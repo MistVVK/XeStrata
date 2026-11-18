@@ -63,6 +63,8 @@ def main(argv=None) -> int:
                          "3) or moss-image-base (its base model), or several, comma-separated (the first the "
                          "default); -uncensored: the text encoder (Qwen3-VL-8B, Mage-Flow's 4B, MOSS-Image's "
                          "Qwen3.5-9B) with the refusal direction removed")
+    ap.add_argument("--lora-training", action="store_true", default=None,
+                    help="prepare the full-step bases for LoRA training (setup's --image-lora-training)")
     ap.add_argument("--dit-q8", choices=["auto", "on", "off"],
                     help="Mage-Flow, MOSS-Image: its DiT 16-bit in VRAM when it fits there with the text encoder, "
                          "else 8 bits (auto, the default); on always 8 bits, off always 16-bit")
@@ -94,7 +96,8 @@ def main(argv=None) -> int:
         a.models_dir = str(data / "models")
     ns = argparse.Namespace(images=a.model, image_quant=a.quant, image_gpu_policy=a.gpu_policy, yes=a.yes,
                             image_ssd_offload=a.ssd_offload, image_dit_q8=a.dit_q8, image_auto_largest=a.auto_largest,
-                            image_dit_keep=a.dit_keep, image_gpu=a.gpu, image_sam3_license=a.sam3_license)
+                            image_dit_keep=a.dit_keep, image_gpu=a.gpu, image_sam3_license=a.sam3_license,
+                            image_lora_training=a.lora_training)
     path = Path(a.config) if a.config else None
     cfg = json.loads(path.read_text(encoding="utf-8-sig")) if path is not None and path.is_file() else {}
     # the RAM the model was set up to leave free (setup's --ram-reserve-gib, its engine's --ram-reserve-mib)

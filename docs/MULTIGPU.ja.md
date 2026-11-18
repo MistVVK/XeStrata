@@ -259,8 +259,7 @@ RAM を読む速さが足りない PC では遅くなります（下の測定）
 `--pipeline-windows 1` は、検証の窓を通る短い prefill（`--short-read`）だけを重ねます。これは 2 段のときだけです。
 
 各段が自分の GPU を持つ 2 段以上の分割と、`--serve` のときに使えます。
-指定がなければ、Xe2（Battlemage）の GPU ちょうど 2 枚の分割で、`--serve` と下書きの層があり、`--batch` と補助のキャッシュがないときは `2` にします（upstream a6fd78856。upstream は Arc Pro B65 2 枚で decode が直列より 17〜28% 速く、1 時間の serve でトークンの違いがなかったと測っています）。
-`--pipeline-windows 0` か `XESTRATA_PIPELINE_AUTO=0` で切れます。ほかの構成は直列のままです。
+指定がなければ `0` で、直列のままです。
 3 段以上で `--pipeline-windows 2` を使うときは、`--adapt-async` を切り、適応する段は判定のときに動かします。
 
 - **費用**: 各 GPU に 2 つ目の検証の窓。各 GPU のエキスパートのキャッシュから 160 MiB を外し、`2` では最後の段より前の各 GPU に再帰の状態のコピーを 2 つ置きます（その GPU の GDN の層 1 つあたり約 3 MiB）。

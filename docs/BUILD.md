@@ -233,6 +233,7 @@ The same executable runs on Intel GPUs too.
    An AMD GPU on amdgpu has its gfx (`gfx1200`, for example) read from the kernel's KFD topology, and `/dev/kfd`'s permissions checked too.
    A GPU older than RDNA2, or one the distribution's rocBLAS (in a package, its engine) has no code for, is shown as not usable ([README](../README.md#amd-gpus)).
 1. It checks RAM and CPU and asks its questions.
+   After the image models, choose whether to prepare the bases for LoRA training too. On the command line, use `--images qwen-image-turbo --image-lora-training`. Omit the second option for inference alone.
 1. It chooses the SYCL compiler ([below](#the-sycl-compiler)) and compiles the engine in `build-xe`.
 
 The engine goes to `engine/` with `BUILD.json` (`"backend": "xe"` and the compiler it was built with).

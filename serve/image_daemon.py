@@ -87,7 +87,7 @@ class Daemon:
         self.proc.stdin.write(line + "\n")
         self.proc.stdin.flush()
 
-    def request(self, conn, f, line: str) -> None:
+    def request(self, conn, f, line: str, disconnected: threading.Event) -> None:
         """One request line: the engine's lines to the client up to the answer.  A client gone meanwhile has its image
         stopped; the lines are still read to the answer, so the next request gets its own."""
         op = line.split(" ", 1)[0]
@@ -101,7 +101,15 @@ class Daemon:
             try:
                 self.send(line)
                 while True:
-                    got = self.lines.get()
+                    if disconnected.is_set() and not gone:
+                        gone = True
+                        if op in ("IMG", "UPSV", "SEGV"):
+                            with contextlib.suppress(OSError, ValueError):
+                                self.send("STOP")
+                    try:
+                        got = self.lines.get(timeout=0.25)
+                    except queue.Empty:
+                        continue
                     if got is None:
                         write(f, "ERROR the image engine ended")
                         self.done.set()
@@ -111,10 +119,11 @@ class Daemon:
                             write(f, got)
                         except OSError:
                             gone = True
-                            if op in ("IMG", "UPSV"):
+                            if op in ("IMG", "UPSV", "SEGV"):
                                 with contextlib.suppress(OSError, ValueError):
                                     self.send("STOP")
-                    if gone and got == "YIELD":   # no one to say RESUME: on to its STOP
+                    if gone and got == "YIELD" and op not in ("IMG", "UPSV", "SEGV"):
+                        # Requests without STOP still need to leave the yield.
                         with contextlib.suppress(OSError, ValueError):
                             self.send("RESUME")
                     if got.split(" ", 1)[0] in ends or got.startswith("ERROR"):
@@ -130,6 +139,7 @@ class Daemon:
             f = conn.makefile("rw", encoding="utf-8", errors="replace", newline="\n")
             write(f, self.ready)
             requests: queue.Queue = queue.Queue()
+            disconnected = threading.Event()
 
             def read():   # the client's lines: STOP and RESUME at once (for the running request), the rest in turn
                 try:
@@ -142,6 +152,7 @@ class Daemon:
                             continue
                         requests.put(line)
                 finally:
+                    disconnected.set()
                     requests.put(None)
             threading.Thread(target=read, daemon=True).start()
             while True:
@@ -156,7 +167,7 @@ class Daemon:
                         write(f, "STOPPED")
                     return
                 if line:
-                    self.request(conn, f, line)
+                    self.request(conn, f, line, disconnected)
         except OSError:
             pass
         finally:

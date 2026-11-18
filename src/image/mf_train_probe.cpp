@@ -303,7 +303,8 @@ int main(int argc, char** argv) {
             Var x16v = load(dir, "x16"), h16v = load(dir, "h16");
             const int64_t cols = x16v.dim(1), rank = h16v.dim(1);
             Var SC = load(dir, "scale");
-            Dev DY(dy), X16T(load(dir, "x16t")), H16T(load(dir, "h16t")), XR(load(dir, "xr")),
+            Dev DY(dy), X16(x16v), H16(h16v), B16(load(dir, "b16")),
+                X16T(load(dir, "x16t")), H16T(load(dir, "h16t")), XR(load(dir, "xr")),
                 HR(load(dir, "hr")), BT16(load(dir, "bt16")), dB(rows * rank * 4),
                 dA(rank * cols * 4), scratch((T * rank + T * rows + rows * rank + rank * cols) * 4),
                 tmp16((2 * T * rows + T * rank) * 2), rsT(T * 4);   // FP16: 2 T N + T rank halves
@@ -312,8 +313,10 @@ int main(int argc, char** argv) {
             strata::prefill::Gemm gemm;
             std::string err;
             if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
-            train::lora_bwd(HR.cf(), XR.cf(), H16T.ch(), X16T.ch(), BT16.ch(), DY.cf(), T, rows, cols, rank, *SC.hf(),
-                        dB.f(), dA.f(), scratch.f(), tmp16.h(), rsT.f(), gemm, s);
+            strata::prefill::Gemm::trace_training();
+            train::lora_bwd(HR.cf(), XR.cf(), H16T.ch(), X16T.ch(), gemm.f16_batch_ex_ok() ? nullptr : BT16.ch(),
+                        DY.cf(), T, rows, cols, rank, *SC.hf(), dB.f(), dA.f(), scratch.f(), tmp16.h(), rsT.f(), gemm, s,
+                        nullptr, nullptr, H16.ch(), X16.ch(), B16.ch());
             std::vector<float> ho((size_t) (rows * rank + rank * cols + T * rank));
             strata::gpu::stream_sync(s);
             dB.read(ho.data(), rows * rank * 4);

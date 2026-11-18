@@ -21,6 +21,7 @@ from pathlib import Path
 
 CVE = "CVE-2026-68264"
 UPSTREAM_FIRST = (6, 12)   # the CVE record: the bug came with 6.12 (fixed in 6.12.103, 6.18.44, 7.1.6 and 7.2)
+UPSTREAM_FIXED = (7, 2)   # 7.2 is the first upstream series with the fix; no Ubuntu table is needed above it
 # https://ubuntu.com/security/CVE-2026-68264 (updated 2026-10-26), the kernels of 7.0 by flavour: the first fixed
 # build's ABI and upload numbers (linux 7.0.0-38.38 on 26.04 and linux-hwe-7.0 7.0.0-38.38~24.04.4 on 24.04 are the
 # generic one; linux-realtime 7.0.0-38.38.1; linux-oem-7.0 7.0.0-1015.15; the cloud ones).  Not in the table:
@@ -61,7 +62,8 @@ def ubuntu_fixed() -> bool | None:
     m = re.match(r"Ubuntu ((\d+)\.(\d+)\.\d+)-(\d+)\.(\d+)\S*?-([a-z][a-z0-9-]*) ", sig)
     if not m:
         return None
-    if (int(m.group(2)), int(m.group(3))) < UPSTREAM_FIRST:
+    series = (int(m.group(2)), int(m.group(3)))
+    if series < UPSTREAM_FIRST or series >= UPSTREAM_FIXED:
         return True
     first = UBUNTU.get(m.group(1), {}).get(m.group(6))
     return first is not None and (int(m.group(4)), int(m.group(5))) >= first

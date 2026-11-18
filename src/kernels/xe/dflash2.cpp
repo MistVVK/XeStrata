@@ -550,7 +550,7 @@ void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, 
         const int row = (int) it.get_group(0), lane = (int) it.get_local_id(0);
         const int g = row / 8, r = row % 8;
         const uint16_t* wd = dpl + (size_t) g * 8 * nb + static_cast<size_t>(r * 16) + (lane >> 1);
-        const sycl::int4* xv = reinterpret_cast<const sycl::int4*>(xq) + lane;
+        const sycl::int4* xv = reinterpret_cast<const sycl::int4*>(xq);
         float acc[NC];
 #pragma unroll
         for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
@@ -566,7 +566,7 @@ void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, 
                 const float dw = (float) sycl::bit_cast<sycl::half>(wd[(size_t) st * 128]);
 #pragma unroll
                 for (int c = 0; c < NC; ++c) {
-                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + static_cast<size_t>(st * 32)];
+                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + static_cast<size_t>(st * 32 + lane)];
                     int isum = xe::dp4a(w0, x.x(), 0);
                     isum = xe::dp4a(w1, x.y(), isum);
                     isum = xe::dp4a(w2, x.z(), isum);
@@ -582,7 +582,7 @@ void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, 
                 const float dw = (float) sycl::bit_cast<sycl::half>(wd[(size_t) st * 128]);
 #pragma unroll
                 for (int c = 0; c < NC; ++c) {
-                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + static_cast<size_t>(st * 32)];
+                    const sycl::int4 x = xv[(size_t) c * (n_in / 16) + static_cast<size_t>(st * 32 + lane)];
                     int isum = xe::dp4a(raw.x(), x.x(), 0);
                     isum = xe::dp4a(raw.y(), x.y(), isum);
                     isum = xe::dp4a(raw.z(), x.z(), isum);

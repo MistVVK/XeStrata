@@ -3063,10 +3063,12 @@ static void latent_cpu_run(ExpertDispatch& d, const int32_t* ids, int64_t n_tok,
     act.assign(ent_t.size() * act_row, 0);
     if (act_gpu) {
         for (size_t j = 0; j < ent_t.size(); ++j)
-            std::memcpy(act.data() + j * act_row, d.lat_act0 + ((size_t) ent_t[j] * G + ent_g[j]) * act_row, act_row);
+            std::memcpy(act.data() + j * act_row,
+                        d.lat_act0 + (((size_t) ent_t[j] + (size_t) d.lat_tb) * G + ent_g[j]) * act_row, act_row);
     } else {
         for (size_t j = 0; j < ent_t.size(); ++j)
-            native_quant_act(f_nr, xl + ((size_t) ent_t[j] * G + ent_g[j]) * ELL, act.data() + j * act_row);
+            native_quant_act(f_nr, xl + (((size_t) ent_t[j] + (size_t) d.lat_tb) * G + ent_g[j]) * ELL,
+                             act.data() + j * act_row);
     }
     // A: one job per expert, its entries together, on the pool's native row phases
     static thread_local std::vector<float> lh;
@@ -4372,15 +4374,17 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             : new PinnedArena(want + (uint64_t) blob, bounds, 0, shared_arena_file, pack_hash, cuts);
     } catch (const std::exception& e) {
         // a runtime without the registration (intel/llvm's CUDA adapter has no urUSMImportExp) takes host USM
-        if (!shared_arena_file.empty() || host_usm) {
+        if (!shared_arena_file.empty() || (host_usm && host_usm_want >= 0)) {
             err = std::string("ArenaExpertSource: ") + e.what();
             return false;
         }
-        std::fprintf(stderr, "xestrata: %s; the expert arena takes host USM instead\n", e.what());
+        const bool alternate_usm = !host_usm;
+        std::fprintf(stderr, "xestrata: %s; the expert arena tries %s instead\n", e.what(),
+                     alternate_usm ? "host USM" : "registered mapping");
         try {
-            a = new PinnedArena(want + (uint64_t) blob, bounds, (uint64_t) blob, /*host_usm=*/true);
+            a = new PinnedArena(want + (uint64_t) blob, bounds, (uint64_t) blob, alternate_usm, cuts);
         } catch (const std::exception& e2) {
-            err = std::string("ArenaExpertSource: ") + e.what() + "; host USM: " + e2.what();
+            err = std::string("ArenaExpertSource: ") + e.what() + "; alternate arena: " + e2.what();
             return false;
         }
     }

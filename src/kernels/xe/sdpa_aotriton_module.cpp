@@ -225,7 +225,7 @@ STRATA_SDPA_EXPORT bool strata_sdpa_aotriton(void* q, const uint16_t* q16, const
     return strata::image::sdpa::aotriton(*static_cast<sycl::queue*>(q), q16, k16, v16, rows, keys, heads, kv_heads, hd,
                                          out16, causal, window);
 }
-STRATA_SDPA_EXPORT bool strata_sdpa_aotriton_train(void* q, bool bwd, const uint16_t* q16, const uint16_t* k16,
+STRATA_SDPA_EXPORT bool xestrata_sdpa_aotriton_train(void* q, bool bwd, const uint16_t* q16, const uint16_t* k16,
                                                    const uint16_t* v16, const uint16_t* o16, const uint16_t* do16,
                                                    float* lse, int64_t rows, int64_t keys, int64_t heads, int64_t hd,
                                                    uint16_t* out16, uint16_t* dq16, uint16_t* dk16, uint16_t* dv16,

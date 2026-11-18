@@ -69,7 +69,7 @@ def dataset_tokens(model: str, data: Path) -> int:
     text_rows = 0
     if model == "qwen-image-2.1":
         for line in data.read_text(encoding="utf-8").splitlines():
-            fields = line.split()
+            fields = line.split("\t")   # a cache path can hold spaces; the lists from mf_pre.py are tab-separated
             if len(fields) < 2:
                 continue
             with Path(fields[1]).open("rb") as f:
@@ -180,12 +180,13 @@ def run_bench(exe: str, pci: str, env: dict | None = None) -> dict | None:
 
 class Decider:
     """The training's placement and budget, re-decided every tick.  `st` (TrainPlace fills it):
-      free: {pci: free_mib} the device reports now; chat_busy / chat_queued: the text engine's work;
+      free: {pci: free_mib} the device reports now, excluding the trainer; chat_busy / chat_queued: the text work;
       chat_eta_s: how long the chat's work is expected to last (None: unknown); image_job: an image job waiting
       or running on the card; image_need_mib: its estimate (None: unknown); device_free: the device's actual free
       MiB, without adding the trainer's usage; proc_alive: whether the training process is still alive;
       helper_mib: the helper cache's size on the card;
-      train: the trainer's last vram line {used_mib, peak_est_mib, min_mib, need_mib, state} (None before the first);
+      train: the trainer's last vram line plus process_mib and process_source sampled beside free when possible;
+        process_live says that sample was available (None before the first report);
       current_pci: the card the trainer runs on (None before the start); step_s / reload_s: the measured step
       time and the state-restore + weights-reload time (None: not measured).
     The action: {pci, budget_mib, save_state, reason, mode: start|run|shrunk|paused|move|refuse, return_helper,
@@ -199,6 +200,8 @@ class Decider:
         self.open_mib, _, self.peak_mib = figures(model, base)
         self.min_mib, self.need_mib = initial_vram(model, base, image_tokens, rank)
         self.cards = candidates(cfg, devices)
+        self._last_action: dict = {}
+        self._low_ticks = 0
 
     def _margin(self, total_mib: int) -> int:
         from serve import vram_ledger
@@ -208,6 +211,11 @@ class Decider:
         """What a training may take on the card now: the report's free, less the margin, less the helper cache
         where the chat needs it (the helper is not closed for the training while the chat runs)."""
         free = int((st.get("free") or {}).get(card["pci"], 0))
+        if card["pci"] == st.get("current_pci") and st.get("proc_alive"):
+            train = st.get("train") or {}
+            # fdinfo and NVML name this process; delta can include other processes and global is the whole device.
+            held = train.get("process_mib") if train.get("process_source") in ("fdinfo", "nvml") else None
+            free += int(held if held is not None else train.get("used_mib") or 0)
         room = free - self._margin(card["total_mib"])
         if card["kind"] == "helper" and (st.get("chat_busy") or st.get("chat_queued")):
             room -= int(st.get("helper_mib") or 0)
@@ -215,6 +223,8 @@ class Decider:
 
     def tick(self, st: dict) -> dict:
         if st.get("image_job"):
+            self._low_ticks = 0
+            self._last_action = {}
             card = next((c for c in self.cards if c["pci"] == st.get("current_pci")), None)
             if card is None:
                 return {"pci": None, "budget_mib": 0, "save_state": False, "reason": "unknown training card",
@@ -228,14 +238,38 @@ class Decider:
             save = alive and paused and not fits
             return {"pci": card["pci"], "budget_mib": 0, "save_state": save, "reason": "image job",
                     "mode": "paused", "return_helper": card["kind"] == "helper", "image_ready": ready}
-        return {**self._tick(st), "image_ready": False}
+        action = {**self._tick(st), "image_ready": False}
+        last = self._last_action
+        train = st.get("train") or {}
+        same = last.get("pci") == st.get("current_pci") and st.get("proc_alive")
+        priority = st.get("chat_busy") or st.get("chat_queued")
+        budget = int(action.get("budget_mib") or 0)
+        previous = int(last.get("budget_mib") or 0)
+        if same and previous > 0 and not priority and not train.get("process_live"):
+            if not train.get("state"):
+                # The open is still allocating and has not emitted its first vram line. Its boundary enforces
+                # the initial budget; do not revoke it because those allocations reduced the device's free count.
+                action = {**last, "reason": "waiting for the first VRAM report"}
+            elif budget < previous:
+                self._low_ticks += 1
+                if self._low_ticks < 2:
+                    action = {**last, "reason": "confirming available GPU memory"}
+                else:
+                    self._low_ticks = 0
+            else:
+                self._low_ticks = 0
+        else:
+            self._low_ticks = 0
+        self._last_action = action
+        return action
 
     def _tick(self, st: dict) -> dict:
         cur = st.get("current_pci")
         card = next((c for c in self.cards if c["pci"] == cur), None)
         train = st.get("train") or {}
         need_mib = int(train.get("need_mib") or self.need_mib)
-        peak = max(need_mib, int(train.get("peak_est_mib") or self.peak_mib))
+        # The trainer's estimate follows its current plan, not the whole form; using it here creates feedback.
+        peak = max(self.peak_mib, need_mib)
         chat = bool(st.get("chat_busy") or st.get("chat_queued"))
 
         if card is None:   # the start: the first card the least form fits on (the open's room checked by TrainPlace)

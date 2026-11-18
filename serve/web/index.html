@@ -278,6 +278,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <div class="img-lora-chips" id="img-lora-chips"></div>
             <!-- adapters added to the server's LoRA folder: a file (or one dropped here), or a Hugging Face file -->
             <div class="img-lora-new">
+              <button class="st-btn st-btn--secondary" id="img-lora-train" type="button" data-i18n="img.loraTrain">Train a LoRA…</button>
               <button class="st-btn st-btn--secondary" id="img-lora-upload" type="button" data-i18n="img.loraUpload">Upload a LoRA…</button>
               <input type="file" id="img-lora-file" accept=".safetensors,.gguf" hidden>
               <input class="st-input" id="img-lora-url" type="url" autocomplete="off" placeholder="Hugging Face link to a .safetensors file"
@@ -396,6 +397,11 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <img id="img-full-img" src="data:," alt="">
       <button type="button" class="st-btn st-btn--icon img-full__close" id="img-full-close" aria-label="Close" data-i18n-label="close">
         <svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6L18 18M18 6L6 18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+    </dialog>
+    <dialog class="ltw-dialog" id="ltw-dialog" aria-label="LoRA training" data-i18n-label="ltw.title">
+      <button type="button" class="st-btn st-btn--icon ltw-dialog__close" id="ltw-dialog-close" aria-label="Close" data-i18n-label="close">
+        <svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6L18 18M18 6L6 18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+      <div class="ltw" data-ltw-dialog></div>
     </dialog>
   </section>
 

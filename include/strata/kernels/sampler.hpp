@@ -44,8 +44,8 @@ inline constexpr int kGumbelK = 20;
 
 // XESTRATA_SPEC_GUMBEL: auto (unset or "auto"), 0, 1.  Auto: for a request that samples, the serve loop learns both
 // arms (Gumbel off and on) by the tokens per ms the request decoded at - spec/drafter_policy.hpp's two-arm learner -
-// and sets the arm the request runs (set_gumbel_auto).  Either arm samples the same distribution, so the choice
-// changes which tokens are drawn, never the distribution.  XESTRATA_EXACT=1 fixes it off (a run whose answers must
+// and sets the arm the request runs (set_gumbel_auto).  The Gumbel arm samples only the top kGumbelK survivors;
+// the other arm samples all survivors, so their distributions can differ.  XESTRATA_EXACT=1 fixes it off (a run whose answers must
 // repeat); 0 and 1 force it off and on.
 enum class GumbelMode { kAuto, kOff, kOn };
 GumbelMode gumbel_mode();

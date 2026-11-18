@@ -32,8 +32,8 @@ void split3(const float* qkv, int64_t R, int64_t C, float* q, float* k, float* v
     dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (R * C)), [=](sycl::id<1> id) {
         const int64_t i = static_cast<int64_t>(id[0]), t = i / C, c = i - t * C;
         q[i] = qkv[t * 3 * C + c];
-        k[i] = qkv[t * 3 * C + C + c];
-        v[i] = qkv[t * 3 * C + 2 * C + c];
+        k[i] = qkv[(t * 3 + 1) * C + c];
+        v[i] = qkv[(t * 3 + 2) * C + c];
     });
 }
 
@@ -41,8 +41,8 @@ void join3(const float* q, const float* k, const float* v, int64_t R, int64_t C,
     dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (R * C)), [=](sycl::id<1> id) {
         const int64_t i = static_cast<int64_t>(id[0]), t = i / C, c = i - t * C;
         qkv[t * 3 * C + c] = q[i];
-        qkv[t * 3 * C + C + c] = k[i];
-        qkv[t * 3 * C + 2 * C + c] = v[i];
+        qkv[(t * 3 + 1) * C + c] = k[i];
+        qkv[(t * 3 + 2) * C + c] = v[i];
     });
 }
 

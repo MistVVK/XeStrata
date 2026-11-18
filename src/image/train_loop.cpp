@@ -6,6 +6,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/platform/replace.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -187,7 +188,7 @@ void save_safetensors_bf16(const std::string& path, std::vector<Tensor> ts,
         }
         if (!f) throw std::runtime_error("image engine: short write " + tmp);
     }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) throw std::runtime_error("image engine: cannot rename " + tmp);
+    if (!strata::platform::replace_file(tmp, path)) throw std::runtime_error("image engine: cannot rename " + tmp);
 }
 
 std::vector<std::pair<std::string, std::string>> lora_meta(const LoraMeta& m) {

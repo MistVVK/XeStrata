@@ -82,7 +82,6 @@ upstream の Strata 0.2.7 から 0.2.8（`870aedd9`）までの変更を Xe に�
 - serve のツール呼び出し: 壊れた引数、余分な思考の閉じタグ、`</function>` の抜けで呼び出しを失わない。呼び出しを丸ごと引く値や同じ引数名が続く値を、値の一部として読む。この直し（`tool_call_recovery`）を既定で入れ、`"tool_call_recovery": false` で切る。
 - 会話のキャッシュ: バッチの空いた枠の退避で、本体の写しと共有の根のチェックポイントを消さない。
 - エンジン: エキスパートの領域に要る RAM を最大 20 秒待ってから読み込む。PLE の表を RAM に固定する方針（`XESTRATA_PLE_AUTO_RAM=1`）で、その固定が会話のキャッシュの余地を奪うときは固定を返す。AVX-512 のない CPU で止まるときは、原因が CPU でなく `native_experts.txt` のないパックだと言う。
-- 層の分割: Xe2 の GPU ちょうど 2 枚では `--pipeline-windows 2` を既定にする（upstream と同じ。`--pipeline-windows 0` で切れる、[MULTIGPU](MULTIGPU.ja.md)）。
 - setup: 使わない APU に大きな BIOS の割り当てがあるときは、OS が失う RAM と直し方を言う。
 
 upstream v0.2.8 と 3 社の GPU で比べました（IQ3_XXS の generate の 1K と 32K、serve の 32K、通常使用）。
@@ -430,7 +429,7 @@ NVIDIA の GPU では contrib-llvm のビルドで同じカーネルが動きま
 - `XESTRATA_PREFILL_CPU_SHARE`（既定は `auto` でプロンプトごとに測ります。0 ですべて GPU）: 短いチャンクで、ほとんど選ばれないエキスパートを空いている CPU のプールで計算します。
 - `--kv-grow`: K/V は要求が届いたセルの分だけ VRAM を取り、残りをエキスパートのキャッシュが使います。
   デバイスの仮想メモリの対応づけの粒度が 2 MiB 以上なら既定で有効です（RTX 4070 は有効、B70 は 64 KiB で無効）。
-- `--adapt-async`（常駐モードの既定）、`--batch-mtp`（`--batch` と `--mtp` のときの既定）、`--pipeline-windows`（Xe2 の GPU 2 枚の分割では既定、ほかは opt-in、[MULTIGPU](MULTIGPU.ja.md)）、`--lookup-chain`（opt-in）。
+- `--adapt-async`（常駐モードの既定）、`--batch-mtp`（`--batch` と `--mtp` のときの既定）、`--pipeline-windows`（opt-in、[MULTIGPU](MULTIGPU.ja.md)）、`--lookup-chain`（opt-in）。
 - setup の追加（`--inspect`、`--source modelscope`、200K の文脈など）とサーバーの変更。
 
 速くするための経路は、B70 か RTX 4070 で速くなり、もう一方で遅くならないものを移しました。

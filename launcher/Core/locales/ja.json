@@ -169,6 +169,7 @@
  "setup.image-gpu-policy.label": "画像を作る間の文章のモデル",
  "setup.image-gpu.choice.auto": "自動: 文章のモデルが使わない GPU、無ければ文章のモデルの GPU",
  "setup.image-gpu.choice.same": "文章のモデルの GPU",
+ "setup.image-lora-training.label": "LoRA の学習用の土台も用意する",
  "setup.image-gpu.label": "画像を作る GPU",
  "setup.image-sam3-license.about": "ライセンス: {license}",
  "setup.image-sam3-license.label": "Meta の SAM License に同意して、SAM 3.1 で画像の一部を言葉で見つける（find_region、edit_region）。同意しなければ Florence-2（MIT）で見つけます",

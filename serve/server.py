@@ -101,6 +101,7 @@ from serve import image_aux  # noqa: E402
 from serve import image_controls as controls_api  # noqa: E402
 from serve import image_regions as regions_api  # noqa: E402
 from serve import videos as videos_api  # noqa: E402
+from serve import lora_train as lora_train_api  # noqa: E402
 from serve import loras as lora_api  # noqa: E402
 from serve import translate as translate_mod  # noqa: E402
 from serve import translate_api  # noqa: E402
@@ -4621,6 +4622,7 @@ class Service:
         # #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
         self.undeclared_tool_calls = "text"
         self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
+        self.lora_jobs: Any = None                        # training jobs, recovered before serving requests
         self.translation: Any = None                      # Translation when the config has "translate"
         self.video_jobs: Any = None                       # serve/videos.py's VideoJobs, made at the first video request
         self.long_job: Any = None                         # a video job's state while it holds the image engine
@@ -5091,7 +5093,10 @@ class Service:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
                 try:
-                    self.ensure_loaded()
+                    try:
+                        self.ensure_loaded()
+                    except images_api.LongJobBusy as e:
+                        raise GpuBusy(str(e), retry_after=e.retry_after) from e
                 finally:
                     if trace is not None:
                         with self.status_lock:
@@ -5493,6 +5498,7 @@ class Service:
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             # the slower paths an engine fell back to (serve/downgrades.py): key -> the engine that reported it
             "downgrades": downgrades.snapshot(),
+            "training": lora_train_api.status_row(self),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
@@ -6949,7 +6955,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                      **({"skipped": True} if r.get("skipped") else {}),
                      **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
                      **({"image": r["image"]} if r.get("image") else {}),
-                     **({"sources": r["sources"]} if "sources" in r else {})}, seen)   # a web search's (search.py)
+                     **({"sources": r["sources"]} if "sources" in r else {}),  # a web search's (search.py)
+                     **{k: r[k] for k in ("requested_model", "training_model", "model_switched") if k in r}}, seen)
 
         # the image and video calls of this reply, two or more: run side by side (serve/tool_parallel.py), their
         # results kept in the reply's order; every other call runs in turn as before, meanwhile
@@ -8199,11 +8206,13 @@ def make_handler(svc: Service):
                 return True
             ctype = self.headers.get("Content-Type", "")
             own = self.headers.get("X-XeStrata-Upload") or self.headers.get("X-Strata-Upload")   # its earlier name
+            upath = self.path.split("?")[0].rstrip("/")
             if ctype.startswith("multipart/form-data") and own \
-                    and self.path.split("?")[0].rstrip("/") in ("/v1/videos", "/v1/videos/sync", "/v1/videos/files",
-                                                                "/v1/videos/segmentations"):
-                return False   # the Video tab's upload: a header of its own, which a page elsewhere cannot send
-                #                without a CORS preflight (granted to cors_origins alone)
+                    and (upath in ("/v1/videos", "/v1/videos/sync", "/v1/videos/files", "/v1/videos/segmentations",
+                                   "/v1/lora/jobs")
+                         or (upath.startswith("/v1/lora/jobs/") and upath.endswith("/images"))):
+                return False   # the Video tab's and the LoRA panel's upload: a header of its own, which a page
+                #                elsewhere cannot send without a CORS preflight (granted to cors_origins alone)
             if not ctype.startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return True
@@ -8278,6 +8287,23 @@ def make_handler(svc: Service):
             if path.startswith("/v1/responses/"):
                 self._json(404, responses_error_body("this server keeps no responses (stateless): there is nothing "
                                                      "to delete", code="not_found"))
+            elif path.startswith("/v1/lora/jobs/"):   # a training job, its image, or a version of it
+                if not self._authorized():
+                    return
+                parts = path.strip("/").split("/")
+                jobs = self._lora_jobs()
+                try:
+                    if len(parts) == 4:
+                        self._json(200, jobs.delete(parts[3]))
+                    elif len(parts) == 6 and parts[4] == "images":
+                        self._json(200, jobs.remove_image(parts[3], parts[5]))
+                    elif len(parts) == 6 and parts[4] == "versions":
+                        self._json(200, jobs.delete_version(parts[3], int(parts[5])))
+                    else:
+                        self._json(404, {"error": {"message": f"Invalid URL (DELETE {path})",
+                                                   "type": "invalid_request_error"}})
+                except (lora_train_api.TrainError, ValueError) as e:
+                    self._json(*lora_train_api.explain(e))
             elif path.startswith("/v1/videos/") and path.count("/") == 3:   # a video job and its files
                 got = self._video_jobs().delete(path[len("/v1/videos/"):]) if svc.images is not None else None
                 if got is None:
@@ -8287,6 +8313,23 @@ def make_handler(svc: Service):
                     self._json(200, got)
             else:
                 self._json(404, {"error": {"message": f"Invalid URL (DELETE {path})", "type": "invalid_request_error"}})
+
+        def do_PUT(self):
+            """PUT /v1/lora/jobs/{id}/captions: the training images' captions, edited on the panel."""
+            if not self._authorized():
+                return
+            path = self.path.split("?")[0].rstrip("/")
+            parts = path.strip("/").split("/")
+            if len(parts) == 5 and parts[:3] == ["v1", "lora", "jobs"] and parts[4] == "captions":
+                try:
+                    req = json.loads(self._body() or b"{}")
+                    if not isinstance(req, dict):
+                        raise ValueError("send a JSON object of image file name -> {caption, note}")
+                    self._json(200, self._lora_jobs().set_captions(parts[3], req))
+                except (lora_train_api.TrainError, ValueError) as e:
+                    self._json(*lora_train_api.explain(e))
+            else:
+                self._json(404, {"error": {"message": f"Invalid URL (PUT {path})", "type": "invalid_request_error"}})
 
         def do_OPTIONS(self):
             # a CORS preflight: no credentials come with it, so no API key; the headers only for cors_origins
@@ -8524,6 +8567,8 @@ def make_handler(svc: Service):
                 if not self._authorized():
                     return
                 self._json(200, svc.updates.check() if release_check.enabled() else svc.updates.info())
+            elif path == "/v1/lora/models" or path.startswith("/v1/lora/jobs"):
+                self._lora_get(path)
             elif path.startswith("/v1/videos/files/"):   # a chat's video: its name (32 random hex digits) is the access
                 f = videos_api.file_path(self._video_jobs(), path[len("/v1/videos/files/"):]) \
                     if svc.images is not None else None
@@ -8562,6 +8607,9 @@ def make_handler(svc: Service):
                         s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
                 for k in ("started", "first_token"):
                     s.pop(k, None)
+                training = lora_train_api.status_row(svc)
+                if training is not None:
+                    s["training"] = training
                 self._json(200, s)
             elif path in self.TRANSLATE_GET:
                 self._translate_get(path, parse_qs(urlsplit(self.path).query))
@@ -8974,6 +9022,9 @@ def make_handler(svc: Service):
                 if path == "/v1/images/upscale":              # a form (LocalAI's multipart) or JSON: read there
                     self._images_upscale()
                     return
+                if path == "/v1/lora/jobs" or path.startswith("/v1/lora/jobs/"):
+                    self._lora_post(path)   # the browser's LoRA training (serve/lora_train.py)
+                    return
                 if path in ("/v1/videos", "/v1/videos/sync", "/v1/videos/segmentations"):
                     self._videos_post(path)   # a video's upscale or segmentation (vLLM-Omni's): its upload streamed
                     return
@@ -9276,6 +9327,112 @@ def make_handler(svc: Service):
             images_api.check_tool(gen.cfg, "upscale_image")
             job = images_api.parse_edit_request(req, [Vision.normalize(picture, keep_alpha=True)], gen.cfg)
             self._image_job(gen, job, edit=True)
+
+        def _lora_jobs(self) -> lora_train_api.TrainJobs:
+            return lora_train_api.jobs_of(svc)
+
+        def _lora_get(self, path: str) -> None:
+            """GET /v1/lora/models (the trainable models), /v1/lora/jobs (the jobs), /v1/lora/jobs/{id} (its record),
+            /v1/lora/jobs/{id}/images|samples/{file} (a picture: the job's id, 32 random hex digits, is the access,
+            as an image file's link)."""
+            if path == "/v1/lora/models":
+                if self._authorized():
+                    self._json(200, {"models": lora_train_api.model_rows(svc)})
+                return
+            jobs = self._lora_jobs()
+            if path == "/v1/lora/jobs":
+                if self._authorized():
+                    self._json(200, {"jobs": jobs.list_jobs()})
+                return
+            rest = path[len("/v1/lora/jobs/"):]
+            jid, _, tail = rest.partition("/")
+            rec = jobs.get(jid)
+            if rec is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "not_found",
+                                           "message": "no such training job"}})
+                return
+            if tail == "":
+                if self._authorized():
+                    self._json(200, rec)
+                return
+            kind, _, name = tail.partition("/")
+            if kind in ("images", "samples") and re.fullmatch(r"[0-9A-Za-z._-]+", name or ""):
+                f = jobs.dir_of(jid) / kind / name
+                if f.is_file():
+                    body = f.read_bytes()
+                    mimes = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                             ".webp": "image/webp", ".bmp": "image/bmp"}
+                    mime = mimes.get(f.suffix.lower(), "application/octet-stream")
+                    self.send_response(200)
+                    self.send_header("Content-Type", mime)
+                    self.send_header("Cache-Control", "private, max-age=86400")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+            self._json(404, {"error": {"type": "invalid_request_error", "code": "not_found", "message": "not found"}})
+
+        def _lora_post(self, path: str) -> None:
+            """POST /v1/lora/jobs (a draft: the images a multipart form, the fields name/kind/trigger/model),
+            /v1/lora/jobs/{id}/images (more images), and the JSON actions caption / start / cancel / resume /
+            register (serve/lora_train.py)."""
+            if not self._authorized():
+                return
+            jobs = self._lora_jobs()
+            folder = jobs.root / f"upload-{uuid.uuid4().hex}"
+            try:
+                parts = path.strip("/").split("/")
+                if path == "/v1/lora/jobs" or (len(parts) == 5 and parts[4] == "images"):
+                    ctype = self.headers.get("Content-Type", "") or ""
+                    length = int(self.headers.get("Content-Length") or -1)
+                    if not ctype.lower().startswith("multipart/form-data") or length < 0:
+                        raise lora_train_api.TrainError("send the images in a multipart/form-data form (images)")
+                    if length > lora_train_api.MAX_DATASET_BYTES + (1 << 20):
+                        raise lora_train_api.TrainError(
+                            f"the upload is past the limit of {lora_train_api.MAX_DATASET_BYTES >> 20} MiB", 413)
+                    folder.mkdir()
+                    fields, files = videos_api.stream_multipart(self.rfile, ctype, length, folder,
+                                                                lora_train_api.MAX_IMAGE_BYTES)
+                    pics = [(f.get("filename") or "image.png", Path(f["path"]).read_bytes())
+                            for f in files if f["field"] in ("images", "images[]", "file")]
+                    if path == "/v1/lora/jobs":
+                        self._json(200, jobs.create(fields, pics))
+                    else:
+                        rec = jobs.get(parts[3])
+                        if rec is None:
+                            raise lora_train_api.TrainError(f"{parts[3]}: no such job", 404)
+                        for fname, data in pics:
+                            jobs.add_image(parts[3], fname, data)
+                        self._json(200, jobs.get(parts[3]))
+                    return
+                req = json.loads(self._body() or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("send a JSON object")
+                if len(parts) != 5:
+                    raise lora_train_api.TrainError(f"Invalid URL (POST {path})", 404)
+                jid, action = parts[3], parts[4]
+                if action == "caption":
+                    self._json(200, jobs.caption(jid, req.get("style_words", "")))
+                elif action == "start":
+                    self._json(200, jobs.start(jid, req))
+                elif action == "cancel":
+                    self._json(200, jobs.cancel(jid))
+                elif action == "resume":
+                    self._json(200, jobs.resume(jid, req.get("steps")))
+                elif action == "register":
+                    step = req.get("step")
+                    if step is not None:
+                        step = int(step)
+                    self._json(200, jobs.register(jid, step, req.get("name")))
+                else:
+                    raise lora_train_api.TrainError(f"Invalid URL (POST {path})", 404)
+            except videos_api.VideoRequestError as e:
+                self._json(e.status, {"error": {"type": "invalid_request_error", "code": "invalid_training",
+                                                "message": str(e)}})
+            except (lora_train_api.TrainError, ValueError) as e:
+                self._json(*lora_train_api.explain(e))
+            finally:
+                shutil.rmtree(folder, ignore_errors=True)
 
         def _video_jobs(self) -> videos_api.VideoJobs:
             return videos_api.jobs_of(svc)
@@ -11930,6 +12087,15 @@ def _main() -> int:
             ap.error("--engine xestrata needs --config")
         vision = None
         env = child_env(cfg)
+        if cfg.get("images") and not envvars.get("GPU_PCI", env=env):
+            # The image and training ledgers need the text engine's actual card even when setup chose it automatically.
+            from serve import gpu_select
+            iexe = str(cfg["images"]["exe"])
+            iexe = iexe if os.path.isabs(iexe) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", iexe))
+            try:
+                envvars.put(env, "GPU_PCI", gpu_select.selected_pci(iexe, env))
+            except ValueError as e:
+                raise SystemExit(f"[xestrata] image GPU: {e}") from e
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
@@ -12067,13 +12233,18 @@ def _main() -> int:
         try:
             ilog = open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None
             # the text engine's environment: its libraries, and its GPU unless the images have a card of their own
-            ienv, separate, said = image_env(cfg, child_env(cfg))
+            text_env = env if a.engine == "xestrata" else child_env(cfg)
+            ienv, separate, said = image_env(cfg, text_env)
             if said:
                 print(f"[xestrata] {said}", flush=True)
+            from serve import gpu_select
+            pci = envvars.get("GPU_PCI", env=ienv) or gpu_select.selected_pci(icfgs[0]["exe"], ienv)
+            ienv = gpu_select.scope(icfgs[0]["exe"], ienv, pci)
             svc.images = images_api.ImageModels(icfgs, log=ilog, env=ienv, separate=separate)
             svc.images.helper_card = image_helper_card(cfg)
             if separate and not svc.images.helper_card:   # the text model's GPU may be lent to them (use_text_gpu)
-                svc.images.lend_cfgs = (icfgs, ilog, child_env(cfg))
+                text_pci = envvars.get("GPU_PCI", env=text_env) or gpu_select.selected_pci(icfgs[0]["exe"], text_env)
+                svc.images.lend_cfgs = (icfgs, ilog, gpu_select.scope(icfgs[0]["exe"], text_env, text_pci))
             svc.images.gpu_pci = envvars.get("GPU_PCI", env=ienv) if separate else None   # the Monitor's image card
         except ValueError as e:
             raise SystemExit(f"[xestrata] config: {e}")
@@ -12089,6 +12260,9 @@ def _main() -> int:
             print(f"[xestrata] image generation: {svc.images.note()}", flush=True)
         import atexit
         atexit.register(svc.images.close)               # the image engine ends with the server
+        # Recover orphans before serving requests, outside status_lock, and stop our own trainer first on exit.
+        svc.lora_jobs = lora_train_api.TrainJobs(lora_train_api.data_root() / "lora-jobs", svc)
+        atexit.register(svc.lora_jobs.close)
     if isinstance(cfg.get("translate"), dict) and cfg["translate"].get("model"):   # the translation model, first used
         tcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "path") and isinstance(v, str) and not os.path.isabs(v) else v)

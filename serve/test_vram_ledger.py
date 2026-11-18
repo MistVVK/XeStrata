@@ -8,6 +8,7 @@ with their allocations, a failed allocation, the boundary of a release, a dead o
 import os
 from pathlib import Path
 import subprocess
+from unittest import mock
 import sys
 import tempfile
 import time
@@ -216,6 +217,41 @@ class LedgerTest(unittest.TestCase):
         time.sleep(0.6)
         self.assertEqual(self.ledger.room(10000), 9900)         # the base read again once the settling time passed
         self.assertIsNotNone(self.ledger.reserve(9000, "image", 10000, pid=self.other()))
+
+
+class LedgerFiles(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.folder = Path(tmp.name)
+
+    def test_files_live_in_a_private_folder_and_temporary_names_are_unique(self):
+        led = vram_ledger.Ledger("gpu0", folder=str(self.folder))
+        led.reserve(100, "translate", 8000, pid=os.getpid())
+        root = self.folder / f"xestrata-vram-{vram_ledger._user()}"
+        self.assertTrue(root.is_dir())
+        self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+        self.assertTrue((root / "gpu0.json").is_file())
+        self.assertTrue((root / "gpu0.lock").is_file())
+        self.assertEqual(list(root.glob("*.tmp")), [])
+        seen = []
+        real = os.replace
+
+        def spy(src, dst):
+            seen.append(Path(src).name)
+            return real(src, dst)
+
+        with mock.patch.object(vram_ledger.os, "replace", spy):
+            led.entries()
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].startswith("gpu0.json.") and seen[0].endswith(".tmp"))
+
+    def test_a_planted_folder_is_refused(self):
+        root = self.folder / f"xestrata-vram-{vram_ledger._user()}"
+        (self.folder / "someone-else").mkdir()
+        root.symlink_to(self.folder / "someone-else")
+        with self.assertRaises(PermissionError):
+            vram_ledger.Ledger("gpu0", folder=str(self.folder))
 
 
 if __name__ == "__main__":

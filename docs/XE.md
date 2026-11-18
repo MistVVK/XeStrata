@@ -80,7 +80,6 @@ What is taken:
 - Serve's tool calls: damaged arguments, a stray closing think tag and a missing `</function>` no longer cost the call; a value that quotes a whole call, or repeats an argument name, is read as part of the value. This repair (`tool_call_recovery`) is on by default; `"tool_call_recovery": false` turns it off.
 - The conversation cache: parking an idle batch slot no longer drops the main session's copy and the shared prefix's checkpoint.
 - The engine: it waits up to 20 s for the RAM the expert arena needs before it loads; under the PLE table's RAM policy (`XESTRATA_PLE_AUTO_RAM=1`) the pinned table is given back when it leaves the conversation cache too little RAM; a stop on a CPU without AVX-512 names the cause, a pack without `native_experts.txt`, not the CPU.
-- Layer split: on exactly two Xe2 GPUs `--pipeline-windows 2` is the default (as upstream; `--pipeline-windows 0` turns it off, [MULTIGPU](MULTIGPU.md)).
 - Setup: an unused APU with a large BIOS carve-out is reported with the RAM the OS loses and how to fix it.
 
 Compared with upstream v0.2.8 on the three makers' GPUs (IQ3_XXS: generate at 1K and 32K, serve at 32K, everyday use).
@@ -449,7 +448,7 @@ The main things carried:
 - `XESTRATA_PREFILL_CPU_SHARE` (`auto` by default, measured per prompt; 0 gives every expert to the GPU): a short chunk's least-routed experts are computed by the idle CPU pool.
 - `--kv-grow`: the K/V takes VRAM only for the cells a request has reached, and the expert cache uses the rest.
   It is on by default where the device's virtual memory mapping granularity is 2 MiB or more (on for the RTX 4070; the B70's is 64 KiB, off).
-- `--adapt-async` (the resident mode's default), `--batch-mtp` (the default with `--batch` and `--mtp`), `--pipeline-windows` (the default on a split of two Xe2 GPUs, opt-in otherwise, [MULTIGPU](MULTIGPU.md)) and `--lookup-chain` (opt-in).
+- `--adapt-async` (the resident mode's default), `--batch-mtp` (the default with `--batch` and `--mtp`), `--pipeline-windows` (opt-in, [MULTIGPU](MULTIGPU.md)) and `--lookup-chain` (opt-in).
 - Setup's additions (`--inspect`, `--source modelscope`, a 200K context and more) and the server's changes.
 
 Of the paths meant to be faster, those faster on the B70 or the RTX 4070 without being slower on the other are carried.

@@ -152,6 +152,7 @@ double Trainer::update(const AdamW& o, float gscale) {
     parts.reserve(params_.size());
     for (const Param& p : params_) parts.emplace_back(p.g, p.n);
     const double norm = std::sqrt(sq_sum(parts, s)) * (double) gscale;
+    if (!std::isfinite(norm)) throw std::runtime_error("training: non-finite gradient norm");
     const float clip = (float) std::min(1.0, 1.0 / (norm + 1e-6));   // torch's clip_grad_norm_ at 1
     ++steps;
     for (const Param& p : params_) adamw(p.w, p.g, p.m, p.v, p.n, o, steps, gscale * clip, s);
@@ -191,7 +192,10 @@ void Trainer::dgrad_weights(Product* p, int n) {
 }
 
 void Trainer::set_budget(int64_t rows, uint64_t keep_row, uint64_t guess_row) {
-    if (rows <= budget_rows_ && budget_stepped_ == stepped && ws.vram() > 0 && !replan_) return;
+    // A step can grow the retained process allocations without changing the shape or budget. Replan before the
+    // next step when the reported peak estimate no longer fits, so the resident weights give that room back.
+    if (rows <= budget_rows_ && budget_stepped_ == stepped && ws.vram() > 0 && !replan_ &&
+        (budget_ == 0 || est_bytes(rows, guess_row) <= budget_)) return;
     budget_rows_ = std::max(budget_rows_, rows);
     budget_stepped_ = stepped;
     replan_ = false;
@@ -503,6 +507,7 @@ void Trainer::load_state(std::istream& is) {
     gpu::stream_sync(s);
     for (const Lora& l : loras_)
         if (l.views) sync_views(l.ad, l.A, l.B, l.N, l.K);
+    sync_loaded_views();
     gpu::stream_sync(s);
     replan_ = true;
 }

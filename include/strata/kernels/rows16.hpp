@@ -74,7 +74,12 @@ template<int SG, class Op> struct Rows16 {
         const float inv = 1.f / sc;
         for (int64_t c = lane; c < C; c += SG) y16[t * C + c] = f16_from_f32(op.value(t, c, st) * inv);
         if (lane == 0) {
-            if (rs != nullptr) rs[t] = sc;
+            // A zero gradient row contributes nothing.  Its scale must be zero as well: a LoRA's transposed
+            // backward folds this scale into the other operand before finding that operand's global FP16 scale.
+            if (rs != nullptr) {
+                if constexpr (requires { Op::kFullRange; }) rs[t] = rmax == 0.f ? 0.f : sc;
+                else rs[t] = sc;
+            }
             if (keep_mean != nullptr) keep_mean[t] = st.mean;
             if (keep_inv != nullptr) keep_inv[t] = st.inv;
         }

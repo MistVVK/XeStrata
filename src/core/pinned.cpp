@@ -297,18 +297,22 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
     }
     if (bounds.size() < 2 || bounds.back() > bytes) throw DeviceError("the expert arena's layer bounds are invalid");
     auto& runtime = Runtime::get();
-    for (size_t l = 0; l + 1 < bounds.size(); ++l) {
-        const uint64_t n = bounds[l + 1] - bounds[l] + pad;
-        void* p = sycl::malloc_host((size_t) n, runtime.context());
-        if (!p) {
-            for (uint8_t* q : layer_base) runtime.free(q);
-            layer_base.clear();
-            throw DeviceError("host USM for the expert arena refused at layer " + std::to_string(l) + " (" +
-                              std::to_string(n) + " B)");
+    layer_base.reserve(bounds.size() - 1);
+    pieces_.reserve(bounds.size() - 1);
+    slice_starts.reserve(bounds.size() - 1);
+    try {
+        for (size_t l = 0; l + 1 < bounds.size(); ++l) {
+            const uint64_t n = bounds[l + 1] - bounds[l] + pad;
+            void* p = sycl::malloc_host((size_t) n, runtime.context());
+            if (!p) throw DeviceError("host USM for the expert arena refused at layer " + std::to_string(l) + " (" +
+                                      std::to_string(n) + " B)");
+            layer_base.push_back((uint8_t*) p);
+            pieces_.emplace_back(p, (size_t) n);
+            slice_starts.push_back(bounds[l]);
         }
-        layer_base.push_back((uint8_t*) p);
-        pieces_.emplace_back(p, (size_t) n);
-        slice_starts.push_back(bounds[l]);
+    } catch (...) {
+        for (uint8_t* q : layer_base) runtime.free(q);
+        throw;
     }
     base = layer_base[0];
     backing = PageBacking::NormalPages;   // the driver's pages; THP cannot be requested for them

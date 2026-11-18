@@ -34,6 +34,7 @@ void* cudnn_dlhandle = nullptr;
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -54,9 +55,9 @@ struct Cudnn {
     bool failed = false, conv_failed = false;   // conv_failed: cuDNN not opened for the convolutions
     cudnnHandle_t handle = nullptr;
     // (rows, keys, heads, kv heads, hd, batch, causal, window) -> its graph
-    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t>,
-             std::shared_ptr<fe::graph::Graph>>
-        graphs;
+    using Key = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t>;
+    std::map<Key, std::shared_ptr<fe::graph::Graph>> graphs;
+    std::list<Key> graph_lru;
     // a training step's: (rows, keys, heads, hd, backward) -> its graph
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool>, std::shared_ptr<fe::graph::Graph>> train;
     std::map<std::vector<int64_t>, std::shared_ptr<fe::graph::Graph>> convs;   // null: no plan for the shape
@@ -365,8 +366,16 @@ bool run_sdpa(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const ui
         if (d.handle == nullptr) open_cudnn(d.handle);
         const auto key = std::make_tuple(rows, T, heads, kv_heads, hd, batch, causal, window);
         auto it = d.graphs.find(key);
-        if (it == d.graphs.end())
+        if (it == d.graphs.end()) {
             it = d.graphs.emplace(key, cudnn_graph(d.handle, rows, T, heads, kv_heads, hd, batch, causal, window)).first;
+            if (d.graph_lru.size() >= 64) {
+                d.graphs.erase(d.graph_lru.back());
+                d.graph_lru.pop_back();
+            }
+        } else {
+            d.graph_lru.remove(key);
+        }
+        d.graph_lru.push_front(key);
         int64_t ws = 0;
         if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");
         if (ws > d.ws_bytes) {

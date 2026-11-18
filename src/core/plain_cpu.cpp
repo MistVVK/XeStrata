@@ -142,6 +142,8 @@ struct PlainCpu::Impl {
     // state
     std::vector<std::vector<float>> gdn_state;   ///< [HV][S / 32 column groups][S rows (k)][32 cols (v)] a GDN layer
     std::vector<std::vector<float>> gdn_conv;    ///< [C][3] a GDN layer
+    int n_snaps = 0;                             ///< set_snap_rows: the window rows whose states are kept
+    std::vector<std::vector<float>> snap_state, snap_conv;   ///< [row * gdn layers + layer]: the state after the row
     std::vector<std::vector<float>> kc_, vc_;    ///< [cells][nkv][HD] an attention layer
     std::vector<float> part_m, part_l, part_acc;   ///< a decode window's attention, a span's partials
     // scratch, kept between runs
@@ -805,12 +807,52 @@ bool PlainCpu::run_blocks(float* x, int64_t n, int64_t pos, std::string& err) {
         err = "plain cpu: the rows are past the context (" + std::to_string(P.max_cells) + " cells)";
         return false;
     }
+    // a decode window's rows run one at a time while their states are kept for a draft's rollback (the state after
+    // each row but the last, as the GPU window kernel's copies); a prompt chunk runs in its chunks
+    const bool snaps = P.n_snaps > 0 && n > 1 && n <= P.n_snaps + 1 && !P.gdn_state.empty();
+    const size_t ng = P.gdn_state.size();
     for (int64_t done = 0; done < n;) {
-        const int T = (int) std::min<int64_t>(P.chunk, n - done);
+        const int T = snaps ? 1 : (int) std::min<int64_t>(P.chunk, n - done);
         P.x.assign(x + (size_t) (done * P.N), x + (size_t) ((done + T) * P.N));
         P.blocks(T, pos + done);
         std::memcpy(x + (size_t) (done * P.N), P.x.data(), (size_t) (T * P.N) * 4);
+        if (snaps && done + 1 < n && done < P.n_snaps) {
+            for (size_t g = 0; g < ng; ++g) {
+                std::memcpy(P.snap_state[(size_t) done * ng + g].data(), P.gdn_state[g].data(),
+                            P.gdn_state[g].size() * 4);
+                std::memcpy(P.snap_conv[(size_t) done * ng + g].data(), P.gdn_conv[g].data(),
+                            P.gdn_conv[g].size() * 4);
+            }
+        }
         done += T;
+    }
+    return true;
+}
+
+void PlainCpu::set_snap_rows(int n) {
+    Impl& P = *p_;
+    if (n < 0) n = 0;
+    const size_t ng = P.gdn_state.size();
+    P.snap_state.resize((size_t) n * ng);
+    P.snap_conv.resize((size_t) n * ng);
+    for (int t = 0; t < n; ++t)
+        for (size_t g = 0; g < ng; ++g) {
+            P.snap_state[(size_t) t * ng + g].resize(P.gdn_state[g].size());
+            P.snap_conv[(size_t) t * ng + g].resize(P.gdn_conv[g].size());
+        }
+    P.n_snaps = n;
+}
+
+bool PlainCpu::rollback(int n, std::string& err) {
+    Impl& P = *p_;
+    const size_t ng = P.gdn_state.size();
+    if (n < 0 || n >= P.n_snaps || ng == 0) {
+        err = "plain cpu: no recurrent state copy of row " + std::to_string(n);
+        return false;
+    }
+    for (size_t g = 0; g < ng; ++g) {
+        std::memcpy(P.gdn_state[g].data(), P.snap_state[(size_t) n * ng + g].data(), P.gdn_state[g].size() * 4);
+        std::memcpy(P.gdn_conv[g].data(), P.snap_conv[(size_t) n * ng + g].data(), P.gdn_conv[g].size() * 4);
     }
     return true;
 }

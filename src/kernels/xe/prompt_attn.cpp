@@ -4,6 +4,7 @@
 #include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/flash_attn.hpp"
+#include "strata/core/graph.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/timed_choice.hpp"
 #include "device_target.hpp"
@@ -193,7 +194,10 @@ uint16_t* scratch(sycl::queue& queue, int slot, size_t n) {
     size_t free_b = 0, total_b = 0;
     if (!gpu::mem_info(&free_b, &total_b) || n * 2 > total_b / 32 || free_b + sc.n * 2 < n * 2) return nullptr;
     queue.wait();
-    if (sc.p != nullptr) gpu::free(sc.p);
+    if (sc.p != nullptr) {
+        core::graph_epoch_bump();
+        gpu::free(sc.p);
+    }
     sc = Scratch{};
     if (gpu::alloc_device(&sc.p, n * sizeof(uint16_t))) sc.n = n;
     else sc.p = nullptr;
@@ -204,6 +208,7 @@ void release_scratch(sycl::queue& queue, int slot) {
     auto& of = scratch_map();
     if (auto it = of.find(&queue); it != of.end() && it->second[slot].p != nullptr) {
         queue.wait();
+        core::graph_epoch_bump();
         gpu::free(it->second[slot].p);
         it->second[slot] = Scratch{};
     }

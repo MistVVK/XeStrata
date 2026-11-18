@@ -1217,6 +1217,8 @@ bool PlainModel::load_qwen(std::string& err) {
                 conv_snap_[g].push_back(cv);
             }
     }
+    // the CPU tail's recurrent layers keep the same row copies in RAM (its blocks run row by row to take them)
+    if (cpu_tail_ != nullptr) cpu_tail_->set_snap_rows(n_snap_);
     // --pipeline-windows 2: on a stage before the last, the copies a guessed window may have to give back (pl_save)
     if (model_mtp_ && n_snap_ > 0 && opt_.pipeline_windows >= 2 && !last()) {
         pl_bak_state_.assign(gdn_state_.size(), {});
@@ -3708,6 +3710,12 @@ bool PlainModel::restore_parts(const Snapshot& snap, bool recurrent_only, std::s
     for (PlainModel* st : chain())
         for (const StatePart& p : st->state_parts(snap.tokens, recurrent_only))
             if (p.bytes != snap.parts[i++].size()) { err = "plain model: a state of another shape"; return false; }
+    // the state's cells are mapped before they are written: a saved or parked conversation may be longer than this
+    // request's prompt (the grow before the request only saw the prompt), and --kv-grow's trim may have given the
+    // cells past it back to the tier.  A recurrent-only restore copies no attention cells (the rings are whole)
+    if (!recurrent_only)
+        for (PlainModel* st : chain())
+            if (!st->kv_grow_to(snap.tokens, err)) return false;
     i = 0;
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
@@ -3779,7 +3787,7 @@ bool PlainModel::reset(std::string& err) {
 }
 
 void PlainModel::pool_fn(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                         int64_t layer) {
+                         int64_t tb, int64_t layer) {
     PlainModel* m = (PlainModel*) user;
     // --batch-groups: the stages' threads take the pool (and its dispatch's buffers and helpers) one at a time
     std::unique_lock<std::mutex> turn(m->root_->pool_mu_, std::defer_lock);
@@ -3789,6 +3797,7 @@ void PlainModel::pool_fn(void* user, const float* x_f, const int32_t* ids, int64
         if (ids[i] >= 0 && ids[i] < E) m->heat_[(size_t) (layer * E + ids[i])] += 1.0;
     m->dump_routes(layer, ids, n_tok, k);
     m->disp_.layers = layer;
+    m->disp_.lat_tb = tb;
     expert_pool_dispatch_multi(m->disp_, x_f, ids, n_tok, k, out);
 }
 
@@ -4185,6 +4194,7 @@ bool PlainModel::set_window_drafts(int drafts, std::string& err) {
             }
     }
     n_snap_ = drafts;
+    if (cpu_tail_ != nullptr) cpu_tail_->set_snap_rows(drafts);
     drop_window_graphs();   // a window's graph took the copies of its rows
     return true;
 }
@@ -5621,6 +5631,8 @@ bool PlainModel::rollback(int n, std::string& err) {
                 return false;
             }
     }
+    // the CPU tail's recurrent layers ran the window's rows too: their copies go back as the GPU stages' do
+    if (cpu_tail_ != nullptr && cpu_tail_->recurrent() && !cpu_tail_->rollback(n, err)) return false;
     return true;
 }
 

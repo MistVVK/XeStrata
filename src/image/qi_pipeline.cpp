@@ -612,6 +612,33 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
                 return img;
             });
         auto peek = [&](int done, const std::function<void(float*)>& make) { preview(done, make); };
+        // The first block can load library workspaces after the initial plan. It also reveals the device's actual
+        // per-allocation cost. Reconcile the remaining resident allocations with free memory before loading them;
+        // the text encoder has finished, so its cached layers can give up room without changing this image.
+        dit_->set_first_block_hook([&] {
+            uint64_t pending = dit_->blocks_pending_physical(), free = free_vram();
+            if (pending <= free) return;
+            const uint64_t shortfall = pending - free;
+            const uint64_t layers = std::min(p.layers, te_->layers_vram());
+            if (layers > te_->layer_min()) {
+                const uint64_t give = std::min(shortfall, layers - te_->layer_min());
+                p.layers = layers - give;
+                te_->set_layer_budget(p.layers);
+                te_set_ = p.layers;
+                p.resident_layers = te_->resident_layers();
+            }
+            pending = dit_->blocks_pending_physical();
+            free = free_vram();
+            if (pending > free) {
+                // The remaining DiT blocks can stream too. The stream accounts for its two slots when it chooses
+                // the resident prefix, and synchronizes before giving up any block already used by this step.
+                const uint64_t give = pending - free;
+                if (control_on_ || p.blocks <= dit_->block_min() + give) plan_too_small(p);
+                p.blocks -= give;
+                plan_blocks(*dit_, p.blocks);
+                p.resident_blocks = dit_->resident_blocks();
+            }
+        });
         dit_->sample(x, h, w, sigmas, step, ls.after(s_), guided ? r.cfg : 1.0f, peek, &r.guide,
                      r.sampler == "er_sde", r.shift > 0 ? r.shift : 1.0f, r.seed);
         dit_->drop_host_prefix();
@@ -653,6 +680,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
             times->decode = std::chrono::duration<double>(t3 - t2).count();
         }
     } catch (...) {
+        dit_->set_first_block_hook({});
         dit_->drop_host_prefix();
         gpu::free(x);
         gpu::free(rgba);

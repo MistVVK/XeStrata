@@ -356,7 +356,8 @@ struct Plain {
     float value(int64_t t, int64_t c, const Stats&) const { return x[t * C + c]; }
 };
 
-// A training step's gradient rows [T][C] as they are, each at the power of two that fills FP16 (pow2_full), rows16's Op
+// A training step's gradient rows [T][C] as they are, each at the power of two that fills FP16 (pow2_full), rows16's Op.
+// A zero row has scale zero, so it cannot dominate a later product's global scale.
 struct Grad : Plain {
     static constexpr bool kFullRange = true;
 };

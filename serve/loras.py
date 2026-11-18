@@ -57,6 +57,7 @@ page load.
 from __future__ import annotations
 
 import collections
+import errno
 import hashlib
 import http.client
 import json
@@ -799,8 +800,12 @@ class Folder:
                 rank = max(rank, a[0])
             targets.add(kind_of(key))
         kind = (meta.get(KIND_KEY) or "").strip().lower()
+        try:
+            steps = int(meta.get("ss_steps", ""))
+        except ValueError:
+            steps = None
         return {"name": name, "path": rel, "rank": rank, "scale": _recommended(meta), "trigger": _trigger(meta),
-                "kind": kind if kind in KINDS else None,
+                "kind": kind if kind in KINDS else None, "steps": steps,
                 "targets": sorted(targets), "size_mib": round(path.stat().st_size / 1048576, 1),
                 "ignored": sorted(ignored)}
 
@@ -1110,7 +1115,18 @@ def add(folders: list[Folder], tmp: Path, name: str) -> dict:
             if i + 1 < len(dirs):
                 shutil.copyfile(tmp, d / final)
             else:
-                os.replace(tmp, d / final)
+                try:
+                    os.replace(tmp, d / final)
+                except OSError as e:
+                    if e.errno != errno.EXDEV:
+                        raise
+                    # Another model's folder can be on a different filesystem.
+                    local = d / f".adding-{secrets.token_hex(8)}.part"
+                    try:
+                        shutil.copyfile(tmp, local)
+                        os.replace(local, d / final)
+                    finally:
+                        local.unlink(missing_ok=True)
     finally:
         if tmp.exists():
             tmp.unlink()

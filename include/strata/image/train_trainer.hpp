@@ -200,6 +200,7 @@ protected:
     const std::string& what() const { return what_; }
     /// The model fixes its own persistent pointers after resume(), through moved() (the trainer's own are fixed).
     virtual void remap() {}
+    virtual void sync_loaded_views() {}
 
 private:
     void* take(size_t bytes);

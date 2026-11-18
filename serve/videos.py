@@ -67,6 +67,15 @@ class VideoRequestError(ValueError):
 
 
 # ------------------------------------------------------------------------------------------- the upload
+def safe_suffix(name: str) -> str:
+    """The file name's extension for a path the image engine reads from a space-separated line: only ASCII letters
+    and digits after the dot.  A multipart header's filename can hold spaces and bare newlines; either would split
+    the engine's UPSV/SEGV line into commands (a name like x.a\\nSHUTDOWN\\nX stops the image daemon)."""
+    suffix = Path(name).suffix[:16]
+    letters = "".join(c for c in suffix[1:] if c.isascii() and c.isalnum()) if suffix.startswith(".") else ""
+    return "." + letters if letters else ""
+
+
 def stream_multipart(rfile, ctype: str, length: int, dest: Path, max_file: int) -> tuple[dict, list[dict]]:
     """A multipart/form-data body of `length` bytes read from `rfile` -> (its text fields, its files: {"field",
     "filename", "path", "bytes"}, each written under `dest` as it arrives).  A file past `max_file` bytes stops it
@@ -126,7 +135,7 @@ def stream_multipart(rfile, ctype: str, length: int, dest: Path, max_file: int) 
         data = bytearray()
         if filename is not None:
             n += 1
-            path = dest / f"upload{n}{Path(filename).suffix[:16]}"
+            path = dest / f"upload{n}{safe_suffix(filename)}"
             out = open(path, "wb")
         try:
             while True:
@@ -560,7 +569,10 @@ class VideoJobs:
                     (self.dir_of(vid) / rec["input"]).unlink()
                 with self.lock:
                     self.cancels.pop(vid, None)
-            self._write(rec)
+            # delete() may have removed this job's folder while it ran: a missing record must not end the worker
+            # before the rest of the queue starts.
+            with contextlib.suppress(OSError):
+                self._write(rec)
 
     def get(self, vid: str) -> dict | None:
         try:

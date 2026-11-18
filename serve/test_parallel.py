@@ -588,7 +588,12 @@ class ParallelService(unittest.TestCase):
         self.assertFalse(any(th.is_alive() for th in threads), "a request never finished (deadlock)")
         self.assertEqual(errors, [])
         self.assertEqual(sorted(r[0] for r in res.values()), ["ok, done."] * 3)
-        self.assertFalse(any(self.engine.slot_busy))
+        # The HTTP reply can finish while a background BDONE drain still owns a slot.  Wait for its notification,
+        # but still fail if a slot never comes free (the deadlock this test is meant to catch).
+        with self.engine.slot_cv:
+            self.assertTrue(self.engine.slot_cv.wait_for(lambda: not any(self.engine.slot_busy), timeout=10),
+                            f"slots did not clear: {self.engine.slot_busy}")
+            self.assertFalse(any(self.engine.slot_busy))
         with self.svc.status_lock:
             self.assertEqual(len(self.svc.history), 3)
 

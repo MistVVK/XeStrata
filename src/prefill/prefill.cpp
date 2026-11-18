@@ -1755,7 +1755,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.steps_up.init(T * strata::kernels::kStepCount);
-    m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
+    m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     for (int b = 0; b < 2; ++b) {
         if (!m.ple_emb_host[b] &&
             (force_pageable() || !strata::gpu::alloc_host((void**) &m.ple_emb_host[b], (size_t) T * N * 4))) {
@@ -2067,6 +2067,11 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
     take_stage(o, ss, s, m.stage, ok);
+    // the host row tables copy their whole length (HostVec::to_device): keep them at this layout's rows, as the
+    // device tables above are.  A relayout to a smaller chunk left them at the init chunk's length, and the slot
+    // upload wrote past slot_dev into src_dev (the row map the FP16 and latent paths read), the src upload past
+    // src_dev into the scratch after it
+    m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K);
     m.T = (int64_t) T;
     return ok;
 }
@@ -3581,13 +3586,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gu.type = up_type; gu.xq = up_xq2 ? hs.xq2 : hs.xq; gu.dst = hs.gu + ff; gu.woff = hf.up_off;
                                 }
                                 hs.ctx->run(gu, q);
-                                mmq::swiglu(hs.gu, hs.hh, rows_help, ff, /*interleaved=*/false, q);
-                                mmq::quantize(hs.hh, nullptr, hs.hq, hf.d_type, ff, ff, rows_help, q);
                                 mmq::Product dn;
                                 dn.type = hf.d_type; dn.w_rows = N; dn.w_cols = ff; dn.n = (int) ne; dn.xq = hs.hq;
                                 dn.bounds = d_bounds; dn.ids = d_ident; dn.total_rows = rows_help; dn.max_rows = maxr;
                                 dn.rows = rows_help; dn.dst = hs.d; dn.ld_dst = N; dn.wtab = hs.wtab; dn.woff = hf.down_off;
+                                // NVFP4: the experts' tail scales (s_gate / s_up into the SwiGLU, s_down on the down
+                                // rows), as the main path's: without them the helper's rows combine unscaled
+                                const bool nv_tail = hf.tail_off != 0;
+                                const mmq::TailAt tails = mmq::tails_of(dn, mmq::matrix_bytes(hf.d_type, N, ff));
+                                if (nv_tail) mmq::swiglu_tails(hs.gu, hs.hh, rows_help, ff, d_bounds, (int) ne, tails, q);
+                                else mmq::swiglu(hs.gu, hs.hh, rows_help, ff, /*interleaved=*/false, q);
+                                mmq::quantize(hs.hh, nullptr, hs.hq, hf.d_type, ff, ff, rows_help, q);
                                 hs.ctx->run(dn, q);
+                                if (nv_tail) mmq::scale_rows_tails(hs.d, N, N, rows_help, d_bounds, (int) ne, tails, q);
                                 if (!strata::gpu::copy_async(hs.d_ex, hs.d, (size_t) rows_help * N * sizeof(float), q)) {
                                     err = std::string("prefill: the helper's results: ") + strata::gpu::last_error();
                                     return false;
@@ -5182,7 +5193,10 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 const int64_t t0 = c * m.T;                // in the super-chunk
                 const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
                 const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
-                if (tap_rows > std::min(tap_cap_, tap_alloc_)) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
+                // the staging holds the super-chunk's tapped rows: each sub-chunk writes at its own offset (the
+                // layer loop overwrites a shared row 0 with the next sub-chunk's rows before this one's upload)
+                const int64_t tap_off = tap_rows > 0 ? p0 + tap_t0 - std::max<int64_t>(tap_first_, pos0 + sc0) : 0;
+                if (tap_off + tap_rows > std::min(tap_cap_, tap_alloc_)) { err = "prefill: the DFlash2 tap staging is smaller than the super-chunk's tapped rows"; return false; }
                 m.R = lb.r_dev ? lb.R + t0 * D : r_buf(c);
                 if (lb.r_dev && l == LB && LB > 0 &&
                     !strata::gpu::copy_async(m.R, lb.R_in + (size_t) t0 * D, (size_t) T * D * 4, cs)) {
@@ -5240,7 +5254,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     // the DFlash2 tap of layer l - 1: its completed output, the mean of the streams
                     if (tap_rows > 0 && l - 1 < (int64_t) tap_slot_.size() && tap_slot_[(size_t) (l - 1)] >= 0) {
                         strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D,
-                                                      tap_dev_ + (size_t) tap_slot_[(size_t) (l - 1)] * N,
+                                                      tap_dev_ + ((size_t) tap_off * tap_local_.size() +
+                                                                  (size_t) tap_slot_[(size_t) (l - 1)]) * N,
                                                       (int64_t) tap_local_.size() * N, N, (int) HC, (int) tap_rows, cs);
                     }
                 }
@@ -5286,7 +5301,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             return false;
                         }
                         lm_mid_ = c + 1 < nc;
-                        if (on_taps && tap_rows > 0 && !on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
+                        if (on_taps && tap_rows > 0 &&
+                            !on_taps(tap_dev_ + (size_t) tap_off * tap_local_.size() * N, tap_rows, p0 + tap_t0, err))
+                            return false;
                         if (on_stage_chunk && !lm_mid_ && !on_stage_chunk(p0 + T, err)) return false;
                         if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
                     }

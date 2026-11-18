@@ -7,6 +7,7 @@
 #include "strata/kernels/i8_gemm.hpp"
 
 #include "strata/core/per_device.hpp"
+#include "strata/core/graph.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/platform/downgrade.hpp"
@@ -269,7 +270,10 @@ const int8_t* kitchen_tiles(sycl::queue& q, const int8_t* X, int64_t T, int64_t 
         Buf& b = bufs[q.get_device()];
         if (b.bytes < need) {
             q.wait();   // the products that read the old buffer
-            if (b.p != nullptr) sycl::free(b.p, q);
+            if (b.p != nullptr) {
+                core::graph_epoch_bump();
+                sycl::free(b.p, q);
+            }
             b.p = sycl::malloc_device<int8_t>(need, q);
             b.bytes = b.p != nullptr ? need : 0;
         }

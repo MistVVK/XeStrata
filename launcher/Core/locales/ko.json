@@ -169,6 +169,7 @@
  "setup.image-gpu-policy.label": "이미지를 만드는 동안의 텍스트 모델",
  "setup.image-gpu.choice.auto": "자동: 텍스트 모델이 쓰지 않는 GPU, 없으면 텍스트 모델의 GPU",
  "setup.image-gpu.choice.same": "텍스트 모델의 GPU",
+ "setup.image-lora-training.label": "LoRA 학습용 기반 모델도 준비",
  "setup.image-gpu.label": "이미지를 만드는 GPU",
  "setup.image-sam3-license.about": "라이선스: {license}",
  "setup.image-sam3-license.label": "Meta의 SAM License에 동의하여 SAM 3.1이 말로 그림의 일부를 찾게 하기(find_region, edit_region). 동의하지 않으면 Florence-2(MIT)가 찾음",

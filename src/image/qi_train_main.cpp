@@ -4,15 +4,16 @@
 //
 //   strata-image-qi-train train --dit <F16 GGUF> --data <items file> --out <prefix> [--rank 32] [--steps 3000]
 //                               [--lr 1e-4] [--seed 42] [--draw balanced|content|style] [--save-every 250]
-//                               [--caption-dropout 0.05] [--base bf16|int8] [--train-blocks 0-5,10]
+//                               [--caption-dropout 0] [--base bf16|int8] [--train-blocks 0-5,10]
 //                               [--only-if-contains attn] [--ignore-if-contains img_mlp] [--kind character|style|other]
 //   strata-image-qi-train check --dit <F16 GGUF> --dir <dir> [--blocks N] [--base bf16|int8]
 //
 // The caches the trainer reads are ai-toolkit's, made before it trains by tools/image/mf_pre.py --cache qi (the list's
 // images through the VAE, its prompts through the text encoder; the reader is train_sample.hpp).
 //
-// train reads an items file, a line "<latent cache> <states cache>" each and a first line "empty <states cache>" (the
-// caption " " the dropout swaps in), and runs ai-toolkit's loop: each epoch the items in a new order, a caption
+// train reads a tab-separated items file, a line "<latent cache>\t<states cache>" each and a first line
+// "empty\t<states cache>" (the caption " " the dropout swaps in), and runs ai-toolkit's loop: each epoch the items in
+// a new order, a caption
 // dropped with its probability, a posterior draw of the latent and new noise, the schedule's index drawn, one step
 // and the clipped AdamW update; the LoRA saved every --save-every steps and at the end (<prefix>_<step>.safetensors).
 //
@@ -53,7 +54,7 @@ void usage() {
                  "usage: xestrata-image-qi-train train --dit <gguf> --data <items> --out <prefix> [--rank N] "
                  "[--steps N] [--lr F] [--seed N] [--draw balanced|content|style] [--save-every N] "
                  "[--caption-dropout F] [--base bf16|int8] [--train-blocks LIST] [--only-if-contains PARTS] "
-                 "[--ignore-if-contains PARTS] [--kind character|style|other] [--vram-budget MIB] "
+                 "[--ignore-if-contains PARTS] [--kind character|style|other] [--trigger PHRASE] [--vram-budget MIB] "
                  "[--vram-control FILE] [--state FILE] [--resume FILE]\n"
                  "       xestrata-image-qi-train check --dit <gguf> --dir <dir> [--blocks N] [--base bf16|int8]\n");
 }
@@ -98,7 +99,8 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     const int64_t rank = std::stoll(opt(f, "rank", "32")), steps = std::stoll(opt(f, "steps", "3000"));
     const int64_t save_every = std::stoll(opt(f, "save-every", "250"));
     const uint64_t seed = std::stoull(opt(f, "seed", "42"));
-    const float dropout = std::stof(opt(f, "caption-dropout", "0.05"));
+    const std::string dropout_arg = opt(f, "caption-dropout", "");
+    const float dropout = dropout_arg.empty() ? train::caption_dropout : std::stof(dropout_arg);
     train::AdamW o;
     o.lr = std::stof(opt(f, "lr", "1e-4"));
     train::IndexDraw draw;
@@ -134,9 +136,11 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
         return text_of[path] = tr.add_text(st, n);
     };
     for (std::string line; std::getline(items, line);) {
+        // tab-separated: a cache path can hold spaces, never a tab.  A file written on Windows has CRLF lines.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         std::istringstream ls(line);
         std::string a, b;
-        if (!(ls >> a >> b)) continue;
+        if (!std::getline(ls, a, '\t') || !std::getline(ls, b, '\t')) continue;
         if (a == "empty") empty = text(b);
         else all.push_back({qi_train_latent(a), text(b)});
     }
@@ -174,6 +178,7 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     co.initial = train::initial_vram("qwen-image-2.1", base, max_hw + max_text_rows, rank);
     train::Control ctl(tr.base(), co);
     ctl.load(opt(f, "resume", ""), load_loop);
+    train::log_training_plan(tr.base(), o.lr);
     ctl.report();
     const int64_t start_step = done + 1;
     std::map<std::pair<int64_t, int64_t>, train::Schedule> sched;
@@ -210,8 +215,8 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         const double own = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
         std::printf("step %lld loss %.5f (avg %.5f) t %.1f grad %.3f %lldx%lld %.2f s (%.2f s/step)\n",
-                    (long long) step, (double) loss, loss_avg, (double) timestep, norm, (long long) (w * 16),
-                    (long long) (h * 16), own, secs / (double) (step - start_step + 1));
+                    (long long) step, (double) loss, loss_avg, (double) timestep, norm, (long long) w * 16,
+                    (long long) h * 16, own, secs / (double) (step - start_step + 1));
         std::fflush(stdout);
         ctl.report();
         if ((save_every > 0 && step % save_every == 0) || step == steps) {
@@ -226,12 +231,16 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
             meta.max_steps = steps;
             meta.seed = seed;
             meta.kind = kind;
+            meta.trigger = opt(f, "trigger", "");
             meta.targets = targets.text();
             meta.extra = {{"ss_content_or_style", opt(f, "draw", "balanced")}};
             tr.save(path, train::lora_meta(meta));
             std::printf("saved %s\n", path.c_str());
         }
+        ctl.progress(step, steps, loss);
+        done = step;
     }
+    ctl.save(save_loop);
     return 0;
 }
 

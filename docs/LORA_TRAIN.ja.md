@@ -282,6 +282,7 @@ DiffSynth-Studio `543bf84`（Qwen-Image-2.1 の副参照）は別作りです。
 
 `tools/image/lora_caption.py` が、学習画像のキャプションをチャットのモデル（画像を読めるもの）に書かせ、画像の隣に `NN.txt`（`<トリガー語>, <説明>` の 1 行）を置きます。
 キャプションの書き方はスキル `serve/skills/lora-caption` で、上の方針と同じ考えです: キャラクターの LoRA は、キャラクター自身の見た目（`--keep` で渡す）を書かず、服・ポーズ・背景・構図と**絵の画風（媒体・塗り・線・質感・作者の画風）を必ず書きます**。書いた語はその語に結び付くので、画風がトリガー語に付きません。画風の LoRA は逆に、画風を書かず中身を書きます。
+画像ごとの題名やメモは、画像と同じ名前の `NN.json` に `{"note": "..."}` と書くか、画面の画像メモ欄に入れます。キャプションを付けるときに画像と一緒に読み手へ渡します。画風用は、学習する画風の名前や特徴を画面の任意欄か `--style-words "語1, 語2"` に入れられます。スキルにある一般の技法・画材・質感の語とその欄の語は、文末の画風だけを表す節から後処理で外します。中身の中にある同じ語は残します。画像の形や文字・署名・印は中身として残します。文字の読みや収蔵の書き込み・印は書きません。自動の説明は画像と照らして直してください。
 書き方は学習する模型のプロンプトの形に合わせます（`--style booru` は Anima と MageTrail の Danbooru のタグ、`natural` はほかの模型の英文。`--model-skill` で模型のスキルも足す）。すでにある `.txt` は `--overwrite` が無ければ残します。
 
 ```sh
@@ -342,15 +343,19 @@ SSD の段は後（v1 に入れない）。
           save_state true = 次のマイクロステップの境で状態を書いてから一時停止（カードを移る・完全に止まる準備）
           stop true = 次の境で通常終了（save_state も true なら状態を先に保存）
 stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib= resident=k/nb tapes=k inputs=... free_mib= gpu_peak_mib= process_mib= process_source= min_source= need_mib= raw_min_mib= raw_min_source=]
+          progress step=<更新数> total=<更新の総数> loss=<損失>
           state saved <path>
 ```
 
-- `vram` 行は step の境で、欄が変わったら出す。先頭 4 欄と `need_mib` を serve が読む。
+- `progress` 行は各更新とその checkpoint の保存の後に出す。serve は人向けの step 行でなくこの行を進捗に使う。
+- `vram` 行は step の境で、欄が変わったら出す。先頭 4 欄と `need_mib`・`process_mib`・`process_source` を serve が読む。
   `used` は学習器の確保の帳簿、`free_mib` は装置の報告（一時停止の後もランタイムが持つ分が見える）。
   `gpu_peak_mib` はプロセス起動後の GPU 確保の帳簿の最大（MiB に切り上げ）。ランタイム自身の確保は含まない。
   `process_mib` はランタイムを含む使用量、`process_source` は `fdinfo`（Linux DRM の自プロセス）、
   `nvml`（NVIDIA ドライバーの自プロセス）、`delta`（装置の空きの差）、`global`（装置全体の保守的な値）。
   差の測定には他プロセスの増減が混ざり得る。測り始める前のランタイムの確保は含まない。
+  serve は Linux で自プロセスを読める場合、装置の空きの前後に使用量を読み、小さい方を足す。読めない場合は
+  予算を下げる前に空き不足を 2 回確かめる（チャット・画像の仕事が来たときは待たない）。
   `min` は常駐 0・tape 0・入力ホスト退避の形の見積もり、`peak_est` は次の step のピークの見積もり。
   `min_source=estimate` は測定表からの見積もり、`step` は後向きの作業領域を持つ時点の使用量から返せる分を
   引いた値。`raw_min_mib` は表を足す前の値で、`raw_min_source` は `floor` または `step`。
@@ -374,6 +379,30 @@ stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib=
 しない（チャットが空いている間だけ閉じて使うか、helper と予算で分け合う）。カードを移るのは、測った値
 （状態の読み直しと重みの読み直しの時間・チャットの残り）が移る方を安いと示すときだけ（測った値が無い間は移らない）。
 帯域と計算の測りは `xestrata-device --bench`（1 枚ずつ。装置ごとのキャッシュに置く）。
+
+## ブラウザからの作成
+
+CLI の前処理と学習器を、Web のチャットから最後まで使えるようにしたものです（`serve/lora_train.py`・`serve/web/app.js` の作成パネル）。
+
+キャラ・画風の呼び出し語には、実在する語や画家・キャラの名前ではなく、短い無意味な語を使います。画面は候補を作り、変更もできます。学習前に LoRA なし・同じ seed で、候補の語ありとなしの画像を 1〜2 組比べ、語だけで題材や画風が変わるなら別の語にします。版画の比較では、画家名は土台だけで時代を変え、キャラを消しました。無意味な語ではキャラが残りました。
+
+Qwen-Image-2.1 のキャラ学習の既定は 8〜15 層・1500 更新です。場面やポーズを保ちやすくなります。キャラを絵柄ごと強く運びたいときは、学習層の欄を空にして全層を学習できます。適用は全層でキャラ 1.0、写真では 1.4 を目安にします。画風と重ねるときは、キャラ 1.0・画風 1.0 を目安に、合わなければ画風を 0.8〜1.2 で調整します。これらは Qwen-Image-2.1 Turbo のキャラ 1 種・seed 7 と 8 で見た結果で、他のキャラにも合うとは限りません。画風を強くすると文字や印が出ることがあります。negative prompt に `no text, no seal` を入れるか強さを下げます。Qwen-Image-2.1 Turbo の CFG 1 では negative prompt は効かず、CFG を上げても印が必ず消えるわけではありません。
+
+学習の既定は caption dropout 0 です。ブラウザの設定や CLI の `--caption-dropout` で変更できます。Mage-Flow の CLI は指定がなければ、前処理の manifest にある画像ごとの値（前処理の既定は 0）を使います。ほかの模型やデータでも 0 が最適とは限りません。
+
+学習の土台は setup の `--images qwen-image-turbo --image-lora-training` のように用意します。画像モデルを複数選ぶと、それぞれの土台を取得します。対話とランチャーでも同じ選択ができます。指定しなければ学習用の追加ダウンロードはありません。
+
+蒸留モデルは学習の一覧に出ません。Qwen-Image-2.1 Turbo は Qwen-Image-2.1 の F16、Mage-Flow Turbo は `mage-flow`（RL）、MOSS-Image 4-step は `moss-image`（SFT）、Anima Turbo は `anima-base` を使います。Anima Base は作者の学習向けの選択であり、Turbo の教師と断定するものではありません。MageTrail は独立して学習し、Mage-Flow の LoRA との互換性は未検証です。蒸留モデルを API やチャットで指定すると土台に切り替え、その事実を返します。できた LoRA は対応する蒸留モデルにも使えます。
+
+- チャットで「この子の LoRA を作りたい」と言うと、モデルがスキル `lora-train` を読み、道具 `train_lora` を呼びます。チャットの中に作成画面が出ます（Images タブの LoRA の節の「LoRA を学習…」からも開けます）。
+- 画面の流れ: 画像を入れる（ドラッグ＆ドロップ・複数・このチャットの画像も選べる）→ 種類（character・style・other）・名前・呼び出し語・模型を選ぶ → キャプションを自動で付けて（`tools/image/lora_caption.py`。チャットの画像を読める模型が書く。[キャプションの方針](#キャプションの方針)どおり）画面で直す → 設定（既定はプリセット。最大 step 数 n・何 step ごとに版を保存するか k・rank・lr・seed・層の絞り・見本の prompt。詳しい設定は畳む）→ 開始。
+- 仕事はデータフォルダの `lora-jobs/<id>/` に状態を持ち（`record.json`）、同時に 1 つだけ回ります。段は 前処理（`mf_pre.py`・`mf_pre_export.py`）→ 学習（学習器のサブプロセス）→ 見本（版ごとに同じ seed・同じ prompt で生成）→ 版の選択。serve を立て直すと途中の仕事は `interrupted` になり、再開で未完了の段からやり直せます（前処理はキャッシュが揃っていれば飛ばす）。取り消しはサブプロセスを止め、それまでに保存した版を残します。
+- 正常終了時は最新の LoRA・最適化器・乱数とデータ順の状態を `state.bin` に保存します。版の選択画面で新しい最大 step を指定すると、この状態から続けられます。状態は最後の時点だけで、途中の各版には付きません。rank 32 の Qwen-Image-2.1 の全層では約 1.19 GiB で、模型・rank・対象の層によって変わります。更新時は前の状態を守るため、同じ大きさの一時ファイルを置く空きも必要です。
+- 版は k ごとと最後に出ます（学習器の `--save-every` / `--checkpoint`。模型ごとの引数の違いは `serve/lora_train.py` の TRAINERS 表 1 か所が写す）。画面は版ごとの見本を並べて見比べ、選んだ版（選ばなければ最後）を LoRA の一覧に登録します（`serve/loras.py` の add。metadata の `ss_steps`・`ss_xestrata_kind`・`modelspec.trigger_phrase` は学習器が書いたまま）。登録した LoRA はすぐチャットの生成で使えます。選ばれなかった版は消せます。一覧の項目に `steps`（`ss_steps`。保存までの step）が加わります。
+- GPU の譲り合い: 学習は一番低い優先度で、LLM と同じ VRAM の帳簿（`serve/vram_ledger.py`）で分け合います。チャット中は LLM が先で学習は残りの予算で遅く回り、画像の仕事が来たら学習は縮むか step の境で一時停止して先に通します（マイクロステップの境と、必要なら状態の保存と解放を待つ）。チャットが空いたら学習は広がります。置き場所と予算の決め手は `serve/train_budget.py`（装置の報告と測った値から。模型名・機種名では決めない）。学習器は予算（MiB）を制御ファイルで受け、step の境で縮む・広がる・止まる（`--vram-budget`・`--vram-control`・`--state`・`--resume`）。キャプション付けは学習の前（チャットの模型）、見本は学習の後（GPU が空いてから）に作ります。
+- 学習画像の大きさの上限は 512・768・1024 から選びます（既定 1024）。前処理はその上限以下のサイズでキャッシュを作り、実際のキャッシュの最大の形と rank から VRAM の必要量を決めます。
+- 上限: 画像 200 枚・1 枚 32 MiB・データセット 2 GiB。n は 1〜100000・k は 1〜n・rank は 1〜256。仕事フォルダの外へは書きません。
+- API: `/v1/lora/models`・`/v1/lora/jobs`（POST は multipart の画像と欄）・`/v1/lora/jobs/<id>`（record）・`.../images`・`.../captions`（PUT）・`.../caption`・`.../start`・`.../cancel`・`.../resume`・`.../register`・`.../versions/<step>`（DELETE）・`.../images|samples/<file>`（GET）。
 
 ## 確かめの手順
 

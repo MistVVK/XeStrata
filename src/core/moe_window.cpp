@@ -908,7 +908,7 @@ void MoeWindow::answer(uint32_t want, int grp, int groups, int tb, int n, int64_
     set_plan_slot(grp, groups);
     if (pool != nullptr)
         pool(user, h_x_ + (size_t) tb * sh_.n_embd, h_ids_ + (size_t) tb * sh_.k, n, sh_.k,
-             h_ymiss_ + (size_t) tb * sh_.k * sh_.n_embd, layer);
+             h_ymiss_ + (size_t) tb * sh_.k * sh_.n_embd, tb, layer);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
     if (*(volatile uint32_t*) h_flagA_ != want) {   // the pool did not publish a plan: an empty one

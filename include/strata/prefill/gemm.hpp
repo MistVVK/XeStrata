@@ -129,6 +129,8 @@ public:
     /// The path the products take on the current GPU, for the startup report: "oneMath", or the own kernels'
     /// (kernels::gemm_path).
     static const char* path();
+    /// Training logs each distinct product shape and the path it actually takes.
+    static void trace_training();
 
     /// Caller-owned buffer only: the scratch moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems);

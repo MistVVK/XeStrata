@@ -544,8 +544,7 @@ struct Options {
     /// 553b0b78): 1 = a prompt's
     /// short reads through the verify windows run with the stages overlapped (stage 0 reads window K+1 while stage 1
     /// reads window K); 2 = the decode windows too: stage 0 runs window K+1 speculatively while stage 1 verifies
-    /// window K (rolled back when K is not accepted as guessed).  0 = off (the stages take turns).  -1 (not given):
-    /// 2 for a split of exactly two Xe2 GPUs with --serve and the MTP drafter (upstream a6fd78856), else 0.
+    /// window K (rolled back when K is not accepted as guessed).  0 = off (the stages take turns); the default is 0.
     int pipeline_windows = -1;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
@@ -826,8 +825,7 @@ void usage() {
                  "  --batch-groups G|auto  with a layer split: the --batch slots in G groups pipelined through the\n"
                  "                       GPUs (each GPU on another group at once; G divides N; 1 = one window, GPU\n"
                  "                       after GPU); auto, the default with a layer split: one group per GPU\n"
-                 "  --pipeline-windows N --serve with a layer split on 2+ GPUs (default 2 on two Xe2 GPUs with the MTP\n"
-                 "                       drafter, else 0): one conversation's windows\n"
+                 "  --pipeline-windows N --serve with a layer split on 2+ GPUs (default 0): one conversation's windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
                  "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTIGPU.md\n"
                  "  --batch-cpu-split N0,N1  EXPERIMENTAL, with --batch-groups over two GPUs: the CPU expert workers\n"
@@ -953,9 +951,10 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
 
 /// Plan v0.3 P6: the pool for a verify window.
 void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+                      int64_t tb, int64_t layer) {
     Drive* t = (Drive*) user;
     t->d.layers = layer;
+    t->d.lat_tb = tb;
     const Clock::time_point a = Clock::now();
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
@@ -993,7 +992,7 @@ struct SplitDrive {
     const uint8_t* lat_act0[kMax] = {};           ///< its q8_0 activation rows
 };
 void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+                      int64_t tb, int64_t layer) {
     SplitDrive* s = (SplitDrive*) user;
     int st = 0;
     while (st + 1 < s->n && layer >= s->end[st]) ++st;
@@ -1005,7 +1004,7 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     d.d.lat_xl = s->lat_xl[st];
     d.d.lat_xlseq = s->lat_xlseq[st];
     d.d.lat_act0 = s->lat_act0[st];
-    drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
+    drive_pool_multi(s->base, x_f, ids, n_tok, k, out, tb, layer);
 }
 
 /// Layer split across GPUs: a later stage on its own device, with its own copy of the dense weights, a session, an
@@ -2849,33 +2848,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "xestrata generate: layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)\n",
                      split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
     }
-    // --pipeline-windows: one conversation's windows with the stages of a layer split overlapped.  Decided
-    // here, before any stage sizes its expert cache (the second verifier per stage and the snapshots are allocated
-    // after the caches, so their room is kept out of them).  What it does not support turns it off, said once.
-    // Not given: 2 for a split of exactly two GPUs that both report the Xe2 (Battlemage) architecture, with --serve and
-    // the MTP drafter, no --batch and no helper caches (upstream a6fd78856: on two Arc Pro B65 decode +17 to +28% over
-    // the serial windows, a 1 h serve of 1,082 requests with no token differences; not measured on XeStrata, which has
-    // no such pair).  Anything else stays serial and says nothing; --pipeline-windows 0 or STRATA_PIPELINE_AUTO=0 keeps
-    // it off.
-    if (o.pipeline_windows < 0) {
-        const char* ae = strata::env_get("PIPELINE_AUTO");
-        const auto xe2 = [](int d) {
-            namespace syclex = sycl::ext::oneapi::experimental;
-            try {
-                const auto a = strata::core::Runtime::at(d).device().get_info<syclex::info::device::architecture>();
-                return a == syclex::architecture::intel_gpu_bmg_g21 || a == syclex::architecture::intel_gpu_bmg_g31;
-            } catch (const std::exception&) {
-                return false;
-            }
-        };
-        const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
-        const bool on = o.serve && multi_gpu && split_devs.size() == 1 && !(ae != nullptr && std::strtol(ae, nullptr, 10) == 0) &&
-                        !o.mtp.empty() && o.spec >= 2 && o.batch == 0 && !helpers && xe2(0) && xe2(split_devs[0]);
-        o.pipeline_windows = on ? 2 : 0;
-        if (on)
-            std::fprintf(stderr, "xestrata generate: --pipeline-windows 2 is on by default for a layer split across two Xe2 "
-                                 "GPUs (--pipeline-windows 0 or XESTRATA_PIPELINE_AUTO=0 turns it off)\n");
-    }
+    // Unmeasured devices stay serial: a device model alone does not establish that pipelining is safe or faster.
+    // On a B70, work queued behind a waiting window has previously stalled.
+    if (o.pipeline_windows < 0) o.pipeline_windows = 0;
     if (o.pipeline_windows > 0) {
         const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
         const char* off = !o.serve ? "it needs --serve"
@@ -3915,7 +3890,7 @@ int main(int argc, char** argv) {
         // against the split, and either against CUDA0 alone (below)
         const char* gain_env = strata::env_get("SPLIT_GAIN_PCT");
         const double gain = (gain_env != nullptr ? std::strtod(gain_env, nullptr) : 5.0) / 100.0;
-        if (o.split_roles_helper) o.pipeline_windows = 0;   // a split's own (its 2 for two Xe2 GPUs, above)
+        if (o.split_roles_helper) o.pipeline_windows = 0;   // a split's own
         const bool skip_fits = o.split_skip_if_fits && alone_holds_all && role.empty();
         // two GPUs only, with the expert pool (the helper's rows are the pool's), without --pipeline-windows (a
         // split's own) and without --batch slots (their groups run one a GPU on a split; the helper was not tried
@@ -4006,7 +3981,7 @@ int main(int argc, char** argv) {
             split_devs.clear();
             split_at.clear();
             o.layer_split.clear();
-            o.pipeline_windows = 0;   // a split's own (its 2 for two Xe2 GPUs, above)
+            o.pipeline_windows = 0;   // a split's own
             multi_gpu = false;
         } else if (choice.role == strata::core::SplitRole::Helper) {
             o.expert_cache_remote[0] = (int) hc.held;
@@ -4888,7 +4863,10 @@ int main(int argc, char** argv) {
         if (o.draft == "dflash2") o.draft = "mtp";
     }
     if (want_df2)
-        df2.set_capacity_rows(o.spec >= strata::kernels::kWindowMaxT &&
+        // the capacity holds the accepted rows a window passes as context (draft, context_async): a lookup window
+        // (--suffix-draft, --lookup-chain) may accept up to --spec rows, which the suffix rule raises by 2, so any
+        // spec past the narrow window needs the wide capacity, not only spec 16
+        df2.set_capacity_rows(o.spec > strata::kernels::kVerifyNarrowT &&
                               strata::core::window_rows_cap() >= strata::kernels::kWindowMaxT
                                   ? strata::kernels::kWindowMaxT : strata::kernels::kVerifyNarrowT);
     // auto without --serve: the MTP (the start's measurement runs in --serve, before its first request)
@@ -9689,8 +9667,10 @@ int main(int argc, char** argv) {
                 if (strata::core::wide_window() == strata::core::WideWindow::Auto) block_selected = v.df2_block;
                 strata::spec::Drafter keep = v.keep;
                 // DFlash2 keeps the VRAM it took from the reserve: only where the reserve the engine started with is
-                // still free beside it (a long prompt's buffers come out of the reserve)
-                if (keep == strata::spec::Drafter::Df2 &&
+                // still free beside it (a long prompt's buffers come out of the reserve).  Not --draft dflash2's: it
+                // was loaded before the cache, which was sized around it, so it took nothing from the reserve;
+                // dropped, the run had no drafter at all (the plain engine's same rule, 2026-11-15)
+                if (keep == strata::spec::Drafter::Df2 && df2_deferred &&
                     free_during < (long long) o.vram_reserve_mib) {
                     std::fprintf(stderr, "xestrata serve: DFlash2 is not kept: with it %lld MiB of VRAM stay free, less "
                                          "than the %d MiB reserve: the MTP drafts\n", free_during, o.vram_reserve_mib);
@@ -13798,16 +13778,22 @@ int main(int argc, char** argv) {
                         drafts[(size_t) i] = dd[i];
                         dprob[(size_t) i] = pp[i];
                     }
-                    df2.note_rows(outv.data(), a + 1, p);
+                    // the committed rows are the window's inputs: position p + i holds window[i] (outv[i] is the
+                    // token of p + i + 1, the next row)
+                    df2.note_rows(window.data(), a + 1, p);
                 } else if (!drafted && req_mtp) {
                     drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_more);
                     // --draft auto: keep the idle DFlash2 ring current with this window's accepted rows (not in the
                     // start's measurement: its MTP arm is timed as the MTP alone runs)
                     if (drafted && df2_loaded && !req_df2 && req_probe == -2) {
-                        if (df2.context_async(ver.tap_dev(), a + 1, p, err)) df2.note_rows(outv.data(), a + 1, p);
+                        if (df2.context_async(ver.tap_dev(), a + 1, p, err)) df2.note_rows(window.data(), a + 1, p);
                     }
                 } else if (!drafted) {
                     drafted = true;
+                } else if (df2_loaded && (req_df2 || req_probe == -2)) {
+                    // the request's last window (stop or length): no draft follows it, but its committed rows are
+                    // the next turn's history - note them as plain's loop does, with their context for the log
+                    if (df2.context_async(ver.tap_dev(), a + 1, p, err)) df2.note_rows(window.data(), a + 1, p);
                 }
                 {
                     const Clock::time_point tw3 = Clock::now();
@@ -15185,7 +15171,7 @@ int main(int argc, char** argv) {
                     drafts[(size_t) i] = dd[i];
                     dprob[(size_t) i] = pp[i];
                 }
-                df2.note_rows(outv.data(), a + 1, p);
+                df2.note_rows(window.data(), a + 1, p);
             } else if (!drafted && use_mtp) {
                 drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_more);
             } else if (!drafted) {

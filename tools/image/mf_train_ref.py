@@ -310,6 +310,24 @@ def case_lora(d: Path, r: np.random.Generator):
             "dA": (dh.T @ (x16.astype(np.float64) * xr[:, None])).astype(np.float32).ravel()}
 
 
+def case_lora_zero_rows(d: Path, r: np.random.Generator):
+    """Zero and small gradient rows together: zero rows must not set the transposed product's FP16 scale."""
+    case_lora(d, r)
+    dy = (r.standard_normal((96, 64)) * 1e-7).astype(np.float32)
+    dy[:24] = 0
+    save(d, "dY", dy)
+    h = load(d, "h16").astype(np.float64) * load(d, "hr").astype(np.float64)[:, None]
+    return {"dB": (float(load(d, "scale")[0]) * dy.astype(np.float64).T @ h).astype(np.float32).ravel()}
+
+
+def case_lora_zero(d: Path, r: np.random.Generator):
+    """All gradient rows zero: both backward paths return finite zeros."""
+    case_lora(d, r)
+    save(d, "dY", np.zeros((96, 64), np.float32))
+    return {"dh": np.zeros(96 * 8, np.float32), "dB": np.zeros(64 * 8, np.float32),
+            "dA": np.zeros(8 * 48, np.float32)}
+
+
 def case_lokr(d: Path, r: np.random.Generator):
     """A LoKr's factors: the delta is kron(w1, w2_a w2_b) over a (out_l out_k) x (in_m in_n) weight, so each factor is
     read through the whole delta's gradient by its partial trace, and w2 splits as a product does."""
@@ -357,7 +375,8 @@ CASES = {"lnmod": case_lnmod, "gelu": case_gelu, "silu": case_silu, "gate": case
          "flow": case_flow, "products": case_products, "productsreal": case_productsreal,
          "attn": case_attn, "attnreal": case_attnreal,
          "rows16": case_rows16,
-         "qkrope": case_qkrope, "lora": case_lora, "lokr": case_lokr, "dora": case_dora}
+         "qkrope": case_qkrope, "lora": case_lora, "lora_zero_rows": case_lora_zero_rows,
+         "lora_zero": case_lora_zero, "lokr": case_lokr, "dora": case_dora}
 # the probe calls of each case: (op, its output files)
 RUNS = {"lnmod": [("lnmod", ["dx", "dshift", "dscale"])], "gelu": [("gelu", ["d"])], "silu": [("silu", ["d"])],
         "gate": [("gate", ["dh", "dgate"])], "patch": [("patch", ["dm", "dmean", "dsd"])],
@@ -368,12 +387,15 @@ RUNS = {"lnmod": [("lnmod", ["dx", "dshift", "dscale"])], "gelu": [("gelu", ["d"
         "attnreal": [("attnf", ["o16", "o32", "lse"]), ("attnb", ["dQ", "dK", "dV"])],
         "rows16": [("rows16", ["rs", "y16"])],
         "qkrope": [("qkrope", ["dq", "dk", "wqn", "wkn"])],
-        "lora": [("lora", ["dh", "dB", "dA"])], "lokr": [("lokr", ["dw1", "dw2"]), ("lokrf", ["dw2a", "dw2b"])],
+        "lora": [("lora", ["dh", "dB", "dA"])], "lora_zero_rows": [("lora", ["dB"])],
+        "lora_zero": [("lora", ["dh", "dB", "dA"])],
+        "lokr": [("lokr", ["dw1", "dw2"]), ("lokrf", ["dw2a", "dw2b"])],
         "dora": [("dora", ["dm", "da", "db"])]}
 # the attention is the shared FP16 kernel (kernels::flash_attn, inference's) and its backward the shared FP16
 # products: P and dS are rounded to FP16 once each, so its gradients and its FP32 output carry FP16's own error
 # (dQ, dK, dV 2.7-3.4e-4 and o32 2.4e-4 measured on the B70, 2026-11-09)
-TOL = {"lora": 5e-4, "lokr": 1e-5, "dora": 1e-6, "qkrope": 2e-4, "attn": 5e-4, "attnreal": 5e-4,
+TOL = {"lora": 5e-4, "lora_zero_rows": 5e-4, "lora_zero": 0.0, "lokr": 1e-5, "dora": 1e-6, "qkrope": 2e-4,
+       "attn": 5e-4, "attnreal": 5e-4,
        "rows16": 1e-3, "lnmod": 2e-5, "gelu": 5e-5, "silu": 5e-5, "gate": 2e-5, "patch": 1e-6, "flow": 1e-5,
        "products": 3e-3, "productsreal": 3e-3}
 
@@ -410,18 +432,34 @@ def main() -> int:
         d.mkdir(parents=True, exist_ok=True)
         want = CASES[name](d, np.random.default_rng(20261103))
         for cmd, outs in RUNS[name]:
-            out = subprocess.run([a.probe, cmd, str(d)], capture_output=True, text=True, env=env)
-            if out.returncode != 0:
-                print(f"{name} {cmd:7} FAILED to run: {out.stderr.strip()}", flush=True)
-                bad += 1
-                continue
-            for o in outs:
-                e = rel(load(d, o), want[o])
-                ok = e <= tol_out.get((name, o), TOL[name])
-                bad += 0 if ok else 1
-                print(f"{name:9} {cmd:7} {o:7} rel {e:.2e} (tol {tol_out.get((name, o), TOL[name]):.0e}) "
-                      f"{'ok' if ok else 'FAIL'}",
-                      flush=True)
+            modes = ("auto", "own") if name in ("lora_zero_rows", "lora_zero") else ("",)
+            for mode in modes:
+                run_env = env.copy()
+                if mode:
+                    run_env["XESTRATA_BLAS"] = "0"
+                    run_env["XESTRATA_NO_BLAS"] = "1" if mode == "own" else "0"
+                out = subprocess.run([a.probe, cmd, str(d)], capture_output=True, text=True, env=run_env)
+                if out.returncode != 0:
+                    print(f"{name} {cmd:7} {mode} FAILED to run: {out.stderr.strip()}", flush=True)
+                    bad += 1
+                    continue
+                if mode:
+                    used_library = any("f16-batch-ex-tn" in line and "path=oneMath" in line
+                                       for line in out.stderr.splitlines())
+                    path = "transposed oneMath" if used_library else "own"
+                    print(f"{name} {mode}: {path}", flush=True)
+                    if mode == "own" and used_library:
+                        print(f"{name}: own mode used oneMath: FAIL", flush=True)
+                        bad += 1
+                for o in outs:
+                    got = load(d, o)
+                    e = rel(got, want[o])
+                    ok = np.isfinite(got).all() and e <= tol_out.get((name, o), TOL[name])
+                    if name == "lora_zero":
+                        ok = ok and np.all(got == 0)
+                    bad += 0 if ok else 1
+                    print(f"{name:9} {cmd:7} {mode:4} {o:7} rel {e:.2e} "
+                          f"(tol {tol_out.get((name, o), TOL[name]):.0e}) {'ok' if ok else 'FAIL'}", flush=True)
     print(f"mf_train_ref: {bad} over tolerance")
     return bad
 

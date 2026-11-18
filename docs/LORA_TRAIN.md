@@ -310,6 +310,7 @@ read both folders:
 
 `tools/image/lora_caption.py` has the chat's model (one that reads images) caption the training images, and puts `NN.txt` (one line, `<trigger word>, <description>`) beside each image.
 The captions follow the skill `serve/skills/lora-caption`, the policy above: a character LoRA's caption leaves out the character's own look (given as `--keep`) and writes the clothes, the pose, the background, the framing and **the picture's style (medium, coloring, line, texture, an artist's style) every time**. A word written is learned with that word, so the style is not learned with the trigger. A style LoRA's is the other way round: the style left out, what the picture shows written.
+For a picture’s title or note, put `{"note": "..."}` in `NN.json` beside it, or enter the note in the panel. The reader receives the note with that picture. For a style LoRA, the optional panel field or `--style-words "word1, word2"` names the style and its features. Postprocessing removes those words and the skill’s general technique, medium and texture words from style-only clauses at the end. The same words inside the subject stay. A visible shape, text, signature or seal stays as content. Text is not transcribed, and museum marks and seals are left out. Check and edit the automatic descriptions against the pictures.
 They are written as the trained model reads a prompt (`--style booru`: Anima's and MageTrail's Danbooru tags; `natural`: the other models' English sentences; `--model-skill` adds the model's own skill). A `.txt` already there is kept unless `--overwrite`.
 
 ```sh
@@ -374,16 +375,20 @@ the control file (serve writes it atomically, tmp + rename; the trainer reads it
           save_state true = write the state at the next micro-step boundary, then pause (a move, a full stop)
           stop true = exit normally at the next boundary (save the state first if save_state is also true)
 stdout    vram <used_mib> <peak_est_mib> <min_mib> <running|paused> [budget_mib= resident=k/nb tapes=k inputs=... free_mib= gpu_peak_mib= process_mib= process_source= min_source= need_mib= raw_min_mib= raw_min_source=]
+          progress step=<update> total=<updates> loss=<loss>
           state saved <path>
 ```
 
-- The `vram` line comes at a step's boundary when its fields changed. Serve reads the first four fields and `need_mib`
-  (the other key=value extras are for the log and the tests). `used` is the trainer's own accounting; `free_mib` is the
+- The `progress` line comes after each update and its checkpoint. Serve uses it for progress, not the human step line.
+- The `vram` line comes at a step's boundary when its fields changed. Serve reads its first four fields, `need_mib`,
+  `process_mib` and `process_source`. `used` is the trainer's own accounting; `free_mib` is the
   device's report (what the runtime still holds after a pause shows there). `gpu_peak_mib` is the maximum accounted
   GPU allocation since process start, rounded up to MiB; it excludes the runtime's own allocations. `process_mib` includes
   the runtime. `process_source` is `fdinfo` (this Linux DRM process), `nvml` (this NVIDIA driver process), `delta` (the
   device's free-memory difference), or `global` (the conservative device-wide value). The difference can include changes
-  by other processes and excludes runtime allocations made before the first reading. `min` estimates the least form
+  by other processes and excludes runtime allocations made before the first reading. On Linux, serve reads its trainer's
+  process use on both sides of the device's free-memory query and adds the smaller reading. When the process use cannot
+  be read, it confirms a shortage twice before lowering the budget; chat and image work do not wait. `min` estimates the least form
   (no resident block, no tape, the inputs on the host); `peak_est` estimates the next step's peak. `min_source=estimate`
   uses the measurement table; `step` uses the process memory with the backward's buffers still alive, less what can be
   reclaimed. `raw_min_mib` is the value before the table; `raw_min_source` is `floor` or `step`.
@@ -412,6 +417,30 @@ hours (the training uses it closed only while the chat is idle, or shares the bu
 move to another card happens only where measured values (the state's and the weights' reload time, the chat's
 remaining time) show it cheaper (with no measurements it does not move). The bandwidth and compute measurements
 are `xestrata-device --bench` (one card at a time, cached per device).
+
+## Training from the browser
+
+The CLI's preprocess and trainers, usable end to end from the web chat (`serve/lora_train.py`, the panel in `serve/web/app.js`).
+
+For a character or style, use a short invented trigger rather than a real word or an artist's or character's name. The panel suggests one; you can edit it. Before training, compare one or two images with and without the candidate, with no LoRA and the same seed. If the word alone changes the subject or style, choose another. In one print-style comparison, the artist's name changed the era in the base and displaced the character; an invented word kept the character.
+
+Qwen-Image-2.1 character training defaults to blocks 8–15 and 1500 updates. This better preserves the scene and pose. To carry the character more strongly with the training images' style, clear the train-blocks field to train all blocks. Apply the LoRA to all blocks at strength 1.0, or 1.4 for a photo. With a style LoRA, start at character 1.0 and style 1.0; if that does not fit, try style 0.8 to 1.2. These are guides from one character on Qwen-Image-2.1 Turbo, seeds 7 and 8; they may not fit other characters. A strong style can add text or seals. Try `no text, no seal` in the negative prompt or lower the strength. Qwen-Image-2.1 Turbo at CFG 1 does not use the negative prompt; a higher CFG does not guarantee that seals disappear.
+
+Training defaults to caption dropout 0. Change it in the browser's settings or with the CLI's `--caption-dropout`. Without the flag, Mage-Flow's CLI uses each image's rate in the preprocessing manifest (preprocessing defaults to 0). Zero is not necessarily optimal for other models or datasets.
+
+Prepare the training bases with setup, for example `--images qwen-image-turbo --image-lora-training`. With several image models it fetches each one's base. The interactive setup and launcher offer the same choice. Without it there are no extra training downloads.
+
+Distilled models are not in the training list. Qwen-Image-2.1 Turbo uses Qwen-Image-2.1 F16, Mage-Flow Turbo uses `mage-flow` (RL), MOSS-Image 4-step uses `moss-image` (SFT), and Anima Turbo uses `anima-base`. Anima Base is the author's choice for training; it is not claimed to be Turbo's teacher. MageTrail is trained separately; its compatibility with Mage-Flow LoRAs is unverified. An API or chat request for a distilled model switches to its base and reports the switch. The resulting LoRA can also be used with the corresponding distilled model.
+
+- Say "I want a LoRA of this character" in the chat: the model reads the `lora-train` skill and calls `train_lora`. The training panel opens in the chat (the Images view's LoRA section has a "Train a LoRA…" button too).
+- The panel's flow: put the pictures in (drag and drop, several at once, or pick this chat's images) -> choose the kind (character, style, other), the name, the trigger word and the model -> caption them automatically (`tools/image/lora_caption.py`, written by the chat's picture-reading model, per the [caption policy](#the-caption-policy)) and edit them on the panel -> the settings (the preset's defaults: the most steps n, how often a version is saved k, rank, lr, seed, the weights' selection, the sample prompts; the advanced ones fold away) -> start.
+- A job keeps its state in the data folder's `lora-jobs/<id>/` (`record.json`), one job run at a time. The stages: preprocess (`mf_pre.py`, `mf_pre_export.py`) -> train (the trainer as a subprocess) -> samples (a picture of every version, the same seed and prompts) -> picking a version. A server restart leaves a running job `interrupted`; resume re-enters the first stage not done (the preprocess is skipped where its caches are whole). A cancel stops the subprocess and keeps the versions saved so far.
+- On normal completion, `state.bin` saves the latest LoRA, optimizer, random generator and data order. On the version page, set a new total and continue from that state. Only the latest state is kept, not one for every version. A rank-32, all-layer Qwen-Image-2.1 state is about 1.19 GiB; the model, rank and selected layers change its size. Replacing it also needs room for a temporary file of the same size, to keep the old state until the new one is whole.
+- Versions come every k steps and at the end (the trainers' `--save-every` / `--checkpoint`; the TRAINERS table in `serve/lora_train.py` is the one place mapping each model's argument names). The panel shows every version's sample pictures side by side; the picked one (the last by default) is registered into the LoRA listing (`serve/loras.py`'s add; the metadata's `ss_steps`, `ss_xestrata_kind` and `modelspec.trigger_phrase` stay as the trainer wrote them). The registered LoRA is usable in the chat's images at once. The unselected versions can be deleted. The listing's entries carry `steps` (`ss_steps`, the steps up to the save).
+- Sharing the GPU: training is the lowest priority, sharing the LLM's VRAM ledger (`serve/vram_ledger.py`). While the chat is busy the LLM goes first and training runs slower on the remaining budget; when an image job comes, training shrinks or pauses at a step boundary and lets it through (the wait covers the micro-step boundary, and state saving and release when needed). When the chat leaves, training expands. The card and budget decisions are `serve/train_budget.py`'s (from the devices' reports and measured values, never a model or vendor name). The trainer takes its budget (MiB) through a control file and shrinks, expands or pauses at step boundaries (`--vram-budget`, `--vram-control`, `--state`, `--resume`). Captions are written before the training (the chat's model); the samples after it (the GPU free).
+- Choose the maximum training image size: 512, 768 or 1024 (default 1024). Preprocessing builds caches up to that limit; the VRAM requirement uses the largest actual cache shape and the rank.
+- Limits: 200 images, 32 MiB each, 2 GiB a dataset; n 1 to 100000, k 1 to n, rank 1 to 256. Nothing is written outside the job's folder.
+- API: `/v1/lora/models`, `/v1/lora/jobs` (POST: the images and fields as multipart), `/v1/lora/jobs/<id>` (the record), `.../images`, `.../captions` (PUT), `.../caption`, `.../start`, `.../cancel`, `.../resume`, `.../register`, `.../versions/<step>` (DELETE), `.../images|samples/<file>` (GET).
 
 ## The checks
 

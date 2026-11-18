@@ -1900,6 +1900,8 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
     gguf_py = (env or {}).get("XESTRATA_GGUF_PY")
     if gguf_py and not Path(gguf_py).is_dir() and Path(gguf_py).parent == ROOT / "third_party" / "main" / "llama.cpp":
         get_llama_cpp()                                # the preparation tools read GGUF files with it: fetched now
+    env = dict(os.environ if env is None else env)
+    envvars.put_default(env, "EXIT_WITH_PARENT", "1")   # mtp_fetch.py ends with setup (upstream #3257)
     say("  > " + " ".join(str(c) for c in cmd))
     if JSON_OUT and not quiet:                         # the program's lines as log objects, not loose on stdout
         with subprocess.Popen([str(c) for c in cmd], cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -1913,8 +1915,6 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
     r = subprocess.run([str(c) for c in cmd], cwd=cwd, env=env,
                        stdout=subprocess.PIPE if quiet else None, stderr=subprocess.STDOUT if quiet else None,
                        text=True, errors="replace")
-    env = dict(os.environ if env is None else env)
-    envvars.put_default(env, "EXIT_WITH_PARENT", "1")   # mtp_fetch.py ends with setup (upstream #3257)
     if check and r.returncode != 0:
         if quiet and r.stdout:
             say(r.stdout[-4000:])
@@ -5766,12 +5766,19 @@ def import_anima(path: Path, models_dir: Path) -> str:
     if dest.name in reserved or "anima-" + path.stem in {v[0] for v in qi.IMAGE_MODELS.values()}:
         raise ValueError("the name is reserved for an Anima release")
     if dest.resolve() != path:
-        with path.open("rb") as src, dest.open("xb") as out:
-            try:
+        if dest.exists():
+            raise FileExistsError(f"{dest} is already there")
+        tmp = dest.with_name(dest.name + ".part")
+        try:
+            with path.open("rb") as src, tmp.open("xb") as out:
                 shutil.copyfileobj(src, out)
-            except BaseException:
-                dest.unlink()
-                raise
+            os.replace(tmp, dest)                # a half-copied file never appears under the final name
+        except BaseException:
+            try:                                 # after the with: Windows cannot unlink an open file
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
     name = qi.ANIMA_USER + path.stem
     if name not in qi.anima_user_dits(models_dir):
         raise ValueError("the name is reserved for an Anima release")
@@ -5795,7 +5802,8 @@ def ask_images(cfg_path: Path) -> str | None:
     if isinstance(cfg, dict) and isinstance(cfg.get("images"), dict):
         picks = [x.get("setup_choice") or by_name[x["model_name"]]
                  for x in [cfg["images"], *(cfg.get("image_models") or [])]
-                 if isinstance(x, dict) and (x.get("setup_choice") or x.get("model_name") in by_name)]
+                 if isinstance(x, dict) and not x.get("training_base_only")
+                 and (x.get("setup_choice") or x.get("model_name") in by_name)]
     else:
         picks = [] if cfg else list(qi.SETUP_DEFAULT)
     while True:
@@ -5929,6 +5937,9 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
     if not exe.exists():
         fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
     choices = QI.parse_choices(a.images)
+    training = getattr(a, "image_lora_training", None)
+    if training is None and not a.yes and not JSON_OUT:
+        training = ask_option("image-lora-training", False)
     for c, _ in choices:
         if c.startswith(QI.ANIMA_USER):
             path = models_dir / QI.ANIMA_DIR / (c[len(QI.ANIMA_USER):] + ".safetensors")
@@ -5936,7 +5947,27 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
             if why:
                 fail(f"{c}: {path}: {why}", f"put the derivative's DiT (.safetensors) in {path.parent}")
     plans = [image_plan(a, choice, text_gb, size, chat_gguf) for choice, size in choices]
-    names = list(dict.fromkeys(n for p in plans for n in p["names"]))   # the files the models share, once
+    extra_names = []
+    if training:
+        chosen = {p["choice"] for p in plans}
+        for source in list(plans):
+            choice = source["choice"]
+            base = QI.TRAINING_BASE.get(choice, choice)
+            if choice.startswith("qwen-image-"):
+                extra_names.append("base-F16")
+            if base == choice or base in chosen:
+                continue
+            # These configs expose the base to the training panel.  Its VAE and text encoder are the same as the
+            # derivative's; fetch only the base DiT, not the base's unrelated editing weights.
+            _, dit, _ = QI.IMAGE_MODELS[base]
+            quant = "F16" if dit == "base" else QI.default_quant(dit)
+            files = QI.file_names(quant, QI.IMAGE_MODELS[base][2], source["tquant"], dit)
+            dit_files = files[:4] if QI.is_moss(dit) else files[:1]
+            plans.append({**source, "choice": base, "requested_size": None, "quant": quant,
+                          "lowered": None, "names": dit_files, "training_base_only": True})
+            chosen.add(base)
+    # The files the models share, once.
+    names = list(dict.fromkeys([*(n for p in plans for n in p["names"]), *extra_names]))
     need = sum(QI.FILES[k][2] for k in names) / 1e9
     what = "the image model" if len(plans) == 1 else f"the {len(plans)} image models"
     if ask(f"Download {what} ({need:.1f} GB) and set up image generation?", ["y", "n"], "y", a.yes) != "y":
@@ -5962,6 +5993,11 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
                               uma=bool((gpu or {}).get("integrated")), policy=a.image_gpu_policy or "auto",
                               ssd_offload=getattr(a, "image_ssd_offload", None) == "on", text_quant=p["tquant"],
                               dit_q8=p["q8"], dit_keep=getattr(a, "image_dit_keep", None) != "off")
+        if p.get("training_base_only"):
+            # The full-step base shares the derivative's text/VAE files.  No editing adapters were downloaded.
+            cfg["training_base_only"] = True
+            for key in ("edit_model", "edit_steps", "edit_lora", "edit_adapter", "edit_adapters"):
+                cfg.pop(key, None)
         cfg["setup_choice"] = p["choice"] + ((":" + p["requested_size"]) if p["requested_size"] else "")
         if p["lowered"]:
             cfg["quant_lowered"] = p["lowered"]
@@ -6631,10 +6667,17 @@ def load_settings() -> dict:
 
 
 def save_settings(s: dict) -> None:
+    path = settings_path()
+    if path.exists():
+        try:
+            settings.load(path)              # never replace settings we could not read with an empty default
+        except (OSError, ValueError) as e:
+            warn(f"could not read {path} ({e}); its settings are kept until the file is fixed")
+            return
     try:
-        settings.save(settings_path(), s)
+        settings.save(path, s)
     except OSError as e:
-        warn(f"could not save {settings_path()} ({e})")
+        warn(f"could not save {path} ({e})")
 
 
 def has_data(folder: Path) -> bool:
@@ -7031,7 +7074,11 @@ def choices_from_config(cfg_path: Path) -> dict:
                  key=lambda f: len(FAMILIES[f]["tag"]), default="qwen")
     # the size as the tables name it (unsloth-ud-iq4_xs: UD-IQ4_XS; gyro-gyro-m: Gyro-M, which upper() lost)
     model = tag[len(FAMILIES[family]["tag"]):]
-    model = next((m for m in FAMILIES[family].get("models", MODELS) if m.lower() == model.lower()), model.upper())
+    # Edge0's config is named after the model itself (xestrata-edge0-145b-q3k.json): the tag is the size, not a prefix
+    # of it.  The other families' tags are a prefix (qwen-iq3_xxs), so the whole tag matches no size and the old answer
+    # stays.
+    model = next((m for m in FAMILIES[family].get("models", MODELS)
+                  if m.lower() in (model.lower(), tag.lower())), model.upper())
     a = cfg.get("args", [])
     val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731
     vis = cfg.get("vision")
@@ -7785,8 +7832,10 @@ def server_on_port(port: int, api_key: str | None = None) -> tuple[str, list] | 
     key = (api_key or "").split(",")[0].strip()
     if key:
         req.add_header("Authorization", f"Bearer {key}")
+    # 127.0.0.1 is never behind a proxy: a proxy in http_proxy with no localhost in no_proxy would get the key
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with opener.open(req, timeout=5) as r:
             body = json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         e.close()
@@ -9259,6 +9308,11 @@ OPTIONS = [
             "skip starting the model once at the end of setup to compile its GPU code (the first request then "
             "compiles it: ~30 s more)", kind="flag", place="advanced", default=False),
     # ---- how the image models run (setup's --image-NAME, tools/image/install.py's --NAME)
+    _option("image-lora-training", "Also prepare the bases for LoRA training",
+            "download the full-step training bases for the selected image models (Qwen-Image also needs its F16 "
+            "base); without this option only inference files are downloaded",
+            kind="flag", place="images", default=False, when=["images"],
+            question="Prepare the image models for LoRA training too?", cli={"default": None}),
     _option("image-gpu", "The GPU that makes the images",
             "the GPU of the image jobs (default auto: a discrete GPU the text model does not take, the one with the "
             "most VRAM, where the images are made beside the chat; else the text model's); same: the text model's "
@@ -9525,6 +9579,9 @@ def describe() -> dict:
     room = room_of(ram, [gpu] if gpu else [])
     families = []
     for f, fam in FAMILIES.items():
+        if fam.get("edge0"):
+            # Edge0 is installed by --family edge0 alone: its sizes are EDGE0_MODELS, not TIERS/MODELS
+            continue
         models = []
         names = family_sizes(f)
         # the recommendation of each quantization's sizes (Ornith-1.5 has two), and of the family's
@@ -9587,7 +9644,7 @@ def describe() -> dict:
         installed.append({"config": str(c), "model_name": cfg.get("model_name", c.stem), "family": ch["family"],
                           "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095,
                           "images": [s.get("setup_choice") or by_name[s["model_name"]] for s in secs
-                                     if isinstance(s, dict)
+                                     if isinstance(s, dict) and not s.get("training_base_only")
                                      and (s.get("setup_choice") or s.get("model_name") in by_name)]})
     return {"type": "describe", "version": source_version(), "packaged": bool(PACKAGED),
             "ram_gb": round(ram_gb(), 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),

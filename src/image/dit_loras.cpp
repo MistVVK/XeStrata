@@ -79,6 +79,7 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
         hooks.drop();
         return false;
     };
+    try {
     void* const s = *s_;
     std::vector<std::string> unknown, text_encoder;
     const int nblocks = blocks();
@@ -240,10 +241,10 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
                 for (const LoraPart& p : w->lora->parts) kr = std::max(kr, w->k * p.entry->rank());
             }
         if (nk > 0) {
+            baked_any_ = true;
             bake_tmp_ = alloc<float>(*owned_, nk, what_);
             bake_at16_ = alloc<uint16_t>(*owned_, kr, what_);
             bake_bytes_ = (uint64_t) nk * 4 + (uint64_t) kr * 2;
-            baked_any_ = true;
             hooks.reprepare();   // the queued work drained before the prepare changes
         }
     }
@@ -251,6 +252,10 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
         if (u.file) files_.push_back(u.file);
     key_ = key;
     return true;
+    } catch (...) {
+        hooks.drop();
+        throw;
+    }
 }
 
 void DitLoras::drop() {

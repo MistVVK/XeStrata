@@ -783,7 +783,7 @@ float Sam3::point_prompt(const std::vector<std::array<float, 3>>& pts, const flo
     product(h116, m.s1, s1, P1);
     product(h016, m.s0, s0, P0);
     float* masks = scratch(kMasks, (size_t) (T * P0 * 4));
-    float* small = scratch(kHyper, (size_t) ((T + 1) * 4));
+    float* small = scratch(kSmall, (size_t) ((T + 1) * 4));
     mask_heads(m, q, Nt, k, s0, s1, masks, small, small + T);
     gpu::stream_sync(s_);
     std::vector<float> iou((size_t) T + 1);

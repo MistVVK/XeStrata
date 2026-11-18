@@ -190,7 +190,23 @@ uint64_t Birefnet::need_bytes(int64_t sw, int64_t sh, int64_t width, int64_t hei
     want += (uint64_t) SS * (4 * 3 + 2 * 3 + 64 * 6 + 8) + (uint64_t) width * height * 6 + (64ull << 20);
     if (refine) want += (uint64_t) width * height * (3 * 7 * 4 + 4 + 3);   // foreground()'s, beside the rest
     const uint64_t have = held() - weight_bytes_;
-    return (loaded_ ? 0 : file_bytes_ + file_bytes_ / 8) + (want > have ? want - have : 0);
+    uint64_t masks = 0;
+    std::vector<int64_t> keys;
+    int64_t h = sh / 4, w = sw / 4;
+    for (int i = 0; i < 5; ++i) {   // four stages at full size, and the half-size backbone
+        const int64_t hp = (h + window_ - 1) / window_ * window_;
+        const int64_t wp = (w + window_ - 1) / window_ * window_;
+        const int64_t key = hp * 100000 + wp;
+        const bool held = loaded_ && std::any_of(masks_.begin(), masks_.end(),
+                                                  [key](const auto& m) { return m.first == key; });
+        if (!held && std::find(keys.begin(), keys.end(), key) == keys.end()) {
+            masks += (uint64_t) hp * wp * window_ * window_ * 4;
+            keys.push_back(key);
+        }
+        h = (h + 1) / 2;
+        w = (w + 1) / 2;
+    }
+    return (loaded_ ? 0 : file_bytes_ + file_bytes_ / 8) + masks + (want > have ? want - have : 0);
 }
 
 void Birefnet::backbone(const uint16_t* img16, int64_t SH, int64_t SW, int slot0, float* feat[4], int64_t sh[4],

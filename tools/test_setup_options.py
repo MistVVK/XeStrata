@@ -65,7 +65,8 @@ class Options(unittest.TestCase):
                     got = setup.ask_option(o["name"], True)
                 offered = ask.call_args.args[2]
                 if o["kind"] == "flag":
-                    self.assertEqual(o.get("values")[0 if described[o["name"]]["default"] else 1], got, o["name"])
+                    values = o.get("values") or [True, False]
+                    self.assertEqual(values[0 if described[o["name"]]["default"] else 1], got, o["name"])
                 else:
                     self.assertEqual(described[o["name"]]["default"], offered, o["name"])
                     self.assertIn(offered, ask.call_args.args[1], o["name"])

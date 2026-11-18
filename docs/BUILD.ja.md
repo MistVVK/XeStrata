@@ -235,6 +235,7 @@ AMD の GPU は `STRATA_HIP_ARCHS` に並べます（RX 6800 は `gfx1030`、RX 
    amdgpu につながった AMD の GPU は、カーネルの KFD のトポロジーから gfx（`gfx1200` など）を読み、`/dev/kfd` の権限も確かめます。
    RDNA2 より前の GPU と、ディストリビューションの rocBLAS（パッケージではそのエンジン）がコードを持たない GPU は、使えないと表示します（[README](../README.ja.md#amd-の-gpu)）。
 1. RAM と CPU を調べ、質問をします。
+   画像モデルを選んだ後、LoRA 学習の土台も用意するか選べます。コマンドでは `--images qwen-image-turbo --image-lora-training` のように指定します。推論だけなら後者は不要です。
 1. SYCL のコンパイラを選び（[下](#sycl-のコンパイラ)）、エンジンを `build-xe` でコンパイルします。
 
 エンジンは `engine/` に置き、`BUILD.json`（`"backend": "xe"` と、使ったコンパイラ）を添えます。

@@ -61,7 +61,7 @@ all of it the DiT's, at most MOSS_MAX_IDS ids), the steps asked for (default 50)
 5; the engine builds the sigmas), guidance at any scale but 1 (default 3) with negative_prompt (default empty), the
 blocks its negative pass skips (uncond_skip_layers, default [22]) and skip-layer guidance (slg_layers, slg_scale,
 slg_start, slg_stop), by its pipeline's names (moss_request).  A layout of boxes (layout: its prompt enhancer's draft,
-boxes in the image's pixels) becomes its JSON prompt (moss_layout_prompt).  It has no edits: an image is img2img's.
+boxes in the image's pixels) becomes its JSON prompt (moss_layout_prompt). Its edits use an edit adapter.
 Its text encoder is Qwen3.5-9B, read by the chat's engine when that reads the same file (text_states).
 enhance has the chat's model write the prompt out first (enhance_prompt).
 
@@ -113,7 +113,7 @@ byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt":
   lists what its DiT takes and checks a request's names); without one, "loras" beside the DiT's file
   crop_edit: false draws an edit with a mask at the output's size, without cutting the part out (plan_crop; a
   request's crop_edit overrides it)
-  MOSS-Image's edit_adapters ({name: {"lora", "format", "vision"}}, setup's chinoll, armv5 and armv6) and
+  MOSS-Image's edit_adapters ({name: {"lora", "format", "vision"}}, setup's chinoll) and
   edit_adapter (the one used; XESTRATA_MOSS_EDIT over it: moss_edit_adapter); edit_format: an edit_lora's layout
   (moss_edit_format)
   max_n: the most images one request makes; budget_s: the longest one request's images may take, by the speed this
@@ -2354,8 +2354,8 @@ def moss_edit_layout(path: Path) -> str | None:
 
 
 def moss_edit_adapters(cfg: dict) -> dict[str, dict]:
-    """The MOSS-Image edit adapters a request may name (edit_adapter): the config's "edit_adapters" (setup's chinoll,
-    armv5 and armv6: {"lora", "format", "vision", "about"}), then the LoRA folder's files moss_edit_layout knows, by
+    """The MOSS-Image edit adapters a request may name (edit_adapter): the config's "edit_adapters" (setup's chinoll:
+    {"lora", "format", "vision", "about"}), then the LoRA folder's files moss_edit_layout knows, by
     their listing's names - ai-toolkit's with the config's vision encoder (Qwen3.5-9B's mmproj; without it, not
     offered)."""
     out = {k: dict(v) for k, v in (cfg.get("edit_adapters") or {}).items()}
@@ -2476,7 +2476,9 @@ def gpu_key(env: dict) -> str:
     """The GPU an engine environment names (its device selection; none: the system's first), for GpuTurn."""
     import hashlib
     others = ("CUDA_VISIBLE_DEVICES", "ONEAPI_DEVICE_SELECTOR", "HIP_VISIBLE_DEVICES", "ZE_AFFINITY_MASK")
-    sel = [envvars.get("GPU_PCI", env=env)] + [env.get(k) for k in others]
+    pci = envvars.get("GPU_PCI", env=env)
+    # With a PCI address, selectors only narrow visibility; all environments naming that physical card share a turn.
+    sel = [pci.lower(), None, None, None, None] if pci else [None] + [env.get(k) for k in others]
     return hashlib.sha256(json.dumps(sel).encode()).hexdigest()[:16]
 
 
@@ -2601,6 +2603,7 @@ class ImageEngine:
 
     def _connect(self, addr: str) -> bool:
         import socket
+        s = None
         try:
             if os.name != "nt":
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -2611,6 +2614,9 @@ class ImageEngine:
                 s = socket.create_connection(("127.0.0.1", int(port)), timeout=10)
                 s.settimeout(None)
         except (OSError, ValueError):
+            if s is not None:
+                with contextlib.suppress(OSError):
+                    s.close()
             return False
         self.sock = s
         self.f = s.makefile("rw", encoding="utf-8", errors="replace", newline="\n")
@@ -2785,6 +2791,8 @@ class ImageGen:
             for key in ("edit_lora", "edit_adapters", "edit_adapter", "edit_format", "edit_steps", "vision"):
                 self.cfg.pop(key, None)
             self.cfg.update(turbo_lora=str(Path(self.cfg["vae"]).with_name(_qimage().LOCAL_NAMES["moss-4-step-lora"])),
+                            edit_lora=str(Path(self.cfg["vae"]).with_name(_qimage().FILES["moss-edit-lora"][1])),
+                            edit_format="moss-image-edit", edit_steps=4, edit_cfg_scale=1.0,
                             lora_bake=False, steps=4, cfg_scale=1.0, shift=MOSS_SHIFT)
         policy = self.cfg.get("gpu_policy") or "auto"
         if policy not in POLICIES:
@@ -2994,11 +3002,13 @@ class ImageGen:
         p = self.dir / name
         return p if p.is_file() else None
 
-    def _ready(self) -> None:
+    def _ready(self, start: bool = True) -> None:
         self.require_available()
         if self.tok is None:
             self.tok = load_tokenizer(self._tokenizer_path(), self.family)
         if not self.engine.alive():
+            if not start:
+                raise ImageJobFailed("the image engine is not running")
             self.engine.start()
             self._enter_ledger()
 
@@ -3021,8 +3031,10 @@ class ImageGen:
             return
         led = self.ledger(int(got.get("total_mib") or 0))
         held = int(got.get("held_mib") or 0)
-        if led.find("image", self._owner()) is None and held > 0:
-            led.hold("image", held, self._owner(), in_base=self.engine.found, whole=True)
+        # a full temp folder (or another user's stale file) must not break the engine's start
+        with contextlib.suppress(OSError):
+            if led.find("image", self._owner()) is None and held > 0:
+                led.hold("image", held, self._owner(), in_base=self.engine.found, whole=True)
 
     def ledger_sync(self) -> None:
         """The engine's ledger entry set to what it holds now, its own report (FREE's held_mib: the image model's and
@@ -3036,12 +3048,15 @@ class ImageGen:
                     held = int(self.engine.ask("FREE", "FREE", 60).get("held_mib") or 0)
                 except ImageJobFailed:
                     held = 0
-            eid = led.find("image", owner)
-            if held > 0:
-                led.hold("image", held, owner, whole=True)
-            elif eid is not None:
-                led.releasing(eid)
-                led.remove(eid)
+            # the ledger's files are shared with the other processes: a write failure here must not skip the
+            # cache's return or the server's busy flag in the caller's finally
+            with contextlib.suppress(OSError):
+                eid = led.find("image", owner)
+                if held > 0:
+                    led.hold("image", held, owner, whole=True)
+                elif eid is not None:
+                    led.releasing(eid)
+                    led.remove(eid)
 
     def ids(self, job: dict) -> list[int]:
         if self.tok is None:
@@ -3258,7 +3273,7 @@ class ImageGen:
                 f",{job['width']},{job['height']}" if job.get("tiles") else "")
         return words
 
-    def need(self, job: dict) -> dict:
+    def need(self, job: dict, *, start: bool = True) -> dict:
         """What the image needs, from the engine (started when it is not running): least_mib, full_mib (every layer
         resident), held_mib (what it holds now), free_mib (the device's free VRAM), cap_mib (the most the engine could
         have) and host_mib (the prefix cache in pinned RAM at cap_mib).  An upscale without a drawing (ups_only): its
@@ -3267,14 +3282,14 @@ class ImageGen:
         if job.get("aux"):
             a = job["aux"]
             with self.lock:
-                self._ready()
+                self._ready(start=start)
                 return self.engine.ask(f"AUXNEED {a['kind']} {a['path']} {job['width']} {job['height']}"
                                        + "".join(f" {v}" for v in a.get("need_args") or ()), "NEED", 600)
         if job.get("video"):   # a video's upscale (serve/videos.py): its upscaler's on the source's frames
             src = job["source"]
             u = job["upscaler"]
             with self.lock:
-                self._ready()
+                self._ready(start=start)
                 return self.engine.ask(f"UPSVNEED {job['width']} {job['height']} {src['width']} {src['height']} "
                                        f"{self._ups_spec(job)}" + (f" COLOR:{u['color']}" if u.get("color") else ""),
                                        "NEED", 600)
@@ -3282,11 +3297,11 @@ class ImageGen:
             w0, h0 = image_dims(job["init"])
             u = job["upscaler"]
             with self.lock:
-                self._ready()
+                self._ready(start=start)
                 return self.engine.ask(f"UPSNEED {job['width']} {job['height']} {w0} {h0} {self._ups_spec(job)}"
                                        + (f" COLOR:{u['color']}" if u.get("color") else ""), "NEED", 600)
         with self.lock:
-            self._ready()
+            self._ready(start=start)
             w, h = made_size(job)
             self.stage(job)
             n, neg = self._need_counts(job)
@@ -4096,6 +4111,13 @@ TOOLS: list[dict[str, Any]] = [
          "image": IMAGE_ARG,
          "version": {"type": "string", "enum": ["general", "lite", "lite-2k", "portrait", "matting", "hr", "dynamic"]},
          "background_color": {"type": "string", "description": "e.g. #ffffff"}}}},
+    {"name": "train_lora",
+     "description": "Open the LoRA training panel in the chat: the user puts the pictures in, picks the kind "
+                    "(character, style, other), the name, the trigger word and the model, captions the pictures and "
+                    "starts the training there; it runs on the server and its versions come back to the panel. Call "
+                    "it when the user wants to make a LoRA; do not wait for the training.",
+     "parameters": {"type": "object", "properties": {
+         "model": {"type": "string", "description": "The image model requested for the LoRA, if specified"}}}},
 ]
 
 # the image tools every request declares; the others once the chat's model reads their skills (ImageTools.unlock)
@@ -4355,7 +4377,8 @@ class ImageTools:
         names = [t["name"] for t in offered]
         if self.all_tools or not any(n in CORE_TOOLS for n in names):
             return offered
-        return [t if t["name"] in CORE_TOOLS or t["name"] in self.unlocked else self._stub(t) for t in offered]
+        return [t if t["name"] in CORE_TOOLS or t["name"] in self.unlocked or t["name"] == "train_lora"
+                else self._stub(t) for t in offered]
 
     def _stub(self, t: dict) -> dict:
         """A tool not given yet, as its name and one line: called, it runs where its arguments are there, else answers
@@ -4402,6 +4425,10 @@ class ImageTools:
                 continue
             if t["name"] in ("upscale_video", "segment_video") and self._video("") is None:
                 continue   # offered for a video in the conversation
+            if t["name"] == "train_lora":
+                from serve import lora_train
+                if not any(lora_train.trainer_family(g) is not None for g in gens):
+                    continue   # offered where a model with a trainer is installed
             t = dict(t)
             if self.skills == "inline":   # the image button's request: the models' skills in the description
                 styles, rules = self._skill_groups(gens)
@@ -4502,7 +4529,8 @@ class ImageTools:
         lines = []
         for g in gens:
             for e in g.loras.listing() if g.loras.takes else ():
-                about = ", ".join(x for x in (e.get("kind"), f"trigger {e['trigger']}" if e.get("trigger") else None)
+                about = ", ".join(x for x in (e.get("kind"), f"trigger {e['trigger']}" if e.get("trigger") else None,
+                                              f"step {e['steps']}" if e.get("steps") else None)
                                   if x)
                 lines.append(e["name"] + (f" ({about})" if about else "") + (f" [{g.model}]" if len(gens) > 1 else ""))
         return lines
@@ -4591,7 +4619,7 @@ class ImageTools:
             want = s.meta.get("tool")
             if s.kind != "tool" or not want:
                 continue
-            if want in tools and want not in CORE_TOOLS and not self.all_tools:
+            if want in tools and want not in CORE_TOOLS and want != "train_lora" and not self.all_tools:
                 continue   # its tool's stub carries its line, and its call answers with the skill (_stub_answer)
             if want == "lora":   # with the LoRA argument only: a model lists LoRAs
                 if {"generate_image", "edit_image", "control"} & set(tools) and self._lora_lines(self._gens()):
@@ -4885,6 +4913,40 @@ class ImageTools:
                         return f
         return None
 
+    def _train_lora_tool(self, args: dict, t0: float) -> dict:
+        """train_lora: the panel opens in the chat (the page renders it by the tool's name); no job starts here.
+        The answer tells the model what the user can do there, with the models this server can train."""
+        from serve import lora_train
+        all_rows = lora_train.model_rows(self.svc)
+        rows = [r for r in all_rows if r["can_train"]]
+        requested = str(args.get("model") or "")
+        target, choice = lora_train.training_model(requested)
+        row = next((r for r in all_rows if r["model"] == target), None) if requested else None
+        if requested and (row is None or not row["can_train"]):
+            why = (row["why"] if row else
+                   f"install the base with {lora_train.setup_command(self.svc, choice)} and restart the server"
+                   if choice else f"{target} is not configured on this server")
+            text = f"Cannot prepare training for {requested}: {why}"
+            return {"ok": False, "text": text, "chars": len(text), "truncated": False,
+                    "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": "train_lora", "images": [],
+                    "requested_model": requested, "training_model": target, "model_switched": bool(choice)}
+        names = ", ".join(f"{r['name']} ({r['model']})" for r in rows) or "none ready (the trainer is not built)"
+        text = ("The LoRA training panel is open in the chat. The user puts the training pictures in (drag and drop, "
+                "or picks this chat's images), chooses the kind (character, style, other), the name, the trigger "
+                f"word and the model ({names}), captions the pictures (the auto button writes them; they can be "
+                "edited), sets the steps and how often a version is saved, and starts the training. It runs on the "
+                "server; the panel shows its progress and, when it ends, a sample picture of every saved version "
+                "side by side. The user picks a version and registers it as a LoRA (the last one by default); it is "
+                "usable in the chat's images at once. Tell the user so and answer their questions; do not wait for "
+                "the training and do not call this tool again for the same request.")
+        if choice:
+            text += (f" {requested} is distilled for fewer steps and is not suitable for training. "
+                     f"The panel selects {target} instead. Tell the user; the resulting LoRA can also be used "
+                     f"with {requested}.")
+        return {"ok": True, "text": text, "chars": len(text), "truncated": False,
+                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": "train_lora", "images": [],
+                "requested_model": requested, "training_model": target, "model_switched": bool(choice)}
+
     def _video_tool(self, args: dict, t0: float) -> dict:
         """upscale_video: a /v1/videos job on the video (videos.start_from_file), its id and where its video will be
         the call's result at once; the job runs on the server past this answer."""
@@ -5024,7 +5086,7 @@ class ImageTools:
                     "it again: answer the user, or take the next step.")
             return {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0, "server": None,
                     "tool": name, "images": [], "skipped": True}
-        if name not in self.unlocked and name not in CORE_TOOLS and not self.all_tools:
+        if name not in self.unlocked and name not in CORE_TOOLS and name != "train_lora" and not self.all_tools:
             answer = self._stub_answer(name, args, t0)   # a stub's call: its arguments, or it runs as it is
             if answer is not None:
                 return answer
@@ -5032,6 +5094,8 @@ class ImageTools:
         merged = merged if isinstance(merged, int) and not isinstance(merged, bool) and merged > 1 else None
         lend = args.pop("_lend", None) is True   # tool_parallel: on the text model's GPU, lent to the images
         self.calls += merged or 1
+        if name == "train_lora":
+            return self._train_lora_tool(args, t0)
         if name in ("find_region", "remove_background", "upscale_video", "segment_video"):
             r = (self._aux_tool(name, args, t0, cancel) if name in ("find_region", "remove_background") else
                  self._video_tool(args, t0) if name == "upscale_video" else self._segment_video_tool(args, t0))
@@ -5768,6 +5832,32 @@ def fix_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = N
 
 @contextlib.contextmanager
 def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
+    """The image job's GPU turn, with the LoRA training's yield first (serve/lora_train.py): a training on this GPU
+    shrinks or pauses at a micro-step boundary so the image goes first (the wait is a micro-step's seconds plus the
+    release, never the training's end)."""
+    lt = getattr(svc, "lora_jobs", None)
+    need = None
+    pci = envvars.get("GPU_PCI", env=gen.engine.env)
+    same_card = not pci or not lt or not lt.place or not lt.place.get("pci") or \
+        pci.lower() == str(lt.place["pci"]).lower()
+    if lt is not None and lt.current is not None and lt.place is not None and same_card and gen.engine.alive():
+        try:
+            need = int(gen.need(job, start=False)["least_mib"])
+            if need <= 0:
+                need = None
+        except (ImageJobFailed, OSError, KeyError, TypeError, ValueError):
+            need = None
+    waiting = lt.image_begin(need, pci) if lt is not None else None
+    try:
+        with _gpu_turn(svc, gen, job, cancel) as policy:
+            yield policy
+    finally:
+        if lt is not None and waiting:
+            lt.image_end(waiting)
+
+
+@contextlib.contextmanager
+def _gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
     """The image job's turn on the GPU: the service's FIFO (and, with parallel requests, the engine's control lines
     once no slot is generating), and the text engine made room for it per the policy.  Yields the policy used.  On a
     card of its own (ImageModels.separate), that card's turn alone (separate_turn)."""

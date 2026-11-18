@@ -737,6 +737,11 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
         }
         if (ctl) control_->after_block(bi, T);
         blocks_stream_.end(bi);
+        if (bi == 0 && first_block_hook_) {
+            gpu::stream_sync(s_);
+            auto hook = std::move(first_block_hook_);
+            hook();
+        }
     }
     qi_ln_mod16(x_ + n_text_ * C, scale_, 0, HW, C, h16_, s_);   // the final norm: row 0 of scale_ for every token
     product(h16_, pout_, h_, HW);
@@ -846,6 +851,11 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
             mlp(wgu, wdown, x_ + m0 * C, mod(3), 0, mr);
         }
         blocks_stream_.end(bi);
+        if (bi == 0 && first_block_hook_) {
+            gpu::stream_sync(s_);
+            auto hook = std::move(first_block_hook_);
+            hook();
+        }
     }
     qi_ln_mod16(x_, scale_, 0, R, C, h16_, s_);   // the final norm: row 0 of scale_ for every token
     product(h16_, pout_, h_, R);

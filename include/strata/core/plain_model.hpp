@@ -1023,7 +1023,7 @@ private:
     PromptGemm& prompt_gemm();
     std::unique_ptr<PromptGemm, void (*)(PromptGemm*)> prompt_gemm_{nullptr, nullptr};
     static void pool_fn(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                        int64_t layer);
+                        int64_t tb, int64_t layer);
 
     // GLM-5.3-Flash (glm5-next), plain_glm5.cpp
     struct GBlock {

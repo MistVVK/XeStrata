@@ -73,7 +73,11 @@ uint64_t Florence2::work_bytes(int beams, int max_new) const {
     // the first stage's buffers (its tokens 4 wide in the MLP), and the decoder's caches
     const int64_t n0 = (image_size_ / 4) * (image_size_ / 4), c0 = 128;
     const uint64_t vision = (uint64_t) n0 * c0 * (4 + 4 + 16 + 8 + 2 * 6) + (64ull << 20);
-    const uint64_t cache = (uint64_t) dec_.size() * 4 * beams * (max_new + 1) * d_ * 2;
+    size_t layers = dec_.size();
+    if (!loaded_)
+        while (st_->find("language_model.model.decoder.layers." + std::to_string(layers) + ".fc1.weight") != nullptr)
+            ++layers;
+    const uint64_t cache = (uint64_t) layers * 4 * beams * (max_new + 1) * d_ * 2;
     return vision + cache + (uint64_t) beams * vocab_ * 4;
 }
 

@@ -37,6 +37,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <new>
@@ -56,6 +57,18 @@ namespace strata::prefill {
 using strata::kernels::XmxType;
 
 namespace {
+std::atomic<bool> g_training_trace{false};
+
+void training_gemm(const char* kind, const char* path, int64_t t, int64_t n, int64_t k, int64_t batch = 1) {
+    if (!g_training_trace.load(std::memory_order_relaxed) || core::timing_depth > 0) return;
+    static std::mutex mu;
+    static std::set<std::tuple<std::string, std::string, int64_t, int64_t, int64_t, int64_t>> seen;
+    std::lock_guard<std::mutex> lock(mu);
+    if (seen.emplace(kind, path, t, n, k, batch).second)
+        std::fprintf(stderr, "training gemm: %s %lldx%lldx%lld batch=%lld path=%s\n", kind,
+                     (long long) t, (long long) n, (long long) k, (long long) batch, path);
+}
+
 #if STRATA_ONEMATH
 bool env_on(const char* name) {
     const char* v = strata::env_get(name);
@@ -418,6 +431,8 @@ void Gemm::settle() {
 #endif
 }
 
+void Gemm::trace_training() { g_training_trace.store(true, std::memory_order_relaxed); }
+
 const char* Gemm::path() {
     // what runs the products on the current GPU, said as the report finds it: oneMath with the library its backend
     // for the device's SYCL backend uses, or XeStrata's own kernels in the form they take; the own kernels also run
@@ -512,7 +527,10 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                 bool accumulate) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
-    if (!accumulate && bf16_through_f16(X, W, Y, T, N, K, ldy)) return;
+    if (!accumulate && bf16_through_f16(X, W, Y, T, N, K, ldy)) {
+        training_gemm("bf16", "converted-f16", T, N, K);
+        return;
+    }
 #if STRATA_ONEMATH
     const bool own = strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy) &&
                      own_first(stream_, Own::bf16, T, N, K, !accumulate,
@@ -521,8 +539,12 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                                    product<oneapi::math::bfloat16>(core::Runtime::get().stream(stream_), X, W, Y, T,
                                                                    N, K, ldy, false);
                                });
-    if (!own && blas<oneapi::math::bfloat16>(X, W, Y, T, N, K, ldy, accumulate, stream_)) return;
+    if (!own && blas<oneapi::math::bfloat16>(X, W, Y, T, N, K, ldy, accumulate, stream_)) {
+        training_gemm("bf16", "oneMath", T, N, K);
+        return;
+    }
 #endif
+    training_gemm("bf16", "own", T, N, K);
     if (strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy))
         strata::kernels::xmx_gemm(XmxType::bf16, X, W, Y, T, N, K, ldy, stream_, accumulate);
     else
@@ -543,12 +565,22 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                                });
     // the FP32 copies and the half-sum path leave Y unread (or write it whole): an accumulating product keeps the
     // half GEMM's FP32 sums, as the engine's own kernels do
-    if (!own && !accumulate && dense_f32(X, W, Y, T, N, K, ldy, stream_)) return;
-    if (!own && half && !accumulate && half_sums(X, W, Y, T, N, K, ldy, stream_)) return;
-    if (!own && blas<sycl::half>(X, W, Y, T, N, K, ldy, accumulate, stream_)) return;
+    if (!own && !accumulate && dense_f32(X, W, Y, T, N, K, ldy, stream_)) {
+        training_gemm("f16", "oneMath-f32", T, N, K);
+        return;
+    }
+    if (!own && half && !accumulate && half_sums(X, W, Y, T, N, K, ldy, stream_)) {
+        training_gemm("f16", "oneMath-f16-sums", T, N, K);
+        return;
+    }
+    if (!own && blas<sycl::half>(X, W, Y, T, N, K, ldy, accumulate, stream_)) {
+        training_gemm("f16", "oneMath", T, N, K);
+        return;
+    }
 #else
     (void) half;
 #endif
+    training_gemm("f16", "own", T, N, K);
     if (strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy))
         strata::kernels::xmx_gemm(XmxType::f16, X, W, Y, T, N, K, ldy, stream_, accumulate);
     else
@@ -569,6 +601,7 @@ void Gemm::f16_batch(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, 
             om::blas::column_major::gemm_batch(q, om::transpose::trans, om::transpose::nontrans, N, T, K, 1.0f,
                                                reinterpret_cast<const sycl::half*>(W), K, sw,
                                                reinterpret_cast<const sycl::half*>(X), K, sx, 0.0f, Y, ldy, sy, batch);
+            training_gemm("f16-batch", "oneMath", T, N, K, batch);
             return;
         } catch (const oneapi::math::exception& e) {
             platform::downgrade("gemm.onemath_batch", std::string("oneMath (a batch of FP16 products): ") + e.what() +
@@ -576,6 +609,7 @@ void Gemm::f16_batch(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, 
         }
     }
 #endif
+    training_gemm("f16-batch", "per-product", T, N, K, batch);
     for (int64_t b = 0; b < batch; ++b) f16(X + b * sx, W + b * sw, Y + b * sy, T, N, K, ldy);
 }
 
@@ -591,6 +625,8 @@ bool Gemm::f16_batch_ex(bool x_t, bool w_nk, const uint16_t* X, const uint16_t* 
                         int64_t K, int64_t batch, int64_t sx, int64_t sw, int64_t sy, int64_t ldx, int64_t ldw,
                         int64_t ldy, float beta) {
     if (T <= 0 || N <= 0 || batch <= 0) return true;
+    const char* kind = x_t ? (w_nk ? "f16-batch-ex-tt" : "f16-batch-ex-tn")
+                           : (w_nk ? "f16-batch-ex-nt" : "f16-batch-ex-nn");
 #if STRATA_ONEMATH
     // X [T][K] and W [K][N] as they are, one product (a training step's dgrad, dY . W): XeStrata's own kernels where
     // they are the faster (own_first)
@@ -607,8 +643,10 @@ bool Gemm::f16_batch_ex(bool x_t, bool w_nk, const uint16_t* X, const uint16_t* 
                                                    reinterpret_cast<const sycl::half*>(W), ldw,
                                                    reinterpret_cast<const sycl::half*>(X), K, 0.0f, Y, ldy);
                   }) &&
-        strata::kernels::gemm_kn(X, W, ldw, Y, T, N, K, ldy, stream_))
+        strata::kernels::gemm_kn(X, W, ldw, Y, T, N, K, ldy, stream_)) {
+        training_gemm(kind, "own", T, N, K, batch);
         return true;
+    }
     sycl::queue& q = core::Runtime::get().stream(stream_);
     if (backend(q.get_device()).blas) {
         try {
@@ -621,6 +659,7 @@ bool Gemm::f16_batch_ex(bool x_t, bool w_nk, const uint16_t* X, const uint16_t* 
                                                reinterpret_cast<const sycl::half*>(W), ldw, sw,
                                                reinterpret_cast<const sycl::half*>(X), ldx, sx, beta, Y, ldy, sy,
                                                batch);
+            training_gemm(kind, "oneMath", T, N, K, batch);
             return true;
         } catch (const oneapi::math::exception& e) {
             std::fprintf(stderr, "xestrata: oneMath (a batch of transposed FP16 products): %s\n", e.what());
@@ -641,6 +680,7 @@ bool Gemm::f16_batch_ex(bool x_t, bool w_nk, const uint16_t* X, const uint16_t* 
     (void) ldy;
     (void) beta;
 #endif
+    training_gemm(kind, "caller-fallback", T, N, K, batch);
     return false;
 }
 
@@ -698,6 +738,7 @@ void Gemm::i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N
     if (strata::kernels::i8_gemm_s32_ok(stream) || !onemath_i8(stream)) {
         if (!strata::kernels::i8_gemm_s32(X, W, Y, T, N, K, ldy, stream))
             throw std::runtime_error("an int8 product on a GPU no library takes it on");
+        training_gemm("i8", "i8-gemm-s32", T, N, K);
         return;
     }
 #if STRATA_ONEMATH
@@ -708,6 +749,7 @@ void Gemm::i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N
     om::blas::column_major::gemm_batch(core::Runtime::get().stream(stream), om::transpose::trans,
                                        om::transpose::nontrans, N, T, K, 1.0f, W, K, N * K, X, K, T * K, 0.0f, Y, ldy,
                                        ldy * T, 1);
+    training_gemm("i8", "oneMath", T, N, K);
 #endif
 }
 
@@ -939,8 +981,11 @@ bool Gemm::w8a8(const int8_t* X, const float* sx, const int8_t* W, const float* 
     if (T <= 0 || N <= 0) return false;
     auto* y16 = static_cast<uint16_t*>(Y);
     auto* y32 = static_cast<int32_t*>(Y);
-    if (bf16_out && w8_fused(stream) && strata::kernels::i8_gemm_bf16(X, sx, W, sw, bias, y16, T, N, K, ldy, stream))
+    if (bf16_out && w8_fused(stream) && strata::kernels::i8_gemm_bf16(X, sx, W, sw, bias, y16, T, N, K, ldy, stream)) {
+        training_gemm("w8a8", "fused", T, N, K);
         return true;
+    }
+    training_gemm("w8a8", "i8-sums", T, N, K);
     i8(X, W, y32, T, N, K, ldy, stream);
     return false;
 }

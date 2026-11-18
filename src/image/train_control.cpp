@@ -20,7 +20,12 @@
 #include <stdexcept>
 #include <thread>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <pthread.h>
 #endif
 
@@ -126,6 +131,16 @@ InitialVram initial_vram(const std::string& model, const std::string& base, int6
     return {minimum, std::max(minimum, peak + std::max<uint64_t>(128, (peak * 2 + 99) / 100))};
 }
 
+void log_training_plan(Trainer& tr, float lr, int warmup_updates) {
+    prefill::Gemm::trace_training();
+    const char* no_blas = strata::env_get("NO_BLAS"), *blas = strata::env_get("BLAS");
+    std::printf("training plan: gemm=%s NO_BLAS=%s BLAS=%s; lr=%g warmup_updates=%d then constant (partial tail at base); "
+                "resident=%d/%d (dynamic; see vram or residency); shared gemm shapes follow as used\n",
+                prefill::Gemm::path(), no_blas ? no_blas : "unset", blas ? blas : "unset", (double) lr,
+                warmup_updates, tr.ws.resident(), tr.ws.count());
+    std::fflush(stdout);
+}
+
 Control::Control(Trainer& tr, Opts o) : tr_(tr), opts_(std::move(o)), budget_mib_(opts_.budget_mib) {
     if (const char* e = strata::env_get("TRAIN_CONTROL_MS")) {
         const long v = std::strtol(e, nullptr, 10);
@@ -167,17 +182,35 @@ void Control::save(const std::function<void(std::ostream&)>& save_loop) {
     loop << std::setprecision(std::numeric_limits<double>::max_digits10);
     save_loop(loop);
     const std::string ls = loop.str();
-    std::ofstream f(opts_.state, std::ios::binary | std::ios::trunc);
-    if (!f) throw std::runtime_error("cannot write the state file " + opts_.state);
-    f.write(kMagic, sizeof kMagic);
-    const int64_t steps = tr_.steps;
-    f.write(reinterpret_cast<const char*>(&steps), sizeof steps);
-    const uint64_t len = ls.size();
-    f.write(reinterpret_cast<const char*>(&len), sizeof len);
-    f.write(ls.data(), (std::streamsize) len);
-    tr_.save_state(f);
-    f.flush();
-    if (!f) throw std::runtime_error("the state file " + opts_.state + " did not write whole");
+    const std::filesystem::path path(std::u8string(opts_.state.begin(), opts_.state.end()));
+    std::filesystem::path tmp = path;
+    tmp += ".tmp";
+    try {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) throw std::runtime_error("cannot write the state file " + opts_.state + ".tmp");
+        f.write(kMagic, sizeof kMagic);
+        const int64_t steps = tr_.steps;
+        f.write(reinterpret_cast<const char*>(&steps), sizeof steps);
+        const uint64_t len = ls.size();
+        f.write(reinterpret_cast<const char*>(&len), sizeof len);
+        f.write(ls.data(), (std::streamsize) len);
+        tr_.save_state(f);
+        f.close();
+        if (!f) throw std::runtime_error("the state file " + opts_.state + ".tmp did not write whole");
+#if defined(_WIN32)
+        if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            throw std::runtime_error("cannot replace the state file " + opts_.state + ": " +
+                                     std::to_string(GetLastError()));
+#else
+        std::filesystem::rename(tmp, path);
+#endif
+    } catch (...) {
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        throw;
+    }
+    std::printf("state saved %s\n", opts_.state.c_str());
+    std::fflush(stdout);
 }
 
 bool Control::load(const std::string& path, const std::function<void(std::istream&)>& load_loop) {
@@ -200,6 +233,11 @@ bool Control::load(const std::string& path, const std::function<void(std::istrea
     tr_.load_state(f);
     tr_.steps = steps;
     return true;
+}
+
+void Control::progress(int64_t step, int64_t total, double loss) const {
+    std::printf("progress step=%lld total=%lld loss=%.9g\n", (long long) step, (long long) total, loss);
+    std::fflush(stdout);
 }
 
 void Control::emit(bool force) {
@@ -241,8 +279,6 @@ bool Control::wait_resume(const std::function<void(std::ostream&)>& save_loop) {
         if (save_state_ && !saved_) {
             save(save_loop);
             saved_ = true;
-            std::printf("state saved %s\n", opts_.state.c_str());
-            std::fflush(stdout);
         }
         if (stop_ || stop_requested()) return false;
         if (!save_state_ && budget_mib_ >= paused_need_mib_ && budget_mib_ > 0) return true;
@@ -257,8 +293,6 @@ bool Control::boundary(bool, const std::function<void(std::ostream&)>& save_loop
     if (save_state_ && !saved_) {
         save(save_loop);
         saved_ = true;
-        std::printf("state saved %s\n", opts_.state.c_str());
-        std::fflush(stdout);
     }
     if (stop_ || stop_requested()) return false;
     const uint64_t min_bytes = std::max(tr_.min_bytes(tr_.last_rows(), tr_.last_row_bytes(), tr_.guess_row()),
@@ -284,7 +318,13 @@ bool Control::boundary(bool, const std::function<void(std::ostream&)>& save_loop
 }
 
 void Control::report() {
-    if (enabled()) emit(false);
+    if (enabled()) {
+        emit(false);
+    } else if (tr_.ws.resident() != last_resident_) {
+        last_resident_ = tr_.ws.resident();
+        std::printf("training residency: %d/%d\n", last_resident_, tr_.ws.count());
+        std::fflush(stdout);
+    }
 }
 
 }  // namespace strata::image::train

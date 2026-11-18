@@ -443,6 +443,22 @@ let ``setup's failure is shown with its hint`` () =
     click w "Back"
     waitFor "the home page again" (fun () -> findButton w (tr "home.install" "Install a model ...")) |> ignore
 
+[<AvaloniaFact>]
+let ``a nonzero exit without a failure message is shown`` () =
+    english ()
+    let setup = FakeSetup(described.Value, none)
+    let w = open' setup
+    installPage w |> ignore
+    click w "Install"
+    let before = setup.Runs.Count
+    setup.Last.Exit 3
+    pump ()
+    Assert.True(shows w "Setup stopped")
+    Assert.True(shows w "setup.py exited with 3.")
+    Assert.Equal(before, setup.Runs.Count)   // not back at the home page until the person has read it
+    click w "Back"
+    waitFor "the home page again" (fun () -> findButton w (tr "home.install" "Install a model ...")) |> ignore
+
 // --------------------------------------------------------------------------------------------- an installed model
 
 [<AvaloniaFact>]
@@ -509,13 +525,15 @@ let ``an installed model's image models are set by install.py`` () =
     pick w "image-gpu" "same"
     let sam3 = all<CheckBox> w |> List.find (fun b -> match b.Content with :? TextBlock as t -> t.Text.StartsWith "Agree to Meta's SAM License" | _ -> false)
     sam3.IsChecked <- Nullable true
+    let training = all<CheckBox> w |> List.find (fun b -> match b.Content with :? TextBlock as t -> t.Text = labelOf "image-lora-training" | _ -> false)
+    training.IsChecked <- Nullable true
     pump ()
     click w "Apply"
     let r = setup.Last
     Assert.Equal(Places.imageInstallPy, r.Script)
     for part in
         [ [ "--config"; d.Installed[0].Config ]; [ "--model"; d.Images[0].Id + "-uncensored" ]; [ "--yes" ]; [ "--gpu"; "same" ]
-          [ "--sam3-license"; "agree" ] ] do
+          [ "--sam3-license"; "agree" ]; [ "--lora-training" ] ] do
         Assert.True(contains part r.Args, sprintf "%A not in %A" part r.Args)
 
 /// The install page passes the image options as setup's --image-<name>, SAM 3.1's license not agreed unless checked;
@@ -527,9 +545,12 @@ let ``an install passes the image options, SAM 3.1's license only where it is no
     let setup = FakeSetup(d, none)
     let w = open' setup
     installPage w |> ignore
+    let training = all<CheckBox> w |> List.find (fun b -> match b.Content with :? TextBlock as t -> t.Text = labelOf "image-lora-training" | _ -> false)
+    training.IsChecked <- Nullable true
+    pump ()
     click w "Install"
     let args = setup.Last.Args
-    for part in [ [ "--image-gpu"; "auto" ]; [ "--image-sam3-license"; "no" ] ] do
+    for part in [ [ "--image-gpu"; "auto" ]; [ "--image-sam3-license"; "no" ]; [ "--image-lora-training" ] ] do
         Assert.True(contains part args, sprintf "%A not in %A" part args)
     let agreed = FakeSetup({ d with Sam3 = { d.Sam3 with Agreed = true } }, none)
     let w2 = open' agreed
@@ -577,6 +598,19 @@ let ``a measurement checks its options`` () =
     let args = setup.Last.Args
     Assert.True(contains [ "--bench-rounds"; "3" ] args, sprintf "%A" args)
     Assert.True(contains [ "--bench-temperature"; "0.5" ] args, sprintf "%A" args)
+
+[<AvaloniaFact>]
+let ``an installed model setup cannot name does not break the pages`` () =
+    // setup names an Edge0 config after its model; a config it cannot name must not reach ArgumentList as null
+    english ()
+    let installed = described.Value.Installed[0]
+    let d = { described.Value with Installed = [| { installed with Model = null } |] }
+    let setup = FakeSetup(d, none)
+    let w = open' setup
+    click w "Measure ..."
+    click w "Measure"
+    Assert.DoesNotContain("--model", setup.Last.Args)
+    Assert.DoesNotContain("--family", setup.Last.Args)
 
 [<AvaloniaFact>]
 let ``upstream's benchmark mode takes its own options`` () =

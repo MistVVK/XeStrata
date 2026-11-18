@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace strata::image {
@@ -93,6 +94,7 @@ bool QiControl::open(const std::string& path, QiDit& dit, std::string& err, bool
         dry_ = dry;
         file_ = std::make_unique<platform::MappedFile>(path);
         SafeTensors st(path);
+        if (st.data_base() > file_->size()) throw std::runtime_error(path + ": data outside the file");
         const uint8_t* data = file_->data() + st.data_base();
         const int64_t C = dit.C_;
         auto need = [&](const std::string& name, std::initializer_list<int64_t> shape) -> const SafeTensor& {
@@ -100,10 +102,25 @@ bool QiControl::open(const std::string& path, QiDit& dit, std::string& err, bool
             if (t == nullptr) throw std::runtime_error(path + ": no " + name + " (not the Fun ControlNet Union)");
             if (t->dtype != "BF16" || t->shape != std::vector<int64_t>(shape))
                 throw std::runtime_error(path + ": " + name + " is not the BF16 shape the DiT takes");
+            auto invalid = [&](const char* why) {
+                std::string msg = path;
+                msg += ": ";
+                msg += name;
+                msg += why;
+                return std::runtime_error(msg);
+            };
+            uint64_t bytes = 2;
+            for (int64_t d : t->shape) {
+                if (d <= 0 || (uint64_t) d > std::numeric_limits<uint64_t>::max() / bytes)
+                    throw invalid(": invalid shape");
+                bytes *= (uint64_t) d;
+            }
+            if (t->end < t->begin || t->end > file_->size() - st.data_base() || t->end - t->begin != bytes)
+                throw invalid(": invalid data_offsets");
             return *t;
         };
         const SafeTensor* inw = st.find("control_img_in.weight");
-        if (inw == nullptr || inw->shape.size() != 2) throw std::runtime_error(path + ": not the Fun ControlNet Union");
+        if (inw == nullptr || inw->shape.size() != 2 || inw->shape[1] <= 0 || inw->shape[1] > INT64_MAX - 7) throw std::runtime_error(path + ": not the Fun ControlNet Union");
         in_k_ = inw->shape[1];
         need("control_img_in.weight", {C, in_k_});
         in_kp_ = (in_k_ + 7) / 8 * 8;

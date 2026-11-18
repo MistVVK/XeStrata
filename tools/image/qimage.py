@@ -49,13 +49,8 @@ Mage-Flow's: "dit_q8"), its Flux2 VAE with a narrower decoder (fixed, bf16), and
 chat model's own GGUFs, Unsloth's or, with -uncensored, HauhauCS's (MOSS_TEXT_QUANTS, Q8_0 lowered for the RAM like
 the others').  When the chat model is that same file, setup links it instead of fetching it again and the server has
 the chat engine encode the prompts (serve/images.py's text_states).  Its edits take an edit adapter, applied at 1:
-up to four reference images, the instruction in the prompt.  Setup fetches three ("edit_adapters"; the config's
-"edit_adapter" or XESTRATA_MOSS_EDIT chooses): chinoll's Moss-Image-Edit (PedroMarinhoDev's copy, GPL-3.0),
-the default - beside akhaliq's MOSS-Image-Edit-HQ armV5 (Apache 2.0) it kept the clothes a face swap was not asked to
-change, in 30 steps against 50 (the same face swap and expression, 2026-11-04) - and
-armV5 and armV6 (armV5 trained on with other captions and loss, its card's experiment), ai-toolkit adapters whose
-text encoder sees the references too: Qwen3.5-9B's vision encoder (Unsloth's mmproj, the same for every size of the
-text encoder) comes with them.
+up to four reference images, the instruction in the prompt. Setup fetches chinoll's Moss-Image-Edit
+(PedroMarinhoDev's ComfyUI copy, GPL-3.0). The 4-step model stacks that edit adapter with its speed LoRA.
 
 Anima (CircleStone Labs and Comfy Org, its own non-commercial license and NVIDIA's Open Model License; anima-base,
 anima-aesthetic, anima-turbo, and Gazingstars123's anima-2.9b): a DiT of one bf16 file (the engine keeps it 16-bit or
@@ -592,7 +587,6 @@ _HY_C = "PedroMarinhoDev/HunyuanImage-3.0-Instruct-Distil-ComfyUI"   # its quant
 _MS = "OpenMOSS-Team/MOSS-Image-SFT"
 _MB = "OpenMOSS-Team/MOSS-Image-Base"
 _ME = "PedroMarinhoDev/Moss-Image-Edit-ComfyUI"   # chinoll's Moss-Image-Edit adapter, its keys under `diffusion_model.`
-_MEHQ = "akhaliq/MOSS-Image-Edit-HQ"              # its armV5 and armV6, ai-toolkit adapters
 _Q35 = "unsloth/Qwen3.5-9B-GGUF"
 _Q35H = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
 _Q35H_FILE = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-{}.gguf"
@@ -737,10 +731,6 @@ FILES = {
                          "154c7f1455c3bf9925945c2f1ea2e4f09d0d0c67256081384a094b2b585f913f"),
     "moss-edit-lora": (_ME, "moss_image_edit_lora_bf16.safetensors", 297_419_000,
                        "f4bf2905dd40ae490ffda37d6be717f3361a4a723225cf0bf1f3b941eb03315d"),
-    "moss-edit-armv5": (_MEHQ, "weights/armV5/armV5.safetensors", 495_514_936,
-                        "1fbfae4eaaafc62c66a298e63e16fc5211566e1e3de1c58f83c35c6bc226c9f9"),
-    "moss-edit-armv6": (_MEHQ, "weights/armV6/armV6.safetensors", 495_514_936,
-                        "579d97ba2d9d12a9fad68cc2678eb3ca4ff5a2ae3a4c7689193a2e354c21f8b0"),
     # the text encoder's vision encoder (an ai-toolkit edit adapter's pictures), one file for every size of it
     "moss-mmproj": (_Q35, "mmproj-F16.gguf", 918_166_080,
                     "f70dc3509053962b0d0d3ee8a7eacebf5d60aa560cad78254ae8698516ae029f"),
@@ -911,6 +901,12 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
                 "anima-aesthetic": ("anima-aesthetic", "anima-aesthetic", "anima-stock"),
                 "anima-turbo": ("anima-turbo", "anima-turbo", "anima-stock"),
                 "anima-2.9b": ("anima-2.9b", "anima-2.9b", "anima-stock")}
+# Training uses the full-step model, not its distilled derivative.  The text encoder's variant is kept.
+TRAINING_BASE = {"qwen-image-turbo": "qwen-image-base", "qwen-image-turbo-uncensored": "qwen-image-base-uncensored",
+                 "mage-flow-turbo": "mage-flow", "mage-flow-turbo-uncensored": "mage-flow-uncensored",
+                 "moss-image-4-step": "moss-image", "moss-image-4-step-uncensored": "moss-image-uncensored",
+                 "anima-turbo": "anima-base"}
+
 DEFAULT_MODEL = "qwen-image-turbo"
 # the image models setup's question and the Windows launcher's checkboxes offer a text model set up for the first
 # time (the first the default model); one set up again offers what it has
@@ -944,7 +940,8 @@ ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
          "moss-image": "OpenMOSS's 5B model: text in images and a layout of boxes in the prompt, 50 steps with "
                        "guidance; edits with up to four reference images (its edit adapter, fetched with it)",
          "moss-image-base": "MOSS-Image's base model, before its fine-tuning, 50 steps with guidance",
-         "moss-image-4-step": "MOSS-Image SFT with akhaliq's 4-step LoRA, without guidance; no edits",
+         "moss-image-4-step": "MOSS-Image SFT with akhaliq's 4-step LoRA, without guidance; "
+                              "edits with chinoll's adapter",
          "anima-base": "Anima (2B), anime illustrations from Danbooru tags and sentences, 30 steps with guidance; the "
                        "model to train LoRAs on",
          "anima-aesthetic": "Anima tuned to a consistent, polished default style, 30 steps with guidance",
@@ -980,7 +977,6 @@ MF_EDIT = {"mf-turbo": ("mf-edit-turbo", 4), "mf-rl": ("mf-edit-rl", 30), "mf-ba
 MF_VAE = {"mf-trail": "mf-trail-vae"}   # a DiT's VAE where it is not Mage-VAE ("mf-vae")
 # files whose own name says too little
 LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-image-vae.safetensors",
-               "moss-edit-armv5": "armV5-ai-toolkit.safetensors", "moss-edit-armv6": "armV6-ai-toolkit.safetensors",
                "moss-mmproj": "Qwen3.5-9B-mmproj-F16.gguf",
                "moss-4-step-lora": "moss-image-akhaliq-4-step-lora.safetensors",
                "moss-control": "moss-control.safetensors",
@@ -1288,12 +1284,12 @@ def license_note(dit: str) -> str:
     if dit in MOSS_FEW_STEP:
         return (f"{name} is under the Apache 2.0 license: https://huggingface.co/{repo}, with "
                 f"akhaliq's 4-step LoRA, under Apache 2.0 too: https://huggingface.co/{_M4}; its text encoder, "
-                "Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well)")
+                f"Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well); chinoll's edit adapter copy is "
+                f"under GPL-3.0: https://huggingface.co/{_ME}")
     if is_moss(dit):
         return (f"{name} is under the Apache 2.0 license: https://huggingface.co/{repo}; its text encoder, Qwen3.5-9B, "
                 "too (HauhauCS's uncensored one, from it, as well).  Its edit adapters: chinoll's Moss-Image-Edit "
-                f"(PedroMarinhoDev's ComfyUI copy) under GPL-3.0, https://huggingface.co/{_ME}; akhaliq's "
-                f"MOSS-Image-Edit-HQ armV5 and armV6 under Apache 2.0, https://huggingface.co/{_MEHQ}")
+                f"(PedroMarinhoDev's ComfyUI copy) under GPL-3.0, https://huggingface.co/{_ME}")
     if dit == "mf-trail":
         return (f"{name} (RicemanT's finetune of Mage-Flow on Danbooru and e621 images) is under the MIT license: "
                 f"https://huggingface.co/{repo}; its VAE, Black Forest Labs' Flux2 VAE from FLUX.2-klein-4B, under "
@@ -1317,13 +1313,13 @@ def file_names(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant:
     if is_hunyuanimage3(dit):
         return (f"hunyuanimage3-{quant}", "hunyuanimage3-vae", "hunyuanimage3-tokenizer",
                 "hunyuanimage3-system-prompt", "hunyuanimage3-vision")
-    if dit in MOSS_FEW_STEP:   # the shards, VAE and LoRA (no edit adapter)
+    if dit in MOSS_FEW_STEP:   # the shards, VAE, speed and edit adapters
         sh = moss_shards(dit)
-        return (f"{sh}-1", f"{sh}-2", f"{sh}-3", f"{sh}-config", "moss-vae", "moss-4-step-lora",
+        return (f"{sh}-1", f"{sh}-2", f"{sh}-3", f"{sh}-config", "moss-vae", "moss-4-step-lora", "moss-edit-lora",
                 text_file(text_encoder, text_quant))
     if is_moss(dit):
-        return (f"{dit}-1", f"{dit}-2", f"{dit}-3", f"{dit}-config", "moss-vae", "moss-edit-lora", "moss-edit-armv5",
-                "moss-edit-armv6", "moss-mmproj", text_file(text_encoder, text_quant))
+        return (f"{dit}-1", f"{dit}-2", f"{dit}-3", f"{dit}-config", "moss-vae", "moss-edit-lora",
+                text_file(text_encoder, text_quant))
     if is_anima(dit):
         return (f"{dit}-bf16", "anima-vae", text_file(text_encoder, text_quant), "anima-t5-tokenizer")
     if is_mage(dit):
@@ -1540,13 +1536,15 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))),
                 "t5_tokenizer": str(local_path(models_dir, "anima-t5-tokenizer")), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
-    if dit in MOSS_FEW_STEP:   # the 4-step LoRA: no guidance or edit adapter, never baked into the weights
+    if dit in MOSS_FEW_STEP:   # speed and edit adapters, never baked into the weights
         q8 = {"dit_q8": bool(dit_q8)} if dit_q8 is not None else {}
         return {**q8, "model_name": name, "family": "moss-image", "exe": str(exe), "quant": "bf16", **loras,
                 "diffusion_model": str(local_path(models_dir, f"{moss_shards(dit)}-1").parent),
                 "steps": DITS[dit][1], "schedule": "moss", "cfg_scale": 1.0, "transparency": False,
                 "vae": str(local_path(models_dir, "moss-vae")),
                 "turbo_lora": str(local_path(models_dir, "moss-4-step-lora")), "lora_bake": False,
+                "edit_lora": str(local_path(models_dir, "moss-edit-lora")), "edit_format": "moss-image-edit",
+                "edit_steps": 4, "edit_cfg_scale": 1.0,
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     if is_moss(dit):
@@ -1558,11 +1556,7 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "vae": str(local_path(models_dir, "moss-vae")),
                 "edit_lora": str(local_path(models_dir, "moss-edit-lora")), "edit_adapter": "chinoll",
                 "edit_adapters": {"chinoll": {"lora": str(local_path(models_dir, "moss-edit-lora")),
-                                              "format": "moss-image-edit", "about": "chinoll's Moss-Image-Edit"},
-                                  **{v: {"lora": str(local_path(models_dir, f"moss-edit-{v}")), "format": "ai-toolkit",
-                                         "vision": str(local_path(models_dir, "moss-mmproj")), "about": about}
-                                     for v, about in (("armv5", "akhaliq's MOSS-Image-Edit-HQ armV5"),
-                                                      ("armv6", "akhaliq's MOSS-Image-Edit-HQ armV6"))}},
+                                              "format": "moss-image-edit", "about": "chinoll's Moss-Image-Edit"}},
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     if is_mage(dit):

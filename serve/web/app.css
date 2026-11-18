@@ -799,3 +799,34 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
   .tr-panes{grid-template-columns:minmax(0,1fr)}
   .tr-text{min-height:160px}
 }
+
+/* ------------------------------------------------------------------ LoRA training panel (ltw, app.js) */
+.ltw { border: 1px solid var(--st-border); border-radius: 10px; padding: 0.9rem; margin-top: 0.6rem; display: grid; gap: 0.6rem; }
+.st-bubble .ltw { width: 100%; min-width: 0; }   /* the chat's tool card: the bubble's width, no overflow */
+.ltw-head { font-weight: 600; }
+.ltw-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.5rem; }
+.ltw-wide { grid-column: 1 / -1; }
+.ltw-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.ltw-drop { border: 2px dashed var(--st-border); border-radius: 10px; padding: 0.9rem; display: grid; gap: 0.5rem; color: var(--st-muted); }
+.ltw-drop--over { border-color: var(--st-accent); color: var(--st-text); }
+.ltw-chatpics { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.ltw-pick { position: relative; width: 72px; height: 72px; }
+.ltw label.ltw-pick img { width: 100%; height: 100%; object-fit: cover; border-radius: 6px; }
+.ltw-pick input { position: absolute; top: 2px; left: 2px; }
+.ltw-imgs { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 0.5rem; }
+.ltw-img { display: grid; grid-template-columns: 64px 1fr auto; gap: 0.4rem; align-items: start; }
+.ltw div.ltw-img img { width: 64px; height: 64px; object-fit: cover; border-radius: 6px; }
+.ltw-img textarea { font-size: 0.85rem; }
+.ltw-settings summary { cursor: pointer; }
+.ltw-bar { height: 8px; border-radius: 4px; background: var(--st-border); overflow: hidden; }
+.ltw-bar__fill { height: 100%; background: var(--st-accent); transition: width 0.5s; }
+.ltw-vers { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.6rem; }
+.ltw-ver { border: 1px solid var(--st-border); border-radius: 10px; padding: 0.5rem; display: grid; gap: 0.4rem; cursor: pointer; }
+.ltw-ver--reg { border-color: var(--st-accent); }
+.ltw-ver__step { font-weight: 600; font-size: 0.9rem; }
+.ltw-ver__pics { display: flex; gap: 0.3rem; }
+.ltw div.ltw-ver__pics img { width: 50%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; }
+.ltw-dialog { border: 1px solid var(--st-border); border-radius: 12px; padding: 1rem; max-width: 860px; width: min(860px, 94vw); max-height: 90vh; overflow: auto; background: var(--st-bg); color: var(--st-text); }
+.ltw-dialog::backdrop { background: rgb(0 0 0 / 0.5); }
+.ltw-dialog__close { position: absolute; top: 0.5rem; right: 0.5rem; }
+.ltw-dialog .ltw { border: none; padding: 0; margin: 0; }

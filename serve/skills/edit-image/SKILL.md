@@ -16,6 +16,8 @@ metadata:
 - `mask`: a mask's link (white changes): find_region's, or the one the user painted (set by itself).
 - `strength` 1 redraws (the default; img2img's 0.87); 0.5 to 0.7 keeps the shapes. A face made into another person's: that person's picture as a
   reference, not fix_image.
+- For an edit combining two or more reference images, tell the user and use Qwen-Image-2.1 even when
+  MOSS-Image is selected.
 - MOSS-Image with a mask and references: first without `refine`; `refine` true only when the part comes out poor
   (on the image edited before). `edit_adapter` only when the user names one.
 - `crop_upscale`: as edit_region's.

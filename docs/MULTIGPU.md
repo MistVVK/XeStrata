@@ -261,8 +261,7 @@ Only the last stage waits for the verdict.
 `--pipeline-windows 1` overlaps only the short prefills that go through the verify windows (`--short-read`), with two stages only.
 
 It works with a split of two or more stages, each on its own GPU, and `--serve`.
-When it is not given, it is `2` on a split of exactly two Xe2 (Battlemage) GPUs with `--serve` and the draft layer, and no `--batch` or helper caches (upstream a6fd78856: on two Arc Pro B65 upstream measured decode 17-28% faster than the serial windows, and a one-hour serve with no token differences).
-`--pipeline-windows 0` or `XESTRATA_PIPELINE_AUTO=0` turns it off; every other setup stays serial.
+When it is not given, it is `0` and the stages stay serial.
 With three or more stages `--pipeline-windows 2` turns `--adapt-async` off, and the adaptive tier runs at a verdict.
 
 - **Cost**: a second verify window on each GPU, 160 MiB more kept out of each GPU's expert cache, and with `2` two copies of the recurrent state on every GPU before the last stage (about 3 MiB per GDN layer of that GPU).

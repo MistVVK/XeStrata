@@ -3057,6 +3057,16 @@
    "default": false
   },
   {
+   "name": "image-lora-training",
+   "label": "Also prepare the bases for LoRA training",
+   "kind": "flag",
+   "place": "images",
+   "default": false,
+   "when": [
+    "images"
+   ]
+  },
+  {
    "name": "image-gpu",
    "label": "The GPU that makes the images",
    "kind": "choice",

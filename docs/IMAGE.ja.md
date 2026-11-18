@@ -29,7 +29,7 @@ Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデル�
 | `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent の大きな MoE のモデル（80B）。いちばん細かく描け、いちばん遅い。プロンプトを自分で読むので文の読み手が要らず、ディスクと RAM をいちばん多く使う（約 52 GB）。編集は参照画像 3 枚まで（透明な背景はない） |
 | `moss-image` | [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50（CFG） | OpenMOSS の 5B のモデル。画像の中の文字と、枠で決めた配置（`layout`）に向く。プロンプトの書き広げ（`enhance`）も使える。編集は chinoll の編集の LoRA（Moss-Image-Edit）で、参照画像 4 枚まで（img2img とマスクも使える） |
 | `moss-image-base` | [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) | 50（CFG） | 調整の前の元のモデル |
-| `moss-image-4-step` | SFT と akhaliq の [4 ステップ LoRA](https://huggingface.co/akhaliq/MOSS-Image-SFT-4-steps) | 4〜8 | 通常の Euler で描く。1024² 以下は 4、より大きい画像は 6 または 8 ステップ。CFG と negative prompt は使わない。編集はない |
+| `moss-image-4-step` | SFT と akhaliq の [4 ステップ LoRA](https://huggingface.co/akhaliq/MOSS-Image-SFT-4-steps) | 4〜8 | 通常の Euler で描く。1024² 以下は 4、より大きい画像は 6 または 8 ステップ。CFG と negative prompt は使わない。部分の編集にも使えるが、画風の変更は通常版を使う |
 | `moss-image-uncensored`、`moss-image-base-uncensored`、`moss-image-4-step-uncensored` | 上の 3 つ | 上と同じ | 文の読み手を HauhauCS の拒否を外した Qwen3.5-9B にした組み合わせ |
 | `anima-base` | [Anima](https://huggingface.co/circlestone-labs/Anima) | 30（CFG） | CircleStone Labs の 2B のモデル。Danbooru のタグと文で描くアニメ調のイラスト向け。編集はできない（img2img とマスクは使える） |
 | `anima-aesthetic` | [Anima-Aesthetic](https://huggingface.co/circlestone-labs/Anima) | 30（CFG） | 決まった整った画風に調整した版 |
@@ -148,7 +148,7 @@ Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じ�
 | `keep_files` | 64 | `response_format: "url"` の画像を残す数 |
 | `out_dir` | 一時フォルダー | 画像とエンジンのログ（`xestrata-image.log`）を置くフォルダー |
 | `lora_bake` | `true` | DiT のブロックに当てる素の LoRA を、重みに焼き込む（`false` で、積のたびに差分を足す。[LoRA](#loraアダプター)） |
-| `edit_adapter` | `chinoll` | MOSS-Image の編集の LoRA（`chinoll`・`armv5`・`armv6` か `edit_adapters` に足した名前、下の「画像を直す」のマスク）。環境変数 `XESTRATA_MOSS_EDIT` がこれより優先します |
+| `edit_adapter` | `chinoll` | MOSS-Image の編集の LoRA（`chinoll` か `edit_adapters` に足した名前、下の「画像を直す」のマスク）。環境変数 `XESTRATA_MOSS_EDIT` がこれより優先します |
 | `image_tools` | すべて | チャットのモデルが使ってよい画像の道具の一覧（`generate_image`・`edit_image`）。ここにない道具は、チャットにも Images API にも出しません |
 | `crop_edit` | `true` | マスク付きの編集で、塗った部分の周りを切り出して拡大して描き直し、貼り戻す（下の「画像を直す」のマスク）。`false` で今までどおり出力の大きさのまま描き直す |
 | `lora_dir` | 画像のモデルのファイルの隣の `loras` | LoRA のファイルを置くフォルダー（setup はデータのフォルダーの `models/loras` を書きます。どのモデルも 1 つを共有し、一覧はモデルごとに絞ります。[LoRA](#loraアダプター)） |
@@ -327,8 +327,8 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
    - 塗った部分が大きく、切り出しても拡大にならないときは、画像全体を約 1024x1024 ピクセルで描き直し、元の大きさに戻して貼り戻します。
    - 何も塗っていないマスクは、1 枚目の画像をそのまま返します。
    - `color_match` に `auto` を付けると、描いた部分を貼り戻す前に、塗った部分のすぐ外（元のまま残る所）で元の画像と描いた画像の色（Lab の平均と標準偏差）をそろえ、モデルの色のずれだけを直します。塗った部分の中で頼んだ色の変更は打ち消しません。`full` は、切り出した全体の色（Lab の平均と標準偏差）を元の画像に寄せます（頼んだ色の変更も薄まります）。既定は `off`（設定の `images` の `color_match` で変えられます）で、試したモデル（Qwen-Image-2.1-Turbo、MOSS-Image）では描いた後の色のずれが小さかったためです。
-   - MOSS-Image の編集の LoRA は、既定が chinoll の版です（顔の差し替えで、頼んでいない服を変えず、30 ステップで済みます）。設定のファイルの `"images"`（か `image_models` の MOSS-Image の欄）の `edit_adapter` を `armv5` か `armv6` にするか、環境変数 `XESTRATA_MOSS_EDIT=armv5` などで替わります。armV6 は armV5 から説明文と損失の重みを変えて学習を続けた版です。どちらも ai-toolkit で学習した形で、文の読み手にも参照画像を見せ（各画像を 384×384 以下に縮め、プロンプトの前に「Picture N:」と置きます）、既定は 50 ステップ・CFG 3 です。
-   - 自分の編集の LoRA は、同じ欄の `edit_adapters` に `"名前": {"lora": "<ファイル>", "format": "<形>", "vision": "<mmproj>"}` を足し、`edit_adapter` をその名前にして使います。`format` は学習の形に合わせます。chinoll の版の形は `moss-image-edit`、ai-toolkit で `kv_cache` を有効にして学習したもの（公開されている ai-toolkit の編集の LoRA はどれもこれです）は `ai-toolkit`、無効にして学習したもの（ai-toolkit の既定）は `ai-toolkit-no-kv`、参照画像を描く画像と同じ時刻で流す形（thearkorbit の moss-image-edit-lora-poc）は `appended` です。ai-toolkit の LoRA のファイルには `kv_cache` の設定が残らないので、学習の設定（`model_kwargs.kv_cache`）を見て選びます。`ai-toolkit` と `ai-toolkit-no-kv` は、`vision` に Qwen3.5-9B の mmproj（setup が取った armV5 のものと同じ）が要ります。
+   - MOSS-Image の編集の LoRA は chinoll の版です。複数の画像を組み合わせる編集は Qwen-Image-2.1 を使ってください。
+   - 自分の編集の LoRA は、同じ欄の `edit_adapters` に `"名前": {"lora": "<ファイル>", "format": "<形>", "vision": "<mmproj>"}` を足し、`edit_adapter` をその名前にして使います。`format` は学習の形に合わせます。chinoll の版の形は `moss-image-edit`、ai-toolkit で `kv_cache` を有効にして学習したもの（公開されている ai-toolkit の編集の LoRA はどれもこれです）は `ai-toolkit`、無効にして学習したもの（ai-toolkit の既定）は `ai-toolkit-no-kv`、参照画像を描く画像と同じ時刻で流す形（thearkorbit の moss-image-edit-lora-poc）は `appended` です。ai-toolkit の LoRA のファイルには `kv_cache` の設定が残らないので、学習の設定（`model_kwargs.kv_cache`）を見て選びます。`ai-toolkit` と `ai-toolkit-no-kv` は、`vision` に Qwen3.5-9B の mmprojが要ります。
    - LoRA の置き場（`lora_dir`）に置いた MOSS-Image の編集の LoRA も、形がファイルから分かれば選べます。分かるのは、隣の `<名前>.json` の `"edit_format"`、Moss-Image-Edit の形のメタデータ（`adapter_config` の `moss-edit-lora`）、ai-toolkit が出力に書く学習の設定（隣の `<名前>.yaml` か、ジョブの名前が同じ `config.yaml`）の `model_kwargs` の `edit` と `kv_cache` です。チャットで「armv6 の LoRA で」のように名指しすると、チャットのモデルが `edit_image` の `edit_adapter` でその LoRA を選び、Images API の編集でも `edit_adapter` に名前を書けます。使えない名前（形の分からない LoRA など）は、既定の LoRA で描かずに理由を返します。
    - MOSS-Image の編集で参照画像が 2 枚以上のときは、切り出さずに画像全体を描き直します（塗った部分の外は 1 枚目の画像のまま残します）。編集の LoRA は参照画像を画像全体と組みで覚えているので、切り出した部分だけでは参照画像の別の部分を写してしまうためです。
      `refine` を `true` にすると、その結果の塗った部分の周りを切り出して、参照画像とともに strength 0.5 で描き直します。塗った部分を拡大して細かく描き直し、時間はおよそ 1.6 倍です。チャットでは、まず `refine` なしで描き、塗った部分の出来が悪いときだけ `refine` で描き直します。
@@ -360,7 +360,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
   SAM 3.1 の重みは、利用者が SAM License に同意するまで取りません（setup の問いか `--image-sam3-license agree`（`xestrata images` では `--sam3-license agree`）、ランチャーの画像の設定のチェック、または Web の画像の画面の「SAM 3 のライセンス…」で同意します。同意は `image-tools/sam3.accepted` に残ります）。同意するまでは Florence-2 が場所を見つけます。
 - **strength**: 0 より大きく 1 以下。1 枚目の画像からどれだけ変えるかで、小さいほど元の画像を多く残します。diffusers の img2img と同じく、ステップの表の先頭 floor(ステップ数 × (1 − strength)) を飛ばし、元の画像の潜在にその時点の分のノイズを混ぜて始めます（回すステップ数が減るので、その分速くなります）。
   既定は、編集では 1（今までの編集）、img2img では 0.87（ただし少なくとも 1 ステップ飛ばすよう、1 − 1/ステップ数 を超えない。4 ステップなら 0.75）、マスクだけの img2img では 1 です。1 ステップも回らない値は断ります。`denoise` は受けません（denoise 0.5 の 20 ステップは、`strength` 0.5 の 40 ステップと同じです）。
-- **ステップ数**: Qwen-Image-2.1 と HunyuanImage 3.0 は生成と同じです。Mage-Flow の編集は Turbo が 4、ほかの 2 つは 30 で、img2img は生成と同じです。MOSS-Image の編集は 30 ステップ、CFG 5 で、編集の LoRA を強さ 1 で当てます（強さが 1 より小さいと、編集でなく描き直しになります）。
+- **ステップ数**: Qwen-Image-2.1 と HunyuanImage 3.0 は生成と同じです。Mage-Flow の編集は Turbo が 4、ほかの 2 つは 30 で、img2img は生成と同じです。MOSS-Image の編集は通常 30 ステップ、CFG 5 です。4-step は CFG 1、4〜8 ステップで部分の編集に使えます。どちらも編集の LoRA を強さ 1 で当てます（強さが 1 より小さいと、編集でなく描き直しになります）。
 - **LoRA**: 生成と同じ `lora`（とプロンプトのタグ）を受け、参照画像を使う画像にも同じアダプターを当てます（[LoRA](#loraアダプター)）。
 - 参照画像のアルファも、そのまま画像のモデルに渡します。ほかの項目は生成と同じです。
 
@@ -515,12 +515,16 @@ vLLM-Omni の動画の分割と同じ形です。multipart の `video`（動画�
 - setup は設定の `"images"` に `"lora_dir"` を書きます（データのフォルダーの `models/loras`）。1 つのフォルダーをどのモデルも共有し、一覧はモデルごとに絞ります。フォルダーが無ければ自分で作ります。
   ファイルは `.safetensors` と `.gguf` で、サブフォルダーも読めます（名前は `style/gouache` のように道になります）。
 - フォルダーは 10 秒まで覚え、フォルダーが更新されるとすぐ読み直します。サーバーを止める必要はありません。
-- `/health` の `image_defaults`・`image_models` と、`/v1/models` の画像モデルの項目の `defaults.loras` に、そのモデルが当てられるファイルが並びます。1 本ごとに、`name`（拡張子を除いた名前。サブフォルダーは道）、`path`（フォルダーからの道）、`rank`（OFT と全体差分は 0）、`scale`（ファイルのメタデータが勧める強さ。無ければ 1）、`trigger`（トリガーの語）、`kind`（学習で足したもの: `character`・`style`・`other`。XeStrata の学習器がメタデータ `ss_xestrata_kind` に書く。無ければ `null`）、`targets`（変える重みの種類）、`size_mib`（ファイルの大きさ）です。
+- `/health` の `image_defaults`・`image_models` と、`/v1/models` の画像モデルの項目の `defaults.loras` に、そのモデルが当てられるファイルが並びます。1 本ごとに、`name`（拡張子を除いた名前。サブフォルダーは道）、`path`（フォルダーからの道）、`rank`（OFT と全体差分は 0）、`scale`（ファイルのメタデータが勧める強さ。無ければ 1）、`trigger`（トリガーの語）、`kind`（学習で足したもの: `character`・`style`・`other`。XeStrata の学習器がメタデータ `ss_xestrata_kind` に書く。無ければ `null`）、`steps`（メタデータの `ss_steps`。保存までの step。無ければ `null`）、`targets`（変える重みの種類）、`size_mib`（ファイルの大きさ）です。
 - そのモデルの重みではないキーを持つファイルや、当てられない形式のファイルは一覧に出ません。その名前で頼むと、理由の付いた 400 が返ります。
 
 ```sh
 curl -s http://127.0.0.1:8095/health | python3 -c 'import json,sys; print(*[e["name"] for e in json.load(sys.stdin)["image_defaults"]["loras"]], sep="\n")'
 ```
+
+### 作成（ブラウザ）
+
+チャットの `train_lora`（スキル `lora-train`）か、Images の LoRA の節の「LoRA を学習…」で作成画面が開きます。画像の投入・キャプション・設定・学習の進み・版の見比べと登録までブラウザでできます。仕組みと API は [LORA_TRAIN](LORA_TRAIN.ja.md#ブラウザからの作成) にあります。
 
 ### 当てる
 
@@ -674,7 +678,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
 - MOSS-Image（SFT と Base）の重みは Apache 2.0 で、OpenMOSS（MOSI. AI）が公開しています。VAE は MOSS-Image のリポジトリにあるものです。
   4 ステップの LoRA は akhaliq の [MOSS-Image-SFT-4-steps](https://huggingface.co/akhaliq/MOSS-Image-SFT-4-steps) で、Apache 2.0 です。強さ 1 で焼き込まずに当てます。ステップ数の指定は 4〜8 です。
   以前の 4 ステップ設定も、新しい LoRA があれば自動で読み替えます。新しいファイルがなければ setup で `moss-image-4-step` を選び直してください。古い 3 ファイルは自動では消しません。
-  編集の LoRA は 3 つで、setup はすべてを取ります。既定は chinoll の [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit)（PedroMarinhoDev が単一ファイルに直した[版](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI)、GPL-3.0）、ほかの 2 つは akhaliq の [MOSS-Image-Edit-HQ](https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ) の armV5 と armV6（Apache 2.0）です。この 2 つのために、Unsloth の Qwen3.5-9B の画像の読み手（mmproj、Apache 2.0）も取ります。
+  編集の LoRA は chinoll の [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit) です。setup は PedroMarinhoDev が単一ファイルに直した[版](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI)（GPL-3.0 表記）を取ります。
 - Anima（Base、Aesthetic、Turbo）の重みは CircleStone Labs の非商用のライセンスと、土台の Cosmos-Predict2 の NVIDIA Open Model License です。モデルを商用に使うことはできません（作った画像は使えます）。使う前に [Anima のページ](https://huggingface.co/circlestone-labs/Anima) を読んでください。
   Anima-2.9B（Gazingstars123）と派生モデルには、それぞれの公開元のライセンスが適用されます。
   VAE は Anima のリポジトリにある Wan 2.1 の VAE、プロンプトの区切りに使う T5 の `tokenizer.json`（google-t5/t5-base）は Apache 2.0 です。

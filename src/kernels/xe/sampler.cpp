@@ -68,7 +68,7 @@ inline float philox_uniform(uint64_t seed, uint64_t counter) {
 // they are its most likely tokens, and the tail's mass is the part a draw almost never reaches.  A draw is one
 // 64-bit mix and two logs - and only the work-item that writes the row's answer makes it (the argument is the same
 // for every work-item, and computing it 256 or 1024 times is what made this cost more than it saved on the B70).
-// D float (a GPU without FP64): u from the hash's top 24 bits, still in (0, 1).
+// D float (a GPU without FP64): u from the hash's top 23 bits, still in (0, 1).
 inline uint64_t kh_mix(uint64_t z) {
     z += 0x9E3779B97F4A7C15ull;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -80,10 +80,10 @@ template <typename D>
 inline D gumbel_noise(uint64_t seed, uint64_t counter, uint32_t token) {
     const uint64_t h = kh_mix(kh_mix(kh_mix(seed) ^ counter) ^ ((uint64_t) token * 0xD6E8FEB86659FD93ull));
     if constexpr (sizeof(D) == 8) {
-        const D u = ((D) (h >> 11) + 0.5) * (1.0 / 9007199254740992.0);   // (0, 1), never 0 or 1
+        const D u = ((D) (h >> 12) + 0.5) * (1.0 / 4503599627370496.0);   // (0, 1), never 0 or 1
         return -sycl::log(-sycl::log(u));
     } else {
-        const D u = ((D) (uint32_t) (h >> 40) + 0.5f) * (1.0f / 16777216.0f);
+        const D u = ((D) (uint32_t) (h >> 41) + 0.5f) * (1.0f / 8388608.0f);
         return -sycl::log(-sycl::log(u));
     }
 }

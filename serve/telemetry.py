@@ -19,6 +19,7 @@ from __future__ import annotations
 import collections
 import ctypes
 import glob
+import functools
 import os
 import platform
 import re
@@ -394,6 +395,37 @@ class _AmdGpu:
         out.update(self.link())
         out["pcie_rx_mb"] = out["pcie_tx_mb"] = None   # no counters for the link's traffic
         return out
+
+
+@functools.lru_cache(maxsize=16)
+def _nv_process_device(pci: str):
+    return _NvGpu(pci)
+
+
+def nvml_process_memory_mib(pid: int, pci: str) -> int | None:
+    """The process's device memory via NVML's compute list (gpu.cpp's process and MIG rules)."""
+    class Process(ctypes.Structure):
+        _fields_ = [("pid", ctypes.c_uint), ("used", ctypes.c_ulonglong),
+                    ("gpu_instance", ctypes.c_uint), ("compute_instance", ctypes.c_uint)]
+
+    gpu = _nv_process_device(pci)
+    if not gpu.ok():
+        return None
+    try:
+        fn = gpu.lib.nvmlDeviceGetComputeRunningProcesses_v3
+        n = ctypes.c_uint(0)
+        rc = fn(gpu.dev, ctypes.byref(n), None)
+        if rc not in (0, 7) or not n.value:
+            return None
+        rows = (Process * n.value)()
+        if fn(gpu.dev, ctypes.byref(n), rows) != 0:
+            return None
+        matches = [row.used for row in rows[:n.value] if row.pid == pid]
+        if not matches or any(v == 0xffffffffffffffff for v in matches):
+            return None
+        return sum(matches) >> 20
+    except (AttributeError, OSError):
+        return None
 
 
 # ------------------------------------------------------------------------------------------------ an NVIDIA GPU

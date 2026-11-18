@@ -327,8 +327,10 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
             for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
             for (int t = 0; t < n; ++t) {
                 const float* ht = hbuf + (size_t) t * C;
+                const float* hk = ht + qk;
+                const float* hv = hk + qk;
                 sycl::group_barrier(it.get_group());
-                if (tid < S) { sk[tid] = ht[qk + qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
+                if (tid < S) { sk[tid] = hk[qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
                 sycl::group_barrier(it.get_group());
                 const float g = sycl::exp(gate[(size_t) t * h_v + head]);
                 float kv = 0.0f;
@@ -337,7 +339,7 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
                 red[rg * GS_COLS + lc] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red[lc] + red[GS_COLS + lc] + red[2 * GS_COLS + lc] + red[3 * GS_COLS + lc];
-                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                const float delta = (hv[head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 float o = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) {

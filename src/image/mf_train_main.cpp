@@ -89,7 +89,8 @@ int main(int argc, char** argv) {
     std::string train_blocks, only_if, ignore_if, kind;   // train::Targets' values, and the metadata's kind
     // ai-toolkit's Mage-Flow defaults (its mageflow model's job): linear timesteps, rank 32 with alpha = rank,
     // AdamW lr 1e-4 eps 1e-6 weight decay 1e-4 at a constant rate, batch 1, 3,000 steps, a save every 250, the
-    // caption dropped 5% of the time.  "logit-normal" and "shifted" are the earlier SPEC's draws.
+    // caption dropout from the manifest (the preprocessing default is the shared 0). "logit-normal" and "shifted"
+    // are the earlier SPEC's draws.
     std::string timesteps = "linear";
     float sigma = 0.5f, lr = 1e-4f, alpha = 0.f, sigma_max = 0.f, adam_eps = 1e-6f, wd = 1e-4f, dropout = -1.f;
     int rank = 32, steps = 3000, accum = 1, checkpoint = 250, seed = 12345, warmup = 0;
@@ -255,11 +256,6 @@ int main(int argc, char** argv) {
             if (dropout >= 0.f) {   // the flag decides for every sample over the manifest's column
                 if (dropout > 1.f) throw std::runtime_error("--caption-dropout out of [0,1]");
                 for (float& d : drop_rates) d = dropout;
-            } else {
-                bool all0 = true;
-                for (float d : drop_rates) all0 = all0 && d == 0.f;
-                if (all0)   // data exported before the dropout column carried a rate: ai-toolkit's 5%
-                    for (float& d : drop_rates) d = 0.05f;
             }
             // ai-toolkit's linear timesteps: torch.linspace(1000, 1, 1000)[randint(0, 999)], sigma = t / 1000
             const strata::image::train::Schedule lin = strata::image::train::schedule_linear();
@@ -334,6 +330,7 @@ int main(int argc, char** argv) {
                                                                        strata::image::mf_train_max_tokens(data), rank);
             strata::image::train::Control ctl(strata::image::mf_trainer_base(m.get()), co);
             ctl.load(resume_path, load_loop);
+            strata::image::train::log_training_plan(strata::image::mf_trainer_base(m.get()), lr, std::max(0, warmup));
             ctl.report();
             if (!ctl.boundary(true, save_loop)) return 0;   // initial eval also needs the largest cached shape's budget
             eval_avg("init");
@@ -387,6 +384,7 @@ int main(int argc, char** argv) {
                 ++updates;
                 const float lrw = warmup > 0 ? lr * std::min(1.f, (float) updates / (float) warmup) : lr;
                 strata::image::mf_trainer_adamw(m.get(), lrw, 0.9f, 0.999f, adam_eps, wd, accum);
+                const double update_loss = acc_loss / accum;
                 if (updates % 10 == 0 || updates == 1) {
                     std::printf("step %5d loss %.6f lr %.1e\n", updates, acc_loss / accum, (double) lrw);
                     std::fflush(stdout);
@@ -396,10 +394,12 @@ int main(int argc, char** argv) {
                 if (updates % checkpoint == 0)
                     strata::image::mf_trainer_save(m.get(), out + "." + std::to_string(updates) + ".safetensors",
                                                    title, trigger, seed, lr, updates, steps, kind);
+                ctl.progress(updates, (steps + accum - 1) / accum, update_loss);
             }
             if (acc_n > 0) {   // the tail micro-steps' gradients, averaged over what ran
                 strata::image::mf_trainer_adamw(m.get(), lr, 0.9f, 0.999f, adam_eps, wd, acc_n);
                 ++updates;
+                ctl.progress(updates, (steps + accum - 1) / accum, acc_loss / acc_n);
             }
             acc_n = 0;
             acc_loss = 0;
@@ -408,6 +408,7 @@ int main(int argc, char** argv) {
             eval_avg("final");
             strata::image::mf_trainer_save(m.get(), out + ".final.safetensors", title, trigger, seed, lr, updates,
                                            steps, kind);
+            ctl.save(save_loop);
             std::printf("done: saved %s (skipped %d non-finite micro-steps)\n",
                         (out + ".final.safetensors").c_str(), nskip);
         } catch (const std::exception& e) {
