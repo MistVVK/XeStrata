@@ -1,6 +1,6 @@
 ---
 name: extend-image
-description: More of the picture around it (wider, taller, another shape).
+description: More of the picture around it (wider, taller, another shape): aspect ("16:9") or left, right, top, bottom, and prompt.
 metadata:
   kind: tool
   tool: extend_image

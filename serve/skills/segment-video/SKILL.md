@@ -1,6 +1,6 @@
 ---
 name: segment-video
-description: Things in an attached video found, followed or masked ("track the car").
+description: Things in an attached video found, followed or masked ("track the car"): prompts, masks.
 metadata:
   kind: tool
   tool: segment_video

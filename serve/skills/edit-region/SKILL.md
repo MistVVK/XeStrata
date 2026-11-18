@@ -1,6 +1,6 @@
 ---
 name: edit-region
-description: One part changed, the rest kept ("her hair blue", "only the sky").
+description: One part changed or removed, the rest kept ("her hair blue", "a smile", "remove the boat"): region and prompt.
 metadata:
   kind: tool
   tool: edit_region

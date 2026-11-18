@@ -1,6 +1,6 @@
 ---
 name: upscale-image
-description: An image larger or finer (a wallpaper, a print, "more detail").
+description: An image larger or finer (a wallpaper, a print, "more detail"): scale, redraw with prompt.
 metadata:
   kind: tool
   tool: upscale_image

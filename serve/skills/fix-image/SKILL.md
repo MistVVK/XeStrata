@@ -1,6 +1,6 @@
 ---
 name: fix-image
-description: Faces or hands drawn rough, mostly small ones (a full-body picture, a group).
+description: Faces or hands drawn rough, mostly small ones (a full-body picture, a group): parts ("face", "hands").
 metadata:
   kind: tool
   tool: fix_image

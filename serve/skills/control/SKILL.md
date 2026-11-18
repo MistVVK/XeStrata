@@ -1,6 +1,6 @@
 ---
 name: control
-description: A new image in a picture's pose, composition or layout ("in this pose", "this sketch drawn properly").
+description: A new image in a picture's pose, sketch, composition or depth ("in this pose", "this sketch drawn properly", "the same layout as a Japanese room"): type, image, prompt.
 metadata:
   kind: tool
   tool: control

@@ -1,6 +1,6 @@
 ---
 name: upscale-video
-description: An attached video larger or sharper ("upscale", "4K").
+description: An attached video larger or sharper ("upscale", "4K"): scale.
 metadata:
   kind: tool
   tool: upscale_video

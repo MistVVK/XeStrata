@@ -1,6 +1,6 @@
 ---
 name: remove-background
-description: The subject cut out (transparent PNG, sticker) or on a plain color.
+description: The subject cut out (transparent PNG, sticker) or on a plain color: image, background_color, version.
 metadata:
   kind: tool
   tool: remove_background

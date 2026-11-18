@@ -1,6 +1,6 @@
 ---
 name: find-region
-description: Where something is in an image, or its mask for another tool.
+description: Where something is in an image, or its mask for edit_image: region (English words) and image.
 metadata:
   kind: tool
   tool: find_region
