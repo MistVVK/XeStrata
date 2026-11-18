@@ -1601,7 +1601,7 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err,
             nb += v * v;
         }
         if (na > kLargeRow && nb > 0.0) {
-            shift[(size_t) j] = (int) std::lround(std::log2(na / nb) / 4.0);   // log2(sqrt(|A| / |B|)), squared norms
+            shift[(size_t) j] = std::max(0, (int) std::lround(std::log2(na / nb) / 4.0));   // log2(sqrt(|A| / |B|)), squared norms
             shifted = shifted || shift[(size_t) j] != 0;
         }
     }
