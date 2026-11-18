@@ -45,8 +45,11 @@ Every copyright holder whose work is in this repository, its license and where t
   with its own LICENSE
 - Copyright (c) 2026 Edge0
   Apache-2.0 - the latent MoE support (Edge0-145B / Edge0-120B, Qwen3.8-Flash-Next's shell with experts at a latent
-  width): the pack readers (src/core/latent.cpp, include/strata/core/latent.hpp), the latent kernels
-  (src/kernels/xe/latent.cpp, include/strata/kernels/latent.hpp) and the layer parity (src/kernels/latent_parity.cpp),
+  width): the pack readers (src/core/latent.cpp, include/strata/core/latent.hpp,
+  include/strata/core/latent_share.hpp), the latent kernels (src/kernels/xe/latent.cpp,
+  include/strata/kernels/latent.hpp, include/strata/kernels/cpu/latent_rows.hpp, src/kernels/cpu/latent_rows.cpp,
+  src/kernels/latent_ref.hpp), the layer parity (src/kernels/latent_parity.cpp) and its reference test
+  (tests/kernels/latent_ref_test.cpp),
   written after the latent additions of edge0-strata (https://github.com/Edge0-AI/Edge0, branch feat/edge0-strata at
   761f14a), a fork of Strata whose directory keeps Strata's MIT; Edge0's contributions carry the Edge0 repository's
   Apache-2.0. The files keep both notices and are under the LGPL as a whole (LGPL-3.0-or-later AND MIT AND
@@ -420,6 +423,30 @@ UniFormer backbone (MIT License)
 MIT License
 
 Copyright (c) 2022 SenseTime X-Lab
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Ostris (MIT License)
+--------------------
+
+Copyright (c) 2024 Ostris, LLC
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
