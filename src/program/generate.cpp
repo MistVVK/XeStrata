@@ -9692,8 +9692,10 @@ int main(int argc, char** argv) {
                 if (strata::core::wide_window() == strata::core::WideWindow::Auto) block_selected = v.df2_block;
                 strata::spec::Drafter keep = v.keep;
                 // DFlash2 keeps the VRAM it took from the reserve: only where the reserve the engine started with is
-                // still free beside it (a long prompt's buffers come out of the reserve)
-                if (keep == strata::spec::Drafter::Df2 &&
+                // still free beside it (a long prompt's buffers come out of the reserve).  Not --draft dflash2's: it
+                // was loaded before the cache, which was sized around it, so it took nothing from the reserve;
+                // dropped, the run had no drafter at all (the plain engine's same rule, 2026-11-15)
+                if (keep == strata::spec::Drafter::Df2 && df2_deferred &&
                     free_during < (long long) o.vram_reserve_mib) {
                     std::fprintf(stderr, "xestrata serve: DFlash2 is not kept: with it %lld MiB of VRAM stay free, less "
                                          "than the %d MiB reserve: the MTP drafts\n", free_during, o.vram_reserve_mib);
