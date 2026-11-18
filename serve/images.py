@@ -3576,7 +3576,8 @@ class ImageGen:
                          self._moss_words(job) if _pipeline(self.family) == "latent_chat" else
                          self._anima_words(job) if _pipeline(self.family) == "dual_tokenizer" else
                          f" SCHED:base STEPS:{job['steps']}" if sched == "base" else
-                         f" STEPS:{job['steps']}" if sched == "mage" else
+                         (f" STEPS:{job['steps']}" + (f" SAMPLER:{job['sampler']}" if job.get("sampler") else ""))
+                         if sched == "mage" else
                          f" SAMPLER:{job['sampler']}" if job.get("sampler") else "")
                 guide += guidance_words(job, self.cfg, mw, mh)
                 for i in range(first, job["n"]):
