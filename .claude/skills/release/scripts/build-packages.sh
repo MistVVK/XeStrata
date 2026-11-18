@@ -5,9 +5,10 @@
 # the contrib set the Windows 7z and the window's xestrata-gui deb and rpm, one for every variant) built from TAG one after another (tools/package/build.sh, a clean container each),
 # gathered into build/release/TAG/ with SHA256SUMS over every package there (the other set's included).
 #
-#   .claude/skills/release/scripts/build-packages.sh TAG contrib   # ubuntu26.04 cuda13.1, cuda12.4; fedora44 cuda13.4;
-#                                                                  # windows cuda12.4; ubuntu26.04 gui, fedora44 gui
-#   .claude/skills/release/scripts/build-packages.sh TAG free      # ubuntu26.04 free; fedora44 free
+#   .claude/skills/release/scripts/build-packages.sh TAG contrib   # ubuntu26.04 cuda13.1, cuda12.4; fedora44 cuda13.4,
+#                                                                  # fedora45 cuda13.5; windows cuda12.4; ubuntu26.04 gui,
+#                                                                  # fedora44 gui, fedora45 gui
+#   .claude/skills/release/scripts/build-packages.sh TAG free      # ubuntu26.04 free; fedora44 free, fedora45 free
 #
 # Run from the repository root.  The contrib set takes about two hours, the free one about an hour.  It
 # writes its own PID to build/release/TAG/build-SET.pid (wait on that PID, not on a pattern: pgrep -f matches the
@@ -20,8 +21,8 @@ usage() { echo "usage: $0 TAG contrib|free" >&2; exit 2; }
 tag=$1
 set_=$2
 case $set_ in
-  contrib) variants="ubuntu26.04 cuda13.1|ubuntu26.04 cuda12.4|fedora44 cuda13.4|windows cuda12.4|ubuntu26.04 gui|fedora44 gui" ;;
-  free) variants="ubuntu26.04 free|fedora44 free" ;;
+  contrib) variants="ubuntu26.04 cuda13.1|ubuntu26.04 cuda12.4|fedora44 cuda13.4|fedora45 cuda13.5|windows cuda12.4|ubuntu26.04 gui|fedora44 gui|fedora45 gui" ;;
+  free) variants="ubuntu26.04 free|fedora44 free|fedora45 free" ;;
   *) usage ;;
 esac
 cd "$(git rev-parse --show-toplevel)" || exit 1
