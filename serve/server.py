@@ -5092,7 +5092,10 @@ class Service:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
                 try:
-                    self.ensure_loaded()
+                    try:
+                        self.ensure_loaded()
+                    except images_api.LongJobBusy as e:
+                        raise GpuBusy(str(e), retry_after=e.retry_after) from e
                 finally:
                     if trace is not None:
                         with self.status_lock:
