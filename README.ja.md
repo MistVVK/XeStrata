@@ -318,7 +318,7 @@ SearXNG 互換の検索サーバーを設定すると、API と Web のページ
 
 **setup がドライバーや IGC が古いと言う**
 Intel の GPU のドライバー（Level Zero）や、その中のコンパイラ（IGC）の版によっては、VRAM の確保が断られたり、遅くなったりします。
-setup が示す方法（Intel の graphics PPA、Fedora 44 以降、Podman）で新しいものにしてください。
+setup が示す方法（Intel の graphics PPA、Fedora 44 か 45、Podman）で新しいものにしてください。
 
 **起動時に VRAM の確保が拒否された（`alloc_device: ... refused`）**
 VRAM に空きがあっても確保を断る、Intel の GPU のドライバーの状態です。エンジンは確保を小分けにしてやり直し、確保できる分だけで起動します。

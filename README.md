@@ -334,7 +334,7 @@ Run `xestrata --setup`: it says what is missing and the command that installs it
 
 **Setup says the driver or IGC is old.**
 Some versions of Intel's GPU driver (Level Zero), or of the compiler in it (IGC), refuse VRAM allocations or run slower.
-Update them the way setup shows (Intel's graphics PPA, Fedora 44 or later, or Podman).
+Update them the way setup shows (Intel's graphics PPA, Fedora 44 or 45, or Podman).
 
 **A VRAM allocation was refused at start (`alloc_device: ... refused`).**
 Intel's GPU driver can refuse allocations while the VRAM is free. The engine allocates again in smaller pieces and starts with what it gets.

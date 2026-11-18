@@ -401,8 +401,9 @@ const std::vector<sycl::device>& engine_devices() {
             g_workaround_version = w.version.empty() ? "unknown" : w.version;
             std::fprintf(stderr, "Xe runtime: IGC's GEP simplification is off (IGC_EnableGEPSimplification=0; IGC %s): "
                                  "2.27 to 2.30 miscompile some reads for Xe2 and later GPUs. The decode of short "
-                                 "prompts is up to 10%% slower. For full speed, use Fedora 44 (its IGC is 2.32 or "
-                                 "later), or install with Podman (Fedora 44 inside)\n", g_workaround_version.c_str());
+                                 "prompts is up to 10%% slower. For full speed, use Fedora 44 or 45 (their IGC is "
+                                 "2.32 or later), or install with Podman (Fedora 45 inside)\n",
+                         g_workaround_version.c_str());
         }
         return found;
     }();

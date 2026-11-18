@@ -569,7 +569,7 @@ function render(m) {
   // Intel's compiler 2.27 to 2.30: the engine works around a bug of it (INFO igc_workaround); said once a version
   if (eng.igc_workaround && eng.igc_workaround !== "none" && store.get("igc-told", "") !== eng.igc_workaround) {
     store.set("igc-told", eng.igc_workaround);
-    toast("warn", tr("igc.toast", "Intel's compiler slows the decode"), tr("igc.toastText", "IGC {version} has a bug XeStrata works around; the decode of short prompts is up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).", {version: eng.igc_workaround}), 12000,
+    toast("warn", tr("igc.toast", "Intel's compiler slows the decode"), tr("igc.toastText", "IGC {version} has a bug XeStrata works around; the decode of short prompts is up to 10% slower. For full speed, use Fedora 44 or 45 (their IGC is 2.32 or later), or install with Podman (Fedora 45 inside).", {version: eng.igc_workaround}), 12000,
           {label: tr("show", "Show"), run: () => showTab("about")});
   }
   // a kernel whose xe driver lacks the fix of CVE-2026-68264 (serve/kernel_check.py); said once a release
@@ -1035,7 +1035,7 @@ function renderAbout(eng, hw, st, xeKernel) {
     [tr("about.vision", "Reading images"), visionText(eng)],
     ...imageModelRows(eng.image_models),
     [tr("about.projection", "Experimental speed projection"), projectionText(eng.cvec)],
-    [tr("igc.label", "Intel compiler"), eng.igc_workaround && eng.igc_workaround !== "none" ? tr("igc.about", "IGC {version} has a bug (2.27 to 2.30 miscompile some reads for Xe2 and later GPUs); XeStrata works around it, the decode of short prompts up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).", {version: eng.igc_workaround}) : null],
+    [tr("igc.label", "Intel compiler"), eng.igc_workaround && eng.igc_workaround !== "none" ? tr("igc.about", "IGC {version} has a bug (2.27 to 2.30 miscompile some reads for Xe2 and later GPUs); XeStrata works around it, the decode of short prompts up to 10% slower. For full speed, use Fedora 44 or 45 (their IGC is 2.32 or later), or install with Podman (Fedora 45 inside).", {version: eng.igc_workaround}) : null],
     [tr("xekernel.label", "Linux kernel"), xeKernel ? tr("xekernel.about", "Linux {version} lacks the fix of the xe driver's CVE-2026-68264 (a GPU memory bind that is retried can crash the driver). Update the kernel; a container (Podman, incus) runs on the host's kernel.", {version: xeKernel}) : null],
   ]);
   facts($("facts-hw"), [

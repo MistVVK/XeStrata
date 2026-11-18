@@ -2845,7 +2845,7 @@ def say_driver_update(lts: str) -> None:
 def check_igc(makers: set) -> None:
     """Says, without stopping, when an Intel GPU of Xe2 or later (the xe driver's graphics IP 20 or later, as the
     engine asks it: xe_gpu_from_xe2 in src/core/device.cpp) runs with a compiler the engine works around
-    (igc_affected), and sends the user to Fedora 44 or later, whose IGC is a fixed one (45's is 2.41), or to the
+    (igc_affected), and sends the user to Fedora 44 or 45, whose IGC is a fixed one (45's is 2.41), or to the
     Podman container (Fedora 45 inside).  Ubuntu 24.04/26.04 is sent to the graphics PPA too - with the HWE kernel
     straight to it, from the GA kernel to the HWE kernel first (the PPA installs the driver with the IGC, and that
     driver is the one for the HWE kernel)."""
@@ -2857,7 +2857,7 @@ def check_igc(makers: set) -> None:
     if not any(g["vendor"] == "intel" and (g.get("ip") or 0) >= 20 for g in gpus()):
         return
     warn(f"Intel's compiler (IGC {v}) has a bug XeStrata works around at the engine's start: the decode of short "
-         "prompts is up to 10% slower. For full speed, use Fedora 44 or later (their IGC is 2.32 or later), or "
+         "prompts is up to 10% slower. For full speed, use Fedora 44 or 45 (their IGC is 2.32 or later), or "
          "install with Podman (Fedora 45 inside: README, Install)")
     lts = ubuntu_lts()
     if lts:
@@ -2949,7 +2949,7 @@ def check_level_zero(makers: set, yes: bool = False, explicit: bool = False) -> 
     GPU fault, and only a host reboot clears it).  On Ubuntu 24.04/26.04 with the HWE kernel the graphics PPA
     brings the fixed driver, and the start is stopped until it is updated or the user asks to go on (confirm_risk,
     --old-driver as the explicit consent); on the GA kernel, where the PPA's driver does not belong, the user is
-    sent to the HWE kernel and the PPA, or to Fedora 44 or later, and the start goes on.  Elsewhere nothing is said: no
+    sent to the HWE kernel and the PPA, or to Fedora 44 or 45, and the start goes on.  Elsewhere nothing is said: no
     repository to point at."""
     if WIN or "intel" not in makers:
         return
@@ -2972,7 +2972,7 @@ def check_level_zero(makers: set, yes: bool = False, explicit: bool = False) -> 
         again = " - the commands above" if _g_driver_update_said else ""
         warn(f"the Level Zero driver (build {build}) predates the fix for refusing device memory while the VRAM is "
              "free (the engine can fail to start; only a host reboot clears the card), and the GA kernel's xe "
-             "driver is the older one: move to the HWE kernel and the graphics PPA, or use Fedora 44 or later / Podman "
+             "driver is the older one: move to the HWE kernel and the graphics PPA, or use Fedora 44 or 45 / Podman "
              f"(README, Install){again}")
         say_driver_update(lts)
     else:
