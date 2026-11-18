@@ -741,6 +741,7 @@
   "mon.last": "последний: {n} токенов",
   "mon.decodeNow": "Decode сейчас",
   "mon.decodeLast": "Decode последнего запроса",
+  "mon.imageStepLast": "Изображение · последнее задание",
   "mon.decodeAvg": "Decode · среднее за сеанс",
   "mon.decode": "Decode",
   "mon.prefillNow": "Prefill сейчас",

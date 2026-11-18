@@ -741,6 +741,7 @@
   "mon.last": "直前: {n} トークン",
   "mon.decodeNow": "いまの decode",
   "mon.decodeLast": "直前の要求の decode",
+  "mon.imageStepLast": "画像 · 前の仕事",
   "mon.decodeAvg": "decode · 回の平均",
   "mon.decode": "Decode",
   "mon.prefillNow": "いまの prefill",

@@ -741,6 +741,7 @@
   "mon.last": "上次：{n} 个 token",
   "mon.decodeNow": "当前 decode",
   "mon.decodeLast": "上一个请求的 decode",
+  "mon.imageStepLast": "图像 · 上一个任务",
   "mon.decodeAvg": "decode · 本次运行平均",
   "mon.decode": "Decode",
   "mon.prefillNow": "当前 prefill",

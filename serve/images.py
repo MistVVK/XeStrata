@@ -3874,7 +3874,8 @@ class ImageGen:
         self.ended.append({"kind": "image", "time": j["started"], "duration_s": round(time.monotonic() - j["t0"], 1),
                            "finish": "stop" if error is None else "cancel" if cancelled else "error",
                            "error": None if cancelled else error,
-                           "size": j["size"], "n": j["images"], "refs": j["refs"], "edit": j["edit"],
+                           "size": j["size"], "n": j["images"], "steps": j["steps"], "refs": j["refs"],
+                           "edit": j["edit"],
                            "seconds": last.get("seconds"), "text_encode_ms": last.get("text_encode_ms"),
                            "sampling_s": last.get("sampling_s"), "vae_decode_s": last.get("vae_decode_s")})
 

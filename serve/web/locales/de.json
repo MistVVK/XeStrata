@@ -741,6 +741,7 @@
   "mon.last": "zuletzt: {n} Token",
   "mon.decodeNow": "Decode jetzt",
   "mon.decodeLast": "Decode der letzten Anfrage",
+  "mon.imageStepLast": "Bild · letzter Auftrag",
   "mon.decodeAvg": "Decode · Durchschnitt des Laufs",
   "mon.decode": "Decode",
   "mon.prefillNow": "Prefill jetzt",

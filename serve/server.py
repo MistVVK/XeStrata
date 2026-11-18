@@ -5232,7 +5232,8 @@ class Service:
             # zeros; a job on a card of its own runs beside the chat, whose speed goes on
             self.telemetry = Telemetry(extra=lambda: {"tok_s": None if self._image_shares_text() else self._tok_s(),
                                                       "tok_s_mean": self._tok_s_mean(),
-                                                      "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+                                                      "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                                                      "image_step_s": self._image_step_s()},
                                        gpus=cards)
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on
@@ -5284,6 +5285,14 @@ class Service:
             many = [dict(st) for st, _ in self.live_reqs.values()] or [dict(self.status)]
         return sum(s["generated"] / max(1e-6, time.time() - s["first_token"]) for s in many
                    if s.get("busy") and s.get("first_token"))
+
+    def _image_step_s(self):
+        """The running image job's seconds a step while it samples (the Monitor's speed on an image card's tab), else
+        None: the history has a gap there, not zeros."""
+        if not self._image_running():
+            return None
+        live = self.images.live()
+        return live.get("step_s") if live and live.get("stage") == "sampling" else None
 
     def _prefill_tok_s_mean(self):
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""

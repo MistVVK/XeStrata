@@ -741,6 +741,7 @@
   "mon.last": "마지막: {n} 토큰",
   "mon.decodeNow": "현재 decode",
   "mon.decodeLast": "마지막 요청의 decode",
+  "mon.imageStepLast": "이미지 · 마지막 작업",
   "mon.decodeAvg": "decode · 실행 평균",
   "mon.decode": "Decode",
   "mon.prefillNow": "현재 prefill",

@@ -661,6 +661,7 @@
   "mon.last": "last: {n} tokens",
   "mon.decodeNow": "Decode now",
   "mon.decodeLast": "Decode last request",
+  "mon.imageStepLast": "Image · last job",
   "mon.decodeAvg": "Decode · run average",
   "mon.decode": "Decode",
   "mon.prefillNow": "Prefill now",

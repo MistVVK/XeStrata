@@ -838,7 +838,20 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   const avgDecode = avgSpeed(totals && totals.decode_ms, totals && totals.output_tokens);
   const readTokens = totals ? Math.max(0, (totals.prompt_tokens || 0) - (totals.reused || 0)) : 0;
   const avgPrefill = avgSpeed(totals && totals.prompt_ms, readTokens);
-  if (image) {   // an image job in the text model's turn: its seconds a step, not a decode rate
+  // the tab chosen above the GPU cards (every card together, or one of them; issue #112)
+  const {g, hist, cards, one, all: allCards} = gpuView(hw, h);
+  // a card that only draws images: its speed is the image job's seconds a step (now, else the last job's), not the
+  // chat's decode on another card; All and the text model's cards keep the chat's speed
+  const imageCard = Boolean(one) && (one.roles || []).includes("image") && !(one.roles || []).includes("text");
+  for (const el of document.querySelectorAll(".speed-values .speed-prefill")) el.hidden = imageCard;
+  if (imageCard) {
+    const job = (requests || []).find((r) => r.kind === "image" && r.finish === "stop" && r.sampling_s > 0 && r.steps > 0);
+    const now = live.image && live.image.stage === "sampling" ? live.image.step_s : null;
+    const stepS = now != null ? now : job ? job.sampling_s / (job.steps * (job.n || 1)) : null;
+    setMetric("speed", stepS == null ? null : fmt(stepS, 2), "s/step",
+              live.image ? tr("img.pill", "Image · {step}", {step: imageStep(live.image)})
+              : job ? tr("mon.imageStepLast", "Image · last job") : tr("img.job", "Image job"));
+  } else if (image) {   // an image job in the text model's turn: its seconds a step, not a decode rate
     setMetric("speed", live.image.step_s == null ? null : fmt(live.image.step_s, 2), "s/step",
               tr("img.pill", "Image · {step}", {step: imageStep(live.image)}));
   } else {
@@ -854,10 +867,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
                  live.state === "reading" ? tr("mon.prefillNow", "Prefill now") : live.state === "generating" ? tr("mon.prefillThis", "Prefill this request")
                  : avgPrefill != null ? tr("mon.prefillAvg", "Prefill · run average")
                  : last ? tr("mon.prefillLast", "Prefill last request") : tr("mon.prefill", "Prefill"));
-  spark("sp-speed", h.tok_s, undefined, true);
-  spark("sp-prefill", h.prefill_tok_s_mean);
-  // the GPU cards: the one card, or the tab chosen above them (every card together, or one of them; issue #112)
-  const {g, hist, cards, one, all: allCards} = gpuView(hw, h);
+  spark("sp-speed", imageCard ? h.image_step_s : h.tok_s, undefined, true);
+  spark("sp-prefill", imageCard ? [] : h.prefill_tok_s_mean);
+  // the GPU cards: the one card, or every card together
   renderGpuTabs(cards);
   const per = (f) => cards.map((c) => `GPU ${c.index} ${f(c)}`).join(" · ");
   setMetric("gpu", g.util == null ? null : fmt(g.util), "%",

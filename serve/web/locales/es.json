@@ -741,6 +741,7 @@
   "mon.last": "último: {n} tokens",
   "mon.decodeNow": "Decode ahora",
   "mon.decodeLast": "Decode de la última solicitud",
+  "mon.imageStepLast": "Imagen · último trabajo",
   "mon.decodeAvg": "Decode · media de la sesión",
   "mon.decode": "Decode",
   "mon.prefillNow": "Prefill ahora",
