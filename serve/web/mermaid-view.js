@@ -41,15 +41,37 @@
     }
     return now;
   }
+  // A chart as a model often writes it, which mermaid does not parse, made into one it does (tried only when the
+  // code as written cannot be drawn; the code shown stays the model's): newlines written as "\n" (a JSON argument
+  // escaped twice), and a flowchart's box labels left without quotes though they hold brackets or quotes
+  // (s1[find the hat (find_region)]): quoted, their quotes as #quot;.  The closer is the one before an arrow, an "&",
+  // ";", ":::" or the line's end, so a label's own brackets stay in it
+  const BOX = /([A-Za-z_][\w-]*)(\[|\(|\{)(?!["[({])(.*?)(\]|\)|\})(?=\s*(?:-->|---|-\.|==>|===|~~~|--|&|;|:::|$))/gm;
+  const PAIR = {"[": "]", "(": ")", "{": "}"};
+  function repair(code) {
+    let out = String(code);
+    if (!out.includes("\n") && out.includes("\\n")) out = out.replace(/\\n/g, "\n").replace(/\\"/g, '"');
+    if (/^\s*(flowchart|graph)\b/.test(out)) {
+      out = out.replace(BOX, (all, id, open, label, close) =>
+        PAIR[open] !== close || !/[()[\]{}"<>]/.test(label) ? all : `${id}${open}"${label.replace(/"/g, "#quot;")}"${close}`);
+    }
+    return out;
+  }
+  async function drawOnce(code) {
+    try {
+      return (await root.mermaid.render(`xs-mermaid-${++seq}`, code)).svg;
+    } catch (_) {
+      for (const junk of document.querySelectorAll(`[id^="dxs-mermaid-"]`)) junk.remove();   // its error box
+      return null;
+    }
+  }
   async function svgOf(code) {
     const key = `${theme}\n${code}`;
     if (drawn.has(key)) return drawn.get(key);
-    let svg = null;
-    try {
-      ({svg} = await root.mermaid.render(`xs-mermaid-${++seq}`, code));
-    } catch (_) {
-      svg = null;
-      for (const junk of document.querySelectorAll(`[id^="dxs-mermaid-"]`)) junk.remove();   // its error box
+    let svg = await drawOnce(code);
+    if (svg === null) {
+      const fixed = repair(code);
+      if (fixed !== code) svg = await drawOnce(fixed);
     }
     drawn.set(key, svg);
     return svg;
@@ -121,7 +143,7 @@
       paint(view.querySelector("svg"), steps);
     }
   }
-  const api = {hydrate, stepOf};
+  const api = {hydrate, stepOf, repair};
   root.StrataMermaid = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
