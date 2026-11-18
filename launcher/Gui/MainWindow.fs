@@ -228,7 +228,18 @@ type MainWindow(setup: Setup.Access) as this =
                 actions [ cancel ]
             ]
         )
-        let r = setup.Start script args onMessage (fun code -> ui (fun () -> if not failed then onDone code))
+        // A child that ends with a code but no Fail message (a server that would not start, an uncaught exception)
+        // must not disappear into the home page: show the code and let the person go back when they have read it.
+        let onExit code =
+            ui (fun () ->
+                if not failed && code <> 0 then
+                    failed <- true
+                    failure (tr "setup.stopped" "Setup stopped")
+                        (trf "home.setupExited" "setup.py exited with {code}." [ "code", box code ])
+                        (fun () -> onDone code)
+                else
+                    onDone code)
+        let r = setup.Start script args onMessage onExit
         run <- Some r
         r
 

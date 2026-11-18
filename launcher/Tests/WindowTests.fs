@@ -443,6 +443,22 @@ let ``setup's failure is shown with its hint`` () =
     click w "Back"
     waitFor "the home page again" (fun () -> findButton w (tr "home.install" "Install a model ...")) |> ignore
 
+[<AvaloniaFact>]
+let ``a nonzero exit without a failure message is shown`` () =
+    english ()
+    let setup = FakeSetup(described.Value, none)
+    let w = open' setup
+    installPage w |> ignore
+    click w "Install"
+    let before = setup.Runs.Count
+    setup.Last.Exit 3
+    pump ()
+    Assert.True(shows w "Setup stopped")
+    Assert.True(shows w "setup.py exited with 3.")
+    Assert.Equal(before, setup.Runs.Count)   // not back at the home page until the person has read it
+    click w "Back"
+    waitFor "the home page again" (fun () -> findButton w (tr "home.install" "Install a model ...")) |> ignore
+
 // --------------------------------------------------------------------------------------------- an installed model
 
 [<AvaloniaFact>]
