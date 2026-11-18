@@ -25,6 +25,28 @@ def is_windows() -> bool:
     return sys.platform.startswith("win")
 
 
+def block_wmi() -> bool:
+    """Make sure no part of this process can ask WMI through CPython 3.12's `_wmi` helper (Windows only; True when it is blocked).
+
+    `platform.system()` / `uname()` / `win32_ver()` / `machine()` query WMI through `_wmi.exec_query`. When WMI refuses the account (HRESULT
+    0x80041003, as for a standard user over an ssh logon) the query takes seconds, `exec_query` gives up after 100 ms and returns, and its
+    worker thread then reads a struct on the caller's gone stack: an access violation that ends the whole process (0xC0000005; the runtime
+    host died this way, "runtime control is unavailable", DIAG-WINHOST-0216). Without `_wmi`, `platform` answers from the registry, `ver` and
+    the environment, as it did before Python 3.12. Every Strata entry point puts `sys.modules["_wmi"] = None` first; this is the second guard
+    for a process whose `platform` was imported before that (`platform._wmi_query` then raises the OSError `platform` already handles)."""
+    if not is_windows():
+        return False
+    sys.modules["_wmi"] = None
+
+    def _wmi_query(*keys):
+        raise OSError("not supported")
+    _wmi_query.strata_blocked = True
+    current = getattr(platform, "_wmi_query", None)
+    if current is not None and not getattr(current, "strata_blocked", False):
+        platform._wmi_query = _wmi_query                 # (a platform without _wmi_query never asks WMI)
+    return True
+
+
 def system() -> str:
     """`platform.system()`: "Windows", "Linux", "Darwin" ..."""
     return "Windows" if is_windows() else platform.system()

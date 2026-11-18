@@ -8,6 +8,11 @@ This is the reference implementation for `src/artifact/` (architecture §15: "GG
 no ggml dependency)"). It parses the header only; tensor data is never read.
 """
 from __future__ import annotations
+import sys
+if sys.platform == "win32":
+    # CPython 3.12's WMI helper (_wmi, behind platform.system() / uname()) takes an access violation in a worker thread when WMI refuses the
+    # account (0x80041003) and the caller has already gone (DIAG-WINHOST-0216). Without _wmi, platform uses the registry and the environment.
+    sys.modules["_wmi"] = None
 
 import dataclasses
 import os

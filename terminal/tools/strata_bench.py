@@ -28,6 +28,11 @@ This is the quick speed check, not the standard benchmark: `strata bench run` fo
 the model card sampling, twelve sanity checks) and writes results other people can compare with.
 """
 from __future__ import annotations
+import sys
+if sys.platform == "win32":
+    # CPython 3.12's WMI helper (_wmi, behind platform.system() / uname()) takes an access violation in a worker thread when WMI refuses the
+    # account (0x80041003) and the caller has already gone (DIAG-WINHOST-0216). Without _wmi, platform uses the registry and the environment.
+    sys.modules["_wmi"] = None
 
 import argparse
 import datetime
