@@ -66,7 +66,9 @@ case "$commit" in *[!0-9a-f]*|"") commit="" ;; esac
 cd "$repo"
 # metal/tools/: the two repack scripts the bundle carries (INSTALLER_METAL_TOOLS in package_terminal.py; without them the terminal stage
 # stops at "No such file or directory: '/src/metal/tools/metal_repack.py'", as the v0.2.11 image build did)
-paths="tools/packaging terminal/bin terminal/strata.py terminal/strata_control terminal/strata_cli terminal/serve terminal/requirements.txt terminal/requirements-monitor.txt docs/MANAGEMENT_PROTOCOL.md docs/TERMINAL_LAUNCH.md terminal/data terminal/bench/prompts/standard-v1 terminal/setup.py terminal/ref/load.py engine/CMakeLists.txt engine/metal/tools/metal_repack.py engine/metal/tools/stream_experts.py"
+# engine/third_party/strata-gguf-py: the model preparation tools the bundle carries (INSTALLER_THIRD_PARTY in package_terminal.py; without it the
+# terminal stage stops at "No such file or directory: '/src/engine/third_party/strata-gguf-py'", as the first v0.2.16 image build did)
+paths="tools/packaging terminal/bin terminal/strata.py terminal/strata_control terminal/strata_cli terminal/serve terminal/requirements.txt terminal/requirements-monitor.txt docs/MANAGEMENT_PROTOCOL.md docs/TERMINAL_LAUNCH.md terminal/data terminal/bench/prompts/standard-v1 terminal/setup.py terminal/ref/load.py engine/CMakeLists.txt engine/metal/tools/metal_repack.py engine/metal/tools/stream_experts.py engine/third_party/strata-gguf-py"
 if git rev-parse --git-dir >/dev/null 2>&1; then
   # shellcheck disable=SC2086
   { git ls-files -z -- $paths ':(glob)terminal/tools/**/*.py'; } | tar --null -T - -cf - | tar -xf - -C "$ctx/terminal-src"
