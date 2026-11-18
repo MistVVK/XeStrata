@@ -5,8 +5,10 @@
 #include <cstdio>
 #include <string>
 #if defined(_WIN32)
+#ifndef NOMINMAX
 #define NOMINMAX
-#include <filesystem>
+#endif
+#include <climits>
 #include <windows.h>
 #endif
 
@@ -15,8 +17,16 @@ namespace strata::platform {
 // Atomically publish a file, replacing an existing destination on both platforms.
 inline bool replace_file(const std::string& from, const std::string& to) {
 #if defined(_WIN32)
-    return MoveFileExW(std::filesystem::u8path(from).c_str(), std::filesystem::u8path(to).c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    const auto wide = [](const std::string& s, std::wstring& out) {
+        if (s.empty() || s.size() > (size_t) INT_MAX) return false;
+        const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int) s.size(), nullptr, 0);
+        if (n <= 0) return false;
+        out.resize((size_t) n);
+        return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int) s.size(), out.data(), n) == n;
+    };
+    std::wstring wfrom, wto;
+    return wide(from, wfrom) && wide(to, wto) &&
+           MoveFileExW(wfrom.c_str(), wto.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
     return std::rename(from.c_str(), to.c_str()) == 0;
 #endif
