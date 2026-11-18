@@ -103,5 +103,30 @@ class StatusProbe(unittest.TestCase):
         self.assertTrue(out["summary"].startswith("Strata is not running"))
 
 
+class CardSpeedChild(unittest.TestCase):
+    """The other 20 s of the app's first read (A9): the child that asks the CUDA driver for each card's speed (gpu_roles.nvidia_speeds). Measured on the owner PC
+    inside the app's MCP server (stdin and stdout are pipes to the host): with the child's stdin inherited it ran into its 20 s limit and its answer was thrown
+    away, with no stdin it took 0.05 s (a9_mcp_client.py; why the CUDA driver waits on that handle was not found out, and a trivial Python child does not wait).
+    The child gets no stdin."""
+
+    def test_the_child_is_started_without_the_parents_stdin(self):
+        from strata_control import gpu_roles
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen.update(kw)
+            return mock.Mock(stdout="0 48 2512000\n1 84 1980000\n", returncode=0)
+
+        with mock.patch("subprocess.run", fake_run):
+            speeds = gpu_roles.nvidia_speeds()
+        self.assertEqual(seen.get("stdin"), __import__("subprocess").DEVNULL)
+        self.assertEqual(speeds, {0: 48.0 * 2512000, 1: 84.0 * 1980000})
+
+    def test_a_child_that_ends_without_an_answer_leaves_no_speeds(self):
+        from strata_control import gpu_roles
+        with mock.patch("subprocess.run", side_effect=__import__("subprocess").TimeoutExpired("x", 20)):
+            self.assertEqual(gpu_roles.nvidia_speeds(), {})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -534,7 +534,9 @@ def nvidia_speeds(timeout: float = 20.0) -> dict[int, float]:
         env = dict(os.environ)
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env.pop("CUDA_VISIBLE_DEVICES", None)
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, errors="replace", timeout=timeout, env=env)
+        # stdin=DEVNULL (A9, measured): inside the app's MCP server (stdin and stdout are pipes to the host) this child ran into its 20 s limit with the parent's stdin and its answer was thrown away;
+        # with no stdin it takes 0.05 s. It made the app's first read of the PC take 25 s instead of 4.
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, errors="replace", timeout=timeout, env=env, stdin=subprocess.DEVNULL)
         out = {}
         for line in r.stdout.splitlines():
             i, sm, khz = (int(x) for x in line.split())
