@@ -220,17 +220,19 @@ void lokr_factor_bwd(const float* dw2, const uint16_t* w2a, const uint16_t* w2b,
 void dora_bwd(const float* dY, const float* p, const float* d, const float* m, const float* norms, int64_t T,
                  int64_t rows, float scale, float* dm, float* da, float* db, void* stream) {
     constexpr float kDoraEps = 1.1920929e-07f;   // kLoraDoraEps, as image_lora.cpp takes it
+    // PEFT's DoRA at strength 1: y_r = c_r p_r + scale c_r d_r with c_r = m_r / (n_r + eps) and n the composed norm
+    // detached, so dm reads (p + scale d) / (n + eps) and the factors carry no norm gradient
     if (dm != nullptr)
         col_sum(T, rows, dm,
                 [=](int64_t t, int64_t r) {
-                    return dY[t * rows + r] * (p[t * rows + r] + d[t * rows + r]) * scale / (norms[r] + kDoraEps);
+                    return dY[t * rows + r] * (p[t * rows + r] + scale * d[t * rows + r]) / (norms[r] + kDoraEps);
                 },
                 stream);
     if (da == nullptr && db == nullptr) return;
     dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) rows), [=](sycl::id<1> id) {
         const int64_t r = static_cast<int64_t>(id[0]);
         const float cr = m[r] / (norms[r] + kDoraEps);
-        if (da != nullptr) da[r] = 1.f + scale * (cr - 1.f);
+        if (da != nullptr) da[r] = cr;
         if (db != nullptr) db[r] = scale * cr;
     });
 }
@@ -394,6 +396,25 @@ void add_into(float* a, const float* b, int64_t n, void* stream) {
 void f16_copy(const float* x, int64_t n, uint16_t* y, void* stream) {
     dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) n),
                                         [=](sycl::id<1> id) { y[id[0]] = kernels::f16_from_f32(x[id[0]]); });
+}
+
+void f16_copy_full(const float* x, int64_t n, uint16_t* y, uint32_t* gbits, void* stream) {
+    const int64_t groups = std::min<int64_t>((n + kWG - 1) / kWG, 1024);
+    gpu::memset_async(gbits, 0, 4, stream);
+    dit_rows::q_of(stream).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) (groups * kWG)), sycl::range<1>(kWG)), [=](sycl::nd_item<1> it) {
+            float m = 0.f;
+            for (int64_t i = (int64_t) it.get_global_linear_id(); i < n; i += groups * kWG)
+                m = sycl::fmax(m, sycl::fabs(x[i]));
+            m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+            if (it.get_local_linear_id() == 0)   // non-negative floats order as their bits
+                sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device>(*gbits).fetch_max(
+                    sycl::bit_cast<uint32_t>(m));
+        });
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const float G = dit_rows::pow2_full(sycl::bit_cast<float>(*gbits));
+        y[id[0]] = kernels::f16_from_f32(x[id[0]] / G);
+    });
 }
 
 void bf16_keep(float* x, int64_t n, uint16_t* y, void* stream) {

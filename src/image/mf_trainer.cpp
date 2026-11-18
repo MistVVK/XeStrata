@@ -109,6 +109,7 @@ struct Model : MfTrainModel, train::Trainer {
                     mv(a.dB);
                     mv(a.m);
                     mv(a.norms);
+                    mv(a.norms0);   // a.w bound again at each use (bind), as the product's own
                     mv(a.dm);
                     mv(a.w1);
                     mv(a.w1t);
@@ -203,6 +204,7 @@ void bind(Model* m, int64_t b, const uint8_t* base) {
             } else {
                 pr.w = reinterpret_cast<uint16_t*>(at);
             }
+            if (blk.adap != nullptr) blk.adap->ad[q][i].w = pr.w;   // a DoRA's composed norms read the same rows
         }
 }
 
@@ -356,6 +358,7 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
                         az.dB = m->get<float>(N * rank);
                         az.dm = m->get<float>(N);
                         az.norms = m->get<float>(N);
+                        az.norms0 = m->get<float>(N);
                         az.w1 = m->get<uint16_t>(ol * im);
                         az.w1t = m->get<uint16_t>(ol * im);
                         az.w2a = m->get<uint16_t>(ok * rank);
@@ -697,7 +700,7 @@ void mf_trainer_free_state(MfTrainModel* base, MfTrainState& s) {
 
 namespace {
 
-// the base weight's row norms (the DoRA divisor), over the FP16 values the products read
+// the base weight's row norms (the DoRA composed norm's base term), over the FP16 values the products read
 void rownorm_f16(const uint16_t* w, int64_t N, int64_t K, float* norms, void* s) {
     constexpr int64_t kWG = 256;
     dit_rows::q_of(s).parallel_for(
@@ -763,7 +766,8 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
                     continue;
                 }
                 if (blk.prod[st][i].w != nullptr)   // (an int8 base takes no DoRA: the trainer refuses the pair)
-                    rownorm_f16(blk.prod[st][i].w, N, K, az.norms, s);
+                    rownorm_f16(blk.prod[st][i].w, N, K, az.norms0, s);   // |W_r| once; each forward composes
+                // ||W_r + (alpha/rank) (BA)_r|| from it (PEFT's DoRA, dora_composed_norms)
                 // A kaiming-uniform (bound 1/sqrt(fan_in), the common LoRA init), B = 0 (the delta starts at nothing),
                 // m = norms (c starts at one).  A drawn N(0, 1/sqrt(rank)) instead is about 24 times larger at
                 // Mage-Flow's K of 3072: B's every step moves the delta that much more, and the run diverged at lr 1e-4
@@ -775,7 +779,8 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
                     throw std::runtime_error("image engine (Mage-Flow training): copy");
                 gpu::stream_sync(s);
                 az.m = tz.M[st][i];
-                if (!gpu::copy(tz.M[st][i], az.norms, (size_t) N * 4))
+                if (!gpu::copy(az.norms, az.norms0, (size_t) N * 4) ||
+                    !gpu::copy(tz.M[st][i], az.norms0, (size_t) N * 4))
                     throw std::runtime_error("image engine (Mage-Flow training): copy");
                 kernels::f32_to_f16_bulk(tz.A[st][i], az.a, rk * K, s);
                 train::transpose_f16(az.a, rk, K, az.at, s);

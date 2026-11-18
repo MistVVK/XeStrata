@@ -367,7 +367,10 @@ def case_lokr(d: Path, r: np.random.Generator):
 
 
 def case_dora(d: Path, r: np.random.Generator):
-    """A DoRA's magnitude: y = a (W x) + b (delta), a = 1 + s (c - 1), b = s c, c = m / (|W| + eps_FP32)."""
+    """A DoRA's magnitude, PEFT's definition at strength 1 (tuners/lora/dora.py): y = c (W x) + s c (BA x) with
+    c = m / (n + eps_FP32) and n = ||W + s BA|| the composed weight's row norm, detached (no gradient through it).
+    So dm = sum_t dY (p + s d) / (n + eps), da = c and db = s c.  The old form (a = 1 + s (c - 1) with n = |W|)
+    was the engine's own blend, not PEFT's: a LoRA trained under it read differently in inference."""
     T, rows, scale, eps = 64, 40, 0.8, 1.1920929e-07
     dY = (r.standard_normal((T, rows)) * 1.1).astype(np.float32)
     pp = (r.standard_normal((T, rows)) * 0.9).astype(np.float32)
@@ -378,9 +381,119 @@ def case_dora(d: Path, r: np.random.Generator):
                  ("scale", np.array([scale], np.float32))):
         save(d, n, a)
     c = m.astype(np.float64) / (norms.astype(np.float64) + eps)
-    return {"dm": (scale * (dY.astype(np.float64) * (pp.astype(np.float64) + dd.astype(np.float64))).sum(0)
+    return {"dm": ((dY.astype(np.float64) * (pp.astype(np.float64) + scale * dd.astype(np.float64))).sum(0)
                    / (norms.astype(np.float64) + eps)).astype(np.float32),
-            "da": (1.0 + scale * (c - 1.0)).astype(np.float32), "db": (scale * c).astype(np.float32)}
+            "da": c.astype(np.float32), "db": (scale * c).astype(np.float32)}
+
+
+def dora_norms_ref(d: Path, r: np.random.Generator, N: int, K: int, rank: int, scale: float):
+    """PEFT's get_weight_norm: the composed weight W + s BA made, its rows' norm directly (FP64 over the FP16
+    values the products read).  norms0 is |W| alone, the base term the engine's expansion starts from."""
+    w = (r.standard_normal((N, K)) * 0.1).astype(np.float16)
+    a = (r.standard_normal((rank, K)) * 0.2).astype(np.float16)
+    b = (r.standard_normal((N, rank)) * 0.3).astype(np.float16)
+    w0 = w.astype(np.float64)
+    norms0 = np.linalg.norm(w0, axis=1).astype(np.float32)
+    for n, arr in (("w16", w), ("a16", a), ("b16", b), ("norms0", norms0),
+                   ("scale", np.array([scale], np.float32))):
+        save(d, n, arr)
+    composed = w0 + scale * (b.astype(np.float64) @ a.astype(np.float64))
+    return {"norms": np.linalg.norm(composed, axis=1).astype(np.float32)}
+
+
+def case_doranorm(d: Path, r: np.random.Generator):
+    return dora_norms_ref(d, r, 40, 48, 8, 0.8)
+
+
+def case_doranormreal(d: Path, r: np.random.Generator):
+    """The same at Mage-Flow's attention width and a large rank (the scratch's N rank + rank rank)."""
+    return dora_norms_ref(d, r, 3072, 3072, 96, 2.0)
+
+
+def dora_ab_ref(d: Path, r: np.random.Generator, T: int, N: int, K: int, rank: int, scale: float):
+    """One DoRA product whole: the forward's rows and the backward's dm, dA, dB and dX, PEFT's definition with the
+    norm detached.  The reference reads the same FP16 bits the GPU does (h rounded once, as the engine keeps it)."""
+    eps = 1.1920929e-07
+    x = r.standard_normal((T, K)) * 3.0
+    xr = np.array([pow2_scale(np.abs(row).max()) for row in x], np.float32)
+    x16 = (x / xr[:, None]).astype(np.float16)
+    w = (r.standard_normal((N, K)) * 0.05).astype(np.float16)
+    a = (r.standard_normal((rank, K)) * 0.2).astype(np.float16)
+    b = (r.standard_normal((N, rank)) * 0.3).astype(np.float16)
+    norms0 = np.linalg.norm(w.astype(np.float64), axis=1).astype(np.float32)
+    m = (norms0 * (1.0 + 0.2 * r.standard_normal(N))).astype(np.float32)
+    dY = (r.standard_normal((T, N)) * 1.3).astype(np.float32)
+    for n, arr in (("x16", x16), ("xr", xr), ("w16", w), ("a16", a), ("b16", b), ("norms0", norms0), ("m", m),
+                   ("dY", dY), ("scale", np.array([scale], np.float32))):
+        save(d, n, arr)
+    X = x16.astype(np.float64) * xr[:, None]
+    W, A, B = w.astype(np.float64), a.astype(np.float64), b.astype(np.float64)
+    norms = np.linalg.norm(W + scale * (B @ A), axis=1)
+    c = m.astype(np.float64) / (norms + eps)
+    h = X @ A.T
+    hr = np.array([pow2_scale(v) for v in np.abs(h).max(1)], np.float32)
+    hd = (h / hr[:, None]).astype(np.float16).astype(np.float64) * hr[:, None]
+    p, delta = X @ W.T, hd @ B.T
+    dYd = dY.astype(np.float64)
+    dYb = dYd * (scale * c)[None, :]
+    dh = dYb @ B
+    return {"y": (c[None, :] * p + (scale * c)[None, :] * delta).astype(np.float32),
+            "dx": ((dYd * c[None, :]) @ W + dh @ A).astype(np.float32),
+            "dm": (dYd * (p + scale * delta)).sum(0) / (norms + eps),
+            "dA": (dh.T @ X).astype(np.float32), "dB": (dYb.T @ hd).astype(np.float32),
+            "norms": norms.astype(np.float32)}
+
+
+def case_doraab(d: Path, r: np.random.Generator):
+    return dora_ab_ref(d, r, 64, 40, 48, 8, 0.8)
+
+
+def case_doraabreal(d: Path, r: np.random.Generator):
+    return dora_ab_ref(d, r, 64, 3072, 3072, 32, 2.0)
+
+
+def lokr_ab_ref(d: Path, r: np.random.Generator, T: int, ol: int, ok: int, im: int, inn: int, rank: int,
+                scale: float):
+    """One LoKr product whole: delta = s kron(w1, w2a w2b) with w2b nonzero (the second update's state, where the
+    transposed reads bite), the forward's rows and every factor's gradient through the whole delta's gradient."""
+    N, K = ol * ok, im * inn
+    x = r.standard_normal((T, K)) * 3.0
+    xr = np.array([pow2_scale(np.abs(row).max()) for row in x], np.float32)
+    x16 = (x / xr[:, None]).astype(np.float16)
+    w = (r.standard_normal((N, K)) * 0.05).astype(np.float16)
+    w1 = (r.standard_normal((ol, im)) * 0.3).astype(np.float16)
+    w2a = (r.standard_normal((ok, rank)) * 0.3).astype(np.float16)
+    w2b = (r.standard_normal((rank, inn)) * 0.2).astype(np.float16)
+    dY = (r.standard_normal((T, N)) * 1.3).astype(np.float32)
+    for n, arr in (("x16", x16), ("xr", xr), ("w16", w), ("w1", w1), ("w2a", w2a), ("w2b", w2b), ("dY", dY),
+                   ("parts", np.array([ol, ok, im, inn, rank], np.float32)),
+                   ("scale", np.array([scale], np.float32))):
+        save(d, n, arr)
+    X = x16.astype(np.float64) * xr[:, None]
+    W = w.astype(np.float64)
+    D = scale * np.kron(w1.astype(np.float64), w2a.astype(np.float64) @ w2b.astype(np.float64))
+    dYd = dY.astype(np.float64)
+    W1, W2 = w1.astype(np.float64), w2a.astype(np.float64) @ w2b.astype(np.float64)
+    G = (scale * (dYd.T @ X)).reshape(ol, ok, im, inn)
+    dw2 = np.einsum("lkmn,lm->kn", G, W1)
+    return {"y": (X @ (W + D).T).astype(np.float32), "dx": (dYd @ (W + D)).astype(np.float32),
+            "dW1": np.einsum("lkmn,kn->lm", G, W2).astype(np.float32),
+            "dW2a": (dw2 @ w2b.astype(np.float64).T).astype(np.float32),
+            "dW2b": (w2a.astype(np.float64).T @ dw2).astype(np.float32)}
+
+
+def case_lokrab(d: Path, r: np.random.Generator):
+    return lokr_ab_ref(d, r, 8, 3, 4, 2, 6, 5, 0.7)
+
+
+def case_lokrabreal(d: Path, r: np.random.Generator):
+    """Mage-Flow's mlp1 (12288 x 3072) at rank 96: the shared scratch's bound the old sizing crossed at rank 65."""
+    return lokr_ab_ref(d, r, 64, 96, 128, 48, 64, 96, 0.5)
+
+
+def case_lokrabattn(d: Path, r: np.random.Generator):
+    """The attention-only target (N = K = 3072): the other shape the old scratch crossed at every rank."""
+    return lokr_ab_ref(d, r, 64, 48, 64, 48, 64, 32, 0.5)
 
 
 CASES = {"lnmod": case_lnmod, "gelu": case_gelu, "silu": case_silu, "gate": case_gate, "patch": case_patch,
@@ -388,7 +501,10 @@ CASES = {"lnmod": case_lnmod, "gelu": case_gelu, "silu": case_silu, "gate": case
          "attn": case_attn, "attnreal": case_attnreal, "attncausal": case_attncausal,
          "rows16": case_rows16,
          "qkrope": case_qkrope, "lora": case_lora, "lora_zero_rows": case_lora_zero_rows,
-         "lora_zero": case_lora_zero, "lokr": case_lokr, "dora": case_dora}
+         "lora_zero": case_lora_zero, "lokr": case_lokr, "dora": case_dora,
+         "doranorm": case_doranorm, "doranormreal": case_doranormreal,
+         "doraab": case_doraab, "doraabreal": case_doraabreal,
+         "lokrab": case_lokrab, "lokrabreal": case_lokrabreal, "lokrabattn": case_lokrabattn}
 # the probe calls of each case: (op, its output files)
 RUNS = {"lnmod": [("lnmod", ["dx", "dshift", "dscale"])], "gelu": [("gelu", ["d"])], "silu": [("silu", ["d"])],
         "gate": [("gate", ["dh", "dgate"])], "patch": [("patch", ["dm", "dmean", "dsd"])],
@@ -397,28 +513,43 @@ RUNS = {"lnmod": [("lnmod", ["dx", "dshift", "dscale"])], "gelu": [("gelu", ["d"
         "productsreal": [("dgrad", ["dx"]), ("wgrad", ["dw"]), ("bias", ["db"])],
         "attn": [("attnf", ["o16", "o32", "lse"]), ("attnb", ["dQ", "dK", "dV"])],
         "attnreal": [("attnf", ["o16", "o32", "lse"]), ("attnb", ["dQ", "dK", "dV"])],
+        "attncausal": [("attnf", ["o16", "o32", "lse"]), ("attnb", ["dQ", "dK", "dV"])],
         "rows16": [("rows16", ["rs", "y16"])],
         "qkrope": [("qkrope", ["dq", "dk", "wqn", "wkn"])],
         "lora": [("lora", ["dh", "dB", "dA"])], "lora_zero_rows": [("lora", ["dB"])],
         "lora_zero": [("lora", ["dh", "dB", "dA"])],
         "lokr": [("lokr", ["dw1", "dw2"]), ("lokrf", ["dw2a", "dw2b"])],
-        "dora": [("dora", ["dm", "da", "db"])]}
+        "dora": [("dora", ["dm", "da", "db"])],
+        "doranorm": [("doranorm", ["norms"])], "doranormreal": [("doranorm", ["norms"])],
+        "doraab": [("doraab", ["y", "dx", "dm", "dA", "dB", "norms"])],
+        "doraabreal": [("doraab", ["y", "dx", "dm", "dA", "dB", "norms"])],
+        "lokrab": [("lokrab", ["y", "dx", "dW1", "dW2a", "dW2b"])],
+        "lokrabreal": [("lokrab", ["y", "dx", "dW1", "dW2a", "dW2b"])],
+        "lokrabattn": [("lokrab", ["y", "dx", "dW1", "dW2a", "dW2b"])]}
 # the attention is the shared FP16 kernel (kernels::flash_attn, inference's) and its backward the shared FP16
 # products: P and dS are rounded to FP16 once each, so its gradients and its FP32 output carry FP16's own error
 # (dQ, dK, dV 2.7-3.4e-4 and o32 2.4e-4 measured on the B70, 2026-11-09)
 TOL = {"lora": 5e-4, "lora_zero_rows": 5e-4, "lora_zero": 0.0, "lokr": 1e-5, "dora": 1e-6, "qkrope": 2e-4,
        "attn": 5e-4, "attnreal": 5e-4, "attncausal": 5e-4,
        "rows16": 1e-3, "lnmod": 2e-5, "gelu": 5e-5, "silu": 5e-5, "gate": 2e-5, "patch": 1e-6, "flow": 1e-5,
-       "products": 3e-3, "productsreal": 3e-3}
+       "products": 3e-3, "productsreal": 3e-3,
+       # the composed norms: FP16 factors into FP32 products, the base |W| FP32 (the expansion's own rounding)
+       "doranorm": 1e-4, "doranormreal": 1e-4,
+       # the whole adapter paths: dgrad and wgrad read FP16 gradient rows (the products' own 3e-3)
+       "doraab": 3e-3, "doraabreal": 3e-3, "lokrab": 3e-3, "lokrabreal": 3e-3, "lokrabattn": 3e-3}
 
 
 # an FP16 tensor can only carry FP16's own error: an output written as FP16 is judged at two of its units
 TOL_OUT = {("attn", "o16"): 2e-3, ("attn", "o32"): 5e-4, ("attnreal", "o16"): 2e-3, ("attnreal", "o32"): 5e-4,
-           ("attncausal", "o16"): 2e-3, ("attncausal", "o32"): 5e-4, ("products", "db"): 1e-3}
+           ("attncausal", "o16"): 2e-3, ("attncausal", "o32"): 5e-4, ("products", "db"): 1e-3,
+           # the DoRA product's FP32 outputs (its FP16 gradient rows' dgrad/wgrad keep the case's 3e-3).  y at the
+           # real width carries the kept h's FP16 rounding through the delta (measured 1.3e-4 on the RX 9060 XT)
+           **{(n, o): 1e-4 for n in ("doraab", "doraabreal") for o in ("dm", "norms")},
+           ("doraab", "y"): 1e-4, ("doraabreal", "y"): 5e-4}
 # the attention through the GPU maker's library (--attn library: oneDNN's, cuDNN's or aotriton's SDPA for training),
 # whose output and gradients come out in FP16: their rounding alone is 2-3e-4 (oneDNN on the B70: dQ 6.3e-4, dK 5.1e-4,
 # dV 5.6e-4 and o32 4.3e-4 at the real shapes, 2026-11-09), so they are judged at 1e-3
-TOL_LIBRARY = {(n, o): 1e-3 for n in ("attn", "attnreal") for o in ("o32", "dQ", "dK", "dV")}
+TOL_LIBRARY = {(n, o): 1e-3 for n in ("attn", "attnreal", "attncausal") for o in ("o32", "dQ", "dK", "dV")}
 
 
 def main() -> int:

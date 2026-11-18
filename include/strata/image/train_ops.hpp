@@ -18,14 +18,18 @@
 // over the rows: there the row scales are folded into the FP32 gradient first and one global power of two (G, from
 // scaled_transpose_f16) is put back on the sum.
 //
-// An adapter's gradients, one weight, with s the request's strength and k = alpha / rank:
+// An adapter's gradients, one weight, with s the request's strength (training takes 1) and k = alpha / rank:
 //
 //   plain LoRA   h = x A^T, delta = s k (h B^T)   dB = s k dY^T h   dA = s k (dY B)^T x
 //   LoKr         delta = s k kron(w1, w2_a w2_b)   each factor by the partial trace of the delta's gradient
-//   DoRA         c_r = m_r / (|W_r| + eps); the rows' factors a_r = 1 + s (c_r - 1) and b_r = s c_r, and
-//                dm_r = s sum_t dY[t,r] (p[t,r] + d[t,r]) / (|W_r| + eps)   (p the base product, d the delta's)
+//   DoRA         PEFT's: n_r = ||W_r + k (BA)_r||, the composed weight's row norm, recomputed every forward with
+//                the factors detached (W frozen, A and B the last step's); c_r = m_r / (n_r + eps); the rows'
+//                factors a_r = c_r and b_r = k c_r (s = 1), and
+//                dm_r = sum_t dY[t,r] (p[t,r] + k d[t,r]) / (n_r + eps)   (p the base product, d the delta's)
 //
-// |W_r| is the row norm of the weight the engine reads (its own dora_norms), eps FP32's.
+// n_r is made without the composed weight: n_r^2 = |W_r|^2 + 2k sum_j B_rj (W A^T)_rj + k^2 B_r (A A^T) B_r^T
+// (dora_composed_norms; |W_r| once at open, the two products each forward).  eps FP32's.  Inference reads the same
+// definition (image_lora.cpp's lora_dora_rows, dit_dora_norms at the bind).
 //
 // The step is rectified flow (docs/LORA_TRAIN.md, "Timestep sampling and loss"): x_sigma = (1 - sigma) x0 + sigma eps,
 // the target v = eps - x0, the loss the mean of (v_pred - v)^2, so dL/dv_pred = 2 (v_pred - v) / n.
@@ -112,10 +116,11 @@ void lokr_partial_trace(const float* dDelta, const uint16_t* w1, const uint16_t*
 void lokr_factor_bwd(const float* dw2, const uint16_t* w2a, const uint16_t* w2b, int64_t out_k, int64_t in_n,
                      int64_t rank, float* dw2a, float* dw2b, void* stream);
 
-/// A DoRA's magnitude m [rows], backwards, with the row norm |W_r| it was divided by (the engine's own dora_norms)
-/// and eps FP32's: dm[r] = scale * sum_t dY[t,r] (p[t,r] + d[t,r]) / (|W_r| + eps), where p is the base product's
-/// rows and d the delta's.  `da` and `db` (null: not taken) get the factors the two paths' own gradients are read by:
-/// da[r] = 1 + scale (c_r - 1) and db[r] = scale c_r, so the caller's dgrad and wgrad see dY da and dY db.
+/// A DoRA's magnitude m [rows], backwards, with the composed row norms n_r = ||W_r + scale (BA)_r|| the forward
+/// divided by (dora_composed_norms) and eps FP32's, at strength 1 (PEFT's): dm[r] = sum_t dY[t,r] (p[t,r] +
+/// scale d[t,r]) / (n_r + eps), where p is the base product's rows and d the delta's (the norm detached: no
+/// gradient through it).  `da` and `db` (null: not taken) get the factors the two paths' own gradients are read by:
+/// da[r] = c_r and db[r] = scale c_r (c_r = m_r / (n_r + eps)), so the caller's dgrad and wgrad see dY da and dY db.
 void dora_bwd(const float* dY, const float* p, const float* d, const float* m, const float* norms, int64_t T,
               int64_t rows, float scale, float* dm, float* da, float* db, void* stream);
 
@@ -134,7 +139,11 @@ struct Adapter {
     float* dA = nullptr;               // [rank][K], added into
     float* dB = nullptr;               // [N][rank], added into
     const float* m = nullptr;         // [N] the DoRA magnitude (null: a plain LoRA)
-    float* norms = nullptr;           // [N] the base weight's row norms (null: a plain LoRA; written once at open)
+    const uint16_t* w = nullptr;      // [N][K] FP16 the base weight's rows (DoRA: dora_composed_norms' W A^T reads
+                                      // them; bound with the product's own, an int8 base takes no DoRA)
+    float* norms0 = nullptr;          // [N] |W_r| at open (DoRA: the composed norm's base term, written once)
+    float* norms = nullptr;           // [N] the composed norms ||W_r + scale (BA)_r|| (DoRA: rewritten each forward,
+                                      // the same call's backward reads them)
     float* dm = nullptr;               // [N], added into (null: not taken)
     // LoKr (method lokr): delta = s kron(w1, w2a w2b), N = ol * ok, K = im * inn (SPEC's factorization)
     int64_t ol = 0, ok = 0, im = 0, inn = 0;
@@ -146,6 +155,12 @@ struct Adapter {
     float* dW2a = nullptr;             // [ok][rank], added into
     float* dW2b = nullptr;             // [rank][inn], added into
 };
+
+/// A DoRA's composed row norms into ad->norms [N], PEFT's ||W_r + scale (BA)_r|| with the factors as the products
+/// read them (FP16) and the norm detached: |W_r|^2 from ad->norms0 (once at open), W A^T and A A^T two products of
+/// ad->a with ad->w and itself.  `wat` holds rank * N and `aat` rank * rank FP32 (the block's adapter scratch).
+void dora_composed_norms(const Adapter* ad, int64_t N, int64_t K, float* wat, float* aat, prefill::Gemm& gemm,
+                         void* stream);
 
 /// out[i] = a[i] * col[i % C] (col null: 1), n elements: a gate's or a norm's per-column factor on rows.
 void mul_cols(const float* a, const float* col, int64_t n, int64_t C, float* out, void* stream);
@@ -163,6 +178,11 @@ void v_scale(const float* v0, int64_t n0, const float* v1, int64_t n1, uint32_t*
 void copy_rows(const float* a, int64_t n, float* out, void* stream);
 void add_into(float* a, const float* b, int64_t n, void* stream);
 void f16_copy(const float* x, int64_t n, uint16_t* y, void* stream);
+/// The same narrowing at one power of two over the whole tensor (pow2_full: the largest value into [2^13, 2^14)),
+/// its bits left in *gbits (a device word, scale_word's) for the caller to put back after the next product.  A
+/// gradient's rows already sit near 2^14 (rows16's full range), so a product over a factor's rows can pass FP16's
+/// 65504: the plain copy overflowed there (a LoKr's backward at Mage-Flow's mlp1, out_k 128).
+void f16_copy_full(const float* x, int64_t n, uint16_t* y, uint32_t* gbits, void* stream);
 /// What a trainer's arena (its blocks' scratch, `held` bytes now) should still grow by for a step of `rows`: in
 /// proportion to the most rows a step has had (`seen`, 0: none yet), 10% over, less what it holds; `guess` before a
 /// step has shown it.  The weights' budgets and the inputs' form read it.
@@ -312,7 +332,8 @@ void ad_product_fwd(const Adapter* ad, const uint16_t* x16, const float* rsx, fl
 /// The same product backwards: dYv [R][N] is the gradient reaching its rows (consumed: a DoRA scales it), dxv [R][K]
 /// the input's gradient (written, or added into with `accumulate`), the base weight's own dw and db where P has them,
 /// and the adapter's factors' gradients.  x16, rsx and xt are the forward's input rows, their scales and their
-/// transposed view; t16, trs, t16t and sums the block's own temporaries (R N, R, N R and N K + R K).
+/// transposed view; t16, trs, t16t and sums the block's own temporaries (R N, R, N R and N K + R K; a LoKr's sums
+/// holds 2 N K + R K: its whole delta's gradient and the wgrad's scratch beside it).
 /// Whether ad_product_bwd reads the input's transposed rows (xt): a full weight's gradient and a LoKr do, and a LoRA
 /// or DoRA where the GPU has no transposed products (Gemm::f16_batch_ex_ok); elsewhere xt may be null.
 bool ad_needs_xt(const Product& P, const Adapter* ad, prefill::Gemm& gemm);

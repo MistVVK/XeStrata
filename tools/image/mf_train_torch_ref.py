@@ -98,8 +98,12 @@ def adapt(yb: torch.Tensor, x16: torch.Tensor, rs, w: torch.Tensor, e, b: torch.
     h16, hr = rows(h)
     delta = h16.float() @ e["B"].T * hr.unsqueeze(-1)
     if e["method"] == "dora":
-        c = e["m"] / (e["norms"] + 1.1920929e-07)
-        return (1.0 + e["scale"] * (c - 1.0)).unsqueeze(0) * yb + (e["scale"] * c).unsqueeze(0) * delta + b
+        # PEFT's DoRA (tuners/lora/dora.py): the norm of the composed weight W + s BA, recomputed from the current
+        # factors and detached (the norm receives no gradient); at strength 1 the base rows take c, the delta's s c
+        with torch.no_grad():
+            n = torch.linalg.vector_norm(w.float() + e["scale"] * (e["B"] @ e["A"]), dim=1)
+        c = e["m"] / (n + 1.1920929e-07)
+        return c.unsqueeze(0) * yb + (e["scale"] * c).unsqueeze(0) * delta + b
     return yb + e["scale"] * delta + b
 
 

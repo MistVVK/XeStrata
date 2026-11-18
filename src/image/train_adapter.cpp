@@ -91,24 +91,30 @@ void lokr_transpose(const float* src, int64_t R, int64_t A, int64_t B, float* ds
 }
 
 // y = (y + s D) rsx + b, D read through the transposed product's rows: D[r][l*ok+k] = o[(r*ok+k)][l].  o was read
-// from the same divided rows as y, so it takes rsx too.
+// from the same divided rows as y, so it takes rsx too.  g1/g2: the two whole-tensor powers of two the forward's
+// FP16 copies divided by (f16_copy_full), put back here.
 void lokr_rows_back(float* y, const float* rsx, const float* bias, const float* o, float scale, int64_t R,
-                    int64_t N, int64_t ol, int64_t ok, void* s) {
+                    int64_t N, int64_t ol, int64_t ok, const uint32_t* g1, const uint32_t* g2, void* s) {
     dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) R * N), [=](sycl::id<1> id) {
         const int64_t i = static_cast<int64_t>(id[0]), t = i / N, j = i - t * N;
         const int64_t l = j / ok, k = j - l * ok;
-        y[i] = (y[i] + scale * o[(t * ok + k) * ol + l]) * (rsx != nullptr ? rsx[t] : 1.f) +
+        const float G = dit_rows::pow2_full(sycl::bit_cast<float>(*g1)) *
+                        dit_rows::pow2_full(sycl::bit_cast<float>(*g2));
+        y[i] = (y[i] + scale * G * o[(t * ok + k) * ol + l]) * (rsx != nullptr ? rsx[t] : 1.f) +
                (bias != nullptr ? bias[j] : 0.f);
     });
 }
 
 // dxv[t*K + m*inn+n] += s * dyrs[t] * dx[((t*inn+n)*im)+m]: the delta path's input gradient joins the base's.
+// g1/g2: the backward's two FP16 copies' whole-tensor powers of two (f16_copy_full), put back here.
 void lokr_dgrad_add(float* dxv, const float* dx, const float* dyrs, float scale, int64_t R, int64_t K,
-                    int64_t im, int64_t inn, void* s) {
+                    int64_t im, int64_t inn, const uint32_t* g1, const uint32_t* g2, void* s) {
     dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) R * K), [=](sycl::id<1> id) {
         const int64_t i = static_cast<int64_t>(id[0]), t = i / K, j = i - t * K;
         const int64_t m = j / inn, n = j - m * inn;
-        dxv[i] += scale * dyrs[t] * dx[(t * inn + n) * im + m];
+        const float G = dit_rows::pow2_full(sycl::bit_cast<float>(*g1)) *
+                        dit_rows::pow2_full(sycl::bit_cast<float>(*g2));
+        dxv[i] += scale * dyrs[t] * G * dx[(t * inn + n) * im + m];
     });
 }
 
@@ -122,14 +128,16 @@ void lokr_product_fwd(const Adapter* ad, const uint16_t* x16, const float* rsx, 
     // U[(R*im), rk] = X[(R*im), inn] w2b ; T[(R*im), ok] = U w2a
     gemm.f16(x16, ad->w2b, t1, R * im, rk, inn);
     uint16_t* u16 = tt;
-    f16_copy(t1, R * im * rk, u16, stream);
+    uint32_t* gu = scale_word(1, stream);
+    f16_copy_full(t1, R * im * rk, u16, gu, stream);
     gemm.f16(u16, ad->w2a, t2, R * im, ok, rk);
     // T2[(R*ok), im] = transpose(T); O[(R*ok), ol] = T2 w1
     lokr_transpose(t2, R, im, ok, t1, stream);
     uint16_t* t2_16 = tt + (size_t) R * im * rk;
-    f16_copy(t1, R * ok * im, t2_16, stream);
+    uint32_t* gt = scale_word(0, stream);
+    f16_copy_full(t1, R * ok * im, t2_16, gt, stream);
     gemm.f16(t2_16, ad->w1, t2, R * ok, ol, im);
-    lokr_rows_back(y, rsx, bias, t2, s, R, N, ol, ok, stream);
+    lokr_rows_back(y, rsx, bias, t2, s, R, N, ol, ok, gu, gt, stream);
 }
 
 // one LoKr product's backward: the delta path's input gradient (added into dxv) and factor gradients (added into
@@ -150,13 +158,15 @@ void lokr_product_bwd(const Adapter* ad, const uint16_t* xt, const float* rsx, f
     transpose_f16(ad->w2b, rk, inn, w2bt, stream);
     gemm.f16(dy16, w2at, t1, R * ol, rk, ok);
     uint16_t* p1_16 = tt + (size_t) R * N;
-    f16_copy(t1, R * ol * rk, p1_16, stream);
+    uint32_t* g1 = scale_word(1, stream);
+    f16_copy_full(t1, R * ol * rk, p1_16, g1, stream);
     gemm.f16(p1_16, w2bt, t2, R * ol, inn, rk);
     lokr_transpose(t2, R, ol, inn, t1, stream);
     uint16_t* p2_16 = p1_16 + (size_t) R * ol * rk;
-    f16_copy(t1, R * inn * ol, p2_16, stream);
+    uint32_t* g2 = scale_word(0, stream);   // the wgrad below takes this word again, after dgrad_add read it
+    f16_copy_full(t1, R * inn * ol, p2_16, g2, stream);
     gemm.f16(p2_16, ad->w1t, t2, R * inn, im, ol);
-    lokr_dgrad_add(dxv, t2, dyrs, s, R, K, im, inn, stream);
+    lokr_dgrad_add(dxv, t2, dyrs, s, R, K, im, inn, g1, g2, stream);
     // the whole delta's gradient, then each factor through its partial trace (w2 splits as a product does)
     uint32_t* g = scale_word(0, stream);
     scaled_transpose_f16(dYv, rsx, R, N, t16t, g, stream);
@@ -177,19 +187,45 @@ void lokr_product_bwd(const Adapter* ad, const uint16_t* xt, const float* rsx, f
     add_into(ad->dW2b, dw2b, rk * inn, stream);
 }
 
-// a DoRA's row factors (the same formula dora_bwd's da/db read: c = m / (|W| + eps), fa = 1 + s (c - 1),
-// fb = s c, with kLoraDoraEps as image_lora.cpp takes it)
+// a DoRA's row factors (the same formula dora_bwd's da/db read: PEFT's at strength 1, c = m / (n + eps) with n the
+// composed norm ||W + s BA||, fa = c, fb = s c; kLoraDoraEps as image_lora.cpp takes it)
 void ad_factors(const float* m, const float* norms, int64_t N, float scale, float* fa, float* fb, void* s) {
     constexpr float kDoraEps = 1.1920929e-07f;
     dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) N), [=](sycl::id<1> id) {
         const int64_t n = static_cast<int64_t>(id[0]);
         const float c = m[n] / (norms[n] + kDoraEps);
-        fa[n] = 1.f + scale * (c - 1.f);
+        fa[n] = c;
         fb[n] = scale * c;
     });
 }
 
 }  // namespace
+
+void dora_composed_norms(const Adapter* ad, int64_t N, int64_t K, float* wat, float* aat, prefill::Gemm& gemm,
+                         void* stream) {
+    const int64_t rk = ad->rank;
+    const float sc = ad->scale;
+    // W A^T read as A W^T [rank][N] (the gemm takes W's rows as they are), A A^T [rank][rank]
+    gemm.f16(ad->a, ad->w, wat, rk, N, K);
+    gemm.f16(ad->a, ad->a, aat, rk, rk, K);
+    const uint16_t* b = ad->b;          // the device's own pointers: the kernel must not read the host's struct
+    const float* norms0 = ad->norms0;
+    float* norms = ad->norms;
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) N), [=](sycl::id<1> id) {
+        const int64_t r = static_cast<int64_t>(id[0]);
+        float cross = 0.f;
+        for (int64_t j = 0; j < rk; ++j) cross += kernels::f32_from_f16(b[r * rk + j]) * wat[j * N + r];
+        float quad = 0.f;
+        for (int64_t j = 0; j < rk; ++j) {
+            float t = 0.f;
+            for (int64_t l = 0; l < rk; ++l) t += aat[j * rk + l] * kernels::f32_from_f16(b[r * rk + l]);
+            quad += kernels::f32_from_f16(b[r * rk + j]) * t;
+        }
+        const float n0 = norms0[r];
+        const float n2 = n0 * n0 + 2.f * sc * cross + sc * sc * quad;
+        norms[r] = sycl::sqrt(sycl::fmax(n2, 0.f));
+    });
+}
 
 void ad_product_fwd(const Adapter* ad, const uint16_t* x16, const float* rsx, float* y, const float* bias, int64_t R,
                     int64_t N, int64_t K, const AdKeep& keep, const AdScratch& sc, prefill::Gemm& gemm,
@@ -220,6 +256,12 @@ void ad_product_fwd(const Adapter* ad, const uint16_t* x16, const float* rsx, fl
     const float* fa_use = nullptr;
     const float* fb_use = nullptr;
     if (ad->method == AdapterMethod::dora) {
+        if (ad->w == nullptr || ad->norms0 == nullptr)
+            throw std::invalid_argument("image engine: a DoRA's composed norms need the base weight's rows");
+        // PEFT recomputes ||W + s BA|| every forward (the factors detached): A and B moved since the last step.
+        // wat and aat live in the block's lora_bwd scratch, free in the forward (N rank + rank rank of its
+        // T rank + N rank + rank K)
+        dora_composed_norms(ad, N, K, sc.scratch, sc.scratch + (size_t) N * ad->rank, gemm, stream);
         ad_factors(ad->m, ad->norms, N, ad->scale, fa, fb, stream);
         fa_use = fa;
         fb_use = fb;

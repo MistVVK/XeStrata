@@ -439,6 +439,7 @@ void Trainer::resume() {
         mv(a.dB);
         mv(a.m);
         mv(a.norms);
+        mv(a.norms0);
         mv(a.dm);
         mv(a.w1);
         mv(a.w1t);

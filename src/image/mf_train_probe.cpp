@@ -17,6 +17,10 @@
 //   dgrad   dy16 rsY wt          -> dx        (wt: the weight's FP16 rows transposed, [K,N])
 //   wgrad   a16t x16t gscale     -> dw        (a16t: the gradient's rows scaled and transposed, [N,T])
 //   bias    dy                   -> db
+//   dora    dY p d m norms scale -> dm da db  (norms: the composed ||W + s BA|| the forward divided by)
+//   doranorm w16 a16 b16 norms0 scale -> norms (PEFT's composed row norms from the base |W|)
+//   doraab  x16 xr w16 a16 b16 m norms0 dY scale -> y dx dA dB dm norms   (one DoRA product, forward and backward)
+//   lokrab  x16 xr w16 w1 w2a w2b parts dY scale -> y dx dW1 dW2a dW2b     (one LoKr product, the same)
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/mf_train.hpp"
@@ -369,6 +373,146 @@ int main(int argc, char** argv) {
             save(dir, "dm", ho.data(), rows * 4);
             save(dir, "da", ho.data() + rows, rows * 4);
             save(dir, "db", ho.data() + 2 * rows, rows * 4);
+        } else if (op == "doranorm") {
+            // PEFT's composed row norms ||W_r + scale (BA)_r|| from the base |W_r| and the FP16 factors
+            Var wv = load(dir, "w16"), av = load(dir, "a16");
+            const int64_t N = wv.dim(0), K = wv.dim(1), rk = av.dim(0);
+            const float scale = load(dir, "scale").hf()[0];
+            Dev W(wv), A(av), B(load(dir, "b16")), N0(load(dir, "norms0")), norms(N * 4),
+                scratch((N * rk + rk * rk) * 4);
+            train::Adapter ad;
+            ad.method = train::AdapterMethod::dora;
+            ad.rank = rk;
+            ad.scale = scale;
+            ad.a = A.h();
+            ad.b = B.h();
+            ad.w = W.ch();
+            ad.norms0 = N0.f();
+            ad.norms = norms.f();
+            strata::prefill::Gemm gemm;
+            std::string err;
+            if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
+            train::dora_composed_norms(&ad, N, K, scratch.f(), scratch.f() + N * rk, gemm, s);
+            strata::gpu::stream_sync(s);
+            std::vector<float> ho((size_t) N);
+            norms.read(ho.data(), N * 4);
+            save(dir, "norms", ho.data(), N * 4);
+        } else if (op == "doraab" || op == "lokrab") {
+            // one product's adapter forward and backward whole (ad_product_fwd / ad_product_bwd): the rows out,
+            // the input's gradient and every factor's, what the partial ops' checks do not reach
+            Var xv = load(dir, "x16"), wv = load(dir, "w16"), dyv = load(dir, "dY");
+            const int64_t T = xv.dim(0), K = xv.dim(1), N = wv.dim(0);
+            const float scale = load(dir, "scale").hf()[0];
+            strata::prefill::Gemm gemm;
+            std::string err;
+            if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
+            Dev X(xv), W(wv), DY(dyv), XR(load(dir, "xr")), WT(N * K * 2), XT(T * K * 2);
+            train::transpose_f16(W.ch(), N, K, WT.h(), s);
+            train::transpose_f16(X.ch(), T, K, XT.h(), s);
+            train::Product P;
+            P.N = N;
+            P.K = K;
+            P.w = W.ch();
+            P.wt = WT.ch();
+            train::Adapter ad;
+            ad.scale = scale;
+            std::deque<Dev> keep;
+            auto fresh = [&](int64_t bytes) -> Dev& {
+                Dev& d = keep.emplace_back(Dev(bytes));
+                zero(d, bytes, s);
+                return d;
+            };
+            int64_t rk = 0;
+            std::vector<std::pair<std::string, float*>> grads;
+            if (op == "doraab") {
+                Var av = load(dir, "a16");
+                rk = av.dim(0);
+                Dev& A = keep.emplace_back(av);
+                Dev& B = keep.emplace_back(load(dir, "b16"));
+                Dev& AT = keep.emplace_back(Dev(rk * K * 2));
+                Dev& BT = keep.emplace_back(Dev(rk * N * 2));
+                train::transpose_f16(A.ch(), rk, K, AT.h(), s);
+                train::transpose_f16(B.ch(), N, rk, BT.h(), s);
+                ad.method = train::AdapterMethod::dora;
+                ad.rank = rk;
+                ad.a = A.h();
+                ad.at = AT.h();
+                ad.b = B.h();
+                ad.bt = BT.h();
+                ad.w = W.ch();
+                ad.m = keep.emplace_back(load(dir, "m")).cf();
+                ad.norms0 = keep.emplace_back(load(dir, "norms0")).f();
+                ad.norms = fresh(N * 4).f();
+                ad.dA = fresh(rk * K * 4).f();
+                ad.dB = fresh(N * rk * 4).f();
+                ad.dm = fresh(N * 4).f();
+                grads = {{"dA", ad.dA}, {"dB", ad.dB}, {"dm", ad.dm}, {"norms", ad.norms}};
+            } else {
+                Var parts = load(dir, "parts");   // out_l, out_k, in_m, in_n, rank
+                const int64_t ol = (int64_t) parts.hf()[0], ok = (int64_t) parts.hf()[1];
+                const int64_t im = (int64_t) parts.hf()[2], inn = (int64_t) parts.hf()[3];
+                rk = (int64_t) parts.hf()[4];
+                if (N != ol * ok || K != im * inn) throw std::runtime_error("mf_train_probe: not the LoKr's shape");
+                Dev& W1 = keep.emplace_back(load(dir, "w1"));
+                Dev& W1T = keep.emplace_back(Dev(ol * im * 2));
+                train::transpose_f16(W1.ch(), ol, im, W1T.h(), s);
+                ad.method = train::AdapterMethod::lokr;
+                ad.rank = rk;
+                ad.ol = ol;
+                ad.ok = ok;
+                ad.im = im;
+                ad.inn = inn;
+                ad.w1 = W1.h();
+                ad.w1t = W1T.h();
+                ad.w2a = keep.emplace_back(load(dir, "w2a")).h();
+                ad.w2b = keep.emplace_back(load(dir, "w2b")).h();
+                ad.dW1 = fresh(ol * im * 4).f();
+                ad.dW2a = fresh(ok * rk * 4).f();
+                ad.dW2b = fresh(rk * inn * 4).f();
+                grads = {{"dW1", ad.dW1}, {"dW2a", ad.dW2a}, {"dW2b", ad.dW2b}};
+            }
+            const train::Product* pp = &P;
+            const train::Adapter* ap = &ad;
+            const train::AdSizes sz = train::ad_sizes(&pp, &ap, 1, [T](int64_t) { return T; });
+            Dev hf(sz.rows * sz.rank * 4), y1(sz.rows * sz.n * 4), y2(sz.rows * sz.n * 4), fafb(2 * sz.n * 4),
+                scratch(sz.scratch * 4), tmp16(sz.tmp * 2), rsT(sz.rows * 4), h16(T * rk * 2), hr(T * 4),
+                h16t(rk * T * 2), t16(T * N * 2), trs(T * 4), t16t(N * T * 2),
+                sums((2 * N * K + T * K) * 4);   // a LoKr's dDelta and its wgrad's scratch, each N K (the blocks' own)
+            train::AdScratch sc;
+            sc.hf = hf.f();
+            sc.y1 = y1.f();
+            sc.y2 = y2.f();
+            sc.fa = fafb.f();
+            sc.fb = fafb.f() + sz.n;
+            sc.scratch = scratch.f();
+            sc.tmp16 = tmp16.h();
+            sc.rsT = rsT.f();
+            train::AdKeep kp;
+            kp.h16 = h16.h();
+            kp.hr = hr.f();
+            kp.h16t = h16t.h();
+            Dev y(T * N * 4), dx(T * K * 4);
+            zero(dx, T * K * 4, s);
+            gemm.f16(X.ch(), W.ch(), y.f(), T, N, K);   // the base product's rows, still divided by xr
+            train::ad_product_fwd(&ad, X.ch(), XR.cf(), y.f(), nullptr, T, N, K, kp, sc, gemm, s);
+            train::ad_product_bwd(P, &ad, X.ch(), XR.cf(), XT.ch(), DY.f(), dx.f(), false, kp, sc, t16.h(),
+                                  trs.f(), t16t.h(), sums.f(), T, gemm, s);
+            strata::gpu::stream_sync(s);
+            std::vector<float> ho((size_t) (T * N));
+            y.read(ho.data(), T * N * 4);
+            save2(dir, "y", ho.data(), T, N);
+            ho.assign((size_t) (T * K), 0.f);
+            dx.read(ho.data(), T * K * 4);
+            save2(dir, "dx", ho.data(), T, K);
+            for (const auto& [name, p] : grads) {
+                const int64_t n = name == "dA" ? rk * K : name == "dB" ? N * rk : name == "dm" || name == "norms"
+                                                              ? N
+                                                              : name == "dW1" ? ad.ol * ad.im
+                                                              : name == "dW2a" ? ad.ok * rk : rk * ad.inn;
+                ho.assign((size_t) n, 0.f);
+                strata::gpu::copy(ho.data(), p, (size_t) n * 4);
+                save2(dir, name, ho.data(), n, 1);
+            }
         } else if (op == "attnbtime") {   // the attention's backward timed: rows, heads, n_causal from dims (3 floats)
             Var dims = load(dir, "dims");
             const int64_t T = (int64_t) dims.hf()[0], H = (int64_t) dims.hf()[1], nc = (int64_t) dims.hf()[2];
@@ -604,7 +748,9 @@ int main(int argc, char** argv) {
                         Dev& md = keep.emplace_back(vm);
                         Dev& nd = keep.emplace_back(vn);
                         az.m = md.cf();
-                        az.norms = nd.f();
+                        az.w = vd.ch();          // the composed norms' W A^T reads the weight's rows
+                        az.norms0 = nd.f();      // the dump's |W_r|; the forward composes ||W_r + s (BA)_r||
+                        az.norms = fresh(N[i]);
                         az.dm = fresh(N[i]);
                         adm[st][i] = az.dm;
                     }

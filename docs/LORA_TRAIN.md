@@ -106,23 +106,24 @@ the common dot-form reader and our `make_lokr` both take it. v1 uses rank 16 for
 
 ### DoRA's norm convention
 
-`dora_scale` is the magnitude vector m, and **the divisor is the row norm of the base weight W** (the formula in `include/strata/image/image_lora.hpp` and `lora_dora_rows`):
+`dora_scale` is the magnitude vector m, and **the divisor is the composed weight's row norm `||W + (alpha/rank) BA||`** (PEFT's DoRA, the same definition as `tuners/lora/dora.py`'s `get_weight_norm`; `lora_dora_rows` and `dit_dora_norms`):
 
 ```text
-c_r = m_r / (|W_r| + eps)      eps = 1.1920929e-07 (FP32's eps, `kLoraDoraEps`)
+n_r = ||W_r + (alpha / rank) (BA)_r||
+c_r = m_r / (n_r + eps)      eps = 1.1920929e-07 (FP32's eps, `kLoraDoraEps`)
 y   = [1 + s (c - 1)] (W x) + s c (alpha / rank) (B A x)
 ```
 
-Training starts with `m_r = |W_r|`, so c = 1 and the model is unchanged at first. At a request's strength 1 the formula is DoRA's weight decomposition with W's row norms, measured to a
-**relative** 3.1e-8 to 4.8e-8 over F32 weights (rounding; 1.9e-7 taking in the strength -0.5 case too) — the values of the DoRA table in `records/2026-10-29-image-lora/formats`. **PEFT divides by `|W + ΔV|`** instead, measured 2.4e-4 apart in relative terms. v1 keeps W's row norms, as the common dot-form reader does.
+At a request's strength s of 1 this is PEFT's DoRA itself (the base's rows times c, the delta's times c and alpha/rank). s blends the base's factor between 1 and c, the engine's own meaning of strength. The composed weight is never made: the norm comes from the expansion
+`n_r² = |W_r|² + 2 (alpha/rank) Σ_j B_rj (W Aᵀ)_rj + (alpha/rank)² B_r (A Aᵀ) B_rᵀ`. Inference computes W Aᵀ and A Aᵀ once when the LoRA is bound, so a generation step's work does not grow. Training recomputes them every forward (the norm detached: no gradient through it).
 
-- A reader that adds `torch.finfo(weight.dtype).eps` follows the base's type, while ours is always FP32's. Where a row norm is 1, an F16 base gives its c about 0.098% below ours (eps 0.0009765625) and a BF16 base about 0.775% below ours (eps 0.0078125); only an FP32 base matches ours (eps 1.1920929e-07). The smaller the row norm, the wider the gap: the bf16 run of the record had row norms of 0.3 to 1 and a relative difference of 1.69e-02 over the weight's change (the last two rows of the DoRA table in
-  `records/2026-10-29-image-lora/formats`), and a base whose row norms sit nearer 1 is closer still.
-- Over a quantized base (Q8_0 and others) the row norms come from the weight the engine reads for inference, dequantized (`dora_norms` reads
-  `model.diffusion_model.<target>.weight`). Training takes them from the same weights.
+Training starts with `m_r = |W_r|` (B = 0, so n = |W| and c = 1: the model is unchanged at first).
+
+- eps is always FP32's, whatever the base's type (PEFT adds no eps; the two differ only where a row norm is extremely small).
+- Over a quantized base (Q8_0 and others) the row norms come from the weight the engine reads for inference, dequantized (Qwen-Image's GGUF through the same dequantization the products use). Training's DoRA takes an FP16 base only; the pair with an int8 base is refused.
 - `dora_scale`'s length must be the weight's **rows** (the engine refuses columns, and the listing checks `(rows,)`).
 - **DoRA is not added to LoKr** (the engine's refusal is what the documents say). DoRA is the plain LoRA plus m.
-- A magnitude written by PEFT or ai-toolkit (`lora_magnitude_vector`, `.magnitude`) applied under our convention is an approximation; the documents and this document say so.
+- A magnitude written by PEFT or ai-toolkit (`lora_magnitude_vector`, `.magnitude`) reads under the same definition as it was written.
 
 ## Files sd-scripts wrote itself (external files)
 
@@ -267,7 +268,7 @@ The same machinery, read in the versions placed beside this document. The right-
 | Loss | rectified flow: `target = noise - latents`; `model_prediction_type` defaults to `sigma_scaled` while the FLUX and MOSS-Image guides use `raw`; `weighting_scheme` defaults to `uniform` | velocity MSE; the sigma scale comes from the scheduler config | rectified flow (diffusers' scheduler) with its `--flow_matching*` fields | `raw` with weight 1.0 (`v = eps - x`) |
 | Optimizer and LR | AdamW by default (`--optimizer_type`); the guides show AdamW8bit, `lr_scheduler=constant`, lr 1e-4 and `network_dim=16` (the argument defaults to None, so LoRA's own 4 is the fallback) | `toolkit/optimizer.py` builds `torch.optim.AdamW` with `eps = 1e-6` (ours is 1e-8), and its own optimizers (`automagic*`) can be chosen instead | `--optimizer` is required, from a long list (bnb-adamw8bit, prodigy, soap, …) | AdamW with F32 states and `eps = 1e-8`, lr 1e-4, 50 warmup steps, gradients accumulated 4, 1500 steps, rank 16 |
 | LoKr keys | `lokr_w1` always whole; w2 as factors (`lokr_w2_a` `[out_k][rank]`, `lokr_w2_b` `[rank][in_n]`) or full matrix; an `alpha` beside them | the same names; even in `peft_format` it keeps `.alpha` for LoKr (`network_mixins.py`); the old form writes a `lycoris_` prefix | through LyCORIS (the `lycoris_` prefix: the survey's problem 2) | sd-scripts' shape (w1 whole, w2 factored, `.alpha`); no full matrix, no Tucker |
-| DoRA's divisor | no training code at all (0 hits for `dora`) | `toolkit/models/DoRA.py` takes the row norms of `W + ΔW`, and names the key `.magnitude` (it rewrites `alpha` to `.magnitude`) | via PEFT / LyCORIS (`lora_magnitude_vector`) | our and the common dot-form reader's `norm(W)`, the key `dora_scale`; a foreign magnitude applied here is an approximation |
+| DoRA's divisor | no training code at all (0 hits for `dora`) | `toolkit/models/DoRA.py` takes the row norms of `W + ΔW`, and names the key `.magnitude` (it rewrites `alpha` to `.magnitude`) | via PEFT / LyCORIS (`lora_magnitude_vector`) | ours is PEFT's own `norm(W + (alpha/rank) BA)`; the key `dora_scale` reads too |
 | Saved keys | `lora_unet_` + underscores + `lora_down` / `lora_up` | `diffusion_model.` + dots + `lora_A` / `lora_B` (the dot form; `peft_format` drops `.alpha`) | diffusers form (`transformer.` + dots) or the dot form, with `lora_alpha` in the metadata | the dot form plus a per-weight `.alpha` ([the saved file](#the-saved-file-d1)) |
 | Plain LoRA keys | `lora_down` / `lora_up` plus `.alpha` (strength alpha / rank) | with `peft_format` it writes `lora_A`/`lora_B` and drops `.alpha` | switches between the diffusers form and the dot form (`lycoris_` belongs to LoKr) | `lora_A`/`lora_B` plus a per-weight `.alpha`. Our readers also take `.lora_A.default`. v1's default rank is 16 |
 
@@ -484,8 +485,8 @@ Around the same build, measure **reading and applying apart, never mixed**:
 
 - reading: one file's keys against the whole target table (`_entry` tries every pattern of `_MATCH`). Adding a form to the table adds patterns: today there are 16 for
   qwen-image, 21 for moss-image, 20 for mage-flow and 66 for anima, and the underscore form beside the dotted one nearly doubles the three first.
-- applying: one number per method (plain LoRA, LoKr, DoRA), never mixed. LoKr is heavier than plain LoRA (its Kronecker product), and DoRA's row norms sit in the per-layer
-  path of generation (`lora_dora_rows` in `qi_dit.cpp`, `mf_dit.cpp`, `moss_dit.cpp`, `anima_dit.cpp`).
+- applying: one number per method (plain LoRA, LoKr, DoRA), never mixed. LoKr is heavier than plain LoRA (its Kronecker product), and DoRA's composed norms are taken once at the
+  bind (`dit_dora_norms`), not in a generation step's path.
 - generation time: same build, prompt, seed and step count, at **no adapter, one adapter and four** (`MAX_LORA` is 4).
 
 The table below is the path with no adapter bound (the record holds the base binary and the one that landed the adapters). What one and four adapters cost is taken by each card against a `before.txt` naming the current dev (the table's base `4ef1c757f` predates dev `11824103d`).

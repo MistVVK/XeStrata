@@ -95,21 +95,24 @@ Tucker の核（`lokr_t2`）も書きません（v1 の対象はすべて Linear
 
 ### DoRA のノルムの規約
 
-`dora_scale` は大きさのベクトル m で、**分母は土台の重み W の行ノルム**です（`include/strata/image/image_lora.hpp` の式と `lora_dora_rows`）:
+`dora_scale` は大きさのベクトル m で、**分母は合成した重みの行ノルム `||W + (alpha/rank) BA||`** です（PEFT の DoRA、`tuners/lora/dora.py` の `get_weight_norm` と同じ定義。`lora_dora_rows` と `dit_dora_norms`）:
 
 ```text
-c_r = m_r / (|W_r| + eps)      eps = 1.1920929e-07（FP32 の eps。`kLoraDoraEps`）
+n_r = ||W_r + (alpha / rank) (BA)_r||
+c_r = m_r / (n_r + eps)      eps = 1.1920929e-07（FP32 の eps。`kLoraDoraEps`）
 y   = [1 + s (c - 1)] (W x) + s c (alpha / rank) (B A x)
 ```
 
-学習の始めは `m_r = |W_r|` に初期化します（c = 1 で、最初は素の模型と同じ）。要求の強さ s が 1 のとき式は W の行ノルムを使う DoRA の重みの分解で、実測の**相対差**は 3.1e-8 〜 4.8e-8 です（F32 の重み。丸めの範囲。強さ -0.5 まで入れて 1.9e-7。`records/2026-10-29-image-lora/formats` の DoRA の表と同じ値）。
-**PEFT は分母が `|W + ΔV|`** で、実測の相対差は 2.4e-4 です。v1 は一般の dot 形の読み手と同じく W の行ノルムに揃えます。
+要求の強さ s が 1 のとき PEFT の DoRA そのものです（土台の行は c 倍、delta の行は c・alpha/rank 倍）。s は土台の係数を 1 と c の間で混ぜる、エンジン独自の強さの意味です。合成した重みは作らず、ノルムは展開
+`n_r² = |W_r|² + 2 (alpha/rank) Σ_j B_rj (W Aᵀ)_rj + (alpha/rank)² B_r (A Aᵀ) B_rᵀ` で出します。推論では W Aᵀ と A Aᵀ を LoRA を載せるときに 1 回だけ計算し、生成の毎ステップの仕事は増えません。学習では毎回の forward で計算し直します（ノルムは detach: 勾配は通りません）。
 
-- eps に `torch.finfo(weight.dtype).eps` を足す読み手では、eps が土台の型に付きます。当方は型に関係なく FP32 の値を足すので、次の差が出ます。行ノルムが 1 の重みで、土台が BF16 ならその c は当方より 0.775% 小さく（eps 0.0078125）、F16 なら 0.098% 小さく（eps 0.0009765625）、FP32 の土台だけ当方と同じです（eps 1.1920929e-07）。行ノルムが小さいほど開きます（記録の bf16 の実測は行ノルム 0.3〜1 で、重みの変化の相対差 1.69e-02。`formats` の DoRA の表の下の 2 行。行ノルムが 1 により近い実物ではもっと小さい）。
-- 量子化した土台（Q8_0 など）では、エンジンが推論で読む復号後の重みから行ノルムを取ります（`dora_norms` が `model.diffusion_model.<対象>.weight` を読む）。学習も同じ重みから取ります。
+学習の始めは `m_r = |W_r|` に初期化します（B = 0 なので n = |W|、c = 1 で、最初は素の模型と同じ）。
+
+- eps は土台の型に関係なく常に FP32 の値です（PEFT は eps を足しません。差が出るのは行ノルムが極めて小さいときだけです）。
+- 量子化した土台（Q8_0 など）では、エンジンが推論で読む復号後の重みから行ノルムを取ります（Qwen-Image の GGUF は積と同じ復号の道を通ります）。学習の DoRA は FP16 の土台だけで、int8 の土台との組み合わせは断ります。
 - `dora_scale` の長さは**重みの行数**でなければなりません（列方向はエンジンが断り、一覧も `(rows,)` で検査します）。
 - **LoKr に DoRA は足しません**（エンジンの断りは文書どおり）。DoRA は素の LoRA に m を足す形です。
-- ai-toolkit や PEFT が書いた `lora_magnitude_vector`・`.magnitude` を当方の規約で当てるのは近似です。docs とこの文書にその旨を書きます。
+- PEFT や ai-toolkit が書いた `lora_magnitude_vector`・`.magnitude` は同じ定義でそのまま読めます。
 
 ## sd-scripts がそのまま書いたファイル（外部ファイル）
 
@@ -243,7 +246,7 @@ Mage-Flow の学習は bf16 常駐で組む（16 GiB、ピーク約 14.5 GiB）�
 | 損失 | flow matching（rectified flow）。`target = noise - latents`、`model_prediction_type` の既定は `sigma_scaled`（FLUX と MOSS の文書の例は `raw`）、`weighting_scheme` の既定は `uniform` | velocity の MSE。`sigma` の目盛りは scheduler の config どおり | flow matching（diffusers の scheduler）+ `--flow_matching*` の欄 | `raw` + 重み 1.0（`v = eps - x`） |
 | optimizer と LR | 既定は AdamW（`--optimizer_type`）。文書の例は AdamW8bit・`lr_scheduler=constant`・lr 1e-4・`network_dim=16`（`--network_dim` の既定は None で、LoRA 側の 4） | `toolkit/optimizer.py` が既定で `torch.optim.AdamW` を `eps = 1e-6`（当方の 1e-8 と違う）で組み、`automagic*` など独自の optimizer も選べる | `--optimizer` が必須で、bnb-adamw8bit・prodigy・soap など長い選択肢から選ぶ | AdamW（F32 の状態、`eps = 1e-8`）、lr 1e-4・warmup 50・勾配の積み 4・1500 step・rank 16 |
 | LoKr の鍵 | `lokr_w1` は常に丸ごと。w2 は因子（`lokr_w2_a` `[out_k][rank]`・`lokr_w2_b` `[rank][in_n]`）か full matrix。`alpha` を添える | 同じ名前。`peft_format` で保存しても LoKr だけは `.alpha` を残す（`network_mixins.py`）。古い形は `lycoris_` 前置 | LyCORIS を通す（`lycoris_` 前置。調査の問題 2） | sd-scripts の形（w1 丸ごと・w2 因子・`.alpha`）。full matrix と Tucker は書かない |
-| DoRA の分母 | 学習コードなし（`dora` の検索 0 件） | `toolkit/models/DoRA.py` が `norm(W + ΔW)` の行ノルムで、鍵の名前は `.magnitude`（`alpha` を `.magnitude` に書き換える） | PEFT / LyCORIS 経由（`lora_magnitude_vector`） | 当方と一般の dot 形の読み手の `norm(W)`。鍵は `dora_scale`。外の magnitude を当方で当てるのは近似 |
+| DoRA の分母 | 学習コードなし（`dora` の検索 0 件） | `toolkit/models/DoRA.py` が `norm(W + ΔW)` の行ノルムで、鍵の名前は `.magnitude`（`alpha` を `.magnitude` に書き換える） | PEFT / LyCORIS 経由（`lora_magnitude_vector`） | 当方も PEFT と同じ `norm(W + (alpha/rank) BA)`。鍵は `dora_scale` も読む |
 | 保存の鍵の形 | `lora_unet_` + 下線 + `lora_down`/`lora_up` | `diffusion_model.` + 点 + `lora_A`/`lora_B`（dot 形。`peft_format` だと `.alpha` を落とす） | diffusers 形（`transformer.` + 点）と dot 形の切り替え。メタデータに `lora_alpha` を書く | dot 形 + 重みごとの `.alpha`（上の[保存の形](#保存の形d1)） |
 | 素の LoRA の鍵 | `lora_down`/`lora_up` + `.alpha`（強さは alpha / rank） | `peft_format` なら `lora_A`/`lora_B` で、`.alpha` は落とす | diffusers 形と dot 形を切り替える（`lycoris_` は LoKr 側の話） | `lora_A`/`lora_B` + 重みごとの `.alpha`。読む側は `.lora_A.default` も読む。v1 の rank の既定は 16 |
 
@@ -442,7 +445,7 @@ Qwen-Image-2.1 のキャラ学習の既定は 8〜15 層・1500 更新です。�
 同じ build の前後で、**読む時間と適用する時間は混ぜずに**分けて取ります。
 
 - 読む時間: 1 ファイルの全鍵の照合（`_entry` は対象表の正規表現すべてに鍵を当てます）。対象表に形を足すと照合の数が増えます（現在の模板数は qwen-image 16・moss-image 21・mage-flow 20・anima 66。下線形を並べると 3 模型はほぼ倍になる）。
-- 適用する時間: 方式ごとに別に取り、混ぜません（素の LoRA・LoKr・DoRA）。LoKr は Kronecker 積で素の LoRA より重く、DoRA の行ノルムは生成の層ごとの道に入ります（`qi_dit.cpp`・`mf_dit.cpp`・`moss_dit.cpp`・`anima_dit.cpp` の `lora_dora_rows`）。
+- 適用する時間: 方式ごとに別に取り、混ぜません（素の LoRA・LoKr・DoRA）。LoKr は Kronecker 積で素の LoRA より重く、DoRA の合成ノルムは LoRA を載せるときの 1 回だけです（`dit_dora_norms`。生成の毎ステップの道には入りません）。
 - 生成時間: 同じ build・同じ prompt・同じ seed・同じ step 数で、**アダプター無し・1 個・4 個**（`MAX_LORA` が 4）の 3 段。
 
 下の表はアダプターを 1 本も当てない道の数値です（記録も土台と導入後の 2 つのバイナリ）。1 本・4 本を当てたときの適用の費用は、各カードが今の dev を名指しした `before.txt` で取り直します（表の土台 `4ef1c757f` は dev `11824103d` より前です）。
