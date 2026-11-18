@@ -177,7 +177,7 @@ class Walk(unittest.TestCase):
 
     # ---- the Save screen says the same tuning length as the Tuning screen
     def test_save_screen_tuning_time_matches_the_model(self):
-        for pick, want, never in (("qwen", "quick (about 20 min)", "5-10"),):
+        for pick, want, never in (("qwen", "skipped", "5-10"),):
             with self.subTest(pick=pick):
                 async def case(app, pilot, ctx):
                     await self.to_model(app, pilot, pick)

@@ -545,7 +545,7 @@ class PicturesParallelTuning(Base):
             self.assertIn("[ ] Allow settings that change answers very slightly", t)
             line = next(l for l in t.splitlines() if "›" in l)
             self.assertIn("Skip", line)                               # T5: a first setup starts on Skip, so Enter all the way does not wait 20 minutes
-            self.assertIn("strata launch --tune quick", t)            # and says how to tune later
+            self.assertIn("strata launch --tune quick", flat(app))          # and says how to tune later
             await press(pilot, "a")
             self.assertIn("[x] Allow settings", text_of(app))
             self.assertTrue(ctx.settings.tune_allow_small)

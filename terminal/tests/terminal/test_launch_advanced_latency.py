@@ -53,7 +53,7 @@ class AdvancedLatency(Base):
             for _ in range(names.index("--prefill")):
                 await press(pilot, "down", pause=0.05)
             derived = self.derive.call_count
-            await press(pilot, "enter")
+            await press(pilot, "e")
             await typed(pilot, "65536")
             await press(pilot, "enter")
             self.assertEqual(ctx.settings.extra, {"--prefill": "65536"})

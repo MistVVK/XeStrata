@@ -2404,7 +2404,7 @@ class Runner:
 
     def mac_first_start(self) -> bool:
         """A Mac on the first start of a fresh engine (T22): the first answer builds the graphics code and takes about 10 seconds longer."""
-        if not (self.engine_fresh and sys.platform == "darwin"):
+        if not (getattr(self, "engine_fresh", False) and sys.platform == "darwin"):
             return False
         return True
 

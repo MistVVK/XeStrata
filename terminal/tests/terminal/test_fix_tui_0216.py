@@ -286,14 +286,17 @@ class T14PicturesOnArc(Base):
         with mock.patch.object(catalog_mod.Catalog, "pictures_not_on_card", return_value=True):
             self.run_app(case)
 
-    def test_the_rule_is_the_intel_engine_on_linux_only(self):
+    def test_the_rule_is_the_intel_engine_without_the_reader_on_linux_only(self):
         with Home():
             cat = catalog()
             with mock.patch.object(catalog_mod.Catalog, "engine_backend", return_value="sycl"):
-                with mock.patch.object(sys, "platform", "linux"):
-                    self.assertTrue(cat.pictures_not_on_card())
-                with mock.patch.object(sys, "platform", "win32"):
-                    self.assertFalse(cat.pictures_not_on_card())
+                with mock.patch.object(catalog_mod.Catalog, "reader_state", return_value="unknown"):
+                    with mock.patch.object(sys, "platform", "linux"):
+                        self.assertTrue(cat.pictures_not_on_card())
+                    with mock.patch.object(sys, "platform", "win32"):
+                        self.assertFalse(cat.pictures_not_on_card())
+                with mock.patch.object(catalog_mod.Catalog, "reader_state", return_value="present"), mock.patch.object(sys, "platform", "linux"):
+                    self.assertFalse(cat.pictures_not_on_card())             # an engine that carries the reader keeps pictures on (B-series decision)
             with mock.patch.object(catalog_mod.Catalog, "engine_backend", return_value="cuda"):
                 with mock.patch.object(sys, "platform", "linux"):
                     self.assertFalse(cat.pictures_not_on_card())

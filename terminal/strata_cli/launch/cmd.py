@@ -553,7 +553,7 @@ def _stop_all(name: str | None) -> int:
 
 def no_screens_words(platform: str | None = None) -> str:
     """The sentence for a window that cannot show the screens, in the words of the computer's own system (Git Bash is Windows-only)."""
-    platform = platform or sys.platform
+    platform = platform or ("win32" if os.environ.get("MSYSTEM") else sys.platform)      # (Git Bash and mintty set MSYSTEM: Windows)
     if platform.startswith("win"):
         return ("This window cannot show Strata's screens (Git Bash and similar windows do not pass the keyboard through). "
                 "For the screens, open Windows Terminal, PowerShell or cmd, or run `winpty strata launch`. Going on with plain questions.")

@@ -596,12 +596,13 @@ class Catalog:
         return VR.default_mode(vram, "intel" if comp.engine_vendor == "intel" else "") if vram > 0 else "cpu"      # no usable card: nothing to read on, the CPU reader
 
     def pictures_not_on_card(self) -> bool:
-        """T14: an Intel Arc card on Linux (the engine route that builds the model's pack from the files itself) starts the engine text-only: no picture
-        reader is fetched or started there yet, so offering "Yes" would say "Pictures on" and then answer "I don't see a picture"."""
+        """T14: an Intel Arc card on Linux whose engine does not carry the picture reader (the engine route that builds the model's pack from the files itself
+        fetches none) starts the engine text-only, so offering "Yes" would say "Pictures on" and then answer "I don't see a picture" (USERTEST-LIN, A750).
+        An engine that carries the reader (reader_state "present", the B-series decision of 2026-10-22) keeps pictures on."""
         if not sys.platform.startswith("linux"):
             return False
         try:
-            return self.engine_backend() == "sycl"
+            return self.engine_backend() == "sycl" and self.reader_state() != "present"
         except Exception:                                    # noqa: BLE001
             return False
 
