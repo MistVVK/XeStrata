@@ -203,6 +203,7 @@ COLOR_MATCH = "off"
 UPSCALE_STRENGTH = 0.35
 UPSCALE_MAX_SCALE = 4.0
 UPSCALE_MAX_SIDE = 4096
+UPSCALE_SIZE_SLACK = 0.03          # an upscale to a size: its shape this close to the image's (stretched by the rest)
 UPSCALE_TILE = 1024
 UPSCALE_PAD = 128
 UPSCALE_BLUR = 32
@@ -1291,9 +1292,9 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
             v = None
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         v = {"scale": v}
-    if not isinstance(v, dict) or not set(v) <= {"scale", "strength", "method", "redraw", "color", "variant"}:
+    if not isinstance(v, dict) or not set(v) <= {"scale", "size", "strength", "method", "redraw", "color", "variant"}:
         raise ImageRequestError('upscale: {"scale": 1.5 or 2, "method": "auto", "redraw": true, "strength": 0.35, '
-                                '"color": "lab", "variant": "7b"} (or the scale alone)')
+                                '"color": "lab", "variant": "7b"} (or the scale alone; "size": "WxH" for a size)')
     scale = parse_number(v.get("scale"), "upscale.scale", 1.0, UPSCALE_MAX_SCALE, 2.0)
     if scale <= 1.0:
         raise ImageRequestError(f"upscale.scale: above 1, at most {UPSCALE_MAX_SCALE:g}")
@@ -1311,6 +1312,19 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
         raise ImageRequestError("upscale.strength: only with \"redraw\": true")
     w0, h0 = image_dims(image)
     w, h = (max(SIZE_STEP, round(x * scale / SIZE_STEP) * SIZE_STEP) for x in (w0, h0))
+    if v.get("size") not in (None, ""):   # a size asked for (a wallpaper's pixels): the upscaler's output resized to it
+        m = re.fullmatch(r"\s*(\d+)\s*[xX×]\s*(\d+)\s*", str(v["size"]))
+        if not m:
+            raise ImageRequestError('upscale.size: "WxH", e.g. "2670x1200"')
+        if redraw:
+            raise ImageRequestError("upscale.size: without redraw (redraw by a scale first, then upscale to the size)")
+        w, h = int(m.group(1)), int(m.group(2))
+        if abs((w / h) / (w0 / h0) - 1) > UPSCALE_SIZE_SLACK:
+            raise ImageRequestError(f"upscale.size: {w}x{h} is another shape than the image's {w0}x{h0}: make the "
+                                    "image that shape first (extend_image, or draw it so), then upscale it")
+        if not 1.0 < max(w / w0, h / h0) <= UPSCALE_MAX_SCALE:
+            raise ImageRequestError(f"upscale.size: {w}x{h} is not larger than {w0}x{h0}, or more than "
+                                    f"{UPSCALE_MAX_SCALE:g} times")
     if max(w, h) > UPSCALE_MAX_SIDE:
         raise ImageRequestError(f"upscale: {w}x{h} passes {UPSCALE_MAX_SIDE} pixels a side")
     resolved = method if method != "auto" else "realesrgan" if redraw else "seedvr2"
@@ -4117,6 +4131,8 @@ TOOLS: list[dict[str, Any]] = [
          "prompt": {"type": "string", "description": "what it shows (with redraw)"},
          "image": IMAGE_ARG,
          "scale": {"type": "number"},
+         "size": {"type": "string", "description": "WxH: an exact size of the image's shape, instead of scale; "
+                                                   "not with redraw"},
          "method": {"type": "string", "enum": list(UPSCALE_METHODS)},
          "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS)},
          "redraw": {"type": "boolean"},
@@ -5221,7 +5237,7 @@ class ImageTools:
                 req["crop_upscale"] = {k: v for k, v in (("method", args.get("crop_upscale")),
                                                          ("variant", args.get("variant"))) if v}
             if name == "upscale_image":
-                req["upscale"] = {k: args[k] for k in ("scale", "method", "redraw", "strength", "variant")
+                req["upscale"] = {k: args[k] for k in ("scale", "size", "method", "redraw", "strength", "variant")
                                   if args.get(k) not in (None, "")}
             if name == "fix_image":
                 req["fix"] = {"parts": args.get("parts") or ["face"],
