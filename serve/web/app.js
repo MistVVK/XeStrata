@@ -833,18 +833,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     $("state-image-bar").style.width = `${p}%`;
   }
 
-  // the eight cards
-  // Idle: not the last request's speed (one request is noisy) but the run's average from the server's totals
-  // (token-weighted, the same figure the engine's DONE lines and Prometheus report).  Live stays live.
-  const avgDecode = avgSpeed(totals && totals.decode_ms, totals && totals.output_tokens);
-  const readTokens = totals ? Math.max(0, (totals.prompt_tokens || 0) - (totals.reused || 0)) : 0;
-  const avgPrefill = avgSpeed(totals && totals.prompt_ms, readTokens);
   // the tab chosen above the GPU cards (every card together, or one of them; issue #112)
   const {g, hist, cards, one, all: allCards} = gpuView(hw, h);
   // a card that only draws images: its speed is the image job's seconds a step (now, else the last job's), not the
-  // chat's decode on another card; All and the text model's cards keep the chat's speed
+  // chat's decode on another card; All and the text model's cards keep the chat's speed (set after the cards below)
   const imageCard = Boolean(one) && (one.roles || []).includes("image") && !(one.roles || []).includes("text");
-  for (const el of document.querySelectorAll(".speed-values .speed-prefill")) el.hidden = imageCard;
   // the seconds a step of `job` (its live.image) while it samples, else the last job's (the steps' seconds grow by the
   // clock during the decode)
   const stepOf = (job) => {
@@ -852,12 +845,13 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     const now = job && job.stage === "sampling" ? job.step_s : null;
     return now != null ? now : last ? last.sampling_s / (last.steps * (last.n || 1)) : null;
   };
-  if (imageCard) {   // a job on the text model's card (on_text) is not this card's
-    const job = live.image && !live.image.on_text ? live.image : null, stepS = stepOf(job);
-    setMetric("speed", stepS == null ? null : fmt(stepS, 2), "s/step",
-              job ? tr("img.pill", "Image · {step}", {step: imageStep(job)})
-              : stepS != null ? tr("mon.imageStepLast", "Image · last job") : tr("img.job", "Image job"));
-  } else if (image) {   // an image job in the text model's turn: its seconds a step, not a decode rate
+  // the eight cards
+  // Idle: not the last request's speed (one request is noisy) but the run's average from the server's totals
+  // (token-weighted, the same figure the engine's DONE lines and Prometheus report).  Live stays live.
+  const avgDecode = avgSpeed(totals && totals.decode_ms, totals && totals.output_tokens);
+  const readTokens = totals ? Math.max(0, (totals.prompt_tokens || 0) - (totals.reused || 0)) : 0;
+  const avgPrefill = avgSpeed(totals && totals.prompt_ms, readTokens);
+  if (image) {   // an image job in the text model's turn: its seconds a step, not a decode rate
     const stepS = stepOf(image);
     setMetric("speed", stepS == null ? null : fmt(stepS, 2), "s/step", tr("img.pill", "Image · {step}", {step: imageStep(image)}));
   } else {
@@ -875,6 +869,13 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
                  : last ? tr("mon.prefillLast", "Prefill last request") : tr("mon.prefill", "Prefill"));
   spark("sp-speed", imageCard ? h.image_step_s : h.tok_s, undefined, true);
   spark("sp-prefill", imageCard ? [] : h.prefill_tok_s_mean);
+  if (imageCard) {   // the image card's own speed over the chat's (a job on the text model's card, on_text, is not its)
+    const job = live.image && !live.image.on_text ? live.image : null, stepS = stepOf(job);
+    setMetric("speed", stepS == null ? null : fmt(stepS, 2), "s/step",
+              job ? tr("img.pill", "Image · {step}", {step: imageStep(job)})
+              : stepS != null ? tr("mon.imageStepLast", "Image · last job") : tr("img.job", "Image job"));
+  }
+  for (const el of document.querySelectorAll(".speed-values .speed-prefill")) el.hidden = imageCard;
   // the GPU cards: the one card, or every card together
   renderGpuTabs(cards);
   const per = (f) => cards.map((c) => `GPU ${c.index} ${f(c)}`).join(" · ");
