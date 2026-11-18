@@ -146,7 +146,7 @@ uint64_t UpscaleRunner::least_bytes(const UpscaleModel& m, int64_t sw, int64_t s
         const int64_t t = in.context > 0 ? in.min_tile : std::max(fw, fh);
         const int64_t ww = window(t, in.context, fw), wh = window(t, in.context, fh), s = std::max(1, in.scale);
         const uint64_t tiles = in.context > 0 && (ww < fw || wh < fh) ? (uint64_t) (ww * wh) * 4 * (1 + s * s) : 0;
-        work = m.weight_least() + m.clip_bytes(ww, wh, clip_frames(in, 1)) + tiles;
+        work = m.weight_least() + m.clip_least(ww, wh, clip_frames(in, 1)) + tiles;
     }
     return frame_bytes(in, sw, sh, w, h, color) + work;
 }

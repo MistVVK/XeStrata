@@ -557,6 +557,25 @@ uint64_t Seedvr2::clip_bytes(int64_t w, int64_t h, int64_t frames) const {
     return own + std::max(vae, m.dit->activation_bytes(th, tw));
 }
 
+uint64_t Seedvr2::clip_least(int64_t w, int64_t h, int64_t frames) const {
+    (void) frames;   // one frame at a time
+    const int64_t th = h / 16, tw = w / 16, HW = w * h;
+    const uint64_t own = (uint64_t) (3 * HW + 4 * th * tw * 64 + 4 * HW) * 4;
+    const auto least = [&](const image::MfVae& v, const Seedvr2Dit& d) {   // run_clip's vae_least beside the DiT's
+        const uint64_t vae = std::max(v.least_scratch_bytes(th, tw),
+                                      v.encode_scratch_bytes(std::min<int64_t>(th, 16), std::min<int64_t>(tw, 16)));
+        return own + std::max(vae, d.activation_bytes(th, tw));
+    };
+    const Impl& m = *impl_;
+    if (m.vae && m.dit) return least(*m.vae, *m.dit);
+    std::string err;   // the parts' sizes from their files, read without their weights
+    image::MfVae v;
+    Seedvr2Dit d;
+    if (!v.open(m.vae_path, m.s, err, true) || !v.open_encoder(err, true) || !d.open(m.dit_path, m.s, err, true))
+        throw std::runtime_error("SeedVR2: " + err);
+    return least(v, d);
+}
+
 uint64_t Seedvr2::clip_largest(int64_t w, int64_t h, int64_t frames) const {
     (void) frames;
     return (uint64_t) (4 * w * h) * 4 + (uint64_t) ((h / 16) * (w / 16)) * 12288 * 4;

@@ -79,6 +79,9 @@ public:
     /// its largest single buffer (against the device's largest allocation).
     virtual uint64_t clip_bytes(int64_t w, int64_t h, int64_t frames) const = 0;
     virtual uint64_t clip_largest(int64_t w, int64_t h, int64_t frames) const = 0;
+    /// The least scratch such a run fits in: clip_bytes where the model's parts cannot be cut smaller (a model that
+    /// cuts its own parts into tiles in the room it is given: their smallest).
+    virtual uint64_t clip_least(int64_t w, int64_t h, int64_t frames) const { return clip_bytes(w, h, frames); }
     /// A clip: `in` [frames][h][w][4] RGBA8 on the GPU -> `out` [frames][h * s][w * s][4] (s the native scale, 1 for a
     /// model of scale 0).  The weights go to the GPU first when they are not there; done when it returns.  Throws
     /// std::runtime_error when the GPU has no room (the driver tries a smaller tile).

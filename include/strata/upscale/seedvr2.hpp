@@ -44,6 +44,8 @@ public:
     void set_room(uint64_t bytes) override;
     uint64_t clip_bytes(int64_t w, int64_t h, int64_t frames) const override;
     uint64_t clip_largest(int64_t w, int64_t h, int64_t frames) const override;
+    /// run_clip's least: the VAE's passes in their smallest tiles (as run_clip takes them where the room is short).
+    uint64_t clip_least(int64_t w, int64_t h, int64_t frames) const override;
     void run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, uint8_t* out, uint64_t seed) override;
     void release(bool all) override;
     uint64_t held() const override;
