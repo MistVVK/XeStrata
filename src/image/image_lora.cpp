@@ -52,6 +52,7 @@
 #include <thread>
 #include <fstream>
 #include <mutex>
+#include <regex>
 #include <stdexcept>
 
 namespace strata::image {
@@ -274,6 +275,58 @@ bool json_true(const std::string& s, const std::string& key) {
         at = meta_value_at(s, key, at + 1);
     }
     return false;
+}
+
+// The string -> number pairs of the metadata's `key` object, in the file's order (PEFT's alpha_pattern: a layer's
+// name pattern and its alpha).  A packed file holds one object a component, as json_numbers' fields.
+std::vector<std::pair<std::string, double>> json_pairs(const std::string& s, const std::string& key) {
+    std::vector<std::pair<std::string, double>> got;
+    size_t at = meta_value_at(s, key, 0);
+    while (at != std::string::npos) {
+        size_t i = at;
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
+        if (i < s.size() && s[i] == ':') ++i;
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
+        if (i < s.size() && s[i] == '{') {
+            for (++i; i < s.size() && s[i] != '}';) {
+                if (s[i] != '"') {
+                    ++i;
+                    continue;
+                }
+                std::string name;
+                for (++i; i < s.size() && s[i] != '"'; ++i) {
+                    if (s[i] == '\\' && i + 1 < s.size()) ++i;
+                    name += s[i];
+                }
+                ++i;
+                const size_t colon = s.find(':', i);
+                if (colon == std::string::npos) break;
+                const char* b = s.c_str() + colon + 1;
+                char* e = nullptr;
+                const double v = std::strtod(b, &e);
+                if (e != b) {
+                    got.emplace_back(std::move(name), v);
+                    i = (size_t) (e - s.c_str());
+                } else {
+                    i = colon + 1;
+                }
+            }
+        }
+        at = meta_value_at(s, key, at + 1);
+    }
+    return got;
+}
+
+// PEFT's get_pattern_key: the first pattern (the file's order) that matches the key's end - the pattern itself a
+// regular expression after any dotted prefix ("(.*\.)?(pattern)$").  A pattern the regex reader cannot compile is
+// matched as the literal name it usually is (a module's own name), not a refusal of the whole file.
+bool peft_pattern_matches(const std::string& pattern, const std::string& key) {
+    try {
+        return std::regex_match(key, std::regex("(.*\\.)?(" + pattern + ")$"));
+    } catch (const std::regex_error&) {
+        return key == pattern || (key.size() > pattern.size() && key.compare(key.size() - pattern.size() - 1,
+                                                                              pattern.size() + 1, "." + pattern) == 0);
+    }
 }
 
 /// The host's threads for one deltas' making: as many as the machine has, up to 16 (the image engine's other host rows
@@ -1018,9 +1071,11 @@ std::vector<LoraEntry> read_entries(Reader& rd, const std::string& path) {
 }
 
 // The scale a PEFT-form file keeps in its metadata ("lora_adapter_metadata": a JSON string), where no ".alpha"
-// tensor says it: alpha / rank.  rsLoRA's scale is another one (alpha / sqrt(rank)) and is refused, and so is a file
-// that names two different alphas: the engine reads one alpha for a file's weights, so which one the image's are
-// under is not said (diffusers writes a text encoder's and a transformer's one in the same field).
+// tensor says it: alpha / rank.  A layer's own alpha the metadata's alpha_pattern says (PEFT's per-layer alphas,
+// the first pattern that matches the key); the rest take the file's lora_alpha.  rsLoRA's scale is another one
+// (alpha / sqrt(rank)) and is refused, and so is a file that names two different alphas for weights no pattern
+// covers: the engine reads one alpha for those, so which one the image's are under is not said (diffusers writes a
+// text encoder's and a transformer's one in the same field).
 void apply_peft_metadata(std::vector<LoraEntry>& entries, const std::map<std::string, std::string>& meta) {
     std::string json;
     for (const auto& [k, v] : meta)
@@ -1029,6 +1084,17 @@ void apply_peft_metadata(std::vector<LoraEntry>& entries, const std::map<std::st
     if (json_true(json, "use_rslora"))
         throw std::runtime_error("the adapter is rsLoRA (use_rslora), whose scale is not the plain alpha / rank: not "
                                  "supported yet");
+    // Only a weight without its own ".alpha" takes the metadata's one (the ".alpha" wins as it does below).
+    const auto pattern = json_pairs(json, "alpha_pattern");
+    for (LoraEntry& e : entries) {
+        if (e.alpha_set) continue;
+        for (const auto& [pat, a] : pattern)
+            if (peft_pattern_matches(pat, e.key)) {
+                e.alpha = (float) a;
+                e.alpha_set = true;
+                break;
+            }
+    }
     const std::vector<double> alphas = json_numbers(json, "lora_alpha");
     size_t distinct = 0;   // how many different values those names hold: a file of one component holds one
     for (size_t i = 0; i < alphas.size(); ++i) {
@@ -1040,8 +1106,6 @@ void apply_peft_metadata(std::vector<LoraEntry>& entries, const std::map<std::st
             }
         if (!seen) ++distinct;
     }
-    // Only a weight without its own ".alpha" takes the metadata's one, so a file whose weights all carry an ".alpha"
-    // needs no answer here (the ".alpha" wins as it does below).
     bool from_meta = false;
     for (const LoraEntry& e : entries)
         if (!e.alpha_set) from_meta = true;
@@ -1051,7 +1115,7 @@ void apply_peft_metadata(std::vector<LoraEntry>& entries, const std::map<std::st
                                  "take is not said: not supported yet");
     if (alphas.empty()) return;
     for (LoraEntry& e : entries) {
-        if (e.alpha_set) continue;   // the file's own ".alpha" wins
+        if (e.alpha_set) continue;   // the file's own ".alpha" and the alpha_pattern's win
         e.alpha = (float) alphas.front();
         e.alpha_set = true;
     }
