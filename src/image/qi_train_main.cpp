@@ -54,7 +54,7 @@ void usage() {
                  "usage: xestrata-image-qi-train train --dit <gguf> --data <items> --out <prefix> [--rank N] "
                  "[--steps N] [--lr F] [--seed N] [--draw balanced|content|style] [--save-every N] "
                  "[--caption-dropout F] [--base bf16|int8] [--train-blocks LIST] [--only-if-contains PARTS] "
-                 "[--ignore-if-contains PARTS] [--kind character|style|other] [--vram-budget MIB] "
+                 "[--ignore-if-contains PARTS] [--kind character|style|other] [--trigger PHRASE] [--vram-budget MIB] "
                  "[--vram-control FILE] [--state FILE] [--resume FILE]\n"
                  "       xestrata-image-qi-train check --dit <gguf> --dir <dir> [--blocks N] [--base bf16|int8]\n");
 }
@@ -231,6 +231,7 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
             meta.max_steps = steps;
             meta.seed = seed;
             meta.kind = kind;
+            meta.trigger = opt(f, "trigger", "");
             meta.targets = targets.text();
             meta.extra = {{"ss_content_or_style", opt(f, "draw", "balanced")}};
             tr.save(path, train::lora_meta(meta));

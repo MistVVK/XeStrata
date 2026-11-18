@@ -15,7 +15,7 @@
 //
 //   train --dit DIT --data EXPORT --out PREFIX [--rank 32] [--steps 3000] [--save-every 250] [--lr 1e-4] [--seed 42]
 //         [--caption-dropout 0] [--train-blocks 0-5,10] [--only-if-contains PARTS] [--ignore-if-contains PARTS]
-//         [--kind character|style|other] [--vram-budget MIB] [--vram-control FILE] [--state FILE] [--resume FILE]
+//         [--kind character|style|other] [--trigger PHRASE] [--vram-budget MIB] [--vram-control FILE] [--state FILE] [--resume FILE]
 //         MOSS-Image also [--base int8|bf16] [--skip 22] [--shift 5]
 //   (the weights trained: train::Targets, every one by default; --skip the blocks left out besides; --kind what the
 //   LoRA adds, in its metadata)
@@ -55,7 +55,7 @@ void usage() {
         std::fprintf(stderr, "usage: xestrata-image-moss-train train --dit DIR --data EXPORT --out PREFIX [--rank N] "
                              "[--steps N] [--save-every N] [--lr F] [--seed N] [--caption-dropout F] "
                              "[--train-blocks LIST] [--only-if-contains PARTS] [--ignore-if-contains PARTS] "
-                             "[--kind character|style|other] [--vram-budget MIB] [--vram-control FILE] [--state FILE] "
+                             "[--kind character|style|other] [--trigger PHRASE] [--vram-budget MIB] [--vram-control FILE] [--state FILE] "
                              "[--resume FILE] [--base int8|bf16] [--skip LIST] [--shift F]\n"
                              "       xestrata-image-moss-train loss --dit DIR --data EXPORT --stem STEM [--sigma F] "
                              "[--seed N] [--base int8|bf16]\n");
@@ -63,7 +63,7 @@ void usage() {
         std::fprintf(stderr, "usage: xestrata-image-anima-train train --dit FILE --data EXPORT --out PREFIX [--rank N] "
                              "[--steps N] [--save-every N] [--lr F] [--seed N] [--caption-dropout F] "
                              "[--train-blocks LIST] [--only-if-contains PARTS] [--ignore-if-contains PARTS] "
-                             "[--kind character|style|other] [--vram-budget MIB] [--vram-control FILE] [--state FILE] "
+                             "[--kind character|style|other] [--trigger PHRASE] [--vram-budget MIB] [--vram-control FILE] [--state FILE] "
                              "[--resume FILE]\n"
                              "       xestrata-image-anima-train loss --dit FILE --data EXPORT --stem STEM [--sigma F] "
                              "[--seed N]\n");
@@ -215,6 +215,7 @@ int run(T& tr, const Flags& f, bool train, uint64_t seed, int64_t rank, const tr
             meta.max_steps = steps;
             meta.seed = seed;
             meta.kind = opt(f, "kind", "");
+            meta.trigger = opt(f, "trigger", "");
             meta.targets = targets.text();
             tr.save(path, train::lora_meta(meta));
             std::printf("saved %s\n", path.c_str());

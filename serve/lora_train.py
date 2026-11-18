@@ -1064,12 +1064,12 @@ class TrainJobs:
         data = str(d / "cache" / "items.txt") if fam == "qwen-image" else str(d / "export")
         argv = [str(trainer_exe(gen)), "train", "--dit", str(base), "--data", data,
                 "--out", str(d / "out" / "lora"), "--rank", str(s["rank"]), "--lr", str(s["lr"]),
-                "--seed", str(s["seed"]), "--kind", rec["kind"],
+                "--seed", str(s["seed"]), "--kind", rec["kind"], "--trigger", rec["trigger"],
                 "--caption-dropout", str(s["dropout"])]
         if fam == "mage-flow":
             argv += ["--steps", str(s["steps"] * s["accum"]), "--accum", str(s["accum"]),
                      "--checkpoint", str(s["save_every"]), "--method", s["method"],
-                     "--trigger", rec["trigger"], "--title", rec["name"], "--base", s["base"]]
+                     "--title", rec["name"], "--base", s["base"]]
         else:
             argv += ["--steps", str(s["steps"]), t["save_flag"], str(s["save_every"])]
             if fam != "anima":
