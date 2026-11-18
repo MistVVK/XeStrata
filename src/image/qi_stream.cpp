@@ -380,12 +380,16 @@ void LayerStream::load_resident(int i) {
     Layer& l = layers_[(size_t) i];
     if (l.d == nullptr) {
         // Measure the device's allocation cost, not a maker-specific page size. Qwen-Image's blocks have the
-        // same shape; the free-memory difference includes the allocator's rounding.
+        // same shape; the free-memory difference includes the allocator's rounding. Every resident layer is
+        // measured and the smallest difference kept: another process's allocation inside the window only adds to
+        // the difference, so one contaminated measurement must not stand for every layer after it (the smallest
+        // of the layers' own is the allocator's cost; a window where memory came back reads 0).
         size_t before = 0, after = 0, total = 0;
-        const bool measure = !allocation_measured_ && gpu::mem_info(&before, &total);
+        const bool measure = gpu::mem_info(&before, &total);
         check(gpu::alloc_device(&l.d, l.bytes), "a layer");
         if (measure && gpu::mem_info(&after, &total)) {
-            allocation_extra_ = before > after + l.bytes ? before - after - l.bytes : 0;
+            const uint64_t extra = before > after + l.bytes ? before - after - l.bytes : 0;
+            allocation_extra_ = allocation_measured_ ? std::min(allocation_extra_, extra) : extra;
             allocation_measured_ = true;
         }
     }
