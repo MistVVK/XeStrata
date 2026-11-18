@@ -314,6 +314,7 @@ from serve.mcp import McpCancelled, hub_from_config, resolve_image_results  # no
 from serve import runconfig  # noqa: E402
 from serve import expert_heat  # noqa: E402
 from serve import commit_limit  # noqa: E402
+from serve import oomd_pacer  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -802,6 +803,7 @@ class StrataEngine:
                 self.log.close()
             raise
         proc = self.proc                                 # THIS start's process: a close() from another thread may set self.proc to None meanwhile (#4792)
+        oomd_pacer.start(proc, loading)                  # Linux desktop: keeps systemd-oomd from ending the load (serve/oomd_pacer.py); not on other systems
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
