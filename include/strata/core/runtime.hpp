@@ -9,10 +9,14 @@
 #include <condition_variable>
 #include <exception>
 #include <list>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <typeindex>
+#include <unordered_map>
 
 namespace strata::core {
 
@@ -66,6 +70,21 @@ public:
     std::string device_status();
     void destroy_stream(sycl::queue* stream);
     sycl::queue& stream(void* stream);
+    /// The runtime that owns `q` (its compute, transfer or an engine stream); throws where none does.
+    static Runtime& of_queue(sycl::queue& q);
+    // A belonging tied to a queue's life (a kernel's scratch, a library's stream on it): made on the queue's first
+    // use, held by this runtime, and destroyed once the queue is drained when its stream is destroyed
+    // (destroy_stream) or the runtime ends.  A queue's address is reused after its destruction; an item keyed by the
+    // bare address would outlive it and meet the next queue there, so the items go with the queue itself.  T is built
+    // with the queue (T(sycl::queue&), keeping its own copy where its destructor frees GPU memory) and the queue is
+    // idle when T's destructor runs.  The lookup is locked; two threads using the T itself synchronize as they would
+    // any shared state (a mutex in T).  The queue must be this runtime's (of_queue).
+    template <class T> T& queue_item(sycl::queue& q) {
+        std::lock_guard<std::mutex> lock(items_mutex_);
+        auto& slot = items_[&q][std::type_index(typeid(T))];
+        if (!slot) slot.reset(new Item<T>(q));
+        return static_cast<Item<T>*>(slot.get())->value;
+    }
 
     sycl::event copy_async(void* dst, const void* src, uint64_t bytes,
                            const std::vector<sycl::event>& dependencies = {});
@@ -133,6 +152,14 @@ private:
     sycl::queue compute_, transfer_;
     std::mutex streams_mutex_;
     std::list<sycl::queue> streams_;
+    // the queues' belongings (queue_item), destroyed before the queues and the context they free memory on
+    struct ItemBase { virtual ~ItemBase() = default; };
+    template <class T> struct Item : ItemBase {
+        explicit Item(sycl::queue& q) : value(q) {}
+        T value;
+    };
+    std::mutex items_mutex_;
+    std::unordered_map<const sycl::queue*, std::map<std::type_index, std::unique_ptr<ItemBase>>> items_;
     std::mutex watch_mutex_;
     std::condition_variable watch_cv_;
     std::list<Waiter> waiters_;

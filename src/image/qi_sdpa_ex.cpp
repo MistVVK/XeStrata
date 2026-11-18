@@ -175,14 +175,26 @@ void split_combine(const QiSdpa& a, int64_t S, int64_t HDP, const float* part, v
 
 // rows_kernel over S parts of the keys, then joined
 // A buffer of `need` floats kept per queue, grown to the largest (null when it does not fit).  The keys' parts and
-// the matrix-engine paths' scratch share it: a call uses one or the other, never both at once.
+// the matrix-engine paths' scratch share it: a call uses one or the other, never both at once.  The queue's own
+// belonging (Runtime::queue_item), freed when its stream is destroyed - keyed by the bare queue address it would
+// outlive the queue and meet the next one there.
+struct ScratchBuf {
+    explicit ScratchBuf(sycl::queue& q) : q(q) {}
+    ~ScratchBuf() {
+        if (p != nullptr) {
+            sycl::free(p, q);
+            core::graph_epoch_bump();   // a recorded step may hold the old one
+        }
+    }
+    sycl::queue q;
+    std::mutex mu;
+    float* p = nullptr;
+    size_t n = 0;
+};
 float* queue_scratch(size_t need, void* stream) {
     sycl::queue& q = queue_for(stream);
-    struct Buf { float* p = nullptr; size_t n = 0; };
-    static std::mutex mu;
-    static std::unordered_map<const sycl::queue*, Buf> bufs;
-    std::lock_guard<std::mutex> lock(mu);
-    Buf& c = bufs[&q];
+    ScratchBuf& c = core::Runtime::of_queue(q).queue_item<ScratchBuf>(q);
+    std::lock_guard<std::mutex> lock(c.mu);
     if (c.n < need) {
         q.wait();
         if (c.p != nullptr) {
@@ -201,19 +213,24 @@ float* parts(const QiSdpa& a, int64_t S, int64_t stride, void* stream) {
     return p;
 }
 
-// The matrix engines' Gemm for the biased attention, one a queue (init once: f16_batch needs no dequant scratch)
+// The matrix engines' Gemm for the biased attention, one a queue (init once: f16_batch needs no dequant scratch):
+// the queue's own belonging, as the scratch above
+struct QueueGemm {
+    explicit QueueGemm(sycl::queue& q) : q(q) {}
+    sycl::queue q;
+    std::mutex mu;
+    std::unique_ptr<prefill::Gemm> g;
+};
 prefill::Gemm& matrix_gemm(void* stream) {
     sycl::queue& q = queue_for(stream);
-    static std::mutex mu;
-    static std::unordered_map<const sycl::queue*, std::unique_ptr<prefill::Gemm>> gemms;
-    std::lock_guard<std::mutex> lock(mu);
-    auto& g = gemms[&q];
-    if (g == nullptr) {
-        g = std::make_unique<prefill::Gemm>();
+    QueueGemm& mg = core::Runtime::of_queue(q).queue_item<QueueGemm>(q);
+    std::lock_guard<std::mutex> lock(mg.mu);
+    if (mg.g == nullptr) {
+        mg.g = std::make_unique<prefill::Gemm>();
         std::string err;
-        if (!g->init(stream, 0, err)) throw std::runtime_error("qi_sdpa_ex: " + err);
+        if (!mg.g->init(stream, 0, err)) throw std::runtime_error("qi_sdpa_ex: " + err);
     }
-    return *g;
+    return *mg.g;
 }
 
 // The biased large shapes on the matrix engines: the shared Gemm attention (aux_attn_matrix), the heads split apart

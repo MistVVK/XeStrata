@@ -303,7 +303,13 @@ struct Dnnl {
     bool failed = false;
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool>, dnnl::matmul> prims;
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, dnnl::matmul> prims_s32;   // int32 out, no scales
-    std::map<const sycl::queue*, dnnl::stream> streams;
+};
+
+// oneDNN's stream on a queue: the queue's own belonging (Runtime::queue_item), gone when its stream is destroyed -
+// keyed by the bare queue address it would outlive the queue and meet the next one there
+struct DnnlStream {
+    explicit DnnlStream(sycl::queue&) {}
+    std::optional<dnnl::stream> s;
 };
 
 std::mutex g_dnnl_mu;
@@ -345,8 +351,8 @@ bool onednn_gemm(sycl::queue& q, const int8_t* X, const float* sx, const int8_t*
                                             : matmul::primitive_desc(*d.eng, a_md, w_md, y_md, attr);
             it = d.prims.emplace(key, matmul(pd)).first;
         }
-        auto st = d.streams.find(&q);
-        if (st == d.streams.end()) st = d.streams.emplace(&q, sycl_interop::make_stream(*d.eng, q)).first;
+        DnnlStream& ds = core::Runtime::of_queue(q).queue_item<DnnlStream>(q);
+        if (!ds.s) ds.s = sycl_interop::make_stream(*d.eng, q);
         const auto usm = sycl_interop::memory_kind::usm;
         auto mem = [&](const memory::desc& md, const void* p) {
             return sycl_interop::make_memory(md, *d.eng, usm, const_cast<void*>(p));
@@ -358,7 +364,7 @@ bool onednn_gemm(sycl::queue& q, const int8_t* X, const float* sx, const int8_t*
             {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
              mem(memory::desc({N}, memory::data_type::f32, memory::format_tag::a), sw)}};
         if (bias != nullptr) args.emplace(DNNL_ARG_BIAS, mem(b_md, bias));
-        it->second.execute(st->second, args);
+        it->second.execute(*ds.s, args);
         return true;
     } catch (const std::exception&) {
         d.failed = true;   // the product refused: the library's from here on
@@ -381,14 +387,14 @@ bool onednn_gemm_s32(sycl::queue& q, const int8_t* X, const int8_t* W, int32_t* 
         auto it = d.prims_s32.find(key);
         if (it == d.prims_s32.end())
             it = d.prims_s32.emplace(key, matmul(matmul::primitive_desc(*d.eng, a_md, w_md, y_md))).first;
-        auto st = d.streams.find(&q);
-        if (st == d.streams.end()) st = d.streams.emplace(&q, sycl_interop::make_stream(*d.eng, q)).first;
+        DnnlStream& ds = core::Runtime::of_queue(q).queue_item<DnnlStream>(q);
+        if (!ds.s) ds.s = sycl_interop::make_stream(*d.eng, q);
         const auto usm = sycl_interop::memory_kind::usm;
         auto mem = [&](const memory::desc& md, const void* p) {
             return sycl_interop::make_memory(md, *d.eng, usm, const_cast<void*>(p));
         };
-        it->second.execute(st->second, {{DNNL_ARG_SRC, mem(a_md, X)}, {DNNL_ARG_WEIGHTS, mem(w_md, W)},
-                                        {DNNL_ARG_DST, mem(y_md, Y)}});
+        it->second.execute(*ds.s, {{DNNL_ARG_SRC, mem(a_md, X)}, {DNNL_ARG_WEIGHTS, mem(w_md, W)},
+                                   {DNNL_ARG_DST, mem(y_md, Y)}});
         return true;
     } catch (const std::exception&) {
         d.failed = true;

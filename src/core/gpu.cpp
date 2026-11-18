@@ -167,8 +167,10 @@ Stream stream_create_copy() {
 }
 
 void stream_destroy(Stream s) {
-    try { rt_of(s).destroy_stream(static_cast<sycl::queue*>(s)); }
-    catch (const std::exception& e) { fail("stream_destroy", e); }
+    try {
+        if (s != nullptr) abandon_capture(s);   // an open recording goes with its queue (destroy_stream refuses one)
+        rt_of(s).destroy_stream(static_cast<sycl::queue*>(s));
+    } catch (const std::exception& e) { fail("stream_destroy", e); }
 }
 
 bool stream_sync(Stream s) {

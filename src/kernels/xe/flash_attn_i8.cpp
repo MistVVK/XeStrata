@@ -119,17 +119,18 @@ Bufs& bufs_of(sycl::queue& q) {
     return *of.get(q.get_device(), [] { return std::make_shared<Bufs>(); });
 }
 
-// a causal attention's: a stream's own (two engines on a GPU, an LLM's prompt beside an image's, at once)
-std::mutex causal_mu;
-std::unordered_map<const sycl::queue*, std::unique_ptr<Bufs>>& causal_bufs() {
-    static std::unordered_map<const sycl::queue*, std::unique_ptr<Bufs>> of;
-    return of;
-}
+// a causal attention's: a stream's own (two engines on a GPU, an LLM's prompt beside an image's, at once), the
+// queue's belonging (Runtime::queue_item): freed when its stream is destroyed - keyed by the bare queue address it
+// would outlive the queue and meet the next one there
+struct CausalOf {
+    explicit CausalOf(sycl::queue& q) : q(q) {}
+    ~CausalOf() { b.release(); }
+    sycl::queue q;
+    std::mutex mu;
+    Bufs b;
+};
 Bufs& causal_bufs_of(sycl::queue& q) {
-    std::lock_guard<std::mutex> g(causal_mu);
-    auto& p = causal_bufs()[&q];
-    if (!p) p = std::make_unique<Bufs>();
-    return *p;
+    return core::Runtime::of_queue(q).queue_item<CausalOf>(q).b;
 }
 
 // NVIDIA's mma.sync from sm_80 on (NvKernel): m16n8k32 s8 . s8 into s32, ldmatrix for the B operands out of local
@@ -1722,12 +1723,10 @@ bool flash_attn_i8_causal_prepare(int64_t Tq, int64_t Tk, int64_t heads, int64_t
 
 void flash_attn_i8_causal_release(void* stream) {
     sycl::queue& q = core::Runtime::get().stream(stream);
-    std::lock_guard<std::mutex> g(i8::causal_mu);
-    auto& of = i8::causal_bufs();
-    if (auto it = of.find(&q); it != of.end()) {
-        q.wait();
-        it->second->release();
-    }
+    i8::CausalOf& of = core::Runtime::of_queue(q).queue_item<i8::CausalOf>(q);
+    std::lock_guard<std::mutex> g(of.mu);
+    q.wait();
+    of.b.release();
 }
 
 uint64_t flash_attn_i8_prefix_bytes(int64_t P, int64_t heads) { return i8::Prefix::bytes(P, heads); }

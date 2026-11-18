@@ -5,6 +5,7 @@
 
 #include "strata/image/aux_kernels.hpp"
 
+#include "strata/core/graph.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/qk_norm_rope.hpp"
 
@@ -614,13 +615,27 @@ inline float value_of(uint16_t v) { return f32_from_f16(v); }
 
 // The 2D axial RoPE's cos and sin [grid^2][hd / 2][2] (a position's channel pairs: x for the first quarter, y for the
 // second), made on the host once a GPU and shape and kept: their exp, cos and sin a pair of every row of every layer
-// were most of SAM 3's ViT's split on the B70 (6.4 ms a frame, 2026-11-07)
+// were most of SAM 3's ViT's split on the B70 (6.4 ms a frame, 2026-11-07).  The tables are the queue's own belonging
+// (Runtime::queue_item), freed when its stream is destroyed - keyed by the bare queue address they would outlive the
+// queue (an auxiliary model's, made again for the next tool's run) and meet the next one there.
+struct RopeTables {
+    explicit RopeTables(sycl::queue& q) : q(q) {}
+    ~RopeTables() {
+        for (auto& e : tables)
+            if (e.second != nullptr) {
+                sycl::free(e.second, q);
+                core::graph_epoch_bump();   // a recorded step may hold the old one
+            }
+    }
+    sycl::queue q;
+    std::mutex mu;
+    std::map<std::tuple<int64_t, float, int64_t, float>, float*> tables;
+};
 const float* rope_table(void* stream, int64_t grid, float pscale, int64_t hd, float theta) {
     sycl::queue& q = queue_for(stream);
-    static std::mutex mu;
-    static std::map<std::tuple<const sycl::queue*, int64_t, float, int64_t, float>, float*> tables;
-    std::lock_guard<std::mutex> lock(mu);
-    float*& t = tables[{&q, grid, pscale, hd, theta}];
+    RopeTables& rt = core::Runtime::of_queue(q).queue_item<RopeTables>(q);
+    std::lock_guard<std::mutex> lock(rt.mu);
+    float*& t = rt.tables[{grid, pscale, hd, theta}];
     if (t != nullptr) return t;
     const int64_t half = hd / 2, quarter = hd / 4, gg = grid * grid;
     std::vector<float> h((size_t) (gg * half * 2));

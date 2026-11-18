@@ -298,19 +298,31 @@ bool half_out(const uint16_t* X, const uint16_t* W, uint16_t* Y16, int64_t T, in
 }
 
 // f16's half_sums: half_out into a half buffer kept per queue and grown to the largest, then widened into Y.
+// The buffer is the queue's own belonging (Runtime::queue_item), freed when its stream is destroyed - keyed by the
+// bare queue address it would outlive the queue and meet the next one there.
+struct HalfBuf {
+    explicit HalfBuf(sycl::queue& q) : q(q) {}
+    ~HalfBuf() {
+        if (p != nullptr) {
+            sycl::free(p, q);
+            core::graph_epoch_bump();   // a recorded step may hold the old one
+        }
+    }
+    sycl::queue q;
+    std::mutex mu;
+    sycl::half* p = nullptr;
+    size_t n = 0;
+};
 bool half_sums(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                void* stream) {
     sycl::queue& q = core::Runtime::get().stream(stream);
     const Backend b = backend(q.get_device());
     if (!b.blas) return false;
-    struct Buf { sycl::half* p = nullptr; size_t n = 0; };
-    static std::mutex mu;
-    static std::unordered_map<const sycl::queue*, Buf> bufs;
     const size_t need = (size_t) T * (size_t) N;
     sycl::half* yh = nullptr;
     {
-        std::lock_guard<std::mutex> lock(mu);
-        Buf& c = bufs[&q];
+        HalfBuf& c = core::Runtime::of_queue(q).queue_item<HalfBuf>(q);
+        std::lock_guard<std::mutex> lock(c.mu);
         if (c.n < need) {
             q.wait();
             if (c.p != nullptr) {
@@ -327,6 +339,20 @@ bool half_sums(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     return true;
 }
 
+// the X and W copies of dense_f32: the queue's own belonging, as half_sums' buffer
+struct CopiesBuf {
+    explicit CopiesBuf(sycl::queue& q) : q(q) {}
+    ~CopiesBuf() {
+        if (p != nullptr) {
+            sycl::free(p, q);
+            core::graph_epoch_bump();
+        }
+    }
+    sycl::queue q;
+    std::mutex mu;
+    float* p = nullptr;
+    size_t n = 0;
+};
 bool dense_f32(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                void* stream) {
     static const bool on = env_on("DENSE_F32");
@@ -334,14 +360,11 @@ bool dense_f32(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     sycl::queue& q = core::Runtime::get().stream(stream);
     const Backend b = backend(q.get_device());
     if (!b.blas) return false;
-    struct Copies { float* p = nullptr; size_t n = 0; };
-    static std::mutex mu;
-    static std::unordered_map<const sycl::queue*, Copies> copies;
     const size_t need = (size_t) (T + N) * (size_t) K;
     float* buf = nullptr;
     {
-        std::lock_guard<std::mutex> lock(mu);
-        Copies& c = copies[&q];
+        CopiesBuf& c = core::Runtime::of_queue(q).queue_item<CopiesBuf>(q);
+        std::lock_guard<std::mutex> lock(c.mu);
         if (c.n < need) {
             q.wait();
             if (c.p != nullptr) {
@@ -1137,6 +1160,23 @@ bool Gemm::half_ok(void* stream) {
 #endif
 }
 
+// the FP32 sums' buffer of native_half: the queue's own belonging (Runtime::queue_item), as half_sums' buffer
+namespace {
+struct F32Buf {
+    explicit F32Buf(sycl::queue& q) : q(q) {}
+    ~F32Buf() {
+        if (p != nullptr) {
+            sycl::free(p, q);
+            core::graph_epoch_bump();   // a recorded step may hold the old one
+        }
+    }
+    sycl::queue q;
+    std::mutex mu;
+    float* p = nullptr;
+    size_t n = 0;
+};
+}  // namespace
+
 void Gemm::native_half(const uint16_t* X, int ggml_type, const void* W_blocks, uint16_t* Y16, int64_t T, int64_t N,
                        int64_t K, int64_t ldy) {
     if (ldy <= 0) ldy = N;
@@ -1146,14 +1186,11 @@ void Gemm::native_half(const uint16_t* X, int ggml_type, const void* W_blocks, u
 #endif
         // no half product for the GPU: the FP32 product into a buffer kept per queue (grown to the largest), narrowed
         sycl::queue& q = core::Runtime::get().stream(stream_);
-        struct Buf { float* p = nullptr; size_t n = 0; };
-        static std::mutex mu;
-        static std::unordered_map<const sycl::queue*, Buf> bufs;
         const size_t need = (size_t) T * (size_t) n;
         float* y = nullptr;
         {
-            std::lock_guard<std::mutex> lock(mu);
-            Buf& c = bufs[&q];
+            F32Buf& c = core::Runtime::of_queue(q).queue_item<F32Buf>(q);
+            std::lock_guard<std::mutex> lock(c.mu);
             if (c.n < need) {
                 q.wait();
                 if (c.p != nullptr) {

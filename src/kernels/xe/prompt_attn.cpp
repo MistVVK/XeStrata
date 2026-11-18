@@ -182,14 +182,25 @@ struct Scratch {
     uint16_t* p = nullptr;
     size_t n = 0;
 };
-std::mutex scratch_mu;
-std::unordered_map<const sycl::queue*, Scratch[2]>& scratch_map() {
-    static std::unordered_map<const sycl::queue*, Scratch[2]> of;
-    return of;
-}
+// the queue's own belonging (Runtime::queue_item): both slots freed when its stream is destroyed - keyed by the
+// bare queue address they would outlive the queue and meet the next one there
+struct ScratchOf {
+    explicit ScratchOf(sycl::queue& q) : q(q) {}
+    ~ScratchOf() {
+        for (Scratch& sc : s)
+            if (sc.p != nullptr) {
+                core::graph_epoch_bump();
+                gpu::free(sc.p);
+            }
+    }
+    sycl::queue q;
+    std::mutex mu;
+    Scratch s[2];
+};
 uint16_t* scratch(sycl::queue& queue, int slot, size_t n) {
-    std::lock_guard<std::mutex> g(scratch_mu);
-    Scratch& sc = scratch_map()[&queue][slot];
+    ScratchOf& of = core::Runtime::of_queue(queue).queue_item<ScratchOf>(queue);
+    std::lock_guard<std::mutex> g(of.mu);
+    Scratch& sc = of.s[slot];
     if (sc.n >= n) return sc.p;
     size_t free_b = 0, total_b = 0;
     if (!gpu::mem_info(&free_b, &total_b) || n * 2 > total_b / 32 || free_b + sc.n * 2 < n * 2) return nullptr;
@@ -204,13 +215,14 @@ uint16_t* scratch(sycl::queue& queue, int slot, size_t n) {
     return sc.p;
 }
 void release_scratch(sycl::queue& queue, int slot) {
-    std::lock_guard<std::mutex> g(scratch_mu);
-    auto& of = scratch_map();
-    if (auto it = of.find(&queue); it != of.end() && it->second[slot].p != nullptr) {
+    ScratchOf& of = core::Runtime::of_queue(queue).queue_item<ScratchOf>(queue);
+    std::lock_guard<std::mutex> g(of.mu);
+    Scratch& sc = of.s[slot];
+    if (sc.p != nullptr) {
         queue.wait();
         core::graph_epoch_bump();
-        gpu::free(it->second[slot].p);
-        it->second[slot] = Scratch{};
+        gpu::free(sc.p);
+        sc = Scratch{};
     }
 }
 

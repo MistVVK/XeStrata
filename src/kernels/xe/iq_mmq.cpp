@@ -31,6 +31,7 @@
 #include "amd_wmma.hpp"
 #include "strata/core/graph.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/core/runtime.hpp"
 #include "strata/platform/env.hpp"
 #include "iq_bits.hpp"
 #include "cuda_intrinsics.hpp"
@@ -1557,22 +1558,28 @@ struct Kernel {
     }
 };
 
-// The parts' buffer of each queue (iq_mmq_split_reserve), for one expert's few rows with K in parts (launch)
-struct SplitState {
+// The parts' buffer of a queue (iq_mmq_split_reserve), for one expert's few rows with K in parts (launch): the
+// queue's own belonging (Runtime::queue_item), freed when its stream is destroyed - keyed by the bare queue address
+// it would outlive the queue and meet the next one there
+struct SplitBuf {
+    explicit SplitBuf(sycl::queue& q) : q(q) {}
+    ~SplitBuf() {
+        if (p != nullptr) {
+            sycl::free(p, q);
+            core::graph_epoch_bump();   // a recorded step may hold the old one
+        }
+    }
+    sycl::queue q;
     std::mutex mu;
-    std::unordered_map<const sycl::queue*, std::pair<float*, size_t>> bufs;
+    float* p = nullptr;
+    size_t n = 0;
 };
-SplitState& split_state(sycl::queue& q) {
-    static core::PerDevice<std::shared_ptr<SplitState>> per_device;
-    return *per_device.get(q.get_device(), [] { return std::make_shared<SplitState>(); });
-}
 
 // The queue's reserved parts' buffer when it holds `floats`, else null
 float* part_buffer(sycl::queue& q, size_t floats) {
-    SplitState& st = split_state(q);
-    std::lock_guard<std::mutex> lock(st.mu);
-    const auto it = st.bufs.find(&q);
-    return it != st.bufs.end() && it->second.second >= floats ? it->second.first : nullptr;
+    SplitBuf& b = core::Runtime::of_queue(q).queue_item<SplitBuf>(q);
+    std::lock_guard<std::mutex> lock(b.mu);
+    return b.n >= floats ? b.p : nullptr;
 }
 
 template<int TY, int SGM, int NSGM, bool DP4A, bool TAIL, int IS, bool REG = false>
@@ -2237,18 +2244,17 @@ void iq_mmq_choose_forms(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols, 
 }
 
 bool iq_mmq_split_reserve(sycl::queue& q, size_t floats) {
-    SplitState& st = split_state(q);
-    std::lock_guard<std::mutex> lock(st.mu);
-    auto& b = st.bufs[&q];
-    if (b.second >= floats) return true;
+    SplitBuf& b = core::Runtime::of_queue(q).queue_item<SplitBuf>(q);
+    std::lock_guard<std::mutex> lock(b.mu);
+    if (b.n >= floats) return true;
     q.wait();
-    if (b.first != nullptr) {
-        sycl::free(b.first, q);
+    if (b.p != nullptr) {
+        sycl::free(b.p, q);
         core::graph_epoch_bump();   // a recorded step may hold the old one
     }
-    b.first = sycl::malloc_device<float>(floats, q);
-    b.second = b.first != nullptr ? floats : 0;
-    return b.first != nullptr;
+    b.p = sycl::malloc_device<float>(floats, q);
+    b.n = b.p != nullptr ? floats : 0;
+    return b.p != nullptr;
 }
 
 }  // namespace strata::kernels

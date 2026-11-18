@@ -717,9 +717,23 @@ void Runtime::destroy_stream(sycl::queue* stream) {
     if (!stream) return;
     if (!owns(stream) || stream == &compute_ || stream == &transfer_)
         throw DeviceError("destroy_stream: not an engine stream of the Xe runtime");
+    if (stream->ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording)
+        throw DeviceError("destroy_stream: the stream is recording a graph");
     finish(*stream);
+    {
+        // the queue's belongings (queue_item) go here: the queue is drained and still alive, so their destructors
+        // can free what they hold on it; the next queue at this address finds none of them
+        std::lock_guard<std::mutex> lock(items_mutex_);
+        items_.erase(stream);
+    }
     std::lock_guard<std::mutex> lock(streams_mutex_);
     streams_.remove_if([stream](const sycl::queue& q) { return &q == stream; });
+}
+
+Runtime& Runtime::of_queue(sycl::queue& q) {
+    Runtime* r = owner_of_stream(&q);
+    if (!r) throw DeviceError("the queue is not one of the Xe runtime's");
+    return *r;
 }
 
 bool Runtime::owns(const sycl::queue* queue) {
