@@ -3031,8 +3031,10 @@ class ImageGen:
             return
         led = self.ledger(int(got.get("total_mib") or 0))
         held = int(got.get("held_mib") or 0)
-        if led.find("image", self._owner()) is None and held > 0:
-            led.hold("image", held, self._owner(), in_base=self.engine.found, whole=True)
+        # a full temp folder (or another user's stale file) must not break the engine's start
+        with contextlib.suppress(OSError):
+            if led.find("image", self._owner()) is None and held > 0:
+                led.hold("image", held, self._owner(), in_base=self.engine.found, whole=True)
 
     def ledger_sync(self) -> None:
         """The engine's ledger entry set to what it holds now, its own report (FREE's held_mib: the image model's and
@@ -3046,12 +3048,15 @@ class ImageGen:
                     held = int(self.engine.ask("FREE", "FREE", 60).get("held_mib") or 0)
                 except ImageJobFailed:
                     held = 0
-            eid = led.find("image", owner)
-            if held > 0:
-                led.hold("image", held, owner, whole=True)
-            elif eid is not None:
-                led.releasing(eid)
-                led.remove(eid)
+            # the ledger's files are shared with the other processes: a write failure here must not skip the
+            # cache's return or the server's busy flag in the caller's finally
+            with contextlib.suppress(OSError):
+                eid = led.find("image", owner)
+                if held > 0:
+                    led.hold("image", held, owner, whole=True)
+                elif eid is not None:
+                    led.releasing(eid)
+                    led.remove(eid)
 
     def ids(self, job: dict) -> list[int]:
         if self.tok is None:
