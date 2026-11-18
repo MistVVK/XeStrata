@@ -1,6 +1,6 @@
 ---
 name: release
-description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages, the window's xestrata-gui deb and rpm and the Windows 7z published with the notes (English then Japanese) and the older releases marked as old, then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
+description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the four contrib-llvm packages, the window's xestrata-gui deb and rpms and the Windows 7z published with the notes (English then Japanese) and the older releases marked as old, then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
 disable-model-invocation: true
 argument-hint: "[VERSION, e.g. 0.1.39 or 0.1.39.1]"
 ---
@@ -9,7 +9,7 @@ argument-hint: "[VERSION, e.g. 0.1.39 or 0.1.39.1]"
 
 A release is the annotated tag `xe<VERSION>` on `main`, pushed to origin, and a published GitHub release on it, made in two stages:
 
-- the preliminary release (先行報): the three contrib-llvm packages, the window's `xestrata-gui` deb and rpm, the Windows 7z, `SHA256SUMS` and the notes;
+- the preliminary release (先行報): the four contrib-llvm packages, the window's `xestrata-gui` deb and rpms, the Windows 7z, `SHA256SUMS` and the notes;
 - the final release (確定報): the speed table against upstream on an Intel, an NVIDIA and an AMD GPU added to the notes.
 
 Rules for the whole run:
@@ -19,7 +19,7 @@ Rules for the whole run:
 - `gh` only as `gh release ...` (the one exception to "git commands only" in the user's global instructions); everything else with git.
   Every `gh release` names `--repo MistVVK/XeStrata`: without it gh takes the `upstream` remote (Niko1221/Strata).
   Never print or read gh's token (`gh auth status` shows the account; leave its token lines out).
-- A release ships the contrib-llvm packages (the user's decision, 2026-10-09), the Windows 7z, a contrib-llvm build for Windows (the user's decision, 2026-10-14), and the Linux window's `xestrata-gui` for Ubuntu 26.04 and Fedora 44 (the user's decision, 2026-11-09; one package for every variant, free included; no Ubuntu 24.04 package). The free packages are built only when the user asks (`build-packages.sh xe<VERSION> free`), and not attached otherwise.
+- A release ships the contrib-llvm packages (the user's decision, 2026-10-09), the Windows 7z, a contrib-llvm build for Windows (the user's decision, 2026-10-14), and the Linux window's `xestrata-gui` for Ubuntu 26.04 and Fedora 44 and 45 (the user's decision, 2026-11-09; one package for every variant, free included; no Ubuntu 24.04 package). The free packages are built only when the user asks (`build-packages.sh xe<VERSION> free`), and not attached otherwise.
 - The check of the packages and the 7z is their build alone (the user's decision, 2026-10-07): no CTest, no incus run, no Windows run, unless the user asks for them.
 - Work and commits are on `dev` (Japanese commit messages, one logical change per commit, `git add` and `git commit` joined with `&&`). `dev` itself is never pushed; `main` is.
 - A tag that has been pushed is never moved or deleted. A mistake after the push is fixed by a new version (the fourth number).
@@ -65,7 +65,7 @@ Both stay local until step 8.
 setsid nohup .claude/skills/release/scripts/build-packages.sh xe<VERSION> contrib >/dev/null 2>&1 </dev/null &
 ```
 
-It builds the three contrib-llvm variants, the Windows 7z and the window's package from the tag one after another (ubuntu26.04 cuda13.1 and cuda12.4, fedora44 cuda13.4, windows cuda12.4: the 7z all cross-built in Ubuntu 26.04; ubuntu26.04 gui and fedora44 gui: a minute each; docs/BUILD.md), each in a clean container (about two hours), and gathers them with `SHA256SUMS` in `build/release/xe<VERSION>/`.
+It builds the four contrib-llvm variants, the Windows 7z and the window's packages from the tag one after another (ubuntu26.04 cuda13.1 and cuda12.4, fedora44 cuda13.4, fedora45 cuda13.5, windows cuda12.4: the 7z all cross-built in Ubuntu 26.04; ubuntu26.04 gui, fedora44 gui and fedora45 gui: a minute each; docs/BUILD.md), each in a clean container (about two hours a variant, so every variant added lengthens the whole), and gathers them with `SHA256SUMS` in `build/release/xe<VERSION>/`.
 Wait on the PID in `build/release/xe<VERSION>/build-contrib.pid` (`kill -0`) and follow `summary-contrib.txt` (a Monitor that prints its new lines, re-armed every 30 minutes); never wait on `pgrep -f`, which matches the waiting shell.
 On `FAILED`, report the end of the variant's log in `logs/`; the fix is an ordinary change on `dev`, after which delete the local tag (`git tag -d xe<VERSION>`) and go back to step 3 (only while the tag has not been pushed).
 
@@ -76,7 +76,7 @@ Steps 5 and 6 are done while it builds.
 Write `build/release/xe<VERSION>/NOTES.md`: the English section first, then the same content in Japanese (the user's decision, 2026-10-12), under a first line linking the two: `[English](#english) | [日本語](#日本語)`.
 
 - What changed for users since the previous release tag (`git log --no-merges <previous>..xe<VERSION>`; for the first release, since `origin/main`), grouped by what a user notices, not a list of commits.
-- How to install: README's install section, as it is there (the user's decision, 2026-10-11). On Linux two ways, in this order (the user's decision, 2026-10-19): `#### 1. Podman` (README's Podman part: the commands, `export PODMAN_COMPOSE_PROVIDER=podman-compose` among them, then its podman-compose, GPU and host lines), then `#### 2. apt / dnf`: the four numbered steps (download from the table with `SHA256SUMS`, `sha256sum -c SHA256SUMS --ignore-missing`, `sudo apt install ./…deb` or `sudo dnf install ./…rpm` with the release's file names, `xestrata --setup`, which shows the GPU makers' packages that are missing and the command that installs them: AGENTS.md, "Packages and versions", the notes do not list them), then the `> [!NOTE]` that without an NVIDIA GPU either CUDA version works the same, then the package table (Intel, AMD (RDNA2 or later), NVIDIA (Turing or later): `xestrata-contrib-cuda13.1`, `cuda13.4` on Fedora; Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta: `xestrata-contrib-cuda12.4`), then the window's part (`xestrata-gui`: an extra, installed with `sudo apt install ./xestrata-gui_…deb` or `sudo dnf install ./xestrata-gui-…rpm` beside the main package, the distribution's .NET 10 runtime coming with it; `xestrata gui` opens it), then its Windows part (download `XeStrata-<VERSION>-windows-x64.7z`, start `xestrata.exe`; what it needs, the GPUs, where things go). A change to one goes into the other.
+- How to install: README's install section, as it is there (the user's decision, 2026-10-11). On Linux two ways, in this order (the user's decision, 2026-10-19): `#### 1. Podman` (README's Podman part: the commands, `export PODMAN_COMPOSE_PROVIDER=podman-compose` among them, then its podman-compose, GPU and host lines), then `#### 2. apt / dnf`: the four numbered steps (download from the table with `SHA256SUMS`, `sha256sum -c SHA256SUMS --ignore-missing`, `sudo apt install ./…deb` or `sudo dnf install ./…rpm` with the release's file names, `xestrata --setup`, which shows the GPU makers' packages that are missing and the command that installs them: AGENTS.md, "Packages and versions", the notes do not list them), then the `> [!NOTE]` that without an NVIDIA GPU either CUDA version works the same, then the package table (Intel, AMD (RDNA2 or later), NVIDIA (Turing or later): `xestrata-contrib-cuda13.1`, `cuda13.4` on Fedora 44 and `cuda13.5` on Fedora 45; Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta: `xestrata-contrib-cuda12.4`), then the window's part (`xestrata-gui`: an extra, installed with `sudo apt install ./xestrata-gui_…deb` or `sudo dnf install ./xestrata-gui-…rpm` beside the main package, the distribution's .NET 10 runtime coming with it; `xestrata gui` opens it), then its Windows part (download `XeStrata-<VERSION>-windows-x64.7z`, start `xestrata.exe`; what it needs, the GPUs, where things go). A change to one goes into the other.
 - When the version changed: saved conversations from another version are not read.
 - That the release has no free packages: a free build is made from the source (docs/BUILD.md).
 
@@ -89,27 +89,27 @@ In short, for when it is not there:
 
 Each section starts with the warnings below (the user's decision, 2026-10-21; AGENTS.md, "Intel Graphics Compiler"), then a line of the stage: 先行報: upstream との速さの比較は後で足す / Preliminary: the speed comparison with upstream follows.
 The first paragraph is the IGC bug, the second the Level Zero driver's: they stay while Ubuntu 26.04 or Debian 13 ships an IGC from 2.27 to 2.30, and while Ubuntu 26.04 ships a compute-runtime older than 26.22; the user decides when they go.
-They name Podman, Fedora 44 and - on Ubuntu 24.04/26.04 with the HWE kernel - Intel's graphics PPA (xestrata --setup prints its commands) as the way out.
+They name Podman, Fedora 44 or later and - on Ubuntu 24.04/26.04 with the HWE kernel - Intel's graphics PPA (xestrata --setup prints its commands) as the way out.
 
 ```markdown
 > [!WARNING]
-> **Intel Arc B-series, Lunar Lake and Panther Lake on Linux:** the Intel graphics compiler (IGC) 2.27 to 2.30, which Ubuntu 26.04 and Debian 13 ship, miscompiles some GPU code. XeStrata turns the affected optimization off by itself, at a cost of up to 10% in the decode of short prompts. For full speed, install with **Podman** (below; its image brings a fixed IGC), use **Fedora 44**, or - on Ubuntu 24.04/26.04 with the HWE kernel - update the driver from Intel's graphics PPA: `xestrata --setup` prints the commands.
+> **Intel Arc B-series, Lunar Lake and Panther Lake on Linux:** the Intel graphics compiler (IGC) 2.27 to 2.30, which Ubuntu 26.04 and Debian 13 ship, miscompiles some GPU code. XeStrata turns the affected optimization off by itself, at a cost of up to 10% in the decode of short prompts. For full speed, install with **Podman** (below; its image brings a fixed IGC), use **Fedora 44 or later** (Fedora 45's IGC is 2.41), or - on Ubuntu 24.04/26.04 with the HWE kernel - update the driver from Intel's graphics PPA: `xestrata --setup` prints the commands.
 >
-> **Every Intel GPU, a separate bug:** a compute-runtime older than 26.22 (Ubuntu 26.04 ships 26.05) can refuse device memory while the card's VRAM is free: the engine then fails to start, and only a reboot brings the card back. This release makes the engine retry the cache in pieces when the driver refuses the one big allocation, and start with what the card gives. The way out is the same: update the driver (26.22 or later), or use Fedora 44 / Podman. On Ubuntu 24.04/26.04 with the HWE kernel, `xestrata --setup` stops before starting and prints the PPA commands; `--old-driver` starts anyway.
+> **Every Intel GPU, a separate bug:** a compute-runtime older than 26.22 (Ubuntu 26.04 ships 26.05) can refuse device memory while the card's VRAM is free: the engine then fails to start, and only a reboot brings the card back. This release makes the engine retry the cache in pieces when the driver refuses the one big allocation, and start with what the card gives. The way out is the same: update the driver (26.22 or later), or use Fedora 44 or later / Podman. On Ubuntu 24.04/26.04 with the HWE kernel, `xestrata --setup` stops before starting and prints the PPA commands; `--old-driver` starts anyway.
 ```
 
 ```markdown
 > [!WARNING]
-> **Linux の Intel Arc B シリーズ・Lunar Lake・Panther Lake:** Ubuntu 26.04 と Debian 13 が入れる Intel のグラフィックスのコンパイラー（IGC）2.27〜2.30 は、GPU のコードの一部を誤ってコンパイルします。XeStrata は該当する最適化を自動で切るので動きますが、短い prompt の decode が最大 10% 遅くなります。本来の速さで使うには、**Podman** で入れる（下の手順。中の IGC は直った版です）、**Fedora 44** を使う、または Ubuntu 24.04/26.04 で HWE カーネルなら Intel の graphics PPA でドライバーを更新してください（`xestrata --setup` がコマンドを出します）。
+> **Linux の Intel Arc B シリーズ・Lunar Lake・Panther Lake:** Ubuntu 26.04 と Debian 13 が入れる Intel のグラフィックスのコンパイラー（IGC）2.27〜2.30 は、GPU のコードの一部を誤ってコンパイルします。XeStrata は該当する最適化を自動で切るので動きますが、短い prompt の decode が最大 10% 遅くなります。本来の速さで使うには、**Podman** で入れる（下の手順。中の IGC は直った版です）、**Fedora 44 以降**（45 は 2.41 です）を使う、または Ubuntu 24.04/26.04 で HWE カーネルなら Intel の graphics PPA でドライバーを更新してください（`xestrata --setup` がコマンドを出します）。
 >
-> **すべての Intel GPU に、別の不具合:** 26.22 より古い compute-runtime（Ubuntu 26.04 は 26.05 を入れます）は、カードの VRAM に空きがあっても GPU メモリの確保を断ることがあります。エンジンは起動に失敗し、カードは再起動しないと戻りません。この版から、エンジンは一括の確保を断られたときに expert cache を小分けで取り直し、確保できた分だけで起動します。抜け道は同じで、ドライバーを 26.22 以降に更新するか、Fedora 44 / Podman を使ってください。Ubuntu 24.04/26.04 で HWE カーネルなら、`xestrata --setup` は起動の前に止まって PPA のコマンドを出します（`--old-driver` でそのまま起動できます）。
+> **すべての Intel GPU に、別の不具合:** 26.22 より古い compute-runtime（Ubuntu 26.04 は 26.05 を入れます）は、カードの VRAM に空きがあっても GPU メモリの確保を断ることがあります。エンジンは起動に失敗し、カードは再起動しないと戻りません。この版から、エンジンは一括の確保を断られたときに expert cache を小分けで取り直し、確保できた分だけで起動します。抜け道は同じで、ドライバーを 26.22 以降に更新するか、Fedora 44 以降 / Podman を使ってください。Ubuntu 24.04/26.04 で HWE カーネルなら、`xestrata --setup` は起動の前に止まって PPA のコマンドを出します（`--old-driver` でそのまま起動できます）。
 ```
 
 Show the notes to the user.
 
 ## 6. The AMD machine
 
-The AMD GPU is in another machine, so its part of the speed table (step 9) is prepared now; its container (step 9, "The container") is made there as soon as the Fedora 44 rpm is in `build/release/xe<VERSION>/` (the packages are built one after another, so it is there before `ALLDONE`), and it measures while the development machine waits for the packages.
+The AMD GPU is in another machine, so its part of the speed table (step 9) is prepared now; its container (step 9, "The container") is made there as soon as the Fedora 45 rpm is in `build/release/xe<VERSION>/` (the packages are built one after another, so it is there before `ALLDONE`), and it measures while the development machine waits for the packages.
 Where the AMD machine is, where its Podman runs, its data folder and a folder with room for the container's work: `LOCAL.md` in the repository root, kept out of git; when it is missing, ask the user and write the answer there.
 Copy over now what the container takes besides the rpm: the tag's tree (`git archive xe<VERSION>`, as a tar), upstream's tree at its newest release tag (`git ls-remote --tags --refs upstream 'v*' | sed 's#.*refs/tags/##' | sort -V | tail -n 1`; not `git tag -l 'v*'`, which also lists other remotes' tags (Project Maya's `upstream-maya` has v1.0.x)), and the prompts and continuations (step 9).
 
@@ -126,7 +126,7 @@ For anything not clearly public, stop and report it with the commit and file; do
 
 ## 8. The preliminary release (先行報)
 
-When `summary-contrib.txt` ends with `ALLDONE`: `build/release/xe<VERSION>/` holds the three contrib-llvm packages (two `.deb`, one `.rpm`), the two `xestrata-gui` packages (a `.deb`, an `.rpm`), the Windows `.7z` and `SHA256SUMS`, and `(cd build/release/xe<VERSION> && sha256sum -c SHA256SUMS)` passes.
+When `summary-contrib.txt` ends with `ALLDONE`: `build/release/xe<VERSION>/` holds the four contrib-llvm packages (two `.deb`, two `.rpm`, the Fedoras' Release naming its Fedora: fc44, fc45), the three `xestrata-gui` packages (a `.deb`, two `.rpm`), the Windows `.7z` and `SHA256SUMS`, and `(cd build/release/xe<VERSION> && sha256sum -c SHA256SUMS)` passes.
 
 ```sh
 git push origin main
@@ -164,11 +164,12 @@ The table's method stays fixed from release to release so the releases compare: 
 
 ### The container
 
-Every table of this step runs in a disposable Fedora 44 container of rootless Podman (the user's decision of 2026-11-05), one on each machine, made for the release by `scripts/podman-bench.sh` and removed with its images and its work folder once all three GPUs' tables are done (step 10), or as soon as something fails (made again from the start after the fix):
+Every table of this step runs in a disposable Fedora 45 container of rootless Podman (the user's decision of 2026-11-05; Fedora 44 until the release that first moved it, 2026-11-18), one on each machine, made for the release by `scripts/podman-bench.sh` and removed with its images and its work folder once all three GPUs' tables are done (step 10), or as soon as something fails (made again from the start after the fix).
+The container moved from Fedora 44 to 45 with this skill's change (2026-11-18): the first release measured in it says so in its notes (Fedora 45 の入れ物 / the Fedora 45 container), and its tables do not compare one to one with the 44 container's releases - when such a comparison is wanted, measure the previous release once in both containers (the user's decision, 2026-11-18). It holds:
 
-- XeStrata: the release's Fedora 44 rpm (`build/release/xe<VERSION>/xestrata-contrib-cuda13.4-*.rpm`) installed by `container/` as a user's Podman install gets it, with the GPU makers' libraries its `BUILD.json` records: the engine `/usr/lib64/xestrata/engine/xestrata-engine`, its tree (`serve/`, `setup.py`) `/usr/share/xestrata`, its profile `/usr/share/xestrata/data/expert-profile.bin`.
+- XeStrata: the release's Fedora 45 rpm (`build/release/xe<VERSION>/xestrata-contrib-cuda13.5-*.rpm`) installed by `container/` as a user's Podman install gets it, with the GPU makers' libraries its `BUILD.json` records: the engine `/usr/lib64/xestrata/engine/xestrata-engine`, its tree (`serve/`, `setup.py`) `/usr/share/xestrata`, its profile `/usr/share/xestrata/data/expert-profile.bin`.
   One GPU at a time with `ONEAPI_DEVICE_SELECTOR` (`level_zero:*` for the B70, `cuda:*` for the RTX 4070).
-- upstream: a copy of its newest release tag's tree, built in the same container (`scripts/podman/up_build.py`) by its own setup.py's functions: `build_engine` (CUDA, with NVIDIA's toolkit from its Fedora 44 repository) or `build_engine_hip` (HIP, with the development packages of the ROCm the image runs), and `build_image_engine` for its `sd-cli` (CUDA, HIP, Vulkan on Intel).
+- upstream: a copy of its newest release tag's tree, built in the same container (`scripts/podman/up_build.py`) by its own setup.py's functions: `build_engine` (CUDA, with NVIDIA's toolkit from its Fedora 44 repository - the only one so far, which the Fedora 45 image uses as well; switch when NVIDIA publishes one of Fedora 45's own) or `build_engine_hip` (HIP, with the development packages of the ROCm the image runs), and `build_image_engine` for its `sd-cli` (CUDA, HIP, Vulkan on Intel).
   On Intel its `sycl/` port, built by its `sycl/tools/build.sh` with the oneAPI DPC++ its docs/INTEL.md names (from Intel's repository; `AOT=<device>`: `LOCAL.md`) and run through `scripts/up-sycl.sh` with `UP_SYCL_DIRECT=1`: without its own image, but as its setup configures an Intel card (the arguments get what its `sycl/setup_intel.py` writes: the xe cards' expert profile, the streamed experts, KV streaming from 64K, the VRAM reserve, the prompt chunks; the engine the run-time switches of its `sycl/serve/strata-sycl.sh`).
 - ComfyUI: its checkout's code copied in, its `models/` read where it is, and a venv in the container with the packages of the machine's venv for the GPU at the same versions (PyTorch's from PyTorch's index of its build).
 
@@ -182,7 +183,7 @@ Set the machine's measuring mark (`LOCAL.md`) before `image` and remove it after
 o=<data>/records/bench-results/<date>-release-xe<VERSION>   # outside git (the user's decision of 2026-10-11)
 s=<tag tree>/.claude/skills/release/scripts                 # the tag's tree: a worktree of xe<VERSION>, or its git archive on the AMD machine
 export ID=xe<VERSION> WORK=<work>/xestrata-bench-xe<VERSION> MAKERS="intel nvidia"   # the AMD machine: MAKERS=amd
-$s/podman-bench.sh image build/release/xe<VERSION>/xestrata-contrib-cuda13.4-*.rpm
+$s/podman-bench.sh image build/release/xe<VERSION>/xestrata-contrib-cuda13.5-*.rpm
 DATA=<data> OUT=$o COMFY=<ComfyUI> MOUNTS="<ids> <ids-serve>" $s/podman-bench.sh start
 $s/podman-bench.sh xe                                                # prints XE=... XE_PROFILE=... (also $WORK/XE.env)
 AOT=<device> $s/podman-bench.sh upstream <upstream's tree> intel      # prints UP=... UP_PROFILE=... (also $WORK/upstream-intel/UP.env)
@@ -254,7 +255,7 @@ python $u/sync_collect.py $o/image xe<VERSION> <upstream tag>                 # 
 python $u/sync_collect.py $o/image-mage xe<VERSION> <upstream tag>
 ```
 
-The record goes into `$o/`, in the data folder and never into git (XeStrata's own measurements are not shared, the user's decision of 2026-10-11): a README (the machines, the container (its Fedora 44 and the versions of the GPU libraries in it: the IGC, the compute-runtime, ROCm, the CUDA toolkit), the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, `serve/` (its `matrix-serve.json`, `matrix-usage.json` and runs), `gyro-m/` (its `matrix.json` and runs), `image/` and `image-mage/` (their `matrix-image.json`, runs and images, ComfyUI's commit), and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
+The record goes into `$o/`, in the data folder and never into git (XeStrata's own measurements are not shared, the user's decision of 2026-10-11): a README (the machines, the container (its Fedora 45 and the versions of the GPU libraries in it: the IGC, the compute-runtime, ROCm, the CUDA toolkit), the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, `serve/` (its `matrix-serve.json`, `matrix-usage.json` and runs), `gyro-m/` (its `matrix.json` and runs), `image/` and `image-mage/` (their `matrix-image.json`, runs and images, ComfyUI's commit), and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
 It is not committed; the release notes carry the tables.
 
 ## 10. The final release (確定報)
