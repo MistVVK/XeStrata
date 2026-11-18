@@ -5473,12 +5473,13 @@ def _client_gone(svc) -> Exception:
     return getattr(sys.modules.get(type(svc).__module__), "ClientGone", RuntimeError)()
 
 
-def check_room(need: dict, ram_mib: int | None) -> None:
+def check_room(need: dict, ram_mib: int | None, job: dict | None = None) -> None:
     """An image the GPU cannot make even with the text model unloaded (its least above the engine's cap), or whose
     prefix cache would not fit the free RAM (`ram_mib`, None: not known): refused before the job, not shrunk (the
-    user's decision, 2026-10-21)."""
+    user's decision, 2026-10-21).  The hint is the job's: an upscale's (`job`) is its scale and upscaler."""
     least, cap, host = (int(need.get(k) or 0) for k in ("least_mib", "cap_mib", "host_mib"))
-    hint = "use fewer or smaller reference images, or a smaller size"
+    hint = ("use a smaller scale, or SeedVR2's 3B or RealESRGAN" if job and (job.get("ups_only") or job.get("upscale"))
+            else "use fewer or smaller reference images, or a smaller size")
     if cap and least > cap:
         raise ImageRequestError(f"this image needs at least {least / 1024:.1f} GiB of VRAM and the GPU has "
                                 f"{cap / 1024:.1f} GiB for images: {hint}")
@@ -5768,17 +5769,33 @@ def upscaler_weights(gen: ImageGen, job: dict, key: str = "upscaler") -> None:
 
 
 def seedvr2_or_realesrgan(gen: ImageGen, job: dict) -> None:
-    """auto's SeedVR2 where the engine says it does not fit the GPU (UPSNEED's least past its cap): RealESRGAN instead,
-    said in the result (job["upscaler"]["fallback"])."""
+    """A SeedVR2 upscale, auto's or asked for, where the engine says it does not fit the GPU (UPSNEED's least past its
+    cap): its 3B instead of the 7B where the 3B's weights are here and fit, else RealESRGAN, said in the result
+    (job["upscaler"]["fallback"]) rather than the upscale refused."""
     u = job["upscaler"]
-    if u["asked"] != "auto" or u["method"] != "seedvr2":
+    if u["method"] != "seedvr2" or not job.get("ups_only") and u["asked"] != "auto":
+        return   # a redraw's upscaler asked for is counted in the drawing's NEED, and refused there
+
+    def fits() -> bool:
+        try:
+            need = gen.need(job) if job.get("ups_only") else None
+        except ImageJobFailed:
+            need = None
+        return need is not None and int(need.get("least_mib", 0)) <= int(need.get("cap_mib", 0))   # UPSNEED's cap
+    if fits():
         return
-    try:
-        need = gen.need(job) if job.get("ups_only") else None
-    except ImageJobFailed:
-        need = None
-    if need is not None and int(need.get("least_mib", 0)) <= int(need.get("cap_mib", 0)):   # UPSNEED's cap: the GPU's
-        return
+    root = image_aux.aux_dir(gen.cfg)
+    small = ("seedvr2-3b-int8", "seedvr2-3b-fp16")
+    if job.get("ups_only") and u.get("variant") != "3b" and any(image_aux.ready(n, root) for n in small):
+        was = u.get("variant") or "7b"
+        u.update(variant="3b")
+        u.pop("path", None)
+        u.pop("file", None)
+        upscaler_weights(gen, job)
+        if fits():
+            gen._say(f"image job: SeedVR2 {was} does not fit the GPU: its 3B instead")
+            u["fallback"] = f"SeedVR2's {was} does not fit the GPU's memory: its 3B"
+            return
     gen._say("image job: SeedVR2 does not fit the GPU: RealESRGAN instead")
     u.update(method="realesrgan", fallback="SeedVR2 does not fit the GPU's memory")
     u.pop("variant", None)
@@ -5996,7 +6013,7 @@ def _gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = No
                 except ImageJobFailed:
                     gen.totals["failed"] += 1
                     raise
-                check_room(need, ram_available_mib())
+                check_room(need, ram_available_mib(), job)
                 policy = resolve_policy(svc, gen, need)
                 with svc.status_lock:
                     svc.status.update(busy=True, phase="generating an image", started=time.time(),
@@ -6156,7 +6173,7 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
             except ImageJobFailed:
                 gen.totals["failed"] += 1
                 raise
-            check_room(need, ram_available_mib())
+            check_room(need, ram_available_mib(), job)
             try:
                 budget = ledger_fit(gen, need, job)
                 gen._say(f"image job: separate, the image engine's budget {budget} MiB on its own GPU (the DiT "
