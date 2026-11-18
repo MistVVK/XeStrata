@@ -8049,6 +8049,10 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     cfg_path.touch()                                     # the most recently used model
     if "--mtp" in cfg["args"][:-1]:
         refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
+    # the DFlash2 pack's folder is shared by the models of this install: another config's setup may have left its
+    # subset there. Put this config's choice back before the engine reads it.
+    if isinstance(cfg.get("draft_model"), str):
+        refresh_draft_vocab(Path(cfg["draft_model"]).parent, cfg.get("draft_vocab", "cjk"))
     if attach_running(cfg, int(port or cfg.get("port", 8095)), open_browser):
         return 0
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata", "--config", str(cfg_path),
@@ -10807,11 +10811,11 @@ def main() -> int:
             warn("the DFlash2 drafter is not on this PC (the download did not complete): the MTP layer continues")
             if drafting == "dflash2":
                 drafting = "mtp"
-    # the draft vocabulary subset beside the pack (when a pack is present), the choice this model's config keeps
-    if df2_pack.exists() or (df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack").exists():
-        src_vocab = ROOT / "data" / DRAFT_VOCABS.get(draft_vocab or "cjk", "draft_vocab.bin")
-        if src_vocab.exists():
-            shutil.copyfile(src_vocab, df2_dir / "draft_vocab.bin")
+    # the draft vocabulary beside the pack (when one is present). Several configs share this folder: keep a subset
+    # made by hand, and let each start put back the choice in its own config.
+    have_df2_pack = df2_pack.exists() or (df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack").exists()
+    if have_df2_pack and drafting in ("auto", "dflash2"):
+        refresh_draft_vocab(df2_dir, draft_vocab or "cjk")
     ok(f"drafting: {drafting}")
 
     # ---- 7. the start script
