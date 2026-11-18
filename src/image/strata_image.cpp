@@ -887,13 +887,19 @@ struct AuxTold {
 // all but `keep`: a chat's find_region after its remove_background found BiRefNet's still held and Florence-2 150 MiB
 // short on the B70 beside the text model, 2026-11-09), the VRAM they give back added to the budget as aux_done adds it
 void aux_room(si::ImagePipeline& p, uint64_t need, const char* what, AuxNets* aux = nullptr,
-              const si::AuxNet* keep = nullptr) {
+              const si::AuxNet* keep = nullptr, Upscalers* ups = nullptr) {
     const auto room = [&p] {
         const uint64_t b = p.budget(), held = p.held();
         return std::min<uint64_t>(si::free_vram(), b > held ? b - held : 0);
     };
     if (room() < need) p.release(false);
     if (room() < need) p.release(true);
+    if (room() < need && ups != nullptr && ups->held() > 0) {
+        const uint64_t before = p.held() + si::free_vram();
+        ups->release(true);
+        const uint64_t after = p.held() + si::free_vram();
+        if (after > before) p.set_budget(p.budget() + (after - before));
+    }
     if (room() < need && aux != nullptr) {
         for (auto it = aux->open.begin(); it != aux->open.end();) {
             if (it->second.get() == keep) {
@@ -1261,7 +1267,8 @@ uint64_t control_plan(AuxNets& aux, const std::string& kind, int64_t width, int6
 // W2:, DWPose's beside YOLOX's), each network opened once in `aux`; `p` the image model whose room a run takes (null:
 // the engine alone, --control)
 std::string control_line(si::ControlPrep& prep, AuxNets& aux, si::ImagePipeline* p, const std::string& kind,
-                         const si::QiRef& img, const std::string& out, std::istream& words, bool keep = false) {
+                         const si::QiRef& img, const std::string& out, std::istream& words, bool keep = false,
+                         Upscalers* ups = nullptr) {
     si::ControlParams cp;
     std::string weights, weights2;
     const auto flag = [](const std::string& v) { return v != "0"; };
@@ -1284,7 +1291,7 @@ std::string control_line(si::ControlPrep& prep, AuxNets& aux, si::ImagePipeline*
     std::vector<si::AuxNet*> used;
     const uint64_t need = control_plan(aux, kind, img.width, img.height, cp, weights, weights2, nets, used);
     const auto t0 = std::chrono::steady_clock::now();
-    if (p != nullptr) aux_room(*p, need, kind.c_str());
+    if (p != nullptr) aux_room(*p, need, kind.c_str(), nullptr, nullptr, ups);
     si::QiRef map;
     try {
         map = prep.run(kind, img, cp, nets);
@@ -1425,6 +1432,8 @@ int serve(si::ImagePipeline& p) {
     for (std::string line; in.next(line);) {
         // the fallbacks so far (the warm-up's, the last request's), never before READY: the server reads that first
         strata::platform::downgrades_say();
+        bool retried_aux = false;
+    retry_aux:
         std::istringstream ls(line);
         std::string op;
         ls >> op;
@@ -1673,7 +1682,7 @@ int serve(si::ImagePipeline& p) {
                 const auto t0 = std::chrono::steady_clock::now();
                 si::Sam3& m = aux.get<si::Sam3>(weights);
                 const si::QiRef img = read_image(pic);
-                aux_room(p, m.need_bytes(img.width, img.height), "SAM 3", &aux, &m);
+                aux_room(p, m.need_bytes(img.width, img.height), "SAM 3", &aux, &m, &ups);
                 const AuxTold told(m);
                 si::Sam3::Times t;
                 std::vector<si::Segment> segs;
@@ -1712,7 +1721,7 @@ int serve(si::ImagePipeline& p) {
                 const auto t0 = std::chrono::steady_clock::now();
                 si::Sam3& m = aux.get<si::Sam3>(decoded_path(weights));
                 const si::QiRef img = read_image(pic);
-                aux_room(p, m.need_bytes(img.width, img.height), "SAM 3", &aux, &m);
+                aux_room(p, m.need_bytes(img.width, img.height), "SAM 3", &aux, &m, &ups);
                 const AuxTold told(m);
                 std::vector<std::vector<si::Segment>> found;
                 try {
@@ -1755,7 +1764,7 @@ int serve(si::ImagePipeline& p) {
                 si::Sam3& m = aux.get<si::Sam3>(weights);
                 const strata::video::Info info = strata::video::probe(src);
                 aux_room(p, m.video_need_bytes(info.width, info.height, 1), "SAM 3.1's video segmentation", &aux,
-                         &m);
+                         &m, &ups);
                 std::printf("STAGE segment-video\n");
                 std::fflush(stdout);
                 o.step = [&in](int64_t d, int64_t n) {
@@ -1781,7 +1790,7 @@ int serve(si::ImagePipeline& p) {
                 const auto t0 = std::chrono::steady_clock::now();
                 si::Florence2& m = aux.get<si::Florence2>(weights);
                 const si::QiRef img = read_image(pic);
-                aux_room(p, m.need_bytes(beams, max_new), "Florence-2", &aux, &m);
+                aux_room(p, m.need_bytes(beams, max_new), "Florence-2", &aux, &m, &ups);
                 const AuxTold told(m);
                 si::Florence2::Times t;
                 std::vector<int32_t> got;
@@ -1823,7 +1832,7 @@ int serve(si::ImagePipeline& p) {
                 const auto t0 = std::chrono::steady_clock::now();
                 si::Birefnet& m = aux.get<si::Birefnet>(weights);
                 const si::QiRef img = read_image(pic);
-                aux_room(p, m.need_bytes(sw, sh, img.width, img.height, refine), "BiRefNet", &aux, &m);
+                aux_room(p, m.need_bytes(sw, sh, img.width, img.height, refine), "BiRefNet", &aux, &m, &ups);
                 const AuxTold told(m);
                 si::Birefnet::Times t;
                 double refine_s = 0.0;
@@ -1893,7 +1902,7 @@ int serve(si::ImagePipeline& p) {
                 std::string kind, pic, out;
                 ls >> kind >> pic >> out;
                 if (!ls) throw std::invalid_argument("CONTROL <kind> <picture> <out> [RES:<n>]...");
-                std::printf("%s\n", control_line(control, aux, &p, kind, read_image(pic), out, ls).c_str());
+                std::printf("%s\n", control_line(control, aux, &p, kind, read_image(pic), out, ls, false, &ups).c_str());
             } else if (op == "RATIO") {   // the size a request leaves to the model (serve/images.py)
                 si::QiRequest r;
                 std::string ids;
@@ -2000,6 +2009,21 @@ int serve(si::ImagePipeline& p) {
                 }
             }
             std::string m = e.what();
+            const bool auxiliary = op == "MATTE" || op == "SEGMENT" || op == "SEGV" || op == "FLORENCE" ||
+                                   op == "CONTROL" || op == "DETECT" || op == "COLORMAP";
+            const bool refused = m.find("alloc_device:") != std::string::npos && m.find("refused") != std::string::npos;
+            if (auxiliary && refused && !retried_aux) {
+                std::fprintf(stderr, "xestrata-image: auxiliary allocation refused, releasing resident weights: %s\n",
+                             m.c_str());
+                p.release(true);
+                detectors.release(true);
+                ups.release(true);
+                aux.release(true);
+                control.release();
+                retried_aux = true;
+                goto retry_aux;
+            }
+            if (auxiliary && refused) m = "memory: the GPU refused an allocation; free GPU memory and try again";
             for (char& c : m)
                 if (c == '\n') c = ' ';
             // an adapter the request names and the engine does not take is the request's fault (the server's 400)

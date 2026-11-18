@@ -187,6 +187,8 @@ def _ask(gen, line: str, want: str) -> dict:
     except img.ImageJobFailed as e:
         if str(e).startswith("memory: "):
             raise MemoryShort(str(e)[8:]) from e
+        if "alloc_device:" in str(e) and "refused" in str(e):
+            raise MemoryShort("GPU memory allocation was refused") from e
         raise
 
 
