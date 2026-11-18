@@ -5187,7 +5187,10 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 const int64_t t0 = c * m.T;                // in the super-chunk
                 const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
                 const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
-                if (tap_rows > std::min(tap_cap_, tap_alloc_)) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
+                // the staging holds the super-chunk's tapped rows: each sub-chunk writes at its own offset (the
+                // layer loop overwrites a shared row 0 with the next sub-chunk's rows before this one's upload)
+                const int64_t tap_off = tap_rows > 0 ? p0 + tap_t0 - std::max<int64_t>(tap_first_, pos0 + sc0) : 0;
+                if (tap_off + tap_rows > std::min(tap_cap_, tap_alloc_)) { err = "prefill: the DFlash2 tap staging is smaller than the super-chunk's tapped rows"; return false; }
                 m.R = lb.r_dev ? lb.R + t0 * D : r_buf(c);
                 if (lb.r_dev && l == LB && LB > 0 &&
                     !strata::gpu::copy_async(m.R, lb.R_in + (size_t) t0 * D, (size_t) T * D * 4, cs)) {
@@ -5245,7 +5248,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     // the DFlash2 tap of layer l - 1: its completed output, the mean of the streams
                     if (tap_rows > 0 && l - 1 < (int64_t) tap_slot_.size() && tap_slot_[(size_t) (l - 1)] >= 0) {
                         strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D,
-                                                      tap_dev_ + (size_t) tap_slot_[(size_t) (l - 1)] * N,
+                                                      tap_dev_ + ((size_t) tap_off * tap_local_.size() +
+                                                                  (size_t) tap_slot_[(size_t) (l - 1)]) * N,
                                                       (int64_t) tap_local_.size() * N, N, (int) HC, (int) tap_rows, cs);
                     }
                 }
@@ -5291,7 +5295,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             return false;
                         }
                         lm_mid_ = c + 1 < nc;
-                        if (on_taps && tap_rows > 0 && !on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
+                        if (on_taps && tap_rows > 0 &&
+                            !on_taps(tap_dev_ + (size_t) tap_off * tap_local_.size() * N, tap_rows, p0 + tap_t0, err))
+                            return false;
                         if (on_stage_chunk && !lm_mid_ && !on_stage_chunk(p0 + T, err)) return false;
                         if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
                     }
