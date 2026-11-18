@@ -3609,13 +3609,27 @@ async function imgLoraFetch() {
   if (r.status !== 202) { imgLoraStatus(tr("img.loraFailed", "Not added: {why}", {why: await imgLoraError(r)}), "error"); return; }
   const job = await r.json();
   $("img-lora-url").value = "";
+  let misses = 0;
   for (;;) {                                       // the download, until it ends (the server keeps going without us)
     const mb = (n) => fmt((n || 0) / 1048576, 0);
     imgLoraStatus(job.total ? tr("img.loraFetching", "Fetching {name}: {got} of {total} MB", {name: job.name, got: mb(job.bytes), total: mb(job.total)})
                             : tr("img.loraFetchingSize", "Fetching {name}: {got} MB", {name: job.name, got: mb(job.bytes)}));
     await new Promise((ok) => setTimeout(ok, 1000));
-    let j;
-    try { j = await (await fetch(`v1/images/loras/fetch/${job.id}`, {headers: headers()})).json(); } catch (e) { continue; }
+    let poll = null, j = null;
+    try { poll = await fetch(`v1/images/loras/fetch/${job.id}`, {headers: headers()}); } catch (e) { /* the server may be down */ }
+    if (poll && !poll.ok) {                        // a restart dropped FETCHES: "no such fetch", never a state
+      imgLoraStatus(tr("img.loraFailed", "Not added: {why}", {why: await imgLoraError(poll)}), "error");
+      return;
+    }
+    try { if (poll) j = await poll.json(); } catch (e) { /* a partial answer: try again */ }
+    if (!j) {
+      if (++misses > 5) {                          // a server that stays away is not going to answer either
+        imgLoraStatus(tr("img.loraFailed", "Not added: {why}", {why: tr("pill.unreachable", "Server not reachable")}), "error");
+        return;
+      }
+      continue;
+    }
+    misses = 0;
     Object.assign(job, j);
     if (job.state === "done") { imgLoraStatus(tr("img.loraAdded", "Added {name}", {name: job.added.name})); await imgLoraRefresh(); return; }
     if (job.state === "failed") { imgLoraStatus(tr("img.loraFailed", "Not added: {why}", {why: job.error}), "error"); return; }
