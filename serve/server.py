@@ -2976,6 +2976,7 @@ class Vision:
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
         args = self.reader_args(cfg)
         self.label = vision_label(cfg)
+        self.gpu_label = self.label
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload (#208)
         # the processor's reader (setup writes it as the vision section's "fallback"): a GPU reader that does not
@@ -3505,6 +3506,7 @@ class Vision:
         self.stopped = True
         if self.elastic and self.on_cpu:                # the next start tries the card again
             self.spawn, self.fallback, self.on_cpu = self.gpu_spawn, self.cpu_spawn, False
+            self.label = self.gpu_label
             self.cpu_note = None
 
     def shutdown(self):
