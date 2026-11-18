@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <spawn.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -245,7 +246,20 @@ Process::Process(const std::vector<std::string>& argv, bool in, bool out) : impl
     args.reserve(argv.size() + 1);
     for (const std::string& a : argv) args.push_back(const_cast<char*>(a.c_str()));
     args.push_back(nullptr);
-    const int rc = posix_spawnp(&m.pid, args[0], &fa, nullptr, args.data(), environ);
+    posix_spawnattr_t attr;
+    int rc = posix_spawnattr_init(&attr);
+    if (rc == 0) {
+        sigset_t mask;
+        rc = pthread_sigmask(SIG_SETMASK, nullptr, &mask);
+        if (rc == 0) {
+            sigdelset(&mask, SIGTERM);
+            sigdelset(&mask, SIGINT);
+            rc = posix_spawnattr_setsigmask(&attr, &mask);
+        }
+        if (rc == 0) rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK);
+        if (rc == 0) rc = posix_spawnp(&m.pid, args[0], &fa, &attr, args.data(), environ);
+        posix_spawnattr_destroy(&attr);
+    }
     posix_spawn_file_actions_destroy(&fa);
     for (int* fd : {&pin[0], &pout[1], &perr[1]})
         if (*fd >= 0) ::close(*fd), *fd = -1;
