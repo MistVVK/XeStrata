@@ -105,7 +105,8 @@
      "0.6"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "MALLOC_ARENA_MAX": "2"
     },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.6)",
@@ -244,7 +245,8 @@
      "0.6"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "MALLOC_ARENA_MAX": "2"
     },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.6)",
@@ -368,7 +370,8 @@
      "0.6"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "MALLOC_ARENA_MAX": "2"
     },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.6)",

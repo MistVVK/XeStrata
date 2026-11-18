@@ -99,7 +99,8 @@
      "--vision"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "MALLOC_ARENA_MAX": "2"
     },
     "notes": []
    },
@@ -196,7 +197,8 @@
      "32768"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "MALLOC_ARENA_MAX": "2"
     },
     "notes": []
    }
@@ -302,7 +304,8 @@
      "32768"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "MALLOC_ARENA_MAX": "2"
     },
     "notes": []
    }
@@ -409,7 +412,8 @@
      "32768"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "MALLOC_ARENA_MAX": "2"
     },
     "notes": []
    }

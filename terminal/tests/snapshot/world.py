@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 from pathlib import Path
 from unittest import mock
 
@@ -227,6 +228,9 @@ class World:
                 pass
             if m.os == "macos":
                 st.enter_context(mock.patch.object(sys, "platform", "darwin"))
+            # childenv's glibc arena cap (P11) is a Linux-only rule: answer for the simulated machine's system, not the host the test runs on
+            from strata_control import childenv
+            st.enter_context(mock.patch.object(childenv, "sys", types.SimpleNamespace(platform={"windows": "win32", "linux": "linux", "macos": "darwin"}[m.os])))
             yield self
         os.environ.clear()
         os.environ.update(saved_env)
