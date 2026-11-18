@@ -57,6 +57,7 @@ page load.
 from __future__ import annotations
 
 import collections
+import errno
 import hashlib
 import http.client
 import json
@@ -1114,13 +1115,18 @@ def add(folders: list[Folder], tmp: Path, name: str) -> dict:
             if i + 1 < len(dirs):
                 shutil.copyfile(tmp, d / final)
             else:
-                # The source can be on a different filesystem (including another model's LoRA folder).
-                local = d / f".adding-{secrets.token_hex(8)}.part"
                 try:
-                    shutil.copyfile(tmp, local)
-                    os.replace(local, d / final)
-                finally:
-                    local.unlink(missing_ok=True)
+                    os.replace(tmp, d / final)
+                except OSError as e:
+                    if e.errno != errno.EXDEV:
+                        raise
+                    # Another model's folder can be on a different filesystem.
+                    local = d / f".adding-{secrets.token_hex(8)}.part"
+                    try:
+                        shutil.copyfile(tmp, local)
+                        os.replace(local, d / final)
+                    finally:
+                        local.unlink(missing_ok=True)
     finally:
         if tmp.exists():
             tmp.unlink()
