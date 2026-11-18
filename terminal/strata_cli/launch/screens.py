@@ -463,7 +463,9 @@ class ModelScreen(Base):
             verdict = r.words + tag
             if self.width() < 100:                           # a short verdict that fits the column; the full sentence is shown under the list
                 extra = " (recommended)" if r.recommended else " (installed)" if r.installed else " [experimental]" if r.experimental else ""
-                verdict = {"fits": "fits", "slower": "may run slower", "tight": "tight", "no": "too big", "disk": "no disk room"}[r.verdict] + extra
+                if r.verdict == "disk":                      # 18 cells: "no disk (rec.)" keeps the recommendation visible
+                    extra = " (rec.)" if r.recommended else extra
+                verdict = {"fits": "fits", "slower": "may run slower", "tight": "tight", "no": "too big", "disk": "no disk"}[r.verdict] + extra
             items.append(Item([r.title, f"{r.download_gb:.0f} GB", need, Cell(verdict, col)], key=(r.family, r.model)))
             if (s.family, s.model) == (r.family, r.model):
                 sel = i
@@ -1655,18 +1657,20 @@ class SaveScreen(Base):
             lines.append(("Download" if n == 0 else "", text))
         return lines
 
-    def download_lines(self) -> list[str]:
+    def download_lines(self, short: bool = False) -> list[str]:
         """One line per thing the launch will download, with its size ("the model, 66 GB"), or the one line "nothing: ..." when everything is here.
-        The engine's size is not known before the update source is read, so it is listed without one."""
+        The engine's size is not known before the update source is read, so it is listed without one. `short`: the words for a small window
+        ("model 66 GB")."""
         plan = self.ctx.download_plan()
         if plan is None:
             return []
         out = []
         if not plan.get("engine_usable", True):
-            out.append("the engine for your graphics card (its size is shown when it starts)")
+            out.append("engine" if short else "the engine for your graphics card (its size is shown when it starts)")
         for p in plan.get("parts") or []:
             gb = float(p["gb"])
-            out.append(f"{p['label']}, " + (f"{gb:.2f} GB" if gb < 1 else f"{gb:.0f} GB" if gb >= 10 else f"{gb:.1f} GB"))
+            size = f"{gb:.2f} GB" if gb < 1 else f"{gb:.0f} GB" if gb >= 10 else f"{gb:.1f} GB"
+            out.append(f"{p['label'].removeprefix('the ')} {size}" if short else f"{p['label']}, {size}")
         return out or ["nothing: everything is on this computer"]
 
     def refresh_body(self) -> None:
@@ -1686,9 +1690,10 @@ class SaveScreen(Base):
             model = dict(lines)["Model"].replace("Qwen3.8-Flash-Next ", "")
             rows = [f"{model} \u00b7 {S.context_label(s.context)} \u00b7 memory {s.kv or 'int8'}",
                     f"Pictures {'on' if s.vision != 'off' else 'off'} \u00b7 Parallel {s.parallel or 'auto'} \u00b7 Tuning {s.tune}",
-                    f"Access {s.access}, port {s.port}" + (f" \u00b7 Storage {s.data_dir}" if s.data_dir else "")]
+                    f"Access {s.access}, port {s.port}" + (f" \u00b7 Storage {s.data_dir}" if s.data_dir else ""),
+                    "Download " + ", ".join(self.download_lines(short=True))]                  # T2: also in a small window
             t.append("Save, then launch   name:\n" if tiny else "Save as preset, then launch   name:\n", style=f"bold {ACCENT}")
-            for ln in rows[:2 if tiny else 3]:
+            for ln in rows[:2 if tiny else 4]:
                 t.append("  " + ln + "\n")
             if warnings and not tiny:
                 t.append(f"  ! {warnings[0]}" + (f"  (+{len(warnings) - 1} more)" if len(warnings) > 1 else "") + "\n", style=WARN)

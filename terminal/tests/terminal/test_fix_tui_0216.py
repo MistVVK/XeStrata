@@ -149,8 +149,8 @@ class T10DiskInTheFit(unittest.TestCase):
         big = rows["IQ3_S"]                                                   # 84 GB download + 8 GB room > 88 GB
         self.assertEqual(big.verdict, "disk")
         self.assertEqual(big.words, "not enough disk space")
-        self.assertIn("88 GB are free", big.sentence)
-        self.assertIn("about 92 GB", big.sentence)
+        self.assertIn("88 GB free", big.sentence)
+        self.assertIn("about 92 GB needed", big.sentence)
         self.assertEqual(rows["Q2_0"].verdict, "fits")                        # 66 GB + 8 GB fits 88 GB
 
     def test_with_room_the_verdicts_are_as_before(self):
@@ -178,6 +178,36 @@ class T10List(Base):
             await press(pilot, "enter")
             self.assertIn("not enough disk space", text_of(app))
         self.run_app(case, ctx=make_ctx({**HW_12, "disk_free_gb": 88.0}))
+
+
+class SmallWindow(Base):
+    """80 x 24, the size of a default terminal window (the real walk on p1004 showed what the 110-wide tests did not)."""
+
+    def run_small(self, coro, ctx):
+        import asyncio
+        app = LaunchApp(ctx)
+
+        async def go():
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause(0.2)
+                return await coro(app, pilot, ctx)
+        return asyncio.run(go())
+
+    def test_the_recommendation_stays_visible_beside_the_disk_verdict(self):
+        async def case(app, pilot, ctx):
+            await press(pilot, "enter")
+            line = next(l for l in text_of(app).splitlines() if "IQ3_S" in l and "›" in l)
+            self.assertIn("no disk (rec.)", line)
+            self.assertNotRegex(text_of(app), r"v31\d\d GB")
+        self.run_small(case, make_ctx({**HW_12, "disk_free_gb": 88.0}))
+
+    def test_the_downloads_are_listed_on_the_small_save_screen_too(self):
+        async def case(app, pilot, ctx):
+            await press(pilot, *("enter",) * 7, "n", "enter")
+            t = text_of(app)
+            self.assertIn("Save as preset, then launch", t)
+            self.assertIn("Download engine, model 84 GB", t)
+        self.run_small(case, make_ctx())
 
 
 class T11Port(Base):

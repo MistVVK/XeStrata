@@ -115,8 +115,8 @@ class ModelRow:
     def sentence(self) -> str:
         """The verdict in words for a line under the list or a warning (the disk verdict says the two figures and the way out)."""
         if self.verdict == DISK and self.disk_free_gb is not None:
-            return (f"Not enough disk space: the download and its working room need about {self.disk_need_gb:.0f} GB and {self.disk_free_gb:.0f} GB are free "
-                    "where the files go (pick a bigger drive on the Folder screen, or a smaller model)")
+            return (f"Not enough disk space: about {self.disk_need_gb:.0f} GB needed, {self.disk_free_gb:.0f} GB free. "
+                    "Pick a bigger drive on the Folder step, or a smaller model")
         return self.words
 
 
