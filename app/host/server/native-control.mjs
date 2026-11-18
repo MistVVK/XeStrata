@@ -27,7 +27,7 @@ import { parseSaved as parseRoles, mirror as mirrorRoles } from './gpu-roles.mjs
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 /** The owner-approved words (11-15) when the draft layer cannot be downloaded offline and no other drafter runs: the Terminal's strata_control/drafting.py MTP_OFFLINE_NOTE. */
-export const MTP_OFFLINE_NOTE="There is no internet connection, so the draft layer can't be downloaded now. The model starts without a drafter.";
+export const MTP_OFFLINE_NOTE="There is no internet connection, so the draft layer can't be downloaded now. The model starts without it.";
 /** FIX-APP A3: while the drafter (DFlash2, about 1.2 GB) is fetched during the first "Tune & start chatting" (or any load that fetches it), the step says so in plain words, with the size
  *  in `details` as soon as Control's plan names it and the running figures after that. Control's own words for the other steps (checking, packing) stay. */
 export const DRAFTER_DOWNLOAD_SUMMARY='Downloading a small helper that makes answers faster. This happens once.';

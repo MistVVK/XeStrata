@@ -2,7 +2,7 @@
  * 0.2.14.x follow-ups of the app side (phaseA-tests notes-ctrl-fix-2.md):
  *  (a) Drafting Off in the app reaches setup as `--mtp off` (the installer's `mtp` word), so no draft layer is fetched, on a Mac too (the Terminal's 1821f298d);
  *  (b) the offline words (owner 11-15, the Terminal's drafting.MTP_OFFLINE_NOTE) are said where the app says its drafter notes (the job's drafterNote), and only when
- *      no other drafter stands in: when Control's plan names a drafter that runs, the sentence "The model starts without a drafter." would be wrong.
+ *      no other drafter stands in: when Control's plan names a drafter that runs, the sentence "The model starts without it." would be wrong.
  * The fixture is applin-0214-drafter.test.mjs's (fake Control, fake installer over MCP).
  */
 import './helpers/isolate-profile.mjs';   // a test run never writes the owner's real Strata profile
@@ -113,7 +113,7 @@ test('(b) offline with no other drafter: the owner\'s sentence, word for word, i
     const job = await finish(f.native, f.native.operation('load', { model: 'ud_q4_k_xl', values: { drafting: 'mtp' } }).id);
     assert.equal(job.state, 'done', job.error);
     assert.equal(installs(f).length, 1, 'the layer step ran once');
-    assert.equal(job.drafterNote, "There is no internet connection, so the draft layer can't be downloaded now. The model starts without a drafter.");
+    assert.equal(job.drafterNote, "There is no internet connection, so the draft layer can't be downloaded now. The model starts without it.");
     assert.equal(MTP_OFFLINE_NOTE, job.drafterNote);
   } finally { await f.native.close(); f.cleanup(); }
 });
