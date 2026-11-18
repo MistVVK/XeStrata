@@ -1347,11 +1347,6 @@
     "src/program/generate.cpp:7472"
    ]
   },
-  "PIPELINE_AUTO": {
-   "reads": [
-    "src/program/generate.cpp:2861"
-   ]
-  },
   "PIPELINE_DEBUG": {
    "reads": [
     "src/core/plain_model.cpp:5351",
