@@ -1015,6 +1015,9 @@ class Assembler:
         if x.get("event") == "call":
             if self.item is not None and self.item["type"] not in ("image_generation_call", "web_search_call"):
                 out += self.close()
+            # like any other tool: the words written before the search are not the structured answer, and the words
+            # after it are not checked against the format (this turn called a tool)
+            out += self._call_started()
             raw = x.get("arguments")
             args: dict = raw if isinstance(raw, dict) else {}
             action = ({"type": "open_page", "url": args.get("url")} if x.get("name") == "fetch_page"
