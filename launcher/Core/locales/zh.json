@@ -174,6 +174,7 @@
  "setup.image-sam3-license.about": "许可证：{license}",
  "setup.image-sam3-license.label": "同意 Meta 的 SAM License，让 SAM 3.1 按文字找出图片的某个部分（find_region、edit_region）；不同意时由 Florence-2（MIT）找出这些部分",
  "setup.image-ssd-offload.label": "RAM 不足时保持图片模型的大小，放不下的部分从 SSD 读取（较慢）",
+ "setup.image-tools.label": "现在下载图像编辑工具的权重（放大、修复局部、查找区域、去除背景）；否则在每个工具首次使用时下载",
  "setup.kv.choice.fp16": "16 位：内存是 8 位的两倍",
  "setup.kv.choice.int8": "8 位（推荐）",
  "setup.kv.choice.k8v4": "8 位键和 4 位值：约四分之三的内存",

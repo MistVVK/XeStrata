@@ -5987,6 +5987,7 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
            f"{QI.local_path(models_dir, 'hunyuanimage3-system-prompt').name}")
         write_ratio_head(QI, models_dir)
     ask_sam3_license(a, models_dir / QI.AUX_DIR)
+    fetch_image_tools(a, gpu, models_dir / QI.AUX_DIR)
     cfgs = []
     for p in plans:
         cfg = QI.image_config(p["quant"], exe, models_dir, model=p["choice"],
@@ -6006,6 +6007,35 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
            + (f", text encoder {p['tquant']}" if p['tquant'] else "")
            + f", GPU policy {cfg['gpu_policy']}" + ("" if p is plans[0] else " (a request names it by \"model\")"))
     return cfgs[0], cfgs[1:]
+
+
+def fetch_image_tools(a, gpu: dict | None, aux: Path) -> None:
+    """The image tools' weights fetched now (serve/image_aux.py setup_names: the main editing tools', the upscale's for
+    this GPU's VRAM and the RAM among them), for --image-tools yes (asked when not given, yes by default and with
+    --yes).  Without them the server fetches each the first time a tool needs it, and the tool waits for it.  One
+    that fails is a warning: the server fetches it then."""
+    from serve import image_aux
+    QI = _qimage()
+    vram = 0 if (gpu or {}).get("integrated") else int((gpu or {}).get("vram_gb", 0) * 1024)
+    names = [n for n in image_aux.setup_names(vram, int(usable_ram_gb(a) * 1024), aux) if not image_aux.ready(n, aux)]
+    if not names:
+        return
+    want = getattr(a, "image_tools", None)
+    if want is None:
+        if not a.yes:
+            gb = sum(QI.FILES[QI.AUX[n]["file"]][2] for n in names) / 1e9
+            say()
+            say(f"  The image tools' weights: {gb:.1f} GB ({', '.join(names)})")
+        want = ask_option("image-tools", a.yes)
+    if want != "yes":
+        return
+    for name in names:
+        got = image_aux.fetch(name, aux, lambda m: say(f"  {m}"))
+        if got["status"] == "ready":
+            ok(f"image tools: {name}")
+        else:
+            warn(f"image tools: {name} was not fetched ({got.get('error') or got['status']}): the server fetches it "
+                 "when a tool first needs it")
 
 
 def ask_sam3_license(a, aux: Path) -> None:
@@ -6029,7 +6059,7 @@ def ask_sam3_license(a, aux: Path) -> None:
             return
     aux.mkdir(parents=True, exist_ok=True)
     mark.write_text(f"{time.strftime('%Y-%m-%d %H:%M')} setup\n{QI.SAM3_LICENSE}\n", encoding="utf-8")
-    ok("the SAM License agreed to: the server fetches SAM 3.1 (1.7 GB) when a part is first found")
+    ok("the SAM License agreed to: SAM 3.1 (1.7 GB) comes with the image tools' weights, or when a part is first found")
 
 
 def image_gpu(a, cfg: dict) -> str | None:
@@ -9321,6 +9351,15 @@ OPTIONS = [
             choices=[["auto", "Auto: a GPU the text model does not use, else the text model's"],
                      ["same", "The text model's GPU"]],
             default="auto", gpu_choices="pci", when=["images"], cli={"metavar": "auto|same|PCI"}),
+    _option("image-tools", "Download the image editing tools' weights now (upscale, fix parts, find a region, remove "
+            "the background); else each on its first use",
+            "yes (default): download now the weights of the upscale (SeedVR2 for this GPU and RAM, RealESRGAN), the "
+            "parts' fix (the face, hand and person detectors), the finding of a region (Florence-2, SAM 3 once its "
+            "license is agreed to) and the background's removal (BiRefNet); no: the server downloads each the first "
+            "time a tool needs it, and that tool waits for it; asked when not given, yes with --yes",
+            kind="flag", place="images", values=["yes", "no"], default=True, when=["images"],
+            question="  Download the image tools' weights now?",
+            cli={"choices": ["yes", "no"]}),
     _option("image-sam3-license", "Agree to Meta's SAM License, so that SAM 3.1 finds a part of a picture by words "
             "(find_region, edit_region); without it Florence-2 (MIT) finds the parts",
             "agree: agree to Meta's SAM License for SAM 3.1 (find_region and edit_region find a part of a picture by "

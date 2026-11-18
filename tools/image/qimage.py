@@ -987,7 +987,8 @@ IMAGE_TOOLS = ("generate_image", "edit_image", "extend_image", "upscale_image", 
 # The image tools' auxiliary weights (serve/image_aux.py): name -> the FILES entry downloaded, what it is converted
 # with ("yolo": tools/image/yolo_pt.py, "esrgan": tools/image/esrgan.py, each a PyTorch checkpoint to safetensors; None:
 # used as it is), the file the engine reads, and the license shown when it is downloaded.  They live in AUX_DIR beside
-# the image models' folders; the server fetches one the first time a tool needs it (setup does not).
+# the image models' folders; the server fetches one the first time a tool needs it, setup the common ones ahead
+# (serve/image_aux.py setup_names).
 AUX_DIR = "image-tools"
 _YOLO_LICENSE = ("Apache-2.0 by its publisher (Bingsu/adetailer, https://huggingface.co/Bingsu/adetailer); trained "
                  "with Ultralytics YOLOv8, whose models Ultralytics holds to be under AGPL-3.0 by default "

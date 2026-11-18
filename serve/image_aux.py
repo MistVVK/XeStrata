@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """serve/image_aux.py - the image tools' auxiliary weights (a detector, an upscaler...), downloaded the first time a
-tool needs one, not by setup and never bundled.
+tool needs one, or by setup ahead (fetch, setup_names: the upscale's and the parts' fix), never bundled.
 
 The weights are tools/image/qimage.py's AUX entries: each names a FILES entry (its repository, path, size and SHA-256
 at the revision REVISIONS pins), what converts it for the engine (AUX "convert": "yolo" runs tools/image/yolo_pt.py,
@@ -44,6 +44,7 @@ from serve import file_lock, model_terms
 from serve.model_terms import _qimage
 
 RETRY_S = 30            # what the tool's result suggests before the chat asks again
+SEEDVR2_WORK_MIB = 4096   # what a 7B run takes besides its weights at a couple of megapixels (the DiT's activations)
 CONVERT_TIMEOUT_S = 600
 CHUNK = 1 << 20
 CONVERTERS = {"yolo": "yolo_pt.py", "esrgan": "esrgan.py", "state": "state_pt.py"}   # AUX "convert" -> its tool
@@ -140,6 +141,34 @@ def ensure(name: str, root: Path, say: Callable[[str], None] | None = None) -> d
             job["thread"] = t
             t.start()
     return status(name, root)
+
+
+def fetch(name: str, root: Path, say: Callable[[str], None] | None = None) -> dict:
+    """`name` fetched now, waiting for it (setup's --image-tools): ensure(), then its download's end -> its status
+    (ready, failed with the reason, or consent)."""
+    got = ensure(name, root, say)
+    if got["status"] == "downloading":
+        with _lock:
+            t = (_jobs.get(name) or {}).get("thread")
+        if t is not None:
+            t.join()
+    return status(name, root)
+
+
+def setup_names(vram_mib: int, ram_mib: int, root: Path) -> list[str]:
+    """The weights setup fetches ahead (--image-tools), the main editing tools' as each takes them by default: the
+    upscale's (SeedVR2's 7B in 8 bits where it fits the VRAM and the RAM together, else its 3B in 8 bits, its VAE, and
+    RealESRGAN for auto's fallback), the parts' fix detectors, the finder of a region in words (Florence-2 large, and
+    SAM 3 where its license was agreed to in `root`) and the background's remover (BiRefNet general).  Not the control
+    tool's: they differ by image model and one is not free software.
+    serve/images.py seedvr2_file takes the 7B's 8-bit file when it is here and fits, so the server uses these; it would
+    fetch the 3B's FP16 file instead only with 10 GiB of VRAM beside less than 2 GiB of RAM."""
+    q = _qimage()
+    seedvr2 = "seedvr2-7b-int8" if vram_mib + ram_mib >= (q.FILES["seedvr2-7b-int8"][2] >> 20) + SEEDVR2_WORK_MIB \
+        else "seedvr2-3b-int8"
+    sam3 = [] if needs_consent("sam3", root) else ["sam3"]
+    return [seedvr2, "seedvr2-vae", "realesrgan", "yolo-face", "yolo-hand", "yolo-person", *sam3, "clip-tokenizer",
+            "florence-2-large", "florence-2-tokenizer", "birefnet-general"]
 
 
 def every() -> list[dict]:

@@ -30,6 +30,8 @@ under Apache 2.0.  Their full texts: the web app's About > Model terms.
 (as setup's --image-dit-q8 and --image-dit-keep).
 --gpu auto|same|PCI: the GPU of the image jobs (setup's --image-gpu); --sam3-license agree|no: Meta's SAM License for
 SAM 3.1, which finds a part of a picture by words (setup's --image-sam3-license; asked when not given).
+--tools yes|no: the main editing tools' weights (the upscale's, the parts' fix detectors, the region finders, the
+background's remover) downloaded now, or each on its first use (setup's --image-tools; asked when not given).
 """
 from __future__ import annotations
 
@@ -70,6 +72,7 @@ def main(argv=None) -> int:
                          "else 8 bits (auto, the default); on always 8 bits, off always 16-bit")
     ap.add_argument("--gpu", metavar="auto|same|PCI", help="the GPU of the image jobs, as setup's --image-gpu")
     ap.add_argument("--sam3-license", choices=["agree", "no"], help="as setup's --image-sam3-license")
+    ap.add_argument("--tools", choices=["yes", "no"], help="as setup's --image-tools")
     ap.add_argument("--dit-keep", choices=["on", "off"],
                     help="Mage-Flow: keep the DiT not in use (the generation's or the edit's) in RAM (on, the default)")
     ap.add_argument("--print", action="store_true", help="print the images section instead of writing it")
@@ -97,7 +100,7 @@ def main(argv=None) -> int:
     ns = argparse.Namespace(images=a.model, image_quant=a.quant, image_gpu_policy=a.gpu_policy, yes=a.yes,
                             image_ssd_offload=a.ssd_offload, image_dit_q8=a.dit_q8, image_auto_largest=a.auto_largest,
                             image_dit_keep=a.dit_keep, image_gpu=a.gpu, image_sam3_license=a.sam3_license,
-                            image_lora_training=a.lora_training)
+                            image_lora_training=a.lora_training, image_tools=a.tools)
     path = Path(a.config) if a.config else None
     cfg = json.loads(path.read_text(encoding="utf-8-sig")) if path is not None and path.is_file() else {}
     # the RAM the model was set up to leave free (setup's --ram-reserve-gib, its engine's --ram-reserve-mib)

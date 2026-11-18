@@ -214,7 +214,7 @@ UPSCALE_WEIGHTS = {"realesrgan": "realesrgan"}
 # SeedVR2's variants: 7B (photos, video, the default), 7B sharp (anime, blurred pictures, crisper detail), 3B (where the
 # 7B's 8 bits do not fit the VRAM and the RAM together); each in FP16 (where the GPU holds it) or int8_convrot
 SEEDVR2_VARIANTS = ("7b", "7b-sharp", "3b")
-SEEDVR2_WORK_MIB = 4096   # what a 7B run takes besides its weights at a couple of megapixels (the DiT's activations)
+SEEDVR2_WORK_MIB = image_aux.SEEDVR2_WORK_MIB
 # the color corrections after it (vLLM-Omni's SeedVR2 color_correction_method's names); none given, the upscaler's
 # own: none for RealESRGAN, lab for SeedVR2 (its pipeline's)
 UPSCALE_COLORS = ("none", "lab", "adain", "wavelet")

@@ -174,6 +174,7 @@
  "setup.image-sam3-license.about": "La licencia: {license}",
  "setup.image-sam3-license.label": "Aceptar la SAM License de Meta, para que SAM 3.1 encuentre una parte de una imagen a partir de palabras (find_region, edit_region); sin ella, Florence-2 (MIT) encuentra las partes",
  "setup.image-ssd-offload.label": "Mantener el tamaño de los modelos de imagen cuando falta RAM, leyendo del SSD lo que no cabe (más lento)",
+ "setup.image-tools.label": "Descargar ahora los pesos de las herramientas de edición (ampliar, corregir partes, encontrar una región, quitar el fondo); si no, cada uno en su primer uso",
  "setup.kv.choice.fp16": "16-bit: el doble de memoria que 8-bit",
  "setup.kv.choice.int8": "8-bit (recomendado)",
  "setup.kv.choice.k8v4": "Claves de 8-bit y valores de 4-bit: unas tres cuartas partes de la memoria",
