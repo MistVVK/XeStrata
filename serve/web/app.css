@@ -473,7 +473,8 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .st-btn.sl-reset .st-icon{width:14px;height:14px}
 .sl-reset:disabled{visibility:hidden}
 .st-label .sl-reset{width:22px;height:22px;margin-left:4px;vertical-align:middle}
-.info-btn{width:22px;height:22px;flex:none;margin-left:4px;vertical-align:middle;color:var(--st-ink-muted)}
+.info-row{display:inline-flex;align-items:center;gap:2px;min-width:0}
+.info-btn{width:22px;height:22px;flex:none;vertical-align:middle;color:var(--st-ink-muted)}
 .st-btn.info-btn .st-icon{width:14px;height:14px}
 .info-btn[aria-expanded="true"]{color:var(--st-accent)}
 .info-pop{margin:var(--st-s-1) 0 var(--st-s-2);padding:var(--st-s-2) var(--st-s-3);border:1px solid var(--st-line);

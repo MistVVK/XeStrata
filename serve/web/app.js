@@ -3416,7 +3416,11 @@ for (const el of document.querySelectorAll("[data-info]")) {
   b.setAttribute("aria-expanded", "false");
   b.innerHTML = icon("info");
   b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); infoToggle(b, key); };
-  el.after(b);
+  // the label and its button on one line (a field's label above its input would leave the button on a line of its own)
+  const row = document.createElement("span");
+  row.className = "info-row";
+  el.replaceWith(row);
+  row.append(el, b);
 }
 document.addEventListener("click", (e) => {
   if (infoOpen && !infoOpen[1].contains(e.target) && !e.target.closest(".info-btn")) infoClose();
