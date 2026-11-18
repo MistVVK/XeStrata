@@ -168,6 +168,7 @@ PlainModel::~PlainModel() {
             strata::gpu::free(gdn_snap_[g][t]);
             strata::gpu::free(conv_snap_[g][t]);
         }
+    strata::gpu::free(hist_dev_);
     for (void* p : allocs_) strata::gpu::free(p);
     for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) h_prob_, (void*) fill_tmp_,
                     (void*) hand_host_, (void*) h_rroute_})
@@ -3347,16 +3348,17 @@ bool PlainModel::set_history(const int32_t* tokens, int n, std::string& err) {
     t.hist_len_ = std::max(0, n);
     if (t.hist_len_ == 0) return true;
     const size_t T = (size_t) opt_.max_t;
-    if (t.hist_len_ > t.hist_cap_) {
+    if ((size_t) t.hist_len_ > t.hist_cap_) {
         int32_t* d = nullptr;
-        if (!strata::gpu::alloc_device(&d, (size_t) t.hist_len_ * T * 4)) {
+        const size_t cap = std::max((size_t) t.hist_len_, (size_t) t.hist_cap_ * 2);
+        if (!strata::gpu::alloc_device(&d, cap * T * sizeof(int32_t))) {
             t.hist_len_ = 0;
             err = std::string("plain model: the penalties' history: ") + strata::gpu::last_error();
             return false;
         }
-        t.allocs_.push_back(d);
+        strata::gpu::free(t.hist_dev_);   // picks run after the window graph, and the stream has finished
         t.hist_dev_ = d;
-        t.hist_cap_ = t.hist_len_;
+        t.hist_cap_ = cap;
     }
     std::vector<int32_t> rows((size_t) t.hist_len_ * T);
     for (size_t r = 0; r < T; ++r) std::copy(tokens, tokens + n, rows.begin() + (std::ptrdiff_t) (r * (size_t) n));

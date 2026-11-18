@@ -1366,8 +1366,9 @@ private:
     // the picks' constraints (set_logit_bias, set_allowed, set_history) on the device, and whether each is set
     float* bias_dev_ = nullptr;
     uint32_t* allowed_dev_ = nullptr;   ///< max_t rows of the same mask
-    int32_t* hist_dev_ = nullptr;       ///< max_t rows of hist_len_ tokens
-    int hist_len_ = 0, hist_cap_ = 0;
+    int32_t* hist_dev_ = nullptr;       ///< max_t rows of hist_len_ tokens; owned separately from allocs_
+    int hist_len_ = 0;
+    size_t hist_cap_ = 0;
     // the batch slots' own (set_slot_history, set_slot_logit_bias): per slot its reply tail and its bias array
     std::vector<std::vector<int32_t>> slot_tail_;
     std::vector<float*> slot_bias_dev_;   ///< per slot: its bias array on the device (kept for the slot's next one)
