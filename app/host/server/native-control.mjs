@@ -28,6 +28,18 @@ import { parseSaved as parseRoles, mirror as mirrorRoles } from './gpu-roles.mjs
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 /** The owner-approved words (11-15) when the draft layer cannot be downloaded offline and no other drafter runs: the Terminal's strata_control/drafting.py MTP_OFFLINE_NOTE. */
 export const MTP_OFFLINE_NOTE="There is no internet connection, so the draft layer can't be downloaded now. The model starts without a drafter.";
+/** FIX-APP A3: while the drafter (DFlash2, about 1.2 GB) is fetched during the first "Tune & start chatting" (or any load that fetches it), the step says so in plain words, with the size
+ *  in `details` as soon as Control's plan names it and the running figures after that. Control's own words for the other steps (checking, packing) stay. */
+export const DRAFTER_DOWNLOAD_SUMMARY='Downloading a small helper that makes answers faster. This happens once.';
+export function drafterDownloadStart(job,drafts){
+ job.summary=DRAFTER_DOWNLOAD_SUMMARY;
+ const gb=Number(drafts?.gb);job.details=Number.isFinite(gb)&&gb>0?`${gb.toFixed(1)} GB`:undefined;
+}
+export function drafterProgress(job,emit){
+ return event=>{if(event.event==='progress'&&job.state==='running'){
+  job.summary=/^downloading/i.test(String(event.step??''))?DRAFTER_DOWNLOAD_SUMMARY:event.step;
+  job.details=event.total>1&&event.done<event.total?`${(event.done/1e9).toFixed(2)} of ${(event.total/1e9).toFixed(2)} GB`:undefined;emit();}};
+}
 /** `args` without `--vision` and the picture word that follows it (the Qwen engine's --vision stands alone; an older config may carry a value). */
 const PICTURE_WORDS = new Set(['on', 'off', 'yes', 'no', 'gpu', 'cpu', 'none']);
 function withoutVisionFlag(args) {
@@ -381,7 +393,8 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   if(!packaged||typeof control.draftingFetch!=='function'||drafts?.needed!==true||!autoChoice(readJson(configFile).drafting))return false;
   job.engineAbort??=new AbortController();
   try{
-   const got=await withPlanFile(args,configFile,planFile=>control.draftingFetch({configPath:planFile,mode:'auto',throttle:true,...(noSplit?{noSplit:true}:{}),...(unloadsRunning(args)?{unloading:true}:{}),signal:job.engineAbort.signal,onEvent:event=>{if(event.event==='progress'&&job.state==='running'){job.summary=event.step;job.details=event.total>1&&event.done<event.total?`${(event.done/1e9).toFixed(2)} of ${(event.total/1e9).toFixed(2)} GB`:undefined;emit();}}}));
+   if(job.state==='running'){drafterDownloadStart(job,drafts);emit();}
+   const got=await withPlanFile(args,configFile,planFile=>control.draftingFetch({configPath:planFile,mode:'auto',throttle:true,...(noSplit?{noSplit:true}:{}),...(unloadsRunning(args)?{unloading:true}:{}),signal:job.engineAbort.signal,onEvent:drafterProgress(job,emit)}));
    if(job.state==='running'&&after){job.summary=after;job.details=undefined;emit();}
    return got?.pack!=null&&got?.skipped!==true;
   }catch(error){if(job.state==='running'){job.drafterNote=error.message;if(after){job.summary=after;job.details=undefined;}emit();}return false;}
@@ -412,7 +425,8 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   try{
    writeFileSync(probe,JSON.stringify(cfg),{mode:0o600});
    job.engineAbort??=new AbortController();
-   await control.draftingFetch({configPath:probe,mode:cfg.drafting??'auto',...(noSplit?{noSplit:true}:{}),...(unloadsRunning(args)?{unloading:true}:{}),signal:job.engineAbort.signal,onEvent:event=>{if(event.event==='progress'&&job.state==='running'){job.summary=event.step;job.details=event.total>1&&event.done<event.total?`${(event.done/1e9).toFixed(2)} of ${(event.total/1e9).toFixed(2)} GB`:undefined;emit();}}});
+   if(job.state==='running'){drafterDownloadStart(job,drafts);emit();}
+   await control.draftingFetch({configPath:probe,mode:cfg.drafting??'auto',...(noSplit?{noSplit:true}:{}),...(unloadsRunning(args)?{unloading:true}:{}),signal:job.engineAbort.signal,onEvent:drafterProgress(job,emit)});
    if(job.state==='running'){job.summary='Loading the model…';job.details=undefined;emit();}
   }catch(error){if(job.state==='running'){job.drafterNote=error.message;job.summary=drafts.mtp_here===false?'The DFlash2 drafter could not be downloaded, so the model starts without a drafter. Loading the model…':'The DFlash2 drafter could not be downloaded, so the model starts with the MTP. Loading the model…';emit();}}
   finally{try{rmSync(probe,{force:true});}catch{/* best effort */}}
