@@ -5834,6 +5834,19 @@ def rollback_engine(toolkit=13) -> int:
     return 0
 
 
+def feed_engine_covers(eng: Path, gpu) -> bool:
+    """Whether the engine installed in `eng` has code for every architecture of `gpu` (BUILD.json "archs", or PTX it can run on newer cards).
+    An engine whose BUILD.json names no architectures is taken as covering (the same rule get_prebuilt applies to an installed one)."""
+    try:
+        meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    have = arch_numbers(meta.get("archs"))
+    miss = [int(x) for x in gpu.get("archs", [gpu["arch"]])
+            if have and int(x) not in have and not (meta.get("ptx") and int(x) > max(have))]
+    return not miss
+
+
 def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | None:
     """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
     updating: called to replace an installed engine, which starts instead when this fails (no compile).
@@ -5882,10 +5895,12 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             if i + 1 < len(bases):                     # #214: this checkout's release is not published (yet)
                 say(f"  No ready-made engine for v{source_version()} ({e}): the latest release instead")
                 continue
-            if int(toolkit) != 12:                     # 0.2 releases: the signed feed has it (#3469)
-                got = engine_from_feed(eng, updating)
-                if got is not None:
-                    return got
+            got = engine_from_feed(eng, updating)      # 0.2 releases: the signed feed has it (#3469), the CUDA 12 package too (since 0.2.13)
+            if got is not None and int(toolkit) == 12 and not feed_engine_covers(got, gpu):
+                warn("the engine package from the update feed has no code for your graphics card" + ("" if updating else ": compiling instead"))
+                return None
+            if got is not None:
+                return got
             warn(f"no ready-made engine at {base} ({e})" + ("" if updating else ": compiling instead"))
             return None
     say("  Downloading the ready-made Strata engine" + (" (CUDA 12, experimental)" if int(toolkit) == 12 else "") + " ...")
