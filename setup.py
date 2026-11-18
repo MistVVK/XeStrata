@@ -4509,9 +4509,23 @@ def check_shards(shards):
                  f"delete {s.name} and its .done mark and run setup again")
 
 
-def published_pin(name: str) -> tuple | None:
-    """The pinned (bytes, SHA-256) of a published model file by its name (REPO_PINS), or None."""
-    pins = {d[name] for d in REPO_PINS.values() if name in d}
+def published_pin(name: str, fam: dict | None = None, model: str | None = None) -> tuple | None:
+    """The pinned (bytes, SHA-256) of a published model file by its name.  With the family and the size, only the
+    repositories that choice downloads from are looked at: swift and huihui-swift publish a file of the same name
+    with a different hash, and a search over every repository would find two pins and reject the person's own file."""
+    repos: set[str] = set()
+    if fam is not None:
+        hf = fam.get("hf")
+        if hf:
+            parts = str(hf).split("/resolve/", 1)[0].split("/")
+            if len(parts) >= 2:
+                repos.add("/".join(parts[-2:]))
+        info = (fam.get("models") or {}).get(model) if model else None
+        if isinstance(info, dict) and info.get("repo"):
+            repos.add(str(info["repo"]))
+    if not repos:
+        return None
+    pins = {REPO_PINS[repo][name] for repo in repos if name in REPO_PINS.get(repo, {})}
     return next(iter(pins)) if len(pins) == 1 else None
 
 
@@ -4523,7 +4537,7 @@ def gguf_dir_renamed(shards: list, fam: dict, model: str) -> None:
         pub = model_file(fam, model, i)
         if s.name == pub or not s.exists():
             continue
-        pin = published_pin(pub)
+        pin = published_pin(pub, fam, model)     # the repo this family and size downloads from, not every repo
         hint = (f"a model of your own goes in under a name of its own: {SETUP_CMD} --setup --gguf {shards[0]} "
                 "--name <a name>")
         if pin is None or s.stat().st_size != pin[0]:
