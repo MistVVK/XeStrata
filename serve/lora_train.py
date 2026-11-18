@@ -50,6 +50,7 @@ import tempfile
 import threading
 import time
 import uuid
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -279,8 +280,9 @@ def check_name(name: str) -> str:
 
 
 def check_trigger(trigger: str) -> str:
-    t = str(trigger or "").strip()
-    if not t or len(t) > 120 or any(ord(c) < 32 or ord(c) == 127 for c in t) or "," in t:
+    raw = str(trigger or "")
+    t = raw.strip()
+    if not t or len(t) > 120 or any(unicodedata.category(c) == "Cc" for c in raw) or "," in t:
         raise TrainError("trigger: one word or phrase, up to 120 characters, no comma or line break")
     return t
 
