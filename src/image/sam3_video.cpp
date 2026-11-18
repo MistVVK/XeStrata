@@ -140,6 +140,7 @@ struct Sam3Video::Impl {
     std::map<std::pair<int64_t, int64_t>, int> overlap;   // (earlier id, later id) -> frames sharing a detection
     int64_t next_id = 0, frame = 0;
     std::deque<Pending> held;
+    std::set<int64_t> removed_unconfirmed;
     std::map<int64_t, std::set<int64_t>> unconfirmed;   // by frame: the objects not yet confirmed after it
     std::map<int64_t, float> first_score;               // every object's, removed ones' too
     std::map<int64_t, int64_t> group_of;                // every object's group
@@ -708,6 +709,7 @@ struct Sam3Video::Impl {
         for (int64_t id : to_remove) {
             Obj* o = find(id);
             if (o == nullptr) continue;
+            if (!o->confirmed) removed_unconfirmed.insert(id);
             buckets[(size_t) o->bucket]->slot[(size_t) o->slot] = kGone;
         }
         objs.erase(std::remove_if(objs.begin(), objs.end(), [&](const Obj& o) { return to_remove.count(o.id) > 0; }),
@@ -759,7 +761,8 @@ struct Sam3Video::Impl {
         std::vector<std::pair<int64_t, const std::vector<float>*>> keep;
         for (const auto& [id, m] : p.masks) {
             // the masklets not yet confirmed are hidden; the removed and the kept-alive-out ones stay shown
-            if (un != unconfirmed.end() && un->second.count(id)) continue;
+            if (removed_unconfirmed.count(id)) continue;
+            if (frame >= cfg.confirm_after && un != unconfirmed.end() && un->second.count(id)) continue;
             keep.emplace_back(id, &m);
         }
         if (keep.empty()) return fr;
