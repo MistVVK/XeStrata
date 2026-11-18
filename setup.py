@@ -1599,7 +1599,7 @@ FAMILIES.update(PLAIN_FAMILIES)
 # one level mixed models, copies and quantizers).  A family is one (model, version, quantization), its --family ID
 # kept; Ornith-1.5's sizes are of two quantizations (a size's own "quantizer").  BASES in the order setup lists them:
 # FIRST_CHOICE's models first.
-BASES = {"qwen3.8-27b": "Qwen3.8-27B", "qwen3.8-flash-next": "Qwen3.8-Flash-Next",
+BASES = {"qwen3.8-flash-next": "Qwen3.8-Flash-Next",
          "ornith-1.5": "Ornith-1.5-35B-A3B",
          "qwen3.6": "Qwen3.6-35B-A3B", "qwen3.5-9b": "Qwen3.5-9B", "qwen3.5-2b": "Qwen3.5-2B",
          "llm-jp-4.1": "llm-jp-4.1-32b-a3b-thinking", "glm-5.3-flash": "GLM-5.3-Flash", "qwen3.5-0.8b": "Qwen3.5-0.8B"}
@@ -10388,7 +10388,7 @@ def main() -> int:
                    key=lambda m: bool(MODELS[m].get("experimental")))
     if a.model and a.model not in names:
         # upstream #444: say which family has that size, and (with --gguf-dir) which files XeStrata can run at all
-        elsewhere_fams = [f for f in FAMILIES if f in MODELS[a.model].get("families", ("qwen", "swift"))]
+        elsewhere_fams = [f for f in FAMILIES if f in MODELS.get(a.model, {}).get("families", ())]
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names)
              + (f" (or {a.model}: " + ", ".join(f"--family {f} --model {a.model}" for f in elsewhere_fams) + ")"
                 if elsewhere_fams else "")
