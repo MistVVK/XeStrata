@@ -1755,7 +1755,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.steps_up.init(T * strata::kernels::kStepCount);
-    m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
+    m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     for (int b = 0; b < 2; ++b) {
         if (!m.ple_emb_host[b] &&
             (force_pageable() || !strata::gpu::alloc_host((void**) &m.ple_emb_host[b], (size_t) T * N * 4))) {
@@ -2067,6 +2067,11 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
     take_stage(o, ss, s, m.stage, ok);
+    // the host row tables copy their whole length (HostVec::to_device): keep them at this layout's rows, as the
+    // device tables above are.  A relayout to a smaller chunk left them at the init chunk's length, and the slot
+    // upload wrote past slot_dev into src_dev (the row map the FP16 and latent paths read), the src upload past
+    // src_dev into the scratch after it
+    m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K);
     m.T = (int64_t) T;
     return ok;
 }
