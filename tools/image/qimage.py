@@ -1319,9 +1319,9 @@ def file_names(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant:
     if dit in MOSS_FEW_STEP:   # the shards, VAE, speed and edit adapters
         sh = moss_shards(dit)
         return (f"{sh}-1", f"{sh}-2", f"{sh}-3", f"{sh}-config", "moss-vae", "moss-4-step-lora", "moss-edit-lora",
-                text_file(text_encoder, text_quant))
+                "moss-mmproj", text_file(text_encoder, text_quant))
     if is_moss(dit):
-        return (f"{dit}-1", f"{dit}-2", f"{dit}-3", f"{dit}-config", "moss-vae", "moss-edit-lora",
+        return (f"{dit}-1", f"{dit}-2", f"{dit}-3", f"{dit}-config", "moss-vae", "moss-edit-lora", "moss-mmproj",
                 text_file(text_encoder, text_quant))
     if is_anima(dit):
         return (f"{dit}-bf16", "anima-vae", text_file(text_encoder, text_quant), "anima-t5-tokenizer")
@@ -1548,6 +1548,9 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "vae": str(local_path(models_dir, "moss-vae")),
                 "turbo_lora": str(local_path(models_dir, "moss-4-step-lora")), "lora_bake": False,
                 "edit_lora": str(local_path(models_dir, "moss-edit-lora")), "edit_format": "moss-image-edit",
+                # the control LoRAs and the LoRA folder's ai-toolkit edits read reference pictures: the engine opens
+                # Qwen3.5-9B's vision encoder for them (moss_pipeline.cpp), so setup installs it for both edges
+                "vision": str(local_path(models_dir, "moss-mmproj")),
                 "edit_steps": 4, "edit_cfg_scale": 1.0,
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
@@ -1561,6 +1564,7 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "edit_lora": str(local_path(models_dir, "moss-edit-lora")), "edit_adapter": "chinoll",
                 "edit_adapters": {"chinoll": {"lora": str(local_path(models_dir, "moss-edit-lora")),
                                               "format": "moss-image-edit", "about": "chinoll's Moss-Image-Edit"}},
+                "vision": str(local_path(models_dir, "moss-mmproj")),   # a control LoRA's reference pictures
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     if is_mage(dit):

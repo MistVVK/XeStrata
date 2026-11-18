@@ -433,9 +433,11 @@ def parse_job(req: dict, cfg: dict, files: list[bytes] | None = None, mask: byte
         if not cfg.get("vision"):
             raise img.ImageRequestError("control: the MOSS-Image vision encoder is required (run setup again)")
         if r.get("steps") is None and r.get("num_inference_steps") is None:
-            r["steps"] = 30
+            # 4-step's turbo LoRA takes 4..8 steps, not the usual 30: parse_request would refuse the control job
+            r["steps"] = min(30, img.model_defaults(cfg)["steps"]) if cfg.get("turbo_lora") else 30
         if r.get("guidance_scale") is None and r.get("true_cfg_scale") is None:
-            r["guidance_scale"] = 4.0
+            # the 4-step LoRA allows no negative prompt and a scale of 1, its config's value
+            r["guidance_scale"] = img.model_defaults(cfg)["guidance"] if cfg.get("turbo_lora") else 4.0
         r.setdefault("uncond_skip_layers", [])
         job = img.parse_edit_request(r, [c["image"]], {**cfg, "edit_format": "ai-toolkit"})
     elif c["mode"] == "reference":
