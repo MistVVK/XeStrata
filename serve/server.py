@@ -8790,9 +8790,23 @@ def make_handler(svc: Service):
                 if not self.headers.get("Content-Type", "").startswith("application/json"):
                     self._translate_error(path, 415, "send application/json")
                     return
+            if path == "/v2/translate":
+                # DeepL's key is in a header and its limit is smaller than the general body limit: check both before
+                # reading a body that will be refused anyway
+                if not self._translate_allowed(path, None):
+                    return
+                try:
+                    declared = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    declared = 0
+                if declared > translate_api.DEEPL_MAX_BODY:
+                    self.close_connection = True
+                    self._translate_error(path, 413, "Request Entity Too Large")
+                    return
             model = svc.translation.model
             body = self._body()
             if path == "/v2/translate" and len(body or b"") > translate_api.DEEPL_MAX_BODY:
+                self.close_connection = True
                 self._translate_error(path, 413, "Request Entity Too Large")
                 return
             try:
@@ -8858,6 +8872,8 @@ def make_handler(svc: Service):
                 return
             sampling = {k: req[k] for k in ("temperature", "top_p", "top_k", "min_p", "seed") if k in req}
             limit = req.get("max_completion_tokens") or req.get("max_tokens")
+            if isinstance(limit, (int, float)) and limit < 0:
+                limit = None                             # llama.cpp's -1 means "the rest"; the engine takes a count
             stops = stop_strings(req)
             rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex
             created = int(time.time())
