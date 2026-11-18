@@ -24,7 +24,7 @@ set(STRATA_PACKAGE_SUGGESTS "" CACHE STRING "the package's suggestions, not inst
 set(STRATA_PACKAGE_RUNTIME "{}" CACHE STRING
     "the GPU makers' packages by maker, as a JSON object, for setup to tell what a PC lacks (BUILD.json's runtime)")
 set(STRATA_PACKAGE_RELEASE_SUFFIX "" CACHE STRING
-    "the rpm Release's dist tag (fc44, fc45), which tells the two Fedoras' gui and free packages apart in a release's folder")
+    "the rpm Release's dist tag (fc44, fc45): it tells the two Fedoras' gui and free packages apart in a release")
 if(NOT STRATA_PACKAGE_NAME)
   message(FATAL_ERROR "STRATA_PACKAGE needs STRATA_PACKAGE_NAME (tools/package/build.sh sets it)")
 endif()
