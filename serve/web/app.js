@@ -2349,7 +2349,7 @@ async function generateReply(opts = {}) {
     body.xestrata_images = {...(body.xestrata_images === true ? {} : body.xestrata_images), use_text_gpu: settings.textGpu};
   if (health.web_search && $("chat-search").value !== "off") body.web_search_options = {};   // the server's search tools
 
-  let firstAt = null, thinkStart = null, usage = null, frame = 0, overflow = false, handoff = false;
+  let firstAt = null, thinkStart = null, usage = null, tokens = 0, frame = 0, overflow = false, handoff = false;
   // the time the server's tools ran (an image made, a search), which tok/s leaves out: the model wrote nothing meanwhile
   let toolMs = 0;
   const toolSince = new Map();
@@ -2411,7 +2411,9 @@ async function generateReply(opts = {}) {
           let j;
           try { j = JSON.parse(data); } catch (e) { return; }
           if (j.error) throw replyError(j.error.message || tr("toast.engineError", "the engine reported an error"));
-          if (j.usage) usage = j.usage;
+          // a page tool sends another request with the same answer: each one has its own usage, and the seconds below
+          // cover them all, so add their output tokens up (usage itself stays the last one, for the context size)
+          if (j.usage) { usage = j.usage; tokens += j.usage.completion_tokens || 0; }
           if (j.strata_mcp) {
             const x = j.strata_mcp;
             if (x.event === "call") { if (!firstAt) firstAt = performance.now(); toolSince.set(x.id, performance.now()); }
@@ -2465,7 +2467,7 @@ async function generateReply(opts = {}) {
   const cut = me.cut;                                        // an interjection ended it: kept as written, marked interrupted
   if (cut) m.interrupted = true;
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
-  const n = usage ? usage.completion_tokens : null;
+  const n = tokens || (usage ? usage.completion_tokens : null);
   if (usage) settleTurn(m, usage, msgs);
   const ended = cut ? tr("chat.interruptedLower", "interrupted") : tr("chat.stoppedLower", "stopped");
   if (n && firstAt) {
