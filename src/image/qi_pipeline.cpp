@@ -496,6 +496,14 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     const int64_t h = r.height / 16, w = r.width / 16;
     const auto t0 = clock::now();
     ensure_open();
+    if (r.control_net.empty() && control_) {
+        // A request without ControlNet does not budget its weights or blocks.  Give them back before processing
+        // references too: their vision and VAE encoders run before use_control and before the sampling plan.
+        dit_->set_control(nullptr);
+        control_.reset();
+        control_set_ = 0;
+        control_on_ = false;
+    }
     use_loras(r);   // before the plan (their bytes are fixed) and the context (a set that changed drops it)
     // an edit: its references through the vision encoder and the VAE's encoder, their pads widened to their tokens
     std::vector<int32_t> ids;
