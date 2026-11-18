@@ -3745,6 +3745,18 @@ class Translation:
             finally:
                 self.lock.release()
 
+    def complete(self, prompts: list) -> list:
+        """Translate for the APIs that return the text alone: a cut-off translation is an error, not an answer.
+        With no caller's max_tokens the budget is what the context leaves, which can be shorter than the text; the
+        APIs here have no finish_reason to tell the client, so refuse instead of returning half a translation.
+        ValueError, answered 413/400 by the DeepL/LibreTranslate routes and by the translation tool."""
+        got = self.translate(prompts)
+        for r in got:
+            if r["finish_reason"] == "length":
+                raise ValueError(f"the text is {r['prompt_tokens']} tokens; the translation model's context leaves "
+                                 f"no room for the whole translation; send a shorter text")
+        return [r["text"] for r in got]
+
     def translate(self, prompts: list, sampling: dict | None = None, max_tokens: int | None = None,
                   cancel: threading.Event | None = None, on_text=None) -> list:
         """Each of `prompts` (PFML3 texts, the model's own) translated, in order: {"text", "prompt_tokens",
@@ -8743,7 +8755,7 @@ def make_handler(svc: Service):
             tr = svc.translation
             try:
                 return translate_api.translate_all(
-                    req, lambda jobs: [r["text"] for r in tr.translate([j.prompt(tr.model) for j in jobs])])
+                    req, lambda jobs: tr.complete([j.prompt(tr.model) for j in jobs]))
             except translate_api.ApiError as e:
                 self._translate_error(path, e.status, str(e))
             except ValueError as e:                      # a text past the model's context
@@ -10412,7 +10424,7 @@ def make_handler(svc: Service):
 
                 def run_jobs(jobs, tr=tr):
                     try:
-                        return [r["text"] for r in tr.translate([j.prompt(tr.model) for j in jobs])]
+                        return tr.complete([j.prompt(tr.model) for j in jobs])
                     except EngineDied as e:
                         raise RuntimeError(str(e)) from None
 
