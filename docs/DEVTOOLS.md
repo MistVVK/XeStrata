@@ -250,7 +250,7 @@ curl -L https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0
 .tools/xwin/xwin-0.10.0-x86_64-unknown-linux-musl/xwin --accept-license --cache-dir .tools/xwin/cache --arch x86_64 \
     splat --output .tools/xwin/sdk
 python3 tools/intel_llvm_build.py --contrib && python3 tools/intel_llvm_build.py --windows
-export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+export CCACHE_DIR=$HOME/.cache/ccache-win CCACHE_COMPILERCHECK=content
 cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON \
     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-windows-msvc.cmake \
     -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++ -DSTRATA_LICENSE=free \
@@ -263,11 +263,11 @@ For an everyday change, only the objects of the sources it touches are compiled 
 ninja builds a source's object when given the source's path with `^` after it (a full path).
 
 ```sh
-export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+export CCACHE_DIR=$HOME/.cache/ccache-win CCACHE_COMPILERCHECK=content
 ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$|^|")
 ```
 
-- ccache is the one of "Faster builds" above. The Windows objects never hit the Linux ones (their settings differ), so a `CCACHE_DIR` of their own keeps them from pushing the Linux cache out. `CCACHE_COMPILERCHECK=content` tells the compiler by its content when intel/llvm is built again.
+- ccache is the one of "Faster builds" above. The Windows objects never hit the Linux ones (their settings differ), so a `CCACHE_DIR` of their own keeps them from pushing the Linux cache out. That `CCACHE_DIR` is one for the machine (`~/.cache/ccache-win`), not one per working tree: its `ccache.conf` sets `base_dir` (a folder above the working trees, `$HOME` for one) and `max_size` (20G or so), so that every worktree hits the same cache (with `CCACHE_DIR` set, `~/.config/ccache/ccache.conf` is not read). `CCACHE_COMPILERCHECK=content` tells the compiler by its content when intel/llvm is built again.
 - When only a header changed, `ninja -C build/win` builds everything (ccache returns the files that did not change).
 - xwin's `cache` is not needed after the splat and may be deleted (`sdk` is 0.8 GB).
 - lld-link warns `skipping imported DllMain symbol` about `sycl9.lib`: it comes from lld reading an import library MSVC made, and does not change the link.

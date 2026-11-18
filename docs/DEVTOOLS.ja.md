@@ -250,7 +250,7 @@ curl -L https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0
 .tools/xwin/xwin-0.10.0-x86_64-unknown-linux-musl/xwin --accept-license --cache-dir .tools/xwin/cache --arch x86_64 \
     splat --output .tools/xwin/sdk
 python3 tools/intel_llvm_build.py --contrib && python3 tools/intel_llvm_build.py --windows
-export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+export CCACHE_DIR=$HOME/.cache/ccache-win CCACHE_COMPILERCHECK=content
 cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON \
     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-windows-msvc.cmake \
     -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++ -DSTRATA_LICENSE=free \
@@ -263,11 +263,11 @@ ninja -C build/win
 ninja はソースのパスに `^` を付けると、そのソースのオブジェクトを作ります（パスはフルパスで書きます）。
 
 ```sh
-export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+export CCACHE_DIR=$HOME/.cache/ccache-win CCACHE_COMPILERCHECK=content
 ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$|^|")
 ```
 
-- ccache は「ビルドを速くする」の節と同じものです。Windows 向けのオブジェクトは Linux 向けのものと設定が違って当たらないので、`CCACHE_DIR` を分けて Linux 向けのキャッシュを追い出さないようにします。`CCACHE_COMPILERCHECK=content` は、intel/llvm を作り直したときにコンパイラーを中身で見分けるためです。
+- ccache は「ビルドを速くする」の節と同じものです。Windows 向けのオブジェクトは Linux 向けのものと設定が違って当たらないので、`CCACHE_DIR` を分けて Linux 向けのキャッシュを追い出さないようにします。この `CCACHE_DIR` は作業の木ごとでなく、開発機に 1 つ（`~/.cache/ccache-win`）にします。worktree をいくつ作っても同じキャッシュに当たるように、その中の `ccache.conf` に `base_dir`（作業の木を置くフォルダーの上、たとえば `$HOME`）と `max_size`（20G ほど）を書きます（`CCACHE_DIR` を決めると `~/.config/ccache/ccache.conf` は読まれないため）。`CCACHE_COMPILERCHECK=content` は、intel/llvm を作り直したときにコンパイラーを中身で見分けるためです。
 - ヘッダーだけを変えたときは、`ninja -C build/win` で全体を作ります（ccache が変わっていないファイルを返します）。
 - xwin の `cache` は展開のあとは要らず、消してかまいません（`sdk` は 0.8 GB）。
 - lld-link は、`sycl9.lib` について `skipping imported DllMain symbol` と警告します。MSVC で作られたインポートライブラリを lld で読むときに出るもので、リンクの結果には関係しません。
