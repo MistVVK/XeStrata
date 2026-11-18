@@ -426,6 +426,7 @@
   "tool.bgRefine": "縁の色を整える（refine_foreground）",
   "tool.bgRes": "読み込む解像度（幅x高さ、32 の倍数）",
   "tool.bgResOwn": "版の既定",
+  "ui.default": "既定値に戻す",
   "tool.fetching": "道具の重み（{name}）をダウンロードしています：{got} / {total} MiB。終わりしだい実行します。",
   "tool.downloadFailed": "{name} のダウンロードに失敗しました：{why}",
   "tool.drawModel": "描く画像のモデル",

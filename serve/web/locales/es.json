@@ -426,6 +426,7 @@
   "tool.bgRefine": "Limpiar los colores del borde (refine_foreground)",
   "tool.bgRes": "Resolución de lectura (ancho x alto, múltiplos de 32)",
   "tool.bgResOwn": "la de la versión",
+  "ui.default": "Valor predeterminado",
   "tool.fetching": "Descargando los pesos de la herramienta ({name}): {got} de {total} MiB. Se ejecuta en cuanto estén.",
   "tool.downloadFailed": "La descarga de {name} falló: {why}",
   "tool.drawModel": "Modelo de imagen que dibuja",

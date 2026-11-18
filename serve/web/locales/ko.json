@@ -426,6 +426,7 @@
   "tool.bgRefine": "가장자리 색 정리(refine_foreground)",
   "tool.bgRes": "읽는 해상도(너비x높이, 32의 배수)",
   "tool.bgResOwn": "버전의 기본값",
+  "ui.default": "기본값으로",
   "tool.fetching": "도구의 가중치({name})를 내려받는 중: {got} / {total} MiB. 받는 대로 실행합니다.",
   "tool.downloadFailed": "{name} 내려받기 실패: {why}",
   "tool.drawModel": "그리는 이미지 모델",

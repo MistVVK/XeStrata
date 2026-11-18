@@ -438,6 +438,7 @@
   "tool.bgRefine": "Nettoyer les couleurs du bord (refine_foreground)",
   "tool.bgRes": "Résolution de lecture (largeur x hauteur, multiples de 32)",
   "tool.bgResOwn": "celle de la version",
+  "ui.default": "Valeur par défaut",
   "tool.fetching": "Téléchargement des poids de l’outil ({name}) : {got} sur {total} Mio. Il se lance dès qu’ils sont là.",
   "tool.downloadFailed": "Le téléchargement de {name} a échoué : {why}",
   "tool.drawModel": "Modèle d’image qui dessine",

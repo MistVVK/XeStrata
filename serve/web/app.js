@@ -3116,6 +3116,7 @@ function thinkingButtons() {
   $("s-thinking").closest(".st-field").hidden = !t.levels.length;
   loadDrawer();
 }
+const SAMPLING_SLIDERS = [["s-temp", "temperature"], ["s-topp", "top_p"], ["s-topk", "top_k"]];
 function outputs() {
   const t = +$("s-temp").value;
   $("o-temp").textContent = t === 0 ? tr("drawer.greedy", "0 · greedy") : t.toFixed(2);
@@ -3130,6 +3131,10 @@ function outputs() {
   $("o-busy").textContent = {queue: tr("drawer.busyQueueNote", "Your message waits and goes as soon as the answer is done."),
     interject: tr("drawer.busyInterjectNote", "The answer stops where it is (what is written stays) and your message goes at once. A tool that is running finishes first.")}[busyMode] || "";
   for (const id of ["s-topp", "s-topk", "s-minp"]) $(id).disabled = t === 0;
+  for (const [id, key] of SAMPLING_SLIDERS) {   // a default button where the slider is off its default
+    const b = $(id)._reset;
+    if (b) b.disabled = $(id).disabled || +$(id).value === +DEFAULTS[key];
+  }
 }
 for (const b of $("s-busy").children) b.onclick = () => { for (const x of $("s-busy").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const b of $("s-script").children) b.onclick = () => {
@@ -3137,6 +3142,12 @@ for (const b of $("s-script").children) b.onclick = () => {
   $("script-ctx-row").hidden = b.dataset.v === "off";        // the switch under it is kept as it was while hidden
 };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
+// the sampling sliders' default buttons (beside their values): DEFAULTS', applied with the drawer's Apply as a move is
+for (const [id, key] of SAMPLING_SLIDERS) {
+  const el = $(id), b = sliderResetButton(() => { el.value = DEFAULTS[key]; outputs(); });
+  el._reset = b;
+  el.closest(".st-field").querySelector(".st-label").append(b);
+}
 for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-skills", "s-share", "s-list", "s-edit", "s-scriptctx"]) {
   $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
 }
@@ -3319,7 +3330,38 @@ function imgSliders() {
     const v = parseFloat(f.value !== "" ? f.value : f.placeholder);
     r.value = String(Number.isFinite(v) ? v : f.min);
   }
+  for (const r of imgRanges) {
+    const f = $(r.dataset.for), b = f._reset;
+    if (b) b.disabled = f.value === sliderDefault(f);
+  }
   for (const r of imgRanges) r.style.setProperty("--fill", `${r.max > r.min ? (r.value - r.min) / (r.max - r.min) * 100 : 0}%`);
+}
+// a slider's default: what its field holds when nothing is chosen - empty where the field's placeholder shows the
+// model's default (a request leaves it out), else the field's own first value (the page's), a select's first choice
+function sliderDefault(f) {
+  if (f.tagName === "SELECT") return f.options.length ? f.options[0].value : "";
+  return f.placeholder !== "" || f.defaultValue === "" ? "" : f.defaultValue;
+}
+// the default button beside a slider's number: the field back to its default, told as a change of the field's own
+function sliderResetButton(onClick) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "st-btn st-btn--icon sl-reset";
+  b.title = tr("ui.default", "Default");
+  b.setAttribute("aria-label", b.title);
+  b.innerHTML = icon("refresh");
+  b.onclick = (e) => { e.preventDefault(); onClick(); };
+  return b;
+}
+for (const r of imgRanges) {
+  const f = $(r.dataset.for);
+  f._reset = sliderResetButton(() => {
+    f.value = sliderDefault(f);
+    f.dispatchEvent(new Event("input", {bubbles: true}));
+    f.dispatchEvent(new Event("change", {bubbles: true}));
+    imgSliders();
+  });
+  f.parentElement.insertBefore(f._reset, f);
 }
 for (const r of imgRanges) r.addEventListener("input", () => {
   const f = $(r.dataset.for);

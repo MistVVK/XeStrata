@@ -426,6 +426,7 @@
   "tool.bgRefine": "Очистить цвета края (refine_foreground)",
   "tool.bgRes": "Разрешение чтения (ширина x высота, кратно 32)",
   "tool.bgResOwn": "по версии",
+  "ui.default": "По умолчанию",
   "tool.fetching": "Загружаются веса инструмента ({name}): {got} из {total} МиБ. Запустится, как только загрузятся.",
   "tool.downloadFailed": "Не удалось загрузить {name}: {why}",
   "tool.drawModel": "Модель изображений, которая рисует",
