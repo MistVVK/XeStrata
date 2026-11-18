@@ -970,7 +970,7 @@ class Assembler:
                 out += self.close()
             raw = x.get("arguments")
             args: dict = raw if isinstance(raw, dict) else {}
-            item = {"id": new_id("ig"), "type": "image_generation_call", "status": "in_progress", "result": None,
+            item: dict = {"id": new_id("ig"), "type": "image_generation_call", "status": "in_progress", "result": None,
                     "revised_prompt": args.get("prompt")}
             out += self._open(item)
             at = self.index
@@ -981,16 +981,18 @@ class Assembler:
             out.append(self.event("response.image_generation_call.generating", item_id=item["id"],
                                   output_index=at))
         elif x.get("event") == "partial":
-            item = self._hosted(x, "image_generation_call")
-            if item is None:
+            found = self._hosted(x, "image_generation_call")
+            if found is None:
                 return out
+            item = found
             out.append(self.event("response.image_generation_call.partial_image", item_id=item["id"],
                                   output_index=self.response["output"].index(item),
                                   partial_image_index=x.get("index", 0), partial_image_b64=x.get("b64")))
         elif x.get("event") == "result":
-            item = self._hosted(x, "image_generation_call")
-            if item is None:
+            found = self._hosted(x, "image_generation_call")
+            if found is None:
                 return out
+            item = found
             urls = x.get("images") or []
             item["result"] = image_b64(urls[0]) if urls else None
             # what OpenAI's item says of the image: its size, quality, background, format and the prompt used
@@ -1022,7 +1024,7 @@ class Assembler:
             args: dict = raw if isinstance(raw, dict) else {}
             action = ({"type": "open_page", "url": args.get("url")} if x.get("name") == "fetch_page"
                       else {"type": "search", "query": args.get("query")})
-            item = {"id": new_id("ws"), "type": "web_search_call", "status": "in_progress", "action": action}
+            item: dict = {"id": new_id("ws"), "type": "web_search_call", "status": "in_progress", "action": action}
             out += self._open(item)
             at = self.index
             if x.get("id") is not None:
@@ -1030,9 +1032,10 @@ class Assembler:
             out.append(self.event("response.web_search_call.in_progress", item_id=item["id"], output_index=at))
             out.append(self.event("response.web_search_call.searching", item_id=item["id"], output_index=at))
         elif x.get("event") == "result":
-            item = self._hosted(x, "web_search_call")
-            if item is None:
+            found = self._hosted(x, "web_search_call")
+            if found is None:
                 return out
+            item = found
             if item["action"]["type"] == "search":
                 item["action"]["sources"] = [{"type": "url", "url": s["url"]} for s in x.get("sources") or []]
             out.append(self.event("response.web_search_call.completed", item_id=item["id"],
