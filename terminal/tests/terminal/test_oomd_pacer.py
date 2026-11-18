@@ -272,7 +272,7 @@ class WhereItIsCalled(unittest.TestCase):
         text = (ROOT / "serve" / "server.py").read_text(encoding="utf-8")
         self.assertIn("from serve import oomd_pacer", text)
         spawn = text.index('self.proc = popen("the Strata engine"')
-        call = text.index("oomd_pacer.start(proc, loading)")
+        call = text.index("oomd_pacer.start(proc, loading, args=args)")
         self.assertGreater(call, spawn)
         self.assertLess(call - spawn, 1800)
         self.assertLess(call, text.index("loading.set()\n        if self.max_context <= 0"))

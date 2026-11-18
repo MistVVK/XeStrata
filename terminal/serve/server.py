@@ -320,6 +320,7 @@ from serve import runconfig  # noqa: E402
 from serve import expert_heat  # noqa: E402
 from serve import commit_limit  # noqa: E402
 from serve import oomd_pacer  # noqa: E402
+from serve import lastrun  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -797,6 +798,7 @@ class StrataEngine:
             print(f"[strata] engine priority: nice +{nice} (this PC has built-in Radeon graphics that usually draw the desktop; "
                   "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
+        oomd_pacer.make_room(args)                       # Linux desktop: the file cache an earlier start left is dropped first, so the engine's RAM is free (serve/oomd_pacer.py)
         spawned_at = time.monotonic()
         try:
             self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
@@ -808,7 +810,7 @@ class StrataEngine:
                 self.log.close()
             raise
         proc = self.proc                                 # THIS start's process: a close() from another thread may set self.proc to None meanwhile (#4792)
-        oomd_pacer.start(proc, loading)                  # Linux desktop: keeps systemd-oomd from ending the load (serve/oomd_pacer.py); not on other systems
+        oomd_pacer.start(proc, loading, args=args)                # Linux desktop: keeps systemd-oomd from ending the load (serve/oomd_pacer.py); not on other systems
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
@@ -8062,6 +8064,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         lease = _runtime.acquire_activity_lease(shared=True)
     except Exception:                                  # noqa: BLE001 - serving never depends on the lease
         lease = None
+    last_run = lastrun.begin(os.environ.get("STRATA_RUNTIME_PROFILE")) if lastrun.wants(argv) else None   # P4b: says what happened to the last run, if it did not end normally
     try:
         if os.environ.get("STRATA_BLOCKING_CONSOLE") == "1":
             return _main(argv, lifecycle_event=lifecycle_event, interrupt_exit_code=interrupt_exit_code)
@@ -8069,6 +8072,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         with decoupled_console():
             return _main(argv, lifecycle_event=lifecycle_event, interrupt_exit_code=interrupt_exit_code)
     finally:
+        lastrun.end(last_run)
         if lease is not None:
             try:
                 os.close(lease)

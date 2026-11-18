@@ -11,6 +11,11 @@ excluded with ManagedOOMPreference=omit is spared and the person's terminal is e
 pressure under the limit while the engine loads: this pacer reads the manager's memory.pressure and stops the engine (SIGSTOP) for a few
 seconds when it nears the limit, then continues it (SIGCONT) when the pressure has fallen. The load takes longer, and is not killed.
 
+P4b (0.2.16 retest, p1004): the pause alone did not hold. The pressure that got the engine ended comes from its own 40 GB RAM placement (one thread in one
+long system call: a stop signal is not acted on until it returns), while the user's cgroup still holds an earlier start's file cache that the kernel must
+reclaim inside that call. So make_room() drops that cache of the model's files before the engine starts, and a stop that has not taken hold within 2 s is
+taken back at once (_took_hold). serve/lastrun.py says at the next start what happened to a last run that did not end normally.
+
 Limits: Linux only; only when systemd-oomd is active, the manager's limit is a kill limit and this server runs below `user@UID.service`; only
 before READY; only the engine process this server started; at most PAUSE_BUDGET_S of pausing in all, then it stops pacing and says so; one
 log line per pause. Everything is read-only except the two signals; any problem reading means "not applicable", never a failed start.
@@ -33,6 +38,10 @@ RUN_MIN_S = 3.0                   # after a continue the engine runs at least th
 STOP_FRACTION = 0.70              # stop at 70 % of oomd's limit (35 % of a 50 % limit) ...
 RESUME_FRACTION = 0.30            # ... continue at 30 % of it (15 %): the 10 s average halves about every 7 s
 POLL_S = 0.5
+TRIM_FRACTION = 0.30              # from 30 % of oomd's limit (15 % of a 50 % limit) the model file's cache is given back as it loads ...
+TRIM_EVERY_S = 1.0                # ... at most once a second
+STOP_CONFIRM_S = 2.0              # a stop that has not taken hold after this long is taken back (see Pacer._took_hold)
+STOP_CONFIRM_POLL_S = 0.1
 SIGSTOP = getattr(signal, "SIGSTOP", 19)         # Linux numbers; the module is imported (and tested) on other systems too
 SIGCONT = getattr(signal, "SIGCONT", 18)
 OOMD_FULL_SCALE = 4294967295.0    # systemd's percentage property: 100 % = 2**32 - 1 (ManagedOOMMemoryPressureLimit=2147483648 is 50 %)
@@ -104,24 +113,179 @@ def applicable(environ=None) -> tuple[Path, float] | None:
     return (pressure, limit) if limit else None
 
 
+# ------------------------------------------------------------------------------------------------ make room before the load (P4b)
+# Measured on p1004 (11-18, FIX2-PLAT; rel0216/fix2plat/): the pressure that gets an engine ended does not come from reading the model. It comes from the
+# engine placing its 40 GB of experts in RAM in one go (anonymous memory, one thread, one long system call that SIGSTOP cannot interrupt) while the
+# user's cgroup still holds the file cache of the PREVIOUS start's reads (14 GB): the kernel has to reclaim that cache page by page inside the
+# allocation, and the manager's memory pressure goes to 80 % for 20-30 s (natural cache: peak 79.5 %, 18 s above 50 %; the same load with the model files'
+# cache dropped first: peak 1 %).  So the server drops that cache itself, before it starts the engine: posix_fadvise(DONTNEED) on the files the engine
+# is about to read - clean pages only, nothing is lost but a faster re-read.
+ROOM_MIN_CACHE = 1 << 30            # the manager's file cache is at least 1 GiB ...
+ROOM_FREE_FRACTION = 0.8            # ... and free memory is below 0.8 x the size of the model's files (else there is room without it)
+ROOM_MIN_FREED = 256 << 20          # say it only when at least this much was given back
+ROOM_MAX_FILES = 200000
+_DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", None)
+
+
+def _arg_files(args) -> list[Path]:
+    """The files the engine is about to read: every existing absolute path among its arguments (a folder: the files under it)."""
+    found: list[Path] = []
+    folders: list[Path] = []
+    for item in args:                                    # the named files first (the big model files), then the folders' files (a pack is ~24,000 small ones)
+        text = str(item)
+        if not os.path.isabs(text):
+            continue
+        p = Path(text)
+        try:
+            if p.is_file():
+                found.append(p)
+            elif p.is_dir():
+                folders.append(p)
+        except OSError:
+            continue
+    for folder in folders:
+        for root, _dirs, files in os.walk(folder):
+            for name in files:
+                found.append(Path(root) / name)
+                if len(found) >= ROOM_MAX_FILES:
+                    return found
+    return found
+
+
+def _drop_cache(path: Path) -> bool:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.posix_fadvise(fd, 0, 0, _DONTNEED)
+        return True
+    except (OSError, AttributeError):
+        return False
+    finally:
+        os.close(fd)
+
+
+def _stat_value(cgroup_dir: Path, key: str) -> int | None:
+    try:
+        for line in (cgroup_dir / "memory.stat").read_text(encoding="utf-8").splitlines():
+            name, _, value = line.partition(" ")
+            if name == key:
+                return int(value)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _mem_free() -> int | None:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemFree:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def make_room(args, say=None, environ=None, *, found=None, drop=_drop_cache, cache_of=None, free_of=None, sizes=None) -> int:
+    """Before the engine starts: drop the file cache the user's cgroup holds for the model's files, when this desktop's memory guard watches us and
+    memory is tight (see above).  Returns the bytes given back (0: nothing done).  Never raises.  STRATA_OOMD_ROOM=0 turns it off."""
+    environ = os.environ if environ is None else environ
+    debug = environ.get("STRATA_OOMD_DEBUG") == "1"        # testers: one line saying why nothing was done
+
+    def why(text: str) -> int:
+        if debug:
+            print(f"[strata] memory guard (debug): make_room: {text}", flush=True)
+        return 0
+    try:
+        if environ.get("STRATA_OOMD_ROOM") == "0" or _DONTNEED is None:
+            return why("turned off")
+        if (applicable(environ) if found is None else found) is None:
+            return why("not below a user manager watched by systemd-oomd")
+        cg = manager_cgroup()
+        if cg is None and found is None:
+            return why("no user manager cgroup")
+        cgroup_dir = CGROUP_ROOT / (cg or "").lstrip("/")
+        cache = (cache_of or (lambda: _stat_value(cgroup_dir, "file")))
+        before = cache()
+        if before is None or before < ROOM_MIN_CACHE:
+            return why(f"file cache of the manager {before} < {ROOM_MIN_CACHE}")
+        files = _arg_files(args)
+        total = 0
+        for p in files:
+            try:
+                total += (sizes or (lambda q: q.stat().st_size))(p)
+            except OSError:
+                continue                                   # a broken link or a file that went away: not counted
+        free = (free_of or _mem_free)()
+        if not files or total <= 0 or free is None or free >= ROOM_FREE_FRACTION * total:
+            return why(f"enough room: free {free}, files {len(files)}, bytes {total}")
+        for p in files:
+            drop(p)
+        after = cache()
+        freed = max(0, before - (after if after is not None else before))
+        if freed < ROOM_MIN_FREED and free_of is None:     # the cgroup's counter lags a moment behind: the free memory shows it at once
+            time.sleep(0.3)
+            later = _mem_free()
+            if later is not None:
+                freed = max(freed, later - free)
+        if debug:
+            print(f"[strata] memory guard (debug): make_room: cache {before} -> {after}, {len(files)} files, free {free}", flush=True)
+        if freed >= ROOM_MIN_FREED:
+            (say or (lambda text: print(text, flush=True)))(
+                f"[strata] memory guard: freed {freed / 1e9:.0f} GB of memory that still held copies of this model's files from an earlier start, "
+                "so that loading does not run short of memory and this desktop (systemd-oomd) does not end it")
+        return freed
+    except Exception as exc:                             # noqa: BLE001 - a nicety, never a reason for a start to fail
+        return why(f"error {type(exc).__name__}: {exc}")
+
+
+def process_state(pid: int) -> str | None:
+    """The state letter of a process from /proc/<pid>/stat ('R', 'S', 'D', 'T' ...), or None when it cannot be read."""
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        return text[text.rindex(")") + 2:].split()[0]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 class Pacer:
     """The loop, with its clock, its pressure reader and its signal sender as arguments so that a test can drive it."""
 
     def __init__(self, pid: int, read, limit: float, say, *, alive, kill=os.kill, now=time.monotonic, sleep=time.sleep,
-                 budget: float = PAUSE_BUDGET_S):
+                 budget: float = PAUSE_BUDGET_S, state=None, trim=None):
+        self.trim, self.last_trim, self.trimmed = trim, -TRIM_EVERY_S, False
         self.pid, self.read, self.say, self.alive = pid, read, say, alive
         self.kill, self.now, self.sleep, self.budget = kill, now, sleep, budget
+        self.state = state                       # () -> the process's state letter ("T" = stopped), or None; None: a stop is taken for granted
         self.stop_at, self.resume_at = limit * STOP_FRACTION, limit * RESUME_FRACTION
         self.limit = limit
         self.pauses = 0
+        self.unstoppable = 0
         self.paused_s = 0.0
         self.stopped = False
+
+    def _maybe_trim(self, value) -> None:
+        """While memory is tight, give back the model file's cache as the load goes (see trim_files): the engine reads the file once, so the pages behind
+        it are of no use, and keeping them makes every new page a reclaim stall (measured: pressure 90 % with 10 GB free)."""
+        if self.trim is None or value is None or value < self.limit * TRIM_FRACTION or self.now() - self.last_trim < TRIM_EVERY_S:
+            return
+        self.last_trim = self.now()
+        try:
+            self.trim()
+        except Exception:                                  # noqa: BLE001
+            return
+        if not self.trimmed:
+            self.trimmed = True
+            self.say("[strata] memory guard: memory is tight, so the memory that holds copies of the model's file is given back as it loads "
+                     "(this does not slow the load)")
 
     def run(self, loading: threading.Event) -> None:
         last_cont = self.now() - RUN_MIN_S
         try:
             while self.alive() and not loading.is_set():
                 value = self.read()
+                self._maybe_trim(value)
                 if value is not None and value >= self.stop_at and self.now() - last_cont >= RUN_MIN_S:
                     if self.paused_s >= self.budget:
                         self.say(f"[strata] memory guard: the engine was paused for {self.paused_s:.0f} s in all and is not paused any more; "
@@ -136,16 +300,38 @@ class Pacer:
             if self.pauses and loading.is_set():
                 self.say(f"[strata] memory guard: the load needed {self.pauses} short pause(s), {self.paused_s:.0f} s in all, so that this desktop did not end it")
 
+    def _took_hold(self) -> bool:
+        """Did the stop take hold within STOP_CONFIRM_S?  A stop signal is acted on by ONE thread of the engine when it returns to user code; while that
+        thread is inside one long system call (the engine placing its 40 GB of experts in RAM, 20-40 s under memory pressure: measured on p1004) the
+        whole engine goes on running and the pressure keeps rising.  Then the stop is taken back at once (SIGCONT drops it), so that it cannot hit
+        later, when the call returns and the pressure is already falling."""
+        if self.state is None:
+            return True
+        end = self.now() + STOP_CONFIRM_S
+        while True:
+            letter = self.state()
+            if letter is None or letter == "T":
+                return True
+            if not self.alive():
+                return True
+            if self.now() >= end:
+                return False
+            self.sleep(STOP_CONFIRM_POLL_S)
+
     def _pause(self, value: float, loading: threading.Event) -> None:
-        self.pauses += 1
-        self.say(f"[strata] memory guard: this desktop (systemd-oomd) ends a program when memory has been under strain for 20 s "
-                 f"(now {value:.0f} %, its limit {self.limit:.0f} %). The engine waits a few seconds while memory settles (pause {self.pauses}).")
         start = self.now()
         try:
             self.kill(self.pid, SIGSTOP)
         except OSError:
             return
         self.stopped = True
+        if not self._took_hold():
+            self._cont()
+            self.unstoppable += 1
+            return
+        self.pauses += 1
+        self.say(f"[strata] memory guard: this desktop (systemd-oomd) ends a program when memory has been under strain for 20 s "
+                 f"(now {value:.0f} %, its limit {self.limit:.0f} %). The engine waits a few seconds while memory settles (pause {self.pauses}).")
         try:
             while self.alive() and not loading.is_set() and self.now() - start < PAUSE_MAX_S and self.paused_s + (self.now() - start) < self.budget:
                 v = self.read()
@@ -177,7 +363,13 @@ def killed_words(rc, environ=None) -> str:
             "and a large model loading can do that. Close other programs and start again; a text console or an ssh login is not watched by it.")
 
 
-def start(proc, loading: threading.Event, say=None) -> threading.Thread | None:
+def trim_files(args) -> list[Path]:
+    """The big model file the engine reads its experts from, once: the path after --native (not the PLE table, which is read at random later)."""
+    items = [str(a) for a in args]
+    return [Path(items[i + 1]) for i, a in enumerate(items[:-1]) if a == "--native" and os.path.isabs(items[i + 1]) and Path(items[i + 1]).is_file()]
+
+
+def start(proc, loading: threading.Event, say=None, args=None) -> threading.Thread | None:
     """Pace `proc` (the engine this server just started) until `loading` is set (READY) or it ends. None when pacing does not apply here.
     Never raises."""
     try:
@@ -192,7 +384,9 @@ def start(proc, loading: threading.Event, say=None) -> threading.Thread | None:
                 return avg10(pressure.read_text(encoding="utf-8"))
             except OSError:
                 return None
-        pacer = Pacer(proc.pid, read, limit, say, alive=lambda: proc.poll() is None)
+        targets = trim_files(args or []) if os.environ.get("STRATA_OOMD_TRIM") != "0" else []
+        pacer = Pacer(proc.pid, read, limit, say, alive=lambda: proc.poll() is None, state=lambda: process_state(proc.pid),
+                      trim=(lambda: [_drop_cache(p) for p in targets]) if targets else None)
         thread = threading.Thread(target=pacer.run, args=(loading,), name="strata-oomd-pacer", daemon=True)
         thread.start()
         return thread
