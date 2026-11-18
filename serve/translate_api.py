@@ -250,39 +250,44 @@ def html_jobs(doc: str) -> tuple:
     return sp.pieces, texts
 
 
-def _marked(run: _Run) -> str:
+def _marks(run: _Run) -> list:
+    """The tags' marks as (close, number, raw tag), in the run's order.  Text is not counted: a citation like [1]
+    in the source is not a tag's mark and never gets a tag put in its place."""
     out: list = []
     stack: list = []
     n = 0
     for kind, s in run.parts:
-        if kind == "text":
-            out.append(s)
-        elif s.startswith("</"):
-            out.append("[/%d]" % (stack.pop() if stack else 0))
+        if kind != "tag":
+            continue
+        if s.startswith("</"):
+            out.append(("/", str(stack.pop() if stack else 0), s))
         else:
             n += 1
             stack.append(n)
-            out.append("[%d]" % n)
+            out.append(("", str(n), s))
+    return out
+
+
+def _marked(run: _Run) -> str:
+    out: list = []
+    marks = iter(_marks(run))
+    for kind, s in run.parts:
+        if kind == "text":
+            out.append(s)
+        else:
+            close, num, _ = next(marks)
+            out.append("[/%s]" % num if close else "[%s]" % num)
     return "".join(out)
 
 
 def _unmarked(run: _Run, translated: str) -> str | None:
     """The translation of a run with its tags back in place of the marks, escaped; None when the marks did not come
     back as they went (the caller translates the run's text pieces one by one then)."""
-    starts = [s for k, s in run.parts if k == "tag" and not s.startswith("</")]
-    ends = [s for k, s in run.parts if k == "tag" and s.startswith("</")]
-    want = sorted(_MARK.findall(_marked(run)))
-    if sorted(_MARK.findall(translated)) != want:
+    marks = _marks(run)
+    if sorted(_MARK.findall(translated)) != sorted((close, num) for close, num, _ in marks):
         return None
-    opened, closed = {}, {}
-    i = j = 0
-    for close, num in _MARK.findall(_marked(run)):
-        if close:
-            closed[num] = ends[j]
-            j += 1
-        else:
-            opened[num] = starts[i]
-            i += 1
+    opened = {num: tag for close, num, tag in marks if not close}
+    closed = {num: tag for close, num, tag in marks if close}
     out, last = [], 0
     for m in _MARK.finditer(translated):
         out.append(html.escape(translated[last:m.start()], quote=False))
