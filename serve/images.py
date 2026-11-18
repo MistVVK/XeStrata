@@ -3631,7 +3631,7 @@ class ImageGen:
                         continue
                     run = job.get("steps_run", job["steps"])
                     self.progress = (i * run, job["n"] * run)
-                    self._live(image=i + 1, step=0, steps=run,
+                    self._live(image=job.get("live_image", i + 1), step=0, steps=run,
                                stage="refs" if job.get("refs") or job.get("init") else "text", sampling_at=None)
                     out = work / f"img_{i}.rgba"
                     shows = partial_steps(run, job.get("partial_images") or 0) if preview is not None else []
@@ -5889,6 +5889,7 @@ def fix_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = N
                     done.append({**entry, "skipped": f"budget_s {budget:g} s"})
                     continue
                 one = fix_job(gen, job, current, region, seed)
+                one["live_image"] = i + 1   # the Monitor's image i of the job's n (run() counts its own one)
                 gen._live(piece=k + 1, pieces=len(regions), piece_kind="part")
                 made, fig = gen.run(one, cancel)
                 current = made[0]
