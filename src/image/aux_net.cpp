@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
@@ -39,10 +40,21 @@ AuxNet::AuxNet(const std::string& path, const char* what)
     for (const auto& t : st_->tensors()) file_bytes_ += t.second.end - t.second.begin;
 }
 
-// The base's own scratch and the weights: a derived part's drop_scratch is gone by now (its members with it)
+// The base's own scratch and the weights: a derived part's drop_scratch is gone by now (its members with it).  The
+// stream goes last: the auxiliary models are let go before an image job and made again for the next tool's run, and
+// a queue kept of each would pile up (Runtime::finish drains them all); its belongings (the RoPE tables, the
+// attention's scratch) go with it.
 AuxNet::~AuxNet() {
     AuxNet::drop_scratch();
     free_weights();
+    if (s_ != nullptr) {
+        try {
+            core::Runtime::get().destroy_stream(static_cast<sycl::queue*>(s_));
+        } catch (const std::exception& e) {   // a lost device: the queue goes with it
+            std::fprintf(stderr, "image engine (%s): its queue at its end: %s\n", what_.c_str(), e.what());
+        }
+        s_ = nullptr;
+    }
 }
 
 void* AuxNet::alloc(size_t bytes) {

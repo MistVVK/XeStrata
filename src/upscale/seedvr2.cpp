@@ -518,10 +518,15 @@ Seedvr2::Seedvr2(const std::string& path) : impl_(std::make_unique<Impl>()) {
 }
 
 Seedvr2::~Seedvr2() {
+    void* s = impl_->s;
     try {
         impl_->drop_scratch();
-        core::Runtime::get().stream(impl_->s).wait();
-    } catch (const std::exception& e) {
+        core::Runtime::get().stream(s).wait();
+        impl_.reset();   // the VAE's and the DiT's weights go before their queue
+        // the upscaler is made again for the next two-stage upscale: a queue kept of each would pile up
+        // (Runtime::finish drains them all); its belongings (the attention's workspace and scratch) go with it
+        core::Runtime::get().destroy_stream(static_cast<sycl::queue*>(s));
+    } catch (const std::exception& e) {   // a lost device: the queue goes with it
         std::fprintf(stderr, "xestrata-image: SeedVR2's queue at its end: %s\n", e.what());
     }
 }
