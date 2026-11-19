@@ -520,7 +520,13 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
             std::ifstream limit_file(path / "memory.limit_in_bytes"), usage_file(path / "memory.usage_in_bytes");
             uint64_t cap = 0, usage = 0;
             if (limit_file >> cap && usage_file >> usage && cap < (1ull << 62)) {
-                bytes = std::min(bytes, usage < cap ? cap - usage : 0);
+                // usage_in_bytes charges the whole page cache, which the kernel evicts before it fails an allocation at the limit
+                // (a container that read its model through the file cache sat at its limit: "only 0.1 GiB of RAM is free"): the
+                // clean file pages of the group's memory.stat count as room, as on the v2 path above (no memory.stat: none)
+                std::ifstream stat_file(path / "memory.stat");
+                std::ostringstream stat_text;
+                if (stat_file) stat_text << stat_file.rdbuf();
+                bytes = std::min(bytes, strata::core::arena_cgroup_room_v1(cap, usage, stat_text.str(), inactive_only).room);
                 m.cgroup_limit = std::min(m.cgroup_limit, cap);
             }
             if (path == mroot) break;

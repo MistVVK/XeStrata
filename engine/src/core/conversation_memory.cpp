@@ -92,6 +92,18 @@ ArenaCgroupRoom arena_cgroup_room(uint64_t limit, uint64_t current, const std::s
     return r;
 }
 
+ArenaCgroupRoom arena_cgroup_room_v1(uint64_t limit, uint64_t usage, const std::string& stat_text, bool inactive_only) {
+    ArenaCgroupRoom r;
+    r.applies = true;
+    const CacheCredit c = cache_credit_from_stat(stat_text, usage, true);
+    uint64_t credit = inactive_only ? c.inactive : c.lists;   // <= usage
+    credit -= std::min(credit / 2, limit / 64);
+    r.credit = credit;
+    const uint64_t used = usage - credit;
+    r.room = used < limit ? limit - used : 0;
+    return r;
+}
+
 namespace {
 std::atomic<uint64_t> g_locked_own_file_bytes{0};
 }
