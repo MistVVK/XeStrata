@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import sys
+import tempfile
 import time
 
 ENGINE = pathlib.Path(__file__).resolve().parents[1]
@@ -96,7 +98,13 @@ def main() -> int:
     install_policy()
     import convert_hf_to_gguf as C  # noqa: E402  (after the policy is installed on the class)
 
-    argv = [str(model), "--outtype", "q8_0", "--outfile", str(out)]
+    # The converter repacks the NVFP4 experts eagerly (one merged tensor per layer and projection) and the GGUF writer
+    # keeps every added tensor in RAM until the file is written: ~76 GB for Qwen3.8-Flash-Next. --use-temp-file spools
+    # each tensor to a temporary file as it is added, so RAM stays at about one layer. The temporary file needs as much
+    # disk as the output; it goes next to the output unless TMPDIR names another folder.
+    if not os.environ.get("TMPDIR"):
+        tempfile.tempdir = str(out.parent)
+    argv = [str(model), "--outtype", "q8_0", "--outfile", str(out), "--use-temp-file"]
     if a.dry_run:
         argv.append("--dry-run")
     sys.argv = ["convert_hf_to_gguf.py"] + argv

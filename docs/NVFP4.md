@@ -36,6 +36,9 @@ python terminal/tools/iq_pack.py --gguf <model>.gguf --out <pack dir>
 - `nvfp4_convert.py` runs llama.cpp's own converter (`third_party/llama.cpp`, the commit setup pins) with the type
   policy the engine needs. The experts are repacked without loss. `terminal/tools/nvfp4_verify.py` compares them with the
   checkpoint bit for bit, and `terminal/tools/nvfp4_verify_gguf.py` checks the GGUF.
+  - Each tensor goes to a temporary file as it is converted, so the conversion needs about 3 GB of RAM, and free disk
+    for the GGUF twice (~76 GB each for Qwen3.8-Flash-Next). The temporary file is next to `--outfile`; `TMPDIR` puts
+    it on another disk.
   - The small projections the BF16 kernels read (routers, SSM gates, indexer, PLE and hyper-connection projections) are
     written as BF16.
   - Everything served natively goes to Q8_0: attention, `ssm_out`, the shared experts, the output head and the token
