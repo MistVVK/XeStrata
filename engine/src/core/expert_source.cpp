@@ -1048,6 +1048,35 @@ FileExpertSource::~FileExpertSource() {
     close();
 }
 
+#if !defined(_WIN32)
+namespace {
+// STRATA_EXPERTS_SEQ_READAHEAD=1 (Linux, opt-in, read once): the mapped expert files - a pack's experts.bin, or each
+// GGUF shard in place - are marked MADV_SEQUENTIAL when they are mapped.  Seen on a 32 GB Linux PC whose experts do not
+// fit the file cache (RX 6900 XT, Gyro-M's 29.9 GiB experts.bin on NVMe RAID0, kernel 7.2): with no hint the mapping's
+// faults read one 4 KiB page each once the file cache thrashed - about 2 million major faults for a 700-token follow-up
+// turn, the drive at a few hundred MB/s of the ~25 GB/s it can read - and with the hint each fault reads the device's
+// read-ahead window.  Only the kernel's read-ahead changes: the bytes read, and so the products, are the same.  Set once
+// here, not per prompt: switching the hint on for each prompt read and off after stalled the batched prompt path (#29)
+// in 3 of 5 runs on that PC (with --adapt-swaps 0).  Unset: nothing here runs.
+void advise_mapped_experts(void* view, size_t bytes, const std::string& path) {
+#if defined(__linux__)
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_EXPERTS_SEQ_READAHEAD");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!on) return;
+    const int rc = madvise(view, bytes, MADV_SEQUENTIAL);
+    std::fprintf(stderr, "FileExpertSource: STRATA_EXPERTS_SEQ_READAHEAD=1: %s is read with sequential read-ahead%s\n",
+                 path.c_str(), rc == 0 ? "" : " (madvise failed: the default read-ahead stays)");
+#else
+    (void) view;
+    (void) bytes;
+    (void) path;
+#endif
+}
+}   // namespace
+#endif
+
 #if defined(__linux__)
 namespace {
 /// Bytes of [p, p + n) whose pages are in the page cache (mincore, page-granular); 0 when the call fails.
@@ -1619,6 +1648,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     }
     void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, 0);
     if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
+    advise_mapped_experts(view, (size_t) want, path);
     fd_ = fd;
     base_ = (const uint8_t*) view;
     paths_.assign(1, path);   // #286: open_direct opens it again with O_DIRECT
@@ -1820,6 +1850,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
                 }
                 void* view = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
                 if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: cannot map " + path; return false; }
+                advise_mapped_experts(view, (size_t) st.st_size, path);
                 m.fd = fd;
                 m.bytes = (uint64_t) st.st_size;
                 m.base = (const uint8_t*) view;

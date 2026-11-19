@@ -320,6 +320,28 @@ The weights and the MTP draft files are asked for ahead of their reads at start 
 steps), which matters on a slow drive: `STRATA_READ_AHEAD=0` turns it off, `STRATA_FILL_AHEAD=N` sets how many fill pairs
 are requested ahead (default 256).
 
+**Sequential read-ahead on the mapped experts (Linux, opt-in).** `STRATA_EXPERTS_SEQ_READAHEAD=1` marks the mapped expert
+files (`experts.bin`, or the GGUF shards in place) `MADV_SEQUENTIAL` when they are mapped. When the experts outside the GPU
+are much larger than the file cache, the kernel can stop reading ahead on the mapping: each page fault then reads one 4 KiB
+page, and a prompt waits on hundreds of thousands of small reads. With the variable each fault reads the drive's read-ahead
+window. The answers are the same. Measured on one PC: RX 6900 XT 16 GB, Ryzen 9 9950X, 32 GB RAM, Gyro-M (a 29.9 GiB
+`experts.bin` on two NVMe SSDs in RAID0), Linux 7.2, `--adapt-swaps 0`, a cold page cache before each run, the same binary
+with and without the variable (2 runs without, 4 with):
+
+| | Without | With |
+| --- | ---: | ---: |
+| Five follow-up turns of 650 to 970 new tokens | 65.2 / 76.2 s | 23.5 to 28.4 s |
+| One follow-up turn | 5.7 to 28.6 s | 4.4 to 6.3 s |
+| Major page faults in one follow-up turn | 15,000 to 1,350,000 | 73,000 to 115,000 |
+| A 20K-token first prompt | 31.0 / 31.9 s | 23.9 to 32.4 s |
+| An 800-token answer at 24K context | 32.8 / 43.9 tok/s | 42.0 to 52.2 tok/s |
+
+Without the variable a turn took about 6 s while the kernel kept reading ahead (about 15,000 faults) and 15 to 29 s once it
+stopped (0.5 to 1.35 million); in two more runs without it the first prompt took 28.6 s with 60,000 faults and 120.5 s with
+7.6 million. With adaptive swaps on (the default) that PC stopped long sessions with and without the variable (#4566), so
+these runs had them off. Not measured: a PC whose file cache holds the experts, a slower drive (the decode's scattered
+misses also read a whole window there).
+
 The prompt chunk follows the host's memory (Linux, file tier, on by default). When the page cache is smaller than the file
 set, a planner picks the chunk and ring with the fewest predicted bytes read per prompt from the RAM copy, the page cache that
 is left, the drive class and the PCIe link. It prints `chunk 8192 -> 3840, ring 96 -> 96: ...` when it changes the pick and
