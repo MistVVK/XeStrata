@@ -1434,6 +1434,63 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // makes side i depend on everything captured on `cs` so far, join(i) makes `cs` depend on everything captured on
     // side i: a branch never races with what came before its fork or after its join.  Not in a split or batch window,
     // nor under the stage profiler (whose stamps are on `cs`).
+    // BW-5 (STRATA_L2_PF=1, default off; CUDA only): while the graph waits for the CPU experts' rows, a low-priority side
+    // stream pulls the NEXT layer's dense weights (the GGUF-form projections, the hyper-connection and router weights,
+    // the shared expert's) into the L2 cache with prefetch hints.  The hints read and write nothing: the window's values
+    // are the same bits.  STRATA_L2_PF_MIB=n keeps only the first n MiB of a layer's weights (in the order the layer
+    // reads them), STRATA_L2_PF_BLOCKS the grid size.  One-token and all-resident windows are left alone.
+    static const int l2pf_env = [] { const char* e = std::getenv("STRATA_L2_PF"); return e != nullptr ? std::atoi(e) : 0; }();
+    std::vector<strata::kernels::L2PrefetchSet> l2pf;
+#if defined(STRATA_USE_HIP)
+    constexpr bool l2pf_cuda = false;   // the prefetch hint kernel is CUDA only
+#else
+    constexpr bool l2pf_cuda = true;
+#endif
+    if (l2pf_cuda && l2pf_env != 0 && G == 1 && !batch_rec_ && !prof_on_ && !ar_on()) {
+        static const long l2pf_mib = [] { const char* e = std::getenv("STRATA_L2_PF_MIB"); return e != nullptr ? std::atol(e) : 0L; }();
+        l2pf.resize((size_t) g.n_layers);
+        std::vector<std::vector<std::pair<int, std::pair<const void*, uint64_t>>>> per((size_t) g.n_layers);
+        for (const auto& kv : wt.all()) {
+            const std::string& nm = kv.first;
+            if (nm.compare(0, 4, "blk.") != 0) continue;
+            char* endp = nullptr;
+            const long li = std::strtol(nm.c_str() + 4, &endp, 10);
+            if (endp == nm.c_str() + 4 || li < 0 || li >= (long) g.n_layers) continue;
+            const WeightRef& w = kv.second;
+            const void* p = nullptr;
+            uint64_t b = 0;
+            if (w.hc_q8 != nullptr) { p = w.hc_q8; b = (uint64_t) w.elements / 32 * 34; }
+            else if (w.native_data != nullptr) { p = w.native_data; b = w.native_bytes; }
+            else if (w.data != nullptr && w.resident) { p = w.data; b = w.bytes; }
+            if (p == nullptr || b == 0) continue;
+            // the order the layer reads them: the attention-side hyper-connection, the mixer / projections, the FFN side
+            const int rank = nm.find("hc_attn_") != std::string::npos ? 0
+                             : (nm.find("attn_") != std::string::npos || nm.find("ssm_") != std::string::npos || nm.find("indexer") != std::string::npos) ? 1
+                             : nm.find("hc_ffn_") != std::string::npos ? 2
+                             : nm.find("gate_inp") != std::string::npos ? 3 : 4;
+            per[(size_t) li].push_back({rank, {p, b}});
+        }
+        uint64_t max_layer = 0;
+        for (int64_t li = 0; li < g.n_layers; ++li) {
+            auto& v = per[(size_t) li];
+            std::stable_sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            uint64_t kept = 0;
+            for (const auto& e : v) {
+                if (l2pf_mib > 0 && kept >= (uint64_t) l2pf_mib << 20) break;
+                uint64_t b = e.second.second;
+                if (l2pf_mib > 0 && kept + b > ((uint64_t) l2pf_mib << 20)) b = ((uint64_t) l2pf_mib << 20) - kept;
+                l2pf[(size_t) li].add(e.second.first, b);
+                kept += b;
+            }
+            max_layer = std::max<uint64_t>(max_layer, (uint64_t) l2pf[(size_t) li].total_bytes);
+        }
+        static bool l2pf_said = false;
+        if (!l2pf_said) {
+            l2pf_said = true;
+            std::fprintf(stderr, "strata: STRATA_L2_PF=%d: next-layer dense-weight L2 prefetch while the window waits for CPU experts (largest layer %.1f MiB%s)\n",
+                         l2pf_env, (double) max_layer / 1048576.0, l2pf_mib > 0 ? ", capped" : "");
+        }
+    }
     const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_ && !side_mixer;   // STRATA_SIDE_MIXER wins
     auto fork = [&](int i) {
         cudaEventRecord(df_fork_, cs);
@@ -2478,6 +2535,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
             grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
             stamp(l, 22, grp);
+            if (!l2pf.empty() && !device_plan_ && l + 1 < le_ && l2pf[(size_t) (l + 1)].n > 0 && sh_stream_on() && sh_cs_ != nullptr &&
+                ev_fork_ != nullptr && ev_join_ != nullptr) {
+                // BW-5: the wait for the CPU's rows starts here: pull the next layer's dense weights into L2 meanwhile (the join
+                // below the CPU rows is the one the shared expert's fork already uses)
+                note_prio_fork(cs);
+                cudaEventRecord(ev_fork_, cs);
+                cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+                strata::kernels::l2_prefetch_ranges(l2pf[(size_t) (l + 1)], sh_cs_);
+                note_prio_tail(sh_cs_, -1);
+                cudaEventRecord(ev_join_, sh_cs_);
+            }
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,

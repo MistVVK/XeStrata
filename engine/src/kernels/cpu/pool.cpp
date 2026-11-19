@@ -686,6 +686,11 @@ int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
+// STRATA_DIAG_POOL=1: time the parts of run_split_multi_native (measuring build only)
+bool diag_pool_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DIAG_POOL"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 // CBA: one plain global, written by the constructor and destructor of the pool that owns it; fine while pools are
 // built and destroyed on one thread (generate's measure pools, then the main one), an atomic owner if that changes.
 NumaSplitPlan g_numa_plan;
@@ -836,6 +841,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     plan_logical_ = plan_in.logical;
     if (n_ < 1) n_ = 1;
     scratch_.resize((size_t) n_);
+    dg_w_.reset(new DiagW[(size_t) n_ + 1]);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
@@ -935,7 +941,27 @@ std::string ExpertPool::placement_line() const {
     return s;
 }
 
+void ExpertPool::diag_pool_print(const char* why) {
+    int64_t busy = 0, wake = 0, tasks = 0;
+    for (int i = 0; i < n_; ++i) {
+        busy += dg_w_[(size_t) i].busy.load(std::memory_order_relaxed);
+        wake += dg_w_[(size_t) i].wake.load(std::memory_order_relaxed);
+        tasks += dg_w_[(size_t) i].tasks.load(std::memory_order_relaxed);
+    }
+    const int64_t hbusy = dg_w_[(size_t) n_].busy.load(std::memory_order_relaxed);
+    const int64_t htasks = dg_w_[(size_t) n_].tasks.load(std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "strata diag-pool (%s): calls %lld batches %lld phases %lld experts %lld entries %lld workers %d host_works %d "
+                 "numa_slices %d run_ms %.3f wp_before_ms %.3f phase_ms %.3f wp_after_ms %.3f quant_ms %.3f "
+                 "worker_busy_ms %.3f worker_wake_ms %.3f worker_tasks %lld host_busy_ms %.3f host_tasks %lld\n",
+                 why, (long long) dg_calls_, (long long) dg_batches_, (long long) dg_phases_, (long long) dg_experts_,
+                 (long long) dg_entries_, n_, host_works_ ? 1 : 0, numa_n_, dg_run_ns_ / 1e6, dg_wp_before_ns_ / 1e6,
+                 dg_phase_ns_ / 1e6, dg_wp_after_ns_ / 1e6, dg_quant_ns_ / 1e6, busy / 1e6, wake / 1e6, (long long) tasks,
+                 hbusy / 1e6, (long long) htasks);
+}
+
 ExpertPool::~ExpertPool() {
+    if (diag_pool_on() && dg_calls_ > 0) diag_pool_print("end");
     const ExpertPool* self = this;
     g_diag_pool.compare_exchange_strong(self, nullptr);
     if (g_numa_owner == this) {
@@ -1016,6 +1042,8 @@ void ExpertPool::worker(int id) {
         if (stop_.load(std::memory_order_acquire)) return;
         // acquire: the batch this epoch published (`head`, and the description before it) is visible from here
         seen = epoch_.load(std::memory_order_acquire);
+        if (diag_pool_on() && mode_ >= 5)
+            dg_w_[(size_t) id].wake.fetch_add(now_ns() - dg_pub_ns_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         parked_of(id).fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
 
         // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more.
@@ -1173,6 +1201,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         if (!sliced) ci = claim(epoch);
         if (ci < 0) break;
         const uint32_t i = (uint32_t) ci;
+        const bool dg_task = diag_pool_on() && mode_ >= 5;
+        const int64_t dg_t0 = dg_task ? now_ns() : 0;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
         if (mode_ == 0) {
@@ -1261,6 +1291,11 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 r += r1 - r0;
             }
         }
+        if (dg_task) {
+            DiagW& w = dg_w_[(size_t) (id >= 0 ? id : n_)];
+            w.busy.fetch_add(now_ns() - dg_t0, std::memory_order_relaxed);
+            w.tasks.fetch_add(1, std::memory_order_relaxed);
+        }
         if (sliced) {
             NodeSync& ns = nsync_[(size_t) s];
             const uint32_t t = (uint32_t) ns.tasks;
@@ -1274,13 +1309,25 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
+    const bool dg = diag_pool_on() && mode >= 5;
+    const int64_t dg_a = dg ? now_ns() : 0;
     wait_parked("before a phase");
+    const int64_t dg_b = dg ? now_ns() : 0;
     mode_ = mode;
     njobs_ = n_tasks;
+    if (dg) dg_pub_ns_.store(now_ns(), std::memory_order_relaxed);   // before the publish: the workers' wake starts here
     const uint32_t e = begin_batch(n_tasks);
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
+    const int64_t dg_c = dg ? now_ns() : 0;
     wait_parked("after a phase");
+    if (dg) {
+        const int64_t dg_d = now_ns();
+        dg_wp_before_ns_ += dg_b - dg_a;
+        dg_phase_ns_ += dg_c - dg_pub_ns_.load(std::memory_order_relaxed);
+        dg_wp_after_ns_ += dg_d - dg_c;
+        ++dg_phases_;
+    }
     // Each slice's stamp is stored after its last `done` increment, so `wait_done` can return before it lands; the
     // thread that stored it has parked again since (it left the park to claim), and that re-park is what the wait
     // above acquired.  So the stamps are read here, not in `wait_done`.
@@ -1378,10 +1425,22 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
         ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
         ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+        if (diag_pool_on()) {
+            ++dg_batches_;
+            dg_quant_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(c - b).count();
+        }
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
-    ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const auto t_end = std::chrono::steady_clock::now();
+    ms_drain_ += std::chrono::duration<double, std::milli>(t_end - t0).count();
+    if (diag_pool_on()) {
+        ++dg_calls_;
+        dg_experts_ += n;
+        for (int e = 0; e < n; ++e) dg_entries_ += jobs[e].nt;
+        dg_run_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t0).count();
+        if (dg_calls_ % 2000 == 0) diag_pool_print("running");
+    }
 }
 
 void ExpertPool::run(ExpertJob* jobs, int n) {
