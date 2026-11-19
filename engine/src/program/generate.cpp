@@ -7604,9 +7604,7 @@ int main(int argc, char** argv) {
     const bool pm_read_wide = [] {
         // (opt-in here: the PR had it on whenever STRATA_SLOT_READ was not "0", which would have widened every pipelined
         // group's window - VRAM and graphs - for a run that never reads a turn in a slot)
-        const char* w = std::getenv("STRATA_SLOT_READ_WIDE");
-        const char* r = std::getenv("STRATA_SLOT_READ");
-        return w != nullptr && w[0] != '\0' && w[0] != '0' && r != nullptr && r[0] != '\0' && r[0] != '0';
+        return strata::program::batch_groups::slot_read_wide_on(std::getenv("STRATA_SLOT_READ"), std::getenv("STRATA_SLOT_READ_WIDE"));
     }();
     auto pm_group_rows = [&]() -> int {
         const int gs = o.batch_groups > 1 && o.batch > 0 ? std::max(1, o.batch / o.batch_groups) : std::max(1, o.batch);
@@ -16696,10 +16694,7 @@ int main(int argc, char** argv) {
         // has passed the stages.  A decode window waits for its verdict; prompt rows are known and all kept, so each
         // stage commits such a window as it launches it and the slot's state there is the next window's start.  A
         // slot that reads alone otherwise has one window in the pipeline and every stage idle half the time.
-        const bool slot_read_ahead = slot_read_wide && [] {
-            const char* e = std::getenv("STRATA_SLOT_READ_AHEAD");
-            return e != nullptr && e[0] != '\0' && e[0] != '0';
-        }();
+        const bool slot_read_ahead = slot_read_wide && strata::program::batch_groups::switch_on(std::getenv("STRATA_SLOT_READ_AHEAD"));
         if (slot_read)
             std::fprintf(stderr, "strata generate: STRATA_SLOT_READ: an idle slot reads the next turn of the conversation it "
                                  "holds in its own windows, %d tokens a window%s, beside the other slots (turns of up to %lld "
