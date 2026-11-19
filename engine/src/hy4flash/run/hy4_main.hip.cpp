@@ -23,8 +23,8 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".";
-    bool load_only = false, dump = false, all_logits = false, no_engram = false;
-    int gen = 0, max_ctx = 0, chunk = 512;
+    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false;
+    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -39,6 +39,9 @@ int main(int argc, char** argv) {
         else if (a == "--dump") dump = true;
         else if (a == "--all-logits") all_logits = true;
         else if (a == "--no-engram") no_engram = true;
+        else if (a == "--index-topk") index_topk = atoi(nxt().c_str());
+        else if (a == "--no-index") no_index = true;
+        else if (a == "--prof") prof = true;
         else {
             fprintf(stderr, "unknown arg %s\n", a.c_str());
             return 2;
@@ -73,17 +76,38 @@ int main(int argc, char** argv) {
     Runner r(g, max_ctx, std::max(chunk, 1));
     r.dump = dump;
     r.dump_dir = out_dir;
+    r.index_topk = index_topk;
+    r.index_on = no_index ? 0 : 1;
+    r.prof = prof;
     std::string err;
     if (!r.init(no_engram ? std::string() : engram, err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
         return 1;
     }
     tok.reserve(max_ctx + 8);
+    if (prof && r.engram_ready) {
+        // random 4 KiB read probe: pages/s with 16 threads x qd 8
+        const size_t NP = 20000;
+        std::vector<uint64_t> pg(NP);
+        uint64_t s = 88172645463325252ull;
+        for (auto& v : pg) {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            v = r.eio.sec4_offset() / 4096 + (s % r.eio.total_pages());
+        }
+        uint8_t* buf = (uint8_t*)engram_aligned_alloc(NP * 4096);
+        double tp = now_s();
+        std::string e2;
+        bool okp = r.eio.file().read_pages(pg.data(), NP, buf, 16, 8, e2);
+        double dtp = now_s() - tp;
+        fprintf(stderr, "[engram-probe] %zu random pages in %.3f s = %.0f pages/s (%.0f MB/s) ok=%d %s\n", NP, dtp, NP / dtp, NP * 4096 / dtp / 1e6, (int)okp, e2.c_str());
+        engram_aligned_free(buf);
+    }
     std::string top_out;
     // prefill in chunks
     double t0 = now_s();
     int done = 0;
     int V = r.c.vocab;
+    r.prefetch_engram(tok.data(), 0, std::min(r.Tc, T0));
     std::vector<float> hl;
     while (done < T0) {
         int T = std::min(r.Tc, T0 - done);
@@ -92,6 +116,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         done += T;
+        if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
         bool last = done == T0;
         if (last) {
             int first = all_logits ? 0 : T - 1;
@@ -108,6 +133,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[prefill] %d/%d tokens, %.2f s, %.1f tok/s\n", done, T0, now_s() - t0, done / (now_s() - t0));
     }
     double t_pf = now_s() - t0;
+    r.prof_report("prefill");
     printf("%s", top_out.c_str());
     fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram cpu %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_cpu);
     // greedy decode
@@ -141,6 +167,7 @@ int main(int argc, char** argv) {
         }
         double td = now_s() - t1;
         printf("generated ids: %s\n", gen_ids.c_str());
+        r.prof_report("decode");
         std::sort(times.begin(), times.end());
         fprintf(stderr, "[decode] %zu tokens in %.2f s = %.2f tok/s (median step %.1f ms)\n", times.size(), td, times.size() / td, times.empty() ? 0.0 : times[times.size() / 2] * 1000);
         std::ofstream f(out_dir + "/gen_ids.txt");

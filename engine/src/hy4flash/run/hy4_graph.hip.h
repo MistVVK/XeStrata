@@ -7,15 +7,16 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <future>
 #include <string>
 #include <vector>
 
 #include "hy4_engram.h"
 #include "hy4_gpu_model.hip.h"
+#include "hy4_indexer.hip.h"
 #include "hy4_kernels.hip.h"
 #include "mla_attn.hip.h"
-#include "skgemm.hip.h"
-#include "skmoe.hip.h"
+#include "skhy4.hip.h"
 
 namespace hy4 {
 
@@ -83,7 +84,14 @@ public:
     __half* wv_b = nullptr;
     std::vector<size_t> wk_off, wv_off;
     std::vector<__half*> kcache;  // per layer
-    int ring = 0;
+    int ring = 0, slots_sparse = 0;
+    void ensure_mla_ws(size_t need) {
+        if (need <= mla_ws_bytes) return;
+        HCK(hipStreamSynchronize(st));
+        if (mla_ws) HCK(hipFree(mla_ws));
+        mla_ws_bytes = need + (need >> 2);
+        HCK(hipMalloc(&mla_ws, mla_ws_bytes));
+    }
     // host side engram
     EngramMeta emeta;
     EngramIO eio;
@@ -94,7 +102,15 @@ public:
     bool dump = false;
     std::string dump_dir = ".";
     bool dbg_layers = false;
-    int index_on = 0;  // IndexPool (not yet implemented): sparse layers attend all keys
+    int index_on = 1;       // IndexPool selection on the sparse layers (off: they attend all keys)
+    int index_topk = 2048;  // selection starts when the sequence is longer than this
+    // indexer state
+    std::vector<__half*> ivg, pooled;
+    float *ik_f = nullptr, *iv_f = nullptr, *ig_f = nullptr, *iq_f = nullptr, *hw_f = nullptr, *score = nullptr;
+    __half *ik_h = nullptr, *iq_h = nullptr;
+    int32_t *keys = nullptr, *nkeys = nullptr;
+    size_t ldS = 0;
+    bool last_use_list = false;
 
     Runner(GpuModel& gm, int max_ctx_, int max_chunk) : g(gm), c(gm.man.c), max_ctx(max_ctx_), Tc(max_chunk) {}
 
@@ -142,8 +158,8 @@ public:
         hfin = dalloc<__half>((size_t)T * HID);
         logits = dalloc<float>((size_t)T * c.vocab);
         d_argmax = dalloc<int32_t>(T);
-        mla_ws_bytes = mla_workspace_bytes(T, 64, max_ctx);
-        mla_ws = dalloc<uint8_t>(mla_ws_bytes ? mla_ws_bytes : 256);
+        mla_ws_bytes = 0;
+        mla_ws = nullptr;
         // experts table
         {
             std::vector<ExpertDev> h(41 * 512);
@@ -159,14 +175,36 @@ public:
             HCK(hipMemcpy(d_experts, h.data(), h.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
         }
         // kv caches
-        ring = 512 + Tc;
+        ring = ((512 + Tc + 15) / 16) * 16;
+        slots_sparse = ((max_ctx + 8 + 15) / 16) * 16;
         kcache.resize(c.n_layers);
         size_t kvbytes = 0;
         for (int il = 0; il < c.n_layers; ++il) {
-            size_t rows = c.is_swa[il] ? (size_t)ring : (size_t)max_ctx;
-            kcache[il] = dalloc<__half>(rows * 576);
-            kvbytes += rows * 576 * 2;
+            int slots = c.is_swa[il] ? ring : slots_sparse;
+            size_t by = mla_cache_bytes(slots);
+            HCK(hipMalloc((void**)&kcache[il], by));
+            HCK(hipMemset(kcache[il], 0, by));
+            kvbytes += by;
         }
+        // indexer state (sparse layers only)
+        ivg.assign(c.n_layers, nullptr);
+        pooled.assign(c.n_layers, nullptr);
+        for (int il = 0; il < c.n_layers; ++il)
+            if (!c.is_swa[il]) {
+                ivg[il] = dalloc<__half>((size_t)(max_ctx + 8) * 256);
+                pooled[il] = dalloc<__half>((size_t)(max_ctx / 4 + 8) * 128);
+            }
+        ik_f = dalloc<float>((size_t)Tc * 128);
+        iv_f = dalloc<float>((size_t)Tc * 128);
+        ig_f = dalloc<float>((size_t)Tc * 128);
+        ik_h = dalloc<__half>((size_t)Tc * 128);
+        iq_f = dalloc<float>((size_t)Tc * 2048);
+        iq_h = dalloc<__half>((size_t)Tc * 2048);
+        hw_f = dalloc<float>((size_t)Tc * 16);
+        ldS = (size_t)(max_ctx / 4 + 8);
+        score = dalloc<float>((size_t)Tc * ldS);
+        keys = dalloc<int32_t>((size_t)Tc * (index_topk + 8));
+        nkeys = dalloc<int32_t>((size_t)Tc);
         // absorbed weights
         wk_off.resize(c.n_layers);
         wv_off.resize(c.n_layers);
@@ -228,8 +266,7 @@ public:
         }
         er_h = dalloc<__half>((size_t)Tc * 1536);
         kv_f = dalloc<float>((size_t)5 * Tc * HID);
-        h_eraw.resize((size_t)4 * Tc * 16 * 100);
-        h_evalid.resize((size_t)4 * Tc * 16);
+        ep_alloc();
         size_t fr = 0, tot = 0;
         HCK(hipMemGetInfo(&fr, &tot));
         fprintf(stderr, "[runner] kv cache %.2f GB (ctx %d, chunk %d), device free %.1f GiB\n", kvbytes / 1e9, max_ctx, Tc, fr / 1073741824.0);
@@ -237,18 +274,78 @@ public:
     }
 
     // Engram rows of one chunk for all 4 modules (CPU hash + page reads), uploaded to the device
-    bool engram_prep(const int32_t* tok_all, int p0, int T, std::string& err) {
-        double t0 = now_s();
+    struct EPrep {
+        std::vector<uint8_t> raw, valid;  // [4][Tc*16*100], [4][Tc*16]
+        int p0 = -1, T = 0;
+        bool ok = false, pending = false;
+        std::string err;
+        std::future<void> fut;
+        hipEvent_t used = nullptr;  // recorded after the uploads of this slot were enqueued
+    };
+    EPrep ep[2];
+    int ep_next = 0;
+    double t_engram_wait = 0;
+
+    void ep_alloc() {
+        for (int s = 0; s < 2; ++s) {
+            ep[s].raw.resize((size_t)4 * Tc * 16 * 100);
+            ep[s].valid.resize((size_t)4 * Tc * 16);
+            HCK(hipEventCreateWithFlags(&ep[s].used, hipEventDisableTiming));
+        }
+    }
+    void ep_compute(EPrep* e, const int32_t* tok_all, int p0, int T) {
+        std::string err;
+        e->ok = true;
         for (int mo = 0; mo < 4; ++mo) {
             std::vector<uint64_t> ids((size_t)T * 16);
-            uint8_t* valid = h_evalid.data() + (size_t)mo * Tc * 16;
+            uint8_t* valid = e->valid.data() + (size_t)mo * Tc * 16;
             engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), valid);
-            uint8_t* raw = h_eraw.data() + (size_t)mo * Tc * 16 * 100;
-            if (!eio.fetch_raw(ids.data(), ids.size(), raw, err)) return false;
-            HCK(hipMemcpyAsync(d_eraw[mo], raw, (size_t)T * 16 * 100, hipMemcpyHostToDevice, st));
-            HCK(hipMemcpyAsync(d_evalid[mo], valid, (size_t)T * 16, hipMemcpyHostToDevice, st));
+            uint8_t* raw = e->raw.data() + (size_t)mo * Tc * 16 * 100;
+            if (!eio.fetch_raw(ids.data(), ids.size(), raw, err)) {
+                e->ok = false;
+                e->err = err;
+                return;
+            }
         }
-        HCK(hipStreamSynchronize(st));
+    }
+    // start fetching the rows of chunk [p0, p0+T) in the background (tokens must be final and stay valid)
+    void prefetch_engram(const int32_t* tok_all, int p0, int T) {
+        if (!engram_ready) return;
+        EPrep& e = ep[ep_next];
+        if (e.fut.valid()) e.fut.wait();
+        HCK(hipEventSynchronize(e.used));
+        e.p0 = p0;
+        e.T = T;
+        e.pending = true;
+        e.fut = std::async(std::launch::async, [this, &e, tok_all, p0, T]() { ep_compute(&e, tok_all, p0, T); });
+        ep_next ^= 1;
+    }
+    bool engram_prep(const int32_t* tok_all, int p0, int T, std::string& err) {
+        double t0 = now_s();
+        EPrep* e = nullptr;
+        for (int s = 0; s < 2; ++s)
+            if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T) e = &ep[s];
+        if (e) {
+            e->fut.get();
+            e->pending = false;
+        } else {
+            // no prefetch: wait for any running one, then do it synchronously in a free slot
+            for (int s = 0; s < 2; ++s)
+                if (ep[s].fut.valid()) ep[s].fut.wait();
+            e = &ep[ep_next];
+            HCK(hipEventSynchronize(e->used));
+            ep_next ^= 1;
+            ep_compute(e, tok_all, p0, T);
+        }
+        if (!e->ok) {
+            err = e->err;
+            return false;
+        }
+        for (int mo = 0; mo < 4; ++mo) {
+            HCK(hipMemcpyAsync(d_eraw[mo], e->raw.data() + (size_t)mo * Tc * 16 * 100, (size_t)T * 16 * 100, hipMemcpyHostToDevice, st));
+            HCK(hipMemcpyAsync(d_evalid[mo], e->valid.data() + (size_t)mo * Tc * 16, (size_t)T * 16, hipMemcpyHostToDevice, st));
+        }
+        HCK(hipEventRecord(e->used, st));
         t_engram_cpu += now_s() - t0;
         return true;
     }
@@ -275,6 +372,33 @@ public:
         hipLaunchKernelGGL(k_engram_apply, dim3(T, 4), dim3(256), 0, st, x, kv_f, e.kvb, e.egate, e.pre_gamma, e.hcs, d_evalid[mo], T);
     }
 
+    // IndexPool: cache iv/ig of the chunk's tokens and pool the groups completed by this chunk
+    void idx_update(int il, int p0, int T) {
+        const std::string p = L(il) + ".self_attn.compressed_indexer";
+        lin(p + ".token_key_projection.weight", cur_h, ik_f, T);  // [T][128]
+        hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(128), 0, st, ik_f, (const float*)tw(p + ".token_key_norm.weight"), (float*)nullptr, ik_h, 128, c.rms_eps);
+        lin(p + ".key_value_projection.weight", ik_h, iv_f, T);
+        lin(p + ".key_gate_projection.weight", ik_h, ig_f, T);
+        hipLaunchKernelGGL(idx::k_idx_store, dim3(T), dim3(128), 0, st, iv_f, ig_f, ivg[il], p0);
+        int g_lo = p0 / 4, g_hi = (p0 + T) / 4 - 1;
+        if (g_hi >= g_lo)
+            hipLaunchKernelGGL(idx::k_idx_pool, dim3(g_hi - g_lo + 1), dim3(128), 0, st, ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], g_lo,
+                               (float)theta(il), c.rms_eps);
+    }
+
+    // per-token key lists for the chunk (sparse layer, sequence longer than index_topk)
+    void idx_select(int il, int p0, int T) {
+        const std::string p = L(il) + ".self_attn.compressed_indexer";
+        lin(p + ".query_projection.weight", qr_h, iq_f, T);  // [T][16*128]
+        hipLaunchKernelGGL(idx::k_idx_q_rope, dim3(T, 16), dim3(128), 0, st, iq_f, iq_h, p0, (float)theta(il));
+        lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);  // [T][16]
+        int G = (p0 + T) / 4;
+        if (G < 1) G = 1;
+        hipLaunchKernelGGL(idx::k_idx_score, dim3((G + 63) / 64, T), dim3(64), 0, st, iq_h, hw_f, pooled[il], score, p0, G, (int)ldS, 1.0f / sqrtf((float)(128 * 16)));
+        int n_top = index_topk / c.kpool - 1;
+        hipLaunchKernelGGL(idx::k_idx_select, dim3(T), dim3(256), 0, st, score, (int)ldS, p0, n_top, index_topk, keys, nkeys);
+    }
+
     void attention_layer(int il, int p0, int T) {
         const std::string pa = L(il) + ".self_attn";
         const int NH = heads(il);
@@ -291,16 +415,33 @@ public:
         lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
         lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]  (qr_h already extracted)
         __half* cache = kcache[il];
-        mla_write_kv(st, F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps);
+        const int cslots = swa ? ring : slots_sparse;
+        mla_write_kv(st, F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps);
         mla_prep_q(st, F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il));
+        bool use_list = false;
+        if (!swa && index_on) {
+            idx_update(il, p0, T);
+            if (p0 + T > index_topk) {
+                idx_select(il, p0, T);
+                use_list = true;
+            }
+        }
+        last_use_list = use_list;
         lin(pa + ".linear_gate.weight", cur_h, F3, T);  // [T][NH*256]
         MlaAttnArgs a;
         a.M = T;
         a.NH = NH;
         a.p0 = p0;
-        a.mode = swa ? MLA_WINDOW : MLA_CAUSAL;
+        a.mode = swa ? MLA_WINDOW : (use_list ? MLA_LIST : MLA_CAUSAL);
         a.window = c.window;
         a.ring = swa ? ring : 0;
+        a.cache_slots = cslots;
+        ensure_mla_ws(mla_workspace_bytes(a));
+        if (use_list) {
+            a.keys = keys;
+            a.nkeys = nkeys;
+            a.kmax = index_topk;
+        }
         mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_b + wv_off[il], F3, o_h, ctx_ws, a, mla_ws, mla_ws_bytes);
         lin(pa + ".o_proj.weight", o_h, F1, T);  // [T][3072]
         hipLaunchKernelGGL(k_add_rms, dim3(T), dim3(256), 0, st, F1, (const float*)nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), sub, HID, c.rms_eps);
@@ -349,16 +490,28 @@ public:
             int mo = -1;
             for (int j = 0; j < 4; ++j)
                 if (emeta.layers[j] == il) mo = j;
+            double ta = 0;
+            if (prof) { HCK(hipStreamSynchronize(st)); ta = now_s(); }
             if (mo >= 0 && engram_ready) {
                 engram_layer(mo, il, T);
                 maybe_dump("x_L" + std::to_string(il) + "_engram", T, 4 * HID, x, 4);
             }
+            if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); p_eng += tb - ta; ta = tb; }
             attention_layer(il, p0, T);
             maybe_dump("x_L" + std::to_string(il) + "_attn", T, 4 * HID, x, 4);
+            if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); (c.is_swa[il] ? p_attn_swa : p_attn_sp) += tb - ta; ta = tb; }
             mlp_layer(il, T);
             maybe_dump("x_L" + std::to_string(il) + "_mlp", T, 4 * HID, x, 4);
+            if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); (il == 0 ? p_mlp0 : p_moe) += tb - ta; }
         }
         return true;
+    }
+    bool prof = false;
+    double p_eng = 0, p_attn_swa = 0, p_attn_sp = 0, p_mlp0 = 0, p_moe = 0;
+    void prof_report(const char* what) {
+        if (!prof) return;
+        fprintf(stderr, "[prof %s] engram %.3f s | attn swa(30) %.3f s sparse(12) %.3f s | mlp0 %.3f s | moe(41) %.3f s\n", what, p_eng, p_attn_swa, p_attn_sp, p_mlp0, p_moe);
+        p_eng = p_attn_swa = p_attn_sp = p_mlp0 = p_moe = 0;
     }
 
     // logits of chunk positions [first, T) into d logits [(T-first)][V]; h_final dumped if dump
