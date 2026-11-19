@@ -758,7 +758,7 @@ static size_t rss_bytes() {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_hcsplit = false, prof3 = false;
-    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8;
+    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -895,6 +895,7 @@ int main(int argc, char** argv) {
         double t1 = now_s();
         std::vector<double> times;
         r.gpu_total = 0;
+        const double t_ew0 = r.t_engram_wait;
         for (int s = 0; s < gen; ++s) {
             tok.push_back(next);
             gen_ids += std::to_string(next) + " ";
@@ -913,6 +914,7 @@ int main(int argc, char** argv) {
             times.push_back(now_s() - ts);
         }
         double td = now_s() - t1;
+        fprintf(stderr, "[engram] decode: total wait %.3f s over %zu steps (%.2f ms/step)\n", r.t_engram_wait - t_ew0, times.size(), times.empty() ? 0.0 : (r.t_engram_wait - t_ew0) / times.size() * 1000);
         printf("generated ids: %s\n", gen_ids.c_str());
         if (prof) r.report("decode", (int) times.size());
         std::sort(times.begin(), times.end());
