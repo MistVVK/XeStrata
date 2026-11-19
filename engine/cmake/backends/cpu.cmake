@@ -481,7 +481,10 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(tqp_cpu_test PRIVATE strata_kernels_cpu)
     add_test(NAME tqp_cpu_test COMMAND tqp_cpu_test)
     add_test(NAME tqp_cpu_test_avx2 COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_AVX2=1 $<TARGET_FILE:tqp_cpu_test>)
-    set_tests_properties(tqp_cpu_test tqp_cpu_test_avx2 PROPERTIES TIMEOUT 120)
+    # #5873: the opt-in fast AVX2 pair-trellis rows (STRATA_TQP_AVX2_FAST=1) bit for bit equal to the scalar kernel as well
+    add_test(NAME tqp_cpu_test_fast COMMAND ${CMAKE_COMMAND} -E env STRATA_TQP_AVX2_FAST=1 $<TARGET_FILE:tqp_cpu_test>)
+    add_test(NAME tqp_cpu_test_avx2_fast COMMAND ${CMAKE_COMMAND} -E env STRATA_TQP_AVX2_FAST=1 STRATA_FORCE_AVX2=1 $<TARGET_FILE:tqp_cpu_test>)
+    set_tests_properties(tqp_cpu_test tqp_cpu_test_avx2 tqp_cpu_test_fast tqp_cpu_test_avx2_fast PROPERTIES TIMEOUT 120)
   endif()
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)

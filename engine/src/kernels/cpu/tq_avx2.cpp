@@ -16,6 +16,8 @@
 
 #include <immintrin.h>
 
+#include <cstdlib>
+
 namespace strata::kernels::cpu::tq_detail {
 namespace {
 
@@ -79,9 +81,72 @@ void rows_t(const int16_t* table, const uint8_t* w, size_t row_bytes, int n, con
 // table row, so 8 states make one YMM of 16 int16 weights, and a 32-value group (16 steps) is two YMM of
 // weights against two YMM of activations: VPMADDWD, one exact int32 sum per group, then the four group sums
 // go into the same per-token __m128 the other kernels use, so the float part is the scalar kernel's.
+inline __m256i pairs8(const int16_t* tab, uint32_t s0, uint32_t s1, uint32_t s2, uint32_t s3, uint32_t s4,
+                      uint32_t s5, uint32_t s6, uint32_t s7) {
+    const __m128i a0 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s0)),
+                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s1)));
+    const __m128i a1 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s2)),
+                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s3)));
+    const __m128i a2 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s4)),
+                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s5)));
+    const __m128i a3 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s6)),
+                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s7)));
+    return _mm256_set_m128i(_mm_unpacklo_epi64(a2, a3), _mm_unpacklo_epi64(a0, a1));
+}
+
 template <int KB>
 void rows_tqp_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
                 int r1) {
+    const int nb = n / 128;
+    constexpr size_t bsz = 2 + 8 * KB;
+    const int16_t* tab = tq_state_table();
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        __m128 acc[kTqMaxTokens];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = x + (size_t) i * bsz;
+            uint32_t st[64];
+            tq_states_tqp<KB>(blk + 2, st);
+            __m256i wv[8];   // wv[2g], wv[2g+1]: the weights of the 32-value group g
+#pragma GCC unroll 4
+            for (int g = 0; g < 4; ++g) {
+                const uint32_t* s = st + 16 * g;
+                wv[2 * g] = pairs8(tab, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+                wv[2 * g + 1] = pairs8(tab, s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15]);
+            }
+            const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
+            for (int t = 0; t < nt; ++t) {
+                const __m256i* q = (const __m256i*) (a[t]->q + 128 * i);
+                int32_t sum[4];
+#pragma GCC unroll 4
+                for (int g = 0; g < 4; ++g) {
+                    const __m256i p = _mm256_add_epi32(_mm256_madd_epi16(wv[2 * g], _mm256_load_si256(q + 2 * g)),
+                                                       _mm256_madd_epi16(wv[2 * g + 1], _mm256_load_si256(q + 2 * g + 1)));
+                    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(p), _mm256_extracti128_si256(p, 1));
+                    s = _mm_hadd_epi32(s, s);
+                    s = _mm_hadd_epi32(s, s);
+                    sum[g] = _mm_cvtsi128_si32(s);
+                }
+                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                const __m128i s4 = _mm_set_epi32(sum[3], sum[2], sum[1], sum[0]);
+                acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s4), sc, acc[t]);
+            }
+        }
+        for (int t = 0; t < nt; ++t) {
+            alignas(16) float v[4];
+            _mm_store_ps(v, acc[t]);
+            out[t][r] = ((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f);
+        }
+    }
+}
+
+// The form of PR #5873 (STRATA_TQP_AVX2_FAST=1): the states from one 32-bit read each (tq_states_tqp_fast), the eight first-pairs of a
+// vector loaded straight from the state table viewed as int32 (a row's first pair = its first int32), and one hadd tree for the four
+// group sums, as rows_t.  Every value is the same exact int32 as above, so the output bytes are the same.
+template <int KB>
+void rows_tqp_fast_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
+                     int r1) {
     const int nb = n / 128;
     constexpr size_t bsz = 2 + 8 * KB;
     const int* tab32 = (const int*) tq_state_table();
@@ -92,8 +157,8 @@ void rows_tqp_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a
         for (int i = 0; i < nb; ++i) {
             const uint8_t* blk = x + (size_t) i * bsz;
             uint32_t st[64];
-            tq_states_tqp<KB>(blk + 2, st);
-            __m256i wv[8];   // wv[2g], wv[2g+1]: the weights of the 32-value group g (a row's first pair = its first int32)
+            tq_states_tqp_fast<KB>(blk + 2, st);
+            __m256i wv[8];   // wv[2g], wv[2g+1]: the weights of the 32-value group g
             for (int m = 0; m < 8; ++m) {
                 const uint32_t* s = st + 8 * m;
                 wv[m] = _mm256_setr_epi32(tab32[2 * s[0]], tab32[2 * s[1]], tab32[2 * s[2]], tab32[2 * s[3]],
@@ -121,10 +186,22 @@ void rows_tqp_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a
     }
 }
 
+// #5873: off unless STRATA_TQP_AVX2_FAST=1 (read once).  Our paired A/B (GCC, Ryzen 5 5600X) did not reproduce the PR's gain.
+bool tqp_fast_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_TQP_AVX2_FAST"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
 }  // namespace
 
 void tq_rows_avx2_tqp(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                       float* const* out, int r0, int r1) {
+    if (tqp_fast_on()) {
+        if (kb == 5) rows_tqp_fast_t<5>(w, row_bytes, n, a, nt, out, r0, r1);
+        else if (kb == 6) rows_tqp_fast_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
+        else rows_tqp_fast_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
+        return;
+    }
     if (kb == 5) rows_tqp_t<5>(w, row_bytes, n, a, nt, out, r0, r1);
     else if (kb == 6) rows_tqp_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
     else rows_tqp_t<7>(w, row_bytes, n, a, nt, out, r0, r1);

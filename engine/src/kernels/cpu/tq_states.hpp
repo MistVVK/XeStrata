@@ -72,10 +72,17 @@ inline uint32_t tq_state_tqp(const uint8_t* qs, int t) {
     const uint32_t w = (uint32_t) qs[i0] | ((uint32_t) qs[i1] << 8) | ((uint32_t) qs[i2] << 16);
     return (w >> (off & 7)) & kTqStateMask;
 }
-// All 64 states: the stream copied once with its first 4 bytes appended, so every state is one 32-bit read, a shift
-// and a mask (same bits as tq_state_tqp, which needs three byte reads and two modulos each: ~2.3x slower on Zen 3).
 template <int KB>
 inline void tq_states_tqp(const uint8_t* qs, uint32_t* st) {
+#if defined(__GNUC__)
+#pragma GCC unroll 64
+#endif
+    for (int t = 0; t < 64; ++t) st[t] = tq_state_tqp<KB>(qs, t);
+}
+// All 64 states, the form of PR #5873 (STRATA_TQP_AVX2_FAST=1, AVX2 rows only): the stream copied once with its first 4 bytes
+// appended, so every state is one 32-bit read, a shift and a mask.  The same bits as tq_state_tqp.
+template <int KB>
+inline void tq_states_tqp_fast(const uint8_t* qs, uint32_t* st) {
     constexpr int NB = 8 * KB;
     uint8_t buf[NB + 4];
     std::memcpy(buf, qs, NB);
