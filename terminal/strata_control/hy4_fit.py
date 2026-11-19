@@ -19,9 +19,11 @@ tests/terminal/test_hy4_squant_fit.py, plus what the 0.2.18 defaults add (owner,
                                                                     same kind of total on Metal (SQ-64, on top of the mapped 62 GB file): 1.6 GB at 4K, 4.4 GB at 32K, 6.6 GB at 128K (+5.0 GB); Strix is +4.4 GB; this is +3.84 GB
                                                                     beyond the author's 20K, the same range (to be checked against the CUDA lane's RTX 5070 numbers at 128K)
 
-The placement is planned at the chosen context on every card, 8 GB ones included (owner, 2026-11-19: 128K is the default everywhere and people change it themselves): when the
-cache and workspace leave no room for experts in video memory (`gpu_room` is 0) they all go to RAM, and where even the core weights plus the cache do not fit the card, keeping some
-of the cache in host memory is the engine's job, not this planner's.
+The placement is planned at the chosen context on every card, 8 GB ones included (owner, 2026-11-19: 128K is the default everywhere and people change it themselves, never a
+lower context chosen for them).  Host-side KV (HY4-CUDA's engine, 2026-11-19): when the sparse-layer KV, the IndexPool state and the absorbed kv_b copies (HOST_KV_GB_PER_TOKEN,
+5.5 GB at 128K) exceed 15% of the card's memory, the engine keeps them in pinned host memory.  Then the card holds only the core weights and the author's 2.00 GB (so its expert room is
+as at 20K) and RAM holds the 5.5 GB and HOST_PIN_HEADROOM_GB more (about 58 GB of a 64 GiB PC is usable).  That makes SQ-64 not fit 8 GiB + 64 GiB at 128K (about 2.8 GB from the SSD),
+and the planner recommends SQ-32 there, still at 128K.  A 12 GiB card at 128K also keeps the state in host memory (5.5 GB is over 15% of it) and stays resident with SQ-64 + 64 GiB.
 
 Unified memory (Strata Halo, Apple silicon, DGX Spark) has one pool: the trunk, the KV and every expert body live in it and nothing is copied or read from the SSD while the
 footprint fits `pool - UMA_RESERVE_GB - kv_extra - vision`.
@@ -45,6 +47,11 @@ DEFAULT_CONTEXT = 131072         # owner, 2026-11-19: 128K by default
 CONTEXTS = [8192, 32768, 65536, 131072]
 KV_GB_PER_TOKEN = 34.7e-6        # KV + context workspace (IndexPool, workspace and Engram buffers grow with it too), per token: HY4-STRIX, Strix Halo SQ-64: (66.3 - 62.2) GiB x 1.0737 / (131072 - 4096); HY4-METAL (M5 Max): +5.0 GB from 4K to 128K, KV alone 1.9 GB of it
 DRAFTER_GB = 0.44                # the 5-layer DFly2 drafter, in Section 1 already (inside every build's dense_gb): kept here to say so, not added twice
+#: Pinned host memory for the sparse-layer KV, the IndexPool state and the absorbed kv_b copies (HY4-CUDA, 2026-11-19): the engine puts them there when they exceed 15% of VRAM.
+#: About 5.5 GB at 128K (so 42 KB a token); with them pinned about 58 GB of a 64 GiB PC is usable, which makes the headroom below (the pinned staging beside the cache itself).
+HOST_KV_GB_PER_TOKEN = 5.5 / 131072
+HOST_KV_VRAM_SHARE = 0.15
+HOST_PIN_HEADROOM_GB = 3.8
 FAMILY = "hy4-flash"
 FAMILY_NAME = "hy4-flash"        # the config's model_name prefix
 
@@ -73,11 +80,24 @@ def non_expert_gb(ctx: int | None = None) -> float:
     return VRAM_NON_EXPERT_GB + kv_extra_gb(ctx)
 
 
+def host_kv_gb(ctx: int | None = None) -> float:
+    """The sparse-layer KV, IndexPool state and absorbed kv_b copies of a context of `ctx` tokens, as pinned host memory (GB): the figure HY4-CUDA's engine uses."""
+    n = DEFAULT_CONTEXT if ctx is None else int(ctx)
+    return n * HOST_KV_GB_PER_TOKEN
+
+
+def kv_in_host(vram_gib: float | None, ctx: int | None = None) -> bool:
+    """The engine keeps that state in pinned host memory when it exceeds 15% of the card's memory (a small card at a long context); else it stays in video memory."""
+    return vram_gib is not None and host_kv_gb(ctx) > HOST_KV_VRAM_SHARE * float(vram_gib) * GIB_TO_GB
+
+
 def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None, vision: bool = False) -> dict:
-    """Where the expert bodies of `build` go on a PC with a card of `vram_gib` and `ram_gib` of main memory (GiB): GB in video memory, in RAM, on the SSD."""
+    """Where the expert bodies of `build` go on a PC with a card of `vram_gib` and `ram_gib` of main memory (GiB): GB in video memory, in RAM, on the SSD.  When the context's
+    KV state is kept in host memory (kv_in_host) the card does not hold it (only the author's 2.00 GB of driver and buffers stay) and RAM holds it, plus the pinned headroom."""
     info = BUILDS[build]
-    gpu_room = max(0.0, vram_gib * GIB_TO_GB - info["dense_gb"] - non_expert_gb(ctx))
-    ram_room = max(0.0, ram_gib * GIB_TO_GB - OS_RESERVE_GB - HOT_ENGRAM_GB - (VISION_GB if vision else 0.0))
+    host = kv_in_host(vram_gib, ctx)
+    gpu_room = max(0.0, vram_gib * GIB_TO_GB - info["dense_gb"] - (VRAM_NON_EXPERT_GB if host else non_expert_gb(ctx)))
+    ram_room = max(0.0, ram_gib * GIB_TO_GB - OS_RESERVE_GB - HOT_ENGRAM_GB - (VISION_GB if vision else 0.0) - ((host_kv_gb(ctx) + HOST_PIN_HEADROOM_GB) if host else 0.0))
     in_vram = min(info["bodies_gb"], gpu_room)
     in_ram = min(info["bodies_gb"] - in_vram, ram_room)
     on_ssd = max(0.0, info["bodies_gb"] - in_vram - in_ram)

@@ -59,6 +59,13 @@ class Table(unittest.TestCase):
         self.assertNotIn("hy4-flash", setup.FAMILIES)
         self.assertNotIn("hy4-flash", setup.OWN_PATH_FAMILIES)
 
+    def test_an_8_gib_card_with_64_gib_is_offered_sq_32_at_128k(self):
+        # HY4-CUDA: SQ-64 (56 GB of experts) + the 5.5 GB of host KV do not fit the 58 GB usable of a 64 GiB PC; SQ-32 is the build to recommend, still at 128K
+        lines = dict(setup.hy4_menu_lines(8, 64, False, 131072, True))
+        self.assertEqual([b for b, t in setup.hy4_menu_lines(8, 64, False, 131072, True) if "(recommended)" in t], ["SQ-32"])
+        self.assertIn("a few experts are read from the SSD", lines["SQ-64"])
+        self.assertEqual([b for b, t in setup.hy4_menu_lines(12, 64, False, 131072, True) if "(recommended)" in t], ["SQ-64"])
+
     def test_menu_lines_recommend_by_the_authors_table(self):
         for vram, ram, want in ((12, 64, "SQ-64"), (12, 32, "SQ-32"), (12, 128, "SQ-128")):
             lines = setup.hy4_menu_lines(vram, ram, False)
@@ -241,8 +248,8 @@ class Defaults0218(unittest.TestCase):
         self.assertEqual(cfg["drafting"], "dfly2")
         self.assertEqual(cfg["arch"], "hy4flash")
         self.assertEqual(cfg["exe"], "component:strata-hy4")
-        self.assertEqual(args[args.index("--vram-experts-gb") + 1], "1.25")               # the 128K cache takes the card's room: 12 GiB, SQ-64
-        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "54.79")
+        self.assertEqual(args[args.index("--vram-experts-gb") + 1], "5.08")               # 12 GiB: the KV state (5.5 GB at 128K) is pinned host memory, so the card keeps the author's 5.08 GB of experts
+        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "50.96")
         self.assertTrue(any(l.startswith("images: on") for l in lines), lines)
 
     def test_vision_no_leaves_the_shard_and_the_option_out(self):
@@ -262,8 +269,8 @@ class Defaults0218(unittest.TestCase):
     def test_the_planned_placement_on_an_8_gib_card_is_written_at_128k(self):
         cfg, _lines, _ = self.install(vram=8.0)                                          # the engine lanes deal with a cache that does not fit the card
         args = cfg["args"]
-        self.assertEqual(args[args.index("--vram-experts-gb") + 1], "0.00")
-        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "56.04")
+        self.assertEqual(args[args.index("--vram-experts-gb") + 1], "0.79")
+        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "52.49")        # 8 GiB + 64 GiB, SQ-64: 2.8 GB of its experts are read from the SSD (the planner recommends SQ-32 there)
 
 
 class Catalog(unittest.TestCase):
@@ -290,7 +297,7 @@ class Catalog(unittest.TestCase):
         self.assertTrue(by["SQ-64"]["images"])
         self.assertEqual({k: by[k]["on_this_pc"] for k in by}, {"SQ-32": "fits", "SQ-64": "fits", "SQ-96": "may run slower", "SQ-128": "may run slower"})
         self.assertEqual([k for k in by if by[k]["hy4"]["recommended"]], ["SQ-64"])
-        self.assertEqual(by["SQ-64"]["hy4"]["placement"], {"vram_gb": 1.25, "ram_gb": 54.79, "ssd_gb": 0.0})            # at the 128K default context the KV takes 3.8 GB of the card more than the author's 20K
+        self.assertEqual(by["SQ-64"]["hy4"]["placement"], {"vram_gb": 5.08, "ram_gb": 50.96, "ssd_gb": 0.0})            # at 128K the engine keeps the KV state in pinned host memory on a 12 GiB card (HY4-CUDA)
         self.assertIsNone(by["SQ-64"]["gpu_options"])
 
     def test_unified_memory(self):

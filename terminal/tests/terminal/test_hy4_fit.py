@@ -103,17 +103,18 @@ class Defaults0218(unittest.TestCase):
         for c in SPEC["cases"]:
             res = F.compute(c["model"], c["vram_gib"], c["ram_gib"], 131072, True)
             self.assertAlmostEqual(res["vram_gb"] + res["ram_gb"] + res["ssd_gb"], F.BUILDS[c["model"]]["bodies_gb"], delta=0.02)
-        # the resident cases stay resident (RAM takes what the card gives up) ...
-        for model, vram, ram in (("SQ-64", 8, 64), ("SQ-64", 12, 64), ("SQ-96", 12, 96), ("SQ-128", 12, 128)):
-            self.assertEqual(F.compute(model, vram, ram, 131072, True)["ssd_gb"], 0.0, (model, vram, ram))
-        self.assertEqual(F.mode(F.compute("SQ-32", 12, 32, 131072, True)["ssd_gb"]), "near_resident_ssd")        # the 32 GiB class: the author's 0 GB from the SSD becomes about 3.5 GB at 128K with images
-        # ... and the ones that read from the SSD read a little more
-        self.assertAlmostEqual(F.compute("SQ-32", 8, 32, 131072, True)["ssd_gb"], 3.03 + 1.34 + 0.93, delta=0.05)           # the 8 GiB card had 1.34 GB of room for experts; the cache takes it all (and does not fit: context_fits says so)
-        self.assertAlmostEqual(F.compute("SQ-64", 12, 32, 131072, True)["ssd_gb"], 22.60 + 3.84 + 0.93, delta=0.1)      # RAM is full, so what the cache and the image reader take from the card and the RAM comes from the SSD side
+        # the resident cases stay resident (RAM takes what the card gives up, and the engine keeps the KV state in pinned host memory on a small card) ...
+        for model, vram, ram in (('SQ-64', 12, 64), ('SQ-96', 12, 96), ('SQ-128', 12, 128), ('SQ-96', 8, 96)):
+            self.assertEqual(F.compute(model, vram, ram, 131072, True)['ssd_gb'], 0.0, (model, vram, ram))
+        # ... and the ones that read from the SSD read more: the 5.5 GB of host KV and the pinned headroom come out of RAM
+        self.assertEqual(F.mode(F.compute('SQ-32', 12, 32, 131072, True)['ssd_gb']), 'cross_tier_ssd')           # the 32 GiB class: the author's 0 GB from the SSD becomes about 9 GB at 128K with images
+        self.assertAlmostEqual(F.compute('SQ-32', 12, 32, 131072, True)['ssd_gb'], 8.97, delta=0.05)
+        self.assertAlmostEqual(F.compute('SQ-32', 8, 32, 131072, True)['ssd_gb'], 13.26, delta=0.05)
+        self.assertAlmostEqual(F.compute('SQ-64', 12, 32, 131072, True)['ssd_gb'], 32.83, delta=0.05)
 
     def test_the_home_pc_12_gib_card_and_64_gib_of_ram_at_128k(self):
         r = F.compute("SQ-64", 12, 64, 131072, True)
-        self.assertEqual((r["vram_gb"], r["ram_gb"], r["ssd_gb"]), (1.25, 54.79, 0.0))      # the card keeps the core weights, the 128K cache and 1.2 GB of hot experts; RAM the rest
+        self.assertEqual((r["vram_gb"], r["ram_gb"], r["ssd_gb"]), (5.08, 50.96, 0.0))      # 12 GiB: the engine keeps the KV state (5.5 GB at 128K, over 15% of the card) in pinned host memory, so the card holds 5.08 GB of experts as at the author's 20K and RAM the rest plus the pinned cache
         self.assertEqual(F.recommend(12, 64, False, 131072, True)["build"], "SQ-64")
 
     def test_the_images_cost_the_ram_only(self):
@@ -128,15 +129,23 @@ class Defaults0218(unittest.TestCase):
 
     def test_an_8_gib_card_is_planned_at_128k_like_every_other(self):
         # owner, 2026-11-19: 128K is the default on every card and people change it themselves: no smaller context is recommended and nothing warns.
-        # The planner still places the experts: the core weights (5.8 GB) and the 128K cache and workspace (5.84 GB) do not fit 8.6 GB, so no expert sits in the card.
+        # HY4-CUDA (2026-11-19): with 128K on a small card the engine puts the sparse-layer KV, the IndexPool state and the absorbed kv_b copies (about 5.5 GB) in pinned host memory
+        # when they exceed 15% of the card; so the planner counts them in RAM (plus the pinned headroom: about 58 GB of a 64 GiB PC is usable).
         self.assertFalse(hasattr(F, "recommend_context"))
         self.assertFalse(hasattr(F, "context_fits"))
+        self.assertTrue(F.kv_in_host(8, 131072))
+        self.assertAlmostEqual(F.host_kv_gb(131072), 5.5, delta=0.001)
         r = F.compute("SQ-64", 8, 64, 131072, True)
-        self.assertEqual(r["vram_gb"], 0.0)
-        self.assertEqual(r["ssd_gb"], 0.0)                                    # 64 GiB of RAM still holds every expert body
-        self.assertAlmostEqual(r["ram_gb"], F.BUILDS["SQ-64"]["bodies_gb"], delta=0.01)
-        self.assertEqual(F.recommend(8, 64, False, 131072, True)["build"], "SQ-64")
-        self.assertGreater(F.compute("SQ-64", 8, 64, 20480, True)["vram_gb"], 0.0)       # at the author's 20K the card did keep some
+        self.assertEqual(F.mode(r["ssd_gb"]), "near_resident_ssd")             # 56 GB of experts + 5.5 GB of host KV do not fit the 58 GB of a 64 GiB PC: about 2.8 GB are read from the SSD
+        self.assertAlmostEqual(r["ssd_gb"], 2.76, delta=0.05)
+        self.assertFalse(F.fits("SQ-64", 8, 64, False, 131072, True))
+        best = F.recommend(8, 64, False, 131072, True)
+        self.assertEqual(best["build"], "SQ-32")                              # the build to recommend there, still at 128K (never a lower context)
+        self.assertEqual(best["mode"], "ram_vram_zero_ssd")
+        self.assertEqual(best["placement"], {"vram_gb": 1.34, "ram_gb": 31.39, "ssd_gb": 0.0})
+        self.assertFalse(F.kv_in_host(48, 131072))                             # a big card keeps it in video memory
+        self.assertGreater(F.compute("SQ-64", 8, 64, 20480, True)["vram_gb"], 0.0)       # at the author's 20K the state stays in the card (0.86 GB is under 15% of 8 GiB)
+        self.assertFalse(F.kv_in_host(8, 20480))
 
     def test_unified_memory_pays_the_cache_and_the_images_from_its_pool(self):
         strix = 107.87                                                        # what the GPU maps on Strix Halo (HY4-STRIX)
