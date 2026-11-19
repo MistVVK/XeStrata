@@ -314,6 +314,26 @@ Measured on: four GP100 dies (PH402 SKU 200), `--layer-split 12,24,36`, Flash-Ne
 (Swift 1.5 IQ3_XXS, 1M context) calibration kept it off, and a fixed 1024 chunk read 19-24% slower there and 22-36% slower on
 2x RTX 4090 (community report).
 
+On 2x RX 6900 XT (HIP, gfx1030, `--layer-split auto` = two stages, Flash-Next IQ3_S, 256K context, 8192-token auto chunk,
+engine 0.2.7 built for gfx1030 with the RDNA2 prompt-attention (#3381) and CPU-share-batch (#3382) patches) the useful value
+is `--prefill-pipe 3072`: any b/a from about 1,800 to 3,400 plans the same chunks. Prompt tok/s, fresh prompts, two
+interleaved rounds per cell, the values passed per request (`strata_tune.prefill_pipe`) on one running engine; synthetic
+text, real text (a mix of English, Chinese and code) in brackets where it was read too:
+
+| Prompt tokens | `--prefill auto` | `--prefill-pipe 3072` (chunk) | `--prefill-pipe 1536` (chunk) |
+| ---: | ---: | ---: | ---: |
+| 4,096 | 1,044-1,064 (1,018-1,043) | 1,059 (1,017-1,018), not re-chunked | 804 (2048), -23% |
+| 8,192 | 1,150-1,160 (1,145-1,148) | 1,341-1,353 (1,325-1,328) (4096), +16% | 1,340-1,345 (4096), +16% |
+| 12,288 | 1,337-1,345 (1,340-1,344) | 1,454-1,459 (1,453) (6144), +8% | 1,498-1,504 (4096), +12% |
+| 16,384 | 1,511-1,520 | 1,518, not re-chunked | 1,589-1,592 (5632), +5% |
+| 32,768 | 1,786-1,798 | 1,791, not re-chunked | 1,794, not re-chunked |
+
+768 re-chunked 4K the same way as 1536 (-23%) and 8K into 2816-token chunks (-2%); 6144 and `1` never re-chunked. No b/a
+both leaves a 4K prompt whole and splits a 16K one (the rule needs b/a below 1,672 to split 16K and at least 1,806 to leave 4K
+alone), so 3072 keeps the short prompts as they are and takes the 8K and 12K gains. Today's 8192-token chunk reads a prompt
+of up to 8K as one serial pass over the two cards; two 4096-token chunks let the second card start while the first is still
+on chunk two.
+
 **Pipeline windows.** Decode tok/s.
 
 | Measured on | Result |
