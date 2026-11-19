@@ -58,6 +58,7 @@ const smallNvidia=gpus=>(gpus??[]).some(g=>{
 const radeon9000=gpus=>(gpus??[]).some(g=>(!g.vendor||g.vendor==='amd')&&(GFX12.test(String(g.arch??''))||(!g.arch&&RADEON_9000.test(String(g.name??'')))));
 export function speedSwitchApplies(id,{deepseek=false,backend=null,gpus=[],arch=null,vision=false}={}){
  if(deepseek)return false;                                              // a DeepSeek settings file (no longer run): no switch
+ if(arch==='hy4flash')return false;                                      // Hy4-Flash (strata-hy4) reads none of these environment switches
  if(id==='faster_long_prompts')return !arch&&(backend==='cuda'||backend==='hip');
  if(id==='faster_12gb_nvidia')return !arch&&backend==='cuda'&&smallNvidia(gpus);   // the engine's routing needs the Flash-Next shape (512 experts, top-10) and a CUDA build
  if(id==='route_tail_skip')return backend==='cuda'||(backend==='hip'&&radeon9000(gpus));   // the engine reads STRATA_ROUTE_TAIL_SKIP on CUDA and gfx1200/gfx1201 only

@@ -1,8 +1,9 @@
 """The Hy4-Flash family: its files (exact sizes and SHA-256), its engine component, its defaults and its sources.  Pure data and small helpers; the fit rule is hy4_fit.py.
 
-Sizes are from the owner's R2 listing; SHA-256 of the four builds from the owner's SHA256SUMS.txt (they match the model card).  The Engram shard's and the Vision shard's
-whole-file SHA-256 are not known yet (None: the download is checked by size only until HY4-CUDA's hash of both is entered; the card's Section 4 hash of the Engram shard,
-176944953bf2b601645d206171964f7fa51b77522ef5dc14ae61b0eb1c803d74, is not a whole-file hash and is checked by the engine against the build's header).
+Sizes are from the owner's R2 listing; SHA-256 of the four builds from the owner's SHA256SUMS.txt (they match the model card); the Engram and Vision whole-file hashes were
+computed by HY4-CUDA after size-verified downloads (sha256sum).  Two different hashes belong to the Engram shard and must stay apart: FILES holds the WHOLE-FILE hash (the download
+check); ENGRAM_SECTION4_SHA256 is the hash of its Section 4, the `engram_shard_sha256` every build's header names (the pairing check the engine makes).  A hash that is None
+means "checked by size only".
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ COMPONENT = "strata-hy4"
 EXE = "strata-hy4.exe" if os.name == "nt" else "strata-hy4"
 TITLE = "Tencent Hy4-Flash 220B-A12B"
 BY = "Strata's own quantization of Tencent's model"
+ENGRAM_SECTION4_SHA256 = "176944953bf2b601645d206171964f7fa51b77522ef5dc14ae61b0eb1c803d74"
 ENGRAM_FILE = "Hy4-Flash-Engram-Q8.strata"
 VISION_FILE = "Hy4-Flash-Vision.strata"
 DEFAULT_CONTEXT = 32768               # owner, 2026-11-19 (provisional): until 32K / 128K runs are measured
@@ -35,7 +37,7 @@ FILES = {
     "Hy4-Flash-SQ-64.strata": (62_030_467_072, "4287bbbd42dbf0dc8bba3fd94142f0051dbc79be380452540726ab22a5d45e93"),
     "Hy4-Flash-SQ-96.strata": (89_577_742_336, "ba9d501350330ebe230ecc815d6e2127c43eaa1741ce9dca7576bf69ef78ba64"),
     "Hy4-Flash-SQ-128.strata": (113_654_603_776, "9bfd65640402114ac7162374c9799a444eb41b7add2a42e10457811a0d4474da"),
-    ENGRAM_FILE: (67_584_905_216, None),
+    ENGRAM_FILE: (67_584_905_216, "ab0cf9b3f9c64bd25f6212d4508e7443ab8b9bc133fbccc7bdfb83510a20c2c1"),
     VISION_FILE: (934_092_800, "ef09bceff8f01b8d226d2dc56aef09cec719b21b45783ee9b5d64e7241b72a09"),
 }
 BUILD_ABOUT = {
