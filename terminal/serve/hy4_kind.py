@@ -74,7 +74,8 @@ def probe(exe: str | None, args: list, cfg: dict | None = None, timeout: float =
         return None
     if key in _PROBES:
         return _PROBES[key]
-    env = dict(os.environ)
+    from strata_control.childenv import quiet_crash_env
+    env = quiet_crash_env(dict(os.environ))          # no debugger on a user's machine (the same rule every program of ours is started with)
     dirs = [d for d in ((cfg or {}).get("lib_dirs") or []) if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
