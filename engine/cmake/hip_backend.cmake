@@ -43,6 +43,17 @@ endif()
 string(REPLACE ";" "," STRATA_HIP_ARCHS "${STRATA_HIP_ARCH_LIST}")
 
 enable_language(HIP)
+# The Windows HIP build uses clang's GNU-style driver, so the MSVC-only manifest helper does not run.
+# Embed the Windows settings in every HIP executable, including the tests. Tensile opens its kernel files
+# with ordinary paths; without longPathAware it fails above MAX_PATH even when Windows long paths are on.
+if(WIN32)
+  add_library(strata_hip_windows_settings INTERFACE)
+  target_link_options(strata_hip_windows_settings INTERFACE "LINKER:/MANIFEST:EMBED"
+    "LINKER:/MANIFESTINPUT:${CMAKE_CURRENT_LIST_DIR}/strata-utf8.manifest")
+  set_property(TARGET strata_hip_windows_settings PROPERTY INTERFACE_LINK_DEPENDS
+    "${CMAKE_CURRENT_LIST_DIR}/strata-utf8.manifest")
+  link_libraries(strata_hip_windows_settings)
+endif()
 # CMake caches CMAKE_HIP_FLAGS_<CONFIG> while it enables HIP, before it tests the compiler.  A configure that stopped
 # there because HIP could not compile at all (Visual Studio 2026's <cmath> with the HIP SDK 7.2, a wrong ROCm path)
 # cached them empty, and every later configure of that build folder keeps them: setup's Release build then compiled
