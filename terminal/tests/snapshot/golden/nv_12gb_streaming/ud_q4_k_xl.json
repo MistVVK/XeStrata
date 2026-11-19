@@ -21,7 +21,7 @@
     "vision": "cpu",
     "low_ram": false,
     "resident": false,
-    "ram_budget_gib": 40,
+    "ram_budget_gib": 47,
     "in_budget": true,
     "engine_version": "0.2.12"
    },
@@ -51,7 +51,7 @@
      "--kv-resident",
      "32768",
      "--resident-budget-gib",
-     "39",
+     "46",
      "--vision"
     ],
     "cwd": "<REPO>",
@@ -95,7 +95,7 @@
      "--kv-resident",
      "32768",
      "--resident-budget-gib",
-     "39",
+     "46",
      "--vision"
     ],
     "env_set": {
@@ -108,7 +108,7 @@
    },
    "setup_says": [
     "[ok] KV streaming on: the context's KV cache lives in RAM (0.9 GB), more experts fit in VRAM",
-    "[ok] RAM budget: 39 GiB (less the KV cache's RAM)"
+    "[ok] RAM budget: 46 GiB (less the KV cache's RAM)"
    ]
   },
   "launch": {

@@ -27,7 +27,7 @@ strata launch --family unsloth --model UD-Q4_K_XL
   PC with less RAM, or on a unified-memory APU, setup keeps a RAM budget: the hottest experts in RAM, the rest read
   from the GGUF on the SSD. It fits when its files (without the n-gram table) are no bigger than your graphics memory and RAM together; then the menu says "fits", otherwise "may run slower" and setup asks (default no), and
   `--model UD-Q4_K_XL --yes` installs it anyway.
-- **The RAM budget** is the PC's RAM less 24 GB (`--resident-budget-gib 40` on 64 GB), at most all 71 GiB of experts. From
+- **The RAM budget** is the PC's RAM less 17 GB (`--resident-budget-gib 47` on 64 GB; 0.2.16 and earlier: less 24 GB, 40), at most all 71 GiB of experts. From
   a 64K context up, where the KV cache moves to RAM, its size comes out of the budget. `--resident-budget-gib N` at
   setup sets another one; a bigger one is kept, with a note on what it risks.
 - **Download.** The four shards below from the pinned revision `38bb39e`, resumable. Setup checks each one's size and
@@ -145,11 +145,27 @@ terminal/.venv/bin/python terminal/serve/server.py --engine strata --config stra
 model's (`terminal/data/expert-profile.bin`). It ranks the same 48 x 512 experts and decides which ones the GPU cache and the RAM
 budget take first.
 
-**Choosing the RAM budget N.** Use your RAM minus 20 to 24 GB (the OS, the engine itself, the 126 MB router copy, and
-room for the OS file cache that serves the rest). On 64 GB that is 40. The engine checks available RAM and, on Windows,
+**Choosing the RAM budget N.** Setup uses your RAM minus 17 GB (the OS, the engine itself, the 126 MB router copy, and
+room for the OS file cache that serves the rest). On 64 GB that is 47 (0.2.16 and earlier: minus 24 GB, 40). The engine checks available RAM and, on Windows,
 available commit capacity. If N exceeds the smaller value minus 4 GiB headroom, it reduces N to that amount minus a
 256 MiB margin and reports which limit applies. Everything above N comes from the SSD for every token, so N is the
 setting that matters most; a bigger budget was faster in every measurement (24 / 32 / 40 GiB).
+
+Under a real 64 GiB memory limit (a cgroup the engine reads; UD-Q4_K_XL, an RTX PRO 4500 Blackwell with an 8,171-slot expert cache,
+48 GiB of experts outside the cache; `phaseA-tests/bw/RESULTS-BW-D.md`):
+
+| setup rule on 64 GB | N | SSD read in a 65K-token prompt | 4K-token prompt | decode, mean of 5 kinds | engine anon+shmem | free of the 64 GiB |
+|---|---|---|---|---|---|---|
+| RAM less 24 (0.2.16) | 40 | 97.7 GB | 3,169 ms | 57.7 tok/s | 47.4 GiB | 16.6 GiB |
+| RAM less 17 | 47 | 37.0 GB | 2,873 ms | 84.2 tok/s | 54.7 GiB | 9.3 GiB |
+| RAM less 12 | 52 | 0.9 GB | 2,138 ms | 83.4 to 88.6 tok/s | 57.4 GiB | 6.6 GiB |
+
+A program that took 8 GiB after the engine had started: N 47 and 40 ran on, N 52 was killed by the kernel (the engine reads
+the free RAM at its start and lowers an N that does not fit then, not later). On Windows the engine takes the smaller of
+available RAM and available commit; for `--resident-budget-gib` its headroom is 4 GiB and the margin 256 MiB, so a PC
+with A GiB available at the start runs N at most A - 4.25 (setup writes no `STRATA_RESIDENT_HEADROOM_GIB`).
+Setup does not count the experts of the card's own cache: the rule is the same for every card, and N above the experts
+outside the cache is not used (47.9 GiB on that card, about 63 GiB on a 12 GB card).
 
 When the driver page-locks the whole budget, the GPU also computes a share of the misses over PCIe, as in the resident
 low-RAM mode. `STRATA_RESIDENT_PIN=0` uses ordinary pageable memory instead, and the CPU then computes every miss. On
@@ -223,8 +239,8 @@ Three shards, 93.7 GB:
 | `Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf` | 49,835,229,856 | `577a38a2392b40ca2193cea502e1d92f60b8cd370675d308e0ec21885d9daaa7` |
 | `Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf` | 43,836,407,744 | `d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833` |
 
-Setup treats it like UD-Q4_K_XL: the same RAM budget rule (your RAM less 24 GB, at most all 55 GiB of its experts, so a
-PC with about 80 GB of RAM or more holds all of them), the pack with `--compat-bf16`, no `experts.bin`, and one GPU by
+Setup treats it like UD-Q4_K_XL: the same RAM budget rule (your RAM less 17 GB, at most all 55 GiB of its experts, so a
+PC with about 72 GB of RAM or more holds all of them), the pack with `--compat-bf16`, no `experts.bin`, and one GPU by
 default. It uses the original model's image encoder.
 
 It packs and runs on a Strix Halo (AMD gfx1151, 128 GB unified memory), where prompts read at about 820 tokens/s at 8K

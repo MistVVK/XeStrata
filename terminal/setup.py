@@ -691,7 +691,9 @@ UNSLOTH_Q4_V31_SHARDS = {
         (28800138432, "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"),
 }
 UNSLOTH_ENGINE = (0, 1, 32)     # the first engine setup configures for UD-Q4_K_XL (0.1.31 ran it by hand)
-UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
+UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget where the 17 below was not measured: a layer split's need (unsloth_split_need_gb) and a unified-memory GPU (the cache and the budget share the RAM)
+UNSLOTH_BUDGET_LEFT_GB = 17     # RAM beside the RAM budget (resident_budget_gib): the OS, the engine, and the file cache the rest is read through.  Owner 11-19: 24 -> 17 (a 64 GB PC: 40 -> 47 GiB;
+                                # phaseA-tests/bw/RESULTS-BW-D.md under a 64 GiB limit: decode 57.7 -> 84.2 tok/s, a 65K prompt reads 97.7 -> 37.0 GB from the SSD, survived an 8 GiB program started after the load)
 UNSLOTH_MIN_RAM_GB = 48         # the RAM-budget mode below which setup says an Unsloth file does not fit (UD-Q4_K_XL's floor)
 # Contexts past 262144 (the model's trained length) extend it by rope scaling: for the context it will
 # serve the setup resolves the method (yarn, or one question when interactive) and derives the factor
@@ -3718,11 +3720,12 @@ def ready_fetch(model: str, models_dir: Path) -> None:
         verify_sha256(dst, size, sha)
 
 
-def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
+def resident_budget_gib(model, ram, kv_ram_gb=0.0, uma=False) -> int:
     """UD-Q4_K_XL: the GiB of experts the engine keeps in RAM (--resident-budget-gib): the RAM (GiB, ram_gb()) less
-    24 for the OS, the engine and the file cache the other experts are read through, less a KV cache streamed to
-    RAM; at most all of them, at least 8.  64 GB: 40, the measured setting (docs/UNSLOTH_Q4.md)."""
-    gib = round(ram) - UNSLOTH_RAM_LEFT_GB - math.ceil(kv_ram_gb)
+    17 (UNSLOTH_BUDGET_LEFT_GB) for the OS, the engine and the file cache the other experts are read through, less a KV
+    cache streamed to RAM; at most all of them, at least 8.  64 GB: 47 (0.2.16: 40; docs/UNSLOTH_Q4.md).  A unified-memory
+    GPU (`uma`) keeps the 24 it had: there the GPU's expert cache is RAM too, and 17 was measured on discrete cards only."""
+    gib = round(ram) - (UNSLOTH_RAM_LEFT_GB if uma else UNSLOTH_BUDGET_LEFT_GB) - math.ceil(kv_ram_gb)
     return max(8, min(gib, int(MODELS[model]["arena_gb"] / 1.073741824)))
 
 
@@ -3842,15 +3845,15 @@ def uma_cache_guard(cfg: dict, model: str, gpu: dict) -> None:
         say(f"  (the expert cache and RAM budget were not compared: {e})")
 
 
-def budget_choice(model, ram, asked) -> float:
+def budget_choice(model, ram, asked, uma=False) -> float:
     """S4: UD-Q4_K_XL's RAM budget: --resident-budget-gib N as given, else the recommendation (resident_budget_gib).
     More than the recommendation is kept, with what it risks (the owner's rule: setup recommends, it never forces)."""
-    rec = resident_budget_gib(model, ram)
+    rec = resident_budget_gib(model, ram, uma=uma)
     if asked is None:
         return rec
     if asked > rec:
         warn(f"a {asked:g} GiB RAM budget is more than setup recommends for this PC ({rec} GiB: the RAM less "
-             f"{UNSLOTH_RAM_LEFT_GB} GB for the OS, the engine and the file cache that reads the other experts). Kept "
+             f"{UNSLOTH_RAM_LEFT_GB if uma else UNSLOTH_BUDGET_LEFT_GB} GB for the OS, the engine and the file cache that reads the other experts). Kept "
              "as you chose: the engine clamps it to the RAM it finds free at start (less 4 GB), and the file cache "
              "gets less room - it may be slower, or run the PC out of RAM under load")
     return int(asked) if asked == int(asked) else asked
@@ -9987,7 +9990,7 @@ def main() -> int:
                          "this mode the experts the GPU does not hold are copied into RAM once when they fit (resident), "
                          "else read through the OS file cache (mmap); resident / mmap force one of the two")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
-                    help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, 40 on 64 GB; "
+                    help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 17 GB, 47 on 64 GB; "
                          "more is kept as you choose, with a note)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
@@ -10462,7 +10465,7 @@ def main() -> int:
                 f"(the n-gram table is in the file), memory {d['ram_gb']} GB{fit}")
             continue
         if d.get("budget"):
-            keeps = (f"~{resident_budget_gib(m, ram)} GB" if unsloth_budget(m, ram, gpu, a.resident_budget_gib)
+            keeps = (f"~{resident_budget_gib(m, ram, uma=bool((gpu or {}).get('uma')))} GB" if unsloth_budget(m, ram, gpu, a.resident_budget_gib)
                      else "all")
             say(f"  {i}) {m}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, keeps {keeps} of its "
                 f"{d['arena_gb']:.0f} GB of experts in RAM{fit}")
@@ -10493,7 +10496,7 @@ def main() -> int:
                          f"or --model {model} --yes to try it on AMD anyway", "  Try it anyway?")
             warn(f"installing {model} on an AMD card, as you chose (please report how it runs)")
         if ram < MODELS[model]["ram_gb"] and model_fit_label(model, ram, gpu) != "fits":
-            have = resident_budget_gib(model, ram)
+            have = resident_budget_gib(model, ram, uma=bool((gpu or {}).get("uma")))
             total = int(MODELS[model]["arena_gb"] / 1.073741824)
             confirm_risk(f"{model} needs {MODELS[model]['ram_gb']} GB of RAM or more; this PC has {ram:.0f} GB: "
                          f"it would keep {have} GiB of its {total} GiB of experts in RAM and read the other "
@@ -10503,7 +10506,7 @@ def main() -> int:
                          f"choose a smaller size, or --model {model} --yes to install it anyway", "  Install it anyway?")
             warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
         if in_budget:
-            budget = budget_choice(model, ram, a.resident_budget_gib)
+            budget = budget_choice(model, ram, a.resident_budget_gib, uma=bool((gpu or {}).get("uma")))
             if multi and not unsloth_together(a, model, ram, fallback_card(a, gpu, chosen), chosen):
                 gpu = fallback_card(a, gpu, chosen)
                 multi, sel, chosen = [], [gpu["index"]], [gpu]

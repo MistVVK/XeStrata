@@ -525,7 +525,7 @@
     "--kv",
     "int8",
     "--resident-budget-gib",
-    "8",
+    "15",
     "--vision",
     "--vram-reserve-mib",
     "700"
@@ -816,7 +816,7 @@
     "--kv",
     "int8",
     "--resident-budget-gib",
-    "23",
+    "30",
     "--vision"
    ],
    "cwd": "<T>",
@@ -1079,7 +1079,7 @@
     "--kv-resident",
     "32768",
     "--resident-budget-gib",
-    "38",
+    "45",
     "--vision",
     "--vram-reserve-mib",
     "700"

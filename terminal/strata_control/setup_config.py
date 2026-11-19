@@ -124,6 +124,7 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
     fam = inp.fam
     family = inp.family
     gpu = inp.gpu
+    gpu_uma = bool((gpu or {}).get("uma"))
     hip = inp.hip
     in_budget = inp.in_budget
     lib_dirs = inp.lib_dirs
@@ -228,10 +229,10 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
            "the OS file cache (run setup again after the next engine update)")
     if low_ram and ready:
         # NVFP4 (68 GB of experts) on a PC whose RAM does not hold them: the RAM-budget mode, as Unsloth's files - the
-        # most-used experts outside VRAM pinned within RAM less 24 GB, the rest read from experts.bin.  Mapped
+        # most-used experts outside VRAM pinned within RAM less 17 GB (24 on a unified-memory GPU), the rest read from experts.bin.  Mapped
         # (--mmap-experts) on a 64 GB Windows PC, the experts it read stayed in the engine's working set: free RAM
         # fell to 0.6 GB on the RTX 5070 PC (2026-10-13), where the budget mode kept 22 GB free
-        rb = resident_budget_gib(model, ram)
+        rb = resident_budget_gib(model, ram, uma=gpu_uma)
         args += ["--resident-budget-gib", str(rb)]
         ok(f"low-RAM mode: {rb} GiB of {model}'s experts kept in RAM (the most used), the rest read from the pack's "
            "experts.bin on the SSD as needed")
@@ -313,11 +314,11 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
         if q4_split:                                   # #498: no budget to take it out of
             pass
         elif budget is not None and a.resident_budget_gib is None:   # its RAM comes out of the experts' budget
-            budget = resident_budget_gib(model, ram, kv_ram_gb)
+            budget = resident_budget_gib(model, ram, kv_ram_gb, gpu_uma)
             ok(f"RAM budget: {budget} GiB (less the KV cache's RAM)")
-        elif budget is not None and budget > resident_budget_gib(model, ram, kv_ram_gb):
+        elif budget is not None and budget > resident_budget_gib(model, ram, kv_ram_gb, gpu_uma):
             warn(f"the KV cache's {kv_ram_gb:.1f} GB of RAM come on top of your {budget:g} GiB RAM budget (setup "
-                 f"would take them out of it: {resident_budget_gib(model, ram, kv_ram_gb)} GiB); kept as you chose")
+                 f"would take them out of it: {resident_budget_gib(model, ram, kv_ram_gb, gpu_uma)} GiB); kept as you chose")
     elif ctx >= 65536:   # #620: say why, so a regenerated config that lost --kv-resident is not a surprise
         ok(f"KV streaming off: it needs ~{stream_need:.0f} GB of RAM for {model} (its experts, the room beside them "
            f"and the {kv_ram_gb:.1f} GB cache), and this PC has {ram:.0f}; the KV cache stays in VRAM (fewer cached experts). --kv-streaming on "
