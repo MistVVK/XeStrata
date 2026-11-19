@@ -5,6 +5,7 @@
 #define STRATA_VERIFY_HGL 1
 #endif
 #include "strata/core/batch_rows.hpp"
+#include "strata/core/per_device_flag.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -215,15 +216,18 @@ inline int64_t select_long_at() {
 // 143-amdk: STRATA_QFUSE_HC - only the hyper-connection read writes its consumer's q8_1 image (not the GDN recurrence): gfx12 default (=0 / 1 forces off / on)
 inline bool g_qfuse_hc() {
 #if defined(STRATA_USE_HIP)
-    static const bool on = [] {
+    static const int forced = [] {
         const char* v = std::getenv("STRATA_QFUSE_HC");
-        if (v != nullptr) return std::atoi(v) != 0;
-        int dev = 0;
-        cudaDeviceProp p;
-        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-               strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
+        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
     }();
-    return on;
+    if (forced >= 0) return forced == 1;
+    static strata::core::PerDeviceFlag<> gfx12_dev;   // per card (#4431): a gfx11 + gfx12 split must not share the first card's answer
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    return gfx12_dev.get(dev, [](int d) {
+        cudaDeviceProp p;
+        return cudaGetDeviceProperties(&p, d) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
+    });
 #else
     return false;
 #endif

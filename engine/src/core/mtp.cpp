@@ -1,6 +1,7 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
 #include "strata/core/pin_budget.hpp"
+#include "strata/core/per_device_flag.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -513,13 +514,16 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // it (the commit is only needed by the next window, and now runs beside the draft).  R9700, UD-Q4_K_XL: draft wall
     // 5.8 -> 3.5 ms a window (notes-latency.md).
     {
-        static const bool hip_prio = [] {
-            if (const char* v = std::getenv("STRATA_MTP_HIP_PRIO"); v != nullptr && *v != 0) return std::atoi(v) != 0;
-            int dev = 0;
-            cudaDeviceProp prop{};
-            return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
-                   strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName);
-        }();
+        static strata::core::PerDeviceFlag<> gfx12_dev;   // per card (#4431): the drafter of each stage asks for its own card
+        const char* prio_env = std::getenv("STRATA_MTP_HIP_PRIO");
+        int prio_dev = 0;
+        if (cudaGetDevice(&prio_dev) != cudaSuccess) (void) cudaGetLastError();
+        const bool hip_prio = (prio_env != nullptr && *prio_env != 0)
+            ? std::atoi(prio_env) != 0
+            : gfx12_dev.get(prio_dev, [](int d) {
+                  cudaDeviceProp prop{};
+                  return cudaGetDeviceProperties(&prop, d) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName);
+              });
         int lo = 0, hi = 0;
         if (hip_prio && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess)
             prio = hipStreamCreateWithPriority(&cs_, hipStreamNonBlocking, hi) == hipSuccess;

@@ -563,6 +563,13 @@ if(STRATA_BUILD_TESTS)
   add_executable(numa_balancing_test tests/platform/numa_balancing_test.cpp)
   target_include_directories(numa_balancing_test PRIVATE include)
   add_test(NAME numa_balancing_test COMMAND numa_balancing_test)
+
+  # #4431: a per-card answer (the arch of each stage of a mixed gfx11 + gfx12 split) is asked once per card (header-only, no GPU); --legacy is the process-wide form and must fail
+  add_executable(per_device_flag_test tests/core/per_device_flag_test.cpp)
+  target_include_directories(per_device_flag_test PRIVATE include)
+  add_test(NAME per_device_flag_test COMMAND per_device_flag_test)
+  add_test(NAME per_device_flag_test_legacy COMMAND per_device_flag_test --legacy)
+  set_tests_properties(per_device_flag_test_legacy PROPERTIES WILL_FAIL TRUE)
   # #4733: an engine started at Low I/O priority goes back to Normal (Windows; else skips)
   add_executable(io_priority_test tests/platform/io_priority_test.cpp src/platform/io_priority.cpp)
   target_include_directories(io_priority_test PRIVATE include)

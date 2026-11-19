@@ -6,6 +6,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/emulate.hpp"
+#include "strata/core/per_device_flag.hpp"
 #include "strata/core/device_error_exit.hpp"
 
 #include <cuda_fp16.h>
@@ -2920,12 +2921,14 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {
 #if defined(__HIPCC__)
-    static const bool gfx11 = [] {
-        int dev = 0;
+    // per card (#4431): a gfx11 + gfx12 layer split asks this from both; a process-wide answer made by the first card launched the gfx11 kernel on the other
+    static strata::core::PerDeviceFlag<> gfx11_dev;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return false; }
+    const bool gfx11 = gfx11_dev.get(dev, [](int d) {
         cudaDeviceProp p;
-        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
-        return strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
-    }();
+        return cudaGetDeviceProperties(&p, d) == cudaSuccess && strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
+    });
     if (!gfx11 || T <= 0) return false;
     gr_upmix_kernel<<<dim3(N / UM_D, (unsigned) ((T + UM_T - 1) / UM_T)), 512, 0, (cudaStream_t) stream>>>(
         lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
