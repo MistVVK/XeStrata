@@ -38,12 +38,51 @@ inline float sigmoid(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 }  // namespace
 
 void glm5_hc_pre(const float* x, const float* mixes, const float* scale, const float* base, float rms_eps, float hc_eps,
-                 int iters, float* y, float* post, float* comb, int64_t n_embd, int64_t n_tokens, void* stream) {
+                 int iters, float* y, float* post, float* comb, int64_t n_embd, int64_t n_tokens, void* stream,
+                 int streams, float pre_scale) {
     if (n_tokens <= 0) return;
+    if (streams != 2 && streams != 4) throw core::DeviceError("glm5_hc_pre: unsupported stream count");
     if (n_embd <= 0 || iters < 1) throw core::DeviceError("glm5_hc_pre: n_embd " + std::to_string(n_embd) + ", iters " +
                                                           std::to_string(iters));
     constexpr int WG = 256;
     const int64_t N = n_embd;
+    if (streams == 2) {   // SenseNova-Loop: pre/post/bias and row-major log-domain Sinkhorn
+        const auto event = queue_for(stream).submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> pre(sycl::range<1>(2), h);
+            h.parallel_for(sycl::nd_range<1>((size_t) n_tokens * WG, WG), [=](sycl::nd_item<1> it) {
+                const int64_t t = (int64_t) it.get_group(0);
+                const int lid = (int) it.get_local_id(0);
+                const float* xt = x + t * 2 * N;
+                float ss = 0.0f;
+                for (int64_t i = lid; i < 2 * N; i += WG) ss += xt[i] * xt[i];
+                ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+                if (lid == 0) {
+                    const float inv = sycl::rsqrt(ss / (float) (2 * N) + rms_eps);
+                    float m[8];
+                    for (int i = 0; i < 8; ++i) m[i] = mixes[t * 8 + i] * inv + base[i];
+                    for (int i = 0; i < 2; ++i) {
+                        pre[i] = pre_scale * sigmoid(m[i]);
+                        post[t * 2 + i] = 2.0f * sigmoid(m[2 + i]);
+                    }
+                    auto normalize = [](float& a, float& b) {
+                        const float delta = a - b;
+                        const float z = sycl::log1p(sycl::exp(-sycl::fabs(delta)));
+                        a = sycl::fmin(delta, 0.0f) - z;
+                        b = sycl::fmin(-delta, 0.0f) - z;
+                    };
+                    for (int i = 0; i < iters; ++i) {
+                        normalize(m[4], m[5]); normalize(m[6], m[7]);
+                        normalize(m[4], m[6]); normalize(m[5], m[7]);
+                    }
+                    for (int i = 0; i < 4; ++i) comb[t * 4 + i] = sycl::exp(m[4 + i]);
+                }
+                sycl::group_barrier(it.get_group());
+                for (int64_t n = lid; n < N; n += WG) y[t * N + n] = xt[n] * pre[0] + xt[N + n] * pre[1];
+            });
+        });
+        sync_if_needed(stream, event, "glm5_hc_pre");
+        return;
+    }
     const auto event = queue_for(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> pre_l(sycl::range<1>(HC), h);
         h.parallel_for(sycl::nd_range<1>((size_t) n_tokens * WG, WG), [=](sycl::nd_item<1> it) {
@@ -112,11 +151,12 @@ void glm5_hc_pre(const float* x, const float* mixes, const float* scale, const f
     sync_if_needed(stream, event, "glm5_hc_pre");
 }
 
-void glm5_hc_init(const float* x, float* hs, int64_t n_embd, int64_t n_tokens, void* stream) {
+void glm5_hc_init(const float* x, float* hs, int64_t n_embd, int64_t n_tokens, void* stream, int streams) {
+    if (streams != 2 && streams != 4) throw core::DeviceError("glm5_hc_init: unsupported stream count");
     if (n_tokens <= 0 || n_embd <= 0) return;
     const int64_t N = n_embd;
-    const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n_tokens * HC * N)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], t = i / (HC * N), n = i % N;
+    const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n_tokens * streams * N)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], t = i / (streams * N), n = i % N;
         hs[i] = x[t * N + n];
     });
     sync_if_needed(stream, event, "glm5_hc_init");
@@ -132,11 +172,18 @@ void glm5_transpose_abd(const float* src, float* dst, int64_t a, int64_t b, int6
 }
 
 void glm5_hc_post(const float* f, const float* residual, const float* post, const float* comb, float* out,
-                  int64_t n_embd, int64_t n_tokens, void* stream) {
+                  int64_t n_embd, int64_t n_tokens, void* stream, int streams) {
+    if (streams != 2 && streams != 4) throw core::DeviceError("glm5_hc_post: unsupported stream count");
     if (n_tokens <= 0 || n_embd <= 0) return;
     const int64_t N = n_embd;
     const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n_tokens * N)), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0], t = i / N, n = i % N;
+        if (streams == 2) {
+            const float a = residual[t * 2 * N + n], b = residual[(t * 2 + 1) * N + n];
+            out[t * 2 * N + n] = a * comb[t * 4] + b * comb[t * 4 + 1] + f[i] * post[t * 2];
+            out[(t * 2 + 1) * N + n] = a * comb[t * 4 + 2] + b * comb[t * 4 + 3] + f[i] * post[t * 2 + 1];
+            return;
+        }
         const float fv = f[i];
         float r[HC];
         for (int s = 0; s < HC; ++s) r[s] = residual[(t * HC + s) * N + n];
@@ -149,7 +196,8 @@ void glm5_hc_post(const float* f, const float* residual, const float* post, cons
     sync_if_needed(stream, event, "glm5_hc_post");
 }
 
-void glm5_hc_mean(const float* x, float* y, int64_t n_embd, int64_t n_tokens, void* stream) {
+void glm5_hc_mean(const float* x, float* y, int64_t n_embd, int64_t n_tokens, void* stream, int streams) {
+    if (streams != 2 && streams != 4) throw core::DeviceError("glm5_hc_mean: unsupported stream count");
     if (n_tokens <= 0 || n_embd <= 0) return;
     const int64_t N = n_embd;
     const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n_tokens * N)), [=](sycl::id<1> id) {
@@ -157,8 +205,9 @@ void glm5_hc_mean(const float* x, float* y, int64_t n_embd, int64_t n_tokens, vo
         // each stream's pointer one step of N from the last: written as xt[N], xt[2 * N], xt[3 * N], IGC 2.27 to 2.30
         // read xt[N], xt[8 * N], xt[9 * N] on Xe2 GPUs, a fault past the buffer (AGENTS.md, "Intel Graphics Compiler";
         // the runtime turns the pass off, this form compiles right either way)
-        const float* x0 = x + t * HC * N + n;
+        const float* x0 = x + t * streams * N + n;
         const float* x1 = x0 + N;
+        if (streams == 2) { y[i] = (*x0 + *x1) * 0.5f; return; }
         const float* x2 = x1 + N;
         const float* x3 = x2 + N;
         y[i] = (((*x0 + *x1) + *x2) + *x3) * (1.0f / HC);
