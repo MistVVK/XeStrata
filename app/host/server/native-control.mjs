@@ -10,7 +10,7 @@ import { join, resolve, dirname, basename, sep, relative, isAbsolute } from 'nod
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
 import { draftingHint, NATIVE_FIELDS, APP_OWNED_FIELDS, withoutDraftLayer, resolveDrafter, validateNativeSettings, validateMcpServers, publicMcpServers, publicNativeEnv, restoreNativeEnv, speedSwitchRows } from './native-settings.mjs';
-import { resourceSettings, saferStart, reserveChoice } from './native-resources.mjs';
+import { resourceSettings, saferStart, reserveChoice, launchBudgetArgs } from './native-resources.mjs';
 import { USER_KEY, capture as captureUserArgs, merge as mergeUserArgs, setFlag as setUserFlag, stamped as stampedUserArgs } from './native-user-args.mjs';
 import { resolvePython, venvPython } from './python-resolver.mjs';
 import os from 'node:os';
@@ -359,6 +359,8 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   else   if(args.gpus!==undefined&&!(args.gpusFromRecommendation&&namedInFile)){const detected=new Set((snapshot.hardware?.gpus??[]).map(g=>g.index));if(!Array.isArray(args.gpus)||!args.gpus.length||new Set(args.gpus).size!==args.gpus.length||args.gpus.some(g=>!Number.isInteger(g)||!detected.has(g)))throw new Error('Choose distinct detected GPUs. CPU-only text inference is not supported by this native adapter.');cfg.gpu=args.gpus.length===1?args.gpus[0]:args.gpus;for(const k of ['gpu_roles','gpu_cards','gpu_none'])delete cfg[k];delete cfg.hip_ordinal;cfg.layer_split=args.gpus.length>1?validateNativeSettings({layer_split:args.layerSplit??'auto'}).layer_split:'auto';if(cfg.layer_split!=='auto'&&cfg.layer_split.split(',').length!==args.gpus.length-1)throw new Error('Choose one layer split point between each pair of GPUs.');}
   if(cfg.vram_reserve_mib!==undefined&&cfg.vram_reserve_mib!==null){cfg.args=[...(cfg.args??[])];const at=cfg.args.indexOf('--vram-reserve-mib');if(at>=0)cfg.args.splice(at,2);cfg.args.push('--vram-reserve-mib',String(cfg.vram_reserve_mib));}
   if(mine.length){cfg.args=mergeUserArgs(cfg.args??[],mine);cfg[USER_KEY]=mine;}else delete cfg[USER_KEY];
+  /* "Leave 20% for my work" starts the engine with the RAM budget of setup's second number ("ui_budget_work_gib"); this copy only. What is saved (`resources`, never `cfg`) keeps setup's own, which is what a Terminal start reads. */
+  if(args.resourceProfile&&Array.isArray(cfg.args))cfg.args=launchBudgetArgs(cfg,args.resourceProfile);
   if(cfg.vision){if(cfg.vision_tokens!=null)cfg.vision={...cfg.vision,max_tokens:cfg.vision_tokens};if(cfg.vision_min_tokens!=null)cfg.vision={...cfg.vision,min_tokens:cfg.vision_min_tokens};}cfg.mcp={...(cfg.mcp??{}),...(cfg.mcp_timeout_s!=null?{timeout_s:cfg.mcp_timeout_s}:{}),...(cfg.mcp_max_rounds!=null?{max_rounds:cfg.mcp_max_rounds}:{}),...(cfg.mcp_max_result_chars!=null?{max_result_chars:cfg.mcp_max_result_chars}:{})};
   /* The model's own choices win over what setup wrote into the arguments: "Draft layer (MTP)" off leaves --mtp out of every start, and a picture reading that is off leaves --vision out (setup writes both again whenever it runs; the saved settings are applied here, on every load). */
   if((cfg.mtp===false||cfg.drafting==='off')&&Array.isArray(cfg.args))cfg.args=withoutDraftLayer(cfg.args);

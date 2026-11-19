@@ -93,8 +93,6 @@ export function resourceSettings(config,hardware,profile,model={},values={}){
  const dropEnv=name=>{if(config.env&&name in config.env){env={...(env??config.env)};delete env[name];}};
  if(baseline.ramHeadroom)dropEnv('STRATA_RESIDENT_HEADROOM_GIB');
  if(baseline.ramKeep)dropEnv('STRATA_RAM_KEEP_GIB');
- /* setup's two budgets (setupRamBudget): a STRATA_RAM_KEEP_GIB or STRATA_RESIDENT_HEADROOM_GIB of the person's (what is left in the env now is theirs) says how much RAM to leave, so "work" swaps in no number of its own. */
- const setupBudget=setupRamBudget(config,args,profile,baseline.setupBudget,Boolean((env??config.env)?.STRATA_RAM_KEEP_GIB||(env??config.env)?.STRATA_RESIDENT_HEADROOM_GIB||args.includes('--ram-keep-gib')));
  const ram=Number(hardware?.ram_gb)||0,arena=Number(model?.arenaGb)||0;let ramKeep=false,ramBudget=false,ramHeadroom=false;
  // The person's own RAM choice wins: a RAM mode or --ram-keep-gib in their args, and STRATA_RAM_KEEP_GIB or STRATA_RESIDENT_HEADROOM_GIB of theirs in the env (the engine reads those first).
  const mineEnv=Boolean((env??config.env)?.STRATA_RAM_KEEP_GIB);
@@ -107,22 +105,22 @@ export function resourceSettings(config,hardware,profile,model={},values={}){
    if(!(env??config.env)?.STRATA_RESIDENT_HEADROOM_GIB){env={...(env??config.env??{}),STRATA_RESIDENT_HEADROOM_GIB:String(Math.ceil(ram*.2))};ramHeadroom=true;}
   }
  }
- const kept={...baseline,ramBudget,ramHeadroom,ramKeep};delete kept.setupBudget;if(setupBudget!==null)kept.setupBudget=setupBudget;
- return {args,vram_reserve_mib:reserve,...(asked!==null?{}:{ui_reserve_applied:reserve}),...(env?{env}:{}),ui_resource_baseline:kept};
+ return {args,vram_reserve_mib:reserve,...(asked!==null?{}:{ui_reserve_applied:reserve}),...(env?{env}:{}),ui_resource_baseline:{...baseline,ramBudget,ramHeadroom,ramKeep}};
 }
 
-/** The RAM budget setup wrote (--resident-budget-gib in "args"), when setup also wrote the number "Leave 20% for my work" runs with ("ui_budget_work_gib", setup.py
- *  resident_budget_gib(work=True): the one place of the rule, so the app holds no copy of it). setup's budget is the RAM less 17 GB; the work number is the earlier rule,
- *  the RAM less 24 GB (40 on 64 GB: 16.6 GiB really free under a 64 GiB limit, against 9.3 GiB at 47). "work" swaps it into `args` (in place) and returns the
- *  setup number it replaced, kept in the baseline (`setupBudget`); "performance" puts that number back, but only while the budget is still the one the app swapped in.
- *  A budget the person set (user_args, or a change of "args" since the file was written, as capture() reads them) is theirs in both profiles; a config with no work number
- *  (a 0.2.16 install, a budget the person asked setup for, a layer split, unified memory where both rules are 24) is left as it is. Returns the setup number the baseline must keep, or null. */
-function setupRamBudget(config,args,profile,previous,ownRam=false){
- const work=Number(config.ui_budget_work_gib),at=args.indexOf('--resident-budget-gib'),have=at>=0?Number(args[at+1]):NaN;
- if(!(work>0)||!Number.isFinite(have)||flagValue(capture(config),'--resident-budget-gib')!==null)return null;
- if(profile==='work'){if(have===work)return Number(previous)>0?Number(previous):null;if(ownRam)return null;args[at+1]=String(work);return have;}   // already swapped in (an earlier load): keep what it replaced
- if(have===work&&Number(previous)>0)args[at+1]=String(Number(previous));   // back to setup's own
- return null;
+/** The `args` of the config of THIS start, with the RAM budget "Leave 20% for my work" runs with. setup writes two numbers (setup.py resident_budget_gib, the one place of the rule, so the app holds
+ *  no copy of it): --resident-budget-gib in "args" is the RAM less 17 GB (47 on 64 GB), which `strata launch`, `strata serve`, Docker and "Full performance" use, and "ui_budget_work_gib" is the
+ *  earlier rule, the RAM less 24 GB (40; 16.6 GiB really free under a 64 GiB limit, against 9.3 GiB at 47). "work" starts the engine with the second; the swap is made on the started copy only and
+ *  is never saved (resourceSettings, which is what every write of the run config takes, does not touch the budget), so a Terminal start of the same file reads setup's number.
+ *  Left as it is: any other profile; a config with no work number (a 0.2.16 install that was not moved yet, a budget the person asked setup for, a layer split, unified memory where both rules are 24);
+ *  a budget of the person's (user_args, or a change of "args" since the file was written, as capture() reads them); a --ram-keep-gib of theirs, or a STRATA_RAM_KEEP_GIB /
+ *  STRATA_RESIDENT_HEADROOM_GIB of theirs in the env (their RAM setting says how much to leave: no number of ours). `cfg` is the config of the start, its env after resourceSettings.
+ *  Returns `cfg.args` itself when nothing changes, else a new list. */
+export function launchBudgetArgs(cfg,profile){
+ const args=Array.isArray(cfg?.args)?cfg.args:[],work=Number(cfg?.ui_budget_work_gib),at=args.indexOf('--resident-budget-gib'),have=at>=0?Number(args[at+1]):NaN;
+ if(profile!=='work'||!(work>0)||!Number.isFinite(have)||have===work)return cfg?.args;
+ if(flagValue(capture(cfg),'--resident-budget-gib')!==null||args.includes('--ram-keep-gib')||cfg.env?.STRATA_RAM_KEEP_GIB||cfg.env?.STRATA_RESIDENT_HEADROOM_GIB)return cfg.args;
+ const next=[...args];next[at+1]=String(work);return next;
 }
 
 /** The RAM, in GiB, "Leave 20% for my work" asks the engine to keep free: a fifth of the PC's RAM rounded up, never under 5 or over 8

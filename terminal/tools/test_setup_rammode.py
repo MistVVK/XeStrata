@@ -8,6 +8,8 @@ Every outside effect is mocked (tools/test_setup_golden.py's install()).
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import unittest
@@ -18,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import setup  # noqa: E402
+from serve.server import engine_args  # noqa: E402
 from test_setup_golden import PROFILES, install  # noqa: E402
 from test_setup_unsloth import Base  # noqa: E402
 
@@ -218,6 +221,18 @@ class MoveFiles(unittest.TestCase):
 
     def test_a_folder_that_is_not_there_is_skipped(self):
         self.assertEqual(self.mod.run([self.dir / "nothing"], setup_module=setup), {})
+
+
+class TerminalStart(unittest.TestCase):
+    """A Terminal start (strata launch, strata serve, Docker) of a config the app has loaded in "Leave 20% for my work": the app saves setup's number, not its own swap."""
+
+    def test_the_engine_gets_setup_number_whatever_the_app_saved(self):
+        saved = old_config(47, ui_budget_work_gib=40, ui_resource_profile="work", ui_resource_baseline={"workers": 6, "reserve": 0, "ramBudget": False, "ramHeadroom": False, "ramKeep": False})
+        saved["exe"] = "strata"
+        with contextlib.redirect_stdout(io.StringIO()):
+            args = engine_args(saved)
+        self.assertEqual(value(args, "--resident-budget-gib"), "47")
+        self.assertEqual(args.count("--resident-budget-gib"), 1)
 
 
 class Written(unittest.TestCase):
