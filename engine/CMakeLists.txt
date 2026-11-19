@@ -391,6 +391,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(prefill_plan_test tests/program/prefill_plan_test.cpp)
   target_include_directories(prefill_plan_test PRIVATE include)
   add_test(NAME prefill_plan_test COMMAND prefill_plan_test)
+  # the Qwen3.6 hybrid placement's slots and VRAM need, with the fallback without the staging pair (#5533 #5285; header-only, no GPU)
+  add_executable(q36_hybrid_fit_test tests/program/q36_hybrid_fit_test.cpp)
+  target_include_directories(q36_hybrid_fit_test PRIVATE include)
+  add_test(NAME q36_hybrid_fit_test COMMAND q36_hybrid_fit_test)
 
   # #5715: strata-q36's one-session context check (the reporter's 12 GB card from its log): header-only, no GPU
   add_executable(q36_context_fit_test tests/program/q36_context_fit_test.cpp)

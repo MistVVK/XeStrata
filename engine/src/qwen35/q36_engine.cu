@@ -35,6 +35,7 @@
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/sampling.hpp"
 #include "strata/qwen35/expert_info.hpp"
+#include "strata/qwen35/hybrid_fit.hpp"
 #include "q36_kernels.cuh"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -3050,30 +3051,38 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
     if (!E.use_pf) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
-    const size_t staging = E.use_pf && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
-    size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
-    if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
-    // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
-    int S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
-    if (mtp_only) {   // the main layers all, the MTP block what is left
-        const size_t left = budget2 > total_main ? budget2 - total_main : 0;
-        S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
+    // the slot count and the VRAM need (hybrid_fit.hpp); when the staging pair of the streamed prompt path does not fit the card, the plan without it (#5533)
+    strata::qwen35::HybridIn hin;
+    hin.fr = fr;
+    hin.budget2 = budget2;
+    hin.per_slot = per_slot;
+    hin.n_layers = all.size();
+    hin.tail = kMmqTail;
+    hin.outputs = (size_t) E.tmax * (size_t) m.top_k * (size_t) g.n_embd * 4 + (size_t) E.tmax * (size_t) m.top_k * 4;
+    hin.staging_full = 2 * (max_layer + kMmqTail);
+    hin.streamed = E.use_pf && E.main_hybrid;
+    hin.allow_drop = std::getenv("STRATA_Q36_KEEP_STAGING") == nullptr;   // =1: the old plan, no fallback
+    hin.ne = ne;
+    hin.slots_forced = slots;
+    hin.mtp_only = mtp_only;
+    hin.total_main = total_main;
+    hin.mtp_stride = m.has_mtp ? m.mtp.stride : 0;
+    strata::qwen35::HybridPlan plan = strata::qwen35::hybrid_plan(hin);
+    if (plan.dropped_staging) {
+        E.use_pf = false;                 // no streamed prompt path: every batch on slots + the pool, as for a layer set with no fast prompt route
+        E.hybrid_t = E.tmax;
+        std::fprintf(stderr, "strata-q36: the streamed prompt path's two staging buffers (%.2f GiB) do not fit the free VRAM (%.2f GiB): "
+                     "prompts are read on the experts in VRAM and the CPU pool instead (slower prompts)\n",
+                     (double) hin.staging_full / (1 << 30), (double) fr / (1 << 30));
     }
-    {   // what the hybrid mode allocates next (the staging pair, the CPU part's outputs, the slots) against the VRAM the
-        // sessions and the context left: said with the numbers instead of a cudaMalloc failure (8 slots on a 12 GB card)
-        const size_t Tn = (size_t) E.tmax, Nn = (size_t) g.n_embd, Kn = (size_t) m.top_k;
-        size_t need = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
-        for (Layer* L : all) {
-            if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
-            else need += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
-        }
-        if (need > fr) {
-            err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((need >> 20)) +
-                  " MiB needed, " + std::to_string(fr >> 20) + " MiB free after the weights, the context and the sessions): use "
-                  "fewer slots (\"parallel\" / --batch), a shorter --max-context" +
-                  (slots > 0 ? ", or fewer --expert-slots" : "");
-            return false;
-        }
+    const size_t staging = plan.staging;
+    const int S = plan.S;
+    if (!plan.fits) {
+        err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((plan.need >> 20)) +
+              " MiB needed, " + std::to_string(fr >> 20) + " MiB free after the weights, the context and the sessions): use "
+              "fewer slots (\"parallel\" / --batch), a shorter --max-context" +
+              (slots > 0 ? ", or fewer --expert-slots" : "");
+        return false;
     }
     // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
     size_t host = 0;
