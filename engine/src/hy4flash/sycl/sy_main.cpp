@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "sy_graph.h"
+#include "sy_spec.h"
 
 using namespace hy4s;
 
@@ -28,7 +28,8 @@ int main(int argc, char** argv) {
         const char* be = std::getenv("HY4S_BACKEND");
         setenv("ONEAPI_DEVICE_SELECTOR", (be && std::string(be) == "level_zero") ? "level_zero:gpu" : "opencl:gpu", 1);
     }
-    std::string model, engram, tok_path, out_dir = ".", force_route;
+    std::string model, engram, tok_path, out_dir = ".", force_route, draft = "off";
+    SpecCfg scfg;
     bool load_only = false, dbg = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false;
     int kv_host_above = 24000, gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 1024, index_topk = 2048, threads = 6, expert_act = 1;
     for (int i = 1; i < argc; ++i) {
@@ -57,6 +58,12 @@ int main(int argc, char** argv) {
         else if (a == "--no-index") no_index = true;
         else if (a == "--prof") prof = true;
         else if (a == "--prof2") prof2 = true;
+        else if (a == "--draft") draft = nxt();  // off (CLI default) | dfly2
+        else if (a == "--spec-k") scfg.K = atoi(nxt().c_str());
+        else if (a == "--spec-fixed") scfg.adaptive = false;
+        else if (a == "--spec-cut") scfg.cut = (float)atof(nxt().c_str());
+        else if (a == "--spec-debug") scfg.debug = true;
+        else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
         else {
             fprintf(stderr, "unknown arg %s\n", a.c_str());
             return 2;
@@ -95,7 +102,8 @@ int main(int argc, char** argv) {
         }
         if (max_ctx <= 0) max_ctx = std::max(T0 + gen + 16, 131072);  // owner default for Hy4-Flash: 128K context on every card (the sparse-layer KV then lives in pinned host memory, see kv_host_above)
         const int Tc = std::max(chunk, 1);
-        Runner r(g, cx, max_ctx, Tc, all_logits ? std::min(Tc, T0) : 1);
+        const bool spec_mode = draft == "dfly2" && gen > 0;
+        Runner r(g, cx, max_ctx, Tc, spec_mode ? 8 : (all_logits ? std::min(Tc, T0) : 1));
         r.dump = dump;
         r.dbg_layers = dbg;
         r.force_route_dir = force_route;
@@ -109,6 +117,14 @@ int main(int argc, char** argv) {
         if (!r.init(no_engram ? std::string() : engram, err)) {
             fprintf(stderr, "init: %s\n", err.c_str());
             return 1;
+        }
+        DFly2 df(r);
+        if (draft == "dfly2") {
+            if (!df.init(err)) {
+                fprintf(stderr, "dfly2: %s\n", err.c_str());
+                return 1;
+            }
+            fprintf(stderr, "[dfly2] drafter ready (K=%d%s, rv=%d), device allocated %.2f GiB\n", scfg.K, scfg.adaptive ? " adaptive" : " fixed", scfg.rv, dev_bytes_allocated() / 1073741824.0);
         }
         GpuExperts gxe;
         if (gx_mb > 0 && T0 >= gx_min_t) {
@@ -142,8 +158,9 @@ int main(int argc, char** argv) {
             if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
             const bool last = done == T0;
             if (last) {
-                const int first = all_logits ? std::max(0, T - r.logit_rows) : T - 1;
+                const int first = (all_logits && !spec_mode) ? std::max(0, T - r.logit_rows) : T - 1;
                 r.head(T, first);
+                if (df.ok) df.snap_h(T - first - 1);
                 const int n = T - first;
                 hl.resize((size_t)n * V);
                 d2h(hl.data(), r.logits, hl.size() * 4);
@@ -160,7 +177,24 @@ int main(int argc, char** argv) {
         r.pacc_report("prefill", (T0 + r.Tc - 1) / r.Tc);
         printf("%s", top_out.c_str());
         fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram cpu %.2f s, cpu experts %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_cpu, r.t_cpu_exp);
-        if (gen > 0) {
+        if (spec_mode) {
+            Spec sp(r, df, scfg);
+            std::string gen_ids, finish, e2;
+            int made = 0;
+            r.t_cpu_exp = 0;
+            const double t1 = now_s();
+            sp.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { gen_ids += std::to_string(t) + " "; return true; }, finish, e2, made);
+            const double td = now_s() - t1;
+            if (finish == "error") {
+                fprintf(stderr, "spec: %s\n", e2.c_str());
+                return 1;
+            }
+            printf("generated ids: %s\n", gen_ids.c_str());
+            fprintf(stderr, "[decode] %d tokens in %.2f s = %.2f tok/s (spec dfly2, finish %s, cpu experts %.1f ms/token)\n", made, td, made / td, finish.c_str(), made ? r.t_cpu_exp / made * 1000 : 0.0);
+            sp.report(stderr, td * 1000.0);
+            std::ofstream f(out_dir + "/gen_ids.txt");
+            f << gen_ids << "\n";
+        } else if (gen > 0) {
             int next = 0;
             {
                 const float* lg = &hl[(size_t)(hl.size() / V - 1) * V];
@@ -169,6 +203,7 @@ int main(int argc, char** argv) {
             std::string gen_ids;
             const double t1 = now_s();
             std::vector<double> times;
+            std::vector<float> margins;
             r.t_cpu_exp = 0;
             for (int s = 0; s < gen; ++s) {
                 tok.push_back(next);
@@ -185,6 +220,17 @@ int main(int argc, char** argv) {
                 int32_t nx = 0;
                 d2h(&nx, r.d_argmax, 4);
                 wait();
+                if (std::getenv("HY4S_MARGINS")) {  // analysis: top1 - top2 logit gap of every generated token (near-tie flips between plain and speculative decode)
+                    std::vector<float> row(V);
+                    d2h(row.data(), r.logits, (size_t)V * 4);
+                    wait();
+                    float b1 = -3e38f, b2 = -3e38f;
+                    for (int i = 0; i < V; ++i) {
+                        if (row[i] > b1) { b2 = b1; b1 = row[i]; }
+                        else if (row[i] > b2) b2 = row[i];
+                    }
+                    margins.push_back(b1 - b2);
+                }
                 next = nx;
                 times.push_back(now_s() - ts);
             }
@@ -197,6 +243,10 @@ int main(int argc, char** argv) {
                     times.empty() ? 0.0 : times[times.size() / 2] * 1000, times.empty() ? 0.0 : r.t_cpu_exp / times.size() * 1000);
             std::ofstream f(out_dir + "/gen_ids.txt");
             f << gen_ids << "\n";
+            if (!margins.empty()) {
+                std::ofstream fm(out_dir + "/margins.txt");
+                for (float m : margins) fm << m << "\n";
+            }
         }
         {
             std::ofstream f(out_dir + "/top5.txt");

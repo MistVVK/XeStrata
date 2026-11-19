@@ -86,6 +86,8 @@ public:
     half *cur_h = nullptr, *qr_h = nullptr, *qa_h = nullptr, *o_h = nullptr, *H1 = nullptr, *z_h = nullptr, *er_h = nullptr, *hfin = nullptr, *ctx_h = nullptr;
     float *z_f = nullptr, *zout_f = nullptr, *moe_w = nullptr, *logits = nullptr;
     int32_t *moe_idx = nullptr, *d_argmax = nullptr;
+    float* d_pack = nullptr;  // device buffer of the MoE router/fold outputs (idx, w, z; see init) and its pinned host mirror
+    float* h_pack = nullptr;
     float* hc_part = nullptr;
     uint32_t* hc_cnt = nullptr;
     float* h_z = nullptr;     // pinned host: z [T][1536]
@@ -102,6 +104,32 @@ public:
     half* wv_b = nullptr;
     std::vector<size_t> wk_off, wv_off;
     std::vector<half*> kcache;
+    // DFly2 hook: the top-index_topk key lists of target layers 25,29,33,37,41 for the last (up to 16) rows of the most recent forward chunk (sy_dfly2.h reads them)
+    bool dfly_cap = false;
+    int32_t *dkeys[5] = {}, *dnkc[5] = {};  // [16][index_topk], [16]
+    int cap_p0 = -1, cap_rows = 0;
+    bool cap_list[5] = {};
+    static int dfly_slot(int il) { return il == 25 ? 0 : il == 29 ? 1 : il == 33 ? 2 : il == 37 ? 3 : il == 41 ? 4 : -1; }
+    void dfly_capture_alloc() {
+        for (int d = 0; d < 5; ++d)
+            if (!dkeys[d]) {
+                dkeys[d] = dalloc<int32_t>((size_t)16 * (index_topk + 8));
+                dnkc[d] = dalloc<int32_t>(16);
+            }
+        dfly_cap = true;
+    }
+    void dfly_capture(int il, int p0, int T, bool use_list) {
+        const int d = dfly_slot(il);
+        if (d < 0) return;
+        const int nr = std::min(T, 16), r0 = T - nr;
+        cap_p0 = p0 + r0;
+        cap_rows = nr;
+        cap_list[d] = use_list;
+        if (use_list) {
+            d2d(dkeys[d], keys + (size_t)r0 * index_topk, (size_t)nr * index_topk * 4);
+            d2d(dnkc[d], nkeys + r0, (size_t)nr * 4);
+        }
+    }
     int ring = 0, slots_sparse = 0, logit_rows = 1;
     // host side engram
     hy4::EngramMeta emeta;
@@ -212,18 +240,21 @@ public:
         qa_h = dalloc<half>((size_t)T * 64 * 576);
         o_h = dalloc<half>((size_t)T * 16384);
         ctx_h = dalloc<half>((size_t)T * 64 * 512);
-        z_f = dalloc<float>((size_t)T * 1536);
+        // routing + folded activations share one device buffer and one pinned host buffer: [idx T*16 | w T*16 | z T*1536], so a decode step needs ONE device->host copy per MoE layer
+        d_pack = dalloc<float>((size_t)T * (32 + 1536));
+        h_pack = halloc<float>((size_t)T * (32 + 1536));
+        z_f = d_pack + (size_t)T * 32;
+        moe_idx = (int32_t*)d_pack;
+        moe_w = d_pack + (size_t)T * 16;
+        h_z = h_pack + (size_t)T * 32;
+        h_idx = (int32_t*)h_pack;
+        h_w = h_pack + (size_t)T * 16;
         z_h = dalloc<half>((size_t)T * 1536);
         zout_f = dalloc<float>((size_t)T * 1536);
-        moe_idx = dalloc<int32_t>((size_t)T * 16);
-        moe_w = dalloc<float>((size_t)T * 16);
-        h_z = halloc<float>((size_t)T * 1536);
         h_zout = halloc<float>((size_t)T * 1536);
-        h_idx = halloc<int32_t>((size_t)T * 16);
-        h_w = halloc<float>((size_t)T * 16);
         hfin = dalloc<half>((size_t)T * HID);
         logits = dalloc<float>((size_t)logit_rows * c.vocab);
-        d_argmax = dalloc<int32_t>(1);
+        d_argmax = dalloc<int32_t>(16);
         // kv caches
         ring = ((512 + Tc + 15) / 16) * 16;
         slots_sparse = ((max_ctx + 8 + 15) / 16) * 16;
@@ -483,6 +514,7 @@ public:
             }
         }
         last_use_list = use_list;
+        if (dfly_cap && !swa) dfly_capture(il, p0, T, use_list);
         lin(pa + ".linear_gate.weight", cur_h, F3, T);  // [T][NH*256]
         MlaAttnArgs a;
         a.M = T;
@@ -521,12 +553,14 @@ public:
             { PS _q(this, "o_norm"); add_rms(F3, nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), sub, HID, c.rms_eps, T); }
         } else {
             const size_t nz = (size_t)T * 1536;
+            moe_idx = (int32_t*)d_pack; moe_w = d_pack + (size_t)T * 16; z_f = d_pack + (size_t)T * 32;  // pack layout of this call (see init)
+            h_idx = (int32_t*)h_pack; h_w = h_pack + (size_t)T * 16; h_z = h_pack + (size_t)T * 32;
             { PS _q(this, "router"); linear_f32((const float*)tw(pm + ".gate.weight"), 512, HID, cur_f, F1, T); }
             { PS _q(this, "router_topk"); router_topk_sg(F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 16, c.routed_scale, T); }
             lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536] fp32
-            d2h(h_z, z_f, nz * 4);
-            d2h(h_idx, moe_idx, (size_t)T * 16 * 4);
-            sycl::event evw = Q().memcpy(h_w, moe_w, (size_t)T * 16 * 4);
+            // the pack layout depends on T: [idx T*16 | w T*16 | z T*1536]; the GPU-expert path needs only idx and w on the host (z stays on the device)
+            const bool gx_now = gx != nullptr && T >= gx_min_T;
+            sycl::event evw = Q().memcpy(h_pack, d_pack, ((size_t)T * 32 + ((gx_now && !(dump && dbg_layers)) ? 0 : nz)) * 4);
             // shared expert on the GPU while the CPU computes the routed experts
             lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
             lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);

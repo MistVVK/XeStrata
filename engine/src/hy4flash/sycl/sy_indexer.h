@@ -158,24 +158,43 @@ inline void select(const float* score, int ldS, int p0, int n_top, int kmax, int
         }
         sycl::group_barrier(it.get_group());
         const int n_eq_need = n_top - *n_gt_s;
-        sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space> cnt(*cnt_sel);
-        for (int g = tid; g < grp; g += 256) {
-            if (f2key(sc[g]) > thr) {
-                const int s = cnt.fetch_add(1);
-                for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
+        // emit in a fixed order (independent of the scheduling: the attention over the list then sums in the same order every run, which speculative decoding needs):
+        // all keys > thr in index order, then the first n_eq_need keys == thr in index order. Contiguous chunk per thread + a scan of the per-thread counts.
+        {
+            int* o_gt = lmem<int, 256>(it);
+            int* o_eq = lmem<int, 256>(it);
+            const int chunk = (grp + 255) / 256;
+            const int g0 = tid * chunk, g1 = sycl::min(grp, g0 + chunk);
+            int cg = 0, ce = 0;
+            for (int g = g0; g < g1; ++g) {
+                const uint32_t k = f2key(sc[g]);
+                cg += k > thr ? 1 : 0;
+                ce += k == thr ? 1 : 0;
             }
-        }
-        sycl::group_barrier(it.get_group());
-        if (tid == 0) {
-            int s = *cnt_sel, need = n_eq_need;
-            for (int g = 0; g < grp && need > 0; ++g) {
-                if (f2key(sc[g]) == thr) {
-                    for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
-                    ++s;
-                    --need;
+            o_gt[tid] = cg;
+            o_eq[tid] = ce;
+            sycl::group_barrier(it.get_group());
+            if (tid == 0) {
+                int sg = 0, se = 0;
+                for (int i = 0; i < 256; ++i) {
+                    const int a = o_gt[i], b = o_eq[i];
+                    o_gt[i] = sg;
+                    o_eq[i] = se;
+                    sg += a;
+                    se += b;
                 }
+                *cnt_sel = *n_gt_s + sycl::min(se, n_eq_need);
             }
-            *cnt_sel = s;
+            sycl::group_barrier(it.get_group());
+            int sg = o_gt[tid], se = o_eq[tid];
+            for (int g = g0; g < g1; ++g) {
+                const uint32_t k = f2key(sc[g]);
+                int s = -1;
+                if (k > thr) s = sg++;
+                else if (k == thr) { if (se < n_eq_need) s = *n_gt_s + se; ++se; }
+                if (s >= 0)
+                    for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
+            }
         }
         sycl::group_barrier(it.get_group());
         const int npool = *cnt_sel;
