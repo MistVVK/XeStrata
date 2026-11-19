@@ -20123,12 +20123,15 @@
    "launch_files": [],
    "launch_sets": [],
    "launch_reads": [],
-   "doc_mentions": [
-    "docs/NVIDIA_V100.md"
-   ],
+   "doc_mentions": [],
+   "first_commit": "a4b5b5356e",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "a4b5b5356e",
+   "last_date": "2026-11-19",
    "status": "research",
    "owner": "prefill",
-   "note": "GPUOS-inspired readiness-tier + row-count prompt expert sorting across staged and layer-major prefill walks plus NVLink P2P p2p_stage / peer wmma_l; off unless set",
+   "note": "[reviewed] #6023, opt-in (off by default): the experts of a prompt chunk in readiness-tier and row-count order, and an async P2P copy of a chunk's hidden state between layer-split stages. On an MMQ-free build, 2x Tesla V100-SXM2 NVLink, IQ3_XXS, 5 pairs: layer split about half resident +1.2% at 64K and +1.1% at 8K, tokens identical; --peer-device 0%. With STRATA_PF_WMMA=1 the tokens of 4 of 9 BASE-05 prompts differ (the FP16 tiles), +11.4% / +5.2% (layer split, about half resident) and +27.6% / +24.0% (--peer-device, about half).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -23698,6 +23701,72 @@
    "status": "opt-in",
    "owner": "program",
    "note": "[auto] documented for users (docs/DETAILS.md:1090)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_P2P_DECODE_SCATTER",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/verify.cpp",
+     "line": 3847,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "67b79feb48",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "67b79feb48",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "",
+   "note": "[reviewed] #6023, opt-in (off by default): =1 with --peer-device on two cards that reach each other over P2P: the peer's expert outputs go straight into the primary's hit_out buffer. Measured on 2x Tesla V100-SXM2 32 GB NVLink, IQ3_XXS, 5 pairs, tokens identical (BASE-05 9 of 9 with all experts resident and with about half): decode +0.6% at 8K and +1.3% at 64K with all resident, +3.6% and +5.7% with about half resident.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_P2P_HANDOFF",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/program/generate.cpp",
+     "line": 12622,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "67b79feb48",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "67b79feb48",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "",
+   "note": "[reviewed] #6023, opt-in (off by default): =1: the layer split's hand-off buffers sit in the next stage's VRAM and the stage before writes them over P2P; unset, pinned host memory. Measured on 2x Tesla V100-SXM2 32 GB NVLink, IQ3_XXS, layer split, 5 pairs: prompt -0.2% at 8K and 64K, decode -0.3% and -2.0%, tokens identical (BASE-05 9 of 9, all experts resident and about half). No gain, so off.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -37775,6 +37844,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_SLOT_READ_AHEAD",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/program/generate.cpp",
+     "line": 16647,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "7f611eaa60",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "73e660784f",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "",
+   "note": "[reviewed] #5868, opt-in (off by default): =1 with STRATA_SLOT_READ=1 and STRATA_SLOT_READ_WIDE=1: a slot that reads its turn alone sends its next whole window through an idle group's rows before the last one has passed the stages. Measured on 2x RTX A4000, IQ3_XXS, two 60K-token conversations taking turns, 4 interleaved rounds: first token of a later turn 12.13 -> 8.20 s (-32.4%, 4 of 4 rounds), read 42.0 -> 62.0 tokens/s, same tokens. At 10K tokens faster in 2 of 4 rounds only.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_SLOT_READ_MAX",
    "backends": [
     "cuda-hip"
@@ -37799,6 +37901,39 @@
    "status": "research",
    "owner": "program",
    "note": "[reviewed] #5864: with STRATA_SLOT_READ, the most new tokens of a turn read in its slot (default 1024); a longer turn takes the usual path.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_SLOT_READ_WIDE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/program/generate.cpp",
+     "line": 7538,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "9fd79519f0",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "73e660784f",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "",
+   "note": "[reviewed] #5866, opt-in (off by default): =1 with STRATA_SLOT_READ=1: a slot that is the only one of its group that runs reads its turn in windows of 8 rows instead of its draft rows. Measured on 2x RTX A4000, IQ3_XXS, two 60K-token conversations taking turns, 4 interleaved rounds: first token of a later turn 12.13 -> 10.45 s (-13.9%, 4 of 4 rounds), read 42.0 -> 48.6 tokens/s, same tokens. A turn read through the main sessions took 2.29 s there, so the slot read itself stays opt-in.",
    "retire_after": "",
    "retired_in": ""
   },
