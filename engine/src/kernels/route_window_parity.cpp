@@ -28,7 +28,7 @@ int main() {
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     for (int n_out : {E, 1}) {
-        for (int T : {2, 3, 4, 6}) {
+        for (int T : {1, 2, 3, 4, 5, 6}) {
             std::vector<uint16_t> w((size_t) n_out * N);
             std::vector<float> x((size_t) T * N);
             for (auto& v : w) v = bf16(nd(rng) * 0.05f);

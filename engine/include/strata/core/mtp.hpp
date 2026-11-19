@@ -63,7 +63,8 @@ public:
     bool hnorm_per_stream() const { return hnorm_stream_; }
     /// --mtp-q4 (opt-in; before load): the draft layer's Q8_0 projections and its draft head run from 4-bit (Q4_0)
     /// copies made at load/bind - fewer bytes per draft step; drafts only, the verify window decides every token.
-    /// (The prompt path's batched K/V pass keeps the Q8_0 originals.)
+    /// (The prompt path's batched K/V pass keeps the Q8_0 originals.)  head/all need the draft head's subset;
+    /// bind() says so when there is none, instead of silently drafting over the full head.
     void set_q4(bool proj, bool head) { q4_ = proj; q4_head_ = head; }
     /// --mtp-draft-vocab FILE (opt-in; before bind): the draft head's token subset from FILE instead of
     /// rt/draft_vocab.bin (e.g. data/draft_vocab_en.bin, 40K tokens)

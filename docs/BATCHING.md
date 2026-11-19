@@ -700,6 +700,12 @@ params, so the graph captured per row layout stays valid):
 
 Both are off by default; off, the engine runs the same launches as before. On, the arithmetic per row is the same:
 4 concurrent prompts at temperature 0 gave the same bytes as without them, with `--batch 4` and `--batch 8`.
+With either one on, the engine log says which at start-up (once per stage of a layer split), and whether the KV
+streams, in which case attention keeps one launch per row and only the GDN switch acts:
+
+```
+strata verify: batch rows in one launch: attention on (STRATA_BATCH_ATTN_ROWS), GDN on (STRATA_BATCH_GDN_GROUPS); the KV streams (--kv-resident), so attention keeps one launch per row
+```
 
 One RTX PRO 6000 Blackwell (96 GB), IQ3_S, all 24,576 experts in VRAM, `--kv int8`, 262144 context, `--mtp`,
 `--spec 4`, through the HTTP server: C different stories sent at once, 1024 tokens each, temperature 0.7, mean of

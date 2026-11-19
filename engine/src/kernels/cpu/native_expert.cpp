@@ -7,9 +7,11 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
+#include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/cpu/nvfp4_avx2.hpp"
 #include "strata/kernels/cpu/nvfp4_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/row_prefetch.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/cpu/tq_cpu.hpp"
 
@@ -241,7 +243,32 @@ void init_once() {
     std::call_once(once, [] { layer_init(); });
 }
 
+// BW-G: how many bytes ahead of the row being computed the row loops request the weights (row_prefetch.hpp).
+int row_pf_setting() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_ROW_PF");
+        return e != nullptr && e[0] != '\0' ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+int row_pf_prologue() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_ROW_PF_PRO");
+        return e != nullptr && e[0] != '\0' ? std::atoi(e) : 1;
+    }();
+    return v;
+}
+
 }  // namespace
+
+int row_pf_bytes() noexcept { return row_pf_setting(); }
+int row_pf_hint() noexcept {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_ROW_PF_HINT");
+        return e != nullptr && e[0] != '\0' ? std::atoi(e) : 1;
+    }();
+    return v;
+}
 
 bool native_experts_available() noexcept { return true; }
 
@@ -258,6 +285,79 @@ bool iq256_supported(int type) noexcept {
 }
 
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
+bool kq512_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
+
+namespace {
+// BW-4 (0.2.17): the AVX-512 VNNI rows of UD-Q4_K_XL's Q4_K gate/up and Q5_1 / Q8_0 down (kq_avx512.cpp) are the AVX2 contract's one-token dot bit for bit.  They are
+// checked once per type against this build's dot (the quant layer's, or ggml-cpu's) on synthetic blocks - odd and even block counts, 1 to 13 tokens, the SwiGLU of the gate/up
+// rows included - and a mismatch sends the type back to the per-token dot (slower, never different).  STRATA_NO_KQ512=1 never takes them.
+bool kq512_ok(int type) {
+    static std::mutex mu;
+    static std::map<int, bool> memo;
+    std::lock_guard<std::mutex> lk(mu);
+    if (const auto it = memo.find(type); it != memo.end()) return it->second;
+    bool ok = false;
+    const Tr tr = traits(type);
+    if (cpu_avx512_ok() && kq512_supported(type) && tr.has_dot()) {
+        const Tr ta = traits(tr.vec_dot_type);
+        if (ta.has_from_float()) {
+            ok = true;
+            const size_t bb = type_size_of(type);
+            uint32_t seed = 90210u + (uint32_t) type;
+            auto rnd = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+            const std::vector<int> ns = type == 12 ? std::vector<int>{256, 512, 2560} : std::vector<int>{32, 96, 640};
+            for (const int n : ns) {
+                if (!ok) break;
+                constexpr int rows = 16, kT = 13;
+                const size_t rb = row_size_of(type, (int64_t) n), nb = rb / bb;
+                std::vector<uint8_t> w((size_t) 2 * rows * rb);
+                for (auto& b : w) b = (uint8_t) rnd();
+                for (int r = 0; r < 2 * rows; ++r)
+                    for (size_t k = 0; k < nb; ++k) {
+                        uint8_t* d = &w[(size_t) r * rb + k * bb];
+                        d[0] = 0x66; d[1] = 0x2e;                       // d ~ 0.1 (f16)
+                        if (type == 12 || type == 7) { d[2] = 0x66; d[3] = 0x2e; }   // dmin / m
+                    }
+                const size_t ab = row_size_of(tr.vec_dot_type, (int64_t) n);
+                std::vector<uint8_t> act((size_t) kT * ab);
+                const void* ap[kT];
+                for (int t = 0; t < kT; ++t) {
+                    std::vector<float> x((size_t) n);
+                    for (auto& v : x) v = ((float) (rnd() % 2001) - 1000.f) * 0.001f * (t % 3 == 0 ? 4.f : 1.f);
+                    ta.from_float(x.data(), act.data() + (size_t) t * ab, n);
+                    ap[t] = act.data() + (size_t) t * ab;
+                }
+                for (const int nt : {1, 2, 5, 7, 13}) {
+                    std::vector<float> got((size_t) nt * rows), want((size_t) nt * rows);
+                    float* gp[kT];
+                    for (int t = 0; t < nt; ++t) gp[t] = &got[(size_t) t * rows];
+                    if (type == 12) {
+                        kq512_gu_rows(type, w.data(), rb, (size_t) rows * rb, n, ap, nt, gp, 0, rows);
+                        for (int t = 0; t < nt; ++t)
+                            for (int r = 0; r < rows; ++r) {
+                                float g = 0.f, u = 0.f;
+                                tr.dot(n, &g, w.data() + (size_t) r * rb, ap[t]);
+                                tr.dot(n, &u, w.data() + (size_t) rows * rb + (size_t) r * rb, ap[t]);
+                                want[(size_t) t * rows + r] = (g / (1.f + std::exp(-g))) * u;
+                            }
+                    } else {
+                        kq512_rows(type, w.data(), rb, n, ap, nt, gp, 0, rows);
+                        for (int t = 0; t < nt; ++t)
+                            for (int r = 0; r < rows; ++r) tr.dot(n, &want[(size_t) t * rows + r], w.data() + (size_t) r * rb, ap[t]);
+                    }
+                    if (std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) != 0) {
+                        std::fprintf(stderr, "strata: the AVX-512 rows of type %d differ from this build's dot (n=%d, %d tokens): its dot runs per token instead\n", type, n, nt);
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    memo[type] = ok;
+    return ok;
+}
+}  // namespace
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     init_once();
@@ -556,6 +656,15 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return cpu_avx2_ok() && v != nullptr && std::atoi(v) != 0; }();
+    // BW-4 (0.2.17): on an AVX-512 VNNI CPU the same rows in 512-bit lanes (kq_avx512.cpp): the integer part of a Q4_K block on vpdpbusd / vpdpwssd, the weights decoded once per row
+    // for every token of the group.  Bit-exact against the per-token dot (kq512_ok checks that on first use, per build); STRATA_NO_KQ512=1 never takes them, STRATA_KQ512_MIN=N: from N tokens on (default 8 = the prompt share's jobs; the 2-7 token groups of a decode window ran 1-6% slower on the rows at floors 3 and 4 on a Xeon 8352V, level at 8).
+    static const bool kq512 = cpu_avx512_ok() && std::getenv("STRATA_NO_KQ512") == nullptr;
+    static const int kq512_min = [] { const char* e = std::getenv("STRATA_KQ512_MIN"); return e ? std::atoi(e) : 8; }();
+    static const bool kq512_gu_ok = kq512 && kq512_ok(12);   // (checked once: the check takes a mutex, and this runs on every pool thread for every row range)
+    if (kq512_gu_ok && f.gu_type == 12 && nt >= kq512_min && (Arithmetic == NativeArithmetic::Default || flavour_avx2())) {
+        kq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     // KQ matches the ggml AVX2/FMA dot; other builds keep their own singleton arithmetic.
     if (kq && f.gu_type == 12 && nt >= 2 &&
         (Arithmetic == NativeArithmetic::Default || (flavour_avx2()))) {   // one token: ggml's own dot below (the same bits, less overhead)
@@ -622,9 +731,21 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         return;
     }
     const Tr dot = traits(f.gu_type);
+    // BW-G: the weights a few rows ahead are requested while this row is computed (row_prefetch.hpp); the same bits
+    const int pf_rows = row_pf_bytes() > 0 ? (int) ((size_t) (row_pf_bytes() + (int) f.gu_row - 1) / f.gu_row) : 0;
+    const int pf_hint = row_pf_hint();
+    if (pf_rows > 0 && row_pf_prologue() != 0)
+        for (int k = 0; k < pf_rows && r0 + k < r1; ++k) {
+            row_prefetch_range(blob + (size_t) (r0 + k) * f.gu_row, f.gu_row, pf_hint);
+            row_prefetch_range(blob + f.up_off + (size_t) (r0 + k) * f.gu_row, f.gu_row, pf_hint);
+        }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+        if (pf_rows > 0 && r + pf_rows < r1) {
+            row_prefetch_range(gr + (size_t) pf_rows * f.gu_row, f.gu_row, pf_hint);
+            row_prefetch_range(ur + (size_t) pf_rows * f.gu_row, f.gu_row, pf_hint);
+        }
         for (int t = 0; t < nt; ++t) {
             // g and u are read back after both calls (so the up row's dot starts while the gate row's result is still on its way)
             // and each with its own 4-byte load: GCC on arm64 put them side by side and read both with one 8-byte ldp, a load
@@ -654,6 +775,14 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
     if (tq_rows_own(f.d_type)) {   // the trellis types, as in native_gu_rows
         tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    // BW-4: Q5_1 / Q8_0 down rows in 256-bit VNNI lanes with the weights decoded once per row (kq_avx512.cpp), bit-exact (kq512_ok), as the Q4_K gate/up rows in native_gu_rows
+    static const bool kq512 = cpu_avx512_ok() && std::getenv("STRATA_NO_KQ512") == nullptr;
+    static const int kq512_min = [] { const char* e = std::getenv("STRATA_KQ512_MIN"); return e ? std::atoi(e) : 8; }();
+    static const bool kq512_q51_ok = kq512 && kq512_ok(7), kq512_q80_ok = kq512 && kq512_ok(8);   // (checked once, see native_gu_rows)
+    if (((f.d_type == 7 && kq512_q51_ok) || (f.d_type == 8 && kq512_q80_ok)) && nt >= kq512_min && (Arithmetic == NativeArithmetic::Default || flavour_avx2())) {
+        kq512_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8) &&
@@ -701,8 +830,14 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
         return;
     }
     const Tr dot = traits(f.d_type);
+    const int pf_rows = row_pf_bytes() > 0 ? (int) ((size_t) (row_pf_bytes() + (int) f.d_row - 1) / f.d_row) : 0;
+    const int pf_hint = row_pf_hint();
+    if (pf_rows > 0 && row_pf_prologue() != 0)
+        for (int k = 0; k < pf_rows && r0 + k < r1; ++k)
+            row_prefetch_range(blob + f.down_off + (size_t) (r0 + k) * f.d_row, f.d_row, pf_hint);
     for (int r = r0; r < r1; ++r) {
         const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
+        if (pf_rows > 0 && r + pf_rows < r1) row_prefetch_range(dr + (size_t) pf_rows * f.d_row, f.d_row, pf_hint);
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot.dot(n, &s, dr, hq[t]);

@@ -24,12 +24,10 @@ class ReferenceParser(OutputParser):
                     self.fence = s[0] * (len(s) - len(s.lstrip(s[0])))
                 elif not s:
                     self.ticks = 0
-                else:
-                    self.ticks += line.count("`")      # #4923: a stray opener followed by prose is not carried on
-                    if self.ticks % 2 == 1:
-                        after = line[line.rfind("`") + 1:].strip()
-                        if after and not after.startswith("<"):
-                            self.ticks -= 1
+                elif self.ticks % 2:                                               # #4923: a span opened at a line's end goes on until closed
+                    self.ticks = (self.ticks + line.count("`")) % 2
+                else:                                                              # ... any other unpaired backtick is not carried
+                    self.ticks = 1 if line.count("`") % 2 and line[line.rfind("`") + 1:].strip()[:1] in ("", "<") else 0
                 if was_fenced or self.fence:                                       # #4703: indented code blocks
                     self._prev_blank = self._indented = False
                 elif not s:

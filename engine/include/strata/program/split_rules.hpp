@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace strata::program::split_rules {
@@ -143,6 +144,16 @@ inline size_t pick_with_headroom(const std::vector<Placement>& c, double tol) {
 // below that the probe's noise and the formula's fit are the larger effects.
 
 constexpr double kLinkScaleMin = 4.0;
+
+/// STRATA_SPLIT_LINK_MIN (BW-MG, opt-in): the gap (the fastest stage's link / this stage's) from which the miss term is scaled; unset, empty or anything that is not a number >= 1 keeps kLinkScaleMin.
+/// 2x RTX 5090 on a PCIe 4.0 x8 + x2 board (14.1 and 3.6 GB/s probed, a gap of 3.92): auto K=24 reads a 4K prompt in 5,950 ms against 4,270 on the x8 card alone; with the gap read as 3 the split
+/// puts fewer layers on the x2 card (RESULTS-BW-E.md).
+inline double link_scale_min_resolve(const char* env) {
+    if (env == nullptr || env[0] == '\0') return kLinkScaleMin;
+    char* end = nullptr;
+    const double v = std::strtod(env, &end);
+    return end != env && v >= 1.0 ? v : kLinkScaleMin;
+}
 
 /// Per stage: the factor on its miss term, from the probed H2D GB/s of each stage (<= 0: not probed -> 1.0).
 inline std::vector<double> link_miss_scale(const std::vector<double>& gbps, double min_ratio = kLinkScaleMin) {

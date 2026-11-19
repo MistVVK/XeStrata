@@ -79,6 +79,22 @@ inline void tq_states_tqp(const uint8_t* qs, uint32_t* st) {
 #endif
     for (int t = 0; t < 64; ++t) st[t] = tq_state_tqp<KB>(qs, t);
 }
+// All 64 states, the form of PR #5873 (STRATA_TQP_AVX2_FAST=1, AVX2 rows only): the stream copied once with its first 4 bytes
+// appended, so every state is one 32-bit read, a shift and a mask.  The same bits as tq_state_tqp.
+template <int KB>
+inline void tq_states_tqp_fast(const uint8_t* qs, uint32_t* st) {
+    constexpr int NB = 8 * KB;
+    uint8_t buf[NB + 4];
+    std::memcpy(buf, qs, NB);
+    std::memcpy(buf + NB, qs, 4);
+#if defined(__GNUC__)
+#pragma GCC unroll 64
+#endif
+    for (int t = 0; t < 64; ++t) {
+        const uint32_t off = (uint32_t) (63 - t) * (uint32_t) KB;
+        st[t] = (tq_ld32(buf + (off >> 3)) >> (off & 7)) & kTqStateMask;
+    }
+}
 
 /// fp16 bits -> float, exact (the block scales and the Q8_0 activation scales).
 inline float tq_half_to_float(uint16_t h) {

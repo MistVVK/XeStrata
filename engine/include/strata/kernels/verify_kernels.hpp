@@ -79,6 +79,27 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// BW-5 (STRATA_L2_PF=1): device ranges to pull into the L2 cache.  `l2_prefetch_ranges` issues a prefetch hint for every
+/// byte of them (`cp.async.bulk.prefetch.L2` on sm_90+, `prefetch.global.L2` below); it reads and writes nothing, so every
+/// value the window computes is unchanged.  A no-op on HIP.
+struct L2PrefetchSet {
+    static constexpr int kMax = 32;
+    unsigned long long ptr[kMax];
+    unsigned long long bytes[kMax];
+    unsigned first_chunk[kMax + 1];   ///< filled by l2_prefetch_finish
+    int n = 0;
+    unsigned long long total_bytes = 0;
+    void add(const void* p, unsigned long long b) {
+        if (p == nullptr || b < 16 || n >= kMax) return;
+        const unsigned long long a = (unsigned long long) (uintptr_t) p;
+        const unsigned long long lo = a & ~15ull;
+        ptr[n] = lo;
+        bytes[n] = (b + (a - lo)) & ~15ull;
+        total_bytes += bytes[n];
+        ++n;
+    }
+};
+void l2_prefetch_ranges(const L2PrefetchSet& set, void* stream);
 /// wait_flag_ge and copy_i32_from_mapped in ONE launch (143-amdk): thread 0 spins on *flag >= value, the block then
 /// copies dst[0, n) = src[0, n) (mapped host memory, volatile reads).  One kernel node fewer per layer: a dependent
 /// kernel costs ~2.4 us on a gfx1201 graph whatever it does.  n <= 128 * k for any k (a strided loop).

@@ -6,8 +6,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <exception>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -95,6 +99,15 @@ int64_t read_int(Cur& c, uint32_t t) {
 }
 }  // namespace
 
+// Threads for the load-time conversion: STRATA_CONVERT_THREADS (1 = the single-threaded loop), else the machine's threads up to 8 (each holds one tensor as
+// floats, 2 GB for the embedding table), never more than there are tensors to convert.
+static int convert_threads(int jobs) {
+    int n = 0;
+    if (const char* v = std::getenv("STRATA_CONVERT_THREADS")) n = std::atoi(v);
+    if (n <= 0) n = (int) std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
+    return std::max(1, std::min(n, jobs));
+}
+
 Gguf::Gguf(const std::string& first) {
     std::smatch m;
     static const std::regex split(R"((.*-)(\d{5})(-of-)(\d{5})(\.gguf)$)");
@@ -121,20 +134,57 @@ void Gguf::convert_small_tensors() {
         mixed |= kv.second.type == T_IQ2_S || kv.second.type == T_IQ3_XXS || kv.second.type == T_IQ3_S || kv.second.type == T_Q2_0;
     iq_experts_ = mixed;
     if (!mixed) return;
+    // #5800: every tensor is converted on its own (its own input, its own output vector), so the conversions run on several threads: one thread took 62 s of
+    // a 122 s cold load of the ISTA IQ3_S set on a 12-core Xeon.  The jobs and their output slots are made in the map's order first, so owned_ holds
+    // the same vectors in the same order as before and the bytes do not depend on the thread count.  STRATA_CONVERT_THREADS=1 is the old single-threaded loop.
+    struct Job {
+        Tensor* t;
+        uint32_t want;   // the type to convert to
+        bool repack;     // the routed Q2_0 -> Q4_0 repack instead (F32 is type 0: it cannot mark it)
+        std::vector<uint8_t>* out;
+    };
+    std::vector<Job> jobs;
     for (auto& kv : tensors_) {
         Tensor& t = kv.second;
         if (t.type == T_Q2_0) {   // the routed down experts of some layers: the same values as Q4_0 blocks
             owned_.emplace_back();
-            conv::repack_q2_0_to_q4_0(t, owned_.back());
-            ++converted_;
+            jobs.push_back({&t, 0, true, &owned_.back()});
             continue;
         }
         const uint32_t want = conv::wanted_type(t.name);
         if (want == 0xFFFFFFFFu || want == t.type) continue;
         owned_.emplace_back();
-        conv::convert(t, want, owned_.back());
-        ++converted_;
+        jobs.push_back({&t, want, false, &owned_.back()});
     }
+    const int n_threads = convert_threads((int) jobs.size());
+    std::atomic<size_t> next{0};
+    std::exception_ptr failed;
+    std::mutex failed_mu;
+    auto work = [&] {
+        for (;;) {
+            const size_t i = next.fetch_add(1);
+            if (i >= jobs.size()) return;
+            try {
+                const Job& j = jobs[i];
+                if (j.repack) conv::repack_q2_0_to_q4_0(*j.t, *j.out);
+                else conv::convert(*j.t, j.want, *j.out);
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(failed_mu);
+                if (!failed) failed = std::current_exception();
+                next.store(jobs.size());   // the others stop at their next tensor
+                return;
+            }
+        }
+    };
+    if (n_threads <= 1) {
+        work();
+    } else {
+        std::vector<std::thread> pool;
+        for (int k = 0; k < n_threads; ++k) pool.emplace_back(work);
+        for (std::thread& th : pool) th.join();
+    }
+    if (failed) std::rethrow_exception(failed);
+    converted_ = (int) jobs.size();
     std::fprintf(stderr, "gguf: %d dense/small tensors converted to Q8_0/F32 at load (the file's routed experts keep their types)\n", converted_);
 }
 

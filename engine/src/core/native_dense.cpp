@@ -603,6 +603,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         for (auto& item : pending) {
             item.ref->native_data = item.data.get();
             item.ref->native_type = item.type;
+            item.ref->native_bytes = item.bytes;
             item.ref->native_q8_1 = scratch.get();
             if (item.packed) {
                 strata::kernels::native_q8_0_packed_register(item.data.get(), item.packed.get(), (int) item.ref->ne0,

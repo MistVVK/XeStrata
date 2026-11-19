@@ -28,6 +28,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/runtime_files.hpp"
+#include "strata/core/verify_env.hpp"
 #include "strata/uc_probe.hpp"
 #include "strata/pipeline_auto.hpp"
 #include "strata/sycl_doorbell.hpp"
@@ -1808,6 +1809,16 @@ int main(int argc, char **argv) try {
             return 0;
         }
     }
+    // #6250, #4698: STRATA_VERIFY_NO_HOST=1 without STRATA_VERIFY_DEVICE_PLAN leaves a layer with an expert outside VRAM unplanned (strata-sycl.sh sets both;
+    // an engine started without it, as the packaged component is, with only NO_HOST=1 ended "the GPU stopped waiting for the plan (flag A)" or wrote "!!!").
+    if (strata::no_host_wants_device_plan(std::getenv("STRATA_VERIFY_NO_HOST"), std::getenv("STRATA_VERIFY_DEVICE_PLAN"))) {
+#if defined(_WIN32)
+        _putenv_s("STRATA_VERIFY_DEVICE_PLAN", "1");
+#else
+        setenv("STRATA_VERIFY_DEVICE_PLAN", "1", 0);
+#endif
+        std::fprintf(stderr, "strata: STRATA_VERIFY_NO_HOST=1 needs the device-built plan for experts outside VRAM: STRATA_VERIFY_DEVICE_PLAN=1 is set too (STRATA_VERIFY_DEVICE_PLAN=0 keeps it off)\n");
+    }
 #if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
     // AMD, a file-backed arena (STRATA_ARENA_MMAP): ROCclr copies a pageable source of 1 MiB or more by locking its
     // pages in place (a GPU userptr), and keeps them - so every expert the VRAM fill copied from the mapped
@@ -2840,11 +2851,16 @@ int main(int argc, char **argv) try {
                                      "(build it again with tools/iq_pack.py, or run setup again).\n");
         }
         strata::kernels::cpu::cpu_require_expert_support();
-    } else if (!strata::kernels::cpu::cpu_avx512_ok())
-        std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
+    } else if (!strata::kernels::cpu::cpu_vnni_ok())
+        std::fprintf(stderr, "strata generate: %s: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
+                     strata::kernels::cpu::cpu_features().avx512_vnni
+                         ? "AVX-512 VNNI tier disabled or unavailable"
+                         : "this CPU has no AVX512-VNNI",
                      !strata::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2: the older-CPU build)"
                      : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+    else if (!strata::kernels::cpu::cpu_avx512_ok())
+        std::fprintf(stderr, "strata generate: AVX-512 VNNI tier enabled (no VBMI)\n");
     // the compiled shape; a native model's file replaces it below with its own metadata (read_geometry), which a
     // pruned variant (GSQ-RCO Coder, fewer than 512 experts) differs from
     strata::core::ModelGeometry g = strata::core::kCompiledGeometry;
@@ -8438,7 +8454,28 @@ int main(int argc, char **argv) try {
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         const bool all_experts_resident = !host_res.empty() &&
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
-        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
+        // An expert the primary does not hold may still be on a GPU: a helper card's cache (--expert-cache-deviceN) or
+        // the peer tier.  When every expert is on SOME GPU there is nothing for the adaptive tier to promote, and its
+        // rounds only exchange experts between the primary and the CPU/host path (evicted experts fall to the CPU).
+        // OFF by default (#5540: the author's two-card helper-mode run went from 32.1 to 61.3 tok/s, which we have not measured; the
+        // adaptive tier's rounds also move experts to the CPU path, so the arithmetic of those rows can differ): STRATA_ADAPT_ALL_ON_GPUS=1 turns it on.
+        static const bool adapt_all_on_gpus_on = [] { const char* v = std::getenv("STRATA_ADAPT_ALL_ON_GPUS"); return v != nullptr && v[0] == '1'; }();
+        const bool all_experts_on_gpus = all_experts_resident || (adapt_all_on_gpus_on && !host_res.empty() &&
+            (drive.d.remote_count > 0 || peer.valid()) && [&] {
+                for (size_t i = 0; i < host_res.size(); ++i) {
+                    if (host_res[i] >= 0) continue;
+                    const int64_t l = (int64_t) (i / (size_t) g.n_expert);
+                    const int32_t e = (int32_t) (i % (size_t) g.n_expert);
+                    bool held = peer.valid() && peer.has(l, e);
+                    for (int r = 0; !held && r < drive.d.remote_count; ++r) held = drive.d.remote[r]->holds(l, e);
+                    if (!held) return false;
+                }
+                return true;
+            }());
+        if (all_experts_on_gpus && !all_experts_resident && o.adapt_every > 0 && o.adapt_swaps > 0)
+            std::fprintf(stderr, "strata generate: every expert is on a GPU (primary + helper/peer caches); "
+                                 "adaptive tier off\n");
+        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_on_gpus)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && n_stages == 1) {

@@ -513,6 +513,22 @@ void test_resident_memory_budget() {
         require(clamp_resident_budget(24 * GiB, phys, strata::platform::commit_available(left, 24 * GiB), headroom) == 24 * GiB,
                 "a budget the page file's room to grow covers was clamped");
     }
+    {
+        // #3725: a 31 GB PC with two cards (WDDM shared segment ~15.5 GiB, ~12 GiB of it left for this process): the
+        // auto complement of 14.81 GiB was pinned whole and the next 26 KB cudaMalloc failed.  With 2 GiB kept for the
+        // buffers mapped later the reporter's own patch gave 12.90 -> 10.97 GiB at 12.97 GiB left.
+        using strata::core::detail::clamp_budget_to_shared_segment;
+        const uint64_t seg = 12970ull * GiB / 1000, keep = 2 * GiB;
+        require(clamp_budget_to_shared_segment(14810ull * GiB / 1000, seg, keep) == seg - keep,
+                "a complement larger than the shared segment's room was not cut");
+        require(clamp_budget_to_shared_segment(8 * GiB, seg, keep) == 8 * GiB,
+                "a complement that fits the shared segment was changed");
+        require(clamp_budget_to_shared_segment(seg - keep, seg, keep) == seg - keep,
+                "a complement that exactly fits the shared segment was changed");
+        require(clamp_budget_to_shared_segment(8 * GiB, keep, keep) == 0 && clamp_budget_to_shared_segment(8 * GiB, 0, keep) == 0,
+                "a shared segment with no room beyond the reserve produced a positive complement");
+        require(clamp_budget_to_shared_segment(8 * GiB, seg, 0) == 8 * GiB, "a zero reserve changed a fitting complement");
+    }
 }
 
 void test_cgroup_memory_budget() {
@@ -703,7 +719,23 @@ void test_host_memory() {
     put("fs/box/memory.max", "48G\n");
     require(!probe("0::/box\n"), "v2 malformed limit accepted");
     fs::remove(t.path / "fs/box/memory.max");
-    require(!probe("0::/box\n"), "v2 group without memory.max accepted");
+    // #5196: a group without a memory.max has no memory controller and no limit of its own; with no limit above it either, MemAvailable alone
+    require(probe("0::/box\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v2 group without memory.max: no limit of its own");
+    // ... and the parent's limit still applies to it (a 40 GiB group above a child that has no controller)
+    put("fs/memory.max", std::to_string(40 * GiB) + "\n");
+    put("fs/memory.current", std::to_string(10 * GiB) + "\n");
+    put("fs/memory.stat", "inactive_file " + std::to_string(2 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
+    require(probe("0::/box\n") && m.cgroup_limit == 40 * GiB && m.available < 100 * GiB, "v2: the controllerless child reads its parent's limit");
+    // a container that has no cgroup namespace: /proc/self/cgroup names the host's path, /sys/fs/cgroup is its own group (the mount's root)
+    require(probe("0::/system.slice/docker-abc.scope\n") && m.cgroup_limit == 40 * GiB && m.available < 100 * GiB,
+            "v2: a path that is not in the mount reads the mount's own group");
+    fs::remove(t.path / "fs/memory.max");
+    fs::remove(t.path / "fs/memory.current");
+    fs::remove(t.path / "fs/memory.stat");
+    // an unreadable limit (a directory where the file should be) is still not guessed at, and says what it could not read
+    fs::create_directories(t.path / "fs/box/memory.max");
+    require(!probe("0::/box\n") && m.why != nullptr, "v2 unreadable memory.max accepted");
+    fs::remove_all(t.path / "fs/box/memory.max");
     // v1: the memory controller's group (a hybrid line list), a 32 GiB limit with 10 GiB used
     put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
     put("fs/memory/docker/abc/memory.usage_in_bytes", std::to_string(10 * GiB) + "\n");
@@ -715,6 +747,27 @@ void test_host_memory() {
     require(probe("4:memory:/docker/abc\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v1 unlimited");
     // a v1 group not visible here (another namespace): MemAvailable alone
     require(probe("4:memory:/elsewhere\n") && m.available == 100 * GiB, "v1 group not mounted");
+    // a hybrid host (Vast's Docker containers): v1 controllers plus a "0::/..." line, and no cgroup.controllers at the root
+    // (the root is the v1 tree, the "0::" path is not in it).  The v1 limit must apply (it was "cannot determine")
+    fs::remove(t.path / "fs/cgroup.controllers");
+    put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
+    const std::string hybrid = "12:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n1:name=systemd:/docker/abc\n0::/docker/abc\n";
+    require(probe(hybrid) && m.available == 22 * GiB && m.cgroup_limit == 32 * GiB, "hybrid: the v1 limit applies");
+    require(probe("4:memory:/docker/abc\n0::/docker/abc\n") && m.available == 22 * GiB, "hybrid: the 0:: line last");
+    require(probe("0::/docker/abc\n4:memory:/docker/abc\n") && m.available == 22 * GiB, "hybrid: the 0:: line first");
+    require(probe("4:memory:/docker/abc\n0::/\n") && m.available == 22 * GiB, "hybrid: a 0::/ line");
+    put("fs/memory/docker/abc/memory.limit_in_bytes", "9223372036854771712\n");
+    require(probe(hybrid) && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "hybrid: v1 unlimited");
+    require(probe("0::/docker/abc\n") && m.available == 100 * GiB, "a 0:: line with no controllers file and no v1 line: MemAvailable alone");
+    // with cgroup.controllers (a real v2 root) the 0:: line is the limit and a v1 line beside it is not read
+    put("fs/cgroup.controllers", "memory\n");
+    put("fs/box/memory.max", std::to_string(48 * GiB) + "\n");
+    put("fs/box/memory.current", std::to_string(16 * GiB) + "\n");
+    put("fs/box/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
+    put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
+    require(probe("4:memory:/docker/abc\n0::/box\n") && m.cgroup_limit == 48 * GiB, "v2 root: the 0:: line wins over a v1 line");
+    // (#5196: a 0:: path that is not in the mount reads the mount's own group; this root has no memory.max, so MemAvailable alone)
+    require(probe("0::/nowhere\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v2 root: a 0:: path that is not a directory: the mount's own group");
 #else
     require(host_available_memory(m) && m.available > 0 && m.cgroup_limit == ~0ull, "this PC's RAM");
 #if defined(_WIN32)

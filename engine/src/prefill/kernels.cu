@@ -6,6 +6,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/emulate.hpp"
+#include "strata/core/per_device_flag.hpp"
 #include "strata/core/device_error_exit.hpp"
 
 #include <cuda_fp16.h>
@@ -41,6 +42,8 @@ __device__ __forceinline__ float warp_max(float v) {
 }
 __device__ __forceinline__ uint16_t bf(float f) {
     uint32_t u = __float_as_uint(f);
+    // a NaN stays a quiet NaN, as in bf16_bits.hpp: the rounding add would carry it into -0 or inf
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 64u);
     u += 0x7fffu + ((u >> 16) & 1u);
     return (uint16_t) (u >> 16);
 }
@@ -1803,9 +1806,14 @@ __global__ void __launch_bounds__(S) gdn_out_norm_loop_kernel(const float* __res
         } else {
             // STRATA_GDN_NOY=1: nothing reads the FP32 result (403 MB per 16K chunk).  The FP16 value is what the
             // compiler makes of hf(v) next to the store: v_fma_mixlo_f16, the product rounded to FP16 once
+#if defined(__gfx900__)
+            // gfx900 has no v_fma_mix (gfx906+): the FP32 product rounded to FP16, which may differ in the last bit
+            y16[o16] = hf(bp * sg);
+#else
             unsigned r;
             asm("v_fma_mixlo_f16 %0, %1, %2, 0" : "=v"(r) : "v"(sg), "v"(bp));
             y16[o16] = (uint16_t) r;
+#endif
         }
     }
 }
@@ -2879,7 +2887,11 @@ bool f16_range_read(float& max_abs, unsigned long long& over, bool reset) {
     union { unsigned u; float f; } c; c.u = bits; max_abs = c.f; over = o;
     if (reset) {
         const unsigned z = 0; const unsigned long long zz = 0;
-        cudaMemcpyToSymbol(g_f16_range_max, &z, sizeof z); cudaMemcpyToSymbol(g_f16_range_over, &zz, sizeof zz);
+        /* both writes must run even when the first fails, else the untouched symbol keeps a stale
+           cumulative count and the next read reports it after a reset was requested */
+        const cudaError_t e_max = cudaMemcpyToSymbol(g_f16_range_max, &z, sizeof z);
+        const cudaError_t e_over = cudaMemcpyToSymbol(g_f16_range_over, &zz, sizeof zz);
+        if (e_max != cudaSuccess || e_over != cudaSuccess) { cudaGetLastError(); return false; }
     }
     return true;
 #endif
@@ -2920,12 +2932,14 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {
 #if defined(__HIPCC__)
-    static const bool gfx11 = [] {
-        int dev = 0;
+    // per card (#4431): a gfx11 + gfx12 layer split asks this from both; a process-wide answer made by the first card launched the gfx11 kernel on the other
+    static strata::core::PerDeviceFlag<> gfx11_dev;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return false; }
+    const bool gfx11 = gfx11_dev.get(dev, [](int d) {
         cudaDeviceProp p;
-        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
-        return strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
-    }();
+        return cudaGetDeviceProperties(&p, d) == cudaSuccess && strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
+    });
     if (!gfx11 || T <= 0) return false;
     gr_upmix_kernel<<<dim3(N / UM_D, (unsigned) ((T + UM_T - 1) / UM_T)), 512, 0, (cudaStream_t) stream>>>(
         lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
@@ -3023,7 +3037,10 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
         // STRATA_GDN_CHUNKED=1 (opt-in): the chunked recurrence on the gfx11 matrix cores, FP16 operands (other bits;
         // a shorter chunk or another part takes the kernels below)
         static const bool chunked = gdn_chunked_env() != 0;   // (unset: gdn_rec_wmma applies the gfx12 length gate)
-        if (chunked && !serial && gdn_rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, (cudaStream_t) stream, ld16)) {
+        // only with the output: the scan fuses the output normalization (it reads z / gamma and writes y16), which the
+        // KVA state-only call passes as null - that combination faulted the device ("unspecified launch failure")
+        if (chunked && !serial && with_out &&
+            gdn_rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, (cudaStream_t) stream, ld16)) {
             check("gdn_recurrence (chunked, WMMA)");
             return;
         }

@@ -150,7 +150,8 @@ restart. Defaults are off unless the table says otherwise.
 | `--vram-reserve-later-mib N` | A separate VRAM reserve for the later cards (default: `--vram-reserve-mib`). Use it when the display sits on the last card. | `--vram-reserve-mib 300 --vram-reserve-later-mib 1800` gives the first card that VRAM. |
 | `--prefill-pipe R` (or `STRATA_PREFILL_PIPE=R`) | Reads each prompt in the chunk count with the least pipeline time for b/a = R tokens. `1` evens out today's chunk count. | Opt-in. `./setup.sh --calibrate` measures it per PC and writes it to the config. |
 | `STRATA_SPLIT_RING=N` | Sets the prompt path's streamed ring to N slots (`0`: the pinned-share rule). A split uses 96 when at least 75% of the (layer, expert) pairs sit in some card's cache. | The startup line `lend sizing: ...` shows the result. |
-| `STRATA_SPLIT_CHUNK16K=1` | Keeps the 16384-token auto chunk on AMD gfx12 splits (default 8192). | |
+| `STRATA_SPLIT_CHUNK16K=1` | Keeps the 16384-token auto chunk on AMD gfx12 splits (default 8192); on NVIDIA it keeps the raised ceiling of 32768. | 2x RTX 5090 (PCIe 4.0 x2 + x8), UD-Q4_K_XL, 73% of the experts on the cards: 16K prompt 11.2 -> 8.7 s, 32K 20.0 -> 12.0 s, decode and 4K unchanged. A split that holds all its experts keeps the 8192 default. |
+| `STRATA_SPLIT_LINK_MIN=r` | The gap (fastest card's link / this card's) from which a slow link scales the auto split's miss cost (default 4). | A x8 beside a x2 slot is a gap of 3.9 and was left unscaled: auto put 24 layers on the x2 card. With `=3` the x2 card gets fewer layers. |
 | `STRATA_SPLIT_OVERLAP=1` | Overlapped hand-off between stages on different cards. | Helps AMD; no gain on NVIDIA. See [below](#overlapped-hand-off). |
 | `--split-device D1[,D2..]` | The later stages' devices (default: the next visible ones). `--layer-split K --split-device 0` runs both stages on one card; a bit-exact hand-off check, not a speed mode. | |
 

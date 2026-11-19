@@ -716,5 +716,26 @@ class Source(unittest.TestCase):
                          f"--source was not used: {warnings}")
 
 
+class RepackTypeSizes(unittest.TestCase):
+    """#5167: metal_repack.py's TYPE_SIZE (bytes per block, values per block) knows every type a Mac pack can carry,
+    and agrees with the Terminal's GGUF reader (tools/gguf_reader.py); a type missing from it stops a repack with a KeyError."""
+
+    def test_sizes_match_the_reader(self):
+        sys.path.insert(0, str(ROOT.parent / "engine" / "metal" / "tools"))
+        sys.path.insert(0, str(ROOT / "tools"))
+        import gguf_reader
+        import metal_repack
+        for type_id, (nbytes, nvals) in metal_repack.TYPE_SIZE.items():
+            name = gguf_reader.GGML_TYPES.get(type_id)
+            if name in gguf_reader.BLOCK_GEOMETRY:
+                self.assertEqual(gguf_reader.BLOCK_GEOMETRY[name], (nvals, nbytes), f"type {type_id} ({name})")
+
+    def test_trellis_types_are_known(self):
+        sys.path.insert(0, str(ROOT.parent / "engine" / "metal" / "tools"))
+        import metal_repack
+        for type_id in (143, 144, 145, 146):   # PTQ1_0, TQ2_T, TQK6, TQK7 (agentionai's Gyro trellis blocks)
+            self.assertIn(type_id, metal_repack.TYPE_SIZE)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -264,7 +264,7 @@ machine then swaps or stalls, raise it. Re-check after a ROCm update.
 | --- | --- | --- |
 | `STRATA_SH_STREAM=1` | Off on HIP, except the gfx1151 table | Shared-expert fork on its own stream. Output is identical; speed goes both ways by PC. `./setup.sh --calibrate` measures it and writes it to the config's `"env"` only when it wins by more than 3%. |
 | `STRATA_MTP_SIDE_STREAM` | Off on HIP, on for gfx103x | `=0` turns it off on gfx103x, `=1` creates it on another HIP card |
-| `STRATA_DENSE_MMQ=1` | Off | Dense GGUF prompt projections through int8 MMQ kernels instead of dequantize + hipBLAS. Greedy text can diverge after a few dozen tokens (q8_1 rounding). |
+| `STRATA_DENSE_MMQ=1` | No effect since 0.2.16 | The engine has no MMQ kernels any more, so the dense prompt projections always run as dequantize + hipBLAS. Before 0.2.16 this switched them to int8 MMQ kernels. The engine says so at start-up when the setting is on. |
 | `STRATA_HIP_ADAPT_KERNEL_COPY=1` | Off | Adaptive-tier swaps copied by a kernel instead of the SDMA engine; a workaround for a gfx1030 hang with MMQ prompts and adaptive swaps (untested by the reporter) |
 
 **Why `STRATA_SH_STREAM` goes both ways.** The fork has to hide something. With experts on the CPU in the window, the shared expert forks

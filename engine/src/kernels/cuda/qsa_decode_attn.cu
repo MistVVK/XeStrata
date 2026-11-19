@@ -883,7 +883,7 @@ bool query_swizzle_gfx906_device() {
         const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
                         cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
         if (!ok) cudaGetLastError();
-        per_dev[dev] = ok && strata::sm120_default(maj, mnr) ? 2 : 1;
+        per_dev[dev] = ok && strata::sm12x_default(maj, mnr, strata::kGb10AttnDaily) ? 2 : 1;
     }
     return per_dev[dev] == 2;
 #endif

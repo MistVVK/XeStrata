@@ -3,6 +3,7 @@
 
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/core/per_device_flag.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1001,11 +1002,13 @@ void df2_attention_variant(int v) { g_attn_variant = v; }
 // warp a row with unroll 1 (31) is 2x faster on the 256 and 640 row matrices (akp / mkp 12.1 -> 6.3 us, selector 11.1 -> 5.2); all bitwise the same results.
 static int df2_q4_auto(int rows) {
 #if defined(STRATA_USE_HIP)
-    static const bool gfx12 = [] {
-        int dev = 0;
+    static strata::core::PerDeviceFlag<> gfx12_dev;   // per card (#4431)
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) (void) cudaGetLastError();
+    const bool gfx12 = gfx12_dev.get(dev, [](int d) {
         cudaDeviceProp p;
-        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
-    }();
+        return cudaGetDeviceProperties(&p, d) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
+    });
     if (gfx12) return rows <= 640 ? 31 : 26;
 #endif
     (void) rows;

@@ -2428,15 +2428,22 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         // started when it was launched behind that work still in flight on another queue (no GPU breadcrumb, 20 s
         // timeout, the engine dies). Letting the other queues drain before every window removes it (9 of 9 three-request runs pass; before, almost all
         // failed; the gap rule alone (=2) did not help, so it is the windows after each other, not only the first). The cost is
-        // the overlap of a window with the previous commit's tail.  STRATA_WINDOW_SYNC=1 always drains, =0 never, =2 the gap rule; the default is 1 on an i915 card, 0 elsewhere.
+        // the overlap of a window with the previous commit's tail.  STRATA_WINDOW_SYNC=1 always drains, =0 never, =2 the gap rule; the default is 1 on an i915 card, an Alchemist card and an integrated GPU, 0 elsewhere.
         // #2194: the same never-starting first window on an Arc A770 under xe (main thread in this function's stepped
         // serve, queue::wait, no xe reset) - an Alchemist card, whatever its driver. Reproduced on the A750 with
         // STRATA_WINDOW_SYNC=0 (stepped, --resident-experts, IQ3_XXS): 1 of 6 runs hung there (same stack), against 0 of 11
         // with the drain. So the default drain is per GPU generation now: every Alchemist card (i915 or xe), as before
         // every i915 card; Battlemage and the others are unchanged (0).
+        // An integrated GPU (the Arc 140T on xe, 2026-10-12) has the same hang: with 0 the first window after the prompt
+        // never rang (10 of 10 requests stalled, cache all-resident or mirrored); with 1, 10 of 10 decode at 11.5-17.2 tok/s
+        // mirrored and 12.0-17.4 all-resident (0.1.40: 11.2-16.9 mirrored, same boot), so it is 1 there too.
+        static const bool igpu = [] {
+            try { return dpct::get_current_device().get_info<sycl::info::device::host_unified_memory>(); }
+            catch (...) { return false; }
+        }();
         static const char* wv = std::getenv("STRATA_WINDOW_SYNC");
         static const int wmode = wv ? std::atoi(wv)
-                                    : ((intel_i915_gpu() || strata::intel_gpu_gen(cs_->get_device()) == strata::IntelGpuGen::Alchemist) ? 1 : 0);
+                                    : ((intel_i915_gpu() || strata::intel_gpu_gen(cs_->get_device()) == strata::IntelGpuGen::Alchemist || igpu) ? 1 : 0);
         const bool first_or_gap = t_prev_end.time_since_epoch().count() == 0 || (t_launch - t_prev_end) > std::chrono::milliseconds(20);
         if (wmode == 1 || (wmode == 2 && first_or_gap)) dpct::get_current_device().queues_wait_and_throw();
     }

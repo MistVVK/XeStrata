@@ -302,7 +302,9 @@ struct GdnQ81 { half2 ds; int8_t qs[32]; };
 __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t idx, float xi) {
     // no contraction: xi is a product here, and fma(a, b, shfl) would round the first sum unlike the separate
     // quantizer, which reads xi from memory (S26 harness: ds.sum differed by 1 ulp without this)
+#if defined(__HIPCC__)
 #pragma clang fp contract(off)
+#endif
     float amax = fabsf(xi), sum = xi;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
@@ -1675,6 +1677,46 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     check("wait_flag_ge");
 }
 
+namespace {
+constexpr unsigned kL2PfChunk = 16384;   // bytes one bulk prefetch covers
+// BW-5: one thread per 16 KiB chunk (strided); the hint is asynchronous, so the kernel itself ends in a few microseconds
+// while the L2 fills.  Nothing is read into registers and nothing is written.
+__global__ void l2_prefetch_kernel(const L2PrefetchSet s, unsigned total_chunks) {
+#if !defined(__HIPCC__)
+    for (unsigned c = blockIdx.x * blockDim.x + threadIdx.x; c < total_chunks; c += gridDim.x * blockDim.x) {
+        int r = 0;
+        while (r + 1 < s.n && s.first_chunk[r + 1] <= c) ++r;
+        const unsigned long long off = (unsigned long long) (c - s.first_chunk[r]) * kL2PfChunk;
+        const unsigned long long len = (s.bytes[r] - off) < kL2PfChunk ? (s.bytes[r] - off) : kL2PfChunk;
+        const unsigned long long a = s.ptr[r] + off;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(a), "r"((unsigned) len) : "memory");
+#else
+        for (unsigned long long o = 0; o < len; o += 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(a + o));
+#endif
+    }
+#else
+    (void) s; (void) total_chunks;
+#endif
+}
+}  // namespace
+
+void l2_prefetch_ranges(const L2PrefetchSet& set, void* stream) {
+    if (set.n <= 0) return;
+    L2PrefetchSet s = set;
+    unsigned total = 0;
+    for (int i = 0; i < s.n; ++i) {
+        s.first_chunk[i] = total;
+        total += (unsigned) ((s.bytes[i] + kL2PfChunk - 1) / kL2PfChunk);
+    }
+    s.first_chunk[s.n] = total;
+    if (total == 0) return;
+    static const int blocks_env = [] { const char* e = std::getenv("STRATA_L2_PF_BLOCKS"); return e != nullptr ? std::atoi(e) : 8; }();
+    const unsigned blocks = (unsigned) std::max(1, std::min(blocks_env, 64));
+    l2_prefetch_kernel<<<blocks, 128, 0, (cudaStream_t) stream>>>(s, total);
+    check("l2_prefetch_ranges");
+}
+
 void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,
                           void* stream) {
     wait_flag_ge_stamped_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, t_in, t_out);
@@ -1791,7 +1833,7 @@ bool pdl_supported() {
         cudaFuncAttributes fa{};
         const bool on_attr = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
                              cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
-        const bool env_on = env_mode == 1 || (env_mode < 0 && on_attr && strata::sm120_default(major, minor));
+        const bool env_on = env_mode == 1 || (env_mode < 0 && on_attr && strata::sm12x_default(major, minor, strata::kGb10DfPdl));
         const bool on = env_on && on_attr &&
                         strata::cc_major_of(major) >= 9 &&
                         cudaFuncGetAttributes(&fa, gpu_stamp_kernel<true>) == cudaSuccess && fa.ptxVersion >= 90 &&

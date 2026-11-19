@@ -7,6 +7,7 @@
 // Every row the synthetic table holds encodes its own index, so a wrong offset, a straddle mishandled or a
 // dedup slot mixed up shows as a mismatch rather than as plausible data.
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/progress.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -223,7 +224,10 @@ void format_round_trip(const std::string& dir, const k::PleFormatInfo& f, uint32
             if (mode == k::PleIo::Mmap) br[5000] = rows + 7;   // out of range (mapped): zeros, as read_row gives
             std::vector<float> bo(nr * k::PLE_HEAD_DIM);
             std::string e2;
+            const uint64_t pb0 = strata::core::progress().beats.load();
             CHECK(t.gather_batch(br.data(), nt, bo.data(), e2), "%s: %s: gather_batch: %s", f.name, name, e2.c_str());
+            // #4682 (mapped table: #3952): one beat for the serve watchdog per 4096-row window, so demand faults that are slow but moving are not "no progress"
+            if (mode == k::PleIo::Mmap) CHECK(strata::core::progress().beats.load() - pb0 >= 3, "%s: %s: gather_batch beat %llu times for 3 windows", f.name, name, (unsigned long long) (strata::core::progress().beats.load() - pb0));
             size_t bad = 0;
             for (size_t i = 0; i < nr && !g_fail; ++i) {
                 if (br[i] >= rows) {
@@ -643,6 +647,17 @@ int selftest(const std::string& dir, uint32_t rb) {
             if (cache > 0) CHECK(rd.stats().cache_hits > 0, "the row cache never hit");
             CHECK(rd.cache_size() <= rd.cache_capacity(), "row cache exceeded its bound");
         }
+    }
+    // #4682: every row read that completes is a beat for the serve watchdog (a slow drive that still answers is not a stopped engine)
+    for (bool thr : {false, true}) {
+        ng::PleReader rd;
+        std::string err;
+        CHECK(rd.open(path, HEADER, N, 16, 0, err, thr, rb), "open: %s", err.c_str());
+        std::vector<uint32_t> rows(16);
+        for (auto& r : rows) r = rng() % N;
+        const uint64_t b0 = strata::core::progress().beats.load();
+        check_rows(rd, rows, N, rb, "beats");
+        CHECK(strata::core::progress().beats.load() > b0, "no progress beat from 16 completed table reads (threaded %d)", (int) thr);
     }
     // fault injection: a 3 ms delay must be observed, and must not change the bytes
     for (bool thr : {false, true}) {
