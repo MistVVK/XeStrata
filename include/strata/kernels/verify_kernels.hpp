@@ -129,6 +129,10 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 /// into dst + k * blob_bytes with coalesced 16-byte loads - the PCIe share of a layer's missed experts, staged
 /// into VRAM before the grouped expert kernel reads them.  Launched for a capacity of `cap` blobs.
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream);
+/// R1Q2: copy each expert's exact size, derived from its K pair, into slots stride bytes apart.
+void fetch_r1q2_blobs(const unsigned long long* src, const int32_t* count, uint8_t* dst, int64_t stride, int cap,
+                      const int32_t* starts, const int32_t* entries, const int32_t* route_ids, const uint8_t* k_pairs,
+                      int n_embd, int n_ff, void* stream);
 /// Measures once per device how many work-groups fetch_blobs needs to fill the link (the fewest within 2% of the
 /// fastest), so the VRAM hits beside it keep the rest of the GPU.  Before it fetch_blobs runs two a compute unit.
 void fetch_blobs_tune(void* stream);

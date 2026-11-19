@@ -1928,6 +1928,11 @@ if(STRATA_NATIVE_EXPERTS)
     set_tests_properties(latent_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     # the BF16 token embedding (--embd-gguf) gathered and dequantized bit for bit: synthetic, so in CTest
     add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
+    # bih3 R1Q2 matrix rows, K=2..14, against the scalar CPU reference
+    add_test(NAME native_expert_parity_bih3_mmvq COMMAND native_expert_parity --bih3-mmvq)
+    set_tests_properties(native_expert_parity_bih3_mmvq PROPERTIES TIMEOUT 120)
+    add_test(NAME native_expert_parity_bih3_grouped COMMAND native_expert_parity --bih3-grouped)
+    set_tests_properties(native_expert_parity_bih3_grouped PROPERTIES TIMEOUT 120)
     # UD-Q4_K_XL's expert pairs (and Q8_0 alone) and OrcaRouter Q4_K_S's q4_K/q5_0 on synthetic ggml-quantized
     # weights at 2560/640 (upstream efeffd8, d652cd6): GPU and CPU experts against the float reference, GPU
     # dequantizers against to_float
