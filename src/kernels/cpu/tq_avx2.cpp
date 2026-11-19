@@ -162,7 +162,7 @@ namespace bih3_avxvnni {
 #endif
 namespace bih3_avx512vnni {
 #define BIH3_MODE 2
-#define BIH3_FN __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+#define BIH3_FN __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")))
 #include "tq_bih3_rows.inl"
 #undef BIH3_FN
 #undef BIH3_MODE

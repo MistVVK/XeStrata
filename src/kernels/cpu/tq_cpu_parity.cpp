@@ -657,6 +657,8 @@ int check_bih3_r1q2() {
             if (std::fabs(gu[t][r] - ref) > 2e-6 * (1 + std::fabs(ref))) ++failures;
         }
     }
+    std::printf("bih3 auto ISA: %s (AVX-VNNI %s, AVX-512 VNNI %s)\n", bih3_isa_name(bih3_isa()),
+                bih3_isa_ok(Bih3Isa::avxvnni) ? "yes" : "no", bih3_isa_ok(Bih3Isa::avx512vnni) ? "yes" : "no");
     std::printf("bih3 R1Q2 scalar vs FP64: worst normalized error %.3g, %d failures\n", worst, failures);
     for (Bih3Isa isa : {Bih3Isa::avx2, Bih3Isa::avxvnni, Bih3Isa::avx512vnni})
         std::printf("bih3 R1Q2 %s vs scalar: %d row results %s\n", bih3_isa_name(isa), checked[(int) isa],
