@@ -78,6 +78,7 @@ from typing import Any, NamedTuple, NoReturn
 
 from serve import download as download_core
 from serve import envvars, hardware, kernel_check, model_terms, places, release_check, settings
+from serve import sync_models
 from serve import autotune
 from serve import option_values as OV
 from serve.model_terms import _qimage
@@ -9926,6 +9927,40 @@ def describe() -> dict:
             "custom": getattr(ARGS, "custom", None),
             # the fields of the options (OPTIONS), each with what setup offers now
             "options": options_described()}
+
+
+SYNC_REPOS = {"Sync-XS": "hiru2005/Sync-XS", "Sync-S": "hiru2005/Sync-S",
+              "Sync-M": "sync-strata/Sync-M"}
+
+
+def fetch_sync_files(models_dir: Path, model: str) -> tuple[Path, Path]:
+    """Fetch the selected pack and the shared files once, checking the pinned manifest hashes."""
+    root = models_dir / "sync"
+    pack, shared = root / model.lower(), root / "sync-shared"
+    groups = ((pack, SYNC_REPOS[model], sync_models.PACK_FILES[model]),
+              (shared, "hiru2005/Sync-shared", sync_models.SHARED_FILES))
+    for folder, repo, files in groups:
+        REPO_PINS.setdefault(repo, {}).update({p.rsplit("/", 1)[-1]: pin for p, pin in files.items()})
+        for rel, (size, expected) in files.items():
+            dst = folder / rel
+            if not dst.exists():
+                download_file(hf(repo) + rel, dst, rel)
+            if not dst.is_file() or dst.stat().st_size != size:
+                fail(f"{dst} does not have the pinned size", "the file was left in place; check it and retry")
+            # Unlike a sidecar .done, this mark is keyed on path, size and mtime.  It is written only after the
+            # direct read, so setup reuses stage 0's files and never trusts an unrelated download's mark.
+            kept = _kept_mark(dst)
+            direct_mark = kept.with_name(kept.name + ".sync-direct") if kept else None
+            if direct_mark and direct_mark.is_file() and direct_mark.read_text(encoding="utf-8") == expected:
+                continue
+            say(f"  checking {dst.name} against the Sync manifest (SHA-256) ...")
+            actual = sync_models.sha256(dst, size)
+            if actual != expected:
+                fail(f"{dst} has SHA-256 {actual}, expected {expected}", "the file was left in place; check it")
+            if direct_mark:
+                direct_mark.parent.mkdir(parents=True, exist_ok=True)
+                direct_mark.write_text(expected, encoding="utf-8")
+    return pack, shared
 
 
 def setup_edge0(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
