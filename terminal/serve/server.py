@@ -6934,8 +6934,11 @@ def make_handler(svc: Service):
             elif path in ("/v1/models", "/models") or path.startswith(("/v1/models/", "/models/")):
                 if self._authorized():
                     loaded = svc.loaded()
+                    ctx = svc.reported_ctx()
+                    # the context size under the names other APIs use too (vLLM's max_model_len, OpenRouter's
+                    # context_length), so a client that sizes its window from /v1/models reads it
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
-                             "meta": {"n_ctx": svc.reported_ctx()},
+                             "max_model_len": ctx, "context_length": ctx, "meta": {"n_ctx": ctx},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
