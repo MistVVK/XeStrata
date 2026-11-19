@@ -319,6 +319,7 @@ public:
             HCK(hipEventCreateWithFlags(&ev_hyb, hipEventDisableTiming));
             int nth = getenv("HY4_CPU_THREADS") ? atoi(getenv("HY4_CPU_THREADS")) : std::max(1, (int)std::thread::hardware_concurrency() / 2);
             if (!cpu.init(g.path, nth, &g.cpu_mask, err)) return false;
+            if (!getenv("STRATA_CPUEXP_ACT")) cpu.set_hi_activations(true);  // two-term int8 activations: ~GPU-exact quality (KL 1e-3 vs 7e-3) for ~1% decode cost
             skd::moe_has_cpu() = 1;
             hyb = true;
             fprintf(stderr, "[hybrid] %llu experts (%.2f GB) in host RAM computed by %d CPU threads\n", (unsigned long long)cpu.resident_count(), cpu.arena_bytes() / 1e9, cpu.n_threads());
