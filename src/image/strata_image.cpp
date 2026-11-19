@@ -129,8 +129,10 @@
 //                            the VRAM that upscale needs (from the files)                   -> NEED as NEED's
 //   UPSVNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:<m>]
 //                            the VRAM a video's upscale needs: UPSNEED's, a temporal model's chunk of one latent
-//                            in the VAE's smallest tiles (least) or of 21 frames with the frame whole (full, the
-//                            default chunk) added                                          -> NEED as NEED's
+//                            in the VAE's tiles that take the least of it with their carried frames in the RAM free
+//                            now (least: past any GPU's where none fits the RAM) or of 21 frames with the frame
+//                            whole (full, the default chunk) added                         -> NEED as NEED's,
+//                            with ram_short=1 where the RAM is too short for every tiling
 //   UPSV <width> <height> <in> <out stem> <name>[:<path>] [COLOR:<m>] [SEED:<s>] [CHUNK:<frames>] [OVERLAP:<latents>]
 //        [CODEC:<h264|vp9|ffv1>] [YIELD:1]
 //                            the video <in> (a file ffmpeg reads) upscaled to width x height by the upscaler, written
@@ -1641,14 +1643,16 @@ int serve(si::ImagePipeline& p) {
                 strata::gpu::mem_info(&free, &total);
                 const int64_t mul = std::max<int64_t>(1, m.info().multiple);
                 const int64_t fw = (w + mul - 1) / mul * mul, fh = (h + mul - 1) / mul * mul;
-                const uint64_t least =
-                    su::UpscaleRunner::least_bytes(m, iw, ih, w, h, color) + m.video_bytes(fw, fh, 1, true);
+                const uint64_t vleast = m.video_bytes(fw, fh, 1, true);   // UINT64_MAX: the RAM too short
+                const uint64_t least = vleast == UINT64_MAX
+                                           ? UINT64_MAX
+                                           : su::UpscaleRunner::least_bytes(m, iw, ih, w, h, color) + vleast;
                 const uint64_t full =
                     su::UpscaleRunner::full_bytes(m, iw, ih, w, h, color) + m.video_bytes(fw, fh, 21, false);
-                std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu cap_mib=%llu host_mib=0\n",
+                std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu cap_mib=%llu host_mib=0%s\n",
                             (unsigned long long) (least >> 20), (unsigned long long) (full >> 20),
                             (unsigned long long) ((p.held() + ups.held()) >> 20), (unsigned long long) (free >> 20),
-                            (unsigned long long) (total >> 20));
+                            (unsigned long long) (total >> 20), vleast == UINT64_MAX ? " ram_short=1" : "");
             } else if (op == "UPSNEED") {   // UPSNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:]
                 int64_t w = 0, h = 0, iw = 0, ih = 0;
                 std::string spec, word;

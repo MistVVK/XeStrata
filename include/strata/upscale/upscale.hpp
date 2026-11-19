@@ -109,7 +109,8 @@ public:
     virtual void video_take(uint8_t* out, int64_t n) { (void) out, (void) n; }
     virtual void video_end() {}
     /// A temporal model's VRAM for a video's chunk of `chunk` frames of w x h besides its weights, at its least
-    /// (`least`) or whole (0 for the others).
+    /// (`least`: within the RAM free now for what it keeps there, UINT64_MAX where that is too little) or whole (0
+    /// for the others).
     virtual uint64_t video_bytes(int64_t w, int64_t h, int64_t chunk, bool least) const {
         (void) w, (void) h, (void) chunk, (void) least;
         return 0;

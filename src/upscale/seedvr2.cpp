@@ -6,6 +6,7 @@
 #include "strata/upscale/seedvr2.hpp"
 
 #include "strata/core/device.hpp"
+#include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/img_start.hpp"
@@ -49,6 +50,46 @@ uint64_t vae_video_need(const image::MfVae& vae, int64_t th, int64_t tw, int64_t
                                                            image::MfVae::video_tiles(tw, tt));
     const uint64_t per = (uint64_t) HW * 176 + (uint64_t) (a * b * 256) * 96 + (uint64_t) (th * tw * 64) * 24;
     return vae.video_scratch_bytes(a, b, 4 * slice) + carried + per * (uint64_t) lat;
+}
+
+// What of vae_video_need stays on the GPU through the DiT's turn as well: every tile's carried frames where the GPU
+// keeps them (with the host cache the last tile's leave it before the DiT runs: run_chunks' video_park), and the
+// buffers video_begin keeps for the clip (the encoder's frames, the decoder's FP32 and RGBA8 output: 112 bytes a
+// pixel a latent; the latents' staging).  Counted with the DiT's activations, not instead of them: without it, and
+// with the last tile's carried frames left on the GPU, a 1280 x 960 video on the RTX 4070 held 9.3 GiB in the DiT's
+// turn where its plan said 8.0 (2026-11-19)
+uint64_t vae_video_kept(const image::MfVae& vae, int64_t th, int64_t tw, int64_t HW, int64_t tt, bool host,
+                        int64_t lat) {
+    if (tt <= 0) tt = std::max(th, tw);
+    const int64_t a = image::MfVae::video_tile_side(th, tt), b = image::MfVae::video_tile_side(tw, tt);
+    const uint64_t carried = host ? 0
+                                  : vae.video_carried_bytes(a, b) * (uint64_t) (image::MfVae::video_tiles(th, tt) *
+                                                                                image::MfVae::video_tiles(tw, tt));
+    return carried + ((uint64_t) HW * 112 + (uint64_t) (th * tw * 64) * 4) * (uint64_t) lat;
+}
+
+// The frames made and not taken yet (RGBA8, kept for the clip once made): a push's decodes, up to a chunk's and a VAE
+// call's latents of four frames each
+uint64_t video_frames_out(int64_t HW, int64_t cl, int64_t lat) { return (uint64_t) (4 * (cl + lat) + 1) * HW * 4; }
+
+// The page-locked RAM a video's VAE holds for its tiles' carried frames with the host cache (every tile's, both
+// sides'; nothing without it)
+uint64_t vae_video_host(const image::MfVae& vae, int64_t th, int64_t tw, int64_t tt, bool host) {
+    if (!host) return 0;
+    if (tt <= 0) tt = std::max(th, tw);
+    const int64_t a = image::MfVae::video_tile_side(th, tt), b = image::MfVae::video_tile_side(tw, tt);
+    return vae.video_carried_bytes(a, b) * (uint64_t) (image::MfVae::video_tiles(th, tt) *
+                                                       image::MfVae::video_tiles(tw, tt));
+}
+
+// The RAM the host cache may lock: what is available now less 8 GiB, or the RAM the user asked to leave free where
+// that is more.  A 1280 x 960 video's tiles of 16 locked 36 GB beside a text engine's 74 and the kernel's OOM killer
+// ended the text engine (the 123 GiB development machine, 2026-11-19).  UINT64_MAX where the RAM cannot be read
+uint64_t video_ram_room() {
+    core::detail::HostMemory hm;
+    if (!core::detail::host_available_memory(hm)) return UINT64_MAX;
+    const uint64_t avail = std::min(hm.available, hm.cgroup_limit), keep = core::detail::ram_headroom(8ull << 30);
+    return avail > keep ? avail - keep : 0;
 }
 
 // the tiles video_begin tries after the frame whole, largest first
@@ -206,6 +247,7 @@ struct Seedvr2::Impl {
     void decode_upto(int64_t upto);
 };
 
+
 // the frames waiting for the encoder through it: the latents they give, scaled, to the conditions; `keep`: more
 // frames after them
 void Seedvr2::Impl::encode_slice(bool keep) {
@@ -246,6 +288,7 @@ void Seedvr2::Impl::run_chunks() {
             image::noise_to_tokens(r.data() + f * lh * lw, 16, lh, lw, 2, tok.data() + f * n, len * lh * lw);
         gpu::copy(v.ncat, tok.data(), tok.size() * 4);
         auto t0 = std::chrono::steady_clock::now();
+        if (vae_host) vae->video_park();   // the last tile's carried frames off the GPU for the DiT's activations
         dit->forward(v.ncat, v.ccat, th, tw, v.vel, len);
         core::Runtime::get().stream(s).wait_and_throw();
         dit->drop_activations();   // the room the VAE's slices take
@@ -317,13 +360,25 @@ uint64_t Seedvr2::video_bytes(int64_t w, int64_t h, int64_t chunk, bool least) c
     if (!v.open(m.vae_path, m.s, err, true) || !v.open_encoder(err, true) || !d.open(m.dit_path, m.s, err, true))
         throw std::runtime_error("SeedVR2: " + err);
     // as video_begin takes the room besides the weights: the chunk's noise, conditions, velocity and latents held,
-    // the frames, then the larger of the chunk's DiT activations and the VAE's slice (the frame whole for the full;
-    // for the least, the smallest tiles with their carried frames in host memory)
+    // the frames and those made, then the larger of the chunk's DiT activations (with what the VAE keeps through
+    // them) and the VAE's slice (the frame whole for the full; for the least, the smallest tiles with their carried
+    // frames in host memory), a latent a call
     const int64_t HW = w * h;
-    uint64_t vae = vae_video_need(v, th, tw, HW, 0, false, 1);
-    if (least)   // the smallest tiles, their carried frames in host memory
-        vae = std::min(vae, vae_video_need(v, th, tw, HW, std::end(kVaeTiles)[-1], true, 1));
-    return (uint64_t) (cl * n) * 4 * 7 + (uint64_t) HW * 4 * 3 + std::max(d.activation_bytes(th, tw, cl), vae);
+    const auto turn = [&](int64_t tt, bool host) {
+        return std::max(vae_video_need(v, th, tw, HW, tt, host, 1),
+                        vae_video_kept(v, th, tw, HW, tt, host, 1) + d.activation_bytes(th, tw, cl));
+    };
+    uint64_t vae = turn(0, false);
+    if (least) {   // the tiles whose carried frames fit the RAM in host memory (video_begin's choice); none: no room
+        const uint64_t ram = video_ram_room();
+        vae = UINT64_MAX;
+        for (const int64_t tt : {int64_t{0}, kVaeTiles[0], kVaeTiles[1], kVaeTiles[2], kVaeTiles[3], kVaeTiles[4],
+                                 kVaeTiles[5]})
+            if ((tt == 0 || tt < std::max(th, tw)) && vae_video_host(v, th, tw, tt, true) <= ram)
+                vae = std::min(vae, turn(tt, true));
+        if (vae == UINT64_MAX) return UINT64_MAX;
+    }
+    return (uint64_t) (cl * n) * 4 * 7 + (uint64_t) HW * 4 * 3 + video_frames_out(HW, cl, 1) + vae;
 }
 
 void Seedvr2::video_begin(int64_t w, int64_t h, int64_t frames, uint64_t seed, int64_t chunk, int64_t overlap) {
@@ -348,9 +403,10 @@ void Seedvr2::video_begin(int64_t w, int64_t h, int64_t frames, uint64_t seed, i
     v.total = (frames - 1 + 3) / 4 * 4 + 1;
     v.tl = (v.total - 1) / 4 + 1;
     const int64_t th = h / 16, tw = w / 16, n = th * tw * 64, HW = w * h;
-    // The room: the weights (the DiT's blocks at their least), the latents held and the frames, then the larger of a
-    // chunk's DiT activations and the VAE's slice (they take the room in turns), the rest the DiT's resident blocks.
-    // The chunk (0: the largest that fits) and the VAE's tiles (the largest that fit: the frame whole where it does)
+    // The room: the weights (the DiT's blocks at their least), the latents held and the frames, the frames made and
+    // not taken yet, then the larger of a chunk's DiT activations (beside what the VAE keeps through the DiT's turn:
+    // vae_video_kept) and the VAE's slice (they take the room in turns), the rest the DiT's resident blocks.  The
+    // chunk (0: the largest that fits) and the VAE's tiles (the largest that fit: the frame whole where it does)
     // from it
     const uint64_t margin = room_margin();
     const auto fixed = [&](int64_t cl) {
@@ -361,57 +417,88 @@ void Seedvr2::video_begin(int64_t w, int64_t h, int64_t frames, uint64_t seed, i
         const uint64_t f = fixed(cl);
         return m.room > f ? m.room - f : 0;
     };
-    int64_t cl = chunk > 0 ? (chunk - 1) / 4 + 1 : v.tl;
+    const auto act = [&](int64_t cl) { return m.dit->activation_bytes(th, tw, cl); };
+    int64_t cl0 = chunk > 0 ? (chunk - 1) / 4 + 1 : v.tl;
     if (chunk > 0 && (chunk - 1) % 4 != 0) throw std::invalid_argument("SeedVR2: a chunk of 4 n + 1 frames");
-    cl = std::min(cl, v.tl);
-    if (chunk <= 0)
-        while (cl > 1 && m.dit->activation_bytes(th, tw, cl) > work(cl)) --cl;
+    cl0 = std::min(cl0, v.tl);
+    if (chunk <= 0) {   // with the least the VAE keeps (its smallest tiles, in host memory, a latent a call)
+        const uint64_t kept = vae_video_kept(*m.vae, th, tw, HW, std::end(kVaeTiles)[-1], true, 1);
+        while (cl0 > 1 && act(cl0) + kept + video_frames_out(HW, cl0, 1) > work(cl0)) --cl0;
+    }
+    // The tiles and the latents a VAE call takes (up to a chunk's): the frame whole, else the largest of 64 .. 16
+    // tokens whose work and carried frames fit with a latent a call; else, the tiles' carried frames in host memory
+    // (copied in and out once a call: slower, but the GPU holds one tile's) where the RAM holds them, the largest
+    // whose work fits with four latents a call (fewer copies), else with one; else the least, whatever the room says.
+    // The calls as long as the room lets them, each tile through all their frames before the next.  For the first
+    // two, the chunk is made smaller down to 21 frames (6 latents): a 1280 x 960 clip's VAE took 1.36 times as long
+    // with two latents a call as with five on the RTX 4070 (tiles of 40 in host memory), where its DiT took 11 s of
+    // the 161 (2026-11-19)
+    const uint64_t ram = video_ram_room();
+    const auto ram_fits = [&](int64_t tt, bool host) { return vae_video_host(*m.vae, th, tw, tt, host) <= ram; };
+    constexpr int64_t kTiles[] = {0, kVaeTiles[0], kVaeTiles[1], kVaeTiles[2], kVaeTiles[3], kVaeTiles[4],
+                                  kVaeTiles[5]};
+    const auto tiles_ok = [&](int64_t tt) { return tt == 0 || tt < std::max(th, tw); };
+    // what a choice takes beside the fixed with a chunk of cl latents: the VAE's turn, or the DiT's with what the VAE
+    // keeps through it
+    const auto turn = [&](int64_t cl, int64_t tt, bool host, int64_t lat, int64_t sl) {
+        return std::max(vae_video_need(*m.vae, th, tw, HW, tt, host, lat, sl),
+                        vae_video_kept(*m.vae, th, tw, HW, tt, host, lat) + act(cl)) +
+               video_frames_out(HW, cl, lat);
+    };
+    const auto most = [&](int64_t cl, int64_t tt, bool host) {   // the latents a call whose turns fit (0: none)
+        int64_t l = cl;
+        while (l > 0 && turn(cl, tt, host, l, 1) > work(cl)) --l;
+        return l;
+    };
+    const auto pick = [&](int64_t cl, bool host, int64_t least) {
+        for (const int64_t tt : kTiles)
+            if (tiles_ok(tt) && ram_fits(tt, host) && most(cl, tt, host) >= least) return tt;
+        return int64_t{-1};
+    };
+    int64_t cl = cl0;
+    m.vae_tt = -1;
+    for (int64_t c = cl0; m.vae_tt < 0 && c >= (chunk > 0 ? cl0 : std::min<int64_t>(cl0, 6)); --c) {
+        cl = c;
+        m.vae_host = false;
+        m.vae_tt = pick(c, false, 1);
+        if (m.vae_tt < 0) {
+            m.vae_host = true;
+            m.vae_tt = pick(c, true, std::min<int64_t>(4, c));
+        }
+    }
+    if (m.vae_tt < 0) {
+        cl = cl0;
+        m.vae_tt = pick(cl, true, 1);
+        for (auto it = std::rbegin(kTiles); m.vae_tt < 0 && it != std::rend(kTiles); ++it)   // the least the GPU takes,
+            if (tiles_ok(*it) && ram_fits(*it, true)) m.vae_tt = *it;                        // whatever its room says
+        if (m.vae_tt < 0) {
+            const double gib = 1073741824.0;
+            char b[320];
+            std::snprintf(b, sizeof b, "memory: SeedVR2's VAE at %lldx%lld carries %.1f GiB of frames at the least, "
+                          "which neither the GPU's room nor the RAM (%.1f GiB free beside what stays free) holds",
+                          (long long) w, (long long) h, (double) vae_video_host(*m.vae, th, tw, 0, true) / gib,
+                          (double) ram / gib);
+            throw std::runtime_error(b);
+        }
+    }
     v.cl = cl;
     m.last_chunk = 4 * (cl - 1) + 1;
     v.overlap = std::clamp<int64_t>(overlap, 0, v.cl - 1);
     v.step = v.cl - v.overlap;
     v.seed = seed;
-    const uint64_t act = m.dit->activation_bytes(th, tw, v.cl), room = work(v.cl);
-    {   // the tiles and the latents a VAE call takes (up to a chunk's): the frame whole, else the largest of 64 .. 16
-        // tokens whose work and carried frames fit with a latent a call; else, the tiles' carried frames in host memory
-        // (copied in and out once a call: slower, but the GPU holds one tile's), the largest whose work fits with
-        // four latents a call (fewer copies), else with one; else the least, whatever the room says.  The calls as
-        // long as the room lets them, each tile through all their frames before the next
-        const auto need = [&](int64_t tt, bool host, int64_t lat) {
-            return vae_video_need(*m.vae, th, tw, HW, tt, host, lat);
-        };
-        const auto most = [&](int64_t tt, bool host) {   // the latents a call whose need fits (0: none)
-            int64_t l = v.cl;
-            while (l > 0 && need(tt, host, l) > room) --l;
-            return l;
-        };
-        const auto pick = [&](bool host, int64_t least) {
-            for (const int64_t tt : {int64_t{0}, kVaeTiles[0], kVaeTiles[1], kVaeTiles[2], kVaeTiles[3], kVaeTiles[4],
-                                     kVaeTiles[5]})
-                if ((tt == 0 || tt < std::max(th, tw)) && most(tt, host) >= least) return tt;
-            return int64_t{-1};
-        };
-        m.vae_host = false;
-        m.vae_tt = pick(false, 1);
-        if (m.vae_tt < 0) {
-            m.vae_host = true;
-            m.vae_tt = pick(true, std::min<int64_t>(4, v.cl));
-            if (m.vae_tt < 0) m.vae_tt = pick(true, 1);
-            if (m.vae_tt < 0) m.vae_tt = std::end(kVaeTiles)[-1];
+    m.vae_lat = std::max<int64_t>(most(cl, m.vae_tt, m.vae_host), 1);
+    // then a tile's slices within a call as long as the room left lets them, up to 4 latents: each convolution over
+    // more frames at once
+    m.vae_slice = 1;
+    for (int64_t sl = std::min<int64_t>(4, m.vae_lat); sl > 1; --sl)
+        if (turn(cl, m.vae_tt, m.vae_host, m.vae_lat, sl) <= work(cl)) {
+            m.vae_slice = sl;
+            break;
         }
-        m.vae_lat = std::max<int64_t>(most(m.vae_tt, m.vae_host), 1);
-        // then a tile's slices within a call as long as the room left lets them, up to 4 latents:
-        // each convolution over more frames at once
-        m.vae_slice = 1;
-        for (int64_t sl = std::min<int64_t>(4, m.vae_lat); sl > 1; --sl)
-            if (vae_video_need(*m.vae, th, tw, HW, m.vae_tt, m.vae_host, m.vae_lat, sl) <= room) {
-                m.vae_slice = sl;
-                break;
-            }
-        m.vae->set_video_host_cache(m.vae_host);
-        m.vae->set_video_slice(m.vae_slice);
-        const uint64_t vae = vae_video_need(*m.vae, th, tw, HW, m.vae_tt, m.vae_host, m.vae_lat, m.vae_slice);
-        const uint64_t f = fixed(v.cl) - m.dit->block_min() + std::max(act, vae);
+    m.vae->set_video_host_cache(m.vae_host);
+    m.vae->set_video_slice(m.vae_slice);
+    {
+        const uint64_t f = fixed(cl) - m.dit->block_min() + turn(cl, m.vae_tt, m.vae_host, m.vae_lat, m.vae_slice);
         m.dit->set_block_budget(std::max(m.room > f ? m.room - f : 0, m.dit->block_min()));
     }
     v.slice = m.get<float>(4 * m.vae_lat * 3 * HW);
@@ -423,6 +510,20 @@ void Seedvr2::video_begin(int64_t w, int64_t h, int64_t frames, uint64_t seed, i
     v.rgb = m.get<float>(4 * m.vae_lat * 3 * HW);
     v.rgba = m.get<uint8_t>(4 * m.vae_lat * 4 * HW);
     m.enc_s = m.dit_s = m.dec_s = 0.0;
+    {   // the plan in the engine's log, beside what the process holds once its buffers are in place
+        const auto mib = [](uint64_t b) { return (unsigned long long) (b >> 20); };
+        const uint64_t vae = vae_video_need(*m.vae, th, tw, HW, m.vae_tt, m.vae_host, m.vae_lat, m.vae_slice);
+        const uint64_t kept = vae_video_kept(*m.vae, th, tw, HW, m.vae_tt, m.vae_host, m.vae_lat);
+        std::fprintf(stderr, "xestrata-image: SeedVR2 video %lldx%lld: room %llu MiB = VAE %llu + DiT %llu + blocks "
+                     "%llu (%d resident) + latents %llu (chunk %lld latents) + frames %llu + made %llu + the larger "
+                     "of the DiT's turn %llu (activations %llu, the VAE's kept %llu) and the VAE's %llu (tiles %lld, "
+                     "host %d, %lld latents a call, slice %lld) + margin %llu; the process holds %llu MiB\n",
+                     (long long) w, (long long) h, mib(m.room), mib(m.vae_bytes), mib(m.dit->weight_bytes()),
+                     mib(m.dit->blocks_vram()), m.dit->resident_blocks(), mib((uint64_t) (v.cl * n) * 4 * 7),
+                     (long long) v.cl, mib((uint64_t) HW * 4 * 3), mib(video_frames_out(HW, v.cl, m.vae_lat)),
+                     mib(act(v.cl) + kept), mib(act(v.cl)), mib(kept), mib(vae), (long long) m.vae_tt, (int) m.vae_host,
+                     (long long) m.vae_lat, (long long) m.vae_slice, mib(margin), mib(gpu::device_held()));
+    }
 }
 
 void Seedvr2::video_push(const uint8_t* in, int64_t n) {
