@@ -274,6 +274,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
             if (o.draft == "dfly2") { proto("ERR --draft dfly2 needs --chunk >= 8"); return 2; }
         } else if (df.init(err)) {
             use_spec = true;
+            r.det_mix = true;
         } else if (o.draft == "dfly2") {
             proto("ERR --draft dfly2: %s", err.c_str());
             return 2;
@@ -292,7 +293,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
     size_t sl = base.find_last_of("/\\");
     if (sl != std::string::npos) base = base.substr(sl + 1);
     proto("INFO engine=hy4-serve-0 arch=hy4flash backend=hip model=%s layers=%d vocab=%d chunk=%d session_reuse=%d drafter=%s", base.c_str(), r.c.n_layers, V, r.Tc,
-          o.session_reuse ? 1 : 0, use_spec ? "dfly2" : "off");
+          o.session_reuse ? 1 : 0, use_spec ? "dfly2" : "none");
     proto("READY %d stop", max_ctx);
 
     LineInput in;

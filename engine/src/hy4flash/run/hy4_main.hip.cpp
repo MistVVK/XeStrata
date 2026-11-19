@@ -54,7 +54,8 @@ static int print_info(const std::string& file) {
     }
     Manifest m;
     parse_manifest(rd.manifest_json(), m, false);
-    printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos);
+    const bool has_dfly = m.T.count("model.dfly_layers.0.self_attn.q_a_proj.weight") && m.T.count("model.dfly_layers.hidden_correction.gate_proj.weight");
+    printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d drafter=%s\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos, has_dfly ? "dfly2" : "none");
     return 0;
 }
 
@@ -77,6 +78,7 @@ int main(int argc, char** argv) {
     std::string draft = "auto";  // auto: dfly2 under --serve (when the file carries the drafter), off for the CLI runs (gates / benches); "off" and "dfly2" force
     SpecCfg scfg;
     std::string parity_list;
+    bool det_flag = true, want_margins = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() {
@@ -105,6 +107,9 @@ int main(int argc, char** argv) {
         else if (a == "--spec-fixed") scfg.adaptive = false;
         else if (a == "--spec-cut") scfg.cut = (float)atof(nxt().c_str());
         else if (a == "--spec-debug") scfg.debug = true;
+        else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
+        else if (a == "--det") det_flag = atoi(nxt().c_str()) != 0;
+        else if (a == "--margins") want_margins = true;
         else if (a == "--spec-exact") scfg.exact = atoi(nxt().c_str()) != 0;
         else if (a == "--parity-m") parity_list = nxt();
         else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
@@ -199,6 +204,7 @@ int main(int argc, char** argv) {
     r.index_on = no_index ? 0 : 1;
     r.prof = prof;
     r.prof2 = prof2;
+    r.det_mix = det_flag || draft == "dfly2";
     std::string err;
     if (!r.init(no_engram ? std::string() : engram, err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
@@ -297,10 +303,27 @@ int main(int argc, char** argv) {
             skd::moe_dec_max_m() = mode ? 16 : 4;
             for (int W : ws) {
                 const int p0 = T0 - W;
+                for (int i = 0; base + i < p0; ++i) {  // restore the sequential prefix rows of the window range (earlier windows rewrote them)
+                    if (!r.forward_chunk(tok.data(), base + i, 1, err)) return 1;
+                }
+                HCK(hipStreamSynchronize(r.st));
                 if (!r.forward_chunk(tok.data(), p0, W, err)) return 1;
                 r.head(W, 0);
                 HCK(hipStreamSynchronize(r.st));
                 HCK(hipMemcpy(win.data(), r.logits, (size_t)W * V * 4, hipMemcpyDeviceToHost));
+                {   // timing of the window forward + head (5 reps)
+                    r.pacc.clear();
+                    const double tb0 = now_s();
+                    for (int rep = 0; rep < 5; ++rep) {
+                        r.forward_chunk(tok.data(), p0, W, err);
+                        r.head(W, 0);
+                    }
+                    HCK(hipStreamSynchronize(r.st));
+                    const double tb1 = now_s();
+                    r.pflush();
+                    fprintf(stderr, "[bench] M=%d %s: forward+head %.1f ms\n", W, mode ? "exact" : "default", (tb1 - tb0) * 200.0);
+                    r.pacc_report("window", 5);
+                }
                 int top1 = 0, bit = 0;
                 double maxabs = 0, kl_sum = 0, kl_max = 0;
                 for (int i = 0; i < W; ++i) {
@@ -332,6 +355,7 @@ int main(int argc, char** argv) {
     }
     if (spec_mode) {
         Spec sp(r, df, scfg);
+        sp.want_margin = want_margins;
         std::string gen_ids, finish, e2;
         int made = 0;
         const double t1 = now_s();
@@ -344,8 +368,13 @@ int main(int argc, char** argv) {
         printf("generated ids: %s\n", gen_ids.c_str());
         fprintf(stderr, "[decode] %d tokens in %.2f s = %.2f tok/s (spec dfly2, finish %s)\n", made, td, made / td, finish.c_str());
         sp.report(stderr, td * 1000.0);
+        r.pacc_report("spec total (all steps)", 1);
         std::ofstream f(out_dir + "/gen_ids.txt");
         f << gen_ids << "\n";
+        if (want_margins) {
+            std::ofstream fm(out_dir + "/margins.txt");
+            for (float m : sp.marg) fm << m << "\n";
+        }
     } else if (gen > 0) {
         int next = 0;
         {
@@ -355,6 +384,16 @@ int main(int argc, char** argv) {
         std::string gen_ids;
         double t1 = now_s();
         std::vector<double> times, enq;
+        std::vector<float> margs;
+        auto gap2 = [&](const float* lg) {
+            float b1 = -3e38f, b2 = -3e38f;
+            for (int i = 0; i < V; ++i) {
+                if (lg[i] > b1) { b2 = b1; b1 = lg[i]; }
+                else if (lg[i] > b2) b2 = lg[i];
+            }
+            return b1 - b2;
+        };
+        if (want_margins) margs.push_back(gap2(&hl[(size_t)(hl.size() / V - 1) * V]));
         for (int s = 0; s < gen; ++s) {
             tok.push_back(next);
             gen_ids += std::to_string(next) + " ";
@@ -369,6 +408,11 @@ int main(int argc, char** argv) {
             enq.push_back(now_s() - ts);
             HCK(hipStreamSynchronize(r.st)); r.pflush();
             float* d = r.logits;
+            if (want_margins) {
+                std::vector<float> hrow(V);
+                HCK(hipMemcpy(hrow.data(), d, (size_t)V * 4, hipMemcpyDeviceToHost));
+                margs.push_back(gap2(hrow.data()));
+            }
             hipLaunchKernelGGL(k_argmax, dim3(1), dim3(1024), 0, r.st, d, V, r.d_argmax);
             int32_t nx = 0;
             HCK(hipMemcpy(&nx, r.d_argmax, 4, hipMemcpyDeviceToHost));
@@ -385,6 +429,10 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[decode] %zu tokens in %.2f s = %.2f tok/s (median step %.1f ms)\n", times.size(), td, times.size() / td, times.empty() ? 0.0 : times[times.size() / 2] * 1000);
         std::ofstream f(out_dir + "/gen_ids.txt");
         f << gen_ids << "\n";
+        if (want_margins) {
+            std::ofstream fm(out_dir + "/margins.txt");
+            for (float m : margs) fm << m << "\n";
+        }
     }
     {
         std::ofstream f(out_dir + "/top5.txt");

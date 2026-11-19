@@ -169,24 +169,42 @@ __global__ void k_idx_select(const float* __restrict__ score, int ldS, int p0, i
     }
     __syncthreads();
     int n_eq_need = n_top - n_gt_s;
-    // emit: all > thr, then the first n_eq_need == thr in index order (single wave walks ties deterministically)
-    for (int g = threadIdx.x; g < grp; g += blockDim.x) {
-        if (f2key(sc[g]) > thr) {
-            int s = atomicAdd(&cnt_sel, 1);
-            for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
+    // emit in a fixed order (independent of the scheduling, so the attention over the list sums in the same order every run): all > thr in index order,
+    // then the first n_eq_need == thr in index order. Contiguous chunk per thread, block-wide exclusive scans of the per-chunk counts.
+    {
+        __shared__ int o_gt[256], o_eq[256];
+        const int chunk = (grp + (int)blockDim.x - 1) / (int)blockDim.x;
+        const int g0 = threadIdx.x * chunk, g1 = min(grp, g0 + chunk);
+        int cg = 0, ce = 0;
+        for (int g = g0; g < g1; ++g) {
+            const uint32_t k = f2key(sc[g]);
+            cg += k > thr ? 1 : 0;
+            ce += k == thr ? 1 : 0;
         }
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        int s = cnt_sel, need = n_eq_need;
-        for (int g = 0; g < grp && need > 0; ++g) {
-            if (f2key(sc[g]) == thr) {
-                for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
-                ++s;
-                --need;
+        o_gt[threadIdx.x] = cg;
+        o_eq[threadIdx.x] = ce;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int sg = 0, se = 0;
+            for (int i = 0; i < (int)blockDim.x; ++i) {
+                const int a = o_gt[i], b = o_eq[i];
+                o_gt[i] = sg;
+                o_eq[i] = se;
+                sg += a;
+                se += b;
             }
+            cnt_sel = n_gt_s + min(se, n_eq_need);
         }
-        cnt_sel = s;
+        __syncthreads();
+        int sg = o_gt[threadIdx.x], se = o_eq[threadIdx.x];
+        for (int g = g0; g < g1; ++g) {
+            const uint32_t k = f2key(sc[g]);
+            int s = -1;
+            if (k > thr) s = sg++;
+            else if (k == thr) { if (se < n_eq_need) s = n_gt_s + se; ++se; }
+            if (s >= 0)
+                for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
+        }
     }
     __syncthreads();
     int npool = cnt_sel;

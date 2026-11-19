@@ -551,7 +551,15 @@ public:
     }
 
     float* hcacc = nullptr;
+    bool det_mix = true;  // deterministic iHC mix (no float atomics), set by the speculative decoder
+    float* hcpart = nullptr;
     void hc_mix_run(const float* xin, const float* hfn, const float* hsc, const float* hbs, int nout, int T) {
+        if (det_mix) {
+            if (!hcpart) hcpart = dalloc<float>((size_t)Tc * 24 * 9);
+            hipLaunchKernelGGL(k_hc_mix_part_d, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcpart, nout);
+            hipLaunchKernelGGL(k_hc_mix_fin_d, dim3(T), dim3(32), 0, st, hcpart, hsc, hbs, pre, post, nout, c.rms_eps, c.hc_eps, c.hc_mag);
+            return;
+        }
         if (!hcacc) hcacc = dalloc<float>((size_t)Tc * 9);
         hipLaunchKernelGGL(k_zero_f, dim3((T * 9 + 255) / 256), dim3(256), 0, st, hcacc, T * 9);
         hipLaunchKernelGGL(k_hc_mix_part, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcacc, nout);

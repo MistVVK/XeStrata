@@ -21,6 +21,7 @@ struct SpecCfg {
     float cut = -1.f;      // >= 0: verify the leading slots with conf > cut instead of the cost model
     bool exact = true;     // verify windows on the M-independent GEMV / decode expert kernels
     bool debug = false;
+    int rv = 0;            // reduced-vocabulary draft chain: candidates per slot (0 = full lm_head per drafted token)
 };
 
 struct SpecStats {
@@ -64,6 +65,8 @@ public:
         }
         if (cfg.K > DFLY_KMAX) cfg.K = DFLY_KMAX;
         if (cfg.K < 1) cfg.K = 1;
+        d.rv = cfg.rv;
+        r.det_mix = true;  // schedule-independent iHC mix: the output must not depend on atomics
         plain_left = 2;  // calibrate the plain step time first
     }
 
@@ -100,7 +103,23 @@ public:
         return best;
     }
 
+    // optional: top1 - top2 logit gap of every emitted token's row (analysis of divergences)
+    std::vector<float> marg;
+    bool want_margin = false;
+    void note_margin(int row) {
+        if (!want_margin) return;
+        std::vector<float> h(V);
+        HCK(hipMemcpy(h.data(), r.logits + (size_t)row * V, (size_t)V * 4, hipMemcpyDeviceToHost));
+        float b1 = -3e38f, b2 = -3e38f;
+        for (int i = 0; i < V; ++i) {
+            if (h[i] > b1) { b2 = b1; b1 = h[i]; }
+            else if (h[i] > b2) b2 = h[i];
+        }
+        marg.push_back(b1 - b2);
+    }
+
     int argmax_host_row0() {
+        note_margin(0);
         hipLaunchKernelGGL(k_argmax, dim3(1), dim3(1024), 0, r.st, (const float*)r.logits, V, r.d_argmax);
         HCK(hipMemcpyAsync(h_arg, r.d_argmax, 4, hipMemcpyDeviceToHost, r.st));
         HCK(hipStreamSynchronize(r.st));
@@ -214,6 +233,8 @@ public:
             int n = 0;
             while (n < Kp && y[n + 1] == h_arg[n]) ++n;
             d.snap_h(n);
+            if (want_margin)
+                for (int i = 0; i <= n; ++i) note_margin(i);
             // calibration + cost model
             for (int j = 1; j <= std::min(Kp, n + 1); ++j) {
                 const int b = bucket(cf[j]);

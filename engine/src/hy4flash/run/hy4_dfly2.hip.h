@@ -9,6 +9,7 @@
 //     prev = y_j, conf_j = sigmoid(confidence_head(h_corr))
 // The own block rows are written into the TARGET layer's cache slots a..a+K (free slots: the verify pass rewrites a..a+K' before it reads them, later positions write before they read).
 #pragma once
+#include <memory>
 #include "hy4_graph.hip.h"
 
 namespace hy4 {
@@ -104,10 +105,89 @@ __global__ void k_argmax_rows(const float* __restrict__ logits, int V, int32_t* 
     }
 }
 
+// ---- reduced-vocabulary chain: candidate ids = the top-N of the base logits lm_head(final_norm(H)[j]); the chain scores only those rows with the corrected hidden state.
+__device__ __forceinline__ uint32_t dfly_f2key(float f) {
+    uint32_t b = __float_as_uint(f);
+    return b ^ ((b >> 31) ? 0xFFFFFFFFu : 0x80000000u);
+}
+// top-N ids of one logits row (block of 1024): threshold search on the order-preserving key, then emit every id with key >= thr until N are written
+__global__ void __launch_bounds__(1024) k_dfly_topn(const float* __restrict__ logits, int V, int N, int32_t* __restrict__ cand) {
+    __shared__ int red[32];
+    __shared__ int cnt;
+    __shared__ uint32_t thr_s;
+    const float* lg = logits + (size_t)blockIdx.x * V;
+    int32_t* out = cand + (size_t)blockIdx.x * N;
+    uint32_t lo = 0, hi = 0xFFFFFFFFu;
+    for (int it = 0; it < 33 && lo < hi; ++it) {
+        const uint32_t mid = (uint32_t)(lo + (((uint64_t)hi - lo + 1) >> 1));
+        int c = 0;
+        for (int i = threadIdx.x; i < V; i += blockDim.x) c += dfly_f2key(lg[i]) >= mid ? 1 : 0;
+        for (int o = 16; o > 0; o >>= 1) c += __shfl_xor(c, o);
+        __syncthreads();
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = c;
+        __syncthreads();
+        int tot = 0;
+        for (int w = 0; w < 32; ++w) tot += red[w];
+        if (tot >= N) lo = mid; else hi = mid - 1;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { thr_s = lo; cnt = 0; }
+    __syncthreads();
+    const uint32_t thr = thr_s;
+    for (int i = threadIdx.x; i < V; i += blockDim.x)
+        if (dfly_f2key(lg[i]) >= thr) {
+            const int s = atomicAdd(&cnt, 1);
+            if (s < N) out[s] = i;
+        }
+}
+
+// score[k] = lm_head row cand[k] . h   (lm_head S8_K [V][3072], row = 12 super-blocks of 262 B); one wave per candidate
+__global__ void __launch_bounds__(32) k_dfly_cand_score(const uint8_t* __restrict__ W, const int32_t* __restrict__ cand, const __half* __restrict__ h, float* __restrict__ score) {
+    const uint8_t* row = W + (size_t)cand[blockIdx.x] * 12 * 262;
+    const int lane = threadIdx.x;
+    float acc = 0;
+    for (int sb = 0; sb < 12; ++sb) {
+        const uint8_t* blk = row + sb * 262;
+        const float D = fp16_bits_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+        for (int i = lane; i < 256; i += 32) {
+            const float eff = D * ((float)blk[2 + (i >> 6)] / 255.0f);
+            acc += (float)(int8_t)blk[6 + i] * eff * __half2float(h[sb * 256 + i]);
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor(acc, o);
+    if (lane == 0) score[blockIdx.x] = acc;
+}
+__global__ void __launch_bounds__(1024) k_dfly_cand_argmax(const float* __restrict__ score, const int32_t* __restrict__ cand, int N, int32_t* __restrict__ out) {
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    float bv = -3.0e38f;
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        const int id = cand[i];
+        if (score[i] > bv || (score[i] == bv && id < bi)) { bv = score[i]; bi = id; }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        float ov = __shfl_xor(bv, o);
+        int oi = __shfl_xor(bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if ((threadIdx.x & 31) == 0) { sv[threadIdx.x >> 5] = bv; si[threadIdx.x >> 5] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float b2 = sv[0]; int i2 = si[0];
+        for (int q = 1; q < (int)(blockDim.x >> 5); ++q)
+            if (sv[q] > b2 || (sv[q] == b2 && si[q] < i2)) { b2 = sv[q]; i2 = si[q]; }
+        *out = i2;
+    }
+}
+
 struct DFly2 {
     Runner& r;
     const Cfg& c;
     bool ok = false;
+    int rv = 0;  // reduced-vocabulary chain: candidates per slot (0 = full lm_head per slot)
+    int32_t* d_cand = nullptr;
+    float* d_cscore = nullptr;
     hipStream_t st;
     // device buffers
     float *H = nullptr, *Hf = nullptr, *F1 = nullptr, *F2 = nullptr, *F3 = nullptr, *F4 = nullptr, *Ec = nullptr, *Dn = nullptr, *G = nullptr, *U = nullptr, *d_conf = nullptr, *hprev_f = nullptr;
@@ -161,6 +241,8 @@ struct DFly2 {
         lstride = r.index_topk + 8;
         dlist = al<int32_t>((size_t)B * lstride);
         dnk = al<int32_t>(16);
+        d_cand = al<int32_t>((size_t)B * 1024);
+        d_cscore = al<float>(1024);
         HCK(hipHostMalloc((void**)&h_bids, 64, hipHostMallocDefault));
         HCK(hipHostMalloc((void**)&h_chain, 64, hipHostMallocDefault));
         HCK(hipHostMalloc((void**)&h_conf, 64, hipHostMallocDefault));
@@ -203,6 +285,7 @@ struct DFly2 {
         r.lin(pf + "mtp_fusion.eh_proj.weight", hcin, F1, 1);
         hipLaunchKernelGGL(k_dfly_fuse, dim3(1), dim3(256), 0, st, H, wf(pf + "mtp_fusion.gate"), (const float*)F1);
         // 5 layers
+        std::unique_ptr<Runner::PS> pl(new Runner::PS(&r, "dfly_layers"));
         for (int d = 0; d < 5; ++d) {
             const int L = DFLY_LAYERS[d];
             const std::string pa = pf + std::to_string(d) + ".self_attn";
@@ -246,9 +329,17 @@ struct DFly2 {
             hipLaunchKernelGGL(k_add_inplace, dim3(((size_t)B * HID + 255) / 256), dim3(256), 0, st, H, (const float*)F3, (size_t)B * HID);
         }
         hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + "final_norm.weight"), Hf, Hf_h, HID, c.rms_eps);
+        pl.reset();
         // hidden_correction + lm_head, unrolled
+        Runner::PS pc(&r, "dfly_chain");
         const TInfo& lm = r.ti("lm_head.weight");
         const void* lmw = r.tw("lm_head.weight");
+        const int N = std::min(rv, 1024);
+        if (N > 0) {
+            // base logits of slots 1..K in ONE lm_head pass, candidate ids per slot
+            linear_h(st, lm.fmt, lmw, (int)lm.rows(), (int)lm.cols(), Hf_h + HID, r.logits, K);
+            hipLaunchKernelGGL(k_dfly_topn, dim3(K), dim3(1024), 0, st, (const float*)r.logits, V, N, d_cand);
+        }
         for (int j = 1; j <= K; ++j) {
             embed_rows(st, emb.fmt, r.tw("model.embed_tokens.weight"), (int)emb.rows(), (int)emb.cols(), d_chain + (j - 1), Ec, 1);
             hipLaunchKernelGGL(k_dfly_cat2, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), wf(pf + "hidden_correction.hidden_norm.weight"), (const float*)Ec,
@@ -259,8 +350,13 @@ struct DFly2 {
             r.lin(pf + "hidden_correction.down_proj.weight", act, Dn, 1);
             hipLaunchKernelGGL(k_dfly_corr, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), (const float*)Dn, wf(pf + "confidence_head.proj.weight"),
                                wf(pf + "confidence_head.proj.bias"), hc_h, d_conf + j);
-            linear_h(st, lm.fmt, lmw, (int)lm.rows(), (int)lm.cols(), hc_h, r.logits, 1);
-            hipLaunchKernelGGL(k_argmax, dim3(1), dim3(1024), 0, st, (const float*)r.logits, V, d_chain + j);
+            if (N > 0) {
+                hipLaunchKernelGGL(k_dfly_cand_score, dim3(N), dim3(32), 0, st, (const uint8_t*)lmw, (const int32_t*)(d_cand + (size_t)(j - 1) * N), (const __half*)hc_h, d_cscore);
+                hipLaunchKernelGGL(k_dfly_cand_argmax, dim3(1), dim3(1024), 0, st, (const float*)d_cscore, (const int32_t*)(d_cand + (size_t)(j - 1) * N), N, d_chain + j);
+            } else {
+                linear_h(st, lm.fmt, lmw, (int)lm.rows(), (int)lm.cols(), hc_h, r.logits, 1);
+                hipLaunchKernelGGL(k_argmax, dim3(1), dim3(1024), 0, st, (const float*)r.logits, V, d_chain + j);
+            }
         }
         HCK(hipMemcpyAsync(h_chain, d_chain, B * 4, hipMemcpyDeviceToHost, st));
         HCK(hipMemcpyAsync(h_conf, d_conf, B * 4, hipMemcpyDeviceToHost, st));
