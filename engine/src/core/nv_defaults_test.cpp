@@ -56,16 +56,19 @@ int main() {
     put("STRATA_SM121_PERF", "1");
     CHECK(nv_default_env(12, 1, false).size() == 6);
     unset("STRATA_SM121_PERF");
-    // sm_120 (RTX 50 / PRO Blackwell, BW-13): the fused hyper-connection up projection + mix only; STRATA_DEFAULTS=026 and STRATA_SM120_PERF=0 leave it out
+    // sm_120 (RTX 50 / PRO Blackwell, BW-13 and BW-G): the fused hyper-connection up projection + mix, L2 prefetch, the one-row Q8_0 kernel, EXP_MODE=8; STRATA_DEFAULTS=026 and STRATA_SM120_PERF=0 leave it out
     {
         unset("STRATA_SM120_PERF");
         const auto t = nv_default_env(12, 0, false);
-        CHECK(t.size() == 1 && find(t, "STRATA_HC_UPMIX") && *find(t, "STRATA_HC_UPMIX") == "1");
+        CHECK(t.size() == 4 && find(t, "STRATA_HC_UPMIX") && *find(t, "STRATA_HC_UPMIX") == "1");
+        CHECK(find(t, "STRATA_L2_PF") && *find(t, "STRATA_L2_PF") == "1");                // BW-G
+        CHECK(find(t, "STRATA_Q80_ROWS1") && *find(t, "STRATA_Q80_ROWS1") == "1");
+        CHECK(find(t, "STRATA_EXP_MODE") && *find(t, "STRATA_EXP_MODE") == "8");
         CHECK(nv_default_env(12, 0, true).empty());
         put("STRATA_SM120_PERF", "0");
         CHECK(nv_default_env(12, 0, false).empty());
         put("STRATA_SM120_PERF", "1");
-        CHECK(nv_default_env(12, 0, false).size() == 1);
+        CHECK(nv_default_env(12, 0, false).size() == 4);
         unset("STRATA_SM120_PERF");
     }
     // sm_100 and the older cards get nothing from this file; the sm_86 / sm_60 tables are unchanged by the flag
@@ -147,7 +150,7 @@ int main() {
         unset("STRATA_PF_FUSED_SM86");
     }
     // the other tables are unchanged by it
-    CHECK(nv_default_env(12, 0, false).size() == 1);   // BW-13: HC_UPMIX only
+    CHECK(nv_default_env(12, 0, false).size() == 4);   // BW-13 HC_UPMIX + BW-G L2_PF, Q80_ROWS1, EXP_MODE=8
     // round 0212: the NVIDIA prompt-chunk ceiling of a bare `--prefill auto` (nv_chunk.hpp)
     CHECK(nv_chunk_ceiling(nullptr, false) == 32768);
     CHECK(nv_chunk_ceiling("1", false) == 32768);

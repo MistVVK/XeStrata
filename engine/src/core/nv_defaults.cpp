@@ -52,6 +52,14 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             // 31,817 tokens) against the baseline of the released engine; STRATA_HC_UPMIX_CHECK on an 8K prompt: mixed rel RMS 0, max |diff| 0 (the fused kernel is the default pair's bits).
             // STRATA_HC_UPMIX=0 is the way back.  (phaseA-tests/bw/RESULTS-BW-A.md)
             {"STRATA_HC_UPMIX", "1"},
+            // BW-G (RTX 5090, UD-Q4_K_XL, DFlash2 spec 6, tail skip OFF, paired rounds; phaseA-tests/bw/RESULTS-BW-C.md, RESULTS-BW-G.md): three more bit-exact decode switches, each alone and the three
+            // together BASE-05 27 of 27 identical to the released engine's baseline, the three together decode +2.0% (20 of 25 paired rounds up), window -2.9%.  Each has =0 as the way back.
+            // the next layer's dense weights prefetched into L2 while the window waits for the CPU experts (doorbell graph only; the all-resident graph never runs it)
+            {"STRATA_L2_PF", "1"},
+            // the one-row-per-block Q8_0 dense kernel (each row keeps its own partial sums: the two-row kernel's bits)
+            {"STRATA_Q80_ROWS1", "1"},
+            // the grouped native experts' mode-8 layout (the GB10 / P100 / P40 default; exact against the CUDA layout on UD-Q4_K_XL)
+            {"STRATA_EXP_MODE", "8"},
         };
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;
