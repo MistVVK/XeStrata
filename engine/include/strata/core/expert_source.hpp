@@ -111,6 +111,12 @@ bool wait_for_ram(uint64_t need, double max_wait_s, double step_s, double note_s
 /// Pass UINT64_MAX for commit when the platform does not report it.
 uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom);
 
+/// #3725: under WDDM every page-locked, mapped host buffer counts against the GPU's shared (non-local) segment, on each
+/// CUDA device it is mapped into, and the segment is about half the RAM; the commit capacity does not show that limit.
+/// `segment_left` is the room the tightest GPU has left (budget - usage), `reserve` what the engine maps after the
+/// complement (the lend ring, the hand-off and staging buffers).  The budget, cut to what is left of the segment.
+uint64_t clamp_budget_to_shared_segment(uint64_t budget, uint64_t segment_left, uint64_t reserve);
+
 /// #1250: one cudaHostAlloc of the whole page-locked complement has no way back when the kernel does not give the
 /// pages as fast as the driver takes them (the process is OOM-killed, even with MemAvailable high: clean file cache
 /// that cannot be reclaimed at that moment).  `free_now` is MemFree (pages that are really free), `bytes` the

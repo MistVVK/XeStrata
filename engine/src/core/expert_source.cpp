@@ -133,6 +133,11 @@ uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t c
     return room > margin ? room - margin : 0;
 }
 
+uint64_t clamp_budget_to_shared_segment(uint64_t budget, uint64_t segment_left, uint64_t reserve) {
+    const uint64_t cap = segment_left > reserve ? segment_left - reserve : 0;
+    return budget > cap ? cap : budget;
+}
+
 bool pin_depends_on_reclaim(uint64_t free_now, uint64_t bytes, uint64_t reserve) {
     return bytes > 0 && free_now < bytes + reserve;
 }
@@ -3667,6 +3672,42 @@ bool FileExpertSource::pin_cache_complement(
             std::fputs(resident_clamp_line(from, budget_bytes, limit, available, headroom_bytes, clamped).c_str(), stderr);
             budget_bytes = clamped;
         }
+#if defined(_WIN32)
+        if (pin) {
+            // #3725: the page-locked complement is charged to the GPU's shared (non-local) WDDM segment on every CUDA device
+            // it is mapped into, a segment of about half the RAM that the commit capacity above does not show.  A 31 GB PC
+            // with two cards pinned 14.8 GiB of 15.5 GiB, and the next tiny cudaMalloc ("prefill: the token id buffer")
+            // failed with out of memory.  Cut the budget to what the tightest GPU has left, less what the engine maps
+            // after the complement (the lend ring, the hand-off and staging buffers: ~1.5 GiB measured on a two-card
+            // split; STRATA_WDDM_SHARED_RESERVE_MIB changes the 2 GiB kept).  Where DXGI cannot tell, nothing changes.
+            uint64_t left = std::numeric_limits<uint64_t>::max();
+            int devices = 0;
+            if (cudaGetDeviceCount(&devices) != cudaSuccess) devices = 0;
+            for (int d = 0; d < devices; ++d) {
+                cudaDeviceProp prop{};
+                uint64_t seg_budget = 0, seg_usage = 0;
+                std::string seg_why;
+                if (cudaGetDeviceProperties(&prop, d) == cudaSuccess &&
+                    strata::platform::gpu_shared_memory_budget(prop.luid, seg_budget, seg_usage, seg_why))
+                    left = std::min(left, seg_budget > seg_usage ? seg_budget - seg_usage : 0);
+            }
+            (void) cudaGetLastError();
+            if (left != std::numeric_limits<uint64_t>::max()) {
+                const char* r = std::getenv("STRATA_WDDM_SHARED_RESERVE_MIB");
+                const uint64_t reserve = (r != nullptr && *r != '\0' ? std::strtoull(r, nullptr, 10) : 2048ull) << 20;
+                const uint64_t cut = detail::clamp_budget_to_shared_segment(budget_bytes, left, reserve);
+                std::fprintf(stderr, "FileExpertSource: WDDM shared segment: %.2f GiB left on the tightest GPU, %.2f GiB kept "
+                                     "for the engine's later mapped buffers\n",
+                             (double) left / 1073741824.0, (double) reserve / 1073741824.0);
+                if (cut < budget_bytes) {
+                    std::fprintf(stderr, "FileExpertSource: the complement is limited by the WDDM shared segment: %.2f -> %.2f "
+                                         "GiB (STRATA_WDDM_SHARED_RESERVE_MIB changes the reserve)\n",
+                                 (double) budget_bytes / 1073741824.0, (double) cut / 1073741824.0);
+                    budget_bytes = cut;
+                }
+            }
+        }
+#endif
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
         int64_t held = 0;
