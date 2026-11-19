@@ -53,17 +53,19 @@ SWITCHES: tuple[Switch, ...] = (
            "Shares the work between the graphics card and the processor in a way that makes answers faster on these cards. "
            "Turn off to go back to the previous setting, which is slower.",
            (("STRATA_PCIE_FRAC_DEFAULT", "old"),), "qwen-radeon-9000"),
-    # 0.2.16 (owner): the route tail skip as a choice.  Unset is the engine's own rule (rank 7 on CUDA and gfx1200/gfx1201 where it helps; off with every
-    # expert in VRAM, 90 % or more cached, --batch slots, a peer or helper GPU, NVFP4 experts); 0 is off; 1-9 is that rank (src/core/expert_source.cpp
-    # tail_skip_rank()).  Only 7 is measured (docs/DETAILS.md, QUANTS.md).  Setup's own "0" (some UD-Q4_K_XL configs) reads as Off.
+    # 0.2.16 (owner): the route tail skip as a choice.  0.2.17 (owner, 11-19): OFF by default.  The engine of 0.2.17 (0.1.62) still has its own rule for an
+    # unset STRATA_ROUTE_TAIL_SKIP (rank 7 on CUDA and gfx1200/gfx1201 where it helps; src/core/expert_source.cpp tail_skip_rank()), so every engine start
+    # sets it: child_env() in serve/server.py gives the engine "0" when neither the run config nor the person's own environment names the setting
+    # (engine_env_defaults below).  On is rank 7, written as STRATA_ROUTE_TAIL_SKIP=7; 1-9 is that rank.  Only 7 is measured (docs/DETAILS.md, QUANTS.md).
+    # A "0" in a run config (setup's own, or the person's) reads as Off, which is the default.
     Switch("route_tail_skip", "Skip rarely used parts of the model",
            "Faster answers: parts of the model that matter least for a word are skipped when they are not on the graphics card yet. "
-           "Answers can change slightly. On by default where it helps.",
-           (("STRATA_ROUTE_TAIL_SKIP", "0"),), "tail-skip", default="on",
-           words=(("on", "Automatic (recommended)"), ("off", "Off")),
-           choices=(("0", "Off"),) + tuple((str(r), str(r)) for r in range(1, 10)),
+           "Answers can change slightly. Off by default.",
+           (("STRATA_ROUTE_TAIL_SKIP", "7"),), "tail-skip", default="off",
+           words=(("on", "On"), ("off", "Off (default)")),
+           choices=(("7", "On"),) + tuple((str(r), str(r)) for r in (1, 2, 3, 4, 5, 6, 8, 9)),
            choice_note="Lower numbers skip more parts and are faster; answers can change more. Only 7 has been measured.",
-           choice_sets="set 0 to turn it off, or 1 to 9 to choose how much is skipped", terminal_default="auto"),
+           choice_sets="set 7 to turn it on, or 1 to 9 to choose how much is skipped"),
     # (0.2.16: the "Picture reader" row, STRATA_VISION_TOWER=mtmd for llama.cpp's reader, is gone with llama.cpp's reader itself: Strata's own reader is the
     # only one.  A run config that still carries the entry starts as before; strata-vision no longer reads the name.)
     # Troubleshooting only, in the Terminal's Advanced table and nowhere else: every Qwen 0.2.7 default back to its 0.2.6 behaviour.
@@ -167,6 +169,23 @@ def set_switch(env: Mapping[str, Any] | None, switch: Switch | str, on: bool) ->
     return out
 
 
+#: The engine settings whose default Strata sets at every engine start, because the engine's own rule for an unset value is not the default Strata
+#: ships (0.2.17, owner 11-19: the route tail skip is Off by default; engine 0.1.62 has it on by default).  name -> the value an unset setting gets.
+ENGINE_START_DEFAULTS: dict[str, str] = {"STRATA_ROUTE_TAIL_SKIP": "0"}
+
+
+def engine_env_defaults(env: dict[str, Any]) -> dict[str, Any]:
+    """The environment of an engine start with Strata's defaults for the settings it does not name (in place; returns ``env``).
+
+    The order every start follows: the person's own environment, then the run config's "env" over it, then this for whatever is still unset.  A value
+    that is there, even an empty one or ``0``, is the person's choice and is never changed.  ``STRATA_ROUTE_TAIL_SKIP=7`` (the switch's On) turns the
+    tail skip on; without it the engine starts with ``STRATA_ROUTE_TAIL_SKIP=0``, so a config made before 0.2.17 that holds no entry starts Off."""
+    for name, value in ENGINE_START_DEFAULTS.items():
+        if name not in env:
+            env[name] = value
+    return env
+
+
 def env_names() -> dict[str, Switch]:
     """Every environment name a switch writes -> its switch."""
     return {name: sw for sw in SWITCHES for name, _ in sw.env}
@@ -179,7 +198,7 @@ def env_words(name: str) -> str:
     together = f"; all {len(sw.env)} speed-up rows go together" if len(sw.env) > 1 else ""
     if sw.choices:
         # "(automatic by default; set 0 for off, or 1 to 9 for that number)": the choices named by a word, then the ones that are their own number
-        default_word = dict(sw.words).get(sw.default, sw.default).replace(" (recommended)", "").lower()
+        default_word = dict(sw.words).get(sw.default, sw.default).replace(" (recommended)", "").replace(" (default)", "").lower()
         named = [f"{v} for {w.lower()}" for v, w in sw.choices if w != v]
         numbers = [v for v, w in sw.choices if w == v]
         if numbers:
