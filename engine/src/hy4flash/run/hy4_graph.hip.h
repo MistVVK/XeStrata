@@ -113,6 +113,34 @@ public:
     size_t ldS = 0;
     bool last_use_list = false;
 
+    // DFly2 hook: the top-index_topk key lists of target layers 25,29,33,37,41 for the last (up to 16) rows of the most recent forward chunk (hy4_dfly2.hip.h reads them)
+    bool dfly_cap = false;
+    int32_t *dkeys[5] = {}, *dnkc[5] = {};  // [16][index_topk], [16]
+    int cap_p0 = -1, cap_rows = 0;
+    bool cap_list[5] = {};
+    static int dfly_slot(int il) { return il == 25 ? 0 : il == 29 ? 1 : il == 33 ? 2 : il == 37 ? 3 : il == 41 ? 4 : -1; }
+    void dfly_capture_alloc() {
+        for (int d = 0; d < 5; ++d) {
+            if (!dkeys[d]) {
+                dkeys[d] = dalloc<int32_t>((size_t)16 * (index_topk + 8));
+                dnkc[d] = dalloc<int32_t>(16);
+            }
+        }
+        dfly_cap = true;
+    }
+    void dfly_capture(int il, int p0, int T, bool use_list) {
+        const int d = dfly_slot(il);
+        if (d < 0) return;
+        const int nr = std::min(T, 16), r0 = T - nr;
+        cap_p0 = p0 + r0;
+        cap_rows = nr;
+        cap_list[d] = use_list;
+        if (use_list) {
+            HCK(hipMemcpyAsync(dkeys[d], keys + (size_t)r0 * index_topk, (size_t)nr * index_topk * 4, hipMemcpyDeviceToDevice, st));
+            HCK(hipMemcpyAsync(dnkc[d], nkeys + r0, (size_t)nr * 4, hipMemcpyDeviceToDevice, st));
+        }
+    }
+
     // hybrid placement: tier-2 experts live in host RAM and are computed by hy4_cpu_experts while the GPU runs the shared experts and the VRAM-resident experts
     CpuExperts cpu;
     bool hyb = false;
@@ -524,7 +552,15 @@ public:
     }
 
     float* hcacc = nullptr;
+    bool det_mix = true;  // deterministic iHC mix (no float atomics), set by the speculative decoder
+    float* hcpart = nullptr;
     void hc_mix_run(const float* xin, const float* hfn, const float* hsc, const float* hbs, int nout, int T) {
+        if (det_mix) {
+            if (!hcpart) hcpart = dalloc<float>((size_t)Tc * 24 * 9);
+            hipLaunchKernelGGL(k_hc_mix_part_d, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcpart, nout);
+            hipLaunchKernelGGL(k_hc_mix_fin_d, dim3(T), dim3(32), 0, st, hcpart, hsc, hbs, pre, post, nout, c.rms_eps, c.hc_eps, c.hc_mag);
+            return;
+        }
         if (!hcacc) hcacc = dalloc<float>((size_t)Tc * 9);
         hipLaunchKernelGGL(k_zero_f, dim3((T * 9 + 255) / 256), dim3(256), 0, st, hcacc, T * 9);
         hipLaunchKernelGGL(k_hc_mix_part, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcacc, nout);
@@ -589,6 +625,7 @@ public:
             }
         }
         last_use_list = use_list;
+        if (dfly_cap && !swa) dfly_capture(il, p0, T, use_list);
         lin(pa + ".linear_gate.weight", cur_h, F3, T);  // [T][NH*256]
         MlaAttnArgs a;
         a.M = T;

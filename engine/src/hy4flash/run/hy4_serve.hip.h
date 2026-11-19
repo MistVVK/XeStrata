@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <deque>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -34,6 +35,7 @@
 #include <vector>
 
 #include "hy4_graph.hip.h"
+#include "hy4_spec.hip.h"
 
 namespace hy4 {
 
@@ -44,7 +46,8 @@ struct ServeOpts {
     int index_topk = 2048;
     bool no_index = false, no_engram = false;
     bool session_reuse = false;
-    std::string draft = "off";
+    std::string draft = "auto";  // auto = dfly2 when the file carries the drafter; off; dfly2 (error without it)
+    SpecCfg spec;
 };
 
 struct SampleOpts {
@@ -264,6 +267,21 @@ inline int hy4_serve_main(const ServeOpts& o) {
         proto("ERR init: %s", err.c_str());
         return 1;
     }
+    DFly2 df(r);
+    bool use_spec = false;
+    if (o.draft != "off") {
+        if (r.Tc < 8) {
+            if (o.draft == "dfly2") { proto("ERR --draft dfly2 needs --chunk >= 8"); return 2; }
+        } else if (df.init(err)) {
+            use_spec = true;
+            r.det_mix = true;
+        } else if (o.draft == "dfly2") {
+            proto("ERR --draft dfly2: %s", err.c_str());
+            return 2;
+        }
+    }
+    std::unique_ptr<Spec> spec;
+    if (use_spec) spec.reset(new Spec(r, df, o.spec));
     const int V = r.c.vocab, EOS = r.c.eos, EOT = 120008;
     std::vector<int32_t> tok;
     tok.reserve((size_t)max_ctx + 16);  // a stable host buffer: the Engram prefetch thread reads it
@@ -275,7 +293,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
     size_t sl = base.find_last_of("/\\");
     if (sl != std::string::npos) base = base.substr(sl + 1);
     proto("INFO engine=hy4-serve-0 arch=hy4flash backend=hip model=%s layers=%d vocab=%d chunk=%d session_reuse=%d drafter=%s", base.c_str(), r.c.n_layers, V, r.Tc,
-          o.session_reuse ? 1 : 0, o.draft.c_str());
+          o.session_reuse ? 1 : 0, use_spec ? "dfly2" : "none");
     proto("READY %d stop", max_ctx);
 
     LineInput in;
@@ -326,6 +344,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
             const bool last = done == T0;
             if (last) {
                 r.head(T, T - 1);
+                if (use_spec) df.snap_h(0);
             }
             HCK(hipStreamSynchronize(r.st));
             r.pflush();
@@ -356,7 +375,19 @@ inline int hy4_serve_main(const ServeOpts& o) {
         // the logits of the last prompt position are on the device now
         const bool greedy_fast = q.s.greedy() && !q.s.penalties();
         bool first = true;
-        while (made < limit) {
+        const bool spec_path = use_spec && greedy_fast && limit > 0;
+        if (spec_path) {
+            // DFly2 lossless greedy: tokens are emitted as they are accepted
+            std::string fin, e2;
+            fwd = spec->run(tok, limit, max_ctx, EOS, EOT, [&](int t) { proto("T %d", t); return !in.stop.load(); }, fin, e2, made);
+            if (fin == "error") {
+                proto("ERR spec: %s", e2.c_str());
+                return 1;
+            }
+            finish = fin == "stop" ? "stop" : fin == "cancel" ? "cancel" : "length";
+            spec->report(stderr, (now_s() - t1) * 1000.0);
+        }
+        while (!spec_path && made < limit) {
             int next = 0;
             if (greedy_fast) {
                 hipLaunchKernelGGL(k_argmax, dim3(1), dim3(1024), 0, r.st, r.logits, V, r.d_argmax);
