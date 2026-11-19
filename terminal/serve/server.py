@@ -2907,12 +2907,16 @@ class Vision:
             args += ["--min-tokens", str(cfg["min_tokens"])]
         return args
 
-    def _ensure_dir(self):
+    def _ensure_dir(self) -> bool:
         """#3370: a temp cleaner (Windows Storage Sense) removes the empty work folder while the encoder is unloaded; the next
-        start then failed with WinError 267 for as long as the server lived.  Make it again; pictures cached in it are gone."""
+        start then failed with WinError 267 for as long as the server lived.  Make it again; pictures cached in it are gone.
+        True when it was made again: a reader that is running has its `cwd` in the removed folder (#5755), so it cannot see
+        the files of the new one and has to be started again."""
         if not self.dir.is_dir():
             self.dir.mkdir(parents=True, exist_ok=True)
             self.cache.clear()
+            return True
+        return False
 
     def _start(self):
         """Start the reader.  When a GPU reader that has a CPU reader to fall back on does not start (the GPU runtime does not
@@ -3234,7 +3238,9 @@ class Vision:
         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
-            self._ensure_dir()
+            if self._ensure_dir() and self.alive():
+                self.restart()              # #5755: that reader's cwd is the removed folder, so the file written below is
+                                            # invisible to it and every picture would fail until the server is restarted
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
                 return self.cache[key]
