@@ -30,6 +30,14 @@
 #include <sys/mman.h>
 #endif
 
+// The fast kernel needs AVX-512 BW + VNNI + VBMI (Ice Lake / Rocket Lake / Zen 4 and later) and F16C; otherwise the library
+// gemm_sk_q8_1 path is used (also selectable with STRATA_CPUEXP_KERNEL=lib, and used when an S8 expert is resident).
+#if defined(__x86_64__) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__) && defined(__F16C__)
+#define HY4_FAST 1
+#else
+#define HY4_FAST 0
+#endif
+
 namespace hy4 {
 namespace {
 
@@ -42,7 +50,8 @@ using strata::quant::sk::superblock_bytes;
 constexpr int E = CpuExperts::kExperts, TOPK = CpuExperts::kTopK, D = CpuExperts::kDim;
 constexpr int NB = D / 64;          // 24 activation blocks per row
 constexpr int TC = CpuExperts::kChunkTokens;
-constexpr int MG = 16;              // tokens per gemm_sk_q8_1 call (its m cap)
+constexpr int MG = 16;              // tokens per gemm_sk_q8_1 call (its m cap), library path
+constexpr int MGF = 32;             // tokens per unit pass, fast path (the kernel itself works on tiles of 8 tokens)
 constexpr int RB = 64;              // output rows per work unit (one Q8_1 block of h)
 constexpr int NUNIT = D / RB;       // 24 units per expert per phase
 constexpr float SWIGLU_LIMIT = 10.0f;
@@ -177,6 +186,192 @@ struct TScratch {
     int sense = 0;
 };
 
+// ==================================================================================================== fast kernel
+// Activation row (K = 1536 = 6 super-blocks of 256) in a "transposed" layout so that the weight planes of every S_K format
+// can be unpacked with a handful of in-register ops and dotted with dpbusd, without any per-64-weights horizontal reduction:
+//   xj[sb][j][L*16 + k] = int8 x[(sb*4 + L)*64 + 4*k + j]      (j = 0..3, L = 64-block within the super-block, k = 0..15)
+//   xd[sb][L*4 + i]     = d of block sb*4+L                     (replicated x4: one float per dword lane)
+//   xs4[sb][L*4 + i]    = 0.25 * s of that block                (s = d * sum(qs); the x4 replication is undone by the 0.25)
+// Weight plane P_j of one super-block is the byte vector with lane L, byte k = q[64*L + 4*k + j] (0..2^bits-1). Then
+//   sum_lanes( cvt(dpbusd chain of P_j . xj) * eff * xd ) - half * sum_lanes( eff * xs4 )  ==  sum_g eff_g (xd_g*isum_g - half*xs_g)
+// i.e. exactly the library's dot_sk_q8_1_row, with float accumulation in 16 lanes and a single horizontal sum per row.
+struct alignas(64) ActRow {
+    int8_t xj[6][4][64];
+    float xd[6][16];
+    float xs4[6][16];
+};
+static_assert(sizeof(ActRow) == 2304, "ActRow");
+
+#if HY4_FAST
+struct FastConsts {
+    alignas(64) uint8_t idx4[4][64];    // vpermi2b index: plane j of the 128-byte nibble array (S4/S5/S6)
+    alignas(64) uint8_t ctrl3[4][64];   // vpmultishiftqb control: bit n -> bit 2 of the byte (S3 high plane)
+    alignas(64) uint8_t ctrl5[4][64];   // ... -> bit 4 (S5 high plane)
+    alignas(64) uint8_t tr[64];         // store_block: dst[16*j+k] = src[4*k+j]
+    alignas(64) int32_t effidx[16];
+    alignas(64) int64_t qidx[8];
+    FastConsts() {
+        for (int j = 0; j < 4; ++j)
+            for (int b = 0; b < 64; ++b) {
+                const int L = b >> 4, k = b & 15, q = k >> 3, kk = k & 7;
+                idx4[j][b] = (uint8_t)(32 * L + 2 * k + (j >> 1));
+                ctrl3[j][b] = (uint8_t)((32 * q + 4 * kk + j - 2) & 63);
+                ctrl5[j][b] = (uint8_t)((32 * q + 4 * kk + j - 4) & 63);
+            }
+        for (int j = 0; j < 4; ++j)
+            for (int k = 0; k < 16; ++k) tr[16 * j + k] = (uint8_t)(4 * k + j);
+        for (int i = 0; i < 16; ++i) effidx[i] = i >> 2;
+        for (int i = 0; i < 8; ++i) qidx[i] = i >> 1;
+    }
+};
+static const FastConsts kc;
+
+// block b (0..23) of a row from the library's Q8_1_G64 block
+static inline void store_block(ActRow* a, int b, const BlockQ8_1_G64& blk) {
+    const int sb = b >> 2, L = b & 3;
+    const __m512i R = _mm512_permutexvar_epi8(_mm512_load_si512((const void*)kc.tr), _mm512_load_si512((const void*)blk.qs));
+    _mm_store_si128((__m128i*)&a->xj[sb][0][L * 16], _mm512_castsi512_si128(R));
+    _mm_store_si128((__m128i*)&a->xj[sb][1][L * 16], _mm512_extracti32x4_epi32(R, 1));
+    _mm_store_si128((__m128i*)&a->xj[sb][2][L * 16], _mm512_extracti32x4_epi32(R, 2));
+    _mm_store_si128((__m128i*)&a->xj[sb][3][L * 16], _mm512_extracti32x4_epi32(R, 3));
+    _mm_store_ps(&a->xd[sb][L * 4], _mm_set1_ps(blk.d));
+    _mm_store_ps(&a->xs4[sb][L * 4], _mm_set1_ps(0.25f * blk.s));
+}
+
+#define HY4_HI3(J) _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_load_si512((const void*)kc.ctrl3[J]), src), m4)
+#define HY4_HI5(J) _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_load_si512((const void*)kc.ctrl5[J]), src), m16)
+#define HY4_NIB(J) _mm512_permutex2var_epi8(n0, _mm512_load_si512((const void*)kc.idx4[J]), n1)
+
+// P[j] lane L byte k = q[64*L + 4*k + j] of one super-block payload
+template <int FMT>
+static inline void unpack_planes(const uint8_t* pl, __m512i (&P)[4]) {
+    const __m512i m3 = _mm512_set1_epi8(3), m4 = _mm512_set1_epi8(4), m15 = _mm512_set1_epi8(15), m16 = _mm512_set1_epi8(16),
+                  m30 = _mm512_set1_epi8(0x30);
+    (void)m3; (void)m4; (void)m16; (void)m30;
+    if constexpr (FMT == 2 || FMT == 3) {
+        const __m512i w = _mm512_loadu_si512((const void*)pl);
+        if constexpr (FMT == 2) {
+            P[0] = _mm512_and_si512(w, m3);
+            P[1] = _mm512_and_si512(_mm512_srli_epi16(w, 2), m3);
+            P[2] = _mm512_and_si512(_mm512_srli_epi16(w, 4), m3);
+            P[3] = _mm512_and_si512(_mm512_srli_epi16(w, 6), m3);
+        } else {
+            const __m512i src = _mm512_permutexvar_epi64(_mm512_load_si512((const void*)kc.qidx), _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*)(pl + 64))));
+            P[0] = _mm512_ternarylogic_epi32(w, HY4_HI3(0), m3, 0xEC);
+            P[1] = _mm512_ternarylogic_epi32(_mm512_srli_epi16(w, 2), HY4_HI3(1), m3, 0xEC);
+            P[2] = _mm512_ternarylogic_epi32(_mm512_srli_epi16(w, 4), HY4_HI3(2), m3, 0xEC);
+            P[3] = _mm512_ternarylogic_epi32(_mm512_srli_epi16(w, 6), HY4_HI3(3), m3, 0xEC);
+        }
+    } else {
+        const __m512i n0 = _mm512_loadu_si512((const void*)pl), n1 = _mm512_loadu_si512((const void*)(pl + 64));
+        const __m512i v0 = HY4_NIB(0), v1 = _mm512_srli_epi16(HY4_NIB(1), 4), v2 = HY4_NIB(2), v3 = _mm512_srli_epi16(HY4_NIB(3), 4);
+        if constexpr (FMT == 4) {
+            P[0] = _mm512_and_si512(v0, m15);
+            P[1] = _mm512_and_si512(v1, m15);
+            P[2] = _mm512_and_si512(v2, m15);
+            P[3] = _mm512_and_si512(v3, m15);
+        } else if constexpr (FMT == 5) {
+            const __m512i src = _mm512_permutexvar_epi64(_mm512_load_si512((const void*)kc.qidx), _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*)(pl + 128))));
+            P[0] = _mm512_ternarylogic_epi32(v0, HY4_HI5(0), m15, 0xEC);
+            P[1] = _mm512_ternarylogic_epi32(v1, HY4_HI5(1), m15, 0xEC);
+            P[2] = _mm512_ternarylogic_epi32(v2, HY4_HI5(2), m15, 0xEC);
+            P[3] = _mm512_ternarylogic_epi32(v3, HY4_HI5(3), m15, 0xEC);
+        } else {  // S6: 2-bit high planes, byte i -> q[4i+j] in bits 2j
+            const __m512i w6 = _mm512_loadu_si512((const void*)(pl + 128));
+            P[0] = _mm512_ternarylogic_epi32(v0, _mm512_and_si512(_mm512_slli_epi16(w6, 4), m30), m15, 0xEC);
+            P[1] = _mm512_ternarylogic_epi32(v1, _mm512_and_si512(_mm512_slli_epi16(w6, 2), m30), m15, 0xEC);
+            P[2] = _mm512_ternarylogic_epi32(v2, _mm512_and_si512(w6, m30), m15, 0xEC);
+            P[3] = _mm512_ternarylogic_epi32(v3, _mm512_and_si512(_mm512_srli_epi16(w6, 2), m30), m15, 0xEC);
+        }
+    }
+}
+
+template <int FMT>
+struct FmtInfo;
+template <> struct FmtInfo<2> { static constexpr int SB = 70;  static constexpr float HALF = 1.5f; };
+template <> struct FmtInfo<3> { static constexpr int SB = 102; static constexpr float HALF = 3.5f; };
+template <> struct FmtInfo<4> { static constexpr int SB = 134; static constexpr float HALF = 7.5f; };
+template <> struct FmtInfo<5> { static constexpr int SB = 166; static constexpr float HALF = 15.5f; };
+template <> struct FmtInfo<6> { static constexpr int SB = 198; static constexpr float HALF = 31.5f; };
+
+// M tokens x 1 weight row (6 super-blocks of format FMT) -> out[t]
+template <int FMT, int M>
+static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* out) {
+    constexpr int SB = FmtInfo<FMT>::SB;
+    __m512 facc[M];
+    for (int t = 0; t < M; ++t) facc[t] = _mm512_setzero_ps();
+    const __m128 inv255 = _mm_set1_ps(255.0f);
+    const __m512 halfv = _mm512_set1_ps(FmtInfo<FMT>::HALF);
+    const __m512i effidx = _mm512_load_si512((const void*)kc.effidx);
+    for (int s = 0; s < 6; ++s) {
+        const uint8_t* blk = row + (size_t)s * SB;
+        uint16_t dh;
+        uint32_t u32;
+        std::memcpy(&dh, blk, 2);
+        std::memcpy(&u32, blk + 2, 4);
+        // eff_g = D * (u_g / 255) exactly as in sk_codecs (float division, then multiply), replicated x4 per group
+        __m128 u4 = _mm_div_ps(_mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)u32))), inv255);
+        u4 = _mm_mul_ps(u4, _mm_set1_ps(_cvtsh_ss(dh)));
+        const __m512 effv = _mm512_permutexvar_ps(effidx, _mm512_castps128_ps512(u4));
+        const __m512 effh = _mm512_mul_ps(effv, halfv);
+        __m512i P[4];
+        unpack_planes<FMT>(blk + 6, P);
+        for (int t = 0; t < M; ++t) {
+            const ActRow* a = X[t];
+            __m512i acc = _mm512_dpbusd_epi32(_mm512_setzero_si512(), P[0], _mm512_load_si512((const void*)a->xj[s][0]));
+            acc = _mm512_dpbusd_epi32(acc, P[1], _mm512_load_si512((const void*)a->xj[s][1]));
+            acc = _mm512_dpbusd_epi32(acc, P[2], _mm512_load_si512((const void*)a->xj[s][2]));
+            acc = _mm512_dpbusd_epi32(acc, P[3], _mm512_load_si512((const void*)a->xj[s][3]));
+            const __m512 sc = _mm512_mul_ps(effv, _mm512_load_ps(a->xd[s]));
+            facc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), sc, facc[t]);
+            facc[t] = _mm512_fnmadd_ps(effh, _mm512_load_ps(a->xs4[s]), facc[t]);
+        }
+    }
+    for (int t = 0; t < M; ++t) out[t] = _mm512_reduce_add_ps(facc[t]);
+}
+
+// nrows rows x M tokens; out[i*nrows + r]
+template <int FMT, int M>
+static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* out) {
+    constexpr size_t RBYTES = 6 * (size_t)FmtInfo<FMT>::SB;
+    for (int r = 0; r < nrows; ++r) {
+        float o[M];
+        row_dot<FMT, M>(W + r * RBYTES, X, o);
+        for (int i = 0; i < M; ++i) out[(size_t)i * nrows + r] = o[i];
+    }
+}
+
+template <int FMT>
+static void rows_fmt(const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out) {
+    for (int g0 = 0; g0 < m; g0 += 8) {
+        const int mg = std::min(8, m - g0);
+        const ActRow* const* x = X + g0;
+        float* o = out + (size_t)g0 * nrows;
+        switch (mg) {
+            case 1: rows_m<FMT, 1>(W, nrows, x, o); break;
+            case 2: rows_m<FMT, 2>(W, nrows, x, o); break;
+            case 3: rows_m<FMT, 3>(W, nrows, x, o); break;
+            case 4: rows_m<FMT, 4>(W, nrows, x, o); break;
+            case 5: rows_m<FMT, 5>(W, nrows, x, o); break;
+            case 6: rows_m<FMT, 6>(W, nrows, x, o); break;
+            case 7: rows_m<FMT, 7>(W, nrows, x, o); break;
+            default: rows_m<FMT, 8>(W, nrows, x, o); break;
+        }
+    }
+}
+
+// W: nrows rows of K=1536 in format `code` (2..6); X[m] activation rows; out[m][nrows]
+static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out) {
+    switch (code) {
+        case 2: rows_fmt<2>(W, nrows, X, m, out); break;
+        case 3: rows_fmt<3>(W, nrows, X, m, out); break;
+        case 4: rows_fmt<4>(W, nrows, X, m, out); break;
+        case 5: rows_fmt<5>(W, nrows, X, m, out); break;
+        default: rows_fmt<6>(W, nrows, X, m, out); break;
+    }
+}
+#endif  // HY4_FAST
+
 }  // namespace
 
 struct CpuExperts::Impl {
@@ -201,7 +396,9 @@ struct CpuExperts::Impl {
     std::unique_ptr<TScratch[]> ts;
     int spin_us = 300;
     // ---- scratch (grown in submit, never while a job runs)
-    ABuf<BlockQ8_1_G64> tokq, h2q;  // [Tc][24], [P][24]
+    ABuf<BlockQ8_1_G64> tokq, h2q;  // library path: [Tc][24], [P][24]
+    ABuf<ActRow> tokA, h2A;         // fast path:    [Tc],     [P]
+    bool fast = false;
     ABuf<float> Y;                  // [P][1536]
     size_t cap_tok = 0;
     std::vector<int> cnt, aoff, act_e, act_o, act_n, pair_tok, posof;
@@ -263,8 +460,8 @@ struct CpuExperts::Impl {
 };
 
 // ==================================================================================================== load
-bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::vector<std::vector<bool>>* mask, std::string& err) {
-    const double t0 = now_s();
+// header + Section 3 directory of a .strata (no zstd needed)
+static bool read_dir(const std::string& path, std::vector<DirE>& dir, uint64_t& s4_off, uint64_t& s4_len, std::string& err) {
     std::FILE* fp = std::fopen(path.c_str(), "rb");
     if (!fp) { err = "cannot open " + path; return false; }
     auto seek = [&](uint64_t off) {
@@ -284,7 +481,7 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
         std::memcpy(&off, frame + 0x10 + i * 64, 8);
         std::memcpy(&len, frame + 0x10 + i * 64 + 8, 8);
     };
-    uint64_t s3_off, s3_len, s4_off, s4_len;
+    uint64_t s3_off, s3_len;
     sec(3, s3_off, s3_len);
     sec(4, s4_off, s4_len);
     if (s3_len == 0 || s3_len % 32 != 0 || s4_len == 0) { std::fclose(fp); err = "no expert directory / Section 4"; return false; }
@@ -292,9 +489,8 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
     if (!seek(s3_off) || std::fread(raw.data(), 1, raw.size(), fp) != raw.size()) { std::fclose(fp); err = "short read of Section 3"; return false; }
     std::fclose(fp);
     const size_t ndir = raw.size() / 32;
-    nlayers = (int)(ndir / E);
-    if (nlayers * E != (int)ndir || nlayers == 0) { err = "expert directory is not layers x 512"; return false; }
-    std::vector<DirE> dir(ndir);
+    if ((ndir % E) != 0 || ndir == 0) { err = "expert directory is not layers x 512"; return false; }
+    dir.resize(ndir);
     for (size_t i = 0; i < ndir; ++i) {
         const uint8_t* r = raw.data() + i * 32;
         DirE& d = dir[i];
@@ -305,6 +501,16 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
         std::memcpy(&d.body_bytes, r + 16, 4);
         std::memcpy(&d.dn_off, r + 20, 4);
     }
+    return true;
+}
+
+bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::vector<std::vector<bool>>* mask, std::string& err) {
+    const double t0 = now_s();
+    std::vector<DirE> dir;
+    uint64_t s4_off = 0, s4_len = 0;
+    if (!read_dir(path, dir, s4_off, s4_len, err)) return false;
+    const size_t ndir = dir.size();
+    nlayers = (int)(ndir / E);
     // residency + arena layout
     recs.assign((size_t)nlayers * E, Rec());
     std::vector<uint64_t> slot(ndir, ~0ull);  // arena offset per directory entry
@@ -374,9 +580,20 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
         r.dn_sb = (uint32_t)superblock_bytes((SkCode)d.dn);
     }
     t_load = now_s() - t0;
-    std::fprintf(stderr, "[cpuexp] %llu experts resident, %.2f GB in %.1f s (%.2f GB/s), %zu reads, mlock=%s, isa=%s\n",
+    fast = false;
+#if HY4_FAST
+    fast = true;
+    if (const char* k = std::getenv("STRATA_CPUEXP_KERNEL"))
+        if (!std::strcmp(k, "lib")) fast = false;
+    for (const Rec& r : recs)
+        if (r.body && (r.gu < 2 || r.gu > 6 || r.dn < 2 || r.dn > 6)) {
+            if (fast) std::fprintf(stderr, "[cpuexp] S8/other expert code resident: using the library kernel\n");
+            fast = false;
+        }
+#endif
+    std::fprintf(stderr, "[cpuexp] %llu experts resident, %.2f GB in %.1f s (%.2f GB/s), %zu reads, mlock=%s, isa=%s, kernel=%s\n",
                  (unsigned long long)n_resident, arena_size / 1e9, t_load, arena_size / 1e9 / std::max(t_load, 1e-9), runs.size(),
-                 locked ? "yes" : "no", strata::quant::sk::active_sk_isa());
+                 locked ? "yes" : "no", strata::quant::sk::active_sk_isa(), fast ? "fast(avx512-vbmi)" : "lib");
     start_threads(n_threads);
     return true;
 }
@@ -428,9 +645,9 @@ void CpuExperts::Impl::start_threads(int n) {
     ts.reset(new TScratch[nth]);
     for (int ti = 0; ti < nth; ++ti) {
         TScratch& s = ts[ti];
-        s.xg.alloc((size_t)MG * NB);
-        s.tg.alloc((size_t)MG * RB);
-        s.tu.alloc((size_t)MG * RB);
+        if (!fast) s.xg.alloc((size_t)MG * NB);
+        s.tg.alloc((size_t)MGF * RB);
+        s.tu.alloc((size_t)MGF * RB);
     }
     if (const char* e = std::getenv("STRATA_CPUEXP_SPIN_US")) spin_us = std::atoi(e);
     std::vector<int> pins;
@@ -549,17 +766,28 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
         const uint16_t* h16 = (const uint16_t*)r.body + b * RB;
         for (int i = 0; i < RB; ++i) sq[i] = fp16_to_fp32(h16[i]);
     }
-    for (int g0 = 0; g0 < m; g0 += MG) {
-        const int mg = std::min(MG, m - g0);
-        const BlockQ8_1_G64* xs;
-        if (mg == 1) {
-            xs = tokq.p + (size_t)pair_tok[p0 + g0] * NB;
-        } else {
-            for (int i = 0; i < mg; ++i) std::memcpy(S.xg.p + (size_t)i * NB, tokq.p + (size_t)pair_tok[p0 + g0 + i] * NB, NB * sizeof(BlockQ8_1_G64));
-            xs = S.xg.p;
+    const int mgmax = fast ? MGF : MG;
+    for (int g0 = 0; g0 < m; g0 += mgmax) {
+        const int mg = std::min(mgmax, m - g0);
+#if HY4_FAST
+        if (fast) {
+            const ActRow* xp[MGF];
+            for (int i = 0; i < mg; ++i) xp[i] = tokA.p + (size_t)pair_tok[p0 + g0 + i];
+            rows_gemm(r.gu, wg, RB, xp, mg, S.tg.p);
+            rows_gemm(r.gu, wu, RB, xp, mg, S.tu.p);
+        } else
+#endif
+        {
+            const BlockQ8_1_G64* xs;
+            if (mg == 1) {
+                xs = tokq.p + (size_t)pair_tok[p0 + g0] * NB;
+            } else {
+                for (int i = 0; i < mg; ++i) std::memcpy(S.xg.p + (size_t)i * NB, tokq.p + (size_t)pair_tok[p0 + g0 + i] * NB, NB * sizeof(BlockQ8_1_G64));
+                xs = S.xg.p;
+            }
+            gemm_sk_q8_1(wg, gc, xs, S.tg.p, RB, D, mg);
+            gemm_sk_q8_1(wu, gc, xs, S.tu.p, RB, D, mg);
         }
-        gemm_sk_q8_1(wg, gc, xs, S.tg.p, RB, D, mg);
-        gemm_sk_q8_1(wu, gc, xs, S.tu.p, RB, D, mg);
         for (int i = 0; i < mg; ++i) {
             float h[RB];
             const float* g = S.tg.p + i * RB;
@@ -571,7 +799,14 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
                 const float uc = std::max(-SWIGLU_LIMIT, std::min(u[d], SWIGLU_LIMIT));
                 h[d] = (sc * uc) / sq[d];
             }
-            quantize_q8_1_g64(h, h2q.p + (size_t)(p0 + g0 + i) * NB + b, 64);
+#if HY4_FAST
+            if (fast) {
+                BlockQ8_1_G64 blk;
+                quantize_q8_1_g64(h, &blk, 64);
+                store_block(h2A.p + (size_t)(p0 + g0 + i), b, blk);
+            } else
+#endif
+                quantize_q8_1_g64(h, h2q.p + (size_t)(p0 + g0 + i) * NB + b, 64);
         }
     }
 }
@@ -583,9 +818,17 @@ void CpuExperts::Impl::dn_unit(int tid, const Job& J, int a, int c) {
     const int p0 = act_o[a], m = act_n[a];
     const size_t row_b = 6ull * r.dn_sb;
     const uint8_t* wd = r.body + r.dn_off + (size_t)c * RB * row_b;
-    for (int g0 = 0; g0 < m; g0 += MG) {
-        const int mg = std::min(MG, m - g0);
-        gemm_sk_q8_1(wd, (SkCode)r.dn, h2q.p + (size_t)(p0 + g0) * NB, S.tg.p, RB, D, mg);
+    const int mgmax = fast ? MGF : MG;
+    for (int g0 = 0; g0 < m; g0 += mgmax) {
+        const int mg = std::min(mgmax, m - g0);
+#if HY4_FAST
+        if (fast) {
+            const ActRow* xp[MGF];
+            for (int i = 0; i < mg; ++i) xp[i] = h2A.p + (size_t)(p0 + g0 + i);
+            rows_gemm(r.dn, wd, RB, xp, mg, S.tg.p);
+        } else
+#endif
+            gemm_sk_q8_1(wd, (SkCode)r.dn, h2q.p + (size_t)(p0 + g0) * NB, S.tg.p, RB, D, mg);
         for (int i = 0; i < mg; ++i) std::memcpy(Y.p + (size_t)(p0 + g0 + i) * D + c * RB, S.tg.p + i * RB, RB * sizeof(float));
     }
 }
@@ -612,29 +855,48 @@ void CpuExperts::Impl::run_job(int tid) {
     int& sense = ts[tid].sense;
     for (int t0 = 0; t0 < J.T; t0 += TC) {
         const int Tc = std::min(TC, J.T - t0);
+        double tp = tid == 0 ? now_s() : 0, tn = 0;
+        auto lap = [&](int k) {
+            if (tid != 0) return;
+            tn = now_s();
+            st.phase_s[k] += tn - tp;
+            tp = tn;
+        };
         if (tid == 0) plan(J, t0, Tc);
         bar.wait(sense);
+        lap(0);
         // quantize the z rows of tokens that have a CPU pair (8 blocks of 64 per unit)
         for (;;) {
             const int u = qctr.fetch_add(1, std::memory_order_relaxed);
             if (u >= Tc * 3) break;
             const int t = u / 3, part = u % 3;
             if (!tok_used[t]) continue;
+#if HY4_FAST
+            if (fast) {
+                alignas(64) BlockQ8_1_G64 blk[8];
+                quantize_q8_1_g64(J.z + (size_t)(t0 + t) * D + part * 512, blk, 512);
+                for (int i = 0; i < 8; ++i) store_block(tokA.p + t, part * 8 + i, blk[i]);
+                continue;
+            }
+#endif
             quantize_q8_1_g64(J.z + (size_t)(t0 + t) * D + part * 512, tokq.p + (size_t)t * NB + part * 8, 512);
         }
         bar.wait(sense);
+        lap(1);
         for (;;) {
             const int u = guctr.fetch_add(1, std::memory_order_relaxed);
             if (u >= nact * NUNIT) break;
             gu_unit(tid, J, u / NUNIT, u % NUNIT);
         }
         bar.wait(sense);
+        lap(2);
         for (;;) {
             const int u = dnctr.fetch_add(1, std::memory_order_relaxed);
             if (u >= nact * NUNIT) break;
             dn_unit(tid, J, u / NUNIT, u % NUNIT);
         }
         bar.wait(sense);
+        lap(3);
         const int cb = D / 256;
         for (;;) {
             const int u = cbctr.fetch_add(1, std::memory_order_relaxed);
@@ -642,6 +904,7 @@ void CpuExperts::Impl::run_job(int tid) {
             combine_unit(J, t0, u / cb, (u % cb) * 256);
         }
         bar.wait(sense);
+        lap(4);
     }
     if (tid == 0) {
         st.wall_s += now_s() - J.t_post;
@@ -655,6 +918,101 @@ void CpuExperts::Impl::run_job(int tid) {
 }
 
 // ==================================================================================================== public API
+bool CpuExperts::read_rank_table(const std::string& path, std::vector<uint16_t>& expert_of_rank, std::vector<uint16_t>& codes, std::string& err) {
+    std::vector<DirE> dir;
+    uint64_t s4o, s4l;
+    if (!read_dir(path, dir, s4o, s4l, err)) return false;
+    expert_of_rank.assign(dir.size(), 0);
+    codes.assign(dir.size(), 0);
+    const size_t nl = dir.size() / E;
+    for (size_t i = 0; i < dir.size(); ++i) {
+        if (dir[i].expert_id >= E) { err = "bad expert_id in directory"; return false; }
+        expert_of_rank[i] = dir[i].expert_id;
+        codes[(i / E) * E + dir[i].expert_id] = (uint16_t)((dir[i].gu << 8) | dir[i].dn);
+    }
+    (void)nl;
+    return true;
+}
+
+bool CpuExperts::make_mask_rank_range(const std::string& path, const std::vector<int>& first_rank, const std::vector<int>& last_rank,
+                                      std::vector<std::vector<bool>>& mask, std::string& err) {
+    std::vector<uint16_t> eor, codes;
+    if (!read_rank_table(path, eor, codes, err)) return false;
+    const int nl = (int)(eor.size() / E);
+    mask.assign(nl, std::vector<bool>(E, false));
+    for (int l = 0; l < nl; ++l) {
+        const int a = l < (int)first_rank.size() ? std::max(0, first_rank[l]) : 0;
+        const int b = l < (int)last_rank.size() ? std::min(E, last_rank[l]) : 0;
+        for (int r = a; r < b; ++r) mask[l][eor[(size_t)l * E + r]] = true;
+    }
+    return true;
+}
+
+bool CpuExperts::make_mask_rank_range(const std::string& path, int first_rank, int last_rank, std::vector<std::vector<bool>>& mask, std::string& err) {
+    std::vector<uint16_t> eor, codes;
+    if (!read_rank_table(path, eor, codes, err)) return false;
+    const int nl = (int)(eor.size() / E);
+    return make_mask_rank_range(path, std::vector<int>(nl, first_rank), std::vector<int>(nl, last_rank), mask, err);
+}
+
+// Random-weight self test of the fast row kernel for every format S2..S6 (the real SQ-64 file only contains S2/S3/S4):
+// random payload bytes / D / u, real quantized activations; reference = dequant_sk_row (double) . dequantized Q8_1 activations.
+bool CpuExperts::selftest_kernels(std::string& report) {
+#if HY4_FAST
+    uint64_t s = 0x1234567ull;
+    auto rnd = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+    bool ok = true;
+    char buf[200];
+    for (int code = 2; code <= 6; ++code) {
+        const size_t sb = superblock_bytes((SkCode)code), rb = 6 * sb;
+        const int nrows = 5;
+        std::vector<uint8_t> W(rb * nrows);
+        for (int r = 0; r < nrows; ++r)
+            for (int b = 0; b < 6; ++b) {
+                uint8_t* p = &W[r * rb + b * sb];
+                for (size_t i = 0; i < sb; ++i) p[i] = (uint8_t)rnd();
+                const uint16_t h = (uint16_t)(0x2800 + (rnd() % 0x1000));  // fp16 in ~[0.03, 4)
+                std::memcpy(p, &h, 2);
+            }
+        double worst = 0;
+        for (int m : {1, 3, 8, 11}) {
+            ABuf<ActRow> A;
+            A.alloc(m);
+            std::vector<float> xd((size_t)m * D), xq((size_t)m * D);
+            const ActRow* xp[16];
+            for (int t = 0; t < m; ++t) {
+                for (int i = 0; i < D; ++i) xd[(size_t)t * D + i] = (float)((double)(rnd() % 2000001) / 1e6 - 1.0) * (1.0f + (i % 64 == 5 ? 6.0f : 0.0f));
+                BlockQ8_1_G64 blk[24];
+                quantize_q8_1_g64(&xd[(size_t)t * D], blk, D);
+                for (int b = 0; b < 24; ++b) {
+                    store_block(&A.p[t], b, blk[b]);
+                    for (int i = 0; i < 64; ++i) xq[(size_t)t * D + b * 64 + i] = blk[b].d * (float)blk[b].qs[i];
+                }
+                xp[t] = &A.p[t];
+            }
+            std::vector<float> out((size_t)m * nrows);
+            rows_gemm(code, W.data(), nrows, xp, m, out.data());
+            std::vector<float> wf(D);
+            for (int r = 0; r < nrows; ++r) {
+                strata::quant::sk::dequant_sk_row(&W[r * rb], (SkCode)code, wf.data(), D);
+                for (int t = 0; t < m; ++t) {
+                    double ref = 0, mag = 0;
+                    for (int i = 0; i < D; ++i) { ref += (double)wf[i] * xq[(size_t)t * D + i]; mag += std::fabs((double)wf[i] * xq[(size_t)t * D + i]); }
+                    worst = std::max(worst, std::fabs(ref - out[(size_t)t * nrows + r]) / (mag + 1e-30));
+                }
+            }
+        }
+        std::snprintf(buf, sizeof(buf), "S%d: worst |err|/sum|w*x| = %.2e (m=1,3,8,11)\n", code, worst);
+        report += buf;
+        if (!(worst < 2e-6)) ok = false;
+    }
+    return ok;
+#else
+    report = "fast kernel not compiled (needs AVX-512 BW/VNNI/VBMI + F16C); nothing to test\n";
+    return true;
+#endif
+}
+
 CpuExperts::CpuExperts() : p_(new Impl) {}
 CpuExperts::~CpuExperts() = default;
 
@@ -676,6 +1034,7 @@ CpuExpertView CpuExperts::view(int layer, int e) const {
     v.body_bytes = r.body_bytes;
     return v;
 }
+bool CpuExperts::fast_kernel() const { return p_->fast; }
 int CpuExperts::n_layers() const { return p_->nlayers; }
 uint64_t CpuExperts::arena_bytes() const { return p_->arena_size; }
 uint64_t CpuExperts::resident_count() const { return p_->n_resident; }
@@ -690,8 +1049,13 @@ void CpuExperts::submit(int layer, int T, const float* z, const int32_t* idx, co
     const int Tc = std::min(T, TC);
     if ((size_t)Tc > I.cap_tok) {
         const size_t cap = std::max<size_t>(Tc, std::min<size_t>(TC, I.cap_tok * 2));
-        I.tokq.alloc(cap * NB);
-        I.h2q.alloc(cap * TOPK * NB);
+        if (I.fast) {
+            I.tokA.alloc(cap);
+            I.h2A.alloc(cap * TOPK);
+        } else {
+            I.tokq.alloc(cap * NB);
+            I.h2q.alloc(cap * TOPK * NB);
+        }
         I.Y.alloc(cap * TOPK * D);
         I.pair_tok.assign(cap * TOPK, 0);
         I.posof.assign(cap * TOPK, -1);

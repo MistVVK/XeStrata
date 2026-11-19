@@ -2,6 +2,7 @@
 #pragma once
 #include "hy4_gpu.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -35,6 +36,7 @@ struct ExpertRef {  // per (moe_layer, expert id); offsets relative to the arena
     uint64_t body_off;
     uint32_t dn_off;  // relative to body_off
     uint8_t gu_code, dn_code;
+    uint8_t tier = 0;  // 0 device arena, 1 pinned host memory read by the GPU, 2 host RAM computed by the CPU (hybrid)
 };
 
 struct GpuModel {
@@ -50,6 +52,7 @@ struct GpuModel {
     uint8_t* h_arena = nullptr;
     uint64_t vram_expert_bytes = 0, host_expert_bytes = 0, n_vram_experts = 0, n_host_experts = 0;
     std::vector<uint8_t> expert_tier;
+    std::vector<std::vector<bool>> cpu_mask;  // [41][512] by expert id: tier-2 experts (computed by hy4_cpu_experts); empty when none
     double t_load_trunk = 0, t_load_experts = 0;
 
     const uint8_t* tensor_dev(const std::string& name) const { return d_trunk + man.get(name).off; }
@@ -104,10 +107,26 @@ inline void stream_to_device(const std::string& path, uint64_t file_off, uint64_
     *seconds = now_s() - t0;
 }
 
+inline double host_mem_gb() {
+#ifdef _WIN32
+    return 64.0;
+#else
+    FILE* f = fopen("/proc/meminfo", "r");
+    double kb = 64.0 * 1048576.0;
+    if (f) {
+        char ln[256];
+        while (fgets(ln, sizeof ln, f))
+            if (sscanf(ln, "MemTotal: %lf kB", &kb) == 1) break;
+        fclose(f);
+    }
+    return kb / 1048576.0;
+#endif
+}
+
 // Expert tiering for cards that cannot hold Section 4: the hottest ranks (rank-major over the 41 layers, Section 4 is stored hot to cold) go to a device arena,
 // every other expert goes to pinned, device-mapped host memory that the GPU reads directly (zero-copy over PCIe). Each expert's body_off is rewritten as the
 // (wrapping) distance of its final address from g.d_sec4, so the kernels keep their `sec4 + body_off` addressing and need no change.
-inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vram_budget, std::string& err) {
+inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vram_budget, bool cpu_mode, std::string& err) {
     const auto& h = g.rd.header();
     const auto& dir = g.rd.expert_directory();
     const size_t N = dir.size();
@@ -126,8 +145,12 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
             vb += sz;
         }
     uint64_t n_v = 0, n_h = 0;
-    for (size_t i = 0; i < N; ++i)
-        if (tier[i] == 1) { off[i] = hb; hb += al(dir[i].body_bytes); ++n_h; } else ++n_v;
+    for (size_t i = 0; i < N; ++i) {
+        if (tier[i] == 1 && cpu_mode) tier[i] = 2;
+        if (tier[i] == 1) { off[i] = hb; hb += al(dir[i].body_bytes); ++n_h; }
+        else if (tier[i] == 0) ++n_v;
+        else ++n_h;
+    }
     HCK(hipMalloc((void**)&g.d_sec4, vb ? vb : 4096));
     uint8_t* hbase = nullptr;
     uint8_t* hdev = nullptr;
@@ -161,6 +184,7 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
                 if (i >= N) break;
                 const uint64_t fo = h.sections[4].file_offset + dir[i].body_offset;
                 const size_t n = dir[i].body_bytes;
+                if (tier[i] == 2) continue;  // loaded by hy4_cpu_experts
                 if (tier[i] == 1) {
                     if (f.read_at(fo, hbase + off[i], n) < n) { failed = 1; break; }
                 } else {
@@ -174,14 +198,18 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         });
     for (auto& t : th) t.join();
     if (failed) { err = "expert read failed"; return false; }
+    if (cpu_mode) g.cpu_mask.assign(N / 512, std::vector<bool>(512, false));
     for (size_t i = 0; i < N; ++i) {
         const auto& e = dir[i];
+        ExpertRef& er = g.experts[(i / 512) * 512 + e.expert_id];
+        er.tier = tier[i];
+        if (tier[i] == 2) { g.cpu_mask[i / 512][e.expert_id] = true; continue; }
         uint8_t* dst = tier[i] == 0 ? g.d_sec4 + off[i] : hdev + off[i];
-        g.experts[(i / 512) * 512 + e.expert_id].body_off = (uint64_t)(uintptr_t)dst - (uint64_t)(uintptr_t)g.d_sec4;
+        er.body_off = (uint64_t)(uintptr_t)dst - (uint64_t)(uintptr_t)g.d_sec4;
     }
     g.t_load_experts = now_s() - t0;
-    fprintf(stderr, "[load] experts tiered: %llu in VRAM (%.2f GB), %llu in pinned host memory read by the GPU (%.2f GB), %.1f s\n", (unsigned long long)n_v, vb / 1e9,
-            (unsigned long long)n_h, hb / 1e9, g.t_load_experts);
+    fprintf(stderr, "[load] experts tiered: %llu in VRAM (%.2f GB), %llu in %s (%.2f GB), %.1f s\n", (unsigned long long)n_v, vb / 1e9, (unsigned long long)n_h,
+            cpu_mode ? "host RAM computed by the CPU" : "pinned host memory read by the GPU", cpu_mode ? (double)(g.sec4_bytes - vb) / 1e9 : hb / 1e9, g.t_load_experts);
     return true;
 }
 
@@ -220,7 +248,13 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
             HCK(hipMalloc((void**)&g.d_sec4, (g.sec4_bytes + 4095) & ~4095ull));
             stream_to_device(path, h.sections[4].file_offset, g.sec4_bytes, g.d_sec4, &g.t_load_experts, "experts");
         } else {
-            if (!load_experts_tiered(g, path, budget < 0 ? 0 : (size_t)budget, err)) {
+            // host-resident experts: pinned + read by the GPU (needs the RAM) or computed by the CPU. HY4_CPU_EXPERTS=1/0 forces, default: CPU when they would use > 45% of the RAM
+            bool cpu_mode = false;
+            {
+                double host_gb = (g.sec4_bytes - std::max(0.0, std::min(budget, (double)g.sec4_bytes))) / 1e9, mem_gb = host_mem_gb();
+                cpu_mode = getenv("HY4_CPU_EXPERTS") ? atoi(getenv("HY4_CPU_EXPERTS")) != 0 : host_gb > 0.45 * mem_gb;
+            }
+            if (!load_experts_tiered(g, path, budget < 0 ? 0 : (size_t)budget, cpu_mode, err)) {
                 fprintf(stderr, "experts: %s\n", err.c_str());
                 return false;
             }

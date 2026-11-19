@@ -21,6 +21,7 @@ struct CpuExpertStats {
     double wall_s = 0;                // sum over jobs of (job finished - submit() called)
     uint64_t jobs = 0, pairs = 0;     // jobs run, (token,slot) pairs evaluated
     uint64_t skipped_unresident = 0;  // pairs with use_pair != 0 whose expert is not CPU-resident (they are NOT computed)
+    double phase_s[5] = {0, 0, 0, 0, 0};  // wall seconds in: plan, quantize z, gate/up(+h), down, combine (sum over jobs)
     double gbps() const { return wall_s > 0 ? (double)bytes / wall_s / 1e9 : 0.0; }
 };
 
@@ -47,6 +48,25 @@ public:
     // STRATA_CPUEXP_PIN=0 disables pinning, STRATA_CPUEXP_SPIN_US sets the idle spin time, default 300 us).
     // cpu_resident[layer][expert] (41 x 512): which experts are loaded; null = all. layer = MoE layer index 0..40.
     bool init(const std::string& strata_path, int n_threads, const std::vector<std::vector<bool>>* cpu_resident, std::string& err);
+
+    // ---- directory helpers (read only the 4 KiB header + Section 3; no model load, no zstd) ------------------------------------
+    // Section 4 stores the 512 experts of every MoE layer hot-to-cold by rank: directory index i = layer*512 + rank, and the
+    // entry says which expert id sits at that rank. These build the cpu_resident mask for init() from rank ranges.
+    // expert_of_rank[layer*512 + rank] = expert id; codes[layer*512 + expert_id] = (gu_code << 8) | dn_code (SkCode values).
+    static bool read_rank_table(const std::string& path, std::vector<uint16_t>& expert_of_rank, std::vector<uint16_t>& codes, std::string& err);
+    // mask[layer][expert] = true for the experts whose rank in that layer is in [first_rank[layer], last_rank[layer]) (half open;
+    // 0 = hottest). One entry per layer (41 for Hy4-Flash). E.g. "the coldest 400 of every layer live in RAM, the hottest 112
+    // are on the GPU" is first_rank = 112, last_rank = 512 for all layers.
+    static bool make_mask_rank_range(const std::string& path, const std::vector<int>& first_rank, const std::vector<int>& last_rank,
+                                     std::vector<std::vector<bool>>& mask, std::string& err);
+    // same range for every layer
+    static bool make_mask_rank_range(const std::string& path, int first_rank, int last_rank, std::vector<std::vector<bool>>& mask, std::string& err);
+
+    // Kernel: AVX-512 VBMI/VNNI "fast" kernel when compiled for it (-march=native on Ice Lake / Zen 4 or newer) and all resident
+    // experts are S2..S6, else the library gemm_sk_q8_1 kernel. STRATA_CPUEXP_KERNEL=lib forces the library kernel.
+    bool fast_kernel() const;
+    // Self test of the fast row kernel with random S2..S6 weights vs dequant_sk_row; returns false on a mismatch.
+    static bool selftest_kernels(std::string& report);
 
     bool resident(int layer, int expert) const;
     CpuExpertView view(int layer, int expert) const;

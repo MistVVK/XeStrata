@@ -37,14 +37,16 @@ inline size_t moe_ws_bytes(int M) {
 namespace skd {
 
 // ---------------------------------------------------------------- routing (single block, counting sort by expert)
-__global__ void __launch_bounds__(512) k_moe_route(const int32_t* __restrict__ idx, int P, int* __restrict__ cnt, int* __restrict__ off, int* __restrict__ pairs,
+__global__ void __launch_bounds__(512) k_moe_route(const ExpertDev* __restrict__ ex, const int32_t* __restrict__ idx, int P, int* __restrict__ cnt, int* __restrict__ off, int* __restrict__ pairs,
                                                     int* __restrict__ active, int* __restrict__ nact) {
     __shared__ int c[512], sc[512], fl[512], fill[512];
     const int t = threadIdx.x;
     c[t] = 0;
     fill[t] = 0;
     __syncthreads();
-    for (int i = t; i < P; i += 512) atomicAdd(&c[idx[i]], 1);
+    // experts flagged pad != 0 live on the CPU (hybrid placement): their pairs are not evaluated here
+    for (int i = t; i < P; i += 512)
+        if (!ex[idx[i]].pad) atomicAdd(&c[idx[i]], 1);
     __syncthreads();
     const int cv = c[t];
     const int f = cv > 0;
@@ -69,6 +71,7 @@ __global__ void __launch_bounds__(512) k_moe_route(const int32_t* __restrict__ i
     __syncthreads();
     for (int i = t; i < P; i += 512) {
         const int e = idx[i];
+        if (ex[e].pad) continue;
         const int pos = atomicAdd(&fill[e], 1);
         pairs[sc[e] + pos] = i;
     }
@@ -421,9 +424,9 @@ __device__ __forceinline__ void wave_dot_dispatch(int code, const uint8_t* rp, i
     }
 }
 
-__global__ void k_moe_hist(const int32_t* __restrict__ idx, int P, int* __restrict__ cnt) {
+__global__ void k_moe_hist(const ExpertDev* __restrict__ ex, const int32_t* __restrict__ idx, int P, int* __restrict__ cnt) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < P) atomicAdd(&cnt[idx[i]], 1);
+    if (i < P && !ex[idx[i]].pad) atomicAdd(&cnt[idx[i]], 1);
 }
 __global__ void k_moe_scan(const int* __restrict__ cnt, int* __restrict__ off) {
     if (threadIdx.x == 0) {
@@ -432,9 +435,9 @@ __global__ void k_moe_scan(const int* __restrict__ cnt, int* __restrict__ off) {
         off[MOE_E] = a;
     }
 }
-__global__ void k_moe_scatter(const int32_t* __restrict__ idx, int P, const int* __restrict__ off, int* __restrict__ fill, int* __restrict__ pairs) {
+__global__ void k_moe_scatter(const ExpertDev* __restrict__ ex, const int32_t* __restrict__ idx, int P, const int* __restrict__ off, int* __restrict__ fill, int* __restrict__ pairs) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < P) {
+    if (i < P && !ex[idx[i]].pad) {
         const int e = idx[i];
         const int pos = atomicAdd(&fill[e], 1);
         pairs[off[e] + pos] = i;
@@ -557,6 +560,7 @@ inline MoeWs moe_ws_split(void* ws, int P) {
 // z_out: float [M][1536] (overwritten = sum over the 16 slots of w * y). ws: moe_ws_bytes(M) bytes of device memory.
 // tuning knob: for M <= moe_dec_max_m() the GEMV-style decode kernels run, above it the grouped WMMA kernels with the smallest token tile per expert
 namespace skd {
+inline int& moe_has_cpu() { static int v = 0; return v; }  // 1 = some experts are CPU-resident (ExpertDev.pad != 0): their y rows are zeroed
 inline int& moe_dec_max_m() { static int v = HY4_MMA ? 4 : 8; return v; }
 }
 
@@ -574,7 +578,8 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
     const int P = M * MOE_TOPK;
     const skd::MoeWs w = skd::moe_ws_split(ws, P);
     const int eb = P < MOE_E ? P : MOE_E;
-    hipLaunchKernelGGL(skd::k_moe_route, dim3(1), dim3(512), 0, s, topk_idx, P, w.cnt, w.off, w.pairs, w.active, w.nact);
+    if (skd::moe_has_cpu()) (void)hipMemsetAsync(w.y, 0, (size_t)P * MOE_D * 4, s);
+    hipLaunchKernelGGL(skd::k_moe_route, dim3(1), dim3(512), 0, s, experts, topk_idx, P, w.cnt, w.off, w.pairs, w.active, w.nact);
     if (M <= skd::moe_dec_max_m() && M <= 16) {
 #define HY4_DEC(MT)                                                                                                                                         \
     hipLaunchKernelGGL((skd::k_moe_gu_dec<MT>), dim3(MOE_D / 8, eb), dim3(256), 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2);  \
@@ -621,11 +626,12 @@ inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const Exper
                             float* z_out, int M, void* ws) {
     const int P = M * MOE_TOPK;
     const skd::MoeWs w = skd::moe_ws_split(ws, P);
+    if (skd::moe_has_cpu()) (void)hipMemsetAsync(w.y, 0, (size_t)P * MOE_D * 4, s);
     (void)hipMemsetAsync(w.cnt, 0, sizeof(int) * 512, s);
     (void)hipMemsetAsync(w.fill, 0, sizeof(int) * 512, s);
-    hipLaunchKernelGGL(skd::k_moe_hist, dim3((P + 255) / 256), dim3(256), 0, s, topk_idx, P, w.cnt);
+    hipLaunchKernelGGL(skd::k_moe_hist, dim3((P + 255) / 256), dim3(256), 0, s, experts, topk_idx, P, w.cnt);
     hipLaunchKernelGGL(skd::k_moe_scan, dim3(1), dim3(32), 0, s, w.cnt, w.off);
-    hipLaunchKernelGGL(skd::k_moe_scatter, dim3((P + 255) / 256), dim3(256), 0, s, topk_idx, P, w.off, w.fill, w.pairs);
+    hipLaunchKernelGGL(skd::k_moe_scatter, dim3((P + 255) / 256), dim3(256), 0, s, experts, topk_idx, P, w.off, w.fill, w.pairs);
     hipLaunchKernelGGL(skd::k_moe_gu_ref, dim3(MOE_D / 8, MOE_E), dim3(256), 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.h2);
     hipLaunchKernelGGL(skd::k_moe_dn_ref, dim3(MOE_D / 8, MOE_E), dim3(256), 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.h2, w.y);
     hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out);

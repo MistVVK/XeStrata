@@ -308,6 +308,12 @@ __global__ void k_add_rms_post(const float* __restrict__ a, const float* __restr
     }
 }
 
+// ---- a += b (fp32)
+__global__ void k_add_inplace(float* __restrict__ a, const float* __restrict__ b, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] += b[i];
+}
+
 // ---- fp32 -> fp16
 __global__ void k_f2h(const float* __restrict__ in, __half* __restrict__ out, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

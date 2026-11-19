@@ -69,7 +69,7 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".";
-    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false;
+    bool load_only = false, dump = false, save_logits = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false;
     int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048;
     bool serve = false, session_reuse = false;
     int gpu = -1;
@@ -117,6 +117,7 @@ int main(int argc, char** argv) {
         else if (a == "--load-only") load_only = true;
         else if (a == "--dump") dump = true;
         else if (a == "--all-logits") all_logits = true;
+        else if (a == "--save-logits") save_logits = true;
         else if (a == "--no-engram") no_engram = true;
         else if (a == "--index-topk") index_topk = atoi(nxt().c_str());
         else if (a == "--no-index") no_index = true;
@@ -235,7 +236,7 @@ int main(int argc, char** argv) {
             hl.resize((size_t)n * V);
             HCK(hipMemcpy(hl.data(), r.logits, hl.size() * 4, hipMemcpyDeviceToHost));
             for (int i = 0; i < n; ++i) top5_line(&hl[(size_t)i * V], V, done - n + i, top_out);
-            if (dump) save_npy_f32(out_dir + "/logits.npy", hl.data(), {n, V});
+            if (dump || save_logits) save_npy_f32(out_dir + "/logits.npy", hl.data(), {n, V});
         } else {
             HCK(hipStreamSynchronize(r.st)); r.pflush();
         }

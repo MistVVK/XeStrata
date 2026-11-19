@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <set>
 #include <string>
 #include <thread>
@@ -154,13 +155,35 @@ static Batch make_batch(Rng& r, int T, const std::vector<int>& pool /*expert ids
 }
 
 static int test_num(const std::string& path, int nth) {
-    const int L = 5;
     Rng rng(7);
-    std::vector<std::vector<bool>> mask(41, std::vector<bool>(512, false));
+    std::vector<uint16_t> eor, codes;
+    std::string err0;
+    if (!CpuExperts::read_rank_table(path, eor, codes, err0)) { std::printf("read_rank_table failed: %s\n", err0.c_str()); return 1; }
+    // layer with the most distinct (gu,dn) code combinations; pool = up to 48 experts round-robin over the combos
+    int L = 5, best = -1;
+    for (int l = 0; l < 41; ++l) {
+        std::set<int> cs;
+        for (int e = 0; e < 512; ++e) cs.insert(codes[(size_t)l * 512 + e]);
+        if ((int)cs.size() > best) { best = (int)cs.size(); L = l; }
+    }
     std::vector<int> pool;
+    std::vector<std::vector<bool>> mask(41, std::vector<bool>(512, false));
     {
+        std::vector<std::vector<int>> by;
+        std::vector<uint16_t> keys;
+        for (int e = 0; e < 512; ++e) {
+            const uint16_t c = codes[(size_t)L * 512 + e];
+            size_t k = 0;
+            while (k < keys.size() && keys[k] != c) ++k;
+            if (k == keys.size()) { keys.push_back(c); by.emplace_back(); }
+            by[k].push_back(e);
+        }
+        for (size_t k = 0; k < by.size(); ++k)
+            std::printf("  layer %d combo gu=S%d dn=S%d: %zu experts\n", L, keys[k] >> 8, keys[k] & 255, by[k].size());
         std::set<int> s;
-        while ((int)s.size() < 40) s.insert(rng.below(512));
+        for (int round = 0; (int)s.size() < 48 && round < 64; ++round)
+            for (size_t k = 0; k < by.size() && (int)s.size() < 48; ++k)
+                if (round < (int)by[k].size()) s.insert(by[k][(round * 7 + (int)k) % by[k].size()]);
         pool.assign(s.begin(), s.end());
         for (int e : pool) mask[L][e] = true;
     }
@@ -170,7 +193,7 @@ static int test_num(const std::string& path, int nth) {
     {
         int hist[9] = {};
         for (int e : pool) { CpuExpertView v = cx.view(L, e); hist[v.gu_code]++; }
-        std::printf("layer %d: 40 resident experts, gu code histogram S2..S6,S8: ", L);
+        std::printf("layer %d: %zu resident experts, kernel=%s, gu code histogram S2..S6,S8: ", L, pool.size(), cx.fast_kernel() ? "fast" : "lib");
         for (int c = 2; c <= 8; ++c) if (hist[c]) std::printf("S%d=%d ", c, hist[c]);
         std::printf("\n");
     }
@@ -305,16 +328,27 @@ static int test_bench(const std::string& path, int nlayers, int nth) {
     sum_arena(cx, nlayers, nth, &bw);
     std::printf("DRAM read ceiling (plain sum loop, %d threads over the arena): %.1f GB/s\n", nth, bw);
     Rng rng(11);
-    std::printf("%-4s %-6s %-10s %-10s %-10s %-12s %-10s\n", "T", "reps", "ms/layer", "p50 ms", "min ms", "MB/layer", "GB/s(mean)");
-    for (int T : {1, 4, 8, 64}) {
-        const int reps = T <= 8 ? 60 : 12;
+    std::printf("kernel: %s\n", cx.fast_kernel() ? "fast (avx512 vbmi/vnni)" : "lib (gemm_sk_q8_1)");
+    std::printf("%-14s %-4s %-6s %-10s %-10s %-10s %-12s %-10s\n", "scenario", "T", "reps", "ms/layer", "p50 ms", "min ms", "MB/layer", "GB/s(mean)");
+    struct Sc { const char* name; int T; int reps; bool same16; };
+    const Sc scs[] = {{"spread", 1, 60, false}, {"spread", 4, 60, false}, {"spread", 8, 60, false}, {"spread", 64, 12, false},
+                      {"same16", 16, 12, true}, {"same16", 64, 8, true}, {"same16", 512, 4, true},
+                      {"spread(all512)", 512, 4, false}};
+    for (const Sc& sc : scs) {
+        const int T = sc.T, reps = sc.reps;
+        std::vector<int> pool16;
+        if (sc.same16) {
+            std::set<int> s;
+            while ((int)s.size() < 16) s.insert(rng.below(512));
+            pool16.assign(s.begin(), s.end());
+        }
         std::vector<double> ms;
         std::vector<float> out((size_t)T * 1536);
-        double bytes_total = 0, wall_total = 0;
+        double bytes_total = 0, wall_total = 0, ph[5] = {0, 0, 0, 0, 0};
         // warm-up (one job)
-        { Batch b = make_batch(rng, T, {}); cx.submit(0, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, out.data()); cx.wait(); }
+        { Batch b = make_batch(rng, T, pool16); cx.submit(0, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, out.data()); cx.wait(); }
         for (int r = 0; r < reps; ++r) {
-            Batch b = make_batch(rng, T, {});
+            Batch b = make_batch(rng, T, pool16);
             const int layer = r % nlayers;
             cx.reset_stats();
             double t0 = now_s();
@@ -325,12 +359,14 @@ static int test_bench(const std::string& path, int nlayers, int nth) {
             ms.push_back(dt * 1e3);
             bytes_total += (double)s.bytes;
             wall_total += dt;
+            for (int k = 0; k < 5; ++k) ph[k] += s.phase_s[k];
         }
         std::sort(ms.begin(), ms.end());
         double mean = 0;
         for (double v : ms) mean += v;
         mean /= ms.size();
-        std::printf("%-4d %-6d %-10.3f %-10.3f %-10.3f %-12.1f %-10.2f\n", T, reps, mean, ms[ms.size() / 2], ms[0], bytes_total / reps / 1e6, bytes_total / wall_total / 1e9);
+        std::printf("%-14s %-4d %-6d %-10.3f %-10.3f %-10.3f %-12.1f %-10.2f\n", sc.name, T, reps, mean, ms[ms.size() / 2], ms[0], bytes_total / reps / 1e6, bytes_total / wall_total / 1e9);
+        std::printf("   phases ms/layer: plan %.3f quantize %.3f gate/up+h %.3f down %.3f combine %.3f\n", ph[0] / reps * 1e3, ph[1] / reps * 1e3, ph[2] / reps * 1e3, ph[3] / reps * 1e3, ph[4] / reps * 1e3);
     }
     // T=1 with a fixed layer and the same 16 experts every time (cache-warm upper bound, 16 experts ~ 45 MB > L3)
     {
@@ -368,7 +404,7 @@ static int test_stress(const std::string& path, int nth) {
         for (int e = 0; e < 512; ++e)
             if (cx.resident(l, e) != (bool)mask[l][e]) { std::printf("FAIL resident() mismatch l=%d e=%d\n", l, e); ++bad; l = 99; break; }
     uint64_t exp_skipped = 0, exp_pairs = 0;
-    double worst_rel = 0, worst_cos = 1;
+    double worst_rel = 0, worst_cos = 1, worst_q = 0;
     cx.reset_stats();
     for (int l = 0; l < 41; ++l) {
         const int T = 1 + (l % 5);
@@ -393,6 +429,12 @@ static int test_stress(const std::string& path, int nth) {
         Err e = compare(out.data(), ref, T);
         worst_rel = std::max(worst_rel, e.max_rel);
         worst_cos = std::min(worst_cos, e.min_cos);
+        {
+            std::vector<double> refq;
+            reference(cx, l, T, b.z.data(), b.idx.data(), b.w.data(), use.data(), refq, true);
+            Err eq = compare(out.data(), refq, T);
+            worst_q = std::max(worst_q, eq.max_rel);
+        }
         // tokens with no CPU pair must be exactly zero
         for (int t = 0; t < T; ++t) {
             bool any = false;
@@ -409,6 +451,34 @@ static int test_stress(const std::string& path, int nth) {
     if (s.pairs != exp_pairs || s.skipped_unresident != exp_skipped) { std::printf("FAIL counters\n"); ++bad; }
     std::printf("over 41 layers: worst rel-L2 %.3e, worst cos %.8f\n", worst_rel, worst_cos);
     if (worst_rel > 3e-2) ++bad;
+    std::printf("same-activations reference (kernel=%s), worst rel-L2 over 41 layers: %.3e\n", cx.fast_kernel() ? "fast" : "lib", worst_q);
+    if (worst_q > 2e-3) { std::printf("FAIL kernel differs from same-activation reference\n"); ++bad; }
+    // rank-range masks
+    {
+        std::vector<std::vector<bool>> rm;
+        std::string e2;
+        std::vector<uint16_t> eor, codes;
+        if (!CpuExperts::read_rank_table(path, eor, codes, e2) || !CpuExperts::make_mask_rank_range(path, 100, 110, rm, e2)) { std::printf("FAIL rank mask: %s\n", e2.c_str()); ++bad; }
+        else {
+            int cnt = 0, wrong = 0;
+            for (int l = 0; l < (int)rm.size(); ++l)
+                for (int e = 0; e < 512; ++e) if (rm[l][e]) ++cnt;
+            for (int l = 0; l < (int)rm.size(); ++l)
+                for (int r = 0; r < 512; ++r) if (rm[l][eor[(size_t)l * 512 + r]] != (r >= 100 && r < 110)) ++wrong;
+            std::printf("make_mask_rank_range(100,110): %zu layers, %d resident (expected %zu), %d wrong\n", rm.size(), cnt, rm.size() * 10, wrong);
+            if (cnt != (int)rm.size() * 10 || wrong) ++bad;
+            std::vector<int> fr(41, 0), lr(41, 0);
+            for (int l = 0; l < 41; ++l) { fr[l] = l; lr[l] = l + 3; }
+            std::vector<std::vector<bool>> rm2;
+            if (!CpuExperts::make_mask_rank_range(path, fr, lr, rm2, e2)) ++bad;
+            else {
+                int c2 = 0;
+                for (auto& v : rm2) for (bool b : v) c2 += b;
+                std::printf("per-layer ranges [l, l+3): %d resident (expected %d)\n", c2, 41 * 3);
+                if (c2 != 41 * 3) ++bad;
+            }
+        }
+    }
     ram_line("stress end");
     std::printf("STRESS TEST: %s\n", bad ? "FAIL" : "PASS");
     return bad ? 1 : 0;
@@ -419,6 +489,21 @@ int main(int argc, char** argv) {
     const std::string path = argv[1], mode = argv[2];
     const int nl = argc > 3 ? std::atoi(argv[3]) : 10, nth = argc > 4 ? std::atoi(argv[4]) : 6;
     std::printf("isa %s, threads %d\n", strata::quant::sk::active_sk_isa(), nth);
+    if (mode == "kernels") {
+        std::string rep;
+        const bool ok = CpuExperts::selftest_kernels(rep);
+        std::printf("%sKERNEL SELFTEST: %s\n", rep.c_str(), ok ? "PASS" : "FAIL");
+        return ok ? 0 : 1;
+    }
+    if (mode == "codes") {
+        std::vector<uint16_t> eor, codes;
+        std::string e;
+        if (!CpuExperts::read_rank_table(path, eor, codes, e)) { std::printf("%s\n", e.c_str()); return 1; }
+        std::map<uint16_t, int> hist;
+        for (auto c : codes) ++hist[c];
+        for (auto& kv : hist) std::printf("gu=S%d dn=S%d: %d experts\n", kv.first >> 8, kv.first & 255, kv.second);
+        return 0;
+    }
     if (mode == "num") return test_num(path, nth);
     if (mode == "bench") return test_bench(path, std::min(nl, 41), nth);
     if (mode == "stress") return test_stress(path, nth);
