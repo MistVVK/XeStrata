@@ -1343,8 +1343,10 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
 //   gfx1201 (R9700): n_in <= 4096 with n_out >= 4096 (qkv 2560->10240 73-79% -> 83-84% of the 644 GB/s, gate 2560->6144
 //     51-68% -> 76-78%, q 2560->12288 74-80% -> 85-86%); 6144->2560 is slower there (79% -> 55-59%) and keeps two rows.
 //   sm_86 (RTX A4000): every n_out >= 2048 (+1-4% at 2-4 columns, 6144->2560 at 6 columns 70% -> 76%).
+//   sm_120 (RTX 5090, BW-6a, STRATA_Q80_ROWS1=1, opt-in): every shape the one-row kernel exists for (n_in / 32 >= 4 blocks per
+//     iteration); the gains are in the 2-6 column table of q8_gemv_bench (phaseA-tests/bw/RESULTS-BW-C.md).
 // Other cards keep two rows until measured (STRATA_NO_MMVQ_ROWS2=1 forces one row everywhere; =0 keeps two everywhere).
-int dev_class() {   // 1 = gfx12, 2 = sm_86, 0 = the rest; per device
+int dev_class() {   // 1 = gfx12, 2 = sm_86, 3 = sm_120, 0 = the rest; per device
     static int cls[16];   // 0 unknown, else class + 1
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 0;
@@ -1358,6 +1360,8 @@ int dev_class() {   // 1 = gfx12, 2 = sm_86, 0 = the rest; per device
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess && major == 8 && minor == 6)
             c = 2;
+        else if (major == 12 && minor == 0)
+            c = 3;
 #endif
         (void) cudaGetLastError();
         cls[dev] = c + 1;
@@ -1376,7 +1380,11 @@ bool q8_0_rows1(int n_in, int n_out) {
         }();
         if (env == 0) return false;
         const int c = dev_class();
-        return (c == 1 && n_in <= 4096 && n_out >= 4096) || (c == 2 && n_out >= 2048);
+        static const bool sm120_rows1 = [] {   // BW-6a: opt-in until the engine A/B is read
+            const char* v = std::getenv("STRATA_Q80_ROWS1");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return (c == 1 && n_in <= 4096 && n_out >= 4096) || (c == 2 && n_out >= 2048) || (c == 3 && sm120_rows1);
     }
 }
 
