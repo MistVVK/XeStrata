@@ -16,6 +16,7 @@
 //
 // Modes: --serve (serve/server.py's engine protocol: READY / GEN / T / DONE / STOP / PP), --tokens IDS [--n N]
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
+#include "strata/artifact/dequant.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/fused_gdn.hpp"
@@ -958,8 +959,15 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
             const float d = f16_to_f32((uint16_t) (q[0] | (q[1] << 8)));
             for (int j = 0; j < 32; ++j) h[b * 32 + j] = d * (float) (int8_t) q[2 + j];
         }
+    } else if (((t.type >= 11 && t.type <= 14) || t.type == 23) && h.size() % 256 == 0) {
+        // Q3_K..Q6_K, IQ4_XS (mixed GGUFs store ssm_alpha / ssm_beta so): 256-value super-blocks
+        static const struct { void (*f)(const uint8_t*, float*); size_t bytes; } kq[] = {
+            {strata::dequantize_q3_K, 110}, {strata::dequantize_q4_K, 144}, {strata::dequantize_q5_K, 176},
+            {strata::dequantize_q6_K, 210}, {strata::dequantize_iq4_xs, 136}};
+        const auto& k = kq[t.type == 23 ? 4 : t.type - 11];
+        for (size_t b = 0; b < h.size() / 256; ++b) k.f(src + b * k.bytes, h.data() + b * 256);
     } else {
-        std::fprintf(stderr, "strata-q36: %s is %s, expected F32, BF16, F16 or Q8_0\n", t.name.c_str(), t.type_name());
+        std::fprintf(stderr, "strata-q36: %s is %s, expected F32, BF16, F16, Q8_0, Q3_K..Q6_K or IQ4_XS\n", t.name.c_str(), t.type_name());
         std::exit(1);
     }
     float* d = nullptr;
