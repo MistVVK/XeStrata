@@ -229,15 +229,18 @@ public:
     // big, rarely-touched state (sparse-layer KV cache, IndexPool, kv_b absorbed copies): VRAM when it fits and HY4_KV_HOST != 1, otherwise pinned host memory mapped into the
     // device address space (the kernels read it over PCIe: attention only reads the 2048 selected keys of a sparse layer, the pool scoring is served by L2 after the first block)
     size_t host_big_bytes = 0;
-    template <class T> T* dalloc_big(size_t n, const char* what) {
+    // `bit` selects the class: 1 = sparse KV rows + Vt, 2 = absorbed wk_b/wv_b, 4 = IndexPool state (pooled keys, iv/ig). HY4_KV_HOST is a bit mask of the classes forced to host memory
+    // (plan_memory sets it from the card size and the context); a class that is not forced still falls back to host memory when VRAM runs out.
+    template <class T> T* dalloc_big(size_t n, const char* what, int bit) {
         const size_t bytes = n * sizeof(T);
         const char* e = getenv("HY4_KV_HOST");
-        const int mode = e ? atoi(e) : -1;
+        const int mode = e ? atoi(e) : 0;
+        const bool forced = (mode & bit) != 0;
         void* p = nullptr;
-        if (mode != 1) {
+        if (!forced) {
             size_t fr = 0, tot = 0;
             HCK(hipMemGetInfo(&fr, &tot));
-            if (mode == 0 || fr > bytes + ((size_t)600 << 20)) {
+            if (fr > bytes + ((size_t)300 << 20)) {
                 if (hipMalloc(&p, bytes) == hipSuccess) {
                     HCK(hipMemset(p, 0, bytes));
                     return (T*)p;
@@ -391,7 +394,7 @@ public:
                 HCK(hipMalloc((void**)&kcache[il], by));
                 HCK(hipMemset(kcache[il], 0, by));
             } else {
-                kcache[il] = (__half*)dalloc_big<uint8_t>(by, "sparse KV cache");
+                kcache[il] = (__half*)dalloc_big<uint8_t>(by, "sparse KV cache", 1);
             }
             kvbytes += by;
         }
@@ -400,8 +403,8 @@ public:
         pooled.assign(c.n_layers, nullptr);
         for (int il = 0; il < c.n_layers; ++il)
             if (!c.is_swa[il]) {
-                ivg[il] = dalloc_big<__half>((size_t)(max_ctx + 8) * 256, "IndexPool iv/ig cache");
-                pooled[il] = dalloc_big<__half>((size_t)(max_ctx / 4 + 8) * 128, "IndexPool pooled keys");
+                ivg[il] = dalloc_big<__half>((size_t)(max_ctx + 8) * 256, "IndexPool iv/ig cache", 4);
+                pooled[il] = dalloc_big<__half>((size_t)(max_ctx / 4 + 8) * 128, "IndexPool pooled keys", 4);
             }
         ik_f = dalloc<float>((size_t)Tc * 128);
         iv_f = dalloc<float>((size_t)Tc * 128);
@@ -425,8 +428,8 @@ public:
             tk += (size_t)NH * 192 * 512;
             tv += (size_t)NH * 256 * 512;
         }
-        wk_b = dalloc_big<__half>(tk, "absorbed wk_b");
-        wv_b = dalloc_big<__half>(tv, "absorbed wv_b");
+        wk_b = dalloc_big<__half>(tk, "absorbed wk_b", 2);
+        wv_b = dalloc_big<__half>(tv, "absorbed wv_b", 2);
         for (int il = 0; il < c.n_layers; ++il) {
             int NH = heads(il);
             const TInfo& t = ti(L(il) + ".self_attn.kv_b_proj.weight");

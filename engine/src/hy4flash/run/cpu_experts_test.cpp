@@ -377,8 +377,10 @@ static int test_bench(const std::string& path, int nlayers, int nth) {
     const Sc scs[] = {{"spread", 1, 60, false}, {"spread", 4, 60, false}, {"spread", 8, 60, false}, {"spread", 64, 12, false},
                       {"same16", 16, 12, true}, {"same16", 64, 8, true}, {"same16", 512, 4, true},
                       {"spread(all512)", 512, 4, false}};
+    const bool no512 = std::getenv("STRATA_BENCH_NO512") != nullptr;  // skip the T=512 scenarios (slow on the library kernel)
     for (const Sc& sc : scs) {
         const int T = sc.T, reps = sc.reps;
+        if (no512 && T >= 512) continue;
         std::vector<int> pool16;
         if (sc.same16) {
             std::set<int> s;

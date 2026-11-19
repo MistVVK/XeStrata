@@ -34,14 +34,16 @@
 //   HY4_FAST  = AVX-512 BW + VNNI + VBMI + F16C (Ice Lake / Rocket Lake / Zen 4 and later),
 //   HY4_FAST2 = AVX2 + FMA + F16C (Haswell / Zen 1-3 and later; used only when HY4_FAST is not available, e.g. -march=native on
 //               a Zen 2 PC, or -mno-avx512f to test it on an AVX-512 machine).
-// Without either, the library gemm_sk_q8_1 path is used (also selectable with STRATA_CPUEXP_KERNEL=lib, and used when an S1.5 or
-// S8 expert is resident).
-#if defined(__x86_64__) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__) && defined(__F16C__)
+// Without either, the library gemm_sk_q8_1 path is used (also selectable with STRATA_CPUEXP_KERNEL=lib at run time, and used when
+// an S1.5 or S8 expert is resident). Compile-time overrides: -DHY4_NO_FAST (library kernel only), -DHY4_FORCE_AVX2 (skip the
+// AVX-512 kernel even when the build target has AVX-512).
+#if defined(__x86_64__) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__) && defined(__F16C__) && \
+    !defined(HY4_NO_FAST) && !defined(HY4_FORCE_AVX2)
 #define HY4_FAST 1
 #else
 #define HY4_FAST 0
 #endif
-#if !HY4_FAST && defined(__x86_64__) && defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+#if !HY4_FAST && !defined(HY4_NO_FAST) && defined(__x86_64__) && defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
 #define HY4_FAST2 1
 #else
 #define HY4_FAST2 0
