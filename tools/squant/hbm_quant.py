@@ -488,66 +488,71 @@ def gptq_flip_quantize_sk_batch_gpu(
 
     if code_name == "S1.5":
         W = W_in.to(torch.float32).clone()
-        W_sb = W.reshape(B * n_sb, 4, 64)
-        abs_w = W_sb.abs()
-        mask = abs_w > (0.7 * abs_w.mean(dim=2, keepdim=True))
-        opt_s = (abs_w * mask).sum(dim=2) / mask.sum(dim=2).clamp(min=1)
-        amax_s = opt_s.amax(dim=1)
-        D_f16 = amax_s.to(torch.float16)
-        D_eff = D_f16.to(torch.float32)
-        denom = torch.where(amax_s > 0.0, amax_s, torch.ones_like(amax_s)).unsqueeze(-1)
-        u = torch.clamp(torch.round(opt_s / denom * 255.0), 0, 255).to(torch.uint8)
-        u = torch.where((opt_s > 0.0) & (u == 0), torch.ones_like(u), u)
-        eff = D_eff.unsqueeze(-1) * (u.to(torch.float32) / 255.0)
-        S_col = eff.reshape(B, M, n_sb_row, 4, 1).expand(B, M, n_sb_row, 4, 64).reshape(B, M, K)
-        inv_S = torch.where(S_col > 0.0, 1.0 / S_col, torch.zeros_like(S_col))
-
         Q_int = torch.zeros((B, M, K), device=dev, dtype=torch.int16)
-        for i1 in range(0, K, block_size):
-            i2 = min(i1 + block_size, K)
-            cnt = i2 - i1
-            W1 = W[:, :, i1:i2].clone()
-            Err1 = torch.zeros_like(W1)
-            Hinv1 = Hinv_U[:, i1:i2, i1:i2]
-            for j in range(cnt):
-                col = i1 + j
-                wj = W1[:, :, j]
-                qi = torch.clamp(torch.round(wj * inv_S[:, :, col]), -1.0, 1.0)
-                qj = qi * S_col[:, :, col]
-                Q_int[:, :, col] = qi.to(torch.int16)
-                err = (wj - qj) / Hinv1[:, j, j].unsqueeze(1)
-                Err1[:, :, j] = err
-                if j + 1 < cnt:
-                    W1[:, :, j + 1 :] -= err.unsqueeze(2) * Hinv1[:, j, j + 1 :].unsqueeze(1)
+        D_list, u_list = [], []
+        for i1 in range(0, K, QK_S):
+            i2 = i1 + QK_S
+            W_blk = W[:, :, i1:i2].clone()  # [B, M, 256]
+            wb = W_blk.reshape(B * M, 4, 64)
+            abs_w = wb.abs()
+            mask = abs_w > (0.7 * abs_w.mean(dim=2, keepdim=True))
+            opt_s = (abs_w * mask).sum(dim=2) / mask.sum(dim=2).clamp(min=1)
+            amax_s = opt_s.amax(dim=1)
+            D_f16 = amax_s.to(torch.float16)
+            D_eff = D_f16.to(torch.float32)
+            denom = torch.where(amax_s > 0.0, amax_s, torch.ones_like(amax_s)).unsqueeze(-1)
+            u = torch.clamp(torch.round(opt_s / denom * 255.0), 0, 255).to(torch.uint8)
+            u = torch.where((opt_s > 0.0) & (u == 0), torch.ones_like(u), u)
+            eff = (D_eff.unsqueeze(-1) * (u.to(torch.float32) / 255.0)).view(B, M, 4)
+            D_list.append(D_f16.view(B, M))
+            u_list.append(u.view(B, M, 4))
+            inv_eff = torch.where(eff > 0.0, 1.0 / eff, torch.zeros_like(eff))
+
+            Err = torch.zeros_like(W_blk)
+            Hinv_blk = Hinv_U[:, i1:i2, i1:i2]
+            for j in range(QK_S):
+                g = j // 64
+                wj = W_blk[:, :, j]
+                qi = torch.clamp(torch.round(wj * inv_eff[:, :, g]), -1.0, 1.0)
+                qj = qi * eff[:, :, g]
+                Q_int[:, :, i1 + j] = qi.to(torch.int16)
+                err = (wj - qj) / Hinv_blk[:, j, j].unsqueeze(1)
+                Err[:, :, j] = err
+                if j + 1 < QK_S:
+                    W_blk[:, :, j + 1 :] -= err.unsqueeze(2) * Hinv_blk[:, j, j + 1 :].unsqueeze(1)
             if i2 < K:
-                W[:, :, i2:] -= torch.bmm(Err1, Hinv_U[:, i1:i2, i2:])
-        return _pack_sk_gpu_batch(D_f16.view(B, n_sb), u.view(B, n_sb, 4), Q_int, "S1.5")
+                W[:, :, i2:] -= torch.bmm(Err, Hinv_U[:, i1:i2, i2:])
+        D_all = torch.stack(D_list, dim=2).reshape(B, n_sb)
+        u_all = torch.stack(u_list, dim=2).reshape(B, n_sb, 4)
+        return _pack_sk_gpu_batch(D_all, u_all, Q_int, "S1.5")
 
     if code_name == "S1.25":
         W = W_in.to(torch.float32).clone()
         cb = torch.from_numpy(S125_CODEBOOK.astype(np.float32)).to(dev)  # [32, 4]
         cb_n2 = (cb * cb).sum(dim=1)  # [32]
-        W_sb = W.reshape(B * n_sb, 4, 64)
-        rms = torch.sqrt((W_sb * W_sb).mean(dim=2) + 1e-12)  # [B*n_sb, 4]
-        amax_s = rms.amax(dim=1)
-        D_f16 = amax_s.to(torch.float16)
-        D_eff = D_f16.to(torch.float32)
-        denom = torch.where(amax_s > 0.0, amax_s, torch.ones_like(amax_s)).unsqueeze(-1)
-        u = torch.clamp(torch.round(rms / denom * 255.0), 0, 255).to(torch.uint8)
-        u = torch.where((rms > 0.0) & (u == 0), torch.ones_like(u), u)
-        eff = D_eff.unsqueeze(-1) * (u.to(torch.float32) / 255.0)  # [B*n_sb, 4]
-        eff_sub = eff.reshape(B, M, n_sb_row, 4)
-
         idx_all = torch.zeros((B, M, K // 4), device=dev, dtype=torch.int16)
+        D_list, u_list, fq_list = [], [], []
         for i1 in range(0, K, QK_S):
             i2 = i1 + QK_S
-            sb_i = i1 // QK_S
             W_blk = W[:, :, i1:i2].clone()  # [B, M, 256]
+            W_blk_init = W_blk.clone()
+            wb = W_blk.reshape(B * M, 4, 64)
+            rms = torch.sqrt((wb * wb).mean(dim=2) + 1e-12)
+            amax_s = rms.amax(dim=1)
+            D_f16 = amax_s.to(torch.float16)
+            D_eff = D_f16.to(torch.float32)
+            denom = torch.where(amax_s > 0.0, amax_s, torch.ones_like(amax_s)).unsqueeze(-1)
+            u = torch.clamp(torch.round(rms / denom * 255.0), 0, 255).to(torch.uint8)
+            u = torch.where((rms > 0.0) & (u == 0), torch.ones_like(u), u)
+            eff = (D_eff.unsqueeze(-1) * (u.to(torch.float32) / 255.0)).view(B, M, 4)  # [B, M, 4]
+            D_list.append(D_f16.view(B, M))
+            u_list.append(u.view(B, M, 4))
+
             Err = torch.zeros_like(W_blk)
             Hinv_blk = Hinv_U[:, i1:i2, i1:i2]
             for g4 in range(0, QK_S, 4):
                 sub = g4 // 64
-                s_g = eff_sub[:, :, sb_i, sub : sub + 1].clamp(min=1e-12)  # [B, M, 1]
+                s_g = eff[:, :, sub : sub + 1].clamp(min=1e-12)  # [B, M, 1]
                 w4 = W_blk[:, :, g4 : g4 + 4]  # [B, M, 4]
                 wn = w4 / s_g
                 dots = torch.matmul(wn, cb.T)  # [B, M, 32]
@@ -563,15 +568,21 @@ def gptq_flip_quantize_sk_batch_gpu(
             if i2 < K:
                 W[:, :, i2:] -= torch.bmm(Err, Hinv_U[:, i1:i2, i2:])
 
-        # Compute optimal 4-bit fine residual multipliers per sub-group on GPU
-        idx_sb = idx_all.reshape(B, M, n_sb_row, 64).reshape(B * n_sb, 64).to(torch.long)
-        recon_unit = cb[idx_sb].reshape(B * n_sb, 4, 64)
-        W_orig_sb = W_in.to(torch.float32).reshape(B * n_sb, 4, 64)
-        num = (W_orig_sb * recon_unit).sum(dim=2)
-        den = (recon_unit * recon_unit).sum(dim=2) * torch.where(eff > 0.0, eff, torch.ones_like(eff)) + 1e-12
-        fine_f = torch.where(eff > 0.0, num / den, torch.ones_like(num))
-        fine_q = torch.clamp(torch.round((fine_f - 0.5) * 15.0), 0, 15).to(torch.uint8).view(B, n_sb, 4)
-        return _pack_sk_gpu_batch(D_f16.view(B, n_sb), u.view(B, n_sb, 4), idx_sb.view(B, n_sb, 64), "S1.25", fine_q=fine_q)
+            # Optimal fine multiplier matched to the GPTQ-compensated super-block target (q4 already targets 1.0x eff!)
+            # Compute fine_q=8 -> 0.5 + 8/15 = 1.033 vs exact least-squares against W_blk_init (after prior GPTQ error)
+            idx_sub = idx_all[:, :, i1 // 4 : i2 // 4].to(torch.long)  # [B, M, 64]
+            recon_u = cb[idx_sub].reshape(B, M, 4, 64)
+            w_sub = W_blk_init.reshape(B, M, 4, 64)
+            num = (w_sub * recon_u).sum(dim=-1)
+            den = (recon_u * recon_u).sum(dim=-1) * torch.where(eff > 0.0, eff, torch.ones_like(eff)) + 1e-12
+            fine_f = torch.where(eff > 0.0, num / den, torch.ones_like(num))
+            fq_list.append(torch.clamp(torch.round((fine_f - 0.5) * 15.0), 0, 15).to(torch.uint8))
+
+        D_all = torch.stack(D_list, dim=2).reshape(B, n_sb)
+        u_all = torch.stack(u_list, dim=2).reshape(B, n_sb, 4)
+        fq_all = torch.stack(fq_list, dim=2).reshape(B, n_sb, 4)
+        idx_sb = idx_all.reshape(B, M, n_sb_row, 64).reshape(B, n_sb, 64)
+        return _pack_sk_gpu_batch(D_all, u_all, idx_sb, "S1.25", fine_q=fq_all)
 
     # --- S2_K..S8_K: Batched Hessian-weighted clipping + Block-LDL + MACaQ 64-flip + Pure-GPU Bit-Packing ---
     is_s8 = code_name == "S8_K"
