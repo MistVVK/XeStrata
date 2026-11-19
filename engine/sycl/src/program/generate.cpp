@@ -28,6 +28,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/runtime_files.hpp"
+#include "strata/core/verify_env.hpp"
 #include "strata/uc_probe.hpp"
 #include "strata/pipeline_auto.hpp"
 #include "strata/sycl_doorbell.hpp"
@@ -1807,6 +1808,16 @@ int main(int argc, char **argv) try {
             std::printf("%s\n", strata::core::kGeometryName);
             return 0;
         }
+    }
+    // #6250, #4698: STRATA_VERIFY_NO_HOST=1 without STRATA_VERIFY_DEVICE_PLAN leaves a layer with an expert outside VRAM unplanned (strata-sycl.sh sets both;
+    // an engine started without it, as the packaged component is, with only NO_HOST=1 ended "the GPU stopped waiting for the plan (flag A)" or wrote "!!!").
+    if (strata::no_host_wants_device_plan(std::getenv("STRATA_VERIFY_NO_HOST"), std::getenv("STRATA_VERIFY_DEVICE_PLAN"))) {
+#if defined(_WIN32)
+        _putenv_s("STRATA_VERIFY_DEVICE_PLAN", "1");
+#else
+        setenv("STRATA_VERIFY_DEVICE_PLAN", "1", 0);
+#endif
+        std::fprintf(stderr, "strata: STRATA_VERIFY_NO_HOST=1 needs the device-built plan for experts outside VRAM: STRATA_VERIFY_DEVICE_PLAN=1 is set too (STRATA_VERIFY_DEVICE_PLAN=0 keeps it off)\n");
     }
 #if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
     // AMD, a file-backed arena (STRATA_ARENA_MMAP): ROCclr copies a pageable source of 1 MiB or more by locking its
