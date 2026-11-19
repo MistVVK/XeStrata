@@ -1013,7 +1013,13 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
                                                  + " ".join(argv[:2]))
     say("  > " + " ".join(str(c) for c in cmd))
     env = dict(os.environ if env is None else env)
-    env.setdefault("STRATA_EXIT_WITH_PARENT", "1")     # tools/mtp_fetch.py ends when setup ends (#3257: a cancel left it writing)
+    inherited = (env.get("STRATA_EXIT_WITH_PARENT") or "").strip()
+    if inherited.isdigit() and inherited != "1":
+        pass                                                # a spawner that already named an id wins; "0" means watch nothing
+    else:                                                   # unset, or "1" inherited from the desktop app's own hand-off:
+        env["STRATA_EXIT_WITH_PARENT"] = str(os.getpid())   # our id, not "1".  .venv\Scripts\python.exe on Windows is a launcher
+        # that spawns the interpreter as its child, so a tool watching its parent id would watch a stub that lives exactly as
+        # long as the download does, and a cancel would stop nothing (tools/mtp_fetch.py exit_with_parent, #3257).
     r = subprocess.run([str(c) for c in cmd], cwd=cwd, env=env,
                        stdout=subprocess.PIPE if quiet else None, stderr=subprocess.STDOUT if quiet else None,
                        text=True, errors="replace")

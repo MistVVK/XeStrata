@@ -32,6 +32,31 @@ class ExitWithParent(unittest.TestCase):
         self.assertFalse(E.exit_with_parent(env={}))
         self.assertFalse(E.exit_with_parent(env={"STRATA_EXIT_WITH_PARENT": "0"}))
 
+    def test_a_number_names_the_process_to_watch(self):
+        """#6190: setup.py passes its own id. A venv's python.exe on Windows is a launcher, so the packer's direct parent is a
+        stub that lives as long as the packer does; the packer has to follow the id it was told, not its parent."""
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        child_code = ("import sys,time; sys.path.insert(0, %r); import exit_with_parent as E; E.exit_with_parent(poll=0.2); "
+                      "print('up', flush=True); time.sleep(60)" % str(HERE))
+        child = subprocess.Popen([sys.executable, "-c", child_code], stdout=subprocess.PIPE, text=True,
+                                 env=dict(os.environ, STRATA_EXIT_WITH_PARENT=str(sleeper.pid)))
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "up")
+            time.sleep(1.0)
+            self.assertIsNone(child.poll(), "the packer ended while the process it watches was still there")
+            sleeper.kill()
+            sleeper.wait(30)
+            end = time.time() + 15
+            while time.time() < end and child.poll() is None:
+                time.sleep(0.2)
+            self.assertIsNotNone(child.poll(), "the packer kept running after the process it was told to watch ended")
+        finally:
+            for p in (child, sleeper):
+                if p.poll() is None:
+                    p.kill()
+                p.wait(30)
+            child.stdout.close()
+
     def test_a_packer_ends_with_the_process_that_started_it(self):
         """setup.py killed: iq_pack, its child, must not go on writing (a grandchild whose parent is gone)."""
         child_code = ("import sys,time; sys.path.insert(0, %r); import exit_with_parent as E; E.exit_with_parent(poll=0.2); "
