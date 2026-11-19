@@ -1,8 +1,7 @@
 // hy4_indexer.hip.h - compressed IndexPool of the 12 sparse layers (kpool 4, 16 index heads x 128 dims, top-(topk/4 - 1) pools + the current group)
 // Per layer state: ivg cache half [ctx][256] (iv | ig of every token), pooled keys half [ctx/4][128] (normed, rope at the group's first position).
 #pragma once
-#include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
+#include "hy4_gpu.h"
 
 #include <cstdint>
 

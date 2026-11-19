@@ -70,7 +70,7 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".";
-    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false;
+    bool load_only = false, dump = false, save_logits = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false;
     int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048;
     bool serve = false, session_reuse = false;
     int gpu = -1;
@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
         else if (a == "--load-only") load_only = true;
         else if (a == "--dump") dump = true;
         else if (a == "--all-logits") all_logits = true;
+        else if (a == "--save-logits") save_logits = true;
         else if (a == "--no-engram") no_engram = true;
         else if (a == "--index-topk") index_topk = atoi(nxt().c_str());
         else if (a == "--no-index") no_index = true;
@@ -164,7 +165,7 @@ int main(int argc, char** argv) {
     HCK(hipGetDeviceProperties(&p, 0));
     size_t fr = 0, tot = 0;
     HCK(hipMemGetInfo(&fr, &tot));
-    fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, p.gcnArchName, fr / 1073741824.0, tot / 1073741824.0);
+    fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0);
     GpuModel g;
     double t_load0 = now_s();
     if (!load_gpu_model(g, model, true)) return 1;
@@ -236,7 +237,7 @@ int main(int argc, char** argv) {
             hl.resize((size_t)n * V);
             HCK(hipMemcpy(hl.data(), r.logits, hl.size() * 4, hipMemcpyDeviceToHost));
             for (int i = 0; i < n; ++i) top5_line(&hl[(size_t)i * V], V, done - n + i, top_out);
-            if (dump) save_npy_f32(out_dir + "/logits.npy", hl.data(), {n, V});
+            if (dump || save_logits) save_npy_f32(out_dir + "/logits.npy", hl.data(), {n, V});
         } else {
             HCK(hipStreamSynchronize(r.st)); r.pflush();
         }
@@ -248,6 +249,7 @@ int main(int argc, char** argv) {
     printf("%s", top_out.c_str());
     fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram cpu %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_cpu);
     // greedy decode
+    const double cpu_wait0 = r.t_cpu_wait;
     if (gen > 0) {
         int next = 0;
         {
@@ -283,6 +285,7 @@ int main(int argc, char** argv) {
         r.pacc_report("decode", (int)times.size());
         if (!enq.empty()) { std::sort(enq.begin(), enq.end()); fprintf(stderr, "[decode] median host enqueue time per step %.1f ms (step %.1f ms)\n", enq[enq.size() / 2] * 1000, times.empty() ? 0.0 : times[times.size() / 2] * 1000); }
         std::sort(times.begin(), times.end());
+        if (r.hyb) fprintf(stderr, "[hybrid] decode: host waited %.2f ms per step for the CPU experts after queueing the GPU work\n", (r.t_cpu_wait - cpu_wait0) * 1000 / std::max<size_t>(times.size(), 1));
         fprintf(stderr, "[decode] %zu tokens in %.2f s = %.2f tok/s (median step %.1f ms)\n", times.size(), td, times.size() / td, times.empty() ? 0.0 : times[times.size() / 2] * 1000);
         std::ofstream f(out_dir + "/gen_ids.txt");
         f << gen_ids << "\n";

@@ -10,12 +10,10 @@
 namespace hy4 {
 namespace skd {
 
-typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
-
 __device__ __forceinline__ uint32_t ld32u(const uint8_t* p) { return (uint32_t)ld16(p) | ((uint32_t)ld16(p + 2) << 16); }
 
 __device__ __forceinline__ float dot2f(uint32_t a, uint32_t b, float c) {
-    return __builtin_amdgcn_fdot2(__builtin_bit_cast(hv2, a), __builtin_bit_cast(hv2, b), c, false);
+    return h2_dot_f32(a, b, c);
 }
 
 // integer q of the 8 weights 8u..8u+7 of a super-block payload (S8: byte ^ 0x80 = q + 128)
@@ -75,23 +73,23 @@ __device__ __forceinline__ void decode_w8(const uint8_t* pl, int u, uint32_t (&w
             const int i = 8 * u + k;
             q[k] = (uint32_t)(s15_trit(pl[i / 5], i % 5) + 1);  // 0..2, magic 1025 below
         }
-        const hv2 mag = hv2{(_Float16)1025.0f, (_Float16)1025.0f};
+        const uint32_t mag = h2_splat(1025.0f);
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const uint32_t pat = 0x64006400u | q[2 * i] | (q[2 * i + 1] << 16);
-            wp[i] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, pat) - mag);
+            wp[i] = h2_sub(pat, mag);
         }
         return;
     }
     decode_q8<FMT>(pl, u, q);
-    const hv2 mag = FMT == FMT_S8 ? hv2{(_Float16)1152.0f, (_Float16)1152.0f} : hv2{(_Float16)1024.0f, (_Float16)1024.0f};
-    const hv2 hh = hv2{(_Float16)sk_half<FMT>(), (_Float16)sk_half<FMT>()};
+    const uint32_t mag = h2_splat(FMT == FMT_S8 ? 1152.0f : 1024.0f);
+    const uint32_t hh = h2_splat(sk_half<FMT>());
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const uint32_t pat = 0x64006400u | q[2 * i] | (q[2 * i + 1] << 16);
-        hv2 w = __builtin_bit_cast(hv2, pat) - mag;
-        if (FMT != FMT_S8) w = w - hh;
-        wp[i] = __builtin_bit_cast(uint32_t, w);
+        uint32_t w = h2_sub(pat, mag);
+        if (FMT != FMT_S8) w = h2_sub(w, hh);
+        wp[i] = w;
     }
 }
 

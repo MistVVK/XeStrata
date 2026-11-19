@@ -1,8 +1,7 @@
 // hy4_graph.hip.h - the 42-layer hy_v4_flash forward on gfx1151 (HIP): chunked prefill + decode, KV fp16, absorbed MLA, LatentMoE.
 // Built from: skgemm (linear_h / linear_f32), skmoe (moe_experts), mla_attn (mla_*), hy4_kernels (norms, iHC, router, engram), hy4_engram (hash + page reads).
 #pragma once
-#include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
+#include "hy4_gpu.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -12,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "hy4_cpu_experts.h"
 #include "hy4_engram.h"
 #include "hy4_gpu_model.hip.h"
 #include "hy4_indexer.hip.h"
@@ -112,6 +112,89 @@ public:
     int32_t *keys = nullptr, *nkeys = nullptr;
     size_t ldS = 0;
     bool last_use_list = false;
+
+    // hybrid placement: tier-2 experts live in host RAM and are computed by hy4_cpu_experts while the GPU runs the shared experts and the VRAM-resident experts
+    CpuExperts cpu;
+    bool hyb = false;
+    float *h_z = nullptr, *h_w = nullptr, *h_zcpu = nullptr, *d_zcpu = nullptr;
+    int32_t* h_idx = nullptr;
+    hipEvent_t ev_hyb = nullptr;
+    // prefill streaming of the CPU-tier experts: for chunks of >= pf_min_T tokens the experts of a layer are DMA'd from the host arena (registered/pinned in place) into a device
+    // scratch buffer while the attention of that layer runs, and the grouped GEMM of the GPU runs on them (the CPU would need ~100 ms per layer and 512 tokens)
+    struct PfRun { const uint8_t* host; size_t dev_off, bytes; };
+    std::vector<std::vector<PfRun>> pf_runs;  // per MoE layer
+    uint8_t* d_scratch = nullptr;
+    ExpertDev* d_experts_pf = nullptr;  // like d_experts, CPU-tier experts re-based onto d_scratch with pad = 0
+    hipStream_t st2 = nullptr;
+    hipEvent_t ev_copy_done = nullptr, ev_moe_done = nullptr;
+    bool pf_stream = false, ev_moe_done_set = false;
+    int pf_min_T = 320;
+    bool pf_active(int T) const { return pf_stream && T >= pf_min_T; }
+    void pf_init() {
+        auto al = [](size_t x) { return (x + 4095) & ~(size_t)4095; };
+        pf_runs.assign(41, {});
+        std::vector<std::vector<uint64_t>> exp_off(41, std::vector<uint64_t>(512, 0));
+        size_t maxb = 0;
+        const uint8_t *lo = nullptr, *hi = nullptr;
+        for (int l = 0; l < 41; ++l) {
+            std::vector<std::pair<const uint8_t*, int>> v;
+            for (int e = 0; e < 512; ++e) {
+                CpuExpertView vw = cpu.view(l, e);
+                if (vw.body) v.push_back({vw.body, e});
+            }
+            std::sort(v.begin(), v.end());
+            size_t off = 0;
+            for (auto& pe : v) {
+                CpuExpertView vw = cpu.view(l, pe.second);
+                const size_t sz = al(vw.body_bytes);
+                if (!pf_runs[l].empty() && pf_runs[l].back().host + pf_runs[l].back().bytes == pe.first) pf_runs[l].back().bytes += sz;
+                else pf_runs[l].push_back({pe.first, off, sz});
+                exp_off[l][pe.second] = off;
+                off += sz;
+                if (!lo || pe.first < lo) lo = pe.first;
+                if (!hi || pe.first + sz > hi) hi = pe.first + sz;
+            }
+            maxb = std::max(maxb, off);
+        }
+        if (!maxb) return;
+        double t0 = now_s();
+        if (hipHostRegister((void*)lo, (size_t)(hi - lo), 0) != hipSuccess) {
+            fprintf(stderr, "[hybrid] prefill streaming disabled: cannot pin the CPU expert arena (%.1f GB)\n", (double)(hi - lo) / 1e9);
+            (void)hipGetLastError();
+            return;
+        }
+        size_t fr = 0, tot = 0;
+        HCK(hipMemGetInfo(&fr, &tot));
+        if (fr < maxb + ((size_t)256 << 20)) {
+            fprintf(stderr, "[hybrid] prefill streaming disabled: scratch %.2f GB does not fit (free %.2f GB)\n", maxb / 1e9, fr / 1e9);
+            return;
+        }
+        d_scratch = dalloc<uint8_t>(maxb);
+        std::vector<ExpertDev> hp(41 * 512);
+        for (int i = 0; i < 41 * 512; ++i) {
+            const ExpertRef& e = g.experts[i];
+            hp[i].body_off = e.tier == 2 ? (uint64_t)(uintptr_t)(d_scratch + exp_off[i / 512][i % 512]) - (uint64_t)(uintptr_t)g.d_sec4 : e.body_off;
+            hp[i].dn_off = e.dn_off;
+            hp[i].gu_code = e.gu_code;
+            hp[i].dn_code = e.dn_code;
+            hp[i].pad = 0;
+        }
+        d_experts_pf = dalloc<ExpertDev>(41 * 512);
+        HCK(hipMemcpy(d_experts_pf, hp.data(), hp.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+        HCK(hipStreamCreate(&st2));
+        HCK(hipEventCreateWithFlags(&ev_copy_done, hipEventDisableTiming));
+        HCK(hipEventCreateWithFlags(&ev_moe_done, hipEventDisableTiming));
+        if (getenv("HY4_PF_MIN_T")) pf_min_T = atoi(getenv("HY4_PF_MIN_T"));
+        pf_stream = true;
+        fprintf(stderr, "[hybrid] prefill streaming on: scratch %.2f GB, arena pinned in %.1f s, used for chunks >= %d tokens\n", maxb / 1e9, now_s() - t0, pf_min_T);
+    }
+    // queue the DMA of the CPU-tier experts of MoE layer ml (= model layer - 1) into the scratch buffer; it may only start when the previous layer's grouped GEMM is done
+    void pf_issue_copy(int ml) {
+        if (ev_moe_done_set) HCK(hipStreamWaitEvent(st2, ev_moe_done, 0));
+        for (const PfRun& r : pf_runs[ml]) HCK(hipMemcpyAsync(d_scratch + r.dev_off, r.host, r.bytes, hipMemcpyHostToDevice, st2));
+        HCK(hipEventRecord(ev_copy_done, st2));
+    }
+    double t_cpu_wait = 0;  // host time spent waiting for the CPU experts after the GPU work was queued (layer sum)
 
     Runner(GpuModel& gm, int max_ctx_, int max_chunk) : g(gm), c(gm.man.c), max_ctx(max_ctx_), Tc(max_chunk) {}
 
@@ -221,10 +304,24 @@ public:
                 h[i].dn_off = e.dn_off;
                 h[i].gu_code = e.gu_code;
                 h[i].dn_code = e.dn_code;
-                h[i].pad = 0;
+                h[i].pad = e.tier == 2 ? 1 : 0;  // CPU-resident experts are skipped by the GPU routing
             }
             d_experts = dalloc<ExpertDev>(41 * 512);
             HCK(hipMemcpy(d_experts, h.data(), h.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+        }
+        if (!g.cpu_mask.empty()) {
+            const size_t nz = (size_t)Tc * 1536;
+            HCK(hipHostMalloc((void**)&h_z, nz * 4, hipHostMallocDefault));
+            HCK(hipHostMalloc((void**)&h_zcpu, nz * 4, hipHostMallocDefault));
+            HCK(hipHostMalloc((void**)&h_w, (size_t)Tc * 16 * 4, hipHostMallocDefault));
+            HCK(hipHostMalloc((void**)&h_idx, (size_t)Tc * 16 * 4, hipHostMallocDefault));
+            d_zcpu = dalloc<float>(nz);
+            HCK(hipEventCreateWithFlags(&ev_hyb, hipEventDisableTiming));
+            int nth = getenv("HY4_CPU_THREADS") ? atoi(getenv("HY4_CPU_THREADS")) : std::max(1, (int)std::thread::hardware_concurrency() / 2);
+            if (!cpu.init(g.path, nth, &g.cpu_mask, err)) return false;
+            skd::moe_has_cpu() = 1;
+            hyb = true;
+            fprintf(stderr, "[hybrid] %llu experts (%.2f GB) in host RAM computed by %d CPU threads\n", (unsigned long long)cpu.resident_count(), cpu.arena_bytes() / 1e9, cpu.n_threads());
         }
         // kv caches
         ring = ((512 + Tc + 15) / 16) * 16;
@@ -319,6 +416,7 @@ public:
         er_h = dalloc<__half>((size_t)Tc * 1536);
         kv_f = dalloc<float>((size_t)5 * Tc * HID);
         ep_alloc();
+        if (hyb && (!getenv("HY4_PF_STREAM") || atoi(getenv("HY4_PF_STREAM")) != 0)) pf_init();  // last: the scratch takes what the other buffers left
         size_t fr = 0, tot = 0;
         HCK(hipMemGetInfo(&fr, &tot));
         fprintf(stderr, "[runner] kv cache %.2f GB (ctx %d, chunk %d), device free %.1f GiB\n", kvbytes / 1e9, max_ctx, Tc, fr / 1073741824.0);
@@ -515,6 +613,49 @@ public:
         { PS _q(this, "o_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F1, (const float*)nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), x, post, c.rms_eps); }
     }
 
+    // MoE after the router and the latent down projection (z_f = [T][1536] fp32, moe_idx / moe_w on the device) for a layer whose experts are split between the GPU and the CPU.
+    // Order: copy z / idx / w to the host, queue everything the GPU can do without the CPU experts (VRAM experts, shared experts), then run the CPU experts while the GPU works,
+    // add their partial sum into zout_f and finish (up projection, combine).
+    void moe_hybrid_tail(int il, int T, const std::string& pm) {
+        const size_t nz = (size_t)T * 1536;
+        if (pf_active(T)) {
+            // large chunk: every expert (the CPU tier arrives through the scratch buffer) runs on the GPU
+            HCK(hipStreamWaitEvent(st, ev_copy_done, 0));
+            { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
+            { PS _q(this, "moe_experts(pf)"); moe_experts(st, g.d_sec4, d_experts_pf + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws); }
+            HCK(hipEventRecord(ev_moe_done, st));
+            ev_moe_done_set = true;
+            { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
+            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
+            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);
+            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
+            { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz); }
+            lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);
+            { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
+            return;
+        }
+        HCK(hipMemcpyAsync(h_z, z_f, nz * 4, hipMemcpyDeviceToHost, st));
+        HCK(hipMemcpyAsync(h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+        HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+        HCK(hipEventRecord(ev_hyb, st));
+        { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
+        { PS _q(this, "moe_experts(gpu part)"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws); }
+        lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
+        lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
+        { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz); }
+        lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
+        double t0 = now_s();
+        HCK(hipEventSynchronize(ev_hyb));
+        cpu.submit(il - 1, T, h_z, h_idx, h_w, nullptr, h_zcpu);
+        cpu.wait();
+        t_cpu_wait += now_s() - t0;
+        HCK(hipMemcpyAsync(d_zcpu, h_zcpu, nz * 4, hipMemcpyHostToDevice, st));
+        hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
+        { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
+        lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
+        { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
+    }
+
     void mlp_layer(int il, int T) {
         const std::string pm = L(il) + ".mlp";
         const float* hfn = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_fn");
@@ -535,6 +676,7 @@ public:
             { PS _q(this, "router_topk"); hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 512, 16, c.routed_scale); }
             lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
             size_t nz = (size_t)T * 1536;
+            if (hyb) { moe_hybrid_tail(il, T, pm); } else {
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
             { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws); }
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
@@ -544,6 +686,7 @@ public:
             { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz); }
             lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
             { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
+            }
         }
     }
 
@@ -566,6 +709,7 @@ public:
                 maybe_dump("x_L" + std::to_string(il) + "_engram", T, 4 * HID, x, 4);
             }
             if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); p_eng += tb - ta; ta = tb; }
+            if (il >= 1 && pf_active(T)) pf_issue_copy(il - 1);
             attention_layer(il, p0, T);
             maybe_dump("x_L" + std::to_string(il) + "_attn", T, 4 * HID, x, 4);
             if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); (c.is_swa[il] ? p_attn_swa : p_attn_sp) += tb - ta; ta = tb; }

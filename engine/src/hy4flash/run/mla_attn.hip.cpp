@@ -1,7 +1,7 @@
 // mla_attn.hip.cpp - Hy4-Flash MLA attention kernels, gfx1151 (see mla_attn.hip.h for the math and the API)
 #include "mla_attn.hip.h"
 
-#include <hip/hip_runtime.h>
+#include "hy4_gpu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -191,6 +191,7 @@ __global__ void __launch_bounds__(256) k_attend_simple(const __half* __restrict_
     *reinterpret_cast<__half2*>(o + 2 * tid) = __floats2half2_rn(acc0 * il, acc1 * il);
 }
 
+#if HY4_MMA && !HY4_CUDA
 // ---- 3b. WMMA flash attention ------------------------------------------------------------------------------------------------------------------------
 // Block = 4 waves, handles ONE query token and ONE tile of 16 heads (the 16 rows of the WMMA tile share the key set), keys [tile range] of a split.
 // Per 64-key tile: wave w scores keys 16w..16w+15 (S = Q K^T, 36 WMMA over the 576 dims, B fragments read straight from the row-major cache), the row max / row sums are
@@ -210,11 +211,16 @@ __device__ __forceinline__ hv16 pack_hv16(uint2 a, uint2 b, uint2 c, uint2 d) {
     return __builtin_bit_cast(hv16, v);
 }
 
+__device__ __forceinline__ fv8 fv8_zero() { return fv8{0, 0, 0, 0, 0, 0, 0, 0}; }
+__device__ __forceinline__ int acc_m(int r, int lane) { return 2 * r + (lane >> 4); }
+__device__ __forceinline__ int acc_n(int r, int lane) { return lane & 15; }
+#endif  // HY4_MMA && !HY4_CUDA
 constexpr int FBK = 64;   // keys per tile
 constexpr int QP = 584;   // sQ pitch (halves)
 constexpr int PP = 72;    // sP pitch (halves)
 constexpr float NEG = -1e30f;
 
+#if HY4_MMA && !HY4_CUDA
 __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ qa, const __half* __restrict__ cache, const float* __restrict__ sinks, __half* __restrict__ out,
                                                       float* __restrict__ part, MlaAttnArgs a, int S, int tps) {
     const int rt = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
@@ -377,6 +383,204 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     }
 }
 
+#elif HY4_MMA
+// NVIDIA version of the flash kernel (mma.sync m16n8k16). Same block structure and online-softmax state as the gfx11 kernel above; the 16 head rows are rows g and g+8 of
+// every lane quad (g = lane>>2), the 64 keys of a tile are 2 n8 sub-tiles per wave. The k axis of every 16-chunk is permuted identically for A and B (lane quad c owns the 4
+// consecutive k 4c..4c+3): for QK^T these are 4 consecutive latent dims, for PV 4 consecutive keys = one group of the Vt copy of the cache (one 8-byte load per fragment).
+__global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ qa, const __half* __restrict__ cache, const float* __restrict__ sinks, __half* __restrict__ out,
+                                                      float* __restrict__ part, MlaAttnArgs a, int S, int tps) {
+    const int rt = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int g = lane >> 2, c = lane & 3, c4 = c * 4;
+    const int NH = a.NH, RT = NH / 16, h0 = rt * 16;
+    __shared__ __align__(16) half_t sQ[16 * QP];
+    __shared__ __align__(16) half_t sP[16 * PP];
+    __shared__ float s_m[4][16], s_l[4][16];
+    {
+        const half_t* qsrc = reinterpret_cast<const half_t*>(qa) + ((size_t)t * NH + h0) * MLA_ROW;
+        for (int idx = tid; idx < 16 * (MLA_ROW / 8); idx += 128) {
+            int r = idx / (MLA_ROW / 8), cc = (idx % (MLA_ROW / 8)) * 8;
+            *reinterpret_cast<uint4*>(&sQ[r * QP + cc]) = *reinterpret_cast<const uint4*>(qsrc + (size_t)r * MLA_ROW + cc);
+        }
+    }
+    const int pos = a.p0 + t;
+    const int mode = a.mode;
+    int lo = 0, lo_al = 0, nk;
+    if (mode == MLA_CAUSAL) nk = pos + 1;
+    else if (mode == MLA_WINDOW) {
+        lo = max(0, pos - a.window + 1);
+        lo_al = lo & ~15;
+        nk = pos - lo_al + 1;
+    } else nk = a.nkeys[t];
+    const int ntiles = (nk + FBK - 1) / FBK;
+    const int tb = sp * tps, te = min(ntiles, tb + tps);
+    const int32_t* klist = a.keys + (size_t)t * a.kmax;
+    const half_t* rows = reinterpret_cast<const half_t*>(cache);
+    const half_t* vt = rows + (size_t)a.cache_slots * MLA_ROW;
+
+    float mrun[2], lrun[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        mrun[i] = sp == 0 ? sinks[h0 + g + 8 * i] : NEG;
+        lrun[i] = sp == 0 ? 1.0f : 0.0f;
+    }
+    float oc[16][4];  // output accumulators: 16 n8 tiles of this wave's 128 columns
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) oc[nt][e] = 0.f;
+    __syncthreads();
+
+    for (int tile = tb; tile < te; ++tile) {
+        const int i0 = tile * FBK;
+        // ---- scores of this wave's 16 keys (2 n8 sub-tiles; this lane loads the B rows of keys 8s+g)
+        const half_t* kr[2];
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+            const int ie = i0 + 16 * w + 8 * s + g;
+            int slot = 0;
+            if (ie < nk) slot = mode == MLA_CAUSAL ? (a.ring > 0 ? ie % a.ring : ie) : (mode == MLA_WINDOW ? (lo_al + ie) % a.ring : klist[ie]);
+            kr[s] = rows + (size_t)slot * MLA_ROW;
+        }
+        float sacc[2][4];
+#pragma unroll
+        for (int s = 0; s < 2; ++s)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) sacc[s][e] = 0.f;
+#pragma unroll 12
+        for (int kk = 0; kk < MLA_ROW / 16; ++kk) {
+            const uint2 alo = *reinterpret_cast<const uint2*>(&sQ[g * QP + kk * 16 + c4]);
+            const uint2 ahi = *reinterpret_cast<const uint2*>(&sQ[(g + 8) * QP + kk * 16 + c4]);
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                const uint2 b = *reinterpret_cast<const uint2*>(kr[s] + kk * 16 + c4);
+                mma_16816(sacc[s], alo.x, ahi.x, alo.y, ahi.y, b.x, b.y);
+            }
+        }
+        float sc[2][4];
+        bool vk[2][4];
+#pragma unroll
+        for (int s = 0; s < 2; ++s)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int kidx = i0 + 16 * w + 8 * s + 2 * c + (e & 1);
+                bool v = kidx < nk;
+                if (mode == MLA_WINDOW) v = v && (lo_al + kidx >= lo);
+                vk[s][e] = v;
+                sc[s][e] = v ? sacc[s][e] * a.scale : NEG;
+            }
+        float pm[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            float x = fmaxf(fmaxf(sc[0][2 * h], sc[0][2 * h + 1]), fmaxf(sc[1][2 * h], sc[1][2 * h + 1]));
+            x = fmaxf(x, __shfl_xor(x, 1));
+            x = fmaxf(x, __shfl_xor(x, 2));
+            pm[h] = x;
+        }
+        if (c == 0) {
+            s_m[w][g] = pm[0];
+            s_m[w][g + 8] = pm[1];
+        }
+        // group base (slot >> 2) of the 4 keys this lane feeds to each of the 4 PV k-steps: keys 4*(4*ks + c) .. +3 of the tile
+        int gidx[4];
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            const int e = i0 + 4 * (4 * ks + c);
+            int gg = 0;
+            if (e < nk) {
+                const int sl = mode == MLA_CAUSAL ? (a.ring > 0 ? e % a.ring : e) : (mode == MLA_WINDOW ? (lo_al + e) % a.ring : klist[e]);
+                gg = sl >> 2;
+            }
+            gidx[ks] = gg;
+        }
+        __syncthreads();
+        float corr[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int r = g + 8 * h;
+            const float tm = fmaxf(fmaxf(s_m[0][r], s_m[1][r]), fmaxf(s_m[2][r], s_m[3][r]));
+            const float nm = fmaxf(mrun[h], tm);
+            corr[h] = expf(mrun[h] - nm);
+            mrun[h] = nm;
+        }
+        float ps[2] = {0.f, 0.f};
+#pragma unroll
+        for (int s = 0; s < 2; ++s)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int h = e >> 1;
+                const float p = vk[s][e] ? expf(sc[s][e] - mrun[h]) : 0.f;
+                sP[(g + 8 * h) * PP + 16 * w + 8 * s + 2 * c + (e & 1)] = h_from_float(p);
+                ps[h] += p;
+            }
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            ps[h] += __shfl_xor(ps[h], 1);
+            ps[h] += __shfl_xor(ps[h], 2);
+        }
+        if (c == 0) {
+            s_l[w][g] = ps[0];
+            s_l[w][g + 8] = ps[1];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int r = g + 8 * h;
+            lrun[h] = lrun[h] * corr[h] + (s_l[0][r] + s_l[1][r] + s_l[2][r] + s_l[3][r]);
+        }
+#pragma unroll
+        for (int nt = 0; nt < 16; ++nt)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) oc[nt][e] *= corr[e >> 1];
+        // ---- P @ V  (this wave: columns 128w .. 128w+127 = 16 n8 tiles)
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            const uint2 plo = *reinterpret_cast<const uint2*>(&sP[g * PP + ks * 16 + c4]);
+            const uint2 phi = *reinterpret_cast<const uint2*>(&sP[(g + 8) * PP + ks * 16 + c4]);
+#pragma unroll
+            for (int nt = 0; nt < 16; ++nt) {
+                const int col = 128 * w + 8 * nt + g;
+                const uint2 b = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[ks] * MLA_KV_LORA + col) * 4);
+                mma_16816(oc[nt], plo.x, phi.x, plo.y, phi.y, b.x, b.y);
+            }
+        }
+        __syncthreads();
+    }
+    // ---- write
+    if (S == 1) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const float il = 1.0f / lrun[h];
+            __half* dst = out + ((size_t)t * NH + h0 + g + 8 * h) * MLA_KV_LORA + 128 * w + 2 * c;
+#pragma unroll
+            for (int nt = 0; nt < 16; ++nt) {
+                dst[8 * nt] = __float2half(oc[nt][2 * h] * il);
+                dst[8 * nt + 1] = __float2half(oc[nt][2 * h + 1] * il);
+            }
+        }
+    } else {
+        const size_t blk = ((size_t)t * RT + rt) * S + sp;
+        float* po = part + blk * (16 * MLA_KV_LORA + 32);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            float* dst = po + (size_t)(g + 8 * h) * MLA_KV_LORA + 128 * w + 2 * c;
+#pragma unroll
+            for (int nt = 0; nt < 16; ++nt) {
+                dst[8 * nt] = oc[nt][2 * h];
+                dst[8 * nt + 1] = oc[nt][2 * h + 1];
+            }
+        }
+        if (w == 0 && c == 0) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                po[16 * MLA_KV_LORA + (g + 8 * h) * 2] = mrun[h];
+                po[16 * MLA_KV_LORA + (g + 8 * h) * 2 + 1] = lrun[h];
+            }
+        }
+    }
+}
+#endif  // HY4_MMA
+
 // merge the split-K partials: grid (16 rows, RT, M), 256 threads (2 columns each)
 __global__ void __launch_bounds__(256) k_combine(const float* __restrict__ part, __half* __restrict__ out, int NH, int S) {
     const int r = blockIdx.x, rt = blockIdx.y, t = blockIdx.z, tid = threadIdx.x;
@@ -420,6 +624,7 @@ int choose_splits(int M, int NH, int max_keys) {
     return std::max(S, 1);
 }
 
+#if HY4_MMA
 // ---- 1b/4b. WMMA q-absorb and v-up projections (prefill / verify windows; per-head GEMMs on the matrix cores) ---------------------------------------------------
 // wk_bt: half [NH][512][192]  (wk_b transposed so that a B fragment = 16 contiguous values of the 192-dim contraction axis)
 __global__ void k_transpose_wk(const __half* __restrict__ wk_b, __half* __restrict__ wk_bt, int NH) {
@@ -432,6 +637,7 @@ __global__ void k_transpose_wk(const __half* __restrict__ wk_b, __half* __restri
     }
 }
 
+#if !HY4_CUDA
 __device__ __forceinline__ hv16 ld_f32_as_hv16(const float* p) {
     const float4 a = *reinterpret_cast<const float4*>(p), b = *(reinterpret_cast<const float4*>(p) + 1), c = *(reinterpret_cast<const float4*>(p) + 2),
                  d = *(reinterpret_cast<const float4*>(p) + 3);
@@ -442,6 +648,7 @@ __device__ __forceinline__ hv16 ld_f32_as_hv16(const float* p) {
     r[12] = (_Float16)d.x; r[13] = (_Float16)d.y; r[14] = (_Float16)d.z; r[15] = (_Float16)d.w;
     return r;
 }
+#endif
 
 // ---- 1b/4b. per-head tiled WMMA GEMMs: q absorb (MODE 0, K=192, N=512) and v up-projection (MODE 1, K=512, N=256) ------------------------------------------------------
 // C[t][n] = sum_k A[t][k] * B_h[n][k] for head h = blockIdx.z. Block tile 128 tokens x 64 outputs, 8 waves (4 x 2), wave tile 32 x 32 (2 x 2 WMMA tiles); the B chunk (64 rows x 64 k)
@@ -453,17 +660,20 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
                                                     float theta) {
     constexpr int K = MODE == 0 ? MLA_NOPE : MLA_KV_LORA;
     constexpr int N = MODE == 0 ? MLA_KV_LORA : MLA_VHEAD;
-    __shared__ __align__(16) _Float16 sB[HG_BN * HG_LD];
-    __shared__ __align__(16) _Float16 sA[HG_BM * HG_LD];
+    __shared__ __align__(16) half_t sB[HG_BN * HG_LD];
+    __shared__ __align__(16) half_t sA[HG_BM * HG_LD];
     const int h = blockIdx.z, t0 = blockIdx.y * HG_BM, n0 = blockIdx.x * HG_BN;
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
     const int wm = wave & 3, wn = wave >> 2;
-    const _Float16* B = reinterpret_cast<const _Float16*>(Bw) + ((size_t)h * N + n0) * K;
+    const half_t* B = reinterpret_cast<const half_t*>(Bw) + ((size_t)h * N + n0) * K;
     fv8 acc[2][2];
+    const int g4 = lane >> 2, c4 = (lane & 3) * 4;
+    (void)g4;
+    (void)c4;
 #pragma unroll
     for (int a = 0; a < 2; ++a)
 #pragma unroll
-        for (int j = 0; j < 2; ++j) acc[a][j] = fv8{};
+        for (int j = 0; j < 2; ++j) acc[a][j] = fv8_zero();
     for (int k0 = 0; k0 < K; k0 += HG_BK) {
         for (int idx = tid; idx < HG_BN * 8; idx += 256) {
             const int r = idx >> 3, c8 = (idx & 7) * 8;
@@ -474,18 +684,37 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
                 const int r = idx >> 4, c4 = (idx & 15) * 4;
                 const int t = min(t0 + r, M - 1);
                 const float4 v = *reinterpret_cast<const float4*>(reinterpret_cast<const float*>(A_) + ((size_t)t * NH + h) * MLA_QHEAD + k0 + c4);
-                _Float16* d = &sA[r * HG_LD + c4];
-                d[0] = (_Float16)v.x; d[1] = (_Float16)v.y; d[2] = (_Float16)v.z; d[3] = (_Float16)v.w;
+                half_t* d = &sA[r * HG_LD + c4];
+                d[0] = h_from_float(v.x); d[1] = h_from_float(v.y); d[2] = h_from_float(v.z); d[3] = h_from_float(v.w);
             }
         } else {
             for (int idx = tid; idx < HG_BM * 8; idx += 256) {
                 const int r = idx >> 3, c8 = (idx & 7) * 8;
                 const int t = min(t0 + r, M - 1);
                 *reinterpret_cast<uint4*>(&sA[r * HG_LD + c8]) =
-                    *reinterpret_cast<const uint4*>(reinterpret_cast<const _Float16*>(A_) + ((size_t)t * NH + h) * MLA_KV_LORA + k0 + c8);
+                    *reinterpret_cast<const uint4*>(reinterpret_cast<const half_t*>(A_) + ((size_t)t * NH + h) * MLA_KV_LORA + k0 + c8);
             }
         }
         __syncthreads();
+#if HY4_CUDA
+#pragma unroll
+        for (int kk = 0; kk < HG_BK / 16; ++kk) {
+            uint2 a_lo[2], a_hi[2];
+#pragma unroll
+            for (int a = 0; a < 2; ++a) {
+                a_lo[a] = *reinterpret_cast<const uint2*>(&sA[(wm * 32 + 16 * a + g4) * HG_LD + kk * 16 + c4]);
+                a_hi[a] = *reinterpret_cast<const uint2*>(&sA[(wm * 32 + 16 * a + g4 + 8) * HG_LD + kk * 16 + c4]);
+            }
+#pragma unroll
+            for (int j = 0; j < 2; ++j)
+#pragma unroll
+                for (int sn = 0; sn < 2; ++sn) {
+                    const uint2 b = *reinterpret_cast<const uint2*>(&sB[(wn * 32 + 16 * j + 8 * sn + g4) * HG_LD + kk * 16 + c4]);
+#pragma unroll
+                    for (int a = 0; a < 2; ++a) mma_16816(&acc[a][j].v[sn * 4], a_lo[a].x, a_hi[a].x, a_lo[a].y, a_hi[a].y, b.x, b.y);
+                }
+        }
+#else
 #pragma unroll
         for (int kk = 0; kk < HG_BK / 16; ++kk) {
             hv16 a0 = ld_hv16(&sA[(wm * 32 + l16) * HG_LD + kk * 16]);
@@ -497,6 +726,7 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
             acc[1][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b0, acc[1][0]);
             acc[1][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc[1][1]);
         }
+#endif
         __syncthreads();
     }
 #pragma unroll
@@ -505,9 +735,9 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
         for (int j = 0; j < 2; ++j)
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                const int t = t0 + wm * 32 + 16 * a + 2 * e + hi;
+                const int t = t0 + wm * 32 + 16 * a + acc_m(e, lane);
                 if (t >= M) continue;
-                const int n = n0 + wn * 32 + 16 * j + l16;
+                const int n = n0 + wn * 32 + 16 * j + acc_n(e, lane);
                 float v = acc[a][j][e];
                 if (MODE == 0) {
                     out[((size_t)t * NH + h) * MLA_ROW + n] = __float2half(v);
@@ -529,6 +759,7 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
         }
     }
 }
+#endif  // HY4_MMA
 // ---- 4. v up-projection + gate -----------------------------------------------------------------------------------------------------------------------
 template <int TT>
 __global__ void __launch_bounds__(256) k_vup(const __half* __restrict__ ctx, const __half* __restrict__ wv_b, const float* __restrict__ gate, __half* __restrict__ o, int M, int NH) {
@@ -573,7 +804,6 @@ __global__ void __launch_bounds__(256) k_vup(const __half* __restrict__ ctx, con
 // kv_b_proj is an S_K tensor [NH*448][512] (2 super-blocks per row). Per-lane decode of 8 weights is the same packed-fp16 scheme as the S_K GEMV kernels
 // (integer q as the low mantissa of 0x6400 patterns, exact (q-H) in fp16; the sub-group scale eff = D*u/255 is applied in fp32).
 namespace dq {
-typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ uint32_t ld16u(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
 __device__ __forceinline__ uint32_t ld32u2(const uint8_t* p) { return ld16u(p) | (ld16u(p + 2) << 16); }
 template <int FMT> struct Info;
@@ -622,7 +852,7 @@ __device__ __forceinline__ void decode8(const uint8_t* pl, int u, float (&w)[8])
 
 __device__ __forceinline__ float sb_scale(const uint8_t* blk, int lane) {
     uint32_t dbits = ld16u(blk);
-    __half dh = __builtin_bit_cast(__half, (unsigned short)dbits);
+    __half dh = __ushort_as_half((unsigned short)dbits);
     return __half2float(dh) * ((float)blk[2 + (lane >> 3)] * (1.0f / 255.0f));
 }
 }  // namespace dq
@@ -779,6 +1009,11 @@ void mla_write_kv(hipStream_t s, const float* kv_a, const float* norm_w, __half*
 }
 
 void mla_attend(hipStream_t s, const __half* qa, const __half* cache, const float* sinks, __half* ctx, const MlaAttnArgs& a, void* ws, size_t ws_bytes) {
+#if !HY4_MMA
+    hipLaunchKernelGGL(k_attend_simple, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);
+    (void)ws; (void)ws_bytes;
+    return;
+#else
     const bool fast_ok = !g_mla_force_simple && (a.NH % 16 == 0) && a.cache_slots > 0 && (a.cache_slots % 16 == 0) && (a.mode != MLA_WINDOW || (a.ring > 0 && a.ring % 16 == 0)) &&
                          (a.mode != MLA_LIST || (a.kmax % 4 == 0));
     if (!fast_ok) {
@@ -796,18 +1031,22 @@ void mla_attend(hipStream_t s, const __half* qa, const __half* cache, const floa
     }
     hipLaunchKernelGGL(k_attend_wmma, dim3(a.NH / 16, S, a.M), dim3(128), 0, s, qa, cache, sinks, ctx, part, a, S, tps);
     if (S > 1) hipLaunchKernelGGL(k_combine, dim3(16, a.NH / 16, a.M), dim3(256), 0, s, part, ctx, a.NH, S);
+#endif
 }
 
 void mla_vup(hipStream_t s, const __half* ctx, const __half* wv_b, const float* gate, __half* o, int M, int NH) {
+#if HY4_MMA
     if (!g_mla_force_simple) {
         hipLaunchKernelGGL(k_head_gemm<1>, dim3(MLA_VHEAD / HG_BN, (M + HG_BM - 1) / HG_BM, NH), dim3(256), 0, s, (const void*)ctx, wv_b, gate, o, M, NH, 0, 0.f);
         return;
     }
+#endif
     constexpr int TT = 8;
     dim3 grid(NH, (M + TT - 1) / TT);
     hipLaunchKernelGGL((k_vup<TT>), grid, dim3(256), 0, s, ctx, wv_b, gate, o, M, NH);
 }
 
+#if HY4_MMA
 void mla_transpose_wk(hipStream_t s, const __half* wk_b, __half* wk_bt, int NH) {
     hipLaunchKernelGGL(k_transpose_wk, dim3(1024), dim3(256), 0, s, wk_b, wk_bt, NH);
 }
@@ -815,6 +1054,7 @@ void mla_transpose_wk(hipStream_t s, const __half* wk_b, __half* wk_bt, int NH) 
 void mla_prep_q_t(hipStream_t s, const float* q_b, const __half* wk_bt, __half* qa, int M, int NH, int p0, float theta) {
     hipLaunchKernelGGL(k_head_gemm<0>, dim3(MLA_KV_LORA / HG_BN, (M + HG_BM - 1) / HG_BM, NH), dim3(256), 0, s, (const void*)q_b, wk_bt, (const float*)nullptr, qa, M, NH, p0, theta);
 }
+#endif
 
 void mla_prep_q_dec(hipStream_t s, int fmt, const void* kv_b, const float* q_b, __half* qa, int M, int NH, int p0, float theta) {
     switch (fmt) {
