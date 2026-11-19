@@ -83,6 +83,17 @@ inline float route_prior_resolve(const char* env, bool hip, bool integrated, dou
     return env != nullptr ? (float) std::atof(env) : route_prior_default(hip, integrated, total_bytes, v026);
 }
 
+/// The window warm-up before READY (generate.cpp, lane DRAFT-COSTS): one dummy window per width on token id 1, whose misses page that token's experts into the GPU expert
+/// cache.  "Speed only" while routing ignores residency; with STRATA_ROUTE_PRIOR on, the first request is routed towards what is resident, so the dummy token's experts bend its
+/// answer (#6171: P(<|im_end|>) summed over the 8 digits of a long passkey answer 4.8 - 7.4 % in the first request after a start against 1.4 - 1.7 % with the warm-up off or the prior off;
+/// 8 starts per arm, RTX 3090, IQ4_XS).  warm_env is STRATA_WINDOW_WARM (nullptr unset): "0" off, "1" on whatever the prior says; unset: on, except while the prior is on (prior > 0).
+/// The cost of skipping it is the graph build of a width that the policy first picks inside a request (tens of ms, once).
+inline bool window_warm_on(const char* warm_env, float prior) {
+    if (warm_env != nullptr && warm_env[0] == '0') return false;
+    if (warm_env != nullptr && warm_env[0] == '1') return true;
+    return !(prior > 0.0f);
+}
+
 /// STRATA_GR_V3 (the stream-split hyper-connection read, another summation order) when the user set nothing: ON for a discrete compute capability
 /// 12.0 card (STRATA_SM120_PERF=0 turns the set off) with more than 13 GiB, CUDA builds only.  Measured: RTX PRO 5000 72 GB +1.2% decode clean,
 /// -3.0% / -5.9% on 2x RTX A4000 (sm_86), +1.0% / -3.4% on an RTX 3060 (sm_86): so not those; a 12 GB sm_120 card is unmeasured.

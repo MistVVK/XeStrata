@@ -541,6 +541,14 @@ int main() {
         CHECK(route_prior_default(false, false, 8.0 * GiB, true) == 0.0f);
         // an explicit STRATA_ROUTE_PRIOR=1.5 wins over 026 as well
         CHECK(route_prior_resolve("1.5", false, false, 12.0 * GiB, true) == 1.5f);
+        // the window warm-up (#6171): on by default, off while the route prior is on (the dummy token's paged-in experts bend the first request), the variable decides when set
+        CHECK(window_warm_on(nullptr, 0.0f));
+        CHECK(!window_warm_on(nullptr, 1.5f));
+        CHECK(window_warm_on(nullptr, route_prior_resolve(nullptr, false, false, 12.0 * GiB)));   // nothing set: the prior is off, the warm-up stays
+        CHECK(!window_warm_on(nullptr, route_prior_resolve("1.5", false, false, 12.0 * GiB)));
+        CHECK(window_warm_on(nullptr, route_prior_resolve("0", false, false, 12.0 * GiB)));
+        CHECK(!window_warm_on("0", 0.0f) && !window_warm_on("0", 1.5f));
+        CHECK(window_warm_on("1", 1.5f) && window_warm_on("1", 0.0f));
         // the wide HC up read: on for a 12.0 card on CUDA, off under 026, off in HIP, off on sm_86 / sm_121
         CHECK(gr_up_wide_default(false, 12, 0));
         CHECK(!gr_up_wide_default(false, 12, 0, true));

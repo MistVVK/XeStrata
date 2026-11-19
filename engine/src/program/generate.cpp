@@ -15521,7 +15521,11 @@ int main(int argc, char** argv) {
         // that reuses nothing does (the engine's state after session_init); no checkpoint, conversation entry, RNG draw, policy sample or statistic is touched (the policy's observe_*
         // calls live in the decode loop); the expert cache may page in what the dummy token routes to (speed only).  STRATA_WINDOW_WARM=0: off (research switch).
         {
-            static const bool warm_off = [] { const char* v = std::getenv("STRATA_WINDOW_WARM"); return v != nullptr && v[0] == '0'; }();
+            // #6171: not while STRATA_ROUTE_PRIOR is on (the dummy token's paged-in experts would bias the first request's routing); STRATA_WINDOW_WARM=1 forces it
+            static const bool warm_off = [] {
+                const float prior = strata::route_prior_resolve(std::getenv("STRATA_ROUTE_PRIOR"), false, false, 0.0);
+                return !strata::window_warm_on(std::getenv("STRATA_WINDOW_WARM"), prior);
+            }();
             if (!warm_off && o.spec >= 2 && n_stages == 1 && o.batch <= 0) {
                 const Clock::time_point w0 = Clock::now();
                 std::vector<int32_t> wtok((size_t) o.spec, 1), wout((size_t) o.spec + 1, 0);
