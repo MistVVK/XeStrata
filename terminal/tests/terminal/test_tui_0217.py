@@ -224,7 +224,9 @@ class OfflineDrafterLine(unittest.TestCase):
         events = []
         with Home(), mock.patch.object(drafting, "hardware_for", return_value=("cuda", ["sm_86"])), \
                 mock.patch.object(drafting, "engine_has_selector_q4", return_value=True), \
+                mock.patch.object(drafting, "card_vram_mib", return_value=12288.0), \
                 mock.patch.object(drafting_fetch, "ensure_for", return_value=None):
+            # (the 12 GB card of HW_12: card_vram_mib would read the real card of the box, and on a 48 or 72 GB card the small tuned drafter applies: INT-0217, boston and l620)
             r = Runner(S.LaunchSettings(family="qwen", model="Q2_0", context=32768, drafting="dflash2"), catalog=catalog(HW_12), emit=events.append)
             r.ensure_drafter(cfg)
             if layer_note:                                   # the safety net then asked setup for the draft layer, which was offline too
