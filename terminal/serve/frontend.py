@@ -859,6 +859,8 @@ class Event:
 THINK_END = "</think>"
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
+FUNCTION_CALLS_START = "<function_calls>"     # #6022: Claude's dialect's wrapper around its `<invoke>` calls (recover)
+FUNCTION_CALLS_END = "</function_calls>"
 
 
 PARAM_END = "</parameter>"
@@ -970,7 +972,7 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
                         return skip_to if final else -2
                     if not names or param_name(nafter[len(PARAM_START):gt]) in names:
                         return skip_to
-                elif not nafter and not final:
+                elif not final and (not nafter or FUNC_END.startswith(nafter) or CALL_END.startswith(nafter) or PARAM_START.startswith(nafter)):
                     return -2                                   # what follows has not arrived
                 at = nxt(at + 1)
                 continue
@@ -1582,6 +1584,12 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
             raise ValueError("malformed tool call: " + body[:80])
         args.update(got[0])
         rest = rest.lstrip()[got[1]:]
+    elif recover and rest.lstrip().startswith("{"):
+        # #6022 (recover): `<function=T>{"k": v}</function>` - a JSON object as the body is the call's arguments (it was run with none)
+        got = json_args(ARGS_START + rest.lstrip(), props, notes)
+        if got is not None and re.fullmatch(r"\s*(?:</function>)?\s*", rest.lstrip()[got[1] - len(ARGS_START):]):
+            args.update(got[0])
+            rest = ""
     openers = dropped = 0
     while True:
         # #6032 R2 (recover): where a parameter may begin, a damaged opener of a declared parameter not set yet
@@ -1808,6 +1816,43 @@ class OutputParser:
                     return p, True
             p = self.buf.find(FUNC_START, p + 1)
         return -1, False
+
+    def _dialect_opener(self):
+        """#6022 (recover): where Claude's dialect starts without the template's wrapper in the answer: `<function_calls>` followed by an `<invoke name="T">` of a
+        declared tool (outside code), or such an `<invoke name="T">` alone at the start of a line that ends its line.  -> (position, "fc" | "invoke" | "hold") or None;
+        "hold": the opener or its name is still arriving."""
+        found = None
+        for tag in (FUNCTION_CALLS_START, "<invoke "):
+            p = self.buf.find(tag)
+            while p >= 0 and (found is None or p < found[0]):
+                if tag == "<invoke ":
+                    ok = self._ok_at(p)
+                    rest = self.buf[p:]
+                else:
+                    ok = self._opens_at(p)
+                    rest = self.buf[p + len(tag):].lstrip()
+                    if ok and not rest:
+                        found = (p, "hold")
+                        break
+                if ok:
+                    m = _INVOKE_OPEN.match(rest)
+                    if m:
+                        line_end = rest[m.end():].lstrip(" \t")[:1]
+                        if tag == "<invoke ":
+                            if not line_end:
+                                found = (p, "hold")
+                                break
+                            if line_end == "\n" and self._callable(m.group(1)):
+                                found = (p, "invoke")
+                                break
+                        elif self._callable(m.group(1)):
+                            found = (p, "fc")
+                            break
+                    elif _INVOKE_PART.match(rest) and "\n" not in rest:
+                        found = (p, "hold")
+                        break
+                p = self.buf.find(tag, p + 1)
+        return found
 
     def _bare_in_reasoning(self):
         """#5804 (recover): a `<function=NAME>` of a declared tool that opens a call in the reasoning without its wrapper (start of a line, outside code)
@@ -2077,6 +2122,20 @@ class OutputParser:
                 stripped = rest.lstrip()
                 self.sp += len(rest) - len(stripped)
                 got = None
+                if self.recover and stripped.startswith("{") and not self.sset:
+                    # #6022: `<function=T>{"k": v}</function>`: the JSON object is the call's arguments (as parse_tool_call reads it), held until whole
+                    props = ((self.schemas.get(self.scall.name) or {}).get("parameters") or {}).get("properties") or {}
+                    whole = json_args(ARGS_START + stripped, props)
+                    if whole is None:
+                        return out
+                    tail = stripped[whole[1] - len(ARGS_START):].strip()
+                    if tail == "" or tail.startswith(FUNC_END) or FUNC_END.startswith(tail):
+                        for k, v in whole[0].items():
+                            self.sheld.pop(k, None)
+                            self.sheld[k] = v
+                            self.sset.add(k)
+                        self.sp += whole[1] - len(ARGS_START)
+                        continue
                 if self.recover and (stripped.startswith(ARGS_START) or (stripped and ARGS_START.startswith(stripped))):
                     # #6032 R3: the arguments as one JSON object: held until it is whole, then sent with the call's
                     # other non-string values when it closes (as parse_tool_call reads it); a cut one sends nothing
@@ -2464,10 +2523,34 @@ class OutputParser:
                     self.buf = self.buf[b:]
                     self.state, self.bare = "call", True
                     continue
+                dialect = self._dialect_opener() if self.recover and self.schemas else None
+                if dialect is not None and (i < 0 or dialect[0] < i):
+                    # #6022 (recover): Claude's dialect without the template's wrapper - `<function_calls>` around `<invoke>`, or a bare `<invoke name="T">`
+                    # alone at the start of a line (a declared tool): the wrapper is put in front and the "invoke" state reads it
+                    p, what = dialect
+                    if what == "hold":
+                        j = p
+                        while j > 0 and self.buf[j - 1] == "\n":
+                            j -= 1
+                        if j > 0:
+                            out.append(Event("content", self._track(self.buf[:j])))
+                        self.buf = self.buf[j:]
+                        return out
+                    if what == "fc":
+                        self.buf = self.buf[:p] + CALL_START + self.buf[p + len(FUNCTION_CALLS_START):]
+                        q = self.buf.find(FUNCTION_CALLS_END, p)
+                        if q >= 0:
+                            self.buf = self.buf[:q] + CALL_END + self.buf[q + len(FUNCTION_CALLS_END):]
+                    else:
+                        self.buf = self.buf[:p] + CALL_START + "\n" + self.buf[p:]
+                    continue
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
                     # so emitting them early would make streamed and whole outputs differ.
-                    j = len(self.buf) - self._hold(self.buf, (CALL_START, THINK_END) if self.after_think else (CALL_START,))
+                    tags = (CALL_START, THINK_END) if self.after_think else (CALL_START,)
+                    if self.recover and self.schemas:
+                        tags += (FUNCTION_CALLS_START, "<invoke ")
+                    j = len(self.buf) - self._hold(self.buf, tags)
                     if self.recover and self.schemas:            # a line that may be becoming a bare <function=
                         k = self.buf.rfind("\n") + 1
                         tail = self.buf[k:]
@@ -2618,9 +2701,10 @@ class OutputParser:
                 tail = rest.lstrip()
                 if not tail and not self._final:
                     return out                          # its `</tool_call>` may still come
-                if tail and CALL_END.startswith(tail) and not self._final:
+                if tail and (CALL_END.startswith(tail) or FUNCTION_CALLS_END.startswith(tail)) and not self._final:
                     return out
-                drop = len(rest) - len(tail) + len(CALL_END) if tail.startswith(CALL_END) else 0
+                closer = CALL_END if tail.startswith(CALL_END) else FUNCTION_CALLS_END if tail.startswith(FUNCTION_CALLS_END) else None   # #6022: `</function_calls>` too
+                drop = len(rest) - len(tail) + len(closer) if closer else 0
                 raw = self.buf[:m.end()]
                 call = None
                 try:

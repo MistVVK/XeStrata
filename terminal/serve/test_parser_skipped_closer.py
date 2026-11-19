@@ -59,6 +59,23 @@ class SkippedCloser(unittest.TestCase):
         for calls, answer in self.each(OWN_CLOSER):
             self.assertEqual(calls, [("edit_file", {"new_string": "use\n<parameter=limit>25</parameter>\nhere"})])
 
+    def test_the_streamed_argument_deltas_agree_with_the_call(self):
+        import json
+        for text in (SKIPPED, SKIPPED_NEXT, OWN_CLOSER):
+            for piece in (0, 1, 3, 7, 16):
+                p = OutputParser(thinking=False, tools=TOOLS, stream_tools=True, recover=True, declared_only=True)
+                evs = []
+                if piece:
+                    for i in range(0, len(text), piece):
+                        evs += p.feed(text[i:i + piece])
+                    evs += p.finish("stop")
+                else:
+                    evs = p.feed(text) + p.finish("stop")
+                streamed = "".join(e.text for e in evs if e.kind == "tool_args")
+                calls = [e.call.arguments for e in evs if e.kind == "tool_call"]
+                self.assertEqual(len(calls), 1, (text, piece))
+                self.assertEqual(json.loads(streamed), calls[0], (text, piece))
+
     def test_a_following_call_is_not_lost(self):
         for calls, answer in self.each(SKIPPED + "\n" + SKIPPED_NEXT):
             self.assertEqual(len(calls), 2)
