@@ -3408,7 +3408,19 @@ int64_t Prefill::short_read_default(int64_t base) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.fmt.empty()) return base;
     const bool cls = stream_floor_class_measured();
-    return strata::prefill::short_read_default(base, cls, cls && layers_all_fused_only(), staged_fo_on(), trellis_g1151_all_fused() && layers_any_folded());
+    // a CUDA compute capability 12.0 card (BW-12: the batched read of a 17 to 64 token piece is 1.3 to 2.3 times faster than the windows on an RTX 5090)
+    bool sm120 = false;
+#if defined(CUDART_VERSION) && !defined(STRATA_USE_HIP) && !defined(__HIPCC__)
+    {
+        int dev = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess)
+            sm120 = strata::sm120_default(major, minor);
+        (void) cudaGetLastError();
+    }
+#endif
+    return strata::prefill::short_read_default(base, cls, cls && layers_all_fused_only(), staged_fo_on(), trellis_g1151_all_fused() && layers_any_folded(),
+                                               sm120 && layers_all_fused_only());
 }
 void Prefill::set_card_expert_share(int64_t resident_slots, int64_t total_pairs, double blob_mb, double link_gbps) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)

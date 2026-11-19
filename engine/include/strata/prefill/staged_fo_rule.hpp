@@ -38,8 +38,18 @@ inline constexpr long long kStagedEntryShortRead = 24;
 /// `folded_trellis`: that class with an all-trellis set on the fused kernels (prefill.cpp trellis_g1151_all_fused(), Gyro-S with STRATA_PF_TQ_G1151 on) in which a layer is Hadamard-folded.  The
 /// staged entry does not take a folded layer, so a batched piece below the floor ran it on the FP16 path (Strix Halo, Gyro-S, 26 / 31 / 33 / 49 tokens 705 / 766 / 778 / 993 ms against 293 / 391 /
 /// 351 / 486 ms through the windows); such a set keeps `base`.
-constexpr long long short_read_default(long long base, bool class_measured, bool all_layers_fused_only, bool entry_on, bool folded_trellis = false) {
-    return class_measured && all_layers_fused_only && entry_on && !folded_trellis ? kStagedEntryShortRead : base;
+///
+/// `sm120_cuda`: a CUDA card of compute capability 12.0 (RTX 5090 / 5080 / 5070 / PRO Blackwell; sm120_series.hpp, not a gfx12 HIP card, and STRATA_SM120_PERF=0 turns it off) AND every layer
+/// fused-only (the caller's test, not the Strix class's).  With the entry on, a piece of 17 to 64 tokens reads in about 125-175 ms batched whatever its length, while the windows cost about 6.5 ms a token (RTX 5090, UD-Q4_K_XL, DFlash2, prompt
+/// ms median of 3 rounds, `--short-read` 64 / 16 / 24 / 32 / 48: 24 tokens 172 / 130 / 175 / 174 / 172, 32 tokens 201 / 143 / 139 / 191 / 188, 48 tokens 284 / 166 / 170 / 159 / 268, 64 tokens 403 / 175 / 183 / 175 / 173;
+/// 16 tokens level at 140 / 127 / 123 / 137 / 129; 84 and 512 tokens are batched in every arm and level), so the windows only win up to about 16 tokens: the default there is 16
+/// (phaseA-tests/bw/RESULTS-BW-A.md BW-12).
+inline constexpr long long kSm120ShortRead = 16;
+
+constexpr long long short_read_default(long long base, bool class_measured, bool all_layers_fused_only, bool entry_on, bool folded_trellis = false, bool sm120_cuda = false) {
+    return class_measured && all_layers_fused_only && entry_on && !folded_trellis ? kStagedEntryShortRead
+         : sm120_cuda && entry_on ? kSm120ShortRead
+         : base;
 }
 
 /// A layer the staged group entry may take on the layer-side rule: it has an MMQ tile (the entry's earlier rule), or it is fused-only and the entry is on (staged_fo_decide).
