@@ -20,7 +20,7 @@ interface SpeedSwitch {
     legacy?: Record<string, string>;
     /** The Expert settings group the row is in (Speed when not given). */
     group?: string;
-    /** The two option names instead of On / Off (no row has them since the picture reader row went in 0.2.16). */
+    /** The two option names instead of On / Off (only the route tail skip choice has them since 0.2.17: its default option's word is "Off (default)"). */
     words?: { on: string; off: string };
     /** A value to choose instead of on / off (STRATA_ROUTE_TAIL_SKIP): [value, word] besides the default, which writes no entry. */
     choices?: [string, string][];
@@ -127,7 +127,7 @@ export function NativeSettings({ model }: {
     const draftingOffered = !!draftingChoices(family, native?.capabilities?.dflash2);
     const rows = (native?.fields ?? []).filter(f => (f.id !== 'drafting' || draftingOffered) && `${tr(f.label)} ${f.id} ${tr(f.group)}`.toLowerCase().includes(query.toLowerCase()));
     const switchRows = switches.filter(sw => `${tr(sw.label)} ${sw.id} ${tr(switchGroup(sw))}`.toLowerCase().includes(query.toLowerCase()));
-    // A choice switch (owner, 0.2.16: STRATA_ROUTE_TAIL_SKIP): the default writes no entry, every other choice writes its value (src/lib/speed-choice.ts).
+    // A choice switch (owner, 0.2.16: STRATA_ROUTE_TAIL_SKIP): the default writes no entry, every other choice writes its value (src/lib/speed-choice.ts). 0.2.17: the default is Off, On is 7.
     const choiceRow = (sw: SpeedSwitch) => { const known = choiceValue(sw, values.env), numbered = isNumberChoice(sw, known);
         return <label className="native-setting-row" key={sw.id}><span><strong>{tr(sw.label)}</strong><small>{tr(sw.hint)}</small>{tr(numbered && sw.choiceNote ? <small>{tr(sw.choiceNote)}</small> : null)}</span><Select ariaLabel={tr(sw.label)} value={known} options={choiceOptions(sw)} onChange={v => change('env', withChoice(sw, values.env, v))}/></label>; };
     const switchRow = (sw: SpeedSwitch) => sw.choices?.length ? choiceRow(sw) : <label className="native-setting-row" key={sw.id}><span><strong>{tr(sw.label)}</strong><small>{tr(sw.hint)}</small></span><Select ariaLabel={tr(sw.label)} value={switchIsOn(sw, values.env) ? 'on' : 'off'} options={sw.words ? [{ value: sw.default, label: sw.words[sw.default] }, { value: sw.default === 'on' ? 'off' : 'on', label: sw.words[sw.default === 'on' ? 'off' : 'on'] }] : sw.default === 'on' ? [{ value: 'on', label: 'On (recommended)' }, { value: 'off', label: 'Off' }] : [{ value: 'off', label: 'Off (recommended)' }, { value: 'on', label: 'On' }]} onChange={v => changeSwitch(sw, v === 'on')}/></label>;

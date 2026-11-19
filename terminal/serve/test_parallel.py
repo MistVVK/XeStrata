@@ -94,7 +94,8 @@ def window():        # one batch window: every active slot one token
             stopped.discard(b)
             prompt_ids, emitted, in_slot = meta.pop(b, ([], [], False))
             slot_ids[b] = prompt_ids + emitted[:-1]
-            print(f"BDONE {b} {produced} {fin}{BDONE_MS}" + (" read=3.0" if in_slot else ""), flush=True)
+            print(f"BDONE {b} {produced} {fin}{BDONE_MS}" + (" read=3.0" if in_slot else "") +
+                  (f" drafts={2 * produced}:{produced}" if "--drafts" in args else ""), flush=True)
             del active[b]
         else:
             active[b] = [left, max_new, produced]
@@ -1218,6 +1219,36 @@ class SlotRead(FakeEngineCase):
         self.assertEqual(self.log.read_text()[before:].split()[0], "GEN")
         self.assertFalse(any(x.endswith(" sr") for x in self.log.read_text().splitlines()))
 
+
+
+class BatchDraftCounters(FakeEngineCase):
+    """#5890: with --batch-mtp the engine's BDONE line carries the slot's own draft counters (drafts=<checked>:<kept>), and the response's
+    draft_n / draft_n_accepted read them; an engine that does not say it leaves them as before."""
+
+    def tokens(self, ids, max_new=64):
+        return [t for t in self.engine.generate_batched(list(ids), max_new, {}, threading.Event()) if t is not None]
+
+    def two_chats(self):
+        """Two conversations at once, so the second one runs in a batch slot -> the second one's engine record right after its reply."""
+        a, b = list(b"first LONGREPLY chat " + b"a" * 600), list(b"second chat " + b"b" * 600)
+        ta = threading.Thread(target=lambda: self.tokens(a))
+        ta.start()
+        time.sleep(0.15)
+        self.tokens(b)
+        last = dict(self.engine.last)
+        ta.join(30)
+        return last
+
+    def test_a_batch_slot_request_reports_its_drafts(self):
+        self.start(2, more=("--drafts",))
+        last = self.two_chats()
+        self.assertGreater(last["drafts_offered"], 0)
+        self.assertEqual((last["drafts_offered"], last["drafts_accepted"]), (2 * last["generated"], last["generated"]))
+
+    def test_an_engine_that_does_not_say_drafts_is_read_as_before(self):
+        self.start(2)
+        last = self.two_chats()
+        self.assertFalse(last.get("drafts_offered"))
 
 
 class EngineOwnedDefaults(unittest.TestCase):

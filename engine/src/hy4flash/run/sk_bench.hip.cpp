@@ -198,6 +198,32 @@ int main(int argc, char** argv) {
                 printf("moe %-5s M=%5d pairs=%6d experts_used=%3d weights_read=%7.1f MB  %8.3f ms  %6.1f GB/s  %6.2f TFLOPs  %9.0f tokens/s (1 layer)\n", mode == 0 ? "dec" : "wmma", M, P, nused, wbytes / 1e6,
                        ms, wbytes / 1e6 / ms, flops / (ms * 1e-3) / 1e12, M / (ms * 1e-3));
             }
+            if (M == 1) {  // one-token slot-record path: same numbers as the generic decode kernels, timed the same way
+                std::vector<ExpertDev> rec(16);
+                for (int k = 0; k < 16; ++k) rec[k] = tab[idx[k]];
+                ExpertDev* d_rec;
+                CK(hipMalloc(&d_rec, 16 * sizeof(ExpertDev)));
+                CK(hipMemcpy(d_rec, rec.data(), 16 * sizeof(ExpertDev), hipMemcpyHostToDevice));
+                CK(hipMemset(d_ws, 0, moe_ws_bytes(M)));
+                float* d_out2;
+                CK(hipMalloc(&d_out2, (size_t)M * 1536 * 4));
+                skd::moe_dec_max_m() = 8;
+                moe_experts(0, d_arena, d_tab, d_z, d_idx, d_w, d_out, M, d_ws);
+                moe_experts(0, d_arena, d_tab, d_z, d_idx, d_w, d_out2, M, d_ws, nullptr, nullptr, d_rec);
+                CK(hipDeviceSynchronize());
+                std::vector<float> a(1536), b(1536);
+                CK(hipMemcpy(a.data(), d_out, 1536 * 4, hipMemcpyDeviceToHost));
+                CK(hipMemcpy(b.data(), d_out2, 1536 * 4, hipMemcpyDeviceToHost));
+                printf("moe slot1 M=1 bit-identical to dec: %s\n", memcmp(a.data(), b.data(), 1536 * 4) == 0 ? "YES" : "NO");
+                hipEventRecord(e0);
+                for (int r = 0; r < 20; ++r) moe_experts(0, d_arena, d_tab, d_z, d_idx, d_w, d_out2, M, d_ws, nullptr, nullptr, d_rec);
+                hipEventRecord(e1);
+                CK(hipEventSynchronize(e1));
+                float ms; hipEventElapsedTime(&ms, e0, e1);
+                ms /= 20;
+                printf("moe slot1 M=    1 pairs=    16 experts_used= 16 weights_read=%7.1f MB  %8.3f ms  %6.1f GB/s\n", wbytes / 1e6, ms, wbytes / 1e6 / ms);
+                hipFree(d_rec); hipFree(d_out2);
+            }
             hipFree(d_z); hipFree(d_idx); hipFree(d_w); hipFree(d_out); hipFree(d_ws);
         }
         return 0;

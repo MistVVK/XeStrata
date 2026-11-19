@@ -113,8 +113,14 @@ def reference(shape: str) -> str:
     return ec.REFERENCE_PREFIX + component_id(shape)
 
 
-def exe_name() -> str:
-    return "strata.exe" if os.name == "nt" else "strata"
+#: The engine of Tencent Hy4-Flash is a "shape" in this module's sense (its own component next to the Strata engine, fetched through the signed feed, named by the run
+#: config's exe "component:strata-hy4") but not a compile of the Strata engine: its program is strata-hy4 and it has no geometry, so it says what it is with `--info`.
+HY4_SHAPE = "hy4"
+
+
+def exe_name(shape: str | None = None) -> str:
+    base = "strata-hy4" if shape == HY4_SHAPE else "strata"
+    return base + (".exe" if os.name == "nt" else "")
 
 
 # ---------------------------------------------------------------------------------------------- where, what is installed
@@ -211,7 +217,11 @@ def _test_start(exe: Path, timeout: float = 120.0, shape: str | None = None) -> 
     if done.returncode != 0 or not first.startswith("strata"):
         tail = ((done.stderr or "").strip().splitlines() or [first or f"exit {done.returncode}"])[-1]
         return False, tail[:160]
-    if shape:
+    if shape == HY4_SHAPE:
+        # Hy4-Flash's engine has no geometry: `strata-hy4 --version` named it ("strata-hy4 <version>") and that is the whole check
+        if not first.startswith("strata-hy4"):
+            return False, NO_SHAPE_ANSWER
+    elif shape:
         ok, why = check_geometry(exe, shape, env, timeout)
         if not ok:
             return False, why
@@ -294,9 +304,9 @@ def update_one(ctx, feed, shape: str, *, install_missing: bool = True, title: st
             shutil.rmtree(longpath.long_path(target), ignore_errors=True)
         updater._move_dir(folder, target)
         if os.name != "nt":
-            (target / exe_name()).chmod(0o755)
+            (target / exe_name(shape)).chmod(0o755)
         ctx.say("test", f"Test-starting the engine for {name} {pkg.version}", component=comp)
-        ok, why = _test_start(target / exe_name(), shape=shape)
+        ok, why = _test_start(target / exe_name(shape), shape=shape)
         if not ok:
             shutil.rmtree(longpath.long_path(target), ignore_errors=True)         # (never an older one)
             refused = updater.UpdateError(WORDS["start_failed"].format(model=name, version=pkg.version, why=why), 6)

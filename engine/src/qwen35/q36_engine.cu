@@ -16,6 +16,7 @@
 //
 // Modes: --serve (serve/server.py's engine protocol: READY / GEN / T / DONE / STOP / PP), --tokens IDS [--n N]
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
+#include "strata/artifact/dequant.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/fused_gdn.hpp"
@@ -35,6 +36,7 @@
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/sampling.hpp"
 #include "strata/qwen35/expert_info.hpp"
+#include "strata/qwen35/hybrid_fit.hpp"
 #include "q36_kernels.cuh"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -957,8 +959,15 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
             const float d = f16_to_f32((uint16_t) (q[0] | (q[1] << 8)));
             for (int j = 0; j < 32; ++j) h[b * 32 + j] = d * (float) (int8_t) q[2 + j];
         }
+    } else if (((t.type >= 11 && t.type <= 14) || t.type == 23) && h.size() % 256 == 0) {
+        // Q3_K..Q6_K, IQ4_XS (mixed GGUFs store ssm_alpha / ssm_beta so): 256-value super-blocks
+        static const struct { void (*f)(const uint8_t*, float*); size_t bytes; } kq[] = {
+            {strata::dequantize_q3_K, 110}, {strata::dequantize_q4_K, 144}, {strata::dequantize_q5_K, 176},
+            {strata::dequantize_q6_K, 210}, {strata::dequantize_iq4_xs, 136}};
+        const auto& k = kq[t.type == 23 ? 4 : t.type - 11];
+        for (size_t b = 0; b < h.size() / 256; ++b) k.f(src + b * k.bytes, h.data() + b * 256);
     } else {
-        std::fprintf(stderr, "strata-q36: %s is %s, expected F32, BF16, F16 or Q8_0\n", t.name.c_str(), t.type_name());
+        std::fprintf(stderr, "strata-q36: %s is %s, expected F32, BF16, F16, Q8_0, Q3_K..Q6_K or IQ4_XS\n", t.name.c_str(), t.type_name());
         std::exit(1);
     }
     float* d = nullptr;
@@ -3050,30 +3059,38 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
     if (!E.use_pf) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
-    const size_t staging = E.use_pf && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
-    size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
-    if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
-    // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
-    int S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
-    if (mtp_only) {   // the main layers all, the MTP block what is left
-        const size_t left = budget2 > total_main ? budget2 - total_main : 0;
-        S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
+    // the slot count and the VRAM need (hybrid_fit.hpp); when the staging pair of the streamed prompt path does not fit the card, the plan without it (#5533)
+    strata::qwen35::HybridIn hin;
+    hin.fr = fr;
+    hin.budget2 = budget2;
+    hin.per_slot = per_slot;
+    hin.n_layers = all.size();
+    hin.tail = kMmqTail;
+    hin.outputs = (size_t) E.tmax * (size_t) m.top_k * (size_t) g.n_embd * 4 + (size_t) E.tmax * (size_t) m.top_k * 4;
+    hin.staging_full = 2 * (max_layer + kMmqTail);
+    hin.streamed = E.use_pf && E.main_hybrid;
+    hin.allow_drop = std::getenv("STRATA_Q36_KEEP_STAGING") == nullptr;   // =1: the old plan, no fallback
+    hin.ne = ne;
+    hin.slots_forced = slots;
+    hin.mtp_only = mtp_only;
+    hin.total_main = total_main;
+    hin.mtp_stride = m.has_mtp ? m.mtp.stride : 0;
+    strata::qwen35::HybridPlan plan = strata::qwen35::hybrid_plan(hin);
+    if (plan.dropped_staging) {
+        E.use_pf = false;                 // no streamed prompt path: every batch on slots + the pool, as for a layer set with no fast prompt route
+        E.hybrid_t = E.tmax;
+        std::fprintf(stderr, "strata-q36: the streamed prompt path's two staging buffers (%.2f GiB) do not fit the free VRAM (%.2f GiB): "
+                     "prompts are read on the experts in VRAM and the CPU pool instead (slower prompts)\n",
+                     (double) hin.staging_full / (1 << 30), (double) fr / (1 << 30));
     }
-    {   // what the hybrid mode allocates next (the staging pair, the CPU part's outputs, the slots) against the VRAM the
-        // sessions and the context left: said with the numbers instead of a cudaMalloc failure (8 slots on a 12 GB card)
-        const size_t Tn = (size_t) E.tmax, Nn = (size_t) g.n_embd, Kn = (size_t) m.top_k;
-        size_t need = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
-        for (Layer* L : all) {
-            if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
-            else need += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
-        }
-        if (need > fr) {
-            err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((need >> 20)) +
-                  " MiB needed, " + std::to_string(fr >> 20) + " MiB free after the weights, the context and the sessions): use "
-                  "fewer slots (\"parallel\" / --batch), a shorter --max-context" +
-                  (slots > 0 ? ", or fewer --expert-slots" : "");
-            return false;
-        }
+    const size_t staging = plan.staging;
+    const int S = plan.S;
+    if (!plan.fits) {
+        err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((plan.need >> 20)) +
+              " MiB needed, " + std::to_string(fr >> 20) + " MiB free after the weights, the context and the sessions): use "
+              "fewer slots (\"parallel\" / --batch), a shorter --max-context" +
+              (slots > 0 ? ", or fewer --expert-slots" : "");
+        return false;
     }
     // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
     size_t host = 0;
@@ -3090,11 +3107,27 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     size_t off = 0;
+    const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
+    auto alloc_vram = [&](void** p, size_t bytes, const char* what) -> bool {
+        const cudaError_t e = cudaMalloc(p, bytes);
+        if (e == cudaSuccess) return true;
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        std::fprintf(stderr, "strata-q36: %s allocation failed: need %.1f MiB, free %.1f MiB "
+                     "(ctx %d, chunk %zu, top_k %lld, n_embd %lld): %s; try a smaller --max-context, --mtp 0, "
+                     "fewer --parallel slots or more free VRAM\n",
+                     what, (double) bytes / 1048576.0, (double) free_b / 1048576.0, E.ctx, T,
+                     (long long) m.top_k, (long long) g.n_embd, cudaGetErrorString(e));
+        err = std::string("out of memory: ") + what + " needs " + std::to_string(bytes / 1048576) +
+              " MiB, " + std::to_string(free_b / 1048576) + " MiB free";
+        return false;
+    };
     E.hy.resize(all.size());
     for (size_t li = 0; li < all.size(); ++li) {
         Layer& L = *all[li];
         if (mtp_only && &L != &m.mtp) {   // a main layer: every expert in VRAM, as in the all-in-VRAM placement
-            CK(cudaMalloc(&L.blobs, L.stride * (size_t) ne + kMmqTail));
+            if (!alloc_vram((void**) &L.blobs, L.stride * (size_t) ne + kMmqTail,
+                            "expert slots, all in VRAM (L.blobs)")) return false;
             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) ne + kMmqTail));
             std::vector<uint8_t> blob(L.L.bytes, 0);
             for (int64_t e = 0; e < ne; ++e) {
@@ -3110,7 +3143,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
         L.n_slots = S;
         if (S > 0) {
-            CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
+            const std::string what = "expert slots (L.blobs), layer " + std::to_string(li) + ", slots " +
+                                     std::to_string(S);
+            if (!alloc_vram((void**) &L.blobs, L.stride * (size_t) S + kMmqTail, what.c_str())) return false;
             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
             CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
         }
@@ -3122,7 +3157,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             H.exp_in_slot[(size_t) s] = s;
         }
         H.score.assign((size_t) ne, 0.0);
-        CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
+        if (!alloc_vram((void**) &H.slot_of_d, (size_t) ne * 4, "expert slot table (H.slot_of_d)")) return false;
         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
         if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
         if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
@@ -3130,20 +3165,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
-    const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
     CK(cudaHostAlloc((void**) &E.h_h, T * N * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * N * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.h_miss, T * Kp * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.h_cnt, all.size() * (size_t) ne * 4, cudaHostAllocDefault));
-    CK(cudaMalloc(&E.ecpu, T * Kp * N * 4));
-    CK(cudaMalloc(&E.d_miss, T * Kp * 4));
+    if (!alloc_vram((void**) &E.ecpu, T * Kp * N * 4, "expert scratch (E.ecpu)")) return false;
+    if (!alloc_vram((void**) &E.d_miss, T * Kp * 4, "expert misses (E.d_miss)")) return false;
     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
         for (int b = 0; b < 2; ++b) {
-            CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
+            if (!alloc_vram((void**) &E.stage[b], max_layer + kMmqTail,
+                            b == 0 ? "prompt staging (E.stage[0])" : "prompt staging (E.stage[1])")) return false;
             CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));

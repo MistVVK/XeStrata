@@ -58,6 +58,14 @@ int main() {
     static_assert(strata::prefill::short_read_default(64, false, true, true, false) == 64, "another class: unchanged");
     CHECK(short_read_default(64, true, true, true, true) == 64);
     CHECK(short_read_default(64, true, true, true) == strata::prefill::kStagedEntryShortRead);
+    // BW-12: a compute capability 12.0 CUDA card with every layer fused-only and the entry on reads 17 to 64 token pieces batched (16 and below through the windows)
+    static_assert(strata::prefill::kSm120ShortRead == 16, "the sweep's crossing (RTX 5090, UD-Q4_K_XL)");
+    static_assert(strata::prefill::short_read_default(64, false, false, true, false, true) == strata::prefill::kSm120ShortRead, "sm_120, every layer fused-only, entry on");
+    static_assert(strata::prefill::short_read_default(64, false, false, false, false, true) == 64, "sm_120, entry off (STRATA_PF_STAGED_FO=0): the windows' 64");
+    static_assert(strata::prefill::short_read_default(64, false, false, true, false, false) == 64, "another card (or a layer not fused-only): unchanged");
+    static_assert(strata::prefill::short_read_default(64, true, true, true, false, true) == strata::prefill::kStagedEntryShortRead, "the Strix Halo class keeps its 24");
+    CHECK(short_read_default(64, false, false, true, false, true) == 16);
+    CHECK(short_read_default(64, false, false, true) == 64);
     // the layer rule: a layer with an MMQ tile is the entry's earlier rule, whatever the decision says
     static_assert(staged_entry_layer(true, false, false), "an MMQ layer keeps the entry");
     static_assert(staged_entry_layer(true, false, true), "an MMQ layer keeps the entry");

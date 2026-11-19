@@ -94,6 +94,7 @@ def main() -> int:
                 cfg["args"] = list(base["args"]) + e.pop("xargs").split(";")
             cfg["port"] = a.port
             cfg["log"] = str(Path(tempfile.gettempdir()) / f"ab_{name}_r{rnd}.log")
+            Path(cfg["log"]).write_text("", encoding="utf-8")   # do not append to a previous A/B run (#4545)
             cpath = Path(tempfile.gettempdir()) / f"ab_{name}.json"
             cpath.write_text(json.dumps(cfg, indent=1))
             penv = dict(os.environ, **e)

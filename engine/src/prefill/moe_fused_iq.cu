@@ -2242,6 +2242,15 @@ struct DevInfo {
 std::mutex g_mu;
 DevInfo g_dev[32];
 
+// nvcc before 12.1 caps kernel parameters at 4096 bytes; the WideBatch kernels (STRATA_PF_FUSED_NT=256 / _F16 / _WS,
+// all opt-in) take 4216, so such a build leaves them out and their setup reports them unavailable
+#if !defined(__HIPCC__) && defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ < 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 1))
+#define STRATA_PF_WIDE_PARAMS 0
+#else
+#define STRATA_PF_WIDE_PARAMS 1
+#endif
+
 #if !defined(__HIPCC__)
 // the activation stages of native_kernel on the current device: its ASTAGES_DEV (2 below sm_80)
 int host_astages() {
@@ -2332,15 +2341,24 @@ bool ws_requested() {
     return on;
 }
 template <int T, bool GU> bool setup_ws() {
+#if !STRATA_PF_WIDE_PARAMS
+    return false;
+#else
     cudaFuncAttributes fa{};
     if (cudaFuncGetAttributes(&fa, native_ws_kernel<T, GU>) != cudaSuccess || fa.ptxVersion < 80) return false;
     if (cudaFuncSetAttribute(native_ws_kernel<T, GU>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) ws_smem_bytes(T)) !=
         cudaSuccess) return false;
     int o = 0;
     return cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, native_ws_kernel<T, GU>, WS_THREADS, ws_smem_bytes(T)) == cudaSuccess && o >= 1;
+#endif
 }
 template <int T, bool GU> bool setup_nt(int& occ) {
+#if !STRATA_PF_WIDE_PARAMS
+    (void) occ;
+    return false;
+#else
     return f16c_requested() ? setup_ww<T, GU, 2, 256, true>(occ) : setup_ww<T, GU, 2, 256>(occ);
+#endif
 }
 #endif
 
@@ -2646,10 +2664,11 @@ bool q8d_f16_default(const DevInfo& d) {
 // The switch means the same everywhere: 1 on, 0 off, unset = the platform's default.
 bool q50_on(const DevInfo& d) {
 #if defined(__HIPCC__)
-    if (!d.w12 && !d.g1151) return false;
+    if (!d.w12 && !d.g1151 && !d.g11) return false;
     static const int env = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q50"); return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '1' ? 1 : 0); }();
     if (env >= 0) return env == 1;
     if (d.w12) return strata::core::kGfx12PromptDefaultsOn;   // gfx12: on by default under Linux, opt-in under Windows
+    if (d.g11) return false;   // gfx1100 - gfx1102 (#5980): the F16 kernel gfx1151 uses, as an opt-in only (STRATA_PF_FUSED_Q50=1, with STRATA_PF_F16=1)
 #if defined(_WIN32)
     const char* off = std::getenv("STRATA_GFX1151_DEFAULTS");
     return !(off != nullptr && off[0] == '0');
@@ -2780,6 +2799,7 @@ void launch(bool ws, unsigned grid, const WideBatch& b, const NativeGeom& g, con
             const int32_t* src, void* out, float* dm, cudaStream_t s) {
     const uint8_t* a = (const uint8_t*) act;
     uint8_t* o = (uint8_t*) out;
+#if STRATA_PF_WIDE_PARAMS
 #if !defined(__HIPCC__)   // (native_ws_kernel and the F16 path are CUDA only; d.ws is never set on HIP)
     if (ws)
         native_ws_kernel<T, GU><<<grid, WS_THREADS, ws_smem_bytes(T), s>>>(b, g, tb, a, src, o, dm);
@@ -2790,6 +2810,9 @@ void launch(bool ws, unsigned grid, const WideBatch& b, const NativeGeom& g, con
     (void) ws;
 #endif
     native_kernel<T, GU, 2, 256><<<grid, 256, smem_bytes(T, 2, host_astages(), 256, false, GU), s>>>(b, g, tb, a, src, o, dm);
+#else   // (never reached: setup_nt / setup_ws report the wide kernels unavailable)
+    (void) ws; (void) grid; (void) b; (void) g; (void) tb; (void) a; (void) src; (void) o; (void) dm; (void) s;
+#endif
 }
 
 // The work item's shape for a layer of `n` routed rows over `n_expert` experts: 128 routed rows when an expert has

@@ -94,7 +94,7 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                    help="let the model read pictures. Default: on when the model can read pictures and the engine has the picture reader. "
                         "'on' picks the reader by your graphics memory: the CPU reader under 24 GB, the GPU reader from 24 GB (any make); "
                         "gpu / cpu choose one; off turns pictures off")
-    g.add_argument("--parallel", type=_parallel, metavar="N", help="requests answered at the same time, 1 to 8 (default: fit to your graphics card)")
+    g.add_argument("--parallel", type=_parallel, metavar="N", help="requests answered at the same time, 1 to 8 (default: fit to your graphics card; one request at a time with the DFlash2 drafter)")
     g.add_argument("--mtp", type=_choice("a draft layer setting", S.MTP_MODES), metavar="on|off",
                    help="the draft layer that makes answers faster. off starts without it: about 1 GB less graphics memory and less RAM, "
                         "slower answers; use it when the engine stops at start on a small card or a PC with little RAM. Default: on")
@@ -571,6 +571,12 @@ def _can_ask() -> bool:
         return False
     if os.environ.get("CI") or os.environ.get("STRATA_NO_PROMPT"):
         return False
+    try:
+        from strata_cli import noinput                       # (0217-PLAT's module; a tree without it asks as before)
+    except ImportError:
+        return bool(os.environ.get("MSYSTEM") or os.environ.get("TERM_PROGRAM") or os.environ.get("TERM") or os.environ.get("WT_SESSION"))
+    if noinput.stdin_is_no_keyboard():                       # `strata launch < /dev/null`: no question that nobody can answer (0.2.17)
+        return False
     return bool(os.environ.get("MSYSTEM") or os.environ.get("TERM_PROGRAM") or os.environ.get("TERM") or os.environ.get("WT_SESSION"))
 
 
@@ -883,6 +889,7 @@ def run_launch(a: argparse.Namespace) -> int:
         move_data = _move_data_choice(a, s, catalog, machine)
         runner.s, runner.move_data = s, move_data
         if a.plan:
+            runner.look_up_feed = True                       # the plan asks the signed feed whether the small tuned drafter is listed (it lists the size the launch fetches)
             plan = runner.plan()
             plan["warnings"] = [n.line() for n in notes]
             if machine:

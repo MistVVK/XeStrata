@@ -97,7 +97,8 @@
      "700"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": [
      "[strata] Drafting: MTP (the DFlash2 drafter isn't downloaded yet)"
@@ -210,7 +211,8 @@
      "0.35"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)",
@@ -351,7 +353,8 @@
      "0.35"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)",
@@ -477,7 +480,8 @@
      "0.35"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)",

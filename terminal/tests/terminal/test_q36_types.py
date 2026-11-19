@@ -65,7 +65,10 @@ class MirrorEqualsTheEngine(unittest.TestCase):
         eng = (ROOT.parent / "engine" / "src" / "qwen35" / "q36_engine.cu").read_text(encoding="utf-8", errors="replace")
         up = eng[eng.index("float* upload_f32("):]
         up = up[:up.index("std::exit(1)")]
-        self.assertEqual({int(x) for x in re.findall(r"t\.type == (\d+)", up)}, set(q36_types.VECTOR))
+        seen = {int(x) for x in re.findall(r"t\.type == (\d+)", up)}
+        for lo, hi in re.findall(r"t\.type >= (\d+) && t\.type <= (\d+)", up):      # #3925: Q3_K..Q6_K are a range in the source
+            seen |= set(range(int(lo), int(hi) + 1))
+        self.assertEqual(seen, set(q36_types.VECTOR))
         self.assertIn('-DSTRATA_Q6K_EXPERTS=ON', (ROOT.parent / "tools" / "packaging" / "build_cuda_linux.sh").read_text(encoding="utf-8"))
 
     def test_every_name_the_loader_reads_is_classified(self):
@@ -96,9 +99,9 @@ class CatalogSets(unittest.TestCase):
     def test_a_type_the_engine_cannot_run_is_refused(self):
         types = table(FIXTURES[-1])
         down = next(n for n in types if n.endswith("ffn_down_exps.weight"))
-        self.assertTrue(q36_types.problems({**types, down: 12}))             # Q4_K is no down type of the expert kernels
+        self.assertTrue(q36_types.problems({**types, down: 11}))             # Q3_K is no down type of the expert kernels
         norm = next(n for n in types if n.endswith("attn_norm.weight"))
-        self.assertTrue(q36_types.problems({**types, norm: 12}))             # a norm the f32 loader cannot widen
+        self.assertTrue(q36_types.problems({**types, norm: 2}))             # a norm the f32 loader cannot widen (Q4_0)
         gate = next(n for n in types if n.endswith("ffn_gate_exps.weight"))
         self.assertTrue(q36_types.problems({**types, gate: 13}))             # gate and up must be one type
 
@@ -134,7 +137,7 @@ class Importer(unittest.TestCase):
     def test_an_unsupported_quant_is_refused_with_the_existing_words(self):
         types = self.small_table()
         down = next(n for n in types if n.endswith("ffn_down_exps.weight"))
-        plan = models.plan_import(str(self.put("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", {**types, down: 12})))
+        plan = models.plan_import(str(self.put("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", {**types, down: 11})))
         self.assertIsNone(plan["candidate_selection"])
         self.assertIn("unsupported_or_missing_architecture", plan["issues"])
         self.assertIn(models.UNSUPPORTED_MODEL_TYPE, plan["messages"])

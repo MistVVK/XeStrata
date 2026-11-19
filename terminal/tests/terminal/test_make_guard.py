@@ -5,6 +5,7 @@ nvidia-smi made detection say cuda. Three guards, all tested here with faked har
   3. the stage step refuses a package of another make even if a decision slipped it through."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -37,19 +38,53 @@ FEED = SimpleNamespace(engine=[package("cuda", "cuda13", ("sm_75", "sm_86", "sm_
 
 
 class Detection(unittest.TestCase):
-    def detect(self, adapters, tools=("nvidia-smi",)):
+    def detect(self, adapters, tools=("nvidia-smi",), store_smi=None):
         def fake_run(command, **kw):
             return subprocess.CompletedProcess(command, 0, stdout="NVIDIA GeForce RTX 3060\n", stderr="")
         with mock.patch.object(ec.os, "name", "nt"), mock.patch.object(ec, "host_platform", return_value=WIN), \
                 mock.patch.object(ec.shutil, "which", lambda name: name if name in tools else None), \
+                mock.patch.object(ec, "_driver_store_smi", return_value=store_smi), \
                 mock.patch.object(ec.subprocess, "run", fake_run), mock.patch.object(ec, "windows_display_adapters", return_value=adapters):
             return ec.detect_backend({})
+
+    def test_a_gpu_pv_guest_whose_nvidia_smi_is_only_in_the_driver_store_is_found(self):
+        # #4718: no PATH entry, nvidia-smi.exe sits in HostDriverStore\FileRepository\nv_dispi.inf_amd64_*\
+        virtual = [{"vendor": "1414", "device": 0x8E, "name": "Microsoft Virtual Render Driver", "vram_gb": 0.0}]
+        store = r"C:\Windows\System32\HostDriverStore\FileRepository\nv_dispi.inf_amd64_x\nvidia-smi.exe"
+        self.assertEqual(self.detect(virtual, tools=(), store_smi=store), ("cuda", "nvidia-smi"))
+
+    def test_the_driver_store_lookup_takes_the_newest_nvidia_smi_and_none_when_there_is_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(ec._driver_store_smi(tmp))
+            old = Path(tmp, "nv_dispi.inf_amd64_old", "nvidia-smi.exe")
+            new = Path(tmp, "nv_dispi.inf_amd64_new", "nvidia-smi.exe")
+            other = Path(tmp, "amd_dispi.inf_amd64_x", "nvidia-smi.exe")
+            for index, path in enumerate((old, new, other)):
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b"x")
+                os.utime(path, (1_000_000 + index * 100, 1_000_000 + index * 100))
+            os.utime(old, (1_000_000, 1_000_000))
+            os.utime(new, (2_000_000, 2_000_000))
+            self.assertEqual(ec._driver_store_smi(tmp), str(new))
 
     def test_a_leftover_nvidia_smi_does_not_make_an_amd_pc_cuda(self):
         self.assertEqual(self.detect(R9700_ONLY), ("hip", "display adapters"))
 
     def test_a_leftover_nvidia_smi_beside_only_an_integrated_radeon_is_not_believed_either(self):
         self.assertEqual(self.detect(AMD_IGPU_ONLY), (None, "no GPU tool answered"))
+
+    def test_a_hyper_v_gpu_pv_guest_with_only_a_virtual_adapter_asks_nvidia_smi(self):
+        # #4718: the guest lists "Microsoft Virtual Render Driver" (vendor 1414) and nothing else; nvidia-smi inside it names the card
+        virtual = [{"vendor": "1414", "device": 0x8E, "name": "Microsoft Virtual Render Driver", "vram_gb": 0.0}]
+        self.assertEqual(self.detect(virtual), ("cuda", "nvidia-smi"))
+
+    def test_a_virtual_adapter_with_no_tool_answering_still_says_no_gpu(self):
+        virtual = [{"vendor": "1414", "device": 0x8E, "name": "Microsoft Virtual Render Driver", "vram_gb": 0.0}]
+        self.assertEqual(self.detect(virtual, tools=()), (None, "no GPU tool answered"))
+
+    def test_a_virtual_adapter_beside_an_integrated_radeon_does_not_make_nvidia_smi_believed(self):
+        both = [{"vendor": "1414", "device": 0x8E, "name": "Microsoft Virtual Render Driver", "vram_gb": 0.0}] + AMD_IGPU_ONLY
+        self.assertEqual(self.detect(both), (None, "no GPU tool answered"))
 
     def test_an_nvidia_pc_is_still_cuda(self):
         self.assertEqual(self.detect(NVIDIA_ONLY), ("cuda", "display adapters"))

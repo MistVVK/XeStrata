@@ -95,11 +95,17 @@ class RunEndsWithSetup(unittest.TestCase):
         with mock.patch.object(setup.subprocess, "run", fake_subprocess_run), mock.patch.object(setup, "say", lambda *a, **k: None), \
                 mock.patch.object(setup.acquisition, "require", lambda *a, **k: None):
             setup.run([sys.executable, "x.py"])
-            self.assertEqual(seen["env"]["STRATA_EXIT_WITH_PARENT"], "1")
+            self.assertEqual(seen["env"]["STRATA_EXIT_WITH_PARENT"], str(os.getpid()),
+                             "setup names the id a tool should follow: its own, not 1, because a venv launcher on Windows "
+                             "would be watched in its place (tools/mtp_fetch.py exit_with_parent)")
             self.assertIn("PATH", seen["env"] if os.name != "nt" else {k.upper(): v for k, v in seen["env"].items()})
             setup.run([sys.executable, "x.py"], env={"B": "2", "STRATA_EXIT_WITH_PARENT": "0"})
             self.assertEqual(seen["env"]["STRATA_EXIT_WITH_PARENT"], "0", "a value the caller set is kept")
             self.assertEqual(seen["env"]["B"], "2")
+            setup.run([sys.executable, "x.py"], env={"STRATA_EXIT_WITH_PARENT": "1"})
+            self.assertEqual(seen["env"]["STRATA_EXIT_WITH_PARENT"], str(os.getpid()),
+                             "the desktop app hands setup the legacy \"1\", and passing it on would make the tool watch its "
+                             "launcher instead of setup; setup is the one that knows its own id")
 
 
 class GyroLowRam(U.Base):

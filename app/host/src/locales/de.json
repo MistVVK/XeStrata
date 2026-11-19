@@ -3571,5 +3571,7 @@
   "s9136": "Maximal",
   "s9137": "2K",
   "s9138": "8K",
-  "s9139": "32K"
+  "s9139": "32K",
+  "s9140": "Beide Karten sind {0}, also gleich: eine ist die Hauptkarte, die andere hilft.",
+  "s9141": "Alle {0} Karten sind {1}, also gleich: eine ist die Hauptkarte, die anderen helfen."
 }

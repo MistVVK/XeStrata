@@ -238,13 +238,22 @@ def lock_folder(out, wait=900.0):
 
 
 def exit_with_parent():
-    """STRATA_EXIT_WITH_PARENT=1 (set by setup.py for the tools it runs): end when the process that started this one ends, so a cancelled
-    or killed setup does not leave a download running on its own (#3257: taskkill /T does not reach a grandchild whose parent is gone)."""
-    if (os.environ.get("STRATA_EXIT_WITH_PARENT") or "").strip() != "1":
+    """STRATA_EXIT_WITH_PARENT (set by setup.py to its own process id, and by the desktop shell to 1): end when the process that started
+    this one ends, so a cancelled or killed setup does not leave a download running on its own (#3257: taskkill /T does not reach a
+    grandchild whose parent is gone).  A number is the id to watch.  "1" means "whoever started me", read as our parent id, and is what
+    a spawner with nothing between us and the child should keep using: a venv's python.exe on Windows is a launcher that runs the real
+    interpreter as its own child, so there getppid() names a stub that lives exactly as long as we do, and a spawner that wants to be
+    followed has to say which id it is."""
+    raw = (os.environ.get("STRATA_EXIT_WITH_PARENT") or "").strip()
+    if raw == "1":                                          # "whoever started me": read the sentinel before the digits,
+        parent = os.getppid()                               # else "1" parses as pid 1 and the watch never arms at all
+    elif raw.isdigit():
+        parent = int(raw)
+    else:
         return
-    parent = os.getppid()
-    if parent <= 1:
+    if parent <= 1 or parent == os.getpid():                 # watching our own id would never end, and never fire
         return
+    direct = os.getppid()
     if os.name == "nt":
         import ctypes
         k32 = ctypes.windll.kernel32
@@ -255,7 +264,15 @@ def exit_with_parent():
             return                                           # no access (or already gone): nothing to watch
         gone = lambda: k32.WaitForSingleObject(h, 0) == 0
     else:
-        gone = lambda: os.getppid() != parent
+        def _alive(pid):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True                                  # it exists; it is not ours to signal
+            return True
+        gone = lambda: os.getppid() != direct or not _alive(parent)
 
     def watch():
         while not gone():
@@ -496,11 +513,16 @@ def verify(out):
 
 
 def main():
+    global REPO
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["inventory", "fetch", "verify"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--only")
+    ap.add_argument("--repo", help="the BF16 checkpoint's resolve base URL to read the MTP tensors from (default: the pinned Qwen/Qwen3.8-Flash-Next revision); "
+                                   "a finetune that keeps them in its own repo, e.g. https://huggingface.co/<user>/<finetune>/resolve/main/ - its tensors are not checked against the pinned SHA256")
     a = ap.parse_args()
+    if a.repo:
+        REPO = a.repo if a.repo.endswith("/") else a.repo + "/"
     if a.cmd == "verify":                           # offline: the hashes are the pinned revision's
         bad = verify(a.out)
         for name in bad:

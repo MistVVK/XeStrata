@@ -210,6 +210,17 @@ def extract_json(text: str) -> str:
     start = s.find("{")
     if start == -1:
         return s
+    for i, ch in enumerate(s[:start]):
+        if ch != "[":
+            continue
+        if not s[i + 1:start].replace("[", "").strip():
+            return s[i:]
+        try:
+            value, end = json.JSONDecoder().raw_decode(s, i)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(value, list) and end > start:
+            return s[i:end]
     depth = 0
     in_str = False
     esc = False

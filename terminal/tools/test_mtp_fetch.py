@@ -13,6 +13,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -346,38 +347,73 @@ class OneAtATime(unittest.TestCase):
             first.close()
             M.lock_folder(d).close()                     # free again once the first ends
 
-    def test_a_download_ends_with_the_process_that_started_it(self):
-        """#3257: setup killed, its child must not go on: a grandchild whose parent is gone."""
-        import subprocess
-        import time
-        child_code = ("import sys,time; sys.path.insert(0, %r); import mtp_fetch as M; M.exit_with_parent(); "
-                      "print('up', flush=True); time.sleep(60)" % str(ROOT / "tools"))
-        parent_code = ("import subprocess,sys,os; env=dict(os.environ, STRATA_EXIT_WITH_PARENT='1'); "
-                       "p=subprocess.Popen([sys.executable,'-c',%r], env=env, stdout=subprocess.PIPE, text=True); "
-                       "print(p.pid, flush=True); p.stdout.readline(); print('ready', flush=True); sys.stdout.flush(); os._exit(0)" % child_code)
+    def _spawn_parent_that_exits(self, flag_expr):
+        """Start a parent that starts a child, tells us the child's own pid, and then ends hard.
+
+        ``flag_expr`` is the expression the *parent* evaluates to build the flag, so it can name the
+        parent's own id ("os.getpid()", as setup.py does) or the shell's literal ("1").
+
+        The child is what stands in for a setup download; it prints its own process id, because a venv's
+        python.exe on Windows is a launcher that spawns the interpreter, so the id Popen reports is not the
+        id of the process that runs the code.  Returns (child pid, whether a launcher sits between us).
+        """
+        interp = getattr(sys, "_base_executable", None) or sys.executable
+        child_code = ("import sys,time,os; sys.path.insert(0, %r); import mtp_fetch as M; M.exit_with_parent(); "
+                      "print('pid', os.getpid(), flush=True); print('up', flush=True); time.sleep(60)" % str(ROOT / "tools"))
+        parent_code = ("import subprocess,sys,os,time; env=dict(os.environ, STRATA_EXIT_WITH_PARENT=str(%s)); "
+                       "p=subprocess.Popen([%r,'-c',%r], env=env, stdout=subprocess.PIPE, text=True); "
+                       "print('spawned', p.pid, flush=True); print(p.stdout.readline().strip(), flush=True); "
+                       "print(p.stdout.readline().strip(), flush=True); sys.stdout.flush(); time.sleep(1); os._exit(0)"
+                       % (flag_expr, interp, child_code))
         r = subprocess.Popen([sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True)
-        pid = int(r.stdout.readline())
-        r.stdout.readline()
+        spawned = int(r.stdout.readline().split()[1])
+        child_pid = int(r.stdout.readline().split()[1])
+        self.assertEqual(r.stdout.readline().strip(), "up", "the child never armed its parent watch")
         r.wait(30)
-        end = time.time() + 15
-        alive = True
-        while time.time() < end and alive:
+        r.stdout.close()                                      # otherwise the harness leaks a pipe handle
+        return child_pid, (child_pid != spawned)
+
+    @staticmethod
+    def _alive(pid):
+        import subprocess
+        if os.name == "nt":
+            out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid], capture_output=True, text=True).stdout
+            return str(pid) in out
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def _wait_for_exit(self, pid, seconds=15):
+        import time
+        end = time.time() + seconds
+        while time.time() < end and self._alive(pid):
             time.sleep(0.5)
-            if os.name == "nt":
-                out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid], capture_output=True, text=True).stdout
-                alive = str(pid) in out
-            else:
-                try:
-                    os.kill(pid, 0)
-                    alive = True
-                except OSError:
-                    alive = False
-        if alive:
+        alive = self._alive(pid)
+        if alive:                                              # do not leave a 60-second sleeper behind
             if os.name == "nt":
                 subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
             else:
                 os.kill(pid, 9)
-        self.assertFalse(alive, "the download kept running after its parent ended")
+        return alive
+
+    def test_a_download_ends_with_the_process_that_started_it(self):
+        """#3257: setup killed, its child must not go on.  setup.py passes its own id, which is the one the
+        watcher has to follow: a venv launcher would otherwise be watched in its place."""
+        child_pid, stub = self._spawn_parent_that_exits("os.getpid()")
+        self.assertFalse(self._wait_for_exit(child_pid),
+                         "the download kept running after the process that started it ended")
+
+    def test_the_shell_style_flag_still_follows_a_direct_parent(self):
+        """STRATA_EXIT_WITH_PARENT=1 means "whoever started me" and is what the desktop app hands down; it has to
+        keep arming a watch.  The child is started with the base interpreter so nothing sits between the two
+        processes here, which is the case where "1" is the correct thing to pass.  Guards the order of the checks
+        in exit_with_parent: "1".isdigit() is true, so reading digits first turns "1" into pid 1 and arms nothing."""
+        child_pid, stub = self._spawn_parent_that_exits("1")
+        self.assertFalse(stub, "the base interpreter was expected to start with no launcher in between")
+        self.assertFalse(self._wait_for_exit(child_pid),
+                         "the download kept running after its direct parent ended")
 
 
 if __name__ == "__main__":

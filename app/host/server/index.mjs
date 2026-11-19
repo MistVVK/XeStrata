@@ -10,6 +10,7 @@ import { saveSnapshot } from './snapshot.mjs';
 import { resolvePython, shellPrefix } from './python-resolver.mjs';
 import { chooseFolder, chooserUnavailable, typedFolder } from './folder-dialog.mjs';
 import { createLocalShare } from './local-share.mjs';
+import { workspaceBases } from './model-directory-default.mjs';
 import { createTaskService, validateTask } from './tasks.mjs';
 import { createAgentTaskRunner } from './agent/task-run.mjs';
 import { migrateSetup } from './setup.mjs';
@@ -111,7 +112,7 @@ const HOST = process.env.STRATA_BIND ?? '127.0.0.1';
 function defaultWorkspace() {
   if (process.env.STRATA_WORKSPACE) return resolve(process.env.STRATA_WORKSPACE);
   const user = process.env.USERPROFILE ?? process.env.HOME ?? homedir();
-  for (const base of [join(user, 'Documents'), user]) {
+  for (const base of workspaceBases(user)) {                // #3749: the Documents folder the models folder uses
     const dir = join(base, 'Strata', 'Workspace');
     try { mkdirSync(dir, { recursive: true }); return dir; } catch { /* try the next place */ }
   }
@@ -321,6 +322,9 @@ function setupState() {
 const CREATED_SKILLS = join(store.DATA_DIR, 'skills');
 /** What the agent scans: the whole current list, written out by syncAgentSkills (the Harness watches it, so no restart). */
 const AGENT_SKILLS = join(store.DATA_DIR, 'agent', 'skills-live');
+/** Skill id -> the folder a written or added skill lives in, so the files beside its SKILL.md go to the agent too (#6245). Kept here, not on the
+ *  skill, which the page receives. */
+const skillFolders = new Map();
 
 function skills() {
   const bundled = [
@@ -398,6 +402,7 @@ for the choice being made.`,
   // Two places hold skills a person brought or wrote: the app's own folder (written in the Skills page) and the workspace's skills folder (added
   // with "Add skill"). Both are plain `<name>/SKILL.md` folders; the frontmatter (name, description) is optional.
   const extra = [];
+  skillFolders.clear();
   for (const [dir, source, prefix] of [[CREATED_SKILLS, 'created', 'my-'], [join(WORKSPACE, 'skills'), 'workspace', 'ws-']]) {
     if (!existsSync(dir) || !statSync(dir).isDirectory()) continue;
     for (const name of readdirSync(dir)) {
@@ -407,6 +412,7 @@ for the choice being made.`,
       const md = join(full, 'SKILL.md');
       try { text = readFileSync(md, 'utf8'); sizeKb = Math.max(0.1, statSync(md).size / 1024); } catch { /* a folder with no SKILL.md is listed but has nothing to show */ }
       const parsed = parseSkillFile(text);
+      skillFolders.set(`${prefix}${name}`, full);
       extra.push({
         id: `${prefix}${name}`,
         name: parsed.title ?? name.replace(/-/g, ' ').replace(/^./, c => c.toUpperCase()),
@@ -438,7 +444,7 @@ let skillState = skills().map((s) => ({
  * switched off is written as hidden. Called after every change to the list.
  */
 function syncAgentSkills() {
-  try { materializeSkills(AGENT_SKILLS, skillState.filter(s => !s.onlyIn)); } catch (e) { console.warn('skills · could not write the agent skills folder:', e.message); }
+  try { materializeSkills(AGENT_SKILLS, skillState.filter(s => !s.onlyIn), skillFolders); } catch (e) { console.warn('skills · could not write the agent skills folder:', e.message); }
 }
 syncAgentSkills();
 

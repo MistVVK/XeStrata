@@ -18,8 +18,7 @@
 //
 // All functions take a hipStream_t first, device pointers, and are asynchronous on that stream (no allocation inside, no sync).
 #pragma once
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
+#include "hy4_gpu.h"
 
 #include <cstddef>
 #include <cstdint>

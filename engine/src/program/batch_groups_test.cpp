@@ -260,6 +260,16 @@ int main() {
     check(bg::pipe_adapt_next(0, 96, 96) == 0 && bg::pipe_adapt_next(32, 96, 0) == 32,
           "pipe adapt auto: nothing to adjust when the rounds or the swaps are off");
 
+    // STRATA_SLOT_READ_WIDE / STRATA_SLOT_READ_AHEAD (#5866, #5868): off unless set, and only beside what they build on
+    check(!bg::switch_on(nullptr) && !bg::switch_on("") && !bg::switch_on("0") && bg::switch_on("1") && bg::switch_on("2"),
+          "slot read switches: unset, empty and 0 are off");
+    check(!bg::slot_read_wide_on(nullptr, nullptr) && !bg::slot_read_wide_on("1", nullptr) && !bg::slot_read_wide_on(nullptr, "1") &&
+          !bg::slot_read_wide_on("0", "1") && !bg::slot_read_wide_on("1", "0") && bg::slot_read_wide_on("1", "1"),
+          "slot read wide: only with the slot read and its own switch");
+    check(!bg::slot_read_ahead_on("1", "1", nullptr) && !bg::slot_read_ahead_on("1", nullptr, "1") && !bg::slot_read_ahead_on(nullptr, "1", "1") &&
+          !bg::slot_read_ahead_on("1", "1", "0") && bg::slot_read_ahead_on("1", "1", "1"),
+          "slot read ahead: only with the slot read, the wide read and its own switch");
+
     std::printf("%s\n", g_fail == 0 ? "batch_groups_test: all passed" : "batch_groups_test: FAILED");
     return g_fail == 0 ? 0 : 1;
 }

@@ -40,5 +40,6 @@ jobs:
       - name: Configure
         run: |
           cmake -S engine/metal -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DMETAL_CPP_DIR="$PWD/_mcpp/metal-cpp"      - name: Build and link the engine
+            -DMETAL_CPP_DIR="$PWD/_mcpp/metal-cpp"
+      - name: Build and link the engine
         run: cmake --build build-metal --target strata

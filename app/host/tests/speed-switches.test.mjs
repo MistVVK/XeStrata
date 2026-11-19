@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SPEED_SWITCHES as ALL_SWITCHES, speedSwitchApplies, speedSwitchIsSet, speedSwitchIsOn, speedSwitchRows as allRows, setSpeedSwitch, validateNativeSettings, publicNativeEnv, restoreNativeEnv } from '../server/native-settings.mjs';
-/* 0.2.16: the route tail skip is a choice (Automatic / Off / 1-9), not an On / Off switch; tail-skip-choice.test.mjs tests it. These tests are the two-state rows. */
+/* 0.2.16: the route tail skip is a choice (0.2.17: Off by default / On = 7 / ranks 1-9), not an On / Off switch; tail-skip-choice.test.mjs tests it. These tests are the two-state rows. */
 const SPEED_SWITCHES = ALL_SWITCHES.filter(s => !s.choices);
 const speedSwitchRows = (env, context) => allRows(env, context).filter(s => !s.choices);
 import { nativeFixture } from './helpers/native-fixture.mjs';

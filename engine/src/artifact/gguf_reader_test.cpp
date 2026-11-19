@@ -10,6 +10,9 @@
 //      end unpadded (unsloth's UD-Q5_K_XL shard 1 ends 6 bytes before its aligned data start; llama.cpp's
 //      gguf-py reads it); nothing is ever read from its data section.
 //   4. one tensor, and the file ends at its header: still refused at open ("data section starts past EOF").
+//   5. a tensor name whose length is near 2^64: refused as a truncated header.  The bounds check was
+//      `pos + n > size`, which wraps for such an n and let the read go on (std::string then threw
+//      length_error, so nothing was read out of bounds, but only by luck).
 //
 // The fixture is a minimal GGUF v3 written here (header, no metadata, two F32[8] tensors, 32-byte
 // alignment), so the test needs neither gguf-py nor a shard.  The file is closed before it is removed:
@@ -123,6 +126,27 @@ int main() {
         std::filesystem::remove(path);
         check(err.find("data section starts past EOF") != std::string::npos,
               "one tensor, ends before the aligned data start: refused at open");
+    }
+    {
+        std::vector<uint8_t> b;
+        put<uint32_t>(b, 0x46554747u);
+        put<uint32_t>(b, 3);
+        put<uint64_t>(b, 1);                       // n_tensors
+        put<uint64_t>(b, 0);                       // n_kv
+        put<uint64_t>(b, UINT64_MAX - 15);         // the name's length: pos (32) + it wraps to 16
+        b.resize(64, 0);
+        const auto path = std::filesystem::temp_directory_path() / "strata_gguf_reader_test.gguf";
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize)b.size());
+        std::string err;
+        try {
+            strata::GgufFile g(path.string());
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        std::filesystem::remove(path);
+        check(err.find("unexpected end of file in header") != std::string::npos,
+              "a name length near 2^64: refused as a truncated header");
+        if (err.find("unexpected end of file in header") == std::string::npos) std::printf("  (%s)\n", err.c_str());
     }
     std::printf(g_fail ? "gguf_reader_test: %d FAILED\n" : "gguf_reader_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;

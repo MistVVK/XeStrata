@@ -197,6 +197,22 @@ export function fromLegacy(gpu: unknown, cards: RoleCard[], gpuOrder?: string | 
 
 export const sameRoles = (a: Roles, b: Roles) => { const ka = byNumber(a), kb = byNumber(b); return ka.length === kb.length && ka.every((k, n) => k === kb[n] && a[k] === b[k]); };
 
+/**
+ * #6117: the roles a model's run config (gpu_roles) holds for these cards, or null when it holds none, names a card this PC does not have, or has no usable
+ * Main. A Load that asks for the recommendation keeps what the file names (the Terminal's choice stays), so the Models page shows these roles instead of the
+ * recommendation: the box says what the Load will do.
+ */
+export function savedRoles(saved: Record<string, string> | null | undefined, cards: RoleCard[]): Roles | null {
+  if (!saved || typeof saved !== 'object' || cards.length < 2) return null;
+  const roles: Roles = {};
+  for (const c of cards) {
+    const role = saved[c.index];
+    if (role !== 'main' && role !== 'helper' && role !== 'off') return null;
+    roles[c.index] = role;
+  }
+  return cards.filter(c => roles[c.index] === 'main').length === 1 ? normalize(roles, cards) : null;
+}
+
 export interface RoleWarning { code: 'igpu_main' | 'cannot_run' | 'low_memory' | 'cpu_only'; card: number | null; text: string; fix: { card: number; role: Role } | null }
 
 /** One short line each, only what a person could not know. Never blocking. */
@@ -243,9 +259,16 @@ export function sentence(cards: RoleCard[] | null | undefined, vendor?: string |
   const m = byi.get(rec.main)!;
   if (cs.length === 1) return `Strata will use your ${shortName(m)}.`;
   const why = { same: 'the cards are alike', memory: 'it has more memory', faster: 'it is faster', only: 'it is the only card', none: '' }[rec.why];
-  let s = `${shortName(m)} is Main: ${why}.`;
   const helpers = byNumber(rec.roles).filter(i => rec.roles[i] === 'helper').map(i => shortName(byi.get(i)!));
-  if (helpers.length) s += ` ${helpers.join(' and ')} ${helpers.length > 1 ? 'help' : 'helps'}.`;
+  let s: string;
+  if (helpers.length && rec.why === 'same' && helpers.every(h => h === shortName(m))) {
+    // 0217 item 12 (the same words as the Terminal, strata_control/gpu_roles.py): alike cards are said once, not as "A is Main: the cards are alike. A helps."
+    const n = helpers.length + 1;
+    s = n === 2 ? `Both cards are ${shortName(m)}, so they are alike: one is Main and the other helps.` : `All ${n} cards are ${shortName(m)}, so they are alike: one is Main and the others help.`;
+  } else {
+    s = `${shortName(m)} is Main: ${why}.`;
+    if (helpers.length) s += ` ${helpers.join(' and ')} ${helpers.length > 1 ? 'help' : 'helps'}.`;
+  }
   for (const i of byNumber(rec.roles)) if (rec.roles[i] === 'off') {
     const code = rec.reasons[i], c = byi.get(i)!;
     s += ` ${shortName(c)} starts Off: ${code === 'cannot_run' ? 'Strata cannot run it.' : code === 'igpu' ? 'built-in graphics.' : `${OFF_AT_OR_BELOW_GB} GB or less.`}`;

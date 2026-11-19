@@ -273,11 +273,12 @@ class MockedInstall(unittest.TestCase):
         code, out, cfg, _ = self.run_install("96GB-1x16GB")    # 68 GB of experts + 10 GB beside them fit 95.8
         self.assertEqual(code, 0, out[-2000:])
         self.assertFalse({"--mmap-experts", "--resident-experts"} & set(cfg["args"]))
-        code, out, cfg, _ = self.run_install("64GB-1x32GB")    # 64 GB: the RAM-budget mode (RAM less 24 GB)
+        code, out, cfg, _ = self.run_install("64GB-1x32GB")    # 64 GB: the RAM-budget mode (RAM less 17 GB)
         self.assertEqual(code, 0, out[-2000:])
         a = cfg["args"]
         self.assertFalse({"--mmap-experts", "--resident-experts"} & set(a))
-        self.assertEqual(a[a.index("--resident-budget-gib") + 1], "40")
+        self.assertEqual(a[a.index("--resident-budget-gib") + 1], "47")
+        self.assertEqual(cfg["ui_budget_work_gib"], 40)    # 0.2.17: what "Leave 20% for my work" keeps (the RAM less 24)
 
     def test_amd_is_refused_with_a_recommendation(self):
         import test_setup_golden as G

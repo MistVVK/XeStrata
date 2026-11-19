@@ -37,14 +37,16 @@ inline size_t moe_ws_bytes(int M) {
 namespace skd {
 
 // ---------------------------------------------------------------- routing (single block, counting sort by expert)
-__global__ void __launch_bounds__(512) k_moe_route(const int32_t* __restrict__ idx, int P, int* __restrict__ cnt, int* __restrict__ off, int* __restrict__ pairs,
+__global__ void __launch_bounds__(512) k_moe_route(const ExpertDev* __restrict__ ex, const int32_t* __restrict__ idx, int P, int* __restrict__ cnt, int* __restrict__ off, int* __restrict__ pairs,
                                                     int* __restrict__ active, int* __restrict__ nact) {
     __shared__ int c[512], sc[512], fl[512], fill[512];
     const int t = threadIdx.x;
     c[t] = 0;
     fill[t] = 0;
     __syncthreads();
-    for (int i = t; i < P; i += 512) atomicAdd(&c[idx[i]], 1);
+    // experts flagged pad != 0 live on the CPU (hybrid placement): their pairs are not evaluated here
+    for (int i = t; i < P; i += 512)
+        if (!ex[idx[i]].pad) atomicAdd(&c[idx[i]], 1);
     __syncthreads();
     const int cv = c[t];
     const int f = cv > 0;
@@ -69,6 +71,7 @@ __global__ void __launch_bounds__(512) k_moe_route(const int32_t* __restrict__ i
     __syncthreads();
     for (int i = t; i < P; i += 512) {
         const int e = idx[i];
+        if (ex[e].pad) continue;
         const int pos = atomicAdd(&fill[e], 1);
         pairs[sc[e] + pos] = i;
     }
@@ -173,7 +176,7 @@ template <int A, int B> struct cmin { static constexpr int v = A < B ? A : B; };
 template <int MT>
 __global__ void __launch_bounds__(256) k_moe_gu_dec(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ ex, const __half* __restrict__ z,
                                                      const int* __restrict__ cnt, const int* __restrict__ off, const int* __restrict__ pairs,
-                                                     const int* __restrict__ active, const int* __restrict__ nact, __half* __restrict__ h2) {
+                                                     const int* __restrict__ active, const int* __restrict__ nact, __half* __restrict__ h2, const float* __restrict__ zf) {
     if ((int)blockIdx.y >= *nact) return;
     const int e = active[blockIdx.y];
     const int n = cnt[e], base = off[e];
@@ -182,7 +185,16 @@ __global__ void __launch_bounds__(256) k_moe_gu_dec(const uint8_t* __restrict__ 
     for (int i = threadIdx.x; i < MT * 192; i += 256) {
         const int m = i / 192, c = i - m * 192;
         uint4 v = make_uint4(0, 0, 0, 0);
-        if (m < n) v = *(const uint4*)(z + (size_t)(pairs[base + m] >> 4) * MOE_D + c * 8);
+        if (m < n) {
+            if (zf) {  // fp32 latent z (the router-side down projection output): converted here, same rounding as a separate fp32 -> fp16 pass
+                const float* zp = zf + (size_t)(pairs[base + m] >> 4) * MOE_D + c * 8;
+                const float4 a = *(const float4*)zp, b = *(const float4*)(zp + 4);
+                v.x = h2_pack(a.x, a.y);
+                v.y = h2_pack(a.z, a.w);
+                v.z = h2_pack(b.x, b.y);
+                v.w = h2_pack(b.z, b.w);
+            } else v = *(const uint4*)(z + (size_t)(pairs[base + m] >> 4) * MOE_D + c * 8);
+        }
         xs[i] = v;
     }
     __syncthreads();
@@ -226,11 +238,190 @@ __global__ void __launch_bounds__(256) k_moe_dn_dec(const uint8_t* __restrict__ 
     else dn_dec_rows<MT>(ed, dn, r0, xs, lane, n, base, pairs, topk_w, y);
 }
 
+// ---------------------------------------------------------------- one-token decode (M = 1) kernels, "slot record" path
+// With one token the 16 slots are the 16 chosen experts: no counting sort, no per-expert token lists. The router kernel copies the 16 ExpertDev records of the chosen experts into a
+// 16-entry table (rec[slot]); gu / dn read rec[blockIdx.y] directly. Blocks issue their weight loads before the activation tile goes through LDS, so the DRAM latency of the weights
+// overlaps the tile load and barrier (S2..S8 only; S1.25 / S1.5 experts take the generic path). Same arithmetic as k_moe_gu_dec<1> / k_moe_dn_dec<1> (bit-identical).
+template <int FMT>
+struct RowRaw {
+    uint32_t a[6], b[6], d[6], ub[6];
+};
+template <int FMT>
+__device__ __forceinline__ void row_raw_load(const uint8_t* rp, int lane, RowRaw<FMT>& r) {
+    constexpr int SB = sk_sb_bytes(FMT);
+#pragma unroll
+    for (int s = 0; s < 6; ++s) {
+        const uint8_t* blk = rp + s * SB;
+        r.d[s] = ld16(blk);
+        r.ub[s] = blk[2 + (lane >> 3)];
+        load_q_raw<FMT>(blk + 6, lane, r.a[s], r.b[s]);
+    }
+}
+template <int FMT>
+__device__ __forceinline__ float row_raw_dot(const RowRaw<FMT>& r, const uint4* xs, int lane) {
+    float acc = 0.f;
+#pragma unroll
+    for (int s = 0; s < 6; ++s) {
+        const float eff = h2f_bits((uint16_t)r.d[s]) * ((float)r.ub[s] * (1.0f / 255.0f));
+        uint32_t q[8], wp[4];
+        q_from_raw<FMT>(r.a[s], r.b[s], q);
+        w_from_q<FMT>(q, wp);
+        const uint4 xv = xs[s * 32 + lane];
+        float p = dot2f(wp[0], xv.x, 0.f);
+        p = dot2f(wp[1], xv.y, p);
+        p = dot2f(wp[2], xv.z, p);
+        p = dot2f(wp[3], xv.w, p);
+        acc += eff * p;
+    }
+    return acc;
+}
+
+__device__ __forceinline__ uint4 load_z8(const __half* z, const float* zf, int c) {  // 8 activations c*8.. as packed halves (fp32 source: converted, same rounding as k_f2h)
+    uint4 v;
+    if (zf) {
+        const float4 a = *(const float4*)(zf + c * 8), b = *(const float4*)(zf + c * 8 + 4);
+        v.x = h2_pack(a.x, a.y);
+        v.y = h2_pack(a.z, a.w);
+        v.z = h2_pack(b.x, b.y);
+        v.w = h2_pack(b.z, b.w);
+    } else v = *(const uint4*)(z + c * 8);
+    return v;
+}
+
+template <int FMT>
+__device__ __forceinline__ void gu1_fmt(const uint8_t* gu, int r, int y, const uint4 zv, uint4* xs, __half* h2, const __half* sqx) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int lane = threadIdx.x & 31;
+    RowRaw<FMT> g, u;
+    row_raw_load<FMT>(gu + (size_t)r * 6 * SB, lane, g);
+    row_raw_load<FMT>(gu + (size_t)(MOE_D + r) * 6 * SB, lane, u);
+    if (threadIdx.x < 192) xs[threadIdx.x] = zv;
+    __syncthreads();
+    float ag = row_raw_dot<FMT>(g, xs, lane), au = row_raw_dot<FMT>(u, xs, lane);
+    const float sq = __half2float(sqx[r]);
+#pragma unroll
+    for (int o = 16; o >= 1; o >>= 1) { ag += __shfl_xor(ag, o); au += __shfl_xor(au, o); }
+    if (lane == 0) {
+        const float sg = ag / (1.0f + expf(-ag));
+        const float hh = fminf(sg, 10.0f) * fminf(fmaxf(au, -10.0f), 10.0f);
+        h2[(size_t)y * MOE_D + r] = __float2half(hh / sq);
+    }
+}
+
+// grid (192, 16): block = 8 waves, wave = (gate row r, up row 1536 + r) of expert rec[blockIdx.y]
+__global__ void __launch_bounds__(256) k_moe_gu_dec1(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ rec, const __half* __restrict__ z, const float* __restrict__ zf,
+                                                      __half* __restrict__ h2) {
+    const int y = blockIdx.y;
+    const ExpertDev ed = rec[y];
+    __shared__ uint4 xs[192];
+    s125_lut_init();
+    uint4 zv = make_uint4(0, 0, 0, 0);
+    if (threadIdx.x < 192) zv = load_z8(z, zf, threadIdx.x);
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = blockIdx.x * 8 + wave;
+    const uint8_t* body = sec4 + ed.body_off;
+    const uint8_t* gu = body + 3072;
+    const __half* sqx = (const __half*)body;
+    switch (ed.gu_code) {
+        case FMT_S2: gu1_fmt<FMT_S2>(gu, r, y, zv, xs, h2, sqx); break;
+        case FMT_S3: gu1_fmt<FMT_S3>(gu, r, y, zv, xs, h2, sqx); break;
+        case FMT_S4: gu1_fmt<FMT_S4>(gu, r, y, zv, xs, h2, sqx); break;
+        case FMT_S5: gu1_fmt<FMT_S5>(gu, r, y, zv, xs, h2, sqx); break;
+        case FMT_S6: gu1_fmt<FMT_S6>(gu, r, y, zv, xs, h2, sqx); break;
+        case FMT_S8: gu1_fmt<FMT_S8>(gu, r, y, zv, xs, h2, sqx); break;
+        default:  // S1.25 / S1.5: generic path
+            if (threadIdx.x < 192) xs[threadIdx.x] = zv;
+            __syncthreads();
+            gu_dec_rows<1>(ed, body, r, xs, lane, 1, y, h2);
+            break;
+    }
+    (void)wave;
+}
+
+template <int FMT>
+__device__ __forceinline__ void dn1_fmt(const uint8_t* dn, int r0, int y, const uint4 hv, uint4* xs, const float* topk_w, float* yb) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int lane = threadIdx.x & 31;
+    RowRaw<FMT> a0, a1;
+    row_raw_load<FMT>(dn + (size_t)r0 * 6 * SB, lane, a0);
+    row_raw_load<FMT>(dn + (size_t)(r0 + 1) * 6 * SB, lane, a1);
+    if (threadIdx.x < 192) xs[threadIdx.x] = hv;
+    __syncthreads();
+    float v0 = row_raw_dot<FMT>(a0, xs, lane), v1 = row_raw_dot<FMT>(a1, xs, lane);
+#pragma unroll
+    for (int o = 16; o >= 1; o >>= 1) { v0 += __shfl_xor(v0, o); v1 += __shfl_xor(v1, o); }
+    if (lane == 0) {
+        const float w = topk_w[y];
+        yb[(size_t)y * MOE_D + r0] = v0 * w;
+        yb[(size_t)y * MOE_D + r0 + 1] = v1 * w;
+    }
+}
+
+// grid (96, 16): wave = 2 output rows of expert rec[blockIdx.y]; the last of the 16 slot blocks of a column block (ticket tk[blockIdx.x], self-resetting, zero-initialised once) adds the
+// 16 slots in slot order into z_out (fp32) and z_out_h (fp16): replaces k_moe_reduce for M = 1, deterministic.
+__global__ void __launch_bounds__(256) k_moe_dn_dec1(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ rec, const float* __restrict__ topk_w, const __half* __restrict__ h2,
+                                                      float* __restrict__ yb, float* __restrict__ z_out, __half* __restrict__ z_out_h, unsigned* __restrict__ tk) {
+    const int y = blockIdx.y;
+    const ExpertDev ed = rec[y];
+    __shared__ uint4 xs[192];
+    __shared__ int is_last;
+    s125_lut_init();
+    uint4 hv = make_uint4(0, 0, 0, 0);
+    if (threadIdx.x < 192) hv = *(const uint4*)(h2 + (size_t)y * MOE_D + threadIdx.x * 8);
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const uint8_t* dn = sec4 + ed.body_off + ed.dn_off;
+    const int r0 = (blockIdx.x * 8 + wave) * 2;
+    switch (ed.dn_code) {
+        case FMT_S2: dn1_fmt<FMT_S2>(dn, r0, y, hv, xs, topk_w, yb); break;
+        case FMT_S3: dn1_fmt<FMT_S3>(dn, r0, y, hv, xs, topk_w, yb); break;
+        case FMT_S4: dn1_fmt<FMT_S4>(dn, r0, y, hv, xs, topk_w, yb); break;
+        case FMT_S5: dn1_fmt<FMT_S5>(dn, r0, y, hv, xs, topk_w, yb); break;
+        case FMT_S6: dn1_fmt<FMT_S6>(dn, r0, y, hv, xs, topk_w, yb); break;
+        case FMT_S8: dn1_fmt<FMT_S8>(dn, r0, y, hv, xs, topk_w, yb); break;
+        default:
+            if (threadIdx.x < 192) xs[threadIdx.x] = hv;
+            __syncthreads();
+            {
+                // generic (S1.25 / S1.5) rows
+                const int rb = code_row_bytes(ed.dn_code, MOE_D);
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+                    float a[1] = {0.f};
+                    row_dot_sw<1>(ed.dn_code, dn + (size_t)(r0 + rr) * rb, xs, lane, a);
+                    float v = a[0];
+#pragma unroll
+                    for (int o = 16; o >= 1; o >>= 1) v += __shfl_xor(v, o);
+                    if (lane == 0) yb[(size_t)y * MOE_D + r0 + rr] = v * topk_w[y];
+                }
+            }
+            break;
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned prev = atomicAdd(&tk[blockIdx.x], 1u);
+        is_last = (prev == MOE_TOPK - 1);
+    }
+    __syncthreads();
+    if (!is_last) return;
+    __threadfence();
+    if (threadIdx.x < 16) {
+        const int r = blockIdx.x * 16 + threadIdx.x;
+        float a = 0.f;
+#pragma unroll
+        for (int s = 0; s < MOE_TOPK; ++s) a += *(volatile const float*)&yb[(size_t)s * MOE_D + r];
+        z_out[r] = a;
+        if (z_out_h) z_out_h[r] = __float2half(a);
+    }
+    if (threadIdx.x == 0) tk[blockIdx.x] = 0;
+}
+
+#if HY4_MMA
 // ---------------------------------------------------------------- WMMA grouped GEMMs (prefill and small verify windows)
 // Token tile BM = WM*MTW*16 (16, 32, 64 or 128): the kernel variant handles the experts whose token count n satisfies nlo < n <= nhi, so every expert
 // is processed with the smallest tile that covers it (a 128-token tile wastes 16x the matrix-core work on an expert that sees 8 tokens).
 template <int FMT, int WM, int MTW>
-__device__ __forceinline__ void gu_gemm_body(const uint8_t* body, int bx, int ty, int n, int base, const int* pairs, const __half* z, __half* h2, _Float16* ws) {
+__device__ __forceinline__ void gu_gemm_body(const uint8_t* body, int bx, int ty, int n, int base, const int* pairs, const __half* z, __half* h2, half_t* ws) {
     constexpr int SB = sk_sb_bytes(FMT);
     constexpr int BMT = WM * MTW * 16;
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
@@ -239,12 +430,12 @@ __device__ __forceinline__ void gu_gemm_body(const uint8_t* body, int bx, int ty
     const int drow = tid >> 2;
     const int wrow = drow < 32 ? bx * 32 + drow : bx * 32 + drow + (MOE_D - 32);
     const uint8_t* wr = body + 3072 + (size_t)wrow * 6 * SB;
-    const _Float16* xrow[MTW];
+    const half_t* xrow[MTW];
 #pragma unroll
     for (int i = 0; i < MTW; ++i) {
         int ml = ty * BMT + wm * MTW * 16 + i * 16 + (lane & 15);
         ml = ml < n ? ml : n - 1;
-        xrow[i] = (const _Float16*)z + (size_t)(pairs[base + ml] >> 4) * MOE_D;
+        xrow[i] = (const half_t*)z + (size_t)(pairs[base + ml] >> 4) * MOE_D;
     }
     fv8 acc[MTW][2];
     acc_zero(acc);
@@ -252,13 +443,13 @@ __device__ __forceinline__ void gu_gemm_body(const uint8_t* body, int bx, int ty
     gemm_mainloop_g<FMT, MTW, 2>(wr, 6, xrow, ws, acc, brow, active);
     if (!active) return;
     const __half* sqx = (const __half*)body;
-    const int c = bx * 32 + wn * 16 + (lane & 15);
-    const float sq = __half2float(sqx[c]);
 #pragma unroll
     for (int i = 0; i < MTW; ++i)
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
-            const int ml = ty * BMT + wm * MTW * 16 + i * 16 + 2 * r + (lane >> 4);
+            const int c = bx * 32 + wn * 16 + acc_n(r, lane);
+            const float sq = __half2float(sqx[c]);
+            const int ml = ty * BMT + wm * MTW * 16 + i * 16 + acc_m(r, lane);
             if (ml < n) {
                 const float g = acc[i][0][r], u = acc[i][1][r];
                 const float sg = g / (1.0f + expf(-g));
@@ -279,7 +470,7 @@ __global__ void __launch_bounds__(256) k_moe_gu_gemm(const uint8_t* __restrict__
     const int n = cnt[e];
     if (n <= nlo || n > nhi) return;
     if ((int)blockIdx.y * BMT >= n) return;
-    __shared__ __attribute__((aligned(16))) _Float16 ws[GEMM_BN * GEMM_LDW];
+    __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * GEMM_LDW];
     const ExpertDev ed = ex[e];
     const uint8_t* body = sec4 + ed.body_off;
     switch (ed.gu_code) {
@@ -297,19 +488,19 @@ __global__ void __launch_bounds__(256) k_moe_gu_gemm(const uint8_t* __restrict__
 
 template <int FMT, int WM, int MTW, int WN, int NTW>
 __device__ __forceinline__ void dn_gemm_body(const uint8_t* dnw, int bx, int ty, int n, int base, const int* pairs, const __half* h2, const float* topk_w,
-                                             float* y, _Float16* ws) {
+                                             float* y, half_t* ws) {
     constexpr int SB = sk_sb_bytes(FMT);
     constexpr int BMT = WM * MTW * 16;
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
     const int wm = wave % WM, wn = wave / WM;
     const bool active = wn < WN;
     const uint8_t* wr = dnw + (size_t)(bx * GEMM_BN + (tid >> 2)) * 6 * SB;
-    const _Float16* xrow[MTW];
+    const half_t* xrow[MTW];
 #pragma unroll
     for (int i = 0; i < MTW; ++i) {
         int ml = ty * BMT + wm * MTW * 16 + i * 16 + (lane & 15);
         ml = ml < n ? ml : n - 1;
-        xrow[i] = (const _Float16*)h2 + (size_t)(base + ml) * MOE_D;
+        xrow[i] = (const half_t*)h2 + (size_t)(base + ml) * MOE_D;
     }
     fv8 acc[MTW][NTW];
     acc_zero(acc);
@@ -322,10 +513,10 @@ __device__ __forceinline__ void dn_gemm_body(const uint8_t* dnw, int bx, int ty,
     for (int i = 0; i < MTW; ++i)
 #pragma unroll
         for (int j = 0; j < NTW; ++j) {
-            const int c = bx * GEMM_BN + (wn * NTW + j) * 16 + (lane & 15);
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
-                const int ml = ty * BMT + wm * MTW * 16 + i * 16 + 2 * r + (lane >> 4);
+                const int c = bx * GEMM_BN + (wn * NTW + j) * 16 + acc_n(r, lane);
+                const int ml = ty * BMT + wm * MTW * 16 + i * 16 + acc_m(r, lane);
                 if (ml < n) {
                     const int pid = pairs[base + ml];
                     y[(size_t)pid * MOE_D + c] = acc[i][j][r] * topk_w[pid];
@@ -346,7 +537,7 @@ __global__ void __launch_bounds__(256) k_moe_dn_gemm(const uint8_t* __restrict__
     const int n = cnt[e];
     if (n <= nlo || n > nhi) return;
     if ((int)blockIdx.y * BMT >= n) return;
-    __shared__ __attribute__((aligned(16))) _Float16 ws[GEMM_BN * GEMM_LDW];
+    __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * GEMM_LDW];
     const ExpertDev ed = ex[e];
     const uint8_t* dnw = sec4 + ed.body_off + ed.dn_off;
     switch (ed.dn_code) {
@@ -362,13 +553,16 @@ __global__ void __launch_bounds__(256) k_moe_dn_gemm(const uint8_t* __restrict__
     }
 }
 
-__global__ void k_moe_reduce(const float* __restrict__ y, float* __restrict__ z_out) {
+#endif  // HY4_MMA
+
+__global__ void k_moe_reduce(const float* __restrict__ y, float* __restrict__ z_out, __half* __restrict__ z_out_h) {
     const int t = blockIdx.x;
     for (int n = threadIdx.x; n < MOE_D; n += blockDim.x) {
         float a = 0.f;
 #pragma unroll
         for (int s = 0; s < MOE_TOPK; ++s) a += y[((size_t)t * MOE_TOPK + s) * MOE_D + n];
         z_out[(size_t)t * MOE_D + n] = a;
+        if (z_out_h) z_out_h[(size_t)t * MOE_D + n] = __float2half(a);
     }
 }
 
@@ -418,9 +612,9 @@ __device__ __forceinline__ void wave_dot_dispatch(int code, const uint8_t* rp, i
     }
 }
 
-__global__ void k_moe_hist(const int32_t* __restrict__ idx, int P, int* __restrict__ cnt) {
+__global__ void k_moe_hist(const ExpertDev* __restrict__ ex, const int32_t* __restrict__ idx, int P, int* __restrict__ cnt) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < P) atomicAdd(&cnt[idx[i]], 1);
+    if (i < P && !ex[idx[i]].pad) atomicAdd(&cnt[idx[i]], 1);
 }
 __global__ void k_moe_scan(const int* __restrict__ cnt, int* __restrict__ off) {
     if (threadIdx.x == 0) {
@@ -429,9 +623,9 @@ __global__ void k_moe_scan(const int* __restrict__ cnt, int* __restrict__ off) {
         off[MOE_E] = a;
     }
 }
-__global__ void k_moe_scatter(const int32_t* __restrict__ idx, int P, const int* __restrict__ off, int* __restrict__ fill, int* __restrict__ pairs) {
+__global__ void k_moe_scatter(const ExpertDev* __restrict__ ex, const int32_t* __restrict__ idx, int P, const int* __restrict__ off, int* __restrict__ fill, int* __restrict__ pairs) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < P) {
+    if (i < P && !ex[idx[i]].pad) {
         const int e = idx[i];
         const int pos = atomicAdd(&fill[e], 1);
         pairs[off[e] + pos] = i;
@@ -554,27 +748,56 @@ inline MoeWs moe_ws_split(void* ws, int P) {
 // z_out: float [M][1536] (overwritten = sum over the 16 slots of w * y). ws: moe_ws_bytes(M) bytes of device memory.
 // tuning knob: for M <= moe_dec_max_m() the GEMV-style decode kernels run, above it the grouped WMMA kernels with the smallest token tile per expert
 namespace skd {
-inline int& moe_dec_max_m() { static int v = 4; return v; }
+inline int& moe_has_cpu() { static int v = 0; return v; }  // 1 = some experts are CPU-resident (ExpertDev.pad != 0): their y rows are zeroed
+#if HY4_CUDA
+#define HY4_MOE_DEC_MAXM 8  // the MT = 16 decode kernels need 49 KB of static shared memory
+#else
+#define HY4_MOE_DEC_MAXM 16
+#endif
+inline int& moe_dec_max_m() { static int v = HY4_MMA ? 4 : HY4_MOE_DEC_MAXM; return v; }
 }
 
+inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const int32_t* topk_idx, const float* topk_w,
+                            float* z_out, int M, void* ws, __half* z_out_h = nullptr);
+
+// Optional launch-saving extras (decode kernels, M <= moe_dec_max_m()): z_f32 = fp32 [M][1536] latent z read INSTEAD of z (z may be nullptr; converted to fp16 on load, the same
+// rounding as a separate fp32 -> fp16 pass); z_out_h = fp16 copy of z_out written by the reduce kernel (same rounding). Both nullptr = the original behaviour.
+// slot_rec (M == 1, no CPU-resident experts): rec[slot] = the ExpertDev record of the expert chosen in that slot (written by the router kernel). The one-token kernels read it directly, so the
+// counting-sort kernel and the reduce kernel are gone (2 launches instead of 4). The ws region `fill` is used as 96 tickets and must be zero before the first call (they reset themselves).
 inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const int32_t* topk_idx, const float* topk_w,
-                        float* z_out, int M, void* ws) {
+                        float* z_out, int M, void* ws, const float* z_f32 = nullptr, __half* z_out_h = nullptr, const ExpertDev* slot_rec = nullptr) {
+#if !HY4_MMA
+    if (M > HY4_MOE_DEC_MAXM) {  // no matrix-core grouped GEMM on this build: the simple path handles any M
+        moe_experts_ref(s, sec4_base, experts, z, topk_idx, topk_w, z_out, M, ws, z_out_h);
+        return;
+    }
+#endif
     const int P = M * MOE_TOPK;
     const skd::MoeWs w = skd::moe_ws_split(ws, P);
     const int eb = P < MOE_E ? P : MOE_E;
-    hipLaunchKernelGGL(skd::k_moe_route, dim3(1), dim3(512), 0, s, topk_idx, P, w.cnt, w.off, w.pairs, w.active, w.nact);
-    if (M <= skd::moe_dec_max_m() && M <= 16) {
+    if (slot_rec && M == 1 && !skd::moe_has_cpu()) {
+        hipLaunchKernelGGL(skd::k_moe_gu_dec1, dim3(MOE_D / 8, MOE_TOPK), dim3(256), 0, s, sec4_base, slot_rec, z, z_f32, w.h2);
+        hipLaunchKernelGGL(skd::k_moe_dn_dec1, dim3(MOE_D / 16, MOE_TOPK), dim3(256), 0, s, sec4_base, slot_rec, topk_w, w.h2, w.y, z_out, z_out_h, (unsigned*)w.fill);
+        return;
+    }
+    if (skd::moe_has_cpu()) (void)hipMemsetAsync(w.y, 0, (size_t)P * MOE_D * 4, s);
+    hipLaunchKernelGGL(skd::k_moe_route, dim3(1), dim3(512), 0, s, experts, topk_idx, P, w.cnt, w.off, w.pairs, w.active, w.nact);
+    if (M <= skd::moe_dec_max_m() && M <= HY4_MOE_DEC_MAXM) {
 #define HY4_DEC(MT)                                                                                                                                         \
-    hipLaunchKernelGGL((skd::k_moe_gu_dec<MT>), dim3(MOE_D / 8, eb), dim3(256), 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2);  \
+    hipLaunchKernelGGL((skd::k_moe_gu_dec<MT>), dim3(MOE_D / 8, eb), dim3(256), 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, z_f32); \
     hipLaunchKernelGGL((skd::k_moe_dn_dec<MT>), dim3(MOE_D / 16, eb), dim3(256), 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.active, w.nact,   \
                        w.h2, w.y)
         if (M <= 1) { HY4_DEC(1); }
         else if (M <= 2) { HY4_DEC(2); }
         else if (M <= 4) { HY4_DEC(4); }
         else if (M <= 8) { HY4_DEC(8); }
+#if !HY4_CUDA
         else { HY4_DEC(16); }
+#endif
 #undef HY4_DEC
-    } else {
+    }
+#if HY4_MMA
+    else {
         const int INF = 1 << 30;
         const dim3 b(256);
         // token tiles 16 / 32 / 64 / 128; an expert with n tokens uses the first tile with n <= BM (several 128-tiles above 64 tokens)
@@ -598,22 +821,24 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
                                w.active, w.nact, w.h2, w.y, 64, INF);
         }
     }
-    hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out);
+#endif
+    hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out, z_out_h);
 }
 
 // simple reference path (any M); same arguments and workspace
 inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const int32_t* topk_idx, const float* topk_w,
-                            float* z_out, int M, void* ws) {
+                            float* z_out, int M, void* ws, __half* z_out_h) {
     const int P = M * MOE_TOPK;
     const skd::MoeWs w = skd::moe_ws_split(ws, P);
+    if (skd::moe_has_cpu()) (void)hipMemsetAsync(w.y, 0, (size_t)P * MOE_D * 4, s);
     (void)hipMemsetAsync(w.cnt, 0, sizeof(int) * 512, s);
     (void)hipMemsetAsync(w.fill, 0, sizeof(int) * 512, s);
-    hipLaunchKernelGGL(skd::k_moe_hist, dim3((P + 255) / 256), dim3(256), 0, s, topk_idx, P, w.cnt);
+    hipLaunchKernelGGL(skd::k_moe_hist, dim3((P + 255) / 256), dim3(256), 0, s, experts, topk_idx, P, w.cnt);
     hipLaunchKernelGGL(skd::k_moe_scan, dim3(1), dim3(32), 0, s, w.cnt, w.off);
-    hipLaunchKernelGGL(skd::k_moe_scatter, dim3((P + 255) / 256), dim3(256), 0, s, topk_idx, P, w.off, w.fill, w.pairs);
+    hipLaunchKernelGGL(skd::k_moe_scatter, dim3((P + 255) / 256), dim3(256), 0, s, experts, topk_idx, P, w.off, w.fill, w.pairs);
     hipLaunchKernelGGL(skd::k_moe_gu_ref, dim3(MOE_D / 8, MOE_E), dim3(256), 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.h2);
     hipLaunchKernelGGL(skd::k_moe_dn_ref, dim3(MOE_D / 8, MOE_E), dim3(256), 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.h2, w.y);
-    hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out);
+    hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out, z_out_h);
 }
 
 }  // namespace hy4

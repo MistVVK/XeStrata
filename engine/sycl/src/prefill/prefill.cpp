@@ -2238,7 +2238,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
 int64_t Prefill::layout_tail() const { return -1; }
 int64_t Prefill::tail_room() const { return INT64_MAX; }
 bool Prefill::tail_matters(int64_t, bool) { return false; }
-void Prefill::set_card_expert_share(int64_t, int64_t, double, double) {}
+void Prefill::set_card_expert_share(int64_t, int64_t, double, double, int) {}
 
 // What `init` really allocates when the prompt path owns its buffers (no loan): every cudaMalloc rounds up to a 2 MiB
 // page, and the ring is one allocation (carve).  `bytes_needed` stays the borrowed region's sum.

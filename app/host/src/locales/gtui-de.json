@@ -1,0 +1,6 @@
+{
+ "gtui01": "Ein Modell läuft bereits über das Terminal",
+ "gtui02": "Ein mit strata launch gestartetes Modell belegt Port {0}, deshalb hat sich Strata stattdessen auf Port {1} geöffnet. Die Seite des Terminals auf Port {0} verlangt einen eigenen API-Schlüssel, und diese App verwendet diese Seite nicht. Um hier ein Modell zu laden, beenden Sie zuerst das Modell des Terminals (strata launch --stop). Auf Port {0} gespeicherte Chats und Einstellungen werden hier nicht angezeigt.",
+ "gtui03": "Einige frühere Bilder fehlen",
+ "gtui04": "Bilder aus früheren Nachrichten sind in diesem Browser nicht mehr gespeichert, deshalb sieht das Modell sie in dieser Antwort nicht. Hängen Sie sie erneut an, wenn sie wichtig sind."
+}

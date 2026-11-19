@@ -825,3 +825,34 @@ class CalibrateWithModel(unittest.TestCase):
             self.assertEqual(setup.calibration_targets(ps, "Q2_0", None), [ps[1]])
             self.assertEqual(setup.calibration_targets(ps, "Q2_0", "qwen"), [ps[1]])
             self.assertEqual(setup.calibration_targets(ps, "Q4_K_M", None), [])
+
+
+class StartIgnoresSetupFlags(unittest.TestCase):
+    """Starting (or tuning) an installed model keeps its saved --kv, --context and --vision: setup says so instead of
+    starting with the old values in silence; a start with none of them says nothing."""
+
+    def run_main(self, *argv):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Path(tmp.name) / "strata-iq3_xxs.json"
+        cfg.write_text(json.dumps({"exe": "x", "args": ["--max-context", "8192", "--kv", "int8"],
+                                   "model_name": "iq3_xxs"}))
+        started = []
+        with mock.patch.object(sys, "argv", ["setup.py", *argv]), \
+                mock.patch.object(setup, "installed_configs", lambda: [cfg]), \
+                mock.patch.object(setup, "update_installed_engine", lambda *a, **k: None), \
+                mock.patch.object(setup, "start", lambda c, *a, **k: started.append(c.name) or 0), \
+                mock.patch.object(setup, "data_folder_in_place", lambda: (Path(tmp.name), [])):
+            code, out = quiet(setup.main)
+        return code, out, started
+
+    def test_said_on_a_plain_start(self):
+        code, out, started = self.run_main("--kv", "q4_0", "--context", "65536", "--vision", "no", "--yes")
+        self.assertEqual((code, started), (0, ["strata-iq3_xxs.json"]))
+        self.assertIn("--kv, --context, --vision", out)
+        self.assertIn("--setup", out)
+
+    def test_silent_without_them(self):
+        code, out, started = self.run_main("--yes")
+        self.assertEqual((code, started), (0, ["strata-iq3_xxs.json"]))
+        self.assertNotIn("keeps its saved", out)

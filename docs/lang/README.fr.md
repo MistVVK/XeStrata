@@ -66,7 +66,7 @@ Vous ne savez pas ce qui tient ? [Choisir un modèle pour votre ordinateur](../M
 
 Installez l'application, choisissez un modèle et commencez à discuter. Il y a un seul installateur par système. Au premier lancement, l'application télécharge le moteur de votre carte graphique. [Aide pour l'installateur](../INSTALL.md#the-app).
 
-<sub>Fichiers: `Strata-0.2.16-windows-x64-setup.exe` · `Strata-0.2.16-linux-x86_64.AppImage` · `Strata-0.2.16-macos-arm64.dmg`</sub>
+<sub>Fichiers: `Strata-0.2.17-windows-x64-setup.exe` · `Strata-0.2.17-linux-x86_64.AppImage` · `Strata-0.2.17-macos-arm64.dmg`</sub>
 
 <p align="center">
   <img src="../media/app-chat.png" width="900" alt="Application de bureau Strata avec une discussion et un aperçu du code en direct côte à côte">

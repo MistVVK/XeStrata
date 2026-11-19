@@ -437,9 +437,16 @@ def _hash_settled(path: Path, digest: str) -> str | None:
     return actual
 
 
+#: Files (path, size, modification time in ns, recorded SHA-256) whose content was read in this process and matched. The quick check a listing makes
+#: hashes the engine's entrypoint (170 MB on Windows CUDA); the setup screens asked about the engine on every key and read it every time, which is
+#: what made `strata launch` take seconds per key on a PC with a slow disk or a virus checker (#6278, #5940). A file that changed has another size or
+#: time and is read again; `full=True` (a start) never uses this.
+_HASHED_OK: set = set()
+
+
 def verify(component: EngineComponent, *, full: bool = False) -> None:
     """Raise IntegrityProblem unless the files are what the manifest says. `full` hashes every file; without it only
-    the entrypoint is hashed (sizes are always checked)."""
+    the entrypoint is hashed (sizes are always checked), once per file as it is on disk (see _HASHED_OK)."""
     # extended-length paths: under a long user name an AMD engine's files pass 259 characters, which Windows (long paths off)
     # reports as "missing" for an ordinary path
     folder = longpath.long_path(component.root)
@@ -457,10 +464,16 @@ def verify(component: EngineComponent, *, full: bool = False) -> None:
         if info.st_size != size:
             raise IntegrityProblem(f"{rel} is {info.st_size} bytes, the manifest says {size}")
         if full or rel == component.entrypoint:
+            seen = (str(target), info.st_size, info.st_mtime_ns, digest)
+            if not full and seen in _HASHED_OK:
+                continue                           # the quick check a listing makes: this very file was read and matched a moment ago (#6278)
             actual = _hash_settled(target, digest)
             if actual != digest:
                 raise IntegrityProblem(f"{rel} does not match its recorded SHA-256 (expected {digest[:12]}, "
                                        f"found {actual[:12] if actual else 'unreadable'})")
+            if len(_HASHED_OK) >= 64:
+                _HASHED_OK.clear()
+            _HASHED_OK.add(seen)
     if os.name != "nt" and not os.access(component.exe, os.X_OK):
         raise IntegrityProblem(f"{component.entrypoint} is not executable")
 
@@ -550,12 +563,15 @@ def detect_backend(environ=None) -> tuple[str | None, str]:
     probes = (("cuda", ("nvidia-smi", "--query-gpu=name", "--format=csv,noheader")),
               ("hip", ("rocminfo",) if os.name != "nt" else ("hipInfo",)),
               ("sycl", ("sycl-ls",)))
-    vendors_here = {a.get("vendor") for a in adapters}
     vendor_of = {"cuda": "10de", "hip": "1002", "sycl": "8086"}
+    # only a card of a make Strata has an engine for can say "this PC has no card of that make". A virtual adapter (Microsoft's
+    # Virtual Render Driver, vendor 1414, in a Hyper-V GPU-PV guest, #4718) names no make, so it must not hide the NVIDIA card
+    # that nvidia-smi still reports inside the guest.
+    vendors_here = {a.get("vendor") for a in adapters} & set(vendor_of.values())
     for backend, command in probes:
         if vendors_here and vendor_of[backend] not in vendors_here:
             continue                                  # the adapters list no card of this make: a tool that answers is a leftover
-        tool = shutil.which(command[0])
+        tool = nvidia_smi_path() if command[0] == "nvidia-smi" else shutil.which(command[0])
         if not tool:
             continue
         try:
@@ -682,7 +698,7 @@ def _drm_vendor_backend(root: str = "/sys/class/drm") -> str | None:
 #: Strix Halo, 0x1586, is in WIN_AMD_UMA_IDS), so an integrated Radeon beside a card never counts as "the GPU".
 WIN_AMD_DEVICE_ARCH = {0x744C: "gfx1100", 0x7448: "gfx1100", 0x745E: "gfx1100", 0x747E: "gfx1101", 0x7480: "gfx1102",
                        0x7590: "gfx1200", 0x7550: "gfx1201", 0x7551: "gfx1201",
-                       0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030", 0x73DF: "gfx1031",
+                       0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030", 0x73A1: "gfx1030", 0x73DF: "gfx1031",
                        0x73FF: "gfx1032", 0x73EF: "gfx1032", 0x73E3: "gfx1032"}
 WIN_AMD_UMA_IDS = {0x1586: "gfx1151"}                                   # Strix Halo: unified memory, supported
 WIN_AMD_IGPU_IDS = {0x150E, 0x1114, 0x1902, 0x15BF, 0x15C8, 0x164F, 0x1900, 0x1901, 0x1681, 0x1638, 0x1636, 0x15D8, 0x15E7}
@@ -941,8 +957,29 @@ def _smi_query(field_name: str) -> list[str]:
     return list(found)
 
 
-def _smi_query_now(field_name: str) -> list[str]:
+def _driver_store_smi(base: str | None = None) -> str | None:
+    """#4718: in a Hyper-V GPU-PV guest the NVIDIA driver is copied from the host into C:\\Windows\\System32\\HostDriverStore\\FileRepository\\nv*\\ and
+    nothing puts that folder on PATH, so `nvidia-smi` is not found although it works there.  The newest nvidia-smi.exe of that store, or None.
+    Plain string paths (no pathlib): the tests set os.name to "nt" on Linux."""
+    import glob
+    root = base or os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "HostDriverStore", "FileRepository")
+    try:
+        found = sorted(glob.glob(os.path.join(root, "nv*", "nvidia-smi.exe")), key=os.path.getmtime, reverse=True)
+    except OSError:
+        return None
+    return found[0] if found else None
+
+
+def nvidia_smi_path() -> str | None:
+    """nvidia-smi on PATH, else (Windows only) the one in the driver store of a GPU-PV guest; None when there is none."""
     tool = shutil.which("nvidia-smi")
+    if tool:
+        return tool
+    return _driver_store_smi() if os.name == "nt" else None
+
+
+def _smi_query_now(field_name: str) -> list[str]:
+    tool = nvidia_smi_path()
     if not tool:
         return []
     try:

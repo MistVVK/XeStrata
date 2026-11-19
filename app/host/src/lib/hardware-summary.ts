@@ -9,6 +9,16 @@ export function memoryInventory(hardware: Hardware) {
 }
 
 /**
+ * The cards worth listing in the first-run memory card. A processor's built-in graphics (a Ryzen's "AMD Radeon(TM) Graphics" with a 0.5 GB share
+ * of RAM) came up as a second GPU on a PC with one real card ("VRAM · 2 GPUs", "2 GPUs connected"), while the Terminal and the Models page
+ * count one. A card with a known size under 1 GB is left out when another card has 4 GB or more; a size of 0 (not read) is kept (#3727).
+ */
+export function listedGpus<T extends { vramGb: number; unified?: boolean }>(gpus: T[]): T[] {
+  const real = gpus.some(g => !g.unified && g.vramGb >= 4);
+  return real ? gpus.filter(g => g.unified || !(g.vramGb > 0 && g.vramGb < 1)) : gpus;
+}
+
+/**
  * The engine's size for each card the host reports with no dedicated memory (an old Windows probe read 0 for AMD cards, #3727).
  * Each engine card is used once: same name first (a "7900 XT" never takes the "7900 XTX" figure while the XT is listed), then a name
  * that contains the other, then the same position when both lists have the same length. A card left without a match stays at 0.

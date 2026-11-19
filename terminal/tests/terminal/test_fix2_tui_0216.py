@@ -436,7 +436,7 @@ class S6Offline(Base):
             t = flat(app)
             self.assertIn("offline: nothing can be downloaded now. Missing:", t)
             self.assertIn("the model, 84 GB: put its files in a folder, then choose Use model files I already have", t)
-            self.assertIn("the DFlash2 drafter, 0.34 GB: copy both of its .pack files into the dflash2 folder of your data folder", t)
+            self.assertIn("the DFlash2 drafter, 0.34 GB: copy one of these files: qwen3.8-flash-next-dflash2.q4_0.pack", t)
             self.assertIn("the engine for your graphics card: install it from a file", t)
             self.assertNotIn("Strata downloads what is listed under Download first", t)
             self.assertIn("This computer is offline", t)
@@ -523,15 +523,16 @@ class S9PlainStorage(Base):
             await goto(pilot, app, "save")
             lines = dict(app.screen.summary_lines())
             self.assertEqual(lines["Your files"], "/home/me/models/iq3 (used where they are)")
-            self.assertIn("(packs and the draft layer go here)", lines["Strata data"])
+            self.assertRegex(lines["Strata data"], r"\(packs and the (draft layer|DFlash2 drafter) go here\)")      # (0217 item 10: the drafter's own name)
             self.assertNotIn("Storage", lines)
         self.run_app(case)
 
-    def test_without_own_files_it_is_storage_as_before(self):
-        async def case(app, pilot, ctx):
+    def test_without_own_files_the_folder_has_the_same_name(self):
+        async def case(app, pilot, ctx):                  # (0217 item 8: it said "Storage" here and "Strata data" with own files)
             await goto(pilot, app, "save")
             lines = dict(app.screen.summary_lines())
-            self.assertIn("Storage", lines)
+            self.assertIn("Strata data", lines)
+            self.assertNotIn("Storage", lines)
             self.assertNotIn("Your files", lines)
         self.run_app(case)
 

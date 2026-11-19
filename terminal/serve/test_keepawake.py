@@ -82,10 +82,17 @@ class KeepAwakeTests(unittest.TestCase):
         svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         rec = Recorder()
         svc.keep_awake = ka = KeepAwake(rec)
-        kinds = [k for k, _ in svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event())]
+        self.addCleanup(ka.close)
+        gen = svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event())
+        self.addCleanup(gen.close)
+        first_kind, _ = next(gen)
+        # Keep the mock request open until the asynchronous worker observes it.
+        self.assertTrue(wait_for(lambda: rec.calls == [ON]))
+        kinds = [first_kind] + [k for k, _ in gen]
         self.assertIn("done", kinds)
         self.assertTrue(wait_for(lambda: rec.calls == [ON, ES_CONTINUOUS]))
         gen = svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event())
+        self.addCleanup(gen.close)
         next(gen)
         self.assertTrue(wait_for(lambda: rec.calls[-1] == ON))
         gen.close()                                           # the client left

@@ -38,6 +38,16 @@ inline int pipe_adapt_every(const char* value) {
     return n > 0 ? n : 0;
 }
 
+/// An opt-in switch of the slot read (STRATA_SLOT_READ, STRATA_SLOT_READ_WIDE, STRATA_SLOT_READ_AHEAD): on only when set to something
+/// that is not "0" (unset and empty are off).  The PRs #5866 / #5868 had the wide and ahead reads on unless "0".
+inline bool switch_on(const char* value) { return value != nullptr && value[0] != '\0' && value[0] != '0'; }
+/// The wide read (a slot alone in its group takes the group's whole window) needs the slot read itself.
+inline bool slot_read_wide_on(const char* slot_read, const char* wide) { return switch_on(slot_read) && switch_on(wide); }
+/// The read ahead (the next window of a read goes behind the one in flight) needs the wide read.
+inline bool slot_read_ahead_on(const char* slot_read, const char* wide, const char* ahead) {
+    return slot_read_wide_on(slot_read, wide) && switch_on(ahead);
+}
+
 /// `auto`: the interval after a round that moved `swaps` experts of the `cap` a round may move (--adapt-swaps).  A
 /// round that came back nearly full says the text has moved and the tier is behind: half the interval, down to
 /// kPipeAdaptMin.  One that found little to move says the tier has caught up, and every round empties the pipeline:

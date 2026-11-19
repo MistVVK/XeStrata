@@ -11,5 +11,6 @@ namespace strata::metal_engine { void missing(const char* name); }
 
 namespace strata::kernels {
 void hc_mean_streams(const float*, float*, int64_t, int, void*) { strata::metal_engine::missing("strata::kernels::hc_mean_streams"); }
+void l2_prefetch_ranges(const L2PrefetchSet&, void*) { strata::metal_engine::missing("strata::kernels::l2_prefetch_ranges"); }
 void route_marginal_stats(const int32_t*, int, int, unsigned long long*, void*) { strata::metal_engine::missing("strata::kernels::route_marginal_stats"); }
 }  // namespace strata::kernels

@@ -163,6 +163,12 @@ void kq256_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*,
 void kq256_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-2 k-quant kernel");
 }
+void kq512_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
+    unsupported("the AVX-512 k-quant kernel");
+}
+void kq512_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    unsupported("the AVX-512 k-quant kernel");
+}
 void bf16_rows_dot_multi_avx1(const uint16_t*, int, int, const float*, int, float*) {
     unsupported("the AVX1 router dot");
 }

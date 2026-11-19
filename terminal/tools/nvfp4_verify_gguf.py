@@ -1,6 +1,6 @@
 """tools/nvfp4_verify_gguf.py - check a converted NVFP4 GGUF against its ModelOpt source, and a PLE GGUF against it.
 
-    python tools/nvfp4_verify_gguf.py --model <ModelOpt dir> --gguf <converted.gguf> [--ple-gguf <IQ4_NL PLE gguf>]
+    python tools/nvfp4_verify_gguf.py --model <ModelOpt dir> --gguf <converted.gguf> [--ple-gguf <PLE gguf>]
 
 nvfp4_verify.py proves the repack function is lossless. This checks what was actually written, where the
 converter's own bookkeeping could go wrong without the function being wrong:
@@ -10,9 +10,10 @@ converter's own bookkeeping could go wrong without the function being wrong:
   * scale order: `.scale[e]` must be that expert's weight_scale_2;
   * the dense policy: every tensor's type against the policy, and every non-PLE tensor name of the reference
     layout present;
-  * the PLE table (with --ple-gguf): the engine will read another file's IQ4_NL table, which is only valid if it
-    is the same table. Sampled rows of it are compared with this checkpoint's FP8 rows by cosine similarity -
-    two quantizations of one table agree to ~0.99, different tables do not.
+  * the PLE table (with --ple-gguf): the engine will read another file's table (IQ4_NL, Q4_0, Q5_0, Q5_1, Q8_0,
+    BF16, or the FP8 table ple_fp8_pack.py writes), which is only valid if it is the same table. Sampled rows of it
+    are compared with this checkpoint's FP8 rows by cosine similarity - two quantizations of one table agree to
+    ~0.99, different tables do not, and the FP8 table itself gives 1.0.
 """
 from __future__ import annotations
 
@@ -103,6 +104,10 @@ def check_policy(T: dict, reference: pathlib.Path | None) -> int:
     return bad
 
 
+# the block types src/kernels/ngram.cpp's format table reads; I8 is its FP8 (and NVFP4 x16) table, told apart by metadata
+PLE_TYPES = (Q.IQ4_NL, Q.Q4_0, Q.Q5_0, Q.Q5_1, Q.Q8_0, Q.BF16)
+
+
 def check_ple(model: pathlib.Path, ple: pathlib.Path, samples: int, rng: random.Random) -> int:
     reader = GGUFReader(ple)
     t = {x.name: x for x in reader.tensors}.get("per_layer_token_embd.weight")
@@ -111,8 +116,21 @@ def check_ple(model: pathlib.Path, ple: pathlib.Path, samples: int, rng: random.
         return 1
     width, rows = int(t.shape[0]), int(t.shape[1])
     print("  PLE file: %s %s, %d rows x %d" % (ple.name, t.tensor_type.name, rows, width))
-    if t.tensor_type != Q.IQ4_NL:
-        print("  PLE: the engine reads IQ4_NL only")
+    if t.tensor_type == Q.I8:
+        meta = {k: f.contents() for k, f in reader.fields.items() if k.startswith("strata.ple.")}
+        fmt = meta.get("strata.ple.format")
+        if fmt != "f8_e4m3":
+            print("  PLE: I8 table with strata.ple.format = %r; this check reads f8_e4m3 (ple_fp8_pack.py)" % fmt)
+            return 1
+        scale = float(meta["strata.ple.scale"])
+
+        def decode(row):
+            return torch.from_numpy(row.view(np.uint8).copy()).view(torch.float8_e4m3fn).float().numpy() * scale
+    elif t.tensor_type in PLE_TYPES:
+        def decode(row):
+            return quants.dequantize(row, t.tensor_type)
+    else:
+        print("  PLE: %s is not a table type the engine reads" % t.tensor_type.name)
         return 1
     table = np.asarray(t.data).reshape(rows, -1)
     index = json.loads((model / "model.safetensors.index.json").read_text(encoding="utf-8"))["weight_map"]
@@ -127,7 +145,7 @@ def check_ple(model: pathlib.Path, ple: pathlib.Path, samples: int, rng: random.
             sname = name.replace(".weight", ".weight_scale")
             if sname in f.keys():
                 src = src * float(f.get_tensor(sname).float())
-        mine = quants.dequantize(np.ascontiguousarray(table[r]), Q.IQ4_NL).reshape(-1)
+        mine = decode(np.ascontiguousarray(table[r])).reshape(-1)
         cos = float(np.dot(src, mine) / (np.linalg.norm(src) * np.linalg.norm(mine) + 1e-30))
         sims.append(cos)
         worst = min(worst, cos)

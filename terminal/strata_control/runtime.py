@@ -854,6 +854,12 @@ def _stop_lost(name: str) -> dict | None:
             **({"error": "leftover_process_not_ended"} if stuck else {})}
 
 
+def recover_lost(name: str) -> dict | None:
+    """Clear the record of a managed runtime whose owner host is gone (what `stop` does for a lost host). None, and nothing touched, when the
+    owner is alive: this never asks a running owner to stop."""
+    return _stop_lost(_name(name))
+
+
 def cleanup(profile: str | None = None) -> dict:
     """End the servers and engines Strata started whose owner is gone (`strata runtime cleanup`). Owned instances
     that are running are not touched, and neither is any process that is not exactly what Strata recorded."""

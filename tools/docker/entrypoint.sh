@@ -153,6 +153,7 @@ if ! printf '%s' "$engine_json" | grep -q '"usable": *true'; then
   cat >&2 <<'MSG'
     Check, in this order:
       NVIDIA  docker run --gpus all ... (needs nvidia-container-toolkit on the host; driver 580+ for the cuda13 image, 575+ for cuda12)
+              podman run --device nvidia.com/gpu=all ... (or the device files by hand when Podman cannot read the toolkit's file: docs/DOCKER.md, Podman)
       AMD     docker run --device /dev/kfd --device /dev/dri --group-add video --group-add render ...
       Intel   docker run --device /dev/dri ... (add --group-add for the host's render group)
     Then pick the image for your card: docs/DOCKER.md.
@@ -165,7 +166,10 @@ fi
 backend=$(printf '%s' "$engine_json" | sed -n 's/.*"backend": *"\([a-z0-9]*\)".*/\1/p' | head -1)
 dev="${STRATA_DEV_DIR:-/dev}"
 case "$backend" in
-  cuda) ls "$dev"/nvidia[0-9]* >/dev/null 2>&1 || [ -e "$dev/dxg" ] || { echo "[X] This computer has an NVIDIA card, but the container cannot use it, so nothing would run (and the model would be prepared for nothing). Start the container with: --gpus all (needs the NVIDIA Container Toolkit on the host; docs/DOCKER.md, Troubleshooting)." >&2; exit 3; } ;;
+  cuda) ls "$dev"/nvidia[0-9]* >/dev/null 2>&1 || [ -e "$dev/dxg" ] || {
+          echo "[X] This computer has an NVIDIA card, but the container cannot use it, so nothing would run (and the model would be prepared for nothing). Start the container with: --gpus all (Docker; needs the NVIDIA Container Toolkit on the host) or --device nvidia.com/gpu=all (Podman; needs a CDI file made with: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml)." >&2
+          echo "    If Podman says it cannot find that device (an older Podman cannot read a newer toolkit's file), pass the card by hand: --device /dev/nvidia0 --device /dev/nvidiactl --device /dev/nvidia-uvm --device /dev/nvidia-uvm-tools, and the driver's libraries (libcuda, libnvidia-ml, libnvidia-ptxjitcompiler, libnvidia-nvvm) with -v ...:ro. Details: docs/DOCKER.md, Troubleshooting, Podman." >&2
+          exit 3; } ;;
   hip)  [ -e "$dev/kfd" ] || { echo "[X] This is an AMD card, but /dev/kfd is not in the container. Add: --device /dev/kfd --device /dev/dri --group-add video --group-add <render group number> (docs/DOCKER.md)" >&2; exit 3; } ;;
   sycl) ls "$dev"/dri/renderD* >/dev/null 2>&1 || { echo "[X] This is an Intel card, but /dev/dri is not in the container. Add: --device /dev/dri --group-add <render group number> (docs/DOCKER.md)" >&2; exit 3; } ;;
 esac

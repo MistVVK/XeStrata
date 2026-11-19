@@ -23,7 +23,7 @@ strata launch --family nvfp4 --model NVFP4
 
 All three read pictures through the original model's picture reader file that setup downloads with them
 ([Images](#images)). The other sections of this page apply to all three unless they say otherwise. Setup runs a pack in
-the RAM-budget mode (`--resident-budget-gib`, the RAM less 24 GB, as for Unsloth's files) when the RAM is below the 68 GB
+the RAM-budget mode (`--resident-budget-gib`, the RAM less 17 GB, as for Unsloth's files) when the RAM is below the 68 GB
 of experts plus room.
 
 ## Getting a model by hand
@@ -36,6 +36,9 @@ python terminal/tools/iq_pack.py --gguf <model>.gguf --out <pack dir>
 - `nvfp4_convert.py` runs llama.cpp's own converter (`third_party/llama.cpp`, the commit setup pins) with the type
   policy the engine needs. The experts are repacked without loss. `terminal/tools/nvfp4_verify.py` compares them with the
   checkpoint bit for bit, and `terminal/tools/nvfp4_verify_gguf.py` checks the GGUF.
+  - Each tensor goes to a temporary file as it is converted, so the conversion needs about 3 GB of RAM, and free disk
+    for the GGUF twice (~76 GB each for Qwen3.8-Flash-Next). The temporary file is next to `--outfile`; `TMPDIR` puts
+    it on another disk.
   - The small projections the BF16 kernels read (routers, SSM gates, indexer, PLE and hyper-connection projections) are
     written as BF16.
   - Everything served natively goes to Q8_0: attention, `ssm_out`, the shared experts, the output head and the token
@@ -65,8 +68,8 @@ the bytes over PCIe. The PCIe share of the missed experts is therefore 0.25 for 
 0.55 the copy kernel was 40% of all GPU kernel time (nsys, 300-token decode). Measurements are in
 [History](#history--older-measurements).
 
-`STRATA_ROUTE_TAIL_SKIP` is off by default for NVFP4 experts, because it moves the answers by more than the quantization
-itself. `STRATA_ROUTE_TAIL_SKIP=7` turns it on.
+`STRATA_ROUTE_TAIL_SKIP` is off for NVFP4 experts, because it moves the answers by more than the quantization
+itself (the engine's own rule since 0.1.44; Strata sets it off for every model since 0.2.17). `STRATA_ROUTE_TAIL_SKIP=7` turns it on.
 
 ## Where the global scales go
 

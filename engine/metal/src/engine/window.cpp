@@ -30,6 +30,8 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/rope.hpp"
+#include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/sampler.hpp"
 namespace strata::gpu { void* host_view(const void* device_pointer); }
 #include "strata/kernels/cpu/hadamard.hpp"
@@ -861,12 +863,45 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     }
     // RoPE: cos/sin [pos][32] for the first 64 dims, NEOX pairs (i, i + 32), in double as build_rope_table
     const double base = f_.meta_num.count("qwen4exp.rope.freq_base") ? f_.meta_num["qwen4exp.rope.freq_base"] : 1e7;
-    for (int p = 0; p < MAXC + 16; ++p)
-        for (int i = 0; i < 32; ++i) {
-            const double th = (double) p * std::pow(base, -2.0 * i / 64.0);
-            cs_.as<float>()[(p * 32 + i) * 2] = (float) std::cos(th);
-            cs_.as<float>()[(p * 32 + i) * 2 + 1] = (float) std::sin(th);
+    // Rope scaling (--rope-scaling linear|yarn, rope_scaling.hpp): the process config generate.cpp resolved before the
+    // window exists.  None: the original loop, unchanged (bit-identical to the unscaled engine).  Linear/YaRN: the shared
+    // table builder (setup_host.cpp, rope.cu's) fills cos/sin with the interpolated angles and YaRN's magnitude correction
+    // (mscale) folded in, as the CUDA table path does.  Every qsa_prep dispatch (q, k, the indexer q and the pooled
+    // indexer keys; decode, verify, prompt and the MTP draft layer) reads this one table, so mscale lands once per rotated
+    // row.  The window's frequency base (the model file's) stays the base.
+    const strata::kernels::RopeScaling& rsc = strata::kernels::rope_scaling();
+    if (rsc.type == strata::kernels::RopeScalingType::None) {
+        for (int p = 0; p < MAXC + 16; ++p)
+            for (int i = 0; i < 32; ++i) {
+                const double th = (double) p * std::pow(base, -2.0 * i / 64.0);
+                cs_.as<float>()[(p * 32 + i) * 2] = (float) std::cos(th);
+                cs_.as<float>()[(p * 32 + i) * 2 + 1] = (float) std::sin(th);
+            }
+    } else {
+        strata::kernels::RopeScaling sc = rsc;
+        if (sc.freq_base != base)
+            std::fprintf(stderr, "strata metal: rope scaling: the resolved frequency base %g differs from the model "
+                                 "file's %g; the window keeps the model file's\n", sc.freq_base, base);
+        sc.freq_base = base;
+        if (const char* why = strata::kernels::rope_scaling_invalid(sc)) {
+            err = std::string("metal window: invalid rope scaling: ") + why;
+            return false;
         }
+        const int rows = MAXC + 16;
+        std::vector<float> ct((size_t) rows * 32), st((size_t) rows * 32);
+        strata::kernels::build_rope_table(64, sc, rows, ct.data(), st.data());
+        float* cs = cs_.as<float>();
+        for (size_t k = 0; k < (size_t) rows * 32; ++k) {
+            cs[k * 2] = ct[k];
+            cs[k * 2 + 1] = st[k];
+        }
+        double cd[2];
+        sc.corr_dims(64, cd);
+        std::fprintf(stderr, "strata metal: rope scaling %s in the window table: factor %g, freq_scale %g, base %g, "
+                             "original context %g, ext_factor %g, mscale %.6f, correction pairs %g..%g, %d positions\n",
+                     sc.type == strata::kernels::RopeScalingType::YaRN ? "yarn" : "linear", sc.factor, sc.freq_scale(),
+                     sc.freq_base, sc.orig_ctx, sc.ext_factor, sc.mscale(), cd[0], cd[1], rows);
+    }
     for (int t = 0; t < MAXT; ++t)
         for (int c = 0; c < G_BUD; ++c) qids_.as<int>()[t * G_BUD + c] = c;
     for (int l = 0; l < G_NL; ++l) {

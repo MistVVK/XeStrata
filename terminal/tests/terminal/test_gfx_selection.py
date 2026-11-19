@@ -77,6 +77,13 @@ class Names(unittest.TestCase):
         self.assertEqual(ec.windows_amd_cards([{"vendor": "1002", "device": 0x9999, "name": "AMD Radeon(TM) Graphics", "vram_gb": 0.5}]), [])
         self.assertEqual(ec.windows_amd_cards([{"vendor": "1002", "device": 0x9999, "name": "AMD Radeon 890M Graphics", "vram_gb": 4.0}]), [])
 
+    def test_the_radeon_pro_v620_is_a_gfx1030(self):
+        # the display adapters of the PC it was reported on: its name says nothing, so only the PCI id identifies it
+        adapters = [{"vendor": "1002", "device": 0x15BF, "name": "AMD Radeon(TM) 780M", "vram_gb": 2.0},
+                    {"vendor": "1002", "device": 0x73A1, "name": "AMD Radeon Pro V620", "vram_gb": 32.0},
+                    {"vendor": "1002", "device": 0x7480, "name": "AMD Radeon(TM) RX 7700S", "vram_gb": 8.0}]
+        self.assertEqual([c["arch"] for c in ec.windows_amd_cards(adapters)], ["gfx1030", "gfx1102"])
+
 
 class Detection(unittest.TestCase):
     def test_windows_without_hipinfo_reads_the_gfx_from_the_adapters(self):

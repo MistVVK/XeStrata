@@ -110,7 +110,7 @@ public:
     static int64_t short_read_default(int64_t base);
     /// STRATA_SWITCH_POINT (on by default for the class in switch_point_rule.hpp, =0 off): the expert cache's live slots and layers x experts of the single card's own model, before the first lend; the floor above is then
     /// chosen from the share of experts the card does not hold, scaled by the cache's mean blob (MB), the start-up link probe (GB/s) and the card's SM count (switch_point_rule.hpp; 0 = unknown: the default floor).  With STRATA_SWITCH_POINT=0 this changes nothing.
-    static void set_card_expert_share(int64_t resident_slots, int64_t total_pairs, double blob_mb = 0.0, double link_gbps = 0.0);
+    static void set_card_expert_share(int64_t resident_slots, int64_t total_pairs, double blob_mb = 0.0, double link_gbps = 0.0, int pool_workers = 0);
     /// --prefill-pipe (opt-in): the chunk a layer split's first stage reads an `n`-token prompt in, for `stages`
     /// stages, chunks of at most `cap` (the buffers' size) and a stage-chunk cost of b + a C with b/a = `ratio` tokens
     /// (0: unknown - STRATA_PREFILL_EQUAL's rule: the same chunk count as `cap` gives, evened out when its last chunk
@@ -309,6 +309,9 @@ public:
     /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
+    /// BW-H: a layer split (before arm_cpu_share): arms the default share with the link rule when `floor_ms` (the stages' stream floors summed, share_rules.hpp link_rule_floor) raises the limit above 3,072;
+    /// STRATA_PREFILL_CPU_SHARE_AUTO=0 or an explicit STRATA_PREFILL_CPU_SHARE leave it as it was.  `all_cc120`: every stage's card is compute capability 12.0 (the class measured; =1 asks for any).
+    static bool arm_cpu_share_split(bool applies, double floor_ms, int pool_workers, bool all_cc120);
     /// STRATA_PREFILL_CPU_SHARE_BATCH=1 (batch slots beside the pool): set before each read - true while a slot decodes
     /// (its windows use the pool), so no chunk of that read takes the share; false lets the read's chunks take it.
     static void set_share_blocked(bool blocked);

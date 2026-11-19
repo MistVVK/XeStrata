@@ -145,6 +145,23 @@ class QuotedThinkEnd(unittest.TestCase):
                     self.assertEqual(joined(evs, "reasoning"), thought)
                     self.assertEqual(joined(evs, "content"), "answer")
 
+    def test_a_quote_that_closes_a_sentence_does_not_quote_the_tag(self):
+        """The thinking ends on a closing quote and the answer follows on the same line, with no line break."""
+        for thought in ('the user said "Reply with the number only."', "it is called 'the tag.'", "run `ls`"):
+            for width in (1, 7, 100_000):
+                with self.subTest(thought=thought, width=width):
+                    evs = run(thought + "</think>2", width)
+                    self.assertEqual(joined(evs, "reasoning"), thought)
+                    self.assertEqual(joined(evs, "content"), "2")
+
+    def test_a_tag_inside_a_pair_of_quotes_stays_reasoning(self):
+        for quote in ('"</think>"', "`</think>`", "'</think>'"):
+            for width in (1, 100_000):
+                with self.subTest(quote=quote, width=width):
+                    evs = run("the tag is " + quote + " here\n</think>\n\nanswer", width)
+                    self.assertEqual(joined(evs, "reasoning"), "the tag is " + quote + " here\n")
+                    self.assertEqual(joined(evs, "content"), "answer")
+
     def test_an_output_that_ends_on_the_tag(self):
         for width in (1, 100_000):
             evs = run('say "</think>', width)

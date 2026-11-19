@@ -35,6 +35,11 @@ def _preflight(argv):
 if __name__ == "__main__":
     # a newer Control installed by `strata update` takes over before anything heavy is imported (stdlib only)
     from strata_cli.handover import maybe_hand_over, refuse_old_updater
+    try:                                               # the app host started this for a long download or pack: it ends with the host (strata_control/parentwatch.py)
+        from strata_control.parentwatch import exit_with_parent
+        exit_with_parent()
+    except Exception:                                  # noqa: BLE001 - never a reason for the command to fail
+        pass
     refused = refuse_old_updater(sys.argv[1:])
     if refused is not None:
         raise SystemExit(refused)
@@ -44,6 +49,11 @@ if __name__ == "__main__":
     try:                                               # an old install's strata.ps1 beside its strata.cmd (Windows; strata_cli/launcher_heal.py)
         from strata_cli import launcher_heal
         launcher_heal.heal(extra=[launcher_heal.installed_bin()])
+    except Exception:                                  # noqa: BLE001 - never a reason for the command to fail
+        pass
+    try:                                               # the RAM budget setup wrote under the 0.2.16 rule moves to the 0.2.17 rule, once (strata_cli/ram_budget_move.py)
+        from strata_cli import ram_budget_move
+        ram_budget_move.run()
     except Exception:                                  # noqa: BLE001 - never a reason for the command to fail
         pass
     code = _preflight(sys.argv[1:])

@@ -6,6 +6,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from '
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { makePrivate } from './private-file.mjs';
+import { cancelOnAbort } from './stream-abort.mjs';
 
 export const PROVIDER_CATALOG = [
   { id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', protocol: 'openai-responses' },
@@ -244,6 +245,7 @@ export function createModelProviders({ directory, changed = () => {}, fetchImpl 
       }
     }
     const reader = res.body.getReader(), decoder = new TextDecoder();
+    const stopListening = cancelOnAbort(reader, requestSignal);   // the connection closes when the person leaves, even if fetch's own abort is not heard (stream-abort.mjs)
     let buffer = '', eventData = [];
     const line = value => {
       if (!value) {
@@ -267,7 +269,7 @@ export function createModelProviders({ directory, changed = () => {}, fetchImpl 
       requestSignal.throwIfAborted();
       if (!finished) fail('The API connection ended early. Partial output is preserved; try again.');
       if (!textLength) fail('The model returned no text. Choose a model that supports text chat.');
-    } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+    } finally { stopListening(); await reader.cancel().catch(() => {}); reader.releaseLock(); }
     const durationMs = Date.now() - started;
     const result = { tokensIn, tokensOut, usageSource: tokensIn !== null && tokensOut !== null ? 'reported' : 'unavailable', durationMs, ttftMs: firstToken, tps: answerSpeed(tokensOut, durationMs, firstToken) };
     onFrame({ type: 'done', ...result }); return result;

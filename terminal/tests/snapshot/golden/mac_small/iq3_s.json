@@ -91,7 +91,8 @@
      "int8"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": []
    }
@@ -194,7 +195,8 @@
      "int8"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": []
    }
@@ -298,7 +300,8 @@
      "int8"
     ],
     "env_set": {
-     "GGML_NO_BACKTRACE": "1"
+     "GGML_NO_BACKTRACE": "1",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": []
    }

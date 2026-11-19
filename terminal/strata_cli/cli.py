@@ -533,6 +533,9 @@ def parser() -> argparse.ArgumentParser:
     code_sessions = code_sp.add_parser("sessions", help="shared harness sessions")
     code_sessions.add_argument("action", choices=("list",))
     code_sessions.add_argument("--output", choices=("human", "json"), default="human")
+    complete = sp.add_parser("complete", help="print a bash, zsh or fish tab-completion script for the strata command")
+    complete.add_argument("--shell", choices=("bash", "zsh", "fish"), default="bash",
+                          help="which shell to print the script for (default bash)")
     for one_shot in (profile_create, profile_list, profile_show, profile_validate, profile_set,
                      profile_source, profile_edit, profile_history, profile_rollback, doctor,
                      components_verify, models_list, models_inspect, models_import, models_move, calibrate,
@@ -1197,6 +1200,22 @@ def _bench(a: argparse.Namespace) -> int:
         return _success({"summary": result}, machine=machine,
                         human=bench.format_summary(result))
     if a.bench_command == "compare":
+        from strata_cli import bench_standard
+        # #4325: the default run writes the standard report, which `bench.load` does not read. Two standard reports are compared here; one of each kind is said plainly.
+        base_std, cand_std = bench_standard.load_if_standard(Path(a.baseline)), bench_standard.load_if_standard(Path(a.candidate))
+        if (base_std is None) != (cand_std is None):
+            raise ProfileError("cannot compare a standard benchmark result with a serving-suite result: give two results of the same kind", 5)
+        if base_std is not None:
+            result = bench_standard.compare(base_std, cand_std)
+            if a.output == "markdown":
+                rendered = bench_standard.markdown_comparison(result)
+                if a.out:
+                    bench.write_markdown(Path(a.out), rendered)
+                    print(f"Markdown comparison: {Path(a.out).resolve()}")
+                else:
+                    print(rendered, end="")
+                return 0
+            return _success({"comparison": result}, machine=machine, human=bench_standard.format_comparison(result))
         result = bench.compare(bench.load(Path(a.baseline)), bench.load(Path(a.candidate)))
         if a.output == "markdown":
             rendered = bench.markdown_comparison(result)
@@ -2200,6 +2219,10 @@ def _run(a: argparse.Namespace) -> int:
             return _timeskip(a)
         if a.command == "presets":
             return tune_commands.presets_command(a)
+        if a.command == "complete":
+            from strata_cli import completion
+            sys.stdout.write(completion.script(parser(), a.shell))
+            return 0
         if a.command in ("launch", "connect"):
             from strata_cli.launch import cmd as launch_cmd
             return launch_cmd.run_launch(a) if a.command == "launch" else launch_cmd.run_connect(a)

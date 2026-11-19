@@ -21,7 +21,7 @@
     "vision": "cpu",
     "low_ram": false,
     "resident": false,
-    "ram_budget_gib": 40,
+    "ram_budget_gib": 47,
     "in_budget": true,
     "engine_version": "0.2.12"
    },
@@ -51,7 +51,7 @@
      "--kv-resident",
      "32768",
      "--resident-budget-gib",
-     "39",
+     "46",
      "--vision"
     ],
     "cwd": "<REPO>",
@@ -60,6 +60,10 @@
     "log": "<REPO>/strata-unsloth-ud-iq4_xs-v31.log",
     "lib_dirs": [],
     "port": 8080,
+    "ui_budget_work_gib": 39,
+    "env": {
+     "STRATA_ROUTE_TAIL_SKIP": "0"
+    },
     "vision": {
      "exe": "<ROOT>/engine/strata-vision",
      "mmproj": "<ROOT>/data/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
@@ -95,12 +99,13 @@
      "--kv-resident",
      "32768",
      "--resident-budget-gib",
-     "39",
+     "46",
      "--vision"
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",
-     "MALLOC_ARENA_MAX": "2"
+     "MALLOC_ARENA_MAX": "2",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": [
      "[strata] Drafting: MTP (the DFlash2 drafter isn't downloaded yet)"
@@ -108,7 +113,7 @@
    },
    "setup_says": [
     "[ok] KV streaming on: the context's KV cache lives in RAM (0.9 GB), more experts fit in VRAM",
-    "[ok] RAM budget: 39 GiB (less the KV cache's RAM)"
+    "[ok] RAM budget: 46 GiB (less the KV cache's RAM)"
    ]
   },
   "launch": {
@@ -215,7 +220,8 @@
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",
-     "MALLOC_ARENA_MAX": "2"
+     "MALLOC_ARENA_MAX": "2",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.8)",
@@ -360,7 +366,8 @@
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",
-     "MALLOC_ARENA_MAX": "2"
+     "MALLOC_ARENA_MAX": "2",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.8)",
@@ -490,7 +497,8 @@
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",
-     "MALLOC_ARENA_MAX": "2"
+     "MALLOC_ARENA_MAX": "2",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.8)",

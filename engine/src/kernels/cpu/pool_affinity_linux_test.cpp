@@ -250,6 +250,63 @@ static bool failed_pin_preserves_affinity() {
     return helper_unchanged && !invalid.valid && public_unchanged;
 }
 
+static size_t mask_popcount(const std::vector<unsigned long>& words) {
+    size_t bits = 0;
+    for (unsigned long w : words)
+        for (unsigned long x = w; x != 0; x &= x - 1) ++bits;
+    return bits;
+}
+
+// PR#14: the mask read once had an unbraced `else` that bound to the INNER `if (CPU_ISSET(...))`, so every CPU id
+// outside the mask re-appended all hardware_concurrency() ids: a k-of-CPU_SETSIZE mask returned
+// k + (CPU_SETSIZE - k) * hardware_concurrency() - 1 entries (issue #13: 16143 CPUs on a 16-thread box).
+// Guard: pin this process to the first few allowed CPUs and require the list read to equal the mask's popcount
+// exactly - the blow-up shape named, computed and rejected - and everything derived from it (physical_cores,
+// detect_cpu_topology) to stay inside the mask.  No root, no cgroups, no quota: pure affinity.
+static bool dangling_else_guard(const std::vector<int>& allowed) {
+    if (allowed.size() < 2) {
+        std::puts("SKIP dangling-else guard: fewer than two allowed CPUs");
+        return true;
+    }
+    const size_t k = (std::min)(size_t(4), allowed.size());
+    const std::vector<int> restricted(allowed.begin(), allowed.begin() + k);
+    if (!set_affinity(restricted)) return false;
+    bool ok = true;
+    std::vector<unsigned long> mask;
+    std::vector<int> cpus;
+    if (cpu::detail::get_thread_affinity(mask, &cpus) != 0) {
+        std::fprintf(stderr, "dangling-else guard: get_thread_affinity failed on the restricted mask\n");
+        ok = false;
+    }
+    if (ok) {
+        const size_t bits = mask_popcount(mask);
+        // the exact list AND the two size identities; a re-introduced dangling else fails all three at once
+        ok = cpus == restricted && cpus.size() == bits && bits == k;
+        // the old bug's shape, stated as the number it produced and refused as such (CPU_SETSIZE == 1024 on glibc)
+        const long long blow_up = (long long) k + (long long) (CPU_SETSIZE - k) *
+                                              (long long) std::thread::hardware_concurrency() - 1;
+        if (!ok)
+            std::fprintf(stderr,
+                         "dangling-else guard: mask read gave %zu CPUs, mask holds %lu bits, set wanted %zu (the dangling else gave %lld)\n",
+                         cpus.size(), (unsigned long) bits, k, blow_up);
+        ok = ok && (long long) cpus.size() != blow_up;
+    }
+    if (ok) ok = topology_respects_current_mask();
+    if (ok) {
+        const auto topo = cpu::detect_cpu_topology(false);
+        const auto cores = cpu::physical_cores(false);
+        // logical processors seen == the mask's size; the worker-core list is a non-empty subset of it, never the
+        // (CPU_SETSIZE - k) * h blow-up (physical_cores == topo.worker_cores, both checked)
+        ok = topo.logical == (int) k && !cores.empty() && cores.size() <= k && topo.worker_cores.size() <= k;
+        if (!ok)
+            std::fprintf(stderr, "dangling-else guard: topology %d logical, %zu worker cores for a %zu-CPU mask\n",
+                         topo.logical, topo.worker_cores.size(), k);
+    }
+    const bool restored = set_affinity(allowed) && expect_affinity(allowed, "restore the full mask after the dangling-else guard");
+    if (ok && restored) std::printf("Dangling-else guard: %zu-CPU self-affinity mask read exactly (%zu CPUs), topology stayed inside it\n", k, k);
+    return ok && restored;
+}
+
 int main(int argc, char** argv) {
     bool require_high = false;
     for (int i = 1; i < argc; ++i) {
@@ -272,6 +329,7 @@ int main(int argc, char** argv) {
     if (ok) ok = round_trip_high_cpu(allowed, require_high);
     if (ok) ok = negative_cpu_is_noop();
     if (ok) ok = failed_pin_preserves_affinity();
+    if (ok) ok = dangling_else_guard(allowed);
     const bool restored = original.restore() && expect_affinity(allowed, "final original affinity cleanup");
     if (!ok || !restored) return 1;
 

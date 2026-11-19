@@ -1,0 +1,6 @@
+{
+ "gtui01": "Ya hay un modelo en marcha desde el Terminal",
+ "gtui02": "Un modelo iniciado con strata launch está usando el puerto {0}, así que Strata se abrió en el puerto {1}. La página del Terminal en el puerto {0} pide su propia clave de API, y esta aplicación no usa esa página. Para cargar un modelo aquí, detenga primero el del Terminal (strata launch --stop). Los chats y los ajustes guardados en el puerto {0} no se muestran aquí.",
+ "gtui03": "Faltan algunas imágenes anteriores",
+ "gtui04": "Las imágenes de mensajes anteriores ya no están guardadas en este navegador, así que el modelo no las ve en esta respuesta. Adjúntelas de nuevo si son importantes."
+}

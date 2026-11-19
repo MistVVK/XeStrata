@@ -1064,7 +1064,11 @@ def expected_slots(vram_mib: float, args: list[Any]) -> int:
     reserve = _flag_value(args, "--vram-reserve-mib")
     reserve = int(reserve) if reserve and reserve.isdigit() else SLOT_RESERVE_MIB
     prefill = _flag_value(args, "--prefill")
-    chunk = vram_fit.chunk_of(prefill.split(":")[-1] if prefill else "auto")
+    # "auto:N" is a ceiling the engine stays under: it lends the prompt buffers from the expert slots and picks the chunk by the card, so its N is not a buffer
+    # that sits beside the slots (#5252: --prefill auto:32768 was priced as 21.6 GiB of buffers, 442 slots against the engine's 8,158, and --draft-conf 0.8).
+    # A plain "auto" and an "auto:N" both come to what auto came to on the 8 GB card; only a number is a chunk the person asked for.
+    chunk = vram_fit.chunk_of(prefill if prefill else "auto")
+    # (--kv-resident is not priced here: the base below was measured on starts that had it, RTX 4080 SUPER 2,710 slots; pricing it raised that start to 3,035.)
     # SLOT_BASE_MIB is the baseline that holds the draft layer (the MTP's ~1.08 GiB, measured); DFlash2 is now the ONLY drafter, so that allowance pays for its own
     # 0.89 GiB (measured: "drafter 799 MiB" + its head's staging, 890 MiB beside the engine without one; 192 MiB less than the MTP layer): nothing more is taken off.
     free = (float(vram_mib) - vram_fit.GAP_OTHER_MIB - SLOT_BASE_MIB - vram_fit.session_mib(ctx, kv) - vram_fit.HEAD_MIB - reserve
@@ -1172,11 +1176,23 @@ def _sycl_host_path(value: str) -> Path:
     """#5395: an Intel (SYCL) run config written by sycl/setup_intel.py names the engine's container paths: the folder above the
     Strata checkout (or STRATA_SYCL_ROOT) is mounted at /work (setup_intel.MOUNT, strata-sycl.sh). A check made here on the host
     looks at the same file through that mount; any other path, or a /work path that exists on this computer, is taken as it is.
-    Only for checks: the engine's own arguments keep the container's paths."""
+    Only for checks: the engine's own arguments keep the container's paths.
+    0.2.17: the mount was the folder above the checkout up to 0.2.16 and is the checkout itself since the layout move (setup_intel.MOUNT),
+    so an Intel config written by an earlier Strata names /work paths relative to the folder above the checkout: STRATA_SYCL_ROOT, the
+    checkout and the folder above it are each tried, and the first one that holds the file is the answer (the checkout's, when none does)."""
     folder = Path(value)
     if value.startswith("/work/") and not folder.exists():
-        root = os.environ.get("STRATA_SYCL_ROOT") or str(Path(__file__).resolve().parents[1].parent)
-        return Path(root) / value[len("/work/"):]
+        rest = value[len("/work/"):]
+        checkout = Path(__file__).resolve().parents[1].parent
+        roots = [Path(os.environ["STRATA_SYCL_ROOT"])] if os.environ.get("STRATA_SYCL_ROOT") else []
+        roots += [checkout, checkout.parent]
+        for root in roots:
+            try:
+                if (root / rest).exists():
+                    return root / rest
+            except OSError:
+                continue
+        return roots[0] / rest
     return folder
 
 

@@ -23,10 +23,10 @@ ENV = {      # what each switch writes outside its default
     "faster_long_prompts": {"STRATA_KVA": "1"},
     "faster_12gb_nvidia": {"STRATA_ROUTE_PRIOR": "1.5"},
     "faster_radeon_9000": {"STRATA_PCIE_FRAC_DEFAULT": "old"},
-    "route_tail_skip": {"STRATA_ROUTE_TAIL_SKIP": "0"},          # 0.2.16: a choice (Automatic / Off / 1-9), test_tail_skip_choice.py
+    "route_tail_skip": {"STRATA_ROUTE_TAIL_SKIP": "7"},          # 0.2.16: a choice; 0.2.17: Off by default, On = 7 (test_tail_skip_choice.py)
     "qwen_defaults_026": {"STRATA_DEFAULTS": "026"},         # the Terminal's troubleshooting switch: not in the app
 }
-DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "off", "faster_radeon_9000": "on", "route_tail_skip": "on", "qwen_defaults_026": "off"}
+DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "off", "faster_radeon_9000": "on", "route_tail_skip": "off", "qwen_defaults_026": "off"}
 RTX3060 = {"name": "NVIDIA GeForce RTX 3060", "vendor": "nvidia", "arch": "86", "vram_gb": 12.0}
 RTX4070S = {"name": "NVIDIA GeForce RTX 4070 SUPER", "vendor": "nvidia", "arch": "89", "vram_gb": 12.0}
 RTX4060TI16 = {"name": "NVIDIA GeForce RTX 4060 Ti 16GB", "vendor": "nvidia", "arch": "89", "vram_gb": 16.0}

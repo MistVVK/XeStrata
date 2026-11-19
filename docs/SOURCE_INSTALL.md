@@ -1,9 +1,10 @@
 # Install and build from a source checkout
 
 Use this guide to work on Strata's code or maintain a source-based installation. It is for developers.
-To just use Strata (version 0.2.16), install the [desktop app or the Terminal](INSTALL.md). Installed apps do not use `START-HERE.bat`.
+To just use Strata (version 0.2.17), install the [desktop app or the Terminal](INSTALL.md). Installed apps do not use `START-HERE.bat`.
 
-The repository includes `START-HERE.bat`, `SETUP.bat`, `UPDATE.bat`, `setup.sh` and `update.sh`.
+The repository includes `START-HERE.bat`, `UPDATE.bat` and `setup.sh`. (`SETUP.bat` and `update.sh` went away with the 0.2.16 folder
+layout: `START-HERE.bat --setup` and `./setup.sh --setup` do what `SETUP.bat` did, `START-HERE.bat --update` and `./setup.sh --update` what `update.sh` did.)
 Run them from a cloned or extracted **source folder**. They may install dependencies, prepare model files and
 acquire or build an engine. Check [model requirements](MODELS.md) before downloading.
 
@@ -15,7 +16,7 @@ acquire or build an engine. Check [model requirements](MODELS.md) before downloa
 | Linux | `./setup.sh` ([steps](#from-source-linux)) |
 | Mac (Apple Silicon) | `./setup.sh` ([steps](#from-source-mac)) |
 | A source build to test a change | `./setup.sh --build --no-start` ([steps](#build-from-git-on-linux-to-try-a-pull-request-or-change-the-code)) |
-| An update | `UPDATE.bat` or `./update.sh` ([steps](#updating)) |
+| An update | `UPDATE.bat` or `./setup.sh --update` ([steps](#updating)) |
 
 ## From source: Windows
 
@@ -150,10 +151,15 @@ a local build. Strata never switches to a local build by itself, not even when i
 
 ## Updating
 
-Stop the running source engine before replacing it. Run `UPDATE.bat` on Windows or `./update.sh` on Linux.
+Stop the running source engine before replacing it. Run `UPDATE.bat` on Windows or `./setup.sh --update` on Linux and Mac.
 In a Git checkout the updater can pull source changes, update dependencies and refresh installed configs without
 starting the model. A source ZIP cannot pull Git history: extract a newer source archive instead.
 Preserve your configs and data location when moving between checkouts.
+
+Since 0.2.16 the checkout has a folder for each part (`app/`, `engine/`, `terminal/`, `docs/`, `tools/`). A run config that names a file
+by its old place in the checkout keeps working until the engine restarts and then fails to open it: the expert profile moved from
+`data/expert-profile.bin` to `terminal/data/expert-profile.bin`, and the server from `serve/server.py` to `terminal/serve/server.py`.
+After an update from 0.2.15 or older, point such paths (and the `ExecStart` of a service unit) at the new places.
 
 If you changed engine code, rebuild it and verify the executable path again. The presence of updated source files
 is not evidence that a running engine contains those changes. Desktop and Terminal component updates are covered

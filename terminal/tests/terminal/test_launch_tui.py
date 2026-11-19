@@ -822,7 +822,7 @@ class SaveAndRun(Base):
             self.assertIn("Qwen3.8-Flash-Next IQ3_S", t)
             self.assertIn("128K, memory int8", t)
             self.assertIn("skipped", t)                               # T5: Tuning starts on Skip
-            self.assertIn("Download  the engine for your graphics card", t)      # T2: the list of downloads, with sizes
+            self.assertRegex(t, r"Download +the engine for your graphics card")      # T2: the list of downloads, with sizes
             self.assertIn("the model, 84 GB", t)
             self.assertIn("This computer only, port 8080", t)
             await press(pilot, "enter")                               # Save as a preset and launch

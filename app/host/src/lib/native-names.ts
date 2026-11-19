@@ -2,7 +2,7 @@
  * A short name for a downloaded optimized model: the family and the quantization ("Swift IQ2_XS", "Gyro-S", "IQ3_S"), made from the id the
  * installation gives it (the family tag in front of the lower-cased quantization). The long name stays available as a tooltip.
  */
-const FAMILIES: [string, string][] = [['swift-', 'Swift'], ['coder-', 'Coder'], ['unsloth-', 'Unsloth'], ['gyro-gyro-', 'Gyro'], ['gyro-', 'Gyro'], ['nvfp4-', 'NVFP4'], ['qwen36-', 'Qwen3.6']];
+const FAMILIES: [string, string][] = [['swift-', 'Swift'], ['coder-', 'Coder'], ['unsloth-', 'Unsloth'], ['gyro-gyro-', 'Gyro'], ['gyro-', 'Gyro'], ['nvfp4-', 'NVFP4'], ['qwen36-', 'Qwen3.6'], ['hy4-flash-', 'Hy4-Flash']];
 
 /**
  * The three NVFP4 versions, named by who made the weights (the plain model names NVFP4 / NVFP4-NVIDIA / NVFP4-QAD looked like the same thing):

@@ -35,6 +35,14 @@ def _no_language_of_the_box():
         yield
 
 
+# serve/winjob.py keeps the real subprocess.Popen class at its first import (`_REAL_POPEN`, to tell a test's stand-in from a real child). A test that replaces
+# subprocess.Popen and is the first to import it (which test comes first depends on how `tools/check --shard` splits the files) left it a Mock, and every later
+# start_contained() call failed with "isinstance() arg 2 must be a type" (Windows shard 3/4 of INT-0217). Import it here, before any test runs.
+try:
+    import serve.winjob  # noqa: F401
+except ImportError:
+    pass
+
 _home = tempfile.mkdtemp(prefix="strata-pytest-config-")
 # a STRATA_SETTINGS_FILE inherited from the shell would point every test at the real file whatever APPDATA says (strata_mcp.Strata.settings_path): none for the session
 os.environ.pop("STRATA_SETTINGS_FILE", None)

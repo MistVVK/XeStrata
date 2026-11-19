@@ -1,6 +1,8 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/mtp_head_rule.hpp"
 #include "strata/core/pin_budget.hpp"
+#include "strata/core/per_device_flag.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -275,7 +277,7 @@ bool MtpDrafter::make_q4_head(std::string& err) {
         if (!mtp_to_float(head_->type(), src.data() + (size_t) r * in_row, row.data(), N)) { err = "mtp: --mtp-q4 cannot read the head's format"; return false; }
         mtp_quant_q4_0(row.data(), dst.data() + (size_t) r * out_row, N);
     }
-    // the Q4_0 rows replace the subset in place (they are smaller)
+    // the Q4_0 rows replace the subset in place (the buffer holds the wider of the two rows: bind, mtp_draft_head_row_cap)
     if (cudaMemcpy(dhead_, dst.data(), dst.size(), cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: writing the draft head"; return false; }
     dhead_type_ = GGML_Q4_0;
     std::fprintf(stderr, "strata mtp: --mtp-q4: draft head over %lld tokens as Q4_0 (%.1f MiB read per step, was %.1f)\n",
@@ -513,13 +515,16 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // it (the commit is only needed by the next window, and now runs beside the draft).  R9700, UD-Q4_K_XL: draft wall
     // 5.8 -> 3.5 ms a window (notes-latency.md).
     {
-        static const bool hip_prio = [] {
-            if (const char* v = std::getenv("STRATA_MTP_HIP_PRIO"); v != nullptr && *v != 0) return std::atoi(v) != 0;
-            int dev = 0;
-            cudaDeviceProp prop{};
-            return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
-                   strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName);
-        }();
+        static strata::core::PerDeviceFlag<> gfx12_dev;   // per card (#4431): the drafter of each stage asks for its own card
+        const char* prio_env = std::getenv("STRATA_MTP_HIP_PRIO");
+        int prio_dev = 0;
+        if (cudaGetDevice(&prio_dev) != cudaSuccess) (void) cudaGetLastError();
+        const bool hip_prio = (prio_env != nullptr && *prio_env != 0)
+            ? std::atoi(prio_env) != 0
+            : gfx12_dev.get(prio_dev, [](int d) {
+                  cudaDeviceProp prop{};
+                  return cudaGetDeviceProperties(&prop, d) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName);
+              });
         int lo = 0, hi = 0;
         if (hip_prio && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess)
             prio = hipStreamCreateWithPriority(&cs_, hipStreamNonBlocking, hi) == hipSuccess;
@@ -821,8 +826,10 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         if (read_file(vocab_file(), raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
+            // #5841: --mtp-q4 head/all rewrites the subset as Q4_0 rows in place; a head in IQ4_XS has the narrower row, so the buffer takes the wider one
+            const int64_t head_cap = strata::core::mtp_draft_head_row_cap(row_bytes, g_->n_embd, q4_head_);
             if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
-                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
+                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * head_cap)) != cudaSuccess) {
                 err = "mtp: the draft head does not fit";
                 draft_head_hint(n_dvocab_, row_bytes);
                 return false;
@@ -859,7 +866,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             }
             cudaDeviceSynchronize();
-            vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
+            vram_ += (uint64_t) (n_dvocab_ * head_cap) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
             dhead_type_ = head->type();
@@ -880,6 +887,13 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 std::fprintf(stderr, "strata mtp: the draft head on the Pascal Q8_0 GEMV (STRATA_MTP_Q8_SM60=1)\n");
             }
         }
+    }
+    if (q4_head_ && dhead_ == nullptr) {
+        // (#4333: a warning, not a refusal - the setup config of some machines passes --mtp-q4 all, and a pack without a subset
+        // used to start; drafting then runs over the full head, as it always did)
+        std::fprintf(stderr, "strata mtp: --mtp-q4 head/all has no effect: it requantizes the draft head's subset, and none is installed "
+                             "(rt/draft_vocab.bin or --mtp-draft-vocab FILE is absent or empty, or STRATA_MTP_FULL_HEAD=1 excludes it); "
+                             "drafting runs over the full head. Install a subset (tools/draft_vocab.py) to use it\n");
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
     return true;

@@ -95,6 +95,20 @@ class IntelSysfsReader(unittest.TestCase):
             self.assertAlmostEqual(second["power"], 50.0, delta=5.0)
             self.assertFalse(telemetry._Intel(1, sysfs=str(root), zes=NoZes()).ok(), "only one discrete Intel card here")
 
+    def test_the_pkg_energy_label_is_not_the_temperature_sensor(self):
+        # 0.2.17 (#6243): an xe card labels its energy counter "pkg" too (energy2_label), in microjoules; the scan for the "pkg" sensor
+        # took any *_label, so with that file listed first the counter / 1000 showed as the temperature (hundreds of millions of degrees).
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            h = b70_tree(root)
+            write(h / "energy1_label", "card\n")
+            write(h / "energy2_label", "pkg\n"); write(h / "energy2_input", "190990789367\n")
+            r = telemetry._Intel(0, sysfs=str(root), stat=str(root / "no-gpustat.json"), proc=str(root / "proc"), zes=NoZes())
+            real = os.listdir
+            order = lambda p: sorted(real(p), key=lambda n: (not n.startswith("energy"), n)) if str(p) == str(h) else real(p)
+            with mock.patch.object(telemetry.os, "listdir", side_effect=order):
+                self.assertEqual(r.read()["temp"], 52.0)
+
     def test_a750_on_i915_is_found_and_read(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

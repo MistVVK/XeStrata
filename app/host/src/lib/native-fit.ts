@@ -6,7 +6,7 @@
  * about 10 GB left for the system; whatever is left is read from the SSD. The same rules setup uses to choose its low-RAM mode
  * (setup.py: low_ram_gpu_gb, LOW_RAM_HEADROOM_GB), so the page and the engine agree.
  */
-export interface FitInput { ram_needed_gb?: number; experts_gb?: number | null; memory_gb?: number; mem_total?: boolean; /** the weight files without the lookup table, when the catalog states them */ fit_gb?: number | null; /** Qwen3.6: its own context rule (below) */ context_fit?: ContextFit | null }
+export interface FitInput { ram_needed_gb?: number; experts_gb?: number | null; memory_gb?: number; mem_total?: boolean; /** the weight files without the lookup table, when the catalog states them */ fit_gb?: number | null; /** Qwen3.6: its own context rule (below) */ context_fit?: ContextFit | null; /** Tencent Hy4-Flash: the author's rank-cut verdict from the catalog (strata_control/hy4_fit.py) */ hy4?: { mode: string } | null }
 export interface FitHardware { ram_gb?: number | null; vram_gb?: number | null }
 export interface Fit {
   /** RAM + VRAM the version needs (the n-gram table not counted). */
@@ -146,6 +146,8 @@ export type VersionFit = 'fits' | 'ssd' | 'unknown';
 export function versionFit(v: FitInput & { on_this_pc?: string | null }, hw: FitHardware | null | undefined, cache?: CacheChoice | null): VersionFit {
   const fit = fitOn(v, hw, true, cache);
   if (!fit.known) return 'unknown';
+  // Tencent Hy4-Flash: the catalog's verdict by the author's rank-cut rule (strata_control/hy4_fit.py; its experts are placed video memory, then RAM, then the SSD)
+  if (v.hy4) return v.hy4.mode === 'cross_tier_ssd' ? 'ssd' : 'fits';
   const size = typeof v.fit_gb === 'number' && Number.isFinite(v.fit_gb) ? v.fit_gb : fit.memoryGb;
   return size <= Number(hw?.ram_gb) + (Number(hw?.vram_gb) || 0) ? 'fits' : 'ssd';
 }

@@ -23,6 +23,7 @@ import { PREVIEW_EXAMPLES, type PreviewArtifact } from './artifacts';
 import { lifecyclePolicy } from './lifecycle';
 import { newestServingState } from './serving-state';
 import { photoData, uploadChatPhotos, photoHistorySlots, pendingChatPhotos, takeChatPhotos } from './chat-photos';
+import { readHistoryPictures, lostPicturesNote } from './history-pictures';
 import { applyNativeEvent, nativeState } from './native';
 import { pictureStatus } from './pictures';
 import { noModelNotice } from './no-model';
@@ -639,8 +640,10 @@ function rememberShellLanguage(language:Language){api.post('/api/shell/prefs',{l
 /** The shell started on another port than it wanted: the chats and settings saved on that port are not here, so say so once (#3402). */
 async function announcePortNotice(){
   try{
-    const shell=await api.get<{portNotice:{wanted:number;used:number}|null}>('/api/shell');
-    if(shell.portNotice)pushToast('warn',tr('Strata could not use its port'),tr('Port {0} is used by another program, so Strata started on port {1}. Chats and settings saved on port {0} are not shown until Strata can use it again. Close the other program and restart Strata.',[shell.portNotice.wanted,shell.portNotice.used]));
+    const shell=await api.get<{portNotice:{wanted:number;used:number;terminal?:boolean}|null}>('/api/shell');
+    /* A model started from the Terminal holds the port (#6278): say that, and that the Terminal's page there needs its own key. */
+    if(shell.portNotice?.terminal)pushToast('warn',tr('A model is already running from the Terminal'),tr('A model started with strata launch is using port {0}, so Strata opened on port {1} instead. The Terminal’s page on port {0} asks for its own API key, and this app does not use that page. To load a model here, stop the Terminal’s one first (strata launch --stop). Chats and settings saved on port {0} are not shown here.',[shell.portNotice.wanted,shell.portNotice.used]));
+    else if(shell.portNotice)pushToast('warn',tr('Strata could not use its port'),tr('Port {0} is used by another program, so Strata started on port {1}. Chats and settings saved on port {0} are not shown until Strata can use it again. Close the other program and restart Strata.',[shell.portNotice.wanted,shell.portNotice.used]));
   }catch{/* a browser or an older host has no shell */}
 }
 export function setFontFamily(fontFamily:string){set({fontFamily:fontFamily.trim().slice(0,128).replace(/[\x00-\x1f]/g,'')});savePrefs();}
@@ -2203,7 +2206,13 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
         sessionId,
         ...(planStart ? { planId: planStart } : {}),
         ...(resume ? { goalAction: 'resume' } : planStart ? {} : { message: options.shown ? body : body }),
-        history:await Promise.all(prior.map(async(m,index)=>{const included=pictureCheck.ok?(m.photos??[]).filter((_,p)=>imageSlots.has(`${index}:${p}`)):[];const omitted=(m.photos??[]).filter(p=>!included.includes(p));const text=m.content+(omitted.length?`\n[Earlier pictures: ${omitted.map(p=>p.name).join(', ')}. Their pixels are outside this model's image context; ask to reattach them if needed.]`:'');return {role:m.role,content:included.length?[{type:'text',text},...await Promise.all(included.map(async photo=>({type:'image_url',image_url:{url:(await photoData(photo)).url}})))]:text};})),
+        history:await (async()=>{
+          /* A picture the browser no longer has (storage cleared, another browser) is left out and named; it used to stop every later message of the chat (GUI-TUI 0.2.17). */
+          let missing=false;
+          const built=await Promise.all(prior.map(async(m,index)=>{const included=pictureCheck.ok?(m.photos??[]).filter((_,p)=>imageSlots.has(`${index}:${p}`)):[];const omitted=(m.photos??[]).filter(p=>!included.includes(p));const {found,lost}=await readHistoryPictures(included,photoData);if(lost.length)missing=true;const text=m.content+(omitted.length?`\n[Earlier pictures: ${omitted.map(p=>p.name).join(', ')}. Their pixels are outside this model's image context; ask to reattach them if needed.]`:'')+lostPicturesNote(lost);return {role:m.role,content:found.length?[{type:'text',text},...found.map(f=>({type:'image_url',image_url:{url:f.url}}))]:text};}));
+          if(missing)pushToast('warn','Some earlier pictures are missing','Pictures from earlier messages are no longer stored in this browser, so the model does not see them in this answer. Attach them again if they matter.');
+          return built;
+        })(),
         model: state.library?.loaded ?? state.library?.current ?? null,
         remoteModel: state.remoteModel,
         nativeModelId:nativeState()?.instances.length?nativeState()?.defaultId:undefined,

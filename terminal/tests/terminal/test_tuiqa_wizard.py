@@ -92,14 +92,16 @@ class SaveChoices(Base):
         async def case(app, pilot, ctx):
             await press(pilot, *("enter",) * 7, "n", "enter")
             shown = text_of(app)
-            for part in ("Save as preset, then launch", "Context", "Pictures", "Parallel", "Tuning", "Access", "Storage"):
+            for part in ("Save as preset, then launch", "Context", "Pictures", "Parallel", "Tuning", "Access", "Strata data"):
                 self.assertIn(part, shown)
         self.run_app(case)
 
 
 def path_of(n: int) -> str:
-    """A storage path of exactly `n` characters, starting with /home/ana/ and ending with /Strata-data."""
-    head, tail = "/home/ana/", "/Strata-data"
+    """A storage path of exactly `n` characters, starting with /ana-qa/ and ending with /Strata-data. The head is a folder that exists on no
+    computer: it was /home/ana/, which exists on the lent box boston (another person's home, unreadable: the plan's disk look-up raised PermissionError
+    and the Save screen was never repainted, so this test failed there and only there; 0.2.17)."""
+    head, tail = "/ana-qa/", "/Strata-data"
     p = head + ("models-and-more-" * 20)[: n - len(head) - len(tail)] + tail
     assert len(p) == n
     return p
@@ -126,10 +128,10 @@ class StoragePath(Base):
                         self.assertIn(choice, shown, (n, shown))
                     body, menu = app.screen.query_one("#body"), app.screen.menu()
                     self.assertLessEqual(menu.region.bottom, body.region.bottom, n)
-                    rows = [r for r in shown.split("\n") if "Storage" in r]
+                    rows = [r for r in shown.split("\n") if "Strata data" in r]
                     self.assertEqual(len(rows), 1, (n, shown))
                     row = rows[0].strip()
-                    self.assertIn("Storage /home/ana/", row, (n, row))                 # (80x24 holds the short form of the summary: one line "Access ... Storage <path>")
+                    self.assertRegex(row, r"^Strata data +/ana-qa/", (n, row))          # (0217: 80x24 shows the folder as a row of its own; the label is "Strata data"; /ana-qa/ is a folder on no computer, PLAT)
                     self.assertTrue(row.endswith("/Strata-data"), (n, row))
                     self.assertLessEqual(len(rows[0]), 80, (n, row))
                     if n <= 60:

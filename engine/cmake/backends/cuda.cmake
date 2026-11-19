@@ -242,7 +242,7 @@ if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND NOT STRATA_ENABLE_HIP AND NOT S
     set_tests_properties(cuda_spill_guard PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     if(NOT WIN32)   # its stand-in demanglers are sh scripts
       add_test(NAME check_cuda_spills_unit COMMAND ${Python3_EXECUTABLE} -m unittest tools.test_check_cuda_spills
-               WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+               WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)   # the repository root: tools/ left engine/ in the 0.2.16 layout move
     endif()
   else()
     message(STATUS "strata: no python3 - the cuda_spill_guard test is NOT registered")

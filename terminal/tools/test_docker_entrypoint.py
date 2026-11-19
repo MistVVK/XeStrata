@@ -258,6 +258,8 @@ class Entrypoint(unittest.TestCase):
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 3)
         self.assertIn("--gpus all", r.stderr)
+        for podman in ("--device nvidia.com/gpu=all", "/dev/nvidia0", "/dev/nvidia-uvm", "libcuda", "docs/DOCKER.md, Troubleshooting, Podman"):    # 0.2.17: Podman's way too
+            self.assertIn(podman, r.stderr)
         self.assertNotIn("launch --no-tui", self.log.read_text())
         (dev / "nvidia0").write_text("")                                  # with the device files the start goes on
         p = self.start(STUB_BACKEND="cuda", STRATA_DEV_DIR=str(dev), MODEL="Q2_0")

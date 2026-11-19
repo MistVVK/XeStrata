@@ -184,7 +184,9 @@ def openai_collect(chunks) -> dict:
     calls = [by_index[i] for i in sorted(by_index)]
     if last["choices"][0]["finish_reason"] != "tool_calls":
         calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
-    msg = {"role": "assistant", "content": "".join(content) or None}
+    # null content only beside tool calls, as OpenAI sends it; a reply that ran out of tokens while thinking gets ""
+    # so strict OpenAI clients and proxies that require a string do not fail on it.
+    msg = {"role": "assistant", "content": "".join(content) or (None if calls else "")}
     if "".join(reasoning).strip() and "".join(reasoning).strip() == "".join(content).strip():
         reasoning = []              # a turn with no </think>: the text is the answer; it is not also reasoning
     if "".join(reasoning):

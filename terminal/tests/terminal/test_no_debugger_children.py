@@ -116,7 +116,11 @@ class SpawnEnvironments(unittest.TestCase):
                 with self.assertRaises(tune_engine.MeasurementError):
                     tune_api.ApiHarness(python=sys.executable, serve_dir=Path(d), config_path=Path(d) / "c.json", env=env).start()
                 if env is None:
-                    self.assertEqual(seen, [None, None], "no environment given: the child inherits this process's, set at the entry point")
+                    # no environment given: the API worker inherits this process's, set at the entry point; the engine harness gets this process's
+                    # environment as a copy with the start defaults (0.2.17: STRATA_ROUTE_TAIL_SKIP=0, tests/terminal/test_tail_skip_default_off.py)
+                    self.assertIsNone(seen[1])
+                    self.assertEqual(seen[0][NO_BACKTRACE], "1")
+                    self.assertEqual(seen[0]["STRATA_ROUTE_TAIL_SKIP"], os.environ.get("STRATA_ROUTE_TAIL_SKIP", "0"))
                 else:
                     self.assertEqual([e[NO_BACKTRACE] for e in seen], ["1", "1"])
                     self.assertEqual([e["PATH"] for e in seen], ["x", "x"])
@@ -153,6 +157,7 @@ STRATA_PROGRAMS = {
     "strata_control/tune_session.py": 1,  # tuning worker (quiet_crash_env)
     "strata_control/tuning.py": 2,     # engine --help and the bare-flag probe of an undocumented flag (#4652), both engine_env
     "strata_control/shape_engine.py": 2,  # engine --version / --geometry (inherit)
+    "serve/hy4_kind.py": 1,            # `strata-hy4 --info <model>` before a Hy4-Flash start (what the engine can do: drafter, images); env through quiet_crash_env
     "strata_control/native_helpers.py": 1,  # an opted-in native helper (strata-<name>, no ggml; inherits)
     "strata_control/local_engine.py": 1,  # the added build's --version check (#5114, quiet_crash_env)
     "strata_control/updater.py": 4,       # --version probes and the AMD test start's strata-device probe (inherit)

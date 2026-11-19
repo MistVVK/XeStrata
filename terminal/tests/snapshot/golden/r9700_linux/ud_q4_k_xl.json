@@ -59,6 +59,9 @@
     "log": "<REPO>/strata-unsloth-ud-q4_k_xl.log",
     "lib_dirs": [],
     "port": 8080,
+    "env": {
+     "STRATA_ROUTE_TAIL_SKIP": "0"
+    },
     "backend": "hip"
    },
    "engine": {
@@ -91,7 +94,8 @@
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",
-     "MALLOC_ARENA_MAX": "2"
+     "MALLOC_ARENA_MAX": "2",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": []
    },
@@ -187,7 +191,8 @@
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",
-     "MALLOC_ARENA_MAX": "2"
+     "MALLOC_ARENA_MAX": "2",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": []
    }
@@ -291,7 +296,8 @@
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",
-     "MALLOC_ARENA_MAX": "2"
+     "MALLOC_ARENA_MAX": "2",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": []
    }
@@ -396,7 +402,8 @@
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",
-     "MALLOC_ARENA_MAX": "2"
+     "MALLOC_ARENA_MAX": "2",
+     "STRATA_ROUTE_TAIL_SKIP": "0"
     },
     "notes": []
    }

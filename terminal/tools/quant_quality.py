@@ -42,7 +42,7 @@ FIXED_ENV = {"STRATA_ROUTE_TAIL_SKIP": "0", "STRATA_PREFILL_CPU_SHARE": "0", "ST
 DROP_VALUE = {"--expert-cache", "--adapt-every", "--pcie-frac", "--suffix-draft", "--prompt-cache", "--max-context",
               "--prefill", "--prompt-cache-every", "--short-read", "--conversation-cache-mib", "--eos-ids",
               "--kv", "--kv-resident"}   # (--resident-budget-gib stays: a PC whose RAM does not hold the experts)
-DROP_FLAG = {"--serve", "--vision", "--resident-experts", "--resident-cpu-experts"}
+DROP_FLAG = {"--serve", "--vision", "--resident-experts", "--resident-cpu-experts", "--prefill-head-alias"}
 
 
 # ------------------------------------------------------------------------------------------------ ids

@@ -1332,3 +1332,70 @@ def load_if_standard(path: Path) -> dict | None:
     if not isinstance(head, dict) or head.get("format") != FORMAT:
         return None
     return load(path)
+
+
+# #4325: `strata bench compare` read only the serving suites' older report, so a folder the default (standard) run wrote was refused. Two standard results are
+# compared by the medians of the speed table: per case, the prompt and decode rates (higher is better) and the first-token and total times (lower is better).
+COMPARED = (("prompt_tps", "Prompt tok/s", 1, True), ("decode_tps", "Decode tok/s", 1, True), ("ttft_s", "TTFT s", 2, False), ("total_s", "Total s", 1, False))
+
+
+def compare(base: dict, cand: dict) -> dict:
+    """The medians of two standard results side by side, with the change in percent and which side is better. Nothing is merged or averaged."""
+    rows = []
+    for case in PERFORMANCE_CASES:
+        for metric, label, digits, higher in COMPARED:
+            if metric == "prompt_tps" and case == "short":
+                continue                                          # the short prompt's rate is the fixed cost of a request (SHORT_PROMPT_NOTE)
+            a, b = _find(base, "performance", case, metric), _find(cand, "performance", case, metric)
+            am = a["median"] if a and a["n"] else None
+            bm = b["median"] if b and b["n"] else None
+            change = round((bm - am) / am * 100, 1) if am and bm is not None else None
+            better = None if not change else ("candidate" if (change > 0) == higher else "baseline")
+            rows.append({"case_id": case, "metric": metric, "label": label, "digits": digits, "baseline": am, "candidate": bm,
+                         "change_pct": change, "better": better})
+
+    def side(doc: dict) -> dict:
+        return {"run_id": doc["run"]["id"], "model": doc["model"]["id"], "quantization": doc["model"]["quantization"],
+                "engine_version": doc["software"]["engine_version"], "context_tokens": doc["configuration"]["context_tokens"],
+                "status": doc["run"]["status"]}
+    sides = {"baseline": side(base), "candidate": side(cand)}
+    notes = [f"the {name} differs between the two runs ({sides['baseline'][key]} and {sides['candidate'][key]})"
+             for key, name in (("model", "model"), ("quantization", "quantization"), ("engine_version", "engine version"), ("context_tokens", "context size"))
+             if sides["baseline"][key] != sides["candidate"][key]]
+    notes += [f"the {w} run is not complete (status {sides[w]['status']}): its numbers cover less than a full run" for w in ("baseline", "candidate")
+              if sides[w]["status"] != "complete"]
+    return {"format": FORMAT + ".comparison", "baseline": sides["baseline"], "candidate": sides["candidate"], "rows": rows, "notes": notes}
+
+
+def _cell(value: float | None, digits: int) -> str:
+    return "not measured" if value is None else f"{value:.{digits}f}"
+
+
+def format_comparison(result: dict) -> str:
+    """The comparison as plain text: one line per case and metric."""
+    b, c = result["baseline"], result["candidate"]
+    lines = [f"Strata standard benchmark comparison", f"Baseline: {b['model'] or 'unknown model'}, engine {b['engine_version'] or 'unknown'} (run {b['run_id']}).",
+             f"Candidate: {c['model'] or 'unknown model'}, engine {c['engine_version'] or 'unknown'} (run {c['run_id']}).", "",
+             "Median of each speed measurement (baseline, candidate, change; the better side is named):"]
+    table = [["Case", "Metric", "Baseline", "Candidate", "Change", "Better"]]
+    for r in result["rows"]:
+        change = "n/a" if r["change_pct"] is None else f"{r['change_pct']:+.1f} %"
+        table.append([r["case_id"], r["label"], _cell(r["baseline"], r["digits"]), _cell(r["candidate"], r["digits"]), change, r["better"] or "-"])
+    widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
+    lines += ["  " + "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip() for row in table]
+    if result["notes"]:
+        lines += ["", "Read with care:"] + [f"  - {n}" for n in result["notes"]]
+    return "\n".join(lines)
+
+
+def markdown_comparison(result: dict) -> str:
+    """The same comparison as a Markdown table."""
+    b, c = result["baseline"], result["candidate"]
+    lines = ["# Strata standard benchmark comparison", "", f"- Baseline: {b['model'] or 'unknown model'}, engine {b['engine_version'] or 'unknown'} (run {b['run_id']})",
+             f"- Candidate: {c['model'] or 'unknown model'}, engine {c['engine_version'] or 'unknown'} (run {c['run_id']})", "",
+             "| Case | Metric | Baseline | Candidate | Change | Better |", "| --- | --- | --- | --- | --- | --- |"]
+    for r in result["rows"]:
+        change = "n/a" if r["change_pct"] is None else f"{r['change_pct']:+.1f} %"
+        lines.append(f"| {r['case_id']} | {r['label']} | {_cell(r['baseline'], r['digits'])} | {_cell(r['candidate'], r['digits'])} | {change} | {r['better'] or '-'} |")
+    lines += [""] + [f"- {n}" for n in result["notes"]]
+    return "\n".join(lines).rstrip() + "\n"

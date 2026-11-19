@@ -1,5 +1,5 @@
 import { tr } from '../lib/i18n';
-import { engineVramForHostCards, memoryInventory } from '../lib/hardware-summary';
+import { engineVramForHostCards, listedGpus, memoryInventory } from '../lib/hardware-summary';
 import { sizeGb } from '../lib/format';
 import type { Hardware } from '../lib/types';
 import type { NativeState } from '../lib/native';
@@ -13,7 +13,7 @@ export function OnboardingMemory({ hardware, native }: {
     // card in the same position when both lists have the same length. Each engine card counts once (two identical cards are not both
     // given the first one's figure). A card the engine does not list stays at 0.
     const nativeGpus = native?.gpus ?? [];
-    const hostGpus = hardware ? hardware.gpus.filter(gpu => gpu.backend !== 'cpu') : [];
+    const hostGpus = hardware ? listedGpus(hardware.gpus.filter(gpu => gpu.backend !== 'cpu')) : [];
     const sizes = engineVramForHostCards(hostGpus, nativeGpus);
     const gpus = hardware ? hostGpus.map((gpu, position) => ({ id: gpu.id ?? String(gpu.index), name: gpu.name, memory: sizes[position], shared: gpu.unified })) : nativeGpus.map(gpu => ({ id: String(gpu.index), name: gpu.name, memory: gpu.vram_gb, shared: false }));
     const dedicatedCount = gpus.filter(gpu => !gpu.shared).length;

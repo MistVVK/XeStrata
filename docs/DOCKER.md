@@ -6,7 +6,7 @@ Intel Arc needs prepared model files. Keep the data volume to reuse downloads an
 
 > **On this page:** [Which image](#which-image-for-which-card) · [One command per card](#one-command-per-card) ·
 > [Docker Compose](#docker-compose) · [Settings](#settings) · [The API key](#the-api-key) · [Connect your apps](#connect-your-coding-apps) ·
-> [Watch and stop](#watch-it-and-stop-it) · [Update](#updating) · [Troubleshooting](#troubleshooting) ·
+> [Watch and stop](#watch-it-and-stop-it) · [Update](#updating) · [Troubleshooting](#troubleshooting) · [Podman](#podman-rootless-on-ubuntu) ·
 > [From the older image](#from-the-older-image) · [Build it yourself](#build-it-yourself)
 
 Docker on a **Mac** has no access to the Mac's graphics chip (no Metal): use the Mac app or the Terminal
@@ -24,9 +24,10 @@ Docker on a **Mac** has no access to the Mac's graphics chip (no Metal): use the
 | AMD **Ryzen AI Max** ("Strix Halo", Radeon 8060S, gfx1151) | `0.2.7-rocm-gfx1151` | the `amdgpu` kernel driver |
 | Intel **Arc** A-series and B-series (including Arc Pro B70) | `0.2.7-sycl` (if no image exists for a release, [build it](#build-it-yourself)) | the `i915` or `xe` kernel driver; **prepared model files** (see [Intel](#intel-arc)) |
 
-**Measured on:** images built from the 0.1.45 engine packages. Size on disk: `cuda13` 2.2 GB, `cuda12` 2.9 GB, `rocm-gfx120x` 2.8 GB,
-`rocm-gfx110x` 2.4 GB, `rocm-gfx1151` 1.5 GB. The download is about a third of that: `cuda13` 640 MB, `cuda12` 845 MB,
-`rocm-gfx120x` 505 MB, `rocm-gfx110x` 330 MB, `sycl` 450 MB. The model comes on top, on the first start. Current sizes may differ.
+**Measured on:** the 0.2.16 images (engine 0.1.62), pulled with Podman. Size on disk: `cuda13` 1.32 GB, `cuda12` 1.65 GB,
+`rocm-gfx120x` 2.73 GB, `rocm-gfx110x` 1.6 GB, `rocm-gfx1151` 1.48 GB, `sycl` 1.47 GB. The download is smaller (the layers are compressed): `cuda13` 713 MB, `cuda12` 904 MB,
+`rocm-gfx120x` 778 MB, `rocm-gfx110x` 415 MB, `rocm-gfx1151` 408 MB, `sycl` 446 MB. The model comes on top, on the first start.
+Current sizes may differ.
 
 Not sure which NVIDIA image? Take `cuda13` when `nvidia-smi` shows driver 580 or newer and the card is an RTX; otherwise `cuda12`.
 A wrong pick does no harm: the container starts, says in plain words that the engine does not fit this card, and stops.
@@ -131,6 +132,9 @@ screens; leave out what you do not care about.
 | `PRESET` | the preset name in `/data` | `docker` |
 | `STRATA_SET` | advanced engine settings, space separated, like `strata launch --set` (`"prefill=65536 STRATA_PIN_BY_NEED=1"`) | none |
 
+The route tail skip (skipping rarely used parts of the model) is off in the container, as everywhere. `STRATA_SET="STRATA_ROUTE_TAIL_SKIP=7"` turns it on;
+the numbers for both choices are in [DETAILS.md](DETAILS.md#route-tail-skip-strata_route_tail_skip-off-by-default-since-0217).
+
 Your choices are saved as a preset in the volume. Start again with no settings and the saved preset is used; start with
 settings and they replace the saved ones (tuning results are kept). To change one thing, recreate the container with the new
 variable; the model and tuning stay in `/data`. Anything else: `docker exec strata strata launch --help`, or
@@ -151,8 +155,10 @@ Mount the folder with the model's GGUF files read-only and name it: `-v /srv/ggu
   If you mount a parent folder, the container says which sub-folder to name in `MODEL_PATH`.
 - The folder has to be mounted: a `MODEL_PATH` that is not in the container, or a folder with no `.gguf` files, stops the start at
   once with a message, and nothing is downloaded.
-- Read-only (`:ro`) is fine. The pack (about 40 GB for IQ3_XXS) and the draft layer (about 6 GB, fetched once) are written to the
-  volume, so it needs that room. With `VISION=on` the picture reader (0.9 GB) is fetched too; `VISION=off` skips it.
+- Read-only (`:ro`) is fine. What is written to the volume is small next to the model: measured with the IQ3_XXS files, the prepared pack
+  is 1.5 GB (the engine reads the experts from your GGUF files), the DFlash2 drafter 0.8 GB on disk (a 1.2 GB download, fetched once), and
+  with `VISION=on` the picture reader 0.9 GB: 3.1 GB for the whole volume. With the MTP draft layer as the drafter instead (`DRAFTING=mtp`) the
+  layer is about 6 GB, fetched once. `VISION=off` skips the picture reader.
 - Links to the files work when the links' targets are mounted too, and `MODEL` is set (without `MODEL`, Strata identifies the files itself
   and does not follow links).
 - Without `MODEL_PATH`, files you put into the volume by hand (`/data/Strata-data/models/<model folder>/`) are found as well, if they have the
@@ -233,7 +239,8 @@ sudo systemctl restart docker
 docker run --rm --gpus all ubuntu nvidia-smi       # must list your card
 ```
 
-On Fedora / RHEL with Podman, use CDI: `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`, then `--device nvidia.com/gpu=all`.
+With Podman use CDI: `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`, then `--device nvidia.com/gpu=all`. If Podman
+cannot read that file (Ubuntu 24.04's Podman 4.9), see [Podman](#podman-rootless-on-ubuntu) below.
 If `nvidia-smi` inside the container works but Strata says the driver is too old, you picked `cuda13` with a driver below 580:
 use the `cuda12` image or update the driver.
 
@@ -263,6 +270,57 @@ an interrupted download continues where it stopped when you start the container 
 (the log names it).
 
 **"No MODEL was set"** warning: fine, Strata chose a model for your card; set `MODEL` to choose yourself.
+
+### Podman (rootless, on Ubuntu)
+
+The image runs under Podman as well; `docker` in the commands above becomes `podman`. Tested with rootless Podman 4.9.3 on Ubuntu 24.04,
+a Tesla P100 and the `0.2.16-cuda12` image: it serves, answers chat, tool calls and pictures, stops cleanly (exit code 0, the graphics memory is
+free again) and starts again from the same volume. Two things on such a computer differ from the Docker commands. Both are about the host, not
+the image.
+
+**`Error: setting up CDI devices: unresolvable CDI devices nvidia.com/gpu=all`.** Podman 4.9 reads the CDI file (`/etc/cdi/nvidia.yaml`),
+but a newer `nvidia-ctk` writes a field it does not know (`unknown field "additionalGids"` in `podman --log-level=debug run ...`), so it
+ignores the whole file. A newer Podman reads it. Without one, pass the card the way the toolkit would: the device files of your card (one
+`--device /dev/nvidiaN` for each card, with the three shared ones) and the driver's libraries, read-only, at the names the engine
+looks for:
+
+```sh
+LIB=/usr/lib/x86_64-linux-gnu          # where your computer keeps them: ldconfig -p | grep 'libcuda.so.1'
+GPU="--device /dev/nvidia0 --device /dev/nvidiactl --device /dev/nvidia-uvm --device /dev/nvidia-uvm-tools"
+for lib in libcuda libnvidia-ml libnvidia-ptxjitcompiler libnvidia-nvvm; do
+  [ -e $LIB/$lib.so.1 ] && GPU="$GPU -v $(readlink -f $LIB/$lib.so.1):$LIB/$lib.so.1:ro"
+done
+GPU="$GPU -v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro"
+```
+
+then use `$GPU` where the Docker commands have `--gpus all`:
+
+```sh
+podman run -d --name strata $GPU -p 127.0.0.1:8080:8080 \
+  --ulimit memlock=-1:-1 --shm-size 2g --stop-timeout 120 \
+  -v strata-data:/data -e FAMILY=qwen -e MODEL=IQ3_XXS -e API_KEY=$(openssl rand -hex 24) \
+  ghcr.io/niko1221/strata:0.2.17-cuda12
+```
+
+If no card reaches the container, its start says so in plain words and stops (exit code 3) before anything is downloaded.
+
+**The container is killed while the model loads (exit code 137, no error in `podman logs`, `OOMKilled` is false).** Ubuntu's
+`systemd-oomd` ends a program of your login when its memory has been under strain for 20 seconds, and a rootless container lives below your
+user manager (`user@<your user number>.service`), where it watches. Loading a model bigger than the free RAM can do that, most of all when an
+earlier start left its copy of the model's files in the memory cache (17 GB on the test computer). `podman ps` can even go on saying
+"running" for a container whose processes are gone; `journalctl --user | grep "oomd killed"` shows the kill.
+
+- **From 0.2.17 the container gives that memory back itself** before the engine starts, and says so in its log (`[strata] memory guard:
+  freed 16 GB of memory that still held copies of this model's files ...`; `STRATA_OOMD_ROOM=0` turns it off). Measured on a Tesla P100
+  computer with 62 GB of RAM, a start that had to build its pack first: the load was ended in 2 of 2 starts without it and went through in 2 of
+  2 with it.
+- With an older image, give the cache of the model's files back yourself right before `podman run`, no root needed (it only forgets copies of
+  files on disk; nothing is deleted): `for f in /srv/gguf/IQ3_XXS/*.gguf; do dd if=$f iflag=nocache count=0 status=none; done` (the model's files
+  on the host, and the same for the big files in the volume's folder). It is what 0.2.17 does inside the container; by hand it was only tried
+  on a volume whose files were already prepared (2 starts, both served).
+- `--cgroups=disabled` is **not** a way out: Podman still puts its `conmon` and the container in a `podman-<number>.scope` below the user manager
+  with that flag (checked in `/proc/<pid>/cgroup`), and a container started with it was ended by `systemd-oomd` too.
+- Docker (rootful) puts containers in the system's slice, where `systemd-oomd` does not look by default; that case was not tested.
 
 ## From the older image
 

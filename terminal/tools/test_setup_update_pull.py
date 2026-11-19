@@ -145,6 +145,33 @@ class UpdatePull(unittest.TestCase):
         call.assert_not_called()
         self.assertIn("git status", out)
 
+    def test_a_clone_without_origin_main_is_not_taken_for_the_old_history(self):
+        """#4390: a failed pull on a clone that has no origin/main (the remote branch is gone from its refs) has no old history to
+        move off: the answer is the general one (git pull did not succeed), not the move to "the new history" that cannot work."""
+        git(self.clone, "update-ref", "-d", "refs/remotes/origin/main")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = setup.pull_onto_new_history(GIT, self.clone)
+        self.assertEqual(rc, 1)
+        self.assertIn("git pull did not succeed", out.getvalue())
+        self.assertNotIn("old history", out.getvalue())
+        self.assertEqual(git(self.clone, "branch", "--list", "pre-cleanup-backup*"), "")      # no backup branch was made
+
+    def test_a_clone_on_unrelated_history_is_still_moved(self):
+        """The case the function is for (#1276) is unchanged: origin/main exists and shares no commit with HEAD."""
+        orphan = self.tmp / "orphan"
+        orphan.mkdir()
+        git(orphan, "init", "-q", "-b", "main")
+        (orphan / "setup.py").write_text("# unrelated\n", encoding="utf-8")
+        git(orphan, "add", "-A")
+        git(orphan, "commit", "-q", "-m", "unrelated")
+        git(self.clone, "fetch", "-q", str(orphan), "main:refs/remotes/origin/main", "--force")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = setup.pull_onto_new_history(GIT, self.clone)
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertIn("Moved to the new history", out.getvalue())
+
     def test_a_clone_on_a_fixed_release_says_so_and_stops(self):
         """P6: a clone on a tag or a commit used to get "Files you changed here can stop it: git status lists them"."""
         git(self.origin, "tag", "v1")

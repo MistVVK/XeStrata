@@ -211,12 +211,18 @@ cards; the Intel Arc engine and the Mac engine do not run it. It reads pictures 
 
 | Size | File | RAM setup plans for | In plain words |
 | --- | ---: | ---: | --- |
-| **UD-Q4_K_XL** | 22.9 GB | 32 GB | 4-bit (Unsloth Dynamic), the smallest |
+| **UD-Q4_K_XL** | 22.9 GB | 32 GB | 4-bit (Unsloth Dynamic), the smallest; see the note below |
 | **UD-Q6_K_XL** | 32.6 GB | 44 GB | 6-bit, closer to the full model |
 | **Q8_0** | 37.8 GB | 52 GB | 8-bit, the closest to the full model |
 
 The picture reader file adds 0.9 GB. The engine keeps every expert it can on the graphics card and computes the rest on
-the CPU.
+the CPU. The "RAM setup plans for" figures are planning sizes for system RAM. They are not a promise that every machine
+with that much RAM runs the size comfortably. On a card that cannot hold most experts (for example 12 GB or 16 GB of
+graphics memory), a large host expert arena stays in system RAM. Free physical RAM after the OS and other programmes
+must cover that arena; if it does not, start can fail after the process has opened with `no host memory for the experts`.
+The decode table below was measured on a Radeon AI PRO R9700 with 32 GB of graphics memory, and on an RTX 3060 with
+12 GB and most experts on the CPU. Those rows are decode speed only. They do not measure how long start takes, and they
+do not describe a 16 GB card sharing 32 GB of system RAM with other large processes.
 
 **Measured on:** UD-Q4_K_XL, decode only.
 

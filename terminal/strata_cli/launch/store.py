@@ -9,6 +9,7 @@ one too (named `launch-<slug>`).
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -112,11 +113,29 @@ def _near(name: str) -> str:
     return (" Saved presets: " + ", ".join(names) + ".") if names else " No presets are saved yet."
 
 
+_LISTED: dict = {}
+
+
+def _listing_key(folder: Path):
+    """(file name, size, modification time) of every preset file: one directory listing, no file opened. None when it cannot be read."""
+    try:
+        with os.scandir(folder) as it:
+            return tuple(sorted((e.name, st.st_size, st.st_mtime_ns) for e in it if e.name.endswith(".json") for st in [e.stat()]))
+    except OSError:
+        return None
+
+
 def list_presets() -> list[LaunchSettings]:
+    """The saved presets, newest use first. The setup screens ask for this on every key (the start screen's list, the Advanced step's default name),
+    so the parsed files are kept while no file's name, size or time changes (#6278); every caller gets its own copies."""
     folder = preset_dir()
     out: list[LaunchSettings] = []
     if not folder.is_dir():
         return out
+    key = _listing_key(folder)
+    hit = _LISTED.get(str(folder))
+    if key is not None and hit is not None and hit[0] == key:
+        return copy.deepcopy(hit[1])
     for path in sorted(folder.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -126,6 +145,8 @@ def list_presets() -> list[LaunchSettings]:
         except (OSError, ValueError):
             continue
     out.sort(key=lambda s: s.last_used or s.created or "", reverse=True)
+    if key is not None:
+        _LISTED[str(folder)] = (key, copy.deepcopy(out))
     return out
 
 

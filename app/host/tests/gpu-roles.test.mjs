@@ -64,6 +64,26 @@ test('saved roles: parse; the server copy agrees on which are usable', () => {
   for (const bad of [{ 0: 'boss' }, { 0: 'main', 1: 'main' }, 'x', {}, null]) { assert.equal(R.parseSaved(bad), null); assert.equal(S.parseSaved(bad), null); }
 });
 
+test('words (0217 item 12): alike cards are said once, with the Terminal\'s words; unlike cards keep their reason', () => {
+  assert.equal(R.sentence(V.hw.equal), 'Both cards are RTX A4000, so they are alike: one is Main and the other helps.');
+  assert.doesNotMatch(R.sentence(V.hw.equal), /the cards are alike/);
+  const four = [0, 1, 2, 3].map(index => ({ index, name: 'NVIDIA RTX A4000', vram_gb: 16, speed: 50 }));
+  assert.equal(R.sentence(four), 'All 4 cards are RTX A4000, so they are alike: one is Main and the others help.');
+  assert.match(R.sentence(V.hw.two), /RTX 4070 Ti is Main: it is faster\. RTX 3060 helps\./);
+});
+
+test('the app page line (GpuRoles.tsx recommendationLine) and the Terminal use the same alike sentence', async () => {
+  const tsx = await readFile(new URL('../src/components/GpuRoles.tsx', import.meta.url), 'utf8');
+  const py = await readFile(new URL('../../../terminal/strata_control/gpu_roles.py', import.meta.url), 'utf8');
+  const two = 'Both cards are {0}, so they are alike: one is Main and the other helps.';
+  const many = 'All {0} cards are {1}, so they are alike: one is Main and the others help.';
+  assert.ok(tsx.includes(`'${two}'`) && tsx.includes(`'${many}'`));
+  assert.ok(py.includes('Both cards are {short_name(m)}, so they are alike: one is Main and the other helps.'));
+  assert.ok(py.includes('All {n} cards are {short_name(m)}, so they are alike: one is Main and the others help.'));
+  const en = JSON.parse(await readFile(new URL('../src/locales/en.json', import.meta.url), 'utf8'));
+  assert.ok(Object.values(en).includes(two) && Object.values(en).includes(many), 'both templates are in the English catalog');
+});
+
 test('words: the sentence and the one-line summary', () => {
   assert.equal(R.sentence(V.hw.one), 'Strata will use your RTX 4070 Ti.');
   assert.match(R.sentence(V.hw.three), /RTX 4070 Ti is Main: it is faster\./);

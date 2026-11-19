@@ -7694,3 +7694,12 @@ button.sent-quote__label { text-decoration: underline; text-underline-offset: 2p
 .native-commit-note { display: flex; flex-direction: column; gap: 2px; margin: 6px 0; }
 .native-commit-note p { margin: 0; display: flex; gap: 6px; align-items: flex-start; }
 .native-commit-note .st-icon { flex: none; margin-top: 2px; }
+
+/* GUI-TUI 0.2.17 QA, 360 px wide (a phone on the local network, a narrow browser window): the Version row and the Computer use switch
+   no longer run past the card: the row wraps, the switch stacks. */
+@media (max-width: 420px) {
+  .native-choice__head { flex-wrap: wrap; row-gap: 6px; }
+  .native-choice__tools { margin-left: 0; flex-wrap: wrap; }
+  .native-choice__col .native-resource-choice { display: flex; flex-wrap: wrap; }
+  .native-choice__col .native-resource-choice button { white-space: normal; height: auto; min-height: 30px; padding: 4px 12px; }
+}

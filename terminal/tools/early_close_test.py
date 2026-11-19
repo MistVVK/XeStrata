@@ -2,10 +2,16 @@
 """A client that stops reading a streamed answer early must not leave its tokens to the next request.
 
   STRATA_KEY=... python3 tools/early_close_test.py http://127.0.0.1:8090
+
+The work sits inside main() behind a __main__ guard on purpose.  The file is named *_test.py, so a
+`pytest tools` run imports it while collecting: an unguarded script this one sent a live chat
+request to whatever server happened to be running, and then aborted the whole collection with
+"ValueError: unknown url type", because the URL was built from sys.argv, which under pytest holds
+pytest's own arguments.
 """
 import json, os, sys, threading, urllib.request
 
-URL = sys.argv[1].rstrip("/") + "/v1/chat/completions"
+URL = ""                                      # main() fills this in from argv[1]
 KEY = os.environ.get("STRATA_KEY", "")
 
 
@@ -30,18 +36,25 @@ def answer(content):
         return (m.get("content") or "") + " " + (m.get("reasoning_content") or m.get("reasoning") or "")
 
 
-ok = True
-# alone (solo path), then the same with a second request running (batch slots)
-for label, background in (("solo", False), ("batch", True)):
-    bg = None
-    if background:
-        bg = threading.Thread(target=answer, args=("Count slowly from 1 to 60, one number per line.",))
-        bg.start()
-    early_close("Describe the weather in Montpellier in great detail, at length.")
-    a = answer("Reply with exactly one word: the color of the sky on a clear day.")
-    good = "blue" in a.lower() and "montpellier" not in a.lower()
-    ok &= good
-    print(f"{label}: {'OK' if good else 'STALE'} -> {a[:120]!r}", flush=True)
-    if bg:
-        bg.join()
-sys.exit(0 if ok else 1)
+def main():
+    global URL
+    URL = sys.argv[1].rstrip("/") + "/v1/chat/completions"
+    ok = True
+    # alone (solo path), then the same with a second request running (batch slots)
+    for label, background in (("solo", False), ("batch", True)):
+        bg = None
+        if background:
+            bg = threading.Thread(target=answer, args=("Count slowly from 1 to 60, one number per line.",))
+            bg.start()
+        early_close("Describe the weather in Montpellier in great detail, at length.")
+        a = answer("Reply with exactly one word: the color of the sky on a clear day.")
+        good = "blue" in a.lower() and "montpellier" not in a.lower()
+        ok &= good
+        print(f"{label}: {'OK' if good else 'STALE'} -> {a[:120]!r}", flush=True)
+        if bg:
+            bg.join()
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -131,6 +131,9 @@ ALLOWED = {
     "strata::kernels::{anonymous}::gr_up_q8_fast_kernel": {"sm_86": (8, 0)},
     # spill 4 / 4 at 40 registers under __launch_bounds__(THREADS = 256), no local array
     "strata::kernels::{anonymous}::gr_up_v3_kernel": {"sm_120": (8, 0)},
+    # i8_kernel<23, true, 4, true, false> on sm_86: an 8-byte stack frame, no spill and no local memory (the sm_89 entry further down carries the same 8 bytes); a CUDA
+    # build for sm_86 failed this check until this line (0.2.17, owner's decision)
+    "strata::kernels::{anonymous}::i8_kernel": {"sm_86": (8, 0)},
     # spill 4 / 4 at 48 registers under __launch_bounds__(256), no local array
     "strata::kernels::{anonymous}::native_down_kernel": {"sm_86": (8, 0)},
     # int off[GRP_NC] / float s[GRP_NC] (GRP_NC = 4): per-entry token offsets and partial sums, plus spill 16 / 16

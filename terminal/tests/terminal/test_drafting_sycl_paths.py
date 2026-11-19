@@ -33,6 +33,28 @@ class SyclContainerPaths(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(drafting._sycl_host_path("/work/Strata-data/mtp/rt"), here / "Strata-data" / "mtp" / "rt")
 
+    def test_a_config_written_before_the_layout_move_is_found_above_the_checkout(self):
+        # 0.2.17 (#5395, again on 0.2.16): the mount was the folder above the checkout; since the layout move the default is the checkout
+        # itself. A data folder beside the checkout (<above>/Strata-data) is where an older Intel config's /work/Strata-data points.
+        with tempfile.TemporaryDirectory() as d:
+            above = Path(d).resolve()
+            checkout = above / "Strata"
+            fake_file = checkout / "terminal" / "strata_control" / "drafting.py"
+            fake_file.parent.mkdir(parents=True)
+            rt = above / "Strata-data" / "mtp" / "rt"
+            rt.mkdir(parents=True)
+            (rt / "experts.bin").write_bytes(b"\0")
+            env = {k: v for k, v in os.environ.items() if k != "STRATA_SYCL_ROOT"}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(drafting, "__file__", str(fake_file)):
+                self.assertEqual(drafting._sycl_host_path("/work/Strata-data/mtp/rt"), rt)
+                self.assertTrue(drafting.mtp_ready(["--mtp", "/work/Strata-data/mtp/rt"]))
+                # a data folder inside the checkout (a fresh 0.2.16 install) is found there first
+                inside = checkout / "Strata-data" / "mtp" / "rt"
+                inside.mkdir(parents=True)
+                self.assertEqual(drafting._sycl_host_path("/work/Strata-data/mtp/rt"), inside)
+                # nowhere: the checkout's path, as before
+                self.assertEqual(drafting._sycl_host_path("/work/nothing/here"), checkout / "nothing" / "here")
+
     def test_host_paths_are_unchanged(self):
         with tempfile.TemporaryDirectory() as d:
             rt = Path(d) / "mtp" / "rt"

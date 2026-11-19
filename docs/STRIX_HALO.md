@@ -16,8 +16,8 @@ Use the [current release](https://github.com/Niko1221/Strata/releases/latest). Y
 
 | System | What to install | Engine variant |
 | --- | --- | --- |
-| Linux | `Strata-0.2.16-linux-x86_64.AppImage` (it downloads the engine on first start), or `strata launch` | `linux-x86_64-hip-halo` |
-| Windows | `Strata-0.2.16-windows-x64-setup.exe` (it downloads the engine on first start), or `strata launch` | `windows-x86_64-hip-rdna3` |
+| Linux | `Strata-0.2.17-linux-x86_64.AppImage` (it downloads the engine on first start), or `strata launch` | `linux-x86_64-hip-halo` |
+| Windows | `Strata-0.2.17-windows-x64-setup.exe` (it downloads the engine on first start), or `strata launch` | `windows-x86_64-hip-rdna3` |
 
 Packaged engines carry the matching hipBLASLt tuning table for gfx1151 and select it on their own. Setup recognizes `gfx1151` and
 PCI ID `1002:1586`; other integrated Radeon chips have separate support limits. Unified memory is counted once. Setup does not
@@ -141,7 +141,7 @@ export STRATA_PREFILL_STREAM_MIN=128   # prompt reads of 128-1,023 tokens on the
 
 `STRATA_PF_GEMM`, `STRATA_HC_UPMIX`, `STRATA_PA_FAST`, `STRATA_HIP_WMMA` and `STRATA_SELECT_WMMA` together are one opt-in on an
 integrated Radeon: `STRATA_IGPU_PROMPT_SET=1` ([AMD_HIP.md](AMD_HIP.md), "Integrated GPUs"), measured on a Radeon 780M only, where
-it is the default. `STRATA_PF_SWITCH_MIN_T` and `STRATA_PREFILL_STREAM_MIN` stay opt-in as well. `STRATA_PF_FUSED` is on by itself on an integrated Radeon under Linux (measured on the 780M only; the Strix Halo takes it by the same rule and was not run there); `STRATA_PF_FUSED=0` keeps MMQ.
+it is the default. `STRATA_PF_SWITCH_MIN_T` and `STRATA_PREFILL_STREAM_MIN` stay opt-in as well. `STRATA_PF_FUSED` is on by itself on an integrated Radeon under Linux (measured on the 780M only; the Strix Halo takes it by the same rule and was not run there); `STRATA_PF_FUSED=0` keeps MMQ in a build that has it (the release builds of 0.2.16 and later have none: `=0` there runs the prompt experts on the native int8 kernels, #6251).
 
 **On Windows the Strix Halo is the exception** (engine 0.1.52 and later): `gfx1151` takes the matrix-core set by itself -
 `STRATA_HIP_WMMA`, `STRATA_PF_GEMM`, `STRATA_PA_FAST`, `STRATA_HC_UPMIX` and `STRATA_PF_FUSED`, without `STRATA_SELECT_WMMA`

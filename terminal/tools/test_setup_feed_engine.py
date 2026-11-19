@@ -82,7 +82,7 @@ class FeedEngine(unittest.TestCase):
         gpu = {"arch": 60, "archs": [60], "vram_gb": 16.0, "index": 0}
         asked = []
 
-        def from_feed(eng, updating=False):               # what the real one does: the package's files, BUILD.json with its archs, become the engine
+        def from_feed(eng, updating=False, backend=None):               # what the real one does: the package's files, BUILD.json with its archs, become the engine
             asked.append(eng)
             (eng / "BUILD.json").write_text(json.dumps({"version": "0.1.62", "source": "prebuilt", "archs": [60, 61, 70, 75, 80, 86, 89]}), encoding="utf-8")
             return eng
@@ -104,6 +104,48 @@ class FeedEngine(unittest.TestCase):
     def test_the_minimum_is_the_0_2_engine(self):
         self.assertLess((0, 1, 45), setup.MIN_ENGINE)
         self.assertGreaterEqual((0, 1, 46), setup.WIN_HIP_MIN_ENGINE)
+
+    def test_the_amd_engine_fetch_tells_the_update_which_family_this_install_is(self):
+        """#4861: get_prebuilt_hip fetches the ready-made engine by running `strata update` as a child process. The
+        child detects the GPU itself, and on a PC that has an NVIDIA card beside the AMD one that detection takes
+        the NVIDIA card first (the documented order), so the AMD setup was handed the CUDA 13 package: it cannot
+        run on the card and the update failed its own test start, ending in "no ready-made AMD engine"."""
+        gpu = {"arch": "gfx1201", "archs": ["gfx1201"], "vram_gb": 16.0, "index": 0}
+        with self.run_update(code=6) as run, \
+                mock.patch.object(setup, "ROOT", self.root), \
+                mock.patch.object(setup, "_urlopen", side_effect=OSError("HTTP Error 404")):
+            self.assertIsNone(setup.get_prebuilt_hip(setup.PREBUILT_URL, gpu))
+        self.assertEqual(run.call_args.kwargs["env"].get("STRATA_ENGINE_BACKEND"), "hip")
+
+    def test_the_fetched_package_is_checked_as_the_family_setup_was_told_to_use(self):
+        """The second half of #4861, found on real mixed hardware by its reporter: after the fetch, setup read the
+        package back with `ec.resolve(store, full=True)` and no family. `resolve()` then runs `detect_backend()`,
+        which on a PC with an AMD card and an NVIDIA card takes the NVIDIA card first, so the hip package the update
+        had just fetched was refused with "This Strata is for AMD RX 9000 cards. Your PC has an NVIDIA card ..."
+        (an `EngineMissing`, which is not a `ComponentProblem`, so it went to setup's top-level handler and stopped
+        the install). The check must be asked for the family setup chose, exactly like the fetch is."""
+        asked = {}
+
+        def resolve(root, *, backend=None, **kwargs):
+            asked["root"], asked["backend"] = root, backend
+            raise ec.ComponentProblem("this test stops at the call it checks")
+
+        gpu = {"arch": "gfx1201", "archs": ["gfx1201"], "vram_gb": 16.0, "index": 0}
+        with self.run_update(code=0), mock.patch.object(setup, "ROOT", self.root), \
+                mock.patch.object(ec, "resolve", side_effect=resolve):
+            self.assertIsNone(setup.engine_from_feed(self.eng, backend="hip"))
+        self.assertEqual(asked.get("backend"), "hip",
+                         "the package read back is checked without the family setup was told to use")
+
+    def test_the_standard_engine_fetch_says_cuda(self):
+        gpu = {"arch": 89, "archs": [89], "vram_gb": 8.0, "index": 0}
+        with mock.patch.object(setup, "engine_dir", lambda toolkit=13: self.eng), \
+                mock.patch.object(setup, "_urlopen", side_effect=OSError("HTTP Error 404")), \
+                mock.patch.object(setup, "engine_from_feed", return_value=None) as feed:
+            setup.get_prebuilt(setup.PREBUILT_URL, gpu, "none", updating=True)
+        feed.assert_called_once()
+        args, kwargs = feed.call_args                 # the call names the family by position (FIX-APP's source check) or by keyword
+        self.assertEqual(kwargs.get("backend", args[2] if len(args) > 2 else None), "cuda")
 
 
 if __name__ == "__main__":

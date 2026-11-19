@@ -153,11 +153,14 @@ old config's `--resident-budget-gib 71` holding the same experts read from the G
 story 39.5 -> 53.3 tok/s, code 60.1 -> 80.4, after a 6K document 49.0 -> 68.8, 5/5 each), prompt 4K x2.07, 6K x1.58,
 32K x1.03.
 
-**The route tail skip** (`STRATA_ROUTE_TAIL_SKIP=7`, the default since 0.1.42: a missed expert every token of a window
-routes at rank 7 or lower is skipped) costs these files more than the 2-3-bit packs: UD-Q4_K_XL's yardstick KL against
-Q8_0 goes from 0.056 to 0.086 with every expert in RAM (R9700, the auto cache) and from 0.053 to 0.115 in the RAM
-budget mode (A4000, 1,500 GPU slots), for +4-10% decode in RAM and +26-67% in the budget mode (5 pairs each).
-`STRATA_ROUTE_TAIL_SKIP=0` in a config's `"env"` turns it off.
+**The route tail skip** (`STRATA_ROUTE_TAIL_SKIP=7`: a missed expert every token of a window routes at rank 7 or lower is
+skipped; the engine default from 0.1.42 to 0.1.62, off by default in Strata since 0.2.17) costs these files more than the
+2-3-bit packs: UD-Q4_K_XL's yardstick KL against Q8_0 goes from 0.056 to 0.086 with every expert in RAM (R9700, the auto
+cache) and from 0.053 to 0.115 in the RAM budget mode (A4000, 1,500 GPU slots), for +4-10% decode in RAM and +26-67% in the
+budget mode (5 pairs each). On an RTX 5090 (UD-Q4_K_XL, 12,288 forced-token positions, KL against exact routing) it is
+0.01260 with every expert in RAM and 0.01331 with `--resident-budget-gib 40`, for decode x1.29 and x1.24
+([DETAILS.md](DETAILS.md#route-tail-skip-strata_route_tail_skip-off-by-default-since-0217)).
+`STRATA_ROUTE_TAIL_SKIP=7` in a config's `"env"` turns it on; `STRATA_ROUTE_TAIL_SKIP=0` is the default.
 
 **The hyper-connections on NVIDIA:** the pack's `--compat-bf16` copy of the Q8_0 HC projections rounds them to BF16
 (and doubles their bytes). On NVIDIA the engine reads the file's own Q8_0 by default for files that carry them as Q8_0 (the Unsloth UD files); `STRATA_HC_Q8=0` restores the BF16 read. On the

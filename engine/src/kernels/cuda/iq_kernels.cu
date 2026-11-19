@@ -854,10 +854,11 @@ STRATA_TQP_FMT(149)
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(147) X(148) X(149)
 #endif
 // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them
+// Q4_K as well: heretic's down experts are Q4_K; without 12 here d_qk(12)=0 and STRATA_DOWN reaches its exit(1)
 #ifdef STRATA_Q6K_EXPERTS
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) X(144) X(146) X(147) X(148) X(149)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(12) X(2) X(3) X(8) X(13) X(14) X(40) X(144) X(146) X(147) X(148) X(149)
 #else
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(12) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
 #endif
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
@@ -3400,6 +3401,15 @@ int gu_qk(int t) {
         default: return 0;
     }
 }
+// the calls a gate/up row of n_embd values takes (Fmt<T>::ipb per qk values); 0 for a type outside the list
+int gu_calls(int t, int64_t n_embd) {
+    switch (t) {
+#define STRATA_GC(T) case T: return (int) ((n_embd / Fmt<T>::qk) * Fmt<T>::ipb);
+        STRATA_GU_FMTS(STRATA_GC)
+#undef STRATA_GC
+        default: return 0;
+    }
+}
 int d_qk(int t) {
     switch (t) {
 #define STRATA_QK(T) case T: return Fmt<T>::qk;
@@ -3845,11 +3855,17 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
 // contraction off so the product cannot fuse into the first sum); h is still written (it is the scratch the old pair used)
 __global__ void s26_swiglu_q8_1_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
                                        block_q8_1* __restrict__ y, long long n) {
+#if defined(__HIPCC__)
 #pragma clang fp contract(off)
+#endif
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n is a multiple of 32: whole warps only
     const float g = gate[i];
+#if defined(__HIPCC__)
     const float xi = (g / (1.0f + __expf(-g))) * up[i];
+#else
+    const float xi = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);   // nvcc ignores the clang pragma: the product is rounded by hand, as swiglu_q8_1_entries_kernel does (#5100)
+#endif
     h[i] = xi;
     float amax = fabsf(xi), sum = xi;
 #pragma unroll
@@ -4269,7 +4285,7 @@ bool gu_swiglu_on() {
         const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
                         cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
         if (!ok) cudaGetLastError();
-        per_dev[dev] = ok && strata::sm120_default(maj, mnr) ? 2 : 1;
+        per_dev[dev] = ok && strata::sm12x_default(maj, mnr, strata::kGb10GuSwiglu) ? 2 : 1;
     }
     return per_dev[dev] == 2;
 #endif
@@ -6580,8 +6596,15 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     const bool v1 = g_grouped_v1;
     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
-    const int gu_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type) &&
-                         gu_qk(L.gu_type) != 128 && L.gu_type != 12 && L.gu_type != 13) ? 16 : GU_ROWS;   // qk 128 (APR trellis): no sub-16 rows, see launch_gu
+    // gu_sub16_rows: launch_gu takes the 16-row (16-lane) kernel only for a split format whose rows have exactly 80 calls
+    // (native_gu_multi_kernel: xb == 80 && nb * ipb == 80); every other row shape runs its full-warp rows, 8 a block, in
+    // ONE pass over blockIdx.x, so a 16-row grid there computed only rows 0 .. n_ff - 1 (the gate) and never the up rows.
+    // That was the case of Q8_0 gate/up (320 calls at 2560; UD-Q6_K_XL layer 2, the rt-q8 drafter) with STRATA_KQ_SPLIT=1;
+    // the old test (qk != 128, not Q4_K / Q5_K) gives the same 16 / 8 as this one for every other split type (IQ*, Q2_0,
+    // NVFP4: 80 calls; Q4_K / Q5_K / APR trellis: 160).
+    const bool gu_sub16_rows = !g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type) &&
+                               gu_calls(L.gu_type, L.n_embd) == 80;
+    const int gu_rows = gu_sub16_rows ? 16 : GU_ROWS;
     const dim3 ggu((unsigned) ((2 * L.n_ff + gu_rows - 1) / gu_rows), (unsigned) gy);
 #if STRATA_EXP_LAYOUTS
 #if defined(STRATA_HIP_GFX906)

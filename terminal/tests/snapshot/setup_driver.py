@@ -100,7 +100,7 @@ def _qwen(setup, world: World, lib: ProbeLib, say) -> tuple[dict, dict]:
     a = _args(world, ctx)
     with contextlib.redirect_stdout(say):
         in_budget = bool(setup.MODELS[model].get("budget")) and setup.unsloth_budget(model, ram, gpu, None)
-        budget = setup.budget_choice(model, ram, None) if in_budget else None
+        budget = setup.budget_choice(model, ram, None, uma=bool(gpu.get("uma"))) if in_budget else None
         low_ram = setup.low_ram_wanted(model, ram, "auto")
         kv = "fp16" if ctx <= 8192 else "int8"
         vision = setup.hip_vision("yes", gpu["vram_gb"]) if hip else setup.flash_vision_encoder("yes", gpu)

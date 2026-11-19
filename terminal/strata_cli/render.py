@@ -449,6 +449,18 @@ def render_view(snapshot: dict, view: str, width: int = 80, height: int = 24,
                 selected: int = 0, frozen: bool = False, filter_text: str = "",
                 glyphs: str = "ascii", connection: str = "", serving_pane: str = "devices",
                 detail: bool = False, connection_state: str | None = None, connect: bool = False) -> str:
+    """The text views (2-6). Where the terminal shows Unicode their separator lines are the same ─ rule as the Overview's and the other screens (0217 item 16: the Hardware tab
+    had a row of hyphens under the tabs); otherwise the plain hyphens stay."""
+    out = _render_view(snapshot, view, width, height, selected, frozen, filter_text, glyphs, connection, serving_pane, detail, connection_state, connect)
+    if glyphs != "unicode":
+        return out
+    return "\n".join(("─" * len(line.rstrip()) if len(line.strip()) >= 20 and set(line.strip()) == {"-"} else line) for line in out.split("\n"))
+
+
+def _render_view(snapshot: dict, view: str, width: int = 80, height: int = 24,
+                 selected: int = 0, frozen: bool = False, filter_text: str = "",
+                 glyphs: str = "ascii", connection: str = "", serving_pane: str = "devices",
+                 detail: bool = False, connection_state: str | None = None, connect: bool = False) -> str:
     """Render the six views (seven with Connect, when `strata launch` opened the monitor) with explicit unavailable markers and no fake rates."""
     width, height = max(width, 30), max(height, 8)
     tiny = width < 60 or height < 14

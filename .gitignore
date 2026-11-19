@@ -64,6 +64,8 @@ build-vision-cuda12.bat
 /terminal/engine/
 /terminal/engine-sycl/
 /engine-sycl/
+/terminal/engine-feed/
+/engine-feed/
 /terminal/engine-cuda12/
 /engine-cuda12/
 /terminal/build-release*/

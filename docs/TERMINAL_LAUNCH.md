@@ -52,7 +52,7 @@ and test-starts it before using it.
    reader adds about 0.9 GB. It runs on the CPU for a card under 24 GB and on the graphics card from 24 GB (about 1 to 1.4 GB kept
    free). The rule is in `terminal/strata_control/vision_reader.py`. `--vision gpu` or `--vision cpu` overrides it per model. If the
    engine package has no picture reader, pictures default to off and the screen says so.
-6. **Parallel requests:** "fit to your card" (12 GB: 1, 20: 2, 24: 3, 32 and more: 4) or a number from 1 to 8, with a warning
+6. **Parallel requests:** "fit to your card" (12 GB: 1, 20: 2, 24: 3, 32 and more: 4; one when the DFlash2 drafter is used) or a number from 1 to 8, with a warning
    if it will not fit. Check the effective slots after startup.
 7. **Tuning:** quick (about 20 minutes), thorough (up to 2 hours) or skip. The screens suggest quick the first time; the
    command line skips tuning unless you add `--tune`.
@@ -93,7 +93,7 @@ strata launch --show-key
 | `--context SIZE` | `32k`, `64k`, `128k`, `256k` or a number of tokens. |
 | `--kv FORMAT` | Conversation memory format: `int8` (default), `q4_0` (half the memory), `k8v4`, `fp16`. |
 | `--vision off\|on\|gpu\|cpu` | Picture reading. Default: on when the model and the engine can. |
-| `--parallel N` | Requests answered at the same time, 1 to 8. Default: fit to your card. |
+| `--parallel N` | Requests answered at the same time, 1 to 8. Default: fit to your card; one at a time with DFlash2 (the Auto drafter where the engine has it). |
 | `--mtp on\|off` | The draft layer. `off` saves about 1 GB of graphics memory and is slower. Default: on. |
 | `--drafting auto\|mtp\|dflash2\|off` | Which drafter guesses ahead. `dflash2` is for Qwen3.8-Flash-Next only and downloads its drafter once (0.34 GB for the models that have a tuned drafter, 0.52 GB on Intel Arc, else 1.2 GB). If it cannot run, MTP is used and the start says why. |
 | `--gpu LIST`, `--gpu-roles LIST` | Which cards to use, and a role per card. |
