@@ -514,7 +514,11 @@ class ModelScreen(Base):
                 out.append(f"{r.title}: {r.about}.\n", style=FG)
                 if r.verdict != "fits":
                     out.append(f"{r.sentence}. ", style=BAD if r.verdict == "no" else WARN)
-        out.append("The n-gram table stays on your SSD and is not counted above.", style=MUTE)
+        # At 80 x 24 the box holds four lines: with a verdict sentence (three lines for a model that does not fit) this last, general sentence was cut
+        # in the middle ("... stays on your SSD and is"). It stays in the help (?); a tall window shows it whole (GUI-TUI 0.2.17 QA).
+        verdict_shown = cur is not None and hasattr(self, "rows") and any((x.family, x.model) == cur.key and x.verdict != "fits" for x in self.rows)
+        if not verdict_shown or self.app.size.height >= 30:
+            out.append("The n-gram table stays on your SSD and is not counted above.", style=MUTE)
         for title, why in self.unavailable_lines():
             out.append(f"\n{title}: {why}", style=MUTE)
         note = self.ctx.computer.other_vendor_note
