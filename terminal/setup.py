@@ -193,6 +193,22 @@ def reachable(url: str, timeout: float = 5.0) -> bool:
         return False
 
 
+def ms_answers(url: str, timeout: float = 12.0, sleep=time.sleep) -> bool:
+    """#5938: whether ModelScope answers for `url`, asked up to three times (a HEAD, a one-byte ranged GET, a HEAD again after a short pause).
+    One slow or refused HEAD on its CDN is not "ModelScope does not answer": on a network where huggingface.co is blocked that one miss ended the
+    install. Each ask is bounded by `timeout`, so a host that really is down costs three asks, not a hang."""
+    def ranged() -> bool:
+        try:
+            _urlopen(urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": "bytes=0-0"}), timeout=timeout).close()
+            return True
+        except OSError:
+            return False
+    if reachable(url, timeout=timeout) or ranged():
+        return True
+    sleep(3)
+    return reachable(url, timeout=timeout)
+
+
 def model_source() -> str:
     """"modelscope" or "huggingface".  ModelScope only when --source modelscope / STRATA_SOURCE=modelscope asks for it;
     everything else (auto, a HF_ENDPOINT mirror chosen on purpose, #495) is Hugging Face.  Setup does not switch hosts
@@ -3315,7 +3331,7 @@ def download(url, dst: Path, what=None):
         return
     ms = ms_file(url) if model_source() == "modelscope" else None
     if ms is not None:
-        if reachable(ms_url(*ms), timeout=netpolicy.FIRST_CONNECT_S):
+        if ms_answers(ms_url(*ms), timeout=netpolicy.FIRST_CONNECT_S):
             url = ms_url(*ms)
         else:
             warn(f"{what or dst.name}: ModelScope does not answer; downloading it from {hf_endpoint()}")
