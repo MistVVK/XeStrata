@@ -114,15 +114,18 @@ int main(int argc, char** argv) {
         hipFree(q2);
     }
 #ifdef SK_GEMM
-    if (only == "moe") {
+    if (only.rfind("moe", 0) == 0) {
         // synthetic SQ-64-like layer: ranks 0..79 S4/S4, 80..255 S3/S3, 256..511 S2/S3; uniform random top-16 routing
-        printf("== moe_experts (synthetic SQ-64-like layer, random uniform routing)\n");
+        printf("== moe_experts (synthetic layer \"%s\": moe = SQ-64-like, moe32 = SQ-32-like, moe128 = SQ-128-like, moe125 = all S1.25+S1.25, moe23 = all S2+S3; uniform random routing)\n", only.c_str());
         std::vector<ExpertDev> tab(512);
         size_t total = 0;
         std::vector<size_t> bytes(512);
         for (int e = 0; e < 512; ++e) {
-            const int gu = e < 80 ? FMT_S4 : e < 256 ? FMT_S3 : FMT_S2;
-            const int dn = e < 80 ? FMT_S4 : FMT_S3;
+            int gu = e < 80 ? FMT_S4 : e < 256 ? FMT_S3 : FMT_S2, dn = e < 80 ? FMT_S4 : FMT_S3;  // SQ-64: 80 S4+S4, 176 S3+S3, 256 S2+S3
+            if (only == "moe32") { gu = e < 32 ? FMT_S2 : e < 176 ? FMT_S2 : FMT_S1_25; dn = e < 32 ? FMT_S3 : e < 176 ? FMT_S2 : FMT_S1_25; }
+            if (only == "moe128") { gu = e < 160 ? FMT_S6 : e < 384 ? FMT_S5 : FMT_S4; dn = e < 160 ? FMT_S8 : e < 384 ? FMT_S6 : FMT_S5; }
+            if (only == "moe125") { gu = FMT_S1_25; dn = FMT_S1_25; }
+            if (only == "moe23") { gu = FMT_S2; dn = FMT_S3; }
             ExpertDev d;
             d.body_off = total;
             d.dn_off = 3072 + 18432 * sk_sb_bytes(gu);
@@ -146,7 +149,7 @@ int main(int argc, char** argv) {
         CK(hipMalloc(&d_tab, sizeof(ExpertDev) * 512));
         CK(hipMemcpy(d_tab, tab.data(), sizeof(ExpertDev) * 512, hipMemcpyHostToDevice));
         printf("arena %.2f GB\n", total / 1e9);
-        for (int M : {1, 2, 4, 6, 8, 12, 16, 32, 64, 256, 1024, 4096}) {
+        for (int M : {1, 2, 4, 6, 8, 12, 16, 32, 64, 256, 512, 1024, 4096}) {
             const int P = M * 16;
             std::vector<int32_t> idx(P);
             std::vector<float> wts(P, 0.1f);
@@ -284,6 +287,9 @@ int main(int argc, char** argv) {
                            {"gemm dense gate S6 [13824,3072]", FMT_S6, 13824, 3072},
                            {"gemm expert gate_up S4 [3072,1536]", FMT_S4, 3072, 1536},
                            {"gemm expert gate_up S2 [3072,1536]", FMT_S2, 3072, 1536},
+                           {"gemm expert gate_up S1.25 [3072,1536]", FMT_S1_25, 3072, 1536},
+                           {"gemm expert gate_up S1.5 [3072,1536]", FMT_S1_5, 3072, 1536},
+                           {"gemm expert gate_up S6 [3072,1536]", FMT_S6, 3072, 1536},
                            {"gemm o_proj S5 [3072,16384]", FMT_S5, 3072, 16384},
                            {"gemm tails S4 [1000,768]", FMT_S4, 1000, 768},
                            {"gemm shared S8 [1536,3072]", FMT_S8, 1536, 3072}};
@@ -343,6 +349,14 @@ int main(int argc, char** argv) {
         {"expert down S4 [1536,1536]", FMT_S4, 1536, 1536},
         {"expert down S3 [1536,1536]", FMT_S3, 1536, 1536},
         {"expert down S2 [1536,1536]", FMT_S2, 1536, 1536},
+        {"expert gate_up S1.25 [3072,1536]", FMT_S1_25, 3072, 1536},
+        {"expert down S1.25 [1536,1536]", FMT_S1_25, 1536, 1536},
+        {"expert gate_up S1.5 [3072,1536]", FMT_S1_5, 3072, 1536},
+        {"expert down S1.5 [1536,1536]", FMT_S1_5, 1536, 1536},
+        {"expert gate_up S5 [3072,1536]", FMT_S5, 3072, 1536},
+        {"expert gate_up S6 [3072,1536]", FMT_S6, 3072, 1536},
+        {"expert down S6 [1536,1536]", FMT_S6, 1536, 1536},
+        {"expert down S8 [1536,1536]", FMT_S8, 1536, 1536},
         {"lm_head S8 [120832,3072]", FMT_S8, 120832, 3072},
         {"dense gate S6 [13824,3072]", FMT_S6, 13824, 3072},
         {"dense down S6 [3072,13824]", FMT_S6, 3072, 13824},
