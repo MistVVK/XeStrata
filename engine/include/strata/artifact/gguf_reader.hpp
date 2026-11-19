@@ -295,7 +295,7 @@ class Cursor {
 public:
     Cursor(const uint8_t* base, size_t size) : base_(base), size_(size) {}
     void need(size_t n) const {
-        if (pos_ + n > size_) throw std::runtime_error("GGUF: unexpected end of file in header");
+        if (n > size_ - pos_) throw std::runtime_error("GGUF: unexpected end of file in header");   // pos_ + n could wrap
     }
     template <class T> T read() {
         need(sizeof(T));
