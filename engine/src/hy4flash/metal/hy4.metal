@@ -867,13 +867,22 @@ kernel void mla_attend(device const half* qa [[buffer(0)]], device const half* c
         }
         d = simd_sum(d) * a.scale;
         float nm = max(m, d);
-        float corr = exp(m - nm);
-        float p = exp(d - nm);
-        l = l * corr + p;
-        for (int i = 0; i < 8; ++i) {
-            half2 v = kr[lane + 32 * i];
-            acc[2 * i] = acc[2 * i] * corr + p * float(v.x);
-            acc[2 * i + 1] = acc[2 * i + 1] * corr + p * float(v.y);
+        float p = fast::exp(d - nm);
+        if (nm == m) {  // the running maximum did not change (the common case): no rescale
+            l += p;
+            for (int i = 0; i < 8; ++i) {
+                half2 v = kr[lane + 32 * i];
+                acc[2 * i] += p * float(v.x);
+                acc[2 * i + 1] += p * float(v.y);
+            }
+        } else {
+            float corr = fast::exp(m - nm);
+            l = l * corr + p;
+            for (int i = 0; i < 8; ++i) {
+                half2 v = kr[lane + 32 * i];
+                acc[2 * i] = acc[2 * i] * corr + p * float(v.x);
+                acc[2 * i + 1] = acc[2 * i + 1] * corr + p * float(v.y);
+            }
         }
         m = nm;
     }

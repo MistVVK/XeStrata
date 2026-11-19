@@ -164,6 +164,8 @@ public:
     bool flash_on = false;     // mla_flash (simdgroup_matrix attention) for prefill chunks of >= 16 tokens (needs the MPP library build)
     int moe_mm_min = 64;       // MoE prefill through the MPP grouped GEMM from this many tokens (needs mpp_ok)
     Buffer m_srt, m_pos, m_tiles, m_meta, m_xs, m_hs, m_y;
+    Buffer hc_part;            // partials of the split iHC mix [T<=8][24][9]
+    bool hc_split = true;
     Buffer attn_ws;            // split-K attention partials [T<=4][64][S<=16][514] floats
     int split_max = 8;         // key splits per head for decode (T <= 4); 0 = off
     static int moe_tm(int T) { return T <= 768 ? 16 : (T <= 1536 ? 32 : 64); }
@@ -286,11 +288,11 @@ public:
         {
             const std::string dir = kernel_path.substr(0, kernel_path.rfind('/') + 1);
             std::string why;
-            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
+            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
             mpp_ok = lib >= 0;
             if (!mpp_ok) {
                 if (mpp_try) fprintf(stderr, "[metal] MPP (Metal 4 matmul2d) kernels not available, simdgroup GEMM only: %s\n", why.substr(0, 200).c_str());
-                lib = cx.compile({kernel_path, dir + "hy4_split.metal"}, "#define NO_GGML_COMMON 1\n", false);
+                lib = cx.compile({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal"}, "#define NO_GGML_COMMON 1\n", false);
             }
             wscr_elems = (size_t) 16384 * 3072;
             if (mpp_ok) wscr = cx.alloc(wscr_elems * 2);
@@ -320,6 +322,7 @@ public:
         F3 = A(big * 4);
         F4 = A((size_t) T * 3072 * 4);
         attn_ws = A((size_t) 4 * 64 * 16 * 514 * 4);
+        hc_part = A((size_t) 8 * 24 * 9 * 4);
         H1 = A(big * 2);
         qr_h = A((size_t) T * 1024 * 2);
         qa_h = A((size_t) T * 64 * 576 * 2);
@@ -518,14 +521,28 @@ public:
         add("idx_select", T, 1, 256, {B(score), I((int) ldS), I(p0), I(n_top), I(index_topk), B(keys), B(nkeys)});
     }
 
+    // iHC pre/post of a layer part + the reduce and norm into cur_h (fp32 copy cur_f with want_f)
+    void hc_pre_norm(const std::string& pfx, const std::string& norm_w, int T, bool want_f) {
+        const std::string hp = pfx + ".hc_pre";
+        if (hc_split && T <= 8) {
+            add("hc_mix_part", T, 24, 128, {B(x), g.tw(hp + ".hc_fn"), B(hc_part), I(8)});
+            // the two kernels of the pair are separate dispatches: the first has 24 x T threadgroups, the second T
+            ds.back().grid[0] = T;
+            ds.back().grid[1] = 24;
+            add("hc_reduce_norm_acc", T, 1, 256, {B(x), B(hc_part), g.tw(hp + ".hc_scale"), g.tw(hp + ".hc_base"), B(pre), B(post), g.tw(norm_w), B(cur_h), B(cur_f), Fl(c.rms_eps), Fl(c.hc_eps), Fl(c.hc_mag),
+                                                  I(want_f ? 1 : 0)});
+            return;
+        }
+        add("hc_mix", T, 1, 256, {B(x), g.tw(hp + ".hc_fn"), g.tw(hp + ".hc_scale"), g.tw(hp + ".hc_base"), B(pre), B(post), I(8), Fl(c.rms_eps), Fl(c.hc_eps), Fl(c.hc_mag)});
+        op("hc_mix");
+        add("hc_reduce_norm", T, 1, 256, {B(x), B(pre), g.tw(norm_w), B(cur_h), B(cur_f), Fl(c.rms_eps), I(want_f ? 1 : 0)});
+    }
+
     void attention_layer(int il, int p0, int T) {
         const std::string pa = L(il) + ".self_attn";
         const int NH = heads(il);
         const bool swa = c.is_swa[il];
-        add("hc_mix", T, 1, 256, {B(x), g.tw(L(il) + ".hc_attn_layer.hc_pre.hc_fn"), g.tw(L(il) + ".hc_attn_layer.hc_pre.hc_scale"), g.tw(L(il) + ".hc_attn_layer.hc_pre.hc_base"), B(pre), B(post), I(8),
-                                 Fl(c.rms_eps), Fl(c.hc_eps), Fl(c.hc_mag)});
-        op("hc_mix");
-        add("hc_reduce_norm", T, 1, 256, {B(x), B(pre), g.tw(L(il) + ".input_layernorm.weight"), B(cur_h), B(cur_f), Fl(c.rms_eps), I(0)});
+        hc_pre_norm(L(il) + ".hc_attn_layer", L(il) + ".input_layernorm.weight", T, false);
         op("hc_reduce_norm");
         lin(pa + ".q_a_proj.weight", cur_h, F1, T);
         lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F4, T);
@@ -582,9 +599,7 @@ public:
 
     void mlp_layer(int il, int T) {
         const std::string pm = L(il) + ".mlp";
-        add("hc_mix", T, 1, 256, {B(x), g.tw(L(il) + ".hc_mlp_layer.hc_pre.hc_fn"), g.tw(L(il) + ".hc_mlp_layer.hc_pre.hc_scale"), g.tw(L(il) + ".hc_mlp_layer.hc_pre.hc_base"), B(pre), B(post), I(8),
-                                 Fl(c.rms_eps), Fl(c.hc_eps), Fl(c.hc_mag)});
-        add("hc_reduce_norm", T, 1, 256, {B(x), B(pre), g.tw(L(il) + ".post_attention_layernorm.weight"), B(cur_h), B(cur_f), Fl(c.rms_eps), I(1)});
+        hc_pre_norm(L(il) + ".hc_mlp_layer", L(il) + ".post_attention_layernorm.weight", T, true);
         op("hc");
         if (il == 0) {
             lin(pm + ".gate_proj.weight", cur_h, F1, T);
@@ -690,6 +705,24 @@ public:
         part("head");
     }
 
+    // every dispatch of the pending list alone, 'reps' times in one serial encoder: time per kernel name (decode step profile; the list is not run afterwards)
+    void kernel_profile(int reps) {
+        std::map<std::string, std::pair<double, int>> acc;
+        double tot = 0;
+        for (auto& d : ds) {
+            const double t = cx.run({d}, reps, false, true) / reps;
+            auto& a = acc[d.p->name];
+            a.first += t;
+            a.second++;
+            tot += t;
+        }
+        std::vector<std::pair<double, std::string>> v;
+        for (auto& kv : acc) v.push_back({kv.second.first, kv.first});
+        std::sort(v.rbegin(), v.rend());
+        fprintf(stderr, "[prof3] one decode step, each dispatch alone x%d (sum %.2f ms for %zu dispatches):\n", reps, tot * 1e3, ds.size());
+        for (auto& p : v) fprintf(stderr, "  %-24s %8.1f us total  %4d calls  %6.1f us each\n", p.second.c_str(), p.first * 1e6, acc[p.second].second, p.first * 1e6 / acc[p.second].second);
+    }
+
     void argmax(int V) { add("argmax_row", 1, 1, 1024, {B(logits), I(V), B(d_argmax)}); }
 
     void report(const char* what, int steps) {
@@ -724,7 +757,7 @@ static size_t rss_bytes() {
 
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
-    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false;
+    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_hcsplit = false, prof3 = false;
     int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -750,6 +783,8 @@ int main(int argc, char** argv) {
         else if (a == "--pair-max") pair_max = atoi(nxt().c_str());
         else if (a == "--layers") n_layers_run = atoi(nxt().c_str());
         else if (a == "--no-mpp") no_mpp = true;
+        else if (a == "--prof3") prof3 = true;
+        else if (a == "--no-hcsplit") no_hcsplit = true;
         else if (a == "--split") split_arg = atoi(nxt().c_str());
         else if (a == "--flash") no_flash = true;
         else if (a == "--no-relax") no_relax = true;
@@ -811,6 +846,7 @@ int main(int argc, char** argv) {
     r.seg_force = seg;
     r.pair_max = pair_max;
     r.mpp_try = !no_mpp;
+    r.hc_split = !no_hcsplit;
     r.split_max = split_arg;
     r.flash_on = no_flash;
     r.relax_ok = !no_relax;
@@ -871,6 +907,7 @@ int main(int argc, char** argv) {
             }
             r.head(1, 0);
             r.argmax(V);
+            if (prof3 && s == 8) r.kernel_profile(30);
             r.run_all();
             next = *(const int32_t*) r.d_argmax.ptr;
             times.push_back(now_s() - ts);
