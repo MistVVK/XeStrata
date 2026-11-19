@@ -120,7 +120,8 @@ The license is the Swift Open License 1.0. Install it with `strata launch --fami
 ### Unsloth's UD-Q4_K_XL
 
 A 4-bit quantization of the same model (111 GB, 72 GiB of experts). Install it with `--family unsloth --model UD-Q4_K_XL`
-(RAM budget: your RAM less 17 GB, the rest read from the SSD). What it does and the manual workflow are in
+(RAM budget: your RAM less 17 GB, 47 on 64 GB, the rest read from the SSD; the app's "Leave 20% for my work" keeps the earlier RAM less 24 GB, 40 on 64 GB: 16.6 GiB free
+of 64 against 9.3 GiB, decode 57.7 against 84.2 tok/s). What it does and the manual workflow are in
 [UNSLOTH_Q4.md](UNSLOTH_Q4.md).
 
 ---
@@ -798,7 +799,7 @@ in a RAM copy, as much as the RAM available at the start allows after a headroom
   fell to 0.9 GiB during the copy. `STRATA_RESIDENT_HEADROOM_GIB`, when set, decides the headroom instead of both (testers).
 - With W = 0 nothing about the fallback changes: the full system is used, the arena whenever it fits, with no margin, and the copy leaves
   the safety headroom. The explicit modes (`--resident-budget-gib N`, `--resident-experts`) leave `max(W, their own 4 GiB)`.
-- The app's "Leave 20% for my work" passes W = clamp(ceil(0.2 x RAM in GB), 5, 8) as `STRATA_RAM_KEEP_GIB` in the run config's env (not as the flag, so an older engine chosen in the Engine tab, which ignores an env variable, still starts); `strata serve` and full performance pass nothing.
+- The app's "Leave 20% for my work" passes W = clamp(ceil(0.2 x RAM in GB), 5, 8) as `STRATA_RAM_KEEP_GIB` in the run config's env (not as the flag, so an older engine chosen in the Engine tab, which ignores an env variable, still starts); `strata serve` and full performance pass nothing. A setup-written `--resident-budget-gib` in the run config is a RAM mode of its own: with it the app adds no `STRATA_RAM_KEEP_GIB`, and for UD-Q4_K_XL and UD-IQ4_XS "Leave 20% for my work" swaps in the earlier rule's number (`"ui_budget_work_gib"`, the RAM less 24 GB; the Terminal and full performance keep the RAM less 17 GB).
 - `STRATA_ARENA_FALLBACK_RESIDENT=0` keeps the plain file source for the fallback (testers).
 - The RAM copy is page-locked. `STRATA_RESIDENT_PIN=0` keeps it in ordinary pageable memory, as with `--resident-budget-gib`. Under a
   tight memory limit the system can then swap part of it out: with a 51.75 GiB limit on an R9700 PC (explicit 45.24 GiB budget, one run)

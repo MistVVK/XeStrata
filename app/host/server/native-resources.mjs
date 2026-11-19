@@ -1,4 +1,4 @@
-import {USER_KEY,flagValue} from './native-user-args.mjs';
+import {USER_KEY,flagValue,capture} from './native-user-args.mjs';
 import {parseEngineVersion} from './engine-version.mjs';
 
 /** The engine's own default reserve, and the one setup writes for pictures read on the GPU: neither is a choice of the person. */
@@ -93,6 +93,8 @@ export function resourceSettings(config,hardware,profile,model={},values={}){
  const dropEnv=name=>{if(config.env&&name in config.env){env={...(env??config.env)};delete env[name];}};
  if(baseline.ramHeadroom)dropEnv('STRATA_RESIDENT_HEADROOM_GIB');
  if(baseline.ramKeep)dropEnv('STRATA_RAM_KEEP_GIB');
+ /* setup's two budgets (setupRamBudget): a STRATA_RAM_KEEP_GIB or STRATA_RESIDENT_HEADROOM_GIB of the person's (what is left in the env now is theirs) says how much RAM to leave, so "work" swaps in no number of its own. */
+ const setupBudget=setupRamBudget(config,args,profile,baseline.setupBudget,Boolean((env??config.env)?.STRATA_RAM_KEEP_GIB||(env??config.env)?.STRATA_RESIDENT_HEADROOM_GIB||args.includes('--ram-keep-gib')));
  const ram=Number(hardware?.ram_gb)||0,arena=Number(model?.arenaGb)||0;let ramKeep=false,ramBudget=false,ramHeadroom=false;
  // The person's own RAM choice wins: a RAM mode or --ram-keep-gib in their args, and STRATA_RAM_KEEP_GIB or STRATA_RESIDENT_HEADROOM_GIB of theirs in the env (the engine reads those first).
  const mineEnv=Boolean((env??config.env)?.STRATA_RAM_KEEP_GIB);
@@ -105,7 +107,22 @@ export function resourceSettings(config,hardware,profile,model={},values={}){
    if(!(env??config.env)?.STRATA_RESIDENT_HEADROOM_GIB){env={...(env??config.env??{}),STRATA_RESIDENT_HEADROOM_GIB:String(Math.ceil(ram*.2))};ramHeadroom=true;}
   }
  }
- return {args,vram_reserve_mib:reserve,...(asked!==null?{}:{ui_reserve_applied:reserve}),...(env?{env}:{}),ui_resource_baseline:{...baseline,ramBudget,ramHeadroom,ramKeep}};
+ const kept={...baseline,ramBudget,ramHeadroom,ramKeep};delete kept.setupBudget;if(setupBudget!==null)kept.setupBudget=setupBudget;
+ return {args,vram_reserve_mib:reserve,...(asked!==null?{}:{ui_reserve_applied:reserve}),...(env?{env}:{}),ui_resource_baseline:kept};
+}
+
+/** The RAM budget setup wrote (--resident-budget-gib in "args"), when setup also wrote the number "Leave 20% for my work" runs with ("ui_budget_work_gib", setup.py
+ *  resident_budget_gib(work=True): the one place of the rule, so the app holds no copy of it). setup's budget is the RAM less 17 GB; the work number is the earlier rule,
+ *  the RAM less 24 GB (40 on 64 GB: 16.6 GiB really free under a 64 GiB limit, against 9.3 GiB at 47). "work" swaps it into `args` (in place) and returns the
+ *  setup number it replaced, kept in the baseline (`setupBudget`); "performance" puts that number back, but only while the budget is still the one the app swapped in.
+ *  A budget the person set (user_args, or a change of "args" since the file was written, as capture() reads them) is theirs in both profiles; a config with no work number
+ *  (a 0.2.16 install, a budget the person asked setup for, a layer split, unified memory where both rules are 24) is left as it is. Returns the setup number the baseline must keep, or null. */
+function setupRamBudget(config,args,profile,previous,ownRam=false){
+ const work=Number(config.ui_budget_work_gib),at=args.indexOf('--resident-budget-gib'),have=at>=0?Number(args[at+1]):NaN;
+ if(!(work>0)||!Number.isFinite(have)||flagValue(capture(config),'--resident-budget-gib')!==null)return null;
+ if(profile==='work'){if(have===work)return Number(previous)>0?Number(previous):null;if(ownRam)return null;args[at+1]=String(work);return have;}   // already swapped in (an earlier load): keep what it replaced
+ if(have===work&&Number(previous)>0)args[at+1]=String(Number(previous));   // back to setup's own
+ return null;
 }
 
 /** The RAM, in GiB, "Leave 20% for my work" asks the engine to keep free: a fifth of the PC's RAM rounded up, never under 5 or over 8

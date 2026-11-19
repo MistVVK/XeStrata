@@ -548,6 +548,7 @@
    "model_name": "qwen3.8-flash-next-unsloth-ud-q4_k_xl",
    "port": 8080,
    "tokenizer": "<T>/data/packs/unsloth-ud-q4_k_xl/tokenizer",
+   "ui_budget_work_gib": 8,
    "vision": {
     "exe": "<T>/engine/<VEXE>",
     "gpu": true,
@@ -819,7 +820,7 @@
     "--kv",
     "int8",
     "--resident-budget-gib",
-    "30",
+    "31",
     "--vision"
    ],
    "cwd": "<T>",
@@ -840,6 +841,7 @@
    "model_name": "qwen3.8-flash-next-unsloth-ud-q4_k_xl",
    "port": 8080,
    "tokenizer": "<T>/data/packs/unsloth-ud-q4_k_xl/tokenizer",
+   "ui_budget_work_gib": 24,
    "vision": {
     "exe": "<T>/engine/<VEXE>",
     "gpu": false,
@@ -1104,6 +1106,7 @@
    "model_name": "qwen3.8-flash-next-unsloth-ud-q4_k_xl",
    "port": 8080,
    "tokenizer": "<T>/data/packs/unsloth-ud-q4_k_xl/tokenizer",
+   "ui_budget_work_gib": 38,
    "vision": {
     "exe": "<T>/engine/<VEXE>",
     "gpu": true,

@@ -278,6 +278,7 @@ class MockedInstall(unittest.TestCase):
         a = cfg["args"]
         self.assertFalse({"--mmap-experts", "--resident-experts"} & set(a))
         self.assertEqual(a[a.index("--resident-budget-gib") + 1], "47")
+        self.assertEqual(cfg["ui_budget_work_gib"], 40)    # 0.2.17: what "Leave 20% for my work" keeps (the RAM less 24)
 
     def test_amd_is_refused_with_a_recommendation(self):
         import test_setup_golden as G

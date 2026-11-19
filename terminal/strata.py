@@ -51,6 +51,11 @@ if __name__ == "__main__":
         launcher_heal.heal(extra=[launcher_heal.installed_bin()])
     except Exception:                                  # noqa: BLE001 - never a reason for the command to fail
         pass
+    try:                                               # the RAM budget setup wrote under the 0.2.16 rule moves to the 0.2.17 rule, once (strata_cli/ram_budget_move.py)
+        from strata_cli import ram_budget_move
+        ram_budget_move.run()
+    except Exception:                                  # noqa: BLE001 - never a reason for the command to fail
+        pass
     code = _preflight(sys.argv[1:])
     if code:
         raise SystemExit(code)

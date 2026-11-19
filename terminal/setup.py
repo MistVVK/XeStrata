@@ -2315,6 +2315,7 @@ def split_budget(cfg: dict, yes: bool = False, explicit: bool = False) -> bool:
                      "start it on one GPU: START-HERE.bat --gpu N (Linux: ./setup.sh --gpu N)")
     i = a.index("--resident-budget-gib")
     del a[i:i + 2]
+    cfg.pop(WORK_BUDGET_KEY, None)                     # no budget in args: nothing for "Leave 20% for my work" to swap
     ok(f"{model} on several GPUs: no RAM budget (the engine has none with a layer split) - all its experts are "
        "loaded into RAM from the model files at start, and the files pass through the OS file cache (#498)")
     return True
@@ -3748,13 +3749,136 @@ def ready_fetch(model: str, models_dir: Path) -> None:
         verify_sha256(dst, size, sha)
 
 
-def resident_budget_gib(model, ram, kv_ram_gb=0.0, uma=False) -> int:
+def resident_budget_gib(model, ram, kv_ram_gb=0.0, uma=False, work=False) -> int:
     """UD-Q4_K_XL: the GiB of experts the engine keeps in RAM (--resident-budget-gib): the RAM (GiB, ram_gb()) less
     17 (UNSLOTH_BUDGET_LEFT_GB) for the OS, the engine and the file cache the other experts are read through, less a KV
     cache streamed to RAM; at most all of them, at least 8.  64 GB: 47 (0.2.16: 40; docs/UNSLOTH_Q4.md).  A unified-memory
-    GPU (`uma`) keeps the 24 it had: there the GPU's expert cache is RAM too, and 17 was measured on discrete cards only."""
-    gib = round(ram) - (UNSLOTH_RAM_LEFT_GB if uma else UNSLOTH_BUDGET_LEFT_GB) - math.ceil(kv_ram_gb)
+    GPU (`uma`) keeps the 24 it had: there the GPU's expert cache is RAM too, and 17 was measured on discrete cards only.
+    `work`: the number the app's "Leave 20% for my work" runs with, the old rule (RAM less 24, 40 on 64 GB: 16.6 GiB really
+    free under a 64 GiB limit, against 9.3 GiB at 47, RESULTS-0217-RAMMODE).  setup writes it beside the budget (WORK_BUDGET_KEY,
+    work_budget_key) and the app swaps it in; the app holds no copy of the rule."""
+    return _budget_gib(model, nominal_ram_gb(ram), kv_ram_gb, UNSLOTH_RAM_LEFT_GB if (uma or work) else UNSLOTH_BUDGET_LEFT_GB)
+
+
+def _budget_gib(model, ram, kv_ram_gb, left) -> int:
+    gib = round(ram) - left - math.ceil(kv_ram_gb)
     return max(8, min(gib, int(MODELS[model]["arena_gb"] / 1.073741824)))
+
+
+NOMINAL_RAM_GB = (16, 24, 32, 48, 64, 96, 128, 192, 256)     # the sizes a PC is sold with (above 256: a multiple of 8)
+NOMINAL_RAM_MARGIN = 0.03                                    # a reading this close under one of them is that size
+
+
+def nominal_ram_gb(ram) -> float:
+    """0.2.17 (owner 11-19): the RAM reading rounded UP to the size the PC is sold with, where it reads within 3% under it.  A "64 GB" Windows PC reads
+    63.1 GiB (ullTotalPhys; Linux MemTotal 62.5 to 63.7), which gave 46 where the same PC on Linux gave 47.  A PC that really has less (60 GB) is not counted
+    as 64: 3% under 64 is 62.1.  Only the RAM budget rule uses it (resident_budget_gib); every other test keeps the reading."""
+    ram = float(ram)
+    size = next((s for s in NOMINAL_RAM_GB if ram <= s), None)
+    if size is None:
+        size = math.ceil(ram / 8) * 8
+    return float(size) if size * (1 - NOMINAL_RAM_MARGIN) <= ram <= size else ram
+
+
+WORK_BUDGET_KEY = "ui_budget_work_gib"     # run config: the RAM budget (GiB) the app's "Leave 20% for my work" runs with, when it differs from the --resident-budget-gib in args
+
+
+def work_budget_key(cfg: dict, work, asked=None) -> None:
+    """0.2.17: write (or leave out) WORK_BUDGET_KEY.  `work` is resident_budget_gib(..., work=True) for a budget setup chose by its rule.  The key is
+    left out when the person asked for the budget (`asked`: --resident-budget-gib N, theirs in every mode), when the args hold no budget (a layer
+    split, every expert in RAM, a mode of its own) and when the two numbers are the same (a unified-memory GPU: 24 in both)."""
+    cfg.pop(WORK_BUDGET_KEY, None)
+    args = cfg.get("args")
+    have = flag_value(args, "--resident-budget-gib") if isinstance(args, list) else None
+    if work is None or asked is not None or have is None:
+        return
+    try:
+        if float(have) == float(work):
+            return
+    except ValueError:
+        return
+    cfg[WORK_BUDGET_KEY] = int(work)
+
+
+def _unified_memory_pc() -> bool:
+    """True when a graphics chip of this PC shares the RAM (Strix Halo and the like): its budget keeps the 24."""
+    try:
+        return any(bool(g.get("uma")) for g in [*(gpus() or []), *(amd_gpus() or [])])
+    except Exception:                                  # noqa: BLE001 - an unreadable probe: the cautious answer, nothing moves
+        return True
+
+
+def migrate_ram_budget(cfg: dict, ram=None, uma=None):
+    """0.2.17 (owner 11-19): a 0.2.16 run config (setup's budget under the old rule, the RAM less 24: 40 on 64 GB) without a setup run.  Returns the config
+    with that budget moved to the new rule (47) and WORK_BUDGET_KEY set to the number "Leave 20% for my work" keeps (40), or None when nothing moves.
+    Moves only a number setup wrote: it is the one the old rule gives for this PC's RAM (the reading as 0.2.16 took it, or rounded to the PC's size), and
+    it is the same in "args_written" (an edited args differs), not in "user_args", no RAM setting of the person's is in the env (STRATA_RAM_KEEP_GIB,
+    STRATA_RESIDENT_HEADROOM_GIB, unless the app wrote it: ui_resource_baseline), no mode of the person's is in args (--ram-keep-gib) and no layer split
+    or unified-memory GPU is involved (24 in both rules).  Idempotent: a config with WORK_BUDGET_KEY, or already on the new number, gives None.
+    A hand edit that typed exactly the old number into args looks the same as setup's own (a number in user_args does not)."""
+    args, written = cfg.get("args"), cfg.get(user_args.WRITTEN_KEY)
+    flag = "--resident-budget-gib"
+    have = flag_value(args, flag) if isinstance(args, list) else None
+    if WORK_BUDGET_KEY in cfg or have is None or not isinstance(written, list) or flag_value(written, flag) != have:
+        return None
+    if flag_value(user_args.flat(user_args.groups(cfg.get(user_args.USER_KEY))), flag) is not None or "--ram-keep-gib" in args:
+        return None
+    base = cfg.get("ui_resource_baseline") if isinstance(cfg.get("ui_resource_baseline"), dict) else {}
+    if base.get("ramBudget"):
+        return None                                    # the 0.2.9 app wrote this one (80% of the RAM), not setup
+    env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
+    for name, own in (("STRATA_RAM_KEEP_GIB", base.get("ramKeep")), ("STRATA_RESIDENT_HEADROOM_GIB", base.get("ramHeadroom"))):
+        if env.get(name) and not own:
+            return None
+    if isinstance(cfg.get("gpu"), list) and len(cfg["gpu"]) > 1:
+        return None                                    # a layer split (#642 keeps the budget there): 24, as RAM64 left it
+    try:
+        have_n = float(have)
+        model = budget_model(cfg)
+        reading = ram_gb() if ram is None else float(ram)
+        ctx = int(flag_value(args, "--max-context") or 0) if "--kv-resident" in args else 0
+        kv_ram = kv_streaming_ram_gb(ctx, flag_value(args, "--kv") or "int8") if ctx else 0.0
+        if reading <= 0 or (_unified_memory_pc() if uma is None else uma):
+            return None
+        wrote = {_budget_gib(model, r, kv_ram, UNSLOTH_RAM_LEFT_GB) for r in (reading, nominal_ram_gb(reading))}   # what 0.2.16 wrote on this PC (or now would)
+        new = resident_budget_gib(model, reading, kv_ram)
+        work = resident_budget_gib(model, reading, kv_ram, work=True)
+    except (ValueError, TypeError, KeyError):
+        return None
+    if have_n not in wrote or new == have_n:
+        return None
+    out = json.loads(json.dumps(cfg))
+    out["args"][out["args"].index(flag) + 1] = str(new)
+    if work != new:
+        out[WORK_BUDGET_KEY] = int(work)
+    user_args.stamp(out)                               # args_written follows: the move is setup's own change, not the person's
+    return out
+
+
+MOVE_MARK = "ram-budget-0217.done"      # in a folder of run configs: the move below has looked at it (once, at the first command of the new Control)
+
+
+def migrate_run_configs(folder) -> list:
+    """The run configs (strata-*.json) of `folder` moved by migrate_ram_budget, each written whole through a temporary file, the earlier one kept as
+    <name>.bak.  Returns the names moved.  A file that cannot be read or written is skipped.  strata_cli/ram_budget_move.py calls it once per folder."""
+    moved = []
+    for path in sorted(model_config_files(Path(folder))):
+        try:
+            old = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        new = migrate_ram_budget(old) if isinstance(old, dict) else None
+        if new is None:
+            continue
+        try:
+            shutil.copyfile(path, path.with_name(path.name + ".bak"))
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(new, indent=1), encoding="utf-8")
+            atomic.replace(tmp, path)
+            moved.append(path.name)
+        except OSError:
+            continue
+    return moved
 
 
 # MODEL-UPDATE Phase 2: Unsloth's files keep every expert in RAM (a pinned arena, as ISTA's files do) where the experts
@@ -7174,7 +7298,7 @@ def write_config(path: Path, cfg: dict):
 # "args_written" (strata_control/user_args.py) is setup's own; "user_args" is not in SETUP_KEYS on purpose: carry_over keeps it,
 # then applies the person's options over the generated ones
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
-                        "gpu", "gpus_asked", "gpus_by", "layer_split", "host", "api_key", "draft_vocab", "vision", "args_written"})
+                        "gpu", "gpus_asked", "gpus_by", "layer_split", "host", "api_key", "draft_vocab", "vision", "args_written", "ui_budget_work_gib"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
                        "STRATA_ROUTE_TAIL_SKIP"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
 # 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
@@ -7287,6 +7411,8 @@ def carry_user_args(old: dict, cfg: dict, explicit: list[str] | None = None) -> 
         return []
     cfg["args"] = user_args.merge(nargs, mine)
     user_args.stamp(cfg, mine)
+    if flag_value(mine, "--resident-budget-gib") is not None:
+        cfg.pop(WORK_BUDGET_KEY, None)                 # a RAM budget of the person's: theirs in every mode, no second number for the app to swap in
     return ["args " + f for f in dict.fromkeys(g[0] for g in user_args.groups(mine) if g[0].startswith("--"))]
 
 

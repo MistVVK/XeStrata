@@ -29,7 +29,16 @@ strata launch --family unsloth --model UD-Q4_K_XL
   `--model UD-Q4_K_XL --yes` installs it anyway.
 - **The RAM budget** is the PC's RAM less 17 GB (`--resident-budget-gib 47` on 64 GB; 0.2.16 and earlier: less 24 GB, 40), at most all 71 GiB of experts. From
   a 64K context up, where the KV cache moves to RAM, its size comes out of the budget. `--resident-budget-gib N` at
-  setup sets another one; a bigger one is kept, with a note on what it risks.
+  setup sets another one; a bigger one is kept, with a note on what it risks. The reading is rounded up to the size the PC is sold with where it
+  is within 3% under it (a "64 GB" Windows PC reads 63.1 GiB, Linux 62.5 to 63.7: both give 47; a PC with 60 GB gives 43).
+- **Which mode gets which number (0.2.17).** `--resident-budget-gib` in the run config is the RAM less 17 GB (47 on 64 GB): the Terminal (`strata launch`,
+  `strata serve`, Docker) and the app's "Full performance" run with it. The app's "Leave 20% for my work" runs with the number of the earlier rule, the RAM
+  less 24 GB (40 on 64 GB; 24 on 48 GB, 8 on 32 GB), which setup writes beside it as `"ui_budget_work_gib"`; the app swaps it in for that mode and puts the first one back
+  for "Full performance". The key is left out where the two numbers are the same (a unified-memory GPU keeps 24 in both; 96 GB and up keep every expert in RAM) and when
+  you asked setup for a budget (`--resident-budget-gib N`, or one in the config's `user_args`, or an edit of `args`): yours is used in both modes, as is a `--ram-keep-gib`,
+  `STRATA_RAM_KEEP_GIB` or `STRATA_RESIDENT_HEADROOM_GIB` of yours. A run config of 0.2.16 (setup's 40, no second number) is moved once, at the first
+  command of the new Control after the update: 40 becomes 47 and `"ui_budget_work_gib": 40` is added, so "Leave 20% for my work" keeps 40
+  (32 GB: 8 -> 15 and 8; 48 GB: 24 -> 31 and 24). A number you set, a unified-memory PC and a layer split are not touched; the earlier file is kept as `.bak`.
 - **Download.** The four shards below from the pinned revision `38bb39e`, resumable. Setup checks each one's size and
   SHA-256 against the table below once and remembers it in the file's finish mark. A file with the wrong hash is
   deleted, so the next run downloads it again.
@@ -162,10 +171,13 @@ Under a real 64 GiB memory limit (a cgroup the engine reads; UD-Q4_K_XL, an RTX 
 | RAM less 17 | 47 | 37.0 GB | 2,873 ms | 84.2 tok/s | 54.7 GiB | 9.3 GiB |
 | RAM less 12 | 52 | 0.9 GB | 2,138 ms | 83.4 to 88.6 tok/s | 57.4 GiB | 6.6 GiB |
 
+So "Full performance" and the Terminal read 9.3 GiB free of 64 with N 47, and "Leave 20% for my work" 16.6 GiB with N 40 (decode 84.2 and 57.7 tok/s).
+
 A program that took 8 GiB after the engine had started: N 47 and 40 ran on, N 52 was killed by the kernel (the engine reads
 the free RAM at its start and lowers an N that does not fit then, not later). On Windows the engine takes the smaller of
 available RAM and available commit; for `--resident-budget-gib` its headroom is 4 GiB and the margin 256 MiB, so a PC
-with A GiB available at the start runs N at most A - 4.25 (setup writes no `STRATA_RESIDENT_HEADROOM_GIB`).
+with A GiB available at the start runs N at most A - 4.25 (setup writes no `STRATA_RESIDENT_HEADROOM_GIB`): on a 64 GB Windows PC (reads 63.1) with 55 GiB
+available N 47 holds (room 50.75), with 50 GiB available it is 45.75, and N 40 ("Leave 20% for my work") holds from 44.25 GiB available.
 Setup does not count the experts of the card's own cache: the rule is the same for every card, and N above the experts
 outside the cache is not used (47.9 GiB on that card, about 63 GiB on a 12 GB card).
 

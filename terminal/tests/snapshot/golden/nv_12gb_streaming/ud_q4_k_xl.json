@@ -60,6 +60,7 @@
     "log": "<REPO>/strata-unsloth-ud-q4_k_xl.log",
     "lib_dirs": [],
     "port": 8080,
+    "ui_budget_work_gib": 39,
     "env": {
      "STRATA_ROUTE_TAIL_SKIP": "0"
     },
