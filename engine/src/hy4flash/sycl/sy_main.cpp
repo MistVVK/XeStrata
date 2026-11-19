@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
     }
     std::string model, engram, tok_path, out_dir = ".", force_route;
     bool load_only = false, dbg = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false;
-    int kv_host_above = 24000, gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, threads = 6, expert_act = 1;
+    int kv_host_above = 24000, gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 1024, index_topk = 2048, threads = 6, expert_act = 1;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "no tokens\n");
             return 2;
         }
-        if (max_ctx <= 0) max_ctx = T0 + gen + 16;
+        if (max_ctx <= 0) max_ctx = std::max(T0 + gen + 16, 131072);  // owner default for Hy4-Flash: 128K context on every card (the sparse-layer KV then lives in pinned host memory, see kv_host_above)
         const int Tc = std::max(chunk, 1);
         Runner r(g, cx, max_ctx, Tc, all_logits ? std::min(Tc, T0) : 1);
         r.dump = dump;

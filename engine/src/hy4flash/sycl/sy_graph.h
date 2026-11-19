@@ -79,6 +79,7 @@ public:
     int kv_host_above = 24000;  // max_ctx above which the sparse layers' KV caches stay in pinned host memory
     size_t kv_host_bytes = 0;
     int iring = 0;
+    int score_rows = 256;
     // buffers
     int32_t* d_ids = nullptr;
     float *x = nullptr, *pre = nullptr, *post = nullptr, *cur_f = nullptr, *F1 = nullptr, *F2 = nullptr, *F3 = nullptr, *sub = nullptr;
@@ -261,7 +262,7 @@ public:
         iq_h = dalloc<half>((size_t)Tc * 2048);
         hw_f = dalloc<float>((size_t)Tc * 16);
         ldS = (size_t)(max_ctx / 4 + 8);
-        score = dalloc<float>((size_t)Tc * ldS);
+        score = dalloc<float>((size_t)std::min(Tc, score_rows) * ldS);
         keys = dalloc<int32_t>((size_t)Tc * (index_topk + 8));
         nkeys = dalloc<int32_t>((size_t)Tc);
         // absorbed weights
@@ -445,11 +446,15 @@ public:
         lin(p + ".query_projection.weight", qr_h, iq_f, T);
         idx::q_rope(iq_f, iq_h, p0, (float)theta(il), T);
         lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
-        int G = (p0 + T) / 4;
-        if (G < 1) G = 1;
-        idx::score(iq_h, hw_f, pooled[il], score, p0, G, (int)ldS, 1.0f / std::sqrt((float)(128 * 16)), T);
         const int n_top = index_topk / c.kpool - 1;
-        idx::select(score, (int)ldS, p0, n_top, index_topk, keys, nkeys, T);
+        // scores are computed and consumed in batches of <= score_rows tokens (the score buffer is [score_rows][ctx/4] floats: 33 MB at 128K instead of 134 MB for a 1024 chunk)
+        for (int t0 = 0; t0 < T; t0 += score_rows) {
+            const int tb = std::min(score_rows, T - t0);
+            int G = (p0 + t0 + tb) / 4;
+            if (G < 1) G = 1;
+            idx::score(iq_h + (size_t)t0 * 2048, hw_f + (size_t)t0 * 16, pooled[il], score, p0 + t0, G, (int)ldS, 1.0f / std::sqrt((float)(128 * 16)), tb);
+            idx::select(score, (int)ldS, p0 + t0, n_top, index_topk, keys + (size_t)t0 * index_topk, nkeys + t0, tb);
+        }
     }
 
     void attention_layer(int il, int p0, int T) {
