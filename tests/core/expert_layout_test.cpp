@@ -17,7 +17,6 @@
 #include "gguf_fixture.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
-
 #include "strata/core/expert_source.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/pinned.hpp"
@@ -28,6 +27,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -180,6 +180,69 @@ void sync_v6() {
           L.blob_bytes(0, 0) == a.bytes && L.blob_bytes(0, 1) == b.bytes &&
           L.format(1, 1).gu_type == 182 && L.format(1, 1).had_gu && L.format(1, 1).had_d,
           "Sync v6: mixed sizes, positions, types and Hadamard" + (ok ? "" : ": " + err));
+    if (ok) {
+        const ExpertLayout original = L;   // NOLINT(performance-unnecessary-copy-initialization): L is replaced below
+        ExpertLayout with_gguf_offsets = L;
+        with_gguf_offsets.gguf_off.assign(6, 0);
+        expert_layout_set(with_gguf_offsets);
+        strata::core::ArenaExpertSource absent;
+        absent.set_gguf((d.path / "common.gguf").string());
+        const bool refused = !absent.open(d.path.string(), 2, 2, 1, err) &&
+                             err.find("cannot open") != std::string::npos &&
+                             err.find("experts.v2.bin") != std::string::npos;
+        expert_layout_set(original);
+        check(refused, "Sync v6: missing experts.v2.bin is not read from the common GGUF");
+        std::vector<uint8_t> packed((size_t) L.total);
+        for (int64_t layer = 0; layer < 2; ++layer) for (int64_t expert = 0; expert < 2; ++expert) {
+            const size_t off = (size_t) L.blob_offset(layer, expert), bytes = (size_t) L.blob_bytes(layer, expert);
+            std::fill(packed.begin() + (ptrdiff_t) off, packed.begin() + (ptrdiff_t) (off + bytes),
+                      (uint8_t) (1 + layer * 2 + expert));
+        }
+        { std::ofstream f(d.path / "experts.v2.bin", std::ios::binary); f.write((const char*) packed.data(), (std::streamsize) packed.size()); }
+        strata::core::FileExpertSource source;
+        ok = source.open(d.path.string(), 2, 2, err);
+        bool equal = ok;
+        for (int64_t layer = 0; ok && layer < 2; ++layer) for (int64_t expert = 0; expert < 2; ++expert) {
+            const size_t off = (size_t) L.blob_offset(layer, expert), bytes = (size_t) L.blob_bytes(layer, expert);
+            std::vector<uint8_t> copy(bytes + 1, 0x91);
+            const uint8_t* ptr = source.blob(layer, expert);
+            equal = equal && ptr && std::memcmp(ptr, packed.data() + off, bytes) == 0 &&
+                    source.copy_blob(layer, expert, copy.data()) && copy.back() == 0x91 &&
+                    std::memcmp(copy.data(), packed.data() + off, bytes) == 0;
+        }
+        check(equal, "Sync v6: mapped experts.v2.bin uses each expert's exact position and length" + (ok ? "" : ": " + err));
+        const std::vector<std::pair<int32_t, int32_t>> rank{{0, 1}, {1, 1}, {0, 0}, {1, 0}};
+        ok = ok && source.pin_complement(0, {}, {}, err, strata::core::FileExpertSource::Pin::off, {}, -1, 0,
+                                         b.bytes + a.bytes, &rank);
+        equal = ok && source.resident_count() == 2 && source.has_resident(0, 1) && source.has_resident(1, 1) &&
+                !source.has_resident(0, 0) && !source.has_resident(1, 0);
+        for (int64_t layer = 0; ok && layer < 2; ++layer) for (int64_t expert = 0; expert < 2; ++expert) {
+            const size_t off = (size_t) L.blob_offset(layer, expert), bytes = (size_t) L.blob_bytes(layer, expert);
+            const uint8_t* ptr = source.blob(layer, expert);
+            equal = equal && ptr && std::memcmp(ptr, packed.data() + off, bytes) == 0;
+        }
+        check(equal, "Sync v6: budgeted mixed RAM copy and mapped fallback" + (ok ? "" : ": " + err));
+        if (ok) {
+            check(!source.replace_resident(0, 0, 1) && source.has_resident(0, 1) && !source.has_resident(0, 0),
+                  "Sync v6: unequal-sized RAM exchange is refused without changing residency");
+        }
+#if !defined(_WIN32)
+        source.close();
+        { std::ofstream f(d.path / "experts.v2.bin", std::ios::binary | std::ios::app);
+          const std::vector<uint8_t> padding((size_t) L.max_blob, 0); f.write((const char*) padding.data(), (std::streamsize) padding.size()); }
+        setenv("XESTRATA_ARENA_MMAP", "1", 1);
+        strata::core::ArenaExpertSource arena;
+        ok = arena.open(d.path.string(), 2, 2, 1, err);
+        unsetenv("XESTRATA_ARENA_MMAP");
+        equal = ok;
+        for (int64_t layer = 0; ok && layer < 2; ++layer) for (int64_t expert = 0; expert < 2; ++expert) {
+            const size_t off = (size_t) L.blob_offset(layer, expert), bytes = (size_t) L.blob_bytes(layer, expert);
+            const uint8_t* ptr = arena.blob(layer, expert);
+            equal = equal && ptr && std::memcmp(ptr, packed.data() + off, bytes) == 0;
+        }
+        check(equal, "Sync v6: mapped arena returns each mixed expert exactly" + (ok ? "" : ": " + err));
+#endif
+    }
     write_text(d.path / "experts_k.txt", kinds + "0 0 182 183\n");
     check(!load(d.path, 2, 2, err) && err.find("duplicate") != std::string::npos, "Sync v6: duplicate expert refused");
     write_text(d.path / "experts_k.txt", "0 0 182 183\n");

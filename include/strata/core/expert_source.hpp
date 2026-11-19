@@ -120,9 +120,10 @@ bool wait_for_ram(uint64_t need, double max_wait_s, double step_s, double note_s
                   const std::function<void(double, uint64_t)>& progress, double& waited, uint64_t& available);
 
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
-/// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.
+/// `blob_sizes` has one entry per (layer, expert), in that order.  Kept CPU-only so selection and byte
+/// accounting can be tested without initializing a GPU.
 bool make_cache_complement_plan(
-    int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+    int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& blob_sizes,
     const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
     std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err);
@@ -150,7 +151,7 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 /// over; a stage's walk stops at the first pair that does not fit `cap_bytes` and the NEXT stage's walk still runs
 /// (the pairs past the cap keep the mapped-file fallback they had).  Returns the pairs added, or -1 - leaving the
 /// plan untouched - when a pair is outside the geometry or a region repeats one (upstream aea9dc3e).
-int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& blob_sizes,
                                   std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t cap_bytes,
                                   const std::vector<std::vector<std::pair<int32_t, int32_t>>>& regions,
                                   std::string& err);
@@ -228,7 +229,7 @@ public:
     /// - the pack's experts.bin, or every GGUF tensor native_experts.txt named, per layer and role
     /// ("expert blk.L.ffn_up").  Filled by open(); empty before.
     const std::vector<std::pair<std::string, std::string>>& model_inputs() const { return inputs_; }
-    /// The blob's bytes into `dst` (blob_bytes(layer) of them).  Safe from several threads for a source whose
+    /// The blob's bytes into `dst` (blob_bytes(layer, expert) of them).  Safe from several threads for a source whose
     /// `transient` can be true.
     virtual bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst);
     /// Asks the OS for these pairs' bytes ahead of the `blob` calls that read them.  False (nothing asked) by default.
@@ -907,7 +908,7 @@ private:
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
-    void publish_stage(size_t v, int64_t layer, bool ok, double us);
+    void publish_stage(size_t v, int64_t layer, int64_t expert, bool ok, double us);
     struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);

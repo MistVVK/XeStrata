@@ -197,7 +197,7 @@ void test_complement_plan() {
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
     std::string error;
-    require(make_cache_complement_plan(2, 3, {3, 5}, {{0, 1}, {1, 2}}, {}, offsets, bytes, error), error);
+    require(make_cache_complement_plan(2, 3, {3, 3, 3, 5, 5, 5}, {{0, 1}, {1, 2}}, {}, offsets, bytes, error), error);
     require(bytes == 16 && offsets == std::vector<uint64_t>{0, kNoCacheComplement, 3, 6, 11, kNoCacheComplement},
             "wrong compact offsets for variable native layer sizes");
     const uint8_t resident[16] = {}, mapped[5] = {};
@@ -205,13 +205,21 @@ void test_complement_plan() {
             "GPU-resident expert lost mmap fallback");
     require(cache_complement_blob_or_fallback(4, offsets, resident, mapped) == resident + 11,
             "CPU miss did not use resident complement");
-    require(!make_cache_complement_plan(2, 3, {3, 5}, {{0, 1}, {0, 1}}, {}, offsets, bytes, error)
+    require(!make_cache_complement_plan(2, 3, {3, 3, 3, 5, 5, 5}, {{0, 1}, {0, 1}}, {}, offsets, bytes, error)
             && offsets.empty() && bytes == 0, "duplicate pair accepted");
-    require(!make_cache_complement_plan(2, 3, {3, 5}, {{0, 1}}, {{0, 1}}, offsets, bytes, error),
+    require(!make_cache_complement_plan(2, 3, {3, 3, 3, 5, 5, 5}, {{0, 1}}, {{0, 1}}, offsets, bytes, error),
             "overlapping tiers accepted");
-    require(!make_cache_complement_plan(2, 3, {3, 5}, {{2, 0}}, {}, offsets, bytes, error),
+    require(!make_cache_complement_plan(2, 3, {3, 3, 3, 5, 5, 5}, {{2, 0}}, {}, offsets, bytes, error),
             "out-of-range pair accepted");
-    require(!make_cache_complement_plan(2, 3, {0, 5}, {}, {}, offsets, bytes, error), "zero-size layer accepted");
+    require(!make_cache_complement_plan(2, 3, {0, 0, 0, 5, 5, 5}, {}, {}, offsets, bytes, error), "zero-size layer accepted");
+    const std::vector<uint64_t> sizes{3, 7, 2, 9, 4, 5};
+    require(make_cache_complement_plan(2, 3, sizes, {{0, 1}, {1, 2}}, {}, offsets, bytes, error), error);
+    require(bytes == 18 && offsets == std::vector<uint64_t>{0, kNoCacheComplement, 3, 5, 14, kNoCacheComplement},
+            "wrong compact offsets for per-expert sizes");
+    require(append_stage_lend_regions(2, 3, sizes, offsets, bytes, 25, {{{1, 2}, {0, 1}}}, error) == 1 &&
+                bytes == 23 && offsets[5] == 18 && offsets[1] == kNoCacheComplement,
+            "mixed-size lend region did not respect the budget");
+    require(!make_cache_complement_plan(2, 3, {3, 5}, {}, {}, offsets, bytes, error), "short size table accepted");
 }
 
 void test_resident_lend_region() {
@@ -236,7 +244,7 @@ void test_resident_exchange() {
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
     std::string error;
-    require(make_cache_complement_plan(2, 3, {3, 5}, {{0, 1}, {1, 2}}, {}, offsets, bytes, error), error);
+    require(make_cache_complement_plan(2, 3, {3, 3, 3, 5, 5, 5}, {{0, 1}, {1, 2}}, {}, offsets, bytes, error), error);
     const std::vector<uint64_t> before = offsets;
     // (1,0) moves into the GPU, (1,2) leaves it: (1,2) takes (1,0)'s bytes' place
     require(exchange_cache_complement(offsets, 3, 5), "a valid exchange was refused");
