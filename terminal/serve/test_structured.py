@@ -149,6 +149,68 @@ class Structured(unittest.TestCase):
                          {"type": "json_object", "repair_latex_escapes": True})
         self.assertEqual(text_format({"text": {"format": {"type": "json_object"}}}), {"type": "json_object"})
 
+    def test_array_root_must_not_become_a_successful_object(self):
+        fmt = {"type": "json_object"}
+        cases = (
+            '[{"answer":1}]',
+            '[{"answer":1},{"answer":2}]',
+            '[[{"answer":1}]]',
+            '[[], [{"answer":1}]]',
+            '[null, {"answer":1}]',
+            '[false, {"answer":1}]',
+            '[1, {"answer":1}]',
+            '["a", {"answer":1}]',
+            '[{"answer":1},]',
+            'Here is the result: [{"answer":1},{"answer":2}]',
+            '```json\n[{"answer":1}]\n```',
+            '[{"answer":1}, BROKEN]',
+            '[{"answer":1}',
+            json.dumps(['text with ] and " escaped', {"answer": 1}]),
+        )
+        for script in cases:
+            with self.subTest(script=script):
+                code, reply = self.chat(script, response_format=fmt)
+                self.assertEqual(code, 502)
+                self.assertEqual(reply["error"]["code"], "structured_output_failed")
+        for script in (cases[0], cases[1], cases[5]):
+            with self.subTest(stream_script=script):
+                code, raw = self.chat(script, response_format=fmt, stream=True)
+                self.assertEqual(code, 200)
+                self.assertIn('"structured_output_failed"', raw)
+                self.assertNotIn('"delta"', raw)
+                self.assertIn("data: [DONE]", raw)
+        code, reply = self.chat('[' + json.dumps(STORY) + ']', response_format=FORMAT)
+        self.assertEqual(code, 502)
+        self.assertEqual(reply["error"]["code"], "structured_output_failed")
+        with mock.patch.object(structured, "_jsonschema", False):
+            code, reply = self.chat('[' + json.dumps(STORY) + ']', response_format=FORMAT)
+            self.assertEqual(code, 502)
+            self.assertEqual(reply["error"]["code"], "structured_output_failed")
+
+    def test_prose_brackets_do_not_block_object_extraction(self):
+        fmt = {"type": "json_object"}
+        for script in (
+            '[note] Result: {"answer":1}',
+            '[one] [two] {"answer":1}',
+            '[1 reason: {"answer":1}',
+            'Context [2026 update: {"answer":1}',
+            'Example [- this note {"answer":1}',
+            'Quoted ["unfinished {"answer":1}',
+            'Example [true story: {"answer":1}',
+            'A long note [ 2 versions: {"answer":1}',
+            'Draft [unfinished note. Result: {"answer":1}',
+            'The character "[" is part of the explanation. {"answer":1}',
+            '{"answer":1,"list":[{"n":2}]}',
+        ):
+            with self.subTest(script=script):
+                code, reply = self.chat(script, response_format=fmt)
+                self.assertEqual(code, 200)
+                if '"list"' in script:
+                    self.assertEqual(json.loads(reply["choices"][0]["message"]["content"]),
+                                     {"answer": 1, "list": [{"n": 2}]})
+                else:
+                    self.assertEqual(reply["choices"][0]["message"]["content"], '{"answer":1}')
+
     def test_rejected_schema_does_not_load_the_engine_or_retry(self):
         with mock.patch.object(self.svc, "load") as load:
             code, _ = self.chat(response_format={"type": "json_schema"})
