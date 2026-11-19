@@ -5883,6 +5883,10 @@ class Service:
                 "reasoning_recoveries": recovery_count}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
+            if finish == "length":
+                # #4035: the stop string was found and cut from the answer, so the answer ended at it: "stop", not the token cap that fell on the
+                # same token (the Anthropic route already says stop_sequence)
+                done["finish"] = "stop"
         if rejected:
             done["rejected_tool_calls"] = rejected
         if markup_retried is not None:
