@@ -471,6 +471,20 @@ class At80Columns(unittest.TestCase):
         self.assertIn("? help   q quit", text[-1])
         self.assertIn("7 views", text[-1])
 
+    def test_two_cards_keep_the_help_line_too(self):
+        from tests.terminal.test_overview import metrics
+        gib = 2 ** 30
+        card = lambda i: {"index": i, "name": "NVIDIA RTX A4000", "util": 3, "mem_used": gib, "mem_total": 16 * gib, "temp": 40, "power": 20,  # noqa: E731
+                          "power_limit": 140, "pcie_gen": 1, "pcie_gen_max": 4, "pcie_width": 16, "pcie_width_max": 16}
+        m = metrics("idle")
+        m["hardware"] = {**m["hardware"], "gpus": [card(0), card(1)]}
+        lines = self.draw(m).rstrip("\n").split("\n")
+        self.assertLessEqual(len(lines), 22)
+        self.assertIn("? help   q quit", lines[-1])
+        tall = self.draw(m, width=110, height=36)
+        self.assertIn("Cards", tall)                                                   # the strip is there where the window has the room
+        self.assertIn("idle, max Gen4", tall)
+
     def test_nothing_in_the_state_line_is_cut(self):
         from tests.terminal.test_overview import metrics
         line = next(ln for ln in self.draw(metrics("generating")).split("\n") if ln.startswith("Model state"))

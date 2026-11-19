@@ -541,7 +541,7 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
     hint = Text(keys, style="dim")
     gap = [] if tight else [Text("")]
     parts: list[Any] = [head, tabs, rule, st, state_bar, *gap, row(tiles1), row(tiles2)]
-    if ncards:
+    if ncards and not tight:                                 # (a window of fewer than 24 rows has no room for the strip: each card is on the Hardware page, and the help line stays)
         parts += [Text(""), _cards_strip(cards, glyphs, accent, ascii_mode, width)]
     parts += [bottom, *gap, hint]
     return Group(*parts)
