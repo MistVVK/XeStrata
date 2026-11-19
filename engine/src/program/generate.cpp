@@ -5492,11 +5492,20 @@ int main(int argc, char** argv) {
             const bool knobs = o.rope_scale > 1.0 || o.rope_freq_scale > 0 || o.yarn_ext_factor > 0 ||
                                o.yarn_attn_factor != 1.0;
             const double base = rope_cfg.freq_base;
+            const double trained = rope_cfg.orig_ctx;   // the model's (or --yarn-orig-ctx), before the reset
             rope_cfg = strata::kernels::RopeScaling{};
             rope_cfg.freq_base = base;
             if (knobs)
                 std::fprintf(stderr, "strata generate: note: no rope scaling is active (none), so --rope-scale, "
                                      "--rope-freq-scale and the --yarn-* knobs have no effect\n");
+            // a --max-context set by hand past the trained one ran without a word: setup adds yarn there, a config
+            // written by hand did not
+            if (trained >= 1 && (double) o.max_context > trained)
+                std::fprintf(stderr, "strata generate: WARNING: --max-context %lld is past the model's trained context "
+                                     "of %.0f and no rope scaling is active: positions past it rotate by angles the model "
+                                     "never saw, and it can lose track there. To extend the context: --rope-scaling yarn "
+                                     "--rope-scale %.3g (what setup writes above %.0f)\n",
+                             (long long) o.max_context, trained, (double) o.max_context / trained, trained);
         }
         // THE RESOLVED CONFIG IS VALIDATED AS A WHOLE, with the one rule every rotation site also applies
         // (rope_scaling.hpp): the CLI ranges above cannot see a model-file value, nor a combination such as a
