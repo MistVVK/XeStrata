@@ -119,6 +119,33 @@ class Mapping(unittest.TestCase):
         self.assertEqual(t._adl_link((0, 0, 0, 0), None)["pcie_gen_max"], None)
 
 
+class WindowsAmdCards(unittest.TestCase):
+    """The card list _pick_card and hardware_static use, rows measured on a 7900 XTX desktop (0.2.16): its Ryzen iGPU
+    carves out exactly 2 GiB, so the old size rule kept it as card 0, and the display class also kept the driver key
+    of a taken-out RX 9070 XT (DirectX AdapterLuid 0).  Neither may take the card's row; an APU alone keeps its own."""
+
+    ROWS = [{"name": "AMD Radeon(TM) Graphics", "vram_bytes": 2 << 30},
+            {"name": "AMD Radeon RX 9070 XT", "vram_bytes": 16 << 30},                     # stale key: not plugged in
+            {"name": "AMD Radeon RX 7900 XTX", "vram_bytes": 24 << 30}]
+
+    def test_igpu_with_2_gib_and_a_stale_key_leave_the_card(self):
+        with mock.patch.object(t, "_dx_amd_absent", return_value={t._norm_card("AMD Radeon RX 9070 XT")}):
+            self.assertEqual([c["name"] for c in t.windows_amd_cards(self.ROWS)], ["AMD Radeon RX 7900 XTX"])
+
+    def test_apu_alone_and_a_name_directx_does_not_report_change_nothing(self):
+        apu = [{"name": "AMD Radeon(TM) 8060S Graphics", "vram_bytes": 512 << 20}]
+        with mock.patch.object(t, "_dx_amd_absent", return_value=set()):
+            self.assertEqual([c["name"] for c in t.windows_amd_cards(apu)], ["AMD Radeon(TM) 8060S Graphics"])
+            # name rule alone: the iGPU still goes, and a stale key DirectX does not report as absent stays (as before the fix)
+            self.assertEqual([c["name"] for c in t.windows_amd_cards(self.ROWS)],
+                             ["AMD Radeon RX 9070 XT", "AMD Radeon RX 7900 XTX"])
+
+    def test_hip_card_0_finds_the_adl_row(self):
+        with mock.patch.object(t, "_dx_amd_absent", return_value={t._norm_card("AMD Radeon RX 9070 XT")}):
+            hip = [c["name"] for c in t.windows_amd_cards(self.ROWS)]
+        self.assertEqual(t._pick_card(["AMD Radeon RX 7900 XTX"], 0, hip), 0)              # was None: the iGPU's name, no ADL row
+
+
 class Sensors(unittest.TestCase):
     """The PMLog sensors a reading takes: the first temperature the card reports (an 8060S has the graphics one, 28, no edge),
     board power before ASIC power, and an integrated Radeon shows no PCIe link."""

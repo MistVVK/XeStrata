@@ -1451,11 +1451,60 @@ def windows_display_adapters(vendor=None) -> list:
     return out
 
 
+_DX_ADAPTERS = r"SOFTWARE\Microsoft\DirectX"   # the adapter list Windows and Task Manager use: Description, VendorId, AdapterLuid
+
+
+def _norm_card(name) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def _dx_amd_absent() -> set:
+    """Normalized Descriptions of AMD adapters the DirectX adapter list knows but reports as not plugged in now
+    (AdapterLuid 0; the app's own host reads the same key).  The display class keeps the driver key of a card that
+    was taken out (#3892): measured on a 7900 XTX PC, a removed RX 9070 XT's key sat between the iGPU and the card
+    and took a Monitor row.  A name counts as absent only when DirectX lists it with no live twin, so a name the
+    list does not know at all is never filtered."""
+    if os.name != "nt":
+        return set()
+    try:
+        import winreg
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _DX_ADAPTERS)
+    except OSError:
+        return set()
+    live, gone = set(), set()
+    i = 0
+    while True:
+        try:
+            sub = winreg.EnumKey(root, i)
+        except OSError:
+            break
+        i += 1
+        try:
+            k = winreg.OpenKey(root, sub)
+            desc = str(winreg.QueryValueEx(k, "Description")[0] or "")
+            vid = int(winreg.QueryValueEx(k, "VendorId")[0])
+            luid = winreg.QueryValueEx(k, "AdapterLuid")[0]
+        except (OSError, TypeError, ValueError):
+            continue
+        if isinstance(luid, (bytes, bytearray)):        # REG_QWORD or REG_BINARY; a Luid of 0 means the card is not there
+            luid = int.from_bytes(bytes(luid[:8]), "little")
+        if vid == 0x1002:
+            (live if luid else gone).add(_norm_card(desc))
+    return gone - live
+
+
 def windows_amd_cards(adapters=None) -> list:
-    """The AMD cards HIP runs on, as windows_display_adapters lists them.  A Ryzen's integrated Radeon is listed too
-    (512 MiB on a Ryzen 5 7600): beside a card with 2 GiB or more it is left out (an APU alone keeps it)."""
+    """The AMD cards HIP runs on, as windows_display_adapters lists them.  A Ryzen's integrated Radeon is listed too,
+    and size cannot tell it apart: 512 MiB on a Ryzen 5 7600, but exactly 2 GiB on a board carrying a 7900 XTX
+    (gfx1036, measured) and 43 GiB on a Strix Halo - so like _adl_cards the driver name decides, an integrated Radeon
+    being the one called "... Graphics"; an APU alone keeps it.  Driver keys of cards no longer plugged in (#3892)
+    are left out when the DirectX adapter list reports that exact name as absent."""
     cards = windows_display_adapters("amd") if adapters is None else adapters
-    return [c for c in cards if (c["vram_bytes"] or 0) >= 2 << 30] or cards
+    gone = _dx_amd_absent()
+    if gone:
+        cards = [c for c in cards if _norm_card(c["name"]) not in gone] or cards
+    discrete = [c for c in cards if "graphics" not in c["name"].lower()]
+    return discrete or cards
 
 
 def free_vram_mib(index=0, amd=False):
