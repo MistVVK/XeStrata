@@ -404,7 +404,7 @@ int main(int argc, char** argv) {
                    14,
 #endif
                    8})        // STRATA_GU_FMTS
-        for (int dt : {20, 23, 42, 7, 8, 6}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS (6 = Q5_0: UD-IQ4_XS / Q3_K_XL); IQ4_XS: n_ff % 256
+        for (int dt : {20, 23, 42, 7, 8, 6, 12}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS (6 = Q5_0: UD-IQ4_XS / Q3_K_XL, 12 = Q4_K: heretic); IQ4_XS: n_ff % 256
     check(42, 42, 2560, 640, s, rng);
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     // round 0214: every expert type pair of the new Unsloth Qwen3.8-Flash-Next sets at the model's 2560 x 640
