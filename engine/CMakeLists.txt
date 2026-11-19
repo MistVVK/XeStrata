@@ -399,6 +399,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(mtp_head_rule_test tests/core/mtp_head_rule_test.cpp)
   target_include_directories(mtp_head_rule_test PRIVATE include)
   add_test(NAME mtp_head_rule_test COMMAND mtp_head_rule_test)
+  # #5822: the batch indexer append names the predicate that failed, with its values (header-only, no GPU)
+  add_executable(qsa_batch_check_test tests/prefill/qsa_batch_check_test.cpp)
+  target_include_directories(qsa_batch_check_test PRIVATE include)
+  add_test(NAME qsa_batch_check_test COMMAND qsa_batch_check_test)
 
   # #5715: strata-q36's one-session context check (the reporter's 12 GB card from its log): header-only, no GPU
   add_executable(q36_context_fit_test tests/program/q36_context_fit_test.cpp)

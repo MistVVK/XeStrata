@@ -21,6 +21,7 @@
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/qsa_batch_check.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <atomic>
@@ -341,10 +342,16 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
                                      const RopeScaling& scaling, void* stream) {
     if (n <= 0) return;
-    if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT || p0 < 0 || p0 + n > max_cells ||
-        max_cells > INT32_MAX || pos_base < 0 || pos_base % R || int64_t(pos_base) + max_cells > INT32_MAX ||
-        !std::isfinite(epsilon) || epsilon <= 0.0f || rope_scaling_invalid(scaling) != nullptr)
-        throw std::invalid_argument("native QSA indexer (batch): bad geometry, positions, parameters or scaling");
+    {   // #5822: the failed predicate and its values, not one text for seven causes (qsa_batch_check.hpp)
+        QsaBatchArgs ca;
+        ca.has_stream = stream != nullptr;
+        ca.idx_dim = s.idx_dim; ca.idx_block = s.idx_block; ca.n_rot = s.n_rot;
+        ca.want_dim = D; ca.want_block = R; ca.want_rot = ROT;
+        ca.n = n; ca.p0 = p0; ca.max_cells = max_cells; ca.pos_base = pos_base; ca.epsilon = epsilon;
+        ca.rope_problem = rope_scaling_invalid(scaling);
+        const std::string why = qsa_batch_problem(ca);
+        if (!why.empty()) throw std::invalid_argument(why);
+    }
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
     const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
     const float fsf = k.freq_scale, cl = k.corr_low, ch = k.corr_high, ef = k.ext_factor, ms = k.attn_factor;
