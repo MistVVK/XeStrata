@@ -402,6 +402,15 @@ private:
     std::vector<int> slice_threads_;  // threads draining each slice (the host counted in its own)
     int64_t pub_ns_ = 0;              // the current mode-5/6 phase's publish time (host only)
     double slice_ms_[2] = {0.0, 0.0}; // accumulated per-slice drain time (host only)
+    // Diagnostic (STRATA_DIAG_POOL=1, a measuring build only): where the time of run_split_multi_native goes.
+    struct alignas(64) DiagW {
+        std::atomic<int64_t> busy{0}, wake{0}, tasks{0};
+    };
+    std::unique_ptr<DiagW[]> dg_w_;          // n_ workers, then the host
+    std::atomic<int64_t> dg_pub_ns_{0};      // the current mode-5/6 phase's publish time, read by the workers
+    int64_t dg_calls_ = 0, dg_batches_ = 0, dg_phases_ = 0, dg_experts_ = 0, dg_entries_ = 0;
+    int64_t dg_run_ns_ = 0, dg_wp_before_ns_ = 0, dg_phase_ns_ = 0, dg_wp_after_ns_ = 0, dg_quant_ns_ = 0;
+    void diag_pool_print(const char* why);
     bool numa_phase() const { return numa_n_ > 0 && mode_ >= 5; }
     /// The claim of `claim()` on slice `slice`'s head: `base + i`, or -1.
     int claim_slice(uint32_t epoch, int slice);
