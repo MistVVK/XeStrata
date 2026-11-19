@@ -6092,6 +6092,13 @@ def update_installed_engine(url_base, toolkit=None, rebuild=False) -> None:
         return
     eng = engine_dir(toolkit)
     info = eng / "BUILD.json"
+    kept = eng / "BUILD.json.prev"
+    if not info.exists() and kept.exists() and (eng / EXE).exists():
+        try:
+            kept.replace(info)
+            warn("an earlier engine update did not finish: trying it again")
+        except OSError:
+            pass
     if not info.exists() or not (eng / EXE).exists():
         return
     meta_text = info.read_text(encoding="utf-8")
