@@ -161,6 +161,9 @@ public:
     bool mpp_ok = false;       // hy4_mpp.metal / hy4_mppq.metal compiled (Metal 4 matmul2d): prefill GEMMs through an fp16 dequantised scratch
     int mpp_min = 96;          // use it from this many tokens
     Buffer wscr;               // dequantised weight scratch [N][K] half
+    int moe_mm_min = 64;       // MoE prefill through the MPP grouped GEMM from this many tokens (needs mpp_ok)
+    Buffer m_srt, m_pos, m_tiles, m_meta, m_xs, m_hs, m_y;
+    static int moe_tm(int T) { return T <= 768 ? 16 : (T <= 1536 ? 32 : 64); }
     size_t wscr_elems = 0;
     int lib = -1;
     std::unordered_map<std::string, mtl::Pipeline> pl;
@@ -271,7 +274,7 @@ public:
         {
             const std::string dir = kernel_path.substr(0, kernel_path.rfind('/') + 1);
             std::string why;
-            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_mpp.metal", dir + "hy4_mppq.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
+            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
             mpp_ok = lib >= 0;
             if (!mpp_ok) {
                 if (mpp_try) fprintf(stderr, "[metal] MPP (Metal 4 matmul2d) kernels not available, simdgroup GEMM only: %s\n", why.substr(0, 200).c_str());
@@ -279,6 +282,16 @@ public:
             }
             wscr_elems = (size_t) 16384 * 3072;
             if (mpp_ok) wscr = cx.alloc(wscr_elems * 2);
+            if (mpp_ok) {
+                const size_t P = (size_t) Tc * 16, rows_max = P + 512 * (size_t) moe_tm(Tc);
+                m_srt = cx.alloc(rows_max * 4);
+                m_pos = cx.alloc(P * 4);
+                m_tiles = cx.alloc((P / 16 + 512 + 8) * 8);
+                m_meta = cx.alloc(64);
+                m_xs = cx.alloc(rows_max * 1536 * 2);
+                m_hs = cx.alloc(rows_max * 1536 * 2);
+                m_y = cx.alloc(rows_max * 1536 * 4);
+            }
         }
         const int T = Tc;
         auto A = [&](size_t bytes) { return cx.alloc(bytes); };
@@ -572,6 +585,19 @@ public:
         op("router_zproj");
         const Arg sec4 = Arg::B(g.wbuf, g.sec4_off);
         const Arg exl = Arg::B(d_experts, (size_t) (il - 1) * 512 * sizeof(ExpertDev));
+        if (mpp_ok && T >= moe_mm_min) {
+            const int Pn = T * 16, TM = moe_tm(T), TN = 32, SG = TM == 64 ? 4 : 2;
+            const std::string tag = std::to_string(TM) + "_" + std::to_string(TN) + "_" + std::to_string(SG);
+            add("moe_plan", 1, 1, 512, {B(moe_idx), I(Pn), I(TM), B(m_srt), B(m_pos), B(m_tiles), B(m_meta), I(1536 / TN), I(1536 / TN)});
+            add("moe_gather", 1, 1, 256, {B(z_h), B(m_srt), B(m_xs)});
+            ds.back().indirect = &m_meta; ds.back().ind_off = 32;
+            add("moe_mm_gu_" + tag, 1, 1, SG * 32, {sec4, exl, B(m_xs), B(m_hs), B(m_tiles)});
+            ds.back().indirect = &m_meta; ds.back().ind_off = 8;
+            add("moe_mm_dn_" + tag, 1, 1, SG * 32, {sec4, exl, B(m_hs), B(m_y), B(m_tiles)});
+            ds.back().indirect = &m_meta; ds.back().ind_off = 20;
+            add("moe_combine", T, 1, 256, {B(m_y), B(m_pos), B(moe_w), B(zout_f)});
+            op("moe_experts");
+        } else {
         if (T <= pair_max) {
             const int Pn = T * 16;
             add("moe_gu_pair", 192, Pn, 256, {sec4, exl, B(z_h), B(moe_idx), B(moe_h2)});
@@ -583,6 +609,7 @@ public:
             add("moe_dn_sorted", 192, 512, 256, {sec4, exl, B(moe_w), B(moe_cnt), B(moe_off), B(moe_pairs), B(moe_h2), B(moe_y)});
         }
         add("moe_reduce", T, 1, 256, {B(moe_y), B(zout_f)});
+        }
         op("moe_experts");
         add("f2h", (nz + 255) / 256, 1, 256, {B(zout_f), B(z_h), U(nz)});
         lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);
@@ -665,7 +692,7 @@ static size_t rss_bytes() {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false;
-    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96;
+    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -690,6 +717,7 @@ int main(int argc, char** argv) {
         else if (a == "--pair-max") pair_max = atoi(nxt().c_str());
         else if (a == "--layers") n_layers_run = atoi(nxt().c_str());
         else if (a == "--no-mpp") no_mpp = true;
+        else if (a == "--moe-mm-min") moe_mm_min_arg = atoi(nxt().c_str());
         else if (a == "--mpp-min") mpp_min_arg = atoi(nxt().c_str());
         else {
             fprintf(stderr, "unknown arg %s\n", a.c_str());
@@ -748,6 +776,7 @@ int main(int argc, char** argv) {
     r.pair_max = pair_max;
     r.mpp_try = !no_mpp;
     r.mpp_min = mpp_min_arg;
+    r.moe_mm_min = moe_mm_min_arg;
     r.n_run = std::min(n_layers_run, r.c.n_layers);
     const int V = r.c.vocab;
     if (!r.init(no_engram ? std::string() : engram, all_logits ? r.Tc : 1, err)) {
