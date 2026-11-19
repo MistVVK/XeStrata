@@ -1624,7 +1624,15 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
         # #6032 R5: every parameter the model began was unreadable (an opener cut before its `>`, a stub): the call is
         # not run with no arguments at all - it goes back as the text it is
         raise ValueError("malformed tool call: no readable parameter: " + body[:80])
+    if recover and unwrap_arguments(args, props):
+        args = args["arguments"]
     return ToolCall(name=name, arguments=args)
+
+
+def unwrap_arguments(args: dict, props: dict) -> bool:
+    """#5804 (recover): the model wrote the whole argument object as one `<parameter=arguments>` (a JSON object) and the tool has no parameter of that
+    name: that object is the call's arguments.  True when `args` is exactly that one parameter."""
+    return list(args) == ["arguments"] and isinstance(args["arguments"], dict) and "arguments" not in props
 
 
 RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
@@ -1704,6 +1712,7 @@ class OutputParser:
         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
         self.recover = recover
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
+        self.rbare = False           # #5804: the call held in the reasoning ("rcall") opened with <function= alone
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._final = False          # #4701: the turn has ended: a call held for what might follow it is decided now
         self._held = ""              # #5276/#5409: the end of a misspelt opener or a prefixed name still arriving (see _prefixed)
@@ -1800,6 +1809,12 @@ class OutputParser:
             p = self.buf.find(FUNC_START, p + 1)
         return -1, False
 
+    def _bare_in_reasoning(self):
+        """#5804 (recover): a `<function=NAME>` of a declared tool that opens a call in the reasoning without its wrapper (start of a line, outside code)
+        -> (position, decided), None for none; a name still arriving is undecided."""
+        b, decided = self._bare_opener()
+        return (b, decided) if b >= 0 else None
+
     @property
     def line(self) -> str:
         """Materialize the current line only for a decision, newline, or state snapshot."""
@@ -1848,12 +1863,16 @@ class OutputParser:
                         self.fence = ""
                 elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
                     self.fence = s[0] * (len(s) - len(s.lstrip(s[0])))
-                else:
-                    # #4923: inline code is a one-line matter here.  The odd count of a line with one unpaired backtick was carried to the
-                    # end of the paragraph, so every `<tool_call>` after it read as quoted inline code and the turn ended with no call.
-                    # A quoted opener sits in a fence or on a line with its own backticks (the fence state and the current line decide
-                    # both), so a finished line carries nothing on.
+                elif not s:
                     self.ticks = 0
+                elif self.ticks % 2:
+                    self.ticks = (self.ticks + line.count("`")) % 2      # a span opened at a line's end goes on until closed
+                else:
+                    # #4923: the odd count of a line with one unpaired backtick in its text ("use `run_commands to check") was carried to the end
+                    # of the paragraph, so every `<tool_call>` after it read as quoted inline code and the turn ended with no call.  Only a
+                    # backtick that ends its line, or is followed on it by markup (`<tool_call>`), opens a span that goes on to the next line
+                    # (the quote "`" + line break + call + "`").
+                    self.ticks = 1 if line.count("`") % 2 and line[line.rfind("`") + 1:].strip()[:1] in ("", "<") else 0
                 # #4703: an indented (4 spaces or a tab) code block starts after a blank line and goes on until a line that is not indented
                 if was_fenced or self.fence:
                     self._prev_blank = self._indented = False
@@ -2186,7 +2205,10 @@ class OutputParser:
         elif self.ss == "raw" and self.sraw_pname is not None:   # a value the output ended inside: its text, as before
             self.sheld.pop(self.sraw_pname, None)
             self.sheld[self.sraw_pname] = self.buf[self.sp:].strip("\n")
-        for k, v in self.sheld.items():         # #5493: the non-string parameters, each once, the later write
+        held = self.sheld
+        if self.recover and self.sfirst and unwrap_arguments(held, self.sdeclared):   # #5804: a lone `<parameter=arguments>` object is the call's arguments
+            held = held["arguments"]
+        for k, v in held.items():               # #5493: the non-string parameters, each once, the later write
             tail += ("" if self.sfirst else ",") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False)
             self.sfirst = False
         self.sheld = {}
@@ -2299,12 +2321,15 @@ class OutputParser:
             if self.state == "rcall":
                 # #804: a `<tool_call>` inside the reasoning, with tools declared.  It is held whole (never streamed
                 # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
-                body = self.buf[len(CALL_START):]
+                lead = 0 if self.rbare else len(CALL_START)   # #5804: a bare `<function=` call in the reasoning has no wrapper
+                body = self.buf[lead:]
                 end, think = call_end(body, hold=False), body.find(THINK_END)
                 drop = len(CALL_END)
                 f = function_end(body)               # #4427: as in the answer, a following call opener confirms an omitted closer
                 if f >= 0 and (end < 0 or f < end) and re.match(r"<tool_call>\s*<function=\s*[^<>\s]+\s*>", body[f:].lstrip()):
                     end, drop = f, 0
+                if self.rbare:
+                    end, drop = f, 0                 # ... it ends at its own `</function>`
                 if end >= 0 and (think < 0 or think >= end):
                     call = None
                     try:
@@ -2315,23 +2340,23 @@ class OutputParser:
                             call.name = name
                     except ValueError:
                         pass
-                    raw = self.buf[:len(CALL_START) + end + drop]
+                    raw = self.buf[:lead + end + drop]
                     if call is not None or self.pending:
                         self.pending.append([raw, call])    # settled by what follows it (see __init__)
                     else:
                         out.append(Event("reasoning", self._track(raw)))
                     self.buf = body[end + drop:]
-                    self.state = "reasoning"
+                    self.state, self.rbare = "reasoning", False
                 elif think >= 0:                     # the thinking ended inside it: it never was a call
                     out += self._release(False)
-                    out.append(Event("reasoning", self._track(self.buf[:len(CALL_START) + think])))
+                    out.append(Event("reasoning", self._track(self.buf[:lead + think])))
                     self.buf = body[think:]
-                    self.state = "reasoning"
+                    self.state, self.rbare = "reasoning", False
                 elif len(body) > RCALL_MAX:          # a tag in the prose that never closes: stop holding the thinking back
                     out += self._release(False)
                     out.append(Event("reasoning", self._track(self.buf)))
                     self.buf = ""
-                    self.state = "reasoning"
+                    self.state, self.rbare = "reasoning", False
                 else:
                     return out
             elif self.state == "reasoning":
@@ -2344,17 +2369,33 @@ class OutputParser:
                         self.buf = stripped
                     if not self.buf:
                         return out
+                    bare = self._bare_in_reasoning() if self.recover and self.schemas else None
                     if self.buf.startswith(CALL_START):
                         self.state = "rcall"
+                    elif bare is not None and bare[0] == 0:          # #5804: a bare `<function=` call after a call
+                        if not bare[1]:
+                            return out
+                        self.state, self.rbare = "rcall", True
                     elif self.buf.startswith(THINK_END):
                         out += self._release(True)
-                    elif CALL_START.startswith(self.buf) or THINK_END.startswith(self.buf):
+                    elif CALL_START.startswith(self.buf) or THINK_END.startswith(self.buf) \
+                            or (bare is None and self.recover and self.schemas and FUNC_START.startswith(self.buf)):
                         return out
                     else:
                         out += self._release(False)
                     continue
                 i = self.buf.find(THINK_END)
                 tool = self.buf.find(CALL_START) if self.schemas else -1
+                bare = self._bare_in_reasoning() if self.recover and self.schemas else None
+                if bare is not None and (i < 0 or bare[0] < i) and (tool < 0 or bare[0] < tool):
+                    # #5804 (recover): a declared tool's `<function=NAME>` at the start of a line, outside code, is a call in the reasoning too
+                    if bare[0]:
+                        out.append(Event("reasoning", self._track(self.buf[:bare[0]])))
+                        self.buf = self.buf[bare[0]:]
+                    if not bare[1]:                  # the name has not arrived: held
+                        return out
+                    self.state, self.rbare = "rcall", True
+                    continue
                 if tool >= 0 and (i < 0 or tool < i):
                     if tool:
                         out.append(Event("reasoning", self._track(self.buf[:tool])))
@@ -2366,7 +2407,8 @@ class OutputParser:
                         self.buf = self.buf[tool + len(CALL_START):]
                     continue
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END, CALL_START) if self.schemas else (THINK_END,))
+                    keep = self._hold(self.buf, ((THINK_END, CALL_START, FUNC_START) if self.recover else (THINK_END, CALL_START))
+                                      if self.schemas else (THINK_END,))
                     if len(self.buf) > keep:
                         out.append(Event("reasoning", self._track(self.buf[:len(self.buf) - keep])))
                         self.buf = self.buf[len(self.buf) - keep:]
@@ -2657,7 +2699,7 @@ class OutputParser:
         if self.state == "rcall" and reason in (None, "stop"):
             # #4427: a call in the reasoning whose `</function>` is the end of the output (the `</tool_call>` left out)
             # is as whole as one in the answer: it waits for the turn's end like the others
-            body = self.buf[len(CALL_START):]
+            body = self.buf[0 if self.rbare else len(CALL_START):]
             f = function_end(body)
             name = body.lstrip()[len(FUNC_START):].split(">", 1)[0].strip() if f >= 0 else ""
             name = self.aliases.get(name, name)
@@ -2666,7 +2708,7 @@ class OutputParser:
                     call = parse_tool_call(body[:f], self.schemas.get(name), self.notes, recover=self.recover)
                     call.name = name
                     self.pending.append([self.buf, call])
-                    self.buf, self.state = "", "reasoning"
+                    self.buf, self.state, self.rbare = "", "reasoning", False
                 except ValueError:
                     pass
         if self.pending:
