@@ -1,0 +1,236 @@
+"""Tencent Hy4-Flash in setup.py and the catalog (tools/strata_mcp.py): the family table, the menu lines, when the family is offered, the download from a configured source (one file,
+parts joined, a source that fails and the next one), the sizes and hashes, the model rows with the fit words, the install plan and the expected files.
+
+    python -m pytest tools/test_setup_hy4.py
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(1, str(HERE.parent))
+import setup  # noqa: E402
+import strata_mcp as M  # noqa: E402
+from strata_control import hy4_family, hy4_fit  # noqa: E402
+
+
+def tiny_files(names=("Hy4-Flash-SQ-64.strata", hy4_family.ENGRAM_FILE)) -> tuple:
+    """Small stand-ins for the real files: the table with their sizes and hashes, and the bytes."""
+    table, data = dict(hy4_family.FILES), {}
+    for i, name in enumerate(names):
+        blob = (name.encode() * 50)[: 1000 + i * 77]
+        table[name] = (len(blob), hashlib.sha256(blob).hexdigest())
+        data[name] = blob
+    return table, data
+
+
+class Table(unittest.TestCase):
+    def test_the_family_matches_the_rule_and_the_files(self):
+        fam = setup.HY4_FAMILIES["hy4-flash"]
+        self.assertEqual(set(fam["models"]), set(hy4_fit.BUILDS))
+        self.assertEqual(fam["arch"], "hy4flash")
+        self.assertEqual(fam["tag"], "hy4-flash-")
+        for b in fam["models"]:
+            name = hy4_fit.BUILDS[b]["file"]
+            size, sha = hy4_family.FILES[name]
+            self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", sha), name)
+            self.assertAlmostEqual(size / 1e9, hy4_fit.BUILDS[b]["file_gb"], delta=0.006)   # the card's GB and the exact bytes agree
+        self.assertAlmostEqual(hy4_family.FILES[hy4_family.ENGRAM_FILE][0] / 1e9, hy4_fit.ENGRAM_GB, delta=0.006)
+        self.assertAlmostEqual(hy4_family.FILES[hy4_family.VISION_FILE][0] / 1e9, hy4_fit.VISION_GB, delta=0.001)
+
+    def test_it_is_not_in_the_tables_other_tests_pin(self):
+        self.assertNotIn("hy4-flash", setup.FAMILIES)
+        self.assertNotIn("hy4-flash", setup.OWN_PATH_FAMILIES)
+
+    def test_menu_lines_recommend_by_the_authors_table(self):
+        for vram, ram, want in ((12, 64, "SQ-64"), (12, 32, "SQ-32"), (12, 128, "SQ-128")):
+            lines = setup.hy4_menu_lines(vram, ram, False)
+            self.assertEqual([b for b, _ in lines], ["SQ-128", "SQ-96", "SQ-64", "SQ-32"])
+            self.assertEqual([b for b, t in lines if "(recommended)" in t], [want])
+        text = dict(setup.hy4_menu_lines(12, 64, False))
+        self.assertIn("fits in memory", text["SQ-64"])
+        self.assertIn("streams experts from the SSD", text["SQ-128"])
+
+    def test_pc_figures(self):
+        self.assertEqual(setup.hy4_pc({"vram_gb": 12.0}, 64.0), (12.0, 64.0, False))
+        vram, pool, unified = setup.hy4_pc({"uma": True, "vram_gb": 115.8}, 128.0)
+        self.assertIsNone(vram)
+        self.assertTrue(unified)
+        self.assertAlmostEqual(pool, 107.85, delta=0.1)
+
+
+class Offered(unittest.TestCase):
+    def test_hidden_until_there_is_a_source_or_a_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            ns = mock.Mock(gguf_dir=None, models_dir=d)
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("STRATA_HY4_SOURCE", None)
+                with mock.patch.object(hy4_family, "SOURCES_FILE", Path(d) / "none.json"):
+                    self.assertFalse(setup.hy4_offered(ns))
+                    os.environ["STRATA_HY4_SOURCE"] = "https://example.invalid/hy4"
+                    self.assertTrue(setup.hy4_offered(ns))
+                    os.environ.pop("STRATA_HY4_SOURCE")
+                    table, data = tiny_files()
+                    folder = Path(d) / "hy4-flash"
+                    folder.mkdir()
+                    (folder / "Hy4-Flash-SQ-64.strata").write_bytes(data["Hy4-Flash-SQ-64.strata"])
+                    with mock.patch.object(hy4_family, "FILES", table):
+                        self.assertTrue(setup.hy4_offered(ns))
+
+    def test_the_shipped_sources_file_is_empty_on_purpose(self):
+        self.assertEqual(hy4_family.sources(env={}, shipped=hy4_family.SOURCES_FILE), [])
+
+    def test_source_forms(self):
+        env = {"STRATA_HY4_SOURCE": "https://models.example/hy4/"}
+        s = hy4_family.sources(env=env, cfg={"hy4_source": {"kind": "http-parts", "base": "https://hf.example/x"}}, shipped=Path("nope.json"))
+        self.assertEqual([x["kind"] for x in s], ["http-parts", "http"])
+        self.assertEqual(hy4_family.urls_for("Hy4-Flash-SQ-64.strata", s[1]), ["https://models.example/hy4/Hy4-Flash-SQ-64.strata"])
+        parts = hy4_family.urls_for("Hy4-Flash-SQ-64.strata", s[0])
+        self.assertEqual(len(parts), 2)                                            # 62.03 GB in parts of 42 GiB
+        self.assertTrue(parts[0].endswith("Hy4-Flash-SQ-64.strata.part-aa") and parts[1].endswith(".part-ab"))
+        self.assertEqual(len(hy4_family.urls_for(hy4_family.ENGRAM_FILE, s[0])), 2)
+        self.assertEqual(len(hy4_family.urls_for("Hy4-Flash-SQ-128.strata", s[0])), 3)
+        listed = {"kind": "http", "base": "", "files": {"a": "https://x/a", "b": ["https://x/b1", "https://x/b2"]}}
+        self.assertEqual(hy4_family.urls_for("a", listed), ["https://x/a"])
+        self.assertEqual(hy4_family.urls_for("b", listed), ["https://x/b1", "https://x/b2"])
+        self.assertEqual(hy4_family.sources(env={"STRATA_HY4_SOURCE": "ftp://nope"}, shipped=Path("nope.json")), [])
+
+
+class Fetch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.table, self.data = tiny_files()
+        self.a = mock.Mock(gguf_dir=None, models_dir=str(self.root / "models"))
+        p = mock.patch.object(hy4_family, "FILES", self.table)
+        p.start()
+        self.addCleanup(p.stop)
+        self.src = self.root / "src"
+        self.src.mkdir()
+
+    def source(self, **kw):
+        return [{"kind": "http", "base": "", "files": kw}]
+
+    def run_fetch(self, name, sources):
+        folder = self.root / "models" / "hy4-flash"
+        with mock.patch.object(hy4_family, "sources", return_value=sources), mock.patch.object(setup, "say"), mock.patch.object(setup, "ok"), \
+                mock.patch.object(setup, "warn") as warn:
+            got = setup.hy4_fetch(self.a, name, folder, False)
+        return got, warn
+
+    def test_one_file_from_a_source(self):
+        name = "Hy4-Flash-SQ-64.strata"
+        (self.src / name).write_bytes(self.data[name])
+        got, _ = self.run_fetch(name, self.source(**{name: (self.src / name).as_posix()}))
+        self.assertEqual(got.read_bytes(), self.data[name])
+
+    def test_parts_are_joined_in_order_and_removed(self):
+        name = hy4_family.ENGRAM_FILE
+        blob = self.data[name]
+        cuts = [0, 400, 800, len(blob)]
+        urls = []
+        for i in range(3):
+            p = self.src / f"{name}.part-{i}"
+            p.write_bytes(blob[cuts[i]:cuts[i + 1]])
+            urls.append(p.as_posix())
+        got, _ = self.run_fetch(name, self.source(**{name: urls}))
+        self.assertEqual(got.read_bytes(), blob)
+        self.assertEqual([p.name for p in got.parent.iterdir() if ".part" in p.name or p.name.endswith(".joining")], [])
+
+    def test_a_wrong_file_is_refused(self):
+        name = "Hy4-Flash-SQ-64.strata"
+        bad = bytearray(self.data[name])
+        bad[5] ^= 1
+        (self.src / name).write_bytes(bytes(bad))
+        with self.assertRaises(SystemExit):
+            self.run_fetch(name, self.source(**{name: (self.src / name).as_posix()}))
+
+    def test_the_next_source_gets_its_turn(self):
+        name = "Hy4-Flash-SQ-64.strata"
+        (self.src / name).write_bytes(self.data[name])
+        sources = [{"kind": "http", "base": "", "files": {name: (self.src / "missing").as_posix()}},
+                   {"kind": "http", "base": "", "files": {name: (self.src / name).as_posix()}}]
+        got, warn = self.run_fetch(name, sources)
+        self.assertEqual(got.read_bytes(), self.data[name])
+        self.assertTrue(warn.called)
+
+    def test_no_source_says_where_to_put_the_file(self):
+        with self.assertRaises(SystemExit):
+            self.run_fetch("Hy4-Flash-SQ-64.strata", [])
+
+    def test_a_file_that_is_there_is_not_downloaded_again(self):
+        name = "Hy4-Flash-SQ-64.strata"
+        folder = self.root / "models" / "hy4-flash"
+        folder.mkdir(parents=True)
+        (folder / name).write_bytes(self.data[name])
+        setup.mark(folder / name)
+        got, _ = self.run_fetch(name, [])
+        self.assertEqual(got, folder / name)
+
+    def test_the_engram_file_without_a_hash_is_checked_by_size(self):
+        name = hy4_family.ENGRAM_FILE
+        self.table[name] = (len(self.data[name]), None)
+        (self.src / name).write_bytes(self.data[name])
+        got, warn = self.run_fetch(name, self.source(**{name: (self.src / name).as_posix()}))
+        self.assertEqual(got.read_bytes(), self.data[name])
+        self.assertTrue(any("size only" in str(c) for c in warn.call_args_list))
+
+
+class Catalog(unittest.TestCase):
+    def setUp(self):
+        self.show = mock.patch.dict(os.environ, {"STRATA_HY4_SHOW": "1"})
+        self.show.start()
+        self.addCleanup(self.show.stop)
+        self.s = M.Strata(HERE.parent)
+
+    def rows(self, hw):
+        fam = next(f for f in self.s.model_table(hw) if f["family"] == "hy4-flash")
+        return {x["model"]: x for x in fam["sizes"]}
+
+    def test_listed_only_when_offered(self):
+        os.environ.pop("STRATA_HY4_SHOW")
+        with mock.patch.object(hy4_family, "sources", return_value=[]), mock.patch.object(hy4_family, "local_files", return_value={}):
+            self.assertNotIn("hy4-flash", [f["family"] for f in self.s.model_table({"ram_gb": 64.0, "gpus": []})])
+
+    def test_rows_and_fit_words(self):
+        by = self.rows({"ram_gb": 64.0, "gpus": [{"index": 0, "name": "x", "vram_gb": 12.0, "usable": True, "vendor": "nvidia"}]})
+        self.assertEqual(list(by), ["SQ-32", "SQ-64", "SQ-96", "SQ-128"])
+        self.assertEqual(by["SQ-64"]["id"], "hy4-flash-sq-64")                      # the tag the install writes its config under
+        self.assertEqual(by["SQ-64"]["download_gb"], round(62.03 + 67.58, 1))
+        self.assertEqual({k: by[k]["on_this_pc"] for k in by}, {"SQ-32": "fits", "SQ-64": "fits", "SQ-96": "may run slower", "SQ-128": "may run slower"})
+        self.assertEqual([k for k in by if by[k]["hy4"]["recommended"]], ["SQ-64"])
+        self.assertEqual(by["SQ-64"]["hy4"]["placement"], {"vram_gb": 5.08, "ram_gb": 50.96, "ssd_gb": 0.0})
+        self.assertFalse(by["SQ-64"]["images"])
+        self.assertIsNone(by["SQ-64"]["gpu_options"])
+
+    def test_unified_memory(self):
+        gpu = {"index": 0, "name": "Radeon 8060S", "vram_gb": 115.8, "dedicated_gb": 0.0, "usable": True, "uma": True, "vendor": "amd"}
+        by = self.rows({"ram_gb": 128.0, "gpus": [gpu]})
+        self.assertEqual([k for k in by if by[k]["hy4"]["recommended"]], ["SQ-96"])
+        self.assertEqual(by["SQ-128"]["hy4"]["mode"], "near_resident_ssd")          # 4 GB of 113 from the SSD: not recommended (not all in memory), still "fits"
+        self.assertEqual(by["SQ-128"]["on_this_pc"], "fits")
+
+    def test_no_ram_figure_gives_no_verdict(self):
+        by = self.rows({"gpus": []})
+        self.assertIsNone(by["SQ-64"]["on_this_pc"])
+
+    def test_the_install_tool_knows_the_sizes_and_the_expected_files(self):
+        self.assertIn("SQ-96", self.s.own_size_names())
+        S = self.s.setup_module()
+        files = M.expected_files(S, "hy4-flash", "SQ-64", Path("/m"), False)
+        self.assertEqual([Path(f["path"]).name for f in files], ["Hy4-Flash-SQ-64.strata", hy4_family.ENGRAM_FILE])
+        self.assertEqual([f["bytes"] for f in files], [62_030_467_072, 67_584_905_216])
+        self.assertTrue(all(Path(f["path"]).parent.name == "hy4-flash" for f in files))
+
+
+if __name__ == "__main__":
+    unittest.main()

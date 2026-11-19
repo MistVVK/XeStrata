@@ -135,6 +135,32 @@ def _parts(name: str) -> int:
     return max(1, -(-size // (42 * 2 ** 30)))     # 42G in `split` is GiB
 
 
+def join_parts(parts, dst, *, keep_parts: bool = False, chunk: int = 16 << 20) -> Path:
+    """Join the downloaded parts of one file (in the order given) into `dst`: each part is appended and then removed, so the disk holds the file plus one part.  The result is
+    written under a temporary name and moved into place when every part is in, so a stop in the middle never leaves a short `dst` that looks whole."""
+    dst = Path(dst)
+    tmp = dst.with_name(dst.name + ".joining")
+    with open(tmp, "wb") as out:
+        for part in parts:
+            with open(part, "rb") as src:
+                while True:
+                    block = src.read(chunk)
+                    if not block:
+                        break
+                    out.write(block)
+            out.flush()
+            if not keep_parts:
+                try:
+                    Path(part).unlink()
+                    Path(str(part) + ".done").unlink(missing_ok=True)
+                except OSError:
+                    pass
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, dst)
+    return dst
+
+
 def local_files(folder: str | os.PathLike, build: str | None = None) -> dict[str, Path]:
     """The Hy4-Flash files that are already in `folder` (by name; a size that is not the pinned one is left out): the family is offered for these even with no source."""
     found: dict[str, Path] = {}
