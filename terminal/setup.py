@@ -4988,17 +4988,24 @@ def hip_card(eng: Path, gpu: dict, listed: list[dict]) -> dict:
     return {**gpu, "index": m["index"], "count": len(hip), "vram_gb": vram, "driver": "hip"}
 
 
-def engine_from_feed(eng: Path, updating: bool = False) -> Path | None:
+def engine_from_feed(eng: Path, updating: bool = False, backend: str = "") -> Path | None:
     """#3469 #3437: the 0.2 releases no longer carry the flat engine zips (strata-windows-x64*.zip); they publish one package
     per card in the signed update feed.  `strata update --no-control` fetches, verifies and test-starts the package for this PC
     (into a folder of its own under the install), and its files then become the installed engine in `eng`, the same way a
-    zip's do.  None when it cannot be had (no internet, nothing for this card): the caller goes on as before."""
+    zip's do.  None when it cannot be had (no internet, nothing for this card): the caller goes on as before.
+
+    `backend` is the GPU family this setup was told to install ("hip" for an AMD setup, "cuda" for the standard one).  It has
+    to travel with the update: the update runs in its own process and detects the GPU itself, and on a PC that has an NVIDIA
+    card beside the AMD one that detection takes the NVIDIA card first (#3688's order), so an AMD setup would receive the CUDA
+    package and fail its own test start (#4861).  Empty keeps the old behaviour (the update detects on its own)."""
     acquisition.require("the ready-made engine")
     from strata_control import engine_component as ec
     store = home() / "engine-feed"
     env = dict(os.environ)
     env.pop("STRATA_NO_ACQUIRE", None)
     env["STRATA_COMPONENTS_DIR"] = str(store)
+    if backend:
+        env[ec.ENV_BACKEND] = backend                  # the family setup already chose, not a second detection
     say("  Fetching the ready-made engine from the signed update feed ...")
     try:
         run = subprocess.run([sys.executable, str(ROOT / "strata.py"), "update", "--no-control", "--output", "json"],
@@ -5071,7 +5078,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
             if i + 1 < len(bases):
                 _next_release_note("AMD engine", e)
                 continue
-            got = engine_from_feed(eng, updating)      # the 0.2 releases carry no flat zip: the signed feed has it (no error text for that)
+            got = engine_from_feed(eng, updating, backend="hip")      # the 0.2 releases carry no flat zip: the signed feed has it (no error text for that)
             if got is None:
                 warn(f"no ready-made AMD engine at {base} ({e})")
             return got
@@ -5905,7 +5912,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     if is_arm64() and sys.platform.startswith("linux"):
         # a DGX Spark: the release has no flat engine zip for it (and the CUDA 12 engine is x86). The signed feed has the linux-aarch64
         # package when the release carries one; without it the caller compiles (spark/build_engine.sh does the same by hand)
-        got = engine_from_feed(eng, updating) if int(toolkit) != 12 else None
+        got = engine_from_feed(eng, updating, backend="cuda") if int(toolkit) != 12 else None
         if got is None:
             warn(f"no ready-made engine for {sysinfo.machine()} in the update feed" + ("" if updating else ": compiling it here, once"))
         return got
@@ -5925,7 +5932,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             if i + 1 < len(bases):                     # #214: this checkout's release is not published (yet)
                 _next_release_note("engine", e)
                 continue
-            got = engine_from_feed(eng, updating)      # 0.2 releases: the signed feed has it (#3469), the CUDA 12 package too (since 0.2.13)
+            got = engine_from_feed(eng, updating, backend="cuda")      # 0.2 releases: the signed feed has it (#3469), the CUDA 12 package too (since 0.2.13)
             if got is not None and int(toolkit) == 12 and not feed_engine_covers(got, gpu):
                 warn("the engine package from the update feed has no code for your graphics card" + ("" if updating else ": compiling instead"))
                 return None

@@ -105,6 +105,27 @@ class FeedEngine(unittest.TestCase):
         self.assertLess((0, 1, 45), setup.MIN_ENGINE)
         self.assertGreaterEqual((0, 1, 46), setup.WIN_HIP_MIN_ENGINE)
 
+    def test_the_amd_engine_fetch_tells_the_update_which_family_this_install_is(self):
+        """#4861: get_prebuilt_hip fetches the ready-made engine by running `strata update` as a child process. The
+        child detects the GPU itself, and on a PC that has an NVIDIA card beside the AMD one that detection takes
+        the NVIDIA card first (the documented order), so the AMD setup was handed the CUDA 13 package: it cannot
+        run on the card and the update failed its own test start, ending in "no ready-made AMD engine"."""
+        gpu = {"arch": "gfx1201", "archs": ["gfx1201"], "vram_gb": 16.0, "index": 0}
+        with self.run_update(code=6) as run, \
+                mock.patch.object(setup, "ROOT", self.root), \
+                mock.patch.object(setup, "_urlopen", side_effect=OSError("HTTP Error 404")):
+            self.assertIsNone(setup.get_prebuilt_hip(setup.PREBUILT_URL, gpu))
+        self.assertEqual(run.call_args.kwargs["env"].get("STRATA_ENGINE_BACKEND"), "hip")
+
+    def test_the_standard_engine_fetch_says_cuda(self):
+        gpu = {"arch": 89, "archs": [89], "vram_gb": 8.0, "index": 0}
+        with mock.patch.object(setup, "engine_dir", lambda toolkit=13: self.eng), \
+                mock.patch.object(setup, "_urlopen", side_effect=OSError("HTTP Error 404")), \
+                mock.patch.object(setup, "engine_from_feed", return_value=None) as feed:
+            setup.get_prebuilt(setup.PREBUILT_URL, gpu, "none", updating=True)
+        feed.assert_called_once()
+        self.assertEqual(feed.call_args.kwargs.get("backend"), "cuda")
+
 
 if __name__ == "__main__":
     unittest.main()
