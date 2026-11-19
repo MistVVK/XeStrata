@@ -1210,6 +1210,16 @@ class ToolCallRecovery(unittest.TestCase):
             self.check(f"<function={name}>\n{self.PARAMS}\n</tool_call>", [("write", self.CALL)], "")   # stray closer
             self.check(f"<function={name}>\n{self.PARAMS}\nDone.", [("write", self.CALL)], "Done.")
 
+    def test_indented_bare_function_streams_as_it_parses_whole(self):
+        # an opener indented by a space or two is a call when parsed whole; streamed it leaked into the content
+        for indent in (" ", "  ", "\t"):
+            with self.subTest(indent=indent):
+                self.check(f"Ok.\n{indent}<function=write>\n{self.PARAMS}", [("write", self.CALL)], "Ok.")
+                self.check(f"<function=write>\n{self.PARAMS}\n{indent}<function=write>\n{self.PARAMS}",
+                           [("write", self.CALL), ("write", self.CALL)], "")
+        block = f"Example:\n\n    <function=write>\n{self.PARAMS}"      # an indented code block is a quote (#4703)
+        self.check(block, [], block)
+
     def test_two_calls_in_one_wrapper(self):
         # corpus 0912870b / 51b155c9: a batch inside one <tool_call> - the second call's parameters were merged into
         # the first (wrong arguments, one call); also with the second opened as <parameter=NAME> (03a8a851)

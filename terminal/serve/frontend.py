@@ -2403,7 +2403,7 @@ class OutputParser:
                     # recover: <function=NAME> alone at the start of a line - the call without its <tool_call>.
                     # Until the name has arrived it is held.
                     j = b
-                    while j > 0 and self.buf[j - 1] == "\n":
+                    while j > 0 and self.buf[j - 1] in "\n \t":     # the line break and an indent before the opener
                         j -= 1
                     if j > 0 and self.buf[:j].strip():
                         out.append(Event("content", self._track(self.buf[:j])))
@@ -2420,7 +2420,8 @@ class OutputParser:
                     if self.recover and self.schemas:            # a line that may be becoming a bare <function=
                         k = self.buf.rfind("\n") + 1
                         tail = self.buf[k:]
-                        if tail and FUNC_START.startswith(tail) and self._ok_at(k):
+                        opener = tail.lstrip(" \t")         # indented like _opener_ok allows: whole parsing takes it
+                        if tail and FUNC_START.startswith(opener) and self._ok_at(k + len(tail) - len(opener)):
                             j = min(j, k)
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
