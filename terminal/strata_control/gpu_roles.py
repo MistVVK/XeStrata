@@ -374,9 +374,15 @@ def sentence(cards: list[dict], vendor: str | None = None) -> str:
         return f"Strata will use your {short_name(m)}."
     helpers = [byi[i] for i, r in rec["roles"].items() if r == "helper"]
     why = {"same": "the cards are alike", "memory": "it has more memory", "faster": "it is faster", "only": "it is the only card"}[rec["why"]]
-    s = f"{short_name(m)} is Main: {why}."
-    if helpers:
-        s += " " + " and ".join(short_name(h) for h in helpers) + (" help." if len(helpers) > 1 else " helps.")
+    if helpers and rec["why"] == "same" and all(short_name(h) == short_name(m) for h in helpers):
+        # 0217 item 12: "RTX A4000 is Main: the cards are alike. RTX A4000 helps." named one card three times and told nothing; the cards are the same, so say that
+        n = len(helpers) + 1
+        s = (f"Both cards are {short_name(m)}, so they are alike: one is Main and the other helps." if n == 2 else
+             f"All {n} cards are {short_name(m)}, so they are alike: one is Main and the others help.")
+    else:
+        s = f"{short_name(m)} is Main: {why}."
+        if helpers:
+            s += " " + " and ".join(short_name(h) for h in helpers) + (" help." if len(helpers) > 1 else " helps.")
     for i, r in rec["roles"].items():
         if r == "off":
             code = rec["reasons"][i]

@@ -571,6 +571,12 @@ def _can_ask() -> bool:
         return False
     if os.environ.get("CI") or os.environ.get("STRATA_NO_PROMPT"):
         return False
+    try:
+        from strata_cli import noinput                       # (0217-PLAT's module; a tree without it asks as before)
+    except ImportError:
+        return bool(os.environ.get("MSYSTEM") or os.environ.get("TERM_PROGRAM") or os.environ.get("TERM") or os.environ.get("WT_SESSION"))
+    if noinput.stdin_is_no_keyboard():                       # `strata launch < /dev/null`: no question that nobody can answer (0.2.17)
+        return False
     return bool(os.environ.get("MSYSTEM") or os.environ.get("TERM_PROGRAM") or os.environ.get("TERM") or os.environ.get("WT_SESSION"))
 
 
@@ -883,6 +889,7 @@ def run_launch(a: argparse.Namespace) -> int:
         move_data = _move_data_choice(a, s, catalog, machine)
         runner.s, runner.move_data = s, move_data
         if a.plan:
+            runner.look_up_feed = True                       # the plan asks the signed feed whether the small tuned drafter is listed (it lists the size the launch fetches)
             plan = runner.plan()
             plan["warnings"] = [n.line() for n in notes]
             if machine:

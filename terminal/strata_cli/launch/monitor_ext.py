@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import textwrap
 import threading
+import time
 
 from rich.text import Text
 from textual.widgets import Static
@@ -50,10 +51,32 @@ class LaunchMonitor(MonitorApp):
         self.view_before_connect = 0
         self.quiet_note: str | None = None        # "New engine X is available. Press u to update." (from the last check; local file only)
         self.updating = False
+        self._last_run_until = 0.0                # 0217 item 7: the paragraph about a last run that did not end normally, shown on the message rows for this long (? hides it)
 
     # ---- a newer engine: one quiet line, and u to update (strata_control/engine_update.py)
+    LAST_RUN_SECONDS = 90.0
+
+    def _last_run_showing(self) -> bool:
+        return bool(self.info.get("last_run")) and time.monotonic() < self._last_run_until
+
+    def _help_wrapped(self, width: int) -> list[str]:
+        if self._last_run_showing():
+            return textwrap.wrap(str(self.info["last_run"]), max(20, width - 2))
+        return super()._help_wrapped(width)
+
+    def action_help(self) -> None:
+        if self._last_run_showing():                         # ? puts the paragraph away; ? again is the key list
+            self._last_run_until = 0.0
+            self.help_until = 0.0
+            self._paint()
+            return
+        super().action_help()
+
     def on_mount(self) -> None:
         super().on_mount()
+        if self.info.get("last_run"):
+            self._last_run_until = time.monotonic() + self.LAST_RUN_SECONDS
+            self.help_until = self._last_run_until
         self._note_refresh()
         if self.info.get("daily_check"):
             try:
@@ -282,7 +305,7 @@ class LaunchMonitor(MonitorApp):
     def _paint(self, size=None) -> None:
         if not self.connect_open:
             super()._paint(size)
-            if self.ask_quit and not self.error and not self.selection_notice and self.connection_state == "connected" and not self.frozen:
+            if self.ask_quit and not self.error and not self.selection_notice and self.connection_state == "connected" and not self.frozen and not self._help_open():
                 try:
                     msg = "Read only  |  q asks: keep serving or stop  |  7 connect an app"
                     width = (size or self.screen.size).width

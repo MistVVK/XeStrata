@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import textwrap
 from pathlib import Path
 
 from rich.text import Text
@@ -279,22 +280,38 @@ class StartScreen(Base):
         self.reload()
         self.paint()
 
-    def reload(self) -> None:
+    def reload(self, keep: int | None = None) -> None:
         self.presets = store.list_presets()
+        columns, with_used = self.preset_columns()
         items: list[Item] = []
         for p in self.presets:
             sm = store.summary(p)
             req = (f"{p.parallel} request" + ("s" if p.parallel != 1 else "")) if p.parallel else "fit to card"
             tuned = f"tuned {p.tuned_at[5:]}" if p.is_tuned and p.tuned_at else "not tuned"
             used = f"last used {p.last_used[5:10]}" if p.last_used else "not used yet"
-            items.append(Item([p.name or "?", str(sm["model"]), S.context_label(p.context), req, Cell(tuned, MUTE if not p.is_tuned else ""),
-                               Cell(used, MUTE)], key=("preset", p.name)))
+            cells = [p.name or "?", str(sm["model"]), S.context_label(p.context), req, Cell(tuned, MUTE if not p.is_tuned else ""), Cell(used, MUTE)]
+            items.append(Item(cells if with_used else cells[:-1], key=("preset", p.name)))
         items.append(Item([Cell("Set up from the beginning", "")], key=("new", None)))
         items.append(Item([Cell("Use model files I already have", "")], key=("own", None)))
         m = self.query_one(Menu)
-        m.columns = [("", 34), ("", 14), ("", 8), ("", 14), ("", 14)]
+        m.columns = columns
         m.show_header = False
-        m.set_items(items, 0)
+        m.set_items(items, keep if keep is not None else 0)
+
+    def preset_columns(self) -> tuple[list[tuple[str, int]], bool]:
+        """The preset row's columns for this window (0217 item 11: at 80 columns "tuned 10-16" and "last used 11-12" ran past the edge and ended in "not tu"): the name takes
+        what is left, and "last used" is shown only where it fits whole."""
+        room = self.width() - 2                          # (the two cells of the cursor)
+        fixed = [14, 7, 13, 13]                          # model, context, requests, tuned
+        used = 17
+        if room - sum(fixed) - used >= 24:
+            return [("", min(34, room - sum(fixed) - used)), *[("", w) for w in fixed], ("", 0)], True
+        return [("", max(16, min(34, room - sum(fixed)))), *[("", w) for w in fixed]], False
+
+    def on_resize(self, _e) -> None:
+        if getattr(self, "presets", None) is not None and self.is_mounted:
+            self.reload(keep=self.query_one(Menu).index)
+        self.paint()
 
     def refresh_body(self) -> None:
         intro = Text()
@@ -320,7 +337,7 @@ class StartScreen(Base):
     def head_text(self) -> Text:
         out = Text(no_wrap=True, overflow="crop")
         out.append("STRATA  Launch", style=f"bold {ACCENT}")
-        info = self.ctx.computer_line()
+        info = self.ctx.computer_line(self.width() - len("STRATA  Launch") - 2)       # (0217 item 11: the card's name gives way, "free" stays)
         gap = max(2, self.width() - len("STRATA  Launch") - len(info))
         out.append(" " * gap + info, style=MUTE)
         return out
@@ -827,7 +844,8 @@ class FolderScreen(Base):
         out = Text()
         if s.model_path:
             out.append(f"Your model files stay where they are: {s.model_path}\n", style=FG)
-            out.append("Strata only writes its prepared data here (packs, a small draft layer).\n", style=MUTE)
+            term = self.ctx.drafter_term()                   # 0217 item 10: the drafter this launch uses, by its own name
+            out.append(f"Strata only writes its prepared data here (packs{', ' + term if term else ''}).\n", style=MUTE)
         out.append(st.headline(), style=FG)
         out.append("\n")
         if st.installed and st.folder is not None:
@@ -1309,15 +1327,35 @@ class AdvancedScreen(Base):
                 continue
             d, t, y = r.cells()[1:]
             desc = ("[experimental] " if r.experimental else "") + r.description
-            items.append(Item([r.name, d, t, Cell(y, ACCENT if y != "-" else ""), Cell(desc, WARN if r.experimental else (BAD if not r.known else ""))],
-                              key=r.name))
-        items.append(Item([Cell("+ Add a setting by name…", ""), "", "", "", Cell("for flags of newer engine versions", MUTE)], key="__add__"))
+            cells = [r.name, d, t, Cell(y, ACCENT if y != "-" else ""), Cell(desc, WARN if r.experimental else (BAD if not r.known else ""))]
+            if self.narrow():
+                del cells[2]                                 # the Tuned column: its value is in the line under the table
+            items.append(Item(cells, key=r.name))
+        add = [Cell("+ Add a setting by name…", ""), "", "", "", Cell("for flags of newer engine versions", MUTE)]
+        items.append(Item(add[:3] + add[4:] if self.narrow() else add, key="__add__"))
+        m = self.query_one(Menu)
+        # 0217 item 11: at 80 columns the description had 16 cells ("Qwen: 0.2.6 beh…"); without the Tuned column (said under the table instead) it has 29
+        m.columns = ([("Setting", 26), ("Default", 10), ("Yours", 9), ("What it does", 0)] if self.narrow() else
+                     [("Setting", 26), ("Default", 11), ("Tuned", 13), ("Yours", 10), ("What it does", 0)])
+        self.fit_box()
+        m.set_items(items, min(m.index, len(items) - 1))
+
+    def fit_box(self) -> None:
+        """The command box is as tall as its text (the title, the command, "Same as", a note) while the list keeps at least three rows; it was a third of the body, so "Same as"
+        lost its end at 80x24 (0217 item 11)."""
+        import textwrap
         m = self.query_one(Menu)
         body_h = self.query_one("#body").size.height or max(6, (self.size.height or 30) - 8)
-        box_h = max(3, min(8, body_h // 3))
+        wrap_w = max(20, self.width() - 8)                     # (the box has a scroll bar and the words wrap a little earlier than a plain count says: one spare line below)
+        texts = ["  " + self.ctx.command_text(), "  Same as: " + self.ctx.flags_line(), *(["  " + self.ctx.engine_note] if self.ctx.engine_note else [])]
+        need = 2 + sum(len(textwrap.wrap(text, wrap_w)) or 1 for text in texts)
+        room = body_h - 7 if body_h >= 14 else body_h // 3                  # (a small body keeps the old third: the list needs its rows)
+        box_h = max(3, min(need, room))
         self.query_one("#cmdbox").styles.height = box_h
         m.window = max(3, body_h - box_h - 4)                # the heading, the column titles, the "n of m" line and the box's rule
-        m.set_items(items, min(m.index, len(items) - 1))
+
+    def narrow(self) -> bool:
+        return self.width() < 100
 
     def on_resize(self, _e) -> None:
         if hasattr(self, "rows"):
@@ -1328,9 +1366,12 @@ class AdvancedScreen(Base):
         eng = self.ctx.engine_note
         t = Text(no_wrap=True, overflow="ellipsis")
         t.append("All settings", style=f"bold {ACCENT}")
-        if self.width() >= 70:
+        if self.width() >= 90:
             t.append("   (optional · for tinkerers)", style=MUTE)
             extra = "   / filter" + (f": {self.filter}" if self.filter else "") + "   x show experimental only" + (" (on)" if self.only_experimental else "")
+        elif self.width() >= 70:                             # 80 columns: the line was one word too long and wrapped ("only" alone on a second row)
+            t.append("   (optional)", style=MUTE)
+            extra = "   / filter" + (f": {self.filter}" if self.filter else "") + "   x experimental only" + (" (on)" if self.only_experimental else "")
         else:
             extra = "  (optional)" + (f"  filter: {self.filter}" if self.filter else "") + ("  experimental only" if self.only_experimental else "")
         t.append(extra, style=MUTE)
@@ -1344,6 +1385,11 @@ class AdvancedScreen(Base):
         if eng:
             out.append("  " + eng, style=WARN)
         self.query_one("#cmdline", Static).update(out)
+        try:                                                 # the box follows its text (a flag typed just now makes the command longer)
+            self.fit_box()
+            self.query_one(Menu)._refresh()
+        except Exception:                                    # noqa: BLE001 - a screen that is closing
+            pass
 
     def hints_text(self) -> str:
         if (self.size.width or 80) < 60:
@@ -1358,7 +1404,8 @@ class AdvancedScreen(Base):
         if cur is not None and cur.key not in (None, "__add__"):
             r = next((x for x in self.rows if x.name == cur.key), None)
             if r:
-                return Text(f"{r.name}: {r.description}" + (" This one is experimental: it may change answers or not work on every card." if r.experimental else ""), style=MUTE)
+                tuned = f" The tuner chose {r.tuned}." if self.narrow() and r.tuned not in ("-", "", None) else ""     # (the Tuned column is left out of a narrow window)
+                return Text(f"{r.name}: {r.description}" + tuned + (" This one is experimental: it may change answers or not work on every card." if r.experimental else ""), style=MUTE)
         return Text("Press e on a row to set your own value; Del puts the tuned value back. You can go on without touching anything: Enter.", style=MUTE)
 
     # ---- editing
@@ -1720,6 +1767,7 @@ class SaveScreen(Base):
         plan = self.ctx.download_plan()
         if plan is not None and (plan.get("parts") or not plan.get("engine_usable", True)):     # S6: something would be downloaded: is there a way to?
             self.ctx.check_offline(lambda: self.app.call_from_thread(self.paint))
+        self.ctx.check_tuned(lambda: self.app.call_from_thread(self.paint))          # 0217 item 3: is the small drafter in the feed? (else the 1.2 GB one is what comes)
         self.paint()
 
     def hints_text(self) -> str:
@@ -1748,13 +1796,20 @@ class SaveScreen(Base):
                  ("Access", f"{S.ACCESS_WORDS[s.access]}, port {s.port}" + (", API key on" if s.api_key else ", no API key")),
                  # S9: with the person's own files, "Storage" was the folder ABOVE their model files and read like where the model is kept
                  *([("Your files", f"{s.model_path} (used where they are)")] if s.model_path else []),
-                 ("Storage" if not s.model_path else "Strata data", (s.data_dir or str(self.ctx.default_folder())) +
-                  (" (packs and the draft layer go here)" if s.model_path else ""))]
+                 # 0217 item 8: one name for the folder, with and without the person's own files; the note names the drafter this launch uses (item 10)
+                 ("Strata data", (s.data_dir or str(self.ctx.default_folder())) + self.data_note())]
         if s.extra:
             lines.append(("Advanced", ", ".join(f"{k}={v}" for k, v in s.extra.items())))
         for n, text in enumerate(self.download_lines()):                       # T2: everything that will be downloaded, with its size
             lines.append(("Download" if n == 0 else "", text))
         return lines
+
+    def data_note(self) -> str:
+        """What goes into the Strata data folder when the model's files stay where they are: " (packs and the DFlash2 drafter go here)" / "(packs and the draft layer go here)" / "(packs go here)"."""
+        if not self.ctx.settings.model_path:
+            return ""
+        term = self.ctx.drafter_term()
+        return f" (packs and {term} go here)" if term else " (packs go here)"
 
     def download_lines(self, short: bool = False) -> list[str]:
         """One line per thing the launch will download, with its size ("the model, 66 GB"), or the one line "nothing: ..." when everything is here.
@@ -1771,9 +1826,9 @@ class SaveScreen(Base):
         for p in plan.get("parts") or []:
             gb = float(p["gb"])
             size = f"{gb:.2f} GB" if gb < 1 else f"{gb:.0f} GB" if gb >= 10 else f"{gb:.1f} GB"
-            if p.get("kind") == "dflash2" and gb >= 1 and not short:     # S5: the standard drafter is a 1.2 GB download that is packed down to the two files (0.52 + 0.34 GB) the engine reads
+            if p.get("kind") == "dflash2" and gb >= 1 and not short:     # S5: the standard drafter is a 1.2 GB download that is packed on this computer; "disk_gb" is what stays (0.9 GB: the 0.52 + 0.34 GB files a CUDA / AMD / Mac engine reads; 0.5 GB: the one file the Intel engine reads)
                 from strata_control import drafting
-                size += f" (packed to {(drafting.PACK_BYTES + drafting.CONVERTED_BYTES) / 1e9:.1f} GB on disk)"
+                size += f" (packed to {float(p.get('disk_gb') or (drafting.PACK_BYTES + drafting.CONVERTED_BYTES) / 1e9):.1f} GB on disk)"
             out.append(f"{p['label'].removeprefix('the ')} {size}" if short else f"{p['label']}, {size}")
         return out or ["nothing: everything is on this computer"]
 
@@ -1782,19 +1837,49 @@ class SaveScreen(Base):
                     "weights": "put its files in a folder, then choose Use model files I already have",
                     "mtp": "copy its mtp folder from another Strata data folder into yours",
                     "mmproj": "put its mmproj file beside your model files, or choose No pictures",
-                    "dflash2": "copy both of its .pack files into the dflash2 folder of your data folder"}
+                    "dflash2": "copy one of its .pack files into the dflash2 folder of your data folder"}
+
+    def offline_way(self, part: dict | None) -> str:
+        """How to put one missing thing in place without internet. The drafter names the file(s) exactly as `strata drafting fetch` and the launch line do
+        (drafting_fetch.offline_files_phrase: one file is enough; 0217 item 9: this row said "both of its .pack files")."""
+        kind = (part or {}).get("kind")
+        if kind == "dflash2":
+            from strata_control import drafting_fetch
+            return (f"copy {drafting_fetch.offline_files_phrase(tuned=bool(part.get('tuned')), variant=part.get('variant'), engine_reads_q4=part.get('reads_q4', True))} "
+                    "into the dflash2 folder of your data folder")
+        return self.OFFLINE_WAYS.get(kind, "copy it in from another computer")
 
     def offline_lines(self, plan: dict, short: bool = False) -> list[str]:
         """The Download rows of a computer that cannot reach the download hosts: what is missing and how to put it in place, not "will download"."""
         parts = list(plan.get("parts") or [])
-        missing = ([("engine", "the engine for your graphics card", None)] if not plan.get("engine_usable", True) else []) + \
-                  [(p["kind"], p["label"], float(p["gb"])) for p in parts]
+        missing = ([("engine", "the engine for your graphics card", None, None)] if not plan.get("engine_usable", True) else []) + \
+                  [(p["kind"], p["label"], float(p["gb"]), p) for p in parts]
         if short:
-            return ["offline, missing: " + ", ".join(label.removeprefix("the ") for _k, label, _g in missing)]
+            return ["offline, missing: " + ", ".join(label.removeprefix("the ") for _k, label, _g, _p in missing)]
         out = ["offline: nothing can be downloaded now. Missing:"]
-        for kind, label, gb in missing:
+        for kind, label, gb, part in missing:
             size = "" if gb is None else f", {gb:.2f} GB" if gb < 1 else f", {gb:.0f} GB" if gb >= 10 else f", {gb:.1f} GB"
-            out.append(f"{label}{size}: {self.OFFLINE_WAYS.get(kind, 'copy it in from another computer')}")
+            out.append(f"{label}{size}: {self.offline_way(part) if part else self.OFFLINE_WAYS.get(kind, 'copy it in from another computer')}")
+        return out
+
+    #: the same ways as OFFLINE_WAYS, short enough for a line of a small window (item 5: at 80x24 the whole how-to was one cut line)
+    OFFLINE_SHORT = {"engine": "install it from a file: strata components install-file",
+                     "weights": "put its files in a folder, then use them (Folder step)",
+                     "mtp": "copy its mtp folder in from another computer",
+                     "mmproj": "copy its mmproj file in, or turn pictures off",
+                     "dflash2": "copy its .pack file in (strata drafting fetch)"}
+
+    def compact_download_rows(self) -> list[str]:
+        """The Download rows of the small-window summary: one line, or (offline) one line for each thing that is missing with its way in place."""
+        plan = self.ctx.download_plan()
+        if plan is None or not (self.ctx.offline and (plan.get("parts") or not plan.get("engine_usable", True))):
+            return [self.compact_download()]
+        missing = ([("engine", "engine", None)] if not plan.get("engine_usable", True) else []) + \
+                  [(p["kind"], p["label"].removeprefix("the "), float(p["gb"])) for p in plan.get("parts") or []]
+        out = ["Download offline: nothing can be fetched now. Missing:"]
+        for kind, label, gb in missing:
+            size = "" if gb is None else f" {gb:.2f} GB" if gb < 1 else f" {gb:.0f} GB" if gb >= 10 else f" {gb:.1f} GB"
+            out.append(f"  {label}{size}: {self.OFFLINE_SHORT.get(kind, 'copy it in from another computer')}")
         return out
 
     def compact_download(self) -> str:
@@ -1810,7 +1895,7 @@ class SaveScreen(Base):
         lines = self.summary_lines()
         warnings = self.ctx.warnings()
         body_h = self.query_one("#body").size.height
-        full_need = 2 + len(lines) + len(warnings) + 3 + 3
+        full_need = 2 + len(self.full_rows(lines, warnings)) + 3 + 3        # (the title, the name row, the rows with what wraps, the field, the three choices)
         compact = bool(body_h) and full_need > body_h
         name = self.query_one("#name", Input)
         name.set_class(compact, "slim")
@@ -1818,13 +1903,19 @@ class SaveScreen(Base):
             t = Text(no_wrap=True, overflow="ellipsis")
             tiny = body_h < 9
             model = dict(lines)["Model"].replace("Qwen3.8-Flash-Next ", "")
+            ellipsis = "\u2026" if self.g.unicode else "..."
             rows = [f"{model} \u00b7 {S.context_label(s.context)} \u00b7 memory {s.kv or 'int8'}",
                     f"Pictures {'on' if s.vision != 'off' else 'off'} \u00b7 Parallel {s.parallel or 'auto'} \u00b7 Tuning {s.tune}",
-                    self.compact_download(),                                                   # T2: also in a small window
-                    f"Access {s.access}, port {s.port}" + (" \u00b7 Storage " + middle_shorten(s.data_dir, max(20, self.width() - 36), "\u2026" if self.g.unicode else "...")
-                                                           if s.data_dir else "")]
+                    *self.compact_download_rows(),                                             # T2: also in a small window (offline: each missing thing with its way, 0217 item 5)
+                    f"Access {s.access}, port {s.port}"]
+            # 0217 item 8: the two folders are rows of their own in a small window too (they were left out, so "Your files" / "Strata data" never showed at 80x24)
+            room = max(16, self.width() - 2 - 13 - 2)
+            if s.model_path:
+                rows.append(f"{'Your files':<13}" + middle_shorten(str(s.model_path), room, ellipsis))
+            rows.append(f"{'Strata data':<13}" + middle_shorten(str(s.data_dir or self.ctx.default_folder()), room, ellipsis))
             t.append("Save, then launch   name:\n" if tiny else "Save as preset, then launch   name:\n", style=f"bold {ACCENT}")
-            for ln in rows[:2 if tiny else 3 if body_h < 12 else 4]:
+            limit = 2 if tiny else 3 if body_h < 12 else max(4, body_h - 6 - (1 if warnings else 0))
+            for ln in rows[:limit]:
                 t.append("  " + ln + "\n")
             if warnings and not tiny:
                 t.append(f"  ! {warnings[0]}" + (f"  (+{len(warnings) - 1} more)" if len(warnings) > 1 else "") + "\n", style=WARN)
@@ -1834,18 +1925,32 @@ class SaveScreen(Base):
             t.append("Save as preset, then launch\n", style=f"bold {ACCENT}")
             t.append("  Name   ")
             t.append("(type below)\n", style=MUTE)
-            for k, v in lines:
-                if k in ("Storage", "Your files", "Strata data"):   # one row: a long folder wrapped and pushed the last choice off an 80x24 screen
-                    path, sep, note = v.partition(" (")
-                    v = middle_shorten(path, max(16, self.width() - 14 - (len(note) + 2 if sep else 0)), "…" if self.g.unicode else "...") + (sep + note if sep else "")
-                t.append(f"  {k:<10}{v}\n")
-            for n in warnings:
-                t.append(f"  ! {n}\n", style=WARN)
+            for text, style in self.full_rows(lines, warnings):
+                t.append(text + "\n", style=style)
             t.rstrip()
         self.query_one("#summary", Static).update(t)
         if getattr(self, "_compact", None) != compact:       # the body's height changes with it: look again once the layout has settled
             self._compact = compact
             self.call_after_refresh(self.paint)
+
+    def full_rows(self, lines: list[tuple[str, str]], warnings: list[str]) -> list[tuple[str, str]]:
+        """The rows of the full summary as (text, style), each one line of the window: a value that is longer than its room continues under itself, in the value's column
+        (0217: the offline drafter row ended in "(340" and went on at the screen's edge)."""
+        col = max(10, *(len(k) for k, _v in lines)) + 2        # 0217 item 8: the label column is as wide as the longest label ("Strata data" touched its path in a 10-wide one)
+        room = max(30, self.width() - col - 4)
+        out: list[tuple[str, str]] = []
+        for k, v in lines:
+            if k in ("Your files", "Strata data"):              # one row: a long folder wrapped and pushed the last choice off an 80x24 screen
+                path, sep, note = v.partition(" (")
+                v = middle_shorten(path, max(16, self.width() - col - 4 - (len(note) + 2 if sep else 0)), "…" if self.g.unicode else "...") + (sep + note if sep else "")
+            parts = textwrap.wrap(v, room, break_long_words=True) or [""]
+            out.append((f"  {k:<{col}}{parts[0]}", ""))
+            out += [(" " * (col + 2) + p, "") for p in parts[1:]]
+        for n in warnings:
+            parts = textwrap.wrap(n, max(30, self.width() - 6)) or [""]
+            out.append((f"  ! {parts[0]}", WARN))
+            out += [(f"    {p}", WARN) for p in parts[1:]]
+        return out
 
     def explain(self) -> Text:
         if (self.size.height or 30) < 20:
@@ -1855,7 +1960,8 @@ class SaveScreen(Base):
             if plan.get("engine_usable", True) and float(plan.get("gb") or 0) < 0.05:
                 fetch = "Nothing needs to be downloaded."
             elif self.ctx.offline:                           # S6
-                fetch = "This computer is offline, so what is listed under Download cannot be fetched now. Put it in place first, as it says."
+                fetch = ("This computer is offline, so what is listed under Download cannot be fetched now. Put it in place first, as it says." if (self.size.height or 30) >= 30
+                         else "This computer is offline: put what is listed under Download in place first.")       # (item 5: a small window needs the lines for the list)
             else:
                 fetch = "Strata downloads what is listed under Download first."
         else:
@@ -1922,6 +2028,7 @@ class RunScreen(Base):
         self.failed: str | None = None
         self.free_port: int | None = None
         self.tune_info: dict = {}
+        self.notes: list[str] = []              # sentences that stay under the rows for the whole launch (0217 item 7: a last run that did not end normally)
 
     def on_mount(self) -> None:
         self.paint()
@@ -1936,6 +2043,11 @@ class RunScreen(Base):
     def handle_event(self, ev) -> None:
         if ev.stage == "done":
             return
+        if ev.stage == "note":                  # not a stage: a note that stays on the screen
+            if ev.text and ev.text not in self.notes:
+                self.notes.append(ev.text)
+                self.paint()
+            return
         st = self.state.get(ev.stage)
         if st is None:
             return
@@ -1944,6 +2056,8 @@ class RunScreen(Base):
                 break
             if self.state[k]["status"] in ("wait", "run"):
                 self.state[k]["status"] = "done" if self.state[k]["text"] else "skip"
+        if st["text"] and st["pct"] is not None and st["pct"] >= 95 and ev.pct is not None and ev.pct < 50 and ev.text != st["text"]:
+            st.setdefault("past", []).append(st["text"])       # 0217 item 14: a new phase starts its own bar at 0 %; the finished one stays on the screen by name
         st["text"] = ev.text
         st["pct"] = ev.pct
         st["level"] = ev.level
@@ -1987,10 +2101,19 @@ class RunScreen(Base):
             style = ACCENT if st["status"] in ("run", "done") else MUTE
             if st.get("level") == "warn" and st["status"] != "run":
                 style = WARN
+            for past in (st.get("past") or [])[-2:]:                       # the phases of this stage that are finished (item 14: the next one's bar starts at 0 % again)
+                t.append(f"  {g.tick} {label:<10}", style=f"bold {ACCENT}")
+                t.append(past + "\n", style=MUTE)
             t.append(f"  {mark}{label:<10}", style=f"bold {style}")
             if st["pct"] is not None and st["status"] == "run":
-                t.append(bar(st["pct"] / 100.0, width, g) + f" {st['pct']:.0f}%  ", style=ACCENT)
+                # the bar gives way so the words after it (the phase: "Downloading the DFlash2 drafter ...") are whole in a small window (item 14: at 80 columns they wrapped under it)
+                own = max(8, min(width, self.width() - 14 - 7 - len(st["text"] or "")))
+                t.append(bar(st["pct"] / 100.0, own, g) + f" {st['pct']:.0f}%  ", style=ACCENT)
             t.append((st["text"] or "") + "\n", style=FG if st["status"] == "run" else MUTE)
+        for note in getattr(self, "notes", None) or []:       # 0217 item 7: stays under the rows for the whole launch
+            t.append("\n")
+            for ln in textwrap.wrap(note, max(30, self.width() - 4)):
+                t.append("  " + ln + "\n", style=WARN)
         if self.failed:
             t.append("\n  " + self.failed + "\n", style=BAD)
             if self.free_port:

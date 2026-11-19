@@ -205,11 +205,19 @@ def assess(catalog, family: str | None, model: str | None, *, vision: str = "off
         st.parts.append(Part("weights", "the model", max(st.total_gb - st.on_disk_gb, 0.0)))
         if family in HELPER_FAMILIES:
             # setup fetches the draft layer and the picture reader after the model, so the question and the disk check count them too
-            if mtp != "off" and not (base / "mtp" / "rt" / "experts.bin").is_file():
+            if mtp != "off" and not _is_file(base / "mtp" / "rt" / "experts.bin"):
                 st.parts.append(Part("mtp", "the draft layer", MTP_FETCH_GB))
             if wants_pictures and not reader_present(catalog, family, [base, *data_places(catalog, None)]):     # setup's rule: the pinned name, here or in a folder it reuses
                 st.parts.append(Part("mmproj", "the picture reader", MMPROJ_GB))
     return st
+
+
+def _is_file(path: Path) -> bool:
+    """Path.is_file() that says no, not PermissionError, for a file below a folder this account may not read (0.2.17: it stopped the Save screen's repaint)."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
 
 
 def data_places(catalog, data: Path | None) -> list[Path]:
@@ -263,6 +271,14 @@ def reader_present(catalog, family: str | None, data_folders, own: Path | None =
                 if f.is_file() and (size is None or f.stat().st_size == size):
                     return True
         except OSError:
+            pass
+        try:                                                 # the same file under another name in their folder (0.2.17: setup.own_reader_by_content, by size and SHA-256)
+            mod = catalog.strata.setup_module()
+            _m, families, _c, _s = catalog.tables()
+            pin = (families.get(family or "") or {}).get("mmproj_sha256") or (getattr(mod, "ISTA_FILES", None) or {}).get(name)
+            if mod is not None and pin and mod.own_reader_by_content(own, name, pin[0], pin[1], start=False) is not None:
+                return True
+        except Exception:                                    # noqa: BLE001 - the plan must not fail on this
             pass
     try:                                                     # no pinned file: a verified Unsloth mmproj-F16.gguf the person already has counts, as in setup
         mod = catalog.strata.setup_module()

@@ -58,6 +58,33 @@ class Ctx:
     probe_offline: bool = False              # S6: ask once, in the background, whether the download hosts answer (only the real launch screens turn this on)
     offline: bool | None = None              # None: not asked yet (or not asked at all)
     _probing: bool = False
+    tuned_offered: dict = field(default_factory=dict)     # (engine family, tuned file) -> True / False / None: whether the feed lists the small tuned drafter (check_tuned)
+    _tuned_asking: set = field(default_factory=set)
+    _tuned_wanted: tuple | None = None
+
+    def probe_now(self) -> bool:
+        """The probe itself: True when none of the download addresses answers. A feed on this computer itself (a loopback address: a test feed, a mirror running here) does not
+        count as an answer from the internet (0217 item 5: with one set, an offline computer looked online); a person's own mirror elsewhere does."""
+        from urllib.parse import urlparse
+        from strata_control import drafting, drafting_fetch
+        urls = []
+        for u in (drafting.base_url(), drafting_fetch._feed_source(self.feed)):
+            if not str(u).lower().startswith(("http://", "https://")):
+                continue
+            if (urlparse(str(u)).hostname or "").lower() in ("127.0.0.1", "localhost", "::1"):
+                continue
+            urls.append(u)
+        return bool(urls) and not any(drafting_fetch.online(url, timeout=4.0) for url in urls)
+
+    def is_offline(self) -> bool:
+        """The answer now: the one the Save screen's probe kept, else (a preset started with one key, which never visited Save) the probe, here and now; False when the screens do not
+        probe (the unit tests) or it cannot be told."""
+        if self.offline is None and self.probe_offline:
+            try:
+                self.offline = self.probe_now()
+            except Exception:                                # noqa: BLE001
+                self.offline = False
+        return bool(self.offline)
 
     def check_offline(self, on_done=None) -> None:
         """S6: is this computer offline? One short HEAD request to each address Strata downloads from: the model files' (as the drafter fetch names
@@ -70,9 +97,7 @@ class Ctx:
 
         def run() -> None:
             try:
-                from strata_control import drafting, drafting_fetch
-                urls = [u for u in (drafting.base_url(), drafting_fetch._feed_source(self.feed)) if str(u).lower().startswith(("http://", "https://"))]
-                self.offline = bool(urls) and not any(drafting_fetch.online(url, timeout=4.0) for url in urls)
+                self.offline = self.probe_now()
             except Exception:                                # noqa: BLE001 - not knowing counts as online: the download itself says what is wrong
                 self.offline = False
             finally:
@@ -99,12 +124,62 @@ class Ctx:
             return cached[1]
         try:
             from strata_cli.launch.runner import Runner as PlanRunner
-            plan = PlanRunner(self.settings, catalog=self.catalog).download_plan()
+            planner = PlanRunner(self.settings, catalog=self.catalog, feed=self.feed)
+            planner.tuned_offered = self.tuned_offered          # what the feed said so far (check_tuned fills it in): the plan lists the size the launch really downloads
+            plan = planner.download_plan()
+            self._tuned_wanted = planner.tuned_wanted
         except Exception:                                    # noqa: BLE001 - a line of information, never a reason to stop the screens
             plan = None
         if key is not None:
             self._plan = (key, plan)
         return plan
+
+    def drafter_term(self) -> str:
+        """What the drafter this launch will use is called in a sentence: "the DFlash2 drafter", "the draft layer" (the MTP) or "" (Off). One term for one case (0217 items 9 and 10: Save and the
+        Folder step said "the draft layer" next to "the DFlash2 drafter"). Worked out once per set of choices."""
+        import dataclasses
+        import json
+        try:
+            key = json.dumps(dataclasses.asdict(self.settings), sort_keys=True, default=str)
+        except Exception:                                    # noqa: BLE001
+            key = None
+        cached = getattr(self, "_term", None)
+        if key is not None and cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            from strata_cli.launch.runner import Runner as PlanRunner
+            resolved = PlanRunner(self.settings, catalog=self.catalog).resolved_drafting(self.settings.family)
+        except Exception:                                    # noqa: BLE001 - not known: the layer, as before
+            resolved = "mtp"
+        word = {"dflash2": "the DFlash2 drafter", "mtp": "the draft layer"}.get(resolved, "")
+        if key is not None:
+            self._term = (key, word)
+        return word
+
+    def check_tuned(self, on_done=None) -> None:
+        """0217 item 3: when the plan lists the small tuned DFlash2 drafter, ask the signed feed once, in the background, whether it really lists that file for this engine family
+        (the launch fetches it only then, else the 1.2 GB standard drafter). The answer is kept; the plan is worked out again and on_done repaints. Never raises, never blocks a screen."""
+        key = getattr(self, "_tuned_wanted", None)
+        if not self.probe_offline or key is None or key in self.tuned_offered or key in self._tuned_asking:
+            return
+        self._tuned_asking.add(key)
+
+        def run() -> None:
+            try:
+                from strata_control import drafting_fetch
+                self.tuned_offered[key] = drafting_fetch.tuned_offered(feed=self.feed, backend=key[0], variant=key[1])
+            except Exception:                                # noqa: BLE001 - not known: the plan keeps the small file's size
+                self.tuned_offered[key] = None
+            finally:
+                self._tuned_asking.discard(key)
+            self._plan = None                                # worked out again with the answer
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception:                            # noqa: BLE001
+                    pass
+        import threading
+        threading.Thread(target=run, daemon=True, name="feed-check").start()
 
     def refresh_disk(self) -> None:
         """Mark the Model list's disk verdicts again for the files in use: the model in the person's own folder needs no download (N1); every other
@@ -115,7 +190,7 @@ class Ctx:
         except Exception:                                    # noqa: BLE001 - a mark in a list is never a reason to stop the screens
             pass
 
-    def computer_line(self) -> str:
+    def computer_line(self, width: int | None = None) -> str:
         """The computer's one line (the header of the start screen, the model list) with the free disk read again now: it was read once when the
         screens opened and stayed "88 GB free" after a download left 26 GB (T9). A statvfs call; nothing else is asked again."""
         try:
@@ -124,7 +199,7 @@ class Ctx:
                 self.computer.disk_free_gb = free
         except Exception:                                    # noqa: BLE001 - the old figure is better than none
             pass
-        return self.computer.line()
+        return self.computer.line(width=width)
 
     def card_roles(self) -> tuple[dict[int, str], list[dict]] | None:
         """The role of every card this launch will use (named here, else the installed model's own, else the recommendation) with the cards, or None
@@ -446,12 +521,16 @@ class LaunchApp(App):
             title, text = asker() if asker else (f"Download about {gb:.0f} GB?",
                                                  f"This model is not on this computer yet. Strata will download about {gb:.0f} GB now; "
                                                  "an interrupted download continues where it stopped.")
+            offline = self.ctx.is_offline()                  # 0217 item 13: the dialog said nothing about the computer being offline
+            go = "Try the download" if offline else "Download and start"
+            if offline:
+                text = "This computer is offline, so this download will probably not work now. " + text
             if kinds:
                 what = ("the draft layer" if kinds == {"mtp"} else "pictures" if kinds == {"mmproj"} else "them")
-                options = [("go", "Download and start"), ("skip", f"Start without {what}")]
+                options = [("go", go), ("skip", f"Start without {what}")]
                 text += " Or start now without it: answers are a little slower or text only, and you can add it later."
             else:
-                options = [("go", "Download and start"), ("no", "Not now")]
+                options = [("go", go), ("no", "Not now")]
             self.push_screen(ConfirmScreen(title, text + room + warn, options), done)
             return
         screen = RunScreen()
@@ -583,7 +662,7 @@ def _info_for(result: Result, s: S.LaunchSettings) -> dict:
         pass
     return {"url": result.urls[0] if result.urls else f"http://127.0.0.1:{s.port}", "urls": result.urls, "key": result.key,
             "model": cfg.get("model_name") or "strata", "context": s.context, "name": s.name, "profile": result.profile, "running": True,
-            "tunnel": result.tunnel}
+            "tunnel": result.tunnel, "last_run": getattr(result, "last_run", "")}
 
 
 def run_monitor(info: dict, *, keep_default: bool = True, color: str = "auto") -> int:

@@ -177,16 +177,30 @@ class Computer:
     def main_vram_gb(self) -> float:
         return max((float(g.get("vram_gb") or 0) for g in self.usable_gpus), default=0.0)
 
-    def line(self, data_dir: str | None = None) -> str:
+    def line(self, data_dir: str | None = None, width: int | None = None) -> str:
+        """The computer in one line. `width`: the room it has; the graphics card's NAME gives way (ending in an ellipsis), never the memory and disk figures at the end
+        (0217 item 11: "... · 28 GB" lost its "free" at 80 columns)."""
         g = self.usable_gpus
         if g and g[0].get("unified_gb"):                       # a Mac: one pool of memory, the chip is the graphics
             disk = f"{self.disk_free_gb:,.0f} GB free" if self.disk_free_gb is not None else ""
-            return " · ".join(x for x in (g[0].get("name", "Apple silicon"), f"{self.ram_gb:.0f} GB unified memory" if self.ram_gb else "memory unknown", disk) if x)
-        card = (f"{g[0].get('name', 'GPU').replace('NVIDIA GeForce ', '').replace('AMD Radeon ', '')} {g[0].get('vram_gb', 0):.0f} GB"
-                + (f" x{len(g)}" if len(g) > 1 else "")) if g else "no usable graphics card found"
+            rest = " · ".join(x for x in (f"{self.ram_gb:.0f} GB unified memory" if self.ram_gb else "memory unknown", disk) if x)
+            return " · ".join((self._fit_name(g[0].get("name", "Apple silicon"), "", rest, width), rest))
+        name = g[0].get('name', 'GPU').replace('NVIDIA GeForce ', '').replace('AMD Radeon ', '') if g else "no usable graphics card found"
+        tail = (f" {g[0].get('vram_gb', 0):.0f} GB" + (f" x{len(g)}" if len(g) > 1 else "")) if g else ""
         ram = f"{self.ram_gb:.0f} GB RAM" if self.ram_gb else "RAM unknown"
         disk = f"{self.disk_free_gb:,.0f} GB free" if self.disk_free_gb is not None else ""
-        return " · ".join(x for x in (card, ram, disk) if x)
+        rest = " · ".join(x for x in (ram, disk) if x)
+        return " · ".join(x for x in (self._fit_name(name, tail, rest, width) + tail, rest) if x)
+
+    @staticmethod
+    def _fit_name(name: str, tail: str, rest: str, width: int | None) -> str:
+        if width is None or len(name) + len(tail) + 3 + len(rest) <= width:
+            return name
+        name = name.replace("(TM)", "").replace("(R)", "")
+        if len(name) + len(tail) + 3 + len(rest) <= width:
+            return name
+        room = width - len(tail) - 3 - len(rest)
+        return name if room < 6 else name[:room - 1].rstrip() + "…"
 
 
 def installer_folder(explicit: str | os.PathLike | None = None) -> Path:
@@ -548,7 +562,10 @@ class Catalog:
         for candidate, rule in ((own, "exact"), (lower, "lower")):
             if any(t["path"] == candidate for t in tried):
                 continue                                     # (a tag that is lower case already: one folder)
-            here = candidate.is_dir()
+            try:
+                here = candidate.is_dir()
+            except OSError:                                  # a parent this account may not read (PermissionError): not there, as far as it can tell
+                here = False
             tried.append({"path": candidate, "rule": rule, "exists": here})
             if here:
                 return {"folder": candidate, "rule": rule, "tried": tried}
