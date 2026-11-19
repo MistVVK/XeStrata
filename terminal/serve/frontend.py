@@ -771,6 +771,8 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             continue
         text, reasoning, calls, parts = [], [], [], []
         for j, block in enumerate(content or []):
+            if not isinstance(block, dict):       # a non-object block is skipped leniently, as _text_of / _check_parts
+                continue                          # do on OpenAI; it used to raise AttributeError here (a generic 400)
             kind = block.get("type")
             if kind == "text":
                 text.append(block.get("text", ""))

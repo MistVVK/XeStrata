@@ -7370,3 +7370,56 @@ class ThinkingBlockValue(unittest.TestCase):
                                        "messages": [{"role": "user", "content": content}]})
                 self.assertEqual(status, 200, b)
 
+
+class AnthropicNonObjectBlock(unittest.TestCase):
+    """A non-object content block in an Anthropic message (content: [5], ["x"], [None]) raised AttributeError
+    ('int'/'str'/'NoneType' object has no attribute 'get') in the block loop (frontend.py:688), caught only by the
+    generic malformed-request handler: a 400 naming the exception, with a traceback in the log. OpenAI skips such
+    parts leniently (_text_of) and _check_parts documents that a non-object part passes through unchanged; the
+    Anthropic reader now skips it the same way, so a valid text block beside it is still read and the request served."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = MockEngine(tok, "ok", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, body):
+        req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_non_object_block_beside_text_is_served(self):
+        for content in ([5, {"type": "text", "text": "ok"}], [{"type": "text", "text": "ok"}, 5],
+                        ["x", {"type": "text", "text": "ok"}], [None, {"type": "text", "text": "ok"}]):
+            with self.subTest(content=content):
+                status, b = self.post({"model": "x", "max_tokens": 8,
+                                       "messages": [{"role": "user", "content": content}]})
+                self.assertEqual(status, 200, b)
+
+    def test_all_non_object_blocks_do_not_crash(self):
+        for content in ([5], ["x"], [None], [5, 6]):
+            with self.subTest(content=content):
+                status, b = self.post({"model": "x", "max_tokens": 8,
+                                       "messages": [{"role": "user", "content": content}]})
+                msg = (b.get("error", {}) or {}).get("message", "") if isinstance(b, dict) else ""
+                self.assertNotIn("AttributeError", msg)
+                self.assertNotIn("malformed", msg)
+                self.assertNotEqual(status, 500)
+
+    def test_valid_text_block_unchanged(self):
+        status, b = self.post({"model": "x", "max_tokens": 8,
+                               "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]})
+        self.assertEqual(status, 200, b)
