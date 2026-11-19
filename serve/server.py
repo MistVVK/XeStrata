@@ -4168,6 +4168,8 @@ def child_env(cfg: dict) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries
         env[str(k)] = str(v)
+    if cfg.get("route_tail_skip_default") is not None:
+        envvars.put_default(env, "ROUTE_TAIL_SKIP", str(cfg["route_tail_skip_default"]))
     args = cfg.get("args")
     if isinstance(args, list) and "--ram-reserve-mib" in args[:-1]:   # setup's --ram-reserve-gib: the image engine too
         envvars.put(env, "RAM_RESERVE_MIB", str(args[args.index("--ram-reserve-mib") + 1]))

@@ -8621,7 +8621,7 @@ def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, 
 # user's - a "sampling" or "mcp_servers" block, "cors_origins", "open_browser" - and is kept when setup runs again, as
 # are "host" and "api_key" when this run does not give them
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "family", "log", "lib_dirs", "port",
-                        "gpu_pci", "draft_vocab", "ple_io", "vision", "custom"})
+                        "gpu_pci", "draft_vocab", "ple_io", "vision", "custom", "route_tail_skip_default"})
 SPLIT_KEYS = frozenset({"split_pci", "layer_split"})
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "gpu_pci", "max_tokens", "threads", "onednn", "fallback"})
 
@@ -10067,6 +10067,9 @@ def setup_sync(a, family: str, model: str, gpu: dict, sel: list, found: list, gp
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"),
                            "lib_dirs": lib_dirs, "port": port, "model_gb": MODELS[model]["download_gb"],
                            "experts_gb": MODELS[model]["arena_gb"], "draft_vocab": draft_vocab}
+    # R7 KL against off on B70 at 12 GiB: XS 0.008904, S 0.010352, M 0.011171; above the 0.0058 reference.
+    # Leave it off unless the user opts in, without changing other models' engine defaults.
+    cfg["route_tail_skip_default"] = 0
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]
     replicas_config(a, cfg)

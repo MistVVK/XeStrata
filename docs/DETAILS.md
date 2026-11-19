@@ -414,6 +414,8 @@ The three share a [GGUF, MTP and tokenizer](https://huggingface.co/hiru2005/Sync
 Setup recommends XS from 24 GiB RAM, S from 32 GiB RAM with 12 GiB VRAM, and M from 48 GiB RAM. With at least 48 GiB RAM, S has no VRAM condition.
 This does not change the order of the first model setup recommends.
 
+Tail skip is off by default for Sync. On the B70 limited to 12 GiB of VRAM, the mean teacher-forced KL against the unskipped path over 21 prompts of 220 tokens was 0.008904 for XS, 0.010352 for S and 0.011171 for M at rank 7. These are not as small as the earlier 0.0058 reference. At rank 4 they were 0.050165, 0.056059 and 0.060073. The caches held 4739, 3945 and 2768 experts respectively, so the numbers are not a direct comparison between packs. Set `XESTRATA_ROUTE_TAIL_SKIP=7` to try rank 7.
+
 ```bash
 ./setup.sh --setup --family sync --model Sync-XS
 ```
