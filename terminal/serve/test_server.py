@@ -4782,6 +4782,41 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT[:10] + wrap)
 
+    def test_the_budget_alias_field_names(self):
+        """pi's thinkingTokenBudgetField can be thinking_token_budget (vLLM), thinking_budget (Qwen)
+        or thinking_budget_tokens (llama.cpp): all three are honoured like reasoning_budget_tokens."""
+        from serve.server import REASONING_WRAP_UP
+        wrap = REASONING_WRAP_UP.split("</think>")[0]
+        for field in ("thinking_token_budget", "thinking_budget", "thinking_budget_tokens"):
+            code, b = self.openai(**{field: 20})
+            self.assertEqual(code, 200, (field, b))
+            msg = b["choices"][0]["message"]
+            self.assertEqual(msg["reasoning_content"], ThinkingEngine.THOUGHT[:20] + wrap, field)
+            self.assertEqual(msg["content"], ThinkingEngine.ANSWER, field)
+            self.assertEqual(b["choices"][0]["finish_reason"], "stop", field)
+        self.assertEqual(len(self.engine.prompts), 6)   # the wrap-up continuation, once per alias
+
+    def test_the_request_s_own_budget_wins_over_the_aliases(self):
+        code, b = self.openai(reasoning_budget_tokens=10_000, thinking_token_budget=20,
+                              thinking_budget=20, thinking_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
+        self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_the_alias_field_order_wins(self):
+        """Several aliases at once: the first of thinking_token_budget / thinking_budget /
+        thinking_budget_tokens does, so a client that sends a mix gets a deterministic budget."""
+        code, b = self.openai(thinking_budget=10_000, thinking_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
+        self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_a_bad_alias_is_a_400(self):
+        for field in ("thinking_token_budget", "thinking_budget", "thinking_budget_tokens"):
+            for bad in (1.5, "20", True):
+                code, b = self.openai(**{field: bad})
+                self.assertEqual(code, 400, (field, bad, b))
+
     def test_a_stop_string_is_found_in_the_answer_after_the_wrap_up(self):
         """#454: the continuation after the thinking budget is cut at a stop string too."""
         code, b = self.openai(reasoning_budget_tokens=20, stop=["answer is"])
