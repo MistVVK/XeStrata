@@ -588,6 +588,61 @@ __global__ void k_engram_apply(float* __restrict__ x, const float* __restrict__ 
     }
 }
 
+// ---- deterministic iHC mix (no float atomics): every slab writes its 9 partial sums to part[t][slab][9], the finisher adds the 24 slabs in a fixed order.
+// Same maths as k_hc_mix_part + k_hc_mix_fin; used when the output must not depend on the scheduling (speculative decoding compares against plain decode).
+__global__ void k_hc_mix_part_d(const float* __restrict__ x, const float* __restrict__ fn, float* __restrict__ part, int nout) {
+    const int K = NHC * HID;
+    int t = blockIdx.x, slab = blockIdx.y;
+    const float* xt = x + (size_t)t * K;
+    float ss = 0, a[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) a[j] = 0;
+    for (int k = slab * 512 + threadIdx.x; k < (slab + 1) * 512; k += 128) {
+        float v = xt[k];
+        ss += v * v;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if (j < nout) a[j] += v * fn[(size_t)j * K + k];
+    }
+    float vals[9];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) vals[j] = a[j];
+    vals[8] = ss;
+#pragma unroll
+    for (int j = 0; j < 9; ++j)
+        for (int o = 16; o > 0; o >>= 1) vals[j] += __shfl_xor(vals[j], o);
+    __shared__ float shv[9][4];
+    if ((threadIdx.x & 31) == 0)
+#pragma unroll
+        for (int j = 0; j < 9; ++j) shv[j][threadIdx.x >> 5] = vals[j];
+    __syncthreads();
+    if (threadIdx.x < 9) {
+        const int j = threadIdx.x;
+        part[((size_t)t * 24 + slab) * 9 + j] = (shv[j][0] + shv[j][1]) + (shv[j][2] + shv[j][3]);
+    }
+}
+__global__ void k_hc_mix_fin_d(const float* __restrict__ part, const float* __restrict__ scale, const float* __restrict__ base, float* __restrict__ pre, float* __restrict__ post, int nout,
+                               float eps, float hc_eps, float hc_mag) {
+    int t = blockIdx.x;
+    if (threadIdx.x != 0) return;
+    const int K = NHC * HID;
+    float acc[9];
+    for (int j = 0; j < 9; ++j) acc[j] = 0.f;
+    for (int s = 0; s < 24; ++s)
+        for (int j = 0; j < 9; ++j) acc[j] += part[((size_t)t * 24 + s) * 9 + j];
+    float inv = rsqrtf(acc[8] / K + eps);
+    float m[8];
+    for (int j = 0; j < 8; ++j) m[j] = j < nout ? acc[j] * inv : 0.0f;
+    if (nout == 8) {
+        for (int h = 0; h < NHC; ++h) {
+            pre[(size_t)t * NHC + h] = sigmoidf_(m[h] * scale[0] + base[h]) + hc_eps;
+            post[(size_t)t * NHC + h] = hc_mag * sigmoidf_(m[NHC + h] * scale[1] + base[NHC + h]) + hc_eps;
+        }
+    } else {
+        for (int h = 0; h < NHC; ++h) pre[(size_t)t * NHC + h] = sigmoidf_(m[h] * scale[0] + base[h]) + hc_eps;
+    }
+}
+
 // ---- add bias-free helper: y[t][n] = y + bias? (not needed) ; fp16 gather of 1 row t from [T][D]
 __global__ void k_copy_row_h(const __half* __restrict__ in, __half* __restrict__ out, int D, int t) {
     for (int i = threadIdx.x; i < D; i += blockDim.x) out[i] = in[(size_t)t * D + i];
