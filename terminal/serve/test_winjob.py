@@ -90,7 +90,11 @@ class Held:
         return "%s created %s (%s)" % (image if image != "?" else "an exited process", _when(created), "the same process" if same else "NOT the process held")
 
     def explain(self, since_kill: float) -> str:
-        listed = subprocess.run(["tasklist", "/FI", f"PID eq {self.pid}", "/NH"], capture_output=True, text=True).stdout.strip().replace("\n", " | ")
+        # tasklist writes in the console's OEM code page (cp850 on a Western European Windows): its table frame bytes are not valid
+        # UTF-8, so text=True raised in the reader thread and left stdout None (#2331)
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {self.pid}", "/NH"], capture_output=True, text=True,
+                             encoding="oem", errors="replace").stdout
+        listed = (out or "").strip().replace("\n", " | ")
         return ("%s outlived the server: pid %d is %s, created %s; %.1f s after the kill it is still running; the PID is held now by: %s; tasklist: %s"
                 % (self.label, self.pid, self.image, _when(self.created), since_kill, self.holder_of_the_pid_now(), listed or "-"))
 
@@ -135,10 +139,6 @@ class TestWinJob(unittest.TestCase):
         self.assertFalse(contain(None))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 @unittest.skipUnless(os.name == "nt", "power throttling is a Windows setting")
 class TestNoThrottle(unittest.TestCase):
     def test_a_contained_child_is_opted_out_of_power_throttling(self):
@@ -152,3 +152,7 @@ class TestNoThrottle(unittest.TestCase):
         finally:
             child.kill()
             child.wait(10)
+
+
+if __name__ == "__main__":
+    unittest.main()
