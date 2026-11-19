@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (268)
+## Switches you can turn on (270)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -206,6 +206,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_PREFILL_BORROW` | on / off | NVIDIA, AMD | [STRIX_HALO.md](STRIX_HALO.md), [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) |
 | `STRATA_PREFILL_CPU_SHARE_BATCH` | on / off | NVIDIA and AMD | - |
 | `STRATA_PREFILL_CPU_SHARE_MAX` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
+| `STRATA_PREFILL_CPU_SHARE_NT` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PREFILL_EQUAL` | text | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
 | `STRATA_PREFILL_FIRST` | number | Intel Arc | [INTEL.md](INTEL.md) |
 | `STRATA_PREFILL_HELP` | number | NVIDIA and AMD, Intel Arc | [BATCHING.md](BATCHING.md), [GYRO.md](GYRO.md), [MULTI_GPU.md](MULTI_GPU.md) |
@@ -262,6 +263,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_SPEC_WATCH` | number | NVIDIA and AMD | [release-notes-0.2.2.md](release-notes-0.2.2.md) |
 | `STRATA_SPLIT_HEADROOM` | number | Intel Arc | [INTEL_ARC.md](INTEL_ARC.md) |
 | `STRATA_SPLIT_HEADROOM_TOL` | number | Intel Arc | [INTEL_ARC.md](INTEL_ARC.md) |
+| `STRATA_SPLIT_LINK_MIN` | text | NVIDIA and AMD | [MULTI_GPU.md](MULTI_GPU.md) |
 | `STRATA_SPLIT_MTP_BATCH` | text | NVIDIA and AMD | [BATCHING.md](BATCHING.md), [MULTI_GPU.md](MULTI_GPU.md) |
 | `STRATA_SPLIT_OVERLAP` | number | NVIDIA and AMD | [MULTI_GPU.md](MULTI_GPU.md) |
 | `STRATA_SPLIT_UNIFORM` | on / off | NVIDIA and AMD | [MULTI_GPU.md](MULTI_GPU.md) |
@@ -285,7 +287,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WATCHDOG_S` | number | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 
-## Switches that go back to earlier behaviour (85)
+## Switches that go back to earlier behaviour (87)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -326,6 +328,7 @@ version made it the default.
 | `STRATA_MTP_BATCH_RING` | on / off | NVIDIA and AMD, Intel Arc | v0.1.40.1 | - |
 | `STRATA_NAN_GUARD` | number | NVIDIA and AMD | v0.1.43 | [DETAILS.md](DETAILS.md) |
 | `STRATA_NO_IQ512` | on / off | CPU | v0.1.40.1 | - |
+| `STRATA_NO_KQ512` | on / off | CPU | - | [DETAILS.md](DETAILS.md) |
 | `STRATA_NUMA_CARD` | text | NVIDIA and AMD | - | - |
 | `STRATA_NUMA_POOL` | on / off | NVIDIA and AMD, CPU | v0.2.2 | [DETAILS.md](DETAILS.md), [release-notes-0.2.2.md](release-notes-0.2.2.md) |
 | `STRATA_NUMA_SPLIT` | text | NVIDIA and AMD, CPU | v0.2.2 | [DETAILS.md](DETAILS.md), [release-notes-0.2.2.md](release-notes-0.2.2.md) |
@@ -343,6 +346,7 @@ version made it the default.
 | `STRATA_PF_XMX` | text | Intel Arc | v0.1.42 | [INTEL.md](INTEL.md), [release-notes-0.2.0.md](release-notes-0.2.0.md) |
 | `STRATA_PIPELINE_ADAPT_ASYNC` | number | NVIDIA and AMD | v0.1.40.2 | - |
 | `STRATA_PLE_AUTO_MMAP` | number | NVIDIA and AMD, Intel Arc | v0.1.43.1 | [DETAILS.md](DETAILS.md) |
+| `STRATA_PREFILL_CPU_SHARE_AUTO` | on / off | NVIDIA and AMD | - | [DETAILS.md](DETAILS.md) |
 | `STRATA_PREFILL_LOAN_WALK` | on / off | NVIDIA and AMD | - | - |
 | `STRATA_PREFILL_STREAM_MIN` | number | NVIDIA and AMD, Intel Arc | v0.1.40.1 | [AMD_HIP.md](AMD_HIP.md), [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_PREFILL_TAIL_LOAN` | on / off | NVIDIA and AMD | - | - |

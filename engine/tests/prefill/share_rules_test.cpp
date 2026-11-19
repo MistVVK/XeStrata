@@ -58,6 +58,42 @@ int main() {
     CHECK(default_share_memory_verdict(m).arm);
     m.avail_ram = kUnknown; m.inplace_bytes = 500 * G;
     CHECK(default_share_memory_verdict(m).arm);                                   // RAM unknown: never blocks
+    // BW-H: the link-aware limit and expert width (RTX 5090, UD-Q4_K_XL: 24,576 experts of ~3.13 MB, 8,056 on the card)
+    {
+        LinkRuleIn in;
+        in.pool_workers = 22; in.resident = 8056; in.total = 24576; in.blob_mb = 3.133;
+        CHECK(!link_rule(in).arm);                                     // no probe: today's behaviour
+        in.link_gbps = 28.3;                                           // PCIe 5.0 x8 (EPYC 9B14, 22 workers): the measured crossing is 8.8K tokens
+        LinkRule r = link_rule(in);
+        CHECK(r.arm && r.limit == 6144 && r.nt == kLinkNt);
+        CHECK(r.floor_ms > 1800.0 && r.floor_ms < 1860.0);
+        in.pool_workers = 8;                                           // a small pool takes less (8 workers: the crossing fell from 8.8K to 7.7K)
+        CHECK(link_rule(in).limit == 5120 && link_rule(in).nt == kLinkNt);
+        CHECK(link_pool_factor(0) == 1.0 && link_pool_factor(64) == 1.0 && link_pool_factor(22) == 1.0 && link_pool_factor(8) < link_pool_factor(16));
+        in.link_gbps = 14.1; in.pool_workers = 32;                     // PCIe 4.0 x8 (Xeon 8352V, 32 workers): crossing 14.0K
+        r = link_rule(in);
+        CHECK(r.arm && r.limit == 12288 && r.nt == kLinkNtWide);
+        in.link_gbps = 53.6; in.pool_workers = 15;                     // PCIe 5.0 x16 (Ryzen 9 9950X, 15 workers): crossing 4.2K, the default 3,072 stays
+        r = link_rule(in);
+        CHECK(r.arm && r.limit == kShareLimitNew && r.nt == 0);
+        in.link_gbps = 3.6; in.pool_workers = 32;                      // PCIe 4.0 x2: the cap, 64-token experts
+        r = link_rule(in);
+        CHECK(r.arm && r.limit == kShareLimitMax && r.nt == kLinkNtWide);
+        in.link_gbps = 1000.0;                                         // a link so fast the floor is tiny: never below the default
+        CHECK(link_rule(in).limit == kShareLimitNew);
+        in.link_gbps = 28.3; in.resident = 24576;                      // every expert resident: nothing to take
+        CHECK(!link_rule(in).arm);
+        in.resident = -1;
+        CHECK(!link_rule(in).arm);                                     // the card's counts not known
+        CHECK(env_state(nullptr) == -1 && env_state("") == -1 && env_state("1") == 1 && env_state("0") == 0 && env_state("auto") == 0);
+        CHECK(link_rule_enabled(true, true, true, 12, 0, -1));         // the class: a discrete cc 12.0 card, link probed
+        CHECK(!link_rule_enabled(true, true, true, 8, 6, -1));         // other cards: not measured
+        CHECK(link_rule_enabled(true, true, true, 8, 6, 1));           // =1 asks for it
+        CHECK(!link_rule_enabled(true, true, true, 12, 0, 0));         // =0 is the way back
+        CHECK(!link_rule_enabled(true, false, true, 12, 0, -1));       // an integrated card
+        CHECK(!link_rule_enabled(true, true, false, 12, 0, 1));        // no probe: nothing to read the link from
+        CHECK(!link_rule_enabled(false, true, true, 12, 0, 1));        // HIP
+    }
     if (failed == 0) std::printf("share_rules_test: ok\n");
     return failed ? 1 : 0;
 }
