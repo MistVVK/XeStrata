@@ -7155,9 +7155,20 @@ def make_handler(svc: Service):
 
             except ClientGone:                               # #1999: the client left while the request was prepared
                 self._note(outcome="disconnected")
-            except OSError:
+            except (ConnectionError, TimeoutError):
                 self._note(outcome="disconnected")
                 raise                                        # as before #332: the server's own handling
+            except BadBody:
+                raise
+            except Exception as e:
+                if getattr(self, "answer_started", False):
+                    raise
+                import traceback
+                print(f"[strata] 500 internal error ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
+                self._note(error=f"{type(e).__name__}: {e}")
+                message = f"internal server error ({type(e).__name__}: {e})"
+                self._json(500, responses_error_body(message, "server_error") if path == "/v1/responses"
+                           else {"error": {"type": "server_error", "message": message}})
             finally:
                 if reserved:
                     svc.release_inference()
