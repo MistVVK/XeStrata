@@ -25,6 +25,15 @@ GOOD = b"reader-bytes " * 200
 SHA = hashlib.sha256(GOOD).hexdigest()
 
 
+def _have_noinput() -> bool:
+    try:
+        from strata_cli import noinput  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@unittest.skipUnless(_have_noinput(), "needs strata_cli/noinput.py (0217-PLAT's module; present after the merge)")
 class NoKeyboard(unittest.TestCase):
     def setUp(self):
         self.home = Home().__enter__()

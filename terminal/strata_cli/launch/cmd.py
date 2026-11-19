@@ -571,7 +571,10 @@ def _can_ask() -> bool:
         return False
     if os.environ.get("CI") or os.environ.get("STRATA_NO_PROMPT"):
         return False
-    from strata_cli import noinput
+    try:
+        from strata_cli import noinput                       # (0217-PLAT's module; a tree without it asks as before)
+    except ImportError:
+        return bool(os.environ.get("MSYSTEM") or os.environ.get("TERM_PROGRAM") or os.environ.get("TERM") or os.environ.get("WT_SESSION"))
     if noinput.stdin_is_no_keyboard():                       # `strata launch < /dev/null`: no question that nobody can answer (0.2.17)
         return False
     return bool(os.environ.get("MSYSTEM") or os.environ.get("TERM_PROGRAM") or os.environ.get("TERM") or os.environ.get("WT_SESSION"))
