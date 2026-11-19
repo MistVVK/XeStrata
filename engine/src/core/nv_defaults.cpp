@@ -18,11 +18,21 @@ bool off(const char* name) {
 }
 }  // namespace
 
+bool adapt_fetch_default_card(int major, int minor, uint64_t vram_bytes) {
+    const int mj = strata::cc_major_of(major);
+    (void) minor;
+    return mj == 12 && vram_bytes > 0 && vram_bytes <= kAdaptFetchMaxVramBytes;
+}
+
 std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor) {
     return nv_default_env(major, minor, strata::qwen_defaults_026());
 }
 
 std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor, bool defaults026) {
+    return nv_default_env(major, minor, defaults026, 0);
+}
+
+std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor, bool defaults026, uint64_t main_vram_bytes) {
     std::vector<std::pair<std::string, std::string>> t;
     const int mj = strata::cc_major_of(major), mn = strata::cc_minor_of(minor);
     if (mj == 8 && mn == 6) {
@@ -61,6 +71,11 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             // the grouped native experts' mode-8 layout (the GB10 / P100 / P40 default; exact against the CUDA layout on UD-Q4_K_XL)
             {"STRATA_EXP_MODE", "8"},
         };
+        // 0.2.17 (owner yes 11-19), a card of 16 GiB or less: the PCIe share also fills the expert cache (not bit-exact: CPU and GPU round differently; the tier is not deterministic).
+        // BW-9 (2x RTX 5060 Ti 16 GB, UD-Q4_K_XL, DFlash2 spec 6, tail skip OFF, product flags, 3 paired rounds; phaseA-tests/bw/RESULTS-BW-F.md): decode +4 to +43% by kind (medians 1.087 to 1.325, 3 of 3 rounds up),
+        // expert cache hit rate 54.4 -> 62.0%, forced-token KL against the FP16 prompt path 0.948 [0.830, 1.063] of the default's (PASS), prompts level except json 169 at +3 to +5%.  Applies to a one-card run only
+        // (the engine turns it off, with a line, for a layer split, helper cards, --batch and the other cases of the DETAILS.md row).  STRATA_ADAPT_FETCH=0 is the way back.
+        if (adapt_fetch_default_card(major, minor, main_vram_bytes)) t.push_back({"STRATA_ADAPT_FETCH", "2"});
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;
         t = {
@@ -109,14 +124,17 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             // It only changes which drafts are attempted, and every draft is verified, so the answers cannot drift.
             {"STRATA_SPEC_COST", "1"},
         };
+        // a 12.1 part reports its unified memory, far above 16 GiB, so this stays off there; the rule is the same as for 12.0
+        if (adapt_fetch_default_card(major, minor, main_vram_bytes)) t.push_back({"STRATA_ADAPT_FETCH", "2"});
     }
     return t;
 }
 
-std::vector<std::string> apply_nv_defaults(int major, int minor) {
+std::vector<std::string> apply_nv_defaults(int major, int minor, uint64_t main_vram_bytes) {
     const int mj = strata::cc_major_of(major), mn = strata::cc_minor_of(minor);
     std::vector<std::string> set;
-    for (const auto& kv : nv_default_env(major, minor)) {
+    bool fetch_set = false;
+    for (const auto& kv : nv_default_env(major, minor, strata::qwen_defaults_026(), main_vram_bytes)) {
         if (std::getenv(kv.first.c_str()) != nullptr) continue;   // the user's setting wins, whatever it is
 #if defined(_WIN32)
         _putenv_s(kv.first.c_str(), kv.second.c_str());
@@ -124,17 +142,21 @@ std::vector<std::string> apply_nv_defaults(int major, int minor) {
         setenv(kv.first.c_str(), kv.second.c_str(), 0);
 #endif
         set.push_back(kv.first);
+        if (kv.first == "STRATA_ADAPT_FETCH") fetch_set = true;
     }
+    adapt_fetch_default_flag() = fetch_set;
     if (!set.empty()) {
         const bool sm86 = mj == 8;
         const bool sm121 = mj == 12 && mn == 1;
         // sm_86 / sm_60: bit-exact switches.  sm_121: the fused prompt path and the FP4-activation NVFP4 prompt round differently from the
         // paths they replace (24 of 24 greedy answers were identical on the Spark; no KL run), so the line does not say "exact".
         const bool sm120 = mj == 12 && mn == 0;
-        std::fprintf(stderr, "strata: %s: %zu %sspeed switches on by default (%s=0 turns them off%s; a switch you set is kept): ",
-                     sm86 ? "sm_86 (Ampere)" : sm121 ? "sm_121 (GB10)" : sm120 ? "sm_120 (Blackwell)" : "sm_60 (Pascal)", set.size(), sm121 ? "" : "exact ",
+        // ADAPT_FETCH (a card of 16 GiB or less) is not bit-exact either: the line then says so and names its own way back
+        std::fprintf(stderr, "strata: %s: %zu %sspeed switches on by default (%s=0 turns them off%s; a switch you set is kept%s): ",
+                     sm86 ? "sm_86 (Ampere)" : sm121 ? "sm_121 (GB10)" : sm120 ? "sm_120 (Blackwell)" : "sm_60 (Pascal)", set.size(), sm121 || fetch_set ? "" : "exact ",
                      sm86 ? "STRATA_SM86_PERF" : sm121 ? "STRATA_SM121_PERF" : sm120 ? "STRATA_SM120_PERF" : "STRATA_SM60_PERF",
-                     sm121 || sm120 ? ", as does STRATA_DEFAULTS=026" : "");
+                     sm121 || sm120 ? ", as does STRATA_DEFAULTS=026" : "",
+                     fetch_set ? "; ADAPT_FETCH is on because this card has 16 GiB of memory or less, it does not give bit-for-bit the same text, STRATA_ADAPT_FETCH=0 turns it off" : "");
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");
     }

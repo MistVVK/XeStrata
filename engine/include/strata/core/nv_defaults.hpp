@@ -16,21 +16,38 @@
 // switches; the table is used only when every visible CUDA device has the same compute capability.
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace strata::core {
 
+/// STRATA_ADAPT_FETCH=2 as a default (0.2.17, owner yes 11-19; BW-9 on 2x RTX 5060 Ti 16 GB, phaseA-tests/bw/RESULTS-BW-F.md): compute
+/// capability 12.x cards with at most this much VRAM (RTX 5050 / 5060 / 5060 Ti / 5070 / 5070 Ti / 5080 and the laptop parts).  A card with more
+/// VRAM keeps it opt-in.  The switch is read once per process and only a one-card run uses it (a layer split, helper cards, a peer tier, --batch
+/// and the other cases the start-up line names turn it off), so the card that decides is the engine's main one (STRATA_PRIMARY_DEVICE).
+constexpr uint64_t kAdaptFetchMaxVramBytes = 16ull << 30;
+/// Whether STRATA_ADAPT_FETCH=2 is the default of a card with compute capability major.minor (raw) and `vram_bytes` of memory
+/// (cudaDeviceProp::totalGlobalMem; 0 = unknown, which is no).  Not about the environment: the off switches are in nv_default_env.
+bool adapt_fetch_default_card(int major, int minor, uint64_t vram_bytes);
+
 /// The environment settings that are the defaults of a card with compute capability major.minor (raw, as the driver reports it);
 /// empty for every other card and when its off switch is 0.
 std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor);
 /// The same with the answer of STRATA_DEFAULTS=026 given (the sm_121 table is empty then), so a test can check both without the environment.
 std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor, bool defaults026);
+/// The same for a main card with `main_vram_bytes` of memory: a card of compute capability 12.x with at most kAdaptFetchMaxVramBytes also gets
+/// STRATA_ADAPT_FETCH=2 (adapt_fetch_default_card).  main_vram_bytes = 0 (the two overloads above) leaves it out.
+std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor, bool defaults026, uint64_t main_vram_bytes);
 
 /// Sets `nv_default_env(major, minor)` in this process's environment where the user has not set the variable, prints one line to
-/// stderr when it set anything, and returns the names it set.
-std::vector<std::string> apply_nv_defaults(int major, int minor);
+/// stderr when it set anything, and returns the names it set.  main_vram_bytes: the engine's main card's memory (see nv_default_env); 0 = not given.
+std::vector<std::string> apply_nv_defaults(int major, int minor, uint64_t main_vram_bytes = 0);
+/// Whether apply_nv_defaults put STRATA_ADAPT_FETCH in the environment (it was the default, not the user's setting); the engine's lines about the switch say so.
+/// (Inline, so a build that does not link nv_defaults.cpp - Metal, SYCL - still compiles the engine's lines: it reads false there.)
+inline bool& adapt_fetch_default_flag() { static bool v = false; return v; }
+inline bool adapt_fetch_is_default() { return adapt_fetch_default_flag(); }
 
 }  // namespace strata::core
 
