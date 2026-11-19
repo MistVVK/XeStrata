@@ -320,7 +320,10 @@ def apply_choices(cfg: dict, s: S.LaunchSettings) -> dict:
 
     if s.context:
         put("--max-context", str(int(s.context)))
-    if "--engram" in args:                                   # Hy4-Flash (strata-hy4): the context is its only choice here; no KV format, no picture reader
+    if "--engram" in args:                                   # Hy4-Flash (strata-hy4): the context, and the Vision shard (on by default; `--vision off` takes `--vision <file>` out); no KV format
+        if s.vision == "off" and "--vision" in args:
+            at = args.index("--vision")
+            del args[at:at + 2]
         cfg["args"] = args
         return cfg
     kv = s.kv or ("int8" if (s.context or 32768) > 8192 else "fp16")
@@ -1219,7 +1222,7 @@ class Runner:
         ctx = s.context
         if ctx:
             args += ["--context", str(ctx)]
-        args += ["--vision", "no" if self.is_hy4() else self.vision_word()]      # Hy4-Flash reads no images yet
+        args += ["--vision", self.vision_word()]             # (Hy4-Flash: images are on by default; setup takes any word but no / none as "on")
         if s.kv and not self.is_hy4():                       # (its KV is fp16: setup says so, it asks for no setting)
             args += ["--kv", s.kv]
         if fam in ("qwen", "coder"):

@@ -1324,6 +1324,9 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
+        # Hy4-Flash (serve/hy4_kind.py): its pictures are files the engine reads and encodes itself, one `image=<path>` key each, in prompt order (spaces and % in a path as %20 and %25)
+        for p in sampling.get("strata_hy4_images") or []:
+            keys += " image=" + hy4_kind.encode_path(p)
         # #2228: the pictures' keys (hex, in prompt order): the engine matches a picture by them, not by its embeddings
         ik = sampling.get("strata_img_keys")
         if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
@@ -5057,6 +5060,14 @@ class Service:
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
+        self.embeddings.hy4 = self._drop_hy4_images(getattr(self.embeddings, "hy4", None))      # an earlier pass of this request left its files: gone first
+        if images and self.hy4:                                       # Hy4-Flash: the engine reads the pictures itself (INFO images=1); never the separate picture reader
+            if (getattr(self.engine, "info", None) or {}).get("images") != 1:
+                raise ValueError(hy4_kind.NO_IMAGES_REPLY)
+            if self.offline and any(src.startswith(("http://", "https://")) for src in images):
+                raise ValueError("offline mode cannot download an image URL; send a data: image instead")
+            self.embeddings.hy4 = hy4_kind.write_images(images, Vision.load, Vision.normalize, cancel)
+            images = []
         if images:
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
                 raise ValueError("offline mode cannot download an image URL; send a data: image instead")
@@ -5243,6 +5254,17 @@ class Service:
         path, self.embeddings.path = getattr(self.embeddings, "path", None), None
         if path is not None:
             Path(path).unlink(missing_ok=True)
+        self.embeddings.hy4 = self._drop_hy4_images(getattr(self.embeddings, "hy4", None))
+
+    @staticmethod
+    def _drop_hy4_images(paths):
+        """Delete the picture files of a Hy4-Flash request (the engine has read them by the end of the request)."""
+        for p in paths or []:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return None
 
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
@@ -5382,6 +5404,9 @@ class Service:
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
+        hy4_images = getattr(self.embeddings, "hy4", None)                 # Hy4-Flash: the picture files of this request (kept until drop_embeddings)
+        if hy4_images:
+            sampling = {**(sampling or {}), "strata_hy4_images": list(hy4_images)}
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
         # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,

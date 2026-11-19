@@ -9690,12 +9690,12 @@ def hy4_pc(gpu, ram) -> tuple:
     return float(g.get("vram_gb") or 0.0), float(ram), False
 
 
-def hy4_menu_lines(vram_gib, ram_gib, unified) -> list:
-    """One line per build for the size menu, best first, with the fit words and the recommended mark."""
-    rec = hy4_fit.recommend(vram_gib, ram_gib, unified)["build"]
+def hy4_menu_lines(vram_gib, ram_gib, unified, ctx=None, vision=hy4_family.DEFAULT_VISION) -> list:
+    """One line per build for the size menu, best first, with the fit words (at this context, with the image reader's memory when images are on) and the recommended mark."""
+    rec = hy4_fit.recommend(vram_gib, ram_gib, unified, ctx, vision)["build"]
     words = {"ram_vram_zero_ssd": "fits in memory", "near_resident_ssd": "fits, a few experts are read from the SSD", "cross_tier_ssd": "streams experts from the SSD: much slower"}
     out = []
-    for r in hy4_fit.rows(vram_gib, ram_gib, unified):
+    for r in hy4_fit.rows(vram_gib, ram_gib, unified, ctx, vision):
         out.append((r["build"], f"{r['build']:7s} {hy4_family.BUILD_ABOUT[r['build']]}; download {r['download_gb']:.0f} GB   <- {words[r['mode']]}"
                     + ("   (recommended)" if r["build"] == rec else "")))
     return out
@@ -9797,8 +9797,10 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
     vram_gib, ram_gib, unified = hy4_pc(gpu, ram)
-    lines = hy4_menu_lines(vram_gib, ram_gib, unified)
-    rec = hy4_fit.recommend(vram_gib, ram_gib, unified)
+    vision = a.vision not in ("no", "none")            # images are on by default (owner, 2026-11-19): the Vision shard is in the download set; --vision no leaves it out
+    want_ctx = a.context or hy4_family.DEFAULT_CONTEXT
+    lines = hy4_menu_lines(vram_gib, ram_gib, unified, want_ctx, vision)
+    rec = hy4_fit.recommend(vram_gib, ram_gib, unified, want_ctx, vision)
     say()
     order = [b for b, _ in lines]
     for i, (b, text) in enumerate(lines, 1):
@@ -9806,29 +9808,32 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
     if not a.model:
         say(f"  Every build also needs the Engram file ({hy4_fit.ENGRAM_GB:.0f} GB, read from the SSD while it answers, shared by all builds, downloaded once).")
     model = a.model or order[int(ask("Which size?", [str(i) for i in range(1, len(order) + 1)], str(order.index(rec["build"]) + 1), a.yes)) - 1]
-    placed = hy4_fit.place(model, vram_gib, ram_gib, unified)
-    mode = hy4_fit.mode(placed["ssd_gb"])
-    if mode == "cross_tier_ssd":
-        warn(f"{model} does not fit this PC's memory: about {placed['ssd_gb']:.0f} GB of its experts are read from the SSD while it answers, so it is much slower "
-             f"({hy4_fit.recommend(vram_gib, ram_gib, unified)['build']} fits better)")
     ok(f"size: {model}")
     tag = fam["tag"] + model
-    ctx = a.context or hy4_family.DEFAULT_CONTEXT
+    rec_ctx = hy4_fit.recommend_context(model, vram_gib, unified, want_ctx)     # 128K, or the largest the card's memory holds the cache of
+    ctx = a.context or rec_ctx
     if not a.context:
         ctxs = hy4_family.CONTEXTS
         say()
-        say("  Context length = how much text the model can see at once (its cache is small: about 15 KB per token).")
+        say(f"  Context length = how much text the model can see at once (128K by default; its cache takes about {hy4_fit.kv_extra_gb(131072) + 1.0:.0f} GB of memory at 128K).")
         for i, c in enumerate(ctxs, 1):
-            say(f"  {i}) {c // 1024}K tokens" + ("   (recommended)" if c == hy4_family.DEFAULT_CONTEXT else ""))
-        ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(hy4_family.DEFAULT_CONTEXT) + 1), a.yes)) - 1]
+            say(f"  {i}) {c // 1024}K tokens" + ("   (recommended)" if c == rec_ctx else ""))
+        ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(rec_ctx) + 1), a.yes)) - 1]
+    if not hy4_fit.context_fits(model, vram_gib, ctx, unified):
+        warn(f"{ctx // 1024}K tokens of context does not fit this card's memory next to the model's core weights ({hy4_fit.recommend_context(model, vram_gib, unified, ctx) // 1024}K does): "
+             "it may not start; choose a smaller context")
+    placed = hy4_fit.place(model, vram_gib, ram_gib, unified, ctx, vision)
+    mode = hy4_fit.mode(placed["ssd_gb"])
+    if mode == "cross_tier_ssd":
+        warn(f"{model} does not fit this PC's memory: about {placed['ssd_gb']:.0f} GB of its experts are read from the SSD while it answers, so it is much slower "
+             f"({hy4_fit.recommend(vram_gib, ram_gib, unified, ctx, vision)['build']} fits better)")
     ok(f"context: {ctx} tokens")
-    if a.vision not in (None, "no", "none"):
-        warn(f"{fam['title']} does not read images yet: images off")
+    ok("images: " + ("on (the Vision file is downloaded; the engine reads pictures once it supports them)" if vision else "off"))
     if a.rope_scaling or a.rope_scale or a.kv or a.resident_budget_gib is not None or a.low_ram not in (None, "auto"):
         warn(f"--rope-scaling / --kv / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} does not use them")
     folder = hy4_folder(a)
     own = bool(getattr(a, "gguf_dir", None))
-    files = hy4_family.files_of(model)
+    files = hy4_family.files_of(model, vision)
     left = 0.0
     for n in files:
         p = folder / n
@@ -9871,6 +9876,8 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
 
     step(7, "writing the start script")
     args = ["--native", str(paths[files[0]]), "--engram", str(engram), "--max-context", str(ctx)]
+    if vision:                                         # the Vision shard: the engine reads pictures with it once it supports them (serve leaves the option out until the engine says images=1)
+        args += ["--vision", str(paths[hy4_family.VISION_FILE])]
     if not unified:                                    # a card: the rank-cut plan (hy4_fit) as the engine's caps; one pool: the engine puts everything in it
         args += ["--vram-experts-gb", f"{placed['vram_gb']:.2f}", "--ram-experts-gb", f"{placed['ram_gb']:.2f}"]
     cfg = {"exe": engine_exe(eng), "args": args, "cwd": str(ROOT), "tokenizer": str(tokdir), "model_name": f"{fam['name']}-{model.lower()}", "arch": fam["arch"],

@@ -25,11 +25,15 @@ BY = "Strata's own quantization of Tencent's model"
 ENGRAM_SECTION4_SHA256 = "176944953bf2b601645d206171964f7fa51b77522ef5dc14ae61b0eb1c803d74"
 ENGRAM_FILE = "Hy4-Flash-Engram-Q8.strata"
 VISION_FILE = "Hy4-Flash-Vision.strata"
-DEFAULT_CONTEXT = 32768               # owner, 2026-11-19 (provisional): until 32K / 128K runs are measured
-CONTEXTS = [8192, 32768, 65536, 131072]
-#: The drafter (DFly2) the engine starts with when the person has not chosen: "off" or "dfly2".  One constant, open until the owner decides (the engine has no DFly2 yet).
-DEFAULT_DRAFTER = "off"
+DEFAULT_CONTEXT = hy4_fit.DEFAULT_CONTEXT       # owner, 2026-11-19: 128K by default, everywhere (setup, launch, the catalog, the app)
+CONTEXTS = hy4_fit.CONTEXTS
+#: The drafter (DFly2) the engine starts with when the person has not chosen: "off" or "dfly2".  Owner, 2026-11-19: on by default, "as it is natively built in".  The engine says
+#: whether it has one (`strata-hy4 --info`: drafter=dfly2); an engine that does not starts without it, with one log line (serve/hy4_kind.py), never a failed start.
+DEFAULT_DRAFTER = "dfly2"
 DRAFTERS = ("off", "dfly2")
+#: Images are on by default (owner, 2026-11-19): the Vision shard is in the default download set and its path is in the engine's arguments.  The engine says whether it reads
+#: images (`--info`: images=1, and INFO images=1 at start); until it does, serve drops the option with one log line and answers an image request with a plain message.
+DEFAULT_VISION = True
 
 #: file name -> (bytes, sha256 or None)
 FILES = {
@@ -52,8 +56,8 @@ def build_file(build: str) -> str:
     return hy4_fit.BUILDS[build]["file"]
 
 
-def files_of(build: str, vision: bool = False, engram_present: bool = False) -> list[str]:
-    """The files one choice needs, in download order: the build, the Engram shard (unless it is there), the Vision shard when wanted."""
+def files_of(build: str, vision: bool = DEFAULT_VISION, engram_present: bool = False) -> list[str]:
+    """The files one choice needs, in download order: the build, the Engram shard (unless it is there), the Vision shard (on by default; `vision=False` leaves it out)."""
     out = [build_file(build)]
     if not engram_present:
         out.append(ENGRAM_FILE)

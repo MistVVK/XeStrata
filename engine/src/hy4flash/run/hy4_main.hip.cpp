@@ -53,7 +53,8 @@ static int print_info(const std::string& file) {
     }
     Manifest m;
     parse_manifest(rd.manifest_json(), m, false);
-    printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos);
+    // what this program CAN do (serve starts without what it cannot): drafter=none|dfly2 (the 5-layer DFly2 drafter in Section 1), images=0|1 (the Vision shard's SigLIP2 reader)
+    printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d drafter=none images=0\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos);
     return 0;
 }
 

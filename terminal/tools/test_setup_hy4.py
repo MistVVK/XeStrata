@@ -194,6 +194,75 @@ class Fetch(unittest.TestCase):
         self.assertTrue(any("size only" in str(c) for c in warn.call_args_list))
 
 
+class Defaults0218(unittest.TestCase):
+    """The owner's 0.2.18 defaults (2026-11-19): 128K context, the drafter on, images on (the Vision shard is in the default download set)."""
+
+    def test_the_constants(self):
+        self.assertEqual(hy4_family.DEFAULT_CONTEXT, 131072)
+        self.assertEqual(hy4_family.DEFAULT_DRAFTER, "dfly2")
+        self.assertTrue(hy4_family.DEFAULT_VISION)
+        self.assertEqual(hy4_family.files_of("SQ-64"), ["Hy4-Flash-SQ-64.strata", hy4_family.ENGRAM_FILE, hy4_family.VISION_FILE])
+        self.assertEqual(hy4_family.files_of("SQ-64", vision=False), ["Hy4-Flash-SQ-64.strata", hy4_family.ENGRAM_FILE])
+
+    def install(self, vram=12.0, **over):
+        """install_hy4_flash with the heavy steps stubbed, small stand-in files in the model folder: returns (the config setup wrote, the lines it said)."""
+        import argparse
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        names = ("Hy4-Flash-SQ-64.strata", hy4_family.ENGRAM_FILE, hy4_family.VISION_FILE)
+        table, data = tiny_files(names)
+        folder = root / "models" / "hy4-flash"
+        folder.mkdir(parents=True)
+        for n in names:
+            (folder / n).write_bytes(data[n])
+            setup.mark(folder / n)
+        a = argparse.Namespace(model="SQ-64", context=None, vision=None, rope_scaling=None, rope_scale=None, kv=None, resident_budget_gib=None, low_ram=None, gguf_dir=None,
+                               models_dir=str(root / "models"), gpu=None, host=None, api_key=None, browser=None, no_start=True, yes=True, feed=None, data_dir=None)
+        for k, v in over.items():
+            setattr(a, k, v)
+        written, lines = {}, []
+        gpu = {"vram_gb": vram, "count": 1, "index": 0, "name": "RTX"}
+        with mock.patch.object(hy4_family, "FILES", table), mock.patch.object(setup, "home", return_value=root), mock.patch.object(setup, "pip_install"), \
+                mock.patch.object(setup, "runtime_packages", return_value=[]), mock.patch.object(setup, "step"), mock.patch.object(setup, "ok", lambda m: lines.append(str(m))), \
+                mock.patch.object(setup, "say", lambda m="": lines.append(str(m))), mock.patch.object(setup, "warn", lambda m: lines.append("WARN " + str(m))), \
+                mock.patch.object(setup, "engine_step", return_value=(None, root / "engine", {"component": "missing"}, [], gpu, "none")), \
+                mock.patch.object(setup, "data_folder_for", return_value=(root / "data", None)), mock.patch.object(setup, "hy4_tokenizer_dir", return_value=root / "tok"), \
+                mock.patch.object(setup, "write_setup_config", lambda path, cfg, *x, **k: written.update(cfg)), mock.patch.object(setup, "write_run_script", return_value=Path("run.cmd")), \
+                mock.patch.object(setup, "explicit_args", return_value=[]), mock.patch.object(setup, "pip_cuda_libs", create=True):
+            setup.install_hy4_flash(a, "hy4-flash", gpu, False, False, None, False, 8095, 64.0, None)
+        return written, lines, root
+
+    def test_the_default_install_is_128k_with_the_drafter_and_the_pictures(self):
+        cfg, lines, root = self.install()
+        args = cfg["args"]
+        self.assertEqual(args[args.index("--max-context") + 1], "131072")
+        self.assertEqual(Path(args[args.index("--vision") + 1]).name, hy4_family.VISION_FILE)
+        self.assertEqual(cfg["drafting"], "dfly2")
+        self.assertEqual(cfg["arch"], "hy4flash")
+        self.assertEqual(cfg["exe"], "component:strata-hy4")
+        self.assertEqual(args[args.index("--vram-experts-gb") + 1], "1.25")               # the 128K cache takes the card's room: 12 GiB, SQ-64
+        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "54.79")
+        self.assertTrue(any(l.startswith("images: on") for l in lines), lines)
+
+    def test_vision_no_leaves_the_shard_and_the_option_out(self):
+        cfg, lines, _ = self.install(vision="no")
+        self.assertNotIn("--vision", cfg["args"])
+        self.assertTrue(any(l.startswith("images: off") for l in lines), lines)
+
+    def test_an_8_gib_card_is_offered_the_context_it_holds(self):
+        cfg, lines, _ = self.install(vram=8.0)                                            # no --context: the largest the card holds the cache of (never forced up to 128K)
+        self.assertEqual(cfg["args"][cfg["args"].index("--max-context") + 1], "32768")
+        self.assertFalse(any("does not fit this card" in l for l in lines))
+
+    def test_a_context_that_does_not_fit_the_card_is_said_and_kept(self):
+        cfg, lines, _ = self.install(vram=8.0, context=131072)                           # the person asked for 128K on an 8 GiB card: recommend, never force
+        self.assertEqual(cfg["args"][cfg["args"].index("--max-context") + 1], "131072")
+        self.assertTrue(any("does not fit this card" in l and "32K does" in l for l in lines), lines)
+        cfg, lines, _ = self.install(context=131072)                                      # a 12 GiB card holds it: no warning
+        self.assertFalse(any("does not fit this card" in l for l in lines))
+
+
 class Catalog(unittest.TestCase):
     def setUp(self):
         self.show = mock.patch.dict(os.environ, {"STRATA_HY4_SHOW": "1"})
@@ -214,19 +283,19 @@ class Catalog(unittest.TestCase):
         by = self.rows({"ram_gb": 64.0, "gpus": [{"index": 0, "name": "x", "vram_gb": 12.0, "usable": True, "vendor": "nvidia"}]})
         self.assertEqual(list(by), ["SQ-32", "SQ-64", "SQ-96", "SQ-128"])
         self.assertEqual(by["SQ-64"]["id"], "hy4-flash-sq-64")                      # the tag the install writes its config under
-        self.assertEqual(by["SQ-64"]["download_gb"], round(62.03 + 67.58, 1))
+        self.assertEqual(by["SQ-64"]["download_gb"], round(62.03 + 67.58 + 0.934, 1))                      # the build, the Engram shard and the Vision shard (images are on by default)
+        self.assertTrue(by["SQ-64"]["images"])
         self.assertEqual({k: by[k]["on_this_pc"] for k in by}, {"SQ-32": "fits", "SQ-64": "fits", "SQ-96": "may run slower", "SQ-128": "may run slower"})
         self.assertEqual([k for k in by if by[k]["hy4"]["recommended"]], ["SQ-64"])
-        self.assertEqual(by["SQ-64"]["hy4"]["placement"], {"vram_gb": 5.08, "ram_gb": 50.96, "ssd_gb": 0.0})
-        self.assertFalse(by["SQ-64"]["images"])
+        self.assertEqual(by["SQ-64"]["hy4"]["placement"], {"vram_gb": 1.25, "ram_gb": 54.79, "ssd_gb": 0.0})            # at the 128K default context the KV takes 3.8 GB of the card more than the author's 20K
         self.assertIsNone(by["SQ-64"]["gpu_options"])
 
     def test_unified_memory(self):
         gpu = {"index": 0, "name": "Radeon 8060S", "vram_gb": 115.8, "dedicated_gb": 0.0, "usable": True, "uma": True, "vendor": "amd"}
         by = self.rows({"ram_gb": 128.0, "gpus": [gpu]})
         self.assertEqual([k for k in by if by[k]["hy4"]["recommended"]], ["SQ-96"])
-        self.assertEqual(by["SQ-128"]["hy4"]["mode"], "near_resident_ssd")          # 4 GB of 113 from the SSD: not recommended (not all in memory), still "fits"
-        self.assertEqual(by["SQ-128"]["on_this_pc"], "fits")
+        self.assertEqual(by["SQ-128"]["hy4"]["mode"], "cross_tier_ssd")          # 8 GB of 113 from the SSD with the 128K cache and the image reader budgeted
+        self.assertEqual(by["SQ-128"]["on_this_pc"], "may run slower")
 
     def test_no_ram_figure_gives_no_verdict(self):
         by = self.rows({"gpus": []})
@@ -239,6 +308,9 @@ class Catalog(unittest.TestCase):
         self.assertEqual([Path(f["path"]).name for f in files], ["Hy4-Flash-SQ-64.strata", hy4_family.ENGRAM_FILE])
         self.assertEqual([f["bytes"] for f in files], [62_030_467_072, 67_584_905_216])
         self.assertTrue(all(Path(f["path"]).parent.name == "hy4-flash" for f in files))
+        files = M.expected_files(S, "hy4-flash", "SQ-64", Path("/m"), True)                       # images on (the default): the Vision shard too
+        self.assertEqual([Path(f["path"]).name for f in files], ["Hy4-Flash-SQ-64.strata", hy4_family.ENGRAM_FILE, hy4_family.VISION_FILE])
+        self.assertEqual(files[2]["bytes"], 934_092_800)
 
 
 if __name__ == "__main__":

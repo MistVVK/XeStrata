@@ -274,7 +274,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
     std::string base = o.model;
     size_t sl = base.find_last_of("/\\");
     if (sl != std::string::npos) base = base.substr(sl + 1);
-    proto("INFO engine=hy4-serve-0 arch=hy4flash backend=hip model=%s layers=%d vocab=%d chunk=%d session_reuse=%d drafter=%s", base.c_str(), r.c.n_layers, V, r.Tc,
+    proto("INFO engine=hy4-serve-0 arch=hy4flash backend=hip model=%s layers=%d vocab=%d chunk=%d session_reuse=%d drafter=%s images=0", base.c_str(), r.c.n_layers, V, r.Tc,
           o.session_reuse ? 1 : 0, o.draft.c_str());
     proto("READY %d stop", max_ctx);
 

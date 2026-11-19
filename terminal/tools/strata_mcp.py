@@ -634,7 +634,7 @@ class Strata:
                       "vision": bool(d.get("vision", True)), "own_path": True, **({"feed": True} if d.get("feed") else {})}
         if self.hy4_visible():                          # Tencent Hy4-Flash (setup.py HY4_FAMILIES): its own engine program; listed once there is a source or the files are here
             for f, d in (getattr(s, "HY4_FAMILIES", None) or {}).items():
-                out[f] = {"title": d["title"], "about": d.get("about"), "tag": d["tag"], "license": d.get("license"), "vision": False, "own_path": True, "hy4": True}
+                out[f] = {"title": d["title"], "about": d.get("about"), "tag": d["tag"], "license": d.get("license"), "vision": True, "own_path": True, "hy4": True}
         return out
 
     def hy4_visible(self) -> bool:
@@ -657,7 +657,7 @@ class Strata:
                 names.extend(n for n in fam.get("models", {}) if n not in names)
         return names
 
-    def hy4_fit_row(self, build, ram, usable) -> dict | None:
+    def hy4_fit_row(self, build, ram, usable, vision: bool = True) -> dict | None:
         """Where Hy4-Flash `build`'s experts go on this PC (hy4_fit.place) and whether it is the recommended build; None when the RAM is not known."""
         if ram is None:
             return None
@@ -667,9 +667,9 @@ class Strata:
             vram_gib, ram_gib, unified = None, float(uma.get("vram_gb") or ram) / hy4_fit.GIB_TO_GB, True
         else:
             vram_gib, ram_gib, unified = max((float(g["vram_gb"]) for g in usable), default=0.0), float(ram), False
-        placed = hy4_fit.place(build, vram_gib, ram_gib, unified)
-        return {"placement": placed, "mode": hy4_fit.mode(placed["ssd_gb"]), "recommended": hy4_fit.recommend(vram_gib, ram_gib, unified)["build"] == build,
-                "unified": unified, "engram_gb": hy4_fit.ENGRAM_GB}
+        placed = hy4_fit.place(build, vram_gib, ram_gib, unified, None, vision)
+        return {"placement": placed, "mode": hy4_fit.mode(placed["ssd_gb"]), "recommended": hy4_fit.recommend(vram_gib, ram_gib, unified, None, vision)["build"] == build,
+                "unified": unified, "engram_gb": hy4_fit.ENGRAM_GB, "context": hy4_fit.recommend_context(build, vram_gib, unified), "kv_gb": round(hy4_fit.kv_extra_gb(), 2)}
 
     def hy4_size(self, family, model) -> dict | None:
         """One build of Hy4-Flash as a model-table row: the download is the build plus the Engram shard every build shares; the memory figures are the author's (hy4_fit)."""
@@ -678,8 +678,8 @@ class Strata:
             return None
         from strata_control import hy4_fit
         b = hy4_fit.BUILDS[model]
-        return {"about": d["models"][model]["about"], "download_gb": round(b["file_gb"] + hy4_fit.ENGRAM_GB, 1), "ram_gb": d["models"][model]["ram_gb"],
-                "arena_gb": b["bodies_gb"], "vision": False, "engine": None, "families": (family,), "context_fit": None, "hy4": True,
+        return {"about": d["models"][model]["about"], "download_gb": round(b["file_gb"] + hy4_fit.ENGRAM_GB + hy4_fit.VISION_GB, 1), "ram_gb": d["models"][model]["ram_gb"],
+                "arena_gb": b["bodies_gb"], "vision": True, "engine": None, "families": (family,), "context_fit": None, "hy4": True,
                 "footprint_gb": b["footprint_gb"], "engram_gb": hy4_fit.ENGRAM_GB}
 
     def own_size(self, family, model) -> dict | None:
@@ -1639,7 +1639,7 @@ def expected_files(S, family: str, model: str, models_dir: Path, vision: bool) -
         if family in (getattr(S, "HY4_FAMILIES", None) or {}):          # Hy4-Flash: the build and the Engram shard every build shares, in one folder
             from strata_control import hy4_family
             folder = Path(models_dir) / hy4_family.FAMILY
-            for name in hy4_family.files_of(model):
+            for name in hy4_family.files_of(model, bool(vision)):
                 out.append({"path": str(folder / name), "bytes": hy4_family.size_of(name), "role": "model"})
             return out
         own = (getattr(S, "OWN_PATH_FAMILIES", None) or {}).get(family)

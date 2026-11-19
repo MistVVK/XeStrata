@@ -54,7 +54,7 @@ class Steps(unittest.TestCase):
         r.installed_card_args = lambda: []
         args = r.setup_args()
         self.assertEqual(args[args.index("--family") + 1], "hy4-flash")
-        self.assertEqual(args[args.index("--vision") + 1], "no")
+        self.assertNotIn(args[args.index("--vision") + 1], ("no", "none"))        # images are on by default (owner, 2026-11-19): setup downloads the Vision shard
         for flag in ("--kv", "--mtp", "--drafter", "--draft-vocab"):
             self.assertNotIn(flag, args)
 
@@ -67,6 +67,14 @@ class Config(unittest.TestCase):
         self.assertNotIn("--kv", out["args"])
         self.assertNotIn("--vision", out["args"])
         self.assertEqual(BASE["args"][-1], "32768")                          # the input is not touched
+
+    def test_vision_off_takes_the_vision_file_out_of_the_command(self):
+        cfg = {**BASE, "args": BASE["args"] + ["--vision", "C:/m/Hy4-Flash-Vision.strata"]}
+        on = R.apply_choices(cfg, S.LaunchSettings(family="hy4-flash", vision="on"))
+        self.assertIn("--vision", on["args"])
+        off = R.apply_choices(cfg, S.LaunchSettings(family="hy4-flash", vision="off"))
+        self.assertNotIn("--vision", off["args"])
+        self.assertNotIn("C:/m/Hy4-Flash-Vision.strata", off["args"])
 
     def test_missing_strata_files_are_named(self):
         cfg = {"args": ["--native", "C:/does/not/exist/a.strata", "--engram", "C:/does/not/exist/e.strata", "--max-context", "4096"]}

@@ -20,7 +20,7 @@ const size = (build, mode, extra = {}) => ({ id: `hy4-flash-${build.toLowerCase(
   hy4: { placement: { vram_gb: 5.08, ram_gb: 50.96, ssd_gb: 0 }, mode, recommended: false, unified: false, engram_gb: 67.58 }, ...extra });
 const FAMILIES = [
   { family: 'qwen', title: 'Qwen3.8-Flash-Next', images: true, sizes: [{ id: 'iq3_s', model: 'IQ3_S' }] },
-  { family: 'hy4-flash', title: 'Tencent Hy4-Flash 220B-A12B', about: 'x', images: false, sizes: [size('SQ-64', 'ram_vram_zero_ssd'), size('SQ-128', 'cross_tier_ssd')] },
+  { family: 'hy4-flash', title: 'Tencent Hy4-Flash 220B-A12B', about: 'x', images: true, sizes: [size('SQ-64', 'ram_vram_zero_ssd'), size('SQ-128', 'cross_tier_ssd')] },
 ];
 
 test('the run config says it is Hy4-Flash by its arch or its program', () => {
@@ -33,13 +33,13 @@ test('the run config says it is Hy4-Flash by its arch or its program', () => {
   assert.equal(isHy4Family('qwen'), false);
 });
 
-test('the catalog lists Hy4-Flash as a group of its own, with no KV choice and no pictures', () => {
+test('the catalog lists Hy4-Flash as a group of its own, with no KV choice and pictures on', () => {
   const groups = catalog.nativeCatalogModels(FAMILIES);
   const hy4 = groups.find(g => g.family === 'hy4-flash');
   assert.ok(hy4, 'the group exists (a family nobody whitelisted used to be dropped)');
   assert.deepEqual(hy4.sizes.map(s => s.model), ['SQ-64', 'SQ-128']);
   assert.equal(hy4.sizes[0].sourceFamily, 'hy4-flash');
-  assert.equal(hy4.images, false);
+  assert.equal(hy4.images, true, 'images are on by default (owner, 2026-11-19)');
   assert.equal(catalog.hasKvChoice('hy4-flash'), false);
   assert.equal(catalog.hasKvChoice('qwen3.8'), true, 'the Qwen3.8 group keeps its select');
   assert.equal(groups.find(g => g.family === 'qwen3.8').sizes.length, 1, 'the Qwen group is unchanged');

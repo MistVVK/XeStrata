@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -168,11 +169,44 @@ class Kind(unittest.TestCase):
         self.assertFalse(hy4_kind.is_hy4({"exe": "component:strata-engine", "arch": "qwen4exp"}))
         self.assertFalse(hy4_kind.is_hy4(None))
 
-    def test_args_are_the_configs_own(self):
-        cfg = {"arch": "hy4flash", "args": ["--native", "m.strata", "--engram", "e.strata", "--max-context", "32768"]}
-        self.assertEqual(hy4_kind.engine_args(cfg), cfg["args"])
-        self.assertEqual(hy4_kind.engine_args({**cfg, "drafting": "dfly2"}), cfg["args"] + ["--draft", "dfly2"])
-        self.assertEqual(hy4_kind.engine_args({**cfg, "drafting": "off"}), cfg["args"])
+    BASE = ["--native", "m.strata", "--engram", "e.strata", "--max-context", "131072"]
+
+    def test_args_are_the_configs_own_when_the_engine_has_neither(self):
+        cfg = {"arch": "hy4flash", "args": self.BASE}
+        with mock.patch.object(hy4_kind, "probe", return_value=None):
+            self.assertEqual(hy4_kind.engine_args(cfg, "x", announce=False), self.BASE)             # drafter asked (the default), the engine cannot say it has one
+        with mock.patch.object(hy4_kind, "probe", return_value={"arch": "hy4flash", "drafter": "none", "images": "0"}):
+            self.assertEqual(hy4_kind.engine_args({**cfg, "args": self.BASE + ["--vision", "v.strata"]}, "x", announce=False), self.BASE)   # no image reader: --vision <file> left out
+
+    def test_the_drafter_and_the_pictures_are_on_by_default_where_the_engine_has_them(self):
+        cfg = {"arch": "hy4flash", "args": self.BASE + ["--vision", "v.strata"]}
+        have = {"arch": "hy4flash", "drafter": "dfly2", "images": "1"}
+        with mock.patch.object(hy4_kind, "probe", return_value=have):
+            self.assertEqual(hy4_kind.engine_args(cfg, "x", announce=False), self.BASE + ["--vision", "v.strata", "--draft", "dfly2"])
+            self.assertEqual(hy4_kind.engine_args({**cfg, "drafting": "off"}, "x", announce=False), self.BASE + ["--vision", "v.strata"])
+            for word in ("auto", "mtp", "dflash2", "dfly2"):                                          # Qwen's words mean "the default" here
+                self.assertIn("--draft", hy4_kind.engine_args({**cfg, "drafting": word}, "x", announce=False), word)
+            kept = {**cfg, "args": cfg["args"] + ["--draft", "dfly2"]}
+            self.assertEqual(hy4_kind.engine_args(kept, "x", announce=False).count("--draft"), 1)
+
+    def test_one_line_says_what_was_left_out(self):
+        cfg = {"arch": "hy4flash", "args": self.BASE + ["--vision", "v.strata"]}
+        with mock.patch.object(hy4_kind, "probe", return_value=None), mock.patch("builtins.print") as say:
+            hy4_kind.engine_args(cfg, "x")
+        said = " ".join(str(c.args[0]) for c in say.call_args_list)
+        self.assertEqual(said.count(hy4_kind.NO_DRAFTER_NOTE), 1)
+        self.assertEqual(said.count(hy4_kind.NO_IMAGES_NOTE), 1)
+
+    def test_info_line_and_paths(self):
+        self.assertEqual(hy4_kind.parse_info("noise\narch=hy4flash layers=42 drafter=dfly2 images=1\n"), {"arch": "hy4flash", "layers": "42", "drafter": "dfly2", "images": "1"})
+        self.assertEqual(hy4_kind.parse_info("usage: strata-hy4"), {})
+        p = "C:/Users/A B/100%/x.png"
+        self.assertEqual(hy4_kind.decode_path(hy4_kind.encode_path(p)), p)
+        self.assertNotIn(" ", hy4_kind.encode_path(p))
+
+    def test_the_probe_says_none_for_a_program_that_cannot_answer(self):
+        self.assertIsNone(hy4_kind.probe("does-not-exist", ["--native", "m.strata"]))
+        self.assertIsNone(hy4_kind.probe(None, ["--native", "m.strata"]))
 
 
 if __name__ == "__main__":
