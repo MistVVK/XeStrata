@@ -6364,11 +6364,21 @@ def toolkit_change_undefs(bdir: Path, defs) -> list:
     return [f"-U{g}" for g in CUDA_CACHE_GLOBS]
 
 
+def forward_slash_defs(defs, win: bool | None = None) -> list:
+    """#5694: the -D definitions of a CMake configure with Windows paths written with forward slashes.  CMake writes a CUDA compiler path it
+    was given as it is into CMakeFiles/<version>/CMakeCUDACompiler.cmake, so `-DCMAKE_CUDA_COMPILER=C:\\Program Files\\...\\nvcc.exe` made
+    CMake 3.26 stop with 'Invalid character escape \\P' (CMAKE_MAKE_PROGRAM, CUDAToolkit_ROOT and STRATA_GGML_DIR kept their back-slashes
+    in the cache the same way).  Windows takes forward slashes everywhere; other systems are left as they are."""
+    win = WIN if win is None else win
+    return [d.replace("\\", "/") if win and isinstance(d, str) and d.startswith("-D") else d for d in defs]
+
+
 def cmake_build(src, bdir, target, defs, vcvars, bat_name):
     acquisition.require("a compile (cmake)")
     cmake, ninja = ensure_build_tools()
     fresh_if_other_generator(bdir)
-    conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
+    defs = forward_slash_defs(defs)
+    conf = [cmake, "-G", "Ninja", *forward_slash_defs([f"-DCMAKE_MAKE_PROGRAM={ninja}"]), "-S", str(src), "-B", str(bdir),
             *toolkit_change_undefs(bdir, defs), "-DCMAKE_BUILD_TYPE=Release", *defs]
     build = [cmake, "--build", str(bdir), "--target", target, "-j", str(max(2, (os.cpu_count() or 4) // 2))]
     # A failed build is tried once more: CUDA 13.0's ptxas now and then fails to parse a PTX file it just wrote, and
