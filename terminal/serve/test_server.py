@@ -7510,3 +7510,62 @@ class ContentShape(unittest.TestCase):
                 status, b = self.post("/v1/messages", {"model": "x", "max_tokens": 8, "system": system,
                                                        "messages": [{"role": "user", "content": "hi"}]})
                 self.assertEqual(status, 200, b)
+
+
+class ChatTemplateKwargsShape(unittest.TestCase):
+    """chat_template_kwargs is the vLLM / llama.cpp object convention. A truthy non-object value ("x", 5, [1])
+    used to raise AttributeError ('str'/'int' object has no attribute 'items') in openai_to_messages, caught only
+    by the generic malformed-request handler: a 400 naming the exception type, with a traceback in the log. As with
+    messages (#460) and tools (#592), a wrong-typed field is a 400 naming the field, before anything is sent."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = MockEngine(tok, "ok", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, body):
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_non_object_chat_template_kwargs_is_a_400_naming_the_field(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        for bad in ("x", 5, 5.5, True, [1], ["enable_thinking"]):
+            with self.subTest(chat_template_kwargs=bad):
+                status, b = self.post({"model": "x", "max_tokens": 8, "messages": msgs, "chat_template_kwargs": bad})
+                self.assertEqual(status, 400, b)
+                self.assertIn("chat_template_kwargs", b["error"]["message"])
+                self.assertNotIn("AttributeError", b["error"]["message"])
+        status, b = self.post({"model": "x", "max_tokens": 8, "messages": msgs})
+        self.assertEqual(status, 200, b)                            # the server goes on
+
+    def test_object_and_absent_chat_template_kwargs_still_work(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        for ctk in (None, {}, {"enable_thinking": False}, {"reasoning_effort": "low"}):
+            with self.subTest(chat_template_kwargs=ctk):
+                body = {"model": "x", "max_tokens": 8, "messages": msgs}
+                if ctk is not None:
+                    body["chat_template_kwargs"] = ctk
+                status, b = self.post(body)
+                self.assertEqual(status, 200, b)
+
+    def test_falsy_non_object_values_are_ignored_as_before(self):
+        # the `or {}` already skipped falsy values; that leniency is unchanged (only truthy non-objects crashed)
+        msgs = [{"role": "user", "content": "hi"}]
+        for ctk in ([], "", 0, False):
+            with self.subTest(chat_template_kwargs=ctk):
+                status, b = self.post({"model": "x", "max_tokens": 8, "messages": msgs, "chat_template_kwargs": ctk})
+                self.assertEqual(status, 200, b)

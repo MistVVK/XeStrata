@@ -636,7 +636,12 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     # `false` is a level (thinking off, effort_kwargs): an `or` between the two fields dropped it
     kwargs.update(effort_kwargs(given if given is not None and given != "" else reasoning.get("effort")))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
-    for k, v in (req.get("chat_template_kwargs") or {}).items():
+    # A truthy non-object ("x", 5, [1]) has no .items(): name the field as a 400, as messages (#460) and tools (#592)
+    # do, instead of an AttributeError caught by the generic malformed-request handler. Falsy values stay ignored.
+    ctk = req.get("chat_template_kwargs") or {}
+    if not isinstance(ctk, dict):
+        raise ValueError("chat_template_kwargs must be an object")
+    for k, v in ctk.items():
         if k == "enable_thinking" and not v:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
