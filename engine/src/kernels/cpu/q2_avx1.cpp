@@ -58,7 +58,7 @@ inline float h2f(uint16_t h) {
 // h2f.  The bit-plane rows convert two scales per 128 values, so the branches h2f takes per call were ~10% of a row.
 inline float h2f_scale(uint16_t h) {
     const uint32_t e = h & 0x7C00u;
-    if (__builtin_expect(e == 0 || e == 0x7C00u, 0)) return h2f(h);
+    if (e == 0 || e == 0x7C00u) return h2f(h);   // (the rare branch; no __builtin_expect: MSVC has none, and the compiler lays the common case out first anyway)
     const uint32_t f = ((uint32_t) (h & 0x8000u) << 16) | (((uint32_t) (h & 0x7FFFu) << 13) + 0x38000000u);
     float out;
     std::memcpy(&out, &f, 4);
