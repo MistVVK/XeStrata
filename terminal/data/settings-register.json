@@ -20103,6 +20103,36 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_MMQ_TIER_SORT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/prefill/mmq_resident_sort.hpp",
+     "line": 43,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/NVIDIA_V100.md"
+   ],
+   "status": "research",
+   "owner": "prefill",
+   "note": "GPUOS-inspired readiness-tier + row-count prompt expert sorting across staged and layer-major prefill walks plus NVLink P2P p2p_stage / peer wmma_l; off unless set",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_MMQ_WS",
    "backends": [
     "cuda-hip"

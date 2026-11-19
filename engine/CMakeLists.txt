@@ -522,6 +522,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(fused_tq_hip_test PRIVATE include)
   add_test(NAME fused_tq_hip_test COMMAND fused_tq_hip_test)
 
+  # GPUOS readiness-tier and row-count MMQ expert sorting (src/prefill/mmq_resident_sort.hpp): header-only, no GPU
+  add_executable(mmq_resident_sort_test tests/prefill/mmq_resident_sort_test.cpp)
+  target_include_directories(mmq_resident_sort_test PRIVATE include)
+  add_test(NAME mmq_resident_sort_test COMMAND mmq_resident_sort_test)
+
   # STRATA_SELECT_TWO_PASS: the bound between the single-pass and 3xTF32 QSA block scores and the cut-off rule that
   # keeps the selection (header-only, no GPU)
   add_executable(qsa_two_pass_test tests/prefill/qsa_two_pass_test.cpp)

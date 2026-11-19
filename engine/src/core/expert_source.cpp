@@ -5338,7 +5338,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int tail_rank = tail_skip_rank();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
+        if (tail_rank > 0 && d.remote_count == 0) {
             int minr[kMaxWindowEntries];
             for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
@@ -5349,7 +5349,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];
                 if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
-                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
+                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0 ||
+                    (d.peer != nullptr && d.peer->has(d.layers, e))) continue;   // resident
                 skip_d[q] = true;
                 --nmiss;
                 ++d.tail_experts;
@@ -5508,6 +5509,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (ids[i] >= 0 && ids[i] < d.n_expert) d.fetch_mark[(size_t) ids[i]] = 0;
         }
         P.start2[fetches] = entries;
+        const bool peer_p2p_hit = d.peer != nullptr && d.peer->p2p() && P.hit_out_dev != nullptr && d.peer->direct_mode();
+        if (peer_p2p_hit) {
+            for (int64_t i = 0; i < n; ++i)
+                if (kind[i] == 2) P.dst[entries++] = (int32_t) i;
+        }
         P.counts[0] = groups;
         P.counts[1] = entries;
         P.counts[2] = fetches;
@@ -5526,7 +5532,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     if (d.peer != nullptr) {                 // multi-GPU: start the second GPU's share before the CPU's own work
         std::string perr;
-        if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out)) {
+        float* peer_out = (d.plan != nullptr && d.peer->p2p() && d.plan->hit_out_dev != nullptr && d.peer->direct_mode())
+                              ? d.plan->hit_out_dev
+                              : out;
+        if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, peer_out)) {
             std::fprintf(stderr, "strata: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
             d.failed = true;
             d.fail = "the peer GPU's experts could not be launched";

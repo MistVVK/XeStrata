@@ -3985,6 +3985,10 @@ void Verifier::set_plan_slot(int grp) {
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
+    const int tb = G == 2 && grp == 1 ? (last_t_ + 1) / 2 : 0;
+    sink_.hit_out_dev = (hit_out_ != nullptr && ss_ != nullptr && g_ != nullptr)
+                            ? hit_out_ + (size_t) tb * ss_->k * g_->n_embd
+                            : nullptr;
 }
 
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.

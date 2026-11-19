@@ -12691,14 +12691,46 @@ int main(int argc, char** argv) {
                                          : strata::kernels::kVerifyNarrowT;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
-            for (float*& h : hand) {
-                float* hh = nullptr;
-                if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
-                    std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
-                    return 1;
+            for (size_t si = 0; si < hand.size(); ++si) {
+                float*& h = hand[si];
+                const int dev_from = si == 0 ? strata::core::primary_device() : stages[si - 1]->dev;
+                const int dev_to = split_same ? dev_from : stages[si]->dev;
+                bool p2p_allocated = false;
+                if (!split_same && dev_from != dev_to) {
+                    int can01 = 0, can10 = 0;
+                    if (cudaDeviceCanAccessPeer(&can01, dev_from, dev_to) == cudaSuccess &&
+                        cudaDeviceCanAccessPeer(&can10, dev_to, dev_from) == cudaSuccess && can01 && can10) {
+                        cudaError_t e0 = cudaSuccess, e1 = cudaSuccess;
+                        {
+                            const strata::core::OnDevice on0(dev_from);
+                            e0 = cudaDeviceEnablePeerAccess(dev_to, 0);
+                            if (e0 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e0 = cudaSuccess; }
+                        }
+                        {
+                            const strata::core::OnDevice on1(dev_to);
+                            e1 = cudaDeviceEnablePeerAccess(dev_from, 0);
+                            if (e1 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e1 = cudaSuccess; }
+                        }
+                        if (e0 == cudaSuccess && e1 == cudaSuccess) {
+                            const strata::core::OnDevice on_dst(dev_to);
+                            if (cudaMalloc((void**) &h, hb) == cudaSuccess && cudaMemset(h, 0, hb) == cudaSuccess) {
+                                p2p_allocated = true;
+                            } else {
+                                cudaGetLastError();
+                                if (h != nullptr) { cudaFree(h); h = nullptr; }
+                            }
+                        }
+                    }
                 }
-                std::memset(hh, 0, hb);
+                if (!p2p_allocated) {
+                    float* hh = nullptr;
+                    if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                        cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
+                        return 1;
+                    }
+                    std::memset(hh, 0, hb);
+                }
             }
             // STRATA_SPLIT_OVERLAP=1 (opt-in; measured on 2x RX 7900 XTX only): a ready word per hand-off, raised by the
             // writing stage's GPU, so the next stage's window is launched early and the host never syncs between
