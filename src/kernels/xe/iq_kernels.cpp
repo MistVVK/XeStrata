@@ -2750,6 +2750,98 @@ void bih3_gather_group(sycl::queue& q, Bih3R1q2Layer L, const unsigned long long
 }
 }  // namespace
 
+// Direct row product for the small-device fallback. The expert's K and the blob address are device-side routing data.
+inline float bih3_grouped_row(Bih3R1q2Layer L, const uint8_t* blob, int expert, int matrix, int row,
+                              const block_q8_1* x) {
+    const int gk = L.k_pairs[(size_t) 2 * expert], dk = L.k_pairs[(size_t) 2 * expert + 1];
+    const int width = matrix == 2 ? L.n_ff : L.n_embd, rows = matrix == 2 ? L.n_embd : L.n_ff;
+    const int k = matrix == 2 ? dk : gk, nb = width / 128, qbytes = (nb + 3) / 4;
+    const size_t grow = (size_t) (L.n_embd / 128) * 4 * (size_t) gk;
+    const size_t drow = (size_t) (L.n_ff / 128) * 4 * (size_t) dk;
+    const size_t up = grow * (size_t) L.n_ff, dn = 2 * up;
+    const size_t scale_off = (dn + drow * (size_t) L.n_embd + 15) & ~(size_t) 15;
+    const size_t gu_scale = (size_t) L.n_ff * 2 + (size_t) (L.n_embd / 128) * 2 +
+                            (size_t) L.n_ff * (size_t) ((L.n_embd / 128 + 3) / 4);
+    const uint8_t* bases = blob + scale_off + (size_t) matrix * gu_scale;
+    const uint8_t* cols = bases + (size_t) rows * 2;
+    const uint8_t* qs = cols + (size_t) nb * 2 + (size_t) row * qbytes;
+    const uint8_t* codes = blob + (matrix == 1 ? up : matrix == 2 ? dn : 0) +
+                           (size_t) row * (matrix == 2 ? drow : grow);
+    const auto half_at = [](const uint8_t* p) {
+        return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+    };
+    float sums[4] = {};
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* code = codes + (size_t) b * 4 * (size_t) k;
+        const float scale = half_at(cols + (size_t) b * 2) * L.p2[matrix][(qs[b / 4] >> (2 * (b % 4))) & 3];
+        for (int q = 0; q < 4; ++q) {
+            const block_q8_1& xb = x[b * 4 + q];
+            int dot = 0;
+            for (int j = 0; j < 8; ++j) {
+                const auto planes = xe::bih3_planes(code, k, q * 8 + j);
+                const int act = get_int_b4(xb.qs, j);
+                for (int p = 0; p < 3; ++p) dot = dp4a((int) planes.v[p], act, dot);
+            }
+            sums[q] = sycl::fma((float) (dot * 64), scale * low_half(xb.ds), sums[q]);
+        }
+    }
+    return ((sums[0] + sums[1]) + (sums[2] + sums[3])) * (1.f / 8192.f) * half_at(bases + (size_t) row * 2);
+}
+
+void bih3_r1q2_grouped_scalar(const Bih3R1q2Layer& L, const unsigned long long* ptr, const int32_t* start,
+                              const int32_t* groups, const int32_t* dst, const int32_t* tok, int64_t cap_groups,
+                              int64_t cap, const void* x_q8_1, void* scratch, float* out, void* stream) {
+    if (cap_groups <= 0 || cap <= 0) return;
+    require(L.n_expert > 0 && L.k_pairs && L.route_ids && ptr && start && groups && dst && tok && x_q8_1 && scratch &&
+            out && bih3_r1q2_grouped_scratch_bytes(cap, L.n_embd, L.n_ff) > 0, "bih3_r1q2_grouped_scalar");
+    auto& q = queue_for(stream);
+    const Bih3GroupedScratch s = bih3_scratch(scratch, cap, L.n_embd, L.n_ff);
+    const auto* X = static_cast<const block_q8_1*>(x_q8_1);
+    const int n = L.n_embd, ff = L.n_ff;
+    const float lim = expert_swiglu_limit();
+    q.parallel_for(sycl::range<2>((size_t) cap, (size_t) (2 * ff)), [=](sycl::id<2> id) {
+        const int e = (int) id[0], row = (int) id[1];
+        int g = 0;
+        while (g < *groups && start[g + 1] <= e) ++g;
+        if (g >= *groups) return;
+        const int expert = L.route_ids[dst[e]], matrix = row / ff;
+        const auto* blob = reinterpret_cast<const uint8_t*>(ptr[g]);
+        s.gu[(size_t) e * 2 * ff + row] = bih3_grouped_row(L, blob, expert, matrix, row % ff,
+                                                           X + (size_t) tok[e] * (n / 32));
+    });
+    q.parallel_for(sycl::range<1>((size_t) cap * ff), [=](sycl::id<1> id) {
+        const size_t i = id[0], e = i / (size_t) ff, r = i % (size_t) ff;
+        if (*groups <= 0 || e >= (size_t) start[*groups]) { s.h[i] = 0.f; return; }
+        float gate = s.gu[e * 2 * ff + r], up = s.gu[e * 2 * ff + ff + r];
+        swiglu_clamp(gate, up, lim);
+        s.h[i] = canon::silu_mul(gate, up);
+    });
+    if (L.had_block > 0)
+        launch_hadamard_rows<float>(q, s.h, s.h, cap, ff, L.had_block, L.d_signs, "bih3_r1q2_grouped_scalar");
+    // One work-item a block: the shared q8 quantizer requires 256 work-items per group.
+    q.parallel_for(sycl::range<1>((size_t) cap * ff / 32), [=](sycl::id<1> id) {
+        const size_t b = id[0];
+        const float* x = s.h + b * 32;
+        float amax = 0.f;
+        for (int i = 0; i < 32; ++i) amax = sycl::fmax(amax, sycl::fabs(x[i]));
+        const float d = canon::q8_scale(amax), inv = canon::q8_inv(d);
+        auto* bytes = reinterpret_cast<uint8_t*>(s.hq + b);
+        *reinterpret_cast<sycl::half2*>(bytes) = sycl::half2(sycl::half(d), sycl::half(0.f));
+        auto* values = reinterpret_cast<int8_t*>(bytes + 4);
+        for (int i = 0; i < 32; ++i) values[i] = canon::q8_value(x[i], inv);
+    });
+    q.parallel_for(sycl::range<2>((size_t) cap, (size_t) n), [=](sycl::id<2> id) {
+        const int e = (int) id[0], row = (int) id[1];
+        int g = 0;
+        while (g < *groups && start[g + 1] <= e) ++g;
+        if (g >= *groups) return;
+        const int expert = L.route_ids[dst[e]];
+        const auto* blob = reinterpret_cast<const uint8_t*>(ptr[g]);
+        out[(size_t) dst[e] * n + row] = bih3_grouped_row(L, blob, expert, 2, row, s.hq + (size_t) e * (ff / 32));
+    });
+    if (!stream) q.wait_and_throw();
+}
+
 size_t bih3_r1q2_grouped_scratch_bytes(int64_t cap, int64_t n, int64_t ff) {
     if (cap <= 0 || n <= 0 || ff <= 0 || n % 128 || ff % 128) return 0;
     return bih3_scratch(nullptr, cap, n, ff).bytes;
@@ -2762,7 +2854,10 @@ void bih3_r1q2_grouped(const Bih3R1q2Layer& L, const unsigned long long* ptr, co
     require(L.n_expert > 0 && L.k_pairs && L.route_ids && ptr && start && groups && dst && tok && x_q8_1 && scratch &&
             out && bih3_r1q2_grouped_scratch_bytes(cap, L.n_embd, L.n_ff) > 0, "bih3_r1q2_grouped");
     auto& q = queue_for(stream);
-    require(iq_mmq_usable(q) || iq_mmq_dp4a_usable(q), "bih3_r1q2_grouped: no tiled matrix or DP4a path");
+    if (!iq_mmq_usable(q) && !iq_mmq_dp4a_usable(q)) {
+        bih3_r1q2_grouped_scalar(L, ptr, start, groups, dst, tok, cap_groups, cap, x_q8_1, scratch, out, stream);
+        return;
+    }
     const Bih3GroupedScratch s = bih3_scratch(scratch, cap, L.n_embd, L.n_ff);
     const auto* X = static_cast<const block_q8_1*>(x_q8_1);
     const int n = L.n_embd, ff = L.n_ff;

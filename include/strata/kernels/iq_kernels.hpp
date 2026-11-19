@@ -64,6 +64,11 @@ void bih3_r1q2_grouped(const Bih3R1q2Layer& layer, const unsigned long long* grp
                        const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                        int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
 
+/// Untiled grouped product for devices too small for the matrix or DP4a tile.
+void bih3_r1q2_grouped_scalar(const Bih3R1q2Layer& layer, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                              const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                              int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
+
 /// One prompt expert, using the same grouped product. Scratch includes its device-side routing tables.
 size_t bih3_r1q2_prompt_scratch_bytes(int64_t cap_entries, int64_t n_embd, int64_t n_ff);
 void bih3_r1q2_prompt(const Bih3R1q2Layer& layer, const uint8_t* blob, int gate_k, int down_k,
