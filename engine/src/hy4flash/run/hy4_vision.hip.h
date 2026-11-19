@@ -86,7 +86,20 @@ __global__ void k_rms_merge(const float* __restrict__ x, const float* __restrict
 }
 
 // ---- GEMM Y = X[M][K] (fp16) * W[N][K]^T (fp16) + bias, 64x64 tile, BK 16, 256 threads (4x4 per thread), fp32 accumulation -------------------------------------------------------
-enum { EPI_H = 0, EPI_GELU_TANH = 1, EPI_GELU_ERF = 2, EPI_RES_ADD = 3, EPI_RES_SET_POS = 4, EPI_F32_ROWMAP = 5 };
+constexpr int VA_HD = 72;  // head dimension (1152 / 16)
+enum { EPI_H = 0, EPI_GELU_TANH = 1, EPI_GELU_ERF = 2, EPI_RES_ADD = 3, EPI_RES_SET_POS = 4, EPI_F32_ROWMAP = 5, EPI_VT = 6 };
+
+// the epilogue shared by both GEMMs: one output element (row m, column n of an [M][N] result)
+template <int EPI>
+__device__ __forceinline__ void store_epi(float v, int m, int n, int N, int ow, __half* Yh, float* Yf, const float* pe) {
+    if (EPI == EPI_H) Yh[(size_t)m * N + n] = __float2half(v);
+    else if (EPI == EPI_GELU_TANH) Yh[(size_t)m * N + n] = __float2half(gelu_tanh_f(v));
+    else if (EPI == EPI_GELU_ERF) Yh[(size_t)m * N + n] = __float2half(gelu_erf_f(v));
+    else if (EPI == EPI_RES_ADD) Yf[(size_t)m * N + n] += v;
+    else if (EPI == EPI_RES_SET_POS) Yf[(size_t)m * N + n] = v + pe[(size_t)m * N + n];
+    else if (EPI == EPI_VT) Yh[(size_t)n * ow + m] = __float2half(v);  // transposed [N][ow]: ow = the key pitch of the attention kernel
+    else Yf[(size_t)(m + m / ow) * N + n] = v;                      // EPI_F32_ROWMAP: merged cell m = oy*ow + ox -> row oy*(ow+1) + ox
+}
 
 template <int EPI>
 __global__ void __launch_bounds__(256) k_gemm(const __half* __restrict__ X, const __half* __restrict__ W, const float* __restrict__ bias, __half* __restrict__ Yh, float* __restrict__ Yf,
@@ -148,19 +161,152 @@ __global__ void __launch_bounds__(256) k_gemm(const __half* __restrict__ X, cons
         for (int j = 0; j < 4; ++j) {
             const int n = n0 + tx + 16 * j;
             if (n >= N) continue;
-            float v = acc[i][j] + (bias ? bias[n] : 0.f);
-            if (EPI == EPI_H) Yh[(size_t)m * N + n] = __float2half(v);
-            else if (EPI == EPI_GELU_TANH) Yh[(size_t)m * N + n] = __float2half(gelu_tanh_f(v));
-            else if (EPI == EPI_GELU_ERF) Yh[(size_t)m * N + n] = __float2half(gelu_erf_f(v));
-            else if (EPI == EPI_RES_ADD) Yf[(size_t)m * N + n] += v;
-            else if (EPI == EPI_RES_SET_POS) Yf[(size_t)m * N + n] = v + pe[(size_t)m * N + n];
-            else Yf[(size_t)(m + m / ow) * N + n] = v;  // EPI_F32_ROWMAP: merged cell m = oy*ow + ox -> row oy*(ow+1) + ox
+            store_epi<EPI>(acc[i][j] + (bias ? bias[n] : 0.f), m, n, N, ow, Yh, Yf, pe);
         }
     }
 }
 
+#if HY4_MMA && !HY4_CUDA
+// ---- gfx11 WMMA versions (v_wmma_f32_16x16x16_f16, wave32). Fragment layout: lane l holds row/column (l & 15) of a 16x16 operand as 16 consecutive k values (so a row of X or W is one
+// 32-byte load); accumulator element i of a lane is row 2*i + (l >> 4), column l & 15.
+typedef _Float16 hv16 __attribute__((ext_vector_type(16)));
+typedef float fv8 __attribute__((ext_vector_type(8)));
+typedef unsigned u32x8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ hv16 ld_hv16(const void* p) {
+    const uint4 a = *reinterpret_cast<const uint4*>(p), b = *(reinterpret_cast<const uint4*>(p) + 1);
+    u32x8 v = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    return __builtin_bit_cast(hv16, v);
+}
+// 8 valid halves (16 bytes at p) followed by 8 zeros: the 72-wide head dimension padded to 80
+__device__ __forceinline__ hv16 ld_hv16_half(const void* p) {
+    const uint4 a = *reinterpret_cast<const uint4*>(p);
+    u32x8 v = {a.x, a.y, a.z, a.w, 0u, 0u, 0u, 0u};
+    return __builtin_bit_cast(hv16, v);
+}
+
+// Y = X * W^T + bias, block 64x64 (4 waves, each 32x32 = 2x2 WMMA tiles), operands straight from global memory (rows clamped; the store is guarded). K % 16 == 0.
+template <int EPI>
+__global__ void __launch_bounds__(128) k_gemm_w(const __half* __restrict__ X, const __half* __restrict__ W, const float* __restrict__ bias, __half* __restrict__ Yh, float* __restrict__ Yf,
+                                                const float* __restrict__ pe, int M, int N, int K, int ow) {
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int l16 = lane & 15, hi = lane >> 4;
+    const int wm = wave & 1, wn = wave >> 1;
+    const int m0 = blockIdx.y * 64 + wm * 32, n0 = blockIdx.x * 64 + wn * 32;
+    const __half* xr[2];
+    const __half* wr[2];
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+        xr[t] = X + (size_t)min(m0 + t * 16 + l16, M - 1) * K;
+        wr[t] = W + (size_t)min(n0 + t * 16 + l16, N - 1) * K;
+    }
+    fv8 acc[2][2];
+#pragma unroll
+    for (int a = 0; a < 2; ++a)
+#pragma unroll
+        for (int b = 0; b < 2; ++b) acc[a][b] = fv8{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll 4
+    for (int k = 0; k < K; k += 16) {
+        const hv16 a0 = ld_hv16(xr[0] + k), a1 = ld_hv16(xr[1] + k), b0 = ld_hv16(wr[0] + k), b1 = ld_hv16(wr[1] + k);
+        acc[0][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc[0][0]);
+        acc[0][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b1, acc[0][1]);
+        acc[1][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b0, acc[1][0]);
+        acc[1][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc[1][1]);
+    }
+#pragma unroll
+    for (int a = 0; a < 2; ++a)
+#pragma unroll
+        for (int b = 0; b < 2; ++b) {
+            const int n = n0 + b * 16 + l16;
+            if (n >= N) continue;
+            const float bv = bias ? bias[n] : 0.f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int m = m0 + a * 16 + 2 * i + hi;
+                if (m < M) store_epi<EPI>(acc[a][b][i] + bv, m, n, N, ow, Yh, Yf, pe);
+            }
+        }
+}
+
+// Flash attention on WMMA: block = 4 waves, wave = 16 queries of one head, loop over key tiles of 16. S = Q K^T (head dim 72 padded to 80: 4 full k-steps + a half one), online softmax in fp32,
+// P goes through a wave-private LDS tile into the A operand of P V. V arrives TRANSPOSED (vt[n = 72 h + d][key], row pitch ldv, so a column of V is a contiguous run of keys).
+constexpr int WA_PP = 24;
+__global__ void __launch_bounds__(128) k_attn_w(const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ vt, __half* __restrict__ o, int N, int D, int ldv,
+                                                float scale) {
+    __shared__ __align__(16) __half sP[4][16 * WA_PP];
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int l16 = lane & 15, hi = lane >> 4;
+    const int h = blockIdx.y;
+    const int q0 = blockIdx.x * 64 + wave * 16;
+    const int qrow = min(q0 + l16, N - 1);
+    hv16 qf[5];
+    {
+        const __half* qp = q + (size_t)qrow * D + h * VA_HD;
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks) qf[ks] = ld_hv16(qp + ks * 16);
+        qf[4] = ld_hv16_half(qp + 64);
+    }
+    fv8 oacc[5];
+#pragma unroll
+    for (int t = 0; t < 5; ++t) oacc[t] = fv8{0, 0, 0, 0, 0, 0, 0, 0};
+    float mrun[8], lrun[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        mrun[i] = -1e30f;
+        lrun[i] = 0.f;
+    }
+    __half* sp = sP[wave];
+    for (int kt = 0; kt < N; kt += 16) {
+        const int key = min(kt + l16, N - 1);
+        const __half* kp = k + (size_t)key * D + h * VA_HD;
+        fv8 s = fv8{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks) s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[ks], ld_hv16(kp + ks * 16), s);
+        s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[4], ld_hv16_half(kp + 64), s);
+        const bool kvalid = kt + l16 < N;
+        float corr[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float sc = kvalid ? s[i] * scale : -1e30f;
+            float mx = sc;
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 16));
+            const float nm = fmaxf(mrun[i], mx);
+            corr[i] = __expf(mrun[i] - nm);
+            const float p = kvalid ? __expf(sc - nm) : 0.f;
+            float ps = p;
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1) ps += __shfl_xor(ps, off, 16);
+            lrun[i] = lrun[i] * corr[i] + ps;
+            mrun[i] = nm;
+            sp[(2 * i + hi) * WA_PP + l16] = __float2half(p);
+        }
+        __syncthreads();
+        const hv16 pf = ld_hv16(sp + l16 * WA_PP);
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) oacc[t][i] *= corr[i];
+            const int d = min(t * 16 + l16, VA_HD - 1);
+            oacc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, ld_hv16(vt + (size_t)(h * VA_HD + d) * ldv + kt), oacc[t]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int qi = q0 + 2 * i + hi;
+        if (qi >= N) continue;
+        const float il = 1.0f / lrun[i];
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const int d = t * 16 + l16;
+            if (d < VA_HD) o[(size_t)qi * D + h * VA_HD + d] = __float2half(oacc[t][i] * il);
+        }
+    }
+}
+#endif  // HY4_MMA && !HY4_CUDA
+
 // ---- attention: full (non-causal) softmax attention per head, head_dim 72, fp16 q/k/v [N][1152] (head h at columns 72h..), online softmax in fp32, one thread per query ------------------
-constexpr int VA_HD = 72, VA_KT = 32;
+constexpr int VA_KT = 32;
 __global__ void __launch_bounds__(64) k_attn(const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v, __half* __restrict__ o, int N, int D, float scale) {
     __shared__ float Ks[VA_KT][VA_HD], Vs[VA_KT][VA_HD];
     const int h = blockIdx.y;
@@ -237,6 +383,7 @@ struct VisionEncoder {
     bool dump = false;
     std::string dump_dir = ".";
     bool gelu_tanh_ffn = true;
+    bool use_wmma = false;  // gfx11 matrix-core GEMM / attention (set in load(); HY4_VIT_NOWMMA=1 forces the plain kernels)
     const std::atomic<bool>* cancel = nullptr;  // set by serve: STOP during the encode ends it at the next layer
 
     const __half* wh(const std::string& n) const { return reinterpret_cast<const __half*>(d_w + vi.get(n).off); }
@@ -255,6 +402,13 @@ struct VisionEncoder {
             return false;
         }
         stream_to_device(path, vi.sec1_off, vi.sec1_len, d_w, &t_load, "vision");
+#if HY4_MMA && !HY4_CUDA
+        {  // matrix-core kernels on gfx11 (RDNA3 / 3.5: Radeon 780M / 8060S / RX 7000); everything else takes the plain kernels
+            hipDeviceProp_t dp;
+            HCK(hipGetDeviceProperties(&dp, 0));
+            use_wmma = std::string(dp.gcnArchName).rfind("gfx11", 0) == 0 && !getenv("HY4_VIT_NOWMMA");
+        }
+#endif
         loaded = true;
         fprintf(stderr, "[vision] shard loaded to the GPU: %.2f GB in %.2f s\n", vi.sec1_len / 1e9, t_load);
         return true;
@@ -267,6 +421,21 @@ struct VisionEncoder {
 
     void gemm(hipStream_t st, int epi, const __half* X, const __half* W, const float* bias, __half* Yh, float* Yf, const float* pe, int M, int N, int K, int ow = 1) {
         dim3 grid((N + 63) / 64, (M + 63) / 64), blk(256);
+#if HY4_MMA && !HY4_CUDA
+        if (use_wmma) {  // gfx11 matrix cores
+            dim3 bw(128);
+            switch (epi) {
+                case vit::EPI_H: hipLaunchKernelGGL((vit::k_gemm_w<vit::EPI_H>), grid, bw, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+                case vit::EPI_VT: hipLaunchKernelGGL((vit::k_gemm_w<vit::EPI_VT>), grid, bw, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+                case vit::EPI_GELU_TANH: hipLaunchKernelGGL((vit::k_gemm_w<vit::EPI_GELU_TANH>), grid, bw, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+                case vit::EPI_GELU_ERF: hipLaunchKernelGGL((vit::k_gemm_w<vit::EPI_GELU_ERF>), grid, bw, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+                case vit::EPI_RES_ADD: hipLaunchKernelGGL((vit::k_gemm_w<vit::EPI_RES_ADD>), grid, bw, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+                case vit::EPI_RES_SET_POS: hipLaunchKernelGGL((vit::k_gemm_w<vit::EPI_RES_SET_POS>), grid, bw, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+                default: hipLaunchKernelGGL((vit::k_gemm_w<vit::EPI_F32_ROWMAP>), grid, bw, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+            }
+            return;
+        }
+#endif
         switch (epi) {
             case vit::EPI_H: hipLaunchKernelGGL((vit::k_gemm<vit::EPI_H>), grid, blk, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
             case vit::EPI_GELU_TANH: hipLaunchKernelGGL((vit::k_gemm<vit::EPI_GELU_TANH>), grid, blk, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
@@ -342,7 +511,9 @@ struct VisionEncoder {
         if (hipMalloc((void**)&d_h, bN * 2) != hipSuccess) return fail("h");
         if (hipMalloc((void**)&d_q, bN * 2) != hipSuccess) return fail("q");
         if (hipMalloc((void**)&d_k, bN * 2) != hipSuccess) return fail("k");
-        if (hipMalloc((void**)&d_v, bN * 2) != hipSuccess) return fail("v");
+        const int ldv = (N + 15) & ~15;  // key pitch of the transposed V of the matrix-core attention
+        if (hipMalloc((void**)&d_v, use_wmma ? (size_t)D * ldv * 2 : bN * 2) != hipSuccess) return fail("v");
+        if (use_wmma) HCK(hipMemsetAsync(d_v, 0, (size_t)D * ldv * 2, st));
         if (hipMalloc((void**)&d_ff, (size_t)N * FF * 2) != hipSuccess) return fail("ffn");
         if (hipMalloc((void**)&d_A, (size_t)M2 * D * 4 * 2) != hipSuccess) return fail("merge");
         if (hipMalloc((void**)&d_mid, (size_t)M2 * D * 4 * 2) != hipSuccess) return fail("mid");
@@ -365,8 +536,15 @@ struct VisionEncoder {
             hipLaunchKernelGGL(vit::k_ln, dim3(N), dim3(256), 0, st, d_x, wf(p + "input_layernorm.weight"), wf(p + "input_layernorm.bias"), d_h, D, c.eps);
             gemm(st, vit::EPI_H, d_h, wh(p + "self_attn.q_proj.weight"), wf(p + "self_attn.q_proj.bias"), d_q, nullptr, nullptr, N, D, D);
             gemm(st, vit::EPI_H, d_h, wh(p + "self_attn.k_proj.weight"), wf(p + "self_attn.k_proj.bias"), d_k, nullptr, nullptr, N, D, D);
-            gemm(st, vit::EPI_H, d_h, wh(p + "self_attn.v_proj.weight"), wf(p + "self_attn.v_proj.bias"), d_v, nullptr, nullptr, N, D, D);
-            hipLaunchKernelGGL(vit::k_attn, dim3((N + 63) / 64, NH), dim3(64), 0, st, d_q, d_k, d_v, d_h, N, D, scale);
+            if (use_wmma) {
+#if HY4_MMA && !HY4_CUDA
+                gemm(st, vit::EPI_VT, d_h, wh(p + "self_attn.v_proj.weight"), wf(p + "self_attn.v_proj.bias"), d_v, nullptr, nullptr, N, D, D, ldv);
+                hipLaunchKernelGGL(vit::k_attn_w, dim3((N + 63) / 64, NH), dim3(128), 0, st, d_q, d_k, d_v, d_h, N, D, ldv, scale);
+#endif
+            } else {
+                gemm(st, vit::EPI_H, d_h, wh(p + "self_attn.v_proj.weight"), wf(p + "self_attn.v_proj.bias"), d_v, nullptr, nullptr, N, D, D);
+                hipLaunchKernelGGL(vit::k_attn, dim3((N + 63) / 64, NH), dim3(64), 0, st, d_q, d_k, d_v, d_h, N, D, scale);
+            }
             gemm(st, vit::EPI_RES_ADD, d_h, wh(p + "self_attn.o_proj.weight"), wf(p + "self_attn.o_proj.bias"), nullptr, d_x, nullptr, N, D, D);
             hipLaunchKernelGGL(vit::k_ln, dim3(N), dim3(256), 0, st, d_x, wf(p + "post_attention_layernorm.weight"), wf(p + "post_attention_layernorm.bias"), d_h, D, c.eps);
             gemm(st, gelu_tanh_ffn ? vit::EPI_GELU_TANH : vit::EPI_GELU_ERF, d_h, wh(p + "mlp.dense_h_to_4h.weight"), wf(p + "mlp.dense_h_to_4h.bias"), d_ff, nullptr, nullptr, N, FF, D);
