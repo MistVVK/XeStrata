@@ -104,6 +104,15 @@ uint64_t cache_credit_for_limit(const CacheCredit& credit, uint64_t limit, std::
 struct ArenaCgroupRoom { bool applies = false; uint64_t room = 0; uint64_t credit = 0; };
 ArenaCgroupRoom arena_cgroup_room(uint64_t limit, uint64_t current, const std::string& stat_text, std::optional<uint64_t> mem_total,
                                   bool inactive_only);
+/// The same figure under a cgroup v1 limit (memory.limit_in_bytes, memory.usage_in_bytes and memory.stat's total_* counters).
+/// v1's usage_in_bytes charges the whole page cache, and the kernel evicts that cache before it fails an allocation at the limit,
+/// so a group that has read a large model through the file cache sits at its limit with RAM to spare (a 171 GiB Docker container
+/// on a cgroup v1 host, 111 GiB of model files cached: limit - usage = 0.1 GiB, "only 0.1 GiB of RAM is free").  The credit is
+/// total_inactive_file + total_active_file less total_dirty and total_writeback, never more than the usage (shmem and mlocked
+/// pages are not on the file lists; v1 counts shmem under total_cache but keeps it on the anon lists), less the margin above
+/// (min(half the credit, limit / 64)).  A memory.stat without total_inactive_file gives no credit (the room is limit - usage).
+/// `inactive_only` (STRATA_MEM_CREDIT_INACTIVE=1) credits total_inactive_file alone.  `applies` is always true.
+ArenaCgroupRoom arena_cgroup_room_v1(uint64_t limit, uint64_t usage, const std::string& stat_text, bool inactive_only);
 /// The operator's cap in bytes for the container/cgroup this engine runs in (0 = none).  Set once at start.
 void set_memory_limit_bytes(uint64_t bytes);
 uint64_t memory_limit_bytes();

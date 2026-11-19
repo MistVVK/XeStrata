@@ -92,7 +92,8 @@ struct HostMemory {
 /// defaults are the real files).  cgroup v2: a group whose memory.max exists but cannot be read fails; a group without a
 /// memory.max has no memory controller and no limit of its own (its parents are read), and a "0::" path that is not in
 /// this namespace's mount reads the mount's root as the process's own group (#5196); cgroup v1's
-/// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes); no cgroup line at all is
+/// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes, the group's clean file pages
+/// credited: arena_cgroup_room_v1); no cgroup line at all is
 /// MemAvailable alone.  False when the RAM cannot be determined.  #5519: MemAvailable plus the ZFS ARC's share above its floor
 /// (`zfs_arcstats`; no ZFS: nothing), which MemAvailable leaves out though ZFS gives it back.
 bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/meminfo",

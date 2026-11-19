@@ -759,6 +759,53 @@ void test_host_memory() {
     put("fs/memory/docker/abc/memory.limit_in_bytes", "9223372036854771712\n");
     require(probe(hybrid) && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "hybrid: v1 unlimited");
     require(probe("0::/docker/abc\n") && m.available == 100 * GiB, "a 0:: line with no controllers file and no v1 line: MemAvailable alone");
+    // CG1-RAM, the numbers of the real box (Vast 61335444: Docker on a cgroup v1 hybrid host, 171 GiB container limit, EPYC 9B14), read
+    // 2026-11-19 19:01:37 UTC while the engine loaded a 104 GB model through the file cache next to 78 GB of its own anonymous memory
+    // ("the CPU prefill share is not armed by default: only 2.7 GiB of RAM is free").  v1's usage_in_bytes charges the whole page cache:
+    // limit - usage was 2.57 GiB, with 99.9 GB of clean file pages in the group that the kernel evicts first.
+    {
+        const std::string stat =
+            "cache 102233292800\nrss 78127566848\nrss_huge 0\nshmem 2349006848\nmapped_file 19106279424\ndirty 12288\nwriteback 0\n"
+            "workingset_refault_anon 0\nworkingset_refault_file 419\nswap 0\nswapcached 0\npgpgin 61422253\npgpgout 41333167\n"
+            "pgfault 59712320\npgmajfault 61279\ninactive_anon 47178797056\nactive_anon 33297645568\ninactive_file 84365942784\n"
+            "active_file 15518371840\nunevictable 0\nhierarchical_memory_limit 183530160128\nhierarchical_memsw_limit 183530160128\n"
+            "total_cache 102233292800\ntotal_rss 78127566848\ntotal_rss_huge 0\ntotal_shmem 2349006848\ntotal_mapped_file 19106279424\n"
+            "total_dirty 12288\ntotal_writeback 0\ntotal_workingset_refault_anon 0\ntotal_workingset_refault_file 419\ntotal_swap 0\n"
+            "total_swapcached 0\ntotal_pgpgin 61422253\ntotal_pgpgout 41333167\ntotal_pgfault 59712320\ntotal_pgmajfault 61279\n"
+            "total_inactive_anon 47178797056\ntotal_active_anon 33297645568\ntotal_inactive_file 84365942784\n"
+            "total_active_file 15518371840\ntotal_unevictable 0\n";
+        constexpr uint64_t limit = 183530160128ull, usage = 180769730560ull;
+        put("meminfo", "MemTotal: 528061164 kB\nMemAvailable: 318494008 kB\n");   // the host's figures (a container sees them as its own)
+        put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(limit) + "\n");
+        put("fs/memory/docker/abc/memory.usage_in_bytes", std::to_string(usage) + "\n");
+        put("fs/memory/docker/abc/memory.stat", stat);
+        // clean file pages = total_inactive_file + total_active_file - total_dirty - total_writeback = 99884302336; less the margin
+        // min(half, limit / 64) = 2867658752: 97016643584 credited, room = limit - (usage - credit) = 99777073152 (92.9 GiB)
+        require(probe(hybrid) && m.cgroup_limit == limit && m.available == 99777073152ull,
+                "cgroup v1: the clean file pages of the group are room (the box read 2.57 GiB: limit - usage)");
+        require(m.available > 90 * GiB && m.available < usage, "cgroup v1: the room is the RAM the kernel can reclaim for the group");
+        set_env("STRATA_MEM_CREDIT_INACTIVE", "1");   // the way back to the inactive list alone
+        require(probe(hybrid) && m.available == 84258701312ull, "cgroup v1: STRATA_MEM_CREDIT_INACTIVE=1 credits inactive_file alone");
+        set_env("STRATA_MEM_CREDIT_INACTIVE", nullptr);
+        // shmem sits in total_cache but on the anon lists: when all of the cache is shmem nothing is credited (the room stays limit - usage)
+        put("fs/memory/docker/abc/memory.stat", "total_cache " + std::to_string(usage / 2) + "\ntotal_shmem " + std::to_string(usage / 2) +
+                                                "\ntotal_inactive_file 0\ntotal_active_file 0\ntotal_dirty 0\ntotal_writeback 0\n");
+        require(probe(hybrid) && m.available == limit - usage, "cgroup v1: shmem is not credited");
+        // dirty and writeback pages are not credited
+        put("fs/memory/docker/abc/memory.stat", "total_inactive_file " + std::to_string(40 * GiB) + "\ntotal_active_file " + std::to_string(10 * GiB) +
+                                                "\ntotal_dirty " + std::to_string(30 * GiB) + "\ntotal_writeback " + std::to_string(5 * GiB) + "\n");
+        // (50 - 30 - 5 = 15 GiB clean, less the margin limit / 64, which is below half of it)
+        require(probe(hybrid) && m.available == limit - (usage - (15 * GiB - limit / 64)),
+                "cgroup v1: dirty and writeback pages are not credited");
+        // a memory.stat without total_inactive_file (an old kernel) or no memory.stat at all: no credit, as before
+        put("fs/memory/docker/abc/memory.stat", "total_cache 1\ntotal_rss 2\n");
+        require(probe(hybrid) && m.available == limit - usage, "cgroup v1: no total_inactive_file: no credit");
+        fs::remove(t.path / "fs/memory/docker/abc/memory.stat");
+        require(probe(hybrid) && m.available == limit - usage, "cgroup v1: no memory.stat: no credit");
+        put("fs/memory/docker/abc/memory.limit_in_bytes", "9223372036854771712\n");
+        put("fs/memory/docker/abc/memory.usage_in_bytes", std::to_string(10 * GiB) + "\n");
+        put("meminfo", "MemTotal: 134217728 kB\nMemAvailable: 104857600 kB\n");
+    }
     // with cgroup.controllers (a real v2 root) the 0:: line is the limit and a v1 line beside it is not read
     put("fs/cgroup.controllers", "memory\n");
     put("fs/box/memory.max", std::to_string(48 * GiB) + "\n");
