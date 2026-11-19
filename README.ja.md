@@ -413,6 +413,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - [Edge0 の Strata フォーク](https://github.com/Edge0-AI/Edge0)（Strata の MIT と Edge0 の Apache-2.0）: latent MoE の対応。モデルの重みのライセンスは別です（[NOTICE](NOTICE)）。
    - [YASAKANI](https://github.com/yasakani-dev/yasakani)（Apache-2.0）: Gumbel 抽選、K/V のトレリス符号、固定小数点の和、静的な下書き表（[NOTICE](NOTICE)）。
    - [vLLM-Omni](https://github.com/vllm-project/vllm-omni)（Apache-2.0）: 画像の検出・動画の分割・色補正の実装（[NOTICE](NOTICE)）。
+   - hiruhiru2005 による [Sync-Strata](https://github.com/hiruhiru2005/sync-strata)（MIT）: bih3 のトレリスと R1Q2 形式の読み込みと復号（[NOTICE](NOTICE)）。
    - Peasant Smith と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（MIT）: server のループ対策（`serve/loop_guard.py`）。
    - Ostris の [ai-toolkit](https://github.com/ostris/ai-toolkit)（MIT）: LoRA の学習の時刻の重み（Anima の既定の weighted、`src/image/flow_weighting.cpp`）。
    - Secret Labs AB・Fredrik Lundh・Jeffrey A. Clark と寄稿者の [Pillow](https://github.com/python-pillow/Pillow)（MIT-CMU）: 画像のエンジンがホストで行う Pillow と同じバイトのリサイズ（`src/image/img_crop.cpp` の `pillow_resize_planes`、`libImaging/Resample.c` から）。

@@ -55,6 +55,9 @@ Every copyright holder whose work is in this repository, its license and where t
   Apache-2.0. The files keep both notices and are under the LGPL as a whole (LGPL-3.0-or-later AND MIT AND
   Apache-2.0) - LICENSES/Apache-2.0.txt. The models' weights are under the Edge0 Community Model License 1.0 and the
   Qwen Community License 1.0 (non-free): XeStrata does not bundle them; setup fetches them to the user's machine
+- Copyright (c) 2026 hiruhiru2005
+  MIT - the bih3 trellis and R1Q2 expert format (https://github.com/hiruhiru2005/sync-strata); the files that
+  contain this code are under the LGPL as a whole (LGPL-3.0-or-later AND MIT) - text below
 - Copyright (c) 2026 Peasant Smith and the Project Maya contributors
   MIT - the loop guard of the server (serve/loop_guard.py and its tests), transcribed from Project Maya
   (https://github.com/mw00/project-maya), a fork of Strata; the code stays under MIT, the files as a whole are under
@@ -220,6 +223,31 @@ Strata (MIT License)
 --------------------
 
 Copyright (c) 2026 Niko1221 and the Strata contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Sync-Strata (MIT License)
+-------------------------
+
+Copyright (c) 2026 Niko1221 and the Strata contributors
+Copyright (c) 2026 hiruhiru2005
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -435,6 +435,7 @@ permission under GPL section 7, what goes in, and how to report).
    - [Edge0's Strata fork](https://github.com/Edge0-AI/Edge0) (Strata's MIT and Edge0's Apache-2.0): latent MoE support. The model weights have separate licenses ([NOTICE](NOTICE)).
    - [YASAKANI](https://github.com/yasakani-dev/yasakani) (Apache-2.0): Gumbel sampling, trellis-coded K/V, fixed-point sums and the static draft table ([NOTICE](NOTICE)).
    - [vLLM-Omni](https://github.com/vllm-project/vllm-omni) (Apache-2.0): image detection, video segmentation and color correction ([NOTICE](NOTICE)).
+   - [Sync-Strata](https://github.com/hiruhiru2005/sync-strata), by hiruhiru2005 (MIT): bih3 trellis and R1Q2 format loading and decoding ([NOTICE](NOTICE)).
    - [Project Maya](https://github.com/mw00/project-maya), by Peasant Smith and the Project Maya contributors (MIT): the
      server's loop guard (`serve/loop_guard.py`);
    - [ai-toolkit](https://github.com/ostris/ai-toolkit), by Ostris (MIT): the LoRA trainer's timestep weights (Anima's
