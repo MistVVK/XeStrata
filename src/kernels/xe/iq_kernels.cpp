@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/iq_kernels.cpp - see include/strata/kernels/iq_kernels.hpp; the Xe port of Strata's src/kernels/cuda/iq_kernels.cu.
 //
@@ -33,6 +34,7 @@
 //
 #include "strata/kernels/canon_math.hpp"
 #include "hadamard_device.hpp"
+#include "bih3.hpp"
 #include "strata/kernels/exact.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_mmq.hpp"
@@ -2583,6 +2585,43 @@ const float* hadamard_device_signs(const float* host, int width) {
         rt.finish(q);
     }
     return d;
+}
+
+void bih3_r1q2_mmvq(const Bih3R1q2Matrix& w, const void* x_q8_1, float* y, int ncols, void* stream) {
+    require(w.codes && w.rowbase && w.colscale && w.q && x_q8_1 && y && w.k >= 2 && w.k <= 14 &&
+            w.n_in > 0 && w.n_in % 128 == 0 && w.n_out > 0 && ncols > 0 &&
+            w.row_bytes >= (size_t) (w.n_in / 128) * 4 * (size_t) w.k, "bih3_r1q2_mmvq");
+    const auto* x = static_cast<const block_q8_1*>(x_q8_1);
+    const int nb = w.n_in / 128, qbytes = (nb + 3) / 4;
+    auto& queue = queue_for(stream);
+    auto event = queue.parallel_for(sycl::range<2>((size_t) ncols, (size_t) w.n_out), [=](sycl::id<2> id) {
+        const size_t col = id[0], row = id[1];
+        const auto half_at = [](const uint8_t* p) {
+            return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+        };
+        float sums[4] = {};
+        const uint8_t* codes = w.codes + row * w.row_bytes;
+        const uint8_t* qr = w.q + row * (size_t) qbytes;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* block = codes + (size_t) b * 4 * (size_t) w.k;
+            const float scale = half_at(w.colscale + (size_t) b * 2) * w.p2[(qr[b / 4] >> (2 * (b % 4))) & 3];
+            for (int q = 0; q < 4; ++q) {
+                int dot = 0;
+                const block_q8_1* xb = x + col * (size_t) (w.n_in / 32) + (size_t) b * 4 + q;
+                for (int j = 0; j < 8; ++j) {
+                    const auto planes = xe::bih3_planes(block, w.k, q * 8 + j);
+                    const int act = get_int_b4(xb->qs, j);
+                    dot = dp4a((int) planes.v[0], act, dot);
+                    dot = dp4a((int) planes.v[1], act, dot);
+                    dot = dp4a((int) planes.v[2], act, dot);
+                }
+                sums[q] = sycl::fma((float) (dot * 64), scale * low_half(xb->ds), sums[q]);
+            }
+        }
+        y[col * (size_t) w.n_out + row] = ((sums[0] + sums[1]) + (sums[2] + sums[3])) *
+                                           (1.f / 8192.f) * half_at(w.rowbase + row * 2);
+    });
+    sync_if_needed(stream, event, "bih3_r1q2_mmvq");
 }
 
 void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {

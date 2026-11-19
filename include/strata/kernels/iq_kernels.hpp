@@ -28,6 +28,20 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
 
+/// One R1Q2 matrix: `codes` has n_out rows, each row_bytes apart; scales have one FP16 row base per row, one FP16
+/// column scale per 128 values, and packed two-bit scale indices in row-major order. All pointers are device pointers.
+struct Bih3R1q2Matrix {
+    const uint8_t* codes = nullptr;
+    const uint8_t* rowbase = nullptr;
+    const uint8_t* colscale = nullptr;
+    const uint8_t* q = nullptr;
+    size_t row_bytes = 0;
+    float p2[4] = {};
+    int k = 0, n_in = 0, n_out = 0;
+};
+/// y[c][r] = W[r] . x[c], with q8_1 activations and the R1Q2 scales above.
+void bih3_r1q2_mmvq(const Bih3R1q2Matrix& w, const void* x_q8_1, float* y, int ncols, void* stream);
+
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32.
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);
