@@ -97,7 +97,7 @@ struct VitMetal {
         gelu_tanh_ffn = vi.c.gelu_tanh_ffn;
         if (const char* g = getenv("HY4_VIT_GELU")) gelu_tanh_ffn = std::string(g) != "erf";
         std::string why;
-        lib = cx->compile_try({kernel_dir + "hy4_mpp.metal", kernel_dir + "hy4_vision.metal"}, "#define NO_GGML_COMMON 1\n", false, &why);
+        lib = cx->compile_try({kernel_dir + "hy4_mpp.metal", kernel_dir + "hy4_vision.metal"}, std::string("#define NO_GGML_COMMON 1\n") + (getenv("HY4_VIT_PRELUDE") ? getenv("HY4_VIT_PRELUDE") : ""), false, &why);
         if (lib < 0) {
             err = "vision kernels: " + why.substr(0, 400);
             return false;
@@ -259,6 +259,17 @@ struct VisionCtxM {
     };
 
     bool active() const { return !spans.empty(); }
+    void release() {
+        if (!cx) return;
+        if (rows.handle) cx->free(rows);
+        if (tab.handle) cx->free(tab);
+        if (map.handle) cx->free(map);
+        rows = tab = map = mtl::Buffer();
+        spans.clear();
+        mask.clear();
+        pos = RopePos();
+        n_rows = tab_n = 0;
+    }
 
     bool setup(VitMetal& e, mtl::Context& c, const std::vector<int32_t>& ids, const std::vector<ImageRec>& recs, std::string& err) {
         enc = &e;

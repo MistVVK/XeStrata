@@ -111,12 +111,21 @@ kernel void v_epi(device const float* C [[buffer(0)]], device const float* bias 
 VEPI(0) VEPI(1) VEPI(2) VEPI(3) VEPI(4) VEPI(5)
 
 // ---- full softmax attention, head dim 72, 16 heads, q/k/v/o half [Npad][1152] (head h at columns 72h; rows >= N are zero padding, Npad a multiple of 64).
-// One simdgroup = 16 queries of one head (a threadgroup = 4 simdgroups = 64 queries), keys in blocks of 32: S = Q K^T on simdgroup_matrix (2 x 4 8x8 tiles, 9 k-steps), online softmax with the
-// per-lane fragment layout (a lane holds 2 consecutive columns of one row of each 8x8 tile; the 4 lanes of a row are xor 1 and xor 8), P (half) is used straight as the A operand of P V.
+// A threadgroup = NSG simdgroups; one simdgroup = 16 queries of one head. The K and V tiles (64 keys x 72, fp16) are loaded cooperatively into threadgroup memory once per threadgroup, then each
+// simdgroup runs S = Q K^T on simdgroup_matrix (2 x 4 8x8 tiles per 32 keys, 9 k-steps), the online softmax in the fragment layout (a lane holds 2 consecutive columns of one row of each 8x8 tile; the
+// 4 lanes of a row are xor 1 and xor 8), and uses P (half) straight as the A operand of P V.
+#ifndef VA_KJ
+#define VA_KJ 4  // 8-key fragments per inner block
+#endif
+#define VA_NSG 4
+#define VA_LD 72
 kernel void v_attn(device const half* Q [[buffer(0)]], device const half* K [[buffer(1)]], device const half* V [[buffer(2)]], device half* O [[buffer(3)]], constant int& N [[buffer(4)]],
-                   constant float& scale [[buffer(5)]], uint2 tgp [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+                   constant float& scale [[buffer(5)]], uint2 tgp [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+                   uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup half Ks[64 * VA_LD];
+    threadgroup half Vs[64 * VA_LD];
     const int h = tgp.y;
-    const int q0 = tgp.x * 64 + sg * 16;
+    const int q0 = tgp.x * (16 * VA_NSG) + sg * 16;
     const int LD = VD;
     const ushort qid = lane / 4;
     const ushort fm = (qid & 4) + ((lane / 2) % 4);
@@ -130,54 +139,78 @@ kernel void v_attn(device const half* Q [[buffer(0)]], device const half* K [[bu
         }
     float mr[2] = {-1e30f, -1e30f}, lr[2] = {0.f, 0.f};
     const float sc = scale * 1.4426950408889634f;  // exp2 domain
-    for (int kb = 0; kb < N; kb += 32) {
-        simdgroup_float8x8 s[2][4];
-        for (int i = 0; i < 2; ++i)
-            for (int j = 0; j < 4; ++j) s[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-        for (int d = 0; d < 9; ++d) {
-            simdgroup_half8x8 kf[4];
-            for (int j = 0; j < 4; ++j) simdgroup_load(kf[j], K + (size_t) (kb + 8 * j) * LD + h * VHD + 8 * d, LD, ulong2(0, 0), true);
+    for (int kb = 0; kb < N; kb += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < 64 * 9; i += 32 * VA_NSG) {
+            const uint row = i / 9, c = i % 9;
+            const size_t src = (size_t) (kb + row) * LD + h * VHD + c * 8;
+            *((threadgroup uint4*) (Ks + row * VA_LD + c * 8)) = *((device const uint4*) (K + src));
+            *((threadgroup uint4*) (Vs + row * VA_LD + c * 8)) = *((device const uint4*) (V + src));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < 64; kk += 8 * VA_KJ) {
+            if (kb + kk >= N) break;
+            simdgroup_float8x8 s[2][VA_KJ];
             for (int i = 0; i < 2; ++i)
-                for (int j = 0; j < 4; ++j) simdgroup_multiply_accumulate(s[i][j], qf[i][d], kf[j], s[i][j]);
-        }
-        simdgroup_half8x8 pf[2][4];
-        for (int i = 0; i < 2; ++i) {
-            float v[4][2];
-            float mx = -1e30f;
-            for (int j = 0; j < 4; ++j)
-                for (int e = 0; e < 2; ++e) {
-                    const int key = kb + 8 * j + fn + e;
-                    const float x = key < N ? s[i][j].thread_elements()[e] * sc : -1e30f;
-                    v[j][e] = x;
-                    mx = max(mx, x);
-                }
-            mx = max(mx, simd_shuffle_xor(mx, ushort(1)));
-            mx = max(mx, simd_shuffle_xor(mx, ushort(8)));
-            const float mn = max(mr[i], mx);
-            const float corr = exp2(mr[i] - mn);
-            float ps = 0.f;
-            for (int j = 0; j < 4; ++j)
-                for (int e = 0; e < 2; ++e) {
-                    const float p = exp2(v[j][e] - mn);
-                    ps += p;
-                    pf[i][j].thread_elements()[e] = half(p);
-                }
-            ps += simd_shuffle_xor(ps, ushort(1));
-            ps += simd_shuffle_xor(ps, ushort(8));
-            lr[i] = lr[i] * corr + ps;
-            mr[i] = mn;
-            if (simd_any(corr != 1.0f))
-                for (int d = 0; d < 9; ++d) {
-                    oa[i][d].thread_elements()[0] *= corr;
-                    oa[i][d].thread_elements()[1] *= corr;
-                }
-        }
-        for (int d = 0; d < 9; ++d)
-            for (int j = 0; j < 4; ++j) {
-                simdgroup_half8x8 vf;
-                simdgroup_load(vf, V + (size_t) (kb + 8 * j) * LD + h * VHD + 8 * d, LD);
-                for (int i = 0; i < 2; ++i) simdgroup_multiply_accumulate(oa[i][d], pf[i][j], vf, oa[i][d]);
+                for (int j = 0; j < VA_KJ; ++j) s[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int d = 0; d < 9; ++d) {
+                simdgroup_half8x8 kf[VA_KJ];
+                for (int j = 0; j < VA_KJ; ++j) simdgroup_load(kf[j], Ks + (kk + 8 * j) * VA_LD + 8 * d, VA_LD, ulong2(0, 0), true);
+                for (int i = 0; i < 2; ++i)
+                    for (int j = 0; j < VA_KJ; ++j) simdgroup_multiply_accumulate(s[i][j], qf[i][d], kf[j], s[i][j]);
             }
+            simdgroup_half8x8 pf[2][VA_KJ];
+#ifdef VA_NOSM
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < VA_KJ; ++j) { pf[i][j].thread_elements()[0] = half(s[i][j].thread_elements()[0]); pf[i][j].thread_elements()[1] = half(s[i][j].thread_elements()[1]); }
+            for (int i = 0; i < 0; ++i) {
+#else
+            for (int i = 0; i < 2; ++i) {
+#endif
+                float v[VA_KJ][2];
+                float mx = -1e30f;
+                for (int j = 0; j < VA_KJ; ++j)
+                    for (int e = 0; e < 2; ++e) {
+                        const int key = kb + kk + 8 * j + fn + e;
+                        const float x = key < N ? s[i][j].thread_elements()[e] * sc : -1e30f;
+                        v[j][e] = x;
+                        mx = max(mx, x);
+                    }
+                mx = max(mx, simd_shuffle_xor(mx, ushort(1)));
+                mx = max(mx, simd_shuffle_xor(mx, ushort(8)));
+                const float mn = max(mr[i], mx);
+                const float corr = exp2(mr[i] - mn);
+                float ps = 0.f;
+                for (int j = 0; j < VA_KJ; ++j)
+                    for (int e = 0; e < 2; ++e) {
+                        const float p = exp2(v[j][e] - mn);
+                        ps += p;
+                        pf[i][j].thread_elements()[e] = half(p);
+                    }
+                ps += simd_shuffle_xor(ps, ushort(1));
+                ps += simd_shuffle_xor(ps, ushort(8));
+                lr[i] = lr[i] * corr + ps;
+                mr[i] = mn;
+                if (simd_any(corr != 1.0f))
+                    for (int d = 0; d < 9; ++d) {
+                        oa[i][d].thread_elements()[0] *= corr;
+                        oa[i][d].thread_elements()[1] *= corr;
+                    }
+            }
+#ifndef VA_NOPV
+#ifdef VA_PVJ
+            for (int j = 0; j < VA_KJ; ++j)
+                for (int d = 0; d < 9; ++d) {
+#else
+            for (int d = 0; d < 9; ++d)
+                for (int j = 0; j < VA_KJ; ++j) {
+#endif
+                    simdgroup_half8x8 vf;
+                    simdgroup_load(vf, Vs + (kk + 8 * j) * VA_LD + 8 * d, VA_LD);
+                    for (int i = 0; i < 2; ++i) simdgroup_multiply_accumulate(oa[i][d], pf[i][j], vf, oa[i][d]);
+                }
+#endif
+        }
     }
     for (int i = 0; i < 2; ++i) {
         const float il = 1.0f / lr[i];
