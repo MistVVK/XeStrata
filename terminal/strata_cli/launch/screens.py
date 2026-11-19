@@ -1894,7 +1894,7 @@ class SaveScreen(Base):
         lines = self.summary_lines()
         warnings = self.ctx.warnings()
         body_h = self.query_one("#body").size.height
-        full_need = 2 + len(lines) + len(warnings) + 3 + 3
+        full_need = 2 + len(self.full_rows(lines, warnings)) + 3 + 3        # (the title, the name row, the rows with what wraps, the field, the three choices)
         compact = bool(body_h) and full_need > body_h
         name = self.query_one("#name", Input)
         name.set_class(compact, "slim")
@@ -1924,19 +1924,32 @@ class SaveScreen(Base):
             t.append("Save as preset, then launch\n", style=f"bold {ACCENT}")
             t.append("  Name   ")
             t.append("(type below)\n", style=MUTE)
-            col = max(10, *(len(k) for k, _v in lines)) + 2        # 0217 item 8: the label column is as wide as the longest label ("Strata data" touched its path in a 10-wide one)
-            for k, v in lines:
-                if k in ("Your files", "Strata data"):              # one row: a long folder wrapped and pushed the last choice off an 80x24 screen
-                    path, sep, note = v.partition(" (")
-                    v = middle_shorten(path, max(16, self.width() - col - 4 - (len(note) + 2 if sep else 0)), "…" if self.g.unicode else "...") + (sep + note if sep else "")
-                t.append(f"  {k:<{col}}{v}\n")
-            for n in warnings:
-                t.append(f"  ! {n}\n", style=WARN)
+            for text, style in self.full_rows(lines, warnings):
+                t.append(text + "\n", style=style)
             t.rstrip()
         self.query_one("#summary", Static).update(t)
         if getattr(self, "_compact", None) != compact:       # the body's height changes with it: look again once the layout has settled
             self._compact = compact
             self.call_after_refresh(self.paint)
+
+    def full_rows(self, lines: list[tuple[str, str]], warnings: list[str]) -> list[tuple[str, str]]:
+        """The rows of the full summary as (text, style), each one line of the window: a value that is longer than its room continues under itself, in the value's column
+        (0217: the offline drafter row ended in "(340" and went on at the screen's edge)."""
+        col = max(10, *(len(k) for k, _v in lines)) + 2        # 0217 item 8: the label column is as wide as the longest label ("Strata data" touched its path in a 10-wide one)
+        room = max(30, self.width() - col - 4)
+        out: list[tuple[str, str]] = []
+        for k, v in lines:
+            if k in ("Your files", "Strata data"):              # one row: a long folder wrapped and pushed the last choice off an 80x24 screen
+                path, sep, note = v.partition(" (")
+                v = middle_shorten(path, max(16, self.width() - col - 4 - (len(note) + 2 if sep else 0)), "…" if self.g.unicode else "...") + (sep + note if sep else "")
+            parts = textwrap.wrap(v, room, break_long_words=True) or [""]
+            out.append((f"  {k:<{col}}{parts[0]}", ""))
+            out += [(" " * (col + 2) + p, "") for p in parts[1:]]
+        for n in warnings:
+            parts = textwrap.wrap(n, max(30, self.width() - 6)) or [""]
+            out.append((f"  ! {parts[0]}", WARN))
+            out += [(f"    {p}", WARN) for p in parts[1:]]
+        return out
 
     def explain(self) -> Text:
         if (self.size.height or 30) < 20:
