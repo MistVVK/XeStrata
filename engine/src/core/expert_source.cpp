@@ -3680,10 +3680,13 @@ bool FileExpertSource::pin_cache_complement(
             // failed with out of memory.  Cut the budget to what the tightest GPU has left, less what the engine maps
             // after the complement (the lend ring, the hand-off and staging buffers: ~1.5 GiB measured on a two-card
             // split; STRATA_WDDM_SHARED_RESERVE_MIB changes the 2 GiB kept).  Where DXGI cannot tell, nothing changes.
+            // Only with two or more CUDA devices (the reported case: every card maps the whole complement and the ring and
+            // hand-off buffers of the split come on top); a one-card PC keeps the sizing it has always had, so its
+            // resident RAM copy is not cut.
             uint64_t left = std::numeric_limits<uint64_t>::max();
             int devices = 0;
             if (cudaGetDeviceCount(&devices) != cudaSuccess) devices = 0;
-            for (int d = 0; d < devices; ++d) {
+            for (int d = 0; d < devices && devices >= 2; ++d) {
                 cudaDeviceProp prop{};
                 uint64_t seg_budget = 0, seg_usage = 0;
                 std::string seg_why;
