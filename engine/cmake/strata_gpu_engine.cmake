@@ -400,6 +400,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME device_free_error_test COMMAND device_free_error_test)
     set_tests_properties(device_free_error_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
                          ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HIP_VISIBLE_DEVICES=-1")
+    # #5636: an error an earlier unchecked call left pending is said and cleared before a graph capture (needs a device; skipped without)
+    add_executable(pending_cuda_error_test tests/core/pending_cuda_error_test.cpp)
+    target_link_libraries(pending_cuda_error_test PRIVATE strata_engine)
+    add_test(NAME pending_cuda_error_test COMMAND pending_cuda_error_test)
+    set_tests_properties(pending_cuda_error_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     # STRATA_MMQ_DIRECT: slot_guard / slot_room / slot_tail on the uniform and the sized cache, and the default
     # (no guard) sized layout unchanged
     add_executable(expert_cache_slot_guard_test tests/core/expert_cache_slot_guard_test.cpp)
