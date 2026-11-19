@@ -602,9 +602,11 @@ static inline void row_dot1536(device const uchar* rp, device const half* xbase,
         sk_w8<F>(blk, g, j, w);
         for (int mm = 0; mm < MT; ++mm) {
             if (xoff[mm] >= 0) {
-                device const half* x = xbase + (size_t) xoff[mm] * 1536 + sbi * 256 + j;
+                device const half4* x4 = (device const half4*) (xbase + (size_t) xoff[mm] * 1536 + sbi * 256 + j);
+                const float4 xa = float4(x4[0]), xb = float4(x4[1]);
                 float a = 0.f;
-                for (int t = 0; t < 8; ++t) a += w[t] * float(x[t]);
+                a += w[0] * xa.x; a += w[1] * xa.y; a += w[2] * xa.z; a += w[3] * xa.w;
+                a += w[4] * xb.x; a += w[5] * xb.y; a += w[6] * xb.z; a += w[7] * xb.w;
                 acc[mm] += a;
             }
         }
@@ -622,6 +624,37 @@ static inline void row_dot_sw(int code, device const uchar* rp, device const hal
         default: break;
     }
 }
+// two rows (gate, up) of the same format against ONE x vector: the x loads are shared (decode pair path)
+template <int F>
+static inline void row_dot1536_gu(device const uchar* rg, device const uchar* ru, device const half* x, int lane, thread float& ag, thread float& au) {
+    constexpr int SB = sk_sb_bytes(F);
+    for (int unit = lane; unit < 6 * 32; unit += 32) {
+        const int sbi = unit >> 5, u = unit & 31, g = u >> 3, j = (g << 6) + ((u & 7) << 3);
+        device const half4* x4 = (device const half4*) (x + sbi * 256 + j);
+        const float4 xa = float4(x4[0]), xb = float4(x4[1]);
+        float wg[8], wu[8];
+        sk_w8<F>(rg + (size_t) sbi * SB, g, j, wg);
+        sk_w8<F>(ru + (size_t) sbi * SB, g, j, wu);
+        float a = 0.f, b = 0.f;
+        a += wg[0] * xa.x; a += wg[1] * xa.y; a += wg[2] * xa.z; a += wg[3] * xa.w;
+        a += wg[4] * xb.x; a += wg[5] * xb.y; a += wg[6] * xb.z; a += wg[7] * xb.w;
+        b += wu[0] * xa.x; b += wu[1] * xa.y; b += wu[2] * xa.z; b += wu[3] * xa.w;
+        b += wu[4] * xb.x; b += wu[5] * xb.y; b += wu[6] * xb.z; b += wu[7] * xb.w;
+        ag += a;
+        au += b;
+    }
+}
+static inline void row_dot_gu_sw(int code, device const uchar* rg, device const uchar* ru, device const half* x, int lane, thread float& ag, thread float& au) {
+    switch (code) {
+        case 2: row_dot1536_gu<2>(rg, ru, x, lane, ag, au); break;
+        case 3: row_dot1536_gu<3>(rg, ru, x, lane, ag, au); break;
+        case 4: row_dot1536_gu<4>(rg, ru, x, lane, ag, au); break;
+        case 5: row_dot1536_gu<5>(rg, ru, x, lane, ag, au); break;
+        case 6: row_dot1536_gu<6>(rg, ru, x, lane, ag, au); break;
+        case 8: row_dot1536_gu<8>(rg, ru, x, lane, ag, au); break;
+        default: break;
+    }
+}
 static inline int code_row_bytes(int code, int K) { return (K >> 8) * (code == 2 ? 70 : code == 3 ? 102 : code == 4 ? 134 : code == 5 ? 166 : code == 6 ? 198 : 262); }
 
 // ---- pair path (decode, few tokens): grid (192, P), 256 threads; every (token, slot) pair reads its own expert
@@ -636,11 +669,9 @@ kernel void moe_gu_pair(device const uchar* sec4 [[buffer(0)]], device const Exp
     device const half* sqx = (device const half*) body;
     const int rb = code_row_bytes(ed.gu_code, 1536);
     device const uchar* gu = body + 3072;
-    int xo[1] = {p / 16};
-    float ag[1] = {0.f}, au[1] = {0.f};
-    row_dot_sw<1>(ed.gu_code, gu + (size_t) r * rb, z, xo, lane, ag);
-    row_dot_sw<1>(ed.gu_code, gu + (size_t) (1536 + r) * rb, z, xo, lane, au);
-    float g = simd_sum(ag[0]), u = simd_sum(au[0]);
+    float ag = 0.f, au = 0.f;
+    row_dot_gu_sw(ed.gu_code, gu + (size_t) r * rb, gu + (size_t) (1536 + r) * rb, z + (size_t) (p / 16) * 1536, lane, ag, au);
+    float g = simd_sum(ag), u = simd_sum(au);
     if (lane == 0) {
         const float sg_ = g / (1.0f + exp(-g));
         const float hh = min(sg_, 10.0f) * clamp(u, -10.0f, 10.0f);
