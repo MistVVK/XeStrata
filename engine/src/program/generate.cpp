@@ -11788,7 +11788,25 @@ int main(int argc, char** argv) {
             (int) stages.size(), multi_gpu, strata::prefill::share_rules::split_share_env_of(std::getenv("STRATA_SPLIT_CPU_SHARE")), share_cuda_build);
         if (share_pool && share_layout && share_has_work && !share_default_ok()) share_has_work = false;   // H11
         if (stages.empty() && !multi_gpu && o.batch <= 0)   // STRATA_SWITCH_POINT: one card, no batch slots; before any bytes_needed, like the share
-            strata::prefill::Prefill::set_card_expert_share((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert), xcache.slots() > 0 ? (double) xcache.bytes() / (double) xcache.slots() / 1e6 : 0.0, o.pcie_probe_gbps);
+            strata::prefill::Prefill::set_card_expert_share((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert), xcache.slots() > 0 ? (double) xcache.bytes() / (double) xcache.slots() / 1e6 : 0.0, o.pcie_probe_gbps, pool.workers());
+        // BW-H: a layer split takes the share's limit and expert width from the link rule where the stages' stream floors, summed (a chunk passes through every stage in turn), are large;
+        // it arms the share by itself only where BW-F's default (below) does not: a split of three or more cards.  Call before arm_cpu_share (whose tail takes the limit as the stream floor).
+        if (share_pool && !stages.empty() && o.batch <= 0 && share_has_work) {
+            double floor_ms = 0.0;
+            bool links_ok = o.pcie_probe_gbps > 0.0, all_cc120 = true;
+            auto stage_floor = [&](const strata::core::ExpertCache& xc, int64_t lb, int64_t le, double link, int dev) {
+                if (!(link > 0.0) || xc.slots() <= 0) { links_ok = false; return; }
+                const int64_t miss = std::max<int64_t>(0, (le - lb) * g.n_expert - (int64_t) xc.slots());
+                floor_ms += (double) miss * ((double) xc.bytes() / (double) xc.slots() / 1e6) / link;
+                cudaDeviceProp dp;
+                if (cudaGetDeviceProperties(&dp, dev) != cudaSuccess || dp.major != 12 || dp.minor != 0) all_cc120 = false;
+            };
+            stage_floor(xcache, 0, stages.front()->lb, o.pcie_probe_gbps, 0);
+            for (auto& st : stages) stage_floor(st->cache, st->lb, st->le, st->link_gbps, st->dev);
+            if (links_ok && share_default_ok())
+                strata::prefill::Prefill::arm_cpu_share_split(true, floor_ms, pool.workers(), all_cc120);
+        }
+        // BW-F: one card, and a layer split of exactly two CUDA cards, arm the share by default (where the link rule above did not already, with its own limit)
         strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && share_layout && share_has_work);
         if (share_pool && share_layout && share_has_work && !stages.empty() && multi_gpu && std::getenv("STRATA_PREFILL_CPU_SHARE") == nullptr)
             std::fprintf(stderr, "strata serve: layer split of two cards: the CPU prefill share is armed by default, as on one card (STRATA_SPLIT_CPU_SHARE=0 turns it off)\n");
@@ -22996,7 +23014,7 @@ int main(int argc, char** argv) {
     int64_t spec_pos = strata::spec::kSpecNotStarted;   // plan v0.3 P6: where the speculative loop starts (0 is a real position: a 1-token prompt on a native pack)
     strata::prefill::Prefill prefill;
     if (!multi_gpu && o.batch <= 0)   // STRATA_SWITCH_POINT: before any bytes_needed, like the share
-        strata::prefill::Prefill::set_card_expert_share((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert), xcache.slots() > 0 ? (double) xcache.bytes() / (double) xcache.slots() / 1e6 : 0.0, o.pcie_probe_gbps);
+        strata::prefill::Prefill::set_card_expert_share((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert), xcache.slots() > 0 ? (double) xcache.bytes() / (double) xcache.slots() / 1e6 : 0.0, o.pcie_probe_gbps, pool.workers());
     // #1595: not by default when the cache holds every expert (nothing to take)
     strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool,
         !multi_gpu && !o.no_pool && o.batch <= 0 &&

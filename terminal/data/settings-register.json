@@ -30482,6 +30482,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PREFILL_CPU_SHARE_AUTO",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 486,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/DETAILS.md:1102"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "rollback",
+   "owner": "core",
+   "note": "=0 keeps the default CPU prompt share's limit 3,072 tokens and 8-token experts; unset: the limit and expert width follow the card's PCIe link, the experts it does not hold and the pool (compute capability 12.0); =1: the same on any CUDA card (RESULTS-BW-H.md)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PREFILL_CPU_SHARE_BATCH",
    "backends": [
     "cuda-hip"
@@ -30593,7 +30628,7 @@
    "last_date": "2026-11-19",
    "status": "opt-in",
    "owner": "core",
-   "note": "experts of up to N tokens may go to the CPU prompt share (default: 8); 2,244-4,272 ms -> 1,828 ms at 4K on an x8 PCIe 4.0 link, KL ratio 1.054 [0.993, 1.120] (RESULTS-BW-E.md)",
+   "note": "experts of up to N tokens may go to the CPU prompt share (default: 8; on a compute capability 12.0 card the link rule STRATA_PREFILL_CPU_SHARE_AUTO sets 32 or 64 where it raises the limit); 2,244-4,272 ms -> 1,828 ms at 4K on an x8 PCIe 4.0 link, KL ratio 1.054 [0.993, 1.120] (RESULTS-BW-E.md, RESULTS-BW-H.md)",
    "retire_after": "",
    "retired_in": ""
   },
