@@ -48,6 +48,8 @@ struct ServeOpts {
     bool session_reuse = false;
     std::string draft = "auto";  // auto = dfly2 when the file carries the drafter; off; dfly2 (error without it)
     SpecCfg spec;
+    std::string vision;                   // HY4-VISION: path of Hy4-Flash-Vision.strata (--vision); empty = text only, GENI is refused
+    int64_t image_max_pixels = 4194304;
 };
 
 struct SampleOpts {
@@ -122,6 +124,7 @@ struct GenReq {
     SampleOpts s;
     std::vector<int32_t> ids;
     bool prefill_only = false;
+    std::vector<std::string> images;  // HY4-VISION: image=<path> keys (percent-decoded), one per picture in prompt order (protocol 1.6b)
 };
 
 inline bool parse_gen(const std::string& line, GenReq& r, std::string& err) {
@@ -136,7 +139,7 @@ inline bool parse_gen(const std::string& line, GenReq& r, std::string& err) {
         i = j;
     }
     if (w.size() < 3 || w[0] != "GEN") {
-        err = "expected: GEN <max_new> [key=value ...] <ids>";
+        err = "expected: GEN <max_new> [key=value ...] [image=<path> ...] <ids>";
         return false;
     }
     char* e = nullptr;
@@ -164,6 +167,7 @@ inline bool parse_gen(const std::string& line, GenReq& r, std::string& err) {
         else if (key == "penalty_last_n") r.s.last_n = (int)d;
         else if (key == "seed") r.s.seed = (uint64_t)strtoull(val.c_str(), nullptr, 10);
         else if (key == "prefill") r.prefill_only = d != 0;
+        else if (key == "image") r.images.push_back(pct_decode(val));  // HY4-VISION
         else if (key == "pcie_frac" || key == "spec_min_p" || key == "prefill_pipe") continue;  // tuning keys of the Strata engine: not ours
         else {
             err = "unsupported key " + key;
@@ -292,8 +296,18 @@ inline int hy4_serve_main(const ServeOpts& o) {
     std::string base = o.model;
     size_t sl = base.find_last_of("/\\");
     if (sl != std::string::npos) base = base.substr(sl + 1);
-    proto("INFO engine=hy4-serve-0 arch=hy4flash backend=hip model=%s layers=%d vocab=%d chunk=%d session_reuse=%d drafter=%s images=0", base.c_str(), r.c.n_layers, V, r.Tc,
-          o.session_reuse ? 1 : 0, use_spec ? "dfly2" : "none");
+    // HY4-VISION: pictures need the Vision shard; probe it now (cheap, no GPU) so INFO tells serve the truth, and load it on the first picture request (not at start)
+    bool images_ok = false;
+    VisionEncoder venc;
+    VisionCtx vctx;
+    if (!o.vision.empty()) {
+        std::string verr;
+        VisionShardInfo vprobe;
+        if (vision_probe(o.vision, vprobe, verr)) images_ok = true;
+        else fprintf(stderr, "[vision] disabled: %s\n", verr.c_str());
+    }
+    proto("INFO engine=hy4-serve-0 arch=hy4flash backend=hip model=%s layers=%d vocab=%d chunk=%d session_reuse=%d drafter=%s images=%d", base.c_str(), r.c.n_layers, V, r.Tc,
+          o.session_reuse ? 1 : 0, use_spec ? "dfly2" : "none", images_ok ? 1 : 0);
     proto("READY %d stop", max_ctx);
 
     LineInput in;
@@ -309,6 +323,38 @@ inline int hy4_serve_main(const ServeOpts& o) {
             continue;
         }
         in.stop.store(false);
+        // HY4-VISION (protocol 1.6b): image=<path> keys, one per image-pad token of the ids. Decode + resize the pictures (CPU), expand each pad to its run, tell serve with IMG lines.
+        r.vis = nullptr;
+        vctx.release();
+        const bool has_images = !q.images.empty();
+        const double t_req = now_s();
+        std::vector<ImageRec> recs;
+        if (has_images) {
+            std::string ierr;
+            if (!images_ok) {
+                proto("ERR image: this engine was started without the Vision shard (--vision Hy4-Flash-Vision.strata)");
+                continue;
+            }
+            bool bad = false;
+            for (const std::string& f : q.images) {
+                ImageRec rc;
+                if (!prepare_picture(f, VitCfg().min_pixels, o.image_max_pixels, rc, ierr)) {
+                    bad = true;
+                    break;
+                }
+                recs.push_back(std::move(rc));
+            }
+            std::vector<int32_t> ex;
+            if (bad || !expand_image_pads(q.ids, VitCfg().image_token, recs, ex, ierr)) {
+                proto("ERR image: %s", ierr.c_str());
+                continue;
+            }
+            q.ids.swap(ex);
+            for (size_t i = 0; i < recs.size(); ++i) proto("IMG %zu %d", i + 1, image_token_count(recs[i].h, recs[i].w));
+        } else if (std::find(q.ids.begin(), q.ids.end(), (int32_t)VitCfg().image_token) != q.ids.end()) {
+            proto("ERR image: 0 files for %d image placeholders", (int)std::count(q.ids.begin(), q.ids.end(), (int32_t)VitCfg().image_token));
+            continue;
+        }
         const int T0 = (int)q.ids.size();
         if (T0 == 0) {
             proto("ERR empty prompt");
@@ -322,14 +368,33 @@ inline int hy4_serve_main(const ServeOpts& o) {
             proto("ERR prefill=1 is not supported");
             continue;
         }
+        // HY4-VISION: encode the pictures now (loads the shard on first use); the runner hooks fill the prompt's image rows. No KV reuse across picture requests.
+        if (has_images) {
+            std::string ierr;
+            venc.cancel = &in.stop;
+            if (!venc.load(o.vision, ierr) || !vctx.setup(venc, r.st, q.ids, recs, r.Tc, ierr)) {
+                if (in.stop.load()) {
+                    proto("DONE 0 %d %.1f 0.0 cancel", T0, (now_s() - t_req) * 1000.0);
+                    continue;
+                }
+                proto("ERR image: %s", ierr.c_str());
+                continue;
+            }
+            fprintf(stderr, "[vision] %zu picture(s), %d image rows, encoded in %.2f s\n", recs.size(), vctx.n_rows, vctx.t_encode);
+            // keep the 0.93 GB of weights resident only when the card has room to spare (a 12 GB card does not): the next picture request then skips the load
+            size_t vf = 0, vt = 0;
+            HCK(hipMemGetInfo(&vf, &vt));
+            if (vf < ((size_t)4 << 30)) venc.unload();
+            r.vis = &vctx;
+        }
         // KV reuse: only a pure extension of what is resident
         int start = 0;
-        if (o.session_reuse && fwd > 0 && fwd < T0 && (int)tok.size() >= fwd && std::equal(tok.begin(), tok.begin() + fwd, q.ids.begin())) start = fwd;
+        if (!has_images && o.session_reuse && fwd > 0 && fwd < T0 && (int)tok.size() >= fwd && std::equal(tok.begin(), tok.begin() + fwd, q.ids.begin())) start = fwd;
         tok.assign(q.ids.begin(), q.ids.end());
         fwd = 0;
         if (start > 0) proto("RESUME %d", start);
         std::mt19937_64 rng(q.s.seed ? q.s.seed : std::random_device{}());
-        const double t0 = now_s();
+        const double t0 = has_images ? t_req : now_s();  // the prompt time of a picture request includes the picture encoding
         int done = start;
         bool cancelled = false, failed = false;
         r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
@@ -431,7 +496,8 @@ inline int hy4_serve_main(const ServeOpts& o) {
             return 1;
         }
         if (nonfinite) finish = "nonfinite";
-        if (!o.session_reuse) fwd = 0;
+        if (!o.session_reuse || has_images) fwd = 0;
+        r.vis = nullptr;
         const double decode_ms = (now_s() - t1) * 1000.0;
         proto("DONE %d %d %.1f %.1f %s 0 0 %d", made, T0, prompt_ms, decode_ms, finish, start);
     }
