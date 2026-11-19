@@ -1812,10 +1812,12 @@ class OutputParser:
                         self.fence = ""
                 elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
                     self.fence = s[0] * (len(s) - len(s.lstrip(s[0])))
-                elif not s:
-                    self.ticks = 0
                 else:
-                    self.ticks += line.count("`")
+                    # #4923: inline code is a one-line matter here.  The odd count of a line with one unpaired backtick was carried to the
+                    # end of the paragraph, so every `<tool_call>` after it read as quoted inline code and the turn ended with no call.
+                    # A quoted opener sits in a fence or on a line with its own backticks (the fence state and the current line decide
+                    # both), so a finished line carries nothing on.
+                    self.ticks = 0
                 # #4703: an indented (4 spaces or a tab) code block starts after a blank line and goes on until a line that is not indented
                 if was_fenced or self.fence:
                     self._prev_blank = self._indented = False

@@ -22,10 +22,8 @@ class ReferenceParser(OutputParser):
                         self.fence = ""
                 elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
                     self.fence = s[0] * (len(s) - len(s.lstrip(s[0])))
-                elif not s:
-                    self.ticks = 0
                 else:
-                    self.ticks += line.count("`")
+                    self.ticks = 0                                                 # #4923: a finished line carries no backtick count
                 if was_fenced or self.fence:                                       # #4703: indented code blocks
                     self._prev_blank = self._indented = False
                 elif not s:
