@@ -233,7 +233,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_QSA_CLUSTER` | number | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
 | `STRATA_QSA_SPLIT_ATTN` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_RAM_ADAPT` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [release-notes-0.2.7.md](release-notes-0.2.7.md) |
-| `STRATA_RAM_KEEP_GIB` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
+| `STRATA_RAM_KEEP_GIB` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [UNSLOTH_Q4.md](UNSLOTH_Q4.md) |
 | `STRATA_RDNA2_SGEMM` | number | AMD | [AMD_HIP.md](AMD_HIP.md), [README.md](bench-results/2026-10-04-rdna2-fp16-prompt/README.md) |
 | `STRATA_RESIDENT_HEADROOM_GIB` | number | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [DETAILS.md](DETAILS.md), [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 | `STRATA_ROCBLAS_TUNING` | on / off | AMD | [AMD_HIP.md](AMD_HIP.md), [README.md](bench-results/2026-10-05-rdna2-rocblas-table/README.md), [README.md](bench-results/2026-10-06-community-2x-rx-6900xt-0.1.40.1/README.md) |
