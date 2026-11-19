@@ -164,6 +164,8 @@ public:
     bool flash_on = false;     // mla_flash (simdgroup_matrix attention) for prefill chunks of >= 16 tokens (needs the MPP library build)
     int moe_mm_min = 64;       // MoE prefill through the MPP grouped GEMM from this many tokens (needs mpp_ok)
     Buffer m_srt, m_pos, m_tiles, m_meta, m_xs, m_hs, m_y;
+    Buffer attn_ws;            // split-K attention partials [T<=4][64][S<=16][514] floats
+    int split_max = 8;         // key splits per head for decode (T <= 4); 0 = off
     static int moe_tm(int T) { return T <= 768 ? 16 : (T <= 1536 ? 32 : 64); }
     size_t wscr_elems = 0;
     int lib = -1;
@@ -284,11 +286,11 @@ public:
         {
             const std::string dir = kernel_path.substr(0, kernel_path.rfind('/') + 1);
             std::string why;
-            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
+            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
             mpp_ok = lib >= 0;
             if (!mpp_ok) {
                 if (mpp_try) fprintf(stderr, "[metal] MPP (Metal 4 matmul2d) kernels not available, simdgroup GEMM only: %s\n", why.substr(0, 200).c_str());
-                lib = cx.compile({kernel_path}, "#define NO_GGML_COMMON 1\n", false);
+                lib = cx.compile({kernel_path, dir + "hy4_split.metal"}, "#define NO_GGML_COMMON 1\n", false);
             }
             wscr_elems = (size_t) 16384 * 3072;
             if (mpp_ok) wscr = cx.alloc(wscr_elems * 2);
@@ -317,6 +319,7 @@ public:
         F2 = A(big * 4);
         F3 = A(big * 4);
         F4 = A((size_t) T * 3072 * 4);
+        attn_ws = A((size_t) 4 * 64 * 16 * 514 * 4);
         H1 = A(big * 2);
         qr_h = A((size_t) T * 1024 * 2);
         qa_h = A((size_t) T * 64 * 576 * 2);
@@ -559,7 +562,15 @@ public:
         a.scale = 0.0625f;
         if (mpp_ok && flash_on && T >= 16 && NH % 32 == 0)
             add("mla_flash", NH / 32, T, 256, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
-        else
+        else if (T <= 4 && split_max > 0) {
+            const int S = std::min(split_max, NH == 32 ? 8 : 4);
+            Dispatch dd;
+            dd.p = &P("mla_attend_part");
+            dd.args = {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(attn_ws), Arg::V<MlaArgs>(a), B(keys), B(nkeys), I(S)};
+            dd.grid[0] = NH; dd.grid[1] = S; dd.grid[2] = T; dd.tg[0] = 256;
+            ds.push_back(std::move(dd));
+            add("mla_attend_merge", NH, T, 256, {B(attn_ws), B(ctx_h), Arg::V<MlaArgs>(a), I(S)});
+        } else
             add("mla_attend", NH, T, 256, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
         op("mla_attend");
         add(TT == 1 ? "mla_vup_1" : "mla_vup_8", NH, (T + TT - 1) / TT, 256, {B(ctx_h), B(wv_b, wv_off[il]), B(F3), B(o_h), I(T), I(NH)});
@@ -713,7 +724,7 @@ static size_t rss_bytes() {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false;
-    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64;
+    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -738,6 +749,7 @@ int main(int argc, char** argv) {
         else if (a == "--pair-max") pair_max = atoi(nxt().c_str());
         else if (a == "--layers") n_layers_run = atoi(nxt().c_str());
         else if (a == "--no-mpp") no_mpp = true;
+        else if (a == "--split") split_arg = atoi(nxt().c_str());
         else if (a == "--flash") no_flash = true;
         else if (a == "--no-relax") no_relax = true;
         else if (a == "--moe-mm-min") moe_mm_min_arg = atoi(nxt().c_str());
@@ -798,6 +810,7 @@ int main(int argc, char** argv) {
     r.seg_force = seg;
     r.pair_max = pair_max;
     r.mpp_try = !no_mpp;
+    r.split_max = split_arg;
     r.flash_on = no_flash;
     r.relax_ok = !no_relax;
     r.mpp_min = mpp_min_arg;

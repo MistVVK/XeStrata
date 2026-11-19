@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
     if (argc < 3) return 2;
     mtl::Context cx;
     const std::string kdir = std::string(argv[1]).substr(0, std::string(argv[1]).rfind('/') + 1);
-    int lib = cx.compile({argv[1], kdir + "hy4_flash.metal"}, "#define NO_GGML_COMMON 1\n", false);
+    int lib = cx.compile({argv[1], kdir + "hy4_flash.metal", kdir + "hy4_split.metal"}, "#define NO_GGML_COMMON 1\n", false);
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 1.f);
     int bad = 0;
@@ -147,6 +147,44 @@ int main(int argc, char** argv) {
             printf("%s mode %d (M %d NH %d)  maxerr %.3e maxref %.3e %s\n", variant ? "mla_flash" : "mla_attend", mode, M, NH, maxerr, maxref, ok ? "ok" : "BAD");
         }
         }
+        // split-K decode attention vs the simple kernel (T = 1, 2, several splits)
+        for (int mode = 0; mode < 3; ++mode)
+            for (int S : {1, 3, 8}) {
+                const int NHs = 4, M = 2, slots = 700, kmax = 600, p0 = mode == 1 ? 900 : 400, ring = mode == 1 ? 640 : 0;
+                std::vector<uint16_t> qa((size_t) M * NHs * 576), cache((size_t) slots * 576);
+                for (auto& v : qa) v = f2h(nd(rng) * 0.3f);
+                for (auto& v : cache) v = f2h(nd(rng) * 0.3f);
+                std::vector<float> sinks(NHs);
+                for (auto& v : sinks) v = nd(rng);
+                std::vector<int32_t> keys((size_t) M * kmax), nk(M);
+                for (int t = 0; t < M; ++t) {
+                    nk[t] = 500 + t * 37;
+                    for (int j = 0; j < nk[t]; ++j) keys[(size_t) t * kmax + j] = (int) (rng() % slots);
+                }
+                mtl::Buffer bq = cx.alloc(qa.size() * 2), bc = cx.alloc(cache.size() * 2), bs = cx.alloc(NHs * 4), bo1 = cx.alloc((size_t) M * NHs * 512 * 2), bo2 = cx.alloc((size_t) M * NHs * 512 * 2),
+                            bk = cx.alloc(keys.size() * 4), bn = cx.alloc(M * 4), bws = cx.alloc((size_t) M * NHs * 16 * 514 * 4);
+                std::memcpy(bq.ptr, qa.data(), qa.size() * 2);
+                std::memcpy(bc.ptr, cache.data(), cache.size() * 2);
+                std::memcpy(bs.ptr, sinks.data(), NHs * 4);
+                std::memcpy(bk.ptr, keys.data(), keys.size() * 4);
+                std::memcpy(bn.ptr, nk.data(), M * 4);
+                MlaArgs a{M, NHs, p0, mode, 512, ring, kmax, 0.0625f};
+                mtl::Pipeline p1, p2, p3;
+                auto d1 = mk(cx, lib, "mla_attend", &p1, {mtl::Arg::B(bq), mtl::Arg::B(bc), mtl::Arg::B(bs), mtl::Arg::B(bo1), mtl::Arg::V<MlaArgs>(a), mtl::Arg::B(bk), mtl::Arg::B(bn)}, NHs, M, 256);
+                auto d2 = mk(cx, lib, "mla_attend_part", &p2, {mtl::Arg::B(bq), mtl::Arg::B(bc), mtl::Arg::B(bs), mtl::Arg::B(bws), mtl::Arg::V<MlaArgs>(a), mtl::Arg::B(bk), mtl::Arg::B(bn), mtl::Arg::V<int32_t>(S)}, NHs, S, 256);
+                d2.grid[2] = M;
+                auto d3 = mk(cx, lib, "mla_attend_merge", &p3, {mtl::Arg::B(bws), mtl::Arg::B(bo2), mtl::Arg::V<MlaArgs>(a), mtl::Arg::V<int32_t>(S)}, NHs, M, 256);
+                cx.run({d1, d2, d3}, 1, false, true);
+                double md = 0, mr = 0;
+                for (size_t i = 0; i < (size_t) M * NHs * 512; ++i) {
+                    double x = h2f(((const uint16_t*) bo1.ptr)[i]), y = h2f(((const uint16_t*) bo2.ptr)[i]);
+                    md = std::max(md, std::fabs(x - y));
+                    mr = std::max(mr, std::fabs(x));
+                }
+                bool ok = md / (mr + 1e-9) < 2e-3;
+                bad += !ok;
+                printf("mla_attend split-K mode %d S %d: maxdiff vs simple %.3e (ref %.3e) %s\n", mode, S, md, mr, ok ? "ok" : "BAD");
+            }
         const int NH = 4;
         // prep_q + vup
         for (int TT : {1, 8}) {
