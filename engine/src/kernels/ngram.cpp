@@ -6,6 +6,7 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/ngram/ple_reader.hpp"
+#include "strata/core/progress.hpp"
 #include "strata/platform/memory.hpp"
 
 #include <cerrno>
@@ -740,6 +741,7 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         if (w + kWin < n) hint(w + kWin, std::min(n, w + 2 * kWin));
         const size_t e = std::min(n, w + kWin);
         for (size_t i = w; i < e; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
+        strata::core::progress_beat();   // #4682, #3952: a window of demand faults that came back is progress for the serve watchdog
     }
     return true;
 }

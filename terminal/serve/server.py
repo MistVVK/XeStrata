@@ -1530,6 +1530,11 @@ class StrataEngine:
                         self.last["prompt_ms"] = (self.last.get("prompt_ms") or 0.0) + float(value)
                     except ValueError:
                         pass
+                elif eq and key == "drafts":                 # drafts=<checked>:<kept>: the slot's own --batch-mtp counters (#5890)
+                    offered, colon, accepted = value.partition(":")
+                    if colon and offered.isdigit() and accepted.isdigit():
+                        self.last["drafts_offered"] = (self.last.get("drafts_offered") or 0) + int(offered)
+                        self.last["drafts_accepted"] = (self.last.get("drafts_accepted") or 0) + int(accepted)
 
     def _raise_if_fatal_gpu(self, line: str) -> None:
         """#4350: the engine's ERR line "fatal GPU error: ..." means it is ending (its GPU context is gone).  The request in flight fails
@@ -5878,6 +5883,10 @@ class Service:
                 "reasoning_recoveries": recovery_count}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
+            if finish == "length":
+                # #4035: the stop string was found and cut from the answer, so the answer ended at it: "stop", not the token cap that fell on the
+                # same token (the Anthropic route already says stop_sequence)
+                done["finish"] = "stop"
         if rejected:
             done["rejected_tool_calls"] = rejected
         if markup_retried is not None:

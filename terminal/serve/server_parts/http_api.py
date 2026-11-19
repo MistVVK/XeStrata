@@ -711,25 +711,63 @@ def with_component_engine(cfg: dict) -> dict:
 def _history_call_names(req) -> list:
     """The tool names a request's own conversation called, in order, on any of the three routes: Chat Completions (an assistant
     message's tool_calls), Anthropic (an assistant message's tool_use blocks) and Responses (function_call / custom_tool_call
-    input items, a namespace in front as `namespace.name`)."""
+    input items, a namespace in front as `namespace.name`).  #6120: a name every call of which the client REFUSED (its result says the tool does not
+    exist: `AI_NoSuchToolError: Model tried to call unavailable tool 'edit'`) is not a tool the client has and is left out."""
     names = []
+    calls = []          # (name, call id)
+    results = {}        # call id -> the text of its result
     for message in req.get("messages") or []:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
+        if not isinstance(message, dict):
             continue
-        for call in message.get("tool_calls") or []:
-            names.append((call.get("function") or {}).get("name") if isinstance(call, dict) else None)
+        if message.get("role") == "tool":
+            results[message.get("tool_call_id")] = _result_text(message.get("content"))
         content = message.get("content")
         for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                results[block.get("tool_use_id")] = _result_text(block.get("content"))
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            calls.append(((call.get("function") or {}).get("name") if isinstance(call, dict) else None,
+                          call.get("id") if isinstance(call, dict) else None))
+        for block in content if isinstance(content, list) else []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
-                names.append(block.get("name"))
+                calls.append((block.get("name"), block.get("id")))
     items = req.get("input")
     for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and item.get("type") in ("function_call_output", "custom_tool_call_output"):
+            results[item.get("call_id")] = _result_text(item.get("output"))
         if isinstance(item, dict) and item.get("type") in ("function_call", "custom_tool_call"):
             name = item.get("name")
             if isinstance(name, str) and name and isinstance(item.get("namespace"), str) and item["namespace"]:
                 name = f"{item['namespace']}.{name}"
+            calls.append((name, item.get("call_id")))
+    kept = {}
+    for name, call_id in calls:
+        refused = call_id is not None and call_id in results and _refusal(results[call_id])
+        kept[name] = kept.get(name, False) or not refused
+    for name, _ in calls:
+        if kept.get(name) and name not in names:
             names.append(name)
     return names
+
+
+def _result_text(content) -> str:
+    """The text of a tool result in any of the routes' shapes (a string, or a list of text parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+    return ""
+
+
+_REFUSAL = re.compile(r"NoSuchTool|rejected before execution|unavailable tool|unknown tool|no such tool|tool '?[\w.:-]+'? (?:does not exist|is not available|not found)",
+                      re.IGNORECASE)
+
+
+def _refusal(text: str) -> bool:
+    """#6120: a tool result in which the client says the tool called does not exist (so the call never ran)."""
+    return bool(_REFUSAL.search(text or ""))
 
 
 def with_history_tools(tools, req) -> list:

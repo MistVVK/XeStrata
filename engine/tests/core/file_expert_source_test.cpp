@@ -703,7 +703,23 @@ void test_host_memory() {
     put("fs/box/memory.max", "48G\n");
     require(!probe("0::/box\n"), "v2 malformed limit accepted");
     fs::remove(t.path / "fs/box/memory.max");
-    require(!probe("0::/box\n"), "v2 group without memory.max accepted");
+    // #5196: a group without a memory.max has no memory controller and no limit of its own; with no limit above it either, MemAvailable alone
+    require(probe("0::/box\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v2 group without memory.max: no limit of its own");
+    // ... and the parent's limit still applies to it (a 40 GiB group above a child that has no controller)
+    put("fs/memory.max", std::to_string(40 * GiB) + "\n");
+    put("fs/memory.current", std::to_string(10 * GiB) + "\n");
+    put("fs/memory.stat", "inactive_file " + std::to_string(2 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
+    require(probe("0::/box\n") && m.cgroup_limit == 40 * GiB && m.available < 100 * GiB, "v2: the controllerless child reads its parent's limit");
+    // a container that has no cgroup namespace: /proc/self/cgroup names the host's path, /sys/fs/cgroup is its own group (the mount's root)
+    require(probe("0::/system.slice/docker-abc.scope\n") && m.cgroup_limit == 40 * GiB && m.available < 100 * GiB,
+            "v2: a path that is not in the mount reads the mount's own group");
+    fs::remove(t.path / "fs/memory.max");
+    fs::remove(t.path / "fs/memory.current");
+    fs::remove(t.path / "fs/memory.stat");
+    // an unreadable limit (a directory where the file should be) is still not guessed at, and says what it could not read
+    fs::create_directories(t.path / "fs/box/memory.max");
+    require(!probe("0::/box\n") && m.why != nullptr, "v2 unreadable memory.max accepted");
+    fs::remove_all(t.path / "fs/box/memory.max");
     // v1: the memory controller's group (a hybrid line list), a 32 GiB limit with 10 GiB used
     put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
     put("fs/memory/docker/abc/memory.usage_in_bytes", std::to_string(10 * GiB) + "\n");
@@ -734,7 +750,8 @@ void test_host_memory() {
     put("fs/box/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
     put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
     require(probe("4:memory:/docker/abc\n0::/box\n") && m.cgroup_limit == 48 * GiB, "v2 root: the 0:: line wins over a v1 line");
-    require(!probe("0::/nowhere\n"), "v2 root: a 0:: path that is not a directory still fails");
+    // (#5196: a 0:: path that is not in the mount reads the mount's own group; this root has no memory.max, so MemAvailable alone)
+    require(probe("0::/nowhere\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v2 root: a 0:: path that is not a directory: the mount's own group");
 #else
     require(host_available_memory(m) && m.available > 0 && m.cgroup_limit == ~0ull, "this PC's RAM");
 #if defined(_WIN32)

@@ -6413,6 +6413,34 @@ class StopStrings(unittest.TestCase):
                     # the engine stopped at the stop string, it did not run to the end of the answer
                     self.assertLess(self.engine.yielded, len("</think>\n\n" + self.ANSWER))
 
+    def test_a_stop_string_that_ends_on_the_token_cap_is_a_stop(self):
+        """#4035: the stop string is the answer's last token and also the token that hits max_tokens: the answer ended at the stop string, so
+        finish_reason is "stop" (it said "length"); the Anthropic route says stop_sequence."""
+        for stop, upto, kept in (("END", "alpha END", "alpha "), ("\n", "alpha END beta STOP gamma\n", "alpha END beta STOP gamma")):
+            tok = ByteTokenizer()
+            engine = CountingEngine(tok, "</think>\n\n" + self.ANSWER + ("\nmore" if stop == "\n" else ""), max_context=CTX)
+            svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            n = len("</think>\n\n" + upto)          # one token per byte: the cap falls on the last byte of the stop string
+            try:
+                for api in ("openai", "anthropic"):
+                    for stream in (False, True):
+                        with self.subTest(stop=stop, api=api, stream=stream):
+                            old, self.base = self.base, base
+                            try:
+                                code, text, finish, seq, _ = self.post(api, stream, max_tokens=n, **self.stop_field(api, [stop]))
+                            finally:
+                                self.base = old
+                            self.assertEqual((code, text), (200, kept))
+                            if api == "openai":
+                                self.assertEqual(finish, "stop")
+                            else:
+                                self.assertEqual((finish, seq), ("stop_sequence", stop))
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
     def test_the_first_of_several(self):
         for api in ("openai", "anthropic"):
             for stream in (False, True):

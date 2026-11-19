@@ -10,6 +10,7 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/pending_cuda_error.hpp"
 #include "strata/core/window_evict.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/pin_budget.hpp"
@@ -2886,6 +2887,11 @@ bool Verifier::capture(int T, std::string& err) {
         else
             (void) cudaGetLastError();
     }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    // #5636: an error an earlier unchecked call left in the thread's slot is said and cleared here; otherwise the first launch check of the capture
+    // (copy_i32_from_mapped: "invalid argument" on sm_70 / sm_75) reads it and ends the engine as if that launch had failed
+    (void) strata::core::take_pending_cuda_error("the verify window's capture");
+#endif
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;

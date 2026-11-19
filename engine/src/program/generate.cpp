@@ -141,6 +141,7 @@
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
+#include "strata/program/bdone_drafts.hpp"
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/par_counters.hpp"
 #if defined(__linux__)
@@ -15484,7 +15485,11 @@ int main(int argc, char** argv) {
         // that reuses nothing does (the engine's state after session_init); no checkpoint, conversation entry, RNG draw, policy sample or statistic is touched (the policy's observe_*
         // calls live in the decode loop); the expert cache may page in what the dummy token routes to (speed only).  STRATA_WINDOW_WARM=0: off (research switch).
         {
-            static const bool warm_off = [] { const char* v = std::getenv("STRATA_WINDOW_WARM"); return v != nullptr && v[0] == '0'; }();
+            // #6171: not while STRATA_ROUTE_PRIOR is on (the dummy token's paged-in experts would bias the first request's routing); STRATA_WINDOW_WARM=1 forces it
+            static const bool warm_off = [] {
+                const float prior = strata::route_prior_resolve(std::getenv("STRATA_ROUTE_PRIOR"), false, false, 0.0);
+                return !strata::window_warm_on(std::getenv("STRATA_WINDOW_WARM"), prior);
+            }();
             if (!warm_off && o.spec >= 2 && n_stages == 1 && o.batch <= 0) {
                 const Clock::time_point w0 = Clock::now();
                 std::vector<int32_t> wtok((size_t) o.spec, 1), wout((size_t) o.spec + 1, 0);
@@ -15806,6 +15811,7 @@ int main(int argc, char** argv) {
             uint64_t caps = 0;             ///< Verifier::graphs_made() then (a round across a capture is not timed)
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
+            int64_t drafts_off = 0, drafts_acc = 0;   ///< --batch-mtp: the proposals its windows checked / kept since the admission (BDONE's drafts=, #5890)
             strata::core::SlotHold hold;   ///< GEN / BGEN hold=N:ID (the server's thinking budget): the slot ends with BDONE "hold" after N emitted tokens unless ID came first
             Clock::time_point t0;
             // the slot's own conversation cache: the tokens its sessions hold (the prompt, then every token a window
@@ -16323,6 +16329,10 @@ int main(int argc, char** argv) {
             for (int a = 0; a < A; ++a) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
+                if (batch_mtp) {   // #5890: the slot's own counters, for its BDONE (the response's draft_n / draft_n_accepted)
+                    bs[(size_t) active[a]].drafts_off += nrow[a] - 1;
+                    bs[(size_t) active[a]].drafts_acc += keep[active[a]] - 1;
+                }
             }
             std::vector<int> df2_launched;   // batch DFlash2: slots whose draft graph is queued
             for (int t = 0; t < A; ++t) {
@@ -16354,7 +16364,7 @@ int main(int argc, char** argv) {
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f%s\n", b, (long long) sl.produced, fin, ms, strata::program::bdone_drafts_text(sl.drafts_off, sl.drafts_acc).c_str());
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
                         break;
@@ -16749,6 +16759,8 @@ int main(int argc, char** argv) {
                 if (!blk.rd) {
                     bt_accepted += blk.keep - 1;
                     bt_tokens += blk.n - 1;   // (proposals checked)
+                    sl.drafts_off += blk.n - 1;   // #5890: the slot's own counters, for its BDONE
+                    sl.drafts_acc += blk.keep - 1;
                 }
                 if (plk && !blk.rd) {
                     // The policy's sample: the window's size and what it kept, in the slot's time since its last verdict
@@ -16813,7 +16825,7 @@ int main(int argc, char** argv) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                     char rd_txt[40] = "";   // (STRATA_SLOT_READ: what the slot's own read of the turn took)
                     if (sl.rd_ms > 0.0) std::snprintf(rd_txt, sizeof rd_txt, " read=%.1f", sl.rd_ms);
-                    std::printf("BDONE %d %lld %s %.1f%s\n", blk.b, (long long) sl.produced, fin, ms, rd_txt);
+                    std::printf("BDONE %d %lld %s %.1f%s%s\n", blk.b, (long long) sl.produced, fin, ms, rd_txt, strata::program::bdone_drafts_text(sl.drafts_off, sl.drafts_acc).c_str());
                     sl.active = false;
                     sl.draft_ready = false;
                     // a cache again (#857), as on the pipelined path without drafts: final once its commits have run
@@ -17036,7 +17048,7 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(sl.x);
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f%s\n", gi * GS + t, (long long) sl.produced, fin, ms, strata::program::bdone_drafts_text(sl.drafts_off, sl.drafts_acc).c_str());
                         sl.active = false;
                         // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
