@@ -6074,22 +6074,27 @@ def upscaler_weights(gen: ImageGen, job: dict, key: str = "upscaler") -> None:
 def seedvr2_or_realesrgan(gen: ImageGen, job: dict) -> None:
     """A SeedVR2 upscale, auto's or asked for, where the engine says it does not fit the GPU (UPSNEED's least past its
     cap): its 3B instead of the 7B where the 3B's weights are here and fit, else RealESRGAN, said in the result
-    (job["upscaler"]["fallback"]) rather than the upscale refused."""
+    (job["upscaler"]["fallback"]) rather than the upscale refused.  A video's where the RAM free now is too short for
+    its VAE's carried frames (UPSVNEED's ram_short; the 3B's VAE is the same): RealESRGAN, decided before its first
+    frame."""
     u = job["upscaler"]
     if u["method"] != "seedvr2" or not job.get("ups_only") and u["asked"] != "auto":
         return   # a redraw's upscaler asked for is counted in the drawing's NEED, and refused there
+    short = {"ram": False}
 
     def fits() -> bool:
         try:
             need = gen.need(job) if job.get("ups_only") else None
         except ImageJobFailed:
             need = None
+        short["ram"] = bool(need and int(need.get("ram_short", 0)))
         return need is not None and int(need.get("least_mib", 0)) <= int(need.get("cap_mib", 0))   # UPSNEED's cap
     if fits():
         return
     root = image_aux.aux_dir(gen.cfg)
     small = ("seedvr2-3b-int8", "seedvr2-3b-fp16")
-    if job.get("ups_only") and u.get("variant") != "3b" and any(image_aux.ready(n, root) for n in small):
+    if job.get("ups_only") and not short["ram"] and u.get("variant") != "3b" and \
+            any(image_aux.ready(n, root) for n in small):
         was = u.get("variant") or "7b"
         u.update(variant="3b")
         u.pop("path", None)
@@ -6099,8 +6104,12 @@ def seedvr2_or_realesrgan(gen: ImageGen, job: dict) -> None:
             gen._say(f"image job: SeedVR2 {was} does not fit the GPU: its 3B instead")
             u["fallback"] = f"SeedVR2's {was} does not fit the GPU's memory: its 3B"
             return
-    gen._say("image job: SeedVR2 does not fit the GPU: RealESRGAN instead")
-    u.update(method="realesrgan", fallback="SeedVR2 does not fit the GPU's memory")
+    if short["ram"]:
+        gen._say("image job: SeedVR2's VAE does not fit the RAM free now for this video: RealESRGAN instead")
+        u.update(method="realesrgan", fallback="SeedVR2's VAE does not fit the RAM free now for this video's size")
+    else:
+        gen._say("image job: SeedVR2 does not fit the GPU: RealESRGAN instead")
+        u.update(method="realesrgan", fallback="SeedVR2 does not fit the GPU's memory")
     u.pop("variant", None)
     u.pop("path", None)
     u.pop("file", None)
