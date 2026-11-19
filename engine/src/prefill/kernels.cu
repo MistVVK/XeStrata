@@ -1804,9 +1804,14 @@ __global__ void __launch_bounds__(S) gdn_out_norm_loop_kernel(const float* __res
         } else {
             // STRATA_GDN_NOY=1: nothing reads the FP32 result (403 MB per 16K chunk).  The FP16 value is what the
             // compiler makes of hf(v) next to the store: v_fma_mixlo_f16, the product rounded to FP16 once
+#if defined(__gfx900__)
+            // gfx900 has no v_fma_mix (gfx906+): the FP32 product rounded to FP16, which may differ in the last bit
+            y16[o16] = hf(bp * sg);
+#else
             unsigned r;
             asm("v_fma_mixlo_f16 %0, %1, %2, 0" : "=v"(r) : "v"(sg), "v"(bp));
             y16[o16] = (uint16_t) r;
+#endif
         }
     }
 }
