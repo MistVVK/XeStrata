@@ -3880,7 +3880,7 @@ class WebApp(unittest.TestCase):
                     self.assertEqual(model["id"], svc.model)
                     self.assertEqual(model["status"]["value"], "loaded")
                     self.assertEqual(model["meta"]["n_ctx"], 262144)
-                    self.assertEqual((model["max_model_len"], model["context_length"]), (262144, 262144))
+                    self.assertEqual((model["max_model_len"], model["context_length"], model["max_context_length"]), (262144, 262144, 262144))
                     self.assertEqual(model["architecture"]["input_modalities"],
                                      ["text", "image"] if vision else ["text"])
                 code, _, body = self.get("/props?model=" + svc.model + "&autoload=false")
