@@ -97,6 +97,15 @@ class Mapping(unittest.TestCase):
         self.assertIsNone(t._pick_card(adl, 2, []))
         self.assertIsNone(t._pick_card(["AMD Radeon(TM) Graphics"], 0, ["AMD Radeon RX 6900 XT"]))           # no ADL row for the HIP card: no reading
 
+    def test_hip_device_beyond_a_one_card_list_reads_the_only_card(self):
+        # 0.2.17 (#5946): an iGPU + one RX 9070 XT; the run config says "gpu": 1 (HIP counts the iGPU), the registry list holds
+        # the one card, ADL lists the one card at row 0: the reading was blank (None), now it is the card's row.
+        card = "AMD Radeon RX 9070 XT"
+        self.assertEqual(t._pick_card([card], 1, [card]), 0)
+        self.assertIsNone(t._pick_card([card, card], 1, [card]))                  # two rows of that name: no guess
+        self.assertIsNone(t._pick_card(["AMD Radeon RX 6800 XT"], 1, [card]))     # no row of that name: no guess
+        self.assertIsNone(t._pick_card([card], 2, [card, "AMD Radeon RX 6800 XT"]))   # a longer list keeps the old rule
+
     def test_cards_skip_the_igpu_beside_a_card_and_keep_an_apu_alone(self):
         A = t._Adl.AdapterInfo
 

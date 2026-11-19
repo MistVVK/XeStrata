@@ -544,6 +544,13 @@ def _pick_card(adl_names, index, hip_names):
     rather than another card's readings).  Only when the registry lists no AMD card at all: row `index`."""
     if hip_names:
         if not 0 <= index < len(hip_names):
+            # A run config can name a HIP device number that the registry list does not reach (HIP counts a Ryzen's integrated
+            # Radeon, which the list leaves out: "gpu": 1 on a PC with an iGPU and one card, #5946).  With exactly one card in
+            # the list and exactly one ADL row of that name the reading is unambiguous; with anything else nothing is guessed.
+            if index > 0 and len(hip_names) == 1:
+                only = [r for r, n in enumerate(adl_names) if n.strip().lower() == hip_names[0].strip().lower()]
+                if len(only) == 1:
+                    return only[0]
             return None
         want = hip_names[index].strip().lower()
         k = sum(1 for n in hip_names[:index] if n.strip().lower() == want)
@@ -1344,7 +1351,8 @@ class _Intel:
         if self.hwmon:
             if out["temp"] is None:
                 files = os.listdir(self.hwmon)
-                src = next((lab[:-6] for lab in files if lab.endswith("_label") and self._rd(f"{self.hwmon}/{lab}") == "pkg"), None)
+                # temp*_label only: an xe card labels its energy counter "pkg" as well (energy2_label, microjoules; #6243)
+                src = next((lab[:-6] for lab in files if lab.startswith("temp") and lab.endswith("_label") and self._rd(f"{self.hwmon}/{lab}") == "pkg"), None)
                 v = self._rd(f"{self.hwmon}/{src or 'temp1'}_input")
                 out["temp"] = int(v) / 1000 if v and v.lstrip("-").isdigit() else None
             if out["power"] is None:
