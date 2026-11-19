@@ -34,7 +34,10 @@ inline void row_prefetch_line(const void* p, int hint) noexcept {
     else if (hint == 2) _mm_prefetch((const char*) p, _MM_HINT_NTA);
     else _mm_prefetch((const char*) p, _MM_HINT_T1);
 #elif defined(__GNUC__)
-    __builtin_prefetch(p, 0, hint == 0 ? 3 : hint == 2 ? 0 : 2);
+    // the locality argument must be a constant integer (clang on arm64 refuses a computed one), so one call a case
+    if (hint == 0) __builtin_prefetch(p, 0, 3);
+    else if (hint == 2) __builtin_prefetch(p, 0, 0);
+    else __builtin_prefetch(p, 0, 2);
 #else
     (void) p; (void) hint;
 #endif
