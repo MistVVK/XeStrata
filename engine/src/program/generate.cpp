@@ -6655,7 +6655,7 @@ int main(int argc, char** argv) {
     // its own layers' (below), and the search counts what that frees towards the card's expert cache.  On a 4060
     // Ti + 5080 with Swift 1.5 IQ3_XXS at K=20 that was 1.9 + 1.3 GiB, 2,174 more cached experts and none left to
     // read from the files: 98 -> 131 tok/s on code at a 32K context, its prompt 1,006 -> 1,978 tok/s.
-    const bool trim = o.trim_stage_weights && multi_gpu && !stages.empty();
+    const bool trim = o.trim_stage_weights && multi_gpu && !stages.empty() && !stage_trim;   // #6110: stage_trim already trimmed CUDA0
     std::vector<std::vector<std::string>> layer_rows((size_t) g.n_layers);   // the arena's blk.<l>. rows
     std::vector<int64_t> trim_prefix((size_t) g.n_layers + 1, 0);           // the bytes of layers [0, l)
     if (trim) {
