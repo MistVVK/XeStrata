@@ -42,13 +42,14 @@ class SyncFiles(unittest.TestCase):
                 self.assertEqual((pack / "pack.bin").read_bytes(), b"bad content")
 
     def test_setup_wires_pack_and_model_alias(self):
-        a = SimpleNamespace(gguf_dir=None, custom=None, drafting="mtp", models_dir="/models",
+        a = SimpleNamespace(gguf_dir=None, custom=None, drafting="mtp", draft_vocab=None, models_dir="/models",
                             resident_budget_gib=None, ple_io=None, vram_reserve_mib=None, ram_reserve_gib=None,
                             host=None, api_key=None, browser=None, parallel=None, images=None)
         gpu = {"pci": "0000:01:00.0"}
         with (mock.patch.object(setup, "prepare_engine", return_value=(Path("/llama"), Path("/engine"), [])),
               mock.patch.object(setup, "fetch_sync_files", return_value=(Path("/pack"), Path("/shared"))),
               mock.patch.object(setup.model_terms, "fetch"), mock.patch.object(setup, "setup_translate"),
+              mock.patch.object(setup, "replicas_config"),
               mock.patch.object(setup, "finish_setup") as finish):
             setup.setup_sync(a, "sync", "Sync-XS", gpu, [0], [gpu], True, 64, [], 8095, None, 8192, "fp16",
                              "none", True, True, None, 1.0)
@@ -58,6 +59,22 @@ class SyncFiles(unittest.TestCase):
         self.assertIn("--resident-experts", cfg["args"])
         self.assertEqual(cfg["args"][cfg["args"].index("--pack") + 1], "/pack")
         self.assertEqual(cfg["tokenizer"], "/shared/tokenizer")
+
+    def test_draft_subset_does_not_change_the_shared_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            shared = Path(temp) / "sync-shared"
+            source = shared / "mtp-rt"
+            source.mkdir(parents=True)
+            for name in ("dense.bin", "dense.txt", "experts.bin", "draft_vocab.bin"):
+                (source / name).write_bytes(name.encode())
+            self.assertEqual(setup.sync_mtp(shared, "cjk"), source)
+            derived = setup.sync_mtp(shared, "en")
+            self.assertEqual((source / "draft_vocab.bin").read_bytes(), b"draft_vocab.bin")
+            self.assertEqual((derived / "draft_vocab.bin").read_bytes(),
+                             (setup.ROOT / "data" / setup.DRAFT_VOCABS["en"]).read_bytes())
+            for name in ("dense.bin", "dense.txt", "experts.bin"):
+                self.assertTrue((source / name).samefile(derived / name))
+            self.assertEqual(setup.sync_mtp(shared, "en"), derived)
 
     def test_hash_direct_and_tail(self):
         with tempfile.TemporaryDirectory() as temp:

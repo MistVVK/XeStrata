@@ -6618,6 +6618,12 @@ def low_ram_resident(model, ram, vram_gb, ctx=32768, kv="int8") -> bool:
     return ram >= rest + LOW_RAM_HEADROOM_GB
 
 
+def minimum_setup_ram(family: str | None) -> float:
+    """Keep other families' existing entry gate when Sync's smaller pack is added."""
+    return min(d["ram_gb"] for d in MODELS.values()
+               if family == "sync" or "sync" not in d.get("families", ()))
+
+
 def low_ram_fits(model, ram, vram_gb) -> bool:
     """In the low-RAM mode: the experts the GPU does not hold fit the RAM left beside the rest (as file cache)."""
     return ram - 6 + max(0.0, vram_gb - 5 - MTP_VRAM_GB) >= MODELS[model]["arena_gb"]
@@ -8005,7 +8011,7 @@ def refresh_shared_draft_vocab(cfg: dict, done: set) -> None:
     the default subset over the cyrillic one of the config in use).  The folder takes the subset of the most recently
     used config that names it; a start still installs its own config's."""
     args = cfg.get("args") or []
-    if "--mtp" not in args[:-1]:
+    if "--mtp" not in args[:-1] or cfg.get("family") == "sync":
         return
     rt = Path(args[args.index("--mtp") + 1])
     key = os.path.normcase(os.path.abspath(rt))
@@ -8236,7 +8242,14 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             else f"{k.replace('_', ' ')} {v}" for k, v in keep.items()))
     cfg_path.touch()                                     # the most recently used model
     if "--mtp" in cfg["args"][:-1]:
-        refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
+        i = cfg["args"].index("--mtp") + 1
+        if cfg.get("family") == "sync":
+            mtp = sync_mtp(Path(cfg["args"][i]).parent, cfg.get("draft_vocab", "cjk"))
+            if cfg["args"][i] != str(mtp):
+                cfg["args"][i] = str(mtp)
+                write_config(cfg_path, cfg)
+        else:
+            refresh_draft_vocab(Path(cfg["args"][i]), cfg.get("draft_vocab", "cjk"))
     # the DFlash2 pack's folder is shared by the models of this install: another config's setup may have left its
     # subset there. Put this config's choice back before the engine reads it.
     if isinstance(cfg.get("draft_model"), str):
@@ -9979,6 +9992,31 @@ def fetch_sync_files(models_dir: Path, model: str) -> tuple[Path, Path]:
     return pack, shared
 
 
+def sync_mtp(shared: Path, choice: str) -> Path:
+    """Keep the pinned shared draft vocabulary intact when another subset is selected."""
+    source = shared / "mtp-rt"
+    if choice == "cjk":
+        return source
+    if choice not in DRAFT_VOCABS:
+        fail(f"unknown draft vocabulary: {choice}")
+    dst = shared / f"mtp-rt-{choice}"
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in ("dense.bin", "dense.txt", "experts.bin"):
+        original, link = source / name, dst / name
+        if link.exists():
+            if not os.path.samefile(original, link):
+                fail(f"{link} is not the shared MTP file", "the file was left in place")
+        else:
+            os.link(original, link)
+    vocab = (ROOT / "data" / DRAFT_VOCABS[choice]).read_bytes()
+    target = dst / "draft_vocab.bin"
+    if target.exists() and target.read_bytes() != vocab:
+        fail(f"{target} is not the selected draft vocabulary", "the file was left in place")
+    if not target.exists():
+        target.write_bytes(vocab)
+    return dst
+
+
 def setup_sync(a, family: str, model: str, gpu: dict, sel: list, found: list, gpu_chosen: bool, ram: float,
                roots: list, port: int, adopted: Path | None, ctx: int, kv: str, vision: str, low_ram: bool,
                resident: bool, scaling: str | None, rope_scale: float | None) -> int:
@@ -9996,8 +10034,10 @@ def setup_sync(a, family: str, model: str, gpu: dict, sel: list, found: list, gp
     pack, shared = fetch_sync_files(Path(a.models_dir), model)
     model_terms.fetch([SYNC_REPOS[model], "hiru2005/Sync-shared"], say=warn, timeout=30, terms=MODEL_TERMS)
     native = shared / "native-gguf" / "Qwen3.8-Flash-Next-Sync-common.gguf"
+    draft_vocab = a.draft_vocab or saved_draft_vocab(CONF / f"xestrata-{tag.lower()}.json") or "cjk"
+    mtp = sync_mtp(shared, draft_vocab)
     args = ["--pack", str(pack), "--native", str(native), "--ple-gguf", str(native),
-            "--mtp", str(shared / "mtp-rt"), "--expert-profile", str(ROOT / "data" / "expert-profile.bin"),
+            "--mtp", str(mtp), "--expert-profile", str(ROOT / "data" / "expert-profile.bin"),
             "--expert-cache", "auto", "--prefill", "auto", "--spec", "auto", "--spec-min-p", "0.5",
             "--max-context", str(ctx)]
     if a.drafting == "off":
@@ -10026,9 +10066,10 @@ def setup_sync(a, family: str, model: str, gpu: dict, sel: list, found: list, gp
                            "aliases": [model, model.lower()], "family": family,
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"),
                            "lib_dirs": lib_dirs, "port": port, "model_gb": MODELS[model]["download_gb"],
-                           "experts_gb": MODELS[model]["arena_gb"]}
+                           "experts_gb": MODELS[model]["arena_gb"], "draft_vocab": draft_vocab}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]
+    replicas_config(a, cfg)
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
@@ -10610,7 +10651,7 @@ def main() -> int:
             fail(f"RAM: {ram:.0f} GB - without a GPU the smallest model needs about {need:.0f} GB")
         ok(f"RAM: {ram:.0f} GB")
     else:
-        need = min(d["ram_gb"] for d in MODELS.values())
+        need = minimum_setup_ram(a.family)
         low_ok = low_ram_fits("IQ1_M", ram, gpu_expert_vram(gpu)) and a.low_ram != "off"   # the smallest model, mapped
         if a.ram_reserve_gib and ram < need - 4 and not low_ok and ram_total >= need - 4:
             # the reserve leaves less than the smallest model runs in: it keeps that least, and less stays free
@@ -10620,10 +10661,11 @@ def main() -> int:
             a.ram_reserve_gib = math.floor(ram_total - ram)
         if ram < need - 4 and not a.check and not low_ok:
             # every model keeps ALL its experts in RAM (23+ GB) unless the GPU holds enough of them for the low-RAM mode
-            fail(f"RAM: {ram:.0f} GB - the smallest model (the Coder) needs about {need} GB",
-                 "XeStrata keeps the model's experts in RAM (23-50 GB) and the GPU holds a copy of the most-used ones: "
-                 "it needs 32 GB of RAM or more (48 GB for the full model), or a GPU with the VRAM to hold most of "
-                 "them")
+            hint = ("Sync-XS needs about 24 GiB of RAM; add memory or keep less reserved" if a.family == "sync" else
+                    "XeStrata keeps the model's experts in RAM (23-50 GB) and the GPU holds a copy of the "
+                    "most-used ones: it needs 32 GB of RAM or more (48 GB for the full model), or a GPU with "
+                    "the VRAM to hold most of them")
+            fail(f"RAM: {ram:.0f} GB - the smallest model needs about {need} GB", hint)
         if a.ram_reserve_gib:
             ok(f"RAM: {ram_total:.0f} GB, {a.ram_reserve_gib:g} GiB of it kept free for other programs "
                f"(--ram-reserve-gib): XeStrata plans with {max(ram, 0.0):.0f} GB")
@@ -10654,7 +10696,9 @@ def main() -> int:
         for m, d in MODELS.items():
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
             vram = gpu_expert_vram(gpu) + sum(max(0.0, gpu_expert_vram(gpu_info(i)) - 5) for i in sel[1:])
-            if d.get("budget"):
+            if "sync" in d.get("families", ()):
+                verdict = "fits" if size_fits("sync", m, room_of(ram, chosen)) else "does not fit"
+            elif d.get("budget"):
                 fits = f"fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest read from the SSD"
                 verdict = ("EXPERIMENTAL, " if d.get("experimental") else "") + fits if ram >= d["ram_gb"] \
                     else "does not fit"

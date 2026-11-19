@@ -40,6 +40,11 @@ class SizeByQuality(unittest.TestCase):
         self.assertEqual(setup.recommend_size("gyro", room(48, 8)), "Gyro-M")
         self.assertEqual(setup.recommend_size("atomicchat", room(64, 0)), "AD-5.00bpw")  # the same experts, 8-bit table
 
+    def test_sync_does_not_change_other_families_entry_gate(self):
+        self.assertEqual(setup.minimum_setup_ram("sync"), 24)
+        self.assertEqual(setup.minimum_setup_ram("gyro"), 26)
+        self.assertEqual(setup.minimum_setup_ram(None), 26)
+
     def test_sync_thresholds_and_recommendation(self):
         cases = [(23, 16, "Sync-XS"), (24, 16, "Sync-XS"), (31.99, 16, "Sync-XS"),
                  (32, 11.99, "Sync-XS"), (32, 12, "Sync-S"), (47.99, 11.99, "Sync-XS"),
