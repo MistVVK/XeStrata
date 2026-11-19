@@ -47,9 +47,10 @@ bool cpu_avx512_ok();
 /// The same probes with VBMI required only (the multishift unpack and other byte-permute shuffles): a CPU may run
 /// every other feature the kernels use and miss it (Cascade Lake Xeon).
 bool cpu_vbmi_ok();
-/// AVX-512F + BW + VL + VNNI, VBMI NOT required: the dpbusd row dots, the q8 quantizer and the dq/bw arithmetic
+/// AVX-512F + DQ + BW + VL + VNNI, VBMI NOT required: the dpbusd row dots, the q8 quantizer and the dq/bw arithmetic
 /// need no byte-permute shuffles (the q2 unpack's op has a substitute in expert.cpp).  A CPU this answers yes on
-/// used to run every expert through the AVX-2 fallback.
+/// used to run every expert through the AVX-2 fallback. Without VBMI, STRATA_VNNI_TIER=1 opts in; unset keeps
+/// the AVX-2 rows' rounding. STRATA_FORCE_AVX2 and STRATA_FORCE_ISA still cap this probe.
 bool cpu_vnni_ok();
 /// Scattered pieces: the copy above is a declaration only (defined in expert.cpp, the AVX-512 TU, because it reads
 /// its STRATA_CPU_YMM switch): whether the 512-bit q2 row dot may run at all (VNNI and not the YMM env).

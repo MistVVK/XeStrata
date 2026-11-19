@@ -2851,11 +2851,16 @@ int main(int argc, char **argv) try {
                                      "(build it again with tools/iq_pack.py, or run setup again).\n");
         }
         strata::kernels::cpu::cpu_require_expert_support();
-    } else if (!strata::kernels::cpu::cpu_avx512_ok())
-        std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
+    } else if (!strata::kernels::cpu::cpu_vnni_ok())
+        std::fprintf(stderr, "strata generate: %s: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
+                     strata::kernels::cpu::cpu_features().avx512_vnni
+                         ? "AVX-512 VNNI tier disabled or unavailable"
+                         : "this CPU has no AVX512-VNNI",
                      !strata::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2: the older-CPU build)"
                      : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+    else if (!strata::kernels::cpu::cpu_avx512_ok())
+        std::fprintf(stderr, "strata generate: AVX-512 VNNI tier enabled (no VBMI)\n");
     // the compiled shape; a native model's file replaces it below with its own metadata (read_geometry), which a
     // pruned variant (GSQ-RCO Coder, fewer than 512 experts) differs from
     strata::core::ModelGeometry g = strata::core::kCompiledGeometry;
