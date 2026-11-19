@@ -10,6 +10,7 @@
 #include "strata/kernels/cpu/nvfp4_avx2.hpp"
 #include "strata/kernels/cpu/nvfp4_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/row_prefetch.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/cpu/tq_cpu.hpp"
 
@@ -241,7 +242,32 @@ void init_once() {
     std::call_once(once, [] { layer_init(); });
 }
 
+// BW-G: how many bytes ahead of the row being computed the row loops request the weights (row_prefetch.hpp).
+int row_pf_setting() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_ROW_PF");
+        return e != nullptr && e[0] != '\0' ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+int row_pf_prologue() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_ROW_PF_PRO");
+        return e != nullptr && e[0] != '\0' ? std::atoi(e) : 1;
+    }();
+    return v;
+}
+
 }  // namespace
+
+int row_pf_bytes() noexcept { return row_pf_setting(); }
+int row_pf_hint() noexcept {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_ROW_PF_HINT");
+        return e != nullptr && e[0] != '\0' ? std::atoi(e) : 1;
+    }();
+    return v;
+}
 
 bool native_experts_available() noexcept { return true; }
 
@@ -622,9 +648,21 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         return;
     }
     const Tr dot = traits(f.gu_type);
+    // BW-G: the weights a few rows ahead are requested while this row is computed (row_prefetch.hpp); the same bits
+    const int pf_rows = row_pf_bytes() > 0 ? (int) ((size_t) (row_pf_bytes() + (int) f.gu_row - 1) / f.gu_row) : 0;
+    const int pf_hint = row_pf_hint();
+    if (pf_rows > 0 && row_pf_prologue() != 0)
+        for (int k = 0; k < pf_rows && r0 + k < r1; ++k) {
+            row_prefetch_range(blob + (size_t) (r0 + k) * f.gu_row, f.gu_row, pf_hint);
+            row_prefetch_range(blob + f.up_off + (size_t) (r0 + k) * f.gu_row, f.gu_row, pf_hint);
+        }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+        if (pf_rows > 0 && r + pf_rows < r1) {
+            row_prefetch_range(gr + (size_t) pf_rows * f.gu_row, f.gu_row, pf_hint);
+            row_prefetch_range(ur + (size_t) pf_rows * f.gu_row, f.gu_row, pf_hint);
+        }
         for (int t = 0; t < nt; ++t) {
             // g and u are read back after both calls (so the up row's dot starts while the gate row's result is still on its way)
             // and each with its own 4-byte load: GCC on arm64 put them side by side and read both with one 8-byte ldp, a load
@@ -701,8 +739,14 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
         return;
     }
     const Tr dot = traits(f.d_type);
+    const int pf_rows = row_pf_bytes() > 0 ? (int) ((size_t) (row_pf_bytes() + (int) f.d_row - 1) / f.d_row) : 0;
+    const int pf_hint = row_pf_hint();
+    if (pf_rows > 0 && row_pf_prologue() != 0)
+        for (int k = 0; k < pf_rows && r0 + k < r1; ++k)
+            row_prefetch_range(blob + f.down_off + (size_t) (r0 + k) * f.d_row, f.d_row, pf_hint);
     for (int r = r0; r < r1; ++r) {
         const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
+        if (pf_rows > 0 && r + pf_rows < r1) row_prefetch_range(dr + (size_t) pf_rows * f.d_row, f.d_row, pf_hint);
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot.dot(n, &s, dr, hq[t]);
