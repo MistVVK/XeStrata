@@ -98,10 +98,10 @@ class SaveChoices(Base):
 
 
 def path_of(n: int) -> str:
-    """A storage path of exactly `n` characters, starting with /strata-test-ana/ and ending with /Strata-data. The head is a folder that exists on no
+    """A storage path of exactly `n` characters, starting with /ana-qa/ and ending with /Strata-data. The head is a folder that exists on no
     computer: it was /home/ana/, which exists on the lent box boston (another person's home, unreadable: the plan's disk look-up raised PermissionError
     and the Save screen was never repainted, so this test failed there and only there; 0.2.17)."""
-    head, tail = "/strata-test-ana/", "/Strata-data"
+    head, tail = "/ana-qa/", "/Strata-data"
     p = head + ("models-and-more-" * 20)[: n - len(head) - len(tail)] + tail
     assert len(p) == n
     return p
@@ -131,7 +131,7 @@ class StoragePath(Base):
                     rows = [r for r in shown.split("\n") if "Storage" in r]
                     self.assertEqual(len(rows), 1, (n, shown))
                     row = rows[0].strip()
-                    self.assertIn("Storage /strata-test-ana/", row, (n, row))                # (80x24 holds the short form of the summary: one line "Access ... Storage <path>")
+                    self.assertIn("Storage /ana-qa/", row, (n, row))                # (80x24 holds the short form of the summary: one line "Access ... Storage <path>")
                     self.assertTrue(row.endswith("/Strata-data"), (n, row))
                     self.assertLessEqual(len(rows[0]), 80, (n, row))
                     if n <= 60:
