@@ -1,7 +1,7 @@
 # Strata packaging: targets, recipes and locks
 
 This page is for developers who build the desktop app, the Terminal archive and the engine packages. To install Strata, use
-[docs/INSTALL.md](../../docs/INSTALL.md). It describes the current release (app and Terminal 0.2.16, Control 0.1.62, engines 0.1.62).
+[docs/INSTALL.md](../../docs/INSTALL.md). It describes the current release (app and Terminal 0.2.17, Control 0.1.63, engines 0.1.63).
 How packages are signed and published is in [UPDATES.md](UPDATES.md), and the package format is in [ENGINE-COMPONENT.md](ENGINE-COMPONENT.md).
 
 Release assets show what was published; the platform guides and retained reports show what was tested. A published package does not

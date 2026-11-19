@@ -35,23 +35,23 @@ class VersionBump(unittest.TestCase):
         # 0.2.14.1 (Control-only: the drafter fixes of the Terminal and Control): the Terminal is 0.2.14.1 and Control 0.1.60.1; the app stays 0.2.14 and every engine package 0.1.60.
         # 0.2.15 (an app + Control fix release): the app and the Terminal are 0.2.15 and Control 0.1.61; every engine package stays 0.1.60 (the v0.2.14 files).
         # 0.2.16 (the layout, own-stack and GUI / TUI release): the app and the Terminal are 0.2.16, Control and the engine packages 0.1.62 (0.1.61 went out as Control with 0.2.15 and is skipped as an engine number).
-        self.assertEqual(strata_cli.PRODUCT_VERSION, "0.2.16")
-        self.assertEqual(strata_cli.version(), "0.1.62")              # the CMake project version: Control
-        self.assertEqual(first("../engine/CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) "), "0.1.62")
-        self.assertIn('STRATA_VERSION="0.1.62-metal"', (ROOT.parent / "engine" / "metal" / "CMakeLists.txt").read_text(encoding="utf-8"))
+        self.assertEqual(strata_cli.PRODUCT_VERSION, "0.2.17")
+        self.assertEqual(strata_cli.version(), "0.1.63")              # the CMake project version: Control
+        self.assertEqual(first("../engine/CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) "), "0.1.63")
+        self.assertIn('STRATA_VERSION="0.1.63-metal"', (ROOT.parent / "engine" / "metal" / "CMakeLists.txt").read_text(encoding="utf-8"))
 
     def test_every_place_the_app_version_lives_says_0_2_3(self):
-        self.assertEqual(first("../app/desktop/src-tauri/Cargo.toml", r'^version = "([^"]+)"'), "0.2.16")
+        self.assertEqual(first("../app/desktop/src-tauri/Cargo.toml", r'^version = "([^"]+)"'), "0.2.17")
         lock = (ROOT.parent / "app" / "desktop" / "src-tauri" / "Cargo.lock").read_text(encoding="utf-8")
-        self.assertRegex(lock, r'name = "strata-desktop"\r?\nversion = "0.2.16"')
-        self.assertEqual(json.loads((ROOT.parent / "app" / "desktop" / "package.json").read_text(encoding="utf-8"))["version"], "0.2.16")
+        self.assertRegex(lock, r'name = "strata-desktop"\r?\nversion = "0.2.17"')
+        self.assertEqual(json.loads((ROOT.parent / "app" / "desktop" / "package.json").read_text(encoding="utf-8"))["version"], "0.2.17")
         host = json.loads((ROOT.parent / "app" / "host" / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(host["version"], "0.2.16")
+        self.assertEqual(host["version"], "0.2.17")
         locked = json.loads((ROOT.parent / "app" / "host" / "package-lock.json").read_text(encoding="utf-8"))
-        self.assertEqual((locked["version"], locked["packages"][""]["version"]), ("0.2.16", "0.2.16"))
+        self.assertEqual((locked["version"], locked["packages"][""]["version"]), ("0.2.17", "0.2.17"))
 
     def test_the_documents_that_state_the_current_version_agree(self):
-        self.assertIn("Version 0.2.16, engine 0.1.62.", (ROOT.parent / "AGENTS.md").read_text(encoding="utf-8"))
+        self.assertIn("Version 0.2.17, engine 0.1.63.", (ROOT.parent / "AGENTS.md").read_text(encoding="utf-8"))
         for name in ("README.md", "docs/lang/README.de.md", "docs/lang/README.es.md", "docs/lang/README.fr.md", "docs/lang/README.ja.md", "docs/lang/README.pl.md", "docs/lang/README.pt-BR.md", "docs/lang/README.zh-CN.md"):
             text = (ROOT.parent / name).read_text(encoding="utf-8")
             self.assertRegex(text, r"Strata-0[.]2[.][0-9]+-", name)       # (the restyled READMEs state the app version through the download buttons; their owner moves them to the release)
@@ -60,7 +60,7 @@ class VersionBump(unittest.TestCase):
     def test_version_prints_the_product_and_the_build(self):
         done = subprocess.run([sys.executable, str(ROOT / "strata.py"), "--version"], capture_output=True, text=True, cwd=str(ROOT),
                               env={**os.environ, "STRATA_NO_HANDOVER": "1"})
-        self.assertTrue(done.stdout.startswith("strata 0.2.16 (build 0.1.62;"), done.stdout)
+        self.assertTrue(done.stdout.startswith("strata 0.2.17 (build 0.1.63;"), done.stdout)
 
 
 class UpdateFromTheLastRelease(test_updater.UpdaterCase):

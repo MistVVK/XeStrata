@@ -409,8 +409,8 @@
    "first_commit": "4058aa782b",
    "first_date": "2026-11-17",
    "since": "v0.2.16",
-   "last_commit": "4058aa782b",
-   "last_date": "2026-11-17",
+   "last_commit": "ca99e886f7",
+   "last_date": "2026-11-19",
    "status": "default",
    "owner": "program",
    "note": "=2 is the default of a compute capability 12.x CUDA card with 16 GiB of memory or less (RTX 5050 to 5080 and laptop parts), decided by the main card; other cards keep it off; not bit-exact; one-card runs only; STRATA_ADAPT_FETCH=0 is the way back (BW-9 in RESULTS-BW-F.md: decode +4 to +43% by kind, hit rate 54.4 to 62.0%, KL ratio 0.948 [0.830, 1.063])",
@@ -997,7 +997,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 6444,
+     "line": 6450,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -1110,7 +1110,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 6319,
+     "line": 6325,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -1312,7 +1312,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 6392,
+     "line": 6398,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -2821,7 +2821,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1942,
+     "line": 1948,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -2854,7 +2854,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1945,
+     "line": 1951,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3309,13 +3309,13 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 2552,
+     "line": 2558,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 5298,
+     "line": 5304,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -4321,7 +4321,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 5557,
+     "line": 5563,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -4428,7 +4428,7 @@
    "first_commit": "4058aa782b",
    "first_date": "2026-11-17",
    "since": "v0.2.16",
-   "last_commit": "f66d9de851",
+   "last_commit": "ca99e886f7",
    "last_date": "2026-11-19",
    "status": "rollback",
    "owner": "core",
@@ -4445,7 +4445,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 6575,
+     "line": 6581,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -6847,8 +6847,8 @@
    "first_commit": "4058aa782b",
    "first_date": "2026-11-17",
    "since": "v0.2.16",
-   "last_commit": "4058aa782b",
-   "last_date": "2026-11-17",
+   "last_commit": "ca99e886f7",
+   "last_date": "2026-11-19",
    "status": "research",
    "owner": "core",
    "note": "[auto] not documented for users; code default not readable from the call",
@@ -6937,7 +6937,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 4639,
+     "line": 4645,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -7342,7 +7342,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1064,
+     "line": 1070,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -7762,7 +7762,7 @@
    "first_commit": "4058aa782b",
    "first_date": "2026-11-17",
    "since": "v0.2.16",
-   "last_commit": "f66d9de851",
+   "last_commit": "ca99e886f7",
    "last_date": "2026-11-19",
    "status": "opt-in",
    "owner": "kernels/native_grouped_parity.cpp",
@@ -7822,7 +7822,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 2722,
+     "line": 2728,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -7903,7 +7903,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 993,
+     "line": 999,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -7939,7 +7939,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 3807,
+     "line": 3813,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -7985,7 +7985,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 979,
+     "line": 985,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -8053,7 +8053,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1009,
+     "line": 1015,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -8396,7 +8396,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 7133,
+     "line": 7139,
      "backend": "cuda-hip",
      "fn": "env_int"
     }
@@ -8462,7 +8462,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 7132,
+     "line": 7138,
      "backend": "cuda-hip",
      "fn": "env_int"
     }
@@ -8495,7 +8495,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 7134,
+     "line": 7140,
      "backend": "cuda-hip",
      "fn": "env_int"
     }
@@ -8528,7 +8528,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 7122,
+     "line": 7128,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -8578,7 +8578,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 7135,
+     "line": 7141,
      "backend": "cuda-hip",
      "fn": "env_int"
     }
@@ -12246,7 +12246,7 @@
    "first_commit": "4058aa782b",
    "first_date": "2026-11-17",
    "since": "v0.2.16",
-   "last_commit": "f66d9de851",
+   "last_commit": "ca99e886f7",
    "last_date": "2026-11-19",
    "status": "default",
    "owner": "core",
@@ -13919,7 +13919,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1278,
+     "line": 1284,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13954,7 +13954,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1291,
+     "line": 1297,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13987,7 +13987,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1290,
+     "line": 1296,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -14020,7 +14020,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1294,
+     "line": 1300,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -14056,7 +14056,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1296,
+     "line": 1302,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -14089,7 +14089,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1295,
+     "line": 1301,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -14124,7 +14124,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1297,
+     "line": 1303,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -14159,7 +14159,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1289,
+     "line": 1295,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -14192,7 +14192,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1287,
+     "line": 1293,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -14225,7 +14225,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1280,
+     "line": 1286,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -14269,7 +14269,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 1292,
+     "line": 1298,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -16696,7 +16696,7 @@
    "first_commit": "3a0e346db1",
    "first_date": "2026-11-19",
    "since": null,
-   "last_commit": "f66d9de851",
+   "last_commit": "ca99e886f7",
    "last_date": "2026-11-19",
    "status": "default",
    "owner": "core",
@@ -17641,7 +17641,7 @@
    "reads": [
     {
      "file": "engine/src/core/conversation_memory.cpp",
-     "line": 396,
+     "line": 408,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -17664,8 +17664,8 @@
    "first_commit": "4058aa782b",
    "first_date": "2026-11-17",
    "since": "v0.2.16",
-   "last_commit": "4058aa782b",
-   "last_date": "2026-11-17",
+   "last_commit": "c9f031dcd8",
+   "last_date": "2026-11-19",
    "status": "rollback",
    "owner": "core",
    "note": "[reviewed] under a container memory limit the memory guard and the expert arena's RAM check credit active and inactive file cache minus the engine's own mapped pages; set to 1 brings back the old inactive-only credit. [src/core/conversation_memory.cpp:363]",
@@ -22883,7 +22883,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 6460,
+     "line": 6466,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -24427,7 +24427,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 4288,
+     "line": 4294,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -24469,7 +24469,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 4294,
+     "line": 4300,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -24983,7 +24983,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 5382,
+     "line": 5388,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -28282,7 +28282,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 4178,
+     "line": 4184,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -28317,7 +28317,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 4171,
+     "line": 4177,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -30088,7 +30088,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 5289,
+     "line": 5295,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -32115,8 +32115,8 @@
    "first_commit": "4058aa782b",
    "first_date": "2026-11-17",
    "since": "v0.2.16",
-   "last_commit": "4058aa782b",
-   "last_date": "2026-11-17",
+   "last_commit": "ca99e886f7",
+   "last_date": "2026-11-19",
    "status": "opt-in",
    "owner": "program",
    "note": "[auto] documented for users (docs/SECOND_GPU.md:110), 1 more",
@@ -34386,7 +34386,7 @@
    "first_commit": "e6efa2b169",
    "first_date": "2026-11-19",
    "since": null,
-   "last_commit": "f66d9de851",
+   "last_commit": "ca99e886f7",
    "last_date": "2026-11-19",
    "status": "default",
    "owner": "core",
@@ -35640,7 +35640,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 4849,
+     "line": 4855,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -36440,7 +36440,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 5364,
+     "line": 5370,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -36769,7 +36769,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 5252,
+     "line": 5258,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -38676,7 +38676,7 @@
    "first_commit": "4058aa782b",
    "first_date": "2026-11-17",
    "since": "v0.2.16",
-   "last_commit": "f66d9de851",
+   "last_commit": "ca99e886f7",
    "last_date": "2026-11-19",
    "status": "opt-in",
    "owner": "core",
@@ -38722,7 +38722,7 @@
    "first_commit": "4058aa782b",
    "first_date": "2026-11-17",
    "since": "v0.2.16",
-   "last_commit": "501738c68e",
+   "last_commit": "ca99e886f7",
    "last_date": "2026-11-19",
    "status": "opt-in",
    "owner": "kernels/cuda",
@@ -41068,7 +41068,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 2183,
+     "line": 2189,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -41218,7 +41218,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 2972,
+     "line": 2978,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -43215,7 +43215,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 2916,
+     "line": 2922,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -44424,13 +44424,13 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 963,
+     "line": 969,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 2848,
+     "line": 2854,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -44631,7 +44631,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 6687,
+     "line": 6693,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -44754,7 +44754,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 4532,
+     "line": 4538,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -44858,13 +44858,13 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 5560,
+     "line": 5566,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 7125,
+     "line": 7131,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -45877,7 +45877,7 @@
    "reads": [
     {
      "file": "engine/src/core/expert_source.cpp",
-     "line": 3963,
+     "line": 3969,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
