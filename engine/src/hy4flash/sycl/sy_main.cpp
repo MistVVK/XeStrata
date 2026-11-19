@@ -7,9 +7,54 @@
 #include <string>
 #include <vector>
 
-#include "sy_spec.h"
+#include "sy_serve.h"
 
 using namespace hy4s;
+
+#ifndef HY4_VERSION
+#define HY4_VERSION "0.2.18-dev-sycl"
+#endif
+
+// `strata-hy4 --export-tokenizer FILE.strata DIR`: Section 0's tokenizer_json and chat_template to DIR/tokenizer.hf.json and DIR/chat_template.jinja
+static int export_tokenizer(const std::string& file, const std::string& dir) {
+    strata::artifact::StrataFileReader rd;
+    std::string err;
+    if (!rd.open(file, err)) {
+        fprintf(stderr, "open: %s\n", err.c_str());
+        return 1;
+    }
+    hy4::Manifest m;
+    hy4::parse_manifest(rd.manifest_json(), m, true);
+    auto put = [&](const std::string& name, const std::string& text) {
+        const std::string path = dir + "/" + name;
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f || fwrite(text.data(), 1, text.size(), f) != text.size()) {
+            fprintf(stderr, "cannot write %s\n", path.c_str());
+            if (f) fclose(f);
+            return false;
+        }
+        fclose(f);
+        return true;
+    };
+    if (!put("tokenizer.hf.json", m.tokenizer_json) || !put("chat_template.jinja", m.chat_template)) return 1;
+    printf("tokenizer: %zu bytes, chat template: %zu bytes\n", m.tokenizer_json.size(), m.chat_template.size());
+    return 0;
+}
+
+// `strata-hy4 --info FILE.strata`: one line of key=value facts, no GPU needed. drafter= and images= are what THIS engine can do with this file (images: not ported to SYCL yet).
+static int print_info(const std::string& file) {
+    strata::artifact::StrataFileReader rd;
+    std::string err;
+    if (!rd.open(file, err)) {
+        fprintf(stderr, "open: %s\n", err.c_str());
+        return 1;
+    }
+    hy4::Manifest m;
+    hy4::parse_manifest(rd.manifest_json(), m, false);
+    printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d drafter=%s images=%d backend=sycl\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos,
+           manifest_has_drafter(m) ? "dfly2" : "none", 0);
+    return 0;
+}
 
 static void top5_line(const float* lg, int V, int pos, std::string& out) {
     std::vector<int> idx(V);
@@ -24,18 +69,57 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 int main(int argc, char** argv) {
     // Backend: the OpenCL runtime of the Intel compute stack launches small kernels ~4x cheaper than Level Zero on the A750 (4.7 vs 19 us per dependent tiny kernel;
     // a decode step has ~1300 of them: 46 ms vs 87 ms without the routed experts). HY4S_BACKEND=level_zero (or an own ONEAPI_DEVICE_SELECTOR) overrides.
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
+    const bool user_sel = std::getenv("ONEAPI_DEVICE_SELECTOR") != nullptr;
+    if (!user_sel) {
         const char* be = std::getenv("HY4S_BACKEND");
         setenv("ONEAPI_DEVICE_SELECTOR", (be && std::string(be) == "level_zero") ? "level_zero:gpu" : "opencl:gpu", 1);
     }
-    std::string model, engram, tok_path, out_dir = ".", force_route, draft = "off";
+    std::string model, engram, tok_path, out_dir = ".", force_route, draft;  // draft: "" = default (serve: auto, CLI runs: off)
     SpecCfg scfg;
     bool load_only = false, dbg = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false;
-    int kv_host_above = 24000, gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 1024, index_topk = 2048, threads = 6, expert_act = 1;
+    bool serve = false, session_reuse = false, vision_requested = false;
+    int kv_host_above = 24000, gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 1024, index_topk = 2048, threads = (int)std::max(2u, std::thread::hardware_concurrency() / 2), expert_act = 1;  // CPU expert threads: half the hardware threads (6 on the 5600X)
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--serve") serve = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto nxt = [&]() { return std::string(argv[++i]); };
-        if (a == "--model") model = nxt();
+        auto nxt = [&]() {
+            if (i + 1 >= argc) {
+                printf("ERR %s needs a value\n", a.c_str());
+                fflush(stdout);
+                exit(2);
+            }
+            return std::string(argv[++i]);
+        };
+        if (a == "--version") {
+            printf("strata-hy4 %s\n", HY4_VERSION);
+            return 0;
+        }
+        if (a == "--info") return print_info(nxt());
+        if (a == "--export-tokenizer") {
+            const std::string f = nxt();
+            return export_tokenizer(f, nxt());
+        }
+        if (a == "--serve") continue;
+        else if (a == "--native" || a == "--model") model = nxt();
+        else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
+        else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
+        else if (a == "--gpu") {  // device index of the OpenCL runtime (an own ONEAPI_DEVICE_SELECTOR still wins)
+            const std::string n = nxt();
+            if (!user_sel) setenv("ONEAPI_DEVICE_SELECTOR", ("opencl:gpu:" + n).c_str(), 1);
+        } else if (a == "--vision") {
+            nxt();
+            vision_requested = true;
+        } else if (a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner (experts: page cache + GPU ring)\n", a.c_str(), nxt().c_str());
+        else if (a == "--kv") {
+            const std::string kv = nxt();
+            if (kv != "fp16") {
+                printf("ERR --kv %s: only fp16\n", kv.c_str());
+                fflush(stdout);
+                return 2;
+            }
+        }
+        else if (a == "--engram-path") engram = nxt();
         else if (a == "--engram") engram = nxt();
         else if (a == "--tokens") tok_path = nxt();
         else if (a == "--out") out_dir = nxt();
@@ -66,11 +150,44 @@ int main(int argc, char** argv) {
         else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
         else {
             fprintf(stderr, "unknown arg %s\n", a.c_str());
+            if (serve) {
+                printf("ERR unknown flag %s\n", a.c_str());
+                fflush(stdout);
+            }
             return 2;
         }
     }
+    if (serve) {
+        if (model.empty()) {
+            printf("ERR --native FILE.strata is required\n");
+            fflush(stdout);
+            return 2;
+        }
+        if (!draft.empty() && draft != "off" && draft != "dfly2" && draft != "auto") {
+            printf("ERR --draft %s: expected off, dfly2 or auto\n", draft.c_str());
+            fflush(stdout);
+            return 2;
+        }
+        ServeOpts so;
+        so.model = model;
+        so.engram = engram;
+        so.max_ctx = max_ctx > 0 ? max_ctx : 131072;
+        so.chunk = std::max(chunk, 1);
+        so.index_topk = index_topk;
+        so.threads = threads;
+        so.gx_mb = gx_mb;
+        so.kv_host_above = kv_host_above;
+        so.no_index = no_index;
+        so.no_engram = no_engram;
+        so.session_reuse = session_reuse;
+        so.draft = draft.empty() ? "auto" : draft;
+        so.vision_requested = vision_requested;
+        so.spec = scfg;
+        return hy4s_serve_main(so);
+    }
+    if (draft.empty()) draft = "off";
     if (model.empty()) {
-        fprintf(stderr, "usage: strata-hy4-sycl --model SQ32.strata --engram Engram-Q8.strata --tokens ids.txt [--gen N] [--chunk N] [--ctx N] [--threads N] [--expert-act 0|1] [--warm] [--dump] [--all-logits] [--out dir]\n");
+        fprintf(stderr, "usage: strata-hy4-sycl --model SQ32.strata --engram Engram-Q8.strata --tokens ids.txt [--gen N] [--chunk N] [--ctx N] [--threads N] [--expert-act 0|1] [--warm] [--dump] [--all-logits] [--out dir]\n       strata-hy4-sycl --serve --native SQ.strata --engram ENG.strata [--max-context N] [--draft off|dfly2|auto]   (engine line protocol)\n       strata-hy4-sycl --info FILE.strata | --version | --export-tokenizer FILE.strata DIR\n");
         return 2;
     }
     try {
