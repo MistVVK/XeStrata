@@ -36,7 +36,7 @@ FILES = {
     "Hy4-Flash-SQ-96.strata": (89_577_742_336, "ba9d501350330ebe230ecc815d6e2127c43eaa1741ce9dca7576bf69ef78ba64"),
     "Hy4-Flash-SQ-128.strata": (113_654_603_776, "9bfd65640402114ac7162374c9799a444eb41b7add2a42e10457811a0d4474da"),
     ENGRAM_FILE: (67_584_905_216, None),
-    VISION_FILE: (934_092_800, None),
+    VISION_FILE: (934_092_800, "ef09bceff8f01b8d226d2dc56aef09cec719b21b45783ee9b5d64e7241b72a09"),
 }
 BUILD_ABOUT = {
     "SQ-32": "the smallest: for 32 GB of RAM and a 12 to 16 GB card",
