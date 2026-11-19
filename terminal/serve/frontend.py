@@ -1961,10 +1961,23 @@ class OutputParser:
         thinking: written right after a quote or backtick and followed by anything but a line break, as in `</think>`
         or "</think>...".  The end of the thinking is followed by a line break.  None while the character after the
         tag has not arrived."""
+        head = self.line + self.buf[:i]
         before = self.buf[i - 1] if i else self.line[-1:]
-        if before not in ('"', "'", "`"):
-            return False
         after = self.buf[i + len(THINK_END):]
+        if before not in ('"', "'", "`"):
+            # #6218: a backtick span the model opened (an odd count in the paragraph so far) that the tag sits inside, written on its own line:
+            # "the marker `" + line break + tag + line break + "`" - the backtick after the tag closes the span the tag is quoted in
+            if (head.rstrip().endswith("`") or not head.strip()) and (self.ticks + head.count("`")) % 2 == 1:
+                if not after.strip():
+                    return None
+                return after.lstrip().startswith("`")
+            return False
+        # #5605: a quote that CLOSES a sentence ("... said "Reply with the number only."" + tag + answer) is not the opening of a quotation the tag
+        # is in: a quote right after a non-space character (a full stop, a letter) closes one.  A quote after a space, a bracket, an `=` or at the
+        # start of a line opens one, as in `returns "</think>`.
+        prev = head[-2:-1]
+        if prev and not prev.isspace() and prev not in "([{<=:,;":
+            return False
         if not after:
             return None
         return after[0] not in "\r\n"
