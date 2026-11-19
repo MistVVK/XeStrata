@@ -3,10 +3,18 @@
 #
 # Most people want the ready-made images instead (nothing compiled): docs/DOCKER.md.
 #
-#   docker build -t strata:src .                                        # RTX 20/30/40/50 (compiles for each, ~25 min)
-#   docker build -t strata:src --build-arg CUDA_ARCHITECTURES=86 .      # one card only (faster); 86 = RTX 30, 89 = RTX 40, 120 = RTX 50
-#   docker build -t strata:src-cuda12 --build-arg CUDA_IMAGE=nvidia/cuda:12.9.1-devel-ubuntu24.04 \
-#              --build-arg CUDA_ARCHITECTURES="60;61;70;75;80;86;89" --build-arg BUILD_VISION=0 .   # GTX 10 / P100 / V100 (driver 575+)
+# Every source build needs STRATA_COMMIT: .git is not copied into the build, and the Terminal archive has to carry a COMMIT file.
+# This is not the ready-made image's Dockerfile, so it is named with -f; the build then reads its ignore list from
+# tools/docker/Dockerfile.src.dockerignore.
+#
+#   docker build -t strata:src --build-arg STRATA_COMMIT=$(git rev-parse HEAD) -f tools/docker/Dockerfile.src .   # RTX 20/30/40/50 (~25 min)
+#   docker build -t strata:src --build-arg STRATA_COMMIT=$(git rev-parse HEAD) -f tools/docker/Dockerfile.src --build-arg CUDA_ARCHITECTURES=86 .
+#              # one card only (faster); 86 = RTX 30, 89 = RTX 40, 120 = RTX 50
+#   docker build -t strata:src-cuda12 --build-arg STRATA_COMMIT=$(git rev-parse HEAD) -f tools/docker/Dockerfile.src \
+#              --build-arg CUDA_IMAGE=nvidia/cuda:12.9.2-devel-ubuntu24.04 \
+#              --build-arg CUDA_ARCHITECTURES="60;61;70;75;80;86;89" .   # GTX 10 / P100 / V100 (driver 575+): the picture reader is built
+#              for the same architectures as the engine (checked on a Tesla P40 sm_61, a Tesla P100 sm_60 and a Tesla V100 sm_70);
+#              --build-arg BUILD_VISION=0 leaves it out
 #   docker run --rm --gpus all -p 127.0.0.1:8080:8080 --ulimit memlock=-1 --shm-size 2g --stop-timeout 120 \
 #              -v strata-data:/data -e MODEL=IQ3_XXS -e API_KEY=change-me-please-123 strata:src
 #

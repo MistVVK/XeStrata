@@ -8,8 +8,13 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# terminal/setup.py outputs and downloads (engine, packs, models, logs)
-/engine/
+# terminal/setup.py outputs and downloads (the built engine, packs, models, logs). Not /engine/: that is the engine's source
+# (the built one goes to /terminal/engine/, .gitignore says the same), and a build without it cannot compile.
+/terminal/engine/
+/terminal/engine-sycl/
+/terminal/engine-cuda12/
+/engine-sycl/
+/engine-cuda12/
 /build/
 /build*/
 /dist/
@@ -22,7 +27,8 @@ __pycache__/
 /data/state/
 /data/home/
 /data/Strata-data/
-third_party/llama.cpp/
+engine/third_party/llama.cpp/
+terminal/third_party/llama.cpp/
 engine/third_party/*.zip
 *.done
 *.log
