@@ -675,9 +675,9 @@ clocks are still ramping. The first fresh prompt after a model loads is also not
 ### rocBLAS table (gfx103x)
 
 On RDNA2 the prompt GEMMs run through rocBLAS in FP16, and hipBLASLt has no gfx1030 kernels. The rocBLAS table does for
-rocBLAS what the table above does for hipBLASLt. A table is valid for one architecture and one rocBLAS build (the full
-version string, tweak hash included), so calibrate it on the card with the rocBLAS the engine loads (`/opt/rocm/lib` is
-rocBLAS 5.6.0.8d1ae90e on ROCm 10.0.0):
+rocBLAS what the table above does for hipBLASLt. A table is valid for one architecture and one rocBLAS build - packaged
+builds make that identity easy to mistake, see below - so calibrate it on the card with the rocBLAS the engine loads
+(`/opt/rocm/lib` is rocBLAS 5.6.0.8d1ae90e on ROCm 10.0.0):
 
 ```sh
 cmake --build build-hip --target tune_rocblas
@@ -692,6 +692,14 @@ names the architecture and version (`STRATA_ROCBLAS_TUNING_V1 gfx1030 5.6.0.8d1a
 `STRATA_ROCBLAS_VERBOSE=1` prints the solution picked per shape and a `tuned_launches=... fallbacks=...` summary at exit. A
 solution rocBLAS refuses at run time falls back to the default kernel for that call, and after three refusals for good.
 `hip_prefill_rocblas_gemm` (with `STRATA_ROCBLAS_TUNING` set) is the smoke test.
+
+**Build identity.** A packaged rocBLAS can report a bare version string: a ROCm-distribution or Nixpkgs rocBLAS 7.2.x
+reports `5.2.0.` on every rebuild, with no tweak hash, and the table's version gate matches exactly that string. Solution
+**indices are per-build** - they index the kernel set the library was built with - so a rebuilt library under an unchanged
+version string can move every index. A table calibrated against the previous build then keeps loading (the gate passes)
+while its indices name the wrong kernels: the symptom is `rocBLAS solution ... refused (status 11)` at each tuned shape, a
+default-kernel fallback after three refusals, and no wrong results. Re-run `tune_rocblas` against the exact library the
+engine loads after any rebuild of the rocBLAS package, even when the version string did not change, and replace the table.
 
 Shipped: `gfx1030-rocblas-5.6.0.8d1ae90e.txt` (ROCm 10.0.0, the `/opt/rocm` setup installs on Ubuntu), measured on an RX 6900 XT.
 Other gfx1030 cards run it too, but a table calibrated for them may pick differently; `tune_rocblas` makes one in about 5
