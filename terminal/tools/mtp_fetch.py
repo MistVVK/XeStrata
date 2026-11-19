@@ -513,11 +513,16 @@ def verify(out):
 
 
 def main():
+    global REPO
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["inventory", "fetch", "verify"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--only")
+    ap.add_argument("--repo", help="the BF16 checkpoint's resolve base URL to read the MTP tensors from (default: the pinned Qwen/Qwen3.8-Flash-Next revision); "
+                                   "a finetune that keeps them in its own repo, e.g. https://huggingface.co/<user>/<finetune>/resolve/main/ - its tensors are not checked against the pinned SHA256")
     a = ap.parse_args()
+    if a.repo:
+        REPO = a.repo if a.repo.endswith("/") else a.repo + "/"
     if a.cmd == "verify":                           # offline: the hashes are the pinned revision's
         bad = verify(a.out)
         for name in bad:
