@@ -65,8 +65,8 @@ the bytes over PCIe. The PCIe share of the missed experts is therefore 0.25 for 
 0.55 the copy kernel was 40% of all GPU kernel time (nsys, 300-token decode). Measurements are in
 [History](#history--older-measurements).
 
-`STRATA_ROUTE_TAIL_SKIP` is off by default for NVFP4 experts, because it moves the answers by more than the quantization
-itself. `STRATA_ROUTE_TAIL_SKIP=7` turns it on.
+`STRATA_ROUTE_TAIL_SKIP` is off for NVFP4 experts, because it moves the answers by more than the quantization
+itself (the engine's own rule since 0.1.44; Strata sets it off for every model since 0.2.17). `STRATA_ROUTE_TAIL_SKIP=7` turns it on.
 
 ## Where the global scales go
 

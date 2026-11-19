@@ -34,9 +34,11 @@ strata launch --family unsloth --model UD-Q4_K_XL
   SHA-256 against the table below once and remembers it in the file's finish mark. A file with the wrong hash is
   deleted, so the next run downloads it again.
 - **Packing.** `--compat-bf16`, and never an `experts.bin` (`--low-ram` does not apply).
-- **Defaults it writes** into the run config's `env`: `STRATA_ROUTE_TAIL_SKIP=0` where every expert is in RAM, except on
-  Linux AMD gfx12 (R9700, RX 9000), where the engine's own default (the skip on, rank 7) stays: UD-Q4_K_XL decodes 6-16%
-  faster there at an unchanged 61-task suite (`STRATA_ROUTE_TAIL_SKIP=0` turns it off). UD-Q4_K_XL keeps `STRATA_MMQ_KQ`
+- **Defaults it writes** into the run config's `env`: `STRATA_ROUTE_TAIL_SKIP=0` (the tail skip off) in every mode since
+  0.2.17. Before that it wrote it only where every expert is in RAM, and not on Linux AMD gfx12 (R9700, RX 9000), where the
+  engine's own default (the skip on, rank 7) ran: UD-Q4_K_XL decoded 6-16% faster there at an unchanged 61-task suite.
+  `STRATA_ROUTE_TAIL_SKIP=7` turns it on (KL and speed numbers: [DETAILS.md](DETAILS.md#route-tail-skip-strata_route_tail_skip-off-by-default-since-0217)).
+  UD-Q4_K_XL keeps `STRATA_MMQ_KQ`
   opt-in in the config (the Linux gfx12 engine takes it by itself since 0.2.10.1). Setup no longer writes `STRATA_HC_Q8`:
   on NVIDIA the engine itself reads the file's own Q8_0 hyper-connection projections (closer to the file and faster) for
   files that carry them as Q8_0, and `STRATA_HC_Q8=0` restores the BF16 read.

@@ -132,6 +132,9 @@ screens; leave out what you do not care about.
 | `PRESET` | the preset name in `/data` | `docker` |
 | `STRATA_SET` | advanced engine settings, space separated, like `strata launch --set` (`"prefill=65536 STRATA_PIN_BY_NEED=1"`) | none |
 
+The route tail skip (skipping rarely used parts of the model) is off in the container, as everywhere. `STRATA_SET="STRATA_ROUTE_TAIL_SKIP=7"` turns it on;
+the numbers for both choices are in [DETAILS.md](DETAILS.md#route-tail-skip-strata_route_tail_skip-off-by-default-since-0217).
+
 Your choices are saved as a preset in the volume. Start again with no settings and the saved preset is used; start with
 settings and they replace the saved ones (tuning results are kept). To change one thing, recreate the container with the new
 variable; the model and tuning stay in `/data`. Anything else: `docker exec strata strata launch --help`, or

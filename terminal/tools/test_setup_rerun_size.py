@@ -99,6 +99,17 @@ class RerunKeepsOwnEnv(unittest.TestCase):
         setup.carry_over(dict(self.OLD), new)
         self.assertEqual(new["env"], {"STRATA_HC_Q8": "1", "MY_VAR": "1"})
 
+    def test_an_unsloth_config_keeps_a_tail_skip_the_person_turned_on(self):
+        """0.2.17: setup writes STRATA_ROUTE_TAIL_SKIP=0 (Off); a 7 (On) or a rank the person chose is theirs and survives a setup run again."""
+        for value in ("7", "5"):
+            new = {"model_name": "qwen3.8-flash-next-unsloth-ud-q4_k_xl", "env": {"STRATA_ROUTE_TAIL_SKIP": "0"}}
+            kept = setup.carry_over({"env": {"STRATA_ROUTE_TAIL_SKIP": value}}, new)
+            self.assertEqual(new["env"], {"STRATA_ROUTE_TAIL_SKIP": value}, value)
+            self.assertIn("env STRATA_ROUTE_TAIL_SKIP", kept)
+        new = {"model_name": "qwen3.8-flash-next-unsloth-ud-q4_k_xl", "env": {"STRATA_ROUTE_TAIL_SKIP": "0"}}   # an old 0 is Off: nothing to keep
+        self.assertNotIn("env STRATA_ROUTE_TAIL_SKIP", setup.carry_over({"env": {"STRATA_ROUTE_TAIL_SKIP": "0"}}, new))
+        self.assertEqual(new["env"], {"STRATA_ROUTE_TAIL_SKIP": "0"})
+
 
 if __name__ == "__main__":
     unittest.main()

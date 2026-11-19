@@ -4389,18 +4389,18 @@ def unsloth_default_env(family: str, model: str, hip: bool, in_budget: bool, arc
     or better than the FP16 path's; UD-Q4_K_XL keeps it opt-in here (the Linux gfx12 engine takes it by itself since 0.2.10.1).
     STRATA_HC_Q8 on CUDA for the UD-* files is the ENGINE's default now (it sees the Q8_0 hyper-connection projections in the GGUF); setup
     writes nothing for it.
-    STRATA_ROUTE_TAIL_SKIP=0 where every expert is in RAM (the skip costs KL there); the RAM-budget mode keeps it.
-    0.2.10.1 (owner 11-03, "3 Yes"): NOT on Linux gfx12 (``arch`` "gfx1200"/"gfx1201", the R9700 and RX 9000): there the engine's own default
-    (rank 7, STRATA_ROUTE_TAIL_SKIP=0 still turns it off) stays, which decodes UD-Q4_K_XL 6-16% faster at an unchanged 61-task suite
-    (phaseA-tests/round0212/RESULTS-TAILSKIP.md).  Windows and every other card keep the 0."""
+    STRATA_ROUTE_TAIL_SKIP=0 in every Unsloth config (0.2.17, owner 11-19: the tail skip is Off by default; users saw lower quality).  Before 0.2.17 setup
+    wrote it only where every expert is in RAM and not on Linux gfx12; the RAM-budget mode and Linux gfx12 ran the engine's own default (rank 7).
+    The ``in_budget`` and ``arch`` arguments are kept for the callers and no longer change anything.  Every engine start also sets an unset
+    STRATA_ROUTE_TAIL_SKIP to 0 (serve/server.py child_env), so the other families and the configs made before 0.2.17 start Off too.  The way to
+    turn it on is STRATA_ROUTE_TAIL_SKIP=7 (the app's Expert settings, ``strata launch --set STRATA_ROUTE_TAIL_SKIP=7``); a setup run again keeps
+    a value the person put there (carry_over)."""
     env = {}
     if family != "unsloth":
         return env
     if model in ("UD-Q5_K_XL", "UD-Q6_K_XL"):
         env["STRATA_MMQ_KQ"] = "1"
-    gfx12_linux = hip and not WIN and str(arch or "").lower().startswith(("gfx1200", "gfx1201"))
-    if not in_budget and not gfx12_linux:
-        env["STRATA_ROUTE_TAIL_SKIP"] = "0"
+    env["STRATA_ROUTE_TAIL_SKIP"] = "0"
     return env
 
 
@@ -7125,6 +7125,12 @@ def carry_over(old: dict, cfg: dict, explicit: list[str] | None = None) -> list[
     if env:
         cfg["env"] = {**(cfg.get("env") or {}), **env}
         kept += [f"env {k}" for k in env]
+    # 0.2.17: the tail skip is Off by default (setup writes STRATA_ROUTE_TAIL_SKIP=0 for Unsloth's files), and On is a value the person chose (7, or a
+    # rank 1-9): a setup run again must not turn it back to the 0.  Only a value other than 0 is kept; an old 0 is Off, the same as the new one.
+    old_skip = str((old.get("env") or {}).get("STRATA_ROUTE_TAIL_SKIP", "")).strip() if isinstance(old.get("env"), dict) else ""
+    if old_skip not in ("", "0") and (cfg.get("env") or {}).get("STRATA_ROUTE_TAIL_SKIP") != old_skip:
+        cfg["env"] = {**(cfg.get("env") or {}), "STRATA_ROUTE_TAIL_SKIP": old_skip}
+        kept.append("env STRATA_ROUTE_TAIL_SKIP")
     ov, nv = old.get("vision"), cfg.get("vision")
     if isinstance(ov, dict) and isinstance(nv, dict):
         for k, v in ov.items():
