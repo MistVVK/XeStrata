@@ -1423,6 +1423,24 @@ class UnfinishedToolCall(unittest.TestCase):
         msg = openai_collect([chunk({"tool_calls": [cut]}), chunk({}, "stop")])["choices"][0]["message"]
         self.assertNotIn("tool_calls", msg)
 
+    def test_collect_content_is_null_only_beside_tool_calls(self):
+        from serve.server import openai_collect
+
+        def chunk(delta, finish=None):
+            return {"id": "c", "created": 1, "model": "m", "usage": {},
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        call = {"index": 0, "id": "a", "type": "function", "function": {"name": "f", "arguments": '{"x": 1}'}}
+        # Out of tokens while still thinking: no answer text, no call. A string, not null.
+        msg = openai_collect([chunk({"reasoning_content": "still thinking"}), chunk({}, "length")])["choices"][0]["message"]
+        self.assertEqual(msg["content"], "")
+        self.assertEqual(msg["reasoning_content"], "still thinking")
+        # A tool call with no text keeps null content, as OpenAI sends it.
+        msg = openai_collect([chunk({"tool_calls": [call]}), chunk({}, "tool_calls")])["choices"][0]["message"]
+        self.assertIsNone(msg["content"])
+        # Text is passed through unchanged.
+        msg = openai_collect([chunk({"content": "hi"}), chunk({}, "stop")])["choices"][0]["message"]
+        self.assertEqual(msg["content"], "hi")
+
     def test_a_whole_call(self):
         whole = {"path": "notes.txt", "content": "all of it"}
         a = self.answers(self.WHOLE)
