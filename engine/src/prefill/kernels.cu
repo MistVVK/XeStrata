@@ -2885,7 +2885,11 @@ bool f16_range_read(float& max_abs, unsigned long long& over, bool reset) {
     union { unsigned u; float f; } c; c.u = bits; max_abs = c.f; over = o;
     if (reset) {
         const unsigned z = 0; const unsigned long long zz = 0;
-        cudaMemcpyToSymbol(g_f16_range_max, &z, sizeof z); cudaMemcpyToSymbol(g_f16_range_over, &zz, sizeof zz);
+        /* both writes must run even when the first fails, else the untouched symbol keeps a stale
+           cumulative count and the next read reports it after a reset was requested */
+        const cudaError_t e_max = cudaMemcpyToSymbol(g_f16_range_max, &z, sizeof z);
+        const cudaError_t e_over = cudaMemcpyToSymbol(g_f16_range_over, &zz, sizeof zz);
+        if (e_max != cudaSuccess || e_over != cudaSuccess) { cudaGetLastError(); return false; }
     }
     return true;
 #endif
