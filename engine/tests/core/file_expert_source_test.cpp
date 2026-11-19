@@ -513,6 +513,22 @@ void test_resident_memory_budget() {
         require(clamp_resident_budget(24 * GiB, phys, strata::platform::commit_available(left, 24 * GiB), headroom) == 24 * GiB,
                 "a budget the page file's room to grow covers was clamped");
     }
+    {
+        // #3725: a 31 GB PC with two cards (WDDM shared segment ~15.5 GiB, ~12 GiB of it left for this process): the
+        // auto complement of 14.81 GiB was pinned whole and the next 26 KB cudaMalloc failed.  With 2 GiB kept for the
+        // buffers mapped later the reporter's own patch gave 12.90 -> 10.97 GiB at 12.97 GiB left.
+        using strata::core::detail::clamp_budget_to_shared_segment;
+        const uint64_t seg = 12970ull * GiB / 1000, keep = 2 * GiB;
+        require(clamp_budget_to_shared_segment(14810ull * GiB / 1000, seg, keep) == seg - keep,
+                "a complement larger than the shared segment's room was not cut");
+        require(clamp_budget_to_shared_segment(8 * GiB, seg, keep) == 8 * GiB,
+                "a complement that fits the shared segment was changed");
+        require(clamp_budget_to_shared_segment(seg - keep, seg, keep) == seg - keep,
+                "a complement that exactly fits the shared segment was changed");
+        require(clamp_budget_to_shared_segment(8 * GiB, keep, keep) == 0 && clamp_budget_to_shared_segment(8 * GiB, 0, keep) == 0,
+                "a shared segment with no room beyond the reserve produced a positive complement");
+        require(clamp_budget_to_shared_segment(8 * GiB, seg, 0) == 8 * GiB, "a zero reserve changed a fitting complement");
+    }
 }
 
 void test_cgroup_memory_budget() {
