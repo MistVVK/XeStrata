@@ -348,7 +348,7 @@ R9700) in the `env` block of the server JSON, then a restart. Experimental, one 
 
 ## Source-checkout problems
 
-Python/venv, CUDA compiler versions, ROCm builds, `UPDATE.bat`, `update.sh` and generated `run-<model>` scripts
+Python/venv, CUDA compiler versions, ROCm builds, `UPDATE.bat`, `./setup.sh --update` and generated `run-<model>` scripts
 belong to [SOURCE_INSTALL.md](SOURCE_INSTALL.md); the entries above marked "source checkout" are the common ones. Use the
 backend guide for build prerequisites. If `git pull` fails in an old clone, see the `UPDATE.bat` entry above and do not
 overwrite local branches or edits just to make `git pull` succeed.

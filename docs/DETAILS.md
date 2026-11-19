@@ -1394,7 +1394,8 @@ On 12.0 cards (sm_120) these also apply:
   on an RTX 40 card by us (same output bit for bit): `STRATA_MMVQ_IL_89=0` or `STRATA_DEFAULTS=026` turns them off.
 - With 80 or more SMs the native packs' prompt experts run on the fused int8 kernels (`STRATA_PF_FUSED`) for IQ2_S, IQ3_XXS,
   IQ3_S and IQ4_XS gate/up. IQ2_XXS and IQ2_XS keep MMQ. Smaller 12.0 cards (an RTX 5070 with 48 SMs) keep MMQ because the fused
-  kernels were 4.7% slower on 20K prompts there. `STRATA_PF_FUSED=0` keeps MMQ.
+  kernels were 4.7% slower on 20K prompts there. `STRATA_PF_FUSED=0` keeps MMQ in a build that has it. The release builds have no MMQ
+  (0.2.16 and later): there `=0` runs the prompt experts on the native int8 kernels, which measured slower at 7K to 20K tokens (#6251).
 - `--spec 4 --spec-min-p 0.5` stays the default depth.
 - Setup (Linux, not WSL): when the RAM covers the model's need plus the n-gram table plus 16 GB (Q2_0 93 GB, IQ3_S 107 GB), the table
   is kept in RAM (`--ple-io ram`), so a new prompt does not wait for its rows from the SSD. With RAM short, ram mode costs
