@@ -1,6 +1,7 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/core/expert_nibble.hpp"
+#include "strata/core/tail_skip_default.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
@@ -4933,15 +4934,13 @@ static_assert(strata::kernels::kWindowMaxT * 10 <= kMaxWindowEntries, "a verify 
 
 namespace {
 // STRATA_ROUTE_TAIL_SKIP: the rank from which a missed expert that every token of the window routes that low is skipped.  An
-// explicit environment value is read once; the serve start-up (generate.cpp) sets the CUDA default where it applies.
+// environment value is read once.  Not set: off on every backend (strata/core/tail_skip_default.hpp; rank 7 on CUDA and gfx1200/gfx1201 until 0.1.62).
 std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
 }  // namespace
 int tail_skip_rank() {
     int r = g_tail_skip_rank.load(std::memory_order_relaxed);
     if (r < 0) {
-        const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP");
-        r = v != nullptr ? std::atoi(v) : 0;
-        r = r > 0 && r < 10 ? r : 0;
+        r = tail_skip_rank_from_text(std::getenv("STRATA_ROUTE_TAIL_SKIP"));
         g_tail_skip_rank.store(r, std::memory_order_relaxed);
     }
     return r;

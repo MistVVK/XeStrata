@@ -41295,11 +41295,11 @@
    "since": "v0.1.43",
    "last_commit": "60abf63edc",
    "last_date": "2026-10-11",
-   "status": "default",
+   "status": "retired",
    "owner": "program",
-   "note": "[reviewed] Moves the cached-percent line of the default tail-skip rule. [phaseA-tests/review-1421.md:28]",
+   "note": "Retired in 0.1.63: code removed, the setting is no longer read. It moved the cached-percent line of the default tail-skip rule, and the tail skip is off when STRATA_ROUTE_TAIL_SKIP is not set (owner decision 2026-11-19), so there is no default rule for it to move. STRATA_ROUTE_TAIL_SKIP=7 turns the skip on whatever the cached share is.",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.1.63"
   },
   {
    "name": "STRATA_TAP_FILE",

@@ -701,7 +701,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// Plan v0.3 P6: the pool for a verify window of `n_tok` tokens.  `x_f` is (n_tok, n_embd), `ids` (n_tok, k) and
 /// `out` (n_tok * k, n_embd).  Each distinct missed expert is computed once for all the tokens routed to it;
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
-/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
+/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0, on every backend (tail_skip_default.hpp).
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
 
