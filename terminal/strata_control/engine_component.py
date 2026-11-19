@@ -437,9 +437,16 @@ def _hash_settled(path: Path, digest: str) -> str | None:
     return actual
 
 
+#: Files (path, size, modification time in ns, recorded SHA-256) whose content was read in this process and matched. The quick check a listing makes
+#: hashes the engine's entrypoint (170 MB on Windows CUDA); the setup screens asked about the engine on every key and read it every time, which is
+#: what made `strata launch` take seconds per key on a PC with a slow disk or a virus checker (#6278, #5940). A file that changed has another size or
+#: time and is read again; `full=True` (a start) never uses this.
+_HASHED_OK: set = set()
+
+
 def verify(component: EngineComponent, *, full: bool = False) -> None:
     """Raise IntegrityProblem unless the files are what the manifest says. `full` hashes every file; without it only
-    the entrypoint is hashed (sizes are always checked)."""
+    the entrypoint is hashed (sizes are always checked), once per file as it is on disk (see _HASHED_OK)."""
     # extended-length paths: under a long user name an AMD engine's files pass 259 characters, which Windows (long paths off)
     # reports as "missing" for an ordinary path
     folder = longpath.long_path(component.root)
@@ -457,10 +464,16 @@ def verify(component: EngineComponent, *, full: bool = False) -> None:
         if info.st_size != size:
             raise IntegrityProblem(f"{rel} is {info.st_size} bytes, the manifest says {size}")
         if full or rel == component.entrypoint:
+            seen = (str(target), info.st_size, info.st_mtime_ns, digest)
+            if not full and seen in _HASHED_OK:
+                continue                           # the quick check a listing makes: this very file was read and matched a moment ago (#6278)
             actual = _hash_settled(target, digest)
             if actual != digest:
                 raise IntegrityProblem(f"{rel} does not match its recorded SHA-256 (expected {digest[:12]}, "
                                        f"found {actual[:12] if actual else 'unreadable'})")
+            if len(_HASHED_OK) >= 64:
+                _HASHED_OK.clear()
+            _HASHED_OK.add(seen)
     if os.name != "nt" and not os.access(component.exe, os.X_OK):
         raise IntegrityProblem(f"{component.entrypoint} is not executable")
 
