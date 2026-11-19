@@ -1078,15 +1078,26 @@ kernel void idx_select(device const float* score [[buffer(0)]], constant int& ld
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     int n_eq_need = n_top - n_gt_s;
-    for (int g = tid; g < grp; g += 256) {
-        if (f2key(sc[g]) > thr) {
-            int s = atomic_fetch_add_explicit(&cnt_sel, 1, memory_order_relaxed);
-            for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
-        }
+    {   // the groups above the threshold in increasing g order (deterministic list order): thread tid owns a contiguous run of groups
+        const int per = (grp + 255) / 256;
+        const int g0 = int(tid) * per, g1 = min(grp, g0 + per);
+        int cnt = 0;
+        for (int g = g0; g < g1; ++g) cnt += (f2key(sc[g]) > thr) ? 1 : 0;
+        const int ex = simd_prefix_exclusive_sum(cnt);
+        if ((tid & 31) == 31) red[tid >> 5] = ex + cnt;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int base = 0;
+        for (uint w = 0; w < (tid >> 5); ++w) base += red[w];
+        int sidx = base + ex;
+        for (int g = g0; g < g1; ++g)
+            if (f2key(sc[g]) > thr) {
+                for (int j = 0; j < 4; ++j) kl[4 * sidx + j] = 4 * g + j;
+                ++sidx;
+            }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) {
-        int s = atomic_load_explicit(&cnt_sel, memory_order_relaxed), need = n_eq_need;
+        int s = n_gt_s, need = n_eq_need;
         for (int g = 0; g < grp && need > 0; ++g) {
             if (f2key(sc[g]) == thr) {
                 for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
