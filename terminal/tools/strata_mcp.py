@@ -2251,15 +2251,26 @@ class Tools:
                        backend=None, low_ram=None, port=None, data_dir=None, confirm=False, cancel=False,
                        gguf_dir=None, drafter=None, mtp=None) -> dict:
         s = self.s
+        asked = time.monotonic()                         # when this call came in (before it waits for the lock)
         with s.lock:
             job = s.install_job()
             if cancel:
                 if not job or not job["running"]:
+                    # A start that came in before this cancel and is still waiting for the lock must not launch the job after it
+                    # (the app quit while "Prepare and load" was starting: the job and its packer then ran on with nobody to stop them).
+                    s.install_cancelled_at = time.monotonic()
                     return {"summary": "no install is running", "install": job}
                 j = s.state("install")
                 res = s.state("install-result")
                 child = res.get("child_pid") if res.get("job") == j.get("job") else None
                 tree = proc_tree_snapshot(j["pid"]) if proc_alive(j["pid"], j["ident"]) else []   # setup.py and what it runs (#3257)
+                if not WIN and proc_alive(j["pid"], j["ident"]):
+                    # The job is a session leader and setup.py and the packer are in its group: end the whole group first. Ending setup.py first
+                    # let the job end too, and the group was then no longer reached (the packer, a grandchild, kept writing).
+                    try:
+                        os.killpg(int(j["pid"]), signal.SIGKILL)
+                    except OSError:
+                        pass
                 if child:
                     proc_kill_tree(child, res.get("child_ident"))
                 proc_kill_tree(j["pid"], j["ident"])
@@ -2273,6 +2284,8 @@ class Tools:
                                       if job.get("download") else ""),
                         "install": job, "follow": "call strata_install again for progress, or strata_logs "
                                                   "source=setup for the full output"}
+            if confirm and getattr(s, "install_cancelled_at", 0) >= asked:
+                raise ToolError("the install was cancelled before it started")
             given = [x for x in (family, model, context, vision, kv, gpu, gpus, backend, low_ram, port, data_dir)
                      if x is not None]
             if job and not given and not confirm:

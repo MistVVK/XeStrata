@@ -40,6 +40,10 @@ def main():
     for pct in (10, 20, 30):
         print(f"\r  model.gguf:  {pct * 0.5:.2f} / 50.00 GB ({pct}%)   ", end="", flush=True)
     print(flush=True)
+    if (root / "packer").exists():                  # setup.py -> tools/iq_pack.py: a grandchild that writes on its own for minutes
+        import subprocess
+        pk = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        (root / "packer.pid").write_text(str(pk.pid))
     if (root / "slow").exists():
         end = time.time() + 30
         while not (root / "go").exists() and time.time() < end:
@@ -444,6 +448,75 @@ class Install(FakeRoot):
         res, err = self.call("strata_install", {"cancel": True})
         self.assertIn("stopped", res["summary"])
         self.assertFalse(self.strata.install_job()["running"])
+
+    def test_cancel_ends_the_packer_setup_started(self):
+        """A quit during "Prepare and load" cancels the install; the model packer (a grandchild of the job) must end with it, and its half-written files
+        are left for the next run to resume (iq_pack writes experts.bin.tmp + a sidecar and renames only when complete)."""
+        (self.root / "slow").write_text("")
+        (self.root / "packer").write_text("")
+        res, err = self.call("strata_install", {"family": "coder", "confirm": True})
+        self.assertFalse(err, res)
+        pidfile = self.root / "packer.pid"
+        self.assertTrue(wait_for(pidfile.exists, 30))
+        time.sleep(0.3)
+        packer = int(pidfile.read_text())
+        ident = M.proc_identity(packer)
+        self.assertTrue(ident, "the packer is running before the cancel")
+        try:
+            res, err = self.call("strata_install", {"cancel": True})
+            self.assertIn("stopped", res["summary"])
+            self.assertTrue(wait_for(lambda: not M.proc_alive(packer, ident), 10), "the packer kept running after the install was cancelled")
+        finally:
+            if M.proc_alive(packer, ident):
+                M.proc_terminate(packer, ident)
+
+    @unittest.skipIf(M.WIN, "POSIX process groups")
+    def test_cancel_reaches_the_packer_when_the_job_ends_as_soon_as_setup_is_killed(self):
+        """Ending setup.py first lets the job (its parent, waiting for it) end at once; the group was then no longer reached and the packer,
+        a grandchild, kept writing. The cancel ends the job's whole group before it touches setup.py."""
+        (self.root / "slow").write_text("")
+        (self.root / "packer").write_text("")
+        res, err = self.call("strata_install", {"family": "coder", "confirm": True})
+        self.assertFalse(err, res)
+        pidfile = self.root / "packer.pid"
+        self.assertTrue(wait_for(pidfile.exists, 30))
+        time.sleep(0.3)
+        packer = int(pidfile.read_text())
+        ident = M.proc_identity(packer)
+        self.assertTrue(ident)
+        real = M.proc_kill_tree
+        calls = []
+
+        def slow_after_the_first(pid, ident_):
+            out = real(pid, ident_)
+            if not calls:                                   # the time the job needs to notice that setup is gone, and to end
+                calls.append(pid)
+                time.sleep(0.6)
+            return out
+        try:
+            with mock.patch.object(M, "proc_kill_tree", slow_after_the_first):
+                self.call("strata_install", {"cancel": True})
+            self.assertTrue(wait_for(lambda: not M.proc_alive(packer, ident), 10), "the packer kept running after the cancel")
+        finally:
+            if M.proc_alive(packer, ident):
+                M.proc_terminate(packer, ident)
+
+    def test_a_start_that_came_in_before_a_cancel_does_not_launch_the_job(self):
+        """The app quit while "Prepare and load" was starting: the cancel got the installer's lock first and found nothing to stop; the start then
+        launched the job and its packer with nobody left to stop them."""
+        res, err = self.call("strata_install", {})
+        self.assertFalse(err)
+        res, err = self.call("strata_install", {"cancel": True})
+        self.assertIn("no install is running", res["summary"])
+        stamp = self.strata.install_cancelled_at
+        with mock.patch.object(M.time, "monotonic", return_value=stamp - 5.0):       # this start came in before the cancel
+            res, err = self.call("strata_install", {"family": "coder", "confirm": True})
+        self.assertTrue(err)
+        self.assertIn("cancelled before it started", res["error"])
+        self.assertIsNone(self.strata.install_job(), "no job was launched")
+        res, err = self.call("strata_install", {"family": "coder", "confirm": True})   # a start asked for after the cancel goes ahead
+        self.assertFalse(err, res)
+        self.wait_job()
 
     def test_failure_is_reported(self):
         (self.root / "fail").write_text("")
