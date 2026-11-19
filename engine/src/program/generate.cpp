@@ -2284,7 +2284,7 @@ std::string draft_costs_key(int argc, char** argv, const std::string& extra, boo
     return k;
 }
 
-/// STRATA_ADAPT_FETCH (opt-in): 1 = the PCIe share also admits into the VRAM tier (ExpertDispatch::fetch_admit), beside
+/// STRATA_ADAPT_FETCH (opt-in; 2 is the default of a compute capability 12.x card with 16 GiB or less, see nv_defaults.hpp): 1 = the PCIe share also admits into the VRAM tier (ExpertDispatch::fetch_admit), beside
 /// the tier's own copies from RAM; 2 = instead of them (the tier's counts still decay).  STRATA_ADAPT_FETCH_MIN and
 /// STRATA_ADAPT_FETCH_MARGIN: the admission's thresholds (default 1 and 0.5).
 int adapt_fetch() {
@@ -4330,7 +4330,20 @@ int main(int argc, char** argv) {
                 same = cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess &&
                        cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) == cudaSuccess && m == m0 && n == n0;
             }
-            if (same) { strata::core::apply_nv_defaults(m0, n0); strata::core::apply_spec_adapt_default(m0, n0); }
+            if (same) {
+                // STRATA_ADAPT_FETCH=2 for a card of 16 GiB or less: only a one-card run uses the switch (it is read once per process), so the engine's main card
+                // (STRATA_PRIMARY_DEVICE, as read below) decides; a card's memory is read without making a context on it
+                uint64_t main_vram = 0;
+                {
+                    const char* pv = std::getenv("STRATA_PRIMARY_DEVICE");
+                    const int pd = pv != nullptr ? std::atoi(pv) : 0;
+                    cudaDeviceProp mp{};
+                    if (cudaGetDeviceProperties(&mp, pd > 0 && pd < nd ? pd : 0) == cudaSuccess) main_vram = (uint64_t) mp.totalGlobalMem;
+                    else (void) cudaGetLastError();
+                }
+                strata::core::apply_nv_defaults(m0, n0, main_vram);
+                strata::core::apply_spec_adapt_default(m0, n0);
+            }
             {   // round 0212: the K-quant MMQ prompt kernels, on by default for compute capability 8.0+ (STRATA_MMQ_KQ=0 or STRATA_NV_KQ_DEFAULT=0 turns them off); the lowest compute capability decides
                 int lo_m = m0, lo_n = n0;
                 for (int d = 1; d < nd; ++d) {
@@ -14364,13 +14377,17 @@ int main(int argc, char** argv) {
                               : remote_opt || drive.d.remote_count > 0 ? "helper GPUs" : o.adapt_async ? "--adapt-async"
                               : o.pipeline_windows > 0 ? "--pipeline-windows" : o.batch > 0 ? "--batch"
                               : adapt_overlap() ? "STRATA_ADAPT_OVERLAP=1" : nullptr;
-        if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in)
+        if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in; the default on a 12.x card of 16 GiB or less)
             const char* off = drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off
                             : o.pcie_mode == "dma" || o.pcie_mode == "direct" ? "--pcie-mode dma / direct"
                             : drive.d.plan == nullptr ? "no GPU plan"
                             : drive.d.pcie_num <= 0 ? "no PCIe share"
                             : src.complement_ready() ? "the resident RAM mode" : nullptr;
-            if (off != nullptr) std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH is off (%s)\n", off);
+            if (off != nullptr) {
+                if (strata::core::adapt_fetch_is_default())   // the default of a card with 16 GiB or less, not the user's setting
+                    std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH=2 (the default for this card) is not used in this run (%s)\n", off);
+                else std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH is off (%s)\n", off);
+            }
             else {
                 drive.d.fetch_admit = adapt_fetch();
                 drive.d.res_mut = host_res.data();
@@ -23534,13 +23551,17 @@ int main(int argc, char** argv) {
         const char* fetch_off = d_res == nullptr ? "no residency table" : o.spec_split ? "--spec-split"
                               : multi_gpu ? "a layer split" : drive.d.peer != nullptr ? "a peer tier"
                               : drive.d.remote_count > 0 ? "helper GPUs" : nullptr;
-        if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in)
+        if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in; the default on a 12.x card of 16 GiB or less)
             const char* off = drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off
                             : o.pcie_mode == "dma" || o.pcie_mode == "direct" ? "--pcie-mode dma / direct"
                             : drive.d.plan == nullptr ? "no GPU plan"
                             : drive.d.pcie_num <= 0 ? "no PCIe share"
                             : src.complement_ready() ? "the resident RAM mode" : nullptr;
-            if (off != nullptr) std::fprintf(stderr, "strata generate: STRATA_ADAPT_FETCH is off (%s)\n", off);
+            if (off != nullptr) {
+                if (strata::core::adapt_fetch_is_default())
+                    std::fprintf(stderr, "strata generate: STRATA_ADAPT_FETCH=2 (the default for this card) is not used in this run (%s)\n", off);
+                else std::fprintf(stderr, "strata generate: STRATA_ADAPT_FETCH is off (%s)\n", off);
+            }
             else {
                 drive.d.fetch_admit = adapt_fetch();
                 drive.d.res_mut = host_res.data();
