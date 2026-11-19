@@ -395,6 +395,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(q36_hybrid_fit_test tests/program/q36_hybrid_fit_test.cpp)
   target_include_directories(q36_hybrid_fit_test PRIVATE include)
   add_test(NAME q36_hybrid_fit_test COMMAND q36_hybrid_fit_test)
+  # #5841: the MTP draft head subset buffer holds the wider of the head row and the Q4_0 row (header-only, no GPU)
+  add_executable(mtp_head_rule_test tests/core/mtp_head_rule_test.cpp)
+  target_include_directories(mtp_head_rule_test PRIVATE include)
+  add_test(NAME mtp_head_rule_test COMMAND mtp_head_rule_test)
 
   # #5715: strata-q36's one-session context check (the reporter's 12 GB card from its log): header-only, no GPU
   add_executable(q36_context_fit_test tests/program/q36_context_fit_test.cpp)
