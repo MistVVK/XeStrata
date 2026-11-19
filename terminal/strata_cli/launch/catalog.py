@@ -460,7 +460,7 @@ class Catalog:
                     about=size["about"], download_gb=float(size["download_gb"]), need_vram_gb=f["vramUseGb"],
                     need_ram_gb=f["ramUseGb"], spill_gb=f["spillGb"], verdict=cat, words=words,
                     experimental=bool(size.get("experimental") or fam.get("experimental")), images=bool(size.get("images")),
-                    installed=bool(size.get("installed")) or self.installed_config(str(size["id"])) is not None, mem_total=bool(size.get("mem_total")),
+                    installed=self.installed_with_files(str(size["id"])), mem_total=bool(size.get("mem_total")),
                     memory_gb=float(size.get("memory_gb") or 0), fit_gb=float(size.get("fit_gb") or size.get("memory_gb") or 0),
                     recommended=(rec.get("family") == fam["family"] and rec.get("model") == size["model"])))
         self.apply_disk(out, hw, own)
@@ -679,6 +679,21 @@ class Catalog:
             if p.is_file():
                 return p
         return None
+
+    def installed_with_files(self, tag: str) -> bool:
+        """Is this model on this computer, as the list's "(installed)" tag means it (#6240)?  A run config that survived its files (deleted, or the
+        data folder moved) is not: its weights or its prepared pack are named and not there.  A config that names no weights (nothing to check), or
+        that cannot be read, still counts, as before; a missing draft layer or picture reader does not matter (they are fetched on their own)."""
+        path = self.installed_config(tag)
+        if path is None:
+            return False
+        try:
+            from strata_control import discovery
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+            gone = {m.kind for m in discovery.footprint(cfg, path).missing()}
+        except (OSError, ValueError, AttributeError, TypeError):
+            return True
+        return not (gone & {"weights", "pack"})
 
     def data_dir_choice(self) -> tuple[Path, str]:
         """(the data folder, where it came from): the person's own setting, the desktop app's folder, a Documents/Strata that holds models,
