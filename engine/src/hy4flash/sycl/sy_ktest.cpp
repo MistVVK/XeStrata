@@ -6,9 +6,11 @@
 #include <vector>
 
 #include "strata/quant/sk_codecs.hpp"
+#include "sy_gemm_xmx.h"
 #include "sy_indexer.h"
 #include "sy_kernels.h"
 #include "sy_linear.h"
+#include "sy_rp.h"
 
 using namespace hy4s;
 using strata::quant::sk::SkCode;
@@ -84,6 +86,38 @@ int main() {
             snprintf(nm, sizeof nm, "linear_h S%d M=%d", fmt, M);
             check(nm, y, ref, 2e-6);
             dfree(dw); dfree(dx); dfree(dy);
+        }
+    }
+    for (int fmt : {FMT_S4, FMT_S8}) {  // RP layout: repack on the host, GEMV (M <= 8), XMX GEMM (M >= 16, N % 64 == 0) vs the raw reference kernel
+        for (int Nr : {320, 200}) {
+            const int Kr = 1536;
+            std::vector<uint8_t> w;
+            make_sk(fmt, Nr, Kr, w);
+            std::vector<uint8_t> rp(rp_bytes(fmt, Nr, Kr));
+            rp_repack_host(fmt, w.data(), rp.data(), Nr, Kr);
+            uint8_t* dw = dalloc<uint8_t>(w.size());
+            uint8_t* dr = dalloc<uint8_t>(rp.size());
+            h2d(dw, w.data(), w.size());
+            h2d(dr, rp.data(), rp.size());
+            for (int M : {1, 3, 8, 20, 77}) {
+                std::vector<half> xh((size_t)M * Kr);
+                for (auto& v : xh) v = (half)rnd(-1.f, 1.f);
+                half* dx = dalloc<half>(xh.size());
+                float* y1 = dalloc<float>((size_t)M * Nr);
+                float* y2 = dalloc<float>((size_t)M * Nr);
+                h2d(dx, xh.data(), xh.size() * 2);
+                linear_h(fmt, dw, Nr, Kr, dx, y1, M);
+                linear_auto(fmt, dr, Nr, Kr, dx, y2, M, true);
+                std::vector<float> a((size_t)M * Nr), b((size_t)M * Nr);
+                d2h(a.data(), y1, a.size() * 4);
+                d2h(b.data(), y2, b.size() * 4);
+                wait();
+                char nm[96];
+                snprintf(nm, sizeof nm, "RP S%d N=%d M=%d (%s)", fmt, Nr, M, (M >= 16 && !(Nr & 63)) ? "xmx" : "gemv");
+                check(nm, b, a, (M >= 16 && !(Nr & 63)) ? 5e-4 : 2e-6);
+                dfree(dx); dfree(y1); dfree(y2);
+            }
+            dfree(dw); dfree(dr);
         }
     }
     {  // Q8ROW and F32

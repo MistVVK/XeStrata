@@ -12,6 +12,7 @@
 #include "hy4_engram.h"
 #include "hy4s_cpuexp.h"
 #include "sy_common.h"
+#include "sy_gemm_xmx.h"
 #include "sy_indexer.h"
 #include "sy_kernels.h"
 #include "sy_linear.h"
@@ -141,7 +142,7 @@ public:
     void lin(const std::string& name, const half* X, float* Y, int M) {
         const hy4::TInfo& t = ti(name);
         PS _p(this, std::string("lin ") + name.substr(name.find('.', 13) == std::string::npos ? 0 : name.find('.', 13) + 1));
-        linear_h(t.fmt, tw(name), (int)t.rows(), (int)t.cols(), X, Y, M);
+        linear_auto(t.fmt, tw(name), (int)t.rows(), (int)t.cols(), X, Y, M, g.is_rp(name));
     }
     void ensure_mla_ws(size_t need) {
         if (need <= mla_ws_bytes) return;
@@ -366,7 +367,7 @@ public:
         for (int j = 0; j < 5; ++j) {
             const std::string nm = j < 4 ? p + ".key_projs." + std::to_string(j) + ".weight" : p + ".value_proj.weight";
             const hy4::TInfo& t = ti(nm);
-            linear_h(t.fmt, tw(nm), (int)t.rows(), (int)t.cols(), er_h, kv_f + (size_t)j * T * HID, T);
+            linear_auto(t.fmt, tw(nm), (int)t.rows(), (int)t.cols(), er_h, kv_f + (size_t)j * T * HID, T, g.is_rp(nm));
         }
         engram_apply(x, kv_f, e.kvb, e.egate, e.pre_gamma, e.hcs, d_evalid[mo], T);
     }
@@ -537,7 +538,7 @@ public:
         { PS _q(this, "head_hc_mix"); hc_mix_run(xs, hfn, hsc, hbs, 4, n); }
         { PS _q(this, "head_reduce_norm"); hc_reduce_norm(xs, pre, (const float*)tw("model.norm.weight"), hfin, nullptr, c.rms_eps, n); }
         const hy4::TInfo& lm = ti("lm_head.weight");
-        linear_h(lm.fmt, tw("lm_head.weight"), (int)lm.rows(), (int)lm.cols(), hfin, logits, n);
+        linear_auto(lm.fmt, tw("lm_head.weight"), (int)lm.rows(), (int)lm.cols(), hfin, logits, n, g.is_rp("lm_head.weight"));
     }
 };
 
