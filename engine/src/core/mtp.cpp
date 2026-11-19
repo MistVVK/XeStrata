@@ -888,6 +888,13 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             }
         }
     }
+    if (q4_head_ && dhead_ == nullptr) {
+        // (#4333: a warning, not a refusal - the setup config of some machines passes --mtp-q4 all, and a pack without a subset
+        // used to start; drafting then runs over the full head, as it always did)
+        std::fprintf(stderr, "strata mtp: --mtp-q4 head/all has no effect: it requantizes the draft head's subset, and none is installed "
+                             "(rt/draft_vocab.bin or --mtp-draft-vocab FILE is absent or empty, or STRATA_MTP_FULL_HEAD=1 excludes it); "
+                             "drafting runs over the full head. Install a subset (tools/draft_vocab.py) to use it\n");
+    }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
     return true;
 }
