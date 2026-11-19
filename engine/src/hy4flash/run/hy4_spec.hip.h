@@ -21,7 +21,8 @@ struct SpecCfg {
     float cut = -1.f;      // >= 0: verify the leading slots with conf > cut instead of the cost model
     bool exact = true;     // verify windows on the M-independent GEMV / decode expert kernels
     bool debug = false;
-    int rv = 0;            // reduced-vocabulary draft chain: candidates per slot (0 = full lm_head per drafted token)
+    bool sabotage = false; // test only: replace every draft token by a random id with conf 0.9 (acceptance ~0): the worst case for the controller
+    int rv = 256;          // reduced-vocabulary draft chain: candidates per slot (0 = full lm_head per drafted token)
 };
 
 struct SpecStats {
@@ -199,6 +200,10 @@ public:
             const double td0 = now_s();
             if (!d.draft(a, tok[a], Kd, y, cf)) { finish = "error"; err = "draft failed"; break; }
             const double tdraft = (now_s() - td0) * 1000.0;
+            if (cfg.sabotage) {
+                static uint64_t xs = 88172645463325252ull;
+                for (int j = 1; j <= Kd; ++j) { xs ^= xs << 13; xs ^= xs >> 7; xs ^= xs << 17; y[j] = (int)(xs % 100000); cf[j] = 0.9f; }
+            }
             S.t_draft += tdraft;
             S.drafted += Kd;
             int Kp = choose_k(Kd);

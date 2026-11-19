@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <numeric>
 #include <string>
@@ -79,6 +80,7 @@ int main(int argc, char** argv) {
     SpecCfg scfg;
     std::string parity_list;
     bool det_flag = true, want_margins = false;
+    int ab_rounds = 0, trace_m = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() {
@@ -108,8 +110,12 @@ int main(int argc, char** argv) {
         else if (a == "--spec-cut") scfg.cut = (float)atof(nxt().c_str());
         else if (a == "--spec-debug") scfg.debug = true;
         else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
+        else if (a == "--spec-sabotage") scfg.sabotage = true;
         else if (a == "--det") det_flag = atoi(nxt().c_str()) != 0;
         else if (a == "--margins") want_margins = true;
+        else if (a == "--ab") ab_rounds = atoi(nxt().c_str());
+        else if (a == "--trace-m") trace_m = atoi(nxt().c_str());
+        else if (a == "--mla-blocks") g_mla_target_blocks = atoi(nxt().c_str());
         else if (a == "--spec-exact") scfg.exact = atoi(nxt().c_str()) != 0;
         else if (a == "--parity-m") parity_list = nxt();
         else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
@@ -243,6 +249,7 @@ int main(int argc, char** argv) {
     int V = r.c.vocab;
     r.prefetch_engram(tok.data(), 0, std::min(r.Tc, T0));
     std::vector<float> hl;
+    int last_p0 = 0, last_T = 0;
     while (done < T0) {
         int T = std::min(r.Tc, T0 - done);
         if (!r.forward_chunk(tok.data(), done, T, err)) {
@@ -253,6 +260,8 @@ int main(int argc, char** argv) {
         if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
         bool last = done == T0;
         if (last) {
+            last_p0 = done - T;
+            last_T = T;
             int first = (all_logits && !spec_mode) ? 0 : T - 1;
             r.head(T, first);
             if (df.ok) df.snap_h(T - first - 1);
@@ -274,6 +283,30 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram cpu %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_cpu);
     // greedy decode
     const double cpu_wait0 = r.t_cpu_wait;
+    if (trace_m > 0) {
+        // layer-by-layer bit comparison of an M-token window against the same positions one at a time: dumps x after every attention / MLP of every layer into out/seq<i> and out/win
+        // (compare with tools: first file whose bytes differ names the layer and the op that is not batch invariant)
+        const int M = trace_m;
+        const int p0 = T0 - M;
+        skd::lin_gemv_max_m() = 16;
+        skd::moe_dec_max_m() = 16;
+        r.dump = true;
+        for (int i = 0; i < M; ++i) {
+            const std::string d = out_dir + "/seq" + std::to_string(i);
+            std::filesystem::create_directories(d);
+            r.dump_dir = d;
+            if (!r.forward_chunk(tok.data(), p0 + i, 1, err)) return 1;
+        }
+        {
+            const std::string d = out_dir + "/win";
+            std::filesystem::create_directories(d);
+            r.dump_dir = d;
+            if (!r.forward_chunk(tok.data(), p0, M, err)) return 1;
+        }
+        HCK(hipStreamSynchronize(r.st));
+        printf("[trace] M=%d window p0=%d dumped\n", M, p0);
+        return 0;
+    }
     if (!parity_list.empty()) {
         // verify-window parity: rows of an M-token chunk vs the same positions run one token at a time (M = 1 decode), same prefix
         std::vector<int> ws;
@@ -292,6 +325,18 @@ int main(int argc, char** argv) {
         std::vector<float> seq((size_t)Wmax * V), win((size_t)Wmax * V);
         skd::lin_gemv_max_m() = 4;
         skd::moe_dec_max_m() = 4;
+        {   // run-to-run determinism of the same M=1 step: three repetitions of the last position, no state change in between (the row rewrites itself)
+            std::vector<float> a(V), b(V);
+            int nd = 0;
+            for (int rep = 0; rep < 4; ++rep) {
+                if (!r.forward_chunk(tok.data(), T0 - 1, 1, err)) return 1;
+                r.head(1, 0);
+                HCK(hipStreamSynchronize(r.st));
+                HCK(hipMemcpy(rep == 0 ? a.data() : b.data(), r.logits, (size_t)V * 4, hipMemcpyDeviceToHost));
+                if (rep > 0) nd += !std::equal(a.begin(), a.end(), b.begin());
+            }
+            printf("[determinism] M=1 last position repeated: %d of 3 repeats differ from the first\n", nd);
+        }
         for (int i = 0; i < Wmax; ++i) {
             if (!r.forward_chunk(tok.data(), base + i, 1, err)) return 1;
             r.head(1, 0);
@@ -353,7 +398,57 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
-    if (spec_mode) {
+    if (ab_rounds > 0 && spec_mode) {
+        // DFly2 off vs on from ONE prefill: each mode starts from the resident prompt state (the last prefill chunk is re-run, which rebuilds the logits, h_final and the key-list capture;
+        // decode rows beyond the prompt are overwritten, the SWA ring keeps >= Tc slack). Rounds alternate plain / spec, same prompt, same flags.
+        auto restore = [&]() {
+            tok.resize(T0);
+            if (!r.forward_chunk(tok.data(), last_p0, last_T, err)) { fprintf(stderr, "ab restore: %s\n", err.c_str()); exit(1); }
+            r.head(last_T, last_T - 1);
+            df.snap_h(0);
+            HCK(hipStreamSynchronize(r.st));
+            HCK(hipMemcpy(hl.data(), r.logits, (size_t)V * 4, hipMemcpyDeviceToHost));
+        };
+        for (int round = 1; round <= ab_rounds; ++round) {
+            // plain
+            restore();
+            std::vector<int> pids;
+            double tp0 = now_s();
+            {
+                int next = (int)(std::max_element(hl.begin(), hl.begin() + V) - hl.begin());
+                for (int s = 0; s < gen; ++s) {
+                    tok.push_back(next);
+                    pids.push_back(next);
+                    if (next == r.c.eos || s + 1 == gen) break;
+                    if (!r.forward_chunk(tok.data(), (int)tok.size() - 1, 1, err)) { fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+                    r.head(1, 0);
+                    hipLaunchKernelGGL(k_argmax, dim3(1), dim3(1024), 0, r.st, r.logits, V, r.d_argmax);
+                    int32_t nx = 0;
+                    HCK(hipMemcpy(&nx, r.d_argmax, 4, hipMemcpyDeviceToHost));
+                    next = nx;
+                }
+            }
+            const double tp = now_s() - tp0;
+            // spec
+            restore();
+            Spec sp(r, df, scfg);
+            std::vector<int> sids;
+            std::string finish, e2;
+            int made = 0;
+            const double ts0 = now_s();
+            sp.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { sids.push_back(t); return true; }, finish, e2, made);
+            const double tsd = now_s() - ts0;
+            if (finish == "error") { fprintf(stderr, "spec: %s\n", e2.c_str()); return 1; }
+            size_t same = 0;
+            while (same < pids.size() && same < sids.size() && pids[same] == sids[same]) ++same;
+            const long steps = sp.S.spec_iters + sp.S.plain_iters;
+            printf("[ab] ctx %d round %d: plain %zu tok %.2f s = %.2f tok/s | dfly2 %zu tok %.2f s = %.2f tok/s | speedup %.3f | tokens/iteration %.2f (accepted/verify-step %.2f, iterations %ld) | identical prefix %zu/%zu tokens\n",
+                   T0, round, pids.size(), tp, pids.size() / tp, sids.size(), tsd, sids.size() / tsd, (sids.size() / tsd) / (pids.size() / tp), steps ? (double)sp.S.tokens / steps : 0.0,
+                   sp.S.spec_iters ? (double)sp.S.accepted / sp.S.spec_iters : 0.0, steps, same, pids.size());
+            fflush(stdout);
+            sp.report(stderr, tsd * 1000.0);
+        }
+    } else if (spec_mode) {
         Spec sp(r, df, scfg);
         sp.want_margin = want_margins;
         std::string gen_ids, finish, e2;
