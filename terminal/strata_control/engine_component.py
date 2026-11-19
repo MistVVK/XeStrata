@@ -550,8 +550,11 @@ def detect_backend(environ=None) -> tuple[str | None, str]:
     probes = (("cuda", ("nvidia-smi", "--query-gpu=name", "--format=csv,noheader")),
               ("hip", ("rocminfo",) if os.name != "nt" else ("hipInfo",)),
               ("sycl", ("sycl-ls",)))
-    vendors_here = {a.get("vendor") for a in adapters}
     vendor_of = {"cuda": "10de", "hip": "1002", "sycl": "8086"}
+    # only a card of a make Strata has an engine for can say "this PC has no card of that make". A virtual adapter (Microsoft's
+    # Virtual Render Driver, vendor 1414, in a Hyper-V GPU-PV guest, #4718) names no make, so it must not hide the NVIDIA card
+    # that nvidia-smi still reports inside the guest.
+    vendors_here = {a.get("vendor") for a in adapters} & set(vendor_of.values())
     for backend, command in probes:
         if vendors_here and vendor_of[backend] not in vendors_here:
             continue                                  # the adapters list no card of this make: a tool that answers is a leftover

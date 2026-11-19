@@ -51,6 +51,19 @@ class Detection(unittest.TestCase):
     def test_a_leftover_nvidia_smi_beside_only_an_integrated_radeon_is_not_believed_either(self):
         self.assertEqual(self.detect(AMD_IGPU_ONLY), (None, "no GPU tool answered"))
 
+    def test_a_hyper_v_gpu_pv_guest_with_only_a_virtual_adapter_asks_nvidia_smi(self):
+        # #4718: the guest lists "Microsoft Virtual Render Driver" (vendor 1414) and nothing else; nvidia-smi inside it names the card
+        virtual = [{"vendor": "1414", "device": 0x8E, "name": "Microsoft Virtual Render Driver", "vram_gb": 0.0}]
+        self.assertEqual(self.detect(virtual), ("cuda", "nvidia-smi"))
+
+    def test_a_virtual_adapter_with_no_tool_answering_still_says_no_gpu(self):
+        virtual = [{"vendor": "1414", "device": 0x8E, "name": "Microsoft Virtual Render Driver", "vram_gb": 0.0}]
+        self.assertEqual(self.detect(virtual, tools=()), (None, "no GPU tool answered"))
+
+    def test_a_virtual_adapter_beside_an_integrated_radeon_does_not_make_nvidia_smi_believed(self):
+        both = [{"vendor": "1414", "device": 0x8E, "name": "Microsoft Virtual Render Driver", "vram_gb": 0.0}] + AMD_IGPU_ONLY
+        self.assertEqual(self.detect(both), (None, "no GPU tool answered"))
+
     def test_an_nvidia_pc_is_still_cuda(self):
         self.assertEqual(self.detect(NVIDIA_ONLY), ("cuda", "display adapters"))
 
