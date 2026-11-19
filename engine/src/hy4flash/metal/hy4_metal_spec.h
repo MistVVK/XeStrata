@@ -288,7 +288,7 @@ public:
 
     // Generates greedily. Precondition: tok = prompt (all processed), r.logits row 0 = logits of the last prompt position, hfin row 0 = its h_final, draft capture on.
     // emit(token) returns false to stop. Returns the number of processed positions.
-    int run(std::vector<int32_t>& tok, int limit, int max_ctx, int eos, const std::function<bool(int)>& emit, std::string& finish, std::string& err, int& made_out) {
+    int run(std::vector<int32_t>& tok, int limit, int max_ctx, int eos, int eot, const std::function<bool(int)>& emit, std::string& finish, std::string& err, int& made_out) {
         int made = 0;
         finish = "length";
         err.clear();
@@ -299,7 +299,7 @@ public:
             ++made;
             ++S.tokens;
             if (!emit(t)) { finish = "cancel"; return false; }
-            if (t == eos) { finish = "stop"; return false; }
+            if (t == eos || t == eot) { finish = "stop"; return false; }
             if (made >= limit) { finish = "length"; return false; }
             return true;
         };
