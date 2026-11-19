@@ -69,8 +69,8 @@ rule.
   together, so the SSD reads an expert with one request. On the 32 GB M4 that is about 17% faster decoding and 30% faster prompts
   with the same tokens. Setup writes it only when the disk has room for it plus 10 GB, otherwise it warns, and it does not write
   it on a Mac with 96 GB or more.
-- Setup configures such a Mac without the draft layer (one token per step is faster there). A streaming Mac with 96 GB or more
-  keeps the draft layer and writes `--spec 3`.
+- Setup skips the MTP draft layer on such a Mac. DFlash2 is still available for compatible packs. If neither drafter is
+  available, the model generates one token per step. A streaming Mac with 96 GB or more keeps the MTP layer and writes `--spec 3`.
 - Prompts stream in chunks of 4096 on a streaming Mac with 96 GB or more, and 1024 on a smaller one. `STRATA_METAL_PROMPT_CHUNK=N`
   sets it.
 - The model's file must be on the internal SSD. An external disk is untested and likely much slower.
@@ -93,12 +93,14 @@ What the first run does (each step is skipped when it is already done):
 3. **Python packages** into `.venv`. CMake and Ninja come from pip too, installed just before the build.
 4. **Builds the engine** (`build-metal/strata`) with Apple's metal-cpp headers (pinned by SHA-256).
 5. **Downloads the model.** The download resumes if interrupted. `--gguf-dir` uses files you already have.
-6. **Prepares the model:** the pack (seconds) and the MTP draft layer (about 5 GB of the original checkpoint). On a Mac that
-   streams, the experts' copy takes the draft layer's place (about 3 minutes on the M4).
-   For UD-Q4_K_XL and UD-IQ4_XS-v31 it also downloads the DFlash2 drafter (0.34 GB, from Strata's signed update feed): the server then drafts
-   with DFlash2 instead of the MTP layer (`--spec 6`, `--draft-conf 0.7`; Apache-2.0, a copy of incoai/Qwen3.8-Flash-Next-DFlash2 that Strata
-   tuned, notice in `data/dflash2-tuned/`). With no internet the download is skipped without a word and the MTP runs as before;
-   `./setup.sh --setup` fetches it later. IQ3_S and the other sets keep the MTP.
+6. **Prepares the model.** Setup makes the pack (seconds) and prepares the MTP draft layer where it fits (about 5 GB of the
+   original checkpoint). A streaming Mac below 96 GB skips MTP and makes the experts' copy (about 3 minutes on the M4).
+   Auto also fetches DFlash2 for compatible Qwen3.8-Flash-Next packs. Q2_0 and IQ3_XXS get the stock drafter (1.2 GB).
+   UD-Q4_K_XL and UD-IQ4_XS-v31 prefer the tuned drafter (0.34 GB from Strata's signed update feed) and can use the stock drafter
+   if the tuned one is unavailable. The tuned drafter uses `--spec 6` and `--draft-conf 0.7`. It is based on
+   incoai/Qwen3.8-Flash-Next-DFlash2 and licensed under Apache-2.0. IQ3_S selects MTP.
+   If DFlash2 is missing, the server uses MTP when it is available. `./setup.sh --setup` can fetch the drafter later.
+   [DFlash2 license notice](../terminal/data/dflash2-tuned/NOTICE.md)
 7. **Writes `strata-<model>.json` and `run-<model>.sh`, then starts the server.**
 
 After that, `./setup.sh` or `./run-q2_0.sh` starts the model directly. The server is the same as on a PC: the OpenAI-compatible
