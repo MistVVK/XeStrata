@@ -308,6 +308,8 @@ When experts are read from GGUF files in place, Linux runs three things by defau
 | io prefetch | `STRATA_IO_PREFETCH=1` (`0` = off) | I/O threads read the layer's uncached experts and the router-predicted ones of the next layers with whole-blob `pread`s into the page cache. Tunables: `STRATA_LOOKAHEAD_K`, `STRATA_IO_PREFETCH_DEPTH` (2), `STRATA_IO_PF_THREADS` (8), `STRATA_IO_PF_STAGE=1`, `STRATA_IO_PF_AHEAD=0`. |
 | Decode gate | `STRATA_IO_PF_GATE=1` (`0` = off) | Every 16 decode windows the read-ahead is judged. It runs only while the page cache has room for the experts (off below 0.55, on above 0.65: `STRATA_IO_PF_GATE_LO` and `_HI`) and while it pays (`STRATA_IO_PF_GATE_USEFUL`). |
 
+A closure for low prefetch benefit retries after 256 decode windows while capacity stays at or above the low watermark. A capacity drop below that watermark cancels the retry; reopening then requires the high watermark to be exceeded.
+
 For an `experts.bin` pack, io prefetch and the gate switch on when the page cache has room for at least 55% of the experts
 (the tightest cgroup limit or `MemAvailable`, asked once at start). Below that the pack reads as before and the log says so;
 `STRATA_IO_PREFETCH=1` forces it. The container RAM check counts a cgroup's clean page cache as available. The startup log

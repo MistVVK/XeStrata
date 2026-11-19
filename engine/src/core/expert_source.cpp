@@ -2303,7 +2303,9 @@ void FileExpertSource::gate_capacity() {
     gate_prev_used_ = used;
     if (dpf >= (64ull << 20)) gate_useful_ = (double) dused / (double) dpf;
     const bool open = gate_open_.load(std::memory_order_relaxed);
-    const bool room_ok = open ? gate_ratio_ >= gate_lo_ : gate_ratio_ > gate_hi_;
+    // A benefit-only closure must still get its periodic probe in the hysteresis band.
+    // Only a real capacity closure needs the high watermark before reopening.
+    const bool room_ok = (open || gate_useless_) ? gate_ratio_ >= gate_lo_ : gate_ratio_ > gate_hi_;
     bool want = room_ok;
     // too little to read ahead (< 128 MB in 16 windows: the RAM and VRAM tiers hold what is predicted) costs the look-ahead's
     // second layer and the I/O threads for nothing (an 18 GiB RAM tier: 2.5 GB read ahead in a run, -9..-16% decode)
