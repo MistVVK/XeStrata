@@ -7319,3 +7319,54 @@ class ToolCallParameterCoercionAndDedup(unittest.TestCase):
             "</function>\n</tool_call>"
         )
         self.check(body, {})
+class ThinkingBlockValue(unittest.TestCase):
+    """An Anthropic thinking block whose "thinking" value is not a string ({"type": "thinking", "thinking": 5}) was
+    appended to the reasoning list and crashed "".join(reasoning) (frontend.py:710) with TypeError 'sequence item 0:
+    expected str instance, int found', caught only by the generic malformed-request handler: a 400 naming the exception,
+    with a traceback. As with a text part's "text" (#6098), a non-string thinking value is a 400 naming the field,
+    before anything is sent. A valid or absent thinking value is unchanged."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = MockEngine(tok, "ok", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, body):
+        req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_non_string_thinking_is_a_400_naming_the_field(self):
+        for th in (5, 5.5, True, None, ["x"]):
+            with self.subTest(thinking=th):
+                status, b = self.post({"model": "x", "max_tokens": 8, "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hi"}, {"type": "thinking", "thinking": th}]}]})
+                self.assertEqual(status, 400, b)
+                self.assertIn("thinking", b["error"]["message"])
+                self.assertNotIn("TypeError", b["error"]["message"])
+        status, b = self.post({"model": "x", "max_tokens": 8,
+                               "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200, b)                            # the server goes on
+
+    def test_valid_and_absent_thinking_unchanged(self):
+        for content in ([{"type": "text", "text": "hi"}, {"type": "thinking", "thinking": "reason"}],
+                        [{"type": "text", "text": "hi"}, {"type": "thinking"}],
+                        [{"type": "text", "text": "hi"}]):
+            with self.subTest(content=content):
+                status, b = self.post({"model": "x", "max_tokens": 8,
+                                       "messages": [{"role": "user", "content": content}]})
+                self.assertEqual(status, 200, b)
+
