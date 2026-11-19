@@ -685,7 +685,7 @@ def _drm_vendor_backend(root: str = "/sys/class/drm") -> str | None:
 #: Strix Halo, 0x1586, is in WIN_AMD_UMA_IDS), so an integrated Radeon beside a card never counts as "the GPU".
 WIN_AMD_DEVICE_ARCH = {0x744C: "gfx1100", 0x7448: "gfx1100", 0x745E: "gfx1100", 0x747E: "gfx1101", 0x7480: "gfx1102",
                        0x7590: "gfx1200", 0x7550: "gfx1201", 0x7551: "gfx1201",
-                       0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030", 0x73DF: "gfx1031",
+                       0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030", 0x73A1: "gfx1030", 0x73DF: "gfx1031",
                        0x73FF: "gfx1032", 0x73EF: "gfx1032", 0x73E3: "gfx1032"}
 WIN_AMD_UMA_IDS = {0x1586: "gfx1151"}                                   # Strix Halo: unified memory, supported
 WIN_AMD_IGPU_IDS = {0x150E, 0x1114, 0x1902, 0x15BF, 0x15C8, 0x164F, 0x1900, 0x1901, 0x1681, 0x1638, 0x1636, 0x15D8, 0x15E7}

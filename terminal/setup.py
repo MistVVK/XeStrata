@@ -4742,6 +4742,7 @@ _WIN_AMD_DID = {0x744C: "gfx1100", 0x7448: "gfx1100", 0x745E: "gfx1100",        
                 0x7590: "gfx1200",                                                  # RX 9060 XT
                 0x7550: "gfx1201", 0x7551: "gfx1201",                               # RX 9070 / 9070 XT, AI PRO R9700
                 0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030",            # RX 6800 / 6800 XT / 6900 XT / 6950 XT
+                0x73A1: "gfx1030",                                                  # Radeon Pro V620
                 0x73DF: "gfx1031",                                                  # RX 6700 XT / 6750 XT / 6800M (#881)
                 0x73FF: "gfx1032", 0x73EF: "gfx1032", 0x73E3: "gfx1032",            # RX 6600 / 6600 XT / 6650 XT, PRO W6600 (Navi 23)
                 **AMD_IGPU_PCI}                                                     # Ryzen APUs: 0x1586 = Strix Halo (gfx1151)
