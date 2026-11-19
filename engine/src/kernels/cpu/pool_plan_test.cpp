@@ -129,6 +129,37 @@ int main() {
     expect(cpu::plan_pool_workers(q).workers == 3, "quota 4 CPUs -> 3 workers");
     expect(cpu::plan_pool_workers(cpu_of(128, {64}, 200.0)).workers == cpu::kPoolWorkersCap, "a big quota changes nothing");
 
+    // ---- PR#14 regression: the quota against the affinity and the other bounds (the container reports) ----
+    {
+        // a quota below the cores wins; it truncates toward zero (never rounds), and a generous one changes nothing
+        const cpu::PoolPlan q136 = cpu::plan_pool_workers(cpu_of(128, {64}, 13.6));
+        expect(q136.workers == 12, "64c/128t under a 13.6-CPU quota -> 12 (never the 32 of the cap or the 64 of the cores)");
+        expect(std::string(q136.limit) == "the container's CPU quota", "13.6 names the quota as the bound");
+        expect(cpu::plan_pool_workers(cpu_of(16, {8}, 4.5)).workers == 3, "quota 4.5 truncates to 3 workers (no rounding up)");
+        expect(cpu::plan_pool_workers(cpu_of(16, {8}, 3.999)).workers == 2, "quota 3.999 truncates to 2 workers");
+        expect(cpu::plan_pool_workers(cpu_of(16, {8}, 7.999)).workers == 6, "quota 7.999 clamps 8c/16t to 6 workers");
+        // the q == n boundary: the comparison is STRICT, so a quota equal to the cores does not drop another worker
+        expect(cpu::plan_pool_workers(cpu_of(16, {8}, 8.0)).workers == 7, "quota 8.0 on 8 cores -> 7, NOT clamped (q == 8 - 1 == n, strict <)");
+        // sub-core quotas floor at 1 worker, never 0
+        expect(cpu::plan_pool_workers(cpu_of(16, {8}, 0.5)).workers == 1, "quota 0.5 -> 1 worker (floor)");
+        expect(cpu::plan_pool_workers(cpu_of(16, {8}, 1.0)).workers == 1, "quota 1.0 -> 1 worker (floor)");
+        expect(cpu::plan_pool_workers(cpu_of(16, {8}, 1.9)).workers == 1, "quota 1.9 -> 1 worker (floor)");
+        expect(cpu::plan_pool_workers(cpu_of(16, {8}, 2.0)).workers == 1, "quota 2.0 -> 1 worker");
+        // affinity below the quota: the mask bounds, the quota is inert
+        expect(cpu::plan_pool_workers(cpu_of(8, {4}, 8.0)).workers == 3, "4 cores under an 8-CPU quota -> 3 (quota inert)");
+        expect(cpu::plan_pool_workers(cpu_of(8, {4}, 200.0)).workers == 3, "4 cores under a 200-CPU quota -> 3");
+        // no quota (0.0: what an unreadable cgroup gives, see cgroup_quota_plan_test) leaves the count EXACTLY at the
+        // pre-cgroup value - the anti silent-collapse pins
+        expect(cpu::plan_pool_workers(cpu_of(16, {8}, 0.0)).workers == 7, "no quota: 8c/16t stays 7");
+        expect(cpu::plan_pool_workers(cpu_of(32, {16}, 0.0)).workers == 15,
+               "no quota: 16c/32t stays 15 (the reserve applies to n after the host's core is dropped: 15 < kPoolReserveFrom)");
+        expect(cpu::plan_pool_workers(cpu_of(40, {20}, 0.0)).workers == 18, "no quota: 20c keeps one core free (19 -> 18)");
+        // an unknown core layout: the half-logical bound first, then the quota over it
+        expect(cpu::plan_pool_workers(cpu_of(16, {}, 4.0)).workers == 3, "16 logical, no layout, quota 4 -> 3");
+        expect(cpu::plan_pool_workers(cpu_of(256, {}, 0.0)).workers == cpu::kPoolWorkersCap, "256 logical, no layout, no quota: the cap");
+        expect(cpu::plan_pool_workers(cpu_of(8, {}, 0.0)).workers == 7, "8 logical, no layout, no quota -> 7");
+    }
+
     // warnings: only above the plan, and each says what to do
     const cpu::PoolPlan p2s = cpu::plan_pool_workers(c2s);
     expect(cpu::pool_workers_warning(0, c2s, p2s).empty(), "0 (the default) never warns");
