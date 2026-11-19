@@ -51,7 +51,7 @@ struct Dev {
 static double test_linear(const char* name, int fmt, const uint8_t* raw, size_t raw_bytes, int N, int K, const std::vector<int>& Ms) {
     std::vector<float> W;
     cpu_dequant(fmt, raw, N, K, W);
-    Dev dW(raw_bytes);
+    Dev dW(raw_bytes + 256);  // the WMMA loaders may read a few bytes past the last super-block
     CK(hipMemcpy(dW.p, raw, raw_bytes, hipMemcpyHostToDevice));
     double worst = 0;
     for (int M : Ms) {
@@ -88,7 +88,9 @@ static double test_linear(const char* name, int fmt, const uint8_t* raw, size_t 
         const double rel = maxv > 0 ? maxe / maxv : maxe;
         worst = std::max(worst, rel);
         const bool ok = rel < 2e-3;
-        printf("  %-52s fmt %3d N=%5d K=%5d M=%3d  max|y|=%.4g  rel_err=%.3g  %s\n", name, fmt, N, K, M, maxv, rel, ok ? "ok" : "FAIL");
+        uint64_t hh = 1469598103934665603ull;
+        for (size_t i = 0; i < Y.size() * 4; ++i) { hh ^= ((const uint8_t*)Y.data())[i]; hh *= 1099511628211ull; }
+        printf("  %-52s fmt %3d N=%5d K=%5d M=%3d  max|y|=%.4g  rel_err=%.3g  hash=%016llx %s\n", name, fmt, N, K, M, maxv, rel, (unsigned long long)hh, ok ? "ok" : "FAIL");
         if (ok) ++g_pass; else ++g_fail;
     }
     return worst;
@@ -96,7 +98,12 @@ static double test_linear(const char* name, int fmt, const uint8_t* raw, size_t 
 
 static void test_random_codes() {
     printf("== random super-blocks vs CPU dequant_sk_row\n");
+#ifdef SK_OLD
     for (int fmt : {FMT_S2, FMT_S3, FMT_S4, FMT_S5, FMT_S6, FMT_S8}) {
+#else
+    for (int fmt : {FMT_S1_25, FMT_S1_5, FMT_S2, FMT_S3, FMT_S4, FMT_S5, FMT_S6, FMT_S8}) {
+#endif
+        g_rng = 0x9E3779B97F4A7C15ull ^ (0x1000193ull * (uint64_t)(fmt + 1));  // per-code data: identical in old/new builds
         const int N = 96, K = 1536;
         const size_t sb = sk_sb_bytes(fmt);
         std::vector<uint8_t> raw((size_t)N * (K / 256) * sb);
@@ -109,8 +116,29 @@ static void test_random_codes() {
             if (fmt == FMT_S8) for (int i = 0; i < 256; ++i) if ((int8_t)blk[6 + i] == -128) blk[6 + i] = 0;
         }
         char nm[64];
-        snprintf(nm, sizeof nm, "random S%d", fmt);
-        test_linear(nm, fmt, raw.data(), raw.size(), N, K, {1, 3, 8, 16, 100});
+        snprintf(nm, sizeof nm, "random %s", fmt == FMT_S1_25 ? "S1.25" : fmt == FMT_S1_5 ? "S1.5" : fmt == FMT_S8 ? "S8_K" : fmt == FMT_S6 ? "S6_K" : fmt == FMT_S5 ? "S5_K"
+                                                : fmt == FMT_S4 ? "S4_K" : fmt == FMT_S3 ? "S3_K" : "S2_K");
+        test_linear(nm, fmt, raw.data(), raw.size(), N, K, {1, 3, 5, 8, 12, 16, 100});
+        // embed_rows on the same rows
+        {
+            std::vector<int32_t> ids = {0, 7, 95, 50};
+            std::vector<float> cpu(ids.size() * (size_t)K);
+            const size_t rb = (size_t)(K / 256) * sb;
+            for (size_t i = 0; i < ids.size(); ++i)
+                strata::quant::sk::dequant_sk_row(raw.data() + (size_t)ids[i] * rb, (strata::quant::sk::SkCode)fmt, cpu.data() + i * K, K);
+            Dev dW(raw.size() + 256), dI(ids.size() * 4), dO(cpu.size() * 4);
+            CK(hipMemcpy(dW.p, raw.data(), raw.size(), hipMemcpyHostToDevice));
+            CK(hipMemcpy(dI.p, ids.data(), ids.size() * 4, hipMemcpyHostToDevice));
+            embed_rows(0, fmt, dW.p, N, K, (const int32_t*)dI.p, (float*)dO.p, (int)ids.size());
+            CK(hipDeviceSynchronize());
+            std::vector<float> got(cpu.size());
+            CK(hipMemcpy(got.data(), dO.p, got.size() * 4, hipMemcpyDeviceToHost));
+            double maxe = 0, maxv = 0;
+            for (size_t i = 0; i < got.size(); ++i) { maxe = std::max(maxe, (double)std::fabs(got[i] - cpu[i])); maxv = std::max(maxv, (double)std::fabs(cpu[i])); }
+            const bool ok = maxe <= 1e-6 * maxv;
+            printf("  %-52s embed_rows max abs err %.3g (max |w| %.3g)  %s\n", nm, maxe, maxv, ok ? "ok" : "FAIL");
+            if (ok) ++g_pass; else ++g_fail;
+        }
     }
     // Q8ROW random, K not a multiple of 256
     {
@@ -164,6 +192,7 @@ struct Trunk {
 };
 
 static void test_real(Trunk& T) {
+    g_rng = 0x5151515151ull;
     printf("== real SQ-64 trunk tensors\n");
     const char* names[] = {
         "model.layers.5.self_attn.q_b_proj.weight",   "model.layers.2.self_attn.kv_b_proj.weight", "model.layers.2.self_attn.o_proj.weight",
@@ -204,6 +233,7 @@ struct ExpertTest {
 };
 
 static void test_experts(Trunk& T) {
+    g_rng = 0x6262626262ull;
     printf("== real SQ-64 expert bodies (section 4)\n");
     const auto& dir = T.rd.expert_directory();
     printf("  directory entries %zu\n", dir.size());

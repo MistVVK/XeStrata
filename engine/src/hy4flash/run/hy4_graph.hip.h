@@ -427,7 +427,7 @@ public:
     float* hcacc = nullptr;
     void hc_mix_run(const float* xin, const float* hfn, const float* hsc, const float* hbs, int nout, int T) {
         if (!hcacc) hcacc = dalloc<float>((size_t)Tc * 9);
-        HCK(hipMemsetAsync(hcacc, 0, (size_t)T * 9 * 4, st));
+        hipLaunchKernelGGL(k_zero_f, dim3((T * 9 + 255) / 256), dim3(256), 0, st, hcacc, T * 9);
         hipLaunchKernelGGL(k_hc_mix_part, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcacc, nout);
         hipLaunchKernelGGL(k_hc_mix_fin, dim3(T), dim3(32), 0, st, hcacc, hsc, hbs, pre, post, nout, c.rms_eps, c.hc_eps, c.hc_mag);
     }
@@ -512,8 +512,7 @@ public:
             { PS _q(this, "mla_attend_vup_prefill"); mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_b + wv_off[il], F3, o_h, ctx_ws, a, mla_ws, mla_ws_bytes); }
         }
         lin(pa + ".o_proj.weight", o_h, F1, T);  // [T][3072]
-        { PS _q(this, "o_norm"); hipLaunchKernelGGL(k_add_rms, dim3(T), dim3(256), 0, st, F1, (const float*)nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), sub, HID, c.rms_eps); }
-        { PS _q(this, "hc_post"); hipLaunchKernelGGL(k_hc_post, dim3(T), dim3(256), 0, st, x, sub, post); }
+        { PS _q(this, "o_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F1, (const float*)nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), x, post, c.rms_eps); }
     }
 
     void mlp_layer(int il, int T) {
@@ -529,10 +528,10 @@ public:
             size_t n = (size_t)T * 13824;
             { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((n + 255) / 256), dim3(256), 0, st, F1, F2, H1, n); }
             lin(pm + ".down_proj.weight", H1, F3, T);  // [T][3072]
-            { PS _q(this, "o_norm"); hipLaunchKernelGGL(k_add_rms, dim3(T), dim3(256), 0, st, F3, (const float*)nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), sub, HID, c.rms_eps); }
+            { PS _q(this, "o_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F3, (const float*)nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), x, post, c.rms_eps); }
         } else {
             // router
-            { PS _q(this, "router_gemv"); if (T <= 16) hipLaunchKernelGGL(k_f32_gemv, dim3(512), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T); else linear_f32(st, (const float*)tw(pm + ".gate.weight"), 512, HID, cur_f, F1, T); }
+            { PS _q(this, "router_gemv"); if (T <= 16) hipLaunchKernelGGL(k_f32_gemv, dim3(512), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T); else hipLaunchKernelGGL(k_f32_gemm, dim3(8, (T + 63) / 64), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T); }
             { PS _q(this, "router_topk"); hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 512, 16, c.routed_scale); }
             lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
             size_t nz = (size_t)T * 1536;
@@ -544,9 +543,8 @@ public:
             lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
             { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz); }
             lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
-            { PS _q(this, "combine_norm"); hipLaunchKernelGGL(k_add_rms, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), sub, HID, c.rms_eps); }
+            { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
         }
-        { PS _q(this, "hc_post"); hipLaunchKernelGGL(k_hc_post, dim3(T), dim3(256), 0, st, x, sub, post); }
     }
 
     // process tokens [p0, p0+T) (T <= Tc) of the sequence tok_all (host, positions 0..p0+T-1). Returns false on error.

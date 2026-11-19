@@ -56,7 +56,7 @@ constexpr int GEMM_BM = 128, GEMM_BN = 64, GEMM_LDW = 264;
 // one stage ahead of their use, so the global-memory latency hides behind the WMMA loop of the previous super-block.
 template <int FMT>
 struct RawSub {
-    static constexpr int NLO = (FMT == FMT_S2 || FMT == FMT_S3) ? 4 : (FMT == FMT_S8 ? 16 : 8);
+    static constexpr int NLO = FMT == FMT_S1_25 ? 3 : (FMT == FMT_S2 || FMT == FMT_S3 || FMT == FMT_S1_5) ? 4 : (FMT == FMT_S8 ? 16 : 8);
     static constexpr int NHI = FMT == FMT_S3 ? 2 : FMT == FMT_S5 ? 2 : FMT == FMT_S6 ? 4 : 1;
     uint32_t lo[NLO];
     uint32_t hi[NHI];
@@ -80,7 +80,9 @@ template <int FMT>
 __device__ __forceinline__ void load_raw(const uint8_t* blk, int dg, RawSub<FMT>& r) {
     load_bytes<2>(blk, r.hdr);
     const uint8_t* pl = blk + 6;
-    if constexpr (FMT == FMT_S2) load_bytes<4>(pl + dg * 16, r.lo);
+    if constexpr (FMT == FMT_S1_25) { load_bytes<3>(pl + dg * 10, r.lo); r.hi[0] = pl[40 + (dg >> 1)]; }  // 16 indices (10 bytes) + fine byte
+    else if constexpr (FMT == FMT_S1_5) { load_bytes<4>(pl + (64 * dg) / 5, r.lo); r.hi[0] = 64u * dg; }  // trits 64dg..64dg+63 (<= 14 bytes)
+    else if constexpr (FMT == FMT_S2) load_bytes<4>(pl + dg * 16, r.lo);
     else if constexpr (FMT == FMT_S3) { load_bytes<4>(pl + dg * 16, r.lo); load_bytes<2>(pl + 64 + dg * 8, r.hi); }
     else if constexpr (FMT == FMT_S4) load_bytes<8>(pl + dg * 32, r.lo);
     else if constexpr (FMT == FMT_S5) { load_bytes<8>(pl + dg * 32, r.lo); load_bytes<2>(pl + 128 + dg * 8, r.hi); }
@@ -92,7 +94,15 @@ template <int FMT>
 __device__ __forceinline__ float raw_eff(const RawSub<FMT>& r, int dg) {
     const float D = h2f_bits((uint16_t)(r.hdr[0] & 0xFFFFu));
     const uint32_t u = dg < 2 ? (r.hdr[0] >> (16 + 8 * dg)) & 0xFFu : (r.hdr[1] >> (8 * (dg - 2))) & 0xFFu;
-    return D * ((float)u * (1.0f / 255.0f));
+    float eff = D * ((float)u * (1.0f / 255.0f));
+    if constexpr (FMT == FMT_S1_25) eff *= 0.5f + (float)((r.hi[0] >> ((dg & 1) * 4)) & 15u) / 15.0f;
+    return eff;
+}
+
+__device__ __forceinline__ uint32_t byte_at4(const uint32_t (&w)[4], int o) {
+    const int d = o >> 2;
+    const uint32_t v = d == 0 ? w[0] : d == 1 ? w[1] : d == 2 ? w[2] : w[3];
+    return (v >> ((o & 3) * 8)) & 0xFFu;
 }
 
 // q[0..7] of unit u8 (weights 8*u8 .. 8*u8+7 of the sub-group); S8 gives byte ^ 0x80
@@ -128,17 +138,45 @@ __device__ __forceinline__ void raw_q8(const RawSub<FMT>& r, uint32_t (&q)[8]) {
 
 template <int FMT, int U8>
 __device__ __forceinline__ void dequant_unit(const RawSub<FMT>& r, float eff, _Float16* dst) {
-    uint32_t q[8];
-    raw_q8<FMT, U8>(r, q);
-    const hv2 mag = FMT == FMT_S8 ? hv2{(_Float16)1152.0f, (_Float16)1152.0f} : hv2{(_Float16)1024.0f, (_Float16)1024.0f};
-    const hv2 hh = hv2{(_Float16)sk_half<FMT>(), (_Float16)sk_half<FMT>()};
     uint32_t o[4];
+    if constexpr (FMT == FMT_S1_25) {
+        // unit U8 = codebook groups 2*U8, 2*U8+1 of this sub-group: a 10-bit field at bit 10*U8 of the 10-byte window
+        constexpr int p = 10 * U8, wi = p >> 5, sh = p & 31;
+        uint32_t bits;
+        if constexpr (sh + 10 <= 32) bits = (r.lo[wi] >> sh) & 0x3FFu;
+        else bits = ((r.lo[wi] >> sh) | (r.lo[wi + 1] << (32 - sh))) & 0x3FFu;
+        const uint2* lut = s125_lut();
+        const uint2 a = lut[bits & 31u], b = lut[bits >> 5];
+        const uint32_t wp[4] = {a.x, a.y, b.x, b.y};
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t pat = 0x64006400u | q[2 * i] | (q[2 * i + 1] << 16);
-        hv2 w = __builtin_bit_cast(hv2, pat) - mag;
-        if constexpr (FMT != FMT_S8) w = w - hh;
-        o[i] = pack_h2((float)w[0] * eff, (float)w[1] * eff);
+        for (int i = 0; i < 4; ++i) {
+            const hv2 w = __builtin_bit_cast(hv2, wp[i]);
+            o[i] = pack_h2((float)w[0] * eff, (float)w[1] * eff);
+        }
+    } else if constexpr (FMT == FMT_S1_5) {
+        const uint32_t t0 = r.hi[0], byte0 = t0 / 5u;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float v[2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t ti = t0 + 8 * U8 + 2 * i + h;
+                v[h] = (float)s15_trit(byte_at4(r.lo, (int)(ti / 5u - byte0)), (int)(ti % 5u));
+            }
+            o[i] = pack_h2(v[0] * eff, v[1] * eff);
+        }
+    } else {
+        uint32_t q[8];
+        raw_q8<FMT, U8>(r, q);
+        const hv2 mag = FMT == FMT_S8 ? hv2{(_Float16)1152.0f, (_Float16)1152.0f} : hv2{(_Float16)1024.0f, (_Float16)1024.0f};
+        const hv2 hh = hv2{(_Float16)sk_half<FMT>(), (_Float16)sk_half<FMT>()};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t pat = 0x64006400u | q[2 * i] | (q[2 * i + 1] << 16);
+            hv2 w = __builtin_bit_cast(hv2, pat) - mag;
+            if constexpr (FMT != FMT_S8) w = w - hh;
+            o[i] = pack_h2((float)w[0] * eff, (float)w[1] * eff);
+        }
     }
     *(uint4*)dst = make_uint4(o[0], o[1], o[2], o[3]);
 }
@@ -213,6 +251,10 @@ __device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, cons
     constexpr int SB = sk_sb_bytes(FMT);
     const int tid = threadIdx.x, lane = tid & 31;
     const int drow = tid >> 2, dg = tid & 3;
+    if constexpr (FMT == FMT_S1_25) {
+        s125_lut_init();
+        __syncthreads();
+    }
     RawSub<FMT> cur, nxt;
     load_raw<FMT>(wr, dg, cur);
     constexpr int PD = 4;
@@ -327,6 +369,8 @@ inline void linear_h_gemm_s(hipStream_t s, int fmt, const void* W, int N, int K,
     dim3 grid((N + skd::GEMM_BN - 1) / skd::GEMM_BN, (M + 15) / 16), block(256);
 #define HY4_GEMMS_CASE(F) case F: hipLaunchKernelGGL((skd::k_gemm_s<F>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M); break
     switch (fmt) {
+        HY4_GEMMS_CASE(FMT_S1_25);
+        HY4_GEMMS_CASE(FMT_S1_5);
         HY4_GEMMS_CASE(FMT_S2);
         HY4_GEMMS_CASE(FMT_S3);
         HY4_GEMMS_CASE(FMT_S4);
@@ -343,6 +387,8 @@ inline void linear_h_gemm(hipStream_t s, int fmt, const void* W, int N, int K, c
     dim3 grid((N + skd::GEMM_BN - 1) / skd::GEMM_BN, (M + skd::GEMM_BM - 1) / skd::GEMM_BM), block(256);
 #define HY4_GEMM_CASE(F) case F: hipLaunchKernelGGL((skd::k_gemm<F>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M); break
     switch (fmt) {
+        HY4_GEMM_CASE(FMT_S1_25);
+        HY4_GEMM_CASE(FMT_S1_5);
         HY4_GEMM_CASE(FMT_S2);
         HY4_GEMM_CASE(FMT_S3);
         HY4_GEMM_CASE(FMT_S4);

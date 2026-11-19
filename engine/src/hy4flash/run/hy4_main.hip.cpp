@@ -70,7 +70,7 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".";
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false;
-    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048;
+    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048;
     bool serve = false, session_reuse = false;
     int gpu = -1;
     std::string draft = "off";
@@ -255,7 +255,7 @@ int main(int argc, char** argv) {
         }
         std::string gen_ids;
         double t1 = now_s();
-        std::vector<double> times;
+        std::vector<double> times, enq;
         for (int s = 0; s < gen; ++s) {
             tok.push_back(next);
             gen_ids += std::to_string(next) + " ";
@@ -267,6 +267,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             r.head(1, 0);
+            enq.push_back(now_s() - ts);
             HCK(hipStreamSynchronize(r.st)); r.pflush();
             float* d = r.logits;
             hipLaunchKernelGGL(k_argmax, dim3(1), dim3(1024), 0, r.st, d, V, r.d_argmax);
@@ -279,6 +280,7 @@ int main(int argc, char** argv) {
         printf("generated ids: %s\n", gen_ids.c_str());
         r.prof_report("decode");
         r.pacc_report("decode", (int)times.size());
+        if (!enq.empty()) { std::sort(enq.begin(), enq.end()); fprintf(stderr, "[decode] median host enqueue time per step %.1f ms (step %.1f ms)\n", enq[enq.size() / 2] * 1000, times.empty() ? 0.0 : times[times.size() / 2] * 1000); }
         std::sort(times.begin(), times.end());
         fprintf(stderr, "[decode] %zu tokens in %.2f s = %.2f tok/s (median step %.1f ms)\n", times.size(), td, times.size() / td, times.empty() ? 0.0 : times[times.size() / 2] * 1000);
         std::ofstream f(out_dir + "/gen_ids.txt");

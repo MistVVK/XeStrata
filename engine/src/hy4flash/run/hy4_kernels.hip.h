@@ -97,6 +97,11 @@ __global__ void k_hc_mix(const float* __restrict__ x, const float* __restrict__ 
     }
 }
 
+__global__ void k_zero_f(float* __restrict__ p, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = 0.0f;
+}
+
 // ---- multi-block variant of the iHC mix (decode: one block per token is too little parallelism).
 // grid (T, 24), block 128: each block takes 512 of the 12288 elements; partial sums are atomically added into acc[t][0..8] (acc[t][8] = sum of squares); acc must be zeroed.
 __global__ void k_hc_mix_part(const float* __restrict__ x, const float* __restrict__ fn, float* __restrict__ acc, int nout) {
@@ -173,6 +178,50 @@ __global__ void __launch_bounds__(256) k_f32_gemv(const float* __restrict__ W, c
     }
 }
 
+// ---- tiled fp32 GEMM for the router at prefill: Y[M][N] = X[M][K] . W[N][K]^T (fp32 everywhere).  block 16x16 threads, tile 64 tokens x 64 outputs, BK 16
+__global__ void __launch_bounds__(256) k_f32_gemm(const float* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y, int N, int K, int M) {
+    __shared__ float sX[16][65];
+    __shared__ float sW[16][65];
+    const int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
+    const int m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
+    for (int k0 = 0; k0 < K; k0 += 16) {
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            int idx = threadIdx.x + l * 256;  // 0..1023: tile 64 rows x 16 k
+            int r = idx >> 4, kk = idx & 15;
+            int mrow = m0 + r, nrow = n0 + r;
+            sX[kk][r] = (mrow < M) ? X[(size_t)mrow * K + k0 + kk] : 0.f;
+            sW[kk][r] = (nrow < N) ? W[(size_t)nrow * K + k0 + kk] : 0.f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 16; ++kk) {
+            float a[4], b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = sX[kk][ty * 4 + i];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) b[j] = sW[kk][tx * 4 + j];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int m = m0 + ty * 4 + i, n = n0 + tx * 4 + j;
+            if (m < M && n < N) Y[(size_t)m * N + n] = acc[i][j];
+        }
+}
+
 // ---- cur = sum_h x[h]*pre[h]; then rmsnorm(cur, w) -> fp16 (GEMM input) and optionally fp32
 __global__ void k_hc_reduce_norm(const float* __restrict__ x, const float* __restrict__ pre, const float* __restrict__ w, __half* __restrict__ outh, float* __restrict__ outf,
                                  float eps) {
@@ -227,6 +276,36 @@ __global__ void k_add_rms(const float* __restrict__ a, const float* __restrict__
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float v = a[o + i] + (b ? b[o + i] : 0.0f);
         out[o + i] = v * inv * w[i];
+    }
+}
+
+// ---- fused: v = rmsnorm(a (+ b), w); x[h] += v * post[h]  (sublayer output norm + iHC post in one kernel). blockDim 256, D = 3072.
+__global__ void k_add_rms_post(const float* __restrict__ a, const float* __restrict__ b, const float* __restrict__ w, float* __restrict__ x, const float* __restrict__ post, float eps) {
+    __shared__ float sh[32];
+    size_t o = (size_t)blockIdx.x * HID;
+    constexpr int PER = HID / 256;
+    float v[PER];
+    float ss = 0;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        int d = threadIdx.x + i * 256;
+        float t = a[o + d] + (b ? b[o + d] : 0.0f);
+        v[i] = t;
+        ss += t * t;
+    }
+    ss = block_sum(ss, sh);
+    float inv = rsqrtf(ss / HID + eps);
+    const float* p = post + (size_t)blockIdx.x * NHC;
+    float p0 = p[0], p1 = p[1], p2 = p[2], p3 = p[3];
+    float* xt = x + (size_t)blockIdx.x * NHC * HID;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        int d = threadIdx.x + i * 256;
+        float s = v[i] * inv * w[d];
+        xt[d] += s * p0;
+        xt[HID + d] += s * p1;
+        xt[2 * HID + d] += s * p2;
+        xt[3 * HID + d] += s * p3;
     }
 }
 
