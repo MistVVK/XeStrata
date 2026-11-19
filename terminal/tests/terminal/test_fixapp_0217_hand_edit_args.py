@@ -36,7 +36,8 @@ class HandEditsInArgs(unittest.TestCase):
         pack.write_bytes(b"x" * (2 << 20))
         self.args = ["--pack", "/d/packs/gyro", "--native", "/d/m.gguf", "--mtp", str(self.mtp), "--spec", "4", "--spec-min-p", "0.5"]
         for patcher in (mock.patch("serve.server.drafting_vram_mib", return_value=None), mock.patch.object(drafting, "data_dir_of", return_value=self.data),
-                        mock.patch.object(drafting, "ENGINE_SERVES_DFLASH2", True)):
+                        mock.patch.object(drafting, "ENGINE_SERVES_DFLASH2", True),
+                        mock.patch.object(drafting, "hardware_for", return_value=("cuda", ["sm_120"]))):      # the card of the box that runs this must not matter
             patcher.start()
             self.addCleanup(patcher.stop)
 
