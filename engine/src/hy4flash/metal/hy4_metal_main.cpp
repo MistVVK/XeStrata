@@ -289,11 +289,11 @@ public:
         {
             const std::string dir = kernel_path.substr(0, kernel_path.rfind('/') + 1);
             std::string why;
-            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
+            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal", dir + "hy4_dfly2.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
             mpp_ok = lib >= 0;
             if (!mpp_ok) {
                 if (mpp_try) fprintf(stderr, "[metal] MPP (Metal 4 matmul2d) kernels not available, simdgroup GEMM only: %s\n", why.substr(0, 200).c_str());
-                lib = cx.compile({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal"}, "#define NO_GGML_COMMON 1\n", false);
+                lib = cx.compile({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_dfly2.metal"}, "#define NO_GGML_COMMON 1\n", false);
             }
             wscr_elems = (size_t) 16384 * 3072;
             if (mpp_ok) wscr = cx.alloc(wscr_elems * 2);
@@ -322,7 +322,7 @@ public:
         F2 = A(big * 4);
         F3 = A(big * 4);
         F4 = A((size_t) T * 3072 * 4);
-        attn_ws = A((size_t) 4 * 64 * 16 * 514 * 4);
+        attn_ws = A((size_t) 8 * 64 * 16 * 514 * 4);
         hc_part = A((size_t) 8 * 24 * 9 * 4);
         H1 = A(big * 2);
         qr_h = A((size_t) T * 1024 * 2);
@@ -341,7 +341,7 @@ public:
         moe_pairs = A((size_t) T * 16 * 4);
         hfin = A((size_t) T * HID_ * 2);
         logits = A((size_t) logit_rows * c.vocab * 4);
-        d_argmax = A(16);
+        d_argmax = A(64);
         d_experts = A(41 * 512 * sizeof(ExpertDev));
         std::memcpy(d_experts.ptr, g.experts.data(), 41 * 512 * sizeof(ExpertDev));
         // kv caches
@@ -499,6 +499,30 @@ public:
         add("engram_apply", T, 4, 256, {B(x), B(kv_f), B(e.kvb), B(e.egate), B(e.pre_gamma), B(e.hcs), B(cur_ep->valid[mo]), I(T)});
     }
 
+    // DFly2 hook: the top-index_topk key lists of target layers 25,29,33,37,41 for the last (up to 16) rows of the most recent forward chunk (hy4_metal_spec.h reads them)
+    bool dfly_cap = false;
+    Buffer dkeys[5], dnkc[5];  // [16][index_topk], [16]
+    int cap_p0 = -1, cap_rows = 0;
+    bool cap_list[5] = {};
+    static int dfly_slot(int il) { return il == 25 ? 0 : il == 29 ? 1 : il == 33 ? 2 : il == 37 ? 3 : il == 41 ? 4 : -1; }
+    void dfly_capture_alloc() {
+        for (int d = 0; d < 5; ++d)
+            if (!dkeys[d].ptr) {
+                dkeys[d] = cx.alloc((size_t) 16 * (index_topk + 8) * 4);
+                dnkc[d] = cx.alloc(16 * 4);
+            }
+        dfly_cap = true;
+    }
+    void dfly_capture(int il, int p0, int T, bool use_list) {
+        const int d = dfly_slot(il);
+        if (d < 0) return;
+        const int nr = std::min(T, 16), r0 = T - nr;
+        cap_p0 = p0 + r0;
+        cap_rows = nr;
+        cap_list[d] = use_list;
+        if (use_list) add("copy_keys", nr, 1, 256, {B(keys), B(nkeys), B(dkeys[d]), B(dnkc[d]), I(r0), I(index_topk)});
+    }
+
     void idx_update(int il, int p0, int T) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".token_key_projection.weight", cur_h, ik_f, T);
@@ -569,6 +593,7 @@ public:
             }
             op("indexer");
         }
+        if (dfly_cap && !swa) dfly_capture(il, p0, T, use_list);
         MlaArgs a{};
         a.M = T;
         a.NH = NH;
@@ -580,7 +605,7 @@ public:
         a.scale = 0.0625f;
         if (mpp_ok && flash_on && T >= 16 && NH % 32 == 0)
             add("mla_flash", NH / 32, T, 256, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
-        else if (T <= 4 && split_max > 0) {
+        else if (T <= 8 && split_max > 0) {
             const int S = std::min(split_max, NH == 32 ? 8 : 4);
             Dispatch dd;
             dd.p = &P("mla_attend_part");
@@ -764,6 +789,9 @@ public:
     }
 };
 
+#include "hy4_metal_spec.h"
+#include "hy4_metal_serve.h"
+
 static void top5_line(const float* lg, int V, int pos, std::string& out) {
     std::vector<int> idx(V);
     std::iota(idx.begin(), idx.end(), 0);
@@ -779,10 +807,61 @@ static size_t rss_bytes() {
     return (size_t) ru.ru_maxrss;  // bytes on macOS
 }
 
+// `strata-hy4-metal --info FILE.strata`: one line of key=value facts, no GPU needed (the sidecar manifest is read)
+static int print_info(const std::string& file) {
+    strata::artifact::StrataFileReader rd;
+    std::string err;
+    if (!rd.open(file, err)) {
+        fprintf(stderr, "open: %s\n", err.c_str());
+        return 1;
+    }
+    Manifest m;
+    parse_manifest(rd.manifest_json(), m);
+    const bool has_dfly = m.T.count("model.dfly_layers.0.self_attn.q_a_proj.weight") && m.T.count("model.dfly_layers.hidden_correction.gate_proj.weight");
+    // drafter=dfly2 only when the manifest carries the DFly2 tensors; images=1 when this build links the Metal ViT (HY4_METAL_IMAGES)
+    printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d drafter=%s images=%d backend=metal\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos, has_dfly ? "dfly2" : "none",
+           HY4_METAL_IMAGES);
+    return 0;
+}
+
+// `strata-hy4-metal --export-tokenizer FILE.strata DIR`: tokenizer.hf.json + chat_template.jinja from the manifest (Section 0 sidecar), no GPU
+static int export_tokenizer(const std::string& file, const std::string& dir) {
+    strata::artifact::StrataFileReader rd;
+    std::string err;
+    if (!rd.open(file, err)) {
+        fprintf(stderr, "open: %s\n", err.c_str());
+        return 1;
+    }
+    Manifest m;
+    parse_manifest(rd.manifest_json(), m, true);
+    auto put = [&](const std::string& name, const std::string& text) {
+        std::string path = dir + "/" + name;
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f || fwrite(text.data(), 1, text.size(), f) != text.size()) {
+            fprintf(stderr, "cannot write %s\n", path.c_str());
+            if (f) fclose(f);
+            return false;
+        }
+        fclose(f);
+        return true;
+    };
+    if (!put("tokenizer.hf.json", m.tokenizer_json) || !put("chat_template.jinja", m.chat_template)) return 1;
+    printf("tokenizer: %zu bytes, chat template: %zu bytes\n", m.tokenizer_json.size(), m.chat_template.size());
+    return 0;
+}
+
+#ifndef STRATA_HY4_VERSION
+#define STRATA_HY4_VERSION "0.2.18"
+#endif
+
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_hcsplit = false, prof3 = false;
-    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16;
+    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0;
+    bool serve = false, session_reuse = false;
+    std::string vision;
+    std::string draft = "auto";  // auto: DFly2 when the file carries the drafter and --gen > 0; off / dfly2 force
+    SpecCfg scfg;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -815,7 +894,30 @@ int main(int argc, char** argv) {
         else if (a == "--no-relax") no_relax = true;
         else if (a == "--moe-mm-min") moe_mm_min_arg = atoi(nxt().c_str());
         else if (a == "--mpp-min") mpp_min_arg = atoi(nxt().c_str());
+        else if (a == "--draft") draft = nxt();
+        else if (a == "--spec-k") scfg.K = atoi(nxt().c_str());
+        else if (a == "--spec-fixed") scfg.adaptive = false;
+        else if (a == "--spec-cut") scfg.cut = (float) atof(nxt().c_str());
+        else if (a == "--spec-debug") scfg.debug = true;
+        else if (a == "--spec-sabotage") scfg.sabotage = true;
+        else if (a == "--ab") ab_rounds = atoi(nxt().c_str());
+        else if (a == "--bench-m") bench_m = atoi(nxt().c_str());
+        else if (a == "--info") return print_info(nxt());
+        else if (a == "--version") {
+            printf("strata-hy4 %s\n", STRATA_HY4_VERSION);
+            return 0;
+        } else if (a == "--export-tokenizer") {
+            std::string f = nxt();
+            return export_tokenizer(f, nxt());
+        } else if (a == "--serve") serve = true;
+        else if (a == "--native") model = nxt();
+        else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
+        else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
+        else if (a == "--vision") vision = nxt();
+        else if (a == "--kv" || a == "--gpu" || a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by the Metal runner\n", a.c_str(), nxt().c_str());
         else {
+            printf("ERR unknown flag %s\n", a.c_str());
+            fflush(stdout);
             fprintf(stderr, "unknown arg %s\n", a.c_str());
             return 2;
         }
@@ -840,6 +942,37 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[load] paged in %.1f s\n", now_s() - t0);
     }
     if (load_only) return 0;
+    if (serve) {
+        ServeOpts so;
+        so.model = model;
+        so.engram = engram;
+        so.vision = vision;
+        so.max_ctx = max_ctx > 0 ? max_ctx : 131072;
+        so.chunk = chunk;
+        so.index_topk = index_topk;
+        so.no_index = no_index;
+        so.no_engram = no_engram;
+        so.session_reuse = session_reuse;
+        so.draft = draft;
+        so.spec = scfg;
+        if (draft != "off" && draft != "dfly2" && draft != "auto") {
+            proto("ERR --draft %s: expected off, dfly2 or auto", draft.c_str());
+            return 2;
+        }
+        if (kernels.empty()) {
+            const char* e = getenv("STRATA_HY4_KERNELS");
+            if (e) kernels = e;
+            else {
+                std::string d = argv[0];
+                size_t sl = d.find_last_of('/');
+                kernels = (sl == std::string::npos ? std::string(".") : d.substr(0, sl)) + "/hy4.metal";
+                if (access(kernels.c_str(), R_OK) != 0) kernels = "hy4.metal";
+            }
+        }
+        char rp[4096];
+        if (realpath(kernels.c_str(), rp)) kernels = rp;
+        return hy4_serve_main(g, cx, so, kernels);
+    }
     std::vector<int32_t> tok;
     {
         std::ifstream f(tok_path);
@@ -880,11 +1013,25 @@ int main(int argc, char** argv) {
     r.moe_mm_min = moe_mm_min_arg;
     r.n_run = std::min(n_layers_run, r.c.n_layers);
     const int V = r.c.vocab;
-    if (!r.init(no_engram ? std::string() : engram, all_logits ? r.Tc : 1, err)) {
+    const bool has_df = g.man.T.count("model.dfly_layers.0.self_attn.q_a_proj.weight") && g.man.T.count("model.dfly_layers.hidden_correction.gate_proj.weight");
+    if (draft != "off" && draft != "dfly2" && draft != "auto") {
+        fprintf(stderr, "--draft %s: expected off, dfly2 or auto\n", draft.c_str());
+        return 2;
+    }
+    const bool spec_mode = (gen > 0 || bench_m > 0) && draft != "off" && has_df && r.Tc >= 16 && !all_logits;
+    if (draft == "dfly2" && !spec_mode && gen > 0) fprintf(stderr, "[spec] --draft dfly2 requested but not possible (no drafter in the file, chunk < 16, or --all-logits)\n");
+    if (!r.init(no_engram ? std::string() : engram, std::max(all_logits ? r.Tc : 1, spec_mode ? 8 : 1), err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
         return 1;
     }
+    DFly2 df(r);
+    if (spec_mode && !df.init(err)) {
+        fprintf(stderr, "dfly2: %s\n", err.c_str());
+        return 1;
+    }
+    fprintf(stderr, "[info] drafter=%s\n", spec_mode ? "dfly2" : (has_df ? "dfly2(off)" : "none"));
     tok.reserve(max_ctx + 8);
+    int last_p0 = 0, last_T = 0;
     std::string top_out;
     double t0 = now_s();
     int done = 0;
@@ -899,6 +1046,8 @@ int main(int argc, char** argv) {
         done += T;
         if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
         if (done == T0) {
+            last_p0 = done - T;
+            last_T = T;
             int first = all_logits ? 0 : T - 1;
             r.head(T, first);
             r.run_all();
@@ -915,7 +1064,90 @@ int main(int argc, char** argv) {
     if (prof) r.report("prefill", (T0 + r.Tc - 1) / r.Tc);
     printf("%s", top_out.c_str());
     fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram wait %.2f s, gpu %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_wait, r.gpu_total);
-    if (gen > 0) {
+    auto plain_gen = [&](std::vector<int>& ids_out, bool verbose) -> bool {  // greedy plain decode of `gen` tokens from the prefilled state (logits in hl)
+        int next = (int) (std::max_element(hl.end() - V, hl.end()) - (hl.end() - V));
+        for (int s = 0; s < gen; ++s) {
+            tok.push_back(next);
+            ids_out.push_back(next);
+            if (next == r.c.eos || s + 1 == gen) break;
+            if (!r.forward_chunk(tok.data(), (int) tok.size() - 1, 1, err)) { fprintf(stderr, "forward: %s\n", err.c_str()); return false; }
+            r.head(1, 0);
+            r.argmax(V);
+            r.run_all();
+            next = *(const int32_t*) r.d_argmax.ptr;
+        }
+        (void) verbose;
+        return true;
+    };
+    // state of the end of the prefill (logits row 0, hfin row 0, key-list capture) rebuilt by re-running the last prefill chunk (A/B rounds)
+    auto restore = [&]() {
+        tok.resize(T0);
+        if (!r.forward_chunk(tok.data(), last_p0, last_T, err)) { fprintf(stderr, "restore: %s\n", err.c_str()); exit(1); }
+        r.head(last_T, last_T - 1);
+        r.run_all();
+        hl.assign((const float*) r.logits.ptr, (const float*) r.logits.ptr + V);
+    };
+    if (bench_m > 0) {  // M-token window (the last M prompt positions re-run) timed + per-kernel profile
+        const int p0 = T0 - bench_m;
+        for (int rep = 0; rep < 6; ++rep) {
+            const double tb = now_s();
+            r.forward_chunk(tok.data(), p0, bench_m, err);
+            r.head(bench_m, 0);
+            r.run_all();
+            fprintf(stderr, "[bench-m] M=%d rep %d: %.2f ms (gpu %.2f)\n", bench_m, rep, (now_s() - tb) * 1e3, r.gpu_total * 1e3);
+            r.gpu_total = 0;
+        }
+        r.forward_chunk(tok.data(), p0, bench_m, err);
+        r.head(bench_m, 0);
+        r.kernel_profile(20);
+        r.ds.clear();
+        return 0;
+    }
+    if (spec_mode && ab_rounds > 0) {
+        for (int round = 1; round <= ab_rounds; ++round) {
+            restore();
+            std::vector<int> pids;
+            double tp0 = now_s();
+            if (!plain_gen(pids, false)) return 1;
+            const double tpl = now_s() - tp0;
+            restore();
+            Spec sp(r, df, scfg);
+            std::vector<int> sids;
+            std::string finish, e2;
+            int made = 0;
+            const double ts0 = now_s();
+            sp.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { sids.push_back(t); return true; }, finish, e2, made);
+            const double tsd = now_s() - ts0;
+            if (finish == "error") { fprintf(stderr, "spec: %s\n", e2.c_str()); return 1; }
+            size_t same = 0;
+            while (same < pids.size() && same < sids.size() && pids[same] == sids[same]) ++same;
+            const long steps = sp.S.spec_iters + sp.S.plain_iters;
+            printf("[ab] ctx %d round %d: plain %zu tok %.2f s = %.2f tok/s | dfly2 %zu tok %.2f s = %.2f tok/s | speedup %.3f | tokens/iteration %.2f (accepted/verify-step %.2f, iterations %ld) | identical prefix %zu/%zu tokens\n",
+                   T0, round, pids.size(), tpl, pids.size() / tpl, sids.size(), tsd, sids.size() / tsd, (sids.size() / tsd) / (pids.size() / tpl), steps ? (double) sp.S.tokens / steps : 0.0,
+                   sp.S.spec_iters ? (double) sp.S.accepted / sp.S.spec_iters : 0.0, steps, same, pids.size());
+            fflush(stdout);
+            sp.report(stderr, tsd * 1000.0);
+            if (round == 1) {
+                std::ofstream f(out_dir + "/gen_ids_plain.txt"), f2(out_dir + "/gen_ids_spec.txt");
+                for (int t : pids) f << t << " ";
+                for (int t : sids) f2 << t << " ";
+            }
+        }
+    } else if (spec_mode) {
+        Spec sp(r, df, scfg);
+        std::vector<int> sids;
+        std::string finish, e2, gen_ids;
+        int made = 0;
+        const double t1 = now_s();
+        sp.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { sids.push_back(t); gen_ids += std::to_string(t) + " "; return true; }, finish, e2, made);
+        const double td = now_s() - t1;
+        if (finish == "error") { fprintf(stderr, "spec: %s\n", e2.c_str()); return 1; }
+        printf("generated ids: %s\n", gen_ids.c_str());
+        sp.report(stderr, td * 1000.0);
+        fprintf(stderr, "[decode] %zu tokens in %.2f s = %.2f tok/s (dfly2, %s)\n", sids.size(), td, sids.size() / td, finish.c_str());
+        std::ofstream f(out_dir + "/gen_ids.txt");
+        f << gen_ids << "\n";
+    } else if (gen > 0) {
         int next = (int) (std::max_element(hl.end() - V, hl.end()) - (hl.end() - V));
         std::string gen_ids;
         double t1 = now_s();
