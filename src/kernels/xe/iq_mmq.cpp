@@ -574,6 +574,19 @@ template<> struct Dec<kNativeQ6KRows> {   // Q6_K split by row (native_mmvq.hpp)
     }
 };
 
+// The gathered bih3 R1Q2 planes: three signed-byte blocks for each original block of 32. Their scale is FP32,
+// so gathering does not round the row, column or two-bit scales to FP16 a second time.
+template<> struct Dec<kBih3Planes> {
+    static constexpr int QK = 32, BSZ = 36;
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const uint8_t* block = row + (size_t) sb * BSZ;
+        Sub r;
+        for (int j = 0; j < 8; ++j) r.v[j] = (uint32_t) get_int_b4(block, j);
+        r.s0 = r.s1 = *reinterpret_cast<const float*>(block + 32);
+        return r;
+    }
+};
+
 template<> struct Dec<kNativeQ8Rows> {   // Q8_0 split by row (native_mmvq.hpp): a row's qs, then its d
     static constexpr int QK = 32, BSZ = (int) sizeof(block_q8_0);
     static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
@@ -2043,7 +2056,9 @@ bool iq_mmq_dp4a_usable(sycl::queue& q) {
 const char* iq_mmq_path(sycl::queue& q) {
     if (iq_mmq_usable(q)) {
         const sycl::device d = q.get_device();
-        return xe::amd_wmma(d) ? "WMMA" : shape_reported(d) ? "joint_matrix" : "XMX";
+        const int intel = intel_shape_of(q);   // by_rows chooses this before the other matrix forms
+        if (intel) return intel == 1 ? "XMX SG16" : "XMX SG8";
+        return xe::amd_wmma(d) ? "WMMA" : "joint_matrix";
     }
     return iq_mmq_dp4a_usable(q) ? "DP4a" : nullptr;
 }
@@ -2052,7 +2067,7 @@ bool iq_mmq_type_sums(int t) { return t == 7 || t == 12 || t == 13; }   // has_m
 
 bool iq_mmq_type_ok(int t) {
     switch (t) {
-        case 2: case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
+        case 2: case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows: case kBih3Planes:
         case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 40: case 42:
         case kIqMmqFx + 16: case kIqMmqFx + 17: case kIqMmqFx + 18: case kIqMmqFx + 20: case kIqMmqFx + 21:
         case kIqMmqFx + 22: case kIqMmqFx + 42: return true;
@@ -2077,6 +2092,7 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
         case 14: return (size_t) (cols / Dec<14>::QK) * Dec<14>::BSZ;
         case kNativeQ6KRows: return (size_t) (cols / Dec<kNativeQ6KRows>::QK) * Dec<kNativeQ6KRows>::BSZ;
         case kNativeQ8Rows: return (size_t) (cols / Dec<kNativeQ8Rows>::QK) * Dec<kNativeQ8Rows>::BSZ;
+        case kBih3Planes: return (size_t) (cols / Dec<kBih3Planes>::QK) * Dec<kBih3Planes>::BSZ;
         case 16: case kIqMmqFx + 16: return (size_t) (cols / Dec<16>::QK) * Dec<16>::BSZ;
         case 17: case kIqMmqFx + 17: return (size_t) (cols / Dec<17>::QK) * Dec<17>::BSZ;
         case 18: case kIqMmqFx + 18: return (size_t) (cols / Dec<18>::QK) * Dec<18>::BSZ;
@@ -2163,6 +2179,7 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         STRATA_MMQ_CASE(14);
         STRATA_MMQ_CASE(kNativeQ6KRows);
         STRATA_MMQ_CASE(kNativeQ8Rows);
+        STRATA_MMQ_CASE(kBih3Planes);
         STRATA_MMQ_CASE(16);
         STRATA_MMQ_CASE(17);
         STRATA_MMQ_CASE(18);

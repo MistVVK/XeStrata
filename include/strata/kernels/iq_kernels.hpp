@@ -42,6 +42,34 @@ struct Bih3R1q2Matrix {
 /// y[c][r] = W[r] . x[c], with q8_1 activations and the R1Q2 scales above.
 void bih3_r1q2_mmvq(const Bih3R1q2Matrix& w, const void* x_q8_1, float* y, int ncols, void* stream);
 
+/// Gather the matrix into iq_mmq's kBih3Planes format. Output has n_out rows of 3*n_in/32 blocks, 36 bytes each.
+void bih3_r1q2_gather_mmq(const Bih3R1q2Matrix& w, void* dst, void* stream);
+/// Repeat each q8_1 input block three times into iq_mmq's activation layout (iq_mmq_act_bytes for 3*n_in columns).
+void bih3_r1q2_expand_mmq(const void* x_q8_1, void* dst, int n_in, int ncols, void* stream);
+
+/// A mixed R1Q2 layer. `k_pairs` is a device array of (gate/up K, down K) bytes per expert; `route_ids` maps the
+/// grouped entries' destination indices to expert IDs. p2 and the geometry are shared by the layer.
+struct Bih3R1q2Layer {
+    int n_embd = 0, n_ff = 0, n_expert = 0, had_block = 0;
+    const uint8_t* k_pairs = nullptr;
+    const int32_t* route_ids = nullptr;
+    const float* d_signs = nullptr;
+    float p2[3][4] = {};
+};
+/// Scratch for one gathered expert and up to cap_entries routed rows, reused across the groups on the same stream.
+size_t bih3_r1q2_grouped_scratch_bytes(int64_t cap_entries, int64_t n_embd, int64_t n_ff);
+/// A grouped layer in the same pointer / start / entry layout as native_expert_grouped. Its mixed experts take the
+/// device's int8 matrix engines where present, else the existing tiled DP4a path.
+void bih3_r1q2_grouped(const Bih3R1q2Layer& layer, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                       const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                       int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
+
+/// One prompt expert, using the same grouped product. Scratch includes its device-side routing tables.
+size_t bih3_r1q2_prompt_scratch_bytes(int64_t cap_entries, int64_t n_embd, int64_t n_ff);
+void bih3_r1q2_prompt(const Bih3R1q2Layer& layer, const uint8_t* blob, int gate_k, int down_k,
+                       const int32_t* token_rows, int64_t rows, int64_t cap_entries, const void* x_q8_1,
+                       void* scratch, float* out, void* stream);
+
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32.
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);

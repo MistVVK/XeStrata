@@ -22,12 +22,15 @@ bool iq_mmq_usable(sycl::queue& q);
 /// permitting): iq_mmq_grouped takes that form where iq_mmq_usable says no.
 bool iq_mmq_dp4a_usable(sycl::queue& q);
 /// What runs these products on `q`'s device, for the start's report: "WMMA" (RDNA3, RDNA4), "joint_matrix" (a shape
-/// the device reports: NVIDIA's tensor cores), "XMX" (Intel's shapes), "DP4a" (no matrix engines), or null (neither).
+/// the device reports: NVIDIA's tensor cores), "XMX SG8" / "XMX SG16" (Intel's shapes), "DP4a" (no matrix
+/// engines), or null (neither).
 const char* iq_mmq_path(sycl::queue& q);
 /// The fixed-point form of a type's products (canon_math.hpp's fx_*): kIqMmqFx + the ggml type, on canonical
 /// activations (iq_mmq_quantize's canon); the same bits as the CPU's canonical rows (canon_expert.hpp) and the decode's
 /// grouped experts, in any tile shape and on every GPU.
 inline constexpr int kIqMmqFx = 1000;
+/// Internal gathered bih3 planes: 32 signed bytes followed by their FP32 scale, three blocks per input block.
+inline constexpr int kBih3Planes = 0x58530003;
 /// The type iq_mmq_grouped takes for the fixed-point products of ggml_type (the gate/up's IQ2_XXS, IQ2_XS, IQ3_XXS,
 /// IQ3_S and IQ2_S, the down's IQ4_NL), or 0 where it has none.
 int iq_mmq_fx(int ggml_type);
