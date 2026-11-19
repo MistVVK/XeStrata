@@ -444,6 +444,9 @@ int main(int argc, char** argv) {
     for (int gu : {12, 13})
         for (int dt : {7, 8}) check_grouped(gu, dt, 2560, 640, s, rng);
     for (int gu : {12, 13}) check_grouped(gu, 13, 2048, 512, s, rng);   // Qwen3.6-35B-A3B's geometry
+    // Q8_0 gate/up (UD-Q6_K_XL's layer 2, the rt-q8 drafter's experts): 320 calls a row at 2560, the full-warp rows - with
+    // STRATA_KQ_SPLIT=1 a 16-row grid left the up rows unwritten (native_expert_grouped's gu_sub16_rows)
+    check_grouped(8, 8, 2560, 640, s, rng);
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);

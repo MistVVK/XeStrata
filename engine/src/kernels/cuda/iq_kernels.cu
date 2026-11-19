@@ -3400,6 +3400,15 @@ int gu_qk(int t) {
         default: return 0;
     }
 }
+// the calls a gate/up row of n_embd values takes (Fmt<T>::ipb per qk values); 0 for a type outside the list
+int gu_calls(int t, int64_t n_embd) {
+    switch (t) {
+#define STRATA_GC(T) case T: return (int) ((n_embd / Fmt<T>::qk) * Fmt<T>::ipb);
+        STRATA_GU_FMTS(STRATA_GC)
+#undef STRATA_GC
+        default: return 0;
+    }
+}
 int d_qk(int t) {
     switch (t) {
 #define STRATA_QK(T) case T: return Fmt<T>::qk;
@@ -6586,8 +6595,15 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     const bool v1 = g_grouped_v1;
     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
-    const int gu_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type) &&
-                         gu_qk(L.gu_type) != 128 && L.gu_type != 12 && L.gu_type != 13) ? 16 : GU_ROWS;   // qk 128 (APR trellis): no sub-16 rows, see launch_gu
+    // gu_sub16_rows: launch_gu takes the 16-row (16-lane) kernel only for a split format whose rows have exactly 80 calls
+    // (native_gu_multi_kernel: xb == 80 && nb * ipb == 80); every other row shape runs its full-warp rows, 8 a block, in
+    // ONE pass over blockIdx.x, so a 16-row grid there computed only rows 0 .. n_ff - 1 (the gate) and never the up rows.
+    // That was the case of Q8_0 gate/up (320 calls at 2560; UD-Q6_K_XL layer 2, the rt-q8 drafter) with STRATA_KQ_SPLIT=1;
+    // the old test (qk != 128, not Q4_K / Q5_K) gives the same 16 / 8 as this one for every other split type (IQ*, Q2_0,
+    // NVFP4: 80 calls; Q4_K / Q5_K / APR trellis: 160).
+    const bool gu_sub16_rows = !g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type) &&
+                               gu_calls(L.gu_type, L.n_embd) == 80;
+    const int gu_rows = gu_sub16_rows ? 16 : GU_ROWS;
     const dim3 ggu((unsigned) ((2 * L.n_ff + gu_rows - 1) / gu_rows), (unsigned) gy);
 #if STRATA_EXP_LAYOUTS
 #if defined(STRATA_HIP_GFX906)
