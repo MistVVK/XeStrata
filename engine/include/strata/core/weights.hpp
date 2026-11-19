@@ -90,6 +90,7 @@ struct WeightRef {
     const void* native_data = nullptr;
     void* native_q8_1 = nullptr;
     int native_type = -1;
+    uint64_t native_bytes = 0;   ///< the size of `native_data`'s payload (BW-5: the L2 prefetch of the next layer's weights)
     /// S23 experiment (STRATA_HC_Q8=1): a hyper-connection projection's Q8_0 bytes as the GGUF stores them, owned by
     /// NativeDense, for the verify window's read (every other path keeps the pack's BF16 `data`)
     const void* hc_q8 = nullptr;
