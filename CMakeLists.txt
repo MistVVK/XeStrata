@@ -1851,9 +1851,10 @@ if(STRATA_NATIVE_EXPERTS)
   # structs in unions on purpose (ggml-common.h, ggml-impl.h); clang warns of both there and nowhere else.  ggml's
   # targets alone, on Windows alone, so XeStrata's files keep the warnings
   if(WIN32)
-    foreach(_t ggml-base ggml-cpu ggml)
-      if(TARGET ${_t})
-        target_compile_options(${_t} PRIVATE -Wno-keyword-macro -Wno-gnu-anonymous-struct -Wno-nested-anon-types)
+    foreach(ggml_target ggml-base ggml-cpu ggml)
+      if(TARGET ${ggml_target})
+        target_compile_options(${ggml_target} PRIVATE -Wno-keyword-macro -Wno-gnu-anonymous-struct
+                               -Wno-nested-anon-types)
       endif()
     endforeach()
   endif()
