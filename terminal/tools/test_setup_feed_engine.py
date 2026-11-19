@@ -82,7 +82,7 @@ class FeedEngine(unittest.TestCase):
         gpu = {"arch": 60, "archs": [60], "vram_gb": 16.0, "index": 0}
         asked = []
 
-        def from_feed(eng, updating=False):               # what the real one does: the package's files, BUILD.json with its archs, become the engine
+        def from_feed(eng, updating=False, backend=""):   # what the real one does: the package's files, BUILD.json with its archs, become the engine
             asked.append(eng)
             (eng / "BUILD.json").write_text(json.dumps({"version": "0.1.62", "source": "prebuilt", "archs": [60, 61, 70, 75, 80, 86, 89]}), encoding="utf-8")
             return eng
