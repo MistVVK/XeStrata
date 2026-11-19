@@ -58,8 +58,10 @@ bool device_sync();
 void* alloc_device(size_t bytes);
 /// The bytes this process holds through alloc_device on the current device.
 size_t device_held();
-/// The maximum live device bytes on the current device since this process started.
+/// The maximum live device bytes on the current device since this process started, or since device_peak_reset.
 size_t device_peak_held();
+/// The high-water mark of the current device set to what this process holds now (a run's own peak measured from it).
+void device_peak_reset();
 /// This process's device memory, including runtime allocations. `source`: fdinfo, nvml, delta, or global (the conservative
 /// device-wide fallback). False only when none of them can read the device. The free-memory delta can include another
 /// process's changes since this runtime's context was created.

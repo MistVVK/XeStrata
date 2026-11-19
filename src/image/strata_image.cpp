@@ -759,6 +759,17 @@ struct Upscalers {
         for (auto& m : open) m.second->release(all);
         if (all) open.clear();
     }
+    // every other one's weights let go (a video's run, which takes the room they hold for its length)
+    void release_except(const su::UpscaleModel& keep) {
+        for (auto it = open.begin(); it != open.end();) {
+            if (it->second.get() == &keep) {
+                ++it;
+                continue;
+            }
+            it->second->release(true);
+            it = open.erase(it);
+        }
+    }
 };
 
 // The VRAM an upscale may take now: what the budget leaves beside the image model's holdings, within the free VRAM
@@ -1611,7 +1622,15 @@ int serve(si::ImagePipeline& p) {
                     }
                 }
                 su::UpscaleModel& m = ups.get(spec);
-                p.release(true);   // a video's run is long: the image model's room its
+                p.release(true);   // a video's run is long: the image model's room its, and what the other upscalers
+                {                  // and the detectors hold, the VRAM they give back added to the budget (aux_room's)
+                    const uint64_t before = p.held() + si::free_vram();
+                    ups.release_except(m);
+                    detectors.release(true);
+                    control.release();
+                    const uint64_t after = p.held() + si::free_vram();
+                    if (after > before) p.set_budget(p.budget() + (after - before));
+                }
                 const uint64_t avail = ups_room(p, m);
                 std::printf("STAGE upscale-video\n");
                 std::fflush(stdout);
@@ -1621,7 +1640,29 @@ int serve(si::ImagePipeline& p) {
                     std::fflush(stdout);
                     return !in.stop().load();
                 };
-                const su::VideoReport vp = su::UpscaleRunner::run_video(m, src, stem, vr, avail, step);
+                // the room it was given against the most the process held through the run (the engine's log)
+                size_t free0 = 0, total0 = 0;
+                strata::gpu::mem_info(&free0, &total0);
+                const size_t held0 = strata::gpu::device_held();
+                const uint64_t ups0 = m.held();
+                strata::gpu::device_peak_reset();
+                const auto told_peak = [&](const char* how) {
+                    std::fprintf(stderr, "xestrata-image: video upscale %s: room %llu MiB (budget %llu, the image "
+                                 "model's %llu, free %llu, the upscaler's %llu at the start), the process held %llu "
+                                 "MiB then and %llu at most\n", how, (unsigned long long) (avail >> 20),
+                                 (unsigned long long) (p.budget() >> 20), (unsigned long long) (p.held() >> 20),
+                                 (unsigned long long) (free0 >> 20), (unsigned long long) (ups0 >> 20),
+                                 (unsigned long long) (held0 >> 20),
+                                 (unsigned long long) (strata::gpu::device_peak_held() >> 20));
+                };
+                su::VideoReport vp;
+                try {
+                    vp = su::UpscaleRunner::run_video(m, src, stem, vr, avail, step);
+                } catch (...) {
+                    told_peak("failed");
+                    throw;
+                }
+                told_peak("done");
                 const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 const std::string parts = m.parts();
                 std::printf("UPSVIDEO path=%s mime=%s frames=%lld width=%lld height=%lld fps=%.6f vfr=%d "
@@ -2016,9 +2057,11 @@ int serve(si::ImagePipeline& p) {
             const bool auxiliary = op == "MATTE" || op == "SEGMENT" || op == "SEGV" || op == "FLORENCE" ||
                                    op == "CONTROL" || op == "DETECT" || op == "COLORMAP";
             const bool refused = m.find("alloc_device:") != std::string::npos && m.find("refused") != std::string::npos;
-            if (auxiliary && refused && !retried_aux) {
-                std::fprintf(stderr, "xestrata-image: auxiliary allocation refused, releasing resident weights: %s\n",
-                             m.c_str());
+            // a video's upscale too: refused past its plan (another program took the VRAM meanwhile), it starts again
+            // once with every weight let go, its file written anew
+            if ((auxiliary || op == "UPSV") && refused && !retried_aux) {
+                std::fprintf(stderr, "xestrata-image: %s allocation refused, releasing resident weights: %s\n",
+                             op == "UPSV" ? "a video's" : "auxiliary", m.c_str());
                 p.release(true);
                 detectors.release(true);
                 ups.release(true);
@@ -2027,7 +2070,8 @@ int serve(si::ImagePipeline& p) {
                 retried_aux = true;
                 goto retry_aux;
             }
-            if (auxiliary && refused) m = "memory: the GPU refused an allocation; free GPU memory and try again";
+            if ((auxiliary || op == "UPSV") && refused)
+                m = "memory: the GPU refused an allocation; free GPU memory and try again";
             for (char& c : m)
                 if (c == '\n') c = ' ';
             // an adapter the request names and the engine does not take is the request's fault (the server's 400)

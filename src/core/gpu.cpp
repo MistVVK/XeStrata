@@ -218,6 +218,12 @@ size_t device_peak_held() {
     return it != g_live_peak.end() ? it->second : 0;
 }
 
+void device_peak_reset() {
+    std::lock_guard<std::mutex> lock(g_live_mu);
+    const auto it = g_live_on.find(rt().ordinal());
+    g_live_peak[rt().ordinal()] = it != g_live_on.end() ? it->second : 0;
+}
+
 namespace {
 // Linux DRM fdinfo is per client, not per fd. The runtime may hold several fds for one client; count it once.
 bool drm_process_memory(const std::string& pci, size_t& bytes) {
