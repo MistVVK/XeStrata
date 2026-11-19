@@ -129,6 +129,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_ADAPT_ALL_ON_GPUS",
+   "backends": [
+    "sycl"
+   ],
+   "reads": [
+    {
+     "file": "engine/sycl/src/program/generate.cpp",
+     "line": 8451,
+     "backend": "sycl",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "f5d7dc9d56",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "f5d7dc9d56",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5540, opt-in (SYCL, off by default): count the helper cards' caches and the peer tier when deciding whether the adaptive expert tier has anything to promote; with every expert on some GPU the tier is skipped (the PR measured decode 32.1 to 61.3 tok/s on two Arc Pro B70 in helper mode; not measured by us).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_ADAPT_ASYNC",
    "backends": [
     "cuda-hip"
@@ -2811,6 +2844,72 @@
    "status": "default",
    "owner": "prefill",
    "note": "[reviewed] \"=1 / =0 turns it on / off on any 7.x card\"; on by default for 7.x. [src/prefill/gemm.cu:790]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_BLOB_VERIFY",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/expert_source.cpp",
+     "line": 1936,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "ab62b9989b",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "ab62b9989b",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #6166, opt-in diagnostic (Windows file tier, off by default): re-read every expert blob the direct reader delivered through a buffered handle and compare, to tell a corrupt direct read from a poisoned cache slot (#879).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_BLOB_VERIFY_DELAY_SEC",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/expert_source.cpp",
+     "line": 1939,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "ab62b9989b",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "ab62b9989b",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #6166: seconds the blob verifier (STRATA_BLOB_VERIFY) holds off at start, so the start-up fill is not slowed.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -7157,6 +7256,41 @@
    "status": "opt-in",
    "owner": "kernels/cuda",
    "note": "[auto] documented for users (docs/EXPERTDEC.md:27)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_EXPERTS_SEQ_READAHEAD",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/expert_source.cpp",
+     "line": 1058,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/DETAILS.md:323"
+   ],
+   "first_commit": "f6e9532e53",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "f6e9532e53",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5561, opt-in (Linux file tier, off by default): mark the mapped expert files MADV_SEQUENTIAL so each page fault reads the drive's read-ahead window; for experts much larger than the file cache. Author's numbers only (follow-up turns 65 to 24 s on one PC).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30844,6 +30978,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PREFILL_PIPE_FLOOR",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/prefill/prefill.cpp",
+     "line": 3475,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "512",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "50f15a514e",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "50f15a514e",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #3821: the smallest chunk the --prefill-pipe rule picks, in tokens (rounded up to 256, clamped 256..4096); default 512, the rule as before. Author's numbers on 4x GP100 (-10% on a 1.1K-token read).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PREFILL_PLAN_TOKS",
    "backends": [
     "cuda-hip"
@@ -35962,6 +36129,39 @@
    "status": "default",
    "owner": "core",
    "note": "[auto] on unless set to 0 (src/core/expert_source.cpp:4878)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_ROUTE_WIN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/verify.cpp",
+     "line": 302,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "on",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "31ca245961",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "31ca245961",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #3476: the verify window's routing for a router the native one does not take (256 experts) in one launch pair per layer (moe_route_window); on by default on gfx906 builds, opt-in (=1) on every other backend; bitwise equal to the per-token calls (route_window_parity).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -42528,6 +42728,39 @@
    "status": "rollback",
    "owner": "kernels/cuda",
    "note": "[auto] on unless set to 0 (src/kernels/cuda/qsa_select.cu:2979); rollback wording at docs/TROUBLESHOOTING.md:253; name first appears in v0.1.40.1",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_TQP_AVX2_FAST",
+   "backends": [
+    "cpu"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/kernels/cpu/tq_avx2.cpp",
+     "line": 191,
+     "backend": "cpu",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "8922e08dfd",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "8922e08dfd",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5873, opt-in (CPU, off by default): the PR's faster AVX2 rows for the pair trellis (TQP5/6/7, Gyro-L), same bits (tqp_cpu_test); our paired A/B on a Ryzen 5 5600X showed no gain with GCC, so it stays off.",
    "retire_after": "",
    "retired_in": ""
   },
