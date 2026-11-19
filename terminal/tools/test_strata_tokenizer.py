@@ -401,13 +401,25 @@ class PreTokenizerType(unittest.TestCase):
 
     def test_known_types(self):
         self.assertEqual(ST.pre_tokenizer_kind("qwen35"), "qwen35")
+        self.assertEqual(ST.pre_tokenizer_kind("qwen2"), "qwen2")
         self.assertEqual(ST.pre_tokenizer_kind(None), "qwen35")
         self.assertEqual(ST.pre_tokenizer_kind(""), "qwen35")
         for p in ("deepseek3", "deepseek-v3", "deepseek-llm", "deepseek41"):
             self.assertEqual(ST.pre_tokenizer_kind(p), "deepseek3", p)
 
+    def test_qwen2_and_qwen35_differ_on_combining_marks(self):
+        # The two rules are identical except `p{M}`: a combining mark groups with the letters under qwen35
+        # and falls into the punctuation run under qwen2.  Pinning the difference is what keeps a future
+        # "they look the same, share one rule" edit from silently re-splitting every Qwen2/Qwen3-Next prompt.
+        toks = ["a", "b", "ab", "a\u0301", "\u0301-"]
+        text = "a\u0301-"
+        q35 = ST.Tokenizer(toks, [], None, "qwen35")._split(text)
+        q2 = ST.Tokenizer(toks, [], None, "qwen2")._split(text)
+        self.assertEqual(q35, ["a\u0301", "-"])
+        self.assertEqual(q2, ["a", "\u0301-"])
+
     def test_unknown_types_are_refused_with_the_name(self):
-        for p in ("qwen2", "qwen3", "qwen4", "default", "gpt2", "llama-bpe", "joyai-llm", "Qwen35", " qwen35"):
+        for p in ("qwen3", "qwen4", "default", "gpt2", "llama-bpe", "joyai-llm", "Qwen35", " qwen35"):
             with self.subTest(p):
                 self.assertIsNone(ST.pre_tokenizer_kind(p))
                 with self.assertRaises(ST.UnknownPreTokenizer) as cm:

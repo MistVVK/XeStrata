@@ -83,6 +83,24 @@ DEEPSEEK3_PATTERNS = (
 )
 
 
+# The `qwen2` pre-tokenizer (Qwen2 / Qwen3-Next; llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2,
+# `.ref`-equivalent src/llama-vocab.cpp L391-398, fetched master 2026-11-12).  It is the `qwen35` pattern
+# WITHOUT `p{M}`: same contraction classes, same digit/punctuation/whitespace arms.  The two families differ
+# only in how combining marks group, which is exactly the difference the qwen35 note above says is invisible
+# to round-tripping on ASCII-shaped text - so the rule is transcribed, not inferred, and the pack's own
+# tokenizer is checked against the HF oracle's ids.  llama.cpp maps the names `qwen2`, `deepseek-r1-qwen`,
+# `kormo` and `f2llmv2` to this one rule; only names we have round-tripped are claimed here.
+QWEN2_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
 def _sequence_findall(patterns, text: str) -> list[str]:
     """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
     matches and the unmatched spans between them."""
@@ -107,11 +125,13 @@ class UnknownPreTokenizer(ValueError):
 
 
 def pre_tokenizer_kind(pre) -> str | None:
-    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "deepseek3", or
+    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "qwen2", "deepseek3", or
     None for a type this file does not know.  An empty or missing value is the qwen35 default, as it always was."""
     p = "qwen35" if pre is None or pre == "" else str(pre)
     if p == "qwen35":
         return "qwen35"
+    if p == "qwen2":
+        return "qwen2"
     if p.startswith("deepseek"):
         return "deepseek3"
     return None
@@ -147,6 +167,9 @@ class Tokenizer:
         if pre_tokenizer_kind(pre) == "deepseek3":
             seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
             self._split = lambda text: _sequence_findall(seq, text)
+        elif pre_tokenizer_kind(pre) == "qwen2":
+            self._re = regex.compile(QWEN2_PATTERN)
+            self._split = self._re.findall
         else:
             self._re = regex.compile(QWEN35_PATTERN)
             self._split = self._re.findall
