@@ -7130,6 +7130,8 @@ SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRA
 # user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there
 # (0.1.44 dropped them with the rest of SETUP_ENV).
 SETUP_ENV_UNSLOTH = frozenset({"STRATA_MMQ_KQ", "STRATA_HC_Q8", "STRATA_ROUTE_TAIL_SKIP"})
+# The only values setup writes for an entry that people also set by hand. STRATA_RESIDENT_PIN: setup writes "0" (ROCm, resident experts); a "1" is the person's (#6244).
+SETUP_ENV_VALUES = {"STRATA_RESIDENT_PIN": frozenset({"0"})}
 SETUP_VISION = frozenset({"exe", "cpu_exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
 
@@ -7148,6 +7150,12 @@ def carry_over(old: dict, cfg: dict, explicit: list[str] | None = None) -> list[
     mine = SETUP_ENV if "-unsloth-" in str(cfg.get("model_name") or "") else SETUP_ENV - SETUP_ENV_UNSLOTH
     env = {k: v for k, v in (old.get("env") or {}).items() if k not in mine and k not in (cfg.get("env") or {})} \
         if isinstance(old.get("env"), dict) else {}
+    # #6244: an entry of setup's own is refreshed on every run, but only to the values setup writes; any other value was put there by the person
+    # (STRATA_RESIDENT_PIN=1, which setup never writes) and is kept over the one this run generated.
+    if isinstance(old.get("env"), dict):
+        for k, v in old["env"].items():
+            if k in mine and k in SETUP_ENV_VALUES and str(v) not in SETUP_ENV_VALUES[k]:
+                env[k] = v
     if env:
         cfg["env"] = {**(cfg.get("env") or {}), **env}
         kept += [f"env {k}" for k in env]
