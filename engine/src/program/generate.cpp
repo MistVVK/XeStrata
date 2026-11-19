@@ -157,6 +157,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/core/stream_watch.hpp"
 #include "strata/core/gpu_pause_time.hpp"
+#include "strata/core/vram_request_notice.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/emulate.hpp"
 #ifndef NOMINMAX
@@ -1891,6 +1892,9 @@ bool launch_blocking() {
 /// #2065: the VRAM free when the current request began (-1 before the first); the stall report prints it, because a
 /// card this full is the one measured cause of a window that never finishes (the driver pages GPU memory).
 std::atomic<int64_t> g_req_vram_free_mib{-1};
+/// The free VRAM the serve start-up line reported ("MiB of VRAM free with everything loaded"; -1 before it or when it did not run): the first
+/// request's note is said only when the free memory fell since then or is under 512 MiB (strata/core/vram_request_notice.hpp).
+std::atomic<int64_t> g_startup_vram_free_mib{-1};
 /// AMD on Linux: the driver's paused-GPU counter (ms, strata/core/gpu_pause_time.hpp) when the current request began;
 /// -1 before the first request, when not available, and in every other build.  Read once per request, never per step.
 std::atomic<int64_t> g_req_gpu_pause_ms{-1};
@@ -15372,6 +15376,7 @@ int main(int argc, char** argv) {
             // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can make
             // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
             const int64_t free_mib = (int64_t) (free_b >> 20);
+            g_startup_vram_free_mib.store(free_mib);   // the first request's note compares with this
             if (free_mib >= 256) {
                 std::fprintf(stderr, "strata serve: %lld MiB of VRAM free with everything loaded\n", (long long) free_mib);
 #ifdef _WIN32
@@ -17649,7 +17654,8 @@ int main(int argc, char** argv) {
                 // eat into what startup reported), once per 128 MiB lower it gets
                 size_t vf_b = 0, vt_b = 0;
                 if (cudaMemGetInfo(&vf_b, &vt_b) == cudaSuccess) {
-                    const int64_t vf = (int64_t) (vf_b >> 20);
+                    // the same figure as the start-up line's: the smaller of the runtime's and the card's own (strata/core/device.hpp)
+                    const int64_t vf = (int64_t) (std::min(vf_b, strata::core::device_free_bytes()) >> 20);
                     g_req_vram_free_mib.store(vf);
                     static int64_t low_said_at = INT64_MAX;
                     static bool uma_said = false;
@@ -17662,14 +17668,22 @@ int main(int argc, char** argv) {
                                                  "If decode drops to a few tok/s, lower --max-context.\n", (long long) vf);
                         }
                     } else
-                    if (vf < kVramSafeMib && vf + 128 <= low_said_at) {
+                    if (strata::core::vram_request_note_due(vf, g_startup_vram_free_mib.load(), kVramSafeMib) && vf + 128 <= low_said_at) {
+                        // item 17 (0.1.63): said when the free memory fell since the start-up line or is under 512 MiB, not at every first
+                        // request of a card the cache has filled on purpose
                         low_said_at = vf;
-                        std::fprintf(stderr, "strata serve: WARNING: only %lld MiB of VRAM free at the start of this request "
-                                             "(below %lld MiB): when the card is this full the driver can page GPU memory "
-                                             "to system RAM, decode falls to a few tok/s and a window may never finish "
-                                             "(#2065). Add --vram-reserve-mib %lld to the config's args, or lower "
-                                             "--max-context / --batch\n", (long long) vf, (long long) kVramSafeMib,
-                                     (long long) ((o.vram_reserve_mib + (kVramSafeMib - vf) + 63) / 64 * 64));
+                        std::fprintf(stderr, "strata serve: %lld MiB of the card's memory are free at the start of this request. "
+                                             "The model and its cache use most of the card on purpose, and the display and other "
+                                             "programs use some. Below %lld MiB %s can move GPU memory to system RAM, and decode can "
+                                             "then fall to a few tokens a second. If decode speed is normal, nothing needs to be "
+                                             "done. If it drops: add --vram-reserve-mib %lld to the config's args, or lower "
+                                             "--max-context.\n", (long long) vf, (long long) kVramSafeMib,
+#ifdef _WIN32
+                                     "Windows",
+#else
+                                     "the driver",
+#endif
+                                     (long long) strata::core::vram_request_reserve_mib(o.vram_reserve_mib, vf, kVramSafeMib));
                     }
                 }
             }

@@ -447,8 +447,7 @@ memory, the start looks normal, and only the speed collapses (see the history ta
 - Keep the cache on `auto`, or keep an explicit size and raise `--vram-reserve-mib`, which the engine deducts before it sizes
   the cache.
 - That figure is read before the verify windows are captured, so it moves down by tens of MiB per captured window or `--batch`
-  layout. Each request re-reads the free VRAM and prints `WARNING: only N MiB of VRAM free at the start of this request` below
-  1 GiB on Windows (512 MiB elsewhere), with the `--vram-reserve-mib` that would leave room. The fix is a larger
+  layout. Each request re-reads the free VRAM; from 0.1.63 the first request says `N MiB of the card's memory are free at the start of this request` only when the figure is below 1 GiB on Windows (512 MiB elsewhere) and either lower than the start-up line's or under 512 MiB, with the `--vram-reserve-mib` that would leave room (0.1.62 and before said `WARNING: only N MiB of VRAM free ...` at the first request of every start). The fix is a larger
   `--vram-reserve-mib`, a smaller `--max-context` or `--batch`, or the NVIDIA setting `CUDA - Sysmem Fallback Policy` set to
   `Prefer No Sysmem Fallback` for the engine's executable.
 - Performance Monitor's `GPU Process Memory` counters did not separate fast from slow runs because they count deliberately
