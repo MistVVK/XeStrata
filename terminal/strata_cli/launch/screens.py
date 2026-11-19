@@ -1346,10 +1346,11 @@ class AdvancedScreen(Base):
         import textwrap
         m = self.query_one(Menu)
         body_h = self.query_one("#body").size.height or max(6, (self.size.height or 30) - 8)
-        wrap_w = max(20, self.width() - 4)
+        wrap_w = max(20, self.width() - 8)                     # (the box has a scroll bar and the words wrap a little earlier than a plain count says: one spare line below)
         texts = ["  " + self.ctx.command_text(), "  Same as: " + self.ctx.flags_line(), *(["  " + self.ctx.engine_note] if self.ctx.engine_note else [])]
-        need = 1 + sum(len(textwrap.wrap(text, wrap_w)) or 1 for text in texts)
-        box_h = max(3, min(need, max(4, body_h - 7)))
+        need = 2 + sum(len(textwrap.wrap(text, wrap_w)) or 1 for text in texts)
+        room = body_h - 7 if body_h >= 14 else body_h // 3                  # (a small body keeps the old third: the list needs its rows)
+        box_h = max(3, min(need, room))
         self.query_one("#cmdbox").styles.height = box_h
         m.window = max(3, body_h - box_h - 4)                # the heading, the column titles, the "n of m" line and the box's rule
 

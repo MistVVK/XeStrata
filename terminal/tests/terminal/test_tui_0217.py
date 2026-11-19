@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import unittest
@@ -529,13 +530,14 @@ class At80Columns(unittest.TestCase):
         self.assertIn("-" * 40, plain)
 
     def test_the_header_keeps_free_and_shortens_the_cards_name(self):
-        hw = {**HW_12}
+        hw = copy.deepcopy(HW_12)                                                    # (the fixture is shared: a changed name would leak into other tests)
         with Home():
             comp = catalog(hw).computer()
         line = comp.line(width=62)
         self.assertTrue(line.endswith("free"), line)
         self.assertLessEqual(len(line), 62)
-        comp.usable_gpus[0]["name"] = "AMD Radeon(TM) 8060S Graphics With A Very Long Name Indeed"
+        comp.raw["gpus"][0]["name"] = "AMD Radeon(TM) 8060S Graphics With A Very Long Name Indeed"
+        comp.usable_gpus[0]["name"] = comp.raw["gpus"][0]["name"]
         line = comp.line(width=62)
         self.assertTrue(line.endswith("free"), line)
         self.assertLessEqual(len(line), 62, line)
