@@ -241,6 +241,7 @@ from serve.server_parts.engines import (  # noqa: F401  (moved unchanged, file s
     start_log_tail,
     start_log_text,
     unload_wait,
+    helper_gpus,
     visible_device_order,
     vision_log_size,
     vision_log_tail,
@@ -8624,6 +8625,17 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     if a.engine == "strata" and split:                  # split serving: the two cards (the prefill card first)
         svc.gpu_indices = [split["prefill_gpu"], split["decode_gpu"]]
         svc.gpu_index = split["decode_gpu"]
+    if a.engine == "strata" and not groups and not split:    # helper / peer cards too, so the Monitor samples them
+        roles = {}
+        base = list(svc.gpu_indices or [svc.gpu_index])
+        for card, role in helper_gpus(cfg, env):
+            if card not in base:
+                base.append(card)
+                roles[card] = role
+        if len(base) > len(svc.gpu_indices or []):
+            svc.gpu_indices = base
+            print("[strata] Monitor: watching " + ", ".join(
+                f"GPU {c} ({roles.get(c, 'main')})" for c in base) + " (as nvidia-smi numbers them)", flush=True)
     svc.terminal_visibility_order = visible_device_order(env, cfg.get("backend")) if a.engine == "strata" else []
     svc.terminal_topology_mode = ("replicas (configured)" if a.engine == "strata" and groups
                                   else "split serve (configured)" if a.engine == "strata" and split
