@@ -152,7 +152,7 @@ jobs:
           powershell.exe -NoProfile -NonInteractive -Command "Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID | ConvertTo-Json -Compress"
           "exit $LASTEXITCODE"
           "--- the host's hardware probe (app/host/server/hardware.mjs detect)"
-          node -e "import('./apps/host/server/hardware.mjs').then(m => m.detect({ force: true })).then(h => console.log(JSON.stringify({ cpu: h.cpu, gpus: h.gpus })), e => console.log('ERROR', e && e.stack))"
+          node -e "import('./app/host/server/hardware.mjs').then(m => m.detect({ force: true })).then(h => console.log(JSON.stringify({ cpu: h.cpu, gpus: h.gpus })), e => console.log('ERROR', e && e.stack))"
           "--- terminal/setup.py cpu_info (powershell Get-CimInstance Win32_Processor)"
           python -c "import sys; sys.path.insert(0, 'terminal'); import setup; print(repr(setup.cpu_info()))"
       # tools/check finds Visual Studio's compiler itself (vcvars64.bat); bash is Git for Windows' (the tester-README tests need it)
