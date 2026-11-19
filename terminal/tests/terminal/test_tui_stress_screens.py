@@ -106,7 +106,7 @@ class FolderScreen(Base):
         async def case(app, pilot, ctx):
             await press(pilot, *("enter",) * 7, "n", "enter")
             t = flat(app)
-            self.assertIn("Storage", t)
+            self.assertIn("Strata data", t)
             folder = Path(ctx.default_folder())
             # the end of the path: a long one is shortened in the middle on the screen (macOS: /private/var/folders/...)
             self.assertIn(folder.parent.name + os.sep + folder.name, t)
