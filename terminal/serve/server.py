@@ -598,6 +598,12 @@ class ConvCacheLog:
     """#596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
     cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
     which is the log): read on from where it was last read, from the start of the engine's current run."""
+    # #879: these two completed recovery messages follow ConversationCache::clear(), which removes every parked
+    # entry and its retained K/V.  Keep history counters: the clear is not a cache park or restore event.
+    CLEARED = re.compile(
+        r"strata serve: after non-finite logits \(#879\): (?:the restored session replaces the live one; dropped \d+ parked "
+        r"conversations?|dropped the live session, \d+ checkpoints?, \d+ parked conversations? and \d+ idle slots? "
+        r"\(\d+ running slots? not kept after their reply\); reading this prompt from token 0)$")
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
@@ -655,6 +661,8 @@ class ConvCacheLog:
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
             if "conversation cache:" not in line:
+                if self.CLEARED.fullmatch(line):
+                    self.state["parked"] = self.state["bytes"] = 0
                 continue
             m = self.EVENT.search(line)
             if m:
