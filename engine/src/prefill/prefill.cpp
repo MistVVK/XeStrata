@@ -193,7 +193,9 @@ void quantize_act_native(const float*, int64_t, int64_t, void*, void*) {}
 void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
                     float*, void*) {}
 bool native_wide() { return false; }
+#if !defined(STRATA_GPU_METAL)   // (the Metal engine has its own want_dm_f16: metal/src/engine/stubs_prompt_f16.cpp)
 void want_dm_f16(bool) {}   // STRATA_PF_DM16: prefill.cpp calls these; moe_fused_iq.cu is not built here
+#endif
 bool dm_f16_used() { return false; }
 void experts_native(const WideBatch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
                     float*, void*) {}
