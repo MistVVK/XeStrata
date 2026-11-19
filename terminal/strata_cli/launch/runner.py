@@ -857,6 +857,7 @@ class Runner:
         self.restart = restart                # --restart: a server that serves other choices (or holds this port) is stopped and replaced without asking
         self.confirm_restart = confirm_restart  # the screens: asked (question, detail) once; True = restart. None (no screens) and no --restart: refuse in one line
         self._stop_first: list[str] = []      # other launch profiles that hold this port; stopped before the measuring and the start
+        self._stop_own: str | None = None     # this launch's own running server, when the restart replaces it: stopped before the model is prepared (#5625)
         self.retune = retune                  # --retune: measure again even when a tuning result for this model on this computer is stored
         self.move_data = move_data            # --move-data / the answer "move": the model files already here go to the new --data-dir
         self.confirm = confirm                # asked (title, text) before a model is downloaded with no engine; True = go on
@@ -2373,8 +2374,26 @@ class Runner:
                 raise LaunchError(f"A model is already running: {what}. These choices are different.",
                                   "Add --restart to stop it and start these, or run `strata launch --stop` first.", 6)
         self._stop_first = [r["profile"] for r in same_port]
+        self._stop_own = own["profile"] if own and not self.retune else None
         self.checked()
         return None
+
+    def stop_before_setup(self) -> None:
+        """#5625: a restart replaces the running server, and the model's preparation test needs the graphics memory that server holds: run with it
+        still up, the test failed with a false "not enough VRAM" and the restart was dropped. Whatever the restart replaces is stopped first,
+        after the engine is here and before the model is prepared. Nothing runs when no restart was decided."""
+        from strata_control import runtime
+        from strata_control.profiles import ProfileError
+        self.stop_others()
+        name, self._stop_own = self._stop_own, None
+        if not name:
+            return
+        self.emit("start", f"Stopping {name[7:]} first: it holds the graphics memory the model's preparation needs…", None)
+        try:
+            runtime.stop(name, timeout=120)
+            acc.stop_tunnel(name)
+        except ProfileError as e:
+            raise LaunchError(f"The running server {name[7:]} could not be stopped: {e}.", "Run `strata launch --stop` first.", 6) from None
 
     def checked(self) -> None:
         cb, self.after_check = self.after_check, None
@@ -2986,6 +3005,9 @@ class Runner:
                 self.say_last_run()                          # 0217 item 7: what happened to the last run is on the screen, not only in the server log
             self.ensure_engine()
             self.check_cancel()
+            if start:
+                self.stop_before_setup()
+                self.check_cancel()
             base = self.ensure_model()
             self.check_cancel()
             self.ensure_drafter(base)
