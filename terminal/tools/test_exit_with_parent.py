@@ -37,7 +37,7 @@ class ExitWithParent(unittest.TestCase):
         child_code = ("import sys,time; sys.path.insert(0, %r); import exit_with_parent as E; E.exit_with_parent(poll=0.2); "
                       "print('up', flush=True); time.sleep(60)" % str(HERE))
         parent_code = ("import subprocess,sys,os; env=dict(os.environ, STRATA_EXIT_WITH_PARENT='1'); "
-                       "p=subprocess.Popen([sys.executable,'-c',%r], env=env, stdout=subprocess.PIPE, text=True); "
+                       "p=subprocess.Popen([sys.executable,'-c',%r], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True); "
                        "print(p.pid, flush=True); p.stdout.readline(); print('ready', flush=True); sys.stdout.flush(); os._exit(0)" % child_code)
         r = subprocess.Popen([sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True)
         pid = int(r.stdout.readline())
@@ -61,7 +61,7 @@ class ExitWithParent(unittest.TestCase):
         child_code = ("import sys,time; sys.path.insert(0, %r); from strata_control.parentwatch import exit_with_parent as w; w(poll=0.2); "
                       "print('up', flush=True); time.sleep(60)" % str(root))
         parent_code = ("import subprocess,sys,os; env=dict(os.environ, STRATA_EXIT_WITH_PARENT='1'); "
-                       "p=subprocess.Popen([sys.executable,'-c',%r], env=env, stdout=subprocess.PIPE, text=True); "
+                       "p=subprocess.Popen([sys.executable,'-c',%r], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True); "
                        "print(p.pid, flush=True); p.stdout.readline(); print('ready', flush=True); sys.stdout.flush(); os._exit(0)" % child_code)
         r = subprocess.Popen([sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True)
         pid = int(r.stdout.readline())

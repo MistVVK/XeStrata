@@ -33,7 +33,10 @@ def exit_with_parent(env=None, poll=1.5):
     def watch():
         while not gone():
             time.sleep(poll)
-        os.write(2, b"the process that started this step has ended: stopping\n")
+        try:
+            os.write(2, b"the process that started this step has ended: stopping\n")
+        except Exception:                                        # noqa: BLE001 - the stream may be a pipe to a process that is gone: the write fails, the exit must not
+            pass
         os._exit(1)
     threading.Thread(target=watch, daemon=True).start()
     return True

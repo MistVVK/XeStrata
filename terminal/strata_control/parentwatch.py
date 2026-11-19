@@ -36,7 +36,10 @@ def exit_with_parent(env=None, poll: float = 1.5) -> bool:
     def watch():
         while not gone():
             time.sleep(poll)
-        os.write(2, b"the program that started this one has ended: stopping\n")
+        try:
+            os.write(2, b"the program that started this one has ended: stopping\n")
+        except Exception:                                        # noqa: BLE001 - stderr is usually a pipe to the host that is gone: the write fails, the exit must not
+            pass
         os._exit(1)
     threading.Thread(target=watch, daemon=True).start()
     return True
