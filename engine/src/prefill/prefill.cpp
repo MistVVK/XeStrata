@@ -479,13 +479,16 @@ inline strata::prefill::switch_point::Card sp_card() {
 }
 // STRATA_PREFILL_CPU_SHARE_AUTO (BW-H): the link-aware limit and expert width of the default-armed share (share_rules.hpp link_rule).  Unset: on for the class measured (CUDA, discrete, one card,
 // start-up link probe ran, compute capability 12.0); 1: on for any CUDA card; any other value (0): off, the share keeps its limit 3,072 and its 8-token experts.
+inline int link_rule_env() {
+    static const int env = [] { const char* v = std::getenv("STRATA_PREFILL_CPU_SHARE_AUTO"); return strata::prefill::share_rules::env_state(v); }();
+    return env;
+}
 inline bool link_rule_on() {
 #if defined(STRATA_USE_HIP) || defined(__HIPCC__) || defined(STRATA_HIP_GFX906)
     return false;
 #else
-    static const int env = [] { const char* v = std::getenv("STRATA_PREFILL_CPU_SHARE_AUTO"); return strata::prefill::share_rules::env_state(v); }();
     if (!switch_point_known()) return false;   // the card's counts have not arrived: a single card, no batch slots only
-    return strata::prefill::share_rules::link_rule_enabled(true, !g_sp_integrated, g_sp_link_gbps > 0.0, g_sp_cc_major, g_sp_cc_minor, env);
+    return strata::prefill::share_rules::link_rule_enabled(true, !g_sp_integrated, g_sp_link_gbps > 0.0, g_sp_cc_major, g_sp_cc_minor, link_rule_env());
 #endif
 }
 // A build without MMQ (STRATA_PF_OWN_ONLY) loading a pack that is not a native one (the AVX-512 Q2_0 pack) whose layers the plan marks fused (mmq_plan(): `!lay.native && fused::enabled()`).
@@ -3725,6 +3728,27 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
         g_own_line.mark_ready();
     }
     own_only_line_flush();
+#endif
+}
+
+// BW-H: a layer split arms the default share only where the link rule raises the limit above 3,072 (the stream floor summed over the stages is large: a slow link in the chain); a split of fast links keeps the
+// share off, as before.  Call before arm_cpu_share (whose tail takes the limit as the stream floor).  Returns whether it armed.
+bool Prefill::arm_cpu_share_split(bool applies, double floor_ms, int pool_workers, bool all_cc120) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    if (!applies || cpu_share_explicit() != -2.0 || g_share_default) return false;
+    if (!strata::prefill::share_rules::link_rule_enabled(true, true, true, all_cc120 ? 12 : 0, 0, link_rule_env())) return false;
+    const auto r = strata::prefill::share_rules::link_rule_floor(floor_ms, pool_workers);
+    if (!r.arm || r.limit <= strata::prefill::share_rules::kShareLimitNew) return false;
+    g_share_default = true;
+    g_share_limit_arch = r.limit;
+    g_share_nt_arch = r.nt;
+    std::fprintf(stderr, "prefill: CPU share rule on a layer split: the stages' links need %.0f ms to stream the experts the cards do not hold, %d pool workers: the CPU share is ON by default for chunks up to %lld tokens, "
+                         "experts of up to %d tokens go to the CPU. STRATA_PREFILL_CPU_SHARE_AUTO=0 keeps the share off on a split; STRATA_PREFILL_CPU_SHARE=0 turns it off.\n",
+                 floor_ms, pool_workers, (long long) r.limit, std::max<int>(r.nt, (int) strata::kernels::cpu::MAXT));
+    return true;
+#else
+    (void) applies; (void) floor_ms; (void) pool_workers; (void) all_cc120;
+    return false;
 #endif
 }
 

@@ -309,6 +309,9 @@ public:
     /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
+    /// BW-H: a layer split (before arm_cpu_share): arms the default share with the link rule when `floor_ms` (the stages' stream floors summed, share_rules.hpp link_rule_floor) raises the limit above 3,072;
+    /// STRATA_PREFILL_CPU_SHARE_AUTO=0 or an explicit STRATA_PREFILL_CPU_SHARE leave it as it was.  `all_cc120`: every stage's card is compute capability 12.0 (the class measured; =1 asks for any).
+    static bool arm_cpu_share_split(bool applies, double floor_ms, int pool_workers, bool all_cc120);
     /// STRATA_PREFILL_CPU_SHARE_BATCH=1 (batch slots beside the pool): set before each read - true while a slot decodes
     /// (its windows use the pool), so no chunk of that read takes the share; false lets the read's chunks take it.
     static void set_share_blocked(bool blocked);

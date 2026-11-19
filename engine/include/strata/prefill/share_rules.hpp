@@ -69,18 +69,22 @@ constexpr double kLinkPoolRef = 22.0;          // the pool the 3.4 was measured 
 inline double link_pool_factor(int workers) {
     return workers > 0 ? std::min(1.0, std::pow((double) workers / kLinkPoolRef, 0.15)) : 1.0;
 }
-inline LinkRule link_rule(const LinkRuleIn& in) {
+/// The rule from the stream floor F (ms) itself: one card's F is (experts not on it) x blob / link; a layer split's is the sum over its stages, because a chunk passes through every stage in turn.
+inline LinkRule link_rule_floor(double f, int pool_workers) {
     LinkRule r;
-    if (!(in.link_gbps > 0.0) || in.total <= 0 || in.resident < 0 || in.resident >= in.total || !(in.blob_mb > 0.0)) return r;
-    r.floor_ms = (double) (in.total - in.resident) * in.blob_mb / in.link_gbps;
-    const double f = r.floor_ms;
+    if (!(f > 0.0)) return r;
+    r.floor_ms = f;
     const double t = f <= kLinkKneeMs ? kLinkTokensPerFloorMs * f : kLinkTokensPerFloorMs * kLinkKneeMs + kLinkTokensPerMsAbove * (f - kLinkKneeMs);
-    int64_t lim = (int64_t) (t * link_pool_factor(in.pool_workers)) / kShareLimitGrid * kShareLimitGrid;
+    int64_t lim = (int64_t) (t * link_pool_factor(pool_workers)) / kShareLimitGrid * kShareLimitGrid;
     lim = std::min<int64_t>(kShareLimitMax, std::max<int64_t>(kShareLimitNew, lim));
     r.limit = lim;
     r.nt = lim > kShareLimitNew ? (f >= kLinkWideFloorMs ? kLinkNtWide : kLinkNt) : 0;
     r.arm = true;
     return r;
+}
+inline LinkRule link_rule(const LinkRuleIn& in) {
+    if (!(in.link_gbps > 0.0) || in.total <= 0 || in.resident < 0 || in.resident >= in.total || !(in.blob_mb > 0.0)) return LinkRule{};
+    return link_rule_floor((double) (in.total - in.resident) * in.blob_mb / in.link_gbps, in.pool_workers);
 }
 /// STRATA_PREFILL_CPU_SHARE_AUTO as the engine reads it: -1 unset (or empty), 1 for exactly "1", 0 for any other value.
 inline int env_state(const char* v) {
