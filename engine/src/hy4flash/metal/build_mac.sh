@@ -27,7 +27,7 @@ if [ "$T" = mmb ] || [ "$T" = all ]; then
   clang++ $CXXF $INC $S/src/hy4flash/metal/hy4_mm_bench.cpp $O/mtl_rt.o $FW -o $O/hy4_mm_bench
 fi
 if [ "$T" = run ] || [ "$T" = all ]; then
-  clang++ $CXXF $INC $S/src/hy4flash/metal/hy4_metal_main.cpp $S/src/hy4flash/metal/hy4_engram.cpp $S/src/hy4flash/metal/strata_reader_nozstd.cpp $O/mtl_rt.o $FW -lpthread -o $O/strata-hy4-metal
+  clang++ $CXXF $INC $S/src/hy4flash/metal/hy4_metal_main.cpp $S/src/hy4flash/run/hy4_engram.cpp $S/src/hy4flash/metal/strata_reader_nozstd.cpp $O/mtl_rt.o $FW -lpthread -o $O/strata-hy4-metal
 fi
 if [ "$T" = cpu ] || [ "$T" = all ]; then
   # the CPU oracle (engine/src/hy4flash/cpu): no OpenMP on this Mac (omp_shim = single thread), no zstd (strata_reader_nozstd), the Arm tier of the quant layer
