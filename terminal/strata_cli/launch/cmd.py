@@ -571,6 +571,9 @@ def _can_ask() -> bool:
         return False
     if os.environ.get("CI") or os.environ.get("STRATA_NO_PROMPT"):
         return False
+    from strata_cli import noinput
+    if noinput.stdin_is_no_keyboard():                       # `strata launch < /dev/null`: no question that nobody can answer (0.2.17)
+        return False
     return bool(os.environ.get("MSYSTEM") or os.environ.get("TERM_PROGRAM") or os.environ.get("TERM") or os.environ.get("WT_SESSION"))
 
 

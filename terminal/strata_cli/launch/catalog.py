@@ -562,7 +562,10 @@ class Catalog:
         for candidate, rule in ((own, "exact"), (lower, "lower")):
             if any(t["path"] == candidate for t in tried):
                 continue                                     # (a tag that is lower case already: one folder)
-            here = candidate.is_dir()
+            try:
+                here = candidate.is_dir()
+            except OSError:                                  # a parent this account may not read (PermissionError): not there, as far as it can tell
+                here = False
             tried.append({"path": candidate, "rule": rule, "exists": here})
             if here:
                 return {"folder": candidate, "rule": rule, "tried": tried}
