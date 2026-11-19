@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -525,6 +526,17 @@ struct VisionEncoder {
         gemm(st, vit::EPI_RES_SET_POS, d_pix, wh("vit.embeddings.patch_embedding.weight"), wf("vit.embeddings.patch_embedding.bias"), nullptr, d_x, d_pe, N, D, 768);
         if (dump) dump_x(st, "emb0", d_x, N, D);
         const float scale = 1.0f / sqrtf((float)(D / NH));
+        // HY4_VIT_PROF=1: wall time per stage (synchronises after every stage: only for measuring)
+        static const bool prof = getenv("HY4_VIT_PROF") != nullptr;
+        std::map<std::string, double> pacc;
+        double tlap = now_s();
+        auto lap = [&](const char* what) {
+            if (!prof) return;
+            HCK(hipStreamSynchronize(st));
+            const double t = now_s();
+            pacc[what] += t - tlap;
+            tlap = t;
+        };
         for (int il = 0; il < c.layers; ++il) {
             if (cancel && cancel->load()) {
                 err = "cancelled";
@@ -534,21 +546,27 @@ struct VisionEncoder {
             }
             const std::string p = "vit.layers." + std::to_string(il) + ".";
             hipLaunchKernelGGL(vit::k_ln, dim3(N), dim3(256), 0, st, d_x, wf(p + "input_layernorm.weight"), wf(p + "input_layernorm.bias"), d_h, D, c.eps);
+            lap("ln");
             gemm(st, vit::EPI_H, d_h, wh(p + "self_attn.q_proj.weight"), wf(p + "self_attn.q_proj.bias"), d_q, nullptr, nullptr, N, D, D);
             gemm(st, vit::EPI_H, d_h, wh(p + "self_attn.k_proj.weight"), wf(p + "self_attn.k_proj.bias"), d_k, nullptr, nullptr, N, D, D);
             if (use_wmma) {
 #if HY4_MMA && !HY4_CUDA
                 gemm(st, vit::EPI_VT, d_h, wh(p + "self_attn.v_proj.weight"), wf(p + "self_attn.v_proj.bias"), d_v, nullptr, nullptr, N, D, D, ldv);
+                lap("qkv gemm");
                 hipLaunchKernelGGL(vit::k_attn_w, dim3((N + 63) / 64, NH), dim3(128), 0, st, d_q, d_k, d_v, d_h, N, D, ldv, scale);
 #endif
             } else {
                 gemm(st, vit::EPI_H, d_h, wh(p + "self_attn.v_proj.weight"), wf(p + "self_attn.v_proj.bias"), d_v, nullptr, nullptr, N, D, D);
                 hipLaunchKernelGGL(vit::k_attn, dim3((N + 63) / 64, NH), dim3(64), 0, st, d_q, d_k, d_v, d_h, N, D, scale);
             }
+            lap("attention");
             gemm(st, vit::EPI_RES_ADD, d_h, wh(p + "self_attn.o_proj.weight"), wf(p + "self_attn.o_proj.bias"), nullptr, d_x, nullptr, N, D, D);
+            lap("o_proj gemm");
             hipLaunchKernelGGL(vit::k_ln, dim3(N), dim3(256), 0, st, d_x, wf(p + "post_attention_layernorm.weight"), wf(p + "post_attention_layernorm.bias"), d_h, D, c.eps);
             gemm(st, gelu_tanh_ffn ? vit::EPI_GELU_TANH : vit::EPI_GELU_ERF, d_h, wh(p + "mlp.dense_h_to_4h.weight"), wf(p + "mlp.dense_h_to_4h.bias"), d_ff, nullptr, nullptr, N, FF, D);
+            lap("fc1 gemm+ln");
             gemm(st, vit::EPI_RES_ADD, d_ff, wh(p + "mlp.dense_4h_to_h.weight"), wf(p + "mlp.dense_4h_to_h.bias"), nullptr, d_x, nullptr, N, D, FF);
+            lap("fc2 gemm");
             if (dump) dump_x(st, "L" + std::to_string(il), d_x, N, D);
         }
         // adapter
@@ -557,6 +575,12 @@ struct VisionEncoder {
         gemm(st, vit::EPI_F32_ROWMAP, d_mid, wh("vit.perceive.proj.2.weight"), wf("vit.perceive.proj.2.bias"), nullptr, rows_out, nullptr, M2, OD, D * 4, ow);
         hipLaunchKernelGGL(vit::k_fill_newline, dim3(oh), dim3(256), 0, st, rows_out, wf("vit.perceive.image_newline"), oh, ow, OD);
         HCK(hipStreamSynchronize(st));
+        if (prof) {
+            lap("adapter");
+            std::string line = "[vit prof] ";
+            for (auto& kv : pacc) line += kv.first + " " + std::to_string(kv.second).substr(0, 5) + " s, ";
+            fprintf(stderr, "%s\n", line.c_str());
+        }
         free_ws();
         return true;
     }
