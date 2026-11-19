@@ -138,6 +138,14 @@ JSON +9.3%, agent turn +12.5%; the other sets are not measured),
 and the Q8_0 hyper-connection read. `STRATA_HC_Q8=0` in the config's `env` gives the exact BF16 read. The Mac engine is
 deterministic: two runs give identical numbers.
 
+### Longer context (`--rope-scaling`)
+
+`--rope-scaling linear|yarn` with `--rope-scale`, `--rope-freq-scale` and the `--yarn-*` options changes the RoPE table of the
+attention, as on a PC. Flash-Next is trained to 262,144 tokens: `--context 524288 --rope-scaling yarn --rope-scale 2` gives it
+512K. The table keeps the model file's frequency base, and the engine logs the table it built (`rope scaling yarn in the window
+table: ...`). Without `--rope-scaling` the table is the original one, bit for bit. The DFlash2 drafter keeps its own unscaled
+table: it only proposes tokens, so the scaling changes how many it gets accepted, not the output.
+
 ### Gyro-S and Gyro-M (agentionai's trellis experts)
 
 The Mac engine runs [Gyro](GYRO.md). The routed experts are trellis-coded blocks (ggml types TQ2_T, TQK6, TQK7) in a
