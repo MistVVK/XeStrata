@@ -403,9 +403,11 @@ kernel void linear_sk(device const uchar* W [[buffer(0)]], device const half* X 
             sk_w8<F>(blk, g, j, w);
             for (int mm = 0; mm < MT; ++mm) {
                 if (m0 + mm < M) {
-                    device const half* xp = X + (size_t) (m0 + mm) * K + sbi * 256 + j;
+                    device const half4* xp = (device const half4*) (X + (size_t) (m0 + mm) * K + sbi * 256 + j);
+                    const float4 xa = float4(xp[0]), xb = float4(xp[1]);
                     float a = 0.f;
-                    for (int t = 0; t < 8; ++t) a += w[t] * float(xp[t]);
+                    a += w[0] * xa.x; a += w[1] * xa.y; a += w[2] * xa.z; a += w[3] * xa.w;
+                    a += w[4] * xb.x; a += w[5] * xb.y; a += w[6] * xb.z; a += w[7] * xb.w;
                     acc[mm] += a;
                 }
             }
