@@ -377,6 +377,12 @@ MODEL_TERMS: dict[str, dict] = {
 }
 
 
+# Sync's packs and common weights use the base model's terms; setup pins the same license text for About.
+for _sync_repo in ("hiru2005/Sync-XS", "hiru2005/Sync-S", "sync-strata/Sync-M", "hiru2005/Sync-shared"):
+    MODEL_TERMS[_sync_repo] = {"license": "Qwen Community License 1.0", "card": None,
+                               "texts": MODEL_TERMS["ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"]["texts"]}
+
+
 HF_DEFAULT = download_core.HF_DEFAULT
 
 
@@ -1327,6 +1333,8 @@ FAMILIES["sync"] = {"title": "Qwen3.8-Flash-Next (Sync)", "by": "Sync packs by h
                     "about": "Sync-XS, Sync-S and Sync-M pre-built packs",
                     "hf": hf("hiru2005/Sync-XS"), "file": "", "tag": "sync-",
                     "name": "qwen3.8-flash-next-sync", "vision": True,
+                    "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+                    "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
                     "license": "Qwen Community License 1.0: https://huggingface.co/hiru2005/Sync-XS"}
 # Edge0's latent MoE (the Qwen3.8-Flash-Next engine with the experts at a latent width): a pre-built pack, its own
 # install path (setup_edge0).  Listed for --family edge0; the models are the two sizes in Q3_K and NVFP4, each from
@@ -1738,6 +1746,10 @@ def family_repos(family: str, model: str | None = None) -> list[tuple[str, str]]
     from, as (role, repository): "model" and "mmproj".  About > Model terms reads their MODEL_TERMS."""
     fam = FAMILIES.get(family) or {}
     out: list[tuple[str, str]] = []
+    if family == "sync":
+        repos = SYNC_REPOS.values() if model is None else (SYNC_REPOS[model],)
+        return [("model", r) for r in repos] + [
+            ("model", "hiru2005/Sync-shared"), ("mmproj", "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")]
     if fam.get("plain"):
         for m, d in fam.get("models", {}).items():
             if model is None or m == model:
@@ -9933,6 +9945,24 @@ SYNC_REPOS = {"Sync-XS": "hiru2005/Sync-XS", "Sync-S": "hiru2005/Sync-S",
               "Sync-M": "sync-strata/Sync-M"}
 
 
+def verify_sync_file(dst: Path, size: int, expected: str) -> None:
+    """Check a Sync file without trusting another download's finish mark."""
+    if not dst.is_file() or dst.stat().st_size != size:
+        fail(f"{dst} does not have the pinned size", "the file was left in place; check it and retry")
+    # This mark is keyed on path, size and mtime, and is written only after the direct read.
+    kept = _kept_mark(dst)
+    direct_mark = kept.with_name(kept.name + ".sync-direct") if kept else None
+    if direct_mark and direct_mark.is_file() and direct_mark.read_text(encoding="utf-8") == expected:
+        return
+    say(f"  checking {dst.name} against the pinned SHA-256 ...")
+    actual = sync_models.sha256(dst, size)
+    if actual != expected:
+        fail(f"{dst} has SHA-256 {actual}, expected {expected}", "the file was left in place; check it")
+    if direct_mark:
+        direct_mark.parent.mkdir(parents=True, exist_ok=True)
+        direct_mark.write_text(expected, encoding="utf-8")
+
+
 def fetch_sync_files(models_dir: Path, model: str) -> tuple[Path, Path]:
     """Fetch the selected pack and the shared files once, checking the pinned manifest hashes."""
     root = models_dir / "sync"
@@ -9945,22 +9975,91 @@ def fetch_sync_files(models_dir: Path, model: str) -> tuple[Path, Path]:
             dst = folder / rel
             if not dst.exists():
                 download_file(hf(repo) + rel, dst, rel)
-            if not dst.is_file() or dst.stat().st_size != size:
-                fail(f"{dst} does not have the pinned size", "the file was left in place; check it and retry")
-            # Unlike a sidecar .done, this mark is keyed on path, size and mtime.  It is written only after the
-            # direct read, so setup reuses stage 0's files and never trusts an unrelated download's mark.
-            kept = _kept_mark(dst)
-            direct_mark = kept.with_name(kept.name + ".sync-direct") if kept else None
-            if direct_mark and direct_mark.is_file() and direct_mark.read_text(encoding="utf-8") == expected:
-                continue
-            say(f"  checking {dst.name} against the Sync manifest (SHA-256) ...")
-            actual = sync_models.sha256(dst, size)
-            if actual != expected:
-                fail(f"{dst} has SHA-256 {actual}, expected {expected}", "the file was left in place; check it")
-            if direct_mark:
-                direct_mark.parent.mkdir(parents=True, exist_ok=True)
-                direct_mark.write_text(expected, encoding="utf-8")
+            verify_sync_file(dst, size, expected)
     return pack, shared
+
+
+def setup_sync(a, family: str, model: str, gpu: dict, sel: list, found: list, gpu_chosen: bool, ram: float,
+               roots: list, port: int, adopted: Path | None, ctx: int, kv: str, vision: str, low_ram: bool,
+               resident: bool, scaling: str | None, rope_scale: float | None) -> int:
+    """Install a pinned Sync pack without converting its already packed experts or MTP layer."""
+    if a.gguf_dir or a.custom:
+        fail("Sync is a pre-built pack, not a GGUF supplied with --gguf-dir", "use --models-dir for its files")
+    if len(sel) > 1:
+        fail("Sync packs run on one GPU", "choose one card with --gpu")
+    if a.drafting not in (None, "auto", "mtp", "off"):
+        fail(f"--drafting {a.drafting} is not available for Sync", "choose auto, mtp or off")
+    fam = FAMILIES[family]
+    tag = fam["tag"] + model
+    _, eng, lib_dirs = prepare_engine(a, gpu)
+    step(5, f"downloading {model}")
+    pack, shared = fetch_sync_files(Path(a.models_dir), model)
+    model_terms.fetch([SYNC_REPOS[model], "hiru2005/Sync-shared"], say=warn, timeout=30, terms=MODEL_TERMS)
+    native = shared / "native-gguf" / "Qwen3.8-Flash-Next-Sync-common.gguf"
+    args = ["--pack", str(pack), "--native", str(native), "--ple-gguf", str(native),
+            "--mtp", str(shared / "mtp-rt"), "--expert-profile", str(ROOT / "data" / "expert-profile.bin"),
+            "--expert-cache", "auto", "--prefill", "auto", "--spec", "auto", "--spec-min-p", "0.5",
+            "--max-context", str(ctx)]
+    if a.drafting == "off":
+        args += ["--draft", "off"]
+    if scaling is not None:
+        assert rope_scale is not None
+        args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
+    if ctx > 8192:
+        args += ["--kv", kv]
+    if low_ram:
+        args += ["--resident-experts" if resident else "--mmap-experts"]
+    if a.resident_budget_gib is not None:
+        args += ["--resident-budget-gib", f"{a.resident_budget_gib:g}"]
+    if a.ple_io and a.ple_io != "auto":
+        set_ple_io(args, a.ple_io)
+    if vision != "none":
+        args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
+    if a.vram_reserve_mib is not None:
+        if "--vram-reserve-mib" in args:
+            args[args.index("--vram-reserve-mib") + 1] = str(a.vram_reserve_mib)
+        else:
+            args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
+    args += ram_reserve_args(a)
+    cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
+                           "tokenizer": str(shared / "tokenizer"), "model_name": served_name(family, model),
+                           "aliases": [model, model.lower()], "family": family,
+                           "log": str(STATE / f"xestrata-{tag.lower()}.log"),
+                           "lib_dirs": lib_dirs, "port": port, "model_gb": MODELS[model]["download_gb"],
+                           "experts_gb": MODELS[model]["arena_gb"]}
+    if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
+        cfg["gpu_pci"] = gpu["pci"]
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if a.browser is not None:
+        cfg["open_browser"] = a.browser
+    if a.parallel is not None:
+        cfg["parallel"] = max(1, a.parallel)
+    if vision != "none":
+        mmproj = Path(a.models_dir) / fam["mmproj"]
+        if not mmproj.exists():
+            mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
+        if not mmproj.exists():
+            download(fam["mmproj_hf"] + fam["mmproj"], mmproj)
+        size, sha = file_pin(fam["mmproj_hf"] + fam["mmproj"])
+        verify_sync_file(mmproj, size, sha)
+        vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
+        cpu_enc = {"exe": str(eng / VISION_EXE), "gpu": False,
+                   "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"], "threads": vision_threads()}
+        cfg["vision"] = {"mmproj": str(mmproj), "model": str(native), **cpu_enc}
+        if vision == "gpu":
+            cfg["vision"] = {"mmproj": str(mmproj), "model": str(native), "exe": str(eng / VISION_EXE),
+                             "gpu": True, "gpu_pci": gpu["pci"], "max_tokens": vt, "fallback": cpu_enc}
+    if a.images:
+        got = setup_images(a, gpu, Path(a.models_dir), eng, text_ram_gb(args, ram, model))
+        cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
+        place_images(a, cfg)
+        if not cfg["image_models"]:
+            cfg["image_models"] = None
+    setup_translate(a, cfg, CONF / f"xestrata-{tag.lower()}.json", text_ram_gb(args, ram, model))
+    return finish_setup(a, cfg, tag, port, adopted, vision != "none")
 
 
 def setup_edge0(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
@@ -10689,7 +10788,7 @@ def main() -> int:
             ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
         if a.low_ram not in ("auto", "off"):
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
-    elif a.resident_budget_gib is not None:
+    elif a.resident_budget_gib is not None and family != "sync":
         warn(f"--resident-budget-gib is for UD-Q4_K_XL and UD-IQ4_XS: {model} keeps all of its experts in RAM or in "
              "the low-RAM mode")
     low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
@@ -10837,6 +10936,9 @@ def main() -> int:
         ok("experimental speed projection: " + ("ON (experimental)" if esp else "off"))
     elif esp_choice.lower() not in ("", "off", "no", "n", "0"):
         warn(f"the experimental speed projection cannot be used with {fam['title']}: left off")
+    if family == "sync":
+        return setup_sync(a, family, model, gpu, sel, found, gpu_chosen, ram, roots, port, adopted, ctx, kv, vision,
+                          low_ram, resident, scaling, rope_scale)
     own = bool(a.gguf_dir or a.custom)                 # the person's own files: never downloaded, deleted or marked
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     shards = gguf_dir_shards(models_dir, fam, model) if a.gguf_dir else \
