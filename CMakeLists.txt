@@ -1875,7 +1875,8 @@ if(STRATA_NATIVE_EXPERTS)
   set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
   set_source_files_properties(src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp
                               PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-  set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
+  set_property(SOURCE src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/tq_avx2.cpp
+               APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
   if(STRATA_BUILD_TESTS)

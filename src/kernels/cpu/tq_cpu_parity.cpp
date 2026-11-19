@@ -563,10 +563,11 @@ int bench(bool quick, const std::string& only) {
 
 // A small in-memory R1Q2 pack: independent bit-at-a-time state decoding and FP64 dequantization.
 int check_bih3_r1q2() {
-    constexpr int rows = 7, nt = 3;
+    constexpr int rows = 7, nt = 8;
     std::mt19937 rng(42019);   // NOLINT(bugprone-random-generator-seed): repeatable parity fixture
     double worst = 0;
     int failures = 0;
+    int checked[4] = {};
     for (int k = 2; k <= 14; ++k) for (int n : {128, 384, 640}) {
         const int nb = n / 128;
         const size_t rb = (size_t) nb * 4 * (size_t) k, qb = (size_t) (nb + 3) / 4;
@@ -591,13 +592,28 @@ int check_bih3_r1q2() {
         float got[nt][rows] = {}, gate[nt][rows] = {}, up[nt][rows] = {}, gu[nt][rows] = {};
         float* op[nt], *gp[nt], *uptr[nt], *fp[nt];
         for (int t = 0; t < nt; ++t) { op[t] = got[t]; gp[t] = gate[t]; uptr[t] = up[t]; fp[t] = gu[t]; }
-        tq_bih3_r1q2_rows(180 + k, blob.data(), rb, n, ap, nt, gp, 0, rows, sc);
-        tq_bih3_r1q2_rows(180 + k, blob.data() + rb * rows, rb, n, ap, nt, uptr, 0, rows, sc);
-        tq_bih3_r1q2_gu_rows(180 + k, blob.data(), rb, rb * rows, n, ap, nt, fp, 0, rows, sc, sc);
+        tq_bih3_r1q2_rows_isa(Bih3Isa::scalar, 180 + k, blob.data(), rb, n, ap, nt, gp, 0, rows, sc);
+        tq_bih3_r1q2_rows_isa(Bih3Isa::scalar, 180 + k, blob.data() + rb * rows, rb, n, ap, nt, uptr, 0, rows, sc);
+        tq_bih3_r1q2_gu_rows_isa(Bih3Isa::scalar, 180 + k, blob.data(), rb, rb * rows, n, ap, nt, fp, 0, rows, sc, sc);
+        for (Bih3Isa isa : {Bih3Isa::avx2, Bih3Isa::avxvnni, Bih3Isa::avx512vnni}) {
+            if (!bih3_isa_ok(isa)) continue;
+            for (int group = 1; group <= nt; ++group) {
+                tq_bih3_r1q2_rows_isa(isa, 180 + k, blob.data(), rb, n, ap, group, op, 0, rows, sc);
+                for (int t = 0; t < group; ++t) {
+                    if (!same_bits(got[t], gate[t], rows)) ++failures;
+                    checked[(int) isa] += rows;
+                }
+                tq_bih3_r1q2_gu_rows_isa(isa, 180 + k, blob.data(), rb, rb * rows, n, ap, group, op, 0, rows, sc, sc);
+                for (int t = 0; t < group; ++t) {
+                    if (!same_bits(got[t], gu[t], rows)) ++failures;
+                    checked[(int) isa] += rows;
+                }
+            }
+        }
         // Exercise split row ranges and token grouping as used by the pool.
         for (int t = 0; t < nt; ++t) {
-            tq_bih3_r1q2_rows(180 + k, blob.data(), rb, n, ap + t, 1, op + t, 0, 3, sc);
-            tq_bih3_r1q2_rows(180 + k, blob.data(), rb, n, ap + t, 1, op + t, 3, rows, sc);
+            tq_bih3_r1q2_rows_isa(bih3_isa(), 180 + k, blob.data(), rb, n, ap + t, 1, op + t, 0, 3, sc);
+            tq_bih3_r1q2_rows_isa(bih3_isa(), 180 + k, blob.data(), rb, n, ap + t, 1, op + t, 3, rows, sc);
             if (!same_bits(got[t], gate[t], rows)) ++failures;
         }
         const uint32_t mul[4] = {0x9e3779b1u, 0x85ebca6bu, 0xc2b2ae35u, 0x27d4eb2fu};
@@ -642,7 +658,43 @@ int check_bih3_r1q2() {
         }
     }
     std::printf("bih3 R1Q2 scalar vs FP64: worst normalized error %.3g, %d failures\n", worst, failures);
+    for (Bih3Isa isa : {Bih3Isa::avx2, Bih3Isa::avxvnni, Bih3Isa::avx512vnni})
+        std::printf("bih3 R1Q2 %s vs scalar: %d row results %s\n", bih3_isa_name(isa), checked[(int) isa],
+                    bih3_isa_ok(isa) ? "checked bitwise" : "skipped (ISA unavailable)");
     return failures;
+}
+
+// In-cache R1Q2 rows, alternating ISA variants to reduce clock and thermal bias.
+int bench_bih3() {
+    constexpr int n = 2560, rows = 128, k = 8, nb = n / 128;
+    const size_t rb = (size_t) nb * 4 * k, qb = (nb + 3) / 4;
+    std::mt19937 rng(51293);  // NOLINT(bugprone-random-generator-seed): repeatable inputs
+    std::vector<uint8_t> w(rows * rb), rowbase((size_t) rows * 2), colscale((size_t) nb * 2), q(rows * qb);
+    for (auto& v : w) v = (uint8_t) rng();
+    for (auto& v : q) v = (uint8_t) rng();
+    for (int i = 0; i < rows; ++i) { const uint16_t h = f2h(0.125f); std::memcpy(rowbase.data() + (size_t) i * 2, &h, 2); }
+    for (int i = 0; i < nb; ++i) { const uint16_t h = f2h(0.25f); std::memcpy(colscale.data() + (size_t) i * 2, &h, 2); }
+    TqR1q2Scales sc{rowbase.data(), colscale.data(), q.data(), qb, {0.5f, 0.75f, 1.f, 1.5f}};
+    std::vector<std::vector<uint8_t>> act;
+    const void* ap[kTqMaxTokens]; float values[kTqMaxTokens][rows] = {}, *op[kTqMaxTokens];
+    for (int t = 0; t < kTqMaxTokens; ++t) {
+        act.push_back(q8_0(make_x(n, 3100 + t))); ap[t] = act.back().data(); op[t] = values[t];
+    }
+    for (int nt : {1, 2, 4, 8}) {
+        std::vector<double> times[4];
+        for (int rep = 0; rep < 7; ++rep) for (int j = 0; j < 3; ++j) {
+            const Bih3Isa isa = (Bih3Isa) (1 + ((j + rep) % 3));
+            if (!bih3_isa_ok(isa)) continue;
+            const double t0 = now_us(); int count = 0; double elapsed;
+            do { tq_bih3_r1q2_rows_isa(isa, 180 + k, w.data(), rb, n, ap, nt, op, 0, rows, sc);
+                 ++count; elapsed = now_us() - t0; } while (elapsed < 50000.0);
+            times[(int) isa].push_back(elapsed / count / rows);
+        }
+        for (Bih3Isa isa : {Bih3Isa::avx2, Bih3Isa::avxvnni, Bih3Isa::avx512vnni})
+            if (bih3_isa_ok(isa)) std::printf("bih3 K=%d N=%d nt=%d %s median %.4f us/row (7 x 50 ms)\n",
+                                               k, n, nt, bih3_isa_name(isa), median(times[(int) isa]));
+    }
+    return 0;
 }
 
 }  // namespace
@@ -652,6 +704,7 @@ int main(int argc, char** argv) {
     if (!ggml_has_tq())
         std::printf("this ggml has no trellis types: the kernels are checked against each other only (the checks "
                     "against ggml-cpu need STRATA_GGML_DIR = the agention llama.cpp fork)\n");
+    if (argc >= 2 && std::strcmp(argv[1], "--bench-bih3") == 0) return bench_bih3();
     if (argc >= 2 && std::strcmp(argv[1], "--bench") == 0) {   // --bench [--quick] [--only <kernel name part>]
         bool quick = false;
         std::string only;

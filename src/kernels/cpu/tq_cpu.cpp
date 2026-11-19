@@ -249,13 +249,56 @@ uint32_t bih3_state(const uint8_t* code, int k, int step) {
 
 }  // namespace
 
-void tq_bih3_r1q2_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
-                        float* const* out, int r0, int r1, const TqR1q2Scales& scales) {
+bool bih3_isa_ok(Bih3Isa isa) {
+#if defined(STRATA_TQ_X86)
+    switch (isa) {
+        case Bih3Isa::avx512vnni: return cpu_avx512_ok();
+        case Bih3Isa::avxvnni: return cpu_avxvnni_ok();
+        case Bih3Isa::avx2: return cpu_avx2_ok();
+        case Bih3Isa::scalar: return true;
+    }
+#else
+    return isa == Bih3Isa::scalar;
+#endif
+    return false;
+}
+
+Bih3Isa bih3_isa() {
+    static const Bih3Isa isa = [] {
+        const char* e = strata::env_get("TQ_ISA");
+        const std::string cap = e == nullptr ? "" : e;
+        if (cap == "scalar") return Bih3Isa::scalar;
+        if (cap != "avx2" && cap != "avxvnni" && bih3_isa_ok(Bih3Isa::avx512vnni)) return Bih3Isa::avx512vnni;
+        if (cap != "avx2" && bih3_isa_ok(Bih3Isa::avxvnni)) return Bih3Isa::avxvnni;
+        return bih3_isa_ok(Bih3Isa::avx2) ? Bih3Isa::avx2 : Bih3Isa::scalar;
+    }();
+    return isa;
+}
+
+const char* bih3_isa_name(Bih3Isa isa) {
+    switch (isa) {
+        case Bih3Isa::avx512vnni: return "avx512vnni";
+        case Bih3Isa::avxvnni: return "avxvnni";
+        case Bih3Isa::avx2: return "avx2";
+        default: return "scalar";
+    }
+}
+
+void tq_bih3_r1q2_rows_isa(Bih3Isa isa, int type, const uint8_t* w, size_t row_bytes, int n,
+                            const void* const* act, int nt, float* const* out, int r0, int r1,
+                            const TqR1q2Scales& scales) {
     const int k = type - 180, nb = n / 128;
     if (k < 2 || k > 14 || n <= 0 || n > kTqMaxN || n % 128 || nt < 1 || nt > kTqMaxTokens ||
         r0 < 0 || r1 < r0 || row_bytes < (size_t) nb * 4 * (size_t) k ||
         scales.qbytes < (size_t) (nb + 3) / 4) std::abort();
+    if (!bih3_isa_ok(isa)) std::abort();
     const ActSet& a = unpack_all(act, n, nt);
+#if defined(STRATA_TQ_X86)
+    if (isa != Bih3Isa::scalar) {
+        tq_detail::bih3_rows_x86(isa, type, w, row_bytes, n, a.ptr, nt, out, r0, r1, scales);
+        return;
+    }
+#endif
     for (int r = r0; r < r1; ++r) {
         float acc[kTqMaxTokens][4] = {};
         const uint8_t* qr = scales.q + (size_t) r * scales.qbytes;
@@ -281,9 +324,14 @@ void tq_bih3_r1q2_rows(int type, const uint8_t* w, size_t row_bytes, int n, cons
     }
 }
 
-void tq_bih3_r1q2_gu_rows(int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n,
-                           const void* const* act, int nt, float* const* ff, int r0, int r1,
-                           const TqR1q2Scales& gate, const TqR1q2Scales& up) {
+void tq_bih3_r1q2_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                        float* const* out, int r0, int r1, const TqR1q2Scales& scales) {
+    tq_bih3_r1q2_rows_isa(bih3_isa(), type, w, row_bytes, n, act, nt, out, r0, r1, scales);
+}
+
+void tq_bih3_r1q2_gu_rows_isa(Bih3Isa isa, int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n,
+                               const void* const* act, int nt, float* const* ff, int r0, int r1,
+                               const TqR1q2Scales& gate, const TqR1q2Scales& up) {
     if (nt < 1 || nt > kTqMaxTokens || r0 < 0 || r1 < r0) std::abort();
     std::vector<float> g((size_t) nt * (size_t) r1), u(g.size());
     float* gp[kTqMaxTokens], *uptr[kTqMaxTokens];
@@ -291,11 +339,17 @@ void tq_bih3_r1q2_gu_rows(int type, const uint8_t* blob, size_t row_bytes, size_
         gp[t] = g.data() + (size_t) t * (size_t) r1;
         uptr[t] = u.data() + (size_t) t * (size_t) r1;
     }
-    tq_bih3_r1q2_rows(type, blob, row_bytes, n, act, nt, gp, r0, r1, gate);
-    tq_bih3_r1q2_rows(type, blob + up_off, row_bytes, n, act, nt, uptr, r0, r1, up);
+    tq_bih3_r1q2_rows_isa(isa, type, blob, row_bytes, n, act, nt, gp, r0, r1, gate);
+    tq_bih3_r1q2_rows_isa(isa, type, blob + up_off, row_bytes, n, act, nt, uptr, r0, r1, up);
     for (int t = 0; t < nt; ++t)
         for (int r = r0; r < r1; ++r)
             ff[t][r] = (gp[t][r] / (1.f + std::exp(-gp[t][r]))) * uptr[t][r];
+}
+
+void tq_bih3_r1q2_gu_rows(int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n,
+                           const void* const* act, int nt, float* const* ff, int r0, int r1,
+                           const TqR1q2Scales& gate, const TqR1q2Scales& up) {
+    tq_bih3_r1q2_gu_rows_isa(bih3_isa(), type, blob, row_bytes, up_off, n, act, nt, ff, r0, r1, gate, up);
 }
 
 }  // namespace strata::kernels::cpu
