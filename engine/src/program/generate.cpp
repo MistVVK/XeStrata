@@ -9406,7 +9406,7 @@ int main(int argc, char** argv) {
         // logits: the drafter allocates them when it binds, after this, as on one GPU (#199), so on the last stage
         // they come out of the cache here.  Out of the reserve instead, a later card without a display (300 MiB)
         // had no room left for them: "mtp: the draft head does not fit" on two 16 GB cards.  (Strata-DualGPU)
-        const int64_t draft_head = (&st == last_st && !o.mtp.empty() && st.head.loaded())
+        const int64_t draft_head = (&st == last_st && !o.mtp.empty() && st.head.loaded() && !mtp_first)
                                        ? (int64_t) mtp.bind_bytes(st.head.row_bytes(), n_vocab) : 0;
         int64_t room = stage_room(st.dev, true, false) - draft_head;
         const strata::core::OnDevice on(st.dev);
