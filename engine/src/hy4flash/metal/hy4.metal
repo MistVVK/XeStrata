@@ -432,6 +432,31 @@ kernel void linear_f32(device const float* W [[buffer(0)]], device const float* 
     }
 }
 
+// fp32 x fp32 GEMM on simdgroup_matrix (router): Y[m][n] = sum_k W[n][k] X[m][k]; tile 32 tokens x 64 rows per threadgroup of 4 simdgroups (each 32 x 16), operands from device memory.
+// X is read up to the next multiple of 32 rows (the buffer is allocated for the whole chunk).
+kernel void linear_f32_mm(device const float* W [[buffer(0)]], device const float* X [[buffer(1)]], device float* Y [[buffer(2)]], constant int& N [[buffer(3)]], constant int& K [[buffer(4)]],
+                          constant int& M [[buffer(5)]], uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sC[32 * 64];
+    const int n0 = tgp.x * 64, m0 = tgp.y * 32;
+    simdgroup_float8x8 acc[4][2];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 2; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int k = 0; k < K; k += 8) {
+        simdgroup_float8x8 a[4], b[2];
+        for (int i = 0; i < 4; ++i) simdgroup_load(a[i], X + (size_t) (m0 + i * 8) * K + k, K);
+        for (int j = 0; j < 2; ++j) simdgroup_load(b[j], W + (size_t) (n0 + sg * 16 + j * 8) * K + k, K, ulong2(0, 0), true);
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 2; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 2; ++j) simdgroup_store(acc[i][j], sC + (i * 8) * 64 + sg * 16 + j * 8, 64);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int idx = tid; idx < 32 * 64; idx += 128) {
+        int m = idx >> 6, n = idx & 63;
+        if (m0 + m < M && n0 + n < N) Y[(size_t) (m0 + m) * N + n0 + n] = sC[idx];
+    }
+}
+
 // GEMM for prefill (M >= 16): simdgroup_matrix half x half -> float. Threadgroup = 4 simdgroups, tile 32 tokens x 64 rows, K step 64 (one scale sub-group).
 // F = 2..8 (S_K) or 100 (Q8ROW). Weights are dequantised in fp32 and rounded to fp16 for the matrix unit.
 template <int F>

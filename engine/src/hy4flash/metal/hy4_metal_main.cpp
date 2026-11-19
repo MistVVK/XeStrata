@@ -270,6 +270,10 @@ public:
     }
     void lin_f32(const std::string& name, const Buffer& X, const Buffer& Y, int M) {
         const TInfo& t = g.ti(name);
+        if (M >= 16) {
+            add("linear_f32_mm", ((int) t.rows() + 63) / 64, (M + 31) / 32, 128, {g.tw(name), B(X), B(Y), I((int) t.rows()), I((int) t.cols()), I(M)});
+            return;
+        }
         add("linear_f32", ((int) t.rows() + 7) / 8, 1, 256, {g.tw(name), B(X), B(Y), I((int) t.rows()), I((int) t.cols()), I(M)});
     }
 
@@ -305,7 +309,7 @@ public:
         pre = A((size_t) T * 4 * 4);
         post = A((size_t) T * 4 * 4);
         cur_h = A((size_t) T * HID_ * 2);
-        cur_f = A((size_t) T * HID_ * 4);
+        cur_f = A((size_t) (T + 32) * HID_ * 4);
         sub = A((size_t) T * HID_ * 4);
         const size_t big = (size_t) T * 16384;
         F1 = A(big * 4);

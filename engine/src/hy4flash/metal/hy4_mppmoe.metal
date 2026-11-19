@@ -70,8 +70,40 @@ static inline void stage_row_f(device const uchar* rp, int ks, int kq, int wpt, 
     const float D = h2f_bits(ld16(blk));
     const float eff = D * (float(blk[2 + g]) / 255.0f);
     device const uchar* pl = blk + 6;
-    for (int e = 0; e < wpt; ++e) dst[e] = half((float(sk_q<F>(pl, g * 64 + kq + e)) - sk_half(F)) * eff);
+    const int i0 = g * 64 + kq;  // a multiple of 8
+    constexpr float H = sk_half(F);
+    for (int e = 0; e < wpt; e += 8) {
+        const int i = i0 + e;
+        int q[8];
+        if (F == 2) {
+            const uint b0 = pl[i >> 2], b1 = pl[(i >> 2) + 1];
+            for (int k = 0; k < 4; ++k) { q[k] = (b0 >> (2 * k)) & 3; q[4 + k] = (b1 >> (2 * k)) & 3; }
+        } else if (F == 3) {
+            const uint b0 = pl[i >> 2], b1 = pl[(i >> 2) + 1], hb = pl[64 + (i >> 3)];
+            for (int k = 0; k < 4; ++k) {
+                q[k] = int(((b0 >> (2 * k)) & 3) | (((hb >> k) & 1) << 2));
+                q[4 + k] = int(((b1 >> (2 * k)) & 3) | (((hb >> (4 + k)) & 1) << 2));
+            }
+        } else if (F == 8) {
+            for (int k = 0; k < 8; ++k) q[k] = int(as_type<char>(pl[i + k]));
+        } else {  // 4, 5, 6: nibbles + the high bits
+            for (int k = 0; k < 4; ++k) {
+                const uint b = pl[(i >> 1) + k];
+                q[2 * k] = int(b & 15);
+                q[2 * k + 1] = int(b >> 4);
+            }
+            if (F == 5) {
+                const uint hb = pl[128 + (i >> 3)];
+                for (int k = 0; k < 8; ++k) q[k] |= int((hb >> k) & 1) << 4;
+            } else if (F == 6) {
+                const uint hb = uint(pl[128 + (i >> 2)]) | (uint(pl[128 + (i >> 2) + 1]) << 8);
+                for (int k = 0; k < 8; ++k) q[k] |= int((hb >> (2 * k)) & 3) << 4;
+            }
+        }
+        for (int k = 0; k < 8; ++k) dst[e + k] = half((float(q[k]) - H) * eff);
+    }
 }
+
 static inline void stage_row(int code, device const uchar* rp, int ks, int kq, int wpt, threadgroup half* dst) {
     switch (code) {
         case 2: stage_row_f<2>(rp, ks, kq, wpt, dst); break;
