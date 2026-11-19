@@ -349,6 +349,16 @@ class NestedModelsDirs(unittest.TestCase):
     def test_data_dir_of_resolves_to_the_outer_data_folder(self):
         self.assertEqual(discovery.data_dir_of(discovery.Footprint(weights=[self.gguf])), self.data)
 
+    def test_a_ready_made_pack_under_models_resolves_to_the_data_folder(self):
+        pack = self.data / "models" / "Maximilian228--Qwen3.8-Flash-Next-NVFP4-GPTQ-Strata" / "pack"
+        pack.mkdir(parents=True)
+        self.assertEqual(discovery.data_dir_of(discovery.Footprint(pack=pack)), self.data)
+
+    def test_a_pack_in_packs_keeps_its_data_folder(self):
+        pack = self.data / "packs" / "coder-IQ1_M"
+        pack.mkdir(parents=True)
+        self.assertEqual(discovery.data_dir_of(discovery.Footprint(pack=pack)), self.data)
+
     def test_a_deep_nest_is_one_level(self):
         deep = self.data / "models" / "models" / "models" / "models" / "t"
         deep.mkdir(parents=True)
