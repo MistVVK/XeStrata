@@ -43,7 +43,7 @@ int main() {
     // more free memory than the pair needs: the streamed plan stays, nothing is dropped
     {
         const HybridPlan p = hybrid_plan(q6xl(8 * GiB));
-        CHECK(p.fits && !p.dropped_staging && p.staging > 0 && p.S > 0);
+        CHECK(p.fits && !p.dropped_staging && p.staging > 0 && p.S == 61);   // the old arithmetic, by hand: (7.78e9 - 1.32e9 staging) / 105.78e6 per slot
     }
     // not even the plan without the pair fits (a few MiB free): reported as not fitting
     {
