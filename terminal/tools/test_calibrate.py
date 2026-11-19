@@ -415,6 +415,109 @@ class Calibrate(unittest.TestCase):
         self.assertEqual(CAL.pick({}, "a"), "a")
 
 
+class VisionLifetime(unittest.TestCase):
+    def run_case(self, gpu=True, failure=None, custom=False, vision=None, top=None):
+        events, instances, engines = [], [], []
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "vocab.json").write_text(json.dumps({"a": 0}))
+            (root / "merges.txt").write_text("")
+            (root / "token_type.json").write_text(json.dumps([1]))
+            cfg = {"exe": "engine", "args": list(BASE), "tokenizer": d,
+                   "cwd": str(root / "cwd"), "log": str(root / "calibration.log")}
+            if gpu is not None:
+                cfg["vision"] = {"exe": "vision-bin", "model": "weights/model.gguf",
+                                 "mmproj": "weights/projector.gguf", "gpu": gpu, **(vision or {})}
+            cfg.update(top or {})
+            env = {"CUDA_VISIBLE_DEVICES": "2"}
+            vision_env = {"CUDA_VISIBLE_DEVICES": "2", "VISION": "1"}
+
+            class Encoder:
+                def __init__(self, config, log=None, env=None):
+                    self.config, self.log, self.env = config, log, env
+                    self.alive = True
+                    instances.append(self)
+                    events.append("vision")
+                    if failure == "vision":
+                        raise RuntimeError("vision initialization failed")
+
+                def shutdown(self):
+                    self.alive = False
+                    events.append("shutdown")
+
+            def engine(exe, args, **kwargs):
+                engines.append((exe, args, kwargs))
+                events.append("engine")
+                if gpu is not None and not custom:
+                    self.assertTrue(instances and instances[0].alive, "configured vision must stay resident")
+                if failure == "engine":
+                    raise RuntimeError("engine initialization failed")
+                return object()
+
+            def measure(args, ids, start_engine, say, extra, long_prompt, hip=False):
+                start_engine(args)
+                start_engine(args)  # the same encoder also covers later tuner restarts
+                if failure == "measure":
+                    raise RuntimeError("measurement failed")
+                return {"settings": {}, "report": {}}
+
+            server = type("Server", (), {"StrataEngine": engine, "Vision": Encoder,
+                "child_env": lambda c: env, "vision_env": lambda c, e: vision_env,
+                "engine_args": lambda c, exe=None: c["args"]})
+            tokenizer = type("ST", (), {"Tokenizer": lambda *a: type("T", (), {"encode": lambda s, t, **k: [0]})()})
+            with mock.patch.dict(sys.modules, {"serve.server": server, "strata_tokenizer": tokenizer}), \
+                 mock.patch.object(CAL, "measure", measure), mock.patch.object(CAL, "host_worker_extras", return_value=[]):
+                if failure:
+                    with self.assertRaisesRegex(RuntimeError, "failed"):
+                        CAL.run(cfg)
+                else:
+                    self.assertEqual(CAL.run(cfg, start_engine=(lambda a: engine("external", a)) if custom else None),
+                                     {"settings": {}, "report": {}})
+            if gpu is not None and not custom:
+                self.assertEqual(len(instances), 1)
+                self.assertTrue(instances[0].log.closed)
+                if failure != "vision":
+                    self.assertFalse(instances[0].alive)
+                    self.assertEqual(events[-1], "shutdown")
+                    for key in ("exe", "model", "mmproj"):
+                        self.assertEqual(instances[0].config[key], str(Path(cfg["cwd"]) / cfg["vision"][key]))
+                    self.assertEqual(instances[0].env, vision_env)
+                    for _, _, kwargs in engines:
+                        self.assertEqual(kwargs["env"], env)
+                        self.assertEqual(kwargs["cwd"], cfg["cwd"])
+                if failure == "vision":
+                    self.assertFalse(engines)
+            else:
+                self.assertFalse(instances)
+            return events, instances
+
+    def test_gpu_encoder_stays_resident_through_restarts(self):
+        self.assertEqual(self.run_case()[0], ["vision", "engine", "engine", "shutdown"])
+
+    def test_cpu_vision_uses_the_same_lifetime(self):
+        self.assertEqual(self.run_case(gpu=False)[0], ["vision", "engine", "engine", "shutdown"])
+
+    def test_text_configuration_does_not_start_an_encoder(self):
+        self.assertEqual(self.run_case(gpu=None)[0], ["engine", "engine"])
+
+    def test_failed_engine_and_measurement_release_vision(self):
+        for failure in ("engine", "measure"):
+            with self.subTest(failure=failure):
+                self.run_case(failure=failure)
+
+    def test_failed_vision_closes_log_and_never_starts_engine(self):
+        self.run_case(failure="vision")
+
+    def test_elastic_follows_the_servers_vram_elastic_rule(self):
+        _, instances = self.run_case(vision={"elastic": True})
+        self.assertIs(instances[0].config["elastic"], False)    # serving starts this encoder with the model
+        _, instances = self.run_case(vision={"elastic": True}, top={"vram_elastic": True})
+        self.assertIs(instances[0].config["elastic"], True)
+
+    def test_supplied_factory_keeps_its_own_resource_lifetime(self):
+        self.assertEqual(self.run_case(custom=True)[0], ["engine", "engine"])
+
+
 class SetupIntegration(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
