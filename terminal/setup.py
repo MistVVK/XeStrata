@@ -1760,10 +1760,16 @@ def gpus():
 
 
 def gpu_drives_display(g) -> bool:
-    """#779: True when nvidia-smi says this card has a display attached (display_active Enabled): its desktop needs
-    VRAM too, and a full expert cache beside it has crashed laptops."""
-    text = out(["nvidia-smi", "-i", str(g.get("index", 0)), "--query-gpu=display_active", "--format=csv,noheader"])
-    return text.strip().lower() == "enabled"
+    """#779: True when nvidia-smi says this card has a display attached (display_active Enabled, or >400 MiB used
+    on Windows #4641): its desktop needs VRAM too, and a full expert cache beside it has crashed laptops."""
+    text = out(["nvidia-smi", "-i", str(g.get("index", 0)), "--query-gpu=display_active,memory.used",
+                "--format=csv,noheader,nounits"])
+    parts = [x.strip() for x in text.strip().split(",")]
+    if parts and parts[0].lower() == "enabled":
+        return True
+    if os.name == "nt" and len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) > 400:
+        return True
+    return False
 
 
 def gpu_compute_mode(index: int) -> str:

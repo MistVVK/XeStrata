@@ -125,6 +125,11 @@ class CarryOver(unittest.TestCase):
             self.assertIn("1", o.call_args[0][0])
         with unittest.mock.patch.object(setup, "out", lambda cmd: ""):
             self.assertFalse(setup.gpu_drives_display({"index": 0}))
+        # #4641: On Windows, nvidia-smi display_active reports Disabled: memory.used > 400 identifies desktop compositor
+        with unittest.mock.patch.object(setup, "out", lambda cmd: "Disabled, 850\n"), unittest.mock.patch.object(setup.os, "name", "nt"):
+            self.assertTrue(setup.gpu_drives_display({"index": 0}))
+        with unittest.mock.patch.object(setup, "out", lambda cmd: "Disabled, 120\n"), unittest.mock.patch.object(setup.os, "name", "nt"):
+            self.assertFalse(setup.gpu_drives_display({"index": 0}))
         with unittest.mock.patch.object(setup.sys, "stdin") as stdin:
             stdin.isatty.return_value = False
             setup.flush_typed_ahead()                      # a pipe: nothing touched

@@ -234,6 +234,22 @@ class DisplayCards(unittest.TestCase):
         strata_mcp.mark_display(gpus[:1] + [{"vendor": "amd", "pci_id": 0x1}], {}, [])
         self.assertTrue(True)
 
+    def test_nvidia_windows_display_fallback(self):
+        # #4641: When nvidia-smi reports Disabled on Windows, desktop_pnp matching DEV_xxxx marks display True,
+        # and an unmatched card is left unknown so the app keeps a safety reserve
+        gpus = [{"vendor": "nvidia", "index": 0, "pci_id": 0x2805}, {"vendor": "nvidia", "index": 1, "pci_id": 0x2C02}]
+        strata_mcp.mark_display(gpus, {0: False, 1: False}, ["PCI\\VEN_10DE&DEV_2805&SUBSYS_1"])
+        self.assertIs(gpus[0]["drives_display"], True)
+        self.assertNotIn("drives_display", gpus[1])
+
+    def test_nvidia_display_active_windows_memory(self):
+        # #4641: nvidia_display_active fallback on Windows when memory.used > 400 MiB
+        with unittest.mock.patch.object(strata_mcp, "WIN", True):
+            with unittest.mock.patch.object(strata_mcp, "run_quiet", lambda cmd: "0, Disabled, 850\n1, Disabled, 0\n"):
+                self.assertEqual(strata_mcp.nvidia_display_active(), {0: True, 1: False})
+            with unittest.mock.patch.object(strata_mcp, "run_quiet", lambda cmd: "0, Enabled, 0\n"):
+                self.assertEqual(strata_mcp.nvidia_display_active(), {0: True})
+
 
 if __name__ == "__main__":
     unittest.main()

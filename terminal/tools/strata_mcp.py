@@ -1085,7 +1085,7 @@ class Strata:
                 if g.get("uma") and g.get("usable"):
                     g["usable"], g["problem"] = False, "integrated graphics: Strata uses the NVIDIA card in this computer"
         try:                                            # does the card drive a display?  (the app keeps less VRAM free on one that does not, #3215)
-            mark_display(nv + amd, nvidia_display_active() if nv else {}, windows_desktop_adapters() if WIN and amd else [])
+            mark_display(nv + amd, nvidia_display_active() if nv else {}, windows_desktop_adapters() if WIN and (amd or nv) else [])
         except Exception:                               # noqa: BLE001 - unknown stays unknown: the app then keeps its safety default
             pass
         try:                                            # the reserve setup writes for this chip when a run config names none (strata_control/setup_config.py UMA_WIN_RESERVE_MIB, G16):
@@ -1854,12 +1854,16 @@ def own_nvidia_gpus() -> list:
 
 
 def nvidia_display_active() -> dict:
-    """{GPU index: True when a display is attached to the card} from nvidia-smi (display_active Enabled); {} when it says nothing."""
+    """{GPU index: True when a display is attached to the card} from nvidia-smi (display_active Enabled, or >400 MiB used on Windows #4641); {} when it says nothing."""
     found = {}
-    for line in run_quiet(["nvidia-smi", "--query-gpu=index,display_active", "--format=csv,noheader"]).strip().splitlines():
-        idx, _, state = line.partition(",")
-        if idx.strip().isdigit() and state.strip().lower() in ("enabled", "disabled"):
-            found[int(idx)] = state.strip().lower() == "enabled"
+    for line in run_quiet(["nvidia-smi", "--query-gpu=index,display_active,memory.used", "--format=csv,noheader,nounits"]).strip().splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) >= 2 and parts[0].isdigit():
+            idx = int(parts[0])
+            active = parts[1].lower() == "enabled"
+            if not active and WIN and len(parts) >= 3 and parts[2].isdigit():
+                active = int(parts[2]) > 400
+            found[idx] = active
     return found
 
 
@@ -1882,6 +1886,17 @@ def mark_display(gpus: list, nvidia_active: dict, desktop_pnp: list) -> None:
     desk = [str(p).upper() for p in desktop_pnp]
     for g in gpus:
         if g.get("vendor") == "nvidia" and g.get("index") in nvidia_active:
+            # #4641: On Windows, nvidia-smi display_active reports Disabled even for cards driving displays.
+            # If windows_desktop_adapters() found active NVIDIA display adapter(s) but nvidia-smi said False,
+            # check PCI device id or leave unknown if twins/unmatched so the app safely treats it as a display card.
+            if not nvidia_active[g["index"]] and desk and any("VEN_10DE" in p for p in desk):
+                if isinstance(g.get("pci_id"), int):
+                    tag = f"DEV_{g['pci_id']:04X}"
+                    twins = [x for x in gpus if x.get("vendor") == "nvidia" and x.get("pci_id") == g["pci_id"]]
+                    if len(twins) == 1 and any(tag in p and "VEN_10DE" in p for p in desk):
+                        g["drives_display"] = True
+                        continue
+                continue
             g["drives_display"] = nvidia_active[g["index"]]
         elif g.get("vendor") == "amd" and isinstance(g.get("pci_id"), int) and desktop_pnp is not None and desktop_pnp:
             tag = f"DEV_{g['pci_id']:04X}"
