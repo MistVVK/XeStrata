@@ -352,7 +352,11 @@ from serve import images as images_api  # noqa: E402
 def popen(what: str, args: list, role: str = "engine", **kw):
     """#735: subprocess.Popen, but Windows' refusal to start a program (WinError 4551, or 1260 when a policy blocks it:
     Smart App Control on a clean Windows 11 blocks an exe that is not signed) is said in words instead of a bare
-    OSError."""
+    OSError.  On Windows the program gets no console window of its own (as serve/mcp.py's servers): a server started
+    without a console (pythonw, a service, a launcher that hides it) would otherwise open one for the engine and one
+    for the image encoder; their output goes through pipes and the log either way."""
+    if os.name == "nt":
+        kw.setdefault("creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
         return lifeline.popen(args, role, **kw)       # a child that cannot outlive this server (serve/lifeline.py)
     except OSError as e:
