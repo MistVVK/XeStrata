@@ -7423,3 +7423,90 @@ class AnthropicNonObjectBlock(unittest.TestCase):
         status, b = self.post({"model": "x", "max_tokens": 8,
                                "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]})
         self.assertEqual(status, 200, b)
+
+
+class ContentShape(unittest.TestCase):
+    """A message content / system that is not a string or an array of parts, or a text part whose "text" is not a
+    string, raised TypeError in _text_of ('int' object is not iterable / sequence item 0: expected str instance, int
+    found), caught only by the generic malformed-request handler: a 400 naming the exception type, with a traceback in
+    the log. As with messages (#460) and tools (#592), it is a 400 naming the field on both APIs, before anything is
+    sent. Lenient handling of unknown part types and non-object parts inside an array is unchanged."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = MockEngine(tok, "ok", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_scalar_content_is_a_400_naming_the_field(self):
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            for bad in (5, 5.5, True):
+                with self.subTest(path=path, content=bad):
+                    status, b = self.post(path, {"model": "x", "max_tokens": 8,
+                                                 "messages": [{"role": "user", "content": bad}]})
+                    self.assertEqual(status, 400, b)
+                    self.assertIn("content", b["error"]["message"])
+                    self.assertNotIn("TypeError", b["error"]["message"])
+        status, b = self.post("/v1/chat/completions", {"model": "x", "max_tokens": 8,
+                                                       "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200, b)                            # the server goes on
+
+    def test_object_content_is_a_400_naming_the_field(self):
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            with self.subTest(path=path):
+                status, b = self.post(path, {"model": "x", "max_tokens": 8,
+                                             "messages": [{"role": "user", "content": {"a": 1}}]})
+                self.assertEqual(status, 400, b)
+                self.assertIn("content", b["error"]["message"])
+
+    def test_scalar_system_is_a_400_naming_the_field(self):
+        for bad in (5, 5.5, True):
+            with self.subTest(system=bad):
+                status, b = self.post("/v1/messages", {"model": "x", "max_tokens": 8, "system": bad,
+                                                       "messages": [{"role": "user", "content": "hi"}]})
+                self.assertEqual(status, 400, b)
+                self.assertIn("system", b["error"]["message"])
+                self.assertNotIn("TypeError", b["error"]["message"])
+
+    def test_non_string_text_part_is_a_400_naming_the_field(self):
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            with self.subTest(path=path):
+                status, b = self.post(path, {"model": "x", "max_tokens": 8,
+                                             "messages": [{"role": "user", "content": [{"type": "text", "text": 5}]}]})
+                self.assertEqual(status, 400, b)
+                self.assertIn("text", b["error"]["message"])
+                self.assertNotIn("TypeError", b["error"]["message"])
+        status, b = self.post("/v1/messages", {"model": "x", "max_tokens": 8,
+                                               "system": [{"type": "text", "text": 5}],
+                                               "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 400, b)
+        self.assertIn("text", b["error"]["message"])
+
+    def test_lenient_shapes_unchanged(self):
+        for content in ([5], [{"type": "text"}], [{"type": "x"}], "plain", [{"type": "text", "text": "ok"}]):
+            with self.subTest(content=content):
+                status, b = self.post("/v1/chat/completions", {"model": "x", "max_tokens": 8,
+                                                               "messages": [{"role": "user", "content": content}]})
+                self.assertEqual(status, 200, b)
+        for system in ([5], "plain", [{"type": "text", "text": "ok"}], [{"type": 5}]):
+            with self.subTest(system=system):
+                status, b = self.post("/v1/messages", {"model": "x", "max_tokens": 8, "system": system,
+                                                       "messages": [{"role": "user", "content": "hi"}]})
+                self.assertEqual(status, 200, b)

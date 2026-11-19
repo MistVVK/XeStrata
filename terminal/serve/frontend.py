@@ -216,19 +216,28 @@ def _check_parts(content, path: str, kinds):
     search_result, server_tool_use / web_search_tool_result blocks, ...) is left out of the prompt exactly as it always
     was, with a debug line: real clients (Claude Code, Codex, opencode, Cline, Continue, Open WebUI) send such parts
     next to text the model can answer from, so refusing them would break requests that work.  A "refusal" part is read
-    as its text, as /v1/responses does.  Content that is not a list, and a part that is not an object, passes through
-    unchanged."""
-    if not isinstance(content, list):
+    as its text, as /v1/responses does.  A part that is not an object inside the array passes through unchanged.
+    Content itself must be a string or an array of parts, and a text part's "text" a string: another shape (a number,
+    a boolean, an object, a non-string text) is a 400 naming the field, as messages (#460) and tools (#592) are,
+    instead of a TypeError later in _text_of / the messages join, caught by the generic malformed-request handler."""
+    if content is None or isinstance(content, str):
         return content
+    if not isinstance(content, list):
+        raise ValueError(f"{path} must be a string or an array of content parts")
     out = content
     for j, part in enumerate(content):
         if not isinstance(part, dict):
             continue
         kind = part.get("type")
+        if kind in TEXT_PARTS and "text" in part and not isinstance(part["text"], str):
+            raise ValueError(f"{path}[{j}].text must be a string")
         if kind == "refusal":
             if out is content:
                 out = list(content)
-            out[j] = {"type": "text", "text": part.get("refusal") or ""}
+            refusal = part.get("refusal") or ""
+            if not isinstance(refusal, str):
+                raise ValueError(f"{path}[{j}].refusal must be a string")
+            out[j] = {"type": "text", "text": refusal}
         elif kind not in kinds:
             LOGGER.debug("%s[%d].type: content part of type %r is not read by this server; left out of the prompt",
                          path, j, kind)
