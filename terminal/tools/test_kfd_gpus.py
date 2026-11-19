@@ -43,6 +43,15 @@ class KfdGpus(unittest.TestCase):
         self.assertFalse(g["usable"])
         self.assertIn("gfx90a", g["problem"])
 
+    def test_an_rx_6650_xt_is_usable(self):
+        # #5261: Navi 23 reports gfx_target_version 100302 = gfx1032; the RX 6000 engine package has covered it since 0.2.16
+        with tempfile.TemporaryDirectory() as tmp:
+            node(Path(tmp), 0, 100302, 32, 128, 8 << 30, "AMD Radeon RX 6650 XT")
+            (g,) = M.kfd_gpus(tmp)
+        self.assertEqual(g["arch"], "gfx1032")
+        self.assertTrue(g["usable"])
+        self.assertIsNone(g["problem"])
+
     def test_no_amd_driver_is_an_empty_list(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(M.kfd_gpus(tmp), [])

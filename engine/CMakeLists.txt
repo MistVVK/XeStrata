@@ -483,6 +483,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(own_only_line_test PRIVATE include)
   add_test(NAME own_only_line_test COMMAND own_only_line_test)
 
+  # #6269: the start-up line for a STRATA_DENSE_MMQ that is set on in an engine without MMQ (header-only, no GPU)
+  add_executable(dense_mmq_notice_test tests/prefill/dense_mmq_notice_test.cpp)
+  target_include_directories(dense_mmq_notice_test PRIVATE include)
+  add_test(NAME dense_mmq_notice_test COMMAND dense_mmq_notice_test)
+
   # the opt-in fused-kernel switches a build without MMQ turns on by default, per backend (header-only, no GPU)
   add_executable(own_only_switches_test tests/prefill/own_only_switches_test.cpp)
   target_include_directories(own_only_switches_test PRIVATE include)
@@ -569,6 +574,23 @@ if(STRATA_BUILD_TESTS)
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
   target_include_directories(host_limits_test PRIVATE include)
   add_test(NAME host_limits_test COMMAND host_limits_test)
+
+  # the opt-out from the kernel's automatic NUMA balancing (KFD userptr queue evictions, #4866): header-only, no GPU
+  add_executable(numa_balancing_test tests/platform/numa_balancing_test.cpp)
+  target_include_directories(numa_balancing_test PRIVATE include)
+  add_test(NAME numa_balancing_test COMMAND numa_balancing_test)
+
+  # #4431: a per-card answer (the arch of each stage of a mixed gfx11 + gfx12 split) is asked once per card (header-only, no GPU); --legacy is the process-wide form and must fail
+  add_executable(per_device_flag_test tests/core/per_device_flag_test.cpp)
+  target_include_directories(per_device_flag_test PRIVATE include)
+  add_test(NAME per_device_flag_test COMMAND per_device_flag_test)
+  add_test(NAME per_device_flag_test_legacy COMMAND per_device_flag_test --legacy)
+  set_tests_properties(per_device_flag_test_legacy PROPERTIES WILL_FAIL TRUE)
+
+  # #5672, #5738: --adapt-async 1 and STRATA_ADAPT_OVERLAP=1 are refused on Windows HIP unless STRATA_WIN_HIP_RISKY=1 (the decision and the two lines; header-only, no GPU)
+  add_executable(win_hip_risky_test tests/core/win_hip_risky_test.cpp)
+  target_include_directories(win_hip_risky_test PRIVATE include)
+  add_test(NAME win_hip_risky_test COMMAND win_hip_risky_test)
   # #4733: an engine started at Low I/O priority goes back to Normal (Windows; else skips)
   add_executable(io_priority_test tests/platform/io_priority_test.cpp src/platform/io_priority.cpp)
   target_include_directories(io_priority_test PRIVATE include)

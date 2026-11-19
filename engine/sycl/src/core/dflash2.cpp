@@ -58,6 +58,7 @@ Dflash2Drafter::~Dflash2Drafter() try {
         if (e) delete e;
     auto fr = [&](void* p) { if (p) sycl::free(p, *cs_); };
     fr(blob_); fr(slab_);   // every work buffer, the rings and the rebuild scratch live in the slab
+    if (dhead_) kernels::native_q6_k_unpack(dhead_);   // a planar draft head (#5286) is in the planar registry under its address
     fr(logits_); fr(dvocab_); fr(dhead_);
     if (h_logq_) sycl::free(h_logq_, *cs_);
     if (h_logd_) sycl::free(h_logd_, *cs_);
@@ -259,6 +260,27 @@ bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, 
     return false;
 }
 
+uint8_t* Dflash2Drafter::gather_draft_head(const void* head_w, int head_type, int64_t row_bytes, const int32_t* ids_dev, int64_t n, sycl::queue* cs, std::string& err) {
+    if (head_type == 14 && kernels::native_q6_k_is_planar(head_w)) {
+        // STRATA_Q6_PLANAR: the output head is stored as 16-byte-aligned planes (native_head.cpp), so its rows cannot be gathered as GGUF rows; the subset is
+        // gathered from the planes and stays planar, as the MTP draft head's is (mtp.cpp).  Gathered as rows it is garbage: every draft is rejected (#5286).
+        void* pd = kernels::native_q6_k_planar_gather(head_w, (int) (row_bytes / 210) * 256, ids_dev, n, "DFlash2 draft head");
+        if (pd == nullptr) {
+            err = "dflash2: no room for the draft head's planar copy (a Q6_K output head); STRATA_Q6_PLANAR=0 starts the engine with the GGUF layout";
+            return nullptr;
+        }
+        return (uint8_t*) pd;
+    }
+    uint8_t* out = sycl::malloc_device<uint8_t>((size_t) (n * row_bytes), *cs);
+    if (out == nullptr) {
+        err = "dflash2: the draft vocabulary's head rows do not fit";
+        return nullptr;
+    }
+    kernels::gather_rows((const uint8_t*) head_w, row_bytes, ids_dev, n, out, cs);
+    cs->wait();
+    return out;
+}
+
 bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err) try {
     const OnDevice on_device(device_);
     if (head == nullptr || !head->loaded()) { err = "dflash2: the drafter needs the native head (--native)"; return false; }
@@ -293,16 +315,14 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
     int64_t head_rows = row_bytes > 0 ? (int64_t) (head->weight_bytes() / (uint64_t) row_bytes) : 0;
     if (!vocab.empty()) {
         int32_t* dv = sycl::malloc_device<int32_t>(vocab.size(), *cs_);
-        dhead_ = sycl::malloc_device<uint8_t>((size_t) ((int64_t) vocab.size() * row_bytes), *cs_);
-        if (dv == nullptr || dhead_ == nullptr) {
-            if (dv) sycl::free(dv, *cs_);
+        if (dv == nullptr) {
             err = "dflash2: the draft vocabulary's head rows do not fit";
             return false;
         }
         cs_->memcpy(dv, vocab.data(), vocab.size() * 4).wait();
-        kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), dhead_, cs_);
-        cs_->wait();
+        dhead_ = gather_draft_head(hw, head->type(), row_bytes, dv, (int64_t) vocab.size(), cs_, err);
         sycl::free(dv, *cs_);
+        if (dhead_ == nullptr) return false;
         vram_ += (uint64_t) ((int64_t) vocab.size() * row_bytes);
         hw = dhead_;
         head_rows = (int64_t) vocab.size();

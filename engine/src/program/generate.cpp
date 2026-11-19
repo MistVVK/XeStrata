@@ -16,6 +16,8 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/platform/memory.hpp"
+#include "strata/platform/numa_balancing.hpp"
+#include "strata/core/win_hip_risky.hpp"
 #include "strata/platform/io_priority.hpp"
 #include "strata/core/adapt_async_default.hpp"
 #include "strata/core/arch_defaults.hpp"
@@ -2193,6 +2195,16 @@ int adapt_lag() {
 /// plan back until that layer's copies have landed (AdaptGate in strata/core/verify.hpp).  The ~10 ms a 96-swap round
 /// took at the next window's start (PCIe 3.0 x16, Q2_0) is then hidden behind the window.  Opt-in on every backend
 /// (=1 turns it on); the startup log names the state, and why when it cannot run.
+#if defined(_WIN32)
+constexpr bool kWinHip = true;    // (win_hip_risky.hpp: --adapt-async 1 and STRATA_ADAPT_OVERLAP=1 are refused on Windows HIP)
+#else
+constexpr bool kWinHip = false;
+#endif
+#if defined(STRATA_USE_HIP)
+constexpr bool kHipBuild = true;
+#else
+constexpr bool kHipBuild = false;
+#endif
 bool adapt_overlap() {
     static const bool v = [] {
         const char* e = std::getenv("STRATA_ADAPT_OVERLAP");
@@ -2201,7 +2213,16 @@ bool adapt_overlap() {
         // decode on an A4000, +4.4% on a P100) until an RTX 5090 Laptop (WSL2, Core Ultra 9 275HX, native IQ3_XXS pack,
         // --expert-cache-per-layer) decoded 21% slower with it: 84.6 vs 106.6 tok/s medians of 5 generations of 256
         // tokens from one build, the slowest of the fast run above the fastest of the slow one.
-        return e && e[0] == '1';
+        const bool asked = e && e[0] == '1';
+        // Windows with an AMD card: refused unless STRATA_WIN_HIP_RISKY=1 (a gfx1030 card ended its first request with a GPU fault and a display-driver
+        // timeout; only checked on CUDA).  include/strata/core/win_hip_risky.hpp
+        const auto verdict = strata::core::win_hip_risky_decide(asked, kWinHip, kHipBuild, std::getenv("STRATA_WIN_HIP_RISKY"));
+        if (verdict == strata::core::WinHipRisky::Refuse) {
+            std::fprintf(stderr, "%s\n", strata::core::win_hip_refused_line("STRATA_ADAPT_OVERLAP=1").c_str());
+            return false;
+        }
+        if (verdict == strata::core::WinHipRisky::AllowWithWarning) std::fprintf(stderr, "%s\n", strata::core::win_hip_warning_line("STRATA_ADAPT_OVERLAP=1").c_str());
+        return asked;
     }();
     return v;
 }
@@ -3572,6 +3593,13 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+    // #4866 (PR #4867): keep the kernel's NUMA scanner off the memory the GPU reads, before any thread is made or anything allocated
+    // (include/strata/platform/numa_balancing.hpp: it evicted the GPU queues for minutes per start on a two-socket host).  AMD only:
+    // the userptr / SVM registration of hipHostRegister is what the scanner's invalidations evict the queues for.
+    if (const std::string numa = strata::platform::numa_balancing::keep_scanner_off(); !numa.empty())
+        std::fprintf(stderr, "%s\n", numa.c_str());
+#endif
     strata::platform::restore_normal_io_priority();   // #4733: not the low disk priority of the program that started this one
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
     {   // 0.2.1.2: hipblas / libhipblaslt / rocblas are delay-loaded (CMakeLists.txt) and live in <exe folder>\rocm\bin, which only the
@@ -11173,6 +11201,15 @@ int main(int argc, char** argv) {
     // from the same table.  The pipelined decode loop (--pipeline-windows 2) has windows in flight at every tick:
     // there the steps that overwrite something a window may still read wait for those windows (see adapt_tick);
     // STRATA_PIPELINE_ADAPT_ASYNC=0 keeps the blocking tier beside it instead.
+    if (o.adapt_async) {   // Windows with an AMD card: refused unless STRATA_WIN_HIP_RISKY=1 (a display-driver reset on an RX 7900 XTX); everywhere else unchanged
+        const auto verdict = strata::core::win_hip_risky_decide(true, kWinHip, kHipBuild, std::getenv("STRATA_WIN_HIP_RISKY"));
+        if (verdict == strata::core::WinHipRisky::Refuse) {
+            std::fprintf(stderr, "%s\n", strata::core::win_hip_refused_line("--adapt-async 1").c_str());
+            o.adapt_async = 0;
+        } else if (verdict == strata::core::WinHipRisky::AllowWithWarning) {
+            std::fprintf(stderr, "%s\n", strata::core::win_hip_warning_line("--adapt-async 1").c_str());
+        }
+    }
     auto adapt_async_off = [&](const char* why) {
         std::fprintf(stderr, "strata generate: --adapt-async 1 is off (%s): the blocking adaptive tier\n", why);
         o.adapt_async = 0;

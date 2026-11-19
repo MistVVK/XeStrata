@@ -22927,6 +22927,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_NUMA_BALANCING",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/include/strata/platform/numa_balancing.hpp",
+     "line": 75,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "87c9821bb1",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "87c9821bb1",
+   "last_date": "2026-11-19",
+   "status": "default",
+   "owner": "host",
+   "note": "Linux HIP only: the engine sets MPOL_LOCAL at the top of main() when kernel.numa_balancing is on and no memory policy was set; =keep leaves the default policy (the NUMA scanner evicted the GPU queues on two-socket hosts).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_NUMA_CARD",
    "backends": [
     "cuda-hip"
@@ -44599,6 +44632,45 @@
    "status": "research",
    "owner": "program",
    "note": "Research switch: =0 turns off the window warm-up (one dummy verify window per allowed width, once, before the first request is read, so a width the policy picks inside a long request does not pay its first-run graph or pipeline build there); default on, changes nothing a request can see.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_WIN_HIP_RISKY",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/program/generate.cpp",
+     "line": 2218,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "engine/src/program/generate.cpp",
+     "line": 11202,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "adaptive tier",
+   "note": "Windows with an AMD card (HIP) only: --adapt-async 1 and STRATA_ADAPT_OVERLAP=1 are refused (display-driver reset, GPU fault); =1 takes both as asked and warns. Not a user setting; for testing.",
    "retire_after": "",
    "retired_in": ""
   },

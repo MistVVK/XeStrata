@@ -1893,7 +1893,7 @@ def windows_video_controllers() -> list:
     return [{"name": x.get("Name"), "driver": x.get("DriverVersion")} for x in d if isinstance(x, dict)]
 
 
-KFD_SUPPORTED = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151")
+KFD_SUPPORTED = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1032", "gfx1151")   # gfx1032: the RX 6600 / 6650 XT, in the RX 6000 engine package since 0.2.16 (#5261)
 
 
 def kfd_gpus(sysfs: str = "/sys") -> list:
