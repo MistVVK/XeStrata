@@ -158,6 +158,10 @@ public:
     mtl::Context& cx;
     int max_ctx, Tc;
     int n_run = 42;  // layers to run (--layers: partial runs for bisecting)
+    bool mpp_ok = false;       // hy4_mpp.metal / hy4_mppq.metal compiled (Metal 4 matmul2d): prefill GEMMs through an fp16 dequantised scratch
+    int mpp_min = 96;          // use it from this many tokens
+    Buffer wscr;               // dequantised weight scratch [N][K] half
+    size_t wscr_elems = 0;
     int lib = -1;
     std::unordered_map<std::string, mtl::Pipeline> pl;
     std::vector<Dispatch> ds;
@@ -243,7 +247,11 @@ public:
         const int N = (int) t.rows(), K = (int) t.cols();
         Arg w = g.tw(name);
         std::vector<Arg> a = {w, B(X, xoff), B(Y, yoff), I(N), I(K), I(M)};
-        if (t.fmt == F_Q8ROW) {
+        if (mpp_ok && M >= mpp_min && t.fmt != F_Q8ROW && (size_t) N * K <= wscr_elems) {
+            struct MmArgs { int M, N, K; } ma{M, N, K};
+            add("dequant_h_" + std::to_string(t.fmt), K / 256, N, 256, {w, B(wscr), I(N), I(K)});
+            add("mpp_mm_128_64_4", (N + 63) / 64, (M + 127) / 128, 128, {B(X, xoff), B(wscr), B(Y, yoff), Arg::V<MmArgs>(ma)});
+        } else if (t.fmt == F_Q8ROW) {
             if (M >= 16) add("linear_mm_100", (N + 63) / 64, (M + 31) / 32, 128, a);
             else add(M == 1 ? "linear_q8row_1" : "linear_q8row_8", (N + 7) / 8, 1, 256, a);
         } else {
@@ -260,7 +268,18 @@ public:
     // ---- init
     bool init(const std::string& engram_path, int logit_rows_, std::string& err) {
         logit_rows = logit_rows_;
-        lib = cx.compile({kernel_path}, "#define NO_GGML_COMMON 1\n", false);
+        {
+            const std::string dir = kernel_path.substr(0, kernel_path.rfind('/') + 1);
+            std::string why;
+            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_mpp.metal", dir + "hy4_mppq.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
+            mpp_ok = lib >= 0;
+            if (!mpp_ok) {
+                if (mpp_try) fprintf(stderr, "[metal] MPP (Metal 4 matmul2d) kernels not available, simdgroup GEMM only: %s\n", why.substr(0, 200).c_str());
+                lib = cx.compile({kernel_path}, "#define NO_GGML_COMMON 1\n", false);
+            }
+            wscr_elems = (size_t) 16384 * 3072;
+            if (mpp_ok) wscr = cx.alloc(wscr_elems * 2);
+        }
         const int T = Tc;
         auto A = [&](size_t bytes) { return cx.alloc(bytes); };
         d_ids = A((size_t) T * 4);
@@ -379,6 +398,7 @@ public:
         return true;
     }
     std::string kernel_path = "hy4.metal";
+    bool mpp_try = true;
     static constexpr int HID_ = 3072;
 
     // ---- engram rows of one chunk for all 4 modules (CPU hash + page reads straight into the shared buffers)
@@ -644,8 +664,8 @@ static size_t rss_bytes() {
 
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
-    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false;
-    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4, n_layers_run = 42;
+    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false;
+    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -669,6 +689,8 @@ int main(int argc, char** argv) {
         else if (a == "--seg") seg = true;
         else if (a == "--pair-max") pair_max = atoi(nxt().c_str());
         else if (a == "--layers") n_layers_run = atoi(nxt().c_str());
+        else if (a == "--no-mpp") no_mpp = true;
+        else if (a == "--mpp-min") mpp_min_arg = atoi(nxt().c_str());
         else {
             fprintf(stderr, "unknown arg %s\n", a.c_str());
             return 2;
@@ -724,6 +746,8 @@ int main(int argc, char** argv) {
     r.prof2 = prof2;
     r.seg_force = seg;
     r.pair_max = pair_max;
+    r.mpp_try = !no_mpp;
+    r.mpp_min = mpp_min_arg;
     r.n_run = std::min(n_layers_run, r.c.n_layers);
     const int V = r.c.vocab;
     if (!r.init(no_engram ? std::string() : engram, all_logits ? r.Tc : 1, err)) {
