@@ -5092,7 +5092,12 @@ bool Verifier::set_slot_logit_bias(int slot, const std::vector<float>& bias, std
     if (le_ >= 0 && le_ < g_->n_layers) return true;
     if (slot < 0 || slot >= (int) slot_bias_dev_.size()) return true;
     const OnDevice on_device(device_);
-    if (bias.empty()) { slot_bias_dev_[(size_t) slot] = nullptr; slot_sp_[(size_t) slot].logit_bias = nullptr; return true; }
+    if (bias.empty()) {
+        if (slot_bias_dev_[(size_t) slot]) cudaFree(slot_bias_dev_[(size_t) slot]);
+        slot_bias_dev_[(size_t) slot] = nullptr;
+        slot_sp_[(size_t) slot].logit_bias = nullptr;
+        return true;
+    }
     if (bias.size() != (size_t) n_vocab_) { err = "logit_bias vocabulary size mismatch"; return false; }
     const size_t bytes = bias.size() * sizeof(float);
     if (slot_bias_dev_[(size_t) slot] == nullptr) {
