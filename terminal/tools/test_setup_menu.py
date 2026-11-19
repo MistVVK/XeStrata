@@ -156,24 +156,23 @@ class UnslothDefaultEnv(unittest.TestCase):
             for hip in (False, True):
                 self.assertNotIn("STRATA_HC_Q8", f("unsloth", m, hip, True), (m, hip))
 
-    def test_tail_skip_off_only_when_every_expert_is_in_ram(self):
+    def test_tail_skip_is_off_for_every_unsloth_config(self):
+        # 0.2.17 (owner 11-19): off by default, with every expert in RAM (arena) and in the RAM-budget mode alike
         f = setup.unsloth_default_env
-        self.assertEqual(f("unsloth", "UD-Q4_K_XL", False, False)["STRATA_ROUTE_TAIL_SKIP"], "0")
-        self.assertNotIn("STRATA_ROUTE_TAIL_SKIP", f("unsloth", "UD-Q4_K_XL", False, True))   # budget mode keeps the skip
+        for m in ("UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"):
+            for in_budget in (False, True):
+                self.assertEqual(f("unsloth", m, False, in_budget)["STRATA_ROUTE_TAIL_SKIP"], "0", (m, in_budget))
 
     @mock.patch.object(setup, "WIN", False)       # "Linux" gfx12: setup asks the host OS (setup.WIN), so the test names Linux itself
-    def test_tail_skip_stays_on_for_linux_gfx12(self):
-        # owner 11-03 ("3 Yes"): on Linux gfx12 (R9700, RX 9000) setup no longer turns the skip off for the UD files; the engine's own default (rank 7) runs
+    def test_tail_skip_is_off_on_every_card_and_system_too(self):
+        # 0.2.10.1 left Linux gfx12 (R9700, RX 9000) on the engine's own rank 7; 0.2.17 writes the 0 there as well
         f = setup.unsloth_default_env
-        for arch in ("gfx1201", "gfx1200", "gfx1201:sramecc-:xnack-"):
+        for arch in ("gfx1201", "gfx1200", "gfx1201:sramecc-:xnack-", "gfx1100", "gfx1151", "gfx1030", "", "sm_120"):
             for m in ("UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL"):
-                self.assertNotIn("STRATA_ROUTE_TAIL_SKIP", f("unsloth", m, True, False, arch), (arch, m))
-        # every other card keeps the 0: other AMD (gfx1100, gfx1151), NVIDIA, no arch given (the old signature)
-        for arch in ("gfx1100", "gfx1151", "gfx1030", "", "sm_120"):
-            self.assertEqual(f("unsloth", "UD-Q4_K_XL", True, False, arch)["STRATA_ROUTE_TAIL_SKIP"], "0", arch)
-        self.assertEqual(f("unsloth", "UD-Q4_K_XL", False, False, "gfx1201")["STRATA_ROUTE_TAIL_SKIP"], "0")    # not hip
+                for hip in (False, True):
+                    for in_budget in (False, True):
+                        self.assertEqual(f("unsloth", m, hip, in_budget, arch)["STRATA_ROUTE_TAIL_SKIP"], "0", (arch, m, hip, in_budget))
         self.assertEqual(f("unsloth", "UD-Q4_K_XL", True, False)["STRATA_ROUTE_TAIL_SKIP"], "0")                 # the old call
-        # Windows gfx12 was not measured: it keeps the 0
         old = setup.WIN
         try:
             setup.WIN = True

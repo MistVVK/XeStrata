@@ -419,6 +419,12 @@ class EngineHarness:
             argv.extend(flag_argv(flag, value))
         return argv
 
+    def _start_env(self) -> dict[str, str]:
+        """The engine's environment for a measurement: the caller's, with Strata's own start defaults for what it does not name (0.2.17: the route tail
+        skip is Off unless STRATA_ROUTE_TAIL_SKIP says otherwise, as in a real start), so a tuning run measures what a launch runs."""
+        from strata_control import speed_switches
+        return speed_switches.engine_env_defaults(quiet_crash_env(dict(os.environ if self.env is None else self.env)))
+
     def __enter__(self) -> "EngineHarness":
         self.start()
         return self
@@ -433,7 +439,7 @@ class EngineHarness:
         try:
             from serve import lifeline       # the engine ends with this process, however this process ends
             self._proc = lifeline.popen(
-                self._argv(), "engine", cwd=str(self.cwd), env=None if self.env is None else quiet_crash_env(dict(self.env)),
+                self._argv(), "engine", cwd=str(self.cwd), env=self._start_env(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, errors="replace", bufsize=1)
         except OSError as e:
