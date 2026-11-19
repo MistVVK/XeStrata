@@ -352,12 +352,13 @@ public:
                 if (!push_emit(nx)) break;
                 continue;
             }
-            const double tv0 = now_s();
+            const double tv0 = now_s(), g0 = r.gpu_total, e0 = r.t_engram_wait;
             for (int i = 1; i <= Kp; ++i) tok.push_back(y[i]);
             const int T = Kp + 1;
             if (!r.forward_chunk(tok.data(), a, T, err)) { finish = "error"; break; }
             r.head(T, 0);
             r.add("argmax_rows", T, 1, 1024, {Runner::B(r.logits), Runner::I(V), Runner::B(r.d_argmax)});
+            { static int pc = 0; if (cfg.debug && T == 4 && ++pc == 5) r.kernel_profile(10); }
             r.run_all();
             const int* h_arg = (const int*) r.d_argmax.ptr;
             const double tver_ms = (now_s() - tv0) * 1000.0;
@@ -377,7 +378,7 @@ public:
             ++S.hist[std::min(n, 8)];
             ++S.spec_iters;
             const int nxt = h_arg[n];
-            if (cfg.debug) fprintf(stderr, "[spec] a=%d K'=%d n=%d draft %.1f ms verify %.1f ms conf %.2f %.2f %.2f\n", a, Kp, n, tdraft, tver_ms, cf[1], Kp > 1 ? cf[2] : 0.f, Kp > 2 ? cf[3] : 0.f);
+            if (cfg.debug) fprintf(stderr, "[spec] a=%d K=%d n=%d draft %.1f ms verify %.1f ms (gpu %.1f engram %.1f) conf %.2f %.2f\n", a, Kp, n, tdraft, tver_ms, (r.gpu_total - g0) * 1e3, (r.t_engram_wait - e0) * 1e3, cf[1], Kp > 1 ? cf[2] : 0.f);
             tok.resize((size_t) a + 1);
             fwd = a + 1 + n;
             bool alive = true;

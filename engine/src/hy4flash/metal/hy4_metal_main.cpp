@@ -158,6 +158,7 @@ public:
     mtl::Context& cx;
     int max_ctx, Tc;
     int n_run = 42;  // layers to run (--layers: partial runs for bisecting)
+    bool f32x = true; bool lin2 = true; int lin2_r = 0;  // row-blocked decode GEMV (--no-lin2 / --lin2-r N for A/B)
     int mm_min = 16;           // GEMM (fp16 weights) from this many tokens; below it the exact fp32-dequant GEMV (--mm-min)
     bool mpp_ok = false;       // hy4_mpp.metal / hy4_mppq.metal compiled (Metal 4 matmul2d): prefill GEMMs through an fp16 dequantised scratch
     int mpp_min = 96;          // use it from this many tokens
@@ -184,6 +185,8 @@ public:
     // buffers
     Buffer d_ids, x, pre, post, cur_h, cur_f, F1, F2, F3, F4, sub, H1, qr_h, qa_h, ctx_h, o_h, z_f, z_h, zout_f, moe_idx, moe_w, moe_h2, moe_y, moe_cnt, moe_off, moe_pairs, hfin, logits, d_argmax, er_h, kv_f;
     Buffer d_experts, wk_b, wv_b, ivg_dummy;
+    Buffer m2_uexp, m2_ucnt, m2_upair, m2_meta;
+    bool moe2 = true;  // distinct-expert decode / verify MoE (hy4_moe2.metal) for T <= 8 (--no-moe2)
     std::vector<size_t> wk_off, wv_off;
     std::vector<Buffer> kcache, ivg, pooled;
     Buffer ik_f, iv_f, ig_f, ik_h, iq_f, iq_h, hw_f, score, keys, nkeys;
@@ -271,7 +274,13 @@ public:
         } else {
             std::string f = std::to_string(t.fmt);
             if (M >= mm_min) add("linear_mm_" + f, (N + 63) / 64, (M + 31) / 32, 128, a);
-            else add(std::string("linear_sk_") + f + (M == 1 ? "_1" : "_8"), (N + 7) / 8, 1, 256, a);
+            else if (lin2 && M >= 1 && M <= 8 && (t.fmt == 4 || t.fmt == 5 || t.fmt == 6 || t.fmt == 8)) {
+                // row-blocked GEMV (hy4_lin2.metal): R rows per simdgroup, MT == M tokens
+                int R = 1;
+                if (lin2_r > 0) R = lin2_r == 3 ? 1 : lin2_r;
+                if (R == 2 && M > 2) R = 1;
+                add("linear_skr_" + f + "_" + std::to_string(M) + "_" + std::to_string(R), (N + 8 * R - 1) / (8 * R), 1, 256, a);
+            } else add(std::string("linear_sk_") + f + (M == 1 ? "_1" : "_8"), (N + 7) / 8, 1, 256, a);
         }
     }
     void lin_f32(const std::string& name, const Buffer& X, const Buffer& Y, int M) {
@@ -280,6 +289,7 @@ public:
             add("linear_f32_mm", ((int) t.rows() + 63) / 64, (M + 31) / 32, 128, {g.tw(name), B(X), B(Y), I((int) t.rows()), I((int) t.cols()), I(M)});
             return;
         }
+        if (f32x && M >= 1 && M <= 8 && (t.cols() % 128) == 0) { add("linear_f32x_" + std::to_string(M), ((int) t.rows() + 7) / 8, 1, 256, {g.tw(name), B(X), B(Y), I((int) t.rows()), I((int) t.cols()), I(M)}); return; }
         add("linear_f32", ((int) t.rows() + 7) / 8, 1, 256, {g.tw(name), B(X), B(Y), I((int) t.rows()), I((int) t.cols()), I(M)});
     }
 
@@ -289,11 +299,11 @@ public:
         {
             const std::string dir = kernel_path.substr(0, kernel_path.rfind('/') + 1);
             std::string why;
-            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal", dir + "hy4_dfly2.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
+            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal", dir + "hy4_dfly2.metal", dir + "hy4_lin2.metal", dir + "hy4_moe2.metal", dir + "hy4_lin3.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
             mpp_ok = lib >= 0;
             if (!mpp_ok) {
                 if (mpp_try) fprintf(stderr, "[metal] MPP (Metal 4 matmul2d) kernels not available, simdgroup GEMM only: %s\n", why.substr(0, 200).c_str());
-                lib = cx.compile({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_dfly2.metal"}, "#define NO_GGML_COMMON 1\n", false);
+                lib = cx.compile({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_dfly2.metal", dir + "hy4_lin2.metal", dir + "hy4_moe2.metal", dir + "hy4_lin3.metal"}, "#define NO_GGML_COMMON 1\n", false);
             }
             wscr_elems = (size_t) 16384 * 3072;
             if (mpp_ok) wscr = cx.alloc(wscr_elems * 2);
@@ -339,6 +349,7 @@ public:
         moe_cnt = A(512 * 4);
         moe_off = A(520 * 4);
         moe_pairs = A((size_t) T * 16 * 4);
+        m2_uexp = A(128 * 4); m2_ucnt = A(128 * 4); m2_upair = A(128 * 8 * 4); m2_meta = A(64);
         hfin = A((size_t) T * HID_ * 2);
         logits = A((size_t) logit_rows * c.vocab * 4);
         d_argmax = A(64);
@@ -684,7 +695,13 @@ public:
         op("router_zproj");
         const Arg sec4 = Arg::B(g.wbuf, g.sec4_off);
         const Arg exl = Arg::B(d_experts, (size_t) (il - 1) * 512 * sizeof(ExpertDev));
-        if (mpp_ok && T >= moe_mm_min) {
+        if (moe2 && T <= 8) {
+            const int Pn = T * 16;
+            add("moe2_plan", 1, 1, 512, {B(moe_idx), I(Pn), B(m2_uexp), B(m2_ucnt), B(m2_upair), B(m2_meta)});
+            add("moe2_gu", 192, Pn, 256, {sec4, exl, B(z_h), B(m2_uexp), B(m2_ucnt), B(m2_upair), B(m2_meta), B(moe_h2)});
+            add("moe2_dn", 192, Pn, 256, {sec4, exl, B(moe_w), B(m2_uexp), B(m2_ucnt), B(m2_upair), B(m2_meta), B(moe_h2), B(moe_y)});
+            add("moe_reduce", T, 1, 256, {B(moe_y), B(zout_f)});
+        } else if (mpp_ok && T >= moe_mm_min) {
             const int Pn = T * 16, TM = moe_tm(T), TN = 32, SG = TM == 64 ? 4 : 2;
             const std::string tag = std::to_string(TM) + "_" + std::to_string(TN) + "_" + std::to_string(SG);
             add("moe_plan", 1, 1, 512, {B(moe_idx), I(Pn), I(TM), B(m_srt), B(m_pos), B(m_tiles), B(m_meta), I(1536 / TN), I(1536 / TN)});
@@ -857,7 +874,8 @@ static int export_tokenizer(const std::string& file, const std::string& dir) {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_hcsplit = false, prof3 = false;
-    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0;
+    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0, lin2_r_arg = 0;
+    bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false;
     bool serve = false, session_reuse = false;
     std::string vision;
     std::string draft = "auto";  // auto: DFly2 when the file carries the drafter and --gen > 0; off / dfly2 force
@@ -895,6 +913,11 @@ int main(int argc, char** argv) {
         else if (a == "--moe-mm-min") moe_mm_min_arg = atoi(nxt().c_str());
         else if (a == "--mpp-min") mpp_min_arg = atoi(nxt().c_str());
         else if (a == "--draft") draft = nxt();
+        else if (a == "--no-lin2") no_lin2 = true;
+        else if (a == "--no-moe2") no_moe2 = true;
+        else if (a == "--no-f32x") no_f32x = true;
+        else if (a == "--save-logits") save_logits = true;
+        else if (a == "--lin2-r") lin2_r_arg = atoi(nxt().c_str());
         else if (a == "--spec-k") scfg.K = atoi(nxt().c_str());
         else if (a == "--spec-fixed") scfg.adaptive = false;
         else if (a == "--spec-cut") scfg.cut = (float) atof(nxt().c_str());
@@ -1005,6 +1028,10 @@ int main(int argc, char** argv) {
     r.pair_max = pair_max;
     r.mpp_try = !no_mpp;
     r.mm_min = mm_min_arg;
+    r.lin2 = !no_lin2;
+    r.moe2 = !no_moe2;
+    r.f32x = !no_f32x;
+    r.lin2_r = lin2_r_arg;
     r.hc_split = !no_hcsplit;
     r.split_max = split_arg;
     r.flash_on = no_flash;
@@ -1054,7 +1081,7 @@ int main(int argc, char** argv) {
             int n = T - first;
             hl.assign((const float*) r.logits.ptr, (const float*) r.logits.ptr + (size_t) n * V);
             for (int i = 0; i < n; ++i) top5_line(&hl[(size_t) i * V], V, done - n + i, top_out);
-            if (dump) save_npy_f32(out_dir + "/logits.npy", hl.data(), {n, V});
+            if (dump || save_logits) save_npy_f32(out_dir + "/logits.npy", hl.data(), {n, V});
         } else {
             r.run_all();
         }
