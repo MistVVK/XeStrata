@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/tq_cpu.cpp - see include/strata/kernels/cpu/tq_cpu.hpp: the state table, the scalar reference
 // kernel, the activation unpacking and the run-time ISA choice.  Compiled for the baseline x86-64 (no AVX), so
@@ -222,6 +223,79 @@ void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, si
             const float g = gp[t][r], u = up[t][r];
             ff[t][r] = (g / (1.f + std::exp(-g))) * u;   // native_gu_rows' SwiGLU expression
         }
+}
+
+
+namespace {
+
+// Sync-Strata's bih3 state: three byte planes of four 32-bit products, minus the centre 384.
+void bih3_weights(uint32_t state, int16_t* out) {
+    const uint32_t a = state * 0x9e3779b1u, b = state * 0x85ebca6bu;
+    const uint32_t c = state * 0xc2b2ae35u, d = state * 0x27d4eb2fu;
+    auto byte = [](uint32_t v, int shift) { return (int) ((v >> shift) & 255u); };
+    out[0] = (int16_t) (byte(a, 8) + byte(b, 16) + byte(c, 24) - 384);
+    out[1] = (int16_t) (byte(a, 16) + byte(b, 24) + byte(d, 8) - 384);
+    out[2] = (int16_t) (byte(a, 24) + byte(c, 8) + byte(d, 16) - 384);
+    out[3] = (int16_t) (byte(b, 8) + byte(c, 16) + byte(d, 24) - 384);
+}
+
+uint32_t bih3_state(const uint8_t* code, int k, int step) {
+    if (k == 8) return (((uint32_t) code[(step + 31) % 32] << 8) | code[step]) & 0x7fffu;
+    const int bit = (31 - step) * k, bytes = 4 * k, i = bit / 8;
+    const uint32_t window = (uint32_t) code[i] | ((uint32_t) code[(i + 1) % bytes] << 8) |
+                            ((uint32_t) code[(i + 2) % bytes] << 16);
+    return (window >> (bit % 8)) & 0x7fffu;
+}
+
+}  // namespace
+
+void tq_bih3_r1q2_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                        float* const* out, int r0, int r1, const TqR1q2Scales& scales) {
+    const int k = type - 180, nb = n / 128;
+    if (k < 2 || k > 14 || n <= 0 || n > kTqMaxN || n % 128 || nt < 1 || nt > kTqMaxTokens ||
+        r0 < 0 || r1 < r0 || row_bytes < (size_t) nb * 4 * (size_t) k ||
+        scales.qbytes < (size_t) (nb + 3) / 4) std::abort();
+    const ActSet& a = unpack_all(act, n, nt);
+    for (int r = r0; r < r1; ++r) {
+        float acc[kTqMaxTokens][4] = {};
+        const uint8_t* qr = scales.q + (size_t) r * scales.qbytes;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* code = w + (size_t) r * row_bytes + (size_t) b * 4 * (size_t) k;
+            const float scale = tq_detail::tq_half_to_float(tq_detail::tq_ld16(scales.colscale + 2 * (size_t) b)) *
+                                scales.p2[(qr[b / 4] >> (2 * (b % 4))) & 3];
+            int32_t dots[kTqMaxTokens][4] = {};
+            for (int step = 0; step < 32; ++step) {
+                int16_t weight[4];
+                bih3_weights(bih3_state(code, k, step), weight);
+                for (int t = 0; t < nt; ++t)
+                    for (int j = 0; j < 4; ++j)
+                        dots[t][step / 8] += (int32_t) weight[j] * a.ptr[t]->q[b * 128 + step * 4 + j];
+            }
+            for (int t = 0; t < nt; ++t)
+                for (int q = 0; q < 4; ++q)
+                    acc[t][q] = std::fma((float) (dots[t][q] * 64), scale * a.ptr[t]->d[b * 4 + q], acc[t][q]);
+        }
+        const float rowbase = tq_detail::tq_half_to_float(tq_detail::tq_ld16(scales.rowbase + 2 * (size_t) r));
+        for (int t = 0; t < nt; ++t)
+            out[t][r] = ((acc[t][0] + acc[t][1]) + (acc[t][2] + acc[t][3])) * (1.f / 8192.f) * rowbase;
+    }
+}
+
+void tq_bih3_r1q2_gu_rows(int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n,
+                           const void* const* act, int nt, float* const* ff, int r0, int r1,
+                           const TqR1q2Scales& gate, const TqR1q2Scales& up) {
+    if (nt < 1 || nt > kTqMaxTokens || r0 < 0 || r1 < r0) std::abort();
+    std::vector<float> g((size_t) nt * (size_t) r1), u(g.size());
+    float* gp[kTqMaxTokens], *uptr[kTqMaxTokens];
+    for (int t = 0; t < nt; ++t) {
+        gp[t] = g.data() + (size_t) t * (size_t) r1;
+        uptr[t] = u.data() + (size_t) t * (size_t) r1;
+    }
+    tq_bih3_r1q2_rows(type, blob, row_bytes, n, act, nt, gp, r0, r1, gate);
+    tq_bih3_r1q2_rows(type, blob + up_off, row_bytes, n, act, nt, uptr, r0, r1, up);
+    for (int t = 0; t < nt; ++t)
+        for (int r = r0; r < r1; ++r)
+            ff[t][r] = (gp[t][r] / (1.f + std::exp(-gp[t][r]))) * uptr[t][r];
 }
 
 }  // namespace strata::kernels::cpu

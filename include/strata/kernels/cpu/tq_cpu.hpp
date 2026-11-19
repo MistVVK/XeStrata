@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/cpu/tq_cpu.hpp - the trellis expert formats (TQ2_T / TQK6 / TQK7 / TQP5 / TQP6 / TQP7, ggml
 // types 144-149 of the agention llama.cpp fork) on the CPU: decode-and-dot against Q8_0 activations (ggml's
@@ -71,6 +72,24 @@ void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n
 /// of native_gu_rows.
 void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                 const void* const* act, int nt, float* const* ff, int r0, int r1);
+
+/// R1Q2 scales for one matrix. Half-precision values are stored little-endian in the blob; q packs four
+/// two-bit indices per byte, separately for each row. p2 selects the layer and projection's scale table.
+struct TqR1q2Scales {
+    const uint8_t* rowbase;
+    const uint8_t* colscale;
+    const uint8_t* q;
+    size_t qbytes;
+    float p2[4];
+};
+
+/// The bih3 types 182..194 use K=2..14 and 4*K code bytes per 128 weights, without a block scale.
+/// These scalar rows are independent of the SIMD dispatch used by the original trellis formats.
+void tq_bih3_r1q2_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                        float* const* out, int r0, int r1, const TqR1q2Scales& scales);
+void tq_bih3_r1q2_gu_rows(int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n,
+                           const void* const* act, int nt, float* const* ff, int r0, int r1,
+                           const TqR1q2Scales& gate, const TqR1q2Scales& up);
 
 /// Largest token group per call and widest row the kernels take.
 inline constexpr int kTqMaxTokens = 8;

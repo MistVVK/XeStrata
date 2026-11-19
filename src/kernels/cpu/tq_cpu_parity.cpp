@@ -560,6 +560,91 @@ int bench(bool quick, const std::string& only) {
     return 0;
 }
 
+
+// A small in-memory R1Q2 pack: independent bit-at-a-time state decoding and FP64 dequantization.
+int check_bih3_r1q2() {
+    constexpr int rows = 7, nt = 3;
+    std::mt19937 rng(42019);   // NOLINT(bugprone-random-generator-seed): repeatable parity fixture
+    double worst = 0;
+    int failures = 0;
+    for (int k = 2; k <= 14; ++k) for (int n : {128, 384, 640}) {
+        const int nb = n / 128;
+        const size_t rb = (size_t) nb * 4 * (size_t) k, qb = (size_t) (nb + 3) / 4;
+        std::vector<uint8_t> blob(2 * rb * rows), rowbase(2 * (size_t) rows), colscale(2u * (size_t) nb), q(qb * rows);
+        for (auto& v : blob) v = (uint8_t) rng();
+        for (auto& v : q) v = (uint8_t) rng();
+        for (int r = 0; r < rows; ++r) {
+            const uint16_t h = f2h((r % 2 ? -1.f : 1.f) * (0.005f + 0.001f * (float) r));
+            std::memcpy(rowbase.data() + 2 * (size_t) r, &h, 2);
+        }
+        for (int b = 0; b < nb; ++b) {
+            const uint16_t h = f2h(0.25f + 0.03125f * (float) b);
+            std::memcpy(colscale.data() + 2 * (size_t) b, &h, 2);
+        }
+        TqR1q2Scales sc{rowbase.data(), colscale.data(), q.data(), qb, {0.5f, 0.75f, 1.f, 1.5f}};
+        std::vector<std::vector<uint8_t>> activations;
+        const void* ap[nt];
+        for (int t = 0; t < nt; ++t) {
+            activations.push_back(q8_0(make_x(n, 1000 + k * 13 + t)));
+            ap[t] = activations.back().data();
+        }
+        float got[nt][rows] = {}, gate[nt][rows] = {}, up[nt][rows] = {}, gu[nt][rows] = {};
+        float* op[nt], *gp[nt], *uptr[nt], *fp[nt];
+        for (int t = 0; t < nt; ++t) { op[t] = got[t]; gp[t] = gate[t]; uptr[t] = up[t]; fp[t] = gu[t]; }
+        tq_bih3_r1q2_rows(180 + k, blob.data(), rb, n, ap, nt, gp, 0, rows, sc);
+        tq_bih3_r1q2_rows(180 + k, blob.data() + rb * rows, rb, n, ap, nt, uptr, 0, rows, sc);
+        tq_bih3_r1q2_gu_rows(180 + k, blob.data(), rb, rb * rows, n, ap, nt, fp, 0, rows, sc, sc);
+        // Exercise split row ranges and token grouping as used by the pool.
+        for (int t = 0; t < nt; ++t) {
+            tq_bih3_r1q2_rows(180 + k, blob.data(), rb, n, ap + t, 1, op + t, 0, 3, sc);
+            tq_bih3_r1q2_rows(180 + k, blob.data(), rb, n, ap + t, 1, op + t, 3, rows, sc);
+            if (!same_bits(got[t], gate[t], rows)) ++failures;
+        }
+        const uint32_t mul[4] = {0x9e3779b1u, 0x85ebca6bu, 0xc2b2ae35u, 0x27d4eb2fu};
+        const int which[4][3] = {{0,1,2}, {0,1,3}, {0,2,3}, {1,2,3}};
+        const int shift[4][3] = {{8,16,24}, {16,24,8}, {24,8,16}, {8,16,24}};
+        for (int t = 0; t < nt; ++t) for (int r = 0; r < rows; ++r) {
+            double expected[2] = {}, magnitude[2] = {};
+            for (int m = 0; m < 2; ++m) for (int b = 0; b < nb; ++b) {
+                const uint8_t* code = blob.data() + (size_t) m * rb * rows + (size_t) r * rb + (size_t) b * 4 * k;
+                double sum = 0, mag = 0;
+                for (int step = 0; step < 32; ++step) {
+                    uint32_t state = 0;
+                    if (k == 8) state = ((uint32_t) code[(step + 31) % 32] << 8) | code[step];
+                    else for (int bit = 0; bit < 15; ++bit) {
+                        const int pos = ((31 - step) * k + bit) % (32 * k);
+                        state |= (uint32_t) ((code[pos / 8] >> (pos % 8)) & 1) << bit;
+                    }
+                    state &= 32767u;
+                    for (int j = 0; j < 4; ++j) {
+                        int w = -384;
+                        for (int z = 0; z < 3; ++z) w += (int) (((state * mul[which[j][z]]) >> shift[j][z]) & 255u);
+                        const int index = b * 128 + step * 4 + j;
+                        const uint8_t* block = activations[t].data() + (size_t) (index / 32) * 34;
+                        uint16_t ah; std::memcpy(&ah, block, 2);
+                        int8_t av; std::memcpy(&av, block + 2 + index % 32, 1);
+                        const double term = (double) w / 128 * av * ggml_fp16_to_fp32(ah);
+                        sum += term; mag += std::fabs(term);
+                    }
+                }
+                uint16_t ch, rh; std::memcpy(&ch, colscale.data() + 2 * (size_t) b, 2); std::memcpy(&rh, rowbase.data() + 2 * (size_t) r, 2);
+                const double scale = (double) ggml_fp16_to_fp32(ch) * sc.p2[(q[(size_t) r * qb + b / 4] >> (2 * (b % 4))) & 3] * ggml_fp16_to_fp32(rh);
+                expected[m] += sum * scale; magnitude[m] += mag * std::fabs(scale);
+            }
+            for (int m = 0; m < 2; ++m) {
+                const double actual = m == 0 ? gate[t][r] : up[t][r];
+                const double e = std::fabs(actual - expected[m]) / (magnitude[m] + 1e-30);
+                worst = std::max(worst, e);
+                if (e > 2e-6) ++failures;
+            }
+            const double ref = expected[0] / (1.0 + std::exp(-expected[0])) * expected[1];
+            if (std::fabs(gu[t][r] - ref) > 2e-6 * (1 + std::fabs(ref))) ++failures;
+        }
+    }
+    std::printf("bih3 R1Q2 scalar vs FP64: worst normalized error %.3g, %d failures\n", worst, failures);
+    return failures;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -585,7 +670,7 @@ int main(int argc, char** argv) {
         std::printf("%d failures\n", f);
         return f ? 1 : 0;
     }
-    int f = 0;
+    int f = check_bih3_r1q2();
     for (bool had : {false, true}) {
         f += synthetic(145, 146, had);   // Gyro-S
         f += synthetic(144, 144, had);   // Gyro-M

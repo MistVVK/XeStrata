@@ -233,6 +233,17 @@ bool native_r1q2_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, cons
 }
 
 namespace {
+TqR1q2Scales r1q2_scales(const NativeFmt& f, const uint8_t* blob, int m) {
+    const size_t rows = (size_t) (m < 2 ? f.n_ff : f.n_embd);
+    const size_t blocks = (size_t) (m < 2 ? f.n_embd : f.n_ff) / kTqBlock;
+    const uint8_t* p = blob + f.sc_off + native_r1q2_scale_offset(f, m);
+    TqR1q2Scales scales{p, p + 2 * rows, p + 2 * rows + 2 * blocks, (blocks + 3) / 4, {}};
+    for (int q = 0; q < 4; ++q) scales.p2[q] = f.p2[m][q];
+    return scales;
+}
+}  // namespace
+
+namespace {
 // Q8_K (the activations of every i-quant row): ggml-cpu's x86 quantizer is the scalar reference, ~3 us per token
 // and layer on the host before the pool can start; q8k_quant_avx2 writes the same bytes.  cpu_avx2_ok() too:
 // iq_avx2.cpp is compiled for AVX2 (an AVX-only CPU, or STRATA_FORCE_ISA=avx, keeps ggml's).  STRATA_NO_Q8K_AVX2=1:
@@ -343,6 +354,12 @@ void part_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (f.r1q2) {
+        tq_bih3_r1q2_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1,
+                              r1q2_scales(f, blob, 0), r1q2_scales(f, blob, 1));
+        return;
+    }
+
     if (canon_layer(f)) { canon_gu_rows(f, blob, act, nt, ff, r0, r1); return; }
     if (f.gu_type == 42) {   // Q2_0: Strata's GGUF-layout kernels on the ActQ native_quant_act wrote
         thread_local float ub[MAXT][kNativeMaxFF];
@@ -437,6 +454,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    if (f.r1q2) {
+        tq_bih3_r1q2_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1,
+                           r1q2_scales(f, blob, 2));
+        return;
+    }
+
     if (canon_layer(f)) { canon_down_rows(f, blob, hq, nt, out, r0, r1); return; }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.  From one
