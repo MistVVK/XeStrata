@@ -122,6 +122,7 @@ def applicable(environ=None) -> tuple[Path, float] | None:
 # is about to read - clean pages only, nothing is lost but a faster re-read.
 ROOM_MIN_CACHE = 1 << 30            # the manager's file cache is at least 1 GiB ...
 ROOM_FREE_FRACTION = 0.8            # ... and free memory is below 0.8 x the size of the model's files (else there is room without it)
+ROOM_FREE_FRACTION_BOXED = 1.1      # in a container the engine's placement needs the model's size free (plus 10 %): MemFree is all the container can see
 ROOM_MIN_FREED = 256 << 20          # say it only when at least this much was given back
 ROOM_MAX_FILES = 200000
 
@@ -182,6 +183,23 @@ def _stat_value(cgroup_dir: Path, key: str) -> int | None:
     return None
 
 
+def in_container(environ=None) -> bool:
+    """A Docker or Podman container (Linux): the engine's memory guard is outside, on the host (0.2.17: rootless Podman on Ubuntu, where systemd-oomd ended the
+    container during the load; the container sees neither the user manager's cgroup nor the pacer's conditions, only the host's /proc/meminfo)."""
+    environ = os.environ if environ is None else environ
+    return sys.platform.startswith("linux") and (os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv") or bool(environ.get("container")))
+
+
+def _meminfo_cached() -> int | None:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("Cached:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _mem_free() -> int | None:
     try:
         for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
@@ -205,13 +223,20 @@ def make_room(args, say=None, environ=None, *, found=None, drop=_drop_cache, cac
     try:
         if environ.get("STRATA_OOMD_ROOM") == "0" or _DONTNEED is None:
             return why("turned off")
-        if (applicable(environ) if found is None else found) is None:
+        guard = applicable(environ) if found is None else found
+        boxed = guard is None and found is None and in_container(environ)      # 0.2.17: in a container the manager's cgroup cannot be seen, the host's can
+        if guard is None and not boxed:
             return why("not below a user manager watched by systemd-oomd")
-        cg = manager_cgroup()
-        if cg is None and found is None:
-            return why("no user manager cgroup")
-        cgroup_dir = CGROUP_ROOT / (cg or "").lstrip("/")
-        cache = (cache_of or (lambda: _stat_value(cgroup_dir, "file")))
+        if boxed:
+            cache = cache_of or _meminfo_cached
+            fraction = ROOM_FREE_FRACTION_BOXED
+        else:
+            cg = manager_cgroup()
+            if cg is None and found is None:
+                return why("no user manager cgroup")
+            cgroup_dir = CGROUP_ROOT / (cg or "").lstrip("/")
+            cache = (cache_of or (lambda: _stat_value(cgroup_dir, "file")))
+            fraction = ROOM_FREE_FRACTION
         before = cache()
         if before is None or before < ROOM_MIN_CACHE:
             return why(f"file cache of the manager {before} < {ROOM_MIN_CACHE}")
@@ -223,7 +248,7 @@ def make_room(args, say=None, environ=None, *, found=None, drop=_drop_cache, cac
             except OSError:
                 continue                                   # a broken link or a file that went away: not counted
         free = (free_of or _mem_free)()
-        if not files or total <= 0 or free is None or free >= ROOM_FREE_FRACTION * total:
+        if not files or total <= 0 or free is None or free >= fraction * total:
             return why(f"enough room: free {free}, files {len(files)}, bytes {total}")
         for p in files:
             drop(p)
@@ -239,7 +264,8 @@ def make_room(args, say=None, environ=None, *, found=None, drop=_drop_cache, cac
         if freed >= ROOM_MIN_FREED:
             (say or (lambda text: print(text, flush=True)))(
                 f"[strata] memory guard: freed {size_words(freed)} of memory that still held copies of this model's files from an earlier start, "
-                "so that loading does not run short of memory and this desktop (systemd-oomd) does not end it")
+                + ("so that loading does not run short of memory and a memory guard of this computer (such as systemd-oomd) does not end the container"
+                   if boxed else "so that loading does not run short of memory and this desktop (systemd-oomd) does not end it"))
         return freed
     except Exception as exc:                             # noqa: BLE001 - a nicety, never a reason for a start to fail
         return why(f"error {type(exc).__name__}: {exc}")
