@@ -1,6 +1,6 @@
 /**
  * Files dropped on the app window on Linux and macOS. The page gets the drag events there but not the files (WebKit hides them), so the app
- * shell reads the drop, hands the paths to the host, and tells the page with these two events (apps/desktop/src-tauri/src/main.rs):
+ * shell reads the drop, hands the paths to the host, and tells the page with these two events (app/desktop/src-tauri/src/main.rs):
  *   strata:native-drag  detail 'enter' | 'leave'      the drop box shows or goes away
  *   strata:native-drop  detail [{ id, name, type }]    the host holds each file once under its id
  */

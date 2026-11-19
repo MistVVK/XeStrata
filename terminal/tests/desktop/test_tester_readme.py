@@ -1,4 +1,4 @@
-"""The tester READMEs get their checksums from the files themselves (apps/desktop/scripts/make-tester-readme.sh)."""
+"""The tester READMEs get their checksums from the files themselves (app/desktop/scripts/make-tester-readme.sh)."""
 import hashlib
 import shutil
 import subprocess

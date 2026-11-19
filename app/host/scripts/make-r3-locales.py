@@ -1,5 +1,5 @@
 """Writes src/locales/r3-<lang>.json: the strings added by the owner's GUI feedback round 3 (branch f-0291-ui-r3).
-Run from apps/host:  python scripts/make-r3-locales.py
+Run from app/host:  python scripts/make-r3-locales.py
 Every entry names all nine languages; the keys are r3_01.. in the order of S. r3-en.json is the English source. Placeholders ({0}, {1}) must be kept in every
 language. A separate file keeps this work from colliding with the other catalogs (the same reason pick-, upd-, df2- and the others exist)."""
 import json

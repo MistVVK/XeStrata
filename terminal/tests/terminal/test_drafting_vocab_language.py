@@ -263,7 +263,7 @@ class TheShippedFiles(unittest.TestCase):
 
 class ThePackagingLists(unittest.TestCase):
     """data/ goes into every package whole (packaging/package_terminal.py INSTALLER_DATA is the folder, not a list of files), so a choice's file is in the Terminal's installer bundle, the app's Control
-    component (apps/desktop/scripts/stage-control.py takes the same name) and the Mac's Control. The Mac ENGINE folder (metal/data) carries only the default file, by design: the other choices are read from Control's data/."""
+    component (app/desktop/scripts/stage-control.py takes the same name) and the Mac's Control. The Mac ENGINE folder (metal/data) carries only the default file, by design: the other choices are read from Control's data/."""
 
     def test_the_installer_data_is_the_whole_folder_and_leaves_no_registered_file_out(self):
         sys.path.insert(0, str(ROOT.parent / "tools" / "packaging"))

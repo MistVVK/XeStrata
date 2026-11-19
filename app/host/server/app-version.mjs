@@ -1,5 +1,5 @@
 /**
- * The app's version, from one place. The desktop shell reports its own (apps/desktop/src-tauri/Cargo.toml, which Tauri also uses for
+ * The app's version, from one place. The desktop shell reports its own (app/desktop/src-tauri/Cargo.toml, which Tauri also uses for
  * the installer and file names) in STRATA_APP_VERSION. Outside the app, in a source checkout, the same file is read; otherwise 'dev'.
  */
 import { readFileSync } from 'node:fs';

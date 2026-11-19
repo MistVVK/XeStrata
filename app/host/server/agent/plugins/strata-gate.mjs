@@ -24,7 +24,7 @@
 export const name = 'strata-gate';
 export const inject = ['approval', 'permissionPresets', 'sessions', 'tools'];
 
-/** Preset key the host writes for Manual (apps/host/server/agent/profile.mjs MODE_PRESETS). */
+/** Preset key the host writes for Manual (app/host/server/agent/profile.mjs MODE_PRESETS). */
 export const MANUAL_PRESET = 'strata-manual';
 /** Preset key the host writes for Plan (read-only, nothing may change). */
 export const PLAN_PRESET = 'strata-plan';

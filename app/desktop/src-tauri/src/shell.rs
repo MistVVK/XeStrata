@@ -1,7 +1,7 @@
 //! The shell's own choices and the two things the host asks of it besides updates (#3402, #3477).
 //!
 //! `<Strata data folder>/shell-prefs.json` is written by the App Host when the person changes a setting
-//! (`apps/host/server/shell-prefs.mjs`) and read here when Strata starts, before any page exists:
+//! (`app/host/server/shell-prefs.mjs`) and read here when Strata starts, before any page exists:
 //!
 //!   { "port": 0 | 1024..65535, "tray": false, "language": "en" }
 //!

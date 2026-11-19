@@ -1,4 +1,4 @@
-"""The desktop app's version is written in one place: apps/desktop/src-tauri/Cargo.toml (Tauri reads it for the installer and file names when
+"""The desktop app's version is written in one place: app/desktop/src-tauri/Cargo.toml (Tauri reads it for the installer and file names when
 tauri.conf.json has no version; the shell passes it to the host as STRATA_APP_VERSION; the host reads the same file in a checkout)."""
 import json
 import re

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * Mock-ups of the Windows installer in Strata's own look: four screens (welcome, where, installing, done), light and dark, drawn with
- * the app's built CSS (apps/host/dist) and brand files, then photographed with Chrome. Nothing here is built or shipped: it is what
+ * the app's built CSS (app/host/dist) and brand files, then photographed with Chrome. Nothing here is built or shipped: it is what
  * the owner is shown before an installer is chosen.
  *
- *   node apps/desktop/scripts/installer-mockups.mjs [--out <folder>]
+ *   node app/desktop/scripts/installer-mockups.mjs [--out <folder>]
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';

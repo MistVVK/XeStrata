@@ -1,5 +1,5 @@
 """Writes src/locales/net-<lang>.json: the line shown while a download server has not answered yet (lane NET, owner wording 11-10, W14).
-Run from apps/host:  python scripts/make-net-locales.py
+Run from app/host:  python scripts/make-net-locales.py
 The English text is strata_control/netpolicy.py WORDS["waiting"] with {host} -> {0} and {seconds} -> {1}; setup prints it and
 strata_control/progress_words.py hands it to the app as the install step's label. Every entry names all nine languages; keys are net01.. in
 the order of S. Placeholders ({0}, {1}) must be kept in every language. The eight translations are first drafts for the owner's later look."""

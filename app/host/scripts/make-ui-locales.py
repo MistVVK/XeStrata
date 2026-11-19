@@ -1,5 +1,5 @@
 """Writes src/locales/ui-<lang>.json: the interface strings of the 0.2.10 interface changes (branch f-0291-ui).
-Run from apps/host:  python scripts/make-ui-locales.py
+Run from app/host:  python scripts/make-ui-locales.py
 Every entry names all nine languages; the keys are ui01.. in the order of S. ui-en.json is the English source. Placeholders ({0}, {1}) must be
 kept in every language. A separate file keeps this work from colliding with the other catalogs (the same reason tune-, tools-, fix- and gh- exist)."""
 import json

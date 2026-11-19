@@ -4,7 +4,7 @@
 # install anything whose digest does not match. Not committed output: node.exe is a ~90 MB binary.
 #
 # Usage:
-#   powershell -NoProfile -ExecutionPolicy Bypass -File apps\desktop\scripts\fetch-node.ps1
+#   powershell -NoProfile -ExecutionPolicy Bypass -File app\desktop\scripts\fetch-node.ps1
 #   ... -File fetch-node.ps1 -Check                  # verify what is already installed
 #   ... -File fetch-node.ps1 -FromFile node.zip      # verify and install a zip you already have (offline)
 #

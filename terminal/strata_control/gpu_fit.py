@@ -5,7 +5,7 @@ The rule (owner decision):
 2. Only when that does not fit, or would be too tight, offer to add the second card as a layer split.
 3. Let the person choose: every option comes with plain numbers and a recommended one is pre-selected (recommend, never force).
 
-The memory arithmetic is native-fit.ts `fitOn` (apps/host/src/lib/native-fit.ts) with the same constants (a test keeps them equal):
+The memory arithmetic is native-fit.ts `fitOn` (app/host/src/lib/native-fit.ts) with the same constants (a test keeps them equal):
 the experts are held first in the graphics memory beyond about DENSE_GB (the dense weights, buffers and a 32K cache), then in RAM beyond
 about SYSTEM_ROOM_GB left for the system; whatever is left would be read from the SSD (`spill_gb`). A split adds the memory of the extra
 cards but every extra card holds its own dense layers and prompt buffers, so each one costs SPLIT_CARD_OVERHEAD_GB of that (an estimate:

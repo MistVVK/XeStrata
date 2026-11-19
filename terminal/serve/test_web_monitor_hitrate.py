@@ -1,6 +1,6 @@
 """#5484: the Monitor's recent-requests table shows the VRAM hit rate column only when a request has a hit rate. On a Mac
 (unified memory) and for a model wholly in VRAM the engine reports none, and a column of dashes read as something
-missing. The web page (serve/web/app.js, run in node with stand-ins) and the app's Monitor (apps/host) both."""
+missing. The web page (serve/web/app.js, run in node with stand-ins) and the app's Monitor (app/host) both."""
 from __future__ import annotations
 
 import json

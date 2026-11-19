@@ -30,7 +30,7 @@ The same command works on Windows, Linux and macOS; the golden files hold no pat
 | entry | how it is driven | what is real | what is replaced |
 |---|---|---|---|
 | `launch` | `strata launch --model <set> --yes --no-tui` through `strata_cli.cli.main` | the whole command: settings, `Runner.run()`, the drafter step, config derivation and writing | the engine download, the model download (`ensure_model` returns the stand-in below), tuning, the server start, the drafter download |
-| `app_plain` | `apps/host/server/native-control.mjs` `operation('load', {model})` in Node (`app_driver.mjs`) | the host's whole Load code, and Control's `drafting plan` / `drafting fetch` (run through `control_shim.py` on the same simulated machine) | the installer process (catalog, hardware), Control's model list / engine / profile save / start, the drafter download |
+| `app_plain` | `app/host/server/native-control.mjs` `operation('load', {model})` in Node (`app_driver.mjs`) | the host's whole Load code, and Control's `drafting plan` / `drafting fetch` (run through `control_shim.py` on the same simulated machine) | the installer process (catalog, hardware), Control's model list / engine / profile save / start, the drafter download |
 | `app_models` | the same with `values: {drafting: 'auto'}` (what the Models screen's Load passes) | same | same |
 | `setup` | `strata_control.setup_config.config_for` (qwen / unsloth), the moved last stretch of `setup.py` main(), called with inputs built by `setup_driver.py` | the whole run-config construction: engine arguments, speed switches, cards, vision section | what `setup.py` decides before it (the cards and RAM come from the class, the context, budget, low-RAM, vision and resident choices from setup's own pure functions), the probes of the machine (`ProbeLib`), the model reader |
 
@@ -71,7 +71,7 @@ only place a difference is allowed, and each entry has its reason.  Today:
 
 **Request slots.**  On NVIDIA 72 GB the plain Load used to write `parallel: 3` and start `--batch 3 --batch-mtp`; that was only because it ran the MTP (no drafter had been fetched).
 Following Auto it runs DFlash2, which answers one request at a time, so the app writes no `parallel` there, as the Models-screen Load always did.  The golden files pin it:
-no app entry writes `parallel` or `--batch-mtp` in any cell.  The app's own default of several request slots (`apps/host/server/native-parallel.mjs`) is for runs that are not
+no app entry writes `parallel` or `--batch-mtp` in any cell.  The app's own default of several request slots (`app/host/server/native-parallel.mjs`) is for runs that are not
 DFlash2 and is not reached in this matrix.
 
 ## Adding a class or a set

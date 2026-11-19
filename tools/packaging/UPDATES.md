@@ -178,7 +178,7 @@ Back both up (a lost feed key means every installed PC needs a build with a new 
 Then, in git, once, in the commit that ships the first signed release (the release key id is `5d1bc23abbeffd0d`):
 
 * the `keys` entry from `feed-key.pub.json` into `strata_control/update_keys.json`;
-* the Tauri public key into `apps/desktop/src-tauri/tauri.conf.json` (`plugins.updater.pubkey`) and into `update_keys.json` as `app_minisign_public`
+* the Tauri public key into `app/desktop/src-tauri/tauri.conf.json` (`plugins.updater.pubkey`) and into `update_keys.json` as `app_minisign_public`
   (the Terminal verifies the app installer with it).
 
 Only release keys live in `update_keys.json`. A tester or local-test key is never added there: it is passed with `STRATA_UPDATE_TRUSTED_KEYS`
@@ -210,7 +210,7 @@ All signing happens on the release PC, on the finished files.
     # --url-prefix= (not --url-prefix "") because PowerShell 5.1 drops an empty argument. The Control version is the VERSION file
     # (0.1.63), not the app version: a Control package newer than the installed one is installed by `strata update`.
     # Pack Linux and Mac packages on Linux / the Mac or on Windows with this tool: it sets the execute bit from the file header either way.
-    cd apps/desktop && npx tauri build --bundles nsis --config src-tauri/tauri.update.conf.json    # Windows installer (no engine inside)
+    cd app/desktop && npx tauri build --bundles nsis --config src-tauri/tauri.update.conf.json    # Windows installer (no engine inside)
     # Linux: tauri build --bundles appimage (no engine inside) is the AppImage
     # on the release PC, per updater artifact (Windows setup .exe, Linux .AppImage, Mac Strata.app.tar.gz):
     npx tauri signer sign -f <path to tauri-updater.key> <artifact>                                 # writes <artifact>.sig
@@ -262,7 +262,7 @@ Publish as a normal release (latest): a pre-release is not found by `latest/down
 
 Everything above runs against a folder or a loopback server: `tests/terminal/test_update_feed.py` (signatures, hashes, downgrades, selection),
 `tests/terminal/test_updater.py` (end to end against a loopback HTTP feed with stub engines: update, test-start, switch; a failing test start
-keeps the old engine; an interrupted download resumes; rollback; Control; the app installer's minisign check), `apps/host/tests/component-updates.test.mjs`
+keeps the old engine; an interrupted download resumes; rollback; Control; the app installer's minisign check), `app/host/tests/component-updates.test.mjs`
 (the Settings buttons). For a real engine on a box, build a package with `packaging/package_engine.py`, serve it from a local feed made by `packaging/make_local_feed.py`, and run `strata update --feed` against it.
 
 ### Release gate: a feed model installed from a real file

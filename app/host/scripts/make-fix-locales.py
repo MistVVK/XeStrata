@@ -1,5 +1,5 @@
 """Writes src/locales/fix-<lang>.json: the interface strings that had no key in the locale files (#3479, #3825) and the strings of the 0.2.4.3 bug fixes.
-Run from apps/host:  python scripts/make-fix-locales.py
+Run from app/host:  python scripts/make-fix-locales.py
 The keys are fx01.. in this order; fix-en.json is the English source. Placeholders ({0}, {1}) must be kept in every language."""
 import json
 from pathlib import Path

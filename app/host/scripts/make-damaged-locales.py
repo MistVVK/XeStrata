@@ -1,5 +1,5 @@
 """Writes src/locales/dmg-<lang>.json: the surface for chat files the host cannot read (#5421).
-Run from apps/host:  python scripts/make-damaged-locales.py
+Run from app/host:  python scripts/make-damaged-locales.py
 Every entry names all nine languages; the keys are dmg01.. in the order of S. dmg-en.json is the English source. Placeholders ({0}) must be kept in every
 language. A separate file keeps this work from colliding with the other catalogs (the same reason sav-, upd-, df2-, pick- and the others exist)."""
 import json

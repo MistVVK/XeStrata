@@ -11,9 +11,9 @@
 # not match the recorded digest.
 #
 # Usage:
-#   apps/desktop/scripts/fetch-node.sh                 # host platform
-#   apps/desktop/scripts/fetch-node.sh --target linux-x64
-#   apps/desktop/scripts/fetch-node.sh --check         # verify what is already installed
+#   app/desktop/scripts/fetch-node.sh                 # host platform
+#   app/desktop/scripts/fetch-node.sh --target linux-x64
+#   app/desktop/scripts/fetch-node.sh --check         # verify what is already installed
 #
 # The Node version must satisfy the App Host's own `engines.node` (>= 24.12.0).
 set -euo pipefail

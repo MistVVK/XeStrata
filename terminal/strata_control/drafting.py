@@ -46,8 +46,8 @@ DFLASH2_BACKENDS = ("cuda", "hip", "metal", "sycl")
 #: Graphics memory each drafter takes on Qwen3.8-Flash-Next IQ3_S (GB; phaseA-tests/blackwell/RESULTS-DF2MEM.md section 1, l620, engine free memory at
 #: the first graph capture): DFlash2 alone 890 MiB, the MTP layer 1082 MiB. The fit, the plan and the slot estimates use the one that is chosen.
 #: `dflash2_selq4` is DFlash2 alone with the converted pack (the selector's codebooks as Q4_0 rows, 175 MiB less: the engine's drafter line 800 -> 625 MiB, section 16):
-#: 715 MiB. vram_gb() says which of the two is the true figure on this computer. The apps keep copies of these numbers (apps/host/server/native-parallel.mjs and
-#: apps/host/src/lib/native-fit.ts); apps/host/tests/drafting.test.mjs reads this table and fails when they differ.
+#: 715 MiB. vram_gb() says which of the two is the true figure on this computer. The apps keep copies of these numbers (app/host/server/native-parallel.mjs and
+#: app/host/src/lib/native-fit.ts); app/host/tests/drafting.test.mjs reads this table and fails when they differ.
 DRAFTER_MIB = {"dflash2": 890, "dflash2_selq4": 715, "mtp": 1082, "off": 0}
 DRAFTER_GB = {name: int(mib / 10 + 0.5) / 100 for name, mib in DRAFTER_MIB.items()}      # 0.89, 0.72, 1.08, the figures the apps show (mib rounded half up to 10 MiB)
 
@@ -78,7 +78,7 @@ def card_class(archs: Any) -> str:
 #   slower    measured on this kind of card: slower on every prompt
 #   untested  the engine has the code for this card but it was never measured on it
 
-#: What the Terminal's Drafting step and the app's paragraph under the dropdown say (the same words; apps/host/src/locales/df2-en.json, tests keep them equal).
+#: What the Terminal's Drafting step and the app's paragraph under the dropdown say (the same words; app/host/src/locales/df2-en.json, tests keep them equal).
 #: The numbers are measured: l620, RTX PRO 5000, Qwen3.8-Flash-Next IQ3_S, DFlash2 `--spec 6 --draft-conf 0.35` against MTP (phaseA-tests/blackwell/RESULTS-DRAFT.md section 4).
 EXPLAIN_NUMBERS = ("MTP is the default. DFlash2 is another way to guess the next words ahead, for Qwen3.8-Flash-Next only. On an RTX PRO 5000 it was 7.8% faster than MTP "
                    "on 19 short prompts and 1.1% faster on long thinking, and faster on 21 of 23 prompts. On the short prompts the answers were identical.")
@@ -494,7 +494,7 @@ DEFAULT_CONTEXT = 131072     # --max-context when the arguments name none (the 1
 SUPPORTED_FAMILIES = ("qwen", "gyro", "unsloth")
 #: The model_name setup.py (and metal/setup_mac.py) write: f"{family name}-{model.lower()}": qwen3.8-flash-next-iq3_s, qwen3.8-flash-next-gyro-gyro-s,
 #: qwen3.8-flash-next-unsloth-ud-q4_k_xl. (Coder is qwen3.8-flash-next-coder-iq1_m, NVFP4 qwen3.8-flash-next-nvfp4-nvfp4: neither matches.) Mirrored in
-#: apps/host/server/native-settings.mjs; tests/drafting.test.mjs keeps the two the same.
+#: app/host/server/native-settings.mjs; tests/drafting.test.mjs keeps the two the same.
 _SUPPORTED_NAME = re.compile(r"^qwen3\.8-flash-next(-gyro-[a-z0-9._-]+|-unsloth-[a-z0-9._-]+|-(q|iq|tq)\d[a-z0-9_.]*)?$", re.IGNORECASE)
 
 
@@ -879,7 +879,7 @@ def normalize(value: Any) -> str:
 ENGINE_SERVES_DFLASH2 = True
 
 #: Why another drafter (or none) runs when the one chosen cannot: a closed set of short reasons, each one is a sentence in the interface catalog in all
-#: nine languages (the line is "Drafting: MTP (<reason>)", apps/host/src/locales/df2-<lang>.json and en.json).
+#: nine languages (the line is "Drafting: MTP (<reason>)", app/host/src/locales/df2-<lang>.json and en.json).
 DIDNT_FIT = "DFlash2 didn't fit"
 NOT_HERE = "DFlash2 isn't available in this mode"
 NOT_SUPPORTED = "DFlash2 is for Qwen3.8-Flash-Next only"
@@ -1566,7 +1566,7 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
 
 ONE_REQUEST_NOTE = "DFlash2 answers one request at a time, so Strata set this model to one request at a time."
 #: setup could not fetch the MTP layer because the computer is offline (tools/mtp_fetch.py OFFLINE) and the start has no other drafter (owner, 11-15).
-#: The app shows the same words (apps/host/server/native-control.mjs installMtpLayer).
+#: The app shows the same words (app/host/server/native-control.mjs installMtpLayer).
 MTP_OFFLINE_NOTE = "There is no internet connection, so the draft layer can't be downloaded now. The model starts without it."
 
 

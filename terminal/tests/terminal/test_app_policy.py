@@ -1,4 +1,4 @@
-"""The app's host reads its launch-policy tables from apps/host/server/policy-generated.mjs, which strata_control/app_policy.py writes from the Python that owns them.
+"""The app's host reads its launch-policy tables from app/host/server/policy-generated.mjs, which strata_control/app_policy.py writes from the Python that owns them.
 A table changed in Python and not regenerated, or edited by hand in the JavaScript, fails here."""
 from __future__ import annotations
 

@@ -488,7 +488,7 @@ class AppPlanEqualsTerminalPlan(Base):
             self.assertIn("--no-split", out)
 
     def test_the_hosts_calls_only_carry_no_split_when_it_is_told_to(self):
-        """The app (apps/host/server/control-runtime.mjs) adds --no-split only after the split's draft layer could not be downloaded."""
+        """The app (app/host/server/control-runtime.mjs) adds --no-split only after the split's draft layer could not be downloaded."""
         text = (Path(__file__).resolve().parents[2].parent / "app" / "host" / "server" / "control-runtime.mjs").read_text(encoding="utf-8")
         self.assertNotIn("'--no-split', '--output', 'json'", text)
         self.assertNotIn("'--no-split', '--if-needed'", text)
@@ -496,7 +496,7 @@ class AppPlanEqualsTerminalPlan(Base):
 
 
 class AppStartsTheSplit(Base):
-    """The app's engine start (apps/host: buildConfig, then `profile` + `runtime start`) never went through the Terminal's apply_split_engine; Control now answers it
+    """The app's engine start (app/host: buildConfig, then `profile` + `runtime start`) never went through the Terminal's apply_split_engine; Control now answers it
     (`strata split-engine apply`, strata_control/split_engine.apply_run_config) from the same rule, engine package and draft layer."""
 
     @staticmethod

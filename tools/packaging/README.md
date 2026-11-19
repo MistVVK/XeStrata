@@ -44,9 +44,9 @@ The desktop bundle ships a pinned standalone Node beside the App Host, so an end
 (about 117 MB, an input rather than source). Fetch and verify it:
 
 ```sh
-apps/desktop/scripts/fetch-node.sh                 # host platform
-apps/desktop/scripts/fetch-node.sh --target linux-x64
-apps/desktop/scripts/fetch-node.sh --check         # verify what is installed
+app/desktop/scripts/fetch-node.sh                 # host platform
+app/desktop/scripts/fetch-node.sh --target linux-x64
+app/desktop/scripts/fetch-node.sh --check         # verify what is installed
 ```
 
 The script refuses an archive whose SHA-256 differs from the digest recorded for that target. The digests come from nodejs.org's
@@ -56,7 +56,7 @@ The script refuses an archive whose SHA-256 differs from the digest recorded for
 ## Desktop app
 
 ```sh
-cd apps/desktop
+cd app/desktop
 ./scripts/fetch-node.sh                                                      # the sidecar (once)
 npm install --prefix ../host && npm --prefix ../host run build                # the UI
 cargo tauri build --bundles app                                              # macOS: Strata.app
@@ -75,7 +75,7 @@ release PC ([UPDATES.md](UPDATES.md#releasing)).
 
 The installer carries Control, and on a Mac the Metal engine too. Neither fetches anything when it runs.
 
-**Control** (`<install>/control`, built by `apps/desktop/scripts/stage-control.py`) is the same bundle as the Terminal archive:
+**Control** (`<install>/control`, built by `app/desktop/scripts/stage-control.py`) is the same bundle as the Terminal archive:
 the pinned CPython 3.12.15, the hash-locked wheels, `strata_control`, `strata_cli` and `serve`, plus a `BUNDLE.json` with the
 interpreter and lock digests. The host finds it beside itself or through `STRATA_CONTROL_DIR`, runs it on its own interpreter
 (`PYTHONNOUSERSITE=1`, no `PYTHONHOME` or `PYTHONPATH`) and starts a model with `strata profile create|use-config` and
@@ -108,8 +108,8 @@ the next step (exit 0, nothing started). The app shows the same warning with an 
 **No acquisition at run time.** `STRATA_NO_ACQUIRE=1` (set by the Tauri shell for the host, and by the host for Control) makes
 `strata_control/acquisition.py` refuse pip, downloads and compiles. On the host side `server/acquisition.mjs` refuses the llama.cpp
 and cloudflared fetches (a connector placed in `components/cloudflared/` is used as it is). Models the user chooses to download are a
-separate, explicit action. `apps/host/tests/no-acquire.test.mjs` fails on any outbound request or installer process.
-`apps/desktop/scripts/installed-flow.mjs` drives an installed app end to end.
+separate, explicit action. `app/host/tests/no-acquire.test.mjs` fails on any outbound request or installer process.
+`app/desktop/scripts/installed-flow.mjs` drives an installed app end to end.
 
 ## The Terminal archive
 
@@ -146,7 +146,7 @@ The Terminal bundles a private Python and its dependencies for `windows-x86_64`,
 
 - **Tauri config:** an early draft used `perMachine`, `oneClick` and `deleteAppDataOnUninstall`. The Tauri schema rejects them; the
   current config uses `installMode: currentUser`.
-- **Repository size:** `apps/desktop/src-tauri/target` and the Node sidecar were briefly committed, which left about 324 MB in the git object
+- **Repository size:** `app/desktop/src-tauri/target` and the Node sidecar were briefly committed, which left about 324 MB in the git object
   store. They are untracked and ignored now. History was not rewritten.
 - **Mac packaging tests:** the first DMG self-test (8/8) and the engine's 17 kernel-parity suites ran on an Apple M4 GPU in a 16 GiB Mac, with service stand-ins for signing.
   Later inference measurements on larger Macs are in [MAC.md](../../docs/MAC.md).

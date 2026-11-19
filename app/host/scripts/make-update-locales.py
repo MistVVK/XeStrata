@@ -1,5 +1,5 @@
 """Writes src/locales/upd-<lang>.json: the strings of the engine update beside a loaded model (the dialog of Settings > About, branch f-0291-ui-final).
-Run from apps/host:  python scripts/make-update-locales.py
+Run from app/host:  python scripts/make-update-locales.py
 Every entry names all nine languages; the keys are upd01.. in the order of S. upd-en.json is the English source. Placeholders ({0}) must be kept in every
 language. A separate file keeps this work from colliding with the other catalogs (the same reason pick-, tune-, tools-, fix-, gh-, ui-, engine- and df2- exist)."""
 import json

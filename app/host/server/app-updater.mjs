@@ -1,7 +1,7 @@
 /**
  * The App Host's client of the desktop shell's update bridge.
  *
- * The desktop app updates itself with Tauri's signed updater, which lives in the Rust shell (apps/desktop/src-tauri). The
+ * The desktop app updates itself with Tauri's signed updater, which lives in the Rust shell (app/desktop/src-tauri). The
  * UI is served by this host, so it cannot call the shell directly; the shell opens a loopback listener, protected by a
  * random token it hands only to this host (STRATA_SHELL_BRIDGE, STRATA_SHELL_TOKEN), and this module is its client.
  * Outside the desktop app (a browser, a test, a source checkout) there is no bridge and `createAppUpdater` returns null.

@@ -3,7 +3,7 @@
  *
  * A helper is a child session of the chat's Harness session. This module is the pure part: it folds one child's
  * `session/follow` items into
- *   - an `agent` frame (the shape `apps/host/src/lib/agents.ts updateAgent` merges into the chat's existing rows:
+ *   - an `agent` frame (the shape `app/host/src/lib/agents.ts updateAgent` merges into the chat's existing rows:
  *     id, name, description, status, durationMs, tokens, updatedAt), and
  *   - tool cards, but only for a helper's request that needs the person (an approval). Everything else a helper does
  *     stays in its row; the transcript is not filled with the work of four helpers at once.

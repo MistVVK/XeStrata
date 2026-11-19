@@ -121,7 +121,7 @@ TOOLS_SUBSET = (
 #: (tools/strata_mcp.py reads setup.py's tables) and the install job, which downloads the model the user chose, prepares it with
 #: the bundled tools and writes a run config naming "component:strata-engine". setup.py runs in its CONTROL mode there
 #: (STRATA_CONTROL_INSTALL=1: no pip, no engine fetch, no compiler). Entry points; their local imports under tools/ come with them.
-#: The same list the app's Control component stages (apps/desktop/scripts/stage-control.py uses these names).
+#: The same list the app's Control component stages (app/desktop/scripts/stage-control.py uses these names).
 INSTALLER_FILES = ("setup.py", "ref/load.py")   # ref/load.py: strata_pack.py (the Q2_0 AVX-512 repack) imports it
 #: calibrate: setup.py imports it after a tune (calibrate_config, and the earlier tuning that a rerun applies); it was missing from this
 #: list in 0.1.47, so every launch after a tune failed (#3613, #3467). setup_tool_imports() below also reads setup.py itself, so a tools/

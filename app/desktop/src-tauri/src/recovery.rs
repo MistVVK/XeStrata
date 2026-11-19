@@ -9,7 +9,7 @@
 //!   - which failures are worth a reload (the page's own renderer; not a GPU process that restarts by itself, not a frame of the page);
 //!   - how many automatic recoveries are allowed in a window of time (a renderer that dies again at once is not reloaded for ever);
 //!   - where the reload goes: the same screen first, with the sidebar previews closed once; the home screen the second time.
-//! The page reads `?recovery=<n>` in apps/host/src/lib/recovery.ts. The chats are the host's: nothing here touches them.
+//! The page reads `?recovery=<n>` in app/host/src/lib/recovery.ts. The chats are the host's: nothing here touches them.
 
 /// Automatic recoveries allowed inside `WINDOW_MS`; the next failure leaves the window as it is for the person to reload.
 pub const MAX_AUTOMATIC: usize = 2;

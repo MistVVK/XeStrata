@@ -3,7 +3,7 @@
  * Stage the DeepSeek Harness (pinned, MIT) as the installer's `harness/` folder: a pruned PRODUCTION install, built at
  * build time, so nothing is fetched or compiled on the person's PC.
  *
- *   node apps/desktop/scripts/stage-harness.mjs --src <built Harness checkout> [--out apps/desktop/src-tauri/resources/harness]
+ *   node app/desktop/scripts/stage-harness.mjs --src <built Harness checkout> [--out app/desktop/src-tauri/resources/harness]
  *
  * <built Harness checkout> is a clone of the pinned commit after `pnpm install --frozen-lockfile` and `pnpm run build:artifacts`
  * (see phaseA-tests/notes-split-s4a.md, step 1). The script never touches it: it runs `pnpm deploy --legacy --prod` into
