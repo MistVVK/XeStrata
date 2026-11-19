@@ -615,6 +615,7 @@ public:
             for (int i = 0; i < T * 16; ++i) { fi[i] = (float) ((const int32_t*) moe_idx.ptr)[i]; fw[i] = ((const float*) moe_w.ptr)[i]; }
             save_npy_f32(dump_dir + "/L" + std::to_string(il) + "_topk_idx.npy", fi.data(), {T, 16});
             save_npy_f32(dump_dir + "/L" + std::to_string(il) + "_topk_w.npy", fw.data(), {T, 16});
+            save_npy_f32(dump_dir + "/L" + std::to_string(il) + "_cur_mlp.npy", (const float*) cur_f.ptr, {T, HID_});
         }
         op("router_zproj");
         const Arg sec4 = Arg::B(g.wbuf, g.sec4_off);
