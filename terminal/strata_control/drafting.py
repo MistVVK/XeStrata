@@ -1064,7 +1064,11 @@ def expected_slots(vram_mib: float, args: list[Any]) -> int:
     reserve = _flag_value(args, "--vram-reserve-mib")
     reserve = int(reserve) if reserve and reserve.isdigit() else SLOT_RESERVE_MIB
     prefill = _flag_value(args, "--prefill")
-    chunk = vram_fit.chunk_of(prefill.split(":")[-1] if prefill else "auto")
+    # "auto:N" is a ceiling the engine stays under: it lends the prompt buffers from the expert slots and picks the chunk by the card, so its N is not a buffer
+    # that sits beside the slots (#5252: --prefill auto:32768 was priced as 21.6 GiB of buffers, 442 slots against the engine's 8,158, and --draft-conf 0.8).
+    # A plain "auto" and an "auto:N" both come to what auto came to on the 8 GB card; only a number is a chunk the person asked for.
+    chunk = vram_fit.chunk_of(prefill if prefill else "auto")
+    # (--kv-resident is not priced here: the base below was measured on starts that had it, RTX 4080 SUPER 2,710 slots; pricing it raised that start to 3,035.)
     # SLOT_BASE_MIB is the baseline that holds the draft layer (the MTP's ~1.08 GiB, measured); DFlash2 is now the ONLY drafter, so that allowance pays for its own
     # 0.89 GiB (measured: "drafter 799 MiB" + its head's staging, 890 MiB beside the engine without one; 192 MiB less than the MTP layer): nothing more is taken off.
     free = (float(vram_mib) - vram_fit.GAP_OTHER_MIB - SLOT_BASE_MIB - vram_fit.session_mib(ctx, kv) - vram_fit.HEAD_MIB - reserve
