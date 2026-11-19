@@ -157,6 +157,7 @@ public:
     const Cfg& c;
     mtl::Context& cx;
     int max_ctx, Tc;
+    int n_run = 42;  // layers to run (--layers: partial runs for bisecting)
     int lib = -1;
     std::unordered_map<std::string, mtl::Pipeline> pl;
     std::vector<Dispatch> ds;
@@ -538,6 +539,13 @@ public:
         }
         lin_f32(pm + ".gate.weight", cur_f, F1, T);
         add("router_topk", T, 1, 256, {B(F1), g.tw(pm + ".gate.e_score_correction_bias"), B(moe_idx), B(moe_w), I(512), I(16), Fl(c.routed_scale)});
+        if (dump) {  // router decisions for bisecting against the oracle (--dbg-layers)
+            run_all();
+            std::vector<float> fi((size_t) T * 16), fw((size_t) T * 16);
+            for (int i = 0; i < T * 16; ++i) { fi[i] = (float) ((const int32_t*) moe_idx.ptr)[i]; fw[i] = ((const float*) moe_w.ptr)[i]; }
+            save_npy_f32(dump_dir + "/L" + std::to_string(il) + "_topk_idx.npy", fi.data(), {T, 16});
+            save_npy_f32(dump_dir + "/L" + std::to_string(il) + "_topk_w.npy", fw.data(), {T, 16});
+        }
         lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);
         const uint32_t nz = (uint32_t) T * 1536;
         add("f2h", (nz + 255) / 256, 1, 256, {B(z_f), B(z_h), U(nz)});
@@ -574,7 +582,7 @@ public:
         seg_mode = T > 8 || prof || seg_force;
         if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
         add("embed_hc", T, 1, 256, {g.tw("model.embed_tokens.weight"), B(d_ids), B(x), I(T)});
-        for (int il = 0; il < c.n_layers; ++il) {
+        for (int il = 0; il < n_run; ++il) {
             int mo = -1;
             for (int j = 0; j < 4; ++j)
                 if (emeta.layers[j] == il) mo = j;
@@ -637,7 +645,7 @@ static size_t rss_bytes() {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false;
-    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4;
+    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4, n_layers_run = 42;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -660,6 +668,7 @@ int main(int argc, char** argv) {
         else if (a == "--warm") warm = true;
         else if (a == "--seg") seg = true;
         else if (a == "--pair-max") pair_max = atoi(nxt().c_str());
+        else if (a == "--layers") n_layers_run = atoi(nxt().c_str());
         else {
             fprintf(stderr, "unknown arg %s\n", a.c_str());
             return 2;
@@ -715,6 +724,7 @@ int main(int argc, char** argv) {
     r.prof2 = prof2;
     r.seg_force = seg;
     r.pair_max = pair_max;
+    r.n_run = std::min(n_layers_run, r.c.n_layers);
     const int V = r.c.vocab;
     if (!r.init(no_engram ? std::string() : engram, all_logits ? r.Tc : 1, err)) {
         fprintf(stderr, "init: %s\n", err.c_str());

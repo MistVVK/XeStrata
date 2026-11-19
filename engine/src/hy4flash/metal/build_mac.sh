@@ -20,6 +20,12 @@ fi
 if [ "$T" = ktest ] || [ "$T" = all ]; then
   clang++ $CXXF $INC $S/src/hy4flash/metal/hy4_kernel_test.cpp $S/src/hy4flash/metal/strata_reader_nozstd.cpp $O/mtl_rt.o $FW -o $O/hy4_kernel_test
 fi
+if [ "$T" = ktest ] || [ "$T" = all ]; then
+  clang++ $CXXF $INC $S/src/hy4flash/metal/hy4_kernel_test2.cpp $S/src/hy4flash/metal/strata_reader_nozstd.cpp $O/mtl_rt.o $FW -o $O/hy4_kernel_test2
+fi
+if [ "$T" = mmb ] || [ "$T" = all ]; then
+  clang++ $CXXF $INC $S/src/hy4flash/metal/hy4_mm_bench.cpp $O/mtl_rt.o $FW -o $O/hy4_mm_bench
+fi
 if [ "$T" = run ] || [ "$T" = all ]; then
   clang++ $CXXF $INC $S/src/hy4flash/metal/hy4_metal_main.cpp $S/src/hy4flash/metal/hy4_engram.cpp $S/src/hy4flash/metal/strata_reader_nozstd.cpp $O/mtl_rt.o $FW -lpthread -o $O/strata-hy4-metal
 fi
@@ -36,6 +42,8 @@ if [ "$T" = cpu ] || [ "$T" = all ]; then
   done
   clang++ -std=c++20 -O2 -I$S/include -c $S/src/ngram/hy4_engram_reader.cpp -o $O/cpu/ngram.o
   clang++ -std=c++20 -O2 -I$S/include -c $S/src/hy4flash/metal/strata_reader_nozstd.cpp -o $O/cpu/reader.o
-  clang++ -std=c++20 -O2 -I$S/src/hy4flash/metal/omp_shim -I$S/src/hy4flash/run -I$S/include -Wno-unknown-pragmas $S/src/hy4flash/cpu/hy4_cpu.cpp $O/cpu/*.o -o $O/hy4cpu
+  # the oracle with an optional Engram shard: --engram none skips the 4 Engram injections (patched copy, the original file is untouched)
+  sed -e 's/m\.eng->stats()/(m.eng ? m.eng->stats() : ngram::Hy4EngramStats{})/g' -e 's/open_engram(m, engram_path);/if (engram_path != "none") open_engram(m, engram_path);/'       -e 's/if (mod >= 0) {/if (mod >= 0 \&\& m.eng) {/' $S/src/hy4flash/cpu/hy4_cpu.cpp > $O/hy4_cpu_mac.cpp
+  clang++ -std=c++20 -O2 -I$S/src/hy4flash/metal/omp_shim -I$S/src/hy4flash/run -I$S/include -Wno-unknown-pragmas $O/hy4_cpu_mac.cpp $O/cpu/*.o -o $O/hy4cpu
 fi
 echo build done
