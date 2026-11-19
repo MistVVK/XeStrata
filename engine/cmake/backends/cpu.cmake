@@ -234,7 +234,7 @@ macro(strata_cpu_native_experts)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
   if(STRATA_CPU_X86)
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
-                                             src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp
+                                             src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/kq_avx512.cpp src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp
                                              src/kernels/cpu/iq_avx1.cpp src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
                                              src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
   else()
@@ -248,6 +248,7 @@ macro(strata_cpu_native_experts)
                                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
@@ -264,6 +265,8 @@ macro(strata_cpu_native_experts)
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mavx2;-mfma;-mf16c")
     # the trellis kernels: AVX2 + FMA, and AVX-512 F/BW/VL/VBMI/VNNI (exactly what cpu_avx512_ok() checks)
     set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS
@@ -341,6 +344,16 @@ macro(strata_cpu_native_experts)
     set_tests_properties(pool_tasks_test PROPERTIES TIMEOUT 180)
     add_test(NAME router_dot_parity COMMAND router_dot_parity)
     add_test(NAME router_dot_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:router_dot_parity>)
+  endif()
+  # BW-4: UD-Q4_K_XL's AVX-512 VNNI rows (kq_avx512.cpp) against the build's one-token dot, bit for bit, 1 to 160 tokens; --bench: their speed against the AVX2 rows and the dot (SKIP, rc 77, on a CPU
+  # without AVX-512 VNNI).  The quant layer's dot is the reference, so it needs no ggml.
+  if(STRATA_OWN_CPU_QUANT)
+    add_executable(kq512_parity src/kernels/cpu/kq512_parity.cpp)
+    target_link_libraries(kq512_parity PRIVATE strata_kernels_cpu)
+    if(STRATA_BUILD_TESTS)
+      add_test(NAME kq512_parity COMMAND kq512_parity)
+      set_tests_properties(kq512_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    endif()
   endif()
   if(TARGET ggml-cpu)   # (the programs below compare against ggml-cpu or read its headers: only in a build that has ggml, CMakeLists.txt)
   # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp) bit for bit against each other at 1..8 tokens and
