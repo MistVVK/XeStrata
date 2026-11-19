@@ -3121,6 +3121,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--native-head-gguf requires --stream-token\n");
         return 2;
     }
+    if (!strata::core::dense_nq_init(o.pack, err)) {
+        std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
+        return 1;
+    }
+    if (strata::core::dense_nq_active() && (o.native_head_gguf.empty() || o.native_dense_gguf.empty())) {
+        std::fprintf(stderr, "xestrata generate: dense_nq requires native head and dense projections (--native)\n");
+        return 2;
+    }
     // Plan v0.3 P6: where the experts live.  A native pack (tools/iq_pack.py: the IQ2_XS / IQ3_XXS files) keeps
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
@@ -3442,7 +3450,10 @@ int main(int argc, char** argv) {
             try {
                 const strata::GgufModel hm = strata::GgufModel::open(o.native_head_gguf);
                 size_t at = 0;
-                if (const strata::TensorInfo* t = hm.find("output.weight", &at)) head_bytes = strata::tensor_payload_bytes(*t);
+                if (const strata::TensorInfo* t = hm.find("output.weight", &at)) {
+                    const auto* nq = strata::core::dense_nq_find("output.weight");
+                    head_bytes = nq ? nq->bytes : strata::tensor_payload_bytes(*t);
+                }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "xestrata generate: layer split auto: %s (the head left out of the sizes)\n", e.what());
             }
@@ -4298,7 +4309,10 @@ int main(int argc, char** argv) {
                 try {
                     const auto hm = strata::GgufModel::open(o.native_head_gguf);
                     size_t at = 0;
-                    if (const auto* t = hm.find("output.weight", &at)) later += strata::tensor_payload_bytes(*t);
+                    if (const auto* t = hm.find("output.weight", &at)) {
+                        const auto* nq = strata::core::dense_nq_find("output.weight");
+                        later += nq ? nq->bytes : strata::tensor_payload_bytes(*t);
+                    }
                 } catch (const std::exception&) {
                     std::fprintf(stderr, "xestrata generate: cannot estimate the later head allocation\n");
                     std::fprintf(stderr, "xestrata generate: session state allocation failed\n");
@@ -5248,7 +5262,7 @@ int main(int argc, char** argv) {
     const bool shared_empty = !o.shared_expert_arena.empty() &&
                               !strata::core::PinnedArena::shared_filled(o.shared_expert_arena);
     if (!o.mmap_experts && (o.shared_expert_arena.empty() || shared_empty) &&
-        !(native_pack && !std::ifstream(o.pack + "/experts.bin", std::ios::binary) && o.native_preset.empty())) {
+        !(native_pack && !std::ifstream(o.pack + (strata::kernels::cpu::expert_layout().mixed() ? "/experts.v2.bin" : "/experts.bin"), std::ios::binary) && o.native_preset.empty())) {
         const char* keep = strata::env_get("ARENA_LOW_RAM");
         strata::core::detail::HostMemory hm;
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -5304,7 +5318,7 @@ int main(int argc, char** argv) {
         // most of them but whose RAM cannot hold them all.
         // Without experts.bin a native pack's experts are read from the model's GGUF files in place (--native;
         // upstream 3889344): each blob assembled from its gate, up and down slices when it is needed.
-        if (native_pack && !std::ifstream(o.pack + "/experts.bin", std::ios::binary)) {
+        if (native_pack && !std::ifstream(o.pack + (strata::kernels::cpu::expert_layout().mixed() ? "/experts.v2.bin" : "/experts.bin"), std::ios::binary)) {
             if (o.native_preset.empty()) {
                 std::fprintf(stderr, "xestrata generate: --mmap-experts on the native pack %s without experts.bin needs "
                                      "--native (the experts are read from the GGUF files)\n", o.pack.c_str());
@@ -8410,9 +8424,11 @@ int main(int argc, char** argv) {
                 // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
                 if (!o.pack.empty()) {
                     for (const char* n : {"index.txt", "dense.bin"}) files.push_back({std::string("pack ") + n, o.pack + "/" + n});
-                    for (const char* n : {"embd.bin", "extra.bin", "manifest.json"})
+                    for (const char* n : {"embd.bin", "extra.bin", "manifest.json", "native_experts.txt", "experts_k.txt",
+                                          "r1q2.txt", "hadamard.txt", "dense_nq.txt", "dense_nq.bin"})
                         files.push_back({std::string("pack ") + n, o.pack + "/" + n, true});
-                    if (srcp == nullptr) files.push_back({"pack experts.bin", o.pack + "/experts.bin", true});
+                    if (srcp == nullptr) files.push_back({"pack experts", o.pack + (strata::kernels::cpu::expert_layout().mixed() ?
+                                                                            "/experts.v2.bin" : "/experts.bin"), true});
                 }
                 if (!o.mtp.empty()) {
                     for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
