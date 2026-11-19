@@ -54,6 +54,58 @@ class MakeRoom(unittest.TestCase):
         self.assertIn("freed 15 GB of memory that still held copies of this model's files", self.said[0])
         self.assertIn("systemd-oomd", self.said[0])
 
+    def test_an_amount_below_1_GB_is_said_in_MB_not_as_0_GB(self):      # 0.2.17 item 18: 256 MiB to 0.5 GB was "freed 0 GB"
+        for freed, words in ((256 << 20, "268 MB"), (400 * (1 << 20), "419 MB"), (500_000_000, "500 MB"), (999_000_000, "999 MB"),
+                             (1_000_000_000, "1 GB"), (1_400_000_000, "1 GB"), (14 * GIB, "15 GB")):
+            self.assertEqual(op.size_words(freed), words)
+        self.said.clear()
+        self.cache[0] = 3 * GIB
+        self.assertEqual(self.room(cache=3 * GIB - (400 << 20)), 400 << 20)
+        self.assertEqual(len(self.said), 1)
+        self.assertIn("freed 419 MB of memory that still held copies", self.said[0])
+        self.assertNotIn("0 GB", self.said[0])
+
+    def boxed(self, *, free, cache=3 * GIB, in_box=True, env=None):
+        """make_room as the server inside a container runs it: no user manager cgroup is visible, the figures are the host's /proc/meminfo."""
+        self.cache[0] = cache
+
+        def drop(path):
+            self.dropped.append(path.name)
+            self.cache[0] = 0
+            return True
+        with mock.patch.object(op, "applicable", return_value=None), mock.patch.object(op, "in_container", return_value=in_box):
+            return op.make_room(["--pack", str(self.d / "pack"), "--native", str(self.model)], self.said.append, env or {}, drop=drop,
+                                cache_of=lambda: self.cache[0], free_of=lambda: free, sizes=lambda p: 40 * GIB // 3)
+
+    def test_in_a_container_the_cache_is_dropped_when_the_free_memory_does_not_cover_the_model_plus_10_percent(self):
+        # 0.2.17, rootless Podman on Ubuntu (p1004): the container is ended by the HOST's systemd-oomd while 43 GB of 62 GB were free and 17 GB held the
+        # earlier start's cache; the desktop rule (free < 0.8 x the model) would have said "enough room"
+        freed = self.boxed(free=43 * GIB)
+        self.assertEqual(freed, 3 * GIB)
+        self.assertEqual(sorted(self.dropped), ["model.gguf", "t1.bin", "t2.bin"])
+        self.assertEqual(len(self.said), 1)
+        self.assertIn("does not end the container", self.said[0])
+        self.assertNotIn("this desktop", self.said[0])
+        self.said.clear()
+        self.dropped.clear()
+        self.assertEqual(self.boxed(free=45 * GIB), 0, "free memory covers the model plus 10 %: nothing to do")
+        self.assertEqual((self.dropped, self.said), ([], []))
+
+    def test_in_a_container_a_small_cache_and_a_switch_leave_it_alone(self):
+        self.assertEqual(self.boxed(free=10 * GIB, cache=GIB // 2), 0)
+        self.assertEqual(self.boxed(free=10 * GIB, env={"STRATA_OOMD_ROOM": "0"}), 0)
+        self.assertEqual(self.boxed(free=10 * GIB, in_box=False), 0, "neither below a user manager nor in a container")
+        self.assertEqual(self.dropped, [])
+
+    def test_a_container_is_told_by_its_marker_files_or_the_container_variable(self):
+        if not sys.platform.startswith("linux"):
+            self.skipTest("Linux only")
+        with mock.patch.object(op.os.path, "exists", lambda p: False):
+            self.assertFalse(op.in_container({}))
+            self.assertTrue(op.in_container({"container": "podman"}))
+        with mock.patch.object(op.os.path, "exists", lambda p: p == "/run/.containerenv"):
+            self.assertTrue(op.in_container({}))
+
     def test_nothing_is_done_when_there_is_room_without_it(self):
         self.assertEqual(self.room(free=200 * GIB), 0)                                         # a big PC: free memory covers the model
         self.assertEqual(self.dropped, [])
