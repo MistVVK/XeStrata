@@ -1098,7 +1098,6 @@ bits of the answer: a switch that changes rounding can change a greedy answer at
 | Setting | Applies to | Off switch | What it does |
 | --- | --- | --- | --- |
 | `STRATA_PREFILL_CPU_SHARE` (`auto`, cap `STRATA_PREFILL_CPU_SHARE_MAX=1024`) | CUDA, one GPU, no `--batch`, prompt chunks under 1,024 tokens | `STRATA_PREFILL_CPU_SHARE=0` | The CPU pool computes the experts few of the chunk's tokens route to, while the GPU works on the rest. `auto` measures per layer how long each side takes and checks that sharing pays. Skipped with one log line when RAM or commit is short. Output changes in the last bits. Layer split, batch slots and HIP keep it off unless you set it. |
-| `STRATA_ROUTE_TAIL_SKIP` (7) | CUDA, and HIP gfx1200/gfx1201; one GPU or a layer split | `STRATA_ROUTE_TAIL_SKIP=0` | A missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed. Not applied when every expert is in VRAM, with `--batch` slots, with a peer tier or helper GPU, on other HIP and SYCL, or when 90% or more of the experts are cached (`STRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves that line; it is 60% on an AMD layer split). Answers differ slightly from a run without it. |
 | PCIe share from the CPU's speed | CUDA, one GPU or a layer split, no `--pcie-frac` | `--pcie-frac N` always wins; `STRATA_PCIE_FRAC_DEFAULT=old` keeps the probe-only rule; `STRATA_PCIE_AUTO_SPLIT=0` keeps the fixed probe share on a CUDA layer split; `STRATA_PCIE_K_RULE=0` and `STRATA_PCIE_SHARE_MAX=0.60` keep the 0.2.10 rule | The share starts at the probe's value and is refined in the first decode windows from the CPU pool's time per missed expert: `L / (L + k R)`, rounded to 0.05 and kept between 0.10 and 0.95, changed at most three times. k is 1.85 from a pool rate R of 30 GB/s of expert bytes and falls linearly to 0.8 at 12 GB/s (a weak pool is compute-bound), so a strong pool gets exactly the 0.2.10 shares (below 0.60) and a weak one up to 0.95. A CUDA layer split refines each stage by its own probed link. Integrated GPUs (Strix Halo and the other APUs) and `STRATA_DEFAULTS=026` keep k 1.85 and 0.60; on HIP the layer-split refinement stays opt-in (`STRATA_PCIE_AUTO_SPLIT=1`). Each change prints a `PCIe share:` line. On HIP it is the default for gfx1200/gfx1201 and for a discrete gfx103x card (RX 6000, #4007); `STRATA_PCIE_FRAC_DEFAULT=auto` turns it on for other HIP parts. Measured on an RTX PRO 6000 (12 GB free): 2 x 12 GB layer split +12% decode; one card with 4 pool workers 56 -> 79 tok/s, 2 workers 31 -> 63, 32 workers unchanged. Output changes in the last bits (first-window KL 0.03 on the decode-window yardstick, the same as the single-card rule). |
 | Chunk follows the host's memory | Linux file tier | `STRATA_PREFILL_HOST_PLAN=0` | See [Linux file tier](#linux-file-tier). |
 | Fused int8 prompt experts | gfx12 (R9700): IQ3_S and IQ3_XXS packs. 12.0 NVIDIA cards with 80 or more SMs: IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS gate/up | `STRATA_PF_FUSED=0` | Replaces the MMQ prompt kernels. `STRATA_PF_FUSED=1` opts in every covered format on other cards (on HIP gfx11 and gfx1200/gfx1201 too; see [AMD_HIP.md](AMD_HIP.md)). |
@@ -1113,6 +1112,37 @@ bits of the answer: a switch that changes rounding can change a greedy answer at
 
 `STRATA_STAGER_SLEEP=1` makes the prompt-staging threads sleep while they wait on Windows too (they sleep on Linux and spin on
 Windows by default, which is a little faster). Use it when sharing the machine matters more than speed. `=0` forces spinning on Linux.
+
+### Route tail skip (`STRATA_ROUTE_TAIL_SKIP`): off by default since 0.2.17
+
+A missed expert (one that is not on the card) that every token of a verify window routes at rank 7 or lower is neither copied nor
+computed: its weight is dropped. It applies on CUDA and on HIP gfx1200/gfx1201, with one GPU or a layer split. It does not apply
+when every expert is in VRAM, with `--batch` slots, with a peer tier or helper GPU, on other HIP and SYCL, or when 90% or more of
+the experts are cached (`STRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves that line; it is 60% on an AMD layer split). Answers differ
+slightly from a run without it.
+
+- **Default.** Off, in every mode. Setup writes `STRATA_ROUTE_TAIL_SKIP=0` into the Unsloth run configs, and Strata sets the same
+  value at every engine start (Terminal, the app, Docker) when neither the run config nor your own environment names the setting,
+  so an install made before 0.2.17 starts with it off too. Engine 0.1.62 and older read an unset value as rank 7 on CUDA; the
+  engine itself will read an unset value as off from 0.1.63.
+- **Turn it on.** `STRATA_ROUTE_TAIL_SKIP=7`: in the app, Expert settings, "Skip rarely used parts of the model" = On; in the
+  Terminal, `strata launch --set STRATA_ROUTE_TAIL_SKIP=7`; or in the `"env"` of the model's run config. Your own environment
+  variable is used when the run config has no entry; a value in the run config wins over it. `1` to `9` choose another rank;
+  only 7 was measured. A 0.2.16 install that had it on "Automatic" runs with it off after the update and can be set to On again.
+- **Speed and quality** (UD-Q4_K_XL, RTX 5090, DFlash2 `--spec 6`, 48 prompts, 12,288 forced-token positions, KL against exact
+  routing; `phaseA-tests/bw/DECISION-TAIL-SKIP.md`):
+
+| Arm | KL against exact routing, all positions [95% interval] | Top-1 equals the exact text |
+| --- | --- | --- |
+| Skip off (exact routing), all experts in RAM | 0 (it wrote the text) | 100% |
+| Skip on (rank 7), all experts in RAM | 0.01260 [0.00981, 0.01612] | 97.30% |
+| Skip off, `--resident-budget-gib 40` | 0.00712 [0.00488, 0.01073] | 98.12% |
+| Skip on (rank 7), `--resident-budget-gib 40` | 0.01331 [0.00978, 0.01858] | 97.23% |
+
+  Decode, 300 new tokens, 2 interleaved rounds, skip on / skip off: all experts in RAM 94.5 / 73.4 tok/s (x1.29, mean of five
+  prompt kinds, x1.16 to x1.40 by kind); `--resident-budget-gib 40` 72.3 / 58.5 tok/s (x1.24, x0.95 to x1.54 by kind). Prompt speed
+  with it on is 0.96, 0.97, 0.98 and 0.98 of skip off at 4K, 16K, 32K and 65K tokens. Earlier measurements on 2-3-bit packs are in
+  [History](#history--older-measurements) (KL 0.0058 / 0.0056 on an RTX 3060 and 0.0032 / 0.0030 on an RTX A4000).
 
 ### Opt-in switches
 
