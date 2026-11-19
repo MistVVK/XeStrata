@@ -58,9 +58,15 @@ __global__ void combine(const float* __restrict__ parts, const float* __restrict
     }
     if constexpr (GATED) {
         // contraction off in this block only: the product is rounded on its own (scale_rows' store), then added
+#if defined(__HIPCC__)
 #pragma clang fp contract(off)
+#endif
         const float g = __fdividef(1.0f, 1.0f + __expf(-sg[tk]));
+#if defined(__HIPCC__)
         const float sh = shared[col] * g;
+#else
+        const float sh = __fmul_rn(shared[col], g);   // nvcc ignores the clang pragma and fuses the product into the add (#5100): a rounded multiply by hand
+#endif
         sum += sh;
     } else {
         if (shared) sum += shared[col];

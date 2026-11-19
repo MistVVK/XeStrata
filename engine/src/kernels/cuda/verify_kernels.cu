@@ -302,7 +302,9 @@ struct GdnQ81 { half2 ds; int8_t qs[32]; };
 __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t idx, float xi) {
     // no contraction: xi is a product here, and fma(a, b, shfl) would round the first sum unlike the separate
     // quantizer, which reads xi from memory (S26 harness: ds.sum differed by 1 ulp without this)
+#if defined(__HIPCC__)
 #pragma clang fp contract(off)
+#endif
     float amax = fabsf(xi), sum = xi;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));

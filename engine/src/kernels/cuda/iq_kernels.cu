@@ -3845,11 +3845,17 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
 // contraction off so the product cannot fuse into the first sum); h is still written (it is the scratch the old pair used)
 __global__ void s26_swiglu_q8_1_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
                                        block_q8_1* __restrict__ y, long long n) {
+#if defined(__HIPCC__)
 #pragma clang fp contract(off)
+#endif
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n is a multiple of 32: whole warps only
     const float g = gate[i];
+#if defined(__HIPCC__)
     const float xi = (g / (1.0f + __expf(-g))) * up[i];
+#else
+    const float xi = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);   // nvcc ignores the clang pragma: the product is rounded by hand, as swiglu_q8_1_entries_kernel does (#5100)
+#endif
     h[i] = xi;
     float amax = fabsf(xi), sum = xi;
 #pragma unroll
