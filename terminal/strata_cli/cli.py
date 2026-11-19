@@ -533,6 +533,9 @@ def parser() -> argparse.ArgumentParser:
     code_sessions = code_sp.add_parser("sessions", help="shared harness sessions")
     code_sessions.add_argument("action", choices=("list",))
     code_sessions.add_argument("--output", choices=("human", "json"), default="human")
+    complete = sp.add_parser("complete", help="print a bash, zsh or fish tab-completion script for the strata command")
+    complete.add_argument("--shell", choices=("bash", "zsh", "fish"), default="bash",
+                          help="which shell to print the script for (default bash)")
     for one_shot in (profile_create, profile_list, profile_show, profile_validate, profile_set,
                      profile_source, profile_edit, profile_history, profile_rollback, doctor,
                      components_verify, models_list, models_inspect, models_import, models_move, calibrate,
@@ -2216,6 +2219,10 @@ def _run(a: argparse.Namespace) -> int:
             return _timeskip(a)
         if a.command == "presets":
             return tune_commands.presets_command(a)
+        if a.command == "complete":
+            from strata_cli import completion
+            sys.stdout.write(completion.script(parser(), a.shell))
+            return 0
         if a.command in ("launch", "connect"):
             from strata_cli.launch import cmd as launch_cmd
             return launch_cmd.run_launch(a) if a.command == "launch" else launch_cmd.run_connect(a)

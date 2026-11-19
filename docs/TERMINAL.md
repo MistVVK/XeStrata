@@ -4,6 +4,17 @@
 
 For the shortest path, use the [terminal quick start](TERMINAL_QUICKSTART.md). The Terminal installs with one line (see [TERMINAL_LAUNCH.md](TERMINAL_LAUNCH.md#install-one-line)) and gives you the `strata` command; every command below is typed as `strata ...`. In a source checkout, run `python terminal/strata.py ...` from the repository root instead (use `python3` where there is no `python`).
 
+Tab completion. `strata complete --shell bash|zsh|fish` prints a completion script that is built from the commands, sub-commands and options of the `strata` you run, so it always matches your version. It needs no extra package.
+
+```sh
+eval "$(strata complete --shell bash)"                                # try it in this bash now
+strata complete --shell bash > ~/.local/share/bash-completion/completions/strata
+strata complete --shell zsh  > SOME_FOLDER_ON_YOUR_FPATH/_strata      # any folder on zsh's $fpath
+strata complete --shell fish > ~/.config/fish/completions/strata.fish
+```
+
+PowerShell has no script yet; typing `strata` there keeps its default completion.
+
 Read a server, watch it and start one:
 
 ```sh
