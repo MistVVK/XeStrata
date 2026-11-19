@@ -715,6 +715,26 @@ void test_host_memory() {
     require(probe("4:memory:/docker/abc\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v1 unlimited");
     // a v1 group not visible here (another namespace): MemAvailable alone
     require(probe("4:memory:/elsewhere\n") && m.available == 100 * GiB, "v1 group not mounted");
+    // a hybrid host (Vast's Docker containers): v1 controllers plus a "0::/..." line, and no cgroup.controllers at the root
+    // (the root is the v1 tree, the "0::" path is not in it).  The v1 limit must apply (it was "cannot determine")
+    fs::remove(t.path / "fs/cgroup.controllers");
+    put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
+    const std::string hybrid = "12:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n1:name=systemd:/docker/abc\n0::/docker/abc\n";
+    require(probe(hybrid) && m.available == 22 * GiB && m.cgroup_limit == 32 * GiB, "hybrid: the v1 limit applies");
+    require(probe("4:memory:/docker/abc\n0::/docker/abc\n") && m.available == 22 * GiB, "hybrid: the 0:: line last");
+    require(probe("0::/docker/abc\n4:memory:/docker/abc\n") && m.available == 22 * GiB, "hybrid: the 0:: line first");
+    require(probe("4:memory:/docker/abc\n0::/\n") && m.available == 22 * GiB, "hybrid: a 0::/ line");
+    put("fs/memory/docker/abc/memory.limit_in_bytes", "9223372036854771712\n");
+    require(probe(hybrid) && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "hybrid: v1 unlimited");
+    require(probe("0::/docker/abc\n") && m.available == 100 * GiB, "a 0:: line with no controllers file and no v1 line: MemAvailable alone");
+    // with cgroup.controllers (a real v2 root) the 0:: line is the limit and a v1 line beside it is not read
+    put("fs/cgroup.controllers", "memory\n");
+    put("fs/box/memory.max", std::to_string(48 * GiB) + "\n");
+    put("fs/box/memory.current", std::to_string(16 * GiB) + "\n");
+    put("fs/box/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
+    put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
+    require(probe("4:memory:/docker/abc\n0::/box\n") && m.cgroup_limit == 48 * GiB, "v2 root: the 0:: line wins over a v1 line");
+    require(!probe("0::/nowhere\n"), "v2 root: a 0:: path that is not a directory still fails");
 #else
     require(host_available_memory(m) && m.available > 0 && m.cgroup_limit == ~0ull, "this PC's RAM");
 #if defined(_WIN32)

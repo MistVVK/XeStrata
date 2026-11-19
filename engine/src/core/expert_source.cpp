@@ -455,6 +455,11 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
                 if (c == "memory") v1_path = line.substr(c2 + 1);
             continue;
         }
+        // A hybrid host (cgroup v1 controllers plus a "0::/..." line for the unified hierarchy; Docker on a v1 host, e.g.
+        // Vast's containers): the root is the v1 tree, it has no cgroup.controllers, and the "0::" path is not in it.
+        // That line is no v2 limit then; the v1 branch below reads the memory controller.  (Before, this returned false
+        // and --resident-budget-gib was ignored: "cannot determine available memory".)
+        if (!std::filesystem::exists(root / "cgroup.controllers")) continue;
         auto path = (root / line.substr(4)).lexically_normal();
         if (path.string().rfind(root.string(), 0) != 0 || !std::filesystem::is_directory(path)) return false;
         v2 = true;
