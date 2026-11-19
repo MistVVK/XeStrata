@@ -230,7 +230,8 @@ __global__ void __launch_bounds__(128) k_gemm_w(const __half* __restrict__ X, co
 
 // Flash attention on WMMA: block = 4 waves, wave = 16 queries of one head, loop over key tiles of 16. S = Q K^T (head dim 72 padded to 80: 4 full k-steps + a half one), online softmax in fp32,
 // P goes through a wave-private LDS tile into the A operand of P V. V arrives TRANSPOSED (vt[n = 72 h + d][key], row pitch ldv, so a column of V is a contiguous run of keys).
-constexpr int WA_PP = 24;
+constexpr int WA_PP = 72;   // LDS pitch (halves) of a wave's 16 x 64 probability tile
+constexpr int WA_KB = 64;   // keys per loop iteration: the row max / correction / oacc rescale are done once per 64 keys, the row sums are kept per lane and reduced at the end
 __global__ void __launch_bounds__(128) k_attn_w(const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ vt, __half* __restrict__ o, int N, int D, int ldv,
                                                 float scale) {
     __shared__ __align__(16) __half sP[4][16 * WA_PP];
@@ -238,10 +239,9 @@ __global__ void __launch_bounds__(128) k_attn_w(const __half* __restrict__ q, co
     const int l16 = lane & 15, hi = lane >> 4;
     const int h = blockIdx.y;
     const int q0 = blockIdx.x * 64 + wave * 16;
-    const int qrow = min(q0 + l16, N - 1);
     hv16 qf[5];
     {
-        const __half* qp = q + (size_t)qrow * D + h * VA_HD;
+        const __half* qp = q + (size_t)min(q0 + l16, N - 1) * D + h * VA_HD;
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) qf[ks] = ld_hv16(qp + ks * 16);
         qf[4] = ld_hv16_half(qp + 64);
@@ -249,54 +249,73 @@ __global__ void __launch_bounds__(128) k_attn_w(const __half* __restrict__ q, co
     fv8 oacc[5];
 #pragma unroll
     for (int t = 0; t < 5; ++t) oacc[t] = fv8{0, 0, 0, 0, 0, 0, 0, 0};
-    float mrun[8], lrun[8];
+    float mrun[8], lpart[8];  // lpart: this lane's share of the row sum (its column of every 16-key tile)
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         mrun[i] = -1e30f;
-        lrun[i] = 0.f;
+        lpart[i] = 0.f;
     }
     __half* sp = sP[wave];
-    for (int kt = 0; kt < N; kt += 16) {
-        const int key = min(kt + l16, N - 1);
-        const __half* kp = k + (size_t)key * D + h * VA_HD;
-        fv8 s = fv8{0, 0, 0, 0, 0, 0, 0, 0};
+    for (int kb = 0; kb < N; kb += WA_KB) {
+        fv8 s[4];
 #pragma unroll
-        for (int ks = 0; ks < 4; ++ks) s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[ks], ld_hv16(kp + ks * 16), s);
-        s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[4], ld_hv16_half(kp + 64), s);
-        const bool kvalid = kt + l16 < N;
+        for (int j = 0; j < 4; ++j) {
+            const int key = min(kb + j * 16 + l16, N - 1);
+            const __half* kp = k + (size_t)key * D + h * VA_HD;
+            fv8 a = fv8{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (int ks = 0; ks < 4; ++ks) a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[ks], ld_hv16(kp + ks * 16), a);
+            s[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[4], ld_hv16_half(kp + 64), a);
+        }
         float corr[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const float sc = kvalid ? s[i] * scale : -1e30f;
-            float mx = sc;
+            float mx = -1e30f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const bool kvalid = kb + j * 16 + l16 < N;
+                s[j][i] = kvalid ? s[j][i] * scale : -1e30f;
+                mx = fmaxf(mx, s[j][i]);
+            }
 #pragma unroll
             for (int off = 8; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 16));
             const float nm = fmaxf(mrun[i], mx);
             corr[i] = __expf(mrun[i] - nm);
-            const float p = kvalid ? __expf(sc - nm) : 0.f;
-            float ps = p;
-#pragma unroll
-            for (int off = 8; off > 0; off >>= 1) ps += __shfl_xor(ps, off, 16);
-            lrun[i] = lrun[i] * corr[i] + ps;
             mrun[i] = nm;
-            sp[(2 * i + hi) * WA_PP + l16] = __float2half(p);
-        }
-        __syncthreads();
-        const hv16 pf = ld_hv16(sp + l16 * WA_PP);
+            float ps = 0.f;
 #pragma unroll
-        for (int t = 0; t < 5; ++t) {
+            for (int j = 0; j < 4; ++j) {
+                const bool kvalid = kb + j * 16 + l16 < N;
+                const float p = kvalid ? __expf(s[j][i] - nm) : 0.f;
+                ps += p;
+                sp[(2 * i + hi) * WA_PP + j * 16 + l16] = __float2half(p);
+            }
+            lpart[i] = lpart[i] * corr[i] + ps;
+        }
+#pragma unroll
+        for (int t = 0; t < 5; ++t)
 #pragma unroll
             for (int i = 0; i < 8; ++i) oacc[t][i] *= corr[i];
-            const int d = min(t * 16 + l16, VA_HD - 1);
-            oacc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, ld_hv16(vt + (size_t)(h * VA_HD + d) * ldv + kt), oacc[t]);
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const hv16 pf = ld_hv16(sp + l16 * WA_PP + j * 16);
+#pragma unroll
+            for (int t = 0; t < 5; ++t) {
+                const int d = min(t * 16 + l16, VA_HD - 1);
+                oacc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, ld_hv16(vt + (size_t)(h * VA_HD + d) * ldv + kb + j * 16), oacc[t]);
+            }
         }
         __syncthreads();
     }
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
+        float l = lpart[i];
+#pragma unroll
+        for (int off = 8; off > 0; off >>= 1) l += __shfl_xor(l, off, 16);
         const int qi = q0 + 2 * i + hi;
         if (qi >= N) continue;
-        const float il = 1.0f / lrun[i];
+        const float il = 1.0f / l;
 #pragma unroll
         for (int t = 0; t < 5; ++t) {
             const int d = t * 16 + l16;
@@ -512,7 +531,7 @@ struct VisionEncoder {
         if (hipMalloc((void**)&d_h, bN * 2) != hipSuccess) return fail("h");
         if (hipMalloc((void**)&d_q, bN * 2) != hipSuccess) return fail("q");
         if (hipMalloc((void**)&d_k, bN * 2) != hipSuccess) return fail("k");
-        const int ldv = (N + 15) & ~15;  // key pitch of the transposed V of the matrix-core attention
+        const int ldv = (N + 63) & ~63;  // key pitch of the transposed V of the matrix-core attention (a multiple of its 64-key block)
         if (hipMalloc((void**)&d_v, use_wmma ? (size_t)D * ldv * 2 : bN * 2) != hipSuccess) return fail("v");
         if (use_wmma) HCK(hipMemsetAsync(d_v, 0, (size_t)D * ldv * 2, st));
         if (hipMalloc((void**)&d_ff, (size_t)N * FF * 2) != hipSuccess) return fail("ffn");
