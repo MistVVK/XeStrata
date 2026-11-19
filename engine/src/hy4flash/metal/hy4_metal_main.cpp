@@ -176,7 +176,7 @@ public:
     double gpu_total = 0;
 
     // buffers
-    Buffer d_ids, x, pre, post, cur_h, cur_f, F1, F2, F3, sub, H1, qr_h, qa_h, ctx_h, o_h, z_f, z_h, zout_f, moe_idx, moe_w, moe_h2, moe_y, moe_cnt, moe_off, moe_pairs, hfin, logits, d_argmax, er_h, kv_f;
+    Buffer d_ids, x, pre, post, cur_h, cur_f, F1, F2, F3, F4, sub, H1, qr_h, qa_h, ctx_h, o_h, z_f, z_h, zout_f, moe_idx, moe_w, moe_h2, moe_y, moe_cnt, moe_off, moe_pairs, hfin, logits, d_argmax, er_h, kv_f;
     Buffer d_experts, wk_b, wv_b, ivg_dummy;
     std::vector<size_t> wk_off, wv_off;
     std::vector<Buffer> kcache, ivg, pooled;
@@ -237,6 +237,11 @@ public:
         a.second++;
     }
     void op(const std::string& label) { if (prof2) part(label); }
+    bool relax_ok = true, allow_nb = true;   // independent dispatches may overlap (no barrier before them); off for the MPP path (shared dequant scratch)
+    void relax(int n = 1) {
+        if (!allow_nb) return;
+        for (int i = 0; i < n && i < (int) ds.size(); ++i) ds[ds.size() - 1 - i].barrier = false;
+    }
     void run_all() {
         if (ds.empty()) return;
         double t = cx.run_graph(ds);
@@ -306,6 +311,7 @@ public:
         F1 = A(big * 4);
         F2 = A(big * 4);
         F3 = A(big * 4);
+        F4 = A((size_t) T * 3072 * 4);
         H1 = A(big * 2);
         qr_h = A((size_t) T * 1024 * 2);
         qa_h = A((size_t) T * 64 * 576 * 2);
@@ -514,13 +520,17 @@ public:
         add("hc_reduce_norm", T, 1, 256, {B(x), B(pre), g.tw(L(il) + ".input_layernorm.weight"), B(cur_h), B(cur_f), Fl(c.rms_eps), I(0)});
         op("hc_reduce_norm");
         lin(pa + ".q_a_proj.weight", cur_h, F1, T);
+        lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F4, T);
+        relax();
+        lin(pa + ".linear_gate.weight", cur_h, F3, T);
+        relax();
         add("rms_rows", T, 1, 256, {B(F1), g.tw(pa + ".q_a_layernorm.weight"), B(F1), B(qr_h), I(c.q_lora), Fl(c.rms_eps), I(1 | 4)});
-        lin(pa + ".q_b_proj.weight", qr_h, F2, T);
-        lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);
-        op("qkv_proj");
         const int cslots = swa ? ring : slots_sparse;
         (void) cslots;
-        add("mla_write_kv", T, 1, 256, {B(F1), g.tw(pa + ".kv_a_layernorm.weight"), B(kcache[il]), I(p0), I(swa ? ring : 0), Fl((float) theta(il)), Fl(c.rms_eps)});
+        add("mla_write_kv", T, 1, 256, {B(F4), g.tw(pa + ".kv_a_layernorm.weight"), B(kcache[il]), I(p0), I(swa ? ring : 0), Fl((float) theta(il)), Fl(c.rms_eps)});
+        relax();
+        lin(pa + ".q_b_proj.weight", qr_h, F2, T);
+        op("qkv_proj");
         const int TT = T <= 8 ? 1 : 8;
         add(TT == 1 ? "mla_prep_q_1" : "mla_prep_q_8", NH, (T + TT - 1) / TT, 256, {B(F2), B(wk_b, wk_off[il]), B(qa_h), I(T), I(NH), I(p0), Fl((float) theta(il))});
         op("mla_prep");
@@ -533,7 +543,6 @@ public:
             }
             op("indexer");
         }
-        lin(pa + ".linear_gate.weight", cur_h, F3, T);
         MlaArgs a{};
         a.M = T;
         a.NH = NH;
@@ -548,8 +557,7 @@ public:
         add(TT == 1 ? "mla_vup_1" : "mla_vup_8", NH, (T + TT - 1) / TT, 256, {B(ctx_h), B(wv_b, wv_off[il]), B(F3), B(o_h), I(T), I(NH)});
         lin(pa + ".o_proj.weight", o_h, F1, T);
         op("vup_o");
-        add("add_rms", T, 1, 256, {B(F1), B(F1), g.tw(pa + ".post_proj_norm.weight"), B(sub), I(HID_), Fl(c.rms_eps), I(0)});
-        add("hc_post", T, 1, 256, {B(x), B(sub), B(post)});
+        add("add_rms_post", T, 1, 256, {B(F1), B(F1), g.tw(pa + ".post_proj_norm.weight"), B(x), B(post), Fl(c.rms_eps), I(0)});
         part(swa ? "attn_swa(30)" : "attn_sparse(12)");
     }
 
@@ -565,13 +573,23 @@ public:
             const uint32_t n = (uint32_t) T * 13824;
             add("swiglu_h", (n + 255) / 256, 1, 256, {B(F1), B(F2), B(H1), U(n)});
             lin(pm + ".down_proj.weight", H1, F3, T);
-            add("add_rms", T, 1, 256, {B(F3), B(F3), g.tw(pm + ".post_fc2_norm.weight"), B(sub), I(HID_), Fl(c.rms_eps), I(0)});
-            add("hc_post", T, 1, 256, {B(x), B(sub), B(post)});
+            add("add_rms_post", T, 1, 256, {B(F3), B(F3), g.tw(pm + ".post_fc2_norm.weight"), B(x), B(post), Fl(c.rms_eps), I(0)});
             part("mlp_dense(1)");
             return;
         }
+        const uint32_t nz = (uint32_t) T * 1536;
         lin_f32(pm + ".gate.weight", cur_f, F1, T);
+        lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);
+        relax();
+        lin(pm + ".shared_experts.gate_proj.weight", cur_h, F3, T);
+        relax();
+        lin(pm + ".shared_experts.up_proj.weight", cur_h, F4, T);
+        relax();
         add("router_topk", T, 1, 256, {B(F1), g.tw(pm + ".gate.e_score_correction_bias"), B(moe_idx), B(moe_w), I(512), I(16), Fl(c.routed_scale)});
+        add("f2h", (nz + 255) / 256, 1, 256, {B(z_f), B(z_h), U(nz)});
+        relax();
+        add("swiglu_h", (nz + 255) / 256, 1, 256, {B(F3), B(F4), B(H1), U(nz)});
+        relax();
         if (dump) {  // router decisions for bisecting against the oracle (--dbg-layers)
             run_all();
             std::vector<float> fi((size_t) T * 16), fw((size_t) T * 16);
@@ -579,9 +597,6 @@ public:
             save_npy_f32(dump_dir + "/L" + std::to_string(il) + "_topk_idx.npy", fi.data(), {T, 16});
             save_npy_f32(dump_dir + "/L" + std::to_string(il) + "_topk_w.npy", fw.data(), {T, 16});
         }
-        lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);
-        const uint32_t nz = (uint32_t) T * 1536;
-        add("f2h", (nz + 255) / 256, 1, 256, {B(z_f), B(z_h), U(nz)});
         op("router_zproj");
         const Arg sec4 = Arg::B(g.wbuf, g.sec4_off);
         const Arg exl = Arg::B(d_experts, (size_t) (il - 1) * 512 * sizeof(ExpertDev));
@@ -613,13 +628,10 @@ public:
         op("moe_experts");
         add("f2h", (nz + 255) / 256, 1, 256, {B(zout_f), B(z_h), U(nz)});
         lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);
-        lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);
-        lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
-        add("swiglu_h", (nz + 255) / 256, 1, 256, {B(F1), B(F3), B(H1), U(nz)});
         lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);
+        relax();
         op("up_shared");
-        add("add_rms", T, 1, 256, {B(F2), B(F3), g.tw(pm + ".combine_output_norm.weight"), B(sub), I(HID_), Fl(c.rms_eps), I(1)});
-        add("hc_post", T, 1, 256, {B(x), B(sub), B(post)});
+        add("add_rms_post", T, 1, 256, {B(F2), B(F3), g.tw(pm + ".combine_output_norm.weight"), B(x), B(post), Fl(c.rms_eps), I(1)});
         part("moe(41)");
     }
 
@@ -627,6 +639,7 @@ public:
     bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err) {
         std::memcpy(d_ids.ptr, tok_all + p0, (size_t) T * 4);
         seg_mode = T > 8 || prof || seg_force;
+        allow_nb = relax_ok && !(mpp_ok && T >= std::min(mpp_min, moe_mm_min));
         if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
         add("embed_hc", T, 1, 256, {g.tw("model.embed_tokens.weight"), B(d_ids), B(x), I(T)});
         for (int il = 0; il < n_run; ++il) {
@@ -691,7 +704,7 @@ static size_t rss_bytes() {
 
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
-    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false;
+    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false;
     int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -717,6 +730,7 @@ int main(int argc, char** argv) {
         else if (a == "--pair-max") pair_max = atoi(nxt().c_str());
         else if (a == "--layers") n_layers_run = atoi(nxt().c_str());
         else if (a == "--no-mpp") no_mpp = true;
+        else if (a == "--no-relax") no_relax = true;
         else if (a == "--moe-mm-min") moe_mm_min_arg = atoi(nxt().c_str());
         else if (a == "--mpp-min") mpp_min_arg = atoi(nxt().c_str());
         else {
@@ -775,6 +789,7 @@ int main(int argc, char** argv) {
     r.seg_force = seg;
     r.pair_max = pair_max;
     r.mpp_try = !no_mpp;
+    r.relax_ok = !no_relax;
     r.mpp_min = mpp_min_arg;
     r.moe_mm_min = moe_mm_min_arg;
     r.n_run = std::min(n_layers_run, r.c.n_layers);

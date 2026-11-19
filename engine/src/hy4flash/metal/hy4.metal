@@ -186,6 +186,34 @@ kernel void add_rms(device const float* a [[buffer(0)]], device const float* b [
     }
 }
 
+kernel void add_rms_post(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device const float* w [[buffer(2)]], device float* x [[buffer(3)]],
+                         device const float* post [[buffer(4)]], constant float& eps [[buffer(5)]], constant int& has_b [[buffer(6)]], uint row [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh[32];
+    size_t o = (size_t) row * HID;
+    float v[HID / 256];
+    float ss = 0;
+    for (int i = 0; i < HID / 256; ++i) {
+        int d = tid + i * 256;
+        float t = a[o + d] + (has_b ? b[o + d] : 0.0f);
+        v[i] = t;
+        ss += t * t;
+    }
+    ss = tg_sum(ss, sh, tid, 256);
+    float inv = rsqrt(ss / float(HID) + eps);
+    device const float* p = post + (size_t) row * NHC;
+    float p0 = p[0], p1 = p[1], p2 = p[2], p3 = p[3];
+    device float* xt = x + (size_t) row * NHC * HID;
+    for (int i = 0; i < HID / 256; ++i) {
+        int d = tid + i * 256;
+        float sv = v[i] * inv * w[d];
+        xt[d] += sv * p0;
+        xt[HID + d] += sv * p1;
+        xt[2 * HID + d] += sv * p2;
+        xt[3 * HID + d] += sv * p3;
+    }
+}
+
 kernel void f2h(device const float* in [[buffer(0)]], device half* out [[buffer(1)]], constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i < n) out[i] = half(in[i]);
 }
