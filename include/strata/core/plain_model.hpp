@@ -717,7 +717,9 @@ private:
         /// the fused [q | k | v] and [gate | up] matrices q, k, v, sh_gate and sh_up are row ranges of, and whether the
         /// layer is a sliding-window one
         const float *attn_post = nullptr, *ffn_post = nullptr;
-        W qkv_all, gu_all;
+        W qkv_all, gu_all, beta_alpha_all;
+        W hc_attn_fn, hc_ffn_fn;
+        const float *hc_attn_bias = nullptr, *hc_ffn_bias = nullptr;
         bool swa = false;
         const float* router = nullptr;                        // F32 [n_embd, n_expert]
         const float* sh_gate_inp = nullptr;                   // F32 [n_embd]

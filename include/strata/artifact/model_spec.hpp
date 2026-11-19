@@ -93,6 +93,11 @@ struct ModelSpec {
         const int64_t width = loop_end - loop_start, extra = (loop_count - 1) * width;
         return visit < loop_end + extra ? loop_start + (visit - loop_start) % width : visit - extra;
     }
+    bool mhc_active_before(int64_t visit) const {
+        if (arch != ModelArch::SenseNovaLoop || visit >= n_layer) return false;
+        const int64_t physical = physical_layer(visit);
+        return physical > mhc_start && physical < mhc_end;
+    }
     int64_t tensor_layer(int64_t visit) const {
         const int64_t physical = physical_layer(visit);
         return arch == ModelArch::SenseNovaLoop && physical < loop_end ? physical : visit;
@@ -271,7 +276,7 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
         // qwen35moe.cpp: attention.recurrent_layers when written, else every layer but each interval-th
         std::vector<double> r;
         const MetaValue* rv = spec_get(g, A, "attention.recurrent_layers");
-        if (s.arch == ModelArch::SenseNovaLoop && (!rv || rv->type != MetaType::ARRAY)) {
+        if (s.arch == ModelArch::SenseNovaLoop && (!rv || rv->type != MetaType::ARRAY || rv->elem != MetaType::BOOL)) {
             err = A + ".attention.recurrent_layers must have one value per layer"; return false;
         }
         if (spec_per_layer(g, A, "attention.recurrent_layers", n_all, r)) {
@@ -306,9 +311,10 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     if (s.arch == ModelArch::SenseNovaLoop) {
         const char* keys[] = {"loop.start", "loop.end", "loop.count", "mhc.start", "mhc.end", "mhc.streams",
                               "mhc.iterations", "mhc.fixed_identity", "mhc.pre_scale"};
-        for (const char* key : keys) {
-            const MetaValue* v = spec_get(g, A, key);
-            if (!v || !v->is_num()) { err = "missing or invalid " + A + "." + key; return false; }
+        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+            const MetaValue* v = spec_get(g, A, keys[i]);
+            const MetaType type = i == 7 ? MetaType::BOOL : i == 8 ? MetaType::F32 : MetaType::U32;
+            if (!v || v->type != type) { err = "missing or invalid " + A + "." + keys[i]; return false; }
         }
         s.loop_start = spec_int(g, A, "loop.start");
         s.loop_end = spec_int(g, A, "loop.end");

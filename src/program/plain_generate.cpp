@@ -3184,8 +3184,8 @@ int plain_main(int argc, char** argv) {
         }
     }
     if (!cvecs.files.empty()) {   // before the first window records the blocks
-        if (model.spec().arch == ModelArch::Glm5Next) {
-            std::fprintf(stderr, "xestrata (%s): --control-vector is not available for GLM-5.3-Flash yet\n", arch.c_str());
+        if (model.spec().arch == ModelArch::Glm5Next || model.spec().arch == ModelArch::SenseNovaLoop) {
+            std::fprintf(stderr, "xestrata (%s): --control-vector is not available for this model yet\n", arch.c_str());
             return 2;
         }
         if (!load_control_vectors(cvecs, model.spec().n_layer, model.spec().n_embd, arch, err) ||

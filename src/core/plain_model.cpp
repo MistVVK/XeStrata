@@ -109,6 +109,9 @@ constexpr int kF16 = 1;
 // Matrices loaded by upload keep F16's exact values in F32; routed experts keep their file layout.
 uint64_t uploaded_bytes(const TensorInfo& t) {
     const uint64_t bytes = tensor_payload_bytes(t);
+    // The fused GDN beta/alpha is widened to F32 unless it is already BF16 or F32.
+    if (t.name.find("ssm_beta_alpha.weight") != std::string::npos && t.type != kBF16 && t.type != kF32)
+        return t.elements() * sizeof(float);
     return t.type == kF16 && t.shape.size() >= 2 && t.name.find("_exps.") == std::string::npos ? 2 * bytes : bytes;
 }
 
@@ -310,9 +313,10 @@ PlainModel::W PlainModel::row_view(const W& all, int64_t r0, int64_t r1) {
 
 bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string& err) {
     const ModelSpec& s = spec_;
-    const bool q35 = s.arch == ModelArch::Qwen35Moe || s.arch == ModelArch::Qwen35;
+    const bool loop = s.arch == ModelArch::SenseNovaLoop;
+    const bool q35 = s.arch == ModelArch::Qwen35Moe || s.arch == ModelArch::Qwen35 || loop;
     const uint64_t N = (uint64_t) s.n_embd, E = (uint64_t) s.n_expert;
-    const std::string p = "blk." + std::to_string(l) + ".";
+    const std::string p = "blk." + std::to_string(s.tensor_layer(l)) + ".";
     if (!upload_f32(m, p + "attn_norm.weight", N, b.attn_norm, err) ||
         !upload_f32(m, p + (q35 ? "post_attention_norm.weight" : "ffn_norm.weight"), N, b.post_norm, err))
         return false;
@@ -324,13 +328,28 @@ bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string
     }
     if (b.recurrent) {
         const uint64_t C = (uint64_t) (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner);
-        if (!upload(m, p + "attn_qkv.weight", b.qkv, err) || !upload(m, p + "attn_gate.weight", b.z, err) ||
-            !upload(m, p + "ssm_alpha.weight", b.alpha, err, true) ||
-            !upload(m, p + "ssm_beta.weight", b.beta, err, true) ||
-            (b.alpha.type != kBF16 && b.alpha.type != kF32 &&
-             (!upload(m, p + "ssm_alpha.weight", b.alpha_f, err, true, true) ||
-              !upload(m, p + "ssm_beta.weight", b.beta_f, err, true, true))) ||
-            !upload(m, p + "ssm_out.weight", b.ssm_out, err) ||
+        if (loop) {
+            if (!upload(m, p + "attn_qkv_gate.weight", b.qkv_all, err) ||
+                !upload(m, p + "ssm_beta_alpha.weight", b.beta_alpha_all, err, true, true)) return false;
+            if (b.qkv_all.n_in != s.n_embd || b.beta_alpha_all.n_in != s.n_embd ||
+                b.qkv_all.n_out != (int64_t) C + s.ssm_d_inner || b.beta_alpha_all.n_out != 2 * s.ssm_dt_rank) {
+                err = "plain model: block " + std::to_string(l) + "'s fused GDN projections have other shapes";
+                return false;
+            }
+            const int64_t qkv_rows = (int64_t) C;
+            b.qkv = row_view(b.qkv_all, 0, qkv_rows);
+            b.z = row_view(b.qkv_all, qkv_rows, qkv_rows + s.ssm_d_inner);
+            b.beta = row_view(b.beta_alpha_all, 0, s.ssm_dt_rank);
+            b.alpha = row_view(b.beta_alpha_all, s.ssm_dt_rank, 2 * s.ssm_dt_rank);
+            for (const W* w : {&b.qkv, &b.z})
+                if (k::native_mmvq_supported(w->type)) tune_wait_.push_back(w);
+        } else if (!upload(m, p + "attn_qkv.weight", b.qkv, err) || !upload(m, p + "attn_gate.weight", b.z, err) ||
+                   !upload(m, p + "ssm_alpha.weight", b.alpha, err, true) ||
+                   !upload(m, p + "ssm_beta.weight", b.beta, err, true) ||
+                   (b.alpha.type != kBF16 && b.alpha.type != kF32 &&
+                    (!upload(m, p + "ssm_alpha.weight", b.alpha_f, err, true, true) ||
+                     !upload(m, p + "ssm_beta.weight", b.beta_f, err, true, true)))) return false;
+        if (!upload(m, p + "ssm_out.weight", b.ssm_out, err) ||
             !upload_f32(m, p + "ssm_conv1d.weight", C * (uint64_t) s.ssm_d_conv, b.conv, err) ||
             !upload_f32(m, p + "ssm_dt.bias", (uint64_t) s.ssm_dt_rank, b.dt, err) ||
             !upload_f32(m, p + "ssm_a", (uint64_t) s.ssm_dt_rank, b.a, err) ||
@@ -367,6 +386,17 @@ bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string
             return false;
         }
         nkv_ = nkv;
+    }
+    if (loop && s.physical_layer(l) >= s.mhc_start && s.physical_layer(l) < s.mhc_end) {
+        if (!upload(m, p + "hc_attn_fn.weight", b.hc_attn_fn, err, true) ||
+            !upload_f32(m, p + "hc_attn_fn.bias", 8, b.hc_attn_bias, err) ||
+            !upload(m, p + "hc_ffn_fn.weight", b.hc_ffn_fn, err, true) ||
+            !upload_f32(m, p + "hc_ffn_fn.bias", 8, b.hc_ffn_bias, err)) return false;
+        if (b.hc_attn_fn.type != kF32 || b.hc_ffn_fn.type != kF32 || b.hc_attn_fn.n_in != 2 * s.n_embd ||
+            b.hc_ffn_fn.n_in != 2 * s.n_embd || b.hc_attn_fn.n_out != 8 || b.hc_ffn_fn.n_out != 8) {
+            err = "plain model: block " + std::to_string(l) + "'s mHC router has another shape or type";
+            return false;
+        }
     }
     if (dense_) {   // qwen35's FFN, in the shared expert's fields (the same products, without the gate or the router)
         if (plamo_) {   // one [gate | up] matrix (ffn_up, 2 n_ff rows: llama.cpp's swiglu takes the first half as gate)
@@ -483,6 +513,13 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         return false;
     }
     if (!read_model_spec(model_->meta(), spec_, err)) return false;
+    if (spec_.arch == ModelArch::SenseNovaLoop) {
+        if (opt_.cpu || opt_.encoder || opt_.stream_blocks || opt_.vision || !tap_req_.empty() ||
+            (opt_.gpu_layers >= 0 && opt_.gpu_layers < spec_.n_layer)) {
+            err = "plain model: this SenseNova-Loop path needs GPU-resident text blocks"; return false;
+        }
+        opt_.spec = 0;
+    }
     // the layer split: its points (given, or from the GPUs' memory), each rising inside the trunk, a GPU each
     const int64_t nl = spec_.n_layer;
     // the GPUs a split takes, as generate.cpp's: the runtime's first, then the ones --split-device names, else the
@@ -522,6 +559,9 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     if (opt_.gpu_layers < 0 && spec_.dense() && at.empty() && !opt_.split_auto && opt_.batch_slots == 0 &&
         !opt_.encoder && !opt_.vision && k::cpu::cpu_avx2_ok() && !auto_gpu_layers(err))
         return false;
+    if (spec_.arch == ModelArch::SenseNovaLoop && opt_.gpu_layers >= 0 && opt_.gpu_layers < nl) {
+        err = "plain model: SenseNova-Loop does not run blocks on the CPU"; return false;
+    }
     if (opt_.gpu_layers >= 0 && opt_.gpu_layers < nl) {
         if (!spec_.dense() || !at.empty() || opt_.split_auto || opt_.batch_slots > 0 || opt_.encoder || opt_.vision) {
             err = "plain model: --gpu-layers splits a dense model (qwen35, plamo3) between one GPU and the CPU, with no "
@@ -1036,11 +1076,11 @@ bool PlainModel::rope_scalings(const ModelSpec& s, const PlainOptions& opt, k::R
 bool PlainModel::load_qwen(std::string& err) {
     const ModelSpec& s = spec_;
     if (s.arch != ModelArch::Qwen35Moe && s.arch != ModelArch::Qwen3Moe && s.arch != ModelArch::Qwen35 &&
-        s.arch != ModelArch::Plamo3 && s.arch != ModelArch::Qwen3) {
+        s.arch != ModelArch::Plamo3 && s.arch != ModelArch::Qwen3 && s.arch != ModelArch::SenseNovaLoop) {
         err = "plain model: " + s.arch_name + " is not run by this engine yet";
         return false;
     }
-    const bool q35 = s.arch == ModelArch::Qwen35Moe || s.arch == ModelArch::Qwen35;
+    const bool q35 = s.arch == ModelArch::Qwen35Moe || s.arch == ModelArch::Qwen35 || s.arch == ModelArch::SenseNovaLoop;
     dense_ = s.dense();
     plamo_ = s.arch == ModelArch::Plamo3;
     // a dense model's decode windows with a graph or straight onto the stream, whichever is faster on this GPU
@@ -1104,7 +1144,20 @@ bool PlainModel::load_qwen(std::string& err) {
             streamed_.resize((size_t) s.n_layer);
             stream_into_ = &streamed_[(size_t) l];
         }
-        const bool ok = l < lb_ || l >= le_ || load_block(m, l, b, err);
+        bool ok = true;
+        if (l >= lb_ && l < le_) {
+            int64_t prior = lb_;
+            if (s.arch == ModelArch::SenseNovaLoop)
+                while (prior < l && s.tensor_layer(prior) != s.tensor_layer(l)) ++prior;
+            else prior = l;
+            if (prior < l) {
+                const int64_t gdn = b.gdn, attn = b.attn;
+                b = blocks_[(size_t) prior];
+                b.gdn = gdn; b.attn = attn;
+            } else {
+                ok = load_block(m, l, b, err);
+            }
+        }
         stream_into_ = nullptr;
         if (!ok) return false;
     }
@@ -1547,13 +1600,14 @@ bool PlainModel::load_qwen(std::string& err) {
     const uint64_t T = (uint64_t) opt_.max_t, NH = (uint64_t) s.n_head, HD = (uint64_t) s.key_length;
     const uint64_t NKV = (uint64_t) qs.n_head_kv, HV = (uint64_t) s.ssm_dt_rank, ZV = (uint64_t) s.ssm_d_inner;
     const uint64_t K = (uint64_t) s.n_expert_used, FS = (uint64_t) (dense_ ? s.n_ff : s.n_ff_shexp);
-    hand_w_ = s.n_embd;
+    const bool loop = s.arch == ModelArch::SenseNovaLoop;
+    hand_w_ = loop ? 2 * s.n_embd : s.n_embd;
     if (!mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_) ||
         !mapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
         !mapped(T * (NH + NKV) * 4, (void**) &h_pos_, (void**) &m_pos_) ||
         !mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) || !mapped(16, (void**) &h_prob_, (void**) &m_prob_) ||
-        (!first() && !mapped(T * N * 4, (void**) &h_in_, (void**) &m_in_)) ||
-        (!last() && !mapped(T * N * 4, (void**) &h_hand_, (void**) &m_hand_))) {
+        (!first() && !mapped(T * (uint64_t) hand_w_ * 4, (void**) &h_in_, (void**) &m_in_)) ||
+        (!last() && !mapped(T * (uint64_t) hand_w_ * 4, (void**) &h_hand_, (void**) &m_hand_))) {
         err = "plain model: mapped staging allocation failed";
         return false;
     }
@@ -1579,6 +1633,10 @@ bool PlainModel::load_qwen(std::string& err) {
         !dev(&logits_, T * (uint64_t) n_vocab_ * 4) || (has_mtp_ && !dev(&mtp_h_, T * N * 4))) {
         err = "plain model: no VRAM for the window's buffers";
         return false;
+    }
+    if (loop && (!dev(&g_hs_, T * 2 * N * 4) || !dev(&g_mixes_, T * 8 * 4) ||
+                 !dev(&g_post_, T * 2 * 4) || !dev(&g_comb_, T * 4 * 4) || !dev(&g_y_, T * N * 4))) {
+        err = "plain model: no VRAM for the loop's mHC buffers"; return false;
     }
     std::vector<int32_t> counts((size_t) T + 1);
     for (size_t i = 0; i < counts.size(); ++i) counts[i] = (int32_t) i;
@@ -1757,6 +1815,10 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
             take(b.kv_stage.k_q, codes); take(b.kv_stage.v_q, codes);
             take(b.kv_stage.k_scale, scales); take(b.kv_stage.v_scale, scales);
         } else { take(b.kv_stage.k_pool, codes * 2); take(b.kv_stage.v_pool, codes * 2); }
+    }
+    if (s.arch == ModelArch::SenseNovaLoop) {
+        take(b.g_hs, U * 2 * N * 4); take(b.g_mixes, U * 8 * 4); take(b.g_post, U * 2 * 4);
+        take(b.g_comb, U * 4 * 4); take(b.g_y, U * N * 4);
     }
     if (glm_) {   // plain_prompt_glm5.cpp
         const uint64_t HC = 4, MIX = (2 + HC) * HC, S = (uint64_t) s.kda_head_dim, GC = NH * S;
@@ -3835,8 +3897,19 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         if (quantize) k::native_quantize_q8_1(x, xq_, w.n_in, ncols, cs);
         k::native_mmvq(w.type, w.data, xq_, y, w.n_in, w.n_out, ncols, cs);
     };
-    // the norm writes the q8_1 rows the projections read as well (one launch; after nextsycl's Qwen3.5 norm)
-    k::native_qsa_rms_norm_weighted_q8_1(x_, b.attn_norm, hn_, xq_, (int) N, T, eps, cs);
+    const bool mhc = b.hc_attn_fn.data != nullptr;
+    const int64_t visit = mhc ? &b - blocks_.data() : -1;
+    auto route = [&](const W& fn, const float* bias) {
+        k::f32_gemv_fp32_mmvf_multi(g_hs_, 2 * N, static_cast<const float*>(fn.data), g_mixes_, 8, 2 * N, 8, T, cs);
+        k::glm5_hc_pre(g_hs_, g_mixes_, nullptr, bias, 1e-6f, 0, (int) s.mhc_iterations,
+                       g_y_, g_post_, g_comb_, N, T, cs, 2, (float) s.mhc_pre_scale);
+    };
+    if (mhc) {
+        if (s.physical_layer(visit) == s.mhc_start) k::glm5_hc_init(x_, g_hs_, N, T, cs, 2);
+        route(b.hc_attn_fn, b.hc_attn_bias);
+    }
+    // the norm writes the q8_1 rows the projections read as well
+    k::native_qsa_rms_norm_weighted_q8_1(mhc ? g_y_ : x_, b.attn_norm, hn_, xq_, (int) N, T, eps, cs);
     // a batch window (row_slot_): each row reads and writes its own slot's state, the rows' products shared
     const bool rows = !row_slot_.empty();
     auto slot_of = [&](int t) -> const SlotSession& { return bslots_[(size_t) row_slot_[(size_t) t]]; };
@@ -3954,7 +4027,10 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
             proj(b.o, attn_, mix_, T, true);
         }
     }
-    if (b.attn_post != nullptr) {   // plamo3: the mixer's output normed before the add
+    if (mhc) {
+        k::glm5_hc_post(mix_, g_hs_, g_post_, g_comb_, g_hs_, N, T, cs, 2);
+        route(b.hc_ffn_fn, b.hc_ffn_bias);
+    } else if (b.attn_post != nullptr) {   // plamo3: the mixer's output normed before the add
         k::native_qsa_rms_norm_weighted(mix_, b.attn_post, hn_, (int) N, T, eps, cs);
         k::add_inplace(x_, hn_, (int64_t) T * N, cs);
     } else {
@@ -3964,13 +4040,13 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     if (dense_) {   // qwen35's FFN: the shared expert's products, from the norm's q8_1 rows where the weights take them
         const bool q8 = q8_in(b.sh_gate) && q8_in(b.sh_up) && q8_in(b.sh_down);
         if (!q8) {
-            k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
+            k::native_qsa_rms_norm_weighted(mhc ? g_y_ : x_, b.post_norm, hn_, (int) N, T, eps, cs);
             proj(b.sh_gate, hn_, sh_gate_, T, true);   // (each quantizes hn_ again: a file may mix the types)
             proj(b.sh_up, hn_, sh_up_, T, true);
             k::native_swiglu_f32(sh_gate_, sh_up_, sh_gate_, (int) FS, T, cs);
             proj(b.sh_down, sh_gate_, moe_out_, T, true);
         } else {
-            k::native_qsa_rms_norm_weighted_q8_1(x_, b.post_norm, hn_, xq_, (int) N, T, eps, cs);
+            k::native_qsa_rms_norm_weighted_q8_1(mhc ? g_y_ : x_, b.post_norm, hn_, xq_, (int) N, T, eps, cs);
             float* up = sh_up_;
             if (b.gu_all.data != nullptr && T == 1) {   // plamo3's fused gate and up: one product for one row
                 k::native_mmvq(b.gu_all.type, b.gu_all.data, xq_, sh_gate_, (int) N, (int) (2 * FS), T, cs);
@@ -3984,14 +4060,19 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
             k::native_swiglu_q8_1(sh_gate_, up, xq_, (int) FS, T, cs);
             k::native_mmvq(b.sh_down.type, b.sh_down.data, xq_, moe_out_, (int) FS, (int) N, T, cs);
         }
-        if (b.ffn_post != nullptr) {   // plamo3: the FFN's output normed before the add
+        if (mhc) {
+            k::glm5_hc_post(moe_out_, g_hs_, g_post_, g_comb_, g_hs_, N, T, cs, 2);
+            if (s.physical_layer(visit) == s.mhc_end - 1) k::glm5_hc_mean(g_hs_, x_, N, T, cs, 2);
+        } else if (b.ffn_post != nullptr) {   // plamo3: the FFN's output normed before the add
             k::native_qsa_rms_norm_weighted(moe_out_, b.ffn_post, hn_, (int) N, T, eps, cs);
             k::add_inplace(x_, hn_, (int64_t) T * N, cs);
         } else {
             k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
         }
-        steer(b, T, x_, cs);
-        tap_block(b, T, cs);
+        if (!mhc || s.physical_layer(visit) == s.mhc_end - 1) {
+            steer(b, T, x_, cs);
+            tap_block(b, T, cs);
+        }
         return true;
     }
 
@@ -4298,7 +4379,13 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err,
     const int64_t N = s.n_embd, NH = s.n_head;
     const float eps = (float) s.rms_eps;
     const int64_t NKV = attn_shapes().n_head_kv;
-    k::copy_from_mapped(x_, first() ? m_emb_ : m_in_, (int64_t) T * N, cs);   // the embeddings, or the rows handed on
+    const bool loop = s.arch == ModelArch::SenseNovaLoop;
+    if (loop && !first()) {
+        k::copy_from_mapped(g_hs_, m_in_, (int64_t) T * 2 * N, cs);
+        if (!s.mhc_active_before(lb_)) k::glm5_hc_mean(g_hs_, x_, N, T, cs, 2);
+    } else {
+        k::copy_from_mapped(x_, first() ? m_emb_ : m_in_, (int64_t) T * N, cs);
+    }
     k::copy_i32_from_mapped(step_, m_step_, (int64_t) T * k::kStepCount, cs);
     k::copy_i32_from_mapped(pos_, m_pos_, (int64_t) opt_.max_t * (NH + NKV), cs);
     uint32_t ring = 0;
@@ -4307,7 +4394,12 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err,
                           err))
             return false;
     if (!last()) {   // the rows to the next stage
-        k::copy_from_mapped(m_hand_, x_, (int64_t) T * N, cs);
+        if (loop) {
+            if (!s.mhc_active_before(le_)) k::glm5_hc_init(x_, g_hs_, N, T, cs, 2);
+            k::copy_from_mapped(m_hand_, g_hs_, (int64_t) T * 2 * N, cs);
+        } else {
+            k::copy_from_mapped(m_hand_, x_, (int64_t) T * N, cs);
+        }
         return true;
     }
     k::native_qsa_rms_norm_weighted(x_, out_norm_, hn_, (int) N, T, eps, cs);
