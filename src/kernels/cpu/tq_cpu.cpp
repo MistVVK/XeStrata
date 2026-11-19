@@ -264,16 +264,38 @@ bool bih3_isa_ok(Bih3Isa isa) {
     return false;
 }
 
-Bih3Isa bih3_isa() {
-    static const Bih3Isa isa = [] {
+Bih3Isa bih3_isa(int nt) {
+    if (nt < 1 || nt > kTqMaxTokens) std::abort();
+    static const std::array<Bih3Isa, kTqMaxTokens + 1> pick = [] {
+        std::array<Bih3Isa, kTqMaxTokens + 1> p{};
         const char* e = strata::env_get("TQ_ISA");
         const std::string cap = e == nullptr ? "" : e;
-        if (cap == "scalar") return Bih3Isa::scalar;
-        if (cap != "avx2" && cap != "avxvnni" && bih3_isa_ok(Bih3Isa::avx512vnni)) return Bih3Isa::avx512vnni;
-        if (cap != "avx2" && bih3_isa_ok(Bih3Isa::avxvnni)) return Bih3Isa::avxvnni;
-        return bih3_isa_ok(Bih3Isa::avx2) ? Bih3Isa::avx2 : Bih3Isa::scalar;
+        const bool a512 = bih3_isa_ok(Bih3Isa::avx512vnni);
+        const bool vnni = bih3_isa_ok(Bih3Isa::avxvnni);
+        const bool a2 = bih3_isa_ok(Bih3Isa::avx2);
+        for (int t = 1; t <= kTqMaxTokens; ++t) {
+            if (cap == "scalar") { p[t] = Bih3Isa::scalar; continue; }
+            if (cap == "avxvnni") { p[t] = vnni ? Bih3Isa::avxvnni : (a2 ? Bih3Isa::avx2 : Bih3Isa::scalar); continue; }
+            if (cap != "avx2") {
+                // AVX-512 F/BW/VL/VNNI (no VBMI needed): the ZMM 16-bit-word form beats both ymm forms at
+                // every NT in llvm-mca (2026-11-19), on every model tried including the double-pumped ones
+                // (-mcpu=icelake-server 43.20/51.17/63.18/86.18 against the AVX2 form's 61.27/79.19/97.16/
+                // 138.16 at NT 1/2/4/8; -mcpu=znver4 34.24/44.68/59.19/87.20 against the AVX-VNNI form's
+                // 49.73/59.73/73.77/127.18).
+                if (a512) { p[t] = Bih3Isa::avx512vnni; continue; }
+                // NT=1 takes the AVX2 tree: on the dev machine (i7-14700, the only AVX-VNNI machine here)
+                // it measures 0.2915 us/row against the AVX-VNNI tree's 0.3049, and llvm-mca -mcpu=znver5
+                // agrees (46.27 against 49.73); -mcpu=alderlake disagrees (50.07 against 48.69) and the
+                // measurement wins.  NT >= 2 takes AVX-VNNI: faster in the dev measurement
+                // (0.3359/0.3958/0.5548 against 0.3363/0.4019/0.5826 at NT 2/4/8) and in llvm-mca
+                // (-mcpu=alderlake, znver4/5).
+                if (vnni && t > 1) { p[t] = Bih3Isa::avxvnni; continue; }
+            }
+            p[t] = a2 ? Bih3Isa::avx2 : Bih3Isa::scalar;
+        }
+        return p;
     }();
-    return isa;
+    return pick[nt];
 }
 
 const char* bih3_isa_name(Bih3Isa isa) {
@@ -327,7 +349,7 @@ void tq_bih3_r1q2_rows_isa(Bih3Isa isa, int type, const uint8_t* w, size_t row_b
 
 void tq_bih3_r1q2_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                         float* const* out, int r0, int r1, const TqR1q2Scales& scales) {
-    tq_bih3_r1q2_rows_isa(bih3_isa(), type, w, row_bytes, n, act, nt, out, r0, r1, scales);
+    tq_bih3_r1q2_rows_isa(bih3_isa(nt), type, w, row_bytes, n, act, nt, out, r0, r1, scales);
 }
 
 void tq_bih3_r1q2_gu_rows_isa(Bih3Isa isa, int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n,
@@ -350,7 +372,7 @@ void tq_bih3_r1q2_gu_rows_isa(Bih3Isa isa, int type, const uint8_t* blob, size_t
 void tq_bih3_r1q2_gu_rows(int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n,
                            const void* const* act, int nt, float* const* ff, int r0, int r1,
                            const TqR1q2Scales& gate, const TqR1q2Scales& up) {
-    tq_bih3_r1q2_gu_rows_isa(bih3_isa(), type, blob, row_bytes, up_off, n, act, nt, ff, r0, r1, gate, up);
+    tq_bih3_r1q2_gu_rows_isa(bih3_isa(nt), type, blob, row_bytes, up_off, n, act, nt, ff, r0, r1, gate, up);
 }
 
 }  // namespace strata::kernels::cpu

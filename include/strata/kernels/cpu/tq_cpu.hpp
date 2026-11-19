@@ -84,10 +84,12 @@ struct TqR1q2Scales {
 };
 
 /// The bih3 types 182..194 use K=2..14 and 4*K code bytes per 128 weights, without a block scale.
-/// Bih3 chooses its ISA separately from the original trellis formats.  The explicit entry is for parity tests.
+/// Bih3 chooses its ISA separately from the original trellis formats, by CPUID feature bits and the token
+/// count (a version is taken only where it measured faster than the one below it; llvm-mca and row
+/// benches, 2026-11-19).  The explicit entry is for parity tests.
 enum class Bih3Isa : int { scalar, avx2, avxvnni, avx512vnni };
 bool bih3_isa_ok(Bih3Isa isa);
-Bih3Isa bih3_isa();
+Bih3Isa bih3_isa(int nt);
 const char* bih3_isa_name(Bih3Isa isa);
 void tq_bih3_r1q2_rows_isa(Bih3Isa isa, int type, const uint8_t* w, size_t row_bytes, int n,
                             const void* const* act, int nt, float* const* out, int r0, int r1,

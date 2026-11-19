@@ -612,8 +612,8 @@ int check_bih3_r1q2() {
         }
         // Exercise split row ranges and token grouping as used by the pool.
         for (int t = 0; t < nt; ++t) {
-            tq_bih3_r1q2_rows_isa(bih3_isa(), 180 + k, blob.data(), rb, n, ap + t, 1, op + t, 0, 3, sc);
-            tq_bih3_r1q2_rows_isa(bih3_isa(), 180 + k, blob.data(), rb, n, ap + t, 1, op + t, 3, rows, sc);
+            tq_bih3_r1q2_rows_isa(bih3_isa(1), 180 + k, blob.data(), rb, n, ap + t, 1, op + t, 0, 3, sc);
+            tq_bih3_r1q2_rows_isa(bih3_isa(1), 180 + k, blob.data(), rb, n, ap + t, 1, op + t, 3, rows, sc);
             if (!same_bits(got[t], gate[t], rows)) ++failures;
         }
         const uint32_t mul[4] = {0x9e3779b1u, 0x85ebca6bu, 0xc2b2ae35u, 0x27d4eb2fu};
@@ -657,7 +657,9 @@ int check_bih3_r1q2() {
             if (std::fabs(gu[t][r] - ref) > 2e-6 * (1 + std::fabs(ref))) ++failures;
         }
     }
-    std::printf("bih3 auto ISA: %s (AVX-VNNI %s, AVX-512 VNNI %s)\n", bih3_isa_name(bih3_isa()),
+    std::printf("bih3 auto ISA by nt:");
+    for (int t = 1; t <= kTqMaxTokens; ++t) std::printf(" %d=%s", t, bih3_isa_name(bih3_isa(t)));
+    std::printf(" (AVX-VNNI %s, AVX-512 VNNI %s)\n",
                 bih3_isa_ok(Bih3Isa::avxvnni) ? "yes" : "no", bih3_isa_ok(Bih3Isa::avx512vnni) ? "yes" : "no");
     std::printf("bih3 R1Q2 scalar vs FP64: worst normalized error %.3g, %d failures\n", worst, failures);
     for (Bih3Isa isa : {Bih3Isa::avx2, Bih3Isa::avxvnni, Bih3Isa::avx512vnni})
