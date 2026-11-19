@@ -226,9 +226,13 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
 }
 #else
 bool PageFile::open_impl(const std::string& path, std::string& err, bool direct) {
-    (void)direct;
     close();
-    int fd = ::open(path.c_str(), O_RDONLY);
+    // HY4_ENGRAM_ODIRECT=1: bypass the page cache (Linux boxes where the routed experts must keep the RAM; the page buffers are 4 KiB aligned)
+    int oflags = O_RDONLY;
+#ifdef O_DIRECT
+    if (direct && getenv("HY4_ENGRAM_ODIRECT") && getenv("HY4_ENGRAM_ODIRECT")[0] == '1') oflags |= O_DIRECT;
+#endif
+    int fd = ::open(path.c_str(), oflags);
     if (fd < 0) { err = "open failed for " + path; return false; }
     off_t sz = lseek(fd, 0, SEEK_END);
     h_ = (void*)(intptr_t)(fd + 1);
