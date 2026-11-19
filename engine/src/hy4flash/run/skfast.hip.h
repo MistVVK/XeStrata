@@ -111,6 +111,7 @@ __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, 
     const uint8_t* rp[RW];
 #pragma unroll
     for (int r = 0; r < RW; ++r) rp[r] = W + (size_t)(row0 + r < N ? row0 + r : N - 1) * nsb * SB;
+    if constexpr (FMT == FMT_S1_25) s125_lut_init();  // published by the barrier after the first x tile
 
     for (int k0 = 0; k0 < K; k0 += KC) {
         const int kc = (K - k0) < KC ? (K - k0) : KC;
@@ -131,8 +132,7 @@ __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, 
 #pragma unroll
             for (int r = 0; r < RW; ++r) {
                 const uint8_t* blk = rp[r] + (size_t)(sb0 + s) * SB;
-                const float D = h2f_bits(ld16(blk));
-                const float eff = D * ((float)blk[2 + (lane >> 3)] * (1.0f / 255.0f));
+                const float eff = sk_eff<FMT>(blk, lane >> 3);
                 uint32_t wp[4];
                 decode_w8<FMT>(blk + 6, lane, wp);
 #pragma unroll
@@ -200,6 +200,8 @@ inline void gemv_by_m(hipStream_t s, const void* W, int N, int K, const __half* 
 // production decode entry: S_K weights, 1 <= M <= 16 (K % 256 == 0, X 16-byte aligned)
 inline void linear_h_gemv(hipStream_t s, int fmt, const void* W, int N, int K, const __half* X, float* Y, int M) {
     switch (fmt) {
+        case FMT_S1_25: skd::gemv_by_m<FMT_S1_25>(s, W, N, K, X, Y, M); break;
+        case FMT_S1_5: skd::gemv_by_m<FMT_S1_5>(s, W, N, K, X, Y, M); break;
         case FMT_S2: skd::gemv_by_m<FMT_S2>(s, W, N, K, X, Y, M); break;
         case FMT_S3: skd::gemv_by_m<FMT_S3>(s, W, N, K, X, Y, M); break;
         case FMT_S4: skd::gemv_by_m<FMT_S4>(s, W, N, K, X, Y, M); break;
@@ -256,6 +258,8 @@ inline void multi_by_m(hipStream_t s, const LinMulti& d, const __half* X, int M)
 // Y_i[m][n] = sum_k W_i[n][k] X[m][k] for all jobs i, 1 <= M <= 16, one launch. Each Y_i is a separate float [M][N_i] buffer.
 inline void linear_h_multi(hipStream_t s, const LinMulti& d, const __half* X, int M) {
     switch (d.fmt) {
+        case FMT_S1_25: skd::multi_by_m<FMT_S1_25>(s, d, X, M); break;
+        case FMT_S1_5: skd::multi_by_m<FMT_S1_5>(s, d, X, M); break;
         case FMT_S2: skd::multi_by_m<FMT_S2>(s, d, X, M); break;
         case FMT_S3: skd::multi_by_m<FMT_S3>(s, d, X, M); break;
         case FMT_S4: skd::multi_by_m<FMT_S4>(s, d, X, M); break;

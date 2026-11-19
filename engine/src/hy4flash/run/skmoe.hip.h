@@ -8,8 +8,9 @@
 //     z_out[t] += w * y             (summed over the 16 slots in slot order: deterministic)
 //
 // moe_experts(): all device pointers, no host sync, one workspace (moe_ws_bytes(M)).
-//   M <= 8  (decode / speculative verify): per active expert, GEMV-style kernels (packed fp16 dot2, x tile of <= 8 tokens in LDS)
-//   M  > 8  (prefill): per active expert, WMMA grouped GEMMs (128 tokens x 32 gate/up row pairs resp. 64 down rows per block)
+//   M <= moe_dec_max_m() (default 4, valid up to 16; decode / speculative verify): per active expert, GEMV-style kernels (packed fp16 dot2, x tile in LDS,
+//                         per-expert token count picks the inner width so an expert with 1 token costs a decode step)
+//   above it (prefill, verify windows): per active expert, WMMA grouped GEMMs with a 16/32/64/128-token tile chosen per expert
 // moe_experts_ref(): the simple phase-1.5 path (any M), kept for testing.
 #pragma once
 #include "skwmma.hip.h"
@@ -73,7 +74,7 @@ __global__ void __launch_bounds__(512) k_moe_route(const int32_t* __restrict__ i
     }
 }
 
-// ---------------------------------------------------------------- decode path (M <= 8)
+// ---------------------------------------------------------------- decode path (M <= 16)
 // dot products of one weight row (K = 1536, FMT) with MT x-vectors held in LDS as uint4[MT][192]
 template <int FMT, int MT>
 __device__ __forceinline__ void row_dot(const uint8_t* rp, const uint4* xs, int lane, float (&acc)[MT]) {
@@ -83,8 +84,7 @@ __device__ __forceinline__ void row_dot(const uint8_t* rp, const uint4* xs, int 
 #pragma unroll
     for (int s = 0; s < 6; ++s) {
         const uint8_t* blk = rp + s * SB;
-        const float D = h2f_bits(ld16(blk));
-        eff[s] = D * ((float)blk[2 + (lane >> 3)] * (1.0f / 255.0f));
+        eff[s] = sk_eff<FMT>(blk, lane >> 3);
         decode_w8<FMT>(blk + 6, lane, wp[s]);
     }
 #pragma unroll
@@ -104,6 +104,8 @@ __device__ __forceinline__ void row_dot(const uint8_t* rp, const uint4* xs, int 
 template <int MT>
 __device__ __forceinline__ void row_dot_sw(int code, const uint8_t* rp, const uint4* xs, int lane, float (&acc)[MT]) {
     switch (code) {
+        case FMT_S1_25: row_dot<FMT_S1_25, MT>(rp, xs, lane, acc); break;
+        case FMT_S1_5: row_dot<FMT_S1_5, MT>(rp, xs, lane, acc); break;
         case FMT_S2: row_dot<FMT_S2, MT>(rp, xs, lane, acc); break;
         case FMT_S3: row_dot<FMT_S3, MT>(rp, xs, lane, acc); break;
         case FMT_S4: row_dot<FMT_S4, MT>(rp, xs, lane, acc); break;
@@ -116,6 +118,57 @@ __device__ __forceinline__ void row_dot_sw(int code, const uint8_t* rp, const ui
 
 __device__ __forceinline__ int code_row_bytes(int code, int K) { return (K >> 8) * sk_sb_bytes(code); }
 
+// the per-token work of the decode kernels only covers the tokens this expert really has (n <= MTE <= MT): an expert that sees 1 token in a
+// verify window of 8 costs the same as in decode. Per token the arithmetic is the same as with MTE = MT (bit-identical results).
+template <int MTE>
+__device__ __forceinline__ void gu_dec_rows(const ExpertDev& ed, const uint8_t* body, int r, const uint4* xs, int lane, int n, int base, __half* h2) {
+    const int rb = code_row_bytes(ed.gu_code, MOE_D);
+    const uint8_t* gu = body + 3072;
+    float ag[MTE], au[MTE];
+#pragma unroll
+    for (int m = 0; m < MTE; ++m) { ag[m] = 0.f; au[m] = 0.f; }
+    row_dot_sw<MTE>(ed.gu_code, gu + (size_t)r * rb, xs, lane, ag);
+    row_dot_sw<MTE>(ed.gu_code, gu + (size_t)(MOE_D + r) * rb, xs, lane, au);
+    const float sq = __half2float(((const __half*)body)[r]);
+#pragma unroll
+    for (int m = 0; m < MTE; ++m) {
+        float g = ag[m], u = au[m];
+#pragma unroll
+        for (int o = 16; o >= 1; o >>= 1) { g += __shfl_xor(g, o); u += __shfl_xor(u, o); }
+        if (lane == 0 && m < n) {
+            const float sg = g / (1.0f + expf(-g));
+            const float hh = fminf(sg, 10.0f) * fminf(fmaxf(u, -10.0f), 10.0f);
+            h2[(size_t)(base + m) * MOE_D + r] = __float2half(hh / sq);
+        }
+    }
+}
+
+template <int MTE>
+__device__ __forceinline__ void dn_dec_rows(const ExpertDev& ed, const uint8_t* dn, int r0, const uint4* xs, int lane, int n, int base, const int* pairs,
+                                            const float* topk_w, float* y) {
+    const int rb = code_row_bytes(ed.dn_code, MOE_D);
+#pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+        const int r = r0 + rr;
+        float a[MTE];
+#pragma unroll
+        for (int m = 0; m < MTE; ++m) a[m] = 0.f;
+        row_dot_sw<MTE>(ed.dn_code, dn + (size_t)r * rb, xs, lane, a);
+#pragma unroll
+        for (int m = 0; m < MTE; ++m) {
+            float v = a[m];
+#pragma unroll
+            for (int o = 16; o >= 1; o >>= 1) v += __shfl_xor(v, o);
+            if (lane == 0 && m < n) {
+                const int pid = pairs[base + m];
+                y[(size_t)pid * MOE_D + r] = v * topk_w[pid];
+            }
+        }
+    }
+}
+
+template <int A, int B> struct cmin { static constexpr int v = A < B ? A : B; };
+
 // stage 1: gate/up + SwiGLU + /sq_xd_dn. grid = (192, min(512,P)); each wave = one (gate row r, up row 1536+r) pair
 template <int MT>
 __global__ void __launch_bounds__(256) k_moe_gu_dec(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ ex, const __half* __restrict__ z,
@@ -125,6 +178,7 @@ __global__ void __launch_bounds__(256) k_moe_gu_dec(const uint8_t* __restrict__ 
     const int e = active[blockIdx.y];
     const int n = cnt[e], base = off[e];
     __shared__ uint4 xs[MT * 192];
+    s125_lut_init();  // the S1.25 codebook (published by the barrier below)
     for (int i = threadIdx.x; i < MT * 192; i += 256) {
         const int m = i / 192, c = i - m * 192;
         uint4 v = make_uint4(0, 0, 0, 0);
@@ -136,25 +190,11 @@ __global__ void __launch_bounds__(256) k_moe_gu_dec(const uint8_t* __restrict__ 
     const int r = blockIdx.x * 8 + wave;
     const ExpertDev ed = ex[e];
     const uint8_t* body = sec4 + ed.body_off;
-    const int rb = code_row_bytes(ed.gu_code, MOE_D);
-    const uint8_t* gu = body + 3072;
-    float ag[MT], au[MT];
-#pragma unroll
-    for (int m = 0; m < MT; ++m) { ag[m] = 0.f; au[m] = 0.f; }
-    row_dot_sw<MT>(ed.gu_code, gu + (size_t)r * rb, xs, lane, ag);
-    row_dot_sw<MT>(ed.gu_code, gu + (size_t)(MOE_D + r) * rb, xs, lane, au);
-    const float sq = __half2float(((const __half*)body)[r]);
-#pragma unroll
-    for (int m = 0; m < MT; ++m) {
-        float g = ag[m], u = au[m];
-#pragma unroll
-        for (int o = 16; o >= 1; o >>= 1) { g += __shfl_xor(g, o); u += __shfl_xor(u, o); }
-        if (lane == 0 && m < n) {
-            const float sg = g / (1.0f + expf(-g));
-            const float hh = fminf(sg, 10.0f) * fminf(fmaxf(u, -10.0f), 10.0f);
-            h2[(size_t)(base + m) * MOE_D + r] = __float2half(hh / sq);
-        }
-    }
+    if (n <= 1) gu_dec_rows<1>(ed, body, r, xs, lane, n, base, h2);
+    else if (n <= 2) gu_dec_rows<cmin<2, MT>::v>(ed, body, r, xs, lane, n, base, h2);
+    else if (n <= 4) gu_dec_rows<cmin<4, MT>::v>(ed, body, r, xs, lane, n, base, h2);
+    else if (n <= 8) gu_dec_rows<cmin<8, MT>::v>(ed, body, r, xs, lane, n, base, h2);
+    else gu_dec_rows<MT>(ed, body, r, xs, lane, n, base, h2);
 }
 
 // stage 2: down. grid = (96, min(512,P)); each wave = 2 output rows
@@ -167,6 +207,7 @@ __global__ void __launch_bounds__(256) k_moe_dn_dec(const uint8_t* __restrict__ 
     const int e = active[blockIdx.y];
     const int n = cnt[e], base = off[e];
     __shared__ uint4 xs[MT * 192];
+    s125_lut_init();
     for (int i = threadIdx.x; i < MT * 192; i += 256) {
         const int m = i / 192, c = i - m * 192;
         uint4 v = make_uint4(0, 0, 0, 0);
@@ -177,25 +218,12 @@ __global__ void __launch_bounds__(256) k_moe_dn_dec(const uint8_t* __restrict__ 
     const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const ExpertDev ed = ex[e];
     const uint8_t* dn = sec4 + ed.body_off + ed.dn_off;
-    const int rb = code_row_bytes(ed.dn_code, MOE_D);
-#pragma unroll
-    for (int rr = 0; rr < 2; ++rr) {
-        const int r = (blockIdx.x * 8 + wave) * 2 + rr;
-        float a[MT];
-#pragma unroll
-        for (int m = 0; m < MT; ++m) a[m] = 0.f;
-        row_dot_sw<MT>(ed.dn_code, dn + (size_t)r * rb, xs, lane, a);
-#pragma unroll
-        for (int m = 0; m < MT; ++m) {
-            float v = a[m];
-#pragma unroll
-            for (int o = 16; o >= 1; o >>= 1) v += __shfl_xor(v, o);
-            if (lane == 0 && m < n) {
-                const int pid = pairs[base + m];
-                y[(size_t)pid * MOE_D + r] = v * topk_w[pid];
-            }
-        }
-    }
+    const int r0 = (blockIdx.x * 8 + wave) * 2;
+    if (n <= 1) dn_dec_rows<1>(ed, dn, r0, xs, lane, n, base, pairs, topk_w, y);
+    else if (n <= 2) dn_dec_rows<cmin<2, MT>::v>(ed, dn, r0, xs, lane, n, base, pairs, topk_w, y);
+    else if (n <= 4) dn_dec_rows<cmin<4, MT>::v>(ed, dn, r0, xs, lane, n, base, pairs, topk_w, y);
+    else if (n <= 8) dn_dec_rows<cmin<8, MT>::v>(ed, dn, r0, xs, lane, n, base, pairs, topk_w, y);
+    else dn_dec_rows<MT>(ed, dn, r0, xs, lane, n, base, pairs, topk_w, y);
 }
 
 // ---------------------------------------------------------------- WMMA grouped GEMMs (prefill and small verify windows)
@@ -255,6 +283,8 @@ __global__ void __launch_bounds__(256) k_moe_gu_gemm(const uint8_t* __restrict__
     const ExpertDev ed = ex[e];
     const uint8_t* body = sec4 + ed.body_off;
     switch (ed.gu_code) {
+        case FMT_S1_25: gu_gemm_body<FMT_S1_25, WM, MTW>(body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2, ws); break;
+        case FMT_S1_5: gu_gemm_body<FMT_S1_5, WM, MTW>(body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2, ws); break;
         case FMT_S2: gu_gemm_body<FMT_S2, WM, MTW>(body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2, ws); break;
         case FMT_S3: gu_gemm_body<FMT_S3, WM, MTW>(body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2, ws); break;
         case FMT_S4: gu_gemm_body<FMT_S4, WM, MTW>(body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2, ws); break;
@@ -320,6 +350,8 @@ __global__ void __launch_bounds__(256) k_moe_dn_gemm(const uint8_t* __restrict__
     const ExpertDev ed = ex[e];
     const uint8_t* dnw = sec4 + ed.body_off + ed.dn_off;
     switch (ed.dn_code) {
+        case FMT_S1_25: dn_gemm_body<FMT_S1_25, WM, MTW, WN, NTW>(dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y, ws); break;
+        case FMT_S1_5: dn_gemm_body<FMT_S1_5, WM, MTW, WN, NTW>(dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y, ws); break;
         case FMT_S2: dn_gemm_body<FMT_S2, WM, MTW, WN, NTW>(dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y, ws); break;
         case FMT_S3: dn_gemm_body<FMT_S3, WM, MTW, WN, NTW>(dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y, ws); break;
         case FMT_S4: dn_gemm_body<FMT_S4, WM, MTW, WN, NTW>(dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y, ws); break;
@@ -351,8 +383,13 @@ __device__ __forceinline__ void wave_dot_row(const uint8_t* rp, int K, const __h
         const float D = h2f_bits(ld16(blk));
         const float eff = D * ((float)blk[2 + g] / 255.0f);
         float w[8];
+        if constexpr (FMT == FMT_S1_25 || FMT == FMT_S1_5) {
 #pragma unroll
-        for (int t = 0; t < 8; ++t) w[t] = ((float)sk_q<FMT>(blk + 6, j + t) - sk_half<FMT>()) * eff;
+            for (int t = 0; t < 8; ++t) w[t] = sk_weight<FMT>(blk, j + t);
+        } else {
+#pragma unroll
+            for (int t = 0; t < 8; ++t) w[t] = ((float)sk_q<FMT>(blk + 6, j + t) - sk_half<FMT>()) * eff;
+        }
 #pragma unroll
         for (int mm = 0; mm < MT; ++mm) {
             if (xp[mm]) {
@@ -369,6 +406,8 @@ __device__ __forceinline__ void wave_dot_row(const uint8_t* rp, int K, const __h
 template <int MT>
 __device__ __forceinline__ void wave_dot_dispatch(int code, const uint8_t* rp, int K, const __half* const (&xp)[MT], float (&acc)[MT], int lane) {
     switch (code) {
+        case FMT_S1_25: wave_dot_row<FMT_S1_25, MT>(rp, K, xp, acc, lane); break;
+        case FMT_S1_5: wave_dot_row<FMT_S1_5, MT>(rp, K, xp, acc, lane); break;
         case FMT_S2: wave_dot_row<FMT_S2, MT>(rp, K, xp, acc, lane); break;
         case FMT_S3: wave_dot_row<FMT_S3, MT>(rp, K, xp, acc, lane); break;
         case FMT_S4: wave_dot_row<FMT_S4, MT>(rp, K, xp, acc, lane); break;
@@ -524,7 +563,7 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
     const skd::MoeWs w = skd::moe_ws_split(ws, P);
     const int eb = P < MOE_E ? P : MOE_E;
     hipLaunchKernelGGL(skd::k_moe_route, dim3(1), dim3(512), 0, s, topk_idx, P, w.cnt, w.off, w.pairs, w.active, w.nact);
-    if (M <= skd::moe_dec_max_m() && M <= 8) {
+    if (M <= skd::moe_dec_max_m() && M <= 16) {
 #define HY4_DEC(MT)                                                                                                                                         \
     hipLaunchKernelGGL((skd::k_moe_gu_dec<MT>), dim3(MOE_D / 8, eb), dim3(256), 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2);  \
     hipLaunchKernelGGL((skd::k_moe_dn_dec<MT>), dim3(MOE_D / 16, eb), dim3(256), 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.active, w.nact,   \
@@ -532,7 +571,8 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
         if (M <= 1) { HY4_DEC(1); }
         else if (M <= 2) { HY4_DEC(2); }
         else if (M <= 4) { HY4_DEC(4); }
-        else { HY4_DEC(8); }
+        else if (M <= 8) { HY4_DEC(8); }
+        else { HY4_DEC(16); }
 #undef HY4_DEC
     } else {
         const int INF = 1 << 30;
