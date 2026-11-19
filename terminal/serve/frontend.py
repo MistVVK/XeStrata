@@ -952,6 +952,28 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
     at = nxt(0)
     while at >= 0:
         if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
+            if hold and text.startswith(PARAM_END, at) and _nested_close(text, at):
+                # #5756: this `</parameter>` closes a `<parameter=X>` the value itself holds (a file that documents the format) on the same
+                # line, so it is value text.  The model often skips the value's own closer after such a pair: then the call's end (or the
+                # next declared parameter) follows the nested closer, and the value ends AFTER it (close_len is 0 there).
+                skip_to = at + len(PARAM_END)
+                nafter = text[skip_to:].lstrip()
+                if nafter.startswith((FUNC_END, CALL_END)):
+                    verdict = _close_verdict(nafter, final)
+                    if verdict == "end":
+                        return skip_to
+                    if verdict == "hold":
+                        return -2
+                elif nafter.startswith(PARAM_START):
+                    gt = nafter.find(">")
+                    if gt < 0:
+                        return skip_to if final else -2
+                    if not names or param_name(nafter[len(PARAM_START):gt]) in names:
+                        return skip_to
+                elif not nafter and not final:
+                    return -2                                   # what follows has not arrived
+                at = nxt(at + 1)
+                continue
             after = text[at + close_len(text, at, closer):].lstrip()
             if after.startswith(PARAM_START):
                 gt = after.find(">")
@@ -980,9 +1002,23 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
     return -1
 
 
+def _nested_close(text: str, at: int) -> bool:
+    """#5756: the `</parameter>` at `at` closes a `<parameter=` opener inside the value that is still open, on the same line (`<parameter=limit>25</parameter>`).
+    The value's own closer comes after a line break, so a closer on the opener's own line is the nested pair's."""
+    opens = [m.start() for m in re.finditer(re.escape(PARAM_START), text[:at])]
+    if len(opens) <= text.count(PARAM_END, 0, at):
+        return False
+    return "\n" not in text[opens[-1]:at]
+
+
 def close_len(text: str, at: int, closer: str | None = None) -> int:
-    """#6032 R4: the length of the value closer param_end found at `at`: `</parameter>`, or the element's `</NAME>`."""
-    return len(closer) if closer and not text.startswith(PARAM_END, at) and text.startswith(closer, at) else len(PARAM_END)
+    """#6032 R4: the length of the value closer param_end found at `at`: `</parameter>`, or the element's `</NAME>`.  0 where no closer stands (#5756:
+    the value ended after a nested pair whose own closer the model left out)."""
+    if text.startswith(PARAM_END, at):
+        return len(PARAM_END)
+    if closer and text.startswith(closer, at):
+        return len(closer)
+    return 0
 
 
 # #6032 R1: what else ends a value after its `</parameter>` (Gyro / Coder-L recordings): the Anthropic XML form's
@@ -1162,7 +1198,7 @@ def call_end(text: str, final: bool = False, hold: bool = True, names=None) -> i
             if end < 0:
                 return -1
             seen.add(pname)
-            pos = gt + 1 + end + len(PARAM_END)
+            pos = gt + 1 + end + close_len(text[gt + 1:], end)
         elif got is not None:                                 # #6032 R2 / R4 / R5: any opener, an element too
             pname, length, _ = got
             closer = "</%s>" % pname if pname and s.startswith("<%s>" % pname) else None
