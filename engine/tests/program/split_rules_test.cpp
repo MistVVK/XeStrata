@@ -90,6 +90,15 @@ int main() {
         const std::vector<double> big = link_miss_scale({26.0, 6.0, 0.2, -1.0});
         CHECK(big[0] == 1.0 && big[1] > 4.3 && big[1] < 4.4 && big[2] == 64.0 && big[3] == 1.0);
         CHECK(link_miss_scale({-1.0, -1.0})[1] == 1.0);
+        // BW-MG: PCIe 4.0 x2 (3.6 GB/s) beside x8 (14.1 GB/s) is a gap of 3.92: unscaled by default, scaled from STRATA_SPLIT_LINK_MIN=3
+        const std::vector<double> x2x8 = link_miss_scale({3.6, 14.1});
+        CHECK(x2x8[0] == 1.0 && x2x8[1] == 1.0);
+        const std::vector<double> x2x8s = link_miss_scale({14.1, 3.6}, 3.0);
+        CHECK(x2x8s[0] == 1.0 && x2x8s[1] > 3.9 && x2x8s[1] < 3.93);
+        // the variable's text: unset / empty / not a number / below 1 keep the default
+        CHECK(link_scale_min_resolve(nullptr) == kLinkScaleMin && link_scale_min_resolve("") == kLinkScaleMin);
+        CHECK(link_scale_min_resolve("banana") == kLinkScaleMin && link_scale_min_resolve("0.5") == kLinkScaleMin);
+        CHECK(link_scale_min_resolve("3") == 3.0 && link_scale_min_resolve("2.5") == 2.5);
     }
     // #2644: RTX 4060 Ti 16 GB + RTX 3060 12 GB, 48 layers.  The reporter's numbers: CUDA1 5.50 GiB free of 11.63 (the
     // 3060 side), CUDA0 the 16 GB card with ~14.2 GiB room.  The #1616 retry alone took K=3 (3 layers on the second card)
