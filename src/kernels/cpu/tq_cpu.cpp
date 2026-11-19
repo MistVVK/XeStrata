@@ -12,6 +12,7 @@
 #include "tq_states.hpp"
 #include "ggml-common-tq.h"
 
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -252,7 +253,7 @@ uint32_t bih3_state(const uint8_t* code, int k, int step) {
 bool bih3_isa_ok(Bih3Isa isa) {
 #if defined(STRATA_TQ_X86)
     switch (isa) {
-        case Bih3Isa::avx512vnni: return cpu_avx512_ok();
+        case Bih3Isa::avx512vnni: return cpu_avx512_latent_ok();  // F/BW/VL/VNNI; the 16-bit-word form needs no VBMI
         case Bih3Isa::avxvnni: return cpu_avxvnni_ok();
         case Bih3Isa::avx2: return cpu_avx2_ok();
         case Bih3Isa::scalar: return true;
