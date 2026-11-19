@@ -371,7 +371,7 @@ static int test_bench(const std::string& path, int nlayers, int nth) {
     sum_arena(cx, nlayers, nth, &bw);
     std::printf("DRAM read ceiling (plain sum loop, %d threads over the arena): %.1f GB/s\n", nth, bw);
     Rng rng(11);
-    std::printf("kernel: %s\n", cx.fast_kernel() ? "fast (avx512 vbmi/vnni)" : "lib (gemm_sk_q8_1)");
+    std::printf("kernel: %s\n", cx.fast_kernel() ? "fast (AVX-512 or AVX2, see init log)" : "lib (gemm_sk_q8_1)");
     std::printf("%-14s %-4s %-6s %-10s %-10s %-10s %-12s %-10s\n", "scenario", "T", "reps", "ms/layer", "p50 ms", "min ms", "MB/layer", "GB/s(mean)");
     struct Sc { const char* name; int T; int reps; bool same16; };
     const Sc scs[] = {{"spread", 1, 60, false}, {"spread", 4, 60, false}, {"spread", 8, 60, false}, {"spread", 64, 12, false},

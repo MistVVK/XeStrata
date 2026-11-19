@@ -226,6 +226,33 @@ public:
 
     Runner(GpuModel& gm, int max_ctx_, int max_chunk) : g(gm), c(gm.man.c), max_ctx(max_ctx_), Tc(max_chunk) {}
 
+    // big, rarely-touched state (sparse-layer KV cache, IndexPool, kv_b absorbed copies): VRAM when it fits and HY4_KV_HOST != 1, otherwise pinned host memory mapped into the
+    // device address space (the kernels read it over PCIe: attention only reads the 2048 selected keys of a sparse layer, the pool scoring is served by L2 after the first block)
+    size_t host_big_bytes = 0;
+    template <class T> T* dalloc_big(size_t n, const char* what) {
+        const size_t bytes = n * sizeof(T);
+        const char* e = getenv("HY4_KV_HOST");
+        const int mode = e ? atoi(e) : -1;
+        void* p = nullptr;
+        if (mode != 1) {
+            size_t fr = 0, tot = 0;
+            HCK(hipMemGetInfo(&fr, &tot));
+            if (mode == 0 || fr > bytes + ((size_t)600 << 20)) {
+                if (hipMalloc(&p, bytes) == hipSuccess) {
+                    HCK(hipMemset(p, 0, bytes));
+                    return (T*)p;
+                }
+                (void)hipGetLastError();
+            }
+        }
+        void *hp = nullptr, *dp = nullptr;
+        HCK(hipHostMalloc(&hp, bytes, hipHostMallocMapped));
+        memset(hp, 0, bytes);
+        HCK(hipHostGetDevicePointer(&dp, hp, 0));
+        host_big_bytes += bytes;
+        fprintf(stderr, "[runner] %s: %.2f GB in pinned host memory (read by the GPU)\n", what, bytes / 1e9);
+        return (T*)dp;
+    }
     template <class T> T* dalloc(size_t n) {
         T* p = nullptr;
         HCK(hipMalloc((void**)&p, n * sizeof(T)));
@@ -360,8 +387,12 @@ public:
         for (int il = 0; il < c.n_layers; ++il) {
             int slots = c.is_swa[il] ? ring : slots_sparse;
             size_t by = mla_cache_bytes(slots);
-            HCK(hipMalloc((void**)&kcache[il], by));
-            HCK(hipMemset(kcache[il], 0, by));
+            if (c.is_swa[il]) {
+                HCK(hipMalloc((void**)&kcache[il], by));
+                HCK(hipMemset(kcache[il], 0, by));
+            } else {
+                kcache[il] = (__half*)dalloc_big<uint8_t>(by, "sparse KV cache");
+            }
             kvbytes += by;
         }
         // indexer state (sparse layers only)
@@ -369,8 +400,8 @@ public:
         pooled.assign(c.n_layers, nullptr);
         for (int il = 0; il < c.n_layers; ++il)
             if (!c.is_swa[il]) {
-                ivg[il] = dalloc<__half>((size_t)(max_ctx + 8) * 256);
-                pooled[il] = dalloc<__half>((size_t)(max_ctx / 4 + 8) * 128);
+                ivg[il] = dalloc_big<__half>((size_t)(max_ctx + 8) * 256, "IndexPool iv/ig cache");
+                pooled[il] = dalloc_big<__half>((size_t)(max_ctx / 4 + 8) * 128, "IndexPool pooled keys");
             }
         ik_f = dalloc<float>((size_t)Tc * 128);
         iv_f = dalloc<float>((size_t)Tc * 128);
@@ -394,8 +425,8 @@ public:
             tk += (size_t)NH * 192 * 512;
             tv += (size_t)NH * 256 * 512;
         }
-        wk_b = dalloc<__half>(tk);
-        wv_b = dalloc<__half>(tv);
+        wk_b = dalloc_big<__half>(tk, "absorbed wk_b");
+        wv_b = dalloc_big<__half>(tv, "absorbed wv_b");
         for (int il = 0; il < c.n_layers; ++il) {
             int NH = heads(il);
             const TInfo& t = ti(L(il) + ".self_attn.kv_b_proj.weight");
