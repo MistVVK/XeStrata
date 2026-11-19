@@ -1,5 +1,6 @@
 import {USER_KEY,flagValue,capture} from './native-user-args.mjs';
 import {parseEngineVersion} from './engine-version.mjs';
+import {isHy4} from './hy4.mjs';
 
 /** The engine's own default reserve, and the one setup writes for pictures read on the GPU: neither is a choice of the person. */
 const ENGINE_DEFAULT_RESERVE_MIB=700;
@@ -62,6 +63,8 @@ const computeOnly=g=>g?.drives_display===false;
 /** Headroom is a worker/memory budget, not a hard utilisation throttle. */
 export function resourceSettings(config,hardware,profile,model={},values={}){
  if(!['work','performance'].includes(profile))throw new Error('Choose a resource preference.');
+ /* Hy4-Flash (strata-hy4) takes none of these Flash-Next options and refuses a flag it does not know: its arguments stay as setup wrote them (server/hy4.mjs). */
+ if(isHy4(config))return {args:[...(config.args??[])],ui_resource_baseline:{}};
  const args=[...(config.args??[])];
  const remove=flag=>{for(let at=args.indexOf(flag);at>=0;at=args.indexOf(flag))args.splice(at,2);};
  const value=flag=>{const at=args.indexOf(flag);return at>=0?Number(args[at+1])||0:0;};
@@ -145,6 +148,7 @@ export const engineVersionOfExe=exe=>{const m=/engine[\\/](\d+(?:\.\d+)+)-/.exec
    failure as it was) or {config, words, detail}: the same run config with ONE safer memory setting, a sentence for the user and the
    technical line for Details. The caller tries once and never again, and does not save this config. */
 export function saferStart(config,hardware,model,failure){
+ if(isHy4(config))return null;/* no Flash-Next memory flag to retry with: the engine's own message is the answer */
  const text=String(failure??'');
  // The engine refused an oversized prompt chunk at the start (an APU whose pool the expert cache fills; the person or the environment named the chunk): the same chunk would fail again, and a memory setting is not the cause.
  if(/prompt chunk does not fit/i.test(text))return null;

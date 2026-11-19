@@ -286,8 +286,8 @@ def files_present(cfg: dict) -> list[str]:
     """The model files a run config names that are missing (empty list: all there)."""
     missing = []
     for tok in cfg.get("args") or []:
-        if isinstance(tok, str) and tok.lower().endswith(".gguf") and not Path(tok).exists():
-            missing.append(tok)
+        if isinstance(tok, str) and tok.lower().endswith((".gguf", ".strata")) and not Path(tok).exists():
+            missing.append(tok)                               # (.strata: Hy4-Flash's build and its Engram shard)
     for flag in ("--pack", "--mtp"):
         args = [str(a) for a in cfg.get("args") or []]
         if flag == "--mtp" and flag in args and args.index(flag) + 1 < len(args) and args[args.index(flag) + 1].isdigit():
@@ -320,6 +320,12 @@ def apply_choices(cfg: dict, s: S.LaunchSettings) -> dict:
 
     if s.context:
         put("--max-context", str(int(s.context)))
+    if "--engram" in args:                                   # Hy4-Flash (strata-hy4): the context, and the Vision shard (on by default; `--vision off` takes `--vision <file>` out); no KV format
+        if s.vision == "off" and "--vision" in args:
+            at = args.index("--vision")
+            del args[at:at + 2]
+        cfg["args"] = args
+        return cfg
     kv = s.kv or ("int8" if (s.context or 32768) > 8192 else "fp16")
     if "--kv" in args or s.kv:
         put("--kv", kv)
@@ -1067,6 +1073,9 @@ class Runner:
 
     def model_shape(self) -> str | None:
         """The model shape whose own engine runs the chosen model (a feed model of a shape other than Flash-Next's: setup's FAMILIES entry has "shape"), or None."""
+        from strata_control import hy4_family
+        if getattr(self.s, "family", None) == hy4_family.FAMILY:     # Tencent Hy4-Flash: its engine is the component strata-hy4 (shape "hy4", strata_control/shape_engine.py)
+            return hy4_family.SHAPE
         try:
             fam = (getattr(self.catalog.strata.setup_module(), "FAMILIES", None) or {}).get(self.s.family) or {}
             shape = fam.get("shape")
@@ -1074,10 +1083,16 @@ class Runner:
         except Exception:                                    # noqa: BLE001 - no table, no shape: the Strata engine
             return None
 
+    def is_hy4(self) -> bool:
+        """The chosen model is Tencent Hy4-Flash: no drafter, no tuning, no slots, no split engine; its own engine program (serve/hy4_kind.py)."""
+        from strata_control import hy4_family
+        return self.s.family == hy4_family.FAMILY
+
     def model_title(self) -> str | None:
         """The chosen model's title ("Q4 Lite Shape"), which the lines about its engine name instead of the geometry's name; None when the table has none."""
         try:
-            title = ((getattr(self.catalog.strata.setup_module(), "FAMILIES", None) or {}).get(self.s.family) or {}).get("title")
+            table = getattr(self.catalog.strata.setup_module(), "FAMILIES", None) or {}
+            title = (table.get(self.s.family) or (getattr(self.catalog.strata.setup_module(), "HY4_FAMILIES", None) or {}).get(self.s.family) or {}).get("title")
             return title if isinstance(title, str) and title else None
         except Exception:                                    # noqa: BLE001
             return None
@@ -1207,8 +1222,8 @@ class Runner:
         ctx = s.context
         if ctx:
             args += ["--context", str(ctx)]
-        args += ["--vision", self.vision_word()]
-        if s.kv:
+        args += ["--vision", self.vision_word()]             # (Hy4-Flash: images are on by default; setup takes any word but no / none as "on")
+        if s.kv and not self.is_hy4():                       # (its KV is fp16: setup says so, it asks for no setting)
             args += ["--kv", s.kv]
         if fam in ("qwen", "coder"):
             args += ["--experimental-speed-projection", "off"]
@@ -1916,6 +1931,8 @@ class Runner:
     def ensure_drafter(self, base_path: Path) -> None:
         """Fetch the DFlash2 drafter when this launch will use it and it is not here yet. Never stops the launch: if it cannot be had, the model
         starts with the MTP and the person is told (recommend, never force)."""
+        if self.is_hy4():                                    # Hy4-Flash's drafter (DFly2) is inside its model file: nothing to fetch
+            return
         from strata_control import drafting, drafting_fetch
         want: dict = {}
         try:
@@ -2037,7 +2054,7 @@ class Runner:
         strata_control/split_engine.py's rule, never when the run config says "split_engine": "off" (`--split-engine off`, STRATA_SPLIT_ENGINE=0).
         In auto a "no" is silent and the config stays as it is; with "on" it gets one plain line. It never stops a launch."""
         from strata_control import split_engine as SE
-        if SE.mode(cfg) == "off":
+        if SE.mode(cfg) == "off" or self.is_hy4():
             return
         exe_for = SE.exe_finder(cfg)                         # strata-split-N beside the run config's engine (shared with the app's start)
 
@@ -2097,6 +2114,8 @@ class Runner:
         """Four Radeon AI PRO R9700 cards and Qwen3.8-Flash-Next IQ3_S: the measured serving profile (strata_control/amd_four_card.py), filled
         in where the person chose nothing. Never stops a launch."""
         self.four_card_parallel = None
+        if self.is_hy4():
+            return
         try:
             from strata_control import amd_four_card
             picked = cfg.get("gpu")
@@ -2116,6 +2135,8 @@ class Runner:
         from strata_control import profiles
         name = self.profile
         parallel = self.s.parallel if self.s.parallel else (getattr(self, "four_card_parallel", None) or self.catalog_parallel())
+        if self.is_hy4():
+            parallel = None                                  # one request at a time (the engine has no slots)
         if parallel and not self.s.parallel and self.one_request_for_dflash2(config):
             parallel = None                                  # the slots Strata fills in by itself would keep the MTP: DFlash2 answers one request at a time
         if parallel and self.run_config_owns_slots(config):
@@ -2162,7 +2183,7 @@ class Runner:
     # ---- 4. tuning
     def tune(self) -> None:
         s = self.s
-        if s.tune == "skip":
+        if s.tune == "skip" or self.is_hy4():                # Hy4-Flash has no tuning knobs (setup skips it for the same reason)
             return
         from strata_control import presets
         if not self.retune:
@@ -2860,6 +2881,8 @@ class Runner:
         a card near a class line where setup and the start read the context differently): setup runs again and fetches the layer with its own download
         lines, then the start decides again. Offline (setup goes on without the layer) or a server that does not answer: the start goes on without, with
         the start's own line. Never stops the launch."""
+        if self.is_hy4():                                    # no MTP layer to fetch: Hy4-Flash's drafter is in its model file
+            return base_path
         from strata_control import drafting
         try:
             cfg = read_config(base_path)

@@ -1,6 +1,7 @@
 /** Native Strata control plane. All user actions are explicit; opening the UI only reads state. */
 import {missingFilesError,missingNames} from './missing-files.mjs';
 import { createJobStore } from './native-job-store.mjs';
+import { isHy4 } from './hy4.mjs';
 import { metricsPowerW, noteEnginePower } from './energy-meter.mjs';
 import { spawn } from 'node:child_process';
 import {chooseParallel,applyParallel,withoutParallel,FALLBACK_NOTE} from './native-parallel.mjs';
@@ -357,7 +358,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   /* Roles chosen in the screen (Main / Helper / Off per card, gpu-roles.mjs): the card list is the roles' mirror - Helpers first, the Main card LAST, Off cards left out - with "gpu_roles" beside it. Every card Off is allowed: the server says plainly what the engine can do. */
   if(args.gpuRoles!==undefined){const make=snapshot.hardware?.engine_vendor,cards=(snapshot.hardware?.gpus??[]).filter(g=>!make||!g.vendor||g.vendor===make),named=parseRoles(args.gpuRoles);if(!named)throw new Error('Choose Main, Helper or Off for each graphics card, with one Main.');const known=new Set(cards.map(g=>g.index));if(Object.keys(named).some(k=>!known.has(Number(k))))throw new Error('Choose detected graphics cards.');const roles=Object.fromEntries(cards.map(g=>[g.index,named[g.index]??'off'])),m=mirrorRoles(roles,cards);for(const k of ['gpu','gpu_order','gpu_none','gpu_roles','gpu_cards','hip_ordinal'])delete cfg[k];Object.assign(cfg,m);const count=Array.isArray(m.gpu)?m.gpu.length:m.gpu_none?0:1;cfg.layer_split=count>1?validateNativeSettings({layer_split:args.layerSplit??'auto'}).layer_split:'auto';if(cfg.layer_split!=='auto'&&cfg.layer_split.split(',').length!==count-1)throw new Error('Choose one layer split point between each pair of GPUs.');}
   else   if(args.gpus!==undefined&&!(args.gpusFromRecommendation&&namedInFile)){const detected=new Set((snapshot.hardware?.gpus??[]).map(g=>g.index));if(!Array.isArray(args.gpus)||!args.gpus.length||new Set(args.gpus).size!==args.gpus.length||args.gpus.some(g=>!Number.isInteger(g)||!detected.has(g)))throw new Error('Choose distinct detected GPUs. CPU-only text inference is not supported by this native adapter.');cfg.gpu=args.gpus.length===1?args.gpus[0]:args.gpus;for(const k of ['gpu_roles','gpu_cards','gpu_none'])delete cfg[k];delete cfg.hip_ordinal;cfg.layer_split=args.gpus.length>1?validateNativeSettings({layer_split:args.layerSplit??'auto'}).layer_split:'auto';if(cfg.layer_split!=='auto'&&cfg.layer_split.split(',').length!==args.gpus.length-1)throw new Error('Choose one layer split point between each pair of GPUs.');}
-  if(cfg.vram_reserve_mib!==undefined&&cfg.vram_reserve_mib!==null){cfg.args=[...(cfg.args??[])];const at=cfg.args.indexOf('--vram-reserve-mib');if(at>=0)cfg.args.splice(at,2);cfg.args.push('--vram-reserve-mib',String(cfg.vram_reserve_mib));}
+  if(!isHy4(cfg)&&cfg.vram_reserve_mib!==undefined&&cfg.vram_reserve_mib!==null){cfg.args=[...(cfg.args??[])];const at=cfg.args.indexOf('--vram-reserve-mib');if(at>=0)cfg.args.splice(at,2);cfg.args.push('--vram-reserve-mib',String(cfg.vram_reserve_mib));}
   if(mine.length){cfg.args=mergeUserArgs(cfg.args??[],mine);cfg[USER_KEY]=mine;}else delete cfg[USER_KEY];
   /* "Leave 20% for my work" starts the engine with the RAM budget of setup's second number ("ui_budget_work_gib"); this copy only. What is saved (`resources`, never `cfg`) keeps setup's own, which is what a Terminal start reads. */
   if(args.resourceProfile&&Array.isArray(cfg.args))cfg.args=launchBudgetArgs(cfg,args.resourceProfile);
@@ -367,8 +368,9 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   /* The Qwen engine's --vision stands alone, so it goes (with a picture word after it, if an older file has one). */
   if(!cfg.vision&&Array.isArray(cfg.args))cfg.args=withoutVisionFlag(cfg.args);
   for(const arg of cfg.args??[])if(arg.endsWith('.gguf')&&!existsSync(resolve(repo(),arg)))throw new Error('An engine argument names a missing GGUF. Restore the saved arguments or repair the files.');
+  for(const arg of cfg.args??[])if(isHy4(cfg)&&arg.endsWith('.strata')&&!existsSync(resolve(repo(),arg)))throw new Error('A Hy4-Flash file is missing. Restore the saved arguments or download the model again.');
   /* The app's own choice of request slots (4, fewer where the card has no room) is part of the configuration, so a tune measures the engine a load will start: slots take VRAM from the expert cache. */
-  const parallelChoice=packaged?chooseParallel({config:cfg,values:args.values??{},drafter,hardware:snapshot.hardware?.gpus?.length?snapshot.hardware:{gpus:hardwareProbe()??[]}}):null;
+  const parallelChoice=packaged&&!isHy4(cfg)?chooseParallel({config:cfg,values:args.values??{},drafter,hardware:snapshot.hardware?.gpus?.length?snapshot.hardware:{gpus:hardwareProbe()??[]}}):null;
   let parallelNote=null;
   /* The agent asks for long answers (a thinking model can use most of the window): let the engine clamp the output to what is left of the context instead of refusing the request. */
   if(packaged&&cfg.fit_max_tokens===undefined)cfg.fit_max_tokens=true;

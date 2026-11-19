@@ -632,21 +632,62 @@ class Strata:
         for f, d in (getattr(s, "OWN_PATH_FAMILIES", None) or {}).items():
             out[f] = {"title": d["title"], "about": d.get("about"), "tag": d["tag"], "license": d.get("license"),
                       "vision": bool(d.get("vision", True)), "own_path": True, **({"feed": True} if d.get("feed") else {})}
+        if self.hy4_visible():                          # Tencent Hy4-Flash (setup.py HY4_FAMILIES): its own engine program; listed once there is a source or the files are here
+            for f, d in (getattr(s, "HY4_FAMILIES", None) or {}).items():
+                out[f] = {"title": d["title"], "about": d.get("about"), "tag": d["tag"], "license": d.get("license"), "vision": True, "own_path": True, "hy4": True}
         return out
 
+    def hy4_visible(self) -> bool:
+        """Is Hy4-Flash in the model list: a download source is configured (strata_control/hy4_family.py), or its files are already in the data folder's models folder
+        (or STRATA_HY4_SHOW=1, for the tests).  The owner decides where the public files are published; until then nothing is offered to download."""
+        try:
+            from strata_control import hy4_family
+            if os.environ.get("STRATA_HY4_SHOW") == "1" or hy4_family.sources():
+                return True
+            return bool(hy4_family.local_files(self.data_dir() / "models" / hy4_family.FAMILY))
+        except Exception:                               # noqa: BLE001 - the list never fails on this
+            return False
+
     def own_size_names(self) -> list:
-        """The size names of the families that have an engine path of their own (Qwen3.6): the install tool accepts them as `model`."""
+        """The size names of the families that have an engine path of their own (Qwen3.6, Hy4-Flash): the install tool accepts them as `model`."""
         s = self.setup_module()
         names = []
-        for table in ("OWN_PATH_FAMILIES",):
+        for table in ("OWN_PATH_FAMILIES", "HY4_FAMILIES"):
             for fam in (getattr(s, table, None) or {}).values():
                 names.extend(n for n in fam.get("models", {}) if n not in names)
         return names
+
+    def hy4_fit_row(self, build, ram, usable, vision: bool = True) -> dict | None:
+        """Where Hy4-Flash `build`'s experts go on this PC (hy4_fit.place) and whether it is the recommended build; None when the RAM is not known."""
+        if ram is None:
+            return None
+        from strata_control import hy4_fit
+        uma = next((g for g in usable if g.get("uma")), None)
+        if uma:
+            vram_gib, ram_gib, unified = None, float(uma.get("vram_gb") or ram) / hy4_fit.GIB_TO_GB, True
+        else:
+            vram_gib, ram_gib, unified = max((float(g["vram_gb"]) for g in usable), default=0.0), float(ram), False
+        placed = hy4_fit.place(build, vram_gib, ram_gib, unified, None, vision)
+        return {"placement": placed, "mode": hy4_fit.mode(placed["ssd_gb"]), "recommended": hy4_fit.recommend(vram_gib, ram_gib, unified, None, vision)["build"] == build,
+                "unified": unified, "engram_gb": hy4_fit.ENGRAM_GB, "context": hy4_fit.DEFAULT_CONTEXT, "kv_gb": round(hy4_fit.kv_extra_gb(), 2)}
+
+    def hy4_size(self, family, model) -> dict | None:
+        """One build of Hy4-Flash as a model-table row: the download is the build plus the Engram shard every build shares; the memory figures are the author's (hy4_fit)."""
+        d = (getattr(self.setup_module(), "HY4_FAMILIES", None) or {}).get(family)
+        if not d or model not in d["models"]:
+            return None
+        from strata_control import hy4_fit
+        b = hy4_fit.BUILDS[model]
+        return {"about": d["models"][model]["about"], "download_gb": round(b["file_gb"] + hy4_fit.ENGRAM_GB + hy4_fit.VISION_GB, 1), "ram_gb": d["models"][model]["ram_gb"],
+                "arena_gb": b["bodies_gb"], "vision": True, "engine": None, "families": (family,), "context_fit": None, "hy4": True,
+                "footprint_gb": b["footprint_gb"], "engram_gb": hy4_fit.ENGRAM_GB}
 
     def own_size(self, family, model) -> dict | None:
         """One size of an own-path family as a model-table row for install_plan / model_table (None: not an own-path size).
         The download is the GGUF; the picture reader (mmproj, ~0.9 GB) is counted by the plan when pictures are on."""
         d = (getattr(self.setup_module(), "OWN_PATH_FAMILIES", None) or {}).get(family)
+        if not d and family in (getattr(self.setup_module(), "HY4_FAMILIES", None) or {}):
+            return self.hy4_size(family, model)
         if not d or model not in d["models"]:
             return None
         size_gb = d["sha256"][d["file"].format(q=model)][0] / 1e9
@@ -666,7 +707,7 @@ class Strata:
 
     def sizes_of(self, models, family) -> list:
         """The family's sizes as setup lists them: an experimental one last (never the default)."""
-        own = (getattr(self.setup_module(), "OWN_PATH_FAMILIES", None) or {}).get(family)
+        own = (getattr(self.setup_module(), "OWN_PATH_FAMILIES", None) or {}).get(family) or (getattr(self.setup_module(), "HY4_FAMILIES", None) or {}).get(family)
         if own:
             return list(own["models"])
         return sorted((m for m in models if family in models[m].get("families", ("qwen", "swift"))),
@@ -1383,7 +1424,13 @@ class Strata:
                 verdict = None
                 if ram is not None:
                     verdict = fit_label.label(fit_gb, ram, card_room)
+                hy4 = None
+                if d.get("hy4"):                              # Tencent Hy4-Flash: the author's rank-cut rule (strata_control/hy4_fit.py), not the weights-against-RAM rule; the Engram shard is read from the SSD
+                    memory_gb, fit_gb = d["footprint_gb"], d["footprint_gb"]
+                    hy4 = self.hy4_fit_row(m, ram, usable)
+                    verdict = None if hy4 is None else ("may run slower" if hy4["mode"] == "cross_tier_ssd" else "fits")
                 sizes.append({"model": m, "about": d["about"], "download_gb": d["download_gb"],
+                              **({"hy4": hy4} if hy4 else {}),
                               "experimental": bool(d.get("experimental")),
                               "images": d.get("vision", fd.get("vision", True)) is not False,
                               # which picture reader "pictures on" gets on this PC (strata_control/vision_reader.py, the one rule: the CPU reader
@@ -1589,6 +1636,12 @@ def expected_files(S, family: str, model: str, models_dir: Path, vision: bool) -
     Empty when the setup module cannot say (the caller then falls back to the folder scan)."""
     out = []
     try:
+        if family in (getattr(S, "HY4_FAMILIES", None) or {}):          # Hy4-Flash: the build and the Engram shard every build shares, in one folder
+            from strata_control import hy4_family
+            folder = Path(models_dir) / hy4_family.FAMILY
+            for name in hy4_family.files_of(model, bool(vision)):
+                out.append({"path": str(folder / name), "bytes": hy4_family.size_of(name), "role": "model"})
+            return out
         own = (getattr(S, "OWN_PATH_FAMILIES", None) or {}).get(family)
         if own:                                         # Qwen3.6: the GGUF and the picture reader in the model's folder
             folder = Path(models_dir) / (own["tag"] + model)
@@ -2397,6 +2450,10 @@ class Tools:
             backend, vision = "sycl", "no"                  # pictures stay off on an Arc (strata_cli/launch/adopt.py)
             if not gguf_dir and not intel_app.model_files_in(have_dir, family, families[family]):
                 raise ToolError(intel_app.NO_DOWNLOAD)
+        if md.get("hy4"):                                       # Hy4-Flash: the files are in <models>/hy4-flash (the build, the shared Engram shard); the disk need is what is not there yet
+            from strata_control import hy4_family
+            have_files = hy4_family.local_files(target / "models" / hy4_family.FAMILY)
+            md = {**md, "download_gb": round(sum(hy4_family.size_of(n) / 1e9 for n in hy4_family.files_of(model) if n not in have_files), 1)}
         partly = (have_dir.is_dir() and any(have_dir.glob("*.gguf*"))) or bool(gguf_dir) \
             or (ready_dir is not None and ready_dir.is_dir() and any(ready_dir.glob("*.gguf*")))   # a local folder: nothing to download
         need = (8 if partly else md["download_gb"] + 8) + (1 if vision in ("yes", "gpu", "cpu") else 0)             + (s.mac().repacked_gb(model) if mac and s.mac() else 0)       # a Mac repacks Unsloth's shards into one file for the GPU (mac_fit.repacked_gb)
@@ -2432,6 +2489,9 @@ class Tools:
         if ram is not None:
             from strata_control import fit_label
             fit = fit_label.label(fit_label.files_gb(family, model, md), ram, fit_label.card_room_gb(s.engine_gpus(hw)))
+            if md.get("hy4"):
+                row = s.hy4_fit_row(model, ram, s.engine_gpus(hw))
+                fit = None if row is None else ("may run slower" if row["mode"] == "cross_tier_ssd" else "fits")
         installed = (s.root / f"strata-{tag.lower()}.json").exists()
         here = None                                     # the page's "already on this computer": the files whole, by the pinned sizes (a local folder: not asked)
         if not gguf_dir and not arc and s.setup_module() is not None:

@@ -105,6 +105,19 @@ class ChatTemplate:
 
         history = [user, {"role": "assistant", "content": "strata_caps_answer",
                           "reasoning_content": "strata_caps_reasoning"}, user]
+        if "<tool_calls{}>" in self.source:      # Hy4-Flash (serve/hy4_dialect.py): its own spelling of the same capabilities
+            def hy4_calls(count):
+                calls = [{"name": f"strata_caps_call_{i}", "arguments": {"arg": f"strata_caps_arg_{i}"}} for i in range(count)]
+                messages = [user, {"role": "assistant", "content": "", "tool_calls": [{"function": call} for call in calls]}]
+                messages += [{"role": "tool", "content": f"strata_caps_result_{i}"} for i in range(count)] + [user]
+                prompt = render(messages, tools)
+                return all(f"<tool_call:opensource>strata_caps_call_{i}<arg_key:opensource>arg</arg_key:opensource><arg_value:opensource>strata_caps_arg_{i}" in prompt
+                           and f"strata_caps_result_{i}" in prompt for i in range(count))
+            return {"supports_tools": all(s in tool_prompt for s in ("strata_caps_call_0", "strata_caps_description", "<tool_calls:opensource>")),
+                    "supports_tool_calls": hy4_calls(1),
+                    "supports_system_role": "strata_caps_system" in render([{"role": "system", "content": "strata_caps_system"}, user]),
+                    "supports_parallel_tool_calls": hy4_calls(2),
+                    "supports_preserve_reasoning": "strata_caps_reasoning" in render(history, tools)}
         return {"supports_tools": all(s in tool_prompt for s in
                                       ("strata_caps_call_0", "strata_caps_description", "<tool_call>", "<function=")),
                 "supports_tool_calls": calls_supported(1),
@@ -140,8 +153,14 @@ _EFFORT_QWEN = dict(EFFORT)
 
 
 def use_family(family: str | None) -> None:
-    """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER): the Qwen table."""
+    """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER): the Qwen table, or Hy4-Flash's
+    (its template knows no_think, high and max: serve/hy4_dialect.py)."""
     EFFORT.clear()
+    if family == "hy4":
+        from serve import hy4_dialect
+        EFFORT.update({**{k: None for k in ("none", "off", "minimal", "disabled", "false")}, "low": "high", "medium": "high", "high": "high",
+                       "xhigh": "max", "max": "max", "maximum": "max"})
+        return
     EFFORT.update(_EFFORT_QWEN)
 
 
@@ -2951,9 +2970,31 @@ class JsonOutputParser(OutputParser):
                          declared_only=declared_only, deferred=deferred)
 
 
+class Hy4OutputParser(OutputParser):
+    """The parser for Hy4-Flash: the model writes its reasoning and its calls with tagged tokens (`<think:opensource>`, `<tool_calls:opensource>`, `<arg_key:opensource>` ...);
+    serve/hy4_dialect.py turns them into the form OutputParser reads as the text arrives, and everything else (reasoning, content, declared-tool rules, recovery) is
+    OutputParser's.  A call is in the declared-tool form once translated, so the recovery that reads a drifted opener is on, as for the JSON form."""
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 recover: bool = False, declared_only: bool = False, deferred: bool = False):
+        super().__init__(thinking=thinking, tools=tools, stream_tools=stream_tools, recover=recover,
+                         declared_only=declared_only, deferred=deferred)
+        from serve import hy4_dialect
+        self._dialect = hy4_dialect.Hy4Dialect()
+
+    def feed(self, delta: str) -> list[Event]:
+        return super().feed(self._dialect.feed(delta))
+
+    def finish(self, reason: str | None = None) -> list[Event]:
+        tail = self._dialect.feed("", final=True)
+        out = super().feed(tail) if tail else []
+        return out + super().finish(reason)
+
+
 def parser_for_template(source: str | None):
     """The OutputParser class for a chat template's text, by the tool-call form the template documents (serve/toolformat.py):
     the JSON form gets JsonOutputParser; the XML form every Strata model ships with, templates without tools, and forms nothing
     here reads keep OutputParser (the same class as before this existed)."""
     from serve import toolformat
-    return JsonOutputParser if toolformat.tool_format(source or "") == "json" else OutputParser
+    kind = toolformat.tool_format(source or "")
+    return Hy4OutputParser if kind == "hy4" else JsonOutputParser if kind == "json" else OutputParser
