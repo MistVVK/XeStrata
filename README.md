@@ -54,7 +54,7 @@ The models, the install, the app and the API are much the same as Strata's.
 | --- | --- |
 | GPU | Intel Arc (A series, B series), AMD Radeon (RDNA2 or later, [AMD GPUs](#amd-gpus)), or an NVIDIA GPU (Pascal or later; Pascal has no tensor cores and runs the slower paths). 12 GB of VRAM or more is recommended (less works, but slower). |
 | CPU | x86-64 with AVX2. With AVX-512 (F, BW, VL, VNNI, VBMI) the CPU's part runs on AVX-512. |
-| RAM | Usually 32-62 GB ([Choosing a model](#choosing-a-model)). The smallest, Gyro-Coder, needs 26 GB (28 GB of RAM and VRAM together, where the VRAM makes up for the RAM); the largest sizes 100 GB or more. |
+| RAM | Usually 32-62 GB ([Choosing a model](#choosing-a-model)). The small Sync-XS needs 24 GiB; the largest sizes 100 GB or more. |
 | Disk | About 60-110 GB for the model (up to 190 GB for the largest sizes), and about 5 GB for the MTP layer. An SSD (NVMe) is strongly recommended. |
 | OS | Linux (the packages are for Ubuntu 26.04 and Fedora 44 and 45; on other distributions, [Podman](#podman) or [from the source](docs/BUILD.md#installing-from-the-source)), Windows 10 and 11 (x64, [Windows](#windows)). WSL 2 may work (pull requests welcome). |
 | BIOS | For a discrete GPU: Above 4G Decoding and Re-Size BAR on, CSM off. |
@@ -131,6 +131,9 @@ The size: the same model, compressed more or less.
 | the original, Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | slower; very good |
 | the original, Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | slow; as the original model |
 | Coder | **IQ1_M** | 58 GB | 32 GB | fast; good at code, weaker elsewhere |
+| Sync | **Sync-XS** | 58 GB | 24 GiB | mixed-bit bih3 pack |
+| Sync | **Sync-S** | 62 GB | 32 GiB, at least 12 GiB VRAM | mixed-bit bih3 pack |
+| Sync | **Sync-M** | 68 GB | 48 GiB | mixed-bit bih3 pack |
 | Gyro | **Gyro-S** | 58 GB | 36 GB (38 GB of RAM and VRAM) | slow; below the 2-3-bit sizes |
 | Gyro | **Gyro-M** | 92 GB | 43 GB (45 GB of RAM and VRAM) | slow; about IQ3_XXS |
 | Gyro | **Gyro-L** | 108 GB | 59 GB (61 GB of RAM and VRAM) | slower than Gyro-M; the best of the Gyro sizes |
@@ -145,6 +148,7 @@ The size: the same model, compressed more or less.
 - **The original:** Qwen's [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [compressed](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by ISTA-DASLab.
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF):** UkisAI's fine-tune. It thinks shorter before it answers, so the answer comes sooner, at much the same quality.
 - **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF):** ISTA-DASLab's version for code. With half the experts, it is weaker outside code and in languages other than English.
+- **Sync:** hiruhiru2005's [Sync-XS](https://huggingface.co/hiru2005/Sync-XS), [Sync-S](https://huggingface.co/hiru2005/Sync-S) and [Sync-M](https://huggingface.co/sync-strata/Sync-M) packs. Setup downloads the [shared files](https://huggingface.co/hiru2005/Sync-shared) once, and the original model's picture reader if chosen. None are bundled.
 - **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF):** agentionai's quantization for PCs with little memory. Where the RAM is short, the VRAM makes up for it (RAM and VRAM together, in brackets).
 - **[Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF):** agentionai's version for code: half the experts, quantized in Gyro's formats. It is weaker outside code. Where the RAM is short, the VRAM makes up for it, as for Gyro.
 - **[Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF):** 4- to 8-bit versions of the original. The experts that do not fit the RAM are read from the SSD while it answers.

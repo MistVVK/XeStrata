@@ -54,7 +54,7 @@ GPU の計算を CUDA から SYCL と Level Zero に書き直し、同じコー�
 | --- | --- |
 | GPU | Intel Arc（A シリーズ、B シリーズ）、AMD Radeon（RDNA2 以降、[AMD の GPU](#amd-の-gpu)）か、NVIDIA の GPU（Pascal 以降。Tensor Core のない Pascal は遅い経路で動きます）。VRAM は 12 GB 以上を勧めます（それより少なくても動きますが、遅くなります）。 |
 | CPU | x86-64 で AVX2 があるもの。AVX-512（F、BW、VL、VNNI、VBMI）があれば、CPU の計算に AVX-512 を使います。 |
-| RAM | ふつうは 32〜62 GB（[モデルの選び方](#モデルの選び方)）。いちばん小さな Gyro-Coder は 26 GB（VRAM が補えば RAM と VRAM の合計で 28 GB）、大きな版は 100 GB 以上です。 |
+| RAM | ふつうは 32〜62 GB（[モデルの選び方](#モデルの選び方)）。小さな Sync-XS は 24 GiB、大きな版は 100 GB 以上です。 |
 | ディスク | モデルに 60〜110 GB ほど（大きな版は 190 GB まで）、ほかに MTP 層に約 5 GB。SSD（NVMe）を強く勧めます。 |
 | OS | Linux（パッケージは Ubuntu 26.04 と Fedora 44・45 向け。ほかのディストリビューションでは [Podman](#podman) か[ソースから](docs/BUILD.ja.md#ソースから入れる)）、Windows 10 と 11（x64、[Windows](#windows)）。WSL 2 は動くかもしれません（プルリクエスト歓迎）。 |
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
@@ -124,6 +124,9 @@ RAM の少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の�
 | 元のモデル、Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | 遅め。とても良い |
 | 元のモデル、Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | 遅い。元のモデルと同等 |
 | Coder | **IQ1_M** | 58 GB | 32 GB | 速い。コードでは良く、ほかは弱い |
+| Sync | **Sync-XS** | 58 GB | 24 GiB | bih3 の混合ビットの pack |
+| Sync | **Sync-S** | 62 GB | 32 GiB、VRAM 12 GiB 以上 | bih3 の混合ビットの pack |
+| Sync | **Sync-M** | 68 GB | 48 GiB | bih3 の混合ビットの pack |
 | Gyro | **Gyro-S** | 58 GB | 36 GB（RAM と VRAM で 38 GB） | 遅い。2〜3 ビットの大きさより低い |
 | Gyro | **Gyro-M** | 92 GB | 43 GB（RAM と VRAM で 45 GB） | 遅い。IQ3_XXS くらい |
 | Gyro | **Gyro-L** | 108 GB | 59 GB（RAM と VRAM で 61 GB） | Gyro-M より遅い。Gyro の中でいちばん良い |
@@ -138,6 +141,7 @@ RAM の少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の�
 - **元のモデル**: Qwen の [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) を、ISTA-DASLab が[圧縮](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)したものです。
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**: UkisAI による調整版です。答える前の思考が短く、答えが早く出ます。品質はほぼ同じです。
 - **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)**: ISTA-DASLab によるコード向けの版です。エキスパートが半分なので、コード以外や、英語以外の言語では弱くなります。
+- **Sync**: hiruhiru2005 の [Sync-XS](https://huggingface.co/hiru2005/Sync-XS)、[Sync-S](https://huggingface.co/hiru2005/Sync-S)、[Sync-M](https://huggingface.co/sync-strata/Sync-M) の pack です。[共通部品](https://huggingface.co/hiru2005/Sync-shared)は一度だけ取得し、画像を読む場合は元のモデルの画像読み手も取得します。同梱はしません。
 - **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)**: agentionai による、メモリの少ない PC 向けの量子化です。RAM が足りなければ、VRAM が補います（括弧の中の、RAM と VRAM の合計）。
 - **[Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)**: agentionai によるコード向けの版です。エキスパートを半分にし、Gyro の形式で量子化しています。コード以外では弱くなります。RAM が足りなければ、Gyro と同じく VRAM が補います。
 - **[Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**: 元のモデルの 4〜8 ビットの版です。RAM に入りきらないエキスパートは、答えている間に SSD から読みます。
