@@ -3586,6 +3586,12 @@ static void exit_if_gpu_fatal(const std::string& err) {
     }
 }
 
+namespace {
+// The client-cancel flag for the prompt read (the engine half of #962/#3675): the stdin reader thread and the
+// in_shared stop flag live below where the E-9 on_chunk lambda needs the flag, so a file-scope atomic carries it.
+std::atomic<bool> g_prompt_stop_req{false};
+}
+
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
 static int engine_main(int argc, char** argv) {   // main() is at the end of this file (#3431)
 #else
@@ -14052,6 +14058,10 @@ int main(int argc, char** argv) {
             // KVA: a chunk the late layers did not compute has no real final rows: its draft cells are neither built
             // nor read (the floor rises before the cells are built, so they are skipped)
             if (use_mtp && mtp.cell_floor_enabled() && sp.kva_floor() > mtp.cell_floor()) mtp.set_cell_floor(sp.kva_floor());
+            // A client cancel ends the read at the next chunk (the engine half of #962/#3675): on Metal the prompt
+            // read runs through prompt_run's chunk loop, which only aborts when this returns false, and the decode
+            // loop's own stop check is the first to see it otherwise - after the whole prompt has been read.
+            if (g_prompt_stop_req.load()) { e = "cancelled"; return false; }
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
@@ -15231,7 +15241,7 @@ int main(int argc, char** argv) {
             };
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "STOP") { st->stop_req.store(true); continue; }
+                if (l == "STOP") { st->stop_req.store(true); g_prompt_stop_req.store(true); continue; }
                 std::lock_guard<std::mutex> lk(st->mu);
                 st->lines.push_back(l);
                 st->cv.notify_one();
@@ -17487,6 +17497,7 @@ int main(int argc, char** argv) {
                 }
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
+            g_prompt_stop_req.store(false);   // the prompt read's cancel flag resets with it (#962/#3675)
             err.clear();
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
