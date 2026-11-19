@@ -7766,7 +7766,17 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
         if (sv == S) { s_use = sv; r_dev = true; } else s_use = fit(false);
     }
     if (s_use <= 0) {
-        why = "no VRAM for a super-chunk (" + std::to_string(free_b >> 20) + " MiB free)";
+        // the need side too, so a user can see how far off it is and free that much (--vram-reserve-mib,
+        // --vram-reserve-later-mib, a smaller --max-context): the smallest super-chunk fit() tried, in the cheaper of
+        // the row placements this mode allows, plus the margin kept free
+        const int64_t s_min = S - (S - min_s) / m.T * m.T;
+        const int64_t margin = lm_margin_bytes(lm_by_default_);
+        const int64_t need_mib = ((int64_t) dev_bytes(s_min, mode == 1) + margin + (1 << 20) - 1) >> 20;
+        int dev = -1;
+        if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); dev = -1; }
+        why = "no VRAM for a super-chunk on CUDA" + std::to_string(dev) + " (" + std::to_string(free_b >> 20) +
+              " MiB free; the smallest, " + std::to_string(s_min) + " tokens, needs " + std::to_string(need_mib) +
+              " MiB with the " + std::to_string(margin >> 20) + " MiB margin)";
         return 0;
     }
     Impl::LmBufs& lb = m.lm;
@@ -9075,7 +9085,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                      "turns it off)\n", (long long) kLmDefaultOnTokens);
             }
         }
+        // prompts the walk turned down in a row, whatever the reason (the free MiB, and on a layer split the stage, change
+        // from prompt to prompt): every 16th says so, so a log read later shows the walk stayed off for every long prompt,
+        // not only the first; a short prompt is not counted, and a prompt the walk reads starts the count over
+        static int64_t off_in_row = 0;
         if (lm_prepare_chain(n, why) > 0) {
+            off_in_row = 0;
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
             // STRATA_SELECT_TWO_PASS is in run_impl's selection only, not in this walk: say so once
             static strata::kernels::two_pass::RequestStatus tp_status(std::getenv("STRATA_SELECT_TWO_PASS"));
@@ -9092,9 +9107,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             return ok;
         }
         static std::string said;   // once per reason (a short prompt is the common one; not worth a line when nobody asked for the walk)
-        if (why != said && !(by_default && why == "a short prompt")) {
+        const bool is_short = why == "a short prompt";
+        if (why != said && !(by_default && is_short)) {
             said = why;
             std::fprintf(stderr, "strata prefill: layer-major off for this prompt: %s\n", why.c_str());
+        }
+        if (!is_short && ++off_in_row % 16 == 0) {
+            std::fprintf(stderr, "strata prefill: layer-major still off, %lld long prompts in a row (now: %s)\n",
+                         (long long) off_in_row, why.c_str());
         }
     }
     const bool body_ok = run_impl(tokens, n, pos0, err);
