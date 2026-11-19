@@ -8,8 +8,54 @@
 #include <vector>
 
 #include "hy4_graph.hip.h"
+#include "hy4_serve.hip.h"
 
 using namespace hy4;
+
+#ifndef HY4_VERSION
+#define HY4_VERSION "0.2.18-dev"
+#endif
+
+// `strata-hy4 --export-tokenizer FILE.strata DIR`: Section 0's tokenizer_json and chat_template to DIR/tokenizer.hf.json and DIR/chat_template.jinja (Python builds serve's tokenizer
+// directory from them: terminal/tools/hy4_tokenizer.py convert_files), so Python needs no zstd.
+static int export_tokenizer(const std::string& file, const std::string& dir) {
+    strata::artifact::StrataFileReader rd;
+    std::string err;
+    if (!rd.open(file, err)) {
+        fprintf(stderr, "open: %s\n", err.c_str());
+        return 1;
+    }
+    Manifest m;
+    parse_manifest(rd.manifest_json(), m, true);
+    auto put = [&](const std::string& name, const std::string& text) {
+        std::string path = dir + "/" + name;
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f || fwrite(text.data(), 1, text.size(), f) != text.size()) {
+            fprintf(stderr, "cannot write %s\n", path.c_str());
+            if (f) fclose(f);
+            return false;
+        }
+        fclose(f);
+        return true;
+    };
+    if (!put("tokenizer.hf.json", m.tokenizer_json) || !put("chat_template.jinja", m.chat_template)) return 1;
+    printf("tokenizer: %zu bytes, chat template: %zu bytes\n", m.tokenizer_json.size(), m.chat_template.size());
+    return 0;
+}
+
+// `strata-hy4 --info FILE.strata`: one line of key=value facts, no GPU needed
+static int print_info(const std::string& file) {
+    strata::artifact::StrataFileReader rd;
+    std::string err;
+    if (!rd.open(file, err)) {
+        fprintf(stderr, "open: %s\n", err.c_str());
+        return 1;
+    }
+    Manifest m;
+    parse_manifest(rd.manifest_json(), m, false);
+    printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos);
+    return 0;
+}
 
 static void top5_line(const float* lg, int V, int pos, std::string& out) {
     std::vector<int> idx(V);
@@ -25,10 +71,43 @@ int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".";
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false;
     int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048;
+    bool serve = false, session_reuse = false;
+    int gpu = -1;
+    std::string draft = "off";
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto nxt = [&]() { return std::string(argv[++i]); };
-        if (a == "--model") model = nxt();
+        auto nxt = [&]() {
+            if (i + 1 >= argc) {
+                printf("ERR %s needs a value\n", a.c_str());
+                fflush(stdout);
+                exit(2);
+            }
+            return std::string(argv[++i]);
+        };
+        if (a == "--version") {
+            printf("strata-hy4 %s\n", HY4_VERSION);
+            return 0;
+        }
+        if (a == "--info") return print_info(nxt());
+        if (a == "--export-tokenizer") {
+            std::string f = nxt();
+            return export_tokenizer(f, nxt());
+        }
+        if (a == "--serve") serve = true;
+        else if (a == "--model" || a == "--native") model = nxt();
+        else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
+        else if (a == "--gpu") gpu = atoi(nxt().c_str());
+        else if (a == "--draft") draft = nxt();
+        else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
+        else if (a == "--vision" || a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner yet\n", a.c_str(), nxt().c_str());
+        else if (a == "--kv") {
+            std::string kv = nxt();
+            if (kv != "fp16") {
+                printf("ERR --kv %s: only fp16\n", kv.c_str());
+                fflush(stdout);
+                return 2;
+            }
+        }
         else if (a == "--engram") engram = nxt();
         else if (a == "--tokens") tok_path = nxt();
         else if (a == "--out") out_dir = nxt();
@@ -45,8 +124,36 @@ int main(int argc, char** argv) {
         else if (a == "--prof2") prof2 = true;
         else {
             fprintf(stderr, "unknown arg %s\n", a.c_str());
+            if (serve) {
+                printf("ERR unknown flag %s\n", a.c_str());
+                fflush(stdout);
+            }
             return 2;
         }
+    }
+    if (gpu >= 0) HCK(hipSetDevice(gpu));
+    if (serve) {
+        if (model.empty()) {
+            printf("ERR --native FILE.strata is required\n");
+            fflush(stdout);
+            return 2;
+        }
+        if (draft != "off") {
+            printf("ERR --draft %s: no drafter in this runner yet\n", draft.c_str());
+            fflush(stdout);
+            return 2;
+        }
+        ServeOpts so;
+        so.model = model;
+        so.engram = engram;
+        so.max_ctx = max_ctx > 0 ? max_ctx : 32768;
+        so.chunk = std::max(chunk, 1);
+        so.index_topk = index_topk;
+        so.no_index = no_index;
+        so.no_engram = no_engram;
+        so.session_reuse = session_reuse;
+        so.draft = draft;
+        return hy4_serve_main(so);
     }
     if (model.empty()) {
         fprintf(stderr, "usage: strata-hy4 --model SQ64.strata --engram Engram-Q8.strata --tokens ids.txt [--gen N] [--chunk N] [--ctx N] [--dump] [--all-logits] [--out dir]\n");
