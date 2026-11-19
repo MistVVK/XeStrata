@@ -352,3 +352,304 @@ def gptq_flip_quantize_sk_gpu(
     raw_bytes = np.concatenate([hdr, pl], axis=1).tobytes()
     assert len(raw_bytes) == n_sb * SUPERBLOCK_BYTES[code_name]
     return Q_deq, raw_bytes
+
+
+@torch.no_grad()
+def damped_cholesky_inv_batch(H: torch.Tensor, damp_frac: float = 0.01) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Batched damped Hessian + upper-triangular Cholesky inverse factor for H [B, K, K] on GPU."""
+    B, K, _ = H.shape
+    Hd = H.to(torch.float32).clone()
+    diag = Hd.diagonal(dim1=-2, dim2=-1)  # [B, K]
+    dead = diag <= 1e-12
+    idx = torch.arange(K, device=H.device)
+    if dead.any():
+        b_dead, j_dead = torch.where(dead)
+        Hd[b_dead, j_dead, j_dead] = 1.0
+        diag = Hd.diagonal(dim1=-2, dim2=-1)
+    active = (~dead).to(torch.float32)
+    mean_d = (diag * active).sum(dim=1) / active.sum(dim=1).clamp(min=1.0)
+    damp = (mean_d * damp_frac).clamp(min=1e-5)
+    Hd[:, idx, idx] += damp.unsqueeze(1)
+    try:
+        L = torch.linalg.cholesky(Hd)
+        Hinv = torch.cholesky_inverse(L)
+        Hinv_U = torch.linalg.cholesky(Hinv, upper=True)
+        return Hd, Hinv_U
+    except RuntimeError:
+        hd_list, hu_list = [], []
+        for b in range(B):
+            h_b, u_b = damped_cholesky_inv(H[b], damp_frac=damp_frac)
+            hd_list.append(h_b)
+            hu_list.append(u_b)
+        return torch.stack(hd_list, dim=0), torch.stack(hu_list, dim=0)
+
+
+@torch.no_grad()
+def _pack_sk_gpu_batch(
+    D_f16: torch.Tensor,
+    u_u8: torch.Tensor,
+    Q_int: torch.Tensor,
+    code_name: str,
+    fine_q: Optional[torch.Tensor] = None,
+) -> List[bytes]:
+    """Pure-GPU bit-packer for batched [B, M, K] quantized weights -> List[bytes] (len B).
+    Matches codecs.py bit-for-bit across all 8 S_K codes with ZERO CPU NumPy overhead!
+    """
+    B, n_sb = D_f16.shape
+    dev = D_f16.device
+    D_bytes = D_f16.contiguous().view(torch.uint8).view(B, n_sb, 2)
+    hdr = torch.cat([D_bytes, u_u8.view(B, n_sb, 4)], dim=2)  # [B, n_sb, 6]
+
+    if code_name == "S8_K":
+        pl = Q_int.to(torch.int8).contiguous().view(B, n_sb, QK_S).view(torch.uint8)
+    elif code_name in ("S2_K", "S3_K", "S4_K", "S5_K", "S6_K"):
+        bits = int(code_name[1])
+        q_u8 = Q_int.to(torch.uint8).reshape(B, n_sb, QK_S)
+        if bits == 2:
+            q4 = q_u8.view(B, n_sb, 64, 4)
+            pl = q4[..., 0] | (q4[..., 1] << 2) | (q4[..., 2] << 4) | (q4[..., 3] << 6)
+        elif bits == 3:
+            lo_b = (q_u8 & 0x03).view(B, n_sb, 64, 4)
+            p_lo = lo_b[..., 0] | (lo_b[..., 1] << 2) | (lo_b[..., 2] << 4) | (lo_b[..., 3] << 6)
+            hi_b = ((q_u8 >> 2) & 0x01).view(B, n_sb, 32, 8)
+            p_hi = (
+                hi_b[..., 0] | (hi_b[..., 1] << 1) | (hi_b[..., 2] << 2) | (hi_b[..., 3] << 3)
+                | (hi_b[..., 4] << 4) | (hi_b[..., 5] << 5) | (hi_b[..., 6] << 6) | (hi_b[..., 7] << 7)
+            )
+            pl = torch.cat([p_lo, p_hi], dim=2)
+        elif bits == 4:
+            q2 = q_u8.view(B, n_sb, 128, 2)
+            pl = q2[..., 0] | (q2[..., 1] << 4)
+        elif bits == 5:
+            lo_b = (q_u8 & 0x0F).view(B, n_sb, 128, 2)
+            p_lo = lo_b[..., 0] | (lo_b[..., 1] << 4)
+            hi_b = ((q_u8 >> 4) & 0x01).view(B, n_sb, 32, 8)
+            p_hi = (
+                hi_b[..., 0] | (hi_b[..., 1] << 1) | (hi_b[..., 2] << 2) | (hi_b[..., 3] << 3)
+                | (hi_b[..., 4] << 4) | (hi_b[..., 5] << 5) | (hi_b[..., 6] << 6) | (hi_b[..., 7] << 7)
+            )
+            pl = torch.cat([p_lo, p_hi], dim=2)
+        elif bits == 6:
+            lo_b = (q_u8 & 0x0F).view(B, n_sb, 128, 2)
+            p_lo = lo_b[..., 0] | (lo_b[..., 1] << 4)
+            hi_b = ((q_u8 >> 4) & 0x03).view(B, n_sb, 64, 4)
+            p_hi = hi_b[..., 0] | (hi_b[..., 1] << 2) | (hi_b[..., 2] << 4) | (hi_b[..., 3] << 6)
+            pl = torch.cat([p_lo, p_hi], dim=2)
+    elif code_name == "S1.5":
+        # Q_int in {-1, 0, +1} -> shift +1 into {0, 1, 2}, pad 256 -> 260 with 1s
+        q_pad = torch.ones((B, n_sb, 260), device=dev, dtype=torch.int32)
+        q_pad[:, :, :256] = Q_int.to(torch.int32).reshape(B, n_sb, QK_S) + 1
+        pow3 = torch.tensor([1, 3, 9, 27, 81], device=dev, dtype=torch.int32)
+        pl = (q_pad.view(B, n_sb, 52, 5) * pow3).sum(dim=-1).to(torch.uint8)
+    elif code_name == "S1.25":
+        # Q_int holds codebook indices [B, n_sb, 64] in 0..31; fine_q holds [B, n_sb, 4] uint8 in 0..15
+        idx8 = Q_int.to(torch.int64).reshape(B, n_sb, 8, 8)
+        bits40 = (
+            idx8[..., 0] | (idx8[..., 1] << 5) | (idx8[..., 2] << 10) | (idx8[..., 3] << 15)
+            | (idx8[..., 4] << 20) | (idx8[..., 5] << 25) | (idx8[..., 6] << 30) | (idx8[..., 7] << 35)
+        )
+        pl40 = torch.stack([((bits40 >> (8 * k)) & 0xFF).to(torch.uint8) for k in range(5)], dim=-1).reshape(B, n_sb, 40)
+        assert fine_q is not None
+        fq = fine_q.to(torch.uint8).reshape(B, n_sb, 4)
+        fb = torch.stack([fq[..., 0] | (fq[..., 1] << 4), fq[..., 2] | (fq[..., 3] << 4)], dim=-1)
+        pl = torch.cat([pl40, fb], dim=2)
+    else:
+        raise ValueError(code_name)
+
+    packed = torch.cat([hdr, pl], dim=2)  # [B, n_sb, sb_bytes]
+    expected_len = n_sb * SUPERBLOCK_BYTES[code_name]
+    packed_cpu = packed.reshape(B, expected_len).cpu().numpy()
+    return [packed_cpu[b].tobytes() for b in range(B)]
+
+
+@torch.no_grad()
+def gptq_flip_quantize_sk_batch_gpu(
+    W_in: torch.Tensor,
+    Hd: torch.Tensor,
+    Hinv_U: torch.Tensor,
+    code_name: str,
+    max_flips: int = 64,
+    block_size: int = 128,
+) -> List[bytes]:
+    """Batched In-HBM Block-LDL (GPTQ) + MACaQ 64-Flip + Pure-GPU Bit-Packing across B experts simultaneously!
+    Inputs:
+      W_in:   [B, M, K] float32 on GPU (K % 256 == 0)
+      Hd:     [B, K, K] float32 on GPU (precomputed damped Hessian per expert)
+      Hinv_U: [B, K, K] float32 on GPU (precomputed upper Cholesky factor of Hd^{-1})
+    Returns:
+      List[bytes] of length B matching codecs.py bit-for-bit!
+    """
+    B, M, K = W_in.shape
+    assert K % QK_S == 0
+    dev = W_in.device
+    n_sb_row = K // QK_S
+    n_sb = M * n_sb_row
+    H_diag = Hd.diagonal(dim1=-2, dim2=-1).clamp(min=1e-8)  # [B, K]
+
+    if code_name == "S1.5":
+        W = W_in.to(torch.float32).clone()
+        W_sb = W.reshape(B * n_sb, 4, 64)
+        abs_w = W_sb.abs()
+        mask = abs_w > (0.7 * abs_w.mean(dim=2, keepdim=True))
+        opt_s = (abs_w * mask).sum(dim=2) / mask.sum(dim=2).clamp(min=1)
+        amax_s = opt_s.amax(dim=1)
+        D_f16 = amax_s.to(torch.float16)
+        D_eff = D_f16.to(torch.float32)
+        denom = torch.where(amax_s > 0.0, amax_s, torch.ones_like(amax_s)).unsqueeze(-1)
+        u = torch.clamp(torch.round(opt_s / denom * 255.0), 0, 255).to(torch.uint8)
+        u = torch.where((opt_s > 0.0) & (u == 0), torch.ones_like(u), u)
+        eff = D_eff.unsqueeze(-1) * (u.to(torch.float32) / 255.0)
+        S_col = eff.reshape(B, M, n_sb_row, 4, 1).expand(B, M, n_sb_row, 4, 64).reshape(B, M, K)
+        inv_S = torch.where(S_col > 0.0, 1.0 / S_col, torch.zeros_like(S_col))
+
+        Q_int = torch.zeros((B, M, K), device=dev, dtype=torch.int16)
+        for i1 in range(0, K, block_size):
+            i2 = min(i1 + block_size, K)
+            cnt = i2 - i1
+            W1 = W[:, :, i1:i2].clone()
+            Err1 = torch.zeros_like(W1)
+            Hinv1 = Hinv_U[:, i1:i2, i1:i2]
+            for j in range(cnt):
+                col = i1 + j
+                wj = W1[:, :, j]
+                qi = torch.clamp(torch.round(wj * inv_S[:, :, col]), -1.0, 1.0)
+                qj = qi * S_col[:, :, col]
+                Q_int[:, :, col] = qi.to(torch.int16)
+                err = (wj - qj) / Hinv1[:, j, j].unsqueeze(1)
+                Err1[:, :, j] = err
+                if j + 1 < cnt:
+                    W1[:, :, j + 1 :] -= err.unsqueeze(2) * Hinv1[:, j, j + 1 :].unsqueeze(1)
+            if i2 < K:
+                W[:, :, i2:] -= torch.bmm(Err1, Hinv_U[:, i1:i2, i2:])
+        return _pack_sk_gpu_batch(D_f16.view(B, n_sb), u.view(B, n_sb, 4), Q_int, "S1.5")
+
+    if code_name == "S1.25":
+        W = W_in.to(torch.float32).clone()
+        cb = torch.from_numpy(S125_CODEBOOK.astype(np.float32)).to(dev)  # [32, 4]
+        cb_n2 = (cb * cb).sum(dim=1)  # [32]
+        W_sb = W.reshape(B * n_sb, 4, 64)
+        rms = torch.sqrt((W_sb * W_sb).mean(dim=2) + 1e-12)  # [B*n_sb, 4]
+        amax_s = rms.amax(dim=1)
+        D_f16 = amax_s.to(torch.float16)
+        D_eff = D_f16.to(torch.float32)
+        denom = torch.where(amax_s > 0.0, amax_s, torch.ones_like(amax_s)).unsqueeze(-1)
+        u = torch.clamp(torch.round(rms / denom * 255.0), 0, 255).to(torch.uint8)
+        u = torch.where((rms > 0.0) & (u == 0), torch.ones_like(u), u)
+        eff = D_eff.unsqueeze(-1) * (u.to(torch.float32) / 255.0)  # [B*n_sb, 4]
+        eff_sub = eff.reshape(B, M, n_sb_row, 4)
+
+        idx_all = torch.zeros((B, M, K // 4), device=dev, dtype=torch.int16)
+        for i1 in range(0, K, QK_S):
+            i2 = i1 + QK_S
+            sb_i = i1 // QK_S
+            W_blk = W[:, :, i1:i2].clone()  # [B, M, 256]
+            Err = torch.zeros_like(W_blk)
+            Hinv_blk = Hinv_U[:, i1:i2, i1:i2]
+            for g4 in range(0, QK_S, 4):
+                sub = g4 // 64
+                s_g = eff_sub[:, :, sb_i, sub : sub + 1].clamp(min=1e-12)  # [B, M, 1]
+                w4 = W_blk[:, :, g4 : g4 + 4]  # [B, M, 4]
+                wn = w4 / s_g
+                dots = torch.matmul(wn, cb.T)  # [B, M, 32]
+                idx = (2.0 * dots - cb_n2).argmax(dim=-1)  # [B, M]
+                idx_all[:, :, (i1 + g4) // 4] = idx.to(torch.int16)
+                q4 = cb[idx] * s_g  # [B, M, 4]
+                for k4 in range(4):
+                    j = g4 + k4
+                    err_j = (W_blk[:, :, j] - q4[:, :, k4]) / Hinv_blk[:, j, j].unsqueeze(1)
+                    Err[:, :, j] = err_j
+                    if j + 1 < QK_S:
+                        W_blk[:, :, j + 1 :] -= err_j.unsqueeze(2) * Hinv_blk[:, j, j + 1 :].unsqueeze(1)
+            if i2 < K:
+                W[:, :, i2:] -= torch.bmm(Err, Hinv_U[:, i1:i2, i2:])
+
+        # Compute optimal 4-bit fine residual multipliers per sub-group on GPU
+        idx_sb = idx_all.reshape(B, M, n_sb_row, 64).reshape(B * n_sb, 64).to(torch.long)
+        recon_unit = cb[idx_sb].reshape(B * n_sb, 4, 64)
+        W_orig_sb = W_in.to(torch.float32).reshape(B * n_sb, 4, 64)
+        num = (W_orig_sb * recon_unit).sum(dim=2)
+        den = (recon_unit * recon_unit).sum(dim=2) * torch.where(eff > 0.0, eff, torch.ones_like(eff)) + 1e-12
+        fine_f = torch.where(eff > 0.0, num / den, torch.ones_like(num))
+        fine_q = torch.clamp(torch.round((fine_f - 0.5) * 15.0), 0, 15).to(torch.uint8).view(B, n_sb, 4)
+        return _pack_sk_gpu_batch(D_f16.view(B, n_sb), u.view(B, n_sb, 4), idx_sb.view(B, n_sb, 64), "S1.25", fine_q=fine_q)
+
+    # --- S2_K..S8_K: Batched Hessian-weighted clipping + Block-LDL + MACaQ 64-flip + Pure-GPU Bit-Packing ---
+    is_s8 = code_name == "S8_K"
+    bits = 8 if is_s8 else int(code_name[1])
+    levels = 1 << bits
+    half = 127.0 if is_s8 else (levels - 1) / 2.0
+
+    W = W_in.to(torch.float32).clone()
+    W_sb = W.reshape(B * n_sb, 4, 64)
+    h_sb = H_diag.reshape(B, 1, n_sb_row, 4, 64).expand(B, M, n_sb_row, 4, 64).reshape(B * n_sb, 4, 64)
+    if is_s8:
+        amax_sub = W_sb.abs().amax(dim=2)
+        amax_sb = amax_sub.amax(dim=1)
+        D_f16 = (amax_sb / 127.0).to(torch.float16)
+        D_eff = D_f16.to(torch.float32)
+        denom = torch.where(amax_sb > 0.0, amax_sb, torch.ones_like(amax_sb)).unsqueeze(-1)
+        u = torch.clamp(torch.round(amax_sub / denom * 255.0), 0, 255).to(torch.uint8)
+        u = torch.where((amax_sub > 0.0) & (u == 0), torch.ones_like(u), u)
+        eff = D_eff.unsqueeze(-1) * (u.to(torch.float32) / 255.0)
+    else:
+        D_f16, u, eff = _optimal_subscales_gpu(W_sb, bits, h_diag_sb=h_sb)
+
+    S_col = eff.reshape(B, M, n_sb_row, 4, 1).expand(B, M, n_sb_row, 4, 64).reshape(B, M, K)
+    inv_S = torch.where(S_col > 0.0, 1.0 / S_col, torch.zeros_like(S_col))
+
+    Q_int = torch.zeros((B, M, K), device=dev, dtype=torch.int16)
+    for i1 in range(0, K, block_size):
+        i2 = min(i1 + block_size, K)
+        cnt = i2 - i1
+        W1 = W[:, :, i1:i2].clone()
+        Err1 = torch.zeros_like(W1)
+        Hinv1 = Hinv_U[:, i1:i2, i1:i2]
+        for j in range(cnt):
+            col = i1 + j
+            wj = W1[:, :, j]
+            sc = S_col[:, :, col]
+            inv_c = inv_S[:, :, col]
+            if is_s8:
+                qi = torch.clamp(torch.round(wj * inv_c), -127, 127)
+                qj = qi * sc
+            else:
+                qi = torch.clamp(torch.floor(wj * inv_c + half + 0.5), 0, levels - 1)
+                qj = (qi - half) * sc
+            Q_int[:, :, col] = qi.to(torch.int16)
+            err = (wj - qj) / Hinv1[:, j, j].unsqueeze(1)
+            Err1[:, :, j] = err
+            if j + 1 < cnt:
+                W1[:, :, j + 1 :] -= err.unsqueeze(2) * Hinv1[:, j, j + 1 :].unsqueeze(1)
+        if i2 < K:
+            W[:, :, i2:] -= torch.bmm(Err1, Hinv_U[:, i1:i2, i2:])
+
+    # Batched MACaQ Analytical Hessian Flip Refinement across all B*M rows simultaneously!
+    if max_flips > 0 and not is_s8:
+        Q_deq = (Q_int.to(torch.float32) - half) * S_col
+        g = torch.bmm(Q_deq - W_in.to(torch.float32), Hd).reshape(B * M, K)
+        Q_flat = Q_int.reshape(B * M, K)
+        S_flat = S_col.reshape(B * M, K)
+        step2_Hjj = (S_col * S_col * H_diag.unsqueeze(1)).reshape(B * M, K)
+        row_idx = torch.arange(B * M, device=dev)
+        row_b = torch.arange(B, device=dev).repeat_interleave(M)
+        for _ in range(max_flips):
+            can_up = Q_flat < (levels - 1)
+            can_dn = Q_flat > 0
+            two_sg = 2.0 * S_flat * g
+            dL_up = torch.where(can_up, step2_Hjj + two_sg, torch.zeros_like(g))
+            dL_dn = torch.where(can_dn, step2_Hjj - two_sg, torch.zeros_like(g))
+            min_dL, best_j = torch.minimum(dL_up, dL_dn).min(dim=1)
+            improve = min_dL < -1e-9
+            if not improve.any():
+                break
+            ar = row_idx[improve]
+            aj = best_j[improve]
+            ab = row_b[ar]
+            go_up = dL_up[ar, aj] <= dL_dn[ar, aj]
+            dq = torch.where(go_up, torch.ones_like(aj, dtype=torch.int16), -torch.ones_like(aj, dtype=torch.int16))
+            Q_flat[ar, aj] += dq
+            delta_w = dq.to(torch.float32) * S_flat[ar, aj]
+            g[ar] += delta_w.unsqueeze(1) * Hd[ab, aj]
+        Q_int = Q_flat.view(B, M, K)
+
+    return _pack_sk_gpu_batch(D_f16.view(B, n_sb), u.view(B, n_sb, 4), Q_int, code_name)
