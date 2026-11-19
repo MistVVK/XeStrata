@@ -10,6 +10,7 @@
 //   qwen4exp   Qwen3.8-Flash-Next and its fine-tunes (the engine's model)
 //   qwen35moe  Qwen3.5 MoE (Ornith-1.5-35B-A3B): gated delta-net + full attention every 4th layer, MTP
 //   qwen35     Qwen3.5 (Qwen3.5-9B): qwen35moe's block with a dense SwiGLU FFN in place of the MoE, MTP
+//   sensenova_loop SenseNova-Loop-9B: dense Qwen3.5 blocks visited in a loop, with mHC
 //   qwen3moe   Qwen3 MoE (llm-jp-4.1-32b-a3b): full attention only, no shared expert
 //   plamo3     PLaMo 3 (PLaMo 3 Translate): full attention, sliding-window layers between every 8th, fused QKV and
 //              gate|up, RMSNorms after the attention and the FFN as well as before
@@ -25,6 +26,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -32,7 +34,7 @@
 
 namespace strata {
 
-enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, Qwen35, Plamo3, Qwen3 };
+enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, Qwen35, Plamo3, Qwen3, SenseNovaLoop };
 
 /// llama.cpp's `llama_expert_gating_func_type`
 enum class ExpertGating : uint32_t { None = 0, Softmax = 1, Sigmoid = 2 };
@@ -66,8 +68,11 @@ struct ModelSpec {
     double rope_base_swa = 0;
     /// True when trunk layer `l` is a sliding-window layer.
     bool layer_swa(int64_t l) const { return swa_window > 0 && l >= 0 && l < (int64_t) swa.size() && swa[(size_t) l]; }
-    /// A dense model: a SwiGLU FFN in every block and no experts (qwen35, plamo3, qwen3)
-    bool dense() const { return arch == ModelArch::Qwen35 || arch == ModelArch::Plamo3 || arch == ModelArch::Qwen3; }
+    /// A dense model: a SwiGLU FFN in every block and no experts.
+    bool dense() const {
+        return arch == ModelArch::Qwen35 || arch == ModelArch::Plamo3 || arch == ModelArch::Qwen3 ||
+               arch == ModelArch::SenseNovaLoop;
+    }
 
     // linear attention.  `recurrent` is per layer: true for a gated delta-net / KDA layer.
     std::vector<bool> recurrent;          ///< block_count entries; the MTP layers are false
@@ -77,6 +82,21 @@ struct ModelSpec {
     int64_t ssm_n_group = 0;              ///< its key heads
     int64_t kda_head_dim = 0;
     double kda_gate_lower_bound = 0;
+
+    // SenseNova-Loop: layer numbers are visits; tensor names after the loop use the visit number.
+    int64_t loop_start = 0, loop_end = 0, loop_count = 0;
+    int64_t mhc_start = 0, mhc_end = 0, mhc_streams = 0, mhc_iterations = 0;
+    bool mhc_fixed_identity = false;
+    double mhc_pre_scale = 0;
+    int64_t physical_layer(int64_t visit) const {
+        if (arch != ModelArch::SenseNovaLoop || visit < loop_start || visit >= n_layer) return visit;
+        const int64_t width = loop_end - loop_start, extra = (loop_count - 1) * width;
+        return visit < loop_end + extra ? loop_start + (visit - loop_start) % width : visit - extra;
+    }
+    int64_t tensor_layer(int64_t visit) const {
+        const int64_t physical = physical_layer(visit);
+        return arch == ModelArch::SenseNovaLoop && physical < loop_end ? physical : visit;
+    }
 
     // MoE
     int64_t n_expert = 0, n_expert_used = 0;
@@ -153,6 +173,7 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     if (A == "qwen4exp") s.arch = ModelArch::Qwen4Exp;
     else if (A == "qwen35moe") s.arch = ModelArch::Qwen35Moe;
     else if (A == "qwen35") s.arch = ModelArch::Qwen35;
+    else if (A == "sensenova_loop") s.arch = ModelArch::SenseNovaLoop;
     else if (A == "qwen3moe") s.arch = ModelArch::Qwen3Moe;
     else if (A == "glm5-next" || A == "glm5next") s.arch = ModelArch::Glm5Next;
     else if (A == "plamo3") s.arch = ModelArch::Plamo3;
@@ -160,7 +181,7 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     else if (A == "qwen3" || A == "qwen3vl") s.arch = ModelArch::Qwen3;
     else {
         err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen35, qwen3moe, glm5-next, plamo3, "
-              "qwen3, qwen3vl)";
+              "qwen3, qwen3vl, sensenova_loop)";
         return false;
     }
 
@@ -245,12 +266,24 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     switch (s.arch) {
     case ModelArch::Qwen4Exp:
     case ModelArch::Qwen35Moe:
-    case ModelArch::Qwen35: {
+    case ModelArch::Qwen35:
+    case ModelArch::SenseNovaLoop: {
         // qwen35moe.cpp: attention.recurrent_layers when written, else every layer but each interval-th
         std::vector<double> r;
+        const MetaValue* rv = spec_get(g, A, "attention.recurrent_layers");
+        if (s.arch == ModelArch::SenseNovaLoop && (!rv || rv->type != MetaType::ARRAY)) {
+            err = A + ".attention.recurrent_layers must have one value per layer"; return false;
+        }
         if (spec_per_layer(g, A, "attention.recurrent_layers", n_all, r)) {
+            if (s.arch == ModelArch::SenseNovaLoop && s.n_nextn && r[(size_t) s.n_layer] != 0) {
+                err = A + ": MTP attention cannot be recurrent"; return false;
+            }
             for (int64_t i = 0; i < n_all; ++i) s.recurrent[(size_t) i] = i < s.n_layer && r[(size_t) i] != 0;
         } else {
+            if (s.arch == ModelArch::SenseNovaLoop) {
+                err = A + ".attention.recurrent_layers must have one value per layer";
+                return false;
+            }
             const int64_t iv = s.full_attention_interval > 0 ? s.full_attention_interval : 4;
             for (int64_t i = 0; i < s.n_layer; ++i) s.recurrent[(size_t) i] = (i + 1) % iv != 0;
         }
@@ -268,6 +301,42 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     case ModelArch::Plamo3:
     case ModelArch::Qwen3:
         break;
+    }
+
+    if (s.arch == ModelArch::SenseNovaLoop) {
+        const char* keys[] = {"loop.start", "loop.end", "loop.count", "mhc.start", "mhc.end", "mhc.streams",
+                              "mhc.iterations", "mhc.fixed_identity", "mhc.pre_scale"};
+        for (const char* key : keys) {
+            const MetaValue* v = spec_get(g, A, key);
+            if (!v || !v->is_num()) { err = "missing or invalid " + A + "." + key; return false; }
+        }
+        s.loop_start = spec_int(g, A, "loop.start");
+        s.loop_end = spec_int(g, A, "loop.end");
+        s.loop_count = spec_int(g, A, "loop.count");
+        s.mhc_start = spec_int(g, A, "mhc.start");
+        s.mhc_end = spec_int(g, A, "mhc.end");
+        s.mhc_streams = spec_int(g, A, "mhc.streams");
+        s.mhc_iterations = spec_int(g, A, "mhc.iterations");
+        s.mhc_fixed_identity = spec_int(g, A, "mhc.fixed_identity") != 0;
+        s.mhc_pre_scale = spec_num(g, A, "mhc.pre_scale");
+        if (s.n_nextn > 1 || s.loop_start < 0 || s.loop_start >= s.loop_end || s.loop_end > s.n_layer ||
+            s.loop_count < 1 || s.loop_count - 1 > (s.n_layer - s.loop_end) / (s.loop_end - s.loop_start)) {
+            err = A + ": invalid loop range or count"; return false;
+        }
+        const int64_t extra = (s.loop_count - 1) * (s.loop_end - s.loop_start);
+        const int64_t n_physical = s.n_layer - extra;
+        if (s.mhc_start < 0 || s.mhc_start >= s.mhc_end || s.mhc_end > n_physical || s.mhc_streams != 2 ||
+            s.mhc_iterations < 1 || s.mhc_iterations > 20 || s.mhc_fixed_identity ||
+            !std::isfinite(s.mhc_pre_scale) || s.mhc_pre_scale <= 0 ||
+            !((s.mhc_end <= s.loop_start) || (s.mhc_start >= s.loop_start && s.mhc_end <= s.loop_end) ||
+              s.mhc_start >= s.loop_end)) {
+            err = A + ": unsupported mHC configuration"; return false;
+        }
+        for (int64_t i = 0; i < s.n_layer; ++i) {
+            if (s.recurrent[(size_t) i] != s.recurrent[(size_t) s.tensor_layer(i)]) {
+                err = A + ": loop visits have different attention types"; return false;
+            }
+        }
     }
 
     s.n_expert = spec_int(g, A, "expert_count");
