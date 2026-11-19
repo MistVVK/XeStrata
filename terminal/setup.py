@@ -6431,9 +6431,9 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
                  "needs no compiler: `strata update` fetches it")
         bat = ROOT / bat_name
         q = lambda c: " ".join(f'"{x}"' if " " in str(x) else str(x) for x in c)  # noqa: E731
-        bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{q(conf)} || exit /b 1\r\n{q(build)} && exit /b 0\r\n'
-                       f'echo   (the build stopped - trying it once more)\r\n{q(build)} || exit /b 1\r\n',
-                       encoding="utf-8")
+        bat.write_bytes((f'@echo off\r\ncall "{vcvars}" >nul\r\n{q(conf)} || exit /b 1\r\n{q(build)} && exit /b 0\r\n'
+                         f'echo   (the build stopped - trying it once more)\r\n{q(build)} || exit /b 1\r\n').encode("utf-8"))
+        # bytes, not text: the \r\n is written here, and text mode on Windows would turn each one into \r\r\n (#1939)
         run(["cmd", "/c", str(bat)])
     else:
         run(conf)
@@ -8833,8 +8833,9 @@ def write_run_script(model, cfg_path, port, open_browser=True):
              "--port", str(port)] + (["--open"] if open_browser else [])
     if WIN:
         script = home() / f"run-{model.lower()}.bat"
-        script.write_text("@echo off\r\ntitle Strata " + model + "\r\ncd /d \"" + str(ROOT) + "\"\r\n" +
-                          " ".join(f'"{x}"' for x in serve) + "\r\nif errorlevel 1 pause\r\n", encoding="utf-8")
+        script.write_bytes(("@echo off\r\ntitle Strata " + model + "\r\ncd /d \"" + str(ROOT) + "\"\r\n" +
+                            " ".join(f'"{x}"' for x in serve) + "\r\nif errorlevel 1 pause\r\n").encode("utf-8"))
+        # bytes, not text: the \r\n is written here, and text mode on Windows would turn each one into \r\r\n (#1939)
     else:
         script = home() / f"run-{model.lower()}.sh"
         script.write_text("#!/bin/sh\ncd \"" + str(ROOT) + "\"\nexec " + " ".join(f'"{x}"' for x in serve) + "\n",
