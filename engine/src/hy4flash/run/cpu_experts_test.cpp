@@ -55,8 +55,20 @@ static long vm_kb(const char* key) {
     }
     return v;
 }
+static long smaps_kb(const char* key) {  // from /proc/self/smaps_rollup
+    long v = -1;
+    if (FILE* f = std::fopen("/proc/self/smaps_rollup", "r")) {
+        char line[256];
+        size_t kl = std::strlen(key);
+        while (std::fgets(line, sizeof(line), f))
+            if (!std::strncmp(line, key, kl)) { std::sscanf(line + kl, " %ld", &v); break; }
+        std::fclose(f);
+    }
+    return v;
+}
 static void ram_line(const char* tag) {
-    std::printf("[ram] %s: VmRSS %.2f GB, VmHWM(peak) %.2f GB\n", tag, vm_kb("VmRSS:") / 1048576.0, vm_kb("VmHWM:") / 1048576.0);
+    std::printf("[ram] %s: VmRSS %.2f GB, VmHWM(peak) %.2f GB, AnonHugePages %.2f GB\n", tag, vm_kb("VmRSS:") / 1048576.0, vm_kb("VmHWM:") / 1048576.0,
+                smaps_kb("AnonHugePages:") / 1048576.0);
 }
 
 // quantize-dequantize 1536 floats with the same Q8_1_G64 rule the evaluator uses (for the tight "same activations" check)
@@ -378,9 +390,12 @@ static int test_bench(const std::string& path, int nlayers, int nth) {
                       {"same16", 16, 12, true}, {"same16", 64, 8, true}, {"same16", 512, 4, true},
                       {"spread(all512)", 512, 4, false}};
     const bool no512 = std::getenv("STRATA_BENCH_NO512") != nullptr;  // skip the T=512 scenarios (slow on the library kernel)
+    const int maxt = std::getenv("STRATA_BENCH_MAXT") ? std::atoi(std::getenv("STRATA_BENCH_MAXT")) : 1 << 30;  // skip scenarios with larger T
+    const int gap_us = std::getenv("STRATA_BENCH_GAP_US") ? std::atoi(std::getenv("STRATA_BENCH_GAP_US")) : 0;  // idle gap between jobs (emulates GPU work: pool threads go to sleep)
     for (const Sc& sc : scs) {
         const int T = sc.T, reps = sc.reps;
         if (no512 && T >= 512) continue;
+        if (T > maxt || (sc.same16 && maxt < 16)) continue;
         std::vector<int> pool16;
         if (sc.same16) {
             std::set<int> s;
@@ -405,6 +420,7 @@ static int test_bench(const std::string& path, int nlayers, int nth) {
             bytes_total += (double)s.bytes;
             wall_total += dt;
             for (int k = 0; k < 5; ++k) ph[k] += s.phase_s[k];
+            if (gap_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(gap_us));
         }
         std::sort(ms.begin(), ms.end());
         double mean = 0;
