@@ -558,6 +558,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
   target_include_directories(host_limits_test PRIVATE include)
   add_test(NAME host_limits_test COMMAND host_limits_test)
+
+  # the opt-out from the kernel's automatic NUMA balancing (KFD userptr queue evictions, #4866): header-only, no GPU
+  add_executable(numa_balancing_test tests/platform/numa_balancing_test.cpp)
+  target_include_directories(numa_balancing_test PRIVATE include)
+  add_test(NAME numa_balancing_test COMMAND numa_balancing_test)
   # #4733: an engine started at Low I/O priority goes back to Normal (Windows; else skips)
   add_executable(io_priority_test tests/platform/io_priority_test.cpp src/platform/io_priority.cpp)
   target_include_directories(io_priority_test PRIVATE include)
