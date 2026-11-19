@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/native_dense.hpp"
 #include "strata/core/run_manifest.hpp"
@@ -19,11 +20,86 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <limits>
 #include <memory>
 #include <set>
 
 namespace strata::core {
+namespace {
+std::map<std::string, DenseNqEntry> g_dense_nq;
+std::string g_dense_nq_file;
+}
+
+bool dense_nq_init(const std::string& pack_dir, std::string& err) {
+    std::map<std::string, DenseNqEntry> entries;
+    const std::string path = pack_dir + "/dense_nq.txt", binary = pack_dir + "/dense_nq.bin";
+    std::ifstream in(path);
+    if (!in) {
+        if (std::filesystem::exists(path) || std::filesystem::exists(binary)) {
+            err = "dense_nq: cannot open " + path;
+            return false;
+        }
+        g_dense_nq.clear(); g_dense_nq_file.clear();
+        return true;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string name, extra;
+        DenseNqEntry e;
+        if (!(ss >> name >> e.type >> e.ne0 >> e.ne1 >> e.offset >> e.bytes) || (ss >> extra) ||
+            (name != "output.weight" && !(name.rfind("blk.", 0) == 0 && name.ends_with(".attn_gate.weight"))) ||
+            (e.type != 11 && e.type != 12 && e.type != 13) || e.ne0 <= 0 || e.ne0 > INT_MAX ||
+            e.ne1 <= 0 || e.ne1 > INT_MAX || e.ne0 % 256 ||
+            e.bytes != strata::kernels::native_mmvq_weight_bytes(e.type, (int) e.ne0, (int) e.ne1) ||
+            e.offset > std::numeric_limits<uint64_t>::max() - e.bytes || !entries.emplace(name, e).second) {
+            err = "dense_nq.txt: invalid or duplicate row: " + line;
+            return false;
+        }
+        ranges.emplace_back(e.offset, e.offset + e.bytes);
+    }
+    if (in.bad() || entries.empty()) { err = "dense_nq.txt: empty or unreadable index"; return false; }
+    std::sort(ranges.begin(), ranges.end());
+    for (size_t i = 1; i < ranges.size(); ++i)
+        if (ranges[i].first < ranges[i - 1].second) { err = "dense_nq.txt: overlapping tensors"; return false; }
+    std::error_code ec;
+    const uint64_t size = std::filesystem::file_size(binary, ec);
+    if (ec || ranges.back().second > size) { err = "dense_nq.bin is absent or shorter than its index"; return false; }
+    g_dense_nq = std::move(entries); g_dense_nq_file = binary;
+    return true;
+}
+
+bool dense_nq_active() { return !g_dense_nq.empty(); }
+
+const DenseNqEntry* dense_nq_find(const std::string& name) {
+    const auto it = g_dense_nq.find(name);
+    return it == g_dense_nq.end() ? nullptr : &it->second;
+}
+
+bool dense_nq_read(const std::string& name, int64_t ne0, int64_t ne1, std::vector<uint8_t>& data,
+                   std::string& err) {
+    const DenseNqEntry* e = dense_nq_find(name);
+    if (!e) { err = "dense_nq: missing " + name; return false; }
+    if (e->ne0 != ne0 || e->ne1 != ne1 || e->bytes > std::numeric_limits<size_t>::max() ||
+        e->offset > (uint64_t) std::numeric_limits<std::streamoff>::max() ||
+        e->bytes > (uint64_t) std::numeric_limits<std::streamsize>::max()) {
+        err = "dense_nq: wrong dimensions or oversized tensor " + name; return false;
+    }
+    std::ifstream in(g_dense_nq_file, std::ios::binary);
+    data.resize((size_t) e->bytes);
+    in.seekg((std::streamoff) e->offset);
+    if (!in || !in.read((char*) data.data(), (std::streamsize) e->bytes)) {
+        err = "dense_nq.bin: short read for " + name; return false;
+    }
+    return true;
+}
+
 namespace {
 int g_layer_lb = -1, g_layer_le = -1;   // set_layer_range; -1: every layer
 bool in_range(const std::string& name) {
@@ -174,9 +250,13 @@ bool NativeDense::layer_bytes(const std::vector<std::string>& shards, bool inclu
                 if (!eligible(tensor, include_ple_key) || tensor.shape.size() != 2 || tensor.shape[0] > INT_MAX ||
                     tensor.shape[1] > INT_MAX)
                     continue;
-                const bool as_q8 = bf16_file_shape(tensor);     // #4741: its Q8_0 copy is what is allocated
-                if (!as_q8 && !strata::kernels::native_mmvq_supported((int) tensor.type)) continue;
-                const uint64_t b = as_q8 ? (uint64_t) tensor.shape[0] / 32 * 34 * (uint64_t) tensor.shape[1]
+                const DenseNqEntry* nq = dense_nq_find(tensor.name);
+                if (nq && (nq->ne0 != (int64_t) tensor.shape[0] || nq->ne1 != (int64_t) tensor.shape[1])) {
+                    err = "dense_nq: wrong dimensions for " + tensor.name; return false;
+                }
+                const bool as_q8 = !nq && bf16_file_shape(tensor);     // #4741: its Q8_0 copy is what is allocated
+                if (!nq && !as_q8 && !strata::kernels::native_mmvq_supported((int) tensor.type)) continue;
+                const uint64_t b = nq ? nq->bytes : as_q8 ? (uint64_t) tensor.shape[0] / 32 * 34 * (uint64_t) tensor.shape[1]
                                          : strata::kernels::native_mmvq_weight_bytes((int) tensor.type,
                                                                                      (int) tensor.shape[0],
                                                                                      (int) tensor.shape[1]);
@@ -547,6 +627,23 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
+                const DenseNqEntry* nq = dense_nq_find(tensor.name);
+                if (nq) {
+                    if (tensor.shape.size() != 2 || tensor.shape[0] != (uint64_t) ref.ne0 ||
+                        tensor.shape[1] != (uint64_t) ref.ne1) {
+                        err = "dense_nq: incompatible matrix " + tensor.name; return false;
+                    }
+                    std::vector<uint8_t> host;
+                    if (!dense_nq_read(tensor.name, ref.ne0, ref.ne1, host, err)) return false;
+                    void* data = take(tensor.name, nq->bytes);
+                    if (!data || !strata::gpu::copy(data, host.data(), host.size())) {
+                        err = "dense_nq upload " + tensor.name + ": " + strata::gpu::last_error(); return false;
+                    }
+                    max_in = (std::max)(max_in, (int) ref.ne0);
+                    total += nq->bytes;
+                    pending.push_back(Pending{&ref, nq->type, nq->bytes, data});
+                    continue;
+                }
                 if (bf16_as_q8_0(tensor, ref)) {   // #4741: a BF16 projection of the pack, served as Q8_0
                     const uint64_t nb = (uint64_t) ref.elements / 32, bytes = nb * 34;
                     void* data = take(tensor.name, bytes);
@@ -627,6 +724,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 strata::kernels::native_q8_0_to_rows(data, (int) ref.ne0, (int) ref.ne1, &compute);
                 hc_q8_bytes += bytes;
                 hc_q8.emplace_back(&ref, data);
+            }
+        }
+        for (const auto& [name, entry] : g_dense_nq) {
+            (void) entry;
+            if (name != "output.weight" && in_range(name) && !seen.count(name)) {
+                err = "dense_nq: no native projection for " + name; return false;
             }
         }
         // upstream 0a379a1f: a pack whose GGUF has no Q8_0 copy of the layers' hyper-connection down / up projections

@@ -16,7 +16,10 @@
 //      truncated file, a role named in the wrong file, a type or a shape the pack does not say, a missing file.
 #include "gguf_fixture.hpp"
 
+#include "strata/artifact/gguf_reader.hpp"
+
 #include "strata/core/expert_source.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -184,6 +187,33 @@ void sync_v6() {
     write_text(d.path / "experts_k.txt", kinds);
     write_text(d.path / "r1q2.txt", "0 0 0 0 0 0 0\n");
     check(!load(d.path, 2, 2, err), "Sync v6: missing scale table refused");
+}
+
+void dense_nq() {
+    using namespace strata::core;
+    TempDir d;
+    std::string err;
+    const std::string index = "output.weight 12 256 1 0 144\nblk.0.attn_gate.weight 11 256 1 144 110\n";
+    std::vector<uint8_t> bytes(254);
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (uint8_t) i;
+    { std::ofstream f(d.path / "dense_nq.bin", std::ios::binary); f.write((const char*) bytes.data(), (std::streamsize) bytes.size()); }
+    write_text(d.path / "dense_nq.txt", index);
+    bool ok = dense_nq_init(d.path.string(), err);
+    std::vector<uint8_t> row;
+    ok = ok && dense_nq_active() && dense_nq_find("output.weight") &&
+         dense_nq_find("blk.0.attn_gate.weight") && !dense_nq_find("other") &&
+         dense_nq_read("blk.0.attn_gate.weight", 256, 1, row, err) &&
+         row == std::vector<uint8_t>(bytes.begin() + 144, bytes.end());
+    check(ok, "dense_nq: validate index and read the replacement's bytes" + (ok ? "" : ": " + err));
+    check(!dense_nq_read("output.weight", 256, 2, row, err), "dense_nq: wrong dimensions refused");
+    write_text(d.path / "dense_nq.txt", index + "output.weight 12 256 1 0 144\n");
+    check(!dense_nq_init(d.path.string(), err), "dense_nq: duplicate refused");
+    write_text(d.path / "dense_nq.txt", "output.weight 12 256 1 0 144\nblk.0.attn_gate.weight 11 256 1 100 110\n");
+    check(!dense_nq_init(d.path.string(), err), "dense_nq: overlapping spans refused");
+    write_text(d.path / "dense_nq.txt", "output.weight 12 256 1 200 144\n");
+    check(!dense_nq_init(d.path.string(), err), "dense_nq: short binary refused");
+    TempDir empty;
+    check(dense_nq_init(empty.path.string(), err) && !dense_nq_active(), "dense_nq: ordinary pack has no replacement");
 }
 
 // ---- 2b. v6: the latent MoE's A-only pack (Edge0): the header's widths, no hadamard.txt, the column scales
@@ -435,6 +465,31 @@ int main(int argc, char** argv) try {
                     ok ? "every span is its tensor" : "REFUSED: ", ok ? "" : err.c_str());
         return ok ? 0 : 1;
     }
+    if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--sync") {
+        std::string err;
+        if (!load(argv[2], 48, 512, err)) { std::printf("layout refused: %s\n", err.c_str()); return 1; }
+        const ExpertLayout& L = strata::kernels::cpu::expert_layout();
+        if (!strata::core::dense_nq_init(argv[2], err) || !strata::core::dense_nq_find("output.weight")) {
+            std::printf("dense_nq refused: %s\n", err.c_str()); return 1;
+        }
+        const auto file_size = fs::file_size(fs::path(argv[2]) / "experts.v2.bin");
+        std::printf("Sync v%d: %lld layers x %lld experts, computed %llu B, file %llu B\n", L.version,
+                    (long long) L.n_layers, (long long) L.n_expert, (unsigned long long) L.total,
+                    (unsigned long long) file_size);
+        if (argc == 4) {
+            const strata::GgufFile gguf(argv[3]);
+            const std::string arch_err = strata::check_architecture(gguf);
+            size_t expert_tensors = 0;
+            for (const auto& t : gguf.tensors())
+                if (t.name.find("ffn_gate_exps.weight") != std::string::npos ||
+                    t.name.find("ffn_up_exps.weight") != std::string::npos ||
+                    t.name.find("ffn_down_exps.weight") != std::string::npos) ++expert_tensors;
+            std::printf("common GGUF: %zu tensors, %zu routed expert tensors, architecture: %s\n",
+                        gguf.tensors().size(), expert_tensors, arch_err.empty() ? "ok" : arch_err.c_str());
+            if (!arch_err.empty() || expert_tensors != 0) return 1;
+        }
+        return L.mixed() && L.total == file_size ? 0 : 1;
+    }
     std::printf("expert_layout_test\n");
     if (argc < 2) {
         std::printf("usage: expert_layout_test <tests/data/native_experts>\n");
@@ -444,6 +499,7 @@ int main(int argc, char** argv) try {
     columns();
     latent_v6();
     sync_v6();
+    dense_nq();
     arena();
     std::printf(g_fail ? "expert_layout_test: %d FAILED\n" : "expert_layout_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;

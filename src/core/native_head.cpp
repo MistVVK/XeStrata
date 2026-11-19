@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/native_head.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/core/run_manifest.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
@@ -47,9 +49,13 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
             err = "native head: expected a natively supported output.weight with the canonical head dimensions";
             return false;
         }
-        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out);
+        const DenseNqEntry* nq = dense_nq_find("output.weight");
+        std::vector<uint8_t> nq_data;
+        if (nq && !dense_nq_read("output.weight", n_in, n_out, nq_data, err)) return false;
+        const int source_type = nq ? nq->type : (int) tensor->type;
+        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes(source_type, (int) n_in, (int) n_out);
         const uint64_t payload = gguf.file_size() - gguf.data_start();
-        if (tensor->offset > payload || bytes > payload - tensor->offset) {
+        if (!nq && (tensor->offset > payload || bytes > payload - tensor->offset)) {
             err = "native head: truncated output.weight payload";
             return false;
         }
@@ -58,16 +64,16 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
         bool status = strata::gpu::alloc_device(&weights, bytes);
         if (status)
             status = strata::gpu::alloc_device(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
-        strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
+        if (!nq) strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
         if (status)
-            status = strata::gpu::copy(weights, gguf.tensor_data(*tensor), bytes);
+            status = strata::gpu::copy(weights, nq ? nq_data.data() : gguf.tensor_data(*tensor), bytes);
         if (!status) {
             if (scratch) strata::gpu::free(scratch);
             if (weights) strata::gpu::free(weights);
             err = std::string("native head upload: ") + strata::gpu::last_error();
             return false;
         }
-        int type = (int) tensor->type;
+        int type = source_type;
         if (type == 14 && strata::kernels::native_q6_k_rows_ok((int) n_in)) {   // aligned loads (native_mmvq.hpp)
             sycl::queue& q = strata::core::Runtime::get().compute();
             strata::kernels::native_q6_k_to_rows(weights, (int) n_in, (int) n_out, &q);
@@ -87,9 +93,9 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
         type_ = type;
         if (strata::core::manifest::enabled()) {   // upstream 89f4fa18 (XESTRATA_MANIFEST): what the head holds and where
             namespace mf = strata::core::manifest;
-            mf::instance().tensors("head", strata::ggml_type_name((uint32_t) tensor->type), 1, bytes);
+            mf::instance().tensors("head", strata::ggml_type_name((uint32_t) source_type), 1, bytes);
             mf::instance().path("head", "output.weight", true, "held in VRAM",
-                                std::string("type ") + strata::ggml_type_name((uint32_t) tensor->type) +
+                                std::string("type ") + strata::ggml_type_name((uint32_t) source_type) +
                                     (type == strata::kernels::kNativeQ6KRows ? ", repacked (aligned rows)" : "") +
                                     (type == strata::kernels::kNativeQ8Rows ? ", repacked (aligned rows)" : ""));
         }
