@@ -57,7 +57,32 @@ __device__ __forceinline__ void decode_q8(const uint8_t* pl, int u, uint32_t (&q
 // half2 weights (q-H pairs) for the 8 weights of this lane
 template <int FMT>
 __device__ __forceinline__ void decode_w8(const uint8_t* pl, int u, uint32_t (&wp)[4]) {
+    if constexpr (FMT == FMT_S1_25) {
+        // weights 8u..8u+7 = codebook groups 2u, 2u+1 (one 10-bit field); values from the LDS codebook (s125_lut_init + barrier first)
+        const int G = u >> 2, r = u & 3;
+        const uint8_t* p = pl + G * 5 + ((10 * r) >> 3);
+        const uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+        const uint32_t bits = (v >> ((10 * r) & 7)) & 0x3FFu;
+        const uint2* lut = s125_lut();
+        const uint2 a = lut[bits & 31u], b = lut[bits >> 5];
+        wp[0] = a.x; wp[1] = a.y; wp[2] = b.x; wp[3] = b.y;
+        return;
+    }
     uint32_t q[8];
+    if constexpr (FMT == FMT_S1_5) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int i = 8 * u + k;
+            q[k] = (uint32_t)(s15_trit(pl[i / 5], i % 5) + 1);  // 0..2, magic 1025 below
+        }
+        const hv2 mag = hv2{(_Float16)1025.0f, (_Float16)1025.0f};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t pat = 0x64006400u | q[2 * i] | (q[2 * i + 1] << 16);
+            wp[i] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, pat) - mag);
+        }
+        return;
+    }
     decode_q8<FMT>(pl, u, q);
     const hv2 mag = FMT == FMT_S8 ? hv2{(_Float16)1152.0f, (_Float16)1152.0f} : hv2{(_Float16)1024.0f, (_Float16)1024.0f};
     const hv2 hh = hv2{(_Float16)sk_half<FMT>(), (_Float16)sk_half<FMT>()};
