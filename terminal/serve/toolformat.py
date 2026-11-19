@@ -6,6 +6,7 @@ that says "this model writes XML calls" and the parser the server picks cannot d
     xml   `<tool_call>` around `<function=NAME>` and `<parameter=NAME>` blocks (Qwen3.6, Qwen3.8-Flash-Next: every template Strata ships)
     json  `<tool_call>` around a JSON object `{"name": ..., "arguments": {...}}` (Qwen3, Hermes)
     dsml  DeepSeek-V4's `<｜DSML｜...>` blocks
+    hy4   Tencent Hy4-Flash's `<tool_calls:opensource>` / `<arg_key:opensource>` tagged tokens (serve/hy4_dialect.py translates them to the xml form)
     none  the template has no tool section
     other the template documents tools in a form this module does not know
 """
@@ -14,6 +15,7 @@ from __future__ import annotations
 import re
 
 _DSML = "｜DSML｜"          # the full-width bars DeepSeek's template writes
+_HY4 = "<tool_calls{}>"          # Tencent Hy4-Flash: its template builds `<tool_calls:opensource>` from this and the suffix variable
 _XML_OPEN = re.compile(r"<function=[^>]*>")
 
 
@@ -23,6 +25,8 @@ def tool_format(source: str) -> str:
         return "none"
     if _DSML in source:
         return "dsml"
+    if _HY4 in source:
+        return "hy4"
     has_call = "<tool_call>" in source
     if has_call and _XML_OPEN.search(source) and "<parameter=" in source:
         return "xml"

@@ -323,6 +323,8 @@ from serve import expert_heat  # noqa: E402
 from serve import commit_limit  # noqa: E402
 from serve import oomd_pacer  # noqa: E402
 from serve import lastrun  # noqa: E402
+from serve import hy4_kind  # noqa: E402
+from serve import hy4_dialect  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -756,6 +758,7 @@ class StrataEngine:
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         # the all-cards split engine (sFNX, strata-split-N[-arch]): its GEN parser accepts fewer keys than Strata's engine (tests/split/test_split_gen_keys.py pins them)
         self.split_engine = os.path.basename(str(exe)).startswith("strata-split")
+        self.hy4_engine = hy4_kind.is_hy4_exe(exe)     # the Hy4-Flash engine (serve/hy4_kind.py): one request at a time, no logprobs, no logit bias
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -3411,6 +3414,8 @@ def mtp_retry_args(cfg: dict, exe: str | None, extra: list[str] | None = None) -
     """The arguments to start again with when an Auto start that picked DFlash2 ends before the engine is ready: the same start with the MTP (or no drafter, when
     the MTP layer is not on this computer). None when there is nothing to retry: the person named DFlash2 themselves (that start fails with its reason, as it
     should), the choice was not DFlash2, or the MTP arguments are the same. Builds the arguments without any line or note (engine_args announce=False)."""
+    if hy4_kind.is_hy4(cfg):
+        return None
     if drafting.normalize(cfg.get("drafting")) != "auto" or "args" not in cfg:
         return None
     try:
@@ -3427,6 +3432,8 @@ def nodraft_retry_args(cfg: dict, exe: str | None, extra: list[str] | None = Non
     """The arguments to start again with when an Auto start ends before the engine is ready because a card ran out of memory: the same start with no drafter
     (the draft layer and DFlash2's buffers are the biggest optional part on a card that is short), never the MTP in place of DFlash2.  None when the drafting
     was not Auto (the person named a drafter: that start fails with the engine's reason), when the first start has no drafter anyway, or when nothing differs."""
+    if hy4_kind.is_hy4(cfg):
+        return None
     if drafting.normalize(cfg.get("drafting")) != "auto" or "args" not in cfg:
         return None
     try:
@@ -3445,6 +3452,8 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     layer_split_value). `exe` is the engine program that will start: the drafter's flags follow what that program takes
     (strata_control/drafting.py engine_form). `announce=False` builds the arguments without the "[strata] drafting" lines
     and without leaving a note for the next engine start (the retry arguments of mtp_retry_args)."""
+    if hy4_kind.is_hy4(cfg):                     # the Hy4-Flash engine takes none of the Flash-Next flags below (serve/hy4_kind.py)
+        return hy4_kind.engine_args(cfg, exe, announce=announce)
     args = list(cfg["args"])
     # "user_args" (strata_control/user_args.py): the options the person set by hand, over the generated ones at every start,
     # so a setup run or the app rewriting "args" cannot undo them (#3216 #3215 #3270)
@@ -3861,6 +3870,7 @@ def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dic
 
 
 def refuse_for_split(engine, req: dict) -> None:
+    hy4_kind.refuse(engine, req)
     if not getattr(engine, "split_engine", False):
         return
     if top_logprobs(req) is not None:
@@ -3977,7 +3987,11 @@ class Service:
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = end_token_ids(tokenizer)
-        self.family = None                              # the model family: set_family() below (None: the Qwen form)
+        self.hy4 = getattr(engine, "hy4_engine", False) is True      # the Hy4-Flash engine: its end tokens, its tagged texts that stay text in a message
+        if self.hy4:
+            self.stop_ids |= hy4_kind.end_ids(tokenizer)
+            self.literals = literal_tags(list(getattr(tokenizer, "control_tokens", ())) + hy4_kind.literal_tags(tokenizer))
+        self.family = None                            # the model family: set_family() below (None: the Qwen form)
         self.parser_cls = parser_for_template(getattr(template, "source", None))   # reads the model's output (reasoning, content, tool calls): by the template's tool-call form
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
@@ -4927,6 +4941,8 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        if self.hy4:                                   # Hy4's template reads reasoning_effort no_think | high | max (serve/hy4_dialect.py)
+            return self.template.render(messages, tools=tools, **hy4_dialect.template_kwargs(kwargs))
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -8291,7 +8307,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     if _ds:                                             # DeepSeek: this Strata no longer runs it; stop before the engine starts (retired.py)
         print(retired.server_line(_ds), flush=True)
         return 2
-    if a.config and a.engine == "strata":
+    if a.config and a.engine == "strata" and not hy4_kind.is_hy4(cfg):     # (the Hy4-Flash engine has no tuning knobs)
         cfg = apply_saved_tuning(cfg)
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
     launch_attestation = None
@@ -8512,7 +8528,9 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(None)
+        svc.set_family("hy4" if svc.hy4 else None)
+        if svc.hy4:
+            svc._force_text = hy4_dialect.force_text
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])

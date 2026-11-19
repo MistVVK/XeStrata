@@ -1,0 +1,4 @@
+{
+  "_note": "Download sources for the Hy4-Flash files, tried in order after the config's hy4_source and the STRATA_HY4_SOURCE environment variable. Empty on purpose: the owner decides where the public files live (phaseA-tests/hy4/HY4-INTEGRATION-DESIGN.md section 4). A source is {\"kind\": \"http\" | \"http-parts\", \"base\": \"https://...\", \"files\": {\"<name>\": [\"url\", ...]}}.",
+  "sources": []
+}
