@@ -440,7 +440,7 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
         else:
             table = hipblaslt_table(gpu["arch"], lib_dirs, meta.get("hipblaslt_version"), [eng / "tuning"])
             if table:
-                cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
+                cfg.setdefault("env", {})["STRATA_HIPBLASLT_TUNING"] = str(table)
         if GFX1103_OPT_IN and gfx_arch_is(gpu["arch"], "gfx1103") and not WIN:
             # the 780M's KFD queues are evicted (a GPU reset) while transparent huge pages move the pinned expert arena
             cfg.setdefault("env", {})["STRATA_NO_ARENA_THP"] = "1"
