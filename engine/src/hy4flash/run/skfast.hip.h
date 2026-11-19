@@ -16,39 +16,63 @@ __device__ __forceinline__ float dot2f(uint32_t a, uint32_t b, float c) {
     return h2_dot_f32(a, b, c);
 }
 
+// the raw payload words of the 8 weights 8u..8u+7 of a super-block (S2..S8 only): a/b = the loaded bytes, decoded by q_from_raw (split so a caller can issue its weight loads early)
+template <int FMT>
+__device__ __forceinline__ void load_q_raw(const uint8_t* pl, int u, uint32_t& a, uint32_t& b) {
+    if (FMT == FMT_S2) { a = ld16(pl + 2 * u); b = 0; }
+    else if (FMT == FMT_S3) { a = ld16(pl + 2 * u); b = pl[64 + u]; }
+    else if (FMT == FMT_S4) { a = ld32u(pl + 4 * u); b = 0; }
+    else if (FMT == FMT_S5) { a = ld32u(pl + 4 * u); b = pl[128 + u]; }
+    else if (FMT == FMT_S6) { a = ld32u(pl + 4 * u); b = ld16(pl + 128 + 2 * u); }
+    else { a = ld32u(pl + 8 * u); b = ld32u(pl + 8 * u + 4); }  // S8
+}
+
+// integer q of the 8 weights from the raw words (S8: byte ^ 0x80 = q + 128)
+template <int FMT>
+__device__ __forceinline__ void q_from_raw(uint32_t a, uint32_t b, uint32_t (&q)[8]) {
+    if (FMT == FMT_S2) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) q[k] = (a >> (2 * k)) & 3u;
+    } else if (FMT == FMT_S3) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) q[k] = ((a >> (2 * k)) & 3u) | (((b >> k) & 1u) << 2);
+    } else if (FMT == FMT_S4) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) q[k] = (a >> (4 * k)) & 15u;
+    } else if (FMT == FMT_S5) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) q[k] = ((a >> (4 * k)) & 15u) | (((b >> k) & 1u) << 4);
+    } else if (FMT == FMT_S6) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) q[k] = ((a >> (4 * k)) & 15u) | (((b >> (2 * k)) & 3u) << 4);
+    } else {  // S8
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            q[k] = ((a >> (8 * k)) & 0xFFu) ^ 0x80u;
+            q[4 + k] = ((b >> (8 * k)) & 0xFFu) ^ 0x80u;
+        }
+    }
+}
+
 // integer q of the 8 weights 8u..8u+7 of a super-block payload (S8: byte ^ 0x80 = q + 128)
 template <int FMT>
 __device__ __forceinline__ void decode_q8(const uint8_t* pl, int u, uint32_t (&q)[8]) {
-    if (FMT == FMT_S2) {
-        const uint32_t w = ld16(pl + 2 * u);
+    uint32_t a, b;
+    load_q_raw<FMT>(pl, u, a, b);
+    q_from_raw<FMT>(a, b, q);
+}
+
+// half2 weights (q-H pairs) from integer q (S2..S8)
+template <int FMT>
+__device__ __forceinline__ void w_from_q(const uint32_t (&q)[8], uint32_t (&wp)[4]) {
+    const uint32_t mag = h2_splat(FMT == FMT_S8 ? 1152.0f : 1024.0f);
+    const uint32_t hh = h2_splat(sk_half<FMT>());
 #pragma unroll
-        for (int k = 0; k < 8; ++k) q[k] = (w >> (2 * k)) & 3u;
-    } else if (FMT == FMT_S3) {
-        const uint32_t w = ld16(pl + 2 * u);
-        const uint32_t hb = pl[64 + u];
-#pragma unroll
-        for (int k = 0; k < 8; ++k) q[k] = ((w >> (2 * k)) & 3u) | (((hb >> k) & 1u) << 2);
-    } else if (FMT == FMT_S4) {
-        const uint32_t w = ld32u(pl + 4 * u);
-#pragma unroll
-        for (int k = 0; k < 8; ++k) q[k] = (w >> (4 * k)) & 15u;
-    } else if (FMT == FMT_S5) {
-        const uint32_t w = ld32u(pl + 4 * u);
-        const uint32_t hb = pl[128 + u];
-#pragma unroll
-        for (int k = 0; k < 8; ++k) q[k] = ((w >> (4 * k)) & 15u) | (((hb >> k) & 1u) << 4);
-    } else if (FMT == FMT_S6) {
-        const uint32_t w = ld32u(pl + 4 * u);
-        const uint32_t h = ld16(pl + 128 + 2 * u);
-#pragma unroll
-        for (int k = 0; k < 8; ++k) q[k] = ((w >> (4 * k)) & 15u) | (((h >> (2 * k)) & 3u) << 4);
-    } else {  // S8
-        const uint32_t d0 = ld32u(pl + 8 * u), d1 = ld32u(pl + 8 * u + 4);
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            q[k] = ((d0 >> (8 * k)) & 0xFFu) ^ 0x80u;
-            q[4 + k] = ((d1 >> (8 * k)) & 0xFFu) ^ 0x80u;
-        }
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t pat = 0x64006400u | q[2 * i] | (q[2 * i + 1] << 16);
+        uint32_t w = h2_sub(pat, mag);
+        if (FMT != FMT_S8) w = h2_sub(w, hh);
+        wp[i] = w;
     }
 }
 
@@ -93,8 +117,13 @@ __device__ __forceinline__ void decode_w8(const uint8_t* pl, int u, uint32_t (&w
     }
 }
 
+// SwiGLU input prologue (same expression as hy4::k_swiglu_h): the activation tile is half(silu(g) * u) built from two fp32 arrays
+__device__ __forceinline__ float sw_silu(float x) { return x / (1.0f + __expf(-x)); }
+
+// Xg/Xu != nullptr: the X rows are not read from X but computed on the fly as half(silu(Xg[m][k]) * Xu[m][k]) (fp32 [M][K] arrays)
 template <int FMT, int MT, int RW>
-__device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M, int bidx) {
+__device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M, int bidx,
+                                          const float* __restrict__ Xg = nullptr, const float* __restrict__ Xu = nullptr) {
     constexpr int KC = 16384 / MT;  // halves per token in LDS
     constexpr int SB = sk_sb_bytes(FMT);
     __shared__ uint4 xs[MT * KC / 8];
@@ -117,7 +146,17 @@ __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, 
         for (int i = threadIdx.x; i < MT * n8; i += 256) {
             const int mm = i / n8, c = i - mm * n8;
             uint4 v = make_uint4(0, 0, 0, 0);
-            if (mm < M) v = *(const uint4*)(X + (size_t)mm * K + k0 + c * 8);
+            if (Xg) {
+                if (mm < M) {
+                    const size_t o = (size_t)mm * K + k0 + c * 8;
+                    const float4 g0 = *(const float4*)(Xg + o), g1 = *(const float4*)(Xg + o + 4);
+                    const float4 u0 = *(const float4*)(Xu + o), u1 = *(const float4*)(Xu + o + 4);
+                    v.x = h2_pack(sw_silu(g0.x) * u0.x, sw_silu(g0.y) * u0.y);
+                    v.y = h2_pack(sw_silu(g0.z) * u0.z, sw_silu(g0.w) * u0.w);
+                    v.z = h2_pack(sw_silu(g1.x) * u1.x, sw_silu(g1.y) * u1.y);
+                    v.w = h2_pack(sw_silu(g1.z) * u1.z, sw_silu(g1.w) * u1.w);
+                }
+            } else if (mm < M) v = *(const uint4*)(X + (size_t)mm * K + k0 + c * 8);
             xs[mm * (KC / 8) + c] = v;
         }
         __syncthreads();
@@ -167,6 +206,8 @@ struct LinJob {
     float* Y;
     int N;
     int blk0;  // first block of this job in the combined grid
+    const __half* X;   // per-job activations (nullptr: the X argument of the launch)
+    const float *Xg, *Xu;  // != nullptr: this job's activations are half(silu(Xg) * Xu) (fp32 [M][K]); X is ignored
 };
 
 template <int FMT, int MT, int RW>
@@ -174,14 +215,25 @@ __global__ void __launch_bounds__(256) k_gemv_multi(const LinJob* __restrict__ j
     int j = 0;
     while (j + 1 < njobs && (int)blockIdx.x >= jobs[j + 1].blk0) ++j;
     const LinJob jb = jobs[j];
-    gemv_body<FMT, MT, RW>(jb.W, jb.N, K, X, jb.Y, M, (int)blockIdx.x - jb.blk0);
+    gemv_body<FMT, MT, RW>(jb.W, jb.N, K, jb.X ? jb.X : X, jb.Y, M, (int)blockIdx.x - jb.blk0, jb.Xg, jb.Xu);
 }
+
+// rows per wave of the single-GEMV launch (1, 2 or 4); per-row results do not depend on it. Tuning knob (env HY4_GEMV_RW).
+inline int& gemv_rw() { static int v = getenv("HY4_GEMV_RW") ? atoi(getenv("HY4_GEMV_RW")) : 2; return v; }
 
 template <int FMT, int MT>
 inline void launch_gemv(hipStream_t s, const void* W, int N, int K, const __half* X, float* Y, int M) {
-    constexpr int RW = 2;
-    dim3 grid((N + 8 * RW - 1) / (8 * RW)), block(256);
-    hipLaunchKernelGGL((k_gemv<FMT, MT, RW>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
+    const int rw = gemv_rw();
+    if (rw == 1) {
+        dim3 grid((N + 7) / 8), block(256);
+        hipLaunchKernelGGL((k_gemv<FMT, MT, 1>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
+    } else if (rw == 4) {
+        dim3 grid((N + 31) / 32), block(256);
+        hipLaunchKernelGGL((k_gemv<FMT, MT, 4>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
+    } else {
+        dim3 grid((N + 15) / 16), block(256);
+        hipLaunchKernelGGL((k_gemv<FMT, MT, 2>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
+    }
 }
 
 template <int FMT>
@@ -216,7 +268,9 @@ struct LinMulti {
     int njobs = 0, total_blocks = 0, K = 0, fmt = 0;
 };
 
-inline LinMulti linear_multi_build(int fmt, int K, int n, const void* const* W, float* const* Y, const int* N) {
+// X / Xg / Xu: optional per-job activations (arrays of n pointers or nullptr), see LinJob
+inline LinMulti linear_multi_build(int fmt, int K, int n, const void* const* W, float* const* Y, const int* N, const __half* const* X = nullptr, const float* const* Xg = nullptr,
+                                   const float* const* Xu = nullptr) {
     LinMulti d;
     d.fmt = fmt;
     d.K = K;
@@ -227,6 +281,9 @@ inline LinMulti linear_multi_build(int fmt, int K, int n, const void* const* W, 
         h[i].W = (const uint8_t*)W[i];
         h[i].Y = Y[i];
         h[i].N = N[i];
+        h[i].X = X ? X[i] : nullptr;
+        h[i].Xg = Xg ? Xg[i] : nullptr;
+        h[i].Xu = Xu ? Xu[i] : nullptr;
         h[i].blk0 = blk;
         blk += (N[i] + 15) / 16;  // RW = 2 rows per wave, 8 waves per block
     }
