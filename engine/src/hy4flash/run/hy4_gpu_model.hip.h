@@ -120,6 +120,42 @@ inline bool host_cpu_fast() {
 #endif
 }
 
+// Memory plan for a context of max_ctx tokens and prefill chunks of `chunk` tokens (chunk <= 0: pick one) on a card with `total` bytes: returns the chunk and, unless the
+// user set them, exports HY4_KV_HOST (1: sparse-layer KV cache, IndexPool state and the absorbed kv_b copies live in pinned host memory read by the GPU, so a 128K context
+// fits 8 GB cards) and HY4_RESERVE_GB (VRAM kept free for the runner when the hot experts are placed).
+inline void hy4_setenv(const char* k, const char* v, int) {
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+
+inline int plan_memory(int max_ctx, int chunk, size_t total, size_t trunk_bytes) {
+    const double GB = 1e9, tot = (double)total / GB;
+    if (chunk <= 0) {
+        // ~1.4 MB of working buffers per chunk token; keep them near 12% of the card
+        int c = 2048;
+        while (c > 256 && c * 1.4e6 > 0.12 * (double)total) c >>= 1;
+        chunk = c;
+    }
+    const double slots = (double)((max_ctx + 8 + 15) / 16 * 16);
+    const double kv_dev = 12.0 * slots * 2176.0 / GB + 12.0 * (double)max_ctx * 512.0 / GB + 12.0 * (double)(max_ctx / 4 + 8) * 256.0 / GB + 1.06;  // sparse KV + ivg + pooled + wk_b/wv_b
+    const double small = chunk * 1.5e6 / GB + 0.4 + 30.0 * (512.0 + chunk) * 2176.0 / GB;                                                         // chunk buffers + engram/misc + SWA rings
+    bool kv_host = kv_dev > 0.15 * tot;
+    if (getenv("HY4_KV_HOST")) kv_host = atoi(getenv("HY4_KV_HOST")) != 0;
+    else hy4_setenv("HY4_KV_HOST", kv_host ? "1" : "0", 1);
+    if (!getenv("HY4_RESERVE_GB")) {
+        double reserve = small + (kv_host ? 0.0 : kv_dev) + (tot >= 10.0 ? 1.45 : 0.0);  // + the prefill streaming scratch on cards that have room
+        char b[32];
+        snprintf(b, sizeof b, "%.2f", reserve);
+        hy4_setenv("HY4_RESERVE_GB", b, 1);
+    }
+    fprintf(stderr, "[plan] ctx %d chunk %d: working buffers ~%.2f GB, sparse KV + IndexPool + kv_b copies ~%.2f GB -> %s; reserve %s GB (card %.1f GB, trunk %.2f GB)\n", max_ctx, chunk, small, kv_dev,
+            kv_host ? "pinned host memory" : "VRAM", getenv("HY4_RESERVE_GB"), tot, trunk_bytes / GB);
+    return chunk;
+}
+
 inline double host_mem_gb() {
 #ifdef _WIN32
     return 64.0;

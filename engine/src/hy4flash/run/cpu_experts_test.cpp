@@ -60,15 +60,25 @@ static void ram_line(const char* tag) {
 }
 
 // quantize-dequantize 1536 floats with the same Q8_1_G64 rule the evaluator uses (for the tight "same activations" check)
-static void qdq(float* x) {
-    strata::quant::sk::BlockQ8_1_G64 blk[24];
+static void qdq(float* x, int mode = 1) {  // mode 1: one Q8_1 term, mode 2: two terms (x = da*qa + db*qb, qb = Q8_1 of the residual)
+    strata::quant::sk::BlockQ8_1_G64 blk[24], blk2[24];
     strata::quant::sk::quantize_q8_1_g64(x, blk, 1536);
+    float res[1536];
     for (int b = 0; b < 24; ++b)
-        for (int i = 0; i < 64; ++i) x[b * 64 + i] = blk[b].d * (float)blk[b].qs[i];
+        for (int i = 0; i < 64; ++i) {
+            const float dq = blk[b].d * (float)blk[b].qs[i];
+            res[b * 64 + i] = x[b * 64 + i] - dq;
+            x[b * 64 + i] = dq;
+        }
+    if (mode == 2) {
+        strata::quant::sk::quantize_q8_1_g64(res, blk2, 1536);
+        for (int b = 0; b < 24; ++b)
+            for (int i = 0; i < 64; ++i) x[b * 64 + i] += blk2[b].d * (float)blk2[b].qs[i];
+    }
 }
 
 // straightforward reference: fp32 dequant of the real S_K rows, double accumulation, exact z (no activation quantization)
-static void reference(const CpuExperts& cx, int layer, int T, const float* z, const int32_t* idx, const float* w, const uint8_t* use, std::vector<double>& out, bool qact = false) {
+static void reference(const CpuExperts& cx, int layer, int T, const float* z, const int32_t* idx, const float* w, const uint8_t* use, std::vector<double>& out, int qact = 0) {
     out.assign((size_t)T * 1536, 0.0);
     std::vector<float> row(1536);
     std::vector<double> gu(3072), h(1536), sq(1536);
@@ -82,7 +92,7 @@ static void reference(const CpuExperts& cx, int layer, int T, const float* z, co
             const size_t gb = strata::quant::sk::superblock_bytes((SkCode)v.gu_code) * 6, db = strata::quant::sk::superblock_bytes((SkCode)v.dn_code) * 6;
             for (int d = 0; d < 1536; ++d) sq[d] = h2f(((const uint16_t*)v.body)[d]);
             std::vector<float> zt(z + (size_t)t * 1536, z + (size_t)(t + 1) * 1536);
-            if (qact) qdq(zt.data());
+            if (qact) qdq(zt.data(), qact);
             for (int r = 0; r < 3072; ++r) {
                 strata::quant::sk::dequant_sk_row(v.body + 3072 + (size_t)r * gb, (SkCode)v.gu_code, row.data(), 1536);
                 double a = 0;
@@ -95,7 +105,7 @@ static void reference(const CpuExperts& cx, int layer, int T, const float* z, co
                 h[d] = std::min(si, 10.0) * std::max(-10.0, std::min(u, 10.0)) / sq[d];
             }
             std::vector<float> hf(h.begin(), h.end());
-            if (qact) qdq(hf.data());
+            if (qact) qdq(hf.data(), qact);
             for (int r = 0; r < 1536; ++r) {
                 strata::quant::sk::dequant_sk_row(v.body + v.dn_off + (size_t)r * db, (SkCode)v.dn_code, row.data(), 1536);
                 double a = 0;
@@ -194,7 +204,7 @@ static int test_num(const std::string& path, int nth) {
         int hist[9] = {};
         for (int e : pool) { CpuExpertView v = cx.view(L, e); hist[v.gu_code]++; }
         std::printf("layer %d: %zu resident experts, kernel=%s, gu code histogram S2..S6,S8: ", L, pool.size(), cx.fast_kernel() ? "fast" : "lib");
-        for (int c = 2; c <= 8; ++c) if (hist[c]) std::printf("S%d=%d ", c, hist[c]);
+        for (int c = 0; c <= 8; ++c) if (hist[c]) std::printf("code%d=%d ", c, hist[c]);
         std::printf("\n");
     }
     int bad = 0;
@@ -232,6 +242,39 @@ static int test_num(const std::string& path, int nth) {
         cx.wait();
         std::printf("  rerun bit-exact: %s\n", std::memcmp(out.data(), out2.data(), out.size() * 4) == 0 ? "yes" : "NO");
         if (std::memcmp(out.data(), out2.data(), out.size() * 4) != 0) ++bad;
+        {   // high-precision (two-term) activations
+            cx.set_hi_activations(true);
+            std::vector<float> oh((size_t)T * 1536, -3.f), oh2((size_t)T * 1536, 4.f);
+            cx.submit(L, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, oh.data());
+            cx.wait();
+            cx.submit(L, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, oh2.data());
+            cx.wait();
+            print_err("  [hi] vs exact fp32 z", compare(oh.data(), ref, T));
+            const Err e1 = compare(oh.data(), ref, T);
+            if (!(e1.max_rel < 2e-3)) { std::printf("  FAIL: hi mode error above 2e-3\n"); ++bad; }
+            if (T <= 8 || T == 64) {
+                std::vector<double> refh;
+                reference(cx, L, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, refh, 2);
+                const Err e2 = compare(oh.data(), refh, T);
+                print_err("  [hi] vs same-act 2-term ref", e2);
+                if (!(e2.max_rel < 2e-3)) { std::printf("  FAIL: hi kernel differs from 2-term reference\n"); ++bad; }
+            }
+            const bool same = std::memcmp(oh.data(), oh2.data(), oh.size() * 4) == 0;
+            std::printf("  [hi] rerun bit-exact: %s\n", same ? "yes" : "NO");
+            if (!same) ++bad;
+            if (T == 8) {
+                CpuExperts c1;
+                if (!c1.init(path, 1, &mask, err)) { std::printf("init(1) failed: %s\n", err.c_str()); return 1; }
+                c1.set_hi_activations(true);
+                std::vector<float> o1((size_t)T * 1536, 9.f);
+                c1.submit(L, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, o1.data());
+                c1.wait();
+                const bool s1 = std::memcmp(oh.data(), o1.data(), oh.size() * 4) == 0;
+                std::printf("  [hi] 1 thread vs %d threads bit-exact: %s\n", nth, s1 ? "yes" : "NO");
+                if (!s1) ++bad;
+            }
+            cx.set_hi_activations(false);
+        }
         if (T == 8) {
             // thread-count independence
             CpuExperts c1;
@@ -328,7 +371,7 @@ static int test_bench(const std::string& path, int nlayers, int nth) {
     sum_arena(cx, nlayers, nth, &bw);
     std::printf("DRAM read ceiling (plain sum loop, %d threads over the arena): %.1f GB/s\n", nth, bw);
     Rng rng(11);
-    std::printf("kernel: %s\n", cx.fast_kernel() ? "fast (avx512 vbmi/vnni)" : "lib (gemm_sk_q8_1)");
+    std::printf("kernel: %s\n", cx.fast_kernel() ? "fast (AVX-512 or AVX2, see init log)" : "lib (gemm_sk_q8_1)");
     std::printf("%-14s %-4s %-6s %-10s %-10s %-10s %-12s %-10s\n", "scenario", "T", "reps", "ms/layer", "p50 ms", "min ms", "MB/layer", "GB/s(mean)");
     struct Sc { const char* name; int T; int reps; bool same16; };
     const Sc scs[] = {{"spread", 1, 60, false}, {"spread", 4, 60, false}, {"spread", 8, 60, false}, {"spread", 64, 12, false},

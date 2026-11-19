@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> image_files;
     int64_t image_max_pixels = 4194304;
     bool load_only = false, dump = false, save_logits = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false;
-    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048;
+    int gen = 0, max_ctx = 0, chunk = 0 /* 0: auto from the card */, index_topk = 2048;
     bool serve = false, session_reuse = false;
     int gpu = -1;
     std::string draft = "auto";  // auto: dfly2 under --serve (when the file carries the drafter), off for the CLI runs (gates / benches); "off" and "dfly2" force
@@ -207,17 +207,30 @@ int main(int argc, char** argv) {
     size_t fr = 0, tot = 0;
     HCK(hipMemGetInfo(&fr, &tot));
     fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0);
+    if (getenv("HY4_VRAM_CAP_GB")) {  // test knob: pretend the card is smaller (ballast allocation), e.g. 7.6 = an 8 GB card
+        const double cap = atof(getenv("HY4_VRAM_CAP_GB")) * 1073741824.0;
+        if (cap < (double)fr) {
+            void* ballast = nullptr;
+            HCK(hipMalloc(&ballast, fr - (size_t)cap));
+            fr = (size_t)cap;
+            tot = (size_t)cap;
+            fprintf(stderr, "[gpu] VRAM capped to %.1f GiB (test)\n", cap / 1073741824.0);
+        }
+    }
+    std::vector<int32_t> tok;
+    const bool ctx_auto = max_ctx <= 0;
+    if (!tok_path.empty()) {
+        std::ifstream f(tok_path);
+        long v;
+        while (f >> v) tok.push_back((int32_t)v);
+        if (max_ctx <= 0 && !tok.empty()) max_ctx = (int)tok.size() + gen + 16;
+    }
+    chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, 0);
     GpuModel g;
     double t_load0 = now_s();
     if (!load_gpu_model(g, model, true)) return 1;
     fprintf(stderr, "[load] total %.1f s\n", now_s() - t_load0);
     if (load_only) return 0;
-    std::vector<int32_t> tok;
-    {
-        std::ifstream f(tok_path);
-        long v;
-        while (f >> v) tok.push_back((int32_t)v);
-    }
     // HY4-VISION: decode + resize the pictures and expand each image-pad token of the prompt to the picture's run of pads (CPU only; the ViT runs after the runner is up)
     std::vector<ImageRec> recs;
     if (!image_files.empty()) {
@@ -236,6 +249,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         tok.swap(ex);
+        if (ctx_auto) max_ctx = (int)tok.size() + gen + 16;  // the pads grew the prompt (the card plan above used the unexpanded length)
     }
     int T0 = (int)tok.size();
     if (T0 == 0) {

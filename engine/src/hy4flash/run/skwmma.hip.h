@@ -306,6 +306,10 @@ __device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, cons
     const int tid = threadIdx.x, lane = tid & 31;
     const int drow = tid >> 2, dg = tid & 3;
     const int g = lane >> 2, c4 = (lane & 3) * 4;
+    if constexpr (FMT == FMT_S1_25) {
+        s125_lut_init();
+        __syncthreads();
+    }
     RawSub<FMT> cur, nxt;
     load_raw<FMT>(wr, dg, cur);
     constexpr int PD = 4;

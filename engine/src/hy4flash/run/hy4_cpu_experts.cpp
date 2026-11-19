@@ -30,12 +30,27 @@
 #include <sys/mman.h>
 #endif
 
-// The fast kernel needs AVX-512 BW + VNNI + VBMI (Ice Lake / Rocket Lake / Zen 4 and later) and F16C; otherwise the library
-// gemm_sk_q8_1 path is used (also selectable with STRATA_CPUEXP_KERNEL=lib, and used when an S8 expert is resident).
+// Fast kernels (compile-time selected):
+//   HY4_FAST  = AVX-512 BW + VNNI + VBMI + F16C (Ice Lake / Rocket Lake / Zen 4 and later),
+//   HY4_FAST2 = AVX2 + FMA + F16C (Haswell / Zen 1-3 and later; used only when HY4_FAST is not available, e.g. -march=native on
+//               a Zen 2 PC, or -mno-avx512f to test it on an AVX-512 machine).
+// Without either, the library gemm_sk_q8_1 path is used (also selectable with STRATA_CPUEXP_KERNEL=lib, and used when an S1.5 or
+// S8 expert is resident).
 #if defined(__x86_64__) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__) && defined(__F16C__)
 #define HY4_FAST 1
 #else
 #define HY4_FAST 0
+#endif
+#if !HY4_FAST && defined(__x86_64__) && defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+#define HY4_FAST2 1
+#else
+#define HY4_FAST2 0
+#endif
+#define HY4_FASTK (HY4_FAST || HY4_FAST2)
+#if HY4_FAST
+#define HY4_FAST_NAME "fast(avx512-vbmi)"
+#else
+#define HY4_FAST_NAME "fast(avx2)"
 #endif
 
 namespace hy4 {
@@ -157,6 +172,7 @@ struct Job {
     const uint8_t* use = nullptr;
     float* zout = nullptr;
     bool accum = false;
+    bool hi = false;
     double t_post = 0;
 };
 
@@ -181,8 +197,8 @@ struct SpinBarrier {
 };
 
 struct TScratch {
-    ABuf<BlockQ8_1_G64> xg;  // gathered z blocks for up to 16 tokens
-    ABuf<float> tg, tu;      // [16][64] gate / up (or down) results
+    ABuf<BlockQ8_1_G64> xg, xg2;  // gathered z blocks for up to 16 tokens (library path; xg2 = residual term, hi mode)
+    ABuf<float> tg, tu, tg2;      // [16..32][64] gate / up (or down) results (tg2: second term, library path hi mode)
     int sense = 0;
 };
 
@@ -195,12 +211,16 @@ struct TScratch {
 // Weight plane P_j of one super-block is the byte vector with lane L, byte k = q[64*L + 4*k + j] (0..2^bits-1). Then
 //   sum_lanes( cvt(dpbusd chain of P_j . xj) * eff * xd ) - half * sum_lanes( eff * xs4 )  ==  sum_g eff_g (xd_g*isum_g - half*xs_g)
 // i.e. exactly the library's dot_sk_q8_1_row, with float accumulation in 16 lanes and a single horizontal sum per row.
+// Optional high-precision mode (STRATA_CPUEXP_ACT=hi): x = da*qa + db*qb, qb = Q8_1 of the residual x - da*qa. The second term
+// lives in xjb/xdb (only touched in hi mode, so q8 mode streams the first 2304 bytes only); xs4 then holds 0.25*(s_a + s_b).
 struct alignas(64) ActRow {
     int8_t xj[6][4][64];
     float xd[6][16];
     float xs4[6][16];
+    int8_t xjb[6][4][64];
+    float xdb[6][16];
 };
-static_assert(sizeof(ActRow) == 2304, "ActRow");
+static_assert(sizeof(ActRow) == 4224, "ActRow");
 
 #if HY4_FAST
 struct FastConsts {
@@ -210,7 +230,22 @@ struct FastConsts {
     alignas(64) uint8_t tr[64];         // store_block: dst[16*j+k] = src[4*k+j]
     alignas(64) int32_t effidx[16];
     alignas(64) int64_t qidx[8];
+    alignas(64) uint8_t cb125[4][64];   // S1.25: codebook column c (+2 bias -> unsigned 0..4), 32 entries, as a vpermb table
+    alignas(64) uint8_t ctrl125[64];    // S1.25: multishift control, byte b -> 5*(b&7)
+    alignas(64) uint8_t perm125[64];    // S1.25: dest byte 8g+i <- payload byte 5g+i (i < 5)
     FastConsts() {
+        static const int8_t cbk[32][4] = {  // = S125_CODEBOOK of sk_codecs.cpp / tools/squant/codecs.py
+            {-1, -1, -1, -1}, {-1, -1, -1, 1}, {-1, -1, 1, -1}, {-1, -1, 1, 1}, {-1, 1, -1, -1}, {-1, 1, -1, 1}, {-1, 1, 1, -1}, {-1, 1, 1, 1},
+            {1, -1, -1, -1},  {1, -1, -1, 1},  {1, -1, 1, -1},  {1, -1, 1, 1},  {1, 1, -1, -1},  {1, 1, -1, 1},  {1, 1, 1, -1},  {1, 1, 1, 1},
+            {2, 0, 0, 0},     {-2, 0, 0, 0},   {0, 2, 0, 0},    {0, -2, 0, 0},   {0, 0, 2, 0},    {0, 0, -2, 0},   {0, 0, 0, 2},    {0, 0, 0, -2},
+            {0, 0, 0, 0},     {2, 2, 0, 0},    {-2, -2, 0, 0},  {0, 0, 2, 2},    {0, 0, -2, -2},  {2, -2, 0, 0},   {0, 0, 2, -2},   {2, 0, 2, 0}};
+        std::memset(cb125, 0, sizeof(cb125));
+        for (int c = 0; c < 4; ++c)
+            for (int e = 0; e < 32; ++e) cb125[c][e] = (uint8_t)(cbk[e][c] + 2);
+        for (int b = 0; b < 64; ++b) {
+            ctrl125[b] = (uint8_t)(5 * (b & 7));
+            perm125[b] = (uint8_t)((b >> 3) * 5 + (b & 7) < 40 ? (b >> 3) * 5 + (b & 7) : 0);
+        }
         for (int j = 0; j < 4; ++j)
             for (int b = 0; b < 64; ++b) {
                 const int L = b >> 4, k = b & 15, q = k >> 3, kk = k & 7;
@@ -238,6 +273,25 @@ static inline void store_block(ActRow* a, int b, const BlockQ8_1_G64& blk) {
     _mm_store_ps(&a->xs4[sb][L * 4], _mm_set1_ps(0.25f * blk.s));
 }
 
+// hi mode: first term from blk, residual term from blk2 (both Q8_1_G64 blocks of the same 64 values)
+static inline void store_block_hi(ActRow* a, int b, const BlockQ8_1_G64& blk, const BlockQ8_1_G64& blk2) {
+    const int sb = b >> 2, L = b & 3;
+    const __m512i idx = _mm512_load_si512((const void*)kc.tr);
+    const __m512i R = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)blk.qs));
+    const __m512i R2 = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)blk2.qs));
+    _mm_store_si128((__m128i*)&a->xj[sb][0][L * 16], _mm512_castsi512_si128(R));
+    _mm_store_si128((__m128i*)&a->xj[sb][1][L * 16], _mm512_extracti32x4_epi32(R, 1));
+    _mm_store_si128((__m128i*)&a->xj[sb][2][L * 16], _mm512_extracti32x4_epi32(R, 2));
+    _mm_store_si128((__m128i*)&a->xj[sb][3][L * 16], _mm512_extracti32x4_epi32(R, 3));
+    _mm_store_si128((__m128i*)&a->xjb[sb][0][L * 16], _mm512_castsi512_si128(R2));
+    _mm_store_si128((__m128i*)&a->xjb[sb][1][L * 16], _mm512_extracti32x4_epi32(R2, 1));
+    _mm_store_si128((__m128i*)&a->xjb[sb][2][L * 16], _mm512_extracti32x4_epi32(R2, 2));
+    _mm_store_si128((__m128i*)&a->xjb[sb][3][L * 16], _mm512_extracti32x4_epi32(R2, 3));
+    _mm_store_ps(&a->xd[sb][L * 4], _mm_set1_ps(blk.d));
+    _mm_store_ps(&a->xdb[sb][L * 4], _mm_set1_ps(blk2.d));
+    _mm_store_ps(&a->xs4[sb][L * 4], _mm_set1_ps(0.25f * (blk.s + blk2.s)));
+}
+
 #define HY4_HI3(J) _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_load_si512((const void*)kc.ctrl3[J]), src), m4)
 #define HY4_HI5(J) _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_load_si512((const void*)kc.ctrl5[J]), src), m16)
 #define HY4_NIB(J) _mm512_permutex2var_epi8(n0, _mm512_load_si512((const void*)kc.idx4[J]), n1)
@@ -248,7 +302,18 @@ static inline void unpack_planes(const uint8_t* pl, __m512i (&P)[4]) {
     const __m512i m3 = _mm512_set1_epi8(3), m4 = _mm512_set1_epi8(4), m15 = _mm512_set1_epi8(15), m16 = _mm512_set1_epi8(16),
                   m30 = _mm512_set1_epi8(0x30);
     (void)m3; (void)m4; (void)m16; (void)m30;
-    if constexpr (FMT == 2 || FMT == 3) {
+    if constexpr (FMT == 0) {
+        // S1.25: 40 payload bytes = 64 five-bit codebook indices (idx[m], m = 8g + j from the 40-bit group g, bits 5j..5j+4);
+        // weights 4m..4m+3 = codebook[idx[m]][0..3], so plane P_j (lane L byte k = q[64L+4k+j]) is codebook column j looked up
+        // with idx[16L+k]: four vpermb on the index vector.
+        const __m512i raw = _mm512_maskz_loadu_epi8((__mmask64)0xFFFFFFFFFFull, (const void*)pl);
+        const __m512i q40 = _mm512_maskz_permutexvar_epi8((__mmask64)0x1F1F1F1F1F1F1F1Full, _mm512_load_si512((const void*)kc.perm125), raw);
+        const __m512i idx = _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_load_si512((const void*)kc.ctrl125), q40), _mm512_set1_epi8(31));
+        P[0] = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)kc.cb125[0]));
+        P[1] = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)kc.cb125[1]));
+        P[2] = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)kc.cb125[2]));
+        P[3] = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)kc.cb125[3]));
+    } else if constexpr (FMT == 2 || FMT == 3) {
         const __m512i w = _mm512_loadu_si512((const void*)pl);
         if constexpr (FMT == 2) {
             P[0] = _mm512_and_si512(w, m3);
@@ -288,6 +353,7 @@ static inline void unpack_planes(const uint8_t* pl, __m512i (&P)[4]) {
 
 template <int FMT>
 struct FmtInfo;
+template <> struct FmtInfo<0> { static constexpr int SB = 48;  static constexpr float HALF = 2.0f; };  // S1.25: q+2 in 0..4, (P-2)*eff
 template <> struct FmtInfo<2> { static constexpr int SB = 70;  static constexpr float HALF = 1.5f; };
 template <> struct FmtInfo<3> { static constexpr int SB = 102; static constexpr float HALF = 3.5f; };
 template <> struct FmtInfo<4> { static constexpr int SB = 134; static constexpr float HALF = 7.5f; };
@@ -295,7 +361,7 @@ template <> struct FmtInfo<5> { static constexpr int SB = 166; static constexpr 
 template <> struct FmtInfo<6> { static constexpr int SB = 198; static constexpr float HALF = 31.5f; };
 
 // M tokens x 1 weight row (6 super-blocks of format FMT) -> out[t]
-template <int FMT, int M>
+template <int FMT, int M, bool HI>
 static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* out) {
     constexpr int SB = FmtInfo<FMT>::SB;
     __m512 facc[M];
@@ -312,6 +378,12 @@ static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* ou
         // eff_g = D * (u_g / 255) exactly as in sk_codecs (float division, then multiply), replicated x4 per group
         __m128 u4 = _mm_div_ps(_mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)u32))), inv255);
         u4 = _mm_mul_ps(u4, _mm_set1_ps(_cvtsh_ss(dh)));
+        if constexpr (FMT == 0) {  // S1.25: x fine[g], fine = 0.5 + nibble/15 (nibbles at payload bytes 40, 41)
+            uint16_t fn;
+            std::memcpy(&fn, blk + 46, 2);
+            __m128i fv = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32((int)fn), _mm_setr_epi32(0, 4, 8, 12)), _mm_set1_epi32(15));
+            u4 = _mm_mul_ps(u4, _mm_add_ps(_mm_div_ps(_mm_cvtepi32_ps(fv), _mm_set1_ps(15.0f)), _mm_set1_ps(0.5f)));
+        }
         const __m512 effv = _mm512_permutexvar_ps(effidx, _mm512_castps128_ps512(u4));
         const __m512 effh = _mm512_mul_ps(effv, halfv);
         __m512i P[4];
@@ -324,6 +396,13 @@ static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* ou
             acc = _mm512_dpbusd_epi32(acc, P[3], _mm512_load_si512((const void*)a->xj[s][3]));
             const __m512 sc = _mm512_mul_ps(effv, _mm512_load_ps(a->xd[s]));
             facc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), sc, facc[t]);
+            if constexpr (HI) {  // residual term: same unpacked weights, second dpbusd chain
+                __m512i accb = _mm512_dpbusd_epi32(_mm512_setzero_si512(), P[0], _mm512_load_si512((const void*)a->xjb[s][0]));
+                accb = _mm512_dpbusd_epi32(accb, P[1], _mm512_load_si512((const void*)a->xjb[s][1]));
+                accb = _mm512_dpbusd_epi32(accb, P[2], _mm512_load_si512((const void*)a->xjb[s][2]));
+                accb = _mm512_dpbusd_epi32(accb, P[3], _mm512_load_si512((const void*)a->xjb[s][3]));
+                facc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(accb), _mm512_mul_ps(effv, _mm512_load_ps(a->xdb[s])), facc[t]);
+            }
             facc[t] = _mm512_fnmadd_ps(effh, _mm512_load_ps(a->xs4[s]), facc[t]);
         }
     }
@@ -331,46 +410,329 @@ static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* ou
 }
 
 // nrows rows x M tokens; out[i*nrows + r]
-template <int FMT, int M>
+template <int FMT, int M, bool HI>
 static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* out) {
     constexpr size_t RBYTES = 6 * (size_t)FmtInfo<FMT>::SB;
     for (int r = 0; r < nrows; ++r) {
         float o[M];
-        row_dot<FMT, M>(W + r * RBYTES, X, o);
+        row_dot<FMT, M, HI>(W + r * RBYTES, X, o);
         for (int i = 0; i < M; ++i) out[(size_t)i * nrows + r] = o[i];
     }
 }
 
-template <int FMT>
+template <int FMT, bool HI>
 static void rows_fmt(const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out) {
     for (int g0 = 0; g0 < m; g0 += 8) {
         const int mg = std::min(8, m - g0);
         const ActRow* const* x = X + g0;
         float* o = out + (size_t)g0 * nrows;
         switch (mg) {
-            case 1: rows_m<FMT, 1>(W, nrows, x, o); break;
-            case 2: rows_m<FMT, 2>(W, nrows, x, o); break;
-            case 3: rows_m<FMT, 3>(W, nrows, x, o); break;
-            case 4: rows_m<FMT, 4>(W, nrows, x, o); break;
-            case 5: rows_m<FMT, 5>(W, nrows, x, o); break;
-            case 6: rows_m<FMT, 6>(W, nrows, x, o); break;
-            case 7: rows_m<FMT, 7>(W, nrows, x, o); break;
-            default: rows_m<FMT, 8>(W, nrows, x, o); break;
+            case 1: rows_m<FMT, 1, HI>(W, nrows, x, o); break;
+            case 2: rows_m<FMT, 2, HI>(W, nrows, x, o); break;
+            case 3: rows_m<FMT, 3, HI>(W, nrows, x, o); break;
+            case 4: rows_m<FMT, 4, HI>(W, nrows, x, o); break;
+            case 5: rows_m<FMT, 5, HI>(W, nrows, x, o); break;
+            case 6: rows_m<FMT, 6, HI>(W, nrows, x, o); break;
+            case 7: rows_m<FMT, 7, HI>(W, nrows, x, o); break;
+            default: rows_m<FMT, 8, HI>(W, nrows, x, o); break;
         }
     }
 }
 
 // W: nrows rows of K=1536 in format `code` (2..6); X[m] activation rows; out[m][nrows]
-static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out) {
+static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi = false) {
+    if (hi) {
+        switch (code) {
+            case 0: rows_fmt<0, true>(W, nrows, X, m, out); break;
+            case 2: rows_fmt<2, true>(W, nrows, X, m, out); break;
+            case 3: rows_fmt<3, true>(W, nrows, X, m, out); break;
+            case 4: rows_fmt<4, true>(W, nrows, X, m, out); break;
+            case 5: rows_fmt<5, true>(W, nrows, X, m, out); break;
+            default: rows_fmt<6, true>(W, nrows, X, m, out); break;
+        }
+        return;
+    }
     switch (code) {
-        case 2: rows_fmt<2>(W, nrows, X, m, out); break;
-        case 3: rows_fmt<3>(W, nrows, X, m, out); break;
-        case 4: rows_fmt<4>(W, nrows, X, m, out); break;
-        case 5: rows_fmt<5>(W, nrows, X, m, out); break;
-        default: rows_fmt<6>(W, nrows, X, m, out); break;
+        case 0: rows_fmt<0, false>(W, nrows, X, m, out); break;
+        case 2: rows_fmt<2, false>(W, nrows, X, m, out); break;
+        case 3: rows_fmt<3, false>(W, nrows, X, m, out); break;
+        case 4: rows_fmt<4, false>(W, nrows, X, m, out); break;
+        case 5: rows_fmt<5, false>(W, nrows, X, m, out); break;
+        default: rows_fmt<6, false>(W, nrows, X, m, out); break;
     }
 }
 #endif  // HY4_FAST
+
+#if HY4_FAST2
+// ==================================================================================================== AVX2 kernel
+// Same idea as the AVX-512 kernel (planes P_j of unsigned weight codes, activations pre-permuted, float accumulation, one horizontal
+// sum per row) on 256-bit vectors: vpmaddubsw (u8 code x s8 activation, no int16 saturation: codes <= 63 so a pair is <= 16002 and
+// four planes added in int16 stay <= 31496 for S1.25..S5) + vpmaddwd with ones. S6 (codes up to 63) does two vpmaddwd.
+// Layout "Z" (per super-block, per half h = groups 2h, 2h+1 of 64 weights; one ymm = 32 bytes):
+//   xj[sb][j][32*h + 16*(k>>3) + 8*g1 + (k&7)] = x[(sb*4 + 2h + g1)*64 + 4*k + j]     (g1 = group within the half, k = 0..15)
+//   i.e. a ymm holds [g0 k0-7 | g1 k0-7 | g0 k8-15 | g1 k8-15] of plane j.
+//   xd/xs4[sb][8*h + 2*g1 + {0,1,4,5}] = d / 0.25*s of that block (each group on 4 dword lanes, matching vpmaddwd's output).
+struct FastConsts2 {
+    alignas(32) uint8_t hsidx[32];       // vpshufb control: hi-bit mask byte for each plane position (S3/S5 high bits)
+    alignas(32) uint8_t oddmask[32];     // 0x80 on odd byte positions (they need the upper nibble of the mask byte)
+    alignas(32) uint8_t cb_lo[4][32];    // S1.25 codebook column c, entries 0..15 (both lanes), +2 bias
+    alignas(32) uint8_t cb_hi[4][32];    // entries 16..31
+    alignas(32) uint8_t ctl125[32];      // S1.25: pshufb control, word j <- bytes (5j>>3, +1)
+    alignas(32) int16_t mul125[16];      // S1.25: 2^(11 - (5j&7)): (word * mul) >> 11 = 5-bit field
+    alignas(32) int32_t effidx[2][8];
+    FastConsts2() {
+        static const int8_t cbk[32][4] = {  // = S125_CODEBOOK of sk_codecs.cpp / tools/squant/codecs.py
+            {-1, -1, -1, -1}, {-1, -1, -1, 1}, {-1, -1, 1, -1}, {-1, -1, 1, 1}, {-1, 1, -1, -1}, {-1, 1, -1, 1}, {-1, 1, 1, -1}, {-1, 1, 1, 1},
+            {1, -1, -1, -1},  {1, -1, -1, 1},  {1, -1, 1, -1},  {1, -1, 1, 1},  {1, 1, -1, -1},  {1, 1, -1, 1},  {1, 1, 1, -1},  {1, 1, 1, 1},
+            {2, 0, 0, 0},     {-2, 0, 0, 0},   {0, 2, 0, 0},    {0, -2, 0, 0},   {0, 0, 2, 0},    {0, 0, -2, 0},   {0, 0, 0, 2},    {0, 0, 0, -2},
+            {0, 0, 0, 0},     {2, 2, 0, 0},    {-2, -2, 0, 0},  {0, 0, 2, 2},    {0, 0, -2, -2},  {2, -2, 0, 0},   {0, 0, 2, -2},   {2, 0, 2, 0}};
+        for (int p = 0; p < 32; ++p) {
+            const int g1 = (p >> 3) & 1, kk = p & 7, up = p >> 4;
+            hsidx[p] = (uint8_t)(8 * g1 + 4 * up + (kk >> 1));
+            oddmask[p] = (p & 1) ? 0x80 : 0;
+        }
+        for (int c = 0; c < 4; ++c)
+            for (int e = 0; e < 16; ++e) {
+                cb_lo[c][e] = cb_lo[c][16 + e] = (uint8_t)(cbk[e][c] + 2);
+                cb_hi[c][e] = cb_hi[c][16 + e] = (uint8_t)(cbk[16 + e][c] + 2);
+            }
+        static const int b0[8] = {0, 0, 1, 1, 2, 3, 3, 4}, off[8] = {0, 5, 2, 7, 4, 1, 6, 3};
+        for (int lane = 0; lane < 2; ++lane)
+            for (int j = 0; j < 8; ++j) {
+                ctl125[16 * lane + 2 * j] = (uint8_t)b0[j];
+                ctl125[16 * lane + 2 * j + 1] = (uint8_t)(b0[j] + 1);
+                mul125[8 * lane + j] = (int16_t)(1 << (11 - off[j]));
+            }
+        for (int h = 0; h < 2; ++h)
+            for (int i = 0; i < 8; ++i) effidx[h][i] = 2 * h + ((i >> 1) & 1);
+    }
+};
+static const FastConsts2 kc2;
+
+static inline void store_qs(int8_t* base, int L, const int8_t* qs) {  // base = &xj[sb][0][0]
+    const int h = L >> 1, g1 = L & 1;
+    for (int j = 0; j < 4; ++j) {
+        int8_t* dst = base + j * 64 + 32 * h + 8 * g1;
+        for (int k = 0; k < 16; ++k) dst[16 * (k >> 3) + (k & 7)] = qs[4 * k + j];
+    }
+}
+static inline void store_scale(float* base, int L, float v) {  // base = xd[sb] / xs4[sb] (16 floats)
+    float* d = base + 8 * (L >> 1) + 2 * (L & 1);
+    d[0] = d[1] = d[4] = d[5] = v;
+}
+static inline void store_block(ActRow* a, int b, const BlockQ8_1_G64& blk) {
+    const int sb = b >> 2, L = b & 3;
+    store_qs(&a->xj[sb][0][0], L, blk.qs);
+    store_scale(a->xd[sb], L, blk.d);
+    store_scale(a->xs4[sb], L, 0.25f * blk.s);
+}
+static inline void store_block_hi(ActRow* a, int b, const BlockQ8_1_G64& blk, const BlockQ8_1_G64& blk2) {
+    const int sb = b >> 2, L = b & 3;
+    store_qs(&a->xj[sb][0][0], L, blk.qs);
+    store_qs(&a->xjb[sb][0][0], L, blk2.qs);
+    store_scale(a->xd[sb], L, blk.d);
+    store_scale(a->xdb[sb], L, blk2.d);
+    store_scale(a->xs4[sb], L, 0.25f * (blk.s + blk2.s));
+}
+
+// byte vector with, for every plane position, the mask byte holding that element's bit, already shifted so the bit sits at bit j
+// of the byte (odd positions need the upper nibble): hsel >> j & 1 = high bit of plane j
+static inline __m256i make_hsel(const uint8_t* p16) {
+    const __m256i hb = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)p16));
+    const __m256i hs = _mm256_shuffle_epi8(hb, _mm256_load_si256((const __m256i*)kc2.hsidx));
+    return _mm256_blendv_epi8(hs, _mm256_srli_epi16(hs, 4), _mm256_load_si256((const __m256i*)kc2.oddmask));
+}
+
+// P[j] = plane j (unsigned codes) of half h of one super-block payload, layout Z
+template <int FMT>
+static inline void unpack_half(const uint8_t* pl, int h, __m256i (&P)[4]) {
+    const __m256i m3 = _mm256_set1_epi8(3), m4 = _mm256_set1_epi8(4), m15 = _mm256_set1_epi8(15), m16 = _mm256_set1_epi8(16),
+                  m30 = _mm256_set1_epi8(0x30), m00FF = _mm256_set1_epi16(0x00FF);
+    (void)m3; (void)m4; (void)m16; (void)m30; (void)m00FF; (void)m15;
+    if constexpr (FMT == 0) {
+        // S1.25: 64 five-bit indices -> 32 bytes (Z order straight out of the pack), then 4 codebook columns by two pshufb + blend
+        const uint8_t* g = pl + 20 * h;
+        const __m256i ctl = _mm256_load_si256((const __m256i*)kc2.ctl125), mulc = _mm256_load_si256((const __m256i*)kc2.mul125);
+        const __m256i X = _mm256_loadu2_m128i((const __m128i*)(g + 5), (const __m128i*)g);
+        const __m256i Y = _mm256_loadu2_m128i((const __m128i*)(g + 15), (const __m128i*)(g + 10));
+        const __m256i Xf = _mm256_srli_epi16(_mm256_mullo_epi16(_mm256_shuffle_epi8(X, ctl), mulc), 11);
+        const __m256i Yf = _mm256_srli_epi16(_mm256_mullo_epi16(_mm256_shuffle_epi8(Y, ctl), mulc), 11);
+        const __m256i idx = _mm256_packus_epi16(Xf, Yf);
+        const __m256i sel = _mm256_slli_epi16(idx, 3);
+        for (int j = 0; j < 4; ++j)
+            P[j] = _mm256_blendv_epi8(_mm256_shuffle_epi8(_mm256_load_si256((const __m256i*)kc2.cb_lo[j]), idx),
+                                      _mm256_shuffle_epi8(_mm256_load_si256((const __m256i*)kc2.cb_hi[j]), idx), sel);
+    } else if constexpr (FMT == 2 || FMT == 3) {
+        const __m256i wz = _mm256_permute4x64_epi64(_mm256_loadu_si256((const __m256i*)(pl + 32 * h)), 0xD8);
+        P[0] = _mm256_and_si256(wz, m3);
+        P[1] = _mm256_and_si256(_mm256_srli_epi16(wz, 2), m3);
+        P[2] = _mm256_and_si256(_mm256_srli_epi16(wz, 4), m3);
+        P[3] = _mm256_and_si256(_mm256_srli_epi16(wz, 6), m3);
+        if constexpr (FMT == 3) {
+            const __m256i hsel = make_hsel(pl + 64 + 16 * h);
+            P[0] = _mm256_or_si256(P[0], _mm256_and_si256(_mm256_slli_epi16(hsel, 2), m4));
+            P[1] = _mm256_or_si256(P[1], _mm256_and_si256(_mm256_slli_epi16(hsel, 1), m4));
+            P[2] = _mm256_or_si256(P[2], _mm256_and_si256(hsel, m4));
+            P[3] = _mm256_or_si256(P[3], _mm256_and_si256(_mm256_srli_epi16(hsel, 1), m4));
+        }
+    } else {
+        // nibble plane (S4/S5/S6): byte i of group G = q[2i] | q[2i+1] << 4 -> E = even bytes, O = odd bytes of the 32-byte group
+        const __m256i wa = _mm256_loadu_si256((const __m256i*)(pl + 64 * h)), wb = _mm256_loadu_si256((const __m256i*)(pl + 64 * h + 32));
+        const __m256i E = _mm256_packus_epi16(_mm256_and_si256(wa, m00FF), _mm256_and_si256(wb, m00FF));
+        const __m256i O = _mm256_packus_epi16(_mm256_srli_epi16(wa, 8), _mm256_srli_epi16(wb, 8));
+        P[0] = _mm256_and_si256(E, m15);
+        P[1] = _mm256_and_si256(_mm256_srli_epi16(E, 4), m15);
+        P[2] = _mm256_and_si256(O, m15);
+        P[3] = _mm256_and_si256(_mm256_srli_epi16(O, 4), m15);
+        if constexpr (FMT == 5) {
+            const __m256i hsel = make_hsel(pl + 128 + 16 * h);
+            P[0] = _mm256_or_si256(P[0], _mm256_and_si256(_mm256_slli_epi16(hsel, 4), m16));
+            P[1] = _mm256_or_si256(P[1], _mm256_and_si256(_mm256_slli_epi16(hsel, 3), m16));
+            P[2] = _mm256_or_si256(P[2], _mm256_and_si256(_mm256_slli_epi16(hsel, 2), m16));
+            P[3] = _mm256_or_si256(P[3], _mm256_and_si256(_mm256_slli_epi16(hsel, 1), m16));
+        } else if constexpr (FMT == 6) {  // 2-bit high planes: byte i -> q[4i+j] in bits 2j
+            const __m256i w6 = _mm256_permute4x64_epi64(_mm256_loadu_si256((const __m256i*)(pl + 128 + 32 * h)), 0xD8);
+            P[0] = _mm256_or_si256(P[0], _mm256_and_si256(_mm256_slli_epi16(w6, 4), m30));
+            P[1] = _mm256_or_si256(P[1], _mm256_and_si256(_mm256_slli_epi16(w6, 2), m30));
+            P[2] = _mm256_or_si256(P[2], _mm256_and_si256(w6, m30));
+            P[3] = _mm256_or_si256(P[3], _mm256_and_si256(_mm256_srli_epi16(w6, 2), m30));
+        }
+    }
+}
+
+template <int FMT>
+struct FmtInfo;
+template <> struct FmtInfo<0> { static constexpr int SB = 48;  static constexpr float HALF = 2.0f; };
+template <> struct FmtInfo<2> { static constexpr int SB = 70;  static constexpr float HALF = 1.5f; };
+template <> struct FmtInfo<3> { static constexpr int SB = 102; static constexpr float HALF = 3.5f; };
+template <> struct FmtInfo<4> { static constexpr int SB = 134; static constexpr float HALF = 7.5f; };
+template <> struct FmtInfo<5> { static constexpr int SB = 166; static constexpr float HALF = 15.5f; };
+template <> struct FmtInfo<6> { static constexpr int SB = 198; static constexpr float HALF = 31.5f; };
+
+static inline float hsum256(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+// int32 lanes [g0 g0 g1 g1 g0 g0 g1 g1] = sum over the 4 planes of (P_j . x_j) for one half
+template <int FMT>
+static inline __m256i dot_half(const __m256i (&P)[4], const int8_t* xj, const __m256i ones) {
+    const __m256i m0 = _mm256_maddubs_epi16(P[0], _mm256_load_si256((const __m256i*)(xj)));
+    const __m256i m1 = _mm256_maddubs_epi16(P[1], _mm256_load_si256((const __m256i*)(xj + 64)));
+    const __m256i m2 = _mm256_maddubs_epi16(P[2], _mm256_load_si256((const __m256i*)(xj + 128)));
+    const __m256i m3 = _mm256_maddubs_epi16(P[3], _mm256_load_si256((const __m256i*)(xj + 192)));
+    const __m256i s01 = _mm256_add_epi16(m0, m1), s23 = _mm256_add_epi16(m2, m3);
+    if constexpr (FMT == 6) return _mm256_add_epi32(_mm256_madd_epi16(s01, ones), _mm256_madd_epi16(s23, ones));  // 4 x 16002 would overflow int16
+    return _mm256_madd_epi16(_mm256_add_epi16(s01, s23), ones);
+}
+
+// M tokens x 1 weight row (6 super-blocks of format FMT) -> out[t]
+template <int FMT, int M, bool HI>
+static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* out) {
+    constexpr int SB = FmtInfo<FMT>::SB;
+    __m256 facc[M];
+    for (int t = 0; t < M; ++t) facc[t] = _mm256_setzero_ps();
+    const __m128 inv255 = _mm_set1_ps(255.0f);
+    const __m256 halfv = _mm256_set1_ps(FmtInfo<FMT>::HALF);
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (int s = 0; s < 6; ++s) {
+        const uint8_t* blk = row + (size_t)s * SB;
+        uint16_t dh;
+        uint32_t u32;
+        std::memcpy(&dh, blk, 2);
+        std::memcpy(&u32, blk + 2, 4);
+        // eff_g = D * (u_g / 255) exactly as in sk_codecs (float division, then multiply)
+        __m128 u4 = _mm_div_ps(_mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)u32))), inv255);
+        u4 = _mm_mul_ps(u4, _mm_set1_ps(_cvtsh_ss(dh)));
+        if constexpr (FMT == 0) {  // S1.25: x fine[g], fine = 0.5 + nibble/15 (nibbles at payload bytes 40, 41)
+            uint16_t fn;
+            std::memcpy(&fn, blk + 46, 2);
+            __m128i fv = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32((int)fn), _mm_setr_epi32(0, 4, 8, 12)), _mm_set1_epi32(15));
+            u4 = _mm_mul_ps(u4, _mm_add_ps(_mm_div_ps(_mm_cvtepi32_ps(fv), _mm_set1_ps(15.0f)), _mm_set1_ps(0.5f)));
+        }
+        const __m256 effc = _mm256_castps128_ps256(u4);
+        for (int h = 0; h < 2; ++h) {
+            const __m256 effv = _mm256_permutevar8x32_ps(effc, _mm256_load_si256((const __m256i*)kc2.effidx[h]));
+            const __m256 effh = _mm256_mul_ps(effv, halfv);
+            __m256i P[4];
+            unpack_half<FMT>(blk + 6, h, P);
+            for (int t = 0; t < M; ++t) {
+                const ActRow* a = X[t];
+                __m256i acc = dot_half<FMT>(P, &a->xj[s][0][32 * h], ones);
+                const __m256 sc = _mm256_mul_ps(effv, _mm256_load_ps(&a->xd[s][8 * h]));
+                facc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), sc, facc[t]);
+                if constexpr (HI) {  // residual term: same unpacked weights
+                    const __m256i accb = dot_half<FMT>(P, &a->xjb[s][0][32 * h], ones);
+                    facc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(accb), _mm256_mul_ps(effv, _mm256_load_ps(&a->xdb[s][8 * h])), facc[t]);
+                }
+                facc[t] = _mm256_fnmadd_ps(effh, _mm256_load_ps(&a->xs4[s][8 * h]), facc[t]);
+            }
+        }
+    }
+    for (int t = 0; t < M; ++t) out[t] = hsum256(facc[t]);
+}
+
+// nrows rows x M tokens; out[i*nrows + r]
+template <int FMT, int M, bool HI>
+static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* out) {
+    constexpr size_t RBYTES = 6 * (size_t)FmtInfo<FMT>::SB;
+    for (int r = 0; r < nrows; ++r) {
+        float o[M];
+        row_dot<FMT, M, HI>(W + r * RBYTES, X, o);
+        for (int i = 0; i < M; ++i) out[(size_t)i * nrows + r] = o[i];
+    }
+}
+
+template <int FMT, bool HI>
+static void rows_fmt(const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out) {
+    for (int g0 = 0; g0 < m; g0 += 4) {
+        const int mg = std::min(4, m - g0);
+        const ActRow* const* x = X + g0;
+        float* o = out + (size_t)g0 * nrows;
+        switch (mg) {
+            case 1: rows_m<FMT, 1, HI>(W, nrows, x, o); break;
+            case 2: rows_m<FMT, 2, HI>(W, nrows, x, o); break;
+            case 3: rows_m<FMT, 3, HI>(W, nrows, x, o); break;
+            default: rows_m<FMT, 4, HI>(W, nrows, x, o); break;
+        }
+    }
+}
+
+// W: nrows rows of K=1536 in format `code` (0 = S1.25, 2..6); X[m] activation rows; out[m][nrows]
+static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi = false) {
+    if (hi) {
+        switch (code) {
+            case 0: rows_fmt<0, true>(W, nrows, X, m, out); break;
+            case 2: rows_fmt<2, true>(W, nrows, X, m, out); break;
+            case 3: rows_fmt<3, true>(W, nrows, X, m, out); break;
+            case 4: rows_fmt<4, true>(W, nrows, X, m, out); break;
+            case 5: rows_fmt<5, true>(W, nrows, X, m, out); break;
+            default: rows_fmt<6, true>(W, nrows, X, m, out); break;
+        }
+        return;
+    }
+    switch (code) {
+        case 0: rows_fmt<0, false>(W, nrows, X, m, out); break;
+        case 2: rows_fmt<2, false>(W, nrows, X, m, out); break;
+        case 3: rows_fmt<3, false>(W, nrows, X, m, out); break;
+        case 4: rows_fmt<4, false>(W, nrows, X, m, out); break;
+        case 5: rows_fmt<5, false>(W, nrows, X, m, out); break;
+        default: rows_fmt<6, false>(W, nrows, X, m, out); break;
+    }
+}
+#endif  // HY4_FAST2
+
+// hi mode: q2 = Q8_1(x - dq(q)) per 64-block (x: nblocks*64 floats, q: its Q8_1 blocks)
+static inline void residual_blocks(const float* x, const BlockQ8_1_G64* q, BlockQ8_1_G64* q2, int nblocks) {
+    float r[64];
+    for (int b = 0; b < nblocks; ++b) {
+        const float d = q[b].d;
+        for (int i = 0; i < 64; ++i) r[i] = x[b * 64 + i] - d * (float)q[b].qs[i];
+        quantize_q8_1_g64(r, &q2[b], 64);
+    }
+}
 
 }  // namespace
 
@@ -398,7 +760,9 @@ struct CpuExperts::Impl {
     // ---- scratch (grown in submit, never while a job runs)
     ABuf<BlockQ8_1_G64> tokq, h2q;  // library path: [Tc][24], [P][24]
     ABuf<ActRow> tokA, h2A;         // fast path:    [Tc],     [P]
+    ABuf<BlockQ8_1_G64> tokq2, h2q2;  // library path, hi mode: residual terms
     bool fast = false;
+    bool hi = false;                // high-precision activations (STRATA_CPUEXP_ACT=hi / set_hi_activations)
     ABuf<float> Y;                  // [P][1536]
     size_t cap_tok = 0;
     std::vector<int> cnt, aoff, act_e, act_o, act_n, pair_tok, posof;
@@ -581,19 +945,22 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
     }
     t_load = now_s() - t0;
     fast = false;
-#if HY4_FAST
+#if HY4_FASTK
     fast = true;
     if (const char* k = std::getenv("STRATA_CPUEXP_KERNEL"))
         if (!std::strcmp(k, "lib")) fast = false;
     for (const Rec& r : recs)
-        if (r.body && (r.gu < 2 || r.gu > 6 || r.dn < 2 || r.dn > 6)) {
-            if (fast) std::fprintf(stderr, "[cpuexp] S8/other expert code resident: using the library kernel\n");
+        if (r.body && !(r.gu <= 6 && r.gu != 1 && r.dn <= 6 && r.dn != 1)) {  // fast kernel: S1.25 (0), S2..S6; S1.5 (1) and S8 use the library kernel
+            if (fast) std::fprintf(stderr, "[cpuexp] S1.5/S8/other expert code resident: using the library kernel for all experts\n");
             fast = false;
         }
 #endif
-    std::fprintf(stderr, "[cpuexp] %llu experts resident, %.2f GB in %.1f s (%.2f GB/s), %zu reads, mlock=%s, isa=%s, kernel=%s\n",
+    hi = false;
+    if (const char* a = std::getenv("STRATA_CPUEXP_ACT"))
+        if (!std::strcmp(a, "hi")) hi = true;
+    std::fprintf(stderr, "[cpuexp] %llu experts resident, %.2f GB in %.1f s (%.2f GB/s), %zu reads, mlock=%s, isa=%s, kernel=%s, act=%s\n",
                  (unsigned long long)n_resident, arena_size / 1e9, t_load, arena_size / 1e9 / std::max(t_load, 1e-9), runs.size(),
-                 locked ? "yes" : "no", strata::quant::sk::active_sk_isa(), fast ? "fast(avx512-vbmi)" : "lib");
+                 locked ? "yes" : "no", strata::quant::sk::active_sk_isa(), fast ? HY4_FAST_NAME : "lib", hi ? "hi(2xQ8_1)" : "q8");
     start_threads(n_threads);
     return true;
 }
@@ -645,7 +1012,8 @@ void CpuExperts::Impl::start_threads(int n) {
     ts.reset(new TScratch[nth]);
     for (int ti = 0; ti < nth; ++ti) {
         TScratch& s = ts[ti];
-        if (!fast) s.xg.alloc((size_t)MG * NB);
+        if (!fast) { s.xg.alloc((size_t)MG * NB); s.xg2.alloc((size_t)MG * NB); }
+        s.tg2.alloc((size_t)MGF * RB);
         s.tg.alloc((size_t)MGF * RB);
         s.tu.alloc((size_t)MGF * RB);
     }
@@ -769,12 +1137,12 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
     const int mgmax = fast ? MGF : MG;
     for (int g0 = 0; g0 < m; g0 += mgmax) {
         const int mg = std::min(mgmax, m - g0);
-#if HY4_FAST
+#if HY4_FASTK
         if (fast) {
             const ActRow* xp[MGF];
             for (int i = 0; i < mg; ++i) xp[i] = tokA.p + (size_t)pair_tok[p0 + g0 + i];
-            rows_gemm(r.gu, wg, RB, xp, mg, S.tg.p);
-            rows_gemm(r.gu, wu, RB, xp, mg, S.tu.p);
+            rows_gemm(r.gu, wg, RB, xp, mg, S.tg.p, J.hi);
+            rows_gemm(r.gu, wu, RB, xp, mg, S.tu.p, J.hi);
         } else
 #endif
         {
@@ -787,6 +1155,19 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
             }
             gemm_sk_q8_1(wg, gc, xs, S.tg.p, RB, D, mg);
             gemm_sk_q8_1(wu, gc, xs, S.tu.p, RB, D, mg);
+            if (J.hi) {  // residual term of the activations
+                const BlockQ8_1_G64* xs2;
+                if (mg == 1) {
+                    xs2 = tokq2.p + (size_t)pair_tok[p0 + g0] * NB;
+                } else {
+                    for (int i = 0; i < mg; ++i) std::memcpy(S.xg2.p + (size_t)i * NB, tokq2.p + (size_t)pair_tok[p0 + g0 + i] * NB, NB * sizeof(BlockQ8_1_G64));
+                    xs2 = S.xg2.p;
+                }
+                gemm_sk_q8_1(wg, gc, xs2, S.tg2.p, RB, D, mg);
+                for (int i = 0; i < mg * RB; ++i) S.tg.p[i] += S.tg2.p[i];
+                gemm_sk_q8_1(wu, gc, xs2, S.tg2.p, RB, D, mg);
+                for (int i = 0; i < mg * RB; ++i) S.tu.p[i] += S.tg2.p[i];
+            }
         }
         for (int i = 0; i < mg; ++i) {
             float h[RB];
@@ -799,14 +1180,24 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
                 const float uc = std::max(-SWIGLU_LIMIT, std::min(u[d], SWIGLU_LIMIT));
                 h[d] = (sc * uc) / sq[d];
             }
-#if HY4_FAST
+#if HY4_FASTK
             if (fast) {
                 BlockQ8_1_G64 blk;
                 quantize_q8_1_g64(h, &blk, 64);
-                store_block(h2A.p + (size_t)(p0 + g0 + i), b, blk);
+                if (J.hi) {
+                    BlockQ8_1_G64 blk2;
+                    residual_blocks(h, &blk, &blk2, 1);
+                    store_block_hi(h2A.p + (size_t)(p0 + g0 + i), b, blk, blk2);
+                } else {
+                    store_block(h2A.p + (size_t)(p0 + g0 + i), b, blk);
+                }
             } else
 #endif
-                quantize_q8_1_g64(h, h2q.p + (size_t)(p0 + g0 + i) * NB + b, 64);
+            {
+                BlockQ8_1_G64* hb = h2q.p + (size_t)(p0 + g0 + i) * NB + b;
+                quantize_q8_1_g64(h, hb, 64);
+                if (J.hi) residual_blocks(h, hb, h2q2.p + (size_t)(p0 + g0 + i) * NB + b, 1);
+            }
         }
     }
 }
@@ -821,14 +1212,20 @@ void CpuExperts::Impl::dn_unit(int tid, const Job& J, int a, int c) {
     const int mgmax = fast ? MGF : MG;
     for (int g0 = 0; g0 < m; g0 += mgmax) {
         const int mg = std::min(mgmax, m - g0);
-#if HY4_FAST
+#if HY4_FASTK
         if (fast) {
             const ActRow* xp[MGF];
             for (int i = 0; i < mg; ++i) xp[i] = h2A.p + (size_t)(p0 + g0 + i);
-            rows_gemm(r.dn, wd, RB, xp, mg, S.tg.p);
+            rows_gemm(r.dn, wd, RB, xp, mg, S.tg.p, J.hi);
         } else
 #endif
+        {
             gemm_sk_q8_1(wd, (SkCode)r.dn, h2q.p + (size_t)(p0 + g0) * NB, S.tg.p, RB, D, mg);
+            if (J.hi) {
+                gemm_sk_q8_1(wd, (SkCode)r.dn, h2q2.p + (size_t)(p0 + g0) * NB, S.tg2.p, RB, D, mg);
+                for (int i = 0; i < mg * RB; ++i) S.tg.p[i] += S.tg2.p[i];
+            }
+        }
         for (int i = 0; i < mg; ++i) std::memcpy(Y.p + (size_t)(p0 + g0 + i) * D + c * RB, S.tg.p + i * RB, RB * sizeof(float));
     }
 }
@@ -871,15 +1268,24 @@ void CpuExperts::Impl::run_job(int tid) {
             if (u >= Tc * 3) break;
             const int t = u / 3, part = u % 3;
             if (!tok_used[t]) continue;
-#if HY4_FAST
+#if HY4_FASTK
             if (fast) {
                 alignas(64) BlockQ8_1_G64 blk[8];
-                quantize_q8_1_g64(J.z + (size_t)(t0 + t) * D + part * 512, blk, 512);
-                for (int i = 0; i < 8; ++i) store_block(tokA.p + t, part * 8 + i, blk[i]);
+                const float* zs = J.z + (size_t)(t0 + t) * D + part * 512;
+                quantize_q8_1_g64(zs, blk, 512);
+                if (J.hi) {
+                    alignas(64) BlockQ8_1_G64 blk2[8];
+                    residual_blocks(zs, blk, blk2, 8);
+                    for (int i = 0; i < 8; ++i) store_block_hi(tokA.p + t, part * 8 + i, blk[i], blk2[i]);
+                } else {
+                    for (int i = 0; i < 8; ++i) store_block(tokA.p + t, part * 8 + i, blk[i]);
+                }
                 continue;
             }
 #endif
-            quantize_q8_1_g64(J.z + (size_t)(t0 + t) * D + part * 512, tokq.p + (size_t)t * NB + part * 8, 512);
+            const float* zs = J.z + (size_t)(t0 + t) * D + part * 512;
+            quantize_q8_1_g64(zs, tokq.p + (size_t)t * NB + part * 8, 512);
+            if (J.hi) residual_blocks(zs, tokq.p + (size_t)t * NB + part * 8, tokq2.p + (size_t)t * NB + part * 8, 8);
         }
         bar.wait(sense);
         lap(1);
@@ -955,15 +1361,58 @@ bool CpuExperts::make_mask_rank_range(const std::string& path, int first_rank, i
     return make_mask_rank_range(path, std::vector<int>(nl, first_rank), std::vector<int>(nl, last_rank), mask, err);
 }
 
-// Random-weight self test of the fast row kernel for every format S2..S6 (the real SQ-64 file only contains S2/S3/S4):
+// S1.5 (ternary, 5 trits per byte) runs on the library kernel: check gemm_sk_q8_1 vs dequant_sk_row with valid payload bytes (< 243).
+static bool selftest_lib_s15(std::string& report) {
+    uint64_t s = 0x7654321ull;
+    auto rnd = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+    const size_t sb = superblock_bytes(SkCode::S1_5), rb = 6 * sb;
+    const int nrows = 5;
+    std::vector<uint8_t> W(rb * nrows);
+    for (int r = 0; r < nrows; ++r)
+        for (int b = 0; b < 6; ++b) {
+            uint8_t* p = &W[r * rb + b * sb];
+            for (size_t i = 0; i < sb; ++i) p[i] = (uint8_t)rnd();
+            for (size_t i = 6; i < 6 + 52; ++i) p[i] = (uint8_t)(rnd() % 243);
+            const uint16_t h = (uint16_t)(0x2800 + (rnd() % 0x1000));
+            std::memcpy(p, &h, 2);
+        }
+    double worst = 0;
+    for (int m : {1, 3, 11}) {
+        std::vector<float> xd((size_t)m * D), xq((size_t)m * D);
+        ABuf<BlockQ8_1_G64> A;
+        A.alloc((size_t)m * NB);
+        for (int t = 0; t < m; ++t) {
+            for (int i = 0; i < D; ++i) xd[(size_t)t * D + i] = (float)((double)(rnd() % 2000001) / 1e6 - 1.0);
+            quantize_q8_1_g64(&xd[(size_t)t * D], A.p + (size_t)t * NB, D);
+            for (int b = 0; b < NB; ++b)
+                for (int i = 0; i < 64; ++i) xq[(size_t)t * D + b * 64 + i] = A.p[(size_t)t * NB + b].d * (float)A.p[(size_t)t * NB + b].qs[i];
+        }
+        std::vector<float> out((size_t)m * nrows), wf(D);
+        gemm_sk_q8_1(W.data(), SkCode::S1_5, A.p, out.data(), nrows, D, m);
+        for (int r = 0; r < nrows; ++r) {
+            strata::quant::sk::dequant_sk_row(&W[r * rb], SkCode::S1_5, wf.data(), D);
+            for (int t = 0; t < m; ++t) {
+                double ref = 0, mag = 0;
+                for (int i = 0; i < D; ++i) { ref += (double)wf[i] * xq[(size_t)t * D + i]; mag += std::fabs((double)wf[i] * xq[(size_t)t * D + i]); }
+                worst = std::max(worst, std::fabs(ref - out[(size_t)t * nrows + r]) / (mag + 1e-30));
+            }
+        }
+    }
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "library kernel S1.5: worst |err|/sum|w*x| = %.2e (m=1,3,11)\n", worst);
+    report += buf;
+    return worst < 2e-6;
+}
+
+// Random-weight self test of the fast row kernel for every format S1.25, S2..S6 (the real SQ-64 file only contains S2/S3/S4):
 // random payload bytes / D / u, real quantized activations; reference = dequant_sk_row (double) . dequantized Q8_1 activations.
 bool CpuExperts::selftest_kernels(std::string& report) {
-#if HY4_FAST
+#if HY4_FASTK
     uint64_t s = 0x1234567ull;
     auto rnd = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
     bool ok = true;
     char buf[200];
-    for (int code = 2; code <= 6; ++code) {
+    for (int code : {0, 2, 3, 4, 5, 6}) {
         const size_t sb = superblock_bytes((SkCode)code), rb = 6 * sb;
         const int nrows = 5;
         std::vector<uint8_t> W(rb * nrows);
@@ -974,7 +1423,7 @@ bool CpuExperts::selftest_kernels(std::string& report) {
                 const uint16_t h = (uint16_t)(0x2800 + (rnd() % 0x1000));  // fp16 in ~[0.03, 4)
                 std::memcpy(p, &h, 2);
             }
-        double worst = 0;
+        double worst = 0, worst_h = 0, ex_q8 = 0, ex_hi = 0;
         for (int m : {1, 3, 8, 11}) {
             ABuf<ActRow> A;
             A.alloc(m);
@@ -999,17 +1448,47 @@ bool CpuExperts::selftest_kernels(std::string& report) {
                     double ref = 0, mag = 0;
                     for (int i = 0; i < D; ++i) { ref += (double)wf[i] * xq[(size_t)t * D + i]; mag += std::fabs((double)wf[i] * xq[(size_t)t * D + i]); }
                     worst = std::max(worst, std::fabs(ref - out[(size_t)t * nrows + r]) / (mag + 1e-30));
+                    double e8 = 0;
+                    for (int i = 0; i < D; ++i) e8 += (double)wf[i] * ((double)xd[(size_t)t * D + i]);
+                    ex_q8 = std::max(ex_q8, std::fabs(e8 - out[(size_t)t * nrows + r]) / (mag + 1e-30));
+                }
+            }
+            // hi mode: two-term activations, same weights
+            std::vector<float> xq2((size_t)m * D);
+            for (int t = 0; t < m; ++t) {
+                BlockQ8_1_G64 blk[24], blk2[24];
+                quantize_q8_1_g64(&xd[(size_t)t * D], blk, D);
+                residual_blocks(&xd[(size_t)t * D], blk, blk2, 24);
+                for (int b = 0; b < 24; ++b) {
+                    store_block_hi(&A.p[t], b, blk[b], blk2[b]);
+                    for (int i = 0; i < 64; ++i) xq2[(size_t)t * D + b * 64 + i] = blk[b].d * (float)blk[b].qs[i] + blk2[b].d * (float)blk2[b].qs[i];
+                }
+            }
+            std::vector<float> outh((size_t)m * nrows);
+            rows_gemm(code, W.data(), nrows, xp, m, outh.data(), true);
+            for (int r = 0; r < nrows; ++r) {
+                strata::quant::sk::dequant_sk_row(&W[r * rb], (SkCode)code, wf.data(), D);
+                for (int t = 0; t < m; ++t) {
+                    double ref = 0, mag = 0, rex = 0;
+                    for (int i = 0; i < D; ++i) {
+                        ref += (double)wf[i] * xq2[(size_t)t * D + i];
+                        rex += (double)wf[i] * xd[(size_t)t * D + i];
+                        mag += std::fabs((double)wf[i] * xd[(size_t)t * D + i]);
+                    }
+                    worst_h = std::max(worst_h, std::fabs(ref - outh[(size_t)t * nrows + r]) / (mag + 1e-30));
+                    ex_hi = std::max(ex_hi, std::fabs(rex - outh[(size_t)t * nrows + r]) / (mag + 1e-30));
                 }
             }
         }
-        std::snprintf(buf, sizeof(buf), "S%d: worst |err|/sum|w*x| = %.2e (m=1,3,8,11)\n", code, worst);
+        std::snprintf(buf, sizeof(buf), "fast kernel %s: worst |err|/sum|w*x| = %.2e (m=1,3,8,11); hi mode vs 2-term ref %.2e; vs exact x: q8 %.1e, hi %.1e\n",
+                      code == 0 ? "S1.25" : (std::string("S") + std::to_string(code)).c_str(), worst, worst_h, ex_q8, ex_hi);
         report += buf;
-        if (!(worst < 2e-6)) ok = false;
+        if (!(worst < 2e-6) || !(worst_h < 2e-6)) ok = false;
     }
-    return ok;
+    return selftest_lib_s15(report) && ok;
 #else
-    report = "fast kernel not compiled (needs AVX-512 BW/VNNI/VBMI + F16C); nothing to test\n";
-    return true;
+    report = "fast kernel not compiled (needs AVX2+FMA+F16C or AVX-512 BW/VNNI/VBMI+F16C); nothing to test\n";
+    return selftest_lib_s15(report);
 #endif
 }
 
@@ -1055,6 +1534,8 @@ void CpuExperts::submit(int layer, int T, const float* z, const int32_t* idx, co
         } else {
             I.tokq.alloc(cap * NB);
             I.h2q.alloc(cap * TOPK * NB);
+            I.tokq2.alloc(cap * NB);
+            I.h2q2.alloc(cap * TOPK * NB);
         }
         I.Y.alloc(cap * TOPK * D);
         I.pair_tok.assign(cap * TOPK, 0);
@@ -1071,6 +1552,7 @@ void CpuExperts::submit(int layer, int T, const float* z, const int32_t* idx, co
     j.use = use;
     j.zout = zout;
     j.accum = accumulate;
+    j.hi = I.hi;
     j.t_post = now_s();
     {
         std::lock_guard<std::mutex> lk(I.m);
@@ -1097,6 +1579,12 @@ void CpuExperts::wait() {
         }
     }
 }
+
+void CpuExperts::set_hi_activations(bool on) {
+    wait();
+    p_->hi = on;
+}
+bool CpuExperts::hi_activations() const { return p_->hi; }
 
 CpuExpertStats CpuExperts::stats() const { return p_->st; }
 void CpuExperts::reset_stats() { p_->st = CpuExpertStats(); }

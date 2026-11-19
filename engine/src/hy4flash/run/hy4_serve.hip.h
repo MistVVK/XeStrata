@@ -255,6 +255,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
     size_t fr = 0, tot = 0;
     HCK(hipMemGetInfo(&fr, &tot));
     fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0);
+    const int serve_chunk = plan_memory(o.max_ctx, o.chunk, tot, 0);
     GpuModel g;
     double t_load0 = now_s();
     if (!load_gpu_model(g, o.model, true)) {
@@ -263,7 +264,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
     }
     fprintf(stderr, "[load] total %.1f s\n", now_s() - t_load0);
     const int max_ctx = o.max_ctx;
-    Runner r(g, max_ctx, std::max(o.chunk, 1));
+    Runner r(g, max_ctx, std::max(serve_chunk, 1));
     r.index_topk = o.index_topk;
     r.index_on = o.no_index ? 0 : 1;
     std::string err;
