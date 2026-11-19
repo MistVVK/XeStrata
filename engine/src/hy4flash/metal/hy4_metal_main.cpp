@@ -301,11 +301,11 @@ public:
         {
             const std::string dir = kernel_path.substr(0, kernel_path.rfind('/') + 1);
             std::string why;
-            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal", dir + "hy4_dfly2.metal", dir + "hy4_lin2.metal", dir + "hy4_moe2.metal", dir + "hy4_lin3.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
+            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal", dir + "hy4_dfly2.metal", dir + "hy4_lin2.metal", dir + "hy4_moe2.metal", dir + "hy4_lin3.metal", dir + "hy4_dfly2b.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
             mpp_ok = lib >= 0;
             if (!mpp_ok) {
                 if (mpp_try) fprintf(stderr, "[metal] MPP (Metal 4 matmul2d) kernels not available, simdgroup GEMM only: %s\n", why.substr(0, 200).c_str());
-                lib = cx.compile({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_dfly2.metal", dir + "hy4_lin2.metal", dir + "hy4_moe2.metal", dir + "hy4_lin3.metal"}, "#define NO_GGML_COMMON 1\n", false);
+                lib = cx.compile({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_dfly2.metal", dir + "hy4_lin2.metal", dir + "hy4_moe2.metal", dir + "hy4_lin3.metal", dir + "hy4_dfly2b.metal"}, "#define NO_GGML_COMMON 1\n", false);
             }
             wscr_elems = (size_t) 16384 * 3072;
             if (mpp_ok) wscr = cx.alloc(wscr_elems * 2);
@@ -935,6 +935,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec-cut") scfg.cut = (float) atof(nxt().c_str());
         else if (a == "--spec-debug") scfg.debug = true;
         else if (a == "--spec-sabotage") scfg.sabotage = true;
+        else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
         else if (a == "--ab") ab_rounds = atoi(nxt().c_str());
         else if (a == "--bench-m") bench_m = atoi(nxt().c_str());
         else if (a == "--info") return print_info(nxt());
