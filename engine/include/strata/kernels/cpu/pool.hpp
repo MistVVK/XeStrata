@@ -402,7 +402,7 @@ private:
     std::vector<int> slice_threads_;  // threads draining each slice (the host counted in its own)
     int64_t pub_ns_ = 0;              // the current mode-5/6 phase's publish time (host only)
     double slice_ms_[2] = {0.0, 0.0}; // accumulated per-slice drain time (host only)
-    // BW-G, BW-11 option B (STRATA_POOL_DEP=1, opt-in): a native layer call as ONE batch (mode 7) instead of two phases with a barrier between them.  The batch's tasks are the experts' gate/up row
+    // BW-G, BW-11 option B (STRATA_POOL_DEP, on by default since 0.1.63, =0 turns it off): a native layer call as ONE batch (mode 7) instead of two phases with a barrier between them.  The batch's tasks are the experts' gate/up row
     // ranges (expert-major), then the experts' down row ranges.  A down task waits only for its own expert's gate/up tasks (counted in gu_left), and the first thread that gets there quantizes that
     // expert's intermediate (native_quant_h, once: quant 0 -> 1 -> 2); so the workers that finish the gate/up rows early start on the experts that are ready instead of waiting for the slowest
     // task of the phase, and the host does not quantize between the phases.  Every row is computed by the same kernel from the same bytes: the outputs are the two-phase batch's bits.
@@ -413,7 +413,7 @@ private:
         std::atomic<int32_t> quant{0};
     };
     std::unique_ptr<DepExpert[]> dep_;   // kMaxSplitMulti
-    bool dep_on_ = false;                // STRATA_POOL_DEP, read once in the constructor
+    bool dep_on_ = true;                 // STRATA_POOL_DEP, read once in the constructor
     int dep_nb_ = 0, dep_k_gu_ = 1, dep_k_dn_ = 1;   // the current batch: experts, gate/up tasks per expert, down tasks per expert
     void dep_task(int i);
     // Diagnostic (STRATA_DIAG_POOL=1, a measuring build only): where the time of run_split_multi_native goes.

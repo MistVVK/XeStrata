@@ -850,7 +850,8 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
     dep_.reset(new DepExpert[(size_t) kMaxSplitMulti]);
-    dep_on_ = [] { const char* v = std::getenv("STRATA_POOL_DEP"); return v != nullptr && v[0] == '1'; }();
+    // STRATA_POOL_DEP: ON unless "0" (0.1.63: bit-exact, window -2.9%; =0 is the way back to the two-phase batch)
+    dep_on_ = [] { const char* v = std::getenv("STRATA_POOL_DEP"); return v == nullptr || v[0] != '0'; }();
     // STRATA_NUMA_SPLIT: decided here, before any worker starts (a worker counts into its slice's `parked` from its
     // first instruction), and never revised.  Unset: the plan stays empty and nothing below runs.
     NumaSplitPlan plan;
