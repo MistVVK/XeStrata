@@ -48,12 +48,14 @@ BIH3_FN inline __m256i dot32(__m256i lo, __m256i hi, const int16_t* q) {
     const __m512i d = _mm512_dpwssd_epi32(_mm512_setzero_si512(), weights, activations);
     const __m256i sum = _mm256_add_epi32(_mm512_castsi512_si256(d), _mm512_extracti64x4_epi64(d, 1));
 #else
-    const __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
 #if BIH3_MODE == 1
-    __m256i sum = _mm256_madd_epi16(lo, q0);
-    // Keep the accumulation: clang can turn the intrinsic back into a separate madd and add.
-    __asm__("%{vex%} vpdpwssd %2, %1, %0" : "+x"(sum) : "x"(hi), "m"(*reinterpret_cast<const __m256i_u*>(q + 16)));
+    // Keep the accumulation and its VEX encoding: clang can split the intrinsic or emit AVX-512's EVEX form.
+    __m256i sum;
+    __asm__("vpmaddwd %3, %1, %0\n\t%{vex%} vpdpwssd %4, %2, %0"
+            : "=&x"(sum) : "x"(hi), "x"(lo), "m"(*reinterpret_cast<const __m256i_u*>(q + 16)),
+              "m"(*reinterpret_cast<const __m256i_u*>(q)));
 #else
+    const __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
     const __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 16));
     const __m256i sum = _mm256_add_epi32(_mm256_madd_epi16(lo, q0), _mm256_madd_epi16(hi, q1));
 #endif
