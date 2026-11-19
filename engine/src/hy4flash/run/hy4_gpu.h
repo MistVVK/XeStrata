@@ -49,13 +49,19 @@
 #define hipHostMallocDefault cudaHostAllocDefault
 #define hipHostMalloc(p, n, f) cudaHostAlloc((p), (n), (f))
 #define hipHostFree cudaFreeHost
+#define hipSetDevice cudaSetDevice
 #define hipHostMallocMapped cudaHostAllocMapped
+#define hipHostRegister cudaHostRegister
+#define hipGetLastError cudaGetLastError
+#define hipHostUnregister cudaHostUnregister
+#define hipStreamWaitEvent cudaStreamWaitEvent
 #define hipHostGetDevicePointer cudaHostGetDevicePointer
 #define hipDeviceSynchronize cudaDeviceSynchronize
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 namespace hy4 {
 inline const char* gpu_arch(const cudaDeviceProp& p) {
     static char b[16];
@@ -66,6 +72,8 @@ inline const char* gpu_arch(const cudaDeviceProp& p) {
 namespace hy4 {
 template <class... KP, class... A>
 inline void gpu_launch(void (*k)(KP...), dim3 g, dim3 b, size_t shmem, cudaStream_t s, A... a) {
+    static const bool dry = getenv("HY4_DRY_LAUNCH") != nullptr;  // host-overhead experiment: skip the kernel launches
+    if (dry) return;
     k<<<g, b, shmem, s>>>(a...);
 }
 }  // namespace hy4

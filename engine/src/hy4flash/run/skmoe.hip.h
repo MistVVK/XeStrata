@@ -561,7 +561,12 @@ inline MoeWs moe_ws_split(void* ws, int P) {
 // tuning knob: for M <= moe_dec_max_m() the GEMV-style decode kernels run, above it the grouped WMMA kernels with the smallest token tile per expert
 namespace skd {
 inline int& moe_has_cpu() { static int v = 0; return v; }  // 1 = some experts are CPU-resident (ExpertDev.pad != 0): their y rows are zeroed
-inline int& moe_dec_max_m() { static int v = HY4_MMA ? 4 : 8; return v; }
+#if HY4_CUDA
+#define HY4_MOE_DEC_MAXM 8  // the MT = 16 decode kernels need 49 KB of static shared memory
+#else
+#define HY4_MOE_DEC_MAXM 16
+#endif
+inline int& moe_dec_max_m() { static int v = HY4_MMA ? 4 : HY4_MOE_DEC_MAXM; return v; }
 }
 
 inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const int32_t* topk_idx, const float* topk_w,
@@ -570,7 +575,7 @@ inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const Exper
 inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const int32_t* topk_idx, const float* topk_w,
                         float* z_out, int M, void* ws) {
 #if !HY4_MMA
-    if (M > 8) {  // no matrix-core grouped GEMM on this build: the simple path handles any M
+    if (M > HY4_MOE_DEC_MAXM) {  // no matrix-core grouped GEMM on this build: the simple path handles any M
         moe_experts_ref(s, sec4_base, experts, z, topk_idx, topk_w, z_out, M, ws);
         return;
     }
@@ -580,7 +585,7 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
     const int eb = P < MOE_E ? P : MOE_E;
     if (skd::moe_has_cpu()) (void)hipMemsetAsync(w.y, 0, (size_t)P * MOE_D * 4, s);
     hipLaunchKernelGGL(skd::k_moe_route, dim3(1), dim3(512), 0, s, experts, topk_idx, P, w.cnt, w.off, w.pairs, w.active, w.nact);
-    if (M <= skd::moe_dec_max_m() && M <= 16) {
+    if (M <= skd::moe_dec_max_m() && M <= HY4_MOE_DEC_MAXM) {
 #define HY4_DEC(MT)                                                                                                                                         \
     hipLaunchKernelGGL((skd::k_moe_gu_dec<MT>), dim3(MOE_D / 8, eb), dim3(256), 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2);  \
     hipLaunchKernelGGL((skd::k_moe_dn_dec<MT>), dim3(MOE_D / 16, eb), dim3(256), 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.active, w.nact,   \
@@ -589,7 +594,9 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
         else if (M <= 2) { HY4_DEC(2); }
         else if (M <= 4) { HY4_DEC(4); }
         else if (M <= 8) { HY4_DEC(8); }
+#if !HY4_CUDA
         else { HY4_DEC(16); }
+#endif
 #undef HY4_DEC
     }
 #if HY4_MMA

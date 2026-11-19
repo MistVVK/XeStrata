@@ -107,6 +107,19 @@ inline void stream_to_device(const std::string& path, uint64_t file_off, uint64_
     *seconds = now_s() - t0;
 }
 
+// the CPU expert kernel needs AVX-512 VBMI + VNNI; without it the GPU reads host-resident experts directly (zero-copy) when they fit the RAM
+inline bool host_cpu_fast() {
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__)
+    return __builtin_cpu_supports("avx512vbmi") && __builtin_cpu_supports("avx512vnni");
+#else
+    return true;
+#endif
+#else
+    return false;
+#endif
+}
+
 inline double host_mem_gb() {
 #ifdef _WIN32
     return 64.0;
@@ -248,11 +261,11 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
             HCK(hipMalloc((void**)&g.d_sec4, (g.sec4_bytes + 4095) & ~4095ull));
             stream_to_device(path, h.sections[4].file_offset, g.sec4_bytes, g.d_sec4, &g.t_load_experts, "experts");
         } else {
-            // host-resident experts: pinned + read by the GPU (needs the RAM) or computed by the CPU. HY4_CPU_EXPERTS=1/0 forces, default: CPU when they would use > 45% of the RAM
+            // host-resident experts: pinned + read by the GPU (needs the RAM) or computed by the CPU. HY4_CPU_EXPERTS=1/0 forces, default: CPU when they would use > 45% of the RAM or the CPU has AVX-512 VBMI+VNNI
             bool cpu_mode = false;
             {
                 double host_gb = (g.sec4_bytes - std::max(0.0, std::min(budget, (double)g.sec4_bytes))) / 1e9, mem_gb = host_mem_gb();
-                cpu_mode = getenv("HY4_CPU_EXPERTS") ? atoi(getenv("HY4_CPU_EXPERTS")) != 0 : host_gb > 0.45 * mem_gb;
+                cpu_mode = getenv("HY4_CPU_EXPERTS") ? atoi(getenv("HY4_CPU_EXPERTS")) != 0 : (host_gb > 0.45 * mem_gb || host_cpu_fast());
             }
             if (!load_experts_tiered(g, path, budget < 0 ? 0 : (size_t)budget, cpu_mode, err)) {
                 fprintf(stderr, "experts: %s\n", err.c_str());
