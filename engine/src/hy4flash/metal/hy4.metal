@@ -41,13 +41,44 @@ static inline int sk_q(device const uchar* pl, int i) {
     return int(as_type<char>(pl[i]));  // S8
 }
 
+// the 8 integers of weights i..i+7 (i a multiple of 8) of a super-block payload, each payload byte loaded once
+template <int F>
+static inline void sk_q8(device const uchar* pl, int i, thread int* q) {
+    if (F == 2) {
+        const uint b0 = pl[i >> 2], b1 = pl[(i >> 2) + 1];
+        for (int k = 0; k < 4; ++k) { q[k] = int((b0 >> (2 * k)) & 3); q[4 + k] = int((b1 >> (2 * k)) & 3); }
+    } else if (F == 3) {
+        const uint b0 = pl[i >> 2], b1 = pl[(i >> 2) + 1], hb = pl[64 + (i >> 3)];
+        for (int k = 0; k < 4; ++k) {
+            q[k] = int(((b0 >> (2 * k)) & 3) | (((hb >> k) & 1) << 2));
+            q[4 + k] = int(((b1 >> (2 * k)) & 3) | (((hb >> (4 + k)) & 1) << 2));
+        }
+    } else if (F == 8) {
+        for (int k = 0; k < 8; ++k) q[k] = int(as_type<char>(pl[i + k]));
+    } else {  // 4, 5, 6: nibbles + the high bits
+        for (int k = 0; k < 4; ++k) {
+            const uint b = pl[(i >> 1) + k];
+            q[2 * k] = int(b & 15);
+            q[2 * k + 1] = int(b >> 4);
+        }
+        if (F == 5) {
+            const uint hb = pl[128 + (i >> 3)];
+            for (int k = 0; k < 8; ++k) q[k] |= int((hb >> k) & 1) << 4;
+        } else if (F == 6) {
+            const uint hb = uint(pl[128 + (i >> 2)]) | (uint(pl[128 + (i >> 2) + 1]) << 8);
+            for (int k = 0; k < 8; ++k) q[k] |= int((hb >> (2 * k)) & 3) << 4;
+        }
+    }
+}
+
 // the 8 weights j..j+7 (j multiple of 8, inside one 64-weight sub-group g) of super-block blk, dequantised
 template <int F>
 static inline void sk_w8(device const uchar* blk, int g, int j, thread float* w) {
     const float D = h2f_bits(ld16(blk));
     const float eff = D * (float(blk[2 + g]) / 255.0f);
-    device const uchar* pl = blk + 6;
-    for (int t = 0; t < 8; ++t) w[t] = (float(sk_q<F>(pl, j + t)) - sk_half(F)) * eff;
+    int q[8];
+    sk_q8<F>(blk + 6, j, q);
+    for (int t = 0; t < 8; ++t) w[t] = (float(q[t]) - sk_half(F)) * eff;
 }
 
 // ================================================================ elementwise / norms / iHC =====================================================================
