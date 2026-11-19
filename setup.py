@@ -127,6 +127,10 @@ HF_REVISIONS = {
     "unsloth/Qwen3.5-0.8B-GGUF": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",                        # 2026-11-08
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
     "AtomicChat/Qwen3.8-Flash-Next-GGUF": "f5b0b790eebb89033c48091c26abf74c1b385940",               # 2026-11-03
+    "hiru2005/Sync-XS": "7caf39170ffd473ec37ffc15e853ba9b79f55648",
+    "hiru2005/Sync-S": "f0674698fbb224ec581227228befb59335043aec",
+    "sync-strata/Sync-M": "435b4178227d9fb13b7e63f8645b7213819419a2",
+    "hiru2005/Sync-shared": "5aabe39c669208e8ae0c6ecad8e9d34f808c8d02",
     # Edge0's latent-MoE packs (EDGE0_REVISIONS below pins the same by model name; setup_edge0 fetches the files)
     "Edge0/Edge0-145B-q3k": "dd6864e1a097685e0ef808cd2e088cfde992abea",                            # 2026-11-13
     "Edge0/Edge0-120B-q3k": "2d8fda55854cdc22b5af049476fd55be3f0a5370",                            # 2026-11-13
@@ -666,6 +670,17 @@ MODELS: dict[str, dict[str, Any]] = {
                    "download_gb": 110.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "shards": 3,
                    "file": "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-0000{i}-of-00003.gguf", "vision": True},
 }
+# Sync's pre-built packs use the same engine as Qwen3.8-Flash-Next.  The thresholds are the pack authors'
+# recommendations, in GiB; they decide only the size within this family, not the first model setup recommends.
+MODELS.update({
+    "Sync-XS": {"about": "the smallest Sync pack", "download_gb": 57.7, "ram_gb": 24,
+                "arena_gb": 20.47, "families": ("sync",), "vision": True},
+    "Sync-S": {"about": "the middle Sync pack", "download_gb": 61.7, "ram_gb": 32,
+               "arena_gb": 24.07, "families": ("sync",), "vision": True},
+    "Sync-M": {"about": "the largest Sync pack", "download_gb": 68.1, "ram_gb": 48,
+               "arena_gb": 30.08, "families": ("sync",), "vision": True},
+})
+
 # Unsloth's Dynamic v3.1 files (UD-Q2_0 to UD-Q4_K_XL) at the pinned revision: name -> (bytes, sha256), the Hub's
 # LFS pointers, checked after the download (check_shards reads the other model files' directories; these are also
 # hashed once).
@@ -1307,6 +1322,11 @@ FAMILIES: dict[str, dict[str, Any]] = {
                    "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the AD files are AtomicChat's "
                               "quantization): https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF"},
 }
+FAMILIES["sync"] = {"title": "Qwen3.8-Flash-Next (Sync)", "by": "Sync packs by hiruhiru2005",
+                    "about": "Sync-XS, Sync-S and Sync-M pre-built packs",
+                    "hf": hf("hiru2005/Sync-XS"), "file": "", "tag": "sync-",
+                    "name": "qwen3.8-flash-next-sync", "vision": True,
+                    "license": "Qwen Community License 1.0: https://huggingface.co/hiru2005/Sync-XS"}
 # Edge0's latent MoE (the Qwen3.8-Flash-Next engine with the experts at a latent width): a pre-built pack, its own
 # install path (setup_edge0).  Listed for --family edge0; the models are the two sizes in Q3_K and NVFP4, each from
 # its own repository (EDGE0_MODELS' "repo").  No picture reader: the pack has none ("vision" False, no mmproj).
@@ -1609,7 +1629,7 @@ VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)
             "swift-huihui-ai": "Swift 1.5, abliterated by huihui-ai", "dealignai": "uncensored by dealignai",
             "llmfan46": "uncensored by llmfan46", "hauhaucs": "uncensored by HauhauCS"}
 QUANTIZERS = {"gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth",
-              "gyro": "Gyro by agentionai",
+              "gyro": "Gyro by agentionai", "sync": "Sync by hiruhiru2005",
               "ad": "AD by AtomicChat", "ornith-ai": "GGUFs by Ornith AI", "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
               "dealignai": "GGUFs by dealignai", "llm-jp": "GGUFs by LLM-jp", "apex": "APEX by SC117",
               "hauhaucs": "GGUFs by HauhauCS", "own": "your own files"}
@@ -1617,6 +1637,7 @@ TIERS = {  # family: (model, version, quantization), in the order each level lis
     "qwen": ("qwen3.8-flash-next", "original", "gsq-rco"),
     "unsloth": ("qwen3.8-flash-next", "original", "unsloth"),
     "gyro": ("qwen3.8-flash-next", "original", "gyro"),
+    "sync": ("qwen3.8-flash-next", "original", "sync"),
     "atomicchat": ("qwen3.8-flash-next", "original", "ad"),
     "swift": ("qwen3.8-flash-next", "swift", "gsq-rco"),
     "coder": ("qwen3.8-flash-next", "coder", "gsq-rco"),
@@ -6716,6 +6737,8 @@ def size_fits(family: str, size: str, room: Room) -> bool:
             return room.gpu_gb >= dense_vram_gb(fam, d, min(DENSE_MIN_CTX, fam["max_context"]))
         return room.ram + room.plain_vram >= d["size"] / 1e9 + 8
     d = MODELS[size]
+    if family == "sync":
+        return room.ram >= d["ram_gb"] and (size != "Sync-S" or room.vram >= 12 or room.ram >= 48)
     if d.get("budget"):
         return d["arena_gb"] + UNSLOTH_RAM_LEFT_GB <= room.ram
     if room.ram >= d["ram_gb"]:
@@ -9838,7 +9861,8 @@ def describe() -> dict:
             for m in names:
                 d = MODELS[m]
                 low = not d.get("budget") and low_ram_needed(m, ram) and low_ram_fits(m, ram, vram)
-                fits = ("budget" if d.get("budget") else "yes" if ram >= d["ram_gb"] else "low-ram" if low else
+                fits = (("yes" if size_fits(f, m, room) else "no") if f == "sync" else
+                        "budget" if d.get("budget") else "yes" if ram >= d["ram_gb"] else "low-ram" if low else
                         "no")
                 models.append({"id": m, "about": d["about"], "download_gb": d["download_gb"], "ram_gb": d["ram_gb"],
                                "fits": fits, "experimental": bool(d.get("experimental")),
