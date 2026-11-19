@@ -3492,6 +3492,15 @@ double pipe_value() {
     }();
     return env;
 }
+// the smallest chunk the rule picks (STRATA_PREFILL_PIPE_FLOOR, on the 256-token grid, 256..4096; default 512)
+int64_t pipe_floor() {
+    static const int64_t f = [] {
+        const char* v = std::getenv("STRATA_PREFILL_PIPE_FLOOR");
+        const int64_t x = v != nullptr && v[0] != '\0' ? std::atoll(v) : 512;
+        return std::clamp<int64_t>((x + 255) / 256 * 256, 256, 4096);
+    }();
+    return f;
+}
 }  // namespace
 void Prefill::set_pipe(double value) { g_pipe = value; }
 void Prefill::set_pipe_request(double value) { g_pipe_req = value; }
@@ -3523,11 +3532,12 @@ int64_t Prefill::pipeline_chunk(int64_t n, int64_t cap, int stages, double ratio
     const int64_t today = std::min(n, cap);
     const int64_t today_cost = cost(today);
     const int64_t k_min = (n + cap - 1) / cap;
-    const int64_t k_max = ratio > 0.0 ? std::max<int64_t>(k_min, std::min<int64_t>(64, (n + 511) / 512)) : k_min;
+    const int64_t lo = pipe_floor();
+    const int64_t k_max = ratio > 0.0 ? std::max<int64_t>(k_min, std::min<int64_t>(64, (n + lo - 1) / lo)) : k_min;
     int64_t best = today;
     int64_t best_cost = today_cost;
     for (int64_t k = k_min; k <= k_max; ++k) {
-        const int64_t c = std::min(cap, std::max<int64_t>(512, (((n + k - 1) / k + 255) / 256) * 256));
+        const int64_t c = std::min(cap, std::max<int64_t>(lo, (((n + k - 1) / k + 255) / 256) * 256));
         const int64_t v = cost(c);
         if (v < best_cost) { best_cost = v; best = c; }
     }
