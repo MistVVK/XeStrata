@@ -7939,7 +7939,9 @@ def pull_onto_new_history(git: str, repo: Path) -> int:
     origin/main: it is moved to the new history when nothing tracked was changed, its old commits kept in a backup branch.  Any other
     failure stops the update (0 = moved, 1 = stopped)."""
     run = lambda *a: subprocess.run([git, "-C", str(repo), *a], capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if git_out(git, repo, "rev-parse", "--is-shallow-repository") == "true" or run("merge-base", "HEAD", "origin/main").returncode == 0:
+    # a clone with no origin/main at all (no remote, or a fetch that never ran) has no history to move to: it is not "the old history" (#4390)
+    if (git_out(git, repo, "rev-parse", "--is-shallow-repository") == "true" or run("merge-base", "HEAD", "origin/main").returncode == 0
+            or run("rev-parse", "--verify", "-q", "origin/main^{commit}").returncode != 0):
         say()
         say("  git pull did not succeed (the reason is above): nothing was updated. Files you changed here can stop it:")
         say('  "git status" lists them.')
