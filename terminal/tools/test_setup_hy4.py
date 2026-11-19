@@ -46,6 +46,15 @@ class Table(unittest.TestCase):
         self.assertAlmostEqual(hy4_family.FILES[hy4_family.ENGRAM_FILE][0] / 1e9, hy4_fit.ENGRAM_GB, delta=0.006)
         self.assertAlmostEqual(hy4_family.FILES[hy4_family.VISION_FILE][0] / 1e9, hy4_fit.VISION_GB, delta=0.001)
 
+    def test_every_file_has_a_whole_file_hash_and_the_engram_section_hash_is_kept_apart(self):
+        for name, (size, sha) in hy4_family.FILES.items():
+            self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", sha or ""), name)
+        whole = hy4_family.FILES[hy4_family.ENGRAM_FILE][1]
+        self.assertEqual(whole, "ab0cf9b3f9c64bd25f6212d4508e7443ab8b9bc133fbccc7bdfb83510a20c2c1")
+        self.assertEqual(hy4_family.ENGRAM_SECTION4_SHA256, "176944953bf2b601645d206171964f7fa51b77522ef5dc14ae61b0eb1c803d74")
+        self.assertNotEqual(whole, hy4_family.ENGRAM_SECTION4_SHA256)
+        self.assertEqual(hy4_family.FILES[hy4_family.VISION_FILE][1], "ef09bceff8f01b8d226d2dc56aef09cec719b21b45783ee9b5d64e7241b72a09")
+
     def test_it_is_not_in_the_tables_other_tests_pin(self):
         self.assertNotIn("hy4-flash", setup.FAMILIES)
         self.assertNotIn("hy4-flash", setup.OWN_PATH_FAMILIES)
