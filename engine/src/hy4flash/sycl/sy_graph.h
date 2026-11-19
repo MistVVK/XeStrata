@@ -76,6 +76,9 @@ public:
     int expert_act = 1;  // 0 float activations (oracle math), 1 Q8_1 activations (fast integer path)
     GpuExperts* gx = nullptr;  // routed experts on the GPU for chunks of >= gx_min_T tokens (prefill); null: CPU only
     int gx_min_T = 32;
+    int kv_host_above = 24000;  // max_ctx above which the sparse layers' KV caches stay in pinned host memory
+    size_t kv_host_bytes = 0;
+    int iring = 0;
     // buffers
     int32_t* d_ids = nullptr;
     float *x = nullptr, *pre = nullptr, *post = nullptr, *cur_f = nullptr, *F1 = nullptr, *F2 = nullptr, *F3 = nullptr, *sub = nullptr;
@@ -106,6 +109,7 @@ public:
     double t_engram_cpu = 0, t_engram_wait = 0, t_cpu_exp = 0;
     bool dump = false, dbg_layers = false;
     std::string force_route_dir;
+    int cur_p0 = 0;  // first position of the chunk being processed (forced routing rows)
     std::string dump_dir = ".";
     int index_on = 1;
     int index_topk = 2048;
@@ -227,16 +231,26 @@ public:
         for (int il = 0; il < c.n_layers; ++il) {
             const int slots = c.is_swa[il] ? ring : slots_sparse;
             const size_t by = mla_cache_bytes(slots);
-            kcache[il] = (half*)dalloc<uint8_t>(by);
-            dzero(kcache[il], by);
+            // long contexts: the 12 sparse layers' caches (1152 B/token each) live in pinned host memory that the GPU reads over PCIe (the IndexPool attends only ~2052 keys per
+            // query on these layers, ~2.4 MB per layer and token), because 128K tokens of KV (1.8 GB) do not fit next to the 6.4 GB trunk in 7.5 GB of VRAM
+            const bool host_kv = !c.is_swa[il] && max_ctx > kv_host_above;
+            if (host_kv) {
+                kcache[il] = (half*)halloc<uint8_t>(by);
+                std::memset(kcache[il], 0, by);
+                kv_host_bytes += by;
+            } else {
+                kcache[il] = (half*)dalloc<uint8_t>(by);
+                dzero(kcache[il], by);
+            }
             kvbytes += by;
         }
-        // indexer state (sparse layers only)
+        // indexer state (sparse layers only): iv/ig rows are a ring (the groups of 4 are pooled as soon as they are complete)
+        iring = ((Tc + 8 + 3) / 4) * 4;
         ivg.assign(c.n_layers, nullptr);
         pooled.assign(c.n_layers, nullptr);
         for (int il = 0; il < c.n_layers; ++il)
             if (!c.is_swa[il]) {
-                ivg[il] = dalloc<half>((size_t)(max_ctx + 8) * 256);
+                ivg[il] = dalloc<half>((size_t)iring * 256);
                 pooled[il] = dalloc<half>((size_t)(max_ctx / 4 + 8) * 128);
             }
         ik_f = dalloc<float>((size_t)Tc * 128);
@@ -307,7 +321,7 @@ public:
         kv_f = dalloc<float>((size_t)5 * Tc * HID);
         ep_alloc();
         wait();
-        fprintf(stderr, "[runner] kv cache %.2f GB (ctx %d, chunk %d), device allocated %.2f GiB of 7.54\n", kvbytes / 1e9, max_ctx, Tc, dev_bytes_allocated() / 1073741824.0);
+        fprintf(stderr, "[runner] kv cache %.2f GB (%.2f GB of it pinned host), ctx %d, chunk %d, device allocated %.2f GiB of 7.54\n", kvbytes / 1e9, kv_host_bytes / 1e9, max_ctx, Tc, dev_bytes_allocated() / 1073741824.0);
         return true;
     }
 
@@ -420,9 +434,9 @@ public:
         rms_rows(ik_f, (const float*)tw(p + ".token_key_norm.weight"), nullptr, ik_h, 128, c.rms_eps, T, 128);
         lin(p + ".key_value_projection.weight", ik_h, iv_f, T);
         lin(p + ".key_gate_projection.weight", ik_h, ig_f, T);
-        idx::store(iv_f, ig_f, ivg[il], p0, T);
+        idx::store(iv_f, ig_f, ivg[il], p0, T, iring);
         const int g_lo = p0 / 4, g_hi = (p0 + T) / 4 - 1;
-        if (g_hi >= g_lo) idx::pool(ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il), c.rms_eps);
+        if (g_hi >= g_lo) idx::pool(ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il), c.rms_eps, iring);
     }
 
     // per-token key lists for the chunk (sparse layer, sequence longer than index_topk)
@@ -503,7 +517,7 @@ public:
         } else {
             const size_t nz = (size_t)T * 1536;
             { PS _q(this, "router"); linear_f32((const float*)tw(pm + ".gate.weight"), 512, HID, cur_f, F1, T); }
-            { PS _q(this, "router_topk"); router_topk(F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 512, 16, c.routed_scale, T); }
+            { PS _q(this, "router_topk"); router_topk_sg(F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 16, c.routed_scale, T); }
             lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536] fp32
             d2h(h_z, z_f, nz * 4);
             d2h(h_idx, moe_idx, (size_t)T * 16 * 4);
@@ -517,18 +531,18 @@ public:
             double tc = now_s();
             if (!force_route_dir.empty()) {  // teacher-forced routing from an oracle dump (L<il>_topk_idx.npy / L<il>_topk_w.npy, float32 [T][16]): isolates numeric noise from routing flips
                 std::vector<float> fi, fw;
-                if (!load_npy_f32(force_route_dir + "/L" + std::to_string(il) + "_topk_idx.npy", fi) || !load_npy_f32(force_route_dir + "/L" + std::to_string(il) + "_topk_w.npy", fw) || fi.size() < (size_t)T * 16) {
+                if (!load_npy_f32(force_route_dir + "/L" + std::to_string(il) + "_topk_idx.npy", fi) || !load_npy_f32(force_route_dir + "/L" + std::to_string(il) + "_topk_w.npy", fw) || fi.size() < (size_t)(cur_p0 + T) * 16) {
                     fprintf(stderr, "force-route: cannot load layer %d\n", il);
                     exit(5);
                 }
                 wait();
-                for (size_t i = 0; i < (size_t)T * 16; ++i) { h_idx[i] = (int32_t)fi[i]; h_w[i] = fw[i]; }
+                for (size_t i = 0; i < (size_t)T * 16; ++i) { h_idx[i] = (int32_t)fi[(size_t)cur_p0 * 16 + i]; h_w[i] = fw[(size_t)cur_p0 * 16 + i]; }
             }
             const bool use_gx = gx != nullptr && T >= gx_min_T;
             if (use_gx) {
                 // prefill: routed experts on the GPU (streamed from the page cache), result stays on the device
                 gx->run(il - 1, T, z_f, h_idx, h_w, zout_f, nullptr);
-            } else {
+            } else if (!std::getenv("HY4S_SKIP_EXPERTS")) {  // timing experiment: no routed experts at all (wrong output)
                 cx.run(il - 1, T, h_z, h_idx, h_w, h_zout, expert_act);
             }
             if (dump && dbg_layers) {
@@ -553,6 +567,7 @@ public:
 
     // process tokens [p0, p0+T) (T <= Tc) of the sequence tok_all (host, positions 0..p0+T-1). Returns false on error.
     bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err) {
+        cur_p0 = p0;
         h2d(d_ids, tok_all + p0, (size_t)T * 4);
         embed_hc((const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
         const bool defer_eng = engram_ready && T <= 8;

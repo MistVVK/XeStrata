@@ -22,9 +22,15 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 }
 
 int main(int argc, char** argv) {
+    // Backend: the OpenCL runtime of the Intel compute stack launches small kernels ~4x cheaper than Level Zero on the A750 (4.7 vs 19 us per dependent tiny kernel;
+    // a decode step has ~1300 of them: 46 ms vs 87 ms without the routed experts). HY4S_BACKEND=level_zero (or an own ONEAPI_DEVICE_SELECTOR) overrides.
+    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
+        const char* be = std::getenv("HY4S_BACKEND");
+        setenv("ONEAPI_DEVICE_SELECTOR", (be && std::string(be) == "level_zero") ? "level_zero:gpu" : "opencl:gpu", 1);
+    }
     std::string model, engram, tok_path, out_dir = ".", force_route;
     bool load_only = false, dbg = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false;
-    int gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, threads = 6, expert_act = 1;
+    int kv_host_above = 24000, gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, threads = 6, expert_act = 1;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -40,6 +46,7 @@ int main(int argc, char** argv) {
         else if (a == "--warm") warm = true;
         else if (a == "--gpu-experts") gx_mb = atoi(nxt().c_str());
         else if (a == "--gx-min-t") gx_min_t = atoi(nxt().c_str());
+        else if (a == "--kv-host-above") kv_host_above = atoi(nxt().c_str());
         else if (a == "--load-only") load_only = true;
         else if (a == "--dump") dump = true;
         else if (a == "--dbg-layers") dbg = true;
@@ -98,6 +105,7 @@ int main(int argc, char** argv) {
         r.prof = prof;
         r.prof2 = prof2;
         r.expert_act = expert_act;
+        r.kv_host_above = kv_host_above;
         if (!r.init(no_engram ? std::string() : engram, err)) {
             fprintf(stderr, "init: %s\n", err.c_str());
             return 1;

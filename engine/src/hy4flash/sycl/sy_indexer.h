@@ -21,23 +21,23 @@ inline uint32_t f2key(float f) {
 }
 
 // store iv, ig (fp32 [T][128] each) of tokens p0..p0+T-1 into the fp16 cache rows
-inline void store(const float* iv, const float* ig, half* ivg, int p0, int T) {
+inline void store(const float* iv, const float* ig, half* ivg, int p0, int T, int iring) {  // ivg is a ring of iring (multiple of 4) token rows: only the tokens of the groups still to be pooled are needed
     Q().parallel_for(NR(T, 128), [=](sycl::nd_item<1> it) REQD_SG32 {
         const int t = (int)it.get_group(0), d = (int)it.get_local_id(0);
-        ivg[(size_t)(p0 + t) * 256 + d] = (half)iv[(size_t)t * 128 + d];
-        ivg[(size_t)(p0 + t) * 256 + 128 + d] = (half)ig[(size_t)t * 128 + d];
+        ivg[(size_t)((p0 + t) % iring) * 256 + d] = (half)iv[(size_t)t * 128 + d];
+        ivg[(size_t)((p0 + t) % iring) * 256 + 128 + d] = (half)ig[(size_t)t * 128 + d];
     });
 }
 
 // pool completed groups g in [g_lo, g_lo + n): softmax over the 4 tokens of (ig + ape), weighted sum of iv, rmsnorm(key_norm), rope at 4g on dims 64..127
-inline void pool(const half* ivg, const float* ape /*[4][128]*/, const float* knw /*[128]*/, half* pooled, int g_lo, int n, float theta, float eps) {
+inline void pool(const half* ivg, const float* ape /*[4][128]*/, const float* knw /*[128]*/, half* pooled, int g_lo, int n, float theta, float eps, int iring) {
     Q().parallel_for(NR(n, 128), [=](sycl::nd_item<1> it) REQD_SG32 {
         float* sh = lmem<float, 32>(it);
         float* sv = lmem<float, 128>(it);
         const int g = g_lo + (int)it.get_group(0), d = (int)it.get_local_id(0);
         float l[4], mx = -3.0e38f;
         for (int j = 0; j < 4; ++j) {
-            l[j] = (float)ivg[(size_t)(4 * g + j) * 256 + 128 + d] + ape[j * 128 + d];
+            l[j] = (float)ivg[(size_t)((4 * g + j) % iring) * 256 + 128 + d] + ape[j * 128 + d];
             mx = sycl::fmax(mx, l[j]);
         }
         float s = 0;
@@ -46,7 +46,7 @@ inline void pool(const half* ivg, const float* ape /*[4][128]*/, const float* kn
             s += l[j];
         }
         float acc = 0;
-        for (int j = 0; j < 4; ++j) acc += (l[j] / s) * (float)ivg[(size_t)(4 * g + j) * 256 + d];
+        for (int j = 0; j < 4; ++j) acc += (l[j] / s) * (float)ivg[(size_t)((4 * g + j) % iring) * 256 + d];
         const float ss = wg_sum(it, acc * acc, sh);
         const float inv = sycl::rsqrt(ss / 128.0f + eps);
         float v = acc * inv * knw[d];

@@ -180,6 +180,24 @@ int main() {
         d2h(gi.data(), di, M * 16 * 4);
         d2h(gw.data(), dwt, M * 16 * 4);
         wait();
+        {  // the one-sub-group variant must give the same ids and weights
+            int32_t* di2 = dalloc<int32_t>(M * 16);
+            float* dwt2 = dalloc<float>(M * 16);
+            router_topk_sg(dy, db, di2, dwt2, 16, 3.998f, M);
+            std::vector<int32_t> gi2(M * 16);
+            std::vector<float> gw2(M * 16);
+            d2h(gi2.data(), di2, M * 16 * 4);
+            d2h(gw2.data(), dwt2, M * 16 * 4);
+            wait();
+            int badsg = 0;
+            double wsg = 0;
+            for (int i = 0; i < M * 16; ++i) {
+                if (gi2[i] != gi[i]) ++badsg;
+                wsg = std::max(wsg, (double)std::fabs(gw2[i] - gw[i]));
+            }
+            printf("router_topk_sg vs router_topk: index mismatches %d, max weight diff %.2e  %s\n", badsg, wsg, (badsg == 0 && wsg < 1e-6) ? "ok" : "FAIL");
+            if (badsg || wsg >= 1e-6) ++fails;
+        }
         int bad = 0;
         double wmax = 0;
         for (int m = 0; m < M; ++m) {
