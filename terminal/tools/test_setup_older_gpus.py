@@ -330,9 +330,9 @@ class Start(unittest.TestCase):
             seen = []
             real = setup.update_installed_engine
 
-            def spy(url_base, toolkit=None):
+            def spy(url_base, toolkit=None, rebuild=False):
                 if toolkit is None:
-                    return real(url_base, toolkit)
+                    return real(url_base, toolkit, rebuild)
                 seen.append(toolkit)
             with mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "update_installed_engine", spy):
                 spy("u")

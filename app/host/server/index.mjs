@@ -10,6 +10,7 @@ import { saveSnapshot } from './snapshot.mjs';
 import { resolvePython, shellPrefix } from './python-resolver.mjs';
 import { chooseFolder, chooserUnavailable, typedFolder } from './folder-dialog.mjs';
 import { createLocalShare } from './local-share.mjs';
+import { workspaceBases } from './model-directory-default.mjs';
 import { createTaskService, validateTask } from './tasks.mjs';
 import { createAgentTaskRunner } from './agent/task-run.mjs';
 import { migrateSetup } from './setup.mjs';
@@ -111,7 +112,7 @@ const HOST = process.env.STRATA_BIND ?? '127.0.0.1';
 function defaultWorkspace() {
   if (process.env.STRATA_WORKSPACE) return resolve(process.env.STRATA_WORKSPACE);
   const user = process.env.USERPROFILE ?? process.env.HOME ?? homedir();
-  for (const base of [join(user, 'Documents'), user]) {
+  for (const base of workspaceBases(user)) {                // #3749: the Documents folder the models folder uses
     const dir = join(base, 'Strata', 'Workspace');
     try { mkdirSync(dir, { recursive: true }); return dir; } catch { /* try the next place */ }
   }

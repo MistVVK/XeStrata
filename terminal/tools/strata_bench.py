@@ -995,7 +995,11 @@ def load_results(path: Path) -> dict:
     p = Path(path)
     if p.is_dir():
         p = p / "results.json"
-    return json.loads(p.read_text(encoding="utf-8"))
+    doc = json.loads(p.read_text(encoding="utf-8"))
+    if isinstance(doc, dict) and "results" not in doc and "summaries" in doc:      # #4325: the default `strata bench run` writes another report
+        sys.exit(f"{p} is a standard benchmark result (strata bench run); compare it with `strata bench compare BASELINE CANDIDATE`. "
+                 "This tool reads the results of its own runs.")
+    return doc
 
 
 def short_table(res: dict) -> str:

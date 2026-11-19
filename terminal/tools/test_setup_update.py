@@ -47,7 +47,7 @@ class Update(unittest.TestCase):
             rc, pip, eng, dv, start, call, out = self.run_update([p])
         self.assertEqual(rc, 0)
         pip.assert_called_once()
-        eng.assert_called_once_with("URL")
+        eng.assert_called_once_with("URL", rebuild=False)
         dv.assert_called_once()
         self.assertEqual(dv.call_args[0][1], "en")                 # the model's own subset is kept
         start.assert_not_called()
@@ -66,12 +66,13 @@ class Update(unittest.TestCase):
                 rc, pip, eng, dv, start, call, out = self.run_update([p])
             self.assertIn("Strata is updated (engine 0.1.49.2)", out)
 
-    def test_build_keeps_the_compiled_engine_path(self):
+    def test_build_compiles_the_installed_engine_again(self):
+        """#5214: --update --build used to skip the engine step; it now asks for the compile (rebuild=True)."""
         with tempfile.TemporaryDirectory() as d:
             p = self.config(Path(d))
             rc, pip, eng, dv, *_ = self.run_update([p], {"build": True})
         self.assertEqual(rc, 0)
-        eng.assert_not_called()
+        eng.assert_called_once_with("URL", rebuild=True)
         self.assertEqual(dv.call_args[0][1], "cjk")
 
     def test_nothing_installed(self):

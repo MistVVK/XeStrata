@@ -7,7 +7,7 @@ import { PcComputer } from './PcComputer';
 import { cardRoomGb, contextCacheGb, fitOn, memoryNeeded, versionFit } from '../lib/native-fit';
 import { contextIsTight, defaultContext, DEFAULT_CONTEXT, openingContext } from '../lib/default-context';
 import { GpuRoles } from './GpuRoles';
-import { fromLegacy, normalize as normalizeRoles, order as roleOrder, recommend as recommendRoles, rows as roleRows, sameRoles, vramOn, type RoleCard, type Roles } from '../lib/gpu-roles';
+import { fromLegacy, normalize as normalizeRoles, order as roleOrder, recommend as recommendRoles, rows as roleRows, sameRoles, savedRoles as savedRolesOf, vramOn, type RoleCard, type Roles } from '../lib/gpu-roles';
 import { Btn, Dialog, ErrorNotice, Icon, Select } from './ui';
 import { installProgress, installStage, stageText, useDownloadEta } from '../lib/download-eta';
 import { useKept } from '../lib/kept-state';
@@ -126,9 +126,14 @@ export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine
     const busy = (i: number) => expert && multiple && usedBy([i]).length > 0, freeCards = roleCards.filter(c => !busy(c.index));
     const recommended = freeCards.length && freeCards.length < roleCards.length ? { ...recommendRoles(freeCards, engineVendor), roles: { ...Object.fromEntries(roleCards.map(c => [c.index, 'off'])), ...recommendRoles(freeCards, engineVendor).roles } as Roles } : recommendRoles(roleCards, engineVendor);
     const loadedRoles = loadedSelected && roleCards.length > 1 ? fromLegacy(loadedSelected.gpus, roleCards, 'as_given') : null;
-    const effectiveRoles: Roles = roleCards.length > 1 ? (roles ? normalizeRoles(roles, roleCards) : loadedRoles ?? recommended.roles) : recommended.roles;
+    // #6117: the cards the model was last started with (its run config's gpu_roles) are what a Load keeps while the page asks for the recommendation, so the box shows
+    // them: it said "Recommended" and the Load ran on one card. Back to recommended, and a pick equal to the recommendation, are then sent as a choice that replaces them.
+    const savedRoles = savedRolesOf(installed?.gpuRoles, roleCards);
+    const savedDiffers = !!savedRoles && !sameRoles(savedRoles, recommended.roles);
+    const effectiveRoles: Roles = roleCards.length > 1 ? (roles ? normalizeRoles(roles, roleCards) : loadedRoles ?? savedRoles ?? recommended.roles) : recommended.roles;
     const customRoles = !sameRoles(effectiveRoles, recommended.roles);
-    const changeRoles = (next: Roles) => setRoles(sameRoles(next, recommended.roles) ? null : next);
+    const changeRoles = (next: Roles) => setRoles(sameRoles(next, recommended.roles) && !savedDiffers ? null : next);
+    const backToRecommended = () => setRoles(savedDiffers ? recommended.roles : null);
     const cardsGpus: number[] = roleCards.length > 1 ? roleOrder(effectiveRoles, roleCards) : [];
     const chosenCards = cardsGpus;
     const fitHardware = { ram_gb: pcRam ? Math.max(0, pcRam - keptRam) : pcRam, vram_gb: Math.max(0, (roleCards.length > 1 ? vramOn(effectiveRoles, roleCards) : pcVram) - keptVramOn(chosenCards)) };
@@ -221,7 +226,7 @@ export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine
     const picturesByLoad = fetchesPictures(selectedSize, native?.packaged);
     async function load() { if (!selectedSize)
         return; setPlan(null); setDrafterGb(null); await perform(async () => { if (installed?.ready && context === installed.context && (!selectedSize?.images || vision === 'no' || picturesByLoad || installed.images && installed.images !== 'off') && (!installed.kv || kv === installed.kv || kv === tunedNow?.fields.kv) && (lowRam === (installed.lowRamMode ?? 'auto') || lowRam === tunedNow?.fields.lowRam)) {
-        const result = await nativeAction<NativeJob>('operations', { kind: 'load', args: { model: selectedSize.id, resourceProfile, vision: selectedSize?.images ? vision : 'no', ...(noReader ? { visionUnavailable: true } : {}), ...(contextPicked && !installed.contextChosen ? { contextChosen: true } : {}), multiple: expert && multiple, ...(draftingChoices ? { values: { drafting } } : {}), ...(roleCards.length > 1 ? (roles && customRoles ? { gpuRoles: effectiveRoles, layerSplit: expert && cardsGpus.length > 1 ? split : 'auto' } : cardsGpus.length ? { gpus: cardsGpus, gpusFromRecommendation: true, layerSplit: expert && cardsGpus.length > 1 ? split : 'auto' } : {}) : {}) } });
+        const result = await nativeAction<NativeJob>('operations', { kind: 'load', args: { model: selectedSize.id, resourceProfile, vision: selectedSize?.images ? vision : 'no', ...(noReader ? { visionUnavailable: true } : {}), ...(contextPicked && !installed.contextChosen ? { contextChosen: true } : {}), multiple: expert && multiple, ...(draftingChoices ? { values: { drafting } } : {}), ...(roleCards.length > 1 ? (roles && (customRoles || savedDiffers) ? { gpuRoles: effectiveRoles, layerSplit: expert && cardsGpus.length > 1 ? split : 'auto' } : cardsGpus.length ? { gpus: cardsGpus, gpusFromRecommendation: true, layerSplit: expert && cardsGpus.length > 1 ? split : 'auto' } : {}) : {}) } });
         setJobId(result.id);
     }
     else {
@@ -266,7 +271,7 @@ export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine
       {tr(contextIsTight(fitHardware.vram_gb, context, kv, selectedSize?.context_fit) ? <p className="small muted native-spill-note"><Icon name="warning" size={16}/>{tr("This much context takes about {0} GB of graphics memory and leaves little room for the model on this card. Strata will try it; if it does not start, choose a shorter context.", [contextCacheGb(context, kv, selectedSize?.context_fit).toFixed(1)])}</p> : null)}
       {tr(loadedSelected?.metrics?.engine?.drafting_note ? <p className="small muted native-spill-note">{tr(String(loadedSelected.metrics.engine.drafting_note))}</p> : null)}
       {tr(loadedCommit ? <div className="native-commit-note" role="status"><p className="small"><Icon name="warning" size={16}/>{tr("Windows is close to its memory limit (memory plus page file). Strata may stop without a message. Make the Windows page file larger, or choose a shorter context.")}</p><p className="small muted">{tr("{0} GB of {1} GB are left.", [loadedCommit.left, loadedCommit.limit])}</p></div> : null)}
-      {roleCards.length > 1 ? <GpuRoles cards={roleCards} roles={effectiveRoles} custom={customRoles} recommendedRoles={recommended.roles} vendor={engineVendor} disabled={!!active} onChange={changeRoles} onBack={() => setRoles(null)} memoryGb={selectedSize ? memoryNeeded(selectedSize) || null : null} ramGb={pcRam} spillGb={selectedSize ? fitOn(selectedSize, fitHardware).spillGb : 0} usedBy={i => usedBy([i])}/> : null}
+      {roleCards.length > 1 ? <GpuRoles cards={roleCards} roles={effectiveRoles} custom={customRoles} recommendedRoles={recommended.roles} vendor={engineVendor} disabled={!!active} onChange={changeRoles} onBack={backToRecommended} memoryGb={selectedSize ? memoryNeeded(selectedSize) || null : null} ramGb={pcRam} spillGb={selectedSize ? fitOn(selectedSize, fitHardware).spillGb : 0} usedBy={i => usedBy([i])}/> : null}
       {tr(roleCards.length > 1 && (native?.hardware?.gpus ?? []).length > roleCards.length ? <p className="small muted native-cards__note">{tr('Not used: {0} (another make of graphics card than this engine drives).', [(native?.hardware?.gpus ?? []).filter(g => !roleCards.some(r => r.index === g.index && r.vendor === g.vendor)).map(g => g.name).join(', ')])}</p> : null)}
       {tr(selectedSize?.images || noReader ? <><div className="native-image-reading"><label title={noReader ? tr("Needs an engine update") : undefined}><input type="checkbox" checked={!noReader && vision !== 'no'} disabled={noReader || !!active} onChange={e => pickVision(e.target.checked ? 'yes' : 'no')}/><span><strong>{tr("Read pictures")}</strong></span></label>{tr(expert && vision !== 'no' ? <Select ariaLabel={tr("Image encoder device")} value={vision === 'yes' ? 'yes' : vision} options={[{ value: 'yes', label: 'Automatic' }, { value: 'gpu', label: 'GPU' }, { value: 'cpu', label: 'CPU' }]} onChange={pickVision}/> : null)}</div>{tr(vision !== 'no' && !noReader && !active && loadedSelected?.picturesNote ? <p className="small muted native-vision-note" role="status">{tr(loadedSelected.picturesNote)}</p> : null)}</> : null)}
      </> : null)}

@@ -197,6 +197,22 @@ export function fromLegacy(gpu: unknown, cards: RoleCard[], gpuOrder?: string | 
 
 export const sameRoles = (a: Roles, b: Roles) => { const ka = byNumber(a), kb = byNumber(b); return ka.length === kb.length && ka.every((k, n) => k === kb[n] && a[k] === b[k]); };
 
+/**
+ * #6117: the roles a model's run config (gpu_roles) holds for these cards, or null when it holds none, names a card this PC does not have, or has no usable
+ * Main. A Load that asks for the recommendation keeps what the file names (the Terminal's choice stays), so the Models page shows these roles instead of the
+ * recommendation: the box says what the Load will do.
+ */
+export function savedRoles(saved: Record<string, string> | null | undefined, cards: RoleCard[]): Roles | null {
+  if (!saved || typeof saved !== 'object' || cards.length < 2) return null;
+  const roles: Roles = {};
+  for (const c of cards) {
+    const role = saved[c.index];
+    if (role !== 'main' && role !== 'helper' && role !== 'off') return null;
+    roles[c.index] = role;
+  }
+  return cards.filter(c => roles[c.index] === 'main').length === 1 ? normalize(roles, cards) : null;
+}
+
 export interface RoleWarning { code: 'igpu_main' | 'cannot_run' | 'low_memory' | 'cpu_only'; card: number | null; text: string; fix: { card: number; role: Role } | null }
 
 /** One short line each, only what a person could not know. Never blocking. */

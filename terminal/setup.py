@@ -193,6 +193,22 @@ def reachable(url: str, timeout: float = 5.0) -> bool:
         return False
 
 
+def ms_answers(url: str, timeout: float = 12.0, sleep=time.sleep) -> bool:
+    """#5938: whether ModelScope answers for `url`, asked up to three times (a HEAD, a one-byte ranged GET, a HEAD again after a short pause).
+    One slow or refused HEAD on its CDN is not "ModelScope does not answer": on a network where huggingface.co is blocked that one miss ended the
+    install. Each ask is bounded by `timeout`, so a host that really is down costs three asks, not a hang."""
+    def ranged() -> bool:
+        try:
+            _urlopen(urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": "bytes=0-0"}), timeout=timeout).close()
+            return True
+        except OSError:
+            return False
+    if reachable(url, timeout=timeout) or ranged():
+        return True
+    sleep(3)
+    return reachable(url, timeout=timeout)
+
+
 def model_source() -> str:
     """"modelscope" or "huggingface".  ModelScope only when --source modelscope / STRATA_SOURCE=modelscope asks for it;
     everything else (auto, a HF_ENDPOINT mirror chosen on purpose, #495) is Hugging Face.  Setup does not switch hosts
@@ -3317,7 +3333,7 @@ def download(url, dst: Path, what=None):
         return
     ms = ms_file(url) if model_source() == "modelscope" else None
     if ms is not None:
-        if reachable(ms_url(*ms), timeout=netpolicy.FIRST_CONNECT_S):
+        if ms_answers(ms_url(*ms), timeout=netpolicy.FIRST_CONNECT_S):
             url = ms_url(*ms)
         else:
             warn(f"{what or dst.name}: ModelScope does not answer; downloading it from {hf_endpoint()}")
@@ -4991,17 +5007,21 @@ def hip_card(eng: Path, gpu: dict, listed: list[dict]) -> dict:
     return {**gpu, "index": m["index"], "count": len(hip), "vram_gb": vram, "driver": "hip"}
 
 
-def engine_from_feed(eng: Path, updating: bool = False) -> Path | None:
+def engine_from_feed(eng: Path, updating: bool = False, backend: str | None = None) -> Path | None:
     """#3469 #3437: the 0.2 releases no longer carry the flat engine zips (strata-windows-x64*.zip); they publish one package
     per card in the signed update feed.  `strata update --no-control` fetches, verifies and test-starts the package for this PC
     (into a folder of its own under the install), and its files then become the installed engine in `eng`, the same way a
-    zip's do.  None when it cannot be had (no internet, nothing for this card): the caller goes on as before."""
+    zip's do.  None when it cannot be had (no internet, nothing for this card): the caller goes on as before.
+    `backend` is the engine family of the card this setup chose ("hip", "cuda"): on a PC with cards of several makes the update below would
+    otherwise pick the first make it finds (NVIDIA) and fetch the wrong engine for the card the person chose (#5402)."""
     acquisition.require("the ready-made engine")
     from strata_control import engine_component as ec
     store = home() / "engine-feed"
     env = dict(os.environ)
     env.pop("STRATA_NO_ACQUIRE", None)
     env["STRATA_COMPONENTS_DIR"] = str(store)
+    if backend and not env.get(ec.ENV_BACKEND):         # a family the person set by hand in the environment still wins
+        env[ec.ENV_BACKEND] = backend
     say("  Fetching the ready-made engine from the signed update feed ...")
     try:
         run = subprocess.run([sys.executable, str(ROOT / "strata.py"), "update", "--no-control", "--output", "json"],
@@ -5014,7 +5034,7 @@ def engine_from_feed(eng: Path, updating: bool = False) -> Path | None:
         warn(f"no engine from the update feed: {why[0][:200]}")
         return None
     try:
-        component = ec.resolve(store, full=True)
+        component = ec.resolve(store, backend=env.get(ec.ENV_BACKEND) or None, full=True)
     except ec.ComponentProblem as e:
         warn(f"the engine from the update feed is not usable: {e}")
         return None
@@ -5074,7 +5094,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
             if i + 1 < len(bases):
                 _next_release_note("AMD engine", e)
                 continue
-            got = engine_from_feed(eng, updating)      # the 0.2 releases carry no flat zip: the signed feed has it (no error text for that)
+            got = engine_from_feed(eng, updating, "hip")   # the 0.2 releases carry no flat zip: the signed feed has it (no error text for that)
             if got is None:
                 warn(f"no ready-made AMD engine at {base} ({e})")
             return got
@@ -5910,7 +5930,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     if is_arm64() and sys.platform.startswith("linux"):
         # a DGX Spark: the release has no flat engine zip for it (and the CUDA 12 engine is x86). The signed feed has the linux-aarch64
         # package when the release carries one; without it the caller compiles (spark/build_engine.sh does the same by hand)
-        got = engine_from_feed(eng, updating) if int(toolkit) != 12 else None
+        got = engine_from_feed(eng, updating, "cuda") if int(toolkit) != 12 else None
         if got is None:
             warn(f"no ready-made engine for {sysinfo.machine()} in the update feed" + ("" if updating else ": compiling it here, once"))
         return got
@@ -5930,7 +5950,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             if i + 1 < len(bases):                     # #214: this checkout's release is not published (yet)
                 _next_release_note("engine", e)
                 continue
-            got = engine_from_feed(eng, updating)      # 0.2 releases: the signed feed has it (#3469), the CUDA 12 package too (since 0.2.13)
+            got = engine_from_feed(eng, updating, "cuda")   # 0.2 releases: the signed feed has it (#3469), the CUDA 12 package too (since 0.2.13)
             if got is not None and int(toolkit) == 12 and not feed_engine_covers(got, gpu):
                 warn("the engine package from the update feed has no code for your graphics card" + ("" if updating else ": compiling instead"))
                 return None
@@ -6039,15 +6059,17 @@ def engine_update_note() -> None:
                  + ("START-HERE.bat --update" if WIN else "./setup.sh --update") + " (or `strata install --update`) to update it")
 
 
-def update_installed_engine(url_base, toolkit=None) -> None:
+def update_installed_engine(url_base, toolkit=None, rebuild=False) -> None:
     """An installed ready-made engine older than MIN_ENGINE is replaced before the model starts, so a plain
     START-HERE.bat on an existing install picks up a new release.  If that cannot happen (no internet, the model
     still running, no ready-made engine for this GPU) the installed engine is kept and starts as before.
-    toolkit None: engine/, then the experimental CUDA 12 engine in engine-cuda12/ when one is installed."""
+    toolkit None: engine/, then the experimental CUDA 12 engine in engine-cuda12/ when one is installed.
+    rebuild (`--update --build`, #5214): compile the installed engine again from this source, whatever it is now (a ready-made one, or a compiled one
+    whose source has not changed); without it a ready-made engine is only replaced when it is older than MIN_ENGINE."""
     if toolkit is None:
-        update_installed_engine(url_base, 13)
+        update_installed_engine(url_base, 13, rebuild)
         if (engine_dir(12) / "BUILD.json").exists():
-            update_installed_engine(url_base, 12)
+            update_installed_engine(url_base, 12, rebuild)
         return
     eng = engine_dir(toolkit)
     info = eng / "BUILD.json"
@@ -6055,8 +6077,8 @@ def update_installed_engine(url_base, toolkit=None) -> None:
         return
     meta_text = info.read_text(encoding="utf-8")
     meta = json.loads(meta_text)
-    if meta.get("backend") == "hip" and WIN:           # AMD on Windows: the ready-made HIP engine, when older
-        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
+    if meta.get("backend") == "hip" and WIN and not rebuild:   # AMD on Windows: the ready-made HIP engine, when older
+        ver =tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
         if meta.get("source") == "prebuilt" and ver < WIN_HIP_MIN_ENGINE:
             try:
                 g = next((x for x in amd_gpus() if amd_problem(x) is None), None)
@@ -6071,9 +6093,9 @@ def update_installed_engine(url_base, toolkit=None) -> None:
                      "starting the installed one")
         return
     if meta.get("backend") == "hip":                   # AMD: compiled here, again when its source changed
-        if meta.get("src") != source_hash(ENGINE_SOURCES) or stale_binary(eng / EXE):
+        if rebuild or meta.get("src") != source_hash(ENGINE_SOURCES) or stale_binary(eng / EXE):
             try:
-                usable = [x for x in amd_gpus() if amd_problem(x) is None]
+                usable =[x for x in amd_gpus() if amd_problem(x) is None]
                 g = next((x for x in usable if x["arch"] in arch_names(meta.get("archs"))), usable[0] if usable else None)
                 if g is None:
                     raise RuntimeError("no supported AMD GPU found")
@@ -6085,9 +6107,11 @@ def update_installed_engine(url_base, toolkit=None) -> None:
                      "starting the installed one")
         return
     ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
-    local = meta.get("source") == "local"
+    local = meta.get("source") == "local" or rebuild
     vision = meta.get("vision") or "none"
-    if local:                                          # compiled here: is it older than the source (a git pull)?
+    if rebuild:
+        pass                                           # --update --build: compile again, whatever the engine is now
+    elif local:                                        # compiled here: is it older than the source (a git pull)?
         if meta.get("src") == source_hash(ENGINE_SOURCES) and not stale_binary(eng / EXE) and \
                 (vision == "none" or meta.get("vision_src") == source_hash(VISION_SOURCES)):
             return
@@ -6364,8 +6388,10 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
     acquisition.require("a compile (cmake)")
     cmake, ninja = ensure_build_tools()
     fresh_if_other_generator(bdir)
+    # #6172: the vendored ggml wraps EVERY compile in ccache / sccache when one is on PATH (a global RULE_LAUNCH_COMPILE), Strata's nvcc compiles
+    # too, and sccache stops them at the fatbinary step ("Could not open input file 'device.ptx'"). Off here; a -DGGML_CCACHE in defs wins.
     conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
-            *toolkit_change_undefs(bdir, defs), "-DCMAKE_BUILD_TYPE=Release", *defs]
+            *toolkit_change_undefs(bdir, defs), "-DCMAKE_BUILD_TYPE=Release", "-DGGML_CCACHE=OFF", *defs]
     build = [cmake, "--build", str(bdir), "--target", target, "-j", str(max(2, (os.cpu_count() or 4) // 2))]
     # A failed build is tried once more: CUDA 13.0's ptxas now and then fails to parse a PTX file it just wrote, and
     # the same command then gets past it (issue #45); a second attempt only compiles what is still missing.
@@ -7109,6 +7135,8 @@ SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRA
 # user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there
 # (0.1.44 dropped them with the rest of SETUP_ENV).
 SETUP_ENV_UNSLOTH = frozenset({"STRATA_MMQ_KQ", "STRATA_HC_Q8", "STRATA_ROUTE_TAIL_SKIP"})
+# The only values setup writes for an entry that people also set by hand. STRATA_RESIDENT_PIN: setup writes "0" (ROCm, resident experts); a "1" is the person's (#6244).
+SETUP_ENV_VALUES = {"STRATA_RESIDENT_PIN": frozenset({"0"})}
 SETUP_VISION = frozenset({"exe", "cpu_exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
 
@@ -7127,6 +7155,12 @@ def carry_over(old: dict, cfg: dict, explicit: list[str] | None = None) -> list[
     mine = SETUP_ENV if "-unsloth-" in str(cfg.get("model_name") or "") else SETUP_ENV - SETUP_ENV_UNSLOTH
     env = {k: v for k, v in (old.get("env") or {}).items() if k not in mine and k not in (cfg.get("env") or {})} \
         if isinstance(old.get("env"), dict) else {}
+    # #6244: an entry of setup's own is refreshed on every run, but only to the values setup writes; any other value was put there by the person
+    # (STRATA_RESIDENT_PIN=1, which setup never writes) and is kept over the one this run generated.
+    if isinstance(old.get("env"), dict):
+        for k, v in old["env"].items():
+            if k in mine and k in SETUP_ENV_VALUES and str(v) not in SETUP_ENV_VALUES[k]:
+                env[k] = v
     if env:
         cfg["env"] = {**(cfg.get("env") or {}), **env}
         kept += [f"env {k}" for k in env]
@@ -8049,8 +8083,7 @@ def update_install(have: list, a) -> int:
         return 0
     pip_install(runtime_packages(),
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil, textual (the screens)")
-    if not a.build:
-        update_installed_engine(a.prebuilt)
+    update_installed_engine(a.prebuilt, rebuild=bool(a.build))      # --update --build compiles it (#5214); it used to skip the engine step
     mtp_done: set = set()
     for cfg_path in have:
         cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))

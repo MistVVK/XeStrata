@@ -338,6 +338,17 @@ def detect_hardware(environ=None) -> dict:
 
 # ---------------------------------------------------------------------------------------------- serving
 
+def _recovered_stale(runtime, entry: dict) -> bool:
+    """True when `entry` was a stale record (its owner host is gone) and it is cleared now."""
+    if entry.get("state") != "stale":
+        return False
+    try:
+        result = runtime.recover_lost(entry["profile"])
+    except Exception:                                  # a record that cannot be read or cleared stays: the update says a model is running
+        return False
+    return bool(result) and result.get("ok") is True and result.get("state") == "stopped"
+
+
 def serving_now() -> list[dict]:
     """Engines that are serving: managed instances of the owner runtime and anything holding the shared activity lease
     (`strata serve`, a runtime host). Empty when nothing is. The exclusive lease is only tried, never kept."""
@@ -346,6 +357,10 @@ def serving_now() -> list[dict]:
         managed = runtime.active_managed_instances()
     except (profiles.ProfileError, OSError):
         managed = []
+    # #3977 / #6239: a record whose owner host is gone ("stale": the app was closed or crashed with a model loaded) is not an engine that serves.
+    # It is recovered the way `strata runtime stop` does (only what Strata recorded, each process re-checked); only a record that cannot be
+    # cleared stays in the answer. A record whose host is alive again is left as it is.
+    managed = [entry for entry in managed if not _recovered_stale(runtime, entry)]
     if managed:
         return managed
     try:

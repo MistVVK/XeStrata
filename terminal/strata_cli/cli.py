@@ -1197,6 +1197,22 @@ def _bench(a: argparse.Namespace) -> int:
         return _success({"summary": result}, machine=machine,
                         human=bench.format_summary(result))
     if a.bench_command == "compare":
+        from strata_cli import bench_standard
+        # #4325: the default run writes the standard report, which `bench.load` does not read. Two standard reports are compared here; one of each kind is said plainly.
+        base_std, cand_std = bench_standard.load_if_standard(Path(a.baseline)), bench_standard.load_if_standard(Path(a.candidate))
+        if (base_std is None) != (cand_std is None):
+            raise ProfileError("cannot compare a standard benchmark result with a serving-suite result: give two results of the same kind", 5)
+        if base_std is not None:
+            result = bench_standard.compare(base_std, cand_std)
+            if a.output == "markdown":
+                rendered = bench_standard.markdown_comparison(result)
+                if a.out:
+                    bench.write_markdown(Path(a.out), rendered)
+                    print(f"Markdown comparison: {Path(a.out).resolve()}")
+                else:
+                    print(rendered, end="")
+                return 0
+            return _success({"comparison": result}, machine=machine, human=bench_standard.format_comparison(result))
         result = bench.compare(bench.load(Path(a.baseline)), bench.load(Path(a.candidate)))
         if a.output == "markdown":
             rendered = bench.markdown_comparison(result)
