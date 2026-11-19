@@ -917,7 +917,17 @@ def _close_verdict(after: str, final: bool) -> str:
         tail = after[len(FUNC_END):].lstrip() if after.startswith(FUNC_END) else after
         if not final and CALL_END.startswith(tail):
             return "hold"                                  # #5040: `</tool_call>` is still arriving: a streamed view must not end the value yet
-        return "end"                                       # the call is cut, or it has no wrapper: as before
+        if not after.startswith(FUNC_END) or tail.startswith((CALL_START, FUNC_START)):
+            return "end"                                   # the call is cut, or the next call follows without this one's `</tool_call>`
+        if not final and (CALL_START.startswith(tail) or FUNC_START.startswith(tail)):
+            return "hold"                                  # that next opener is still arriving
+        # A file in a value (an XML file, a test of a parser) can have `</parameter>` and then `</function>` on the next line, and then
+        # its own next element: the wrapped call goes on, so the sequence is part of the value when closing tags follow later (#4701's rule)
+        if PARAM_END in tail or FUNC_END in tail or CALL_END in tail:
+            return "continue"
+        if final or len(tail) > CLOSE_LOOKAHEAD_CHARS:
+            return "end"                                   # the call is cut, or its `</tool_call>` was left out before prose: as before
+        return "hold"
     rest = after[m.end():].lstrip()
     if not rest:
         return "end" if final else "hold"                  # the usual call: the turn ends right after it
