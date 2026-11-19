@@ -141,17 +141,17 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, size_t trunk_bytes)
     }
     const double slots = (double)((max_ctx + 8 + 15) / 16 * 16);
     const double kv_dev = 12.0 * slots * 2176.0 / GB + 12.0 * (double)max_ctx * 512.0 / GB + 12.0 * (double)(max_ctx / 4 + 8) * 256.0 / GB + 1.06;  // sparse KV + ivg + pooled + wk_b/wv_b
-    const double small = chunk * 1.5e6 / GB + 0.4 + 30.0 * (512.0 + chunk) * 2176.0 / GB;                                                         // chunk buffers + engram/misc + SWA rings
+    const double work_gb = chunk * 1.5e6 / GB + 0.4 + 30.0 * (512.0 + chunk) * 2176.0 / GB;                                                         // chunk buffers + engram/misc + SWA rings
     bool kv_host = kv_dev > 0.15 * tot;
     if (getenv("HY4_KV_HOST")) kv_host = atoi(getenv("HY4_KV_HOST")) != 0;
     else hy4_setenv("HY4_KV_HOST", kv_host ? "1" : "0", 1);
     if (!getenv("HY4_RESERVE_GB")) {
-        double reserve = small + (kv_host ? 0.0 : kv_dev) + (tot >= 10.0 ? 1.45 : 0.0);  // + the prefill streaming scratch on cards that have room
+        double reserve = work_gb + (kv_host ? 0.0 : kv_dev) + (tot >= 10.0 ? 1.45 : 0.0);  // + the prefill streaming scratch on cards that have room
         char b[32];
         snprintf(b, sizeof b, "%.2f", reserve);
         hy4_setenv("HY4_RESERVE_GB", b, 1);
     }
-    fprintf(stderr, "[plan] ctx %d chunk %d: working buffers ~%.2f GB, sparse KV + IndexPool + kv_b copies ~%.2f GB -> %s; reserve %s GB (card %.1f GB, trunk %.2f GB)\n", max_ctx, chunk, small, kv_dev,
+    fprintf(stderr, "[plan] ctx %d chunk %d: working buffers ~%.2f GB, sparse KV + IndexPool + kv_b copies ~%.2f GB -> %s; reserve %s GB (card %.1f GB, trunk %.2f GB)\n", max_ctx, chunk, work_gb, kv_dev,
             kv_host ? "pinned host memory" : "VRAM", getenv("HY4_RESERVE_GB"), tot, trunk_bytes / GB);
     return chunk;
 }
