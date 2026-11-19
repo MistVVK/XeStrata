@@ -132,7 +132,7 @@ class Catalog(unittest.TestCase):
         self.assertFalse(setup.unsloth_budget("UD-IQ1_M", 64))
         self.assertTrue(setup.unsloth_budget("UD-IQ4_XS-v31", 64))
         self.assertFalse(setup.unsloth_budget("UD-IQ4_XS-v31", 96))
-        self.assertEqual(setup.resident_budget_gib("UD-IQ3_XXS", 63.7), 40)
+        self.assertEqual(setup.resident_budget_gib("UD-IQ3_XXS", 63.7), 46)       # 47 less than its 50.3 GB of experts (46.8 GiB)
         self.assertEqual(setup.resident_budget_gib("UD-IQ1_M", 96), 32)            # at most all of them (34.8 GB = 32.4 GiB)
         self.assertAlmostEqual(setup.unsloth_split_need_gb("UD-Q3_K_XL"), 89.5 + setup.UNSLOTH_RAM_LEFT_GB)
 

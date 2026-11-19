@@ -135,6 +135,53 @@ class SetupRerun(unittest.TestCase):
         self.assertNotIn("user_args", cfg)
 
 
+class BudgetRerun(unittest.TestCase):
+    """0.2.17: the RAM budget rule is the RAM less 17 GB (64 GB: 47, was 40).  A budget setup wrote moves with the rule when setup runs
+    again; one the person set (user_args, or a hand edit of args) stays."""
+
+    def setUp(self):
+        self.ram, self.found = PROFILES["64GB-1x32GB"]
+
+    def run_setup(self, *extra, configs=()):
+        return install(self.ram, self.found, ["--family", "unsloth", "--model", "UD-Q4_K_XL", "--no-start", "--context", "8192", *extra], configs=configs)
+
+    def with_budget(self, args, gib):
+        args = [*args]
+        args[args.index("--resident-budget-gib") + 1] = str(gib)
+        return args
+
+    def first(self):
+        code, out, first, _ = self.run_setup()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(value(first["args"], "--resident-budget-gib"), "47")             # a 64 GB PC: the RAM less 17
+        return first
+
+    def test_a_budget_setup_wrote_in_0216_moves_to_47(self):
+        first = self.first()
+        written = self.with_budget(first["args"], 40)                                       # what 0.2.16 wrote, and its copy of what it wrote
+        code, out, cfg, _ = self.run_setup(configs=[("strata-unsloth-ud-q4_k_xl.json", {**first, "args": written, "args_written": written})])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(value(cfg["args"], "--resident-budget-gib"), "47")
+        self.assertNotIn("user_args", cfg)
+
+    def test_a_budget_the_person_saved_wins(self):
+        first = self.first()
+        written = self.with_budget(first["args"], 40)
+        name = "strata-unsloth-ud-q4_k_xl.json"
+        mine = ["--resident-budget-gib", "36"]
+        for old in ({**first, "args": self.with_budget(first["args"], 36), "args_written": written, "user_args": mine},   # in user_args
+                    {**first, "args": self.with_budget(first["args"], 36), "args_written": written},                       # a hand edit of args
+                    {**first, "args": self.with_budget(first["args"], 40), "args_written": written, "user_args": mine}):   # user_args over a stale args
+            code, out, cfg, _ = self.run_setup(configs=[(name, old)])
+            self.assertEqual(code, 0, out)
+            self.assertEqual(value(cfg["args"], "--resident-budget-gib"), "36")
+            self.assertEqual(value(cfg["user_args"], "--resident-budget-gib"), "36")
+
+    def test_a_unified_memory_pc_keeps_its_rule(self):
+        # the 24 stays where the GPU's cache and the budget share the RAM (and for a layer split): setup.resident_budget_gib(uma=True)
+        self.assertEqual(setup.resident_budget_gib("UD-Q4_K_XL", self.ram, uma=True), 40)
+
+
 class Start(unittest.TestCase):
     def test_every_start_puts_the_persons_options_over_the_generated_ones(self):
         cfg = {"args": ["--pack", "/p", "--vram-reserve-mib", "1536", "--spec", "4"],

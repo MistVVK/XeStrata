@@ -23,7 +23,7 @@ strata launch --family nvfp4 --model NVFP4
 
 All three read pictures through the original model's picture reader file that setup downloads with them
 ([Images](#images)). The other sections of this page apply to all three unless they say otherwise. Setup runs a pack in
-the RAM-budget mode (`--resident-budget-gib`, the RAM less 24 GB, as for Unsloth's files) when the RAM is below the 68 GB
+the RAM-budget mode (`--resident-budget-gib`, the RAM less 17 GB, as for Unsloth's files) when the RAM is below the 68 GB
 of experts plus room.
 
 ## Getting a model by hand
