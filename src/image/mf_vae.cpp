@@ -1683,22 +1683,32 @@ void MfVae::video_reset() {
     }
 }
 
-// the encoder's (0) or the decoder's (1) turn: with the host cache, the other side's carried frames leave the GPU (back
-// to their tiles' host copies, unless its last call said none reads them)
-void MfVae::v_enter(int side) {
-    vside_ = side;
-    vkept_[side] = vkeep_;
-    auto& other = vdev_[1 - side];
-    if (!vhost_ || other.empty()) return;
-    for (auto& [c, d] : other)
+// with the host cache, a side's carried frames on the GPU leave it (back to their tiles' host copies, unless its last
+// call said none reads them)
+void MfVae::v_leave(int side) {
+    auto& dev = vdev_[side];
+    if (!vhost_ || dev.empty()) return;
+    for (auto& [c, d] : dev)
         if (d.owner >= 0) {
-            VCache& o = vcache_[1 - side][VKey{c, d.owner}];
-            if (vkept_[1 - side]) gpu::copy_async(o.buf, d.buf, (size_t) (o.m * o.frame) * 2, s_);
+            VCache& o = vcache_[side][VKey{c, d.owner}];
+            if (vkept_[side]) gpu::copy_async(o.buf, d.buf, (size_t) (o.m * o.frame) * 2, s_);
             else o.n = 0;
         }
     gpu::stream_sync(s_);
-    for (auto& [c, d] : other) release(allocs_, d.buf);
-    other.clear();
+    for (auto& [c, d] : dev) release(allocs_, d.buf);
+    dev.clear();
+}
+
+// the encoder's (0) or the decoder's (1) turn: the other side's carried frames leave the GPU
+void MfVae::v_enter(int side) {
+    vside_ = side;
+    vkept_[side] = vkeep_;
+    v_leave(1 - side);
+}
+
+void MfVae::video_park() {
+    v_leave(0);
+    v_leave(1);
 }
 
 void MfVae::set_video_host_cache(bool on) {

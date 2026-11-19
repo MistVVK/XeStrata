@@ -121,6 +121,10 @@ public:
     /// frames do not fit the GPU together.  Set between clips (it forgets what the slices left).
     void set_video_host_cache(bool on);
     bool video_host_cache() const { return vhost_; }
+    /// With the host cache: the GPU's copies of the last tiles' carried frames (both sides') back to their host copies
+    /// and their memory let go, for another part's turn (the copy back the next call would make anyway: nothing more
+    /// is copied while there are several tiles).
+    void video_park();
     /// Whether the slices after this call read what it leaves (true until the clip's last call): false spares the
     /// host cache's copies back of the tiles' carried frames, which no slice reads again.
     void set_video_keep(bool keep) { vkeep_ = keep; }
@@ -265,6 +269,7 @@ private:
     void v_attention(const Attn& a, uint16_t* x, int64_t T, int64_t H, int64_t W);
     void v_grow(int64_t values, int64_t head, int64_t frame);
     void v_others(const uint16_t* x, uint16_t*& a, uint16_t*& b) const;
+    void v_leave(int side);
     void v_enter(int side);
     bool finite(const float* x, int64_t n);
     int64_t v_encode_tiled(const float* rgb, int64_t T, int64_t h, int64_t w, bool first, float* z, int64_t tt);
