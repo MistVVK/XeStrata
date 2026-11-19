@@ -15941,13 +15941,14 @@ int main(int argc, char** argv) {
             // STRATA_SLOT_READ: the slot reads the next turn of its conversation in its own windows (rd_on, until the
             // reply's first token).  `rd`: the prompt tokens still to feed after `x` (from rd_at); w_rd: how many of them
             // its next window holds behind `x`, and w_rd_x: how many more it takes of the rows the group's other slots
-            // leave (STRATA_SLOT_READ_WIDE); rd_ck: the turn boundary whose checkpoint the read still takes (-1:
-            // none); rd_n, rd_w, rd_t0, rd_ms: what it read, in how many windows, since when, and how long it took
-            // (BDONE's read=).
+            // leave (STRATA_SLOT_READ_WIDE); fly: the rows of its read that are in flight (STRATA_SLOT_READ_AHEAD: its
+            // next window goes on behind them, before their verdict; 0 otherwise); rd_ck: the turn boundary whose
+            // checkpoint the read still takes (-1: none); rd_n, rd_w, rd_t0, rd_ms: what it read, in how many windows,
+            // since when, and how long it took (BDONE's read=).
             std::vector<int32_t> rd;
             size_t rd_at = 0;
             bool rd_on = false;
-            int w_rd = 0, w_rd_x = 0;
+            int w_rd = 0, w_rd_x = 0, fly = 0;
             int64_t rd_ck = -1, rd_n = 0, rd_w = 0;
             bool rd_ck_due = false;        ///< its read is at rd_ck: the checkpoint is taken once nothing is in flight
             Clock::time_point rd_t0;
@@ -16651,12 +16652,24 @@ int main(int argc, char** argv) {
             return e != nullptr && e[0] != '\0' ? std::max<int64_t>(1, (int64_t) std::atoll(e)) : (int64_t) 1024;
         }();
         const bool slot_read_wide = slot_read && pm_read_wide && pmtp_group_cap > pmtp_rows_per_slot;
+        // STRATA_SLOT_READ_AHEAD (opt-in, #5868, with STRATA_SLOT_READ and STRATA_SLOT_READ_WIDE; unset or =0: off; the PR
+        // had it on with the wide read): a slot that reads its turn alone in its group
+        // while another group stands idle sends its next whole window through that group's rows before its last one
+        // has passed the stages.  A decode window waits for its verdict; prompt rows are known and all kept, so each
+        // stage commits such a window as it launches it and the slot's state there is the next window's start.  A
+        // slot that reads alone otherwise has one window in the pipeline and every stage idle half the time.
+        const bool slot_read_ahead = slot_read_wide && [] {
+            const char* e = std::getenv("STRATA_SLOT_READ_AHEAD");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
         if (slot_read)
             std::fprintf(stderr, "strata generate: STRATA_SLOT_READ: an idle slot reads the next turn of the conversation it "
                                  "holds in its own windows, %d tokens a window%s, beside the other slots (turns of up to %lld "
                                  "new tokens, where the server asks: slot_read=1)\n", pmtp_rows_per_slot,
                          slot_read_wide ? (" and " + std::to_string(pmtp_group_cap) + " while it is the only slot of its group "
-                                           "that runs (STRATA_SLOT_READ_WIDE)").c_str() : "",
+                                           "that runs (STRATA_SLOT_READ_WIDE)" +
+                                           (slot_read_ahead ? ", a window ahead through a group that stands idle "
+                                                              "(STRATA_SLOT_READ_AHEAD)" : "")).c_str() : "",
                          (long long) slot_read_max);
         if (GS > strata::kernels::kVerifyMaxT && !batch_mtp) {   // (slots_in_windows keeps it so: a group's window is
             // PGroup's rows, and the serial windows reach only the first kVerifyMaxT slots)
@@ -16675,9 +16688,11 @@ int main(int argc, char** argv) {
             int active = 0;                  ///< live slots at launch; S can also include idle padding rows
             Clock::time_point started;       ///< the group window's first stage launch
             // STRATA_PIPED_MTP (pmtp): S counts ROWS - each of the group's slots' token, then that slot's proposals - at
-            // hand-off rows [hbase, hbase + S)
+            // hand-off rows [hbase, hbase + S).  forced: prompt rows only (STRATA_SLOT_READ_AHEAD), committed by every
+            // stage as it launches them; such a window may carry another group's slot (rows[] says whose rows they are)
             int rows[strata::kernels::kVerifyMaxT] = {};
             int hbase = 0;
+            bool forced = false;
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
@@ -16702,6 +16717,7 @@ int main(int argc, char** argv) {
         // STRATA_PIPED_MTP: a slot whose next proposals are drafting (its chain in flight on the drafter's stream), and
         // per slot the event after the copy of its rows on the last stage's stream, which the chain waits for
         std::vector<char> pm_drafting(bs.size(), 0);
+        std::vector<int> pm_all_kept(bs.size(), 0);   // (STRATA_SLOT_READ_AHEAD: a forced window's rows per slot, for its commits)
         std::vector<cudaEvent_t> pm_copied(pmtp ? bs.size() : 0, nullptr);
         if (pmtp) {
             const strata::core::OnDevice on_last(stage_verifier(n_pipe - 1).device());
@@ -16751,7 +16767,8 @@ int main(int argc, char** argv) {
         strata::spec::DraftPolicy bpolicy(std::max(2, pmtp_rows_per_slot));
         bpolicy.set_robust(true);   // (a round that waited for something else counts little, it does not price a size out)
         int64_t bt_lk_windows = 0, bt_lk_drafts = 0, bt_lk_ok = 0;
-        int64_t bt_rd_rows = 0, bt_rd_turns = 0;   // STRATA_SLOT_READ: prompt rows the slots read themselves, turns read
+        // STRATA_SLOT_READ: prompt rows the slots read themselves, turns read, windows sent ahead through an idle group
+        int64_t bt_rd_rows = 0, bt_rd_turns = 0, bt_rd_ahead = 0;
         int rd_ck_pending = 0;                      // ... and slots whose read stands at its turn boundary (rd_ck_due)
         // The drafts of slot b's next window (sl.w_n, sl.w_lk).  1: decided; 0: its chain is still drafting and the
         // lookup has nothing better, so another group goes first; -1: an error.
@@ -16763,12 +16780,17 @@ int main(int argc, char** argv) {
                 // checkpoint is still to take (a window ends there), and with a penalty the last prompt token alone
                 // (its row draws the reply's first token: the rows before it must not join its penalty window, #4590)
                 if (pmtp_poll_draft(b, false) < 0) return -1;   // (the catch-up behind its last window: collected, not used)
-                const int64_t left = (int64_t) sl.rd.size() - (int64_t) sl.rd_at;
-                // (cap: the rows a window may hold for this slot, `x` included)
+                // (STRATA_SLOT_READ_AHEAD: its next window starts behind the rows of its read that are in flight)
+                const int64_t p1 = sl.p + sl.fly;
+                const int64_t left = (int64_t) sl.rd.size() - (int64_t) sl.rd_at - sl.fly;
+                // nothing to start while windows in flight hold every row, end at the turn boundary whose checkpoint is
+                // still to take, or it was stopped (what is in flight lands first)
+                if (sl.fly > 0 && (left < 0 || sl.stop || (sl.rd_ck >= 0 && p1 >= sl.rd_ck))) return 0;
+                // (cap: the rows a window may hold for this slot, its first one included)
                 auto rd_rows = [&](int cap) -> int {
-                    int64_t f = std::min<int64_t>((int64_t) cap - 1, std::min<int64_t>(left, (int64_t) o.max_context - sl.p - 2));
+                    int64_t f = std::min<int64_t>((int64_t) cap - 1, std::min<int64_t>(left, (int64_t) o.max_context - p1 - 2));
                     if (sl.pen_n > 0) f = std::min<int64_t>(f, left - 1);
-                    if (sl.rd_ck > sl.p) f = std::min<int64_t>(f, sl.rd_ck - sl.p - 1);
+                    if (sl.rd_ck > p1) f = std::min<int64_t>(f, sl.rd_ck - p1 - 1);
                     return (int) std::max<int64_t>(0, f);
                 };
                 sl.w_rd = sl.stop ? 0 : rd_rows(pmtp_rows_per_slot);
@@ -16915,7 +16937,8 @@ int main(int argc, char** argv) {
                     return false;
                 }
             }
-            for (int k = 0; k < n_pipe; ++k)
+            // (STRATA_SLOT_READ_AHEAD: a window of prompt rows was committed by every stage as it launched it)
+            for (int k = 0; k < n_pipe && !G.forced; ++k)
                 if (!stage_verifier(k).batch_commit_rows(G.rows, G.S, G.hbase, keep.data(), G.tok, G.pos, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
@@ -16925,11 +16948,13 @@ int main(int argc, char** argv) {
                 if (vk.nonfinite_in(t)) {
                     const int b = G.rows[t];
                     BSlot& sl = bs[(size_t) b];
+                    if (G.forced && !sl.active) continue;   // (a window of its read still in flight when it ended)
                     std::fprintf(stderr, "strata batch: non-finite logits (#879) in slot %d at position %lld: it ends (BDONE "
                                          "nonfinite) and the next request reads its prompt from token 0\n", b, (long long) sl.p);
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                     std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
                     sl.active = false;
+                    sl.fly = 0;
                     sl.cached = false;
                     sl.draft_ready = false;
                     sl.checks.clear();
@@ -16956,6 +16981,7 @@ int main(int argc, char** argv) {
                     for (int j = 0; j < blk.keep; ++j) sl.ids.push_back(G.tok[blk.f + j]);
                     sl.p += blk.keep;
                     sl.rd_at += (size_t) (blk.keep - 1);
+                    if (G.forced) sl.fly -= blk.keep;
                     bt_rd_rows += blk.keep;
                     ++sl.rd_w;
                     if (sl.rd_ck >= 0 && sl.p == sl.rd_ck) {   // (taken by pump once the pipeline is empty: see there)
@@ -16965,7 +16991,7 @@ int main(int argc, char** argv) {
                     const bool more = sl.rd_at < sl.rd.size();
                     const int32_t y = outb[blk.f + blk.keep - 1];
                     blk.nx = more ? sl.rd[sl.rd_at] : y;
-                    if (more && sl.stop) {   // stopped while it read: what it read stays the slot's
+                    if (more && sl.stop && sl.fly == 0) {   // stopped while it read: what it read stays the slot's
                         sl.rd_on = false;
                         ends("cancel");
                         continue;
@@ -17218,20 +17244,63 @@ int main(int argc, char** argv) {
                         }
                         pick = gi;
                     }
+                    // STRATA_SLOT_READ_AHEAD: nothing to start and a group stands idle - a slot that reads its turn
+                    // alone in its group, its last window still on its way through the stages, sends its next whole
+                    // window through the idle group's rows (only a whole one: one more layout of rows a slot)
+                    int ahead_b = -1;
+                    if (pick < 0 && slot_read_ahead) {
+                        int idle = -1;
+                        for (int gi = 0; gi < (int) pg.size() && idle < 0; ++gi)
+                            if (!pg[(size_t) gi].inflight && !group_active(gi)) idle = gi;
+                        for (int gi = 0; gi < (int) pg.size() && idle >= 0 && ahead_b < 0; ++gi) {
+                            if (!pg[(size_t) gi].inflight || !pg[(size_t) gi].forced) continue;
+                            int n_active = 0, b = -1;
+                            for (int t = 0; t < GS; ++t)
+                                if (bs[(size_t) (gi * GS + t)].active) {
+                                    ++n_active;
+                                    b = gi * GS + t;
+                                }
+                            if (n_active != 1 || !bs[(size_t) b].rd_on) continue;
+                            const int dr = pmtp_plan(b);
+                            if (dr < 0) return false;
+                            if (dr == 1 && 1 + bs[(size_t) b].w_rd + bs[(size_t) b].w_rd_x == pmtp_group_cap) {
+                                ahead_b = b;
+                                pick = idle;
+                            }
+                        }
+                    }
                     if (pick < 0) continue;
-                    rr = pick + 1;
+                    if (ahead_b < 0) rr = pick + 1;
                     PGroup& G = pg[(size_t) pick];
                     G.S = 0;
                     if (pmtp) {   // the group's slots: each its token, then its own proposals - as many as could be emitted
                         G.hbase = pmtp_group_cap * pick;
                         G.S = 0;
                         G.active = 0;
+                        G.forced = false;
+                        // a reading slot's rows: `x` and the prompt tokens behind it - or, with rows of its read in
+                        // flight (STRATA_SLOT_READ_AHEAD), the ones behind those
+                        auto read_rows = [&](int b, int n_rd) {
+                            const BSlot& sl = bs[(size_t) b];
+                            for (int j = 0; j <= n_rd; ++j) {
+                                const int64_t i = (int64_t) sl.fly + j;   // the row's place behind `x`
+                                G.rows[G.S] = b;
+                                G.tok[G.S] = i == 0 ? sl.x : sl.rd[sl.rd_at + (size_t) (i - 1)];
+                                G.pos[G.S] = sl.p + i;
+                                ++G.S;
+                            }
+                        };
+                        if (ahead_b >= 0) {
+                            G.active = 1;
+                            read_rows(ahead_b, bs[(size_t) ahead_b].w_rd + bs[(size_t) ahead_b].w_rd_x);
+                            ++bt_rd_ahead;
+                        }
                         // STRATA_SLOT_READ_WIDE: the one slot of the group that runs, reading its turn with a whole
                         // window's worth still to read, takes the whole window.  Only the whole one: every layout of
                         // rows is a set of graphs on each stage (20-30 MiB of VRAM), so a read adds one layout a slot
                         // to the ones its drafts already use, not one for every size in between.
                         int wide_b = -1;
-                        if (slot_read_wide) {
+                        if (slot_read_wide && ahead_b < 0) {
                             int n_active = 0, last = -1;
                             for (int t = 0; t < GS; ++t)
                                 if (bs[(size_t) (pick * GS + t)].active) {
@@ -17242,25 +17311,19 @@ int main(int argc, char** argv) {
                                 1 + bs[(size_t) last].w_rd + bs[(size_t) last].w_rd_x == pmtp_group_cap)
                                 wide_b = last;
                         }
-                        for (int t = 0; t < GS; ++t) {
+                        for (int t = 0; t < GS && ahead_b < 0; ++t) {
                             const int b = pick * GS + t;
                             const BSlot& sl = bs[(size_t) b];
                             if (!sl.active) continue;   // an idle slot carries no row (its state is left untouched)
                             ++G.active;
+                            if (sl.rd_on) {   // STRATA_SLOT_READ: the next prompt tokens of its turn, as pmtp_plan counted
+                                read_rows(b, sl.w_rd + (b == wide_b ? sl.w_rd_x : 0));
+                                continue;
+                            }
                             G.rows[G.S] = b;
                             G.tok[G.S] = sl.x;
                             G.pos[G.S] = sl.p;
                             ++G.S;
-                            if (sl.rd_on) {   // STRATA_SLOT_READ: the next prompt tokens of its turn, as pmtp_plan counted
-                                const int n_rd = sl.w_rd + (b == wide_b ? sl.w_rd_x : 0);
-                                for (int j = 0; j < n_rd; ++j) {
-                                    G.rows[G.S] = b;
-                                    G.tok[G.S] = sl.rd[sl.rd_at + (size_t) j];
-                                    G.pos[G.S] = sl.p + 1 + j;
-                                    ++G.S;
-                                }
-                                continue;
-                            }
                             // its drafts, as pmtp_plan decided them just above: the lookup's or the draft layer's
                             const int nd = sl.stop ? 0 : (int) std::max<int64_t>(0, std::min<int64_t>(
                                 sl.w_n, std::min<int64_t>(strata::core::slot_cap(sl.max_new, sl.hold) - sl.produced - 1,
@@ -17273,6 +17336,13 @@ int main(int argc, char** argv) {
                             }
                         }
                         if (G.S == 0) { G.inflight = false; continue; }   // every slot of the group went idle
+                        // STRATA_SLOT_READ_AHEAD: prompt rows only - kept whole whatever the last stage picks: every
+                        // stage commits the window behind its launch (below), and its rows are in flight for their slots
+                        if (slot_read_ahead) {
+                            G.forced = true;
+                            for (int t = 0; t < G.S; ++t) G.forced = G.forced && bs[(size_t) G.rows[t]].rd_on;
+                            for (int t = 0; t < G.S && G.forced; ++t) ++bs[(size_t) G.rows[t]].fly;
+                        }
                     } else {
                         G.active = 0;
                         for (int t = 0; t < GS; ++t) if (bs[(size_t) (pick * GS + t)].active) {
@@ -17318,6 +17388,14 @@ int main(int argc, char** argv) {
                            : stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
+                }
+                if (pmtp && G.forced) {   // STRATA_SLOT_READ_AHEAD: prompt rows, all kept - this stage's commit follows its window
+                    std::fill(pm_all_kept.begin(), pm_all_kept.end(), 0);
+                    for (int t = 0; t < G.S; ++t) ++pm_all_kept[(size_t) G.rows[t]];
+                    if (!stage_verifier(k).batch_commit_rows(G.rows, G.S, G.hbase, pm_all_kept.data(), G.tok, G.pos, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return false;
+                    }
                 }
                 p4.launched(k, pick, p4_l0);
                 stage_group[(size_t) k] = pick;
@@ -17389,8 +17467,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, " (lookup: %lld windows, %lld of %lld drafts kept)", (long long) bt_lk_windows,
                                  (long long) bt_lk_ok, (long long) bt_lk_drafts);
                 if (bt_rd_rows > 0)
-                    std::fprintf(stderr, " (read in the slots: %lld prompt tokens, %lld turns)", (long long) bt_rd_rows,
-                                 (long long) bt_rd_turns);
+                    std::fprintf(stderr, " (read in the slots: %lld prompt tokens, %lld turns, %lld windows ahead)",
+                                 (long long) bt_rd_rows, (long long) bt_rd_turns, (long long) bt_rd_ahead);
                 std::fprintf(stderr, "\n");
                 p4.flush();
                 pa_rounds = pa_swaps = 0;
@@ -17401,7 +17479,7 @@ int main(int argc, char** argv) {
                 }
                 bt_windows = bt_rows = bt_tokens = bt_accepted = 0;
                 bt_lk_windows = bt_lk_drafts = bt_lk_ok = 0;
-                bt_rd_rows = bt_rd_turns = 0;
+                bt_rd_rows = bt_rd_turns = bt_rd_ahead = 0;
                 // (not while a prompt is read in a request: its windows ran beside it, and the watchdog stays on for
                 // the rest of the read, STRATA_PIPED_CONCURRENT; the request's end turns it off)
                 if (!in_prompt_read) strata::core::progress().busy.store(false);
