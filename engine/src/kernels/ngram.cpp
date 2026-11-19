@@ -27,6 +27,10 @@
 #include <vector>
 #include <stdexcept>
 
+#if defined(__AVX__) && !defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #if defined(_WIN32)
 // `PrefetchVirtualMemory` (memoryapi.h, Windows 8+) is the whole point of the change in `gather` below.
 #define WIN32_LEAN_AND_MEAN
@@ -139,11 +143,29 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
         std::memcpy(&dbits, blk, 2);
         const float d = f32_from_f16(dbits);
         const uint8_t* qs = blk + 2;
+        // The halves use the same scalar multiply order, including signed zero and non-finite scales.
+#if defined(__AVX__) && !defined(__AVX2__)
+        const __m128i table = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4Nl));
+        const __m128i mask = _mm_set1_epi8(15);
+        const __m128i codes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
+        __m128i lo = _mm_shuffle_epi8(table, _mm_and_si128(codes, mask));
+        __m128i hi = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(codes, 4), mask));
+        const __m128 scale = _mm_set1_ps(d);
+        for (int j = 0; j < 16; j += 4) {
+            _mm_storeu_ps(out160 + b * 32 + j,
+                          _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_cvtepi8_epi32(lo))));
+            _mm_storeu_ps(out160 + b * 32 + j + 16,
+                          _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_cvtepi8_epi32(hi))));
+            lo = _mm_srli_si128(lo, 4);
+            hi = _mm_srli_si128(hi, 4);
+        }
+#else
         // SPLIT HALVES: qs[j] holds elements j and j+16, not 2j and 2j+1.
         for (int j = 0; j < 16; ++j) {
             out160[b * 32 + j] = d * (float) kIq4Nl[qs[j] & 0x0F];
             out160[b * 32 + j + 16] = d * (float) kIq4Nl[qs[j] >> 4];
         }
+#endif
     }
 }
 

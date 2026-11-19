@@ -99,6 +99,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
+  if(STRATA_ISA_FLOOR STREQUAL "avx")
+    if(MSVC)
+      set_source_files_properties(src/kernels/ngram.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
+    else()
+      set_source_files_properties(src/kernels/ngram.cpp PROPERTIES
+                                  COMPILE_OPTIONS "-mavx;-mno-avx2;-mno-fma;-mno-f16c")
+    endif()
+  endif()
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
   # also available where the published source omits tests/.
