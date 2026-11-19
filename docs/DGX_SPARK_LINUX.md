@@ -116,6 +116,15 @@ On a GB10 the engine switches on six settings that were measured here, and print
 | `STRATA_SIDE_MIXER=2` | input-only QSA/GDN work on branches of the verify graph | fixed-work IQ3_S decode +6.7% (30 October) |
 | `STRATA_SPEC_COST=1` | the draft window follows what a draft costs | decode +4.7% |
 
+Two more settings of the 12.0 cards' set are on for a GB10 after 0.2.16, in the engine's own kernel rules (they are not in the printed list):
+`STRATA_ATTN_DAILY=1` (the decode attention of the verify windows) and `STRATA_GR_DOWN_TG=2` (the hyper-connection down read, two tokens a block row; the
+GB10 has 48 SMs). Both give the same bits as the kernels they replace (IQ3_S, six prompts, first-token logits and generated tokens equal to the old
+path's, and the same under the BASE-05 token baseline). IQ3_S with the DFlash2 drafter, three paired rounds on a rented Spark, decode tokens/s against
+the old default (chat / code / JSON / agent turn): `STRATA_ATTN_DAILY` +0.3 / +0.9 / +0.7 / +1.2%, `STRATA_GR_DOWN_TG` -0.1 / +0.7 / +1.1 / +0.9%
+(JSON and agent turns faster in 3 of 3 pairs for both). The other switches of the 12.0 set (`STRATA_GU_SWIGLU`, `STRATA_GR_UP75`, `STRATA_GR_UP_WIDE`,
+`STRATA_SMALL_UNR`, `STRATA_DF_PDL`, and the load ordering `STRATA_GR_V3_PF`) measured level or slower on this part and stay off here; setting one
+yourself still works. `STRATA_SM121_PERF=0` (or `STRATA_DEFAULTS=026`) turns the two new ones off with the rest of the GB10 set.
+
 **What the first three switches do to the answers.** The fused prompt path and the FP4 activations round differently from the paths they replace,
 and the other three do not touch the text (the fused hyper-connection read gives bit-identical logits; the side mixer changes only graph scheduling;
 the cost-aware window only chooses

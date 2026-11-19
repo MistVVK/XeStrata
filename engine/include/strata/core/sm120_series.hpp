@@ -91,9 +91,9 @@ inline bool sm12x_default(int major, int minor, bool gb10_measured) { return sm1
 ///   STRATA_GR_V3 (another summation order, KL-gated; text changes) and STRATA_GR_V3_PF (E15, acts only with GR_V3): mixed, E15 itself level (v3 with / without PF
 ///   chat +1.0 %, code -0.9 %, json -0.4 %, agent -0.5 %)   -> stay off
 constexpr bool kGb10GuSwiglu = false;     ///< STRATA_GU_SWIGLU
-constexpr bool kGb10AttnDaily = false;    ///< STRATA_ATTN_DAILY
+constexpr bool kGb10AttnDaily = true;     ///< STRATA_ATTN_DAILY
 constexpr bool kGb10GrUp75 = false;       ///< STRATA_GR_UP75
-constexpr bool kGb10GrDownTg = false;     ///< STRATA_GR_DOWN_TG
+constexpr bool kGb10GrDownTg = true;      ///< STRATA_GR_DOWN_TG
 constexpr bool kGb10GrUpWide = false;     ///< STRATA_GR_UP_WIDE
 constexpr bool kGb10SmallUnr = false;     ///< STRATA_SMALL_UNR
 constexpr bool kGb10DfPdl = false;        ///< STRATA_DF_PDL
