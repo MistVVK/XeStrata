@@ -2492,8 +2492,9 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     for (const Exchange& x : staged_)
         if (x.in == i_in || x.q == q) return false;
     const uint64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer, out);
-    const uint64_t at = strata::kernels::cpu::expert_layout().mixed() ? replacement_offset(i_in, bytes)
-                                                                       : complement_offsets_[i_in];
+    // Rotation commits through its ownership table; only the copy path uses a complement offset.
+    const uint64_t at = exchange_storage_.active() ? 0 :
+        strata::kernels::cpu::expert_layout().mixed() ? replacement_offset(i_in, bytes) : complement_offsets_[i_in];
     if (at == kNoComplement) return false;
     override_[i_out] = exchange_buffer(q, layer);
     staged_.push_back({i_in, i_out, q, bytes, at});
