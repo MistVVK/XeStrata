@@ -444,7 +444,7 @@ The server listens on `http://127.0.0.1:8080` (`--port` in setup, or edit the ru
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
 | OpenAI Responses (stream and non-stream, tools; stateless, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses` |
-| Model list and health | `GET /v1/models`, `GET /models`, `GET /health` |
+| Model list and health | `GET /v1/models`, `GET /v1/models/{id}`, `GET /models`, `GET /health` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing now | `GET /status`, `GET /slots` (busy or idle, with `n_prompt_tokens`; one entry per slot with `--batch`) |
 | Save or restore the conversation to a file | `POST /slots/0?action=save\|restore` ([session files](#session-files-disk)) |

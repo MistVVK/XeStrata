@@ -62,7 +62,7 @@ from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator, Protocol
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, unquote
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -6931,7 +6931,7 @@ def make_handler(svc: Service):
                 for k in ("started", "first_token"):
                     s.pop(k, None)
                 self._json(200, s)
-            elif path in ("/v1/models", "/models"):
+            elif path in ("/v1/models", "/models") or path.startswith(("/v1/models/", "/models/")):
                 if self._authorized():
                     loaded = svc.loaded()
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
@@ -6948,7 +6948,18 @@ def make_handler(svc: Service):
                     if svc.images is not None:            # the image model: POST /v1/images/generations
                         data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
                                      "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
-                    self._json(200, {"object": "list", "data": data})
+                    if path in ("/v1/models", "/models"):
+                        self._json(200, {"object": "list", "data": data})
+                    else:                                 # #5460: GET /v1/models/{model_id} (OpenAI model retrieve)
+                        head = "/v1/models/" if path.startswith("/v1/models/") else "/models/"
+                        asked = unquote(path[len(head):])
+                        item = next((m for m in data if m["id"] == asked), None)
+                        if item is None:
+                            self._json(404, {"error": {"message": f"The model '{asked}' does not exist",
+                                                       "type": "invalid_request_error", "param": "model",
+                                                       "code": "model_not_found"}})
+                        else:
+                            self._json(200, item)
             elif path == "/props":
                 if self._authorized():
                     self._props()

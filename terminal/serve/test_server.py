@@ -5568,6 +5568,32 @@ class ModelAliases(unittest.TestCase):
         self.assertEqual(data[1]["alias_of"], "qwen3.8-flash-next-iq3_xxs")
         self.assertEqual(self.get("/props?model=local-model")["model_alias"], "qwen3.8-flash-next-iq3_xxs")
 
+    def test_model_retrieve_single_and_alias(self):
+        # #5460: GET /v1/models/{model_id} and GET /models/{model_id}
+        for prefix in ("/v1/models/", "/models/"):
+            m = self.get(prefix + "qwen3.8-flash-next-iq3_xxs")
+            self.assertEqual(m["id"], "qwen3.8-flash-next-iq3_xxs")
+            self.assertEqual(m["object"], "model")
+            self.assertEqual(m["status"]["value"], "loaded")
+
+            alias = self.get(prefix + "qwen")
+            self.assertEqual(alias["id"], "qwen")
+            self.assertEqual(alias["alias_of"], "qwen3.8-flash-next-iq3_xxs")
+
+    def test_model_retrieve_unknown_returns_404(self):
+        # #5460: unknown model returns OpenAI-style 404 with code model_not_found
+        for path in ("/v1/models/does-not-exist", "/models/does-not-exist"):
+            req = urllib.request.Request(self.base + path)
+            try:
+                urllib.request.urlopen(req)
+                self.fail(f"expected 404 on {path}")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 404)
+                err = json.loads(e.read().decode())["error"]
+                self.assertEqual(err["code"], "model_not_found")
+                self.assertEqual(err["param"], "model")
+                self.assertIn("does-not-exist", err["message"])
+
     def test_requests_are_answered_under_the_alias(self):
         msgs = [{"role": "user", "content": "hi"}]
         for asked, want in (("qwen", "qwen"), ("local-model", "local-model"),
