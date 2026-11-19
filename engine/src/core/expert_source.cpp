@@ -1036,7 +1036,17 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
 
 // ================================ THE FILE-BACKED SOURCE ================================
 
-FileExpertSource::~FileExpertSource() { close(); }
+FileExpertSource::~FileExpertSource() {
+#if defined(_WIN32)
+    // The per-thread verify handles close with their threads; nothing to close here on purpose
+    // (a destructor that touches many handles ran into an unrelated end-of-run crash once).
+    if (verify_on_.load(std::memory_order_relaxed))
+        std::fprintf(stderr, "strata nan879-verify: total blobs compared %llu, mismatches %llu, unstable channel reads %llu, mmap arbitrations %llu\n",
+                     (unsigned long long) verify_blob_n_.load(), (unsigned long long) verify_bad_n_.load(),
+                     (unsigned long long) verify_channel_n_.load(), (unsigned long long) verify_arb_n_.load());
+#endif
+    close();
+}
 
 #if defined(__linux__)
 namespace {
@@ -1832,6 +1842,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
     base_ = maps_.front().base;       // "opened"; mapped_blob answers nullptr in this mode
     warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
     for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
+    open_verify_handles();   // NAN879-LAB: no-op unless STRATA_BLOB_VERIFY=1
     return true;
 }
 
@@ -1839,7 +1850,10 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     if (!direct_.empty()) {   // #286: from the drive; a failed read falls back to the mapping below
         const Fill f{0, layer, expert, dst};
-        if (read_direct(&f, 1)) return true;
+        if (read_direct(&f, 1)) {
+            verify_blob(layer, expert, dst);   // NAN879-LAB: no-op unless STRATA_BLOB_VERIFY=1
+            return true;
+        }
         direct_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     }
 #if defined(__linux__)
@@ -1886,6 +1900,205 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     if (b == nullptr) return false;
     std::memcpy(dst, b, (size_t) layer_blob_bytes_[(size_t) layer]);
     return true;
+}
+
+// NAN879-LAB diagnostic (see expert_source.hpp).  Plain buffered reads of the very byte ranges
+// read_direct just delivered - an independent channel through the file cache.  The offsets are
+// the same arithmetic read_direct uses (role_ptr_[i] - m.base survives drop_mapping: the bases
+// stay only as numbers for the offsets).
+void FileExpertSource::open_verify_handles() {
+#if defined(_WIN32)
+    const char* v = std::getenv("STRATA_BLOB_VERIFY");
+    if (v == nullptr || v[0] == '\0' || v[0] == '0') return;
+    verify_on_.store(true, std::memory_order_relaxed);
+    const char* d = std::getenv("STRATA_BLOB_VERIFY_DELAY_SEC");
+    if (d != nullptr && *d != '\0') verify_delay_ms_ = (int64_t) atoi(d) * 1000;
+    verify_t0_ = std::chrono::steady_clock::now();
+    std::fprintf(stderr,
+                 "strata nan879-verify: ON (STRATA_BLOB_VERIFY=1): %zu shard file(s), per-thread synchronous handles; every read_direct blob is re-read and compared%s\n",
+                 paths_.size(),
+                 verify_delay_ms_ > 0 ? "; verification holds off for the startup fill (STRATA_BLOB_VERIFY_DELAY_SEC)" : "");
+#endif
+}
+
+void FileExpertSource::verify_blob(int64_t layer, int64_t expert, const uint8_t* dst) const {
+    if (!verify_on_.load(std::memory_order_relaxed)) return;
+    if (role_ptr_.empty() || expert < 0 || expert >= n_expert_ || layer < 0 || layer >= n_layers_) return;
+    if (verify_delay_ms_ > 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - verify_t0_).count() <
+            verify_delay_ms_)
+        return;   // still in the startup fill: verifying every blob there slows the load down for nothing
+#if defined(_WIN32)
+    // Every blob is read TWICE into separate buffers (zeroed first).  The two buffered reads must
+    // agree with each other: when they do not, the buffered channel itself is unreliable at this
+    // moment (counted, no verdict).  A MISMATCH is reported only when both buffered reads agree
+    // with each other and differ from what read_direct delivered - that cannot be our buffer.
+    thread_local std::vector<uint8_t> tmp, tmp2;
+    const uint64_t blob = layer_blob_bytes_[(size_t) layer];
+    verify_blob_n_.fetch_add(1, std::memory_order_relaxed);
+    uint64_t at = 0;
+    for (int r = 0; r < 3; ++r) {
+        const size_t i = (size_t) (3 * layer + r);
+        const size_t fi = (size_t) role_file_[i];
+        if (fi >= paths_.size()) return;   // not a mapped-GGUF pack
+        const uint64_t per = role_bytes_[i];
+        const uint64_t off = (uint64_t) (role_ptr_[i] - maps_[fi].base) + (uint64_t) expert * per;
+        if (tmp.size() < (size_t) per) { tmp.resize((size_t) per); tmp2.resize((size_t) per); }
+        std::memset(tmp.data(), 0, (size_t) per);
+        std::memset(tmp2.data(), 0, (size_t) per);
+        // One synchronous, thread-owned handle per shard file: no shared file pointer between the
+        // pool workers, no overlapped state, nothing another thread could move underneath us.
+        // The handles live for the thread's lifetime; the OS closes them at process exit.
+        thread_local std::vector<HANDLE> tls;
+        if (tls.size() < paths_.size()) tls.resize(paths_.size(), nullptr);
+        HANDLE h = tls[fi];
+        if (h == nullptr) {
+            const int wwide = MultiByteToWideChar(CP_UTF8, 0, paths_[fi].c_str(), -1, nullptr, 0);
+            std::vector<wchar_t> wpath((size_t) (wwide > 0 ? wwide : 1));
+            if (wwide > 0) MultiByteToWideChar(CP_UTF8, 0, paths_[fi].c_str(), -1, wpath.data(), wwide);
+            h = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) h = nullptr;
+            tls[fi] = h;
+        }
+        if (h == nullptr) return;   // could not open this shard on this thread
+        const auto read_fail = [layer, expert, r, off, per](const char* what, DWORD err, DWORD got, DWORD want) {
+            std::fprintf(stderr,
+                         "strata nan879-verify: BUFFERED READ FAILED (%s, error %lu, got %lu of %lu) layer %lld expert %lld role %d off %llu per %llu\n",
+                         what, (unsigned long) err, (unsigned long) got, (unsigned long) want,
+                         (long long) layer, (long long) expert, r, (unsigned long long) off,
+                         (unsigned long long) per);
+        };
+        auto read_span = [h, off, per, layer, expert, r, &read_fail](std::vector<uint8_t>& buf) {
+            LARGE_INTEGER pos;
+            pos.QuadPart = (LONGLONG) off;
+            if (SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) == 0) {
+                read_fail("seek", GetLastError(), 0, 0);
+                return false;
+            }
+            uint64_t done = 0;
+            while (done < per) {
+                const DWORD chunk = (DWORD) std::min<uint64_t>(per - done, 4ull << 20);
+                DWORD got = 0;
+                if (!ReadFile(h, buf.data() + done, chunk, &got, nullptr)) {
+                    read_fail("read", GetLastError(), got, chunk);
+                    return false;
+                }
+                if (got != chunk) {
+                    read_fail("short", 0, got, chunk);
+                    return false;
+                }
+                done += got;
+            }
+            return true;
+        };
+        const bool ok1 = read_span(tmp);
+        const bool ok2 = ok1 ? read_span(tmp2) : false;
+        if (!ok1 || !ok2) {
+            verify_bad_n_.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "strata nan879-verify: BUFFERED READ FAILED layer %lld expert %lld role %d off %llu per %llu\n",
+                         (long long) layer, (long long) expert, r, (unsigned long long) off,
+                         (unsigned long long) per);
+            return;
+        }
+        if (std::memcmp(tmp.data(), tmp2.data(), (size_t) per) != 0) {
+            verify_channel_n_.fetch_add(1, std::memory_order_relaxed);   // channel read differently twice: no verdict
+            return;
+        }
+        const uint8_t* a = dst + at;
+        for (uint64_t k = 0; k < per; ++k) {
+            if (a[k] != tmp[k]) {
+                verify_bad_n_.fetch_add(1, std::memory_order_relaxed);
+                const uint64_t logged = verify_bad_logged_.fetch_add(1, std::memory_order_relaxed);
+                if (logged < 200) {
+                    const uint64_t lo = k >= 16 ? k - 16 : 0;
+                    const uint64_t hi = std::min<uint64_t>(per, k + 16);
+                    char hx[3][200] = {"", "", ""};
+                    for (uint64_t j = lo, w = 0; j < hi && w + 3 < sizeof hx[0]; ++j, w += 3) {
+                        std::snprintf(hx[0] + w, 4, "%02x ", a[j]);
+                        std::snprintf(hx[1] + w, 4, "%02x ", tmp[j]);
+                        std::snprintf(hx[2] + w, 4, "%02x ", tmp2[j]);
+                    }
+                    std::fprintf(stderr,
+                                 "strata nan879-verify: MISMATCH layer %lld expert %lld role %d shard %s off %llu first-diff +%llu: direct 0x%02x buffered 0x%02x\n"
+                                 "  direct   [%llu..%llu): %s\n  buffered [%llu..%llu): %s\n  buffered2[%llu..%llu): %s (blob %llu, byte %llu of %llu, logged %llu)\n",
+                                 (long long) layer, (long long) expert, r, paths_[fi].c_str(),
+                                 (unsigned long long) off, (unsigned long long) k, a[k], tmp[k],
+                                 (unsigned long long) lo, (unsigned long long) hi, hx[0],
+                                 (unsigned long long) lo, (unsigned long long) hi, hx[1],
+                                 (unsigned long long) lo, (unsigned long long) hi, hx[2],
+                                 (unsigned long long) blob, (unsigned long long) (at + k),
+                                 (unsigned long long) blob, (unsigned long long) logged);
+                }
+                // v3 arbitration at the moment of a confirmed mismatch: map the same span through the
+                // memory manager (an independent channel; the view is created and closed here so the
+                // engine's unmapped direct state is untouched the rest of the time) and give a verdict.
+                if (verify_arb_n_.load(std::memory_order_relaxed) < 50) {
+                    verify_arb_n_.fetch_add(1, std::memory_order_relaxed);
+                    auto first_diff = [](const uint8_t* x, const uint8_t* y, uint64_t n) {
+                        for (uint64_t i = 0; i < n; ++i)
+                            if (x[i] != y[i]) return i;
+                        return n;
+                    };
+                    const int wwide = MultiByteToWideChar(CP_UTF8, 0, paths_[fi].c_str(), -1, nullptr, 0);
+                    std::vector<wchar_t> wpath((size_t) (wwide > 0 ? wwide : 1));
+                    if (wwide > 0) MultiByteToWideChar(CP_UTF8, 0, paths_[fi].c_str(), -1, wpath.data(), wwide);
+                    HANDLE mf = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    if (mf == INVALID_HANDLE_VALUE) {
+                        std::fprintf(stderr, "strata nan879-verify: ARBITRATION open failed (error %lu)\n",
+                                     GetLastError());
+                        return;
+                    }
+                    HANDLE sec = CreateFileMappingW(mf, nullptr, PAGE_READONLY, 0, 0, nullptr);
+                    uint8_t* vraw = sec != nullptr
+                                        ? (uint8_t*) MapViewOfFile(sec, FILE_MAP_READ, (DWORD) ((off >> 32) & 0xFFFFFFFFu),
+                                                                   (DWORD) (off & 0xFFFFFFFFu), (SIZE_T) per)
+                                        : nullptr;
+                    if (vraw == nullptr && sec != nullptr && (off & 0xFFFF) != 0) {
+                        // MapViewOfFile wants a 64 KiB-aligned file offset: fall back to a rounded window
+                        const uint64_t mb = off & ~(uint64_t) 0xFFFF;
+                        vraw = (uint8_t*) MapViewOfFile(sec, FILE_MAP_READ, (DWORD) ((mb >> 32) & 0xFFFFFFFFu),
+                                                        (DWORD) (mb & 0xFFFFFFFFu), (SIZE_T) (per + (off - mb)));
+                        if (vraw != nullptr) vraw += (off - mb);
+                    }
+                    if (vraw != nullptr) {
+                        const uint8_t* mv = vraw;
+                        const uint64_t d_diff = first_diff(a, mv, per);
+                        const uint64_t b_diff = first_diff(tmp.data(), mv, per);
+                        const char* verdict = d_diff < per && b_diff == per
+                                                  ? "DIRECT CORRUPT (mmap agrees with the buffered re-read, not with read_direct)"
+                                                  : b_diff < per && d_diff == per
+                                                        ? "CHANNEL ANOMALY (mmap agrees with read_direct; the buffered re-read returned foreign bytes)"
+                                                        : "mmap differs from BOTH read_direct and the buffered re-read";
+                        char hxm[100] = "";
+                        const uint64_t xd = d_diff < per ? d_diff : 0;
+                        for (uint64_t j = xd, w = 0; j < per && w + 3 < sizeof hxm; ++j, w += 3)
+                            std::snprintf(hxm + w, 4, "%02x ", mv[j]);
+                        std::fprintf(stderr,
+                                     "strata nan879-verify: ARBITRATION layer %lld expert %lld role %d off %llu per %llu: "
+                                     "direct-vs-mmap first diff +%llu, buffered-vs-mmap first diff +%llu -> %s\n"
+                                     "  mmap[%llu..%llu): %s\n",
+                                     (long long) layer, (long long) expert, r, (unsigned long long) off,
+                                     (unsigned long long) per, (unsigned long long) d_diff,
+                                     (unsigned long long) b_diff, verdict,
+                                     (unsigned long long) xd, (unsigned long long) std::min<uint64_t>(per, xd + 32), hxm);
+                        UnmapViewOfFile((void*) (vraw - (off & 0xFFFF)));
+                    } else {
+                        std::fprintf(stderr, "strata nan879-verify: ARBITRATION map failed (error %lu)\n",
+                                     GetLastError());
+                    }
+                    if (sec != nullptr) CloseHandle(sec);
+                    CloseHandle(mf);
+                }
+                return;
+            }
+        }
+        at += per;
+    }
+#else
+    (void) dst;
+#endif
 }
 
 // Pinned stage buffers (PR 1237): opt-in (STRATA_STAGE_PIN=1).  On by default they corrupted IQ3_S decode after a 4096-token
@@ -2336,6 +2549,8 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
                 const size_t k = std::min<size_t>(16, todo.size() - at);
                 const auto t0 = std::chrono::steady_clock::now();
                 const bool ok = read_direct(todo.data() + at, k);
+                if (ok)
+                    for (size_t j = at; j < at + k; ++j) verify_blob(todo[j].layer, todo[j].e, todo[j].dst);
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 for (size_t i = at; i < at + k; ++i) {
                     const Fill& f = todo[i];
@@ -2446,6 +2661,8 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
                 const size_t k = std::min<size_t>(16, todo.size() - at);
                 const auto t0 = std::chrono::steady_clock::now();
                 const bool ok = read_direct(todo.data() + at, k);
+                if (ok)
+                    for (size_t j = at; j < at + k; ++j) verify_blob(todo[j].layer, todo[j].e, todo[j].dst);
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 for (size_t i = at; i < at + k; ++i) {
                     const Fill& f = todo[i];

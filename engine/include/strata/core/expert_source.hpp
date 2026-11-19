@@ -1117,6 +1117,20 @@ private:
     bool open_direct(std::string& why);
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
     bool map_view(std::string& why);
+    /// NAN879-LAB diagnostic, opt-in (STRATA_BLOB_VERIFY=1): after read_direct assembles a blob, the
+    /// same byte ranges are re-read through a plain buffered handle (an independent channel) and memcmp'd.
+    /// A difference can only mean the unbuffered path delivered wrong bytes; it is logged loudly with the
+    /// shard, offsets and a hexdump. Off by default: the default path only checks one bool.
+    void verify_blob(int64_t layer, int64_t expert, const uint8_t* dst) const;
+    void open_verify_handles();
+    std::atomic<bool> verify_on_{false};
+    mutable std::atomic<uint64_t> verify_blob_n_{0};
+    mutable std::atomic<uint64_t> verify_bad_n_{0};
+    mutable std::atomic<uint64_t> verify_bad_logged_{0};
+    mutable std::atomic<uint64_t> verify_channel_n_{0};   ///< the buffered channel itself disagreed with itself
+    mutable std::atomic<uint64_t> verify_arb_n_{0};       ///< v3: three-way mmap arbitrations performed
+    std::chrono::steady_clock::time_point verify_t0_{};   ///< when verification was armed (for the startup delay)
+    int64_t verify_delay_ms_ = 0;                         ///< STRATA_BLOB_VERIFY_DELAY_SEC: hold verification off for the startup fill
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> pdirect_;              ///< open_prompt_direct: O_DIRECT fds for copy_blobs only
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
