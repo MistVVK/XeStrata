@@ -15,8 +15,8 @@ const instances = [
 
 test('ready models carry their window as context_length and meta.n_ctx; an unknown window is left out', () => {
   const list = nativeModelEntries(instances);
-  assert.deepEqual(list.map(m => m.id), ['qwen3.8-flash-next', 'configured-only', 'unknown-window'], 'a model still loading is not listed');
-  const [live, configured, unknown] = list;
+  assert.deepEqual(list.map(m => m.id), ['qwen3.8-flash-next', 'local', 'configured-only', 'unknown-window'], 'a model still loading is not listed; the alias of the ready model rides along as its own row (#6180)');
+  const [live, , configured, unknown] = list;
   assert.equal(live.context_length, 120000, 'the engine\'s live window first');
   assert.equal(live.meta.n_ctx, 120000);
   assert.equal(configured.context_length, 65536);

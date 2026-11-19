@@ -4,7 +4,7 @@ import { nativeModelEntries } from '../server/native-models.mjs';
 const ready = (patch = {}) => ({ id: 'inst-a', apiModelId: 'qwen-q2_0', status: 'ready', gpus: [0], label: 'Qwen 3.6', aliases: ['qwen-q2_0'], context: 65536, metrics: null, ...patch });
 
 test('the configured context is reported as n_ctx and the other keys are unchanged', () => {
-  assert.deepEqual(nativeModelEntries([ready()]), [{ id: 'qwen-q2_0', object: 'model', owned_by: 'strata', context_length: 65536, meta: { instanceId: 'inst-a', gpus: [0], label: 'Qwen 3.6', aliases: ['qwen-q2_0'], n_ctx: 65536 } }]);
+  assert.deepEqual(nativeModelEntries([ready()]), [{ id: 'qwen-q2_0', object: 'model', owned_by: 'strata', status: { value: 'loaded' }, architecture: { input_modalities: ['text'], output_modalities: ['text'] }, context_length: 65536, meta: { instanceId: 'inst-a', gpus: [0], label: 'Qwen 3.6', aliases: ['qwen-q2_0'], n_ctx: 65536 } }]);
 });
 
 test('the engine-reported window wins over the config', () => {
@@ -37,8 +37,10 @@ test('only ready instances are listed, in input order', () => {
     ready({ id: 'd', apiModelId: 'm-d', status: 'unloading' }),
     ready({ id: 'e', apiModelId: 'm-e', context: 131072 }),
   ]);
-  assert.deepEqual(result.map(e => e.id), ['m-a', 'm-e']);
-  assert.equal(result[1].meta.n_ctx, 131072);
+  // #6180: the shared alias 'qwen-q2_0' differs from both canonical ids, so each ready instance also gets an alias row naming its owner.
+  assert.deepEqual(result.map(e => e.id), ['m-a', 'qwen-q2_0', 'm-e', 'qwen-q2_0']);
+  assert.deepEqual(result.map(e => e.alias_of), [undefined, 'm-a', undefined, 'm-e']);
+  assert.equal(result[2].meta.n_ctx, 131072);
 });
 
 test('empty input', () => {
@@ -56,6 +58,6 @@ test('the input is not changed', () => {
 
 test('n_ctx is the only key added to meta', () => {
   const [entry] = nativeModelEntries([ready()]);
-  assert.deepEqual(Object.keys(entry).sort(), ['context_length', 'id', 'meta', 'object', 'owned_by'], 'context_length (#5893) beside the old keys');
+  assert.deepEqual(Object.keys(entry).sort(), ['architecture', 'context_length', 'id', 'meta', 'object', 'owned_by', 'status'], 'status and architecture (#6180) beside the old keys');
   assert.deepEqual(Object.keys(entry.meta).sort(), ['aliases', 'gpus', 'instanceId', 'label', 'n_ctx']);
 });
