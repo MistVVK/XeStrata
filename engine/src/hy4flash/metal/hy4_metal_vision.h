@@ -196,6 +196,17 @@ struct VitMetal {
         mtl::Buffer d_ff = cx->alloc((size_t) N * FF * 2), d_A = cx->alloc((size_t) M2 * D * 4 * 2), d_mid = cx->alloc((size_t) M2 * D * 4 * 2);
         const size_t cmax = std::max({(size_t) N * FF, (size_t) N * D, (size_t) M2 * D * 4, (size_t) M2 * OD});
         mtl::Buffer d_c = cx->alloc(cmax * 4);
+        // attention path: "mpp" = materialised scores on the neural accelerators (default), "sg" = simdgroup_matrix flash kernel (HY4_VIT_ATTN=sg|mpp)
+        const char* am = getenv("HY4_VIT_ATTN");
+        const bool mpp_attn = am ? std::string(am) == "mpp" : true;
+        const int Bq = 256;
+        struct VHeadArgs { int M, N, K, a_head, b_head, c_head; };
+        mtl::Buffer d_s, d_p, d_o;
+        if (mpp_attn) {
+            d_s = cx->alloc((size_t) NH * Bq * Np * 4);
+            d_p = cx->alloc((size_t) NH * Bq * Np * 2);
+            d_o = cx->alloc((size_t) NH * Bq * 72 * 4);
+        }
         std::memcpy(d_rgb.ptr, rgb, (size_t) h * w * 3);
         add("v_patchify", N, 1, 256, {B(d_rgb), B(d_pix), I(w), I(gw)});
         const float sy = (float) (1.0 / (((double) gh + 0.1) / (double) c.pos_edge)), sx = (float) (1.0 / (((double) gw + 0.1) / (double) c.pos_edge));
@@ -207,11 +218,31 @@ struct VitMetal {
         for (int il = 0; il < c.layers; ++il) {
             const std::string p = "vit.layers." + std::to_string(il) + ".";
             add("v_ln", N, 1, 256, {B(d_x), W(p + "input_layernorm.weight"), W(p + "input_layernorm.bias"), B(d_h), Fl(c.eps)});
-            gemm(0, d_h, p + "self_attn.q_proj.weight", p + "self_attn.q_proj.bias", d_c, &d_q, nullptr, nullptr, N, D, D);
-            gemm(0, d_h, p + "self_attn.k_proj.weight", p + "self_attn.k_proj.bias", d_c, &d_k, nullptr, nullptr, N, D, D);
-            gemm(0, d_h, p + "self_attn.v_proj.weight", p + "self_attn.v_proj.bias", d_c, &d_v, nullptr, nullptr, N, D, D);
+            gemm(mpp_attn ? 6 : 0, d_h, p + "self_attn.q_proj.weight", p + "self_attn.q_proj.bias", d_c, &d_q, nullptr, nullptr, N, D, D, Np);
+            gemm(mpp_attn ? 6 : 0, d_h, p + "self_attn.k_proj.weight", p + "self_attn.k_proj.bias", d_c, &d_k, nullptr, nullptr, N, D, D, Np);
+            gemm(mpp_attn ? 7 : 0, d_h, p + "self_attn.v_proj.weight", p + "self_attn.v_proj.bias", d_c, &d_v, nullptr, nullptr, N, D, D, Np);
             flush("ln+qkv");
-            if (dbg && il == 0) { nan_check("ln0 (d_h)", d_h, N * D, true); nan_check("q", d_q, N * D, true); nan_check("k", d_k, N * D, true); nan_check("v", d_v, N * D, true); }
+            if (dbg && il == 0 && !mpp_attn) { nan_check("ln0 (d_h)", d_h, N * D, true); nan_check("q", d_q, N * D, true); nan_check("k", d_k, N * D, true); nan_check("v", d_v, N * D, true); }
+            if (mpp_attn) {
+                // S = Q K^T per query block and head (MPP), softmax, O = P V (MPP); one command buffer per layer (the blocks are queued, 3 dispatches each)
+                for (int q0 = 0; q0 < N; q0 += Bq) {
+                    const int M = std::min(Bq, N - q0);
+                    VHeadArgs qk{M, Np, 72, Np * 72, Np * 72, Bq * Np};
+                    VHeadArgs pv{M, 72, Np, Bq * Np, 72 * Np, Bq * 72};
+                    mtl::Dispatch a;
+                    a.p = &P("v_mpp_head_128_64_4");
+                    a.args = {B(d_q, (size_t) q0 * 72 * 2), B(d_k), B(d_s), mtl::Arg::V<VHeadArgs>(qk)};
+                    a.grid[0] = (Np + 63) / 64; a.grid[1] = (M + 127) / 128; a.grid[2] = NH; a.tg[0] = 128;
+                    ds.push_back(std::move(a));
+                    add("v_softmax", NH * Bq, 1, 256, {B(d_s), B(d_p), I(N), I(Np), Fl(scale)});  // all Bq rows of every head (rows past M hold stale finite data, unused)
+                    mtl::Dispatch b;
+                    b.p = &P("v_mpp_head_128_64_4");
+                    b.args = {B(d_p), B(d_v), B(d_o), mtl::Arg::V<VHeadArgs>(pv)};
+                    b.grid[0] = 2; b.grid[1] = (M + 127) / 128; b.grid[2] = NH; b.tg[0] = 128;
+                    ds.push_back(std::move(b));
+                    add("v_attn_out", M, NH, 96, {B(d_o), B(d_h), I(Bq), I(q0)});
+                }
+            } else
             add("v_attn", Np / 64, NH, 128, {B(d_q), B(d_k), B(d_v), B(d_h), I(N), Fl(scale)});
             flush("attention");
             if (dbg && il == 0) nan_check("attn out", d_h, N * D, true);
@@ -236,7 +267,8 @@ struct VitMetal {
             for (auto& kv : pacc) line += kv.first + " " + std::to_string(kv.second).substr(0, 6) + " s, ";
             fprintf(stderr, "%s\n", line.c_str());
         }
-        for (mtl::Buffer* b : {&d_rgb, &d_pix, &d_x, &d_pe, &d_h, &d_q, &d_k, &d_v, &d_ff, &d_A, &d_mid, &d_c}) cx->free(*b);
+        for (mtl::Buffer* b : {&d_rgb, &d_pix, &d_x, &d_pe, &d_h, &d_q, &d_k, &d_v, &d_ff, &d_A, &d_mid, &d_c, &d_s, &d_p, &d_o})
+            if (b->handle) cx->free(*b);
         last_wall = mtl::now_s() - t0;
         return true;
     }

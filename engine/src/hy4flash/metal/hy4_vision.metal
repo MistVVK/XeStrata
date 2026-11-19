@@ -105,10 +105,12 @@ kernel void v_epi(device const float* C [[buffer(0)]], device const float* bias 
     else if (EPI == 2) Yh[i] = half(v_gelu_erf(v));
     else if (EPI == 3) Yf[i] += v;
     else if (EPI == 4) Yf[i] = v + pe[i];
-    else Yf[(size_t) (m + m / ow) * N + n] = v;
+    else if (EPI == 5) Yf[(size_t) (m + m / ow) * N + n] = v;
+    else if (EPI == 6) Yh[((size_t) (n / VHD) * ow + m) * VHD + (n % VHD)] = half(v);   // per-head layout [h][ow = Npad][72] (q, k of the MPP attention)
+    else Yh[((size_t) (n / VHD) * VHD + (n % VHD)) * ow + m] = half(v);                  // per-head transposed [h][72][ow = Npad] (v of the MPP attention)
 }
 #define VEPI(E) template [[host_name("v_epi_" #E)]] kernel void v_epi<E>(device const float*, device const float*, device half*, device float*, device const float*, constant int&, constant int&, constant int&, constant int&, uint);
-VEPI(0) VEPI(1) VEPI(2) VEPI(3) VEPI(4) VEPI(5)
+VEPI(0) VEPI(1) VEPI(2) VEPI(3) VEPI(4) VEPI(5) VEPI(6) VEPI(7)
 
 // ---- full softmax attention, head dim 72, 16 heads, q/k/v/o half [Npad][1152] (head h at columns 72h; rows >= N are zero padding, Npad a multiple of 64).
 // A threadgroup = NSG simdgroups; one simdgroup = 16 queries of one head. The K and V tiles (64 keys x 72, fp16) are loaded cooperatively into threadgroup memory once per threadgroup, then each
@@ -321,4 +323,57 @@ kernel void v_fix_pool(device half* pooled [[buffer(0)]], constant int& g_lo [[b
     const float x0 = float(p[0]), x1 = float(p[1]);
     p[0] = half(x0 * cs - x1 * sn);
     p[1] = half(x0 * sn + x1 * cs);
+}
+
+// ================================================================ MPP attention (materialised scores, one query block at a time) ================================================================
+// q, k per head [16][Npad][72], v per head transposed [16][72][Npad] (written by the v_epi 6 / 7 epilogues). For a block of Bq queries and ALL heads (grid z = head):
+//   S[h][Bq][Npad] = Q_h K_h^T (fp32, Metal 4 matmul2d on the neural accelerators)  ->  v_softmax: P = softmax(scale S) over the first N keys (half, 0 beyond)  ->  C[h][Bq][72] = P V_h  ->  v_attn_out.
+struct VHeadArgs {
+    int M, N, K;
+    int a_head, b_head, c_head;  // element strides between heads
+};
+template <int TM, int TN, int SG>
+kernel void v_mpp_head(device half* A [[buffer(0)]], device half* B [[buffer(1)]], device float* C [[buffer(2)]], constant VHeadArgs& a [[buffer(3)]], uint3 tg [[threadgroup_position_in_grid]]) {
+    device half* Ah = A + (size_t) tg.z * a.a_head;
+    device half* Bh = B + (size_t) tg.z * a.b_head;
+    device float* Ch = C + (size_t) tg.z * a.c_head;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tA(Ah, dextents<int32_t, 2>(a.K, a.M));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tB(Bh, dextents<int32_t, 2>(a.K, a.N));
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tC(Ch, dextents<int32_t, 2>(a.N, a.M));
+    constexpr auto desc = matmul2d_descriptor(TM, TN, dynamic_length_v<int>, false, true, false);
+    matmul2d<desc, execution_simdgroups<SG>> op;
+    auto mA = tA.slice(0, int(tg.y) * TM);
+    auto mB = tB.slice(0, int(tg.x) * TN);
+    auto mC = tC.slice(int(tg.x) * TN, int(tg.y) * TM);
+    op.run(mA, mB, mC);
+}
+template [[host_name("v_mpp_head_128_64_4")]] kernel decltype(v_mpp_head<128, 64, 4>) v_mpp_head<128, 64, 4>;
+template [[host_name("v_mpp_head_128_128_4")]] kernel decltype(v_mpp_head<128, 128, 4>) v_mpp_head<128, 128, 4>;
+
+// softmax of rows of S [rows][ld] over the first N columns -> P half [rows][ld] (normalised, 0 beyond N). One threadgroup (256 threads) per row; grid = rows
+kernel void v_softmax(device const float* S [[buffer(0)]], device half* P [[buffer(1)]], constant int& N [[buffer(2)]], constant int& ld [[buffer(3)]], constant float& scale [[buffer(4)]],
+                      uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh[8];
+    device const float* s = S + (size_t) row * ld;
+    device half* p = P + (size_t) row * ld;
+    const float sc = scale * 1.4426950408889634f;
+    float mx = -1e30f;
+    for (int i = tid; i < N; i += 256) mx = max(mx, s[i]);
+    mx = simd_max(mx);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((tid & 31) == 0) sh[tid >> 5] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = sh[0];
+    for (int i = 1; i < 8; ++i) mx = max(mx, sh[i]);
+    float sum = 0.f;
+    for (int i = tid; i < N; i += 256) sum += exp2((s[i] - mx) * sc);
+    sum = v_tg_sum(sum, sh, tid, 256);
+    const float inv = 1.0f / sum;
+    for (int i = tid; i < ld; i += 256) p[i] = i < N ? half(exp2((s[i] - mx) * sc) * inv) : half(0.0f);
+}
+
+// C [16][Bq][72] fp32 -> O half [Npad][1152] at query rows q0..q0+Bq. grid (Bq, 16), 96 threads (72 used)
+kernel void v_attn_out(device const float* C [[buffer(0)]], device half* O [[buffer(1)]], constant int& Bq [[buffer(2)]], constant int& q0 [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]]) {
+    if (tid < VHD) O[(size_t) (q0 + tg.x) * VD + tg.y * VHD + tid] = half(C[((size_t) tg.y * Bq + tg.x) * VHD + tid]);
 }
