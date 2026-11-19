@@ -333,6 +333,9 @@ inline int hy4_serve_main(const ServeOpts& o) {
             }
             q.ids.swap(ex);
             for (size_t i = 0; i < recs.size(); ++i) proto("IMG %zu %d", i + 1, image_token_count(recs[i].h, recs[i].w));
+        } else if (std::find(q.ids.begin(), q.ids.end(), (int32_t)VitCfg().image_token) != q.ids.end()) {
+            proto("ERR image: 0 files for %d image placeholders", (int)std::count(q.ids.begin(), q.ids.end(), (int32_t)VitCfg().image_token));
+            continue;
         }
         const int T0 = (int)q.ids.size();
         if (T0 == 0) {
