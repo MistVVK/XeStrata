@@ -26,6 +26,18 @@ int main() {
     CHECK(strata::prefill::share_rules::gfx12_share_limit(true) == 2304 && strata::prefill::share_rules::gfx12_share_limit(false) == 3072);   // AMD-Q
     static_assert(strata::prefill::share_rules::kShareLimitOld == 1024, "the old limit (the way back is STRATA_PREFILL_CPU_SHARE_MAX=1024)");
 
+    // BW-F: the card layouts that arm the default share: one card as before, two cards (one later stage) by the switch's default, nothing else
+    {
+        using namespace strata::prefill::share_rules;
+        CHECK(default_share_layout(0, false, -1) && default_share_layout(0, false, 0) && default_share_layout(0, false, 1));   // one card: STRATA_SPLIT_CPU_SHARE is not read
+        CHECK(default_share_layout(1, true, -1) == kSplitShareDefault);                                                       // two cards, the switch unset
+        CHECK(!default_share_layout(1, true, 0) && default_share_layout(1, true, 1));                                          // the switch both ways
+        CHECK(!default_share_layout(2, true, -1) && !default_share_layout(2, true, 1) && !default_share_layout(3, true, 1));  // three and four cards: not measured, never armed by default
+        CHECK(!default_share_layout(1, true, -1, false) && !default_share_layout(1, true, 1, false) && default_share_layout(0, false, -1, false));   // HIP / SYCL: the split stays off, one card as before
+        CHECK(!default_share_layout(1, false, 1) && !default_share_layout(0, true, 1));                                        // helper caches (no layer split) and an inconsistent split: off
+        CHECK(split_share_env_of(nullptr) == -1 && split_share_env_of("") == -1 && split_share_env_of("0") == 0 && split_share_env_of("1") == 1 && split_share_env_of("on") == 1);
+        static_assert(default_share_layout(0, false, -1), "constexpr");
+    }
     // H11: memory verdicts
     using namespace strata::prefill::share_rules;
     const uint64_t G = 1ull << 30;

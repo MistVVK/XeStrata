@@ -38,6 +38,20 @@ constexpr bool default_share_has_work(int64_t resident_slots, int64_t total_pair
     return total_pairs <= 0 || resident_slots < total_pairs;
 }
 
+// ---- which card layouts arm the default share (BW-F, two 16 GB cards) ----
+// Until 0.2.16 the default share was armed on one card only: a layer split left every prompt chunk below the staged-chunk limit to stream its experts over PCIe on each stage in turn, although
+// the stages already take the pool one at a time (prefill.cpp g_cpu_pool_busy).  Two RTX 5060 Ti 16 GB (PCIe 4.0 x8, 14.3 GB/s each, EPYC 7K62 with 48 cores, UD-Q4_K_XL, DFlash2, layer split auto K = 24),
+// prompt ms, STRATA_PREFILL_CPU_SHARE=auto against the split's own default (share off), median of 3 rounds: see phaseA-tests/bw/RESULTS-BW-F.md (BW-MG-small).
+// `later_stages`: the layer split's stages after the first (0: no split); `multi_gpu`: a layer split across devices; `env`: STRATA_SPLIT_CPU_SHARE as read (-1 unset, 0 off, 1 on).
+// One card as before; exactly one later stage (two cards) by the switch's default on a CUDA build (not measured on HIP or SYCL); three and four cards, and the helper caches, are not measured and stay off.
+inline constexpr bool kSplitShareDefault = true;
+constexpr bool default_share_layout(int later_stages, bool multi_gpu, int env, bool cuda = true) {
+    if (later_stages == 0 && !multi_gpu) return true;
+    if (later_stages == 1 && multi_gpu && cuda) return env < 0 ? kSplitShareDefault : env != 0;
+    return false;
+}
+constexpr int split_share_env_of(const char* v) { return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '0' ? 0 : 1); }
+
 
 // ---- memory (0.1.41 report, RTX 5090, tight RAM: chats failed and the engine restarted until STRATA_PREFILL_CPU_SHARE=0) ----
 // The default share reads experts with the CPU and keeps two pinned buffers on the host.  When the host has little
