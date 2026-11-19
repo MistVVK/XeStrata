@@ -172,6 +172,14 @@ if WIN:
     CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_BREAKAWAY_FROM_JOB = 0x200, 0x08000000, 0x01000000
 
 
+def ready_pack_dir(target, md) -> "Path | None":
+    """Where setup keeps a ready-made pack (a size whose setup entry names a `repo`): <data>/models/<owner>--<repo> (setup.py ready_where). The family tag
+    folder is where the other models' GGUF files go; looking only there made "Download and prepare" ask for the whole pack's size on a pack that was
+    already on the disk (#4892). None for a size that names no repository."""
+    repo = md.get("repo") if isinstance(md, dict) else None
+    return Path(target) / "models" / str(repo).replace("/", "--") if repo else None
+
+
 def log(msg: str) -> None:
     """Diagnostics go to stderr: stdout carries only the protocol."""
     try:
@@ -2360,6 +2368,7 @@ class Tools:
         target = self.check_data_dir(data_dir) if data_dir else s.data_dir()
         tag = (families[family].get("tag", "") + model)
         have_dir = target / "models" / tag
+        ready_dir = ready_pack_dir(target, md)                 # a ready-made pack (NVFP4): setup keeps it under <owner>--<repo>, not under the family tag (#4892)
         # An Intel Arc (Linux, the SYCL engine): setup.py's `--backend sycl` in its CONTROL mode prepares the model's files and writes the run config, as the
         # Terminal does (strata_control/intel_app.py); it downloads nothing. NVIDIA and AMD never come here.
         arc = backend == "sycl" or (backend in (None, "auto") and any(g.get("vendor") == "intel" for g in hw.get("gpus", [])))
@@ -2373,7 +2382,8 @@ class Tools:
             backend, vision = "sycl", "no"                  # pictures stay off on an Arc (strata_cli/launch/adopt.py)
             if not gguf_dir and not intel_app.model_files_in(have_dir, family, families[family]):
                 raise ToolError(intel_app.NO_DOWNLOAD)
-        partly = (have_dir.is_dir() and any(have_dir.glob("*.gguf*"))) or bool(gguf_dir)   # a local folder: nothing to download
+        partly = (have_dir.is_dir() and any(have_dir.glob("*.gguf*"))) or bool(gguf_dir) \
+            or (ready_dir is not None and ready_dir.is_dir() and any(ready_dir.glob("*.gguf*")))   # a local folder: nothing to download
         need = (8 if partly else md["download_gb"] + 8) + (1 if vision in ("yes", "gpu", "cpu") else 0)             + (s.mac().repacked_gb(model) if mac and s.mac() else 0)       # a Mac repacks Unsloth's shards into one file for the GPU (mac_fit.repacked_gb)
         free = s.disk_free(target)
         short = None
