@@ -84,13 +84,15 @@ struct ExpertDev {
 int main(int argc, char** argv) {
     if (argc < 3) return 2;
     mtl::Context cx;
-    int lib = cx.compile({argv[1]}, "#define NO_GGML_COMMON 1\n", false);
+    const std::string kdir = std::string(argv[1]).substr(0, std::string(argv[1]).rfind('/') + 1);
+    int lib = cx.compile({argv[1], kdir + "hy4_flash.metal"}, "#define NO_GGML_COMMON 1\n", false);
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 1.f);
     int bad = 0;
     // ---------------------------------------------------------------- attention
     {
-        const int NH = 4, slots = 96;
+        for (int variant = 0; variant < 2; ++variant) {
+        const int NH = variant ? 32 : 4, slots = 96;
         for (int mode = 0; mode < 3; ++mode) {
             const int M = 5, p0 = mode == 1 ? 150 : 20, ring = mode == 1 ? 64 : 0, window = 16, kmax = 40;
             std::vector<uint16_t> qa((size_t) M * NH * 576), cache((size_t) slots * 576);
@@ -111,7 +113,7 @@ int main(int argc, char** argv) {
             std::memcpy(bn.ptr, nk.data(), M * 4);
             MlaArgs a{M, NH, p0, mode, window, ring, kmax, 0.0625f};
             mtl::Pipeline p;
-            auto d = mk(cx, lib, "mla_attend", &p, {mtl::Arg::B(bq), mtl::Arg::B(bc), mtl::Arg::B(bs), mtl::Arg::B(bo), mtl::Arg::V<MlaArgs>(a), mtl::Arg::B(bk), mtl::Arg::B(bn)}, NH, M, 256);
+            auto d = mk(cx, lib, variant ? "mla_flash" : "mla_attend", &p, {mtl::Arg::B(bq), mtl::Arg::B(bc), mtl::Arg::B(bs), mtl::Arg::B(bo), mtl::Arg::V<MlaArgs>(a), mtl::Arg::B(bk), mtl::Arg::B(bn)}, variant ? NH / 32 : NH, M, 256);
             cx.run({d});
             double maxerr = 0, maxref = 0;
             for (int t = 0; t < M; ++t)
@@ -142,8 +144,10 @@ int main(int argc, char** argv) {
                 }
             bool ok = maxerr / (maxref + 1e-9) < 2e-3;
             bad += !ok;
-            printf("mla_attend mode %d (M %d NH %d)  maxerr %.3e maxref %.3e %s\n", mode, M, NH, maxerr, maxref, ok ? "ok" : "BAD");
+            printf("%s mode %d (M %d NH %d)  maxerr %.3e maxref %.3e %s\n", variant ? "mla_flash" : "mla_attend", mode, M, NH, maxerr, maxref, ok ? "ok" : "BAD");
         }
+        }
+        const int NH = 4;
         // prep_q + vup
         for (int TT : {1, 8}) {
             const int M = 11, p0 = 37;

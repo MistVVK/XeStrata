@@ -161,6 +161,7 @@ public:
     bool mpp_ok = false;       // hy4_mpp.metal / hy4_mppq.metal compiled (Metal 4 matmul2d): prefill GEMMs through an fp16 dequantised scratch
     int mpp_min = 96;          // use it from this many tokens
     Buffer wscr;               // dequantised weight scratch [N][K] half
+    bool flash_on = false;     // mla_flash (simdgroup_matrix attention) for prefill chunks of >= 16 tokens (needs the MPP library build)
     int moe_mm_min = 64;       // MoE prefill through the MPP grouped GEMM from this many tokens (needs mpp_ok)
     Buffer m_srt, m_pos, m_tiles, m_meta, m_xs, m_hs, m_y;
     static int moe_tm(int T) { return T <= 768 ? 16 : (T <= 1536 ? 32 : 64); }
@@ -283,7 +284,7 @@ public:
         {
             const std::string dir = kernel_path.substr(0, kernel_path.rfind('/') + 1);
             std::string why;
-            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
+            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
             mpp_ok = lib >= 0;
             if (!mpp_ok) {
                 if (mpp_try) fprintf(stderr, "[metal] MPP (Metal 4 matmul2d) kernels not available, simdgroup GEMM only: %s\n", why.substr(0, 200).c_str());
@@ -556,7 +557,10 @@ public:
         a.ring = swa ? ring : 0;
         a.kmax = index_topk;
         a.scale = 0.0625f;
-        add("mla_attend", NH, T, 256, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
+        if (mpp_ok && flash_on && T >= 16 && NH % 32 == 0)
+            add("mla_flash", NH / 32, T, 256, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
+        else
+            add("mla_attend", NH, T, 256, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
         op("mla_attend");
         add(TT == 1 ? "mla_vup_1" : "mla_vup_8", NH, (T + TT - 1) / TT, 256, {B(ctx_h), B(wv_b, wv_off[il]), B(F3), B(o_h), I(T), I(NH)});
         lin(pa + ".o_proj.weight", o_h, F1, T);
@@ -708,7 +712,7 @@ static size_t rss_bytes() {
 
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
-    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false;
+    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false;
     int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -734,6 +738,7 @@ int main(int argc, char** argv) {
         else if (a == "--pair-max") pair_max = atoi(nxt().c_str());
         else if (a == "--layers") n_layers_run = atoi(nxt().c_str());
         else if (a == "--no-mpp") no_mpp = true;
+        else if (a == "--flash") no_flash = true;
         else if (a == "--no-relax") no_relax = true;
         else if (a == "--moe-mm-min") moe_mm_min_arg = atoi(nxt().c_str());
         else if (a == "--mpp-min") mpp_min_arg = atoi(nxt().c_str());
@@ -793,6 +798,7 @@ int main(int argc, char** argv) {
     r.seg_force = seg;
     r.pair_max = pair_max;
     r.mpp_try = !no_mpp;
+    r.flash_on = no_flash;
     r.relax_ok = !no_relax;
     r.mpp_min = mpp_min_arg;
     r.moe_mm_min = moe_mm_min_arg;
