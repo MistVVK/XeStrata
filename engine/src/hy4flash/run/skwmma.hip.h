@@ -7,12 +7,15 @@
 // gemm_mainloop is shared with the grouped expert kernels (skmoe.hip.h).
 #pragma once
 #include "skfast.hip.h"
+#if HY4_MMA
 
 namespace hy4 {
 namespace skd {
 
-typedef _Float16 hv16 __attribute__((ext_vector_type(16)));
+#if !HY4_CUDA
+typedef half_t hv16 __attribute__((ext_vector_type(16)));
 typedef float fv8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ fv8 fv8_zero() { return fv8{0, 0, 0, 0, 0, 0, 0, 0}; }
 
 __device__ __forceinline__ hv16 ld_hv16(const void* p) {
     const uint4 a = *(const uint4*)p, b = *((const uint4*)p + 1);
@@ -20,16 +23,11 @@ __device__ __forceinline__ hv16 ld_hv16(const void* p) {
     u32x8 v = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
     return __builtin_bit_cast(hv16, v);
 }
-
-__device__ __forceinline__ uint32_t pack_h2(float a, float b) {
-    hv2 h = {(_Float16)a, (_Float16)b};
-    return __builtin_bit_cast(uint32_t, h);
-}
-__device__ __forceinline__ void unpack_h2(uint32_t w, float& a, float& b) {
-    hv2 h = __builtin_bit_cast(hv2, w);
-    a = (float)h[0];
-    b = (float)h[1];
-}
+// accumulator element r (0..7) of a lane in a 16x16 output tile: row / column within the tile
+__device__ __forceinline__ int acc_m(int r, int lane) { return 2 * r + (lane >> 4); }
+__device__ __forceinline__ int acc_n(int r, int lane) { return lane & 15; }
+#else
+#endif
 
 // dequantize the 8 weights 8u..8u+7 of super-block `blk` scaled by eff into 4 packed half2 words
 template <int FMT>
@@ -40,8 +38,8 @@ __device__ __forceinline__ void dequant8_h(const uint8_t* blk, int u, float eff,
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         float a, b;
-        unpack_h2(wp[i], a, b);
-        r[i] = pack_h2(a * eff, b * eff);
+        h2_unpack(wp[i], a, b);
+        r[i] = h2_pack(a * eff, b * eff);
     }
     out = make_uint4(r[0], r[1], r[2], r[3]);
 }
@@ -73,7 +71,7 @@ __device__ __forceinline__ void load_bytes(const uint8_t* p, uint32_t (&o)[N]) {
     for (int i = 0; i < N; ++i) d[i] = q[i];
     d[N] = ofs ? q[N] : 0u;
 #pragma unroll
-    for (int i = 0; i < N; ++i) o[i] = __builtin_amdgcn_alignbyte(d[i + 1], d[i], ofs);
+    for (int i = 0; i < N; ++i) o[i] = byte_funnel(d[i + 1], d[i], ofs);
 }
 
 template <int FMT>
@@ -137,7 +135,7 @@ __device__ __forceinline__ void raw_q8(const RawSub<FMT>& r, uint32_t (&q)[8]) {
 }
 
 template <int FMT, int U8>
-__device__ __forceinline__ void dequant_unit(const RawSub<FMT>& r, float eff, _Float16* dst) {
+__device__ __forceinline__ void dequant_unit(const RawSub<FMT>& r, float eff, half_t* dst) {
     uint32_t o[4];
     if constexpr (FMT == FMT_S1_25) {
         // unit U8 = codebook groups 2*U8, 2*U8+1 of this sub-group: a 10-bit field at bit 10*U8 of the 10-byte window
@@ -150,8 +148,9 @@ __device__ __forceinline__ void dequant_unit(const RawSub<FMT>& r, float eff, _F
         const uint32_t wp[4] = {a.x, a.y, b.x, b.y};
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const hv2 w = __builtin_bit_cast(hv2, wp[i]);
-            o[i] = pack_h2((float)w[0] * eff, (float)w[1] * eff);
+            float w0, w1;
+            h2_unpack(wp[i], w0, w1);
+            o[i] = h2_pack(w0 * eff, w1 * eff);
         }
     } else if constexpr (FMT == FMT_S1_5) {
         const uint32_t t0 = r.hi[0], byte0 = t0 / 5u;
@@ -163,26 +162,28 @@ __device__ __forceinline__ void dequant_unit(const RawSub<FMT>& r, float eff, _F
                 const uint32_t ti = t0 + 8 * U8 + 2 * i + h;
                 v[h] = (float)s15_trit(byte_at4(r.lo, (int)(ti / 5u - byte0)), (int)(ti % 5u));
             }
-            o[i] = pack_h2(v[0] * eff, v[1] * eff);
+            o[i] = h2_pack(v[0] * eff, v[1] * eff);
         }
     } else {
         uint32_t q[8];
         raw_q8<FMT, U8>(r, q);
-        const hv2 mag = FMT == FMT_S8 ? hv2{(_Float16)1152.0f, (_Float16)1152.0f} : hv2{(_Float16)1024.0f, (_Float16)1024.0f};
-        const hv2 hh = hv2{(_Float16)sk_half<FMT>(), (_Float16)sk_half<FMT>()};
+        const uint32_t mag = h2_splat(FMT == FMT_S8 ? 1152.0f : 1024.0f);
+        const uint32_t hh = h2_splat(sk_half<FMT>());
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const uint32_t pat = 0x64006400u | q[2 * i] | (q[2 * i + 1] << 16);
-            hv2 w = __builtin_bit_cast(hv2, pat) - mag;
-            if constexpr (FMT != FMT_S8) w = w - hh;
-            o[i] = pack_h2((float)w[0] * eff, (float)w[1] * eff);
+            uint32_t w = h2_sub(pat, mag);
+            if constexpr (FMT != FMT_S8) w = h2_sub(w, hh);
+            float w0, w1;
+            h2_unpack(w, w0, w1);
+            o[i] = h2_pack(w0 * eff, w1 * eff);
         }
     }
     *(uint4*)dst = make_uint4(o[0], o[1], o[2], o[3]);
 }
 
 template <int FMT>
-__device__ __forceinline__ void dequant_sub(const RawSub<FMT>& r, float eff, _Float16* dst) {
+__device__ __forceinline__ void dequant_sub(const RawSub<FMT>& r, float eff, half_t* dst) {
     dequant_unit<FMT, 0>(r, eff, dst + 0);
     dequant_unit<FMT, 1>(r, eff, dst + 8);
     dequant_unit<FMT, 2>(r, eff, dst + 16);
@@ -193,8 +194,9 @@ __device__ __forceinline__ void dequant_sub(const RawSub<FMT>& r, float eff, _Fl
     dequant_unit<FMT, 7>(r, eff, dst + 56);
 }
 
+#if !HY4_CUDA
 template <int FMT>
-__device__ __forceinline__ void gemm_mainloop_old(const uint8_t* wr, int nsb, const _Float16* xrow0, const _Float16* xrow1, _Float16* ws, fv8 (&acc)[2][2],
+__device__ __forceinline__ void gemm_mainloop_old(const uint8_t* wr, int nsb, const half_t* xrow0, const half_t* xrow1, half_t* ws, fv8 (&acc)[2][2],
                                               int b0row, int b1row) {
     constexpr int SB = sk_sb_bytes(FMT);
     const int tid = threadIdx.x, lane = tid & 31;
@@ -233,20 +235,21 @@ __device__ __forceinline__ void gemm_mainloop_old(const uint8_t* wr, int nsb, co
         cur = nxt;
     }
 }
-
+#endif  // !HY4_CUDA
 
 template <int A, int B>
 __device__ __forceinline__ void acc_zero(fv8 (&acc)[A][B]) {
 #pragma unroll
     for (int i = 0; i < A; ++i)
 #pragma unroll
-        for (int j = 0; j < B; ++j) acc[i][j] = fv8{0, 0, 0, 0, 0, 0, 0, 0};
+        for (int j = 0; j < B; ++j) acc[i][j] = fv8_zero();
 }
 
 // Generic tile main loop: MTW m-tiles x NTW n-tiles of 16 per wave. xrow[i]: A-operand row (this lane: token row (lane&15) of m-tile i);
 // brow[j]: LDS tile row base of n-tile j. Waves with active == false only take part in the dequantization and the barriers.
+#if !HY4_CUDA
 template <int FMT, int MTW, int NTW>
-__device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, const _Float16* const (&xrow)[MTW], _Float16* ws, fv8 (&acc)[MTW][NTW],
+__device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, const half_t* const (&xrow)[MTW], half_t* ws, fv8 (&acc)[MTW][NTW],
                                                 const int (&brow)[NTW], bool active) {
     constexpr int SB = sk_sb_bytes(FMT);
     const int tid = threadIdx.x, lane = tid & 31;
@@ -294,10 +297,74 @@ __device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, cons
     }
 }
 
+#else  // HY4_CUDA
+// Same contract as the gfx11 loop: xrow[m] = this lane's A row (row = lane & 15 of m-tile m); brow[j] = LDS tile row base of n-tile j (16 weight rows).
+// A rows g = lane>>2 and g+8 are taken from lanes g and g+8 by pointer shuffle; per 16-k step a lane loads 8 bytes of each A row and 8 bytes of each B row (n = g of the n8 sub-tile).
+template <int FMT, int MTW, int NTW>
+__device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, const half_t* const (&xrow)[MTW], half_t* ws, fv8 (&acc)[MTW][NTW], const int (&brow)[NTW], bool active) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int drow = tid >> 2, dg = tid & 3;
+    const int g = lane >> 2, c4 = (lane & 3) * 4;
+    RawSub<FMT> cur, nxt;
+    load_raw<FMT>(wr, dg, cur);
+    constexpr int PD = 4;
+    const int total = nsb * 16;
+    const half_t* rlo[MTW];
+    const half_t* rhi[MTW];
+    uint2 alo[MTW][PD], ahi[MTW][PD];
+#pragma unroll
+    for (int m = 0; m < MTW; ++m) {
+        rlo[m] = (const half_t*)shfl_ptr(xrow[m], g);
+        rhi[m] = (const half_t*)shfl_ptr(xrow[m], g + 8);
+    }
+    if (active) {
+#pragma unroll
+        for (int i = 0; i < PD; ++i)
+#pragma unroll
+            for (int m = 0; m < MTW; ++m) {
+                alo[m][i] = *(const uint2*)(rlo[m] + i * 16 + c4);
+                ahi[m][i] = *(const uint2*)(rhi[m] + i * 16 + c4);
+            }
+    }
+    for (int sb = 0; sb < nsb; ++sb) {
+        dequant_sub<FMT>(cur, raw_eff<FMT>(cur, dg), &ws[drow * GEMM_LDW + dg * 64]);
+        if (sb + 1 < nsb) load_raw<FMT>(wr + (size_t)(sb + 1) * SB, dg, nxt);
+        __syncthreads();
+        if (active) {
+#pragma unroll
+            for (int kk = 0; kk < 16; ++kk) {
+                const int gi = sb * 16 + kk;
+                uint2 a_lo[MTW], a_hi[MTW];
+#pragma unroll
+                for (int m = 0; m < MTW; ++m) {
+                    a_lo[m] = alo[m][kk & (PD - 1)];
+                    a_hi[m] = ahi[m][kk & (PD - 1)];
+                    if (gi + PD < total) {
+                        alo[m][kk & (PD - 1)] = *(const uint2*)(rlo[m] + (gi + PD) * 16 + c4);
+                        ahi[m][kk & (PD - 1)] = *(const uint2*)(rhi[m] + (gi + PD) * 16 + c4);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < NTW; ++j)
+#pragma unroll
+                    for (int s = 0; s < 2; ++s) {
+                        const uint2 b = *(const uint2*)&ws[(brow[j] + s * 8 + g) * GEMM_LDW + kk * 16 + c4];
+#pragma unroll
+                        for (int m = 0; m < MTW; ++m) mma_16816(&acc[m][j].v[s * 4], a_lo[m].x, a_hi[m].x, a_lo[m].y, a_hi[m].y, b.x, b.y);
+                    }
+            }
+        }
+        __syncthreads();
+        cur = nxt;
+    }
+}
+#endif
+
 template <int FMT>
-__device__ __forceinline__ void gemm_mainloop(const uint8_t* wr, int nsb, const _Float16* xrow0, const _Float16* xrow1, _Float16* ws, fv8 (&acc)[2][2],
+__device__ __forceinline__ void gemm_mainloop(const uint8_t* wr, int nsb, const half_t* xrow0, const half_t* xrow1, half_t* ws, fv8 (&acc)[2][2],
                                               int b0row, int b1row) {
-    const _Float16* xr[2] = {xrow0, xrow1};
+    const half_t* xr[2] = {xrow0, xrow1};
     const int br[2] = {b0row, b1row};
     gemm_mainloop_g<FMT, 2, 2>(wr, nsb, xr, ws, acc, br, true);
 }
@@ -306,7 +373,7 @@ __device__ __forceinline__ void gemm_mainloop(const uint8_t* wr, int nsb, const 
 template <int FMT>
 __global__ void __launch_bounds__(256) k_gemm_s(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M) {
     constexpr int SB = sk_sb_bytes(FMT);
-    __shared__ __attribute__((aligned(16))) _Float16 ws[GEMM_BN * GEMM_LDW];
+    __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * GEMM_LDW];
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
     const int bn = blockIdx.x * GEMM_BN, bm = blockIdx.y * 16;
     const int nsb = K >> 8;
@@ -314,16 +381,16 @@ __global__ void __launch_bounds__(256) k_gemm_s(const uint8_t* __restrict__ W, i
     acc_zero(acc);
     int row = bm + (lane & 15);
     row = row < M ? row : M - 1;
-    const _Float16* xrow[1] = {(const _Float16*)X + (size_t)row * K};
+    const half_t* xrow[1] = {(const half_t*)X + (size_t)row * K};
     int wrow = bn + (tid >> 2);
     wrow = wrow < N ? wrow : N - 1;
     const int brow[1] = {wave * 16};
     gemm_mainloop_g<FMT, 1, 1>(W + (size_t)wrow * nsb * SB, nsb, xrow, ws, acc, brow, wave < 4);
     if (wave < 4) {
-        const int n = bn + wave * 16 + (lane & 15);
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
-            const int m = bm + 2 * r + (lane >> 4);
+            const int n = bn + wave * 16 + acc_n(r, lane);
+            const int m = bm + acc_m(r, lane);
             if (m < M && n < N) Y[(size_t)m * N + n] = acc[0][0][r];
         }
     }
@@ -332,19 +399,19 @@ __global__ void __launch_bounds__(256) k_gemm_s(const uint8_t* __restrict__ W, i
 template <int FMT>
 __global__ void __launch_bounds__(256) k_gemm(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M) {
     constexpr int SB = sk_sb_bytes(FMT);
-    __shared__ __attribute__((aligned(16))) _Float16 ws[GEMM_BN * GEMM_LDW];
+    __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * GEMM_LDW];
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
     const int wm = wave & 3, wn = wave >> 2;
     const int bn = blockIdx.x * GEMM_BN, bm = blockIdx.y * GEMM_BM;
     const int nsb = K >> 8;
     fv8 acc[2][2];
     acc_zero(acc);
-    const _Float16* xrow[2];
+    const half_t* xrow[2];
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
         int row = bm + wm * 32 + i * 16 + (lane & 15);
         row = row < M ? row : M - 1;
-        xrow[i] = (const _Float16*)X + (size_t)row * K;
+        xrow[i] = (const half_t*)X + (size_t)row * K;
     }
     int wrow = bn + (tid >> 2);
     wrow = wrow < N ? wrow : N - 1;
@@ -353,10 +420,10 @@ __global__ void __launch_bounds__(256) k_gemm(const uint8_t* __restrict__ W, int
     for (int i = 0; i < 2; ++i)
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
-            const int n = bn + wn * 32 + j * 16 + (lane & 15);
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
-                const int m = bm + wm * 32 + i * 16 + 2 * r + (lane >> 4);
+                const int n = bn + wn * 32 + j * 16 + acc_n(r, lane);
+                const int m = bm + wm * 32 + i * 16 + acc_m(r, lane);
                 if (m < M && n < N) Y[(size_t)m * N + n] = acc[i][j][r];
             }
         }
@@ -401,3 +468,4 @@ inline void linear_h_gemm(hipStream_t s, int fmt, const void* W, int N, int K, c
 }
 
 }  // namespace hy4
+#endif  // HY4_MMA

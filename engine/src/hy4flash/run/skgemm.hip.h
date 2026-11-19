@@ -5,8 +5,7 @@
 //   w = (q - H) * D * (u/255)  per 64-weight sub-group, H = 1.5/3.5/7.5/15.5/31.5 (S2..S6), 0 for S8 (q signed int8)
 // Header-only (one translation unit per program).
 #pragma once
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
+#include "hy4_gpu.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

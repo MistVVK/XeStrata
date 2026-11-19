@@ -226,11 +226,12 @@ __global__ void __launch_bounds__(256) k_moe_dn_dec(const uint8_t* __restrict__ 
     else dn_dec_rows<MT>(ed, dn, r0, xs, lane, n, base, pairs, topk_w, y);
 }
 
+#if HY4_MMA
 // ---------------------------------------------------------------- WMMA grouped GEMMs (prefill and small verify windows)
 // Token tile BM = WM*MTW*16 (16, 32, 64 or 128): the kernel variant handles the experts whose token count n satisfies nlo < n <= nhi, so every expert
 // is processed with the smallest tile that covers it (a 128-token tile wastes 16x the matrix-core work on an expert that sees 8 tokens).
 template <int FMT, int WM, int MTW>
-__device__ __forceinline__ void gu_gemm_body(const uint8_t* body, int bx, int ty, int n, int base, const int* pairs, const __half* z, __half* h2, _Float16* ws) {
+__device__ __forceinline__ void gu_gemm_body(const uint8_t* body, int bx, int ty, int n, int base, const int* pairs, const __half* z, __half* h2, half_t* ws) {
     constexpr int SB = sk_sb_bytes(FMT);
     constexpr int BMT = WM * MTW * 16;
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
@@ -239,12 +240,12 @@ __device__ __forceinline__ void gu_gemm_body(const uint8_t* body, int bx, int ty
     const int drow = tid >> 2;
     const int wrow = drow < 32 ? bx * 32 + drow : bx * 32 + drow + (MOE_D - 32);
     const uint8_t* wr = body + 3072 + (size_t)wrow * 6 * SB;
-    const _Float16* xrow[MTW];
+    const half_t* xrow[MTW];
 #pragma unroll
     for (int i = 0; i < MTW; ++i) {
         int ml = ty * BMT + wm * MTW * 16 + i * 16 + (lane & 15);
         ml = ml < n ? ml : n - 1;
-        xrow[i] = (const _Float16*)z + (size_t)(pairs[base + ml] >> 4) * MOE_D;
+        xrow[i] = (const half_t*)z + (size_t)(pairs[base + ml] >> 4) * MOE_D;
     }
     fv8 acc[MTW][2];
     acc_zero(acc);
@@ -252,13 +253,13 @@ __device__ __forceinline__ void gu_gemm_body(const uint8_t* body, int bx, int ty
     gemm_mainloop_g<FMT, MTW, 2>(wr, 6, xrow, ws, acc, brow, active);
     if (!active) return;
     const __half* sqx = (const __half*)body;
-    const int c = bx * 32 + wn * 16 + (lane & 15);
-    const float sq = __half2float(sqx[c]);
 #pragma unroll
     for (int i = 0; i < MTW; ++i)
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
-            const int ml = ty * BMT + wm * MTW * 16 + i * 16 + 2 * r + (lane >> 4);
+            const int c = bx * 32 + wn * 16 + acc_n(r, lane);
+            const float sq = __half2float(sqx[c]);
+            const int ml = ty * BMT + wm * MTW * 16 + i * 16 + acc_m(r, lane);
             if (ml < n) {
                 const float g = acc[i][0][r], u = acc[i][1][r];
                 const float sg = g / (1.0f + expf(-g));
@@ -279,7 +280,7 @@ __global__ void __launch_bounds__(256) k_moe_gu_gemm(const uint8_t* __restrict__
     const int n = cnt[e];
     if (n <= nlo || n > nhi) return;
     if ((int)blockIdx.y * BMT >= n) return;
-    __shared__ __attribute__((aligned(16))) _Float16 ws[GEMM_BN * GEMM_LDW];
+    __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * GEMM_LDW];
     const ExpertDev ed = ex[e];
     const uint8_t* body = sec4 + ed.body_off;
     switch (ed.gu_code) {
@@ -297,19 +298,19 @@ __global__ void __launch_bounds__(256) k_moe_gu_gemm(const uint8_t* __restrict__
 
 template <int FMT, int WM, int MTW, int WN, int NTW>
 __device__ __forceinline__ void dn_gemm_body(const uint8_t* dnw, int bx, int ty, int n, int base, const int* pairs, const __half* h2, const float* topk_w,
-                                             float* y, _Float16* ws) {
+                                             float* y, half_t* ws) {
     constexpr int SB = sk_sb_bytes(FMT);
     constexpr int BMT = WM * MTW * 16;
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
     const int wm = wave % WM, wn = wave / WM;
     const bool active = wn < WN;
     const uint8_t* wr = dnw + (size_t)(bx * GEMM_BN + (tid >> 2)) * 6 * SB;
-    const _Float16* xrow[MTW];
+    const half_t* xrow[MTW];
 #pragma unroll
     for (int i = 0; i < MTW; ++i) {
         int ml = ty * BMT + wm * MTW * 16 + i * 16 + (lane & 15);
         ml = ml < n ? ml : n - 1;
-        xrow[i] = (const _Float16*)h2 + (size_t)(base + ml) * MOE_D;
+        xrow[i] = (const half_t*)h2 + (size_t)(base + ml) * MOE_D;
     }
     fv8 acc[MTW][NTW];
     acc_zero(acc);
@@ -322,10 +323,10 @@ __device__ __forceinline__ void dn_gemm_body(const uint8_t* dnw, int bx, int ty,
     for (int i = 0; i < MTW; ++i)
 #pragma unroll
         for (int j = 0; j < NTW; ++j) {
-            const int c = bx * GEMM_BN + (wn * NTW + j) * 16 + (lane & 15);
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
-                const int ml = ty * BMT + wm * MTW * 16 + i * 16 + 2 * r + (lane >> 4);
+                const int c = bx * GEMM_BN + (wn * NTW + j) * 16 + acc_n(r, lane);
+                const int ml = ty * BMT + wm * MTW * 16 + i * 16 + acc_m(r, lane);
                 if (ml < n) {
                     const int pid = pairs[base + ml];
                     y[(size_t)pid * MOE_D + c] = acc[i][j][r] * topk_w[pid];
@@ -346,7 +347,7 @@ __global__ void __launch_bounds__(256) k_moe_dn_gemm(const uint8_t* __restrict__
     const int n = cnt[e];
     if (n <= nlo || n > nhi) return;
     if ((int)blockIdx.y * BMT >= n) return;
-    __shared__ __attribute__((aligned(16))) _Float16 ws[GEMM_BN * GEMM_LDW];
+    __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * GEMM_LDW];
     const ExpertDev ed = ex[e];
     const uint8_t* dnw = sec4 + ed.body_off + ed.dn_off;
     switch (ed.dn_code) {
@@ -361,6 +362,8 @@ __global__ void __launch_bounds__(256) k_moe_dn_gemm(const uint8_t* __restrict__
         default: break;
     }
 }
+
+#endif  // HY4_MMA
 
 __global__ void k_moe_reduce(const float* __restrict__ y, float* __restrict__ z_out) {
     const int t = blockIdx.x;
@@ -554,11 +557,20 @@ inline MoeWs moe_ws_split(void* ws, int P) {
 // z_out: float [M][1536] (overwritten = sum over the 16 slots of w * y). ws: moe_ws_bytes(M) bytes of device memory.
 // tuning knob: for M <= moe_dec_max_m() the GEMV-style decode kernels run, above it the grouped WMMA kernels with the smallest token tile per expert
 namespace skd {
-inline int& moe_dec_max_m() { static int v = 4; return v; }
+inline int& moe_dec_max_m() { static int v = HY4_MMA ? 4 : 8; return v; }
 }
+
+inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const int32_t* topk_idx, const float* topk_w,
+                            float* z_out, int M, void* ws);
 
 inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const int32_t* topk_idx, const float* topk_w,
                         float* z_out, int M, void* ws) {
+#if !HY4_MMA
+    if (M > 8) {  // no matrix-core grouped GEMM on this build: the simple path handles any M
+        moe_experts_ref(s, sec4_base, experts, z, topk_idx, topk_w, z_out, M, ws);
+        return;
+    }
+#endif
     const int P = M * MOE_TOPK;
     const skd::MoeWs w = skd::moe_ws_split(ws, P);
     const int eb = P < MOE_E ? P : MOE_E;
@@ -574,7 +586,9 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
         else if (M <= 8) { HY4_DEC(8); }
         else { HY4_DEC(16); }
 #undef HY4_DEC
-    } else {
+    }
+#if HY4_MMA
+    else {
         const int INF = 1 << 30;
         const dim3 b(256);
         // token tiles 16 / 32 / 64 / 128; an expert with n tokens uses the first tile with n <= BM (several 128-tiles above 64 tokens)
@@ -598,6 +612,7 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
                                w.active, w.nact, w.h2, w.y, 64, INF);
         }
     }
+#endif
     hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out);
 }
 

@@ -1,8 +1,7 @@
 // hy4_graph.hip.h - the 42-layer hy_v4_flash forward on gfx1151 (HIP): chunked prefill + decode, KV fp16, absorbed MLA, LatentMoE.
 // Built from: skgemm (linear_h / linear_f32), skmoe (moe_experts), mla_attn (mla_*), hy4_kernels (norms, iHC, router, engram), hy4_engram (hash + page reads).
 #pragma once
-#include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
+#include "hy4_gpu.h"
 
 #include <algorithm>
 #include <cstdio>

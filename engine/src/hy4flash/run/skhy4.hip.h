@@ -15,8 +15,13 @@ namespace hy4 {
 inline void linear_h(hipStream_t s, int fmt, const void* W, int N, int K, const __half* X, float* Y, int M) {
     if (fmt == FMT_Q8ROW) linear_h_ref(s, fmt, W, N, K, X, Y, M);
     else if (M <= 4) linear_h_gemv(s, fmt, W, N, K, X, Y, M);
+#if HY4_MMA
     else if (M <= 16) linear_h_gemm_s(s, fmt, W, N, K, X, Y, M);
     else linear_h_gemm(s, fmt, W, N, K, X, Y, M);
+#else
+    else if (M <= 16) linear_h_gemv(s, fmt, W, N, K, X, Y, M);
+    else linear_h_ref(s, fmt, W, N, K, X, Y, M);
+#endif
 }
 
 }  // namespace hy4

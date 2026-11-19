@@ -1,8 +1,7 @@
 // hy4_kernels.hip.h - elementwise / norm / iHC / router / engram / head kernels of the Hy4-Flash graph (gfx1151, wave32)
 // Residual stream x is fp32 [T][4][3072]. GEMM inputs are fp16, GEMM outputs fp32.
 #pragma once
-#include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
+#include "hy4_gpu.h"
 
 #include <cstdint>
 

@@ -1,0 +1,426 @@
+// cpu_experts_test.cpp - test / benchmark of hy4_cpu_experts (CPU routed-expert evaluator)
+//   cpu_experts_test <model.strata> <mode> [nlayers=10] [threads=6]
+//   modes: num     numeric check vs an fp32/double dequant reference (+ determinism over thread counts, T>512 chunking)
+//          bench   T = 1,4,8,64 timing, 16 experts/token, nlayers fully resident; DRAM read ceiling
+//          stress  ~10% random residency over all layers, unresident / invalid pairs must be skipped
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "hy4_cpu_experts.h"
+#include "strata/quant/sk_codecs.hpp"
+
+using namespace hy4;
+using strata::quant::sk::SkCode;
+
+static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+struct Rng {
+    uint64_t s;
+    explicit Rng(uint64_t seed) : s(seed * 0x9E3779B97F4A7C15ull + 1) {}
+    uint64_t next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; }
+    double uni() { return (next() >> 11) * (1.0 / 9007199254740992.0); }
+    double gauss() { double u = uni() + 1e-12, v = uni(); return std::sqrt(-2 * std::log(u)) * std::cos(6.283185307179586 * v); }
+    int below(int n) { return (int)(next() % (uint64_t)n); }
+};
+
+static float h2f(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16, ex = (h >> 10) & 0x1F, mn = h & 0x3FF, f;
+    if (ex == 0) {
+        if (mn == 0) f = sign;
+        else { uint32_t e2 = 127 - 14, m2 = mn; while (!(m2 & 0x400)) { m2 <<= 1; --e2; } m2 &= 0x3FF; f = sign | (e2 << 23) | (m2 << 13); }
+    } else if (ex == 31) f = sign | 0x7F800000u | (mn << 13);
+    else f = sign | ((ex + 112) << 23) | (mn << 13);
+    float o;
+    std::memcpy(&o, &f, 4);
+    return o;
+}
+
+static long vm_kb(const char* key) {
+    long v = -1;
+    if (FILE* f = std::fopen("/proc/self/status", "r")) {
+        char line[256];
+        size_t kl = std::strlen(key);
+        while (std::fgets(line, sizeof(line), f))
+            if (!std::strncmp(line, key, kl)) { std::sscanf(line + kl, " %ld", &v); break; }
+        std::fclose(f);
+    }
+    return v;
+}
+static void ram_line(const char* tag) {
+    std::printf("[ram] %s: VmRSS %.2f GB, VmHWM(peak) %.2f GB\n", tag, vm_kb("VmRSS:") / 1048576.0, vm_kb("VmHWM:") / 1048576.0);
+}
+
+// quantize-dequantize 1536 floats with the same Q8_1_G64 rule the evaluator uses (for the tight "same activations" check)
+static void qdq(float* x) {
+    strata::quant::sk::BlockQ8_1_G64 blk[24];
+    strata::quant::sk::quantize_q8_1_g64(x, blk, 1536);
+    for (int b = 0; b < 24; ++b)
+        for (int i = 0; i < 64; ++i) x[b * 64 + i] = blk[b].d * (float)blk[b].qs[i];
+}
+
+// straightforward reference: fp32 dequant of the real S_K rows, double accumulation, exact z (no activation quantization)
+static void reference(const CpuExperts& cx, int layer, int T, const float* z, const int32_t* idx, const float* w, const uint8_t* use, std::vector<double>& out, bool qact = false) {
+    out.assign((size_t)T * 1536, 0.0);
+    std::vector<float> row(1536);
+    std::vector<double> gu(3072), h(1536), sq(1536);
+    for (int t = 0; t < T; ++t)
+        for (int s = 0; s < 16; ++s) {
+            const size_t q = (size_t)t * 16 + s;
+            if (use && !use[q]) continue;
+            if (idx[q] < 0 || idx[q] >= 512) continue;
+            CpuExpertView v = cx.view(layer, idx[q]);
+            if (!v.body) continue;
+            const size_t gb = strata::quant::sk::superblock_bytes((SkCode)v.gu_code) * 6, db = strata::quant::sk::superblock_bytes((SkCode)v.dn_code) * 6;
+            for (int d = 0; d < 1536; ++d) sq[d] = h2f(((const uint16_t*)v.body)[d]);
+            std::vector<float> zt(z + (size_t)t * 1536, z + (size_t)(t + 1) * 1536);
+            if (qact) qdq(zt.data());
+            for (int r = 0; r < 3072; ++r) {
+                strata::quant::sk::dequant_sk_row(v.body + 3072 + (size_t)r * gb, (SkCode)v.gu_code, row.data(), 1536);
+                double a = 0;
+                for (int k = 0; k < 1536; ++k) a += (double)row[k] * zt[k];
+                gu[r] = a;
+            }
+            for (int d = 0; d < 1536; ++d) {
+                double g = gu[d], u = gu[1536 + d];
+                double si = g / (1.0 + std::exp(-g));
+                h[d] = std::min(si, 10.0) * std::max(-10.0, std::min(u, 10.0)) / sq[d];
+            }
+            std::vector<float> hf(h.begin(), h.end());
+            if (qact) qdq(hf.data());
+            for (int r = 0; r < 1536; ++r) {
+                strata::quant::sk::dequant_sk_row(v.body + v.dn_off + (size_t)r * db, (SkCode)v.dn_code, row.data(), 1536);
+                double a = 0;
+                for (int k = 0; k < 1536; ++k) a += (double)row[k] * hf[k];
+                out[(size_t)t * 1536 + r] += (double)w[q] * a;
+            }
+        }
+}
+
+struct Err { double max_rel = 0, mean_rel = 0, min_cos = 1, mean_cos = 0, max_abs_rel = 0; int n = 0; };
+static Err compare(const float* got, const std::vector<double>& ref, int T, const int* tok_list = nullptr, int nlist = 0) {
+    Err e;
+    for (int i = 0; i < (tok_list ? nlist : T); ++i) {
+        const int t = tok_list ? tok_list[i] : i;
+        double dd = 0, rr = 0, gg = 0, gr = 0, rmax = 0, dmax = 0;
+        for (int c = 0; c < 1536; ++c) {
+            double g = got[(size_t)t * 1536 + c], r = ref[(size_t)t * 1536 + c], d = g - r;
+            dd += d * d; rr += r * r; gg += g * g; gr += g * r;
+            rmax = std::max(rmax, std::fabs(r)); dmax = std::max(dmax, std::fabs(d));
+        }
+        if (rr == 0) continue;
+        const double rel = std::sqrt(dd / rr), cs = gr / (std::sqrt(gg) * std::sqrt(rr) + 1e-300);
+        e.max_rel = std::max(e.max_rel, rel); e.mean_rel += rel; e.min_cos = std::min(e.min_cos, cs); e.mean_cos += cs;
+        e.max_abs_rel = std::max(e.max_abs_rel, dmax / rmax);
+        ++e.n;
+    }
+    if (e.n) { e.mean_rel /= e.n; e.mean_cos /= e.n; }
+    return e;
+}
+static void print_err(const char* tag, const Err& e) {
+    std::printf("  %-34s tokens %3d  rel-L2 max %.3e mean %.3e | cos min %.8f mean %.8f | max|d|/max|ref| %.3e\n", tag, e.n, e.max_rel, e.mean_rel, e.min_cos, e.mean_cos, e.max_abs_rel);
+}
+
+struct Batch {
+    int T;
+    std::vector<float> z, w;
+    std::vector<int32_t> idx;
+};
+static Batch make_batch(Rng& r, int T, const std::vector<int>& pool /*expert ids to draw from; empty = 0..511*/) {
+    Batch b;
+    b.T = T;
+    b.z.resize((size_t)T * 1536);
+    b.w.resize((size_t)T * 16);
+    b.idx.resize((size_t)T * 16);
+    for (auto& x : b.z) x = (float)r.gauss();
+    for (int t = 0; t < T; ++t) {
+        std::set<int> used;
+        for (int s = 0; s < 16; ++s) {
+            int e;
+            do { e = pool.empty() ? r.below(512) : pool[r.below((int)pool.size())]; } while (used.count(e));
+            used.insert(e);
+            b.idx[(size_t)t * 16 + s] = e;
+            b.w[(size_t)t * 16 + s] = (float)(0.1 + 0.6 * r.uni());
+        }
+    }
+    return b;
+}
+
+static int test_num(const std::string& path, int nth) {
+    const int L = 5;
+    Rng rng(7);
+    std::vector<std::vector<bool>> mask(41, std::vector<bool>(512, false));
+    std::vector<int> pool;
+    {
+        std::set<int> s;
+        while ((int)s.size() < 40) s.insert(rng.below(512));
+        pool.assign(s.begin(), s.end());
+        for (int e : pool) mask[L][e] = true;
+    }
+    CpuExperts cx;
+    std::string err;
+    if (!cx.init(path, nth, &mask, err)) { std::printf("init failed: %s\n", err.c_str()); return 1; }
+    {
+        int hist[9] = {};
+        for (int e : pool) { CpuExpertView v = cx.view(L, e); hist[v.gu_code]++; }
+        std::printf("layer %d: 40 resident experts, gu code histogram S2..S6,S8: ", L);
+        for (int c = 2; c <= 8; ++c) if (hist[c]) std::printf("S%d=%d ", c, hist[c]);
+        std::printf("\n");
+    }
+    int bad = 0;
+    for (int T : {1, 4, 8, 64}) {
+        Batch b = make_batch(rng, T, pool);
+        std::vector<float> out((size_t)T * 1536, -777.f);
+        cx.submit(L, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, out.data());
+        cx.wait();
+        std::vector<double> ref;
+        reference(cx, L, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, ref);
+        Err e = compare(out.data(), ref, T);
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "T=%d (all 16 experts CPU)", T);
+        print_err(tag, e);
+        if (!(e.max_rel < 3e-2 && e.min_cos > 0.9995)) { std::printf("  FAIL: error larger than int8-activation level\n"); ++bad; }
+        if (T <= 8 || T == 64) {
+            // tight check: same Q8_1 activations in the reference (only h-quantization differs where rounding flips) -> kernel correctness
+            std::vector<double> refq;
+            reference(cx, L, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, refq, true);
+            Err eq = compare(out.data(), refq, T);
+            print_err("  same-activations reference", eq);
+            if (!(eq.max_rel < 2e-3)) { std::printf("  FAIL: kernel differs from same-activation reference\n"); ++bad; }
+        }
+        // accumulate mode
+        std::vector<float> acc((size_t)T * 1536, 1.0f);
+        cx.submit(L, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, acc.data(), true);
+        cx.wait();
+        double md = 0;
+        for (size_t i = 0; i < acc.size(); ++i) md = std::max(md, (double)std::fabs(acc[i] - 1.0f - out[i]));
+        std::printf("  accumulate mode: max |(1+partial)-1 - partial| = %.3e (float rounding only)\n", md);
+        if (md > 1e-5) ++bad;
+        // determinism: second run bit-exact
+        std::vector<float> out2((size_t)T * 1536, 5.f);
+        cx.submit(L, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, out2.data());
+        cx.wait();
+        std::printf("  rerun bit-exact: %s\n", std::memcmp(out.data(), out2.data(), out.size() * 4) == 0 ? "yes" : "NO");
+        if (std::memcmp(out.data(), out2.data(), out.size() * 4) != 0) ++bad;
+        if (T == 8) {
+            // thread-count independence
+            CpuExperts c1;
+            if (!c1.init(path, 1, &mask, err)) { std::printf("init(1) failed: %s\n", err.c_str()); return 1; }
+            std::vector<float> o1((size_t)T * 1536, 9.f);
+            c1.submit(L, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, o1.data());
+            c1.wait();
+            const bool same = std::memcmp(out.data(), o1.data(), out.size() * 4) == 0;
+            std::printf("  1 thread vs %d threads bit-exact: %s\n", nth, same ? "yes" : "NO");
+            if (!same) ++bad;
+        }
+    }
+    // chunking T > 512: tokens around the chunk boundary vs single-token jobs and vs reference
+    {
+        const int T = 600;
+        Batch b = make_batch(rng, T, pool);
+        std::vector<float> out((size_t)T * 1536, -1.f);
+        cx.submit(L, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, out.data());
+        cx.wait();
+        const int probe[] = {0, 1, 255, 510, 511, 512, 513, 599};
+        double md = 0;
+        std::vector<float> one(1536);
+        for (int t : probe) {
+            cx.submit(L, 1, b.z.data() + (size_t)t * 1536, b.idx.data() + (size_t)t * 16, b.w.data() + (size_t)t * 16, nullptr, one.data());
+            cx.wait();
+            for (int c = 0; c < 1536; ++c) md = std::max(md, (double)std::fabs(one[c] - out[(size_t)t * 1536 + c]));
+        }
+        std::printf("  T=600 (2 chunks) vs single-token jobs on 8 probe tokens: max |diff| = %.3e\n", md);
+        if (md > 1e-3) ++bad;
+        // reference on 2 probe tokens
+        std::vector<int32_t> idx2(32);
+        std::vector<float> w2(32), z2(2 * 1536);
+        for (int k = 0; k < 2; ++k) {
+            int t = k ? 512 : 510;
+            std::memcpy(&idx2[k * 16], &b.idx[(size_t)t * 16], 64);
+            std::memcpy(&w2[k * 16], &b.w[(size_t)t * 16], 64);
+            std::memcpy(&z2[(size_t)k * 1536], &b.z[(size_t)t * 1536], 6144);
+        }
+        std::vector<double> ref;
+        reference(cx, L, 2, z2.data(), idx2.data(), w2.data(), nullptr, ref);
+        std::vector<float> g2(2 * 1536);
+        std::memcpy(g2.data(), &out[(size_t)510 * 1536], 6144);
+        std::memcpy(g2.data() + 1536, &out[(size_t)512 * 1536], 6144);
+        print_err("T=600 tokens 510,512 vs reference", compare(g2.data(), ref, 2));
+    }
+    ram_line("num end");
+    std::printf("NUM TEST: %s\n", bad ? "FAIL" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static double sum_arena(const CpuExperts& cx, int layers, int nth, double* gbps_out) {
+    // multi-threaded read-only sum over all resident bodies = DRAM read ceiling for this thread count
+    std::vector<std::pair<const uint8_t*, size_t>> segs;
+    for (int l = 0; l < layers; ++l)
+        for (int e = 0; e < 512; ++e) {
+            CpuExpertView v = cx.view(l, e);
+            if (v.body) segs.push_back({v.body, v.body_bytes});
+        }
+    size_t total = 0;
+    for (auto& s : segs) total += s.second;
+    double best = 0;
+    for (int pass = 0; pass < 3; ++pass) {
+        std::vector<std::thread> th;
+        std::vector<uint64_t> part(nth, 0);
+        double t0 = now_s();
+        for (int i = 0; i < nth; ++i)
+            th.emplace_back([&, i]() {
+                uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+                for (size_t k = i; k < segs.size(); k += nth) {
+                    const uint64_t* p = (const uint64_t*)segs[k].first;
+                    size_t n = segs[k].second / 8 / 4 * 4;
+                    for (size_t j = 0; j < n; j += 4) { a0 += p[j]; a1 += p[j + 1]; a2 += p[j + 2]; a3 += p[j + 3]; }
+                }
+                part[i] = a0 + a1 + a2 + a3;
+            });
+        for (auto& t : th) t.join();
+        double dt = now_s() - t0;
+        best = std::max(best, total / dt / 1e9);
+        volatile uint64_t sink = 0;
+        for (auto v : part) sink += v;
+    }
+    *gbps_out = best;
+    return (double)total;
+}
+
+static int test_bench(const std::string& path, int nlayers, int nth) {
+    std::vector<std::vector<bool>> mask(41, std::vector<bool>(512, false));
+    for (int l = 0; l < nlayers; ++l) std::fill(mask[l].begin(), mask[l].end(), true);
+    CpuExperts cx;
+    std::string err;
+    if (!cx.init(path, nth, &mask, err)) { std::printf("init failed: %s\n", err.c_str()); return 1; }
+    ram_line("after load");
+    double bw;
+    sum_arena(cx, nlayers, nth, &bw);
+    std::printf("DRAM read ceiling (plain sum loop, %d threads over the arena): %.1f GB/s\n", nth, bw);
+    Rng rng(11);
+    std::printf("%-4s %-6s %-10s %-10s %-10s %-12s %-10s\n", "T", "reps", "ms/layer", "p50 ms", "min ms", "MB/layer", "GB/s(mean)");
+    for (int T : {1, 4, 8, 64}) {
+        const int reps = T <= 8 ? 60 : 12;
+        std::vector<double> ms;
+        std::vector<float> out((size_t)T * 1536);
+        double bytes_total = 0, wall_total = 0;
+        // warm-up (one job)
+        { Batch b = make_batch(rng, T, {}); cx.submit(0, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, out.data()); cx.wait(); }
+        for (int r = 0; r < reps; ++r) {
+            Batch b = make_batch(rng, T, {});
+            const int layer = r % nlayers;
+            cx.reset_stats();
+            double t0 = now_s();
+            cx.submit(layer, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, out.data());
+            cx.wait();
+            double dt = now_s() - t0;
+            CpuExpertStats s = cx.stats();
+            ms.push_back(dt * 1e3);
+            bytes_total += (double)s.bytes;
+            wall_total += dt;
+        }
+        std::sort(ms.begin(), ms.end());
+        double mean = 0;
+        for (double v : ms) mean += v;
+        mean /= ms.size();
+        std::printf("%-4d %-6d %-10.3f %-10.3f %-10.3f %-12.1f %-10.2f\n", T, reps, mean, ms[ms.size() / 2], ms[0], bytes_total / reps / 1e6, bytes_total / wall_total / 1e9);
+    }
+    // T=1 with a fixed layer and the same 16 experts every time (cache-warm upper bound, 16 experts ~ 45 MB > L3)
+    {
+        Batch b = make_batch(rng, 1, {});
+        std::vector<float> out(1536);
+        std::vector<double> ms;
+        for (int r = 0; r < 40; ++r) {
+            double t0 = now_s();
+            cx.submit(1, 1, b.z.data(), b.idx.data(), b.w.data(), nullptr, out.data());
+            cx.wait();
+            ms.push_back((now_s() - t0) * 1e3);
+        }
+        std::sort(ms.begin(), ms.end());
+        std::printf("T=1 same 16 experts repeated: p50 %.3f ms min %.3f ms\n", ms[ms.size() / 2], ms[0]);
+    }
+    ram_line("bench end");
+    return 0;
+}
+
+static int test_stress(const std::string& path, int nth) {
+    Rng rng(99);
+    std::vector<std::vector<bool>> mask(41, std::vector<bool>(512, false));
+    int nres = 0;
+    for (int l = 0; l < 41; ++l)
+        for (int e = 0; e < 512; ++e)
+            if (rng.below(10) == 0) { mask[l][e] = true; ++nres; }
+    CpuExperts cx;
+    std::string err;
+    if (!cx.init(path, nth, &mask, err)) { std::printf("init failed: %s\n", err.c_str()); return 1; }
+    ram_line("after load");
+    std::printf("mask %d experts, resident_count %llu, arena %.2f GB\n", nres, (unsigned long long)cx.resident_count(), cx.arena_bytes() / 1e9);
+    int bad = 0;
+    if ((uint64_t)nres != cx.resident_count()) { std::printf("FAIL resident_count\n"); ++bad; }
+    for (int l = 0; l < 41; ++l)
+        for (int e = 0; e < 512; ++e)
+            if (cx.resident(l, e) != (bool)mask[l][e]) { std::printf("FAIL resident() mismatch l=%d e=%d\n", l, e); ++bad; l = 99; break; }
+    uint64_t exp_skipped = 0, exp_pairs = 0;
+    double worst_rel = 0, worst_cos = 1;
+    cx.reset_stats();
+    for (int l = 0; l < 41; ++l) {
+        const int T = 1 + (l % 5);
+        Batch b = make_batch(rng, T, {});
+        std::vector<uint8_t> use((size_t)T * 16);
+        for (auto& u : use) u = rng.below(10) != 0;
+        if (l % 7 == 3) { b.idx[0] = -1; use[0] = 1; b.idx[1] = 600; use[1] = 1; exp_skipped += 2; }  // invalid ids must be skipped
+        for (size_t q = 0; q < use.size(); ++q) {
+            const int e = b.idx[q];
+            if (e < 0 || e >= 512) continue;
+            if (!use[q]) continue;
+            if (mask[l][e]) ++exp_pairs; else ++exp_skipped;
+        }
+        std::vector<float> out((size_t)T * 1536, std::nanf(""));
+        cx.submit(l, T, b.z.data(), b.idx.data(), b.w.data(), use.data(), out.data());
+        cx.wait();
+        std::vector<double> ref;
+        reference(cx, l, T, b.z.data(), b.idx.data(), b.w.data(), use.data(), ref);
+        bool nan = false;
+        for (float v : out) if (std::isnan(v)) nan = true;
+        if (nan) { std::printf("FAIL layer %d: NaN left in zout (overwrite mode must write every token)\n", l); ++bad; }
+        Err e = compare(out.data(), ref, T);
+        worst_rel = std::max(worst_rel, e.max_rel);
+        worst_cos = std::min(worst_cos, e.min_cos);
+        // tokens with no CPU pair must be exactly zero
+        for (int t = 0; t < T; ++t) {
+            bool any = false;
+            for (int s = 0; s < 16; ++s) {
+                size_t q = (size_t)t * 16 + s;
+                if (use[q] && b.idx[q] >= 0 && b.idx[q] < 512 && mask[l][b.idx[q]]) any = true;
+            }
+            if (!any) for (int c = 0; c < 1536; ++c) if (out[(size_t)t * 1536 + c] != 0.0f) { std::printf("FAIL layer %d token %d should be zero\n", l, t); ++bad; break; }
+        }
+    }
+    CpuExpertStats s = cx.stats();
+    std::printf("stats: jobs %llu pairs %llu (expected %llu) skipped %llu (expected %llu)\n", (unsigned long long)s.jobs, (unsigned long long)s.pairs,
+                (unsigned long long)exp_pairs, (unsigned long long)s.skipped_unresident, (unsigned long long)exp_skipped);
+    if (s.pairs != exp_pairs || s.skipped_unresident != exp_skipped) { std::printf("FAIL counters\n"); ++bad; }
+    std::printf("over 41 layers: worst rel-L2 %.3e, worst cos %.8f\n", worst_rel, worst_cos);
+    if (worst_rel > 3e-2) ++bad;
+    ram_line("stress end");
+    std::printf("STRESS TEST: %s\n", bad ? "FAIL" : "PASS");
+    return bad ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 3) { std::printf("usage: %s <model.strata> <num|bench|stress> [nlayers] [threads]\n", argv[0]); return 2; }
+    const std::string path = argv[1], mode = argv[2];
+    const int nl = argc > 3 ? std::atoi(argv[3]) : 10, nth = argc > 4 ? std::atoi(argv[4]) : 6;
+    std::printf("isa %s, threads %d\n", strata::quant::sk::active_sk_isa(), nth);
+    if (mode == "num") return test_num(path, nth);
+    if (mode == "bench") return test_bench(path, std::min(nl, 41), nth);
+    if (mode == "stress") return test_stress(path, nth);
+    return 2;
+}

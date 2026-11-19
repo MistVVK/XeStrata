@@ -163,7 +163,7 @@ int main(int argc, char** argv) {
     HCK(hipGetDeviceProperties(&p, 0));
     size_t fr = 0, tot = 0;
     HCK(hipMemGetInfo(&fr, &tot));
-    fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, p.gcnArchName, fr / 1073741824.0, tot / 1073741824.0);
+    fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0);
     GpuModel g;
     double t_load0 = now_s();
     if (!load_gpu_model(g, model, true)) return 1;
