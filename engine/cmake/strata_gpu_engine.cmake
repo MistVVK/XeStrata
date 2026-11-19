@@ -160,6 +160,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(qsa_topk_active_parity PRIVATE strata_kernels CUDA::cudart)
     add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
     set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
+    # the same cases through the one-read top-k (#2093, STRATA_TOPK_SAMPLE=1, Turing's default) on any CUDA card: the
+    # same ids, including the rows past 524,288 cells where its sampling stride doubles
+    add_test(NAME qsa_topk_active_parity_sample COMMAND qsa_topk_active_parity)
+    set_tests_properties(qsa_topk_active_parity_sample PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "STRATA_TOPK_SAMPLE=1")
     # STRATA_QSA_SLOTS: a batch window's scores, top-k and attention as one launch over rows of different slots
     # against one call per row, bitwise (synthetic, no model)
     add_executable(qsa_slots_parity src/kernels/qsa_slots_parity.cpp)

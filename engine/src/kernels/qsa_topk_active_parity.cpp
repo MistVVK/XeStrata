@@ -19,7 +19,8 @@ void ck(cudaError_t e) {
 }
 struct Case { int64_t ctx, queries; int mode; };
 bool check(Case c) {
-    constexpr int64_t stride = 262144 / 4 + 2;
+    // the score-row stride: the 262144 capacity, or the case's own context past it (the 1M cases)
+    const int64_t stride = std::max<int64_t>(262144, c.ctx) / 4 + 2;
     const auto s = k::qsa_real_shapes();
     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);
     std::vector<int32_t> steps((size_t)(c.queries * k::kStepCount));
@@ -90,8 +91,12 @@ int main() {
         {131072, 256, 1}, {131072, 256, 2}, {131072, 256, 3}, {131072, 256, 4},
         // either side of the Turing wide-kernel bound (22,528 blocks), and ties above the register limit
         {90108, 256, 0}, {90112, 256, 0}, {200000, 256, 2}, {262144, 256, 1},
+        // either side of the one-read top-k's first stride doubling (TS_CAP * 32 blocks = 524,288 cells), and 1M-cell
+        // rows with random scores, ties, an odd query count and a batch of one
+        {524284, 256, 0}, {524288, 256, 0}, {600000, 256, 0}, {1000000, 256, 0}, {1000000, 257, 0}, {1000000, 1, 0},
+        {1000000, 256, 1}, {1000000, 256, 2},
     };
     for (const auto c : cases) if (!check(c)) return 1;
-    std::puts("PASS: 20 top-k active-bound cases, selected IDs bitwise identical");
+    std::puts("PASS: 28 top-k active-bound cases, selected IDs bitwise identical");
     return 0;
 }

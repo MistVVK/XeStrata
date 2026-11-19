@@ -2705,6 +2705,10 @@ bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq,
 // order.  Otherwise (too few cells above LB, or more than SM_CAP candidates) the query is flagged and
 // block_topk_wide_kernel<true> runs it.  STRATA_TOPK_SAMPLE=0 keeps the wide kernel alone.
 constexpr int TS_STRIDE = 32, TS_CAP = 4096;
+// Past TS_CAP * TS_STRIDE blocks (524,288 cells) the sampling stride doubles (64 up to 1M cells, 128 up to 2M) instead of
+// failing every query at `ns > TS_CAP`, which handed the whole second half of a 1M prompt to the six-read wide kernel.
+// The candidate budget, the threshold and the emit are unchanged, so the ids stay the reference's.
+constexpr int TS_STRIDE_MAX = 128;
 
 __device__ __forceinline__ int ts_block_scan(int v, int* s_w) {   // exclusive scan over the CTA's TK_T threads
     const int t = threadIdx.x, lane = t & 31, w = t >> 5;
@@ -2747,14 +2751,16 @@ __global__ void __launch_bounds__(TK_T) block_topk_sample_kernel(const float* __
     const float* sc = scores + qi * max_blocks;
     const int64_t nb = n_bid + 1;
     auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
-    const int ns = (int) ((nb + TS_STRIDE - 1) / TS_STRIDE);
+    int ts = TS_STRIDE;                           // the sampling stride: a function of nb, so uniform over the CTA
+    while (ts < TS_STRIDE_MAX && nb > (int64_t) TS_CAP * ts) ts <<= 1;
+    const int ns = (int) ((nb + ts - 1) / ts);
     if (ns > TS_CAP) { if (t == 0) g_tk_fail[qi] = 1; return; }
-    // 1. the bound: the KS-th largest of every 32nd block's key (a block without cells counts as the smallest key)
+    // 1. the bound: the KS-th largest of every ts-th block's key (a block without cells counts as the smallest key)
     for (int i = t; i < ns; i += TK_T) {
-        const int64_t b = (int64_t) i * TS_STRIDE;
+        const int64_t b = (int64_t) i * ts;
         s_key[i] = weight(b) ? order_key(sc[b]) : 0u;
     }
-    const int ks_want = (int) (2 * ((width + R * TS_STRIDE - 1) / (R * TS_STRIDE)) + 16);
+    const int ks_want = (int) (2 * ((width + R * ts - 1) / (R * ts)) + 16);
     int need = ks_want < ns ? ks_want : ns;
     uint32_t prefix = 0;
     for (int shift = 24; shift >= 0; shift -= 8) {
