@@ -631,9 +631,9 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return cpu_avx2_ok() && v != nullptr && std::atoi(v) != 0; }();
     // BW-4 (0.2.17): on an AVX-512 VNNI CPU the same rows in 512-bit lanes (kq_avx512.cpp): the integer part of a Q4_K block on vpdpbusd / vpdpwssd, the weights decoded once per row
-    // for every token of the group.  Bit-exact against the per-token dot (kq512_ok checks that on first use, per build); STRATA_NO_KQ512=1 never takes them, STRATA_KQ512_MIN=N: from N tokens on (default 3 for the Q4_K gate/up rows, 2 for the Q5_1 / Q8_0 down rows: below that the per-token dot is as fast or faster, measured on a Xeon 8352V).
+    // for every token of the group.  Bit-exact against the per-token dot (kq512_ok checks that on first use, per build); STRATA_NO_KQ512=1 never takes them, STRATA_KQ512_MIN=N: from N tokens on (default 8 = the prompt share's jobs; the 2-7 token groups of a decode window ran 1-6% slower on the rows at floors 3 and 4 on a Xeon 8352V, level at 8).
     static const bool kq512 = cpu_avx512_ok() && std::getenv("STRATA_NO_KQ512") == nullptr;
-    static const int kq512_min = [] { const char* e = std::getenv("STRATA_KQ512_MIN"); return e ? std::atoi(e) : 3; }();
+    static const int kq512_min = [] { const char* e = std::getenv("STRATA_KQ512_MIN"); return e ? std::atoi(e) : 8; }();
     static const bool kq512_gu_ok = kq512 && kq512_ok(12);   // (checked once: the check takes a mutex, and this runs on every pool thread for every row range)
     if (kq512_gu_ok && f.gu_type == 12 && nt >= kq512_min && (Arithmetic == NativeArithmetic::Default || flavour_avx2())) {
         kq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
@@ -741,7 +741,7 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     }
     // BW-4: Q5_1 / Q8_0 down rows in 256-bit VNNI lanes with the weights decoded once per row (kq_avx512.cpp), bit-exact (kq512_ok), as the Q4_K gate/up rows in native_gu_rows
     static const bool kq512 = cpu_avx512_ok() && std::getenv("STRATA_NO_KQ512") == nullptr;
-    static const int kq512_min = [] { const char* e = std::getenv("STRATA_KQ512_MIN"); return e ? std::atoi(e) : 2; }();
+    static const int kq512_min = [] { const char* e = std::getenv("STRATA_KQ512_MIN"); return e ? std::atoi(e) : 8; }();
     static const bool kq512_q51_ok = kq512 && kq512_ok(7), kq512_q80_ok = kq512 && kq512_ok(8);   // (checked once, see native_gu_rows)
     if (((f.d_type == 7 && kq512_q51_ok) || (f.d_type == 8 && kq512_q80_ok)) && nt >= kq512_min && (Arithmetic == NativeArithmetic::Default || flavour_avx2())) {
         kq512_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
