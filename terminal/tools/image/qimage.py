@@ -132,7 +132,7 @@ def cmake_defs(backend: str, arch=None, rocm: Path | None = None, cuda_root: Pat
                  f"-DCMAKE_C_COMPILER={llvm / 'bin' / 'clang'}", f"-DCMAKE_CXX_COMPILER={llvm / 'bin' / 'clang++'}",
                  f"-DCMAKE_HIP_COMPILER={llvm / 'bin' / 'clang++'}",
                  f"-DCMAKE_PREFIX_PATH={rocm};{rocm / 'lib' / 'rocm_sysdeps'};{llvm}",
-                 f"-DCMAKE_HIP_FLAGS=--rocm-path={rocm} --rocm-device-lib-path={bitcode}"]
+                 f"-DCMAKE_HIP_FLAGS=-isystem {rocm}/include --rocm-path={rocm} --rocm-device-lib-path={bitcode}"]
     elif backend == "vulkan":
         defs += ["-DSD_VULKAN=ON"]
     elif backend != "cpu":
