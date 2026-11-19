@@ -149,6 +149,43 @@ void columns() {
     check(!load(d.path, 2, 512, err), "a column after the shard column is refused");
 }
 
+// Sync's v6: the pack is made here so it needs neither model files nor a GPU.
+void sync_v6() {
+    using namespace strata::kernels::cpu;
+    float p2[3][4];
+    for (auto& m : p2) for (float& q : m) q = 1.f;
+    NativeFmt a, b;
+    std::string err;
+    if (!native_r1q2_fmt(182, 183, 256, 128, p2, a, err) ||
+        !native_r1q2_fmt(183, 184, 256, 128, p2, b, err)) {
+        check(false, "Sync v6: create formats: " + err); return;
+    }
+    TempDir d;
+    const std::string header = "# strata native experts v6: (n_expert 2, expert_embd 256, expert_ff 128)\n";
+    const std::string manifest = header + "0 183 184 0 " + std::to_string(b.bytes) + "\n1 183 184 " +
+                                 std::to_string(a.bytes + b.bytes) + " " + std::to_string(b.bytes) + "\n";
+    const std::string kinds = "0 0 182 183\n0 1 183 184\n1 0 183 184\n1 1 182 183\n";
+    write_text(d.path / "native_experts.txt", manifest);
+    write_text(d.path / "experts_k.txt", kinds);
+    write_text(d.path / "r1q2.txt", "0 0 0 0 0 0 0\n1 0 0 0 0 0 0\n");
+    write_text(d.path / "hadamard.txt", "# strata hadamard v1\nblock 128\nlayer 0 1 1 1\nlayer 1 1 1 1\n");
+    bool ok = load(d.path, 2, 2, err);
+    const ExpertLayout& L = expert_layout();
+    check(ok && L.mixed() && L.total == 2 * (a.bytes + b.bytes) &&
+          L.blob_offset(0, 0) == 0 && L.blob_offset(0, 1) == a.bytes &&
+          L.blob_offset(1, 0) == a.bytes + b.bytes && L.blob_offset(1, 1) == a.bytes + 2 * b.bytes &&
+          L.blob_bytes(0, 0) == a.bytes && L.blob_bytes(0, 1) == b.bytes &&
+          L.format(1, 1).gu_type == 182 && L.format(1, 1).had_gu && L.format(1, 1).had_d,
+          "Sync v6: mixed sizes, positions, types and Hadamard" + (ok ? "" : ": " + err));
+    write_text(d.path / "experts_k.txt", kinds + "0 0 182 183\n");
+    check(!load(d.path, 2, 2, err) && err.find("duplicate") != std::string::npos, "Sync v6: duplicate expert refused");
+    write_text(d.path / "experts_k.txt", "0 0 182 183\n");
+    check(!load(d.path, 2, 2, err) && err.find("missing") != std::string::npos, "Sync v6: missing expert refused");
+    write_text(d.path / "experts_k.txt", kinds);
+    write_text(d.path / "r1q2.txt", "0 0 0 0 0 0 0\n");
+    check(!load(d.path, 2, 2, err), "Sync v6: missing scale table refused");
+}
+
 // ---- 2b. v6: the latent MoE's A-only pack (Edge0): the header's widths, no hadamard.txt, the column scales
 void latent_v6() {
     strata::kernels::cpu::NativeFmt f;
@@ -406,6 +443,7 @@ int main(int argc, char** argv) try {
     real_packs(argv[1]);
     columns();
     latent_v6();
+    sync_v6();
     arena();
     std::printf(g_fail ? "expert_layout_test: %d FAILED\n" : "expert_layout_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;
