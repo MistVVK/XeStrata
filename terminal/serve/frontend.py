@@ -1885,16 +1885,22 @@ class OutputParser:
 
     def _quoted_think_end(self, i: int) -> bool | None:
         """#537: the `</think>` at self.buf[i] is the model quoting the tag while it thinks, not the end of the
-        thinking: written right after a quote or backtick and followed by anything but a line break, as in `</think>`
-        or "</think>...".  The end of the thinking is followed by a line break.  None while the character after the
+        thinking: written right after an OPENING quote or backtick and followed by anything but a line break, as in
+        `</think>` or "</think>...", or closed by the same quote right after it.  A quote that closes a sentence
+        (`...number only."</think>2`) is no quoting of the tag: GLM ends short reasoning that way and answers on the
+        same line, which the old test kept as reasoning, leaving the answer empty.  None while the character after the
         tag has not arrived."""
-        before = self.buf[i - 1] if i else self.line[-1:]
+        context = self.line + self.buf[:i] if i < 2 else self.buf[:i]
+        before = context[-1:]
         if before not in ('"', "'", "`"):
             return False
         after = self.buf[i + len(THINK_END):]
         if not after:
             return None
-        return after[0] not in "\r\n"
+        if after[0] == before:                       # "</think>" / `</think>`: the tag inside a pair of quotes
+            return True
+        opens = context[-2:-1] in ("", " ", "\t", "\n", "(", "[", "{", ":")
+        return opens and after[0] not in "\r\n"
 
     def _stray_think_at(self) -> int:
         """#4077: where self.buf has a `</think>` at the start of a line, in the answer of a turn whose reasoning
