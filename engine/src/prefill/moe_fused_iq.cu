@@ -2646,10 +2646,11 @@ bool q8d_f16_default(const DevInfo& d) {
 // The switch means the same everywhere: 1 on, 0 off, unset = the platform's default.
 bool q50_on(const DevInfo& d) {
 #if defined(__HIPCC__)
-    if (!d.w12 && !d.g1151) return false;
+    if (!d.w12 && !d.g1151 && !d.g11) return false;
     static const int env = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q50"); return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '1' ? 1 : 0); }();
     if (env >= 0) return env == 1;
     if (d.w12) return strata::core::kGfx12PromptDefaultsOn;   // gfx12: on by default under Linux, opt-in under Windows
+    if (d.g11) return false;   // gfx1100 - gfx1102 (#5980): the F16 kernel gfx1151 uses, as an opt-in only (STRATA_PF_FUSED_Q50=1, with STRATA_PF_F16=1)
 #if defined(_WIN32)
     const char* off = std::getenv("STRATA_GFX1151_DEFAULTS");
     return !(off != nullptr && off[0] == '0');
