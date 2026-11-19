@@ -329,7 +329,7 @@ struct GpuPlanSink {
     int64_t cap = 0;
     void (*publish)(void* ctx) = nullptr;
     /// Starts the DMA copies of `n` host blobs (pinned) into staging slots 0..n-1 and signals the GPU when they land.
-    void (*fetch)(void* ctx, const uint8_t* const* src, int n, size_t bytes) = nullptr;
+    void (*fetch)(void* ctx, const uint8_t* const* src, int n, const size_t* bytes, size_t stride) = nullptr;
     void* ctx = nullptr;
     /// Plan v0.3 P6: how a PCIe group reaches the GPU.  0 = the copy engine stages it (DMA, `fetch`); 1 = the grouped
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
@@ -1024,6 +1024,8 @@ private:
         const ComplementChunk* c = chunk_of(chunks, offset);
         return c->host + (size_t) (offset - c->start);
     }
+    /// A free span for a RAM replacement, counting the outgoing expert as free. kNoComplement means no fit.
+    uint64_t replacement_offset(size_t outgoing, uint64_t bytes) const;
     uint8_t* complement_at(uint64_t offset) const {
         return complement_chunks_.empty() ? (uint8_t*) complement_host_ + (size_t) offset
                                           : chunk_at(complement_chunks_, offset);
@@ -1046,7 +1048,7 @@ private:
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
     std::vector<int> layer_dev_;              ///< layer_devices: each layer's engine device (empty: one runtime)
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
-    struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
+    struct Exchange { size_t in, out; int64_t q; uint64_t bytes, at; };
     std::vector<Exchange> staged_;
     uint8_t* xstage_ = nullptr;               ///< exchange buffers, `xstage_cap_ x xstage_blob_`
     std::vector<std::pair<int, std::vector<void*>>> stage_reg_;   ///< register_on: a device, its registrations

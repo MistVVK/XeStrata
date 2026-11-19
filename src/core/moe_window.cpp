@@ -10,6 +10,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/latent.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -247,6 +248,11 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), shape.n_embd, max_ff),
             strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), max_ff)));
+        if (lay.mixed()) {
+            bih3_types_ = b.take<uint8_t>((uint64_t) lay.n_layers * (uint64_t) lay.n_expert * 2);
+            bih3_scratch_ = b.take<uint8_t>(strata::kernels::bih3_r1q2_grouped_scratch_bytes(
+                (int64_t) (T * K), shape.n_embd, max_ff));
+        }
         if (latent_) {
             const uint64_t ELL = (uint64_t) lat_ELL_, G = (uint64_t) lat_G_;
             lat_xl_ = b.take<float>(T * G * ELL);
@@ -268,6 +274,26 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    if (lay.mixed()) {
+        std::vector<uint8_t> types((size_t) lay.n_layers * (size_t) lay.n_expert * 2);
+        for (int64_t l = 0; l < lay.n_layers; ++l) for (int64_t e = 0; e < lay.n_expert; ++e) {
+            const auto& f = lay.format(l, e);
+            if (!f.r1q2 || f.n_embd != shape.n_embd || f.n_ff != max_ff || f.gu_type < 182 || f.gu_type > 194 ||
+                f.d_type < 182 || f.d_type > 194) {
+                err = "moe window: invalid mixed R1Q2 geometry or expert type";
+                return false;
+            }
+            const size_t i = lay.expert_index(l, e) * 2;
+            types[i] = (uint8_t) (f.gu_type - 180);
+            types[i + 1] = (uint8_t) (f.d_type - 180);
+        }
+        const char* path = strata::kernels::iq_mmq_path(strata::core::Runtime::get().compute());
+        if (!strata::gpu::copy(bih3_types_, types.data(), types.size())) {
+            err = "moe window: could not copy the R1Q2 expert type table";
+            return false;
+        }
+        std::fprintf(stderr, "xestrata: R1Q2 grouped expert products: %s\n", path ? path : "scalar");
+    }
     // The decode's A and U each have a matrix-unit form and a dp4a form; which is faster depends on the device and
     // the window's few rows, not the GPU's name.  Time both once per device (synthetic rows: the values do not change
     // the time) and keep the faster.  LATENT_A_MODE8 / LATENT_U_MMU = 0/1 still force a form.  Falls back to the
@@ -439,12 +465,12 @@ void MoeWindow::raise_flag_b_ordered(uint32_t want) {
 
 // The PCIe share by DMA: the copy engine moves the blobs while the CPU computes its share and the GPU its VRAM
 // experts; a kernel behind them raises flag B when they have landed (the graph waits for it before the PCIe groups).
-void MoeWindow::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
+void MoeWindow::fetch_dma(void* ctx, const uint8_t* const* src, int n, const size_t* bytes, size_t stride) {
     MoeWindow* w = (MoeWindow*) ctx;
     const uint32_t want = w->cur_ring_;
     if (n <= 0) { w->raise_flag_b_ordered(want); return; }   // an empty plan stays behind the copies already queued
     uint8_t* stage = (uint8_t*) w->sink_.staging;   // this group's half in a split window
-    for (int i = 0; i < n; ++i) strata::gpu::copy_async(stage + (size_t) i * bytes, src[i], bytes, w->copy_);
+    for (int i = 0; i < n; ++i) strata::gpu::copy_async(stage + (size_t) i * stride, src[i], bytes[i], w->copy_);
     w->copy_used_ = true;
     // flag B by a kernel behind the copies on the same in-order stream: a host function there cost the RTX 4070's
     // SYCL ~0.2 ms of the pool's time a layer (Edge0-120B-q3k, 32K: 0.23 of 0.73 ms a layer's call, 2026-11-15)
@@ -660,6 +686,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
     float* hit_out = hit_out_ + (size_t) tb * K * N;
     const float* ymiss = m_ymiss_ + (size_t) tb * K * N;
     const auto* fp = lay.native ? &lay.fmt[(size_t) layer] : nullptr;
+    if (lay.mixed() && fp == nullptr) { err = "moe window: mixed experts require a native layout"; return false; }
     if (fp != nullptr && fp->had_d && mode.had_signs == nullptr) {
         err = "moe window: a Hadamard-folded expert layer without its signs";
         return false;
@@ -669,6 +696,16 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
     auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid_groups) {
         if (fp != nullptr) {   // the layer's GGUF formats
             const auto& f = *fp;
+            if (lay.mixed()) {
+                Bih3R1q2Layer L;
+                L.n_embd = (int) f.n_embd; L.n_ff = (int) f.n_ff; L.n_expert = (int) lay.n_expert;
+                L.k_pairs = bih3_types_ + (size_t) layer * (size_t) lay.n_expert * 2;
+                L.route_ids = m_ids_ + (size_t) tb * K;
+                L.had_block = f.had_d ? f.had_block : 0; L.d_signs = mode.had_signs;
+                std::memcpy(L.p2, f.p2, sizeof L.p2);
+                bih3_r1q2_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq(tb), bih3_scratch_, hit_out, cs);
+                return;
+            }
             NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
             if (f.gu_type == 30) {
                 native_expert_grouped_bf16(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xf_ + (size_t) tb * N,
@@ -691,8 +728,17 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
         if (sink_.pcie_mode == 2) {                         // stage it with a copy kernel, then point at staging
             const int64_t per = groups == 2 ? kStagingBlobs / 2 : kStagingBlobs;
             uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(layer), (int) per, on);
-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(layer), on);
+            const int64_t stride = (int64_t) (lay.mixed() ? lay.max_blob : lay.blob_bytes(layer));
+            if (lay.mixed()) {
+                const auto& f = lay.format(layer, 0);
+                fetch_r1q2_blobs(p_ptr2, p_counts + 2, stage, stride, (int) per, p_start2, p_dst,
+                                  m_ids_ + (size_t) tb * K,
+                                  bih3_types_ + (size_t) layer * (size_t) lay.n_expert * 2,
+                                  (int) f.n_embd, (int) f.n_ff, on);
+            } else {
+                fetch_blobs(p_ptr2, p_counts + 2, stage, stride, (int) per, on);
+            }
+            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, stride, on);
         }
     };
     // ---- the latent MoE: A reads the D stage's q8_1 rows (row = token*G + label), U projects each route back

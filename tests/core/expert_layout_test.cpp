@@ -223,8 +223,40 @@ void sync_v6() {
         }
         check(equal, "Sync v6: budgeted mixed RAM copy and mapped fallback" + (ok ? "" : ": " + err));
         if (ok) {
-            check(!source.replace_resident(0, 0, 1) && source.has_resident(0, 1) && !source.has_resident(0, 0),
-                  "Sync v6: unequal-sized RAM exchange is refused without changing residency");
+            bool swapped = source.replace_resident(0, 0, 1) && source.has_resident(0, 0) &&
+                           !source.has_resident(0, 1) && source.has_resident(1, 1);
+            const uint8_t* small = source.blob(0, 0);
+            swapped = swapped && small && std::memcmp(small, packed.data(), (size_t) a.bytes) == 0;
+            swapped = swapped && source.replace_resident(0, 1, 0) && source.has_resident(0, 1) &&
+                      !source.has_resident(0, 0) && source.has_resident(1, 1);
+            const uint8_t* large = source.blob(0, 1);
+            const uint8_t* other = source.blob(1, 1);
+            swapped = swapped && large && other &&
+                      std::memcmp(large, packed.data() + L.blob_offset(0, 1), (size_t) b.bytes) == 0 &&
+                      std::memcmp(other, packed.data() + L.blob_offset(1, 1), (size_t) a.bytes) == 0;
+            check(swapped, "Sync v6: unequal-sized RAM exchange shrinks and grows without corrupting another expert");
+            const bool full = !source.replace_resident(1, 0, 1) && source.has_resident(1, 1) &&
+                              !source.has_resident(1, 0) && source.has_resident(0, 1) &&
+                              std::memcmp(source.blob(1, 1), packed.data() + L.blob_offset(1, 1), (size_t) a.bytes) == 0;
+            check(full, "Sync v6: a growing RAM exchange without space leaves ownership and bytes intact");
+            bool exchange = source.reserve_exchanges(2, err);
+            uint8_t* tmp = source.exchange_buffer(0, 0);
+            exchange = exchange && tmp != nullptr;
+            if (exchange) {
+                std::memcpy(tmp, packed.data() + L.blob_offset(0, 0), (size_t) a.bytes);
+                exchange = source.stage_exchange(0, 1, 0, 0) && source.commit_exchanges() == 1 &&
+                           source.has_resident(0, 0) && !source.has_resident(0, 1) &&
+                           std::memcmp(source.blob(0, 0), packed.data() + L.blob_offset(0, 0), (size_t) a.bytes) == 0;
+            }
+            if (exchange) {
+                std::memcpy(tmp, packed.data() + L.blob_offset(0, 1), (size_t) b.bytes);
+                exchange = source.stage_exchange(0, 0, 1, 0);
+                if (exchange) { source.commit_copies(); exchange = source.commit_flip() == 1; }
+                exchange = exchange && source.has_resident(0, 1) && !source.has_resident(0, 0) &&
+                           std::memcmp(source.blob(0, 1), packed.data() + L.blob_offset(0, 1), (size_t) b.bytes) == 0 &&
+                           std::memcmp(source.blob(1, 1), packed.data() + L.blob_offset(1, 1), (size_t) a.bytes) == 0;
+            }
+            check(exchange, "Sync v6: staged unequal-sized GPU exchanges shrink and grow, including asynchronous commit");
         }
 #if !defined(_WIN32)
         source.close();

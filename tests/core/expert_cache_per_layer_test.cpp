@@ -41,6 +41,24 @@ int main() {
             }
         }
     }
+    {
+        strata::core::ExpertCache cache;
+        if (!cache.open_sized({256, 512}, 1, 2, err)) {
+            std::fprintf(stderr, "sized cache: %s\n", err.c_str()); return 1;
+        }
+        std::vector<uint8_t> a(512, 0x5a), b(512, 0xa5);
+        if (!cache.fill_slot_blocking(1, b.data(), err, 512) ||
+            !cache.fill_slot_blocking(0, a.data(), err, 256)) return 1;
+        if (cache.fill_slot_blocking(0, a.data(), err, 257) ||
+            cache.fill_slot(0, a.data(), nullptr, err, 257) ||
+            cache.fill_slot_queued(0, a.data(), err, 257) ||
+            cache.verify_slot(0, a.data(), err, 257) ||
+            !cache.verify_slot(0, a.data(), err, 256) || !cache.verify_slot(1, b.data(), err, 512)) {
+            std::fprintf(stderr, "sized cache: a copy escaped its slot: %s\n", err.c_str()); return 1;
+        }
+        if (!cache.fill_slot_blocking(0, a.data(), err) || !cache.verify_slot(0, a.data(), err)) return 1;
+    }
+    std::puts("expert cache sized copies: lengths checked against each slot");
     std::puts("expert cache per-layer admission: uniform and sized caches passed");
     return 0;
 }

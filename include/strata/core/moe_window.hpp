@@ -187,7 +187,7 @@ public:
 
 private:
     static void publish_plan(void* ctx);
-    static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
+    static void fetch_dma(void* ctx, const uint8_t* const* src, int n, const size_t* bytes, size_t stride);
     static void raise_flag(uint32_t* flag, uint32_t value);
     /// Flag B for `want`, behind every copy queued on copy_ (an empty plan must not overtake an earlier ring's DMA).
     void raise_flag_b_ordered(uint32_t want);
@@ -232,6 +232,8 @@ private:
     uint8_t* hit_xq_ = nullptr;
     float* hit_xs_ = nullptr;
     uint8_t* hit_scratch_ = nullptr;
+    uint8_t* bih3_types_ = nullptr;      ///< per-layer, per-expert gate/up and down K
+    uint8_t* bih3_scratch_ = nullptr;    ///< one gathered R1Q2 expert, reused by the grouped matrix products
     uint32_t* skip_ = nullptr;                   ///< per group: the ring resident_plan planned, else 0 (device)
     unsigned long long* slot_off_d_ = nullptr;   ///< the tier's slot offsets on the device (resident_plan)
 

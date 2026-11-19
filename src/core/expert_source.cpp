@@ -2423,7 +2423,8 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
                                  "one)\n", rotate_want == 1 ? "on" : "off",
                          (double) extra / 1073741824.0, (double) have / 1073741824.0);
     }
-    const bool requested = rotate_want == 1;
+    // Mixed experts need different-sized destinations; the ownership rotation has only per-layer sizes.
+    const bool requested = rotate_want == 1 && !strata::kernels::cpu::expert_layout().mixed();
     const bool eligible = requested && rotate_total != 0 && rotate_total <= std::numeric_limits<size_t>::max() &&
                           complement_pinned_ && !complement_partial_ &&
                           complement_host_ != nullptr && complement_device_ != nullptr && complement_bytes_ > 0 &&
@@ -2481,7 +2482,6 @@ uint8_t* FileExpertSource::exchange_buffer(int64_t q, int64_t layer) const {
 }
 
 bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q) {
-    if (strata::kernels::cpu::expert_layout().mixed()) return false;
     if (out < 0 || out >= n_expert_ || !has_resident(layer, in) || has_resident(layer, out) ||
         exchange_buffer(q, layer) == nullptr)
         return false;
@@ -2491,8 +2491,12 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     if (override_[i_out] != nullptr) return false;
     for (const Exchange& x : staged_)
         if (x.in == i_in || x.q == q) return false;
+    const uint64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer, out);
+    const uint64_t at = strata::kernels::cpu::expert_layout().mixed() ? replacement_offset(i_in, bytes)
+                                                                       : complement_offsets_[i_in];
+    if (at == kNoComplement) return false;
     override_[i_out] = exchange_buffer(q, layer);
-    staged_.push_back({i_in, i_out, q, strata::kernels::cpu::expert_layout().blob_bytes(layer, in)});
+    staged_.push_back({i_in, i_out, q, bytes, at});
     return true;
 }
 
@@ -2510,11 +2514,13 @@ int64_t FileExpertSource::commit_exchanges() {
             override_[x.out] = nullptr;
             continue;
         }
-        const uint64_t at = complement_offsets_[x.in];
+        const uint64_t at = x.at;
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr) {
             std::memcpy(complement_at(at), src, (size_t) x.bytes);
-            if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
+            complement_offsets_[x.in] = kNoComplement;
+            complement_offsets_[x.out] = at;
+            ++n;
         }
         override_[x.out] = nullptr;
     }
@@ -2523,19 +2529,51 @@ int64_t FileExpertSource::commit_exchanges() {
     return n;
 }
 
+uint64_t FileExpertSource::replacement_offset(size_t outgoing, uint64_t bytes) const {
+    const uint64_t old = complement_offsets_[outgoing];
+    if (old == kNoComplement || bytes == 0) return kNoComplement;
+    uint64_t begin = 0, end = complement_bytes_;
+    if (!complement_chunks_.empty()) {
+        const ComplementChunk* c = chunk_of(complement_chunks_, old);
+        begin = c->start;
+        end = c->end;
+    }
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const int64_t l = (int64_t) (outgoing / (size_t) n_expert_);
+    const int64_t e = (int64_t) (outgoing % (size_t) n_expert_);
+    if (bytes <= lay.blob_bytes(l, e)) return old;
+    std::vector<std::pair<uint64_t, uint64_t>> used;
+    for (size_t i = 0; i < complement_offsets_.size(); ++i) {
+        const uint64_t at = complement_offsets_[i];
+        if (i == outgoing || at == kNoComplement || at < begin || at >= end) continue;
+        const uint64_t len = lay.blob_bytes((int64_t) (i / (size_t) n_expert_), (int64_t) (i % (size_t) n_expert_));
+        if (len > end - at) return kNoComplement;
+        used.emplace_back(at, at + len);
+    }
+    for (const Exchange& x : staged_) {
+        if (x.at >= begin && x.at < end) used.emplace_back(x.at, x.at + x.bytes);
+    }
+    std::sort(used.begin(), used.end());
+    uint64_t cursor = begin;
+    for (const auto& span : used) {
+        if (span.first > cursor && bytes <= span.first - cursor) return cursor;
+        cursor = std::max(cursor, span.second);
+    }
+    return bytes <= end - cursor ? cursor : kNoComplement;
+}
+
 bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) {
     if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
         layer < 0 || layer >= n_layers_ || in < 0 || out < 0 || in >= n_expert_ || out >= n_expert_ || in == out)
         return false;
-    if (strata::kernels::cpu::expert_layout().blob_bytes(layer, in) !=
-        strata::kernels::cpu::expert_layout().blob_bytes(layer, out)) return false;
     const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
     const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
     if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
     if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
-    const uint64_t at = complement_offsets_[i_out], bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer, in);
-    if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
-        bytes > complement_bytes_ - at) return false;
+    const uint64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer, in);
+    if (complement_offsets_[i_out] == kNoComplement || complement_offsets_[i_in] != kNoComplement) return false;
+    const uint64_t at = replacement_offset(i_out, bytes);
+    if (at == kNoComplement) return false;
     // read beside the copy first: a failed read leaves `out` where it was
     if (ram_adapt_buf_.size() < (size_t) bytes) ram_adapt_buf_.resize((size_t) bytes);
     const auto t0 = std::chrono::steady_clock::now();
@@ -2544,7 +2582,8 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
                        std::memory_order_relaxed);
     file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     std::memcpy(complement_at(at), ram_adapt_buf_.data(), (size_t) bytes);
-    if (!detail::exchange_cache_complement(complement_offsets_, i_out, i_in)) return false;
+    complement_offsets_[i_out] = kNoComplement;
+    complement_offsets_[i_in] = at;
     ++ram_adapts_;
     return true;
 }
@@ -2553,15 +2592,15 @@ bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_
     if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
         layer < 0 || layer >= n_layers_ || in < 0 || out < 0 || in >= n_expert_ || out >= n_expert_ || in == out)
         return false;
-    if (strata::kernels::cpu::expert_layout().blob_bytes(layer, in) !=
-        strata::kernels::cpu::expert_layout().blob_bytes(layer, out)) return false;
     const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
     const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
     if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
     if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
-    const uint64_t at = complement_offsets_[i_out], bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer, in);
-    if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
-        bytes > complement_bytes_ - at || bytes > stage_blob_) return false;
+    const uint64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer, in);
+    if (complement_offsets_[i_out] == kNoComplement || complement_offsets_[i_in] != kNoComplement ||
+        bytes > stage_blob_) return false;
+    const uint64_t at = replacement_offset(i_out, bytes);
+    if (at == kNoComplement) return false;
     {
         // held across the copy: claim_stage cannot hand the buffer to another blob meanwhile
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -2569,7 +2608,8 @@ bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_
         if (it == stage_of_.end() || stage_busy_[it->second] || stage_key_[it->second] != (int64_t) i_in) return false;
         std::memcpy(complement_at(at), stage_buf_[it->second].get(), (size_t) bytes);
     }
-    if (!detail::exchange_cache_complement(complement_offsets_, i_out, i_in)) return false;
+    complement_offsets_[i_out] = kNoComplement;
+    complement_offsets_[i_in] = at;
     ++ram_adapts_;
     ++ram_staged_;
     return true;
@@ -2579,7 +2619,7 @@ void FileExpertSource::commit_copies() {
     if (exchange_storage_.active()) return;   // STRATA_EXCHANGE_ROTATE: ownership moves in commit_flip, nothing to copy
     for (const Exchange& x : staged_) {
         const uint8_t* src = override_.empty() ? nullptr : override_[x.out];
-        const uint64_t at = complement_offsets_[x.in];
+        const uint64_t at = x.at;
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr)
             std::memcpy(complement_at(at), src, (size_t) x.bytes);
@@ -2599,11 +2639,14 @@ int64_t FileExpertSource::commit_flip() {
             override_[x.out] = nullptr;
             continue;
         }
-        const uint64_t at = complement_offsets_[x.in];
+        const uint64_t at = x.at;
         // the same test as commit_copies: an exchange whose bytes were copied is the one that flips
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
-            complement_host_ != nullptr && detail::exchange_cache_complement(complement_offsets_, x.in, x.out))
+            complement_host_ != nullptr) {
+            complement_offsets_[x.in] = kNoComplement;
+            complement_offsets_[x.out] = at;
             ++n;
+        }
         override_[x.out] = nullptr;
     }
     staged_.clear();
@@ -2842,11 +2885,13 @@ struct CpuCalJobs {
     std::vector<float> x, out;
     strata::kernels::cpu::NativeAct act;
     const uint8_t* ring[kRing] = {};
+    const strata::kernels::cpu::NativeFmt* formats[kRing] = {};
     int cursor = 0;
     strata::kernels::cpu::ExpertJobMulti jobs[kCall];
     void next(int k) {   // the next k experts of the ring into jobs[0, k)
         for (int j = 0; j < k; ++j) {
             jobs[j].blob = ring[cursor];
+            jobs[j].fmt = formats[cursor];
             cursor = (cursor + 1) % kRing;
         }
     }
@@ -2863,7 +2908,11 @@ bool cpu_cal_jobs(ExpertDispatch& d, int64_t n_layers, int64_t& layer, CpuCalJob
         for (int64_t e = 0; e < d.n_expert && n < CpuCalJobs::kRing; ++e)
             if (d.host_res[(size_t) l * (size_t) d.n_expert + (size_t) e] < 0 && d.src->pinned(l, e)) {
                 const uint8_t* b = d.src->blob(l, e);
-                if (b != nullptr) cj.ring[n++] = b;
+                if (b != nullptr) {
+                    cj.ring[n] = b;
+                    cj.formats[n] = lay.mixed() ? &lay.format(l, e) : nullptr;
+                    ++n;
+                }
             }
         if (n == CpuCalJobs::kRing) layer = l;
     }
@@ -3313,6 +3362,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
+        size_t dma_bytes[64];
         int64_t pcie_i0[64];
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
@@ -3340,6 +3390,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                         if (src != nullptr) {
                             kd = 1;
                             dma_src[fetches] = src;
+                            dma_bytes[fetches] = (size_t) lay.blob_bytes(d.layers, e);
                             pcie_i0[fetches] = i0;
                             ++fetches;
                         }
@@ -3367,7 +3418,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++groups;
         }
         P.start[groups] = entries;
-        const uint64_t bb = lay.blob_bytes(d.layers);
+        const uint64_t bb = lay.mixed() ? lay.max_blob : lay.blob_bytes(d.layers);
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
             P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
@@ -3389,7 +3440,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
-        if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, dma_bytes, (size_t) bb);   // beside the CPU's work
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -3907,6 +3958,8 @@ std::vector<std::string> native_layer_problems(bool mixed_gu) {
     const ExpertLayout& lay = expert_layout();
     for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
         const NativeFmt& f = lay.fmt[(size_t) l];
+        // Qwen3.8's window and prompt paths take the mixed R1Q2 format; PlainModel's mixed-gu path does not yet.
+        if (lay.mixed() && !mixed_gu && f.r1q2) continue;
         const std::string at = "MoE layer " + std::to_string(l) + " (block " + std::to_string(lay.block_of(l)) + ")";
         const int up = f.up_type >= 0 ? f.up_type : f.gu_type;
         if (!mixed_gu && native_mixed_gu(f)) {

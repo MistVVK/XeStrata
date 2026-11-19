@@ -357,6 +357,16 @@ struct SwapHome {
 template <class Swap, class Locate>
 bool resident_stage_swaps(FileExpertSource& src, const std::vector<int32_t>& host_res, int64_t n_expert,
                           std::vector<Swap>& swaps, Locate locate) {
+    const auto& layout = kernels::cpu::expert_layout();
+    if (layout.mixed()) {
+        swaps.erase(std::remove_if(swaps.begin(), swaps.end(), [&](const Swap& s) {
+            if (s.out < 0) return false;
+            const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
+            if (slot < 0) return true;
+            const auto* cache = locate(s.layer).cache;
+            return layout.blob_bytes(s.layer, s.in) > cache->slot_capacity(slot);
+        }), swaps.end());
+    }
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
@@ -375,7 +385,7 @@ bool resident_stage_swaps(FileExpertSource& src, const std::vector<int32_t>& hos
         const SwapHome home = locate(s.layer);
         const OnDevice on(home.dev);
         if (gpu::copy_async(src.exchange_buffer(q, s.layer), home.cache->device_slot(slot),
-                            (size_t) kernels::cpu::expert_layout().blob_bytes(s.layer), home.stream) != true)
+                            (size_t) layout.blob_bytes(s.layer, s.out), home.stream) != true)
             return false;
         if (std::find_if(used.begin(), used.end(), [&](const SwapHome& h) { return h.stream == home.stream; }) == used.end())
             used.push_back(home);
@@ -387,8 +397,13 @@ bool resident_stage_swaps(FileExpertSource& src, const std::vector<int32_t>& hos
             const OnDevice on(h.dev);
             if (gpu::stream_sync(h.stream) != true) return false;
         }
-        for (const Staged& x : staged)
-            if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
+        for (const Staged& x : staged) {
+            if (src.stage_exchange(x.layer, x.in, x.out, x.q)) continue;
+            if (!layout.mixed()) return false;
+            kept.erase(std::remove_if(kept.begin(), kept.end(), [&](const Swap& s) {
+                return s.layer == x.layer && s.in == x.in && s.out == x.out;
+            }), kept.end());
+        }
     }
     swaps.swap(kept);
     return true;
