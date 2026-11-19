@@ -97,6 +97,82 @@ __global__ void k_hc_mix(const float* __restrict__ x, const float* __restrict__ 
     }
 }
 
+// ---- multi-block variant of the iHC mix (decode: one block per token is too little parallelism).
+// grid (T, 24), block 128: each block takes 512 of the 12288 elements; partial sums are atomically added into acc[t][0..8] (acc[t][8] = sum of squares); acc must be zeroed.
+__global__ void k_hc_mix_part(const float* __restrict__ x, const float* __restrict__ fn, float* __restrict__ acc, int nout) {
+    __shared__ float sh[8][4];
+    const int K = NHC * HID;
+    int t = blockIdx.x, slab = blockIdx.y;
+    const float* xt = x + (size_t)t * K;
+    float ss = 0, a[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) a[j] = 0;
+    for (int k = slab * 512 + threadIdx.x; k < (slab + 1) * 512; k += 128) {
+        float v = xt[k];
+        ss += v * v;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if (j < nout) a[j] += v * fn[(size_t)j * K + k];
+    }
+    // wave reduce then 4 waves
+    float vals[9];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) vals[j] = a[j];
+    vals[8] = ss;
+#pragma unroll
+    for (int j = 0; j < 9; ++j)
+        for (int o = 16; o > 0; o >>= 1) vals[j] += __shfl_xor(vals[j], o);
+    __shared__ float shv[9][4];
+    if ((threadIdx.x & 31) == 0)
+#pragma unroll
+        for (int j = 0; j < 9; ++j) shv[j][threadIdx.x >> 5] = vals[j];
+    __syncthreads();
+    if (threadIdx.x < 9) {
+        int j = threadIdx.x;
+        if (j == 8 || j < nout) atomicAdd(&acc[(size_t)t * 9 + j], shv[j][0] + shv[j][1] + shv[j][2] + shv[j][3]);
+    }
+}
+__global__ void k_hc_mix_fin(const float* __restrict__ acc, const float* __restrict__ scale, const float* __restrict__ base, float* __restrict__ pre, float* __restrict__ post, int nout,
+                             float eps, float hc_eps, float hc_mag) {
+    int t = blockIdx.x;
+    if (threadIdx.x != 0) return;
+    const int K = NHC * HID;
+    float inv = rsqrtf(acc[(size_t)t * 9 + 8] / K + eps);
+    float m[8];
+    for (int j = 0; j < 8; ++j) m[j] = j < nout ? acc[(size_t)t * 9 + j] * inv : 0.0f;
+    if (nout == 8) {
+        for (int h = 0; h < NHC; ++h) {
+            pre[(size_t)t * NHC + h] = sigmoidf_(m[h] * scale[0] + base[h]) + hc_eps;
+            post[(size_t)t * NHC + h] = hc_mag * sigmoidf_(m[NHC + h] * scale[1] + base[NHC + h]) + hc_eps;
+        }
+    } else {
+        for (int h = 0; h < NHC; ++h) pre[(size_t)t * NHC + h] = sigmoidf_(m[h] * scale[0] + base[h]) + hc_eps;
+    }
+}
+
+// ---- F32 GEMV for the router: one block per output row, M <= 16 tokens; W [N][K] f32, X [M][K] f32, Y [M][N]
+__global__ void __launch_bounds__(256) k_f32_gemv(const float* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y, int N, int K, int M) {
+    __shared__ float sh[32];
+    int n = blockIdx.x;
+    const float4* w4 = (const float4*)(W + (size_t)n * K);
+    float acc[16];
+#pragma unroll
+    for (int m = 0; m < 16; ++m) acc[m] = 0;
+    for (int k4 = threadIdx.x; k4 < K / 4; k4 += blockDim.x) {
+        float4 w = w4[k4];
+#pragma unroll
+        for (int m = 0; m < 16; ++m)
+            if (m < M) {
+                float4 xv = ((const float4*)(X + (size_t)m * K))[k4];
+                acc[m] += w.x * xv.x + w.y * xv.y + w.z * xv.z + w.w * xv.w;
+            }
+    }
+    for (int m = 0; m < M; ++m) {
+        float r = block_sum(acc[m], sh);
+        if (threadIdx.x == 0) Y[(size_t)m * N + n] = r;
+    }
+}
+
 // ---- cur = sum_h x[h]*pre[h]; then rmsnorm(cur, w) -> fp16 (GEMM input) and optionally fp32
 __global__ void k_hc_reduce_norm(const float* __restrict__ x, const float* __restrict__ pre, const float* __restrict__ w, __half* __restrict__ outh, float* __restrict__ outf,
                                  float eps) {

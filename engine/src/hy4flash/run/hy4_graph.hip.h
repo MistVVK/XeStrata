@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <future>
 #include <string>
 #include <vector>
@@ -125,8 +126,59 @@ public:
     int heads(int il) const { return c.is_swa[il] ? c.heads_swa : c.heads_sparse; }
     double theta(int il) const { return c.is_swa[il] ? c.theta_swa : c.theta_sparse; }
 
+    // per-kernel timing (prof2): hipEvent pairs per labelled section, summed per label at report time
+    bool prof2 = false;
+    struct PEv { hipEvent_t a, b; std::string name; };
+    std::vector<PEv> pev;
+    std::vector<std::pair<hipEvent_t, hipEvent_t>> pev_pool;
+    std::map<std::string, std::pair<double, int>> pacc;
+    struct PS {
+        Runner* r; bool on; size_t idx = 0;
+        PS(Runner* r_, const std::string& nm) : r(r_), on(r_->prof2) {
+            if (!on) return;
+            PEv e;
+            if (!r->pev_pool.empty()) { e.a = r->pev_pool.back().first; e.b = r->pev_pool.back().second; r->pev_pool.pop_back(); }
+            else { HCK(hipEventCreate(&e.a)); HCK(hipEventCreate(&e.b)); }
+            e.name = nm;
+            HCK(hipEventRecord(e.a, r->st));
+            idx = r->pev.size();
+            r->pev.push_back(e);
+        }
+        ~PS() { if (on) HCK(hipEventRecord(r->pev[idx].b, r->st)); }
+    };
+    void pflush() {
+        if (!prof2 || pev.empty()) return;
+        HCK(hipStreamSynchronize(st));
+        for (auto& e : pev) {
+            float ms = 0;
+            HCK(hipEventElapsedTime(&ms, e.a, e.b));
+            auto& a = pacc[e.name];
+            a.first += ms;
+            a.second++;
+            pev_pool.push_back({e.a, e.b});
+        }
+        pev.clear();
+    }
+    void pacc_report(const char* what, int steps) {
+        if (!prof2) return;
+        pflush();
+        std::vector<std::pair<double, std::string>> v;
+        for (auto& kv : pacc) v.push_back({kv.second.first, kv.first});
+        std::sort(v.rbegin(), v.rend());
+        fprintf(stderr, "[prof2 %s] per-step ms by section (sum of GPU event time / %d steps):\n", what, steps);
+        double tot = 0;
+        for (auto& p : v) {
+            tot += p.first;
+            fprintf(stderr, "  %-34s %8.3f ms  (%d calls/step)\n", p.second.c_str(), p.first / steps, pacc[p.second].second / steps);
+        }
+        fprintf(stderr, "  TOTAL %.3f ms\n", tot / steps);
+        pacc.clear();
+    }
     void lin(const std::string& name, const __half* X, float* Y, int M) {
         const TInfo& t = ti(name);
+        size_t dot = name.rfind('.', name.rfind('.') - 1);
+        PS _p(this, std::string("lin ") + name.substr(name.find('.', 13) == std::string::npos ? 0 : name.find('.', 13) + 1));
+        (void)dot;
         linear_h(st, t.fmt, tw(name), (int)t.rows(), (int)t.cols(), X, Y, M);
     }
 
@@ -372,6 +424,14 @@ public:
         hipLaunchKernelGGL(k_engram_apply, dim3(T, 4), dim3(256), 0, st, x, kv_f, e.kvb, e.egate, e.pre_gamma, e.hcs, d_evalid[mo], T);
     }
 
+    float* hcacc = nullptr;
+    void hc_mix_run(const float* xin, const float* hfn, const float* hsc, const float* hbs, int nout, int T) {
+        if (!hcacc) hcacc = dalloc<float>((size_t)Tc * 9);
+        HCK(hipMemsetAsync(hcacc, 0, (size_t)T * 9 * 4, st));
+        hipLaunchKernelGGL(k_hc_mix_part, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcacc, nout);
+        hipLaunchKernelGGL(k_hc_mix_fin, dim3(T), dim3(32), 0, st, hcacc, hsc, hbs, pre, post, nout, c.rms_eps, c.hc_eps, c.hc_mag);
+    }
+
     // IndexPool: cache iv/ig of the chunk's tokens and pool the groups completed by this chunk
     void idx_update(int il, int p0, int T) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
@@ -407,22 +467,25 @@ public:
         const float* hfn = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_fn");
         const float* hsc = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_base");
-        hipLaunchKernelGGL(k_hc_mix, dim3(T), dim3(256), 0, st, x, hfn, hsc, hbs, pre, post, 8, c.rms_eps, c.hc_eps, c.hc_mag);
-        hipLaunchKernelGGL(k_hc_reduce_norm, dim3(T), dim3(256), 0, st, x, pre, (const float*)tw(L(il) + ".input_layernorm.weight"), cur_h, (float*)nullptr, c.rms_eps);
+        { PS _q(this, "hc_mix"); hc_mix_run(x, hfn, hsc, hbs, 8, T); }
+        { PS _q(this, "hc_reduce_norm"); hipLaunchKernelGGL(k_hc_reduce_norm, dim3(T), dim3(256), 0, st, x, pre, (const float*)tw(L(il) + ".input_layernorm.weight"), cur_h, (float*)nullptr, c.rms_eps); }
         // q path
         lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
-        hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps);
+        { PS _q(this, "q_a_rms"); hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps); }
         lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
         lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]  (qr_h already extracted)
         __half* cache = kcache[il];
         const int cslots = swa ? ring : slots_sparse;
-        mla_write_kv(st, F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps);
-        mla_prep_q(st, F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il));
+        { PS _q(this, "mla_write_kv"); mla_write_kv(st, F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
+        const bool dec = T <= 8;
+        const int kvfmt = ti(pa + ".kv_b_proj.weight").fmt;
+        { PS _q(this, "mla_prep_q"); if (dec) mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il));
+        else mla_prep_q(st, F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il)); }
         bool use_list = false;
         if (!swa && index_on) {
-            idx_update(il, p0, T);
+            { PS _q(this, "idx_update"); idx_update(il, p0, T); }
             if (p0 + T > index_topk) {
-                idx_select(il, p0, T);
+                { PS _q(this, "idx_select"); idx_select(il, p0, T); }
                 use_list = true;
             }
         }
@@ -442,10 +505,15 @@ public:
             a.nkeys = nkeys;
             a.kmax = index_topk;
         }
-        mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_b + wv_off[il], F3, o_h, ctx_ws, a, mla_ws, mla_ws_bytes);
+        if (dec) {
+            { PS _q(this, "mla_attend"); mla_attend(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), (__half*)ctx_ws, a, mla_ws, mla_ws_bytes); }
+            { PS _q(this, "mla_vup"); mla_vup_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), (const __half*)ctx_ws, F3, o_h, T, NH); }
+        } else {
+            { PS _q(this, "mla_attend_vup_prefill"); mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_b + wv_off[il], F3, o_h, ctx_ws, a, mla_ws, mla_ws_bytes); }
+        }
         lin(pa + ".o_proj.weight", o_h, F1, T);  // [T][3072]
-        hipLaunchKernelGGL(k_add_rms, dim3(T), dim3(256), 0, st, F1, (const float*)nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), sub, HID, c.rms_eps);
-        hipLaunchKernelGGL(k_hc_post, dim3(T), dim3(256), 0, st, x, sub, post);
+        { PS _q(this, "o_norm"); hipLaunchKernelGGL(k_add_rms, dim3(T), dim3(256), 0, st, F1, (const float*)nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), sub, HID, c.rms_eps); }
+        { PS _q(this, "hc_post"); hipLaunchKernelGGL(k_hc_post, dim3(T), dim3(256), 0, st, x, sub, post); }
     }
 
     void mlp_layer(int il, int T) {
@@ -453,47 +521,50 @@ public:
         const float* hfn = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_fn");
         const float* hsc = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_base");
-        hipLaunchKernelGGL(k_hc_mix, dim3(T), dim3(256), 0, st, x, hfn, hsc, hbs, pre, post, 8, c.rms_eps, c.hc_eps, c.hc_mag);
-        hipLaunchKernelGGL(k_hc_reduce_norm, dim3(T), dim3(256), 0, st, x, pre, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), cur_h, cur_f, c.rms_eps);
+        { PS _q(this, "hc_mix"); hc_mix_run(x, hfn, hsc, hbs, 8, T); }
+        { PS _q(this, "hc_reduce_norm"); hipLaunchKernelGGL(k_hc_reduce_norm, dim3(T), dim3(256), 0, st, x, pre, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), cur_h, cur_f, c.rms_eps); }
         if (il == 0) {
             lin(pm + ".gate_proj.weight", cur_h, F1, T);  // [T][13824]
             lin(pm + ".up_proj.weight", cur_h, F2, T);
             size_t n = (size_t)T * 13824;
-            hipLaunchKernelGGL(k_swiglu_h, dim3((n + 255) / 256), dim3(256), 0, st, F1, F2, H1, n);
+            { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((n + 255) / 256), dim3(256), 0, st, F1, F2, H1, n); }
             lin(pm + ".down_proj.weight", H1, F3, T);  // [T][3072]
-            hipLaunchKernelGGL(k_add_rms, dim3(T), dim3(256), 0, st, F3, (const float*)nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), sub, HID, c.rms_eps);
+            { PS _q(this, "o_norm"); hipLaunchKernelGGL(k_add_rms, dim3(T), dim3(256), 0, st, F3, (const float*)nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), sub, HID, c.rms_eps); }
         } else {
             // router
-            linear_f32(st, (const float*)tw(pm + ".gate.weight"), 512, HID, cur_f, F1, T);  // [T][512]
-            hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 512, 16, c.routed_scale);
+            { PS _q(this, "router_gemv"); if (T <= 16) hipLaunchKernelGGL(k_f32_gemv, dim3(512), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T); else linear_f32(st, (const float*)tw(pm + ".gate.weight"), 512, HID, cur_f, F1, T); }
+            { PS _q(this, "router_topk"); hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 512, 16, c.routed_scale); }
             lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
             size_t nz = (size_t)T * 1536;
-            hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz);
-            moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws);
-            hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz);
+            { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
+            { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws); }
+            { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
             lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
             lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
             lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
-            hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz);
+            { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz); }
             lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
-            hipLaunchKernelGGL(k_add_rms, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), sub, HID, c.rms_eps);
+            { PS _q(this, "combine_norm"); hipLaunchKernelGGL(k_add_rms, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), sub, HID, c.rms_eps); }
         }
-        hipLaunchKernelGGL(k_hc_post, dim3(T), dim3(256), 0, st, x, sub, post);
+        { PS _q(this, "hc_post"); hipLaunchKernelGGL(k_hc_post, dim3(T), dim3(256), 0, st, x, sub, post); }
     }
 
     // process tokens [p0, p0+T) (T <= Tc) of the sequence tok_all (host, positions 0..p0+T-1). Returns false on error.
     bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err) {
         HCK(hipMemcpyAsync(d_ids, tok_all + p0, (size_t)T * 4, hipMemcpyHostToDevice, st));
         hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
-        if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
+        const bool defer_eng = engram_ready && T <= 8;
+        if (defer_eng) prefetch_engram(tok_all, p0, T);
+        else if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
         for (int il = 0; il < c.n_layers; ++il) {
+            if (defer_eng && il == 1 && !engram_prep(tok_all, p0, T, err)) return false;
             int mo = -1;
             for (int j = 0; j < 4; ++j)
                 if (emeta.layers[j] == il) mo = j;
             double ta = 0;
             if (prof) { HCK(hipStreamSynchronize(st)); ta = now_s(); }
             if (mo >= 0 && engram_ready) {
-                engram_layer(mo, il, T);
+                { PS _q(this, "engram_layer"); engram_layer(mo, il, T); }
                 maybe_dump("x_L" + std::to_string(il) + "_engram", T, 4 * HID, x, 4);
             }
             if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); p_eng += tb - ta; ta = tb; }
@@ -521,8 +592,8 @@ public:
         const float* hsc = (const float*)tw("model.hc_head.hc_head_scale");
         const float* hbs = (const float*)tw("model.hc_head.hc_head_base");
         const float* xs = x + (size_t)first * 4 * HID;
-        hipLaunchKernelGGL(k_hc_mix, dim3(n), dim3(256), 0, st, xs, hfn, hsc, hbs, pre, post, 4, c.rms_eps, c.hc_eps, c.hc_mag);
-        hipLaunchKernelGGL(k_hc_reduce_norm, dim3(n), dim3(256), 0, st, xs, pre, (const float*)tw("model.norm.weight"), hfin, (float*)nullptr, c.rms_eps);
+        { PS _q(this, "head_hc_mix"); hc_mix_run(xs, hfn, hsc, hbs, 4, n); }
+        { PS _q(this, "head_reduce_norm"); hipLaunchKernelGGL(k_hc_reduce_norm, dim3(n), dim3(256), 0, st, xs, pre, (const float*)tw("model.norm.weight"), hfin, (float*)nullptr, c.rms_eps); }
         const TInfo& lm = ti("lm_head.weight");
         linear_h(st, lm.fmt, tw("lm_head.weight"), (int)lm.rows(), (int)lm.cols(), hfin, logits, n);
     }

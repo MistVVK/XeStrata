@@ -23,7 +23,7 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".";
-    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false;
+    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false;
     int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
         else if (a == "--index-topk") index_topk = atoi(nxt().c_str());
         else if (a == "--no-index") no_index = true;
         else if (a == "--prof") prof = true;
+        else if (a == "--prof2") prof2 = true;
         else {
             fprintf(stderr, "unknown arg %s\n", a.c_str());
             return 2;
@@ -79,6 +80,7 @@ int main(int argc, char** argv) {
     r.index_topk = index_topk;
     r.index_on = no_index ? 0 : 1;
     r.prof = prof;
+    r.prof2 = prof2;
     std::string err;
     if (!r.init(no_engram ? std::string() : engram, err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
@@ -121,19 +123,20 @@ int main(int argc, char** argv) {
         if (last) {
             int first = all_logits ? 0 : T - 1;
             r.head(T, first);
-            HCK(hipStreamSynchronize(r.st));
+            HCK(hipStreamSynchronize(r.st)); r.pflush();
             int n = T - first;
             hl.resize((size_t)n * V);
             HCK(hipMemcpy(hl.data(), r.logits, hl.size() * 4, hipMemcpyDeviceToHost));
             for (int i = 0; i < n; ++i) top5_line(&hl[(size_t)i * V], V, done - n + i, top_out);
             if (dump) save_npy_f32(out_dir + "/logits.npy", hl.data(), {n, V});
         } else {
-            HCK(hipStreamSynchronize(r.st));
+            HCK(hipStreamSynchronize(r.st)); r.pflush();
         }
         fprintf(stderr, "[prefill] %d/%d tokens, %.2f s, %.1f tok/s\n", done, T0, now_s() - t0, done / (now_s() - t0));
     }
     double t_pf = now_s() - t0;
     r.prof_report("prefill");
+    r.pacc_report("prefill", (T0 + r.Tc - 1) / r.Tc);
     printf("%s", top_out.c_str());
     fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram cpu %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_cpu);
     // greedy decode
@@ -157,7 +160,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             r.head(1, 0);
-            HCK(hipStreamSynchronize(r.st));
+            HCK(hipStreamSynchronize(r.st)); r.pflush();
             float* d = r.logits;
             hipLaunchKernelGGL(k_argmax, dim3(1), dim3(1024), 0, r.st, d, V, r.d_argmax);
             int32_t nx = 0;
@@ -168,6 +171,7 @@ int main(int argc, char** argv) {
         double td = now_s() - t1;
         printf("generated ids: %s\n", gen_ids.c_str());
         r.prof_report("decode");
+        r.pacc_report("decode", (int)times.size());
         std::sort(times.begin(), times.end());
         fprintf(stderr, "[decode] %zu tokens in %.2f s = %.2f tok/s (median step %.1f ms)\n", times.size(), td, times.size() / td, times.empty() ? 0.0 : times[times.size() / 2] * 1000);
         std::ofstream f(out_dir + "/gen_ids.txt");
@@ -176,6 +180,11 @@ int main(int argc, char** argv) {
     {
         std::ofstream f(out_dir + "/top5.txt");
         f << top_out;
+    }
+    {
+        size_t f2 = 0, t2 = 0;
+        HCK(hipMemGetInfo(&f2, &t2));
+        fprintf(stderr, "[gpu] end: used %.2f GiB of %.2f GiB (free %.2f)\n", (t2 - f2) / 1073741824.0, t2 / 1073741824.0, f2 / 1073741824.0);
     }
     auto s = r.eio.stats();
     fprintf(stderr, "[engram] lookups %llu seed %llu lru %llu page reads %llu (%.1f MB) io %.2f s\n", (unsigned long long)s.lookups, (unsigned long long)s.seed_hits,
