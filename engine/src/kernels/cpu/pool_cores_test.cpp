@@ -13,6 +13,21 @@ namespace cpu = strata::kernels::cpu;
 
 static int g_fail = 0;
 
+static void put_env(const char* k, const char* v) {
+#if defined(_WIN32)
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+static void unset_env(const char* k) {
+#if defined(_WIN32)
+    _putenv_s(k, "");
+#else
+    unsetenv(k);
+#endif
+}
+
 static void expect(bool ok, const char* what) {
     if (!ok) {
         ++g_fail;
@@ -41,8 +56,11 @@ int main() {
     const cpu::CpuTopology topo = cpu::detect_cpu_topology(true);
     expect(!topo.worker_cores.empty() || topo.host_core >= 0, "the topology has cores");
 
-    // 1. the default: nothing set, the placement is the topology's, one worker per physical core
+    // 1. the default: nothing set, the placement is the topology's, one worker per physical core.  On a machine with
+    // two NUMA nodes the split runs by itself and puts the workers on the sockets in turn (numa_pool_test and
+    // pool_tasks_test cover that): it is switched off here so the topology's order is what gets checked
     {
+        put_env("STRATA_NUMA_POOL", "0");
         cpu::set_pool_cores({});
         const int n = (int) std::min<size_t>(2, topo.worker_cores.size());
         if (n >= 1) {
@@ -75,6 +93,7 @@ int main() {
                         if (m.cpu == pool.worker_cores()[(size_t) i] && l.core >= 0)
                             expect(m.core != l.core, "default: no worker on the host's core");
         }
+        unset_env("STRATA_NUMA_POOL");
     }
 
     // 2. --pool-cores: the list as given, in its order; the count is the list's length
