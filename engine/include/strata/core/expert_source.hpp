@@ -85,10 +85,13 @@ struct HostMemory {
     uint64_t available = 0;
     uint64_t cgroup_limit = ~uint64_t{0};
     uint64_t commit = ~uint64_t{0};   ///< available Windows commit capacity; ~0 when not reported
+    const char* why = nullptr;        ///< when host_available_memory is false: what it could not read (a static text, for the log line)
 };
 
 /// Linux reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
-/// defaults are the real files).  cgroup v2 as before (an unreadable limit of a group that has one fails); cgroup v1's
+/// defaults are the real files).  cgroup v2: a group whose memory.max exists but cannot be read fails; a group without a
+/// memory.max has no memory controller and no limit of its own (its parents are read), and a "0::" path that is not in
+/// this namespace's mount reads the mount's root as the process's own group (#5196); cgroup v1's
 /// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes); no cgroup line at all is
 /// MemAvailable alone.  False when the RAM cannot be determined.  #5519: MemAvailable plus the ZFS ARC's share above its floor
 /// (`zfs_arcstats`; no ZFS: nothing), which MemAvailable leaves out though ZFS gives it back.

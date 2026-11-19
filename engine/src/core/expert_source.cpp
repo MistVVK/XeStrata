@@ -433,7 +433,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
             value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
         else if (key == "MemTotal:" && unit == "kB" && value <= std::numeric_limits<uint64_t>::max() / 1024) mem_total = value * 1024;
     }
-    if (bytes == 0) return false;
+    if (bytes == 0) { m.why = "MemAvailable is not in /proc/meminfo"; return false; }
     // #5519: the ZFS ARC's share above its floor, which MemAvailable leaves out (the cgroup room below still bounds a container)
     if (const uint64_t arc = strata::core::zfs_arc_reclaimable_bytes(zfs_arcstats); arc > 0)
         bytes = bytes > std::numeric_limits<uint64_t>::max() - arc ? std::numeric_limits<uint64_t>::max() : bytes + arc;
@@ -441,7 +441,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     // Account for the tightest cgroup ancestor limit when its normal mount is visible.
     // This is a point-in-time guard, not a reservation against concurrent allocations.
     std::ifstream groups(self_cgroup);
-    if (!groups) return false;
+    if (!groups) { m.why = "/proc/self/cgroup cannot be read"; return false; }
     const std::filesystem::path root(cgroup_root);
     bool v2 = false;
     std::string v1_path;   // the memory controller's group (cgroup v1), when there is no v2 line
@@ -461,25 +461,34 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
         // and --resident-budget-gib was ignored: "cannot determine available memory".)
         if (!std::filesystem::exists(root / "cgroup.controllers")) continue;
         auto path = (root / line.substr(4)).lexically_normal();
-        if (path.string().rfind(root.string(), 0) != 0 || !std::filesystem::is_directory(path)) return false;
+        if (path.string().rfind(root.string(), 0) != 0) { m.why = "the process's cgroup path leaves the cgroup mount"; return false; }
+        // #5196: a process whose "0::" path is not in this mount (a container without a cgroup namespace of its own: its
+        // /proc/self/cgroup names the host's path, while /sys/fs/cgroup is its own group) - the mount's root is that group.
+        // On a real v2 host the root has no memory.max and imposes nothing, so MemAvailable alone applies then.
+        if (!std::filesystem::is_directory(path)) path = root;
         v2 = true;
         while (path.string().rfind(root.string(), 0) == 0) {
+            // A group without a memory.max has no memory controller (it is not in its parent's subtree_control) and no limit
+            // of its own; its parents are read.  (Before: "cannot determine available memory" on such a host, with free RAM.)
+            if (!std::filesystem::exists(path / "memory.max")) {
+                if (path == root) break;
+                path = path.parent_path();
+                continue;
+            }
             std::ifstream limit_file(path / "memory.max"), current_file(path / "memory.current");
             std::string limit;
             uint64_t current = 0;
             const bool readable = bool(limit_file >> limit) && bool(current_file >> current);
-            // The host's root cgroup has no memory.max; ordinary child groups must expose their limits.
-            if (!readable && !(path == root && !std::filesystem::exists(path / "memory.max") &&
-                               std::filesystem::exists(path / "cgroup.controllers"))) return false;
+            if (!readable) { m.why = "a cgroup's memory.max or memory.current cannot be read"; return false; }
             if (readable && limit != "max") {
                 try {
                     size_t consumed = 0;
                     const uint64_t cap = std::stoull(limit, &consumed);
-                    if (consumed != limit.size()) return false;
+                    if (consumed != limit.size()) { m.why = "a cgroup's memory.max is not a number"; return false; }
                     CgroupMemoryStat stat;
-                    if (!read_cgroup_memory_stat(path, current, stat)) return false;
+                    if (!read_cgroup_memory_stat(path, current, stat)) { m.why = "a cgroup's memory.stat has no counters"; return false; }
                     uint64_t cgroup_available = 0;
-                    if (!cgroup_available_bytes(cap, stat, cgroup_available)) return false;
+                    if (!cgroup_available_bytes(cap, stat, cgroup_available)) { m.why = "a cgroup's counters do not add up"; return false; }
                     // a container's limit: the memory guard's file-list credit (no shmem, no locked pages), this margin kept
                     std::ifstream stat_file(path / "memory.stat");
                     std::ostringstream stat_text;
@@ -489,7 +498,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
                     if (room.applies) cgroup_available = room.room;
                     bytes = std::min(bytes, cgroup_available);
                     m.cgroup_limit = std::min(m.cgroup_limit, cap);
-                } catch (...) { return false; }
+                } catch (...) { m.why = "a cgroup's memory.max is not a number"; return false; }
             }
             if (path == root) break;
             path = path.parent_path();
@@ -539,9 +548,12 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
 
 namespace {
 
-bool available_memory_bytes(uint64_t& bytes, uint64_t* commit = nullptr) {
+bool available_memory_bytes(uint64_t& bytes, uint64_t* commit = nullptr, std::string* why = nullptr) {
     detail::HostMemory m;
-    if (!detail::host_available_memory(m)) return false;
+    if (!detail::host_available_memory(m)) {
+        if (why != nullptr && m.why != nullptr) *why = std::string(" (") + m.why + ")";   // what could not be read, for the log line
+        return false;
+    }
     bytes = m.available;
     if (commit != nullptr) *commit = m.commit;
     return bytes > 0;
@@ -3648,9 +3660,10 @@ bool FileExpertSource::pin_cache_complement(
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
         // they fit, the rest left on the mapped files; Windows commit capacity also limits the allocation (#730).
         uint64_t physical = 0;
-        if (!available_memory_bytes(physical, &budget_commit)) {
-            err = budget_automatic_ ? "FileExpertSource: cannot determine available memory for the automatic RAM copy"
-                                    : "FileExpertSource: cannot determine available memory for --resident-budget-gib";
+        std::string mem_why;
+        if (!available_memory_bytes(physical, &budget_commit, &mem_why)) {
+            err = std::string(budget_automatic_ ? "FileExpertSource: cannot determine available memory for the automatic RAM copy"
+                                                : "FileExpertSource: cannot determine available memory for --resident-budget-gib") + mem_why;
             return false;
         }
         budget_physical = physical;
@@ -3730,8 +3743,9 @@ bool FileExpertSource::pin_cache_complement(
         // allocations, the file cache) failed a budget the first one had clamped.  (A budget turns `lend` off.)
         uint64_t physical = budget_physical;
         uint64_t commit = budget_commit;
-        if (physical == 0 && !available_memory_bytes(physical, &commit)) {
-            err = "FileExpertSource: cannot determine available memory for the resident-memory safety check";
+        std::string mem_why3;
+        if (physical == 0 && !available_memory_bytes(physical, &commit, &mem_why3)) {
+            err = "FileExpertSource: cannot determine available memory for the resident-memory safety check" + mem_why3;
             return false;
         }
         const uint64_t available = std::min(physical, commit);
@@ -3785,8 +3799,9 @@ bool FileExpertSource::pin_cache_complement(
     if (!stage_lend_regions_.empty()) {
         if (budget == std::numeric_limits<uint64_t>::max()) {   // #403: the one reading, taken now
             uint64_t physical = budget_physical, commit = budget_commit;
-            if (physical == 0 && !available_memory_bytes(physical, &commit)) {
-                err = "FileExpertSource: cannot determine available memory for the stage lend regions";
+            std::string mem_why2;
+            if (physical == 0 && !available_memory_bytes(physical, &commit, &mem_why2)) {
+                err = "FileExpertSource: cannot determine available memory for the stage lend regions" + mem_why2;
                 return false;
             }
             const uint64_t available = std::min(physical, commit);
