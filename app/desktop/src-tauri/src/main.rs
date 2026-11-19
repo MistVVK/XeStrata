@@ -39,6 +39,7 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod updater;
 mod desktoplog;
+mod identity;
 mod recovery;
 mod shell;
 // Plain std, built on every platform so its decisions are tested everywhere; only the Linux window process uses it.
@@ -274,7 +275,9 @@ fn pick_stable_port() -> Result<u16, String> {
         }
         Err(_) => {
             let used = pick_port()?;
-            *PORT_NOTICE.lock().unwrap() = Some(shell::busy_notice(wanted, used));
+            // A model started from the Terminal (`strata launch`, port 8080 unless told otherwise) is the usual holder: say so (#6278).
+            let by_terminal = health_answer(wanted) == identity::Answer::ModelServer;
+            *PORT_NOTICE.lock().unwrap() = Some(if by_terminal { identity::terminal_notice(wanted, used) } else { shell::busy_notice(wanted, used) });
             Ok(used)
         }
     }
@@ -369,9 +372,13 @@ fn wait_for_health(
         if let Some(why) = exited() {
             return Err(format!("the Strata App Host stopped before it became healthy: {why}"));
         }
-        match ureq_get_ok(&url) {
-            Ok(true) => return Ok(()),
-            Ok(false) => last = "the host answered with a non-2xx status".into(),
+        // The App Host's own answer only (#6278): the Terminal's model server also answers 200 on /api/health.
+        match ureq_get(&url) {
+            Ok((status, body)) => match identity::classify_health(&status, &body) {
+                identity::Answer::AppHost => return Ok(()),
+                identity::Answer::ModelServer => last = "a Strata model server (started from the Terminal) answers on this port, not the App Host".into(),
+                identity::Answer::Other => last = "the host answered with a non-2xx status".into(),
+            },
             Err(e) => last = e,
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -418,8 +425,21 @@ fn http_request_body(method: &str, url: &str, headers: &[(&str, &str)], body: Op
     Ok((status, response))
 }
 
+/// Who answers `/api/health` on this loopback port: the App Host, a Strata model server from the Terminal, or something else / nothing.
+pub(crate) fn health_answer(port: u16) -> identity::Answer {
+    match ureq_get(&format!("http://127.0.0.1:{port}/api/health")) {
+        Ok((status, body)) => identity::classify_health(&status, &body),
+        Err(_) => identity::Answer::Other,
+    }
+}
+
 /// A minimal blocking HTTP GET, so the shell needs no async runtime for one health probe.
 fn ureq_get_ok(url: &str) -> Result<bool, String> {
+    ureq_get(url).map(|(status, _)| status.contains(" 200") || status.contains(" 204"))
+}
+
+/// The same GET with a short read timeout, returning the status line and the body.
+fn ureq_get(url: &str) -> Result<(String, String), String> {
     use std::io::{Read, Write};
     let rest = url.strip_prefix("http://").ok_or("only http:// is supported")?;
     let (authority, path) = match rest.find('/') {
@@ -441,8 +461,9 @@ fn ureq_get_ok(url: &str) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
     let mut buf = String::new();
     stream.read_to_string(&mut buf).map_err(|e| e.to_string())?;
-    let status = buf.lines().next().unwrap_or_default();
-    Ok(status.contains(" 200") || status.contains(" 204"))
+    let status = buf.lines().next().unwrap_or_default().to_string();
+    let body = buf.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    Ok((status, body))
 }
 
 /// The App Host's command, ready to start: the bundled Node runs the host on `port`, serving the built UI, on 127.0.0.1 only.
@@ -1331,6 +1352,33 @@ mod tests {
         let script = drop_script(files);
         assert!(script.starts_with("window.dispatchEvent(new CustomEvent('strata:native-drop', { detail: [{"));
         assert!(script.contains("x.png") && script.ends_with("}));"));
+    }
+
+    /// A loopback server that answers every request with `body` as a 200 (what a Strata model server or the App Host does on /api/health).
+    fn answer_with(body: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_terminal_model_server_on_the_port_is_not_taken_for_the_host() {
+        // #6278: `strata launch`'s server answers 200 on /api/health too; only the App Host's own answer counts.
+        let server = answer_with(r#"{"status": "ok", "model": "swift-1.5-iq3_xxs", "api_key": true, "service": "strata"}"#);
+        assert_eq!(health_answer(server), identity::Answer::ModelServer);
+        assert!(wait_for_health(server, Duration::from_millis(600), || None).is_err());
+        let host = answer_with(r#"{"ok":true,"uptimeSec":2,"backend":"none","engine":null,"clients":0}"#);
+        assert_eq!(health_answer(host), identity::Answer::AppHost);
+        assert!(wait_for_health(host, Duration::from_secs(5), || None).is_ok());
     }
 
     #[test]

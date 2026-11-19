@@ -57,8 +57,10 @@ export function writeShellPrefs(patch, file = shellPrefsFile()) {
  * (set by the shell, never by the person). The page turns it into a sentence in the person's language.
  */
 export function parsePortNotice(value) {
-  const m = /^busy:(\d{1,5}):(\d{1,5})$/.exec(String(value ?? ''));
-  return m ? { wanted: Number(m[1]), used: Number(m[2]) } : null;
+  // "busy:<wanted>:<used>:terminal": the program on the wanted port is a Strata model server started from the Terminal (#6278).
+  const m = /^busy:(\d{1,5}):(\d{1,5})(:terminal)?$/.exec(String(value ?? ''));
+  if (!m) return null;
+  return m[3] ? { wanted: Number(m[1]), used: Number(m[2]), terminal: true } : { wanted: Number(m[1]), used: Number(m[2]) };
 }
 
 /** The notification route of the shell's bridge (loopback, token). Null outside the desktop app. */

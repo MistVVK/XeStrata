@@ -639,8 +639,10 @@ function rememberShellLanguage(language:Language){api.post('/api/shell/prefs',{l
 /** The shell started on another port than it wanted: the chats and settings saved on that port are not here, so say so once (#3402). */
 async function announcePortNotice(){
   try{
-    const shell=await api.get<{portNotice:{wanted:number;used:number}|null}>('/api/shell');
-    if(shell.portNotice)pushToast('warn',tr('Strata could not use its port'),tr('Port {0} is used by another program, so Strata started on port {1}. Chats and settings saved on port {0} are not shown until Strata can use it again. Close the other program and restart Strata.',[shell.portNotice.wanted,shell.portNotice.used]));
+    const shell=await api.get<{portNotice:{wanted:number;used:number;terminal?:boolean}|null}>('/api/shell');
+    /* A model started from the Terminal holds the port (#6278): say that, and that the Terminal's page there needs its own key. */
+    if(shell.portNotice?.terminal)pushToast('warn',tr('A model is already running from the Terminal'),tr('A model started with strata launch is using port {0}, so Strata opened on port {1} instead. The Terminal’s page on port {0} asks for its own API key, and this app does not use that page. To load a model here, stop the Terminal’s one first (strata launch --stop). Chats and settings saved on port {0} are not shown here.',[shell.portNotice.wanted,shell.portNotice.used]));
+    else if(shell.portNotice)pushToast('warn',tr('Strata could not use its port'),tr('Port {0} is used by another program, so Strata started on port {1}. Chats and settings saved on port {0} are not shown until Strata can use it again. Close the other program and restart Strata.',[shell.portNotice.wanted,shell.portNotice.used]));
   }catch{/* a browser or an older host has no shell */}
 }
 export function setFontFamily(fontFamily:string){set({fontFamily:fontFamily.trim().slice(0,128).replace(/[\x00-\x1f]/g,'')});savePrefs();}

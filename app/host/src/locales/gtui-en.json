@@ -1,0 +1,4 @@
+{
+ "gtui01": "A model is already running from the Terminal",
+ "gtui02": "A model started with strata launch is using port {0}, so Strata opened on port {1} instead. The Terminal’s page on port {0} asks for its own API key, and this app does not use that page. To load a model here, stop the Terminal’s one first (strata launch --stop). Chats and settings saved on port {0} are not shown here."
+}

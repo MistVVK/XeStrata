@@ -154,7 +154,9 @@ fn pid_alive(pid: u32) -> bool {
 /// A Strata that is really running: its shell process exists and its host answers.
 pub fn live_session() -> Option<Session> {
     let s = read_session()?;
-    if s.pid != std::process::id() && pid_alive(s.pid) && crate::ureq_get_ok(&format!("http://127.0.0.1:{}/api/health", s.port)).unwrap_or(false) {
+    // The answer must be the App Host's: a process that took over the old process id and a Terminal model server on the old port
+    // (default 8080) are not a running Strata (#6278: the window then showed the model server's page and asked for its API key).
+    if s.pid != std::process::id() && pid_alive(s.pid) && crate::health_answer(s.port) == crate::identity::Answer::AppHost {
         Some(s)
     } else {
         None
