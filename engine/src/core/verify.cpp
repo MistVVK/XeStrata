@@ -343,6 +343,16 @@ bool batch_self_commit_on() { static const bool v = env_on("STRATA_BATCH_SELF_CO
 // streamed KV cache (a row's block resolve could evict the blocks an earlier row of the same slot selected).
 bool qsa_slots_on() { static const bool v = env_on("STRATA_QSA_SLOTS"); return v; }
 #define g_qsa_slots (qsa_slots_on())
+// STRATA_BATCH_ATTN_ROWS=1 / STRATA_BATCH_GDN_GROUPS=1 (opt-in, #2234): see record_window and capture_commit_batch.  Read at the
+// first use, like the switches above (main() sets platform defaults after the namespace-scope constants are initialised).
+bool env_nonzero(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && std::atoi(v) != 0;
+}
+bool batch_attn_rows_on() { static const bool v = env_nonzero("STRATA_BATCH_ATTN_ROWS"); return v; }
+bool batch_gdn_groups_on() { static const bool v = env_nonzero("STRATA_BATCH_GDN_GROUPS"); return v; }
+#define g_batch_attn_rows (batch_attn_rows_on())
+#define g_batch_gdn_groups (batch_gdn_groups_on())
 
 // every row of a batch window is another slot's (no slot has proposal rows)
 bool one_row_per_slot(const int* rows, int S) {
@@ -1888,11 +1898,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 }
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
-                static const bool gdn_groups_on = [] {   // STRATA_BATCH_GDN_GROUPS=1, all slots in one launch
-                    const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
-                if (batch_rec_ && gdn_groups_on && te - tb <= 8) {
+                if (batch_rec_ && g_batch_gdn_groups && te - tb <= 8) {
                     strata::kernels::GdnGroups gg;
                     for (int t = tb; t < te;) {
                         const int first = t;
@@ -2214,11 +2220,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // own indexer keys, the top-k over all rows (row-independent), attention with each row's own pools -
                 // instead of 3-4 one-row launches per row; the same per-row arithmetic.  Not with KV streaming
                 // (qsa_kv_resolve has work per slot then).
-                static const bool attn_rows = [] {
-                    const char* v = std::getenv("STRATA_BATCH_ATTN_ROWS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
-                bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
+                bool rows_ok = batch_rec_ && g_batch_attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
                 for (int t = tb; rows_ok && t < te; ++t) rows_ok = slot_ss(t).qsa_states[qi].kv_mode != 1;
                 if (rows_ok) {
                     const int n_rows = te - tb;
@@ -4241,6 +4243,17 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     slot_tail_.assign(slots.size(), {});
     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))%s\n", (long long) S,
                  (long long) lb_, (long long) le_, g_batch_self_commit ? ", one-row windows keep their rows" : "");
+    if (g_batch_attn_rows || g_batch_gdn_groups) {   // #2234: which are on, and when attention cannot use its own
+        bool streamed = false;   // a slot whose KV streams (kv_mode 1) keeps the per-row attention launches
+        for (const SessionState* x : slots)
+            for (int64_t j = 0; j < x->qsa_alloc && !streamed; ++j)
+                streamed = x->qsa_states[x->qsa_ord0 + j].kv_mode == 1;
+        std::fprintf(stderr, "strata verify: batch rows in one launch: attention %s (STRATA_BATCH_ATTN_ROWS), "
+                     "GDN %s (STRATA_BATCH_GDN_GROUPS)%s\n", g_batch_attn_rows ? "on" : "off",
+                     g_batch_gdn_groups ? "on" : "off",
+                     g_batch_attn_rows && streamed ? "; the KV streams (--kv-resident), so attention keeps one launch "
+                                                     "per row" : "");
+    }
     return true;
 }
 
@@ -4308,10 +4321,6 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                 if (!wnm) { ok = false; break; }
                 // STRATA_BATCH_GDN_GROUPS=1: one-row groups (no --batch-mtp proposals) commit their recurrence
                 // in one launch for all slots; the conv commits stay per slot
-                static const bool gdn_groups_on = [] {
-                    const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
                 bool one_row = S <= 8;
                 for (int t = 1; one_row && t < S; ++t) one_row = rows[t] != rows[t - 1];
                 strata::kernels::GdnGroups gg;
@@ -4324,7 +4333,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                     gdn_conv_commit(conv, qkv_L_ + (size_t) gdn_index * MT * C + (size_t) first * C,
                                     (int) C, keep, cs_);
-                    if (gdn_groups_on && one_row) {
+                    if (g_batch_gdn_groups && one_row) {
                         gg.state[gg.n] = state;
                         gg.keep[gg.n] = keep;
                         gg.first[gg.n] = first;
