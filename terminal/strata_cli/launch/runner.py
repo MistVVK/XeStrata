@@ -1070,8 +1070,8 @@ class Runner:
 
     def model_shape(self) -> str | None:
         """The model shape whose own engine runs the chosen model (a feed model of a shape other than Flash-Next's: setup's FAMILIES entry has "shape"), or None."""
-        if self.is_hy4():                                    # Tencent Hy4-Flash: its engine is the component strata-hy4 (shape "hy4", strata_control/shape_engine.py)
-            from strata_control import hy4_family
+        from strata_control import hy4_family
+        if getattr(self.s, "family", None) == hy4_family.FAMILY:     # Tencent Hy4-Flash: its engine is the component strata-hy4 (shape "hy4", strata_control/shape_engine.py)
             return hy4_family.SHAPE
         try:
             fam = (getattr(self.catalog.strata.setup_module(), "FAMILIES", None) or {}).get(self.s.family) or {}
