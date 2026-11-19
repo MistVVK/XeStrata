@@ -55,6 +55,8 @@ __global__ void history_advance_kernel(float* __restrict__ history, const float*
 __device__ __forceinline__ uint16_t bf16_bits(float f) {
     uint32_t i;
     memcpy(&i, &f, 4);
+    // a NaN stays a quiet NaN, as in bf16_bits.hpp: the rounding add would carry it into -0 or inf
+    if ((i & 0x7FFFFFFFu) > 0x7F800000u) return (uint16_t) ((i >> 16) | 64u);
     i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;
     return (uint16_t) (i >> 16);
 }

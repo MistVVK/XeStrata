@@ -5424,7 +5424,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cudaMemcpy(hid.data(), m.ids, hid.size() * 4, cudaMemcpyDeviceToHost);
                                 cudaMemcpy(hw.data(), m.w, hw.size() * 4, cudaMemcpyDeviceToHost);
                                 std::vector<uint16_t> ids16(hid.size()), w16(hw.size());
-                                for (size_t i = 0; i < hid.size(); ++i) { ids16[i] = (uint16_t) hid[i]; w16[i] = (uint16_t) (((*(const uint32_t*) &hw[i]) + 0x8000u) >> 16); }
+                                for (size_t i = 0; i < hid.size(); ++i) { ids16[i] = (uint16_t) hid[i]; const uint32_t b = *(const uint32_t*) &hw[i]; w16[i] = (b & 0x7fffffffu) > 0x7f800000u ? (uint16_t) ((b >> 16) | 64u) : (uint16_t) ((b + 0x8000u) >> 16); }
                                 const int32_t hd[4] = {(int32_t) l, pos, (int32_t) T, featl[(size_t) (l & 63)] ? 1 : 0};
                                 std::fwrite(hd, 4, 4, ff);
                                 std::fwrite(ids16.data(), 2, ids16.size(), ff);
@@ -7368,6 +7368,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     for (int64_t i = 0; i < nr * D; ++i) {
                         uint32_t u;
                         std::memcpy(&u, &rows[(size_t) i], 4);
+                        if ((u & 0x7fffffffu) > 0x7f800000u) {      // a NaN stays a quiet NaN (bf16_bits.hpp)
+                            out[(size_t) i] = (uint16_t) ((u >> 16) | 64u);
+                            continue;
+                        }
                         u += 0x7fffu + ((u >> 16) & 1u);
                         out[(size_t) i] = (uint16_t) (u >> 16);
                     }
