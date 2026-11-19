@@ -181,7 +181,7 @@ def build(src: Path, backend: str, version: str, target: str, out: Path, *, entr
         # sm_75 and up starts a restart loop on those cards ("this PC's GPU is sm_60")
         raise SystemExit("refusing to package the cuda12 engine without sm_60, sm_61 or sm_70: it is the Pascal and Volta build "
                          "(CUDA 12.9, -DSTRATA_EXPERIMENTAL_SM60=ON, --arch sm_60 --arch sm_61 --arch sm_70 ...; see packaging/build_cuda_linux.sh)")
-    if backend == "hip":
+    if backend == "hip" and shape != shape_engine.HY4_SHAPE:         # the Hy4-Flash runner has its own kernels: no hipBLASLt, so no tuning table to match
         from strata_control import hipblaslt_tuning
         problems = hipblaslt_tuning.check_stage(src, archs)
         if problems:
