@@ -868,11 +868,18 @@ bool Verifier::gather_taps(float* landing, int landing_device, int row0, int row
 // STRATA_TAP_FILE: one record per row of the window: int32 position, int32 input token, then n_taps x n_embd floats
 void Verifier::tap_write(int T, const int32_t* tokens, int64_t pos0) {
     if (tap_file_ == nullptr) return;
-    const size_t per = tap_layers_.size() * (size_t) g_->n_embd;
+    const float* src = h_tap_;
+    size_t per = tap_layers_.size() * (size_t) g_->n_embd;
+    if (tap_split_) {   // a layer split - every stage's rows come to the host through the drafter's gather
+        std::string gerr;
+        if (!gather_taps_host(tap_split_host_.data(), 0, T, gerr)) { std::fprintf(stderr, "strata: STRATA_TAP_FILE (split): %s\n", gerr.c_str()); return; }
+        src = tap_split_host_.data();
+        per = (size_t) tap_total() * (size_t) g_->n_embd;
+    }
     for (int t = 0; t < T; ++t) {
         const int32_t hdr[2] = {(int32_t) (pos0 + t), tokens[t]};
         std::fwrite(hdr, sizeof hdr, 1, tap_file_);
-        std::fwrite(h_tap_ + (size_t) t * per, sizeof(float), per, tap_file_);
+        std::fwrite(src + (size_t) t * per, sizeof(float), per, tap_file_);
     }
     std::fflush(tap_file_);
 }
@@ -1006,7 +1013,31 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // A layer split's stage taps the requested layers inside its own range [lb_, le_) into its own buffer [max_t][its taps][n_embd];
     // gather_taps() lands every stage's rows on the drafter's card.  The research dump (STRATA_TAP_FILE) needs the whole model in one verifier.
     const bool tap_whole = lb_ == 0 && le_ == g.n_layers;
-    if (!tap_whole) tap_path = nullptr;
+    // on a layer split the research dump rides the drafter's mechanism - each stage keeps the requested layers of its
+    // own range (tap_req_, as set_taps would), and the first stage owns the file and gathers the chain's rows to the host.
+    // Not when a drafter already claimed the taps (tap_req_ set): its layers are its own.
+    const char* tap_split_path = nullptr;
+    if (!tap_whole) {
+        if (tap_path != nullptr && tap_req_.empty()) {
+            const char* tl = std::getenv("STRATA_TAP_LAYERS");
+            std::string list = tl != nullptr && tl[0] != '\0' ? tl : "5,15,25,35,45";
+            for (size_t i = 0; i < list.size();) {
+                const size_t j = list.find(',', i);
+                const int l = std::atoi(list.substr(i, j == std::string::npos ? std::string::npos : j - i).c_str());
+                if (l >= 0 && l < g.n_layers - 1) tap_req_.push_back(l);
+                if (j == std::string::npos) break;
+                i = j + 1;
+            }
+            std::sort(tap_req_.begin(), tap_req_.end());
+            tap_req_.erase(std::unique(tap_req_.begin(), tap_req_.end()), tap_req_.end());
+            if (lb_ == 0 && !tap_req_.empty()) tap_split_path = tap_path;
+            if (lb_ == 0 && tap_req_.empty())
+                std::fprintf(stderr, "strata: STRATA_TAP_FILE ignored: STRATA_TAP_LAYERS names no layer in 0..%d\n", g.n_layers - 2);
+        } else if (tap_path != nullptr && lb_ == 0) {
+            std::fprintf(stderr, "strata: STRATA_TAP_FILE ignored: the drafter owns this layer split's taps\n");
+        }
+        tap_path = nullptr;
+    }
     if (tap_path != nullptr || !tap_req_.empty()) {
         tap_layers_.clear();
         if (tap_path == nullptr) {
@@ -1043,6 +1074,17 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             std::fprintf(stderr, "strata: STRATA_TAP_FILE %s: %zu taps of %lld floats per row\n", tap_path, nt, (long long) N);
         }
         tap_on_ = true;
+    }
+    if (tap_split_path != nullptr) {
+        const size_t nt_all = (size_t) tap_total();
+        tap_file_ = std::fopen(tap_split_path, "wb");
+        if (tap_file_ == nullptr) { err = std::string("verify: cannot write STRATA_TAP_FILE ") + tap_split_path; return false; }
+        const int32_t hdr[4] = {0x50415453 /* 'STAP' */, 1, (int32_t) N, (int32_t) nt_all};
+        std::fwrite(hdr, sizeof hdr, 1, tap_file_);
+        for (int l : tap_req_) { const int32_t v = l; std::fwrite(&v, sizeof v, 1, tap_file_); }
+        tap_split_host_.assign((size_t) T * nt_all * (size_t) N, 0.0f);
+        tap_split_ = true;
+        std::fprintf(stderr, "strata: STRATA_TAP_FILE %s: %zu taps of %lld floats per row (layer split: gathered from every stage)\n", tap_split_path, nt_all, (long long) N);
     }
     if (bal_ != nullptr) {   // set_pcie_balance: four stamp words per (layer, group)
         if (!mapped((size_t) g.n_layers * 2 * 4 * 8, (void**) &h_bal_, (void**) &m_bal_)) {
@@ -2771,7 +2813,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
     stamp(g.n_layers, 1, 0);
-    if (tap_on_ && !batch_rec_ && tap_file_ != nullptr) copy_from_mapped(m_tap_, tap_dev_, (int64_t) T * (int64_t) tap_layers_.size() * N, cs);
+    if (tap_on_ && !batch_rec_ && tap_file_ != nullptr && !tap_split_) copy_from_mapped(m_tap_, tap_dev_, (int64_t) T * (int64_t) tap_layers_.size() * N, cs);
     return true;
 }
 
@@ -3744,6 +3786,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         commit_pending_ = false;
         if (prof_on_ && G == 1) collect_profile();
+        if (tap_split_ && !batch_rec_) tap_write(T, tokens, pos0);   // the chain is synced: every stage's taps are final
         return true;
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
@@ -3783,7 +3826,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
-        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
+        if (next_ != nullptr && !next_->run(T, tokens, pos0, pool, next_user_, out, err)) return false;
+        // a layer split's first stage owns STRATA_TAP_FILE: it writes once the rest of the chain has run
+        if (tap_split_ && !batch_rec_) tap_write(T, tokens, pos0);
+        return true;
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {

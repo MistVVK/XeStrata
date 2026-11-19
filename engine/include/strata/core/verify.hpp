@@ -708,6 +708,8 @@ private:
     cudaEvent_t tap_ev_ = nullptr;
     float* h_tap_ = nullptr;     float* m_tap_ = nullptr;       ///< the mapped copy of tap_dev_
     std::FILE* tap_file_ = nullptr;
+    bool tap_split_ = false;                      ///< STRATA_TAP_FILE on a layer split - this (first) stage gathers the chain's taps to the host
+    std::vector<float> tap_split_host_;           ///< [max_t][all taps][n_embd]
     void tap_write(int T, const int32_t* tokens, int64_t pos0);
     uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
     int nf_row_ = -1;                     ///< nonfinite_row()
