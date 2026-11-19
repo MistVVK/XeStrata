@@ -14987,6 +14987,47 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_KQ512_MIN",
+   "backends": [
+    "cpu"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cpu/native_expert.cpp",
+     "line": 636,
+     "backend": "cpu",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/kernels/cpu/native_expert.cpp",
+     "line": 744,
+     "backend": "cpu",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "8",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/DETAILS.md:1102"
+   ],
+   "first_commit": "461b94b43a",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "461b94b43a",
+   "last_date": "2026-11-19",
+   "status": "research",
+   "owner": "core",
+   "note": "token floor of the AVX-512 rows (default 8); floors 3 and 4 measured 1-6% slower decode on a Xeon 8352V (RESULTS-BW-E.md)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_KQ_GU_LANES",
    "backends": [
     "sycl"
@@ -22296,6 +22337,47 @@
    "status": "research",
    "owner": "core",
    "note": "turns off the wait before READY on an integrated gfx11 GPU under Linux (the engine waits until its own KFD eviction counter was quiet for 2 s, at most 10 s; automatic on that class, nothing on other devices); for A/B runs only, not for users",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_NO_KQ512",
+   "backends": [
+    "cpu"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cpu/native_expert.cpp",
+     "line": 635,
+     "backend": "cpu",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/kernels/cpu/native_expert.cpp",
+     "line": 743,
+     "backend": "cpu",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "on",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/DETAILS.md:1102"
+   ],
+   "first_commit": "461b94b43a",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "461b94b43a",
+   "last_date": "2026-11-19",
+   "status": "rollback",
+   "owner": "core",
+   "note": "=1 never takes the AVX-512 VNNI rows of UD-Q4_K_XL's Q4_K gate/up and Q5_1 / Q8_0 down experts (kq_avx512.cpp, bit-exact against the one-token dot, groups of 8 tokens and more); BW-4 f-bw-e",
    "retire_after": "",
    "retired_in": ""
   },
@@ -29779,6 +29861,41 @@
    "status": "opt-in",
    "owner": "prefill",
    "note": "[reviewed] Documented CPU share extension, off by default. [release-v0.1.41.md:66]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PREFILL_CPU_SHARE_NT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 687,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/DETAILS.md:1101"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "opt-in",
+   "owner": "core",
+   "note": "experts of up to N tokens may go to the CPU prompt share (default: 8); 2,244-4,272 ms -> 1,828 ms at 4K on an x8 PCIe 4.0 link, KL ratio 1.054 [0.993, 1.120] (RESULTS-BW-E.md)",
    "retire_after": "",
    "retired_in": ""
   },
@@ -38793,6 +38910,41 @@
    "status": "research",
    "owner": "program",
    "note": "[auto] off unless set, not documented for users",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_SPLIT_LINK_MIN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 6685,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/MULTI_GPU.md:154"
+   ],
+   "first_commit": "becf4a3d9a",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "becf4a3d9a",
+   "last_date": "2026-11-19",
+   "status": "opt-in",
+   "owner": "core",
+   "note": "gap from which a slow link scales the auto split's miss cost (default 4; =3 puts fewer layers on a x2 card beside a x8 one: 4K prompt 5,950 -> 3,926 ms, RESULTS-BW-E.md)",
    "retire_after": "",
    "retired_in": ""
   },

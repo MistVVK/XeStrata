@@ -6681,7 +6681,9 @@ int main(int argc, char** argv) {
         // where any scaling moves auto off the balanced placement.
         static const bool link_abs = [] { const char* v = std::getenv("STRATA_SPLIT_LINK_ABS"); return v && v[0] == '1'; }();
         static const bool split_uniform = [] { const char* v = std::getenv("STRATA_SPLIT_UNIFORM"); return v && v[0] == '1'; }();
-        std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
+        // STRATA_SPLIT_LINK_MIN=r (BW-MG, opt-in): the gap from which the scale applies, 4 unless set (a x8 beside a x2 slot is a gap of 3.9: unscaled by default)
+        static const double link_min = strata::program::split_rules::link_scale_min_resolve(std::getenv("STRATA_SPLIT_LINK_MIN"));
+        std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps, link_min);
         for (int i = 0; i < ns; ++i) {
             const double bw = link_gbps[(size_t) i];
             if (split_uniform) link_scale[(size_t) i] = 1.0;
