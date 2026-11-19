@@ -3986,7 +3986,13 @@ void Verifier::set_plan_slot(int grp) {
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
     const int tb = G == 2 && grp == 1 ? (last_t_ + 1) / 2 : 0;
-    sink_.hit_out_dev = (hit_out_ != nullptr && ss_ != nullptr && g_ != nullptr)
+    // STRATA_P2P_DECODE_SCATTER=1 (opt-in; #6023 had it always on): the decode peer writes its experts' outputs straight into this
+    // buffer over P2P (expert_pool_dispatch_multi); unset, they come back through the host as before.
+    static const bool p2p_scatter = [] {
+        const char* v = std::getenv("STRATA_P2P_DECODE_SCATTER");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    sink_.hit_out_dev = (p2p_scatter && hit_out_ != nullptr && ss_ != nullptr && g_ != nullptr)
                             ? hit_out_ + (size_t) tb * ss_->k * g_->n_embd
                             : nullptr;
 }

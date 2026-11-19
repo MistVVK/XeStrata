@@ -12696,7 +12696,13 @@ int main(int argc, char** argv) {
                 const int dev_from = si == 0 ? strata::core::primary_device() : stages[si - 1]->dev;
                 const int dev_to = split_same ? dev_from : stages[si]->dev;
                 bool p2p_allocated = false;
-                if (!split_same && dev_from != dev_to) {
+                // STRATA_P2P_HANDOFF=1 (opt-in; #6023 did it whenever two cards can reach each other): the hand-off buffer sits in
+                // the next stage's VRAM and the stage before writes it over P2P; unset, it is pinned host memory as before
+                static const bool p2p_handoff = [] {
+                    const char* v = std::getenv("STRATA_P2P_HANDOFF");
+                    return v != nullptr && v[0] != '\0' && v[0] != '0';
+                }();
+                if (p2p_handoff && !split_same && dev_from != dev_to) {
                     int can01 = 0, can10 = 0;
                     if (cudaDeviceCanAccessPeer(&can01, dev_from, dev_to) == cudaSuccess &&
                         cudaDeviceCanAccessPeer(&can10, dev_to, dev_from) == cudaSuccess && can01 && can10) {

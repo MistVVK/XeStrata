@@ -5338,7 +5338,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int tail_rank = tail_skip_rank();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if (tail_rank > 0 && d.remote_count == 0) {
+        // (not taken from #6023: the tail skip with a peer card - it changes the bits of a --peer-device run that sets
+        // STRATA_ROUTE_TAIL_SKIP, and the owner's default for the skip is off; the peer-resident test below stays, it is right)
+        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
             int minr[kMaxWindowEntries];
             for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
