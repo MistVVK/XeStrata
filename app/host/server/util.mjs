@@ -100,6 +100,16 @@ export async function which(binary, { env = process.env, platform = process.plat
   return out.split(/\r?\n/)[0].trim() || null;
 }
 
+/**
+ * What may wait, unsent, for one event stream client (#6153). A window that stops reading (a hidden or suspended WebView, a frozen tab) leaves
+ * its socket open, and Node keeps every frame it cannot send in memory. The host sends a monitor frame of about 100 KB every second, so one such
+ * window filled the host's 4 GB heap in about 9 hours. A snapshot that the next one replaces is not queued behind an unsent one; any other
+ * event may queue up to this much, then the client is let go: the page reconnects by itself and asks for the state again.
+ */
+export const EVENT_BACKLOG_MAX = 4 * 1024 * 1024;
+/** Events that are a full snapshot of the current state: a client that is behind loses nothing by missing one. */
+const REPLACEABLE = new Set(['monitor']);
+
 /** Minimal SSE hub. */
 export class EventHub {
   #clients = new Set();
@@ -113,7 +123,7 @@ export class EventHub {
     });
     res.write(': connected\n\n');
     this.#clients.add(res);
-    const ping = setInterval(() => res.write(': ping\n\n'), 15000);
+    const ping = setInterval(() => { if (!res.writableNeedDrain) res.write(': ping\n\n'); }, 15000);
     res.on('close', () => {
       clearInterval(ping);
       this.#clients.delete(res);
@@ -124,6 +134,8 @@ export class EventHub {
     const frame = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
     for (const res of this.#clients) {
       try {
+        if (res.writableNeedDrain && REPLACEABLE.has(event)) continue;
+        if (res.writableLength > EVENT_BACKLOG_MAX) { this.#clients.delete(res); res.destroy(); continue; }
         res.write(frame);
       } catch {
         this.#clients.delete(res);
