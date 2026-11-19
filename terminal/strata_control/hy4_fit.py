@@ -14,7 +14,10 @@ tests/terminal/test_hy4_squant_fit.py, plus what the 0.2.18 defaults add (owner,
 
     non_expert(ctx) = VRAM_NON_EXPERT_GB + kv_extra(ctx)            the author's 2.00 GB holds the KV of a 20K context; a longer one adds what it measured to take:
     kv_extra(ctx)   = max(0, ctx - 20480) x KV_GB_PER_TOKEN         HY4-STRIX measured 66.3 GiB resident at 128K against 62.2 GiB at 4K on SQ-64 (about 4.1 GiB for 124K more
-                                                                    tokens, 34.7 KB a token; the MLA latent cache of the 12 sparse layers, the 30 SWA rings and the index pool together)
+                                                                    tokens, 34.7 KB a token).  It is "KV + context workspace", not the KV alone: the MLA latent cache of the 12 sparse layers (1.9 GB at 128K on the
+                                                                    M5 Max), the 30 SWA rings, and the IndexPool, workspace and Engram buffers, whose size also grows with the context. HY4-METAL measured the
+                                                                    same kind of total on Metal (SQ-64, on top of the mapped 62 GB file): 1.6 GB at 4K, 4.4 GB at 32K, 6.6 GB at 128K (+5.0 GB); Strix is +4.4 GB; this is +3.84 GB
+                                                                    beyond the author's 20K, the same range (to be checked against the CUDA lane's RTX 5070 numbers at 128K)
 
 Unified memory (Strata Halo, Apple silicon, DGX Spark) has one pool: the trunk, the KV and every expert body live in it and nothing is copied or read from the SSD while the
 footprint fits `pool - UMA_RESERVE_GB - kv_extra - vision`.
@@ -36,7 +39,7 @@ VISION_GB = 0.934                # Hy4-Flash-Vision.strata (934,092,800 B): in t
 AUTHOR_CONTEXT = 20480           # the context the author's 2.00 GB (and his 7 cases) are made for
 DEFAULT_CONTEXT = 131072         # owner, 2026-11-19: 128K by default
 CONTEXTS = [8192, 32768, 65536, 131072]
-KV_GB_PER_TOKEN = 34.7e-6        # HY4-STRIX, Strix Halo SQ-64: (66.3 - 62.2) GiB x 1.0737 / (131072 - 4096) tokens
+KV_GB_PER_TOKEN = 34.7e-6        # KV + context workspace (IndexPool, workspace and Engram buffers grow with it too), per token: HY4-STRIX, Strix Halo SQ-64: (66.3 - 62.2) GiB x 1.0737 / (131072 - 4096); HY4-METAL (M5 Max): +5.0 GB from 4K to 128K, KV alone 1.9 GB of it
 DRAFTER_GB = 0.44                # the 5-layer DFly2 drafter, in Section 1 already (inside every build's dense_gb): kept here to say so, not added twice
 FAMILY = "hy4-flash"
 FAMILY_NAME = "hy4-flash"        # the config's model_name prefix
@@ -56,7 +59,7 @@ def build_names() -> list[str]:
 
 
 def kv_extra_gb(ctx: int | None = None) -> float:
-    """What a context of `ctx` tokens holds beyond the author's 20K (GB)."""
+    """What a context of `ctx` tokens holds beyond the author's 20K (GB): the KV and the context workspace (IndexPool, workspace and Engram buffers), see the module text."""
     n = DEFAULT_CONTEXT if ctx is None else int(ctx)
     return max(0, n - AUTHOR_CONTEXT) * KV_GB_PER_TOKEN
 
