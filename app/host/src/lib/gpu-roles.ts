@@ -243,9 +243,16 @@ export function sentence(cards: RoleCard[] | null | undefined, vendor?: string |
   const m = byi.get(rec.main)!;
   if (cs.length === 1) return `Strata will use your ${shortName(m)}.`;
   const why = { same: 'the cards are alike', memory: 'it has more memory', faster: 'it is faster', only: 'it is the only card', none: '' }[rec.why];
-  let s = `${shortName(m)} is Main: ${why}.`;
   const helpers = byNumber(rec.roles).filter(i => rec.roles[i] === 'helper').map(i => shortName(byi.get(i)!));
-  if (helpers.length) s += ` ${helpers.join(' and ')} ${helpers.length > 1 ? 'help' : 'helps'}.`;
+  let s: string;
+  if (helpers.length && rec.why === 'same' && helpers.every(h => h === shortName(m))) {
+    // 0217 item 12 (the same words as the Terminal, strata_control/gpu_roles.py): alike cards are said once, not as "A is Main: the cards are alike. A helps."
+    const n = helpers.length + 1;
+    s = n === 2 ? `Both cards are ${shortName(m)}, so they are alike: one is Main and the other helps.` : `All ${n} cards are ${shortName(m)}, so they are alike: one is Main and the others help.`;
+  } else {
+    s = `${shortName(m)} is Main: ${why}.`;
+    if (helpers.length) s += ` ${helpers.join(' and ')} ${helpers.length > 1 ? 'help' : 'helps'}.`;
+  }
   for (const i of byNumber(rec.roles)) if (rec.roles[i] === 'off') {
     const code = rec.reasons[i], c = byi.get(i)!;
     s += ` ${shortName(c)} starts Off: ${code === 'cannot_run' ? 'Strata cannot run it.' : code === 'igpu' ? 'built-in graphics.' : `${OFF_AT_OR_BELOW_GB} GB or less.`}`;

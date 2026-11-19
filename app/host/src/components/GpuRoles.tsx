@@ -17,9 +17,16 @@ export function recommendationLine(cards: RoleCard[], vendor?: string | null): s
   const m = byi.get(rec.main)!;
   if (cards.length === 1) return tr('Strata will use your {0}.', [shortName(m)]);
   const why = { same: 'the cards are alike', memory: 'it has more memory', faster: 'it is faster', only: 'it is the only card', none: '' }[rec.why];
-  let s = tr('{0} is Main: {1}.', [shortName(m), tr(why)]);
   const helpers = Object.keys(rec.roles).map(Number).filter(i => rec.roles[i] === 'helper').map(i => shortName(byi.get(i)!));
-  if (helpers.length) s += ' ' + tr(helpers.length > 1 ? '{0} help.' : '{0} helps.', [helpers.join(', ')]);
+  let s: string;
+  if (helpers.length && rec.why === 'same' && helpers.every(h => h === shortName(m))) {
+    // 0217 item 12: alike cards are said once (the same words as the Terminal's sentence)
+    s = helpers.length === 1 ? tr('Both cards are {0}, so they are alike: one is Main and the other helps.', [shortName(m)])
+      : tr('All {0} cards are {1}, so they are alike: one is Main and the others help.', [helpers.length + 1, shortName(m)]);
+  } else {
+    s = tr('{0} is Main: {1}.', [shortName(m), tr(why)]);
+    if (helpers.length) s += ' ' + tr(helpers.length > 1 ? '{0} help.' : '{0} helps.', [helpers.join(', ')]);
+  }
   for (const i of Object.keys(rec.roles).map(Number)) if (rec.roles[i] === 'off') {
     const code = rec.reasons[i], c = byi.get(i)!;
     s += ' ' + tr('{0} starts Off: {1}', [shortName(c), code === 'cannot_run' ? tr('Strata cannot run it.') : code === 'igpu' ? tr('built-in graphics.') : tr('{0} GB or less.', [OFF_AT_OR_BELOW_GB])]);

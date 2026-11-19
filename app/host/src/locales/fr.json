@@ -3571,5 +3571,7 @@
   "s9136": "Maximum",
   "s9137": "2K",
   "s9138": "8K",
-  "s9139": "32K"
+  "s9139": "32K",
+  "s9140": "Les deux cartes sont des {0}, elles se valent : l’une est principale et l’autre aide.",
+  "s9141": "Les {0} cartes sont des {1}, elles se valent : l’une est principale et les autres aident."
 }

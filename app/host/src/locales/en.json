@@ -3571,5 +3571,7 @@
   "s9136": "Max",
   "s9137": "2K",
   "s9138": "8K",
-  "s9139": "32K"
+  "s9139": "32K",
+  "s9140": "Both cards are {0}, so they are alike: one is Main and the other helps.",
+  "s9141": "All {0} cards are {1}, so they are alike: one is Main and the others help."
 }

@@ -3571,5 +3571,7 @@
   "s9136": "Máximo",
   "s9137": "2K",
   "s9138": "8K",
-  "s9139": "32K"
+  "s9139": "32K",
+  "s9140": "As duas placas são {0}, então são iguais: uma é a principal e a outra ajuda.",
+  "s9141": "As {0} placas são {1}, então são iguais: uma é a principal e as outras ajudam."
 }
