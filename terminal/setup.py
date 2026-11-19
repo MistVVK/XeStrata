@@ -4138,7 +4138,10 @@ GFX1103_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1103") == "1"
 # build one with `STRATA_HIP_ARCHS=gfx1150 tools\hip\build_windows.bat` and start setup with `--prebuilt dist\`.
 # Unset: unchanged.
 GFX1150_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1150") == "1"
-AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1032", "gfx1151") \
+# The Instinct MI50 / MI60 / Radeon VII (gfx906) also runs, from a source build on a system ROCm 6.x (the last line
+# with gfx906 libraries; AMD's wheels hold 7.x families only): setup lists the card but does not drive that build
+# (docs/AMD_HIP.md, the gfx906 section).
+AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1032", "gfx1151", "gfx906") \
             + (("gfx1103",) if GFX1103_OPT_IN else ()) + (("gfx1150",) if GFX1150_OPT_IN else ())
 # The exact (bit-identical) speed switches the engine turns on by default on gfx1151 (src/core/arch_defaults.cpp), less
 # STRATA_HCD_EXACT: that one copies the gfx1151 hipBLASLt table's solutions 1176 / 1177, and the gfx1103 table
@@ -4173,12 +4176,14 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
              # integrated Radeons of other Ryzen families: named so they are not taken for Strix Halo (not supported)
              "gfx1150": "AMD Radeon 890M / 880M (Ryzen AI 300, Strix Point, gfx1150)",
              "gfx1152": "AMD Radeon 860M / 840M (Ryzen AI 300, Krackan Point, gfx1152)",
-             "gfx1103": "AMD Radeon 780M / 760M / 740M (Ryzen 7040 / 8040, Phoenix / Hawk Point, gfx1103)"}
+             "gfx1103": "AMD Radeon 780M / 760M / 740M (Ryzen 7040 / 8040, Phoenix / Hawk Point, gfx1103)",
+             "gfx906": "AMD Instinct MI50 / MI60 / Radeon VII (gfx906)"}
 AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), RX 9060 XT (gfx1200) and "
              "RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201), and the RX 6800 / 6900 series (gfx1030) and RX 6700 XT "
              "(gfx1031, #524), and the RX 7600 / 7600 XT (gfx1102, one run reported, #942), and the RX 6600 / 6600 XT / 6650 XT "
              "(gfx1032), all unvalidated, and the Ryzen AI Max \"Strix Halo\" APU (Radeon 8060S / 8050S / 8040S, "
-             "gfx1151: experimental, docs/STRIX_HALO.md)")
+             "gfx1151: experimental, docs/STRIX_HALO.md), and the Instinct MI50 / MI60 / Radeon VII (gfx906: "
+             "source build on a system ROCm 6.x, setup does not drive it, docs/AMD_HIP.md)")
 
 
 def rocm_index(arch):
@@ -5205,6 +5210,11 @@ def rocm_root(archs):
         else:                                          # #446: a runtime-only ROCm (no -dev packages): cmake would fail
             warn(f"the ROCm in {sysroot} has no HIP development files ({', '.join(missing)}): using AMD's wheels in "
                  ".venv instead (or install them, e.g. AMD's amdrocm-core-dev package for your ROCm and card)")
+    missing_wheels = [a for a in archs if a not in ROCM_INDEXES]
+    if missing_wheels:                                 # gfx906: no TheRock wheels (7.x families only)
+        fail(f"no ready-made ROCm wheels for {', '.join(missing_wheels)}: this card runs from a source build, "
+             "which setup does not drive",
+             "build the engine per docs/AMD_HIP.md (the gfx906 section) against a system ROCm 6.x")
     indexes = list(dict.fromkeys(rocm_index(a) for a in archs))
     if len(indexes) > 1:                               # TheRock's wheels hold one GPU family's libraries
         fail(f"cards of two GPU families ({', '.join(archs)}) need a system ROCm 7 (in /opt/rocm): AMD's Python "
