@@ -51,9 +51,22 @@ static int print_info(const std::string& file) {
         fprintf(stderr, "open: %s\n", err.c_str());
         return 1;
     }
+    if (rd.header().profile == strata::artifact::StrataProfile::VisionShard) {  // HY4-VISION: the Vision shard itself
+        rd.close();
+        VisionShardInfo vi;
+        if (!vision_probe(file, vi, err)) {
+            fprintf(stderr, "vision shard: %s\n", err.c_str());
+            return 1;
+        }
+        printf("arch=hy4flash-vision layers=%d hidden=%d out_hidden=%d patch=%d merge=%d tensors=%zu image_pad=%d\n", vi.c.layers, vi.c.hidden, vi.c.out_hidden, vi.c.patch, vi.c.merge,
+               vi.T.size(), vi.c.image_token);
+        return 0;
+    }
     Manifest m;
     parse_manifest(rd.manifest_json(), m, false);
-    printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos);
+    // images=1: this engine build can read pictures when started with --vision Hy4-Flash-Vision.strata (GENI requests, HY4-VISION-DESIGN.md); serve falls back to text-only when the key is absent
+    printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d images=1 image_pad=%d image_max_pixels=%d\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos, VitCfg().image_token,
+           (int)VitCfg().max_pixels);
     return 0;
 }
 
@@ -68,7 +81,9 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 }
 
 int main(int argc, char** argv) {
-    std::string model, engram, tok_path, out_dir = ".";
+    std::string model, engram, tok_path, out_dir = ".", vision_path;
+    std::vector<std::string> image_files;
+    int64_t image_max_pixels = 4194304;
     bool load_only = false, dump = false, save_logits = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false;
     int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048;
     bool serve = false, session_reuse = false;
@@ -99,7 +114,10 @@ int main(int argc, char** argv) {
         else if (a == "--gpu") gpu = atoi(nxt().c_str());
         else if (a == "--draft") draft = nxt();
         else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
-        else if (a == "--vision" || a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner yet\n", a.c_str(), nxt().c_str());
+        else if (a == "--vision") vision_path = nxt();           // HY4-VISION: the Vision shard; loaded on the first request that carries a picture
+        else if (a == "--image") image_files.push_back(nxt());  // HY4-VISION (offline runs): a picture file per image-pad token of --tokens, in order (the engine expands each pad)
+        else if (a == "--image-max-pixels") image_max_pixels = atoll(nxt().c_str());
+        else if (a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner yet\n", a.c_str(), nxt().c_str());
         else if (a == "--kv") {
             std::string kv = nxt();
             if (kv != "fp16") {
@@ -154,6 +172,8 @@ int main(int argc, char** argv) {
         so.no_engram = no_engram;
         so.session_reuse = session_reuse;
         so.draft = draft;
+        so.vision = vision_path;  // HY4-VISION
+        so.image_max_pixels = image_max_pixels;
         return hy4_serve_main(so);
     }
     if (model.empty()) {
@@ -176,6 +196,25 @@ int main(int argc, char** argv) {
         long v;
         while (f >> v) tok.push_back((int32_t)v);
     }
+    // HY4-VISION: decode + resize the pictures and expand each image-pad token of the prompt to the picture's run of pads (CPU only; the ViT runs after the runner is up)
+    std::vector<ImageRec> recs;
+    if (!image_files.empty()) {
+        std::string ierr;
+        std::vector<int32_t> ex;
+        for (const std::string& f : image_files) {
+            ImageRec rc;
+            if (!prepare_picture(f, VitCfg().min_pixels, image_max_pixels, rc, ierr)) {
+                fprintf(stderr, "image: %s\n", ierr.c_str());
+                return 1;
+            }
+            recs.push_back(std::move(rc));
+        }
+        if (vision_path.empty() || !expand_image_pads(tok, VitCfg().image_token, recs, ex, ierr)) {
+            fprintf(stderr, "image: %s\n", vision_path.empty() ? "--vision FILE is required with --image" : ierr.c_str());
+            return 1;
+        }
+        tok.swap(ex);
+    }
     int T0 = (int)tok.size();
     if (T0 == 0) {
         fprintf(stderr, "no tokens\n");
@@ -195,6 +234,18 @@ int main(int argc, char** argv) {
         return 1;
     }
     tok.reserve(max_ctx + 8);
+    // HY4-VISION: pictures of an offline run (--images): encode them now, the runner hooks do the rest
+    VisionEncoder venc;
+    VisionCtx vctx;
+    if (!recs.empty()) {
+        if (!venc.load(vision_path, err) || !vctx.setup(venc, r.st, tok, recs, r.Tc, err)) {
+            fprintf(stderr, "images: %s\n", err.c_str());
+            return 1;
+        }
+        fprintf(stderr, "[vision] %zu picture(s), %d image rows, encoded in %.2f s\n", recs.size(), vctx.n_rows, vctx.t_encode);
+        venc.unload();
+        r.vis = &vctx;
+    }
     if (prof && r.engram_ready) {
         // random 4 KiB read probe: pages/s with 16 threads x qd 8
         const size_t NP = 20000;

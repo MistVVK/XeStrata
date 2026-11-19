@@ -16,6 +16,7 @@
 #include "hy4_gpu_model.hip.h"
 #include "hy4_indexer.hip.h"
 #include "hy4_kernels.hip.h"
+#include "hy4_vision.hip.h"  // HY4-VISION hook: image rows + 3D rope (all hooks below are no-ops while Runner::vis is null)
 #include "mla_attn.hip.h"
 #include "skhy4.hip.h"
 
@@ -102,6 +103,7 @@ public:
     double t_engram_cpu = 0;
     bool dump = false;
     std::string dump_dir = ".";
+    VisionCtx* vis = nullptr;  // HY4-VISION hook: the pictures of the running request (hy4_vision.hip.h); null for a text-only request
     bool dbg_layers = false;
     int index_on = 1;       // IndexPool selection on the sparse layers (off: they attend all keys)
     int index_topk = 2048;  // selection starts when the sequence is longer than this
@@ -450,6 +452,7 @@ public:
             std::vector<uint64_t> ids((size_t)T * 16);
             uint8_t* valid = e->valid.data() + (size_t)mo * Tc * 16;
             engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), valid);
+            if (vis) vis->mask_engram(valid, p0, T);  // HY4-VISION hook: no Engram contribution at image positions
             uint8_t* raw = e->raw.data() + (size_t)mo * Tc * 16 * 100;
             if (!eio.fetch_raw(ids.data(), ids.size(), raw, err)) {
                 e->ok = false;
@@ -542,13 +545,15 @@ public:
         if (g_hi >= g_lo)
             hipLaunchKernelGGL(idx::k_idx_pool, dim3(g_hi - g_lo + 1), dim3(128), 0, st, ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], g_lo,
                                (float)theta(il), c.rms_eps);
+        if (vis && g_hi >= g_lo && vis->needs_fix(p0, T)) vis->pool_fix(st, pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il));  // HY4-VISION hook
     }
 
     // per-token key lists for the chunk (sparse layer, sequence longer than index_topk)
     void idx_select(int il, int p0, int T) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".query_projection.weight", qr_h, iq_f, T);  // [T][16*128]
-        hipLaunchKernelGGL(idx::k_idx_q_rope, dim3(T, 16), dim3(128), 0, st, iq_f, iq_h, p0, (float)theta(il));
+        if (vis && vis->needs_fix(p0, T)) vis->iq_rope(st, iq_f, iq_h, T, p0, (float)theta(il));  // HY4-VISION hook: 3D positions
+        else hipLaunchKernelGGL(idx::k_idx_q_rope, dim3(T, 16), dim3(128), 0, st, iq_f, iq_h, p0, (float)theta(il));
         lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);  // [T][16]
         int G = (p0 + T) / 4;
         if (G < 1) G = 1;
@@ -579,6 +584,10 @@ public:
         const int kvfmt = ti(pa + ".kv_b_proj.weight").fmt;
         { PS _q(this, "mla_prep_q"); if (dec) mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il));
         else mla_prep_q(st, F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il)); }
+        if (vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
+            vis->fix_k(st, F1, cache, T, p0, swa ? ring : 0, (float)theta(il));
+            vis->fix_q(st, F2, qa_h, T, NH, p0, (float)theta(il));
+        }
         bool use_list = false;
         if (!swa && index_on) {
             { PS _q(this, "idx_update"); idx_update(il, p0, T); }
@@ -694,6 +703,7 @@ public:
     bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err) {
         HCK(hipMemcpyAsync(d_ids, tok_all + p0, (size_t)T * 4, hipMemcpyHostToDevice, st));
         hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
+        if (vis) vis->embed(st, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
         const bool defer_eng = engram_ready && T <= 8;
         if (defer_eng) prefetch_engram(tok_all, p0, T);
         else if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
