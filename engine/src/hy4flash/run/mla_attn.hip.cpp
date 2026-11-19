@@ -860,53 +860,49 @@ __device__ __forceinline__ float sb_scale(const uint8_t* blk, int lane) {
 // qa[t][h][0:512] = sum_{i<192} q_nope[t][h][i] * Wk[h*448+i][:]   (+ rope part). Block = (head), 8 waves, wave w owns rows 24w..24w+23; partial sums reduced through LDS.
 template <int FMT, int MT>
 __global__ void __launch_bounds__(256) k_prep_q_dec(const uint8_t* __restrict__ kvb, const float* __restrict__ q_b, __half* __restrict__ qa, int M, int NH, int p0, float theta) {
+    // grid (NH, 2): block (h, s) handles the 256 latent columns of super-block s (the two halves of every row are independent: same per-column summation order as one block doing both)
     constexpr int SB = dq::Info<FMT>::SB;
-    const int h = blockIdx.x, tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
-    __shared__ float red[8][512 + 1];
-    float acc[MT][2][8];
+    const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    __shared__ float red[8][256 + 1];
+    float acc[MT][8];
 #pragma unroll
     for (int m = 0; m < MT; ++m)
 #pragma unroll
-        for (int s = 0; s < 2; ++s)
-#pragma unroll
-            for (int k = 0; k < 8; ++k) acc[m][s][k] = 0.f;
+        for (int k = 0; k < 8; ++k) acc[m][k] = 0.f;
     for (int ii = 0; ii < 24; ++ii) {
         const int i = wave * 24 + ii;
         const uint8_t* row = kvb + ((size_t)h * 448 + i) * (2 * SB);
         float qv[MT];
 #pragma unroll
         for (int m = 0; m < MT; ++m) qv[m] = m < M ? q_b[((size_t)m * NH + h) * MLA_QHEAD + i] : 0.f;
+        const uint8_t* blk = row + s * SB;
+        const float eff = dq::sb_scale(blk, lane);
+        float w[8];
+        dq::decode8<FMT>(blk + 6, lane, w);
 #pragma unroll
-        for (int s = 0; s < 2; ++s) {
-            const uint8_t* blk = row + s * SB;
-            const float eff = dq::sb_scale(blk, lane);
-            float w[8];
-            dq::decode8<FMT>(blk + 6, lane, w);
+        for (int m = 0; m < MT; ++m) {
+            const float qe = qv[m] * eff;
 #pragma unroll
-            for (int m = 0; m < MT; ++m) {
-                const float qe = qv[m] * eff;
-#pragma unroll
-                for (int k = 0; k < 8; ++k) acc[m][s][k] += qe * w[k];
-            }
+            for (int k = 0; k < 8; ++k) acc[m][k] += qe * w[k];
         }
     }
 #pragma unroll
     for (int m = 0; m < MT; ++m) {
         if (m < M) {
 #pragma unroll
-            for (int s = 0; s < 2; ++s)
-#pragma unroll
-                for (int k = 0; k < 8; ++k) red[wave][s * 256 + lane * 8 + k] = acc[m][s][k];
+            for (int k = 0; k < 8; ++k) red[wave][lane * 8 + k] = acc[m][k];
             __syncthreads();
-            for (int c = tid; c < 512; c += 256) {
+            {
+                const int c = tid;  // 256 threads = 256 columns
                 float v = 0.f;
 #pragma unroll
                 for (int w2 = 0; w2 < 8; ++w2) v += red[w2][c];
-                qa[((size_t)m * NH + h) * MLA_ROW + c] = __float2half(v);
+                qa[((size_t)m * NH + h) * MLA_ROW + s * 256 + c] = __float2half(v);
             }
             __syncthreads();
         }
     }
+    if (s != 0) return;
     for (int idx = tid; idx < MT * 32; idx += 256) {
         const int m = idx / 32, i = idx % 32;
         if (m >= M) continue;
@@ -968,10 +964,10 @@ __global__ void __launch_bounds__(256) k_vup_dec(const uint8_t* __restrict__ kvb
 
 template <int FMT>
 static void launch_prep_dec(hipStream_t s, const void* kvb, const float* q_b, __half* qa, int M, int NH, int p0, float theta) {
-    if (M <= 1) hipLaunchKernelGGL((k_prep_q_dec<FMT, 1>), dim3(NH), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta);
-    else if (M <= 2) hipLaunchKernelGGL((k_prep_q_dec<FMT, 2>), dim3(NH), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta);
-    else if (M <= 4) hipLaunchKernelGGL((k_prep_q_dec<FMT, 4>), dim3(NH), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta);
-    else hipLaunchKernelGGL((k_prep_q_dec<FMT, 8>), dim3(NH), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta);
+    if (M <= 1) hipLaunchKernelGGL((k_prep_q_dec<FMT, 1>), dim3(NH, 2), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta);
+    else if (M <= 2) hipLaunchKernelGGL((k_prep_q_dec<FMT, 2>), dim3(NH, 2), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta);
+    else if (M <= 4) hipLaunchKernelGGL((k_prep_q_dec<FMT, 4>), dim3(NH, 2), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta);
+    else hipLaunchKernelGGL((k_prep_q_dec<FMT, 8>), dim3(NH, 2), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta);
 }
 template <int FMT>
 static void launch_vup_dec(hipStream_t s, const void* kvb, const __half* ctx, const float* gate, __half* o, int M, int NH) {

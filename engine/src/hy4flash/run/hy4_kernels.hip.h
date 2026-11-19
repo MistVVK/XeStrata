@@ -333,7 +333,10 @@ __global__ void k_gate_mul_h(const float* __restrict__ a, const float* __restric
 }
 
 // ---- router: logits fp32 [T][512] -> top-16 by sigmoid+bias; weights = p/(sum p + 1e-20)*scale.  One block (256 thr) per token.
-__global__ void k_router_topk(const float* __restrict__ logits, const float* __restrict__ bias, int32_t* __restrict__ idx, float* __restrict__ w, int E, int K, float scale) {
+// rec != nullptr (decode, one token): also copies the 16-byte ExpertDev records of the chosen experts (ex_layer = the layer's table of 512) into rec[slot], the input of the one-token expert
+// kernels (moe_experts slot_rec path), which then need neither the counting sort nor per-expert token lists.
+__global__ void k_router_topk(const float* __restrict__ logits, const float* __restrict__ bias, int32_t* __restrict__ idx, float* __restrict__ w, int E, int K, float scale,
+                              const uint4* __restrict__ ex_layer = nullptr, uint4* __restrict__ rec = nullptr) {
     __shared__ float sp[512], ss[512];
     __shared__ float rv[8];
     __shared__ int ri[8];
@@ -373,6 +376,134 @@ __global__ void k_router_topk(const float* __restrict__ logits, const float* __r
         for (int k = 0; k < K; ++k) {
             idx[(size_t)blockIdx.x * K + k] = chosen[k];
             w[(size_t)blockIdx.x * K + k] = sp[chosen[k]] / (sum + 1e-20f) * scale;
+            if (rec) rec[k] = ex_layer[chosen[k]];
+        }
+    }
+}
+
+// ---- fused iHC pre-mix + input RMSNorm: replaces k_zero_f + k_hc_mix_part + k_hc_mix_fin + k_hc_reduce_norm (4 launches) by one.
+// grid (T, 24), block 256. Block (t, slab) reduces 512 of the 12288 flat elements into 9 partial sums (8 mixes + sum of squares) stored per slab (fixed order: deterministic).
+// The last block to finish a token (ticket counter cnt[t], self-resetting, zero-initialised once) sums the 24 slabs in order, forms pre/post (post goes to global for the
+// sublayer-output kernel), and does cur = sum_h x_h pre_h -> RMSNorm(w) -> fp16 (outh) and optionally fp32 (outf). nout = 8 (layers) or 4 (head, pre only).
+__global__ void __launch_bounds__(256) k_hc_pre(const float* __restrict__ x, const float* __restrict__ fn, const float* __restrict__ scale, const float* __restrict__ base, const float* __restrict__ nw,
+                                                 float* __restrict__ part, unsigned* __restrict__ cnt, float* __restrict__ post_out, __half* __restrict__ outh, float* __restrict__ outf,
+                                                 int nout, float eps, float hc_eps, float hc_mag, float norm_eps) {
+    constexpr int K = NHC * HID;
+    constexpr int NSLAB = 24;
+    __shared__ float shv[9][4];
+    __shared__ float tot[9];
+    __shared__ float pre_s[4];
+    __shared__ float sh[32];
+    __shared__ int is_last;
+    const int t = blockIdx.x, slab = blockIdx.y, tid = threadIdx.x;
+    const float* xt = x + (size_t)t * K;
+    // partial sums: threads 0..127 in the exact summation order of k_hc_mix_part_d (the deterministic mix), so both paths agree bit for bit
+    if (tid < 128) {
+        float ss = 0, a[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) a[j] = 0;
+        for (int k = slab * 512 + tid; k < (slab + 1) * 512; k += 128) {
+            const float v = xt[k];
+            ss += v * v;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                if (j < nout) a[j] += v * fn[(size_t)j * K + k];
+        }
+        float vals[9];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) vals[j] = a[j];
+        vals[8] = ss;
+#pragma unroll
+        for (int j = 0; j < 9; ++j)
+            for (int o = 16; o > 0; o >>= 1) vals[j] += __shfl_xor(vals[j], o);
+        if ((tid & 31) == 0)
+#pragma unroll
+            for (int j = 0; j < 9; ++j) shv[j][tid >> 5] = vals[j];
+    }
+    __syncthreads();
+    if (tid < 9) part[((size_t)t * NSLAB + slab) * 9 + tid] = (shv[tid][0] + shv[tid][1]) + (shv[tid][2] + shv[tid][3]);
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned prev = atomicAdd(&cnt[t], 1u);
+        is_last = (prev == NSLAB - 1);
+    }
+    __syncthreads();
+    if (!is_last) return;
+    __threadfence();
+    if (tid < 9) {
+        float s = 0;
+        for (int q = 0; q < NSLAB; ++q) s += *(volatile const float*)&part[((size_t)t * NSLAB + q) * 9 + tid];
+        tot[tid] = s;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        cnt[t] = 0;
+        const float inv = rsqrtf(tot[8] / K + eps);
+        float m[8];
+        for (int j = 0; j < 8; ++j) m[j] = j < nout ? tot[j] * inv : 0.0f;
+        for (int h = 0; h < NHC; ++h) {
+            pre_s[h] = sigmoidf_(m[h] * scale[0] + base[h]) + hc_eps;
+            if (nout == 8) post_out[(size_t)t * NHC + h] = hc_mag * sigmoidf_(m[NHC + h] * scale[1] + base[NHC + h]) + hc_eps;
+        }
+    }
+    __syncthreads();
+    // cur = sum_h x_h * pre_h, RMSNorm, fp16/fp32 out (same arithmetic as k_hc_reduce_norm)
+    const float p0 = pre_s[0], p1 = pre_s[1], p2 = pre_s[2], p3 = pre_s[3];
+    float cs = 0;
+    constexpr int PER = HID / 256;
+    float v[PER];
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int d = tid + i * 256;
+        const float c = xt[d] * p0 + xt[HID + d] * p1 + xt[2 * HID + d] * p2 + xt[3 * HID + d] * p3;
+        v[i] = c;
+        cs += c * c;
+    }
+    cs = block_sum(cs, sh);
+    const float inv2 = rsqrtf(cs / HID + norm_eps);
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int d = tid + i * 256;
+        const float o = v[i] * inv2 * (nw ? nw[d] : 1.0f);
+        if (outh) outh[(size_t)t * HID + d] = __float2half(o);
+        if (outf) outf[(size_t)t * HID + d] = o;
+    }
+}
+
+// ---- router top-k by rank: expert e (one thread each, E = 512) counts the experts ahead of it (higher biased score, ties to the lower index = the order of the argmax rounds above), the 16
+// best write chosen[rank]. Bit-identical to k_router_topk, without its 16 dependent block-wide rounds. 512 threads per token; optional routing tables as in k_router_topk.
+__global__ void __launch_bounds__(512) k_router_topk_r(const float* __restrict__ logits, const float* __restrict__ bias, int32_t* __restrict__ idx, float* __restrict__ w, int K, float scale,
+                                                       const uint4* __restrict__ ex_layer = nullptr, uint4* __restrict__ rec = nullptr) {
+    __shared__ __attribute__((aligned(16))) float ss[512];
+    __shared__ float sp[512];
+    __shared__ int chosen[16];
+    const int e = threadIdx.x;
+    const float p = sigmoidf_(logits[(size_t)blockIdx.x * 512 + e]);
+    sp[e] = p;
+    const float v = p + bias[e];
+    ss[e] = v;
+    __syncthreads();
+    int rank = 0;
+    const float4* s4 = (const float4*)ss;
+#pragma unroll 8
+    for (int j4 = 0; j4 < 128; ++j4) {
+        const float4 u = s4[j4];
+        const int j = 4 * j4;
+        rank += (u.x > v) | ((u.x == v) & (j < e));
+        rank += (u.y > v) | ((u.y == v) & (j + 1 < e));
+        rank += (u.z > v) | ((u.z == v) & (j + 2 < e));
+        rank += (u.w > v) | ((u.w == v) & (j + 3 < e));
+    }
+    if (rank < K) chosen[rank] = e;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0;
+        for (int k = 0; k < K; ++k) sum += sp[chosen[k]];
+        for (int k = 0; k < K; ++k) {
+            idx[(size_t)blockIdx.x * K + k] = chosen[k];
+            w[(size_t)blockIdx.x * K + k] = sp[chosen[k]] / (sum + 1e-20f) * scale;
+            if (rec) rec[k] = ex_layer[chosen[k]];
         }
     }
 }
