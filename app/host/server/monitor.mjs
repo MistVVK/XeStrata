@@ -5,7 +5,7 @@ import { readGpuTelemetry, gpuMemoryTotals } from './device-probes.mjs';
 import { createSystemSampler } from './system-telemetry.mjs';
 import { sensorPace, WATCH_MS } from './sensor-pace.mjs';
 import { readTemperatures, stopTemperatures } from './temperature-telemetry.mjs';
-import { addEnergy, energyWh, reportedPowerW } from './energy-meter.mjs';
+import { addEnergy, energyWh, meteredPowerW, reportedPowerW } from './energy-meter.mjs';
 import { state as servingState } from './serving.mjs';
 import { originalDashboard } from './monitor-dashboard.mjs';
 import { get as getStore } from './store.mjs';
@@ -140,7 +140,7 @@ function tick() {
   /* #4661: the drive-temperature reader asks every physical drive for its temperature. Only while the Monitor is looked at, never from the first second of the app
      (on some PCs the storage queries stall the whole system); it ends a couple of minutes after the Monitor was last seen. */
   if(Date.now()>drivesUntil+120000)stopTemperatures();
-  addEnergy(reportedPowerW(hardwareSnapshot().gpus),Date.now());
+  addEnergy(meteredPowerW(reportedPowerW(hardwareSnapshot().gpus)),Date.now());   /* the engine's own reading counts where the host has none (#3727) */
   const hw = state.hardware;
   const busy = state.phase === 'generating' || state.phase === 'reading' || state.phase === 'thinking';
 

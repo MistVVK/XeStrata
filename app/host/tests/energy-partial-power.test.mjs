@@ -23,6 +23,6 @@ test('the energy meter counts the GPUs that report power and skips one that has 
 
 test('the monitor feeds the energy meter from the per-GPU readings, not the all-or-nothing machine total', () => {
   const src = readFileSync(new URL('../server/monitor.mjs', import.meta.url), 'utf8');
-  assert.match(src, /addEnergy\(reportedPowerW\(hardwareSnapshot\(\)\.gpus\),/);
+  assert.match(src, /addEnergy\(meteredPowerW\(reportedPowerW\(hardwareSnapshot\(\)\.gpus\)\),/);
   assert.doesNotMatch(src, /addEnergy\(hardwareSnapshot\(\)\.powerW/);
 });
