@@ -195,7 +195,7 @@ test('route: two chats at once are independent; leaving one does not touch the o
   assert.ok(await until(() => count(a) >= 2 && count(b) >= 2), 'both beat');
   a.abort();
   await assert.rejects(a.done, { name: 'AbortError' });
-  assert.ok(await until(() => s.worker.aborted === 1), 'exactly the one request was cancelled');
+  assert.ok(await until(() => s.worker.aborted === 1), `exactly the one request was cancelled (the model server saw ${s.worker.aborted} cancelled of ${s.worker.requests.length} requests: ${JSON.stringify(s.worker.requests.map(r => r.directive ?? r.summary ?? '?'))})`);
   const frozen = count(a);
   const bBefore = count(b);
   assert.ok(await until(() => count(b) >= bBefore + 2), 'the other chat keeps getting beats');

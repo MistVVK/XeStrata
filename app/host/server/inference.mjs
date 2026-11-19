@@ -15,6 +15,7 @@
 import * as supervisor from './supervisor.mjs';
 import { get as getStore } from './store.mjs';
 import { which } from './util.mjs';
+import { cancelOnAbort } from './stream-abort.mjs';
 
 /** Where Strata's own API worker listens by default (`serve/server.py`, `--port 8095`). */
 const STRATA_DEFAULT_URL = 'http://127.0.0.1:8095/v1';
@@ -280,6 +281,7 @@ export async function proxyCompletion({ baseUrl, message, history = [], systemPr
   onFrame({ type: 'start', demo: false });
 
   const reader = res.body.getReader();
+  const stopListening = cancelOnAbort(reader, signal);   // the engine's request ends when the person leaves, even if fetch's own abort is not heard (stream-abort.mjs)
   const decoder = new TextDecoder();
   let buffer = '';
   let out = null;
@@ -359,6 +361,7 @@ export async function proxyCompletion({ baseUrl, message, history = [], systemPr
   } finally {
     streaming = false;
     if (metricsTicker) clearInterval(metricsTicker);
+    stopListening();
     reader.releaseLock();
   }
 
