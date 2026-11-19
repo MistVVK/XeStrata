@@ -1,4 +1,6 @@
 {
  "gtui01": "Un modèle tourne déjà depuis le Terminal",
- "gtui02": "Un modèle lancé avec strata launch utilise le port {0} ; Strata s’est donc ouvert sur le port {1}. La page du Terminal sur le port {0} demande sa propre clé d’API, et cette application n’utilise pas cette page. Pour charger un modèle ici, arrêtez d’abord celui du Terminal (strata launch --stop). Les conversations et réglages enregistrés sur le port {0} ne sont pas affichés ici."
+ "gtui02": "Un modèle lancé avec strata launch utilise le port {0} ; Strata s’est donc ouvert sur le port {1}. La page du Terminal sur le port {0} demande sa propre clé d’API, et cette application n’utilise pas cette page. Pour charger un modèle ici, arrêtez d’abord celui du Terminal (strata launch --stop). Les conversations et réglages enregistrés sur le port {0} ne sont pas affichés ici.",
+ "gtui03": "Certaines images précédentes sont absentes",
+ "gtui04": "Les images des messages précédents ne sont plus conservées dans ce navigateur ; le modèle ne les voit donc pas dans cette réponse. Joignez-les de nouveau si elles comptent."
 }
