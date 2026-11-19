@@ -16,8 +16,11 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-import torch
-from safetensors.torch import save_file
+import pytest
+
+torch = pytest.importorskip("torch", reason="torch and safetensors are not installed here (the checkpoint is built with them)")
+pytest.importorskip("safetensors")
+from safetensors.torch import save_file  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import nvfp4_verify_gguf as V  # noqa: E402
