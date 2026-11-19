@@ -53,6 +53,16 @@ def middle_shorten(text: str, width: int, dots: str = "…") -> str:
     return head + dots + tail
 
 
+def tuned_sentence(row) -> str:
+    """The Advanced step's note for a narrow window (the Tuned column is left out there): what the tuner chose. Said only when the tuned value is
+    not the default: "The tuner chose off." for a switch that is off by default, in a launch whose tuning step said Skip, claimed work nobody did
+    (GUI-TUI 0.2.17 QA)."""
+    tuned = getattr(row, "tuned", None)
+    if tuned in ("-", "", None) or str(tuned) == str(getattr(row, "default", "") or ""):
+        return ""
+    return f" The tuner chose {tuned}."
+
+
 def drafting_choice_available(ctx, family: str | None = None) -> bool:
     """The Drafting step exists only where there is something to choose: Qwen3.8-Flash-Next (qwen, gyro) on a computer whose engine can run DFlash2
     (CUDA or HIP, strata_control/drafting.py). Every other model has no step: the rest have only the MTP. `family`: the model family to ask for
@@ -1408,7 +1418,7 @@ class AdvancedScreen(Base):
         if cur is not None and cur.key not in (None, "__add__"):
             r = next((x for x in self.rows if x.name == cur.key), None)
             if r:
-                tuned = f" The tuner chose {r.tuned}." if self.narrow() and r.tuned not in ("-", "", None) else ""     # (the Tuned column is left out of a narrow window)
+                tuned = tuned_sentence(r) if self.narrow() else ""     # (the Tuned column is left out of a narrow window)
                 return Text(f"{r.name}: {r.description}" + tuned + (" This one is experimental: it may change answers or not work on every card." if r.experimental else ""), style=MUTE)
         return Text("Press e on a row to set your own value; Del puts the tuned value back. You can go on without touching anything: Enter.", style=MUTE)
 

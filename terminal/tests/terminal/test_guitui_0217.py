@@ -48,5 +48,24 @@ class ModelStepExplanation(unittest.TestCase):
         self.assertIn("The n-gram table stays on your SSD and is not counted above.", t)
 
 
+class AdvancedTunerNote(unittest.TestCase):
+    """The Advanced step (80 columns) said "The tuner chose off." for a switch that is simply off by default, in a launch whose Tuning step said Skip."""
+
+    class Row:
+        def __init__(self, default, tuned):
+            self.default, self.tuned = default, tuned
+
+    def test_a_value_equal_to_the_default_is_not_called_a_choice_of_the_tuner(self):
+        from strata_cli.launch.screens import tuned_sentence
+        self.assertEqual(tuned_sentence(self.Row("off", "off")), "")
+        self.assertEqual(tuned_sentence(self.Row("", "-")), "")
+        self.assertEqual(tuned_sentence(self.Row("off", "")), "")
+
+    def test_a_value_the_tuner_changed_is_named(self):
+        from strata_cli.launch.screens import tuned_sentence
+        self.assertEqual(tuned_sentence(self.Row("off", "on")), " The tuner chose on.")
+        self.assertEqual(tuned_sentence(self.Row("", "8")), " The tuner chose 8.")
+
+
 if __name__ == "__main__":
     unittest.main()
