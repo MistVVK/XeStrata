@@ -21,6 +21,21 @@
 
 namespace hy4s {
 
+static bool load_npy_f32(const std::string& path, std::vector<float>& out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    unsigned char h[10];
+    if (fread(h, 1, 10, f) != 10) { fclose(f); return false; }
+    const size_t hl = (size_t)h[8] | ((size_t)h[9] << 8);
+    fseek(f, 0, SEEK_END);
+    const long sz = ftell(f);
+    fseek(f, (long)(10 + hl), SEEK_SET);
+    out.resize((size_t)(sz - 10 - (long)hl) / 4);
+    const size_t n = fread(out.data(), 4, out.size(), f);
+    fclose(f);
+    return n == out.size();
+}
+
 static void save_npy_f32(const std::string& path, const float* d, const std::vector<int64_t>& shape) {
     std::string sh = "(";
     for (size_t i = 0; i < shape.size(); ++i) sh += std::to_string(shape[i]) + (shape.size() == 1 || i + 1 < shape.size() ? "," : "");
@@ -84,7 +99,8 @@ public:
     hy4::EngramIO eio;
     bool engram_ready = false;
     double t_engram_cpu = 0, t_engram_wait = 0, t_cpu_exp = 0;
-    bool dump = false;
+    bool dump = false, dbg_layers = false;
+    std::string force_route_dir;
     std::string dump_dir = ".";
     int index_on = 1;
     int index_topk = 2048;
@@ -270,7 +286,7 @@ public:
         kv_f = dalloc<float>((size_t)5 * Tc * HID);
         ep_alloc();
         wait();
-        fprintf(stderr, "[runner] kv cache %.2f GB (ctx %d, chunk %d)\n", kvbytes / 1e9, max_ctx, Tc);
+        fprintf(stderr, "[runner] kv cache %.2f GB (ctx %d, chunk %d), device allocated %.2f GiB of 7.54\n", kvbytes / 1e9, max_ctx, Tc, dev_bytes_allocated() / 1073741824.0);
         return true;
     }
 
@@ -478,7 +494,27 @@ public:
             lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
             evw.wait();
             double tc = now_s();
+            if (!force_route_dir.empty()) {  // teacher-forced routing from an oracle dump (L<il>_topk_idx.npy / L<il>_topk_w.npy, float32 [T][16]): isolates numeric noise from routing flips
+                std::vector<float> fi, fw;
+                if (!load_npy_f32(force_route_dir + "/L" + std::to_string(il) + "_topk_idx.npy", fi) || !load_npy_f32(force_route_dir + "/L" + std::to_string(il) + "_topk_w.npy", fw) || fi.size() < (size_t)T * 16) {
+                    fprintf(stderr, "force-route: cannot load layer %d\n", il);
+                    exit(5);
+                }
+                wait();
+                for (size_t i = 0; i < (size_t)T * 16; ++i) { h_idx[i] = (int32_t)fi[i]; h_w[i] = fw[i]; }
+            }
             cx.run(il - 1, T, h_z, h_idx, h_w, h_zout, expert_act);
+            if (dump && dbg_layers) {
+                wait();
+                const std::string nm = "L" + std::to_string(il) + "_";
+                save_npy_f32(dump_dir + "/" + nm + "z_folded.npy", h_z, {T, 1536});
+                std::vector<float> ti((size_t)T * 16);
+                for (size_t i = 0; i < ti.size(); ++i) ti[i] = (float)h_idx[i];
+                save_npy_f32(dump_dir + "/" + nm + "topk_idx.npy", ti.data(), {T, 16});
+                save_npy_f32(dump_dir + "/" + nm + "topk_w.npy", h_w, {T, 16});
+                save_npy_f32(dump_dir + "/" + nm + "z_out.npy", h_zout, {T, 1536});
+                maybe_dump(nm + "shared_out", T, HID, F3);
+            }
             t_cpu_exp += now_s() - tc;
             h2d(zout_f, h_zout, nz * 4);
             f2h(zout_f, z_h, nz);

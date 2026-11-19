@@ -22,8 +22,8 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 }
 
 int main(int argc, char** argv) {
-    std::string model, engram, tok_path, out_dir = ".";
-    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false;
+    std::string model, engram, tok_path, out_dir = ".", force_route;
+    bool load_only = false, dbg = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false;
     int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, threads = 6, expert_act = 1;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -40,6 +40,8 @@ int main(int argc, char** argv) {
         else if (a == "--warm") warm = true;
         else if (a == "--load-only") load_only = true;
         else if (a == "--dump") dump = true;
+        else if (a == "--dbg-layers") dbg = true;
+        else if (a == "--force-route") force_route = nxt();
         else if (a == "--all-logits") all_logits = true;
         else if (a == "--no-engram") no_engram = true;
         else if (a == "--index-topk") index_topk = atoi(nxt().c_str());
@@ -86,6 +88,8 @@ int main(int argc, char** argv) {
         const int Tc = std::max(chunk, 1);
         Runner r(g, cx, max_ctx, Tc, all_logits ? std::min(Tc, T0) : 1);
         r.dump = dump;
+        r.dbg_layers = dbg;
+        r.force_route_dir = force_route;
         r.dump_dir = out_dir;
         r.index_topk = index_topk;
         r.index_on = no_index ? 0 : 1;

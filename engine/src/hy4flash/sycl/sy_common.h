@@ -29,8 +29,10 @@ inline sycl::queue& Q() {
 
 inline void wait() { Q().wait_and_throw(); }
 
+inline size_t& dev_bytes_allocated() { static size_t b = 0; return b; }  // running total of dalloc bytes (the free-memory query of the driver reports the whole card)
 template <class T> inline T* dalloc(size_t n) {
     T* p = sycl::malloc_device<T>(n ? n : 1, Q());
+    dev_bytes_allocated() += (n ? n : 1) * sizeof(T);
     if (!p) {
         fprintf(stderr, "dalloc: out of device memory (%zu bytes)\n", n * sizeof(T));
         exit(3);
