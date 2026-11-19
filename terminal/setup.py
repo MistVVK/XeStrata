@@ -6367,8 +6367,10 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
     acquisition.require("a compile (cmake)")
     cmake, ninja = ensure_build_tools()
     fresh_if_other_generator(bdir)
+    # #6172: the vendored ggml wraps EVERY compile in ccache / sccache when one is on PATH (a global RULE_LAUNCH_COMPILE), Strata's nvcc compiles
+    # too, and sccache stops them at the fatbinary step ("Could not open input file 'device.ptx'"). Off here; a -DGGML_CCACHE in defs wins.
     conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
-            *toolkit_change_undefs(bdir, defs), "-DCMAKE_BUILD_TYPE=Release", *defs]
+            *toolkit_change_undefs(bdir, defs), "-DCMAKE_BUILD_TYPE=Release", "-DGGML_CCACHE=OFF", *defs]
     build = [cmake, "--build", str(bdir), "--target", target, "-j", str(max(2, (os.cpu_count() or 4) // 2))]
     # A failed build is tried once more: CUDA 13.0's ptxas now and then fails to parse a PTX file it just wrote, and
     # the same command then gets past it (issue #45); a second attempt only compiles what is still missing.
