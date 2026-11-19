@@ -16,6 +16,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import json
+import math
 import logging
 import os
 import re
@@ -1534,7 +1535,7 @@ def coerce_value(value: str, declared, notes: list | None = None):
     object read with lenient_json (a note says so in `notes`); else the text itself, as before.  An array or object that
     arrived as a JSON string of itself is decoded once more.  #5493: a declared non-string parameter written empty or as
     a null placeholder (null / None) is null when its type allows null, else _SKIP (left out, not sent as the text)."""
-    if declared == "string":
+    if declared == "string" or declared == ["string"]:
         return value
     boolean = declared == "boolean" or (isinstance(declared, list) and "boolean" in declared and "string" not in declared)
     if boolean and value.strip().lower() in ("true", "false"):
@@ -1545,6 +1546,14 @@ def coerce_value(value: str, declared, notes: list | None = None):
     try:
         v = json.loads(value)
     except ValueError:
+        if not _declares(declared, "string"):
+            # Python-form numbers JSON refuses (+10, 010, .5) are the declared integer / number
+            if _declares(declared, "integer") and re.fullmatch(r"[+-]?[0-9]+", s):
+                return int(s)
+            if _declares(declared, "number") and re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", s):
+                n = float(s)
+                if math.isfinite(n):
+                    return n
         if not value.lstrip().startswith(("[", "{", "`")) or _declares(declared, "string"):
             return value
         try:
