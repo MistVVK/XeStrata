@@ -10217,6 +10217,12 @@ def main() -> int:
         why = ("--setup" if a.setup else "--check" if a.check else "no model is installed yet")
         warn(f"--calibrate does nothing with {why}: it tunes a model that is already installed. Run setup first, "
              "then " + ("START-HERE.bat" if WIN else "./setup.sh") + " --calibrate [--model NAME]")
+    if have and not (a.setup or a.check) and (a.calibrate or not (a.model or a.family or a.no_start)):
+        given = [f for f, v in (("--kv", a.kv), ("--context", a.context), ("--vision", a.vision)) if v is not None]
+        if given:                                      # said, not dropped (as --calibrate above, #2036)
+            warn(f"{', '.join(given)} only apply when a model is set up: this start keeps its saved settings. To "
+                 "change them: " + ("START-HERE.bat" if WIN else "./setup.sh") + " --setup --model NAME "
+                 + " ".join(given) + " ...")
     if have and a.calibrate and not (a.setup or a.check):
         targets = calibration_targets(have, a.model, a.family)
         if not targets:                                # #2036: --model names a model that is not installed
