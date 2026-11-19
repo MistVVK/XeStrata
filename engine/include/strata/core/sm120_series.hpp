@@ -18,9 +18,11 @@
 //
 //   STRATA_SM120_PERF=0  turns the whole set off on a 12.0 card (the defaults every other card has).
 // Each switch's own variable still wins in both directions (=0 off, =1 / =2 on), on any card, as before.
-// Nothing here changes a card that is not a 12.0 (an sm_121 / sm_100 card keeps its defaults).
+// Nothing here changes a card that is not a 12.0, except the two switches the GB10 (sm_121) measured as well (kGb10AttnDaily, kGb10GrDownTg below;
+// STRATA_SM121_PERF=0 or STRATA_DEFAULTS=026 give the GB10 its earlier defaults back); an sm_100 card keeps its defaults.
 #pragma once
 
+#include "strata/core/defaults_026.hpp"
 #include "strata/core/emulate.hpp"
 
 #include <cstdlib>
@@ -58,6 +60,46 @@ inline bool ple_batch_resolve(const char* env, int cudart_version, bool hip, int
 /// the default of a bitwise switch of the set: on for a 12.0 card unless STRATA_SM120_PERF=0
 inline bool sm120_default(int major, int minor) { return is_sm120(major, minor) && sm120_series(); }
 
+/// the device is a GB10 (NVIDIA DGX Spark, compute capability 12.1, or emulates one)
+inline bool is_sm121(int major, int minor) { return cc_major_of(major) == 12 && cc_minor_of(minor) == 1; }
+
+/// STRATA_SM121_PERF (read once): unset or anything but "0" = on.  The GB10 table of nv_defaults.cpp reads the same variable.
+inline bool sm121_series() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_SM121_PERF");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+/// The default of a bitwise switch of the 12.0 set that was ALSO measured on a GB10 (BW-7, phaseA-tests/bw/RESULTS-BW-B.md): on for a 12.0 card unless
+/// STRATA_SM120_PERF=0, and on for a GB10 when `gb10_measured` (the caller's constant: the switch won there and passed its gate) unless
+/// STRATA_SM121_PERF=0 or STRATA_DEFAULTS=026 (the same off switches as the GB10 table of nv_defaults.cpp).  `v026`: qwen_defaults_026().
+inline bool sm12x_default_v(int major, int minor, bool gb10_measured, bool v026) {
+    return sm120_default(major, minor) || (gb10_measured && is_sm121(major, minor) && sm121_series() && !v026);
+}
+inline bool sm12x_default(int major, int minor, bool gb10_measured) { return sm12x_default_v(major, minor, gb10_measured, qwen_defaults_026()); }
+
+/// Which switches of the 12.0 set are on for a GB10 (compute capability 12.1, DGX Spark) as well.  BW-7, 11-19, a rented GB10 (IQ3_S, all 24,576 experts resident,
+/// DFlash2 Q4_0 drafter, --spec 6, fixed draft-cost table, fresh engine per start, arms interleaved, 4 requests x 300 tokens per kind a start, token ids identical to
+/// the default's); numbers and gates in phaseA-tests/bw/RESULTS-BW-B.md.  Each constant is one measured verdict, so a later measurement flips one line.
+/// Decode against the GB10 default (3 paired rounds, median; chat / code / json / agent):
+///   STRATA_ATTN_DAILY  +0.3 / +0.9 / +0.7 / +1.2 %  (json, agent 3 of 3 pairs)   -> ON
+///   STRATA_GR_DOWN_TG  -0.1 / +0.7 / +1.1 / +0.9 %  (json, agent 3 of 3 pairs; token pairs, the GB10 has 48 SMs)   -> ON
+///   STRATA_GU_SWIGLU -0.2 / -1.0 / 0.0 / +0.1 %, STRATA_GR_UP75 -0.7 / -0.2 / -0.4 / -0.6 %, STRATA_GR_UP_WIDE -0.4 / -0.3 / -0.1 / -0.2 %,
+///   STRATA_SMALL_UNR +0.1 / -0.9 / +0.2 / 0.0 %, STRATA_DF_PDL +0.1 / -0.6 / 0.0 / +0.3 %: level or slower here (inside the 0.2-1 % scatter)   -> stay off
+///   STRATA_GR_V3 (another summation order, KL-gated; text changes) and STRATA_GR_V3_PF (E15, acts only with GR_V3): mixed, E15 itself level (v3 with / without PF
+///   chat +1.0 %, code -0.9 %, json -0.4 %, agent -0.5 %)   -> stay off
+constexpr bool kGb10GuSwiglu = false;     ///< STRATA_GU_SWIGLU
+constexpr bool kGb10AttnDaily = false;    ///< STRATA_ATTN_DAILY
+constexpr bool kGb10GrUp75 = false;       ///< STRATA_GR_UP75
+constexpr bool kGb10GrDownTg = false;     ///< STRATA_GR_DOWN_TG
+constexpr bool kGb10GrUpWide = false;     ///< STRATA_GR_UP_WIDE
+constexpr bool kGb10SmallUnr = false;     ///< STRATA_SMALL_UNR
+constexpr bool kGb10DfPdl = false;        ///< STRATA_DF_PDL
+constexpr bool kGb10GrV3Pf = false;       ///< STRATA_GR_V3_PF (E15: the v3 HC read's load ordering; bitwise, but it only acts when the v3 read runs)
+constexpr bool kGb10GrV3 = false;         ///< STRATA_GR_V3 (the stream-split HC read: another summation order, KL-gated)
+
 // ---- 0.2.7 defaults of the CUDA speed work (pure rules; the engine reads the device and calls these; tests in arch_defaults_test)
 // `hip`: a HIP build, where a gfx1200 / gfx1201 reports compute capability 12.0 as well and none of these is measured or wanted.
 // `v026`: STRATA_DEFAULTS=026 (defaults_026.hpp qwen_defaults_026()): every one of these is then off, as in v0.2.6.  An explicit variable
@@ -87,7 +129,7 @@ inline float route_prior_resolve(const char* env, bool hip, bool integrated, dou
 /// 12.0 card (STRATA_SM120_PERF=0 turns the set off) with more than 13 GiB, CUDA builds only.  Measured: RTX PRO 5000 72 GB +1.2% decode clean,
 /// -3.0% / -5.9% on 2x RTX A4000 (sm_86), +1.0% / -3.4% on an RTX 3060 (sm_86): so not those; a 12 GB sm_120 card is unmeasured.
 inline bool gr_v3_default(bool hip, int major, int minor, bool integrated, double total_bytes, bool v026 = false) {
-    return !v026 && !hip && !integrated && sm120_default(major, minor) && total_bytes / 1073741824.0 > kSmallCardGiB;
+    return !v026 && !hip && ((!integrated && sm120_default(major, minor) && total_bytes / 1073741824.0 > kSmallCardGiB) || (kGb10GrV3 && is_sm121(major, minor) && sm121_series()));
 }
 
 /// STRATA_PROMPT_ATTN_IMMA (the prompt attention on int8 tensor cores, another summation order) when the user set nothing: ON for every CUDA card of
@@ -118,7 +160,7 @@ inline bool mmvq_il_89_resolve(const char* env, bool hip, int cc, bool v026 = fa
 
 /// STRATA_GR_UP_WIDE (the hyper-connection up projection, one warp a row; bitwise the old kernel) when the user set nothing: ON for a compute
 /// capability 12.0 card (STRATA_SM120_PERF=0 turns the set off), CUDA builds only.
-inline bool gr_up_wide_default(bool hip, int major, int minor, bool v026 = false) { return !v026 && !hip && sm120_default(major, minor); }
+inline bool gr_up_wide_default(bool hip, int major, int minor, bool v026 = false) { return !v026 && !hip && sm12x_default_v(major, minor, kGb10GrUpWide, v026); }
 
 /// STRATA_PREFILL_LAYER_MAJOR (#3976: the layer-major prompt walk, which reads each layer's streamed experts once per super-chunk instead of once
 /// per chunk; another summation order of the routed experts, so KL-checked, not bitwise) when the user set nothing: OFF everywhere (owner's yes 2026-11-02).

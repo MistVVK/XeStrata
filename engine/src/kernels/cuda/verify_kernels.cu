@@ -1791,7 +1791,7 @@ bool pdl_supported() {
         cudaFuncAttributes fa{};
         const bool on_attr = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
                              cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
-        const bool env_on = env_mode == 1 || (env_mode < 0 && on_attr && strata::sm120_default(major, minor));
+        const bool env_on = env_mode == 1 || (env_mode < 0 && on_attr && strata::sm12x_default(major, minor, strata::kGb10DfPdl));
         const bool on = env_on && on_attr &&
                         strata::cc_major_of(major) >= 9 &&
                         cudaFuncGetAttributes(&fa, gpu_stamp_kernel<true>) == cudaSuccess && fa.ptxVersion >= 90 &&
