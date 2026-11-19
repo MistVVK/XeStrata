@@ -3364,7 +3364,12 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         pp->Dm_b[1] = (float*) take((size_t) Gr * N * 4);
         for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
         const char* fs = std::getenv("STRATA_PF_PEER_STREAM");
-        pp->ps_frac = fs ? std::atof(fs) : 0.35;   // measured: 0.25-0.5 all ~1950-1970 at 32K, 0.35 best
+        // measured: 0.25-0.5 all ~1950-1970 at 32K, 0.35 best.  Not on an MMQ-free build's int8 peer layers unless named: with the peer's
+        // streamed experts (#6023's ring of peer-streamed blobs read by the int8 kernels) 2x V100-SXM2 + IQ3_XXS ended every prompt of 2K
+        // tokens or more in non-finite logits (also over the host route, STRATA_PEER_NO_P2P=1); with STRATA_PF_PEER_STREAM=0 the answers
+        // were bit-identical to the build without the peer prompt path.
+        const double ps_default = (kPfOwnOnlyBuild && any_peer_i8) ? 0.0 : 0.35;
+        pp->ps_frac = fs ? std::atof(fs) : ps_default;
         if (pp->ps_frac > 0.0 && all_peer_layers && m.T_max >= stream_all_min()) {
             pp->RP = 48;
             if (const char* pr = std::getenv("STRATA_PF_PEER_RING"); pr != nullptr) pp->RP = std::atoi(pr);
