@@ -19,6 +19,11 @@ REFUSED = {"logprobs": "logprobs: not supported by the Hy4-Flash engine",
            "logit_bias": "logit_bias: not supported by the Hy4-Flash engine"}
 
 
+def _base(exe) -> str:
+    """The program's file name, whichever separator the config was written with (a Windows path read on Linux, or the other way round)."""
+    return str(exe or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
 def is_hy4(cfg: dict | None) -> bool:
     """A run config for the Hy4-Flash engine: its arch, or its program."""
     if not isinstance(cfg, dict):
@@ -26,11 +31,11 @@ def is_hy4(cfg: dict | None) -> bool:
     if cfg.get("arch") == ARCH:
         return True
     exe = str(cfg.get("exe") or "")
-    return exe == REFERENCE or os.path.basename(exe).lower().startswith(EXE_PREFIX)
+    return exe == REFERENCE or _base(exe).startswith(EXE_PREFIX)
 
 
 def is_hy4_exe(exe) -> bool:
-    return os.path.basename(str(exe or "")).lower().startswith(EXE_PREFIX)
+    return _base(exe).startswith(EXE_PREFIX)
 
 
 def drafter_args(cfg: dict) -> list[str]:
