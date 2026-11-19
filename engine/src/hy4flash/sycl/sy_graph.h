@@ -13,6 +13,7 @@
 #include "hy4s_cpuexp.h"
 #include "sy_common.h"
 #include "sy_gemm_xmx.h"
+#include "sy_gpuexp.h"
 #include "sy_indexer.h"
 #include "sy_kernels.h"
 #include "sy_linear.h"
@@ -73,12 +74,16 @@ public:
     CpuExperts& cx;
     int max_ctx, Tc;
     int expert_act = 1;  // 0 float activations (oracle math), 1 Q8_1 activations (fast integer path)
+    GpuExperts* gx = nullptr;  // routed experts on the GPU for chunks of >= gx_min_T tokens (prefill); null: CPU only
+    int gx_min_T = 32;
     // buffers
     int32_t* d_ids = nullptr;
     float *x = nullptr, *pre = nullptr, *post = nullptr, *cur_f = nullptr, *F1 = nullptr, *F2 = nullptr, *F3 = nullptr, *sub = nullptr;
     half *cur_h = nullptr, *qr_h = nullptr, *qa_h = nullptr, *o_h = nullptr, *H1 = nullptr, *z_h = nullptr, *er_h = nullptr, *hfin = nullptr, *ctx_h = nullptr;
     float *z_f = nullptr, *zout_f = nullptr, *moe_w = nullptr, *logits = nullptr;
     int32_t *moe_idx = nullptr, *d_argmax = nullptr;
+    float* hc_part = nullptr;
+    uint32_t* hc_cnt = nullptr;
     float* h_z = nullptr;     // pinned host: z [T][1536]
     float* h_zout = nullptr;  // pinned host: expert output [T][1536]
     int32_t* h_idx = nullptr;
@@ -120,33 +125,46 @@ public:
     int heads(int il) const { return c.is_swa[il] ? c.heads_swa : c.heads_sparse; }
     double theta(int il) const { return c.is_swa[il] ? c.theta_swa : c.theta_sparse; }
 
-    // coarse per-section timing (prof2): each labelled section is bracketed by a queue wait, so use it for relative numbers only
+    // per-section GPU timeline (prof2, needs the profiling queue: HY4S_PROF=1): every labelled section is bracketed by two marker kernels whose GPU start times are read back at
+    // the report, so the sections show real GPU time including launch gaps, without draining the queue (the queue keeps running between the markers).
     bool prof2 = false;
     std::map<std::string, std::pair<double, int>> pacc;
+    struct PEv { sycl::event a, b; std::string nm; };
+    std::vector<PEv> pev;
     struct PS {
         Runner* r;
         bool on;
-        double t0 = 0;
-        std::string nm;
-        PS(Runner* r_, const std::string& n) : r(r_), on(r_->prof2), nm(n) {
+        PEv e;
+        PS(Runner* r_, const std::string& n) : r(r_), on(r_->prof2) {
             if (!on) return;
-            wait();
-            t0 = now_s();
+            e.nm = n;
+            e.a = Q().single_task([]() {});
         }
         ~PS() {
             if (!on) return;
-            wait();
-            auto& a = r->pacc[nm];
-            a.first += (now_s() - t0) * 1e3;
-            a.second++;
+            e.b = Q().single_task([]() {});
+            r->pev.push_back(e);
         }
     };
+    void pflush() {
+        if (!prof2 || pev.empty()) return;
+        wait();
+        for (auto& e : pev) {
+            const double t0 = (double)e.a.get_profiling_info<sycl::info::event_profiling::command_start>();
+            const double t1 = (double)e.b.get_profiling_info<sycl::info::event_profiling::command_start>();
+            auto& a = pacc[e.nm];
+            a.first += (t1 - t0) * 1e-6;
+            a.second++;
+        }
+        pev.clear();
+    }
     void pacc_report(const char* what, int steps) {
         if (!prof2) return;
+        pflush();
         std::vector<std::pair<double, std::string>> v;
         for (auto& kv : pacc) v.push_back({kv.second.first, kv.first});
         std::sort(v.rbegin(), v.rend());
-        fprintf(stderr, "[prof2 %s] per-step ms by section (queue-synchronised, /%d steps):\n", what, steps);
+        fprintf(stderr, "[prof2 %s] per-step GPU ms by section (marker kernels, /%d steps):\n", what, steps);
         double tot = 0;
         for (auto& p : v) {
             tot += p.first;
@@ -174,6 +192,9 @@ public:
         x = dalloc<float>((size_t)T * 4 * HID);
         pre = dalloc<float>(T * 4);
         post = dalloc<float>(T * 4);
+        hc_part = dalloc<float>((size_t)T * 24 * 9);
+        hc_cnt = dalloc<uint32_t>(T);
+        dzero(hc_cnt, (size_t)T * 4);
         cur_h = dalloc<half>((size_t)T * HID);
         cur_f = dalloc<float>((size_t)T * HID);
         sub = dalloc<float>((size_t)T * HID);
@@ -389,7 +410,7 @@ public:
     }
 
     void hc_mix_run(const float* xin, const float* hfn, const float* hsc, const float* hbs, int nout, int T) {
-        hc_mix(xin, hfn, hsc, hbs, pre, post, nout, c.rms_eps, c.hc_eps, c.hc_mag, T);
+        hc_mix2(xin, hfn, hsc, hbs, pre, post, nout, c.rms_eps, c.hc_eps, c.hc_mag, T, hc_part, hc_cnt);
     }
 
     // IndexPool: cache iv/ig of the chunk's tokens and pool the groups completed by this chunk
@@ -503,7 +524,13 @@ public:
                 wait();
                 for (size_t i = 0; i < (size_t)T * 16; ++i) { h_idx[i] = (int32_t)fi[i]; h_w[i] = fw[i]; }
             }
-            cx.run(il - 1, T, h_z, h_idx, h_w, h_zout, expert_act);
+            const bool use_gx = gx != nullptr && T >= gx_min_T;
+            if (use_gx) {
+                // prefill: routed experts on the GPU (streamed from the page cache), result stays on the device
+                gx->run(il - 1, T, z_f, h_idx, h_w, zout_f, nullptr);
+            } else {
+                cx.run(il - 1, T, h_z, h_idx, h_w, h_zout, expert_act);
+            }
             if (dump && dbg_layers) {
                 wait();
                 const std::string nm = "L" + std::to_string(il) + "_";
@@ -516,7 +543,7 @@ public:
                 maybe_dump(nm + "shared_out", T, HID, F3);
             }
             t_cpu_exp += now_s() - tc;
-            h2d(zout_f, h_zout, nz * 4);
+            if (!use_gx) h2d(zout_f, h_zout, nz * 4);
             f2h(zout_f, z_h, nz);
             lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
             { PS _q(this, "combine_norm"); add_rms(F2, F3, (const float*)tw(pm + ".combine_output_norm.weight"), sub, HID, c.rms_eps, T); }

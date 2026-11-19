@@ -60,24 +60,27 @@ inline void k_gemv_rp(const uint8_t* W, int N, int K, const half* X, float* Y, i
                 const sycl::uchar8 hd = *reinterpret_cast<const sycl::uchar8*>(hdr + (size_t)sb * 8);
                 const float D = h2f_bits((uint16_t)hd[0] | ((uint16_t)hd[1] << 8));
                 const float eff = D * ((float)hd[2 + (off >> 6)] / 255.0f);
-                float w[WPC];
-                if constexpr (FMT == FMT_S4) {
-                    for (int b = 0; b < 16; ++b) {
-                        w[2 * b] = ((float)(raw[b] & 15) - 7.5f) * eff;
-                        w[2 * b + 1] = ((float)(raw[b] >> 4) - 7.5f) * eff;
-                    }
-                } else {
-                    for (int b = 0; b < 16; ++b) w[b] = (float)(int8_t)raw[b] * eff;
-                }
+                // no per-weight array (it spilled to private memory and ran ~8x slower than S8): dot = eff * (sum q*x - H * sum x), fully unrolled
                 for (int m = 0; m < MT; ++m) {
                     if (m < M) {
                         const half* xp = X + (size_t)m * K + (size_t)sb * 256 + off;
-                        float a = 0.f;
+                        float sq = 0.f, sx = 0.f;
+#pragma unroll
                         for (int v = 0; v < WPC / 8; ++v) {
                             const sycl::vec<half, 8> xv = *reinterpret_cast<const sycl::vec<half, 8>*>(xp + v * 8);
-                            for (int t = 0; t < 8; ++t) a += w[v * 8 + t] * (float)xv[t];
+                            if constexpr (FMT == FMT_S4) {
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    const float x0 = (float)xv[2 * j], x1 = (float)xv[2 * j + 1];
+                                    sq += (float)(raw[4 * v + j] & 15) * x0 + (float)(raw[4 * v + j] >> 4) * x1;
+                                    sx += x0 + x1;
+                                }
+                            } else {
+#pragma unroll
+                                for (int t = 0; t < 8; ++t) sq += (float)(int8_t)raw[8 * v + t] * (float)xv[t];
+                            }
                         }
-                        acc[m] += a;
+                        acc[m] += eff * (sq - (FMT == FMT_S4 ? 7.5f : 0.0f) * sx);
                     }
                 }
             }

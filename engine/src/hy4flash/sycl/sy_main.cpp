@@ -24,7 +24,7 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", force_route;
     bool load_only = false, dbg = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false;
-    int gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, threads = 6, expert_act = 1;
+    int gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 512, index_topk = 2048, threads = 6, expert_act = 1;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -38,6 +38,8 @@ int main(int argc, char** argv) {
         else if (a == "--threads") threads = atoi(nxt().c_str());
         else if (a == "--expert-act") expert_act = atoi(nxt().c_str());
         else if (a == "--warm") warm = true;
+        else if (a == "--gpu-experts") gx_mb = atoi(nxt().c_str());
+        else if (a == "--gx-min-t") gx_min_t = atoi(nxt().c_str());
         else if (a == "--load-only") load_only = true;
         else if (a == "--dump") dump = true;
         else if (a == "--dbg-layers") dbg = true;
@@ -99,6 +101,21 @@ int main(int argc, char** argv) {
         if (!r.init(no_engram ? std::string() : engram, err)) {
             fprintf(stderr, "init: %s\n", err.c_str());
             return 1;
+        }
+        GpuExperts gxe;
+        if (gx_mb > 0 && T0 >= gx_min_t) {
+            std::string gerr;
+            try {
+                if (gxe.init(cx, (size_t)gx_mb << 20, Tc, gerr, threads)) {
+                    r.gx = &gxe;
+                    r.gx_min_T = gx_min_t;
+                    fprintf(stderr, "[gpu-experts] on for chunks >= %d tokens: %.1f MiB device, device allocated %.2f GiB total\n", gx_min_t, gxe.device_bytes() / 1048576.0, (dev_bytes_allocated() + gxe.device_bytes()) / 1073741824.0);
+                } else {
+                    fprintf(stderr, "[gpu-experts] disabled: %s\n", gerr.c_str());
+                }
+            } catch (const sycl::exception& e) {
+                fprintf(stderr, "[gpu-experts] disabled: %s\n", e.what());
+            }
         }
         tok.reserve(max_ctx + 8);
         std::string top_out;

@@ -23,7 +23,15 @@ constexpr int HID = 3072;
 constexpr int NHC = 4;
 
 inline sycl::queue& Q() {
-    static sycl::queue q{sycl::gpu_selector_v, sycl::property_list{sycl::property::queue::in_order()}};
+    // HY4S_DISCARD=1: the queue creates no event objects (cheaper launches; the events returned by submit/memcpy then must not be waited on - use host flags / q.wait())
+    static sycl::queue q = [] {
+        const char* pf = std::getenv("HY4S_PROF");
+        if (pf && pf[0] == '1') return sycl::queue{sycl::gpu_selector_v, sycl::property_list{sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+        const char* d = std::getenv("HY4S_DISCARD");
+        if (d && d[0] == '1')
+            return sycl::queue{sycl::gpu_selector_v, sycl::property_list{sycl::property::queue::in_order(), sycl::ext::oneapi::property::queue::discard_events()}};
+        return sycl::queue{sycl::gpu_selector_v, sycl::property_list{sycl::property::queue::in_order()}};
+    }();
     return q;
 }
 

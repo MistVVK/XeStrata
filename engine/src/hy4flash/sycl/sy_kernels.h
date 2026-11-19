@@ -72,6 +72,63 @@ inline void hc_mix(const float* x, const float* fn, const float* scale, const fl
     });
 }
 
+// ---- same as hc_mix, spread over 24 work-groups per token (decode has T = 1: one group streaming 393 KB of hc_fn was latency bound, 0.15 ms).
+// Every group writes its 9 partial sums (8 dot products + sum of squares) to part[t][slab][9]; the LAST group to finish (atomic counter cnt[t], zero on entry, reset on exit)
+// adds the 24 partials in slab order (deterministic) and writes pre/post. part: float [T][24][9], cnt: uint32 [T].
+inline void hc_mix2(const float* x, const float* fn, const float* scale, const float* base, float* pre, float* post, int nout, float eps, float hc_eps, float hc_mag, int T, float* part, uint32_t* cnt) {
+    constexpr int NWG = 24, K = NHC * HID, PER = K / NWG, BT = 128;
+    Q().parallel_for(NR((size_t)T * NWG, BT), [=](sycl::nd_item<1> it) REQD_SG32 {
+        float* shv = lmem<float, 9 * 4>(it);
+        int* last = lmem<int, 1>(it);
+        const int g = (int)it.get_group(0), t = g / NWG, slab = g % NWG, tid = (int)it.get_local_id(0);
+        const float* xt = x + (size_t)t * K;
+        float ss = 0, a[8];
+        for (int j = 0; j < 8; ++j) a[j] = 0;
+        for (int k = slab * PER + tid; k < (slab + 1) * PER; k += BT) {
+            const float v = xt[k];
+            ss += v * v;
+            for (int j = 0; j < 8; ++j)
+                if (j < nout) a[j] += v * fn[(size_t)j * K + k];
+        }
+        float vals[9];
+        for (int j = 0; j < 8; ++j) vals[j] = sg_sum(it, a[j]);
+        vals[8] = sg_sum(it, ss);
+        const int sgid = tid >> 5, lane = tid & 31;
+        if (lane == 0)
+            for (int j = 0; j < 9; ++j) shv[j * 4 + sgid] = vals[j];
+        sycl::group_barrier(it.get_group());
+        if (tid < 9) part[((size_t)t * NWG + slab) * 9 + tid] = shv[tid * 4] + shv[tid * 4 + 1] + shv[tid * 4 + 2] + shv[tid * 4 + 3];
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+        sycl::group_barrier(it.get_group());
+        if (tid == 0) {
+            sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device, sycl::access::address_space::global_space> c(cnt[t]);
+            const uint32_t old = c.fetch_add(1u);
+            *last = (old == (uint32_t)NWG - 1u) ? 1 : 0;
+            if (*last) c.store(0u);
+        }
+        sycl::group_barrier(it.get_group());
+        if (!*last) return;
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+        if (tid < 9) {
+            float s = 0;
+            for (int q = 0; q < NWG; ++q) s += sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(part[((size_t)t * NWG + q) * 9 + tid]).load();
+            shv[tid] = s;
+        }
+        sycl::group_barrier(it.get_group());
+        if (tid == 0) {
+            const float inv = sycl::rsqrt(shv[8] / K + eps);
+            for (int h = 0; h < NHC; ++h) {
+                const float m0 = shv[h] * inv;
+                pre[(size_t)t * NHC + h] = sigmoidf_(m0 * scale[0] + base[h]) + hc_eps;
+                if (nout == 8) {
+                    const float m1 = shv[NHC + h] * inv;
+                    post[(size_t)t * NHC + h] = hc_mag * sigmoidf_(m1 * scale[1] + base[NHC + h]) + hc_eps;
+                }
+            }
+        }
+    });
+}
+
 // ---- cur = sum_h x[h]*pre[h]; then rmsnorm(cur, w) -> fp16 (GEMM input) and optionally fp32
 inline void hc_reduce_norm(const float* x, const float* pre, const float* w, half* outh, float* outf, float eps, int T) {
     Q().parallel_for(NR(T, 256), [=](sycl::nd_item<1> it) REQD_SG32 {
