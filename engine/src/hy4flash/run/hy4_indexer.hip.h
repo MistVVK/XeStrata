@@ -1,0 +1,200 @@
+// hy4_indexer.hip.h - compressed IndexPool of the 12 sparse layers (kpool 4, 16 index heads x 128 dims, top-(topk/4 - 1) pools + the current group)
+// Per layer state: ivg cache half [ctx][256] (iv | ig of every token), pooled keys half [ctx/4][128] (normed, rope at the group's first position).
+#pragma once
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+
+#include <cstdint>
+
+namespace hy4 {
+namespace idx {
+
+__device__ __forceinline__ void rope_pair_i(float x0, float x1, int pos, int i, float theta, float& o0, float& o1) {
+    float freq = 1.0f / powf(theta, (float)(2 * i) / 64.0f);
+    float ang = (float)pos * freq;
+    float sn, cs;
+    sincosf(ang, &sn, &cs);
+    o0 = x0 * cs - x1 * sn;
+    o1 = x0 * sn + x1 * cs;
+}
+
+__device__ __forceinline__ float bsum128(float v, float* sh) {  // block of 128 threads (4 waves)
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o);
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = v;
+    __syncthreads();
+    return sh[0] + sh[1] + sh[2] + sh[3];
+}
+
+// store iv, ig (fp32 [T][128] each) of tokens p0..p0+T-1 into the fp16 cache rows
+__global__ void k_idx_store(const float* __restrict__ iv, const float* __restrict__ ig, __half* __restrict__ ivg, int p0) {
+    int t = blockIdx.x, d = threadIdx.x;  // 128 threads
+    ivg[(size_t)(p0 + t) * 256 + d] = __float2half(iv[(size_t)t * 128 + d]);
+    ivg[(size_t)(p0 + t) * 256 + 128 + d] = __float2half(ig[(size_t)t * 128 + d]);
+}
+
+// pool completed groups g in [g_lo, g_lo + n): softmax over the 4 tokens of (ig + ape), weighted sum of iv, rmsnorm(key_norm), rope at 4g on dims 64..127
+__global__ void k_idx_pool(const __half* __restrict__ ivg, const float* __restrict__ ape /*[4][128]*/, const float* __restrict__ knw /*[128]*/, __half* __restrict__ pooled, int g_lo, float theta,
+                           float eps) {
+    __shared__ float sh[4];
+    __shared__ float sv[128];
+    int g = g_lo + blockIdx.x, d = threadIdx.x;
+    float l[4], mx = -3.0e38f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        l[j] = __half2float(ivg[(size_t)(4 * g + j) * 256 + 128 + d]) + ape[j * 128 + d];
+        mx = fmaxf(mx, l[j]);
+    }
+    float s = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        l[j] = __expf(l[j] - mx);
+        s += l[j];
+    }
+    float acc = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc += (l[j] / s) * __half2float(ivg[(size_t)(4 * g + j) * 256 + d]);
+    float ss = bsum128(acc * acc, sh);
+    float inv = rsqrtf(ss / 128.0f + eps);
+    float v = acc * inv * knw[d];
+    sv[d] = v;
+    __syncthreads();
+    if (d >= 64) {
+        int i = (d - 64) >> 1;
+        float x0 = sv[64 + 2 * i], x1 = sv[64 + 2 * i + 1], o0, o1;
+        rope_pair_i(x0, x1, 4 * g, i, theta, o0, o1);
+        v = (d & 1) ? o1 : o0;
+    }
+    pooled[(size_t)g * 128 + d] = __float2half(v);
+}
+
+// iq: fp32 [T][2048] (16 heads x 128) -> rope on dims 64..127 of every head at position p0+t -> half [T][2048]
+__global__ void k_idx_q_rope(const float* __restrict__ iq, __half* __restrict__ out, int p0, float theta) {
+    int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;  // 128 threads
+    const float* q = iq + (size_t)t * 2048 + h * 128;
+    float v = q[d];
+    if (d >= 64) {
+        int i = (d - 64) >> 1;
+        float x0 = q[64 + 2 * i], x1 = q[64 + 2 * i + 1], o0, o1;
+        rope_pair_i(x0, x1, p0 + t, i, theta, o0, o1);
+        v = (d & 1) ? o1 : o0;
+    }
+    out[(size_t)t * 2048 + h * 128 + d] = __float2half(v);
+}
+
+// score[t][g] = sum_h relu(iq[t][h] . pooled[g]) * hw[t][h] * hscale, for g < grp(t) = (p0+t)/4, else -inf.  block (64 pools, 1 token), 64 threads.
+__global__ void __launch_bounds__(64) k_idx_score(const __half* __restrict__ iq, const float* __restrict__ hw, const __half* __restrict__ pooled, float* __restrict__ score, int p0, int G, int ldS,
+                                                  float hscale) {
+    __shared__ float sq[16 * 128];
+    __shared__ float shw[16];
+    int t = blockIdx.y, g = blockIdx.x * 64 + threadIdx.x;
+    for (int i = threadIdx.x; i < 16 * 128; i += 64) sq[i] = __half2float(iq[(size_t)t * 2048 + i]);
+    if (threadIdx.x < 16) shw[threadIdx.x] = hw[(size_t)t * 16 + threadIdx.x] * hscale;
+    __syncthreads();
+    if (g >= G) return;
+    int grp = (p0 + t) >> 2;
+    float res;
+    if (g >= grp) {
+        res = -INFINITY;
+    } else {
+        float pk[128];
+        const __half2* pr = (const __half2*)(pooled + (size_t)g * 128);
+#pragma unroll
+        for (int i = 0; i < 64; ++i) {
+            float2 f = __half22float2(pr[i]);
+            pk[2 * i] = f.x;
+            pk[2 * i + 1] = f.y;
+        }
+        res = 0;
+        for (int h = 0; h < 16; ++h) {
+            float dsum = 0;
+#pragma unroll
+            for (int k = 0; k < 128; ++k) dsum += sq[h * 128 + k] * pk[k];
+            res += fmaxf(dsum, 0.0f) * shw[h];
+        }
+    }
+    score[(size_t)t * ldS + g] = res;
+}
+
+__device__ __forceinline__ uint32_t f2key(float f) {
+    uint32_t b = __float_as_uint(f);
+    return b ^ ((b >> 31) ? 0xFFFFFFFFu : 0x80000000u);
+}
+
+// per token: select the top n_top pools among g < grp (all of them if grp <= n_top), emit the key list (cache slots = positions):
+// the 4 tokens of each selected pool, then the own group's tokens 4*grp..t.  keys [T][kmax], nkeys [T].  256 threads.
+__global__ void k_idx_select(const float* __restrict__ score, int ldS, int p0, int n_top, int kmax, int32_t* __restrict__ keys, int32_t* __restrict__ nkeys) {
+    __shared__ int red[8];
+    __shared__ int cnt_sel;
+    __shared__ uint32_t thr_s;
+    __shared__ int n_gt_s;
+    int t = blockIdx.x;
+    int pos = p0 + t;
+    int grp = pos >> 2;
+    int32_t* kl = keys + (size_t)t * kmax;
+    if (grp <= n_top) {  // everything before the own group plus the own group: causal
+        for (int i = threadIdx.x; i <= pos; i += blockDim.x) kl[i] = i;
+        if (threadIdx.x == 0) nkeys[t] = pos + 1;
+        return;
+    }
+    const float* sc = score + (size_t)t * ldS;
+    // binary search the n_top-th largest key
+    uint32_t lo = 0, hi = 0xFFFFFFFFu;  // find max thr with count(key >= thr) >= n_top
+    for (int it = 0; it < 33 && lo < hi; ++it) {
+        uint32_t mid = (uint32_t)(lo + (((uint64_t)hi - lo + 1) >> 1));
+        int c = 0;
+        for (int g = threadIdx.x; g < grp; g += blockDim.x) c += (f2key(sc[g]) >= mid) ? 1 : 0;
+        for (int o = 16; o > 0; o >>= 1) c += __shfl_xor(c, o);
+        __syncthreads();
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = c;
+        __syncthreads();
+        int tot = 0;
+        for (int w = 0; w < 8; ++w) tot += red[w];
+        if (tot >= n_top) lo = mid; else hi = mid - 1;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { thr_s = lo; cnt_sel = 0; }
+    __syncthreads();
+    uint32_t thr = thr_s;
+    // count strictly greater
+    int c = 0;
+    for (int g = threadIdx.x; g < grp; g += blockDim.x) c += (f2key(sc[g]) > thr) ? 1 : 0;
+    for (int o = 16; o > 0; o >>= 1) c += __shfl_xor(c, o);
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = c;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int tot = 0;
+        for (int w = 0; w < 8; ++w) tot += red[w];
+        n_gt_s = tot;
+    }
+    __syncthreads();
+    int n_eq_need = n_top - n_gt_s;
+    // emit: all > thr, then the first n_eq_need == thr in index order (single wave walks ties deterministically)
+    for (int g = threadIdx.x; g < grp; g += blockDim.x) {
+        if (f2key(sc[g]) > thr) {
+            int s = atomicAdd(&cnt_sel, 1);
+            for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int s = cnt_sel, need = n_eq_need;
+        for (int g = 0; g < grp && need > 0; ++g) {
+            if (f2key(sc[g]) == thr) {
+                for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
+                ++s;
+                --need;
+            }
+        }
+        cnt_sel = s;
+    }
+    __syncthreads();
+    int npool = cnt_sel;
+    int nown = pos - 4 * grp + 1;
+    for (int i = threadIdx.x; i < nown; i += blockDim.x) kl[4 * npool + i] = 4 * grp + i;
+    if (threadIdx.x == 0) nkeys[t] = 4 * npool + nown;
+}
+
+}  // namespace idx
+}  // namespace hy4

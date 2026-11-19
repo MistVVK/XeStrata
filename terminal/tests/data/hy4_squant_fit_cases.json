@@ -1,0 +1,24 @@
+{
+  "description": "Shared rank-cut fit test cases for Tencent Hy4-Flash (.strata v1.0) matching docs/10-GUI-TUI.md & scripts/speed_model.py",
+  "constants": {
+    "GIB_TO_GB": 1.073741824,
+    "VRAM_NON_EXPERT_GB": 2.00,
+    "OS_RESERVE_GB": 5.10,
+    "HOT_ENGRAM_GB": 0.90
+  },
+  "models": {
+    "SQ-32":  {"file_name": "Hy4-Flash-SQ-32.strata",  "footprint_gb": 37.98,  "dense_gb": 5.25, "bodies_gb": 32.73,  "engram_shard": "Hy4-Flash-Engram-Q8.strata", "engram_gb": 67.58},
+    "SQ-64":  {"file_name": "Hy4-Flash-SQ-64.strata",  "footprint_gb": 61.84,  "dense_gb": 5.80, "bodies_gb": 56.04,  "engram_shard": "Hy4-Flash-Engram-Q8.strata", "engram_gb": 67.58},
+    "SQ-96":  {"file_name": "Hy4-Flash-SQ-96.strata",  "footprint_gb": 89.43,  "dense_gb": 6.50, "bodies_gb": 82.93,  "engram_shard": "Hy4-Flash-Engram-Q8.strata", "engram_gb": 67.58},
+    "SQ-128": {"file_name": "Hy4-Flash-SQ-128.strata", "footprint_gb": 113.06, "dense_gb": 7.30, "bodies_gb": 105.76, "engram_shard": "Hy4-Flash-Engram-Q8.strata", "engram_gb": 67.58}
+  },
+  "cases": [
+    {"model": "SQ-32",  "vram_gib": 12, "ram_gib": 32,  "expected_ssd_gb": 0.00,  "mode": "ram_vram_zero_ssd"},
+    {"model": "SQ-32",  "vram_gib": 8,  "ram_gib": 32,  "expected_ssd_gb": 3.03,  "mode": "near_resident_ssd"},
+    {"model": "SQ-64",  "vram_gib": 8,  "ram_gib": 64,  "expected_ssd_gb": 0.00,  "mode": "ram_vram_zero_ssd"},
+    {"model": "SQ-64",  "vram_gib": 12, "ram_gib": 64,  "expected_ssd_gb": 0.00,  "mode": "ram_vram_zero_ssd"},
+    {"model": "SQ-64",  "vram_gib": 12, "ram_gib": 32,  "expected_ssd_gb": 22.60, "mode": "cross_tier_ssd"},
+    {"model": "SQ-96",  "vram_gib": 12, "ram_gib": 96,  "expected_ssd_gb": 0.00,  "mode": "ram_vram_zero_ssd"},
+    {"model": "SQ-128", "vram_gib": 12, "ram_gib": 128, "expected_ssd_gb": 0.00,  "mode": "ram_vram_zero_ssd"}
+  ]
+}
