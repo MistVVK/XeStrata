@@ -117,6 +117,26 @@ class FeedEngine(unittest.TestCase):
             self.assertIsNone(setup.get_prebuilt_hip(setup.PREBUILT_URL, gpu))
         self.assertEqual(run.call_args.kwargs["env"].get("STRATA_ENGINE_BACKEND"), "hip")
 
+    def test_the_fetched_package_is_checked_as_the_family_setup_was_told_to_use(self):
+        """The second half of #4861, found on real mixed hardware by its reporter: after the fetch, setup read the
+        package back with `ec.resolve(store, full=True)` and no family. `resolve()` then runs `detect_backend()`,
+        which on a PC with an AMD card and an NVIDIA card takes the NVIDIA card first, so the hip package the update
+        had just fetched was refused with "This Strata is for AMD RX 9000 cards. Your PC has an NVIDIA card ..."
+        (an `EngineMissing`, which is not a `ComponentProblem`, so it went to setup's top-level handler and stopped
+        the install). The check must be asked for the family setup chose, exactly like the fetch is."""
+        asked = {}
+
+        def resolve(root, *, backend=None, **kwargs):
+            asked["root"], asked["backend"] = root, backend
+            raise ec.ComponentProblem("this test stops at the call it checks")
+
+        gpu = {"arch": "gfx1201", "archs": ["gfx1201"], "vram_gb": 16.0, "index": 0}
+        with self.run_update(code=0), mock.patch.object(setup, "ROOT", self.root), \
+                mock.patch.object(ec, "resolve", side_effect=resolve):
+            self.assertIsNone(setup.engine_from_feed(self.eng, backend="hip"))
+        self.assertEqual(asked.get("backend"), "hip",
+                         "the package read back is checked without the family setup was told to use")
+
     def test_the_standard_engine_fetch_says_cuda(self):
         gpu = {"arch": 89, "archs": [89], "vram_gb": 8.0, "index": 0}
         with mock.patch.object(setup, "engine_dir", lambda toolkit=13: self.eng), \

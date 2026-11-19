@@ -4997,7 +4997,9 @@ def engine_from_feed(eng: Path, updating: bool = False, backend: str = "") -> Pa
     `backend` is the GPU family this setup was told to install ("hip" for an AMD setup, "cuda" for the standard one).  It has
     to travel with the update: the update runs in its own process and detects the GPU itself, and on a PC that has an NVIDIA
     card beside the AMD one that detection takes the NVIDIA card first (#3688's order), so an AMD setup would receive the CUDA
-    package and fail its own test start (#4861).  Empty keeps the old behaviour (the update detects on its own)."""
+    package and fail its own test start (#4861).  The same family is handed to the check that reads the fetched package back
+    (`ec.resolve`), which would otherwise run that detection again and refuse the package it had just fetched.  Empty keeps the
+    old behaviour (the update detects on its own)."""
     acquisition.require("the ready-made engine")
     from strata_control import engine_component as ec
     store = home() / "engine-feed"
@@ -5018,7 +5020,7 @@ def engine_from_feed(eng: Path, updating: bool = False, backend: str = "") -> Pa
         warn(f"no engine from the update feed: {why[0][:200]}")
         return None
     try:
-        component = ec.resolve(store, full=True)
+        component = ec.resolve(store, full=True, backend=backend or None)
     except ec.ComponentProblem as e:
         warn(f"the engine from the update feed is not usable: {e}")
         return None
