@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "hy4_graph.hip.h"
+#include "hy4_spec.hip.h"
 #include "hy4_serve.hip.h"
 
 using namespace hy4;
@@ -73,7 +74,9 @@ int main(int argc, char** argv) {
     int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048;
     bool serve = false, session_reuse = false;
     int gpu = -1;
-    std::string draft = "off";
+    std::string draft = "auto";  // auto: dfly2 under --serve (when the file carries the drafter), off for the CLI runs (gates / benches); "off" and "dfly2" force
+    SpecCfg scfg;
+    std::string parity_list;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() {
@@ -98,6 +101,12 @@ int main(int argc, char** argv) {
         else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
         else if (a == "--gpu") gpu = atoi(nxt().c_str());
         else if (a == "--draft") draft = nxt();
+        else if (a == "--spec-k") scfg.K = atoi(nxt().c_str());
+        else if (a == "--spec-fixed") scfg.adaptive = false;
+        else if (a == "--spec-cut") scfg.cut = (float)atof(nxt().c_str());
+        else if (a == "--spec-debug") scfg.debug = true;
+        else if (a == "--spec-exact") scfg.exact = atoi(nxt().c_str()) != 0;
+        else if (a == "--parity-m") parity_list = nxt();
         else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
         else if (a == "--vision" || a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner yet\n", a.c_str(), nxt().c_str());
         else if (a == "--kv") {
@@ -139,12 +148,13 @@ int main(int argc, char** argv) {
             fflush(stdout);
             return 2;
         }
-        if (draft != "off") {
-            printf("ERR --draft %s: no drafter in this runner yet\n", draft.c_str());
+        if (draft != "off" && draft != "dfly2" && draft != "auto") {
+            printf("ERR --draft %s: expected off, dfly2 or auto\n", draft.c_str());
             fflush(stdout);
             return 2;
         }
         ServeOpts so;
+        so.spec = scfg;
         so.model = model;
         so.engram = engram;
         so.max_ctx = max_ctx > 0 ? max_ctx : 32768;
@@ -195,6 +205,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     tok.reserve(max_ctx + 8);
+    DFly2 df(r);
+    const bool spec_mode = draft == "dfly2" && gen > 0;
+    if (draft == "dfly2") {
+        if (!df.init(err)) {
+            fprintf(stderr, "dfly2: %s\n", err.c_str());
+            return 1;
+        }
+    }
     if (prof && r.engram_ready) {
         // random 4 KiB read probe: pages/s with 16 threads x qd 8
         const size_t NP = 20000;
@@ -229,8 +247,9 @@ int main(int argc, char** argv) {
         if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
         bool last = done == T0;
         if (last) {
-            int first = all_logits ? 0 : T - 1;
+            int first = (all_logits && !spec_mode) ? 0 : T - 1;
             r.head(T, first);
+            if (df.ok) df.snap_h(T - first - 1);
             HCK(hipStreamSynchronize(r.st)); r.pflush();
             int n = T - first;
             hl.resize((size_t)n * V);
@@ -249,7 +268,85 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram cpu %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_cpu);
     // greedy decode
     const double cpu_wait0 = r.t_cpu_wait;
-    if (gen > 0) {
+    if (!parity_list.empty()) {
+        // verify-window parity: rows of an M-token chunk vs the same positions run one token at a time (M = 1 decode), same prefix
+        std::vector<int> ws;
+        for (size_t p = 0; p < parity_list.size();) {
+            ws.push_back(atoi(parity_list.c_str() + p));
+            size_t q = parity_list.find(',', p);
+            if (q == std::string::npos) break;
+            p = q + 1;
+        }
+        int Wmax = *std::max_element(ws.begin(), ws.end());
+        if (Wmax > 16 || T0 < Wmax + 16 || r.Tc < Wmax) {
+            fprintf(stderr, "parity: need W <= 16, chunk >= W and a longer prompt\n");
+            return 2;
+        }
+        const int base = T0 - Wmax;
+        std::vector<float> seq((size_t)Wmax * V), win((size_t)Wmax * V);
+        skd::lin_gemv_max_m() = 4;
+        skd::moe_dec_max_m() = 4;
+        for (int i = 0; i < Wmax; ++i) {
+            if (!r.forward_chunk(tok.data(), base + i, 1, err)) return 1;
+            r.head(1, 0);
+            HCK(hipStreamSynchronize(r.st));
+            HCK(hipMemcpy(&seq[(size_t)i * V], r.logits, (size_t)V * 4, hipMemcpyDeviceToHost));
+        }
+        for (int mode = 0; mode < 2; ++mode) {
+            skd::lin_gemv_max_m() = mode ? 16 : 4;
+            skd::moe_dec_max_m() = mode ? 16 : 4;
+            for (int W : ws) {
+                const int p0 = T0 - W;
+                if (!r.forward_chunk(tok.data(), p0, W, err)) return 1;
+                r.head(W, 0);
+                HCK(hipStreamSynchronize(r.st));
+                HCK(hipMemcpy(win.data(), r.logits, (size_t)W * V * 4, hipMemcpyDeviceToHost));
+                int top1 = 0, bit = 0;
+                double maxabs = 0, kl_sum = 0, kl_max = 0;
+                for (int i = 0; i < W; ++i) {
+                    const float* s = &seq[(size_t)(p0 - base + i) * V];
+                    const float* w = &win[(size_t)i * V];
+                    int as = (int)(std::max_element(s, s + V) - s), aw = (int)(std::max_element(w, w + V) - w);
+                    top1 += as == aw;
+                    bit += std::equal(s, s + V, w);
+                    double ms = *std::max_element(s, s + V), mw = *std::max_element(w, w + V), zs = 0, zw = 0;
+                    for (int v = 0; v < V; ++v) {
+                        zs += std::exp((double)s[v] - ms);
+                        zw += std::exp((double)w[v] - mw);
+                        maxabs = std::max(maxabs, (double)std::fabs(s[v] - w[v]));
+                    }
+                    double kl = 0;
+                    for (int v = 0; v < V; ++v) {
+                        double ps = std::exp((double)s[v] - ms) / zs;
+                        if (ps > 1e-12) kl += ps * ((s[v] - ms - std::log(zs)) - (w[v] - mw - std::log(zw)));
+                    }
+                    kl_sum += kl;
+                    kl_max = std::max(kl_max, kl);
+                }
+                printf("[parity] M=%d %s: top1 %d/%d, bit-identical rows %d/%d, max|dlogit| %.4g, mean KL %.3g, max KL %.3g\n", W, mode ? "gemv16+moe_dec16" : "default(gemv4+moe_dec4)", top1, W, bit, W,
+                       maxabs, kl_sum / W, kl_max);
+                fflush(stdout);
+            }
+        }
+        return 0;
+    }
+    if (spec_mode) {
+        Spec sp(r, df, scfg);
+        std::string gen_ids, finish, e2;
+        int made = 0;
+        const double t1 = now_s();
+        sp.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { gen_ids += std::to_string(t) + " "; return true; }, finish, e2, made);
+        const double td = now_s() - t1;
+        if (finish == "error") {
+            fprintf(stderr, "spec: %s\n", e2.c_str());
+            return 1;
+        }
+        printf("generated ids: %s\n", gen_ids.c_str());
+        fprintf(stderr, "[decode] %d tokens in %.2f s = %.2f tok/s (spec dfly2, finish %s)\n", made, td, made / td, finish.c_str());
+        sp.report(stderr, td * 1000.0);
+        std::ofstream f(out_dir + "/gen_ids.txt");
+        f << gen_ids << "\n";
+    } else if (gen > 0) {
         int next = 0;
         {
             const float* lg = &hl[(size_t)(hl.size() / V - 1) * V];
