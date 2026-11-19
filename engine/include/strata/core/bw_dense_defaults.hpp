@@ -13,9 +13,9 @@ namespace strata {
 
 /// STRATA_GR_V3_PF when unset (gr_down_v3 / gr_up_v3 load-ordering variants): bits 0 (gr_down batched staging loads), 2 (gr_up batched loads) and 7 (gr_down: windows of 5+ rows
 /// take 2 rows a warp with the activations read from shared memory once for both rows; bitwise the same dots, DF2-MORE: down 16.1 / 16.2 / 17.6 / 19.5 -> 13.3 / 14.1 / 14.7 / 15.6 us at T 5-8).
-inline int gr_v3_pf_default(int major, int minor) { return sm120_default(major, minor) && !qwen_defaults_026() ? 133 : 0; }
+inline int gr_v3_pf_default(int major, int minor) { return sm12x_default(major, minor, kGb10GrV3Pf) && !qwen_defaults_026() ? 133 : 0; }
 
 /// STRATA_SMALL_UNR when unset: bit 0 the bf16 router read, bit 1 the GDN a/b projection (constant-trip loops).
-inline int small_unr_default(int major, int minor) { return sm120_default(major, minor) && !qwen_defaults_026() ? 3 : 0; }
+inline int small_unr_default(int major, int minor) { return sm12x_default(major, minor, kGb10SmallUnr) && !qwen_defaults_026() ? 3 : 0; }
 
 }  // namespace strata

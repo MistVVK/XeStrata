@@ -2,6 +2,7 @@
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/gfx12_platform_defaults.hpp"
 #include "strata/core/sm120_series.hpp"
+#include "strata/core/bw_dense_defaults.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/own_only_switches.hpp"
@@ -546,7 +547,15 @@ int main() {
         CHECK(!gr_up_wide_default(false, 12, 0, true));
         CHECK(!gr_up_wide_default(true, 12, 0));
         CHECK(!gr_up_wide_default(false, 8, 6));
-        CHECK(!gr_up_wide_default(false, 12, 1));
+        CHECK(gr_up_wide_default(false, 12, 1) == kGb10GrUpWide);          // GB10: the BW-7 constant (the 12.0 rule is the line above)
+        // BW-7: the 12.0 set on a GB10 (sm_121): per-switch constants, STRATA_SM121_PERF (unset here) and STRATA_DEFAULTS=026 turn them off; 12.0 and the rest unchanged
+        CHECK(sm12x_default_v(12, 0, false, false) && sm12x_default_v(12, 0, true, false));
+        CHECK(!sm12x_default_v(12, 1, false, false));
+        CHECK(sm12x_default_v(12, 1, true, false));
+        CHECK(!sm12x_default_v(12, 1, true, true));
+        CHECK(!sm12x_default_v(8, 6, true, false) && !sm12x_default_v(10, 0, true, false) && !sm12x_default_v(7, 5, true, false));
+        CHECK(small_unr_default(12, 0) == 3 && small_unr_default(12, 1) == (kGb10SmallUnr ? 3 : 0) && small_unr_default(8, 6) == 0);
+        CHECK(gr_v3_pf_default(12, 0) == 133 && gr_v3_pf_default(12, 1) == (kGb10GrV3Pf ? 133 : 0) && gr_v3_pf_default(8, 6) == 0);
         // #3453: the sm_89 MMVQ-IL tables: on by default for compute capability 8.9 only, off under 026 and in HIP; "1" and "0" win
         CHECK(mmvq_il_89_default(false, 89));
         CHECK(!mmvq_il_89_default(false, 86) && !mmvq_il_89_default(false, 80) && !mmvq_il_89_default(false, 90) &&
@@ -637,7 +646,9 @@ int main() {
         CHECK(!gr_v3_default(false, 8, 6, false, 15.7 * GiB));              // 2x RTX A4000 (sm_86): measured -3.0% / -5.9%
         CHECK(!gr_v3_default(false, 8, 6, false, 72.0 * GiB));              // any sm_86
         CHECK(!gr_v3_default(false, 8, 9, false, 24.0 * GiB));              // sm_89
-        CHECK(!gr_v3_default(false, 12, 1, false, 128.0 * GiB));            // sm_121 (DGX Spark class): not 12.0
+        CHECK(gr_v3_default(false, 12, 1, true, 128.0 * GiB) == kGb10GrV3);  // sm_121 (DGX Spark class, integrated): the BW-7 constant; never on without it
+        CHECK(!gr_v3_default(false, 12, 1, true, 128.0 * GiB, true));       // STRATA_DEFAULTS=026 turns it off there too
+        CHECK(!gr_v3_default(false, 12, 0, true, 128.0 * GiB));             // an integrated 12.0 part: still off (unchanged)
         CHECK(!gr_v3_default(false, 12, 0, true, 128.0 * GiB));             // integrated
         CHECK(!gr_v3_default(true, 12, 0, false, 32.0 * GiB));              // a HIP build: gfx1201 reports 12.0 too
         CHECK(!gr_v3_default(false, 6, 0, false, 16.0 * GiB));              // P100
