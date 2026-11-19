@@ -7594,6 +7594,30 @@ int main(int argc, char** argv) {
         if (pm_lookup) rows = std::max(rows, std::min<int>(o.spec, (int) strata::kernels::kVerifyNarrowT / gs));
         return rows;
     };
+    // STRATA_SLOT_READ_WIDE (opt-in, with STRATA_SLOT_READ; unset or =0: off): a slot that reads its conversation's next turn in its
+    // own windows, and is the only slot of its group that runs, takes the group's whole window - kVerifyNarrowT rows -
+    // while it has that many prompt tokens left: they are known, so its window need not stop at the rows a slot gets
+    // for its drafts.  A window costs mostly by the window, not by the row (2x RTX 3090, 178K-token conversations,
+    // read windows of 5 rows: 17.3 + 15.5 ms on the two stages), so the wider one reads more tokens a second.  For
+    // that every group's window - the verifiers' rows, the hand-off rows, the rows the commit replays - holds
+    // kVerifyNarrowT rows (pm_group_rows), and a slot's drafter catches up as many in one round (pm_drafter_rows).
+    const bool pm_read_wide = [] {
+        // (opt-in here: the PR had it on whenever STRATA_SLOT_READ was not "0", which would have widened every pipelined
+        // group's window - VRAM and graphs - for a run that never reads a turn in a slot)
+        const char* w = std::getenv("STRATA_SLOT_READ_WIDE");
+        const char* r = std::getenv("STRATA_SLOT_READ");
+        return w != nullptr && w[0] != '\0' && w[0] != '0' && r != nullptr && r[0] != '\0' && r[0] != '0';
+    }();
+    auto pm_group_rows = [&]() -> int {
+        const int gs = o.batch_groups > 1 && o.batch > 0 ? std::max(1, o.batch / o.batch_groups) : std::max(1, o.batch);
+        const int rows = gs * pm_slot_rows();
+        return pm_read_wide && o.batch_groups > 1 && rows < (int) strata::kernels::kVerifyNarrowT
+                   ? (int) strata::kernels::kVerifyNarrowT : rows;
+    };
+    auto pm_drafter_rows = [&]() -> int {
+        return piped_mtp && pm_read_wide && o.batch_groups > 1 ? std::max<int>(o.spec, strata::kernels::kVerifyNarrowT)
+                                                               : o.spec;
+    };
     // The verifiers' window: the solo path's drafts (--spec rows), the plain batch windows (the slots) and, with
     // STRATA_PIPED_MTP, a group's rows: its slots, each its token and its proposals ((slots) * (1 + proposals), one slot
     // per group = at most --spec rows).  A function, not a number: --batch (the slots that fit) and the groups are final
@@ -7604,7 +7628,7 @@ int main(int argc, char** argv) {
         if (batch_mtp && !piped_mtp) return (int) strata::kernels::kVerifyNarrowT;
         const int plain = std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT));
         const int group_rows = (piped_mtp && o.batch_groups > 1 && o.batch > 0)
-            ? std::min<int>(strata::kernels::kVerifyNarrowT, (o.batch / o.batch_groups) * pm_slot_rows()) : 0;
+            ? std::min<int>(strata::kernels::kVerifyNarrowT, pm_group_rows()) : 0;
         return std::max(plain, group_rows);
     };
     // The most slots, up to n, whose windows hold at most kVerifyMaxT rows each: n itself up to that, more only as
@@ -8033,7 +8057,7 @@ int main(int argc, char** argv) {
                 if (piped_mtp) d->set_force_capture(true);
                 // (mtp_first: the solo drafter is on the first stage's card, so slot b's is carved from its first-stage session)
                 strata::core::SessionState& slot_s = mtp_first ? *bslot_ss[0][(size_t) b] : *bslot_ss.back()[(size_t) b];
-                if (!d->load(o.mtp, draft_geometry, slot_s, o.spec, err, o.mtp_window, &mtp)) {
+                if (!d->load(o.mtp, draft_geometry, slot_s, pm_drafter_rows(), err, o.mtp_window, &mtp)) {
                     std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;
@@ -12658,8 +12682,9 @@ int main(int argc, char** argv) {
             // kVerifyNarrowT slots in groups the hand-off holds one row per slot (otherwise kVerifyNarrowT, as before; a
             // wide build holds more only for a batch of more than that: the buffer is not made larger for a run that
             // never forms a window of 9..16 rows)
-            // (STRATA_PIPED_MTP: per slot its token and its drafts, pm_slot_rows())
-            const int hrows = piped_mtp ? std::max<int>(strata::kernels::kVerifyNarrowT, pm_slot_rows() * o.batch)
+            // (STRATA_PIPED_MTP: per slot its token and its drafts, pm_slot_rows(); a group's rows, pm_group_rows(), are
+            // more than its slots' with STRATA_SLOT_READ_WIDE)
+            const int hrows = piped_mtp ? std::max<int>(strata::kernels::kVerifyNarrowT, pm_group_rows() * std::max(1, o.batch_groups))
                             : !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyNarrowT, o.batch)
                             : !batch_mtp ? std::max<int>(strata::kernels::kVerifyNarrowT,
                                                          std::min<int>(o.batch, strata::kernels::kVerifyMaxT))
@@ -12971,7 +12996,7 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on_slot_mtp(mtp.device());
             for (int b = 0; b < o.batch; ++b) {
                 float* r = nullptr;
-                const size_t bytes = (size_t) o.spec * (size_t) g.hc * (size_t) g.n_embd * sizeof(float);
+                const size_t bytes = (size_t) pm_drafter_rows() * (size_t) g.hc * (size_t) g.n_embd * sizeof(float);
                 if (cudaMalloc((void**) &r, bytes) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: batch MTP slot %d residual buffer does not fit%s\n",
                                  b, vram_free_note().c_str());
@@ -13000,7 +13025,7 @@ int main(int argc, char** argv) {
                 }
                 // STRATA_PIPED_MTP: the rows a group's commit replays after the verdict, one hand-off row each
                 if (piped_mtp && bslot_ss.size() > 1 &&
-                    !vk.init_deferred_commit(std::max<int>(strata::kernels::kVerifyNarrowT, pm_slot_rows() * o.batch), err)) {
+                    !vk.init_deferred_commit(std::max<int>(strata::kernels::kVerifyNarrowT, pm_group_rows() * std::max(1, o.batch_groups)), err)) {
                     std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP, stage %zu: %s\n", k + 1, err.c_str());
                     return 1;
                 }
@@ -15915,13 +15940,15 @@ int main(int argc, char** argv) {
             ConvCheckpoint::PromptPlan partial_plan;   ///< --prefill-pipe: the segment it stopped in, read on in its chunks
             // STRATA_SLOT_READ: the slot reads the next turn of its conversation in its own windows (rd_on, until the
             // reply's first token).  `rd`: the prompt tokens still to feed after `x` (from rd_at); w_rd: how many of them
-            // its window in flight holds behind `x`; rd_ck: the turn boundary whose checkpoint the read still takes (-1:
-            // none); rd_n, rd_t0, rd_ms: what it read, since when, and how long it took (BDONE's read=).
+            // its next window holds behind `x`, and w_rd_x: how many more it takes of the rows the group's other slots
+            // leave (STRATA_SLOT_READ_WIDE); rd_ck: the turn boundary whose checkpoint the read still takes (-1:
+            // none); rd_n, rd_w, rd_t0, rd_ms: what it read, in how many windows, since when, and how long it took
+            // (BDONE's read=).
             std::vector<int32_t> rd;
             size_t rd_at = 0;
             bool rd_on = false;
-            int w_rd = 0;
-            int64_t rd_ck = -1, rd_n = 0;
+            int w_rd = 0, w_rd_x = 0;
+            int64_t rd_ck = -1, rd_n = 0, rd_w = 0;
             bool rd_ck_due = false;        ///< its read is at rd_ck: the checkpoint is taken once nothing is in flight
             Clock::time_point rd_t0;
             double rd_ms = 0.0;
@@ -16600,8 +16627,10 @@ int main(int argc, char** argv) {
         // their commit replays
         const int pmtp_rows_per_slot = pm_slot_rows();             // the slot's token + its drafts
         const int pmtp_rows_per_group = GS * pmtp_rows_per_slot;    // the group's slots
+        // ... and the rows the group's window holds: more than its slots' drafts need with STRATA_SLOT_READ_WIDE
+        const int pmtp_group_cap = std::max(pmtp_rows_per_group, piped ? pm_group_rows() : 0);
         const bool pmtp = piped && piped_mtp && ver.deferred_commit_on() &&
-                          pmtp_rows_per_group <= batch_max_t();
+                          pmtp_group_cap <= batch_max_t();
         if (piped && batch_mtp && !pmtp)   // #1413: said, not silent
             std::fprintf(stderr,
                          "strata generate: WARNING: --batch-groups %d runs the pipelined path, which builds one row per slot: "
@@ -16621,10 +16650,13 @@ int main(int argc, char** argv) {
             const char* e = std::getenv("STRATA_SLOT_READ_MAX");
             return e != nullptr && e[0] != '\0' ? std::max<int64_t>(1, (int64_t) std::atoll(e)) : (int64_t) 1024;
         }();
+        const bool slot_read_wide = slot_read && pm_read_wide && pmtp_group_cap > pmtp_rows_per_slot;
         if (slot_read)
             std::fprintf(stderr, "strata generate: STRATA_SLOT_READ: an idle slot reads the next turn of the conversation it "
-                                 "holds in its own windows, %d tokens a window, beside the other slots (turns of up to %lld "
+                                 "holds in its own windows, %d tokens a window%s, beside the other slots (turns of up to %lld "
                                  "new tokens, where the server asks: slot_read=1)\n", pmtp_rows_per_slot,
+                         slot_read_wide ? (" and " + std::to_string(pmtp_group_cap) + " while it is the only slot of its group "
+                                           "that runs (STRATA_SLOT_READ_WIDE)").c_str() : "",
                          (long long) slot_read_max);
         if (GS > strata::kernels::kVerifyMaxT && !batch_mtp) {   // (slots_in_windows keeps it so: a group's window is
             // PGroup's rows, and the serial windows reach only the first kVerifyMaxT slots)
@@ -16732,10 +16764,16 @@ int main(int argc, char** argv) {
                 // (its row draws the reply's first token: the rows before it must not join its penalty window, #4590)
                 if (pmtp_poll_draft(b, false) < 0) return -1;   // (the catch-up behind its last window: collected, not used)
                 const int64_t left = (int64_t) sl.rd.size() - (int64_t) sl.rd_at;
-                int64_t f = std::min<int64_t>((int64_t) pmtp_rows_per_slot - 1, std::min<int64_t>(left, (int64_t) o.max_context - sl.p - 2));
-                if (sl.pen_n > 0) f = std::min<int64_t>(f, left - 1);
-                if (sl.rd_ck > sl.p) f = std::min<int64_t>(f, sl.rd_ck - sl.p - 1);
-                sl.w_rd = sl.stop ? 0 : (int) std::max<int64_t>(0, f);
+                // (cap: the rows a window may hold for this slot, `x` included)
+                auto rd_rows = [&](int cap) -> int {
+                    int64_t f = std::min<int64_t>((int64_t) cap - 1, std::min<int64_t>(left, (int64_t) o.max_context - sl.p - 2));
+                    if (sl.pen_n > 0) f = std::min<int64_t>(f, left - 1);
+                    if (sl.rd_ck > sl.p) f = std::min<int64_t>(f, sl.rd_ck - sl.p - 1);
+                    return (int) std::max<int64_t>(0, f);
+                };
+                sl.w_rd = sl.stop ? 0 : rd_rows(pmtp_rows_per_slot);
+                // STRATA_SLOT_READ_WIDE: what it adds where the group's other slots leave rows (the launch gives them out)
+                sl.w_rd_x = sl.stop || !slot_read_wide ? 0 : rd_rows(pmtp_group_cap) - sl.w_rd;
                 sl.w_lk = false;
                 sl.w_n = 0;
                 return 1;
@@ -16919,6 +16957,7 @@ int main(int argc, char** argv) {
                     sl.p += blk.keep;
                     sl.rd_at += (size_t) (blk.keep - 1);
                     bt_rd_rows += blk.keep;
+                    ++sl.rd_w;
                     if (sl.rd_ck >= 0 && sl.p == sl.rd_ck) {   // (taken by pump once the pipeline is empty: see there)
                         sl.rd_ck_due = true;
                         ++rd_ck_pending;
@@ -16941,8 +16980,9 @@ int main(int argc, char** argv) {
                     sl.rd_ms = std::max(0.1, std::chrono::duration<double, std::milli>(now - sl.rd_t0).count());
                     ++bt_rd_turns;
                     std::fprintf(stderr, "strata batch: slot %d read the %lld new tokens of its conversation's turn in its own "
-                                         "windows in %.0f ms (%.1f tok/s); it holds %zu\n", blk.b, (long long) sl.rd_n,
-                                 sl.rd_ms, 1000.0 * (double) sl.rd_n / sl.rd_ms, sl.ids.size());
+                                         "windows in %.0f ms (%.1f tok/s, %lld windows); it holds %zu\n", blk.b,
+                                 (long long) sl.rd_n, sl.rd_ms, 1000.0 * (double) sl.rd_n / sl.rd_ms, (long long) sl.rd_w,
+                                 sl.ids.size());
                     sl.t0 = now;   // (BDONE's time is the reply's, as after an admission)
                     sl.t_round = now;
                     sl.caps = strata::core::Verifier::graphs_made();
@@ -17183,9 +17223,25 @@ int main(int argc, char** argv) {
                     PGroup& G = pg[(size_t) pick];
                     G.S = 0;
                     if (pmtp) {   // the group's slots: each its token, then its own proposals - as many as could be emitted
-                        G.hbase = pmtp_rows_per_group * pick;
+                        G.hbase = pmtp_group_cap * pick;
                         G.S = 0;
                         G.active = 0;
+                        // STRATA_SLOT_READ_WIDE: the one slot of the group that runs, reading its turn with a whole
+                        // window's worth still to read, takes the whole window.  Only the whole one: every layout of
+                        // rows is a set of graphs on each stage (20-30 MiB of VRAM), so a read adds one layout a slot
+                        // to the ones its drafts already use, not one for every size in between.
+                        int wide_b = -1;
+                        if (slot_read_wide) {
+                            int n_active = 0, last = -1;
+                            for (int t = 0; t < GS; ++t)
+                                if (bs[(size_t) (pick * GS + t)].active) {
+                                    ++n_active;
+                                    last = pick * GS + t;
+                                }
+                            if (n_active == 1 && bs[(size_t) last].rd_on &&
+                                1 + bs[(size_t) last].w_rd + bs[(size_t) last].w_rd_x == pmtp_group_cap)
+                                wide_b = last;
+                        }
                         for (int t = 0; t < GS; ++t) {
                             const int b = pick * GS + t;
                             const BSlot& sl = bs[(size_t) b];
@@ -17196,7 +17252,8 @@ int main(int argc, char** argv) {
                             G.pos[G.S] = sl.p;
                             ++G.S;
                             if (sl.rd_on) {   // STRATA_SLOT_READ: the next prompt tokens of its turn, as pmtp_plan counted
-                                for (int j = 0; j < sl.w_rd; ++j) {
+                                const int n_rd = sl.w_rd + (b == wide_b ? sl.w_rd_x : 0);
+                                for (int j = 0; j < n_rd; ++j) {
                                     G.rows[G.S] = b;
                                     G.tok[G.S] = sl.rd[sl.rd_at + (size_t) j];
                                     G.pos[G.S] = sl.p + 1 + j;
