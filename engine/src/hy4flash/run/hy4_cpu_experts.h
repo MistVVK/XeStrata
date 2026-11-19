@@ -65,6 +65,12 @@ public:
     // Kernel: AVX-512 VBMI/VNNI "fast" kernel when compiled for it (-march=native on Ice Lake / Zen 4 or newer) and all resident
     // experts are S2..S6, else the library gemm_sk_q8_1 kernel. STRATA_CPUEXP_KERNEL=lib forces the library kernel.
     bool fast_kernel() const;
+    // Activation precision. Default "q8": z and h2 are quantized to one Q8_1_G64 term (rel-L2 about 1.4e-2 of the expert output vs
+    // exact fp32 activations). "hi" (env STRATA_CPUEXP_ACT=hi at init, or set_hi_activations(true) between jobs): two terms
+    // x = da*qa + db*qb with qb = Q8_1 of the residual, two dpbusd passes over the same unpacked weights, summed in fp32.
+    // set_hi_activations waits for a running job first.
+    void set_hi_activations(bool on);
+    bool hi_activations() const;
     // Self test of the fast row kernel with random S2..S6 weights vs dequant_sk_row; returns false on a mismatch.
     static bool selftest_kernels(std::string& report);
 
