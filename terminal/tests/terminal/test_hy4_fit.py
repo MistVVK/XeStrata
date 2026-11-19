@@ -115,7 +115,6 @@ class Defaults0218(unittest.TestCase):
         r = F.compute("SQ-64", 12, 64, 131072, True)
         self.assertEqual((r["vram_gb"], r["ram_gb"], r["ssd_gb"]), (1.25, 54.79, 0.0))      # the card keeps the core weights, the 128K cache and 1.2 GB of hot experts; RAM the rest
         self.assertEqual(F.recommend(12, 64, False, 131072, True)["build"], "SQ-64")
-        self.assertTrue(F.context_fits("SQ-64", 12, 131072))
 
     def test_the_images_cost_the_ram_only(self):
         with_images = F.compute("SQ-64", 12, 64, 131072, True)
@@ -127,15 +126,17 @@ class Defaults0218(unittest.TestCase):
         self.assertEqual(F.DRAFTER_GB, 0.44)
         self.assertGreater(F.BUILDS["SQ-32"]["dense_gb"], F.DRAFTER_GB)      # it is part of every build's dense weights (Section 1)
 
-    def test_a_card_that_cannot_hold_the_cache_gets_a_smaller_context_recommended(self):
-        self.assertFalse(F.context_fits("SQ-64", 8, 131072))                 # 5.8 + 5.84 GB against 8.6 GB
-        self.assertTrue(F.context_fits("SQ-64", 8, 32768))
-        self.assertEqual(F.recommend_context("SQ-64", 8), 32768)
-        self.assertEqual(F.recommend_context("SQ-64", 12), 131072)
-        self.assertEqual(F.recommend_context("SQ-64", 24), 131072)
-        self.assertEqual(F.recommend_context("SQ-64", 4), 8192)              # never below the smallest: a recommendation, not a refusal
-        self.assertEqual(F.recommend_context("SQ-64", None, unified=True), 131072)
-        self.assertEqual(F.recommend_context("SQ-64", 12, want=65536), 65536)
+    def test_an_8_gib_card_is_planned_at_128k_like_every_other(self):
+        # owner, 2026-11-19: 128K is the default on every card and people change it themselves: no smaller context is recommended and nothing warns.
+        # The planner still places the experts: the core weights (5.8 GB) and the 128K cache and workspace (5.84 GB) do not fit 8.6 GB, so no expert sits in the card.
+        self.assertFalse(hasattr(F, "recommend_context"))
+        self.assertFalse(hasattr(F, "context_fits"))
+        r = F.compute("SQ-64", 8, 64, 131072, True)
+        self.assertEqual(r["vram_gb"], 0.0)
+        self.assertEqual(r["ssd_gb"], 0.0)                                    # 64 GiB of RAM still holds every expert body
+        self.assertAlmostEqual(r["ram_gb"], F.BUILDS["SQ-64"]["bodies_gb"], delta=0.01)
+        self.assertEqual(F.recommend(8, 64, False, 131072, True)["build"], "SQ-64")
+        self.assertGreater(F.compute("SQ-64", 8, 64, 20480, True)["vram_gb"], 0.0)       # at the author's 20K the card did keep some
 
     def test_unified_memory_pays_the_cache_and_the_images_from_its_pool(self):
         strix = 107.87                                                        # what the GPU maps on Strix Halo (HY4-STRIX)

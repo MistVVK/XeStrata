@@ -669,7 +669,7 @@ class Strata:
             vram_gib, ram_gib, unified = max((float(g["vram_gb"]) for g in usable), default=0.0), float(ram), False
         placed = hy4_fit.place(build, vram_gib, ram_gib, unified, None, vision)
         return {"placement": placed, "mode": hy4_fit.mode(placed["ssd_gb"]), "recommended": hy4_fit.recommend(vram_gib, ram_gib, unified, None, vision)["build"] == build,
-                "unified": unified, "engram_gb": hy4_fit.ENGRAM_GB, "context": hy4_fit.recommend_context(build, vram_gib, unified), "kv_gb": round(hy4_fit.kv_extra_gb(), 2)}
+                "unified": unified, "engram_gb": hy4_fit.ENGRAM_GB, "context": hy4_fit.DEFAULT_CONTEXT, "kv_gb": round(hy4_fit.kv_extra_gb(), 2)}
 
     def hy4_size(self, family, model) -> dict | None:
         """One build of Hy4-Flash as a model-table row: the download is the build plus the Engram shard every build shares; the memory figures are the author's (hy4_fit)."""

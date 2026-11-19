@@ -9810,19 +9810,15 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
     model = a.model or order[int(ask("Which size?", [str(i) for i in range(1, len(order) + 1)], str(order.index(rec["build"]) + 1), a.yes)) - 1]
     ok(f"size: {model}")
     tag = fam["tag"] + model
-    rec_ctx = hy4_fit.recommend_context(model, vram_gib, unified, want_ctx)     # 128K, or the largest the card's memory holds the cache of
-    ctx = a.context or rec_ctx
+    ctx = a.context or hy4_family.DEFAULT_CONTEXT       # 128K on every card (owner, 2026-11-19: "people can change whenever they want themselves"); no card-size special case
     if not a.context:
         ctxs = hy4_family.CONTEXTS
         say()
-        say(f"  Context length = how much text the model can see at once (128K by default; its cache takes about {hy4_fit.kv_extra_gb(131072) + 1.0:.0f} GB of memory at 128K).")
+        say("  Context length = how much text the model can see at once (128K by default; a longer context takes more memory for its cache).")
         for i, c in enumerate(ctxs, 1):
-            say(f"  {i}) {c // 1024}K tokens" + ("   (recommended)" if c == rec_ctx else ""))
-        ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(rec_ctx) + 1), a.yes)) - 1]
-    if not hy4_fit.context_fits(model, vram_gib, ctx, unified):
-        warn(f"{ctx // 1024}K tokens of context does not fit this card's memory next to the model's core weights ({hy4_fit.recommend_context(model, vram_gib, unified, ctx) // 1024}K does): "
-             "it may not start; choose a smaller context")
-    placed = hy4_fit.place(model, vram_gib, ram_gib, unified, ctx, vision)
+            say(f"  {i}) {c // 1024}K tokens" + ("   (recommended)" if c == hy4_family.DEFAULT_CONTEXT else ""))
+        ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(hy4_family.DEFAULT_CONTEXT) + 1), a.yes)) - 1]
+    placed =hy4_fit.place(model, vram_gib, ram_gib, unified, ctx, vision)
     mode = hy4_fit.mode(placed["ssd_gb"])
     if mode == "cross_tier_ssd":
         warn(f"{model} does not fit this PC's memory: about {placed['ssd_gb']:.0f} GB of its experts are read from the SSD while it answers, so it is much slower "

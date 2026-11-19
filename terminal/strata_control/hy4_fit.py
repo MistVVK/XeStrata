@@ -19,6 +19,10 @@ tests/terminal/test_hy4_squant_fit.py, plus what the 0.2.18 defaults add (owner,
                                                                     same kind of total on Metal (SQ-64, on top of the mapped 62 GB file): 1.6 GB at 4K, 4.4 GB at 32K, 6.6 GB at 128K (+5.0 GB); Strix is +4.4 GB; this is +3.84 GB
                                                                     beyond the author's 20K, the same range (to be checked against the CUDA lane's RTX 5070 numbers at 128K)
 
+The placement is planned at the chosen context on every card, 8 GB ones included (owner, 2026-11-19: 128K is the default everywhere and people change it themselves): when the
+cache and workspace leave no room for experts in video memory (`gpu_room` is 0) they all go to RAM, and where even the core weights plus the cache do not fit the card, keeping some
+of the cache in host memory is the engine's job, not this planner's.
+
 Unified memory (Strata Halo, Apple silicon, DGX Spark) has one pool: the trunk, the KV and every expert body live in it and nothing is copied or read from the SSD while the
 footprint fits `pool - UMA_RESERVE_GB - kv_extra - vision`.
 
@@ -108,23 +112,6 @@ def mode(ssd_gb: float) -> str:
 def fits(build: str, vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None, vision: bool = False) -> bool:
     """Every expert body stays in memory (nothing read from the SSD while it answers)."""
     return mode(place(build, vram_gib, ram_gib, unified, ctx, vision)["ssd_gb"]) == "ram_vram_zero_ssd"
-
-
-def context_fits(build: str, vram_gib: float | None, ctx: int | None = None, unified: bool = False) -> bool:
-    """The card holds the trunk, the drafter, the driver, the buffers and the KV of `ctx` tokens (the experts that do not fit go to RAM, so they do not count here).  A unified
-    pool always says yes (the placement then says how much is read from the SSD)."""
-    if unified or vram_gib is None:
-        return True
-    return BUILDS[build]["dense_gb"] + non_expert_gb(ctx) <= float(vram_gib) * GIB_TO_GB
-
-
-def recommend_context(build: str, vram_gib: float | None, unified: bool = False, want: int | None = None) -> int:
-    """The context to start with: `want` (default 128K) when the card holds its KV, else the largest of CONTEXTS that it holds (never below the smallest)."""
-    top = DEFAULT_CONTEXT if want is None else int(want)
-    for c in sorted((x for x in CONTEXTS if x <= top), reverse=True) or [CONTEXTS[0]]:
-        if context_fits(build, vram_gib, c, unified):
-            return c
-    return CONTEXTS[0]
 
 
 def recommend(vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None, vision: bool = False) -> dict:

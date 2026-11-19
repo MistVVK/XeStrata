@@ -250,17 +250,20 @@ class Defaults0218(unittest.TestCase):
         self.assertNotIn("--vision", cfg["args"])
         self.assertTrue(any(l.startswith("images: off") for l in lines), lines)
 
-    def test_an_8_gib_card_is_offered_the_context_it_holds(self):
-        cfg, lines, _ = self.install(vram=8.0)                                            # no --context: the largest the card holds the cache of (never forced up to 128K)
+    def test_128k_is_the_default_on_every_card_with_no_smaller_context_and_no_warning(self):
+        # owner, 2026-11-19: "Keep 128K as default, people can change whenever they want themselves": an 8 GiB card gets 128K like a 24 GiB one
+        for vram in (8.0, 12.0, 24.0):
+            cfg, lines, _ = self.install(vram=vram)
+            self.assertEqual(cfg["args"][cfg["args"].index("--max-context") + 1], "131072", vram)
+            self.assertFalse(any("does not fit this card" in l or "choose a smaller context" in l for l in lines), (vram, lines))
+        cfg, lines, _ = self.install(vram=8.0, context=32768)                             # what the person chooses is what runs
         self.assertEqual(cfg["args"][cfg["args"].index("--max-context") + 1], "32768")
-        self.assertFalse(any("does not fit this card" in l for l in lines))
 
-    def test_a_context_that_does_not_fit_the_card_is_said_and_kept(self):
-        cfg, lines, _ = self.install(vram=8.0, context=131072)                           # the person asked for 128K on an 8 GiB card: recommend, never force
-        self.assertEqual(cfg["args"][cfg["args"].index("--max-context") + 1], "131072")
-        self.assertTrue(any("does not fit this card" in l and "32K does" in l for l in lines), lines)
-        cfg, lines, _ = self.install(context=131072)                                      # a 12 GiB card holds it: no warning
-        self.assertFalse(any("does not fit this card" in l for l in lines))
+    def test_the_planned_placement_on_an_8_gib_card_is_written_at_128k(self):
+        cfg, _lines, _ = self.install(vram=8.0)                                          # the engine lanes deal with a cache that does not fit the card
+        args = cfg["args"]
+        self.assertEqual(args[args.index("--vram-experts-gb") + 1], "0.00")
+        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "56.04")
 
 
 class Catalog(unittest.TestCase):
