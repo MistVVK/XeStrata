@@ -1824,9 +1824,9 @@ class OutputParser:
         self._line_blocks = None
 
     def _track(self, text: str) -> str:
-        """Follow the reasoning text that has gone out: the open code fence, the current line, and the backticks of
-        the current paragraph.  Returns the text."""
-        # Most token fragments stay on the current line. Fence and paragraph
+        """Follow the reasoning text that has gone out: the open code fence, the current line and the inline-code
+        parity of the paragraph.  Returns the text."""
+        # Most token fragments stay on the current line. Fence and line
         # bookkeeping happens only when a newline completes that line.
         if "\n" not in text:
             if text:
@@ -1858,7 +1858,16 @@ class OutputParser:
                 elif not s:
                     self.ticks = 0
                 else:
+                    # #4923: an unmatched backtick followed by prose on its line ("Let me use `run_commands to
+                    # check.") is a stray marker, not the opening of a code span that goes on into the next line
+                    # and hides every later call.  A span does go on from a backtick at the end of its line ("Use `"
+                    # and the example on the next line) or one immediately followed by a tag ("Use `<tool_call>`"),
+                    # the two shapes #804/#1058 keep as text.
                     self.ticks += line.count("`")
+                    if self.ticks % 2 == 1:
+                        after = line[line.rfind("`") + 1:].strip()
+                        if after and not after.startswith("<"):
+                            self.ticks -= 1
                 # #4703: an indented (4 spaces or a tab) code block starts after a blank line and goes on until a line that is not indented
                 if was_fenced or self.fence:
                     self._prev_blank = self._indented = False
@@ -1876,7 +1885,7 @@ class OutputParser:
 
     def _opener_ok(self) -> bool:
         """The reasoning text so far puts a `<tool_call>` at the start of a line, outside a code fence and outside
-        inline code."""
+        inline code (`_in_code`)."""
         return not self.fence and not self.line.strip() and self.ticks % 2 == 0 and not self._in_indented_block()
 
     def _in_indented_block(self) -> bool:

@@ -25,7 +25,11 @@ class ReferenceParser(OutputParser):
                 elif not s:
                     self.ticks = 0
                 else:
-                    self.ticks += line.count("`")
+                    self.ticks += line.count("`")      # #4923: a stray opener followed by prose is not carried on
+                    if self.ticks % 2 == 1:
+                        after = line[line.rfind("`") + 1:].strip()
+                        if after and not after.startswith("<"):
+                            self.ticks -= 1
                 if was_fenced or self.fence:                                       # #4703: indented code blocks
                     self._prev_blank = self._indented = False
                 elif not s:
