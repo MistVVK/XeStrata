@@ -356,6 +356,27 @@ class ParallelServiceYield(tp.FakeEngineCase):
         self.assertEqual(t["cache_n"], 3, t)                          # the first read's reuse only
         self.assertGreater(t["predicted_ms"], 60.0, t)
 
+    def test_a_continued_leg_shows_the_requests_own_clocks(self):
+        """A request that decoded on the solo path and went on in a slot: the slot's live view shows the request's
+        elapsed time and its mean rate since its first token.  Each admission started both clocks again while the
+        tokens counted the reply so far, so a request continued in a slot showed a rate several times too high."""
+        self.start(2, slot_cache=True)
+        e, rows = self.engine, []
+        long = threading.Thread(target=lambda: self.chat("LONGREPLY please", max_tokens=200))
+        long.start()
+        time.sleep(0.35)                                   # some solo tokens first
+        short = threading.Thread(target=lambda: self.chat("short", max_tokens=200))
+        short.start()
+        while short.is_alive():                            # the long one's row: more than the short reply's 10 tokens
+            rows += [r for r in e.slots_view() if r["state"] == "decoding" and r["generated"] > 10]
+            time.sleep(0.005)
+        long.join(30)
+        kinds = [x.split()[0] for x in self.log.read_text().splitlines()]
+        self.assertEqual(kinds[:2], ["GEN", "BGEN"], kinds)           # solo, then continued in a slot
+        self.assertTrue(rows)
+        self.assertGreaterEqual(min(r["elapsed_s"] for r in rows), 0.3, rows)   # since the request began
+        self.assertLess(max(r["tok_s"] for r in rows), 1.5 / 0.02, rows)       # the fake engine: a token per 0.02 s
+
     def test_a_leaked_busy_slot_does_not_hang_the_next_request(self):
         """#1603: a slot whose busy flag has no owner (no request holds it, no BDONE wait is running) kept every later
         request waiting for a slot nothing would free: running 0, queued 0, and the frozen-engine check never looked.
