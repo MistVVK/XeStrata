@@ -505,6 +505,12 @@ if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU
   target_link_libraries(mmvq_bench PRIVATE strata_kernels)
   add_executable(dflash2_ring_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/dflash2_ring_test.cpp)   # DF2-SYCL: the ring log: rebuilt K/V rows are the original ones
   target_link_libraries(dflash2_ring_test PRIVATE strata_engine strata_prefill strata_spec)
+  add_executable(dflash2_head_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/dflash2_head_test.cpp)   # #5286: the draft head of a planar Q6_K output head (needs one SYCL GPU, no model)
+  target_link_libraries(dflash2_head_test PRIVATE strata_engine strata_prefill strata_spec)
+  add_test(NAME dflash2_head_test COMMAND dflash2_head_test)
+  set_tests_properties(dflash2_head_test PROPERTIES SKIP_RETURN_CODE 77)
+  add_test(NAME dflash2_head_test_legacy COMMAND dflash2_head_test --legacy)   # the GGUF-row gather of a planar head (before #5286): must fail
+  set_tests_properties(dflash2_head_test_legacy PROPERTIES WILL_FAIL TRUE)
   add_executable(short_cache_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/short_cache_test.cpp)   # the sizing of a start short of VRAM (CPU, no model)
   target_include_directories(short_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME short_cache_test COMMAND short_cache_test)

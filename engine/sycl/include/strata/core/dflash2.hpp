@@ -40,6 +40,10 @@ public:
     bool bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err);
     using EmbedFn = std::function<void(const int32_t* tokens_dev, int n, float* out, sycl::queue*)>;
     bool bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err);
+    /// #5286: the draft vocabulary's rows of the target head, as a new device allocation (the caller frees it with sycl::free, after native_q6_k_unpack).  A Q6_K head
+    /// that STRATA_Q6_PLANAR stores as planes is gathered from the planes and stays planar (a GGUF-row gather of it gave a garbage head: 0 of every draft accepted);
+    /// any other head is gathered as rows.  Null with `err` set when the draft head does not fit.  `ids_dev` holds the `n` row numbers (device memory).
+    static uint8_t* gather_draft_head(const void* head_w, int head_type, int64_t row_bytes, const int32_t* ids_dev, int64_t n, sycl::queue* cs, std::string& err);
 
     /// A new request: the ring is empty again.
     void reset();
