@@ -12,6 +12,7 @@
 #include "strata/prefill/plain_floor_rule.hpp"
 #include "strata/prefill/share_own_rule.hpp"
 #include "strata/prefill/fp16_rows_rule.hpp"
+#include "strata/prefill/dense_mmq_notice.hpp"
 #include "strata/prefill/own_only_line.hpp"
 #include "strata/prefill/own_only_switches.hpp"
 #include "strata/prefill/stream_floor_rule.hpp"
@@ -2060,6 +2061,14 @@ const MmqPlan& mmq_plan() {
                 g_own_line.plan(layers, big, small, peer_off);
             }
             own_only_line_flush();
+            {   // #6269: a STRATA_DENSE_MMQ left on in a config does nothing here (no MMQ kernels): said once, not left to be tuned
+                static const bool dense_mmq_said = [] {
+                    const std::string t = strata::prefill::dense_mmq_notice(std::getenv("STRATA_DENSE_MMQ"));
+                    if (!t.empty()) std::fprintf(stderr, "%s\n", t.c_str());
+                    return true;
+                }();
+                (void) dense_mmq_said;
+            }
             std::string sw;
             for (const std::string& k : own_only_switches()) sw += (sw.empty() ? "" : " ") + k;
             if (mf) strata::core::manifest::instance().path("prefill", "own-only-build", true,

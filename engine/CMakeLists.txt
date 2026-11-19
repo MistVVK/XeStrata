@@ -467,6 +467,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(own_only_line_test PRIVATE include)
   add_test(NAME own_only_line_test COMMAND own_only_line_test)
 
+  # #6269: the start-up line for a STRATA_DENSE_MMQ that is set on in an engine without MMQ (header-only, no GPU)
+  add_executable(dense_mmq_notice_test tests/prefill/dense_mmq_notice_test.cpp)
+  target_include_directories(dense_mmq_notice_test PRIVATE include)
+  add_test(NAME dense_mmq_notice_test COMMAND dense_mmq_notice_test)
+
   # the opt-in fused-kernel switches a build without MMQ turns on by default, per backend (header-only, no GPU)
   add_executable(own_only_switches_test tests/prefill/own_only_switches_test.cpp)
   target_include_directories(own_only_switches_test PRIVATE include)
