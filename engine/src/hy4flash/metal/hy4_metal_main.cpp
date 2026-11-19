@@ -27,6 +27,7 @@
 
 #include "hy4_engram.h"
 #include "hy4_manifest.h"
+#include "hy4_metal_vision.h"  // HY4-VISION hook: ViT + image rows + 3D rope (the hooks below are no-ops while Runner::vis is null)
 #include "mtl_rt.h"
 #include "strata/artifact/strata_reader.hpp"
 
@@ -210,6 +211,7 @@ public:
     int ep_next = 0;
     EPrep* cur_ep = nullptr;
     double t_engram_wait = 0;
+    hy4::VisionCtxM* vis = nullptr;  // HY4-VISION hook: the pictures of the running request; null for a text-only request
 
     Runner(Model& gm, mtl::Context& cx_, int max_ctx_, int max_chunk) : g(gm), c(gm.man.c), cx(cx_), max_ctx(max_ctx_), Tc(max_chunk) {}
 
@@ -450,6 +452,7 @@ public:
         std::vector<uint64_t> ids((size_t) T * 16);
         for (int mo = 0; mo < 4; ++mo) {
             engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), (uint8_t*) e->valid[mo].ptr);
+            if (vis) vis->mask_engram((uint8_t*) e->valid[mo].ptr, p0, T);  // HY4-VISION hook: no Engram contribution at image positions
             if (!eio.fetch_raw(ids.data(), ids.size(), (uint8_t*) e->raw[mo].ptr, err)) {
                 e->ok = false;
                 e->err = err;
@@ -544,11 +547,13 @@ public:
         int g_lo = p0 / 4, g_hi = (p0 + T) / 4 - 1;
         if (g_hi >= g_lo)
             add("idx_pool", g_hi - g_lo + 1, 1, 128, {B(ivg[il]), g.tw(p + ".intra_group_ape"), g.tw(p + ".key_norm.weight"), B(pooled[il]), I(g_lo), Fl((float) theta(il)), Fl(c.rms_eps)});
+        if (vis && g_hi >= g_lo && vis->needs_fix(p0, T)) vis->pool_fix(ds, pooled[il], g_lo, g_hi - g_lo + 1, (float) theta(il));  // HY4-VISION hook
     }
     void idx_select(int il, int p0, int T) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".query_projection.weight", qr_h, iq_f, T);
-        add("idx_q_rope", T, 16, 128, {B(iq_f), B(iq_h), I(p0), Fl((float) theta(il))});
+        if (vis && vis->needs_fix(p0, T)) vis->iq_rope(ds, iq_f, iq_h, T, p0, (float) theta(il));  // HY4-VISION hook: 3D positions
+        else add("idx_q_rope", T, 16, 128, {B(iq_f), B(iq_h), I(p0), Fl((float) theta(il))});
         lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
         int G = (p0 + T) / 4;
         if (G < 1) G = 1;
@@ -595,6 +600,10 @@ public:
         const int TT = T <= 8 ? 1 : 8;
         add(TT == 1 ? "mla_prep_q_1" : "mla_prep_q_8", NH, (T + TT - 1) / TT, 256, {B(F2), B(wk_b, wk_off[il]), B(qa_h), I(T), I(NH), I(p0), Fl((float) theta(il))});
         op("mla_prep");
+        if (vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
+            vis->fix_k(ds, F4, kcache[il], T, p0, swa ? ring : 0, (float) theta(il));
+            vis->fix_q(ds, F2, qa_h, T, NH, p0, (float) theta(il));
+        }
         bool use_list = false;
         if (!swa && index_on) {
             idx_update(il, p0, T);
@@ -743,6 +752,7 @@ public:
         allow_nb = relax_ok && !(mpp_ok && T >= std::min(mpp_min, moe_mm_min));
         if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
         add("embed_hc", T, 1, 256, {g.tw("model.embed_tokens.weight"), B(d_ids), B(x), I(T)});
+        if (vis) vis->embed(ds, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
         for (int il = 0; il < n_run; ++il) {
             int mo = -1;
             for (int j = 0; j < 4; ++j)
@@ -878,6 +888,8 @@ int main(int argc, char** argv) {
     bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false;
     bool serve = false, session_reuse = false;
     std::string vision;
+    std::vector<std::string> image_files;
+    int64_t image_max_pixels = 4194304;
     std::string draft = "auto";  // auto: DFly2 when the file carries the drafter and --gen > 0; off / dfly2 force
     SpecCfg scfg;
     for (int i = 1; i < argc; ++i) {
@@ -937,6 +949,8 @@ int main(int argc, char** argv) {
         else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
         else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
         else if (a == "--vision") vision = nxt();
+        else if (a == "--image") image_files.push_back(nxt());  // HY4-VISION (offline runs): one picture file per image-pad token of --tokens, in order
+        else if (a == "--image-max-pixels") image_max_pixels = atoll(nxt().c_str());
         else if (a == "--kv" || a == "--gpu" || a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by the Metal runner\n", a.c_str(), nxt().c_str());
         else {
             printf("ERR unknown flag %s\n", a.c_str());
@@ -970,6 +984,7 @@ int main(int argc, char** argv) {
         so.model = model;
         so.engram = engram;
         so.vision = vision;
+        so.image_max_pixels = image_max_pixels;
         so.max_ctx = max_ctx > 0 ? max_ctx : 131072;
         so.chunk = chunk;
         so.index_topk = index_topk;
@@ -1001,6 +1016,25 @@ int main(int argc, char** argv) {
         std::ifstream f(tok_path);
         long v;
         while (f >> v) tok.push_back((int32_t) v);
+    }
+    // HY4-VISION: decode + resize the pictures and expand each image-pad token of the prompt to the picture's run of pads (CPU only; the ViT runs after the runner is up)
+    std::vector<hy4::ImageRec> recs;
+    if (!image_files.empty()) {
+        std::string ierr;
+        std::vector<int32_t> ex;
+        for (const std::string& f : image_files) {
+            hy4::ImageRec rc;
+            if (!hy4::prepare_picture(f, hy4::VitCfg().min_pixels, image_max_pixels, rc, ierr)) {
+                fprintf(stderr, "image: %s\n", ierr.c_str());
+                return 1;
+            }
+            recs.push_back(std::move(rc));
+        }
+        if (vision.empty() || !hy4::expand_image_pads(tok, hy4::VitCfg().image_token, recs, ex, ierr)) {
+            fprintf(stderr, "image: %s\n", vision.empty() ? "--vision FILE is required with --image" : ierr.c_str());
+            return 1;
+        }
+        tok.swap(ex);
     }
     int T0 = (int) tok.size();
     if (T0 == 0) {
@@ -1045,7 +1079,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "--draft %s: expected off, dfly2 or auto\n", draft.c_str());
         return 2;
     }
-    const bool spec_mode = (gen > 0 || bench_m > 0) && draft != "off" && has_df && r.Tc >= 16 && !all_logits;
+    const bool spec_mode = (gen > 0 || bench_m > 0) && draft != "off" && has_df && r.Tc >= 16 && !all_logits && recs.empty();  // a picture request decodes plainly (the drafter positions are token indices, the picture rows use 3D positions)
     if (draft == "dfly2" && !spec_mode && gen > 0) fprintf(stderr, "[spec] --draft dfly2 requested but not possible (no drafter in the file, chunk < 16, or --all-logits)\n");
     if (!r.init(no_engram ? std::string() : engram, std::max(all_logits ? r.Tc : 1, spec_mode ? 8 : 1), err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
@@ -1058,6 +1092,17 @@ int main(int argc, char** argv) {
     }
     fprintf(stderr, "[info] drafter=%s\n", spec_mode ? "dfly2" : (has_df ? "dfly2(off)" : "none"));
     tok.reserve(max_ctx + 8);
+    // HY4-VISION: encode the pictures of an offline run now (the runner hooks do the rest); the Vision shard is mapped for the encode only
+    hy4::VitMetal venc;
+    hy4::VisionCtxM vctx;
+    if (!recs.empty()) {
+        if (!venc.load(cx, vision, kernels.substr(0, kernels.rfind('/') + 1), err) || !vctx.setup(venc, cx, tok, recs, err)) {
+            fprintf(stderr, "images: %s\n", err.c_str());
+            return 1;
+        }
+        fprintf(stderr, "[vision] %zu picture(s), %d image rows, encoded in %.2f s\n", recs.size(), vctx.n_rows, vctx.t_encode);
+        r.vis = &vctx;
+    }
     int last_p0 = 0, last_T = 0;
     std::string top_out;
     double t0 = now_s();
