@@ -550,12 +550,15 @@ def detect_backend(environ=None) -> tuple[str | None, str]:
     probes = (("cuda", ("nvidia-smi", "--query-gpu=name", "--format=csv,noheader")),
               ("hip", ("rocminfo",) if os.name != "nt" else ("hipInfo",)),
               ("sycl", ("sycl-ls",)))
-    vendors_here = {a.get("vendor") for a in adapters}
     vendor_of = {"cuda": "10de", "hip": "1002", "sycl": "8086"}
+    # only a card of a make Strata has an engine for can say "this PC has no card of that make". A virtual adapter (Microsoft's
+    # Virtual Render Driver, vendor 1414, in a Hyper-V GPU-PV guest, #4718) names no make, so it must not hide the NVIDIA card
+    # that nvidia-smi still reports inside the guest.
+    vendors_here = {a.get("vendor") for a in adapters} & set(vendor_of.values())
     for backend, command in probes:
         if vendors_here and vendor_of[backend] not in vendors_here:
             continue                                  # the adapters list no card of this make: a tool that answers is a leftover
-        tool = shutil.which(command[0])
+        tool = nvidia_smi_path() if command[0] == "nvidia-smi" else shutil.which(command[0])
         if not tool:
             continue
         try:
@@ -941,8 +944,29 @@ def _smi_query(field_name: str) -> list[str]:
     return list(found)
 
 
-def _smi_query_now(field_name: str) -> list[str]:
+def _driver_store_smi(base: str | None = None) -> str | None:
+    """#4718: in a Hyper-V GPU-PV guest the NVIDIA driver is copied from the host into C:\\Windows\\System32\\HostDriverStore\\FileRepository\\nv*\\ and
+    nothing puts that folder on PATH, so `nvidia-smi` is not found although it works there.  The newest nvidia-smi.exe of that store, or None.
+    Plain string paths (no pathlib): the tests set os.name to "nt" on Linux."""
+    import glob
+    root = base or os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "HostDriverStore", "FileRepository")
+    try:
+        found = sorted(glob.glob(os.path.join(root, "nv*", "nvidia-smi.exe")), key=os.path.getmtime, reverse=True)
+    except OSError:
+        return None
+    return found[0] if found else None
+
+
+def nvidia_smi_path() -> str | None:
+    """nvidia-smi on PATH, else (Windows only) the one in the driver store of a GPU-PV guest; None when there is none."""
     tool = shutil.which("nvidia-smi")
+    if tool:
+        return tool
+    return _driver_store_smi() if os.name == "nt" else None
+
+
+def _smi_query_now(field_name: str) -> list[str]:
+    tool = nvidia_smi_path()
     if not tool:
         return []
     try:

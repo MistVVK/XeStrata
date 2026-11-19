@@ -194,6 +194,22 @@ DRAFT_HEAD_HINT = ("a smaller draft vocabulary needs less VRAM: --draft-vocab cy
                    "keeps it; or a smaller --context in setup.")
 
 
+COMMIT_FAIL_HINT = ("Windows could promise only {left:.1f} GiB more memory (RAM + page file) while this start plans {planned:.1f} GiB "
+                    "and keeps {floor:.1f} GiB free, so the engine may have run out of memory it can be given while RAM was still "
+                    "free. A bigger page file helps: set it to \"System managed\" (System > About > Advanced system settings > "
+                    "Performance > Advanced > Virtual memory), or start with a smaller context.")
+
+
+def commit_failure_hint(text: str) -> str:
+    """#5133 / #3725: a start that ended after the engine's own Windows commit-limit warning (#1607: "N GiB of it is left, but this
+    run plans M GiB") is told the page file is the thing to change; "" when the start's log has no such warning."""
+    from serve import commit_limit
+    warned = commit_limit.commit_warning(text)
+    if not warned:
+        return ""
+    return ". memory: " + COMMIT_FAIL_HINT.format(left=warned["left_gib"], planned=warned["planned_gib"], floor=warned["floor_gib"])
+
+
 def start_failure_hint(log: str | None, offset: int) -> str:
     """#474: what to change when the engine stopped at the start because the MTP draft head did not fit the VRAM
     left: the engine's own `strata mtp:` lines after that failure (0.1.36+: what it needs, what is free, the smaller
@@ -207,7 +223,7 @@ def start_failure_hint(log: str | None, offset: int) -> str:
     except (OSError, ValueError):
         return ""
     if DRAFT_HEAD_FAIL not in text:
-        return ""
+        return commit_failure_hint(text)
     said = [x.strip()[len("strata mtp: "):] for x in text.splitlines()
             if x.strip().startswith("strata mtp: ") and ("draft head over" in x or "hint:" in x)]
     return ". mtp: " + DRAFT_HEAD_FAIL + ". " + (" ".join(said) if said else "Hint: " + DRAFT_HEAD_HINT)

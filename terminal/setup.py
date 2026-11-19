@@ -5012,15 +5012,21 @@ def engine_from_feed(eng: Path, updating: bool = False, backend: str | None = No
     per card in the signed update feed.  `strata update --no-control` fetches, verifies and test-starts the package for this PC
     (into a folder of its own under the install), and its files then become the installed engine in `eng`, the same way a
     zip's do.  None when it cannot be had (no internet, nothing for this card): the caller goes on as before.
-    `backend` is the engine family of the card this setup chose ("hip", "cuda"): on a PC with cards of several makes the update below would
-    otherwise pick the first make it finds (NVIDIA) and fetch the wrong engine for the card the person chose (#5402)."""
+
+    `backend` is the GPU family this setup was told to install ("hip" for an AMD setup, "cuda" for the standard one) and the engine
+    family of the card the person chose (#5402, #4861).  It has to travel with the update: the update runs in its own process and
+    detects the GPU itself, and on a PC that has an NVIDIA card beside the AMD one that detection takes the NVIDIA card first
+    (#3688's order), so an AMD setup would receive the CUDA package and fail its own test start.  The same family is handed to the
+    check that reads the fetched package back (`ec.resolve`), which would otherwise run that detection again and refuse the package
+    it had just fetched.  Empty keeps the old behaviour (the update detects on its own).  A family the person set by hand in the
+    environment (STRATA_ENGINE_BACKEND) still wins."""
     acquisition.require("the ready-made engine")
     from strata_control import engine_component as ec
     store = home() / "engine-feed"
     env = dict(os.environ)
     env.pop("STRATA_NO_ACQUIRE", None)
     env["STRATA_COMPONENTS_DIR"] = str(store)
-    if backend and not env.get(ec.ENV_BACKEND):         # a family the person set by hand in the environment still wins
+    if backend and not env.get(ec.ENV_BACKEND):         # the family setup already chose, not a second detection; one the person set by hand wins
         env[ec.ENV_BACKEND] = backend
     say("  Fetching the ready-made engine from the signed update feed ...")
     try:
@@ -6384,13 +6390,23 @@ def toolkit_change_undefs(bdir: Path, defs) -> list:
     return [f"-U{g}" for g in CUDA_CACHE_GLOBS]
 
 
+def forward_slash_defs(defs, win: bool | None = None) -> list:
+    """#5694: the -D definitions of a CMake configure with Windows paths written with forward slashes.  CMake writes a CUDA compiler path it
+    was given as it is into CMakeFiles/<version>/CMakeCUDACompiler.cmake, so `-DCMAKE_CUDA_COMPILER=C:\\Program Files\\...\\nvcc.exe` made
+    CMake 3.26 stop with 'Invalid character escape \\P' (CMAKE_MAKE_PROGRAM, CUDAToolkit_ROOT and STRATA_GGML_DIR kept their back-slashes
+    in the cache the same way).  Windows takes forward slashes everywhere; other systems are left as they are."""
+    win = WIN if win is None else win
+    return [d.replace("\\", "/") if win and isinstance(d, str) and d.startswith("-D") else d for d in defs]
+
+
 def cmake_build(src, bdir, target, defs, vcvars, bat_name):
     acquisition.require("a compile (cmake)")
     cmake, ninja = ensure_build_tools()
     fresh_if_other_generator(bdir)
+    defs = forward_slash_defs(defs)                    # #5694: CMake 3.26 stops on a back-slash path
     # #6172: the vendored ggml wraps EVERY compile in ccache / sccache when one is on PATH (a global RULE_LAUNCH_COMPILE), Strata's nvcc compiles
     # too, and sccache stops them at the fatbinary step ("Could not open input file 'device.ptx'"). Off here; a -DGGML_CCACHE in defs wins.
-    conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
+    conf = [cmake, "-G", "Ninja", *forward_slash_defs([f"-DCMAKE_MAKE_PROGRAM={ninja}"]), "-S", str(src), "-B", str(bdir),
             *toolkit_change_undefs(bdir, defs), "-DCMAKE_BUILD_TYPE=Release", "-DGGML_CCACHE=OFF", *defs]
     build = [cmake, "--build", str(bdir), "--target", target, "-j", str(max(2, (os.cpu_count() or 4) // 2))]
     # A failed build is tried once more: CUDA 13.0's ptxas now and then fails to parse a PTX file it just wrote, and
