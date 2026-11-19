@@ -158,6 +158,7 @@ public:
     mtl::Context& cx;
     int max_ctx, Tc;
     int n_run = 42;  // layers to run (--layers: partial runs for bisecting)
+    int mm_min = 16;           // GEMM (fp16 weights) from this many tokens; below it the exact fp32-dequant GEMV (--mm-min)
     bool mpp_ok = false;       // hy4_mpp.metal / hy4_mppq.metal compiled (Metal 4 matmul2d): prefill GEMMs through an fp16 dequantised scratch
     int mpp_min = 96;          // use it from this many tokens
     Buffer wscr;               // dequantised weight scratch [N][K] half
@@ -269,7 +270,7 @@ public:
             else add(M == 1 ? "linear_q8row_1" : "linear_q8row_8", (N + 7) / 8, 1, 256, a);
         } else {
             std::string f = std::to_string(t.fmt);
-            if (M >= 16) add("linear_mm_" + f, (N + 63) / 64, (M + 31) / 32, 128, a);
+            if (M >= mm_min) add("linear_mm_" + f, (N + 63) / 64, (M + 31) / 32, 128, a);
             else add(std::string("linear_sk_") + f + (M == 1 ? "_1" : "_8"), (N + 7) / 8, 1, 256, a);
         }
     }
@@ -593,6 +594,29 @@ public:
         add(TT == 1 ? "mla_vup_1" : "mla_vup_8", NH, (T + TT - 1) / TT, 256, {B(ctx_h), B(wv_b, wv_off[il]), B(F3), B(o_h), I(T), I(NH)});
         lin(pa + ".o_proj.weight", o_h, F1, T);
         op("vup_o");
+        if (dump && il == 0) {
+            run_all();
+            auto h2f = [](uint16_t b) { uint32_t sgn = (b >> 15) & 1, e = (b >> 10) & 31, m = b & 1023; float v = e == 0 ? std::ldexp((float) m, -24) : (e == 31 ? INFINITY : std::ldexp((float) (m + 1024), (int) e - 25)); return sgn ? -v : v; };
+            auto dumph = [&](const char* nm, const Buffer& b, size_t n, int cols, size_t off = 0) {
+                std::vector<float> f(n);
+                for (size_t i = 0; i < n; ++i) f[i] = h2f(((const uint16_t*) b.ptr)[off + i]);
+                save_npy_f32(dump_dir + "/" + nm + ".npy", f.data(), {T, cols});
+            };
+            dumph("L0_cur_attn", cur_h, (size_t) T * HID_, HID_);
+            dumph("L0_qr", qr_h, (size_t) T * 1024, 1024);
+            save_npy_f32(dump_dir + "/L0_q.npy", (const float*) F2.ptr, {T, NH, 256});
+            save_npy_f32(dump_dir + "/L0_attn_gate.npy", (const float*) F3.ptr, {T, NH * 256});
+            dumph("L0_attn_gated", o_h, (size_t) T * NH * 256, NH * 256);
+            save_npy_f32(dump_dir + "/L0_attn_oproj.npy", (const float*) F1.ptr, {T, HID_});
+            std::vector<float> kc((size_t) T * 512), kp((size_t) T * 64);
+            for (int t = 0; t < T; ++t) {
+                const int slot = swa ? (p0 + t) % ring : p0 + t;
+                for (int c2 = 0; c2 < 512; ++c2) kc[(size_t) t * 512 + c2] = h2f(((const uint16_t*) kcache[il].ptr)[(size_t) slot * 576 + c2]);
+                for (int c2 = 0; c2 < 64; ++c2) kp[(size_t) t * 64 + c2] = h2f(((const uint16_t*) kcache[il].ptr)[(size_t) slot * 576 + 512 + c2]);
+            }
+            save_npy_f32(dump_dir + "/L0_kv_cmpr.npy", kc.data(), {T, 512});
+            save_npy_f32(dump_dir + "/L0_k_pe.npy", kp.data(), {T, 64});
+        }
         add("add_rms_post", T, 1, 256, {B(F1), B(F1), g.tw(pa + ".post_proj_norm.weight"), B(x), B(post), Fl(c.rms_eps), I(0)});
         part(swa ? "attn_swa(30)" : "attn_sparse(12)");
     }
@@ -758,7 +782,7 @@ static size_t rss_bytes() {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_hcsplit = false, prof3 = false;
-    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8;
+    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -783,6 +807,7 @@ int main(int argc, char** argv) {
         else if (a == "--pair-max") pair_max = atoi(nxt().c_str());
         else if (a == "--layers") n_layers_run = atoi(nxt().c_str());
         else if (a == "--no-mpp") no_mpp = true;
+        else if (a == "--mm-min") mm_min_arg = atoi(nxt().c_str());
         else if (a == "--prof3") prof3 = true;
         else if (a == "--no-hcsplit") no_hcsplit = true;
         else if (a == "--split") split_arg = atoi(nxt().c_str());
@@ -846,6 +871,7 @@ int main(int argc, char** argv) {
     r.seg_force = seg;
     r.pair_max = pair_max;
     r.mpp_try = !no_mpp;
+    r.mm_min = mm_min_arg;
     r.hc_split = !no_hcsplit;
     r.split_max = split_arg;
     r.flash_on = no_flash;
