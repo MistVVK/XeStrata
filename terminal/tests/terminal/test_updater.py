@@ -227,6 +227,9 @@ class EngineUpdate(UpdaterCase):
         self.assertIn("unchanged", result["error"])
         self.assertNotIn("server_exited", result["error"], "the engine's own words stay out of the sentence")
         self.assertIn("strata update --force", result["error"])
+        kept_log = self.components / ".updates" / "logs" / "test-start-0.1.47.log"
+        self.assertIn(str(kept_log), result["error"])
+        self.assertTrue(kept_log.is_file())
         self.assertEqual(self.resolved(), "0.1.45")
         self.assertEqual(self.engine_folders(), [f"0.1.45-{self.platform}-{self.tag}"], "the failed engine was never put in the live folder")
         self.assertEqual(sorted(p.name for p in (self.components / ".s").iterdir()), [])
@@ -511,6 +514,26 @@ class LightTestStart(unittest.TestCase):
                          ["--max-context", "2048", "--mtp", "x"])
         self.assertEqual(updater.light_test_args(["--vision"]), [])
         self.assertEqual(updater.light_test_args(["--max-context", "abc"]), ["--max-context", "abc"])
+
+
+class TestStartLog(unittest.TestCase):
+    def test_long_startup_lines_do_not_hide_the_final_native_pack_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox = Path(directory)
+            error = "is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) and --prefill CHUNK"
+            (sandbox / "engine.log").write_text(
+                "strata generate: PCIe probe: " + "probe details " * 30 + "\n"
+                "strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2\n"
+                "strata generate: /models/" + "long-model-name/" * 80 + error + "\n", encoding="utf-8")
+            component = mock.Mock(version="0.1.54")
+            tail = updater._log_tail(sandbox, component)
+            self.assertTrue(tail.endswith(error))
+            self.assertLessEqual(len(tail), 1003)
+            ctx = mock.Mock(components=sandbox, test_timeout=600)
+            failure = updater._test_start_failure(component, {"error": "server_exited"}, ctx, tail)
+            self.assertIn(error, failure.reason)
+            self.assertIn(str(sandbox / ".updates" / "logs" / "test-start-0.1.54.log"), str(failure))
+            self.assertIn("unchanged", str(failure))
 
 
 class LazyModel(UpdaterCase):
@@ -810,6 +833,7 @@ class Cli(UpdaterCase):
         self.assertEqual(code, 6, text + err)
         self.assertIn("NOT changed", text)
         self.assertIn("unchanged", text)
+        self.assertIn(str(self.components / ".updates" / "logs" / "test-start-0.1.47.log"), text)
         self.assertEqual(self.resolved(), "0.1.45")
 
     def test_jsonl_streams_progress_and_ends_with_the_result(self):

@@ -1013,7 +1013,8 @@ def _log_tail(sandbox: Path, component: ec.EngineComponent) -> str:
         lines = log.read_text(errors="replace").splitlines()[-3:]
     except OSError:
         return ""
-    return " | " + " ".join(lines)[:300] if lines else ""
+    # Keep the end: startup diagnostics and long model paths can otherwise push the actual error out of the retained reason.
+    return " | " + " ".join(lines)[-1000:] if lines else ""
 
 
 def _keep_log(sandbox: Path, component: ec.EngineComponent, ctx: Context) -> None:
