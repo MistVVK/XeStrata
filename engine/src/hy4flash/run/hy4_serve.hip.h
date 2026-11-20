@@ -48,6 +48,7 @@ struct ServeOpts {
     bool session_reuse = false;
     int tail_skip = 0;  // opt-in only (0 = OFF by default)
     std::string draft = "auto";  // auto = dfly2 when the file carries the drafter; off; dfly2 (error without it)
+    std::string dfly_override;   // optional flat DFLYOVR1 binary overriding model.dfly_layers.* in VRAM
     SpecCfg spec;
     std::string vision;                   // HY4-VISION: path of Hy4-Flash-Vision.strata (--vision); empty = text only, GENI is refused
     int64_t image_max_pixels = 4194304;
@@ -256,6 +257,13 @@ inline int hy4_serve_main(const ServeOpts& o) {
     if (!load_gpu_model(g, o.model, true)) {
         proto("ERR cannot load %s", o.model.c_str());
         return 1;
+    }
+    if (!o.dfly_override.empty()) {
+        std::string derr;
+        if (!load_dfly_override(g, o.dfly_override, derr)) {
+            proto("ERR %s", derr.c_str());
+            return 1;
+        }
     }
     fprintf(stderr, "[load] total %.1f s\n", now_s() - t_load0);
     const int max_ctx = o.max_ctx;

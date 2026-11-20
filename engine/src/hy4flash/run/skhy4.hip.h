@@ -12,6 +12,9 @@
 #if HY4_CUDA && HY4_MMA
 #include "sk_int8_cuda.hip.h"
 #endif
+#if HY4_CUDA
+#include "sk_cublas_cuda.hip.h"
+#endif
 
 namespace hy4 {
 
@@ -50,8 +53,8 @@ inline void linear_h(hipStream_t s, int fmt, const void* W, int N, int K, const 
         linear_h_gemm_s(s, fmt, W, N, K, X, Y, M);
     } else {
 #if HY4_CUDA
-        if (skd::lin_int8_mma()) linear_h_gemm_i8(s, fmt, W, N, K, X, Y, M, skd::lin_int8_mma() >= 2);
-        else
+        if (M >= skd::cublas_pf_min_m() && skd::linear_h_cublas(s, fmt, W, N, K, X, Y, M)) return;
+        if (skd::lin_int8_mma()) { linear_h_gemm_i8(s, fmt, W, N, K, X, Y, M, skd::lin_int8_mma() >= 2); return; }
 #endif
         linear_h_gemm(s, fmt, W, N, K, X, Y, M);
     }

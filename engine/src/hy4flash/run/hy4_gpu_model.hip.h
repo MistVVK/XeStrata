@@ -32,6 +32,77 @@ inline double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+inline bool gpu_is_uma() {
+    static int cached = -1;
+    if (cached < 0) {
+        hipDeviceProp_t dp{};
+        cached = (hipGetDeviceProperties(&dp, 0) == hipSuccess && dp.integrated != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+inline void gpu_mem_avail(size_t& fr, size_t& tot) {
+    HCK(hipMemGetInfo(&fr, &tot));
+#if !defined(_WIN32)
+    if (gpu_is_uma()) {
+        size_t avail = 0;
+        if (FILE* f = fopen("/proc/meminfo", "r")) {
+            char ln[256];
+            unsigned long long total_kb = 0, avail_kb = 0, used_kb = 0, v = 0;
+            while (fgets(ln, sizeof ln, f)) {
+                if (sscanf(ln, "MemTotal: %llu kB", &v) == 1) total_kb = v;
+                else if (sscanf(ln, "MemAvailable: %llu kB", &v) == 1) avail_kb = v;
+                else if (sscanf(ln, "AnonPages: %llu kB", &v) == 1 ||
+                         sscanf(ln, "Shmem: %llu kB", &v) == 1 ||
+                         sscanf(ln, "SUnreclaim: %llu kB", &v) == 1 ||
+                         sscanf(ln, "KernelStack: %llu kB", &v) == 1 ||
+                         sscanf(ln, "PageTables: %llu kB", &v) == 1 ||
+                         sscanf(ln, "Mlocked: %llu kB", &v) == 1 ||
+                         sscanf(ln, "Percpu: %llu kB", &v) == 1 ||
+                         sscanf(ln, "VmallocUsed: %llu kB", &v) == 1 ||
+                         sscanf(ln, "GPUActive: %llu kB", &v) == 1)
+                    used_kb += v;
+            }
+            fclose(f);
+            const unsigned long long margin_kb = 4ull << 20;
+            if (total_kb > used_kb + margin_kb) avail = (size_t)(total_kb - used_kb - margin_kb) * 1024ull;
+            else avail = (size_t)avail_kb * 1024ull;
+        }
+        const char* limf[2] = {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
+        const char* curf[2] = {"/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"};
+        for (int i = 0; i < 2; ++i) {
+            FILE* fl = fopen(limf[i], "r");
+            if (!fl) continue;
+            char buf[64] = {0};
+            unsigned long long lim = 0, cur = 0, file_cache = 0;
+            if (fgets(buf, sizeof buf, fl) && buf[0] >= '0' && buf[0] <= '9') lim = strtoull(buf, nullptr, 10);
+            fclose(fl);
+            if (lim > (1ull << 30) && lim < (1ull << 50)) {
+                if (FILE* fc = fopen(curf[i], "r")) {
+                    char b2[64] = {0};
+                    if (fgets(b2, sizeof b2, fc) && b2[0] >= '0' && b2[0] <= '9') cur = strtoull(b2, nullptr, 10);
+                    fclose(fc);
+                }
+                if (i == 0) {
+                    if (FILE* fs = fopen("/sys/fs/cgroup/memory.stat", "r")) {
+                        char ln[128];
+                        unsigned long long fv = 0;
+                        while (fgets(ln, sizeof ln, fs))
+                            if (sscanf(ln, "file %llu", &fv) == 1) { file_cache = fv; break; }
+                        fclose(fs);
+                    }
+                }
+                const unsigned long long non_file = cur > file_cache ? cur - file_cache : 0;
+                const unsigned long long margin = 4ull << 30;
+                const size_t cg = lim > non_file + margin ? (size_t)(lim - non_file - margin) : 0;
+                if (avail == 0 || cg < avail) avail = cg;
+            }
+        }
+        if (avail > fr && avail <= tot) fr = avail;
+    }
+#endif
+}
+
 struct ExpertRef {  // per (moe_layer, expert id); offsets relative to the arena base
     uint64_t body_off;
     uint32_t dn_off;  // relative to body_off
@@ -171,11 +242,14 @@ inline void hy4_setenv(const char* k, const char* v, int) {
 
 inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& model_path) {
     const double GB = 1e9, tot = (double)total / GB;
-    double trunk = 5.92;
+    double trunk = 5.92, sec4_gb = 0.0;
     if (!model_path.empty()) {
         strata::artifact::StrataFileReader rd;
         std::string e;
-        if (rd.open(model_path, e)) trunk = (double)rd.header().sections[1].byte_length / GB;
+        if (rd.open(model_path, e)) {
+            trunk = (double)rd.header().sections[1].byte_length / GB;
+            sec4_gb = (double)rd.header().sections[4].byte_length / GB;
+        }
     }
     // Discrete cards (< 48 GB) keep embed_tokens (0.38 GB) in pinned mapped host memory
     const bool host_embed = !getenv("HY4_EMBED_VRAM") && (total < (48ull << 30));
@@ -196,15 +270,26 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     }
     const double kv_init_gb = (double)((init_slots + 8 + 15) / 16 * 16) * per_pos / GB;
     const double wkv = 0.03;  // single-layer reusable FP16 wk/wv prefill scratch (28 MiB)
+    const double cublas_gb = HY4_CUDA ? 0.08 : 0.0;  // 64 MiB reusable side-stream FP16 dequant + cuBLAS scratch
     auto est_work_gb = [&](int c) {
-        // Aliased work_arena + qa_h/H1/x/z/etc (~0.30 MB/tok) + SWA rings (30*(512+c)*1152 B) + misc 0.22 GB
-        return c * 0.30e6 / GB + 0.22 + 30.0 * (512.0 + c) * 1152.0 / GB;
+        // Aliased work_arena (max(2*c*16384*4, moe_ws_bytes(c))) + qa_h/H1/x/z/etc (~0.195 MB/tok) + SWA rings (30*(512+c)*1152 B) + misc 0.22 GB
+        const double arena = std::max(2.0 * c * 16384.0 * 4.0, (double)c * 16.0 * 1536.0 * 6.0) / GB;
+        return arena + c * 0.195e6 / GB + 0.22 + 30.0 * (512.0 + c) * 1152.0 / GB;
     };
     if (chunk <= 0) {
-        // 16 GB+ cards default to Tc = 4096 (single PCIe expert pass per 4K prompt!); 12 GB -> 2048; 8 GB -> 1024/512
-        int c = (tot >= 15.0) ? 4096 : (tot >= 11.0 ? 2048 : 1024);
-        while (c > 256 && est_work_gb(c) > 0.14 * tot) c >>= 1;
-        while (c > 256 && trunk + est_work_gb(c) + kv_init_gb + wkv + 0.35 > tot) c >>= 1;
+        // 16 GB+ cards default to Tc = 8192 when ctx > 4096 (halves PCIe passes 32->16 at 128K; capped to 4096 when ctx <= 4096 to keep max expert cache!)
+        // 12 GB -> 2048; 8 GB -> 1024/512
+        int c = (tot >= 15.0) ? ((max_ctx > 4096) ? 8192 : 4096) : (tot >= 11.0 ? 2048 : 1024);
+        const double work_cap = (tot >= 15.0) ? 0.22 : 0.16;
+        while (c > 256 && est_work_gb(c) > work_cap * tot) c >>= 1;
+        while (c > 256 && trunk + est_work_gb(c) + kv_init_gb + wkv + cublas_gb + 0.55 > tot) c >>= 1;
+        // Preserve 100%-resident placement when a smaller chunk keeps all experts + full KV in VRAM (e.g. SQ-96 128K on 96 GB card)
+        if (sec4_gb > 0.0 && c > 4096) {
+            const double kv_full = (double)((max_ctx + 8 + 15) / 16 * 16) * per_pos / GB;
+            if (trunk + sec4_gb + est_work_gb(c) + kv_full + wkv + cublas_gb + 0.55 > tot &&
+                trunk + sec4_gb + est_work_gb(c >> 1) + kv_full + wkv + cublas_gb + 0.55 <= tot)
+                c >>= 1;
+        }
         chunk = c;
     }
     const double slots = (double)((max_ctx + 8 + 15) / 16 * 16);
@@ -213,10 +298,10 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     const double work_gb = est_work_gb(chunk);
     // Check if full max_ctx KV fits in VRAM; if not and card is very small (8 GB), set dev_pos for VRAM-to-host spill
     int mask = 0;
-    if (trunk + work_gb + pivg + rows + wkv + 0.35 > tot) mask |= 1;
+    if (trunk + work_gb + pivg + rows + wkv + cublas_gb + 0.35 > tot) mask |= 1;
     long dev_pos = 0;
     if ((mask & 1) && !getenv("HY4_KV_HOST")) {
-        const double avail = tot - trunk - work_gb - wkv - 0.35;
+        const double avail = tot - trunk - work_gb - wkv - cublas_gb - 0.35;
         dev_pos = avail > 0 ? (long)(avail * GB / per_pos) / 1024 * 1024 : 0;
         if (dev_pos >= 4096 && dev_pos < max_ctx) {
             mask &= ~1;
@@ -242,7 +327,7 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     if (!getenv("HY4_RESERVE_GB")) {
         const double kv_res = (mask & 1) ? 0.0 : (init_slots < max_ctx ? kv_init_gb : (dev_pos ? dev_pos * per_pos / GB : (rows + pivg)));
         const double pf_res = (tot >= 10.0 && tot < 64.0 && mask == 0) ? 0.56 : 0.0;  // 2 x 256 MiB device scratch for prefill streaming
-        const double reserve = work_gb + kv_res + wkv + pf_res + 0.45;
+        const double reserve = work_gb + kv_res + wkv + cublas_gb + pf_res + 0.45;
         char b[32];
         snprintf(b, sizeof b, "%.2f", reserve);
         hy4_setenv("HY4_RESERVE_GB", b, 1);
@@ -614,13 +699,24 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
     }
     if (with_experts) {
         size_t fr = 0, tot = 0;
-        HCK(hipMemGetInfo(&fr, &tot));
+        gpu_mem_avail(fr, tot);
+        if (gpu_is_uma() && fr > g.trunk_bytes) fr -= g.trunk_bytes;
         double reserve_gb = getenv("HY4_RESERVE_GB") ? atof(getenv("HY4_RESERVE_GB")) : 6.0;
         double budget = (double)fr - reserve_gb * 1073741824.0;
         if (getenv("HY4_EXPERT_VRAM_GB")) budget = atof(getenv("HY4_EXPERT_VRAM_GB")) * 1073741824.0;
         if (g.peer_devs.empty() && budget >= (double)((g.sec4_bytes + 4095) & ~4095ull)) {
-            HCK(hipMalloc((void**)&g.d_sec4, (g.sec4_bytes + 4095) & ~4095ull));
-            stream_to_device(path, h.sections[4].file_offset, g.sec4_bytes, g.d_sec4, &g.t_load_experts, "experts");
+            if (hipMalloc((void**)&g.d_sec4, (g.sec4_bytes + 4095) & ~4095ull) == hipSuccess) {
+                stream_to_device(path, h.sections[4].file_offset, g.sec4_bytes, g.d_sec4, &g.t_load_experts, "experts");
+            } else {
+                (void)hipGetLastError();
+                HCK(hipMemGetInfo(&fr, &tot));
+                budget = (double)fr - reserve_gb * 1073741824.0;
+                bool cpu_mode = getenv("HY4_CPU_EXPERTS") ? atoi(getenv("HY4_CPU_EXPERTS")) != 0 : host_cpu_fast();
+                if (!load_experts_tiered(g, path, budget < 0 ? 0 : (size_t)budget, cpu_mode, err)) {
+                    fprintf(stderr, "experts: %s\n", err.c_str());
+                    return false;
+                }
+            }
         } else {
             // host-resident experts: pinned + read by the GPU (needs the RAM) or computed by the CPU. HY4_CPU_EXPERTS=1/0 forces, default: CPU when they would use > 45% of the RAM or the CPU has AVX-512 VBMI+VNNI
             bool cpu_mode = false;
@@ -636,6 +732,44 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
     }
     fprintf(stderr, "[load] done: trunk %.2f GB in %.1f s, experts %.2f GB in %.1f s\n", g.trunk_bytes / 1e9, g.t_load_trunk, g.sec4_bytes / 1e9, g.t_load_experts);
     return true;
+}
+
+// Overlay distilled DFly2 weights from a flat binary `DFLYOVR1` file directly into `g.d_trunk` (zero .strata file duplication).
+inline bool load_dfly_override(GpuModel& g, const std::string& path, std::string& err) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open dfly-override: " + path; return false; }
+    char magic[8] = {};
+    uint32_t count = 0;
+    if (fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "DFLYOVR1", 8) != 0 || fread(&count, 4, 1, f) != 1) {
+        fclose(f);
+        err = "invalid DFLYOVR1 header: " + path;
+        return false;
+    }
+    double t0 = now_s();
+    size_t applied = 0, total_bytes = 0;
+    std::vector<uint8_t> buf;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint16_t nlen = 0;
+        uint64_t blen = 0;
+        if (fread(&nlen, 2, 1, f) != 1 || fread(&blen, 8, 1, f) != 1) { fclose(f); err = "truncated DFLYOVR1 entry"; return false; }
+        std::string name(nlen, '\0');
+        if (fread(&name[0], 1, nlen, f) != nlen) { fclose(f); err = "truncated DFLYOVR1 name"; return false; }
+        buf.resize((size_t)blen);
+        if (fread(buf.data(), 1, (size_t)blen, f) != (size_t)blen) { fclose(f); err = "truncated DFLYOVR1 payload"; return false; }
+        auto it = g.man.T.find(name);
+        if (it == g.man.T.end()) continue;
+        if (it->second.bytes != blen) {
+            fclose(f);
+            err = "dfly-override byte mismatch for " + name + " (" + std::to_string(blen) + " vs " + std::to_string(it->second.bytes) + ")";
+            return false;
+        }
+        HCK(hipMemcpy(g.d_trunk + it->second.off, buf.data(), (size_t)blen, hipMemcpyHostToDevice));
+        ++applied;
+        total_bytes += (size_t)blen;
+    }
+    fclose(f);
+    fprintf(stderr, "[dfly-override] applied %zu/%u tensors (%.2f MB) from %s in %.2f s\n", applied, count, total_bytes / 1e6, path.c_str(), now_s() - t0);
+    return applied > 0;
 }
 
 }  // namespace hy4

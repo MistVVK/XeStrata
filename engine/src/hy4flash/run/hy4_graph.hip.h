@@ -331,6 +331,12 @@ public:
     bool pf_stream = false;
     int pf_min_T = 128;
     int pf_gather_max_T = 1536;  // below this T, gather only cnt[e] > 0 experts; at/above, stream full layer overlapped with attention
+    ExpertDev* d_pf_tables = nullptr;
+    size_t d_pf_tables_cap = 0;
+    uint64_t vcache_ver = 1, pf_vcache_ver = 0;
+    double pf_cpu_frac = 0.0;
+    bool has_pf_cpu = false;
+    std::vector<uint8_t> pf_cpu_flag;
     bool pf_active(int T) const { return pf_stream && T >= pf_min_T; }
     bool pf_use_gather(int T) const { return pf_stream && T >= pf_min_T && T < pf_gather_max_T && h_bounce[0] != nullptr; }
 
@@ -342,33 +348,155 @@ public:
         pf_packed_seq[b] = k;
         pf_pool.kick(b, h_bounce[b], G, ev_pf_copy_set[b] ? ev_pf_copy[b] : nullptr);
     }
+    void pf_build_groups(bool log_init = false) {
+        if (!pf_cap) return;
+        pf_pool.wait();
+        if (st2) HCK(hipStreamSynchronize(st2));
+        auto al = [](size_t x) { return (x + 4095) & ~(size_t)4095; };
+        const size_t cap = pf_cap;
+        pf_groups.assign(41, {});
+        pf_layer_first.assign(41, 0);
+        pf_cpu_flag.assign(41 * 512, 0);
+        has_pf_cpu = false;
+        std::vector<ExpertDev> all;
+        std::vector<std::vector<std::vector<int>>> gexp(41);
+        int seq = 0;
+        size_t skipped_vcache = 0, total_dma_bytes = 0, maxb = 0;
+        for (int l = 0; l < 41; ++l) {
+            std::vector<std::pair<const uint8_t*, int>> lay;
+            lay.reserve(512);
+            for (int e = 0; e < 512; ++e) {
+                const int gi = l * 512 + e;
+                if (g.experts[gi].tier != 2 || !cpu.resident(l, e)) continue;
+                if (gi < (int)vram_flag.size() && vram_flag[gi]) {
+                    ++skipped_vcache;  // Already resident in AdaptiveExpertCache -> run directly from VRAM in group 0!
+                    continue;
+                }
+                CpuExpertView vw = cpu.view(l, e);
+                if (vw.body) lay.push_back({vw.body, e});
+            }
+            // Optional CPU/GPU parallel prefill split (HY4_PF_CPU_FRAC): peel coldest subset to CPU while PCIe+GPU runs
+            if (pf_cpu_frac > 0.001 && lay.size() > 8) {
+                std::sort(lay.begin(), lay.end(), [&](const auto& a, const auto& b) {
+                    const int ra = (int)g.expert_rank.size() > l * 512 + a.second ? g.expert_rank[l * 512 + a.second] : a.second;
+                    const int rb = (int)g.expert_rank.size() > l * 512 + b.second ? g.expert_rank[l * 512 + b.second] : b.second;
+                    return ra < rb;
+                });
+                const size_t n_cpu = std::min(lay.size() - 1, (size_t)(lay.size() * pf_cpu_frac));
+                for (size_t k = lay.size() - n_cpu; k < lay.size(); ++k) {
+                    pf_cpu_flag[l * 512 + lay[k].second] = 1;
+                    has_pf_cpu = true;
+                }
+                lay.resize(lay.size() - n_cpu);
+            }
+            std::sort(lay.begin(), lay.end());
+            pf_layer_first[l] = seq;
+            pf_groups[l].emplace_back();
+            gexp[l].emplace_back();
+            size_t off = 0, lbytes = 0;
+            for (auto& pe : lay) {
+                CpuExpertView vw = cpu.view(l, pe.second);
+                const size_t sz = al(vw.body_bytes);
+                lbytes += sz;
+                if (off + sz > cap && off > 0) {
+                    pf_groups[l].back().total_bytes = off;
+                    pf_groups[l].emplace_back();
+                    gexp[l].emplace_back();
+                    off = 0;
+                }
+                PfGroup& G = pf_groups[l].back();
+                if (!G.runs.empty() && G.runs.back().host + G.runs.back().bytes == pe.first) G.runs.back().bytes += sz;
+                else G.runs.push_back({pe.first, off, sz});
+                gexp[l].back().push_back(pe.second);
+                off += sz;
+            }
+            pf_groups[l].back().total_bytes = off;
+            total_dma_bytes += lbytes;
+            maxb = std::max(maxb, lbytes);
+            for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) pf_groups[l][gi].seq = seq++;
+        }
+        pf_nseq = seq;
+        all.reserve((size_t)seq * 512);
+        for (int l = 0; l < 41; ++l)
+            for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) {
+                const int k = pf_groups[l][gi].seq, b = k % pf_nbuf;
+                std::vector<ExpertDev> hp(512);
+                std::vector<char> in_group(512, 0);
+                std::vector<size_t> eoff(512, 0);
+                size_t off = 0;
+                for (int e : gexp[l][gi]) {
+                    CpuExpertView vw = cpu.view(l, e);
+                    in_group[e] = 1;
+                    eoff[e] = off;
+                    off += al(vw.body_bytes);
+                }
+                for (int e = 0; e < 512; ++e) {
+                    const int idx = l * 512 + e;
+                    const ExpertRef& er = g.experts[idx];
+                    if (idx < (int)vram_flag.size() && vram_flag[idx]) {
+                        hp[e] = h_experts[idx];
+                        hp[e].pad = (gi == 0) ? 0 : 1;  // static VRAM or AdaptiveExpertCache: run once in group 0!
+                    } else if (er.tier == 3 || er.tier == 4 || pf_cpu_flag[idx]) {
+                        hp[e].body_off = 0;
+                        hp[e].dn_off = er.dn_off;
+                        hp[e].gu_code = er.gu_code;
+                        hp[e].dn_code = er.dn_code;
+                        hp[e].pad = 1;  // cold SSD, peer GPU, or parallel CPU-split expert
+                    } else if (er.tier == 2) {
+                        hp[e].dn_off = er.dn_off;
+                        hp[e].gu_code = er.gu_code;
+                        hp[e].dn_code = er.dn_code;
+                        if (in_group[e]) {
+                            hp[e].body_off = (uint64_t)(uintptr_t)(d_scratch[b] + eoff[e]) - (uint64_t)(uintptr_t)g.d_sec4;
+                            hp[e].pad = 0;
+                        } else {
+                            hp[e].body_off = 0;
+                            hp[e].pad = 1;
+                        }
+                    } else {
+                        hp[e] = h_experts[idx];
+                        hp[e].pad = (gi == 0) ? 0 : 1;
+                    }
+                }
+                all.insert(all.end(), hp.begin(), hp.end());
+            }
+        if (all.size() > d_pf_tables_cap) {
+            if (d_pf_tables) HCK(hipFree(d_pf_tables));
+            d_pf_tables_cap = std::max(all.size(), (size_t)41 * 12 * 512);
+            d_pf_tables = dalloc<ExpertDev>(d_pf_tables_cap);
+        }
+        HCK(hipMemcpy(d_pf_tables, all.data(), all.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+        {
+            size_t idx = 0;
+            for (int l = 0; l < 41; ++l)
+                for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) pf_groups[l][gi].table = d_pf_tables + 512 * idx++;
+        }
+        pf_vcache_ver = vcache_ver;
+        if (log_init) {
+            fprintf(stderr, "[hybrid] prefill streaming on (%s): %d buffer(s) of %.0f MiB, %d groups for 41 layers (%.2f GB/pass, skipped %zu vcache experts, cpu_frac=%.2f, largest %.2f GB), active for T >= %d (gather < %d)\n",
+                    pf_bounce ? "pinned bounce ring" : "arena pinned", pf_nbuf, cap / 1048576.0, seq, total_dma_bytes / 1e9, skipped_vcache, pf_cpu_frac, maxb / 1e9, pf_min_T, pf_gather_max_T);
+        }
+    }
     void pf_init() {
         auto al = [](size_t x) { return (x + 4095) & ~(size_t)4095; };
-        std::vector<std::vector<std::pair<const uint8_t*, int>>> lay(41);
-        std::vector<size_t> tot_l(41, 0);
         size_t maxb = 0;
         const uint8_t *lo = nullptr, *hi = nullptr;
         for (int l = 0; l < 41; ++l) {
+            size_t tot_l = 0;
             for (int e = 0; e < 512; ++e) {
                 CpuExpertView vw = cpu.view(l, e);
                 if (vw.body) {
-                    lay[l].push_back({vw.body, e});
                     const size_t sz = al(vw.body_bytes);
-                    tot_l[l] += sz;
+                    tot_l += sz;
                     if (!lo || vw.body < lo) lo = vw.body;
                     if (!hi || vw.body + sz > hi) hi = vw.body + sz;
                 }
             }
-            std::sort(lay[l].begin(), lay[l].end());
-            maxb = std::max(maxb, tot_l[l]);
+            maxb = std::max(maxb, tot_l);
         }
         if (!maxb) return;
-        double t0 = now_s();
         bool pinned_arena = false;
 #ifndef _WIN32
-        // Only try hipHostRegister on the full ~50 GB arena when host RAM has ample headroom (> 2x arena size, e.g. >=128 GB servers)
-        // or when explicitly forced via HY4_PF_BOUNCE=0. On 64-96 GB machines / containers / Windows WDDM, calling hipHostRegister on
-        // 50+ GB starves physical RAM and can hang or OOM-thrash the driver; the 2 x 256 MiB pinned bounce ring avoids pinning the arena!
         const size_t arena_span = (size_t)(hi - lo);
         const char* b_env = getenv("HY4_PF_BOUNCE");
         const bool force_bounce = b_env && atoi(b_env) != 0;
@@ -398,7 +526,6 @@ public:
             d_pf_dyn_table[b] = dalloc<ExpertDev>(512);
             HCK(hipHostMalloc((void**)&h_pf_dyn_table[b], 512 * sizeof(ExpertDev), hipHostMallocDefault));
         }
-        // Always allocate pinned bounce buffers when pf_bounce is true (and best-effort when pinned_arena is true so active-expert gather works!)
         for (int b = 0; b < pf_nbuf; ++b) {
             if (hipHostMalloc((void**)&h_bounce[b], cap, hipHostMallocDefault) != hipSuccess) {
                 (void)hipGetLastError();
@@ -411,80 +538,6 @@ public:
                 break;
             }
         }
-        // groups, sequence numbers and tables
-        pf_groups.assign(41, {});
-        pf_layer_first.assign(41, 0);
-        std::vector<ExpertDev> all;
-        std::vector<std::vector<std::vector<int>>> gexp(41);
-        int seq = 0;
-        for (int l = 0; l < 41; ++l) {
-            pf_layer_first[l] = seq;
-            pf_groups[l].emplace_back();
-            gexp[l].emplace_back();
-            size_t off = 0;
-            for (auto& pe : lay[l]) {
-                CpuExpertView vw = cpu.view(l, pe.second);
-                const size_t sz = al(vw.body_bytes);
-                if (off + sz > cap) {
-                    pf_groups[l].back().total_bytes = off;
-                    pf_groups[l].emplace_back();
-                    gexp[l].emplace_back();
-                    off = 0;
-                }
-                PfGroup& G = pf_groups[l].back();
-                if (!G.runs.empty() && G.runs.back().host + G.runs.back().bytes == pe.first) G.runs.back().bytes += sz;
-                else G.runs.push_back({pe.first, off, sz});
-                gexp[l].back().push_back(pe.second);
-                off += sz;
-            }
-            pf_groups[l].back().total_bytes = off;
-            for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) pf_groups[l][gi].seq = seq++;
-        }
-        pf_nseq = seq;
-        // per-group tables: offsets of the group's experts inside its buffer follow the order of gexp
-        for (int l = 0; l < 41; ++l)
-            for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) {
-                const int k = pf_groups[l][gi].seq, b = k % pf_nbuf;
-                std::vector<ExpertDev> hp(512);
-                std::vector<char> in_group(512, 0);
-                std::vector<size_t> eoff(512, 0);
-                size_t off = 0;
-                for (int e : gexp[l][gi]) {
-                    CpuExpertView vw = cpu.view(l, e);
-                    in_group[e] = 1;
-                    eoff[e] = off;
-                    off += al(vw.body_bytes);
-                }
-                for (int e = 0; e < 512; ++e) {
-                    const ExpertRef& er = g.experts[l * 512 + e];
-                    hp[e].dn_off = er.dn_off;
-                    hp[e].gu_code = er.gu_code;
-                    hp[e].dn_code = er.dn_code;
-                    if (er.tier == 3 || er.tier == 4) {
-                        hp[e].body_off = 0;
-                        hp[e].pad = 1;  // cold expert (SSD) or peer-GPU resident: skipped by GPU 0 prefill streaming
-                    } else if (er.tier == 2) {
-                        if (in_group[e]) {
-                            hp[e].body_off = (uint64_t)(uintptr_t)(d_scratch[b] + eoff[e]) - (uint64_t)(uintptr_t)g.d_sec4;
-                            hp[e].pad = 0;
-                        } else {
-                            hp[e].body_off = 0;
-                            hp[e].pad = 1;
-                        }
-                    } else {
-                        hp[e].body_off = er.body_off;
-                        hp[e].pad = gi == 0 ? 0 : 1;  // the static GPU-resident experts run once per layer, with the first group
-                    }
-                }
-                all.insert(all.end(), hp.begin(), hp.end());
-            }
-        ExpertDev* dt = dalloc<ExpertDev>(all.size());
-        HCK(hipMemcpy(dt, all.data(), all.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
-        {
-            size_t idx = 0;
-            for (int l = 0; l < 41; ++l)
-                for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) pf_groups[l][gi].table = dt + 512 * idx++;
-        }
         if (!st2) HCK(hipStreamCreate(&st2));
         for (int b = 0; b < 2; ++b) {
             HCK(hipEventCreateWithFlags(&ev_pf_copy[b], hipEventDisableTiming));
@@ -492,13 +545,12 @@ public:
         }
         if (getenv("HY4_PF_MIN_T")) pf_min_T = atoi(getenv("HY4_PF_MIN_T"));
         if (getenv("HY4_PF_GATHER_MAX_T")) pf_gather_max_T = atoi(getenv("HY4_PF_GATHER_MAX_T"));
+        if (getenv("HY4_PF_CPU_FRAC")) pf_cpu_frac = std::max(0.0, std::min(0.45, atof(getenv("HY4_PF_CPU_FRAC"))));
         pf_stream = true;
-        size_t ng = 0;
-        for (auto& v : pf_groups) ng += v.size();
-        fprintf(stderr, "[hybrid] prefill streaming on (%s): %d buffer(s) of %.0f MiB, %zu groups for 41 layers (largest layer %.2f GB), init %.2f s, active for T >= %d (gather < %d)\n",
-                pf_bounce ? "pinned bounce ring" : "arena pinned", pf_nbuf, cap / 1048576.0, ng, maxb / 1e9, now_s() - t0, pf_min_T, pf_gather_max_T);
+        pf_build_groups(true);
     }
     void pf_begin_chunk() {
+        if (pf_vcache_ver != vcache_ver) pf_build_groups(false);
         pf_pool.wait();
         for (int b = 0; b < 2; ++b) {
             pf_packed_seq[b] = -1;
@@ -636,6 +688,7 @@ public:
             HCK(hipMemcpyAsync(d_experts + idx, &h_experts[idx], sizeof(ExpertDev), hipMemcpyHostToDevice, st));
             vprom[p].inflight = false;
             ++vc_promotes;
+            ++vcache_ver;
         }
     }
     void vcache_flush() {
@@ -697,6 +750,7 @@ public:
             HCK(hipStreamSynchronize(st2));
             HCK(hipMemcpy(d_experts, h_experts.data(), h_experts.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
             vc_promotes += (uint64_t)swapped;
+            ++vcache_ver;
         }
     }
     // Online decode update: record routing hits for layer l (0..40) and asynchronously promote up to vcache_max_swaps hottest misses on st2
@@ -822,6 +876,7 @@ public:
         }
         if (freed_slabs > 0) {
             HCK(hipMemcpy(d_experts, h_experts.data(), h_experts.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+            ++vcache_ver;
             fprintf(stderr, "[vcache] released %d slab(s) (%.2f GB) for VRAM KV growth -> %d adaptive slots (%.2f GB) remain\n",
                     freed_slabs, freed_bytes / 1e9, vcache_nslots, (vcache_nslots * (double)vcache_slot_bytes) / 1e9);
         }
@@ -1336,6 +1391,7 @@ public:
         if (hyb && (!getenv("HY4_PF_STREAM") || atoi(getenv("HY4_PF_STREAM")) != 0)) pf_init();  // last: the scratch takes what the other buffers left
         tune_init();
 #if HY4_CUDA
+        skd::cublas_pf().ensure(st);
         cuda_graph_on = getenv("HY4_CUDA_GRAPH") ? atoi(getenv("HY4_CUDA_GRAPH")) != 0 : true;
         HCK(hipHostMalloc((void**)&h_step, sizeof(DevStepArgs), hipHostMallocDefault));
         d_step = dalloc<DevStepArgs>(1);
@@ -1374,6 +1430,8 @@ public:
     EPrep* ep_rest = nullptr;
     EPrep ep[2];
     int ep_next = 0;
+    const int32_t* pf_eng_tok = nullptr;  // upfront whole-prompt Engram prefetch: kicks next chunk at Layer 11 while GPU runs Layers 11..41
+    int pf_eng_total = 0;
     double t_engram_wait = 0, t_eng_issue = 0, t_eng_prep = 0;
     int n_eng_dec = 0;
 
@@ -1392,27 +1450,33 @@ public:
             else engram_hash(emeta, mo, tok_all, p0, p0 + T, dst_ids, dst_val);
             if (vis && e->tree.M == 0) vis->mask_engram(dst_val, p0, T);
         };
-        if (T <= 8 && e->staged) {  // decode / verify window: module 0 first (published through pm0), then modules 1..3 in one batch
+        if (e->staged) {  // module 0 first (published through pm0 for Layer 1), then modules 1..3 overlapped with Layers 1..10
             const size_t per = (size_t)T * 16;
-            auto fetch_modules = [&](int m0, int m1) -> bool {
-                std::vector<uint64_t> ids((size_t)(m1 - m0) * per);
-                for (int mo = m0; mo < m1; ++mo) hash_mo(mo, ids.data() + (size_t)(mo - m0) * per, e->valid + (size_t)mo * Tc * 16);
-                std::vector<uint8_t> tmp(ids.size() * 100);
-                if (!eio.fetch_raw(ids.data(), ids.size(), tmp.data(), err)) return false;
-                for (int mo = m0; mo < m1; ++mo) std::memcpy(e->raw + (size_t)mo * Tc * 16 * 100, tmp.data() + (size_t)(mo - m0) * per * 100, per * 100);
-                return true;
-            };
-            if (!fetch_modules(0, 1)) {
-                e->ok = false;
-                e->err = err;
-                e->ok_rest = false;
+            if (T <= 8) {
+                auto fetch_modules = [&](int m0, int m1) -> bool {
+                    std::vector<uint64_t> ids((size_t)(m1 - m0) * per);
+                    for (int mo = m0; mo < m1; ++mo) hash_mo(mo, ids.data() + (size_t)(mo - m0) * per, e->valid + (size_t)mo * Tc * 16);
+                    std::vector<uint8_t> tmp(ids.size() * 100);
+                    if (!eio.fetch_raw(ids.data(), ids.size(), tmp.data(), err)) return false;
+                    for (int mo = m0; mo < m1; ++mo) std::memcpy(e->raw + (size_t)mo * Tc * 16 * 100, tmp.data() + (size_t)(mo - m0) * per * 100, per * 100);
+                    return true;
+                };
+                if (!fetch_modules(0, 1)) { e->ok = false; e->err = err; e->ok_rest = false; e->pm0.set_value(); return; }
                 e->pm0.set_value();
-                return;
-            }
-            e->pm0.set_value();
-            if (!fetch_modules(1, 4)) {
-                e->ok_rest = false;
-                e->err = err;
+                if (!fetch_modules(1, 4)) { e->ok_rest = false; e->err = err; }
+            } else {
+                std::vector<uint64_t> ids(per);
+                hash_mo(0, ids.data(), e->valid);
+                if (!eio.fetch_raw(ids.data(), ids.size(), e->raw, err)) {
+                    e->ok = false; e->err = err; e->ok_rest = false; e->pm0.set_value(); return;
+                }
+                e->pm0.set_value();
+                for (int mo = 1; mo < 4; ++mo) {
+                    hash_mo(mo, ids.data(), e->valid + (size_t)mo * Tc * 16);
+                    if (!eio.fetch_raw(ids.data(), ids.size(), e->raw + (size_t)mo * Tc * 16 * 100, err)) {
+                        e->ok_rest = false; e->err = err; return;
+                    }
+                }
             }
             return;
         }
@@ -1450,7 +1514,7 @@ public:
         e.p0 = p0;
         e.T = T;
         e.pending = true;
-        e.staged = T <= 8;
+        e.staged = true;
         e.ok_rest = true;
         e.tree = tree ? *tree : TreeSpec{};
         if (e.staged) {
@@ -1753,9 +1817,11 @@ public:
         void* mws = T <= 4 ? moe_ws_dec : moe_ws;
         if (pf_active(T)) {
             const int ml = il - 1;
-            const bool need_idx_host = has_cold || pf_use_gather(T) || (vcache_nslots > 1 && !vcache_frozen);
+            const bool do_pf_cpu = has_pf_cpu && !pf_use_gather(T);
+            const bool need_cpu_pass = has_cold || do_pf_cpu;
+            const bool need_idx_host = need_cpu_pass || pf_use_gather(T) || (vcache_nslots > 1 && !vcache_frozen);
             if (need_idx_host) {
-                if (has_cold) {
+                if (need_cpu_pass) {
                     HCK(hipMemcpyAsync(h_z, z_f, nz * 4, hipMemcpyDeviceToHost, st));
                     HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
                 }
@@ -1764,6 +1830,8 @@ public:
             }
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
             peers_launch(il, T);
+            bool cpu_submitted = false;
+            double t_cpu0 = 0.0;
             if (pf_use_gather(T)) {
                 // Active-expert gather (pf_min_T <= T < pf_gather_max_T): only DMA host experts with cnt[e] > 0 that are NOT already in VRAM/vcache!
                 HCK(hipEventSynchronize(ev_hyb));
@@ -1821,7 +1889,7 @@ public:
                     ++batch;
                 } while (pos < need.size());
             } else {
-                // Full-layer pipelined streaming (T >= pf_gather_max_T, e.g. Tc=2048/4096): DMA overlaps attention + earlier groups!
+                // Full-layer pipelined streaming (T >= pf_gather_max_T, e.g. Tc=4096/8192): DMA overlaps attention + earlier groups, skipping VRAM/vcache experts!
                 const std::vector<PfGroup>& gs = pf_groups[ml];
                 for (size_t gi = 0; gi < gs.size(); ++gi) {
                     const PfGroup& G = gs[gi];
@@ -1834,8 +1902,25 @@ public:
                     ev_pf_done_set[b] = true;
                     ++pf_next_comp;
                     pf_pump(k + pf_nbuf);
+                    // Launch parallel CPU subset (cold + pf_cpu_flag) right after group 0 is queued so CPU runs concurrently with remaining PCIe+GPU groups!
+                    if (gi == 0 && need_cpu_pass) {
+                        t_cpu0 = now_s();
+                        HCK(hipEventSynchronize(ev_hyb));
+                        for (size_t i = 0; i < (size_t)T * 16; ++i) {
+                            const int e = h_idx[i];
+                            uint8_t u = 0;
+                            if (e >= 0 && e < 512) {
+                                if (has_cold && cold_flag[(size_t)ml * 512 + (size_t)e]) u = 1;
+                                if (do_pf_cpu && pf_cpu_flag[(size_t)ml * 512 + (size_t)e]) u = 1;
+                                if (vcache_nslots > 1 && !vcache_frozen) vscore[ml * 512 + e] += vcache_inv_scale;
+                            }
+                            h_use[i] = u;
+                        }
+                        cpu.submit(ml, T, h_z, h_idx, h_w, h_use.data(), h_zcpu);
+                        cpu_submitted = true;
+                    }
                 }
-                if (need_idx_host && !has_cold) {
+                if (need_idx_host && !need_cpu_pass) {
                     HCK(hipEventSynchronize(ev_hyb));
                     for (size_t i = 0; i < (size_t)T * 16; ++i) {
                         const int e = h_idx[i];
@@ -1844,17 +1929,19 @@ public:
                 }
             }
             peers_gather(T);
-            if (has_cold) {
-                double t0 = now_s();
-                if (!pf_use_gather(T)) HCK(hipEventSynchronize(ev_hyb));
-                for (size_t i = 0; i < (size_t)T * 16; ++i) {
-                    const int e = h_idx[i];
-                    h_use[i] = (e >= 0 && e < 512) ? cold_flag[(size_t)ml * 512 + (size_t)e] : 0;
-                    if (!pf_use_gather(T) && vcache_nslots > 1 && !vcache_frozen && e >= 0 && e < 512) vscore[ml * 512 + e] += vcache_inv_scale;
+            if (need_cpu_pass) {
+                if (!cpu_submitted) {
+                    t_cpu0 = now_s();
+                    if (!pf_use_gather(T)) HCK(hipEventSynchronize(ev_hyb));
+                    for (size_t i = 0; i < (size_t)T * 16; ++i) {
+                        const int e = h_idx[i];
+                        h_use[i] = (e >= 0 && e < 512 && has_cold) ? cold_flag[(size_t)ml * 512 + (size_t)e] : 0;
+                        if (!pf_use_gather(T) && vcache_nslots > 1 && !vcache_frozen && e >= 0 && e < 512) vscore[ml * 512 + e] += vcache_inv_scale;
+                    }
+                    cpu.submit(ml, T, h_z, h_idx, h_w, h_use.data(), h_zcpu);
                 }
-                cpu.submit(ml, T, h_z, h_idx, h_w, h_use.data(), h_zcpu);
                 cpu.wait();
-                t_cpu_wait += now_s() - t0;
+                t_cpu_wait += now_s() - t_cpu0;
                 HCK(hipMemcpyAsync(d_zcpu, h_zcpu, nz * 4, hipMemcpyHostToDevice, st));
                 hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
             }
@@ -2483,17 +2570,28 @@ public:
         HCK(hipMemcpyAsync(d_ids, is_tree ? tree->tok : (tok_all + p0), (size_t)T * 4, hipMemcpyHostToDevice, st));
         hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
         if (!is_tree && vis) vis->embed(st, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
-        const bool defer_eng = engram_ready && T <= 8;
+        const bool defer_eng = engram_ready;
         const bool pf_pipe = pf_active(T) && !pf_use_gather(T);
         if (pf_pipe) pf_begin_chunk();
         if (defer_eng) {
-            const double t_pf0 = now_s();
-            prefetch_engram(tok_all, p0, T, tree);
-            t_eng_issue += now_s() - t_pf0;
-        } else if (engram_ready && !engram_prep(tok_all, p0, T, err, tree)) return false;
+            bool already = false;
+            for (int s = 0; s < 2; ++s)
+                if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T && (ep[s].tree.M == (tree ? tree->M : 0))) already = true;
+            if (!already) {
+                const double t_pf0 = now_s();
+                prefetch_engram(tok_all, p0, T, tree);
+                t_eng_issue += now_s() - t_pf0;
+            }
+        }
         for (int il = 0; il < c.n_layers; ++il) {
-            if (defer_eng && il == 1) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err, tree)) return false; t_eng_prep += now_s() - tq; ++n_eng_dec; }
-            if (defer_eng && il == emeta.layers[1] && !engram_prep_rest(err)) return false;
+            if (defer_eng && il == 1) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err, tree)) return false; if (T <= 8) { t_eng_prep += now_s() - tq; ++n_eng_dec; } }
+            if (defer_eng && il == emeta.layers[1]) {
+                if (!engram_prep_rest(err)) return false;
+                if (pf_eng_tok && p0 + T < pf_eng_total) {
+                    const int np0 = p0 + T, nT = std::min(Tc, pf_eng_total - np0);
+                    prefetch_engram(pf_eng_tok, np0, nT);
+                }
+            }
             int mo = -1;
             for (int j = 0; j < 4; ++j)
                 if (emeta.layers[j] == il) mo = j;

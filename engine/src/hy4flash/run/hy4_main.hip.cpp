@@ -328,7 +328,7 @@ static int run_dump_dfly_batch(Runner& r, const std::string& manifest_path, cons
 }
 
 int main(int argc, char** argv) {
-    std::string model, engram, tok_path, out_dir = ".", vision_path;
+    std::string model, engram, tok_path, out_dir = ".", vision_path, dfly_override;
     std::vector<std::string> image_files;
     std::string info_file;
     int64_t image_max_pixels = 4194304;
@@ -376,6 +376,7 @@ int main(int argc, char** argv) {
         else if (a == "--gpu") gpu = atoi(nxt().c_str());
         else if (a == "--gpus") gpus_csv = nxt();
         else if (a == "--draft") draft = nxt();
+        else if (a == "--dfly-override") dfly_override = nxt();
         else if (a == "--spec-k") scfg.K = atoi(nxt().c_str());
         else if (a == "--spec-fixed") scfg.adaptive = false;
         else if (a == "--spec-cut") scfg.cut = (float)atof(nxt().c_str());
@@ -491,6 +492,7 @@ int main(int argc, char** argv) {
         so.session_reuse = session_reuse;
         so.tail_skip = tail_skip_arg;
         so.draft = draft;
+        so.dfly_override = dfly_override;
         so.vision = vision_path;  // HY4-VISION
         so.image_max_pixels = image_max_pixels;
         so.primary_gpu = primary_gpu;
@@ -530,6 +532,10 @@ int main(int argc, char** argv) {
     g.peer_devs = peer_devs;
     double t_load0 = now_s();
     if (!load_gpu_model(g, model, true)) return 1;
+    if (!dfly_override.empty()) {
+        std::string derr;
+        if (!load_dfly_override(g, dfly_override, derr)) { fprintf(stderr, "%s\n", derr.c_str()); return 1; }
+    }
     fprintf(stderr, "[load] total %.1f s\n", now_s() - t_load0);
     if (load_only) return 0;
     // HY4-VISION: decode + resize the pictures and expand each image-pad token of the prompt to the picture's run of pads (CPU only; the ViT runs after the runner is up)
@@ -618,6 +624,8 @@ int main(int argc, char** argv) {
     double t0 = now_s();
     int done = 0;
     int V = r.c.vocab;
+    r.pf_eng_tok = tok.data();
+    r.pf_eng_total = T0;
     r.prefetch_engram(tok.data(), 0, std::min(r.Tc, T0));
     std::vector<float> hl;
     int last_p0 = 0, last_T = 0;
@@ -628,7 +636,6 @@ int main(int argc, char** argv) {
             return 1;
         }
         done += T;
-        if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
         bool last = done == T0;
         if (last) {
             last_p0 = done - T;
@@ -647,6 +654,8 @@ int main(int argc, char** argv) {
         }
         fprintf(stderr, "[prefill] %d/%d tokens, %.2f s, %.1f tok/s\n", done, T0, now_s() - t0, done / (now_s() - t0));
     }
+    r.pf_eng_tok = nullptr;
+    r.pf_eng_total = 0;
     double t_pf = now_s() - t0;
     r.prof_report("prefill");
     r.pacc_report("prefill", (T0 + r.Tc - 1) / r.Tc);

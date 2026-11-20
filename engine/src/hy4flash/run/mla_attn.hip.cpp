@@ -5,7 +5,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#if HY4_CUDA
+#include "sk_cublas_ctx.hip.h"
+#endif
 
 namespace hy4 {
 
@@ -1306,7 +1310,117 @@ static int max_keys_of(const MlaAttnArgs& a) {
 size_t mla_workspace_bytes(const MlaAttnArgs& a) { return mla_workspace_bytes(a.M, a.NH, max_keys_of(a)); }
 int mla_choose_splits(const MlaAttnArgs& a) { return choose_splits(a.M, a.NH, max_keys_of(a)); }
 
+#if HY4_CUDA
+// Pack q_nope[t0..t0+mt)[h][192] (f32) -> q_hm[h][dt][192] (f16) and RoPE q_pe[t0..t0+mt)[h][64] -> qa[t0+dt][h][512..576)
+__global__ void __launch_bounds__(256) k_mla_pack_qnope_rope(const float* __restrict__ q_b, __half* __restrict__ q_hm, __half* __restrict__ qa, int t0, int mt, int NH, int p0, float theta) {
+    const int h = blockIdx.x, dt = blockIdx.y, tid = threadIdx.x;
+    const int t = t0 + dt;
+    const float* qp = q_b + ((size_t)t * NH + h) * MLA_QHEAD;
+    if (tid < MLA_NOPE) {
+        q_hm[((size_t)h * mt + dt) * MLA_NOPE + tid] = __float2half(qp[tid]);
+    } else if (tid < MLA_NOPE + 32) {
+        const int i = tid - MLA_NOPE;
+        float o0, o1;
+        rope_pair(qp[MLA_NOPE + 2 * i], qp[MLA_NOPE + 2 * i + 1], p0 + t, i, theta, o0, o1);
+        *reinterpret_cast<__half2*>(qa + ((size_t)t * NH + h) * MLA_ROW + MLA_KV_LORA + 2 * i) = __floats2half2_rn(o0, o1);
+    }
+}
+__global__ void __launch_bounds__(256) k_mla_unpack_qa(const float* __restrict__ y_hm, __half* __restrict__ qa, int t0, int mt, int NH) {
+    const int h = blockIdx.x, dt = blockIdx.y, tid = threadIdx.x;
+    const float* src = y_hm + ((size_t)h * mt + dt) * MLA_KV_LORA + 2 * tid;
+    __half* dst = qa + ((size_t)(t0 + dt) * NH + h) * MLA_ROW + 2 * tid;
+    *reinterpret_cast<__half2*>(dst) = __floats2half2_rn(src[0], src[1]);
+}
+__global__ void __launch_bounds__(256) k_mla_pack_ctx(const __half* __restrict__ ctx, __half* __restrict__ ctx_hm, int t0, int mt, int NH) {
+    const int h = blockIdx.x, dt = blockIdx.y, tid = threadIdx.x;
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(ctx + ((size_t)(t0 + dt) * NH + h) * MLA_KV_LORA);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(ctx_hm + ((size_t)h * mt + dt) * MLA_KV_LORA);
+    dst[tid] = src[tid];  // 256 threads x 2 halves = 512 halves
+}
+__global__ void __launch_bounds__(256) k_mla_unpack_vup(const float* __restrict__ y_hm, const float* __restrict__ gate, __half* __restrict__ o, int t0, int mt, int NH) {
+    const int h = blockIdx.x, dt = blockIdx.y, tid = threadIdx.x;
+    float v = y_hm[((size_t)h * mt + dt) * MLA_VHEAD + tid];
+    const size_t gi = ((size_t)(t0 + dt) * NH + h) * MLA_VHEAD + tid;
+    if (gate) v *= 1.0f / (1.0f + expf(-gate[gi]));
+    o[gi] = __float2half(v);
+}
+
+static bool mla_prep_q_cublas(hipStream_t s, const float* q_b, const __half* wk_b, __half* qa, int M, int NH, int p0, float theta) {
+    skd::CublasPfState& st = skd::cublas_pf();
+    if (!st.ensure(s)) return false;
+    // Per token needs NH * (192*2 + 512*4) = NH * 2432 bytes
+    const size_t per_tok = (size_t)NH * ((size_t)MLA_NOPE * 2 + (size_t)MLA_KV_LORA * 4);
+    int MT = (int)(st.total_bytes / per_tok);
+    MT = std::min(M, std::min(512, (MT / 32) * 32));
+    if (MT < 32) return false;
+    if (cublasSetStream(st.handle, s) != CUBLAS_STATUS_SUCCESS) return false;
+    const float alpha = 1.0f, beta = 0.0f;
+    uint8_t* raw = reinterpret_cast<uint8_t*>(st.base);
+    for (int t0 = 0; t0 < M; t0 += MT) {
+        const int mt = std::min(MT, M - t0);
+        __half* q_hm = reinterpret_cast<__half*>(raw);
+        const size_t q_bytes = (((size_t)NH * mt * MLA_NOPE * 2) + 255) & ~(size_t)255;
+        float* y_hm = reinterpret_cast<float*>(raw + q_bytes);
+        k_mla_pack_qnope_rope<<<dim3(NH, mt), dim3(256), 0, s>>>(q_b, q_hm, qa, t0, mt, NH, p0, theta);
+        cublasStatus_t cst = cublasGemmStridedBatchedEx(
+            st.handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            MLA_KV_LORA, mt, MLA_NOPE,
+            &alpha,
+            wk_b, CUDA_R_16F, MLA_KV_LORA, (long long)MLA_NOPE * MLA_KV_LORA,
+            q_hm, CUDA_R_16F, MLA_NOPE, (long long)mt * MLA_NOPE,
+            &beta,
+            y_hm, CUDA_R_32F, MLA_KV_LORA, (long long)mt * MLA_KV_LORA,
+            NH, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (cst != CUBLAS_STATUS_SUCCESS) { st.release_full(s); return false; }
+        k_mla_unpack_qa<<<dim3(NH, mt), dim3(256), 0, s>>>(y_hm, qa, t0, mt, NH);
+    }
+    st.release_full(s);
+    return true;
+}
+
+static bool mla_vup_cublas(hipStream_t s, const __half* ctx, const __half* wv_b, const float* gate, __half* o, int M, int NH) {
+    skd::CublasPfState& st = skd::cublas_pf();
+    if (!st.ensure(s)) return false;
+    // Per token needs NH * (512*2 + 256*4) = NH * 2048 bytes
+    const size_t per_tok = (size_t)NH * ((size_t)MLA_KV_LORA * 2 + (size_t)MLA_VHEAD * 4);
+    int MT = (int)(st.total_bytes / per_tok);
+    MT = std::min(M, std::min(512, (MT / 32) * 32));
+    if (MT < 32) return false;
+    if (cublasSetStream(st.handle, s) != CUBLAS_STATUS_SUCCESS) return false;
+    const float alpha = 1.0f, beta = 0.0f;
+    uint8_t* raw = reinterpret_cast<uint8_t*>(st.base);
+    for (int t0 = 0; t0 < M; t0 += MT) {
+        const int mt = std::min(MT, M - t0);
+        __half* ctx_hm = reinterpret_cast<__half*>(raw);
+        const size_t c_bytes = (((size_t)NH * mt * MLA_KV_LORA * 2) + 255) & ~(size_t)255;
+        float* y_hm = reinterpret_cast<float*>(raw + c_bytes);
+        k_mla_pack_ctx<<<dim3(NH, mt), dim3(256), 0, s>>>(ctx, ctx_hm, t0, mt, NH);
+        cublasStatus_t cst = cublasGemmStridedBatchedEx(
+            st.handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            MLA_VHEAD, mt, MLA_KV_LORA,
+            &alpha,
+            wv_b, CUDA_R_16F, MLA_KV_LORA, (long long)MLA_VHEAD * MLA_KV_LORA,
+            ctx_hm, CUDA_R_16F, MLA_KV_LORA, (long long)mt * MLA_KV_LORA,
+            &beta,
+            y_hm, CUDA_R_32F, MLA_VHEAD, (long long)mt * MLA_VHEAD,
+            NH, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (cst != CUBLAS_STATUS_SUCCESS) { st.release_full(s); return false; }
+        k_mla_unpack_vup<<<dim3(NH, mt), dim3(256), 0, s>>>(y_hm, gate, o, t0, mt, NH);
+    }
+    st.release_full(s);
+    return true;
+}
+#endif
+
+static int cublas_mla_mode() {
+    static int v = getenv("HY4_CUBLAS_MLA") ? atoi(getenv("HY4_CUBLAS_MLA")) : 2;
+    return v;
+}
+
 void mla_prep_q(hipStream_t s, const float* q_b, const __half* wk_b, __half* qa, int M, int NH, int p0, float theta) {
+#if HY4_CUDA
+    if (!g_mla_force_simple && cublas_mla_mode() >= 2 && M >= skd::cublas_pf_min_m() && mla_prep_q_cublas(s, q_b, wk_b, qa, M, NH, p0, theta)) return;
+#endif
     constexpr int TT = 8;
     dim3 grid(NH, (M + TT - 1) / TT);
     hipLaunchKernelGGL((k_prep_q<TT>), grid, dim3(256), 0, s, q_b, wk_b, qa, M, NH, p0, theta);
@@ -1372,6 +1486,9 @@ void mla_attend(hipStream_t s, const __half* qa, const __half* cache, const floa
 }
 
 void mla_vup(hipStream_t s, const __half* ctx, const __half* wv_b, const float* gate, __half* o, int M, int NH) {
+#if HY4_CUDA
+    if (!g_mla_force_simple && cublas_mla_mode() >= 1 && M >= skd::cublas_pf_min_m() && mla_vup_cublas(s, ctx, wv_b, gate, o, M, NH)) return;
+#endif
 #if HY4_MMA
     if (!g_mla_force_simple) {
         hipLaunchKernelGGL(k_head_gemm<1>, dim3(MLA_VHEAD / HG_BN, (M + HG_BM - 1) / HG_BM, NH), dim3(256), 0, s, (const void*)ctx, wv_b, gate, o, M, NH, 0, 0.f);
