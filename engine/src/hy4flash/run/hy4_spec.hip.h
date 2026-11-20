@@ -328,12 +328,17 @@ public:
                 if (tr.parent[i] != i - 1) { is_branched = true; break; }
             if (is_branched) ++S.tree_steps;
             // verify tree (or linear fast path when !is_branched)
+            const bool chk_fr_was = r.vcache_frozen;
+            if (cfg.check && !prob_mode) {
+                r.vcache_flush();
+                r.vcache_frozen = true;
+            }
             const double tv0 = now_s();
             if (!is_branched) {
                 for (int i = 1; i < T; ++i) tok.push_back(tr.tok[i]);
-                if (!r.forward_chunk(tok.data(), a, T, err, nullptr)) { finish = "error"; break; }
+                if (!r.forward_chunk(tok.data(), a, T, err, nullptr)) { r.vcache_frozen = chk_fr_was; finish = "error"; break; }
             } else {
-                if (!r.forward_chunk(tok.data(), a, T, err, &tr)) { finish = "error"; break; }
+                if (!r.forward_chunk(tok.data(), a, T, err, &tr)) { r.vcache_frozen = chk_fr_was; finish = "error"; break; }
             }
             r.head(T, 0);
             int path[9] = {};
@@ -409,10 +414,7 @@ public:
             d.snap_h(u);
             if (is_branched) r.commit_tree_path(a, path, n);
             if (cfg.check && !prob_mode) {
-                // diagnostic: recompute rows 0..n one token at a time and compare them with the window's rows (bitwise); freeze vcache during comparison
-                const bool was_fr = r.vcache_frozen;
-                r.vcache_flush();
-                r.vcache_frozen = true;
+                // diagnostic: recompute rows 0..n one token at a time and compare them with the window's rows (bitwise); vcache already flushed & frozen before verify
                 std::vector<float> wl((size_t)T * V), sl(V);
                 HCK(hipMemcpy(wl.data(), r.logits, (size_t)T * V * 4, hipMemcpyDeviceToHost));
                 std::vector<int32_t> chk_tok(tok.begin(), tok.begin() + (size_t)a + 1);
@@ -434,7 +436,7 @@ public:
                                                      (int)(std::max_element(wl.begin() + (size_t)row_idx * V, wl.begin() + (size_t)(row_idx + 1) * V) - wl.begin() - (size_t)row_idx * V));
                     }
                 }
-                r.vcache_frozen = was_fr;
+                r.vcache_frozen = chk_fr_was;
                 if (finish == "error") break;
             }
             if (want_margin)

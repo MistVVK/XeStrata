@@ -277,9 +277,9 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         return arena + c * 0.195e6 / GB + 0.22 + 30.0 * (512.0 + c) * 1152.0 / GB;
     };
     if (chunk <= 0) {
-        // 16 GB+ cards default to Tc = 8192 when ctx > 4096 (halves PCIe passes 32->16 at 128K; capped to 4096 when ctx <= 4096 to keep max expert cache!)
+        // 16 GB+ cards default to Tc = 8192 when ctx >= 8192 (halves PCIe passes 32->16 at 128K; capped to 4096 for <=4K sessions to maximize expert cache!)
         // 12 GB -> 2048; 8 GB -> 1024/512
-        int c = (tot >= 15.0) ? ((max_ctx > 4096) ? 8192 : 4096) : (tot >= 11.0 ? 2048 : 1024);
+        int c = (tot >= 15.0) ? ((max_ctx >= 8192) ? 8192 : 4096) : (tot >= 11.0 ? 2048 : 1024);
         const double work_cap = (tot >= 15.0) ? 0.22 : 0.16;
         while (c > 256 && est_work_gb(c) > work_cap * tot) c >>= 1;
         while (c > 256 && trunk + est_work_gb(c) + kv_init_gb + wkv + cublas_gb + 0.55 > tot) c >>= 1;
