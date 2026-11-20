@@ -60,7 +60,7 @@ struct Input {
     bool batch_mtp = false;    ///< --batch-mtp is on (it passed the gates that do not concern the groups)
     bool adapt_async = false;  ///< --adapt-async 1 was asked for
     bool mtp_serial = false;   ///< STRATA_BATCH_MTP_SERIAL=1: --batch-mtp with no --batch-groups runs one serial group (0.1.43)
-    bool nv_serial_faster = false;   ///< opt-in: every GPU on CUDA, two cards, STRATA_BATCH_GROUPS_NV_SERIAL=1 - one serial group (upstream 0.2.1-0.2.6's default)
+    bool serial_faster = false;   ///< opt-in: two cards that reach each other's memory (peer access), STRATA_BATCH_GROUPS_NV_SERIAL=1 - one serial group (upstream 0.2.1-0.2.6's default on two NVIDIA cards)
     bool mtp_piped = false;    ///< STRATA_PIPED_MTP=1: the pipelined groups draft too (each group carries its slots' rows)
 };
 
@@ -93,7 +93,7 @@ inline Result resolve(const Input& in) {
         r.groups = r.would_be;
         if (!in.set && r.would_be > 1) {   // only the default gives way; `--batch-groups auto` asked for the pipeline
             if (in.batch_mtp && in.mtp_serial) r.serial = Serial::BatchMtp;
-            else if (in.nv_serial_faster && in.later_stages == 1 && !in.batch_mtp && !in.adapt_async) r.serial = Serial::TwoCardsSerialFaster;
+            else if (in.serial_faster && in.later_stages == 1 && !in.batch_mtp && !in.adapt_async) r.serial = Serial::TwoCardsSerialFaster;
             else if (in.adapt_async) r.serial = Serial::AdaptAsync;
             if (r.serial != Serial::None) r.groups = 1;
             r.mtp_dropped = in.batch_mtp && r.serial == Serial::None;
@@ -110,7 +110,7 @@ inline Result resolve(const Input& in) {
 
 inline const char* serial_what(Serial s) {
     return s == Serial::BatchMtp ? "--batch-mtp" : s == Serial::AdaptAsync ? "--adapt-async 1"
-         : s == Serial::TwoCardsSerialFaster ? "serial windows (XESTRATA_BATCH_GROUPS_NV_SERIAL=1 asked for them on two NVIDIA cards; --batch-groups auto pipelines)" : "";
+         : s == Serial::TwoCardsSerialFaster ? "serial windows (XESTRATA_BATCH_GROUPS_NV_SERIAL=1 asked for them on two cards with peer access; --batch-groups auto pipelines)" : "";
 }
 
 }  // namespace strata::program::batch_groups

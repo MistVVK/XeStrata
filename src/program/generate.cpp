@@ -5112,14 +5112,18 @@ int main(int argc, char** argv) {
             bin.mtp_serial = batch_mtp_serial();
             bin.mtp_piped = piped_mtp_asked;
             bin.adapt_async = o.adapt_async == 1;
-            {   // two NVIDIA cards: one serial group only with STRATA_BATCH_GROUPS_NV_SERIAL=1 (upstream f680a80d8 made it
-                // the default; upstream ec8e40590 went back to the pipeline, measured faster with 0.2.7's code on 2x RTX A6000
-                // and 2x RTX A4000 at 2 and 4 streams).  Every GPU of the split on CUDA, as upstream's NVIDIA build.
-                // Unmeasured here (no machine with two NVIDIA cards)
-                const char* nv = strata::env_get("BATCH_GROUPS_NV_SERIAL");
-                bool all_cuda = strata::core::device_info(strata::core::current_device()).backend == "CUDA";
-                for (const auto& st : stages) all_cuda = all_cuda && strata::core::device_info(st->dev).backend == "CUDA";
-                bin.nv_serial_faster = all_cuda && nv != nullptr && nv[0] != '\0' && nv[0] != '0';
+            {   // one serial group only with STRATA_BATCH_GROUPS_NV_SERIAL=1 (upstream f680a80d8 made it two NVIDIA cards'
+                // default; upstream ec8e40590 went back to the pipeline, measured faster with 0.2.7's code on 2x RTX A6000
+                // and 2x RTX A4000 at 2 and 4 streams), on cards that reach each other's memory both ways as those do
+                // (peer access), whatever their maker.  Unmeasured here (no machine with two such cards)
+                const char* v = strata::env_get("BATCH_GROUPS_NV_SERIAL");
+                bool peers = !stages.empty();
+                int prev = strata::core::current_device();
+                for (const auto& st : stages) {
+                    peers = peers && strata::gpu::peer_access(prev, st->dev) && strata::gpu::peer_access(st->dev, prev);
+                    prev = st->dev;
+                }
+                bin.serial_faster = peers && v != nullptr && v[0] != '\0' && v[0] != '0';
             }
             const auto r = strata::program::batch_groups::resolve(bin);
             if (r.from_auto) {

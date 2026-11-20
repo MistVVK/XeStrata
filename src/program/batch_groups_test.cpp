@@ -151,19 +151,19 @@ int main() {
     }
     {   // PROPOSED NVIDIA default: two cards, nothing given: serial windows (measured +12..16% on 2x A4000)
         bg::Input i = in(4, 1);
-        i.nv_serial_faster = true;
+        i.serial_faster = true;
         auto r = bg::resolve(i);
         check(r.groups == 1 && r.from_auto && r.serial == bg::Serial::TwoCardsSerialFaster && r.would_be == 2,
-              "nv_serial_faster, 2 cards, 4 slots, nothing given: one group, named");
+              "serial_faster, 2 cards, 4 slots, nothing given: one group, named");
         check(bg::serial_what(r.serial)[0] == 's', "the reason names the measurement");
         check(bg::resolve(in(4, 1)).groups == 2, "flag off: the pipeline default stays");
-        i = in(8, 1); i.nv_serial_faster = true;   // measured too: +15%
+        i = in(8, 1); i.serial_faster = true;   // measured too: +15%
         check(bg::resolve(i).groups == 1, "8 slots (measured +15%): serial too");
-        i = in(4, 3); i.nv_serial_faster = true;
+        i = in(4, 3); i.serial_faster = true;
         check(bg::resolve(i).groups == 4, "4 cards (not measured): the pipeline stays");
-        i = in(4, 1); i.nv_serial_faster = true; i.batch_mtp = true;
+        i = in(4, 1); i.serial_faster = true; i.batch_mtp = true;
         check(bg::resolve(i).groups == 2 && bg::resolve(i).mtp_dropped, "with --batch-mtp the 0.1.43.1 rule is unchanged");
-        i = in(4, 1); i.nv_serial_faster = true; i.set = true; i.auto_given = true;
+        i = in(4, 1); i.serial_faster = true; i.set = true; i.auto_given = true;
         check(bg::resolve(i).groups == 2, "--batch-groups auto given: the pipeline");
         i.auto_given = false; i.given = 2;
         check(bg::resolve(i).groups == 2, "--batch-groups 2 given: 2");
