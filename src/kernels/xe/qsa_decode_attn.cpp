@@ -294,7 +294,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                     int host = 0;
                     if (t < n_here) {
                         const int cell = dense ? lo + c0 + t : ids[c0 + t];
-                        if (dense && p.host.present() && cell < n_all - p.resident) {
+                        if ((dense || p.sparse_host) && p.host.present() && cell < step[kStepNKv] - p.resident) {
                             // the host copy, identity layout: block cell / page_size, its own KV head's run
                             r = ((long long) (cell / page_size) * n_kv_real + kv_real) * page_size + (cell % page_size);
                             host = 1;

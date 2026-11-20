@@ -304,9 +304,31 @@ bool run_dense(int fmt) {
             if (bad++ < 5) std::fprintf(stderr, "  %s dense pos %lld n_q %d: streamed attention differs\n",
                                         name, (long long) pos, n_q);
         }
+        // Sparse selections in the plain engine read old cells from the host and the recent cells from the ring.
+        constexpr int CAP = 256;
+        std::vector<int32_t> selected((size_t) n_q * CAP);
+        for (int t = 0; t < n_q; ++t) {
+            const int cells = hst[t * 4 + 1], width = std::min(cells, CAP);
+            hst[t * 4 + 3] = width;
+            for (int j = 0; j < width; ++j)
+                selected[(size_t) t * CAP + j] = width == 1 ? 0 : (int32_t) ((int64_t) j * (cells - 1) / (width - 1));
+        }
+        int32_t* dids = dalloc<int32_t>((size_t) n_q * CAP);
+        strata::parity::copy_bytes_in(dids, selected.data(), selected.size() * 4);
+        strata::parity::copy_bytes_in(steps, hst.data(), hst.size() * 4);
+        sp.sparse_host = true;
+        k::qsa_decode_attn_batch(q, ref.attn(ident), dids, steps, CAP, s, scratch, out_ref, n_q, nullptr);
+        k::qsa_decode_attn_batch(q, sp, dids, steps, CAP, s, scratch, out_str, n_q, nullptr);
+        strata::parity::sync();
+        strata::parity::copy_bytes_out(a.data(), out_ref, (size_t) n_q * NH * D * 4);
+        strata::parity::copy_bytes_out(b2.data(), out_str, (size_t) n_q * NH * D * 4);
+        if (std::memcmp(a.data(), b2.data(), (size_t) n_q * NH * D * 4) != 0) {
+            if (bad++ < 5) std::fprintf(stderr, "  %s sparse pos %lld n_q %d: streamed attention differs\n",
+                                        name, (long long) pos, n_q);
+        }
         ++checks;
     }
-    std::printf("  %s dense: %d windows, %d failures\n", name, checks, bad);
+    std::printf("  %s dense and sparse: %d windows, %d failures\n", name, checks, bad);
     return bad == 0;
 }
 }  // namespace

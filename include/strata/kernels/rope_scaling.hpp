@@ -173,6 +173,25 @@ inline void rope_scaled_angle(float theta_extrap, float freq_scale, float corr_l
 }
 
 #if defined(SYCL_LANGUAGE_VERSION)
+/// The rotary table used by an FP32 indexer trained against a BF16 backbone: build and blend inverse frequencies
+/// before multiplying by position, as the training table does. The caller rounds the resulting coefficients to BF16.
+inline void rope_bf16_table_cs(float pos, int pair, int n_rot, float base, bool scaled,
+                               const RopeKernelArgs& a, float& c, float& s) {
+    const float denom = sycl::pow(base, float(2 * pair) / float(n_rot));
+    const float extrap = 1.0f / denom;
+    float inv = extrap, amplitude = 1.0f;
+    if (scaled) {
+        const float interp = 1.0f / (denom / a.freq_scale);
+        const float ramp = rope_yarn_ramp(a.corr_low, a.corr_high, pair) * a.ext_factor;
+        inv = interp * (1.0f - ramp) + extrap * ramp;
+        amplitude = a.attn_factor;
+        if (a.ext_factor != 0.0f) amplitude *= 1.0f + 0.1f * sycl::log(1.0f / a.freq_scale);
+    }
+    const float angle = pos * inv;
+    c = sycl::cos(angle) * amplitude;
+    s = sycl::sin(angle) * amplitude;
+}
+
 /// cos and sin of a pair's trained angle `theta`: as the unscaled kernels take them (sycl::cos / sycl::sin) when
 /// `scaled` is false, else through rope_scaled_angle with the process's constants.  `scaled` is the same for every
 /// work-item of a launch.

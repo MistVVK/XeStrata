@@ -44,6 +44,7 @@ struct QsaAttnPools {
     /// reads each host cell once (no KV-head split). Empty / 0: every cell through page_table, as before.
     KvHostPools host;
     int32_t resident = 0;
+    bool sparse_host = false;   ///< selected cells outside the ring read the authoritative host copy as dense does
 };
 
 /// A batch window's queries, each with its own slot's pools (upstream 7a9245b6c): query z reads rows.p[z].

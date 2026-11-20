@@ -10,6 +10,7 @@
 // here pow, cos and sin are the precise SYCL functions.
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/qk_norm_rope.hpp"
 #include "strata/core/on_device.hpp"
@@ -198,7 +199,8 @@ bool native_norm_rope_usable(int head_dim, int n_rot) {
 // fixed. On RX 9060 XT, 32K decode fell from 41.972 to 41.719 tokens/s (all three alternating pairs slower), so this
 // path stays.
 void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out, int rows, int head_dim,
-                              int n_rot, float epsilon, const RopeScaling& scaling, const int* positions, void* stream) {
+                              int n_rot, float epsilon, const RopeScaling& scaling, const int* positions, void* stream,
+                              bool bf16_table) {
     if (!x || !gamma || !out || !positions || !stream || rows < 1 || rows > 65535 ||
         (head_dim != 128 && head_dim != 256) || in_stride < head_dim || (n_rot != 64 && n_rot != head_dim) ||
         !std::isfinite(epsilon) ||
@@ -208,6 +210,7 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
         throw std::invalid_argument("native_qsa_rms_norm_rope: invalid arguments");
     constexpr int BlockSize = 256;
     const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
+    const float theta_base = (float) scaling.freq_base;
     const MRope mtab = mrope_for(n_rot);   // as native_rope_apply
     const bool scaled = scaling.type != RopeScalingType::None;
     const RopeKernelArgs ka = scaling.kernel_args(n_rot);
@@ -244,8 +247,12 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
                 const float a = scale * x_tid * gamma[tid], b = scale * x_hi * gamma[tid + half];
                 const int p = mrope_pos(mtab, positions[row], tid);
                 float c, s;
-                if (!rope_tab_cs(tab, p, tid, c, s))
+                if (bf16_table) {
+                    rope_bf16_table_cs((float) p, tid, n_rot, theta_base, scaled, ka, c, s);
+                    c = f32_from_bf16(bf16_from_f32(c)); s = f32_from_bf16(bf16_from_f32(s));
+                } else if (!rope_tab_cs(tab, p, tid, c, s)) {
                     rope_cos_sin((float) p * sycl::pow(theta_scale, float(tid)), scaled, ka, tid, c, s);
+                }
                 o[tid] = a * c - b * s;
                 o[tid + half] = a * s + b * c;
             }
