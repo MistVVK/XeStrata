@@ -3,8 +3,14 @@
 //   modes: num     numeric check vs an fp32/double dequant reference (+ determinism over thread counts, T>512 chunking)
 //          bench   T = 1,4,8,64 timing, 16 experts/token, nlayers fully resident; DRAM read ceiling
 //          stress  ~10% random residency over all layers, unresident / invalid pairs must be skipped
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#include "hy4_io.h"
+#else
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -71,8 +77,14 @@ static long smaps_kb(const char* key) {  // from /proc/self/smaps_rollup
     return v;
 }
 static void ram_line(const char* tag) {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        std::printf("[ram] %s: WorkingSet %.2f GB, PeakWorkingSet %.2f GB\n", tag, pmc.WorkingSetSize / 1073741824.0, pmc.PeakWorkingSetSize / 1073741824.0);
+#else
     std::printf("[ram] %s: VmRSS %.2f GB, VmHWM(peak) %.2f GB, AnonHugePages %.2f GB\n", tag, vm_kb("VmRSS:") / 1048576.0, vm_kb("VmHWM:") / 1048576.0,
                 smaps_kb("AnonHugePages:") / 1048576.0);
+#endif
 }
 
 // quantize-dequantize 1536 floats with the same Q8_1_G64 rule the evaluator uses (for the tight "same activations" check)
@@ -566,7 +578,11 @@ static void print_cold_stats(const char* tag, const CpuExpertStats& s) {
 
 // cold vs all-resident must be bit-exact (bodies from the arena, from the slot cache and from the file give identical results)
 static int test_cold(const std::string& path, int nth) {
+#ifdef _WIN32
+    _putenv_s("STRATA_CPUEXP_COLD_CACHE_MB", "16");  // 4 slots of ~4 MB: forces many waves and evictions
+#else
     setenv("STRATA_CPUEXP_COLD_CACHE_MB", "16", 1);  // 4 slots of ~4 MB: forces many waves and evictions
+#endif
     Rng rng(5);
     const int layers[2] = {3, 7};
     std::vector<std::vector<bool>> all(41, std::vector<bool>(512, false)), half(41, std::vector<bool>(512, false)), cold_half(41, std::vector<bool>(512, false)),
@@ -703,6 +719,42 @@ static int test_coldbench(const std::string& path, int nlayers, int nth, int R, 
 
 // raw pread throughput of the model file: coldio <file> <block MB> <qd> <seq|rand> <direct|buffered> <seconds>
 static int test_rawio(const std::string& path, double block_mb, int qd, bool rnd, bool direct, double secs) {
+#ifdef _WIN32
+    hy4::AlignedFile af;
+    if (!af.open(path, direct)) { std::printf("open failed (%s)\n", direct ? "NO_BUFFERING" : "buffered"); return 1; }
+    const uint64_t fsize = af.size();
+    const size_t blk = ((size_t)(block_mb * 1048576.0) + 4095) & ~(size_t)4095;
+    std::atomic<uint64_t> bytes{0}, ops{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> th;
+    const double t0 = now_s();
+    for (int i = 0; i < qd; ++i)
+        th.emplace_back([&, i]() {
+            void* buf = VirtualAlloc(nullptr, blk, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (!buf) return;
+            hy4::AlignedFile tf;
+            if (!tf.open(path, direct)) { VirtualFree(buf, 0, MEM_RELEASE); return; }
+            Rng r(1000 + i);
+            uint64_t pos = ((fsize / 2 / qd) * i) & ~4095ull;
+            while (!stop.load()) {
+                uint64_t off;
+                if (rnd) off = (r.next() % (fsize - blk)) & ~4095ull;
+                else { off = pos; pos += blk; if (pos + blk > fsize) pos = 0; }
+                const size_t n = tf.read_at(off, buf, blk);
+                if (n == 0) break;
+                bytes.fetch_add((uint64_t)n);
+                ops.fetch_add(1);
+            }
+            VirtualFree(buf, 0, MEM_RELEASE);
+        });
+    std::this_thread::sleep_for(std::chrono::milliseconds((int)(secs * 1000)));
+    stop.store(true);
+    for (auto& t : th) t.join();
+    const double dt = now_s() - t0;
+    std::printf("rawio %s %s block %.1f MB qd %d: %.2f GB/s, %.0f reads/s (%.1f s)\n", rnd ? "random" : "sequential", direct ? "NO_BUFFERING" : "buffered", block_mb, qd,
+                bytes.load() / dt / 1e9, ops.load() / dt, dt);
+    return 0;
+#else
     const int fd = ::open(path.c_str(), O_RDONLY | (direct ? O_DIRECT : 0));
     if (fd < 0) { std::printf("open failed (%s)\n", direct ? "O_DIRECT" : "buffered"); return 1; }
     const off_t fsize = lseek(fd, 0, SEEK_END);
@@ -736,6 +788,7 @@ static int test_rawio(const std::string& path, double block_mb, int qd, bool rnd
                 bytes.load() / dt / 1e9, ops.load() / dt, dt);
     ::close(fd);
     return 0;
+#endif
 }
 
 // decode-token SSD read rate for a resident rank prefix: p(rank r) ~ 1/(r+8), 16 distinct experts per layer, LRU slot cache
