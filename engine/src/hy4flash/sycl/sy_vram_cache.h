@@ -303,10 +303,11 @@ public:
                 if (d_ptr_[(size_t)L * 512 + e] != nullptr) vram_mask[L][e] = true;
     }
 
-    // Evaluate all VRAM-resident (token, slot) pairs for MoE layer L (0..40) on the GPU (asynchronous on Q()).
-    // Builds use_cpu[T*16] = 1 for CPU misses, 0 for VRAM hits. Returns number of VRAM-hit pairs evaluated on GPU.
-    // zout_gpu_dev: float [T][1536] (written with VRAM-hit partial sum; zeroed for tokens with 0 VRAM hits).
-    int run_decode(int L, int T, const float* z_dev, const int32_t* idx_host, const float* w_host, uint8_t* use_cpu, float* zout_gpu_dev) {
+    // Step 1 (host-only, ~1 us): plan VRAM hits vs CPU misses and fill use_cpu[T*16].
+    // Call BEFORE ucx.submit() so CPU threads start immediately without waiting on SYCL kernel submission!
+    int plan_decode(int L, int T, const int32_t* idx_host, const float* w_host, uint8_t* use_cpu) {
+        planned_pairs_ = 0;
+        planned_T_ = T;
         if (!active() || T <= 0 || T > MAX_T) {
             if (use_cpu) std::memset(use_cpu, 1, (size_t)T * vcache_detail::VC_NTOP);
             return 0;
@@ -314,7 +315,6 @@ public:
         int npairs = 0;
         h_tok_off_[0] = 0;
         for (int t = 0; t < T; ++t) {
-            // Collect VRAM hits for token t and sort by ascending expert_id for bitwise determinism (plain == DFly2)
             int hit_k[vcache_detail::VC_NTOP], nh = 0;
             for (int k = 0; k < vcache_detail::VC_NTOP; ++k) {
                 const int e = idx_host[t * vcache_detail::VC_NTOP + k];
@@ -352,7 +352,15 @@ public:
             }
             h_tok_off_[t + 1] = npairs;
         }
-        if (npairs == 0) return 0;
+        planned_pairs_ = npairs;
+        return npairs;
+    }
+
+    // Step 2 (async on Q()): enqueue GPU evaluation of planned VRAM hits while CPU threads run in parallel.
+    void launch_decode(const float* z_dev, float* zout_gpu_dev) {
+        const int npairs = planned_pairs_;
+        const int T = planned_T_;
+        if (npairs <= 0) return;
 
         Q().memcpy(d_pairs_, h_pairs_, (size_t)npairs * sizeof(vcache_detail::VramPair));
         Q().memcpy(d_tok_off_, h_tok_off_, (size_t)(T + 1) * sizeof(int32_t));
@@ -362,8 +370,6 @@ public:
         float* ye = d_ye_;
         const int32_t* toff = d_tok_off_;
 
-        // Kernel 1: Gate + Up + SwiGLU + /sq_xd_dn -> hmid[npairs][1536] (half)
-        // 192 workgroups per pair (8 SG32 subgroups/WG = 8 rows each -> 1536 rows)
         Q().parallel_for(NR((size_t)npairs * 192, 256), [=](sycl::nd_item<1> it) REQD_SG32 {
             const int gid = (int)it.get_group(0);
             const int p = gid / 192, rb = gid % 192;
@@ -383,7 +389,6 @@ public:
             }
         });
 
-        // Kernel 2: Down projection -> ye[npairs][1536] (float)
         Q().parallel_for(NR((size_t)npairs * 192, 256), [=](sycl::nd_item<1> it) REQD_SG32 {
             const int gid = (int)it.get_group(0);
             const int p = gid / 192, rb = gid % 192;
@@ -396,7 +401,6 @@ public:
             if (lane == 0) ye[(size_t)p * vcache_detail::VC_K + d] = y;
         });
 
-        // Kernel 3: Deterministic per-token reduce in ascending expert_id order
         Q().parallel_for(NR(T, 256), [=](sycl::nd_item<1> it) {
             const int t = (int)it.get_group(0), tid = (int)it.get_local_id(0);
             const int p0 = toff[t], p1 = toff[t + 1];
@@ -406,7 +410,12 @@ public:
                 zout_gpu_dev[(size_t)t * vcache_detail::VC_K + d] = acc;
             }
         });
-        return npairs;
+    }
+
+    int run_decode(int L, int T, const float* z_dev, const int32_t* idx_host, const float* w_host, uint8_t* use_cpu, float* zout_gpu_dev) {
+        const int n = plan_decode(L, T, idx_host, w_host, use_cpu);
+        if (n > 0) launch_decode(z_dev, zout_gpu_dev);
+        return n;
     }
 
     // Add CPU partial zout to GPU VRAM partial zout: zout_f[i] += zout_gpu[i]
@@ -418,26 +427,28 @@ public:
     }
 
     // Online LFU-decay promotion (call ONLY between decode/verify steps for bitwise plain == DFly2 determinism!).
+    // Tuned to real 41-layer SQ-64 routing traces: no pinned static core (core_frac=0), decay=0.965/step,
+    // up to 2 swaps/layer (capped globally per step to keep swap bandwidth bounded).
     // get_host_body(L, e) returns host RAM pointer to expert body (or nullptr if cold/unavailable).
     template <class BodyFn>
-    void step_adapt(BodyFn&& get_host_body, int max_swaps = 2) {
+    void step_adapt(BodyFn&& get_host_body, int max_swaps = 16) {
         if (!active() || !adaptive_) { pending_candidates_.clear(); return; }
         ++step_ctr_;
-        if ((step_ctr_ & 15) == 0) {
-            for (float& s : scores_) s *= 0.92f;
-        }
+        for (float& s : scores_) s *= 0.965f;
         int swapped = 0;
+        uint8_t layer_swaps[64] = {};
         for (int key : pending_candidates_) {
             if (swapped >= max_swaps) break;
             const int L = key >> 10, e = key & 511;
+            if ((unsigned)L >= 64u || layer_swaps[L] >= 2) continue;
             if (d_ptr_[(size_t)L * 512 + e] != nullptr) continue;
             const float sc = scores_[(size_t)L * 512 + e];
-            if (sc < 3.5f) continue;
+            if (sc < 1.8f) continue;
             const uint8_t* hbody = get_host_body(L, e);
             if (!hbody) continue;
-            // Find coldest resident slot in layer L
+            // Find coldest resident slot in layer L (core_frac=0: any resident slot can be evicted)
             int victim_slot = -1;
-            float worst_sc = sc / 1.5f;
+            float worst_sc = sc / 1.25f;
             for (int ee = 0; ee < 512; ++ee) {
                 const int sl = slot_of_[(size_t)L * 512 + ee];
                 if (sl >= 0 && scores_[(size_t)L * 512 + ee] < worst_sc) {
@@ -455,6 +466,7 @@ public:
             slots_[victim_slot].expert = e;
             d_ptr_[(size_t)L * 512 + e] = slots_[victim_slot].d_ptr;
             slot_of_[(size_t)L * 512 + e] = victim_slot;
+            ++layer_swaps[L];
             ++promotions_;
             ++swapped;
         }
@@ -485,6 +497,8 @@ private:
     int32_t* h_tok_off_ = nullptr;
     half* d_hmid_ = nullptr;
     float* d_ye_ = nullptr;
+    int planned_pairs_ = 0;
+    int planned_T_ = 0;
 };
 
 }  // namespace hy4s

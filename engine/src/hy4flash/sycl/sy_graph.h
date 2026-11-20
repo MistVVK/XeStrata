@@ -971,14 +971,13 @@ public:
             t_cpu_exp += now_s() - tc;
             return;
         }
-        // Decode / Verify (T <= 16): hybrid GPU VRAM cache hits (overlapped on Q()!) + unified CPU pool misses!
+        // Decode / Verify (T <= 16): overlap CPU misses (submitted FIRST!) with GPU VRAM cache hits!
         int vhits = 0;
         if (vcache && vcache->active() && T <= SyVramExpertCache::MAX_T) {
-            vhits = vcache->run_decode(il - 1, T, z_f, h_idx, h_w, h_use_cpu, zout_gpu_f);
-            if (vhits < T * 16) {
-                ucx.submit(il - 1, T, h_z, h_idx, h_w, h_use_cpu, h_zout, false);
-                ucx.wait();
-            }
+            vhits = vcache->plan_decode(il - 1, T, h_idx, h_w, h_use_cpu);
+            if (vhits < T * 16) ucx.submit(il - 1, T, h_z, h_idx, h_w, h_use_cpu, h_zout, false);
+            if (vhits > 0) vcache->launch_decode(z_f, zout_gpu_f);
+            if (vhits < T * 16) ucx.wait();
         } else {
             ucx.submit(il - 1, T, h_z, h_idx, h_w, nullptr, h_zout, false);
             ucx.wait();
