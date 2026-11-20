@@ -869,7 +869,7 @@ inline bool gemm_onemkl_fmt(const uint8_t* W, int N, int K, const half* X, float
 }
 
 inline bool gemm_onemkl(int fmt, const void* Wv, int N, int K, const half* X, float* Y, int M, bool rp = false) {
-    if (!onemkl_enabled() || M < 64 || (K & 255) || xmx_i8_mode() != 0) return false;
+    if (!onemkl_enabled() || M < 32 || (N & 63) || (K & 255) || xmx_i8_mode() != 0) return false;
     const uint8_t* W = (const uint8_t*)Wv;
     if (rp) {
         if (fmt == FMT_S4) return gemm_onemkl_fmt<FMT_S4, true>(W, N, K, X, Y, M);
