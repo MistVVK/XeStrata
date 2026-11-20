@@ -771,6 +771,7 @@ public:
             e = &ep[ep_next];
             HCK(hipEventSynchronize(e->used));
             ep_next ^= 1;
+            e->staged = false;  // synchronous fetch: no module-0-first publishing
             ep_compute(e, tok_all, p0, T);
         }
         if (!e->ok) {
