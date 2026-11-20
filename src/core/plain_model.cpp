@@ -1322,11 +1322,13 @@ bool PlainModel::load_qwen(std::string& err) {
             allocs_.push_back(p);
             return strata::gpu::memset(p, 0, bytes);
         };
+        // the pooled keys of max_cells as it is rounded up to whole pages below, which reset() clears
+        const int64_t cells = (opt_.max_cells + qs.page_size - 1) / qs.page_size * qs.page_size;
         for (size_t a = 0; a < qsa_weights_.size(); ++a) {
             if (!qsa_weights_[a].q.data) continue;
             auto& ib = qsa_index_[a];
             if (!take(ib.tail, size_t(3) * 128 * 4) || !take(ib.dead, size_t(128) * 4) ||
-                !take(ib.pooled, (size_t) (opt_.max_cells / 4 + 1) * 128 * 4) || !take(ib.block_pos, 4)) {
+                !take(ib.pooled, (size_t) (cells / 4 + 1) * 128 * 4) || !take(ib.block_pos, 4)) {
                 err = "plain model: no VRAM for the QSA indexer state";
                 return false;
             }
