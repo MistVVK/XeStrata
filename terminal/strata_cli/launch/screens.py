@@ -53,6 +53,20 @@ def middle_shorten(text: str, width: int, dots: str = "…") -> str:
     return head + dots + tail
 
 
+MIN_STAGE_BAR = 8        # the shortest a stage's bar is drawn
+
+
+def stage_bar_width(wide: int, screen_width: int, text_len: int) -> int:
+    """The cells of a stage's bar. `wide` (40 at most) is the bar's own width. It gives way so the phase words after it are whole in a small
+    window (0217 item 14), but only when giving way gets the words onto the line: a phrase that cannot fit beside even the shortest bar
+    ("Checking the files downloaded so far (54.8 of 84.5 GB); the download goes on after it", 89 characters) wraps under the bar at any width,
+    so the bar keeps its width there (the 0.2.17 retest saw it cut to 8 cells in a 110-column window, 0.2.16 drew 40)."""
+    room = screen_width - 14 - 7 - text_len
+    if room < MIN_STAGE_BAR:
+        return wide
+    return min(wide, room)
+
+
 def tuned_sentence(row) -> str:
     """The Advanced step's note for a narrow window (the Tuned column is left out there): what the tuner chose. Said only when the tuned value is
     not the default: "The tuner chose off." for a switch that is off by default, in a launch whose tuning step said Skip, claimed work nobody did
@@ -2121,7 +2135,7 @@ class RunScreen(Base):
             t.append(f"  {mark}{label:<10}", style=f"bold {style}")
             if st["pct"] is not None and st["status"] == "run":
                 # the bar gives way so the words after it (the phase: "Downloading the DFlash2 drafter ...") are whole in a small window (item 14: at 80 columns they wrapped under it)
-                own = max(8, min(width, self.width() - 14 - 7 - len(st["text"] or "")))
+                own = stage_bar_width(width, self.width(), len(st["text"] or ""))
                 t.append(bar(st["pct"] / 100.0, own, g) + f" {st['pct']:.0f}%  ", style=ACCENT)
             t.append((st["text"] or "") + "\n", style=FG if st["status"] == "run" else MUTE)
         for note in getattr(self, "notes", None) or []:       # 0217 item 7: stays under the rows for the whole launch
