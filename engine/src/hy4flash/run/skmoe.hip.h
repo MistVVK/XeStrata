@@ -13,6 +13,9 @@
 //   above it (prefill, verify windows): per active expert, WMMA grouped GEMMs with a 16/32/64/128-token tile chosen per expert
 // moe_experts_ref(): the simple phase-1.5 path (any M), kept for testing.
 #pragma once
+#if !HY4_CUDA
+#include "sk_rdna2.hip.h"
+#endif
 #include "skwmma.hip.h"
 #if HY4_MMA && !HY4_CUDA
 #include "sk_int8_rdna4.hip.h"
@@ -514,6 +517,140 @@ __global__ void __launch_bounds__(256) k_moe_dn_dec1_wl(const uint8_t* __restric
             break;
     }
 }
+
+#if !HY4_CUDA
+// ---------------------------------------------------------------- RDNA2 Wave32 sdot4 grouped MoE GEMMs (no WMMA, all 8 waves active, K-major int4 LDS reads)
+// Gate/up: block handles 32 gate rows (0..31) + 32 up rows (32..63) of expert e across BM tokens (BM in {16, 32, 64}).
+// Each thread computes TM tokens x TN_GU gate+up pairs directly (SPLIT_GU=true), so SwiGLU needs zero LDS exchange!
+template <int FMT, int BM, int TM, int TN_GU>
+__device__ __forceinline__ void gu_rdna2_body(rdna2::Rdna2Smem<BM, true>& sm, const uint8_t* body, int bx, int ty, int n, int base, const int* pairs, const __half* z, __half* h2) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    constexpr int T_N = 32 / TN_GU;
+    const int tid = threadIdx.x;
+    const int tn = tid % T_N, tm = tid / T_N;
+    const int m0 = tm * TM, n0 = tn * TN_GU;
+    const int drow = tid >> 2;
+    const int wrow = drow < 32 ? bx * 32 + drow : MOE_D + bx * 32 + (drow - 32);
+    const uint8_t* wr = body + 3072 + (size_t)wrow * 6 * SB;
+
+    float acc[TM][2 * TN_GU];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < 2 * TN_GU; ++j) acc[i][j] = 0.f;
+
+    auto xrow_fn = [&](int r) -> const __half* {
+        int ml = ty * BM + r;
+        ml = ml < n ? ml : n - 1;
+        return z + (size_t)(pairs[base + ml] >> 4) * MOE_D;
+    };
+
+    rdna2::rdna2_sdot4_loop<FMT, BM, TM, 2 * TN_GU, true, true>(sm, wr, 6, xrow_fn, m0, n0, acc);
+
+    const __half* sqx = (const __half*)body;
+#pragma unroll
+    for (int j = 0; j < TN_GU; ++j) {
+        const int c = bx * 32 + n0 + j;
+        const float sq = __half2float(sqx[c]);
+#pragma unroll
+        for (int i = 0; i < TM; ++i) {
+            const int ml = ty * BM + m0 + i;
+            if (ml < n) {
+                const float g = acc[i][j], u = acc[i][TN_GU + j];
+                const float sg = g / (1.0f + expf(-g));
+                const float hh = fminf(sg, 10.0f) * fminf(fmaxf(u, -10.0f), 10.0f);
+                h2[(size_t)(base + ml) * MOE_D + c] = __float2half(hh / sq);
+            }
+        }
+    }
+}
+
+template <int BM, int TM, int TN_GU>
+__global__ void __launch_bounds__(256, 2) k_moe_gu_rdna2(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ ex, const __half* __restrict__ z,
+                                                         const int* __restrict__ cnt, const int* __restrict__ off, const int* __restrict__ pairs,
+                                                         const int* __restrict__ active, const int* __restrict__ nact, __half* __restrict__ h2, int nlo, int nhi) {
+    __shared__ rdna2::Rdna2Smem<BM, true> sm;
+    if ((int)blockIdx.z >= *nact) return;
+    const int e = active[blockIdx.z];
+    const int n = cnt[e];
+    if (n <= nlo || n > nhi) return;
+    if ((int)blockIdx.y * BM >= n) return;
+    const ExpertDev ed = ex[e];
+    const uint8_t* body = sec4 + ed.body_off;
+    switch (ed.gu_code) {
+        case FMT_S1_25: gu_rdna2_body<FMT_S1_25, BM, TM, TN_GU>(sm, body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2); break;
+        case FMT_S1_5: gu_rdna2_body<FMT_S1_5, BM, TM, TN_GU>(sm, body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2); break;
+        case FMT_S2: gu_rdna2_body<FMT_S2, BM, TM, TN_GU>(sm, body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2); break;
+        case FMT_S3: gu_rdna2_body<FMT_S3, BM, TM, TN_GU>(sm, body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2); break;
+        case FMT_S4: gu_rdna2_body<FMT_S4, BM, TM, TN_GU>(sm, body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2); break;
+        case FMT_S5: gu_rdna2_body<FMT_S5, BM, TM, TN_GU>(sm, body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2); break;
+        case FMT_S6: gu_rdna2_body<FMT_S6, BM, TM, TN_GU>(sm, body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2); break;
+        case FMT_S8: gu_rdna2_body<FMT_S8, BM, TM, TN_GU>(sm, body, blockIdx.x, blockIdx.y, n, off[e], pairs, z, h2); break;
+        default: break;
+    }
+}
+
+template <int FMT, int BM, int TM, int TN>
+__device__ __forceinline__ void dn_rdna2_body(rdna2::Rdna2Smem<BM, true>& sm, const uint8_t* dnw, int bx, int ty, int n, int base, const int* pairs, const __half* h2, const float* topk_w, float* y) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    constexpr int T_N = rdna2::R2_BN / TN;
+    const int tid = threadIdx.x;
+    const int tn = tid % T_N, tm = tid / T_N;
+    const int m0 = tm * TM, n0 = tn * TN;
+    const uint8_t* wr = dnw + (size_t)(bx * rdna2::R2_BN + (tid >> 2)) * 6 * SB;
+
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.f;
+
+    auto xrow_fn = [&](int r) -> const __half* {
+        int ml = ty * BM + r;
+        ml = ml < n ? ml : n - 1;
+        return h2 + (size_t)(base + ml) * MOE_D;
+    };
+
+    rdna2::rdna2_sdot4_loop<FMT, BM, TM, TN, true, false>(sm, wr, 6, xrow_fn, m0, n0, acc);
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int ml = ty * BM + m0 + i;
+        if (ml >= n) continue;
+        const int pid = pairs[base + ml];
+        const float tw = topk_w[pid];
+        float* yp = y + (size_t)pid * MOE_D + bx * rdna2::R2_BN + n0;
+#pragma unroll
+        for (int j = 0; j < TN; ++j) yp[j] = acc[i][j] * tw;
+    }
+}
+
+template <int BM, int TM, int TN>
+__global__ void __launch_bounds__(256, 2) k_moe_dn_rdna2(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ ex, const float* __restrict__ topk_w,
+                                                         const int* __restrict__ cnt, const int* __restrict__ off, const int* __restrict__ pairs,
+                                                         const int* __restrict__ active, const int* __restrict__ nact, const __half* __restrict__ h2,
+                                                         float* __restrict__ y, int nlo, int nhi) {
+    __shared__ rdna2::Rdna2Smem<BM, true> sm;
+    if ((int)blockIdx.z >= *nact) return;
+    const int e = active[blockIdx.z];
+    const int n = cnt[e];
+    if (n <= nlo || n > nhi) return;
+    if ((int)blockIdx.y * BM >= n) return;
+    const ExpertDev ed = ex[e];
+    const uint8_t* dnw = sec4 + ed.body_off + ed.dn_off;
+    switch (ed.dn_code) {
+        case FMT_S1_25: dn_rdna2_body<FMT_S1_25, BM, TM, TN>(sm, dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y); break;
+        case FMT_S1_5: dn_rdna2_body<FMT_S1_5, BM, TM, TN>(sm, dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y); break;
+        case FMT_S2: dn_rdna2_body<FMT_S2, BM, TM, TN>(sm, dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y); break;
+        case FMT_S3: dn_rdna2_body<FMT_S3, BM, TM, TN>(sm, dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y); break;
+        case FMT_S4: dn_rdna2_body<FMT_S4, BM, TM, TN>(sm, dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y); break;
+        case FMT_S5: dn_rdna2_body<FMT_S5, BM, TM, TN>(sm, dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y); break;
+        case FMT_S6: dn_rdna2_body<FMT_S6, BM, TM, TN>(sm, dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y); break;
+        case FMT_S8: dn_rdna2_body<FMT_S8, BM, TM, TN>(sm, dnw, blockIdx.x, blockIdx.y, n, off[e], pairs, h2, topk_w, y); break;
+        default: break;
+    }
+}
+#endif  // !HY4_CUDA
 
 #if HY4_MMA
 #if !HY4_CUDA && !HY4_GFX12
@@ -1273,11 +1410,13 @@ __global__ void __launch_bounds__(256) k_moe_dn_ref(const uint8_t* __restrict__ 
     }
 }
 
+#if HY4_CUDA
 struct MoeWs {
     int *cnt, *off, *fill, *active, *nact, *wcnt, *wl16, *wl32, *wl64, *pairs, *wl128_e, *wl128_ty;
     __half* h2;
     float* y;
 };
+#endif
 inline MoeWs moe_ws_split(void* ws, int P) {
     uint8_t* w = (uint8_t*)ws;
     MoeWs s;
@@ -1303,6 +1442,24 @@ inline MoeWs moe_ws_split(void* ws, int P) {
     return s;
 }
 
+#if !HY4_CUDA
+inline void launch_moe_rdna2(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const float* topk_w, int M, int eb, const MoeWs& w) {
+    const int INF = 1 << 30;
+    const dim3 b(256);
+    hipLaunchKernelGGL((k_moe_gu_rdna2<16, 2, 1>), dim3(MOE_D / 32, 1, eb), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, 0, 16);
+    hipLaunchKernelGGL((k_moe_dn_rdna2<16, 2, 2>), dim3(MOE_D / rdna2::R2_BN, 1, eb), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, w.y, 0, 16);
+    if (M > 16) {
+        hipLaunchKernelGGL((k_moe_gu_rdna2<32, 4, 1>), dim3(MOE_D / 32, 1, eb), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, 16, 32);
+        hipLaunchKernelGGL((k_moe_dn_rdna2<32, 4, 2>), dim3(MOE_D / rdna2::R2_BN, 1, eb), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, w.y, 16, 32);
+    }
+    if (M > 32) {
+        const int ty = (M + 63) / 64;
+        hipLaunchKernelGGL((k_moe_gu_rdna2<64, 4, 2>), dim3(MOE_D / 32, ty, eb), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, 32, INF);
+        hipLaunchKernelGGL((k_moe_dn_rdna2<64, 4, 4>), dim3(MOE_D / rdna2::R2_BN, ty, eb), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, w.y, 32, INF);
+    }
+}
+#endif
+
 }  // namespace skd
 
 // z: __half [M][1536] (= routed_expert_down_proj output; 16-byte aligned rows), topk_idx int32 [M][16], topk_w float [M][16] (normalized * routed_scaling_factor),
@@ -1315,7 +1472,10 @@ inline int& moe_has_cpu() { static int v = 0; return v; }  // 1 = some experts a
 #else
 #define HY4_MOE_DEC_MAXM 16
 #endif
-inline int& moe_dec_max_m() { static int v = HY4_MMA ? 4 : HY4_MOE_DEC_MAXM; return v; }
+inline int& moe_dec_max_m() {
+    static int v = (!HY4_MMA || hy4_is_rdna2()) ? 16 : 4;
+    return v;
+}
 }
 
 inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const int32_t* topk_idx, const float* topk_w,
@@ -1327,8 +1487,8 @@ inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const Exper
 // counting-sort kernel and the reduce kernel are gone (2 launches instead of 4). The ws region `fill` is used as 96 tickets and must be zero before the first call (they reset themselves).
 inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const int32_t* topk_idx, const float* topk_w,
                         float* z_out, int M, void* ws, const float* z_f32 = nullptr, __half* z_out_h = nullptr, const ExpertDev* slot_rec = nullptr, int accum = 0) {
-#if !HY4_MMA
-    if (M > HY4_MOE_DEC_MAXM) {  // no matrix-core grouped GEMM on this build: the simple path handles any M
+#if !HY4_MMA && HY4_CUDA
+    if (M > HY4_MOE_DEC_MAXM) {  // no matrix-core grouped GEMM on this CUDA build: the simple path handles any M
         moe_experts_ref(s, sec4_base, experts, z, topk_idx, topk_w, z_out, M, ws, z_out_h);
         return;
     }
@@ -1363,6 +1523,11 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
 #undef HY4_DEC
         }
     }
+#if !HY4_CUDA
+    else if (!HY4_MMA || hy4_is_rdna2()) {
+        skd::launch_moe_rdna2(s, sec4_base, experts, z, topk_w, M, eb, w);
+    }
+#endif
 #if HY4_MMA
     else {
         const dim3 b(256);

@@ -574,6 +574,8 @@ int main(int argc, char** argv) {
     r.prof2 = prof2;
     r.tail_skip = tail_skip_arg;
     r.det_mix = det_flag || draft == "dfly2";
+    const bool spec_mode = draft == "dfly2" && gen > 0 && !alloc_only;
+    r.want_all_logits = all_logits && !spec_mode;
     std::string err;
     if (!r.init(no_engram ? std::string() : engram, err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
@@ -584,7 +586,6 @@ int main(int argc, char** argv) {
     }
     tok.reserve(max_ctx + 8);
     DFly2 df(r);
-    const bool spec_mode = draft == "dfly2" && gen > 0 && !alloc_only;
     if (draft == "dfly2") {
         if (!df.init(err)) {
             fprintf(stderr, "dfly2: %s\n", err.c_str());

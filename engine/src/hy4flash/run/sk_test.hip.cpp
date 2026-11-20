@@ -299,15 +299,21 @@ static void test_embed(Trunk& T) {
 int main(int argc, char** argv) {
     std::string path = "C:\\Hy4-Flash\\Strata-Quant-Hy4Flash-pack\\store\\Hy4-Flash-SQ-64.strata";
     std::string mode = "all";
+    bool random_only = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--strata" && i + 1 < argc) path = argv[++i];
         else if (a == "--mode" && i + 1 < argc) mode = argv[++i];
+        else if (a == "--random-only") random_only = true;
     }
     hipDeviceProp_t p;
     CK(hipGetDeviceProperties(&p, 0));
     printf("device %s %s warp %d CUs %d\n", p.name, gpu_arch(p), p.warpSize, p.multiProcessorCount);
     test_random_codes();
+    if (random_only) {
+        printf("\nSUMMARY pass=%d fail=%d\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
     Trunk T;
     std::string err;
     if (!T.rd.open(path, err)) { printf("open failed: %s\n", err.c_str()); return 1; }

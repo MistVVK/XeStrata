@@ -349,6 +349,60 @@ inline void multi_by_m(hipStream_t s, const LinMulti& d, const __half* X, int M)
     else hipLaunchKernelGGL((k_gemv_multi<FMT, 16, 1, 8>), dim3(d.total_blocks1), dim3(256), 0, s, d.d_jobs1, d.njobs, d.K, X, M);
 #endif
 }
+
+// ---- raw sub-group loader (shared by skwmma.hip.h and sk_rdna2.hip.h):
+// 64 weights of sub-group dg of a super-block fetched with 4-byte aligned dword loads + byte realignment,
+// one stage ahead of their use so global-memory latency hides behind the compute loop.
+template <int FMT>
+struct RawSub {
+    static constexpr int NLO = FMT == FMT_S1_25 ? 3 : (FMT == FMT_S2 || FMT == FMT_S3 || FMT == FMT_S1_5) ? 4 : (FMT == FMT_S8 ? 16 : 8);
+    static constexpr int NHI = FMT == FMT_S3 ? 2 : FMT == FMT_S5 ? 2 : FMT == FMT_S6 ? 4 : 1;
+    uint32_t lo[NLO];
+    uint32_t hi[NHI];
+    uint32_t hdr[2];
+};
+
+template <int N>
+__device__ __forceinline__ void load_bytes(const uint8_t* p, uint32_t (&o)[N]) {
+    const uintptr_t a = (uintptr_t)p;
+    const uint32_t ofs = (uint32_t)(a & 3);
+    const uint32_t* q = (const uint32_t*)(a - ofs);
+    uint32_t d[N + 1];
+#pragma unroll
+    for (int i = 0; i < N; ++i) d[i] = q[i];
+    d[N] = ofs ? q[N] : 0u;
+#pragma unroll
+    for (int i = 0; i < N; ++i) o[i] = byte_funnel(d[i + 1], d[i], ofs);
+}
+
+template <int FMT>
+__device__ __forceinline__ void load_raw(const uint8_t* blk, int dg, RawSub<FMT>& r) {
+    load_bytes<2>(blk, r.hdr);
+    const uint8_t* pl = blk + 6;
+    if constexpr (FMT == FMT_S1_25) { load_bytes<3>(pl + dg * 10, r.lo); r.hi[0] = pl[40 + (dg >> 1)]; }
+    else if constexpr (FMT == FMT_S1_5) { load_bytes<4>(pl + (64 * dg) / 5, r.lo); r.hi[0] = 64u * dg; }
+    else if constexpr (FMT == FMT_S2) load_bytes<4>(pl + dg * 16, r.lo);
+    else if constexpr (FMT == FMT_S3) { load_bytes<4>(pl + dg * 16, r.lo); load_bytes<2>(pl + 64 + dg * 8, r.hi); }
+    else if constexpr (FMT == FMT_S4) load_bytes<8>(pl + dg * 32, r.lo);
+    else if constexpr (FMT == FMT_S5) { load_bytes<8>(pl + dg * 32, r.lo); load_bytes<2>(pl + 128 + dg * 8, r.hi); }
+    else if constexpr (FMT == FMT_S6) { load_bytes<8>(pl + dg * 32, r.lo); load_bytes<4>(pl + 128 + dg * 16, r.hi); }
+    else load_bytes<16>(pl + dg * 64, r.lo);
+}
+
+template <int FMT>
+__device__ __forceinline__ float raw_eff(const RawSub<FMT>& r, int dg) {
+    const float D = h2f_bits((uint16_t)(r.hdr[0] & 0xFFFFu));
+    const uint32_t u = dg < 2 ? (r.hdr[0] >> (16 + 8 * dg)) & 0xFFu : (r.hdr[1] >> (8 * (dg - 2))) & 0xFFu;
+    float eff = D * ((float)u * (1.0f / 255.0f));
+    if constexpr (FMT == FMT_S1_25) eff *= 0.5f + (float)((r.hi[0] >> ((dg & 1) * 4)) & 15u) / 15.0f;
+    return eff;
+}
+
+__device__ __forceinline__ uint32_t byte_at4(const uint32_t (&w)[4], int o) {
+    const int d = o >> 2;
+    const uint32_t v = d == 0 ? w[0] : d == 1 ? w[1] : d == 2 ? w[2] : w[3];
+    return (v >> ((o & 3) * 8)) & 0xFFu;
+}
 }  // namespace skd
 
 // Y_i[m][n] = sum_k W_i[n][k] X[m][k] for all jobs i, 1 <= M <= 16, one launch. Each Y_i is a separate float [M][N_i] buffer.

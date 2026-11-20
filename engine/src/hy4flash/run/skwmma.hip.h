@@ -23,7 +23,12 @@ __device__ __forceinline__ hv_t ld_hv(const void* p, int hi) {
     return __builtin_bit_cast(hv_t, a);
 }
 __device__ __forceinline__ fv8 wmma_f16(hv_t a, hv_t b, fv8 c) {
+#if defined(__HIP_DEVICE_COMPILE__) && !HY4_DEV_WMMA
+    (void)a; (void)b;
+    return c;
+#else
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#endif
 }
 // accumulator element r (0..7) of a lane in a 16x16 output tile: row / column within the tile (gfx12: 8*(lane>>4) + r)
 __device__ __forceinline__ int acc_m(int r, int lane) { return 8 * (lane >> 4) + r; }
@@ -41,7 +46,12 @@ __device__ __forceinline__ hv_t ld_hv(const void* p, int /*hi*/) {
     return __builtin_bit_cast(hv_t, v);
 }
 __device__ __forceinline__ fv8 wmma_f16(hv_t a, hv_t b, fv8 c) {
+#if defined(__HIP_DEVICE_COMPILE__) && !HY4_DEV_WMMA
+    (void)a; (void)b;
+    return c;
+#else
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#endif
 }
 // accumulator element r (0..7) of a lane in a 16x16 output tile: row / column within the tile
 __device__ __forceinline__ int acc_m(int r, int lane) { return 2 * r + (lane >> 4); }

@@ -167,6 +167,135 @@ __global__ void __launch_bounds__(256) k_gemm(const __half* __restrict__ X, cons
     }
 }
 
+#if !HY4_CUDA
+// ---- Wave32 fdot2 GEMM for RDNA2 (and non-WMMA HIP): 64x64 tile, BK 16 (8 __half2 pairs), 256 threads (4x4 per thread), fp32 accumulation
+template <int EPI>
+__global__ void __launch_bounds__(256) k_gemm_fdot2(const __half* __restrict__ X, const __half* __restrict__ W, const float* __restrict__ bias, __half* __restrict__ Yh, float* __restrict__ Yf,
+                                                    const float* __restrict__ pe, int M, int N, int K, int ow) {
+    __shared__ uint32_t As[8][65], Bs[8][65];
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+    const int ty = tid >> 4, tx = tid & 15;
+    const int lr = tid >> 2, lk = (tid & 3) * 4;
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
+    const bool am = (m0 + lr) < M, bn = (n0 + lr) < N;
+    const __half* xp = X + (size_t)(m0 + lr) * K + lk;
+    const __half* wp = W + (size_t)(n0 + lr) * K + lk;
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        uint2 ua = {0u, 0u}, ub = {0u, 0u};
+        if (am) ua = *reinterpret_cast<const uint2*>(xp + k0);
+        if (bn) ub = *reinterpret_cast<const uint2*>(wp + k0);
+        __syncthreads();
+        const int kk0 = lk >> 1;
+        As[kk0][lr] = ua.x;
+        As[kk0 + 1][lr] = ua.y;
+        Bs[kk0][lr] = ub.x;
+        Bs[kk0 + 1][lr] = ub.y;
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+            uint32_t a[4], b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = As[kk][ty * 4 + i];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) b[j] = Bs[kk][tx + 16 * j];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = h2_dot_f32(a[i], b[j], acc[i][j]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int m = m0 + ty * 4 + i;
+        if (m >= M) continue;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int n = n0 + tx + 16 * j;
+            if (n >= N) continue;
+            store_epi<EPI>(acc[i][j] + (bias ? bias[n] : 0.f), m, n, N, ow, Yh, Yf, pe);
+        }
+    }
+}
+
+// ---- Wave32 fdot2 Flash Attention for RDNA2 (4 threads per query, 32 queries per 128-thread block, head_dim 72 = 36 half2 pairs, transposed V in LDS)
+__global__ void __launch_bounds__(128) k_attn_fdot2(const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v, __half* __restrict__ o, int N, int D, float scale) {
+    __shared__ uint32_t Ks[32][37];
+    __shared__ uint32_t Vst[16][VA_HD + 1];
+    const int tid = threadIdx.x;
+    const int q_loc = tid >> 2, lane4 = tid & 3;
+    const int h = blockIdx.y;
+    const int qi = blockIdx.x * 32 + q_loc;
+    uint32_t qh[9];
+    if (qi < N) {
+        const uint32_t* qp = reinterpret_cast<const uint32_t*>(q + (size_t)qi * D + h * VA_HD) + lane4 * 9;
+#pragma unroll
+        for (int d = 0; d < 9; ++d) qh[d] = qp[d];
+    } else {
+#pragma unroll
+        for (int d = 0; d < 9; ++d) qh[d] = 0u;
+    }
+    float acc[18];
+#pragma unroll
+    for (int d = 0; d < 18; ++d) acc[d] = 0.f;
+    float mrun = -3.0e38f, lrun = 0.f;
+    for (int kb = 0; kb < N; kb += 32) {
+        __syncthreads();
+        for (int e = tid; e < 32 * 36; e += 128) {
+            const int j = e / 36, d2 = e % 36;
+            const int kj = kb + j;
+            Ks[j][d2] = kj < N ? reinterpret_cast<const uint32_t*>(k + (size_t)kj * D + h * VA_HD)[d2] : 0u;
+        }
+        for (int e = tid; e < 16 * VA_HD; e += 128) {
+            const int jp = e / VA_HD, d = e % VA_HD;
+            const int k0 = kb + 2 * jp, k1 = k0 + 1;
+            const uint16_t h0 = k0 < N ? *reinterpret_cast<const uint16_t*>(v + (size_t)k0 * D + h * VA_HD + d) : 0u;
+            const uint16_t h1 = k1 < N ? *reinterpret_cast<const uint16_t*>(v + (size_t)k1 * D + h * VA_HD + d) : 0u;
+            Vst[jp][d] = (uint32_t)h0 | ((uint32_t)h1 << 16);
+        }
+        __syncthreads();
+        const int nj = min(32, N - kb);
+        float s[32];
+        float mt = -3.0e38f;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            float dot = 0.f;
+#pragma unroll
+            for (int d = 0; d < 9; ++d) dot = h2_dot_f32(qh[d], Ks[j][lane4 * 9 + d], dot);
+            dot += __shfl_xor(dot, 1, 4);
+            dot += __shfl_xor(dot, 2, 4);
+            s[j] = j < nj ? dot * scale : -3.0e38f;
+            mt = fmaxf(mt, s[j]);
+        }
+        const float mn = fmaxf(mrun, mt);
+        const float corr = __expf(mrun - mn);
+        lrun *= corr;
+#pragma unroll
+        for (int d = 0; d < 18; ++d) acc[d] *= corr;
+#pragma unroll
+        for (int jp = 0; jp < 16; ++jp) {
+            const float p0 = (2 * jp < nj) ? __expf(s[2 * jp] - mn) : 0.f;
+            const float p1 = (2 * jp + 1 < nj) ? __expf(s[2 * jp + 1] - mn) : 0.f;
+            lrun += p0 + p1;
+            const uint32_t p2 = h2_pack(p0, p1);
+#pragma unroll
+            for (int d = 0; d < 18; ++d) acc[d] = h2_dot_f32(p2, Vst[jp][lane4 * 18 + d], acc[d]);
+        }
+        mrun = mn;
+    }
+    if (qi < N) {
+        const float inv = 1.0f / lrun;
+        __half* op = o + (size_t)qi * D + h * VA_HD + lane4 * 18;
+#pragma unroll
+        for (int d = 0; d < 18; ++d) op[d] = __float2half(acc[d] * inv);
+    }
+}
+#endif  // !HY4_CUDA
+
 #if HY4_MMA && !HY4_CUDA
 // ---- gfx11 / gfx12 WMMA versions (v_wmma_f32_16x16x16_f16, wave32).
 // gfx11: lane l holds all 16 k of row/col (l&15); acc row = 2*i + (l>>4).
@@ -184,7 +313,12 @@ __device__ __forceinline__ hv_t ld_hv_half(const void* p, int hi) {
     return hv_t{0, 0, 0, 0, 0, 0, 0, 0};
 }
 __device__ __forceinline__ fv8 vit_wmma(hv_t a, hv_t b, fv8 c) {
+#if defined(__HIP_DEVICE_COMPILE__) && !HY4_DEV_WMMA
+    (void)a; (void)b;
+    return c;
+#else
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#endif
 }
 __device__ __forceinline__ int vit_acc_m(int i, int hi) { return 8 * hi + i; }
 #else
@@ -204,7 +338,12 @@ __device__ __forceinline__ hv_t ld_hv_half(const void* p, int /*hi*/) {
     return __builtin_bit_cast(hv_t, v);
 }
 __device__ __forceinline__ fv8 vit_wmma(hv_t a, hv_t b, fv8 c) {
+#if defined(__HIP_DEVICE_COMPILE__) && !HY4_DEV_WMMA
+    (void)a; (void)b;
+    return c;
+#else
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#endif
 }
 __device__ __forceinline__ int vit_acc_m(int i, int hi) { return 2 * i + hi; }
 #endif
@@ -427,7 +566,8 @@ struct VisionEncoder {
     bool dump = false;
     std::string dump_dir = ".";
     bool gelu_tanh_ffn = true;
-    bool use_wmma = false;  // gfx11 matrix-core GEMM / attention (set in load(); HY4_VIT_NOWMMA=1 forces the plain kernels)
+    bool use_wmma = false;  // gfx11 matrix-core GEMM / attention (set in load(); HY4_VIT_NOWMMA=1 forces non-WMMA)
+    bool use_fdot2 = false; // Wave32 fdot2 GEMM / attention for RDNA2 & non-WMMA HIP (HY4_VIT_PLAIN=1 forces plain)
     const std::atomic<bool>* cancel = nullptr;  // set by serve: STOP during the encode ends it at the next layer
 
     const __half* wh(const std::string& n) const { return reinterpret_cast<const __half*>(d_w + vi.get(n).off); }
@@ -447,15 +587,19 @@ struct VisionEncoder {
         }
         stream_to_device(path, vi.sec1_off, vi.sec1_len, d_w, &t_load, "vision");
 #if HY4_MMA && !HY4_CUDA
-        {  // matrix-core kernels on gfx11 (RDNA3 / 3.5) and gfx12 (RDNA4: RX 9060/9070, R9700); everything else takes the plain kernels
+        {  // matrix-core kernels on gfx11 (RDNA3 / 3.5) and gfx12 (RDNA4: RX 9060/9070, R9700); everything else takes fdot2 / plain kernels
             hipDeviceProp_t dp;
             HCK(hipGetDeviceProperties(&dp, 0));
             const std::string arch(dp.gcnArchName);
             use_wmma = (arch.rfind("gfx11", 0) == 0 || arch.rfind("gfx12", 0) == 0) && !getenv("HY4_VIT_NOWMMA");
         }
 #endif
+#if !HY4_CUDA
+        use_fdot2 = !use_wmma && !getenv("HY4_VIT_PLAIN");
+#endif
         loaded = true;
-        fprintf(stderr, "[vision] shard loaded to the GPU: %.2f GB in %.2f s\n", vi.sec1_len / 1e9, t_load);
+        fprintf(stderr, "[vision] shard loaded to the GPU: %.2f GB in %.2f s (%s)\n", vi.sec1_len / 1e9, t_load,
+                use_wmma ? "wmma" : (use_fdot2 ? "fdot2" : "plain"));
         return true;
     }
     void unload() {
@@ -477,6 +621,19 @@ struct VisionEncoder {
                 case vit::EPI_RES_ADD: hipLaunchKernelGGL((vit::k_gemm_w<vit::EPI_RES_ADD>), grid, bw, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
                 case vit::EPI_RES_SET_POS: hipLaunchKernelGGL((vit::k_gemm_w<vit::EPI_RES_SET_POS>), grid, bw, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
                 default: hipLaunchKernelGGL((vit::k_gemm_w<vit::EPI_F32_ROWMAP>), grid, bw, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+            }
+            return;
+        }
+#endif
+#if !HY4_CUDA
+        if (use_fdot2) {
+            switch (epi) {
+                case vit::EPI_H: hipLaunchKernelGGL((vit::k_gemm_fdot2<vit::EPI_H>), grid, blk, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+                case vit::EPI_GELU_TANH: hipLaunchKernelGGL((vit::k_gemm_fdot2<vit::EPI_GELU_TANH>), grid, blk, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+                case vit::EPI_GELU_ERF: hipLaunchKernelGGL((vit::k_gemm_fdot2<vit::EPI_GELU_ERF>), grid, blk, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+                case vit::EPI_RES_ADD: hipLaunchKernelGGL((vit::k_gemm_fdot2<vit::EPI_RES_ADD>), grid, blk, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+                case vit::EPI_RES_SET_POS: hipLaunchKernelGGL((vit::k_gemm_fdot2<vit::EPI_RES_SET_POS>), grid, blk, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
+                default: hipLaunchKernelGGL((vit::k_gemm_fdot2<vit::EPI_F32_ROWMAP>), grid, blk, 0, st, X, W, bias, Yh, Yf, pe, M, N, K, ow); break;
             }
             return;
         }
@@ -601,7 +758,13 @@ struct VisionEncoder {
 #endif
             } else {
                 gemm(st, vit::EPI_H, d_h, wh(p + "self_attn.v_proj.weight"), wf(p + "self_attn.v_proj.bias"), d_v, nullptr, nullptr, N, D, D);
-                hipLaunchKernelGGL(vit::k_attn, dim3((N + 63) / 64, NH), dim3(64), 0, st, d_q, d_k, d_v, d_h, N, D, scale);
+                lap("qkv gemm");
+#if !HY4_CUDA
+                if (use_fdot2)
+                    hipLaunchKernelGGL(vit::k_attn_fdot2, dim3((N + 31) / 32, NH), dim3(128), 0, st, d_q, d_k, d_v, d_h, N, D, scale);
+                else
+#endif
+                    hipLaunchKernelGGL(vit::k_attn, dim3((N + 63) / 64, NH), dim3(64), 0, st, d_q, d_k, d_v, d_h, N, D, scale);
             }
             lap("attention");
             gemm(st, vit::EPI_RES_ADD, d_h, wh(p + "self_attn.o_proj.weight"), wf(p + "self_attn.o_proj.bias"), nullptr, d_x, nullptr, N, D, D);

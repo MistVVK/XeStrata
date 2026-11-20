@@ -1752,7 +1752,7 @@ public:
         const std::string nm = L(il) + ".self_attn.kv_b_proj.weight";
         const TInfo& t = ti(nm);
         const uint8_t* W = (const uint8_t*)tw(nm);
-#if !HY4_CUDA && HY4_MMA
+#if !HY4_CUDA
         dim3 gk(NH * 6, 16), gv(NH * 256), blk(256);
         switch (t.fmt) {
             case FMT_S2: hipLaunchKernelGGL((k_dequant_wkt<FMT_S2>), gk, blk, 0, st, W, wk_layer, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S2>), gv, blk, 0, st, W, wv_layer, NH); break;
@@ -1814,7 +1814,7 @@ public:
               if (p0d) mla_prep_q_dec_d(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0d, (float)theta(il));
               else mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il), tp);
           } else {
-#if !HY4_CUDA && HY4_MMA
+#if !HY4_CUDA
               mla_prep_q_t(st, F2, wk_layer, qa_h, T, NH, p0, (float)theta(il));
 #else
               mla_prep_q(st, F2, wk_layer, qa_h, T, NH, p0, (float)theta(il));

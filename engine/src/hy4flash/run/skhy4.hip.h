@@ -7,6 +7,9 @@
 #pragma once
 #include "skgemm.hip.h"
 #include "skfast.hip.h"
+#if !HY4_CUDA
+#include "sk_rdna2.hip.h"
+#endif
 #include "skwmma.hip.h"
 #if HY4_MMA && !HY4_CUDA
 #include "sk_int8_rdna4.hip.h"
@@ -23,7 +26,10 @@ namespace hy4 {
 
 namespace skd {
 // tuning knob: M <= lin_gemv_max_m() (valid up to 16) uses the bandwidth GEMV, whose per-row result does not depend on M (speculative verify windows, DFly2)
-inline int& lin_gemv_max_m() { static int v = 4; return v; }
+inline int& lin_gemv_max_m() {
+    static int v = (!HY4_MMA || hy4_is_rdna2()) ? 16 : 4;
+    return v;
+}
 #if HY4_CUDA && HY4_MMA
 // 0 = FP16 mma_16816 (default until parity/speed verified), 1 = INT8 mma_16832 (1-term Q8_1), 2 = INT8 mma_16832 (2-term HI)
 inline int& lin_int8_mma() {
@@ -47,6 +53,9 @@ inline void linear_h(hipStream_t s, int fmt, const void* W, int N, int K, const 
 #endif
         linear_h_gemv(s, fmt, W, N, K, X, Y, M);
     }
+#if !HY4_CUDA
+    else if (hy4_is_rdna2()) linear_h_rdna2(s, fmt, W, N, K, X, Y, M);
+#endif
 #if HY4_MMA
     else if (M <= 16) {
 #if HY4_CUDA
@@ -70,8 +79,7 @@ inline void linear_h(hipStream_t s, int fmt, const void* W, int N, int K, const 
         linear_h_gemm(s, fmt, W, N, K, X, Y, M);
     }
 #else
-    else if (M <= 16) linear_h_gemv(s, fmt, W, N, K, X, Y, M);
-    else linear_h_ref(s, fmt, W, N, K, X, Y, M);
+    else linear_h_rdna2(s, fmt, W, N, K, X, Y, M);
 #endif
 }
 
