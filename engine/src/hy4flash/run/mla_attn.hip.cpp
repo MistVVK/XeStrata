@@ -193,6 +193,16 @@ __global__ void __launch_bounds__(256) k_attend_simple(const __half* __restrict_
     *reinterpret_cast<__half2*>(o + 2 * tid) = __floats2half2_rn(acc0 * il, acc1 * il);
 }
 
+// V operand of the PV product: the 4 halves of a Vt group are the values of 4 consecutive slots; only the first v of them belong to keys of this query. The others (slots after the
+// query's position: rows of later tokens of the same chunk, or stale rows) have probability exactly 0, but the matrix core's product alignment still sees their exponents, so they must
+// not reach the instruction at all (otherwise row t of a chunk depends on the tokens after it, at 1e-7 level, and a verify window differs from one-token decode).
+__device__ __forceinline__ uint2 vmask(uint2 b, int v) {
+    if (v >= 4) return b;
+    if (v <= 0) return make_uint2(0u, 0u);
+    if (v == 1) return make_uint2(b.x & 0xFFFFu, 0u);
+    if (v == 2) return make_uint2(b.x, 0u);
+    return make_uint2(b.x, b.y & 0xFFFFu);
+}
 #if HY4_MMA && !HY4_CUDA
 // ---- 3b. WMMA flash attention ------------------------------------------------------------------------------------------------------------------------
 // Block = 4 waves, handles ONE query token and ONE tile of 16 heads (the 16 rows of the WMMA tile share the key set), keys [tile range] of a split.
@@ -510,10 +520,11 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
             s_m[w][g + 8] = pm[1];
         }
         // group base (slot >> 2) of the 4 keys this lane feeds to each of the 4 PV k-steps: keys 4*(4*ks + c) .. +3 of the tile
-        int gidx[4];
+        int gidx[4], vv[4];  // vv: valid keys (0..4) of each 4-key group; the V halves of the others must not reach the mma (their P is 0, but the product alignment still sees their exponents)
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
             const int e = i0 + 4 * (4 * ks + c);
+            vv[ks] = min(max(nk - e, 0), 4);
             int gg = 0;
             if (e < nk) {
                 const int sl = mode == MLA_CAUSAL ? (a.ring > 0 ? e % a.ring : e) : (mode == MLA_WINDOW ? (lo_al + e) % a.ring : klist[e]);
@@ -568,7 +579,8 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
 #pragma unroll
             for (int nt = 0; nt < 16; ++nt) {
                 const int col = 128 * w + 8 * nt + g;
-                const uint2 b = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[ks] * MLA_KV_LORA + col) * 4);
+                uint2 b = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[ks] * MLA_KV_LORA + col) * 4);
+                if (vv[ks] < 4) b = vmask(b, vv[ks]);
                 mma_16816(oc[nt], plo.x, phi.x, plo.y, phi.y, b.x, b.y);
             }
         }
