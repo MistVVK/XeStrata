@@ -63,10 +63,11 @@ public:
     void drop_cache();
     // Asynchronous read-ahead hints.
     void prefetch_layer(int moe_layer);
-    // Expert body -> dst (4 KiB aligned): memcpy from the page cache when resident, O_DIRECT read from the SSD otherwise (HY4S_DIRECT=0 turns that off).
+    // Expert body -> dst (4 KiB aligned): memcpy from the page cache when resident, else a large pread (buffered; O_DIRECT when the experts are far larger than the RAM, HY4S_DIRECT=0|1 overrides).
     void copy_body(const uint8_t* body, uint32_t bytes, void* dst) const;
     uint64_t direct_read_bytes() const;
     uint64_t cached_read_bytes() const;
+    uint64_t miss_read_bytes() const;  // bodies read with a buffered pread because their pages were not cached
     void prefetch_experts(int moe_layer, const int32_t* idx, int n);
 
     // One MoE layer (moe_layer = il-1, 0..40). z fp32 [T][1536] = routed_expert_down_proj output; idx int32 [T][16] expert ids (0..511);
@@ -88,7 +89,7 @@ private:
     const uint8_t* base_ = nullptr;
     uint64_t sec4_bytes_ = 0;
     int nth_ = 1;
-    bool streaming_ = false;
+    bool streaming_ = false, bypass_ = false;
     CpuExpertStats st_;
 };
 

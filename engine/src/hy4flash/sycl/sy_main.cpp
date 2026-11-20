@@ -208,6 +208,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "experts: %s\n", err.c_str());
             return 1;
         }
+        if (std::getenv("HY4S_COLD") && std::getenv("HY4S_COLD")[0] == '1') { cx.drop_cache(); fprintf(stderr, "[experts] cold start: Section 4 dropped from the page cache (HY4S_COLD=1)\n"); }
         if (warm) { double ws_ = 0; double gbs = cx.warm(threads, &ws_); fprintf(stderr, "[experts] warm %.1f s (%.2f GB/s)\n", ws_, gbs); }
         if (load_only) return 0;
         std::vector<int32_t> tok;
@@ -300,7 +301,7 @@ int main(int argc, char** argv) {
         printf("%s", top_out.c_str());
         fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram cpu %.2f s, cpu experts %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_cpu, r.t_cpu_exp);
         const double io1 = io_read_gb();
-        fprintf(stderr, "[io] prefill: SSD read %.2f GB in %.2f s = %.3f GB/s (storage reads of this process, experts + Engram; direct expert reads %.2f GB, from page cache %.2f GB)\n", io1 - io0, t_pf, (io1 - io0) / std::max(t_pf, 1e-9), cx.direct_read_bytes() / 1e9, cx.cached_read_bytes() / 1e9);
+        fprintf(stderr, "[io] prefill: SSD read %.2f GB in %.2f s = %.3f GB/s (storage reads of this process, experts + Engram; direct expert reads %.2f GB, pread misses %.2f GB, from page cache %.2f GB)\n", io1 - io0, t_pf, (io1 - io0) / std::max(t_pf, 1e-9), cx.direct_read_bytes() / 1e9, cx.miss_read_bytes() / 1e9, cx.cached_read_bytes() / 1e9);
         if (spec_mode) {
             Spec sp(r, df, scfg);
             std::string gen_ids, finish, e2;

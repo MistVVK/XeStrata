@@ -298,7 +298,7 @@ struct CpuExperts::Impl {
     strata::artifact::StrataFileReader rd;
     int fd = -1;
     int fdd = -1;  // O_DIRECT descriptor (reads that must not go through the page cache)
-    std::atomic<uint64_t> direct_bytes{0}, cached_bytes{0};
+    std::atomic<uint64_t> direct_bytes{0}, cached_bytes{0}, miss_bytes{0};
     uint64_t sec4_off = 0;
     void* map = nullptr;
     size_t map_len = 0;
@@ -329,6 +329,7 @@ void CpuExperts::close() {
     base_ = nullptr;
 }
 
+static double ram_budget_bytes();
 bool CpuExperts::open(const std::string& path, int nthreads, std::string& err, int max_tokens) {
     Impl& I = *im_;
     nth_ = std::max(1, nthreads);
@@ -337,6 +338,12 @@ bool CpuExperts::open(const std::string& path, int nthreads, std::string& err, i
     const auto& h = I.rd.header();
     I.sec4_off = h.sections[4].file_offset;
     sec4_bytes_ = h.sections[4].byte_length;
+    {
+        const double f = std::min(1.0, ram_budget_bytes() / (double)sec4_bytes_);
+        streaming_ = f < 1.0;  // some experts will come from the SSD: prefetch the routed bodies in decode
+        bypass_ = f < 0.85;    // clearly larger than the RAM: prefill reads bypass the page cache (O_DIRECT) so the decode's hot set stays cached
+        if (const char* e = std::getenv("HY4S_DIRECT")) bypass_ = e[0] == '1';
+    }
     const auto& dir = I.rd.expert_directory();
     if (dir.size() != 41 * 512) {
         err = "expert directory size " + std::to_string(dir.size()) + " != 20992";
@@ -470,6 +477,22 @@ bool CpuExperts::expert_info(int L, int e, const uint8_t** body, int* gu, int* d
     return true;
 }
 
+// RAM this process may use for expert bodies in the page cache: MemAvailable (the file's own cached pages count as available) - 9 GB (process, pinned KV, Engram rows); HY4S_WARM_GB overrides
+static double ram_budget_bytes() {
+    double budget = 1e30, avail_gb = 0;
+    if (FILE* f = fopen("/proc/meminfo", "r")) {
+        char ln[256];
+        while (fgets(ln, sizeof ln, f)) {
+            unsigned long long kb;
+            if (sscanf(ln, "MemAvailable: %llu kB", &kb) == 1) avail_gb = kb * 1024.0 / 1e9;
+        }
+        fclose(f);
+    }
+    if (avail_gb > 0) budget = (avail_gb - 9.0) * 1e9;
+    if (const char* e = std::getenv("HY4S_WARM_GB")) budget = atof(e) * 1e9;
+    return budget;
+}
+
 double CpuExperts::warm(int nthreads, double* seconds) {
     Impl& I = *im_;
     if (I.synthetic) return 0.0;
@@ -478,22 +501,8 @@ double CpuExperts::warm(int nthreads, double* seconds) {
     const size_t nch = (sec4_bytes_ + CH - 1) / CH;
     // Experts larger than the RAM this box can spare (SQ-64 on a 62 GB machine, SQ-96/128): warm only a share of the file, spread evenly over it (every k-th 8 MiB chunk);
     // the rest is read from the SSD on demand and the page cache keeps whatever the decode touches. Budget = MemAvailable - 9 GB (process, pinned KV, Engram rows), or HY4S_WARM_GB.
-    double budget = 1e30;
-    {
-        double avail_gb = 0;
-        if (FILE* f = fopen("/proc/meminfo", "r")) {
-            char ln[256];
-            while (fgets(ln, sizeof ln, f)) {
-                unsigned long long kb;
-                if (sscanf(ln, "MemAvailable: %llu kB", &kb) == 1) avail_gb = kb * 1024.0 / 1e9;
-            }
-            fclose(f);
-        }
-        if (avail_gb > 0) budget = (avail_gb - 9.0) * 1e9;
-        if (const char* e = std::getenv("HY4S_WARM_GB")) budget = atof(e) * 1e9;
-    }
+    const double budget = ram_budget_bytes();
     const double frac = budget >= (double)sec4_bytes_ ? 1.0 : std::max(0.0, budget / (double)sec4_bytes_);
-    streaming_ = frac < 1.0;
     auto selected = [&](size_t c) { return frac >= 1.0 || (size_t)((c + 1) * frac) > (size_t)(c * frac); };
     std::atomic_flag fail = ATOMIC_FLAG_INIT;
 #pragma omp parallel num_threads(std::max(1, nthreads))
@@ -551,38 +560,66 @@ void CpuExperts::drop_cache() {
     I.warmed = false;
 }
 
-// Copies one expert body (a pointer into the mapping) to dst: from the page cache when every page of it is resident (memcpy), else read from the SSD with O_DIRECT so a
-// prefill that touches every expert of every layer neither waits on page faults nor throws the decode's hot set out of the cache. dst 4 KiB aligned (pinned ring slots are).
+// Copies one expert body (a pointer into the mapping) to dst. Resident in the page cache: memcpy. Not resident: one large pread (buffered: fills the cache, so later chunks hit it;
+// 4 KiB page faults through the mapping ran at 0.9 GB/s, large reads at 3+ GB/s), or, when the experts are clearly larger than the RAM (bypass_), an O_DIRECT read that leaves the cache alone.
 void CpuExperts::copy_body(const uint8_t* body, uint32_t bytes, void* dst) const {
     Impl& I = *im_;
-    static const bool direct_ok = !(std::getenv("HY4S_DIRECT") && std::getenv("HY4S_DIRECT")[0] == '0');
     const uint64_t off = (uint64_t)(body - base_);
-    bool resident = true;
-    if (!I.synthetic && I.fdd >= 0 && direct_ok && (off % 4096) == 0 && (bytes % 4096) == 0 && ((uintptr_t)dst % 4096) == 0) {
+    if (!I.synthetic && I.fdd >= 0 && (off % 4096) == 0 && (bytes % 4096) == 0 && ((uintptr_t)dst % 4096) == 0) {
         const size_t npg = bytes / 4096;
+        bool resident = true;
         unsigned char vec[1024];
         for (size_t p0 = 0; p0 < npg && resident; p0 += sizeof vec) {
             const size_t n = std::min(sizeof vec, npg - p0);
-            if (mincore((void*)(body + p0 * 4096), n * 4096, vec) != 0) { resident = true; break; }
+            if (mincore((void*)(body + p0 * 4096), n * 4096, vec) != 0) break;
             for (size_t i = 0; i < n; ++i)
                 if (!(vec[i] & 1)) { resident = false; break; }
         }
         if (!resident) {
             size_t got = 0;
-            while (got < bytes) {
-                ssize_t r = pread(I.fdd, (char*)dst + got, bytes - got, (off_t)(I.sec4_off + off + got));
-                if (r <= 0) break;
-                got += (size_t)r;
-            }
-            if (got == bytes) {
-                I.direct_bytes += bytes;
-                return;
+            if (bypass_) {
+                // O_DIRECT into an ordinary page-aligned bounce buffer (pinned USM host memory is not accepted as a direct-I/O target), then one memcpy into the ring slot
+                struct Bounce {
+                    uint8_t* p = nullptr;
+                    size_t cap = 0;
+                    ~Bounce() { free(p); }
+                };
+                static thread_local Bounce bb;
+                if (bb.cap < bytes) {
+                    free(bb.p);
+                    bb.p = nullptr;
+                    bb.cap = 0;
+                    if (posix_memalign((void**)&bb.p, 4096, (size_t)bytes + (1u << 20)) == 0) bb.cap = (size_t)bytes + (1u << 20);
+                }
+                if (bb.cap >= bytes) {
+                    while (got < bytes) {
+                        ssize_t r = pread(I.fdd, bb.p + got, bytes - got, (off_t)(I.sec4_off + off + got));
+                        if (r <= 0) break;
+                        got += (size_t)r;
+                    }
+                    if (got == bytes) {
+                        std::memcpy(dst, bb.p, bytes);
+                        I.direct_bytes += bytes;
+                        return;
+                    }
+                }
+            } else {
+                while (got < bytes) {
+                    ssize_t r = pread(I.fd, (char*)dst + got, bytes - got, (off_t)(I.sec4_off + off + got));
+                    if (r <= 0) break;
+                    got += (size_t)r;
+                }
+                if (got == bytes) {
+                    I.miss_bytes += bytes;
+                    return;
+                }
             }
         }
     }
     I.cached_bytes += bytes;
     std::memcpy(dst, body, bytes);
 }
+uint64_t CpuExperts::miss_read_bytes() const { return im_->miss_bytes.load(); }
 uint64_t CpuExperts::direct_read_bytes() const { return im_->direct_bytes.load(); }
 uint64_t CpuExperts::cached_read_bytes() const { return im_->cached_bytes.load(); }
 
