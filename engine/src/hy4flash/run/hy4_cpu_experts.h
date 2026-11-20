@@ -63,7 +63,7 @@ public:
     // (GPU-owned) stay skipped. A job touching cold experts runs in waves: wave 0 = resident experts + cold cache hits, then the
     // missed cold experts, read by reader threads with large preads (O_DIRECT by default) that were issued when the job started
     // and overlap the earlier waves' compute. A small LRU slot cache keeps recently used cold bodies in RAM. The result does not
-    // depend on whether a body came from the arena, the cache or the file (bit-exact). Linux only (returns false on Windows).
+    // depend on whether a body came from the arena, the cache or the file (bit-exact). Works on Linux (O_DIRECT pread) and Windows (FILE_FLAG_NO_BUFFERING overlapped ReadFile).
     // Env: STRATA_CPUEXP_COLD_CACHE_MB (default 256), STRATA_CPUEXP_COLD_READERS (default 8),
     //      STRATA_CPUEXP_COLD_IO = direct (default) | buffered (page cache kept, for warm-cache runs) | fadvise (buffered + DONTNEED).
     bool set_cold_experts(const std::vector<std::vector<bool>>& cold, std::string& err);

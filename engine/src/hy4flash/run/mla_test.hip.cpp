@@ -1,6 +1,6 @@
 // mla_test.hip.cpp - unit tests + timings for mla_attn.hip.cpp (Hy4-Flash MLA attention, gfx1151)
 // usage: mla_test.exe [--model <Hy4-Flash-SQ-64.strata>] [--perf] [--noref] [--layers 5,2]
-#include <hip/hip_runtime.h>
+#include "hy4_gpu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -379,11 +379,6 @@ static void perf_case(const PerfCfg& pc, bool check_vs_simple) {
     int slots = ring ? ring : (Tk + 15) / 16 * 16;
     std::vector<uint16_t> cache(mla_cache_bytes(slots) / 2, 0);
     for (size_t i = 0; i < (size_t)slots * 576; ++i) cache[i] = f2h(ud(rng) * 1.5f);
-    {  // Vt copy: Vt[((s>>2)*512 + c)*4 + (s&3)] = rows[s][c]
-        uint16_t* vt = cache.data() + (size_t)slots * 576;
-        for (int sl = 0; sl < slots; ++sl)
-            for (int cc = 0; cc < 512; ++cc) vt[((size_t)(sl >> 2) * 512 + cc) * 4 + (sl & 3)] = cache[(size_t)sl * 576 + cc];
-    }
     std::vector<uint16_t> qa((size_t)M * NH * 576), wv((size_t)NH * 256 * 512);
     for (auto& x : qa) x = f2h(ud(rng) * 0.5f);
     for (auto& x : wv) x = f2h(ud(rng) * 0.05f);
@@ -501,7 +496,7 @@ int main(int argc, char** argv) {
     }
     hipDeviceProp_t prop;
     CK(hipGetDeviceProperties(&prop, 0));
-    printf("device %s %s CUs=%d\n", prop.name, prop.gcnArchName, prop.multiProcessorCount);
+    printf("device %s %s CUs=%d\n", prop.name, gpu_arch(prop), prop.multiProcessorCount);
     int fails = 0;
     std::mt19937_64 rng(1234);
     const double TOL = 2e-3;

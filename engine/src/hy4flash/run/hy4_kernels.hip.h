@@ -314,6 +314,16 @@ __global__ void k_add_inplace(float* __restrict__ a, const float* __restrict__ b
     if (i < n) a[i] += b[i];
 }
 
+// ---- fused a += b; out_h = half(a) (eliminates a separate k_f2h launch in hybrid MoE)
+__global__ void k_add_f2h(float* __restrict__ a, const float* __restrict__ b, __half* __restrict__ out_h, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float v = a[i] + b[i];
+        a[i] = v;
+        out_h[i] = __float2half(v);
+    }
+}
+
 // ---- fp32 -> fp16
 __global__ void k_f2h(const float* __restrict__ in, __half* __restrict__ out, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

@@ -46,6 +46,8 @@
 #define hipStreamSynchronize cudaStreamSynchronize
 #define hipEventCreate cudaEventCreate
 #define hipEventCreateWithFlags cudaEventCreateWithFlags
+#define hipEventDestroy cudaEventDestroy
+#define hipEventQuery cudaEventQuery
 #define hipEventDisableTiming cudaEventDisableTiming
 #define hipEventRecord cudaEventRecord
 #define hipEventSynchronize cudaEventSynchronize

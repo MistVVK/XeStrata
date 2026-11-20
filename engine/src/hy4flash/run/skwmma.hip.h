@@ -497,6 +497,92 @@ __global__ void __launch_bounds__(256) k_gemm(const uint8_t* __restrict__ W, int
         }
 }
 
+#if !HY4_CUDA
+// On-GPU S_K -> FP16 dequant-once + pure FP16 register-prefetched WMMA GEMM (27.6 KB LDS -> 2 WG/CU on RDNA4, zero redundant bit-unpacking across M tiles)
+template <int FMT>
+__global__ void __launch_bounds__(64) k_dequant_sk_f16(const uint8_t* __restrict__ W, half_t* __restrict__ W16, int N, int nsb) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    if constexpr (FMT == FMT_S1_25) {
+        s125_lut_init();
+        hy4_sync_lds();
+    }
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x * 16 + (tid >> 2);
+    const int dg = tid & 3;
+    const int sb = blockIdx.y;
+    if (row >= N) return;
+    RawSub<FMT> r;
+    load_raw<FMT>(W + ((size_t)row * nsb + sb) * SB, dg, r);
+    dequant_sub<FMT>(r, raw_eff<FMT>(r, dg), W16 + ((size_t)row * nsb + sb) * 256 + dg * 64);
+}
+
+constexpr int F16_BM = 128, F16_BN = 64, F16_BK = 64, F16_LD = F16_BK + 8;
+
+__global__ void __launch_bounds__(256) k_gemm_f16_rdna4(const __half* __restrict__ X_, const __half* __restrict__ W16_, float* __restrict__ Y, int M, int N, int K) {
+    __shared__ __attribute__((aligned(16))) half_t sA[F16_BM * F16_LD];
+    __shared__ __attribute__((aligned(16))) half_t sB[F16_BN * F16_LD];
+    const int bm = blockIdx.y * F16_BM, bn = blockIdx.x * F16_BN;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
+    const int wm = wave & 3, wn = wave >> 2;
+    const half_t* X = (const half_t*)X_;
+    const half_t* B = (const half_t*)W16_;
+    fv8 acc[2][2];
+    acc_zero(acc);
+    uint4 va[4], vb[2];
+    auto gload = [&](int k0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int idx = tid + 256 * i, r = idx >> 3, c8 = (idx & 7) * 8;
+            const int m = bm + r < M ? bm + r : M - 1;
+            va[i] = *(const uint4*)(X + (size_t)m * K + k0 + c8);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int idx = tid + 256 * i, r = idx >> 3, c8 = (idx & 7) * 8;
+            const int n = bn + r < N ? bn + r : N - 1;
+            vb[i] = *(const uint4*)(B + (size_t)n * K + k0 + c8);
+        }
+    };
+    gload(0);
+    for (int k0 = 0; k0 < K; k0 += F16_BK) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int idx = tid + 256 * i, r = idx >> 3, c8 = (idx & 7) * 8;
+            *(uint4*)(&sA[r * F16_LD + c8]) = va[i];
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int idx = tid + 256 * i, r = idx >> 3, c8 = (idx & 7) * 8;
+            *(uint4*)(&sB[r * F16_LD + c8]) = vb[i];
+        }
+        hy4_sync_lds();
+        if (k0 + F16_BK < K) gload(k0 + F16_BK);
+#pragma unroll
+        for (int kk = 0; kk < F16_BK / 16; ++kk) {
+            const hv_t a0 = ld_hv(&sA[(wm * 32 + l16) * F16_LD + kk * 16], hi);
+            const hv_t a1 = ld_hv(&sA[(wm * 32 + 16 + l16) * F16_LD + kk * 16], hi);
+            const hv_t b0 = ld_hv(&sB[(wn * 32 + l16) * F16_LD + kk * 16], hi);
+            const hv_t b1 = ld_hv(&sB[(wn * 32 + 16 + l16) * F16_LD + kk * 16], hi);
+            acc[0][0] = wmma_f16(a0, b0, acc[0][0]);
+            acc[0][1] = wmma_f16(a0, b1, acc[0][1]);
+            acc[1][0] = wmma_f16(a1, b0, acc[1][0]);
+            acc[1][1] = wmma_f16(a1, b1, acc[1][1]);
+        }
+        hy4_sync_lds();
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int m = bm + wm * 32 + 16 * i + acc_m(r, lane);
+                const int n = bn + wn * 32 + 16 * j + acc_n(r, lane);
+                if (m < M && n < N) Y[(size_t)m * N + n] = acc[i][j][r];
+            }
+}
+#endif
+
 }  // namespace skd
 
 // small-M WMMA entry (M <= 16 per call; larger M loops over 16-token blocks inside the grid): S_K weights, same requirements as linear_h_gemm
@@ -539,6 +625,28 @@ inline void linear_h_gemm(hipStream_t s, int fmt, const void* W, int N, int K, c
     }
 #undef HY4_GEMM_CASE
 }
+
+#if !HY4_CUDA
+inline void linear_h_dequant_f16(hipStream_t s, int fmt, const void* W, int N, int K, const __half* X, float* Y, int M, __half* w16) {
+    const int nsb = K >> 8;
+    dim3 dg((N + 15) / 16, nsb), db(64);
+#define HY4_DQ_CASE(F) case F: hipLaunchKernelGGL((skd::k_dequant_sk_f16<F>), dg, db, 0, s, (const uint8_t*)W, (half_t*)w16, N, nsb); break
+    switch (fmt) {
+        HY4_DQ_CASE(FMT_S1_25);
+        HY4_DQ_CASE(FMT_S1_5);
+        HY4_DQ_CASE(FMT_S2);
+        HY4_DQ_CASE(FMT_S3);
+        HY4_DQ_CASE(FMT_S4);
+        HY4_DQ_CASE(FMT_S5);
+        HY4_DQ_CASE(FMT_S6);
+        HY4_DQ_CASE(FMT_S8);
+        default: linear_h_gemm(s, fmt, W, N, K, X, Y, M); return;
+    }
+#undef HY4_DQ_CASE
+    dim3 gg((N + skd::F16_BN - 1) / skd::F16_BN, (M + skd::F16_BM - 1) / skd::F16_BM), gb(256);
+    hipLaunchKernelGGL(skd::k_gemm_f16_rdna4, gg, gb, 0, s, X, w16, Y, M, N, K);
+}
+#endif
 
 }  // namespace hy4
 #endif  // HY4_MMA

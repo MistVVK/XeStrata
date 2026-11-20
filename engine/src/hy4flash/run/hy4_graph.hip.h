@@ -26,15 +26,22 @@
 
 namespace hy4 {
 
-// device dequantization of kv_b_proj [NH*448][512] (any S_K fmt) into wk_b [NH][192][512] and wv_b [NH][256][512] fp16
+// device dequantization of kv_b_proj [NH*448][512] (any S_K fmt) into wk_bt [NH][512][192] (transposed for WMMA mla_prep_q_t) and wv_b [NH][256][512] fp16
 template <int FMT>
 __global__ void k_split_kvb(const uint8_t* __restrict__ W, __half* __restrict__ wk, __half* __restrict__ wv, int NH) {
     int r = blockIdx.x;  // row in [0, NH*448)
     int h = r / 448, j = r % 448;
     constexpr int SB = sk_sb_bytes(FMT);
     const uint8_t* rp = W + (size_t)r * 2 * SB;
-    __half* dst = j < 192 ? wk + ((size_t)h * 192 + j) * 512 : wv + ((size_t)h * 256 + (j - 192)) * 512;
-    for (int k = threadIdx.x; k < 512; k += blockDim.x) dst[k] = __float2half(skd::sk_weight<FMT>(rp + (size_t)(k >> 8) * SB, k & 255));
+    if (j < 192) {
+        __half* dst = wk + (size_t)h * 512 * 192 + j;
+        for (int k = threadIdx.x; k < 512; k += blockDim.x)
+            dst[(size_t)k * 192] = __float2half(skd::sk_weight<FMT>(rp + (size_t)(k >> 8) * SB, k & 255));
+    } else {
+        __half* dst = wv + ((size_t)h * 256 + (j - 192)) * 512;
+        for (int k = threadIdx.x; k < 512; k += blockDim.x)
+            dst[k] = __float2half(skd::sk_weight<FMT>(rp + (size_t)(k >> 8) * SB, k & 255));
+    }
 }
 
 static void save_npy_f32(const std::string& path, const float* d, const std::vector<int64_t>& shape) {
@@ -78,23 +85,34 @@ public:
     float *x = nullptr, *pre = nullptr, *post = nullptr, *cur_f = nullptr, *F1 = nullptr, *F2 = nullptr, *F3 = nullptr, *sub = nullptr, *ctx_ws = nullptr;
     __half *cur_h = nullptr, *qr_h = nullptr, *qa_h = nullptr, *o_h = nullptr, *H1 = nullptr, *z_h = nullptr, *er_h = nullptr, *hfin = nullptr;
     float *z_f = nullptr, *zout_f = nullptr, *moe_w = nullptr, *logits = nullptr;
+    int logits_cap = 0;
     int32_t *moe_idx = nullptr, *d_argmax = nullptr;
-    void *moe_ws = nullptr, *mla_ws = nullptr;
+    void *work_arena = nullptr, *moe_ws = nullptr, *moe_ws_dec = nullptr, *mla_ws = nullptr;
     size_t mla_ws_bytes = 0;
     float* kv_f = nullptr;
     uint8_t* d_eraw[4] = {};
     uint8_t* d_evalid[4] = {};
     EngramDev eng_dev[4];
     ExpertDev* d_experts = nullptr;
-    __half* wk_b = nullptr;  // per layer offsets
-    __half* wv_b = nullptr;
-    std::vector<size_t> wk_off, wv_off;
-    std::vector<__half*> kcache;  // per layer
+    ExpertDev* h_experts = nullptr;    // pinned host mirror of d_experts [41*512] (non-blocking H2D for vcache updates)
+    __half* wk_layer = nullptr;        // reusable single-layer [max_NH][192][512] fp16 for prefill T > 8 (12 MiB)
+    __half* wv_layer = nullptr;        // reusable single-layer [max_NH][256][512] fp16 for prefill T > 8 (16 MiB)
+    std::vector<__half*> kcache;       // per layer
     int ring = 0, slots_sparse = 0;
-    // growable KV state (cards that cannot hold the whole context): the sparse-layer KV rows + Vt and the IndexPool state start in VRAM for kv_cap positions and move to pinned host memory
-    // (all of it, once) when the context passes kv_cap, so short chats in a 128K context run at VRAM speed. kv_cap == 0: not growable.
-    int kv_cap = 0;
-    bool kv_moved = false;
+    // Growable sparse KV + IndexPool state: starts at kv_alloc_pos positions (16,384 by default on discrete cards) in VRAM,
+    // grows in 16K increments in VRAM up to kv_dev_limit (or max_ctx), and spills cleanly to pinned host memory if VRAM runs out.
+    int kv_alloc_pos = 0;
+    int kv_dev_limit = 0;
+    bool kv_is_host = false;
+    void ensure_logits(int rows) {
+        if (rows <= logits_cap) return;
+        HCK(hipStreamSynchronize(st));
+        if (logits) HCK(hipFree(logits));
+        if (hfin) HCK(hipFree(hfin));
+        logits_cap = rows;
+        logits = dalloc<float>((size_t)logits_cap * c.vocab);
+        hfin = dalloc<__half>((size_t)logits_cap * HID);
+    }
     void ensure_mla_ws(size_t need) {
         if (need <= mla_ws_bytes) return;
         HCK(hipStreamSynchronize(st));
@@ -168,23 +186,70 @@ public:
     float *h_z = nullptr, *h_w = nullptr, *h_zcpu = nullptr, *d_zcpu = nullptr;
     int32_t* h_idx = nullptr;
     hipEvent_t ev_hyb = nullptr;
-    // prefill streaming of the CPU-tier experts: for chunks of >= pf_min_T tokens the experts of a layer are DMA'd from the host arena (registered/pinned in place) into a device
-    // scratch buffer while the attention of that layer runs, and the grouped GEMM of the GPU runs on them (the CPU would need ~100 ms per layer and 512 tokens).
-    // When a whole layer does not fit the scratch space (small cards), the layer's experts are split into groups that fit one of two alternating buffers: group k+1 is copied
-    // while group k computes. Every group has its own ExpertDev table (the experts of other groups carry pad = 1 and are skipped by the routing; the VRAM-tier experts run in
-    // group 0), and the partial sums are added up in fp32.
+    // prefill streaming of the CPU-tier experts: for chunks of >= pf_min_T tokens the experts of a layer are DMA'd from the host arena into alternating device scratch buffers
+    // while attention / earlier groups compute. When whole-arena hipHostRegister fails (Windows WDDM or ulimit -l containers) or HY4_PF_BOUNCE=1, a 2 x 256 MiB pinned host
+    // bounce ring filled by parallel memcpy threads feeds st2 hipMemcpyAsync. For medium chunks (pf_min_T <= T < pf_gather_max_T), only active experts (cnt[e] > 0) are gathered!
     struct PfRun { const uint8_t* host; size_t dev_off, bytes; };
-    struct PfGroup { std::vector<PfRun> runs; int seq = 0; ExpertDev* table = nullptr; };
+    struct PfGroup { std::vector<PfRun> runs; size_t total_bytes = 0; int seq = 0; ExpertDev* table = nullptr; };
     std::vector<std::vector<PfGroup>> pf_groups;  // [41 MoE layers][groups]
     std::vector<int> pf_layer_first;              // sequence index of group 0 of each layer
     int pf_nseq = 0, pf_nbuf = 1, pf_next_copy = 0, pf_next_comp = 0;
+    size_t pf_cap = 0;
     uint8_t* d_scratch[2] = {nullptr, nullptr};
+    uint8_t* h_bounce[2] = {nullptr, nullptr};    // 2 x cap pinned host bounce ring (used when arena is not pinned or for active-expert gather)
+    ExpertDev* d_pf_dyn_table[2] = {nullptr, nullptr};
+    ExpertDev* h_pf_dyn_table[2] = {nullptr, nullptr};  // pinned host tables for active-expert gather (safe for async H2D)
+    ExpertDev* d_pf_all_tables = nullptr;
+    size_t pf_tables_cap = 0;                     // max group tables allocated in d_pf_all_tables
+    uint64_t pf_built_promotes = ~0ull;           // vc_promotes snapshot when pf_groups was last built
+    bool pf_bounce = false;
+    std::future<void> pf_pack_fut[2];
+    int pf_packed_seq[2] = {-1, -1};
+    bool ev_pf_copy_set[2] = {false, false};
     hipStream_t st2 = nullptr;
     hipEvent_t ev_pf_copy[2] = {nullptr, nullptr}, ev_pf_done[2] = {nullptr, nullptr};
     bool ev_pf_done_set[2] = {false, false};
     bool pf_stream = false;
-    int pf_min_T = 320;
+    int pf_min_T = 128;
+    int pf_gather_max_T = 1536;  // below this T, gather only cnt[e] > 0 experts; at/above, stream full layer overlapped with attention
     bool pf_active(int T) const { return pf_stream && T >= pf_min_T; }
+    bool pf_use_gather(int T) const { return pf_stream && T >= pf_min_T && T < pf_gather_max_T && h_bounce[0] != nullptr; }
+
+    // parallel host memcpy of a PfGroup into pinned bounce buffer h_bounce[b]
+    void pf_pack_group_sync(int b, const PfGroup* G) {
+        if (!G || G->runs.empty()) return;
+        const size_t nruns = G->runs.size();
+        const int nthr = (G->total_bytes >= (16ull << 20)) ? 4 : 1;
+        if (nthr == 1) {
+            for (const PfRun& r : G->runs) std::memcpy(h_bounce[b] + r.dev_off, r.host, r.bytes);
+            return;
+        }
+        // split total_bytes evenly across 4 worker threads (works cleanly even when nruns == 1!)
+        std::vector<std::thread> wth;
+        wth.reserve(nthr);
+        for (int t = 0; t < nthr; ++t) {
+            wth.emplace_back([&, t]() {
+                const size_t lo = (G->total_bytes * (size_t)t) / (size_t)nthr;
+                const size_t hi = (G->total_bytes * (size_t)(t + 1)) / (size_t)nthr;
+                for (const PfRun& r : G->runs) {
+                    const size_t r0 = r.dev_off, r1 = r.dev_off + r.bytes;
+                    const size_t a = std::max(r0, lo), z = std::min(r1, hi);
+                    if (a < z) std::memcpy(h_bounce[b] + a, r.host + (a - r0), z - a);
+                }
+            });
+        }
+        for (auto& th : wth) th.join();
+    }
+    void pf_pack_kick(int k) {
+        if (!pf_bounce || k < 0 || k >= pf_nseq) return;
+        const int b = k % pf_nbuf;
+        if (pf_packed_seq[b] == k) return;
+        if (pf_pack_fut[b].valid()) pf_pack_fut[b].wait();
+        if (ev_pf_copy_set[b]) HCK(hipEventSynchronize(ev_pf_copy[b]));
+        const PfGroup* G = pf_find(k);
+        pf_packed_seq[b] = k;
+        pf_pack_fut[b] = std::async(std::launch::async, [this, b, G]() { pf_pack_group_sync(b, G); });
+    }
     void pf_init() {
         auto al = [](size_t x) { return (x + 4095) & ~(size_t)4095; };
         std::vector<std::vector<std::pair<const uint8_t*, int>>> lay(41);
@@ -207,38 +272,101 @@ public:
         }
         if (!maxb) return;
         double t0 = now_s();
-        if (hipHostRegister((void*)lo, (size_t)(hi - lo), 0) != hipSuccess) {
-            fprintf(stderr, "[hybrid] prefill streaming disabled: cannot pin the CPU expert arena (%.1f GB)\n", (double)(hi - lo) / 1e9);
-            (void)hipGetLastError();
-            return;
+        bool pinned_arena = false;
+#ifndef _WIN32
+        // Only try hipHostRegister on the full ~50 GB arena when host RAM has ample headroom (> 2x arena size, e.g. >=128 GB servers)
+        // or when explicitly forced via HY4_PF_BOUNCE=0. On 64-96 GB machines / containers / Windows WDDM, calling hipHostRegister on
+        // 50+ GB starves physical RAM and can hang or OOM-thrash the driver; the 2 x 256 MiB pinned bounce ring avoids pinning the arena!
+        const size_t arena_span = (size_t)(hi - lo);
+        const char* b_env = getenv("HY4_PF_BOUNCE");
+        const bool force_bounce = b_env && atoi(b_env) != 0;
+        const bool force_arena  = b_env && atoi(b_env) == 0;
+        const bool safe_to_pin  = ((double)arena_span < 0.48 * ram_limit_gb() * 1e9);
+        if (!force_bounce && (force_arena || safe_to_pin)) {
+            if (hipHostRegister((void*)lo, arena_span, 0) == hipSuccess) pinned_arena = true;
+            else (void)hipGetLastError();
         }
+#endif
+        pf_bounce = !pinned_arena;
         size_t fr = 0, tot = 0;
         HCK(hipMemGetInfo(&fr, &tot));
-        const size_t margin = (size_t)200 << 20, tables_est = (size_t)41 * 16 * 8192;
+        const size_t margin = (size_t)320 << 20, tables_est = (size_t)41 * 16 * 8192;
         size_t avail = fr > margin + tables_est ? fr - margin - tables_est : 0;
+        const size_t cap_limit = getenv("HY4_PF_BUF_MB") ? ((size_t)std::max(64, atoi(getenv("HY4_PF_BUF_MB"))) << 20) : ((size_t)256 << 20);
         size_t cap;
-        if (avail >= maxb) { pf_nbuf = 1; cap = maxb; }
-        else { pf_nbuf = 2; cap = (avail / 2) & ~(size_t)4095; }
+        if (!pf_bounce && avail >= maxb && tot >= (48ull << 30)) { pf_nbuf = 1; cap = maxb; }
+        else { pf_nbuf = 2; cap = std::min(cap_limit, (avail / 2) & ~(size_t)4095); }
         if (cap < ((size_t)64 << 20)) {
             fprintf(stderr, "[hybrid] prefill streaming disabled: no room for a scratch buffer (free %.2f GB, layer %.2f GB)\n", fr / 1e9, maxb / 1e9);
             return;
         }
-        for (int b = 0; b < pf_nbuf; ++b) d_scratch[b] = dalloc<uint8_t>(cap);
-        // groups, sequence numbers and tables
+        pf_cap = cap;
+        for (int b = 0; b < pf_nbuf; ++b) {
+            d_scratch[b] = dalloc<uint8_t>(cap);
+            d_pf_dyn_table[b] = dalloc<ExpertDev>(512);
+            HCK(hipHostMalloc((void**)&h_pf_dyn_table[b], 512 * sizeof(ExpertDev), hipHostMallocDefault));
+        }
+        // Always allocate pinned bounce buffers when pf_bounce is true (and best-effort when pinned_arena is true so active-expert gather works!)
+        for (int b = 0; b < pf_nbuf; ++b) {
+            if (hipHostMalloc((void**)&h_bounce[b], cap, hipHostMallocDefault) != hipSuccess) {
+                (void)hipGetLastError();
+                for (int j = 0; j < b; ++j) { hipHostFree(h_bounce[j]); h_bounce[j] = nullptr; }
+                if (pf_bounce) {
+                    fprintf(stderr, "[hybrid] prefill streaming disabled: cannot allocate %d x %.0f MiB pinned bounce ring\n", pf_nbuf, cap / 1048576.0);
+                    for (int j = 0; j < pf_nbuf; ++j) { hipFree(d_scratch[j]); d_scratch[j] = nullptr; }
+                    return;
+                }
+                break;
+            }
+        }
+        pf_tables_cap = 41 * 12;  // up to 12 groups/layer (492 * 512 * 16 B = 4.0 MiB)
+        d_pf_all_tables = dalloc<ExpertDev>(pf_tables_cap * 512);
+        pf_rebuild_groups(false);
+        if (!st2) HCK(hipStreamCreate(&st2));
+        for (int b = 0; b < 2; ++b) {
+            HCK(hipEventCreateWithFlags(&ev_pf_copy[b], hipEventDisableTiming));
+            HCK(hipEventCreateWithFlags(&ev_pf_done[b], hipEventDisableTiming));
+        }
+        if (getenv("HY4_PF_MIN_T")) pf_min_T = atoi(getenv("HY4_PF_MIN_T"));
+        if (getenv("HY4_PF_GATHER_MAX_T")) pf_gather_max_T = atoi(getenv("HY4_PF_GATHER_MAX_T"));
+        pf_stream = true;
+        size_t ng = 0, total_stream_b = 0;
+        for (auto& v : pf_groups) {
+            ng += v.size();
+            for (auto& G : v) total_stream_b += G.total_bytes;
+        }
+        fprintf(stderr, "[hybrid] prefill streaming on (%s): %d buffer(s) of %.0f MiB, %zu groups (%.2f GB streamed, skipping VRAM/vcache), init %.2f s, active for T >= %d (gather < %d)\n",
+                pf_bounce ? "pinned bounce ring" : "arena pinned", pf_nbuf, cap / 1048576.0, ng, total_stream_b / 1e9, now_s() - t0, pf_min_T, pf_gather_max_T);
+    }
+    // Build per-layer streaming groups skipping every expert currently resident in VRAM/vcache (vram_flag[gi] == 1 runs once in gi == 0 from d_sec4!)
+    void pf_rebuild_groups(bool sync_stream) {
+        if (pf_cap == 0 || !d_pf_all_tables) return;
+        if (sync_stream) HCK(hipStreamSynchronize(st));
+        auto al = [](size_t x) { return (x + 4095) & ~(size_t)4095; };
         pf_groups.assign(41, {});
         pf_layer_first.assign(41, 0);
         std::vector<ExpertDev> all;
         std::vector<std::vector<std::vector<int>>> gexp(41);
         int seq = 0;
         for (int l = 0; l < 41; ++l) {
+            std::vector<std::pair<const uint8_t*, int>> lay;
+            lay.reserve(512);
+            for (int e = 0; e < 512; ++e) {
+                const int gi = l * 512 + e;
+                if (!vram_flag.empty() && vram_flag[gi]) continue;  // already resident in VRAM / vcache!
+                CpuExpertView vw = cpu.view(l, e);
+                if (vw.body) lay.push_back({vw.body, e});
+            }
+            std::sort(lay.begin(), lay.end());
             pf_layer_first[l] = seq;
             pf_groups[l].emplace_back();
             gexp[l].emplace_back();
             size_t off = 0;
-            for (auto& pe : lay[l]) {
+            for (auto& pe : lay) {
                 CpuExpertView vw = cpu.view(l, pe.second);
                 const size_t sz = al(vw.body_bytes);
-                if (off + sz > cap) {
+                if (off + sz > pf_cap && off > 0) {
+                    pf_groups[l].back().total_bytes = off;
                     pf_groups[l].emplace_back();
                     gexp[l].emplace_back();
                     off = 0;
@@ -249,18 +377,17 @@ public:
                 gexp[l].back().push_back(pe.second);
                 off += sz;
             }
-            for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) {
-                pf_groups[l][gi].seq = seq++;
-            }
+            pf_groups[l].back().total_bytes = off;
+            for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) pf_groups[l][gi].seq = seq++;
         }
         pf_nseq = seq;
-        // per-group tables: offsets of the group's experts inside its buffer follow the order of gexp
+        all.reserve((size_t)seq * 512);
         for (int l = 0; l < 41; ++l)
             for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) {
                 const int k = pf_groups[l][gi].seq, b = k % pf_nbuf;
-                std::vector<ExpertDev> hp(512);
-                std::vector<char> in_group(512, 0);
-                std::vector<size_t> eoff(512, 0);
+                ExpertDev hp[512];
+                char in_group[512] = {};
+                size_t eoff[512] = {};
                 size_t off = 0;
                 for (int e : gexp[l][gi]) {
                     CpuExpertView vw = cpu.view(l, e);
@@ -269,61 +396,77 @@ public:
                     off += al(vw.body_bytes);
                 }
                 for (int e = 0; e < 512; ++e) {
-                    const ExpertRef& er = g.experts[l * 512 + e];
-                    hp[e].dn_off = er.dn_off;
-                    hp[e].gu_code = er.gu_code;
-                    hp[e].dn_code = er.dn_code;
-                    if (er.tier == 3) {
+                    const int idx = l * 512 + e;
+                    const ExpertRef& er = g.experts[idx];
+                    if (!vram_flag.empty() && vram_flag[idx]) {
+                        hp[e] = h_experts[idx];
+                        hp[e].pad = gi == 0 ? 0 : 1;  // VRAM / vcache experts run once per layer in group 0
+                    } else if (er.tier == 3) {
                         hp[e].body_off = 0;
-                        hp[e].pad = 1;  // cold expert: computed by the CPU pool from the SSD
-                    } else if (er.tier == 2) {
-                        if (in_group[e]) {
-                            hp[e].body_off = (uint64_t)(uintptr_t)(d_scratch[b] + eoff[e]) - (uint64_t)(uintptr_t)g.d_sec4;
-                            hp[e].pad = 0;
-                        } else {
-                            hp[e].body_off = 0;
-                            hp[e].pad = 1;
-                        }
+                        hp[e].dn_off = er.dn_off;
+                        hp[e].gu_code = er.gu_code;
+                        hp[e].dn_code = er.dn_code;
+                        hp[e].pad = 1;
+                    } else if (in_group[e]) {
+                        hp[e].body_off = (uint64_t)(uintptr_t)(d_scratch[b] + eoff[e]) - (uint64_t)(uintptr_t)g.d_sec4;
+                        hp[e].dn_off = er.dn_off;
+                        hp[e].gu_code = er.gu_code;
+                        hp[e].dn_code = er.dn_code;
+                        hp[e].pad = 0;
                     } else {
-                        hp[e].body_off = er.body_off;
-                        hp[e].pad = gi == 0 ? 0 : 1;  // the GPU-resident experts run once per layer, with the first group
+                        hp[e].body_off = 0;
+                        hp[e].dn_off = er.dn_off;
+                        hp[e].gu_code = er.gu_code;
+                        hp[e].dn_code = er.dn_code;
+                        hp[e].pad = 1;
                     }
                 }
-                all.insert(all.end(), hp.begin(), hp.end());
+                all.insert(all.end(), hp, hp + 512);
             }
-        ExpertDev* dt = dalloc<ExpertDev>(all.size());
-        HCK(hipMemcpy(dt, all.data(), all.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
-        {
-            size_t idx = 0;
-            for (int l = 0; l < 41; ++l)
-                for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) pf_groups[l][gi].table = dt + 512 * idx++;
+        if ((size_t)seq > pf_tables_cap) {
+            HCK(hipFree(d_pf_all_tables));
+            pf_tables_cap = (size_t)seq;
+            d_pf_all_tables = dalloc<ExpertDev>(pf_tables_cap * 512);
         }
-        HCK(hipStreamCreate(&st2));
-        for (int b = 0; b < 2; ++b) {
-            HCK(hipEventCreateWithFlags(&ev_pf_copy[b], hipEventDisableTiming));
-            HCK(hipEventCreateWithFlags(&ev_pf_done[b], hipEventDisableTiming));
-        }
-        if (getenv("HY4_PF_MIN_T")) pf_min_T = atoi(getenv("HY4_PF_MIN_T"));
-        pf_stream = true;
-        size_t ng = 0;
-        for (auto& v : pf_groups) ng += v.size();
-        fprintf(stderr, "[hybrid] prefill streaming on: %d buffer(s) of %.2f GB, %zu groups for 41 layers (largest layer %.2f GB), arena pinned in %.1f s, used for chunks >= %d tokens\n", pf_nbuf, cap / 1e9, ng, maxb / 1e9,
-                now_s() - t0, pf_min_T);
+        HCK(hipMemcpy(d_pf_all_tables, all.data(), all.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+        size_t idx = 0;
+        for (int l = 0; l < 41; ++l)
+            for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) pf_groups[l][gi].table = d_pf_all_tables + 512 * idx++;
+        pf_built_promotes = vc_promotes;
     }
     void pf_begin_chunk() {
+        if (vcache_nslots > 1) vcache_flush();
+        if (pf_built_promotes != vc_promotes) pf_rebuild_groups(true);
+        for (int b = 0; b < 2; ++b) {
+            if (pf_pack_fut[b].valid()) pf_pack_fut[b].wait();
+            pf_packed_seq[b] = -1;
+            ev_pf_copy_set[b] = false;
+        }
         pf_next_copy = 0;
         pf_next_comp = 0;
     }
-    // queue the DMA of sequence entries up to `upto` (inclusive) whose buffer is free (the compute that used it nbuf entries earlier has been enqueued)
+    // queue the DMA of sequence entries up to `upto` (inclusive) whose buffer is free
     void pf_pump(int upto) {
         while (pf_next_copy <= upto && pf_next_copy < pf_nseq) {
             const int k = pf_next_copy, b = k % pf_nbuf;
             if (k - pf_nbuf >= pf_next_comp) break;
             const PfGroup* G = pf_find(k);
-            if (ev_pf_done_set[b]) HCK(hipStreamWaitEvent(st2, ev_pf_done[b], 0));
-            for (const PfRun& r : G->runs) HCK(hipMemcpyAsync(d_scratch[b] + r.dev_off, r.host, r.bytes, hipMemcpyHostToDevice, st2));
-            HCK(hipEventRecord(ev_pf_copy[b], st2));
+            if (pf_bounce) {
+                if (pf_packed_seq[b] != k) pf_pack_kick(k);
+                if (pf_pack_fut[b].valid()) pf_pack_fut[b].wait();
+                if (ev_pf_done_set[b]) HCK(hipStreamWaitEvent(st2, ev_pf_done[b], 0));
+                if (G->total_bytes > 0) HCK(hipMemcpyAsync(d_scratch[b], h_bounce[b], G->total_bytes, hipMemcpyHostToDevice, st2));
+                HCK(hipEventRecord(ev_pf_copy[b], st2));
+                ev_pf_copy_set[b] = true;
+            } else {
+                if (ev_pf_done_set[b]) HCK(hipStreamWaitEvent(st2, ev_pf_done[b], 0));
+                for (const PfRun& r : G->runs) HCK(hipMemcpyAsync(d_scratch[b] + r.dev_off, r.host, r.bytes, hipMemcpyHostToDevice, st2));
+                HCK(hipEventRecord(ev_pf_copy[b], st2));
+                ev_pf_copy_set[b] = true;
+            }
             ++pf_next_copy;
+            // lookahead pack of the next buffer while st2 transfers the current one
+            if (pf_bounce && pf_nbuf > 1 && pf_next_copy < pf_nseq && (pf_next_copy - pf_nbuf < pf_next_comp)) pf_pack_kick(pf_next_copy);
         }
     }
     const PfGroup* pf_find(int k) const {
@@ -334,6 +477,291 @@ public:
             if (pf_layer_first[mid] <= k) lo = mid; else hi = mid - 1;
         }
         return &pf_groups[lo][k - pf_layer_first[lo]];
+    }
+
+    // ---- Adaptive Per-Layer VRAM Expert Cache (online decayed LFU + 4-slot async st2 promotion ring) ----
+    // Parameters tuned from real 41-layer SQ-64 traces: core_frac=0 (100% dynamic when RAM allows), decay=0.965, max_swaps=2/layer.
+    struct VSlot { int layer = -1, expert = -1; };
+    struct VProm {
+        uint8_t* h_stg = nullptr;
+        hipEvent_t ev_done = nullptr, ev_evict = nullptr;
+        bool inflight = false;
+        int slot = -1, layer = -1, expert = -1;
+    };
+    static constexpr int VPROM_RING = 4;
+    int vcache_nslots = 0;
+    size_t vcache_slot_bytes = 0;
+    double vcache_decay = 0.965;
+    int vcache_max_swaps = 2;
+    std::vector<VSlot> vslots;
+    std::vector<int> vslot_of;        // [41*512]: slot index in [0, vcache_nslots) or -1
+    std::vector<double> vscore;       // [41*512]: decayed routing score (scaled by vcache_inv_scale)
+    std::vector<uint8_t> vram_flag;   // [41*512]: 1 = evaluated on GPU (static or vcache), 0 = evaluated on CPU
+    std::vector<uint8_t> v_use_buf;   // [Tc*16]: per-pair CPU mask for CpuExperts::submit
+    double vcache_inv_scale = 1.0;
+    VProm vprom[VPROM_RING];
+    bool vcache_frozen = false;       // frozen during --spec-check / --parity-m for deterministic verify comparison
+    uint64_t vc_hits = 0, vc_misses = 0, vc_promotes = 0;
+
+    void vcache_init() {
+        vram_flag.assign(41 * 512, 0);
+        for (int i = 0; i < 41 * 512; ++i)
+            if (g.experts[i].tier == 0 || g.experts[i].tier == 1) vram_flag[i] = 1;
+        vcache_nslots = g.vcache_nslots;
+        vcache_slot_bytes = g.vcache_slot_bytes;
+        if (!hyb || vcache_nslots <= 0 || vcache_slot_bytes == 0) return;
+        if (getenv("HY4_VCACHE_DECAY")) vcache_decay = std::max(0.80, std::min(0.999, atof(getenv("HY4_VCACHE_DECAY"))));
+        if (getenv("HY4_VCACHE_MAX_SWAPS")) vcache_max_swaps = std::max(0, std::min(VPROM_RING, atoi(getenv("HY4_VCACHE_MAX_SWAPS"))));
+        vslots.assign(vcache_nslots, VSlot{});
+        vslot_of.assign(41 * 512, -1);
+        vscore.assign(41 * 512, 0.0);
+        v_use_buf.assign((size_t)Tc * 16, 0);
+        for (int i = 0; i < 41 * 512; ++i) {
+            const int r = i < (int)g.expert_rank.size() ? g.expert_rank[i] : 511;
+            vscore[i] = 0.5 / (1.0 + 0.05 * (double)r);  // soft rank prior so session hits rapidly adapt
+        }
+        if (!st2) HCK(hipStreamCreate(&st2));
+        for (int p = 0; p < VPROM_RING; ++p) {
+            HCK(hipHostMalloc((void**)&vprom[p].h_stg, vcache_slot_bytes, hipHostMallocDefault));
+            HCK(hipEventCreateWithFlags(&vprom[p].ev_done, hipEventDisableTiming));
+            HCK(hipEventCreateWithFlags(&vprom[p].ev_evict, hipEventDisableTiming));
+        }
+        // Pre-populate dynamic VRAM slots with the hottest tier-2 (RAM-resident) experts in rank-major order
+        double t0 = now_s();
+        int filled = 0;
+        std::vector<std::pair<int, int>> cands;  // (rank, l*512+e)
+        cands.reserve(41 * 512);
+        for (int l = 0; l < 41; ++l)
+            for (int e = 0; e < 512; ++e) {
+                const int idx = l * 512 + e;
+                if (g.experts[idx].tier == 2 && cpu.resident(l, e)) cands.push_back({g.expert_rank[idx], idx});
+            }
+        std::stable_sort(cands.begin(), cands.end());
+        for (const auto& pr : cands) {
+            if (filled >= vcache_nslots) break;
+            const int idx = pr.second, l = idx / 512, e = idx % 512;
+            CpuExpertView vw = cpu.view(l, e);
+            if (!vw.body || vw.body_bytes > vcache_slot_bytes) continue;
+            const int rp = filled % VPROM_RING;
+            if (filled >= VPROM_RING) HCK(hipEventSynchronize(vprom[rp].ev_done));
+            std::memcpy(vprom[rp].h_stg, vw.body, vw.body_bytes);
+            HCK(hipMemcpyAsync(g.vcache_slot_ptr(filled), vprom[rp].h_stg, vw.body_bytes, hipMemcpyHostToDevice, st2));
+            HCK(hipEventRecord(vprom[rp].ev_done, st2));
+            vslots[filled] = {l, e};
+            vslot_of[idx] = filled;
+            vram_flag[idx] = 1;
+            h_experts[idx].body_off = g.vcache_slot_off(filled);
+            h_experts[idx].pad = 0;
+            ++filled;
+        }
+        HCK(hipStreamSynchronize(st2));
+        HCK(hipMemcpy(d_experts, h_experts, (size_t)41 * 512 * sizeof(ExpertDev), hipMemcpyHostToDevice));
+        fprintf(stderr, "[vcache] pre-populated %d/%d adaptive VRAM slots (%.2f GB, decay=%.3f, max_swaps=%d) in %.2f s\n",
+                filled, vcache_nslots, (filled * (double)vcache_slot_bytes) / 1e9, vcache_decay, vcache_max_swaps, now_s() - t0);
+    }
+    void vcache_poll_commit() {
+        for (int p = 0; p < VPROM_RING; ++p) {
+            if (!vprom[p].inflight) continue;
+            if (hipEventQuery(vprom[p].ev_done) != hipSuccess) continue;
+            const int idx = vprom[p].layer * 512 + vprom[p].expert;
+            vslots[vprom[p].slot] = {vprom[p].layer, vprom[p].expert};
+            vslot_of[idx] = vprom[p].slot;
+            vram_flag[idx] = 1;
+            h_experts[idx].body_off = g.vcache_slot_off(vprom[p].slot);
+            h_experts[idx].pad = 0;
+            HCK(hipMemcpyAsync(d_experts + idx, &h_experts[idx], sizeof(ExpertDev), hipMemcpyHostToDevice, st));
+            vprom[p].inflight = false;
+            ++vc_promotes;
+        }
+    }
+    void vcache_flush() {
+        for (int p = 0; p < VPROM_RING; ++p)
+            if (vprom[p].inflight) HCK(hipEventSynchronize(vprom[p].ev_done));
+        vcache_poll_commit();
+    }
+    // Batch rebalance at end of prefill chunk: promote the prompt's hottest tier-2 experts into vcache so decode starts hot from token 1
+    void vcache_rebalance_prefill() {
+        if (!hyb || vcache_nslots <= 1 || vcache_frozen) return;
+        vcache_flush();
+        HCK(hipStreamSynchronize(st));
+        std::vector<std::pair<double, int>> in_slots;
+        in_slots.reserve(vcache_nslots);
+        for (int s = 0; s < vcache_nslots; ++s) {
+            const int l = vslots[s].layer, e = vslots[s].expert;
+            const double sc = (l >= 0) ? vscore[l * 512 + e] : -1.0;
+            in_slots.push_back({sc, s});
+        }
+        std::sort(in_slots.begin(), in_slots.end());
+        std::vector<std::pair<double, int>> hot_cpu;
+        const double min_in = in_slots.empty() ? 0.0 : in_slots[0].first;
+        for (int l = 0; l < 41; ++l)
+            for (int e = 0; e < 512; ++e) {
+                const int idx = l * 512 + e;
+                if (g.experts[idx].tier == 2 && !vram_flag[idx] && vscore[idx] > min_in * 1.05 && cpu.resident(l, e))
+                    hot_cpu.push_back({vscore[idx], idx});
+            }
+        if (hot_cpu.empty()) return;
+        std::sort(hot_cpu.rbegin(), hot_cpu.rend());
+        const int max_swaps = std::min<int>({(int)hot_cpu.size(), (int)in_slots.size(), std::max(128, (vcache_nslots * 3) / 4)});
+        int swapped = 0;
+        for (int i = 0; i < max_swaps; ++i) {
+            if (hot_cpu[i].first <= in_slots[i].first * 1.05) break;
+            const int s = in_slots[i].second;
+            const int old_l = vslots[s].layer, old_e = vslots[s].expert;
+            if (old_l >= 0) {
+                const int oidx = old_l * 512 + old_e;
+                vslot_of[oidx] = -1;
+                vram_flag[oidx] = 0;
+                h_experts[oidx].pad = 1;
+            }
+            const int nidx = hot_cpu[i].second, nl = nidx / 512, ne = nidx % 512;
+            CpuExpertView vw = cpu.view(nl, ne);
+            const int rp = swapped % VPROM_RING;
+            if (swapped >= VPROM_RING) HCK(hipEventSynchronize(vprom[rp].ev_done));
+            std::memcpy(vprom[rp].h_stg, vw.body, vw.body_bytes);
+            HCK(hipMemcpyAsync(g.vcache_slot_ptr(s), vprom[rp].h_stg, vw.body_bytes, hipMemcpyHostToDevice, st2));
+            HCK(hipEventRecord(vprom[rp].ev_done, st2));
+            vslots[s] = {nl, ne};
+            vslot_of[nidx] = s;
+            vram_flag[nidx] = 1;
+            h_experts[nidx].body_off = g.vcache_slot_off(s);
+            h_experts[nidx].pad = 0;
+            ++swapped;
+        }
+        if (swapped > 0) {
+            HCK(hipStreamSynchronize(st2));
+            HCK(hipMemcpy(d_experts, h_experts, (size_t)41 * 512 * sizeof(ExpertDev), hipMemcpyHostToDevice));
+            vc_promotes += (uint64_t)swapped;
+        }
+    }
+    // Online decode update: record routing hits for layer l (0..40) and asynchronously promote up to vcache_max_swaps hottest misses on st2
+    void vcache_note_decode(int l, int T, const int32_t* idx_arr) {
+        if (vcache_nslots <= 1) return;
+        const size_t n = (size_t)T * 16;
+        int cand_idx[4] = {-1, -1, -1, -1};
+        double cand_sc[4] = {0.0, 0.0, 0.0, 0.0};
+        const int max_c = std::min(vcache_max_swaps, VPROM_RING);
+        for (size_t i = 0; i < n; ++i) {
+            const int e = idx_arr[i];
+            if (e < 0 || e >= 512) continue;
+            const int gi = l * 512 + e;
+            if (vram_flag[gi]) ++vc_hits;
+            else ++vc_misses;
+            if (!vcache_frozen) {
+                vscore[gi] += vcache_inv_scale;
+                if (max_c > 0 && g.experts[gi].tier == 2 && !vram_flag[gi] && cpu.resident(l, e)) {
+                    // Check not already inflight
+                    bool infl = false;
+                    for (int p = 0; p < VPROM_RING; ++p)
+                        if (vprom[p].inflight && vprom[p].layer == l && vprom[p].expert == e) { infl = true; break; }
+                    if (!infl) {
+                        const double sc = vscore[gi];
+                        int dup = -1, min_k = 0;
+                        for (int k = 0; k < max_c; ++k) {
+                            if (cand_idx[k] == gi) dup = k;
+                            if (cand_sc[k] < cand_sc[min_k]) min_k = k;
+                        }
+                        if (dup >= 0) cand_sc[dup] = sc;
+                        else if (sc > cand_sc[min_k]) { cand_idx[min_k] = gi; cand_sc[min_k] = sc; }
+                    }
+                }
+            }
+        }
+        if (vcache_frozen || max_c <= 0) return;
+        vcache_poll_commit();
+        // Sort candidates descending by score
+        for (int a = 0; a < max_c; ++a)
+            for (int b = a + 1; b < max_c; ++b)
+                if (cand_sc[b] > cand_sc[a]) { std::swap(cand_sc[a], cand_sc[b]); std::swap(cand_idx[a], cand_idx[b]); }
+        for (int ci = 0; ci < max_c; ++ci) {
+            const int best_miss = cand_idx[ci];
+            if (best_miss < 0) break;
+            // Find a free ring staging entry
+            int rp = -1;
+            for (int p = 0; p < VPROM_RING; ++p)
+                if (!vprom[p].inflight) { rp = p; break; }
+            if (rp < 0) break;
+            // Exact coldest-slot scan (skips in-flight sentinel layer == -2; ~2 us for 3300 slots)
+            int victim = -1;
+            double vic_sc = 1e300;
+            for (int s = 0; s < vcache_nslots; ++s) {
+                const int sl = vslots[s].layer, se = vslots[s].expert;
+                if (sl == -2) continue;  // in-flight promotion target
+                const double sc = (sl >= 0) ? vscore[sl * 512 + se] : -1.0;
+                if (sc < vic_sc) { vic_sc = sc; victim = s; }
+            }
+            if (victim < 0 || cand_sc[ci] <= vic_sc * 1.05) break;
+            const int nl = best_miss / 512, ne = best_miss % 512;
+            CpuExpertView vw = cpu.view(nl, ne);
+            if (!vw.body || vw.body_bytes > vcache_slot_bytes) continue;
+            // Evict victim from d_experts on st first, record ev_evict on st, wait on st2, then async DMA into victim slot
+            const int ol = vslots[victim].layer, oe = vslots[victim].expert;
+            if (ol >= 0) {
+                const int oidx = ol * 512 + oe;
+                vslot_of[oidx] = -1;
+                vram_flag[oidx] = 0;
+                h_experts[oidx].pad = 1;
+                HCK(hipMemcpyAsync(d_experts + oidx, &h_experts[oidx], sizeof(ExpertDev), hipMemcpyHostToDevice, st));
+            }
+            vslots[victim] = {-2, -2};  // mark in-flight so no other promotion picks this slot
+            HCK(hipEventRecord(vprom[rp].ev_evict, st));
+            HCK(hipStreamWaitEvent(st2, vprom[rp].ev_evict, 0));
+            std::memcpy(vprom[rp].h_stg, vw.body, vw.body_bytes);
+            HCK(hipMemcpyAsync(g.vcache_slot_ptr(victim), vprom[rp].h_stg, vw.body_bytes, hipMemcpyHostToDevice, st2));
+            HCK(hipEventRecord(vprom[rp].ev_done, st2));
+            vprom[rp].inflight = true;
+            vprom[rp].slot = victim;
+            vprom[rp].layer = nl;
+            vprom[rp].expert = ne;
+        }
+    }
+    void vcache_decay_step(int T = 1) {
+        if (vcache_nslots <= 1 || vcache_frozen) return;
+        const double step = std::pow(vcache_decay, (double)std::max(1, std::min(T, 4)));
+        vcache_inv_scale /= step;
+        if (vcache_inv_scale > 1e12) {
+            const double inv = 1.0 / vcache_inv_scale;
+            for (double& s : vscore) s *= inv;
+            vcache_inv_scale = 1.0;
+        }
+    }
+    // Reclaim tail vcache slabs back to the GPU allocator so sparse KV + IndexPool can grow up to 128K 100% in VRAM without spilling to host!
+    bool vcache_release_vram(size_t need_free) {
+        if (g.vcache_slabs.size() <= 1 || g.vcache_slots_per_slab <= 0) return false;
+        vcache_flush();
+        HCK(hipDeviceSynchronize());
+        int freed_slabs = 0;
+        size_t freed_bytes = 0;
+        size_t fr = 0, tot = 0;
+        HCK(hipMemGetInfo(&fr, &tot));
+        while (fr < need_free && g.vcache_slabs.size() > 1) {
+            const int cut = (int)(g.vcache_slabs.size() - 1) * g.vcache_slots_per_slab;
+            const int take = vcache_nslots - cut;
+            for (int s = cut; s < vcache_nslots; ++s) {
+                const int ol = vslots[s].layer, oe = vslots[s].expert;
+                if (ol >= 0) {
+                    const int oidx = ol * 512 + oe;
+                    vslot_of[oidx] = -1;
+                    vram_flag[oidx] = 0;
+                    h_experts[oidx].pad = 1;
+                }
+            }
+            HCK(hipFree(g.vcache_slabs.back()));
+            g.vcache_slabs.pop_back();
+            vcache_nslots = cut;
+            g.vcache_nslots = cut;
+            vslots.resize(cut);
+            ++freed_slabs;
+            freed_bytes += (size_t)take * vcache_slot_bytes;
+            HCK(hipMemGetInfo(&fr, &tot));
+        }
+        if (freed_slabs > 0) {
+            HCK(hipMemcpy(d_experts, h_experts, (size_t)41 * 512 * sizeof(ExpertDev), hipMemcpyHostToDevice));
+            pf_built_promotes = ~0ull;  // rebuild streaming groups on next prefill chunk to include newly evicted experts
+            fprintf(stderr, "[vcache] released %d slab(s) (%.2f GB) for VRAM KV growth -> %d adaptive slots (%.2f GB) remain\n",
+                    freed_slabs, freed_bytes / 1e9, vcache_nslots, (vcache_nslots * (double)vcache_slot_bytes) / 1e9);
+        }
+        return fr >= need_free;
     }
     double t_cpu_wait = 0;  // host time spent waiting for the CPU experts after the GPU work was queued (layer sum)
 
@@ -429,11 +857,21 @@ public:
         fprintf(stderr, "  TOTAL %.3f ms\n", tot / steps);
         pacc.clear();
     }
-    void lin(const std::string& name, const __half* X, float* Y, int M) {
+    void lin(const std::string& name, const __half* X, float* Y, int M, __half* w16 = nullptr) {
         const TInfo& t = ti(name);
         size_t dot = name.rfind('.', name.rfind('.') - 1);
         PS _p(this, std::string("lin ") + name.substr(name.find('.', 13) == std::string::npos ? 0 : name.find('.', 13) + 1));
         (void)dot;
+#if HY4_MMA && !HY4_CUDA
+        static const bool allow_w16 = !getenv("HY4_NO_W16");
+        // Only dequant S_K -> FP16 when the FP16 weight matrix fits inside RDNA4's 64 MB Infinity Cache (<= 48 MiB)
+        if (allow_w16 && w16 && M >= 256 && t.fmt != FMT_Q8ROW && skd::int8_wmma_mode() == 0 && (size_t)t.rows() * t.cols() * 2 <= (48ull << 20)) {
+            linear_h_dequant_f16(st, t.fmt, tw(name), (int)t.rows(), (int)t.cols(), X, Y, M, w16);
+            return;
+        }
+#else
+        (void)w16;
+#endif
         linear_h(st, t.fmt, tw(name), (int)t.rows(), (int)t.cols(), X, Y, M);
     }
 
@@ -447,12 +885,13 @@ public:
     bool route_now = false;
     ExpertDev* slot_rec = nullptr;  // [16] ExpertDev records of the chosen experts (one-token decode path)
     LinMulti lm_eng[4];             // per engram module: key_projs 0..3 + value_proj for one token
+    LinMulti lm_mlp[41];            // per MoE layer (1..41): shared_experts.gate_proj + shared_experts.up_proj for T == 1 decode
     void tune_init() {
         const char* e = getenv("HY4_TUNE");
         tune = e ? atoi(e) : TUNE_DEFAULT;
         if (tune == 0) return;
         slot_rec = dalloc<ExpertDev>(16);
-        HCK(hipMemset(moe_ws, 0, moe_ws_bytes(Tc)));  // the one-token expert kernels keep their column tickets in the (otherwise unused) `fill` table of the workspace
+        HCK(hipMemset(moe_ws_dec, 0, moe_ws_bytes(4)));  // the one-token expert kernels keep their column tickets in the (otherwise unused) `fill` table of the workspace
         if (engram_ready && emeta.layers.size() >= 4) {
             for (int mo = 0; mo < 4; ++mo) {
                 const std::string p = L(emeta.layers[mo]) + ".engram_layer";
@@ -473,6 +912,18 @@ public:
                 if (ok) lm_eng[mo] = linear_multi_build(fmt, K, 5, W, Y, N);
             }
         }
+        // Fuse shared_experts.gate_proj + shared_experts.up_proj for T == 1 decode (same input cur_h, K=3072)
+        for (int il = 1; il < c.n_layers; ++il) {
+            const std::string pm = L(il) + ".mlp";
+            const TInfo& tg = ti(pm + ".shared_experts.gate_proj.weight");
+            const TInfo& tu = ti(pm + ".shared_experts.up_proj.weight");
+            if (tg.fmt == tu.fmt && tg.cols() == tu.cols() && tg.fmt != FMT_Q8ROW) {
+                const void* W[2] = {tw(pm + ".shared_experts.gate_proj.weight"), tw(pm + ".shared_experts.up_proj.weight")};
+                float* Y[2] = {F1, dump ? F3 : (F1 + 1536)};
+                int N[2] = {(int)tg.rows(), (int)tu.rows()};
+                lm_mlp[il - 1] = linear_multi_build(tg.fmt, (int)tg.cols(), 2, W, Y, N);
+            }
+        }
         fprintf(stderr, "[tune] HY4_TUNE=%d\n", tune);
     }
 
@@ -487,38 +938,55 @@ public:
         cur_f = dalloc<float>((size_t)T * HID);
         sub = dalloc<float>((size_t)T * HID);
         size_t big = (size_t)T * 16384;
-        F1 = dalloc<float>(big);
-        F2 = dalloc<float>(big);
-        F3 = dalloc<float>(big);
-        H1 = dalloc<__half>(big);
+        ldS = (size_t)(max_ctx / 4 + 8);
+        moe_ws_dec = dalloc<uint8_t>(moe_ws_bytes(4));
+        if (!dump) {
+            const size_t arena_bytes = std::max({(size_t)2 * big * sizeof(float), (size_t)T * ldS * sizeof(float), moe_ws_bytes(T)});
+            work_arena = dalloc<uint8_t>(arena_bytes);
+            F1 = (float*)work_arena;
+            F2 = F1 + big;
+            F3 = F1;            // attention linear_gate and layer-0 down_proj; layers 1..41 use F1 + T*1536
+            ctx_ws = F2;        // mla_attend stores __half[T][NH][512] = T*16384*4 bytes = big floats (F2 is dead before mla_attend)
+            kv_f = F1;          // 5*T*3072 = T*15360 <= big (engram_layer runs when F1 is dead)
+            score = (float*)work_arena;
+            moe_ws = work_arena;
+            H1 = dalloc<__half>(big);
+            o_h = H1;           // o_h is only live in attention_layer; H1 is only live in mlp_layer
+        } else {
+            F1 = dalloc<float>(big);
+            F2 = dalloc<float>(big);
+            F3 = dalloc<float>(big);
+            H1 = dalloc<__half>(big);
+            o_h = dalloc<__half>((size_t)T * 16384);
+            ctx_ws = dalloc<float>((size_t)T * 64 * 512);
+            kv_f = dalloc<float>((size_t)5 * T * HID);
+            score = dalloc<float>((size_t)T * ldS);
+            moe_ws = dalloc<uint8_t>(moe_ws_bytes(T));
+        }
         qr_h = dalloc<__half>((size_t)T * 1024);
         qa_h = dalloc<__half>((size_t)T * 64 * 576);
-        o_h = dalloc<__half>((size_t)T * 16384);
-        ctx_ws = dalloc<float>((size_t)T * 64 * 512);
         z_f = dalloc<float>((size_t)T * 1536);
         z_h = dalloc<__half>((size_t)T * 1536);
         zout_f = dalloc<float>((size_t)T * 1536);
         moe_idx = dalloc<int32_t>((size_t)T * 16);
         moe_w = dalloc<float>((size_t)T * 16);
-        moe_ws = dalloc<uint8_t>(moe_ws_bytes(T));
-        hfin = dalloc<__half>((size_t)T * HID);
-        logits = dalloc<float>((size_t)T * c.vocab);
+        ensure_logits(16);  // 7.7 MiB instead of Tc * vocab * 4 (1-2 GB); grows on demand for --all-logits
         d_argmax = dalloc<int32_t>(T);
         mla_ws_bytes = 0;
         mla_ws = nullptr;
-        // experts table
+        // experts table (pinned host mirror so single-entry vcache H2D updates never stall the GPU stream)
         {
-            std::vector<ExpertDev> h(41 * 512);
+            HCK(hipHostMalloc((void**)&h_experts, (size_t)41 * 512 * sizeof(ExpertDev), hipHostMallocDefault));
             for (int i = 0; i < 41 * 512; ++i) {
                 const ExpertRef& e = g.experts[i];
-                h[i].body_off = e.body_off;
-                h[i].dn_off = e.dn_off;
-                h[i].gu_code = e.gu_code;
-                h[i].dn_code = e.dn_code;
-                h[i].pad = (e.tier == 2 || e.tier == 3) ? 1 : 0;  // CPU-computed experts (resident or cold) are skipped by the GPU routing
+                h_experts[i].body_off = e.body_off;
+                h_experts[i].dn_off = e.dn_off;
+                h_experts[i].gu_code = e.gu_code;
+                h_experts[i].dn_code = e.dn_code;
+                h_experts[i].pad = (e.tier == 2 || e.tier == 3) ? 1 : 0;  // CPU-computed experts (resident or cold) are skipped by the GPU routing
             }
             d_experts = dalloc<ExpertDev>(41 * 512);
-            HCK(hipMemcpy(d_experts, h.data(), h.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+            HCK(hipMemcpy(d_experts, h_experts, (size_t)41 * 512 * sizeof(ExpertDev), hipMemcpyHostToDevice));
         }
         if (!g.cpu_mask.empty()) {
             const size_t nz = (size_t)Tc * 1536;
@@ -548,14 +1016,20 @@ public:
             hyb = true;
             fprintf(stderr, "[hybrid] %llu experts (%.2f GB) in host RAM computed by %d CPU threads\n", (unsigned long long)cpu.resident_count(), cpu.arena_bytes() / 1e9, cpu.n_threads());
         }
-        // kv caches
+        // kv caches (incremental 16K-token VRAM growth when HY4_KV_INIT_SLOTS is set)
         ring = ((512 + Tc + 15) / 16) * 16;
-        slots_sparse = ((max_ctx + 8 + 15) / 16) * 16;
-        const int devpos = getenv("HY4_KV_DEVPOS") ? atoi(getenv("HY4_KV_DEVPOS")) : 0;
-        if (devpos > 0 && devpos < max_ctx) {
-            kv_cap = devpos;
-            slots_sparse = ((kv_cap + 8 + 15) / 16) * 16;
+        const int kv_host_mask = getenv("HY4_KV_HOST") ? atoi(getenv("HY4_KV_HOST")) : 0;
+        kv_dev_limit = getenv("HY4_KV_DEVPOS") ? atoi(getenv("HY4_KV_DEVPOS")) : 0;
+        kv_is_host = (kv_host_mask & 1) != 0;
+        if (kv_is_host) {
+            kv_alloc_pos = max_ctx;
+        } else {
+            int init_p = max_ctx;
+            if (getenv("HY4_KV_INIT_SLOTS")) init_p = std::min(init_p, std::max(4096, atoi(getenv("HY4_KV_INIT_SLOTS"))));
+            if (kv_dev_limit > 0 && kv_dev_limit < max_ctx) init_p = std::min(init_p, kv_dev_limit);
+            kv_alloc_pos = init_p;
         }
+        slots_sparse = ((kv_alloc_pos + 8 + 15) / 16) * 16;
         kcache.resize(c.n_layers);
         size_t kvbytes = 0;
         for (int il = 0; il < c.n_layers; ++il) {
@@ -564,7 +1038,7 @@ public:
             if (c.is_swa[il]) {
                 HCK(hipMalloc((void**)&kcache[il], by));
                 HCK(hipMemset(kcache[il], 0, by));
-            } else if (kv_cap) {
+            } else if (!kv_is_host) {
                 HCK(hipMalloc((void**)&kcache[il], by));
                 HCK(hipMemset(kcache[il], 0, by));
             } else {
@@ -572,16 +1046,16 @@ public:
             }
             kvbytes += by;
         }
-        // indexer state (sparse layers only)
+        // indexer state (sparse layers only; grows in lockstep with sparse KV)
         ivg.assign(c.n_layers, nullptr);
         pooled.assign(c.n_layers, nullptr);
         for (int il = 0; il < c.n_layers; ++il)
             if (!c.is_swa[il]) {
-                if (kv_cap) {
-                    ivg[il] = dalloc<__half>((size_t)(kv_cap + 8) * 256);
-                    pooled[il] = dalloc<__half>((size_t)(kv_cap / 4 + 8) * 128);
-                    HCK(hipMemset(ivg[il], 0, (size_t)(kv_cap + 8) * 256 * 2));
-                    HCK(hipMemset(pooled[il], 0, (size_t)(kv_cap / 4 + 8) * 128 * 2));
+                if (!kv_is_host) {
+                    ivg[il] = dalloc<__half>((size_t)(kv_alloc_pos + 8) * 256);
+                    pooled[il] = dalloc<__half>((size_t)(kv_alloc_pos / 4 + 8) * 128);
+                    HCK(hipMemset(ivg[il], 0, (size_t)(kv_alloc_pos + 8) * 256 * 2));
+                    HCK(hipMemset(pooled[il], 0, (size_t)(kv_alloc_pos / 4 + 8) * 128 * 2));
                 } else {
                     ivg[il] = dalloc_big<__half>((size_t)(max_ctx + 8) * 256, "IndexPool iv/ig cache", 4);
                     pooled[il] = dalloc_big<__half>((size_t)(max_ctx / 4 + 8) * 128, "IndexPool pooled keys", 4);
@@ -594,36 +1068,14 @@ public:
         iq_f = dalloc<float>((size_t)Tc * 2048);
         iq_h = dalloc<__half>((size_t)Tc * 2048);
         hw_f = dalloc<float>((size_t)Tc * 16);
-        ldS = (size_t)(max_ctx / 4 + 8);
-        score = dalloc<float>((size_t)Tc * ldS);
         keys = dalloc<int32_t>((size_t)Tc * (index_topk + 8));
         nkeys = dalloc<int32_t>((size_t)Tc);
-        // absorbed weights
-        wk_off.resize(c.n_layers);
-        wv_off.resize(c.n_layers);
-        size_t tk = 0, tv = 0;
-        for (int il = 0; il < c.n_layers; ++il) {
-            int NH = heads(il);
-            wk_off[il] = tk;
-            wv_off[il] = tv;
-            tk += (size_t)NH * 192 * 512;
-            tv += (size_t)NH * 256 * 512;
+        // Single-layer reusable FP16 scratch for prefill (T > 8); decode reads quantized kv_b_proj directly (saves 1.035 GB VRAM!)
+        {
+            const int max_NH = std::max(c.heads_swa, c.heads_sparse);
+            wk_layer = dalloc<__half>((size_t)max_NH * 192 * 512);
+            wv_layer = dalloc<__half>((size_t)max_NH * 256 * 512);
         }
-        wk_b = dalloc_big<__half>(tk, "absorbed wk_b", 2);
-        wv_b = dalloc_big<__half>(tv, "absorbed wv_b", 2);
-        for (int il = 0; il < c.n_layers; ++il) {
-            int NH = heads(il);
-            const TInfo& t = ti(L(il) + ".self_attn.kv_b_proj.weight");
-            dim3 grid(NH * 448), block(128);
-            switch (t.fmt) {
-                case FMT_S4: hipLaunchKernelGGL((k_split_kvb<FMT_S4>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                case FMT_S5: hipLaunchKernelGGL((k_split_kvb<FMT_S5>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                case FMT_S6: hipLaunchKernelGGL((k_split_kvb<FMT_S6>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                case FMT_S8: hipLaunchKernelGGL((k_split_kvb<FMT_S8>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                default: err = "kv_b_proj format not supported"; return false;
-            }
-        }
-        HCK(hipStreamSynchronize(st));
         // engram
         if (!load_engram_meta_file(g.path, emeta, err)) return false;
         if (!engram_path.empty()) {
@@ -658,13 +1110,13 @@ public:
             d_evalid[mo] = dalloc<uint8_t>((size_t)Tc * 16);
         }
         er_h = dalloc<__half>((size_t)Tc * 1536);
-        kv_f = dalloc<float>((size_t)5 * Tc * HID);
         ep_alloc();
+        if (hyb) vcache_init();
         if (hyb && (!getenv("HY4_PF_STREAM") || atoi(getenv("HY4_PF_STREAM")) != 0)) pf_init();  // last: the scratch takes what the other buffers left
         tune_init();
         size_t fr = 0, tot = 0;
         HCK(hipMemGetInfo(&fr, &tot));
-        fprintf(stderr, "[runner] kv cache %.2f GB (ctx %d, chunk %d), device free %.1f GiB\n", kvbytes / 1e9, max_ctx, Tc, fr / 1073741824.0);
+        fprintf(stderr, "[runner] kv cache %.2f GB (init %d / ctx %d, chunk %d), device free %.1f GiB\n", kvbytes / 1e9, kv_alloc_pos, max_ctx, Tc, fr / 1073741824.0);
         return true;
     }
 
@@ -910,6 +1362,20 @@ public:
         hipLaunchKernelGGL(idx::k_idx_select, dim3(T), dim3(256), 0, st, score, (int)ldS, p0, n_top, index_topk, keys, nkeys);
     }
 
+    void dequant_kvb_layer(int il) {
+        const int NH = heads(il);
+        const std::string nm = L(il) + ".self_attn.kv_b_proj.weight";
+        const TInfo& t = ti(nm);
+        dim3 grid(NH * 448), block(128);
+        switch (t.fmt) {
+            case FMT_S4: hipLaunchKernelGGL((k_split_kvb<FMT_S4>), grid, block, 0, st, (const uint8_t*)tw(nm), wk_layer, wv_layer, NH); break;
+            case FMT_S5: hipLaunchKernelGGL((k_split_kvb<FMT_S5>), grid, block, 0, st, (const uint8_t*)tw(nm), wk_layer, wv_layer, NH); break;
+            case FMT_S6: hipLaunchKernelGGL((k_split_kvb<FMT_S6>), grid, block, 0, st, (const uint8_t*)tw(nm), wk_layer, wv_layer, NH); break;
+            case FMT_S8: hipLaunchKernelGGL((k_split_kvb<FMT_S8>), grid, block, 0, st, (const uint8_t*)tw(nm), wk_layer, wv_layer, NH); break;
+            default: fprintf(stderr, "kv_b_proj format %d not supported\n", t.fmt); exit(3);
+        }
+    }
+
     void attention_layer(int il, int p0, int T) {
         const std::string pa = L(il) + ".self_attn";
         const int NH = heads(il);
@@ -919,18 +1385,20 @@ public:
         const float* hsc = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_base");
         { PS _q(this, "hc_mix"); hc_pre(x, hfn, hsc, hbs, (const float*)tw(L(il) + ".input_layernorm.weight"), 8, T, cur_h, (float*)nullptr); }
+        const bool w16_ok = !dump && Tc >= 2048;
         // q path
-        lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
+        lin(pa + ".q_a_proj.weight", cur_h, F1, T, w16_ok ? (__half*)F2 : nullptr);  // [T][1024]
         { PS _q(this, "q_a_rms"); hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps); }
-        lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
-        lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]  (qr_h already extracted)
+        lin(pa + ".q_b_proj.weight", qr_h, F2, T, w16_ok ? (__half*)F1 : nullptr);  // [T][NH*256]
+        lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T, w16_ok ? (__half*)(F1 + (size_t)T * 1024) : nullptr);  // [T][576]  (qr_h already extracted)
         __half* cache = kcache[il];
         const int cslots = swa ? ring : slots_sparse;
         { PS _q(this, "mla_write_kv"); mla_write_kv(st, F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
         const bool dec = T <= 8;
         const int kvfmt = ti(pa + ".kv_b_proj.weight").fmt;
+        if (!dec) { PS _q(this, "dequant_kvb"); dequant_kvb_layer(il); }
         { PS _q(this, "mla_prep_q"); if (dec) mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il));
-        else mla_prep_q(st, F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il)); }
+        else mla_prep_q_t(st, F2, wk_layer, qa_h, T, NH, p0, (float)theta(il)); }
         if (vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
             vis->fix_k(st, F1, cache, T, p0, swa ? ring : 0, (float)theta(il));
             vis->fix_q(st, F2, qa_h, T, NH, p0, (float)theta(il));
@@ -945,7 +1413,7 @@ public:
         }
         last_use_list = use_list;
         if (dfly_cap && !swa) dfly_capture(il, p0, T, use_list);
-        lin(pa + ".linear_gate.weight", cur_h, F3, T);  // [T][NH*256]
+        lin(pa + ".linear_gate.weight", cur_h, F3, T, w16_ok ? (__half*)F2 : nullptr);  // [T][NH*256]
         MlaAttnArgs a;
         a.M = T;
         a.NH = NH;
@@ -959,8 +1427,6 @@ public:
             a.nkeys = nkeys;
             a.kmax = index_topk;
         }
-        // size the split-K workspace AFTER kmax is set: mla_workspace_bytes() takes max_keys = kmax in list mode. (Before: kmax was still 0 here, no workspace was ensured for the
-        // IndexPool layers, and mla_attend fell back to the simple kernel unless another call had happened to grow the buffer: which kernel decode used depended on earlier GPU work.)
         ensure_mla_ws(mla_workspace_bytes(a));
         if (dec) {
             { PS _q(this, "mla_attend"); mla_attend(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), (__half*)ctx_ws, a, mla_ws, mla_ws_bytes); }
@@ -974,9 +1440,9 @@ public:
                 maybe_dump("in_gate", T, NH * 256, F3);
             }
         } else {
-            { PS _q(this, "mla_attend_vup_prefill"); mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_b + wv_off[il], F3, o_h, ctx_ws, a, mla_ws, mla_ws_bytes); }
+            { PS _q(this, "mla_attend_vup_prefill"); mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_layer, F3, o_h, ctx_ws, a, mla_ws, mla_ws_bytes); }
         }
-        lin(pa + ".o_proj.weight", o_h, F1, T);  // [T][3072]
+        lin(pa + ".o_proj.weight", o_h, F1, T, w16_ok ? (__half*)F2 : nullptr);  // [T][3072]
         if (dump && il == dump_layer) maybe_dump("in_oproj", T, HID, F1);
         { PS _q(this, "o_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F1, (const float*)nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), x, post, c.rms_eps); }
     }
@@ -986,67 +1452,165 @@ public:
     // add their partial sum into zout_f and finish (up projection, combine).
     void moe_hybrid_tail(int il, int T, const std::string& pm) {
         const size_t nz = (size_t)T * 1536;
+        float* F3m = dump ? F3 : (F1 + (size_t)T * 1536);
+        void* mws = T <= 4 ? moe_ws_dec : moe_ws;
         if (pf_active(T)) {
-            // large chunk: every expert (the CPU tier arrives through the scratch buffers, group by group) runs on the GPU
-            if (has_cold) {  // the cold experts (SSD) are computed by the CPU pool while the GPU runs the streamed groups
-                HCK(hipMemcpyAsync(h_z, z_f, nz * 4, hipMemcpyDeviceToHost, st));
+            const int ml = il - 1;
+            const bool need_idx_host = has_cold || pf_use_gather(T) || (vcache_nslots > 1 && !vcache_frozen);
+            if (need_idx_host) {
+                if (has_cold) {
+                    HCK(hipMemcpyAsync(h_z, z_f, nz * 4, hipMemcpyDeviceToHost, st));
+                    HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+                }
                 HCK(hipMemcpyAsync(h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
-                HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
                 HCK(hipEventRecord(ev_hyb, st));
             }
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
-            const std::vector<PfGroup>& gs = pf_groups[il - 1];
-            for (size_t gi = 0; gi < gs.size(); ++gi) {
-                const PfGroup& G = gs[gi];
-                const int k = G.seq, b = k % pf_nbuf;
-                pf_pump(k);
-                if (!G.runs.empty()) HCK(hipStreamWaitEvent(st, ev_pf_copy[b], 0));
-                { PS _q(this, "moe_experts(pf)"); moe_experts(st, g.d_sec4, G.table, z_h, moe_idx, moe_w, gi == 0 ? zout_f : d_zcpu, T, moe_ws); }
-                if (gi > 0) hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
-                HCK(hipEventRecord(ev_pf_done[b], st));
-                ev_pf_done_set[b] = true;
-                ++pf_next_comp;
-                pf_pump(k + pf_nbuf);
+            if (pf_use_gather(T)) {
+                // Active-expert gather (pf_min_T <= T < pf_gather_max_T): only DMA host experts with cnt[e] > 0 that are NOT already in VRAM/vcache!
+                HCK(hipEventSynchronize(ev_hyb));
+                int ecnt[512] = {};
+                for (size_t i = 0; i < (size_t)T * 16; ++i) {
+                    const int e = h_idx[i];
+                    if (e >= 0 && e < 512) {
+                        ++ecnt[e];
+                        if (vcache_nslots > 1 && !vcache_frozen) vscore[ml * 512 + e] += vcache_inv_scale;
+                    }
+                }
+                auto al = [](size_t x) { return (x + 4095) & ~(size_t)4095; };
+                std::vector<int> need;
+                need.reserve(256);
+                for (int e = 0; e < 512; ++e)
+                    if (ecnt[e] > 0 && g.experts[ml * 512 + e].tier == 2 && !vram_flag[ml * 512 + e] && cpu.resident(ml, e)) need.push_back(e);
+                // Group 0 runs all VRAM/vcache experts + first batch of active host experts; subsequent batches add into zout_f
+                size_t pos = 0;
+                int batch = 0;
+                do {
+                    const int b = batch % pf_nbuf;
+                    if (ev_pf_copy_set[b]) HCK(hipEventSynchronize(ev_pf_copy[b]));
+                    if (ev_pf_done_set[b]) {
+                        HCK(hipEventSynchronize(ev_pf_done[b]));  // ensure previous batch finished reading h_pf_dyn_table[b] and d_scratch[b]
+                        ev_pf_done_set[b] = false;
+                    }
+                    ExpertDev* tbl = h_pf_dyn_table[b];
+                    for (int e = 0; e < 512; ++e) {
+                        const int gi = ml * 512 + e;
+                        tbl[e] = h_experts[gi];
+                        if (batch > 0 || !vram_flag[gi]) tbl[e].pad = 1;
+                    }
+                    size_t off = 0;
+                    std::vector<std::pair<const uint8_t*, std::pair<size_t, size_t>>> copies;
+                    while (pos < need.size()) {
+                        const int e = need[pos];
+                        CpuExpertView vw = cpu.view(ml, e);
+                        const size_t sz = al(vw.body_bytes);
+                        if (off + sz > pf_cap && off > 0) break;
+                        copies.push_back({vw.body, {off, sz}});
+                        tbl[e].body_off = (uint64_t)(uintptr_t)(d_scratch[b] + off) - (uint64_t)(uintptr_t)g.d_sec4;
+                        tbl[e].pad = 0;
+                        off += sz;
+                        ++pos;
+                    }
+                    if (!copies.empty()) {
+                        for (const auto& cp : copies) std::memcpy(h_bounce[b] + cp.second.first, cp.first, cp.second.second);
+                        HCK(hipMemcpyAsync(d_scratch[b], h_bounce[b], off, hipMemcpyHostToDevice, st2));
+                        HCK(hipEventRecord(ev_pf_copy[b], st2));
+                        ev_pf_copy_set[b] = true;
+                        HCK(hipStreamWaitEvent(st, ev_pf_copy[b], 0));
+                    }
+                    HCK(hipMemcpyAsync(d_pf_dyn_table[b], tbl, 512 * sizeof(ExpertDev), hipMemcpyHostToDevice, st));
+                    { PS _q(this, "moe_experts(pf_gather)"); moe_experts(st, g.d_sec4, d_pf_dyn_table[b], z_h, moe_idx, moe_w, zout_f, T, mws, nullptr, nullptr, nullptr, batch > 0 ? 1 : 0); }
+                    HCK(hipEventRecord(ev_pf_done[b], st));
+                    ev_pf_done_set[b] = true;
+                    ++batch;
+                } while (pos < need.size());
+            } else {
+                // Full-layer pipelined streaming (T >= pf_gather_max_T, e.g. Tc=2048/4096): DMA overlaps attention + earlier groups!
+                const std::vector<PfGroup>& gs = pf_groups[ml];
+                for (size_t gi = 0; gi < gs.size(); ++gi) {
+                    const PfGroup& G = gs[gi];
+                    const int k = G.seq, b = k % pf_nbuf;
+                    pf_pump(k);
+                    if (!G.runs.empty()) HCK(hipStreamWaitEvent(st, ev_pf_copy[b], 0));
+                    { PS _q(this, "moe_experts(pf)"); moe_experts(st, g.d_sec4, G.table, z_h, moe_idx, moe_w, zout_f, T, mws, nullptr, nullptr, nullptr, gi > 0 ? 1 : 0); }
+                    HCK(hipEventRecord(ev_pf_done[b], st));
+                    ev_pf_done_set[b] = true;
+                    ++pf_next_comp;
+                    pf_pump(k + pf_nbuf);
+                }
+                if (need_idx_host && !has_cold) {
+                    HCK(hipEventSynchronize(ev_hyb));
+                    for (size_t i = 0; i < (size_t)T * 16; ++i) {
+                        const int e = h_idx[i];
+                        if (e >= 0 && e < 512) vscore[ml * 512 + e] += vcache_inv_scale;
+                    }
+                }
             }
             if (has_cold) {
                 double t0 = now_s();
-                HCK(hipEventSynchronize(ev_hyb));
-                for (size_t i = 0; i < (size_t)T * 16; ++i) h_use[i] = cold_flag[(size_t)(il - 1) * 512 + (size_t)h_idx[i]];
-                cpu.submit(il - 1, T, h_z, h_idx, h_w, h_use.data(), h_zcpu);
+                if (!pf_use_gather(T)) HCK(hipEventSynchronize(ev_hyb));
+                for (size_t i = 0; i < (size_t)T * 16; ++i) {
+                    const int e = h_idx[i];
+                    h_use[i] = (e >= 0 && e < 512) ? cold_flag[(size_t)ml * 512 + (size_t)e] : 0;
+                    if (!pf_use_gather(T) && vcache_nslots > 1 && !vcache_frozen && e >= 0 && e < 512) vscore[ml * 512 + e] += vcache_inv_scale;
+                }
+                cpu.submit(ml, T, h_z, h_idx, h_w, h_use.data(), h_zcpu);
                 cpu.wait();
                 t_cpu_wait += now_s() - t0;
                 HCK(hipMemcpyAsync(d_zcpu, h_zcpu, nz * 4, hipMemcpyHostToDevice, st));
                 hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
             }
+            const bool w16_ok = !dump && Tc >= 2048;
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
-            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
-            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);
-            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
-            { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz); }
-            lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);
-            { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
+            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T, w16_ok ? (__half*)F1 : nullptr);  // [T][3072]
+            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);
+            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3m, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);
+            { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3m, H1, nz); }
+            lin(pm + ".shared_experts.down_proj.weight", H1, F3m, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);
+            { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3m, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
             return;
         }
+        const int ml = il - 1;
         HCK(hipMemcpyAsync(h_z, z_f, nz * 4, hipMemcpyDeviceToHost, st));
         HCK(hipMemcpyAsync(h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
         HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
         HCK(hipEventRecord(ev_hyb, st));
-        { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
-        { PS _q(this, "moe_experts(gpu part)"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws); }
-        lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
-        lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
-        { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz); }
-        lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
+        const bool nof = T <= 4 && (tune & TN_NOF2H);
+        if (nof) {
+            PS _q(this, "moe_experts(gpu part)");
+            moe_experts(st, g.d_sec4, d_experts + (size_t)ml * 512, nullptr, moe_idx, moe_w, zout_f, T, mws, z_f, nullptr, nullptr);
+        } else {
+            { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
+            { PS _q(this, "moe_experts(gpu part)"); moe_experts(st, g.d_sec4, d_experts + (size_t)ml * 512, z_h, moe_idx, moe_w, zout_f, T, mws); }
+        }
+        if (T == 1 && lm_mlp[ml].d_jobs) {
+            PS _q(this, "lin shared_gu_multi");
+            linear_h_multi(st, lm_mlp[ml], cur_h, 1);
+        } else {
+            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
+            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3m, T);
+        }
+        { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3m, H1, nz); }
+        lin(pm + ".shared_experts.down_proj.weight", H1, F3m, T);  // [T][3072]
         double t0 = now_s();
         HCK(hipEventSynchronize(ev_hyb));
-        cpu.submit(il - 1, T, h_z, h_idx, h_w, nullptr, h_zcpu);
+        const uint8_t* use_ptr = nullptr;
+        if (vcache_nslots > 1) {
+            const size_t np = (size_t)T * 16;
+            for (size_t i = 0; i < np; ++i) {
+                const int e = h_idx[i];
+                v_use_buf[i] = (e >= 0 && e < 512 && !vram_flag[ml * 512 + e]) ? 1 : 0;
+            }
+            use_ptr = v_use_buf.data();
+        }
+        cpu.submit(ml, T, h_z, h_idx, h_w, use_ptr, h_zcpu);
+        if (vcache_nslots > 1) vcache_note_decode(ml, T, h_idx);  // hidden behind CPU expert execution!
         cpu.wait();
         t_cpu_wait += now_s() - t0;
         HCK(hipMemcpyAsync(d_zcpu, h_zcpu, nz * 4, hipMemcpyHostToDevice, st));
-        hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
-        { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
+        { PS _q(this, "add_f2h"); hipLaunchKernelGGL(k_add_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, z_h, nz); }
         lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
-        { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
+        { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3m, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
     }
 
     void mlp_layer(int il, int T) {
@@ -1055,12 +1619,13 @@ public:
         const float* hsc = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_base");
         { PS _q(this, "hc_mix"); hc_pre(x, hfn, hsc, hbs, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), 8, T, cur_h, cur_f); }
+        const bool w16_ok = !dump && Tc >= 2048;
         if (il == 0) {
-            lin(pm + ".gate_proj.weight", cur_h, F1, T);  // [T][13824]
+            lin(pm + ".gate_proj.weight", cur_h, F1, T, w16_ok ? (__half*)F2 : nullptr);  // [T][13824]
             lin(pm + ".up_proj.weight", cur_h, F2, T);
             size_t n = (size_t)T * 13824;
             { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((n + 255) / 256), dim3(256), 0, st, F1, F2, H1, n); }
-            lin(pm + ".down_proj.weight", H1, F3, T);  // [T][3072]
+            lin(pm + ".down_proj.weight", H1, F3, T, w16_ok ? (__half*)F2 : nullptr);  // [T][3072]
             { PS _q(this, "o_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F3, (const float*)nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), x, post, c.rms_eps); }
         } else {
             // router
@@ -1074,34 +1639,40 @@ public:
                 if (tune & TN_TOPK) hipLaunchKernelGGL(k_router_topk_r, dim3(T), dim3(512), 0, st, F1, rb, moe_idx, moe_w, 16, c.routed_scale, exl, rec);
                 else hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, rb, moe_idx, moe_w, 512, 16, c.routed_scale, exl, rec);
             }
-            lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
+            lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T, w16_ok ? (__half*)F2 : nullptr);  // [T][1536]
             size_t nz = (size_t)T * 1536;
             if (hyb) { moe_hybrid_tail(il, T, pm); } else {
+            float* F3m = dump ? F3 : (F1 + (size_t)T * 1536);
+            void* mws = T <= 4 ? moe_ws_dec : moe_ws;
             const bool nof = T <= 4 && (tune & TN_NOF2H);  // fp32 latent read directly by the expert kernels, fp16 result written by their reduce
-            if (nof) { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, nullptr, moe_idx, moe_w, zout_f, T, moe_ws, z_f, z_h, route_now ? slot_rec : nullptr); }
+            if (nof) { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, nullptr, moe_idx, moe_w, zout_f, T, mws, z_f, z_h, route_now ? slot_rec : nullptr); }
             else {
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
-            { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws, nullptr, nullptr, route_now ? slot_rec : nullptr); }
+            { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, mws, nullptr, nullptr, route_now ? slot_rec : nullptr); }
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
             }
-            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
-            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
-            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
-            { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz); }
-            lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
-            { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
+            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T, w16_ok ? (__half*)F1 : nullptr);  // [T][3072]
+            if (T == 1 && lm_mlp[il - 1].d_jobs) {
+                PS _q(this, "lin shared_gu_multi");
+                linear_h_multi(st, lm_mlp[il - 1], cur_h, 1);
+            } else {
+                lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);  // [T][1536]
+                lin(pm + ".shared_experts.up_proj.weight", cur_h, F3m, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);
+            }
+            { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3m, H1, nz); }
+            lin(pm + ".shared_experts.down_proj.weight", H1, F3m, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);  // [T][3072]
+            { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3m, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
             }
         }
     }
 
-    // process tokens [p0, p0+T) (T <= Tc) of the sequence tok_all (host, positions 0..p0+T-1). Returns false on error.
-    // the context passed the VRAM part of the KV state: move rows, Vt and the IndexPool state to pinned host memory (one time, ~0.1 s per GB)
-    void kv_grow() {
-        if (!kv_cap || kv_moved) return;
+    // Spill sparse KV + IndexPool to pinned mapped host memory (full max_ctx, once) when VRAM cannot grow further
+    void kv_spill_to_host() {
+        if (kv_is_host) return;
         const double t0 = now_s();
         HCK(hipDeviceSynchronize());
         const size_t os = (size_t)slots_sparse, ns = (size_t)((max_ctx + 8 + 15) / 16) * 16;
-        const size_t row_b = (size_t)576 * 2, vt_b = (size_t)512 * 2;  // MLA_ROW, MLA_KV_LORA halves;  // bytes per slot of the rows and of the Vt copy
+        const size_t row_b = (size_t)576 * 2;  // MLA_ROW halves (no Vt)
         auto host_alloc = [&](size_t bytes, void** hp) {
             void* dp = nullptr;
             HCK(hipHostMalloc(hp, bytes, hipHostMallocMapped));
@@ -1113,40 +1684,101 @@ public:
         for (int il = 0; il < c.n_layers; ++il) {
             if (c.is_swa[il]) continue;
             void* hp = nullptr;
-            uint8_t* nd = (uint8_t*)host_alloc(ns * (row_b + vt_b), &hp);
+            uint8_t* nd = (uint8_t*)host_alloc(ns * row_b, &hp);
             uint8_t* od = (uint8_t*)kcache[il];
             HCK(hipMemcpy(nd, od, os * row_b, hipMemcpyDeviceToDevice));
-            HCK(hipMemcpy(nd + ns * row_b, od + os * row_b, os * vt_b, hipMemcpyDeviceToDevice));
             HCK(hipFree(od));
             kcache[il] = (__half*)nd;
             void* hp2 = nullptr;
             __half* niv = (__half*)host_alloc((size_t)(max_ctx + 8) * 256 * 2, &hp2);
-            HCK(hipMemcpy(niv, ivg[il], (size_t)(kv_cap + 8) * 256 * 2, hipMemcpyDeviceToDevice));
+            HCK(hipMemcpy(niv, ivg[il], (size_t)(kv_alloc_pos + 8) * 256 * 2, hipMemcpyDeviceToDevice));
             HCK(hipFree(ivg[il]));
             ivg[il] = niv;
             void* hp3 = nullptr;
             __half* npl = (__half*)host_alloc((size_t)(max_ctx / 4 + 8) * 128 * 2, &hp3);
-            HCK(hipMemcpy(npl, pooled[il], (size_t)(kv_cap / 4 + 8) * 128 * 2, hipMemcpyDeviceToDevice));
+            HCK(hipMemcpy(npl, pooled[il], (size_t)(kv_alloc_pos / 4 + 8) * 128 * 2, hipMemcpyDeviceToDevice));
             HCK(hipFree(pooled[il]));
             pooled[il] = npl;
         }
+        kv_alloc_pos = max_ctx;
         slots_sparse = (int)ns;
-        kv_moved = true;
-        fprintf(stderr, "[runner] context passed %d positions: KV rows, Vt and IndexPool state moved to pinned host memory (%.2f GB, %.2f s); attention now reads them over PCIe\n", kv_cap, host_big_bytes / 1e9, now_s() - t0);
+        kv_is_host = true;
+        fprintf(stderr, "[runner] sparse KV + IndexPool moved to pinned host memory (%d positions, %.2f GB, %.2f s)\n", max_ctx, host_big_bytes / 1e9, now_s() - t0);
+    }
+    // Grow sparse KV + IndexPool in 16,384-token VRAM increments; fall back cleanly to pinned host memory if VRAM runs out
+    void kv_grow_to(int need) {
+        if (kv_is_host || need <= kv_alloc_pos) return;
+        const int target = std::min(max_ctx, ((std::max(need + 16, kv_alloc_pos + 16384) + 16383) / 16384) * 16384);
+        if (kv_dev_limit > 0 && target > kv_dev_limit) { kv_spill_to_host(); return; }
+        const double t0 = now_s();
+        HCK(hipDeviceSynchronize());
+        const size_t os = (size_t)slots_sparse, ns = (size_t)((target + 8 + 15) / 16) * 16;
+        const size_t row_b = (size_t)576 * 2;
+        const size_t delta_per_layer = (ns - os) * row_b + (size_t)(target - kv_alloc_pos) * 256 * 2 + (size_t)(target / 4 - kv_alloc_pos / 4) * 128 * 2;
+        const size_t peak_one = ns * row_b + (size_t)(target + 8) * 256 * 2 + (size_t)(target / 4 + 8) * 128 * 2;
+        size_t fr = 0, tot = 0;
+        HCK(hipMemGetInfo(&fr, &tot));
+        const size_t need_vram = delta_per_layer * 12 + peak_one + (128ull << 20);
+        if (fr < need_vram) {
+            vcache_release_vram(need_vram);
+            HCK(hipMemGetInfo(&fr, &tot));
+        }
+        if (fr < need_vram) {
+            kv_spill_to_host();
+            return;
+        }
+        for (int il = 0; il < c.n_layers; ++il) {
+            if (c.is_swa[il]) continue;
+            __half* nk = nullptr;
+            __half* niv = nullptr;
+            __half* npl = nullptr;
+            if (hipMalloc((void**)&nk, ns * row_b) != hipSuccess ||
+                hipMalloc((void**)&niv, (size_t)(target + 8) * 256 * 2) != hipSuccess ||
+                hipMalloc((void**)&npl, (size_t)(target / 4 + 8) * 128 * 2) != hipSuccess) {
+                if (nk) hipFree(nk);
+                if (niv) hipFree(niv);
+                if (npl) hipFree(npl);
+                (void)hipGetLastError();
+                kv_spill_to_host();
+                return;
+            }
+            HCK(hipMemset(nk, 0, ns * row_b));
+            HCK(hipMemcpy(nk, kcache[il], os * row_b, hipMemcpyDeviceToDevice));
+            HCK(hipFree(kcache[il]));
+            kcache[il] = nk;
+            HCK(hipMemset(niv, 0, (size_t)(target + 8) * 256 * 2));
+            HCK(hipMemcpy(niv, ivg[il], (size_t)(kv_alloc_pos + 8) * 256 * 2, hipMemcpyDeviceToDevice));
+            HCK(hipFree(ivg[il]));
+            ivg[il] = niv;
+            HCK(hipMemset(npl, 0, (size_t)(target / 4 + 8) * 128 * 2));
+            HCK(hipMemcpy(npl, pooled[il], (size_t)(kv_alloc_pos / 4 + 8) * 128 * 2, hipMemcpyDeviceToDevice));
+            HCK(hipFree(pooled[il]));
+            pooled[il] = npl;
+        }
+        const int old_p = kv_alloc_pos;
+        kv_alloc_pos = target;
+        slots_sparse = (int)ns;
+        fprintf(stderr, "[runner] sparse KV + IndexPool grew in VRAM: %d -> %d positions (%.2f GB total, %.1f ms)\n",
+                old_p, target, (12.0 * (ns * row_b + (target + 8) * 512.0 + (target / 4 + 8) * 256.0)) / 1e9, (now_s() - t0) * 1000.0);
     }
     // make room for positions < need; false when need exceeds the context
     bool kv_ensure(int need) {
         if (need > max_ctx + 8) return false;
-        if (kv_cap && !kv_moved && need > kv_cap) kv_grow();
+        if (!kv_is_host && need > kv_alloc_pos) kv_grow_to(need);
         return need <= slots_sparse;
     }
     bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err) {
-        if (kv_cap && !kv_moved && p0 + T + 16 > kv_cap) kv_grow();
+        if (!kv_is_host && p0 + T + 16 > kv_alloc_pos) kv_grow_to(p0 + T + 16);
+        if (T <= 8 && vcache_nslots > 1) {
+            vcache_decay_step(T);
+            vcache_poll_commit();
+        }
         HCK(hipMemcpyAsync(d_ids, tok_all + p0, (size_t)T * 4, hipMemcpyHostToDevice, st));
         hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
         if (vis) vis->embed(st, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
         const bool defer_eng = engram_ready && T <= 8;
-        if (pf_active(T)) pf_begin_chunk();
+        const bool pf_pipe = pf_active(T) && !pf_use_gather(T);
+        if (pf_pipe) pf_begin_chunk();
         if (defer_eng) {
             const double t_pf0 = now_s();
             prefetch_engram(tok_all, p0, T);
@@ -1165,7 +1797,7 @@ public:
                 maybe_dump("x_L" + std::to_string(il) + "_engram", T, 4 * HID, x, 4);
             }
             if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); p_eng += tb - ta; ta = tb; }
-            if (il >= 1 && pf_active(T)) pf_pump(pf_layer_first[il - 1] + pf_nbuf - 1);
+            if (il >= 1 && pf_pipe) pf_pump(pf_layer_first[il - 1] + pf_nbuf - 1);
             attention_layer(il, p0, T);
             maybe_dump("x_L" + std::to_string(il) + "_attn", T, 4 * HID, x, 4);
             if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); (c.is_swa[il] ? p_attn_swa : p_attn_sp) += tb - ta; ta = tb; }
@@ -1173,6 +1805,7 @@ public:
             maybe_dump("x_L" + std::to_string(il) + "_mlp", T, 4 * HID, x, 4);
             if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); (il == 0 ? p_mlp0 : p_moe) += tb - ta; }
         }
+        if (T >= 64 && vcache_nslots > 1 && !vcache_frozen) vcache_rebalance_prefill();
         return true;
     }
     bool prof = false;
@@ -1186,6 +1819,7 @@ public:
     // logits of chunk positions [first, T) into d logits [(T-first)][V]; h_final dumped if dump
     void head(int T, int first) {
         int n = T - first;
+        ensure_logits(n);
         const float* hfn = (const float*)tw("model.hc_head.hc_head_fn");
         const float* hsc = (const float*)tw("model.hc_head.hc_head_scale");
         const float* hbs = (const float*)tw("model.hc_head.hc_head_base");

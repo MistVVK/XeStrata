@@ -798,12 +798,20 @@ __global__ void __launch_bounds__(256) k_moe_dn_i8_rdna4(const uint8_t* __restri
 
 #endif  // HY4_MMA
 
-__global__ void k_moe_reduce(const float* __restrict__ y, float* __restrict__ z_out, __half* __restrict__ z_out_h) {
+__global__ void k_moe_reduce(const float* __restrict__ y, float* __restrict__ z_out, __half* __restrict__ z_out_h,
+                             const ExpertDev* __restrict__ ex, const int32_t* __restrict__ topk_idx, int accum) {
     const int t = blockIdx.x;
+    __shared__ uint8_t act[MOE_TOPK];
+    if (threadIdx.x < MOE_TOPK) {
+        const int e = topk_idx[(size_t)t * MOE_TOPK + threadIdx.x];
+        act[threadIdx.x] = (ex && e >= 0 && e < MOE_E && ex[e].pad) ? 0 : 1;
+    }
+    __syncthreads();
     for (int n = threadIdx.x; n < MOE_D; n += blockDim.x) {
-        float a = 0.f;
+        float a = accum ? z_out[(size_t)t * MOE_D + n] : 0.f;
 #pragma unroll
-        for (int s = 0; s < MOE_TOPK; ++s) a += y[((size_t)t * MOE_TOPK + s) * MOE_D + n];
+        for (int s = 0; s < MOE_TOPK; ++s)
+            if (act[s]) a += y[((size_t)t * MOE_TOPK + s) * MOE_D + n];
         z_out[(size_t)t * MOE_D + n] = a;
         if (z_out_h) z_out_h[(size_t)t * MOE_D + n] = __float2half(a);
     }
@@ -1008,7 +1016,7 @@ inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const Exper
 // slot_rec (M == 1, no CPU-resident experts): rec[slot] = the ExpertDev record of the expert chosen in that slot (written by the router kernel). The one-token kernels read it directly, so the
 // counting-sort kernel and the reduce kernel are gone (2 launches instead of 4). The ws region `fill` is used as 96 tickets and must be zero before the first call (they reset themselves).
 inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const int32_t* topk_idx, const float* topk_w,
-                        float* z_out, int M, void* ws, const float* z_f32 = nullptr, __half* z_out_h = nullptr, const ExpertDev* slot_rec = nullptr) {
+                        float* z_out, int M, void* ws, const float* z_f32 = nullptr, __half* z_out_h = nullptr, const ExpertDev* slot_rec = nullptr, int accum = 0) {
 #if !HY4_MMA
     if (M > HY4_MOE_DEC_MAXM) {  // no matrix-core grouped GEMM on this build: the simple path handles any M
         moe_experts_ref(s, sec4_base, experts, z, topk_idx, topk_w, z_out, M, ws, z_out_h);
@@ -1018,12 +1026,11 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
     const int P = M * MOE_TOPK;
     const skd::MoeWs w = skd::moe_ws_split(ws, P);
     const int eb = P < MOE_E ? P : MOE_E;
-    if (slot_rec && M == 1 && !skd::moe_has_cpu()) {
+    if (slot_rec && M == 1 && !skd::moe_has_cpu() && !accum) {
         hipLaunchKernelGGL(skd::k_moe_gu_dec1, dim3(MOE_D / 8, MOE_TOPK), dim3(256), 0, s, sec4_base, slot_rec, z, z_f32, w.h2);
         hipLaunchKernelGGL(skd::k_moe_dn_dec1, dim3(MOE_D / 16, MOE_TOPK), dim3(256), 0, s, sec4_base, slot_rec, topk_w, w.h2, w.y, z_out, z_out_h, (unsigned*)w.fill);
         return;
     }
-    if (skd::moe_has_cpu()) (void)hipMemsetAsync(w.y, 0, (size_t)P * MOE_D * 4, s);
     hipLaunchKernelGGL(skd::k_moe_route, dim3(1), dim3(512), 0, s, experts, topk_idx, P, w.cnt, w.off, w.pairs, w.active, w.nact);
     if (M <= skd::moe_dec_max_m() && M <= HY4_MOE_DEC_MAXM) {
 #define HY4_DEC(MT)                                                                                                                                         \
@@ -1112,7 +1119,7 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
 #endif
     }
 #endif
-    hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out, z_out_h);
+    hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out, z_out_h, experts, topk_idx, accum);
 }
 
 // simple reference path (any M); same arguments and workspace
@@ -1120,7 +1127,6 @@ inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const Exper
                             float* z_out, int M, void* ws, __half* z_out_h) {
     const int P = M * MOE_TOPK;
     const skd::MoeWs w = skd::moe_ws_split(ws, P);
-    if (skd::moe_has_cpu()) (void)hipMemsetAsync(w.y, 0, (size_t)P * MOE_D * 4, s);
     (void)hipMemsetAsync(w.cnt, 0, sizeof(int) * 512, s);
     (void)hipMemsetAsync(w.fill, 0, sizeof(int) * 512, s);
     hipLaunchKernelGGL(skd::k_moe_hist, dim3((P + 255) / 256), dim3(256), 0, s, experts, topk_idx, P, w.cnt);
@@ -1128,7 +1134,7 @@ inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const Exper
     hipLaunchKernelGGL(skd::k_moe_scatter, dim3((P + 255) / 256), dim3(256), 0, s, experts, topk_idx, P, w.off, w.fill, w.pairs);
     hipLaunchKernelGGL(skd::k_moe_gu_ref, dim3(MOE_D / 8, MOE_E), dim3(256), 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.h2);
     hipLaunchKernelGGL(skd::k_moe_dn_ref, dim3(MOE_D / 8, MOE_E), dim3(256), 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.h2, w.y);
-    hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out, z_out_h);
+    hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out, z_out_h, experts, topk_idx, 0);
 }
 
 }  // namespace hy4
