@@ -201,7 +201,7 @@ int main(int argc, char** argv) {
         so.model = model;
         so.engram = engram;
         so.max_ctx = max_ctx > 0 ? max_ctx : 32768;
-        so.chunk = std::max(chunk, 1);
+        so.chunk = chunk;  // 0 = auto: plan_memory picks it from the card (max(chunk, 1) made the serve chunk 1 after the CUDA lane's chunk = 0 default)
         so.index_topk = index_topk;
         so.no_index = no_index;
         so.no_engram = no_engram;
