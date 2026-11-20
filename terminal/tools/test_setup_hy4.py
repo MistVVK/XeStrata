@@ -46,6 +46,22 @@ class Table(unittest.TestCase):
         self.assertAlmostEqual(hy4_family.FILES[hy4_family.ENGRAM_FILE][0] / 1e9, hy4_fit.ENGRAM_GB, delta=0.006)
         self.assertAlmostEqual(hy4_family.FILES[hy4_family.VISION_FILE][0] / 1e9, hy4_fit.VISION_GB, delta=0.001)
 
+    def test_sq_32_is_removed_everywhere(self):
+        # owner, 2026-11-20: "we will REMOVE the 32GB variant ... it is too weak": SQ-64, SQ-96 and SQ-128 stay
+        fam = setup.HY4_FAMILIES["hy4-flash"]
+        self.assertEqual(list(fam["models"]), ["SQ-64", "SQ-96", "SQ-128"])
+        self.assertNotIn("SQ-32", hy4_family.BUILD_ABOUT)
+        self.assertNotIn("Hy4-Flash-SQ-32.strata", hy4_family.FILES)
+        self.assertEqual(sorted(n for n in hy4_family.FILES if n.startswith("Hy4-Flash-SQ-")), ["Hy4-Flash-SQ-128.strata", "Hy4-Flash-SQ-64.strata", "Hy4-Flash-SQ-96.strata"])
+        with self.assertRaises(KeyError):
+            hy4_family.files_of("SQ-32")
+        self.assertIsNone(hy4_fit.build_of_model_name("hy4-flash-sq-32"))
+        self.assertNotIn("SQ-32", M.Strata(HERE.parent).own_size_names())
+        import subprocess
+        r = subprocess.run([sys.executable, str(HERE.parent / "setup.py"), "--family", "hy4-flash", "--model", "SQ-32", "--yes", "--no-start"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("invalid choice: 'SQ-32'", r.stderr)
+
     def test_every_file_has_a_whole_file_hash_and_the_engram_section_hash_is_kept_apart(self):
         for name, (size, sha) in hy4_family.FILES.items():
             self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", sha or ""), name)
@@ -59,17 +75,19 @@ class Table(unittest.TestCase):
         self.assertNotIn("hy4-flash", setup.FAMILIES)
         self.assertNotIn("hy4-flash", setup.OWN_PATH_FAMILIES)
 
-    def test_an_8_gib_card_with_64_gib_is_offered_sq_32_at_128k(self):
-        # HY4-CUDA: SQ-64 (56 GB of experts) + the 5.5 GB of host KV do not fit the 58 GB usable of a 64 GiB PC; SQ-32 is the build to recommend, still at 128K
+    def test_an_8_gib_card_with_64_gib_is_offered_sq_64_with_ssd_reads_at_128k(self):
+        # HY4-CUDA: SQ-64 (56 GB of experts) + the 5.5 GB of host KV do not fit the 58 GB usable of a 64 GiB PC: about 2.8 GB are read from the SSD.  There is no SQ-32 any more
+        # (owner, 2026-11-20): SQ-64 stays the recommendation, still at 128K, with the "may run slower" words; Hy4-Flash is not hidden
         lines = dict(setup.hy4_menu_lines(8, 64, False, 131072, True))
-        self.assertEqual([b for b, t in setup.hy4_menu_lines(8, 64, False, 131072, True) if "(recommended)" in t], ["SQ-32"])
+        self.assertEqual([b for b, t in setup.hy4_menu_lines(8, 64, False, 131072, True) if "(recommended)" in t], ["SQ-64"])
         self.assertIn("a few experts are read from the SSD", lines["SQ-64"])
+        self.assertNotIn("SQ-32", lines)
         self.assertEqual([b for b, t in setup.hy4_menu_lines(12, 64, False, 131072, True) if "(recommended)" in t], ["SQ-64"])
 
     def test_menu_lines_recommend_by_the_authors_table(self):
-        for vram, ram, want in ((12, 64, "SQ-64"), (12, 32, "SQ-32"), (12, 128, "SQ-128")):
+        for vram, ram, want in ((12, 64, "SQ-64"), (12, 32, "SQ-64"), (12, 128, "SQ-128")):
             lines = setup.hy4_menu_lines(vram, ram, False)
-            self.assertEqual([b for b, _ in lines], ["SQ-128", "SQ-96", "SQ-64", "SQ-32"])
+            self.assertEqual([b for b, _ in lines], ["SQ-128", "SQ-96", "SQ-64"])
             self.assertEqual([b for b, t in lines if "(recommended)" in t], [want])
         text = dict(setup.hy4_menu_lines(12, 64, False))
         self.assertIn("fits in memory", text["SQ-64"])
@@ -270,7 +288,7 @@ class Defaults0218(unittest.TestCase):
         cfg, _lines, _ = self.install(vram=8.0)                                          # the engine lanes deal with a cache that does not fit the card
         args = cfg["args"]
         self.assertEqual(args[args.index("--vram-experts-gb") + 1], "0.79")
-        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "52.49")        # 8 GiB + 64 GiB, SQ-64: 2.8 GB of its experts are read from the SSD (the planner recommends SQ-32 there)
+        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "52.49")        # 8 GiB + 64 GiB, SQ-64: 2.8 GB of its experts are read from the SSD (the planner recommends SQ-64 there: there is no SQ-32)
 
 
 class Catalog(unittest.TestCase):
@@ -291,11 +309,11 @@ class Catalog(unittest.TestCase):
 
     def test_rows_and_fit_words(self):
         by = self.rows({"ram_gb": 64.0, "gpus": [{"index": 0, "name": "x", "vram_gb": 12.0, "usable": True, "vendor": "nvidia"}]})
-        self.assertEqual(list(by), ["SQ-32", "SQ-64", "SQ-96", "SQ-128"])
+        self.assertEqual(list(by), ["SQ-64", "SQ-96", "SQ-128"])                  # SQ-32 is not offered (owner, 2026-11-20)
         self.assertEqual(by["SQ-64"]["id"], "hy4-flash-sq-64")                      # the tag the install writes its config under
         self.assertEqual(by["SQ-64"]["download_gb"], round(62.03 + 67.58 + 0.934, 1))                      # the build, the Engram shard and the Vision shard (images are on by default)
         self.assertTrue(by["SQ-64"]["images"])
-        self.assertEqual({k: by[k]["on_this_pc"] for k in by}, {"SQ-32": "fits", "SQ-64": "fits", "SQ-96": "may run slower", "SQ-128": "may run slower"})
+        self.assertEqual({k: by[k]["on_this_pc"] for k in by}, {"SQ-64": "fits", "SQ-96": "may run slower", "SQ-128": "may run slower"})
         self.assertEqual([k for k in by if by[k]["hy4"]["recommended"]], ["SQ-64"])
         self.assertEqual(by["SQ-64"]["hy4"]["placement"], {"vram_gb": 5.08, "ram_gb": 50.96, "ssd_gb": 0.0})            # at 128K the engine keeps the KV state in pinned host memory on a 12 GiB card (HY4-CUDA)
         self.assertIsNone(by["SQ-64"]["gpu_options"])
