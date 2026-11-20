@@ -81,58 +81,7 @@ constexpr int GEMM_BM = 128, GEMM_BN = 64, GEMM_LDW = 264;
 // xrow0/xrow1: A-operand row pointers (fp16, K elements) for this lane's two m-tiles (row = lane & 15). b0row/b1row: LDS tile row bases of the two n-tiles
 // of this wave. ws: LDS [64][GEMM_LDW].
 
-// ---- raw sub-group loader: the 64 weights of sub-group dg of a super-block are fetched with 4-byte aligned dword loads (+ byte realignment),
-// one stage ahead of their use, so the global-memory latency hides behind the WMMA loop of the previous super-block.
-template <int FMT>
-struct RawSub {
-    static constexpr int NLO = FMT == FMT_S1_25 ? 3 : (FMT == FMT_S2 || FMT == FMT_S3 || FMT == FMT_S1_5) ? 4 : (FMT == FMT_S8 ? 16 : 8);
-    static constexpr int NHI = FMT == FMT_S3 ? 2 : FMT == FMT_S5 ? 2 : FMT == FMT_S6 ? 4 : 1;
-    uint32_t lo[NLO];
-    uint32_t hi[NHI];
-    uint32_t hdr[2];
-};
-
-template <int N>
-__device__ __forceinline__ void load_bytes(const uint8_t* p, uint32_t (&o)[N]) {
-    const uintptr_t a = (uintptr_t)p;
-    const uint32_t ofs = (uint32_t)(a & 3);
-    const uint32_t* q = (const uint32_t*)(a - ofs);
-    uint32_t d[N + 1];
-#pragma unroll
-    for (int i = 0; i < N; ++i) d[i] = q[i];
-    d[N] = ofs ? q[N] : 0u;
-#pragma unroll
-    for (int i = 0; i < N; ++i) o[i] = byte_funnel(d[i + 1], d[i], ofs);
-}
-
-template <int FMT>
-__device__ __forceinline__ void load_raw(const uint8_t* blk, int dg, RawSub<FMT>& r) {
-    load_bytes<2>(blk, r.hdr);
-    const uint8_t* pl = blk + 6;
-    if constexpr (FMT == FMT_S1_25) { load_bytes<3>(pl + dg * 10, r.lo); r.hi[0] = pl[40 + (dg >> 1)]; }  // 16 indices (10 bytes) + fine byte
-    else if constexpr (FMT == FMT_S1_5) { load_bytes<4>(pl + (64 * dg) / 5, r.lo); r.hi[0] = 64u * dg; }  // trits 64dg..64dg+63 (<= 14 bytes)
-    else if constexpr (FMT == FMT_S2) load_bytes<4>(pl + dg * 16, r.lo);
-    else if constexpr (FMT == FMT_S3) { load_bytes<4>(pl + dg * 16, r.lo); load_bytes<2>(pl + 64 + dg * 8, r.hi); }
-    else if constexpr (FMT == FMT_S4) load_bytes<8>(pl + dg * 32, r.lo);
-    else if constexpr (FMT == FMT_S5) { load_bytes<8>(pl + dg * 32, r.lo); load_bytes<2>(pl + 128 + dg * 8, r.hi); }
-    else if constexpr (FMT == FMT_S6) { load_bytes<8>(pl + dg * 32, r.lo); load_bytes<4>(pl + 128 + dg * 16, r.hi); }
-    else load_bytes<16>(pl + dg * 64, r.lo);
-}
-
-template <int FMT>
-__device__ __forceinline__ float raw_eff(const RawSub<FMT>& r, int dg) {
-    const float D = h2f_bits((uint16_t)(r.hdr[0] & 0xFFFFu));
-    const uint32_t u = dg < 2 ? (r.hdr[0] >> (16 + 8 * dg)) & 0xFFu : (r.hdr[1] >> (8 * (dg - 2))) & 0xFFu;
-    float eff = D * ((float)u * (1.0f / 255.0f));
-    if constexpr (FMT == FMT_S1_25) eff *= 0.5f + (float)((r.hi[0] >> ((dg & 1) * 4)) & 15u) / 15.0f;
-    return eff;
-}
-
-__device__ __forceinline__ uint32_t byte_at4(const uint32_t (&w)[4], int o) {
-    const int d = o >> 2;
-    const uint32_t v = d == 0 ? w[0] : d == 1 ? w[1] : d == 2 ? w[2] : w[3];
-    return (v >> ((o & 3) * 8)) & 0xFFu;
-}
+// RawSub, load_bytes, load_raw, raw_eff, byte_at4 are defined in skfast.hip.h.
 
 // q[0..7] of unit u8 (weights 8*u8 .. 8*u8+7 of the sub-group); S8 gives byte ^ 0x80
 template <int FMT, int U8>
@@ -563,12 +512,6 @@ __device__ __forceinline__ void gemm_mainloop_bk(const uint8_t* wr, int nsb, con
         hy4_sync_lds();
         cur = nxt;
     }
-}
-
-template <int FMT, int MTW, int NTW>
-__device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, const half_t* const (&xrow)[MTW], half_t* ws, fv8 (&acc)[MTW][NTW],
-                                                const int (&brow)[NTW], bool active) {
-    gemm_mainloop_bk<FMT, MTW, NTW, GEMM_BN, 256>(wr, nsb, xrow, ws, acc, brow, active);
 }
 
 #else  // HY4_CUDA

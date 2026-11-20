@@ -1410,13 +1410,11 @@ __global__ void __launch_bounds__(256) k_moe_dn_ref(const uint8_t* __restrict__ 
     }
 }
 
-#if HY4_CUDA
 struct MoeWs {
     int *cnt, *off, *fill, *active, *nact, *wcnt, *wl16, *wl32, *wl64, *pairs, *wl128_e, *wl128_ty;
     __half* h2;
     float* y;
 };
-#endif
 inline MoeWs moe_ws_split(void* ws, int P) {
     uint8_t* w = (uint8_t*)ws;
     MoeWs s;
@@ -1530,6 +1528,7 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
 #endif
 #if HY4_MMA
     else {
+        const int INF = 1 << 30;
         const dim3 b(256);
 #if !HY4_CUDA
         const int i8m = skd::int8_wmma_mode();

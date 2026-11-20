@@ -338,7 +338,6 @@ int main(int argc, char** argv) {
     int gpu = -1;
     std::string gpus_csv = getenv("HY4_GPUS") ? getenv("HY4_GPUS") : "";
     std::string draft = "auto";  // auto: dfly2 under --serve (when the file carries the drafter), off for the CLI runs (gates / benches); "off" and "dfly2" force
-    std::string dfly_override;
     SpecCfg scfg;
     SampleOpts cli_samp;
     int tail_skip_arg = 0;  // opt-in only (0 = OFF by default)
@@ -575,7 +574,6 @@ int main(int argc, char** argv) {
     r.tail_skip = tail_skip_arg;
     r.det_mix = det_flag || draft == "dfly2";
     const bool spec_mode = draft == "dfly2" && gen > 0 && !alloc_only;
-    r.want_all_logits = all_logits && !spec_mode;
     std::string err;
     if (!r.init(no_engram ? std::string() : engram, err)) {
         fprintf(stderr, "init: %s\n", err.c_str());

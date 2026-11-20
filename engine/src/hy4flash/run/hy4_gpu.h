@@ -299,6 +299,9 @@ __device__ __forceinline__ const void* shfl_ptr(const void* p, int src) {
 }  // namespace hy4
 
 #else  // ---------------------------------------------------------------- HIP
+#ifndef HY4_CUDA
+#define HY4_CUDA 0
+#endif
 // RDNA2 (gfx103x) has no WMMA instructions; guard WMMA cleanly and route to custom Wave32 sdot4/fdot2 kernels.
 #if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
 #undef HY4_MMA
