@@ -119,7 +119,8 @@ __device__ __forceinline__ void load_half8_f32(const __half* p, float (&x)[8]) {
 // KC = 8192 / MT elements per K-tile: LDS = 16 KB (qa+qb) + 1.5 KB (da,db,sx8) = 17.5 KB (high occupancy on sm_75 64 KB/SM!).
 template <int FMT, int MT, int RW>
 __device__ __forceinline__ void gemv_dp4a_body(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M, int bidx) {
-    constexpr int KC = 8192 / MT;
+    constexpr int KC = (8192 / MT) & ~255;
+    static_assert(KC >= 256 && (KC % 256) == 0, "KC must be a multiple of 256");
     constexpr int N8_MAX = KC / 8;
     constexpr int NG_MAX = KC / 64;
     constexpr int SB = sk_sb_bytes(FMT);

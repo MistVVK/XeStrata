@@ -121,11 +121,12 @@ template <int FMT, int MT, int RW, int NW = 8>
 __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M, int bidx) {
 #if HY4_CUDA
     // Tight LDS budget for small MT (8 KB at MT=1 vs 32 KB -> 4x higher SM occupancy on 128-188 SM Ada/Blackwell GPUs!)
-    constexpr int KC = (MT == 1) ? 4096 : ((MT == 2) ? 4096 : ((MT == 4) ? 2048 : (16384 / MT)));
+    constexpr int KC = (MT <= 2) ? 4096 : (MT <= 4) ? 2048 : (MT <= 8) ? 1024 : 512;
 #else
     // For MT >= 5, cap LDS at 16 KB (higher CU occupancy) and read xs per m instead of holding uint4 xv[MT] in VGPRs (eliminates 2x VGPR-pressure cliff at M=6..16).
     constexpr int KC = MT <= 4 ? (16384 / MT) : (MT <= 8 ? 1024 : 512);
 #endif
+    static_assert(KC >= 256 && (KC % 256) == 0, "KC must be a multiple of 256");
     constexpr int SB = sk_sb_bytes(FMT);
     constexpr int NTHR = NW * 32;
     __shared__ uint4 xs[MT * KC / 8];
