@@ -37,7 +37,6 @@ DEFAULT_VISION = True
 
 #: file name -> (bytes, sha256 or None)
 FILES = {
-    "Hy4-Flash-SQ-32.strata": (38_086_242_304, "6a21cf2a9f17732e39507e2ba476a7bab17edda9018b2a469618597ed629b1b8"),
     "Hy4-Flash-SQ-64.strata": (62_030_467_072, "4287bbbd42dbf0dc8bba3fd94142f0051dbc79be380452540726ab22a5d45e93"),
     "Hy4-Flash-SQ-96.strata": (89_577_742_336, "ba9d501350330ebe230ecc815d6e2127c43eaa1741ce9dca7576bf69ef78ba64"),
     "Hy4-Flash-SQ-128.strata": (113_654_603_776, "9bfd65640402114ac7162374c9799a444eb41b7add2a42e10457811a0d4474da"),
@@ -45,8 +44,7 @@ FILES = {
     VISION_FILE: (934_092_800, "ef09bceff8f01b8d226d2dc56aef09cec719b21b45783ee9b5d64e7241b72a09"),
 }
 BUILD_ABOUT = {
-    "SQ-32": "the smallest: for 32 GB of RAM and a 12 to 16 GB card",
-    "SQ-64": "the flagship: for 64 GB of RAM and an 8 to 16 GB card",
+    "SQ-64": "the smallest and the flagship: for 64 GB of RAM and a card of 8 GB or more (a PC with less memory runs it slower, reading part of it from the SSD)",
     "SQ-96": "close to the full model: for 96 GB of RAM, or a 128 GB shared-memory PC",
     "SQ-128": "the closest to the full model: for 128 GB of RAM, or a 128 GB shared-memory PC",
 }

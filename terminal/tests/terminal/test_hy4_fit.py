@@ -17,15 +17,33 @@ class AuthorsRule(unittest.TestCase):
         for key, value in SPEC["constants"].items():
             self.assertEqual(getattr(F, key), value, key)
         for name, info in SPEC["models"].items():
-            mine = F.BUILDS[name]
+            mine = F.BUILDS.get(name) or F.NOT_OFFERED[name]               # SQ-32 is the author's, and is not offered (owner, 2026-11-20): its numbers stay as data
             self.assertEqual(mine["file"], info["file_name"])
             for k in ("footprint_gb", "dense_gb", "bodies_gb"):
                 self.assertEqual(mine[k], info[k], (name, k))
             self.assertEqual(F.ENGRAM_GB, info["engram_gb"])
             self.assertAlmostEqual(mine["dense_gb"] + mine["bodies_gb"], mine["footprint_gb"], delta=0.02)
 
+    def test_sq_32_is_not_offered(self):
+        self.assertEqual(list(F.BUILDS), ["SQ-64", "SQ-96", "SQ-128"])
+        self.assertEqual(F.ORDER, ("SQ-128", "SQ-96", "SQ-64"))
+        self.assertIn("SQ-32", F.NOT_OFFERED)
+        self.assertNotIn("SQ-32", F.BUILDS)
+        self.assertEqual([r["build"] for r in F.rows(12, 64)], ["SQ-128", "SQ-96", "SQ-64"])
+        self.assertIsNone(F.build_of_model_name("hy4-flash-sq-32"))
+        with self.assertRaises(KeyError):
+            F.compute("SQ-32", 12, 32)
+
     def test_the_seven_cases(self):
-        for c in SPEC["cases"]:
+        offered = [c for c in SPEC["cases"] if c["model"] in F.BUILDS]
+        gone = [c for c in SPEC["cases"] if c["model"] not in F.BUILDS]
+        self.assertEqual(len(offered), 5)
+        self.assertEqual([c["model"] for c in gone], ["SQ-32", "SQ-32"])               # the author's two SQ-32 cases: kept as data, asserted as "not offered"
+        for c in gone:
+            self.assertIn(c["model"], F.NOT_OFFERED)
+            self.assertNotIn(c["model"], F.ORDER)
+            self.assertNotEqual(F.recommend(c["vram_gib"], c["ram_gib"], False, F.AUTHOR_CONTEXT)["build"], c["model"])      # the planner never answers SQ-32
+        for c in offered:
             res = F.compute(c["model"], c["vram_gib"], c["ram_gib"], F.AUTHOR_CONTEXT)
             self.assertAlmostEqual(res["ssd_gb"], c["expected_ssd_gb"], delta=0.05, msg=str(c))
             self.assertEqual(F.mode(res["ssd_gb"]), c["mode"], c)
@@ -38,19 +56,29 @@ class AuthorsRule(unittest.TestCase):
 
 class Recommendation(unittest.TestCase):
     def test_the_authors_hardware_classes(self):
-        for vram, ram, want in ((12, 32, "SQ-32"), (16, 32, "SQ-32"), (8, 64, "SQ-64"), (12, 64, "SQ-64"), (16, 64, "SQ-64"),
+        for vram, ram, want in ((8, 64, "SQ-64"), (12, 64, "SQ-64"), (16, 64, "SQ-64"),
                                 (8, 96, "SQ-96"), (12, 96, "SQ-96"), (12, 128, "SQ-128"), (24, 128, "SQ-128")):
             got = F.recommend(vram, ram, False, F.AUTHOR_CONTEXT)
             self.assertEqual(got["build"], want, (vram, ram, got))
             self.assertTrue(got["fits"])
             self.assertEqual(got["mode"], "ram_vram_zero_ssd")
 
-    def test_a_small_pc_still_gets_a_pick_and_the_words_say_it_streams(self):
+    def test_a_small_pc_still_gets_sq_64_and_the_words_say_it_streams(self):
         got = F.recommend(8, 16)
-        self.assertEqual(got["build"], "SQ-32")               # the least read from the SSD, never a refusal
+        self.assertEqual(got["build"], "SQ-64")               # the smallest build, never a refusal and never hidden (there is no SQ-32)
         self.assertFalse(got["fits"])
         self.assertEqual(got["mode"], "cross_tier_ssd")
         self.assertGreater(got["placement"]["ssd_gb"], 5)
+
+    def test_the_32_gib_class_gets_sq_64_with_its_ssd_read_figure(self):
+        # the author's 32 GiB class was SQ-32 (not offered since 2026-11-20): SQ-64 is recommended with the "may run slower" mode and the GB read from the SSD
+        for vram, ram in ((12, 32), (16, 32)):
+            got = F.recommend(vram, ram, False, 131072, True)
+            self.assertEqual(got["build"], "SQ-64", (vram, ram))
+            self.assertFalse(got["fits"])
+            self.assertGreater(got["placement"]["ssd_gb"], 5.0)
+            self.assertEqual(got["mode"], "cross_tier_ssd")
+        self.assertAlmostEqual(F.recommend(12, 32, False, 131072, True)["placement"]["ssd_gb"], 32.83, delta=0.05)
 
     def test_no_card(self):
         got = F.recommend(None, 64)
@@ -71,8 +99,8 @@ class Recommendation(unittest.TestCase):
 
     def test_rows_are_best_first(self):
         rows = F.rows(12, 64)
-        self.assertEqual([r["build"] for r in rows], ["SQ-128", "SQ-96", "SQ-64", "SQ-32"])
-        self.assertEqual([r["mode"] for r in rows], ["cross_tier_ssd", "cross_tier_ssd", "ram_vram_zero_ssd", "ram_vram_zero_ssd"])
+        self.assertEqual([r["build"] for r in rows], ["SQ-128", "SQ-96", "SQ-64"])
+        self.assertEqual([r["mode"] for r in rows], ["cross_tier_ssd", "cross_tier_ssd", "ram_vram_zero_ssd"])
 
 
 class Defaults0218(unittest.TestCase):
@@ -94,22 +122,20 @@ class Defaults0218(unittest.TestCase):
         self.assertAlmostEqual(F.non_expert_gb(131072), 2.0 + 3.84, delta=0.02)
 
     def test_the_authors_seven_cases_still_hold_at_their_context(self):
-        for c in SPEC["cases"]:
+        for c in (c for c in SPEC["cases"] if c["model"] in F.BUILDS):               # (the two SQ-32 cases are asserted as "not offered" in AuthorsRule)
             res = F.compute(c["model"], c["vram_gib"], c["ram_gib"], F.AUTHOR_CONTEXT)
             self.assertAlmostEqual(res["ssd_gb"], c["expected_ssd_gb"], delta=0.05, msg=str(c))
 
     def test_the_seven_cases_at_128k_with_images(self):
         # (the author's own cases are at 20K; these are what the 0.2.18 defaults make of the same seven PCs)
-        for c in SPEC["cases"]:
+        for c in (c for c in SPEC["cases"] if c["model"] in F.BUILDS):
             res = F.compute(c["model"], c["vram_gib"], c["ram_gib"], 131072, True)
             self.assertAlmostEqual(res["vram_gb"] + res["ram_gb"] + res["ssd_gb"], F.BUILDS[c["model"]]["bodies_gb"], delta=0.02)
         # the resident cases stay resident (RAM takes what the card gives up, and the engine keeps the KV state in pinned host memory on a small card) ...
         for model, vram, ram in (('SQ-64', 12, 64), ('SQ-96', 12, 96), ('SQ-128', 12, 128), ('SQ-96', 8, 96)):
             self.assertEqual(F.compute(model, vram, ram, 131072, True)['ssd_gb'], 0.0, (model, vram, ram))
         # ... and the ones that read from the SSD read more: the 5.5 GB of host KV and the pinned headroom come out of RAM
-        self.assertEqual(F.mode(F.compute('SQ-32', 12, 32, 131072, True)['ssd_gb']), 'cross_tier_ssd')           # the 32 GiB class: the author's 0 GB from the SSD becomes about 9 GB at 128K with images
-        self.assertAlmostEqual(F.compute('SQ-32', 12, 32, 131072, True)['ssd_gb'], 8.97, delta=0.05)
-        self.assertAlmostEqual(F.compute('SQ-32', 8, 32, 131072, True)['ssd_gb'], 13.26, delta=0.05)
+        # (the author's SQ-32 rows of the 32 GiB class are not offered any more; there SQ-64 is recommended and reads from the SSD, see test_the_32_gib_class_gets_sq_64_with_its_ssd_read_figure)
         self.assertAlmostEqual(F.compute('SQ-64', 12, 32, 131072, True)['ssd_gb'], 32.83, delta=0.05)
 
     def test_the_home_pc_12_gib_card_and_64_gib_of_ram_at_128k(self):
@@ -125,7 +151,7 @@ class Defaults0218(unittest.TestCase):
 
     def test_the_drafter_is_not_added_twice(self):
         self.assertEqual(F.DRAFTER_GB, 0.44)
-        self.assertGreater(F.BUILDS["SQ-32"]["dense_gb"], F.DRAFTER_GB)      # it is part of every build's dense weights (Section 1)
+        self.assertGreater(F.BUILDS["SQ-64"]["dense_gb"], F.DRAFTER_GB)      # it is part of every build's dense weights (Section 1)
 
     def test_an_8_gib_card_is_planned_at_128k_like_every_other(self):
         # owner, 2026-11-19: 128K is the default on every card and people change it themselves: no smaller context is recommended and nothing warns.
@@ -140,9 +166,11 @@ class Defaults0218(unittest.TestCase):
         self.assertAlmostEqual(r["ssd_gb"], 2.76, delta=0.05)
         self.assertFalse(F.fits("SQ-64", 8, 64, False, 131072, True))
         best = F.recommend(8, 64, False, 131072, True)
-        self.assertEqual(best["build"], "SQ-32")                              # the build to recommend there, still at 128K (never a lower context)
-        self.assertEqual(best["mode"], "ram_vram_zero_ssd")
-        self.assertEqual(best["placement"], {"vram_gb": 1.34, "ram_gb": 31.39, "ssd_gb": 0.0})
+        # owner, 2026-11-20: SQ-32 is removed ("too weak"), so SQ-64 is still the recommendation there, still at 128K, with its SSD-read figure and the "may run slower" words
+        self.assertEqual(best["build"], "SQ-64")
+        self.assertFalse(best["fits"])
+        self.assertEqual(best["mode"], "near_resident_ssd")
+        self.assertEqual(best["placement"], {"vram_gb": 0.79, "ram_gb": 52.49, "ssd_gb": 2.76})
         self.assertFalse(F.kv_in_host(48, 131072))                             # a big card keeps it in video memory
         self.assertGreater(F.compute("SQ-64", 8, 64, 20480, True)["vram_gb"], 0.0)       # at the author's 20K the state stays in the card (0.86 GB is under 15% of 8 GiB)
         self.assertFalse(F.kv_in_host(8, 20480))

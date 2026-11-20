@@ -53,7 +53,7 @@ test('the short name and the version labels', () => {
 test('the version fit is the catalog verdict of the rank-cut rule', () => {
   const hw = { ram_gb: 64, vram_gb: 12 };
   assert.equal(fit.versionFit(size('SQ-64', 'ram_vram_zero_ssd'), hw), 'fits');
-  assert.equal(fit.versionFit(size('SQ-32', 'near_resident_ssd'), hw), 'fits');
+  assert.equal(fit.versionFit(size('SQ-96', 'near_resident_ssd'), hw), 'fits');
   assert.equal(fit.versionFit(size('SQ-128', 'cross_tier_ssd'), hw), 'ssd');
 });
 

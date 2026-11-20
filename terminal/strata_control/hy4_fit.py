@@ -1,6 +1,6 @@
 """Which Hy4-Flash build fits a PC, and where its parts go: the one rule setup's menu, `strata launch`, the serve start line and the app's estimate use.
 
-Tencent Hy4-Flash (220B-A12B, `.strata` v1.0) comes as four builds of the same model (SQ-32, SQ-64, SQ-96, SQ-128: how many GiB of memory they are made for), one
+Tencent Hy4-Flash (220B-A12B, `.strata` v1.0) comes as three builds of the same model (SQ-64, SQ-96, SQ-128: how many GiB of memory they are made for; the author's fourth, SQ-32, is not offered: owner, 2026-11-20, "too weak"), one
 Engram shard they all share (Hy4-Flash-Engram-Q8.strata, 67.58 GB, read from the SSD, never loaded) and a Vision shard (images are on by default).  The numbers and the rule
 are the model's author's (docs/10-GUI-TUI.md of the quantization pack, `terminal/tests/data/hy4_squant_fit_cases.json`, at the author's 20K context), pinned by
 tests/terminal/test_hy4_squant_fit.py, plus what the 0.2.18 defaults add (owner, 2026-11-19: 128K context, the drafter and images on):
@@ -23,7 +23,7 @@ The placement is planned at the chosen context on every card, 8 GB ones included
 lower context chosen for them).  Host-side KV (HY4-CUDA's engine, 2026-11-19): when the sparse-layer KV, the IndexPool state and the absorbed kv_b copies (HOST_KV_GB_PER_TOKEN,
 5.5 GB at 128K) exceed 15% of the card's memory, the engine keeps them in pinned host memory.  Then the card holds only the core weights and the author's 2.00 GB (so its expert room is
 as at 20K) and RAM holds the 5.5 GB and HOST_PIN_HEADROOM_GB more (about 58 GB of a 64 GiB PC is usable).  That makes SQ-64 not fit 8 GiB + 64 GiB at 128K (about 2.8 GB from the SSD),
-and the planner recommends SQ-32 there, still at 128K.  A 12 GiB card at 128K also keeps the state in host memory (5.5 GB is over 15% of it) and stays resident with SQ-64 + 64 GiB.
+and the planner still recommends SQ-64 there (the smallest build; there is no SQ-32), still at 128K, with the "may run slower" words and its SSD-read figure.  A 12 GiB card at 128K also keeps the state in host memory (5.5 GB is over 15% of it) and stays resident with SQ-64 + 64 GiB.
 
 Unified memory (Strata Halo, Apple silicon, DGX Spark) has one pool: the trunk, the KV and every expert body live in it and nothing is copied or read from the SSD while the
 footprint fits `pool - UMA_RESERVE_GB - kv_extra - vision`.
@@ -57,12 +57,13 @@ FAMILY_NAME = "hy4-flash"        # the config's model_name prefix
 
 #: name -> (file, footprint_gb, dense_gb, bodies_gb, file_gb).  footprint = dense + bodies (what the PC holds); file_gb is the download.
 BUILDS = {
-    "SQ-32": {"file": "Hy4-Flash-SQ-32.strata", "footprint_gb": 37.98, "dense_gb": 5.25, "bodies_gb": 32.73, "file_gb": 38.09},
     "SQ-64": {"file": "Hy4-Flash-SQ-64.strata", "footprint_gb": 61.84, "dense_gb": 5.80, "bodies_gb": 56.04, "file_gb": 62.03},
     "SQ-96": {"file": "Hy4-Flash-SQ-96.strata", "footprint_gb": 89.43, "dense_gb": 6.50, "bodies_gb": 82.93, "file_gb": 89.58},
     "SQ-128": {"file": "Hy4-Flash-SQ-128.strata", "footprint_gb": 113.06, "dense_gb": 7.30, "bodies_gb": 105.76, "file_gb": 113.65},
 }
-ORDER = ("SQ-128", "SQ-96", "SQ-64", "SQ-32")      # best quality first
+ORDER = ("SQ-128", "SQ-96", "SQ-64")      # best quality first; SQ-64 is the smallest build
+#: builds that exist as files but are not offered anywhere (owner, 2026-11-20: SQ-32 is "too weak"): never listed, never recommended, never downloaded; the author's SQ-32 fit cases stay as data
+NOT_OFFERED = {"SQ-32": {"file": "Hy4-Flash-SQ-32.strata", "footprint_gb": 37.98, "dense_gb": 5.25, "bodies_gb": 32.73, "file_gb": 38.09}}
 
 
 def build_names() -> list[str]:
@@ -136,7 +137,7 @@ def fits(build: str, vram_gib: float | None, ram_gib: float, unified: bool = Fal
 
 def recommend(vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None, vision: bool = False) -> dict:
     """The build to offer first on this PC: the best quality whose experts all stay in memory; when none does, the one with the least read from the SSD
-    (ties to the smaller build).  Returns {"build", "placement", "mode", "fits"}.  Never refuses: a PC below SQ-32 still gets SQ-32 and the words say it streams."""
+    (ties to the smaller build).  Returns {"build", "placement", "mode", "fits"}.  Never refuses and never hides the model: a PC that cannot hold SQ-64 (the smallest build) still gets SQ-64 with the words "may run slower" and its SSD-read figure."""
     best = next((b for b in ORDER if fits(b, vram_gib, ram_gib, unified, ctx, vision)), None)
     if best is None:
         best = min(reversed(ORDER), key=lambda b: place(b, vram_gib, ram_gib, unified, ctx, vision)["ssd_gb"])
