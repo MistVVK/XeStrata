@@ -829,6 +829,43 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
     out += buf;
 }
 
+// Kernel sources embedded in the binary (build_mac.sh runs embed_metal.py and defines HY4_EMBED_KERNELS): written once to <TMPDIR>/strata-hy4-kernels-<hash>/ and compiled from there at run time
+// (mtl_rt compiles MSL source files; the Command Line Tools have no offline metal compiler, so a metallib cannot be made on this machine). Returns the path of hy4.metal, or "" without embedding.
+#ifdef HY4_EMBED_KERNELS
+#include "hy4_metal_embedded.inc"
+static std::string extract_embedded_kernels() {
+    uint64_t h = 1469598103934665603ull;
+    for (const auto& f : hy4_emb_files) {
+        for (unsigned long i = 0; i < f.size; ++i) h = (h ^ f.data[i]) * 1099511628211ull;
+        for (const char* c = f.name; *c; ++c) h = (h ^ (unsigned char) *c) * 1099511628211ull;
+    }
+    const char* tmp = getenv("TMPDIR");
+    char hx[32];
+    snprintf(hx, sizeof hx, "%016llx", (unsigned long long) h);
+    std::string base = std::string(tmp && *tmp ? tmp : "/tmp");
+    if (base.back() != '/') base += '/';
+    const std::string dir = base + "strata-hy4-kernels-" + hx + "/";
+    mkdir(dir.c_str(), 0700);
+    for (const auto& f : hy4_emb_files) {
+        const std::string path = dir + f.name;
+        struct stat st;
+        if (stat(path.c_str(), &st) == 0 && (unsigned long) st.st_size == f.size) continue;
+        const std::string tmpf = path + ".tmp" + std::to_string((long) getpid());
+        FILE* fp = fopen(tmpf.c_str(), "wb");
+        if (!fp || fwrite(f.data, 1, f.size, fp) != f.size) {
+            if (fp) fclose(fp);
+            fprintf(stderr, "cannot write %s\n", tmpf.c_str());
+            return "";
+        }
+        fclose(fp);
+        rename(tmpf.c_str(), path.c_str());
+    }
+    return dir + "hy4.metal";
+}
+#else
+static std::string extract_embedded_kernels() { return ""; }
+#endif
+
 static size_t rss_bytes() {
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
@@ -1003,7 +1040,8 @@ int main(int argc, char** argv) {
         if (kernels.empty()) {
             const char* e = getenv("STRATA_HY4_KERNELS");
             if (e) kernels = e;
-            else {
+            else if (!(kernels = extract_embedded_kernels()).empty()) {
+            } else {
                 std::string d = argv[0];
                 size_t sl = d.find_last_of('/');
                 kernels = (sl == std::string::npos ? std::string(".") : d.substr(0, sl)) + "/hy4.metal";
@@ -1047,7 +1085,8 @@ int main(int argc, char** argv) {
     if (max_ctx <= 0) max_ctx = T0 + gen + 16;
     if (kernels.empty()) {
         const char* e = getenv("STRATA_HY4_KERNELS");
-        kernels = e ? e : "hy4.metal";
+        kernels = e ? e : extract_embedded_kernels();
+        if (kernels.empty()) kernels = "hy4.metal";
     }
     Runner r(g, cx, max_ctx, std::max(chunk, 1));
     {
