@@ -254,9 +254,21 @@ public:
         if (!allow_nb) return;
         for (int i = 0; i < n && i < (int) ds.size(); ++i) ds[ds.size() - 1 - i].barrier = false;
     }
+    bool pipe_enc = true;  // decode / verify graphs: the dispatch list is cut into ~4 command buffers on the async queue so the GPU runs the first while the host encodes the rest (--no-pipe)
+    int pipe_segs = 8;
     void run_all() {
         if (ds.empty()) return;
-        double t = cx.run_graph(ds);
+        double t = 0;
+        if (pipe_enc && ds.size() >= 400) {
+            const size_t per = (ds.size() + pipe_segs - 1) / pipe_segs;
+            std::vector<void*> toks;
+            for (size_t s = 0; s < ds.size(); s += per) {
+                std::vector<Dispatch> seg(std::make_move_iterator(ds.begin() + s), std::make_move_iterator(ds.begin() + std::min(ds.size(), s + per)));
+                toks.push_back(cx.run_graph_async(seg));
+            }
+            for (void* tk : toks) t += cx.wait_async(tk);
+        } else
+            t = cx.run_graph(ds);
         ds.clear();
         gpu_total += t;
     }
@@ -923,7 +935,8 @@ int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_hcsplit = false, prof3 = false;
     int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0, par_m = 0, lin2_r_arg = 0;
-    bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false;
+    bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false, no_pipe = false;
+    int pipe_segs_arg = 8;
     bool serve = false, session_reuse = false;
     std::string vision;
     std::vector<std::string> image_files;
@@ -965,6 +978,8 @@ int main(int argc, char** argv) {
         else if (a == "--draft") draft = nxt();
         else if (a == "--no-lin2") no_lin2 = true;
         else if (a == "--no-moe2") no_moe2 = true;
+        else if (a == "--no-pipe") no_pipe = true;
+        else if (a == "--pipe-segs") pipe_segs_arg = atoi(nxt().c_str());
         else if (a == "--no-f32x") no_f32x = true;
         else if (a == "--save-logits") save_logits = true;
         else if (a == "--lin2-r") lin2_r_arg = atoi(nxt().c_str());
@@ -1105,6 +1120,8 @@ int main(int argc, char** argv) {
     r.mpp_try = !no_mpp;
     r.mm_min = mm_min_arg;
     r.lin2 = !no_lin2;
+    r.pipe_enc = !no_pipe;
+    r.pipe_segs = std::max(1, pipe_segs_arg);
     if (ab_rounds > 0) r.ring_slack = gen + 64;
     r.moe2 = !no_moe2;
     r.f32x = !no_f32x;

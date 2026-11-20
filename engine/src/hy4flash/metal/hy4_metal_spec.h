@@ -201,7 +201,7 @@ struct SpecCfg {
 struct SpecStats {
     long spec_iters = 0, plain_iters = 0, plain_after_draft = 0, tokens = 0, accepted = 0, verified_slots = 0, drafted = 0, probes = 0, backoffs = 0;
     long hist[9] = {};
-    double t_draft = 0, t_verify = 0, t_plain = 0, t_spec_total = 0, g_plain = 0, g_verify = 0, e_plain = 0, e_verify = 0;
+    double t_draft = 0, t_verify = 0, t_plain = 0, t_spec_total = 0, g_plain = 0, b_plain = 0, g_verify = 0, e_plain = 0, e_verify = 0;
     long n_plainstep = 0;
     int P_final = 8;
     long plain_mode_iters = 0;
@@ -276,11 +276,14 @@ public:
     }
 
     bool plain_step(std::vector<int32_t>& tok, int a, int& nx, std::string& err) {
-        const double g0 = r.gpu_total, e0 = r.t_engram_wait;
+        const double g0 = r.gpu_total, e0 = r.t_engram_wait, tb0 = now_s();
         if (!r.forward_chunk(tok.data(), a, 1, err)) return false;
         r.head(1, 0);
         hrow = 0;
-        nx = argmax_host_row0();
+        r.add("argmax_row", 1, 1, 1024, {Runner::B(r.logits), Runner::I(V), Runner::B(r.d_argmax)});
+        S.b_plain += now_s() - tb0;
+        r.run_all();
+        nx = ((int*) r.d_argmax.ptr)[0];
         S.g_plain += r.gpu_total - g0;
         S.e_plain += r.t_engram_wait - e0;
         ++S.n_plainstep;
@@ -426,8 +429,8 @@ public:
         fprintf(f, "[spec] verify steps %ld: accepted drafts per step %.3f (verified slots %.2f/step), draft %.1f ms/step, verify %.1f ms/step, plain %.1f ms/step (EMA %.1f), spec iteration %.1f ms\n",
                 S.spec_iters, S.spec_iters ? (double) S.accepted / S.spec_iters : 0.0, S.spec_iters ? (double) S.verified_slots / S.spec_iters : 0.0, S.spec_iters ? S.t_draft / S.spec_iters : 0.0,
                 S.spec_iters ? S.t_verify / S.spec_iters : 0.0, S.plain_iters ? S.t_plain / (S.plain_iters + S.plain_after_draft) : 0.0, tp, S.spec_iters ? S.t_spec_total / S.spec_iters : 0.0);
-        fprintf(f, "[spec] GPU time per plain step %.1f ms (wall %.1f, engram wait %.1f ms), per verify step %.1f ms (engram wait %.1f ms)\n", S.n_plainstep ? S.g_plain / S.n_plainstep * 1e3 : 0.0,
-                S.n_plainstep ? S.t_plain / S.n_plainstep : 0.0, S.n_plainstep ? S.e_plain / S.n_plainstep * 1e3 : 0.0, S.spec_iters ? S.g_verify / S.spec_iters * 1e3 : 0.0, S.spec_iters ? S.e_verify / S.spec_iters * 1e3 : 0.0);
+        fprintf(f, "[spec] GPU time per plain step %.1f ms (wall %.1f, host build %.1f ms, engram wait %.1f ms), per verify step %.1f ms (engram wait %.1f ms)\n", S.n_plainstep ? S.g_plain / S.n_plainstep * 1e3 : 0.0,
+                S.n_plainstep ? S.t_plain / S.n_plainstep : 0.0, S.n_plainstep ? S.b_plain / S.n_plainstep * 1e3 : 0.0, S.n_plainstep ? S.e_plain / S.n_plainstep * 1e3 : 0.0, S.spec_iters ? S.g_verify / S.spec_iters * 1e3 : 0.0, S.spec_iters ? S.e_verify / S.spec_iters * 1e3 : 0.0);
         fprintf(f, "[spec] accepted histogram (0..8):");
         for (int i = 0; i < 9; ++i) fprintf(f, " %ld", S.hist[i]);
         fprintf(f, "\n[spec] backoff state: backoffs %ld, probes %ld, plain-mode iterations %ld, plain after draft (K'=0) %ld, P now %d (last %d)\n", S.backoffs, S.probes, S.plain_mode_iters,
