@@ -2705,13 +2705,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 398,
+     "line": 410,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 398,
+     "line": 410,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -2744,13 +2744,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 413,
+     "line": 425,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 413,
+     "line": 425,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -2783,13 +2783,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 397,
+     "line": 409,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 397,
+     "line": 409,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -2822,7 +2822,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 396,
+     "line": 408,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3808,13 +3808,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1248,
+     "line": 1642,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/hy4_graph.hip.h",
-     "line": 588,
+     "line": 1324,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3847,7 +3847,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1885,
+     "line": 2319,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3858,7 +3858,11 @@
    "engine_sets": [
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 569
+     "line": 582
+    },
+    {
+     "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
+     "line": 584
     }
    ],
    "engine_defaults": [],
@@ -3885,7 +3889,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1888,
+     "line": 2322,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "engine/src/hy4flash/sycl/sy_graph.h",
+     "line": 173,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3893,7 +3903,12 @@
    "parse": "flag",
    "default_state": null,
    "code_default": null,
-   "engine_sets": [],
+   "engine_sets": [
+    {
+     "file": "engine/src/hy4flash/sycl/sy_graph.h",
+     "line": 174
+    }
+   ],
    "engine_defaults": [],
    "launch_files": [],
    "launch_sets": [],
@@ -3918,7 +3933,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1887,
+     "line": 2321,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3951,7 +3966,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1207,
+     "line": 1580,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3984,7 +3999,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1228,
+     "line": 1601,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
+     "line": 1623,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4017,7 +4038,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1305,
+     "line": 1753,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4050,7 +4071,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1315,
+     "line": 1657,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
+     "line": 1763,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4083,7 +4110,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1304,
+     "line": 1751,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4116,7 +4143,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1313,
+     "line": 1761,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -8846,7 +8873,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 811,
+     "line": 1103,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
+     "line": 1132,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -13702,13 +13735,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/metal/hy4_metal_main.cpp",
-     "line": 1056,
+     "line": 1556,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/metal/hy4_metal_main.cpp",
-     "line": 1102,
+     "line": 1603,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13741,7 +13774,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_graph.hip.h",
-     "line": 596,
+     "line": 1332,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -18598,6 +18631,34 @@
    "status": "research",
    "owner": "metal/engine",
    "note": "[auto] diagnostic / trace / measurement switch by name or by code, not documented for users",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_METAL_EXP_CACHE_GB",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/hy4flash/metal/hy4_metal_main.cpp",
+     "line": 628,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "opt-in",
+   "owner": "hy4flash/metal",
+   "note": "Override Metal LRU GPU expert cache budget (GB) when cold experts are enabled",
    "retire_after": "",
    "retired_in": ""
   },

@@ -801,6 +801,8 @@ int main(int argc, char** argv) {
             skd::moe_dec_max_m() = 16;
             skd::lin_gemv_max_m() = 16;
         }
+        r.det_mix = true;
+        g_mla_batch_invariant = scfg.inv ? 1 : 0;
         auto restore = [&]() {
             tok.resize(T0);
             if (!r.forward_chunk(tok.data(), redo_p0, redo_T, err)) { fprintf(stderr, "ab restore: %s\n", err.c_str()); exit(1); }
