@@ -513,8 +513,13 @@ public:
         size_t fr = 0, tot = 0;
         HCK(hipMemGetInfo(&fr, &tot));
         const size_t margin = (size_t)320 << 20, tables_est = (size_t)41 * 16 * 8192;
-        size_t avail = fr > margin + tables_est ? fr - margin - tables_est : 0;
         const size_t cap_limit = getenv("HY4_PF_BUF_MB") ? ((size_t)std::max(64, atoi(getenv("HY4_PF_BUF_MB"))) << 20) : ((size_t)256 << 20);
+        const size_t want_fr = margin + tables_est + 2 * cap_limit;
+        if (fr < want_fr && vcache_nslots > 1) {
+            vcache_release_vram(want_fr);
+            HCK(hipMemGetInfo(&fr, &tot));
+        }
+        size_t avail = fr > margin + tables_est ? fr - margin - tables_est : 0;
         size_t cap;
         if (!pf_bounce && avail >= maxb && tot >= (48ull << 30)) { pf_nbuf = 1; cap = maxb; }
         else { pf_nbuf = 2; cap = std::min(cap_limit, (avail / 2) & ~(size_t)4095); }
@@ -1096,7 +1101,7 @@ public:
         tune = e ? atoi(e) : TUNE_DEFAULT;
         if (tune == 0) return;
         slot_rec = dalloc<ExpertDev>(16);
-        HCK(hipMemset(moe_ws_dec, 0, moe_ws_bytes(4)));  // the one-token expert kernels keep their column tickets in the (otherwise unused) `fill` table of the workspace
+        HCK(hipMemset(moe_ws_dec, 0, moe_ws_bytes(8)));  // the one-token expert kernels keep their column tickets in the (otherwise unused) `fill` table of the workspace
         if (engram_ready && emeta.layers.size() >= 4) {
             for (int mo = 0; mo < 4; ++mo) {
                 const std::string p = L(emeta.layers[mo]) + ".engram_layer";
@@ -1170,7 +1175,7 @@ public:
         sub = dalloc<float>((size_t)T * HID);
         size_t big = (size_t)T * 16384;
         ldS = (size_t)(max_ctx / 4 + 8);
-        moe_ws_dec = dalloc<uint8_t>(moe_ws_bytes(4));
+        moe_ws_dec = dalloc<uint8_t>(moe_ws_bytes(8));
         F3_dec = dalloc<float>((size_t)8 * 16384);  // 512 KiB dedicated decode/verify scratch for fused lm_attn/lm_sh/CUDA Graphs (zero aliasing with work_arena/score)
         if (!dump) {
             const size_t arena_bytes = std::max({(size_t)2 * big * sizeof(float), (size_t)T * ldS * sizeof(float), moe_ws_bytes(T)});
@@ -1816,7 +1821,7 @@ public:
     void moe_hybrid_tail(int il, int T, const std::string& pm) {
         const size_t nz = (size_t)T * 1536;
         float* F3m = dump ? F3 : (F1 + (size_t)T * 1536);
-        void* mws = T <= 4 ? moe_ws_dec : moe_ws;
+        void* mws = T <= 8 ? moe_ws_dec : moe_ws;
         if (pf_active(T)) {
             const int ml = il - 1;
             const bool do_pf_cpu = has_pf_cpu && !pf_use_gather(T);
@@ -2039,7 +2044,7 @@ public:
             lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
             size_t nz = (size_t)T * 1536;
             if (hyb) { moe_hybrid_tail(il, T, pm); } else {
-            void* mws = T <= 4 ? moe_ws_dec : moe_ws;
+            void* mws = T <= 8 ? moe_ws_dec : moe_ws;
             const bool nof = T <= 4 && (tune & TN_NOF2H) && peer_runs.empty();  // fp32 latent read directly by the expert kernels, fp16 result written by their reduce
             if (nof) { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, nullptr, moe_idx, moe_w, zout_f, T, mws, z_f, z_h, route_now ? slot_rec : nullptr); }
             else {
@@ -2263,7 +2268,7 @@ public:
     void cg_emit_layer_gpuexp_hyb(int il, int T) {
         const size_t nz = (size_t)T * 1536;
         const std::string pm = L(il) + ".mlp";
-        void* mws = T <= 4 ? moe_ws_dec : moe_ws;
+        void* mws = T <= 8 ? moe_ws_dec : moe_ws;
         hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz);
         moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, mws);
         if (lm_ok_m(T) && (il - 1) < (int)lm_sh.size() && lm_sh[il - 1].d_jobs) {
@@ -2304,7 +2309,7 @@ public:
     void cg_emit_layer_gpuexp_mgpu(int il, int T) {
         const size_t nz = (size_t)T * 1536;
         const std::string pm = L(il) + ".mlp";
-        void* mws = T <= 4 ? moe_ws_dec : moe_ws;
+        void* mws = T <= 8 ? moe_ws_dec : moe_ws;
         moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, mws);
         if (lm_ok_m(T) && (il - 1) < (int)lm_sh.size() && lm_sh[il - 1].d_jobs) {
             linear_h_multi(st, lm_sh[il - 1], cur_h, T);

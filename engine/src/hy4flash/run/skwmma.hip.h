@@ -322,15 +322,71 @@ __device__ __forceinline__ void gemm_mainloop_bk(const uint8_t* wr, int nsb, con
     const int tid = threadIdx.x, lane = tid & 31;
     const int drow = tid / G_PER_ROW, gl = tid % G_PER_ROW;
     const int g = lane >> 2, c4 = (lane & 3) * 4;
+    (void)KSTEPS; (void)g; (void)c4;
     if constexpr (FMT == FMT_S1_25) {
         s125_lut_init();
         __syncthreads();
     }
     RawSub<FMT> cur, nxt;
     load_raw<FMT>(wr, gl, cur);
+    const int nstages = nsb * STAGES;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+    // Native Volta sm_70 zero-shuffle HMMA.884 mainloop: 4 quad-pairs compute a full 16x16x4 tile per instruction.
+    // Converts d[8] -> fv8 ONCE after the entire K-loop (zero shuffles inside K-loop, 32/32 bank-conflict-free uint4 LDS loads).
+    const int qp = (lane >> 2) & 3;
+    const int qp_m = qp >> 1, qp_n = qp & 1;
+    const int rl = (lane & 3) + ((lane >> 4) & 1) * 4;
+    const half_t* rA[MTW];
+#pragma unroll
+    for (int m = 0; m < MTW; ++m) rA[m] = (const half_t*)shfl_ptr(xrow[m], (qp_m << 3) | rl);
+    float dacc[MTW][NTW][8];
+#pragma unroll
+    for (int m = 0; m < MTW; ++m)
+#pragma unroll
+        for (int j = 0; j < NTW; ++j)
+#pragma unroll
+            for (int r = 0; r < 8; ++r) dacc[m][j][r] = 0.f;
+    constexpr int KSTEPS8 = BK / 8;
+    for (int st = 0; st < nstages; ++st) {
+        const int dg = (st % STAGES) * G_PER_ROW + gl;
+        dequant_sub<FMT>(cur, raw_eff<FMT>(cur, dg), &ws[drow * LDW + gl * 64]);
+        if (st + 1 < nstages) {
+            const int nst = st + 1;
+            const int nsb_i = nst / STAGES;
+            const int ndg = (nst % STAGES) * G_PER_ROW + gl;
+            load_raw<FMT>(wr + (size_t)nsb_i * SB, ndg, nxt);
+        }
+        __syncthreads();
+        if (active) {
+            const int k_base = st * BK;
+#pragma unroll 4
+            for (int k8 = 0; k8 < KSTEPS8; ++k8) {
+                uint4 a[MTW];
+#pragma unroll
+                for (int m = 0; m < MTW; ++m) a[m] = *(const uint4*)(rA[m] + k_base + k8 * 8);
+#pragma unroll
+                for (int j = 0; j < NTW; ++j) {
+                    const uint4 b = *(const uint4*)&ws[(brow[j] + qp_n * 8 + rl) * LDW + k8 * 8];
+#pragma unroll
+                    for (int m = 0; m < MTW; ++m) {
+                        mma_884(dacc[m][j], a[m].x, a[m].y, b.x, b.y);
+                        mma_884(dacc[m][j], a[m].z, a[m].w, b.z, b.w);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        cur = nxt;
+    }
+    if (active) {
+#pragma unroll
+        for (int m = 0; m < MTW; ++m)
+#pragma unroll
+            for (int j = 0; j < NTW; ++j) sm70_d8_to_fv8(dacc[m][j], acc[m][j].v);
+    }
+#else
     constexpr int PD = 4;
     const int total = nsb * 16;
-    const int nstages = nsb * STAGES;
     const half_t* rlo[MTW];
     const half_t* rhi[MTW];
     uint2 alo[MTW][PD], ahi[MTW][PD];
@@ -385,6 +441,7 @@ __device__ __forceinline__ void gemm_mainloop_bk(const uint8_t* wr, int nsb, con
         __syncthreads();
         cur = nxt;
     }
+#endif
 }
 #endif
 
@@ -448,6 +505,49 @@ __device__ __forceinline__ void gemm_mainloop_splitk(const uint8_t* wr, int nsb,
         __syncthreads();
         cur = nxt;
     }
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+    const int qp = (lane >> 2) & 3;
+    const int qp_m = qp >> 1, qp_n = qp & 1;
+    const int rl = (lane & 3) + ((lane >> 4) & 1) * 4;
+    const half_t* rA[MTW];
+#pragma unroll
+    for (int m = 0; m < MTW; ++m) rA[m] = (const half_t*)shfl_ptr(xrow[m], (qp_m << 3) | rl);
+    float dacc[MTW][NTW][8];
+#pragma unroll
+    for (int m = 0; m < MTW; ++m)
+#pragma unroll
+        for (int j = 0; j < NTW; ++j)
+#pragma unroll
+            for (int r = 0; r < 8; ++r) dacc[m][j][r] = 0.f;
+    constexpr int KSTEPS8 = KSTEPS * 2;
+    const int k0_h = k0 * 16;
+    for (int sb = 0; sb < nsb; ++sb) {
+        dequant_sub<FMT>(cur, raw_eff<FMT>(cur, gl), &ws[drow * GEMM_LDW + gl * 64]);
+        if (sb + 1 < nsb) load_raw<FMT>(wr + (size_t)(sb + 1) * SB, gl, nxt);
+        __syncthreads();
+        const int k_base = sb * 256 + k0_h;
+#pragma unroll 4
+        for (int k8 = 0; k8 < KSTEPS8; ++k8) {
+            uint4 a[MTW];
+#pragma unroll
+            for (int m = 0; m < MTW; ++m) a[m] = *(const uint4*)(rA[m] + k_base + k8 * 8);
+#pragma unroll
+            for (int j = 0; j < NTW; ++j) {
+                const uint4 b = *(const uint4*)&ws[(brow[j] + qp_n * 8 + rl) * GEMM_LDW + k0_h + k8 * 8];
+#pragma unroll
+                for (int m = 0; m < MTW; ++m) {
+                    mma_884(dacc[m][j], a[m].x, a[m].y, b.x, b.y);
+                    mma_884(dacc[m][j], a[m].z, a[m].w, b.z, b.w);
+                }
+            }
+        }
+        __syncthreads();
+        cur = nxt;
+    }
+#pragma unroll
+    for (int m = 0; m < MTW; ++m)
+#pragma unroll
+        for (int j = 0; j < NTW; ++j) sm70_d8_to_fv8(dacc[m][j], acc[m][j].v);
 #else
     const int g = lane >> 2, c4 = (lane & 3) * 4;
     const half_t* rlo[MTW];

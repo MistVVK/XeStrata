@@ -16,6 +16,9 @@
 #include "hy4_io.h"
 #include "hy4_manifest.h"
 #include "strata/artifact/strata_reader.hpp"
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#endif
 
 #define HCK(x)                                                                                                        \
     do {                                                                                                              \
@@ -158,69 +161,225 @@ struct GpuModel {
     }
 };
 
-// Streams [file_off, file_off+bytes) into device memory dst with a reader thread and a ring of pinned staging buffers (handles arbitrary file_off alignment).
+inline bool gpu_is_uma() {
+    static int cached = -1;
+    if (cached < 0) {
+        hipDeviceProp_t dp{};
+        cached = (hipGetDeviceProperties(&dp, 0) == hipSuccess && dp.integrated != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+// Available GPU memory: on Linux UMA (e.g. NVIDIA GB10 / DGX Spark), cudaMemGetInfo reports only
+// Linux MemFree and ignores both reclaimable page cache and the NVIDIA kernel driver's cached UMA pool
+// (which also does not appear in /proc/meminfo MemAvailable). Estimate allocatable RAM from MemTotal
+// minus non-reclaimable OS/process memory, bounded by the container cgroup (excluding file cache).
+inline void gpu_mem_avail(size_t& fr, size_t& tot) {
+    HCK(hipMemGetInfo(&fr, &tot));
+#if !defined(_WIN32)
+    if (gpu_is_uma()) {
+        size_t avail = 0;
+        if (FILE* f = fopen("/proc/meminfo", "r")) {
+            char ln[256];
+            unsigned long long total_kb = 0, avail_kb = 0, used_kb = 0, v = 0;
+            while (fgets(ln, sizeof ln, f)) {
+                if (sscanf(ln, "MemTotal: %llu kB", &v) == 1) total_kb = v;
+                else if (sscanf(ln, "MemAvailable: %llu kB", &v) == 1) avail_kb = v;
+                else if (sscanf(ln, "AnonPages: %llu kB", &v) == 1 ||
+                         sscanf(ln, "Shmem: %llu kB", &v) == 1 ||
+                         sscanf(ln, "SUnreclaim: %llu kB", &v) == 1 ||
+                         sscanf(ln, "KernelStack: %llu kB", &v) == 1 ||
+                         sscanf(ln, "PageTables: %llu kB", &v) == 1 ||
+                         sscanf(ln, "Mlocked: %llu kB", &v) == 1 ||
+                         sscanf(ln, "Percpu: %llu kB", &v) == 1 ||
+                         sscanf(ln, "VmallocUsed: %llu kB", &v) == 1 ||
+                         sscanf(ln, "GPUActive: %llu kB", &v) == 1)
+                    used_kb += v;
+            }
+            fclose(f);
+            const unsigned long long margin_kb = 4ull << 20;  // 4 GiB OS/driver headroom
+            if (total_kb > used_kb + margin_kb) avail = (size_t)(total_kb - used_kb - margin_kb) * 1024ull;
+            else avail = (size_t)avail_kb * 1024ull;
+        }
+        const char* limf[2] = {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
+        const char* curf[2] = {"/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"};
+        for (int i = 0; i < 2; ++i) {
+            FILE* fl = fopen(limf[i], "r");
+            if (!fl) continue;
+            char buf[64] = {0};
+            unsigned long long lim = 0, cur = 0, file_cache = 0;
+            if (fgets(buf, sizeof buf, fl) && buf[0] >= '0' && buf[0] <= '9') lim = strtoull(buf, nullptr, 10);
+            fclose(fl);
+            if (lim > (1ull << 30) && lim < (1ull << 50)) {
+                if (FILE* fc = fopen(curf[i], "r")) {
+                    char b2[64] = {0};
+                    if (fgets(b2, sizeof b2, fc) && b2[0] >= '0' && b2[0] <= '9') cur = strtoull(b2, nullptr, 10);
+                    fclose(fc);
+                }
+                if (i == 0) {
+                    if (FILE* fs = fopen("/sys/fs/cgroup/memory.stat", "r")) {
+                        char ln[128];
+                        unsigned long long fv = 0;
+                        while (fgets(ln, sizeof ln, fs))
+                            if (sscanf(ln, "file %llu", &fv) == 1) { file_cache = fv; break; }
+                        fclose(fs);
+                    }
+                }
+                const unsigned long long non_file = cur > file_cache ? cur - file_cache : 0;
+                const unsigned long long margin = 4ull << 30;
+                const size_t cg = lim > non_file + margin ? (size_t)(lim - non_file - margin) : 0;
+                if (avail == 0 || cg < avail) avail = cg;
+            }
+        }
+        if (avail > fr && avail <= tot) fr = avail;
+    }
+#endif
+}
+
+// Parallel direct read into a host-accessible buffer (used for UMA zero-copy mapped load).
+inline void read_file_parallel(const std::string& path, uint64_t file_off, uint64_t bytes, uint8_t* dst, double* seconds, const char* what) {
+    const size_t CH = 64ull << 20;
+    const uint64_t nchunks = (bytes + CH - 1) / CH;
+    const int NT = (int)std::min<uint64_t>(4, std::max<uint64_t>(1, nchunks));
+    std::atomic<uint64_t> next{0}, done_chunks{0};
+    std::atomic<int> failed{0};
+    double t0 = now_s();
+    std::vector<std::thread> th;
+    for (int t = 0; t < NT; ++t) {
+        th.emplace_back([&]() {
+            AlignedFile f;
+            if (!f.open(path, true)) { failed = 1; return; }
+            for (;;) {
+                uint64_t c = next.fetch_add(1);
+                if (c >= nchunks || failed.load()) break;
+                size_t want = (size_t)std::min<uint64_t>(CH, bytes - c * CH);
+                size_t rd_len = (want + 4095) & ~(size_t)4095;
+                size_t got = f.read_at(file_off + c * CH, dst + c * CH, rd_len);
+                if (got < want) {
+                    fprintf(stderr, "short read in %s chunk %llu (%zu < %zu)\n", what, (unsigned long long)c, got, want);
+                    failed = 1;
+                    break;
+                }
+                uint64_t d = done_chunks.fetch_add(1) + 1;
+                if (nchunks > 16 && (d * 10 / nchunks) != ((d - 1) * 10 / nchunks)) {
+                    double dt = now_s() - t0;
+                    fprintf(stderr, "[load %s] %llu%% %.1f s %.2f GB/s\n", what, (unsigned long long)(d * 10 / nchunks * 10), dt, (double)d * CH / std::max(dt, 1e-6) / 1e9);
+                }
+            }
+        });
+    }
+    for (auto& t : th) t.join();
+    if (failed.load()) exit(1);
+    *seconds = now_s() - t0;
+}
+
+// Streams [file_off, file_off+bytes) into device memory dst with parallel unbuffered readers and a ring of pinned staging buffers (handles arbitrary file_off alignment).
 inline void stream_to_device(const std::string& path, uint64_t file_off, uint64_t bytes, uint8_t* dst, double* seconds, const char* what) {
     if (bytes == 0) { *seconds = 0.0; return; }
     const uint64_t fo_al = file_off & ~4095ull;
     const size_t head_skip = (size_t)(file_off - fo_al);
     const uint64_t total_span = bytes + head_skip;
-    const size_t CH = 128ull << 20;
+    const size_t CH = 64ull << 20;
     const int NB = 4;
     std::vector<void*> buf(NB);
-    for (int i = 0; i < NB; ++i) HCK(hipHostMalloc(&buf[i], CH, hipHostMallocDefault));
-    AlignedFile f;
-    if (!f.open(path, true)) {
-        fprintf(stderr, "cannot open %s\n", path.c_str());
-        exit(1);
+    std::vector<hipEvent_t> ev(NB);
+    for (int i = 0; i < NB; ++i) {
+        HCK(hipHostMalloc(&buf[i], CH, hipHostMallocDefault));
+        HCK(hipEventCreateWithFlags(&ev[i], hipEventDisableTiming));
     }
     uint64_t nchunks = (total_span + CH - 1) / CH;
-    std::atomic<uint64_t> filled{0};  // chunks read
-    std::atomic<uint64_t> freed{0};   // chunks copied (buffers released)
-    std::vector<size_t> clen(nchunks);
+    const int NRD = (int)std::min<uint64_t>(4, std::max<uint64_t>(1, nchunks));
+    std::vector<std::atomic<int>> slot_state(NB);
+    for (int i = 0; i < NB; ++i) slot_state[i].store(0, std::memory_order_relaxed);
+    std::vector<uint64_t> slot_chunk(NB, 0);
+    std::vector<size_t> slot_len(NB, 0);
+    std::atomic<uint64_t> next_chunk{0};
+    std::atomic<int> failed{0};
+    std::mutex qm;
     double t0 = now_s();
-    std::thread reader([&]() {
-        for (uint64_t c = 0; c < nchunks; ++c) {
-            while (c - freed.load(std::memory_order_acquire) >= (uint64_t)NB) std::this_thread::sleep_for(std::chrono::microseconds(200));
-            size_t want = (size_t)std::min<uint64_t>(CH, total_span - c * CH);
-            size_t rd_len = (want + 4095) & ~(size_t)4095;
-            size_t got = f.read_at(fo_al + c * CH, buf[c % NB], rd_len);
-            clen[c] = std::min(got, want);
-            if (got < want) {
-                fprintf(stderr, "short read in %s chunk %llu (%zu < %zu)\n", what, (unsigned long long)c, got, want);
-                exit(1);
+    std::vector<std::thread> readers;
+    for (int rt = 0; rt < NRD; ++rt) {
+        readers.emplace_back([&]() {
+            AlignedFile f;
+            if (!f.open(path, true)) { failed = 1; return; }
+            for (;;) {
+                uint64_t c = 0;
+                int s = -1;
+                {
+                    std::lock_guard<std::mutex> lk(qm);
+                    if (next_chunk.load() >= nchunks || failed.load()) return;
+                    for (int i = 0; i < NB; ++i) {
+                        if (slot_state[i].load(std::memory_order_acquire) == 0) {
+                            s = i;
+                            slot_state[i].store(1, std::memory_order_relaxed);
+                            c = next_chunk.fetch_add(1);
+                            break;
+                        }
+                    }
+                }
+                if (s < 0) { std::this_thread::sleep_for(std::chrono::microseconds(100)); continue; }
+                size_t want = (size_t)std::min<uint64_t>(CH, total_span - c * CH);
+                size_t rd_len = (want + 4095) & ~(size_t)4095;
+                size_t got = f.read_at(fo_al + c * CH, buf[s], rd_len);
+                if (got < want) {
+                    fprintf(stderr, "short read in %s chunk %llu (%zu < %zu)\n", what, (unsigned long long)c, got, want);
+                    failed = 1;
+                    slot_state[s].store(0, std::memory_order_release);
+                    return;
+                }
+                slot_chunk[s] = c;
+                slot_len[s] = want;
+                slot_state[s].store(2, std::memory_order_release);
             }
-            filled.store(c + 1, std::memory_order_release);
-        }
-    });
+        });
+    }
     hipStream_t st;
     HCK(hipStreamCreate(&st));
-    uint64_t last_print = 0;
-    uint64_t dst_off = 0;
-    for (uint64_t c = 0; c < nchunks; ++c) {
-        while (filled.load(std::memory_order_acquire) <= c) std::this_thread::sleep_for(std::chrono::microseconds(200));
-        const size_t sk = (c == 0) ? head_skip : 0;
-        const size_t ncp = clen[c] - sk;
-        HCK(hipMemcpyAsync(dst + dst_off, (const uint8_t*)buf[c % NB] + sk, ncp, hipMemcpyHostToDevice, st));
-        HCK(hipStreamSynchronize(st));
-        dst_off += ncp;
-        freed.store(c + 1, std::memory_order_release);
-        if (nchunks > 16 && (c + 1) * 10 / nchunks != last_print) {
-            last_print = (c + 1) * 10 / nchunks;
-            fprintf(stderr, "[load %s] %llu%% %.1f s %.2f GB/s\n", what, (unsigned long long)(last_print * 10), now_s() - t0, (c + 1) * (double)CH / (now_s() - t0) / 1e9);
+    uint64_t copied = 0, last_print = 0;
+    while (copied < nchunks && !failed.load()) {
+        bool did = false;
+        for (int s = 0; s < NB; ++s) {
+            if (slot_state[s].load(std::memory_order_acquire) == 2) {
+                uint64_t c = slot_chunk[s];
+                const size_t sk = (c == 0) ? head_skip : 0;
+                const uint64_t dst_off = (c == 0) ? 0 : (c * CH - head_skip);
+                HCK(hipMemcpyAsync(dst + dst_off, (const uint8_t*)buf[s] + sk, slot_len[s] - sk, hipMemcpyHostToDevice, st));
+                HCK(hipEventRecord(ev[s], st));
+                HCK(hipEventSynchronize(ev[s]));
+                slot_state[s].store(0, std::memory_order_release);
+                ++copied;
+                did = true;
+                if (nchunks > 16 && copied * 10 / nchunks != last_print) {
+                    last_print = copied * 10 / nchunks;
+                    double dt = now_s() - t0;
+                    fprintf(stderr, "[load %s] %llu%% %.1f s %.2f GB/s\n", what, (unsigned long long)(last_print * 10), dt, (double)copied * CH / std::max(dt, 1e-6) / 1e9);
+                }
+            }
         }
+        if (!did) std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
-    reader.join();
+    for (auto& t : readers) t.join();
+    if (failed.load()) exit(1);
+    HCK(hipStreamSynchronize(st));
     HCK(hipStreamDestroy(st));
-    for (int i = 0; i < NB; ++i) HCK(hipHostFree(buf[i]));
+    for (int i = 0; i < NB; ++i) {
+        HCK(hipEventDestroy(ev[i]));
+        HCK(hipHostFree(buf[i]));
+    }
     *seconds = now_s() - t0;
 }
 
-// Modern x86-64 CPUs (AVX2 / AVX-512) run fast(avx2)/fast(avx512) CPU experts + AdaptiveExpertCache + bounce-ring prefill streaming,
-// which is 5-10x faster than zero-copy GPU PCIe reads on discrete cards.
+// Modern x86-64 CPUs (AVX2 / AVX-512) and ARM64 dotprod CPUs run fast CPU experts + AdaptiveExpertCache + bounce-ring prefill streaming.
 inline bool host_cpu_fast() {
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(__GNUC__)
     return __builtin_cpu_supports("avx2");
+#else
+    return true;
+#endif
+#elif defined(__aarch64__)
+#if defined(__linux__)
+    return (getauxval(AT_HWCAP) & (1ul << 20)) != 0;  // HWCAP_ASIMDDP
 #else
     return true;
 #endif
@@ -240,7 +399,7 @@ inline void hy4_setenv(const char* k, const char* v, int) {
 #endif
 }
 
-inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& model_path) {
+inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& model_path, bool multi_gpu = false) {
     const double GB = 1e9, tot = (double)total / GB;
     double trunk = 5.92, sec4_gb = 0.0;
     if (!model_path.empty()) {
@@ -255,11 +414,11 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     const bool host_embed = !getenv("HY4_EMBED_VRAM") && (total < (48ull << 30));
     if (host_embed && trunk > 0.5) trunk -= 0.38;
     // Sparse KV (no Vt: 1152 B/slot) + IndexPool (576 B/slot) = 1728 B/slot * 12 layers = 20,736 B/token.
-    // On discrete cards (< 48 GB) with max_ctx > 16384, allocate sparse KV + IndexPool in 16,384-token VRAM increments
-    // so short/medium chats start with ~9.0-9.5 GB free VRAM for hot experts on 16 GB cards and grow cleanly up to 128K.
+    // On single discrete cards (< 48 GB) with max_ctx > 16384, allocate sparse KV + IndexPool in 16,384-token VRAM increments
+    // (reclaiming adaptive vcache slabs as KV grows). On multi-GPU static EP (no vcache slabs), reserve full max_ctx KV upfront so 128K stays in VRAM.
     const double per_pos = 12.0 * 1152.0 + 12.0 * 512.0 + 12.0 * 64.0;  // 20,736 B per token across 12 sparse layers
     int init_slots = max_ctx;
-    if (!getenv("HY4_KV_NO_GROW") && total < (48ull << 30) && max_ctx > 16384) {
+    if (!multi_gpu && !getenv("HY4_KV_NO_GROW") && total < (48ull << 30) && max_ctx > 16384) {
         init_slots = 16384;
         if (getenv("HY4_KV_INIT_SLOTS")) init_slots = std::max(4096, std::min(max_ctx, atoi(getenv("HY4_KV_INIT_SLOTS"))));
         else {
@@ -277,9 +436,9 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         return arena + c * 0.195e6 / GB + 0.22 + 30.0 * (512.0 + c) * 1152.0 / GB;
     };
     if (chunk <= 0) {
-        // 16 GB+ cards default to Tc = 8192 when ctx >= 8192 (halves PCIe passes 32->16 at 128K; capped to 4096 for <=4K sessions to maximize expert cache!)
-        // 12 GB -> 2048; 8 GB -> 1024/512
-        int c = (tot >= 15.0) ? ((max_ctx >= 8192) ? 8192 : 4096) : (tot >= 11.0 ? 2048 : 1024);
+        // 16 GB+ cards default to Tc = 8192 when ctx >= 8192 (halves PCIe passes 32->16 at 128K; capped to 4096 for <=4K sessions to maximize expert cache!).
+        // Multi-GPU 32 GB static EP at >=96K context uses Tc = 2048 so 100% of SQ-64 experts + full 128K KV fit in HBM2 (e.g. 2x V100 32 GB).
+        int c = (multi_gpu && max_ctx >= 98304 && tot < 40.0) ? 2048 : ((tot >= 15.0) ? ((max_ctx >= 8192) ? 8192 : 4096) : (tot >= 11.0 ? 2048 : 1024));
         const double work_cap = (tot >= 15.0) ? 0.22 : 0.16;
         while (c > 256 && est_work_gb(c) > work_cap * tot) c >>= 1;
         while (c > 256 && trunk + est_work_gb(c) + kv_init_gb + wkv + cublas_gb + 0.55 > tot) c >>= 1;
@@ -388,9 +547,8 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     std::vector<uint64_t> off(N, 0);
     const size_t ng = 1 + g.peer_devs.size();
     std::vector<uint64_t> vcap(ng, 0), vb_gpu(ng, 0), nv_gpu(ng, 0);
-    // Adaptive VRAM expert cache (single-GPU cpu_mode): when host RAM fits all experts (e.g. 64 GB+ Hero cards), use 100% dynamic slots
-    // (core_frac = 0, proven +5-6 pp better than static-pinned cores on code/json/prose traces); when RAM is tight (cold-tier SSD),
-    // put the hottest static core in VRAM-only so it does not duplicate in RAM and minimizes SSD spills.
+    // Adaptive VRAM expert cache (single-GPU cpu_mode): when host RAM fits all experts (e.g. 64 GB+ Hero cards), use 100% dynamic slots;
+    // when multi-GPU (--gpus 0,1...), distribute static experts across all GPUs (e.g. 2x V100 32 GB = 64 GB HBM2).
     double ram_budget_gb = 0.0;
     if (cpu_mode) {
         if (getenv("HY4_RAM_BUDGET_GB")) ram_budget_gb = atof(getenv("HY4_RAM_BUDGET_GB"));
@@ -407,18 +565,20 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         all_al_bytes += sz;
         max_body_sz = std::max<size_t>(max_body_sz, (size_t)sz);
     }
-    double dyn_frac = 1.0;
-    if (getenv("HY4_VCACHE_FRAC")) {
-        dyn_frac = std::max(0.0, std::min(1.0, atof(getenv("HY4_VCACHE_FRAC"))));
-    } else if (cpu_mode && all_al_bytes > ram_budget_bytes && vram_budget > 0) {
-        const uint64_t overflow = all_al_bytes - ram_budget_bytes;
-        const double static_share = std::min(0.75, (double)overflow / (double)vram_budget);
-        dyn_frac = std::max(0.25, 1.0 - static_share);
+    double dyn_frac = (ng == 1) ? 1.0 : 0.0;
+    if (ng == 1) {
+        if (getenv("HY4_VCACHE_FRAC")) {
+            dyn_frac = std::max(0.0, std::min(1.0, atof(getenv("HY4_VCACHE_FRAC"))));
+        } else if (cpu_mode && all_al_bytes > ram_budget_bytes && vram_budget > 0) {
+            const uint64_t overflow = all_al_bytes - ram_budget_bytes;
+            const double static_share = std::min(0.75, (double)overflow / (double)vram_budget);
+            dyn_frac = std::max(0.25, 1.0 - static_share);
+        }
     }
     size_t static_budget = vram_budget;
     int dyn_slots = 0;
     size_t dyn_bytes = 0;
-    if (g.peer_devs.empty() && cpu_mode && dyn_frac > 0.01 && vram_budget >= 2 * max_body_sz && max_body_sz > 0) {
+    if (ng == 1 && cpu_mode && dyn_frac > 0.01 && vram_budget >= 2 * max_body_sz && max_body_sz > 0) {
         size_t want_dyn = (size_t)((double)vram_budget * dyn_frac);
         dyn_slots = (int)(want_dyn / max_body_sz);
         dyn_bytes = (size_t)dyn_slots * max_body_sz;
@@ -431,7 +591,7 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         HCK(hipSetDevice(pd));
         size_t pfr = 0, ptot = 0;
         HCK(hipMemGetInfo(&pfr, &ptot));
-        const size_t preserve = (size_t)512 << 20;  // 512 MiB for peer moe_ws + buffers + runtime
+        const size_t preserve = (size_t)960 << 20;  // 960 MiB for peer moe_ws (604 MiB at Tc=4096) + buffers + runtime
         vcap[1 + p] = pfr > preserve ? (uint64_t)(pfr - preserve) : 0;
         int can = 0;
         if (cudaDeviceCanAccessPeer(&can, g.primary_gpu, pd) == cudaSuccess && can) {
@@ -468,7 +628,7 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     }
     uint64_t vb = vb_gpu[0];
     // Reclaim any leftover static_budget slack into additional dynamic slots
-    if (g.peer_devs.empty() && cpu_mode && dyn_frac > 0.01 && max_body_sz > 0 && vram_budget > vb + dyn_bytes + max_body_sz) {
+    if (ng == 1 && cpu_mode && dyn_frac > 0.01 && max_body_sz > 0 && vram_budget > vb + dyn_bytes + max_body_sz) {
         int extra = (int)((vram_budget - vb - dyn_bytes) / max_body_sz);
         dyn_slots += extra;
         dyn_bytes = (size_t)dyn_slots * max_body_sz;
@@ -645,9 +805,11 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
     const auto& h = g.rd.header();
     g.trunk_bytes = h.sections[1].byte_length;
     g.sec4_bytes = h.sections[4].byte_length;
+    const bool uma_mapped = gpu_is_uma() && getenv("HY4_UMA_MAPPED") && atoi(getenv("HY4_UMA_MAPPED")) != 0;
+    const uint64_t trunk_al = (g.trunk_bytes + 4095) & ~4095ull;
     size_t fr0 = 0, tot0 = 0;
-    HCK(hipMemGetInfo(&fr0, &tot0));
-    const bool want_host_embed = !getenv("HY4_EMBED_VRAM") && (tot0 < (48ull << 30)) && g.man.T.count("model.embed_tokens.weight");
+    gpu_mem_avail(fr0, tot0);
+    const bool want_host_embed = !uma_mapped && !getenv("HY4_EMBED_VRAM") && (tot0 < (48ull << 30)) && g.man.T.count("model.embed_tokens.weight");
     bool loaded_host_embed = false;
     if (want_host_embed) {
         const TInfo emb = g.man.T.at("model.embed_tokens.weight");
@@ -681,8 +843,15 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
         }
     }
     if (!loaded_host_embed) {
-        HCK(hipMalloc((void**)&g.d_trunk, (g.trunk_bytes + 4095) & ~4095ull));
-        stream_to_device(path, h.sections[1].file_offset, g.trunk_bytes, g.d_trunk, &g.t_load_trunk, "trunk");
+        if (uma_mapped) {
+            void* hp = nullptr;
+            HCK(hipHostMalloc(&hp, trunk_al, hipHostMallocMapped));
+            read_file_parallel(path, h.sections[1].file_offset, g.trunk_bytes, (uint8_t*)hp, &g.t_load_trunk, "trunk(uma-mapped)");
+            HCK(hipHostGetDevicePointer((void**)&g.d_trunk, hp, 0));
+        } else {
+            HCK(hipMalloc((void**)&g.d_trunk, trunk_al));
+            stream_to_device(path, h.sections[1].file_offset, g.trunk_bytes, g.d_trunk, &g.t_load_trunk, "trunk");
+        }
     }
     if (!g.rd.read_section(2, g.seed, err)) {
         fprintf(stderr, "sec2: %s\n", err.c_str());
@@ -700,24 +869,37 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
     if (with_experts) {
         size_t fr = 0, tot = 0;
         gpu_mem_avail(fr, tot);
-        if (gpu_is_uma() && fr > g.trunk_bytes) fr -= g.trunk_bytes;
+        if (gpu_is_uma() && fr > trunk_al) fr -= trunk_al;
         double reserve_gb = getenv("HY4_RESERVE_GB") ? atof(getenv("HY4_RESERVE_GB")) : 6.0;
         double budget = (double)fr - reserve_gb * 1073741824.0;
         if (getenv("HY4_EXPERT_VRAM_GB")) budget = atof(getenv("HY4_EXPERT_VRAM_GB")) * 1073741824.0;
-        if (g.peer_devs.empty() && budget >= (double)((g.sec4_bytes + 4095) & ~4095ull)) {
-            if (hipMalloc((void**)&g.d_sec4, (g.sec4_bytes + 4095) & ~4095ull) == hipSuccess) {
-                stream_to_device(path, h.sections[4].file_offset, g.sec4_bytes, g.d_sec4, &g.t_load_experts, "experts");
+        const uint64_t sec4_al = (g.sec4_bytes + 4095) & ~4095ull;
+        bool loaded_full = false;
+        if (g.peer_devs.empty() && budget >= (double)sec4_al) {
+            if (uma_mapped) {
+                void* hp = nullptr;
+                if (hipHostMalloc(&hp, sec4_al, hipHostMallocMapped) == hipSuccess) {
+                    read_file_parallel(path, h.sections[4].file_offset, g.sec4_bytes, (uint8_t*)hp, &g.t_load_experts, "experts(uma-mapped)");
+                    HCK(hipHostGetDevicePointer((void**)&g.d_sec4, hp, 0));
+                    g.h_arena = (uint8_t*)hp;
+                    loaded_full = true;
+                } else {
+                    (void)hipGetLastError();
+                }
             } else {
-                (void)hipGetLastError();
-                HCK(hipMemGetInfo(&fr, &tot));
-                budget = (double)fr - reserve_gb * 1073741824.0;
-                bool cpu_mode = getenv("HY4_CPU_EXPERTS") ? atoi(getenv("HY4_CPU_EXPERTS")) != 0 : host_cpu_fast();
-                if (!load_experts_tiered(g, path, budget < 0 ? 0 : (size_t)budget, cpu_mode, err)) {
-                    fprintf(stderr, "experts: %s\n", err.c_str());
-                    return false;
+                if (hipMalloc((void**)&g.d_sec4, sec4_al) == hipSuccess) {
+                    stream_to_device(path, h.sections[4].file_offset, g.sec4_bytes, g.d_sec4, &g.t_load_experts, "experts");
+                    loaded_full = true;
+                } else {
+                    (void)hipGetLastError();
+                    fprintf(stderr, "[load] full expert cudaMalloc (%.2f GB) failed; falling back to tiered loading\n", sec4_al / 1e9);
+                    size_t fr2 = 0, tot2 = 0;
+                    HCK(hipMemGetInfo(&fr2, &tot2));
+                    budget = (double)fr2 - reserve_gb * 1073741824.0;
                 }
             }
-        } else {
+        }
+        if (!loaded_full) {
             // host-resident experts: pinned + read by the GPU (needs the RAM) or computed by the CPU. HY4_CPU_EXPERTS=1/0 forces, default: CPU when they would use > 45% of the RAM or the CPU has AVX-512 VBMI+VNNI
             bool cpu_mode = false;
             {

@@ -471,6 +471,7 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     const int rt = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const int g = lane >> 2, c = lane & 3, c4 = c * 4;
+    (void)c4;
     const int NH = a.NH, RT = NH / 16, h0 = rt * 16;
     __shared__ __align__(16) half_t sQ[16 * QP];
     __shared__ __align__(16) half_t sP[16 * PP];
@@ -511,15 +512,46 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         lrun[i] = sp == 0 ? 1.0f : 0.0f;
     }
     float oc[16][4];  // output accumulators: 16 n8 tiles of this wave's 128 columns
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+    const int qp = (lane >> 2) & 3;
+    const int qp_m = qp >> 1, qp_n = qp & 1;
+    const int rl = (lane & 3) + ((lane >> 4) & 1) * 4;
+    const int r0_v = (lane & 1) + ((lane >> 4) & 1) * 4;
+    float ocd[8][8];  // native Volta HMMA.884 16x16 accumulators (8 tiles = 128 cols; converted to oc ONCE after the loop!)
+#pragma unroll
+    for (int nt2 = 0; nt2 < 8; ++nt2)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) ocd[nt2][e] = 0.f;
+#else
 #pragma unroll
     for (int nt = 0; nt < 16; ++nt)
 #pragma unroll
         for (int e = 0; e < 4; ++e) oc[nt][e] = 0.f;
+#endif
     __syncthreads();
 
     for (int tile = tb; tile < te; ++tile) {
         const int i0 = tile * FBK;
-        // ---- scores of this wave's 16 keys (2 n8 sub-tiles; this lane loads the B rows of keys 8s+g)
+        // ---- scores of this wave's 16 keys (2 n8 sub-tiles)
+        float sacc[2][4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+        const int ie_v = i0 + 16 * w + qp_n * 8 + rl;
+        int slot_v = 0;
+        if (ie_v < nk) slot_v = mode == MLA_CAUSAL ? (a.ring > 0 ? ie_v % a.ring : ie_v) : (mode == MLA_WINDOW ? (lo_al + ie_v) % a.ring : klist[ie_v]);
+        const half_t* kr_v = rows + (size_t)slot_v * MLA_ROW;
+        float sd[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll 8
+        for (int kk = 0; kk < MLA_ROW; kk += 8) {
+            const uint4 aq = *reinterpret_cast<const uint4*>(&sQ[(qp_m * 8 + rl) * QP + kk]);
+            const uint4 bk = *reinterpret_cast<const uint4*>(kr_v + kk);
+            mma_884(sd, aq.x, aq.y, bk.x, bk.y);
+            mma_884(sd, aq.z, aq.w, bk.z, bk.w);
+        }
+        float sv8[8];
+        sm70_d8_to_fv8(sd, sv8);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { sacc[0][e] = sv8[e]; sacc[1][e] = sv8[4 + e]; }
+#else
         const half_t* kr[2];
 #pragma unroll
         for (int s = 0; s < 2; ++s) {
@@ -531,7 +563,6 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
             }
             kr[s] = rows + (size_t)slot * MLA_ROW;
         }
-        float sacc[2][4];
 #pragma unroll
         for (int s = 0; s < 2; ++s)
 #pragma unroll
@@ -546,6 +577,7 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
                 mma_16816(sacc[s], alo.x, ahi.x, alo.y, ahi.y, b.x, b.y);
             }
         }
+#endif
         float sc[2][4];
         bool vk[2][4];
 #pragma unroll
@@ -605,10 +637,24 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
             const int r = g + 8 * h;
             lrun[h] = lrun[h] * corr[h] + (s_l[0][r] + s_l[1][r] + s_l[2][r] + s_l[3][r]);
         }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+        const float cc0_0 = __shfl_sync(0xffffffffu, corr[0], r0_v << 2);
+        const float cc0_1 = __shfl_sync(0xffffffffu, corr[1], r0_v << 2);
+        const float cc2_0 = __shfl_sync(0xffffffffu, corr[0], (r0_v + 2) << 2);
+        const float cc2_1 = __shfl_sync(0xffffffffu, corr[1], (r0_v + 2) << 2);
+        const float cc0 = qp_m ? cc0_1 : cc0_0;
+        const float cc2 = qp_m ? cc2_1 : cc2_0;
+#pragma unroll
+        for (int nt2 = 0; nt2 < 8; ++nt2) {
+            ocd[nt2][0] *= cc0; ocd[nt2][1] *= cc0; ocd[nt2][4] *= cc0; ocd[nt2][5] *= cc0;
+            ocd[nt2][2] *= cc2; ocd[nt2][3] *= cc2; ocd[nt2][6] *= cc2; ocd[nt2][7] *= cc2;
+        }
+#else
 #pragma unroll
         for (int nt = 0; nt < 16; ++nt)
 #pragma unroll
             for (int e = 0; e < 4; ++e) oc[nt][e] *= corr[e >> 1];
+#endif
         // ---- P @ V  (this wave: columns 128w .. 128w+127 = 16 n8 tiles; read row-major kv_cmpr into per-warp shared memory and transpose via ldmatrix.x2.trans)
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
@@ -629,6 +675,19 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
                 *reinterpret_cast<uint4*>(&sV[w][kk][c_u4 * 8]) = vx;
             }
             __syncwarp();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+#pragma unroll
+            for (int k4 = 0; k4 < 16; k4 += 4) {
+                const uint2 ap = *reinterpret_cast<const uint2*>(&sP[(qp_m * 8 + rl) * PP + ks * 16 + k4]);
+#pragma unroll
+                for (int nt2 = 0; nt2 < 8; ++nt2) {
+                    const int col = 16 * nt2 + qp_n * 8 + rl;
+                    const uint32_t b0 = h2_bits(make_half2(sV[w][k4 + 0][col], sV[w][k4 + 1][col]));
+                    const uint32_t b1 = h2_bits(make_half2(sV[w][k4 + 2][col], sV[w][k4 + 3][col]));
+                    mma_884(ocd[nt2], ap.x, ap.y, b0, b1);
+                }
+            }
+#else
             // standard m16n8k16 A fragment layout matching ldmatrix.m8n8.x2.trans B fragment: k = {2c, 2c+1} and {8+2c, 8+2c+1}
             const uint32_t a0 = *reinterpret_cast<const uint32_t*>(&sP[g * PP + ks * 16 + 2 * c]);
             const uint32_t a1 = *reinterpret_cast<const uint32_t*>(&sP[(g + 8) * PP + ks * 16 + 2 * c]);
@@ -637,14 +696,30 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
 #pragma unroll
             for (int nt = 0; nt < 16; ++nt) {
                 uint32_t b0, b1;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
                 const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&sV[w][lane & 15][8 * nt]));
                 asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n" : "=r"(b0), "=r"(b1) : "r"(addr));
+#else
+                const int col = 8 * nt + g;
+                b0 = h2_bits(make_half2(sV[w][2 * c][col], sV[w][2 * c + 1][col]));
+                b1 = h2_bits(make_half2(sV[w][8 + 2 * c][col], sV[w][8 + 2 * c + 1][col]));
+#endif
                 mma_16816(oc[nt], a0, a1, a2, a3, b0, b1);
             }
+#endif
             __syncwarp();
         }
         __syncthreads();
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+#pragma unroll
+    for (int nt2 = 0; nt2 < 8; ++nt2) {
+        float ov8[8];
+        sm70_d8_to_fv8(ocd[nt2], ov8);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { oc[2 * nt2][e] = ov8[e]; oc[2 * nt2 + 1][e] = ov8[4 + e]; }
+    }
+#endif
     // ---- write
     if (S == 1) {
 #pragma unroll
@@ -689,6 +764,7 @@ __global__ void __launch_bounds__(128) k_attend_host_kv(const __half* __restrict
     const int rt = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const int g = lane >> 2, c = lane & 3, c4 = c * 4;
+    (void)c4;
     const int NH = a.NH, RT = NH / 16, h0 = rt * 16;
     __shared__ __align__(16) half_t sQ[16 * QP];
     __shared__ __align__(16) half_t sK[HBK * QP];
@@ -953,10 +1029,23 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
     const int g4 = lane >> 2, c4 = (lane & 3) * 4;
     (void)g4;
     (void)c4;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+    const int qp = (lane >> 2) & 3;
+    const int qp_m = qp >> 1, qp_n = qp & 1;
+    const int rl = (lane & 3) + ((lane >> 4) & 1) * 4;
+    float dacc[2][2][8];
+#pragma unroll
+    for (int a = 0; a < 2; ++a)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int r = 0; r < 8; ++r) dacc[a][j][r] = 0.f;
+#else
 #pragma unroll
     for (int a = 0; a < 2; ++a)
 #pragma unroll
         for (int j = 0; j < 2; ++j) acc[a][j] = fv8_zero();
+#endif
     // software pipeline: the global loads of the next k chunk are issued before the WMMA loop of the current one (registers -> LDS after the loop's barrier), so their latency overlaps the matrix work
     constexpr int NA = MODE == 0 ? (HG_BM * 16) / 256 : (HG_BM * 8) / 256;  // A items per thread: float4 (MODE 0) or uint4 (MODE 1)
     uint4 vb[(HG_BN * 8) / 256];
@@ -1009,6 +1098,21 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
         __syncthreads();
         if (k0 + HG_BK < K) gload(k0 + HG_BK);
 #if HY4_CUDA
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+#pragma unroll
+        for (int kk = 0; kk < HG_BK; kk += 8) {
+            const uint4 a0 = *reinterpret_cast<const uint4*>(&sA[(wm * 32 + 0 + qp_m * 8 + rl) * HG_LD + kk]);
+            const uint4 a1 = *reinterpret_cast<const uint4*>(&sA[(wm * 32 + 16 + qp_m * 8 + rl) * HG_LD + kk]);
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const uint4 b = *reinterpret_cast<const uint4*>(&sB[(wn * 32 + 16 * j + qp_n * 8 + rl) * HG_LD + kk]);
+                mma_884(dacc[0][j], a0.x, a0.y, b.x, b.y);
+                mma_884(dacc[0][j], a0.z, a0.w, b.z, b.w);
+                mma_884(dacc[1][j], a1.x, a1.y, b.x, b.y);
+                mma_884(dacc[1][j], a1.z, a1.w, b.z, b.w);
+            }
+        }
+#else
 #pragma unroll
         for (int kk = 0; kk < HG_BK / 16; ++kk) {
             uint2 a_lo[2], a_hi[2];
@@ -1026,6 +1130,7 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
                     for (int a = 0; a < 2; ++a) mma_16816(&acc[a][j].v[sn * 4], a_lo[a].x, a_hi[a].x, a_lo[a].y, a_hi[a].y, b.x, b.y);
                 }
         }
+#endif
 #else
 #pragma unroll
         for (int kk = 0; kk < HG_BK / 16; ++kk) {
@@ -1041,6 +1146,12 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
 #endif
         __syncthreads();
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+#pragma unroll
+    for (int a = 0; a < 2; ++a)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) sm70_d8_to_fv8(dacc[a][j], acc[a][j].v);
+#endif
 #pragma unroll
     for (int a = 0; a < 2; ++a)
 #pragma unroll

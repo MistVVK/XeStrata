@@ -506,8 +506,8 @@ int main(int argc, char** argv) {
     hipDeviceProp_t p;
     HCK(hipGetDeviceProperties(&p, primary_gpu));
     size_t fr = 0, tot = 0;
-    HCK(hipMemGetInfo(&fr, &tot));
-    fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0);
+    gpu_mem_avail(fr, tot);
+    fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB%s\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0, p.integrated ? " (UMA)" : "");
     if (getenv("HY4_VRAM_CAP_GB")) {  // test knob: pretend the card is smaller (ballast allocation), e.g. 7.6 = an 8 GB card
         const double cap = atof(getenv("HY4_VRAM_CAP_GB")) * 1073741824.0;
         if (cap < (double)fr) {
@@ -526,7 +526,7 @@ int main(int argc, char** argv) {
         while (f >> v) tok.push_back((int32_t)v);
         if (max_ctx <= 0 && !tok.empty()) max_ctx = (int)tok.size() + gen + 16;
     }
-    chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, model);
+    chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, model, !peer_devs.empty());
     GpuModel g;
     g.primary_gpu = primary_gpu;
     g.peer_devs = peer_devs;

@@ -1,4 +1,4 @@
-// hy4_gpu.h - one include for the Hy4-Flash GPU code: HIP (gfx1151, the reference lane) or CUDA (sm_80+: sm_86 / sm_89 / sm_120).
+// hy4_gpu.h - one include for the Hy4-Flash GPU code: HIP (gfx1151, the reference lane) or CUDA (sm_70+: sm_70 / sm_75 / sm_86 / sm_89 / sm_120 / sm_121).
 //
 // The kernels are written once. This header maps the hipXxx runtime names to cudaXxx and wraps the handful of device primitives that differ:
 //   - hipLaunchKernelGGL                  -> kernel<<<>>> through hy4::gpu_launch
@@ -112,8 +112,23 @@ __device__ __forceinline__ void h2_unpack(uint32_t w, float& a, float& b) {
 __device__ __forceinline__ uint32_t byte_funnel(uint32_t hi, uint32_t lo, uint32_t ofs) { return __funnelshift_r(lo, hi, ofs * 8u); }
 typedef __half half_t;
 __device__ __forceinline__ half_t h_from_float(float f) { return __float2half(f); }
+__device__ __forceinline__ int hy4_dp4a(int a, int b, int c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, c);
+#else
+    int s = c;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int8_t xa = (int8_t)((a >> (8 * i)) & 0xFF);
+        int8_t xb = (int8_t)((b >> (8 * i)) & 0xFF);
+        s += (int)xa * (int)xb;
+    }
+    return s;
+#endif
+}
 #if HY4_MMA
-// NVIDIA: mma.sync.m16n8k16 (row.col, f16 inputs, f32 accumulate). A 16x16 output tile is two n8 tiles: fv8.v[s*4 + e], s = n8 sub-tile, e = 0..3.
+// NVIDIA: mma.sync.m16n8k16 (sm_80+), 2x mma.sync.m16n8k8 (sm_75 Turing), or warp-shuffle fallback (sm_70 Volta / < sm_75).
+// A 16x16 output tile is two n8 tiles: fv8.v[s*4 + e], s = n8 sub-tile, e = 0..3.
 // The k axis of a 16-chunk is permuted identically for A and B (lane quad c holds the 4 consecutive k 4c..4c+3, loaded as one 8-byte word), so no shuffling is needed.
 struct fv8 {
     float v[8];
@@ -128,37 +143,124 @@ __device__ __forceinline__ fv8 fv8_zero() {
 }
 __device__ __forceinline__ int acc_m(int r, int lane) { return (lane >> 2) + 8 * ((r & 3) >> 1); }
 __device__ __forceinline__ int acc_n(int r, int lane) { return (r >> 2) * 8 + 2 * (lane & 3) + (r & 1); }
+static __device__ __noinline__ void mma_16816_shfl(float& c0, float& c1, float& c2, float& c3,
+                                            uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    // sm_70 Volta / < sm_75 warp-shuffle exact fallback (identical fragment and accumulator layout;
+    // __noinline__ prevents IR blowup across multi-format WMMA kernel templates).
+    const int lane = threadIdx.x & 31;
+    const int g = lane >> 2, q = lane & 3;
+    const int n0 = 2 * q, n1 = 2 * q + 1;
+#pragma unroll 1
+    for (int kq = 0; kq < 4; ++kq) {
+        const int sa = (g << 2) | kq;
+        const int sb0 = (n0 << 2) | kq;
+        const int sb1 = (n1 << 2) | kq;
+        const uint32_t ar00 = __shfl_sync(0xffffffffu, a0, sa);
+        const uint32_t ar10 = __shfl_sync(0xffffffffu, a1, sa);
+        const uint32_t ar01 = __shfl_sync(0xffffffffu, a2, sa);
+        const uint32_t ar11 = __shfl_sync(0xffffffffu, a3, sa);
+        const uint32_t bc00 = __shfl_sync(0xffffffffu, b0, sb0);
+        const uint32_t bc01 = __shfl_sync(0xffffffffu, b1, sb0);
+        const uint32_t bc10 = __shfl_sync(0xffffffffu, b0, sb1);
+        const uint32_t bc11 = __shfl_sync(0xffffffffu, b1, sb1);
+        c0 = h2_dot_f32(ar00, bc00, h2_dot_f32(ar01, bc01, c0));
+        c1 = h2_dot_f32(ar00, bc10, h2_dot_f32(ar01, bc11, c1));
+        c2 = h2_dot_f32(ar10, bc00, h2_dot_f32(ar11, bc01, c2));
+        c3 = h2_dot_f32(ar10, bc10, h2_dot_f32(ar11, bc11, c3));
+    }
+}
+// Volta sm_70 native HMMA.884: each quad-pair computes 8x8x4 (4 quad-pairs per warp = 1024 FMAs/inst = full 16x16x4 tile).
+__device__ __forceinline__ void mma_884(float (&d)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#else
+    (void)d; (void)a0; (void)a1; (void)b0; (void)b1;
+#endif
+}
+// Convert Volta HMMA.884 16x16 quad-pair accumulator d[8] (qp = (lane>>2)&3: qp_m=qp>>1, qp_n=qp&1) to standard fv8 layout ONCE after the K-loop.
+__device__ __forceinline__ void sm70_d8_to_fv8(const float (&d)[8], float (&out)[8]) {
+    const int lane = threadIdx.x & 31;
+    const int g = lane >> 2, q = lane & 3;
+    const bool r2 = (g & 2) != 0, c4 = (q & 2) != 0;
+    const int base = ((g >> 2) << 4) | ((q & 1) << 1) | (g & 1);
+    const int qps[4] = {0, 2, 1, 3};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int src = base | (qps[k] << 2);
+        const float t0 = __shfl_sync(0xffffffffu, d[0], src), t1 = __shfl_sync(0xffffffffu, d[1], src);
+        const float t2 = __shfl_sync(0xffffffffu, d[2], src), t3 = __shfl_sync(0xffffffffu, d[3], src);
+        const float t4 = __shfl_sync(0xffffffffu, d[4], src), t5 = __shfl_sync(0xffffffffu, d[5], src);
+        const float t6 = __shfl_sync(0xffffffffu, d[6], src), t7 = __shfl_sync(0xffffffffu, d[7], src);
+        const float a0 = r2 ? t2 : t0, a1 = r2 ? t3 : t1;
+        const float b0 = r2 ? t6 : t4, b1 = r2 ? t7 : t5;
+        out[2 * k]     = c4 ? b0 : a0;
+        out[2 * k + 1] = c4 ? b1 : a1;
+    }
+}
+static __device__ __noinline__ void mma_16816_sm70(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    // Map m16n8k16 fragment layout onto 2x Volta HMMA.884 instructions using all 4 quad-pairs (0 shared memory):
+    //   qp = (lane >> 2) & 3: qp 0,1 compute M[0..7] (k_half 0,1); qp 2,3 compute M[8..15] (k_half 0,1).
+    //   rl = (lane & 3) + ((lane >> 4) & 1) * 4: row/col index 0..7 within each quad-pair.
+    const int lane = threadIdx.x & 31;
+    const int qp = (lane >> 2) & 3;
+    const int rl = (lane & 3) + ((lane >> 4) & 1) * 4;
+    const int s0 = (rl << 2) | ((qp & 1) << 1);
+    const int s1 = s0 + 1;
+    const uint32_t a0_0 = __shfl_sync(0xffffffffu, a0, s0), a1_0 = __shfl_sync(0xffffffffu, a1, s0);
+    const uint32_t a0_1 = __shfl_sync(0xffffffffu, a0, s1), a1_1 = __shfl_sync(0xffffffffu, a1, s1);
+    const uint32_t a2_0 = __shfl_sync(0xffffffffu, a2, s0), a3_0 = __shfl_sync(0xffffffffu, a3, s0);
+    const uint32_t a2_1 = __shfl_sync(0xffffffffu, a2, s1), a3_1 = __shfl_sync(0xffffffffu, a3, s1);
+    const uint32_t ra0 = (qp & 2) ? a1_0 : a0_0;
+    const uint32_t ra1 = (qp & 2) ? a1_1 : a0_1;
+    const uint32_t ra2 = (qp & 2) ? a3_0 : a2_0;
+    const uint32_t ra3 = (qp & 2) ? a3_1 : a2_1;
+    const uint32_t rb0 = __shfl_sync(0xffffffffu, b0, s0);
+    const uint32_t rb1 = __shfl_sync(0xffffffffu, b0, s1);
+    const uint32_t rb2 = __shfl_sync(0xffffffffu, b1, s0);
+    const uint32_t rb3 = __shfl_sync(0xffffffffu, b1, s1);
+    float d[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    mma_884(d, ra0, ra1, rb0, rb1);
+    mma_884(d, ra2, ra3, rb2, rb3);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) d[i] += __shfl_xor_sync(0xffffffffu, d[i], 4);
+    // qp 0,2 publish rows r0 (d[0,1,4,5]); qp 1,3 publish rows r0+2 (d[2,3,6,7])
+    const float x0 = (qp & 1) ? d[2] : d[0];
+    const float x1 = (qp & 1) ? d[3] : d[1];
+    const float y0 = (qp & 1) ? d[6] : d[4];
+    const float y1 = (qp & 1) ? d[7] : d[5];
+    const int g = lane >> 2, q = lane & 3;
+    const int src_top = ((g >> 2) << 4) | (((g >> 1) & 1) << 2) | ((q & 1) << 1) | (g & 1);
+    const int src_bot = src_top | 8;
+    const float t_x0 = __shfl_sync(0xffffffffu, x0, src_top), t_x1 = __shfl_sync(0xffffffffu, x1, src_top);
+    const float t_y0 = __shfl_sync(0xffffffffu, y0, src_top), t_y1 = __shfl_sync(0xffffffffu, y1, src_top);
+    const float b_x0 = __shfl_sync(0xffffffffu, x0, src_bot), b_x1 = __shfl_sync(0xffffffffu, x1, src_bot);
+    const float b_y0 = __shfl_sync(0xffffffffu, y0, src_bot), b_y1 = __shfl_sync(0xffffffffu, y1, src_bot);
+    c[0] += (q & 2) ? t_y0 : t_x0;
+    c[1] += (q & 2) ? t_y1 : t_x1;
+    c[2] += (q & 2) ? b_y0 : b_x0;
+    c[3] += (q & 2) ? b_y1 : b_x1;
+}
 __device__ __forceinline__ void mma_16816(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(HY4_FORCE_SM75_MMA) && !defined(HY4_FORCE_MMA_SHFL)
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-#elif __CUDA_ARCH__ >= 750
-    // Turing sm_75: two m16n8k8 instructions over the exact same permuted k layout ({a0,a1,b0} and {a2,a3,b1})
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && !defined(HY4_FORCE_MMA_SHFL)
+    // Turing sm_75: identical lane/accumulator layout to m16n8k16; k-split into two k=8 Tensor Core ops:
+    //   call 1 sums k in {4c, 4c+1} across c=0..3; call 2 sums k in {4c+2, 4c+3} across c=0..3.
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(b0));
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a2), "r"(a3), "r"(b1));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+    mma_16816_sm70(c, a0, a1, a2, a3, b0, b1);
 #else
-    // Pre-Turing (sm_60/sm_70): software fallback so fat binaries compile cleanly; runtime uses GEMV/simple paths
-    const int lane = threadIdx.x & 31, g = lane >> 2, l = lane & 3;
-    uint32_t ba[4] = {a0, a1, a2, a3}, bb[2] = {b0, b1};
-#pragma unroll
-    for (int col = 0; col < 2; ++col) {
-        const int n_idx = 2 * l + col;
-        for (int kq = 0; kq < 4; ++kq) {
-            const uint32_t bv0 = __shfl_sync(0xffffffffu, bb[0], n_idx * 4 + kq);
-            const uint32_t bv1 = __shfl_sync(0xffffffffu, bb[1], n_idx * 4 + kq);
-            const uint32_t av0 = __shfl_sync(0xffffffffu, ba[0], g * 4 + kq);
-            const uint32_t av1 = __shfl_sync(0xffffffffu, ba[1], g * 4 + kq);
-            const uint32_t av2 = __shfl_sync(0xffffffffu, ba[2], g * 4 + kq);
-            const uint32_t av3 = __shfl_sync(0xffffffffu, ba[3], g * 4 + kq);
-            c[col] = h2_dot_f32(av0, bv0, h2_dot_f32(av2, bv1, c[col]));
-            c[2 + col] = h2_dot_f32(av1, bv0, h2_dot_f32(av3, bv1, c[2 + col]));
-        }
-    }
+    mma_16816_shfl(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b0, b1);
 #endif
 }
 // Native INT8 Tensor Core m16n8k32 (sm_80+: Ampere/Ada/Hopper/Blackwell). A: s8 [16x32] row-major, B: s8 [8x32] row-major (col-major 32x8), C: s32 [16x8].

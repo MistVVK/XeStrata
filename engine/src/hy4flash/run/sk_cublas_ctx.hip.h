@@ -62,7 +62,7 @@ struct CublasPfState {
             handle = nullptr;
             return false;
         }
-        (void)cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+        (void)cublasSetMathMode(handle, dp.major == 7 ? CUBLAS_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
         if (cudaMalloc((void**)&base, want_bytes) != cudaSuccess) {
             (void)cudaGetLastError();
             cublasDestroy(handle);

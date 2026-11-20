@@ -1,5 +1,5 @@
-// mla_test.hip.cpp - unit tests + timings for mla_attn.hip.cpp (Hy4-Flash MLA attention, gfx1151)
-// usage: mla_test.exe [--model <Hy4-Flash-SQ-64.strata>] [--perf] [--noref] [--layers 5,2]
+// mla_test.hip.cpp - unit tests + timings for mla_attn.hip.cpp (Hy4-Flash MLA attention, HIP / CUDA)
+// usage: mla_test [--model <Hy4-Flash-SQ-64.strata>] [--perf] [--noreal] [--layers 5,2]
 #include "hy4_gpu.h"
 
 #include <algorithm>

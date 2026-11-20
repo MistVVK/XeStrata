@@ -23,6 +23,8 @@ static inline float _cvtsh_ss(unsigned short h) {
 }
 #endif
 #define HY4_RELAX() _mm_pause()
+#elif defined(__aarch64__)
+#define HY4_RELAX() __asm__ __volatile__("yield" ::: "memory")
 #else
 #define HY4_RELAX() std::this_thread::yield()
 #endif
@@ -50,9 +52,22 @@ static inline float _cvtsh_ss(unsigned short h) {
 // AVX-512. Compile-time: -DHY4_NO_FAST drops both fast kernels (library only; non-x86 targets get that automatically).
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(HY4_NO_FAST)
 #define HY4_KERNELS 1
+#define HY4_NEON_KERNELS 0
+#elif defined(__aarch64__) && !defined(HY4_NO_FAST)
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1 << 20)
+#endif
+#endif
+#define HY4_KERNELS 0
+#define HY4_NEON_KERNELS 1
 #else
 #define HY4_KERNELS 0
+#define HY4_NEON_KERNELS 0
 #endif
+#define HY4_ANY_FAST (HY4_KERNELS || HY4_NEON_KERNELS)
 #if defined(__clang__)
 #define HY4_PUSH_AVX512 _Pragma("clang attribute push (__attribute__((target(\"avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,f16c,fma,avx2\"))), apply_to=function)")
 #define HY4_PUSH_AVX2 _Pragma("clang attribute push (__attribute__((target(\"avx2,fma,f16c\"))), apply_to=function)")
@@ -65,6 +80,21 @@ static inline float _cvtsh_ss(unsigned short h) {
 #define HY4_PUSH_AVX512
 #define HY4_PUSH_AVX2
 #define HY4_POP_TARGET
+#endif
+#if HY4_NEON_KERNELS && !defined(__ARM_FEATURE_DOTPROD)
+#if defined(__clang__)
+#define HY4_PUSH_NEON_DP _Pragma("clang attribute push (__attribute__((target(\"+dotprod\"))), apply_to=function)")
+#define HY4_POP_NEON _Pragma("clang attribute pop")
+#elif defined(__GNUC__)
+#define HY4_PUSH_NEON_DP _Pragma("GCC push_options") _Pragma("GCC target(\"+dotprod\")")
+#define HY4_POP_NEON _Pragma("GCC pop_options")
+#else
+#define HY4_PUSH_NEON_DP
+#define HY4_POP_NEON
+#endif
+#else
+#define HY4_PUSH_NEON_DP
+#define HY4_POP_NEON
 #endif
 #if HY4_KERNELS && !defined(_MSC_VER)
 #include <cpuid.h>
@@ -782,7 +812,252 @@ HY4_POP_TARGET
 }  // namespace k2
 #endif  // HY4_KERNELS (k2)
 
-static const char* kern_name(int k) { return k == 2 ? "fast(avx512-vbmi)" : (k == 1 ? "fast(avx2)" : "lib"); }
+#if HY4_NEON_KERNELS
+namespace kneon {
+// ==================================================================================================== ARM64 NEON dotprod kernel
+// 128-bit NEON vdotq_s32 (__ARM_FEATURE_DOTPROD) kernel for S1.25 and S2..S6.
+// Layout in ActRow:
+//   xj[sb][j][L*16 + k] = qs[4*k + j]  (4-plane de-interleaved via vld4q_s8; L = 0..3 sub-group, k = 0..15)
+//   xd[sb][L]           = d of block sb*4+L
+//   xs4[sb][L]          = s of block sb*4+L (or s_a + s_b in hi mode; 1 float lane per sub-group, no x4 replication)
+// All unpacked weight codes are in 0..63 (fit in signed int8), so vdotq_s32(acc, P[j], xj) is exact.
+struct NeonConsts {
+    alignas(16) uint8_t cb125[4][32];  // S1.25 codebook column c (+2 bias -> 0..4), 32 entries for vqtbl2q_u8
+    alignas(16) uint8_t hmask[4][16];  // bit test mask for S3/S5 high bits: even k -> bit j, odd k -> bit 4+j
+    NeonConsts() {
+        static const int8_t cbk[32][4] = {
+            {-1, -1, -1, -1}, {-1, -1, -1, 1}, {-1, -1, 1, -1}, {-1, -1, 1, 1}, {-1, 1, -1, -1}, {-1, 1, -1, 1}, {-1, 1, 1, -1}, {-1, 1, 1, 1},
+            {1, -1, -1, -1},  {1, -1, -1, 1},  {1, -1, 1, -1},  {1, -1, 1, 1},  {1, 1, -1, -1},  {1, 1, -1, 1},  {1, 1, 1, -1},  {1, 1, 1, 1},
+            {2, 0, 0, 0},     {-2, 0, 0, 0},   {0, 2, 0, 0},    {0, -2, 0, 0},   {0, 0, 2, 0},    {0, 0, -2, 0},   {0, 0, 0, 2},    {0, 0, 0, -2},
+            {0, 0, 0, 0},     {2, 2, 0, 0},    {-2, -2, 0, 0},  {0, 0, 2, 2},    {0, 0, -2, -2},  {2, -2, 0, 0},   {0, 0, 2, -2},   {2, 0, 2, 0}};
+        for (int c = 0; c < 4; ++c)
+            for (int e = 0; e < 32; ++e) cb125[c][e] = (uint8_t)(cbk[e][c] + 2);
+        for (int j = 0; j < 4; ++j)
+            for (int k = 0; k < 16; ++k) hmask[j][k] = (uint8_t)(1u << ((k & 1) ? (4 + j) : j));
+    }
+};
+static const NeonConsts knc;
+
+template <int FMT>
+struct FmtInfo;
+template <> struct FmtInfo<0> { static constexpr int SB = 48;  static constexpr float HALF = 2.0f; };
+template <> struct FmtInfo<2> { static constexpr int SB = 70;  static constexpr float HALF = 1.5f; };
+template <> struct FmtInfo<3> { static constexpr int SB = 102; static constexpr float HALF = 3.5f; };
+template <> struct FmtInfo<4> { static constexpr int SB = 134; static constexpr float HALF = 7.5f; };
+template <> struct FmtInfo<5> { static constexpr int SB = 166; static constexpr float HALF = 15.5f; };
+template <> struct FmtInfo<6> { static constexpr int SB = 198; static constexpr float HALF = 31.5f; };
+
+HY4_PUSH_NEON_DP
+
+static inline void store_block(ActRow* a, int b, const BlockQ8_1_G64& blk) {
+    const int sb = b >> 2, L = b & 3;
+    const int8x16x4_t v = vld4q_s8(blk.qs);
+    vst1q_s8(&a->xj[sb][0][L * 16], v.val[0]);
+    vst1q_s8(&a->xj[sb][1][L * 16], v.val[1]);
+    vst1q_s8(&a->xj[sb][2][L * 16], v.val[2]);
+    vst1q_s8(&a->xj[sb][3][L * 16], v.val[3]);
+    a->xd[sb][L] = blk.d;
+    a->xs4[sb][L] = blk.s;
+}
+
+static inline void store_block_hi(ActRow* a, int b, const BlockQ8_1_G64& blk, const BlockQ8_1_G64& blk2) {
+    const int sb = b >> 2, L = b & 3;
+    const int8x16x4_t v = vld4q_s8(blk.qs);
+    const int8x16x4_t v2 = vld4q_s8(blk2.qs);
+    vst1q_s8(&a->xj[sb][0][L * 16], v.val[0]);
+    vst1q_s8(&a->xj[sb][1][L * 16], v.val[1]);
+    vst1q_s8(&a->xj[sb][2][L * 16], v.val[2]);
+    vst1q_s8(&a->xj[sb][3][L * 16], v.val[3]);
+    vst1q_s8(&a->xjb[sb][0][L * 16], v2.val[0]);
+    vst1q_s8(&a->xjb[sb][1][L * 16], v2.val[1]);
+    vst1q_s8(&a->xjb[sb][2][L * 16], v2.val[2]);
+    vst1q_s8(&a->xjb[sb][3][L * 16], v2.val[3]);
+    a->xd[sb][L] = blk.d;
+    a->xdb[sb][L] = blk2.d;
+    a->xs4[sb][L] = blk.s + blk2.s;
+}
+
+template <int FMT>
+static inline void unpack_group(const uint8_t* pl, int L, int8x16_t (&P)[4]) {
+    if constexpr (FMT == 0) {
+        alignas(16) uint8_t idx_arr[16];
+        for (int g = 0; g < 2; ++g) {
+            const uint8_t* p = pl + L * 10 + g * 5;
+            const uint64_t b40 = (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32);
+            for (int i = 0; i < 8; ++i) idx_arr[g * 8 + i] = (uint8_t)((b40 >> (5 * i)) & 31u);
+        }
+        const uint8x16_t vidx = vld1q_u8(idx_arr);
+        for (int j = 0; j < 4; ++j) {
+            uint8x16x2_t tab;
+            tab.val[0] = vld1q_u8(knc.cb125[j]);
+            tab.val[1] = vld1q_u8(knc.cb125[j] + 16);
+            P[j] = vreinterpretq_s8_u8(vqtbl2q_u8(tab, vidx));
+        }
+    } else if constexpr (FMT == 2 || FMT == 3) {
+        const uint8x16_t w = vld1q_u8(pl + L * 16);
+        const uint8x16_t m3 = vdupq_n_u8(3);
+        uint8x16_t p0 = vandq_u8(w, m3);
+        uint8x16_t p1 = vandq_u8(vshrq_n_u8(w, 2), m3);
+        uint8x16_t p2 = vandq_u8(vshrq_n_u8(w, 4), m3);
+        uint8x16_t p3 = vshrq_n_u8(w, 6);
+        if constexpr (FMT == 3) {
+            const uint8x8_t h8 = vld1_u8(pl + 64 + L * 8);
+            const uint8x16_t hd = vcombine_u8(vzip1_u8(h8, h8), vzip2_u8(h8, h8));
+            const uint8x16_t m4 = vdupq_n_u8(4);
+            p0 = vorrq_u8(p0, vandq_u8(vtstq_u8(hd, vld1q_u8(knc.hmask[0])), m4));
+            p1 = vorrq_u8(p1, vandq_u8(vtstq_u8(hd, vld1q_u8(knc.hmask[1])), m4));
+            p2 = vorrq_u8(p2, vandq_u8(vtstq_u8(hd, vld1q_u8(knc.hmask[2])), m4));
+            p3 = vorrq_u8(p3, vandq_u8(vtstq_u8(hd, vld1q_u8(knc.hmask[3])), m4));
+        }
+        P[0] = vreinterpretq_s8_u8(p0);
+        P[1] = vreinterpretq_s8_u8(p1);
+        P[2] = vreinterpretq_s8_u8(p2);
+        P[3] = vreinterpretq_s8_u8(p3);
+    } else {
+        const uint8x16x2_t w = vld2q_u8(pl + L * 32);
+        const uint8x16_t m15 = vdupq_n_u8(15);
+        uint8x16_t p0 = vandq_u8(w.val[0], m15);
+        uint8x16_t p1 = vshrq_n_u8(w.val[0], 4);
+        uint8x16_t p2 = vandq_u8(w.val[1], m15);
+        uint8x16_t p3 = vshrq_n_u8(w.val[1], 4);
+        if constexpr (FMT == 5) {
+            const uint8x8_t h8 = vld1_u8(pl + 128 + L * 8);
+            const uint8x16_t hd = vcombine_u8(vzip1_u8(h8, h8), vzip2_u8(h8, h8));
+            const uint8x16_t m16 = vdupq_n_u8(16);
+            p0 = vorrq_u8(p0, vandq_u8(vtstq_u8(hd, vld1q_u8(knc.hmask[0])), m16));
+            p1 = vorrq_u8(p1, vandq_u8(vtstq_u8(hd, vld1q_u8(knc.hmask[1])), m16));
+            p2 = vorrq_u8(p2, vandq_u8(vtstq_u8(hd, vld1q_u8(knc.hmask[2])), m16));
+            p3 = vorrq_u8(p3, vandq_u8(vtstq_u8(hd, vld1q_u8(knc.hmask[3])), m16));
+        } else if constexpr (FMT == 6) {
+            const uint8x16_t w6 = vld1q_u8(pl + 128 + L * 16);
+            const uint8x16_t m30 = vdupq_n_u8(0x30);
+            p0 = vorrq_u8(p0, vandq_u8(vshlq_n_u8(w6, 4), m30));
+            p1 = vorrq_u8(p1, vandq_u8(vshlq_n_u8(w6, 2), m30));
+            p2 = vorrq_u8(p2, vandq_u8(w6, m30));
+            p3 = vorrq_u8(p3, vandq_u8(vshrq_n_u8(w6, 2), m30));
+        }
+        P[0] = vreinterpretq_s8_u8(p0);
+        P[1] = vreinterpretq_s8_u8(p1);
+        P[2] = vreinterpretq_s8_u8(p2);
+        P[3] = vreinterpretq_s8_u8(p3);
+    }
+}
+
+template <int FMT, int M, bool HI>
+static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* out) {
+    constexpr int SB = FmtInfo<FMT>::SB;
+    float32x4_t facc[M];
+    for (int t = 0; t < M; ++t) facc[t] = vdupq_n_f32(0.0f);
+    const float32x4_t halfv = vdupq_n_f32(FmtInfo<FMT>::HALF);
+    for (int s = 0; s < 6; ++s) {
+        const uint8_t* blk = row + (size_t)s * SB;
+        uint16_t dh;
+        std::memcpy(&dh, blk, 2);
+        const float D = fp16_to_fp32(dh);
+        alignas(16) float eff[4];
+        for (int g = 0; g < 4; ++g) eff[g] = D * ((float)blk[2 + g] / 255.0f);
+        if constexpr (FMT == 0) {
+            const uint8_t f0 = blk[46], f1 = blk[47];
+            eff[0] *= 0.5f + (float)(f0 & 15u) / 15.0f;
+            eff[1] *= 0.5f + (float)((f0 >> 4) & 15u) / 15.0f;
+            eff[2] *= 0.5f + (float)(f1 & 15u) / 15.0f;
+            eff[3] *= 0.5f + (float)((f1 >> 4) & 15u) / 15.0f;
+        }
+        const float32x4_t effv = vld1q_f32(eff);
+        const float32x4_t effh = vmulq_f32(effv, halfv);
+        int32x4_t acc_a[M][4];
+        int32x4_t acc_b[HI ? M : 1][4];
+        for (int L = 0; L < 4; ++L) {
+            int8x16_t P[4];
+            unpack_group<FMT>(blk + 6, L, P);
+            for (int t = 0; t < M; ++t) {
+                const ActRow* a = X[t];
+                int32x4_t acc = vdupq_n_s32(0);
+                acc = vdotq_s32(acc, P[0], vld1q_s8(&a->xj[s][0][L * 16]));
+                acc = vdotq_s32(acc, P[1], vld1q_s8(&a->xj[s][1][L * 16]));
+                acc = vdotq_s32(acc, P[2], vld1q_s8(&a->xj[s][2][L * 16]));
+                acc = vdotq_s32(acc, P[3], vld1q_s8(&a->xj[s][3][L * 16]));
+                acc_a[t][L] = acc;
+                if constexpr (HI) {
+                    int32x4_t accb = vdupq_n_s32(0);
+                    accb = vdotq_s32(accb, P[0], vld1q_s8(&a->xjb[s][0][L * 16]));
+                    accb = vdotq_s32(accb, P[1], vld1q_s8(&a->xjb[s][1][L * 16]));
+                    accb = vdotq_s32(accb, P[2], vld1q_s8(&a->xjb[s][2][L * 16]));
+                    accb = vdotq_s32(accb, P[3], vld1q_s8(&a->xjb[s][3][L * 16]));
+                    acc_b[t][L] = accb;
+                }
+            }
+        }
+        for (int t = 0; t < M; ++t) {
+            const ActRow* a = X[t];
+            const int32x4_t sum4 = vpaddq_s32(vpaddq_s32(acc_a[t][0], acc_a[t][1]), vpaddq_s32(acc_a[t][2], acc_a[t][3]));
+            facc[t] = vfmaq_f32(facc[t], vcvtq_f32_s32(sum4), vmulq_f32(effv, vld1q_f32(a->xd[s])));
+            if constexpr (HI) {
+                const int32x4_t sum4b = vpaddq_s32(vpaddq_s32(acc_b[t][0], acc_b[t][1]), vpaddq_s32(acc_b[t][2], acc_b[t][3]));
+                facc[t] = vfmaq_f32(facc[t], vcvtq_f32_s32(sum4b), vmulq_f32(effv, vld1q_f32(a->xdb[s])));
+            }
+            facc[t] = vfmsq_f32(facc[t], effh, vld1q_f32(a->xs4[s]));
+        }
+    }
+    for (int t = 0; t < M; ++t) out[t] = vaddvq_f32(facc[t]);
+}
+
+template <int FMT, int M, bool HI>
+static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* out) {
+    constexpr size_t RBYTES = 6 * (size_t)FmtInfo<FMT>::SB;
+    const int pf = g_pf_rows;
+    for (int r = 0; r < nrows; ++r) {
+        if (pf) {
+            const char* pp = (const char*)(W + (size_t)(r + pf) * RBYTES);
+            for (size_t o = 0; o < RBYTES; o += 64) __builtin_prefetch(pp + o, 0, 3);
+        }
+        float o[M];
+        row_dot<FMT, M, HI>(W + r * RBYTES, X, o);
+        for (int i = 0; i < M; ++i) out[(size_t)i * nrows + r] = o[i];
+    }
+}
+
+template <int FMT, bool HI>
+static void rows_fmt(const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out) {
+    for (int g0 = 0; g0 < m; g0 += 4) {
+        const int mg = std::min(4, m - g0);
+        const ActRow* const* x = X + g0;
+        float* o = out + (size_t)g0 * nrows;
+        switch (mg) {
+            case 1: rows_m<FMT, 1, HI>(W, nrows, x, o); break;
+            case 2: rows_m<FMT, 2, HI>(W, nrows, x, o); break;
+            case 3: rows_m<FMT, 3, HI>(W, nrows, x, o); break;
+            default: rows_m<FMT, 4, HI>(W, nrows, x, o); break;
+        }
+    }
+}
+
+static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi = false) {
+    if (hi) {
+        switch (code) {
+            case 0: rows_fmt<0, true>(W, nrows, X, m, out); break;
+            case 2: rows_fmt<2, true>(W, nrows, X, m, out); break;
+            case 3: rows_fmt<3, true>(W, nrows, X, m, out); break;
+            case 4: rows_fmt<4, true>(W, nrows, X, m, out); break;
+            case 5: rows_fmt<5, true>(W, nrows, X, m, out); break;
+            default: rows_fmt<6, true>(W, nrows, X, m, out); break;
+        }
+        return;
+    }
+    switch (code) {
+        case 0: rows_fmt<0, false>(W, nrows, X, m, out); break;
+        case 2: rows_fmt<2, false>(W, nrows, X, m, out); break;
+        case 3: rows_fmt<3, false>(W, nrows, X, m, out); break;
+        case 4: rows_fmt<4, false>(W, nrows, X, m, out); break;
+        case 5: rows_fmt<5, false>(W, nrows, X, m, out); break;
+        default: rows_fmt<6, false>(W, nrows, X, m, out); break;
+    }
+}
+HY4_POP_NEON
+}  // namespace kneon
+#endif  // HY4_NEON_KERNELS
+
+static const char* kern_name(int k) { return k == 3 ? "fast(neon-dotprod)" : (k == 2 ? "fast(avx512-vbmi)" : (k == 1 ? "fast(avx2)" : "lib")); }
 
 #if HY4_KERNELS
 // ---- CPU probe (same checks as the main engine's quant/isa.cpp: CPUID + XGETBV for OS support) and per-call dispatch ------------
@@ -842,6 +1117,27 @@ static inline void kern_store_hi(int k, ActRow* a, int b, const BlockQ8_1_G64& b
 static void kern_gemm(int k, int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi) {
     if (k == 2) k512::rows_gemm(code, W, nrows, X, m, out, hi);
     else k2::rows_gemm(code, W, nrows, X, m, out, hi);
+}
+#elif HY4_NEON_KERNELS
+struct KernCaps {
+    bool neon_dp = false;
+};
+static KernCaps probe_kernel_caps() {
+    KernCaps c;
+#if defined(__linux__)
+    c.neon_dp = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#elif defined(__ARM_FEATURE_DOTPROD) || defined(__APPLE__)
+    c.neon_dp = true;
+#endif
+    if (const char* f = std::getenv("STRATA_FORCE_ISA")) {
+        if (!std::strcmp(f, "scalar") || !std::strcmp(f, "lib")) c.neon_dp = false;
+    }
+    return c;
+}
+static inline void kern_store(int, ActRow* a, int b, const BlockQ8_1_G64& blk) { kneon::store_block(a, b, blk); }
+static inline void kern_store_hi(int, ActRow* a, int b, const BlockQ8_1_G64& blk, const BlockQ8_1_G64& blk2) { kneon::store_block_hi(a, b, blk, blk2); }
+static void kern_gemm(int, int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi) {
+    kneon::rows_gemm(code, W, nrows, X, m, out, hi);
 }
 #endif
 
@@ -1319,6 +1615,27 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
                 kern = 0;
             }
     }
+#elif HY4_NEON_KERNELS
+    {
+        const KernCaps kcaps = probe_kernel_caps();
+        const int best = kcaps.neon_dp ? 3 : 0;
+        kern = best;
+        if (const char* k = std::getenv("STRATA_CPUEXP_KERNEL")) {
+            int want = -1;
+            if (!std::strcmp(k, "lib")) want = 0;
+            else if (!std::strcmp(k, "neon")) want = 3;
+            else std::fprintf(stderr, "[cpuexp] STRATA_CPUEXP_KERNEL=%s is not neon or lib; ignored\n", k);
+            if (want >= 0) {
+                if (want == 0 || kcaps.neon_dp) kern = want;
+                else std::fprintf(stderr, "[cpuexp] STRATA_CPUEXP_KERNEL=%s is not supported by this CPU/OS; using %s\n", k, kern_name(best));
+            }
+        }
+        for (const Rec& r : recs)
+            if (kern && r.body && !(r.gu <= 6 && r.gu != 1 && r.dn <= 6 && r.dn != 1)) {
+                std::fprintf(stderr, "[cpuexp] S1.5/S8/other expert code resident: using the library kernel for all experts\n");
+                kern = 0;
+            }
+    }
 #endif
     fast = kern != 0;
     hi = false;
@@ -1612,7 +1929,7 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
     const int mgmax = fast ? MGF : MG;
     for (int g0 = 0; g0 < m; g0 += mgmax) {
         const int mg = std::min(mgmax, m - g0);
-#if HY4_KERNELS
+#if HY4_ANY_FAST
         if (fast) {
             const ActRow* xp[MGF];
             for (int i = 0; i < mg; ++i) xp[i] = tokA.p + (size_t)pair_tok[p0 + g0 + i];
@@ -1655,7 +1972,7 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
                 const float uc = std::max(-SWIGLU_LIMIT, std::min(u[d], SWIGLU_LIMIT));
                 h[d] = (sc * uc) / sq[d];
             }
-#if HY4_KERNELS
+#if HY4_ANY_FAST
             if (fast) {
                 BlockQ8_1_G64 blk;
                 quantize_q8_1_g64(h, &blk, 64);
@@ -1687,7 +2004,7 @@ void CpuExperts::Impl::dn_unit(int tid, const Job& J, int a, int c) {
     const int mgmax = fast ? MGF : MG;
     for (int g0 = 0; g0 < m; g0 += mgmax) {
         const int mg = std::min(mgmax, m - g0);
-#if HY4_KERNELS
+#if HY4_ANY_FAST
         if (fast) {
             const ActRow* xp[MGF];
             for (int i = 0; i < mg; ++i) xp[i] = h2A.p + (size_t)(p0 + g0 + i);
@@ -1873,7 +2190,7 @@ void CpuExperts::Impl::run_job(int tid) {
             if (u >= Tc * 3) break;
             const int t = u / 3, part = u % 3;
             if (!tok_used[t]) continue;
-#if HY4_KERNELS
+#if HY4_ANY_FAST
             if (fast) {
                 alignas(64) BlockQ8_1_G64 blk[8];
                 const float* zs = J.z + (size_t)(t0 + t) * D + part * 512;
@@ -2149,14 +2466,23 @@ static bool selftest_lib_s15(std::string& report) {
 // Random-weight self test of the fast row kernel for every format S1.25, S2..S6 (the real SQ-64 file only contains S2/S3/S4):
 // random payload bytes / D / u, real quantized activations; reference = dequant_sk_row (double) . dequantized Q8_1 activations.
 bool CpuExperts::selftest_kernels(std::string& report) {
-#if HY4_KERNELS
+#if HY4_ANY_FAST
     uint64_t s = 0x1234567ull;
     auto rnd = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
     bool ok = true;
     char buf[200];
     const KernCaps kcs = probe_kernel_caps();
-    for (int kk = 1; kk <= 2; ++kk) {
+#if HY4_KERNELS
+    const int klist[] = {1, 2};
+#else
+    const int klist[] = {3};
+#endif
+    for (int kk : klist) {
+#if HY4_KERNELS
     if ((kk == 1 && !kcs.avx2) || (kk == 2 && !kcs.avx512)) { report += std::string(kern_name(kk)) + ": not supported by this CPU, skipped\n"; continue; }
+#else
+    if (!kcs.neon_dp) { report += std::string(kern_name(kk)) + ": not supported by this CPU, skipped\n"; continue; }
+#endif
     for (int code : {0, 2, 3, 4, 5, 6}) {
         const size_t sb = superblock_bytes((SkCode)code), rb = 6 * sb;
         const int nrows = 5;
