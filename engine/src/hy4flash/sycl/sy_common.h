@@ -125,16 +125,39 @@ inline const DevCaps& dev_caps() {
         d.has_graph = dev.has(sycl::aspect::ext_oneapi_limited_graph) || dev.has(sycl::aspect::ext_oneapi_graph);
 #endif
         // Alchemist (DG2 / Arc A-series) supports SG=8 XMX (8x8x16 fp16, 8x8x32 int8);
-        // Battlemage Xe2 (Arc B-series / Lunar Lake) / PVC supports SG=16 XMX (8x16x16 fp16, 8x16x32 int8) and has no SG=8.
+        // Battlemage Xe2 (Arc B570/B580 bmg_g21, Arc Pro B60/B70 bmg_g31, Lunar Lake lnl_m) / PVC supports SG=16 XMX (8x16x16 fp16) and has no SG=8.
         // Older/non-XMX Intel iGPUs fall back to SG=32 SIMT tiled GEMM when HY4S_NO_XMX=1 or when joint_matrix is unsupported.
         const bool no_xmx = std::getenv("HY4S_NO_XMX") && std::getenv("HY4S_NO_XMX")[0] == '1';
         if (!no_xmx) {
             bool is_arc_or_xmx = (d.name.find("Arc") != std::string::npos || d.name.find("Data Center") != std::string::npos ||
                                   d.name.find("A7") != std::string::npos || d.name.find("A5") != std::string::npos ||
                                   d.name.find("A3") != std::string::npos || d.name.find("B5") != std::string::npos ||
+                                  d.name.find("B6") != std::string::npos || d.name.find("B7") != std::string::npos ||
+                                  d.name.find("Pro B") != std::string::npos ||
                                   d.name.find("140V") != std::string::npos || d.name.find("130V") != std::string::npos ||
                                   d.name.find("Battlemage") != std::string::npos || d.name.find("Alchemist") != std::string::npos ||
                                   d.name.find("DG2") != std::string::npos || d.name.find("BMG") != std::string::npos);
+#if defined(SYCL_EXT_ONEAPI_DEVICE_ARCHITECTURE)
+            try {
+                namespace exp = sycl::ext::oneapi::experimental;
+                const auto a = dev.get_info<exp::info::device::architecture>();
+                if (a == exp::architecture::intel_gpu_acm_g10 || a == exp::architecture::intel_gpu_acm_g11 ||
+                    a == exp::architecture::intel_gpu_acm_g12 || a == exp::architecture::intel_gpu_bmg_g21 ||
+                    a == exp::architecture::intel_gpu_bmg_g31 || a == exp::architecture::intel_gpu_lnl_m ||
+                    a == exp::architecture::intel_gpu_pvc || a == exp::architecture::intel_gpu_pvc_vg) {
+                    is_arc_or_xmx = true;
+                }
+            } catch (...) {
+            }
+#endif
+            // Linux drivers for Arc Pro B70 / Battlemage may report PCI IDs like "Intel(R) Graphics [0xe223]"
+            if (!is_arc_or_xmx) {
+                if (const size_t b = d.name.find("[0x"); b != std::string::npos) {
+                    const unsigned long id = std::strtoul(d.name.c_str() + b + 1, nullptr, 16);
+                    if ((id >= 0xE200 && id <= 0xE2FF) || (id >= 0x5690 && id <= 0x56BF) || id == 0x56C0 || id == 0x56C1)
+                        is_arc_or_xmx = true;
+                }
+            }
             if (is_arc_or_xmx) {
                 if (d.has_sg8) d.has_xmx_sg8 = true;
                 else if (d.has_sg16) d.has_xmx_sg16 = true;

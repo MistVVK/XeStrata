@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
     std::string vision_path;
     int64_t image_max_pixels = 1048576;
     double vram_experts_gb = -1.0, ram_experts_gb = -1.0;
-    int kv_host_above = 24000, gx_mb = 256, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 0, index_topk = 2048, threads = (int)std::max(2u, std::thread::hardware_concurrency() / 2), expert_act = 1;
+    int kv_host_above = -1, gx_mb = 256, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 0, index_topk = 2048, threads = (int)std::max(2u, std::thread::hardware_concurrency() / 2), expert_act = 1;
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--serve") serve = true;
     for (int i = 1; i < argc; ++i) {
@@ -190,7 +190,7 @@ int main(int argc, char** argv) {
         so.index_topk = index_topk;
         so.threads = threads;
         so.gx_mb = gx_mb;
-        so.kv_host_above = kv_host_above;
+        so.kv_host_above = kv_host_above >= 0 ? kv_host_above : (dev_caps().global_mem >= (24ull << 30) ? 131072 : 24000);
         so.vram_experts_gb = vram_experts_gb;
         so.ram_experts_gb = ram_experts_gb;
         so.hi_act = hi_act || (expert_act == 0);
@@ -246,7 +246,7 @@ int main(int argc, char** argv) {
         r.prof = prof;
         r.prof2 = prof2;
         r.expert_act = expert_act;
-        r.kv_host_above = kv_host_above;
+        r.kv_host_above = kv_host_above >= 0 ? kv_host_above : (caps.global_mem >= (24ull << 30) ? 131072 : 24000);
         if (!r.init(no_engram ? std::string() : engram, err)) {
             fprintf(stderr, "init: %s\n", err.c_str());
             return 1;
