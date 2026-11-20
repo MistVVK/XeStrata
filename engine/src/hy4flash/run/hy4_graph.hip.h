@@ -945,12 +945,14 @@ public:
         a.window = c.window;
         a.ring = swa ? ring : 0;
         a.cache_slots = cslots;
-        ensure_mla_ws(mla_workspace_bytes(a));
         if (use_list) {
             a.keys = keys;
             a.nkeys = nkeys;
             a.kmax = index_topk;
         }
+        // size the split-K workspace AFTER kmax is set: mla_workspace_bytes() takes max_keys = kmax in list mode. (Before: kmax was still 0 here, no workspace was ensured for the
+        // IndexPool layers, and mla_attend fell back to the simple kernel unless another call had happened to grow the buffer: which kernel decode used depended on earlier GPU work.)
+        ensure_mla_ws(mla_workspace_bytes(a));
         if (dec) {
             { PS _q(this, "mla_attend"); mla_attend(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), (__half*)ctx_ws, a, mla_ws, mla_ws_bytes); }
             { PS _q(this, "mla_vup"); mla_vup_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), (const __half*)ctx_ws, F3, o_h, T, NH); }
