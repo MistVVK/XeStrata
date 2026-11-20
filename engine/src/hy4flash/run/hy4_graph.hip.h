@@ -102,6 +102,15 @@ public:
     // stats
     double t_engram_cpu = 0;
     bool dump = false;
+    int dump_layer = -1;  // with dump: also dump the inner buffers of this layer's attention (debug)
+    void dump_half(const std::string& name, const __half* dev, size_t n, int T) {
+        HCK(hipStreamSynchronize(st));
+        std::vector<__half> h(n);
+        HCK(hipMemcpy(h.data(), dev, n * 2, hipMemcpyDeviceToHost));
+        std::vector<float> f(n);
+        for (size_t i = 0; i < n; ++i) f[i] = __half2float(h[i]);
+        save_npy_f32(dump_dir + "/" + name + ".npy", f.data(), {(int64_t)T, (int64_t)(n / T)});
+    }
     std::string dump_dir = ".";
     bool dbg_layers = false;
     int index_on = 1;       // IndexPool selection on the sparse layers (off: they attend all keys)
@@ -647,10 +656,19 @@ public:
         if (dec) {
             { PS _q(this, "mla_attend"); mla_attend(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), (__half*)ctx_ws, a, mla_ws, mla_ws_bytes); }
             { PS _q(this, "mla_vup"); mla_vup_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), (const __half*)ctx_ws, F3, o_h, T, NH); }
+            if (dump && il == dump_layer) {
+                dump_half("in_cur_h", cur_h, (size_t)T * HID, T);
+                maybe_dump("in_qb", T, NH * 256, F2);
+                dump_half("in_qa", qa_h, (size_t)T * NH * 576, T);
+                dump_half("in_ctx", (const __half*)ctx_ws, (size_t)T * NH * 512, T);
+                dump_half("in_o", o_h, (size_t)T * NH * 256, T);
+                maybe_dump("in_gate", T, NH * 256, F3);
+            }
         } else {
             { PS _q(this, "mla_attend_vup_prefill"); mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_b + wv_off[il], F3, o_h, ctx_ws, a, mla_ws, mla_ws_bytes); }
         }
         lin(pa + ".o_proj.weight", o_h, F1, T);  // [T][3072]
+        if (dump && il == dump_layer) maybe_dump("in_oproj", T, HID, F1);
         { PS _q(this, "o_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F1, (const float*)nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), x, post, c.rms_eps); }
     }
 

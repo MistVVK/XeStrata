@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
     SpecCfg scfg;
     std::string parity_list;
     bool det_flag = true, want_margins = false;
-    int ab_rounds = 0, trace_m = 0;
+    int ab_rounds = 0, trace_m = 0, trace_off = 0, trace_mut = -1, dump_layer_arg = -1;
     bool ab_sab = false, alloc_only = false, knobs16 = false, dfly_warm = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -112,6 +112,8 @@ int main(int argc, char** argv) {
         else if (a == "--spec-debug") scfg.debug = true;
         else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
         else if (a == "--spec-sabotage") scfg.sabotage = true;
+        else if (a == "--spec-inv") scfg.inv = atoi(nxt().c_str()) != 0;
+        else if (a == "--spec-check") scfg.check = true;
         else if (a == "--spec-nodraft") { scfg.sabotage = true; scfg.nodraft = true; }
         else if (a == "--det") det_flag = atoi(nxt().c_str()) != 0;
         else if (a == "--margins") want_margins = true;
@@ -121,7 +123,11 @@ int main(int argc, char** argv) {
         else if (a == "--knobs16") knobs16 = true;
         else if (a == "--dfly-warm") dfly_warm = true;
         else if (a == "--trace-m") trace_m = atoi(nxt().c_str());
+        else if (a == "--trace-off") trace_off = atoi(nxt().c_str());
+        else if (a == "--trace-mut") trace_mut = atoi(nxt().c_str());
+        else if (a == "--dump-layer") dump_layer_arg = atoi(nxt().c_str());
         else if (a == "--mla-blocks") g_mla_target_blocks = atoi(nxt().c_str());
+        else if (a == "--mla-inv") g_mla_batch_invariant = atoi(nxt().c_str());
         else if (a == "--spec-exact") scfg.exact = atoi(nxt().c_str()) != 0;
         else if (a == "--parity-m") parity_list = nxt();
         else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
@@ -294,10 +300,12 @@ int main(int argc, char** argv) {
         // layer-by-layer bit comparison of an M-token window against the same positions one at a time: dumps x after every attention / MLP of every layer into out/seq<i> and out/win
         // (compare with tools: first file whose bytes differ names the layer and the op that is not batch invariant)
         const int M = trace_m;
-        const int p0 = T0 - M;
+        const int p0 = T0 - M - trace_off;
+        if (trace_mut >= 0) tok[T0 - 1 - trace_off] = trace_mut;  // causality test: change the LAST token of the window
         skd::lin_gemv_max_m() = 16;
         skd::moe_dec_max_m() = 16;
         r.dump = true;
+        r.dump_layer = dump_layer_arg;
         for (int i = 0; i < M; ++i) {
             const std::string d = out_dir + "/seq" + std::to_string(i);
             std::filesystem::create_directories(d);
@@ -495,7 +503,9 @@ int main(int argc, char** argv) {
         f << gen_ids << "\n";
         if (want_margins) {
             std::ofstream fm(out_dir + "/margins.txt");
-            for (float m : sp.marg) fm << m << "\n";
+            for (float m : sp.marg) fm << m << '\n';
+            std::ofstream fh(out_dir + "/hashes.txt");
+            for (uint64_t hv : sp.hsh) fh << std::hex << hv << '\n';
         }
     } else if (gen > 0) {
         int next = 0;
@@ -514,12 +524,18 @@ int main(int argc, char** argv) {
         double t1 = now_s();
         std::vector<double> times, enq;
         std::vector<float> margs;
+        std::vector<uint64_t> hashes;  // FNV-1a of the bits of every logits row the token choice came from
         auto gap2 = [&](const float* lg) {
             float b1 = -3e38f, b2 = -3e38f;
+            uint64_t hh = 1469598103934665603ull;
             for (int i = 0; i < V; ++i) {
                 if (lg[i] > b1) { b2 = b1; b1 = lg[i]; }
                 else if (lg[i] > b2) b2 = lg[i];
+                uint32_t bits;
+                memcpy(&bits, &lg[i], 4);
+                hh = (hh ^ bits) * 1099511628211ull;
             }
+            hashes.push_back(hh);
             return b1 - b2;
         };
         if (want_margins) margs.push_back(gap2(&hl[(size_t)(hl.size() / V - 1) * V]));
@@ -560,7 +576,9 @@ int main(int argc, char** argv) {
         f << gen_ids << "\n";
         if (want_margins) {
             std::ofstream fm(out_dir + "/margins.txt");
-            for (float m : margs) fm << m << "\n";
+            for (float m : margs) fm << m << '\n';
+            std::ofstream fh(out_dir + "/hashes.txt");
+            for (uint64_t hv : hashes) fh << std::hex << hv << '\n';
         }
     }
     {

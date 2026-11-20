@@ -21,12 +21,15 @@ struct SpecCfg {
     float cut = -1.f;      // >= 0: verify the leading slots with conf > cut instead of the cost model
     bool exact = true;     // verify windows on the M-independent GEMV / decode expert kernels
     bool debug = false;
+    bool check = false;    // diagnostic: after every verify recompute the accepted rows one token at a time and compare bitwise
+    bool inv = true;       // batch-invariant MLA split-K for verify windows (costs ~5 ms per verify step, makes window rows sum in the one-token order)
     bool nodraft = false;  // test only (with sabotage): skip the drafter entirely, verify windows of fixed junk tokens
     bool sabotage = false; // test only: replace every draft token by a random id with conf 0.9 (acceptance ~0): the worst case for the controller
     int rv = 256;          // reduced-vocabulary draft chain: candidates per slot (0 = full lm_head per drafted token)
 };
 
 struct SpecStats {
+    long chk_rows = 0, chk_bad = 0;
     long spec_iters = 0, plain_iters = 0, plain_after_draft = 0, tokens = 0, accepted = 0, verified_slots = 0, drafted = 0, probes = 0, backoffs = 0;
     long hist[9] = {};  // accepted drafts per verify step
     double t_draft = 0, t_verify = 0, t_plain = 0, t_spec_total = 0;
@@ -69,6 +72,7 @@ public:
         if (cfg.K < 1) cfg.K = 1;
         d.rv = cfg.rv;
         r.det_mix = true;  // schedule-independent iHC mix: the output must not depend on atomics
+        g_mla_batch_invariant = cfg.inv ? 1 : 0;  // verify windows split the keys like a one-token step
         plain_left = 2;  // calibrate the plain step time first
     }
 
@@ -107,6 +111,7 @@ public:
 
     // optional: top1 - top2 logit gap of every emitted token's row (analysis of divergences)
     std::vector<float> marg;
+    std::vector<uint64_t> hsh;
     bool want_margin = false;
     void note_margin(int row) {
         if (!want_margin) return;
@@ -118,6 +123,15 @@ public:
             else if (h[i] > b2) b2 = h[i];
         }
         marg.push_back(b1 - b2);
+        {
+            uint64_t hh = 1469598103934665603ull;
+            for (int i = 0; i < V; ++i) {
+                uint32_t bits;
+                memcpy(&bits, &h[i], 4);
+                hh = (hh ^ bits) * 1099511628211ull;
+            }
+            hsh.push_back(hh);
+        }
     }
 
     int argmax_host_row0() {
@@ -249,6 +263,26 @@ public:
             int n = 0;
             while (n < Kp && y[n + 1] == h_arg[n]) ++n;
             d.snap_h(n);
+            if (cfg.check) {
+                // diagnostic: recompute rows 0..n one token at a time and compare them with the window's rows (bitwise); the rewritten KV rows are the same when the kernels are batch invariant
+                std::vector<float> wl((size_t)T * V), sl(V);
+                HCK(hipMemcpy(wl.data(), r.logits, (size_t)T * V * 4, hipMemcpyDeviceToHost));
+                for (int i = 0; i <= n; ++i) {
+                    if (!r.forward_chunk(tok.data(), a + i, 1, err)) { finish = "error"; break; }
+                    r.head(1, 0);
+                    HCK(hipStreamSynchronize(r.st));
+                    HCK(hipMemcpy(sl.data(), r.logits, (size_t)V * 4, hipMemcpyDeviceToHost));
+                    ++S.chk_rows;
+                    if (!std::equal(sl.begin(), sl.end(), wl.begin() + (size_t)i * V)) {
+                        double md = 0;
+                        for (int v = 0; v < V; ++v) md = std::max(md, (double)std::fabs(sl[v] - wl[(size_t)i * V + v]));
+                        ++S.chk_bad;
+                        if (S.chk_bad <= 12) fprintf(stderr, "[check] a=%d (a mod 4 = %d) row %d of window T=%d (n=%d): window row differs from the one-token row, max|dlogit| %.4g, argmax %d vs %d\n", a, a & 3, i, T, n, md,
+                                                     (int)(std::max_element(sl.begin(), sl.end()) - sl.begin()), (int)(std::max_element(wl.begin() + (size_t)i * V, wl.begin() + (size_t)(i + 1) * V) - wl.begin() - (size_t)i * V));
+                    }
+                }
+                if (finish == "error") break;
+            }
             if (want_margin)
                 for (int i = 0; i <= n; ++i) note_margin(i);
             // calibration + cost model
@@ -297,6 +331,7 @@ public:
         fprintf(f, "[spec] verify ms by m:");
         for (int m = 2; m <= 8; ++m) fprintf(f, " m%d=%.1f", m, tv[m]);
         fprintf(f, "\n");
+        if (cfg.check) fprintf(f, "[spec] check: %ld window rows recomputed one token at a time, %ld differ bitwise\n", S.chk_rows, S.chk_bad);
     }
 };
 
