@@ -10,6 +10,8 @@
 // GFX11: a lane all 16 K values (lanes 16-31 repeat 0-15), the accumulator's rows 2 e + l / 16.
 #pragma once
 
+#include "strata/kernels/matrix_report.hpp"
+
 #include <sycl/sycl.hpp>
 
 #include <cstddef>
@@ -24,22 +26,13 @@
 
 namespace strata::kernels::xe {
 
-/// Whether the device is an RDNA3 or RDNA4 GPU (GFX11, GFX12), whose WMMA these kernels take: the architecture as SYCL
-/// reports it (its values carry the version: 0x0200000000110000 is gfx1100).
-inline bool amd_wmma(const sycl::device& d) {
-    namespace syclex = sycl::ext::oneapi::experimental;
-    if (d.get_backend() != sycl::backend::ext_oneapi_hip) return false;
-    const auto a = static_cast<uint64_t>(d.get_info<syclex::info::device::architecture>());
-    return a >= static_cast<uint64_t>(syclex::architecture::amd_gpu_gfx1100) && a < 0x0200000000130000ull;
-}
+/// Whether the device has the WMMA instructions these kernels take (wmma_gfx, matrix_report.hpp).  Inside the kernels'
+/// own choices only (layouts, shapes): a path asks has_form(d, MatrixForm::wmma).
+inline bool amd_wmma(const sycl::device& d) { return wmma_gfx(d) != 0; }
 
-/// Whether the device is an RDNA4 GPU (GFX12), whose WMMA takes its operands in another layout than RDNA3's (and whose
-/// products take tile layouts of their own, mma_gemm.cpp).
-inline bool amd_wmma_gfx12(const sycl::device& d) {
-    namespace syclex = sycl::ext::oneapi::experimental;
-    if (!amd_wmma(d)) return false;
-    return static_cast<uint64_t>(d.get_info<syclex::info::device::architecture>()) >= 0x0200000000120000ull;
-}
+/// Whether the device's WMMA takes its operands in GFX12's layout, not GFX11's (and its products take tile layouts of
+/// their own, mma_gemm.cpp).
+inline bool amd_wmma_gfx12(const sycl::device& d) { return wmma_gfx(d) == 12; }
 
 #if STRATA_AMD_WMMA
 namespace wmma {
