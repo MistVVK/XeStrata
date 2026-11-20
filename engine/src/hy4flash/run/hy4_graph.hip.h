@@ -86,6 +86,10 @@ public:
     std::vector<size_t> wk_off, wv_off;
     std::vector<__half*> kcache;  // per layer
     int ring = 0, slots_sparse = 0;
+    // growable KV state (cards that cannot hold the whole context): the sparse-layer KV rows + Vt and the IndexPool state start in VRAM for kv_cap positions and move to pinned host memory
+    // (all of it, once) when the context passes kv_cap, so short chats in a 128K context run at VRAM speed. kv_cap == 0: not growable.
+    int kv_cap = 0;
+    bool kv_moved = false;
     void ensure_mla_ws(size_t need) {
         if (need <= mla_ws_bytes) return;
         HCK(hipStreamSynchronize(st));
@@ -491,12 +495,20 @@ public:
         // kv caches
         ring = ((512 + Tc + 15) / 16) * 16;
         slots_sparse = ((max_ctx + 8 + 15) / 16) * 16;
+        const int devpos = getenv("HY4_KV_DEVPOS") ? atoi(getenv("HY4_KV_DEVPOS")) : 0;
+        if (devpos > 0 && devpos < max_ctx) {
+            kv_cap = devpos;
+            slots_sparse = ((kv_cap + 8 + 15) / 16) * 16;
+        }
         kcache.resize(c.n_layers);
         size_t kvbytes = 0;
         for (int il = 0; il < c.n_layers; ++il) {
             int slots = c.is_swa[il] ? ring : slots_sparse;
             size_t by = mla_cache_bytes(slots);
             if (c.is_swa[il]) {
+                HCK(hipMalloc((void**)&kcache[il], by));
+                HCK(hipMemset(kcache[il], 0, by));
+            } else if (kv_cap) {
                 HCK(hipMalloc((void**)&kcache[il], by));
                 HCK(hipMemset(kcache[il], 0, by));
             } else {
@@ -509,8 +521,15 @@ public:
         pooled.assign(c.n_layers, nullptr);
         for (int il = 0; il < c.n_layers; ++il)
             if (!c.is_swa[il]) {
-                ivg[il] = dalloc_big<__half>((size_t)(max_ctx + 8) * 256, "IndexPool iv/ig cache", 4);
-                pooled[il] = dalloc_big<__half>((size_t)(max_ctx / 4 + 8) * 128, "IndexPool pooled keys", 4);
+                if (kv_cap) {
+                    ivg[il] = dalloc<__half>((size_t)(kv_cap + 8) * 256);
+                    pooled[il] = dalloc<__half>((size_t)(kv_cap / 4 + 8) * 128);
+                    HCK(hipMemset(ivg[il], 0, (size_t)(kv_cap + 8) * 256 * 2));
+                    HCK(hipMemset(pooled[il], 0, (size_t)(kv_cap / 4 + 8) * 128 * 2));
+                } else {
+                    ivg[il] = dalloc_big<__half>((size_t)(max_ctx + 8) * 256, "IndexPool iv/ig cache", 4);
+                    pooled[il] = dalloc_big<__half>((size_t)(max_ctx / 4 + 8) * 128, "IndexPool pooled keys", 4);
+                }
             }
         ik_f = dalloc<float>((size_t)Tc * 128);
         iv_f = dalloc<float>((size_t)Tc * 128);
@@ -894,7 +913,53 @@ public:
     }
 
     // process tokens [p0, p0+T) (T <= Tc) of the sequence tok_all (host, positions 0..p0+T-1). Returns false on error.
+    // the context passed the VRAM part of the KV state: move rows, Vt and the IndexPool state to pinned host memory (one time, ~0.1 s per GB)
+    void kv_grow() {
+        if (!kv_cap || kv_moved) return;
+        const double t0 = now_s();
+        HCK(hipDeviceSynchronize());
+        const size_t os = (size_t)slots_sparse, ns = (size_t)((max_ctx + 8 + 15) / 16) * 16;
+        const size_t row_b = (size_t)576 * 2, vt_b = (size_t)512 * 2;  // MLA_ROW, MLA_KV_LORA halves;  // bytes per slot of the rows and of the Vt copy
+        auto host_alloc = [&](size_t bytes, void** hp) {
+            void* dp = nullptr;
+            HCK(hipHostMalloc(hp, bytes, hipHostMallocMapped));
+            memset(*hp, 0, bytes);
+            HCK(hipHostGetDevicePointer(&dp, *hp, 0));
+            host_big_bytes += bytes;
+            return dp;
+        };
+        for (int il = 0; il < c.n_layers; ++il) {
+            if (c.is_swa[il]) continue;
+            void* hp = nullptr;
+            uint8_t* nd = (uint8_t*)host_alloc(ns * (row_b + vt_b), &hp);
+            uint8_t* od = (uint8_t*)kcache[il];
+            HCK(hipMemcpy(nd, od, os * row_b, hipMemcpyDeviceToDevice));
+            HCK(hipMemcpy(nd + ns * row_b, od + os * row_b, os * vt_b, hipMemcpyDeviceToDevice));
+            HCK(hipFree(od));
+            kcache[il] = (__half*)nd;
+            void* hp2 = nullptr;
+            __half* niv = (__half*)host_alloc((size_t)(max_ctx + 8) * 256 * 2, &hp2);
+            HCK(hipMemcpy(niv, ivg[il], (size_t)(kv_cap + 8) * 256 * 2, hipMemcpyDeviceToDevice));
+            HCK(hipFree(ivg[il]));
+            ivg[il] = niv;
+            void* hp3 = nullptr;
+            __half* npl = (__half*)host_alloc((size_t)(max_ctx / 4 + 8) * 128 * 2, &hp3);
+            HCK(hipMemcpy(npl, pooled[il], (size_t)(kv_cap / 4 + 8) * 128 * 2, hipMemcpyDeviceToDevice));
+            HCK(hipFree(pooled[il]));
+            pooled[il] = npl;
+        }
+        slots_sparse = (int)ns;
+        kv_moved = true;
+        fprintf(stderr, "[runner] context passed %d positions: KV rows, Vt and IndexPool state moved to pinned host memory (%.2f GB, %.2f s); attention now reads them over PCIe\n", kv_cap, host_big_bytes / 1e9, now_s() - t0);
+    }
+    // make room for positions < need; false when need exceeds the context
+    bool kv_ensure(int need) {
+        if (need > max_ctx + 8) return false;
+        if (kv_cap && !kv_moved && need > kv_cap) kv_grow();
+        return need <= slots_sparse;
+    }
     bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err) {
+        if (kv_cap && !kv_moved && p0 + T + 16 > kv_cap) kv_grow();
         HCK(hipMemcpyAsync(d_ids, tok_all + p0, (size_t)T * 4, hipMemcpyHostToDevice, st));
         hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
         const bool defer_eng = engram_ready && T <= 8;

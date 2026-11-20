@@ -160,6 +160,20 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     int mask = 0;
     if (trunk + work_gb + pivg + rows + wkv + 0.3 > tot) mask |= 2;
     if (trunk + work_gb + pivg + rows + 0.3 > tot) mask |= 1;
+    // Cards that cannot hold the whole context: keep the first dev_pos positions of the KV rows + Vt + IndexPool state in VRAM and move all of it to pinned host memory when the context
+    // passes dev_pos (Runner::kv_grow), so a short chat in the 128K context runs at VRAM speed. HY4_KV_DEVPOS = dev_pos; the rows are then not forced to host.
+    long dev_pos = 0;
+    if ((mask & 1) && !getenv("HY4_KV_HOST")) {
+        const double per_pos = 12.0 * 2176.0 + 12.0 * 512.0 + 12.0 * 64.0;  // rows + Vt, iv/ig, pooled keys per position (bytes)
+        const double avail = tot - trunk - work_gb - 0.3;
+        dev_pos = avail > 0 ? (long)(avail * GB / per_pos) / 1024 * 1024 : 0;
+        if (dev_pos >= 4096 && dev_pos < max_ctx) {
+            mask &= ~1;
+            char b[16];
+            snprintf(b, sizeof b, "%ld", dev_pos);
+            hy4_setenv("HY4_KV_DEVPOS", b, 1);
+        } else dev_pos = 0;
+    }
     if (getenv("HY4_KV_HOST")) mask = atoi(getenv("HY4_KV_HOST"));
     else {
         char m[8];
@@ -168,17 +182,18 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     }
     {
         char b[32];
-        snprintf(b, sizeof b, "%.2f", ((mask & 1) ? rows : 0.0) + ((mask & 2) ? wkv : 0.0) + 0.3);
+        snprintf(b, sizeof b, "%.2f", ((mask & 1) || dev_pos ? rows + (dev_pos ? pivg : 0.0) : 0.0) + ((mask & 2) ? wkv : 0.0) + 0.3);
         hy4_setenv("HY4_HOST_NEED_GB", b, 1);
     }
     if (!getenv("HY4_RESERVE_GB")) {
-        double reserve = work_gb + pivg + ((mask & 1) ? 0.0 : rows) + ((mask & 2) ? 0.0 : wkv) + (tot >= 10.0 && mask == 0 ? 1.45 : 0.0);  // + the prefill streaming scratch when everything else fits
+        double reserve = work_gb + (dev_pos ? dev_pos * (12.0 * 2176.0 + 12.0 * 512.0 + 12.0 * 64.0) / GB : pivg + ((mask & 1) ? 0.0 : rows)) + ((mask & 2) ? 0.0 : wkv) + (tot >= 10.0 && mask == 0 ? 1.45 : 0.0);  // + the prefill streaming scratch when everything else fits
         char b[32];
         snprintf(b, sizeof b, "%.2f", reserve);
         hy4_setenv("HY4_RESERVE_GB", b, 1);
     }
     fprintf(stderr, "[plan] ctx %d chunk %d: buffers ~%.2f GB, KV rows %.2f GB, IndexPool %.2f GB, kv_b copies %.2f GB, trunk %.2f GB on a %.1f GB card -> host mask %d (1 rows, 2 kv_b copies); reserve %s GB\n", max_ctx, chunk, work_gb,
             rows, pivg, wkv, trunk, tot, atoi(getenv("HY4_KV_HOST")), getenv("HY4_RESERVE_GB"));
+    if (dev_pos) fprintf(stderr, "[plan] growable KV: the first %ld positions of rows + IndexPool stay in VRAM, everything moves to pinned host memory when the context passes them\n", dev_pos);
     return chunk;
 }
 
