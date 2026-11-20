@@ -29,7 +29,7 @@ struct SyModel {
     std::unordered_map<std::string, const uint8_t*> ptr;
     std::unordered_set<std::string> rp;  // tensors stored in the RP layout
     std::vector<uint8_t> seed;           // Section 2 (engram hot seed), host
-    uint64_t trunk_bytes = 0, dev_bytes_total = 0;
+    uint64_t trunk_bytes = 0, dev_bytes_total = 0, host_bytes_total = 0;
     double t_load = 0;
     bool use_rp = true;
 
@@ -43,6 +43,12 @@ struct SyModel {
     }
     bool is_rp(const std::string& name) const { return rp.count(name) != 0; }
     const hy4::TInfo& ti(const std::string& name) const { return man.get(name); }
+
+    // Tensors the kernels only touch a row / a few times (the embedding table: one row per token; kv_b_proj: split into the absorbed halves once at start) stay in PINNED HOST memory
+    // (zero-copy reads from the kernels): 0.37 GB + 0.2 GB of the 8 GB card are worth more as VRAM for the trunk and the expert ring.
+    static bool host_resident(const hy4::TInfo& t) {
+        return t.name.find("kv_b_proj") != std::string::npos || t.name.find("embed_tokens") != std::string::npos;
+    }
 
     static bool wants_rp(const hy4::TInfo& t) {
         if (t.shape.size() != 2) return false;
@@ -68,7 +74,7 @@ struct SyModel {
         for (size_t i = 0; i < ts.size(); ++i) {
             isrp[i] = use_rp && wants_rp(*ts[i]);
             const uint64_t db = isrp[i] ? rp_bytes(ts[i]->fmt, (int)ts[i]->rows(), (int)ts[i]->cols()) : ts[i]->bytes;
-            dsz[i] = (db + 255) & ~255ull;
+            dsz[i] = host_resident(*ts[i]) ? 0 : (db + 255) & ~255ull;
             max_raw = std::max<uint64_t>(max_raw, ts[i]->bytes);
             max_out = std::max<uint64_t>(max_out, dsz[i]);
         }
@@ -98,6 +104,19 @@ struct SyModel {
             uint64_t pos = 0;
             for (size_t i = g.first; i <= g.second; ++i) {
                 const hy4::TInfo& t = *ts[i];
+                if (host_resident(t)) {
+                    uint8_t* hp = halloc<uint8_t>(t.bytes + 256);
+                    size_t hgot = 0;
+                    while (hgot < t.bytes) {
+                        ssize_t r = pread(fd, hp + hgot, t.bytes - hgot, (off_t)(sec1 + t.off + hgot));
+                        if (r <= 0) { err = "short read of trunk tensor " + t.name; return false; }
+                        hgot += (size_t)r;
+                    }
+                    posix_fadvise(fd, (off_t)(sec1 + t.off), (off_t)t.bytes, POSIX_FADV_DONTNEED);
+                    ptr[t.name] = hp;
+                    host_bytes_total += t.bytes;
+                    continue;
+                }
                 size_t got = 0;
                 while (got < t.bytes) {
                     ssize_t r = pread(fd, raw + got, t.bytes - got, (off_t)(sec1 + t.off + got));
@@ -123,7 +142,7 @@ struct SyModel {
         sycl::free(out, Q());
         if (!rd.read_section(2, seed, err)) return false;
         t_load = now_s() - t0;
-        fprintf(stderr, "[load] trunk %.2f GB file -> %.2f GB device in %zu slabs, %zu tensors (%zu repacked), %.1f s\n", trunk_bytes / 1e9, dev_bytes_total / 1e9, slabs.size(), man.T.size(), rp.size(), t_load);
+        fprintf(stderr, "[load] trunk %.2f GB file -> %.2f GB device (+ %.2f GB pinned host) in %zu slabs, %zu tensors (%zu repacked), %.1f s\n", trunk_bytes / 1e9, dev_bytes_total / 1e9, host_bytes_total / 1e9, slabs.size(), man.T.size(), rp.size(), t_load);
         return true;
     }
 };

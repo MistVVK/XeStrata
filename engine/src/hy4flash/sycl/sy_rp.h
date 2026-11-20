@@ -13,8 +13,8 @@
 
 namespace hy4s {
 
-inline bool rp_supported(int fmt, int K) { return (fmt == FMT_S4 || fmt == FMT_S8) && K % 256 == 0; }
-inline int rp_pb(int fmt) { return fmt == FMT_S4 ? 128 : 256; }
+inline bool rp_supported(int fmt, int K) { return (fmt == FMT_S4 || fmt == FMT_S5 || fmt == FMT_S8) && K % 256 == 0; }
+inline int rp_pb(int fmt) { return fmt == FMT_S4 ? 128 : fmt == FMT_S5 ? 160 : 256; }  // S5: 128 B of low nibbles + 32 B of high bits
 inline size_t rp_pay_off(int N, int nsb) { return ((size_t)N * nsb * 8 + 255) & ~(size_t)255; }
 inline size_t rp_bytes(int fmt, int N, int K) { const int nsb = K / 256; return rp_pay_off(N, nsb) + (size_t)N * nsb * rp_pb(fmt); }
 
@@ -38,9 +38,9 @@ inline void rp_repack_host(int fmt, const uint8_t* src, uint8_t* dst, int N, int
 // GEMV for M <= 8 tokens: one sub-group (32 lanes) per output row, lane = 16-byte payload chunk.   Y[m][n] = sum_k W[n][k] X[m][k]
 template <int FMT, int MT>
 inline void k_gemv_rp(const uint8_t* W, int N, int K, const half* X, float* Y, int M) {
-    constexpr int PB = FMT == FMT_S4 ? 128 : 256;
-    constexpr int CPB = PB / 16;  // 16-byte chunks per super-block
-    constexpr int WPC = FMT == FMT_S4 ? 32 : 16;  // weights per chunk
+    constexpr int PB = FMT == FMT_S4 ? 128 : FMT == FMT_S5 ? 160 : 256;  // payload bytes per super-block
+    constexpr int CPB = FMT == FMT_S8 ? 16 : 8;                          // 16-byte chunks (of nibbles / int8) per super-block
+    constexpr int WPC = FMT == FMT_S8 ? 16 : 32;                         // weights per chunk
     const int nsb = K >> 8;
     const size_t pay_off = rp_pay_off(N, nsb);
     Q().parallel_for(NR((N + 7) / 8, 256), [=](sycl::nd_item<1> it) REQD_SG32 {
@@ -56,7 +56,10 @@ inline void k_gemv_rp(const uint8_t* W, int N, int K, const half* X, float* Y, i
             const int c = c0 + lane;
             if (c < nchunk) {
                 const int sb = c / CPB, off = (c % CPB) * WPC;  // first weight of the chunk inside the super-block
-                const sycl::uchar16 raw = *reinterpret_cast<const sycl::uchar16*>(pay + (size_t)c * 16);
+                const uint8_t* pc = pay + (size_t)sb * PB;
+                const sycl::uchar16 raw = *reinterpret_cast<const sycl::uchar16*>(pc + (size_t)(c % CPB) * 16);
+                uint32_t hb = 0;  // S5: the 32 high bits of the chunk
+                if constexpr (FMT == FMT_S5) hb = *reinterpret_cast<const uint32_t*>(pc + 128 + (size_t)(c % CPB) * 4);
                 const sycl::uchar8 hd = *reinterpret_cast<const sycl::uchar8*>(hdr + (size_t)sb * 8);
                 const float D = h2f_bits((uint16_t)hd[0] | ((uint16_t)hd[1] << 8));
                 const float eff = D * ((float)hd[2 + (off >> 6)] / 255.0f);
@@ -68,11 +71,16 @@ inline void k_gemv_rp(const uint8_t* W, int N, int K, const half* X, float* Y, i
 #pragma unroll
                         for (int v = 0; v < WPC / 8; ++v) {
                             const sycl::vec<half, 8> xv = *reinterpret_cast<const sycl::vec<half, 8>*>(xp + v * 8);
-                            if constexpr (FMT == FMT_S4) {
+                            if constexpr (FMT == FMT_S4 || FMT == FMT_S5) {
 #pragma unroll
                                 for (int j = 0; j < 4; ++j) {
                                     const float x0 = (float)xv[2 * j], x1 = (float)xv[2 * j + 1];
-                                    sq += (float)(raw[4 * v + j] & 15) * x0 + (float)(raw[4 * v + j] >> 4) * x1;
+                                    float q0 = (float)(raw[4 * v + j] & 15), q1 = (float)(raw[4 * v + j] >> 4);
+                                    if constexpr (FMT == FMT_S5) {
+                                        q0 += (float)(((hb >> (8 * v + 2 * j)) & 1u) << 4);
+                                        q1 += (float)(((hb >> (8 * v + 2 * j + 1)) & 1u) << 4);
+                                    }
+                                    sq += q0 * x0 + q1 * x1;
                                     sx += x0 + x1;
                                 }
                             } else {
@@ -80,7 +88,7 @@ inline void k_gemv_rp(const uint8_t* W, int N, int K, const half* X, float* Y, i
                                 for (int t = 0; t < 8; ++t) sq += (float)(int8_t)raw[8 * v + t] * (float)xv[t];
                             }
                         }
-                        acc[m] += eff * (sq - (FMT == FMT_S4 ? 7.5f : 0.0f) * sx);
+                        acc[m] += eff * (sq - (FMT == FMT_S4 ? 7.5f : FMT == FMT_S5 ? 15.5f : 0.0f) * sx);
                     }
                 }
             }
@@ -168,6 +176,7 @@ inline bool gemv_rp(int fmt, const void* W, int N, int K, const half* X, float* 
     const uint8_t* w = (const uint8_t*)W;
     if (M > 8) return false;
     if (fmt == FMT_S4) { if (M == 1) k_gemv_rp<FMT_S4, 1>(w, N, K, X, Y, M); else k_gemv_rp<FMT_S4, 8>(w, N, K, X, Y, M); return true; }
+    if (fmt == FMT_S5) { if (M == 1) k_gemv_rp<FMT_S5, 1>(w, N, K, X, Y, M); else k_gemv_rp<FMT_S5, 8>(w, N, K, X, Y, M); return true; }
     if (fmt == FMT_S8) { if (M == 1) k_gemv_rp<FMT_S8, 1>(w, N, K, X, Y, M); else k_gemv_rp<FMT_S8, 8>(w, N, K, X, Y, M); return true; }
     return false;
 }

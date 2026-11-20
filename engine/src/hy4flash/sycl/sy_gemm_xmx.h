@@ -14,7 +14,7 @@ namespace xm = sycl::ext::oneapi::experimental::matrix;
 template <int FMT, bool RP>
 inline void k_gemm_xmx(const uint8_t* W, int N, int K, const half* X, float* Y, int M) {
     constexpr int SB = sk_sb_bytes(FMT);
-    constexpr int PB = FMT == FMT_S4 ? 128 : 256;
+    constexpr int PB = FMT == FMT_S4 ? 128 : FMT == FMT_S5 ? 160 : 256;
     const int nbm = (M + 63) / 64, nbn = N / 64;
     const size_t pay_off = RP ? rp_pay_off(N, K >> 8) : 0;
     Q().submit([&](sycl::handler& h) {
@@ -49,6 +49,14 @@ inline void k_gemm_xmx(const uint8_t* W, int N, int K, const half* X, float* Y, 
                                 const int k = g * 64 + 2 * i;
                                 sb_ptr[(k >> 1) * 128 + tid * 2 + 0] = (half)(((float)(b & 15) - 7.5f) * eff);
                                 sb_ptr[(k >> 1) * 128 + tid * 2 + 1] = (half)(((float)(b >> 4) - 7.5f) * eff);
+                            }
+                        } else if constexpr (FMT == FMT_S5) {
+                            for (int i = 0; i < 32; ++i) {  // low nibbles pl[0..128), high bits pl[128..160): weight k has bit k&7 of byte 128 + (k>>3)
+                                const uint8_t b = pl[g * 32 + i];
+                                const int k = g * 64 + 2 * i;
+                                const uint32_t hbits = pl[128 + (k >> 3)] >> (k & 7);
+                                sb_ptr[(k >> 1) * 128 + tid * 2 + 0] = (half)(((float)((b & 15) | ((hbits & 1u) << 4)) - 15.5f) * eff);
+                                sb_ptr[(k >> 1) * 128 + tid * 2 + 1] = (half)(((float)((b >> 4) | (((hbits >> 1) & 1u) << 4)) - 15.5f) * eff);
                             }
                         } else {
                             for (int i = 0; i < 64; ++i) {
@@ -97,6 +105,7 @@ inline bool gemm_xmx(int fmt, const void* Wv, int N, int K, const half* X, float
     if ((N & 63) || (K & 255) || (M & 7)) return false;
     if (rp) {
         if (fmt == FMT_S4) { k_gemm_xmx<FMT_S4, true>(W, N, K, X, Y, M); return true; }
+        if (fmt == FMT_S5) { k_gemm_xmx<FMT_S5, true>(W, N, K, X, Y, M); return true; }
         if (fmt == FMT_S8) { k_gemm_xmx<FMT_S8, true>(W, N, K, X, Y, M); return true; }
         return false;
     }

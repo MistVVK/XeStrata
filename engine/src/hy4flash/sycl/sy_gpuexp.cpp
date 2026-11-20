@@ -36,7 +36,7 @@ struct Item {  // one (expert, 64-token tile) of a group
     int32_t pad0, pad1;
 };
 
-inline int code_sb_bytes(int code) { return code == 0 ? 48 : code == 2 ? 70 : 102; }
+inline int code_sb_bytes(int code) { return code == 0 ? 48 : code == 2 ? 70 : code == 3 ? 102 : 134; }
 
 // store two adjacent k values (one packed row, 4-byte aligned) with a single 32-bit write
 inline void put2(half* p, float a, float b) { *reinterpret_cast<sycl::vec<half, 2>*>(p) = sycl::vec<half, 2>((half)a, (half)b); }
@@ -75,7 +75,7 @@ inline void dq_sb(const uint8_t* blk, half* sb_ptr, int n) {
                 put2(d0 + 128, ((float)((by >> 4) & 3) - 1.5f) * eff, ((float)(by >> 6) - 1.5f) * eff);
             }
         }
-    } else {  // S3_K: q = low 2 bits (4 per byte) | high bit (8 per byte at +64) << 2;  w = (q - 3.5) * D * u/255
+    } else if constexpr (CODE == 3) {  // S3_K: q = low 2 bits (4 per byte) | high bit (8 per byte at +64) << 2;  w = (q - 3.5) * D * u/255
         for (int g = 0; g < 4; ++g) {
             const float eff = D * ((float)blk[2 + g] / 255.0f);
             for (int u8 = 0; u8 < 8; ++u8) {  // 8 weights per unit
@@ -88,6 +88,14 @@ inline void dq_sb(const uint8_t* blk, half* sb_ptr, int n) {
                     const int k0 = unit * 8 + 2 * jp;
                     put2(sb_ptr + (k0 >> 1) * 128 + n * 2, ((float)q0 - 3.5f) * eff, ((float)q1 - 3.5f) * eff);
                 }
+            }
+        }
+    } else {  // S4_K: weights 2b (low nibble) and 2b+1 (high nibble) of payload byte b; w = (q - 7.5) * D * u/255
+        for (int g = 0; g < 4; ++g) {
+            const float eff = D * ((float)blk[2 + g] / 255.0f);
+            for (int b = 0; b < 32; ++b) {
+                const uint32_t by = pl[g * 32 + b];
+                put2(sb_ptr + ((g * 64 + 2 * b) >> 1) * 128 + n * 2, ((float)(by & 15) - 7.5f) * eff, ((float)(by >> 4) - 7.5f) * eff);
             }
         }
     }
@@ -128,7 +136,8 @@ sycl::event launch_gemm(sycl::queue& q, const sycl::event* dep, const uint8_t* d
 #else
                 if (code == 0) dq_sb<0>(blk, sb_ptr, tid);
                 else if (code == 2) dq_sb<2>(blk, sb_ptr, tid);
-                else dq_sb<3>(blk, sb_ptr, tid);
+                else if (code == 3) dq_sb<3>(blk, sb_ptr, tid);
+                else dq_sb<4>(blk, sb_ptr, tid);
 #endif
                 sycl::group_barrier(it.get_group());
                 if (active) {  // sub-group sgi = 8 tokens [8*sgi, 8*sgi+8) x all 64 columns (8 accumulators); A fragments come straight from global memory (L1/L2)
@@ -275,9 +284,9 @@ bool GpuExperts::init(const CpuExperts& cx, size_t stage_bytes, int max_tokens, 
             int gu, dn;
             uint32_t dno, bytes;
             if (!cx.expert_info(L, e, &body, &gu, &dn, &dno, &bytes)) continue;
-            auto okc = [](int c) { return c == 0 || c == 2 || c == 3; };
+            auto okc = [](int c) { return c == 0 || c == 2 || c == 3 || c == 4; };
             if (!okc(gu) || !okc(dn)) {
-                err = "expert code not supported by the GPU path (only S1.25 / S2_K / S3_K): layer " + std::to_string(L) + " expert " + std::to_string(e);
+                err = "expert code not supported by the GPU path (only S1.25 / S2_K / S3_K / S4_K): layer " + std::to_string(L) + " expert " + std::to_string(e);
                 return false;
             }
             if (bytes > I.slot_bytes) {
@@ -466,7 +475,7 @@ void GpuExperts::run(int L, int T, const float* z_dev, const int32_t* idx, const
         }
         double tc = now_s();
 #pragma omp parallel for num_threads(I.copy_threads) schedule(dynamic, 1)
-        for (int i = a; i < b; ++i) std::memcpy(I.h_slot[hs] + off[i - a], einfo[I.act_e[i]].body, einfo[I.act_e[i]].bytes);
+        for (int i = a; i < b; ++i) cx.copy_body(einfo[I.act_e[i]].body, einfo[I.act_e[i]].bytes, I.h_slot[hs] + off[i - a]);
         I.stats.t_copy_host += now_s() - tc;
         // copy queue: wait for the compute that last used this device slot, then items + bodies
         sycl::event ci = I.cq.submit([&](sycl::handler& h) {

@@ -656,6 +656,7 @@ public:
                 // prefill: routed experts on the GPU (streamed from the page cache), result stays on the device
                 gx->run(il - 1, T, z_f, h_idx, h_w, zout_f, nullptr);
             } else if (!std::getenv("HY4S_SKIP_EXPERTS")) {  // timing experiment: no routed experts at all (wrong output)
+                if (cx.streaming()) cx.prefetch_experts(il - 1, h_idx, T * 16);  // experts larger than the page cache: start the SSD reads of the routed bodies now
                 cx.run(il - 1, T, h_z, h_idx, h_w, h_zout, expert_act);
             }
             if (dump && dbg_layers) {

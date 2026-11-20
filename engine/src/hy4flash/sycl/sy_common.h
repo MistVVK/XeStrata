@@ -17,6 +17,20 @@
 
 namespace hy4s {
 
+// storage bytes this process has read (/proc/self/io read_bytes: page-cache misses, O_DIRECT reads, readahead), in GB
+inline double io_read_gb() {
+    double v = 0;
+    if (FILE* f = fopen("/proc/self/io", "r")) {
+        char ln[128];
+        while (fgets(ln, sizeof ln, f)) {
+            unsigned long long b;
+            if (sscanf(ln, "read_bytes: %llu", &b) == 1) v = (double)b / 1e9;
+        }
+        fclose(f);
+    }
+    return v;
+}
+
 using half = sycl::half;
 
 constexpr int HID = 3072;

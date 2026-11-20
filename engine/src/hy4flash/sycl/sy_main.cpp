@@ -264,6 +264,7 @@ int main(int argc, char** argv) {
         }
         tok.reserve(max_ctx + 8);
         std::string top_out;
+        const double io0 = io_read_gb();
         const double t0 = now_s();
         int done = 0;
         const int V = r.c.vocab;
@@ -298,6 +299,8 @@ int main(int argc, char** argv) {
         r.pacc_report("prefill", (T0 + r.Tc - 1) / r.Tc);
         printf("%s", top_out.c_str());
         fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram cpu %.2f s, cpu experts %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_cpu, r.t_cpu_exp);
+        const double io1 = io_read_gb();
+        fprintf(stderr, "[io] prefill: SSD read %.2f GB in %.2f s = %.3f GB/s (storage reads of this process, experts + Engram; direct expert reads %.2f GB, from page cache %.2f GB)\n", io1 - io0, t_pf, (io1 - io0) / std::max(t_pf, 1e-9), cx.direct_read_bytes() / 1e9, cx.cached_read_bytes() / 1e9);
         if (spec_mode) {
             Spec sp(r, df, scfg);
             std::string gen_ids, finish, e2;
@@ -312,6 +315,7 @@ int main(int argc, char** argv) {
             }
             printf("generated ids: %s\n", gen_ids.c_str());
             fprintf(stderr, "[decode] %d tokens in %.2f s = %.2f tok/s (spec dfly2, finish %s, cpu experts %.1f ms/token)\n", made, td, made / td, finish.c_str(), made ? r.t_cpu_exp / made * 1000 : 0.0);
+            fprintf(stderr, "[io] decode: SSD read %.2f GB in %.2f s = %.3f GB/s (storage reads of this process, experts + Engram)\n", io_read_gb() - io1, td, (io_read_gb() - io1) / std::max(td, 1e-9));
             sp.report(stderr, td * 1000.0);
             std::ofstream f(out_dir + "/gen_ids.txt");
             f << gen_ids << "\n";
@@ -362,6 +366,7 @@ int main(int argc, char** argv) {
             std::sort(times.begin(), times.end());
             fprintf(stderr, "[decode] %zu tokens in %.2f s = %.2f tok/s (median step %.1f ms, cpu experts %.1f ms/token)\n", times.size(), td, times.size() / td,
                     times.empty() ? 0.0 : times[times.size() / 2] * 1000, times.empty() ? 0.0 : r.t_cpu_exp / times.size() * 1000);
+            fprintf(stderr, "[io] decode: SSD read %.2f GB in %.2f s = %.3f GB/s (storage reads of this process, experts + Engram)\n", io_read_gb() - io1, td, (io_read_gb() - io1) / std::max(td, 1e-9));
             std::ofstream f(out_dir + "/gen_ids.txt");
             f << gen_ids << "\n";
             if (!margins.empty()) {
