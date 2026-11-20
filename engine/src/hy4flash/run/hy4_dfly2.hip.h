@@ -261,6 +261,7 @@ struct DFly2 {
     // can the block at anchor position a be drafted (a context list is needed for every layer above index_topk)
     bool can_draft(int a, int K) const {
         if (!ok || K < 1 || K > DFLY_KMAX) return false;
+        if (!r.kv_ensure(a + K + 2)) return false;
         if (a + K + 1 > r.slots_sparse) return false;
         if (r.cap_p0 < 0) return false;
         const int row = a - 1 - r.cap_p0;
