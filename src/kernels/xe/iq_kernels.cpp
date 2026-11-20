@@ -2876,7 +2876,7 @@ inline void bih3_seg_row(const sycl::sub_group& sg, const Bih3R1q2Layer& L, cons
         const uint8_t* code = codes + (size_t) b * 4 * (size_t) k;
         const float scale = half_at(cols + (size_t) b * 2) * L.p2[matrix][(qs[b / 4] >> (2 * (b % 4))) & 3];
         xe::Bih3Planes planes[8];
-        for (int j = 0; j < 8; ++j) planes[j] = xe::bih3_planes(code, k, q * 8 + j);
+        for (int j = 0; j < 8; ++j) planes[j] = xe::bih3_planes_w(code, k, q * 8 + j);
         for (int e = 0; e < NE; ++e)
             if (e < n) {
                 const block_q8_1& xb = xs[e][sb];

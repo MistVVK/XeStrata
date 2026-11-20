@@ -703,7 +703,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
                 L.route_ids = m_ids_ + (size_t) tb * K;
                 L.had_block = f.had_d ? f.had_block : 0; L.d_signs = mode.had_signs;
                 std::memcpy(L.p2, f.p2, sizeof L.p2);
-                bih3_r1q2_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq(tb), bih3_scratch_, hit_out, cs);
+                bih3_r1q2_grouped(L, gp, gs, gn, p_dst, p_tok, grid_groups, cap, nat_xq(tb), bih3_scratch_, hit_out, cs);
                 return;
             }
             NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);

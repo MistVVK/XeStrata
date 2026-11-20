@@ -10,6 +10,16 @@ namespace strata::kernels::xe {
 
 struct Bih3Planes { uint32_t v[3]; };
 
+// A 15-bit state's four values as three byte planes.
+inline Bih3Planes bih3_state_planes(uint32_t state) {
+    state &= 0x7fffu;
+    const uint32_t a = state * 0x9e3779b1u, b = state * 0x85ebca6bu;
+    const uint32_t c = state * 0xc2b2ae35u, d = state * 0x27d4eb2fu;
+    return {{(((a >> 8) & 0x00ffffffu) | ((b & 0x0000ff00u) << 16)) ^ 0x80808080u,
+             (((b >> 16) & 0x0000ffffu) | ((c & 0x00ffff00u) << 8)) ^ 0x80808080u,
+             (((c >> 24) & 0xffu) | (d & 0xffffff00u)) ^ 0x80808080u}};
+}
+
 // Each byte is signed: adding the three bytes gives the value's integer numerator (the weight is that / 128).
 // K=8 stores each state in this order rather than as the circular K-bit stream used by the other widths.
 inline Bih3Planes bih3_planes(const uint8_t* code, int k, int step) {
@@ -21,12 +31,17 @@ inline Bih3Planes bih3_planes(const uint8_t* code, int k, int step) {
                                 ((uint32_t) code[(i + 2) % bytes] << 16);
         state = window >> (bit % 8);
     }
-    state &= 0x7fffu;
-    const uint32_t a = state * 0x9e3779b1u, b = state * 0x85ebca6bu;
-    const uint32_t c = state * 0xc2b2ae35u, d = state * 0x27d4eb2fu;
-    return {{(((a >> 8) & 0x00ffffffu) | ((b & 0x0000ff00u) << 16)) ^ 0x80808080u,
-             (((b >> 16) & 0x0000ffffu) | ((c & 0x00ffff00u) << 8)) ^ 0x80808080u,
-             (((c >> 24) & 0xffu) | (d & 0xffffff00u)) ^ 0x80808080u}};
+    return bih3_state_planes(state);
+}
+
+// The same values with the codes read as 32-bit words (the block is 4K bytes, 4-byte aligned in every blob): two word
+// loads a state instead of three byte loads.  K=8's byte order goes through the byte form.
+inline Bih3Planes bih3_planes_w(const uint8_t* code, int k, int step) {
+    if (k == 8) return bih3_planes(code, k, step);
+    const auto* words = reinterpret_cast<const uint32_t*>(code);
+    const int bit = (31 - step) * k, w = bit >> 5, sh = bit & 31;
+    const uint64_t pair = (uint64_t) words[w] | ((uint64_t) words[w + 1 == k ? 0 : w + 1] << 32);
+    return bih3_state_planes((uint32_t) (pair >> sh));
 }
 
 }  // namespace strata::kernels::xe
