@@ -117,13 +117,8 @@ __device__ __forceinline__ void decode_w8(const uint8_t* pl, int u, uint32_t (&w
     }
 }
 
-// SwiGLU input prologue (same expression as hy4::k_swiglu_h): the activation tile is half(silu(g) * u) built from two fp32 arrays
-__device__ __forceinline__ float sw_silu(float x) { return x / (1.0f + __expf(-x)); }
-
-// Xg/Xu != nullptr: the X rows are not read from X but computed on the fly as half(silu(Xg[m][k]) * Xu[m][k]) (fp32 [M][K] arrays)
 template <int FMT, int MT, int RW>
-__device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M, int bidx,
-                                          const float* __restrict__ Xg = nullptr, const float* __restrict__ Xu = nullptr) {
+__device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M, int bidx) {
     constexpr int KC = 16384 / MT;  // halves per token in LDS
     constexpr int SB = sk_sb_bytes(FMT);
     __shared__ uint4 xs[MT * KC / 8];
@@ -146,17 +141,7 @@ __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, 
         for (int i = threadIdx.x; i < MT * n8; i += 256) {
             const int mm = i / n8, c = i - mm * n8;
             uint4 v = make_uint4(0, 0, 0, 0);
-            if (Xg) {
-                if (mm < M) {
-                    const size_t o = (size_t)mm * K + k0 + c * 8;
-                    const float4 g0 = *(const float4*)(Xg + o), g1 = *(const float4*)(Xg + o + 4);
-                    const float4 u0 = *(const float4*)(Xu + o), u1 = *(const float4*)(Xu + o + 4);
-                    v.x = h2_pack(sw_silu(g0.x) * u0.x, sw_silu(g0.y) * u0.y);
-                    v.y = h2_pack(sw_silu(g0.z) * u0.z, sw_silu(g0.w) * u0.w);
-                    v.z = h2_pack(sw_silu(g1.x) * u1.x, sw_silu(g1.y) * u1.y);
-                    v.w = h2_pack(sw_silu(g1.z) * u1.z, sw_silu(g1.w) * u1.w);
-                }
-            } else if (mm < M) v = *(const uint4*)(X + (size_t)mm * K + k0 + c * 8);
+            if (mm < M) v = *(const uint4*)(X + (size_t)mm * K + k0 + c * 8);
             xs[mm * (KC / 8) + c] = v;
         }
         __syncthreads();
@@ -206,8 +191,6 @@ struct LinJob {
     float* Y;
     int N;
     int blk0;  // first block of this job in the combined grid
-    const __half* X;   // per-job activations (nullptr: the X argument of the launch)
-    const float *Xg, *Xu;  // != nullptr: this job's activations are half(silu(Xg) * Xu) (fp32 [M][K]); X is ignored
 };
 
 template <int FMT, int MT, int RW>
@@ -215,12 +198,12 @@ __global__ void __launch_bounds__(256) k_gemv_multi(const LinJob* __restrict__ j
     int j = 0;
     while (j + 1 < njobs && (int)blockIdx.x >= jobs[j + 1].blk0) ++j;
     const LinJob jb = jobs[j];
-    gemv_body<FMT, MT, RW>(jb.W, jb.N, K, jb.X ? jb.X : X, jb.Y, M, (int)blockIdx.x - jb.blk0, jb.Xg, jb.Xu);
+    gemv_body<FMT, MT, RW>(jb.W, jb.N, K, X, jb.Y, M, (int)blockIdx.x - jb.blk0);
 }
 
 template <int FMT, int MT>
 inline void launch_gemv(hipStream_t s, const void* W, int N, int K, const __half* X, float* Y, int M) {
-    constexpr int RW = 2;  // rows per wave (1 and 4 measured: no gain, 4 slower for M > 1)
+    constexpr int RW = 2;
     dim3 grid((N + 8 * RW - 1) / (8 * RW)), block(256);
     hipLaunchKernelGGL((k_gemv<FMT, MT, RW>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
 }
@@ -257,9 +240,7 @@ struct LinMulti {
     int njobs = 0, total_blocks = 0, K = 0, fmt = 0;
 };
 
-// X / Xg / Xu: optional per-job activations (arrays of n pointers or nullptr), see LinJob
-inline LinMulti linear_multi_build(int fmt, int K, int n, const void* const* W, float* const* Y, const int* N, const __half* const* X = nullptr, const float* const* Xg = nullptr,
-                                   const float* const* Xu = nullptr) {
+inline LinMulti linear_multi_build(int fmt, int K, int n, const void* const* W, float* const* Y, const int* N) {
     LinMulti d;
     d.fmt = fmt;
     d.K = K;
@@ -270,9 +251,6 @@ inline LinMulti linear_multi_build(int fmt, int K, int n, const void* const* W, 
         h[i].W = (const uint8_t*)W[i];
         h[i].Y = Y[i];
         h[i].N = N[i];
-        h[i].X = X ? X[i] : nullptr;
-        h[i].Xg = Xg ? Xg[i] : nullptr;
-        h[i].Xu = Xu ? Xu[i] : nullptr;
         h[i].blk0 = blk;
         blk += (N[i] + 15) / 16;  // RW = 2 rows per wave, 8 waves per block
     }

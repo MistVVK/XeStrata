@@ -20,7 +20,7 @@
 #include "skhy4.hip.h"
 
 #ifndef TUNE_DEFAULT
-#define TUNE_DEFAULT 0  // default HY4_TUNE bitmask when the environment variable is not set (see Runner::tune_init)
+#define TUNE_DEFAULT 834  // default HY4_TUNE bitmask when the environment variable is not set (see Runner::tune_init)
 #endif
 
 namespace hy4 {
@@ -269,40 +269,22 @@ public:
         linear_h(st, t.fmt, tw(name), (int)t.rows(), (int)t.cols(), X, Y, M);
     }
 
-    // ---- HY4-TUNE decode launch fusion (T <= 4). HY4_TUNE = bitmask, read once; each bit is an independent, exact (bit-for-bit or same-rounding) restructuring of the decode step:
-    //   2 TN_TOPK    router top-16 by rank instead of 16 sequential block argmax rounds
-    //   4 TN_ATT     q_a_proj + kv_a_proj in one launch (linear_h_multi)
-    //  16 TN_M1      routed_expert_down + shared gate + shared up in one launch (one activation read)
-    //  64 TN_NOF2H   no fp32->fp16 passes around moe_experts (the expert kernels read fp32 z, the reduce kernel also writes fp16)
-    // 128 TN_M2      routed_expert_up + shared down (swiglu prologue) in one launch (needs M1 + NOF2H)
-    // 512 TN_ENG     engram layers, one token: the 5 projections in one launch
-    // 256 TN_ROUTE   one token: the router top-k kernel copies the chosen experts' records, the one-token expert kernels (2 launches) replace route + gu + dn + reduce
-    //   (TN_TOPK is now the rank-based k_router_topk_r with 512 threads, bit-identical to the argmax-round kernel)
-    enum { TN_TOPK = 2, TN_ATT = 4, TN_M1 = 16, TN_NOF2H = 64, TN_M2 = 128, TN_ROUTE = 256, TN_ENG = 512 };
+    // ---- HY4-TUNE decode path (one token / T <= 4). HY4_TUNE = bitmask (default TUNE_DEFAULT), read once; every bit is an exact restructuring (same numbers bit for bit):
+    //   2 TN_TOPK     router top-16 by rank (k_router_topk_r) instead of 16 sequential block-wide argmax rounds
+    //  64 TN_NOF2H    no fp32 -> fp16 passes around moe_experts (the expert kernels read the fp32 latent z, the reduce also writes the fp16 result)
+    // 256 TN_ROUTE    one token: the router kernel copies the 16 chosen experts' records, the one-token expert kernels (2 launches) replace route + gu + dn + reduce
+    // 512 TN_ENG      engram layers, one token: the 5 projections in one launch
+    enum { TN_TOPK = 2, TN_NOF2H = 64, TN_ROUTE = 256, TN_ENG = 512 };
     int tune = 0;
     bool route_now = false;
     ExpertDev* slot_rec = nullptr;  // [16] ExpertDev records of the chosen experts (one-token decode path)
-    float *kva_f = nullptr, *shB_g = nullptr, *shB_u = nullptr, *shB_o = nullptr;
-    std::vector<LinMulti> lm_att, lm_m1, lm_sh2, lm_shd, lm_m2;  // per layer (lm_*.d_jobs == nullptr: not built / formats differ)
-    LinMulti lm_eng[4];  // per engram module: key_projs 0..3 + value_proj for one token
-    bool tune_att_ok(int il) const { return !lm_att.empty() && lm_att[il].d_jobs; }
-    bool tune_mlp_ok(int il) const { return !lm_m1.empty() && il >= 1 && lm_m1[il].d_jobs && lm_sh2[il].d_jobs && lm_shd[il].d_jobs && lm_m2[il].d_jobs; }
+    LinMulti lm_eng[4];             // per engram module: key_projs 0..3 + value_proj for one token
     void tune_init() {
         const char* e = getenv("HY4_TUNE");
         tune = e ? atoi(e) : TUNE_DEFAULT;
         if (tune == 0) return;
         slot_rec = dalloc<ExpertDev>(16);
         HCK(hipMemset(moe_ws, 0, moe_ws_bytes(Tc)));  // the one-token expert kernels keep their column tickets in the (otherwise unused) `fill` table of the workspace
-        kva_f = dalloc<float>((size_t)Tc * 576);
-        shB_g = dalloc<float>((size_t)Tc * 1536);
-        shB_u = dalloc<float>((size_t)Tc * 1536);
-        shB_o = dalloc<float>((size_t)Tc * HID);
-        const int NL = c.n_layers;
-        lm_att.assign(NL, LinMulti());
-        lm_m1.assign(NL, LinMulti());
-        lm_sh2.assign(NL, LinMulti());
-        lm_shd.assign(NL, LinMulti());
-        lm_m2.assign(NL, LinMulti());
         if (engram_ready && emeta.layers.size() >= 4) {
             for (int mo = 0; mo < 4; ++mo) {
                 const std::string p = L(emeta.layers[mo]) + ".engram_layer";
@@ -321,53 +303,6 @@ public:
                     N[j] = (int)t.rows();
                 }
                 if (ok) lm_eng[mo] = linear_multi_build(fmt, K, 5, W, Y, N);
-            }
-        }
-        for (int il = 0; il < NL; ++il) {
-            const std::string pa = L(il) + ".self_attn", pm = L(il) + ".mlp";
-            {
-                const TInfo &qa = ti(pa + ".q_a_proj.weight"), &kv = ti(pa + ".kv_a_proj_with_mqa.weight");
-                if (qa.fmt == kv.fmt && qa.cols() == kv.cols() && qa.fmt != FMT_Q8ROW) {
-                    const void* W[2] = {tw(pa + ".q_a_proj.weight"), tw(pa + ".kv_a_proj_with_mqa.weight")};
-                    float* Y[2] = {F1, kva_f};
-                    const int N[2] = {(int)qa.rows(), (int)kv.rows()};
-                    lm_att[il] = linear_multi_build(qa.fmt, (int)qa.cols(), 2, W, Y, N);
-                }
-            }
-            if (il == 0) continue;
-            const TInfo &rd = ti(pm + ".routed_expert_down_proj.weight"), &sg = ti(pm + ".shared_experts.gate_proj.weight"), &su = ti(pm + ".shared_experts.up_proj.weight"),
-                        &ru = ti(pm + ".routed_expert_up_proj.weight"), &sd = ti(pm + ".shared_experts.down_proj.weight");
-            const bool same_in = rd.fmt == sg.fmt && rd.fmt == su.fmt && rd.cols() == sg.cols() && rd.cols() == su.cols() && rd.fmt != FMT_Q8ROW;
-            const bool same_out = ru.fmt == sd.fmt && ru.cols() == sd.cols() && ru.fmt != FMT_Q8ROW;
-            if (!same_in || !same_out) continue;
-            {
-                const void* W[3] = {tw(pm + ".routed_expert_down_proj.weight"), tw(pm + ".shared_experts.gate_proj.weight"), tw(pm + ".shared_experts.up_proj.weight")};
-                float* Y[3] = {z_f, shB_g, shB_u};
-                const int N[3] = {(int)rd.rows(), (int)sg.rows(), (int)su.rows()};
-                lm_m1[il] = linear_multi_build(rd.fmt, (int)rd.cols(), 3, W, Y, N);
-            }
-            {
-                const void* W[2] = {tw(pm + ".shared_experts.gate_proj.weight"), tw(pm + ".shared_experts.up_proj.weight")};
-                float* Y[2] = {shB_g, shB_u};
-                const int N[2] = {(int)sg.rows(), (int)su.rows()};
-                lm_sh2[il] = linear_multi_build(sg.fmt, (int)sg.cols(), 2, W, Y, N);
-            }
-            {
-                const void* W[1] = {tw(pm + ".shared_experts.down_proj.weight")};
-                float* Y[1] = {shB_o};
-                const int N[1] = {(int)sd.rows()};
-                const float* Xg[1] = {shB_g};
-                const float* Xu[1] = {shB_u};
-                lm_shd[il] = linear_multi_build(sd.fmt, (int)sd.cols(), 1, W, Y, N, nullptr, Xg, Xu);
-            }
-            {
-                const void* W[2] = {tw(pm + ".routed_expert_up_proj.weight"), tw(pm + ".shared_experts.down_proj.weight")};
-                float* Y[2] = {F2, shB_o};
-                const int N[2] = {(int)ru.rows(), (int)sd.rows()};
-                const __half* X[2] = {z_h, nullptr};
-                const float* Xg[2] = {nullptr, shB_g};
-                const float* Xu[2] = {nullptr, shB_u};
-                lm_m2[il] = linear_multi_build(ru.fmt, (int)ru.cols(), 2, W, Y, N, X, Xg, Xu);
             }
         }
         fprintf(stderr, "[tune] HY4_TUNE=%d\n", tune);
@@ -773,17 +708,14 @@ public:
         const float* hsc = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_base");
         { PS _q(this, "hc_mix"); hc_pre(x, hfn, hsc, hbs, (const float*)tw(L(il) + ".input_layernorm.weight"), 8, T, cur_h, (float*)nullptr); }
-        const bool fz = T <= 4 && tune != 0;
-        const bool att_m = fz && (tune & TN_ATT) && tune_att_ok(il);
         // q path
-        if (att_m) { PS _q(this, "lin q_a+kv_a"); linear_h_multi(st, lm_att[il], cur_h, T); }  // F1 = q_a [T][1024], kva_f = kv_a [T][576]
-        else lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
+        lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
         { PS _q(this, "q_a_rms"); hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps); }
         lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
-        if (!att_m) lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]  (qr_h already extracted)
+        lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]  (qr_h already extracted)
         __half* cache = kcache[il];
         const int cslots = swa ? ring : slots_sparse;
-        { PS _q(this, "mla_write_kv"); mla_write_kv(st, att_m ? kva_f : F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
+        { PS _q(this, "mla_write_kv"); mla_write_kv(st, F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
         const bool dec = T <= 8;
         const int kvfmt = ti(pa + ".kv_b_proj.weight").fmt;
         { PS _q(this, "mla_prep_q"); if (dec) mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il));
@@ -865,29 +797,6 @@ public:
         { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
     }
 
-    // decode MoE half of a layer (router logits -> moe_idx / moe_w already done) with the HY4_TUNE launch fusions; every variant computes the same numbers as the plain flow
-    void moe_dec_fused(int il, int T, const std::string& pm) {
-        const bool m1 = tune & TN_M1, nof = tune & TN_NOF2H, m2 = (tune & TN_M2) && m1 && nof;
-        const size_t nz = (size_t)T * 1536;
-        if (m1) { PS _q(this, "lin down+shared gate/up"); linear_h_multi(st, lm_m1[il], cur_h, T); }  // z_f, shB_g, shB_u
-        else {
-            lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
-            linear_h_multi(st, lm_sh2[il], cur_h, T);
-        }
-        if (nof) { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, nullptr, moe_idx, moe_w, zout_f, T, moe_ws, z_f, z_h, route_now ? slot_rec : nullptr); }
-        else {
-            hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz);
-            { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws, nullptr, nullptr, route_now ? slot_rec : nullptr); }
-            hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz);
-        }
-        if (m2) { PS _q(this, "lin up+shared down"); linear_h_multi(st, lm_m2[il], z_h, T); }  // F2 = routed up, shB_o = shared down
-        else {
-            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
-            linear_h_multi(st, lm_shd[il], cur_h, T);
-        }
-        { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)shB_o, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
-    }
-
     void mlp_layer(int il, int T) {
         const std::string pm = L(il) + ".mlp";
         const float* hfn = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_fn");
@@ -913,13 +822,16 @@ public:
                 if (tune & TN_TOPK) hipLaunchKernelGGL(k_router_topk_r, dim3(T), dim3(512), 0, st, F1, rb, moe_idx, moe_w, 16, c.routed_scale, exl, rec);
                 else hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, rb, moe_idx, moe_w, 512, 16, c.routed_scale, exl, rec);
             }
-            if (T <= 4 && !hyb && (tune & (TN_M1 | TN_NOF2H | TN_M2)) && tune_mlp_ok(il)) { moe_dec_fused(il, T, pm); return; }
             lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
             size_t nz = (size_t)T * 1536;
             if (hyb) { moe_hybrid_tail(il, T, pm); } else {
+            const bool nof = T <= 4 && (tune & TN_NOF2H);  // fp32 latent read directly by the expert kernels, fp16 result written by their reduce
+            if (nof) { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, nullptr, moe_idx, moe_w, zout_f, T, moe_ws, z_f, z_h, route_now ? slot_rec : nullptr); }
+            else {
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
             { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws, nullptr, nullptr, route_now ? slot_rec : nullptr); }
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
+            }
             lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
             lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
             lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
