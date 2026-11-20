@@ -251,10 +251,16 @@ public:
                 continue;
             }
             // verify [x_a, y_1..y_Kp]
+            const bool chk_was_fr = r.vcache_frozen;
+            if (cfg.check) {
+                // Freeze vcache BEFORE the window pass so window and 1-token recomputation see the exact same VRAM/CPU expert partition
+                r.vcache_flush();
+                r.vcache_frozen = true;
+            }
             const double tv0 = now_s();
             for (int i = 1; i <= Kp; ++i) tok.push_back(y[i]);
             const int T = Kp + 1;
-            if (!r.forward_chunk(tok.data(), a, T, err)) { finish = "error"; break; }
+            if (!r.forward_chunk(tok.data(), a, T, err)) { r.vcache_frozen = chk_was_fr; finish = "error"; break; }
             r.head(T, 0);
             hipLaunchKernelGGL(k_argmax_rows, dim3(T), dim3(1024), 0, r.st, (const float*)r.logits, V, r.d_argmax);
             HCK(hipMemcpyAsync(h_arg, r.d_argmax, T * 4, hipMemcpyDeviceToHost, r.st));
@@ -264,10 +270,7 @@ public:
             while (n < Kp && y[n + 1] == h_arg[n]) ++n;
             d.snap_h(n);
             if (cfg.check) {
-                // diagnostic: recompute rows 0..n one token at a time and compare them with the window's rows (bitwise); freeze vcache during comparison
-                const bool was_fr = r.vcache_frozen;
-                r.vcache_flush();
-                r.vcache_frozen = true;
+                // diagnostic: recompute rows 0..n one token at a time and compare them with the window's rows (bitwise)
                 std::vector<float> wl((size_t)T * V), sl(V);
                 HCK(hipMemcpy(wl.data(), r.logits, (size_t)T * V * 4, hipMemcpyDeviceToHost));
                 for (int i = 0; i <= n; ++i) {
@@ -284,7 +287,7 @@ public:
                                                      (int)(std::max_element(sl.begin(), sl.end()) - sl.begin()), (int)(std::max_element(wl.begin() + (size_t)i * V, wl.begin() + (size_t)(i + 1) * V) - wl.begin() - (size_t)i * V));
                     }
                 }
-                r.vcache_frozen = was_fr;
+                r.vcache_frozen = chk_was_fr;
                 if (finish == "error") break;
             }
             if (want_margin)

@@ -328,7 +328,7 @@ inline void hy4_setenv(const char* k, const char* v, int) {
 #endif
 }
 
-inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& model_path) {
+inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& model_path, bool multi_gpu = false) {
     const double GB = 1e9, tot = (double)total / GB;
     double trunk = 5.92;
     if (!model_path.empty()) {
@@ -340,11 +340,11 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     const bool host_embed = !getenv("HY4_EMBED_VRAM") && (total < (48ull << 30));
     if (host_embed && trunk > 0.5) trunk -= 0.38;
     // Sparse KV (no Vt: 1152 B/slot) + IndexPool (576 B/slot) = 1728 B/slot * 12 layers = 20,736 B/token.
-    // On discrete cards (< 48 GB) with max_ctx > 16384, allocate sparse KV + IndexPool in 16,384-token VRAM increments
-    // so short/medium chats start with ~9.0-9.5 GB free VRAM for hot experts on 16 GB cards and grow cleanly up to 128K.
+    // On single discrete cards (< 48 GB) with max_ctx > 16384, allocate sparse KV + IndexPool in 16,384-token VRAM increments
+    // (reclaiming adaptive vcache slabs as KV grows). On multi-GPU static EP (no vcache slabs), reserve full max_ctx KV upfront so 128K stays in VRAM.
     const double per_pos = 12.0 * 1152.0 + 12.0 * 512.0 + 12.0 * 64.0;  // 20,736 B per token across 12 sparse layers
     int init_slots = max_ctx;
-    if (!getenv("HY4_KV_NO_GROW") && total < (48ull << 30) && max_ctx > 16384) {
+    if (!multi_gpu && !getenv("HY4_KV_NO_GROW") && total < (48ull << 30) && max_ctx > 16384) {
         init_slots = 16384;
         if (getenv("HY4_KV_INIT_SLOTS")) init_slots = std::max(4096, std::min(max_ctx, atoi(getenv("HY4_KV_INIT_SLOTS"))));
         else {
@@ -360,8 +360,9 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         return c * 0.30e6 / GB + 0.22 + 30.0 * (512.0 + c) * 1152.0 / GB;
     };
     if (chunk <= 0) {
-        // 16 GB+ cards and large UMA systems default to Tc = 4096; 12 GB -> 2048; 8 GB -> 1024/512
-        int c = (tot >= 15.0) ? 4096 : (tot >= 11.0 ? 2048 : 1024);
+        // 16 GB+ cards and large UMA systems default to Tc = 4096; 12 GB -> 2048; 8 GB -> 1024/512.
+        // Multi-GPU 32 GB static EP at >=96K context uses Tc = 2048 so 100% of SQ-64 experts + full 128K KV fit in HBM2.
+        int c = (multi_gpu && max_ctx >= 98304 && tot < 40.0) ? 2048 : ((tot >= 15.0) ? 4096 : (tot >= 11.0 ? 2048 : 1024));
         while (c > 256 && est_work_gb(c) > 0.14 * tot) c >>= 1;
         while (c > 256 && trunk + est_work_gb(c) + kv_init_gb + wkv + 0.35 > tot) c >>= 1;
         chunk = c;
@@ -506,7 +507,7 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         HCK(hipSetDevice(pd));
         size_t pfr = 0, ptot = 0;
         HCK(hipMemGetInfo(&pfr, &ptot));
-        const size_t preserve = (size_t)512 << 20;  // 512 MiB for peer moe_ws + buffers + runtime
+        const size_t preserve = (size_t)960 << 20;  // 960 MiB for peer moe_ws (604 MiB at Tc=4096) + buffers + runtime
         vcap[1 + p] = pfr > preserve ? (uint64_t)(pfr - preserve) : 0;
         int can = 0;
         if (cudaDeviceCanAccessPeer(&can, g.primary_gpu, pd) == cudaSuccess && can) {

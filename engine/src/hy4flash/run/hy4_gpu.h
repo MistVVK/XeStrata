@@ -169,7 +169,7 @@ static __device__ __noinline__ void mma_16816_shfl(float& c0, float& c1, float& 
         c3 = h2_dot_f32(ar10, bc10, h2_dot_f32(ar11, bc11, c3));
     }
 }
-// Volta sm_70 native HMMA.884: each quad-pair computes 8x8x4 (4 quad-pairs per warp = 1024 FMAs/inst).
+// Volta sm_70 native HMMA.884: each quad-pair computes 8x8x4 (4 quad-pairs per warp = 1024 FMAs/inst = full 16x16x4 tile).
 __device__ __forceinline__ void mma_884(float (&d)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
     asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
@@ -180,7 +180,27 @@ __device__ __forceinline__ void mma_884(float (&d)[8], uint32_t a0, uint32_t a1,
     (void)d; (void)a0; (void)a1; (void)b0; (void)b1;
 #endif
 }
-__device__ __forceinline__ void mma_16816_sm70(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+// Convert Volta HMMA.884 16x16 quad-pair accumulator d[8] (qp = (lane>>2)&3: qp_m=qp>>1, qp_n=qp&1) to standard fv8 layout ONCE after the K-loop.
+__device__ __forceinline__ void sm70_d8_to_fv8(const float (&d)[8], float (&out)[8]) {
+    const int lane = threadIdx.x & 31;
+    const int g = lane >> 2, q = lane & 3;
+    const bool r2 = (g & 2) != 0, c4 = (q & 2) != 0;
+    const int base = ((g >> 2) << 4) | ((q & 1) << 1) | (g & 1);
+    const int qps[4] = {0, 2, 1, 3};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int src = base | (qps[k] << 2);
+        const float t0 = __shfl_sync(0xffffffffu, d[0], src), t1 = __shfl_sync(0xffffffffu, d[1], src);
+        const float t2 = __shfl_sync(0xffffffffu, d[2], src), t3 = __shfl_sync(0xffffffffu, d[3], src);
+        const float t4 = __shfl_sync(0xffffffffu, d[4], src), t5 = __shfl_sync(0xffffffffu, d[5], src);
+        const float t6 = __shfl_sync(0xffffffffu, d[6], src), t7 = __shfl_sync(0xffffffffu, d[7], src);
+        const float a0 = r2 ? t2 : t0, a1 = r2 ? t3 : t1;
+        const float b0 = r2 ? t6 : t4, b1 = r2 ? t7 : t5;
+        out[2 * k]     = c4 ? b0 : a0;
+        out[2 * k + 1] = c4 ? b1 : a1;
+    }
+}
+static __device__ __noinline__ void mma_16816_sm70(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
     // Map m16n8k16 fragment layout onto 2x Volta HMMA.884 instructions using all 4 quad-pairs (0 shared memory):
     //   qp = (lane >> 2) & 3: qp 0,1 compute M[0..7] (k_half 0,1); qp 2,3 compute M[8..15] (k_half 0,1).
     //   rl = (lane & 3) + ((lane >> 4) & 1) * 4: row/col index 0..7 within each quad-pair.

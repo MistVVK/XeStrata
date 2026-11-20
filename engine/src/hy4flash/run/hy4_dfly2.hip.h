@@ -328,7 +328,7 @@ struct DFly2 {
 #endif
             DgKey key{};
             key.K = K; key.list_mask = lmask; key.s_causal = s_causal; key.rv = std::min(rv, 1024);
-            key.kv_moved = r.kv_moved ? 1 : 0;
+            key.kv_moved = r.kv_is_host ? 1 : 0;
             key.lin_gemv_max = skd::lin_gemv_max_m();
 #if HY4_MMA
             key.int8_mma = skd::lin_int8_mma();

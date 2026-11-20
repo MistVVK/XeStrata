@@ -198,6 +198,8 @@ public:
     size_t pf_cap = 0;
     uint8_t* d_scratch[2] = {nullptr, nullptr};
     uint8_t* h_bounce[2] = {nullptr, nullptr};    // 2 x cap pinned host bounce ring (used when arena is not pinned or for active-expert gather)
+    ExpertDev* d_pf_tables = nullptr;
+    size_t d_pf_tables_cap = 0;
     ExpertDev* d_pf_dyn_table[2] = {nullptr, nullptr};
     ExpertDev* h_pf_dyn_table[2] = {nullptr, nullptr};  // persistent pinned host mirror for pf_use_gather async H2D
     bool pf_bounce = false;
@@ -286,7 +288,7 @@ public:
     hipStream_t st2 = nullptr;
     hipEvent_t ev_pf_copy[2] = {nullptr, nullptr}, ev_pf_done[2] = {nullptr, nullptr};
     bool ev_pf_done_set[2] = {false, false};
-    bool pf_stream = false;
+    bool pf_stream = false, pf_dirty = false;
     int pf_min_T = 128;
     int pf_gather_max_T = 1536;  // below this T, gather only cnt[e] > 0 experts; at/above, stream full layer overlapped with attention
     bool pf_active(int T) const { return pf_stream && T >= pf_min_T; }
@@ -338,11 +340,16 @@ public:
         }
 #endif
         pf_bounce = !pinned_arena;
+        const size_t margin = (size_t)320 << 20, tables_est = (size_t)41 * 16 * 8192;
+        const size_t cap_limit = getenv("HY4_PF_BUF_MB") ? ((size_t)std::max(64, atoi(getenv("HY4_PF_BUF_MB"))) << 20) : ((size_t)256 << 20);
         size_t fr = 0, tot = 0;
         HCK(hipMemGetInfo(&fr, &tot));
-        const size_t margin = (size_t)320 << 20, tables_est = (size_t)41 * 16 * 8192;
+        const size_t want_fr = margin + tables_est + 2 * cap_limit;
+        if (fr < want_fr && vcache_nslots > 1) {
+            vcache_release_vram(want_fr);
+            HCK(hipMemGetInfo(&fr, &tot));
+        }
         size_t avail = fr > margin + tables_est ? fr - margin - tables_est : 0;
-        const size_t cap_limit = getenv("HY4_PF_BUF_MB") ? ((size_t)std::max(64, atoi(getenv("HY4_PF_BUF_MB"))) << 20) : ((size_t)256 << 20);
         size_t cap;
         if (!pf_bounce && avail >= maxb && tot >= (48ull << 30)) { pf_nbuf = 1; cap = maxb; }
         else { pf_nbuf = 2; cap = std::min(cap_limit, (avail / 2) & ~(size_t)4095); }
@@ -369,21 +376,50 @@ public:
                 break;
             }
         }
-        // groups, sequence numbers and tables
+        if (!st2) HCK(hipStreamCreate(&st2));
+        for (int b = 0; b < 2; ++b) {
+            HCK(hipEventCreateWithFlags(&ev_pf_copy[b], hipEventDisableTiming));
+            HCK(hipEventCreateWithFlags(&ev_pf_done[b], hipEventDisableTiming));
+        }
+        if (getenv("HY4_PF_MIN_T")) pf_min_T = atoi(getenv("HY4_PF_MIN_T"));
+        if (getenv("HY4_PF_GATHER_MAX_T")) pf_gather_max_T = atoi(getenv("HY4_PF_GATHER_MAX_T"));
+        pf_stream = true;
+        pf_rebuild_groups();
+        size_t ng = 0, dma_bytes = 0;
+        for (auto& v : pf_groups) {
+            ng += v.size();
+            for (auto& gr : v) dma_bytes += gr.total_bytes;
+        }
+        fprintf(stderr, "[hybrid] prefill streaming on (%s): %d buffer(s) of %.0f MiB, %zu groups for 41 layers (%.2f GB PCIe/chunk, skipping %d VRAM slots), init %.2f s, active for T >= %d (gather < %d)\n",
+                pf_bounce ? "pinned bounce ring" : "arena pinned", pf_nbuf, cap / 1048576.0, ng, dma_bytes / 1e9, vcache_nslots, now_s() - t0, pf_min_T, pf_gather_max_T);
+    }
+    // Rebuild pf_groups skipping all experts currently resident in VRAM (static OR adaptive vcache): cuts PCIe prefill DMA by ~45% on 32 GB cards!
+    void pf_rebuild_groups() {
+        if (!pf_stream || pf_cap == 0) return;
+        auto al = [](size_t x) { return (x + 4095) & ~(size_t)4095; };
         pf_groups.assign(41, {});
         pf_layer_first.assign(41, 0);
         std::vector<ExpertDev> all;
         std::vector<std::vector<std::vector<int>>> gexp(41);
         int seq = 0;
         for (int l = 0; l < 41; ++l) {
+            std::vector<std::pair<const uint8_t*, int>> lay;
+            lay.reserve(512);
+            for (int e = 0; e < 512; ++e) {
+                const int gi = l * 512 + e;
+                if (gi < (int)vram_flag.size() && vram_flag[gi]) continue;  // already in VRAM/vcache: zero PCIe DMA!
+                CpuExpertView vw = cpu.view(l, e);
+                if (vw.body) lay.push_back({vw.body, e});
+            }
+            std::sort(lay.begin(), lay.end());
             pf_layer_first[l] = seq;
             pf_groups[l].emplace_back();
             gexp[l].emplace_back();
             size_t off = 0;
-            for (auto& pe : lay[l]) {
+            for (auto& pe : lay) {
                 CpuExpertView vw = cpu.view(l, pe.second);
                 const size_t sz = al(vw.body_bytes);
-                if (off + sz > cap) {
+                if (off + sz > pf_cap && off > 0) {
                     pf_groups[l].back().total_bytes = off;
                     pf_groups[l].emplace_back();
                     gexp[l].emplace_back();
@@ -399,7 +435,7 @@ public:
             for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) pf_groups[l][gi].seq = seq++;
         }
         pf_nseq = seq;
-        // per-group tables: offsets of the group's experts inside its buffer follow the order of gexp
+        all.reserve((size_t)seq * 512);
         for (int l = 0; l < 41; ++l)
             for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) {
                 const int k = pf_groups[l][gi].seq, b = k % pf_nbuf;
@@ -414,13 +450,18 @@ public:
                     off += al(vw.body_bytes);
                 }
                 for (int e = 0; e < 512; ++e) {
-                    const ExpertRef& er = g.experts[l * 512 + e];
+                    const int idx = l * 512 + e;
+                    const ExpertRef& er = g.experts[idx];
                     hp[e].dn_off = er.dn_off;
                     hp[e].gu_code = er.gu_code;
                     hp[e].dn_code = er.dn_code;
                     if (er.tier == 3 || er.tier == 4) {
                         hp[e].body_off = 0;
-                        hp[e].pad = 1;  // cold expert (SSD) or peer-GPU resident: skipped by GPU 0 prefill streaming
+                        hp[e].pad = 1;
+                    } else if (idx < (int)vram_flag.size() && vram_flag[idx]) {
+                        // Static VRAM OR adaptive vcache expert: run directly from HBM2 once per layer (gi == 0)!
+                        hp[e].body_off = h_experts[idx].body_off;
+                        hp[e].pad = gi == 0 ? 0 : 1;
                     } else if (er.tier == 2) {
                         if (in_group[e]) {
                             hp[e].body_off = (uint64_t)(uintptr_t)(d_scratch[b] + eoff[e]) - (uint64_t)(uintptr_t)g.d_sec4;
@@ -431,33 +472,24 @@ public:
                         }
                     } else {
                         hp[e].body_off = er.body_off;
-                        hp[e].pad = gi == 0 ? 0 : 1;  // the static GPU-resident experts run once per layer, with the first group
+                        hp[e].pad = gi == 0 ? 0 : 1;
                     }
                 }
                 all.insert(all.end(), hp.begin(), hp.end());
             }
-        ExpertDev* dt = dalloc<ExpertDev>(all.size());
-        HCK(hipMemcpy(dt, all.data(), all.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
-        {
-            size_t idx = 0;
-            for (int l = 0; l < 41; ++l)
-                for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) pf_groups[l][gi].table = dt + 512 * idx++;
+        if (all.size() > d_pf_tables_cap) {
+            if (d_pf_tables) HCK(hipFree(d_pf_tables));
+            d_pf_tables_cap = std::max(all.size(), (size_t)41 * 24 * 512);
+            d_pf_tables = dalloc<ExpertDev>(d_pf_tables_cap);
         }
-        if (!st2) HCK(hipStreamCreate(&st2));
-        for (int b = 0; b < 2; ++b) {
-            HCK(hipEventCreateWithFlags(&ev_pf_copy[b], hipEventDisableTiming));
-            HCK(hipEventCreateWithFlags(&ev_pf_done[b], hipEventDisableTiming));
-        }
-        if (getenv("HY4_PF_MIN_T")) pf_min_T = atoi(getenv("HY4_PF_MIN_T"));
-        if (getenv("HY4_PF_GATHER_MAX_T")) pf_gather_max_T = atoi(getenv("HY4_PF_GATHER_MAX_T"));
-        pf_stream = true;
-        size_t ng = 0;
-        for (auto& v : pf_groups) ng += v.size();
-        fprintf(stderr, "[hybrid] prefill streaming on (%s): %d buffer(s) of %.0f MiB, %zu groups for 41 layers (largest layer %.2f GB), init %.2f s, active for T >= %d (gather < %d)\n",
-                pf_bounce ? "pinned bounce ring" : "arena pinned", pf_nbuf, cap / 1048576.0, ng, maxb / 1e9, now_s() - t0, pf_min_T, pf_gather_max_T);
+        HCK(hipMemcpy(d_pf_tables, all.data(), all.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+        size_t idx = 0;
+        for (int l = 0; l < 41; ++l)
+            for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) pf_groups[l][gi].table = d_pf_tables + 512 * idx++;
     }
     void pf_begin_chunk() {
         pf_pool.wait();
+        if (pf_dirty) { pf_rebuild_groups(); pf_dirty = false; }
         for (int b = 0; b < 2; ++b) {
             pf_packed_seq[b] = -1;
             ev_pf_copy_set[b] = false;
@@ -594,6 +626,7 @@ public:
             HCK(hipMemcpyAsync(d_experts + idx, &h_experts[idx], sizeof(ExpertDev), hipMemcpyHostToDevice, st));
             vprom[p].inflight = false;
             ++vc_promotes;
+            pf_dirty = true;
         }
     }
     void vcache_flush() {
@@ -655,6 +688,7 @@ public:
             HCK(hipStreamSynchronize(st2));
             HCK(hipMemcpy(d_experts, h_experts.data(), h_experts.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
             vc_promotes += (uint64_t)swapped;
+            pf_rebuild_groups();
         }
     }
     // Online decode update: record routing hits for layer l (0..40) and asynchronously promote up to vcache_max_swaps hottest misses on st2
@@ -780,6 +814,7 @@ public:
         }
         if (freed_slabs > 0) {
             HCK(hipMemcpy(d_experts, h_experts.data(), h_experts.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+            pf_rebuild_groups();
             fprintf(stderr, "[vcache] released %d slab(s) (%.2f GB) for VRAM KV growth -> %d adaptive slots (%.2f GB) remain\n",
                     freed_slabs, freed_bytes / 1e9, vcache_nslots, (vcache_nslots * (double)vcache_slot_bytes) / 1e9);
         }
@@ -1277,6 +1312,11 @@ public:
         }
         er_h = dalloc<__half>((size_t)Tc * 1536);
         ep_alloc();
+#if HY4_CUDA && defined(HY4_CUBLAS)
+        if (skd::cublas_prefill_min_m() > 0 && skd::cublas_prefill_ctx().ensure_init())
+            fprintf(stderr, "[runner] cuBLAS FP16 Tensor Core prefill enabled (M >= %d, 2x%zu MiB side-stream dequant)\n",
+                    skd::cublas_prefill_min_m(), (skd::cublas_prefill_ctx().buf_elems * 2) >> 20);
+#endif
         if (hyb) vcache_init();
         if (hyb && (!getenv("HY4_PF_STREAM") || atoi(getenv("HY4_PF_STREAM")) != 0)) pf_init();  // last: the scratch takes what the other buffers left
         tune_init();
