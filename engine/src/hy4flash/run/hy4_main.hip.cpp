@@ -238,7 +238,7 @@ int main(int argc, char** argv) {
         while (f >> v) tok.push_back((int32_t)v);
         if (max_ctx <= 0 && !tok.empty()) max_ctx = (int)tok.size() + gen + 16;
     }
-    chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, 0);
+    chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, model);
     GpuModel g;
     double t_load0 = now_s();
     if (!load_gpu_model(g, model, true)) return 1;

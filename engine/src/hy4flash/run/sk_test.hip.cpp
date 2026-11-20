@@ -306,7 +306,7 @@ int main(int argc, char** argv) {
     }
     hipDeviceProp_t p;
     CK(hipGetDeviceProperties(&p, 0));
-    printf("device %s %s warp %d CUs %d\n", p.name, p.gcnArchName, p.warpSize, p.multiProcessorCount);
+    printf("device %s %s warp %d CUs %d\n", p.name, gpu_arch(p), p.warpSize, p.multiProcessorCount);
     test_random_codes();
     Trunk T;
     std::string err;

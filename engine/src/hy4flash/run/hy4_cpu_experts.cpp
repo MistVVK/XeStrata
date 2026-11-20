@@ -34,14 +34,16 @@
 //   HY4_FAST  = AVX-512 BW + VNNI + VBMI + F16C (Ice Lake / Rocket Lake / Zen 4 and later),
 //   HY4_FAST2 = AVX2 + FMA + F16C (Haswell / Zen 1-3 and later; used only when HY4_FAST is not available, e.g. -march=native on
 //               a Zen 2 PC, or -mno-avx512f to test it on an AVX-512 machine).
-// Without either, the library gemm_sk_q8_1 path is used (also selectable with STRATA_CPUEXP_KERNEL=lib, and used when an S1.5 or
-// S8 expert is resident).
-#if defined(__x86_64__) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__) && defined(__F16C__)
+// Without either, the library gemm_sk_q8_1 path is used (also selectable with STRATA_CPUEXP_KERNEL=lib at run time, and used when
+// an S1.5 or S8 expert is resident). Compile-time overrides: -DHY4_NO_FAST (library kernel only), -DHY4_FORCE_AVX2 (skip the
+// AVX-512 kernel even when the build target has AVX-512).
+#if defined(__x86_64__) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__) && defined(__F16C__) && \
+    !defined(HY4_NO_FAST) && !defined(HY4_FORCE_AVX2)
 #define HY4_FAST 1
 #else
 #define HY4_FAST 0
 #endif
-#if !HY4_FAST && defined(__x86_64__) && defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+#if !HY4_FAST && !defined(HY4_NO_FAST) && defined(__x86_64__) && defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
 #define HY4_FAST2 1
 #else
 #define HY4_FAST2 0
@@ -177,8 +179,8 @@ struct Job {
 };
 
 struct SpinBarrier {
-    std::atomic<int> count{0};
-    std::atomic<int> sense{0};
+    alignas(64) std::atomic<int> count{0};  // arrivals (RMW storm) and the release flag live on different cache lines:
+    alignas(64) std::atomic<int> sense{0};  // the spinners only ever poll `sense`
     int n = 1;
     void wait(int& local_sense) {
         local_sense ^= 1;
@@ -196,7 +198,13 @@ struct SpinBarrier {
     }
 };
 
-struct TScratch {
+struct alignas(64) PadCnt {  // one counter per cache line
+    std::atomic<int> v{0};
+};
+
+static int g_pf_rows = 0;  // software prefetch distance in weight rows for the fast kernels (STRATA_CPUEXP_PF, 0 = off)
+
+struct alignas(64) TScratch {
     ABuf<BlockQ8_1_G64> xg, xg2;  // gathered z blocks for up to 16 tokens (library path; xg2 = residual term, hi mode)
     ABuf<float> tg, tu, tg2;      // [16..32][64] gate / up (or down) results (tg2: second term, library path hi mode)
     int sense = 0;
@@ -413,7 +421,12 @@ static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* ou
 template <int FMT, int M, bool HI>
 static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* out) {
     constexpr size_t RBYTES = 6 * (size_t)FmtInfo<FMT>::SB;
+    const int pf = g_pf_rows;
     for (int r = 0; r < nrows; ++r) {
+        if (pf) {  // pull in the row `pf` rows ahead (crosses 4 KiB page boundaries, which the hardware prefetcher does not)
+            const char* pp = (const char*)(W + (size_t)(r + pf) * RBYTES);
+            for (size_t o = 0; o < RBYTES; o += 64) _mm_prefetch(pp + o, _MM_HINT_T0);
+        }
         float o[M];
         row_dot<FMT, M, HI>(W + r * RBYTES, X, o);
         for (int i = 0; i < M; ++i) out[(size_t)i * nrows + r] = o[i];
@@ -678,7 +691,12 @@ static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* ou
 template <int FMT, int M, bool HI>
 static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* out) {
     constexpr size_t RBYTES = 6 * (size_t)FmtInfo<FMT>::SB;
+    const int pf = g_pf_rows;
     for (int r = 0; r < nrows; ++r) {
+        if (pf) {  // pull in the row `pf` rows ahead (crosses 4 KiB page boundaries, which the hardware prefetcher does not)
+            const char* pp = (const char*)(W + (size_t)(r + pf) * RBYTES);
+            for (size_t o = 0; o < RBYTES; o += 64) _mm_prefetch(pp + o, _MM_HINT_T0);
+        }
         float o[M];
         row_dot<FMT, M, HI>(W + r * RBYTES, X, o);
         for (int i = 0; i < M; ++i) out[(size_t)i * nrows + r] = o[i];
@@ -767,7 +785,9 @@ struct CpuExperts::Impl {
     size_t cap_tok = 0;
     std::vector<int> cnt, aoff, act_e, act_o, act_n, pair_tok, posof;
     std::vector<uint8_t> tok_used;
-    std::atomic<int> qctr{0}, guctr{0}, dnctr{0}, cbctr{0};
+    PadCnt qctr, guctr, dnctr, cbctr, fctr;  // unit counters, one cache line each
+    std::unique_ptr<PadCnt[]> gdone, dn_cc;  // flow scheduler: finished gate/up units per active expert, finished down units per column chunk
+    int sched = 0;                           // 0 = barriered phases, 1 = gate/up -> down -> combine dataflow (STRATA_CPUEXP_SCHED)
     int nact = 0;
     // ---- stats (written by thread 0 only, read after wait())
     CpuExpertStats st;
@@ -821,6 +841,8 @@ struct CpuExperts::Impl {
     void gu_unit(int tid, const Job& J, int a, int b);
     void dn_unit(int tid, const Job& J, int a, int c);
     void combine_unit(const Job& J, int t0, int tl, int c0);
+    void combine_cols(const Job& J, int t0, int Tc, int c);
+    void flow_phase(int tid, const Job& J, int t0, int Tc);
 };
 
 // ==================================================================================================== load
@@ -1010,6 +1032,10 @@ void CpuExperts::Impl::start_threads(int n) {
     nth = std::max(1, n);
     bar.n = nth;
     ts.reset(new TScratch[nth]);
+    gdone.reset(new PadCnt[E]);
+    dn_cc.reset(new PadCnt[NUNIT]);
+    if (const char* e = std::getenv("STRATA_CPUEXP_SCHED")) sched = std::atoi(e);
+    if (const char* e = std::getenv("STRATA_CPUEXP_PF")) g_pf_rows = std::atoi(e);
     for (int ti = 0; ti < nth; ++ti) {
         TScratch& s = ts[ti];
         if (!fast) { s.xg.alloc((size_t)MG * NB); s.xg2.alloc((size_t)MG * NB); }
@@ -1040,7 +1066,7 @@ void CpuExperts::Impl::start_threads(int n) {
 #endif
         }
     }
-    std::fprintf(stderr, "[cpuexp] %d pool threads%s, spin %d us\n", nth, pins.empty() ? " (not pinned)" : " (pinned, physical cores first)", spin_us);
+    std::fprintf(stderr, "[cpuexp] %d pool threads%s, spin %d us, sched=%d, pf=%d rows\n", nth, pins.empty() ? " (not pinned)" : " (pinned, physical cores first)", spin_us, sched, g_pf_rows);
 }
 
 void CpuExperts::Impl::worker(int tid) {
@@ -1110,10 +1136,13 @@ void CpuExperts::Impl::plan(const Job& J, int t0, int Tc) {
             pair_tok[p] = t;
             posof[(size_t)t * TOPK + s] = p;
         }
-    qctr.store(0);
-    guctr.store(0);
-    dnctr.store(0);
-    cbctr.store(0);
+    qctr.v.store(0);
+    guctr.v.store(0);
+    dnctr.v.store(0);
+    cbctr.v.store(0);
+    fctr.v.store(0);
+    for (int a = 0; a < nact; ++a) gdone[a].v.store(0, std::memory_order_relaxed);
+    for (int c = 0; c < NUNIT; ++c) dn_cc[c].v.store(0, std::memory_order_relaxed);
     st.bytes += bytes;
     st.pairs += (uint64_t)off;
     st.skipped_unresident += skipped;
@@ -1247,6 +1276,51 @@ void CpuExperts::Impl::combine_unit(const Job& J, int t0, int tl, int c0) {
     else for (int i = 0; i < CW; ++i) zo[i] = acc[i];
 }
 
+// zout[t][c*64 .. c*64+64) (+)= sum over slots (ascending) w * y, for the Tc tokens of the chunk (same per-element arithmetic as combine_unit)
+void CpuExperts::Impl::combine_cols(const Job& J, int t0, int Tc, int c) {
+    constexpr int CW = RB;
+    for (int tl = 0; tl < Tc; ++tl) {
+        float acc[CW];
+        for (int i = 0; i < CW; ++i) acc[i] = 0.0f;
+        for (int s = 0; s < TOPK; ++s) {
+            const int p = posof[(size_t)tl * TOPK + s];
+            if (p < 0) continue;
+            const float wt = J.w[(size_t)(t0 + tl) * TOPK + s];
+            const float* y = Y.p + (size_t)p * D + c * CW;
+            for (int i = 0; i < CW; ++i) acc[i] += wt * y[i];
+        }
+        float* zo = J.zout + (size_t)(t0 + tl) * D + c * CW;
+        if (J.accum) for (int i = 0; i < CW; ++i) zo[i] += acc[i];
+        else for (int i = 0; i < CW; ++i) zo[i] = acc[i];
+    }
+}
+
+void CpuExperts::Impl::flow_phase(int tid, const Job& J, int t0, int Tc) {
+    if (nact == 0) {  // nothing to compute: still (over)write zout with zeros / leave it unchanged
+        for (int c = tid; c < NUNIT; c += nth) combine_cols(J, t0, Tc, c);
+        return;
+    }
+    const int G = nact * NUNIT, total = 2 * G;
+    for (;;) {
+        const int u = fctr.v.fetch_add(1, std::memory_order_relaxed);
+        if (u >= total) break;
+        if (u < G) {
+            const int a = u / NUNIT;
+            gu_unit(tid, J, a, u % NUNIT);
+            gdone[a].v.fetch_add(1, std::memory_order_release);
+        } else {
+            const int v = u - G, a = v / NUNIT, c = v % NUNIT;
+            uint32_t spins = 0;
+            while (gdone[a].v.load(std::memory_order_acquire) < NUNIT) {
+                HY4_RELAX();
+                if ((++spins & 0xFFFF) == 0) std::this_thread::yield();
+            }
+            dn_unit(tid, J, a, c);
+            if (dn_cc[c].v.fetch_add(1, std::memory_order_acq_rel) == nact - 1) combine_cols(J, t0, Tc, c);
+        }
+    }
+}
+
 void CpuExperts::Impl::run_job(int tid) {
     const Job J = job;  // copy: the submitter may not touch it, but be safe
     int& sense = ts[tid].sense;
@@ -1264,7 +1338,7 @@ void CpuExperts::Impl::run_job(int tid) {
         lap(0);
         // quantize the z rows of tokens that have a CPU pair (8 blocks of 64 per unit)
         for (;;) {
-            const int u = qctr.fetch_add(1, std::memory_order_relaxed);
+            const int u = qctr.v.fetch_add(1, std::memory_order_relaxed);
             if (u >= Tc * 3) break;
             const int t = u / 3, part = u % 3;
             if (!tok_used[t]) continue;
@@ -1289,15 +1363,23 @@ void CpuExperts::Impl::run_job(int tid) {
         }
         bar.wait(sense);
         lap(1);
+        if (sched == 1) {
+            // dataflow: gate/up units of all experts, then down units (expert-major; a down unit waits only for its own expert's
+            // gate/up units), and the last down unit of a column chunk does that chunk's slot-ordered combine. One barrier at the end.
+            flow_phase(tid, J, t0, Tc);
+            bar.wait(sense);
+            lap(2);
+            continue;
+        }
         for (;;) {
-            const int u = guctr.fetch_add(1, std::memory_order_relaxed);
+            const int u = guctr.v.fetch_add(1, std::memory_order_relaxed);
             if (u >= nact * NUNIT) break;
             gu_unit(tid, J, u / NUNIT, u % NUNIT);
         }
         bar.wait(sense);
         lap(2);
         for (;;) {
-            const int u = dnctr.fetch_add(1, std::memory_order_relaxed);
+            const int u = dnctr.v.fetch_add(1, std::memory_order_relaxed);
             if (u >= nact * NUNIT) break;
             dn_unit(tid, J, u / NUNIT, u % NUNIT);
         }
@@ -1305,7 +1387,7 @@ void CpuExperts::Impl::run_job(int tid) {
         lap(3);
         const int cb = D / 256;
         for (;;) {
-            const int u = cbctr.fetch_add(1, std::memory_order_relaxed);
+            const int u = cbctr.v.fetch_add(1, std::memory_order_relaxed);
             if (u >= Tc * cb) break;
             combine_unit(J, t0, u / cb, (u % cb) * 256);
         }

@@ -131,28 +131,48 @@ inline void hy4_setenv(const char* k, const char* v, int) {
 #endif
 }
 
-inline int plan_memory(int max_ctx, int chunk, size_t total, size_t trunk_bytes) {
+inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& model_path) {
     const double GB = 1e9, tot = (double)total / GB;
+    double trunk = 5.9;
+    if (!model_path.empty()) {
+        strata::artifact::StrataFileReader rd;
+        std::string e;
+        if (rd.open(model_path, e)) trunk = (double)rd.header().sections[1].byte_length / GB;
+    }
     if (chunk <= 0) {
         // ~1.4 MB of working buffers per chunk token; keep them near 12% of the card
         int c = 2048;
         while (c > 256 && c * 1.4e6 > 0.12 * (double)total) c >>= 1;
+        // work_gb cards: shrink further until trunk + buffers + the IndexPool state leave room for the KV rows
+        const double slots0 = (double)((max_ctx + 8 + 15) / 16 * 16);
+        const double rows0 = 12.0 * slots0 * 2176.0 / GB, pivg0 = 12.0 * (double)max_ctx * 512.0 / GB + 12.0 * (double)(max_ctx / 4 + 8) * 256.0 / GB;
+        while (c > 256 && trunk + c * 1.5e6 / GB + 0.4 + pivg0 + rows0 + 0.3 > tot) c >>= 1;
         chunk = c;
     }
     const double slots = (double)((max_ctx + 8 + 15) / 16 * 16);
-    const double kv_dev = 12.0 * slots * 2176.0 / GB + 12.0 * (double)max_ctx * 512.0 / GB + 12.0 * (double)(max_ctx / 4 + 8) * 256.0 / GB + 1.06;  // sparse KV + ivg + pooled + wk_b/wv_b
-    const double work_gb = chunk * 1.5e6 / GB + 0.4 + 30.0 * (512.0 + chunk) * 2176.0 / GB;                                                         // chunk buffers + engram/misc + SWA rings
-    bool kv_host = kv_dev > 0.15 * tot;
-    if (getenv("HY4_KV_HOST")) kv_host = atoi(getenv("HY4_KV_HOST")) != 0;
-    else hy4_setenv("HY4_KV_HOST", kv_host ? "1" : "0", 1);
+    const double rows = 12.0 * slots * 2176.0 / GB;                                                                                              // sparse-layer KV rows + Vt
+    const double pivg = 12.0 * (double)max_ctx * 512.0 / GB + 12.0 * (double)(max_ctx / 4 + 8) * 256.0 / GB;                                       // IndexPool iv/ig + pooled keys
+    const double wkv = 1.06;                                                                                                                       // absorbed kv_b copies
+    const double work_gb = chunk * 1.5e6 / GB + 0.4 + 30.0 * (512.0 + chunk) * 2176.0 / GB;                                                          // chunk buffers + engram/misc + SWA rings
+    // The kernels read host-mapped KV rows over PCIe with work_gb gathers (~30x slower prefill at 128K), so the rows stay in VRAM whenever trunk + buffers + state + rows fit;
+    // the rarely-read absorbed copies go to host first, the rows only on cards that cannot hold them (8 GB at 128K).
+    int mask = 0;
+    if (trunk + work_gb + pivg + rows + wkv + 0.3 > tot) mask |= 2;
+    if (trunk + work_gb + pivg + rows + 0.3 > tot) mask |= 1;
+    if (getenv("HY4_KV_HOST")) mask = atoi(getenv("HY4_KV_HOST"));
+    else {
+        char m[8];
+        snprintf(m, sizeof m, "%d", mask);
+        hy4_setenv("HY4_KV_HOST", m, 1);
+    }
     if (!getenv("HY4_RESERVE_GB")) {
-        double reserve = work_gb + (kv_host ? 0.0 : kv_dev) + (tot >= 10.0 ? 1.45 : 0.0);  // + the prefill streaming scratch on cards that have room
+        double reserve = work_gb + pivg + ((mask & 1) ? 0.0 : rows) + ((mask & 2) ? 0.0 : wkv) + (tot >= 10.0 && mask == 0 ? 1.45 : 0.0);  // + the prefill streaming scratch when everything else fits
         char b[32];
         snprintf(b, sizeof b, "%.2f", reserve);
         hy4_setenv("HY4_RESERVE_GB", b, 1);
     }
-    fprintf(stderr, "[plan] ctx %d chunk %d: working buffers ~%.2f GB, sparse KV + IndexPool + kv_b copies ~%.2f GB -> %s; reserve %s GB (card %.1f GB, trunk %.2f GB)\n", max_ctx, chunk, work_gb, kv_dev,
-            kv_host ? "pinned host memory" : "VRAM", getenv("HY4_RESERVE_GB"), tot, trunk_bytes / GB);
+    fprintf(stderr, "[plan] ctx %d chunk %d: buffers ~%.2f GB, KV rows %.2f GB, IndexPool %.2f GB, kv_b copies %.2f GB, trunk %.2f GB on a %.1f GB card -> host mask %d (1 rows, 2 kv_b copies); reserve %s GB\n", max_ctx, chunk, work_gb,
+            rows, pivg, wkv, trunk, tot, atoi(getenv("HY4_KV_HOST")), getenv("HY4_RESERVE_GB"));
     return chunk;
 }
 

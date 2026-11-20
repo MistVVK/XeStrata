@@ -255,7 +255,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
     size_t fr = 0, tot = 0;
     HCK(hipMemGetInfo(&fr, &tot));
     fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0);
-    const int serve_chunk = plan_memory(o.max_ctx, o.chunk, tot, 0);
+    const int serve_chunk = plan_memory(o.max_ctx, o.chunk, tot, o.model);
     GpuModel g;
     double t_load0 = now_s();
     if (!load_gpu_model(g, o.model, true)) {
