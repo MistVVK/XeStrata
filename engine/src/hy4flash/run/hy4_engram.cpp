@@ -176,6 +176,44 @@ void engram_hash(const EngramMeta& m, int module, const int32_t* tok, int t0, in
     }
 }
 
+void engram_hash_tree(const EngramMeta& m, int module, const int32_t* tok_prefix, int p0, const int32_t* tree_tok, const int8_t* tree_parent, int T, uint64_t* row_ids, uint8_t* valid) {
+    const uint64_t* mu = m.mult[module];
+    const size_t V = m.token_map.size();
+    const uint64_t pad = (uint64_t)(int64_t)m.pad_cid;
+    auto map_tok = [&](int32_t t) -> int64_t {
+        return (t >= 0 && (size_t)t < V) ? (int64_t)m.token_map[(size_t)t] : -1;
+    };
+    auto prefix_cid = [&](int pos) -> int64_t {
+        return pos >= 0 ? map_tok(tok_prefix[pos]) : -1;
+    };
+    for (int i = 0; i < T; ++i) {
+        const int64_t c0 = map_tok(tree_tok[i]);
+        const bool dead = c0 < 0;
+        const int p1 = (int)tree_parent[i];
+        int64_t c1 = -1, c2 = -1;
+        if (p1 >= 0) {
+            c1 = map_tok(tree_tok[p1]);
+            const int p2 = (int)tree_parent[p1];
+            c2 = p2 >= 0 ? map_tok(tree_tok[p2]) : prefix_cid(p0 - 1);
+        } else {
+            c1 = prefix_cid(p0 - 1);
+            c2 = prefix_cid(p0 - 2);
+        }
+        const uint64_t u0 = dead ? pad : (uint64_t)c0;
+        const uint64_t u1 = c1 < 0 ? pad : (uint64_t)c1;
+        const uint64_t u2 = c2 < 0 ? pad : (uint64_t)c2;
+        const uint64_t r1 = (u0 * mu[0]) ^ (u1 * mu[1]);
+        const uint64_t r2 = r1 ^ (u2 * mu[2]);
+        uint64_t* o = row_ids + (size_t)i * ENGRAM_COLS;
+        uint8_t* v = valid + (size_t)i * ENGRAM_COLS;
+        for (int h = 0; h < m.n_head; ++h) {
+            o[h] = (uint64_t)((int64_t)(r1 % m.primes[module][h]) + m.offsets[module][h]);
+            o[m.n_head + h] = (uint64_t)((int64_t)(r2 % m.primes[module][m.n_head + h]) + m.offsets[module][m.n_head + h]);
+        }
+        for (int h = 0; h < ENGRAM_COLS; ++h) v[h] = dead ? 0 : 1;
+    }
+}
+
 // ---------------------------------------------------------------- aligned alloc
 void* engram_aligned_alloc(size_t bytes) {
 #if defined(_WIN32)

@@ -92,8 +92,243 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
     out += buf;
 }
 
+// ---- Fast GPU top-64 exact log-prob + tail_p extractor for --dump-dfly-batch ----
+static inline float fp16_bits_host(uint16_t h) {
+    uint32_t s = ((uint32_t)h & 0x8000u) << 16;
+    uint32_t e = (h >> 10) & 0x1Fu;
+    uint32_t m = h & 0x3FFu;
+    uint32_t f = 0;
+    if (e == 0) {
+        if (m != 0) {
+            e = 113;
+            while ((m & 0x400u) == 0) { m <<= 1; --e; }
+            m &= 0x3FFu;
+            f = s | (e << 23) | (m << 13);
+        } else f = s;
+    } else if (e == 31) {
+        f = s | 0x7F800000u | (m << 13);
+    } else {
+        f = s | ((e + 112) << 23) | (m << 13);
+    }
+    float out = 0.f;
+    std::memcpy(&out, &f, 4);
+    return out;
+}
+
+__global__ void __launch_bounds__(1024) k_dfly_logp_top64(const float* __restrict__ logits, int V, int32_t* __restrict__ top_idx, __half* __restrict__ top_logp, __half* __restrict__ tail_p) {
+    __shared__ float sm[32];
+    __shared__ float slg[64];
+    __shared__ int32_t sid[64];
+    const float* lg = logits + (size_t)blockIdx.x * V;
+    const int tid = threadIdx.x;
+    float mx = -3.0e38f;
+    for (int i = tid; i < V; i += blockDim.x) mx = fmaxf(mx, lg[i]);
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o));
+    if ((tid & 31) == 0) sm[tid >> 5] = mx;
+    __syncthreads();
+    if (tid == 0) {
+        float b = sm[0];
+        for (int w = 1; w < 32; ++w) b = fmaxf(b, sm[w]);
+        sm[0] = b;
+    }
+    __syncthreads();
+    const float row_mx = sm[0];
+    float se = 0.0f;
+    for (int i = tid; i < V; i += blockDim.x) se += __expf(lg[i] - row_mx);
+    for (int o = 16; o > 0; o >>= 1) se += __shfl_xor(se, o);
+    if ((tid & 31) == 0) sm[tid >> 5] = se;
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < 32; ++w) s += sm[w];
+        sm[0] = row_mx + logf(fmaxf(s, 1e-30f));
+    }
+    __syncthreads();
+    const float logZ = sm[0];
+    if (tid < 64) {
+        const int32_t id = top_idx[(size_t)blockIdx.x * 64 + tid];
+        sid[tid] = id;
+        slg[tid] = lg[id];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        for (int i = 1; i < 64; ++i) {
+            float kv = slg[i];
+            int32_t ki = sid[i];
+            int j = i - 1;
+            while (j >= 0 && (slg[j] < kv || (slg[j] == kv && sid[j] > ki))) {
+                slg[j + 1] = slg[j];
+                sid[j + 1] = sid[j];
+                --j;
+            }
+            slg[j + 1] = kv;
+            sid[j + 1] = ki;
+        }
+        float psum = 0.0f;
+        for (int i = 0; i < 64; ++i) {
+            const float lp = slg[i] - logZ;
+            top_idx[(size_t)blockIdx.x * 64 + i] = sid[i];
+            top_logp[(size_t)blockIdx.x * 64 + i] = __float2half(lp);
+            psum += expf(lp);
+        }
+        const float tp = fmaxf(1e-7f, 1.0f - fminf(psum, 1.0f - 1e-7f));
+        tail_p[blockIdx.x] = __float2half(tp);
+    }
+}
+
+static int run_dump_dfly_batch(Runner& r, const std::string& manifest_path, const std::string& out_dir, int gen_n, float dump_temp, uint64_t seed) {
+    std::ifstream mf(manifest_path);
+    if (!mf) {
+        fprintf(stderr, "dump-dfly-batch: cannot open %s\n", manifest_path.c_str());
+        return 1;
+    }
+    std::filesystem::create_directories(out_dir);
+    std::vector<std::vector<int32_t>> prompts;
+    std::string line;
+    while (std::getline(mf, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::vector<int32_t> ids;
+        const char* p = line.c_str();
+        while (*p) {
+            while (*p == ' ' || *p == '\t' || *p == ',' || *p == '\r') ++p;
+            if (!*p) break;
+            char* e = nullptr;
+            long v = strtol(p, &e, 10);
+            if (e == p) break;
+            ids.push_back((int32_t)v);
+            p = e;
+        }
+        if (ids.size() >= 8) prompts.push_back(std::move(ids));
+    }
+    fprintf(stderr, "[dump-dfly] loaded %zu prompts from %s, gen=%d, temp=%.2f -> %s\n", prompts.size(), manifest_path.c_str(), gen_n, dump_temp, out_dir.c_str());
+    const int V = r.c.vocab;
+    const int max_rows = r.Tc;
+    int32_t* d_top_idx = r.dalloc<int32_t>((size_t)max_rows * 64);
+    __half* d_top_lp = r.dalloc<__half>((size_t)max_rows * 64);
+    __half* d_tail_p = r.dalloc<__half>((size_t)max_rows);
+    std::mt19937_64 rng(seed ? seed : 20261120ULL);
+    std::string err;
+    long total_toks = 0;
+    const double t_all = now_s();
+    for (size_t pi = 0; pi < prompts.size(); ++pi) {
+        std::vector<int32_t> tok = prompts[pi];
+        if ((int)tok.size() > r.Tc) tok.resize((size_t)r.Tc);
+        const int T0 = (int)tok.size();
+        const int max_T = std::min(r.max_ctx - 8, T0 + gen_n);
+        if (max_T <= T0) continue;
+        tok.reserve((size_t)max_T + 8);
+        std::vector<uint16_t> hfin_all;
+        std::vector<int32_t> tidx_all;
+        std::vector<uint16_t> tlp_all;
+        std::vector<uint16_t> tp_all;
+        hfin_all.reserve((size_t)max_T * HID);
+        tidx_all.reserve((size_t)max_T * 64);
+        tlp_all.reserve((size_t)max_T * 64);
+        tp_all.reserve((size_t)max_T);
+        const double t0 = now_s();
+        if (!r.forward_chunk(tok.data(), 0, T0, err)) {
+            fprintf(stderr, "[dump-dfly] prefill err seq %zu: %s\n", pi, err.c_str());
+            return 1;
+        }
+        r.head(T0, 0);
+        hipLaunchKernelGGL(k_dfly_topn, dim3(T0), dim3(1024), 0, r.st, (const float*)r.logits, V, 64, d_top_idx);
+        hipLaunchKernelGGL(k_dfly_logp_top64, dim3(T0), dim3(1024), 0, r.st, (const float*)r.logits, V, d_top_idx, d_top_lp, d_tail_p);
+        hfin_all.resize((size_t)T0 * HID);
+        tidx_all.resize((size_t)T0 * 64);
+        tlp_all.resize((size_t)T0 * 64);
+        tp_all.resize((size_t)T0);
+        HCK(hipMemcpyAsync(hfin_all.data(), r.hfin, (size_t)T0 * HID * 2, hipMemcpyDeviceToHost, r.st));
+        HCK(hipMemcpyAsync(tidx_all.data(), d_top_idx, (size_t)T0 * 64 * 4, hipMemcpyDeviceToHost, r.st));
+        HCK(hipMemcpyAsync(tlp_all.data(), d_top_lp, (size_t)T0 * 64 * 2, hipMemcpyDeviceToHost, r.st));
+        HCK(hipMemcpyAsync(tp_all.data(), d_tail_p, (size_t)T0 * 2, hipMemcpyDeviceToHost, r.st));
+        HCK(hipStreamSynchronize(r.st));
+        const float seq_temp = dump_temp < 0.f ? ((pi % 3 == 2) ? -dump_temp : 0.f) : dump_temp;
+        auto pick_next = [&](int row_idx) -> int32_t {
+            const int32_t* ids = tidx_all.data() + (size_t)row_idx * 64;
+            if (seq_temp <= 0.f) return ids[0];
+            const uint16_t* lps = tlp_all.data() + (size_t)row_idx * 64;
+            double w[64], z = 0.0;
+            const double lp0 = (double)fp16_bits_host(lps[0]);
+            for (int k = 0; k < 64; ++k) {
+                const double lp = (double)fp16_bits_host(lps[k]);
+                w[k] = std::exp((lp - lp0) / (double)seq_temp);
+                z += w[k];
+            }
+            double c = 0.0;
+            int keep = 0;
+            while (keep < 64) {
+                c += w[keep++] / z;
+                if (c >= 0.95) break;
+            }
+            double z2 = 0.0;
+            for (int k = 0; k < keep; ++k) z2 += w[k];
+            std::uniform_real_distribution<double> u(0.0, z2);
+            double rv = u(rng), acc = 0.0;
+            for (int k = 0; k < keep; ++k) {
+                acc += w[k];
+                if (rv <= acc) return ids[k];
+            }
+            return ids[keep - 1];
+        };
+        int cur_row = T0 - 1;
+        while ((int)tok.size() < max_T) {
+            const int32_t nx = pick_next(cur_row);
+            tok.push_back(nx);
+            if (nx == r.c.eos || nx == 120008) break;
+            const int pos = (int)tok.size() - 1;
+            if (!r.forward_chunk(tok.data(), pos, 1, err)) {
+                fprintf(stderr, "[dump-dfly] decode err seq %zu pos %d: %s\n", pi, pos, err.c_str());
+                return 1;
+            }
+            r.head(1, 0);
+            hipLaunchKernelGGL(k_dfly_topn, dim3(1), dim3(1024), 0, r.st, (const float*)r.logits, V, 64, d_top_idx);
+            hipLaunchKernelGGL(k_dfly_logp_top64, dim3(1), dim3(1024), 0, r.st, (const float*)r.logits, V, d_top_idx, d_top_lp, d_tail_p);
+            const size_t ridx = (size_t)pos;
+            hfin_all.resize((ridx + 1) * HID);
+            tidx_all.resize((ridx + 1) * 64);
+            tlp_all.resize((ridx + 1) * 64);
+            tp_all.resize(ridx + 1);
+            HCK(hipMemcpyAsync(hfin_all.data() + ridx * HID, r.hfin, (size_t)HID * 2, hipMemcpyDeviceToHost, r.st));
+            HCK(hipMemcpyAsync(tidx_all.data() + ridx * 64, d_top_idx, 64 * 4, hipMemcpyDeviceToHost, r.st));
+            HCK(hipMemcpyAsync(tlp_all.data() + ridx * 64, d_top_lp, 64 * 2, hipMemcpyDeviceToHost, r.st));
+            HCK(hipMemcpyAsync(tp_all.data() + ridx, d_tail_p, 2, hipMemcpyDeviceToHost, r.st));
+            HCK(hipStreamSynchronize(r.st));
+            cur_row = pos;
+        }
+        const int T = (int)tp_all.size();
+        tok.resize((size_t)T);
+        std::vector<uint16_t> kv_all((size_t)5 * T * MLA_ROW);
+        for (int d = 0; d < 5; ++d) {
+            const int L = DFLY_LAYERS[d];
+            HCK(hipMemcpy(kv_all.data() + (size_t)d * T * MLA_ROW, r.kcache[L], (size_t)T * MLA_ROW * 2, hipMemcpyDeviceToHost));
+        }
+        char fn[512];
+        snprintf(fn, sizeof fn, "%s/seq_%04zu.bin", out_dir.c_str(), pi);
+        FILE* fo = fopen(fn, "wb");
+        if (!fo) {
+            fprintf(stderr, "[dump-dfly] cannot write %s\n", fn);
+            return 1;
+        }
+        int32_t hdr[8] = {0x44464C59, 1, T, T0, 64, 5, HID, MLA_ROW};
+        fwrite(hdr, 4, 8, fo);
+        fwrite(tok.data(), 4, (size_t)T, fo);
+        fwrite(hfin_all.data(), 2, (size_t)T * HID, fo);
+        fwrite(kv_all.data(), 2, (size_t)5 * T * MLA_ROW, fo);
+        fwrite(tidx_all.data(), 4, (size_t)T * 64, fo);
+        fwrite(tlp_all.data(), 2, (size_t)T * 64, fo);
+        fwrite(tp_all.data(), 2, (size_t)T, fo);
+        fclose(fo);
+        total_toks += T;
+        const double dt = now_s() - t0;
+        fprintf(stderr, "[dump-dfly] %zu/%zu -> %s (T=%d, prompt=%d, gen=%d, temp=%.2f, %.1f tok/s, cum=%ld tok)\n",
+                pi + 1, prompts.size(), fn, T, T0, T - T0, seq_temp, (T - T0) / std::max(dt, 1e-6), total_toks);
+    }
+    fprintf(stderr, "[dump-dfly] DONE: %zu sequences, %ld total tokens in %.1f s\n", prompts.size(), total_toks, now_s() - t_all);
+    return 0;
+}
+
 int main(int argc, char** argv) {
-    std::string model, engram, tok_path, out_dir = ".", vision_path;
+    std::string model, engram, tok_path, out_dir = ".", vision_path, dfly_override;
     std::vector<std::string> image_files;
     std::string info_file;
     int64_t image_max_pixels = 4194304;
@@ -101,8 +336,14 @@ int main(int argc, char** argv) {
     int gen = 0, max_ctx = 0, chunk = 0 /* 0: auto from the card */, index_topk = 2048;
     bool serve = false, session_reuse = false;
     int gpu = -1;
+    std::string gpus_csv = getenv("HY4_GPUS") ? getenv("HY4_GPUS") : "";
     std::string draft = "auto";  // auto: dfly2 under --serve (when the file carries the drafter), off for the CLI runs (gates / benches); "off" and "dfly2" force
     SpecCfg scfg;
+    SampleOpts cli_samp;
+    int tail_skip_arg = 0;  // opt-in only (0 = OFF by default)
+    std::string dump_dfly_batch, dump_dfly_out;
+    int dump_dfly_gen = 384;
+    float dump_dfly_temp = -0.6f;  // <0: mixed 2/3 greedy + 1/3 sampled at |temp|; 0: pure greedy; >0: sampled
     std::string parity_list;
     bool det_flag = true, want_margins = false;
     int ab_rounds = 0, trace_m = 0, trace_off = 0, trace_mut = -1, dump_layer_arg = -1;
@@ -133,12 +374,26 @@ int main(int argc, char** argv) {
         else if (a == "--model" || a == "--native") model = nxt();
         else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
         else if (a == "--gpu") gpu = atoi(nxt().c_str());
+        else if (a == "--gpus") gpus_csv = nxt();
         else if (a == "--draft") draft = nxt();
+        else if (a == "--dfly-override") dfly_override = nxt();
         else if (a == "--spec-k") scfg.K = atoi(nxt().c_str());
         else if (a == "--spec-fixed") scfg.adaptive = false;
         else if (a == "--spec-cut") scfg.cut = (float)atof(nxt().c_str());
         else if (a == "--spec-debug") scfg.debug = true;
         else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
+        else if (a == "--spec-tree") scfg.tree = atoi(nxt().c_str()) != 0;
+        else if (a == "--spec-early") scfg.early_cut = (float)atof(nxt().c_str());
+        else if (a == "--tail-skip") tail_skip_arg = atoi(nxt().c_str());
+        else if (a == "--temperature") cli_samp.temperature = (float)atof(nxt().c_str());
+        else if (a == "--top-p") cli_samp.top_p = (float)atof(nxt().c_str());
+        else if (a == "--top-k") cli_samp.top_k = atoi(nxt().c_str());
+        else if (a == "--min-p") cli_samp.min_p = (float)atof(nxt().c_str());
+        else if (a == "--seed") cli_samp.seed = (uint64_t)strtoull(nxt().c_str(), nullptr, 10);
+        else if (a == "--dump-dfly-batch") dump_dfly_batch = nxt();
+        else if (a == "--dump-dfly-out") dump_dfly_out = nxt();
+        else if (a == "--dump-dfly-gen") dump_dfly_gen = atoi(nxt().c_str());
+        else if (a == "--dump-dfly-temp") dump_dfly_temp = (float)atof(nxt().c_str());
         else if (a == "--spec-sabotage") scfg.sabotage = true;
         else if (a == "--spec-inv") scfg.inv = atoi(nxt().c_str()) != 0;
         else if (a == "--spec-check") scfg.check = true;
@@ -196,6 +451,23 @@ int main(int argc, char** argv) {
         }
     }
     if (!info_file.empty()) return print_info(info_file, vision_path);
+    std::vector<int> peer_devs;
+    int primary_gpu = gpu >= 0 ? gpu : 0;
+    if (!gpus_csv.empty()) {
+        std::vector<int> ids;
+        for (size_t pos = 0; pos < gpus_csv.size();) {
+            ids.push_back(atoi(gpus_csv.c_str() + pos));
+            size_t q = gpus_csv.find(',', pos);
+            if (q == std::string::npos) break;
+            pos = q + 1;
+        }
+        if (!ids.empty()) {
+            primary_gpu = ids[0];
+            for (size_t k = 1; k < ids.size(); ++k)
+                if (ids[k] != primary_gpu) peer_devs.push_back(ids[k]);
+            gpu = primary_gpu;
+        }
+    }
     if (gpu >= 0) HCK(hipSetDevice(gpu));
     if (serve) {
         if (model.empty()) {
@@ -218,17 +490,21 @@ int main(int argc, char** argv) {
         so.no_index = no_index;
         so.no_engram = no_engram;
         so.session_reuse = session_reuse;
+        so.tail_skip = tail_skip_arg;
         so.draft = draft;
+        so.dfly_override = dfly_override;
         so.vision = vision_path;  // HY4-VISION
         so.image_max_pixels = image_max_pixels;
+        so.primary_gpu = primary_gpu;
+        so.peer_devs = peer_devs;
         return hy4_serve_main(so);
     }
     if (model.empty()) {
-        fprintf(stderr, "usage: strata-hy4 --model SQ64.strata --engram Engram-Q8.strata --tokens ids.txt [--gen N] [--chunk N] [--ctx N] [--dump] [--all-logits] [--out dir]\n");
+        fprintf(stderr, "usage: strata-hy4 --model SQ64.strata --engram Engram-Q8.strata --tokens ids.txt [--gen N] [--chunk N] [--ctx N] [--gpus 0,1] [--dump] [--all-logits] [--out dir]\n");
         return 2;
     }
     hipDeviceProp_t p;
-    HCK(hipGetDeviceProperties(&p, 0));
+    HCK(hipGetDeviceProperties(&p, primary_gpu));
     size_t fr = 0, tot = 0;
     HCK(hipMemGetInfo(&fr, &tot));
     fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0);
@@ -252,8 +528,14 @@ int main(int argc, char** argv) {
     }
     chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, model);
     GpuModel g;
+    g.primary_gpu = primary_gpu;
+    g.peer_devs = peer_devs;
     double t_load0 = now_s();
     if (!load_gpu_model(g, model, true)) return 1;
+    if (!dfly_override.empty()) {
+        std::string derr;
+        if (!load_dfly_override(g, dfly_override, derr)) { fprintf(stderr, "%s\n", derr.c_str()); return 1; }
+    }
     fprintf(stderr, "[load] total %.1f s\n", now_s() - t_load0);
     if (load_only) return 0;
     // HY4-VISION: decode + resize the pictures and expand each image-pad token of the prompt to the picture's run of pads (CPU only; the ViT runs after the runner is up)
@@ -277,11 +559,11 @@ int main(int argc, char** argv) {
         if (ctx_auto) max_ctx = (int)tok.size() + gen + 16;  // the pads grew the prompt (the card plan above used the unexpanded length)
     }
     int T0 = (int)tok.size();
-    if (T0 == 0) {
+    if (T0 == 0 && dump_dfly_batch.empty()) {
         fprintf(stderr, "no tokens\n");
         return 2;
     }
-    if (max_ctx <= 0) max_ctx = T0 + gen + 16;
+    if (max_ctx <= 0) max_ctx = dump_dfly_batch.empty() ? (T0 + gen + 16) : (dump_dfly_gen + 512);
     Runner r(g, max_ctx, std::max(chunk, 1));
     r.dump = dump;
     r.dump_dir = out_dir;
@@ -289,11 +571,15 @@ int main(int argc, char** argv) {
     r.index_on = no_index ? 0 : 1;
     r.prof = prof;
     r.prof2 = prof2;
+    r.tail_skip = tail_skip_arg;
     r.det_mix = det_flag || draft == "dfly2";
     std::string err;
     if (!r.init(no_engram ? std::string() : engram, err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
         return 1;
+    }
+    if (!dump_dfly_batch.empty()) {
+        return run_dump_dfly_batch(r, dump_dfly_batch, dump_dfly_out.empty() ? out_dir : dump_dfly_out, dump_dfly_gen, dump_dfly_temp, cli_samp.seed);
     }
     tok.reserve(max_ctx + 8);
     DFly2 df(r);
@@ -338,6 +624,8 @@ int main(int argc, char** argv) {
     double t0 = now_s();
     int done = 0;
     int V = r.c.vocab;
+    r.pf_eng_tok = tok.data();
+    r.pf_eng_total = T0;
     r.prefetch_engram(tok.data(), 0, std::min(r.Tc, T0));
     std::vector<float> hl;
     int last_p0 = 0, last_T = 0;
@@ -348,7 +636,6 @@ int main(int argc, char** argv) {
             return 1;
         }
         done += T;
-        if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
         bool last = done == T0;
         if (last) {
             last_p0 = done - T;
@@ -367,6 +654,8 @@ int main(int argc, char** argv) {
         }
         fprintf(stderr, "[prefill] %d/%d tokens, %.2f s, %.1f tok/s\n", done, T0, now_s() - t0, done / (now_s() - t0));
     }
+    r.pf_eng_tok = nullptr;
+    r.pf_eng_total = 0;
     double t_pf = now_s() - t0;
     r.prof_report("prefill");
     r.pacc_report("prefill", (T0 + r.Tc - 1) / r.Tc);
@@ -405,6 +694,8 @@ int main(int argc, char** argv) {
     const EngramStats es0 = r.engram_ready ? r.eio.stats() : EngramStats();
     if (!parity_list.empty()) {
         // verify-window parity: rows of an M-token chunk vs the same positions run one token at a time (M = 1 decode), same prefix
+        r.vcache_flush();
+        r.vcache_frozen = true;
         std::vector<int> ws;
         for (size_t p = 0; p < parity_list.size();) {
             ws.push_back(atoi(parity_list.c_str() + p));
@@ -495,6 +786,8 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (ab_rounds > 0 && spec_mode) {
+        r.vcache_flush();
+        r.vcache_frozen = true;  // both plain and dfly2 rounds share the identical prompt-adapted VRAM expert cache for exact 256/256 comparison
         // DFly2 off vs on from ONE prefill: each mode starts from the resident prompt state (the last prefill chunk is re-run, which rebuilds the logits, h_final and the key-list capture;
         // decode rows beyond the prompt are overwritten). Only the LAST 16 prompt positions are re-run: a longer re-run would need SWA ring slots of the early part of the last chunk,
         // which decode has overwritten (ring = 512 + chunk). Both modes start from this same re-run state. Rounds alternate plain / spec, same prompt, same flags.
@@ -569,8 +862,10 @@ int main(int argc, char** argv) {
         sp.want_margin = want_margins;
         std::string gen_ids, finish, e2;
         int made = 0;
+        std::mt19937_64 cli_rng(cli_samp.seed ? cli_samp.seed : 20261120ULL);
+        const SampleOpts* sptr = (!cli_samp.greedy() || cli_samp.penalties()) ? &cli_samp : nullptr;
         const double t1 = now_s();
-        sp.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { gen_ids += std::to_string(t) + " "; return true; }, finish, e2, made);
+        sp.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { gen_ids += std::to_string(t) + " "; return true; }, finish, e2, made, sptr, sptr ? &cli_rng : nullptr);
         const double td = now_s() - t1;
         if (finish == "error") {
             fprintf(stderr, "spec: %s\n", e2.c_str());
@@ -654,6 +949,11 @@ int main(int argc, char** argv) {
         if (r.n_eng_dec && r.engram_ready) { const EngramStats e1 = r.eio.stats(); const double n = r.n_eng_dec; fprintf(stderr, "[decode] engram io per step: %.1f pages, page-read wall %.3f ms, whole fetch %.3f ms, lookups %.0f (seed+lru hits %.0f)\n", (e1.page_reads - es0.page_reads) / n, (e1.io_seconds - es0.io_seconds) * 1000 / n, (e1.fetch_seconds - es0.fetch_seconds) * 1000 / n, (e1.lookups - es0.lookups) / n, (e1.seed_hits + e1.lru_hits - es0.seed_hits - es0.lru_hits) / n); }
         if (r.n_eng_dec) fprintf(stderr, "[decode] engram per step: prefetch issue %.3f ms, host wait+upload at layer 1 %.3f ms\n", r.t_eng_issue * 1000 / r.n_eng_dec, r.t_eng_prep * 1000 / r.n_eng_dec);
         if (r.hyb) fprintf(stderr, "[hybrid] decode: host waited %.2f ms per step for the CPU experts after queueing the GPU work\n", (r.t_cpu_wait - cpu_wait0) * 1000 / std::max<size_t>(times.size(), 1));
+        if (r.vcache_nslots > 1 && (r.vc_hits + r.vc_misses) > 0) {
+            const uint64_t tot_p = r.vc_hits + r.vc_misses;
+            fprintf(stderr, "[vcache] decode: %.1f%% VRAM expert hit rate (%llu / %llu pairs), %llu promotions\n", 100.0 * (double)r.vc_hits / (double)tot_p,
+                    (unsigned long long)r.vc_hits, (unsigned long long)tot_p, (unsigned long long)r.vc_promotes);
+        }
         if (r.hyb && r.has_cold) {
             const hy4::CpuExpertStats c1 = r.cpu.stats();
             const double nt = (double)std::max<size_t>(times.size(), 1);
@@ -674,6 +974,11 @@ int main(int argc, char** argv) {
     {
         std::ofstream f(out_dir + "/top5.txt");
         f << top_out;
+    }
+    if (r.vcache_nslots > 1 && (r.vc_hits + r.vc_misses) > 0) {
+        const uint64_t tot_p = r.vc_hits + r.vc_misses;
+        fprintf(stderr, "[vcache] session: %.1f%% VRAM expert hit rate (%llu / %llu pairs), %llu promotions\n", 100.0 * (double)r.vc_hits / (double)tot_p,
+                (unsigned long long)r.vc_hits, (unsigned long long)tot_p, (unsigned long long)r.vc_promotes);
     }
     {
         size_t f2 = 0, t2 = 0;

@@ -17,6 +17,11 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#if defined(_MSC_VER) && !defined(__clang__)
+static inline float _cvtsh_ss(unsigned short h) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)h)));
+}
+#endif
 #define HY4_RELAX() _mm_pause()
 #else
 #define HY4_RELAX() std::this_thread::yield()
@@ -217,7 +222,7 @@ struct alignas(64) PadCnt {  // one counter per cache line
     std::atomic<int> v{0};
 };
 
-static int g_pf_rows = 0;  // software prefetch distance in weight rows for the fast kernels (STRATA_CPUEXP_PF, 0 = off)
+static int g_pf_rows = 0;  // software prefetch distance in weight rows for the fast kernels (STRATA_CPUEXP_PF, 0 = hw prefetcher)
 
 struct alignas(64) TScratch {
     ABuf<BlockQ8_1_G64> xg, xg2;  // gathered z blocks for up to 16 tokens (library path; xg2 = residual term, hi mode)
@@ -385,6 +390,14 @@ template <> struct FmtInfo<4> { static constexpr int SB = 134; static constexpr 
 template <> struct FmtInfo<5> { static constexpr int SB = 166; static constexpr float HALF = 15.5f; };
 template <> struct FmtInfo<6> { static constexpr int SB = 198; static constexpr float HALF = 31.5f; };
 
+static inline float cvt_f16_f32(uint16_t h) {
+#ifdef _MSC_VER
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)h)));
+#else
+    return _cvtsh_ss(h);
+#endif
+}
+
 // M tokens x 1 weight row (6 super-blocks of format FMT) -> out[t]
 template <int FMT, int M, bool HI>
 static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* out) {
@@ -402,7 +415,7 @@ static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* ou
         std::memcpy(&u32, blk + 2, 4);
         // eff_g = D * (u_g / 255) exactly as in sk_codecs (float division, then multiply), replicated x4 per group
         __m128 u4 = _mm_div_ps(_mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)u32))), inv255);
-        u4 = _mm_mul_ps(u4, _mm_set1_ps(_cvtsh_ss(dh)));
+        u4 = _mm_mul_ps(u4, _mm_set1_ps(cvt_f16_f32(dh)));
         if constexpr (FMT == 0) {  // S1.25: x fine[g], fine = 0.5 + nibble/15 (nibbles at payload bytes 40, 41)
             uint16_t fn;
             std::memcpy(&fn, blk + 46, 2);
@@ -440,7 +453,7 @@ static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* o
     constexpr size_t RBYTES = 6 * (size_t)FmtInfo<FMT>::SB;
     const int pf = g_pf_rows;
     for (int r = 0; r < nrows; ++r) {
-        if (pf) {  // pull in the row `pf` rows ahead (crosses 4 KiB page boundaries, which the hardware prefetcher does not)
+        if (pf && r + pf < nrows) {  // pull in the row `pf` rows ahead (crosses 4 KiB page boundaries, which the hardware prefetcher does not)
             const char* pp = (const char*)(W + (size_t)(r + pf) * RBYTES);
             for (size_t o = 0; o < RBYTES; o += 64) _mm_prefetch(pp + o, _MM_HINT_T0);
         }
@@ -679,7 +692,11 @@ static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* ou
         std::memcpy(&u32, blk + 2, 4);
         // eff_g = D * (u_g / 255) exactly as in sk_codecs (float division, then multiply)
         __m128 u4 = _mm_div_ps(_mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)u32))), inv255);
+#ifdef _MSC_VER
+        u4 = _mm_mul_ps(u4, _mm_set1_ps(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)dh)))));
+#else
         u4 = _mm_mul_ps(u4, _mm_set1_ps(_cvtsh_ss(dh)));
+#endif
         if constexpr (FMT == 0) {  // S1.25: x fine[g], fine = 0.5 + nibble/15 (nibbles at payload bytes 40, 41)
             uint16_t fn;
             std::memcpy(&fn, blk + 46, 2);
@@ -714,7 +731,7 @@ static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* o
     constexpr size_t RBYTES = 6 * (size_t)FmtInfo<FMT>::SB;
     const int pf = g_pf_rows;
     for (int r = 0; r < nrows; ++r) {
-        if (pf) {  // pull in the row `pf` rows ahead (crosses 4 KiB page boundaries, which the hardware prefetcher does not)
+        if (pf && r + pf < nrows) {  // pull in the row `pf` rows ahead (crosses 4 KiB page boundaries, which the hardware prefetcher does not)
             const char* pp = (const char*)(W + (size_t)(r + pf) * RBYTES);
             for (size_t o = 0; o < RBYTES; o += 64) _mm_prefetch(pp + o, _MM_HINT_T0);
         }
@@ -844,7 +861,6 @@ static inline void residual_blocks(const float* x, const BlockQ8_1_G64* q, Block
 // On-demand reader for experts that live in the .strata file instead of the arena: a small slot cache (LRU, slot = one expert
 // body, 4 KiB aligned) filled by a few reader threads with large preads (O_DIRECT by default, so the page cache does not eat the
 // RAM budget). Slot management is done by pool thread 0 only; the readers only see (dst, offset, length) requests.
-#ifndef _WIN32
 struct ColdStore {
     struct Slot {
         int64_t key = -1;  // layer * 512 + expert, -1 = empty
@@ -856,8 +872,12 @@ struct ColdStore {
         uint64_t off;
         size_t len;
     };
+#ifdef _WIN32
+    HANDLE h = INVALID_HANDLE_VALUE;
+#else
     int fd = -1;
-    int io_mode = 0;  // 0 = O_DIRECT, 1 = buffered (page cache kept: "warm cache" runs), 2 = buffered + POSIX_FADV_DONTNEED
+#endif
+    int io_mode = 0;  // 0 = direct (O_DIRECT / FILE_FLAG_NO_BUFFERING), 1 = buffered (page cache kept: "warm cache" runs), 2 = buffered + POSIX_FADV_DONTNEED
     size_t slot_bytes = 0;
     int nslots = 0;
     uint8_t* mem = nullptr;
@@ -882,6 +902,20 @@ struct ColdStore {
         slot_bytes = slot_bytes_;
         nslots = nslots_;
         io_mode = mode;
+#ifdef _WIN32
+        if (mode == 2) io_mode = 0;  // Windows uses FILE_FLAG_NO_BUFFERING rather than fadvise
+        DWORD fl = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS | (io_mode == 0 ? FILE_FLAG_NO_BUFFERING : 0);
+        h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, fl, nullptr);
+        if (h == INVALID_HANDLE_VALUE && io_mode == 0) {
+            std::fprintf(stderr, "[cpuexp] cold: FILE_FLAG_NO_BUFFERING open failed, using buffered overlapped reads\n");
+            io_mode = 1;
+            fl = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS;
+            h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, fl, nullptr);
+        }
+        if (h == INVALID_HANDLE_VALUE) { e = "cannot open " + path + " for cold reads"; return false; }
+        mem = (uint8_t*)VirtualAlloc(nullptr, slot_bytes * (size_t)nslots, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!mem) { CloseHandle(h); h = INVALID_HANDLE_VALUE; e = "cannot allocate the cold-expert cache"; return false; }
+#else
         if (mode == 0) {
             fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
             if (fd < 0) {
@@ -893,6 +927,7 @@ struct ColdStore {
         if (fd < 0) { e = "cannot open " + path + " for cold reads"; return false; }
         if (posix_memalign((void**)&mem, 4096, slot_bytes * (size_t)nslots) != 0) { mem = nullptr; e = "cannot allocate the cold-expert cache"; return false; }
         std::memset(mem, 0, slot_bytes * (size_t)nslots);
+#endif
         slots.assign(nslots, Slot());
         for (int i = 0; i < nreaders; ++i) readers.emplace_back([this]() { reader(); });
         return true;
@@ -908,16 +943,54 @@ struct ColdStore {
     }
 
     void reader() {
+#ifdef _WIN32
+        HANDLE ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+#endif
         for (;;) {
             Req r;
             {
                 std::unique_lock<std::mutex> lk(qm);
                 qcv.wait(lk, [&] { return stop || !q.empty(); });
-                if (stop && q.empty()) return;
+                if (stop && q.empty()) {
+#ifdef _WIN32
+                    if (ev) CloseHandle(ev);
+#endif
+                    return;
+                }
                 r = q.front();
                 q.pop_front();
             }
             size_t got = 0;
+#ifdef _WIN32
+            while (got < r.len) {
+                OVERLAPPED ov{};
+                const uint64_t o = r.off + got;
+                ov.Offset = (DWORD)(o & 0xFFFFFFFFu);
+                ov.OffsetHigh = (DWORD)(o >> 32);
+                ov.hEvent = ev;
+                if (ev) ResetEvent(ev);
+                const DWORD chunk = (DWORD)((r.len - got) > (1u << 30) ? (1u << 30) : (r.len - got));
+                DWORD n = 0;
+                if (!ReadFile(h, r.dst + got, chunk, &n, &ov)) {
+                    const DWORD le = GetLastError();
+                    if (le == ERROR_IO_PENDING) {
+                        if (!GetOverlappedResult(h, &ov, &n, TRUE)) {
+                            if (GetLastError() == ERROR_HANDLE_EOF) break;
+                            err.store(true);
+                            break;
+                        }
+                    } else if (le == ERROR_HANDLE_EOF) {
+                        break;
+                    } else {
+                        err.store(true);
+                        break;
+                    }
+                }
+                if (n == 0) break;
+                got += (size_t)n;
+            }
+            if (got < r.len) std::memset(r.dst + got, 0, r.len - got);
+#else
             while (got < r.len) {
                 const ssize_t n = ::pread(fd, r.dst + got, r.len - got, (off_t)(r.off + got));
                 if (n < 0) {
@@ -928,7 +1001,9 @@ struct ColdStore {
                 if (n == 0) break;  // EOF: the last body of the file may be clipped
                 got += (size_t)n;
             }
+            if (got < r.len) std::memset(r.dst + got, 0, r.len - got);
             if (io_mode == 2) posix_fadvise(fd, (off_t)r.off, (off_t)r.len, POSIX_FADV_DONTNEED);
+#endif
             const int64_t t = now_ns();
             int64_t prev = last_done_ns.load();
             while (prev < t && !last_done_ns.compare_exchange_weak(prev, t)) {}
@@ -943,11 +1018,15 @@ struct ColdStore {
         }
         qcv.notify_all();
         for (auto& t : readers) t.join();
+#ifdef _WIN32
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (mem) VirtualFree(mem, 0, MEM_RELEASE);
+#else
         if (fd >= 0) ::close(fd);
         free(mem);
+#endif
     }
 };
-#endif
 
 struct CpuExperts::Impl {
     // ---- model
@@ -988,9 +1067,7 @@ struct CpuExperts::Impl {
     std::string path;
     std::vector<DirE> dir;
     uint64_t s4_off = 0;
-#ifndef _WIN32
     std::unique_ptr<ColdStore> cs;
-#endif
     std::vector<const uint8_t*> act_body;    // body pointer per active expert (arena, or cold slot)
     std::vector<int> act_slot;               // cold slot per active expert (-1 = resident)
     bool cold_job = false, wave_finished = false;
@@ -1256,25 +1333,63 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
 
 // ==================================================================================================== pool
 namespace {
-// physical-core-first list of logical CPU ids to pin to (empty = do not pin)
+// physical-core-first list of logical CPU ids to pin to, spread round-robin across L3/CCD domains so multi-CCD CPUs (EPYC / Threadripper) engage all memory channels
 std::vector<int> pin_list(int want) {
-    std::vector<int> prim, sec;
+    const char* pe = std::getenv("STRATA_CPUEXP_PIN");
+    const bool linear = pe && !std::strcmp(pe, "linear");
+    std::vector<std::vector<int>> prim_g, sec_g;
 #ifdef _WIN32
     DWORD len = 0;
     GetLogicalProcessorInformation(nullptr, &len);
     std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+    std::vector<ULONG_PTR> l3_masks;
     if (len && GetLogicalProcessorInformation(info.data(), &len)) {
+        for (auto& i : info)
+            if (i.Relationship == RelationCache && i.Cache.Level == 3) l3_masks.push_back(i.ProcessorMask);
+        const size_t ng = std::max<size_t>(1, l3_masks.size());
+        prim_g.resize(ng);
+        sec_g.resize(ng);
         for (auto& i : info) {
             if (i.Relationship != RelationProcessorCore) continue;
+            size_t g = 0;
+            for (size_t k = 0; k < l3_masks.size(); ++k)
+                if (l3_masks[k] & i.ProcessorMask) { g = k; break; }
             bool first = true;
             for (int b = 0; b < (int)(8 * sizeof(ULONG_PTR)); ++b)
-                if ((i.ProcessorMask >> b) & 1) { (first ? prim : sec).push_back(b); first = false; }
+                if ((i.ProcessorMask >> b) & 1) { (first ? prim_g[g] : sec_g[g]).push_back(b); first = false; }
         }
     }
 #else
     cpu_set_t cs;
     CPU_ZERO(&cs);
     if (sched_getaffinity(0, sizeof(cs), &cs) != 0) return {};
+    std::unordered_map<std::string, size_t> dom_id;
+    auto domain_of = [&](int c) -> size_t {
+        if (linear) {
+            if (prim_g.empty()) { prim_g.emplace_back(); sec_g.emplace_back(); }
+            return 0;
+        }
+        char fn[160], buf[128] = {0};
+        std::string key = "0";
+        std::snprintf(fn, sizeof(fn), "/sys/devices/system/cpu/cpu%d/cache/index3/shared_cpu_list", c);
+        if (std::FILE* f = std::fopen(fn, "r")) {
+            if (std::fgets(buf, sizeof(buf), f)) key = buf;
+            std::fclose(f);
+        } else {
+            std::snprintf(fn, sizeof(fn), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", c);
+            if (std::FILE* f = std::fopen(fn, "r")) {
+                if (std::fgets(buf, sizeof(buf), f)) key = buf;
+                std::fclose(f);
+            }
+        }
+        auto it = dom_id.find(key);
+        if (it != dom_id.end()) return it->second;
+        const size_t id = dom_id.size();
+        dom_id[key] = id;
+        prim_g.emplace_back();
+        sec_g.emplace_back();
+        return id;
+    };
     for (int c = 0; c < CPU_SETSIZE; ++c) {
         if (!CPU_ISSET(c, &cs)) continue;
         int first = c;
@@ -1285,11 +1400,24 @@ std::vector<int> pin_list(int want) {
             if (std::fscanf(f, "%d", &a) == 1) first = a;
             std::fclose(f);
         }
-        (first == c ? prim : sec).push_back(c);
+        const size_t g = domain_of(c);
+        (first == c ? prim_g[g] : sec_g[g]).push_back(c);
     }
 #endif
-    std::vector<int> all = prim;
-    all.insert(all.end(), sec.begin(), sec.end());
+    std::vector<int> all;
+    auto spread = [&](const std::vector<std::vector<int>>& groups) {
+        if (linear) {
+            for (const auto& v : groups) all.insert(all.end(), v.begin(), v.end());
+            return;
+        }
+        size_t mx = 0;
+        for (const auto& v : groups) mx = std::max(mx, v.size());
+        for (size_t r = 0; r < mx; ++r)
+            for (const auto& v : groups)
+                if (r < v.size()) all.push_back(v[r]);
+    };
+    spread(prim_g);
+    spread(sec_g);
     if (all.empty() || want > (int)all.size()) return {};
     return all;
 }
@@ -1393,7 +1521,6 @@ void CpuExperts::Impl::plan(const Job& J, int t0, int Tc) {
     }
     aoff[E] = off;
     cold_job = false;
-#ifndef _WIN32
     if (cs) {
         // cold experts: wave 0 = resident experts + cold cache hits, then the cold misses in waves limited by the slot cache
         bool any_cold = false;
@@ -1439,7 +1566,6 @@ void CpuExperts::Impl::plan(const Job& J, int t0, int Tc) {
             cold_issue();  // start reading the first cold wave now: overlaps the activation quantization and wave 0
         }
     }
-#endif
     // fill sorted pair table
     std::vector<int>& fill = cnt;  // reuse: becomes the running write position
     for (int e = 0; e < E; ++e) fill[e] = aoff[e];
@@ -1644,7 +1770,6 @@ void CpuExperts::Impl::flow_phase(int tid, const Job& J, int t0, int Tc) {
 // ---- cold waves (thread 0 only) -------------------------------------------------------------------------------------------
 // Start reading the next wave of cold misses (at most nslots/2, only into unpinned slots, LRU first). Never called while reads are pending.
 void CpuExperts::Impl::cold_issue() {
-#ifndef _WIN32
     nxt_a0 = nxt_a1 = next_miss;
     if (next_miss >= nact || cs->err.load()) return;
     const int B = std::max(1, cs->nslots / 2);
@@ -1678,11 +1803,9 @@ void CpuExperts::Impl::cold_issue() {
     nxt_a1 = next_miss;
     st.cold_reads += (uint64_t)issued;
     st.cold_bytes += bytes;
-#endif
 }
 
 void CpuExperts::Impl::cold_wait() {
-#ifndef _WIN32
     const double t0 = now_s();
     while (cs->pending.load(std::memory_order_acquire) > 0) std::this_thread::sleep_for(std::chrono::microseconds(20));
     st.cold_wait_s += now_s() - t0;
@@ -1701,12 +1824,10 @@ void CpuExperts::Impl::cold_wait() {
             if (act_slot[a] >= 0) { cs->where.erase(cs->slots[act_slot[a]].key); cs->slots[act_slot[a]].key = -1; }
         cs->err.store(false);
     }
-#endif
 }
 
 // Prepare wave w: wave 0 = resident + cache hits; wave w > 0 = the cold experts read meanwhile (wait for them, then start reading the next wave)
 void CpuExperts::Impl::cold_advance(int w) {
-#ifndef _WIN32
     guctr.v.store(0);
     dnctr.v.store(0);
     if (w == 0) {
@@ -1729,7 +1850,6 @@ void CpuExperts::Impl::cold_advance(int w) {
     cur_a0 = nxt_a0;
     cur_a1 = nxt_a1;
     cold_issue();  // the wave after this one is read while this one is computed
-#endif
 }
 
 void CpuExperts::Impl::run_job(int tid) {
@@ -1848,12 +1968,6 @@ void CpuExperts::Impl::run_job(int tid) {
 }
 
 bool CpuExperts::Impl::set_cold(const std::vector<std::vector<bool>>& cold, std::string& err) {
-#ifdef _WIN32
-    for (const auto& v : cold)
-        for (bool b : v)
-            if (b) { err = "cold experts are not supported on Windows"; return false; }
-    return true;
-#else
     cs.reset();  // joins the readers
     for (Rec& r : recs)
         if (r.cold) r = Rec();
@@ -1897,10 +2011,14 @@ bool CpuExperts::Impl::set_cold(const std::vector<std::vector<bool>>& cold, std:
             if (r.cold) r = Rec();
         return false;
     }
-    std::fprintf(stderr, "[cpuexp] cold experts: %llu (slot %.2f MB, %d slots = %.0f MB cache, %d readers, io=%s)\n", (unsigned long long)n, maxsz / 1048576.0, nslots,
-                 nslots * (double)maxsz / 1048576.0, readers, cs->io_mode == 0 ? "O_DIRECT" : (cs->io_mode == 1 ? "buffered" : "buffered+fadvise"));
-    return true;
+#ifdef _WIN32
+    const char* iostr = cs->io_mode == 0 ? "NO_BUFFERING+OVERLAPPED" : "buffered+OVERLAPPED";
+#else
+    const char* iostr = cs->io_mode == 0 ? "O_DIRECT" : (cs->io_mode == 1 ? "buffered" : "buffered+fadvise");
 #endif
+    std::fprintf(stderr, "[cpuexp] cold experts: %llu (slot %.2f MB, %d slots = %.0f MB cache, %d readers, io=%s)\n", (unsigned long long)n, maxsz / 1048576.0, nslots,
+                 nslots * (double)maxsz / 1048576.0, readers, iostr);
+    return true;
 }
 
 // ==================================================================================================== public API

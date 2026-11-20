@@ -46,26 +46,20 @@ struct ServeOpts {
     int index_topk = 2048;
     bool no_index = false, no_engram = false;
     bool session_reuse = false;
+    int tail_skip = 0;  // opt-in only (0 = OFF by default)
     std::string draft = "auto";  // auto = dfly2 when the file carries the drafter; off; dfly2 (error without it)
+    std::string dfly_override;   // optional flat DFLYOVR1 binary overriding model.dfly_layers.* in VRAM
     SpecCfg spec;
     std::string vision;                   // HY4-VISION: path of Hy4-Flash-Vision.strata (--vision); empty = text only, GENI is refused
     int64_t image_max_pixels = 4194304;
-};
-
-struct SampleOpts {
-    float temperature = 0.f;  // 0 = greedy
-    float top_p = 1.f;
-    int top_k = 64;
-    float min_p = 0.f;
-    float rep = 1.f, freq = 0.f, pres = 0.f;
-    int last_n = 64;
-    uint64_t seed = 0;
-    bool greedy() const { return temperature <= 0.f; }
-    bool penalties() const { return rep != 1.f || freq != 0.f || pres != 0.f; }
+    int primary_gpu = 0;
+    std::vector<int> peer_devs;
 };
 
 // ---- protocol output: one line at a time, flushed -------------------------------------------------------------------------------------------------------------
+#ifndef _MSC_VER
 inline void proto(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+#endif
 inline void proto(const char* fmt, ...) {
     char buf[512];
     va_list ap;
@@ -251,22 +245,32 @@ inline bool finite_row(const float* lg, int V) {
 // ---- the loop --------------------------------------------------------------------------------------------------------------------------------------------------
 inline int hy4_serve_main(const ServeOpts& o) {
     hipDeviceProp_t p;
-    HCK(hipGetDeviceProperties(&p, 0));
+    HCK(hipGetDeviceProperties(&p, o.primary_gpu));
     size_t fr = 0, tot = 0;
     HCK(hipMemGetInfo(&fr, &tot));
     fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0);
     const int serve_chunk = plan_memory(o.max_ctx, o.chunk, tot, o.model);
     GpuModel g;
+    g.primary_gpu = o.primary_gpu;
+    g.peer_devs = o.peer_devs;
     double t_load0 = now_s();
     if (!load_gpu_model(g, o.model, true)) {
         proto("ERR cannot load %s", o.model.c_str());
         return 1;
+    }
+    if (!o.dfly_override.empty()) {
+        std::string derr;
+        if (!load_dfly_override(g, o.dfly_override, derr)) {
+            proto("ERR %s", derr.c_str());
+            return 1;
+        }
     }
     fprintf(stderr, "[load] total %.1f s\n", now_s() - t_load0);
     const int max_ctx = o.max_ctx;
     Runner r(g, max_ctx, std::max(serve_chunk, 1));
     r.index_topk = o.index_topk;
     r.index_on = o.no_index ? 0 : 1;
+    r.tail_skip = o.tail_skip;
     std::string err;
     if (!r.init(o.no_engram ? std::string() : o.engram, err)) {
         proto("ERR init: %s", err.c_str());
@@ -441,11 +445,11 @@ inline int hy4_serve_main(const ServeOpts& o) {
         // the logits of the last prompt position are on the device now
         const bool greedy_fast = q.s.greedy() && !q.s.penalties();
         bool first = true;
-        const bool spec_path = use_spec && greedy_fast && limit > 0;
+        const bool spec_path = use_spec && limit > 0;
         if (spec_path) {
-            // DFly2 lossless greedy: tokens are emitted as they are accepted
+            // DFly2 lossless greedy + exact probabilistic rejection sampling: tokens are emitted as they are accepted
             std::string fin, e2;
-            fwd = spec->run(tok, limit, max_ctx, EOS, EOT, [&](int t) { proto("T %d", t); return !in.stop.load(); }, fin, e2, made);
+            fwd = spec->run(tok, limit, max_ctx, EOS, EOT, [&](int t) { proto("T %d", t); return !in.stop.load(); }, fin, e2, made, &q.s, &rng);
             if (fin == "error") {
                 proto("ERR spec: %s", e2.c_str());
                 return 1;

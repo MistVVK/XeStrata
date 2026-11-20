@@ -46,10 +46,13 @@
 #define hipStreamSynchronize cudaStreamSynchronize
 #define hipEventCreate cudaEventCreate
 #define hipEventCreateWithFlags cudaEventCreateWithFlags
+#define hipEventDestroy cudaEventDestroy
+#define hipEventQuery cudaEventQuery
 #define hipEventDisableTiming cudaEventDisableTiming
 #define hipEventRecord cudaEventRecord
 #define hipEventSynchronize cudaEventSynchronize
 #define hipEventElapsedTime cudaEventElapsedTime
+#define hipEventDestroy cudaEventDestroy
 #define hipHostMallocDefault cudaHostAllocDefault
 #define hipHostMalloc(p, n, f) cudaHostAlloc((p), (n), (f))
 #define hipHostFree cudaFreeHost
@@ -126,9 +129,59 @@ __device__ __forceinline__ fv8 fv8_zero() {
 __device__ __forceinline__ int acc_m(int r, int lane) { return (lane >> 2) + 8 * ((r & 3) >> 1); }
 __device__ __forceinline__ int acc_n(int r, int lane) { return (r >> 2) * 8 + 2 * (lane & 3) + (r & 1); }
 __device__ __forceinline__ void mma_16816(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#elif __CUDA_ARCH__ >= 750
+    // Turing sm_75: two m16n8k8 instructions over the exact same permuted k layout ({a0,a1,b0} and {a2,a3,b1})
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a2), "r"(a3), "r"(b1));
+#else
+    // Pre-Turing (sm_60/sm_70): software fallback so fat binaries compile cleanly; runtime uses GEMV/simple paths
+    const int lane = threadIdx.x & 31, g = lane >> 2, l = lane & 3;
+    uint32_t ba[4] = {a0, a1, a2, a3}, bb[2] = {b0, b1};
+#pragma unroll
+    for (int col = 0; col < 2; ++col) {
+        const int n_idx = 2 * l + col;
+        for (int kq = 0; kq < 4; ++kq) {
+            const uint32_t bv0 = __shfl_sync(0xffffffffu, bb[0], n_idx * 4 + kq);
+            const uint32_t bv1 = __shfl_sync(0xffffffffu, bb[1], n_idx * 4 + kq);
+            const uint32_t av0 = __shfl_sync(0xffffffffu, ba[0], g * 4 + kq);
+            const uint32_t av1 = __shfl_sync(0xffffffffu, ba[1], g * 4 + kq);
+            const uint32_t av2 = __shfl_sync(0xffffffffu, ba[2], g * 4 + kq);
+            const uint32_t av3 = __shfl_sync(0xffffffffu, ba[3], g * 4 + kq);
+            c[col] = h2_dot_f32(av0, bv0, h2_dot_f32(av2, bv1, c[col]));
+            c[2 + col] = h2_dot_f32(av1, bv0, h2_dot_f32(av3, bv1, c[2 + col]));
+        }
+    }
+#endif
+}
+// Native INT8 Tensor Core m16n8k32 (sm_80+: Ampere/Ada/Hopper/Blackwell). A: s8 [16x32] row-major, B: s8 [8x32] row-major (col-major 32x8), C: s32 [16x8].
+// Note: all S2..S6 weights q in [0..63] and S8 weights in [-127..127] fit in signed s8.
+__device__ __forceinline__ void mma_16832_s8s8(int32_t* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
+#endif
+}
+// Portable 4-way int8 dot product: hardware dp4a on sm_61+, scalar fallback on sm_60 (P100)
+__device__ __forceinline__ int32_t dp4a_s8(uint32_t a, uint32_t b, int32_t c) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 610
+    return __dp4a((int)a, (int)b, c);
+#else
+    int32_t r = c;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r += (int32_t)(int8_t)((a >> (8 * i)) & 0xFFu) * (int32_t)(int8_t)((b >> (8 * i)) & 0xFFu);
+    return r;
+#endif
 }
 __device__ __forceinline__ const void* shfl_ptr(const void* p, int src) {
     const uint64_t u = (uint64_t)(uintptr_t)p;

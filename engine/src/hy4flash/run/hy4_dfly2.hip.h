@@ -9,10 +9,179 @@
 //     prev = y_j, conf_j = sigmoid(confidence_head(h_corr))
 // The own block rows are written into the TARGET layer's cache slots a..a+K (free slots: the verify pass rewrites a..a+K' before it reads them, later positions write before they read).
 #pragma once
+#include <algorithm>
+#include <cmath>
+#include <functional>
 #include <memory>
+#include <numeric>
+#include <random>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 #include "hy4_graph.hip.h"
 
 namespace hy4 {
+
+struct SampleOpts {
+    float temperature = 0.f;  // 0 = greedy
+    float top_p = 1.f;
+    int top_k = 64;
+    float min_p = 0.f;
+    float rep = 1.f, freq = 0.f, pres = 0.f;
+    int last_n = 64;
+    uint64_t seed = 0;
+    bool greedy() const { return temperature <= 0.f; }
+    bool penalties() const { return rep != 1.f || freq != 0.f || pres != 0.f; }
+};
+
+using SparseDist = std::vector<std::pair<int32_t, double>>;
+
+// Exact normalized probability distribution from a full logits row [V] under SampleOpts + history penalties.
+// Matches hy4_serve's sample_host bit-for-bit: penalties -> top-k (<=64) -> temp softmax -> min_p -> top_p -> renorm.
+inline void compute_dist_full(const float* lg_in, int V, const SampleOpts& s, const std::vector<int32_t>& hist, SparseDist& out) {
+    out.clear();
+    std::unordered_map<int32_t, int> count;
+    if (s.penalties() && s.last_n > 0) {
+        size_t from = hist.size() > (size_t)s.last_n ? hist.size() - (size_t)s.last_n : 0;
+        for (size_t i = from; i < hist.size(); ++i) ++count[hist[i]];
+    }
+    auto adj = [&](int id) -> float {
+        float x = lg_in[id];
+        if (!count.empty()) {
+            auto it = count.find(id);
+            if (it != count.end()) {
+                if (s.rep != 1.f) x = x > 0 ? x / s.rep : x * s.rep;
+                x -= (float)it->second * s.freq + (s.pres != 0.f ? s.pres : 0.f);
+            }
+        }
+        return x;
+    };
+    const int K = std::min(std::max(1, s.top_k), 64);
+    // Single-pass top-K maintenance avoids allocating & partial_sorting a 120K index vector on every verify row!
+    std::pair<float, int> top[65];
+    int ntop = 0;
+    for (int i = 0; i < V; ++i) {
+        float v = adj(i);
+        if (ntop < K || v > top[ntop - 1].first) {
+            int pos = ntop < K ? ntop++ : K - 1;
+            while (pos > 0 && (v > top[pos - 1].first || (v == top[pos - 1].first && i < top[pos - 1].second))) {
+                top[pos] = top[pos - 1];
+                --pos;
+            }
+            top[pos] = {v, i};
+        }
+    }
+    if (ntop == 0) return;
+    if (s.greedy()) {
+        out.push_back({top[0].second, 1.0});
+        return;
+    }
+    double p[64];
+    const double mx = top[0].first;
+    double sum = 0.0;
+    for (int i = 0; i < ntop; ++i) {
+        p[i] = std::exp(((double)top[i].first - mx) / (double)s.temperature);
+        sum += p[i];
+    }
+    for (int i = 0; i < ntop; ++i) p[i] /= sum;
+    int keep = ntop;
+    if (s.min_p > 0.f) {
+        const double thr = (double)s.min_p * p[0];
+        keep = 1;
+        while (keep < ntop && p[keep] >= thr) ++keep;
+    }
+    if (s.top_p < 1.f) {
+        double c = 0.0;
+        int k2 = 0;
+        while (k2 < keep) {
+            c += p[k2++];
+            if (c >= (double)s.top_p) break;
+        }
+        keep = std::max(1, k2);
+    }
+    double z = 0.0;
+    for (int i = 0; i < keep; ++i) z += p[i];
+    out.reserve(keep);
+    for (int i = 0; i < keep; ++i) out.push_back({top[i].second, p[i] / z});
+}
+
+// Normalized draft distribution over a reduced candidate subset (ids[0..N-1], scores[0..N-1]).
+inline void compute_dist_cand(const int32_t* ids, const float* scores, int N, const SampleOpts& s, const std::vector<int32_t>& hist, SparseDist& out) {
+    out.clear();
+    if (N <= 0) return;
+    std::unordered_map<int32_t, int> count;
+    if (s.penalties() && s.last_n > 0) {
+        size_t from = hist.size() > (size_t)s.last_n ? hist.size() - (size_t)s.last_n : 0;
+        for (size_t i = from; i < hist.size(); ++i) ++count[hist[i]];
+    }
+    const int K = std::min(std::min(std::max(1, s.top_k), 64), N);
+    std::vector<std::pair<float, int32_t>> cand((size_t)N);
+    for (int i = 0; i < N; ++i) {
+        float x = scores[i];
+        int32_t id = ids[i];
+        if (!count.empty()) {
+            auto it = count.find(id);
+            if (it != count.end()) {
+                if (s.rep != 1.f) x = x > 0 ? x / s.rep : x * s.rep;
+                x -= (float)it->second * s.freq + (s.pres != 0.f ? s.pres : 0.f);
+            }
+        }
+        cand[i] = {x, id};
+    }
+    std::partial_sort(cand.begin(), cand.begin() + K, cand.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+    if (s.greedy()) {
+        out.push_back({cand[0].second, 1.0});
+        return;
+    }
+    double p[64];
+    const double mx = cand[0].first;
+    double sum = 0.0;
+    for (int i = 0; i < K; ++i) {
+        p[i] = std::exp(((double)cand[i].first - mx) / (double)s.temperature);
+        sum += p[i];
+    }
+    for (int i = 0; i < K; ++i) p[i] /= sum;
+    int keep = K;
+    if (s.min_p > 0.f) {
+        const double thr = (double)s.min_p * p[0];
+        keep = 1;
+        while (keep < K && p[keep] >= thr) ++keep;
+    }
+    if (s.top_p < 1.f) {
+        double c = 0.0;
+        int k2 = 0;
+        while (k2 < keep) {
+            c += p[k2++];
+            if (c >= (double)s.top_p) break;
+        }
+        keep = std::max(1, k2);
+    }
+    double z = 0.0;
+    for (int i = 0; i < keep; ++i) z += p[i];
+    out.reserve(keep);
+    for (int i = 0; i < keep; ++i) out.push_back({cand[i].second, p[i] / z});
+}
+
+inline int32_t sample_from_dist(const SparseDist& dist, std::mt19937_64& rng) {
+    if (dist.empty()) return 0;
+    double z = 0.0;
+    for (const auto& kv : dist) z += kv.second;
+    if (z <= 0.0) return dist[0].first;
+    std::uniform_real_distribution<double> u(0.0, z);
+    double r = u(rng), c = 0.0;
+    for (const auto& kv : dist) {
+        c += kv.second;
+        if (r <= c) return kv.first;
+    }
+    return dist.back().first;
+}
+
+inline double dist_prob_of(const SparseDist& dist, int32_t tok) {
+    for (const auto& kv : dist)
+        if (kv.first == tok) return kv.second;
+    return 0.0;
+}
 
 constexpr int DFLY_MASK_ID = 120009;
 constexpr int DFLY_KMAX = 7;
@@ -77,6 +246,18 @@ __global__ void k_dfly_lists(const int32_t* __restrict__ ckeys, const int32_t* _
     const int n = cnk[0];
     int32_t* l = dlist + (size_t)j * lstride;
     for (int i = threadIdx.x; i < n; i += blockDim.x) l[i] = ckeys[i];
+    for (int i = threadIdx.x; i <= j; i += blockDim.x) l[n + i] = a + i;
+    if (threadIdx.x == 0) dnk[j] = n + j + 1;
+}
+__global__ void k_dfly_lists_d(const int32_t* __restrict__ ckeys_base, const int32_t* __restrict__ cnk_base, int index_topk, const int* __restrict__ a_dev, const int* __restrict__ row_dev,
+                               int32_t* __restrict__ dlist, int32_t* __restrict__ dnk, int lstride) {
+    const int j = blockIdx.x;
+    const int a = *a_dev;
+    const int row = *row_dev;
+    const int n = cnk_base[row];
+    const int32_t* ck = ckeys_base + (size_t)row * index_topk;
+    int32_t* l = dlist + (size_t)j * lstride;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) l[i] = ck[i];
     for (int i = threadIdx.x; i <= j; i += blockDim.x) l[n + i] = a + i;
     if (threadIdx.x == 0) dnk[j] = n + j + 1;
 }
@@ -199,10 +380,34 @@ struct DFly2 {
     int32_t *d_bids = nullptr, *d_chain = nullptr, *dlist = nullptr, *dnk = nullptr;
     int32_t *h_bids = nullptr, *h_chain = nullptr;  // pinned
     float* h_conf = nullptr;
+    int32_t* h_cand = nullptr;    // pinned [DFLY_BMAX * 1024] for Tree-8 / probabilistic chain
+    float* h_cscore = nullptr;    // pinned [1024]
+    int32_t* d_prev_one = nullptr;
     int lstride = 0;
     // stats
     double t_draft = 0;
     long n_draft = 0;
+    long n_chain_evals = 0;
+    long n_early_exits = 0;
+#if HY4_CUDA
+    struct DevDraftArgs { int a; int row; };
+    DevDraftArgs *h_dargs = nullptr, *d_dargs = nullptr;
+    struct DgKey {
+        int K, list_mask, s_causal, rv, kv_is_host, slots_sparse, lin_gemv_max, int8_mma, dp4a, mla_ws_gen, bb_only;
+        uint64_t kv_gen;
+        bool operator==(const DgKey& o) const { return std::memcmp(this, &o, sizeof(DgKey)) == 0; }
+    };
+    struct DgEntry {
+        DgKey key;
+        cudaGraphExec_t exec = nullptr;
+    };
+    std::vector<DgEntry> dg_cache;
+    void dg_clear() {
+        for (auto& e : dg_cache) if (e.exec) (void)cudaGraphExecDestroy(e.exec);
+        dg_cache.clear();
+    }
+    ~DFly2() { dg_clear(); }
+#endif
 
     explicit DFly2(Runner& rr) : r(rr), c(rr.c), st(rr.st) {}
 
@@ -246,9 +451,16 @@ struct DFly2 {
         dnk = al<int32_t>(16);
         d_cand = al<int32_t>((size_t)B * 1024);
         d_cscore = al<float>(1024);
+        d_prev_one = al<int32_t>(4);
         HCK(hipHostMalloc((void**)&h_bids, 64, hipHostMallocDefault));
         HCK(hipHostMalloc((void**)&h_chain, 64, hipHostMallocDefault));
         HCK(hipHostMalloc((void**)&h_conf, 64, hipHostMallocDefault));
+        HCK(hipHostMalloc((void**)&h_cand, (size_t)B * 1024 * 4, hipHostMallocDefault));
+        HCK(hipHostMalloc((void**)&h_cscore, (size_t)1024 * 4, hipHostMallocDefault));
+#if HY4_CUDA
+        HCK(hipHostMalloc((void**)&h_dargs, sizeof(DevDraftArgs), hipHostMallocDefault));
+        d_dargs = al<DevDraftArgs>(1);
+#endif
         ok = true;
         return true;
     }
@@ -280,6 +492,126 @@ struct DFly2 {
         for (int i = 1; i <= K; ++i) h_bids[i] = DFLY_MASK_ID;
         HCK(hipMemcpyAsync(d_bids, h_bids, B * 4, hipMemcpyHostToDevice, st));
         HCK(hipMemcpyAsync(d_chain, h_bids, 4, hipMemcpyHostToDevice, st));
+#if HY4_CUDA
+        if (r.cuda_graph_on && !isolate && skip == 0 && !r.prof && !r.prof2 && !r.dump) {
+            int lmask = 0;
+            for (int d = 0; d < 5; ++d) if (r.cap_list[d]) lmask |= (1 << d);
+            MlaAttnArgs ma_c;
+            ma_c.M = B; ma_c.NH = 32; ma_c.p0 = a; ma_c.mode = MLA_CAUSAL;
+            const int s_causal = (lmask == 31) ? 0 : mla_choose_splits(ma_c);
+            const size_t need_ws = mla_workspace_bytes(B, 32, std::max(lstride, a + B));
+            r.ensure_mla_ws(need_ws);
+#if HY4_MMA
+            if (skd::lin_int8_mma()) skd::int8_act_buf().ensure((size_t)B * 16384, skd::lin_int8_mma() >= 2);
+#endif
+            DgKey key{};
+            key.K = K; key.list_mask = lmask; key.s_causal = s_causal; key.rv = std::min(rv, 1024);
+            key.kv_is_host = r.kv_is_host ? 1 : 0;
+            key.slots_sparse = r.slots_sparse;
+            key.lin_gemv_max = skd::lin_gemv_max_m();
+#if HY4_MMA
+            key.int8_mma = skd::lin_int8_mma();
+            key.dp4a = skd::lin_dp4a();
+#endif
+            key.mla_ws_gen = r.mla_ws_gen;
+            key.bb_only = 0;
+            key.kv_gen = r.kv_gen;
+            if (!dg_cache.empty() && dg_cache.front().key.kv_gen != r.kv_gen) dg_clear();
+            cudaGraphExec_t exec = nullptr;
+            for (auto& e : dg_cache) if (e.key == key) { exec = e.exec; break; }
+            if (!exec) {
+                if (dg_cache.size() >= 12) {
+                    if (dg_cache.front().exec) (void)cudaGraphExecDestroy(dg_cache.front().exec);
+                    dg_cache.erase(dg_cache.begin());
+                }
+                const std::string pf = "model.dfly_layers.";
+                const TInfo& emb = r.ti("model.embed_tokens.weight");
+                const TInfo& lm = r.ti("lm_head.weight");
+                const void* lmw = r.tw("lm_head.weight");
+                const int N = std::min(rv, 1024);
+                cudaGraph_t gr = nullptr;
+                HCK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+                embed_rows(st, emb.fmt, r.tw("model.embed_tokens.weight"), (int)emb.rows(), (int)emb.cols(), d_bids, H, B);
+                hipLaunchKernelGGL(k_dfly_h2f, dim3(1), dim3(256), 0, st, hprev_h, hprev_f, HID);
+                hipLaunchKernelGGL(k_dfly_cat2, dim3(1), dim3(256), 0, st, (const float*)H, wf(pf + "mtp_fusion.enorm.weight"), (const float*)hprev_f, wf(pf + "mtp_fusion.hnorm.weight"), hcin, c.rms_eps);
+                r.lin(pf + "mtp_fusion.eh_proj.weight", hcin, F1, 1);
+                hipLaunchKernelGGL(k_dfly_fuse, dim3(1), dim3(256), 0, st, H, wf(pf + "mtp_fusion.gate"), (const float*)F1);
+                for (int d = 0; d < 5; ++d) {
+                    const int L = DFLY_LAYERS[d];
+                    const std::string pa = pf + std::to_string(d) + ".self_attn";
+                    const std::string pm = pf + std::to_string(d) + ".mlp";
+                    const bool use_list = r.cap_list[d];
+                    __half* dcache = r.kcache[L];
+                    hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + std::to_string(d) + ".input_layernorm.weight"), (float*)nullptr, hn, HID, c.rms_eps);
+                    r.lin(pa + ".q_a_proj.weight", hn, F1, B);
+                    hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps);
+                    r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);
+                    r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);
+                    mla_write_kv_d(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, &d_dargs->a, 0, (float)c.theta_sparse, c.rms_eps);
+                    const int kvfmt = r.ti(pa + ".kv_b_proj.weight").fmt;
+                    mla_prep_q_dec_d(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), F2, qa_h, B, 32, &d_dargs->a, (float)c.theta_sparse);
+                    r.lin(pa + ".linear_gate.weight", hn, F4, B);
+                    MlaAttnArgs ma;
+                    ma.M = B; ma.NH = 32; ma.p0 = a; ma.p0_dev = &d_dargs->a; ma.cache_slots = r.slots_sparse;
+                    if (use_list) {
+                        hipLaunchKernelGGL(k_dfly_lists_d, dim3(B), dim3(256), 0, st, (const int32_t*)r.dkeys[d], (const int32_t*)r.dnkc[d], r.index_topk, &d_dargs->a, &d_dargs->row, dlist, dnk, lstride);
+                        ma.mode = MLA_LIST; ma.keys = dlist; ma.nkeys = dnk; ma.kmax = lstride;
+                    } else {
+                        ma.mode = MLA_CAUSAL;
+                    }
+                    mla_attend(st, qa_h, dcache, wf(pa + ".learnable_sink_param"), ctx_h, ma, r.mla_ws, r.mla_ws_bytes);
+                    mla_vup_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), ctx_h, F4, o_h, B, 32);
+                    r.lin(pa + ".o_proj.weight", o_h, F1, B);
+                    hipLaunchKernelGGL(k_dfly_rms_resid, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".post_proj_norm.weight"), H, c.rms_eps);
+                    hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + std::to_string(d) + ".post_attention_layernorm.weight"), (float*)nullptr, hn, HID, c.rms_eps);
+                    r.lin(pm + ".gate_proj.weight", hn, F1, B);
+                    r.lin(pm + ".up_proj.weight", hn, F2, B);
+                    const size_t n9 = (size_t)B * 9216;
+                    hipLaunchKernelGGL(k_swiglu_h, dim3((n9 + 255) / 256), dim3(256), 0, st, (const float*)F1, (const float*)F2, mlp_h, n9);
+                    r.lin(pm + ".down_proj.weight", mlp_h, F3, B);
+                    hipLaunchKernelGGL(k_add_inplace, dim3(((size_t)B * HID + 255) / 256), dim3(256), 0, st, H, (const float*)F3, (size_t)B * HID);
+                }
+                hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + "final_norm.weight"), Hf, Hf_h, HID, c.rms_eps);
+                if (N > 0) {
+                    linear_h(st, lm.fmt, lmw, (int)lm.rows(), (int)lm.cols(), Hf_h + HID, r.logits, K);
+                    hipLaunchKernelGGL(k_dfly_topn, dim3(K), dim3(1024), 0, st, (const float*)r.logits, V, N, d_cand);
+                }
+                for (int j = 1; j <= K; ++j) {
+                    embed_rows(st, emb.fmt, r.tw("model.embed_tokens.weight"), (int)emb.rows(), (int)emb.cols(), d_chain + (j - 1), Ec, 1);
+                    hipLaunchKernelGGL(k_dfly_cat2, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), wf(pf + "hidden_correction.hidden_norm.weight"), (const float*)Ec,
+                                       wf(pf + "hidden_correction.embed_norm.weight"), hcin, c.rms_eps);
+                    r.lin(pf + "hidden_correction.gate_proj.weight", hcin, G, 1);
+                    r.lin(pf + "hidden_correction.up_proj.weight", hcin, U, 1);
+                    hipLaunchKernelGGL(k_swiglu_h, dim3((HID + 255) / 256), dim3(256), 0, st, (const float*)G, (const float*)U, act, (size_t)HID);
+                    r.lin(pf + "hidden_correction.down_proj.weight", act, Dn, 1);
+                    hipLaunchKernelGGL(k_dfly_corr, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), (const float*)Dn, wf(pf + "confidence_head.proj.weight"),
+                                       wf(pf + "confidence_head.proj.bias"), hc_h, d_conf + j);
+                    if (N > 0) {
+                        hipLaunchKernelGGL(k_dfly_cand_score, dim3(N), dim3(32), 0, st, (const uint8_t*)lmw, (const int32_t*)(d_cand + (size_t)(j - 1) * N), (const __half*)hc_h, d_cscore);
+                        hipLaunchKernelGGL(k_dfly_cand_argmax, dim3(1), dim3(1024), 0, st, (const float*)d_cscore, (const int32_t*)(d_cand + (size_t)(j - 1) * N), N, d_chain + j);
+                    } else {
+                        linear_h(st, lm.fmt, lmw, (int)lm.rows(), (int)lm.cols(), hc_h, r.logits, 1);
+                        hipLaunchKernelGGL(k_argmax, dim3(1), dim3(1024), 0, st, (const float*)r.logits, V, d_chain + j);
+                    }
+                }
+                HCK(cudaStreamEndCapture(st, &gr));
+                HCK(cudaGraphInstantiate(&exec, gr, nullptr, nullptr, 0));
+                HCK(cudaGraphDestroy(gr));
+                dg_cache.push_back({key, exec});
+            }
+            h_dargs->a = a;
+            h_dargs->row = row;
+            HCK(hipMemcpyAsync(d_dargs, h_dargs, sizeof(DevDraftArgs), hipMemcpyHostToDevice, st));
+            HCK(cudaGraphLaunch(exec, st));
+            HCK(hipMemcpyAsync(h_chain, d_chain, B * 4, hipMemcpyDeviceToHost, st));
+            HCK(hipMemcpyAsync(h_conf, d_conf, B * 4, hipMemcpyDeviceToHost, st));
+            HCK(hipStreamSynchronize(st));
+            for (int j = 1; j <= K; ++j) { y[j] = h_chain[j]; conf[j] = h_conf[j]; }
+            t_draft += now_s() - t0;
+            ++n_draft;
+            return true;
+        }
+#endif
         const std::string pf = "model.dfly_layers.";
         const TInfo& emb = r.ti("model.embed_tokens.weight");
         embed_rows(st, emb.fmt, r.tw("model.embed_tokens.weight"), (int)emb.rows(), (int)emb.cols(), d_bids, H, B);
@@ -376,6 +708,357 @@ struct DFly2 {
             y[j] = h_chain[j];
             conf[j] = h_conf[j];
         }
+        t_draft += now_s() - t0;
+        ++n_draft;
+        return true;
+    }
+
+    // Run the 5 DFly2 layers once for [xa, MASK x K] + batched base-logits top-N candidates (when N > 0).
+    bool run_block_backbone(int a, int xa, int K, int& N_out) {
+        if (!can_draft(a, K)) return false;
+        const int B = K + 1;
+        const int V = c.vocab;
+        const int row = a - 1 - r.cap_p0;
+        h_bids[0] = xa;
+        for (int i = 1; i <= K; ++i) h_bids[i] = DFLY_MASK_ID;
+        HCK(hipMemcpyAsync(d_bids, h_bids, B * 4, hipMemcpyHostToDevice, st));
+#if HY4_CUDA
+        if (r.cuda_graph_on && !isolate && skip == 0 && !r.prof && !r.prof2 && !r.dump) {
+            int lmask = 0;
+            for (int d = 0; d < 5; ++d) if (r.cap_list[d]) lmask |= (1 << d);
+            MlaAttnArgs ma_c;
+            ma_c.M = B; ma_c.NH = 32; ma_c.p0 = a; ma_c.mode = MLA_CAUSAL;
+            const int s_causal = (lmask == 31) ? 0 : mla_choose_splits(ma_c);
+            const size_t need_ws = mla_workspace_bytes(B, 32, std::max(lstride, a + B));
+            r.ensure_mla_ws(need_ws);
+#if HY4_MMA
+            if (skd::lin_int8_mma()) skd::int8_act_buf().ensure((size_t)B * 16384, skd::lin_int8_mma() >= 2);
+#endif
+            const int N = std::min(rv, 1024);
+            N_out = N;
+            DgKey key{};
+            key.K = K; key.list_mask = lmask; key.s_causal = s_causal; key.rv = N;
+            key.kv_is_host = r.kv_is_host ? 1 : 0;
+            key.slots_sparse = r.slots_sparse;
+            key.lin_gemv_max = skd::lin_gemv_max_m();
+#if HY4_MMA
+            key.int8_mma = skd::lin_int8_mma();
+            key.dp4a = skd::lin_dp4a();
+#endif
+            key.mla_ws_gen = r.mla_ws_gen;
+            key.bb_only = 1;
+            key.kv_gen = r.kv_gen;
+            if (!dg_cache.empty() && dg_cache.front().key.kv_gen != r.kv_gen) dg_clear();
+            cudaGraphExec_t exec = nullptr;
+            for (auto& e : dg_cache) if (e.key == key) { exec = e.exec; break; }
+            if (!exec) {
+                if (dg_cache.size() >= 16) {
+                    if (dg_cache.front().exec) (void)cudaGraphExecDestroy(dg_cache.front().exec);
+                    dg_cache.erase(dg_cache.begin());
+                }
+                const std::string pf = "model.dfly_layers.";
+                const TInfo& emb = r.ti("model.embed_tokens.weight");
+                const TInfo& lm = r.ti("lm_head.weight");
+                const void* lmw = r.tw("lm_head.weight");
+                cudaGraph_t gr = nullptr;
+                HCK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+                embed_rows(st, emb.fmt, r.tw("model.embed_tokens.weight"), (int)emb.rows(), (int)emb.cols(), d_bids, H, B);
+                hipLaunchKernelGGL(k_dfly_h2f, dim3(1), dim3(256), 0, st, hprev_h, hprev_f, HID);
+                hipLaunchKernelGGL(k_dfly_cat2, dim3(1), dim3(256), 0, st, (const float*)H, wf(pf + "mtp_fusion.enorm.weight"), (const float*)hprev_f, wf(pf + "mtp_fusion.hnorm.weight"), hcin, c.rms_eps);
+                r.lin(pf + "mtp_fusion.eh_proj.weight", hcin, F1, 1);
+                hipLaunchKernelGGL(k_dfly_fuse, dim3(1), dim3(256), 0, st, H, wf(pf + "mtp_fusion.gate"), (const float*)F1);
+                for (int d = 0; d < 5; ++d) {
+                    const int L = DFLY_LAYERS[d];
+                    const std::string pa = pf + std::to_string(d) + ".self_attn";
+                    const std::string pm = pf + std::to_string(d) + ".mlp";
+                    const bool use_list = r.cap_list[d];
+                    __half* dcache = r.kcache[L];
+                    hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + std::to_string(d) + ".input_layernorm.weight"), (float*)nullptr, hn, HID, c.rms_eps);
+                    r.lin(pa + ".q_a_proj.weight", hn, F1, B);
+                    hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps);
+                    r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);
+                    r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);
+                    mla_write_kv_d(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, &d_dargs->a, 0, (float)c.theta_sparse, c.rms_eps);
+                    const int kvfmt = r.ti(pa + ".kv_b_proj.weight").fmt;
+                    mla_prep_q_dec_d(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), F2, qa_h, B, 32, &d_dargs->a, (float)c.theta_sparse);
+                    r.lin(pa + ".linear_gate.weight", hn, F4, B);
+                    MlaAttnArgs ma;
+                    ma.M = B; ma.NH = 32; ma.p0 = a; ma.p0_dev = &d_dargs->a; ma.cache_slots = r.slots_sparse;
+                    if (use_list) {
+                        hipLaunchKernelGGL(k_dfly_lists_d, dim3(B), dim3(256), 0, st, (const int32_t*)r.dkeys[d], (const int32_t*)r.dnkc[d], r.index_topk, &d_dargs->a, &d_dargs->row, dlist, dnk, lstride);
+                        ma.mode = MLA_LIST; ma.keys = dlist; ma.nkeys = dnk; ma.kmax = lstride;
+                    } else {
+                        ma.mode = MLA_CAUSAL;
+                    }
+                    mla_attend(st, qa_h, dcache, wf(pa + ".learnable_sink_param"), ctx_h, ma, r.mla_ws, r.mla_ws_bytes);
+                    mla_vup_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), ctx_h, F4, o_h, B, 32);
+                    r.lin(pa + ".o_proj.weight", o_h, F1, B);
+                    hipLaunchKernelGGL(k_dfly_rms_resid, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".post_proj_norm.weight"), H, c.rms_eps);
+                    hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + std::to_string(d) + ".post_attention_layernorm.weight"), (float*)nullptr, hn, HID, c.rms_eps);
+                    r.lin(pm + ".gate_proj.weight", hn, F1, B);
+                    r.lin(pm + ".up_proj.weight", hn, F2, B);
+                    const size_t n9 = (size_t)B * 9216;
+                    hipLaunchKernelGGL(k_swiglu_h, dim3((n9 + 255) / 256), dim3(256), 0, st, (const float*)F1, (const float*)F2, mlp_h, n9);
+                    r.lin(pm + ".down_proj.weight", mlp_h, F3, B);
+                    hipLaunchKernelGGL(k_add_inplace, dim3(((size_t)B * HID + 255) / 256), dim3(256), 0, st, H, (const float*)F3, (size_t)B * HID);
+                }
+                hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + "final_norm.weight"), Hf, Hf_h, HID, c.rms_eps);
+                if (N > 0) {
+                    linear_h(st, lm.fmt, lmw, (int)lm.rows(), (int)lm.cols(), Hf_h + HID, r.logits, K);
+                    hipLaunchKernelGGL(k_dfly_topn, dim3(K), dim3(1024), 0, st, (const float*)r.logits, V, N, d_cand);
+                }
+                HCK(cudaStreamEndCapture(st, &gr));
+                HCK(cudaGraphInstantiate(&exec, gr, nullptr, nullptr, 0));
+                HCK(cudaGraphDestroy(gr));
+                dg_cache.push_back({key, exec});
+            }
+            h_dargs->a = a;
+            h_dargs->row = row;
+            HCK(hipMemcpyAsync(d_dargs, h_dargs, sizeof(DevDraftArgs), hipMemcpyHostToDevice, st));
+            HCK(cudaGraphLaunch(exec, st));
+            if (N > 0) HCK(hipMemcpyAsync(h_cand, d_cand, (size_t)K * N * 4, hipMemcpyDeviceToHost, st));
+            return true;
+        }
+#endif
+        const std::string pf = "model.dfly_layers.";
+        const TInfo& emb = r.ti("model.embed_tokens.weight");
+        embed_rows(st, emb.fmt, r.tw("model.embed_tokens.weight"), (int)emb.rows(), (int)emb.cols(), d_bids, H, B);
+        hipLaunchKernelGGL(k_dfly_h2f, dim3(1), dim3(256), 0, st, hprev_h, hprev_f, HID);
+        hipLaunchKernelGGL(k_dfly_cat2, dim3(1), dim3(256), 0, st, (const float*)H, wf(pf + "mtp_fusion.enorm.weight"), (const float*)hprev_f, wf(pf + "mtp_fusion.hnorm.weight"), hcin, c.rms_eps);
+        r.lin(pf + "mtp_fusion.eh_proj.weight", hcin, F1, 1);
+        hipLaunchKernelGGL(k_dfly_fuse, dim3(1), dim3(256), 0, st, H, wf(pf + "mtp_fusion.gate"), (const float*)F1);
+        std::unique_ptr<Runner::PS> pl(new Runner::PS(&r, "dfly_layers"));
+        for (int d = 0; d < ((skip & 1) ? 0 : 5); ++d) {
+            const int L = DFLY_LAYERS[d];
+            const std::string pa = pf + std::to_string(d) + ".self_attn";
+            const std::string pm = pf + std::to_string(d) + ".mlp";
+            const bool use_list = r.cap_list[d];
+            __half* dcache = r.kcache[L];
+            if (isolate) {
+                const size_t by = mla_cache_bytes(r.slots_sparse);
+                if (!shadow[d]) HCK(hipMalloc((void**)&shadow[d], by));
+                HCK(hipMemcpyAsync(shadow[d], r.kcache[L], by, hipMemcpyDeviceToDevice, st));
+                dcache = shadow[d];
+            }
+            hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + std::to_string(d) + ".input_layernorm.weight"), (float*)nullptr, hn, HID, c.rms_eps);
+            if (!(skip & 32)) r.lin(pa + ".q_a_proj.weight", hn, F1, B);
+            hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps);
+            if (!(skip & 32)) r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);
+            if (!(skip & 32)) r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);
+            if (!(skip & 8)) mla_write_kv(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, a, 0, (float)c.theta_sparse, c.rms_eps);
+            const int kvfmt = r.ti(pa + ".kv_b_proj.weight").fmt;
+            if (!(skip & 8)) mla_prep_q_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), F2, qa_h, B, 32, a, (float)c.theta_sparse);
+            if (!(skip & 32)) r.lin(pa + ".linear_gate.weight", hn, F4, B);
+            MlaAttnArgs ma;
+            ma.M = B;
+            ma.NH = 32;
+            ma.p0 = a;
+            ma.cache_slots = r.slots_sparse;
+            if (use_list) {
+                hipLaunchKernelGGL(k_dfly_lists, dim3(B), dim3(256), 0, st, (const int32_t*)(r.dkeys[d] + (size_t)row * r.index_topk), (const int32_t*)(r.dnkc[d] + row), a, dlist, dnk, lstride);
+                ma.mode = MLA_LIST;
+                ma.keys = dlist;
+                ma.nkeys = dnk;
+                ma.kmax = lstride;
+            } else {
+                ma.mode = MLA_CAUSAL;
+            }
+            if (!(skip & 64)) r.ensure_mla_ws(mla_workspace_bytes(ma));
+            if (!(skip & 8)) mla_attend(st, qa_h, dcache, wf(pa + ".learnable_sink_param"), ctx_h, ma, r.mla_ws, r.mla_ws_bytes);
+            if (!(skip & 8)) mla_vup_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), ctx_h, F4, o_h, B, 32);
+            if (!(skip & 32)) r.lin(pa + ".o_proj.weight", o_h, F1, B);
+            hipLaunchKernelGGL(k_dfly_rms_resid, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".post_proj_norm.weight"), H, c.rms_eps);
+            hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + std::to_string(d) + ".post_attention_layernorm.weight"), (float*)nullptr, hn, HID, c.rms_eps);
+            if (!(skip & 16)) r.lin(pm + ".gate_proj.weight", hn, F1, B);
+            if (!(skip & 16)) r.lin(pm + ".up_proj.weight", hn, F2, B);
+            const size_t n9 = (size_t)B * 9216;
+            hipLaunchKernelGGL(k_swiglu_h, dim3((n9 + 255) / 256), dim3(256), 0, st, (const float*)F1, (const float*)F2, mlp_h, n9);
+            if (!(skip & 16)) r.lin(pm + ".down_proj.weight", mlp_h, F3, B);
+            hipLaunchKernelGGL(k_add_inplace, dim3(((size_t)B * HID + 255) / 256), dim3(256), 0, st, H, (const float*)F3, (size_t)B * HID);
+        }
+        hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + "final_norm.weight"), Hf, Hf_h, HID, c.rms_eps);
+        pl.reset();
+        const int N = std::min(rv, 1024);
+        N_out = N;
+        if (N > 0 && !(skip & 2)) {
+            const TInfo& lm = r.ti("lm_head.weight");
+            linear_h(st, lm.fmt, r.tw("lm_head.weight"), (int)lm.rows(), (int)lm.cols(), Hf_h + HID, r.logits, K);
+            hipLaunchKernelGGL(k_dfly_topn, dim3(K), dim3(1024), 0, st, (const float*)r.logits, V, N, d_cand);
+            HCK(hipMemcpyAsync(h_cand, d_cand, (size_t)K * N * 4, hipMemcpyDeviceToHost, st));
+        }
+        return true;
+    }
+
+    // Evaluate ONE hidden_correction + lm_head slot j (1..K) given previous token prev_tok.
+    // Returns confidence; fills cand scores in h_cscore[0..N-1] (if N > 0) or full logits in full_lg (if N == 0).
+    float eval_slot_host(int j, int32_t prev_tok, int N, std::vector<float>& full_lg) {
+        const std::string pf = "model.dfly_layers.";
+        const TInfo& emb = r.ti("model.embed_tokens.weight");
+        const TInfo& lm = r.ti("lm_head.weight");
+        const void* lmw = r.tw("lm_head.weight");
+        h_chain[0] = prev_tok;
+        HCK(hipMemcpyAsync(d_prev_one, h_chain, 4, hipMemcpyHostToDevice, st));
+        embed_rows(st, emb.fmt, r.tw("model.embed_tokens.weight"), (int)emb.rows(), (int)emb.cols(), d_prev_one, Ec, 1);
+        hipLaunchKernelGGL(k_dfly_cat2, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), wf(pf + "hidden_correction.hidden_norm.weight"), (const float*)Ec,
+                           wf(pf + "hidden_correction.embed_norm.weight"), hcin, c.rms_eps);
+        r.lin(pf + "hidden_correction.gate_proj.weight", hcin, G, 1);
+        r.lin(pf + "hidden_correction.up_proj.weight", hcin, U, 1);
+        hipLaunchKernelGGL(k_swiglu_h, dim3((HID + 255) / 256), dim3(256), 0, st, (const float*)G, (const float*)U, act, (size_t)HID);
+        r.lin(pf + "hidden_correction.down_proj.weight", act, Dn, 1);
+        hipLaunchKernelGGL(k_dfly_corr, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), (const float*)Dn, wf(pf + "confidence_head.proj.weight"),
+                           wf(pf + "confidence_head.proj.bias"), hc_h, d_conf);
+        if (N > 0) {
+            hipLaunchKernelGGL(k_dfly_cand_score, dim3(N), dim3(32), 0, st, (const uint8_t*)lmw, (const int32_t*)(d_cand + (size_t)(j - 1) * N), (const __half*)hc_h, d_cscore);
+            HCK(hipMemcpyAsync(h_cscore, d_cscore, (size_t)N * 4, hipMemcpyDeviceToHost, st));
+            HCK(hipMemcpyAsync(h_conf, d_conf, 4, hipMemcpyDeviceToHost, st));
+            HCK(hipStreamSynchronize(st));
+        } else {
+            linear_h(st, lm.fmt, lmw, (int)lm.rows(), (int)lm.cols(), hc_h, r.logits, 1);
+            full_lg.resize((size_t)c.vocab);
+            HCK(hipMemcpyAsync(full_lg.data(), r.logits, (size_t)c.vocab * 4, hipMemcpyDeviceToHost, st));
+            HCK(hipMemcpyAsync(h_conf, d_conf, 4, hipMemcpyDeviceToHost, st));
+            HCK(hipStreamSynchronize(st));
+        }
+        ++n_chain_evals;
+        return h_conf[0];
+    }
+
+    // Tree-8 + Early-Exit + Probabilistic-aware drafter.
+    // Produces a connected topological tree of M <= K + 1 <= 8 nodes rooted at node 0 (xa).
+    // - Greedy mode (samp == nullptr || (samp->greedy() && !samp->penalties())):
+    //   Uses confidence_head + top-256 lm_head margins to branch top-2 at uncertain slot(s), ordered by decreasing expected reach probability.
+    // - Probabilistic mode:
+    //   Computes exact sparse draft distributions q_c for each child (without-replacement top-2 branching when enable_tree) for lossless SpecInfer rejection sampling.
+    // - Early-exit: stops unrolling hidden_correction + lm_head once the best frontier reach probability drops below early_cut.
+    bool draft_tree(int a, int xa, int K, TreeSpec& tree, float* node_conf, float* node_reach, const SampleOpts* samp, const std::vector<int32_t>* tok_hist, std::mt19937_64* rng,
+                    std::vector<SparseDist>* node_qdist, float early_cut, bool enable_tree, const std::function<double(float)>& pcal_fn) {
+        const double t0 = now_s();
+        int N = 0;
+        if (!run_block_backbone(a, xa, K, N)) return false;
+        Runner::PS pc(&r, "dfly_chain");
+        const bool prob_mode = samp != nullptr && (!samp->greedy() || samp->penalties());
+        tree = TreeSpec{};
+        tree.M = 1;
+        tree.tok[0] = xa;
+        tree.parent[0] = -1;
+        tree.depth[0] = 0;
+        node_conf[0] = 1.0f;
+        node_reach[0] = 1.0f;
+        if (node_qdist) {
+            node_qdist->clear();
+            node_qdist->resize(1);
+        }
+        struct Cand {
+            int parent;
+            int depth;
+            int32_t tok;
+            float conf;
+            float reach;
+            SparseDist qdist;
+        };
+        std::vector<Cand> frontier;
+        std::vector<float> full_lg;
+        std::vector<int32_t> branch_hist;
+        auto expand = [&](int u) {
+            const int d_next = (int)tree.depth[u] + 1;
+            if (d_next > K) return;
+            const float cf = eval_slot_host(d_next, tree.tok[u], N, full_lg);
+            const double p_acc = std::clamp(pcal_fn(cf), 0.02, 0.995);
+            const float r_u = node_reach[u];
+            if (!prob_mode) {
+                // Find top-1 and top-2 tokens + logit gap -> softmax share
+                int32_t id1 = 0, id2 = -1;
+                float s1 = -3e38f, s2 = -3e38f;
+                if (N > 0) {
+                    const int32_t* cids = h_cand + (size_t)(d_next - 1) * N;
+                    for (int i = 0; i < N; ++i) {
+                        const float sc = h_cscore[i];
+                        const int32_t id = cids[i];
+                        if (sc > s1 || (sc == s1 && id < id1)) { s2 = s1; id2 = id1; s1 = sc; id1 = id; }
+                        else if (id != id1 && (sc > s2 || (sc == s2 && id < id2))) { s2 = sc; id2 = id; }
+                    }
+                } else {
+                    for (int i = 0; i < c.vocab; ++i) {
+                        const float sc = full_lg[i];
+                        if (sc > s1) { s2 = s1; id2 = id1; s1 = sc; id1 = i; }
+                        else if (sc > s2) { s2 = sc; id2 = i; }
+                    }
+                }
+                const float r1 = (float)(r_u * p_acc);
+                frontier.push_back({u, d_next, id1, cf, r1, {}});
+                if (enable_tree && id2 >= 0 && id2 != id1) {
+                    const double gap = std::max(0.0, (double)(s1 - s2));
+                    const double ratio2 = std::exp(-gap);  // q2 / q1
+                    const double p2 = std::min(1.0 - p_acc, p_acc * ratio2 * 0.85);
+                    if (p2 > 0.05) {
+                        frontier.push_back({u, d_next, id2, (float)std::clamp(p2, 0.01, 0.95), (float)(r_u * p2), {}});
+                    }
+                }
+            } else {
+                // Probabilistic mode: build branch history if penalties are active
+                const std::vector<int32_t>* hptr = tok_hist;
+                if (samp->penalties() && tok_hist) {
+                    branch_hist = *tok_hist;
+                    int chain_nodes[8], nc = 0;
+                    for (int cur = u; cur > 0; cur = tree.parent[cur]) chain_nodes[nc++] = cur;
+                    for (int k = nc - 1; k >= 0; --k) branch_hist.push_back(tree.tok[chain_nodes[k]]);
+                    hptr = &branch_hist;
+                }
+                static const std::vector<int32_t> empty_h;
+                SparseDist q1;
+                if (N > 0) compute_dist_cand(h_cand + (size_t)(d_next - 1) * N, h_cscore, N, *samp, hptr ? *hptr : empty_h, q1);
+                else compute_dist_full(full_lg.data(), c.vocab, *samp, hptr ? *hptr : empty_h, q1);
+                if (q1.empty()) return;
+                const int32_t y1 = sample_from_dist(q1, *rng);
+                const float r1 = (float)(r_u * p_acc);
+                frontier.push_back({u, d_next, y1, cf, r1, q1});
+                if (enable_tree && q1.size() >= 2) {
+                    // Second sibling drawn without replacement from q1 \ {y1} (SpecInfer exact tree residual)
+                    SparseDist q2;
+                    double z2 = 0.0;
+                    for (const auto& kv : q1)
+                        if (kv.first != y1) z2 += kv.second;
+                    if (z2 > 0.08) {
+                        q2.reserve(q1.size() - 1);
+                        for (const auto& kv : q1)
+                            if (kv.first != y1) q2.push_back({kv.first, kv.second / z2});
+                        const int32_t y2 = sample_from_dist(q2, *rng);
+                        const double p2 = std::min(1.0 - p_acc, z2 * 0.75);
+                        if (p2 > 0.05) {
+                            frontier.push_back({u, d_next, y2, (float)std::clamp(p2, 0.01, 0.95), (float)(r_u * p2), std::move(q2)});
+                        }
+                    }
+                }
+            }
+        };
+
+        // Expand root 0 first
+        expand(0);
+        const int max_nodes = std::min(K + 1, DFLY_BMAX);
+        while (tree.M < max_nodes && !frontier.empty()) {
+            // Pick frontier node with maximum reach probability (preserves topological order since reach[child] <= reach[parent])
+            int best_i = 0;
+            for (int i = 1; i < (int)frontier.size(); ++i)
+                if (frontier[i].reach > frontier[best_i].reach) best_i = i;
+            if (early_cut > 0.f && tree.M > 1 && frontier[best_i].reach < early_cut) {
+                ++n_early_exits;
+                break;
+            }
+            Cand chosen = std::move(frontier[best_i]);
+            frontier.erase(frontier.begin() + best_i);
+            const int idx = tree.M++;
+            tree.tok[idx] = chosen.tok;
+            tree.parent[idx] = (int8_t)chosen.parent;
+            tree.depth[idx] = (uint8_t)chosen.depth;
+            node_conf[idx] = chosen.conf;
+            node_reach[idx] = chosen.reach;
+            if (node_qdist) node_qdist->push_back(std::move(chosen.qdist));
+            // Expand newly added node only if we still have room in the tree and its children could beat early_cut
+            if (tree.M < max_nodes && chosen.depth < K && (early_cut <= 0.f || chosen.reach >= early_cut)) {
+                expand(idx);
+            }
+        }
+        tree.build_anc();
         t_draft += now_s() - t0;
         ++n_draft;
         return true;
