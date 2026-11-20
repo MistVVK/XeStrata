@@ -27,17 +27,20 @@ namespace hy4s {
 
 struct ServeOpts {
     std::string model, engram;
-    int max_ctx = 131072;  // owner default for Hy4-Flash: 128K on every card
+    int max_ctx = 131072;
     int chunk = 1024;
     int index_topk = 2048;
     int threads = 6;
     int gx_mb = 384;
     int kv_host_above = 24000;
+    double vram_experts_gb = -1.0;  // < 0: auto from free VRAM
+    double ram_experts_gb = -1.0;   // < 0: auto from RAM budget
+    bool hi_act = false;
     bool no_index = false, no_engram = false;
     bool session_reuse = false;
-    std::string draft = "auto";  // auto = dfly2 when the file carries the drafter; off; dfly2 (error without it)
-    std::string vision;            // path of Hy4-Flash-Vision.strata (--vision); empty = text only
-    int64_t image_max_pixels = 1048576;  // picture size cap (1024 x 1024): the ViT workspace has to fit next to the trunk in 8 GB of VRAM
+    std::string draft = "auto";
+    std::string vision;
+    int64_t image_max_pixels = 1048576;
     bool vision_requested = false;
     SpecCfg spec;
 };
@@ -54,7 +57,9 @@ struct SampleOpts {
     bool penalties() const { return rep != 1.f || freq != 0.f || pres != 0.f; }
 };
 
+#ifndef _MSC_VER
 inline void proto(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+#endif
 inline void proto(const char* fmt, ...) {
     char buf[512];
     va_list ap;
@@ -250,14 +255,6 @@ inline int hy4s_serve_main(const ServeOpts& o) {
             proto("ERR cannot load %s: %s", o.model.c_str(), err.c_str());
             return 1;
         }
-        CpuExperts cx;
-        if (!cx.open(o.model, o.threads, err, std::max(o.chunk, 1))) {
-            proto("ERR experts: %s", err.c_str());
-            return 1;
-        }
-        double ws = 0;
-        const double gbs = cx.warm(o.threads, &ws);  // the experts of this box live in the page cache: bring them in once at start
-        fprintf(stderr, "[experts] warm %.1f s (%.2f GB/s)\n", ws, gbs);
         const bool has_drafter = manifest_has_drafter(g.man);
         if (o.draft == "dfly2" && !has_drafter) {
             proto("ERR --draft dfly2: this .strata has no DFly2 drafter tensors");
@@ -269,7 +266,9 @@ inline int hy4s_serve_main(const ServeOpts& o) {
             return 2;
         }
         const int max_ctx = o.max_ctx;
-        Runner r(g, cx, max_ctx, std::max(o.chunk, 1), want_spec ? 8 : 1);
+        hy4::CpuExperts ucx;
+        SyVramExpertCache vcache;
+        Runner r(g, ucx, max_ctx, std::max(o.chunk, 1), want_spec ? 8 : 1);
         r.index_topk = o.index_topk;
         r.index_on = o.no_index ? 0 : 1;
         r.kv_host_above = o.kv_host_above;
@@ -287,11 +286,19 @@ inline int hy4s_serve_main(const ServeOpts& o) {
                 return 2;
             }
         }
+        // Size VRAM expert cache + unified CPU expert pool AFTER trunk/KV/DFly2 are allocated!
+        const size_t gx_reserve = o.gx_mb > 0 ? ((size_t)o.gx_mb * 2 / 3 + 220) * (1ull << 20) : 0;
+        const size_t host_oh = r.kv_host_bytes + g.host_bytes_total + ((size_t)std::max(o.gx_mb, 0) << 20) + (640ull << 20);
+        if (!setup_experts_unified(o.model, o.threads, o.vram_experts_gb, o.ram_experts_gb, gx_reserve, host_oh, o.hi_act, vcache, ucx, err)) {
+            proto("ERR experts: %s", err.c_str());
+            return 1;
+        }
+        r.vcache = vcache.active() ? &vcache : nullptr;
         GpuExperts gxe;
         if (o.gx_mb > 0) {
             std::string gerr;
             try {
-                if (gxe.init(cx, (size_t)o.gx_mb << 20, r.Tc, gerr, o.threads)) {
+                if (gxe.init_unified(o.model, &ucx, r.vcache, (size_t)o.gx_mb << 20, r.Tc, gerr, o.threads)) {
                     r.gx = &gxe;
                     r.gx_min_T = 32;
                 } else {
@@ -307,7 +314,8 @@ inline int hy4s_serve_main(const ServeOpts& o) {
             spec.reset(new Spec(r, df, sc));
             spec_set_batch_invariant();
         }
-        fprintf(stderr, "[load] total %.1f s, device allocated %.2f GiB of 7.54\n", now_s() - t_load0, (dev_bytes_allocated() + (r.gx ? gxe.device_bytes() : 0)) / 1073741824.0);
+        fprintf(stderr, "[load] total %.1f s, device allocated %.2f GiB of %.2f GiB\n", now_s() - t_load0,
+                (dev_bytes_allocated() + (r.gx ? gxe.device_bytes() : 0)) / 1073741824.0, dev_caps().global_mem / 1073741824.0);
         // pictures need the Vision shard: probe it now (cheap, no GPU) so INFO tells serve the truth; it is read into pinned host memory on the first picture request, not at start
         bool images_ok = false;
         VisionEncoder venc;
@@ -416,12 +424,12 @@ inline int hy4s_serve_main(const ServeOpts& o) {
             r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
             while (done < T0) {
                 const int T = std::min(r.Tc, T0 - done);
+                if (done + T < T0) r.prefetch_engram(tok.data(), done + T, std::min(r.Tc, T0 - (done + T)));
                 if (!r.forward_chunk(tok.data(), done, T, err)) {
                     failed = true;
                     break;
                 }
                 done += T;
-                if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
                 const bool last = done == T0;
                 if (last) {
                     r.head(T, T - 1);
@@ -501,6 +509,7 @@ inline int hy4s_serve_main(const ServeOpts& o) {
                 fwd = pos + 1;
                 r.head(1, 0);
                 wait();
+                r.step_adapt();
             }
             if (failed) {
                 proto("ERR forward: %s", err.c_str());
@@ -515,9 +524,7 @@ inline int hy4s_serve_main(const ServeOpts& o) {
         wait();
         // QUIT / EOF: leave without running the destructors. After some request mixes (cancel, errors) the teardown of the async Engram tasks / runtime threads did not return in
         // tests on p1006 (main thread in a futex wait for >60 s); everything the process holds (device memory, pinned memory, mmaps) is released by the OS.
-        fflush(stdout);
-        fflush(stderr);
-        _exit(0);
+        hy4s_exit_fast(0);
     } catch (const sycl::exception& e) {
         proto("ERR sycl: %s", e.what());
         return 1;

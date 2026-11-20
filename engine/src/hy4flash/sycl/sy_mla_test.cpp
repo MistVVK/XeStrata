@@ -6,6 +6,7 @@
 #include <cmath>
 #include <vector>
 
+#include "sy_linear.h"
 #include "sy_mla.h"
 
 using namespace hy4s;
@@ -341,6 +342,50 @@ int main(int argc, char** argv) {
             {"list NH64 kmax256 p0=900 M=5", 64, MLA_LIST, 900, 5, 0, 512, 256, 1e7f},
         };
         for (const auto& s : scs) all &= run_scn(s, 12345 + s.p0 + s.M);
+        // Quantized S_K kv_b (mla_prep_q_sk / mla_vup_sk) vs split_kvb -> fp16 -> mla_prep_q / mla_vup
+        {
+            Rng rng(999);
+            const int NH = 32, M = 4, p0 = 123;
+            for (int fmt : {FMT_S4, FMT_S5, FMT_S8}) {
+                const int sb = sk_sb_bytes(fmt);
+                std::vector<uint8_t> w((size_t)NH * 448 * 2 * sb);
+                for (size_t i = 0; i < w.size(); ++i) w[i] = (uint8_t)(rng.next() & 255);
+                for (size_t i = 0; i < w.size(); i += sb) {
+                    uint16_t d = sycl::bit_cast<uint16_t>((half)(0.01f + 0.02f * rng.uni()));
+                    w[i] = d & 255; w[i + 1] = d >> 8;
+                    for (int g = 0; g < 4; ++g) w[i + 2 + g] = (uint8_t)(100 + (rng.next() % 150));
+                }
+                std::vector<float> qb((size_t)M * NH * MLA_QHEAD), gt((size_t)M * NH * MLA_VHEAD);
+                std::vector<half> ctx((size_t)M * NH * MLA_KV_LORA);
+                for (auto& v : qb) v = rng.nrm();
+                for (auto& v : gt) v = rng.nrm();
+                for (auto& v : ctx) v = (half)(rng.nrm() * 0.3f);
+                uint8_t* dw = dalloc<uint8_t>(w.size());
+                half *dwk = dalloc<half>((size_t)NH * 192 * 512), *dwv = dalloc<half>((size_t)NH * 256 * 512);
+                float *dqb = dalloc<float>(qb.size()), *dgt = dalloc<float>(gt.size());
+                half *dctx = dalloc<half>(ctx.size()), *qa1 = dalloc<half>((size_t)M * NH * MLA_ROW), *qa2 = dalloc<half>((size_t)M * NH * MLA_ROW);
+                half *o1 = dalloc<half>((size_t)M * NH * MLA_VHEAD), *o2 = dalloc<half>((size_t)M * NH * MLA_VHEAD);
+                h2d(dw, w.data(), w.size()); h2d(dqb, qb.data(), qb.size() * 4); h2d(dgt, gt.data(), gt.size() * 4); h2d(dctx, ctx.data(), ctx.size() * 2);
+                split_kvb(fmt, dw, dwk, dwv, NH);
+                mla_prep_q(dqb, dwk, qa1, M, NH, p0, 1e7f);
+                mla_prep_q_sk(fmt, dw, dqb, qa2, M, NH, p0, nullptr, false, 1e7f);
+                mla_vup(dctx, dwv, dgt, o1, M, NH);
+                mla_vup_sk(fmt, dw, dctx, dgt, o2, M, NH);
+                std::vector<half> hqa1((size_t)M * NH * MLA_ROW), hqa2((size_t)M * NH * MLA_ROW), ho1((size_t)M * NH * MLA_VHEAD), ho2((size_t)M * NH * MLA_VHEAD);
+                d2h(hqa1.data(), qa1, hqa1.size() * 2); d2h(hqa2.data(), qa2, hqa2.size() * 2);
+                d2h(ho1.data(), o1, ho1.size() * 2); d2h(ho2.data(), o2, ho2.size() * 2);
+                wait();
+                std::vector<float> fqa1(hqa1.size()), fqa2(hqa2.size()), fo1(ho1.size()), fo2(ho2.size());
+                for (size_t i = 0; i < hqa1.size(); ++i) { fqa1[i] = (float)hqa1[i]; fqa2[i] = (float)hqa2[i]; }
+                for (size_t i = 0; i < ho1.size(); ++i) { fo1[i] = (float)ho1[i]; fo2[i] = (float)ho2[i]; }
+                Err eq = cmp(fqa2, fqa1), eo = cmp(fo2, fo1);
+                bool ok = eq.cos > 0.999999 && eo.cos > 0.999999 && eq.max_abs < 5e-3 * eq.max_ref && eo.max_abs < 5e-3 * eo.max_ref;
+                printf("quant_kvb S%d M=%d: prep_q cos %.7f maxabs %.2e | vup cos %.7f maxabs %.2e %s\n",
+                       fmt, M, eq.cos, eq.max_abs, eo.cos, eo.max_abs, ok ? "OK" : "FAIL");
+                all &= ok;
+                for (void* p : {(void*)dw, (void*)dwk, (void*)dwv, (void*)dqb, (void*)dgt, (void*)dctx, (void*)qa1, (void*)qa2, (void*)o1, (void*)o2}) dfree(p);
+            }
+        }
         printf("CORRECTNESS: %s\n", all ? "ALL OK" : "FAILED");
     }
     if (do_perf) {

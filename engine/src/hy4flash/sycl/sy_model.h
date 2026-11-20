@@ -2,8 +2,10 @@
 // Tensors never straddle a slab. S4_K / S8_K weight matrices are repacked to the RP layout (sy_rp.h) on the host while loading; everything else is copied as is.
 // The routed experts (Section 4) stay in host memory and are computed on the CPU (hy4s_cpuexp.h).
 #pragma once
+#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -11,6 +13,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "hy4_io.h"
 #include "hy4_manifest.h"
 #include "strata/artifact/strata_reader.hpp"
 #include "sy_common.h"
@@ -44,10 +47,14 @@ struct SyModel {
     bool is_rp(const std::string& name) const { return rp.count(name) != 0; }
     const hy4::TInfo& ti(const std::string& name) const { return man.get(name); }
 
-    // Tensors the kernels only touch a row / a few times (the embedding table: one row per token; kv_b_proj: split into the absorbed halves once at start) stay in PINNED HOST memory
-    // (zero-copy reads from the kernels): 0.37 GB + 0.2 GB of the 8 GB card are worth more as VRAM for the trunk and the expert ring.
+    // embed_tokens (0.37 GB) is touched only 1..8 rows per decode step, so it stays in PINNED HOST memory (zero-copy reads).
+    // kv_b_proj (0.34 GB in compact quantized S5_K) lives in VRAM slabs: we no longer expand it to 1.06 GB of persistent fp16 wk_b/wv_b,
+    // saving ~0.72 GB VRAM + 0.34 GB host RAM and cutting decode/verify kv_b read bandwidth by 3x! (HY4S_KVB_HOST=1 keeps kv_b_proj in host RAM.)
     static bool host_resident(const hy4::TInfo& t) {
-        return t.name.find("kv_b_proj") != std::string::npos || t.name.find("embed_tokens") != std::string::npos;
+        if (t.name.find("embed_tokens") != std::string::npos) return true;
+        static const bool kvb_host = std::getenv("HY4S_KVB_HOST") && std::getenv("HY4S_KVB_HOST")[0] == '1';
+        if (kvb_host && t.name.find("kv_b_proj") != std::string::npos) return true;
+        return false;
     }
 
     static bool wants_rp(const hy4::TInfo& t) {
@@ -91,8 +98,8 @@ struct SyModel {
             acc += dsz[i];
         }
         if (!ts.empty()) groups.push_back({i0, ts.size() - 1});
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) { err = "open failed"; return false; }
+        hy4::AlignedFile af;
+        if (!af.open(path, false)) { err = "open failed"; return false; }
         uint8_t* raw = halloc<uint8_t>(max_raw + 4096);
         uint8_t* out = halloc<uint8_t>(max_out + 4096);
         for (auto& g : groups) {
@@ -106,24 +113,12 @@ struct SyModel {
                 const hy4::TInfo& t = *ts[i];
                 if (host_resident(t)) {
                     uint8_t* hp = halloc<uint8_t>(t.bytes + 256);
-                    size_t hgot = 0;
-                    while (hgot < t.bytes) {
-                        ssize_t r = pread(fd, hp + hgot, t.bytes - hgot, (off_t)(sec1 + t.off + hgot));
-                        if (r <= 0) { err = "short read of trunk tensor " + t.name; return false; }
-                        hgot += (size_t)r;
-                    }
-                    posix_fadvise(fd, (off_t)(sec1 + t.off), (off_t)t.bytes, POSIX_FADV_DONTNEED);
+                    if (af.read_at(sec1 + t.off, hp, t.bytes) < t.bytes) { err = "short read of trunk tensor " + t.name; return false; }
                     ptr[t.name] = hp;
                     host_bytes_total += t.bytes;
                     continue;
                 }
-                size_t got = 0;
-                while (got < t.bytes) {
-                    ssize_t r = pread(fd, raw + got, t.bytes - got, (off_t)(sec1 + t.off + got));
-                    if (r <= 0) { err = "short read of trunk tensor " + t.name; return false; }
-                    got += (size_t)r;
-                }
-                posix_fadvise(fd, (off_t)(sec1 + t.off), (off_t)t.bytes, POSIX_FADV_DONTNEED);
+                if (af.read_at(sec1 + t.off, raw, t.bytes) < t.bytes) { err = "short read of trunk tensor " + t.name; return false; }
                 if (isrp[i]) {
                     rp_repack_host(t.fmt, raw, out, (int)t.rows(), (int)t.cols());
                     Q().memcpy(s.d + pos, out, rp_bytes(t.fmt, (int)t.rows(), (int)t.cols())).wait();
@@ -137,7 +132,7 @@ struct SyModel {
             slabs.push_back(s);
             dev_bytes_total += sz;
         }
-        ::close(fd);
+        af.close();
         sycl::free(raw, Q());
         sycl::free(out, Q());
         if (!rd.read_section(2, seed, err)) return false;

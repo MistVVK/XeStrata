@@ -16,8 +16,8 @@ int main() {
     printf("device %s\n", Q().get_device().get_info<sycl::info::device::name>().c_str());
     std::mt19937 rng(7);
     auto rnd = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(rng); };
-    for (int fmt : {FMT_S4, FMT_S5, FMT_S6, FMT_S8}) {
-        const int N = 640, K = 1536, M = 77;
+    for (int fmt : {FMT_S2, FMT_S3, FMT_S4, FMT_S5, FMT_S6, FMT_S8}) {
+        const int N = 640, K = 1536, M = 141;
         const int Mr = (M + 7) & ~7;
         const int sb = sk_sb_bytes(fmt);
         std::vector<uint8_t> w((size_t)N * (K / 256) * sb);

@@ -141,29 +141,29 @@ inline void k_gemv_multi(const GemvMulti& mj) {
                 const float D = h2f_bits((uint16_t)hd[0] | ((uint16_t)hd[1] << 8));
                 const float eff = D * ((float)hd[2 + (off >> 6)] / 255.0f);
                 const int k0 = sb * 256 + off;
-                float xf[32];
-                if (jb.xmode == 0) {
-                    for (int v = 0; v < 4; ++v) {
-                        const sycl::vec<half, 8> xv = *reinterpret_cast<const sycl::vec<half, 8>*>(jb.Xh + k0 + v * 8);
-#pragma unroll
-                        for (int t = 0; t < 8; ++t) xf[v * 8 + t] = (float)xv[t];
-                    }
-                } else if (jb.xmode == 1) {
-#pragma unroll
-                    for (int t = 0; t < 32; ++t) xf[t] = (float)(half)jb.Xf[k0 + t];
-                } else {
-#pragma unroll
-                    for (int t = 0; t < 32; ++t) xf[t] = (float)(half)(siluf_(jb.Xg[k0 + t]) * jb.Xu[k0 + t]);
-                }
                 float sq = 0.f, sx = 0.f;
+                // Stream 8 elements at a time (eliminates 32-float register array & 30 SIMD32 register spills!)
 #pragma unroll
-                for (int v = 0; v < 4; ++v)
+                for (int v = 0; v < 4; ++v) {
+                    float xv[8];
+                    if (jb.xmode == 0) {
+                        const sycl::vec<half, 8> vh = *reinterpret_cast<const sycl::vec<half, 8>*>(jb.Xh + k0 + v * 8);
+#pragma unroll
+                        for (int t = 0; t < 8; ++t) xv[t] = (float)vh[t];
+                    } else if (jb.xmode == 1) {
+#pragma unroll
+                        for (int t = 0; t < 8; ++t) xv[t] = (float)(half)jb.Xf[k0 + v * 8 + t];
+                    } else {
+#pragma unroll
+                        for (int t = 0; t < 8; ++t) xv[t] = (float)(half)(siluf_(jb.Xg[k0 + v * 8 + t]) * jb.Xu[k0 + v * 8 + t]);
+                    }
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        const float x0 = xf[v * 8 + 2 * j], x1 = xf[v * 8 + 2 * j + 1];
+                        const float x0 = xv[2 * j], x1 = xv[2 * j + 1];
                         sq += (float)(raw[4 * v + j] & 15) * x0 + (float)(raw[4 * v + j] >> 4) * x1;
                         sx += x0 + x1;
                     }
+                }
                 acc += eff * (sq - 7.5f * sx);
             }
         }
@@ -175,9 +175,9 @@ inline void k_gemv_multi(const GemvMulti& mj) {
 inline bool gemv_rp(int fmt, const void* W, int N, int K, const half* X, float* Y, int M) {
     const uint8_t* w = (const uint8_t*)W;
     if (M > 8) return false;
-    if (fmt == FMT_S4) { if (M == 1) k_gemv_rp<FMT_S4, 1>(w, N, K, X, Y, M); else k_gemv_rp<FMT_S4, 8>(w, N, K, X, Y, M); return true; }
-    if (fmt == FMT_S5) { if (M == 1) k_gemv_rp<FMT_S5, 1>(w, N, K, X, Y, M); else k_gemv_rp<FMT_S5, 8>(w, N, K, X, Y, M); return true; }
-    if (fmt == FMT_S8) { if (M == 1) k_gemv_rp<FMT_S8, 1>(w, N, K, X, Y, M); else k_gemv_rp<FMT_S8, 8>(w, N, K, X, Y, M); return true; }
+    if (fmt == FMT_S4) { if (M == 1) k_gemv_rp<FMT_S4, 1>(w, N, K, X, Y, M); else if (M <= 4) k_gemv_rp<FMT_S4, 4>(w, N, K, X, Y, M); else k_gemv_rp<FMT_S4, 8>(w, N, K, X, Y, M); return true; }
+    if (fmt == FMT_S5) { if (M == 1) k_gemv_rp<FMT_S5, 1>(w, N, K, X, Y, M); else if (M <= 4) k_gemv_rp<FMT_S5, 4>(w, N, K, X, Y, M); else k_gemv_rp<FMT_S5, 8>(w, N, K, X, Y, M); return true; }
+    if (fmt == FMT_S8) { if (M == 1) k_gemv_rp<FMT_S8, 1>(w, N, K, X, Y, M); else if (M <= 4) k_gemv_rp<FMT_S8, 4>(w, N, K, X, Y, M); else k_gemv_rp<FMT_S8, 8>(w, N, K, X, Y, M); return true; }
     return false;
 }
 
