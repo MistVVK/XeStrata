@@ -189,7 +189,7 @@ def build(src: Path, backend: str, version: str, target: str, out: Path, *, entr
     entrypoint = entry or ("strata.exe" if target.startswith("windows") else "strata")
     if not (src / entrypoint).is_file():
         raise SystemExit(f"{src / entrypoint} does not exist")
-    if check_reader:                       # the release recipes and the CLI ask for it; the library call keeps its old behaviour
+    if check_reader and shape != shape_engine.HY4_SHAPE:   # the release recipes and the CLI ask for it; the library call keeps its old behaviour. Hy4-Flash reads pictures inside its runner (no strata-vision)
         for note in check_picture_reader(src, backend, target, archs, variant=variant, allow_stale=allow_stale_vision,
                                          allow_none=allow_no_reader):
             print("note: " + note)
