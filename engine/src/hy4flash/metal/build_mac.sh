@@ -2,7 +2,7 @@
 # build_mac.sh (runs on m1002, CLT clang only, no cmake): builds the Hy4-Flash Metal tools into ~/strata-mac/hy4/bin
 # usage: build_mac.sh [target...]   targets: check (compile check), run (strata-hy4-metal), all (default)
 set -e
-H=$HOME/strata-mac/hy4
+H=${HY4_DIR:-$HOME/strata-mac/hy4}
 S=$H/wt/engine
 O=$H/bin
 mkdir -p $O
@@ -43,7 +43,7 @@ if [ "$T" = run ] || [ "$T" = all ]; then
   # the MSL sources are embedded in the binary (no kernel files to ship; compiled at run time, the CLT have no offline metal compiler)
   M=$S/src/hy4flash/metal
   mkdir -p $O/gen
-  python3 $M/embed_metal.py $O/gen/hy4_metal_embedded.inc $M/hy4.metal $M/hy4_split.metal $M/hy4_hcp.metal $M/hy4_mpp.metal $M/hy4_mppq.metal $M/hy4_mppmoe.metal $M/hy4_flash.metal $M/hy4_dfly2.metal $M/hy4_dfly2b.metal $M/hy4_lin2.metal $M/hy4_lin3.metal $M/hy4_moe2.metal $M/hy4_vision.metal
+  python3 $M/embed_metal.py $O/gen/hy4_metal_embedded.inc $M/hy4.metal $M/hy4_split.metal $M/hy4_hcp.metal $M/hy4_mpp.metal $M/hy4_mppq.metal $M/hy4_mppmoe.metal $M/hy4_flash.metal $M/hy4_mppflash.metal $M/hy4_kvb.metal $M/hy4_dfly2.metal $M/hy4_dfly2b.metal $M/hy4_lin2.metal $M/hy4_lin3.metal $M/hy4_moe2.metal $M/hy4_vision.metal
   clang++ $CXXF $INC -I$Z -DHY4_EMBED_KERNELS -I$O/gen $S/src/hy4flash/metal/hy4_metal_main.cpp $S/src/hy4flash/run/hy4_engram.cpp $S/src/artifact/strata_reader.cpp $O/zstd/*.o $O/mtl_rt.o $FW -lpthread -o $O/strata-hy4-metal
 fi
 if [ "$T" = cpu ] || [ "$T" = all ]; then

@@ -82,9 +82,17 @@ struct Model {
     std::string path;
     uint8_t* base = nullptr;
     size_t fsize = 0;
-    Buffer wbuf;  // the whole file, no-copy
+    int fd_model = -1;
+    bool cold_experts = false;     // true on 32 GB Macs when the 62 GB file exceeds maxBufferLength or working set
+    bool force_cold = false;
+    uint64_t sec1_map_base = 0;    // page-aligned base offset wrapped by wbuf when cold_experts is true
+    Buffer wbuf;  // the whole file (no-copy) or Section 1 trunk only (cold_experts)
     uint64_t sec1_off = 0, sec4_off = 0, sec1_bytes = 0, sec4_bytes = 0;
     std::vector<ExpertDev> experts;  // [41*512] by moe_layer*512 + expert id
+    std::vector<uint32_t> expert_bytes; // [41*512] body_bytes per expert (for cold_experts pread)
+    std::vector<uint64_t> expert_file_off; // [41*512] file offset of each expert body (sec4_off + body_offset)
+    std::vector<int> expert_hot_order; // global expert indices (layer*512 + id) in hotness order from directory
+    size_t max_expert_bytes = 0;
     std::vector<uint8_t> seed;
     double t_load = 0;
 
@@ -104,21 +112,48 @@ struct Model {
         sec4_bytes = h.sections[4].byte_length;
         int fd = ::open(p.c_str(), O_RDONLY);
         if (fd < 0) { err = "open " + p; return false; }
+        fd_model = fd;
         struct stat st;
         fstat(fd, &st);
         fsize = (size_t) st.st_size;
-        void* m = mmap(nullptr, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (m == MAP_FAILED) { err = "mmap failed"; return false; }
-        base = (uint8_t*) m;
         const size_t pg = 16384;
+        const size_t max_buf = cx.max_buffer_length();
+        const size_t work_set = cx.recommended_working_set();
         size_t len = (fsize + pg - 1) / pg * pg;
-        wbuf = cx.wrap(base, len);
+        cold_experts = force_cold || (len > max_buf) || (work_set > 0 && fsize > (size_t) (work_set * 0.88));
+        if (!cold_experts) {
+            void* m = mmap(nullptr, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (m == MAP_FAILED) { err = "mmap failed"; return false; }
+            base = (uint8_t*) m;
+            sec1_map_base = 0;
+            wbuf = cx.wrap(base, len);
+        } else {
+            // 32 GB Mac tier: mmap & wrap ONLY Section 1 trunk (~5.9 GB); Section 4 experts stream via LRU cache + pread
+            sec1_map_base = (sec1_off / pg) * pg;
+            size_t mlen = ((sec1_off + sec1_bytes - sec1_map_base) + pg - 1) / pg * pg;
+            void* m = mmap(nullptr, mlen, PROT_READ, MAP_PRIVATE, fd, (off_t) sec1_map_base);
+            if (m == MAP_FAILED) { err = "mmap sec1 failed"; return false; }
+            base = (uint8_t*) m;
+            wbuf = cx.wrap(base, mlen);
+            fprintf(stderr, "[load] 32GB cold-expert mode: wrapped trunk %.2f GB (file %.2f GB > maxBuf %.1f / workSet %.1f GB)\n",
+                    mlen / 1e9, fsize / 1e9, max_buf / 1e9, work_set / 1e9);
+        }
         if (!rd.read_section(2, seed, err)) return false;
         const auto& dir = rd.expert_directory();
         experts.assign(41 * 512, ExpertDev{0, 0, 0, 0, 0});
+        expert_bytes.assign(41 * 512, 0);
+        expert_file_off.assign(41 * 512, 0);
+        expert_hot_order.clear();
+        expert_hot_order.reserve(dir.size());
+        max_expert_bytes = 0;
         for (size_t i = 0; i < dir.size(); ++i) {
             const auto& e = dir[i];
-            experts[(i / 512) * 512 + e.expert_id] = ExpertDev{e.body_offset, e.dn_offset, e.gu_code_id, e.dn_code_id, 0};
+            const size_t gid = (i / 512) * 512 + e.expert_id;
+            experts[gid] = ExpertDev{e.body_offset, e.dn_offset, e.gu_code_id, e.dn_code_id, 0};
+            expert_bytes[gid] = e.body_bytes;
+            expert_file_off[gid] = sec4_off + e.body_offset;
+            expert_hot_order.push_back((int) gid);
+            if (e.body_bytes > max_expert_bytes) max_expert_bytes = e.body_bytes;
         }
         t_load = now_s() - t0;
         return true;
@@ -143,12 +178,12 @@ struct Model {
                 });
             for (auto& x : th) x.join();
         };
-        touch(sec1_off, sec1_bytes);
-        touch(sec4_off, sec4_bytes);
+        touch(sec1_off - sec1_map_base, sec1_bytes);
+        if (!cold_experts) touch(sec4_off, sec4_bytes);
     }
     const TInfo& ti(const std::string& n) const { return man.get(n); }
-    Arg tw(const std::string& n) const { return Arg::B(wbuf, sec1_off + man.get(n).off); }
-    const float* tf(const std::string& n) const { return (const float*) (base + sec1_off + man.get(n).off); }
+    Arg tw(const std::string& n) const { return Arg::B(wbuf, (sec1_off - sec1_map_base) + man.get(n).off); }
+    const float* tf(const std::string& n) const { return (const float*) (base + (sec1_off - sec1_map_base) + man.get(n).off); }
 };
 
 // ------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -161,18 +196,26 @@ public:
     int n_run = 42;  // layers to run (--layers: partial runs for bisecting)
     int ring_slack = 0;  // extra SWA ring slots (--ab: a decode round must not clobber the window rows the restore re-run of the last prefill chunk reads)
     bool f32x = true; bool lin2 = true; int lin2_r = 0;  // row-blocked decode GEMV (--no-lin2 / --lin2-r N for A/B)
+    bool sm_verify = false;    // use small-M simdgroup_matrix linear_sm for M = 1..8 (--sm-verify for A/B)
     int mm_min = 16;           // GEMM (fp16 weights) from this many tokens; below it the exact fp32-dequant GEMV (--mm-min)
     bool mpp_ok = false;       // hy4_mpp.metal / hy4_mppq.metal compiled (Metal 4 matmul2d): prefill GEMMs through an fp16 dequantised scratch
+    bool mpp_flash_ok = false; // hy4_mppflash.metal compiled (Metal 4 matmul2d Flash-MLA)
+    bool mpp_flash_on = true;  // use mla_flash_mpp when mpp_flash_ok (--no-mpp-flash to force simdgroup_matrix mla_flash)
+    bool mpp_dec_attn = false; // split-K MPP Flash-MLA for decode/verify (--mpp-dec-attn)
     int mpp_min = 96;          // use it from this many tokens
     Buffer wscr;               // dequantised weight scratch [N][K] half
-    bool flash_on = false;     // mla_flash (simdgroup_matrix attention) for prefill chunks of >= 16 tokens (needs the MPP library build)
+    bool flash_on = true;      // K-streamed Flash-MLA (mla_flash_mpp / mla_flash) for prefill chunks of >= 16 tokens (--no-flash to disable)
+    bool qkvb_on = true;       // quantized S_K kv_b_proj in decode/verify (--no-qkvb to disable)
+    bool idxsg_on = true;      // simdgroup_matrix IndexPool scorer (--no-idxsg to disable)
     int moe_mm_min = 64;       // MoE prefill through the MPP grouped GEMM from this many tokens (needs mpp_ok)
+    int moe_tn_arg = 64;       // MPP MoE N tile (64 default, 32 for A/B)
+    int moe_tm_arg = 0;        // MPP MoE M tile override (0 = auto)
     Buffer m_srt, m_pos, m_tiles, m_meta, m_xs, m_hs, m_y;
     Buffer hc_part;            // partials of the split iHC mix [T<=8][24][9]
     bool hc_split = true;
-    Buffer attn_ws;            // split-K attention partials [T<=4][64][S<=16][514] floats
-    int split_max = 8;         // key splits per head for decode (T <= 4); 0 = off
-    static int moe_tm(int T) { return T <= 768 ? 16 : (T <= 1536 ? 32 : 64); }
+    Buffer attn_ws;            // split-K attention partials [T<=8][64][S<=16][514] floats
+    int split_max = 8;         // key splits per head for decode (T <= 8); 0 = off
+    static int moe_tm(int T) { return T <= 768 ? 16 : 32; }
     size_t wscr_elems = 0;
     int lib = -1;
     std::unordered_map<std::string, mtl::Pipeline> pl;
@@ -186,10 +229,19 @@ public:
 
     // buffers
     Buffer d_ids, x, pre, post, cur_h, cur_f, F1, F2, F3, F4, sub, H1, qr_h, qa_h, ctx_h, o_h, z_f, z_h, zout_f, moe_idx, moe_w, moe_h2, moe_y, moe_cnt, moe_off, moe_pairs, hfin, logits, d_argmax, er_h, kv_f;
-    Buffer d_experts, wk_b, wv_b, ivg_dummy;
+    Buffer d_experts, wk_scr, wv_scr, ivg_dummy; // wk_scr [64][512][192] + wv_scr [64][256][512] = 29.4 MB single-layer prefill scratch (-1.03 GB wired RAM!)
     Buffer m2_uexp, m2_ucnt, m2_upair, m2_meta;
     bool moe2 = true;  // distinct-expert decode / verify MoE (hy4_moe2.metal) for T <= 8 (--no-moe2)
-    std::vector<size_t> wk_off, wv_off;
+    // 32 GB Mac tier: bounded LRU GPU expert cache (only allocated when g.cold_experts is true)
+    Buffer exp_cache;
+    size_t exp_slot_bytes = 0;
+    int exp_n_slots = 0;
+    std::vector<int> exp_slot_of;   // [41*512] -> slot index or -1
+    std::vector<int> exp_owner;     // [exp_n_slots] -> global expert id or -1
+    std::vector<uint64_t> exp_lru;  // [exp_n_slots] -> last-used tick
+    uint64_t exp_tick = 0;
+    uint64_t exp_cache_hits = 0, exp_cache_misses = 0;
+    double t_cold_io = 0;
     std::vector<Buffer> kcache, ivg, pooled;
     Buffer ik_f, iv_f, ig_f, ik_h, iq_f, iq_h, hw_f, score, keys, nkeys;
     size_t ldS = 0;
@@ -282,14 +334,19 @@ public:
         if (mpp_ok && M >= mpp_min && t.fmt != F_Q8ROW && (size_t) N * K <= wscr_elems) {
             struct MmArgs { int M, N, K; } ma{M, N, K};
             add("dequant_h_" + std::to_string(t.fmt), K / 256, N, 256, {w, B(wscr), I(N), I(K)});
-            add("mpp_mm_128_64_4", (N + 63) / 64, (M + 127) / 128, 128, {B(X, xoff), B(wscr), B(Y, yoff), Arg::V<MmArgs>(ma)});
+            if (N >= 1024 && (N % 128) == 0 && M >= 128)
+                add("mpp_mm_128_128_4", N / 128, (M + 127) / 128, 128, {B(X, xoff), B(wscr), B(Y, yoff), Arg::V<MmArgs>(ma)});
+            else
+                add("mpp_mm_128_64_4", (N + 63) / 64, (M + 127) / 128, 128, {B(X, xoff), B(wscr), B(Y, yoff), Arg::V<MmArgs>(ma)});
         } else if (t.fmt == F_Q8ROW) {
             if (M >= 16) add("linear_mm_100", (N + 63) / 64, (M + 31) / 32, 128, a);
             else add(M == 1 ? "linear_q8row_1" : "linear_q8row_8", (N + 7) / 8, 1, 256, a);
         } else {
             std::string f = std::to_string(t.fmt);
             if (M >= mm_min) add("linear_mm_" + f, (N + 63) / 64, (M + 31) / 32, 128, a);
-            else if (lin2 && M >= 1 && M <= 8 && (t.fmt == 4 || t.fmt == 5 || t.fmt == 6 || t.fmt == 8)) {
+            else if (sm_verify && M >= 1 && M <= 8 && (t.fmt == 4 || t.fmt == 5 || t.fmt == 6 || t.fmt == 8)) {
+                add("linear_sm_" + f, (N + 31) / 32, 1, 128, a);
+            } else if (lin2 && M >= 1 && M <= 8 && (t.fmt == 4 || t.fmt == 5 || t.fmt == 6 || t.fmt == 8)) {
                 // row-blocked GEMV (hy4_lin2.metal): R rows per simdgroup, MT == M tokens
                 int R = 1;
                 if (lin2_r > 0) R = lin2_r == 3 ? 1 : lin2_r;
@@ -313,17 +370,41 @@ public:
         logit_rows = logit_rows_;
         {
             const std::string dir = kernel_path.substr(0, kernel_path.rfind('/') + 1);
+            std::vector<std::string> base_files = {kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_flash.metal", dir + "hy4_kvb.metal",
+                                                   dir + "hy4_dfly2.metal", dir + "hy4_lin2.metal", dir + "hy4_moe2.metal", dir + "hy4_lin3.metal", dir + "hy4_dfly2b.metal"};
             std::string why;
-            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal", dir + "hy4_dfly2.metal", dir + "hy4_lin2.metal", dir + "hy4_moe2.metal", dir + "hy4_lin3.metal", dir + "hy4_dfly2b.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
-            mpp_ok = lib >= 0;
-            if (!mpp_ok) {
-                if (mpp_try) fprintf(stderr, "[metal] MPP (Metal 4 matmul2d) kernels not available, simdgroup GEMM only: %s\n", why.substr(0, 200).c_str());
-                lib = cx.compile({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_dfly2.metal", dir + "hy4_lin2.metal", dir + "hy4_moe2.metal", dir + "hy4_lin3.metal", dir + "hy4_dfly2b.metal"}, "#define NO_GGML_COMMON 1\n", false);
+            mpp_ok = false;
+            mpp_flash_ok = false;
+            lib = -1;
+            if (mpp_try) {
+                std::vector<std::string> mpp_all = base_files;
+                mpp_all.push_back(dir + "hy4_mpp.metal");
+                mpp_all.push_back(dir + "hy4_mppq.metal");
+                mpp_all.push_back(dir + "hy4_mppmoe.metal");
+                mpp_all.push_back(dir + "hy4_mppflash.metal");
+                lib = cx.compile_try(mpp_all, "#define NO_GGML_COMMON 1\n", false, &why);
+                if (lib >= 0) {
+                    mpp_ok = true;
+                    mpp_flash_ok = true;
+                } else {
+                    fprintf(stderr, "[metal] mppflash not available (%s), trying MPP without mppflash\n", why.substr(0, 180).c_str());
+                    std::vector<std::string> mpp_core = base_files;
+                    mpp_core.push_back(dir + "hy4_mpp.metal");
+                    mpp_core.push_back(dir + "hy4_mppq.metal");
+                    mpp_core.push_back(dir + "hy4_mppmoe.metal");
+                    lib = cx.compile_try(mpp_core, "#define NO_GGML_COMMON 1\n", false, &why);
+                    mpp_ok = lib >= 0;
+                }
+            }
+            if (lib < 0) {
+                if (mpp_try) fprintf(stderr, "[metal] MPP (Metal 4 matmul2d) kernels not available, simdgroup GEMM + Flash-MLA only: %s\n", why.substr(0, 200).c_str());
+                lib = cx.compile(base_files, "#define NO_GGML_COMMON 1\n", false);
             }
             wscr_elems = (size_t) 16384 * 3072;
             if (mpp_ok) wscr = cx.alloc(wscr_elems * 2);
             if (mpp_ok) {
-                const size_t P = (size_t) Tc * 16, rows_max = P + 512 * (size_t) moe_tm(Tc);
+                const size_t P = (size_t) Tc * 16, tm_alloc = (size_t) std::max(moe_tm(Tc), moe_tm_arg);
+                const size_t rows_max = P + 512 * tm_alloc;
                 m_srt = cx.alloc(rows_max * 4);
                 m_pos = cx.alloc(P * 4);
                 m_tiles = cx.alloc((P / 16 + 512 + 8) * 8);
@@ -397,26 +478,47 @@ public:
         score = A((size_t) Tc * ldS * 4);
         keys = A((size_t) Tc * (index_topk + 8) * 4);
         nkeys = A((size_t) Tc * 4);
-        // absorbed MLA weights wk_b [NH][192][512], wv_b [NH][256][512] fp16 per layer
-        wk_off.resize(c.n_layers);
-        wv_off.resize(c.n_layers);
-        size_t tk = 0, tv = 0;
-        for (int il = 0; il < c.n_layers; ++il) {
-            wk_off[il] = tk;
-            wv_off[il] = tv;
-            tk += (size_t) heads(il) * 192 * 512 * 2;
-            tv += (size_t) heads(il) * 256 * 512 * 2;
-        }
-        wk_b = A(tk);
-        wv_b = A(tv);
+        // Single-layer FP16 scratch for prefill kv_b_proj (29.4 MB instead of 1.05 GB persistent wk_b/wv_b; decode/verify reads quantized S_K kv_b_proj directly!)
+        wk_scr = A((size_t) 64 * 512 * 192 * 2);
+        wv_scr = A((size_t) 64 * 256 * 512 * 2);
         for (int il = 0; il < c.n_layers; ++il) {
             const std::string nm = L(il) + ".self_attn.kv_b_proj.weight";
             const TInfo& t = g.ti(nm);
             if (t.fmt != F_S4 && t.fmt != F_S5 && t.fmt != F_S6 && t.fmt != F_S8) { err = "kv_b_proj format not supported"; return false; }
-            add("split_kvb_" + std::to_string(t.fmt), heads(il) * 448, 1, 128, {g.tw(nm), B(wk_b, wk_off[il]), B(wv_b, wv_off[il])});
-            if (ds.size() >= 8) run_all();
         }
-        run_all();
+        // 32 GB Mac tier: bounded LRU GPU expert cache when g.cold_experts is active
+        if (g.cold_experts) {
+            exp_slot_bytes = ((g.max_expert_bytes + 4095) / 4096) * 4096;
+            const size_t work_set = cx.recommended_working_set();
+            const size_t used_now = cx.allocated();
+            size_t budget = (work_set > used_now + (size_t) 4 * 1024 * 1024 * 1024ULL) ? (work_set - used_now - (size_t) 4 * 1024 * 1024 * 1024ULL) : ((size_t) 2 * 1024 * 1024 * 1024ULL);
+            const char* env_gb = getenv("STRATA_METAL_EXP_CACHE_GB");
+            if (env_gb && *env_gb) budget = (size_t) (atof(env_gb) * 1e9);
+            budget = std::min(budget, (size_t) 41 * 512 * exp_slot_bytes);
+            budget = std::max(budget, (size_t) 512 * exp_slot_bytes);  // at least 1 full layer (512 experts) for prefill!
+            exp_n_slots = (int) (budget / exp_slot_bytes);
+            exp_cache = A((size_t) exp_n_slots * exp_slot_bytes);
+            exp_slot_of.assign(41 * 512, -1);
+            exp_owner.assign(exp_n_slots, -1);
+            exp_lru.assign(exp_n_slots, 0);
+            // Pre-populate hot experts (first exp_n_slots entries in directory hotness order)
+            int preload = std::min(exp_n_slots, (int) g.expert_hot_order.size());
+            // Limit startup preload to avoid slow startup if testing cold streaming; load up to min(preload, 512) eagerly, rest on demand
+            int eager = std::min(preload, 512);
+            for (int s = 0; s < eager; ++s) {
+                int gid = g.expert_hot_order[s];
+                uint8_t* dst = (uint8_t*) exp_cache.ptr + (size_t) s * exp_slot_bytes;
+                ssize_t rd_n = pread(g.fd_model, dst, g.expert_bytes[gid], (off_t) g.expert_file_off[gid]);
+                if (rd_n == (ssize_t) g.expert_bytes[gid]) {
+                    exp_slot_of[gid] = s;
+                    exp_owner[s] = gid;
+                    exp_lru[s] = ++exp_tick;
+                    ((ExpertDev*) d_experts.ptr)[gid].body_off = (uint64_t) s * exp_slot_bytes;
+                }
+            }
+            fprintf(stderr, "[cold-experts] LRU cache %.2f GB (%d slots x %.2f MB, preloaded %d)\n",
+                    (size_t) exp_n_slots * exp_slot_bytes / 1e9, exp_n_slots, exp_slot_bytes / 1e6, eager);
+        }
         // engram
         if (!load_engram_meta_json(g.rd.manifest_json(), emeta, err)) return false;
         if (!engram_path.empty()) {
@@ -451,7 +553,29 @@ public:
                 ep[s].raw[mo] = A((size_t) Tc * 16 * 100);
                 ep[s].valid[mo] = A((size_t) Tc * 16);
             }
-        fprintf(stderr, "[runner] kv cache %.2f GB (ctx %d, chunk %d), metal allocated %.2f GB\n", kvbytes / 1e9, max_ctx, Tc, cx.allocated() / 1e9);
+        // Warm up GPU pipeline JIT & bind g.wbuf residency during init (avoids paying first-bind wbuf wiring inside chunk-1 prefill)
+        {
+            const double tw0 = now_s();
+            const std::string kv0 = L(0) + ".self_attn.kv_b_proj.weight";
+            const int f0 = g.ti(kv0).fmt;
+            add("split_kvb_t_" + std::to_string(f0), heads(0) * 448, 1, 128, {g.tw(kv0), B(wk_scr), B(wv_scr)});
+            (void) P("router_topk_fast");
+            (void) P("idx_score_sg");
+            if (mpp_flash_ok) {
+                (void) P("mla_flash_mpp");
+                (void) P("mla_prep_q_mpp");
+                (void) P("mla_vup_mpp");
+            }
+            if (mpp_ok) {
+                (void) P("mpp_mm_128_64_4");
+                (void) P("mpp_mm_128_128_4");
+                (void) P("moe_mm_gu_32_64_4");
+                (void) P("moe_mm_dn_32_64_4");
+            }
+            run_all();
+            gpu_total = 0;
+            fprintf(stderr, "[runner] kv cache %.2f GB (ctx %d, chunk %d), metal allocated %.2f GB, warmup %.2f s\n", kvbytes / 1e9, max_ctx, Tc, cx.allocated() / 1e9, now_s() - tw0);
+        }
         return true;
     }
     std::string kernel_path = "hy4.metal";
@@ -570,9 +694,78 @@ public:
         lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
         int G = (p0 + T) / 4;
         if (G < 1) G = 1;
-        add("idx_score", (G + 63) / 64, T, 64, {B(iq_h), B(hw_f), B(pooled[il]), B(score), I(p0), I(G), I((int) ldS), Fl(1.0f / sqrtf((float) (128 * 16)))});
+        if (idxsg_on)
+            add("idx_score_sg", (G + 63) / 64, T, 128, {B(iq_h), B(hw_f), B(pooled[il]), B(score), I(p0), I(G), I((int) ldS), Fl(1.0f / sqrtf((float) (128 * 16)))});
+        else
+            add("idx_score", (G + 63) / 64, T, 64, {B(iq_h), B(hw_f), B(pooled[il]), B(score), I(p0), I(G), I((int) ldS), Fl(1.0f / sqrtf((float) (128 * 16)))});
         int n_top = index_topk / c.kpool - 1;
         add("idx_select", T, 1, 256, {B(score), I((int) ldS), I(p0), I(n_top), I(index_topk), B(keys), B(nkeys)});
+    }
+
+    // 32 GB Mac tier: ensure all experts selected in moe_idx[0..P-1] for layer `il` (il >= 1) are loaded in exp_cache
+    void ensure_cold_experts(int il, int P) {
+        const double t0 = now_s();
+        const int* idx = (const int*) moe_idx.ptr;
+        const int base_gid = (il - 1) * 512;
+        uint8_t needed[512] = {};
+        std::vector<int> misses;
+        for (int i = 0; i < P; ++i) {
+            int e = idx[i];
+            if (e < 0 || e >= 512 || needed[e]) continue;
+            needed[e] = 1;
+            int gid = base_gid + e;
+            int sl = exp_slot_of[gid];
+            if (sl >= 0) {
+                exp_lru[sl] = ++exp_tick;
+                ++exp_cache_hits;
+            } else {
+                misses.push_back(gid);
+                ++exp_cache_misses;
+            }
+        }
+        if (misses.empty()) return;
+        // Allocate free or LRU slots (never evicting any expert needed by this layer!)
+        std::vector<std::pair<int, int>> loads;  // (gid, slot)
+        loads.reserve(misses.size());
+        for (int gid : misses) {
+            int best = -1;
+            uint64_t best_tick = UINT64_MAX;
+            for (int s = 0; s < exp_n_slots; ++s) {
+                int own = exp_owner[s];
+                if (own < 0) { best = s; break; }
+                if (own >= base_gid && own < base_gid + 512 && needed[own - base_gid]) continue;
+                if (exp_lru[s] < best_tick) { best_tick = exp_lru[s]; best = s; }
+            }
+            if (exp_owner[best] >= 0) exp_slot_of[exp_owner[best]] = -1;
+            exp_owner[best] = gid;
+            exp_slot_of[gid] = best;
+            exp_lru[best] = ++exp_tick;
+            ((ExpertDev*) d_experts.ptr)[gid].body_off = (uint64_t) best * exp_slot_bytes;
+            loads.push_back({gid, best});
+        }
+        // Parallel pread into shared Metal exp_cache buffer
+        const int nth = std::min((int) loads.size(), 8);
+        if (nth <= 1) {
+            for (auto& kv : loads) {
+                uint8_t* dst = (uint8_t*) exp_cache.ptr + (size_t) kv.second * exp_slot_bytes;
+                (void) pread(g.fd_model, dst, g.expert_bytes[kv.first], (off_t) g.expert_file_off[kv.first]);
+            }
+        } else {
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> th;
+            for (int t = 0; t < nth; ++t)
+                th.emplace_back([&]() {
+                    for (;;) {
+                        size_t i = next.fetch_add(1);
+                        if (i >= loads.size()) break;
+                        auto kv = loads[i];
+                        uint8_t* dst = (uint8_t*) exp_cache.ptr + (size_t) kv.second * exp_slot_bytes;
+                        (void) pread(g.fd_model, dst, g.expert_bytes[kv.first], (off_t) g.expert_file_off[kv.first]);
+                    }
+                });
+            for (auto& x : th) x.join();
+        }
+        t_cold_io += now_s() - t0;
     }
 
     // iHC pre/post of a layer part + the reduce and norm into cur_h (fp32 copy cur_f with want_f)
@@ -610,8 +803,25 @@ public:
         relax();
         lin(pa + ".q_b_proj.weight", qr_h, F2, T);
         op("qkv_proj");
-        const int TT = T <= 8 ? 1 : 8;
-        add(TT == 1 ? "mla_prep_q_1" : "mla_prep_q_8", NH, (T + TT - 1) / TT, 256, {B(F2), B(wk_b, wk_off[il]), B(qa_h), I(T), I(NH), I(p0), Fl((float) theta(il))});
+        const std::string kvb_nm = pa + ".kv_b_proj.weight";
+        const int kvb_fmt = g.ti(kvb_nm).fmt;
+        const bool use_qkvb = qkvb_on && T <= 8;
+        if (use_qkvb) {
+            add("mla_prep_q_dec_" + std::to_string(kvb_fmt) + "_" + std::to_string(T), NH, 2, 256,
+                {g.tw(kvb_nm), B(F2), B(qa_h), I(T), I(NH), I(p0), Fl((float) theta(il))});
+        } else {
+            add("split_kvb_t_" + std::to_string(kvb_fmt), NH * 448, 1, 128, {g.tw(kvb_nm), B(wk_scr), B(wv_scr)});
+            Dispatch dq;
+            if (mpp_flash_ok && mpp_flash_on && T >= 32) {
+                dq.p = &P("mla_prep_q_mpp");
+                dq.grid[0] = 8; dq.grid[1] = (T + 63) / 64; dq.grid[2] = NH; dq.tg[0] = 128;
+            } else {
+                dq.p = &P("mla_prep_q_mm");
+                dq.grid[0] = 8; dq.grid[1] = (T + 31) / 32; dq.grid[2] = NH; dq.tg[0] = 128;
+            }
+            dq.args = {B(F2), B(wk_scr), B(qa_h), I(T), I(NH), I(p0), Fl((float) theta(il))};
+            ds.push_back(std::move(dq));
+        }
         op("mla_prep");
         if (vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
             vis->fix_k(ds, F4, kcache[il], T, p0, swa ? ring : 0, (float) theta(il));
@@ -636,20 +846,41 @@ public:
         a.ring = swa ? ring : 0;
         a.kmax = index_topk;
         a.scale = 0.0625f;
-        if (mpp_ok && flash_on && T >= 16 && NH % 32 == 0)
-            add("mla_flash", NH / 32, T, 256, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
+        if (flash_on && mpp_flash_ok && mpp_flash_on && T >= 16 && NH % 16 == 0)
+            add("mla_flash_mpp", NH / 16, T, 128, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
+        else if (flash_on && T >= 16 && NH % 16 == 0)
+            add("mla_flash_sg16", NH / 16, T, 256, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
         else if (T <= 8 && split_max > 0) {
             const int S = std::min(split_max, NH == 32 ? 8 : 4);
             Dispatch dd;
-            dd.p = &P("mla_attend_part");
+            if (mpp_flash_ok && mpp_dec_attn && NH % 16 == 0) {
+                dd.p = &P("mla_flash_mpp_part");
+                dd.grid[0] = NH / 16; dd.grid[1] = S; dd.grid[2] = T; dd.tg[0] = 128;
+            } else {
+                dd.p = &P("mla_attend_part");
+                dd.grid[0] = NH; dd.grid[1] = S; dd.grid[2] = T; dd.tg[0] = 256;
+            }
             dd.args = {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(attn_ws), Arg::V<MlaArgs>(a), B(keys), B(nkeys), I(S)};
-            dd.grid[0] = NH; dd.grid[1] = S; dd.grid[2] = T; dd.tg[0] = 256;
             ds.push_back(std::move(dd));
             add("mla_attend_merge", NH, T, 256, {B(attn_ws), B(ctx_h), Arg::V<MlaArgs>(a), I(S)});
         } else
             add("mla_attend", NH, T, 256, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
         op("mla_attend");
-        add(TT == 1 ? "mla_vup_1" : "mla_vup_8", NH, (T + TT - 1) / TT, 256, {B(ctx_h), B(wv_b, wv_off[il]), B(F3), B(o_h), I(T), I(NH)});
+        if (use_qkvb) {
+            add("mla_vup_dec_" + std::to_string(kvb_fmt) + "_" + std::to_string(T), NH, 32, 256,
+                {g.tw(kvb_nm), B(ctx_h), B(F3), B(o_h), I(T), I(NH)});
+        } else {
+            Dispatch dv;
+            if (mpp_flash_ok && mpp_flash_on && T >= 32) {
+                dv.p = &P("mla_vup_mpp");
+                dv.grid[0] = 4; dv.grid[1] = (T + 63) / 64; dv.grid[2] = NH; dv.tg[0] = 128;
+            } else {
+                dv.p = &P("mla_vup_mm");
+                dv.grid[0] = 4; dv.grid[1] = (T + 31) / 32; dv.grid[2] = NH; dv.tg[0] = 128;
+            }
+            dv.args = {B(ctx_h), B(wv_scr), B(F3), B(o_h), I(T), I(NH)};
+            ds.push_back(std::move(dv));
+        }
         lin(pa + ".o_proj.weight", o_h, F1, T);
         op("vup_o");
         if (dump && il == 0) {
@@ -701,7 +932,7 @@ public:
         relax();
         lin(pm + ".shared_experts.up_proj.weight", cur_h, F4, T);
         relax();
-        add("router_topk", T, 1, 256, {B(F1), g.tw(pm + ".gate.e_score_correction_bias"), B(moe_idx), B(moe_w), I(512), I(16), Fl(c.routed_scale)});
+        add("router_topk_fast", T, 1, 32, {B(F1), g.tw(pm + ".gate.e_score_correction_bias"), B(moe_idx), B(moe_w), I(512), I(16), Fl(c.routed_scale)});
         add("f2h", (nz + 255) / 256, 1, 256, {B(z_f), B(z_h), U(nz)});
         relax();
         add("swiglu_h", (nz + 255) / 256, 1, 256, {B(F3), B(F4), B(H1), U(nz)});
@@ -715,16 +946,23 @@ public:
             save_npy_f32(dump_dir + "/L" + std::to_string(il) + "_cur_mlp.npy", (const float*) cur_f.ptr, {T, HID_});
         }
         op("router_zproj");
-        const Arg sec4 = Arg::B(g.wbuf, g.sec4_off);
+        if (g.cold_experts) {
+            run_all();
+            ensure_cold_experts(il, T * 16);
+        }
+        const Arg sec4 = g.cold_experts ? Arg::B(exp_cache, 0) : Arg::B(g.wbuf, g.sec4_off);
         const Arg exl = Arg::B(d_experts, (size_t) (il - 1) * 512 * sizeof(ExpertDev));
         if (moe2 && T <= 8) {
             const int Pn = T * 16;
             add("moe2_plan", 1, 1, 512, {B(moe_idx), I(Pn), B(m2_uexp), B(m2_ucnt), B(m2_upair), B(m2_meta)});
-            add("moe2_gu", 192, Pn, 256, {sec4, exl, B(z_h), B(m2_uexp), B(m2_ucnt), B(m2_upair), B(m2_meta), B(moe_h2)});
-            add("moe2_dn", 192, Pn, 256, {sec4, exl, B(moe_w), B(m2_uexp), B(m2_ucnt), B(m2_upair), B(m2_meta), B(moe_h2), B(moe_y)});
-            add("moe_reduce", T, 1, 256, {B(moe_y), B(zout_f)});
+            add("moe2_gu", 1, 1, 256, {sec4, exl, B(z_h), B(m2_uexp), B(m2_ucnt), B(m2_upair), B(m2_meta), B(moe_h2)});
+            ds.back().indirect = &m2_meta; ds.back().ind_off = 8;
+            add("moe2_dn", 1, 1, 256, {sec4, exl, B(moe_w), B(m2_uexp), B(m2_ucnt), B(m2_upair), B(m2_meta), B(moe_h2), B(moe_y)});
+            ds.back().indirect = &m2_meta; ds.back().ind_off = 8;
+            add("moe_reduce_h", T, 1, 256, {B(moe_y), B(z_h)});
         } else if (mpp_ok && T >= moe_mm_min) {
-            const int Pn = T * 16, TM = moe_tm(T), TN = 32, SG = TM == 64 ? 4 : 2;
+            const int Pn = T * 16, TM = moe_tm_arg > 0 ? moe_tm_arg : moe_tm(T), TN = moe_tn_arg;
+            const int SG = (TM == 64 || (TM == 32 && TN == 64)) ? 4 : 2;
             const std::string tag = std::to_string(TM) + "_" + std::to_string(TN) + "_" + std::to_string(SG);
             add("moe_plan", 1, 1, 512, {B(moe_idx), I(Pn), I(TM), B(m_srt), B(m_pos), B(m_tiles), B(m_meta), I(1536 / TN), I(1536 / TN)});
             add("moe_gather", 1, 1, 256, {B(z_h), B(m_srt), B(m_xs)});
@@ -733,23 +971,22 @@ public:
             ds.back().indirect = &m_meta; ds.back().ind_off = 8;
             add("moe_mm_dn_" + tag, 1, 1, SG * 32, {sec4, exl, B(m_hs), B(m_y), B(m_tiles)});
             ds.back().indirect = &m_meta; ds.back().ind_off = 20;
-            add("moe_combine", T, 1, 256, {B(m_y), B(m_pos), B(moe_w), B(zout_f)});
+            add("moe_combine_h", T, 1, 256, {B(m_y), B(m_pos), B(moe_w), B(z_h)});
             op("moe_experts");
         } else {
-        if (T <= pair_max) {
-            const int Pn = T * 16;
-            add("moe_gu_pair", 192, Pn, 256, {sec4, exl, B(z_h), B(moe_idx), B(moe_h2)});
-            add("moe_dn_pair", 192, Pn, 256, {sec4, exl, B(moe_w), B(moe_idx), B(moe_h2), B(moe_y)});
-        } else {
-            const int Pn = T * 16;
-            add("moe_route", 1, 1, 512, {B(moe_idx), I(Pn), B(moe_cnt), B(moe_off), B(moe_pairs)});
-            add("moe_gu_sorted", 192, 512, 256, {sec4, exl, B(z_h), B(moe_cnt), B(moe_off), B(moe_pairs), B(moe_h2)});
-            add("moe_dn_sorted", 192, 512, 256, {sec4, exl, B(moe_w), B(moe_cnt), B(moe_off), B(moe_pairs), B(moe_h2), B(moe_y)});
-        }
-        add("moe_reduce", T, 1, 256, {B(moe_y), B(zout_f)});
+            if (T <= pair_max) {
+                const int Pn = T * 16;
+                add("moe_gu_pair", 192, Pn, 256, {sec4, exl, B(z_h), B(moe_idx), B(moe_h2)});
+                add("moe_dn_pair", 192, Pn, 256, {sec4, exl, B(moe_w), B(moe_idx), B(moe_h2), B(moe_y)});
+            } else {
+                const int Pn = T * 16;
+                add("moe_route", 1, 1, 512, {B(moe_idx), I(Pn), B(moe_cnt), B(moe_off), B(moe_pairs)});
+                add("moe_gu_sorted", 192, 512, 256, {sec4, exl, B(z_h), B(moe_cnt), B(moe_off), B(moe_pairs), B(moe_h2)});
+                add("moe_dn_sorted", 192, 512, 256, {sec4, exl, B(moe_w), B(moe_cnt), B(moe_off), B(moe_pairs), B(moe_h2), B(moe_y)});
+            }
+            add("moe_reduce_h", T, 1, 256, {B(moe_y), B(z_h)});
         }
         op("moe_experts");
-        add("f2h", (nz + 255) / 256, 1, 256, {B(zout_f), B(z_h), U(nz)});
         lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);
         lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);
         relax();
@@ -759,11 +996,11 @@ public:
     }
 
     // tokens [p0, p0+T) (T <= Tc) of the sequence tok_all (host, positions 0..p0+T-1)
-    bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err) {
+    bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err, int next_p0 = -1, int next_T = 0) {
         std::memcpy(d_ids.ptr, tok_all + p0, (size_t) T * 4);
-        seg_mode = T > 8 || prof || seg_force;
+        seg_mode = prof || seg_force;
         allow_nb = relax_ok && !(mpp_ok && T >= std::min(mpp_min, moe_mm_min));
-        if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
+        bool eng_prepped = false;
         add("embed_hc", T, 1, 256, {g.tw("model.embed_tokens.weight"), B(d_ids), B(x), I(T)});
         if (vis) vis->embed(ds, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
         for (int il = 0; il < n_run; ++il) {
@@ -771,6 +1008,19 @@ public:
             for (int j = 0; j < 4; ++j)
                 if (emeta.layers[j] == il) mo = j;
             if (mo >= 0 && engram_ready) {
+                if (!eng_prepped) {
+                    if (T > 8 && !seg_mode && !g.cold_experts && !ds.empty()) {
+                        void* tk = cx.run_graph_async(ds);
+                        ds.clear();
+                        const bool ok = engram_prep(tok_all, p0, T, err);
+                        gpu_total += cx.wait_async(tk);
+                        if (!ok) return false;
+                    } else {
+                        if (!engram_prep(tok_all, p0, T, err)) return false;
+                    }
+                    eng_prepped = true;
+                    if (next_T > 0) prefetch_engram(tok_all, next_p0, next_T);
+                }
                 engram_layer(mo, il, T);
                 part("engram(4)");
                 maybe_dump("x_L" + std::to_string(il) + "_engram", T, 4 * HID_, x, 4);
@@ -779,6 +1029,8 @@ public:
             maybe_dump("x_L" + std::to_string(il) + "_attn", T, 4 * HID_, x, 4);
             mlp_layer(il, T);
             maybe_dump("x_L" + std::to_string(il) + "_mlp", T, 4 * HID_, x, 4);
+            // Batch prefill command buffers (every 7 layers -> 6 CBs instead of 88 synchronous flushes!)
+            if (T > 8 && !seg_mode && !g.cold_experts && ((il + 1) % 7 == 0)) run_all();
         }
         return true;
     }
@@ -787,9 +1039,17 @@ public:
     void head(int T, int first) {
         const int n = T - first;
         const size_t xo = (size_t) first * 4 * HID_ * 4;
-        add("hc_mix", n, 1, 256, {B(x, xo), g.tw("model.hc_head.hc_head_fn"), g.tw("model.hc_head.hc_head_scale"), g.tw("model.hc_head.hc_head_base"), B(pre), B(post), I(4), Fl(c.rms_eps), Fl(c.hc_eps),
-                                 Fl(c.hc_mag)});
-        add("hc_reduce_norm", n, 1, 256, {B(x, xo), B(pre), g.tw("model.norm.weight"), B(hfin), B(cur_f), Fl(c.rms_eps), I(0)});
+        if (hc_split && n <= 8) {
+            add("hc_mix_part", n, 24, 128, {B(x, xo), g.tw("model.hc_head.hc_head_fn"), B(hc_part), I(4)});
+            ds.back().grid[0] = n;
+            ds.back().grid[1] = 24;
+            add("hc_reduce_norm_acc4", n, 1, 256, {B(x, xo), B(hc_part), g.tw("model.hc_head.hc_head_scale"), g.tw("model.hc_head.hc_head_base"), B(pre), g.tw("model.norm.weight"), B(hfin),
+                                                    Fl(c.rms_eps), Fl(c.hc_eps)});
+        } else {
+            add("hc_mix", n, 1, 256, {B(x, xo), g.tw("model.hc_head.hc_head_fn"), g.tw("model.hc_head.hc_head_scale"), g.tw("model.hc_head.hc_head_base"), B(pre), B(post), I(4), Fl(c.rms_eps), Fl(c.hc_eps),
+                                     Fl(c.hc_mag)});
+            add("hc_reduce_norm", n, 1, 256, {B(x, xo), B(pre), g.tw("model.norm.weight"), B(hfin), B(cur_f), Fl(c.rms_eps), I(0)});
+        }
         lin("lm_head.weight", hfin, logits, n);
         part("head");
     }
@@ -933,8 +1193,8 @@ static int export_tokenizer(const std::string& file, const std::string& dir) {
 
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
-    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_hcsplit = false, prof3 = false;
-    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0, par_m = 0, lin2_r_arg = 0;
+    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_mpp_flash = false, mpp_dec_attn = false, no_qkvb = false, no_idxsg = false, sm_verify = false, force_cold = false, no_hcsplit = false, prof3 = false;
+    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, moe_tn_arg = 64, moe_tm_arg = 0, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0, par_m = 0, lin2_r_arg = 0;
     bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false, no_pipe = false;
     int pipe_segs_arg = 8;
     bool serve = false, session_reuse = false;
@@ -971,7 +1231,16 @@ int main(int argc, char** argv) {
         else if (a == "--prof3") prof3 = true;
         else if (a == "--no-hcsplit") no_hcsplit = true;
         else if (a == "--split") split_arg = atoi(nxt().c_str());
-        else if (a == "--flash") no_flash = true;
+        else if (a == "--flash") no_flash = false;
+        else if (a == "--no-flash") no_flash = true;
+        else if (a == "--no-mpp-flash") no_mpp_flash = true;
+        else if (a == "--mpp-dec-attn") mpp_dec_attn = true;
+        else if (a == "--moe-tn") moe_tn_arg = atoi(nxt().c_str());
+        else if (a == "--moe-tm") moe_tm_arg = atoi(nxt().c_str());
+        else if (a == "--no-qkvb") no_qkvb = true;
+        else if (a == "--no-idxsg") no_idxsg = true;
+        else if (a == "--sm-verify") sm_verify = true;
+        else if (a == "--cold-experts") force_cold = true;
         else if (a == "--no-relax") no_relax = true;
         else if (a == "--moe-mm-min") moe_mm_min_arg = atoi(nxt().c_str());
         else if (a == "--mpp-min") mpp_min_arg = atoi(nxt().c_str());
@@ -1021,6 +1290,7 @@ int main(int argc, char** argv) {
     mtl::Context cx;
     fprintf(stderr, "[gpu] %s metal4=%d maxBuffer %.1f GB workingSet %.1f GB\n", cx.device_name().c_str(), (int) cx.supports_metal4(), cx.max_buffer_length() / 1e9, cx.recommended_working_set() / 1e9);
     Model g;
+    g.force_cold = force_cold;
     std::string err;
     if (!g.load(cx, model, err)) {
         fprintf(stderr, "load: %s\n", err.c_str());
@@ -1128,7 +1398,14 @@ int main(int argc, char** argv) {
     r.lin2_r = lin2_r_arg;
     r.hc_split = !no_hcsplit;
     r.split_max = split_arg;
-    r.flash_on = no_flash;
+    r.flash_on = !no_flash;
+    r.mpp_flash_on = !no_mpp_flash;
+    r.mpp_dec_attn = mpp_dec_attn;
+    r.moe_tn_arg = moe_tn_arg;
+    r.moe_tm_arg = moe_tm_arg;
+    r.qkvb_on = !no_qkvb;
+    r.idxsg_on = !no_idxsg;
+    r.sm_verify = sm_verify;
     r.relax_ok = !no_relax;
     r.mpp_min = mpp_min_arg;
     r.moe_mm_min = moe_mm_min_arg;
@@ -1171,12 +1448,13 @@ int main(int argc, char** argv) {
     std::vector<float> hl;
     while (done < T0) {
         int T = std::min(r.Tc, T0 - done);
-        if (!r.forward_chunk(tok.data(), done, T, err)) {
+        int np0 = done + T < T0 ? done + T : -1;
+        int nT = np0 >= 0 ? std::min(r.Tc, T0 - np0) : 0;
+        if (!r.forward_chunk(tok.data(), done, T, err, np0, nT)) {
             fprintf(stderr, "forward: %s\n", err.c_str());
             return 1;
         }
         done += T;
-        if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
         if (done == T0) {
             last_p0 = done - T;
             last_T = T;

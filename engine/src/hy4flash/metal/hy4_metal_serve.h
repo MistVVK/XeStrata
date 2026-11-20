@@ -352,12 +352,13 @@ static int hy4_serve_main(Model& g, mtl::Context& cx, const ServeOpts& o, const 
         r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
         while (done < T0) {
             int T = std::min(r.Tc, T0 - done);
-            if (!r.forward_chunk(tok.data(), done, T, err)) {
+            int np0 = done + T < T0 ? done + T : -1;
+            int nT = np0 >= 0 ? std::min(r.Tc, T0 - np0) : 0;
+            if (!r.forward_chunk(tok.data(), done, T, err, np0, nT)) {
                 failed = true;
                 break;
             }
             done += T;
-            if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
             const bool last = done == T0;
             if (last) r.head(T, T - 1);
             r.run_all();

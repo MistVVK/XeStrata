@@ -19,8 +19,7 @@ struct DFly2 {
     Runner& r;
     const Cfg& c;
     bool ok = false;
-    Buffer H, Hf, F1, F2, F3, F4, Ec, Dn, G, U, d_conf, hprev_f, Hf_h, hn, qr_h, qa_h, ctx_h, o_h, mlp_h, hcin, act, hc_h, d_bids, d_chain, dlist, dnk, wkd, wvd;
-    size_t wk_stride = 0, wv_stride = 0;
+    Buffer H, Hf, F1, F2, F3, F4, Ec, Dn, G, U, d_conf, hprev_f, Hf_h, hn, qr_h, qa_h, ctx_h, o_h, mlp_h, hcin, act, hc_h, d_bids, d_chain, dlist, dnk;
     Buffer d_cand, d_cscore;
     int rv = 256;  // reduced-vocabulary chain: candidates per slot (0 = full lm_head per drafted token)
     int lstride = 0;
@@ -67,18 +66,12 @@ struct DFly2 {
         dnk = A(64);
         d_cand = A((size_t) DFLY_BMAX * 1024 * 4);
         d_cscore = A(1024 * 4);
-        // absorbed kv_b_proj of the 5 draft layers (fp16 wk [32][192][512], wv [32][256][512])
-        wk_stride = (size_t) 32 * 192 * 512 * 2;
-        wv_stride = (size_t) 32 * 256 * 512 * 2;
-        wkd = A(5 * wk_stride);
-        wvd = A(5 * wv_stride);
+        // Verify draft kv_b_proj formats (read quantized directly via mla_prep_q_dec / mla_vup_dec: saves 74 MB wired RAM + 3x kv_b bandwidth!)
         for (int d = 0; d < 5; ++d) {
             const std::string nm = "model.dfly_layers." + std::to_string(d) + ".self_attn.kv_b_proj.weight";
             const TInfo& t = r.g.ti(nm);
             if (t.fmt != F_S4 && t.fmt != F_S5 && t.fmt != F_S6 && t.fmt != F_S8) { err = "dfly kv_b_proj format not supported"; return false; }
-            r.add("split_kvb_" + std::to_string(t.fmt), 32 * 448, 1, 128, {r.g.tw(nm), Arg::B(wkd, d * wk_stride), Arg::B(wvd, d * wv_stride)});
         }
-        r.run_all();
         ok = true;
         return true;
     }
@@ -118,14 +111,20 @@ struct DFly2 {
             const std::string pa = pd + ".self_attn", pm = pd + ".mlp";
             const bool use_list = r.cap_list[d];
             const double th = c.theta_sparse;
+            const std::string kvb_nm = pa + ".kv_b_proj.weight";
+            const int kvb_fmt = r.g.ti(kvb_nm).fmt;
             r.add("rms_rows", B, 1, 256, {Bf(H), wf(pd + ".input_layernorm.weight"), Bf(F1), Bf(hn), I(3072), Fl(eps), I(1 | 4)});
             r.lin(pa + ".q_a_proj.weight", hn, F1, B);
-            r.add("rms_rows", B, 1, 256, {Bf(F1), wf(pa + ".q_a_layernorm.weight"), Bf(F1), Bf(qr_h), I(1024), Fl(eps), I(1 | 4)});
-            r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);
             r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);
-            r.add("mla_write_kv", B, 1, 256, {Bf(F3), wf(pa + ".kv_a_layernorm.weight"), Bf(r.kcache[L]), I(a), I(0), Fl((float) th), Fl(eps)});
-            r.add("mla_prep_q_1", 32, B, 256, {Bf(F2), Bf(wkd, d * wk_stride), Bf(qa_h), I(B), I(32), I(a), Fl((float) th)});
+            r.relax();
             r.lin(pa + ".linear_gate.weight", hn, F4, B);
+            r.relax();
+            r.add("rms_rows", B, 1, 256, {Bf(F1), wf(pa + ".q_a_layernorm.weight"), Bf(F1), Bf(qr_h), I(1024), Fl(eps), I(1 | 4)});
+            r.add("mla_write_kv", B, 1, 256, {Bf(F3), wf(pa + ".kv_a_layernorm.weight"), Bf(r.kcache[L]), I(a), I(0), Fl((float) th), Fl(eps)});
+            r.relax();
+            r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);
+            r.add("mla_prep_q_dec_" + std::to_string(kvb_fmt) + "_" + std::to_string(B), 32, 2, 256,
+                  {wf(kvb_nm), Bf(F2), Bf(qa_h), I(B), I(32), I(a), Fl((float) th)});
             MlaArgs ma{};
             ma.M = B;
             ma.NH = 32;
@@ -135,19 +134,31 @@ struct DFly2 {
             ma.scale = 0.0625f;
             if (use_list) {
                 r.add("dfly_lists", B, 1, 256, {Bf(r.dkeys[d], (size_t) row * r.index_topk * 4), Bf(r.dnkc[d], (size_t) row * 4), I(a), Bf(dlist), Bf(dnk), I(lstride)});
+                r.relax();
                 ma.mode = MODE_LIST;
                 ma.kmax = lstride;
             } else {
                 ma.mode = MODE_CAUSAL;
                 ma.kmax = 0;
             }
-            r.add("mla_attend", 32, B, 256, {Bf(qa_h), Bf(r.kcache[L]), wf(pa + ".learnable_sink_param"), Bf(ctx_h), Arg::V<MlaArgs>(ma), Bf(dlist), Bf(dnk)});
-            r.add("mla_vup_1", 32, B, 256, {Bf(ctx_h), Bf(wvd, d * wv_stride), Bf(F4), Bf(o_h), I(B), I(32)});
+            if (r.split_max > 0) {
+                const int S = std::min(r.split_max, 8);
+                Dispatch dd;
+                dd.p = &r.P("mla_attend_part");
+                dd.args = {Bf(qa_h), Bf(r.kcache[L]), wf(pa + ".learnable_sink_param"), Bf(r.attn_ws), Arg::V<MlaArgs>(ma), Bf(dlist), Bf(dnk), I(S)};
+                dd.grid[0] = 32; dd.grid[1] = S; dd.grid[2] = B; dd.tg[0] = 256;
+                r.ds.push_back(std::move(dd));
+                r.add("mla_attend_merge", 32, B, 256, {Bf(r.attn_ws), Bf(ctx_h), Arg::V<MlaArgs>(ma), I(S)});
+            } else {
+                r.add("mla_attend", 32, B, 256, {Bf(qa_h), Bf(r.kcache[L]), wf(pa + ".learnable_sink_param"), Bf(ctx_h), Arg::V<MlaArgs>(ma), Bf(dlist), Bf(dnk)});
+            }
+            r.add("mla_vup_dec_" + std::to_string(kvb_fmt) + "_" + std::to_string(B), 32, 32, 256,
+                  {wf(kvb_nm), Bf(ctx_h), Bf(F4), Bf(o_h), I(B), I(32)});
             r.lin(pa + ".o_proj.weight", o_h, F1, B);
-            r.add("dfly_rms_resid", B, 1, 256, {Bf(F1), wf(pa + ".post_proj_norm.weight"), Bf(H), Fl(eps)});
-            r.add("rms_rows", B, 1, 256, {Bf(H), wf(pd + ".post_attention_layernorm.weight"), Bf(F1), Bf(hn), I(3072), Fl(eps), I(1 | 4)});
+            r.add("dfly_rms_resid_norm", B, 1, 256, {Bf(F1), wf(pa + ".post_proj_norm.weight"), Bf(H), wf(pd + ".post_attention_layernorm.weight"), Bf(hn), Fl(eps)});
             r.lin(pm + ".gate_proj.weight", hn, F1, B);
             r.lin(pm + ".up_proj.weight", hn, F2, B);
+            r.relax();
             const uint32_t n9 = (uint32_t) B * 9216;
             r.add("swiglu_h", (n9 + 255) / 256, 1, 256, {Bf(F1), Bf(F2), Bf(mlp_h), Runner::U(n9)});
             r.lin(pm + ".down_proj.weight", mlp_h, F3, B);
@@ -166,6 +177,7 @@ struct DFly2 {
             r.add("dfly_cat2", 1, 1, 256, {Bf(Hf, (size_t) j * 3072 * 4), wf(pf + "hidden_correction.hidden_norm.weight"), Bf(Ec), wf(pf + "hidden_correction.embed_norm.weight"), Bf(hcin), Fl(eps)});
             r.lin(pf + "hidden_correction.gate_proj.weight", hcin, G, 1);
             r.lin(pf + "hidden_correction.up_proj.weight", hcin, U, 1);
+            r.relax();
             r.add("swiglu_h", (3072 + 255) / 256, 1, 256, {Bf(G), Bf(U), Bf(act), Runner::U(3072)});
             r.lin(pf + "hidden_correction.down_proj.weight", act, Dn, 1);
             r.add("dfly_corr", 1, 1, 256, {Bf(Hf, (size_t) j * 3072 * 4), Bf(Dn), wf(pf + "confidence_head.proj.weight"), wf(pf + "confidence_head.proj.bias"), Bf(hc_h), Bf(d_conf, (size_t) j * 4)});
