@@ -387,6 +387,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     const hy4::CpuExpertStats cold0 = r.hyb ? r.cpu.stats() : hy4::CpuExpertStats();
+    const EngramStats es0 = r.engram_ready ? r.eio.stats() : EngramStats();
     if (!parity_list.empty()) {
         // verify-window parity: rows of an M-token chunk vs the same positions run one token at a time (M = 1 decode), same prefix
         std::vector<int> ws;
@@ -600,6 +601,8 @@ int main(int argc, char** argv) {
         r.pacc_report("decode", (int)times.size());
         if (!enq.empty()) { std::sort(enq.begin(), enq.end()); fprintf(stderr, "[decode] median host enqueue time per step %.1f ms (step %.1f ms)\n", enq[enq.size() / 2] * 1000, times.empty() ? 0.0 : times[times.size() / 2] * 1000); }
         std::sort(times.begin(), times.end());
+        if (r.n_eng_dec && r.engram_ready) { const EngramStats e1 = r.eio.stats(); const double n = r.n_eng_dec; fprintf(stderr, "[decode] engram io per step: %.1f pages, page-read wall %.3f ms, whole fetch %.3f ms, lookups %.0f (seed+lru hits %.0f)\n", (e1.page_reads - es0.page_reads) / n, (e1.io_seconds - es0.io_seconds) * 1000 / n, (e1.fetch_seconds - es0.fetch_seconds) * 1000 / n, (e1.lookups - es0.lookups) / n, (e1.seed_hits + e1.lru_hits - es0.seed_hits - es0.lru_hits) / n); }
+        if (r.n_eng_dec) fprintf(stderr, "[decode] engram per step: prefetch issue %.3f ms, host wait+upload at layer 1 %.3f ms\n", r.t_eng_issue * 1000 / r.n_eng_dec, r.t_eng_prep * 1000 / r.n_eng_dec);
         if (r.hyb) fprintf(stderr, "[hybrid] decode: host waited %.2f ms per step for the CPU experts after queueing the GPU work\n", (r.t_cpu_wait - cpu_wait0) * 1000 / std::max<size_t>(times.size(), 1));
         if (r.hyb && r.has_cold) {
             const hy4::CpuExpertStats c1 = r.cpu.stats();
