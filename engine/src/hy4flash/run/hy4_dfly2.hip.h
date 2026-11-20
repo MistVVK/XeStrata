@@ -394,6 +394,7 @@ struct DFly2 {
     DevDraftArgs *h_dargs = nullptr, *d_dargs = nullptr;
     struct DgKey {
         int K, list_mask, s_causal, rv, kv_is_host, slots_sparse, lin_gemv_max, int8_mma, dp4a, mla_ws_gen, bb_only;
+        uint64_t kv_gen;
         bool operator==(const DgKey& o) const { return std::memcmp(this, &o, sizeof(DgKey)) == 0; }
     };
     struct DgEntry {
@@ -514,6 +515,8 @@ struct DFly2 {
 #endif
             key.mla_ws_gen = r.mla_ws_gen;
             key.bb_only = 0;
+            key.kv_gen = r.kv_gen;
+            if (!dg_cache.empty() && dg_cache.front().key.kv_gen != r.kv_gen) dg_clear();
             cudaGraphExec_t exec = nullptr;
             for (auto& e : dg_cache) if (e.key == key) { exec = e.exec; break; }
             if (!exec) {
@@ -744,6 +747,8 @@ struct DFly2 {
 #endif
             key.mla_ws_gen = r.mla_ws_gen;
             key.bb_only = 1;
+            key.kv_gen = r.kv_gen;
+            if (!dg_cache.empty() && dg_cache.front().key.kv_gen != r.kv_gen) dg_clear();
             cudaGraphExec_t exec = nullptr;
             for (auto& e : dg_cache) if (e.key == key) { exec = e.exec; break; }
             if (!exec) {

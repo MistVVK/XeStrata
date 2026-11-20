@@ -139,6 +139,7 @@ public:
     int kv_dev_limit = 0;
     bool kv_is_host = false;
     int mla_ws_gen = 0;
+    uint64_t kv_gen = 0;
     void ensure_logits(int rows) {
         if (rows <= logits_cap) return;
         HCK(hipStreamSynchronize(st));
@@ -147,6 +148,7 @@ public:
         logits_cap = rows;
         logits = dalloc<float>((size_t)logits_cap * c.vocab);
         hfin = dalloc<__half>((size_t)logits_cap * HID);
+        ++kv_gen;
     }
     void ensure_mla_ws(size_t need) {
         if (need <= mla_ws_bytes) return;
@@ -2100,6 +2102,7 @@ public:
         kv_alloc_pos = max_ctx;
         slots_sparse = (int)ns;
         kv_is_host = true;
+        ++kv_gen;
 #if HY4_CUDA
         cg_clear();
 #endif
@@ -2109,6 +2112,7 @@ public:
     void kv_grow_to(int need) {
         if (kv_is_host || need <= kv_alloc_pos) return;
         const int target = std::min(max_ctx, ((std::max(need + 16, kv_alloc_pos + 16384) + 16383) / 16384) * 16384);
+        if (target <= kv_alloc_pos) return;
         if (kv_dev_limit > 0 && target > kv_dev_limit) { kv_spill_to_host(); return; }
         const double t0 = now_s();
         HCK(hipDeviceSynchronize());
@@ -2158,6 +2162,7 @@ public:
         const int old_p = kv_alloc_pos;
         kv_alloc_pos = target;
         slots_sparse = (int)ns;
+        ++kv_gen;
 #if HY4_CUDA
         cg_clear();
 #endif
