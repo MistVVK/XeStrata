@@ -260,9 +260,10 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[dfly2] drafter ready (K=%d%s, rv=%d), device allocated %.2f GiB\n", scfg.K, scfg.adaptive ? " adaptive" : " fixed", scfg.rv, dev_bytes_allocated() / 1073741824.0);
         }
         // Size VRAM expert cache + unified CPU expert pool AFTER trunk/KV/DFly2 are allocated
+        // Reserve exact DFly2 footprint (~7.5 MiB) when !df.ok so plain and DFly2 get identical VRAM slot counts!
         if (scfg.check || wincheck > 0 || detcheck > 0) hy4s_setenv("HY4S_VRAM_STATIC", "1", 1);
         const bool want_gx = (gx_mb > 0 && (load_only || T0 >= gx_min_t));
-        const size_t gx_reserve = want_gx ? ((size_t)gx_mb * 2 / 3 + 220) * (1ull << 20) : 0;
+        const size_t gx_reserve = (want_gx ? ((size_t)gx_mb * 2 / 3 + 220) * (1ull << 20) : 0) + (df.ok ? 0 : (8ull << 20));
         const size_t host_oh = r.kv_host_bytes + g.host_bytes_total + ((size_t)std::max(gx_mb, 0) << 20) + (640ull << 20);
         if (!setup_experts_unified(model, threads, vram_experts_gb, ram_experts_gb, gx_reserve, host_oh, hi_act || (expert_act == 0), vcache, ucx, err)) {
             fprintf(stderr, "experts: %s\n", err.c_str());
@@ -521,7 +522,7 @@ int main(int argc, char** argv) {
                     margins.push_back(b1 - b2);
                 }
                 next = nx;
-                r.step_adapt();
+                r.commit_vram_adapt(1, pos + 1);
                 times.push_back(now_s() - ts);
             }
             const double td = now_s() - t1;

@@ -170,6 +170,7 @@ public:
     static constexpr int MAX_PAIRS = MAX_T * vcache_detail::VC_NTOP;
 
     bool active() const { return !slots_.empty(); }
+    bool adaptive() const { return active() && adaptive_; }
     int num_slots() const { return (int)slots_.size(); }
     size_t device_bytes() const { return dev_bytes_; }
     const uint8_t* expert_ptr(int L, int e) const {
@@ -222,6 +223,7 @@ public:
         slot_of_.assign(dir.size(), -1);
         scores_.assign(dir.size(), 0.0f);
         rank_eid_.assign(dir.size(), 0);
+        last_idx_.assign((size_t)nlayers_ * MAX_T * vcache_detail::VC_NTOP, -1);
         uint32_t max_body = 0;
         for (size_t i = 0; i < dir.size(); ++i) {
             const int L = (int)(i / 512), rk = (int)(i % 512);
@@ -328,12 +330,13 @@ public:
         }
         int npairs = 0;
         h_tok_off_[0] = 0;
+        int32_t* lbuf = &last_idx_[(size_t)L * MAX_T * vcache_detail::VC_NTOP];
         for (int t = 0; t < T; ++t) {
             int hit_k[vcache_detail::VC_NTOP], nh = 0;
             for (int k = 0; k < vcache_detail::VC_NTOP; ++k) {
                 const int e = idx_host[t * vcache_detail::VC_NTOP + k];
+                lbuf[t * vcache_detail::VC_NTOP + k] = e;
                 if ((unsigned)e < 512u) {
-                    scores_[(size_t)L * 512 + e] += 1.0f;
                     if (d_ptr_[(size_t)L * 512 + e] != nullptr) {
                         use_cpu[t * vcache_detail::VC_NTOP + k] = 0;
                         ++hits_;
@@ -346,7 +349,6 @@ public:
                     } else {
                         use_cpu[t * vcache_detail::VC_NTOP + k] = 1;
                         ++misses_;
-                        if (adaptive_) pending_candidates_.push_back((L << 10) | e);
                     }
                 } else {
                     use_cpu[t * vcache_detail::VC_NTOP + k] = 0;
@@ -445,51 +447,67 @@ public:
         });
     }
 
-    // Online LFU-decay promotion (call ONLY between decode/verify steps for bitwise plain == DFly2 determinism!).
-    // Tuned to real 41-layer SQ-64 routing traces: no pinned static core (core_frac=0), decay=0.965/step,
-    // up to 2 swaps/layer (capped globally per step to keep swap bandwidth bounded).
-    // get_host_body(L, e) returns host RAM pointer to expert body (or nullptr if cold/unavailable).
+    // Committed-token LFU-decay update + periodic deterministic promotion (every 32 committed tokens!).
+    // Because rejected speculative draft tokens are ignored and DFly2 clamps windows at 32-token boundaries,
+    // plain and DFly2 execute the EXACT SAME promotions at the EXACT SAME token positions -> 100% bitwise identical!
     template <class BodyFn>
-    void step_adapt(BodyFn&& get_host_body, int max_swaps = 16) {
-        if (!active() || !adaptive_) { pending_candidates_.clear(); return; }
-        ++step_ctr_;
-        for (float& s : scores_) s *= 0.965f;
-        int swapped = 0;
-        uint8_t layer_swaps[64] = {};
-        for (int key : pending_candidates_) {
-            if (swapped >= max_swaps) break;
-            const int L = key >> 10, e = key & 511;
-            if ((unsigned)L >= 64u || layer_swaps[L] >= 2) continue;
-            if (d_ptr_[(size_t)L * 512 + e] != nullptr) continue;
-            const float sc = scores_[(size_t)L * 512 + e];
-            if (sc < 1.8f) continue;
-            const uint8_t* hbody = get_host_body(L, e);
-            if (!hbody) continue;
-            // Find coldest resident slot in layer L (core_frac=0: any resident slot can be evicted)
-            int victim_slot = -1;
-            float worst_sc = sc / 1.25f;
-            for (int ee = 0; ee < 512; ++ee) {
-                const int sl = slot_of_[(size_t)L * 512 + ee];
-                if (sl >= 0 && scores_[(size_t)L * 512 + ee] < worst_sc) {
-                    worst_sc = scores_[(size_t)L * 512 + ee];
-                    victim_slot = sl;
+    void commit_tokens(int n_committed, int next_pos, BodyFn&& get_host_body, int max_swaps = 41) {
+        if (!active() || !adaptive_ || n_committed <= 0) return;
+        const int n = std::min(n_committed, MAX_T);
+        for (int t = 0; t < n; ++t) {
+            for (float& s : scores_) s *= 0.965f;
+            for (int L = 0; L < nlayers_; ++L) {
+                const int32_t* row = &last_idx_[((size_t)L * MAX_T + t) * vcache_detail::VC_NTOP];
+                for (int k = 0; k < vcache_detail::VC_NTOP; ++k) {
+                    const int e = row[k];
+                    if ((unsigned)e < 512u) scores_[(size_t)L * 512 + e] += 1.0f;
                 }
             }
-            if (victim_slot < 0) continue;
-            const int old_e = slots_[victim_slot].expert;
-            const Meta& m = meta_[(size_t)L * 512 + e];
-            std::memcpy(h_stage_, hbody, m.body_bytes);
-            cq_->memcpy(slots_[victim_slot].d_ptr, h_stage_, m.body_bytes).wait();
-            d_ptr_[(size_t)L * 512 + old_e] = nullptr;
-            slot_of_[(size_t)L * 512 + old_e] = -1;
-            slots_[victim_slot].expert = e;
-            d_ptr_[(size_t)L * 512 + e] = slots_[victim_slot].d_ptr;
-            slot_of_[(size_t)L * 512 + e] = victim_slot;
-            ++layer_swaps[L];
-            ++promotions_;
-            ++swapped;
         }
-        pending_candidates_.clear();
+        if ((next_pos & 31) != 0) return;  // promote strictly at deterministic 32-token boundaries!
+        int swapped = 0;
+        for (int L = 0; L < nlayers_ && swapped < max_swaps; ++L) {
+            // Pick up to 2 hottest non-resident experts in layer L vs coldest resident slots (core_frac=0)
+            for (int rep = 0; rep < 2 && swapped < max_swaps; ++rep) {
+                int best_e = -1;
+                float best_sc = 1.8f;
+                for (int e = 0; e < 512; ++e) {
+                    if (d_ptr_[(size_t)L * 512 + e] != nullptr) continue;
+                    const float sc = scores_[(size_t)L * 512 + e];
+                    if (sc > best_sc) { best_sc = sc; best_e = e; }
+                }
+                if (best_e < 0) break;
+                const uint8_t* hbody = get_host_body(L, best_e);
+                if (!hbody) break;
+                int victim_slot = -1;
+                float worst_sc = best_sc / 1.25f;
+                for (int ee = 0; ee < 512; ++ee) {
+                    const int sl = slot_of_[(size_t)L * 512 + ee];
+                    if (sl >= 0 && scores_[(size_t)L * 512 + ee] < worst_sc) {
+                        worst_sc = scores_[(size_t)L * 512 + ee];
+                        victim_slot = sl;
+                    }
+                }
+                if (victim_slot < 0) break;
+                const int old_e = slots_[victim_slot].expert;
+                const Meta& m = meta_[(size_t)L * 512 + best_e];
+                std::memcpy(h_stage_, hbody, m.body_bytes);
+                cq_->memcpy(slots_[victim_slot].d_ptr, h_stage_, m.body_bytes).wait();
+                d_ptr_[(size_t)L * 512 + old_e] = nullptr;
+                slot_of_[(size_t)L * 512 + old_e] = -1;
+                slots_[victim_slot].expert = best_e;
+                d_ptr_[(size_t)L * 512 + best_e] = slots_[victim_slot].d_ptr;
+                slot_of_[(size_t)L * 512 + best_e] = victim_slot;
+                ++promotions_;
+                ++swapped;
+            }
+        }
+    }
+
+    template <class BodyFn>
+    void step_adapt(BodyFn&& get_host_body, int max_swaps = 16) {
+        ++step_ctr_;
+        commit_tokens(1, (int)step_ctr_, std::forward<BodyFn>(get_host_body), max_swaps);
     }
 
 private:
@@ -508,6 +526,7 @@ private:
     std::vector<uint8_t*> d_ptr_;
     std::vector<int> slot_of_;
     std::vector<float> scores_;
+    std::vector<int32_t> last_idx_;
     std::vector<int> pending_candidates_;
     sycl::queue* cq_ = nullptr;
     uint8_t* h_stage_ = nullptr;

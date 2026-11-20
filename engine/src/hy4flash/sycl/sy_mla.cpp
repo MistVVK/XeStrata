@@ -257,19 +257,20 @@ static void prep_q_xmx(const float* q_b, const half* wk_b, half* qa, int M, int 
 #endif
 
 // ---- Quantized S_K q absorb + rope (decode/verify M <= 16; bit-identical to split_kvb -> fp16 -> prep_q) ----
-// Cooperatively stages each superblock (SB <= 262 B) into SLM so 256 threads do 1 coalesced byte load instead of 256 uncoalesced reads!
+// 8 WGs per head (2 superblocks x 4 64-weight subgroups) x 64 threads/WG -> 4x higher occupancy, ZERO inner-loop barriers!
 template <int FMT, int TT>
 static void prep_q_sk_t(const uint8_t* W_kvb, const float* q_b, half* qa, int M, int NH, int p0_host, const StepParams* d_step, bool use_dfly_a, float theta) {
     constexpr int SB = sk_sb_bytes(FMT);
     const int ntt = (M + TT - 1) / TT;
     Q().submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sq(TT * MLA_NOPE, h);
-        sycl::local_accessor<uint8_t, 1> sblk(SB + 16, h);
-        h.parallel_for(sycl::nd_range<3>(sycl::range<3>(NH, 2, (size_t)ntt * 256), sycl::range<3>(1, 1, 256)), [=](sycl::nd_item<3> it) REQD_SG32 {
-            const int hh = (int)it.get_group(0), sbi = (int)it.get_group(1), t0 = (int)it.get_group(2) * TT;
-            const int tid = (int)it.get_local_id(2);  // column c = sbi*256 + tid
+        h.parallel_for(sycl::nd_range<3>(sycl::range<3>(NH, 8, (size_t)ntt * 64), sycl::range<3>(1, 1, 64)), [=](sycl::nd_item<3> it) REQD_SG32 {
+            const int hh = (int)it.get_group(0), grp8 = (int)it.get_group(1), t0 = (int)it.get_group(2) * TT;
+            const int sbi = grp8 >> 2, g = grp8 & 3;
+            const int tid = (int)it.get_local_id(2);  // 0..63 within 64-weight subgroup g
+            const int c_in_sb = (g << 6) + tid;      // 0..255
             const int p0 = d_step ? (use_dfly_a ? d_step->a : d_step->p0) : p0_host;
-            for (int idx = tid; idx < TT * MLA_NOPE; idx += 256) {
+            for (int idx = tid; idx < TT * MLA_NOPE; idx += 64) {
                 const int tt = idx / MLA_NOPE, i = idx % MLA_NOPE, t = t0 + tt;
                 sq[idx] = t < M ? q_b[((size_t)t * NH + hh) * MLA_QHEAD + i] : 0.f;
             }
@@ -278,30 +279,22 @@ static void prep_q_sk_t(const uint8_t* W_kvb, const float* q_b, half* qa, int M,
 #pragma unroll
             for (int tt = 0; tt < TT; ++tt) acc[tt] = 0.f;
             const uint8_t* wbase = W_kvb + ((size_t)hh * 448 * 2 + (size_t)sbi) * SB;
-            uint8_t* sbp = &sblk[0];
-            const int g = tid >> 6;
             for (int i = 0; i < MLA_NOPE; ++i) {
                 const uint8_t* blk = wbase + (size_t)i * 2 * SB;
-                if (tid < SB) sbp[tid] = blk[tid];
-                if constexpr (SB > 256) {
-                    if (tid + 256 < SB) sbp[tid + 256] = blk[tid + 256];
-                }
-                sycl::group_barrier(it.get_group());
-                const float D = h2f_bits(ld16(sbp));
-                const float eff = D * ((float)sbp[2 + g] / 255.0f);
-                const float w = (float)(half)(((float)sk_q<FMT>(sbp + 6, tid) - sk_half<FMT>()) * eff);
+                const float D = h2f_bits(ld16(blk));
+                const float eff = D * ((float)blk[2 + g] * (1.0f / 255.0f));
+                const float w = (float)(half)(((float)sk_q<FMT>(blk + 6, c_in_sb) - sk_half<FMT>()) * eff);
 #pragma unroll
                 for (int tt = 0; tt < TT; ++tt) acc[tt] += sq[tt * MLA_NOPE + i] * w;
-                sycl::group_barrier(it.get_group());
             }
-            const int col = sbi * 256 + tid;
+            const int col = sbi * 256 + c_in_sb;
 #pragma unroll
             for (int tt = 0; tt < TT; ++tt) {
                 const int t = t0 + tt;
                 if (t < M) qa[((size_t)t * NH + hh) * MLA_ROW + col] = (half)acc[tt];
             }
-            if (sbi == 0) {
-                for (int idx = tid; idx < TT * 32; idx += 256) {
+            if (grp8 == 0) {
+                for (int idx = tid; idx < TT * 32; idx += 64) {
                     const int tt = idx / 32, i = idx % 32, t = t0 + tt;
                     if (t >= M) continue;
                     const float* qp = q_b + ((size_t)t * NH + hh) * MLA_QHEAD + MLA_NOPE + 2 * i;

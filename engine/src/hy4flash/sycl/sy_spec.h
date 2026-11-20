@@ -163,6 +163,11 @@ public:
             const double ti0 = now_s();
             int Kd = cfg.K;
             if (a + Kd + 2 >= max_ctx) Kd = max_ctx - a - 3;
+            // Clamp speculative window so it never crosses a 32-token adaptive VRAM promotion boundary (plain == DFly2 bitwise!)
+            if (!cfg.check && r.vcache && r.vcache->adaptive()) {
+                const int next_b = ((a >> 5) + 1) << 5;
+                if (a + 1 + Kd > next_b) Kd = std::max(0, next_b - a - 1);
+            }
             const bool use_plain = cfg.plain_only || plain_left > 0 || Kd < 1 || !d.can_draft(a, Kd);
             if (use_plain) {
                 if (plain_left > 0) { --plain_left; ++S.plain_mode_iters; if (plain_left == 0) { probing = true; win.clear(); ++S.probes; } }
@@ -173,6 +178,7 @@ public:
                 S.t_plain += dt;
                 ++S.plain_iters;
                 fwd = a + 1;
+                if (!cfg.check) r.commit_vram_adapt(1, a + 1);
                 if (!push_emit(nx)) break;
                 continue;
             }
@@ -198,6 +204,7 @@ public:
                 note_iter((now_s() - ti0) * 1000.0, 1, true);
                 S.t_spec_total += (now_s() - ti0) * 1000.0;
                 ++S.spec_iters;
+                if (!cfg.check) r.commit_vram_adapt(1, a + 1);
                 if (!push_emit(nx)) break;
                 continue;
             }
@@ -282,7 +289,7 @@ public:
             const double itms = (now_s() - ti0) * 1000.0;
             S.t_spec_total += itms;
             note_iter(itms, n + 1, true);
-            if (!cfg.check) r.step_adapt();
+            if (!cfg.check) r.commit_vram_adapt(n + 1, a + n + 1);
             if (!alive) break;
         }
         made_out = made;

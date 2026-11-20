@@ -314,9 +314,11 @@ inline void k_gemm_xmx_fp16(const uint8_t* W, int N, int K, const half* X, float
     constexpr int SB = sk_sb_bytes(FMT);
     constexpr int PB = FMT == FMT_S4 ? 128 : FMT == FMT_S5 ? 160 : 256;
     constexpr int RM = BM_TILE / 64;  // 1 (BM=64) or 2 (BM=128) M-tiles of 8 per subgroup
+    constexpr int SA_LD = 72;         // 64 + 8 halves padding -> zero SLM bank conflicts on A!
     const int nbm = (M + BM_TILE - 1) / BM_TILE, nbn = N / 64;
     const size_t pay_off = RP ? rp_pay_off(N, K >> 8) : 0;
     Q().submit([&](sycl::handler& h) {
+        sycl::local_accessor<half, 1> sA(BM_TILE * SA_LD, h);              // 9 KiB (BM=64) or 18 KiB (BM=128)
         sycl::local_accessor<half, 1> sB(32 * xmx_detail::SB_FP16_LD, h);  // 8.7 KiB bank-conflict-free VNNI-2 B tile for BK=64
         h.parallel_for(sycl::nd_range<1>((size_t)nbm * nbn * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(8)]] {
             const int gid = (int)it.get_group(0);
@@ -347,8 +349,14 @@ inline void k_gemm_xmx_fp16(const uint8_t* W, int N, int K, const half* X, float
                 act[mi] = (m_base[mi] + 8 <= M);
             }
 
+            half* sa_ptr = &sA[0];
             half* sb_ptr = &sB[0];
+            auto sA_mp = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(sa_ptr);
             auto sB_mp = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(sb_ptr);
+
+            // Cooperative vh8 load coordinates for sA[BM_TILE][64]: 128 threads x (BM_TILE/2) halves = 2*RM vh8 loads/thread
+            const int a_r0 = tid >> 3;       // 0..15
+            const int a_c8 = (tid & 7) << 3; // 0, 8, ..., 56
 
             for (int sbi = 0; sbi < nsb; ++sbi) {
                 const uint8_t* hd;
@@ -370,18 +378,25 @@ inline void k_gemm_xmx_fp16(const uint8_t* W, int N, int K, const half* X, float
 
 #pragma unroll
                 for (int g = 0; g < 4; ++g) {
+                    const int k0 = sbi * 256 + g * 64;
+                    // Stage A tile [BM_TILE][64] into SLM with coalesced 16-byte vh8 loads
+#pragma unroll
+                    for (int rb = 0; rb < BM_TILE; rb += 16) {
+                        const int r = rb + a_r0;
+                        const int gm = bm * BM_TILE + r;
+                        *reinterpret_cast<sycl::vec<half, 8>*>(sa_ptr + r * SA_LD + a_c8) =
+                            (gm < M) ? *reinterpret_cast<const sycl::vec<half, 8>*>(X + (size_t)gm * K + k0 + a_c8) : sycl::vec<half, 8>((half)0.f);
+                    }
+                    // Dequantize B tile [64][64] into VNNI-2 SLM
                     xmx_detail::dq_half_group_fp16<FMT, RP>(pl, effs[g], g, half_idx, sb_ptr, row_local);
                     sycl::group_barrier(it.get_group());
 
-                    const int k0 = sbi * 256 + g * 64;
 #pragma unroll
                     for (int s = 0; s < 4; ++s) {
 #pragma unroll
                         for (int mi = 0; mi < RM; ++mi) {
                             if (act[mi]) {
-                                auto xp = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
-                                    const_cast<half*>(X + (size_t)m_base[mi] * K + k0 + s * 16));
-                                xm::joint_matrix_load(sg, ma[mi], xp, (size_t)K);
+                                xm::joint_matrix_load(sg, ma[mi], sA_mp + (size_t)((mi * 8 + sg_m) * 8) * SA_LD + s * 16, (size_t)SA_LD);
                             }
                         }
 #pragma unroll

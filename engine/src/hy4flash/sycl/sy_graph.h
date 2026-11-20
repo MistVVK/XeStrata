@@ -85,7 +85,7 @@ struct EngramDev {
 inline bool setup_experts_unified(const std::string& model_path, int threads, double vram_experts_gb_arg, double ram_experts_gb_arg,
                                   size_t reserve_vram_bytes, size_t host_overhead_bytes, bool hi_act,
                                   SyVramExpertCache& vcache, hy4::CpuExperts& ucx, std::string& err) {
-    // 1. Determine VRAM expert cache budget (reserve 24 MiB for DFly2 so plain and DFly2 get identical slot counts!)
+    // 1. Determine VRAM expert cache budget (caller includes DFly2 reserve in reserve_vram_bytes when !df.ok so plain & DFly2 match!)
     size_t vram_budget = 0;
     if (vram_experts_gb_arg >= 0.0) {
         vram_budget = (size_t)(vram_experts_gb_arg * 1073741824.0);
@@ -94,7 +94,7 @@ inline bool setup_experts_unified(const std::string& model_path, int threads, do
         vram_budget = g > 0.0 ? (size_t)(g * 1073741824.0) : 0;
     } else {
         const size_t tot = dev_caps().global_mem;
-        const size_t used = dev_bytes_allocated() + reserve_vram_bytes + (24ull << 20);
+        const size_t used = dev_bytes_allocated() + reserve_vram_bytes;
         const size_t safe_cap = (size_t)((double)tot * 0.94);
         if (safe_cap > used + (256ull << 20)) vram_budget = safe_cap - used;
     }
@@ -314,9 +314,13 @@ public:
     int heads(int il) const { return c.is_swa[il] ? c.heads_swa : c.heads_sparse; }
     double theta(int il) const { return c.is_swa[il] ? c.theta_swa : c.theta_sparse; }
 
-    // Call strictly between decode/verify steps for adaptive VRAM expert promotion (disabled during checks)
+    // Call strictly on committed tokens for bitwise plain == DFly2 adaptive VRAM cache promotion
+    void commit_vram_adapt(int n_committed, int next_pos) {
+        if (!vcache || !vcache->adaptive() || dump || tap || !force_route_dir.empty()) return;
+        vcache->commit_tokens(n_committed, next_pos, [&](int L, int e) -> const uint8_t* { return ucx.view(L, e).body; });
+    }
     void step_adapt() {
-        if (!vcache || !vcache->active() || dump || tap || !force_route_dir.empty()) return;
+        if (!vcache || !vcache->adaptive() || dump || tap || !force_route_dir.empty()) return;
         vcache->step_adapt([&](int L, int e) -> const uint8_t* { return ucx.view(L, e).body; });
     }
 

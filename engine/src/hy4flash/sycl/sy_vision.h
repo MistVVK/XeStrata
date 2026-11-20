@@ -94,9 +94,11 @@ inline void rms_merge(const float* x, const float* w, half* A, int gw, int D, fl
     });
 }
 
-// Y = X[M][K] (fp16, rows padded to a multiple of 64) * W[N][K]^T (fp16) + bias, XMX 8x8x16, tile 64 x 64 per work-group (8 sub-groups of 8 lanes, 8 rows each), K % 16 == 0.
+// Y = X[M][K] (fp16, rows padded to a multiple of 64) * W[N][K]^T (fp16) + bias, XMX 8x8x16 (Alchemist) or portable SG32 fallback (Xe2/iGPU), K % 16 == 0.
 template <int EPI>
 inline void gemm(const half* X, const half* W, const float* bias, half* Yh, float* Yf, const float* pe, int M, int N, int K, int ow) {
+#ifndef HY4S_DISABLE_SG8
+    if (dev_caps().has_xmx_sg8) {
     namespace xm = sycl::ext::oneapi::experimental::matrix;
     const int nbm = (M + 63) / 64, nbn = (N + 63) / 64;
     Q().submit([&](sycl::handler& h) {
@@ -166,6 +168,51 @@ inline void gemm(const half* X, const half* W, const float* bias, half* Yh, floa
                     }
                 }
                 sycl::group_barrier(sg);
+            }
+        });
+    });
+    return;
+    }
+#endif
+    // Portable SG32 tiled GEMM fallback (Xe2 Battlemage / Core Ultra iGPU)
+    const int nbm = (M + 31) / 32, nbn = (N + 31) / 32;
+    Q().submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sA(32 * 33, h);
+        sycl::local_accessor<float, 1> sB(32 * 33, h);
+        h.parallel_for(sycl::nd_range<1>((size_t)nbm * nbn * 128, 128), [=](sycl::nd_item<1> it) REQD_SG32 {
+            const int gid = (int)it.get_group(0), bn = gid % nbn, bm = gid / nbn, tid = (int)it.get_local_id(0);
+            const int tm = (tid >> 4) * 4, tn = (tid & 15) * 2;
+            float c[4][2] = {};
+            for (int k0 = 0; k0 < K; k0 += 32) {
+                for (int idx = tid; idx < 32 * 32; idx += 128) {
+                    const int r = idx >> 5, k = idx & 31;
+                    const int gm = bm * 32 + r, gn = bn * 32 + r;
+                    sA[r * 33 + k] = (gm < M && k0 + k < K) ? (float)X[(size_t)gm * K + k0 + k] : 0.f;
+                    sB[r * 33 + k] = (gn < N && k0 + k < K) ? (float)W[(size_t)gn * K + k0 + k] : 0.f;
+                }
+                sycl::group_barrier(it.get_group());
+                for (int k = 0; k < 32; ++k) {
+                    const float a0 = sA[(tm + 0) * 33 + k], a1 = sA[(tm + 1) * 33 + k], a2 = sA[(tm + 2) * 33 + k], a3 = sA[(tm + 3) * 33 + k];
+                    const float b0 = sB[(tn + 0) * 33 + k], b1 = sB[(tn + 1) * 33 + k];
+                    c[0][0] += a0 * b0; c[0][1] += a0 * b1; c[1][0] += a1 * b0; c[1][1] += a1 * b1;
+                    c[2][0] += a2 * b0; c[2][1] += a2 * b1; c[3][0] += a3 * b0; c[3][1] += a3 * b1;
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            for (int r = 0; r < 4; ++r) {
+                const int m = bm * 32 + tm + r;
+                if (m >= M) continue;
+                for (int j = 0; j < 2; ++j) {
+                    const int n = bn * 32 + tn + j;
+                    if (n >= N) continue;
+                    const float v = c[r][j] + (bias ? bias[n] : 0.f);
+                    if constexpr (EPI == EPI_H) Yh[(size_t)m * N + n] = (half)v;
+                    else if constexpr (EPI == EPI_GELU_TANH) Yh[(size_t)m * N + n] = (half)gelu_tanh_f(v);
+                    else if constexpr (EPI == EPI_GELU_ERF) Yh[(size_t)m * N + n] = (half)gelu_erf_f(v);
+                    else if constexpr (EPI == EPI_RES_ADD) Yf[(size_t)m * N + n] += v;
+                    else if constexpr (EPI == EPI_RES_SET_POS) Yf[(size_t)m * N + n] = v + pe[(size_t)m * N + n];
+                    else Yf[(size_t)(m + m / ow) * N + n] = v;
+                }
             }
         });
     });
