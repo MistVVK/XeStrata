@@ -254,9 +254,21 @@ public:
         if (!allow_nb) return;
         for (int i = 0; i < n && i < (int) ds.size(); ++i) ds[ds.size() - 1 - i].barrier = false;
     }
+    bool pipe_enc = true;  // decode / verify graphs: the dispatch list is cut into ~4 command buffers on the async queue so the GPU runs the first while the host encodes the rest (--no-pipe)
+    int pipe_segs = 8;
     void run_all() {
         if (ds.empty()) return;
-        double t = cx.run_graph(ds);
+        double t = 0;
+        if (pipe_enc && ds.size() >= 400) {
+            const size_t per = (ds.size() + pipe_segs - 1) / pipe_segs;
+            std::vector<void*> toks;
+            for (size_t s = 0; s < ds.size(); s += per) {
+                std::vector<Dispatch> seg(std::make_move_iterator(ds.begin() + s), std::make_move_iterator(ds.begin() + std::min(ds.size(), s + per)));
+                toks.push_back(cx.run_graph_async(seg));
+            }
+            for (void* tk : toks) t += cx.wait_async(tk);
+        } else
+            t = cx.run_graph(ds);
         ds.clear();
         gpu_total += t;
     }
@@ -829,6 +841,43 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
     out += buf;
 }
 
+// Kernel sources embedded in the binary (build_mac.sh runs embed_metal.py and defines HY4_EMBED_KERNELS): written once to <TMPDIR>/strata-hy4-kernels-<hash>/ and compiled from there at run time
+// (mtl_rt compiles MSL source files; the Command Line Tools have no offline metal compiler, so a metallib cannot be made on this machine). Returns the path of hy4.metal, or "" without embedding.
+#ifdef HY4_EMBED_KERNELS
+#include "hy4_metal_embedded.inc"
+static std::string extract_embedded_kernels() {
+    uint64_t h = 1469598103934665603ull;
+    for (const auto& f : hy4_emb_files) {
+        for (unsigned long i = 0; i < f.size; ++i) h = (h ^ f.data[i]) * 1099511628211ull;
+        for (const char* c = f.name; *c; ++c) h = (h ^ (unsigned char) *c) * 1099511628211ull;
+    }
+    const char* tmp = getenv("TMPDIR");
+    char hx[32];
+    snprintf(hx, sizeof hx, "%016llx", (unsigned long long) h);
+    std::string base = std::string(tmp && *tmp ? tmp : "/tmp");
+    if (base.back() != '/') base += '/';
+    const std::string dir = base + "strata-hy4-kernels-" + hx + "/";
+    mkdir(dir.c_str(), 0700);
+    for (const auto& f : hy4_emb_files) {
+        const std::string path = dir + f.name;
+        struct stat st;
+        if (stat(path.c_str(), &st) == 0 && (unsigned long) st.st_size == f.size) continue;
+        const std::string tmpf = path + ".tmp" + std::to_string((long) getpid());
+        FILE* fp = fopen(tmpf.c_str(), "wb");
+        if (!fp || fwrite(f.data, 1, f.size, fp) != f.size) {
+            if (fp) fclose(fp);
+            fprintf(stderr, "cannot write %s\n", tmpf.c_str());
+            return "";
+        }
+        fclose(fp);
+        rename(tmpf.c_str(), path.c_str());
+    }
+    return dir + "hy4.metal";
+}
+#else
+static std::string extract_embedded_kernels() { return ""; }
+#endif
+
 static size_t rss_bytes() {
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
@@ -886,7 +935,8 @@ int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_hcsplit = false, prof3 = false;
     int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0, par_m = 0, lin2_r_arg = 0;
-    bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false;
+    bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false, no_pipe = false;
+    int pipe_segs_arg = 8;
     bool serve = false, session_reuse = false;
     std::string vision;
     std::vector<std::string> image_files;
@@ -928,6 +978,8 @@ int main(int argc, char** argv) {
         else if (a == "--draft") draft = nxt();
         else if (a == "--no-lin2") no_lin2 = true;
         else if (a == "--no-moe2") no_moe2 = true;
+        else if (a == "--no-pipe") no_pipe = true;
+        else if (a == "--pipe-segs") pipe_segs_arg = atoi(nxt().c_str());
         else if (a == "--no-f32x") no_f32x = true;
         else if (a == "--save-logits") save_logits = true;
         else if (a == "--lin2-r") lin2_r_arg = atoi(nxt().c_str());
@@ -1003,7 +1055,8 @@ int main(int argc, char** argv) {
         if (kernels.empty()) {
             const char* e = getenv("STRATA_HY4_KERNELS");
             if (e) kernels = e;
-            else {
+            else if (!(kernels = extract_embedded_kernels()).empty()) {
+            } else {
                 std::string d = argv[0];
                 size_t sl = d.find_last_of('/');
                 kernels = (sl == std::string::npos ? std::string(".") : d.substr(0, sl)) + "/hy4.metal";
@@ -1047,7 +1100,8 @@ int main(int argc, char** argv) {
     if (max_ctx <= 0) max_ctx = T0 + gen + 16;
     if (kernels.empty()) {
         const char* e = getenv("STRATA_HY4_KERNELS");
-        kernels = e ? e : "hy4.metal";
+        kernels = e ? e : extract_embedded_kernels();
+        if (kernels.empty()) kernels = "hy4.metal";
     }
     Runner r(g, cx, max_ctx, std::max(chunk, 1));
     {
@@ -1066,6 +1120,8 @@ int main(int argc, char** argv) {
     r.mpp_try = !no_mpp;
     r.mm_min = mm_min_arg;
     r.lin2 = !no_lin2;
+    r.pipe_enc = !no_pipe;
+    r.pipe_segs = std::max(1, pipe_segs_arg);
     if (ab_rounds > 0) r.ring_slack = gen + 64;
     r.moe2 = !no_moe2;
     r.f32x = !no_f32x;

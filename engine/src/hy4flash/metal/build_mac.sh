@@ -33,7 +33,18 @@ if [ "$T" = attb ] || [ "$T" = all ]; then
   clang++ $CXXF $INC $S/src/hy4flash/metal/hy4_attn_bench.cpp $O/mtl_rt.o $FW -o $O/hy4_attn_bench
 fi
 if [ "$T" = run ] || [ "$T" = all ]; then
-  clang++ $CXXF $INC $S/src/hy4flash/metal/hy4_metal_main.cpp $S/src/hy4flash/run/hy4_engram.cpp $S/src/hy4flash/metal/strata_reader_nozstd.cpp $O/mtl_rt.o $FW -lpthread -o $O/strata-hy4-metal
+  # Section 0 is read by the engine itself: the decompress-only zstd sources of engine/third_party/zstd-dec are built here (no libzstd, no sidecar manifest needed)
+  Z=$S/third_party/zstd-dec
+  mkdir -p $O/zstd
+  for f in $Z/common/debug.c $Z/common/entropy_common.c $Z/common/error_private.c $Z/common/fse_decompress.c $Z/common/zstd_common.c $Z/common/xxhash.c $Z/decompress/huf_decompress.c $Z/decompress/zstd_ddict.c $Z/decompress/zstd_decompress.c $Z/decompress/zstd_decompress_block.c; do
+    b=$(basename $f .c)
+    if [ ! -f $O/zstd/$b.o ] || [ $f -nt $O/zstd/$b.o ]; then clang -O2 -DZSTD_DISABLE_ASM=1 -DXXH_NAMESPACE=ZSTD_ -I$Z -I$Z/common -I$Z/decompress -c $f -o $O/zstd/$b.o; fi
+  done
+  # the MSL sources are embedded in the binary (no kernel files to ship; compiled at run time, the CLT have no offline metal compiler)
+  M=$S/src/hy4flash/metal
+  mkdir -p $O/gen
+  python3 $M/embed_metal.py $O/gen/hy4_metal_embedded.inc $M/hy4.metal $M/hy4_split.metal $M/hy4_hcp.metal $M/hy4_mpp.metal $M/hy4_mppq.metal $M/hy4_mppmoe.metal $M/hy4_flash.metal $M/hy4_dfly2.metal $M/hy4_dfly2b.metal $M/hy4_lin2.metal $M/hy4_lin3.metal $M/hy4_moe2.metal $M/hy4_vision.metal
+  clang++ $CXXF $INC -I$Z -DHY4_EMBED_KERNELS -I$O/gen $S/src/hy4flash/metal/hy4_metal_main.cpp $S/src/hy4flash/run/hy4_engram.cpp $S/src/artifact/strata_reader.cpp $O/zstd/*.o $O/mtl_rt.o $FW -lpthread -o $O/strata-hy4-metal
 fi
 if [ "$T" = cpu ] || [ "$T" = all ]; then
   # the CPU oracle (engine/src/hy4flash/cpu): no OpenMP on this Mac (omp_shim = single thread), no zstd (strata_reader_nozstd), the Arm tier of the quant layer
