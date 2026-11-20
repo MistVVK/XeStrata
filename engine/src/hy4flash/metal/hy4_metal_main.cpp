@@ -159,6 +159,7 @@ public:
     mtl::Context& cx;
     int max_ctx, Tc;
     int n_run = 42;  // layers to run (--layers: partial runs for bisecting)
+    int ring_slack = 0;  // extra SWA ring slots (--ab: a decode round must not clobber the window rows the restore re-run of the last prefill chunk reads)
     bool f32x = true; bool lin2 = true; int lin2_r = 0;  // row-blocked decode GEMV (--no-lin2 / --lin2-r N for A/B)
     int mm_min = 16;           // GEMM (fp16 weights) from this many tokens; below it the exact fp32-dequant GEMV (--mm-min)
     bool mpp_ok = false;       // hy4_mpp.metal / hy4_mppq.metal compiled (Metal 4 matmul2d): prefill GEMMs through an fp16 dequantised scratch
@@ -358,7 +359,7 @@ public:
         d_experts = A(41 * 512 * sizeof(ExpertDev));
         std::memcpy(d_experts.ptr, g.experts.data(), 41 * 512 * sizeof(ExpertDev));
         // kv caches
-        ring = ((512 + Tc + 15) / 16) * 16;
+        ring = ((512 + Tc + ring_slack + 15) / 16) * 16;
         slots_sparse = ((max_ctx + 8 + 15) / 16) * 16;
         kcache.resize(c.n_layers);
         ivg.resize(c.n_layers);
@@ -884,7 +885,7 @@ static int export_tokenizer(const std::string& file, const std::string& dir) {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_hcsplit = false, prof3 = false;
-    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0, lin2_r_arg = 0;
+    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0, par_m = 0, lin2_r_arg = 0;
     bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false;
     bool serve = false, session_reuse = false;
     std::string vision;
@@ -938,6 +939,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
         else if (a == "--ab") ab_rounds = atoi(nxt().c_str());
         else if (a == "--bench-m") bench_m = atoi(nxt().c_str());
+        else if (a == "--par-m") par_m = atoi(nxt().c_str());
         else if (a == "--info") return print_info(nxt());
         else if (a == "--version") {
             printf("strata-hy4 %s\n", STRATA_HY4_VERSION);
@@ -1064,6 +1066,7 @@ int main(int argc, char** argv) {
     r.mpp_try = !no_mpp;
     r.mm_min = mm_min_arg;
     r.lin2 = !no_lin2;
+    if (ab_rounds > 0) r.ring_slack = gen + 64;
     r.moe2 = !no_moe2;
     r.f32x = !no_f32x;
     r.lin2_r = lin2_r_arg;
@@ -1080,7 +1083,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "--draft %s: expected off, dfly2 or auto\n", draft.c_str());
         return 2;
     }
-    const bool spec_mode = (gen > 0 || bench_m > 0) && draft != "off" && has_df && r.Tc >= 16 && !all_logits && recs.empty();  // a picture request decodes plainly (the drafter positions are token indices, the picture rows use 3D positions)
+    const bool spec_mode = (gen > 0 || bench_m > 0 || par_m > 0) && draft != "off" && has_df && r.Tc >= 16 && !all_logits && recs.empty();  // a picture request decodes plainly (the drafter positions are token indices, the picture rows use 3D positions)
     if (draft == "dfly2" && !spec_mode && gen > 0) fprintf(stderr, "[spec] --draft dfly2 requested but not possible (no drafter in the file, chunk < 16, or --all-logits)\n");
     if (!r.init(no_engram ? std::string() : engram, std::max(all_logits ? r.Tc : 1, spec_mode ? 8 : 1), err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
@@ -1160,6 +1163,31 @@ int main(int argc, char** argv) {
         r.run_all();
         hl.assign((const float*) r.logits.ptr, (const float*) r.logits.ptr + V);
     };
+    if (par_m > 0) {  // window parity: the last W prompt positions one token at a time vs as one W-token chunk; bit-identical logits rows are the condition of the lossless speculative loop
+        const int W = par_m, p0 = T0 - W;
+        std::vector<float> seq((size_t) W * V), win((size_t) W * V);
+        for (int i = 0; i < W; ++i) {
+            r.forward_chunk(tok.data(), p0 + i, 1, err);
+            r.head(1, 0);
+            r.run_all();
+            std::memcpy(&seq[(size_t) i * V], r.logits.ptr, (size_t) V * 4);
+        }
+        r.forward_chunk(tok.data(), p0, W, err);
+        r.head(W, 0);
+        r.run_all();
+        std::memcpy(win.data(), r.logits.ptr, (size_t) W * V * 4);
+        int bit = 0, top = 0;
+        for (int i = 0; i < W; ++i) {
+            const float *s = &seq[(size_t) i * V], *w = &win[(size_t) i * V];
+            bit += std::memcmp(s, w, (size_t) V * 4) == 0;
+            top += (std::max_element(s, s + V) - s) == (std::max_element(w, w + V) - w);
+            double md = 0;
+            for (int v = 0; v < V; ++v) md = std::max(md, (double) std::fabs(s[v] - w[v]));
+            fprintf(stderr, "[par-m] row %d: bit-identical %d, max|dlogit| %.3g\n", i, (int) (std::memcmp(s, w, (size_t) V * 4) == 0), md);
+        }
+        printf("[par-m] W=%d: bit-identical rows %d/%d, top-1 equal %d/%d\n", W, bit, W, top, W);
+        return 0;
+    }
     if (bench_m > 0) {  // M-token window (the last M prompt positions re-run) timed + per-kernel profile
         const int p0 = T0 - bench_m;
         for (int rep = 0; rep < 6; ++rep) {
@@ -1181,7 +1209,7 @@ int main(int argc, char** argv) {
             restore();
             std::vector<int> pids;
             double tp0 = now_s();
-            if (!plain_gen(pids, false)) return 1;
+            if (!getenv("HY4_AB_SKIP_PLAIN") && !plain_gen(pids, false)) return 1;
             const double tpl = now_s() - tp0;
             restore();
             Spec sp(r, df, scfg);
