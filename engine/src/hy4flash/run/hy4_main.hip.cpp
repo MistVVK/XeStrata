@@ -768,6 +768,10 @@ int main(int argc, char** argv) {
         const int redo_T = std::min(16, T0), redo_p0 = T0 - redo_T;
         (void)last_p0;
         (void)last_T;
+        if (scfg.exact) {
+            skd::moe_dec_max_m() = 16;
+            skd::lin_gemv_max_m() = 16;
+        }
         auto restore = [&]() {
             tok.resize(T0);
             if (!r.forward_chunk(tok.data(), redo_p0, redo_T, err)) { fprintf(stderr, "ab restore: %s\n", err.c_str()); exit(1); }
