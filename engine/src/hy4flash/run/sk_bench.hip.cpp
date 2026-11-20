@@ -3,6 +3,9 @@
 #include "skfast.hip.h"
 #ifdef SK_GEMM
 #include "skmoe.hip.h"
+#if HY4_CUDA && HY4_MMA
+#include "sk_int8_cuda.hip.h"
+#endif
 #endif
 
 #include <algorithm>
@@ -41,7 +44,7 @@ __global__ void k_read(const uint4* __restrict__ p, size_t n, unsigned* out) {
 
 struct Case { const char* name; int fmt; int N, K; };
 
-#ifdef SK_GEMM
+#if defined(SK_GEMM) && !HY4_CUDA
 typedef int iv4 __attribute__((ext_vector_type(4)));
 typedef int iv8 __attribute__((ext_vector_type(8)));
 __global__ void __launch_bounds__(256) k_wmma_peak(float* out, int iters) {
@@ -86,7 +89,7 @@ int main(int argc, char** argv) {
     }
     hipDeviceProp_t p;
     CK(hipGetDeviceProperties(&p, 0));
-    printf("device %s %s CUs %d\n", p.name, p.gcnArchName, p.multiProcessorCount);
+    printf("device %s %s CUs %d\n", p.name, gpu_arch(p), p.multiProcessorCount);
     const size_t pool = pool_gb << 30;
     uint8_t* d_pool;
     CK(hipMalloc(&d_pool, pool));
@@ -229,7 +232,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 #endif
-#ifdef SK_GEMM
+#if defined(SK_GEMM) && !HY4_CUDA
     if (only == "peak") {
         float* d_o; CK(hipMalloc(&d_o, 64));
         for (int blocks_per_wgp : {1, 2, 4, 8}) {
@@ -254,6 +257,72 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+#endif
+#if defined(SK_GEMM) && HY4_CUDA && HY4_MMA
+    if (only == "i8") {
+        printf("== CUDA Head-to-Head: FP16 mma_16816 vs INT8 mma_16832 (q8 & hi) & skfast vs __dp4a (q8 & hi)\n");
+        const Case gc[] = {
+            {"expert gate_up S4 [3072,1536]", FMT_S4, 3072, 1536},
+            {"expert gate_up S3 [3072,1536]", FMT_S3, 3072, 1536},
+            {"expert gate_up S2 [3072,1536]", FMT_S2, 3072, 1536},
+            {"attn q_b sparse S5 [8192,1024]", FMT_S5, 8192, 1024},
+            {"dense gate S6 [13824,3072]", FMT_S6, 13824, 3072},
+            {"shared S8 [1536,3072]", FMT_S8, 1536, 3072},
+            {"o_proj S5 [3072,16384]", FMT_S5, 3072, 16384},
+            {"lm_head S8 [120832,3072]", FMT_S8, 120832, 3072},
+        };
+        for (const Case& c : gc) {
+            const int SB = sk_sb_bytes(c.fmt);
+            hipLaunchKernelGGL(k_fill_sk, dim3((unsigned)((pool / SB + 255) / 256)), dim3(256), 0, 0, d_pool, pool / SB, SB, 777u);
+            CK(hipDeviceSynchronize());
+            for (int M : {1, 4, 8, 16, 128, 512, 2048}) {
+                if ((size_t)c.N * M > 240000000ull && M > 512) continue;
+                std::vector<__half> hx((size_t)M * c.K);
+                for (size_t i = 0; i < hx.size(); ++i) hx[i] = __float2half((((i * 2654435761u) >> 8) & 1023) / 512.0f - 1.0f);
+                __half* d_x; float *d_ref, *d_y;
+                CK(hipMalloc(&d_x, hx.size() * 2));
+                CK(hipMalloc(&d_ref, (size_t)M * c.N * 4));
+                CK(hipMalloc(&d_y, (size_t)M * c.N * 4));
+                CK(hipMemcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice));
+                linear_h_ref(0, c.fmt, d_pool, c.N, c.K, d_x, d_ref, M);
+                CK(hipDeviceSynchronize());
+                std::vector<float> yref((size_t)M * c.N), ygot((size_t)M * c.N);
+                CK(hipMemcpy(yref.data(), d_ref, yref.size() * 4, hipMemcpyDeviceToHost));
+                double mx = 0;
+                for (float v : yref) mx = std::max(mx, (double)std::fabs(v));
+                auto bench_one = [&](const char* tag, auto fn) {
+                    fn();
+                    CK(hipDeviceSynchronize());
+                    CK(hipMemcpy(ygot.data(), d_y, ygot.size() * 4, hipMemcpyDeviceToHost));
+                    double me = 0;
+                    for (size_t i = 0; i < yref.size(); ++i) me = std::max(me, (double)std::fabs(yref[i] - ygot[i]));
+                    const int reps = M >= 512 ? 10 : 30;
+                    hipEventRecord(e0);
+                    for (int r = 0; r < reps; ++r) fn();
+                    hipEventRecord(e1);
+                    CK(hipEventSynchronize(e1));
+                    float ms; hipEventElapsedTime(&ms, e0, e1);
+                    ms /= reps;
+                    const double tf = 2.0 * M * c.N * c.K / (ms * 1e-3) / 1e12;
+                    printf("  %-32s M=%4d %-10s %7.3f ms %6.2f TF  rel=%.2e\n", c.name, M, tag, ms, tf, mx > 0 ? me / mx : me);
+                };
+                if (M <= 8) {
+                    bench_one("gemv_fp16", [&] { linear_h_gemv(0, c.fmt, d_pool, c.N, c.K, d_x, d_y, M); });
+                    bench_one("dp4a_q8",   [&] { linear_h_gemv_dp4a(0, c.fmt, d_pool, c.N, c.K, d_x, d_y, M, false); });
+                    bench_one("dp4a_hi",   [&] { linear_h_gemv_dp4a(0, c.fmt, d_pool, c.N, c.K, d_x, d_y, M, true); });
+                }
+                if (M >= 4) {
+                    bench_one("mma_fp16", [&] { if (M <= 16) linear_h_gemm_s(0, c.fmt, d_pool, c.N, c.K, d_x, d_y, M); else linear_h_gemm(0, c.fmt, d_pool, c.N, c.K, d_x, d_y, M); });
+                    bench_one("i8_q8",    [&] { linear_h_gemm_i8(0, c.fmt, d_pool, c.N, c.K, d_x, d_y, M, false); });
+                    bench_one("i8_hi",    [&] { linear_h_gemm_i8(0, c.fmt, d_pool, c.N, c.K, d_x, d_y, M, true); });
+                }
+                hipFree(d_x); hipFree(d_ref); hipFree(d_y);
+            }
+        }
+        return 0;
+    }
+#endif
+#ifdef SK_GEMM
     if (only == "multi") {
         // q_a [1024,3072] + kv_a [576,3072] + linear_gate [8192,3072] (all S5, same activations) in one launch vs three
         const int K = 3072, Ns[3] = {1024, 576, 8192};
