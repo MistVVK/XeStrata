@@ -27,6 +27,7 @@
 
 #include "hy4_engram.h"
 #include "hy4_manifest.h"
+#include "hy4_metal_vision.h"  // HY4-VISION hook: ViT + image rows + 3D rope (the hooks below are no-ops while Runner::vis is null)
 #include "mtl_rt.h"
 #include "strata/artifact/strata_reader.hpp"
 
@@ -158,6 +159,8 @@ public:
     mtl::Context& cx;
     int max_ctx, Tc;
     int n_run = 42;  // layers to run (--layers: partial runs for bisecting)
+    int ring_slack = 0;  // extra SWA ring slots (--ab: a decode round must not clobber the window rows the restore re-run of the last prefill chunk reads)
+    bool f32x = true; bool lin2 = true; int lin2_r = 0;  // row-blocked decode GEMV (--no-lin2 / --lin2-r N for A/B)
     int mm_min = 16;           // GEMM (fp16 weights) from this many tokens; below it the exact fp32-dequant GEMV (--mm-min)
     bool mpp_ok = false;       // hy4_mpp.metal / hy4_mppq.metal compiled (Metal 4 matmul2d): prefill GEMMs through an fp16 dequantised scratch
     int mpp_min = 96;          // use it from this many tokens
@@ -184,6 +187,8 @@ public:
     // buffers
     Buffer d_ids, x, pre, post, cur_h, cur_f, F1, F2, F3, F4, sub, H1, qr_h, qa_h, ctx_h, o_h, z_f, z_h, zout_f, moe_idx, moe_w, moe_h2, moe_y, moe_cnt, moe_off, moe_pairs, hfin, logits, d_argmax, er_h, kv_f;
     Buffer d_experts, wk_b, wv_b, ivg_dummy;
+    Buffer m2_uexp, m2_ucnt, m2_upair, m2_meta;
+    bool moe2 = true;  // distinct-expert decode / verify MoE (hy4_moe2.metal) for T <= 8 (--no-moe2)
     std::vector<size_t> wk_off, wv_off;
     std::vector<Buffer> kcache, ivg, pooled;
     Buffer ik_f, iv_f, ig_f, ik_h, iq_f, iq_h, hw_f, score, keys, nkeys;
@@ -207,6 +212,7 @@ public:
     int ep_next = 0;
     EPrep* cur_ep = nullptr;
     double t_engram_wait = 0;
+    hy4::VisionCtxM* vis = nullptr;  // HY4-VISION hook: the pictures of the running request; null for a text-only request
 
     Runner(Model& gm, mtl::Context& cx_, int max_ctx_, int max_chunk) : g(gm), c(gm.man.c), cx(cx_), max_ctx(max_ctx_), Tc(max_chunk) {}
 
@@ -271,7 +277,13 @@ public:
         } else {
             std::string f = std::to_string(t.fmt);
             if (M >= mm_min) add("linear_mm_" + f, (N + 63) / 64, (M + 31) / 32, 128, a);
-            else add(std::string("linear_sk_") + f + (M == 1 ? "_1" : "_8"), (N + 7) / 8, 1, 256, a);
+            else if (lin2 && M >= 1 && M <= 8 && (t.fmt == 4 || t.fmt == 5 || t.fmt == 6 || t.fmt == 8)) {
+                // row-blocked GEMV (hy4_lin2.metal): R rows per simdgroup, MT == M tokens
+                int R = 1;
+                if (lin2_r > 0) R = lin2_r == 3 ? 1 : lin2_r;
+                if (R == 2 && M > 2) R = 1;
+                add("linear_skr_" + f + "_" + std::to_string(M) + "_" + std::to_string(R), (N + 8 * R - 1) / (8 * R), 1, 256, a);
+            } else add(std::string("linear_sk_") + f + (M == 1 ? "_1" : "_8"), (N + 7) / 8, 1, 256, a);
         }
     }
     void lin_f32(const std::string& name, const Buffer& X, const Buffer& Y, int M) {
@@ -280,6 +292,7 @@ public:
             add("linear_f32_mm", ((int) t.rows() + 63) / 64, (M + 31) / 32, 128, {g.tw(name), B(X), B(Y), I((int) t.rows()), I((int) t.cols()), I(M)});
             return;
         }
+        if (f32x && M >= 1 && M <= 8 && (t.cols() % 128) == 0) { add("linear_f32x_" + std::to_string(M), ((int) t.rows() + 7) / 8, 1, 256, {g.tw(name), B(X), B(Y), I((int) t.rows()), I((int) t.cols()), I(M)}); return; }
         add("linear_f32", ((int) t.rows() + 7) / 8, 1, 256, {g.tw(name), B(X), B(Y), I((int) t.rows()), I((int) t.cols()), I(M)});
     }
 
@@ -289,11 +302,11 @@ public:
         {
             const std::string dir = kernel_path.substr(0, kernel_path.rfind('/') + 1);
             std::string why;
-            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal", dir + "hy4_dfly2.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
+            lib = mpp_try ? cx.compile_try({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_mpp.metal", dir + "hy4_mppq.metal", dir + "hy4_mppmoe.metal", dir + "hy4_flash.metal", dir + "hy4_dfly2.metal", dir + "hy4_lin2.metal", dir + "hy4_moe2.metal", dir + "hy4_lin3.metal", dir + "hy4_dfly2b.metal"}, "#define NO_GGML_COMMON 1\n", false, &why) : -1;
             mpp_ok = lib >= 0;
             if (!mpp_ok) {
                 if (mpp_try) fprintf(stderr, "[metal] MPP (Metal 4 matmul2d) kernels not available, simdgroup GEMM only: %s\n", why.substr(0, 200).c_str());
-                lib = cx.compile({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_dfly2.metal"}, "#define NO_GGML_COMMON 1\n", false);
+                lib = cx.compile({kernel_path, dir + "hy4_split.metal", dir + "hy4_hcp.metal", dir + "hy4_dfly2.metal", dir + "hy4_lin2.metal", dir + "hy4_moe2.metal", dir + "hy4_lin3.metal", dir + "hy4_dfly2b.metal"}, "#define NO_GGML_COMMON 1\n", false);
             }
             wscr_elems = (size_t) 16384 * 3072;
             if (mpp_ok) wscr = cx.alloc(wscr_elems * 2);
@@ -339,13 +352,14 @@ public:
         moe_cnt = A(512 * 4);
         moe_off = A(520 * 4);
         moe_pairs = A((size_t) T * 16 * 4);
+        m2_uexp = A(128 * 4); m2_ucnt = A(128 * 4); m2_upair = A(128 * 8 * 4); m2_meta = A(64);
         hfin = A((size_t) T * HID_ * 2);
         logits = A((size_t) logit_rows * c.vocab * 4);
         d_argmax = A(64);
         d_experts = A(41 * 512 * sizeof(ExpertDev));
         std::memcpy(d_experts.ptr, g.experts.data(), 41 * 512 * sizeof(ExpertDev));
         // kv caches
-        ring = ((512 + Tc + 15) / 16) * 16;
+        ring = ((512 + Tc + ring_slack + 15) / 16) * 16;
         slots_sparse = ((max_ctx + 8 + 15) / 16) * 16;
         kcache.resize(c.n_layers);
         ivg.resize(c.n_layers);
@@ -439,6 +453,7 @@ public:
         std::vector<uint64_t> ids((size_t) T * 16);
         for (int mo = 0; mo < 4; ++mo) {
             engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), (uint8_t*) e->valid[mo].ptr);
+            if (vis) vis->mask_engram((uint8_t*) e->valid[mo].ptr, p0, T);  // HY4-VISION hook: no Engram contribution at image positions
             if (!eio.fetch_raw(ids.data(), ids.size(), (uint8_t*) e->raw[mo].ptr, err)) {
                 e->ok = false;
                 e->err = err;
@@ -533,11 +548,13 @@ public:
         int g_lo = p0 / 4, g_hi = (p0 + T) / 4 - 1;
         if (g_hi >= g_lo)
             add("idx_pool", g_hi - g_lo + 1, 1, 128, {B(ivg[il]), g.tw(p + ".intra_group_ape"), g.tw(p + ".key_norm.weight"), B(pooled[il]), I(g_lo), Fl((float) theta(il)), Fl(c.rms_eps)});
+        if (vis && g_hi >= g_lo && vis->needs_fix(p0, T)) vis->pool_fix(ds, pooled[il], g_lo, g_hi - g_lo + 1, (float) theta(il));  // HY4-VISION hook
     }
     void idx_select(int il, int p0, int T) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".query_projection.weight", qr_h, iq_f, T);
-        add("idx_q_rope", T, 16, 128, {B(iq_f), B(iq_h), I(p0), Fl((float) theta(il))});
+        if (vis && vis->needs_fix(p0, T)) vis->iq_rope(ds, iq_f, iq_h, T, p0, (float) theta(il));  // HY4-VISION hook: 3D positions
+        else add("idx_q_rope", T, 16, 128, {B(iq_f), B(iq_h), I(p0), Fl((float) theta(il))});
         lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
         int G = (p0 + T) / 4;
         if (G < 1) G = 1;
@@ -584,6 +601,10 @@ public:
         const int TT = T <= 8 ? 1 : 8;
         add(TT == 1 ? "mla_prep_q_1" : "mla_prep_q_8", NH, (T + TT - 1) / TT, 256, {B(F2), B(wk_b, wk_off[il]), B(qa_h), I(T), I(NH), I(p0), Fl((float) theta(il))});
         op("mla_prep");
+        if (vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
+            vis->fix_k(ds, F4, kcache[il], T, p0, swa ? ring : 0, (float) theta(il));
+            vis->fix_q(ds, F2, qa_h, T, NH, p0, (float) theta(il));
+        }
         bool use_list = false;
         if (!swa && index_on) {
             idx_update(il, p0, T);
@@ -684,7 +705,13 @@ public:
         op("router_zproj");
         const Arg sec4 = Arg::B(g.wbuf, g.sec4_off);
         const Arg exl = Arg::B(d_experts, (size_t) (il - 1) * 512 * sizeof(ExpertDev));
-        if (mpp_ok && T >= moe_mm_min) {
+        if (moe2 && T <= 8) {
+            const int Pn = T * 16;
+            add("moe2_plan", 1, 1, 512, {B(moe_idx), I(Pn), B(m2_uexp), B(m2_ucnt), B(m2_upair), B(m2_meta)});
+            add("moe2_gu", 192, Pn, 256, {sec4, exl, B(z_h), B(m2_uexp), B(m2_ucnt), B(m2_upair), B(m2_meta), B(moe_h2)});
+            add("moe2_dn", 192, Pn, 256, {sec4, exl, B(moe_w), B(m2_uexp), B(m2_ucnt), B(m2_upair), B(m2_meta), B(moe_h2), B(moe_y)});
+            add("moe_reduce", T, 1, 256, {B(moe_y), B(zout_f)});
+        } else if (mpp_ok && T >= moe_mm_min) {
             const int Pn = T * 16, TM = moe_tm(T), TN = 32, SG = TM == 64 ? 4 : 2;
             const std::string tag = std::to_string(TM) + "_" + std::to_string(TN) + "_" + std::to_string(SG);
             add("moe_plan", 1, 1, 512, {B(moe_idx), I(Pn), I(TM), B(m_srt), B(m_pos), B(m_tiles), B(m_meta), I(1536 / TN), I(1536 / TN)});
@@ -726,6 +753,7 @@ public:
         allow_nb = relax_ok && !(mpp_ok && T >= std::min(mpp_min, moe_mm_min));
         if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
         add("embed_hc", T, 1, 256, {g.tw("model.embed_tokens.weight"), B(d_ids), B(x), I(T)});
+        if (vis) vis->embed(ds, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
         for (int il = 0; il < n_run; ++il) {
             int mo = -1;
             for (int j = 0; j < 4; ++j)
@@ -857,9 +885,12 @@ static int export_tokenizer(const std::string& file, const std::string& dir) {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_hcsplit = false, prof3 = false;
-    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0;
+    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0, par_m = 0, lin2_r_arg = 0;
+    bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false;
     bool serve = false, session_reuse = false;
     std::string vision;
+    std::vector<std::string> image_files;
+    int64_t image_max_pixels = 4194304;
     std::string draft = "auto";  // auto: DFly2 when the file carries the drafter and --gen > 0; off / dfly2 force
     SpecCfg scfg;
     for (int i = 1; i < argc; ++i) {
@@ -895,13 +926,20 @@ int main(int argc, char** argv) {
         else if (a == "--moe-mm-min") moe_mm_min_arg = atoi(nxt().c_str());
         else if (a == "--mpp-min") mpp_min_arg = atoi(nxt().c_str());
         else if (a == "--draft") draft = nxt();
+        else if (a == "--no-lin2") no_lin2 = true;
+        else if (a == "--no-moe2") no_moe2 = true;
+        else if (a == "--no-f32x") no_f32x = true;
+        else if (a == "--save-logits") save_logits = true;
+        else if (a == "--lin2-r") lin2_r_arg = atoi(nxt().c_str());
         else if (a == "--spec-k") scfg.K = atoi(nxt().c_str());
         else if (a == "--spec-fixed") scfg.adaptive = false;
         else if (a == "--spec-cut") scfg.cut = (float) atof(nxt().c_str());
         else if (a == "--spec-debug") scfg.debug = true;
         else if (a == "--spec-sabotage") scfg.sabotage = true;
+        else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
         else if (a == "--ab") ab_rounds = atoi(nxt().c_str());
         else if (a == "--bench-m") bench_m = atoi(nxt().c_str());
+        else if (a == "--par-m") par_m = atoi(nxt().c_str());
         else if (a == "--info") return print_info(nxt());
         else if (a == "--version") {
             printf("strata-hy4 %s\n", STRATA_HY4_VERSION);
@@ -914,6 +952,8 @@ int main(int argc, char** argv) {
         else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
         else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
         else if (a == "--vision") vision = nxt();
+        else if (a == "--image") image_files.push_back(nxt());  // HY4-VISION (offline runs): one picture file per image-pad token of --tokens, in order
+        else if (a == "--image-max-pixels") image_max_pixels = atoll(nxt().c_str());
         else if (a == "--kv" || a == "--gpu" || a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by the Metal runner\n", a.c_str(), nxt().c_str());
         else {
             printf("ERR unknown flag %s\n", a.c_str());
@@ -947,6 +987,7 @@ int main(int argc, char** argv) {
         so.model = model;
         so.engram = engram;
         so.vision = vision;
+        so.image_max_pixels = image_max_pixels;
         so.max_ctx = max_ctx > 0 ? max_ctx : 131072;
         so.chunk = chunk;
         so.index_topk = index_topk;
@@ -979,6 +1020,25 @@ int main(int argc, char** argv) {
         long v;
         while (f >> v) tok.push_back((int32_t) v);
     }
+    // HY4-VISION: decode + resize the pictures and expand each image-pad token of the prompt to the picture's run of pads (CPU only; the ViT runs after the runner is up)
+    std::vector<hy4::ImageRec> recs;
+    if (!image_files.empty()) {
+        std::string ierr;
+        std::vector<int32_t> ex;
+        for (const std::string& f : image_files) {
+            hy4::ImageRec rc;
+            if (!hy4::prepare_picture(f, hy4::VitCfg().min_pixels, image_max_pixels, rc, ierr)) {
+                fprintf(stderr, "image: %s\n", ierr.c_str());
+                return 1;
+            }
+            recs.push_back(std::move(rc));
+        }
+        if (vision.empty() || !hy4::expand_image_pads(tok, hy4::VitCfg().image_token, recs, ex, ierr)) {
+            fprintf(stderr, "image: %s\n", vision.empty() ? "--vision FILE is required with --image" : ierr.c_str());
+            return 1;
+        }
+        tok.swap(ex);
+    }
     int T0 = (int) tok.size();
     if (T0 == 0) {
         fprintf(stderr, "no tokens\n");
@@ -1005,6 +1065,11 @@ int main(int argc, char** argv) {
     r.pair_max = pair_max;
     r.mpp_try = !no_mpp;
     r.mm_min = mm_min_arg;
+    r.lin2 = !no_lin2;
+    if (ab_rounds > 0) r.ring_slack = gen + 64;
+    r.moe2 = !no_moe2;
+    r.f32x = !no_f32x;
+    r.lin2_r = lin2_r_arg;
     r.hc_split = !no_hcsplit;
     r.split_max = split_arg;
     r.flash_on = no_flash;
@@ -1018,7 +1083,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "--draft %s: expected off, dfly2 or auto\n", draft.c_str());
         return 2;
     }
-    const bool spec_mode = (gen > 0 || bench_m > 0) && draft != "off" && has_df && r.Tc >= 16 && !all_logits;
+    const bool spec_mode = (gen > 0 || bench_m > 0 || par_m > 0) && draft != "off" && has_df && r.Tc >= 16 && !all_logits && recs.empty();  // a picture request decodes plainly (the drafter positions are token indices, the picture rows use 3D positions)
     if (draft == "dfly2" && !spec_mode && gen > 0) fprintf(stderr, "[spec] --draft dfly2 requested but not possible (no drafter in the file, chunk < 16, or --all-logits)\n");
     if (!r.init(no_engram ? std::string() : engram, std::max(all_logits ? r.Tc : 1, spec_mode ? 8 : 1), err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
@@ -1031,6 +1096,17 @@ int main(int argc, char** argv) {
     }
     fprintf(stderr, "[info] drafter=%s\n", spec_mode ? "dfly2" : (has_df ? "dfly2(off)" : "none"));
     tok.reserve(max_ctx + 8);
+    // HY4-VISION: encode the pictures of an offline run now (the runner hooks do the rest); the Vision shard is mapped for the encode only
+    hy4::VitMetal venc;
+    hy4::VisionCtxM vctx;
+    if (!recs.empty()) {
+        if (!venc.load(cx, vision, kernels.substr(0, kernels.rfind('/') + 1), err) || !vctx.setup(venc, cx, tok, recs, err)) {
+            fprintf(stderr, "images: %s\n", err.c_str());
+            return 1;
+        }
+        fprintf(stderr, "[vision] %zu picture(s), %d image rows, encoded in %.2f s\n", recs.size(), vctx.n_rows, vctx.t_encode);
+        r.vis = &vctx;
+    }
     int last_p0 = 0, last_T = 0;
     std::string top_out;
     double t0 = now_s();
@@ -1054,7 +1130,7 @@ int main(int argc, char** argv) {
             int n = T - first;
             hl.assign((const float*) r.logits.ptr, (const float*) r.logits.ptr + (size_t) n * V);
             for (int i = 0; i < n; ++i) top5_line(&hl[(size_t) i * V], V, done - n + i, top_out);
-            if (dump) save_npy_f32(out_dir + "/logits.npy", hl.data(), {n, V});
+            if (dump || save_logits) save_npy_f32(out_dir + "/logits.npy", hl.data(), {n, V});
         } else {
             r.run_all();
         }
@@ -1087,6 +1163,31 @@ int main(int argc, char** argv) {
         r.run_all();
         hl.assign((const float*) r.logits.ptr, (const float*) r.logits.ptr + V);
     };
+    if (par_m > 0) {  // window parity: the last W prompt positions one token at a time vs as one W-token chunk; bit-identical logits rows are the condition of the lossless speculative loop
+        const int W = par_m, p0 = T0 - W;
+        std::vector<float> seq((size_t) W * V), win((size_t) W * V);
+        for (int i = 0; i < W; ++i) {
+            r.forward_chunk(tok.data(), p0 + i, 1, err);
+            r.head(1, 0);
+            r.run_all();
+            std::memcpy(&seq[(size_t) i * V], r.logits.ptr, (size_t) V * 4);
+        }
+        r.forward_chunk(tok.data(), p0, W, err);
+        r.head(W, 0);
+        r.run_all();
+        std::memcpy(win.data(), r.logits.ptr, (size_t) W * V * 4);
+        int bit = 0, top = 0;
+        for (int i = 0; i < W; ++i) {
+            const float *s = &seq[(size_t) i * V], *w = &win[(size_t) i * V];
+            bit += std::memcmp(s, w, (size_t) V * 4) == 0;
+            top += (std::max_element(s, s + V) - s) == (std::max_element(w, w + V) - w);
+            double md = 0;
+            for (int v = 0; v < V; ++v) md = std::max(md, (double) std::fabs(s[v] - w[v]));
+            fprintf(stderr, "[par-m] row %d: bit-identical %d, max|dlogit| %.3g\n", i, (int) (std::memcmp(s, w, (size_t) V * 4) == 0), md);
+        }
+        printf("[par-m] W=%d: bit-identical rows %d/%d, top-1 equal %d/%d\n", W, bit, W, top, W);
+        return 0;
+    }
     if (bench_m > 0) {  // M-token window (the last M prompt positions re-run) timed + per-kernel profile
         const int p0 = T0 - bench_m;
         for (int rep = 0; rep < 6; ++rep) {
@@ -1108,7 +1209,7 @@ int main(int argc, char** argv) {
             restore();
             std::vector<int> pids;
             double tp0 = now_s();
-            if (!plain_gen(pids, false)) return 1;
+            if (!getenv("HY4_AB_SKIP_PLAIN") && !plain_gen(pids, false)) return 1;
             const double tpl = now_s() - tp0;
             restore();
             Spec sp(r, df, scfg);

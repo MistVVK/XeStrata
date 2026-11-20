@@ -21,6 +21,8 @@ struct DFly2 {
     bool ok = false;
     Buffer H, Hf, F1, F2, F3, F4, Ec, Dn, G, U, d_conf, hprev_f, Hf_h, hn, qr_h, qa_h, ctx_h, o_h, mlp_h, hcin, act, hc_h, d_bids, d_chain, dlist, dnk, wkd, wvd;
     size_t wk_stride = 0, wv_stride = 0;
+    Buffer d_cand, d_cscore;
+    int rv = 256;  // reduced-vocabulary chain: candidates per slot (0 = full lm_head per drafted token)
     int lstride = 0;
     double t_draft = 0;
     long n_draft = 0;
@@ -63,6 +65,8 @@ struct DFly2 {
         lstride = r.index_topk + 8;
         dlist = A((size_t) B * lstride * 4);
         dnk = A(64);
+        d_cand = A((size_t) DFLY_BMAX * 1024 * 4);
+        d_cscore = A(1024 * 4);
         // absorbed kv_b_proj of the 5 draft layers (fp16 wk [32][192][512], wv [32][256][512])
         wk_stride = (size_t) 32 * 192 * 512 * 2;
         wv_stride = (size_t) 32 * 256 * 512 * 2;
@@ -151,6 +155,12 @@ struct DFly2 {
             r.add("add_inplace", (nh + 255) / 256, 1, 256, {Bf(H), Bf(F3), Runner::U(nh)});
         }
         r.add("rms_rows", B, 1, 256, {Bf(H), wf(pf + "final_norm.weight"), Bf(Hf), Bf(Hf_h), I(3072), Fl(eps), I(1 | 2 | 4)});
+        const int NC = std::min(rv, 1024);
+        const Arg lmw = r.g.tw("lm_head.weight");
+        if (NC > 0) {  // base logits of slots 1..K in ONE lm_head pass, then the top-NC candidate ids per slot
+            r.lin("lm_head.weight", Hf_h, r.logits, K, (size_t) 3072 * 2, 0);
+            r.add("dfly_topn", K, 1, 1024, {Bf(r.logits), I(c.vocab), I(NC), Bf(d_cand)});
+        }
         for (int j = 1; j <= K; ++j) {
             r.add("dfly_embed", 1, 1, 256, {embw, Bf(d_chain, (size_t) (j - 1) * 4), Bf(Ec)});
             r.add("dfly_cat2", 1, 1, 256, {Bf(Hf, (size_t) j * 3072 * 4), wf(pf + "hidden_correction.hidden_norm.weight"), Bf(Ec), wf(pf + "hidden_correction.embed_norm.weight"), Bf(hcin), Fl(eps)});
@@ -159,9 +169,15 @@ struct DFly2 {
             r.add("swiglu_h", (3072 + 255) / 256, 1, 256, {Bf(G), Bf(U), Bf(act), Runner::U(3072)});
             r.lin(pf + "hidden_correction.down_proj.weight", act, Dn, 1);
             r.add("dfly_corr", 1, 1, 256, {Bf(Hf, (size_t) j * 3072 * 4), Bf(Dn), wf(pf + "confidence_head.proj.weight"), wf(pf + "confidence_head.proj.bias"), Bf(hc_h), Bf(d_conf, (size_t) j * 4)});
-            r.lin("lm_head.weight", hc_h, r.logits, 1);
-            r.add("argmax_row", 1, 1, 1024, {Bf(r.logits), I(c.vocab), Bf(d_chain, (size_t) j * 4)});
+            if (NC > 0) {
+                r.add("dfly_cand_score", NC, 1, 32, {lmw, Bf(d_cand, (size_t) (j - 1) * NC * 4), Bf(hc_h), Bf(d_cscore)});
+                r.add("dfly_cand_argmax", 1, 1, 1024, {Bf(d_cscore), Bf(d_cand, (size_t) (j - 1) * NC * 4), I(NC), Bf(d_chain, (size_t) j * 4)});
+            } else {
+                r.lin("lm_head.weight", hc_h, r.logits, 1);
+                r.add("argmax_row", 1, 1, 1024, {Bf(r.logits), I(c.vocab), Bf(d_chain, (size_t) j * 4)});
+            }
         }
+        { static int pc = 0; if (getenv("HY4_DRAFT_PROF") && ++pc == 4) r.kernel_profile(10); }
         r.run_all();
         for (int j = 1; j <= K; ++j) {
             y[j] = ((int*) d_chain.ptr)[j];
@@ -179,6 +195,7 @@ struct SpecCfg {
     float cut = -1.f;      // >= 0: verify the leading slots with conf > cut instead of the cost model
     bool debug = false;
     bool sabotage = false; // test only: random draft ids with conf 0.9 (acceptance ~0)
+    int rv = 256;          // reduced-vocabulary draft chain: candidates per slot (0 = full lm_head per drafted token)
 };
 
 struct SpecStats {
@@ -215,6 +232,7 @@ public:
         if (cfg.K > DFLY_KMAX) cfg.K = DFLY_KMAX;
         if (cfg.K < 1) cfg.K = 1;
         plain_left = 2;  // calibrate the plain step time first
+        d.rv = cfg.rv;
     }
 
     static int bucket(float c) {
@@ -352,12 +370,13 @@ public:
                 if (!push_emit(nx)) break;
                 continue;
             }
-            const double tv0 = now_s();
+            const double tv0 = now_s(), g0 = r.gpu_total, e0 = r.t_engram_wait;
             for (int i = 1; i <= Kp; ++i) tok.push_back(y[i]);
             const int T = Kp + 1;
             if (!r.forward_chunk(tok.data(), a, T, err)) { finish = "error"; break; }
             r.head(T, 0);
             r.add("argmax_rows", T, 1, 1024, {Runner::B(r.logits), Runner::I(V), Runner::B(r.d_argmax)});
+            { static int pc = 0; if (cfg.debug && T == 4 && ++pc == 5) r.kernel_profile(10); }
             r.run_all();
             const int* h_arg = (const int*) r.d_argmax.ptr;
             const double tver_ms = (now_s() - tv0) * 1000.0;
@@ -377,7 +396,7 @@ public:
             ++S.hist[std::min(n, 8)];
             ++S.spec_iters;
             const int nxt = h_arg[n];
-            if (cfg.debug) fprintf(stderr, "[spec] a=%d K'=%d n=%d draft %.1f ms verify %.1f ms conf %.2f %.2f %.2f\n", a, Kp, n, tdraft, tver_ms, cf[1], Kp > 1 ? cf[2] : 0.f, Kp > 2 ? cf[3] : 0.f);
+            if (cfg.debug) fprintf(stderr, "[spec] a=%d K=%d n=%d draft %.1f ms verify %.1f ms (gpu %.1f engram %.1f) conf %.2f %.2f\n", a, Kp, n, tdraft, tver_ms, (r.gpu_total - g0) * 1e3, (r.t_engram_wait - e0) * 1e3, cf[1], Kp > 1 ? cf[2] : 0.f);
             tok.resize((size_t) a + 1);
             fwd = a + 1 + n;
             bool alive = true;
