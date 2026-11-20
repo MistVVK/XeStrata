@@ -676,28 +676,57 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
     for (int a = 0; a < 2; ++a)
 #pragma unroll
         for (int j = 0; j < 2; ++j) acc[a][j] = fv8_zero();
-    for (int k0 = 0; k0 < K; k0 += HG_BK) {
-        for (int idx = tid; idx < HG_BN * 8; idx += 256) {
-            const int r = idx >> 3, c8 = (idx & 7) * 8;
-            *reinterpret_cast<uint4*>(&sB[r * HG_LD + c8]) = *reinterpret_cast<const uint4*>(B + (size_t)r * K + k0 + c8);
+    // software pipeline: the global loads of the next k chunk are issued before the WMMA loop of the current one (registers -> LDS after the loop's barrier), so their latency overlaps the matrix work
+    constexpr int NA = MODE == 0 ? (HG_BM * 16) / 256 : (HG_BM * 8) / 256;  // A items per thread: float4 (MODE 0) or uint4 (MODE 1)
+    uint4 vb[(HG_BN * 8) / 256];
+    float4 va0[MODE == 0 ? NA : 1];
+    uint4 va1[MODE == 0 ? 1 : NA];
+    auto gload = [&](int k0) {
+#pragma unroll
+        for (int i = 0; i < (HG_BN * 8) / 256; ++i) {
+            const int idx = tid + 256 * i, r = idx >> 3, c8 = (idx & 7) * 8;
+            vb[i] = *reinterpret_cast<const uint4*>(B + (size_t)r * K + k0 + c8);
         }
-        if (MODE == 0) {  // fp32 q_nope rows -> half
-            for (int idx = tid; idx < HG_BM * 16; idx += 256) {
-                const int r = idx >> 4, c4 = (idx & 15) * 4;
+        if (MODE == 0) {  // fp32 q_nope rows (converted to half when stored)
+#pragma unroll
+            for (int i = 0; i < NA; ++i) {
+                const int idx = tid + 256 * i, r = idx >> 4, c4 = (idx & 15) * 4;
                 const int t = min(t0 + r, M - 1);
-                const float4 v = *reinterpret_cast<const float4*>(reinterpret_cast<const float*>(A_) + ((size_t)t * NH + h) * MLA_QHEAD + k0 + c4);
+                va0[i % (MODE == 0 ? NA : 1)] = *reinterpret_cast<const float4*>(reinterpret_cast<const float*>(A_) + ((size_t)t * NH + h) * MLA_QHEAD + k0 + c4);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < NA; ++i) {
+                const int idx = tid + 256 * i, r = idx >> 3, c8 = (idx & 7) * 8;
+                const int t = min(t0 + r, M - 1);
+                va1[i % (MODE == 0 ? 1 : NA)] = *reinterpret_cast<const uint4*>(reinterpret_cast<const half_t*>(A_) + ((size_t)t * NH + h) * MLA_KV_LORA + k0 + c8);
+            }
+        }
+    };
+    gload(0);
+    for (int k0 = 0; k0 < K; k0 += HG_BK) {
+#pragma unroll
+        for (int i = 0; i < (HG_BN * 8) / 256; ++i) {
+            const int idx = tid + 256 * i, r = idx >> 3, c8 = (idx & 7) * 8;
+            *reinterpret_cast<uint4*>(&sB[r * HG_LD + c8]) = vb[i];
+        }
+        if (MODE == 0) {
+#pragma unroll
+            for (int i = 0; i < NA; ++i) {
+                const int idx = tid + 256 * i, r = idx >> 4, c4 = (idx & 15) * 4;
+                const float4 v = va0[i % (MODE == 0 ? NA : 1)];
                 half_t* d = &sA[r * HG_LD + c4];
                 d[0] = h_from_float(v.x); d[1] = h_from_float(v.y); d[2] = h_from_float(v.z); d[3] = h_from_float(v.w);
             }
         } else {
-            for (int idx = tid; idx < HG_BM * 8; idx += 256) {
-                const int r = idx >> 3, c8 = (idx & 7) * 8;
-                const int t = min(t0 + r, M - 1);
-                *reinterpret_cast<uint4*>(&sA[r * HG_LD + c8]) =
-                    *reinterpret_cast<const uint4*>(reinterpret_cast<const half_t*>(A_) + ((size_t)t * NH + h) * MLA_KV_LORA + k0 + c8);
+#pragma unroll
+            for (int i = 0; i < NA; ++i) {
+                const int idx = tid + 256 * i, r = idx >> 3, c8 = (idx & 7) * 8;
+                *reinterpret_cast<uint4*>(&sA[r * HG_LD + c8]) = va1[i % (MODE == 0 ? 1 : NA)];
             }
         }
         __syncthreads();
+        if (k0 + HG_BK < K) gload(k0 + HG_BK);
 #if HY4_CUDA
 #pragma unroll
         for (int kk = 0; kk < HG_BK / 16; ++kk) {
