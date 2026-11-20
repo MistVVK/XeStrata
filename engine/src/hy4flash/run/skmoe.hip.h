@@ -420,15 +420,18 @@ __global__ void __launch_bounds__(256) k_moe_dn_dec1(const uint8_t* __restrict__
 // ---------------------------------------------------------------- WMMA grouped GEMMs (prefill and small verify windows)
 // Token tile BM = WM*MTW*16 (16, 32, 64 or 128): the kernel variant handles the experts whose token count n satisfies nlo < n <= nhi, so every expert
 // is processed with the smallest tile that covers it (a 128-token tile wastes 16x the matrix-core work on an expert that sees 8 tokens).
+// All 8 waves are active in every variant via warp-level split-K (WK = 4/WM = 4, 2, 1 for WM = 1, 2, 4), keeping full grid.x = MOE_D/32 = 48 and BK = 256 (6 barriers).
 template <int FMT, int WM, int MTW>
 __device__ __forceinline__ void gu_gemm_body(const uint8_t* body, int bx, int ty, int n, int base, const int* pairs, const __half* z, __half* h2, half_t* ws) {
     constexpr int SB = sk_sb_bytes(FMT);
     constexpr int BMT = WM * MTW * 16;
+    constexpr int WK = 4 / WM;  // 4 (WM=1), 2 (WM=2), 1 (WM=4)
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
-    const int wm = wave % WM, wn = wave / WM;  // wn in 0..1 for the active waves (gate tile + up tile of 16 output columns each)
-    const bool active = wn < 2;
+    const int wm = wave % WM;
+    const int wn = (wave / WM) & 1;
+    const int wk = wave / (WM * 2);  // 0..WK-1: all 8 warps active
     const int drow = tid >> 2;
-    const int wrow = drow < 32 ? bx * 32 + drow : bx * 32 + drow + (MOE_D - 32);
+    const int wrow = drow < 32 ? bx * 32 + drow : MOE_D + bx * 32 + (drow - 32);
     const uint8_t* wr = body + 3072 + (size_t)wrow * 6 * SB;
     const half_t* xrow[MTW];
 #pragma unroll
@@ -440,8 +443,8 @@ __device__ __forceinline__ void gu_gemm_body(const uint8_t* body, int bx, int ty
     fv8 acc[MTW][2];
     acc_zero(acc);
     const int brow[2] = {wn * 16, 32 + wn * 16};
-    gemm_mainloop_g<FMT, MTW, 2>(wr, 6, xrow, ws, acc, brow, active);
-    if (!active) return;
+    gemm_mainloop_splitk<FMT, MTW, 2, WK>(wr, 6, xrow, ws, acc, brow, wm * 2 + wn, wk);
+    if (wk != 0) return;
     const __half* sqx = (const __half*)body;
 #pragma unroll
     for (int i = 0; i < MTW; ++i)
@@ -459,7 +462,7 @@ __device__ __forceinline__ void gu_gemm_body(const uint8_t* body, int bx, int ty
         }
 }
 
-// grid = (48, ceil(maxtokens/BM), min(512,P))
+// grid = (MOE_D / 32, ceil(maxtokens/BM), min(512,P))
 template <int WM, int MTW>
 __global__ void __launch_bounds__(256) k_moe_gu_gemm(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ ex, const __half* __restrict__ z,
                                                       const int* __restrict__ cnt, const int* __restrict__ off, const int* __restrict__ pairs,
@@ -470,7 +473,7 @@ __global__ void __launch_bounds__(256) k_moe_gu_gemm(const uint8_t* __restrict__
     const int n = cnt[e];
     if (n <= nlo || n > nhi) return;
     if ((int)blockIdx.y * BMT >= n) return;
-    __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * GEMM_LDW];
+    __shared__ __align__(16) half_t ws[GEMM_BN * GEMM_LDW];
     const ExpertDev ed = ex[e];
     const uint8_t* body = sec4 + ed.body_off;
     switch (ed.gu_code) {
@@ -491,9 +494,11 @@ __device__ __forceinline__ void dn_gemm_body(const uint8_t* dnw, int bx, int ty,
                                              float* y, half_t* ws) {
     constexpr int SB = sk_sb_bytes(FMT);
     constexpr int BMT = WM * MTW * 16;
+    constexpr int WK = 8 / (WM * WN);  // 2 (WM=1,WN=4), 1 otherwise
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
-    const int wm = wave % WM, wn = wave / WM;
-    const bool active = wn < WN;
+    const int wm = wave % WM;
+    const int wn = (wave / WM) % WN;
+    const int wk = wave / (WM * WN);
     const uint8_t* wr = dnw + (size_t)(bx * GEMM_BN + (tid >> 2)) * 6 * SB;
     const half_t* xrow[MTW];
 #pragma unroll
@@ -507,8 +512,8 @@ __device__ __forceinline__ void dn_gemm_body(const uint8_t* dnw, int bx, int ty,
     int brow[NTW];
 #pragma unroll
     for (int j = 0; j < NTW; ++j) brow[j] = (wn * NTW + j) * 16;
-    gemm_mainloop_g<FMT, MTW, NTW>(wr, 6, xrow, ws, acc, brow, active);
-    if (!active) return;
+    gemm_mainloop_splitk<FMT, MTW, NTW, WK>(wr, 6, xrow, ws, acc, brow, wm * WN + wn, wk);
+    if (wk != 0) return;
 #pragma unroll
     for (int i = 0; i < MTW; ++i)
 #pragma unroll
@@ -525,7 +530,7 @@ __device__ __forceinline__ void dn_gemm_body(const uint8_t* dnw, int bx, int ty,
         }
 }
 
-// grid = (24, ceil(maxtokens/BM), min(512,P))
+// grid = (MOE_D / GEMM_BN, ceil(maxtokens/BM), min(512,P))
 template <int WM, int MTW, int WN, int NTW>
 __global__ void __launch_bounds__(256) k_moe_dn_gemm(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ ex, const float* __restrict__ topk_w,
                                                       const int* __restrict__ cnt, const int* __restrict__ off, const int* __restrict__ pairs,
@@ -537,7 +542,7 @@ __global__ void __launch_bounds__(256) k_moe_dn_gemm(const uint8_t* __restrict__
     const int n = cnt[e];
     if (n <= nlo || n > nhi) return;
     if ((int)blockIdx.y * BMT >= n) return;
-    __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * GEMM_LDW];
+    __shared__ __align__(16) half_t ws[GEMM_BN * GEMM_LDW];
     const ExpertDev ed = ex[e];
     const uint8_t* dnw = sec4 + ed.body_off + ed.dn_off;
     switch (ed.dn_code) {
@@ -800,7 +805,7 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
     else {
         const int INF = 1 << 30;
         const dim3 b(256);
-        // token tiles 16 / 32 / 64 / 128; an expert with n tokens uses the first tile with n <= BM (several 128-tiles above 64 tokens)
+        // token tiles 16 / 32 / 64 / 128; all 8 waves active via warp split-K (full grid.x = 48 / 24, BK = 256)
         hipLaunchKernelGGL((skd::k_moe_gu_gemm<1, 1>), dim3(MOE_D / 32, 1, eb), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, 0, 16);
         hipLaunchKernelGGL((skd::k_moe_dn_gemm<1, 1, 4, 1>), dim3(MOE_D / skd::GEMM_BN, 1, eb), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.active,
                            w.nact, w.h2, w.y, 0, 16);
