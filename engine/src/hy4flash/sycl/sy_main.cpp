@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
     std::string vision_path;
     int64_t image_max_pixels = 1048576;
     double vram_experts_gb = -1.0, ram_experts_gb = -1.0;
-    int kv_host_above = 24000, gx_mb = 256, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, threads = (int)std::max(2u, std::thread::hardware_concurrency() / 2), expert_act = 1;
+    int kv_host_above = 24000, gx_mb = 256, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 0, index_topk = 2048, threads = (int)std::max(2u, std::thread::hardware_concurrency() / 2), expert_act = 1;
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--serve") serve = true;
     for (int i = 1; i < argc; ++i) {
@@ -186,7 +186,7 @@ int main(int argc, char** argv) {
         so.model = model;
         so.engram = engram;
         so.max_ctx = max_ctx > 0 ? max_ctx : 131072;
-        so.chunk = std::max(chunk, 1);
+        so.chunk = chunk > 0 ? chunk : (dev_caps().global_mem >= (11ull << 30) ? 4096 : 2048);
         so.index_topk = index_topk;
         so.threads = threads;
         so.gx_mb = gx_mb;
@@ -211,9 +211,9 @@ int main(int argc, char** argv) {
     }
     try {
         const auto& caps = dev_caps();
-        fprintf(stderr, "[gpu] %s, %.2f GiB (runtime: %s, sg8=%d sg16=%d xmx8=%d graph=%d)\n",
+        fprintf(stderr, "[gpu] %s, %.2f GiB (runtime: %s, sg8=%d sg16=%d xmx8=%d graph=%d onemkl=%d)\n",
                 caps.name.c_str(), caps.global_mem / 1073741824.0, caps.platform.c_str(),
-                (int)caps.has_sg8, (int)caps.has_sg16, (int)caps.has_xmx_sg8, (int)caps.has_graph);
+                (int)caps.has_sg8, (int)caps.has_sg16, (int)caps.has_xmx_sg8, (int)caps.has_graph, (int)onemkl_enabled());
         SyModel g;
         std::string err;
         if (!g.load(model, err)) {
@@ -232,7 +232,7 @@ int main(int argc, char** argv) {
         }
         const int T0 = (int)tok.size();
         if (max_ctx <= 0) max_ctx = std::max(T0 + gen + 16, 131072);
-        const int Tc = std::max(chunk, 1);
+        const int Tc = chunk > 0 ? chunk : (caps.global_mem >= (11ull << 30) ? 4096 : 2048);
         const bool spec_mode = draft == "dfly2" && gen > 0;
         hy4::CpuExperts ucx;
         SyVramExpertCache vcache;
@@ -272,6 +272,9 @@ int main(int argc, char** argv) {
         }
         (void)warm;
         if (load_only) return 0;
+        // Start Chunk 0 Engram NVMe fetch upfront so it overlaps with GpuExperts setup AND Layer 0!
+        tok.reserve(max_ctx + 8);
+        r.prefetch_engram(tok.data(), 0, std::min(r.Tc, T0));
         GpuExperts gxe;
         if (gx_mb > 0 && T0 >= gx_min_t) {
             std::string gerr;
@@ -287,22 +290,21 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "[gpu-experts] disabled: %s\n", e.what());
             }
         }
-        tok.reserve(max_ctx + 8);
         std::string top_out;
         const double io0 = io_read_gb();
         const double t0 = now_s();
         int done = 0;
         const int V = r.c.vocab;
-        r.prefetch_engram(tok.data(), 0, std::min(r.Tc, T0));
         std::vector<float> hl;
         while (done < T0) {
             const int T = std::min(r.Tc, T0 - done);
+            // Prefetch NEXT chunk BEFORE running forward_chunk so NVMe Engram reads overlap 100% with the 42-layer GPU forward!
+            if (done + T < T0) r.prefetch_engram(tok.data(), done + T, std::min(r.Tc, T0 - (done + T)));
             if (!r.forward_chunk(tok.data(), done, T, err)) {
                 fprintf(stderr, "forward: %s\n", err.c_str());
                 return 1;
             }
             done += T;
-            if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
             const bool last = done == T0;
             if (last) {
                 const int first = (all_logits && !spec_mode) ? std::max(0, T - r.logit_rows) : T - 1;

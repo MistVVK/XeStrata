@@ -221,7 +221,8 @@ public:
     uint8_t* d_eraw[4] = {};
     uint8_t* d_evalid[4] = {};
     EngramDev eng_dev[4];
-    // Single-layer reusable fp16 kv_b scratch for prefill (29.4 MB instead of 1.06 GB persistent!)
+    // Single-layer reusable fp16 scratch: dq_buf (32 MiB) for oneMKL dequant-once dense prefill (aliases wk_tmp; wv_tmp independent)
+    half* dq_buf = nullptr;
     half* wk_tmp = nullptr;
     half* wv_tmp = nullptr;
     std::vector<half*> kcache;
@@ -478,9 +479,12 @@ public:
         keys = dalloc<int32_t>((size_t)Tc * (index_topk + 8));
         nkeys = dalloc<int32_t>((size_t)Tc);
 
-        // Single-layer reusable fp16 kv_b scratch for prefill (29.4 MB vs 1.06 GB persistent!)
-        wk_tmp = dalloc<half>((size_t)64 * 192 * 512);
+        // Unified 32 MiB fp16 scratch for oneMKL dequant-once dense prefill (aliases wk_tmp=12.6 MB; wv_tmp stays independent!)
+        constexpr size_t DQ_HALVES = (size_t)16 * 1024 * 1024;  // 32 MiB
+        dq_buf = dalloc<half>(DQ_HALVES);
+        wk_tmp = dq_buf;
         wv_tmp = dalloc<half>((size_t)64 * 256 * 512);
+        register_dq_scratch(dq_buf, DQ_HALVES);
 
         // Engram
         if (!hy4::load_engram_meta_file(g.path, emeta, err)) return false;
@@ -542,10 +546,10 @@ public:
         sycl::event used;
         bool have_used = false;
     };
-    EPrep ep[2];
+    EPrep ep[3];
     int ep_next = 0;
     void ep_alloc() {
-        for (int s = 0; s < 2; ++s) {
+        for (int s = 0; s < 3; ++s) {
             ep[s].raw.resize((size_t)4 * Tc * 16 * 100);
             ep[s].valid.resize((size_t)4 * Tc * 16);
         }
@@ -568,6 +572,8 @@ public:
     }
     void prefetch_engram(const int32_t* tok_all, int p0, int T) {
         if (!engram_ready) return;
+        for (int s = 0; s < 3; ++s)
+            if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T) return;
         EPrep& e = ep[ep_next];
         if (e.fut.valid()) e.fut.wait();
         if (e.have_used) e.used.wait();
@@ -575,22 +581,22 @@ public:
         e.T = T;
         e.pending = true;
         e.fut = std::async(std::launch::async, [this, &e, tok_all, p0, T]() { ep_compute(&e, tok_all, p0, T); });
-        ep_next ^= 1;
+        ep_next = (ep_next + 1) % 3;
     }
     bool engram_prep(const int32_t* tok_all, int p0, int T, std::string& err) {
         const double t0 = now_s();
         EPrep* e = nullptr;
-        for (int s = 0; s < 2; ++s)
+        for (int s = 0; s < 3; ++s)
             if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T) e = &ep[s];
         if (e) {
             e->fut.get();
             e->pending = false;
         } else {
-            for (int s = 0; s < 2; ++s)
+            for (int s = 0; s < 3; ++s)
                 if (ep[s].fut.valid()) ep[s].fut.wait();
             e = &ep[ep_next];
             if (e->have_used) e->used.wait();
-            ep_next ^= 1;
+            ep_next = (ep_next + 1) % 3;
             ep_compute(e, tok_all, p0, T);
         }
         if (!e->ok) {
@@ -1180,11 +1186,12 @@ public:
         h2d(d_ids, tok_all + p0, (size_t)T * 4);
         embed_hc((const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
         if (vis) vis->embed(x, p0, T);
-        const bool defer_eng = engram_ready && T <= 8;
+        const int eng_first_layer = engram_ready ? emeta.layers[0] : 0;
+        const bool defer_eng = engram_ready && (T <= 8 || eng_first_layer > 0);
         if (defer_eng) prefetch_engram(tok_all, p0, T);
         else if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
         for (int il = 0; il < c.n_layers; ++il) {
-            if (defer_eng && il == 1) {
+            if (defer_eng && il == std::max(1, eng_first_layer)) {
                 double tw0 = now_s();
                 if (!engram_prep(tok_all, p0, T, err)) return false;
                 t_engram_wait += now_s() - tw0;

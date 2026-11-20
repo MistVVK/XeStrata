@@ -424,12 +424,12 @@ inline int hy4s_serve_main(const ServeOpts& o) {
             r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
             while (done < T0) {
                 const int T = std::min(r.Tc, T0 - done);
+                if (done + T < T0) r.prefetch_engram(tok.data(), done + T, std::min(r.Tc, T0 - (done + T)));
                 if (!r.forward_chunk(tok.data(), done, T, err)) {
                     failed = true;
                     break;
                 }
                 done += T;
-                if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
                 const bool last = done == T0;
                 if (last) {
                     r.head(T, T - 1);

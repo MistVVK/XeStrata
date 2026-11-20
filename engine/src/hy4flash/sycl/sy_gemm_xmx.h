@@ -8,7 +8,12 @@
 //   5. Portable SG32 SIMT tiled GEMM fallback for non-XMX Intel iGPUs (Core Ultra / UHD).
 #pragma once
 #include <algorithm>
+#include <cstdint>
 #include <type_traits>
+
+#ifdef HY4S_USE_ONEMKL
+#include <oneapi/mkl/blas.hpp>
+#endif
 
 #include "sy_common.h"
 #include "sy_linear.h"
@@ -691,6 +696,136 @@ inline void k_gemm_simt_sg32(const uint8_t* W, int N, int K, const half* X, floa
     });
 }
 
+// ---- Path 0 (optional, default ON when built with -DHY4S_USE_ONEMKL): Dequant-once S_K -> FP16 + oneMKL XMX GEMM ----
+// Eliminates redundant per-M-tile S_K bit-unpacking on prefill (M >= 64), running Intel oneMKL's tuned Xe-HPG/Xe2 XMX GEMM
+// directly with FP16 inputs and FP32 accumulation/output (zero quality loss, zero extra VRAM when aliased with Runner's dq_buf).
+namespace xmx_detail {
+
+struct DqScratch {
+    half* external = nullptr;
+    size_t external_cap = 0;
+    half* owned = nullptr;
+    size_t owned_cap = 0;
+    void set_external(half* p, size_t cap_halves) {
+        external = p;
+        external_cap = cap_halves;
+    }
+    half* get(size_t& cap_halves) {
+        if (external && external_cap > 0) {
+            cap_halves = external_cap;
+            return external;
+        }
+        if (!owned) {
+            owned_cap = (size_t)16 * 1024 * 1024;  // 32 MiB fallback for standalone unit tests
+            owned = dalloc<half>(owned_cap);
+        }
+        cap_halves = owned_cap;
+        return owned;
+    }
+};
+
+inline DqScratch& dq_scratch() {
+    static DqScratch s;
+    return s;
+}
+
+template <int FMT, bool RP>
+inline void k_dequant_sk_to_fp16(const uint8_t* W, int N, int K, int n0, int nc, half* out_fp16) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    constexpr int PB = FMT == FMT_S4 ? 128 : FMT == FMT_S5 ? 160 : 256;
+    const int nsb = K >> 8;
+    const size_t total_sb = (size_t)nc * nsb;
+    const size_t pay_off = RP ? rp_pay_off(N, nsb) : 0;
+    Q().parallel_for(NR((total_sb + 7) / 8, 256), [=](sycl::nd_item<1> it) REQD_SG32 {
+        const size_t sb_idx = (size_t)it.get_group(0) * 8 + ((size_t)it.get_local_id(0) >> 5);
+        if (sb_idx >= total_sb) return;
+        const int lane = (int)it.get_local_id(0) & 31;
+        const int r_local = (int)(sb_idx / (size_t)nsb);
+        const int sbi = (int)(sb_idx % (size_t)nsb);
+        const int row = n0 + r_local;
+        const int g = lane >> 3;
+        const int u = lane & 7;
+
+        const uint8_t* hd = RP ? (W + ((size_t)row * nsb + sbi) * 8) : (W + ((size_t)row * nsb + sbi) * SB);
+        const uint8_t* pl = RP ? (W + pay_off + ((size_t)row * nsb + sbi) * PB) : (hd + 6);
+        const float D = h2f_bits(ld16(hd));
+        const float eff = D * ((float)hd[2 + g] * (1.0f / 255.0f));
+        const float bias = -sk_half<FMT>() * eff;
+
+        sycl::vec<half, 8> vh;
+        if constexpr (FMT == FMT_S4) {
+            const uint32_t wd = ld_u32_unaligned(pl + g * 32 + u * 4);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t by = (wd >> (8 * i)) & 0xFFu;
+                vh[2 * i] = (half)((float)(by & 15u) * eff + bias);
+                vh[2 * i + 1] = (half)((float)(by >> 4) * eff + bias);
+            }
+        } else if constexpr (FMT == FMT_S5) {
+            const uint32_t wd = ld_u32_unaligned(pl + g * 32 + u * 4);
+            const uint32_t hb = pl[128 + g * 8 + u];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t by = (wd >> (8 * i)) & 0xFFu;
+                const uint32_t q0 = (by & 15u) | (((hb >> (2 * i)) & 1u) << 4);
+                const uint32_t q1 = (by >> 4) | (((hb >> (2 * i + 1)) & 1u) << 4);
+                vh[2 * i] = (half)((float)q0 * eff + bias);
+                vh[2 * i + 1] = (half)((float)q1 * eff + bias);
+            }
+        } else if constexpr (FMT == FMT_S8) {
+            const uint8_t* p = pl + g * 64 + u * 8;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) vh[i] = (half)((float)(int8_t)p[i] * eff);
+        } else if constexpr (FMT == FMT_S2) {
+            const uint8_t* p = pl + g * 16 + u * 2;
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const uint32_t by = p[i];
+                vh[4 * i + 0] = (half)((float)(by & 3u) * eff + bias);
+                vh[4 * i + 1] = (half)((float)((by >> 2) & 3u) * eff + bias);
+                vh[4 * i + 2] = (half)((float)((by >> 4) & 3u) * eff + bias);
+                vh[4 * i + 3] = (half)((float)(by >> 6) * eff + bias);
+            }
+        } else if constexpr (FMT == FMT_S3) {
+            const uint8_t* p = pl + g * 16 + u * 2;
+            const uint32_t hb = pl[64 + g * 8 + u];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const uint32_t by = p[i];
+                const uint32_t h4 = (hb >> (4 * i)) & 0xFu;
+                const uint32_t q0 = (by & 3u) | ((h4 & 1u) << 2);
+                const uint32_t q1 = ((by >> 2) & 3u) | (((h4 >> 1) & 1u) << 2);
+                const uint32_t q2 = ((by >> 4) & 3u) | (((h4 >> 2) & 1u) << 2);
+                const uint32_t q3 = (by >> 6) | (((h4 >> 3) & 1u) << 2);
+                vh[4 * i + 0] = (half)((float)q0 * eff + bias);
+                vh[4 * i + 1] = (half)((float)q1 * eff + bias);
+                vh[4 * i + 2] = (half)((float)q2 * eff + bias);
+                vh[4 * i + 3] = (half)((float)q3 * eff + bias);
+            }
+        } else {
+            // FMT_S6
+            const uint32_t wd = ld_u32_unaligned(pl + g * 32 + u * 4);
+            const uint32_t hw = (uint32_t)pl[128 + g * 16 + u * 2] | ((uint32_t)pl[128 + g * 16 + u * 2 + 1] << 8);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t by = (wd >> (8 * i)) & 0xFFu;
+                const uint32_t h4 = (hw >> (4 * i)) & 0xFu;
+                const uint32_t q0 = (by & 15u) | ((h4 & 3u) << 4);
+                const uint32_t q1 = (by >> 4) | (((h4 >> 2) & 3u) << 4);
+                vh[2 * i] = (half)((float)q0 * eff + bias);
+                vh[2 * i + 1] = (half)((float)q1 * eff + bias);
+            }
+        }
+        *reinterpret_cast<sycl::vec<half, 8>*>(out_fp16 + (size_t)r_local * K + (size_t)sbi * 256 + lane * 8) = vh;
+    });
+}
+
+}  // namespace xmx_detail
+
+inline void register_dq_scratch(half* ptr, size_t cap_halves) {
+    xmx_detail::dq_scratch().set_external(ptr, cap_halves);
+}
+
 inline int xmx_i8_mode() {
     static const int mode = [] {
         const char* e = std::getenv("HY4S_XMX_I8");
@@ -699,6 +834,60 @@ inline int xmx_i8_mode() {
     }();
     return mode;
 }
+
+inline bool onemkl_enabled() {
+#ifdef HY4S_USE_ONEMKL
+    static const bool on = [] {
+        const char* e = std::getenv("HY4S_ONEMKL");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+#else
+    return false;
+#endif
+}
+
+#ifdef HY4S_USE_ONEMKL
+template <int FMT, bool RP>
+inline bool gemm_onemkl_fmt(const uint8_t* W, int N, int K, const half* X, float* Y, int M) {
+    size_t cap_h = 0;
+    half* buf = xmx_detail::dq_scratch().get(cap_h);
+    int n_step = (int)std::min<size_t>((size_t)N, cap_h / (size_t)K);
+    if (n_step >= 64) n_step &= ~63;
+    if (n_step <= 0) return false;
+    for (int n0 = 0; n0 < N; n0 += n_step) {
+        const int nc = std::min(n_step, N - n0);
+        xmx_detail::k_dequant_sk_to_fp16<FMT, RP>(W, N, K, n0, nc, buf);
+        oneapi::mkl::blas::row_major::gemm(
+            Q(), oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+            (std::int64_t)M, (std::int64_t)nc, (std::int64_t)K,
+            1.0f, X, (std::int64_t)K,
+            buf, (std::int64_t)K,
+            0.0f, Y + n0, (std::int64_t)N);
+    }
+    return true;
+}
+
+inline bool gemm_onemkl(int fmt, const void* Wv, int N, int K, const half* X, float* Y, int M, bool rp = false) {
+    if (!onemkl_enabled() || M < 64 || (K & 255) || xmx_i8_mode() != 0) return false;
+    const uint8_t* W = (const uint8_t*)Wv;
+    if (rp) {
+        if (fmt == FMT_S4) return gemm_onemkl_fmt<FMT_S4, true>(W, N, K, X, Y, M);
+        if (fmt == FMT_S5) return gemm_onemkl_fmt<FMT_S5, true>(W, N, K, X, Y, M);
+        if (fmt == FMT_S8) return gemm_onemkl_fmt<FMT_S8, true>(W, N, K, X, Y, M);
+        return false;
+    }
+    switch (fmt) {
+        case FMT_S4: return gemm_onemkl_fmt<FMT_S4, false>(W, N, K, X, Y, M);
+        case FMT_S5: return gemm_onemkl_fmt<FMT_S5, false>(W, N, K, X, Y, M);
+        case FMT_S6: return gemm_onemkl_fmt<FMT_S6, false>(W, N, K, X, Y, M);
+        case FMT_S8: return gemm_onemkl_fmt<FMT_S8, false>(W, N, K, X, Y, M);
+        case FMT_S2: return gemm_onemkl_fmt<FMT_S2, false>(W, N, K, X, Y, M);
+        case FMT_S3: return gemm_onemkl_fmt<FMT_S3, false>(W, N, K, X, Y, M);
+        default: return false;
+    }
+}
+#endif
 
 template <int FMT, bool RP>
 inline void dispatch_xmx_fmt(const uint8_t* W, int N, int K, const half* X, float* Y, int M) {
@@ -733,6 +922,9 @@ inline void dispatch_xmx_fmt(const uint8_t* W, int N, int K, const half* X, floa
 }
 
 inline bool gemm_xmx(int fmt, const void* Wv, int N, int K, const half* X, float* Y, int M, bool rp = false) {
+#ifdef HY4S_USE_ONEMKL
+    if (gemm_onemkl(fmt, Wv, N, K, X, Y, M, rp)) return true;
+#endif
     const uint8_t* W = (const uint8_t*)Wv;
     if ((N & 63) || (K & 255) || (M & 7)) return false;
     if (rp) {
@@ -752,8 +944,13 @@ inline bool gemm_xmx(int fmt, const void* Wv, int N, int K, const half* X, float
     }
 }
 
-// production entry. rp: the weight is in the RP layout (S4/S5/S8 repacked at load time). M <= 8: GEMV; M >= 16: XMX GEMM for the first (M & ~7) rows, the rest by the GEMV/simple kernel.
+// production entry. rp: the weight is in the RP layout (S4/S5/S8 repacked at load time).
+// M >= 64 (with oneMKL): dequant-once + oneMKL XMX GEMM for all M rows (no tail!).
+// M >= 16 (fallback): fused XMX GEMM for the first (M & ~7) rows, tail by GEMV.
 inline void linear_auto(int fmt, const void* W, int N, int K, const half* X, float* Y, int M, bool rp = false) {
+#ifdef HY4S_USE_ONEMKL
+    if (fmt != FMT_Q8ROW && fmt != FMT_F32 && gemm_onemkl(fmt, W, N, K, X, Y, M, rp)) return;
+#endif
     int Mx = 0;
     if (M >= 16 && !(N & 63) && !(K & 255) && fmt != FMT_Q8ROW && fmt != FMT_F32) {
         Mx = M & ~7;
