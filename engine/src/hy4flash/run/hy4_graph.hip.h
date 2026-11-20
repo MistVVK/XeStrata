@@ -97,6 +97,7 @@ public:
         if (mla_ws) HCK(hipFree(mla_ws));
         mla_ws_bytes = need + (need >> 2);
         HCK(hipMalloc(&mla_ws, mla_ws_bytes));
+        if (getenv("HY4_POISON")) HCK(hipMemset(mla_ws, 0xFF, mla_ws_bytes));
     }
     // host side engram
     EngramMeta emeta;
@@ -358,6 +359,7 @@ public:
     template <class T> T* dalloc(size_t n) {
         T* p = nullptr;
         HCK(hipMalloc((void**)&p, n * sizeof(T)));
+        if (getenv("HY4_POISON")) HCK(hipMemset(p, 0xFF, n * sizeof(T)));  // debug: NaN / -1 fill, finds reads of uninitialised device memory
         return p;
     }
     const void* tw(const std::string& name) const { return g.tensor_dev(name); }

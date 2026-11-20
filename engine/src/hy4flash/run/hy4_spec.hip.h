@@ -16,11 +16,12 @@
 namespace hy4 {
 
 struct SpecCfg {
-    int K = 5;             // drafted tokens per block (1..7)
+    int K = 7;             // drafted tokens per block (1..7)
     bool adaptive = true;  // false: always verify K (fixed window, no back-off); for sweeps
     float cut = -1.f;      // >= 0: verify the leading slots with conf > cut instead of the cost model
     bool exact = true;     // verify windows on the M-independent GEMV / decode expert kernels
     bool debug = false;
+    bool nodraft = false;  // test only (with sabotage): skip the drafter entirely, verify windows of fixed junk tokens
     bool sabotage = false; // test only: replace every draft token by a random id with conf 0.9 (acceptance ~0): the worst case for the controller
     int rv = 256;          // reduced-vocabulary draft chain: candidates per slot (0 = full lm_head per drafted token)
 };
@@ -198,7 +199,17 @@ public:
             }
             // draft
             const double td0 = now_s();
-            if (!d.draft(a, tok[a], Kd, y, cf)) { finish = "error"; err = "draft failed"; break; }
+            if (cfg.nodraft) {  // test only: no drafter work at all (HY4_DUMMY_MB: a device-to-device copy of that many MB instead, to test timing / scheduling sensitivity of the target kernels)
+                for (int j = 1; j <= Kd; ++j) { y[j] = 1000 + j; cf[j] = 0.9f; }
+                static float* dummy = nullptr;
+                static size_t dummy_bytes = getenv("HY4_DUMMY_MB") ? (size_t)atoi(getenv("HY4_DUMMY_MB")) << 20 : 0;
+                if (dummy_bytes) {
+                    if (!dummy) HCK(hipMalloc((void**)&dummy, 2 * dummy_bytes));
+                    HCK(hipMemcpyAsync((char*)dummy + dummy_bytes, dummy, dummy_bytes, hipMemcpyDeviceToDevice, r.st));
+                    HCK(hipStreamSynchronize(r.st));
+                }
+            }
+            else if (!d.draft(a, tok[a], Kd, y, cf)) { finish = "error"; err = "draft failed"; break; }
             const double tdraft = (now_s() - td0) * 1000.0;
             if (cfg.sabotage) {
                 static uint64_t xs = 88172645463325252ull;

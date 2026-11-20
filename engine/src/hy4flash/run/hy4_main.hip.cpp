@@ -106,6 +106,7 @@ int main(int argc, char** argv) {
     std::string parity_list;
     bool det_flag = true, want_margins = false;
     int ab_rounds = 0, trace_m = 0;
+    bool ab_sab = false, alloc_only = false, knobs16 = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() {
@@ -139,9 +140,13 @@ int main(int argc, char** argv) {
         else if (a == "--spec-debug") scfg.debug = true;
         else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
         else if (a == "--spec-sabotage") scfg.sabotage = true;
+        else if (a == "--spec-nodraft") { scfg.sabotage = true; scfg.nodraft = true; }
         else if (a == "--det") det_flag = atoi(nxt().c_str()) != 0;
         else if (a == "--margins") want_margins = true;
         else if (a == "--ab") ab_rounds = atoi(nxt().c_str());
+        else if (a == "--ab-sab") ab_sab = true;
+        else if (a == "--dfly-alloc-only") alloc_only = true;
+        else if (a == "--knobs16") knobs16 = true;
         else if (a == "--trace-m") trace_m = atoi(nxt().c_str());
         else if (a == "--mla-blocks") g_mla_target_blocks = atoi(nxt().c_str());
         else if (a == "--spec-exact") scfg.exact = atoi(nxt().c_str()) != 0;
@@ -285,7 +290,7 @@ int main(int argc, char** argv) {
     }
     tok.reserve(max_ctx + 8);
     DFly2 df(r);
-    const bool spec_mode = draft == "dfly2" && gen > 0;
+    const bool spec_mode = draft == "dfly2" && gen > 0 && !alloc_only;
     if (draft == "dfly2") {
         if (!df.init(err)) {
             fprintf(stderr, "dfly2: %s\n", err.c_str());
@@ -362,6 +367,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram cpu %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_cpu);
     // greedy decode
     const double cpu_wait0 = r.t_cpu_wait;
+    if (knobs16) { skd::lin_gemv_max_m() = 16; skd::moe_dec_max_m() = 16; }
     if (trace_m > 0) {
         // layer-by-layer bit comparison of an M-token window against the same positions one at a time: dumps x after every attention / MLP of every layer into out/seq<i> and out/win
         // (compare with tools: first file whose bytes differ names the layer and the op that is not batch invariant)
@@ -481,11 +487,15 @@ int main(int argc, char** argv) {
     }
     if (ab_rounds > 0 && spec_mode) {
         // DFly2 off vs on from ONE prefill: each mode starts from the resident prompt state (the last prefill chunk is re-run, which rebuilds the logits, h_final and the key-list capture;
-        // decode rows beyond the prompt are overwritten, the SWA ring keeps >= Tc slack). Rounds alternate plain / spec, same prompt, same flags.
+        // decode rows beyond the prompt are overwritten). Only the LAST 16 prompt positions are re-run: a longer re-run would need SWA ring slots of the early part of the last chunk,
+        // which decode has overwritten (ring = 512 + chunk). Both modes start from this same re-run state. Rounds alternate plain / spec, same prompt, same flags.
+        const int redo_T = std::min(16, T0), redo_p0 = T0 - redo_T;
+        (void)last_p0;
+        (void)last_T;
         auto restore = [&]() {
             tok.resize(T0);
-            if (!r.forward_chunk(tok.data(), last_p0, last_T, err)) { fprintf(stderr, "ab restore: %s\n", err.c_str()); exit(1); }
-            r.head(last_T, last_T - 1);
+            if (!r.forward_chunk(tok.data(), redo_p0, redo_T, err)) { fprintf(stderr, "ab restore: %s\n", err.c_str()); exit(1); }
+            r.head(redo_T, redo_T - 1);
             df.snap_h(0);
             HCK(hipStreamSynchronize(r.st));
             HCK(hipMemcpy(hl.data(), r.logits, (size_t)V * 4, hipMemcpyDeviceToHost));
@@ -528,6 +538,22 @@ int main(int argc, char** argv) {
                    sp.S.spec_iters ? (double)sp.S.accepted / sp.S.spec_iters : 0.0, steps, same, pids.size());
             fflush(stdout);
             sp.report(stderr, tsd * 1000.0);
+            if (ab_sab) {
+                // worst case: the same controller, every draft replaced by a random id (acceptance ~0)
+                restore();
+                SpecCfg sc2 = scfg;
+                sc2.sabotage = true;
+                Spec sb(r, df, sc2);
+                std::vector<int> bids;
+                std::string fin2, e3;
+                int made2 = 0;
+                const double tb0 = now_s();
+                sb.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { bids.push_back(t); return true; }, fin2, e3, made2);
+                const double tbd = now_s() - tb0;
+                printf("[ab-sab] ctx %d round %d: plain %.2f tok/s | dfly2 with random drafts (worst case) %zu tok %.2f s = %.2f tok/s | speedup %.3f | backoffs %ld, probes %ld, plain-mode iterations %ld, plain after draft %ld\n", T0, round,
+                       pids.size() / tp, bids.size(), tbd, bids.size() / tbd, (bids.size() / tbd) / (pids.size() / tp), sb.S.backoffs, sb.S.probes, sb.S.plain_mode_iters, sb.S.plain_after_draft);
+                fflush(stdout);
+            }
         }
     } else if (spec_mode) {
         Spec sp(r, df, scfg);

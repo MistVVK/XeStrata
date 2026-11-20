@@ -186,6 +186,9 @@ struct DFly2 {
     const Cfg& c;
     bool ok = false;
     int rv = 0;  // reduced-vocabulary chain: candidates per slot (0 = full lm_head per slot)
+    bool isolate = getenv("HY4_DRAFT_ISOLATE") != nullptr;  // debug: the drafter works on private copies of the target cache layers
+    int skip = getenv("HY4_DRAFT_SKIP") ? atoi(getenv("HY4_DRAFT_SKIP")) : 0;  // debug bisect: 1 skip the 5 layers, 2 skip the base-logit pass, 4 skip the chain loop
+    __half* shadow[5] = {};
     int32_t* d_cand = nullptr;
     float* d_cscore = nullptr;
     hipStream_t st;
@@ -286,17 +289,24 @@ struct DFly2 {
         hipLaunchKernelGGL(k_dfly_fuse, dim3(1), dim3(256), 0, st, H, wf(pf + "mtp_fusion.gate"), (const float*)F1);
         // 5 layers
         std::unique_ptr<Runner::PS> pl(new Runner::PS(&r, "dfly_layers"));
-        for (int d = 0; d < 5; ++d) {
+        for (int d = 0; d < ((skip & 1) ? 0 : 5); ++d) {
             const int L = DFLY_LAYERS[d];
             const std::string pa = pf + std::to_string(d) + ".self_attn";
             const std::string pm = pf + std::to_string(d) + ".mlp";
             const bool use_list = r.cap_list[d];
+            __half* dcache = r.kcache[L];
+            if (isolate) {  // debug: work on a private copy of the target layer's cache so the target cache is never written by the drafter
+                const size_t by = mla_cache_bytes(r.slots_sparse);
+                if (!shadow[d]) HCK(hipMalloc((void**)&shadow[d], by));
+                HCK(hipMemcpyAsync(shadow[d], r.kcache[L], by, hipMemcpyDeviceToDevice, st));
+                dcache = shadow[d];
+            }
             hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + std::to_string(d) + ".input_layernorm.weight"), (float*)nullptr, hn, HID, c.rms_eps);
             r.lin(pa + ".q_a_proj.weight", hn, F1, B);  // [B][1024]
             hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps);
             r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);  // [B][8192]
             r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);  // [B][576]
-            mla_write_kv(st, F3, wf(pa + ".kv_a_layernorm.weight"), r.kcache[L], r.slots_sparse, B, a, 0, (float)c.theta_sparse, c.rms_eps);
+            mla_write_kv(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, a, 0, (float)c.theta_sparse, c.rms_eps);
             const int kvfmt = r.ti(pa + ".kv_b_proj.weight").fmt;
             mla_prep_q_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), F2, qa_h, B, 32, a, (float)c.theta_sparse);
             r.lin(pa + ".linear_gate.weight", hn, F4, B);  // [B][8192]
@@ -315,7 +325,7 @@ struct DFly2 {
                 ma.mode = MLA_CAUSAL;
             }
             r.ensure_mla_ws(mla_workspace_bytes(ma));
-            mla_attend(st, qa_h, r.kcache[L], wf(pa + ".learnable_sink_param"), ctx_h, ma, r.mla_ws, r.mla_ws_bytes);
+            mla_attend(st, qa_h, dcache, wf(pa + ".learnable_sink_param"), ctx_h, ma, r.mla_ws, r.mla_ws_bytes);
             mla_vup_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), ctx_h, F4, o_h, B, 32);
             r.lin(pa + ".o_proj.weight", o_h, F1, B);  // [B][3072]
             hipLaunchKernelGGL(k_dfly_rms_resid, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".post_proj_norm.weight"), H, c.rms_eps);
@@ -335,12 +345,12 @@ struct DFly2 {
         const TInfo& lm = r.ti("lm_head.weight");
         const void* lmw = r.tw("lm_head.weight");
         const int N = std::min(rv, 1024);
-        if (N > 0) {
+        if (N > 0 && !(skip & 2)) {
             // base logits of slots 1..K in ONE lm_head pass, candidate ids per slot
             linear_h(st, lm.fmt, lmw, (int)lm.rows(), (int)lm.cols(), Hf_h + HID, r.logits, K);
             hipLaunchKernelGGL(k_dfly_topn, dim3(K), dim3(1024), 0, st, (const float*)r.logits, V, N, d_cand);
         }
-        for (int j = 1; j <= K; ++j) {
+        for (int j = 1; j <= ((skip & 4) ? 0 : K); ++j) {
             embed_rows(st, emb.fmt, r.tw("model.embed_tokens.weight"), (int)emb.rows(), (int)emb.cols(), d_chain + (j - 1), Ec, 1);
             hipLaunchKernelGGL(k_dfly_cat2, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), wf(pf + "hidden_correction.hidden_norm.weight"), (const float*)Ec,
                                wf(pf + "hidden_correction.embed_norm.weight"), hcin, c.rms_eps);
