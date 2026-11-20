@@ -305,6 +305,7 @@ inline int hy4s_serve_main(const ServeOpts& o) {
         if (use_spec) {
             SpecCfg sc = o.spec;
             spec.reset(new Spec(r, df, sc));
+            spec_set_batch_invariant();
         }
         fprintf(stderr, "[load] total %.1f s, device allocated %.2f GiB of 7.54\n", now_s() - t_load0, (dev_bytes_allocated() + (r.gx ? gxe.device_bytes() : 0)) / 1073741824.0);
         // pictures need the Vision shard: probe it now (cheap, no GPU) so INFO tells serve the truth; it is read into pinned host memory on the first picture request, not at start

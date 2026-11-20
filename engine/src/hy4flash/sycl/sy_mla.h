@@ -59,5 +59,6 @@ void mla_vup(const half* ctx, const half* wv_b, const float* gate, half* o, int 
 
 // tuning knob: split-K aims for about this many work-groups (default 256)
 extern int g_mla_target_blocks;
+extern int g_mla_batch_invariant;  // see sy_mla.cpp: set by the speculative path (default 0; HY4S_BATCH_INV=0 keeps it off)
 
 }  // namespace hy4s

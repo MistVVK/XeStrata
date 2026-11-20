@@ -303,6 +303,7 @@ int main(int argc, char** argv) {
         const double io1 = io_read_gb();
         fprintf(stderr, "[io] prefill: SSD read %.2f GB in %.2f s = %.3f GB/s (storage reads of this process, experts + Engram; direct expert reads %.2f GB, pread misses %.2f GB, from page cache %.2f GB)\n", io1 - io0, t_pf, (io1 - io0) / std::max(t_pf, 1e-9), cx.direct_read_bytes() / 1e9, cx.miss_read_bytes() / 1e9, cx.cached_read_bytes() / 1e9);
         if (spec_mode) {
+            spec_set_batch_invariant();
             Spec sp(r, df, scfg);
             std::string gen_ids, finish, e2;
             int made = 0;
