@@ -116,10 +116,7 @@ __global__ void __launch_bounds__(256) k_write_kv(const float* __restrict__ kv_a
     __half h0 = __float2half(v0 * inv * norm_w[2 * tid]), h1 = __float2half(v1 * inv * norm_w[2 * tid + 1]);
     dst[2 * tid] = h0;
     dst[2 * tid + 1] = h1;
-    // transposed copy for the WMMA PV product: Vt[((slot>>2)*512 + c)*4 + (slot&3)]
-    __half* vt = cache + (size_t)cache_slots * MLA_ROW;
-    vt[((size_t)(slot >> 2) * MLA_KV_LORA + 2 * tid) * 4 + (slot & 3)] = h0;
-    vt[((size_t)(slot >> 2) * MLA_KV_LORA + 2 * tid + 1) * 4 + (slot & 3)] = h1;
+    (void)cache_slots;
     if (tid < 32) {
         float o0, o1;
         rope_pair(row[MLA_KV_LORA + 2 * tid], row[MLA_KV_LORA + 2 * tid + 1], pos, tid, theta, o0, o1);
@@ -241,6 +238,7 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     const int NH = a.NH, RT = NH / 16, h0 = rt * 16;
     __shared__ __align__(16) _Float16 sQ[16 * QP];
     __shared__ __align__(16) _Float16 sP[16 * PP];
+    __shared__ __align__(16) _Float16 sV[4][16][136];
     __shared__ float s_m[4][16], s_l[4][16];
     {
         const _Float16* qsrc = reinterpret_cast<const _Float16*>(qa) + ((size_t)t * NH + h0) * MLA_ROW;
@@ -262,7 +260,6 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     const int tb = sp * tps, te = min(ntiles, tb + tps);
     const int32_t* klist = a.keys + (size_t)t * a.kmax;
     const _Float16* rows = reinterpret_cast<const _Float16*>(cache);
-    const _Float16* vt = rows + (size_t)a.cache_slots * MLA_ROW;
 
     float mrun[8], lrun[8];
 #pragma unroll
@@ -306,21 +303,6 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
 #pragma unroll
             for (int i = 0; i < 8; ++i) s_m[w][2 * i + hi] = pm[i];
         }
-        // group base (slot >> 2) of the 16 key groups of the 4 PV k-steps (entry 4q of the tile)
-        int gidx[16];
-#pragma unroll
-        for (int q = 0; q < 16; ++q) {
-            int e = i0 + 4 * q;
-            int g = 0;
-            if (e < nk) {
-                int sl = mode == MLA_CAUSAL ? (a.ring > 0 ? e % a.ring : e) : (mode == MLA_WINDOW ? (lo_al + e) % a.ring : klist[e]);
-                g = sl >> 2;
-            }
-            gidx[q] = g;
-        }
-        int vv[16];  // valid keys (0..4) of each 4-key group of this tile
-#pragma unroll
-        for (int q = 0; q < 16; ++q) vv[q] = min(max(nk - (i0 + 4 * q), 0), 4);
         __syncthreads();
         float corr[8];
 #pragma unroll
@@ -355,31 +337,31 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         for (int c = 0; c < 8; ++c)
 #pragma unroll
             for (int i = 0; i < 8; ++i) o[c][i] *= corr[i];
-        // ---- P @ V  (this wave: columns 128w .. 128w+127)
+        // ---- P @ V  (this wave: columns 128w .. 128w+127; read row-major kv_cmpr into per-wave LDS and transpose in LDS)
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
+            const int kbase = i0 + 16 * ks;
+#pragma unroll
+            for (int rr = 0; rr < 8; ++rr) {
+                const int kk = 2 * rr + hi;
+                const int e = kbase + kk;
+                bool kv = e < nk;
+                if (mode == MLA_WINDOW) kv = kv && (lo_al + e >= lo);
+                uint4 vx = make_uint4(0u, 0u, 0u, 0u);
+                if (kv) {
+                    const int sl = mode == MLA_CAUSAL ? (a.ring > 0 ? e % a.ring : e) : (mode == MLA_WINDOW ? (lo_al + e) % a.ring : klist[e]);
+                    vx = *reinterpret_cast<const uint4*>(rows + (size_t)sl * MLA_ROW + 128 * w + l16 * 8);
+                }
+                *reinterpret_cast<uint4*>(&sV[w][kk][l16 * 8]) = vx;
+            }
             hv16 pf = ld_hv16(&sP[l16 * PP + ks * 16]);
-            const bool full = (vv[4 * ks + 0] >= 4) & (vv[4 * ks + 1] >= 4) & (vv[4 * ks + 2] >= 4) & (vv[4 * ks + 3] >= 4);  // uniform: only the last tile of a query has a partial group
-            if (full) {
 #pragma unroll
-                for (int ct = 0; ct < 8; ++ct) {
-                    const int c = 128 * w + 16 * ct + l16;
-                    uint2 b0 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 0] * MLA_KV_LORA + c) * 4);
-                    uint2 b1 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 1] * MLA_KV_LORA + c) * 4);
-                    uint2 b2 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2] * MLA_KV_LORA + c) * 4);
-                    uint2 b3 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 3] * MLA_KV_LORA + c) * 4);
-                    o[ct] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, pack_hv16(b0, b1, b2, b3), o[ct]);
-                }
-            } else {
+            for (int ct = 0; ct < 8; ++ct) {
+                const int col = 16 * ct + l16;
+                hv16 bf;
 #pragma unroll
-                for (int ct = 0; ct < 8; ++ct) {
-                    const int c = 128 * w + 16 * ct + l16;
-                    uint2 b0 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 0] * MLA_KV_LORA + c) * 4), vv[4 * ks + 0]);
-                    uint2 b1 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 1] * MLA_KV_LORA + c) * 4), vv[4 * ks + 1]);
-                    uint2 b2 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2] * MLA_KV_LORA + c) * 4), vv[4 * ks + 2]);
-                    uint2 b3 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 3] * MLA_KV_LORA + c) * 4), vv[4 * ks + 3]);
-                    o[ct] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, pack_hv16(b0, b1, b2, b3), o[ct]);
-                }
+                for (int kk = 0; kk < 16; ++kk) bf[kk] = sV[w][kk][col];
+                o[ct] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, bf, o[ct]);
             }
         }
         __syncthreads();
@@ -424,6 +406,7 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     const int NH = a.NH, RT = NH / 16, h0 = rt * 16;
     __shared__ __align__(16) half_t sQ[16 * QP];
     __shared__ __align__(16) half_t sP[16 * PP];
+    __shared__ __align__(16) half_t sV[4][16][136];
     __shared__ float s_m[4][16], s_l[4][16];
     {
         const half_t* qsrc = reinterpret_cast<const half_t*>(qa) + ((size_t)t * NH + h0) * MLA_ROW;
@@ -445,7 +428,6 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     const int tb = sp * tps, te = min(ntiles, tb + tps);
     const int32_t* klist = a.keys + (size_t)t * a.kmax;
     const half_t* rows = reinterpret_cast<const half_t*>(cache);
-    const half_t* vt = rows + (size_t)a.cache_slots * MLA_ROW;
 
     float mrun[2], lrun[2];
 #pragma unroll
@@ -510,19 +492,6 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
             s_m[w][g] = pm[0];
             s_m[w][g + 8] = pm[1];
         }
-        // group base (slot >> 2) of the 4 keys this lane feeds to each of the 4 PV k-steps: keys 4*(4*ks + c) .. +3 of the tile
-        int gidx[4], vv[4];  // vv: valid keys (0..4) of each 4-key group; the V halves of the others must not reach the mma (their P is 0, but the product alignment still sees their exponents)
-#pragma unroll
-        for (int ks = 0; ks < 4; ++ks) {
-            const int e = i0 + 4 * (4 * ks + c);
-            vv[ks] = min(max(nk - e, 0), 4);
-            int gg = 0;
-            if (e < nk) {
-                const int sl = mode == MLA_CAUSAL ? (a.ring > 0 ? e % a.ring : e) : (mode == MLA_WINDOW ? (lo_al + e) % a.ring : klist[e]);
-                gg = sl >> 2;
-            }
-            gidx[ks] = gg;
-        }
         __syncthreads();
         float corr[2];
 #pragma unroll
@@ -562,18 +531,38 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         for (int nt = 0; nt < 16; ++nt)
 #pragma unroll
             for (int e = 0; e < 4; ++e) oc[nt][e] *= corr[e >> 1];
-        // ---- P @ V  (this wave: columns 128w .. 128w+127 = 16 n8 tiles)
+        // ---- P @ V  (this wave: columns 128w .. 128w+127 = 16 n8 tiles; read row-major kv_cmpr into per-warp shared memory and transpose via ldmatrix.x2.trans)
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
-            const uint2 plo = *reinterpret_cast<const uint2*>(&sP[g * PP + ks * 16 + c4]);
-            const uint2 phi = *reinterpret_cast<const uint2*>(&sP[(g + 8) * PP + ks * 16 + c4]);
+            const int kbase = i0 + 16 * ks;
+            const int r_sub = lane >> 4, c_u4 = lane & 15;
+#pragma unroll
+            for (int rr = 0; rr < 8; ++rr) {
+                const int kk = 2 * rr + r_sub;
+                const int e = kbase + kk;
+                bool kv = e < nk;
+                if (mode == MLA_WINDOW) kv = kv && (lo_al + e >= lo);
+                uint4 vx = make_uint4(0u, 0u, 0u, 0u);
+                if (kv) {
+                    const int sl = mode == MLA_CAUSAL ? (a.ring > 0 ? e % a.ring : e) : (mode == MLA_WINDOW ? (lo_al + e) % a.ring : klist[e]);
+                    vx = *reinterpret_cast<const uint4*>(rows + (size_t)sl * MLA_ROW + 128 * w + c_u4 * 8);
+                }
+                *reinterpret_cast<uint4*>(&sV[w][kk][c_u4 * 8]) = vx;
+            }
+            __syncwarp();
+            // standard m16n8k16 A fragment layout matching ldmatrix.m8n8.x2.trans B fragment: k = {2c, 2c+1} and {8+2c, 8+2c+1}
+            const uint32_t a0 = *reinterpret_cast<const uint32_t*>(&sP[g * PP + ks * 16 + 2 * c]);
+            const uint32_t a1 = *reinterpret_cast<const uint32_t*>(&sP[(g + 8) * PP + ks * 16 + 2 * c]);
+            const uint32_t a2 = *reinterpret_cast<const uint32_t*>(&sP[g * PP + ks * 16 + 8 + 2 * c]);
+            const uint32_t a3 = *reinterpret_cast<const uint32_t*>(&sP[(g + 8) * PP + ks * 16 + 8 + 2 * c]);
 #pragma unroll
             for (int nt = 0; nt < 16; ++nt) {
-                const int col = 128 * w + 8 * nt + g;
-                uint2 b = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[ks] * MLA_KV_LORA + col) * 4);
-                if (vv[ks] < 4) b = vmask(b, vv[ks]);
-                mma_16816(oc[nt], plo.x, phi.x, plo.y, phi.y, b.x, b.y);
+                uint32_t b0, b1;
+                const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&sV[w][lane & 15][8 * nt]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n" : "=r"(b0), "=r"(b1) : "r"(addr));
+                mma_16816(oc[nt], a0, a1, a2, a3, b0, b1);
             }
+            __syncwarp();
         }
         __syncthreads();
     }
@@ -1046,7 +1035,7 @@ size_t mla_workspace_bytes(int M, int NH, int max_keys) {
     return (size_t)M * (NH / 16) * S * (16 * MLA_KV_LORA + 32) * sizeof(float);
 }
 
-size_t mla_cache_bytes(int slots) { return (size_t)slots * (MLA_ROW + MLA_KV_LORA) * sizeof(__half); }
+size_t mla_cache_bytes(int slots) { return (size_t)slots * MLA_ROW * sizeof(__half); }
 
 static int max_keys_of(const MlaAttnArgs& a) {
     if (a.mode == MLA_CAUSAL) return a.p0 + a.M;
