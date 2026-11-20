@@ -96,5 +96,6 @@ void mla_attention(hipStream_t s, const __half* qa, const __half* cache, const f
 // forces the simple reference-quality kernels (for tests / bisecting); default 0 = fast paths when available
 extern int g_mla_force_simple;
 extern int g_mla_target_blocks;  // decode split-K tuning: aim for this many blocks when M*NH/16 is small (default 192)
+extern int g_mla_batch_invariant;  // 1: for M <= 16 the split count is chosen as for M = 1 (fixed key partition per kv length: rows of a verify window sum in the same order as one-token decode)
 
 }  // namespace hy4

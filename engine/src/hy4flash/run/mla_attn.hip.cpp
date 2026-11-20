@@ -11,6 +11,7 @@ namespace hy4 {
 
 int g_mla_force_simple = 0;
 int g_mla_target_blocks = 192;
+int g_mla_batch_invariant = 0;
 
 namespace {
 
@@ -212,6 +213,16 @@ __device__ __forceinline__ hv16 pack_hv16(uint2 a, uint2 b, uint2 c, uint2 d) {
     return __builtin_bit_cast(hv16, v);
 }
 
+// V operand of the PV product: the 4 halves of a Vt group are the values of 4 consecutive slots; only the first v of them belong to keys of this query. The others (slots after the
+// query's position: rows of later tokens of the same chunk, or stale rows) have probability exactly 0, but the matrix core's product alignment still sees their exponents, so they must
+// not reach the instruction at all (otherwise row t of a chunk depends on the tokens after it, at 1e-7 level, and a verify window differs from one-token decode).
+__device__ __forceinline__ uint2 vmask(uint2 b, int v) {
+    if (v >= 4) return b;
+    if (v <= 0) return make_uint2(0u, 0u);
+    if (v == 1) return make_uint2(b.x & 0xFFFFu, 0u);
+    if (v == 2) return make_uint2(b.x, 0u);
+    return make_uint2(b.x, b.y & 0xFFFFu);
+}
 __device__ __forceinline__ fv8 fv8_zero() { return fv8{0, 0, 0, 0, 0, 0, 0, 0}; }
 __device__ __forceinline__ int acc_m(int r, int lane) { return 2 * r + (lane >> 4); }
 __device__ __forceinline__ int acc_n(int r, int lane) { return lane & 15; }
@@ -306,6 +317,9 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
             }
             gidx[q] = g;
         }
+        int vv[16];  // valid keys (0..4) of each 4-key group of this tile
+#pragma unroll
+        for (int q = 0; q < 16; ++q) vv[q] = min(max(nk - (i0 + 4 * q), 0), 4);
         __syncthreads();
         float corr[8];
 #pragma unroll
@@ -344,14 +358,27 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
             hv16 pf = ld_hv16(&sP[l16 * PP + ks * 16]);
+            const bool full = (vv[4 * ks + 0] >= 4) & (vv[4 * ks + 1] >= 4) & (vv[4 * ks + 2] >= 4) & (vv[4 * ks + 3] >= 4);  // uniform: only the last tile of a query has a partial group
+            if (full) {
 #pragma unroll
-            for (int ct = 0; ct < 8; ++ct) {
-                const int c = 128 * w + 16 * ct + l16;
-                uint2 b0 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 0] * MLA_KV_LORA + c) * 4);
-                uint2 b1 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 1] * MLA_KV_LORA + c) * 4);
-                uint2 b2 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2] * MLA_KV_LORA + c) * 4);
-                uint2 b3 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 3] * MLA_KV_LORA + c) * 4);
-                o[ct] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, pack_hv16(b0, b1, b2, b3), o[ct]);
+                for (int ct = 0; ct < 8; ++ct) {
+                    const int c = 128 * w + 16 * ct + l16;
+                    uint2 b0 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 0] * MLA_KV_LORA + c) * 4);
+                    uint2 b1 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 1] * MLA_KV_LORA + c) * 4);
+                    uint2 b2 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2] * MLA_KV_LORA + c) * 4);
+                    uint2 b3 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 3] * MLA_KV_LORA + c) * 4);
+                    o[ct] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, pack_hv16(b0, b1, b2, b3), o[ct]);
+                }
+            } else {
+#pragma unroll
+                for (int ct = 0; ct < 8; ++ct) {
+                    const int c = 128 * w + 16 * ct + l16;
+                    uint2 b0 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 0] * MLA_KV_LORA + c) * 4), vv[4 * ks + 0]);
+                    uint2 b1 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 1] * MLA_KV_LORA + c) * 4), vv[4 * ks + 1]);
+                    uint2 b2 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2] * MLA_KV_LORA + c) * 4), vv[4 * ks + 2]);
+                    uint2 b3 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 3] * MLA_KV_LORA + c) * 4), vv[4 * ks + 3]);
+                    o[ct] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, pack_hv16(b0, b1, b2, b3), o[ct]);
+                }
             }
         }
         __syncthreads();
@@ -616,7 +643,7 @@ __global__ void __launch_bounds__(256) k_combine(const float* __restrict__ part,
 
 int choose_splits(int M, int NH, int max_keys) {
     const int RT = NH / 16;
-    const int base = M * RT;
+    const int base = ((g_mla_batch_invariant && M <= 16) ? 1 : M) * RT;  // batch invariant: the split count of a decode window is the one of a single token (same partition and summation order for every M)
     if (base >= g_mla_target_blocks) return 1;
     const int ntiles = (max_keys + FBK - 1) / FBK;
     int S = (g_mla_target_blocks + base - 1) / base;
