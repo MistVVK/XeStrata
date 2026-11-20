@@ -672,7 +672,10 @@ public:
             const size_t per = (size_t)T * 16;
             auto fetch_modules = [&](int m0, int m1) -> bool {
                 std::vector<uint64_t> ids((size_t)(m1 - m0) * per);
-                for (int mo = m0; mo < m1; ++mo) engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data() + (size_t)(mo - m0) * per, e->valid + (size_t)mo * Tc * 16);
+                for (int mo = m0; mo < m1; ++mo) {
+                    engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data() + (size_t)(mo - m0) * per, e->valid + (size_t)mo * Tc * 16);
+                    if (vis) vis->mask_engram(e->valid + (size_t)mo * Tc * 16, p0, T);  // HY4-VISION hook (merge: the tuned decode path needs it too)
+                }
                 std::vector<uint8_t> tmp(ids.size() * 100);
                 if (!eio.fetch_raw(ids.data(), ids.size(), tmp.data(), err)) return false;
                 for (int mo = m0; mo < m1; ++mo) std::memcpy(e->raw + (size_t)mo * Tc * 16 * 100, tmp.data() + (size_t)(mo - m0) * per * 100, per * 100);
