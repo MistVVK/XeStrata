@@ -68,13 +68,13 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
         const char* v = strata::env_get("PROMPT_ATTN_MMA");
         return v != nullptr && std::strtol(v, nullptr, 10) == 0;
     }();
-    // RDNA3 and RDNA4: the shared attention's WMMA form (flash_attn.hpp), which these GPUs' FMA form is far behind;
+    // the WMMA form (RDNA3 and RDNA4): the shared attention's (flash_attn.hpp), which these GPUs' FMA form is far behind;
     // elsewhere its FMA form (FP32 FMAs, K and V from FP16)
     QsaAttnPools pools;
     pools.k_pool = k_pool;
     pools.v_pool = v_pool;
     pools.page_table = page_table;
-    if (!no_mma && xe::amd_wmma(queue.get_device())) {
+    if (!no_mma && has_form(queue.get_device(), MatrixForm::wmma)) {
         if (!flash_pools(queue, q, pools, kFmtF16, pos0, T, s, attn, window)) return false;
     } else {
         FlashAttnArgs a;

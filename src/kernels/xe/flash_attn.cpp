@@ -1335,7 +1335,7 @@ struct PromptAttn {
 #endif
     }
     // the large register file, which holds q, the output and the chunk's tiles: the default one ran 30 ms against 21
-    // (B70, int8, 2,048 queries over 32K cells).  The caller runs this kernel only where xmx_available(), which
+    // (B70, int8, 2,048 queries over 32K cells).  The caller runs this kernel only where has_form(xmx_f16), which
     // requires the mode
     auto get(syclex::properties_tag) const {
         return syclex::properties{sycl::ext::intel::experimental::grf_size<256>, syclex::sub_group_size<SGS>};
@@ -1987,7 +1987,7 @@ bool batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const 
     const size_t slm = queue.get_device().get_info<sycl::info::device::local_mem_size>();
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
-    if (!xmx_available(XmxType::f16)) {
+    if (!has_form(queue.get_device(), MatrixForm::xmx_f16)) {
         // the portable kernel: FP16, INT8 and K8V4 pools (Q4_0 K keeps the FP32 kernel)
         static core::PerDevice<bool> per_device;
         const bool mma = per_device.get(queue.get_device(), [&queue, slm] {

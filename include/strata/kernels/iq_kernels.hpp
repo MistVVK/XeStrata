@@ -142,8 +142,8 @@ constexpr int kIqGemmTileRows = 256;
 /// rows of Y (`ldy` floats apart).  With `interleave` (N / 2) the matrix is gate rows then up rows and Y's columns
 /// alternate gate, up (iq_dequant_gu_f16's layout).  The weights are dequantized in local memory to the FP16 values
 /// iq_dequant_f16 writes, so Y is that of dequantizing and multiplying with xmx_gemm_grouped (the same bits), without
-/// the dequantized weights in memory.  `max_rows`: the most rows an expert has.  Needs XMX for FP16
-/// (xmx_available).
+/// the dequantized weights in memory.  `max_rows`: the most rows an expert has.  Needs the f16_from_blocks
+/// form (matrix_report.hpp).
 void iq_gemm_grouped_f16(int ggml_type, const uint16_t* X, const void* const* W, int64_t interleave, float* Y,
                          int64_t ldy, const int32_t* bounds, int G, int64_t max_rows, int64_t N, int64_t K,
                          void* stream);

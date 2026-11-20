@@ -102,7 +102,7 @@ template<> struct Path<3> { using Ops = Wm; };
 // STRATA_NO_XMX=1)
 inline int path(const sycl::device& d) {
     if (no_xmx()) return -1;
-    if (amd_wmma(d)) return 3;
+    if (has_form(d, MatrixForm::wmma)) return 3;
     struct S { int m, n, k, sg; };
     const S shapes[] = {{8, 16, 16, 16}, {8, 8, 16, 8}, {16, 16, 16, 32}};
     for (int i = 0; i < 3; ++i) {

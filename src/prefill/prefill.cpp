@@ -45,6 +45,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/flash_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/matrix_report.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/iq_mmq.hpp"
@@ -1286,7 +1287,7 @@ const MmqPlan& mmq_plan() {
             launches.f16_group = std::min(MMQ_GROUP, g_expert_group);
             launches.int8_gathers = true;
             p.int8_below = mmq::int8_rows_below(lay.fmt[(size_t) first], (size_t) lay.blob_bytes(first),
-                                                 strata::kernels::xmx_available(strata::kernels::XmxType::f16) ? 0 : INT64_MAX,
+                                                 strata::kernels::has_form(strata::kernels::MatrixForm::f16_grouped) ? 0 : INT64_MAX,
                                                  launches);
             if (p.int8_below == 0 && !p.canon) {   // FP16 at every size
                 p = MmqPlan{};
@@ -1347,7 +1348,7 @@ bool bih3_prompt_f16(int64_t rows, int64_t experts) {
         return v == nullptr || v[0] == '\0' ? -1 : (int) std::strtol(v, nullptr, 10);
     }();
     if (env >= 0) return env != 0;
-    return strata::kernels::xmx_available(strata::kernels::XmxType::f16) && rows >= kBih3F16Rows * experts;
+    return strata::kernels::has_form(strata::kernels::MatrixForm::f16_grouped) && rows >= kBih3F16Rows * experts;
 }
 size_t bih3_meta_ints(size_t T, int64_t k, int64_t n_expert) { return (size_t) (6 * n_expert + 2) + T * (size_t) k; }
 
@@ -3505,7 +3506,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }();
                         const strata::kernels::cpu::NativeFmt* ffmt = lay.native ? &lay.fmt[(size_t) l] : nullptr;
                         const bool fuse_res = fused_on && !lay.mixed() && !use_mmq && ffmt != nullptr && m.host_res && m.cache &&
-                                              strata::kernels::xmx_available(strata::kernels::XmxType::f16) &&
+                                              strata::kernels::has_form(strata::kernels::MatrixForm::f16_from_blocks) &&
                                               ffmt->up_off == (size_t) ffmt->n_ff * ffmt->gu_row &&
                                               strata::kernels::iq_gemm_grouped_ok(ffmt->gu_type, 2 * ffmt->n_ff, ffmt->n_embd) &&
                                               strata::kernels::iq_gemm_grouped_ok(ffmt->d_type, ffmt->n_embd, ffmt->n_ff);

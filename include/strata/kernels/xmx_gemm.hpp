@@ -13,7 +13,7 @@ enum class XmxType { f16, bf16 };
 
 /// Whether the compute device runs the XMX kernels for inputs of type `t` (joint_matrix 8 x 16 x 16 with FP32
 /// accumulators and 16-wide sub-groups, as it reports them; STRATA_NO_XMX=1 says no).  Without them the products run
-/// through DP4a, and other kernels on the matrix engines (the prompt attention) take their own paths.
+/// through DP4a.  For matrix_report's has_form: a path asks for its form there.
 bool xmx_available(XmxType t);
 
 /// Whether the compute device runs FP16 products on its matrix engines (the XMX kernels, or mma_gemm's joint_matrix).
