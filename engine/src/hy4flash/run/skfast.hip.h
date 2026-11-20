@@ -258,10 +258,11 @@ inline void linear_h_gemv(hipStream_t s, int fmt, const void* W, int N, int K, c
     }
 }
 
-// ---- several GEMVs with the same activations and the same format in one launch. Build once at load time, call per token.
+// ---- several GEMVs with the same activations and the same format in one launch. Build once at load time, call per token (1 <= M <= 16).
 struct LinMulti {
-    skd::LinJob* d_jobs = nullptr;
-    int njobs = 0, total_blocks = 0, K = 0, fmt = 0;
+    skd::LinJob* d_jobs = nullptr;   // RW = 2 (used for M <= 4)
+    skd::LinJob* d_jobs1 = nullptr;  // RW = 1 (used for M >= 5, matches gemv_by_m low-VGPR path)
+    int njobs = 0, total_blocks = 0, total_blocks1 = 0, K = 0, fmt = 0;
 };
 
 inline LinMulti linear_multi_build(int fmt, int K, int n, const void* const* W, float* const* Y, const int* N) {
@@ -269,35 +270,40 @@ inline LinMulti linear_multi_build(int fmt, int K, int n, const void* const* W, 
     d.fmt = fmt;
     d.K = K;
     d.njobs = n;
-    skd::LinJob h[16];
-    int blk = 0;
+    skd::LinJob h2[16], h1[16];
+    int blk2 = 0, blk1 = 0;
     for (int i = 0; i < n && i < 16; ++i) {
-        h[i].W = (const uint8_t*)W[i];
-        h[i].Y = Y[i];
-        h[i].N = N[i];
-        h[i].blk0 = blk;
-        blk += (N[i] + 15) / 16;  // RW = 2 rows per wave, 8 waves per block
+        h2[i].W = h1[i].W = (const uint8_t*)W[i];
+        h2[i].Y = h1[i].Y = Y[i];
+        h2[i].N = h1[i].N = N[i];
+        h2[i].blk0 = blk2;
+        h1[i].blk0 = blk1;
+        blk2 += (N[i] + 15) / 16;  // RW = 2 rows per wave, 8 waves per block
+        blk1 += (N[i] + 7) / 8;    // RW = 1 row per wave, 8 waves per block
     }
-    d.total_blocks = blk;
+    d.total_blocks = blk2;
+    d.total_blocks1 = blk1;
     if (hipMalloc((void**)&d.d_jobs, sizeof(skd::LinJob) * n) != hipSuccess) abort();
-    if (hipMemcpy(d.d_jobs, h, sizeof(skd::LinJob) * n, hipMemcpyHostToDevice) != hipSuccess) abort();
+    if (hipMemcpy(d.d_jobs, h2, sizeof(skd::LinJob) * n, hipMemcpyHostToDevice) != hipSuccess) abort();
+    if (hipMalloc((void**)&d.d_jobs1, sizeof(skd::LinJob) * n) != hipSuccess) abort();
+    if (hipMemcpy(d.d_jobs1, h1, sizeof(skd::LinJob) * n, hipMemcpyHostToDevice) != hipSuccess) abort();
     return d;
 }
 inline void linear_multi_free(LinMulti& d) {
     if (d.d_jobs) (void)hipFree(d.d_jobs);
-    d.d_jobs = nullptr;
+    if (d.d_jobs1) (void)hipFree(d.d_jobs1);
+    d.d_jobs = d.d_jobs1 = nullptr;
 }
 
 namespace skd {
 template <int FMT>
 inline void multi_by_m(hipStream_t s, const LinMulti& d, const __half* X, int M) {
-#define HY4_MULTI(MT) hipLaunchKernelGGL((k_gemv_multi<FMT, MT, 2>), dim3(d.total_blocks), dim3(256), 0, s, d.d_jobs, d.njobs, d.K, X, M)
-    if (M <= 1) { HY4_MULTI(1); }
-    else if (M <= 2) { HY4_MULTI(2); }
-    else if (M <= 4) { HY4_MULTI(4); }
-    else if (M <= 8) { HY4_MULTI(8); }
-    else { HY4_MULTI(16); }
-#undef HY4_MULTI
+    if (M <= 1) hipLaunchKernelGGL((k_gemv_multi<FMT, 1, 2>), dim3(d.total_blocks), dim3(256), 0, s, d.d_jobs, d.njobs, d.K, X, M);
+    else if (M <= 2) hipLaunchKernelGGL((k_gemv_multi<FMT, 2, 2>), dim3(d.total_blocks), dim3(256), 0, s, d.d_jobs, d.njobs, d.K, X, M);
+    else if (M <= 4) hipLaunchKernelGGL((k_gemv_multi<FMT, 4, 2>), dim3(d.total_blocks), dim3(256), 0, s, d.d_jobs, d.njobs, d.K, X, M);
+    else if (M <= 6) hipLaunchKernelGGL((k_gemv_multi<FMT, 6, 1>), dim3(d.total_blocks1), dim3(256), 0, s, d.d_jobs1, d.njobs, d.K, X, M);
+    else if (M <= 8) hipLaunchKernelGGL((k_gemv_multi<FMT, 8, 1>), dim3(d.total_blocks1), dim3(256), 0, s, d.d_jobs1, d.njobs, d.K, X, M);
+    else hipLaunchKernelGGL((k_gemv_multi<FMT, 16, 1>), dim3(d.total_blocks1), dim3(256), 0, s, d.d_jobs1, d.njobs, d.K, X, M);
 }
 }  // namespace skd
 

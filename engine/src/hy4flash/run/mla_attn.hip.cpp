@@ -799,6 +799,69 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
         }
     }
 }
+
+#if !HY4_CUDA
+// Single-pass gfx1151 WMMA kernels for prefill: each block reads q_b (prep_q) or ctx (vup) ONCE instead of 8x / 4x across N tiles.
+// Block ordering (NH, M/BM) keeps all heads of one token tile contiguous in L2/MALL.
+__global__ void __launch_bounds__(256) k_head_gemm_prep_q(const float* __restrict__ q_b, const __half* __restrict__ wk_bt, __half* __restrict__ qa, int M, int NH, int p0, float theta) {
+    __shared__ __align__(16) _Float16 sA[64 * 200];  // 25.6 KB: entire [64 tokens][192 nope] loaded once
+    __shared__ __align__(16) _Float16 sB[64 * 40];   //  5.1 KB: [64 out cols][32 k] chunk (total 30.7 KB < 32 KB -> 2 blk/CU)
+    const int h = blockIdx.x, t0 = blockIdx.y * 64;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15;
+    const int wm = wave & 1, wn = wave >> 1;  // 2 x 4 waves -> wave owns 32 tokens x 16 cols
+    // 1. Load q_b[t0..t0+63][h][0..191] once into sA
+#pragma unroll
+    for (int i = 0; i < 12; ++i) {
+        const int idx = tid + 256 * i, r = idx / 48, c4 = (idx - r * 48) * 4;
+        const int t = min(t0 + r, M - 1);
+        const float4 v = *reinterpret_cast<const float4*>(q_b + ((size_t)t * NH + h) * MLA_QHEAD + c4);
+        _Float16* d = &sA[r * 200 + c4];
+        d[0] = (_Float16)v.x; d[1] = (_Float16)v.y; d[2] = (_Float16)v.z; d[3] = (_Float16)v.w;
+    }
+    // 2. Write rope(q_pe) for these 64 tokens
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int idx = tid + 256 * i, tt = idx >> 5, p = idx & 31, t = t0 + tt;
+        if (t < M) {
+            const float* qp = q_b + ((size_t)t * NH + h) * MLA_QHEAD + MLA_NOPE + 2 * p;
+            float o0, o1;
+            rope_pair(qp[0], qp[1], p0 + t, p, theta, o0, o1);
+            *reinterpret_cast<__half2*>(qa + ((size_t)t * NH + h) * MLA_ROW + MLA_KV_LORA + 2 * p) = __floats2half2_rn(o0, o1);
+        }
+    }
+    __syncthreads();
+    const int br = tid >> 2, bc = (tid & 3) * 8;
+    const _Float16* Bhead = reinterpret_cast<const _Float16*>(wk_bt) + (size_t)h * MLA_KV_LORA * MLA_NOPE;
+    for (int n0 = 0; n0 < MLA_KV_LORA; n0 += 64) {
+        const _Float16* B = Bhead + (size_t)n0 * MLA_NOPE;
+        fv8 acc0 = fv8{}, acc1 = fv8{};
+        uint4 vb = *reinterpret_cast<const uint4*>(B + (size_t)br * MLA_NOPE + bc);
+#pragma unroll
+        for (int k0 = 0; k0 < MLA_NOPE; k0 += 32) {
+            *reinterpret_cast<uint4*>(&sB[br * 40 + bc]) = vb;
+            __syncthreads();
+            if (k0 + 32 < MLA_NOPE) vb = *reinterpret_cast<const uint4*>(B + (size_t)br * MLA_NOPE + k0 + 32 + bc);
+#pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                hv16 a0 = ld_hv16(&sA[(wm * 32 + l16) * 200 + k0 + kk * 16]);
+                hv16 a1 = ld_hv16(&sA[(wm * 32 + 16 + l16) * 200 + k0 + kk * 16]);
+                hv16 b0 = ld_hv16(&sB[(wn * 16 + l16) * 40 + kk * 16]);
+                acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc0);
+                acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b0, acc1);
+            }
+            __syncthreads();
+        }
+        const int col = n0 + wn * 16 + l16;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int r0 = t0 + wm * 32 + acc_m(e, lane);
+            if (r0 < M) qa[((size_t)r0 * NH + h) * MLA_ROW + col] = __float2half(acc0[e]);
+            const int r1 = r0 + 16;
+            if (r1 < M) qa[((size_t)r1 * NH + h) * MLA_ROW + col] = __float2half(acc1[e]);
+        }
+    }
+}
+#endif  // !HY4_CUDA
 #endif  // HY4_MMA
 // ---- 4. v up-projection + gate -----------------------------------------------------------------------------------------------------------------------
 template <int TT>
@@ -1122,7 +1185,11 @@ void mla_transpose_wk(hipStream_t s, const __half* wk_b, __half* wk_bt, int NH) 
 }
 
 void mla_prep_q_t(hipStream_t s, const float* q_b, const __half* wk_bt, __half* qa, int M, int NH, int p0, float theta) {
+#if !HY4_CUDA
+    hipLaunchKernelGGL(k_head_gemm_prep_q, dim3(NH, (M + 63) / 64), dim3(256), 0, s, q_b, wk_bt, qa, M, NH, p0, theta);
+#else
     hipLaunchKernelGGL(k_head_gemm<0>, dim3(MLA_KV_LORA / HG_BN, NH, (M + HG_BM - 1) / HG_BM), dim3(256), 0, s, (const void*)q_b, wk_bt, (const float*)nullptr, qa, M, NH, p0, theta);
+#endif
 }
 #endif
 

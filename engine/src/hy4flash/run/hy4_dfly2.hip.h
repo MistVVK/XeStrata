@@ -110,52 +110,97 @@ __device__ __forceinline__ uint32_t dfly_f2key(float f) {
     uint32_t b = __float_as_uint(f);
     return b ^ ((b >> 31) ? 0xFFFFFFFFu : 0x80000000u);
 }
-// top-N ids of one logits row (block of 1024): threshold search on the order-preserving key, then emit every id with key >= thr until N are written
+// top-N ids of one logits row (block of 1024): 4-pass MSB-first 8-bit radix select (8x faster than 33-round binary search), then emit all > thr followed by == thr up to N
 __global__ void __launch_bounds__(1024) k_dfly_topn(const float* __restrict__ logits, int V, int N, int32_t* __restrict__ cand) {
-    __shared__ int red[32];
+    __shared__ int hist[256];
+    __shared__ uint32_t prefix_s;
+    __shared__ int need_s;
     __shared__ int cnt;
     __shared__ uint32_t thr_s;
     const float* lg = logits + (size_t)blockIdx.x * V;
     int32_t* out = cand + (size_t)blockIdx.x * N;
-    uint32_t lo = 0, hi = 0xFFFFFFFFu;
-    for (int it = 0; it < 33 && lo < hi; ++it) {
-        const uint32_t mid = (uint32_t)(lo + (((uint64_t)hi - lo + 1) >> 1));
-        int c = 0;
-        for (int i = threadIdx.x; i < V; i += blockDim.x) c += dfly_f2key(lg[i]) >= mid ? 1 : 0;
-        for (int o = 16; o > 0; o >>= 1) c += __shfl_xor(c, o);
+    if (threadIdx.x == 0) { prefix_s = 0; need_s = N; }
+    __syncthreads();
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8 * pass;
+        if (threadIdx.x < 256) hist[threadIdx.x] = 0;
         __syncthreads();
-        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = c;
+        const uint32_t pre = prefix_s;
+        for (int i = threadIdx.x; i < V; i += 1024) {
+            const uint32_t k = dfly_f2key(lg[i]);
+            if (pass == 0 || (k >> (shift + 8)) == (pre >> (shift + 8))) atomicAdd(&hist[(k >> shift) & 255u], 1);
+        }
         __syncthreads();
-        int tot = 0;
-        for (int w = 0; w < 32; ++w) tot += red[w];
-        if (tot >= N) lo = mid; else hi = mid - 1;
+        if (threadIdx.x == 0) {
+            int acc = 0, d = 255;
+            const int need = need_s;
+            for (; d > 0; --d) {
+                if (acc + hist[d] >= need) break;
+                acc += hist[d];
+            }
+            need_s = need - acc;
+            prefix_s = pre | ((uint32_t)d << shift);
+        }
         __syncthreads();
     }
-    if (threadIdx.x == 0) { thr_s = lo; cnt = 0; }
+    if (threadIdx.x == 0) { thr_s = prefix_s; cnt = 0; }
     __syncthreads();
     const uint32_t thr = thr_s;
-    for (int i = threadIdx.x; i < V; i += blockDim.x)
-        if (dfly_f2key(lg[i]) >= thr) {
+    for (int i = threadIdx.x; i < V; i += 1024) {
+        if (dfly_f2key(lg[i]) > thr) {
             const int s = atomicAdd(&cnt, 1);
             if (s < N) out[s] = i;
         }
-}
-
-// score[k] = lm_head row cand[k] . h   (lm_head S8_K [V][3072], row = 12 super-blocks of 262 B); one wave per candidate
-__global__ void __launch_bounds__(32) k_dfly_cand_score(const uint8_t* __restrict__ W, const int32_t* __restrict__ cand, const __half* __restrict__ h, float* __restrict__ score) {
-    const uint8_t* row = W + (size_t)cand[blockIdx.x] * 12 * 262;
-    const int lane = threadIdx.x;
-    float acc = 0;
-    for (int sb = 0; sb < 12; ++sb) {
-        const uint8_t* blk = row + sb * 262;
-        const float D = fp16_bits_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
-        for (int i = lane; i < 256; i += 32) {
-            const float eff = D * ((float)blk[2 + (i >> 6)] / 255.0f);
-            acc += (float)(int8_t)blk[6 + i] * eff * __half2float(h[sb * 256 + i]);
+    }
+    __syncthreads();
+    if (cnt < N) {
+        for (int i = threadIdx.x; i < V; i += 1024) {
+            if (dfly_f2key(lg[i]) == thr) {
+                const int s = atomicAdd(&cnt, 1);
+                if (s < N) out[s] = i;
+            }
         }
     }
+}
+
+// score[k] = lm_head row cand[k] . h   (lm_head S8_K [V][3072], row = 12 super-blocks of 262 B); 8 waves per block share h[3072] in LDS (6 KB) + packed fdot2
+__global__ void __launch_bounds__(256) k_dfly_cand_score(const uint8_t* __restrict__ W, const int32_t* __restrict__ cand, const __half* __restrict__ h, float* __restrict__ score, int N) {
+    __shared__ __align__(16) uint4 sh[384];
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const uint4* h4 = reinterpret_cast<const uint4*>(h);
+    for (int i = tid; i < 384; i += 256) sh[i] = h4[i];
+    __syncthreads();
+    const int k = blockIdx.x * 8 + wave;
+    if (k >= N) return;
+    const uint8_t* row = W + (size_t)cand[k] * 12 * 262;
+    const uint32_t mag = h2_splat(1152.0f);
+    float acc = 0.f;
+#pragma unroll 4
+    for (int sb = 0; sb < 12; ++sb) {
+        const uint8_t* blk = row + sb * 262;
+        uint16_t dbits;
+        memcpy(&dbits, blk, 2);
+        const float eff = __half2float(__ushort_as_half(dbits)) * ((float)blk[2 + (lane >> 3)] * (1.0f / 255.0f));
+        uint32_t d0, d1;
+        memcpy(&d0, blk + 6 + 8 * lane, 4);
+        memcpy(&d1, blk + 6 + 8 * lane + 4, 4);
+        const uint32_t q0 = ((d0) & 0xFFu) ^ 0x80u, q1 = ((d0 >> 8) & 0xFFu) ^ 0x80u;
+        const uint32_t q2 = ((d0 >> 16) & 0xFFu) ^ 0x80u, q3 = ((d0 >> 24) & 0xFFu) ^ 0x80u;
+        const uint32_t q4 = ((d1) & 0xFFu) ^ 0x80u, q5 = ((d1 >> 8) & 0xFFu) ^ 0x80u;
+        const uint32_t q6 = ((d1 >> 16) & 0xFFu) ^ 0x80u, q7 = ((d1 >> 24) & 0xFFu) ^ 0x80u;
+        const uint32_t w0 = h2_sub(0x64006400u | q0 | (q1 << 16), mag);
+        const uint32_t w1 = h2_sub(0x64006400u | q2 | (q3 << 16), mag);
+        const uint32_t w2 = h2_sub(0x64006400u | q4 | (q5 << 16), mag);
+        const uint32_t w3 = h2_sub(0x64006400u | q6 | (q7 << 16), mag);
+        const uint4 xv = sh[sb * 32 + lane];
+        float p = h2_dot_f32(w0, xv.x, 0.f);
+        p = h2_dot_f32(w1, xv.y, p);
+        p = h2_dot_f32(w2, xv.z, p);
+        p = h2_dot_f32(w3, xv.w, p);
+        acc += eff * p;
+    }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor(acc, o);
-    if (lane == 0) score[blockIdx.x] = acc;
+    if (lane == 0) score[k] = acc;
 }
 __global__ void __launch_bounds__(1024) k_dfly_cand_argmax(const float* __restrict__ score, const int32_t* __restrict__ cand, int N, int32_t* __restrict__ out) {
     __shared__ float sv[32];
@@ -200,6 +245,8 @@ struct DFly2 {
     int32_t *h_bids = nullptr, *h_chain = nullptr;  // pinned
     float* h_conf = nullptr;
     int lstride = 0;
+    LinMulti lm_attn[5], lm_mlp[5], lm_hc;
+    int attn_fuse[5] = {}, mlp_fuse[5] = {};
     // stats
     double t_draft = 0;
     long n_draft = 0;
@@ -249,6 +296,49 @@ struct DFly2 {
         HCK(hipHostMalloc((void**)&h_bids, 64, hipHostMallocDefault));
         HCK(hipHostMalloc((void**)&h_chain, 64, hipHostMallocDefault));
         HCK(hipHostMalloc((void**)&h_conf, 64, hipHostMallocDefault));
+        // build LinMulti tables for drafter layers + hidden_correction
+        const std::string pf = "model.dfly_layers.";
+        for (int d = 0; d < 5; ++d) {
+            const std::string pa = pf + std::to_string(d) + ".self_attn";
+            const TInfo& tq = r.ti(pa + ".q_a_proj.weight");
+            const TInfo& tk = r.ti(pa + ".kv_a_proj_with_mqa.weight");
+            const TInfo& tg = r.ti(pa + ".linear_gate.weight");
+            if (tq.fmt != FMT_Q8ROW && tq.fmt == tk.fmt && tq.cols() == HID && tk.cols() == HID) {
+                if (tg.fmt == tq.fmt && tg.cols() == HID) {
+                    const void* W[3] = {r.tw(pa + ".q_a_proj.weight"), r.tw(pa + ".kv_a_proj_with_mqa.weight"), r.tw(pa + ".linear_gate.weight")};
+                    float* Y[3] = {F1, F3, F4};
+                    int N[3] = {(int)tq.rows(), (int)tk.rows(), (int)tg.rows()};
+                    lm_attn[d] = linear_multi_build(tq.fmt, HID, 3, W, Y, N);
+                    attn_fuse[d] = 3;
+                } else {
+                    const void* W[2] = {r.tw(pa + ".q_a_proj.weight"), r.tw(pa + ".kv_a_proj_with_mqa.weight")};
+                    float* Y[2] = {F1, F3};
+                    int N[2] = {(int)tq.rows(), (int)tk.rows()};
+                    lm_attn[d] = linear_multi_build(tq.fmt, HID, 2, W, Y, N);
+                    attn_fuse[d] = 2;
+                }
+            }
+            const std::string pm = pf + std::to_string(d) + ".mlp";
+            const TInfo& t0 = r.ti(pm + ".gate_proj.weight");
+            const TInfo& t1 = r.ti(pm + ".up_proj.weight");
+            if (t0.fmt != FMT_Q8ROW && t0.fmt == t1.fmt && t0.cols() == HID && t1.cols() == HID) {
+                const void* W[2] = {r.tw(pm + ".gate_proj.weight"), r.tw(pm + ".up_proj.weight")};
+                float* Y[2] = {F1, F2};
+                int N[2] = {(int)t0.rows(), (int)t1.rows()};
+                lm_mlp[d] = linear_multi_build(t0.fmt, HID, 2, W, Y, N);
+                mlp_fuse[d] = 2;
+            }
+        }
+        {
+            const TInfo& tg = r.ti(pf + "hidden_correction.gate_proj.weight");
+            const TInfo& tu = r.ti(pf + "hidden_correction.up_proj.weight");
+            if (tg.fmt != FMT_Q8ROW && tg.fmt == tu.fmt && tg.cols() == 2 * HID && tu.cols() == 2 * HID) {
+                const void* W[2] = {r.tw(pf + "hidden_correction.gate_proj.weight"), r.tw(pf + "hidden_correction.up_proj.weight")};
+                float* Y[2] = {G, U};
+                int N[2] = {(int)tg.rows(), (int)tu.rows()};
+                lm_hc = linear_multi_build(tg.fmt, 2 * HID, 2, W, Y, N);
+            }
+        }
         ok = true;
         return true;
     }
@@ -303,14 +393,16 @@ struct DFly2 {
                 dcache = shadow[d];
             }
             hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + std::to_string(d) + ".input_layernorm.weight"), (float*)nullptr, hn, HID, c.rms_eps);
-            if (!(skip & 32)) r.lin(pa + ".q_a_proj.weight", hn, F1, B);  // [B][1024]
+            const int daf = (!(skip & 32) && lm_attn[d].d_jobs) ? attn_fuse[d] : 0;
+            if (daf > 0) linear_h_multi(st, lm_attn[d], hn, B);
+            else if (!(skip & 32)) r.lin(pa + ".q_a_proj.weight", hn, F1, B);  // [B][1024]
             hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps);
             if (!(skip & 32)) r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);  // [B][8192]
-            if (!(skip & 32)) r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);  // [B][576]
+            if (daf == 0 && !(skip & 32)) r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);  // [B][576]
             if (!(skip & 8)) mla_write_kv(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, a, 0, (float)c.theta_sparse, c.rms_eps);
             const int kvfmt = r.ti(pa + ".kv_b_proj.weight").fmt;
             if (!(skip & 8)) mla_prep_q_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), F2, qa_h, B, 32, a, (float)c.theta_sparse);
-            if (!(skip & 32)) r.lin(pa + ".linear_gate.weight", hn, F4, B);  // [B][8192]
+            if (daf < 3 && !(skip & 32)) r.lin(pa + ".linear_gate.weight", hn, F4, B);  // [B][8192]
             MlaAttnArgs ma;
             ma.M = B;
             ma.NH = 32;
@@ -332,8 +424,13 @@ struct DFly2 {
             hipLaunchKernelGGL(k_dfly_rms_resid, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".post_proj_norm.weight"), H, c.rms_eps);
             // dense SwiGLU
             hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + std::to_string(d) + ".post_attention_layernorm.weight"), (float*)nullptr, hn, HID, c.rms_eps);
-            if (!(skip & 16)) r.lin(pm + ".gate_proj.weight", hn, F1, B);  // [B][9216]
-            if (!(skip & 16)) r.lin(pm + ".up_proj.weight", hn, F2, B);
+            if (!(skip & 16)) {
+                if (mlp_fuse[d] == 2 && lm_mlp[d].d_jobs) linear_h_multi(st, lm_mlp[d], hn, B);
+                else {
+                    r.lin(pm + ".gate_proj.weight", hn, F1, B);  // [B][9216]
+                    r.lin(pm + ".up_proj.weight", hn, F2, B);
+                }
+            }
             const size_t n9 = (size_t)B * 9216;
             hipLaunchKernelGGL(k_swiglu_h, dim3((n9 + 255) / 256), dim3(256), 0, st, (const float*)F1, (const float*)F2, mlp_h, n9);
             if (!(skip & 16)) r.lin(pm + ".down_proj.weight", mlp_h, F3, B);  // [B][3072]
@@ -355,14 +452,18 @@ struct DFly2 {
             embed_rows(st, emb.fmt, r.tw("model.embed_tokens.weight"), (int)emb.rows(), (int)emb.cols(), d_chain + (j - 1), Ec, 1);
             hipLaunchKernelGGL(k_dfly_cat2, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), wf(pf + "hidden_correction.hidden_norm.weight"), (const float*)Ec,
                                wf(pf + "hidden_correction.embed_norm.weight"), hcin, c.rms_eps);
-            r.lin(pf + "hidden_correction.gate_proj.weight", hcin, G, 1);
-            r.lin(pf + "hidden_correction.up_proj.weight", hcin, U, 1);
+            if (lm_hc.d_jobs) {
+                linear_h_multi(st, lm_hc, hcin, 1);
+            } else {
+                r.lin(pf + "hidden_correction.gate_proj.weight", hcin, G, 1);
+                r.lin(pf + "hidden_correction.up_proj.weight", hcin, U, 1);
+            }
             hipLaunchKernelGGL(k_swiglu_h, dim3((HID + 255) / 256), dim3(256), 0, st, (const float*)G, (const float*)U, act, (size_t)HID);
             r.lin(pf + "hidden_correction.down_proj.weight", act, Dn, 1);
             hipLaunchKernelGGL(k_dfly_corr, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), (const float*)Dn, wf(pf + "confidence_head.proj.weight"),
                                wf(pf + "confidence_head.proj.bias"), hc_h, d_conf + j);
             if (N > 0) {
-                hipLaunchKernelGGL(k_dfly_cand_score, dim3(N), dim3(32), 0, st, (const uint8_t*)lmw, (const int32_t*)(d_cand + (size_t)(j - 1) * N), (const __half*)hc_h, d_cscore);
+                hipLaunchKernelGGL(k_dfly_cand_score, dim3((N + 7) / 8), dim3(256), 0, st, (const uint8_t*)lmw, (const int32_t*)(d_cand + (size_t)(j - 1) * N), (const __half*)hc_h, d_cscore, N);
                 hipLaunchKernelGGL(k_dfly_cand_argmax, dim3(1), dim3(1024), 0, st, (const float*)d_cscore, (const int32_t*)(d_cand + (size_t)(j - 1) * N), N, d_chain + j);
             } else {
                 linear_h(st, lm.fmt, lmw, (int)lm.rows(), (int)lm.cols(), hc_h, r.logits, 1);

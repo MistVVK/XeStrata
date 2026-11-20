@@ -484,6 +484,8 @@ public:
     bool route_now = false;
     ExpertDev* slot_rec = nullptr;  // [16] ExpertDev records of the chosen experts (one-token decode path)
     LinMulti lm_eng[4];             // per engram module: key_projs 0..3 + value_proj for one token
+    std::vector<LinMulti> lm_attn, lm_mlp;  // per layer fused cur_h GEMVs for T <= 8 (bit-identical to separate linear_h_gemv)
+    std::vector<int> attn_fuse, mlp_fuse;   // 3 = all 3 fused, 2 = 2 fused, 0 = separate
     void tune_init() {
         const char* e = getenv("HY4_TUNE");
         tune = e ? atoi(e) : TUNE_DEFAULT;
@@ -508,6 +510,63 @@ public:
                     N[j] = (int)t.rows();
                 }
                 if (ok) lm_eng[mo] = linear_multi_build(fmt, K, 5, W, Y, N);
+            }
+        }
+        // per-layer LinMulti tables (same-format projections sharing cur_h; works for all T = 1..8)
+        lm_attn.resize(c.n_layers);
+        lm_mlp.resize(c.n_layers);
+        attn_fuse.assign(c.n_layers, 0);
+        mlp_fuse.assign(c.n_layers, 0);
+        for (int il = 0; il < c.n_layers; ++il) {
+            const std::string pa = L(il) + ".self_attn";
+            const TInfo& tq = ti(pa + ".q_a_proj.weight");
+            const TInfo& tk = ti(pa + ".kv_a_proj_with_mqa.weight");
+            const TInfo& tg = ti(pa + ".linear_gate.weight");
+            if (tq.fmt != FMT_Q8ROW && tq.fmt == tk.fmt && tq.cols() == HID && tk.cols() == HID) {
+                if (tg.fmt == tq.fmt && tg.cols() == HID) {
+                    const void* W[3] = {tw(pa + ".q_a_proj.weight"), tw(pa + ".kv_a_proj_with_mqa.weight"), tw(pa + ".linear_gate.weight")};
+                    float* Y[3] = {F1, kv_f, F3};
+                    int N[3] = {(int)tq.rows(), (int)tk.rows(), (int)tg.rows()};
+                    lm_attn[il] = linear_multi_build(tq.fmt, HID, 3, W, Y, N);
+                    attn_fuse[il] = 3;
+                } else {
+                    const void* W[2] = {tw(pa + ".q_a_proj.weight"), tw(pa + ".kv_a_proj_with_mqa.weight")};
+                    float* Y[2] = {F1, kv_f};
+                    int N[2] = {(int)tq.rows(), (int)tk.rows()};
+                    lm_attn[il] = linear_multi_build(tq.fmt, HID, 2, W, Y, N);
+                    attn_fuse[il] = 2;
+                }
+            }
+            const std::string pm = L(il) + ".mlp";
+            if (il == 0) {
+                const TInfo& t0 = ti(pm + ".gate_proj.weight");
+                const TInfo& t1 = ti(pm + ".up_proj.weight");
+                if (t0.fmt != FMT_Q8ROW && t0.fmt == t1.fmt && t0.cols() == HID && t1.cols() == HID) {
+                    const void* W[2] = {tw(pm + ".gate_proj.weight"), tw(pm + ".up_proj.weight")};
+                    float* Y[2] = {F1, F2};
+                    int N[2] = {(int)t0.rows(), (int)t1.rows()};
+                    lm_mlp[il] = linear_multi_build(t0.fmt, HID, 2, W, Y, N);
+                    mlp_fuse[il] = 2;
+                }
+            } else {
+                const TInfo& td = ti(pm + ".routed_expert_down_proj.weight");
+                const TInfo& ts0 = ti(pm + ".shared_experts.gate_proj.weight");
+                const TInfo& ts1 = ti(pm + ".shared_experts.up_proj.weight");
+                if (ts0.fmt != FMT_Q8ROW && ts0.fmt == ts1.fmt && ts0.cols() == HID && ts1.cols() == HID) {
+                    if (td.fmt == ts0.fmt && td.cols() == HID) {
+                        const void* W[3] = {tw(pm + ".routed_expert_down_proj.weight"), tw(pm + ".shared_experts.gate_proj.weight"), tw(pm + ".shared_experts.up_proj.weight")};
+                        float* Y[3] = {z_f, F1, F3};
+                        int N[3] = {(int)td.rows(), (int)ts0.rows(), (int)ts1.rows()};
+                        lm_mlp[il] = linear_multi_build(ts0.fmt, HID, 3, W, Y, N);
+                        mlp_fuse[il] = 3;
+                    } else {
+                        const void* W[2] = {tw(pm + ".shared_experts.gate_proj.weight"), tw(pm + ".shared_experts.up_proj.weight")};
+                        float* Y[2] = {F1, F3};
+                        int N[2] = {(int)ts0.rows(), (int)ts1.rows()};
+                        lm_mlp[il] = linear_multi_build(ts0.fmt, HID, 2, W, Y, N);
+                        mlp_fuse[il] = 2;
+                    }
+                }
             }
         }
         fprintf(stderr, "[tune] HY4_TUNE=%d\n", tune);
@@ -893,6 +952,13 @@ public:
 
     // iHC pre-mix + RMSNorm(nw) of cur = sum_h pre_h x_h  ->  outh (fp16) / outf (fp32, optional); post (4 per token) is produced for nout == 8
     void hc_pre(const float* xin, const float* hfn, const float* hsc, const float* hbs, const float* nw, int nout, int T, __half* outh, float* outf) {
+        if (det_mix) {
+            if (!hcpart) hcpart = dalloc<float>((size_t)Tc * 24 * 9);
+            if (T >= 16) hipLaunchKernelGGL(k_hc_mix_part_d_batch, dim3((T + 31) / 32, 24), dim3(128), 0, st, xin, hfn, hcpart, nout, T);
+            else hipLaunchKernelGGL(k_hc_mix_part_d, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcpart, nout);
+            hipLaunchKernelGGL(k_hc_fin_reduce_norm_d, dim3(T), dim3(256), 0, st, hcpart, hsc, hbs, xin, nw, pre, post, outh, outf, nout, c.rms_eps, c.hc_eps, c.hc_mag);
+            return;
+        }
         hc_mix_run(xin, hfn, hsc, hbs, nout, T);
         hipLaunchKernelGGL(k_hc_reduce_norm, dim3(T), dim3(256), 0, st, xin, pre, nw, outh, outf, c.rms_eps);
     }
@@ -960,14 +1026,26 @@ public:
         const float* hsc = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_base");
         { PS _q(this, "hc_mix"); hc_pre(x, hfn, hsc, hbs, (const float*)tw(L(il) + ".input_layernorm.weight"), 8, T, cur_h, (float*)nullptr); }
-        // q path
-        lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
+        // q / kv / gate path (fused cur_h LinMulti for T <= min(8, lin_gemv_max_m))
+        const bool afuse = (tune != 0) && T <= 8 && T <= skd::lin_gemv_max_m() && il < (int)attn_fuse.size() && attn_fuse[il] > 0 && lm_attn[il].d_jobs != nullptr;
+        const int af = afuse ? attn_fuse[il] : 0;
+        if (af > 0) {
+            PS _p(this, af == 3 ? "lin q_a+kv_a+gate" : "lin q_a+kv_a");
+            linear_h_multi(st, lm_attn[il], cur_h, T);
+        } else {
+            lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
+        }
         { PS _q(this, "q_a_rms"); hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps); }
         lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
-        lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]  (qr_h already extracted)
+        const float* kva_buf = F1;
+        if (af > 0) {
+            kva_buf = kv_f;
+        } else {
+            lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]  (qr_h already extracted)
+        }
         __half* cache = kcache[il];
         const int cslots = swa ? ring : slots_sparse;
-        { PS _q(this, "mla_write_kv"); mla_write_kv(st, F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
+        { PS _q(this, "mla_write_kv"); mla_write_kv(st, kva_buf, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
         const bool dec = T <= 8;
         const int kvfmt = ti(pa + ".kv_b_proj.weight").fmt;
         const void* kvb_w = tw(pa + ".kv_b_proj.weight");
@@ -980,7 +1058,7 @@ public:
 #endif
         }
         if (vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
-            vis->fix_k(st, F1, cache, T, p0, swa ? ring : 0, (float)theta(il));
+            vis->fix_k(st, kva_buf, cache, T, p0, swa ? ring : 0, (float)theta(il));
             vis->fix_q(st, F2, qa_h, T, NH, p0, (float)theta(il));
         }
         bool use_list = false;
@@ -993,7 +1071,7 @@ public:
         }
         last_use_list = use_list;
         if (dfly_cap && !swa) dfly_capture(il, p0, T, use_list);
-        lin(pa + ".linear_gate.weight", cur_h, F3, T);  // [T][NH*256]
+        if (af < 3) lin(pa + ".linear_gate.weight", cur_h, F3, T);  // [T][NH*256]
         MlaAttnArgs a;
         a.M = T;
         a.NH = NH;
@@ -1103,28 +1181,53 @@ public:
         const float* hsc = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_base");
         { PS _q(this, "hc_mix"); hc_pre(x, hfn, hsc, hbs, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), 8, T, cur_h, cur_f); }
+        const bool mfuse = (tune != 0) && T <= 8 && T <= skd::lin_gemv_max_m() && il < (int)mlp_fuse.size() && mlp_fuse[il] > 0 && lm_mlp[il].d_jobs != nullptr;
+        const int mf = mfuse ? mlp_fuse[il] : 0;
         if (il == 0) {
-            lin(pm + ".gate_proj.weight", cur_h, F1, T);  // [T][13824]
-            lin(pm + ".up_proj.weight", cur_h, F2, T);
+            if (mf == 2) {
+                PS _p(this, "lin gate+up");
+                linear_h_multi(st, lm_mlp[0], cur_h, T);
+            } else {
+                lin(pm + ".gate_proj.weight", cur_h, F1, T);  // [T][13824]
+                lin(pm + ".up_proj.weight", cur_h, F2, T);
+            }
             size_t n = (size_t)T * 13824;
             { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((n + 255) / 256), dim3(256), 0, st, F1, F2, H1, n); }
             lin(pm + ".down_proj.weight", H1, F3, T);  // [T][3072]
             { PS _q(this, "o_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F3, (const float*)nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), x, post, c.rms_eps); }
         } else {
             // router
-            { PS _q(this, "router_gemv"); if (T <= 16) hipLaunchKernelGGL(k_f32_gemv, dim3(512), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T); else hipLaunchKernelGGL(k_f32_gemm, dim3(8, (T + 63) / 64), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T); }
+            {
+                PS _q(this, "router_gemv");
+                const float* rw = (const float*)tw(pm + ".gate.weight");
+                if (T <= 1) hipLaunchKernelGGL((k_f32_gemv_t<1>), dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else if (T <= 2) hipLaunchKernelGGL((k_f32_gemv_t<2>), dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else if (T <= 4) hipLaunchKernelGGL((k_f32_gemv_t<4>), dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else if (T <= 6) hipLaunchKernelGGL((k_f32_gemv_t<6>), dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else if (T <= 8) hipLaunchKernelGGL((k_f32_gemv_t<8>), dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else if (T <= 16) hipLaunchKernelGGL(k_f32_gemv, dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else hipLaunchKernelGGL(k_f32_gemm, dim3(8, (T + 63) / 64), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+            }
             route_now = (tune & TN_ROUTE) && T == 1 && !hyb;
             {
                 PS _q(this, "router_topk");
                 const uint4* exl = route_now ? (const uint4*)(d_experts + (size_t)(il - 1) * 512) : nullptr;
                 uint4* rec = route_now ? (uint4*)slot_rec : nullptr;
                 const float* rb = (const float*)tw(pm + ".gate.e_score_correction_bias");
-                if (tune & TN_TOPK) hipLaunchKernelGGL(k_router_topk_r, dim3(T), dim3(512), 0, st, F1, rb, moe_idx, moe_w, 16, c.routed_scale, exl, rec);
+                if (tune & TN_TOPK) hipLaunchKernelGGL(k_router_topk_w32, dim3(T), dim3(32), 0, st, F1, rb, moe_idx, moe_w, 16, c.routed_scale, exl, rec);
                 else hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, rb, moe_idx, moe_w, 512, 16, c.routed_scale, exl, rec);
             }
-            lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
             size_t nz = (size_t)T * 1536;
-            if (hyb) { moe_hybrid_tail(il, T, pm); } else {
+            if (hyb) {
+                lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
+                moe_hybrid_tail(il, T, pm);
+            } else {
+            if (mf == 3) {
+                PS _p(this, "lin dn+sh_gate+sh_up");
+                linear_h_multi(st, lm_mlp[il], cur_h, T);
+            } else {
+                lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
+            }
             const bool nof = T <= 4 && (tune & TN_NOF2H);  // fp32 latent read directly by the expert kernels, fp16 result written by their reduce
             if (nof) { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, nullptr, moe_idx, moe_w, zout_f, T, moe_ws, z_f, z_h, route_now ? slot_rec : nullptr); }
             else {
@@ -1133,8 +1236,13 @@ public:
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
             }
             lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
-            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
-            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
+            if (mf == 2) {
+                PS _p(this, "lin sh_gate+sh_up");
+                linear_h_multi(st, lm_mlp[il], cur_h, T);
+            } else if (mf < 3) {
+                lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
+                lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
+            }
             { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz); }
             lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
             { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }

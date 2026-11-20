@@ -154,6 +154,41 @@ __global__ void k_hc_mix_fin(const float* __restrict__ acc, const float* __restr
     }
 }
 
+// ---- templated F32 GEMV for the router (M <= 8): exact same summation order as k_f32_gemv, zero m-branch overhead, single barrier reduction across all MT tokens
+template <int MT>
+__global__ void __launch_bounds__(256) k_f32_gemv_t(const float* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y, int N, int K, int M) {
+    __shared__ float sh[MT][8];
+    const int n = blockIdx.x, tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const float4* w4 = (const float4*)(W + (size_t)n * K);
+    float acc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[m] = 0.f;
+    for (int k4 = tid; k4 < K / 4; k4 += 256) {
+        const float4 w = w4[k4];
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            if (m < M) {
+                const float4 xv = ((const float4*)(X + (size_t)m * K))[k4];
+                acc[m] += w.x * xv.x + w.y * xv.y + w.z * xv.z + w.w * xv.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        float v = acc[m];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o);
+        if (lane == 0) sh[m][wave] = v;
+    }
+    __syncthreads();
+    if (tid < MT && tid < M) {
+        float r = 0.f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) r += sh[tid][w];
+        Y[(size_t)tid * N + n] = r;
+    }
+}
+
 // ---- F32 GEMV for the router: one block per output row, M <= 16 tokens; W [N][K] f32, X [M][K] f32, Y [M][N]
 __global__ void __launch_bounds__(256) k_f32_gemv(const float* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y, int N, int K, int M) {
     __shared__ float sh[32];
@@ -418,6 +453,58 @@ __global__ void __launch_bounds__(512) k_router_topk_r(const float* __restrict__
     }
 }
 
+// ---- single-wave (32-thread) zero-barrier top-16 router (E = 512, 16 elements/lane in registers). Bit-identical to k_router_topk / k_router_topk_r, 32x fewer comparisons and zero __syncthreads().
+__global__ void __launch_bounds__(32) k_router_topk_w32(const float* __restrict__ logits, const float* __restrict__ bias, int32_t* __restrict__ idx, float* __restrict__ w, int K, float scale,
+                                                        const uint4* __restrict__ ex_layer = nullptr, uint4* __restrict__ rec = nullptr) {
+    const int lane = threadIdx.x;
+    const float* lg = logits + (size_t)blockIdx.x * 512;
+    float p[16], v[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const int e = lane + 32 * j;
+        p[j] = sigmoidf_(lg[e]);
+        v[j] = p[j] + bias[e];
+    }
+    int chosen[16];
+    float cp[16];
+    for (int k = 0; k < K; ++k) {
+        float bv = -3.0e38f;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int e = lane + 32 * j;
+            if (v[j] > bv || (v[j] == bv && e < bi)) { bv = v[j]; bi = e; }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor(bv, o);
+            const int oi = __shfl_xor(bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        const int win_lane = bi & 31, win_j = bi >> 5;
+        float wp = 0.f;
+        if (lane == win_lane) {
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+                if (j == win_j) { wp = p[j]; v[j] = -3.0e38f; }
+        }
+        wp = __shfl(wp, win_lane);
+        chosen[k] = bi;
+        cp[k] = wp;
+    }
+    if (lane == 0) {
+        float sum = 0.f;
+        for (int k = 0; k < K; ++k) sum += cp[k];
+        const float inv = scale / (sum + 1e-20f);
+        for (int k = 0; k < K; ++k) {
+            idx[(size_t)blockIdx.x * K + k] = chosen[k];
+            w[(size_t)blockIdx.x * K + k] = cp[k] / (sum + 1e-20f) * scale;
+            if (rec) rec[k] = ex_layer[chosen[k]];
+        }
+        (void)inv;
+    }
+}
+
 // ---- argmax over logits [V] (one row) -> token id; 1 block of 1024
 __global__ void k_argmax(const float* __restrict__ logits, int V, int32_t* __restrict__ out) {
     __shared__ float sv[32];
@@ -616,6 +703,66 @@ __global__ void k_hc_mix_fin_d(const float* __restrict__ part, const float* __re
         }
     } else {
         for (int h = 0; h < NHC; ++h) pre[(size_t)t * NHC + h] = sigmoidf_(m[h] * scale[0] + base[h]) + hc_eps;
+    }
+}
+
+// ---- fused deterministic iHC finisher + reduce + RMSNorm: bit-identical to k_hc_mix_fin_d + k_hc_reduce_norm in ONE launch (saves 85 launches/step)
+__global__ void __launch_bounds__(256) k_hc_fin_reduce_norm_d(const float* __restrict__ part, const float* __restrict__ scale, const float* __restrict__ base,
+                                                              const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ pre, float* __restrict__ post,
+                                                              __half* __restrict__ outh, float* __restrict__ outf, int nout, float eps, float hc_eps, float hc_mag) {
+    __shared__ float sp[4];
+    __shared__ float sh[32];
+    const int t = blockIdx.x;
+    if (threadIdx.x == 0) {
+        const int K = NHC * HID;
+        float acc[9];
+#pragma unroll
+        for (int j = 0; j < 9; ++j) acc[j] = 0.f;
+        for (int s = 0; s < 24; ++s)
+#pragma unroll
+            for (int j = 0; j < 9; ++j) acc[j] += part[((size_t)t * 24 + s) * 9 + j];
+        const float inv = rsqrtf(acc[8] / K + eps);
+        float m[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) m[j] = j < nout ? acc[j] * inv : 0.0f;
+        if (nout == 8) {
+#pragma unroll
+            for (int h = 0; h < NHC; ++h) {
+                const float pr = sigmoidf_(m[h] * scale[0] + base[h]) + hc_eps;
+                sp[h] = pr;
+                pre[(size_t)t * NHC + h] = pr;
+                post[(size_t)t * NHC + h] = hc_mag * sigmoidf_(m[NHC + h] * scale[1] + base[NHC + h]) + hc_eps;
+            }
+        } else {
+#pragma unroll
+            for (int h = 0; h < NHC; ++h) {
+                const float pr = sigmoidf_(m[h] * scale[0] + base[h]) + hc_eps;
+                sp[h] = pr;
+                pre[(size_t)t * NHC + h] = pr;
+            }
+        }
+    }
+    __syncthreads();
+    const float* xt = x + (size_t)t * NHC * HID;
+    const float p0 = sp[0], p1 = sp[1], p2 = sp[2], p3 = sp[3];
+    float ss = 0.f;
+    constexpr int PER = HID / 256;
+    float v[PER];
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int d = threadIdx.x + i * 256;
+        const float c = xt[d] * p0 + xt[HID + d] * p1 + xt[2 * HID + d] * p2 + xt[3 * HID + d] * p3;
+        v[i] = c;
+        ss += c * c;
+    }
+    ss = block_sum(ss, sh);
+    const float inv = rsqrtf(ss / HID + eps);
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int d = threadIdx.x + i * 256;
+        const float o = v[i] * inv * (w ? w[d] : 1.0f);
+        if (outh) outh[(size_t)t * HID + d] = __float2half(o);
+        if (outf) outf[(size_t)t * HID + d] = o;
     }
 }
 
