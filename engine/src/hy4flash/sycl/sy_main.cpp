@@ -76,6 +76,8 @@ int main(int argc, char** argv) {
     }
     std::string model, engram, tok_path, out_dir = ".", force_route, draft;  // draft: "" = default (serve: auto, CLI runs: off)
     SpecCfg scfg;
+    int wincheck = 0, wincheck_skip = 0, detcheck = 0;
+    bool detnotap = false;
     bool load_only = false, dbg = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false;
     bool serve = false, session_reuse = false, vision_requested = false;
     std::string vision_path;
@@ -139,6 +141,10 @@ int main(int argc, char** argv) {
         else if (a == "--dbg-layers") dbg = true;
         else if (a == "--force-route") force_route = nxt();
         else if (a == "--all-logits") all_logits = true;
+        else if (a == "--wincheck") wincheck = atoi(nxt().c_str());
+        else if (a == "--wincheck-skip") wincheck_skip = atoi(nxt().c_str());
+        else if (a == "--detcheck") detcheck = atoi(nxt().c_str());
+        else if (a == "--detnotap") detnotap = true;
         else if (a == "--no-engram") no_engram = true;
         else if (a == "--index-topk") index_topk = atoi(nxt().c_str());
         else if (a == "--no-index") no_index = true;
@@ -149,6 +155,8 @@ int main(int argc, char** argv) {
         else if (a == "--spec-fixed") scfg.adaptive = false;
         else if (a == "--spec-cut") scfg.cut = (float)atof(nxt().c_str());
         else if (a == "--spec-debug") scfg.debug = true;
+        else if (a == "--spec-check") scfg.check = true;
+        else if (a == "--spec-plain-only") scfg.plain_only = true;
         else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
         else {
             fprintf(stderr, "unknown arg %s\n", a.c_str());
@@ -225,7 +233,7 @@ int main(int argc, char** argv) {
         if (max_ctx <= 0) max_ctx = std::max(T0 + gen + 16, 131072);  // owner default for Hy4-Flash: 128K context on every card (the sparse-layer KV then lives in pinned host memory, see kv_host_above)
         const int Tc = std::max(chunk, 1);
         const bool spec_mode = draft == "dfly2" && gen > 0;
-        Runner r(g, cx, max_ctx, Tc, spec_mode ? 8 : (all_logits ? std::min(Tc, T0) : 1));
+        Runner r(g, cx, max_ctx, Tc, (spec_mode || wincheck > 0 || detcheck > 0) ? 8 : (all_logits ? std::min(Tc, T0) : 1));
         r.dump = dump;
         r.dbg_layers = dbg;
         r.force_route_dir = force_route;
@@ -321,6 +329,124 @@ int main(int argc, char** argv) {
             sp.report(stderr, td * 1000.0);
             std::ofstream f(out_dir + "/gen_ids.txt");
             f << gen_ids << "\n";
+        } else if (detcheck > 0) {
+            // is a 1-token step repeatable? Greedy-decode wincheck_skip tokens, then run the SAME step (same token, same position, same KV prefix) detcheck times, tapping every layer, and compare the repeats bitwise.
+            int next = 0;
+            {
+                const float* lg = &hl[(size_t)(hl.size() / V - 1) * V];
+                next = (int)(std::max_element(lg, lg + V) - lg);
+            }
+            for (int s = 0; s < wincheck_skip; ++s) {
+                tok.push_back(next);
+                const int pos = (int)tok.size() - 1;
+                if (!r.forward_chunk(tok.data(), pos, 1, err)) { fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+                r.head(1, 0);
+                argmax_row(r.logits, V, r.d_argmax);
+                int32_t nx = 0;
+                d2h(&nx, r.d_argmax, 4);
+                wait();
+                next = nx;
+            }
+            tok.push_back(next);
+            const int pos = (int)tok.size() - 1;
+            std::vector<std::vector<std::pair<std::string, std::vector<float>>>> rep(detcheck);
+            std::vector<std::vector<float>> rlog(detcheck);
+            for (int k = 0; k < detcheck; ++k) {
+                r.tap = detnotap ? nullptr : &rep[k];
+                if (!r.forward_chunk(tok.data(), pos, 1, err)) { fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+                r.tap = nullptr;
+                r.head(1, 0);
+                rlog[k].resize(V);
+                d2h(rlog[k].data(), r.logits, (size_t)V * 4);
+                wait();
+            }
+            printf("detcheck pos=%d repeats=%d\n", pos, detcheck);
+            int bad = 0;
+            for (int k = 1; k < detcheck; ++k) {
+                std::string first;
+                size_t nbad = 0;
+                for (size_t t = 0; t < rep[0].size() && t < rep[k].size(); ++t) {
+                    size_t nb = 0;
+                    const auto& a0 = rep[0][t].second;
+                    const auto& a1 = rep[k][t].second;
+                    for (size_t e = 0; e < a0.size() && e < a1.size(); ++e)
+                        if (std::memcmp(&a0[e], &a1[e], 4) != 0) nb++;
+                    if (nb) { nbad++; if (first.empty()) first = rep[0][t].first + " (" + std::to_string(nb) + " of " + std::to_string(a0.size()) + ")"; }
+                }
+                size_t lb = 0;
+                for (int e = 0; e < V; ++e) if (std::memcmp(&rlog[0][e], &rlog[k][e], 4) != 0) lb++;
+                if (!detnotap || lb) printf("repeat %d vs 0: differing taps %zu of %zu, first: %s, logits differing %zu\n", k, nbad, rep[0].size(), first.empty() ? "none" : first.c_str(), lb);
+                if (nbad || lb) bad++;
+            }
+            printf("DETCHECK %s\n", bad ? "NONDETERMINISTIC" : "REPEATABLE");
+        } else if (wincheck > 0) {
+            // does a window of M rows give bit-identical rows to M single-token steps? (the verify of speculative decoding must). Greedy-decode wincheck_skip tokens, then
+            // run M single steps (tapping every layer), then the same tokens as ONE window, and compare the tapped rows bitwise.
+            const int M = std::min(wincheck, 8);
+            if (std::getenv("HY4S_BATCH_INV") == nullptr || std::getenv("HY4S_BATCH_INV")[0] != '0') spec_set_batch_invariant();
+            int next = 0;
+            {
+                const float* lg = &hl[(size_t)(hl.size() / V - 1) * V];
+                next = (int)(std::max_element(lg, lg + V) - lg);
+            }
+            for (int s = 0; s < wincheck_skip; ++s) {
+                tok.push_back(next);
+                const int pos = (int)tok.size() - 1;
+                if (!r.forward_chunk(tok.data(), pos, 1, err)) { fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+                r.head(1, 0);
+                argmax_row(r.logits, V, r.d_argmax);
+                int32_t nx = 0;
+                d2h(&nx, r.d_argmax, 4);
+                wait();
+                next = nx;
+            }
+            const int p0 = (int)tok.size();
+            std::vector<std::vector<std::pair<std::string, std::vector<float>>>> singles(M);
+            std::vector<std::vector<float>> slog(M);
+            for (int i = 0; i < M; ++i) {
+                tok.push_back(next);
+                r.tap = &singles[i];
+                if (!r.forward_chunk(tok.data(), p0 + i, 1, err)) { fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+                r.tap = nullptr;
+                r.head(1, 0);
+                slog[i].resize(V);
+                d2h(slog[i].data(), r.logits, (size_t)V * 4);
+                wait();
+                next = (int)(std::max_element(slog[i].begin(), slog[i].end()) - slog[i].begin());
+            }
+            std::vector<std::pair<std::string, std::vector<float>>> win;
+            r.tap = &win;
+            if (!r.forward_chunk(tok.data(), p0, M, err)) { fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+            r.tap = nullptr;
+            r.head(M, 0);
+            std::vector<float> wlog((size_t)M * V);
+            d2h(wlog.data(), r.logits, wlog.size() * 4);
+            wait();
+            printf("wincheck p0=%d M=%d batch_invariant=%d\n", p0, M, g_mla_batch_invariant);
+            int bad_rows = 0;
+            for (int i = 0; i < M; ++i) {
+                std::string first;
+                size_t nbad = 0, ntap = 0;
+                double maxd = 0;
+                for (size_t k = 0; k < singles[i].size() && k < win.size(); ++k) {
+                    const auto& sv = singles[i][k].second;
+                    const auto& wv = win[k].second;
+                    const size_t per = sv.size();
+                    if (singles[i][k].first != win[k].first || wv.size() < (size_t)(i + 1) * per) { if (first.empty()) first = singles[i][k].first + " (shape)"; continue; }
+                    ntap++;
+                    size_t nb = 0;
+                    for (size_t e = 0; e < per; ++e) {
+                        const float a = sv[e], b = wv[(size_t)i * per + e];
+                        if (std::memcmp(&a, &b, 4) != 0) { nb++; maxd = std::max(maxd, (double)std::fabs(a - b)); }
+                    }
+                    if (nb) { nbad++; if (first.empty()) first = singles[i][k].first + " (" + std::to_string(nb) + " of " + std::to_string(per) + " differ)"; }
+                }
+                size_t lb = 0;
+                for (int e = 0; e < V; ++e) if (std::memcmp(&slog[i][e], &wlog[(size_t)i * V + e], 4) != 0) lb++;
+                printf("row %d: taps compared %zu, differing taps %zu, first: %s, max abs diff %.3g, logits differing %zu of %d\n", i, ntap, nbad, first.empty() ? "none" : first.c_str(), maxd, lb, V);
+                if (nbad || lb) bad_rows++;
+            }
+            printf("WINCHECK %s\n", bad_rows ? "DIFFERS" : "IDENTICAL");
         } else if (gen > 0) {
             int next = 0;
             {
@@ -347,6 +473,15 @@ int main(int argc, char** argv) {
                 int32_t nx = 0;
                 d2h(&nx, r.d_argmax, 4);
                 wait();
+                if (std::getenv("HY4S_LOGSUM")) {  // analysis: FNV-1a hash of the exact bits of every decode step's logits (run-to-run determinism: compare two runs step by step)
+                    std::vector<float> lrow(V);
+                    d2h(lrow.data(), r.logits, (size_t)V * 4);
+                    wait();
+                    uint64_t hsh = 1469598103934665603ull;
+                    const uint8_t* bp = (const uint8_t*)lrow.data();
+                    for (size_t i = 0; i < (size_t)V * 4; ++i) hsh = (hsh ^ bp[i]) * 1099511628211ull;
+                    printf("H %d %016llx\n", s, (unsigned long long)hsh);
+                }
                 if (std::getenv("HY4S_MARGINS")) {  // analysis: top1 - top2 logit gap of every generated token (near-tie flips between plain and speculative decode)
                     std::vector<float> row(V);
                     d2h(row.data(), r.logits, (size_t)V * 4);

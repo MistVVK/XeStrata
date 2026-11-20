@@ -166,16 +166,22 @@ public:
     std::map<std::string, std::pair<double, int>> pacc;
     struct PEv { sycl::event a, b; std::string nm; };
     std::vector<PEv> pev;
+    static bool sync_all_env() {
+        static const bool v = std::getenv("HY4S_SYNCALL") != nullptr;
+        return v;
+    }
     struct PS {
         Runner* r;
         bool on;
         PEv e;
         PS(Runner* r_, const std::string& n) : r(r_), on(r_->prof2) {
+            if (sync_all_env()) wait();  // HY4S_SYNCALL=1: debug, a full device sync around every scoped stage
             if (!on) return;
             e.nm = n;
             e.a = Q().single_task([]() {});
         }
         ~PS() {
+            if (sync_all_env()) wait();
             if (!on) return;
             e.b = Q().single_task([]() {});
             r->pev.push_back(e);
@@ -243,6 +249,7 @@ public:
         o_h = dalloc<half>((size_t)T * 16384);
         ctx_h = dalloc<half>((size_t)T * 64 * 512);
         // routing + folded activations share one device buffer and one pinned host buffer: [idx T*16 | w T*16 | z T*1536], so a decode step needs ONE device->host copy per MoE layer
+        if (std::getenv("HY4S_HASH")) d_hash = dalloc<uint64_t>(65536);
         d_pack = dalloc<float>((size_t)T * (32 + 1536));
         h_pack = halloc<float>((size_t)T * (32 + 1536));
         z_f = d_pack + (size_t)T * 32;
@@ -436,7 +443,86 @@ public:
         return true;
     }
 
+    // HY4S_HASH=1: order-independent 64-bit hash of selected arrays, computed ON THE DEVICE without any host synchronisation inside the chunk (a tap with a wait() hid the race),
+    // printed to stderr at the end of every forward_chunk as "[hash] c<p0> <name> <hex>": compare two runs line by line to find the first stage whose result differs.
+    uint64_t* d_hash = nullptr;
+    std::vector<std::string> hash_names;
+    void tap_hash(const std::string& name, const float* dev, size_t n) {
+        if (!d_hash || hash_names.size() >= 60000) return;
+        const size_t slot = hash_names.size();
+        hash_names.push_back("c" + std::to_string(cur_p0) + " " + name);
+        uint64_t* out = d_hash + slot;
+        Q().memset(out, 0, 8);
+        const size_t G = 128;
+        Q().parallel_for(NR(G, 256), [=](sycl::nd_item<1> it) {
+            uint64_t acc = 0;
+            for (size_t i = it.get_global_id(0); i < n; i += G * 256) {
+                uint32_t b;
+                std::memcpy(&b, dev + i, 4);
+                uint64_t v = (uint64_t)b * 0x9E3779B97F4A7C15ull + (uint64_t)i * 0xD6E8FEB86659FD93ull;
+                v ^= v >> 29;
+                v *= 0xBF58476D1CE4E5B9ull;
+                v ^= v >> 32;
+                acc += v;
+            }
+            acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<uint64_t>());
+            if (it.get_local_id(0) == 0) {
+                sycl::atomic_ref<uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> a(*out);
+                a.fetch_add(acc);
+            }
+        });
+    }
+    void hash_flush() {
+        if (!d_hash || hash_names.empty()) return;
+        wait();
+        std::vector<uint64_t> h(hash_names.size());
+        d2h(h.data(), d_hash, h.size() * 8);
+        wait();
+        for (size_t i = 0; i < h.size(); ++i) fprintf(stderr, "[hash] %s %016llx\n", hash_names[i].c_str(), (unsigned long long)h[i]);
+        hash_names.clear();
+    }
+
+    // --wincheck: every tapped array (in execution order) of one forward call, as float rows [T][per_row]
+    std::vector<std::pair<std::string, std::vector<float>>>* tap = nullptr;
+    void tap_dev(const std::string& name, const void* dev, size_t n, int kind /*0 f32, 1 half, 2 int32*/) {
+        if (!tap) return;
+        wait();
+        std::vector<float> h(n);
+        if (kind == 0) d2h(h.data(), dev, n * 4);
+        else if (kind == 1) {
+            std::vector<half> hh(n);
+            d2h(hh.data(), dev, n * 2);
+            wait();
+            for (size_t i = 0; i < n; ++i) h[i] = (float)hh[i];
+        } else {
+            std::vector<int32_t> hi(n);
+            d2h(hi.data(), dev, n * 4);
+            wait();
+            for (size_t i = 0; i < n; ++i) h[i] = (float)hi[i];
+        }
+        wait();
+        tap->push_back({name, std::move(h)});
+    }
+    // IndexPool key lists of T rows: only the first nkeys entries of a row count
+    void tap_keys(const std::string& name, int T) {
+        if (!tap) return;
+        wait();
+        std::vector<int32_t> hk((size_t)T * index_topk), hn(T);
+        d2h(hk.data(), keys, hk.size() * 4);
+        d2h(hn.data(), nkeys, (size_t)T * 4);
+        wait();
+        std::vector<float> h((size_t)T * index_topk, 0.f), hnf(T);
+        for (int t = 0; t < T; ++t) {
+            hnf[t] = (float)hn[t];
+            for (int j = 0; j < hn[t] && j < index_topk; ++j) h[(size_t)t * index_topk + j] = (float)hk[(size_t)t * index_topk + j];
+        }
+        tap->push_back({name + "_n", std::move(hnf)});
+        tap->push_back({name, std::move(h)});
+    }
+
     void maybe_dump(const std::string& name, int T, int D, const float* dev, int per_tok_streams = 0) {
+        if (d_hash) tap_hash(name, dev, (size_t)T * D);
+        if (tap) tap_dev(name, dev, (size_t)T * D, 0);
         if (!dump) return;
         wait();
         const size_t n = (size_t)T * D;
@@ -580,6 +666,7 @@ public:
             { PS _q(this, "idx_update"); idx_update(il, p0, T); }
             if (p0 + T > index_topk) {
                 { PS _q(this, "idx_select"); idx_select(il, p0, T); }
+                if (tap) tap_keys("L" + std::to_string(il) + "_keys", T);
                 use_list = true;
             }
         }
@@ -601,6 +688,7 @@ public:
         }
         ensure_mla_ws(mla_workspace_bytes(a));
         { PS _q(this, "mla_attend"); mla_attend(qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), ctx_h, a, mla_ws, mla_ws_bytes); }
+        if (tap) tap_dev("L" + std::to_string(il) + "_ctx", ctx_h, (size_t)T * NH * 512, 1);
         { PS _q(this, "mla_vup"); mla_vup(ctx_h, wv_b + wv_off[il], F3, o_h, T, NH); }
         lin(pa + ".o_proj.weight", o_h, F1, T);  // [T][3072]
         { PS _q(this, "o_norm_post"); add_rms_post(F1, nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), x, post, HID, c.rms_eps, T); }
@@ -625,9 +713,11 @@ public:
             h_idx = (int32_t*)h_pack; h_w = h_pack + (size_t)T * 16; h_z = h_pack + (size_t)T * 32;
             { PS _q(this, "router"); linear_f32((const float*)tw(pm + ".gate.weight"), 512, HID, cur_f, F1, T); }
             { PS _q(this, "router_topk"); router_topk_sg(F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 16, c.routed_scale, T); }
+            if (d_hash) { tap_hash("L" + std::to_string(il) + "_router_logits", F1, (size_t)T * 512); tap_hash("L" + std::to_string(il) + "_router_w", moe_w, (size_t)T * 16); tap_hash("L" + std::to_string(il) + "_router_idx", (const float*)moe_idx, (size_t)T * 16); }
             const bool fm = T == 1 && fuse_dec && !dump && mg_moe_ok[il];  // decode launch fusions (see build_fuse)
             if (fm) { PS _q(this, "lin down+shared gate/up"); k_gemv_multi(mg_m1[il]); }  // z_f (pack), sg_f, su_f
             else lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536] fp32
+            if (d_hash) tap_hash("L" + std::to_string(il) + "_routed_down_z", z_f, (size_t)T * 1536);
             // the pack layout depends on T: [idx T*16 | w T*16 | z T*1536]; the GPU-expert path needs only idx and w on the host (z stays on the device)
             const bool gx_now = gx != nullptr && T >= gx_min_T;
             sycl::event evw = Q().memcpy(h_pack, d_pack, ((size_t)T * 32 + ((gx_now && !(dump && dbg_layers)) ? 0 : nz)) * 4);
@@ -640,6 +730,7 @@ public:
                 { PS _q(this, "swiglu"); swiglu_h(F1, F3, H1, nz); }
                 lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
             }
+            if (d_hash && !fm) tap_hash("L" + std::to_string(il) + "_shared_out", F3, (size_t)T * HID);
             evw.wait();
             double tc = now_s();
             if (!force_route_dir.empty()) {  // teacher-forced routing from an oracle dump (L<il>_topk_idx.npy / L<il>_topk_w.npy, float32 [T][16]): isolates numeric noise from routing flips
@@ -672,12 +763,14 @@ public:
             }
             t_cpu_exp += now_s() - tc;
             if (!use_gx) h2d(zout_f, h_zout, nz * 4);
+            if (d_hash) tap_hash("L" + std::to_string(il) + "_routed_zout", zout_f, nz);
             if (fm) {
                 k_gemv_multi(mg_up[il]);  // routed up_proj reading zout_f rounded to fp16 (no f2h pass): F2 = [3072]
             } else {
                 f2h(zout_f, z_h, nz);
                 lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
             }
+            if (d_hash) tap_hash("L" + std::to_string(il) + "_routed_up_out", F2, (size_t)T * HID);
             { PS _q(this, "combine_norm_post"); add_rms_post(F2, fm ? so_f : F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, HID, c.rms_eps, T); }
         }
     }
@@ -714,6 +807,7 @@ public:
             maybe_dump("x_L" + std::to_string(il) + "_mlp", T, 4 * HID, x, 4);
             if (prof) { wait(); double tb = now_s(); (il == 0 ? p_mlp0 : p_moe) += tb - ta; }
         }
+        hash_flush();
         return true;
     }
     bool prof = false;
