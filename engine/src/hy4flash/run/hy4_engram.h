@@ -46,6 +46,10 @@ bool load_engram_meta_file(const std::string& strata_path, EngramMeta& m, std::s
 // row_ids: [(t1-t0)*16] global row ids; valid: [(t1-t0)*16], 0 for every head of a "dead" token (id out of [0, vocab)).
 void engram_hash(const EngramMeta& m, int module, const int32_t* tok, int t0, int t1, uint64_t* row_ids, uint8_t* valid);
 
+// Tree-aware Engram hashing for speculative tree verification (T <= 8 nodes rooted at logical position p0).
+// Node t has token tree_tok[t] and parent tree_parent[t] (-1 for root 0, < t otherwise). Ancestors above root 0 read tok_prefix[p0 - 1], tok_prefix[p0 - 2].
+void engram_hash_tree(const EngramMeta& m, int module, const int32_t* tok_prefix, int p0, const int32_t* tree_tok, const int8_t* tree_parent, int T, uint64_t* row_ids, uint8_t* valid);
+
 // ---- low-level 4 KiB page reads (also used by the I/O benchmark) ----
 class PageFile {
 public:
