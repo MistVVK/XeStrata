@@ -270,31 +270,27 @@ public:
     }
 
     // ---- HY4-TUNE decode launch fusion (T <= 4). HY4_TUNE = bitmask, read once; each bit is an independent, exact (bit-for-bit or same-rounding) restructuring of the decode step:
-    //   1 TN_HC      iHC pre-mix: zero + partial sums + finalize + reduce/RMSNorm in ONE launch (k_hc_pre), also for prefill and the head
     //   2 TN_TOPK    router top-16 by rank instead of 16 sequential block argmax rounds
     //   4 TN_ATT     q_a_proj + kv_a_proj in one launch (linear_h_multi)
     //  16 TN_M1      routed_expert_down + shared gate + shared up in one launch (one activation read)
     //  64 TN_NOF2H   no fp32->fp16 passes around moe_experts (the expert kernels read fp32 z, the reduce kernel also writes fp16)
     // 128 TN_M2      routed_expert_up + shared down (swiglu prologue) in one launch (needs M1 + NOF2H)
+    // 512 TN_ENG     engram layers, one token: the 5 projections in one launch
     // 256 TN_ROUTE   one token: the router top-k kernel copies the chosen experts' records, the one-token expert kernels (2 launches) replace route + gu + dn + reduce
     //   (TN_TOPK is now the rank-based k_router_topk_r with 512 threads, bit-identical to the argmax-round kernel)
-    enum { TN_HC = 1, TN_TOPK = 2, TN_ATT = 4, TN_M1 = 16, TN_NOF2H = 64, TN_M2 = 128, TN_ROUTE = 256 };
+    enum { TN_TOPK = 2, TN_ATT = 4, TN_M1 = 16, TN_NOF2H = 64, TN_M2 = 128, TN_ROUTE = 256, TN_ENG = 512 };
     int tune = 0;
     bool route_now = false;
     ExpertDev* slot_rec = nullptr;  // [16] ExpertDev records of the chosen experts (one-token decode path)
-    float* hc_part = nullptr;
-    unsigned* hc_cnt = nullptr;
     float *kva_f = nullptr, *shB_g = nullptr, *shB_u = nullptr, *shB_o = nullptr;
     std::vector<LinMulti> lm_att, lm_m1, lm_sh2, lm_shd, lm_m2;  // per layer (lm_*.d_jobs == nullptr: not built / formats differ)
+    LinMulti lm_eng[4];  // per engram module: key_projs 0..3 + value_proj for one token
     bool tune_att_ok(int il) const { return !lm_att.empty() && lm_att[il].d_jobs; }
     bool tune_mlp_ok(int il) const { return !lm_m1.empty() && il >= 1 && lm_m1[il].d_jobs && lm_sh2[il].d_jobs && lm_shd[il].d_jobs && lm_m2[il].d_jobs; }
     void tune_init() {
         const char* e = getenv("HY4_TUNE");
         tune = e ? atoi(e) : TUNE_DEFAULT;
         if (tune == 0) return;
-        hc_part = dalloc<float>((size_t)Tc * 24 * 9);
-        hc_cnt = dalloc<unsigned>((size_t)Tc);
-        HCK(hipMemset(hc_cnt, 0, (size_t)Tc * 4));
         slot_rec = dalloc<ExpertDev>(16);
         HCK(hipMemset(moe_ws, 0, moe_ws_bytes(Tc)));  // the one-token expert kernels keep their column tickets in the (otherwise unused) `fill` table of the workspace
         kva_f = dalloc<float>((size_t)Tc * 576);
@@ -307,6 +303,26 @@ public:
         lm_sh2.assign(NL, LinMulti());
         lm_shd.assign(NL, LinMulti());
         lm_m2.assign(NL, LinMulti());
+        if (engram_ready && emeta.layers.size() >= 4) {
+            for (int mo = 0; mo < 4; ++mo) {
+                const std::string p = L(emeta.layers[mo]) + ".engram_layer";
+                const void* W[5];
+                float* Y[5];
+                int N[5];
+                bool ok = true;
+                int fmt = -1, K = 0;
+                for (int j = 0; j < 5; ++j) {
+                    const std::string nm = j < 4 ? p + ".key_projs." + std::to_string(j) + ".weight" : p + ".value_proj.weight";
+                    const TInfo& t = ti(nm);
+                    if (j == 0) { fmt = t.fmt; K = (int)t.cols(); }
+                    ok = ok && t.fmt == fmt && (int)t.cols() == K && t.fmt != FMT_Q8ROW;
+                    W[j] = tw(nm);
+                    Y[j] = kv_f + (size_t)j * HID;
+                    N[j] = (int)t.rows();
+                }
+                if (ok) lm_eng[mo] = linear_multi_build(fmt, K, 5, W, Y, N);
+            }
+        }
         for (int il = 0; il < NL; ++il) {
             const std::string pa = L(il) + ".self_attn", pm = L(il) + ".mlp";
             {
@@ -518,32 +534,74 @@ public:
 
     // Engram rows of one chunk for all 4 modules (CPU hash + page reads), uploaded to the device
     struct EPrep {
-        std::vector<uint8_t> raw, valid;  // [4][Tc*16*100], [4][Tc*16]
+        uint8_t *raw = nullptr, *valid = nullptr;  // pinned host memory: [4][Tc*16*100], [4][Tc*16] (real async uploads)
         int p0 = -1, T = 0;
         bool ok = false, pending = false;
         std::string err;
         std::future<void> fut;
         hipEvent_t used = nullptr;  // recorded after the uploads of this slot were enqueued
+        bool staged = false, ok_rest = true;  // decode: module 0 is published through pm0 / fm0 as soon as it is loaded, modules 1..3 follow (fut)
+        std::promise<void> pm0;
+        std::future<void> fm0;
     };
+    EPrep* ep_rest = nullptr;
     EPrep ep[2];
     int ep_next = 0;
-    double t_engram_wait = 0;
+    double t_engram_wait = 0, t_eng_issue = 0, t_eng_prep = 0;
+    int n_eng_dec = 0;
 
     void ep_alloc() {
         for (int s = 0; s < 2; ++s) {
-            ep[s].raw.resize((size_t)4 * Tc * 16 * 100);
-            ep[s].valid.resize((size_t)4 * Tc * 16);
+            HCK(hipHostMalloc((void**)&ep[s].raw, (size_t)4 * Tc * 16 * 100, hipHostMallocDefault));
+            HCK(hipHostMalloc((void**)&ep[s].valid, (size_t)4 * Tc * 16, hipHostMallocDefault));
             HCK(hipEventCreateWithFlags(&ep[s].used, hipEventDisableTiming));
         }
     }
     void ep_compute(EPrep* e, const int32_t* tok_all, int p0, int T) {
         std::string err;
         e->ok = true;
+        if (T <= 8 && e->staged) {  // decode / verify window: module 0 first (published through pm0), then modules 1..3 in one batch
+            const size_t per = (size_t)T * 16;
+            auto fetch_modules = [&](int m0, int m1) -> bool {
+                std::vector<uint64_t> ids((size_t)(m1 - m0) * per);
+                for (int mo = m0; mo < m1; ++mo) engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data() + (size_t)(mo - m0) * per, e->valid + (size_t)mo * Tc * 16);
+                std::vector<uint8_t> tmp(ids.size() * 100);
+                if (!eio.fetch_raw(ids.data(), ids.size(), tmp.data(), err)) return false;
+                for (int mo = m0; mo < m1; ++mo) std::memcpy(e->raw + (size_t)mo * Tc * 16 * 100, tmp.data() + (size_t)(mo - m0) * per * 100, per * 100);
+                return true;
+            };
+            if (!fetch_modules(0, 1)) {
+                e->ok = false;
+                e->err = err;
+                e->ok_rest = false;
+                e->pm0.set_value();
+                return;
+            }
+            e->pm0.set_value();
+            if (!fetch_modules(1, 4)) {
+                e->ok_rest = false;
+                e->err = err;
+            }
+            return;
+        }
+        if (T <= 8) {  // sync decode / verify window without a prefetch: the rows of all 4 modules in ONE fetch
+            const size_t per = (size_t)T * 16;
+            std::vector<uint64_t> ids(4 * per);
+            for (int mo = 0; mo < 4; ++mo) engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data() + mo * per, e->valid + (size_t)mo * Tc * 16);
+            std::vector<uint8_t> tmp(4 * per * 100);
+            if (!eio.fetch_raw(ids.data(), ids.size(), tmp.data(), err)) {
+                e->ok = false;
+                e->err = err;
+                return;
+            }
+            for (int mo = 0; mo < 4; ++mo) std::memcpy(e->raw + (size_t)mo * Tc * 16 * 100, tmp.data() + mo * per * 100, per * 100);
+            return;
+        }
         for (int mo = 0; mo < 4; ++mo) {
             std::vector<uint64_t> ids((size_t)T * 16);
-            uint8_t* valid = e->valid.data() + (size_t)mo * Tc * 16;
+            uint8_t* valid = e->valid + (size_t)mo * Tc * 16;
             engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), valid);
-            uint8_t* raw = e->raw.data() + (size_t)mo * Tc * 16 * 100;
+            uint8_t* raw = e->raw + (size_t)mo * Tc * 16 * 100;
             if (!eio.fetch_raw(ids.data(), ids.size(), raw, err)) {
                 e->ok = false;
                 e->err = err;
@@ -560,6 +618,12 @@ public:
         e.p0 = p0;
         e.T = T;
         e.pending = true;
+        e.staged = T <= 8;
+        e.ok_rest = true;
+        if (e.staged) {
+            e.pm0 = std::promise<void>();
+            e.fm0 = e.pm0.get_future();
+        }
         e.fut = std::async(std::launch::async, [this, &e, tok_all, p0, T]() { ep_compute(&e, tok_all, p0, T); });
         ep_next ^= 1;
     }
@@ -568,6 +632,20 @@ public:
         EPrep* e = nullptr;
         for (int s = 0; s < 2; ++s)
             if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T) e = &ep[s];
+        if (e && e->staged) {
+            // decode: only module 0 (needed at layer 1) is awaited here; modules 1..3 keep loading while the GPU runs layers 1..10 (engram_prep_rest, before module 1's layer)
+            e->fm0.get();
+            if (!e->ok) {
+                err = e->err;
+                return false;
+            }
+            HCK(hipMemcpyAsync(d_eraw[0], e->raw, (size_t)T * 16 * 100, hipMemcpyHostToDevice, st));
+            HCK(hipMemcpyAsync(d_evalid[0], e->valid, (size_t)T * 16, hipMemcpyHostToDevice, st));
+            HCK(hipEventRecord(e->used, st));
+            ep_rest = e;
+            t_engram_cpu += now_s() - t0;
+            return true;
+        }
         if (e) {
             e->fut.get();
             e->pending = false;
@@ -585,11 +663,30 @@ public:
             return false;
         }
         for (int mo = 0; mo < 4; ++mo) {
-            HCK(hipMemcpyAsync(d_eraw[mo], e->raw.data() + (size_t)mo * Tc * 16 * 100, (size_t)T * 16 * 100, hipMemcpyHostToDevice, st));
-            HCK(hipMemcpyAsync(d_evalid[mo], e->valid.data() + (size_t)mo * Tc * 16, (size_t)T * 16, hipMemcpyHostToDevice, st));
+            HCK(hipMemcpyAsync(d_eraw[mo], e->raw + (size_t)mo * Tc * 16 * 100, (size_t)T * 16 * 100, hipMemcpyHostToDevice, st));
+            HCK(hipMemcpyAsync(d_evalid[mo], e->valid + (size_t)mo * Tc * 16, (size_t)T * 16, hipMemcpyHostToDevice, st));
         }
         HCK(hipEventRecord(e->used, st));
         t_engram_cpu += now_s() - t0;
+        return true;
+    }
+
+    // second half of a staged decode fetch: wait for modules 1..3 and upload them
+    bool engram_prep_rest(std::string& err) {
+        if (!ep_rest) return true;
+        EPrep* e = ep_rest;
+        ep_rest = nullptr;
+        e->fut.get();
+        e->pending = false;
+        if (!e->ok_rest) {
+            err = e->err;
+            return false;
+        }
+        for (int mo = 1; mo < 4; ++mo) {
+            HCK(hipMemcpyAsync(d_eraw[mo], e->raw + (size_t)mo * Tc * 16 * 100, (size_t)e->T * 16 * 100, hipMemcpyHostToDevice, st));
+            HCK(hipMemcpyAsync(d_evalid[mo], e->valid + (size_t)mo * Tc * 16, (size_t)e->T * 16, hipMemcpyHostToDevice, st));
+        }
+        HCK(hipEventRecord(e->used, st));
         return true;
     }
 
@@ -607,6 +704,9 @@ public:
         const std::string p = L(il) + ".engram_layer";
         EngramDev& e = eng_dev[mo];
         hipLaunchKernelGGL(k_engram_rows, dim3(T), dim3(512), 0, st, d_eraw[mo], e.lnw, d_evalid[mo], er_h);
+        if (T == 1 && (tune & TN_ENG) && lm_eng[mo].d_jobs) {  // the 5 projections of one token in ONE launch (outputs at kv_f + j * HID, as below)
+            linear_h_multi(st, lm_eng[mo], er_h, 1);
+        } else
         for (int j = 0; j < 5; ++j) {
             std::string nm = j < 4 ? p + ".key_projs." + std::to_string(j) + ".weight" : p + ".value_proj.weight";
             const TInfo& t = ti(nm);
@@ -633,12 +733,8 @@ public:
 
     // iHC pre-mix + RMSNorm(nw) of cur = sum_h pre_h x_h  ->  outh (fp16) / outf (fp32, optional); post (4 per token) is produced for nout == 8
     void hc_pre(const float* xin, const float* hfn, const float* hsc, const float* hbs, const float* nw, int nout, int T, __half* outh, float* outf) {
-        if (tune & TN_HC) {
-            hipLaunchKernelGGL(k_hc_pre, dim3(T, 24), dim3(256), 0, st, xin, hfn, hsc, hbs, nw, hc_part, hc_cnt, post, outh, outf, nout, c.rms_eps, c.hc_eps, c.hc_mag, c.rms_eps);
-        } else {
-            hc_mix_run(xin, hfn, hsc, hbs, nout, T);
-            hipLaunchKernelGGL(k_hc_reduce_norm, dim3(T), dim3(256), 0, st, xin, pre, nw, outh, outf, c.rms_eps);
-        }
+        hc_mix_run(xin, hfn, hsc, hbs, nout, T);
+        hipLaunchKernelGGL(k_hc_reduce_norm, dim3(T), dim3(256), 0, st, xin, pre, nw, outh, outf, c.rms_eps);
     }
 
     // IndexPool: cache iv/ig of the chunk's tokens and pool the groups completed by this chunk
@@ -839,10 +935,14 @@ public:
         HCK(hipMemcpyAsync(d_ids, tok_all + p0, (size_t)T * 4, hipMemcpyHostToDevice, st));
         hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
         const bool defer_eng = engram_ready && T <= 8;
-        if (defer_eng) prefetch_engram(tok_all, p0, T);
-        else if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
+        if (defer_eng) {
+            const double t_pf0 = now_s();
+            prefetch_engram(tok_all, p0, T);
+            t_eng_issue += now_s() - t_pf0;
+        } else if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
         for (int il = 0; il < c.n_layers; ++il) {
-            if (defer_eng && il == 1 && !engram_prep(tok_all, p0, T, err)) return false;
+            if (defer_eng && il == 1) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err)) return false; t_eng_prep += now_s() - tq; ++n_eng_dec; }
+            if (defer_eng && il == emeta.layers[1] && !engram_prep_rest(err)) return false;
             int mo = -1;
             for (int j = 0; j < 4; ++j)
                 if (emeta.layers[j] == il) mo = j;

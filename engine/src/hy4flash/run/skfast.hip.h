@@ -218,22 +218,11 @@ __global__ void __launch_bounds__(256) k_gemv_multi(const LinJob* __restrict__ j
     gemv_body<FMT, MT, RW>(jb.W, jb.N, K, jb.X ? jb.X : X, jb.Y, M, (int)blockIdx.x - jb.blk0, jb.Xg, jb.Xu);
 }
 
-// rows per wave of the single-GEMV launch (1, 2 or 4); per-row results do not depend on it. Tuning knob (env HY4_GEMV_RW).
-inline int& gemv_rw() { static int v = getenv("HY4_GEMV_RW") ? atoi(getenv("HY4_GEMV_RW")) : 2; return v; }
-
 template <int FMT, int MT>
 inline void launch_gemv(hipStream_t s, const void* W, int N, int K, const __half* X, float* Y, int M) {
-    const int rw = gemv_rw();
-    if (rw == 1) {
-        dim3 grid((N + 7) / 8), block(256);
-        hipLaunchKernelGGL((k_gemv<FMT, MT, 1>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
-    } else if (rw == 4) {
-        dim3 grid((N + 31) / 32), block(256);
-        hipLaunchKernelGGL((k_gemv<FMT, MT, 4>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
-    } else {
-        dim3 grid((N + 15) / 16), block(256);
-        hipLaunchKernelGGL((k_gemv<FMT, MT, 2>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
-    }
+    constexpr int RW = 2;  // rows per wave (1 and 4 measured: no gain, 4 slower for M > 1)
+    dim3 grid((N + 8 * RW - 1) / (8 * RW)), block(256);
+    hipLaunchKernelGGL((k_gemv<FMT, MT, RW>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
 }
 
 template <int FMT>

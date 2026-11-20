@@ -137,22 +137,35 @@ __global__ void k_idx_select(const float* __restrict__ score, int ldS, int p0, i
         return;
     }
     const float* sc = score + (size_t)t * ldS;
-    // binary search the n_top-th largest key
-    uint32_t lo = 0, hi = 0xFFFFFFFFu;  // find max thr with count(key >= thr) >= n_top
-    for (int it = 0; it < 33 && lo < hi; ++it) {
-        uint32_t mid = (uint32_t)(lo + (((uint64_t)hi - lo + 1) >> 1));
-        int c = 0;
-        for (int g = threadIdx.x; g < grp; g += blockDim.x) c += (f2key(sc[g]) >= mid) ? 1 : 0;
-        for (int o = 16; o > 0; o >>= 1) c += __shfl_xor(c, o);
+    // the n_top-th largest key (= the max thr with count(key >= thr) >= n_top): MSB-first radix select, 4 passes of an 8-bit histogram (integer LDS atomics: exact and independent of the
+    // scheduling) instead of 33 dependent block-wide counting rounds. Same thr as the binary search it replaces.
+    __shared__ int hist[256];
+    __shared__ uint32_t prefix_s;
+    __shared__ int need_s;
+    if (threadIdx.x == 0) { prefix_s = 0; need_s = n_top; }
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8 * pass;
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
         __syncthreads();
-        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = c;
+        const uint32_t pre = prefix_s;
+        for (int g = threadIdx.x; g < grp; g += blockDim.x) {
+            const uint32_t k = f2key(sc[g]);
+            if (pass == 0 || (k >> (shift + 8)) == (pre >> (shift + 8))) atomicAdd(&hist[(k >> shift) & 255u], 1);
+        }
         __syncthreads();
-        int tot = 0;
-        for (int w = 0; w < 8; ++w) tot += red[w];
-        if (tot >= n_top) lo = mid; else hi = mid - 1;
+        if (threadIdx.x == 0) {
+            int acc = 0, d = 255;
+            const int need = need_s;
+            for (; d > 0; --d) {
+                if (acc + hist[d] >= need) break;
+                acc += hist[d];
+            }
+            need_s = need - acc;
+            prefix_s = pre | ((uint32_t)d << shift);
+        }
         __syncthreads();
     }
-    if (threadIdx.x == 0) { thr_s = lo; cnt_sel = 0; }
+    if (threadIdx.x == 0) { thr_s = prefix_s; cnt_sel = 0; }
     __syncthreads();
     uint32_t thr = thr_s;
     // count strictly greater

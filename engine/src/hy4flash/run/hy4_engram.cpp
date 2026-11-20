@@ -6,7 +6,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <functional>
 #include <future>
+#include <mutex>
 #include <thread>
 
 #include "hy4_json.h"
@@ -51,6 +54,49 @@ void parallel_for_chunks(size_t n, int nt, F&& f) {  // f(tid, begin, end)
         th.emplace_back([&, t, b, e] { f(t, b, e); });
     }
     for (auto& x : th) x.join();
+}
+
+// Persistent helper threads for small page-read batches (a decode step reads ~50 random pages, ~4 times per second per token: spawning threads for them cost more than the reads).
+// run(n, fn): fn() runs on n-1 pool threads and on the caller; returns when all are done. Never destroyed (the threads die with the process).
+struct HelperPool {
+    std::mutex m;
+    std::condition_variable cv, done;
+    std::vector<std::thread> th;
+    std::function<void()> job;
+    int claim = 0, remaining = 0;
+    void loop() {
+        for (;;) {
+            std::function<void()> j;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] { return claim > 0; });
+                --claim;
+                j = job;
+            }
+            j();
+            std::lock_guard<std::mutex> lk(m);
+            if (--remaining == 0) done.notify_all();
+        }
+    }
+    void run(int n, const std::function<void()>& fn) {
+        if (n <= 1) { fn(); return; }
+        std::lock_guard<std::mutex> serial(run_mu);
+        {
+            std::lock_guard<std::mutex> lk(m);
+            while ((int)th.size() < n - 1) { th.emplace_back([this] { loop(); }); th.back().detach(); }
+            job = fn;
+            claim = remaining = n - 1;
+        }
+        cv.notify_all();
+        fn();
+        std::unique_lock<std::mutex> lk(m);
+        done.wait(lk, [&] { return remaining == 0; });
+    }
+    std::mutex run_mu;
+};
+HelperPool& helper_pool() {
+    static HelperPool* p = new HelperPool();
+    return *p;
 }
 
 }  // namespace
@@ -177,6 +223,8 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
     if (n == 0) return true;
     threads = std::max(1, threads);
     qd = std::max(1, qd);
+    const bool few_pages = n <= 256;  // a decode-step fetch (~50 pages): spread over persistent helper threads (each issues its share and waits), no thread creation per call
+    if (few_pages) { qd = std::min(qd, 8); threads = std::min(threads, 8); }
     std::atomic<size_t> next{0};
     std::atomic<bool> bad{false};
     std::mutex emu;
@@ -217,10 +265,16 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
         for (int j = 0; j < qd; ++j) CloseHandle(ev[(size_t)j]);
     };
     int nt = (int)std::min<size_t>((size_t)threads, (n + (size_t)qd - 1) / (size_t)qd);
-    std::vector<std::thread> th;
-    for (int t = 1; t < nt; ++t) th.emplace_back(worker);
-    worker();
-    for (auto& t : th) t.join();
+    if (few_pages) {
+        nt = (int)std::min<size_t>((size_t)threads, (n + 5) / 6);  // ~6 pages per thread
+        qd = (int)std::min<size_t>((size_t)qd, (n + (size_t)nt - 1) / (size_t)nt);
+        helper_pool().run(nt, std::function<void()>(worker));
+    } else {
+        std::vector<std::thread> th;
+        for (int t = 1; t < nt; ++t) th.emplace_back(worker);
+        worker();
+        for (auto& t : th) t.join();
+    }
     if (bad.load()) { err = first_err; return false; }
     return true;
 }
@@ -246,6 +300,7 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
     if (!h_) { err = "PageFile not open"; return false; }
     int fd = (int)((intptr_t)h_ - 1);
     int nt = (int)std::min<size_t>((size_t)std::max(1, threads) * (size_t)std::max(1, qd), n);
+    if (n <= 256) nt = std::min(nt, 16);  // decode-sized fetches: persistent helper threads
     std::atomic<size_t> next{0};
     std::atomic<bool> bad{false};
     std::mutex emu;
@@ -261,10 +316,14 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
             }
         }
     };
-    std::vector<std::thread> th;
-    for (int t = 1; t < nt; ++t) th.emplace_back(worker);
-    worker();
-    for (auto& t : th) t.join();
+    if (n <= 256) {
+        helper_pool().run(nt, std::function<void()>(worker));
+    } else {
+        std::vector<std::thread> th;
+        for (int t = 1; t < nt; ++t) th.emplace_back(worker);
+        worker();
+        for (auto& t : th) t.join();
+    }
     if (bad.load()) { err = first_err; return false; }
     return true;
 }
@@ -470,7 +529,8 @@ bool EngramIO::fetch_raw(const uint64_t* ids, size_t n, uint8_t* out, std::strin
     const size_t P = pages.size();
     const size_t B = 8192;  // pages per batch = 32 MiB
     const uint64_t base_page = sec4_off_ / ENGRAM_PAGE;
-    uint8_t* buf[2] = {(uint8_t*)engram_aligned_alloc(B * ENGRAM_PAGE), (uint8_t*)engram_aligned_alloc(B * ENGRAM_PAGE)};
+    const size_t BA = std::min(P, B);  // small fetches (decode: ~64 pages) must not allocate two 32 MiB buffers
+    uint8_t* buf[2] = {(uint8_t*)engram_aligned_alloc(BA * ENGRAM_PAGE), (uint8_t*)engram_aligned_alloc(BA * ENGRAM_PAGE)};
     if (!buf[0] || !buf[1]) { engram_aligned_free(buf[0]); engram_aligned_free(buf[1]); err = "fetch_raw: out of memory for page buffers"; return false; }
     bool ok = true;
     std::string ioerr;
