@@ -1709,6 +1709,7 @@ public:
     void kv_grow_to(int need) {
         if (kv_is_host || need <= kv_alloc_pos) return;
         const int target = std::min(max_ctx, ((std::max(need + 16, kv_alloc_pos + 16384) + 16383) / 16384) * 16384);
+        if (target <= kv_alloc_pos) return;
         if (kv_dev_limit > 0 && target > kv_dev_limit) { kv_spill_to_host(); return; }
         const double t0 = now_s();
         HCK(hipDeviceSynchronize());
