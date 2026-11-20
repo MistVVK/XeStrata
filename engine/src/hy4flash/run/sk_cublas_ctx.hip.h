@@ -48,6 +48,10 @@ struct CublasPfState {
         if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) return false;
         cudaDeviceProp dp{};
         const bool is_uma = (cudaGetDeviceProperties(&dp, d) == cudaSuccess && dp.integrated != 0);
+        if (is_uma && !getenv("HY4_CUBLAS_PF")) {
+            fprintf(stderr, "[cublas-pf] auto-disabled on integrated UMA GPU (fused skwmma avoids LPDDR5X round-trip; set HY4_CUBLAS_PF=1 to override)\n");
+            return false;
+        }
         size_t want_bytes = getenv("HY4_CUBLAS_SCRATCH_MB") ? ((size_t)std::max(16, atoi(getenv("HY4_CUBLAS_SCRATCH_MB"))) << 20) : ((size_t)64 << 20);
         if (!is_uma && fr < want_bytes + ((size_t)96 << 20)) want_bytes = (size_t)32 << 20;
         if (!is_uma && fr < want_bytes + ((size_t)64 << 20)) {
