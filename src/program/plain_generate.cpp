@@ -2674,6 +2674,8 @@ int plain_main(int argc, char** argv) {
     linkless_gpu_adapter();
 
     strata::core::PlainOptions opt;
+    // The official Q4_K_M MTP accepted 52.8% of 123 drafts on the B70; keep it available with --spec.
+    if (arch == "sensenova_loop") opt.spec = 0;
     opt.coupled_draft = strata::core::coupled_draft_env();   // STRATA_SPEC_COUPLED=1, as Qwen3.8-Flash-Next's
     // XESTRATA_BATCH_MTP: auto (the default) keeps the option (on by default where the slots allow it); 0 and 1 turn
     // it off and on, as --no-batch-mtp / --batch-mtp do.

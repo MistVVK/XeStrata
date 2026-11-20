@@ -518,7 +518,6 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
             (opt_.gpu_layers >= 0 && opt_.gpu_layers < spec_.n_layer)) {
             err = "plain model: this SenseNova-Loop path needs GPU-resident text blocks"; return false;
         }
-        opt_.spec = 0;
     }
     // the layer split: its points (given, or from the GPUs' memory), each rising inside the trunk, a GPU each
     const int64_t nl = spec_.n_layer;
@@ -706,13 +705,17 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
     // each block's weights; the head and the final norm; a block's K/V (a sliding-window layer's ring: the window and
     // a prompt chunk) or recurrent state
     std::vector<uint64_t> block((size_t) nl, 0);
-    uint64_t head = 0;
+    uint64_t head = 0, mtp_weights = 0;
+    const bool mtp = opt_.spec >= 2 && s.n_nextn == 1 &&
+                     (s.arch == ModelArch::Qwen35 || s.arch == ModelArch::SenseNovaLoop) &&
+                     model_->find("blk." + std::to_string(nl) + ".nextn.eh_proj.weight") != nullptr;
     for (size_t i = 0; i < model_->size(); ++i)
         for (const TensorInfo& ti : model_->shard(i).tensors()) {
             const uint64_t b = uploaded_bytes(ti);
             if (ti.name.rfind("blk.", 0) == 0) {
                 const int64_t l = std::strtoll(ti.name.c_str() + 4, nullptr, 10);
                 if (l >= 0 && l < nl) block[(size_t) l] += b;
+                else if (mtp && l == nl) mtp_weights += b;
             } else if (ti.name == head_name() || ti.name == "output_norm.weight") {
                 head += b;
             }
@@ -736,6 +739,7 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
         else
             kv_cells[(size_t) l] = (uint64_t) (cells * nkv);
     }
+    uint64_t mtp_kv_cells = mtp ? (uint64_t) opt_.max_cells * (uint64_t) nkv : 0;
     // the window's and the prompt's buffers and the driver's share: the layer split's reserve (split_auto_points)
     // - the device's room, core::vram_room, plus the 1 GiB this stage's windows and prompt path take
     const uint64_t reserve = opt_.reserve_mib >= 0
@@ -743,12 +747,13 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
                                  : core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30);
     // the blocks the GPU holds in order with the K/V's rows of `row` bytes, and the bytes they take
     const auto fits = [&](uint64_t row, uint64_t* bytes) {
-        uint64_t used = head + reserve;
+        uint64_t used = head + reserve + mtp_weights + mtp_kv_cells * row;
         int64_t n = 0;
         while (n < nl && used + block[(size_t) n] + kv_cells[(size_t) n] * row <= free_b) {
             used += block[(size_t) n] + kv_cells[(size_t) n] * row;
             ++n;
         }
+        if (bytes != nullptr) *bytes += mtp_weights + mtp_kv_cells * row;
         if (bytes != nullptr)
             for (int64_t l = 0; l < nl; ++l) *bytes += block[(size_t) l] + kv_cells[(size_t) l] * row;
         return n;
@@ -767,6 +772,7 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
         const int64_t ring = std::min<int64_t>(opt_.max_cells, (32768 + opt_.max_t + ps - 1) / ps * ps);
         for (int64_t l = 0; l < nl; ++l)
             if (!s.recurrent[(size_t) l] && !s.layer_swa(l)) kv_cells[(size_t) l] = (uint64_t) (ring * nkv);
+        if (mtp) mtp_kv_cells = (uint64_t) ring * (uint64_t) nkv;
         if (opt_.kv_tcq != 0) {
             opt_.kv_tcq = 0;
             opt_.kv_int8 = fits(kv_row(false, 0, 0), nullptr) < nl;
