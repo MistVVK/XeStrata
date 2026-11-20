@@ -76,7 +76,7 @@ class Table(unittest.TestCase):
         self.assertNotIn("hy4-flash", setup.OWN_PATH_FAMILIES)
 
     def test_an_8_gib_card_with_64_gib_is_offered_sq_64_with_ssd_reads_at_128k(self):
-        # HY4-CUDA: SQ-64 (56 GB of experts) + the 5.5 GB of host KV do not fit the 58 GB usable of a 64 GiB PC: about 2.8 GB are read from the SSD.  There is no SQ-32 any more
+        # HY4-CUDA: SQ-64 (56 GB of experts) + the 5.7 GB of host KV do not fit the 58 GB usable of a 64 GiB PC: about 3.0 GB are read from the SSD.  There is no SQ-32 any more
         # (owner, 2026-11-20): SQ-64 stays the recommendation, still at 128K, with the "may run slower" words; Hy4-Flash is not hidden
         lines = dict(setup.hy4_menu_lines(8, 64, False, 131072, True))
         self.assertEqual([b for b, t in setup.hy4_menu_lines(8, 64, False, 131072, True) if "(recommended)" in t], ["SQ-64"])
@@ -288,7 +288,7 @@ class Defaults0218(unittest.TestCase):
         cfg, _lines, _ = self.install(vram=8.0)                                          # the engine lanes deal with a cache that does not fit the card
         args = cfg["args"]
         self.assertEqual(args[args.index("--vram-experts-gb") + 1], "0.79")
-        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "52.49")        # 8 GiB + 64 GiB, SQ-64: 2.8 GB of its experts are read from the SSD (the planner recommends SQ-64 there: there is no SQ-32)
+        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "52.29")        # 8 GiB + 64 GiB, SQ-64: 3.0 GB of its experts are read from the SSD (the planner recommends SQ-64 there: there is no SQ-32)
 
 
 class Catalog(unittest.TestCase):

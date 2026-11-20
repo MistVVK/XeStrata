@@ -78,7 +78,7 @@ class Recommendation(unittest.TestCase):
             self.assertFalse(got["fits"])
             self.assertGreater(got["placement"]["ssd_gb"], 5.0)
             self.assertEqual(got["mode"], "cross_tier_ssd")
-        self.assertAlmostEqual(F.recommend(12, 32, False, 131072, True)["placement"]["ssd_gb"], 32.83, delta=0.05)
+        self.assertAlmostEqual(F.recommend(12, 32, False, 131072, True)["placement"]["ssd_gb"], 33.03, delta=0.05)
 
     def test_no_card(self):
         got = F.recommend(None, 64)
@@ -134,13 +134,13 @@ class Defaults0218(unittest.TestCase):
         # the resident cases stay resident (RAM takes what the card gives up, and the engine keeps the KV state in pinned host memory on a small card) ...
         for model, vram, ram in (('SQ-64', 12, 64), ('SQ-96', 12, 96), ('SQ-128', 12, 128), ('SQ-96', 8, 96)):
             self.assertEqual(F.compute(model, vram, ram, 131072, True)['ssd_gb'], 0.0, (model, vram, ram))
-        # ... and the ones that read from the SSD read more: the 5.5 GB of host KV and the pinned headroom come out of RAM
+        # ... and the ones that read from the SSD read more: the 5.7 GB of host KV and the pinned headroom come out of RAM
         # (the author's SQ-32 rows of the 32 GiB class are not offered any more; there SQ-64 is recommended and reads from the SSD, see test_the_32_gib_class_gets_sq_64_with_its_ssd_read_figure)
-        self.assertAlmostEqual(F.compute('SQ-64', 12, 32, 131072, True)['ssd_gb'], 32.83, delta=0.05)
+        self.assertAlmostEqual(F.compute('SQ-64', 12, 32, 131072, True)['ssd_gb'], 33.03, delta=0.05)
 
     def test_the_home_pc_12_gib_card_and_64_gib_of_ram_at_128k(self):
         r = F.compute("SQ-64", 12, 64, 131072, True)
-        self.assertEqual((r["vram_gb"], r["ram_gb"], r["ssd_gb"]), (5.08, 50.96, 0.0))      # 12 GiB: the engine keeps the KV state (5.5 GB at 128K, over 15% of the card) in pinned host memory, so the card holds 5.08 GB of experts as at the author's 20K and RAM the rest plus the pinned cache
+        self.assertEqual((r["vram_gb"], r["ram_gb"], r["ssd_gb"]), (5.08, 50.96, 0.0))      # 12 GiB: the engine keeps the KV state (5.7 GB at 128K, over 15% of the card) in pinned host memory, so the card holds 5.08 GB of experts as at the author's 20K and RAM the rest plus the pinned cache
         self.assertEqual(F.recommend(12, 64, False, 131072, True)["build"], "SQ-64")
 
     def test_the_images_cost_the_ram_only(self):
@@ -160,17 +160,17 @@ class Defaults0218(unittest.TestCase):
         self.assertFalse(hasattr(F, "recommend_context"))
         self.assertFalse(hasattr(F, "context_fits"))
         self.assertTrue(F.kv_in_host(8, 131072))
-        self.assertAlmostEqual(F.host_kv_gb(131072), 5.5, delta=0.001)
+        self.assertAlmostEqual(F.host_kv_gb(131072), 5.7, delta=0.001)
         r = F.compute("SQ-64", 8, 64, 131072, True)
-        self.assertEqual(F.mode(r["ssd_gb"]), "near_resident_ssd")             # 56 GB of experts + 5.5 GB of host KV do not fit the 58 GB of a 64 GiB PC: about 2.8 GB are read from the SSD
-        self.assertAlmostEqual(r["ssd_gb"], 2.76, delta=0.05)
+        self.assertEqual(F.mode(r["ssd_gb"]), "near_resident_ssd")             # 56 GB of experts + 5.5 GB of host KV do not fit the 58 GB of a 64 GiB PC: about 3.0 GB are read from the SSD
+        self.assertAlmostEqual(r["ssd_gb"], 2.96, delta=0.05)
         self.assertFalse(F.fits("SQ-64", 8, 64, False, 131072, True))
         best = F.recommend(8, 64, False, 131072, True)
         # owner, 2026-11-20: SQ-32 is removed ("too weak"), so SQ-64 is still the recommendation there, still at 128K, with its SSD-read figure and the "may run slower" words
         self.assertEqual(best["build"], "SQ-64")
         self.assertFalse(best["fits"])
         self.assertEqual(best["mode"], "near_resident_ssd")
-        self.assertEqual(best["placement"], {"vram_gb": 0.79, "ram_gb": 52.49, "ssd_gb": 2.76})
+        self.assertEqual(best["placement"], {"vram_gb": 0.79, "ram_gb": 52.29, "ssd_gb": 2.96})
         self.assertFalse(F.kv_in_host(48, 131072))                             # a big card keeps it in video memory
         self.assertGreater(F.compute("SQ-64", 8, 64, 20480, True)["vram_gb"], 0.0)       # at the author's 20K the state stays in the card (0.86 GB is under 15% of 8 GiB)
         self.assertFalse(F.kv_in_host(8, 20480))

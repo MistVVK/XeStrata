@@ -21,8 +21,8 @@ tests/terminal/test_hy4_squant_fit.py, plus what the 0.2.18 defaults add (owner,
 
 The placement is planned at the chosen context on every card, 8 GB ones included (owner, 2026-11-19: 128K is the default everywhere and people change it themselves, never a
 lower context chosen for them).  Host-side KV (HY4-CUDA's engine, 2026-11-19): when the sparse-layer KV, the IndexPool state and the absorbed kv_b copies (HOST_KV_GB_PER_TOKEN,
-5.5 GB at 128K) exceed 15% of the card's memory, the engine keeps them in pinned host memory.  Then the card holds only the core weights and the author's 2.00 GB (so its expert room is
-as at 20K) and RAM holds the 5.5 GB and HOST_PIN_HEADROOM_GB more (about 58 GB of a 64 GiB PC is usable).  That makes SQ-64 not fit 8 GiB + 64 GiB at 128K (about 2.8 GB from the SSD),
+5.7 GB at 128K once a prompt passes about 33K positions on an 8 GB card: rows + IndexPool + kv_b copies, HY4-CUDA's growable KV of 2026-11-20) exceed 15% of the card's memory, the engine keeps them in pinned host memory.  Then the card holds only the core weights and the author's 2.00 GB (so its expert room is
+as at 20K) and RAM holds the 5.7 GB and HOST_PIN_HEADROOM_GB more (about 58 GB of a 64 GiB PC is usable).  That makes SQ-64 not fit 8 GiB + 64 GiB at 128K (about 3.0 GB from the SSD),
 and the planner still recommends SQ-64 there (the smallest build; there is no SQ-32), still at 128K, with the "may run slower" words and its SSD-read figure.  A 12 GiB card at 128K also keeps the state in host memory (5.5 GB is over 15% of it) and stays resident with SQ-64 + 64 GiB.
 
 Unified memory (Strata Halo, Apple silicon, DGX Spark) has one pool: the trunk, the KV and every expert body live in it and nothing is copied or read from the SSD while the
@@ -48,8 +48,8 @@ CONTEXTS = [8192, 32768, 65536, 131072]
 KV_GB_PER_TOKEN = 34.7e-6        # KV + context workspace (IndexPool, workspace and Engram buffers grow with it too), per token: HY4-STRIX, Strix Halo SQ-64: (66.3 - 62.2) GiB x 1.0737 / (131072 - 4096); HY4-METAL (M5 Max): +5.0 GB from 4K to 128K, KV alone 1.9 GB of it
 DRAFTER_GB = 0.44                # the 5-layer DFly2 drafter, in Section 1 already (inside every build's dense_gb): kept here to say so, not added twice
 #: Pinned host memory for the sparse-layer KV, the IndexPool state and the absorbed kv_b copies (HY4-CUDA, 2026-11-19): the engine puts them there when they exceed 15% of VRAM.
-#: About 5.5 GB at 128K (so 42 KB a token); with them pinned about 58 GB of a 64 GiB PC is usable, which makes the headroom below (the pinned staging beside the cache itself).
-HOST_KV_GB_PER_TOKEN = 5.5 / 131072
+#: About 5.7 GB at 128K (so 43.5 KB a token; rows + IndexPool + kv_b copies, HY4-CUDA 2026-11-20); with them pinned about 58 GB of a 64 GiB PC is usable, which makes the headroom below (the pinned staging beside the cache itself).
+HOST_KV_GB_PER_TOKEN = 5.7 / 131072
 HOST_KV_VRAM_SHARE = 0.15
 HOST_PIN_HEADROOM_GB = 3.8
 FAMILY = "hy4-flash"
