@@ -15,7 +15,7 @@
 using namespace hy4;
 
 #ifndef HY4_VERSION
-#define HY4_VERSION "0.2.18-dev"
+#define HY4_VERSION "0.1.64"  // the engine numbering of the 0.2.18 release (engines: 0.1.64; app and Terminal: 0.2.18)
 #endif
 
 // `strata-hy4 --export-tokenizer FILE.strata DIR`: Section 0's tokenizer_json and chat_template to DIR/tokenizer.hf.json and DIR/chat_template.jinja (Python builds serve's tokenizer
