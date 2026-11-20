@@ -223,16 +223,7 @@ __device__ __forceinline__ hv16 pack_hv16(uint2 a, uint2 b, uint2 c, uint2 d) {
     return __builtin_bit_cast(hv16, v);
 }
 
-// V operand of the PV product: the 4 halves of a Vt group are the values of 4 consecutive slots; only the first v of them belong to keys of this query. The others (slots after the
-// query's position: rows of later tokens of the same chunk, or stale rows) have probability exactly 0, but the matrix core's product alignment still sees their exponents, so they must
-// not reach the instruction at all (otherwise row t of a chunk depends on the tokens after it, at 1e-7 level, and a verify window differs from one-token decode).
-__device__ __forceinline__ uint2 vmask(uint2 b, int v) {
-    if (v >= 4) return b;
-    if (v <= 0) return make_uint2(0u, 0u);
-    if (v == 1) return make_uint2(b.x & 0xFFFFu, 0u);
-    if (v == 2) return make_uint2(b.x, 0u);
-    return make_uint2(b.x, b.y & 0xFFFFu);
-}
+// (vmask: defined once above for both the gfx11 and the CUDA matrix-core paths; the merge of f-hy4-dfly2 a3bc436fc and f-hy4-cuda a9ed385dd had left a second copy here)
 __device__ __forceinline__ fv8 fv8_zero() { return fv8{0, 0, 0, 0, 0, 0, 0, 0}; }
 __device__ __forceinline__ int acc_m(int r, int lane) { return 2 * r + (lane >> 4); }
 __device__ __forceinline__ int acc_n(int r, int lane) { return lane & 15; }
