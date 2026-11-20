@@ -77,9 +77,12 @@ inline void hc_mix(const float* x, const float* fn, const float* scale, const fl
 // adds the 24 partials in slab order (deterministic) and writes pre/post. part: float [T][24][9], cnt: uint32 [T].
 inline void hc_mix2(const float* x, const float* fn, const float* scale, const float* base, float* pre, float* post, int nout, float eps, float hc_eps, float hc_mag, int T, float* part, uint32_t* cnt) {
     constexpr int NWG = 24, K = NHC * HID, PER = K / NWG, BT = 128;
+    // Two launches instead of the earlier single launch with a "last work-group to finish does the final sum" counter (fetch_add + release / acquire fences on `part`): on the A750 that
+    // pattern gave run-to-run different pre/post for a small share of the tokens of a prefill chunk (stale partial sums of the previous call), which made the router logits and the
+    // prefill logits non-reproducible. Same partial sums, same slab order for the final sum: the results are bit-identical to the single-launch version when it works.
+    (void)cnt;
     Q().parallel_for(NR((size_t)T * NWG, BT), [=](sycl::nd_item<1> it) REQD_SG32 {
         float* shv = lmem<float, 9 * 4>(it);
-        int* last = lmem<int, 1>(it);
         const int g = (int)it.get_group(0), t = g / NWG, slab = g % NWG, tid = (int)it.get_local_id(0);
         const float* xt = x + (size_t)t * K;
         float ss = 0, a[8];
@@ -98,30 +101,22 @@ inline void hc_mix2(const float* x, const float* fn, const float* scale, const f
             for (int j = 0; j < 9; ++j) shv[j * 4 + sgid] = vals[j];
         sycl::group_barrier(it.get_group());
         if (tid < 9) part[((size_t)t * NWG + slab) * 9 + tid] = shv[tid * 4] + shv[tid * 4 + 1] + shv[tid * 4 + 2] + shv[tid * 4 + 3];
-        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-        sycl::group_barrier(it.get_group());
+    });
+    Q().parallel_for(NR(T, 32), [=](sycl::nd_item<1> it) REQD_SG32 {
+        const int t = (int)it.get_group(0), tid = (int)it.get_local_id(0);
+        auto sg = it.get_sub_group();
+        float s = 0;
+        if (tid < 9)
+            for (int q = 0; q < NWG; ++q) s += part[((size_t)t * NWG + q) * 9 + tid];
+        float v[9];
+        for (int j = 0; j < 9; ++j) v[j] = sycl::select_from_group(sg, s, (unsigned)j);
         if (tid == 0) {
-            sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device, sycl::access::address_space::global_space> c(cnt[t]);
-            const uint32_t old = c.fetch_add(1u);
-            *last = (old == (uint32_t)NWG - 1u) ? 1 : 0;
-            if (*last) c.store(0u);
-        }
-        sycl::group_barrier(it.get_group());
-        if (!*last) return;
-        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
-        if (tid < 9) {
-            float s = 0;
-            for (int q = 0; q < NWG; ++q) s += sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(part[((size_t)t * NWG + q) * 9 + tid]).load();
-            shv[tid] = s;
-        }
-        sycl::group_barrier(it.get_group());
-        if (tid == 0) {
-            const float inv = sycl::rsqrt(shv[8] / K + eps);
+            const float inv = sycl::rsqrt(v[8] / K + eps);
             for (int h = 0; h < NHC; ++h) {
-                const float m0 = shv[h] * inv;
+                const float m0 = v[h] * inv;
                 pre[(size_t)t * NHC + h] = sigmoidf_(m0 * scale[0] + base[h]) + hc_eps;
                 if (nout == 8) {
-                    const float m1 = shv[NHC + h] * inv;
+                    const float m1 = v[NHC + h] * inv;
                     post[(size_t)t * NHC + h] = hc_mag * sigmoidf_(m1 * scale[1] + base[NHC + h]) + hc_eps;
                 }
             }

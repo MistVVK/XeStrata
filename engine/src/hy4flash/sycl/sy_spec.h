@@ -24,6 +24,8 @@ struct SpecCfg {
     bool adaptive = true;  // false: always verify K (fixed window, no back-off); for sweeps
     float cut = -1.f;      // >= 0: verify the leading slots with conf > cut instead of the cost model
     bool debug = false;
+    bool plain_only = false;  // --spec-plain-only: drafter initialised and capturing, but every step is a plain step (isolates the capture / drafter from the verify windows)
+    bool check = false;    // --spec-check: after every verify, recompute the accepted window rows one token at a time and compare bitwise (diagnostic; slow)
     int rv = 256;          // reduced-vocabulary draft chain: candidates per slot (0 = full lm_head per drafted token)
 };
 
@@ -161,7 +163,7 @@ public:
             const double ti0 = now_s();
             int Kd = cfg.K;
             if (a + Kd + 2 >= max_ctx) Kd = max_ctx - a - 3;
-            const bool use_plain = plain_left > 0 || Kd < 1 || !d.can_draft(a, Kd);
+            const bool use_plain = cfg.plain_only || plain_left > 0 || Kd < 1 || !d.can_draft(a, Kd);
             if (use_plain) {
                 if (plain_left > 0) { --plain_left; ++S.plain_mode_iters; if (plain_left == 0) { probing = true; win.clear(); ++S.probes; } }
                 int nx = 0;
@@ -203,8 +205,18 @@ public:
             const double tv0 = now_s();
             for (int i = 1; i <= Kp; ++i) tok.push_back(y[i]);
             const int T = Kp + 1;
+            std::vector<std::pair<std::string, std::vector<float>>> wtap;
+            const bool dfly_cap_saved = r.dfly_cap;
+            if (cfg.check) r.tap = &wtap;
             if (!r.forward_chunk(tok.data(), a, T, err)) { finish = "error"; break; }
+            r.tap = nullptr;
             r.head(T, 0);
+            std::vector<float> wlog;
+            if (cfg.check) {
+                wlog.resize((size_t)T * V);
+                d2h(wlog.data(), r.logits, wlog.size() * 4);
+                wait();
+            }
             argmax_rows(r.logits, V, r.d_argmax, T);
             d2h(h_arg, r.d_argmax, T * 4);
             wait();
@@ -225,6 +237,41 @@ public:
             ++S.hist[std::min(n, 8)];
             ++S.spec_iters;
             const int nxt = h_arg[n];
+            if (cfg.check) {
+                // rows 0..n are the accepted ones: recompute each as a 1-token step (same KV prefix) and compare the logits bitwise; on a difference say which tap differs first
+                r.dfly_cap = false;
+                static long nchecks = 0, nbad = 0;
+                for (int i = 0; i <= n; ++i) {
+                    std::vector<std::pair<std::string, std::vector<float>>> stap;
+                    r.tap = &stap;
+                    if (!r.forward_chunk(tok.data(), a + i, 1, err)) { finish = "error"; break; }
+                    r.tap = nullptr;
+                    r.head(1, 0);
+                    std::vector<float> sl((size_t)V);
+                    d2h(sl.data(), r.logits, (size_t)V * 4);
+                    wait();
+                    size_t lb = 0;
+                    for (int e = 0; e < V; ++e) if (std::memcmp(&sl[e], &wlog[(size_t)i * V + e], 4) != 0) ++lb;
+                    ++nchecks;
+                    if (lb) {
+                        ++nbad;
+                        std::string first = "none";
+                        for (size_t k = 0; k < stap.size() && k < wtap.size(); ++k) {
+                            const size_t per = stap[k].second.size();
+                            if (stap[k].first != wtap[k].first || wtap[k].second.size() < (size_t)(i + 1) * per) continue;
+                            size_t nb = 0;
+                            for (size_t e = 0; e < per; ++e) {
+                                const float x = stap[k].second[e], y2 = wtap[k].second[(size_t)i * per + e];
+                                if (std::memcmp(&x, &y2, 4) != 0) ++nb;
+                            }
+                            if (nb) { first = stap[k].first + " (" + std::to_string(nb) + " of " + std::to_string(per) + ")"; break; }
+                        }
+                        fprintf(stderr, "[spec-check] MISMATCH a=%d row %d of window T=%d (accepted n=%d, p0 mod 4 = %d): %zu of %d logits differ; first differing tap: %s\n", a, i, T, n, a & 3, lb, V, first.c_str());
+                    }
+                }
+                r.dfly_cap = dfly_cap_saved;
+                if (nchecks % 20 == 0) fprintf(stderr, "[spec-check] %ld rows checked, %ld mismatches so far\n", nchecks, nbad);
+            }
             if (cfg.debug) fprintf(stderr, "[spec] a=%d K'=%d n=%d draft %.1f ms verify %.1f ms conf %.2f %.2f %.2f\n", a, Kp, n, tdraft, tver_ms, cf[1], Kp > 1 ? cf[2] : 0.f, Kp > 2 ? cf[3] : 0.f);
             tok.resize((size_t)a + 1);
             fwd = a + 1 + n;
@@ -242,6 +289,7 @@ public:
     }
 
     void report(FILE* f, double total_ms) const {
+        if (cfg.check) fprintf(f, "[spec-check] done (mismatch lines above, if any)\n");
         const long steps = S.spec_iters + S.plain_iters;
         fprintf(f, "[spec] K=%d %s: %ld tokens in %ld iterations (%ld spec + %ld plain), %.2f tokens/iteration, total %.0f ms\n", cfg.K, cfg.adaptive ? "adaptive" : "fixed", S.tokens, steps,
                 S.spec_iters, S.plain_iters, steps ? (double)S.tokens / steps : 0.0, total_ms);
