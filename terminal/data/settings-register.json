@@ -2705,13 +2705,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 394,
+     "line": 398,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 394,
+     "line": 398,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -2737,6 +2737,45 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_BENCH_K",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
+     "line": 413,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
+     "line": 413,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "259b51066d",
+   "first_date": "2026-11-20",
+   "since": null,
+   "last_commit": "259b51066d",
+   "last_date": "2026-11-20",
+   "status": "research",
+   "owner": "",
+   "note": "",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_BENCH_MAXT",
    "backends": [
     "cuda-hip"
@@ -2744,13 +2783,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 393,
+     "line": 397,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 393,
+     "line": 397,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -2783,7 +2822,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
-     "line": 392,
+     "line": 396,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3769,13 +3808,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 981,
+     "line": 1248,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/hy4_graph.hip.h",
-     "line": 563,
+     "line": 580,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3801,6 +3840,143 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_CPUEXP_COLD_CACHE_MB",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
+     "line": 1885,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "256",
+   "engine_sets": [
+    {
+     "file": "engine/src/hy4flash/run/cpu_experts_test.cpp",
+     "line": 569
+    }
+   ],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "259b51066d",
+   "first_date": "2026-11-20",
+   "since": null,
+   "last_commit": "259b51066d",
+   "last_date": "2026-11-20",
+   "status": "research",
+   "owner": "",
+   "note": "",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_CPUEXP_COLD_IO",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
+     "line": 1888,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "259b51066d",
+   "first_date": "2026-11-20",
+   "since": null,
+   "last_commit": "259b51066d",
+   "last_date": "2026-11-20",
+   "status": "research",
+   "owner": "",
+   "note": "",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_CPUEXP_COLD_READERS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
+     "line": 1887,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "259b51066d",
+   "first_date": "2026-11-20",
+   "since": null,
+   "last_commit": "259b51066d",
+   "last_date": "2026-11-20",
+   "status": "research",
+   "owner": "",
+   "note": "",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_CPUEXP_COLLAPSE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
+     "line": 1207,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "259b51066d",
+   "first_date": "2026-11-20",
+   "since": null,
+   "last_commit": "259b51066d",
+   "last_date": "2026-11-20",
+   "status": "research",
+   "owner": "",
+   "note": "",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_CPUEXP_KERNEL",
    "backends": [
     "cuda-hip"
@@ -3808,7 +3984,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 972,
+     "line": 1228,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3825,7 +4001,7 @@
    "first_commit": "b1f71a7f84",
    "first_date": "2026-11-19",
    "since": null,
-   "last_commit": "8927b2f163",
+   "last_commit": "259b51066d",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -3841,7 +4017,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1038,
+     "line": 1305,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3874,7 +4050,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1048,
+     "line": 1315,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3907,7 +4083,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1037,
+     "line": 1304,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3940,7 +4116,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1046,
+     "line": 1313,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -8669,6 +8845,12 @@
    ],
    "reads": [
     {
+     "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
+     "line": 811,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
      "file": "engine/src/kernels/cpu/expert_layout.cpp",
      "line": 30,
      "backend": "cpu",
@@ -8695,8 +8877,8 @@
    "first_commit": "4058aa782b",
    "first_date": "2026-11-17",
    "since": "v0.2.16",
-   "last_commit": "4e94b05592",
-   "last_date": "2026-11-19",
+   "last_commit": "259b51066d",
+   "last_date": "2026-11-20",
    "status": "research",
    "owner": "kernels/cpu",
    "note": "[auto] not documented for users; code default not readable from the call",
@@ -13520,13 +13702,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/metal/hy4_metal_main.cpp",
-     "line": 1004,
+     "line": 1056,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/metal/hy4_metal_main.cpp",
-     "line": 1049,
+     "line": 1102,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
