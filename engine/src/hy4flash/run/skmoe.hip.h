@@ -653,8 +653,8 @@ __global__ void __launch_bounds__(256, 2) k_moe_dn_rdna2(const uint8_t* __restri
 #endif  // !HY4_CUDA
 
 #if HY4_MMA
-#if !HY4_CUDA && !HY4_GFX12
-// ---------------------------------------------------------------- gfx11 ALL-8-WAVE WMMA grouped GEMMs (prefill & verify)
+#if !HY4_CUDA
+// ---------------------------------------------------------------- HIP WMMA (gfx11 + gfx12) ALL-8-WAVE grouped GEMMs (prefill & verify)
 // BM=16,32 use BN=128 BK=128 (gemm_mainloop_128: 1 thread = 1 subgroup = 64 weights, v_pk_mul_f16, global A, zero idle waves).
 // BM=64,128 use BN=64 BK=256 (gemm_mainloop_g: 2 barriers/256 k, v_pk_mul_f16, global A, zero idle waves).
 template <int FMT>
@@ -853,7 +853,7 @@ __global__ void __launch_bounds__(256) k_moe_dn_sg(const uint8_t* __restrict__ s
         default: break;
     }
 }
-#else  // HY4_CUDA || HY4_GFX12
+#else  // HY4_CUDA
 // ---------------------------------------------------------------- WMMA grouped GEMMs (prefill and small verify windows)
 // Token tile BM = WM*MTW*16 (16, 32, 64 or 128): the kernel variant handles the experts whose token count n satisfies nlo < n <= nhi, so every expert
 // is processed with the smallest tile that covers it (a 128-token tile wastes 16x the matrix-core work on an expert that sees 8 tokens).
@@ -1554,28 +1554,6 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
             if (i8m == 1) launch_i8(std::false_type{});
             else launch_i8(std::true_type{});
         } else {
-#if HY4_GFX12
-            // token tiles 16 / 32 / 64 / 128; all 8 waves active on RDNA4 (WN=8/WM for gu, WN=8 for dn<1,1>)
-            hipLaunchKernelGGL((skd::k_moe_gu_gemm<1, 1>), dim3(MOE_D / 128, 1, eb), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, 0, 16);
-            hipLaunchKernelGGL((skd::k_moe_dn_gemm<1, 1, 8, 1>), dim3(MOE_D / 128, 1, eb), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.active,
-                               w.nact, w.h2, w.y, 0, 16);
-            if (M > 16) {
-                hipLaunchKernelGGL((skd::k_moe_gu_gemm<2, 1>), dim3(MOE_D / 64, 1, eb), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, 16, 32);
-                hipLaunchKernelGGL((skd::k_moe_dn_gemm<2, 1, 4, 1>), dim3(MOE_D / skd::GEMM_BN, 1, eb), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs,
-                                   w.active, w.nact, w.h2, w.y, 16, 32);
-            }
-            if (M > 32) {
-                hipLaunchKernelGGL((skd::k_moe_gu_gemm<4, 1>), dim3(MOE_D / 32, 1, eb), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, 32, 64);
-                hipLaunchKernelGGL((skd::k_moe_dn_gemm<2, 2, 4, 1>), dim3(MOE_D / skd::GEMM_BN, 1, eb), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs,
-                                   w.active, w.nact, w.h2, w.y, 32, 64);
-            }
-            if (M > 64) {
-                const int ty = (M + skd::GEMM_BM - 1) / skd::GEMM_BM;
-                hipLaunchKernelGGL((skd::k_moe_gu_gemm<4, 2>), dim3(MOE_D / 32, ty, eb), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, 64, INF);
-                hipLaunchKernelGGL((skd::k_moe_dn_gemm<4, 2, 2, 2>), dim3(MOE_D / skd::GEMM_BN, ty, eb), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs,
-                                   w.active, w.nact, w.h2, w.y, 64, INF);
-            }
-#else
             const int g16 = eb;
             hipLaunchKernelGGL((skd::k_moe_gu_sg<16>), dim3(MOE_D / 64, g16), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.wl16, (const int*)nullptr, w.wcnt + 0, w.h2);
             hipLaunchKernelGGL((skd::k_moe_dn_sg<16, 128, 1, 1, 8, 1>), dim3(MOE_D / 128, g16), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.wl16, (const int*)nullptr, w.wcnt + 0, w.h2, w.y);
@@ -1598,7 +1576,6 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
                 hipLaunchKernelGGL((skd::k_moe_gu_sg<128>), dim3(MOE_D / 32, g128), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.wl128_e, w.wl128_ty, w.wcnt + 3, w.h2);
                 hipLaunchKernelGGL((skd::k_moe_dn_sg<128, 64, 4, 2, 2, 2>), dim3(MOE_D / 64, g128), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.wl128_e, w.wl128_ty, w.wcnt + 3, w.h2, w.y);
             }
-#endif
         }
 #else
         // token tiles 16 / 32 / 64 / 128; all 8 waves active via warp split-K (full grid.x = 48 / 24, BK = 256)
