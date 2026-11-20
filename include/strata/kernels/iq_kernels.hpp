@@ -64,6 +64,14 @@ void bih3_r1q2_grouped(const Bih3R1q2Layer& layer, const unsigned long long* grp
                        const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                        int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
 
+/// The prompt's experts of a layer, many to a launch, straight from their blobs: group g (of n_groups, on the device)
+/// the expert at ptr[g] (0: one computed elsewhere, its rows left as they are), its K in k_pack[g] (gate/up | down
+/// << 8), its rows start[g] .. start[g + 1] (start_host: the same on the host).  Row r's activation is x_q8_1's row
+/// tok[r], its output out's row r.  Taken in passes of whole groups whose rows fit cap (the scratch's, as
+/// bih3_r1q2_prompt_scratch_bytes(cap)); an expert's rows are at most cap.
+void bih3_r1q2_prompt_groups(const Bih3R1q2Layer& layer, const unsigned long long* ptr, const int32_t* start,
+                             const int32_t* k_pack, const int32_t* start_host, int n_groups, const int32_t* tok,
+                             const void* x_q8_1, void* scratch, int64_t cap, float* out, void* stream);
 /// Untiled grouped product for devices too small for the matrix or DP4a tile.
 void bih3_r1q2_grouped_scalar(const Bih3R1q2Layer& layer, const unsigned long long* grp_ptr, const int32_t* grp_start,
                               const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,

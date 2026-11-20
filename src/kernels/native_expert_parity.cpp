@@ -794,6 +794,35 @@ static int check_bih3_grouped(void* stream) {
         std::copy_n(want.data() + (size_t) dst[i] * H, H, prompt_want.data() + (size_t) i * H);
     const double prompt_error = rel(prompt, prompt_want);
     std::printf("bih3 prompt mixed K=2/3,8/9: rel %.9g, scratch %zu bytes\n", prompt_error, prompt_bytes);
+    // A layer's experts in one call: rows sorted by expert (entry 0 expert 0's, entries 1 and 2 expert 1's), a group
+    // with no blob (row 1: left as it was) and a cap of 2 rows, so the groups take two passes.
+    double groups_error = 0;
+    {
+        const unsigned long long blob0 = ptr[0], blob1 = ptr[1];
+        const std::vector<int32_t> meta = {(int32_t) blob0, (int32_t) (blob0 >> 32), 0, 0,
+                                           (int32_t) blob1, (int32_t) (blob1 >> 32)};
+        const std::vector<int32_t> starts = {0, 1, 2, 3};
+        const std::vector<int32_t> kp = {2 | 3 << 8, 8 | 9 << 8, 8 | 9 << 8};
+        const auto* gptr = reinterpret_cast<const unsigned long long*>(dev.upload(meta));
+        const auto* gstart = dev.upload(starts);
+        const auto* gk = dev.upload(kp);
+        const auto* gtok = dev.upload(std::vector<int32_t>(tok, tok + NT));
+        const size_t gbytes = strata::kernels::bih3_r1q2_prompt_scratch_bytes(2, H, FF);
+        auto* gs = dev.alloc<uint8_t>(gbytes);
+        std::vector<float> gout((size_t) NT * H, 7.f);
+        auto* go = dev.upload(gout);
+        strata::kernels::Bih3R1q2Layer one = L;
+        strata::kernels::bih3_r1q2_prompt_groups(one, gptr, gstart, gk, starts.data(), 3, gtok, dx, gs, 2, go, stream);
+        strata::parity::copy_out(gout.data(), go, gout.size());
+        std::vector<float> g_got, g_want;
+        for (int r : {0, 2}) {
+            g_got.insert(g_got.end(), gout.begin() + (size_t) r * H, gout.begin() + (size_t) (r + 1) * H);
+            g_want.insert(g_want.end(), want.begin() + (size_t) dst[r] * H, want.begin() + (size_t) (dst[r] + 1) * H);
+        }
+        groups_error = rel(g_got, g_want);
+        for (int i = 0; i < H; ++i) if (gout[(size_t) H + i] != 7.f) groups_error = 1;   // the group with no blob
+        std::printf("bih3 prompt groups (two passes, a group without a blob): rel %.9g\n", groups_error);
+    }
     std::vector<float> signs(FF);
     for (int i = 0; i < FF; ++i) signs[i] = i % 3 ? 1.f : -1.f;
     for (auto& fmt : f) { fmt.had_d = true; fmt.had_block = FF; fmt.d_signs = signs.data(); }
@@ -815,7 +844,8 @@ static int check_bih3_grouped(void* stream) {
     const double had_error = rel(got, want);
     std::printf("bih3 grouped scalar with Hadamard: rel %.9g\n", had_error);
     return std::isfinite(error) && error < 1e-2 && std::isfinite(scalar_error) && scalar_error < 1e-2 &&
-           std::isfinite(prompt_error) && prompt_error < 1e-2 && std::isfinite(had_error) && had_error < 1e-2 ? 0 : 1;
+           std::isfinite(prompt_error) && prompt_error < 1e-2 && std::isfinite(groups_error) && groups_error < 1e-2 &&
+           std::isfinite(had_error) && had_error < 1e-2 ? 0 : 1;
 }
 
 // Isolate the product's device time; gathering and activation quantization finish before the warm-up.

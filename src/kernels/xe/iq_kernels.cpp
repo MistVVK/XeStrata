@@ -2843,19 +2843,36 @@ void bih3_r1q2_grouped_scalar(const Bih3R1q2Layer& L, const unsigned long long* 
 }
 
 namespace {
+// Lanes a row and rows a work-group of the direct grouped products: the gate/up rows are 2560 values (80 blocks of 32)
+// and the down rows 640 (20), as the native experts' GU_LPR / DOWN_LPR.
+constexpr int kBih3GuLpr = 16, kBih3DownLpr = 8, kBih3Rows = 8;
+// a single group of up to this many entries goes straight from the blob, more are gathered for the matrix kernel
+constexpr int64_t kBih3DirectRows = 16;
+
+// The prompt's groups (bih3_r1q2_prompt_groups): groups gbase .. gend of a layer, group g the expert at ptr[g] (0:
+// computed elsewhere), its K in kp[g] (gate/up | down << 8), its entries start[g] .. start[g + 1], entry e's
+// activation row tok[e] and output row e, its scratch row e - rbase.
+struct Bih3PromptGroups {
+    const unsigned long long* ptr;
+    const int32_t *start, *kp, *tok;
+    int gbase, gend, rbase;
+};
+
 // A routed expert's row of R1Q2 codes against up to NE entries' q8_1 activations, straight from the blob: LPR lanes a
-// row, each lane a 32-value block at a time, its byte planes decoded once for the NE entries.  Rows not `valid` (past
-// the matrix on some lanes of the sub-group) add nothing but still take part in the segment's reduction.
-// matrix 0 gate, 1 up, 2 down.  Returns, on every lane of the segment, the row's sums times 1/8192 and the row base.
+// row, each lane a 32-value block at a time, its byte planes decoded once for the NE entries.  The entries' activations
+// are x's rows rows_of[e] (ints held, not pointers: NE 64-bit pointers took twice the registers on a SIMD32 sub-group,
+// and the prompt's 8 entries a pass ran 1.8x slower with them on the B70).  Rows not `valid` (past the matrix on some
+// lanes of the sub-group) add nothing but still take part in the segment's reduction.  matrix 0 gate, 1 up, 2 down;
+// k_gu / k_d the expert's K.  Returns, on every lane of the segment, the row's sums times 1/8192 and the row base.
 template<int LPR, int NE>
-inline void bih3_seg_row(const sycl::sub_group& sg, const Bih3R1q2Layer& L, const uint8_t* blob, int expert,
-                         int matrix, int row, bool valid, const block_q8_1* const (&xs)[NE], int n, int seg,
-                         float (&out)[NE]) {
-    const int gk = L.k_pairs[(size_t) 2 * expert], dk = L.k_pairs[(size_t) 2 * expert + 1];
-    const int width = matrix == 2 ? L.n_ff : L.n_embd, rows = matrix == 2 ? L.n_embd : L.n_ff;
-    const int k = matrix == 2 ? dk : gk, nb = width / 128, qbytes = (nb + 3) / 4;
-    const size_t grow = (size_t) (L.n_embd / 128) * 4 * (size_t) gk;
-    const size_t drow = (size_t) (L.n_ff / 128) * 4 * (size_t) dk;
+inline void bih3_direct_row(const sycl::sub_group& sg, const Bih3R1q2Layer& L, const uint8_t* blob, int k_gu,
+                            int k_d, int matrix, int row, bool valid, const block_q8_1* x, const int (&rows_of)[NE],
+                            int n, int seg, float (&out)[NE]) {
+    const int width = matrix == 2 ? L.n_ff : L.n_embd, xb = width / 32;
+    const int rows = matrix == 2 ? L.n_embd : L.n_ff;
+    const int k = matrix == 2 ? k_d : k_gu, nb = width / 128, qbytes = (nb + 3) / 4;
+    const size_t grow = (size_t) (L.n_embd / 128) * 4 * (size_t) k_gu;
+    const size_t drow = (size_t) (L.n_ff / 128) * 4 * (size_t) k_d;
     const size_t up = grow * (size_t) L.n_ff, dn = 2 * up;
     const size_t scale_off = (dn + drow * (size_t) L.n_embd + 15) & ~(size_t) 15;
     const size_t gu_scale = (size_t) L.n_ff * 2 + (size_t) (L.n_embd / 128) * 2 +
@@ -2870,7 +2887,7 @@ inline void bih3_seg_row(const sycl::sub_group& sg, const Bih3R1q2Layer& L, cons
     };
     float s[NE];
     for (int j = 0; j < NE; ++j) s[j] = 0.f;
-    const int nsb = valid ? width / 32 : 0;
+    const int nsb = valid ? xb : 0;
     for (int sb = seg; sb < nsb; sb += LPR) {
         const int b = sb / 4, q = sb % 4;
         const uint8_t* code = codes + (size_t) b * 4 * (size_t) k;
@@ -2879,13 +2896,13 @@ inline void bih3_seg_row(const sycl::sub_group& sg, const Bih3R1q2Layer& L, cons
         for (int j = 0; j < 8; ++j) planes[j] = xe::bih3_planes_w(code, k, q * 8 + j);
         for (int e = 0; e < NE; ++e)
             if (e < n) {
-                const block_q8_1& xb = xs[e][sb];
+                const block_q8_1& xq = x[(size_t) ((uint32_t) rows_of[e] * (uint32_t) xb + (uint32_t) sb)];
                 int dot = 0;
                 for (int j = 0; j < 8; ++j) {
-                    const int act = get_int_b4(xb.qs, j);
+                    const int act = get_int_b4(xq.qs, j);
                     for (int p = 0; p < 3; ++p) dot = dp4a((int) planes[j].v[p], act, dot);
                 }
-                s[e] = sycl::fma((float) (dot * 64), scale * low_half(xb.ds), s[e]);
+                s[e] = sycl::fma((float) (dot * 64), scale * low_half(xq.ds), s[e]);
             }
     }
     const float base = valid ? half_at(bases + (size_t) row * 2) * (1.f / 8192.f) : 0.f;
@@ -2896,19 +2913,70 @@ inline void bih3_seg_row(const sycl::sub_group& sg, const Bih3R1q2Layer& L, cons
     }
 }
 
-// Lanes a row and rows a work-group of the direct grouped products: the gate/up rows are 2560 values (80 blocks of 32)
-// and the down rows 640 (20), as the native experts' GU_LPR / DOWN_LPR.
-constexpr int kBih3GuLpr = 16, kBih3DownLpr = 8, kBih3Rows = 8;
-// a single group of up to this many entries goes straight from the blob, more are gathered for the matrix kernel
-constexpr int64_t kBih3DirectRows = 16;
+// gate/up (matrix < 2: the 2 n_ff rows into gu) or down (the n_embd rows from hq into out), the grid's rows the groups
+template<int LPR, int NE, bool DOWN>
+void launch_bih3_prompt(sycl::queue& q, size_t grid, Bih3R1q2Layer L, Bih3PromptGroups G, const block_q8_1* x,
+                        float* y) {
+    constexpr int RPW = kWarp / LPR;
+    const int rows = DOWN ? L.n_embd : 2 * L.n_ff;
+    const size_t xgroups = (size_t) ((rows + kBih3Rows * RPW - 1) / (kBih3Rows * RPW));
+    q.parallel_for(sycl::nd_range<2>({grid, xgroups * kBih3Rows * kWarp}, {1, (size_t) kBih3Rows * kWarp}),
+                   [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int row0 = ((int) it.get_group(1) * kBih3Rows + warp) * RPW;
+        if (row0 >= rows) return;                                            // the whole sub-group
+        const int row = row0 + lane / LPR, seg = lane % LPR;
+        const bool valid = row < rows;
+        const int matrix = DOWN ? 2 : valid ? row / L.n_ff : 0, r = DOWN ? (valid ? row : 0) : valid ? row % L.n_ff : 0;
+        for (int g = G.gbase + (int) it.get_group(0); g < G.gend; g += (int) it.get_group_range(0)) {
+            const int e0 = G.start[g], e1 = G.start[g + 1];
+            if (e0 >= e1 || G.ptr[g] == 0) continue;
+            const int k_gu = G.kp[g] & 0xff, k_d = G.kp[g] >> 8;
+            const auto* blob = reinterpret_cast<const uint8_t*>(G.ptr[g]);
+            for (int e = e0; e < e1; e += NE) {
+                const int n = sycl::min(NE, e1 - e);
+                int rows_of[NE];
+                for (int j = 0; j < NE; ++j) rows_of[j] = DOWN ? (j < n ? e + j : e) - G.rbase : G.tok[j < n ? e + j : e];
+                float s[NE];
+                bih3_direct_row<LPR, NE>(sg, L, blob, k_gu, k_d, matrix, r, valid, x, rows_of, n, seg, s);
+                if (valid && seg == 0)
+                    for (int j = 0; j < n; ++j) {
+                        const size_t o = DOWN ? (size_t) (e + j) : (size_t) (e + j - G.rbase);
+                        y[o * (size_t) rows + (size_t) row] = s[j];
+                    }
+            }
+        }
+    });
+}
+
+// One pass over `grid` groups and the scratch rows [0, nrows): gate/up, SwiGLU, the Hadamard of h, q8_1, down.
+// A row of a group with no blob is left as it is in the scratch (nothing reads it).
+template<int NE>
+void bih3_prompt_pass(sycl::queue& q, const Bih3R1q2Layer& L, const Bih3PromptGroups& G, size_t grid, int64_t nrows,
+                      const void* x_q8_1, const Bih3GroupedScratch& s, float* out) {
+    const int ff = L.n_ff;
+    const float lim = expert_swiglu_limit();
+    launch_bih3_prompt<kBih3GuLpr, NE, false>(q, grid, L, G, static_cast<const block_q8_1*>(x_q8_1), s.gu);
+    q.parallel_for(sycl::range<1>((size_t) nrows * (size_t) ff), [=](sycl::id<1> id) {
+        const size_t i = id[0], e = i / (size_t) ff, r = i % (size_t) ff;
+        float gate = s.gu[e * (size_t) (2 * ff) + r], up = s.gu[e * (size_t) (2 * ff) + (size_t) ff + r];
+        swiglu_clamp(gate, up, lim);
+        s.h[i] = canon::silu_mul(gate, up);
+    });
+    if (L.had_block > 0)
+        launch_hadamard_rows<float>(q, s.h, s.h, nrows, ff, L.had_block, L.d_signs, "bih3_prompt_pass");
+    launch_quantize_q8_1_canon(q, s.h, s.hq, (long long) nrows * ff);
+    launch_bih3_prompt<kBih3DownLpr, NE, true>(q, grid, L, G, s.hq, out);
+}
 
 // gate/up: grid rows are the groups (a group's entries in passes of kEntriesPass), columns the 2 * n_ff rows
 template<int LPR>
-void launch_bih3_direct_gu(sycl::queue& q, size_t cap_groups, Bih3R1q2Layer L, const unsigned long long* ptr,
+void launch_bih3_decode_gu(sycl::queue& q, size_t cap_groups, Bih3R1q2Layer L, const unsigned long long* ptr,
                            const int32_t* start, const int32_t* groups, const int32_t* dst, const int32_t* tok,
                            const block_q8_1* X, float* gu) {
     constexpr int RPW = kWarp / LPR;
-    const int rows = 2 * L.n_ff, xb = L.n_embd / 32;
+    const int rows = 2 * L.n_ff;
     const size_t xgroups = (size_t) ((rows + kBih3Rows * RPW - 1) / (kBih3Rows * RPW));
     q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * kBih3Rows * kWarp}, {1, (size_t) kBih3Rows * kWarp}),
                    [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
@@ -2923,13 +2991,14 @@ void launch_bih3_direct_gu(sycl::queue& q, size_t cap_groups, Bih3R1q2Layer L, c
             const int e0 = start[g], e1 = start[g + 1];
             if (e0 >= e1) continue;
             const int expert = L.route_ids[dst[e0]];
+            const int k_gu = L.k_pairs[(size_t) 2 * expert], k_d = L.k_pairs[(size_t) 2 * expert + 1];
             const auto* blob = reinterpret_cast<const uint8_t*>(ptr[g]);
             for (int e = e0; e < e1; e += kEntriesPass) {
                 const int n = sycl::min(kEntriesPass, e1 - e);
-                const block_q8_1* xs[kEntriesPass];
-                for (int j = 0; j < kEntriesPass; ++j) xs[j] = X + (size_t) tok[j < n ? e + j : e] * (size_t) xb;
+                int rows_of[kEntriesPass];
+                for (int j = 0; j < kEntriesPass; ++j) rows_of[j] = tok[j < n ? e + j : e];
                 float s[kEntriesPass];
-                bih3_seg_row<LPR, kEntriesPass>(sg, L, blob, expert, matrix, r, valid, xs, n, seg, s);
+                bih3_direct_row<LPR, kEntriesPass>(sg, L, blob, k_gu, k_d, matrix, r, valid, X, rows_of, n, seg, s);
                 if (valid && seg == 0)
                     for (int j = 0; j < n; ++j) gu[(size_t) (e + j) * (size_t) rows + (size_t) row] = s[j];
             }
@@ -2939,11 +3008,11 @@ void launch_bih3_direct_gu(sycl::queue& q, size_t cap_groups, Bih3R1q2Layer L, c
 
 // down: the entries' q8_1 h rows to out[dst[e]]
 template<int LPR>
-void launch_bih3_direct_down(sycl::queue& q, size_t cap_groups, Bih3R1q2Layer L, const unsigned long long* ptr,
+void launch_bih3_decode_down(sycl::queue& q, size_t cap_groups, Bih3R1q2Layer L, const unsigned long long* ptr,
                              const int32_t* start, const int32_t* groups, const int32_t* dst, const block_q8_1* hq,
                              float* out) {
     constexpr int RPW = kWarp / LPR;
-    const int rows = L.n_embd, hb = L.n_ff / 32;
+    const int rows = L.n_embd;
     const size_t xgroups = (size_t) ((rows + kBih3Rows * RPW - 1) / (kBih3Rows * RPW));
     q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * kBih3Rows * kWarp}, {1, (size_t) kBih3Rows * kWarp}),
                    [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
@@ -2957,13 +3026,14 @@ void launch_bih3_direct_down(sycl::queue& q, size_t cap_groups, Bih3R1q2Layer L,
             const int e0 = start[g], e1 = start[g + 1];
             if (e0 >= e1) continue;
             const int expert = L.route_ids[dst[e0]];
+            const int k_gu = L.k_pairs[(size_t) 2 * expert], k_d = L.k_pairs[(size_t) 2 * expert + 1];
             const auto* blob = reinterpret_cast<const uint8_t*>(ptr[g]);
             for (int e = e0; e < e1; e += kEntriesPass) {
                 const int n = sycl::min(kEntriesPass, e1 - e);
-                const block_q8_1* xs[kEntriesPass];
-                for (int j = 0; j < kEntriesPass; ++j) xs[j] = hq + (size_t) (j < n ? e + j : e) * (size_t) hb;
+                int rows_of[kEntriesPass];
+                for (int j = 0; j < kEntriesPass; ++j) rows_of[j] = j < n ? e + j : e;
                 float s[kEntriesPass];
-                bih3_seg_row<LPR, kEntriesPass>(sg, L, blob, expert, 2, valid ? row : 0, valid, xs, n, seg, s);
+                bih3_direct_row<LPR, kEntriesPass>(sg, L, blob, k_gu, k_d, 2, valid ? row : 0, valid, hq, rows_of, n, seg, s);
                 if (valid && seg == 0)
                     for (int j = 0; j < n; ++j) out[(size_t) dst[e + j] * (size_t) rows + (size_t) row] = s[j];
             }
@@ -2980,7 +3050,7 @@ void bih3_r1q2_grouped_direct(const Bih3R1q2Layer& L, const unsigned long long* 
     const Bih3GroupedScratch s = bih3_scratch(scratch, cap, L.n_embd, L.n_ff);
     const int ff = L.n_ff;
     const float lim = expert_swiglu_limit();
-    launch_bih3_direct_gu<kBih3GuLpr>(q, (size_t) cap_groups, L, ptr, start, groups, dst, tok,
+    launch_bih3_decode_gu<kBih3GuLpr>(q, (size_t) cap_groups, L, ptr, start, groups, dst, tok,
                                       static_cast<const block_q8_1*>(x_q8_1), s.gu);
     q.parallel_for(sycl::range<1>((size_t) cap * (size_t) ff), [=](sycl::id<1> id) {
         const size_t i = id[0], e = i / (size_t) ff, r = i % (size_t) ff;
@@ -2992,7 +3062,7 @@ void bih3_r1q2_grouped_direct(const Bih3R1q2Layer& L, const unsigned long long* 
     if (L.had_block > 0)
         launch_hadamard_rows<float>(q, s.h, s.h, cap, ff, L.had_block, L.d_signs, "bih3_r1q2_grouped_direct");
     launch_quantize_q8_1_canon(q, s.h, s.hq, (long long) cap * ff);
-    launch_bih3_direct_down<kBih3DownLpr>(q, (size_t) cap_groups, L, ptr, start, groups, dst, s.hq, out);
+    launch_bih3_decode_down<kBih3DownLpr>(q, (size_t) cap_groups, L, ptr, start, groups, dst, s.hq, out);
 }
 }  // namespace
 
@@ -3098,6 +3168,29 @@ void bih3_r1q2_prompt(const Bih3R1q2Layer& layer, const uint8_t* blob, int gate_
     one.n_expert = 1; one.k_pairs = k; one.route_ids = route;
     bih3_r1q2_grouped(one, ptr, start, groups, dst, token_rows, 1, rows <= kBih3DirectRows ? rows : cap, x_q8_1,
                       scratch, out, stream);
+}
+
+// Entries a pass over a row in the prompt's direct products: an expert's rows are many (a 3.5K prompt routes ~70 rows
+// to each of 512), and each pass decodes the row's states again.
+constexpr int kBih3PromptPass = 8;
+
+void bih3_r1q2_prompt_groups(const Bih3R1q2Layer& layer, const unsigned long long* ptr, const int32_t* start,
+                             const int32_t* k_pack, const int32_t* start_host, int n_groups, const int32_t* tok,
+                             const void* x_q8_1, void* scratch, int64_t cap, float* out, void* stream) {
+    require(ptr && start && k_pack && start_host && tok && x_q8_1 && scratch && out && cap > 0 && n_groups >= 0 &&
+            bih3_r1q2_prompt_scratch_bytes(cap, layer.n_embd, layer.n_ff), "bih3_r1q2_prompt_groups");
+    auto& q = queue_for(stream);
+    const Bih3GroupedScratch s = bih3_scratch(scratch, cap, layer.n_embd, layer.n_ff);
+    for (int g0 = 0; g0 < n_groups;) {   // whole groups whose rows fit the scratch's cap (a group's rows are <= cap)
+        int g1 = g0 + 1;
+        require(start_host[g1] - start_host[g0] <= cap, "bih3_r1q2_prompt_groups: a group's rows pass the cap");
+        while (g1 < n_groups && start_host[g1 + 1] - start_host[g0] <= cap) ++g1;
+        const Bih3PromptGroups G{ptr, start, k_pack, tok, g0, g1, start_host[g0]};
+        bih3_prompt_pass<kBih3PromptPass>(q, layer, G, (size_t) (g1 - g0), start_host[g1] - start_host[g0], x_q8_1, s,
+                                          out);
+        g0 = g1;
+    }
+    if (!stream) q.wait_and_throw();
 }
 
 void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {

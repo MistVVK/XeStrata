@@ -682,6 +682,10 @@ struct Prefill::Impl {
     void *Xq = nullptr, *Hq = nullptr;
     void *bih3_xq = nullptr, *bih3_scratch = nullptr;
     float* bih3_rotated = nullptr;
+    // the resident experts' direct products in one call a layer: their blob pointers (two words each), row bounds and
+    // K (gate/up | down << 8), n_expert each (start one more)
+    int32_t* bih3_meta = nullptr;
+    HostVec<int32_t> bih3_meta_host;
     float* H = nullptr;
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
     int32_t* ids_rel = nullptr;               // row r of the chunk -> r - its group's first row (the gate/up's dst rows)
@@ -1349,6 +1353,7 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
         all.take<float>(T * N, ok);
         all.take<uint8_t>(T * (N / 32) * 36, ok);
         all.take<uint8_t>(strata::kernels::bih3_r1q2_prompt_scratch_bytes((int64_t) T, N, 640), ok);
+        all.take<int32_t>((size_t) (4 * n_expert + 2), ok);
     }
     return all.used;
 }
@@ -2019,6 +2024,7 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.bih3_rotated = c.take<float>(T * N, ok);
             m.bih3_xq = c.take<uint8_t>(T * (N / 32) * 36, ok);
             m.bih3_scratch = c.take<uint8_t>(strata::kernels::bih3_r1q2_prompt_scratch_bytes((int64_t) T, N, 640), ok);
+            m.bih3_meta = c.take<int32_t>((size_t) (4 * m.g->n_expert + 2), ok);
         }
         if (base == nullptr) ok = false;
     }
@@ -3950,7 +3956,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         int64_t grp_rows_last = 0;   // the rows of the last int8 group (GU and H hold that group's)
                         // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                         // expert) is released once the blob is read
+                        // a mixed layer's resident experts: computed together after the walk (bih3_r1q2_prompt_groups),
+                        // the streamed ones as each lands
+                        std::vector<const uint8_t*> bih3_res(lay.mixed() ? order.size() : 0, nullptr);
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
+                            if (lay.mixed() && slot < 0) { bih3_res[j] = blob_dev; return true; }
                             pt.mark(kPfDequant, cs);
                             if (lay.mixed()) {
                                 const int32_t e = order[j];
@@ -4137,6 +4147,32 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                             }
                             release_to((int32_t) m.g->n_expert);
+                        }
+                        if (lay.mixed() && std::any_of(bih3_res.begin(), bih3_res.end(), [](const uint8_t* b) { return b; })) {
+                            pt.mark(kPfDequant, cs);
+                            const size_t n = order.size(), E = (size_t) m.g->n_expert;
+                            m.bih3_meta_host.resize(4 * E + 2);
+                            int32_t* mh = m.bih3_meta_host.data();
+                            int32_t* start_h = mh + 2 * E;
+                            int32_t* k_h = start_h + E + 1;
+                            for (size_t j = 0; j < n; ++j) {
+                                const int32_t e = order[j];
+                                const auto& f = lay.format(l, e);
+                                std::memcpy(mh + 2 * j, static_cast<const void*>(&bih3_res[j]), sizeof bih3_res[j]);
+                                start_h[j] = m.off[(size_t) e];
+                                k_h[j] = (f.gu_type - 180) | ((f.d_type - 180) << 8);
+                            }
+                            start_h[n] = n > 0 ? m.off[(size_t) order[n - 1]] + m.cnt[(size_t) order[n - 1]] : 0;
+                            m.bih3_meta_host.to_device(m.bih3_meta, m.cs);
+                            const auto& f = lay.format(l, order[0]);
+                            strata::kernels::Bih3R1q2Layer layer;
+                            layer.n_embd = (int) f.n_embd; layer.n_ff = (int) f.n_ff;
+                            layer.had_block = f.had_d ? f.had_block : 0; layer.d_signs = had_sh;
+                            std::memcpy(layer.p2, f.p2, sizeof layer.p2);
+                            strata::kernels::bih3_r1q2_prompt_groups(
+                                layer, reinterpret_cast<const unsigned long long*>(m.bih3_meta), m.bih3_meta + 2 * E,
+                                m.bih3_meta + 3 * E + 1, start_h, (int) n, m.src_dev, m.bih3_xq, m.bih3_scratch, T,
+                                ex_out, m.cs);
                         }
                         pt.mark(kPfCombine, cs);
                         if (rows_help > 0) {   // set_helper: its rows into Dm's tail, once its stream is done
