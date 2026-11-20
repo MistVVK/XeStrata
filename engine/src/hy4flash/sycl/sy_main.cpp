@@ -67,12 +67,12 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 }
 
 int main(int argc, char** argv) {
-    // Backend: the OpenCL runtime of the Intel compute stack launches small kernels ~4x cheaper than Level Zero on the A750 (4.7 vs 19 us per dependent tiny kernel;
-    // a decode step has ~1300 of them: 46 ms vs 87 ms without the routed experts). HY4S_BACKEND=level_zero (or an own ONEAPI_DEVICE_SELECTOR) overrides.
+    // Backend: Level Zero with SYCL command_graph replay (~2.15 us/kernel) beats OpenCL eager (~7.35 us/kernel) on both prefill & decode!
+    // HY4S_BACKEND=opencl (or an explicit ONEAPI_DEVICE_SELECTOR) overrides.
     const bool user_sel = std::getenv("ONEAPI_DEVICE_SELECTOR") != nullptr;
     if (!user_sel) {
         const char* be = std::getenv("HY4S_BACKEND");
-        hy4s_setenv("ONEAPI_DEVICE_SELECTOR", (be && std::string(be) == "level_zero") ? "level_zero:gpu" : "opencl:gpu", 1);
+        hy4s_setenv("ONEAPI_DEVICE_SELECTOR", (be && std::string(be) == "opencl") ? "opencl:gpu" : "level_zero:gpu", 1);
     }
     std::string model, engram, tok_path, out_dir = ".", force_route, draft;
     SpecCfg scfg;
@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
     std::string vision_path;
     int64_t image_max_pixels = 1048576;
     double vram_experts_gb = -1.0, ram_experts_gb = -1.0;
-    int kv_host_above = 24000, gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 1024, index_topk = 2048, threads = (int)std::max(2u, std::thread::hardware_concurrency() / 2), expert_act = 1;
+    int kv_host_above = 24000, gx_mb = 256, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, threads = (int)std::max(2u, std::thread::hardware_concurrency() / 2), expert_act = 1;
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--serve") serve = true;
     for (int i = 1; i < argc; ++i) {

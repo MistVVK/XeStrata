@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: sy_vit_test shard.strata pic.rgb h w outdir [reps]\n");
         return 2;
     }
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) setenv("ONEAPI_DEVICE_SELECTOR", "opencl:gpu", 1);
+    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) hy4s_setenv("ONEAPI_DEVICE_SELECTOR", "opencl:gpu");
     const std::string shard = argv[1], rgbf = argv[2], outdir = argv[5];
     const int h = atoi(argv[3]), w = atoi(argv[4]);
     const int reps = argc > 6 ? atoi(argv[6]) : 1;

@@ -28,14 +28,16 @@ inline uint32_t ld_u32_unaligned(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+constexpr int SB_FP16_LD = 136;  // 128 + 8 halves padding -> zero SLM bank conflicts!
+
 // Cooperatively dequantize 32 weights (half_idx = 0 -> weights 0..31, half_idx = 1 -> weights 32..63) of 64-weight subgroup `g`
-// of super-block `sbi` of row `row_local` (0..63) into VNNI-2 packed SLM `sb_ptr` [32][128] halves:
-//   element (k in 0..63, n in 0..63) at sb_ptr[(k >> 1) * 128 + n * 2 + (k & 1)].
+// of super-block `sbi` of row `row_local` (0..63) into VNNI-2 packed SLM `sb_ptr` [32][SB_FP16_LD] halves:
+//   element (k in 0..63, n in 0..63) at sb_ptr[(k >> 1) * SB_FP16_LD + n * 2 + (k & 1)].
 template <int FMT, bool RP>
 inline void dq_half_group_fp16(const uint8_t* pl, float eff, int g, int half_idx, half* sb_ptr, int row_local) {
     const float bias = -sk_half<FMT>() * eff;
     const int k_base = half_idx * 32;  // 0 or 32 within the 64-weight subgroup
-    half* dst = sb_ptr + (k_base >> 1) * 128 + row_local * 2;
+    half* dst = sb_ptr + (k_base >> 1) * SB_FP16_LD + row_local * 2;
     if constexpr (FMT == FMT_S4) {
         // 32 weights = 16 bytes
         const uint8_t* p = pl + g * 32 + half_idx * 16;
@@ -44,7 +46,7 @@ inline void dq_half_group_fp16(const uint8_t* pl, float eff, int g, int half_idx
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
                 const uint32_t by = v[i];
-                put_h2(dst + i * 128, (float)(by & 15u) * eff + bias, (float)(by >> 4) * eff + bias);
+                put_h2(dst + i * SB_FP16_LD, (float)(by & 15u) * eff + bias, (float)(by >> 4) * eff + bias);
             }
         } else {
 #pragma unroll
@@ -53,7 +55,7 @@ inline void dq_half_group_fp16(const uint8_t* pl, float eff, int g, int half_idx
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     const uint32_t by = (wd >> (8 * j)) & 0xFFu;
-                    put_h2(dst + (w * 4 + j) * 128, (float)(by & 15u) * eff + bias, (float)(by >> 4) * eff + bias);
+                    put_h2(dst + (w * 4 + j) * SB_FP16_LD, (float)(by & 15u) * eff + bias, (float)(by >> 4) * eff + bias);
                 }
             }
         }
@@ -68,7 +70,7 @@ inline void dq_half_group_fp16(const uint8_t* pl, float eff, int g, int half_idx
                 const uint32_t by = v[i];
                 const uint32_t q0 = (by & 15u) | (((hb >> (2 * i)) & 1u) << 4);
                 const uint32_t q1 = (by >> 4) | (((hb >> (2 * i + 1)) & 1u) << 4);
-                put_h2(dst + i * 128, (float)q0 * eff + bias, (float)q1 * eff + bias);
+                put_h2(dst + i * SB_FP16_LD, (float)q0 * eff + bias, (float)q1 * eff + bias);
             }
         } else {
 #pragma unroll
@@ -80,7 +82,7 @@ inline void dq_half_group_fp16(const uint8_t* pl, float eff, int g, int half_idx
                     const uint32_t by = (wd >> (8 * j)) & 0xFFu;
                     const uint32_t q0 = (by & 15u) | (((hb >> (2 * i)) & 1u) << 4);
                     const uint32_t q1 = (by >> 4) | (((hb >> (2 * i + 1)) & 1u) << 4);
-                    put_h2(dst + i * 128, (float)q0 * eff + bias, (float)q1 * eff + bias);
+                    put_h2(dst + i * SB_FP16_LD, (float)q0 * eff + bias, (float)q1 * eff + bias);
                 }
             }
         }
@@ -91,15 +93,15 @@ inline void dq_half_group_fp16(const uint8_t* pl, float eff, int g, int half_idx
             const sycl::uchar16 v0 = *reinterpret_cast<const sycl::uchar16*>(p);
             const sycl::uchar16 v1 = *reinterpret_cast<const sycl::uchar16*>(p + 16);
 #pragma unroll
-            for (int i = 0; i < 8; ++i) put_h2(dst + i * 128, (float)(int8_t)v0[2 * i] * eff, (float)(int8_t)v0[2 * i + 1] * eff);
+            for (int i = 0; i < 8; ++i) put_h2(dst + i * SB_FP16_LD, (float)(int8_t)v0[2 * i] * eff, (float)(int8_t)v0[2 * i + 1] * eff);
 #pragma unroll
-            for (int i = 0; i < 8; ++i) put_h2(dst + (8 + i) * 128, (float)(int8_t)v1[2 * i] * eff, (float)(int8_t)v1[2 * i + 1] * eff);
+            for (int i = 0; i < 8; ++i) put_h2(dst + (8 + i) * SB_FP16_LD, (float)(int8_t)v1[2 * i] * eff, (float)(int8_t)v1[2 * i + 1] * eff);
         } else {
 #pragma unroll
             for (int w = 0; w < 8; ++w) {
                 const uint32_t wd = ld_u32_unaligned(p + w * 4);
-                put_h2(dst + (2 * w) * 128, (float)(int8_t)(wd & 0xFFu) * eff, (float)(int8_t)((wd >> 8) & 0xFFu) * eff);
-                put_h2(dst + (2 * w + 1) * 128, (float)(int8_t)((wd >> 16) & 0xFFu) * eff, (float)(int8_t)(wd >> 24) * eff);
+                put_h2(dst + (2 * w) * SB_FP16_LD, (float)(int8_t)(wd & 0xFFu) * eff, (float)(int8_t)((wd >> 8) & 0xFFu) * eff);
+                put_h2(dst + (2 * w + 1) * SB_FP16_LD, (float)(int8_t)((wd >> 16) & 0xFFu) * eff, (float)(int8_t)(wd >> 24) * eff);
             }
         }
     } else if constexpr (FMT == FMT_S2) {
@@ -109,14 +111,14 @@ inline void dq_half_group_fp16(const uint8_t* pl, float eff, int g, int half_idx
 #pragma unroll
         for (int b = 0; b < 4; ++b) {
             const uint32_t by = (w0 >> (8 * b)) & 0xFFu;
-            put_h2(dst + (2 * b) * 128, (float)(by & 3u) * eff + bias, (float)((by >> 2) & 3u) * eff + bias);
-            put_h2(dst + (2 * b + 1) * 128, (float)((by >> 4) & 3u) * eff + bias, (float)(by >> 6) * eff + bias);
+            put_h2(dst + (2 * b) * SB_FP16_LD, (float)(by & 3u) * eff + bias, (float)((by >> 2) & 3u) * eff + bias);
+            put_h2(dst + (2 * b + 1) * SB_FP16_LD, (float)((by >> 4) & 3u) * eff + bias, (float)(by >> 6) * eff + bias);
         }
 #pragma unroll
         for (int b = 0; b < 4; ++b) {
             const uint32_t by = (w1 >> (8 * b)) & 0xFFu;
-            put_h2(dst + (8 + 2 * b) * 128, (float)(by & 3u) * eff + bias, (float)((by >> 2) & 3u) * eff + bias);
-            put_h2(dst + (8 + 2 * b + 1) * 128, (float)((by >> 4) & 3u) * eff + bias, (float)(by >> 6) * eff + bias);
+            put_h2(dst + (8 + 2 * b) * SB_FP16_LD, (float)(by & 3u) * eff + bias, (float)((by >> 2) & 3u) * eff + bias);
+            put_h2(dst + (8 + 2 * b + 1) * SB_FP16_LD, (float)((by >> 4) & 3u) * eff + bias, (float)(by >> 6) * eff + bias);
         }
     } else if constexpr (FMT == FMT_S3) {
         // 32 weights = 8 low bytes + 4 high-bit bytes
@@ -131,8 +133,8 @@ inline void dq_half_group_fp16(const uint8_t* pl, float eff, int g, int half_idx
             const uint32_t q1 = ((by >> 2) & 3u) | (((h4 >> 1) & 1u) << 2);
             const uint32_t q2 = ((by >> 4) & 3u) | (((h4 >> 2) & 1u) << 2);
             const uint32_t q3 = (by >> 6) | (((h4 >> 3) & 1u) << 2);
-            put_h2(dst + (2 * b) * 128, (float)q0 * eff + bias, (float)q1 * eff + bias);
-            put_h2(dst + (2 * b + 1) * 128, (float)q2 * eff + bias, (float)q3 * eff + bias);
+            put_h2(dst + (2 * b) * SB_FP16_LD, (float)q0 * eff + bias, (float)q1 * eff + bias);
+            put_h2(dst + (2 * b + 1) * SB_FP16_LD, (float)q2 * eff + bias, (float)q3 * eff + bias);
         }
     } else {
         // FMT_S6: 32 low nibbles (16 B) + 32 2-bit highs (8 B)
@@ -149,7 +151,7 @@ inline void dq_half_group_fp16(const uint8_t* pl, float eff, int g, int half_idx
                 const uint32_t h4 = (hw >> (4 * j)) & 0xFu;
                 const uint32_t q0 = (by & 15u) | ((h4 & 3u) << 4);
                 const uint32_t q1 = (by >> 4) | (((h4 >> 2) & 3u) << 4);
-                put_h2(dst + (w * 4 + j) * 128, (float)q0 * eff + bias, (float)q1 * eff + bias);
+                put_h2(dst + (w * 4 + j) * SB_FP16_LD, (float)q0 * eff + bias, (float)q1 * eff + bias);
             }
         }
     }
@@ -315,7 +317,7 @@ inline void k_gemm_xmx_fp16(const uint8_t* W, int N, int K, const half* X, float
     const int nbm = (M + BM_TILE - 1) / BM_TILE, nbn = N / 64;
     const size_t pay_off = RP ? rp_pay_off(N, K >> 8) : 0;
     Q().submit([&](sycl::handler& h) {
-        sycl::local_accessor<half, 1> sB(64 * 64, h);  // 8 KiB VNNI-2 B tile for BK=64
+        sycl::local_accessor<half, 1> sB(32 * xmx_detail::SB_FP16_LD, h);  // 8.7 KiB bank-conflict-free VNNI-2 B tile for BK=64
         h.parallel_for(sycl::nd_range<1>((size_t)nbm * nbn * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(8)]] {
             const int gid = (int)it.get_group(0);
             const int bn = gid % nbn, bm = gid / nbn;
@@ -384,7 +386,7 @@ inline void k_gemm_xmx_fp16(const uint8_t* W, int N, int K, const half* X, float
                         }
 #pragma unroll
                         for (int j = 0; j < 4; ++j) {
-                            xm::joint_matrix_load(sg, mb, sB_mp + (size_t)(s * 8) * 128 + (size_t)(sg_n * 4 + j) * 16, (size_t)128);
+                            xm::joint_matrix_load(sg, mb, sB_mp + (size_t)(s * 8) * xmx_detail::SB_FP16_LD + (size_t)(sg_n * 4 + j) * 16, (size_t)xmx_detail::SB_FP16_LD);
 #pragma unroll
                             for (int mi = 0; mi < RM; ++mi) {
                                 if (act[mi]) xm::joint_matrix_mad(sg, mc[mi][j], ma[mi], mb, mc[mi][j]);

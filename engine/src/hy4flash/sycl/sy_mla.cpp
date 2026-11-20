@@ -257,12 +257,14 @@ static void prep_q_xmx(const float* q_b, const half* wk_b, half* qa, int M, int 
 #endif
 
 // ---- Quantized S_K q absorb + rope (decode/verify M <= 16; bit-identical to split_kvb -> fp16 -> prep_q) ----
+// Cooperatively stages each superblock (SB <= 262 B) into SLM so 256 threads do 1 coalesced byte load instead of 256 uncoalesced reads!
 template <int FMT, int TT>
 static void prep_q_sk_t(const uint8_t* W_kvb, const float* q_b, half* qa, int M, int NH, int p0_host, const StepParams* d_step, bool use_dfly_a, float theta) {
     constexpr int SB = sk_sb_bytes(FMT);
     const int ntt = (M + TT - 1) / TT;
     Q().submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sq(TT * MLA_NOPE, h);
+        sycl::local_accessor<uint8_t, 1> sblk(SB + 16, h);
         h.parallel_for(sycl::nd_range<3>(sycl::range<3>(NH, 2, (size_t)ntt * 256), sycl::range<3>(1, 1, 256)), [=](sycl::nd_item<3> it) REQD_SG32 {
             const int hh = (int)it.get_group(0), sbi = (int)it.get_group(1), t0 = (int)it.get_group(2) * TT;
             const int tid = (int)it.get_local_id(2);  // column c = sbi*256 + tid
@@ -276,14 +278,21 @@ static void prep_q_sk_t(const uint8_t* W_kvb, const float* q_b, half* qa, int M,
 #pragma unroll
             for (int tt = 0; tt < TT; ++tt) acc[tt] = 0.f;
             const uint8_t* wbase = W_kvb + ((size_t)hh * 448 * 2 + (size_t)sbi) * SB;
+            uint8_t* sbp = &sblk[0];
             const int g = tid >> 6;
             for (int i = 0; i < MLA_NOPE; ++i) {
                 const uint8_t* blk = wbase + (size_t)i * 2 * SB;
-                const float D = h2f_bits(ld16(blk));
-                const float eff = D * ((float)blk[2 + g] / 255.0f);
-                const float w = (float)(half)(((float)sk_q<FMT>(blk + 6, tid) - sk_half<FMT>()) * eff);
+                if (tid < SB) sbp[tid] = blk[tid];
+                if constexpr (SB > 256) {
+                    if (tid + 256 < SB) sbp[tid + 256] = blk[tid + 256];
+                }
+                sycl::group_barrier(it.get_group());
+                const float D = h2f_bits(ld16(sbp));
+                const float eff = D * ((float)sbp[2 + g] / 255.0f);
+                const float w = (float)(half)(((float)sk_q<FMT>(sbp + 6, tid) - sk_half<FMT>()) * eff);
 #pragma unroll
                 for (int tt = 0; tt < TT; ++tt) acc[tt] += sq[tt * MLA_NOPE + i] * w;
+                sycl::group_barrier(it.get_group());
             }
             const int col = sbi * 256 + tid;
 #pragma unroll
@@ -853,6 +862,194 @@ static void attend_xmx(const half* qa, const half* cache, const float* sinks, ha
         });
     });
 }
+
+// ---- Multi-Query Tiled XMX Flash-MLA (prefill M >= 16, CAUSAL / WINDOW, S == 1): 4 queries x 16 heads = 64 rows per WG! ----
+// 512 threads = 64 SG8 (8 M-tiles x 8 N-tiles): 4x LESS KV cache global bandwidth + full 64x64 XMX tiles + 33.7 KiB SLM + zero spills!
+static void attend_xmx_mq(const half* qa, const half* cache, const float* sinks, half* ctx, const MlaAttnArgs& a_in) {
+    constexpr int TKT = 64;
+    constexpr int KV_LD = 136;  // bank-conflict-free VNNI-2 stride (128 + 8 halves)
+    const int NHG = a_in.NH / HG;
+    const int nqb = (a_in.M + 3) / 4;
+    Q().submit([&](sycl::handler& h) {
+        sycl::local_accessor<half, 1> sQP(64 * 64, h);        // 8 KiB (Q tile in Phase 1, P probs in Phase 2/3)
+        sycl::local_accessor<half, 1> sKV(32 * KV_LD, h);     // 8.7 KiB VNNI-2 K/V tile
+        sycl::local_accessor<float, 1> sS(64 * 64, h);        // 16 KiB (scores in Phase 1/2, reused as 64*64 sTmp in Phase 3)
+        sycl::local_accessor<int, 1> sSlot(TKT, h);
+        sycl::local_accessor<float, 1> sm(64, h), sl(64, h), sc(64, h);
+        h.parallel_for(sycl::nd_range<3>(sycl::range<3>(nqb, 1, (size_t)NHG * 512), sycl::range<3>(1, 1, 512)), [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(8)]] {
+            const MlaAttnArgs a = a_in;
+            const int t0 = (int)it.get_group(0) * 4, hg = (int)it.get_group(2);
+            const int tid = (int)it.get_local_id(2);
+            auto grp = it.get_group();
+            auto sg = it.get_sub_group();
+            const int sgi = tid >> 3, lane = tid & 7;  // sgi: 0..63
+            const int sg_m = sgi >> 3;                 // 0..7 (8 rows: q_local = sg_m>>1, h_half = sg_m&1)
+            const int sg_n = sgi & 7;                  // 0..7 (8 cols)
+            const int q_local = sg_m >> 1, h_half = sg_m & 1;
+
+            half* sqp = &sQP[0];
+            half* skv = &sKV[0];
+            float* sSp = &sS[0];
+            float* my_tmp = sSp + sgi * 64;
+
+            auto sQP_mp = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(sqp);
+            auto sKV_mp = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(skv);
+            auto sS_mp = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(sSp);
+            auto tmp_mp = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(my_tmp);
+
+            const int pos_min = a.p0 + t0;
+            const int pos_max = a.p0 + std::min(t0 + 3, a.M - 1);
+            const int lo_u = (a.mode == MLA_WINDOW) ? std::max(0, pos_min - a.window + 1) : 0;
+            const int nk_u = pos_max - lo_u + 1;
+            const int ntile = (nk_u + TKT - 1) / TKT;
+
+            if (tid < 64) {
+                sm[tid] = sinks[hg * HG + (tid & 15)];
+                sl[tid] = 1.0f;
+            }
+            float o_reg[8][8];
+#pragma unroll
+            for (int cb = 0; cb < 8; ++cb)
+#pragma unroll
+                for (int r = 0; r < 8; ++r) o_reg[cb][r] = 0.0f;
+
+            sycl::group_barrier(grp);
+
+            xm::joint_matrix<sycl::sub_group, half, xm::use::a, 8, 16, xm::layout::row_major> ma;
+            xm::joint_matrix<sycl::sub_group, half, xm::use::b, 16, 8, xm::layout::ext_intel_packed> mb;
+            xm::joint_matrix<sycl::sub_group, float, xm::use::accumulator, 8, 8> mc;
+
+            const int qr_ld = tid >> 3, qc8_ld = tid & 7;  // for loading sQP[64][64] (8 halves/thread)
+            const int q_ld_t = t0 + (qr_ld >> 4);
+            const int q_ld_h = hg * HG + (qr_ld & 15);
+            const bool q_ld_ok = q_ld_t < a.M;
+
+            const int k_row = tid >> 3, d8 = tid & 7;      // for loading sKV[32][KV_LD] (8 halves/thread)
+            const int kp_v = tid >> 4, cq_v = tid & 15;    // for Phase 3 V load: 32 key-pairs x 16 col-quads (4 cols/thread)
+
+            for (int tile = 0; tile < ntile; ++tile) {
+                const int j0 = tile * TKT;
+                const int cnt = std::min(TKT, nk_u - j0);
+                if (tid < TKT) {
+                    const int k_abs = lo_u + j0 + tid;
+                    sSlot[tid] = (tid < cnt) ? (a.ring > 0 ? (k_abs % a.ring) : k_abs) : 0;
+                }
+                sycl::group_barrier(grp);
+
+                // ---- Phase 1: S[64][64] = Q[64][576] @ K[64][576]^T ----
+                xm::joint_matrix_fill(sg, mc, 0.0f);
+                const int my_slot = sSlot[k_row];
+                const bool k_valid = (k_row < cnt);
+
+                for (int d0 = 0; d0 < MLA_ROW; d0 += 64) {
+                    *reinterpret_cast<vh8*>(sqp + qr_ld * 64 + qc8_ld * 8) =
+                        q_ld_ok ? *reinterpret_cast<const vh8*>(qa + ((size_t)q_ld_t * a.NH + q_ld_h) * MLA_ROW + d0 + qc8_ld * 8) : vh8((half)0.f);
+                    const vh8 kv = k_valid ? *reinterpret_cast<const vh8*>(cache + (size_t)my_slot * MLA_ROW + d0 + d8 * 8) : vh8((half)0.f);
+                    half* kdst = skv + (d8 * 4) * KV_LD + k_row * 2;
+                    *reinterpret_cast<vh2*>(kdst + 0 * KV_LD) = vh2(kv[0], kv[1]);
+                    *reinterpret_cast<vh2*>(kdst + 1 * KV_LD) = vh2(kv[2], kv[3]);
+                    *reinterpret_cast<vh2*>(kdst + 2 * KV_LD) = vh2(kv[4], kv[5]);
+                    *reinterpret_cast<vh2*>(kdst + 3 * KV_LD) = vh2(kv[6], kv[7]);
+                    sycl::group_barrier(grp);
+#pragma unroll
+                    for (int s = 0; s < 4; ++s) {
+                        xm::joint_matrix_load(sg, ma, sQP_mp + (size_t)(sg_m * 8) * 64 + s * 16, (size_t)64);
+                        xm::joint_matrix_load(sg, mb, sKV_mp + (size_t)(s * 8) * KV_LD + (size_t)sg_n * 16, (size_t)KV_LD);
+                        xm::joint_matrix_mad(sg, mc, ma, mb, mc);
+                    }
+                    sycl::group_barrier(grp);
+                }
+
+                xm::joint_matrix_store(sg, mc, sS_mp + (size_t)(sg_m * 8) * 64 + sg_n * 8, (size_t)64, xm::layout::row_major);
+                sycl::group_barrier(grp);
+
+                // ---- Phase 2: Online softmax (64 subgroups = 1 SG8 per row r = sgi) ----
+                {
+                    const int r = sgi;
+                    const int tq = t0 + (r >> 4);
+                    const int pos_q = a.p0 + tq;
+                    const int lo_q = (a.mode == MLA_WINDOW) ? std::max(0, pos_q - a.window + 1) : 0;
+                    float sv[8];
+                    float tmax = NEG;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int k = lane * 8 + i;
+                        const int k_abs = lo_u + j0 + k;
+                        const bool ok = (k < cnt) && (tq < a.M) && (k_abs >= lo_q) && (k_abs <= pos_q);
+                        sv[i] = ok ? (sSp[r * 64 + k] * a.scale) : NEG;
+                        tmax = sycl::fmax(tmax, sv[i]);
+                    }
+                    tmax = sycl::reduce_over_group(sg, tmax, sycl::maximum<float>());
+                    const float mo = sm[r];
+                    const float nm = sycl::fmax(mo, tmax);
+                    const float corr = sycl::exp(mo - nm);
+                    float psum = 0.f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const float p = sv[i] > -1e29f ? sycl::exp(sv[i] - nm) : 0.f;
+                        sqp[r * 64 + lane * 8 + i] = (half)p;
+                        psum += p;
+                    }
+                    psum = sycl::reduce_over_group(sg, psum, sycl::plus<float>());
+                    if (lane == 0) {
+                        sl[r] = sl[r] * corr + psum;
+                        sm[r] = nm;
+                        sc[r] = corr;
+                    }
+                }
+                sycl::group_barrier(grp);
+
+                float corrs[8];
+#pragma unroll
+                for (int r = 0; r < 8; ++r) corrs[r] = sc[sg_m * 8 + r];
+
+                // ---- Phase 3: O[64][512] += P[64][64] @ V[64][512] (reusing sS as 64*64 sTmp!) ----
+                const int k0_v = 2 * kp_v, k1_v = 2 * kp_v + 1;
+                const int sl0 = sSlot[k0_v], sl1 = sSlot[k1_v];
+                const bool v0_ok = k0_v < cnt, v1_ok = k1_v < cnt;
+
+                for (int cb = 0; cb < 8; ++cb) {
+                    const int c0 = cb * 64 + cq_v * 4;
+                    const vh4 r0 = v0_ok ? *reinterpret_cast<const vh4*>(cache + (size_t)sl0 * MLA_ROW + c0) : vh4((half)0.f);
+                    const vh4 r1 = v1_ok ? *reinterpret_cast<const vh4*>(cache + (size_t)sl1 * MLA_ROW + c0) : vh4((half)0.f);
+                    half* vdst = skv + kp_v * KV_LD + (cq_v * 4) * 2;
+                    *reinterpret_cast<vh2*>(vdst + 0) = vh2(r0[0], r1[0]);
+                    *reinterpret_cast<vh2*>(vdst + 2) = vh2(r0[1], r1[1]);
+                    *reinterpret_cast<vh2*>(vdst + 4) = vh2(r0[2], r1[2]);
+                    *reinterpret_cast<vh2*>(vdst + 6) = vh2(r0[3], r1[3]);
+                    sycl::group_barrier(grp);
+
+                    xm::joint_matrix_fill(sg, mc, 0.0f);
+#pragma unroll
+                    for (int s = 0; s < 4; ++s) {
+                        xm::joint_matrix_load(sg, ma, sQP_mp + (size_t)(sg_m * 8) * 64 + s * 16, (size_t)64);
+                        xm::joint_matrix_load(sg, mb, sKV_mp + (size_t)(s * 8) * KV_LD + (size_t)sg_n * 16, (size_t)KV_LD);
+                        xm::joint_matrix_mad(sg, mc, ma, mb, mc);
+                    }
+                    xm::joint_matrix_store(sg, mc, tmp_mp, (size_t)8, xm::layout::row_major);
+                    sycl::group_barrier(sg);
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) o_reg[cb][r] = o_reg[cb][r] * corrs[r] + my_tmp[r * 8 + lane];
+                    sycl::group_barrier(grp);
+                }
+            }
+
+            const int t_out = t0 + q_local;
+            if (t_out < a.M) {
+                float inv_l[8];
+#pragma unroll
+                for (int r = 0; r < 8; ++r) inv_l[r] = 1.0f / sl[sg_m * 8 + r];
+#pragma unroll
+                for (int cb = 0; cb < 8; ++cb) {
+                    const int col = cb * 64 + sg_n * 8 + lane;
+#pragma unroll
+                    for (int r = 0; r < 8; ++r)
+                        ctx[((size_t)t_out * a.NH + hg * HG + h_half * 8 + r) * MLA_KV_LORA + col] = (half)(o_reg[cb][r] * inv_l[r]);
+                }
+            }
+        });
+    });
+}
 #endif
 
 void launch_split_reduce(const float* part, half* ctx, int M, int NH, int S) {
@@ -954,6 +1151,7 @@ void mla_prep_q_sk(int fmt, const void* W_kvb, const float* q_b, half* qa, int M
     auto disp = [&](auto tag) {
         constexpr int F = decltype(tag)::value;
         if (M == 1) prep_q_sk_t<F, 1>(w, q_b, qa, M, NH, p0, d_step, use_dfly_a, theta);
+        else if (M <= 4) prep_q_sk_t<F, 4>(w, q_b, qa, M, NH, p0, d_step, use_dfly_a, theta);
         else prep_q_sk_t<F, 8>(w, q_b, qa, M, NH, p0, d_step, use_dfly_a, theta);
     };
     switch (fmt) {
@@ -981,6 +1179,7 @@ void mla_vup_sk(int fmt, const void* W_kvb, const half* ctx, const float* gate, 
     auto disp = [&](auto tag) {
         constexpr int F = decltype(tag)::value;
         if (M == 1) vup_sk_t<F, 1>(w, ctx, gate, o, M, NH);
+        else if (M <= 4) vup_sk_t<F, 4>(w, ctx, gate, o, M, NH);
         else vup_sk_t<F, 8>(w, ctx, gate, o, M, NH);
     };
     switch (fmt) {
@@ -1004,7 +1203,11 @@ void mla_attend_dev(const half* qa, const half* cache, const float* sinks, half*
     float* part = static_cast<float*>(ws);
 #ifndef HY4S_DISABLE_SG8
     if (a.M >= 16 && mla_use_xmx() && TK == 64) {
-        attend_xmx(qa, cache, sinks, ctx, a, d_step, use_dfly_a, part, S, tps);
+        if (S == 1 && !d_step && (a.mode == MLA_CAUSAL || a.mode == MLA_WINDOW)) {
+            attend_xmx_mq(qa, cache, sinks, ctx, a);
+        } else {
+            attend_xmx(qa, cache, sinks, ctx, a, d_step, use_dfly_a, part, S, tps);
+        }
     } else
 #endif
     {

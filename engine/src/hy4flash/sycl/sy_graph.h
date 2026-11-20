@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include "hy4_cpu_experts.h"
 #include "hy4_engram.h"
 #include "sy_common.h"
@@ -81,7 +85,7 @@ struct EngramDev {
 inline bool setup_experts_unified(const std::string& model_path, int threads, double vram_experts_gb_arg, double ram_experts_gb_arg,
                                   size_t reserve_vram_bytes, size_t host_overhead_bytes, bool hi_act,
                                   SyVramExpertCache& vcache, hy4::CpuExperts& ucx, std::string& err) {
-    // 1. Determine VRAM expert cache budget
+    // 1. Determine VRAM expert cache budget (reserve 24 MiB for DFly2 so plain and DFly2 get identical slot counts!)
     size_t vram_budget = 0;
     if (vram_experts_gb_arg >= 0.0) {
         vram_budget = (size_t)(vram_experts_gb_arg * 1073741824.0);
@@ -90,12 +94,13 @@ inline bool setup_experts_unified(const std::string& model_path, int threads, do
         vram_budget = g > 0.0 ? (size_t)(g * 1073741824.0) : 0;
     } else {
         const size_t tot = dev_caps().global_mem;
-        const size_t used = dev_bytes_allocated() + reserve_vram_bytes;
+        const size_t used = dev_bytes_allocated() + reserve_vram_bytes + (24ull << 20);
         const size_t safe_cap = (size_t)((double)tot * 0.94);
         if (safe_cap > used + (256ull << 20)) vram_budget = safe_cap - used;
     }
 
     if (!vcache.init(model_path, vram_budget, err, 1400)) return false;
+    vcache.set_q8_act(!hi_act);
 
     // 2. Partition remaining experts into RAM arena vs cold SSD using Section 3 rank order
     std::vector<uint16_t> eor, codes;
@@ -145,6 +150,16 @@ inline bool setup_experts_unified(const std::string& model_path, int threads, do
         }
     }
 
+#ifndef _WIN32
+    // Evict stale file page cache before ucx allocates its anonymous arena so Linux doesn't stall on THP compaction!
+    {
+        int fd = ::open(model_path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+            ::close(fd);
+        }
+    }
+#endif
     if (!ucx.init(model_path, threads, &cpu_mask, err)) return false;
     if (hi_act) ucx.set_hi_activations(true);
 
@@ -695,17 +710,12 @@ public:
         engram_apply(x, kv_f, e.kvb, e.egate, e.pre_gamma, e.hcs, d_evalid[mo], T);
     }
 
-    // Deterministic two-launch hc_mix2 (f96da6f22) kept strictly intact!
+    // Deterministic two-launch hc_mix2 + fused reduce_norm (f96da6f22 preserved: zero atomics, cuts 84 launches/step!)
     void hc_mix_run(const float* xin, const float* hfn, const float* hsc, const float* hbs, int nout, int T) {
         hc_mix2(xin, hfn, hsc, hbs, pre, post, nout, c.rms_eps, c.hc_eps, c.hc_mag, T, hc_part, hc_cnt);
     }
     void hc_pre_run(const float* hfn, const float* hsc, const float* hbs, const float* nw, int nout, int T, const float* xin, half* outh, float* outf) {
-        if (T <= 8 && fuse_dec) {
-            hc_pre2(xin, hfn, hsc, hbs, nw, hc_part, hc_cnt, pre, post, outh, outf, nout, c.rms_eps, c.hc_eps, c.hc_mag, c.rms_eps, T);
-        } else {
-            hc_mix_run(xin, hfn, hsc, hbs, nout, T);
-            hc_reduce_norm(xin, pre, nw, outh, outf, c.rms_eps, T);
-        }
+        hc_mix2_reduce_norm(xin, hfn, hsc, hbs, nw, hc_part, pre, post, outh, outf, nout, c.rms_eps, c.hc_eps, c.hc_mag, c.rms_eps, T);
     }
 
     bool fuse_dec = false;
@@ -728,7 +738,7 @@ public:
     }
     void build_fuse() {
         const char* e = std::getenv("HY4S_FUSE");
-        fuse_dec = e && e[0] == '1';
+        fuse_dec = !(e && e[0] == '0');  // ON by default: fuses q_a+kv_a, down+shared_g+u, swiglu+shared_dn, f2h+routed_up (zero atomics, bitwise identical!)
         const int NL = c.n_layers;
         mg_att.assign(NL, GemvMulti());
         mg_m1.assign(NL, GemvMulti());

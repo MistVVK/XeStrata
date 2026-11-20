@@ -124,6 +124,79 @@ inline void hc_mix2(const float* x, const float* fn, const float* scale, const f
     });
 }
 
+// ---- Deterministic 2-launch hc_pre: Launch 1 = hc_mix2 pass 1 (24 slabs/tok -> part[t][24][9], zero atomics);
+// Launch 2 = fused reduction of part[t][0..23] in slab order + write pre/post + reduce x*pre + RMSNorm -> outh/outf!
+// Bit-identical to f96da6f22's hc_mix2 + hc_reduce_norm while cutting 84 launches/step!
+inline void hc_mix2_reduce_norm(const float* x, const float* fn, const float* scale, const float* base, const float* nw,
+                                float* part, float* pre, float* post, half* outh, float* outf, int nout,
+                                float eps, float hc_eps, float hc_mag, float norm_eps, int T) {
+    constexpr int NWG = 24, K = NHC * HID, PER = K / NWG, BT = 128;
+    Q().parallel_for(NR((size_t)T * NWG, BT), [=](sycl::nd_item<1> it) REQD_SG32 {
+        float* shv = lmem<float, 9 * 4>(it);
+        const int g = (int)it.get_group(0), t = g / NWG, slab = g % NWG, tid = (int)it.get_local_id(0);
+        const float* xt = x + (size_t)t * K;
+        float ss = 0, a[8];
+        for (int j = 0; j < 8; ++j) a[j] = 0;
+        for (int k = slab * PER + tid; k < (slab + 1) * PER; k += BT) {
+            const float v = xt[k];
+            ss += v * v;
+            for (int j = 0; j < 8; ++j)
+                if (j < nout) a[j] += v * fn[(size_t)j * K + k];
+        }
+        float vals[9];
+        for (int j = 0; j < 8; ++j) vals[j] = sg_sum(it, a[j]);
+        vals[8] = sg_sum(it, ss);
+        const int sgid = tid >> 5, lane = tid & 31;
+        if (lane == 0)
+            for (int j = 0; j < 9; ++j) shv[j * 4 + sgid] = vals[j];
+        sycl::group_barrier(it.get_group());
+        if (tid < 9) part[((size_t)t * NWG + slab) * 9 + tid] = shv[tid * 4] + shv[tid * 4 + 1] + shv[tid * 4 + 2] + shv[tid * 4 + 3];
+    });
+    Q().parallel_for(NR(T, 256), [=](sycl::nd_item<1> it) REQD_SG32 {
+        float* sh = lmem<float, 32>(it);
+        float* shp = lmem<float, 4>(it);
+        const size_t t = it.get_group(0);
+        const int tid = (int)it.get_local_id(0);
+        if (tid < 32) {
+            auto sg = it.get_sub_group();
+            float s = 0;
+            if (tid < 9)
+                for (int q = 0; q < NWG; ++q) s += part[(t * NWG + q) * 9 + tid];
+            float v[9];
+            for (int j = 0; j < 9; ++j) v[j] = sycl::select_from_group(sg, s, (unsigned)j);
+            if (tid == 0) {
+                const float inv = sycl::rsqrt(v[8] / K + eps);
+                for (int h = 0; h < NHC; ++h) {
+                    const float pr = sigmoidf_(v[h] * inv * scale[0] + base[h]) + hc_eps;
+                    pre[t * NHC + h] = pr;
+                    shp[h] = pr;
+                    if (nout == 8) post[t * NHC + h] = hc_mag * sigmoidf_(v[NHC + h] * inv * scale[1] + base[NHC + h]) + hc_eps;
+                }
+            }
+        }
+        sycl::group_barrier(it.get_group());
+        const float* xt = x + t * NHC * HID;
+        const float p0 = shp[0], p1 = shp[1], p2 = shp[2], p3 = shp[3];
+        constexpr int PER_R = HID / 256;
+        float vr[PER_R];
+        float ss = 0;
+        for (int i = 0; i < PER_R; ++i) {
+            const int d = tid + i * 256;
+            const float c = xt[d] * p0 + xt[HID + d] * p1 + xt[2 * HID + d] * p2 + xt[3 * HID + d] * p3;
+            vr[i] = c;
+            ss += c * c;
+        }
+        ss = wg_sum(it, ss, sh);
+        const float inv2 = sycl::rsqrt(ss / HID + norm_eps);
+        for (int i = 0; i < PER_R; ++i) {
+            const int d = tid + i * 256;
+            const float o = vr[i] * inv2 * (nw ? nw[d] : 1.0f);
+            if (outh) outh[t * HID + d] = (half)o;
+            if (outf) outf[t * HID + d] = o;
+        }
+    });
+}
+
 // ---- cur = sum_h x[h]*pre[h]; then rmsnorm(cur, w) -> fp16 (GEMM input) and optionally fp32
 inline void hc_reduce_norm(const float* x, const float* pre, const float* w, half* outh, float* outf, float eps, int T) {
     Q().parallel_for(NR(T, 256), [=](sycl::nd_item<1> it) REQD_SG32 {

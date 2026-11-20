@@ -489,6 +489,7 @@ GpuExperts::~GpuExperts() {
     sycl::free(im_->ye, im_->cq);
 }
 
+#ifdef HY4S_LEGACY_CPUEXP
 bool GpuExperts::init(const CpuExperts& cx, size_t stage_bytes, int max_tokens, std::string& err, int copy_threads) {
     Impl& I = *im_;
     I.cx = &cx;
@@ -512,6 +513,7 @@ bool GpuExperts::init(const CpuExperts& cx, size_t stage_bytes, int max_tokens, 
         }
     return true;
 }
+#endif
 
 bool GpuExperts::init_unified(const std::string& strata_path, const hy4::CpuExperts* ucx, const SyVramExpertCache* vcache,
                               size_t stage_bytes, int max_tokens, std::string& err, int copy_threads) {
@@ -539,7 +541,7 @@ bool GpuExperts::init_unified(const std::string& strata_path, const hy4::CpuExpe
         }
         DirMeta& dm = I.umeta[(size_t)L * 512 + d.expert_id];
         dm.file_off = h.sections[4].file_offset + d.body_offset;
-        dm.dn_off = d.dn_off;
+        dm.dn_off = d.dn_offset;
         dm.bytes = d.body_bytes;
         dm.gu = d.gu_code_id;
         dm.dn = d.dn_code_id;
@@ -605,7 +607,9 @@ void GpuExperts::run(int L, int T, const float* z_dev, const int32_t* idx, const
         EInfo& x = einfo[e];
         bool ok = false;
         if (I.cx) {
+#ifdef HY4S_LEGACY_CPUEXP
             ok = I.cx->expert_info(L, e, &x.hbody, &x.gu, &x.dn, &x.dn_off, &x.bytes);
+#endif
         } else {
             const DirMeta& dm = I.umeta[(size_t)L * 512 + e];
             ok = dm.ok;
@@ -757,7 +761,9 @@ void GpuExperts::run(int L, int T, const float* z_dev, const int32_t* idx, const
             const EInfo& ei = einfo[I.act_host[i]];
             uint8_t* dst = I.h_slot[hs] + off[i - a];
             if (I.cx) {
+#ifdef HY4S_LEGACY_CPUEXP
                 I.cx->copy_body(ei.hbody, ei.bytes, dst);
+#endif
             } else if (ei.hbody) {
                 std::memcpy(dst, ei.hbody, ei.bytes);
             } else if (I.af_open) {

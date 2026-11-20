@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "hy4_io.h"
@@ -39,13 +40,15 @@ inline int vc_sb_bytes(int code) {
     return code == 0 ? 48 : code == 2 ? 70 : code == 3 ? 102 : code == 4 ? 134 : code == 5 ? 166 : code == 6 ? 198 : 262;
 }
 
-// Dot product of 1 S_K row (K = 1536 = 6 superblocks) with fp32 or fp16 activation vector using 1 SG32 sub-group.
-// Each lane handles 48 weights (8 weights per superblock across 6 superblocks = 6*8 = 48 weights).
-template <class ActT>
+// Dot product of 1 S_K row (K = 1536 = 6 superblocks) with fp32/fp16 or Q8_1_G64-quantized activation vector using 1 SG32 sub-group.
+// When Q8_ACT=true, activations are quantized per 64-element group identically to hy4::CpuExperts (d = amax/127, q = rint(x/d)),
+// making VRAM-resident and CPU-resident experts numerically identical (< 1e-6 diff) so adaptive VRAM promotion never perturbs logits!
+template <class ActT, bool Q8_ACT>
 inline float sg_dot_row(const sycl::nd_item<1>& it, int code, const uint8_t* rp, const ActT* x) {
+    auto sg = it.get_sub_group();
     const int lane = (int)it.get_local_id(0) & 31;
     const int sby = vc_sb_bytes(code);
-    const int g = lane >> 3;        // 0..3 (64-weight subgroup)
+    const int g = lane >> 3;        // 0..3 (64-weight subgroup, 8 lanes per subgroup)
     const int j0 = (lane & 7) << 3; // 0, 8, ..., 56 within subgroup
     const int base_i = (g << 6) + j0;
     float acc = 0.0f;
@@ -56,66 +59,75 @@ inline float sg_dot_row(const sycl::nd_item<1>& it, int code, const uint8_t* rp,
         const float eff = D * ((float)blk[2 + g] / 255.0f);
         const uint8_t* pl = blk + 6;
         const ActT* xp = x + sbi * 256 + base_i;
+        float xv[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) xv[k] = (float)xp[k];
+        float scale_x = 1.0f;
+        if constexpr (Q8_ACT) {
+            float amax = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) amax = sycl::fmax(amax, sycl::fabs(xv[k]));
+            amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 1));
+            amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 2));
+            amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 4));
+            scale_x = amax * (1.0f / 127.0f);
+            const float inv = amax > 0.0f ? (127.0f / amax) : 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) xv[k] = (float)sycl::clamp((int)sycl::rint(xv[k] * inv), -127, 127);
+        }
+        const float effx = eff * scale_x;
         float sq = 0.0f, sx = 0.0f;
         if (code == 2) {
             const uint8_t b0 = pl[base_i >> 2], b1 = pl[(base_i >> 2) + 1];
-            const float x0 = (float)xp[0], x1 = (float)xp[1], x2 = (float)xp[2], x3 = (float)xp[3];
-            const float x4 = (float)xp[4], x5 = (float)xp[5], x6 = (float)xp[6], x7 = (float)xp[7];
-            sq = (float)(b0 & 3u) * x0 + (float)((b0 >> 2) & 3u) * x1 + (float)((b0 >> 4) & 3u) * x2 + (float)(b0 >> 6) * x3 +
-                 (float)(b1 & 3u) * x4 + (float)((b1 >> 2) & 3u) * x5 + (float)((b1 >> 4) & 3u) * x6 + (float)(b1 >> 6) * x7;
-            sx = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
-            acc += eff * (sq - 1.5f * sx);
+            sq = (float)(b0 & 3u) * xv[0] + (float)((b0 >> 2) & 3u) * xv[1] + (float)((b0 >> 4) & 3u) * xv[2] + (float)(b0 >> 6) * xv[3] +
+                 (float)(b1 & 3u) * xv[4] + (float)((b1 >> 2) & 3u) * xv[5] + (float)((b1 >> 4) & 3u) * xv[6] + (float)(b1 >> 6) * xv[7];
+            sx = xv[0] + xv[1] + xv[2] + xv[3] + xv[4] + xv[5] + xv[6] + xv[7];
+            acc += effx * (sq - 1.5f * sx);
         } else if (code == 3) {
             const uint8_t b0 = pl[base_i >> 2], b1 = pl[(base_i >> 2) + 1];
             const uint32_t hi = pl[64 + (base_i >> 3)];
-            const float x0 = (float)xp[0], x1 = (float)xp[1], x2 = (float)xp[2], x3 = (float)xp[3];
-            const float x4 = (float)xp[4], x5 = (float)xp[5], x6 = (float)xp[6], x7 = (float)xp[7];
-            sq = (float)((b0 & 3u) | ((hi & 1u) << 2)) * x0 + (float)(((b0 >> 2) & 3u) | (((hi >> 1) & 1u) << 2)) * x1 +
-                 (float)(((b0 >> 4) & 3u) | (((hi >> 2) & 1u) << 2)) * x2 + (float)((b0 >> 6) | (((hi >> 3) & 1u) << 2)) * x3 +
-                 (float)((b1 & 3u) | (((hi >> 4) & 1u) << 2)) * x4 + (float)(((b1 >> 2) & 3u) | (((hi >> 5) & 1u) << 2)) * x5 +
-                 (float)(((b1 >> 4) & 3u) | (((hi >> 6) & 1u) << 2)) * x6 + (float)((b1 >> 6) | (((hi >> 7) & 1u) << 2)) * x7;
-            sx = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
-            acc += eff * (sq - 3.5f * sx);
+            sq = (float)((b0 & 3u) | ((hi & 1u) << 2)) * xv[0] + (float)(((b0 >> 2) & 3u) | (((hi >> 1) & 1u) << 2)) * xv[1] +
+                 (float)(((b0 >> 4) & 3u) | (((hi >> 2) & 1u) << 2)) * xv[2] + (float)((b0 >> 6) | (((hi >> 3) & 1u) << 2)) * xv[3] +
+                 (float)((b1 & 3u) | (((hi >> 4) & 1u) << 2)) * xv[4] + (float)(((b1 >> 2) & 3u) | (((hi >> 5) & 1u) << 2)) * xv[5] +
+                 (float)(((b1 >> 4) & 3u) | (((hi >> 6) & 1u) << 2)) * xv[6] + (float)((b1 >> 6) | (((hi >> 7) & 1u) << 2)) * xv[7];
+            sx = xv[0] + xv[1] + xv[2] + xv[3] + xv[4] + xv[5] + xv[6] + xv[7];
+            acc += effx * (sq - 3.5f * sx);
         } else if (code == 4) {
             const uint8_t* p = pl + (base_i >> 1);
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 const uint8_t by = p[k];
-                const float x0 = (float)xp[2 * k], x1 = (float)xp[2 * k + 1];
-                sq += (float)(by & 15u) * x0 + (float)(by >> 4) * x1;
-                sx += x0 + x1;
+                sq += (float)(by & 15u) * xv[2 * k] + (float)(by >> 4) * xv[2 * k + 1];
+                sx += xv[2 * k] + xv[2 * k + 1];
             }
-            acc += eff * (sq - 7.5f * sx);
+            acc += effx * (sq - 7.5f * sx);
         } else if (code == 0) {
             const float fine = 0.5f + (float)((pl[40 + (g >> 1)] >> ((g & 1) * 4)) & 15u) / 15.0f;
-            const int grp = base_i >> 5;  // 0..7 (32 weights = 8 indices = 5 bytes)
+            const int grp = base_i >> 5;
             const uint8_t* p = pl + grp * 5;
             const uint64_t bits = (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32);
-            const int j_sub = (base_i & 31) >> 2;  // 0, 2, 4, 6
+            const int j_sub = (base_i & 31) >> 2;
             const uint32_t i0 = (uint32_t)((bits >> (5 * j_sub)) & 0x1Fu);
             const uint32_t i1 = (uint32_t)((bits >> (5 * (j_sub + 1))) & 0x1Fu);
-            sq = (float)kS125[i0][0] * (float)xp[0] + (float)kS125[i0][1] * (float)xp[1] +
-                 (float)kS125[i0][2] * (float)xp[2] + (float)kS125[i0][3] * (float)xp[3] +
-                 (float)kS125[i1][0] * (float)xp[4] + (float)kS125[i1][1] * (float)xp[5] +
-                 (float)kS125[i1][2] * (float)xp[6] + (float)kS125[i1][3] * (float)xp[7];
-            acc += eff * fine * sq;
+            sq = (float)kS125[i0][0] * xv[0] + (float)kS125[i0][1] * xv[1] + (float)kS125[i0][2] * xv[2] + (float)kS125[i0][3] * xv[3] +
+                 (float)kS125[i1][0] * xv[4] + (float)kS125[i1][1] * xv[5] + (float)kS125[i1][2] * xv[6] + (float)kS125[i1][3] * xv[7];
+            acc += effx * fine * sq;
         } else if (code == 5) {
             const uint8_t* p = pl + (base_i >> 1);
             const uint32_t hi = pl[128 + (base_i >> 3)];
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 const uint8_t by = p[k];
-                const float x0 = (float)xp[2 * k], x1 = (float)xp[2 * k + 1];
                 const uint32_t q0 = (by & 15u) | (((hi >> (2 * k)) & 1u) << 4);
                 const uint32_t q1 = (by >> 4) | (((hi >> (2 * k + 1)) & 1u) << 4);
-                sq += (float)q0 * x0 + (float)q1 * x1;
-                sx += x0 + x1;
+                sq += (float)q0 * xv[2 * k] + (float)q1 * xv[2 * k + 1];
+                sx += xv[2 * k] + xv[2 * k + 1];
             }
-            acc += eff * (sq - 15.5f * sx);
+            acc += effx * (sq - 15.5f * sx);
         } else {
 #pragma unroll
-            for (int k = 0; k < 8; ++k) sq += (float)(int8_t)pl[base_i + k] * (float)xp[k];
-            acc += eff * sq;
+            for (int k = 0; k < 8; ++k) sq += (float)(int8_t)pl[base_i + k] * xv[k];
+            acc += effx * sq;
         }
     }
     return sg_sum(it, acc);
@@ -170,6 +182,8 @@ public:
     uint64_t misses() const { return misses_; }
     uint64_t promotions() const { return promotions_; }
     void reset_stats() { hits_ = misses_ = promotions_ = 0; }
+    void set_q8_act(bool on) { q8_act_ = on; }
+    bool q8_act() const { return q8_act_; }
 
     ~SyVramExpertCache() { release(); }
 
@@ -214,7 +228,7 @@ public:
             const auto& d = dir[i];
             Meta& m = meta_[(size_t)L * 512 + d.expert_id];
             m.file_off = h.sections[4].file_offset + d.body_offset;
-            m.dn_off = d.dn_off;
+            m.dn_off = d.dn_offset;
             m.body_bytes = d.body_bytes;
             m.gu = d.gu_code_id;
             m.dn = d.dn_code_id;
@@ -370,36 +384,41 @@ public:
         float* ye = d_ye_;
         const int32_t* toff = d_tok_off_;
 
-        Q().parallel_for(NR((size_t)npairs * 192, 256), [=](sycl::nd_item<1> it) REQD_SG32 {
-            const int gid = (int)it.get_group(0);
-            const int p = gid / 192, rb = gid % 192;
-            const int wave = (int)it.get_local_id(0) >> 5, lane = (int)it.get_local_id(0) & 31;
-            const int d = rb * 8 + wave;
-            const vcache_detail::VramPair vp = dp[p];
-            const size_t row_b = (size_t)6 * vcache_detail::vc_sb_bytes(vp.gu);
-            const uint8_t* wgu = vp.body + 3072;
-            const float* zt = z_dev + (size_t)vp.tok * vcache_detail::VC_K;
-            const float g = vcache_detail::sg_dot_row(it, vp.gu, wgu + (size_t)d * row_b, zt);
-            const float u = vcache_detail::sg_dot_row(it, vp.gu, wgu + (size_t)(vcache_detail::VC_K + d) * row_b, zt);
-            if (lane == 0) {
-                const float sq = h2f_bits(ld16(vp.body + 2 * d));
-                const float s = sycl::fmin(g / (1.0f + sycl::exp(-g)), 10.0f);
-                const float uc = sycl::fmax(-10.0f, sycl::fmin(u, 10.0f));
-                hmid[(size_t)p * vcache_detail::VC_K + d] = (half)((s * uc) / sq);
-            }
-        });
+        auto launch_k = [&](auto q8_tag) {
+            constexpr bool Q8A = decltype(q8_tag)::value;
+            Q().parallel_for(NR((size_t)npairs * 192, 256), [=](sycl::nd_item<1> it) REQD_SG32 {
+                const int gid = (int)it.get_group(0);
+                const int p = gid / 192, rb = gid % 192;
+                const int wave = (int)it.get_local_id(0) >> 5, lane = (int)it.get_local_id(0) & 31;
+                const int d = rb * 8 + wave;
+                const vcache_detail::VramPair vp = dp[p];
+                const size_t row_b = (size_t)6 * vcache_detail::vc_sb_bytes(vp.gu);
+                const uint8_t* wgu = vp.body + 3072;
+                const float* zt = z_dev + (size_t)vp.tok * vcache_detail::VC_K;
+                const float g = vcache_detail::sg_dot_row<float, Q8A>(it, vp.gu, wgu + (size_t)d * row_b, zt);
+                const float u = vcache_detail::sg_dot_row<float, Q8A>(it, vp.gu, wgu + (size_t)(vcache_detail::VC_K + d) * row_b, zt);
+                if (lane == 0) {
+                    const float sq = h2f_bits(ld16(vp.body + 2 * d));
+                    const float s = sycl::fmin(g / (1.0f + sycl::exp(-g)), 10.0f);
+                    const float uc = sycl::fmax(-10.0f, sycl::fmin(u, 10.0f));
+                    hmid[(size_t)p * vcache_detail::VC_K + d] = (half)((s * uc) / sq);
+                }
+            });
 
-        Q().parallel_for(NR((size_t)npairs * 192, 256), [=](sycl::nd_item<1> it) REQD_SG32 {
-            const int gid = (int)it.get_group(0);
-            const int p = gid / 192, rb = gid % 192;
-            const int wave = (int)it.get_local_id(0) >> 5, lane = (int)it.get_local_id(0) & 31;
-            const int d = rb * 8 + wave;
-            const vcache_detail::VramPair vp = dp[p];
-            const size_t row_b = (size_t)6 * vcache_detail::vc_sb_bytes(vp.dn);
-            const uint8_t* wdn = vp.body + vp.dn_off;
-            const float y = vcache_detail::sg_dot_row(it, vp.dn, wdn + (size_t)d * row_b, hmid + (size_t)p * vcache_detail::VC_K);
-            if (lane == 0) ye[(size_t)p * vcache_detail::VC_K + d] = y;
-        });
+            Q().parallel_for(NR((size_t)npairs * 192, 256), [=](sycl::nd_item<1> it) REQD_SG32 {
+                const int gid = (int)it.get_group(0);
+                const int p = gid / 192, rb = gid % 192;
+                const int wave = (int)it.get_local_id(0) >> 5, lane = (int)it.get_local_id(0) & 31;
+                const int d = rb * 8 + wave;
+                const vcache_detail::VramPair vp = dp[p];
+                const size_t row_b = (size_t)6 * vcache_detail::vc_sb_bytes(vp.dn);
+                const uint8_t* wdn = vp.body + vp.dn_off;
+                const float y = vcache_detail::sg_dot_row<half, Q8A>(it, vp.dn, wdn + (size_t)d * row_b, hmid + (size_t)p * vcache_detail::VC_K);
+                if (lane == 0) ye[(size_t)p * vcache_detail::VC_K + d] = y;
+            });
+        };
+        if (q8_act_) launch_k(std::true_type{});
+        else launch_k(std::false_type{});
 
         Q().parallel_for(NR(T, 256), [=](sycl::nd_item<1> it) {
             const int t = (int)it.get_group(0), tid = (int)it.get_local_id(0);
@@ -479,6 +498,7 @@ private:
     size_t slot_bytes_ = 0;
     size_t dev_bytes_ = 0;
     bool adaptive_ = true;
+    bool q8_act_ = true;
     uint64_t step_ctr_ = 0;
     uint64_t hits_ = 0, misses_ = 0, promotions_ = 0;
     std::vector<Meta> meta_;

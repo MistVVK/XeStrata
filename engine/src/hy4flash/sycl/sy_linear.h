@@ -91,6 +91,112 @@ inline void k_linear_f32(const float* W, int N, int K, const float* X, float* Y,
     });
 }
 
+// Tiled Q8ROW GEMM for prefill (M >= 16): BM=32, BN=32, BK=32, 128 threads (16x8 -> each thread computes 4x2 = 8 outputs).
+// Avoids 2-WG stall on small-N / small-K indexer projections (key_gate [128,128], key_value [128,128], head_weight [16,3072]).
+inline void k_gemm_q8row(const uint8_t* W, int N, int K, const half* X, float* Y, int M) {
+    const int nbm = (M + 31) / 32, nbn = (N + 31) / 32;
+    const float* scales = reinterpret_cast<const float*>(W);
+    const int8_t* Qw = reinterpret_cast<const int8_t*>(W + (size_t)N * 4);
+    Q().submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sA(32 * 33, h);
+        sycl::local_accessor<float, 1> sB(32 * 33, h);
+        h.parallel_for(sycl::nd_range<1>((size_t)nbm * nbn * 128, 128), [=](sycl::nd_item<1> it) {
+            const int gid = (int)it.get_group(0);
+            const int bn = gid % nbn, bm = gid / nbn;
+            const int tid = (int)it.get_local_id(0);
+            const int tm = (tid >> 4) * 4;  // 0,4,...,28 (8 rows of 4)
+            const int tn = (tid & 15) * 2;  // 0,2,...,30 (16 cols of 2)
+            float c[4][2] = {};
+            for (int k0 = 0; k0 < K; k0 += 32) {
+                for (int idx = tid; idx < 32 * 32; idx += 128) {
+                    const int r = idx >> 5, k = idx & 31;
+                    const int gm = bm * 32 + r;
+                    sA[r * 33 + k] = (gm < M && k0 + k < K) ? (float)X[(size_t)gm * K + k0 + k] : 0.f;
+                    const int gn = bn * 32 + r;
+                    sB[r * 33 + k] = (gn < N && k0 + k < K) ? (float)Qw[(size_t)gn * K + k0 + k] : 0.f;
+                }
+                sycl::group_barrier(it.get_group());
+                for (int k = 0; k < 32; ++k) {
+                    const float a0 = sA[(tm + 0) * 33 + k], a1 = sA[(tm + 1) * 33 + k];
+                    const float a2 = sA[(tm + 2) * 33 + k], a3 = sA[(tm + 3) * 33 + k];
+                    const float b0 = sB[(tn + 0) * 33 + k], b1 = sB[(tn + 1) * 33 + k];
+                    c[0][0] += a0 * b0; c[0][1] += a0 * b1;
+                    c[1][0] += a1 * b0; c[1][1] += a1 * b1;
+                    c[2][0] += a2 * b0; c[2][1] += a2 * b1;
+                    c[3][0] += a3 * b0; c[3][1] += a3 * b1;
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            const int gn0 = bn * 32 + tn, gn1 = gn0 + 1;
+            const float sc0 = gn0 < N ? scales[gn0] : 0.f;
+            const float sc1 = gn1 < N ? scales[gn1] : 0.f;
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const int gm = bm * 32 + tm + r;
+                if (gm < M) {
+                    if (gn0 < N) Y[(size_t)gm * N + gn0] = c[r][0] * sc0;
+                    if (gn1 < N) Y[(size_t)gm * N + gn1] = c[r][1] * sc1;
+                }
+            }
+        });
+    });
+}
+
+// Tiled exact-FP32 GEMM for prefill router (W [N,K] f32, X [M,K] f32 -> Y [M,N] f32, M >= 16).
+// BM=32, BN=64, BK=16, 128 threads (8x16 -> each thread computes 4x4 = 16 outputs). Zero FP16 rounding!
+inline void k_gemm_f32(const float* W, int N, int K, const float* X, float* Y, int M) {
+    const int nbm = (M + 31) / 32, nbn = (N + 63) / 64;
+    Q().submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sA(32 * 17, h);
+        sycl::local_accessor<float, 1> sB(64 * 17, h);
+        h.parallel_for(sycl::nd_range<1>((size_t)nbm * nbn * 128, 128), [=](sycl::nd_item<1> it) {
+            const int gid = (int)it.get_group(0);
+            const int bn = gid % nbn, bm = gid / nbn;
+            const int tid = (int)it.get_local_id(0);
+            const int tm = (tid >> 4) * 4;   // 0,4,...,28 (8 rows of 4)
+            const int tn = (tid & 15) * 4;   // 0,4,...,60 (16 cols of 4)
+            float c[4][4] = {};
+            for (int k0 = 0; k0 < K; k0 += 16) {
+                // Load 32x16 of X (512 floats = 4/thread) and 64x16 of W (1024 floats = 8/thread)
+                for (int idx = tid; idx < 32 * 16; idx += 128) {
+                    const int r = idx >> 4, k = idx & 15;
+                    const int gm = bm * 32 + r;
+                    sA[r * 17 + k] = (gm < M && k0 + k < K) ? X[(size_t)gm * K + k0 + k] : 0.f;
+                }
+                for (int idx = tid; idx < 64 * 16; idx += 128) {
+                    const int r = idx >> 4, k = idx & 15;
+                    const int gn = bn * 64 + r;
+                    sB[r * 17 + k] = (gn < N && k0 + k < K) ? W[(size_t)gn * K + k0 + k] : 0.f;
+                }
+                sycl::group_barrier(it.get_group());
+#pragma unroll
+                for (int k = 0; k < 16; ++k) {
+                    const float a0 = sA[(tm + 0) * 17 + k], a1 = sA[(tm + 1) * 17 + k];
+                    const float a2 = sA[(tm + 2) * 17 + k], a3 = sA[(tm + 3) * 17 + k];
+                    const float b0 = sB[(tn + 0) * 17 + k], b1 = sB[(tn + 1) * 17 + k];
+                    const float b2 = sB[(tn + 2) * 17 + k], b3 = sB[(tn + 3) * 17 + k];
+                    c[0][0] += a0 * b0; c[0][1] += a0 * b1; c[0][2] += a0 * b2; c[0][3] += a0 * b3;
+                    c[1][0] += a1 * b0; c[1][1] += a1 * b1; c[1][2] += a1 * b2; c[1][3] += a1 * b3;
+                    c[2][0] += a2 * b0; c[2][1] += a2 * b1; c[2][2] += a2 * b2; c[2][3] += a2 * b3;
+                    c[3][0] += a3 * b0; c[3][1] += a3 * b1; c[3][2] += a3 * b2; c[3][3] += a3 * b3;
+                }
+                sycl::group_barrier(it.get_group());
+            }
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const int gm = bm * 32 + tm + r;
+                if (gm < M) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const int gn = bn * 64 + tn + j;
+                        if (gn < N) Y[(size_t)gm * N + gn] = c[r][j];
+                    }
+                }
+            }
+        });
+    });
+}
+
 inline void linear_h(int fmt, const void* Wv, int N, int K, const half* X, float* Y, int M) {
     const uint8_t* W = (const uint8_t*)Wv;
     switch (fmt) {
@@ -106,14 +212,16 @@ inline void linear_h(int fmt, const void* Wv, int N, int K, const half* X, float
         HY4S_LIN(FMT_S8);
 #undef HY4S_LIN
         case FMT_Q8ROW:
-            if (M <= 8) k_linear_q8row<8>(W, N, K, X, Y, M); else k_linear_q8row<16>(W, N, K, X, Y, M);
+            if (M >= 16) k_gemm_q8row(W, N, K, X, Y, M);
+            else k_linear_q8row<8>(W, N, K, X, Y, M);
             break;
         default: fprintf(stderr, "linear_h: unsupported fmt %d\n", fmt); abort();
     }
 }
 
 inline void linear_f32(const float* W, int N, int K, const float* X, float* Y, int M) {
-    if (M <= 8) k_linear_f32<8>(W, N, K, X, Y, M); else k_linear_f32<16>(W, N, K, X, Y, M);
+    if (M >= 16) k_gemm_f32(W, N, K, X, Y, M);
+    else k_linear_f32<8>(W, N, K, X, Y, M);
 }
 
 // kv_b_proj [NH*448][512] (any S_K fmt) -> wk_b [NH][192][512] and wv_b [NH][256][512] fp16 (absorbed MLA weights)
