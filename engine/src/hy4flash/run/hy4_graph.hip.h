@@ -158,7 +158,7 @@ public:
     uint8_t* d_evalid[4] = {};
     EngramDev eng_dev[4];
     ExpertDev* d_experts = nullptr;
-    std::vector<ExpertDev> h_experts;  // host mirror of d_experts [41*512]
+    ExpertDev* h_experts = nullptr;    // pinned host mirror of d_experts [41*512] (non-blocking H2D for vcache updates)
     __half* wk_layer = nullptr;        // reusable single-layer [max_NH][192][512] (or [max_NH][512][192] on HIP) fp16 for prefill T > 8 (12.6 MiB)
     __half* wv_layer = nullptr;        // reusable single-layer [max_NH][256][512] fp16 for prefill T > 8 (16.8 MiB)
     std::vector<__half*> kcache;       // per layer
@@ -707,7 +707,7 @@ public:
             ++filled;
         }
         HCK(hipStreamSynchronize(st2));
-        HCK(hipMemcpy(d_experts, h_experts.data(), h_experts.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+        HCK(hipMemcpy(d_experts, h_experts, (size_t)41 * 512 * sizeof(ExpertDev), hipMemcpyHostToDevice));
         fprintf(stderr, "[vcache] pre-populated %d/%d adaptive VRAM slots (%.2f GB, decay=%.3f, max_swaps=%d) in %.2f s\n",
                 filled, vcache_nslots, (filled * (double)vcache_slot_bytes) / 1e9, vcache_decay, vcache_max_swaps, now_s() - t0);
     }
@@ -785,7 +785,7 @@ public:
         }
         if (swapped > 0) {
             HCK(hipStreamSynchronize(st2));
-            HCK(hipMemcpy(d_experts, h_experts.data(), h_experts.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+            HCK(hipMemcpy(d_experts, h_experts, (size_t)41 * 512 * sizeof(ExpertDev), hipMemcpyHostToDevice));
             vc_promotes += (uint64_t)swapped;
             ++vcache_ver;
         }
@@ -912,7 +912,7 @@ public:
             HCK(hipMemGetInfo(&fr, &tot));
         }
         if (freed_slabs > 0) {
-            HCK(hipMemcpy(d_experts, h_experts.data(), h_experts.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+            HCK(hipMemcpy(d_experts, h_experts, (size_t)41 * 512 * sizeof(ExpertDev), hipMemcpyHostToDevice));
             ++vcache_ver;
             fprintf(stderr, "[vcache] released %d slab(s) (%.2f GB) for VRAM KV growth -> %d adaptive slots (%.2f GB) remain\n",
                     freed_slabs, freed_bytes / 1e9, vcache_nslots, (vcache_nslots * (double)vcache_slot_bytes) / 1e9);
@@ -1003,7 +1003,7 @@ public:
         for (auto& e : cg_cache) e.destroy();
         cg_cache.clear();
     }
-    ~Runner() { cg_clear(); }
+    ~Runner() { cg_clear(); if (h_experts) { (void)hipHostFree(h_experts); h_experts = nullptr; } }
 #endif
 
     Runner(GpuModel& gm, int max_ctx_, int max_chunk) : g(gm), c(gm.man.c), max_ctx(max_ctx_), Tc(max_chunk) {}
@@ -1098,11 +1098,21 @@ public:
         fprintf(stderr, "  TOTAL %.3f ms\n", tot / steps);
         pacc.clear();
     }
-    void lin(const std::string& name, const __half* X, float* Y, int M) {
+    void lin(const std::string& name, const __half* X, float* Y, int M, __half* w16 = nullptr) {
         const TInfo& t = ti(name);
         size_t dot = name.rfind('.', name.rfind('.') - 1);
         PS _p(this, std::string("lin ") + name.substr(name.find('.', 13) == std::string::npos ? 0 : name.find('.', 13) + 1));
         (void)dot;
+#if HY4_MMA && !HY4_CUDA
+        static const bool allow_w16 = !getenv("HY4_NO_W16") && skd::is_gfx12_device();
+        // On RDNA4 (gfx12), dequant S_K -> FP16 once when the FP16 weight fits in the 64 MB Infinity Cache (<= 48 MiB)
+        if (allow_w16 && w16 && M >= 256 && t.fmt != FMT_Q8ROW && skd::int8_wmma_mode() == 0 && (size_t)t.rows() * t.cols() * 2 <= (48ull << 20)) {
+            linear_h_dequant_f16(st, t.fmt, tw(name), (int)t.rows(), (int)t.cols(), X, Y, M, w16);
+            return;
+        }
+#else
+        (void)w16;
+#endif
         linear_h(st, t.fmt, tw(name), (int)t.rows(), (int)t.cols(), X, Y, M);
     }
 
@@ -1241,9 +1251,9 @@ public:
         d_argmax = dalloc<int32_t>(T);
         mla_ws_bytes = 0;
         mla_ws = nullptr;
-        // experts table
+        // experts table (pinned host mirror for non-blocking vcache H2D updates)
         {
-            h_experts.resize(41 * 512);
+            HCK(hipHostMalloc((void**)&h_experts, (size_t)41 * 512 * sizeof(ExpertDev), hipHostMallocDefault));
             for (int i = 0; i < 41 * 512; ++i) {
                 const ExpertRef& e = g.experts[i];
                 h_experts[i].body_off = e.body_off;
@@ -1253,7 +1263,7 @@ public:
                 h_experts[i].pad = (e.tier >= 2) ? 1 : 0;  // CPU (2), cold-SSD (3), or peer-GPU (4) skipped by GPU 0; tier 0 (VRAM) & tier 1 (pinned host) run on GPU 0
             }
             d_experts = dalloc<ExpertDev>(41 * 512);
-            HCK(hipMemcpy(d_experts, h_experts.data(), h_experts.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
+            HCK(hipMemcpy(d_experts, h_experts, (size_t)41 * 512 * sizeof(ExpertDev), hipMemcpyHostToDevice));
         }
 #if HY4_CUDA
         if (!g.peers.empty()) {
@@ -1780,15 +1790,16 @@ public:
         // q + kv_a + linear_gate: fuse into ONE LinMulti launch on decode/verify (T <= 8) when formats match
         const bool fused_attn = lm_ok_m(T) && il < (int)lm_attn.size() && lm_attn[il].d_jobs != nullptr;
         const float* kv_a_out = fused_attn ? (F1 + 8192) : F1;
+        const bool w16_ok = !dump && Tc >= 2048;
         if (fused_attn) {
             { PS _q(this, "lin attn_qkvg_multi"); linear_h_multi(st, lm_attn[il], cur_h, T); }
             { PS _q(this, "q_a_rms"); hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps); }
             lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
         } else {
-            lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
+            lin(pa + ".q_a_proj.weight", cur_h, F1, T, w16_ok ? (__half*)F2 : nullptr);  // [T][1024]
             { PS _q(this, "q_a_rms"); hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps); }
-            lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
-            lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]  (qr_h already extracted)
+            lin(pa + ".q_b_proj.weight", qr_h, F2, T, w16_ok ? (__half*)F1 : nullptr);  // [T][NH*256]
+            lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T, w16_ok ? (__half*)(F1 + (size_t)T * 1024) : nullptr);  // [T][576]  (qr_h already extracted)
         }
         __half* cache = kcache[il];
         const int cslots = swa ? ring : slots_sparse;
@@ -1825,7 +1836,7 @@ public:
         }
         last_use_list = use_list;
         if (dfly_cap && !swa) dfly_capture(il, p0, T, use_list);
-        if (!fused_attn) lin(pa + ".linear_gate.weight", cur_h, F3, T);  // [T][NH*256]
+        if (!fused_attn) lin(pa + ".linear_gate.weight", cur_h, F3, T, w16_ok ? (__half*)F2 : nullptr);  // [T][NH*256]
         const float* gate_buf = fused_attn ? F3_dec : F3;
         MlaAttnArgs a;
         a.M = T;
@@ -1863,7 +1874,7 @@ public:
         } else {
             { PS _q(this, "mla_attend_vup_prefill"); mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_layer, gate_buf, o_h, ctx_ws, a, mla_ws, mla_ws_bytes); }
         }
-        lin(pa + ".o_proj.weight", o_h, F1, T);  // [T][3072]
+        lin(pa + ".o_proj.weight", o_h, F1, T, w16_ok ? (__half*)F2 : nullptr);  // [T][3072]
         if (dump && il == dump_layer) maybe_dump("in_oproj", T, HID, F1);
         { PS _q(this, "o_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F1, (const float*)nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), x, post, c.rms_eps); }
     }
@@ -2006,11 +2017,12 @@ public:
                 hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
             }
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
-            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
-            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);
-            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3m, T);
+            const bool w16_ok = !dump && Tc >= 2048;
+            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T, w16_ok ? (__half*)F1 : nullptr);  // [T][3072]
+            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);
+            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3m, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);
             { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3m, H1, nz); }
-            lin(pm + ".shared_experts.down_proj.weight", H1, F3m, T);
+            lin(pm + ".shared_experts.down_proj.weight", H1, F3m, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);
             { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3m, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
             return;
         }
@@ -2071,18 +2083,17 @@ public:
         const float* hsc = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_base");
         { PS _q(this, "hc_mix"); hc_pre(x, hfn, hsc, hbs, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), 8, T, cur_h, cur_f); }
-        const bool mfuse = (tune != 0) && T <= 8 && T <= skd::lin_gemv_max_m() && il < (int)mlp_fuse.size() && mlp_fuse[il] > 0 && lm_mlp[il].d_jobs != nullptr;
-        const int mf = mfuse ? mlp_fuse[il] : 0;
+        const bool w16_ok = !dump && Tc >= 2048;
         if (il == 0) {
             if (lm_ok_m(T) && lm_mlp0.d_jobs) {
                 PS _q(this, "lin mlp0_gu_multi"); linear_h_multi(st, lm_mlp0, cur_h, T);
             } else {
-                lin(pm + ".gate_proj.weight", cur_h, F1, T);  // [T][13824]
+                lin(pm + ".gate_proj.weight", cur_h, F1, T, w16_ok ? (__half*)F2 : nullptr);  // [T][13824]
                 lin(pm + ".up_proj.weight", cur_h, F2, T);
             }
             size_t n = (size_t)T * 13824;
             { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((n + 255) / 256), dim3(256), 0, st, F1, F2, H1, n); }
-            lin(pm + ".down_proj.weight", H1, F3, T);  // [T][3072]
+            lin(pm + ".down_proj.weight", H1, F3, T, w16_ok ? (__half*)F2 : nullptr);  // [T][3072]
             { PS _q(this, "o_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F3, (const float*)nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), x, post, c.rms_eps); }
         } else {
             // router
@@ -2107,6 +2118,7 @@ public:
                 else hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, rb, moe_idx, moe_w, 512, 16, c.routed_scale, exl, rec);
             }
             size_t nz = (size_t)T * 1536;
+            lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T, w16_ok ? (__half*)F2 : nullptr);  // [T][1536]
             if (hyb) { moe_hybrid_tail(il, T, pm); } else {
             void* mws = T <= 8 ? moe_ws_dec : moe_ws;
             const bool nof = T <= 4 && (tune & TN_NOF2H) && peer_runs.empty();  // fp32 latent read directly by the expert kernels, fp16 result written by their reduce
@@ -2118,17 +2130,17 @@ public:
             peers_gather(T);
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
             }
-            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
+            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T, w16_ok ? (__half*)F1 : nullptr);  // [T][3072]
             const bool use_sh = lm_ok_m(T) && (il - 1) < (int)lm_sh.size() && lm_sh[il - 1].d_jobs;
             float* F3m = use_sh ? F3_dec : (dump ? F3 : (F1 + (size_t)T * 1536));
             if (use_sh) {
                 PS _q(this, "lin shared_gu_multi"); linear_h_multi(st, lm_sh[il - 1], cur_h, T);
             } else {
-                lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
-                lin(pm + ".shared_experts.up_proj.weight", cur_h, F3m, T);
+                lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);  // [T][1536]
+                lin(pm + ".shared_experts.up_proj.weight", cur_h, F3m, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);
             }
             { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3m, H1, nz); }
-            lin(pm + ".shared_experts.down_proj.weight", H1, F3m, T);  // [T][3072]
+            lin(pm + ".shared_experts.down_proj.weight", H1, F3m, T, w16_ok ? (__half*)(F1 + (size_t)T * 5120) : nullptr);  // [T][3072]
             { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3m, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
             }
         }

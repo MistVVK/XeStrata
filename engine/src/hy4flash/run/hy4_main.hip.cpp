@@ -595,6 +595,7 @@ int main(int argc, char** argv) {
     VisionEncoder venc;
     VisionCtx vctx;
     if (!recs.empty()) {
+        r.vcache_release_vram(1280ull << 20);  // reclaim ~1.25 GiB from tail vcache slabs for vision weights + encode scratch
         if (!venc.load(vision_path, err) || !vctx.setup(venc, r.st, tok, recs, r.Tc, err)) {
             fprintf(stderr, "images: %s\n", err.c_str());
             return 1;

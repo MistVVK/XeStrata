@@ -8,6 +8,9 @@
 #include "skgemm.hip.h"
 #include "skfast.hip.h"
 #include "skwmma.hip.h"
+#if HY4_MMA && !HY4_CUDA
+#include "sk_int8_rdna4.hip.h"
+#endif
 #include "skmoe.hip.h"
 #if HY4_CUDA && HY4_MMA
 #include "sk_int8_cuda.hip.h"
@@ -49,12 +52,20 @@ inline void linear_h(hipStream_t s, int fmt, const void* W, int N, int K, const 
 #if HY4_CUDA
         if (skd::lin_int8_mma()) linear_h_gemm_i8(s, fmt, W, N, K, X, Y, M, skd::lin_int8_mma() >= 2);
         else
+#else
+        const int i8m = skd::int8_wmma_mode();
+        if (i8m == 1) { skd::launch_gemm_s_i8_rdna4<false>(s, fmt, W, N, K, X, Y, M); return; }
+        if (i8m == 2) { skd::launch_gemm_s_i8_rdna4<true>(s, fmt, W, N, K, X, Y, M); return; }
 #endif
         linear_h_gemm_s(s, fmt, W, N, K, X, Y, M);
     } else {
 #if HY4_CUDA
         if (!skd::lin_int8_mma() && M >= skd::cublas_pf_min_m() && skd::linear_h_cublas(s, fmt, W, N, K, X, Y, M)) return;
         if (skd::lin_int8_mma()) { linear_h_gemm_i8(s, fmt, W, N, K, X, Y, M, skd::lin_int8_mma() >= 2); return; }
+#else
+        const int i8m = skd::int8_wmma_mode();
+        if (i8m == 1) { skd::launch_gemm_i8_rdna4<false>(s, fmt, W, N, K, X, Y, M); return; }
+        if (i8m == 2) { skd::launch_gemm_i8_rdna4<true>(s, fmt, W, N, K, X, Y, M); return; }
 #endif
         linear_h_gemm(s, fmt, W, N, K, X, Y, M);
     }

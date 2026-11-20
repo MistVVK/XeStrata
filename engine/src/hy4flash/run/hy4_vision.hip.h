@@ -168,22 +168,46 @@ __global__ void __launch_bounds__(256) k_gemm(const __half* __restrict__ X, cons
 }
 
 #if HY4_MMA && !HY4_CUDA
-// ---- gfx11 WMMA versions (v_wmma_f32_16x16x16_f16, wave32). Fragment layout: lane l holds row/column (l & 15) of a 16x16 operand as 16 consecutive k values (so a row of X or W is one
-// 32-byte load); accumulator element i of a lane is row 2*i + (l >> 4), column l & 15.
-typedef _Float16 hv16 __attribute__((ext_vector_type(16)));
+// ---- gfx11 / gfx12 WMMA versions (v_wmma_f32_16x16x16_f16, wave32).
+// gfx11: lane l holds all 16 k of row/col (l&15); acc row = 2*i + (l>>4).
+// gfx12: lane l holds 8 k at offset 8*(l>>4) of row/col (l&15); acc row = 8*(l>>4) + i.
+#if HY4_GFX12
+typedef _Float16 hv_t __attribute__((ext_vector_type(8)));
 typedef float fv8 __attribute__((ext_vector_type(8)));
-typedef unsigned u32x8 __attribute__((ext_vector_type(8)));
-__device__ __forceinline__ hv16 ld_hv16(const void* p) {
-    const uint4 a = *reinterpret_cast<const uint4*>(p), b = *(reinterpret_cast<const uint4*>(p) + 1);
-    u32x8 v = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-    return __builtin_bit_cast(hv16, v);
+__device__ __forceinline__ hv_t ld_hv(const void* p, int hi) {
+    const uint4 a = *reinterpret_cast<const uint4*>(reinterpret_cast<const _Float16*>(p) + hi * 8);
+    return __builtin_bit_cast(hv_t, a);
 }
 // 8 valid halves (16 bytes at p) followed by 8 zeros: the 72-wide head dimension padded to 80
-__device__ __forceinline__ hv16 ld_hv16_half(const void* p) {
+__device__ __forceinline__ hv_t ld_hv_half(const void* p, int hi) {
+    if (hi == 0) return __builtin_bit_cast(hv_t, *reinterpret_cast<const uint4*>(p));
+    return hv_t{0, 0, 0, 0, 0, 0, 0, 0};
+}
+__device__ __forceinline__ fv8 vit_wmma(hv_t a, hv_t b, fv8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+}
+__device__ __forceinline__ int vit_acc_m(int i, int hi) { return 8 * hi + i; }
+#else
+typedef _Float16 hv16 __attribute__((ext_vector_type(16)));
+typedef hv16 hv_t;
+typedef float fv8 __attribute__((ext_vector_type(8)));
+typedef unsigned u32x8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ hv_t ld_hv(const void* p, int /*hi*/) {
+    const uint4 a = *reinterpret_cast<const uint4*>(p), b = *(reinterpret_cast<const uint4*>(p) + 1);
+    u32x8 v = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    return __builtin_bit_cast(hv_t, v);
+}
+// 8 valid halves (16 bytes at p) followed by 8 zeros: the 72-wide head dimension padded to 80
+__device__ __forceinline__ hv_t ld_hv_half(const void* p, int /*hi*/) {
     const uint4 a = *reinterpret_cast<const uint4*>(p);
     u32x8 v = {a.x, a.y, a.z, a.w, 0u, 0u, 0u, 0u};
-    return __builtin_bit_cast(hv16, v);
+    return __builtin_bit_cast(hv_t, v);
 }
+__device__ __forceinline__ fv8 vit_wmma(hv_t a, hv_t b, fv8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+}
+__device__ __forceinline__ int vit_acc_m(int i, int hi) { return 2 * i + hi; }
+#endif
 
 // Y = X * W^T + bias, block 64x64 (4 waves, each 32x32 = 2x2 WMMA tiles), operands straight from global memory (rows clamped; the store is guarded). K % 16 == 0.
 template <int EPI>
@@ -207,11 +231,11 @@ __global__ void __launch_bounds__(128) k_gemm_w(const __half* __restrict__ X, co
         for (int b = 0; b < 2; ++b) acc[a][b] = fv8{0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll 4
     for (int k = 0; k < K; k += 16) {
-        const hv16 a0 = ld_hv16(xr[0] + k), a1 = ld_hv16(xr[1] + k), b0 = ld_hv16(wr[0] + k), b1 = ld_hv16(wr[1] + k);
-        acc[0][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc[0][0]);
-        acc[0][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b1, acc[0][1]);
-        acc[1][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b0, acc[1][0]);
-        acc[1][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc[1][1]);
+        const hv_t a0 = ld_hv(xr[0] + k, hi), a1 = ld_hv(xr[1] + k, hi), b0 = ld_hv(wr[0] + k, hi), b1 = ld_hv(wr[1] + k, hi);
+        acc[0][0] = vit_wmma(a0, b0, acc[0][0]);
+        acc[0][1] = vit_wmma(a0, b1, acc[0][1]);
+        acc[1][0] = vit_wmma(a1, b0, acc[1][0]);
+        acc[1][1] = vit_wmma(a1, b1, acc[1][1]);
     }
 #pragma unroll
     for (int a = 0; a < 2; ++a)
@@ -222,7 +246,7 @@ __global__ void __launch_bounds__(128) k_gemm_w(const __half* __restrict__ X, co
             const float bv = bias ? bias[n] : 0.f;
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                const int m = m0 + a * 16 + 2 * i + hi;
+                const int m = m0 + a * 16 + vit_acc_m(i, hi);
                 if (m < M) store_epi<EPI>(acc[a][b][i] + bv, m, n, N, ow, Yh, Yf, pe);
             }
         }
@@ -239,12 +263,12 @@ __global__ void __launch_bounds__(128) k_attn_w(const __half* __restrict__ q, co
     const int l16 = lane & 15, hi = lane >> 4;
     const int h = blockIdx.y;
     const int q0 = blockIdx.x * 64 + wave * 16;
-    hv16 qf[5];
+    hv_t qf[5];
     {
         const __half* qp = q + (size_t)min(q0 + l16, N - 1) * D + h * VA_HD;
 #pragma unroll
-        for (int ks = 0; ks < 4; ++ks) qf[ks] = ld_hv16(qp + ks * 16);
-        qf[4] = ld_hv16_half(qp + 64);
+        for (int ks = 0; ks < 4; ++ks) qf[ks] = ld_hv(qp + ks * 16, hi);
+        qf[4] = ld_hv_half(qp + 64, hi);
     }
     fv8 oacc[5];
 #pragma unroll
@@ -264,8 +288,8 @@ __global__ void __launch_bounds__(128) k_attn_w(const __half* __restrict__ q, co
             const __half* kp = k + (size_t)key * D + h * VA_HD;
             fv8 a = fv8{0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
-            for (int ks = 0; ks < 4; ++ks) a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[ks], ld_hv16(kp + ks * 16), a);
-            s[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[4], ld_hv16_half(kp + 64), a);
+            for (int ks = 0; ks < 4; ++ks) a = vit_wmma(qf[ks], ld_hv(kp + ks * 16, hi), a);
+            s[j] = vit_wmma(qf[4], ld_hv_half(kp + 64, hi), a);
         }
         float corr[8];
 #pragma unroll
@@ -288,7 +312,7 @@ __global__ void __launch_bounds__(128) k_attn_w(const __half* __restrict__ q, co
                 const bool kvalid = kb + j * 16 + l16 < N;
                 const float p = kvalid ? __expf(s[j][i] - nm) : 0.f;
                 ps += p;
-                sp[(2 * i + hi) * WA_PP + j * 16 + l16] = __float2half(p);
+                sp[vit_acc_m(i, hi) * WA_PP + j * 16 + l16] = __float2half(p);
             }
             lpart[i] = lpart[i] * corr[i] + ps;
         }
@@ -296,24 +320,24 @@ __global__ void __launch_bounds__(128) k_attn_w(const __half* __restrict__ q, co
         for (int t = 0; t < 5; ++t)
 #pragma unroll
             for (int i = 0; i < 8; ++i) oacc[t][i] *= corr[i];
-        __syncthreads();
+        hy4_sync_lds();
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const hv16 pf = ld_hv16(sp + l16 * WA_PP + j * 16);
+            const hv_t pf = ld_hv(sp + l16 * WA_PP + j * 16, hi);
 #pragma unroll
             for (int t = 0; t < 5; ++t) {
                 const int d = min(t * 16 + l16, VA_HD - 1);
-                oacc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, ld_hv16(vt + (size_t)(h * VA_HD + d) * ldv + kb + j * 16), oacc[t]);
+                oacc[t] = vit_wmma(pf, ld_hv(vt + (size_t)(h * VA_HD + d) * ldv + kb + j * 16, hi), oacc[t]);
             }
         }
-        __syncthreads();
+        hy4_sync_lds();
     }
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         float l = lpart[i];
 #pragma unroll
         for (int off = 8; off > 0; off >>= 1) l += __shfl_xor(l, off, 16);
-        const int qi = q0 + 2 * i + hi;
+        const int qi = q0 + vit_acc_m(i, hi);
         if (qi >= N) continue;
         const float il = 1.0f / l;
 #pragma unroll
@@ -423,10 +447,11 @@ struct VisionEncoder {
         }
         stream_to_device(path, vi.sec1_off, vi.sec1_len, d_w, &t_load, "vision");
 #if HY4_MMA && !HY4_CUDA
-        {  // matrix-core kernels on gfx11 (RDNA3 / 3.5: Radeon 780M / 8060S / RX 7000); everything else takes the plain kernels
+        {  // matrix-core kernels on gfx11 (RDNA3 / 3.5) and gfx12 (RDNA4: RX 9060/9070, R9700); everything else takes the plain kernels
             hipDeviceProp_t dp;
             HCK(hipGetDeviceProperties(&dp, 0));
-            use_wmma = std::string(dp.gcnArchName).rfind("gfx11", 0) == 0 && !getenv("HY4_VIT_NOWMMA");
+            const std::string arch(dp.gcnArchName);
+            use_wmma = (arch.rfind("gfx11", 0) == 0 || arch.rfind("gfx12", 0) == 0) && !getenv("HY4_VIT_NOWMMA");
         }
 #endif
         loaded = true;

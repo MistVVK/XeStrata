@@ -1638,9 +1638,11 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
     }
 #endif
     fast = kern != 0;
-    hi = false;
-    if (const char* a = std::getenv("STRATA_CPUEXP_ACT"))
+    hi = (kern == 1);  // AVX2 is DRAM-bound so high-precision residual costs ~1% while cutting short-prompt KL in half
+    if (const char* a = std::getenv("STRATA_CPUEXP_ACT")) {
         if (!std::strcmp(a, "hi")) hi = true;
+        else if (!std::strcmp(a, "q8")) hi = false;
+    }
     std::fprintf(stderr, "[cpuexp] %llu experts resident, %.2f GB in %.1f s (%.2f GB/s), %zu reads, mlock=%s, isa=%s, kernel=%s, act=%s\n",
                  (unsigned long long)n_resident, arena_size / 1e9, t_load, arena_size / 1e9 / std::max(t_load, 1e-9), runs.size(),
                  locked ? "yes" : "no", strata::quant::sk::active_sk_isa(), kern_name(kern), hi ? "hi(2xQ8_1)" : "q8");
@@ -1747,6 +1749,7 @@ void CpuExperts::Impl::start_threads(int n) {
     gdone.reset(new PadCnt[E]);
     dn_cc.reset(new PadCnt[NUNIT]);
     if (const char* e = std::getenv("STRATA_CPUEXP_SCHED")) sched = std::atoi(e);
+    else if (nth >= 8) sched = 1;  // dataflow scheduler avoids phase barriers on multi-core CPUs
     if (const char* e = std::getenv("STRATA_CPUEXP_PF")) g_pf_rows = std::atoi(e);
     for (int ti = 0; ti < nth; ++ti) {
         TScratch& s = ts[ti];
