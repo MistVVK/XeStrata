@@ -338,6 +338,7 @@ int main(int argc, char** argv) {
     int gpu = -1;
     std::string gpus_csv = getenv("HY4_GPUS") ? getenv("HY4_GPUS") : "";
     std::string draft = "auto";  // auto: dfly2 under --serve (when the file carries the drafter), off for the CLI runs (gates / benches); "off" and "dfly2" force
+    std::string dfly_override;
     SpecCfg scfg;
     SampleOpts cli_samp;
     int tail_skip_arg = 0;  // opt-in only (0 = OFF by default)
@@ -534,7 +535,7 @@ int main(int argc, char** argv) {
     if (!load_gpu_model(g, model, true)) return 1;
     if (!dfly_override.empty()) {
         std::string derr;
-        if (!load_dfly_override(g, dfly_override, derr)) { fprintf(stderr, "%s\n", derr.c_str()); return 1; }
+        if (!load_dfly_override(g, dfly_override, derr)) { fprintf(stderr, "dfly-override: %s\n", derr.c_str()); return 1; }
     }
     fprintf(stderr, "[load] total %.1f s\n", now_s() - t_load0);
     if (load_only) return 0;
@@ -794,6 +795,10 @@ int main(int argc, char** argv) {
         const int redo_T = std::min(16, T0), redo_p0 = T0 - redo_T;
         (void)last_p0;
         (void)last_T;
+        if (scfg.exact) {
+            skd::moe_dec_max_m() = 16;
+            skd::lin_gemv_max_m() = 16;
+        }
         auto restore = [&]() {
             tok.resize(T0);
             if (!r.forward_chunk(tok.data(), redo_p0, redo_T, err)) { fprintf(stderr, "ab restore: %s\n", err.c_str()); exit(1); }

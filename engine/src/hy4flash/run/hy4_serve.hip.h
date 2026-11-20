@@ -48,7 +48,7 @@ struct ServeOpts {
     bool session_reuse = false;
     int tail_skip = 0;  // opt-in only (0 = OFF by default)
     std::string draft = "auto";  // auto = dfly2 when the file carries the drafter; off; dfly2 (error without it)
-    std::string dfly_override;   // optional flat DFLYOVR1 binary overriding model.dfly_layers.* in VRAM
+    std::string dfly_override;   // optional flat DFLYOVR1 or DFOV0001 binary overriding model.dfly_layers.* in VRAM
     SpecCfg spec;
     std::string vision;                   // HY4-VISION: path of Hy4-Flash-Vision.strata (--vision); empty = text only, GENI is refused
     int64_t image_max_pixels = 4194304;

@@ -430,6 +430,51 @@ int main(int argc, char** argv) {
         }
         if (only == "gemm") return 0;
     }
+    if (only == "gemms") {
+        printf("== small-M GEMV vs WMMA k_gemm_s (M = 1, 2, 4, 6, 8, 16)\n");
+        const Case sc[] = {{"o_proj swa S5 [3072,16384]", FMT_S5, 3072, 16384},
+                           {"linear_gate swa S5 [16384,3072]", FMT_S5, 16384, 3072},
+                           {"q_b swa S5 [16384,1024]", FMT_S5, 16384, 1024},
+                           {"shared/latent S8 [1536,3072]", FMT_S8, 1536, 3072},
+                           {"expert gu S4 [3072,1536]", FMT_S4, 3072, 1536}};
+        for (const Case& c : sc) {
+            const int SB = sk_sb_bytes(c.fmt);
+            const size_t wb = weight_bytes(c.fmt, c.N, c.K);
+            const size_t stride = (wb + 4095) & ~(size_t)4095;
+            const int nmat = (int)std::min<size_t>(32, pool / stride);
+            hipLaunchKernelGGL(k_fill_sk, dim3((unsigned)((pool / SB + 255) / 256)), dim3(256), 0, 0, d_pool, pool / SB, SB, 777u);
+            CK(hipDeviceSynchronize());
+            for (int M : {1, 2, 4, 6, 8, 16}) {
+                std::vector<__half> hx((size_t)M * c.K);
+                for (size_t i = 0; i < hx.size(); ++i) hx[i] = __float2half((((i * 2654435761u) >> 8) & 1023) / 512.0f - 1.0f);
+                __half* d_x; float *d_y1, *d_y2;
+                CK(hipMalloc(&d_x, hx.size() * 2));
+                CK(hipMalloc(&d_y1, (size_t)M * c.N * 4));
+                CK(hipMalloc(&d_y2, (size_t)M * c.N * 4));
+                CK(hipMemcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice));
+                linear_h_gemv(0, c.fmt, d_pool, c.N, c.K, d_x, d_y1, M);
+                linear_h_gemm_s(0, c.fmt, d_pool, c.N, c.K, d_x, d_y2, M);
+                CK(hipDeviceSynchronize());
+                std::vector<float> y1((size_t)M * c.N), y2((size_t)M * c.N);
+                CK(hipMemcpy(y1.data(), d_y1, y1.size() * 4, hipMemcpyDeviceToHost));
+                CK(hipMemcpy(y2.data(), d_y2, y2.size() * 4, hipMemcpyDeviceToHost));
+                double mx = 0, me = 0;
+                for (size_t i = 0; i < y1.size(); ++i) { mx = std::max(mx, (double)std::fabs(y1[i])); me = std::max(me, (double)std::fabs(y1[i] - y2[i])); }
+                float ms_v = 0, ms_w = 0;
+                const int reps = nmat;
+                hipEventRecord(e0);
+                for (int r = 0; r < reps; ++r) linear_h_gemv(0, c.fmt, d_pool + r * stride, c.N, c.K, d_x, d_y1, M);
+                hipEventRecord(e1); CK(hipEventSynchronize(e1)); hipEventElapsedTime(&ms_v, e0, e1); ms_v /= reps;
+                hipEventRecord(e0);
+                for (int r = 0; r < reps; ++r) linear_h_gemm_s(0, c.fmt, d_pool + r * stride, c.N, c.K, d_x, d_y2, M);
+                hipEventRecord(e1); CK(hipEventSynchronize(e1)); hipEventElapsedTime(&ms_w, e0, e1); ms_w /= reps;
+                printf("%-32s M=%2d  gemv %.3f ms (%5.1f GB/s) | wmma_s %.3f ms (%5.1f GB/s) | speedup %.2fx | rel_err %.2e\n",
+                       c.name, M, ms_v, wb / 1e6 / ms_v, ms_w, wb / 1e6 / ms_w, ms_v / ms_w, mx > 0 ? me / mx : 0.0);
+                hipFree(d_x); hipFree(d_y1); hipFree(d_y2);
+            }
+        }
+        return 0;
+    }
 #endif
     const Case cases[] = {
         {"attn q_b sparse S5 [8192,1024]", FMT_S5, 8192, 1024},

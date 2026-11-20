@@ -154,6 +154,41 @@ __global__ void k_hc_mix_fin(const float* __restrict__ acc, const float* __restr
     }
 }
 
+// ---- templated F32 GEMV for the router (M <= 8): exact same summation order as k_f32_gemv, zero m-branch overhead, single barrier reduction across all MT tokens
+template <int MT>
+__global__ void __launch_bounds__(256) k_f32_gemv_t(const float* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y, int N, int K, int M) {
+    __shared__ float sh[MT][8];
+    const int n = blockIdx.x, tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const float4* w4 = (const float4*)(W + (size_t)n * K);
+    float acc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[m] = 0.f;
+    for (int k4 = tid; k4 < K / 4; k4 += 256) {
+        const float4 w = w4[k4];
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            if (m < M) {
+                const float4 xv = ((const float4*)(X + (size_t)m * K))[k4];
+                acc[m] += w.x * xv.x + w.y * xv.y + w.z * xv.z + w.w * xv.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        float v = acc[m];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o);
+        if (lane == 0) sh[m][wave] = v;
+    }
+    __syncthreads();
+    if (tid < MT && tid < M) {
+        float r = 0.f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) r += sh[tid][w];
+        Y[(size_t)tid * N + n] = r;
+    }
+}
+
 // ---- F32 GEMV for the router: one block per output row, M <= 16 tokens; W [N][K] f32, X [M][K] f32, Y [M][N]
 __global__ void __launch_bounds__(256) k_f32_gemv(const float* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y, int N, int K, int M) {
     __shared__ float sh[32];
@@ -457,6 +492,58 @@ __global__ void __launch_bounds__(512) k_router_topk_r(const float* __restrict__
     }
 }
 
+// ---- single-wave (32-thread) zero-barrier top-16 router (E = 512, 16 elements/lane in registers). Bit-identical to k_router_topk / k_router_topk_r, 32x fewer comparisons and zero __syncthreads().
+__global__ void __launch_bounds__(32) k_router_topk_w32(const float* __restrict__ logits, const float* __restrict__ bias, int32_t* __restrict__ idx, float* __restrict__ w, int K, float scale,
+                                                        const uint4* __restrict__ ex_layer = nullptr, uint4* __restrict__ rec = nullptr) {
+    const int lane = threadIdx.x;
+    const float* lg = logits + (size_t)blockIdx.x * 512;
+    float p[16], v[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const int e = lane + 32 * j;
+        p[j] = sigmoidf_(lg[e]);
+        v[j] = p[j] + bias[e];
+    }
+    int chosen[16];
+    float cp[16];
+    for (int k = 0; k < K; ++k) {
+        float bv = -3.0e38f;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int e = lane + 32 * j;
+            if (v[j] > bv || (v[j] == bv && e < bi)) { bv = v[j]; bi = e; }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor(bv, o);
+            const int oi = __shfl_xor(bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        const int win_lane = bi & 31, win_j = bi >> 5;
+        float wp = 0.f;
+        if (lane == win_lane) {
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+                if (j == win_j) { wp = p[j]; v[j] = -3.0e38f; }
+        }
+        wp = __shfl(wp, win_lane);
+        chosen[k] = bi;
+        cp[k] = wp;
+    }
+    if (lane == 0) {
+        float sum = 0.f;
+        for (int k = 0; k < K; ++k) sum += cp[k];
+        const float inv = scale / (sum + 1e-20f);
+        for (int k = 0; k < K; ++k) {
+            idx[(size_t)blockIdx.x * K + k] = chosen[k];
+            w[(size_t)blockIdx.x * K + k] = cp[k] / (sum + 1e-20f) * scale;
+            if (rec) rec[k] = ex_layer[chosen[k]];
+        }
+        (void)inv;
+    }
+}
+
 // ---- argmax over logits [V] (one row) -> token id; 1 block of 1024
 __global__ void k_argmax(const float* __restrict__ logits, int V, int32_t* __restrict__ out) {
     __shared__ float sv[32];
@@ -570,6 +657,72 @@ __global__ void k_hc_mix_part_d(const float* __restrict__ x, const float* __rest
         part[((size_t)t * 24 + slab) * 9 + j] = (shv[j][0] + shv[j][1]) + (shv[j][2] + shv[j][3]);
     }
 }
+// ---- batched deterministic iHC mix for prefill (T >= 16): stages fn[0..nout-1][slab*512..+511] once into LDS (16 KB) and processes up to 32 tokens per block in 8x4 sub-batches.
+// Exact bit-for-bit identical summation order to k_hc_mix_part_d, with 32x less fn global read traffic.
+__global__ void __launch_bounds__(128) k_hc_mix_part_d_batch(const float* __restrict__ x, const float* __restrict__ fn, float* __restrict__ part, int nout, int T) {
+    constexpr int K = NHC * HID;
+    const int t0 = blockIdx.x * 32;
+    const int slab = blockIdx.y;
+    const int tid = threadIdx.x;
+    __shared__ float sfn[8][512];
+    __shared__ float shv[9][4];
+    const int base_k = slab * 512;
+    for (int j = 0; j < nout; ++j) {
+        const float* fp = fn + (size_t)j * K + base_k;
+#pragma unroll
+        for (int st = 0; st < 4; ++st) sfn[j][st * 128 + tid] = fp[st * 128 + tid];
+    }
+    __syncthreads();
+    for (int b0 = 0; b0 < 32; b0 += 4) {
+        if (t0 + b0 >= T) break;
+        float ss[4] = {0.f, 0.f, 0.f, 0.f};
+        float a[4][8];
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) a[b][j] = 0.f;
+#pragma unroll
+        for (int st = 0; st < 4; ++st) {
+            const int kl = st * 128 + tid;
+            const int kg = base_k + kl;
+            float f[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) f[j] = j < nout ? sfn[j][kl] : 0.f;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int t = t0 + b0 + b;
+                if (t < T) {
+                    const float v = x[(size_t)t * K + kg];
+                    ss[b] += v * v;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        if (j < nout) a[b][j] += v * f[j];
+                }
+            }
+        }
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const int t = t0 + b0 + b;
+            if (t >= T) break;
+            float vals[9];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) vals[j] = a[b][j];
+            vals[8] = ss[b];
+#pragma unroll
+            for (int j = 0; j < 9; ++j)
+                for (int o = 16; o > 0; o >>= 1) vals[j] += __shfl_xor(vals[j], o);
+            if ((tid & 31) == 0)
+#pragma unroll
+                for (int j = 0; j < 9; ++j) shv[j][tid >> 5] = vals[j];
+            __syncthreads();
+            if (tid < 9) {
+                part[((size_t)t * 24 + slab) * 9 + tid] = (shv[tid][0] + shv[tid][1]) + (shv[tid][2] + shv[tid][3]);
+            }
+            __syncthreads();
+        }
+    }
+}
+
 __global__ void k_hc_mix_fin_d(const float* __restrict__ part, const float* __restrict__ scale, const float* __restrict__ base, float* __restrict__ pre, float* __restrict__ post, int nout,
                                float eps, float hc_eps, float hc_mag) {
     int t = blockIdx.x;

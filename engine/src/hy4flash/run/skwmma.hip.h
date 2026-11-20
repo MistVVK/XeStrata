@@ -137,6 +137,7 @@ __device__ __forceinline__ void raw_q8(const RawSub<FMT>& r, uint32_t (&q)[8]) {
 template <int FMT, int U8>
 __device__ __forceinline__ void dequant_unit(const RawSub<FMT>& r, float eff, half_t* dst) {
     uint32_t o[4];
+    const uint32_t ef2 = h2_splat(eff);
     if constexpr (FMT == FMT_S1_25) {
         // unit U8 = codebook groups 2*U8, 2*U8+1 of this sub-group: a 10-bit field at bit 10*U8 of the 10-byte window
         constexpr int p = 10 * U8, wi = p >> 5, sh = p & 31;
@@ -145,24 +146,19 @@ __device__ __forceinline__ void dequant_unit(const RawSub<FMT>& r, float eff, ha
         else bits = ((r.lo[wi] >> sh) | (r.lo[wi + 1] << (32 - sh))) & 0x3FFu;
         const uint2* lut = s125_lut();
         const uint2 a = lut[bits & 31u], b = lut[bits >> 5];
-        const uint32_t wp[4] = {a.x, a.y, b.x, b.y};
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            float w0, w1;
-            h2_unpack(wp[i], w0, w1);
-            o[i] = h2_pack(w0 * eff, w1 * eff);
-        }
+        o[0] = h2_mul(a.x, ef2);
+        o[1] = h2_mul(a.y, ef2);
+        o[2] = h2_mul(b.x, ef2);
+        o[3] = h2_mul(b.y, ef2);
     } else if constexpr (FMT == FMT_S1_5) {
         const uint32_t t0 = r.hi[0], byte0 = t0 / 5u;
+        const uint32_t mag = h2_splat(1025.0f);
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            float v[2];
-#pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                const uint32_t ti = t0 + 8 * U8 + 2 * i + h;
-                v[h] = (float)s15_trit(byte_at4(r.lo, (int)(ti / 5u - byte0)), (int)(ti % 5u));
-            }
-            o[i] = h2_pack(v[0] * eff, v[1] * eff);
+            const uint32_t ti0 = t0 + 8 * U8 + 2 * i, ti1 = ti0 + 1;
+            const uint32_t v0 = (uint32_t)(s15_trit(byte_at4(r.lo, (int)(ti0 / 5u - byte0)), (int)(ti0 % 5u)) + 1);
+            const uint32_t v1 = (uint32_t)(s15_trit(byte_at4(r.lo, (int)(ti1 / 5u - byte0)), (int)(ti1 % 5u)) + 1);
+            o[i] = h2_mul(h2_sub(0x64006400u | v0 | (v1 << 16), mag), ef2);
         }
     } else {
         uint32_t q[8];
@@ -174,9 +170,7 @@ __device__ __forceinline__ void dequant_unit(const RawSub<FMT>& r, float eff, ha
             const uint32_t pat = 0x64006400u | q[2 * i] | (q[2 * i + 1] << 16);
             uint32_t w = h2_sub(pat, mag);
             if constexpr (FMT != FMT_S8) w = h2_sub(w, hh);
-            float w0, w1;
-            h2_unpack(w, w0, w1);
-            o[i] = h2_pack(w0 * eff, w1 * eff);
+            o[i] = h2_mul(w, ef2);
         }
     }
     *(uint4*)dst = make_uint4(o[0], o[1], o[2], o[3]);
@@ -195,6 +189,236 @@ __device__ __forceinline__ void dequant_sub(const RawSub<FMT>& r, float eff, hal
 }
 
 #if !HY4_CUDA
+// ---- subgroup-scaled BK=64 WMMA loader (gfx11 Wave32):
+// Dequantizes 1 subgroup (64 weights) at a time as exact (q - H) in fp16 (zero fp32 unpack/mul/pack per weight!),
+// accumulates 4 WMMAs (64 k-steps) into `sub`, and scales by fp32 `eff` ONCE per subgroup (acc_n = lane & 15).
+// Cuts LDS from 33.8 KB (1 blk/CU) to 9.5-27.9 KB (2-3 blk/CU) and eliminates idle waves in small-M / MoE kernels.
+constexpr int SG_BK = 64, SG_LD = 72;  // 64 + 8 halves = 144 B (36 dwords -> zero bank conflicts for ds_read_b128 on RDNA3)
+
+template <int FMT>
+struct RawQ16 {
+    static constexpr int NLO = FMT == FMT_S8 ? 4 : (FMT == FMT_S4 || FMT == FMT_S5 || FMT == FMT_S6) ? 2 : 1;
+    uint32_t lo[NLO];
+    uint32_t hi;
+    float eff;
+};
+
+template <int FMT>
+__device__ __forceinline__ void load_q16(const uint8_t* blk, int g, int q4, RawQ16<FMT>& r) {
+    const uint8_t* pl = blk + 6;
+    if constexpr (FMT == FMT_S1_25) {
+        load_bytes<1>(pl + g * 10 + ((20 * q4) >> 3), r.lo);
+        r.hi = 0;
+    } else if constexpr (FMT == FMT_S1_5) {
+        const int t0 = g * 64 + q4 * 16;
+        load_bytes<1>(pl + t0 / 5, r.lo);
+        r.hi = (uint32_t)t0;
+    } else if constexpr (FMT == FMT_S2) {
+        load_bytes<1>(pl + g * 16 + q4 * 4, r.lo);
+        r.hi = 0;
+    } else if constexpr (FMT == FMT_S3) {
+        load_bytes<1>(pl + g * 16 + q4 * 4, r.lo);
+        r.hi = ld16(pl + 64 + g * 8 + q4 * 2);
+    } else if constexpr (FMT == FMT_S4) {
+        load_bytes<2>(pl + g * 32 + q4 * 8, r.lo);
+        r.hi = 0;
+    } else if constexpr (FMT == FMT_S5) {
+        load_bytes<2>(pl + g * 32 + q4 * 8, r.lo);
+        r.hi = ld16(pl + 128 + g * 8 + q4 * 2);
+    } else if constexpr (FMT == FMT_S6) {
+        load_bytes<2>(pl + g * 32 + q4 * 8, r.lo);
+        uint32_t tmp[1];
+        load_bytes<1>(pl + 128 + g * 16 + q4 * 4, tmp);
+        r.hi = tmp[0];
+    } else {
+        load_bytes<4>(pl + g * 64 + q4 * 16, r.lo);
+        r.hi = 0;
+    }
+    if (q4 == 0) r.eff = sk_eff<FMT>(blk, g);
+}
+
+template <int FMT>
+__device__ __forceinline__ void dequant_q16(const RawQ16<FMT>& r, int q4, half_t* dst) {
+    if constexpr (FMT == FMT_S1_25) {
+        const uint32_t bits = (r.lo[0] >> ((q4 & 1) * 4)) & 0xFFFFFu;
+        const uint2* lut = s125_lut();
+        const uint2 a = lut[bits & 31u], b = lut[(bits >> 5) & 31u], c = lut[(bits >> 10) & 31u], d = lut[(bits >> 15) & 31u];
+        *(uint4*)(dst + 0) = make_uint4(a.x, a.y, b.x, b.y);
+        *(uint4*)(dst + 8) = make_uint4(c.x, c.y, d.x, d.y);
+        return;
+    }
+    if constexpr (FMT == FMT_S1_5) {
+        const uint32_t t0 = r.hi, byte0 = t0 / 5u;
+        const uint32_t mag = h2_splat(1025.0f);
+        uint32_t o[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t ti0 = t0 + 2 * i, ti1 = ti0 + 1;
+            const uint32_t b0 = (r.lo[0] >> ((ti0 / 5u - byte0) * 8)) & 0xFFu;
+            const uint32_t b1 = (r.lo[0] >> ((ti1 / 5u - byte0) * 8)) & 0xFFu;
+            const uint32_t v0 = (uint32_t)(s15_trit(b0, (int)(ti0 % 5u)) + 1);
+            const uint32_t v1 = (uint32_t)(s15_trit(b1, (int)(ti1 % 5u)) + 1);
+            o[i] = h2_sub(0x64006400u | v0 | (v1 << 16), mag);
+        }
+        *(uint4*)(dst + 0) = make_uint4(o[0], o[1], o[2], o[3]);
+        *(uint4*)(dst + 8) = make_uint4(o[4], o[5], o[6], o[7]);
+        return;
+    }
+    uint32_t q[16];
+    if constexpr (FMT == FMT_S2 || FMT == FMT_S3) {
+        const uint32_t w = r.lo[0], hb = FMT == FMT_S3 ? r.hi : 0u;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) q[k] = ((w >> (2 * k)) & 3u) | (FMT == FMT_S3 ? (((hb >> k) & 1u) << 2) : 0u);
+    } else if constexpr (FMT == FMT_S4 || FMT == FMT_S5 || FMT == FMT_S6) {
+        const uint32_t w0 = r.lo[0], w1 = r.lo[1], hb = FMT == FMT_S5 ? r.hi : 0u, h2 = FMT == FMT_S6 ? r.hi : 0u;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            uint32_t v0 = (w0 >> (4 * k)) & 15u, v1 = (w1 >> (4 * k)) & 15u;
+            if constexpr (FMT == FMT_S5) { v0 |= ((hb >> k) & 1u) << 4; v1 |= ((hb >> (k + 8)) & 1u) << 4; }
+            if constexpr (FMT == FMT_S6) { v0 |= ((h2 >> (2 * k)) & 3u) << 4; v1 |= ((h2 >> (2 * (k + 8))) & 3u) << 4; }
+            q[k] = v0;
+            q[k + 8] = v1;
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t d = r.lo[j];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) q[4 * j + k] = ((d >> (8 * k)) & 0xFFu) ^ 0x80u;
+        }
+    }
+    const uint32_t mag = h2_splat(FMT == FMT_S8 ? 1152.0f : 1024.0f);
+    const uint32_t hh = h2_splat(sk_half<FMT>());
+    uint32_t o[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint32_t w = h2_sub(0x64006400u | q[2 * i] | (q[2 * i + 1] << 16), mag);
+        if constexpr (FMT != FMT_S8) w = h2_sub(w, hh);
+        o[i] = w;
+    }
+    *(uint4*)(dst + 0) = make_uint4(o[0], o[1], o[2], o[3]);
+    *(uint4*)(dst + 8) = make_uint4(o[4], o[5], o[6], o[7]);
+}
+
+// 128-row BK=128 WMMA mainloop (gfx11 Wave32): loads 128 weight rows x 128 k (2 subgroups) into ws[128][136] (34.8 KB) with packed v_pk_mul_f16 dequant,
+// global A register-ring prefetch (PD=4), zero sub-accumulators, 2x fewer barriers than BK=64, and ALL 8 waves active (for BN=128 small-M / MoE BM=16,32).
+constexpr int BK128_LD = 136;
+
+template <int FMT>
+__device__ __forceinline__ void dequant_q16_scaled(const RawQ16<FMT>& r, int q4, float eff, half_t* dst) {
+    const uint32_t ef2 = h2_splat(eff);
+    if constexpr (FMT == FMT_S1_25) {
+        const uint32_t bits = (r.lo[0] >> ((q4 & 1) * 4)) & 0xFFFFFu;
+        const uint2* lut = s125_lut();
+        const uint2 a = lut[bits & 31u], b = lut[(bits >> 5) & 31u], c = lut[(bits >> 10) & 31u], d = lut[(bits >> 15) & 31u];
+        *(uint4*)(dst + 0) = make_uint4(h2_mul(a.x, ef2), h2_mul(a.y, ef2), h2_mul(b.x, ef2), h2_mul(b.y, ef2));
+        *(uint4*)(dst + 8) = make_uint4(h2_mul(c.x, ef2), h2_mul(c.y, ef2), h2_mul(d.x, ef2), h2_mul(d.y, ef2));
+        return;
+    }
+    if constexpr (FMT == FMT_S1_5) {
+        const uint32_t t0 = r.hi, byte0 = t0 / 5u;
+        const uint32_t mag = h2_splat(1025.0f);
+        uint32_t o[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t ti0 = t0 + 2 * i, ti1 = ti0 + 1;
+            const uint32_t b0 = (r.lo[0] >> ((ti0 / 5u - byte0) * 8)) & 0xFFu;
+            const uint32_t b1 = (r.lo[0] >> ((ti1 / 5u - byte0) * 8)) & 0xFFu;
+            const uint32_t v0 = (uint32_t)(s15_trit(b0, (int)(ti0 % 5u)) + 1);
+            const uint32_t v1 = (uint32_t)(s15_trit(b1, (int)(ti1 % 5u)) + 1);
+            o[i] = h2_mul(h2_sub(0x64006400u | v0 | (v1 << 16), mag), ef2);
+        }
+        *(uint4*)(dst + 0) = make_uint4(o[0], o[1], o[2], o[3]);
+        *(uint4*)(dst + 8) = make_uint4(o[4], o[5], o[6], o[7]);
+        return;
+    }
+    uint32_t q[16];
+    if constexpr (FMT == FMT_S2 || FMT == FMT_S3) {
+        const uint32_t w = r.lo[0], hb = FMT == FMT_S3 ? r.hi : 0u;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) q[k] = ((w >> (2 * k)) & 3u) | (FMT == FMT_S3 ? (((hb >> k) & 1u) << 2) : 0u);
+    } else if constexpr (FMT == FMT_S4 || FMT == FMT_S5 || FMT == FMT_S6) {
+        const uint32_t w0 = r.lo[0], w1 = r.lo[1], hb = FMT == FMT_S5 ? r.hi : 0u, h2 = FMT == FMT_S6 ? r.hi : 0u;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            uint32_t v0 = (w0 >> (4 * k)) & 15u, v1 = (w1 >> (4 * k)) & 15u;
+            if constexpr (FMT == FMT_S5) { v0 |= ((hb >> k) & 1u) << 4; v1 |= ((hb >> (k + 8)) & 1u) << 4; }
+            if constexpr (FMT == FMT_S6) { v0 |= ((h2 >> (2 * k)) & 3u) << 4; v1 |= ((h2 >> (2 * (k + 8))) & 3u) << 4; }
+            q[k] = v0;
+            q[k + 8] = v1;
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t d = r.lo[j];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) q[4 * j + k] = ((d >> (8 * k)) & 0xFFu) ^ 0x80u;
+        }
+    }
+    const uint32_t mag = h2_splat(FMT == FMT_S8 ? 1152.0f : 1024.0f);
+    const uint32_t hh = h2_splat(sk_half<FMT>());
+    uint32_t o[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint32_t w = h2_sub(0x64006400u | q[2 * i] | (q[2 * i + 1] << 16), mag);
+        if constexpr (FMT != FMT_S8) w = h2_sub(w, hh);
+        o[i] = h2_mul(w, ef2);
+    }
+    *(uint4*)(dst + 0) = make_uint4(o[0], o[1], o[2], o[3]);
+    *(uint4*)(dst + 8) = make_uint4(o[4], o[5], o[6], o[7]);
+}
+
+// 128-row BK=128 mainloop: 256 threads load 128 rows x 2 subgroups (1 thread loads 1 subgroup of 64 weights = 1 RawSub<FMT>!).
+// Wait: 128 rows * 2 subgroups = 256 RawSub! 1 thread = 1 (row, subgroup) -> EXACTLY load_raw<FMT> + dequant_sub<FMT> (zero wasted header loads, 100% coalesced 32-64 B loads)!
+template <int FMT, int MTW, int NTW>
+__device__ __forceinline__ void gemm_mainloop_128(const uint8_t* wr, int nsb, const half_t* const (&xrow)[MTW], half_t* ws, fv8 (&acc)[MTW][NTW], const int (&brow)[NTW]) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int tid = threadIdx.x, lane = tid & 31, l16 = lane & 15;
+    const int drow = tid >> 1, dg_lo = tid & 1;  // 128 rows (0..127), 2 subgroups (0,1 then 2,3)
+    if constexpr (FMT == FMT_S1_25) {
+        s125_lut_init();
+        __syncthreads();
+    }
+    RawSub<FMT> cur, nxt;
+    load_raw<FMT>(wr, dg_lo, cur);
+    constexpr int PD = 4;
+    const int total = nsb * 16;
+    hv16 aq[MTW][PD];
+#pragma unroll
+    for (int i = 0; i < PD; ++i)
+#pragma unroll
+        for (int m = 0; m < MTW; ++m) aq[m][i] = ld_hv16(xrow[m] + i * 16);
+    const int nhalf = nsb * 2;
+    for (int hs = 0; hs < nhalf; ++hs) {
+        const int sb = hs >> 1, dg = (hs & 1) * 2 + dg_lo;
+        dequant_sub<FMT>(cur, raw_eff<FMT>(cur, dg), &ws[drow * BK128_LD + dg_lo * 64]);
+        if (hs + 1 < nhalf) {
+            const int nsb_i = (hs + 1) >> 1, ndg = ((hs + 1) & 1) * 2 + dg_lo;
+            load_raw<FMT>(wr + (size_t)nsb_i * SB, ndg, nxt);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+            const int g = hs * 8 + kk;
+            hv16 a[MTW];
+#pragma unroll
+            for (int m = 0; m < MTW; ++m) {
+                a[m] = aq[m][kk & (PD - 1)];
+                if (g + PD < total) aq[m][kk & (PD - 1)] = ld_hv16(xrow[m] + (g + PD) * 16);
+            }
+            hv16 b[NTW];
+#pragma unroll
+            for (int j = 0; j < NTW; ++j) b[j] = ld_hv16(&ws[(brow[j] + l16) * BK128_LD + kk * 16]);
+#pragma unroll
+            for (int m = 0; m < MTW; ++m)
+#pragma unroll
+                for (int j = 0; j < NTW; ++j) acc[m][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[m], b[j], acc[m][j]);
+        }
+        __syncthreads();
+        cur = nxt;
+    }
+}
+
 template <int FMT>
 __device__ __forceinline__ void gemm_mainloop_old(const uint8_t* wr, int nsb, const half_t* xrow0, const half_t* xrow1, half_t* ws, fv8 (&acc)[2][2],
                                               int b0row, int b1row) {
@@ -609,9 +833,69 @@ __device__ __forceinline__ void gemm_mainloop_splitk(const uint8_t* wr, int nsb,
     }
 }
 
-// small-M linear kernel (M <= 16 tokens per block row): 64 weight rows per block (full SM grid), all 8 waves active via WK=2 split-K (4 N-warps x 2 K-warps)
-constexpr int GEMM_S_BN = GEMM_BN;
+// small-M linear kernel (M <= 16 tokens per block row):
+// On gfx11 (HIP): 128 weight rows per block, ALL 8 waves active (16 rows each), BK=128 (2 subgroups/step, 1 thread = 1 subgroup = 64 weights, v_pk_mul_f16).
+// On CUDA: 64 weight rows per block (full SM grid), all 8 warps active via WK=2 split-K (4 N-warps x 2 K-warps).
+#if !HY4_CUDA
+constexpr int GEMMS_BN = 128;
+template <int FMT>
+__global__ void __launch_bounds__(256) k_gemm_s(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    __shared__ __attribute__((aligned(16))) half_t ws[GEMMS_BN * BK128_LD];
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int bn = blockIdx.x * GEMMS_BN, bm = blockIdx.y * 16;
+    const int nsb = K >> 8;
+    int wrow = bn + (tid >> 1);
+    wrow = wrow < N ? wrow : N - 1;
+    int row = bm + (lane & 15);
+    row = row < M ? row : M - 1;
+    const half_t* xrow[1] = {(const half_t*)X + (size_t)row * K};
+    fv8 acc[1][1];
+    acc_zero(acc);
+    const int brow[1] = {wave * 16};
+    gemm_mainloop_128<FMT, 1, 1>(W + (size_t)wrow * nsb * SB, nsb, xrow, ws, acc, brow);
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int n = bn + wave * 16 + acc_n(r, lane);
+        const int m = bm + acc_m(r, lane);
+        if (m < M && n < N) Y[(size_t)m * N + n] = acc[0][0][r];
+    }
+}
 
+template <int FMT>
+__global__ void __launch_bounds__(256) k_gemm(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * GEMM_LDW];
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int wm = wave & 3, wn = wave >> 2;
+    const int bn = blockIdx.x * GEMM_BN, bm = blockIdx.y * GEMM_BM;
+    const int nsb = K >> 8;
+    fv8 acc[2][2];
+    acc_zero(acc);
+    const half_t* xrow[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int row = bm + wm * 32 + i * 16 + (lane & 15);
+        row = row < M ? row : M - 1;
+        xrow[i] = (const half_t*)X + (size_t)row * K;
+    }
+    int wrow = bn + (tid >> 2);
+    wrow = wrow < N ? wrow : N - 1;
+    gemm_mainloop<FMT>(W + (size_t)wrow * nsb * SB, nsb, xrow[0], xrow[1], ws, acc, wn * 32, wn * 32 + 16);
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int n = bn + wn * 32 + j * 16 + acc_n(r, lane);
+                const int m = bm + wm * 32 + i * 16 + acc_m(r, lane);
+                if (m < M && n < N) Y[(size_t)m * N + n] = acc[i][j][r];
+            }
+        }
+}
+#else  // HY4_CUDA
+constexpr int GEMMS_BN = GEMM_BN;
 template <int FMT>
 __global__ void __launch_bounds__(256) k_gemm_s(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M) {
     constexpr int SB = sk_sb_bytes(FMT);
@@ -670,12 +954,13 @@ __global__ void __launch_bounds__(256) k_gemm(const uint8_t* __restrict__ W, int
             }
         }
 }
+#endif
 
 }  // namespace skd
 
 // small-M WMMA entry (M <= 16 per call; larger M loops over 16-token blocks inside the grid): S_K weights, same requirements as linear_h_gemm
 inline void linear_h_gemm_s(hipStream_t s, int fmt, const void* W, int N, int K, const __half* X, float* Y, int M) {
-    dim3 grid((N + skd::GEMM_S_BN - 1) / skd::GEMM_S_BN, (M + 15) / 16), block(256);
+    dim3 grid((N + skd::GEMMS_BN - 1) / skd::GEMMS_BN, (M + 15) / 16), block(256);
 #define HY4_GEMMS_CASE(F) case F: hipLaunchKernelGGL((skd::k_gemm_s<F>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M); break
     switch (fmt) {
         HY4_GEMMS_CASE(FMT_S1_25);

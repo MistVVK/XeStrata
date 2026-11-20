@@ -93,15 +93,17 @@ __global__ void k_idx_q_rope(const float* __restrict__ iq, __half* __restrict__ 
 }
 
 // score[t][g] = sum_h relu(iq[t][h] . pooled[g]) * hw[t][h] * hscale, for g < grp(t) = (p0+t)/4, else -inf.  block (64 pools, 1 token), 64 threads.
+// Uses packed half2 (v_dot2_f32_f16) + 4 KB LDS + 64 VGPRs instead of 128-VGPR fp32 array (2x FLOPs/cycle, half register pressure).
 __global__ void __launch_bounds__(64) k_idx_score(const __half* __restrict__ iq, const float* __restrict__ hw, const __half* __restrict__ pooled, float* __restrict__ score, int p0, int G, int ldS,
                                                   float hscale, const int* __restrict__ p0_dev = nullptr, const int* __restrict__ G_dev = nullptr) {
     const int G_u = G_dev ? *G_dev : G;
     if ((int)blockIdx.x * 64 >= G_u) return;
     const int p0_u = p0_dev ? *p0_dev : p0;
-    __shared__ float sq[16 * 128];
+    __shared__ uint32_t sq[16 * 64];
     __shared__ float shw[16];
     int t = blockIdx.y, g = blockIdx.x * 64 + threadIdx.x;
-    for (int i = threadIdx.x; i < 16 * 128; i += 64) sq[i] = __half2float(iq[(size_t)t * 2048 + i]);
+    const uint32_t* iq2 = reinterpret_cast<const uint32_t*>(iq + (size_t)t * 2048);
+    for (int i = threadIdx.x; i < 16 * 64; i += 64) sq[i] = iq2[i];
     if (threadIdx.x < 16) shw[threadIdx.x] = hw[(size_t)t * 16 + threadIdx.x] * hscale;
     __syncthreads();
     if (g >= G_u) return;
@@ -110,19 +112,22 @@ __global__ void __launch_bounds__(64) k_idx_score(const __half* __restrict__ iq,
     if (g >= grp) {
         res = -INFINITY;
     } else {
-        float pk[128];
-        const __half2* pr = (const __half2*)(pooled + (size_t)g * 128);
+        uint32_t pk[64];
+        const uint4* pr4 = reinterpret_cast<const uint4*>(pooled + (size_t)g * 128);
 #pragma unroll
-        for (int i = 0; i < 64; ++i) {
-            float2 f = __half22float2(pr[i]);
-            pk[2 * i] = f.x;
-            pk[2 * i + 1] = f.y;
+        for (int i = 0; i < 16; ++i) {
+            const uint4 v = pr4[i];
+            pk[4 * i + 0] = v.x;
+            pk[4 * i + 1] = v.y;
+            pk[4 * i + 2] = v.z;
+            pk[4 * i + 3] = v.w;
         }
-        res = 0;
+        res = 0.f;
         for (int h = 0; h < 16; ++h) {
-            float dsum = 0;
+            const uint32_t* qh = sq + h * 64;
+            float dsum = 0.f;
 #pragma unroll
-            for (int k = 0; k < 128; ++k) dsum += sq[h * 128 + k] * pk[k];
+            for (int k = 0; k < 64; ++k) dsum = h2_dot_f32(qh[k], pk[k], dsum);
             res += fmaxf(dsum, 0.0f) * shw[h];
         }
     }
@@ -309,10 +314,11 @@ __global__ void k_idx_q_rope_tree(const float* __restrict__ iq, __half* __restri
 
 __global__ void __launch_bounds__(64) k_idx_score_tree(const __half* __restrict__ iq, const float* __restrict__ hw, const __half* __restrict__ pooled, const __half* __restrict__ tmp_pooled,
                                                        float* __restrict__ score, int p0, IdxTree tp, int G, int ldS, float hscale) {
-    __shared__ float sq[16 * 128];
+    __shared__ uint32_t sq[16 * 64];
     __shared__ float shw[16];
     int t = blockIdx.y, g = blockIdx.x * 64 + threadIdx.x;
-    for (int i = threadIdx.x; i < 16 * 128; i += 64) sq[i] = __half2float(iq[(size_t)t * 2048 + i]);
+    const uint32_t* iq2 = reinterpret_cast<const uint32_t*>(iq + (size_t)t * 2048);
+    for (int i = threadIdx.x; i < 16 * 64; i += 64) sq[i] = iq2[i];
     if (threadIdx.x < 16) shw[threadIdx.x] = hw[(size_t)t * 16 + threadIdx.x] * hscale;
     __syncthreads();
     if (g >= G) return;
@@ -322,20 +328,23 @@ __global__ void __launch_bounds__(64) k_idx_score_tree(const __half* __restrict_
     if (g >= grp) {
         res = -INFINITY;
     } else {
-        float pk[128];
+        uint32_t pk[64];
         const __half* prow = (g < g0) ? (pooled + (size_t)g * 128) : (tmp_pooled + (size_t)(t * 2 + (g - g0)) * 128);
-        const __half2* pr = (const __half2*)prow;
+        const uint4* pr4 = reinterpret_cast<const uint4*>(prow);
 #pragma unroll
-        for (int i = 0; i < 64; ++i) {
-            float2 f = __half22float2(pr[i]);
-            pk[2 * i] = f.x;
-            pk[2 * i + 1] = f.y;
+        for (int i = 0; i < 16; ++i) {
+            const uint4 v = pr4[i];
+            pk[4 * i + 0] = v.x;
+            pk[4 * i + 1] = v.y;
+            pk[4 * i + 2] = v.z;
+            pk[4 * i + 3] = v.w;
         }
-        res = 0;
+        res = 0.f;
         for (int h = 0; h < 16; ++h) {
-            float dsum = 0;
+            const uint32_t* qh = sq + h * 64;
+            float dsum = 0.f;
 #pragma unroll
-            for (int k = 0; k < 128; ++k) dsum += sq[h * 128 + k] * pk[k];
+            for (int k = 0; k < 64; ++k) dsum = h2_dot_f32(qh[k], pk[k], dsum);
             res += fmaxf(dsum, 0.0f) * shw[h];
         }
     }

@@ -916,30 +916,56 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
     return true;
 }
 
-// Overlay distilled DFly2 weights from a flat binary `DFLYOVR1` file directly into `g.d_trunk` (zero .strata file duplication).
+// Overlay distilled DFly2 weights directly into `g.d_trunk` (never touches target model weights).
+// Supports BOTH flat override formats: `DFLYOVR1` (uint16 nlen, uint64 blen, name, payload) and `DFOV0001` (uint32 nlen, name, uint64 blen, payload).
 inline bool load_dfly_override(GpuModel& g, const std::string& path, std::string& err) {
+    if (path.empty()) return true;
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { err = "cannot open dfly-override: " + path; return false; }
     char magic[8] = {};
     uint32_t count = 0;
-    if (fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "DFLYOVR1", 8) != 0 || fread(&count, 4, 1, f) != 1) {
+    if (fread(magic, 1, 8, f) != 8 || fread(&count, 4, 1, f) != 1 || count == 0 || count > 2048) {
         fclose(f);
-        err = "invalid DFLYOVR1 header: " + path;
+        err = "invalid dfly-override header (expected DFLYOVR1 or DFOV0001): " + path;
+        return false;
+    }
+    const bool is_v1 = (std::memcmp(magic, "DFLYOVR1", 8) == 0);
+    const bool is_dfov = (std::memcmp(magic, "DFOV0001", 8) == 0);
+    if (!is_v1 && !is_dfov) {
+        fclose(f);
+        err = "invalid dfly-override magic (expected DFLYOVR1 or DFOV0001): " + path;
         return false;
     }
     double t0 = now_s();
     size_t applied = 0, total_bytes = 0;
     std::vector<uint8_t> buf;
     for (uint32_t i = 0; i < count; ++i) {
-        uint16_t nlen = 0;
+        std::string name;
         uint64_t blen = 0;
-        if (fread(&nlen, 2, 1, f) != 1 || fread(&blen, 8, 1, f) != 1) { fclose(f); err = "truncated DFLYOVR1 entry"; return false; }
-        std::string name(nlen, '\0');
-        if (fread(&name[0], 1, nlen, f) != nlen) { fclose(f); err = "truncated DFLYOVR1 name"; return false; }
+        if (is_v1) {
+            uint16_t nlen = 0;
+            if (fread(&nlen, 2, 1, f) != 1 || fread(&blen, 8, 1, f) != 1 || nlen == 0 || nlen > 1024) { fclose(f); err = "truncated DFLYOVR1 entry"; return false; }
+            name.resize(nlen);
+            if (fread(&name[0], 1, nlen, f) != nlen) { fclose(f); err = "truncated DFLYOVR1 name"; return false; }
+        } else {
+            uint32_t nlen = 0;
+            if (fread(&nlen, 4, 1, f) != 1 || nlen == 0 || nlen > 1024) { fclose(f); err = "bad DFOV0001 name length"; return false; }
+            name.resize(nlen);
+            if (fread(&name[0], 1, nlen, f) != nlen || fread(&blen, 8, 1, f) != 1) { fclose(f); err = "truncated DFOV0001 entry"; return false; }
+        }
+        if (name.rfind("model.dfly_layers.", 0) != 0) {
+            fclose(f);
+            err = "refusing non-dfly tensor in override: " + name;
+            return false;
+        }
         buf.resize((size_t)blen);
-        if (fread(buf.data(), 1, (size_t)blen, f) != (size_t)blen) { fclose(f); err = "truncated DFLYOVR1 payload"; return false; }
+        if (fread(buf.data(), 1, (size_t)blen, f) != (size_t)blen) { fclose(f); err = "truncated dfly-override payload for " + name; return false; }
         auto it = g.man.T.find(name);
-        if (it == g.man.T.end()) continue;
+        if (it == g.man.T.end()) {
+            fclose(f);
+            err = "dfly-override tensor not in manifest: " + name;
+            return false;
+        }
         if (it->second.bytes != blen) {
             fclose(f);
             err = "dfly-override byte mismatch for " + name + " (" + std::to_string(blen) + " vs " + std::to_string(it->second.bytes) + ")";
@@ -950,8 +976,10 @@ inline bool load_dfly_override(GpuModel& g, const std::string& path, std::string
         total_bytes += (size_t)blen;
     }
     fclose(f);
-    fprintf(stderr, "[dfly-override] applied %zu/%u tensors (%.2f MB) from %s in %.2f s\n", applied, count, total_bytes / 1e6, path.c_str(), now_s() - t0);
+    fprintf(stderr, "[dfly-override] applied %zu/%u tensors (%.2f MB, %s) from %s in %.2f s\n",
+            applied, count, total_bytes / 1e6, is_v1 ? "DFLYOVR1" : "DFOV0001", path.c_str(), now_s() - t0);
     return applied > 0;
 }
+inline bool apply_dfly_override(GpuModel& g, const std::string& path, std::string& err) { return load_dfly_override(g, path, err); }
 
 }  // namespace hy4

@@ -29,7 +29,37 @@
 
 namespace hy4 {
 
-// device dequantization of kv_b_proj [NH*448][512] (any S_K fmt) into wk_b [NH][192][512] and wv_b [NH][256][512] fp16
+// device dequantization of one layer's kv_b_proj [NH*448][512] (any S_K fmt) into wk_bt [NH][512][192] (transposed for WMMA mla_prep_q_t) and wv_b [NH][256][512] fp16
+template <int FMT>
+__global__ void __launch_bounds__(256) k_dequant_wkt(const uint8_t* __restrict__ W, __half* __restrict__ wk_bt, int NH) {
+    // grid (NH * 6, 16): block (h*6 + it, ct) transposes 32 rows (i0..i0+31) x 32 cols (c0..c0+31) via LDS
+    __shared__ __half sh[32][33];
+    const int h = blockIdx.x / 6, i0 = (blockIdx.x % 6) * 32, c0 = blockIdx.y * 32;
+    const int tid = threadIdx.x, r0 = tid >> 5, col = tid & 31;
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int sb = c0 >> 8, c_in = (c0 & 255) + col;
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const int ri = r0 + p * 8;
+        const uint8_t* rp = W + ((size_t)h * 448 + i0 + ri) * (2 * SB) + (size_t)sb * SB;
+        sh[ri][col] = __float2half(skd::sk_weight<FMT>(rp, c_in));
+    }
+    __syncthreads();
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const int rc = r0 + p * 8;
+        wk_bt[((size_t)h * 512 + c0 + rc) * 192 + i0 + col] = sh[col][rc];
+    }
+}
+template <int FMT>
+__global__ void __launch_bounds__(256) k_dequant_wv(const uint8_t* __restrict__ W, __half* __restrict__ wv, int NH) {
+    // grid (NH * 256): one block per v row (512 cols = 2 per thread)
+    const int r = blockIdx.x, h = r >> 8, j = r & 255;
+    constexpr int SB = sk_sb_bytes(FMT);
+    const uint8_t* rp = W + ((size_t)h * 448 + 192 + j) * (2 * SB);
+    __half* dst = wv + ((size_t)h * 256 + j) * 512;
+    for (int k = threadIdx.x; k < 512; k += 256) dst[k] = __float2half(skd::sk_weight<FMT>(rp + (size_t)(k >> 8) * SB, k & 255));
+}
 template <int FMT>
 __global__ void k_split_kvb(const uint8_t* __restrict__ W, __half* __restrict__ wk, __half* __restrict__ wv, int NH) {
     int r = blockIdx.x;  // row in [0, NH*448)
@@ -129,8 +159,8 @@ public:
     EngramDev eng_dev[4];
     ExpertDev* d_experts = nullptr;
     std::vector<ExpertDev> h_experts;  // host mirror of d_experts [41*512]
-    __half* wk_layer = nullptr;        // reusable single-layer [max_NH][192][512] fp16 for prefill T > 8 (12 MiB)
-    __half* wv_layer = nullptr;        // reusable single-layer [max_NH][256][512] fp16 for prefill T > 8 (16 MiB)
+    __half* wk_layer = nullptr;        // reusable single-layer [max_NH][192][512] (or [max_NH][512][192] on HIP) fp16 for prefill T > 8 (12.6 MiB)
+    __half* wv_layer = nullptr;        // reusable single-layer [max_NH][256][512] fp16 for prefill T > 8 (16.8 MiB)
     std::vector<__half*> kcache;       // per layer
     int ring = 0, slots_sparse = 0;
     // Growable sparse KV + IndexPool state: starts at kv_alloc_pos positions (16,384 by default on discrete cards) in VRAM,
@@ -1627,7 +1657,8 @@ public:
     void hc_mix_run(const float* xin, const float* hfn, const float* hsc, const float* hbs, int nout, int T) {
         if (det_mix) {
             if (!hcpart) hcpart = dalloc<float>((size_t)Tc * 24 * 9);
-            hipLaunchKernelGGL(k_hc_mix_part_d, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcpart, nout);
+            if (T >= 16) hipLaunchKernelGGL(k_hc_mix_part_d_batch, dim3((T + 31) / 32, 24), dim3(128), 0, st, xin, hfn, hcpart, nout, T);
+            else hipLaunchKernelGGL(k_hc_mix_part_d, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcpart, nout);
             hipLaunchKernelGGL(k_hc_mix_fin_d, dim3(T), dim3(32), 0, st, hcpart, hsc, hbs, pre, post, nout, c.rms_eps, c.hc_eps, c.hc_mag);
             return;
         }
@@ -1641,7 +1672,8 @@ public:
     void hc_pre(const float* xin, const float* hfn, const float* hsc, const float* hbs, const float* nw, int nout, int T, __half* outh, float* outf) {
         if (det_mix) {
             if (!hcpart) hcpart = dalloc<float>((size_t)Tc * 24 * 9);
-            hipLaunchKernelGGL(k_hc_mix_part_d, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcpart, nout);
+            if (T >= 16) hipLaunchKernelGGL(k_hc_mix_part_d_batch, dim3((T + 31) / 32, 24), dim3(128), 0, st, xin, hfn, hcpart, nout, T);
+            else hipLaunchKernelGGL(k_hc_mix_part_d, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcpart, nout);
             hipLaunchKernelGGL(k_hc_fin_reduce_norm, dim3(T), dim3(256), 0, st, hcpart, hsc, hbs, pre, post, nout, c.hc_eps, c.hc_mag, xin, nw, outh, outf, c.rms_eps);
             return;
         }
@@ -1709,14 +1741,28 @@ public:
         const int NH = heads(il);
         const std::string nm = L(il) + ".self_attn.kv_b_proj.weight";
         const TInfo& t = ti(nm);
+        const uint8_t* W = (const uint8_t*)tw(nm);
+#if !HY4_CUDA && HY4_MMA
+        dim3 gk(NH * 6, 16), gv(NH * 256), blk(256);
+        switch (t.fmt) {
+            case FMT_S2: hipLaunchKernelGGL((k_dequant_wkt<FMT_S2>), gk, blk, 0, st, W, wk_layer, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S2>), gv, blk, 0, st, W, wv_layer, NH); break;
+            case FMT_S3: hipLaunchKernelGGL((k_dequant_wkt<FMT_S3>), gk, blk, 0, st, W, wk_layer, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S3>), gv, blk, 0, st, W, wv_layer, NH); break;
+            case FMT_S4: hipLaunchKernelGGL((k_dequant_wkt<FMT_S4>), gk, blk, 0, st, W, wk_layer, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S4>), gv, blk, 0, st, W, wv_layer, NH); break;
+            case FMT_S5: hipLaunchKernelGGL((k_dequant_wkt<FMT_S5>), gk, blk, 0, st, W, wk_layer, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S5>), gv, blk, 0, st, W, wv_layer, NH); break;
+            case FMT_S6: hipLaunchKernelGGL((k_dequant_wkt<FMT_S6>), gk, blk, 0, st, W, wk_layer, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S6>), gv, blk, 0, st, W, wv_layer, NH); break;
+            default:     hipLaunchKernelGGL((k_dequant_wkt<FMT_S8>), gk, blk, 0, st, W, wk_layer, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S8>), gv, blk, 0, st, W, wv_layer, NH); break;
+        }
+#else
         dim3 grid(NH * 448), block(128);
         switch (t.fmt) {
-            case FMT_S4: hipLaunchKernelGGL((k_split_kvb<FMT_S4>), grid, block, 0, st, (const uint8_t*)tw(nm), wk_layer, wv_layer, NH); break;
-            case FMT_S5: hipLaunchKernelGGL((k_split_kvb<FMT_S5>), grid, block, 0, st, (const uint8_t*)tw(nm), wk_layer, wv_layer, NH); break;
-            case FMT_S6: hipLaunchKernelGGL((k_split_kvb<FMT_S6>), grid, block, 0, st, (const uint8_t*)tw(nm), wk_layer, wv_layer, NH); break;
-            case FMT_S8: hipLaunchKernelGGL((k_split_kvb<FMT_S8>), grid, block, 0, st, (const uint8_t*)tw(nm), wk_layer, wv_layer, NH); break;
-            default: fprintf(stderr, "kv_b_proj format %d not supported\n", t.fmt); exit(3);
+            case FMT_S2: hipLaunchKernelGGL((k_split_kvb<FMT_S2>), grid, block, 0, st, W, wk_layer, wv_layer, NH); break;
+            case FMT_S3: hipLaunchKernelGGL((k_split_kvb<FMT_S3>), grid, block, 0, st, W, wk_layer, wv_layer, NH); break;
+            case FMT_S4: hipLaunchKernelGGL((k_split_kvb<FMT_S4>), grid, block, 0, st, W, wk_layer, wv_layer, NH); break;
+            case FMT_S5: hipLaunchKernelGGL((k_split_kvb<FMT_S5>), grid, block, 0, st, W, wk_layer, wv_layer, NH); break;
+            case FMT_S6: hipLaunchKernelGGL((k_split_kvb<FMT_S6>), grid, block, 0, st, W, wk_layer, wv_layer, NH); break;
+            default:     hipLaunchKernelGGL((k_split_kvb<FMT_S8>), grid, block, 0, st, W, wk_layer, wv_layer, NH); break;
         }
+#endif
     }
 
     void attention_layer(int il, int p0, int T, const TreeSpec* tree = nullptr) {
@@ -1756,7 +1802,14 @@ public:
           if (dec) {
               if (p0d) mla_prep_q_dec_d(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0d, (float)theta(il));
               else mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il), tp);
-          } else mla_prep_q(st, F2, wk_layer, qa_h, T, NH, p0, (float)theta(il)); }
+          } else {
+#if !HY4_CUDA && HY4_MMA
+              mla_prep_q_t(st, F2, wk_layer, qa_h, T, NH, p0, (float)theta(il));
+#else
+              mla_prep_q(st, F2, wk_layer, qa_h, T, NH, p0, (float)theta(il));
+#endif
+          }
+        }
         if (!is_tree && !capturing && vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
             vis->fix_k(st, kv_a_out, cache, T, p0, swa ? ring : 0, (float)theta(il));
             vis->fix_q(st, F2, qa_h, T, NH, p0, (float)theta(il));
@@ -2018,6 +2071,8 @@ public:
         const float* hsc = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_base");
         { PS _q(this, "hc_mix"); hc_pre(x, hfn, hsc, hbs, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), 8, T, cur_h, cur_f); }
+        const bool mfuse = (tune != 0) && T <= 8 && T <= skd::lin_gemv_max_m() && il < (int)mlp_fuse.size() && mlp_fuse[il] > 0 && lm_mlp[il].d_jobs != nullptr;
+        const int mf = mfuse ? mlp_fuse[il] : 0;
         if (il == 0) {
             if (lm_ok_m(T) && lm_mlp0.d_jobs) {
                 PS _q(this, "lin mlp0_gu_multi"); linear_h_multi(st, lm_mlp0, cur_h, T);
@@ -2031,17 +2086,26 @@ public:
             { PS _q(this, "o_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F3, (const float*)nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), x, post, c.rms_eps); }
         } else {
             // router
-            { PS _q(this, "router_gemv"); if (T <= 16) hipLaunchKernelGGL(k_f32_gemv, dim3(512), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T); else hipLaunchKernelGGL(k_f32_gemm, dim3(8, (T + 63) / 64), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T); }
+            {
+                PS _q(this, "router_gemv");
+                const float* rw = (const float*)tw(pm + ".gate.weight");
+                if (T <= 1) hipLaunchKernelGGL((k_f32_gemv_t<1>), dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else if (T <= 2) hipLaunchKernelGGL((k_f32_gemv_t<2>), dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else if (T <= 4) hipLaunchKernelGGL((k_f32_gemv_t<4>), dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else if (T <= 6) hipLaunchKernelGGL((k_f32_gemv_t<6>), dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else if (T <= 8) hipLaunchKernelGGL((k_f32_gemv_t<8>), dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else if (T <= 16) hipLaunchKernelGGL(k_f32_gemv, dim3(512), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+                else hipLaunchKernelGGL(k_f32_gemm, dim3(8, (T + 63) / 64), dim3(256), 0, st, rw, (const float*)cur_f, F1, 512, HID, T);
+            }
             route_now = (tune & TN_ROUTE) && T == 1 && !hyb && peer_runs.empty();
             {
                 PS _q(this, "router_topk");
                 const uint4* exl = route_now ? (const uint4*)(d_experts + (size_t)(il - 1) * 512) : nullptr;
                 uint4* rec = route_now ? (uint4*)slot_rec : nullptr;
                 const float* rb = (const float*)tw(pm + ".gate.e_score_correction_bias");
-                if (tune & TN_TOPK) hipLaunchKernelGGL(k_router_topk_r, dim3(T), dim3(512), 0, st, F1, rb, moe_idx, moe_w, 16, c.routed_scale, exl, rec);
+                if (tune & TN_TOPK) hipLaunchKernelGGL(k_router_topk_w32, dim3(T), dim3(32), 0, st, F1, rb, moe_idx, moe_w, 16, c.routed_scale, exl, rec);
                 else hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, rb, moe_idx, moe_w, 512, 16, c.routed_scale, exl, rec);
             }
-            lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
             size_t nz = (size_t)T * 1536;
             if (hyb) { moe_hybrid_tail(il, T, pm); } else {
             void* mws = T <= 8 ? moe_ws_dec : moe_ws;
@@ -2590,13 +2654,15 @@ public:
             if (!already) {
                 const double t_pf0 = now_s();
                 prefetch_engram(tok_all, p0, T, tree);
-                t_eng_issue += now_s() - t_pf0;
+                if (T <= 8) t_eng_issue += now_s() - t_pf0;
             }
         }
         for (int il = 0; il < c.n_layers; ++il) {
-            if (defer_eng && il == 1) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err, tree)) return false; if (T <= 8) { t_eng_prep += now_s() - tq; ++n_eng_dec; } }
+            if (defer_eng && il == emeta.layers[0]) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err, tree)) return false; if (T <= 8) { t_eng_prep += now_s() - tq; ++n_eng_dec; } }
             if (defer_eng && il == emeta.layers[1]) {
+                double tq = now_s();
                 if (!engram_prep_rest(err)) return false;
+                if (T > 8) t_engram_cpu += now_s() - tq;
                 if (pf_eng_tok && p0 + T < pf_eng_total) {
                     const int np0 = p0 + T, nT = std::min(Tc, pf_eng_total - np0);
                     prefetch_engram(pf_eng_tok, np0, nT);

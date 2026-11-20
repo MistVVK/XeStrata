@@ -119,8 +119,13 @@ __device__ __forceinline__ void decode_w8(const uint8_t* pl, int u, uint32_t (&w
 
 template <int FMT, int MT, int RW, int NW = 8>
 __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M, int bidx) {
+#if HY4_CUDA
     // Tight LDS budget for small MT (8 KB at MT=1 vs 32 KB -> 4x higher SM occupancy on 128-188 SM Ada/Blackwell GPUs!)
     constexpr int KC = (MT == 1) ? 4096 : ((MT == 2) ? 4096 : ((MT == 4) ? 2048 : (16384 / MT)));
+#else
+    // For MT >= 5, cap LDS at 16 KB (higher CU occupancy) and read xs per m instead of holding uint4 xv[MT] in VGPRs (eliminates 2x VGPR-pressure cliff at M=6..16).
+    constexpr int KC = MT <= 4 ? (16384 / MT) : (MT <= 8 ? 1024 : 512);
+#endif
     constexpr int SB = sk_sb_bytes(FMT);
     constexpr int NTHR = NW * 32;
     __shared__ uint4 xs[MT * KC / 8];
@@ -148,24 +153,45 @@ __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, 
         }
         __syncthreads();
         const int sb0 = k0 >> 8, nsbc = kc >> 8;
+        if constexpr (MT <= 4) {
 #pragma unroll 2
-        for (int s = 0; s < nsbc; ++s) {
-            uint4 xv[MT];
+            for (int s = 0; s < nsbc; ++s) {
+                uint4 xv[MT];
 #pragma unroll
-            for (int m = 0; m < MT; ++m) xv[m] = xs[m * (KC / 8) + s * 32 + lane];
+                for (int m = 0; m < MT; ++m) xv[m] = xs[m * (KC / 8) + s * 32 + lane];
 #pragma unroll
-            for (int r = 0; r < RW; ++r) {
-                const uint8_t* blk = rp[r] + (size_t)(sb0 + s) * SB;
-                const float eff = sk_eff<FMT>(blk, lane >> 3);
-                uint32_t wp[4];
-                decode_w8<FMT>(blk + 6, lane, wp);
+                for (int r = 0; r < RW; ++r) {
+                    const uint8_t* blk = rp[r] + (size_t)(sb0 + s) * SB;
+                    const float eff = sk_eff<FMT>(blk, lane >> 3);
+                    uint32_t wp[4];
+                    decode_w8<FMT>(blk + 6, lane, wp);
 #pragma unroll
-                for (int m = 0; m < MT; ++m) {
-                    float p = dot2f(wp[0], xv[m].x, 0.f);
-                    p = dot2f(wp[1], xv[m].y, p);
-                    p = dot2f(wp[2], xv[m].z, p);
-                    p = dot2f(wp[3], xv[m].w, p);
-                    acc[r][m] += eff * p;
+                    for (int m = 0; m < MT; ++m) {
+                        float p = dot2f(wp[0], xv[m].x, 0.f);
+                        p = dot2f(wp[1], xv[m].y, p);
+                        p = dot2f(wp[2], xv[m].z, p);
+                        p = dot2f(wp[3], xv[m].w, p);
+                        acc[r][m] += eff * p;
+                    }
+                }
+            }
+        } else {
+            for (int s = 0; s < nsbc; ++s) {
+#pragma unroll
+                for (int r = 0; r < RW; ++r) {
+                    const uint8_t* blk = rp[r] + (size_t)(sb0 + s) * SB;
+                    const float eff = sk_eff<FMT>(blk, lane >> 3);
+                    uint32_t wp[4];
+                    decode_w8<FMT>(blk + 6, lane, wp);
+#pragma unroll
+                    for (int m = 0; m < MT; ++m) {
+                        const uint4 xv = xs[m * (KC / 8) + s * 32 + lane];
+                        float p = dot2f(wp[0], xv.x, 0.f);
+                        p = dot2f(wp[1], xv.y, p);
+                        p = dot2f(wp[2], xv.z, p);
+                        p = dot2f(wp[3], xv.w, p);
+                        acc[r][m] += eff * p;
+                    }
                 }
             }
         }
@@ -213,10 +239,14 @@ inline void launch_gemv(hipStream_t s, const void* W, int N, int K, const __half
         hipLaunchKernelGGL((k_gemv<FMT, MT, RW, NW>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
         return;
     }
-#endif
     constexpr int RW = 2, NW = 8;
     dim3 grid((N + NW * RW - 1) / (NW * RW)), block(NW * 32);
     hipLaunchKernelGGL((k_gemv<FMT, MT, RW, NW>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
+#else
+    constexpr int RW = MT <= 4 ? 2 : 1, NW = 8;
+    dim3 grid((N + NW * RW - 1) / (NW * RW)), block(NW * 32);
+    hipLaunchKernelGGL((k_gemv<FMT, MT, RW, NW>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
+#endif
 }
 
 template <int FMT>
@@ -224,6 +254,7 @@ inline void gemv_by_m(hipStream_t s, const void* W, int N, int K, const __half* 
     if (M <= 1) launch_gemv<FMT, 1>(s, W, N, K, X, Y, M);
     else if (M <= 2) launch_gemv<FMT, 2>(s, W, N, K, X, Y, M);
     else if (M <= 4) launch_gemv<FMT, 4>(s, W, N, K, X, Y, M);
+    else if (M <= 6) launch_gemv<FMT, 6>(s, W, N, K, X, Y, M);
     else if (M <= 8) launch_gemv<FMT, 8>(s, W, N, K, X, Y, M);
     else launch_gemv<FMT, 16>(s, W, N, K, X, Y, M);
 }
@@ -233,7 +264,8 @@ inline void gemv_by_m(hipStream_t s, const void* W, int N, int K, const __half* 
 // ---- several GEMVs with the same activations and the same format in one launch. Build once at load time, call per token.
 struct LinMulti {
     skd::LinJob* d_jobs = nullptr;
-    int njobs = 0, total_blocks = 0, K = 0, fmt = 0;
+    skd::LinJob* d_jobs1 = nullptr;
+    int njobs = 0, total_blocks = 0, total_blocks1 = 0, K = 0, fmt = 0;
 };
 
 #if HY4_CUDA
@@ -260,32 +292,40 @@ inline void linear_h_gemv(hipStream_t s, int fmt, const void* W, int N, int K, c
     }
 }
 
+// ---- several GEMVs with the same activations and the same format in one launch. Build once at load time, call per token (1 <= M <= 16).
 inline LinMulti linear_multi_build(int fmt, int K, int n, const void* const* W, float* const* Y, const int* N) {
     LinMulti d;
     d.fmt = fmt;
     d.K = K;
     d.njobs = n;
-    skd::LinJob h[16];
-    int blk = 0;
+    skd::LinJob h2[16], h1[16];
+    int blk2 = 0, blk1 = 0;
     for (int i = 0; i < n && i < 16; ++i) {
-        h[i].W = (const uint8_t*)W[i];
-        h[i].Y = Y[i];
-        h[i].N = N[i];
-        h[i].blk0 = blk;
+        h2[i].W = h1[i].W = (const uint8_t*)W[i];
+        h2[i].Y = h1[i].Y = Y[i];
+        h2[i].N = h1[i].N = N[i];
+        h2[i].blk0 = blk2;
+        h1[i].blk0 = blk1;
 #if HY4_CUDA
-        blk += (N[i] + 3) / 4;   // CUDA: RW = 1, NW = 4 (4 rows/block)
+        blk2 += (N[i] + 3) / 4;   // CUDA: RW = 1, NW = 4 (4 rows/block)
+        blk1 += (N[i] + 3) / 4;
 #else
-        blk += (N[i] + 15) / 16;  // HIP: RW = 2, NW = 8 (16 rows/block)
+        blk2 += (N[i] + 15) / 16;  // HIP M <= 4: RW = 2, NW = 8 (16 rows/block)
+        blk1 += (N[i] + 7) / 8;    // HIP M >= 5: RW = 1, NW = 8 (8 rows/block, low VGPR)
 #endif
     }
-    d.total_blocks = blk;
+    d.total_blocks = blk2;
+    d.total_blocks1 = blk1;
     if (hipMalloc((void**)&d.d_jobs, sizeof(skd::LinJob) * n) != hipSuccess) abort();
-    if (hipMemcpy(d.d_jobs, h, sizeof(skd::LinJob) * n, hipMemcpyHostToDevice) != hipSuccess) abort();
+    if (hipMemcpy(d.d_jobs, h2, sizeof(skd::LinJob) * n, hipMemcpyHostToDevice) != hipSuccess) abort();
+    if (hipMalloc((void**)&d.d_jobs1, sizeof(skd::LinJob) * n) != hipSuccess) abort();
+    if (hipMemcpy(d.d_jobs1, h1, sizeof(skd::LinJob) * n, hipMemcpyHostToDevice) != hipSuccess) abort();
     return d;
 }
 inline void linear_multi_free(LinMulti& d) {
     if (d.d_jobs) (void)hipFree(d.d_jobs);
-    d.d_jobs = nullptr;
+    if (d.d_jobs1) (void)hipFree(d.d_jobs1);
+    d.d_jobs = d.d_jobs1 = nullptr;
 }
 
 namespace skd {
@@ -293,15 +333,21 @@ template <int FMT>
 inline void multi_by_m(hipStream_t s, const LinMulti& d, const __half* X, int M) {
 #if HY4_CUDA
 #define HY4_MULTI(MT) hipLaunchKernelGGL((k_gemv_multi<FMT, MT, 1, 4>), dim3(d.total_blocks), dim3(128), 0, s, d.d_jobs, d.njobs, d.K, X, M)
-#else
-#define HY4_MULTI(MT) hipLaunchKernelGGL((k_gemv_multi<FMT, MT, 2, 8>), dim3(d.total_blocks), dim3(256), 0, s, d.d_jobs, d.njobs, d.K, X, M)
-#endif
     if (M <= 1) { HY4_MULTI(1); }
     else if (M <= 2) { HY4_MULTI(2); }
     else if (M <= 4) { HY4_MULTI(4); }
+    else if (M <= 6) { HY4_MULTI(6); }
     else if (M <= 8) { HY4_MULTI(8); }
     else { HY4_MULTI(16); }
 #undef HY4_MULTI
+#else
+    if (M <= 1) hipLaunchKernelGGL((k_gemv_multi<FMT, 1, 2, 8>), dim3(d.total_blocks), dim3(256), 0, s, d.d_jobs, d.njobs, d.K, X, M);
+    else if (M <= 2) hipLaunchKernelGGL((k_gemv_multi<FMT, 2, 2, 8>), dim3(d.total_blocks), dim3(256), 0, s, d.d_jobs, d.njobs, d.K, X, M);
+    else if (M <= 4) hipLaunchKernelGGL((k_gemv_multi<FMT, 4, 2, 8>), dim3(d.total_blocks), dim3(256), 0, s, d.d_jobs, d.njobs, d.K, X, M);
+    else if (M <= 6) hipLaunchKernelGGL((k_gemv_multi<FMT, 6, 1, 8>), dim3(d.total_blocks1), dim3(256), 0, s, d.d_jobs1, d.njobs, d.K, X, M);
+    else if (M <= 8) hipLaunchKernelGGL((k_gemv_multi<FMT, 8, 1, 8>), dim3(d.total_blocks1), dim3(256), 0, s, d.d_jobs1, d.njobs, d.K, X, M);
+    else hipLaunchKernelGGL((k_gemv_multi<FMT, 16, 1, 8>), dim3(d.total_blocks1), dim3(256), 0, s, d.d_jobs1, d.njobs, d.K, X, M);
+#endif
 }
 }  // namespace skd
 

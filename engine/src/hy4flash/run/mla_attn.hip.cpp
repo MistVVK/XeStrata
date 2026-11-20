@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #if HY4_CUDA
 #include "sk_cublas_ctx.hip.h"
 #endif
@@ -120,8 +121,7 @@ __global__ void __launch_bounds__(256) k_write_kv(const float* __restrict__ kv_a
     int slot = ring > 0 ? phys_pos % ring : phys_pos;
     __half* dst = cache + (size_t)slot * MLA_ROW;
     __half h0 = __float2half(v0 * inv * norm_w[2 * tid]), h1 = __float2half(v1 * inv * norm_w[2 * tid + 1]);
-    dst[2 * tid] = h0;
-    dst[2 * tid + 1] = h1;
+    *reinterpret_cast<__half2*>(dst + 2 * tid) = __halves2half2(h0, h1);
     (void)cache_slots;
     if (tid < 32) {
         float o0, o1;
@@ -131,9 +131,8 @@ __global__ void __launch_bounds__(256) k_write_kv(const float* __restrict__ kv_a
 }
 
 // Compact accepted tree-branch KV rows sequentially from physical slot (p0 + src.depth[k]) -> (p0 + k).
-__global__ void __launch_bounds__(256) k_compact_kv(__half* __restrict__ cache, int cache_slots, int p0, int ring, TreePos src) {
+__global__ void __launch_bounds__(256) k_compact_kv(__half* __restrict__ cache, int /*cache_slots*/, int p0, int ring, TreePos src) {
     const int tid = threadIdx.x;
-    (void)cache_slots;
     for (int k = 0; k < src.n; ++k) {
         const int sidx = (int)src.depth[k];
         if (sidx == k) continue;
@@ -141,8 +140,7 @@ __global__ void __launch_bounds__(256) k_compact_kv(__half* __restrict__ cache, 
         const int d_slot = ring > 0 ? (p0 + k) % ring : (p0 + k);
         const __half* sr = cache + (size_t)s_slot * MLA_ROW;
         __half* dr = cache + (size_t)d_slot * MLA_ROW;
-        dr[2 * tid] = sr[2 * tid];
-        dr[2 * tid + 1] = sr[2 * tid + 1];
+        *reinterpret_cast<__half2*>(dr + 2 * tid) = *reinterpret_cast<const __half2*>(sr + 2 * tid);
         if (tid < 32) {
             *reinterpret_cast<__half2*>(dr + MLA_KV_LORA + 2 * tid) = *reinterpret_cast<const __half2*>(sr + MLA_KV_LORA + 2 * tid);
         }
@@ -157,28 +155,6 @@ __device__ __forceinline__ int mla_tree_slot(const MlaAttnArgs& a, int t, int lp
         phys = p0_use + (int)a.tree_anc[t][(lp - p0_use) & 7];
     }
     return a.ring > 0 ? phys % a.ring : phys;
-}
-
-__device__ __forceinline__ bool mla_is_tree_grp(const MlaAttnArgs& a, int e, int vv, int lo_al, const int32_t* klist) {
-    if (a.tree_nodes <= 0 || vv <= 0) return false;
-    const int last_idx = e + vv - 1;
-    const int last_lp = a.mode == MLA_CAUSAL ? last_idx : (a.mode == MLA_WINDOW ? lo_al + last_idx : klist[last_idx]);
-    return last_lp >= a.p0;
-}
-
-template <class H>
-__device__ __forceinline__ uint2 mla_load_tree_v4(const H* rows, const MlaAttnArgs& a, int t, int e, int lo_al, const int32_t* klist, int nk, int col) {
-    uint16_t h[4] = {0, 0, 0, 0};
-#pragma unroll
-    for (int u = 0; u < 4; ++u) {
-        const int idx = e + u;
-        if (idx < nk) {
-            const int lp = a.mode == MLA_CAUSAL ? idx : (a.mode == MLA_WINDOW ? lo_al + idx : klist[idx]);
-            const int sl = mla_tree_slot(a, t, lp);
-            h[u] = *reinterpret_cast<const uint16_t*>(rows + (size_t)sl * MLA_ROW + col);
-        }
-    }
-    return make_uint2((uint32_t)h[0] | ((uint32_t)h[1] << 16), (uint32_t)h[2] | ((uint32_t)h[3] << 16));
 }
 
 // ---- 3. simple attention: one block per (head, query) -------------------------------------------------------------------------------------------------
@@ -295,7 +271,8 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     const int NH = a.NH, RT = NH / 16, h0 = rt * 16;
     __shared__ __align__(16) _Float16 sQ[16 * QP];
     __shared__ __align__(16) _Float16 sP[16 * PP];
-    __shared__ __align__(16) _Float16 sV[4][16][136];
+    __shared__ __align__(16) _Float16 sVt[4][16 * 24];
+    __shared__ int s_slot[64];
     __shared__ float s_m[4][16], s_l[4][16];
     {
         const _Float16* qsrc = reinterpret_cast<const _Float16*>(qa) + ((size_t)t * NH + h0) * MLA_ROW;
@@ -347,6 +324,7 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
             const int lp = mode == MLA_CAUSAL ? ie : (mode == MLA_WINDOW ? lo_al + ie : klist[ie]);
             slot = mla_tree_slot(a, t, lp);
         }
+        if (hi == 0) s_slot[16 * w + l16] = v ? slot : -1;
         const _Float16* krow = rows + (size_t)slot * MLA_ROW;
         fv8 sacc = fv8{};
 #pragma unroll 12
@@ -404,32 +382,25 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         for (int c = 0; c < 8; ++c)
 #pragma unroll
             for (int i = 0; i < 8; ++i) o[c][i] *= corr[i];
-        // ---- P @ V  (this wave: columns 128w .. 128w+127; read row-major kv_cmpr into per-wave LDS and transpose in LDS)
+        // ---- P @ V  (this wave: columns 128w .. 128w+127; reads V directly from rows — L2 hit from Q@K^T — and transposes 16x16 in wave-private LDS; invalid slots zeroed)
+        _Float16* svw = sVt[w];
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
-            const int kbase = i0 + 16 * ks;
-#pragma unroll
-            for (int rr = 0; rr < 8; ++rr) {
-                const int kk = 2 * rr + hi;
-                const int e = kbase + kk;
-                bool kv = e < nk;
-                if (mode == MLA_WINDOW) kv = kv && (lo_al + e >= lo);
-                uint4 vx = make_uint4(0u, 0u, 0u, 0u);
-                if (kv) {
-                    const int lp = mode == MLA_CAUSAL ? e : (mode == MLA_WINDOW ? lo_al + e : klist[e]);
-                    const int sl = mla_tree_slot(a, t, lp);
-                    vx = *reinterpret_cast<const uint4*>(rows + (size_t)sl * MLA_ROW + 128 * w + l16 * 8);
-                }
-                *reinterpret_cast<uint4*>(&sV[w][kk][l16 * 8]) = vx;
-            }
             hv16 pf = ld_hv16(&sP[l16 * PP + ks * 16]);
+            const int sl = s_slot[16 * ks + l16];
+            const _Float16* vrow = sl >= 0 ? (rows + (size_t)sl * MLA_ROW + 128 * w + hi * 8) : nullptr;
+            uint4 v_cur = vrow ? *reinterpret_cast<const uint4*>(vrow) : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
             for (int ct = 0; ct < 8; ++ct) {
-                const int col = 16 * ct + l16;
-                hv16 bf;
+                uint4 v_nxt = (ct + 1 < 8 && vrow) ? *reinterpret_cast<const uint4*>(vrow + 16 * (ct + 1)) : make_uint4(0u, 0u, 0u, 0u);
+                const _Float16* vh = reinterpret_cast<const _Float16*>(&v_cur);
+                const int cbase = hi * 8;
 #pragma unroll
-                for (int kk = 0; kk < 16; ++kk) bf[kk] = sV[w][kk][col];
+                for (int j = 0; j < 8; ++j) svw[(cbase + j) * 24 + l16] = vh[j];
+                asm volatile("" ::: "memory");
+                hv16 bf = ld_hv16(&svw[l16 * 24]);
                 o[ct] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, bf, o[ct]);
+                v_cur = v_nxt;
             }
         }
         __syncthreads();
@@ -556,11 +527,14 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
 #pragma unroll
         for (int s = 0; s < 2; ++s) {
             const int ie = i0 + 16 * w + 8 * s + g;
+            bool v = ie < nk;
+            if (mode == MLA_WINDOW) v = v && (lo_al + ie >= lo);
             int slot = 0;
             if (ie < nk) {
                 const int lp = mode == MLA_CAUSAL ? ie : (mode == MLA_WINDOW ? lo_al + ie : klist[ie]);
                 slot = mla_tree_slot(a, t, lp);
             }
+            if (c == 0) s_slot[16 * w + 8 * s + g] = v ? slot : -1;
             kr[s] = rows + (size_t)slot * MLA_ROW;
         }
 #pragma unroll
@@ -1021,7 +995,7 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
     constexpr int N = MODE == 0 ? MLA_KV_LORA : MLA_VHEAD;
     __shared__ __align__(16) half_t sB[HG_BN * HG_LD];
     __shared__ __align__(16) half_t sA[HG_BM * HG_LD];
-    const int h = blockIdx.z, t0 = blockIdx.y * HG_BM, n0 = blockIdx.x * HG_BN;
+    const int h = blockIdx.y, t0 = blockIdx.z * HG_BM, n0 = blockIdx.x * HG_BN;
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
     const int wm = wave & 3, wn = wave >> 2;
     const half_t* B = reinterpret_cast<const half_t*>(Bw) + ((size_t)h * N + n0) * K;
@@ -1182,6 +1156,69 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
         }
     }
 }
+
+#if !HY4_CUDA
+// Single-pass gfx1151 WMMA kernels for prefill: each block reads q_b (prep_q) or ctx (vup) ONCE instead of 8x / 4x across N tiles.
+// Block ordering (NH, M/BM) keeps all heads of one token tile contiguous in L2/MALL.
+__global__ void __launch_bounds__(256) k_head_gemm_prep_q(const float* __restrict__ q_b, const __half* __restrict__ wk_bt, __half* __restrict__ qa, int M, int NH, int p0, float theta) {
+    __shared__ __align__(16) _Float16 sA[64 * 200];  // 25.6 KB: entire [64 tokens][192 nope] loaded once
+    __shared__ __align__(16) _Float16 sB[64 * 40];   //  5.1 KB: [64 out cols][32 k] chunk (total 30.7 KB < 32 KB -> 2 blk/CU)
+    const int h = blockIdx.x, t0 = blockIdx.y * 64;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15;
+    const int wm = wave & 1, wn = wave >> 1;  // 2 x 4 waves -> wave owns 32 tokens x 16 cols
+    // 1. Load q_b[t0..t0+63][h][0..191] once into sA
+#pragma unroll
+    for (int i = 0; i < 12; ++i) {
+        const int idx = tid + 256 * i, r = idx / 48, c4 = (idx - r * 48) * 4;
+        const int t = min(t0 + r, M - 1);
+        const float4 v = *reinterpret_cast<const float4*>(q_b + ((size_t)t * NH + h) * MLA_QHEAD + c4);
+        _Float16* d = &sA[r * 200 + c4];
+        d[0] = (_Float16)v.x; d[1] = (_Float16)v.y; d[2] = (_Float16)v.z; d[3] = (_Float16)v.w;
+    }
+    // 2. Write rope(q_pe) for these 64 tokens
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int idx = tid + 256 * i, tt = idx >> 5, p = idx & 31, t = t0 + tt;
+        if (t < M) {
+            const float* qp = q_b + ((size_t)t * NH + h) * MLA_QHEAD + MLA_NOPE + 2 * p;
+            float o0, o1;
+            rope_pair(qp[0], qp[1], p0 + t, p, theta, o0, o1);
+            *reinterpret_cast<__half2*>(qa + ((size_t)t * NH + h) * MLA_ROW + MLA_KV_LORA + 2 * p) = __floats2half2_rn(o0, o1);
+        }
+    }
+    __syncthreads();
+    const int br = tid >> 2, bc = (tid & 3) * 8;
+    const _Float16* Bhead = reinterpret_cast<const _Float16*>(wk_bt) + (size_t)h * MLA_KV_LORA * MLA_NOPE;
+    for (int n0 = 0; n0 < MLA_KV_LORA; n0 += 64) {
+        const _Float16* B = Bhead + (size_t)n0 * MLA_NOPE;
+        fv8 acc0 = fv8{}, acc1 = fv8{};
+        uint4 vb = *reinterpret_cast<const uint4*>(B + (size_t)br * MLA_NOPE + bc);
+#pragma unroll
+        for (int k0 = 0; k0 < MLA_NOPE; k0 += 32) {
+            *reinterpret_cast<uint4*>(&sB[br * 40 + bc]) = vb;
+            __syncthreads();
+            if (k0 + 32 < MLA_NOPE) vb = *reinterpret_cast<const uint4*>(B + (size_t)br * MLA_NOPE + k0 + 32 + bc);
+#pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                hv16 a0 = ld_hv16(&sA[(wm * 32 + l16) * 200 + k0 + kk * 16]);
+                hv16 a1 = ld_hv16(&sA[(wm * 32 + 16 + l16) * 200 + k0 + kk * 16]);
+                hv16 b0 = ld_hv16(&sB[(wn * 16 + l16) * 40 + kk * 16]);
+                acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc0);
+                acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b0, acc1);
+            }
+            __syncthreads();
+        }
+        const int col = n0 + wn * 16 + l16;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int r0 = t0 + wm * 32 + acc_m(e, lane);
+            if (r0 < M) qa[((size_t)r0 * NH + h) * MLA_ROW + col] = __float2half(acc0[e]);
+            const int r1 = r0 + 16;
+            if (r1 < M) qa[((size_t)r1 * NH + h) * MLA_ROW + col] = __float2half(acc1[e]);
+        }
+    }
+}
+#endif  // !HY4_CUDA
 #endif  // HY4_MMA
 // ---- 4. v up-projection + gate -----------------------------------------------------------------------------------------------------------------------
 template <int TT>
@@ -1227,8 +1264,16 @@ __global__ void __launch_bounds__(256) k_vup(const __half* __restrict__ ctx, con
 // kv_b_proj is an S_K tensor [NH*448][512] (2 super-blocks per row). Per-lane decode of 8 weights is the same packed-fp16 scheme as the S_K GEMV kernels
 // (integer q as the low mantissa of 0x6400 patterns, exact (q-H) in fp16; the sub-group scale eff = D*u/255 is applied in fp32).
 namespace dq {
-__device__ __forceinline__ uint32_t ld16u(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
-__device__ __forceinline__ uint32_t ld32u2(const uint8_t* p) { return ld16u(p) | (ld16u(p + 2) << 16); }
+__device__ __forceinline__ uint32_t ld16u(const uint8_t* p) {
+    uint16_t v;
+    memcpy(&v, p, 2);
+    return (uint32_t)v;
+}
+__device__ __forceinline__ uint32_t ld32u2(const uint8_t* p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
 template <int FMT> struct Info;
 template <> struct Info<2> { static constexpr int SB = 70; static constexpr float H = 1.5f; };
 template <> struct Info<3> { static constexpr int SB = 102; static constexpr float H = 3.5f; };
@@ -1237,10 +1282,8 @@ template <> struct Info<5> { static constexpr int SB = 166; static constexpr flo
 template <> struct Info<6> { static constexpr int SB = 198; static constexpr float H = 31.5f; };
 template <> struct Info<8> { static constexpr int SB = 262; static constexpr float H = 0.0f; };
 
-// the 8 weights 8u..8u+7 of a super-block payload as 8 floats (q-H), not yet scaled
 template <int FMT>
-__device__ __forceinline__ void decode8(const uint8_t* pl, int u, float (&w)[8]) {
-    uint32_t q[8];
+__device__ __forceinline__ void decode_q8(const uint8_t* pl, int u, uint32_t (&q)[8]) {
     if (FMT == 2) {
         const uint32_t x = ld16u(pl + 2 * u);
 #pragma unroll
@@ -1269,8 +1312,31 @@ __device__ __forceinline__ void decode8(const uint8_t* pl, int u, float (&w)[8])
             q[4 + k] = ((d1 >> (8 * k)) & 0xFFu) ^ 0x80u;
         }
     }
+}
+
+// the 8 weights 8u..8u+7 of a super-block payload as 8 floats (q-H), not yet scaled
+template <int FMT>
+__device__ __forceinline__ void decode8(const uint8_t* pl, int u, float (&w)[8]) {
+    uint32_t q[8];
+    decode_q8<FMT>(pl, u, q);
 #pragma unroll
     for (int k = 0; k < 8; ++k) w[k] = FMT == 8 ? (float)((int)q[k] - 128) : ((float)q[k] - Info<FMT>::H);
+}
+
+// packed half2 weights (q-H pairs) for v_dot2_f32_f16 (exact for all S2..S8)
+template <int FMT>
+__device__ __forceinline__ void decode8_h2(const uint8_t* pl, int u, uint32_t (&wp)[4]) {
+    uint32_t q[8];
+    decode_q8<FMT>(pl, u, q);
+    const uint32_t mag = h2_splat(FMT == 8 ? 1152.0f : 1024.0f);
+    const uint32_t hh = h2_splat(Info<FMT>::H);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t pat = 0x64006400u | q[2 * i] | (q[2 * i + 1] << 16);
+        uint32_t w = h2_sub(pat, mag);
+        if (FMT != 8) w = h2_sub(w, hh);
+        wp[i] = w;
+    }
 }
 
 __device__ __forceinline__ float sb_scale(const uint8_t* blk, int lane) {
@@ -1280,14 +1346,20 @@ __device__ __forceinline__ float sb_scale(const uint8_t* blk, int lane) {
 }
 }  // namespace dq
 
-// qa[t][h][0:512] = sum_{i<192} q_nope[t][h][i] * Wk[h*448+i][:]   (+ rope part). Block = (head), 8 waves, wave w owns rows 24w..24w+23; partial sums reduced through LDS.
+// qa[t][h][0:512] = sum_{i<192} q_nope[t][h][i] * Wk[h*448+i][:]   (+ rope part). Block = (head, sb), 8 waves, wave w owns rows 24w..24w+23; partial sums reduced through LDS.
 template <int FMT, int MT>
 __global__ void __launch_bounds__(256) k_prep_q_dec(const uint8_t* __restrict__ kvb, const float* __restrict__ q_b, __half* __restrict__ qa, int M, int NH, int p0, float theta,
                                                       TreePos tp, const int* __restrict__ p0_dev = nullptr) {
     // grid (NH, 2): block (h, s) handles the 256 latent columns of super-block s (the two halves of every row are independent: same per-column summation order as one block doing both)
     constexpr int SB = dq::Info<FMT>::SB;
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    __shared__ float qs[MT][MLA_NOPE];
     __shared__ float red[8][256 + 1];
+    for (int idx = tid; idx < MT * MLA_NOPE; idx += 256) {
+        const int m = idx / MLA_NOPE, i = idx % MLA_NOPE;
+        qs[m][i] = m < M ? q_b[((size_t)m * NH + h) * MLA_QHEAD + i] : 0.f;
+    }
+    __syncthreads();
     float acc[MT][8];
 #pragma unroll
     for (int m = 0; m < MT; ++m)
@@ -1295,17 +1367,13 @@ __global__ void __launch_bounds__(256) k_prep_q_dec(const uint8_t* __restrict__ 
         for (int k = 0; k < 8; ++k) acc[m][k] = 0.f;
     for (int ii = 0; ii < 24; ++ii) {
         const int i = wave * 24 + ii;
-        const uint8_t* row = kvb + ((size_t)h * 448 + i) * (2 * SB);
-        float qv[MT];
-#pragma unroll
-        for (int m = 0; m < MT; ++m) qv[m] = m < M ? q_b[((size_t)m * NH + h) * MLA_QHEAD + i] : 0.f;
-        const uint8_t* blk = row + s * SB;
+        const uint8_t* blk = kvb + ((size_t)h * 448 + i) * (2 * SB) + s * SB;
         const float eff = dq::sb_scale(blk, lane);
         float w[8];
         dq::decode8<FMT>(blk + 6, lane, w);
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
-            const float qe = qv[m] * eff;
+            const float qe = qs[m][i] * eff;
 #pragma unroll
             for (int k = 0; k < 8; ++k) acc[m][k] += qe * w[k];
         }
@@ -1339,21 +1407,19 @@ __global__ void __launch_bounds__(256) k_prep_q_dec(const uint8_t* __restrict__ 
     }
 }
 
-// o[t][h][j] = sigmoid(gate) * sum_c Wv[h*448+192+j][c] * ctx[t][h][c]. grid (NH, 256/16), 8 waves x 2 rows
+// o[t][h][j] = sigmoid(gate) * sum_c Wv[h*448+192+j][c] * ctx[t][h][c]. grid (NH, 256/16), 8 waves x 2 rows.
+// Stages ctx[0..MT-1][h][0..511] in LDS (<= 8 KB) and uses packed fdot2 (zero xv VGPRs, 100% bit-identical across MT = 1..8).
 template <int FMT, int MT>
 __global__ void __launch_bounds__(256) k_vup_dec(const uint8_t* __restrict__ kvb, const __half* __restrict__ ctx, const float* __restrict__ gate, __half* __restrict__ o, int M, int NH) {
     constexpr int SB = dq::Info<FMT>::SB;
-    const int h = blockIdx.x, wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int h = blockIdx.x, tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
     const int j0 = (blockIdx.y * 8 + wave) * 2;
-    float xv[MT][2][8];
-#pragma unroll
-    for (int m = 0; m < MT; ++m)
-#pragma unroll
-        for (int s = 0; s < 2; ++s) {
-            const __half* xp = ctx + ((size_t)m * NH + h) * MLA_KV_LORA + s * 256 + lane * 8;
-#pragma unroll
-            for (int k = 0; k < 8; ++k) xv[m][s][k] = m < M ? __half2float(xp[k]) : 0.f;
-        }
+    __shared__ __align__(16) uint4 xs[MT * 64];
+    for (int idx = tid; idx < MT * 64; idx += 256) {
+        const int m = idx >> 6, c8 = idx & 63;
+        xs[idx] = m < M ? *reinterpret_cast<const uint4*>(ctx + ((size_t)m * NH + h) * MLA_KV_LORA + c8 * 8) : make_uint4(0u, 0u, 0u, 0u);
+    }
+    __syncthreads();
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
         const uint8_t* row = kvb + ((size_t)h * 448 + 192 + j0 + r) * (2 * SB);
@@ -1364,13 +1430,16 @@ __global__ void __launch_bounds__(256) k_vup_dec(const uint8_t* __restrict__ kvb
         for (int s = 0; s < 2; ++s) {
             const uint8_t* blk = row + s * SB;
             const float eff = dq::sb_scale(blk, lane);
-            float w[8];
-            dq::decode8<FMT>(blk + 6, lane, w);
+            uint32_t wp[4];
+            dq::decode8_h2<FMT>(blk + 6, lane, wp);
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
+                const uint4 xv = xs[m * 64 + s * 32 + lane];
                 float p = 0.f;
-#pragma unroll
-                for (int k = 0; k < 8; ++k) p += w[k] * xv[m][s][k];
+                p = h2_dot_f32(wp[0], xv.x, p);
+                p = h2_dot_f32(wp[1], xv.y, p);
+                p = h2_dot_f32(wp[2], xv.z, p);
+                p = h2_dot_f32(wp[3], xv.w, p);
                 acc[m] += eff * p;
             }
         }
@@ -1393,6 +1462,7 @@ static void launch_prep_dec(hipStream_t s, const void* kvb, const float* q_b, __
     if (M <= 1) hipLaunchKernelGGL((k_prep_q_dec<FMT, 1>), dim3(NH, 2), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta, tp, p0_dev);
     else if (M <= 2) hipLaunchKernelGGL((k_prep_q_dec<FMT, 2>), dim3(NH, 2), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta, tp, p0_dev);
     else if (M <= 4) hipLaunchKernelGGL((k_prep_q_dec<FMT, 4>), dim3(NH, 2), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta, tp, p0_dev);
+    else if (M <= 6) hipLaunchKernelGGL((k_prep_q_dec<FMT, 6>), dim3(NH, 2), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta, tp, p0_dev);
     else hipLaunchKernelGGL((k_prep_q_dec<FMT, 8>), dim3(NH, 2), dim3(256), 0, s, (const uint8_t*)kvb, q_b, qa, M, NH, p0, theta, tp, p0_dev);
 }
 template <int FMT>
@@ -1401,6 +1471,7 @@ static void launch_vup_dec(hipStream_t s, const void* kvb, const __half* ctx, co
     if (M <= 1) hipLaunchKernelGGL((k_vup_dec<FMT, 1>), grid, dim3(256), 0, s, (const uint8_t*)kvb, ctx, gate, o, M, NH);
     else if (M <= 2) hipLaunchKernelGGL((k_vup_dec<FMT, 2>), grid, dim3(256), 0, s, (const uint8_t*)kvb, ctx, gate, o, M, NH);
     else if (M <= 4) hipLaunchKernelGGL((k_vup_dec<FMT, 4>), grid, dim3(256), 0, s, (const uint8_t*)kvb, ctx, gate, o, M, NH);
+    else if (M <= 6) hipLaunchKernelGGL((k_vup_dec<FMT, 6>), grid, dim3(256), 0, s, (const uint8_t*)kvb, ctx, gate, o, M, NH);
     else hipLaunchKernelGGL((k_vup_dec<FMT, 8>), grid, dim3(256), 0, s, (const uint8_t*)kvb, ctx, gate, o, M, NH);
 }
 }  // namespace
@@ -1602,7 +1673,7 @@ void mla_vup(hipStream_t s, const __half* ctx, const __half* wv_b, const float* 
 #endif
 #if HY4_MMA
     if (!g_mla_force_simple) {
-        hipLaunchKernelGGL(k_head_gemm<1>, dim3(MLA_VHEAD / HG_BN, (M + HG_BM - 1) / HG_BM, NH), dim3(256), 0, s, (const void*)ctx, wv_b, gate, o, M, NH, 0, 0.f);
+        hipLaunchKernelGGL(k_head_gemm<1>, dim3(MLA_VHEAD / HG_BN, NH, (M + HG_BM - 1) / HG_BM), dim3(256), 0, s, (const void*)ctx, wv_b, gate, o, M, NH, 0, 0.f);
         return;
     }
 #endif
@@ -1617,7 +1688,11 @@ void mla_transpose_wk(hipStream_t s, const __half* wk_b, __half* wk_bt, int NH) 
 }
 
 void mla_prep_q_t(hipStream_t s, const float* q_b, const __half* wk_bt, __half* qa, int M, int NH, int p0, float theta) {
-    hipLaunchKernelGGL(k_head_gemm<0>, dim3(MLA_KV_LORA / HG_BN, (M + HG_BM - 1) / HG_BM, NH), dim3(256), 0, s, (const void*)q_b, wk_bt, (const float*)nullptr, qa, M, NH, p0, theta);
+#if !HY4_CUDA
+    hipLaunchKernelGGL(k_head_gemm_prep_q, dim3(NH, (M + 63) / 64), dim3(256), 0, s, q_b, wk_bt, qa, M, NH, p0, theta);
+#else
+    hipLaunchKernelGGL(k_head_gemm<0>, dim3(MLA_KV_LORA / HG_BN, NH, (M + HG_BM - 1) / HG_BM), dim3(256), 0, s, (const void*)q_b, wk_bt, (const float*)nullptr, qa, M, NH, p0, theta);
+#endif
 }
 #endif
 
