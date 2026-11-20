@@ -70,6 +70,44 @@ struct EngramDev {  // per module, gathered at init
     float* hcs = nullptr;      // [4][3072]
 };
 
+// Tree-8 speculative verification descriptor (M <= 8 nodes rooted at anchor node 0, topological order parent[i] < i).
+struct TreeSpec {
+    int M = 0;
+    int32_t tok[8] = {};
+    int8_t parent[8] = {};
+    uint8_t depth[8] = {};
+    uint8_t anc[8][8] = {};
+    int max_depth() const {
+        int md = 0;
+        for (int i = 0; i < M; ++i) md = std::max(md, (int)depth[i]);
+        return md;
+    }
+    void build_anc() {
+        for (int i = 0; i < M; ++i) {
+            int cur = i;
+            for (int d = (int)depth[i]; d >= 0; --d) {
+                anc[i][d] = (uint8_t)cur;
+                cur = cur >= 0 ? (int)parent[cur] : -1;
+            }
+        }
+    }
+    TreePos to_mla_pos() const {
+        TreePos tp;
+        tp.n = M;
+        for (int i = 0; i < M; ++i) tp.depth[i] = depth[i];
+        return tp;
+    }
+    idx::IdxTree to_idx_tree() const {
+        idx::IdxTree it;
+        it.n = M;
+        for (int i = 0; i < M; ++i) {
+            it.depth[i] = depth[i];
+            for (int d = 0; d < 8; ++d) it.anc[i][d] = anc[i][d];
+        }
+        return it;
+    }
+};
+
 class Runner {
 public:
     GpuModel& g;
@@ -146,11 +184,15 @@ public:
     int index_topk = 2048;  // selection starts when the sequence is longer than this
     // indexer state
     std::vector<__half*> ivg, pooled;
+    __half* tmp_pooled = nullptr;  // [16][128] per-node temporary pooled keys during Tree-8 verify
     float *ik_f = nullptr, *iv_f = nullptr, *ig_f = nullptr, *iq_f = nullptr, *hw_f = nullptr, *score = nullptr;
     __half *ik_h = nullptr, *iq_h = nullptr;
     int32_t *keys = nullptr, *nkeys = nullptr;
     size_t ldS = 0;
     bool last_use_list = false;
+    // opt-in tail-skip (STRATA_HY4_TAIL_SKIP / --tail-skip): 0 = OFF by default (100% lossless); 1..15 skips missed CPU-tier experts routed only at rank >= tail_skip
+    int tail_skip = 0;
+    uint64_t tail_skipped_pairs = 0;
 
     // DFly2 hook: the top-index_topk key lists of target layers 25,29,33,37,41 for the last (up to 16) rows of the most recent forward chunk (hy4_dfly2.hip.h reads them)
     bool dfly_cap = false;
@@ -1178,9 +1220,21 @@ public:
                 h_use.assign((size_t)Tc * 16, 0);
             }
             if (!getenv("STRATA_CPUEXP_ACT")) cpu.set_hi_activations(true);  // two-term int8 activations: ~GPU-exact quality (KL 1e-3 vs 7e-3) for ~1% decode cost
+            if (h_use.empty()) h_use.assign((size_t)Tc * 16, 1);
             skd::moe_has_cpu() = 1;
             hyb = true;
             fprintf(stderr, "[hybrid] %llu experts (%.2f GB) in host RAM computed by %d CPU threads\n", (unsigned long long)cpu.resident_count(), cpu.arena_bytes() / 1e9, cpu.n_threads());
+        }
+        // STRATA_HY4_TAIL_SKIP: OFF by default (0); explicit opt-in only (1..15 skips CPU/cold-tier experts whose min rank in a verify/decode window is >= tail_skip)
+        if (tail_skip <= 0) {
+            const char* ts_env = std::getenv("STRATA_HY4_TAIL_SKIP");
+            if (ts_env && ts_env[0] != '\0') {
+                int v = std::atoi(ts_env);
+                tail_skip = (v >= 1 && v <= 15) ? v : 0;
+            }
+        }
+        if (tail_skip > 0) {
+            fprintf(stderr, "[runner] STRATA_HY4_TAIL_SKIP=%d is ON (opt-in): missed CPU/cold-tier experts routed only at rank >= %d in decode/verify are skipped\n", tail_skip, tail_skip);
         }
         // kv caches (incremental 16K-token VRAM growth when HY4_KV_INIT_SLOTS is set)
         ring = ((512 + Tc + 15) / 16) * 16;
@@ -1236,6 +1290,7 @@ public:
         hw_f = dalloc<float>((size_t)Tc * 16);
         keys = dalloc<int32_t>((size_t)Tc * (index_topk + 8));
         nkeys = dalloc<int32_t>((size_t)Tc);
+        tmp_pooled = dalloc<__half>((size_t)16 * 128);
         // Single-layer reusable FP16 scratch for prefill (T > 8); decode reads quantized kv_b_proj directly (saves 1.035 GB VRAM!)
         {
             const int max_NH = std::max(c.heads_swa, c.heads_sparse);
@@ -1312,6 +1367,7 @@ public:
         std::future<void> fut;
         hipEvent_t used = nullptr;  // recorded after the uploads of this slot were enqueued
         bool staged = false, ok_rest = true;  // decode: module 0 is published through pm0 / fm0 as soon as it is loaded, modules 1..3 follow (fut)
+        TreeSpec tree{};                      // tree.M > 0: Tree-8 verify (engram_hash_tree)
         std::promise<void> pm0;
         std::future<void> fm0;
     };
@@ -1331,14 +1387,16 @@ public:
     void ep_compute(EPrep* e, const int32_t* tok_all, int p0, int T) {
         std::string err;
         e->ok = true;
+        auto hash_mo = [&](int mo, uint64_t* dst_ids, uint8_t* dst_val) {
+            if (e->tree.M > 0) engram_hash_tree(emeta, mo, tok_all, p0, e->tree.tok, e->tree.parent, T, dst_ids, dst_val);
+            else engram_hash(emeta, mo, tok_all, p0, p0 + T, dst_ids, dst_val);
+            if (vis && e->tree.M == 0) vis->mask_engram(dst_val, p0, T);
+        };
         if (T <= 8 && e->staged) {  // decode / verify window: module 0 first (published through pm0), then modules 1..3 in one batch
             const size_t per = (size_t)T * 16;
             auto fetch_modules = [&](int m0, int m1) -> bool {
                 std::vector<uint64_t> ids((size_t)(m1 - m0) * per);
-                for (int mo = m0; mo < m1; ++mo) {
-                    engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data() + (size_t)(mo - m0) * per, e->valid + (size_t)mo * Tc * 16);
-                    if (vis) vis->mask_engram(e->valid + (size_t)mo * Tc * 16, p0, T);  // HY4-VISION hook (merge: the tuned decode path needs it too)
-                }
+                for (int mo = m0; mo < m1; ++mo) hash_mo(mo, ids.data() + (size_t)(mo - m0) * per, e->valid + (size_t)mo * Tc * 16);
                 std::vector<uint8_t> tmp(ids.size() * 100);
                 if (!eio.fetch_raw(ids.data(), ids.size(), tmp.data(), err)) return false;
                 for (int mo = m0; mo < m1; ++mo) std::memcpy(e->raw + (size_t)mo * Tc * 16 * 100, tmp.data() + (size_t)(mo - m0) * per * 100, per * 100);
@@ -1361,10 +1419,7 @@ public:
         if (T <= 8) {  // sync decode / verify window without a prefetch: the rows of all 4 modules in ONE fetch
             const size_t per = (size_t)T * 16;
             std::vector<uint64_t> ids(4 * per);
-            for (int mo = 0; mo < 4; ++mo) {
-                engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data() + mo * per, e->valid + (size_t)mo * Tc * 16);
-                if (vis) vis->mask_engram(e->valid + (size_t)mo * Tc * 16, p0, T);  // HY4-VISION hook (merge: the tuned decode path needs it too)
-            }
+            for (int mo = 0; mo < 4; ++mo) hash_mo(mo, ids.data() + mo * per, e->valid + (size_t)mo * Tc * 16);
             std::vector<uint8_t> tmp(4 * per * 100);
             if (!eio.fetch_raw(ids.data(), ids.size(), tmp.data(), err)) {
                 e->ok = false;
@@ -1377,8 +1432,7 @@ public:
         for (int mo = 0; mo < 4; ++mo) {
             std::vector<uint64_t> ids((size_t)T * 16);
             uint8_t* valid = e->valid + (size_t)mo * Tc * 16;
-            engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), valid);
-            if (vis) vis->mask_engram(valid, p0, T);  // HY4-VISION hook: no Engram contribution at image positions
+            hash_mo(mo, ids.data(), valid);
             uint8_t* raw = e->raw + (size_t)mo * Tc * 16 * 100;
             if (!eio.fetch_raw(ids.data(), ids.size(), raw, err)) {
                 e->ok = false;
@@ -1388,7 +1442,7 @@ public:
         }
     }
     // start fetching the rows of chunk [p0, p0+T) in the background (tokens must be final and stay valid)
-    void prefetch_engram(const int32_t* tok_all, int p0, int T) {
+    void prefetch_engram(const int32_t* tok_all, int p0, int T, const TreeSpec* tree = nullptr) {
         if (!engram_ready) return;
         EPrep& e = ep[ep_next];
         if (e.fut.valid()) e.fut.wait();
@@ -1398,6 +1452,7 @@ public:
         e.pending = true;
         e.staged = T <= 8;
         e.ok_rest = true;
+        e.tree = tree ? *tree : TreeSpec{};
         if (e.staged) {
             e.pm0 = std::promise<void>();
             e.fm0 = e.pm0.get_future();
@@ -1405,11 +1460,11 @@ public:
         e.fut = std::async(std::launch::async, [this, &e, tok_all, p0, T]() { ep_compute(&e, tok_all, p0, T); });
         ep_next ^= 1;
     }
-    bool engram_prep(const int32_t* tok_all, int p0, int T, std::string& err) {
+    bool engram_prep(const int32_t* tok_all, int p0, int T, std::string& err, const TreeSpec* tree = nullptr) {
         double t0 = now_s();
         EPrep* e = nullptr;
         for (int s = 0; s < 2; ++s)
-            if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T) e = &ep[s];
+            if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T && (ep[s].tree.M == (tree ? tree->M : 0))) e = &ep[s];
         if (e && e->staged) {
             // decode: only module 0 (needed at layer 1) is awaited here; modules 1..3 keep loading while the GPU runs layers 1..10 (engram_prep_rest, before module 1's layer)
             e->fm0.get();
@@ -1435,6 +1490,7 @@ public:
             HCK(hipEventSynchronize(e->used));
             ep_next ^= 1;
             e->staged = false;  // synchronous fetch: no module-0-first publishing
+            e->tree = tree ? *tree : TreeSpec{};
             ep_compute(e, tok_all, p0, T);
         }
         if (!e->ok) {
@@ -1523,7 +1579,7 @@ public:
     }
 
     // IndexPool: cache iv/ig of the chunk's tokens and pool the groups completed by this chunk
-    void idx_update(int il, int p0, int T) {
+    void idx_update(int il, int p0, int T, const TreeSpec* tree = nullptr) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".token_key_projection.weight", cur_h, ik_f, T);  // [T][128]
         hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(128), 0, st, ik_f, (const float*)tw(p + ".token_key_norm.weight"), (float*)nullptr, ik_h, 128, c.rms_eps);
@@ -1531,6 +1587,12 @@ public:
         lin(p + ".key_gate_projection.weight", ik_h, ig_f, T);
         const int* p0d = capturing ? &d_step->p0 : nullptr;
         hipLaunchKernelGGL(idx::k_idx_store, dim3(T), dim3(128), 0, st, iv_f, ig_f, ivg[il], p0, p0d);
+        if (tree && tree->M > 0) {
+            // Tree verify: compute temporary per-node pooled keys for groups >= p0/4 along each node's ancestor chain (committed later by commit_tree_path)
+            hipLaunchKernelGGL(idx::k_idx_pool_tree, dim3(T, 2), dim3(128), 0, st, ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), tmp_pooled, p0,
+                               tree->to_idx_tree(), (float)theta(il), c.rms_eps);
+            return;
+        }
         if (capturing) {
             const int ngrp = (T + 3) / 4;
             hipLaunchKernelGGL(idx::k_idx_pool, dim3(ngrp), dim3(128), 0, st, ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], 0,
@@ -1545,11 +1607,22 @@ public:
     }
 
     // per-token key lists for the chunk (sparse layer, sequence longer than index_topk)
-    void idx_select(int il, int p0, int T) {
+    void idx_select(int il, int p0, int T, const TreeSpec* tree = nullptr) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         const int* p0d = capturing ? &d_step->p0 : nullptr;
         const int* Gd = capturing ? &d_step->idx_G : nullptr;
         lin(p + ".query_projection.weight", qr_h, iq_f, T);  // [T][16*128]
+        if (tree && tree->M > 0) {
+            const idx::IdxTree it = tree->to_idx_tree();
+            hipLaunchKernelGGL(idx::k_idx_q_rope_tree, dim3(T, 16), dim3(128), 0, st, iq_f, iq_h, p0, it, (float)theta(il));
+            lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
+            int G = (p0 + tree->max_depth() + 1) / 4;
+            if (G < 1) G = 1;
+            hipLaunchKernelGGL(idx::k_idx_score_tree, dim3((G + 63) / 64, T), dim3(64), 0, st, iq_h, hw_f, pooled[il], tmp_pooled, score, p0, it, G, (int)ldS, 1.0f / sqrtf((float)(128 * 16)));
+            int n_top = index_topk / c.kpool - 1;
+            hipLaunchKernelGGL(idx::k_idx_select_tree, dim3(T), dim3(256), 0, st, score, (int)ldS, p0, it, n_top, index_topk, keys, nkeys);
+            return;
+        }
         if (!capturing && vis && vis->needs_fix(p0, T)) vis->iq_rope(st, iq_f, iq_h, T, p0, (float)theta(il));  // HY4-VISION hook: 3D positions
         else hipLaunchKernelGGL(idx::k_idx_q_rope, dim3(T, 16), dim3(128), 0, st, iq_f, iq_h, p0, (float)theta(il), p0d);
         lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);  // [T][16]
@@ -1575,11 +1648,13 @@ public:
         }
     }
 
-    void attention_layer(int il, int p0, int T) {
+    void attention_layer(int il, int p0, int T, const TreeSpec* tree = nullptr) {
         const std::string pa = L(il) + ".self_attn";
         const int NH = heads(il);
         const bool swa = c.is_swa[il];
         const int* p0d = capturing ? &d_step->p0 : nullptr;
+        const bool is_tree = tree != nullptr && tree->M > 0;
+        const TreePos tp = is_tree ? tree->to_mla_pos() : TreePos{};
         // iHC pre + input_layernorm
         const float* hfn = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_fn");
         const float* hsc = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_scale");
@@ -1602,24 +1677,25 @@ public:
         const int cslots = swa ? ring : slots_sparse;
         { PS _q(this, "mla_write_kv");
           if (p0d) mla_write_kv_d(st, kv_a_out, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0d, swa ? ring : 0, (float)theta(il), c.rms_eps);
-          else mla_write_kv(st, kv_a_out, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
+          else mla_write_kv(st, kv_a_out, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps, tp); }
         const bool dec = T <= 8;
         const int kvfmt = ti(pa + ".kv_b_proj.weight").fmt;
         if (!dec) { PS _q(this, "dequant_kvb"); dequant_kvb_layer(il); }
         { PS _q(this, "mla_prep_q");
           if (dec) {
               if (p0d) mla_prep_q_dec_d(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0d, (float)theta(il));
-              else mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il));
+              else mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il), tp);
           } else mla_prep_q(st, F2, wk_layer, qa_h, T, NH, p0, (float)theta(il)); }
-        if (!capturing && vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
+        if (!is_tree && !capturing && vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
             vis->fix_k(st, kv_a_out, cache, T, p0, swa ? ring : 0, (float)theta(il));
             vis->fix_q(st, F2, qa_h, T, NH, p0, (float)theta(il));
         }
         bool use_list = false;
         if (!swa && index_on) {
-            { PS _q(this, "idx_update"); idx_update(il, p0, T); }
-            if (p0 + T > index_topk) {
-                { PS _q(this, "idx_select"); idx_select(il, p0, T); }
+            { PS _q(this, "idx_update"); idx_update(il, p0, T, tree); }
+            const int end_pos = is_tree ? (p0 + tree->max_depth() + 1) : (p0 + T);
+            if (end_pos > index_topk) {
+                { PS _q(this, "idx_select"); idx_select(il, p0, T, tree); }
                 use_list = true;
             }
         }
@@ -1636,6 +1712,13 @@ public:
         a.window = c.window;
         a.ring = swa ? ring : 0;
         a.cache_slots = cslots;
+        if (is_tree) {
+            a.tree_nodes = tree->M;
+            for (int i = 0; i < tree->M; ++i) {
+                a.tree_depth[i] = tree->depth[i];
+                for (int d = 0; d < 8; ++d) a.tree_anc[i][d] = tree->anc[i][d];
+            }
+        }
         if (use_list) {
             a.keys = keys;
             a.nkeys = nkeys;
@@ -1799,13 +1882,29 @@ public:
         double t0 = now_s();
         HCK(hipEventSynchronize(ev_hyb));
         const uint8_t* use_ptr = nullptr;
-        if (vcache_nslots > 1) {
-            const size_t np = (size_t)T * 16;
-            for (size_t i = 0; i < np; ++i) {
-                const int e = h_idx[i];
-                v_use_buf[i] = (e >= 0 && e < 512 && !vram_flag[ml * 512 + e]) ? 1 : 0;
+        const bool do_tail = (tail_skip > 0 && T <= 16);
+        if (vcache_nslots > 1 || do_tail) {
+            int minr[512];
+            if (do_tail) {
+                for (int e = 0; e < 512; ++e) minr[e] = 99;
+                for (int t = 0; t < T; ++t)
+                    for (int s = 0; s < 16; ++s) {
+                        const int e = h_idx[(size_t)t * 16 + s];
+                        if (e >= 0 && e < 512 && s < minr[e]) minr[e] = s;
+                    }
             }
-            use_ptr = v_use_buf.data();
+            for (int t = 0; t < T; ++t)
+                for (int s = 0; s < 16; ++s) {
+                    const size_t i = (size_t)t * 16 + s;
+                    const int e = h_idx[i];
+                    uint8_t u = (e >= 0 && e < 512 && !(vcache_nslots > 1 && vram_flag[ml * 512 + e])) ? 1 : 0;
+                    if (u && do_tail && g.experts[(size_t)ml * 512 + e].tier >= 2 && minr[e] >= tail_skip) {
+                        u = 0;
+                        ++tail_skipped_pairs;
+                    }
+                    h_use[i] = u;
+                }
+            use_ptr = h_use.data();
         }
         cpu.submit(ml, T, h_z, h_idx, h_w, use_ptr, h_zcpu);
         if (vcache_nslots > 1) vcache_note_decode(ml, T, h_idx);  // hidden behind CPU expert execution!
@@ -1983,6 +2082,52 @@ public:
         if (need > max_ctx + 8) return false;
         if (!kv_is_host && need > kv_alloc_pos) kv_grow_to(need);
         return need <= slots_sparse;
+    }
+    // Commit accepted tree path `path[0..n_accepted]` (path[0] == 0, length cnt = n_accepted + 1, topological order path[k] >= k):
+    // compacts KV rows + IndexPool ivg when a side branch was accepted, builds completed IndexPool groups for [p0, p0+cnt),
+    // and aligns the DFly2 captured key-list row for the next draft step.
+    void commit_tree_path(int p0, const int* path, int n_accepted) {
+        const int cnt = n_accepted + 1;
+        bool need_compact = false;
+        TreePos src;
+        src.n = cnt;
+        idx::IdxTree isrc;
+        isrc.n = cnt;
+        for (int k = 0; k < cnt; ++k) {
+            src.depth[k] = (uint8_t)path[k];
+            isrc.depth[k] = (uint8_t)path[k];
+            if (path[k] != k) need_compact = true;
+        }
+        if (need_compact) {
+            for (int il = 0; il < c.n_layers; ++il) {
+                const bool swa = c.is_swa[il];
+                mla_compact_kv(st, kcache[il], swa ? ring : slots_sparse, p0, swa ? ring : 0, src);
+                if (!swa && index_on) hipLaunchKernelGGL(idx::k_idx_compact_ivg, dim3(1), dim3(256), 0, st, ivg[il], p0, isrc);
+            }
+        }
+        if (index_on) {
+            const int g_lo = p0 / 4, g_hi = (p0 + cnt) / 4 - 1;
+            if (g_hi >= g_lo) {
+                for (int il = 0; il < c.n_layers; ++il) {
+                    if (c.is_swa[il]) continue;
+                    const std::string p = L(il) + ".self_attn.compressed_indexer";
+                    hipLaunchKernelGGL(idx::k_idx_pool, dim3(g_hi - g_lo + 1), dim3(128), 0, st, ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"),
+                                       pooled[il], g_lo, (float)theta(il), c.rms_eps, (const int*)nullptr, 0);
+                }
+            }
+        }
+        if (dfly_cap) {
+            const int last_node = path[n_accepted];
+            if (last_node != n_accepted) {
+                for (int d = 0; d < 5; ++d) {
+                    if (!cap_list[d]) continue;
+                    HCK(hipMemcpyAsync(dkeys[d] + (size_t)n_accepted * index_topk, dkeys[d] + (size_t)last_node * index_topk, (size_t)index_topk * 4, hipMemcpyDeviceToDevice, st));
+                    HCK(hipMemcpyAsync(dnkc[d] + n_accepted, dnkc[d] + last_node, 4, hipMemcpyDeviceToDevice, st));
+                }
+            }
+            cap_p0 = p0;
+            cap_rows = cnt;
+        }
     }
 #if HY4_CUDA
     template <class Fn>
@@ -2281,13 +2426,29 @@ public:
                 HCK(hipEventSynchronize(ev_hyb));
                 const int ml = il - 1;
                 const uint8_t* use_ptr = nullptr;
-                if (vcache_nslots > 1) {
-                    const size_t np = (size_t)T * 16;
-                    for (size_t i = 0; i < np; ++i) {
-                        const int e = h_idx[i];
-                        v_use_buf[i] = (e >= 0 && e < 512 && !vram_flag[ml * 512 + e]) ? 1 : 0;
+                const bool do_tail = (tail_skip > 0 && T <= 16);
+                if (vcache_nslots > 1 || do_tail) {
+                    int minr[512];
+                    if (do_tail) {
+                        for (int e = 0; e < 512; ++e) minr[e] = 99;
+                        for (int t = 0; t < T; ++t)
+                            for (int s = 0; s < 16; ++s) {
+                                const int e = h_idx[(size_t)t * 16 + s];
+                                if (e >= 0 && e < 512 && s < minr[e]) minr[e] = s;
+                            }
                     }
-                    use_ptr = v_use_buf.data();
+                    for (int t = 0; t < T; ++t)
+                        for (int s = 0; s < 16; ++s) {
+                            const size_t i = (size_t)t * 16 + s;
+                            const int e = h_idx[i];
+                            uint8_t u = (e >= 0 && e < 512 && !(vcache_nslots > 1 && vram_flag[ml * 512 + e])) ? 1 : 0;
+                            if (u && do_tail && g.experts[(size_t)ml * 512 + e].tier >= 2 && minr[e] >= tail_skip) {
+                                u = 0;
+                                ++tail_skipped_pairs;
+                            }
+                            h_use[i] = u;
+                        }
+                    use_ptr = h_use.data();
                 }
                 cpu.submit(ml, T, h_z, h_idx, h_w, use_ptr, h_zcpu);
                 if (vcache_nslots > 1) vcache_note_decode(ml, T, h_idx);
@@ -2308,29 +2469,30 @@ public:
         return true;
     }
 #endif
-    bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err) {
+    bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err, const TreeSpec* tree = nullptr) {
         if (!kv_is_host && p0 + T + 16 > kv_alloc_pos) kv_grow_to(p0 + T + 16);
         if (T <= 8 && vcache_nslots > 1) {
             vcache_decay_step(T);
             vcache_poll_commit();
         }
+        const bool is_tree = tree != nullptr && tree->M > 0;
 #if HY4_CUDA
-        if (cuda_graph_on && (peer_runs.empty() || !hyb) && T <= 8 && !dump && !prof && !prof2 && !(vis && vis->needs_fix(p0, T)))
+        if (!is_tree && cuda_graph_on && (peer_runs.empty() || !hyb) && T <= 8 && !dump && !prof && !prof2 && !(vis && vis->needs_fix(p0, T)))
             return forward_chunk_graph(tok_all, p0, T, err);
 #endif
-        HCK(hipMemcpyAsync(d_ids, tok_all + p0, (size_t)T * 4, hipMemcpyHostToDevice, st));
+        HCK(hipMemcpyAsync(d_ids, is_tree ? tree->tok : (tok_all + p0), (size_t)T * 4, hipMemcpyHostToDevice, st));
         hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
-        if (vis) vis->embed(st, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
+        if (!is_tree && vis) vis->embed(st, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
         const bool defer_eng = engram_ready && T <= 8;
         const bool pf_pipe = pf_active(T) && !pf_use_gather(T);
         if (pf_pipe) pf_begin_chunk();
         if (defer_eng) {
             const double t_pf0 = now_s();
-            prefetch_engram(tok_all, p0, T);
+            prefetch_engram(tok_all, p0, T, tree);
             t_eng_issue += now_s() - t_pf0;
-        } else if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
+        } else if (engram_ready && !engram_prep(tok_all, p0, T, err, tree)) return false;
         for (int il = 0; il < c.n_layers; ++il) {
-            if (defer_eng && il == 1) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err)) return false; t_eng_prep += now_s() - tq; ++n_eng_dec; }
+            if (defer_eng && il == 1) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err, tree)) return false; t_eng_prep += now_s() - tq; ++n_eng_dec; }
             if (defer_eng && il == emeta.layers[1] && !engram_prep_rest(err)) return false;
             int mo = -1;
             for (int j = 0; j < 4; ++j)
@@ -2343,7 +2505,7 @@ public:
             }
             if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); p_eng += tb - ta; ta = tb; }
             if (il >= 1 && pf_pipe) pf_pump(pf_layer_first[il - 1] + pf_nbuf - 1);
-            attention_layer(il, p0, T);
+            attention_layer(il, p0, T, tree);
             maybe_dump("x_L" + std::to_string(il) + "_attn", T, 4 * HID, x, 4);
             if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); (c.is_swa[il] ? p_attn_swa : p_attn_sp) += tb - ta; ta = tb; }
             mlp_layer(il, T);

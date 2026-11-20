@@ -3814,7 +3814,7 @@
     },
     {
      "file": "engine/src/hy4flash/run/hy4_graph.hip.h",
-     "line": 580,
+     "line": 588,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -13730,6 +13730,34 @@
    "status": "research",
    "owner": "",
    "note": "",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_HY4_TAIL_SKIP",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/hy4flash/run/hy4_graph.hip.h",
+     "line": 596,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "opt-in",
+   "owner": "hy4-dfly-distill",
+   "note": "Opt-in rank cutoff (1..15) for skipping missed CPU/cold-tier routed experts in Hy4-Flash decode/verify; 0 = off by default (exact lossless).",
    "retire_after": "",
    "retired_in": ""
   },

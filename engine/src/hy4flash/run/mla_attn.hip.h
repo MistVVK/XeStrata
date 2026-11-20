@@ -35,8 +35,13 @@ enum MlaMode : int {
     MLA_LIST = 2     // explicit per-query list of CACHE SLOT indices: keys[t*kmax + i], i < nkeys[t]   (IndexPool picks; no ordering needed)
 };
 
+struct TreePos {
+    int n = 0;             // 0 = standard linear positions p0 + t; 1..8 = tree verify positions p0 + depth[t]
+    uint8_t depth[8] = {}; // logical depth of each tree node (or source node indices for compaction)
+};
+
 struct MlaAttnArgs {
-    int M = 1;              // number of queries (chunk of tokens), query t sits at position p0 + t
+    int M = 1;              // number of queries (chunk of tokens), query t sits at position p0 + t (or p0 + tree_depth[t] when tree_nodes > 0)
     int NH = 32;            // 32 (sparse layers) or 64 (SWA layers)
     int p0 = 0;             // position of the first query of the chunk
     int mode = MLA_CAUSAL;
@@ -45,11 +50,16 @@ struct MlaAttnArgs {
     int cache_slots = 0;    // total slots of the cache buffer (the Vt region starts at cache + cache_slots*576 halves); must equal the value given to mla_write_kv
     // MLA_LIST (IndexPool picks). Entries are consumed in blocks of 4: entry 4b+u is the slot of position 4*G+u of ONE aligned 4-token group G
     // (for the fast path the 4 entries of a block must be the slots 4G..4G+3 in order; the last block may be partial, nkeys counts valid entries).
-    const int32_t* keys = nullptr;   // [M][kmax] cache slot indices, kmax % 4 == 0
+    const int32_t* keys = nullptr;   // [M][kmax] cache slot indices (logical positions when tree_nodes > 0), kmax % 4 == 0
     const int32_t* nkeys = nullptr;  // [M]
     int kmax = 0;
     float scale = 0.0625f;  // 1/sqrt(256)
     const int* p0_dev = nullptr;  // optional device pointer to step-varying p0 (for CUDA/HIP Graph replay)
+    // Tree-8 speculative verification (tree_nodes == 0: standard linear chunk; 1..8: tree node t sits at logical position p0 + tree_depth[t]
+    // and its ancestor at logical position p0 + d is stored in physical cache slot (p0 + tree_anc[t][d]) [% ring])
+    int tree_nodes = 0;
+    uint8_t tree_depth[8] = {};
+    uint8_t tree_anc[8][8] = {};
 };
 
 // ---- host helpers (not device code) --------------------------------------------------------------------------------------------------------------------
@@ -73,14 +83,18 @@ void mla_prep_q_t(hipStream_t s, const float* q_b, const __half* wk_bt, __half* 
 // 1c. DECODE variants (M = 1..8, e.g. decode and DFly2 verify windows) that read the QUANTIZED kv_b_proj tensor directly (S_K wire format, fmt = 2,3,4,5,6,8 as FMT_S*,
 //     [NH*448][512], 2 super-blocks per row): no fp16 absorbed copies are needed for decode and ~3x fewer weight bytes are read per token.
 //     mla_prep_q_dec == mla_prep_q (q absorb + rope), mla_vup_dec == mla_vup (v up-projection + gate), given the raw kv_b_proj bytes on the device.
-void mla_prep_q_dec(hipStream_t s, int fmt, const void* kv_b, const float* q_b, __half* qa, int M, int NH, int p0, float theta);
+void mla_prep_q_dec(hipStream_t s, int fmt, const void* kv_b, const float* q_b, __half* qa, int M, int NH, int p0, float theta, TreePos tp = {});
 void mla_prep_q_dec_d(hipStream_t s, int fmt, const void* kv_b, const float* q_b, __half* qa, int M, int NH, const int* p0_dev, float theta);
 void mla_vup_dec(hipStream_t s, int fmt, const void* kv_b, const __half* ctx, const float* gate, __half* o, int M, int NH);
 
 // 2. KV cache write.  kv_a: fp32 [M][576] (output of kv_a_proj_with_mqa: 512 latent | 64 pe). Writes cache slot (p0+t) % ring (ring = 0: slot = p0+t):
-//    cache[slot][0:512] = half(kv_a[t][0:512] * rsqrt(mean(kv_a[t][0:512]^2) + eps) * norm_w[c]);  cache[slot][512:576] = rope(kv_a[t][512:576], p0+t, theta).
-void mla_write_kv(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, int p0, int ring, float theta, float eps);
+//    cache[slot][0:512] = half(kv_a[t][0:512] * rsqrt(mean(kv_a[t][0:512]^2) + eps) * norm_w[c]);  cache[slot][512:576] = rope(kv_a[t][512:576], pos, theta).
+void mla_write_kv(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, int p0, int ring, float theta, float eps, TreePos tp = {});
 void mla_write_kv_d(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, const int* p0_dev, int ring, float theta, float eps);
+
+// 2b. Compact accepted tree-branch KV rows: for k = 0..src.n-1 copies physical slot (p0 + src.depth[k]) -> (p0 + k) (mod ring if ring > 0).
+//     Requires src.depth[k] >= k (topological order), so sequential in-place compaction is race-free.
+void mla_compact_kv(hipStream_t s, __half* cache, int cache_slots, int p0, int ring, TreePos src);
 
 // 3. attention, latent output.  qa: half [M][NH][576]; cache: half rows; sinks: fp32 [NH]; ctx: HALF [M][NH][512] (softmax-weighted latent rows).
 //    The cache must already hold every key position the chunk can see (write the chunk's own K/V first).  ws: scratch (>= mla_workspace_bytes()), may be null for tiny M*keys.
