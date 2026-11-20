@@ -72,6 +72,16 @@ void bih3_r1q2_grouped(const Bih3R1q2Layer& layer, const unsigned long long* grp
 void bih3_r1q2_prompt_groups(const Bih3R1q2Layer& layer, const unsigned long long* ptr, const int32_t* start,
                              const int32_t* k_pack, const int32_t* start_host, int n_groups, const int32_t* tok,
                              const void* x_q8_1, void* scratch, int64_t cap, float* out, void* stream);
+/// Bytes an expert takes in bih3_r1q2_prompt_mmq's `weights` (its gate/up and down codes as kBih3Code rows).
+size_t bih3_r1q2_code_bytes(int64_t n_embd, int64_t n_ff);
+/// A pass of the prompt's experts through the matrix products (iq_mmq_grouped's kBih3Code): n experts at ptr[e]
+/// (K in k_pack[e], gate/up | down << 8), their rows bounds[e] .. bounds[e + 1] of the pass's R (max_rows the most an
+/// expert has), the pass's row c the layer's routed row rows[c], whose activation is x_q8_1's row tok[rows[c]] and
+/// whose output is out's row rows[c].  scratch: bih3_r1q2_grouped_scratch_bytes(R) at least; weights: n
+/// bih3_r1q2_code_bytes.
+void bih3_r1q2_prompt_mmq(const Bih3R1q2Layer& layer, int n, const unsigned long long* ptr, const int32_t* k_pack,
+                          const int32_t* bounds, int64_t max_rows, const int32_t* rows, const int32_t* tok, int64_t R,
+                          const void* x_q8_1, void* scratch, void* weights, float* out, void* stream);
 /// Untiled grouped product for devices too small for the matrix or DP4a tile.
 void bih3_r1q2_grouped_scalar(const Bih3R1q2Layer& layer, const unsigned long long* grp_ptr, const int32_t* grp_start,
                               const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,

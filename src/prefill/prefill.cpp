@@ -686,6 +686,7 @@ struct Prefill::Impl {
     // K (gate/up | down << 8), n_expert each (start one more)
     int32_t* bih3_meta = nullptr;
     HostVec<int32_t> bih3_meta_host;
+    uint8_t* bih3_w = nullptr;   // kBih3PassExperts experts' codes for the matrix passes (bih3_r1q2_prompt_mmq)
     float* H = nullptr;
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
     int32_t* ids_rel = nullptr;               // row r of the chunk -> r - its group's first row (the gate/up's dst rows)
@@ -1327,6 +1328,17 @@ std::vector<size_t> latent_set_sizes(size_t T) {
             TK * 4, TK * 4, TK * 4, TK * 4};
 }
 
+// A mixed (bih3 R1Q2) layer's resident experts in the prompt: in passes of whole experts whose rows fit the chunk,
+// through the direct products (bih3_r1q2_prompt_groups) or the matrix ones (bih3_r1q2_prompt_mmq, at most
+// kBih3PassExperts experts' codes a pass).  Their table a layer (bih3_meta, int32): the experts' blob pointers (two
+// words each), K, row bounds (a pass's own, one more a pass) and the passes' routed rows.
+constexpr size_t kBih3PassExperts = 32;
+// The matrix passes from this many rows an expert on (a layer's average): the B70's Sync-S prompt of 1K (20 rows an
+// expert) took 558 tok/s direct against 450 in the matrix passes, of 3.5K (70 rows) 579 against 685 (2026-11-20);
+// the codes are decoded in the tile once a plane, three times a state, which the direct products' few rows do not pay.
+constexpr int64_t kBih3MatrixRows = 48;
+size_t bih3_meta_ints(size_t T, int64_t k, int64_t n_expert) { return (size_t) (6 * n_expert + 2) + T * (size_t) k; }
+
 uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     const MmqPlan& mp = mmq_plan();
     Alloc a; a.count_only = true; bool ok = true;
@@ -1353,7 +1365,8 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
         all.take<float>(T * N, ok);
         all.take<uint8_t>(T * (N / 32) * 36, ok);
         all.take<uint8_t>(strata::kernels::bih3_r1q2_prompt_scratch_bytes((int64_t) T, N, 640), ok);
-        all.take<int32_t>((size_t) (4 * n_expert + 2), ok);
+        all.take<int32_t>(bih3_meta_ints(T, K, n_expert), ok);
+        all.take<uint8_t>(kBih3PassExperts * strata::kernels::bih3_r1q2_code_bytes(N, 640), ok);
     }
     return all.used;
 }
@@ -2024,7 +2037,8 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.bih3_rotated = c.take<float>(T * N, ok);
             m.bih3_xq = c.take<uint8_t>(T * (N / 32) * 36, ok);
             m.bih3_scratch = c.take<uint8_t>(strata::kernels::bih3_r1q2_prompt_scratch_bytes((int64_t) T, N, 640), ok);
-            m.bih3_meta = c.take<int32_t>((size_t) (4 * m.g->n_expert + 2), ok);
+            m.bih3_meta = c.take<int32_t>(bih3_meta_ints(T, K, m.g->n_expert), ok);
+            m.bih3_w = c.take<uint8_t>(kBih3PassExperts * strata::kernels::bih3_r1q2_code_bytes(N, 640), ok);
         }
         if (base == nullptr) ok = false;
     }
@@ -4151,28 +4165,75 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (lay.mixed() && std::any_of(bih3_res.begin(), bih3_res.end(), [](const uint8_t* b) { return b; })) {
                             pt.mark(kPfDequant, cs);
                             const size_t n = order.size(), E = (size_t) m.g->n_expert;
-                            m.bih3_meta_host.resize(4 * E + 2);
-                            int32_t* mh = m.bih3_meta_host.data();
-                            int32_t* start_h = mh + 2 * E;
-                            int32_t* k_h = start_h + E + 1;
-                            for (size_t j = 0; j < n; ++j) {
-                                const int32_t e = order[j];
-                                const auto& f = lay.format(l, e);
-                                std::memcpy(mh + 2 * j, static_cast<const void*>(&bih3_res[j]), sizeof bih3_res[j]);
-                                start_h[j] = m.off[(size_t) e];
-                                k_h[j] = (f.gu_type - 180) | ((f.d_type - 180) << 8);
-                            }
-                            start_h[n] = n > 0 ? m.off[(size_t) order[n - 1]] + m.cnt[(size_t) order[n - 1]] : 0;
-                            m.bih3_meta_host.to_device(m.bih3_meta, m.cs);
                             const auto& f = lay.format(l, order[0]);
                             strata::kernels::Bih3R1q2Layer layer;
                             layer.n_embd = (int) f.n_embd; layer.n_ff = (int) f.n_ff;
                             layer.had_block = f.had_d ? f.had_block : 0; layer.d_signs = had_sh;
                             std::memcpy(layer.p2, f.p2, sizeof layer.p2);
-                            strata::kernels::bih3_r1q2_prompt_groups(
-                                layer, reinterpret_cast<const unsigned long long*>(m.bih3_meta), m.bih3_meta + 2 * E,
-                                m.bih3_meta + 3 * E + 1, start_h, (int) n, m.src_dev, m.bih3_xq, m.bih3_scratch, T,
-                                ex_out, m.cs);
+                            auto kpack = [&](int32_t e) {
+                                const auto& fe = lay.format(l, e);
+                                return (int32_t) ((fe.gu_type - 180) | ((fe.d_type - 180) << 8));
+                            };
+                            size_t n_res = 0, rows_res = 0;
+                            for (size_t j = 0; j < n; ++j)
+                                if (bih3_res[j]) { ++n_res; rows_res += (size_t) m.cnt[(size_t) order[j]]; }
+                            m.bih3_meta_host.resize(bih3_meta_ints((size_t) T, K, (int64_t) E));
+                            int32_t* mh = m.bih3_meta_host.data();
+                            if ((int64_t) rows_res >= kBih3MatrixRows * (int64_t) n_res &&
+                                strata::kernels::iq_mmq_path(strata::core::Runtime::get().compute()) != nullptr) {
+                                // the matrix passes: the resident experts in order, their rows packed
+                                int32_t* k_h = mh + 2 * E;
+                                int32_t* bnd_h = k_h + E;          // a pass's bounds, one more a pass
+                                int32_t* rows_h = bnd_h + 2 * E;   // the passes' routed rows
+                                struct Pass { size_t e0, e1, b0, r0, r1; int64_t max_rows; };
+                                std::vector<Pass> passes;
+                                size_t ne = 0, nb = 0, nr = 0;
+                                for (size_t j = 0; j < n; ++j) {
+                                    if (!bih3_res[j]) continue;
+                                    const int32_t e = order[j];
+                                    const int64_t c = m.cnt[(size_t) e];
+                                    if (passes.empty() || passes.back().e1 - passes.back().e0 >= kBih3PassExperts ||
+                                        (int64_t) (nr - passes.back().r0) + c > T) {
+                                        if (!passes.empty()) bnd_h[nb++] = (int32_t) (nr - passes.back().r0);
+                                        passes.push_back({ne, ne, nb, nr, nr, 0});
+                                    }
+                                    Pass& p = passes.back();
+                                    std::memcpy(mh + 2 * ne, static_cast<const void*>(&bih3_res[j]), sizeof bih3_res[j]);
+                                    k_h[ne] = kpack(e);
+                                    bnd_h[nb++] = (int32_t) (nr - p.r0);
+                                    for (int64_t i = 0; i < c; ++i) rows_h[nr++] = m.off[(size_t) e] + (int32_t) i;
+                                    p.e1 = ++ne;
+                                    p.r1 = nr;
+                                    p.max_rows = std::max<int64_t>(p.max_rows, c);
+                                }
+                                bnd_h[nb++] = (int32_t) (nr - passes.back().r0);
+                                m.bih3_meta_host.to_device(m.bih3_meta, m.cs);
+                                const auto* ptr_d = reinterpret_cast<const unsigned long long*>(m.bih3_meta);
+                                const int32_t* k_d = m.bih3_meta + 2 * E;
+                                const int32_t* bnd_d = k_d + E;
+                                const int32_t* rows_d = bnd_d + 2 * E;
+                                for (const Pass& p : passes)
+                                    strata::kernels::bih3_r1q2_prompt_mmq(
+                                        layer, (int) (p.e1 - p.e0), ptr_d + p.e0, k_d + p.e0, bnd_d + p.b0, p.max_rows,
+                                        rows_d + p.r0, m.src_dev, (int64_t) (p.r1 - p.r0), m.bih3_xq, m.bih3_scratch,
+                                        m.bih3_w, ex_out, m.cs);
+                            } else {
+                                // the direct products: every expert of `order` a group, the streamed ones without a blob
+                                int32_t* start_h = mh + 2 * E;
+                                int32_t* k_h = start_h + E + 1;
+                                for (size_t j = 0; j < n; ++j) {
+                                    const int32_t e = order[j];
+                                    std::memcpy(mh + 2 * j, static_cast<const void*>(&bih3_res[j]), sizeof bih3_res[j]);
+                                    start_h[j] = m.off[(size_t) e];
+                                    k_h[j] = kpack(e);
+                                }
+                                start_h[n] = m.off[(size_t) order[n - 1]] + m.cnt[(size_t) order[n - 1]];
+                                m.bih3_meta_host.to_device(m.bih3_meta, m.cs);
+                                strata::kernels::bih3_r1q2_prompt_groups(
+                                    layer, reinterpret_cast<const unsigned long long*>(m.bih3_meta), m.bih3_meta + 2 * E,
+                                    m.bih3_meta + 3 * E + 1, start_h, (int) n, m.src_dev, m.bih3_xq, m.bih3_scratch, T,
+                                    ex_out, m.cs);
+                            }
                         }
                         pt.mark(kPfCombine, cs);
                         if (rows_help > 0) {   // set_helper: its rows into Dm's tail, once its stream is done

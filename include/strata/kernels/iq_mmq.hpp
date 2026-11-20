@@ -31,6 +31,9 @@ const char* iq_mmq_path(sycl::queue& q);
 inline constexpr int kIqMmqFx = 1000;
 /// Internal gathered bih3 planes: 32 signed bytes followed by their FP32 scale, three blocks per input block.
 inline constexpr int kBih3Planes = 0x58530003;
+/// Internal gathered bih3 R1Q2 codes: a row's 128-value blocks of 64 bytes each (the block's 4K code bytes, its FP32
+/// scale at 56, K at 60), read as kBih3Planes' three planes (w_cols three times the values), decoded in the tile.
+inline constexpr int kBih3Code = 0x58530004;
 /// The type iq_mmq_grouped takes for the fixed-point products of ggml_type (the gate/up's IQ2_XXS, IQ2_XS, IQ3_XXS,
 /// IQ3_S and IQ2_S, the down's IQ4_NL), or 0 where it has none.
 int iq_mmq_fx(int ggml_type);

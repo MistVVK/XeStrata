@@ -822,6 +822,24 @@ static int check_bih3_grouped(void* stream) {
         groups_error = rel(g_got, g_want);
         for (int i = 0; i < H; ++i) if (gout[(size_t) H + i] != 7.f) groups_error = 1;   // the group with no blob
         std::printf("bih3 prompt groups (two passes, a group without a blob): rel %.9g\n", groups_error);
+        // the same rows through the matrix products of the gathered codes (kBih3Code), where the device has them
+        if (strata::kernels::iq_mmq_path(strata::core::Runtime::get().compute()) != nullptr) {
+            const std::vector<int32_t> mptr = {(int32_t) blob0, (int32_t) (blob0 >> 32), (int32_t) blob1,
+                                               (int32_t) (blob1 >> 32)};
+            const auto* m_ptr = reinterpret_cast<const unsigned long long*>(dev.upload(mptr));
+            const auto* m_k = dev.upload(std::vector<int32_t>{2 | 3 << 8, 8 | 9 << 8});
+            const auto* m_bnd = dev.upload(std::vector<int32_t>{0, 1, 3});
+            const auto* m_rows = dev.upload(std::vector<int32_t>{0, 1, 2});
+            auto* ms = dev.alloc<uint8_t>(strata::kernels::bih3_r1q2_grouped_scratch_bytes(NT, H, FF));
+            auto* mw = dev.alloc<uint8_t>(2 * strata::kernels::bih3_r1q2_code_bytes(H, FF));
+            auto* mo = dev.alloc<float>((size_t) NT * H);
+            strata::kernels::bih3_r1q2_prompt_mmq(one, 2, m_ptr, m_k, m_bnd, 2, m_rows, gtok, NT, dx, ms, mw, mo, stream);
+            std::vector<float> m_got((size_t) NT * H);
+            strata::parity::copy_out(m_got.data(), mo, m_got.size());
+            double mmq_error = rel(m_got, prompt_want);
+            std::printf("bih3 prompt matrix pass (kBih3Code): rel %.9g\n", mmq_error);
+            if (!(mmq_error < 1e-2)) groups_error = 1;
+        }
     }
     std::vector<float> signs(FF);
     for (int i = 0; i < FF; ++i) signs[i] = i % 3 ? 1.f : -1.f;

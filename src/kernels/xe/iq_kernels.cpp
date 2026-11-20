@@ -3193,6 +3193,85 @@ void bih3_r1q2_prompt_groups(const Bih3R1q2Layer& layer, const unsigned long lon
     if (!stream) q.wait_and_throw();
 }
 
+size_t bih3_r1q2_code_bytes(int64_t n_embd, int64_t n_ff) {
+    return (size_t) (2 * n_ff) * (size_t) (n_embd / 128) * 64 + (size_t) n_embd * (size_t) (n_ff / 128) * 64;
+}
+
+void bih3_r1q2_prompt_mmq(const Bih3R1q2Layer& L, int n, const unsigned long long* ptr, const int32_t* k_pack,
+                          const int32_t* bounds, int64_t max_rows, const int32_t* rows, const int32_t* tok, int64_t R,
+                          const void* x_q8_1, void* scratch, void* weights, float* out, void* stream) {
+    if (n <= 0 || R <= 0) return;
+    require(ptr && k_pack && bounds && rows && tok && x_q8_1 && scratch && weights && out && max_rows > 0 &&
+            bih3_r1q2_grouped_scratch_bytes(R, L.n_embd, L.n_ff), "bih3_r1q2_prompt_mmq");
+    auto& q = queue_for(stream);
+    const Bih3GroupedScratch s = bih3_scratch(scratch, R, L.n_embd, L.n_ff);
+    const int N = L.n_embd, ff = L.n_ff, nbg = N / 128, nbd = ff / 128;
+    const size_t gu_row = (size_t) nbg * 64, d_row = (size_t) nbd * 64;
+    const size_t gu_bytes = (size_t) (2 * ff) * gu_row, d_bytes = (size_t) N * d_row;
+    auto* wgu = static_cast<uint8_t*>(weights);
+    uint8_t* wd = wgu + (size_t) n * gu_bytes;
+    // the pass's experts' codes into kBih3Code rows: one 128-value block of a row an item
+    const size_t items = (size_t) (2 * ff) * (size_t) nbg + (size_t) N * (size_t) nbd;
+    const Bih3R1q2Layer lay = L;
+    q.parallel_for(sycl::range<2>((size_t) n, items), [=](sycl::id<2> id) {
+        const int e = (int) id[0];
+        const size_t i = id[1];
+        const bool down = i >= (size_t) (2 * ff) * (size_t) nbg;
+        const size_t j = down ? i - (size_t) (2 * ff) * (size_t) nbg : i;
+        const int nb = down ? nbd : nbg, row = (int) (j / (size_t) nb), b = (int) (j % (size_t) nb);
+        const int matrix = down ? 2 : row / ff, r = down ? row : row % ff;
+        const int gk = k_pack[e] & 0xff, dk = k_pack[e] >> 8, k = down ? dk : gk;
+        const auto* blob = reinterpret_cast<const uint8_t*>(ptr[e]);
+        const size_t grow = (size_t) nbg * 4 * (size_t) gk, drow = (size_t) nbd * 4 * (size_t) dk;
+        const size_t up = grow * (size_t) ff, dn = 2 * up;
+        const size_t scale_off = (dn + drow * (size_t) N + 15) & ~(size_t) 15;
+        const size_t gu_scale = (size_t) ff * 2 + (size_t) nbg * 2 + (size_t) ff * (size_t) ((nbg + 3) / 4);
+        const int rows_m = down ? N : ff, qbytes = (nb + 3) / 4;
+        const uint8_t* bases = blob + scale_off + (size_t) matrix * gu_scale;
+        const uint8_t* cols = bases + (size_t) rows_m * 2;
+        const uint8_t* qs = cols + (size_t) nb * 2 + (size_t) r * qbytes;
+        const auto* code = reinterpret_cast<const uint32_t*>(
+            blob + (matrix == 1 ? up : matrix == 2 ? dn : 0) + (size_t) r * (down ? drow : grow) + (size_t) b * 4 * k);
+        const auto half_at = [](const uint8_t* p) {
+            return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+        };
+        auto* dst = reinterpret_cast<uint32_t*>(down ? wd + (size_t) e * d_bytes + (size_t) row * d_row + (size_t) b * 64
+                                                      : wgu + (size_t) e * gu_bytes + (size_t) row * gu_row + (size_t) b * 64);
+        for (int w = 0; w < k; ++w) dst[w] = code[w];
+        const float scale = half_at(bases + 2 * (size_t) r) * half_at(cols + 2 * (size_t) b) *
+                            lay.p2[matrix][(qs[b / 4] >> (2 * (b % 4))) & 3] * (1.f / 128.f);
+        dst[14] = sycl::bit_cast<uint32_t>(scale);
+        dst[15] = (uint32_t) k;
+    });
+    // the routed rows' activations, three times each (a plane each), in the pass's order
+    const auto* X = static_cast<const block_q8_1*>(x_q8_1);
+    q.parallel_for(sycl::range<2>((size_t) R, (size_t) (N / 32)), [=](sycl::id<2> id) {
+        const size_t c = id[0], block = id[1];
+        const block_q8_1& in = X[(size_t) tok[rows[c]] * (size_t) (N / 32) + block];
+        auto* scales = reinterpret_cast<float*>(s.xq + (size_t) R * (size_t) (3 * N));
+        for (int p = 0; p < 3; ++p) {
+            const size_t dest = c * (size_t) (3 * N / 32) + 3 * block + p;
+            for (int j = 0; j < 8; ++j) reinterpret_cast<uint32_t*>(s.xq + dest * 32)[j] = (uint32_t) get_int_b4(in.qs, j);
+            scales[dest] = low_half(in.ds);
+        }
+        if (block == 0) s.identity[c] = (int32_t) c;
+    });
+    iq_mmq_grouped(q, kBih3Code, wgu, gu_bytes, (int64_t) 2 * ff, (int64_t) 3 * N, n, s.xq, R, bounds, max_rows,
+                   s.identity, s.gu, (int64_t) 2 * ff);
+    const float lim = expert_swiglu_limit();
+    q.parallel_for(sycl::range<1>((size_t) R * (size_t) ff), [=](sycl::id<1> id) {
+        const size_t i = id[0], e = i / (size_t) ff, r = i % (size_t) ff;
+        float gate = s.gu[e * (size_t) (2 * ff) + r], up = s.gu[e * (size_t) (2 * ff) + (size_t) ff + r];
+        swiglu_clamp(gate, up, lim);
+        s.h[i] = canon::silu_mul(gate, up);
+    });
+    if (L.had_block > 0) launch_hadamard_rows<float>(q, s.h, s.h, R, ff, L.had_block, L.d_signs, "bih3_r1q2_prompt_mmq");
+    launch_quantize_q8_1_canon(q, s.h, s.hq, (long long) R * ff);
+    bih3_r1q2_expand_mmq(s.hq, s.xq, ff, (int) R, stream);
+    iq_mmq_grouped(q, kBih3Code, wd, d_bytes, N, (int64_t) 3 * ff, n, s.xq, R, bounds, max_rows, rows, out, N);
+    if (!stream) q.wait_and_throw();
+}
+
 void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     auto& q = queue_for(stream);
     const size_t rb = iq_row_bytes(t, n_in);
