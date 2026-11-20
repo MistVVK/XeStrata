@@ -1165,9 +1165,11 @@ void fetch_r1q2_blobs(const unsigned long long* src, const int32_t* count, uint8
     const int groups = fixed > 0 ? fixed : fetch_groups().get(q.get_device(), [&] { return fetch_groups_default(q); });
     const size_t items = (size_t) groups * 256, per = (size_t) stride / 16;
     auto event = q.parallel_for(sycl::nd_range<1>(items, 256), [=](sycl::nd_item<1> it) {
-        for (size_t i = it.get_global_linear_id(); i < (size_t) cap * per; i += items) {
+        // the groups this window fetches, not the staging's cap: a layer with no PCIe share (every expert in VRAM)
+        // walked cap x stride / 16 items for nothing, 80 us a layer on the B70 (Sync-S, 2026-11-20)
+        const size_t n = (size_t) sycl::clamp(*count, 0, cap);
+        for (size_t i = it.get_global_linear_id(); i < n * per; i += items) {
             const size_t g = i / per, off = i % per;
-            if (g >= (size_t) *count) continue;
             // The host-built plan supplies in-range entry, route and expert indices for each fetched group.
             const int expert = route_ids[entries[starts[g]]];  // NOLINT(clang-analyzer-security.ArrayBound)
             const size_t gk = k_pairs[(size_t) 2 * expert], dk = k_pairs[(size_t) 2 * expert + 1];
