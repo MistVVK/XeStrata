@@ -352,7 +352,7 @@ public:
         void* p = nullptr;
         if (!forced) {
             size_t fr = 0, tot = 0;
-            HCK(hipMemGetInfo(&fr, &tot));
+            gpu_mem_avail(fr, tot);
             if (fr > bytes + ((size_t)300 << 20)) {
                 if (hipMalloc(&p, bytes) == hipSuccess) {
                     HCK(hipMemset(p, 0, bytes));

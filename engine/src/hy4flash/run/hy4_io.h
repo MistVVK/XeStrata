@@ -7,6 +7,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -26,8 +27,19 @@ public:
         size_ = (uint64_t)sz.QuadPart;
         return true;
 #else
-        fd_ = ::open(path.c_str(), O_RDONLY);
-        if (fd_ < 0) return false;
+        direct_ = false;
+        fadv_dontneed_ = false;
+        if (unbuffered) {
+#ifdef O_DIRECT
+            fd_ = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+            if (fd_ >= 0) direct_ = true;
+#endif
+        }
+        if (fd_ < 0) {
+            fd_ = ::open(path.c_str(), O_RDONLY);
+            if (fd_ < 0) return false;
+            if (unbuffered) fadv_dontneed_ = true;
+        }
         size_ = (uint64_t)lseek(fd_, 0, SEEK_END);
         return true;
 #endif
@@ -65,9 +77,16 @@ public:
         size_t got = 0;
         while (got < n) {
             ssize_t r = pread(fd_, (char*)dst + got, n - got, (off_t)(off + got));
-            if (r <= 0) break;
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (r == 0) break;
             got += (size_t)r;
         }
+#if defined(POSIX_FADV_DONTNEED)
+        if (fadv_dontneed_ && got > 0) posix_fadvise(fd_, (off_t)off, (off_t)got, POSIX_FADV_DONTNEED);
+#endif
         return got;
 #endif
     }
@@ -78,6 +97,8 @@ private:
     HANDLE h_ = INVALID_HANDLE_VALUE;
 #else
     int fd_ = -1;
+    bool direct_ = false;
+    bool fadv_dontneed_ = false;
 #endif
 };
 

@@ -11,6 +11,15 @@
 #elif defined(__AVX2__)
 #include <immintrin.h>
 #define STRATA_SK_AVX2 1
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1 << 20)
+#endif
+#endif
+#define STRATA_SK_NEON_DOTPROD 1
 #endif
 
 namespace strata::quant::sk {
@@ -70,6 +79,43 @@ struct Trit5Table {
 };
 constexpr Trit5Table kT5{};
 
+#if defined(STRATA_SK_NEON_DOTPROD)
+static inline bool sk_has_neon_dp() noexcept {
+    static const bool v = []() {
+#if defined(__linux__)
+        return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#elif defined(__ARM_FEATURE_DOTPROD) || defined(__APPLE__)
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return v;
+}
+#if !defined(__ARM_FEATURE_DOTPROD) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("+dotprod")))
+#endif
+static inline int32_t dot_u8_i8_64_neon_dp(const uint8_t* w, const int8_t* x) noexcept {
+    int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
+    acc0 = vdotq_s32(acc0, vreinterpretq_s8_u8(vld1q_u8(w + 0)), vld1q_s8(x + 0));
+    acc1 = vdotq_s32(acc1, vreinterpretq_s8_u8(vld1q_u8(w + 16)), vld1q_s8(x + 16));
+    acc0 = vdotq_s32(acc0, vreinterpretq_s8_u8(vld1q_u8(w + 32)), vld1q_s8(x + 32));
+    acc1 = vdotq_s32(acc1, vreinterpretq_s8_u8(vld1q_u8(w + 48)), vld1q_s8(x + 48));
+    return vaddvq_s32(vaddq_s32(acc0, acc1));
+}
+#if !defined(__ARM_FEATURE_DOTPROD) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("+dotprod")))
+#endif
+static inline int32_t dot_i8_i8_64_neon_dp(const int8_t* w, const int8_t* x) noexcept {
+    int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
+    acc0 = vdotq_s32(acc0, vld1q_s8(w + 0), vld1q_s8(x + 0));
+    acc1 = vdotq_s32(acc1, vld1q_s8(w + 16), vld1q_s8(x + 16));
+    acc0 = vdotq_s32(acc0, vld1q_s8(w + 32), vld1q_s8(x + 32));
+    acc1 = vdotq_s32(acc1, vld1q_s8(w + 48), vld1q_s8(x + 48));
+    return vaddvq_s32(vaddq_s32(acc0, acc1));
+}
+#endif
+
 inline int32_t dot_u8_i8_64(const uint8_t* w, const int8_t* x) noexcept {
 #if defined(STRATA_SK_AVX512_VNNI)
     __m512i vw = _mm512_loadu_si512(w);
@@ -91,6 +137,11 @@ inline int32_t dot_u8_i8_64(const uint8_t* w, const int8_t* x) noexcept {
     a = _mm_hadd_epi32(a, a);
     a = _mm_hadd_epi32(a, a);
     return _mm_cvtsi128_si32(a);
+#elif defined(STRATA_SK_NEON_DOTPROD)
+    if (sk_has_neon_dp()) return dot_u8_i8_64_neon_dp(w, x);
+    int32_t s = 0;
+    for (int i = 0; i < 64; ++i) s += static_cast<int32_t>(w[i]) * static_cast<int32_t>(x[i]);
+    return s;
 #else
     int32_t s = 0;
     for (int i = 0; i < 64; ++i) s += static_cast<int32_t>(w[i]) * static_cast<int32_t>(x[i]);
@@ -108,6 +159,11 @@ inline int32_t dot_i8_i8_64(const int8_t* w, const int8_t* x) noexcept {
     __m512i acc = _mm512_dpbusd_epi32(_mm512_setzero_si512(), vwu, vx);
     __m512i sumx = _mm512_dpbusd_epi32(_mm512_setzero_si512(), _mm512_set1_epi8(1), vx);
     return _mm512_reduce_add_epi32(acc) - 128 * _mm512_reduce_add_epi32(sumx);
+#elif defined(STRATA_SK_NEON_DOTPROD)
+    if (sk_has_neon_dp()) return dot_i8_i8_64_neon_dp(w, x);
+    int32_t s = 0;
+    for (int i = 0; i < 64; ++i) s += static_cast<int32_t>(w[i]) * static_cast<int32_t>(x[i]);
+    return s;
 #else
     int32_t s = 0;
     for (int i = 0; i < 64; ++i) s += static_cast<int32_t>(w[i]) * static_cast<int32_t>(x[i]);
@@ -296,6 +352,8 @@ const char* active_sk_isa() noexcept {
     return "avx512-vnni";
 #elif defined(STRATA_SK_AVX2)
     return "avx2";
+#elif defined(STRATA_SK_NEON_DOTPROD)
+    return sk_has_neon_dp() ? "neon-dotprod" : "scalar";
 #else
     return "scalar";
 #endif

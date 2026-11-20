@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
     }
     hipDeviceProp_t p;
     CK(hipGetDeviceProperties(&p, 0));
-    printf("device %s %s CUs %d\n", p.name, p.gcnArchName, p.multiProcessorCount);
+    printf("device %s %s CUs %d\n", p.name, hy4::gpu_arch(p), p.multiProcessorCount);
     const size_t pool = pool_gb << 30;
     uint8_t* d_pool;
     CK(hipMalloc(&d_pool, pool));

@@ -219,8 +219,23 @@ inline void gemv_by_m(hipStream_t s, const void* W, int N, int K, const __half* 
 
 }  // namespace skd
 
+// ---- several GEMVs with the same activations and the same format in one launch. Build once at load time, call per token.
+struct LinMulti {
+    skd::LinJob* d_jobs = nullptr;
+    int njobs = 0, total_blocks = 0, K = 0, fmt = 0;
+};
+
+#if HY4_CUDA
+}  // namespace hy4
+#include "sk_dp4a_cuda.hip.h"
+namespace hy4 {
+#endif
+
 // production decode entry: S_K weights, 1 <= M <= 16 (K % 256 == 0, X 16-byte aligned)
 inline void linear_h_gemv(hipStream_t s, int fmt, const void* W, int N, int K, const __half* X, float* Y, int M) {
+#if HY4_CUDA
+    if (skd::linear_h_gemv_dp4a(s, fmt, W, N, K, X, Y, M)) return;
+#endif
     switch (fmt) {
         case FMT_S1_25: skd::gemv_by_m<FMT_S1_25>(s, W, N, K, X, Y, M); break;
         case FMT_S1_5: skd::gemv_by_m<FMT_S1_5>(s, W, N, K, X, Y, M); break;
@@ -233,12 +248,6 @@ inline void linear_h_gemv(hipStream_t s, int fmt, const void* W, int N, int K, c
         default: fprintf(stderr, "linear_h_gemv: unsupported fmt %d\n", fmt); abort();
     }
 }
-
-// ---- several GEMVs with the same activations and the same format in one launch. Build once at load time, call per token.
-struct LinMulti {
-    skd::LinJob* d_jobs = nullptr;
-    int njobs = 0, total_blocks = 0, K = 0, fmt = 0;
-};
 
 inline LinMulti linear_multi_build(int fmt, int K, int n, const void* const* W, float* const* Y, const int* N) {
     LinMulti d;
@@ -279,6 +288,9 @@ inline void multi_by_m(hipStream_t s, const LinMulti& d, const __half* X, int M)
 
 // Y_i[m][n] = sum_k W_i[n][k] X[m][k] for all jobs i, 1 <= M <= 16, one launch. Each Y_i is a separate float [M][N_i] buffer.
 inline void linear_h_multi(hipStream_t s, const LinMulti& d, const __half* X, int M) {
+#if HY4_CUDA
+    if (skd::linear_h_multi_dp4a(s, d, X, M)) return;
+#endif
     switch (d.fmt) {
         case FMT_S1_25: skd::multi_by_m<FMT_S1_25>(s, d, X, M); break;
         case FMT_S1_5: skd::multi_by_m<FMT_S1_5>(s, d, X, M); break;
