@@ -46,7 +46,7 @@ static int export_tokenizer(const std::string& file, const std::string& dir) {
 }
 
 // `strata-hy4 --info FILE.strata`: one line of key=value facts, no GPU needed
-static int print_info(const std::string& file) {
+static int print_info(const std::string& file, const std::string& vision) {
     strata::artifact::StrataFileReader rd;
     std::string err;
     if (!rd.open(file, err)) {
@@ -67,10 +67,18 @@ static int print_info(const std::string& file) {
     Manifest m;
     parse_manifest(rd.manifest_json(), m, false);
     // what this program CAN do (serve starts without what it cannot): drafter=none|dfly2 (the 5-layer DFly2 drafter in Section 1), images=0|1 (the Vision shard's SigLIP2 reader)
-    // images=1: this engine build can read pictures when started with --vision Hy4-Flash-Vision.strata (GENI requests, HY4-VISION-DESIGN.md); serve falls back to text-only when the key is absent
     const bool has_dfly = m.T.count("model.dfly_layers.0.self_attn.q_a_proj.weight") && m.T.count("model.dfly_layers.hidden_correction.gate_proj.weight");
-    printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d drafter=%s images=1 image_pad=%d image_max_pixels=%d\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos,
-           has_dfly ? "dfly2" : "none", VitCfg().image_token, (int)VitCfg().max_pixels);
+    // images=1: this engine build reads pictures (image= keys on GEN, started with --vision Hy4-Flash-Vision.strata). With `--vision FILE` given the key says whether THAT shard is usable
+    // (profile 3, the 441-tensor manifest parses): 0 when it is missing or damaged. Without --vision it is the program's capability (what serve asks before it knows the shard).
+    int images = 1;
+    if (!vision.empty()) {
+        VisionShardInfo vi;
+        std::string verr;
+        images = vision_probe(vision, vi, verr) ? 1 : 0;
+        if (!images) fprintf(stderr, "vision shard: %s\n", verr.c_str());
+    }
+    printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d drafter=%s images=%d image_pad=%d image_max_pixels=%d\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos,
+           has_dfly ? "dfly2" : "none", images, VitCfg().image_token, (int)VitCfg().max_pixels);
     return 0;
 }
 
@@ -87,6 +95,7 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", vision_path;
     std::vector<std::string> image_files;
+    std::string info_file;
     int64_t image_max_pixels = 4194304;
     bool load_only = false, dump = false, save_logits = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false;
     int gen = 0, max_ctx = 0, chunk = 0 /* 0: auto from the card */, index_topk = 2048;
@@ -111,7 +120,10 @@ int main(int argc, char** argv) {
             printf("strata-hy4 %s\n", HY4_VERSION);
             return 0;
         }
-        if (a == "--info") return print_info(nxt());
+        if (a == "--info") {  // answered after the whole command line is read, so `--info MODEL --vision SHARD` can check the shard
+            info_file = nxt();
+            continue;
+        }
         if (a == "--export-tokenizer") {
             std::string f = nxt();
             return export_tokenizer(f, nxt());
@@ -171,6 +183,7 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (!info_file.empty()) return print_info(info_file, vision_path);
     if (gpu >= 0) HCK(hipSetDevice(gpu));
     if (serve) {
         if (model.empty()) {
