@@ -514,9 +514,9 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     }
     if (!read_model_spec(model_->meta(), spec_, err)) return false;
     if (spec_.arch == ModelArch::SenseNovaLoop) {
-        if (opt_.cpu || opt_.encoder || opt_.stream_blocks || opt_.vision || !tap_req_.empty() ||
+        if (opt_.cpu || opt_.encoder || opt_.stream_blocks || !tap_req_.empty() ||
             (opt_.gpu_layers >= 0 && opt_.gpu_layers < spec_.n_layer)) {
-            err = "plain model: this SenseNova-Loop path needs GPU-resident text blocks"; return false;
+            err = "plain model: this SenseNova-Loop path needs GPU-resident blocks"; return false;
         }
     }
     // the layer split: its points (given, or from the GPUs' memory), each rising inside the trunk, a GPU each
