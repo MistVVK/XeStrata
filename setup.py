@@ -137,7 +137,7 @@ HF_REVISIONS = {
     "pfnet/plamo-3-translate-0.8b-GGUF": "1cf96ae02133958a20074bfdfab76517bb737d00",                # 2026-11-09
     "pfnet/plamo-3-translate-8b-GGUF": "c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42",                  # 2026-11-09
     # the QSA GGUFs, and the base model's picture reader (the QSA repository has none)
-    "MistVVK/SenseNova-Loop-9B-QSA-GGUF": "4ac7a2a81287f2d29a533c251f66b1fea129dc93",             # 2026-11-20
+    "MistVVK/SenseNova-Loop-9B-QSA-GGUF": "2ce9e179fa86e3ecd2f813396ef2e792910390af",             # 2026-11-20
     "sensenova/SenseNova-Loop-9B-GGUF": "11c121055062d33647348cf236a8c543138b282e",                 # 2026-11-20
 }
 
@@ -562,9 +562,8 @@ GYRO_CODER_FILES = {
 }
 
 # SenseNova-Loop-9B-QSA: the same four quantizations as the official repository, with trained QSA indexers added.
-# Each row's size and SHA-256 come from the GGUF's LFS pointer at the pinned revision.  A None hash means the file
-# does not exist yet: setup offers no size without a pinned hash.  E5 fills the two missing rows' size and hash,
-# after making those files, and they appear in the family below without another code change.
+# Each row's size and SHA-256 come from the GGUF's LFS pointer at the pinned revision: setup offers no file without
+# a pinned hash.  Every file was generated twice and the two copies compared byte for byte before it was stored.
 SENSENOVA_QSA_REPO = "MistVVK/SenseNova-Loop-9B-QSA-GGUF"
 SENSENOVA_QSA_FILES: dict[str, dict[str, Any]] = {
     "Q4_K_M": {"file": "Q4_K_M-qsa.gguf", "size": 5965458112,
@@ -573,10 +572,12 @@ SENSENOVA_QSA_FILES: dict[str, dict[str, Any]] = {
     "Q8_0": {"file": "Q8_0-qsa.gguf", "size": 9945475776,
              "sha256": "72107a8d3be8b7ca4ed829ea3a0ee1fe5b89f49a3264ea57dd72bbc4d0a765b3",
              "about": "8-bit, with QSA indexers"},
-    "BF16": {"file": "BF16-qsa.gguf", "size": None, "sha256": None,
-             "about": "the unquantized weights, with QSA indexers (E5)"},
-    "Q5_K_M": {"file": "Q5_K_M-qsa.gguf", "size": None, "sha256": None,
-               "about": "5-bit, with QSA indexers (E5)"},
+    "BF16": {"file": "BF16-qsa.gguf", "size": 18566736576,
+             "sha256": "9d745360346d88ca568f5ca7654c754a105a052ac2871a6414f820ff83a2b3db",
+             "about": "the unquantized weights, with QSA indexers"},
+    "Q5_K_M": {"file": "Q5_K_M-qsa.gguf", "size": 6815328960,
+               "sha256": "13d86283cdbbef9147d46fdd81675b870ebd7da4930f98f51f34b083f6c8b099",
+               "about": "5-bit, with QSA indexers"},
 }
 # The picture reader is the base model's official file; the QSA repository holds no vision encoder.
 _SENSENOVA_QSA_MMPROJ = {"repo": "sensenova/SenseNova-Loop-9B-GGUF",
