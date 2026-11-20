@@ -137,6 +137,26 @@ class Convert(unittest.TestCase):
         self.assertEqual(cfg["special_ids"], {"bos": 120000, "eos": 120025, "pad": 120002})
         self.assertEqual((self.out / "chat_template.jinja").read_text(encoding="utf-8"), "T")
 
+    def test_read_manifest_checks_real_strata_v1_magic(self):
+        import struct
+        d = Path(self.tmp.name)
+        bad = d / "bad.strata"
+        bad.write_bytes(b"STRATA1\0" + b"\x00" * 4088)
+        with self.assertRaises(ValueError):
+            H.read_manifest(bad)
+        good = d / "good.strata"
+        hdr = bytearray(4096)
+        hdr[:8] = b"STRATA\x00\x01"
+        struct.pack_into("<QQ", hdr, 16, 4096, 0)
+        good.write_bytes(bytes(hdr))
+        # Magic is accepted: either raises RuntimeError (no zstd in Python) or fails on empty payload, never ValueError("not a .strata file")
+        try:
+            H.read_manifest(good)
+        except ValueError as exc:
+            self.assertNotIn("not a .strata file", str(exc))
+        except Exception:
+            pass
+
 
 class RealTemplate(unittest.TestCase):
     """The file's own template through serve's ChatTemplate (Jinja sandbox, trim_blocks, lstrip_blocks): the text the model was trained on."""

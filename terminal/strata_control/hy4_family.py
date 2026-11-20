@@ -37,9 +37,9 @@ DEFAULT_VISION = True
 
 #: file name -> (bytes, sha256 or None)
 FILES = {
-    "Hy4-Flash-SQ-64.strata": (62_030_467_072, "4287bbbd42dbf0dc8bba3fd94142f0051dbc79be380452540726ab22a5d45e93"),
-    "Hy4-Flash-SQ-96.strata": (89_577_742_336, "ba9d501350330ebe230ecc815d6e2127c43eaa1741ce9dca7576bf69ef78ba64"),
-    "Hy4-Flash-SQ-128.strata": (113_654_603_776, "9bfd65640402114ac7162374c9799a444eb41b7add2a42e10457811a0d4474da"),
+    "Hy4-Flash-SQ-64.strata": (62_030_467_072, "b2cc38fe4bded35df82a701f9e868ea09c6fcd9be52c8446289e394f804417b2"),
+    "Hy4-Flash-SQ-96.strata": (89_577_742_336, "3b1c5755a220c69892b3d2dbad506b8593a30be24b17a390ecbd1642c0c1e14c"),
+    "Hy4-Flash-SQ-128.strata": (113_654_603_776, "6e8ba2729465f38ed42b5bfa7db02c92beddc25ca0413b7f0c24ab9f1e8b51f4"),
     ENGRAM_FILE: (67_584_905_216, "ab0cf9b3f9c64bd25f6212d4508e7443ab8b9bc133fbccc7bdfb83510a20c2c1"),
     VISION_FILE: (934_092_800, "ef09bceff8f01b8d226d2dc56aef09cec719b21b45783ee9b5d64e7241b72a09"),
 }

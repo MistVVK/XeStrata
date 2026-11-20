@@ -65,6 +65,9 @@ class Table(unittest.TestCase):
     def test_every_file_has_a_whole_file_hash_and_the_engram_section_hash_is_kept_apart(self):
         for name, (size, sha) in hy4_family.FILES.items():
             self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", sha or ""), name)
+        self.assertEqual(hy4_family.FILES["Hy4-Flash-SQ-64.strata"][1], "b2cc38fe4bded35df82a701f9e868ea09c6fcd9be52c8446289e394f804417b2")
+        self.assertEqual(hy4_family.FILES["Hy4-Flash-SQ-96.strata"][1], "3b1c5755a220c69892b3d2dbad506b8593a30be24b17a390ecbd1642c0c1e14c")
+        self.assertEqual(hy4_family.FILES["Hy4-Flash-SQ-128.strata"][1], "6e8ba2729465f38ed42b5bfa7db02c92beddc25ca0413b7f0c24ab9f1e8b51f4")
         whole = hy4_family.FILES[hy4_family.ENGRAM_FILE][1]
         self.assertEqual(whole, "ab0cf9b3f9c64bd25f6212d4508e7443ab8b9bc133fbccc7bdfb83510a20c2c1")
         self.assertEqual(hy4_family.ENGRAM_SECTION4_SHA256, "176944953bf2b601645d206171964f7fa51b77522ef5dc14ae61b0eb1c803d74")
@@ -119,8 +122,76 @@ class Offered(unittest.TestCase):
                     with mock.patch.object(hy4_family, "FILES", table):
                         self.assertTrue(setup.hy4_offered(ns))
 
-    def test_the_shipped_sources_file_is_empty_on_purpose(self):
-        self.assertEqual(hy4_family.sources(env={}, shipped=hy4_family.SOURCES_FILE), [])
+    def test_the_shipped_sources_file_names_the_hf_repo_and_parts(self):
+        srcs = hy4_family.sources(env={}, shipped=hy4_family.SOURCES_FILE)
+        self.assertEqual(len(srcs), 1)
+        src = srcs[0]
+        base = "https://huggingface.co/Niko1221/Hy4-Flash-Strata/resolve/main"
+        self.assertEqual(src["kind"], "http-parts")
+        self.assertEqual(src["base"], base)
+        self.assertEqual(hy4_family.urls_for("Hy4-Flash-SQ-64.strata", src),
+                         [f"{base}/Hy4-Flash-SQ-64.strata.part-aa", f"{base}/Hy4-Flash-SQ-64.strata.part-ab"])
+        self.assertEqual(hy4_family.urls_for("Hy4-Flash-SQ-96.strata", src),
+                         [f"{base}/Hy4-Flash-SQ-96.strata.part-aa", f"{base}/Hy4-Flash-SQ-96.strata.part-ab"])
+        self.assertEqual(hy4_family.urls_for("Hy4-Flash-SQ-128.strata", src),
+                         [f"{base}/Hy4-Flash-SQ-128.strata.part-aa", f"{base}/Hy4-Flash-SQ-128.strata.part-ab", f"{base}/Hy4-Flash-SQ-128.strata.part-ac"])
+        self.assertEqual(hy4_family.urls_for(hy4_family.ENGRAM_FILE, src),
+                         [f"{base}/{hy4_family.ENGRAM_FILE}.part-aa", f"{base}/{hy4_family.ENGRAM_FILE}.part-ab"])
+        self.assertEqual(hy4_family.urls_for(hy4_family.VISION_FILE, src),
+                         [f"{base}/{hy4_family.VISION_FILE}"])
+
+    def test_cli_accepts_family_hy4_flash_with_model_sq64_and_rejects_bare_sq64_cleanly(self):
+        import subprocess
+        # P0 #1 regression: --model SQ-64 without --family names --family hy4-flash (not empty string)
+        r = subprocess.run([sys.executable, str(HERE.parent / "setup.py"), "--model", "SQ-64", "--yes", "--no-start"],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--model SQ-64 is a size of --family hy4-flash", r.stderr)
+        # With --family hy4-flash, arg validation passes (exits cleanly or reaches later steps, never argparse error 2 on --model)
+        r2 = subprocess.run([sys.executable, str(HERE.parent / "setup.py"), "--family", "hy4-flash", "--model", "SQ-64", "--context", "131072", "--vision", "yes", "--check"],
+                            capture_output=True, text=True, timeout=120)
+        self.assertNotIn("is a size of", r2.stderr)
+        self.assertIn("Tencent Hy4-Flash 220B-A12B", r2.stdout)
+
+    def test_control_mode_allows_strata_hy4_export_tokenizer_fallback(self):
+        # P0 #4 regression: bundled CONTROL=True mode permits strata-hy4[.exe] --export-tokenizer fallback when Python lacks zstd
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            eng = root / ("strata-hy4.exe" if os.name == "nt" else "strata-hy4")
+            eng.write_bytes(b"")
+            model = root / "Hy4-Flash-SQ-64.strata"
+            model.write_bytes(b"STRATA\x00\x01" + b"\x00" * 4088)
+            out = root / "tok"
+            seen = []
+
+            def fake_subproc(cmd, **kw):
+                seen.append((cmd, kw.get("env")))
+                raw = Path(cmd[3])
+                raw.mkdir(parents=True, exist_ok=True)
+                (raw / "tokenizer.hf.json").write_text("{}", encoding="utf-8")
+                (raw / "chat_template.jinja").write_text("T", encoding="utf-8")
+                return mock.Mock(returncode=0, stdout="")
+
+            with mock.patch.object(setup, "CONTROL", True), mock.patch.object(setup, "say"), \
+                    mock.patch("subprocess.run", side_effect=fake_subproc), \
+                    mock.patch("hy4_tokenizer.read_manifest", side_effect=RuntimeError("no zstd")), \
+                    mock.patch("hy4_tokenizer.convert_files", return_value={}):
+                got = setup.hy4_tokenizer_dir(model, out, eng)
+            self.assertEqual(got, out)
+            self.assertEqual(seen[0][0][:2], [str(eng), "--export-tokenizer"])
+
+    def test_strata_mcp_install_plan_omits_qwen_drafter_flags_for_hy4(self):
+        # #109 regression: strata_mcp install_plan for hy4-flash must not pass Qwen's --drafter mtp / --mtp
+        with tempfile.TemporaryDirectory() as d:
+            s = M.Strata(Path(d), HERE.parent)
+            t = M.Tools(s)
+            hw = {"ram_gb": 64.0, "gpus": [{"index": 0, "name": "RTX 5070", "vram_gb": 12.0, "usable": True, "vendor": "nvidia"}]}
+            with mock.patch.object(s, "hardware", return_value=hw), mock.patch.object(s, "disk_free", return_value=500.0):
+                _plan, args = t.install_plan("hy4-flash", "SQ-64", 131072, "yes", None, None, None, None, None, None, None, drafter="mtp", mtp="on")
+            self.assertNotIn("--drafter", args)
+            self.assertNotIn("--mtp", args)
+            self.assertEqual(args[args.index("--family") + 1], "hy4-flash")
+            self.assertEqual(args[args.index("--model") + 1], "SQ-64")
 
     def test_source_forms(self):
         env = {"STRATA_HY4_SOURCE": "https://models.example/hy4/"}

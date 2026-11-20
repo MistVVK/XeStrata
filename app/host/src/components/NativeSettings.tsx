@@ -124,8 +124,9 @@ export function NativeSettings({ model }: {
       {error ? <><ErrorNotice message={tr('Couldn’t load model settings.')} next={tr('Check that the engine is connected and this model is installed, then try again.')} onRetry={() => setRevision(value => value + 1)}/><details className="native-settings-diagnostic"><summary className="small">{tr('Details')}</summary><p className="small muted">{error}</p></details></> : <p className="small muted" role="status">{tr('Reading saved settings…')}</p>}
     </details>;
     const family = (native?.catalog?.families ?? []).find(f => f.sizes.some(s => s.id === model))?.family ?? null;
-    const draftingOffered = !!draftingChoices(family, native?.capabilities?.dflash2);
-    const rows = (native?.fields ?? []).filter(f => (f.id !== 'drafting' || draftingOffered) && `${tr(f.label)} ${f.id} ${tr(f.group)}`.toLowerCase().includes(query.toLowerCase()));
+    const draftingOpts = draftingChoices(family, native?.capabilities?.dflash2);
+    const draftingOffered = !!draftingOpts;
+    const rows = (native?.fields ?? []).filter(f => (f.id !== 'drafting' || draftingOffered) && `${tr(f.label)} ${f.id} ${tr(f.group)}`.toLowerCase().includes(query.toLowerCase())).map(f => f.id === 'drafting' && draftingOpts ? { ...f, choices: draftingOpts } : f);
     const switchRows = switches.filter(sw => `${tr(sw.label)} ${sw.id} ${tr(switchGroup(sw))}`.toLowerCase().includes(query.toLowerCase()));
     // A choice switch (owner, 0.2.16: STRATA_ROUTE_TAIL_SKIP): the default writes no entry, every other choice writes its value (src/lib/speed-choice.ts). 0.2.17: the default is Off, On is 7.
     const choiceRow = (sw: SpeedSwitch) => { const known = choiceValue(sw, values.env), numbered = isNumberChoice(sw, known);

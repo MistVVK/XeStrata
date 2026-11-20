@@ -4,9 +4,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
-import { isHy4, isHy4Family } from '../server/hy4.mjs';
+import { isHy4, isHy4Family, hy4VisionShard, withoutHy4Vision } from '../server/hy4.mjs';
 import { resourceSettings, saferStart } from '../server/native-resources.mjs';
 import { speedSwitchApplies } from '../server/native-settings.mjs';
+import { checkRunConfig } from '../server/run-config-check.mjs';
+import { markPictures, runtimeVision } from '../server/native-vision.mjs';
 
 const bundle = async file => {
   const built = await build({ entryPoints: [fileURLToPath(new URL(file, import.meta.url))], bundle: true, write: false, platform: 'node', format: 'esm', loader: { '.json': 'json' } });
@@ -73,4 +75,38 @@ test('the environment speed switches do not apply to it', () => {
     assert.equal(speedSwitchApplies(id, { backend: 'cuda', arch: 'hy4flash', gpus: [{ vram_gb: 12, vendor: 'nvidia' }] }), false, id);
   }
   assert.equal(speedSwitchApplies('route_tail_skip', { backend: 'cuda', gpus: [] }), true, 'the Strata engine keeps its switch');
+});
+
+test('run-config validation accepts Hy4-Flash drafting: dfly2', () => {
+  const cfg = {
+    exe: 'component:strata-hy4',
+    arch: 'hy4flash',
+    model_name: 'hy4-flash-sq-64',
+    port: 8095,
+    drafting: 'dfly2',
+    args: ['--native', 'C:\\m\\Hy4-Flash-SQ-64.strata', '--engram', 'C:\\m\\Hy4-Flash-Engram-Q8.strata', '--max-context', '131072'],
+  };
+  const checked = checkRunConfig(JSON.stringify(cfg, null, 2));
+  assert.equal(checked.ok, true, JSON.stringify(checked.issues));
+});
+
+test('hy4VisionShard, withoutHy4Vision, runtimeVision, and markPictures handle built-in Vision shard cleanly', () => {
+  const cfg = {
+    arch: 'hy4flash',
+    exe: 'component:strata-hy4',
+    args: ['--native', 'C:\\m\\Hy4-Flash-SQ-64.strata', '--vision', 'C:\\m\\Hy4-Flash-Vision.strata', '--max-context', '131072'],
+  };
+  assert.equal(hy4VisionShard(cfg), 'C:\\m\\Hy4-Flash-Vision.strata');
+  assert.deepEqual(withoutHy4Vision(cfg.args), ['--native', 'C:\\m\\Hy4-Flash-SQ-64.strata', '--max-context', '131072']);
+  assert.equal(runtimeVision(cfg, 'yes'), undefined);
+  assert.equal(runtimeVision(cfg, 'no'), undefined);
+  const noShard = { arch: 'hy4flash', exe: 'component:strata-hy4', args: ['--native', 'C:\\m\\Hy4-Flash-SQ-64.strata'] };
+  assert.equal(hy4VisionShard(noShard), null);
+  assert.throws(() => runtimeVision(noShard, 'yes'), /Prepare this model/);
+  const marked = markPictures({ families: FAMILIES }, false);
+  const hy4Fam = marked.families.find(f => f.family === 'hy4-flash');
+  const qwenFam = marked.families.find(f => f.family === 'qwen');
+  assert.equal(hy4Fam.images, true);
+  assert.equal(hy4Fam.sizes[0].images, true);
+  assert.equal(qwenFam.images, false, 'Qwen still requires strata-vision reader');
 });

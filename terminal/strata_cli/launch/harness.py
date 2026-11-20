@@ -128,9 +128,18 @@ def claude_file(t: Target) -> str:
     return _j({"env": claude_env(t)})
 
 
+def _display_name(t: Target) -> str:
+    m = (t.model or "").lower()
+    if m.startswith("hy4-flash"):
+        return "Tencent Hy4-Flash 220B-A12B (Strata, local)"
+    if m.startswith("qwen3.6") or m.startswith("qwen36"):
+        return "Qwen3.6-35B-A3B (Strata, local)"
+    return "Qwen3.8-Flash-Next (Strata, local)"
+
+
 def omp_models(t: Target) -> str:
     return ("providers:\n  strata:\n    baseUrl: " + t.base + "\n    api: openai-completions\n    auth: none\n    compat:\n"
-            "      supportsDeveloperRole: false\n    models:\n      - id: " + t.model + "\n        name: Qwen3.8-Flash-Next (Strata, local)\n"
+            "      supportsDeveloperRole: false\n    models:\n      - id: " + t.model + "\n        name: " + _display_name(t) + "\n"
             "        reasoning: true\n        input: [text]\n        contextWindow: " + str(t.context) + "\n        maxTokens: " + str(t.output_cap) +
             "\n        thinking:\n          mode: effort\n          efforts: [minimal, low, medium, high]\n          defaultLevel: medium\n"
             "        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}\n")
@@ -144,7 +153,7 @@ def omp_config(t: Target) -> str:
 def pi_models(t: Target) -> str:
     return _j({"providers": {"strata": {"baseUrl": t.base, "api": "openai-completions", "apiKey": t.key,
                                         "compat": {"supportsDeveloperRole": False, "supportsReasoningEffort": False},
-                                        "models": [{"id": t.model, "name": "Qwen3.8-Flash-Next (Strata, local)", "reasoning": True,
+                                        "models": [{"id": t.model, "name": _display_name(t), "reasoning": True,
                                                     "input": ["text"], "contextWindow": t.context, "maxTokens": t.output_cap,
                                                     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}]}}})
 

@@ -817,7 +817,7 @@ PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and t
 from strata_control import hy4_family, hy4_fit  # noqa: E402
 HY4_FAMILIES = {
     hy4_family.FAMILY: {
-        "title": hy4_family.TITLE, "by": hy4_family.BY, "tag": hy4_family.TAG, "name": hy4_family.FAMILY, "arch": hy4_family.ARCH, "hy4": True, "vision": False,
+        "title": hy4_family.TITLE, "by": hy4_family.BY, "tag": hy4_family.TAG, "name": hy4_family.FAMILY, "arch": hy4_family.ARCH, "hy4": True, "vision": hy4_family.DEFAULT_VISION,
         "about": "a very large mixture-of-experts model (12B active): runs from RAM and the SSD on a PC with 32 GB or more; the Engram file is read from the SSD",
         "license": "Tencent's base model license: https://huggingface.co/tencent/Hy4-flash",
         "models": {b: {"about": hy4_family.BUILD_ABOUT[b], "ram_gb": int(-(-hy4_fit.BUILDS[b]["footprint_gb"] // 1))} for b in hy4_fit.ORDER[::-1]},
@@ -1018,10 +1018,11 @@ def net_fail(e: "netpolicy.NetFailure", url: str, what=None):
 def run(cmd, cwd=None, env=None, check=True, quiet=False):
     """An install, build or preparation step (pip, cmake, a package manager, tools/*.py): never part of a start."""
     acquisition.require("an install or build step (" + Path(str(cmd[0])).name + ")")
-    if CONTROL:                                        # the app: only this Python running a bundled tool
+    if CONTROL:                                        # the app: only this Python running a bundled tool (or strata-hy4 --export-tokenizer)
         argv = [str(c) for c in cmd]
-        if len(argv) < 2 or os.path.normcase(argv[0]) != os.path.normcase(sys.executable) or argv[1] == "-m" or \
-                Path(argv[1]).resolve().parent not in ((ROOT / "tools").resolve(), (engine_src() / "metal" / "tools").resolve()):
+        hy4_tok = len(argv) >= 2 and Path(argv[0]).name.lower() in ("strata-hy4", "strata-hy4.exe") and argv[1] == "--export-tokenizer"
+        if not hy4_tok and (len(argv) < 2 or os.path.normcase(argv[0]) != os.path.normcase(sys.executable) or argv[1] == "-m" or
+                Path(argv[1]).resolve().parent not in ((ROOT / "tools").resolve(), (engine_src() / "metal" / "tools").resolve())):
             raise acquisition.AcquisitionRefused("the desktop app's installer only runs its bundled preparation tools; "
                                                  + " ".join(argv[:2]))
     say("  > " + " ".join(str(c) for c in cmd))
@@ -7563,15 +7564,17 @@ def choices_from_config(cfg_path: Path) -> dict:
     """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     tag = cfg_path.stem[len("strata-"):]
-    own = next((f for f, d in OWN_PATH_FAMILIES.items() if tag.startswith(d["tag"])), None)
-    if own is not None:                                # Qwen3.6: its own sizes; no KV / images / projection settings
-        d = OWN_PATH_FAMILIES[own]
+    special_fams = {**OWN_PATH_FAMILIES, **HY4_FAMILIES}
+    own = next((f for f, d in special_fams.items() if tag.startswith(d["tag"])), None)
+    if own is not None:                                # Qwen3.6 / Hy4-Flash: own sizes; no Flash-Next KV / projection settings
+        d = special_fams[own]
         size = next((m for m in d["models"] if m.lower() == tag[len(d["tag"]):].lower()), None)
         a = cfg.get("args", [])
         ctx = a[a.index("--max-context") + 1] if "--max-context" in a and a.index("--max-context") + 1 < len(a) else None
         vis = cfg.get("vision")
         return {"family": own, "model": size, "context": int(ctx) if ctx and ctx.isdigit() else None, "kv": None,
-                "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none", "esp": "off", "host": cfg.get("host"), "api_key": cfg.get("api_key"),
+                "vision": ("yes" if "--vision" in a else "none") if d.get("hy4") else (("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none"),
+                "esp": "off", "host": cfg.get("host"), "api_key": cfg.get("api_key"),
                 "port": cfg.get("port"), "gpu": cfg.get("gpu"), "layer_split": None,
                 "cuda": 12 if config_toolkit(cfg) == 12 else None, "vram_reserve_mib": None}
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
@@ -7598,12 +7601,13 @@ def choices_from_config(cfg_path: Path) -> dict:
 
 def calibration_targets(have: list, model: str | None, family: str | None) -> list:
     """#2036: the installed configs `--calibrate --model X` (and/or --family) means; every config with neither."""
+    skip = set(OWN_PATH_FAMILIES) | set(HY4_FAMILIES)
     if not (model or family):
-        return [c for c in have if choices_from_config(c)["family"] not in OWN_PATH_FAMILIES]
+        return [c for c in have if choices_from_config(c)["family"] not in skip]
     out = []
     for c in have:
         ch = choices_from_config(c)
-        if ch["family"] in OWN_PATH_FAMILIES:            # the tuning measures Flash-Next's engine settings
+        if ch["family"] in skip:                         # the tuning measures Flash-Next's engine settings
             continue
         if (not model or ch["model"] == model) and (not family or ch["family"] == family):
             out.append(c)
@@ -9775,7 +9779,11 @@ def hy4_tokenizer_dir(model: Path, out: Path, engine: Path | None) -> Path | Non
     if engine is not None and Path(engine).is_file():
         raw = out.with_name(out.name + "-export")
         raw.mkdir(parents=True, exist_ok=True)
-        run([str(engine), "--export-tokenizer", str(model), str(raw)])
+        env = dict(os.environ)
+        var = "PATH" if WIN else "LD_LIBRARY_PATH"
+        eng_dir = str(Path(engine).resolve().parent)
+        env[var] = os.pathsep.join([eng_dir, env[var]]) if env.get(var) else eng_dir
+        run([str(engine), "--export-tokenizer", str(model), str(raw)], env=env)
         hy4_tokenizer.convert_files(raw / "tokenizer.hf.json", raw / "chat_template.jinja", out)
         return out
     return None
@@ -10467,7 +10475,7 @@ def main() -> int:
                     help="the draft layer (MTP): off starts the model without it, which frees about 1 GB of graphics memory "
                          "for the expert cache and takes less RAM, at the price of speed; it is kept in the run config "
                          "(\"mtp\": false) and a later setup run does not undo it. on: back to the default")
-    ap.add_argument("--drafter", choices=["mtp", "dflash2"],
+    ap.add_argument("--drafter", choices=["mtp", "dflash2", "dfly2"],
                     help="which drafter this model will use. dflash2: the MTP draft layer's ~5 GB are not downloaded (the DFlash2 drafter is fetched by `strata drafting fetch`); "
                          "the arguments keep the --mtp folder so a later switch to the MTP works. mtp (the default): the draft layer is fetched as before. Nothing is written about it "
                          "in the run config: the choice is its \"drafting\" key")
@@ -10504,8 +10512,8 @@ def main() -> int:
     if getattr(a, "dsv41_package", None):              # DeepSeek's engine package: no longer offered (strata_control/retired.py)
         say("  " + retired.NOT_OFFERED)
         return 2
-    if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES:
-        ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in PREVIEW_FAMILIES.items()
+    if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES and a.family not in HY4_FAMILIES:
+        ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in {**PREVIEW_FAMILIES, **HY4_FAMILIES}.items()
                                                               if a.model in d["models"]))
     if a.source:
         os.environ["STRATA_SOURCE"] = a.source
@@ -10553,7 +10561,8 @@ def main() -> int:
             a.gpus = ",".join(str(i) for i in order)
         else:
             a.gpu = order[0]
-    say("Strata - " + (OWN_PATH_FAMILIES[a.family]["title"] if a.family in OWN_PATH_FAMILIES else "Qwen3.8-Flash-Next")
+    _fams = {**OWN_PATH_FAMILIES, **HY4_FAMILIES}
+    say("Strata - " + (_fams[a.family]["title"] if a.family in _fams else "Qwen3.8-Flash-Next")
         + " on a normal PC (a GPU + system RAM + CPU)")
     have = installed_configs()
     if a.update or not (a.setup or a.model or a.family or a.check or a.no_start or a.calibrate or a.rollback_engine):

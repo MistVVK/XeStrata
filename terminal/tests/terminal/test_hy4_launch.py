@@ -93,5 +93,27 @@ class Config(unittest.TestCase):
             self.assertNotIn(flag, cfg["args"])
 
 
+class CatalogAndHarness(unittest.TestCase):
+    def test_catalog_resolve_and_names_include_hy4_flash(self):
+        # P0 #2 regression: strata launch --plan --family hy4-flash --model SQ-64 must resolve SQ-64 cleanly
+        import tempfile
+        from strata_cli.launch.catalog import Catalog
+        with tempfile.TemporaryDirectory() as d:
+            cat = Catalog(src=Path(__file__).resolve().parents[2], root=Path(d))
+            self.assertEqual(cat.resolve("SQ-64", "hy4-flash"), ("hy4-flash", "SQ-64"))
+            self.assertEqual(cat.resolve("sq-64"), ("hy4-flash", "SQ-64"))
+            self.assertEqual(cat.model_name_of("hy4-flash", "SQ-64"), "hy4-flash-sq-64")
+            self.assertEqual(cat.tag_of("hy4-flash", "SQ-64"), "hy4-flash-sq-64")
+            self.assertEqual(cat.model_folder(Path(d), "hy4-flash", "SQ-64"), Path(d) / "models" / "hy4-flash")
+
+    def test_harness_display_name_uses_hy4_flash_title(self):
+        from strata_cli.launch import harness
+        t_hy4 = harness.Target(url="http://127.0.0.1:8095", key="k", model="hy4-flash-sq-64", context=131072)
+        self.assertIn("name: Tencent Hy4-Flash 220B-A12B (Strata, local)", harness.omp_models(t_hy4))
+        self.assertIn("Tencent Hy4-Flash 220B-A12B (Strata, local)", harness.pi_models(t_hy4))
+        t_qwen = harness.Target(url="http://127.0.0.1:8095", key="k", model="qwen3.8-flash-next-iq3_s", context=32768)
+        self.assertIn("name: Qwen3.8-Flash-Next (Strata, local)", harness.omp_models(t_qwen))
+
+
 if __name__ == "__main__":
     unittest.main()

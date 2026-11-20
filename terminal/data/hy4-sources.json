@@ -1,4 +1,12 @@
 {
-  "_note": "Download sources for the Hy4-Flash files, tried in order after the config's hy4_source and the STRATA_HY4_SOURCE environment variable. Empty on purpose: the owner decides where the public files live (phaseA-tests/hy4/HY4-INTEGRATION-DESIGN.md section 4). A source is {\"kind\": \"http\" | \"http-parts\", \"base\": \"https://...\", \"files\": {\"<name>\": [\"url\", ...]}}.",
-  "sources": []
+ "note": "Public Hugging Face mirror for Tencent Hy4-Flash (.strata v1.0, 42 GiB split parts + unsplit Vision shard). Overridden by STRATA_HY4_SOURCE or config key hy4_source.",
+ "sources": [
+  {
+   "kind": "http-parts",
+   "base": "https://huggingface.co/Niko1221/Hy4-Flash-Strata/resolve/main",
+   "files": {
+    "Hy4-Flash-Vision.strata": "https://huggingface.co/Niko1221/Hy4-Flash-Strata/resolve/main/Hy4-Flash-Vision.strata"
+   }
+  }
+ ]
 }

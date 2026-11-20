@@ -2480,9 +2480,9 @@ class Tools:
             args += ["--gguf-dir", str(local)]
         if backend in ("cuda", "hip", "sycl"):
             args += ["--backend", backend]
-        if drafter in ("mtp", "dflash2") and backend != "sycl":      # an Arc runs with no drafter the installer sets up (the Terminal's adopted config has none either)
+        if drafter in ("mtp", "dflash2") and backend != "sycl" and not md.get("hy4"):      # an Arc or Hy4-Flash runs with no Qwen drafter the installer sets up
             args += ["--drafter", drafter]
-        if mtp in ("on", "off"):                                      # the app's Drafting Off: no draft layer is fetched, on a Mac too (setup.py takes --mtp everywhere)
+        if mtp in ("on", "off") and not md.get("hy4"):                                      # the app's Drafting Off: no draft layer is fetched, on a Mac too (setup.py takes --mtp everywhere)
             args += ["--mtp", mtp]
         fit = None
         ram = hw.get("ram_gb")

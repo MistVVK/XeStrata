@@ -26,7 +26,6 @@ first positions of rows + IndexPool (about 46K here, 33K measured on a real 8 GB
 for experts (0.3 GB) and RAM holds 5.7 GB of state plus HOST_PIN_HEADROOM_GB (about 58 GB of a 64 GiB PC are usable): SQ-64 does not fit 8 GiB + 64 GiB (about 3.4 GB from the SSD) and is
 still recommended there, still at 128K, with the "may run slower" words and its SSD-read figure.  A 12 GiB card keeps the rows in the card and pins only the kv_b copies (1.4 GB): 0.6 GB of
 experts in the card, SQ-64 + 64 GiB resident (12 GiB + 32 GiB reads 33 GB).  A 16 GiB card and larger hold all the state and reserve the prefill scratch.
-Known gap (HY4-CUDA): the cold SSD expert tier of the CUDA engine is Linux-only; a Windows PC whose RAM is short has no reader for it yet.
 
 Unified memory (Strata Halo, Apple silicon, DGX Spark) has one pool: the trunk, the KV and every expert body live in it and nothing is copied or read from the SSD while the
 footprint fits `pool - UMA_RESERVE_GB - kv_extra - vision`.

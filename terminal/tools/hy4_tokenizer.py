@@ -35,8 +35,8 @@ def read_manifest(path) -> dict:
     """Section 0 of a `.strata` file as a dict.  RuntimeError (with the engine's way) when this Python has no zstd module."""
     with open(path, "rb") as f:
         frame = f.read(4096)
-        if frame[:8] != b"STRATA1\0":
-            raise ValueError(f"{path} is not a .strata file (no STRATA1 magic)")
+        if frame[:8] != b"STRATA\x00\x01":
+            raise ValueError(f"{path} is not a .strata file (no STRATA\\x00\\x01 magic)")
         off, length = struct.unpack_from("<QQ", frame, 16)
         f.seek(off)
         raw = f.read(length)
