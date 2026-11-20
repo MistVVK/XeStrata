@@ -18,7 +18,7 @@ const catalog = await bundle('../src/lib/native-catalog.ts');
 const fit = await bundle('../src/lib/native-fit.ts');
 const names = await bundle('../src/lib/native-names.ts');
 
-const size = (build, mode, extra = {}) => ({ id: `hy4-flash-${build.toLowerCase()}`, model: build, about: '', download_gb: 130, ram_needed_gb: 62, experts_gb: 56, on_this_pc: 'fits', installed: false,
+const size = (build, mode, extra = {}) => ({ id: `hy4-flash-${build.toLowerCase()}`, model: build, about: '', download_gb: 130, ram_needed_gb: 62, experts_gb: 56, images: true, on_this_pc: 'fits', installed: false,
   hy4: { placement: { vram_gb: 5.08, ram_gb: 50.96, ssd_gb: 0 }, mode, recommended: false, unified: false, engram_gb: 67.58 }, ...extra });
 const FAMILIES = [
   { family: 'qwen', title: 'Qwen3.8-Flash-Next', images: true, sizes: [{ id: 'iq3_s', model: 'IQ3_S' }] },
@@ -77,7 +77,7 @@ test('the environment speed switches do not apply to it', () => {
   assert.equal(speedSwitchApplies('route_tail_skip', { backend: 'cuda', gpus: [] }), true, 'the Strata engine keeps its switch');
 });
 
-test('run-config validation accepts Hy4-Flash drafting: dfly2', () => {
+test('run-config validation accepts Hy4-Flash drafting: dfly2 and rejects it for Qwen', () => {
   const cfg = {
     exe: 'component:strata-hy4',
     arch: 'hy4flash',
@@ -88,6 +88,8 @@ test('run-config validation accepts Hy4-Flash drafting: dfly2', () => {
   };
   const checked = checkRunConfig(JSON.stringify(cfg, null, 2));
   assert.equal(checked.ok, true, JSON.stringify(checked.issues));
+  const qwen = checkRunConfig(JSON.stringify({ exe: 'component:strata-engine', drafting: 'dfly2' }, null, 2));
+  assert.equal(qwen.ok, false);
 });
 
 test('hy4VisionShard, withoutHy4Vision, runtimeVision, and markPictures handle built-in Vision shard cleanly', () => {

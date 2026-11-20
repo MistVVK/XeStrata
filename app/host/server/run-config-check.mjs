@@ -11,6 +11,7 @@
  * `message` is the same sentence in English for logs and the Details of a refused start.
  */
 import { NATIVE_FIELDS } from './native-settings.mjs';
+import { isHy4 } from './hy4.mjs';
 
 /** Every top-level key a run config may carry: what setup writes, what serve/server.py reads, the app's own fields. */
 export const KNOWN_KEYS = new Set([
@@ -109,7 +110,7 @@ export function checkRunConfig(text, { known = KNOWN_KEYS } = {}) {
       if (value === '') continue;
       if (f.type === 'number' && (typeof value !== 'number' || !Number.isInteger(value) || value < f.min || value > f.max)) add('error', 'whole-range', key, { key, min: f.min, max: f.max, value: show(value) }, `"${key}" must be a whole number from ${f.min} to ${f.max}, not ${show(value)}.`);
       else if (f.type === 'boolean' && typeof value !== 'boolean') add('error', 'bool', key, { key, value: show(value) }, `"${key}" must be true or false, not ${show(value)}.`);
-      else if (f.type === 'enum' && !f.choices.includes(value)) add('error', 'choice', key, { key, choices: f.choices.join(', '), value: show(value) }, `"${key}" must be one of ${f.choices.join(', ')}, not ${show(value)}.`);
+      else if (f.type === 'enum' && !(key === 'drafting' && value === 'dfly2' && isHy4(config)) && !f.choices.includes(value)) add('error', 'choice', key, { key, choices: f.choices.join(', '), value: show(value) }, `"${key}" must be one of ${f.choices.join(', ')}, not ${show(value)}.`);
       else if (f.type === 'string' && (typeof value !== 'string' || value.length > 256)) add('error', 'text', key, { key }, `"${key}" must be text of at most 256 characters.`);
       else if (f.type === 'array') {
         const list = typeof value === 'string' ? value.split(',').map(v => v.trim()).filter(Boolean) : value;

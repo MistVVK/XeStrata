@@ -49,8 +49,14 @@ class TheTerminalMenu(unittest.TestCase):
     def test_the_v100_screenshot(self):
         rows = self.rows(HW_V100_31)
         for (family, model), r in rows.items():
+            if family == "hy4-flash":
+                # Hy4-Flash uses its own rank-cut placement rule (strata_control/hy4_fit.py, pinned by test_hy4_fit.py), which reserves OS/Engram/KV room.
+                self.assertIn((r.verdict, r.words), ((FITS, "fits"), (SLOWER, "may run slower")), (family, model))
+                continue
             want = FITS if r.fit_gb <= 63.0 else SLOWER
             self.assertEqual((r.verdict, r.words), (want, "fits" if want == FITS else "may run slower"), (family, model, r.fit_gb))
+        if ("hy4-flash", "SQ-64") in rows:
+            self.assertEqual(rows[("hy4-flash", "SQ-64")].words, "may run slower")
         for m in ("UD-IQ1_M", "UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL"):         # the Unsloth sets that were "too big", 39 to 61 GB
             self.assertEqual(rows[("unsloth", m)].words, "fits", m)
         for m in ("UD-IQ4_XS", "UD-IQ4_XS-v31", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"):

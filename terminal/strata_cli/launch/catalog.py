@@ -528,7 +528,7 @@ class Catalog:
     def resolve(self, model: str, family: str | None = None) -> tuple[str, str]:
         """`iq3_xxs` or `IQ3_XXS` (and an optional family) -> (family, model); raises ValueError with the closest match."""
         models, families, _ctx, _src = self.tables()
-        all_families = self._all_families(families)
+        all_families = Catalog._all_families(self, families)
         names = list(dict.fromkeys([*models, *self.strata.own_size_names()]))
         match = next((n for n in names if n.lower() == model.lower()), None)
         if match is None:
@@ -553,12 +553,12 @@ class Catalog:
         """The ``model_name`` setup writes into this model's run config (``qwen3.8-flash-next-iq3_s``), known before the model is installed: what the drafter table is keyed by."""
         if not family or not model:
             return None
-        fam = self._all_families(self.tables()[1]).get(family) or {}
+        fam = Catalog._all_families(self, self.tables()[1]).get(family) or {}
         return f"{fam.get('name', family)}-{model.lower()}"
 
     def tag_of(self, family: str, model: str) -> str:
         _m, families, _c, _s = self.tables()
-        all_families = self._all_families(families)
+        all_families = Catalog._all_families(self, families)
         return (all_families[family].get("tag", "") + model).lower()
 
     def model_folder(self, base: Path, family: str, model: str) -> Path:
@@ -571,7 +571,7 @@ class Catalog:
         """model_folder's lookup with its steps (#4887, `strata models explain`): {"folder", "rule", "tried": [{"path", "rule", "exists"}]}. rule: "exact" (setup's
         spelling), "lower" (the run-config tag), "case" (a folder that differs only in letter case) or "fallback" (none is there: setup's spelling, where a download goes)."""
         _m, families, _c, _s = self.tables()
-        all_families = self._all_families(families)
+        all_families = Catalog._all_families(self, families)
         models = Path(base) / "models"
         if all_families.get(family, {}).get("hy4"):
             hy4_dir = models / family
