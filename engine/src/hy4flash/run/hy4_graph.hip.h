@@ -143,7 +143,8 @@ public:
 
     // hybrid placement: tier-2 experts live in host RAM and are computed by hy4_cpu_experts while the GPU runs the shared experts and the VRAM-resident experts
     CpuExperts cpu;
-    bool hyb = false;
+    bool hyb = false, has_cold = false;
+    std::vector<uint8_t> cold_flag, h_use;  // [41*512] cold experts by (layer, id); [Tc*16] per-pair "computed by the CPU" flags of a prefill chunk
     float *h_z = nullptr, *h_w = nullptr, *h_zcpu = nullptr, *d_zcpu = nullptr;
     int32_t* h_idx = nullptr;
     hipEvent_t ev_hyb = nullptr;
@@ -252,7 +253,10 @@ public:
                     hp[e].dn_off = er.dn_off;
                     hp[e].gu_code = er.gu_code;
                     hp[e].dn_code = er.dn_code;
-                    if (er.tier == 2) {
+                    if (er.tier == 3) {
+                        hp[e].body_off = 0;
+                        hp[e].pad = 1;  // cold expert: computed by the CPU pool from the SSD
+                    } else if (er.tier == 2) {
                         if (in_group[e]) {
                             hp[e].body_off = (uint64_t)(uintptr_t)(d_scratch[b] + eoff[e]) - (uint64_t)(uintptr_t)g.d_sec4;
                             hp[e].pad = 0;
@@ -451,7 +455,7 @@ public:
                 h[i].dn_off = e.dn_off;
                 h[i].gu_code = e.gu_code;
                 h[i].dn_code = e.dn_code;
-                h[i].pad = e.tier == 2 ? 1 : 0;  // CPU-resident experts are skipped by the GPU routing
+                h[i].pad = (e.tier == 2 || e.tier == 3) ? 1 : 0;  // CPU-computed experts (resident or cold) are skipped by the GPU routing
             }
             d_experts = dalloc<ExpertDev>(41 * 512);
             HCK(hipMemcpy(d_experts, h.data(), h.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
@@ -466,6 +470,19 @@ public:
             HCK(hipEventCreateWithFlags(&ev_hyb, hipEventDisableTiming));
             int nth = getenv("HY4_CPU_THREADS") ? atoi(getenv("HY4_CPU_THREADS")) : std::max(1, (int)std::thread::hardware_concurrency() / 2);
             if (!cpu.init(g.path, nth, &g.cpu_mask, err)) return false;
+            if (!g.cold_mask.empty()) {
+#if HY4_COLD_API
+                if (!cpu.set_cold_experts(g.cold_mask, err)) return false;
+#else
+                err = "cold experts need hy4_cpu_experts with set_cold_experts";
+                return false;
+#endif
+                has_cold = true;
+                cold_flag.assign(41 * 512, 0);
+                for (int l = 0; l < 41; ++l)
+                    for (int e = 0; e < 512; ++e) cold_flag[l * 512 + e] = g.cold_mask[l][e] ? 1 : 0;
+                h_use.assign((size_t)Tc * 16, 0);
+            }
             if (!getenv("STRATA_CPUEXP_ACT")) cpu.set_hi_activations(true);  // two-term int8 activations: ~GPU-exact quality (KL 1e-3 vs 7e-3) for ~1% decode cost
             skd::moe_has_cpu() = 1;
             hyb = true;
@@ -781,6 +798,12 @@ public:
         const size_t nz = (size_t)T * 1536;
         if (pf_active(T)) {
             // large chunk: every expert (the CPU tier arrives through the scratch buffers, group by group) runs on the GPU
+            if (has_cold) {  // the cold experts (SSD) are computed by the CPU pool while the GPU runs the streamed groups
+                HCK(hipMemcpyAsync(h_z, z_f, nz * 4, hipMemcpyDeviceToHost, st));
+                HCK(hipMemcpyAsync(h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+                HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+                HCK(hipEventRecord(ev_hyb, st));
+            }
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
             const std::vector<PfGroup>& gs = pf_groups[il - 1];
             for (size_t gi = 0; gi < gs.size(); ++gi) {
@@ -794,6 +817,16 @@ public:
                 ev_pf_done_set[b] = true;
                 ++pf_next_comp;
                 pf_pump(k + pf_nbuf);
+            }
+            if (has_cold) {
+                double t0 = now_s();
+                HCK(hipEventSynchronize(ev_hyb));
+                for (size_t i = 0; i < (size_t)T * 16; ++i) h_use[i] = cold_flag[(size_t)(il - 1) * 512 + (size_t)h_idx[i]];
+                cpu.submit(il - 1, T, h_z, h_idx, h_w, h_use.data(), h_zcpu);
+                cpu.wait();
+                t_cpu_wait += now_s() - t0;
+                HCK(hipMemcpyAsync(d_zcpu, h_zcpu, nz * 4, hipMemcpyHostToDevice, st));
+                hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
             }
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
             lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
