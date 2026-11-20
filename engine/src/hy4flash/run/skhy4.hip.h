@@ -8,6 +8,9 @@
 #include "skgemm.hip.h"
 #include "skfast.hip.h"
 #include "skwmma.hip.h"
+#if HY4_MMA && !HY4_CUDA
+#include "sk_int8_rdna4.hip.h"
+#endif
 #include "skmoe.hip.h"
 
 namespace hy4 {
@@ -21,8 +24,21 @@ inline void linear_h(hipStream_t s, int fmt, const void* W, int N, int K, const 
     if (fmt == FMT_Q8ROW) linear_h_ref(s, fmt, W, N, K, X, Y, M);
     else if (M <= skd::lin_gemv_max_m() && M <= 16) linear_h_gemv(s, fmt, W, N, K, X, Y, M);
 #if HY4_MMA
-    else if (M <= 16) linear_h_gemm_s(s, fmt, W, N, K, X, Y, M);
-    else linear_h_gemm(s, fmt, W, N, K, X, Y, M);
+    else if (M <= 16) {
+#if !HY4_CUDA
+        const int i8m = skd::int8_wmma_mode();
+        if (i8m == 1) { skd::launch_gemm_s_i8_rdna4<false>(s, fmt, W, N, K, X, Y, M); return; }
+        if (i8m == 2) { skd::launch_gemm_s_i8_rdna4<true>(s, fmt, W, N, K, X, Y, M); return; }
+#endif
+        linear_h_gemm_s(s, fmt, W, N, K, X, Y, M);
+    } else {
+#if !HY4_CUDA
+        const int i8m = skd::int8_wmma_mode();
+        if (i8m == 1) { skd::launch_gemm_i8_rdna4<false>(s, fmt, W, N, K, X, Y, M); return; }
+        if (i8m == 2) { skd::launch_gemm_i8_rdna4<true>(s, fmt, W, N, K, X, Y, M); return; }
+#endif
+        linear_h_gemm(s, fmt, W, N, K, X, Y, M);
+    }
 #else
     else if (M <= 16) linear_h_gemv(s, fmt, W, N, K, X, Y, M);
     else linear_h_ref(s, fmt, W, N, K, X, Y, M);

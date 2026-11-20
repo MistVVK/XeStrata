@@ -266,21 +266,29 @@ __device__ __forceinline__ void acc_zero(fv8 (&acc)[A][B]) {
         for (int j = 0; j < B; ++j) acc[i][j] = fv8_zero();
 }
 
-// Generic tile main loop: MTW m-tiles x NTW n-tiles of 16 per wave. xrow[i]: A-operand row (this lane: token row (lane&15) of m-tile i);
-// brow[j]: LDS tile row base of n-tile j. Waves with active == false only take part in the dequantization and the barriers.
+// Generic tile main loop with configurable (BN_W, BK) where BN_W * BK == 16384:
+//   (64, 256): G = 4 sub-groups/step, ST = 1 step/super-block, LDW = 264
+//   (128, 128): G = 2 sub-groups/step, ST = 2 steps/super-block, LDW = 136
+//   (256, 64): G = 1 sub-group/step, ST = 4 steps/super-block, LDW = 72
+// Allows all 8 waves to compute even for small M (WM = 1 -> WN = 8, WM = 2 -> WN = 4).
 #if !HY4_CUDA
-template <int FMT, int MTW, int NTW>
-__device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, const half_t* const (&xrow)[MTW], half_t* ws, fv8 (&acc)[MTW][NTW],
-                                                const int (&brow)[NTW], bool active) {
+template <int FMT, int MTW, int NTW, int BN_W, int BK>
+__device__ __forceinline__ void gemm_mainloop_bk(const uint8_t* wr, int nsb, const half_t* const (&xrow)[MTW], half_t* ws, fv8 (&acc)[MTW][NTW],
+                                                 const int (&brow)[NTW], bool active) {
+    static_assert(BN_W * BK == 16384, "BN_W * BK must be 16384");
     constexpr int SB = sk_sb_bytes(FMT);
+    constexpr int G = BK / 64;        // sub-groups loaded per row per step (4, 2, or 1)
+    constexpr int ST = 4 / G;         // steps per 256-k super-block (1, 2, or 4)
+    constexpr int KSTEPS = BK / 16;   // 16-k WMMA steps per tile (16, 8, or 4)
+    constexpr int LDW = BK + 8;       // padded LDS pitch (264, 136, or 72)
     const int tid = threadIdx.x, lane = tid & 31, hi = lane >> 4;
-    const int drow = tid >> 2, dg = tid & 3;
+    const int drow = tid / G, sg_t = tid & (G - 1);
     if constexpr (FMT == FMT_S1_25) {
         s125_lut_init();
         hy4_sync_lds();
     }
     RawSub<FMT> cur, nxt;
-    load_raw<FMT>(wr, dg, cur);
+    load_raw<FMT>(wr, sg_t, cur);
     constexpr int PD = 4;
     const int total = nsb * 16;
     hv_t aq[MTW][PD];
@@ -290,23 +298,29 @@ __device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, cons
 #pragma unroll
             for (int m = 0; m < MTW; ++m) aq[m][i] = ld_hv(xrow[m] + i * 16, hi);
     }
-    for (int sb = 0; sb < nsb; ++sb) {
-        dequant_sub<FMT>(cur, raw_eff<FMT>(cur, dg), &ws[drow * GEMM_LDW + dg * 64]);
-        if (sb + 1 < nsb) load_raw<FMT>(wr + (size_t)(sb + 1) * SB, dg, nxt);
+    const int niter = nsb * ST;
+    for (int it = 0; it < niter; ++it) {
+        const int dg = (it % ST) * G + sg_t;
+        dequant_sub<FMT>(cur, raw_eff<FMT>(cur, dg), &ws[drow * LDW + sg_t * 64]);
+        if (it + 1 < niter) {
+            const int sb_n = (it + 1) / ST;
+            const int dg_n = ((it + 1) % ST) * G + sg_t;
+            load_raw<FMT>(wr + (size_t)sb_n * SB, dg_n, nxt);
+        }
         hy4_sync_lds();
         if (active) {
 #pragma unroll
-            for (int kk = 0; kk < 16; ++kk) {
-                const int g = sb * 16 + kk;
+            for (int kk = 0; kk < KSTEPS; ++kk) {
+                const int g = it * KSTEPS + kk;
                 hv_t a[MTW];
 #pragma unroll
                 for (int m = 0; m < MTW; ++m) {
-                    a[m] = aq[m][kk & (PD - 1)];
-                    if (g + PD < total) aq[m][kk & (PD - 1)] = ld_hv(xrow[m] + (g + PD) * 16, hi);
+                    a[m] = aq[m][g & (PD - 1)];
+                    if (g + PD < total) aq[m][g & (PD - 1)] = ld_hv(xrow[m] + (g + PD) * 16, hi);
                 }
                 hv_t b[NTW];
 #pragma unroll
-                for (int j = 0; j < NTW; ++j) b[j] = ld_hv(&ws[(brow[j] + (lane & 15)) * GEMM_LDW + kk * 16], hi);
+                for (int j = 0; j < NTW; ++j) b[j] = ld_hv(&ws[(brow[j] + (lane & 15)) * LDW + kk * 16], hi);
 #pragma unroll
                 for (int m = 0; m < MTW; ++m)
 #pragma unroll
@@ -316,6 +330,12 @@ __device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, cons
         hy4_sync_lds();
         cur = nxt;
     }
+}
+
+template <int FMT, int MTW, int NTW>
+__device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, const half_t* const (&xrow)[MTW], half_t* ws, fv8 (&acc)[MTW][NTW],
+                                                const int (&brow)[NTW], bool active) {
+    gemm_mainloop_bk<FMT, MTW, NTW, GEMM_BN, 256>(wr, nsb, xrow, ws, acc, brow, active);
 }
 
 #else  // HY4_CUDA
@@ -394,10 +414,32 @@ __device__ __forceinline__ void gemm_mainloop(const uint8_t* wr, int nsb, const 
     gemm_mainloop_g<FMT, 2, 2>(wr, nsb, xr, ws, acc, br, true);
 }
 
-// small-M linear kernel (M <= 16 tokens per block row): 64 weight rows per block, 4 active waves (16 rows each), one 16-token m-tile
+// small-M linear kernel (M <= 16 tokens per block row): on HIP all 8 waves compute (128 weight rows per block, BK=128)
 template <int FMT>
 __global__ void __launch_bounds__(256) k_gemm_s(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M) {
     constexpr int SB = sk_sb_bytes(FMT);
+#if !HY4_CUDA
+    constexpr int BN_S = 128, BK_S = 128, LDW_S = BK_S + 8;
+    __shared__ __attribute__((aligned(16))) half_t ws[BN_S * LDW_S];
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int bn = blockIdx.x * BN_S, bm = blockIdx.y * 16;
+    const int nsb = K >> 8;
+    fv8 acc[1][1];
+    acc_zero(acc);
+    int row = bm + (lane & 15);
+    row = row < M ? row : M - 1;
+    const half_t* xrow[1] = {(const half_t*)X + (size_t)row * K};
+    int wrow = bn + (tid >> 1);
+    wrow = wrow < N ? wrow : N - 1;
+    const int brow[1] = {wave * 16};
+    gemm_mainloop_bk<FMT, 1, 1, BN_S, BK_S>(W + (size_t)wrow * nsb * SB, nsb, xrow, ws, acc, brow, true);
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int n = bn + wave * 16 + acc_n(r, lane);
+        const int m = bm + acc_m(r, lane);
+        if (m < M && n < N) Y[(size_t)m * N + n] = acc[0][0][r];
+    }
+#else
     __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * GEMM_LDW];
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
     const int bn = blockIdx.x * GEMM_BN, bm = blockIdx.y * 16;
@@ -419,6 +461,7 @@ __global__ void __launch_bounds__(256) k_gemm_s(const uint8_t* __restrict__ W, i
             if (m < M && n < N) Y[(size_t)m * N + n] = acc[0][0][r];
         }
     }
+#endif
 }
 
 template <int FMT>
@@ -458,7 +501,12 @@ __global__ void __launch_bounds__(256) k_gemm(const uint8_t* __restrict__ W, int
 
 // small-M WMMA entry (M <= 16 per call; larger M loops over 16-token blocks inside the grid): S_K weights, same requirements as linear_h_gemm
 inline void linear_h_gemm_s(hipStream_t s, int fmt, const void* W, int N, int K, const __half* X, float* Y, int M) {
-    dim3 grid((N + skd::GEMM_BN - 1) / skd::GEMM_BN, (M + 15) / 16), block(256);
+#if !HY4_CUDA
+    constexpr int BN_S = 128;
+#else
+    constexpr int BN_S = skd::GEMM_BN;
+#endif
+    dim3 grid((N + BN_S - 1) / BN_S, (M + 15) / 16), block(256);
 #define HY4_GEMMS_CASE(F) case F: hipLaunchKernelGGL((skd::k_gemm_s<F>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M); break
     switch (fmt) {
         HY4_GEMMS_CASE(FMT_S1_25);
