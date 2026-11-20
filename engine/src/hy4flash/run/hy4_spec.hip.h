@@ -264,7 +264,10 @@ public:
             while (n < Kp && y[n + 1] == h_arg[n]) ++n;
             d.snap_h(n);
             if (cfg.check) {
-                // diagnostic: recompute rows 0..n one token at a time and compare them with the window's rows (bitwise); the rewritten KV rows are the same when the kernels are batch invariant
+                // diagnostic: recompute rows 0..n one token at a time and compare them with the window's rows (bitwise); freeze vcache during comparison
+                const bool was_fr = r.vcache_frozen;
+                r.vcache_flush();
+                r.vcache_frozen = true;
                 std::vector<float> wl((size_t)T * V), sl(V);
                 HCK(hipMemcpy(wl.data(), r.logits, (size_t)T * V * 4, hipMemcpyDeviceToHost));
                 for (int i = 0; i <= n; ++i) {
@@ -281,6 +284,7 @@ public:
                                                      (int)(std::max_element(sl.begin(), sl.end()) - sl.begin()), (int)(std::max_element(wl.begin() + (size_t)i * V, wl.begin() + (size_t)(i + 1) * V) - wl.begin() - (size_t)i * V));
                     }
                 }
+                r.vcache_frozen = was_fr;
                 if (finish == "error") break;
             }
             if (want_margin)
