@@ -53,7 +53,7 @@ static void make_act(std::mt19937& rng, float* x, int n) {
 }
 
 static int cmd_acc() {
-    const int codes[3] = {0, 2, 3};
+    const int codes[4] = {0, 2, 3, 4};
     bool all_ok = true;
     for (int code : codes) {
         const int NR = 192;

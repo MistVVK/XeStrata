@@ -90,10 +90,10 @@ constexpr Perm kPerm;
 // 4 rows at a time x M tokens (M <= 16).  Per quad of pairs (= 2 super-blocks) the weights of 4 pairs are unpacked into 16 planes once and reused for every token.
 template <int CODE>
 void rows_kernel(const uint8_t* W, int nrows, const ActPlan* const* acts, int M, float* out, size_t ldo) {
-    static_assert(CODE == 0 || CODE == 2 || CODE == 3, "code");
-    constexpr size_t SB = CODE == 0 ? 48 : CODE == 2 ? 70 : 102;
+    static_assert(CODE == 0 || CODE == 2 || CODE == 3 || CODE == 4, "code");
+    constexpr size_t SB = CODE == 0 ? 48 : CODE == 2 ? 70 : CODE == 3 ? 102 : 134;
     constexpr size_t RB = SB * 6;
-    constexpr float HALF = CODE == 2 ? 1.5f : 3.5f;
+    constexpr float HALF = CODE == 2 ? 1.5f : CODE == 3 ? 3.5f : 7.5f;
     const __m256i ones = _mm256_set1_epi16(1);
     const Luts& LU = luts();
     __m256i Tlo[4], Thi[4];
@@ -149,6 +149,19 @@ void rows_kernel(const uint8_t* W, int nrows, const ActPlan* const* acts, int M,
                             w[i][2] = hi(w[i][2], 2);
                             w[i][3] = hi(w[i][3], 3);
                         }
+                    } else if constexpr (CODE == 4) {
+                        // 4-bit: byte b of a group holds weights 2b (low nibble) and 2b+1 (high nibble); plane j wants weight 4m+j = byte 2m+(j>>1), nibble j&1
+                        const __m256i A = _mm256_loadu_si256((const __m256i*)(pl + 64 * pp)), B = _mm256_loadu_si256((const __m256i*)(pl + 64 * pp + 32));
+                        const __m256i X = _mm256_permute2x128_si256(A, B, 0x20), Y = _mm256_permute2x128_si256(A, B, 0x31);  // low lane = group 0, high lane = group 1
+                        const __m256i ev = _mm256_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1, 0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1);
+                        const __m256i od = _mm256_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, -1, -1, -1, -1, -1, -1, -1, -1, 1, 3, 5, 7, 9, 11, 13, 15, -1, -1, -1, -1, -1, -1, -1, -1);
+                        const __m256i E = _mm256_unpacklo_epi64(_mm256_shuffle_epi8(X, ev), _mm256_shuffle_epi8(Y, ev));
+                        const __m256i O = _mm256_unpacklo_epi64(_mm256_shuffle_epi8(X, od), _mm256_shuffle_epi8(Y, od));
+                        const __m256i m15 = _mm256_set1_epi8(15);
+                        w[i][0] = _mm256_and_si256(E, m15);
+                        w[i][1] = _mm256_and_si256(_mm256_srli_epi16(E, 4), m15);
+                        w[i][2] = _mm256_and_si256(O, m15);
+                        w[i][3] = _mm256_and_si256(_mm256_srli_epi16(O, 4), m15);
                     } else {
                         const uint8_t* qp = pl + 20 * pp;
                         const uint64_t K5 = 0x1F1F1F1F1F1F1F1FULL;
@@ -260,6 +273,7 @@ bool cx_rows_q8(int code, const uint8_t* W, int nrows, const ActPlan* const* act
         case 0: rows_kernel<0>(W, nrows, acts, M, out, ldo); return true;
         case 2: rows_kernel<2>(W, nrows, acts, M, out, ldo); return true;
         case 3: rows_kernel<3>(W, nrows, acts, M, out, ldo); return true;
+        case 4: rows_kernel<4>(W, nrows, acts, M, out, ldo); return true;
         default: return false;
     }
 }
@@ -283,6 +297,8 @@ struct TLS {
 struct CpuExperts::Impl {
     strata::artifact::StrataFileReader rd;
     int fd = -1;
+    int fdd = -1;  // O_DIRECT descriptor (reads that must not go through the page cache)
+    std::atomic<uint64_t> direct_bytes{0}, cached_bytes{0};
     uint64_t sec4_off = 0;
     void* map = nullptr;
     size_t map_len = 0;
@@ -307,6 +323,8 @@ void CpuExperts::close() {
     if (im_->map) munmap(im_->map, im_->map_len);
     im_->map = nullptr;
     if (im_->fd >= 0) ::close(im_->fd);
+    if (im_->fdd >= 0) ::close(im_->fdd);
+    im_->fdd = -1;
     im_->fd = -1;
     base_ = nullptr;
 }
@@ -329,6 +347,7 @@ bool CpuExperts::open(const std::string& path, int nthreads, std::string& err, i
         return false;
     }
     I.fd = ::open(path.c_str(), O_RDONLY);
+    I.fdd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
     if (I.fd < 0) {
         err = "open failed";
         return false;
@@ -457,6 +476,25 @@ double CpuExperts::warm(int nthreads, double* seconds) {
     double t0 = now_s();
     const size_t CH = 8ull << 20;
     const size_t nch = (sec4_bytes_ + CH - 1) / CH;
+    // Experts larger than the RAM this box can spare (SQ-64 on a 62 GB machine, SQ-96/128): warm only a share of the file, spread evenly over it (every k-th 8 MiB chunk);
+    // the rest is read from the SSD on demand and the page cache keeps whatever the decode touches. Budget = MemAvailable - 9 GB (process, pinned KV, Engram rows), or HY4S_WARM_GB.
+    double budget = 1e30;
+    {
+        double avail_gb = 0;
+        if (FILE* f = fopen("/proc/meminfo", "r")) {
+            char ln[256];
+            while (fgets(ln, sizeof ln, f)) {
+                unsigned long long kb;
+                if (sscanf(ln, "MemAvailable: %llu kB", &kb) == 1) avail_gb = kb * 1024.0 / 1e9;
+            }
+            fclose(f);
+        }
+        if (avail_gb > 0) budget = (avail_gb - 9.0) * 1e9;
+        if (const char* e = std::getenv("HY4S_WARM_GB")) budget = atof(e) * 1e9;
+    }
+    const double frac = budget >= (double)sec4_bytes_ ? 1.0 : std::max(0.0, budget / (double)sec4_bytes_);
+    streaming_ = frac < 1.0;
+    auto selected = [&](size_t c) { return frac >= 1.0 || (size_t)((c + 1) * frac) > (size_t)(c * frac); };
     std::atomic_flag fail = ATOMIC_FLAG_INIT;
 #pragma omp parallel num_threads(std::max(1, nthreads))
     {
@@ -464,7 +502,7 @@ double CpuExperts::warm(int nthreads, double* seconds) {
         if (posix_memalign(&buf, 4096, CH)) fail.test_and_set();
 #pragma omp for schedule(dynamic, 1)
         for (long c = 0; c < (long)nch; ++c) {
-            if (!buf) continue;
+            if (!buf || !selected((size_t)c)) continue;
             size_t off = (size_t)c * CH, n = std::min(CH, (size_t)sec4_bytes_ - off);
             size_t got = 0;
             while (got < n) {
@@ -478,8 +516,16 @@ double CpuExperts::warm(int nthreads, double* seconds) {
     double t1 = now_s();
     // map the pages (page-table population)
     size_t popped_fail = 0;
+    if (frac < 1.0) {
+#pragma omp parallel for num_threads(std::max(1, nthreads)) schedule(dynamic, 8)
+        for (long c = 0; c < (long)nch; ++c) {
+            if (!selected((size_t)c)) continue;
+            size_t off = (size_t)c * CH, n = std::min(CH, (size_t)I.map_len - off);
+            madvise((char*)I.map + off, n, 22 /*MADV_POPULATE_READ*/);
+        }
+    }
 #pragma omp parallel for num_threads(std::max(1, nthreads)) schedule(dynamic, 1) reduction(+ : popped_fail)
-    for (long c = 0; c < (long)((I.map_len + (1ull << 30) - 1) >> 30); ++c) {
+    for (long c = 0; c < (long)(frac < 1.0 ? 0 : (I.map_len + (1ull << 30) - 1) >> 30); ++c) {
         size_t off = (size_t)c << 30, n = std::min((size_t)1 << 30, I.map_len - off);
         if (madvise((char*)I.map + off, n, 22 /*MADV_POPULATE_READ*/) != 0) {
             volatile uint8_t s = 0;
@@ -491,9 +537,10 @@ double CpuExperts::warm(int nthreads, double* seconds) {
     double t2 = now_s();
     I.warmed = true;
     if (seconds) *seconds = t2 - t0;
-    fprintf(stderr, "[cpuexp] warm: read %.2f GB in %.1f s (%.2f GB/s), map %.1f s%s\n", sec4_bytes_ / 1e9, t1 - t0, sec4_bytes_ / 1e9 / (t1 - t0), t2 - t1,
+    const double gb = sec4_bytes_ * std::min(1.0, frac) / 1e9;
+    fprintf(stderr, "[cpuexp] warm: read %.2f GB of %.2f GB (%.0f%%) in %.1f s (%.2f GB/s), map %.1f s%s\n", gb, sec4_bytes_ / 1e9, 100.0 * std::min(1.0, frac), t1 - t0, gb / (t1 - t0), t2 - t1,
             popped_fail ? " (touch fallback)" : "");
-    return sec4_bytes_ / 1e9 / (t1 - t0);
+    return gb / (t1 - t0);
 }
 
 void CpuExperts::drop_cache() {
@@ -503,6 +550,41 @@ void CpuExperts::drop_cache() {
     posix_fadvise(I.fd, (off_t)I.sec4_off, (off_t)sec4_bytes_, POSIX_FADV_DONTNEED);
     I.warmed = false;
 }
+
+// Copies one expert body (a pointer into the mapping) to dst: from the page cache when every page of it is resident (memcpy), else read from the SSD with O_DIRECT so a
+// prefill that touches every expert of every layer neither waits on page faults nor throws the decode's hot set out of the cache. dst 4 KiB aligned (pinned ring slots are).
+void CpuExperts::copy_body(const uint8_t* body, uint32_t bytes, void* dst) const {
+    Impl& I = *im_;
+    static const bool direct_ok = !(std::getenv("HY4S_DIRECT") && std::getenv("HY4S_DIRECT")[0] == '0');
+    const uint64_t off = (uint64_t)(body - base_);
+    bool resident = true;
+    if (!I.synthetic && I.fdd >= 0 && direct_ok && (off % 4096) == 0 && (bytes % 4096) == 0 && ((uintptr_t)dst % 4096) == 0) {
+        const size_t npg = bytes / 4096;
+        unsigned char vec[1024];
+        for (size_t p0 = 0; p0 < npg && resident; p0 += sizeof vec) {
+            const size_t n = std::min(sizeof vec, npg - p0);
+            if (mincore((void*)(body + p0 * 4096), n * 4096, vec) != 0) { resident = true; break; }
+            for (size_t i = 0; i < n; ++i)
+                if (!(vec[i] & 1)) { resident = false; break; }
+        }
+        if (!resident) {
+            size_t got = 0;
+            while (got < bytes) {
+                ssize_t r = pread(I.fdd, (char*)dst + got, bytes - got, (off_t)(I.sec4_off + off + got));
+                if (r <= 0) break;
+                got += (size_t)r;
+            }
+            if (got == bytes) {
+                I.direct_bytes += bytes;
+                return;
+            }
+        }
+    }
+    I.cached_bytes += bytes;
+    std::memcpy(dst, body, bytes);
+}
+uint64_t CpuExperts::direct_read_bytes() const { return im_->direct_bytes.load(); }
+uint64_t CpuExperts::cached_read_bytes() const { return im_->cached_bytes.load(); }
 
 void CpuExperts::prefetch_experts(int L, const int32_t* idx, int n) {
     Impl& I = *im_;
