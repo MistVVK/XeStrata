@@ -236,7 +236,7 @@ int main(int argc, char** argv) {
         const bool spec_mode = draft == "dfly2" && gen > 0;
         hy4::CpuExperts ucx;
         SyVramExpertCache vcache;
-        Runner r(g, ucx, max_ctx, Tc, (spec_mode || wincheck > 0 || detcheck > 0) ? 8 : (all_logits ? std::min(Tc, std::max(T0, 1)) : 1));
+        Runner r(g, ucx, max_ctx, Tc, std::max(8, all_logits ? std::min(Tc, std::max(T0, 1)) : 8));
         r.dump = dump;
         r.dbg_layers = dbg;
         r.force_route_dir = force_route;
