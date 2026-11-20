@@ -29,18 +29,6 @@ struct ServeOpts {
     SpecCfg spec;
 };
 
-struct SampleOpts {
-    float temperature = 0.f;
-    float top_p = 1.f;
-    int top_k = 64;
-    float min_p = 0.f;
-    float rep = 1.f, freq = 0.f, pres = 0.f;
-    int last_n = 64;
-    uint64_t seed = 0;
-    bool greedy() const { return temperature <= 0.f; }
-    bool penalties() const { return rep != 1.f || freq != 0.f || pres != 0.f; }
-};
-
 static void proto(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void proto(const char* fmt, ...) {
     char buf[512];
@@ -388,11 +376,11 @@ static int hy4_serve_main(Model& g, mtl::Context& cx, const ServeOpts& o, const 
         bool nonfinite = false;
         long acc0 = 0, off0 = 0;
         const bool greedy_fast = q.s.greedy() && !q.s.penalties();
-        const bool spec_path = use_spec && greedy_fast && limit > 0 && !has_images;  // a picture request decodes plainly (the drafter positions are token indices, picture rows use 3D positions)
+        const bool spec_path = use_spec && limit > 0 && !has_images;  // Tree-8 + lossless SpecInfer rejection sampling for both greedy and temp>0/top_p/top_k/penalties!
         if (spec_path) {
             std::string fin, e2;
             const long a_before = spec->S.accepted, o_before = spec->S.verified_slots;
-            fwd = spec->run(tok, limit, max_ctx, EOS, EOT, [&](int t) { proto("T %d", t); return !in.stop.load(); }, fin, e2, made);
+            fwd = spec->run(tok, limit, max_ctx, EOS, EOT, [&](int t) { proto("T %d", t); return !in.stop.load(); }, fin, e2, made, greedy_fast ? nullptr : &q.s, greedy_fast ? nullptr : &rng);
             if (fin == "error") {
                 proto("ERR spec: %s", e2.c_str());
                 return 1;

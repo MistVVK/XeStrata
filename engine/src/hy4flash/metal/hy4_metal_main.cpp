@@ -73,6 +73,84 @@ struct MlaArgs {  // = MlaArgs of hy4.metal
     float scale;
 };
 
+struct TreeArgs {  // = TreeArgs of hy4_dfly2b.metal (76 B)
+    int32_t n = 0;
+    uint8_t depth[8] = {};
+    uint8_t anc[8][8] = {};
+};
+static_assert(sizeof(TreeArgs) == 76, "TreeArgs");
+
+// Shared 100-byte Tree-8 speculative verification contract (topological order parent[i] < i)
+struct TreeSpec {
+    int M = 0;
+    int32_t tok[8] = {};
+    int8_t parent[8] = {};
+    uint8_t depth[8] = {};
+    uint8_t anc[8][8] = {};
+    int max_depth() const {
+        int md = 0;
+        for (int i = 0; i < M; ++i) md = std::max(md, (int) depth[i]);
+        return md;
+    }
+    void build_anc() {
+        for (int i = 0; i < M; ++i) {
+            int cur = i;
+            for (int d = (int) depth[i]; d >= 0; --d) {
+                anc[i][d] = (uint8_t) cur;
+                cur = cur >= 0 ? (int) parent[cur] : -1;
+            }
+        }
+    }
+    TreeArgs to_args() const {
+        TreeArgs ta{};
+        ta.n = M;
+        for (int i = 0; i < M; ++i) {
+            ta.depth[i] = depth[i];
+            for (int d = 0; d < 8; ++d) ta.anc[i][d] = anc[i][d];
+        }
+        return ta;
+    }
+};
+
+// Tree-aware Engram hashing (bitwise identical to engram_hash_tree in run/hy4_engram.cpp, kept local to metal/ so diff stays isolated)
+static void engram_hash_tree_metal(const EngramMeta& m, int module, const int32_t* tok_prefix, int p0, const int32_t* tree_tok, const int8_t* tree_parent, int T, uint64_t* row_ids, uint8_t* valid) {
+    const uint64_t* mu = m.mult[module];
+    const size_t V = m.token_map.size();
+    const uint64_t pad = (uint64_t) (int64_t) m.pad_cid;
+    auto map_tok = [&](int32_t t) -> int64_t {
+        return (t >= 0 && (size_t) t < V) ? (int64_t) m.token_map[(size_t) t] : -1;
+    };
+    auto prefix_cid = [&](int pos) -> int64_t {
+        return pos >= 0 ? map_tok(tok_prefix[pos]) : -1;
+    };
+    for (int i = 0; i < T; ++i) {
+        const int64_t c0 = map_tok(tree_tok[i]);
+        const bool dead = c0 < 0;
+        const int p1 = (int) tree_parent[i];
+        int64_t c1 = -1, c2 = -1;
+        if (p1 >= 0) {
+            c1 = map_tok(tree_tok[p1]);
+            const int p2 = (int) tree_parent[p1];
+            c2 = p2 >= 0 ? map_tok(tree_tok[p2]) : prefix_cid(p0 - 1);
+        } else {
+            c1 = prefix_cid(p0 - 1);
+            c2 = prefix_cid(p0 - 2);
+        }
+        const uint64_t u0 = dead ? pad : (uint64_t) c0;
+        const uint64_t u1 = c1 < 0 ? pad : (uint64_t) c1;
+        const uint64_t u2 = c2 < 0 ? pad : (uint64_t) c2;
+        const uint64_t r1 = (u0 * mu[0]) ^ (u1 * mu[1]);
+        const uint64_t r2 = r1 ^ (u2 * mu[2]);
+        uint64_t* o = row_ids + (size_t) i * ENGRAM_COLS;
+        uint8_t* v = valid + (size_t) i * ENGRAM_COLS;
+        for (int h = 0; h < m.n_head; ++h) {
+            o[h] = (uint64_t) ((int64_t) (r1 % m.primes[module][h]) + m.offsets[module][h]);
+            o[m.n_head + h] = (uint64_t) ((int64_t) (r2 % m.primes[module][m.n_head + h]) + m.offsets[module][m.n_head + h]);
+        }
+        for (int h = 0; h < ENGRAM_COLS; ++h) v[h] = dead ? 0 : 1;
+    }
+}
+
 constexpr int MODE_CAUSAL = 0, MODE_WINDOW = 1, MODE_LIST = 2;
 
 // ------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -94,7 +172,44 @@ struct Model {
     std::vector<int> expert_hot_order; // global expert indices (layer*512 + id) in hotness order from directory
     size_t max_expert_bytes = 0;
     std::vector<uint8_t> seed;
+    Buffer dfly_ovr_buf;
+    std::unordered_map<std::string, size_t> dfly_ovr_off;
     double t_load = 0;
+
+    bool load_dfly_override(mtl::Context& cx, const std::string& p, std::string& err) {
+        FILE* f = fopen(p.c_str(), "rb");
+        if (!f) { err = "cannot open dfly-override " + p; return false; }
+        struct stat st;
+        if (fstat(fileno(f), &st) != 0 || st.st_size < 16) { fclose(f); err = "bad dfly-override file"; return false; }
+        const size_t fsz = (size_t) st.st_size;
+        dfly_ovr_buf = cx.alloc(fsz);
+        if (fread(dfly_ovr_buf.ptr, 1, fsz, f) != fsz) { fclose(f); err = "short read dfly-override"; return false; }
+        fclose(f);
+        const uint8_t* b = (const uint8_t*) dfly_ovr_buf.ptr;
+        if (std::memcmp(b, "DFLYOVR1", 8) != 0) { err = "dfly-override bad magic"; return false; }
+        uint32_t count = 0;
+        std::memcpy(&count, b + 8, 4);
+        size_t cur = 16;
+        dfly_ovr_off.clear();
+        for (uint32_t i = 0; i < count; ++i) {
+            if (cur + 20 > fsz) { err = "dfly-override truncated header"; return false; }
+            uint32_t nlen = 0; uint64_t off = 0, sz = 0;
+            std::memcpy(&nlen, b + cur, 4);
+            std::memcpy(&off, b + cur + 4, 8);
+            std::memcpy(&sz, b + cur + 12, 8);
+            cur += 20;
+            const size_t npad = ((size_t) nlen + 7) / 8 * 8;
+            if (cur + npad > fsz || off + sz > fsz) { err = "dfly-override entry out of bounds"; return false; }
+            std::string nm((const char*) (b + cur), nlen);
+            cur += npad;
+            if (nm.rfind("model.dfly_layers.", 0) != 0) { err = "dfly-override refuses non-dfly tensor: " + nm; return false; }
+            if (!man.T.count(nm)) { err = "dfly-override unknown tensor: " + nm; return false; }
+            if (man.get(nm).bytes != sz) { err = "dfly-override byte mismatch for " + nm; return false; }
+            dfly_ovr_off[nm] = (size_t) off;
+        }
+        fprintf(stderr, "[dfly-override] loaded %zu model.dfly_layers.* tensors (%.2f MB) from %s\n", dfly_ovr_off.size(), fsz / 1e6, p.c_str());
+        return true;
+    }
 
     bool load(mtl::Context& cx, const std::string& p, std::string& err) {
         double t0 = now_s();
@@ -182,8 +297,20 @@ struct Model {
         if (!cold_experts) touch(sec4_off, sec4_bytes);
     }
     const TInfo& ti(const std::string& n) const { return man.get(n); }
-    Arg tw(const std::string& n) const { return Arg::B(wbuf, (sec1_off - sec1_map_base) + man.get(n).off); }
-    const float* tf(const std::string& n) const { return (const float*) (base + (sec1_off - sec1_map_base) + man.get(n).off); }
+    Arg tw(const std::string& n) const {
+        if (!dfly_ovr_off.empty()) {
+            auto it = dfly_ovr_off.find(n);
+            if (it != dfly_ovr_off.end()) return Arg::B(dfly_ovr_buf, it->second);
+        }
+        return Arg::B(wbuf, (sec1_off - sec1_map_base) + man.get(n).off);
+    }
+    const float* tf(const std::string& n) const {
+        if (!dfly_ovr_off.empty()) {
+            auto it = dfly_ovr_off.find(n);
+            if (it != dfly_ovr_off.end()) return (const float*) ((const uint8_t*) dfly_ovr_buf.ptr + it->second);
+        }
+        return (const float*) (base + (sec1_off - sec1_map_base) + man.get(n).off);
+    }
 };
 
 // ------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -210,12 +337,13 @@ public:
     int moe_mm_min = 64;       // MoE prefill through the MPP grouped GEMM from this many tokens (needs mpp_ok)
     int moe_tn_arg = 64;       // MPP MoE N tile (64 default, 32 for A/B)
     int moe_tm_arg = 0;        // MPP MoE M tile override (0 = auto)
+    int mpp_tile_arg = 0;      // MPP dense GEMM tile override: 0=128x64 (default), 64=64x64, 128=128x128
     Buffer m_srt, m_pos, m_tiles, m_meta, m_xs, m_hs, m_y;
     Buffer hc_part;            // partials of the split iHC mix [T<=8][24][9]
     bool hc_split = true;
     Buffer attn_ws;            // split-K attention partials [T<=8][64][S<=16][514] floats
     int split_max = 8;         // key splits per head for decode (T <= 8); 0 = off
-    static int moe_tm(int T) { return T <= 768 ? 16 : 32; }
+    static int moe_tm(int T) { return T <= 2560 ? 32 : 64; }
     size_t wscr_elems = 0;
     int lib = -1;
     std::unordered_map<std::string, mtl::Pipeline> pl;
@@ -243,7 +371,7 @@ public:
     uint64_t exp_cache_hits = 0, exp_cache_misses = 0;
     double t_cold_io = 0;
     std::vector<Buffer> kcache, ivg, pooled;
-    Buffer ik_f, iv_f, ig_f, ik_h, iq_f, iq_h, hw_f, score, keys, nkeys;
+    Buffer ik_f, iv_f, ig_f, ik_h, iq_f, iq_h, hw_f, score, keys, nkeys, tmp_pooled;
     size_t ldS = 0;
     int ring = 0, slots_sparse = 0, logit_rows = 1;
     // engram
@@ -257,6 +385,7 @@ public:
         Buffer raw[4], valid[4];
         int p0 = -1, T = 0;
         bool ok = false, pending = false;
+        TreeSpec tree;
         std::string err;
         std::future<void> fut;
     };
@@ -333,8 +462,10 @@ public:
         std::vector<Arg> a = {w, B(X, xoff), B(Y, yoff), I(N), I(K), I(M)};
         if (mpp_ok && M >= mpp_min && t.fmt != F_Q8ROW && (size_t) N * K <= wscr_elems) {
             struct MmArgs { int M, N, K; } ma{M, N, K};
-            add("dequant_h_" + std::to_string(t.fmt), K / 256, N, 256, {w, B(wscr), I(N), I(K)});
-            if (N >= 1024 && (N % 128) == 0 && M >= 128)
+            add("dequant_h_" + std::to_string(t.fmt), K / 256, N, 32, {w, B(wscr), I(N), I(K)});
+            if (mpp_tile_arg == 64)
+                add("mpp_mm_64_64_4", (N + 63) / 64, (M + 63) / 64, 128, {B(X, xoff), B(wscr), B(Y, yoff), Arg::V<MmArgs>(ma)});
+            else if (mpp_tile_arg == 128 && N >= 1024 && (N % 128) == 0 && M >= 128)
                 add("mpp_mm_128_128_4", N / 128, (M + 127) / 128, 128, {B(X, xoff), B(wscr), B(Y, yoff), Arg::V<MmArgs>(ma)});
             else
                 add("mpp_mm_128_64_4", (N + 63) / 64, (M + 127) / 128, 128, {B(X, xoff), B(wscr), B(Y, yoff), Arg::V<MmArgs>(ma)});
@@ -440,8 +571,9 @@ public:
         zout_f = A((size_t) T * 1536 * 4);
         moe_idx = A((size_t) T * 16 * 4);
         moe_w = A((size_t) T * 16 * 4);
-        moe_h2 = A((size_t) T * 16 * 1536 * 2);
-        moe_y = A((size_t) T * 16 * 1536 * 4);
+        const int moe_pair_t = mpp_ok ? std::min(T, moe_mm_min) : T;
+        moe_h2 = A((size_t) moe_pair_t * 16 * 1536 * 2);
+        moe_y = A((size_t) moe_pair_t * 16 * 1536 * 4);
         moe_cnt = A(512 * 4);
         moe_off = A(520 * 4);
         moe_pairs = A((size_t) T * 16 * 4);
@@ -478,6 +610,7 @@ public:
         score = A((size_t) Tc * ldS * 4);
         keys = A((size_t) Tc * (index_topk + 8) * 4);
         nkeys = A((size_t) Tc * 4);
+        tmp_pooled = A((size_t) 16 * 128 * 2);
         // Single-layer FP16 scratch for prefill kv_b_proj (29.4 MB instead of 1.05 GB persistent wk_b/wv_b; decode/verify reads quantized S_K kv_b_proj directly!)
         wk_scr = A((size_t) 64 * 512 * 192 * 2);
         wv_scr = A((size_t) 64 * 256 * 512 * 2);
@@ -567,10 +700,13 @@ public:
                 (void) P("mla_vup_mpp");
             }
             if (mpp_ok) {
+                (void) P("mpp_mm_64_64_4");
                 (void) P("mpp_mm_128_64_4");
                 (void) P("mpp_mm_128_128_4");
                 (void) P("moe_mm_gu_32_64_4");
                 (void) P("moe_mm_dn_32_64_4");
+                (void) P("moe_mm_gu_64_64_4");
+                (void) P("moe_mm_dn_64_64_4");
             }
             run_all();
             gpu_total = 0;
@@ -588,8 +724,9 @@ public:
         e->ok = true;
         std::vector<uint64_t> ids((size_t) T * 16);
         for (int mo = 0; mo < 4; ++mo) {
-            engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), (uint8_t*) e->valid[mo].ptr);
-            if (vis) vis->mask_engram((uint8_t*) e->valid[mo].ptr, p0, T);  // HY4-VISION hook: no Engram contribution at image positions
+            if (e->tree.M > 0) engram_hash_tree_metal(emeta, mo, tok_all, p0, e->tree.tok, e->tree.parent, T, ids.data(), (uint8_t*) e->valid[mo].ptr);
+            else engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), (uint8_t*) e->valid[mo].ptr);
+            if (vis && e->tree.M == 0) vis->mask_engram((uint8_t*) e->valid[mo].ptr, p0, T);  // HY4-VISION hook: no Engram contribution at image positions
             if (!eio.fetch_raw(ids.data(), ids.size(), (uint8_t*) e->raw[mo].ptr, err)) {
                 e->ok = false;
                 e->err = err;
@@ -597,21 +734,23 @@ public:
             }
         }
     }
-    void prefetch_engram(const int32_t* tok_all, int p0, int T) {
+    void prefetch_engram(const int32_t* tok_all, int p0, int T, const TreeSpec* tree = nullptr) {
         if (!engram_ready) return;
         EPrep& e = ep[ep_next];
         if (e.fut.valid()) e.fut.wait();
         e.p0 = p0;
         e.T = T;
+        e.tree = tree ? *tree : TreeSpec{};
         e.pending = true;
         e.fut = std::async(std::launch::async, [this, &e, tok_all, p0, T]() { ep_compute(&e, tok_all, p0, T); });
         ep_next ^= 1;
     }
-    bool engram_prep(const int32_t* tok_all, int p0, int T, std::string& err) {
+    bool engram_prep(const int32_t* tok_all, int p0, int T, std::string& err, const TreeSpec* tree = nullptr) {
         double t0 = now_s();
+        const int tm = tree ? tree->M : 0;
         EPrep* e = nullptr;
         for (int s = 0; s < 2; ++s)
-            if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T) e = &ep[s];
+            if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T && ep[s].tree.M == tm) e = &ep[s];
         if (e) {
             e->fut.get();
             e->pending = false;
@@ -620,6 +759,7 @@ public:
                 if (ep[s].fut.valid()) ep[s].fut.wait();
             e = &ep[ep_next];
             ep_next ^= 1;
+            e->tree = tree ? *tree : TreeSpec{};
             ep_compute(e, tok_all, p0, T);
         }
         t_engram_wait += now_s() - t0;
@@ -674,21 +814,37 @@ public:
         if (use_list) add("copy_keys", nr, 1, 256, {B(keys), B(nkeys), B(dkeys[d]), B(dnkc[d]), I(r0), I(index_topk)});
     }
 
-    void idx_update(int il, int p0, int T) {
+    void idx_update(int il, int p0, int T, const TreeSpec* tree = nullptr) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".token_key_projection.weight", cur_h, ik_f, T);
         add("rms_rows", T, 1, 128, {B(ik_f), g.tw(p + ".token_key_norm.weight"), B(ik_f), B(ik_h), I(128), Fl(c.rms_eps), I(1 | 4)});
         lin(p + ".key_value_projection.weight", ik_h, iv_f, T);
         lin(p + ".key_gate_projection.weight", ik_h, ig_f, T);
         add("idx_store", T, 1, 128, {B(iv_f), B(ig_f), B(ivg[il]), I(p0)});
+        if (tree && tree->M > 0) {
+            const TreeArgs ta = tree->to_args();
+            add("idx_pool_tree", T, 2, 128, {B(ivg[il]), g.tw(p + ".intra_group_ape"), g.tw(p + ".key_norm.weight"), B(tmp_pooled), I(p0), Arg::V<TreeArgs>(ta), Fl((float) theta(il)), Fl(c.rms_eps)});
+            return;
+        }
         int g_lo = p0 / 4, g_hi = (p0 + T) / 4 - 1;
         if (g_hi >= g_lo)
             add("idx_pool", g_hi - g_lo + 1, 1, 128, {B(ivg[il]), g.tw(p + ".intra_group_ape"), g.tw(p + ".key_norm.weight"), B(pooled[il]), I(g_lo), Fl((float) theta(il)), Fl(c.rms_eps)});
         if (vis && g_hi >= g_lo && vis->needs_fix(p0, T)) vis->pool_fix(ds, pooled[il], g_lo, g_hi - g_lo + 1, (float) theta(il));  // HY4-VISION hook
     }
-    void idx_select(int il, int p0, int T) {
+    void idx_select(int il, int p0, int T, const TreeSpec* tree = nullptr) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".query_projection.weight", qr_h, iq_f, T);
+        if (tree && tree->M > 0) {
+            const TreeArgs ta = tree->to_args();
+            add("idx_q_rope_tree", T, 16, 128, {B(iq_f), B(iq_h), I(p0), Arg::V<TreeArgs>(ta), Fl((float) theta(il))});
+            lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
+            int G = (p0 + tree->max_depth() + 1) / 4;
+            if (G < 1) G = 1;
+            add("idx_score_tree", (G + 63) / 64, T, 64, {B(iq_h), B(hw_f), B(pooled[il]), B(tmp_pooled), B(score), I(p0), Arg::V<TreeArgs>(ta), I(G), I((int) ldS), Fl(1.0f / sqrtf((float) (128 * 16)))});
+            int n_top = index_topk / c.kpool - 1;
+            add("idx_select_tree", T, 1, 256, {B(score), I((int) ldS), I(p0), Arg::V<TreeArgs>(ta), I(n_top), I(index_topk), B(keys), B(nkeys)});
+            return;
+        }
         if (vis && vis->needs_fix(p0, T)) vis->iq_rope(ds, iq_f, iq_h, T, p0, (float) theta(il));  // HY4-VISION hook: 3D positions
         else add("idx_q_rope", T, 16, 128, {B(iq_f), B(iq_h), I(p0), Fl((float) theta(il))});
         lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
@@ -785,10 +941,12 @@ public:
         add("hc_reduce_norm", T, 1, 256, {B(x), B(pre), g.tw(norm_w), B(cur_h), B(cur_f), Fl(c.rms_eps), I(want_f ? 1 : 0)});
     }
 
-    void attention_layer(int il, int p0, int T) {
+    void attention_layer(int il, int p0, int T, const TreeSpec* tree = nullptr) {
         const std::string pa = L(il) + ".self_attn";
         const int NH = heads(il);
         const bool swa = c.is_swa[il];
+        const bool is_tree = tree != nullptr && tree->M > 0;
+        const TreeArgs ta = is_tree ? tree->to_args() : TreeArgs{};
         hc_pre_norm(L(il) + ".hc_attn_layer", L(il) + ".input_layernorm.weight", T, false);
         op("hc_reduce_norm");
         lin(pa + ".q_a_proj.weight", cur_h, F1, T);
@@ -799,7 +957,10 @@ public:
         add("rms_rows", T, 1, 256, {B(F1), g.tw(pa + ".q_a_layernorm.weight"), B(F1), B(qr_h), I(c.q_lora), Fl(c.rms_eps), I(1 | 4)});
         const int cslots = swa ? ring : slots_sparse;
         (void) cslots;
-        add("mla_write_kv", T, 1, 256, {B(F4), g.tw(pa + ".kv_a_layernorm.weight"), B(kcache[il]), I(p0), I(swa ? ring : 0), Fl((float) theta(il)), Fl(c.rms_eps)});
+        if (is_tree)
+            add("mla_write_kv_tree", T, 1, 256, {B(F4), g.tw(pa + ".kv_a_layernorm.weight"), B(kcache[il]), I(p0), I(swa ? ring : 0), Fl((float) theta(il)), Fl(c.rms_eps), Arg::V<TreeArgs>(ta)});
+        else
+            add("mla_write_kv", T, 1, 256, {B(F4), g.tw(pa + ".kv_a_layernorm.weight"), B(kcache[il]), I(p0), I(swa ? ring : 0), Fl((float) theta(il)), Fl(c.rms_eps)});
         relax();
         lin(pa + ".q_b_proj.weight", qr_h, F2, T);
         op("qkv_proj");
@@ -822,16 +983,18 @@ public:
             dq.args = {B(F2), B(wk_scr), B(qa_h), I(T), I(NH), I(p0), Fl((float) theta(il))};
             ds.push_back(std::move(dq));
         }
+        if (is_tree) add("mla_q_rope_tree", NH, T, 32, {B(F2), B(qa_h), I(NH), I(p0), Fl((float) theta(il)), Arg::V<TreeArgs>(ta)});
         op("mla_prep");
-        if (vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
+        if (!is_tree && vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
             vis->fix_k(ds, F4, kcache[il], T, p0, swa ? ring : 0, (float) theta(il));
             vis->fix_q(ds, F2, qa_h, T, NH, p0, (float) theta(il));
         }
         bool use_list = false;
         if (!swa && index_on) {
-            idx_update(il, p0, T);
-            if (p0 + T > index_topk) {
-                idx_select(il, p0, T);
+            idx_update(il, p0, T, tree);
+            const int end_pos = is_tree ? (p0 + tree->max_depth() + 1) : (p0 + T);
+            if (end_pos > index_topk) {
+                idx_select(il, p0, T, tree);
                 use_list = true;
             }
             op("indexer");
@@ -846,7 +1009,15 @@ public:
         a.ring = swa ? ring : 0;
         a.kmax = index_topk;
         a.scale = 0.0625f;
-        if (flash_on && mpp_flash_ok && mpp_flash_on && T >= 16 && NH % 16 == 0)
+        if (is_tree) {
+            const int S = std::max(1, std::min(split_max > 0 ? split_max : 1, NH == 32 ? 8 : 4));
+            Dispatch dd;
+            dd.p = &P("mla_attend_part_tree");
+            dd.grid[0] = NH; dd.grid[1] = S; dd.grid[2] = T; dd.tg[0] = 256;
+            dd.args = {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(attn_ws), Arg::V<MlaArgs>(a), B(keys), B(nkeys), I(S), Arg::V<TreeArgs>(ta)};
+            ds.push_back(std::move(dd));
+            add("mla_attend_merge", NH, T, 256, {B(attn_ws), B(ctx_h), Arg::V<MlaArgs>(a), I(S)});
+        } else if (flash_on && mpp_flash_ok && mpp_flash_on && T >= 16 && NH % 16 == 0)
             add("mla_flash_mpp", NH / 16, T, 128, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
         else if (flash_on && T >= 16 && NH % 16 == 0)
             add("mla_flash_sg16", NH / 16, T, 256, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
@@ -995,14 +1166,57 @@ public:
         part("moe(41)");
     }
 
-    // tokens [p0, p0+T) (T <= Tc) of the sequence tok_all (host, positions 0..p0+T-1)
-    bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err, int next_p0 = -1, int next_T = 0) {
-        std::memcpy(d_ids.ptr, tok_all + p0, (size_t) T * 4);
+    // Commit accepted tree path `path[0..n_accepted]` (path[0] == 0, length cnt = n_accepted + 1, topological order path[k] >= k):
+    // compacts KV + IndexPool ivg when a side branch was accepted, finalizes completed pooled groups, and aligns captured DFly2 key lists.
+    void commit_tree_path(int p0, const int* path, int n_accepted) {
+        const int cnt = n_accepted + 1;
+        bool need_compact = false;
+        TreeArgs src{};
+        src.n = cnt;
+        for (int k = 0; k < cnt; ++k) {
+            src.depth[k] = (uint8_t) path[k];
+            if (path[k] != k) need_compact = true;
+        }
+        if (need_compact) {
+            for (int il = 0; il < c.n_layers; ++il) {
+                const bool swa = c.is_swa[il];
+                add("mla_compact_kv", 1, 1, 256, {B(kcache[il]), I(p0), I(swa ? ring : 0), Arg::V<TreeArgs>(src)});
+                if (!swa && index_on) add("idx_compact_ivg", 1, 1, 256, {B(ivg[il]), I(p0), Arg::V<TreeArgs>(src)});
+            }
+        }
+        if (index_on) {
+            const int g_lo = p0 / 4, g_hi = (p0 + cnt) / 4 - 1;
+            if (g_hi >= g_lo) {
+                for (int il = 0; il < c.n_layers; ++il) {
+                    if (c.is_swa[il]) continue;
+                    const std::string p = L(il) + ".self_attn.compressed_indexer";
+                    add("idx_pool", g_hi - g_lo + 1, 1, 128, {B(ivg[il]), g.tw(p + ".intra_group_ape"), g.tw(p + ".key_norm.weight"), B(pooled[il]), I(g_lo), Fl((float) theta(il)), Fl(c.rms_eps)});
+                }
+            }
+        }
+        if (dfly_cap) {
+            const int last_node = path[n_accepted];
+            if (last_node != n_accepted) {
+                for (int d = 0; d < 5; ++d) {
+                    if (!cap_list[d]) continue;
+                    add("copy_key_one", 1, 1, 256, {B(dkeys[d]), B(dnkc[d]), I(last_node), I(n_accepted), I(index_topk)});
+                }
+            }
+            cap_p0 = p0;
+            cap_rows = cnt;
+        }
+        run_all();
+    }
+
+    // tokens [p0, p0+T) (T <= Tc) of the sequence tok_all (host, positions 0..p0+T-1); optional Tree-8 verify when tree != nullptr
+    bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err, int next_p0 = -1, int next_T = 0, const TreeSpec* tree = nullptr) {
+        const bool is_tree = tree != nullptr && tree->M > 0;
+        std::memcpy(d_ids.ptr, is_tree ? tree->tok : (tok_all + p0), (size_t) T * 4);
         seg_mode = prof || seg_force;
         allow_nb = relax_ok && !(mpp_ok && T >= std::min(mpp_min, moe_mm_min));
         bool eng_prepped = false;
         add("embed_hc", T, 1, 256, {g.tw("model.embed_tokens.weight"), B(d_ids), B(x), I(T)});
-        if (vis) vis->embed(ds, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
+        if (!is_tree && vis) vis->embed(ds, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
         for (int il = 0; il < n_run; ++il) {
             int mo = -1;
             for (int j = 0; j < 4; ++j)
@@ -1012,11 +1226,11 @@ public:
                     if (T > 8 && !seg_mode && !g.cold_experts && !ds.empty()) {
                         void* tk = cx.run_graph_async(ds);
                         ds.clear();
-                        const bool ok = engram_prep(tok_all, p0, T, err);
+                        const bool ok = engram_prep(tok_all, p0, T, err, tree);
                         gpu_total += cx.wait_async(tk);
                         if (!ok) return false;
                     } else {
-                        if (!engram_prep(tok_all, p0, T, err)) return false;
+                        if (!engram_prep(tok_all, p0, T, err, tree)) return false;
                     }
                     eng_prepped = true;
                     if (next_T > 0) prefetch_engram(tok_all, next_p0, next_T);
@@ -1025,7 +1239,7 @@ public:
                 part("engram(4)");
                 maybe_dump("x_L" + std::to_string(il) + "_engram", T, 4 * HID_, x, 4);
             }
-            attention_layer(il, p0, T);
+            attention_layer(il, p0, T, tree);
             maybe_dump("x_L" + std::to_string(il) + "_attn", T, 4 * HID_, x, 4);
             mlp_layer(il, T);
             maybe_dump("x_L" + std::to_string(il) + "_mlp", T, 4 * HID_, x, 4);
@@ -1194,15 +1408,16 @@ static int export_tokenizer(const std::string& file, const std::string& dir) {
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
     bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_mpp_flash = false, mpp_dec_attn = false, no_qkvb = false, no_idxsg = false, sm_verify = false, force_cold = false, no_hcsplit = false, prof3 = false;
-    int gen = 0, max_ctx = 0, chunk = 2048, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, moe_tn_arg = 64, moe_tm_arg = 0, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0, par_m = 0, lin2_r_arg = 0;
+    int gen = 0, max_ctx = 0, chunk = 0, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, moe_tn_arg = 64, moe_tm_arg = 0, mpp_tile_arg = 0, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0, par_m = 0, lin2_r_arg = 0;
     bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false, no_pipe = false;
     int pipe_segs_arg = 8;
     bool serve = false, session_reuse = false;
-    std::string vision;
+    std::string vision, dfly_override;
     std::vector<std::string> image_files;
     int64_t image_max_pixels = 4194304;
     std::string draft = "auto";  // auto: DFly2 when the file carries the drafter and --gen > 0; off / dfly2 force
     SpecCfg scfg;
+    SampleOpts cli_samp;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() { return std::string(argv[++i]); };
@@ -1237,6 +1452,7 @@ int main(int argc, char** argv) {
         else if (a == "--mpp-dec-attn") mpp_dec_attn = true;
         else if (a == "--moe-tn") moe_tn_arg = atoi(nxt().c_str());
         else if (a == "--moe-tm") moe_tm_arg = atoi(nxt().c_str());
+        else if (a == "--mpp-tile") mpp_tile_arg = atoi(nxt().c_str());
         else if (a == "--no-qkvb") no_qkvb = true;
         else if (a == "--no-idxsg") no_idxsg = true;
         else if (a == "--sm-verify") sm_verify = true;
@@ -1256,8 +1472,18 @@ int main(int argc, char** argv) {
         else if (a == "--spec-fixed") scfg.adaptive = false;
         else if (a == "--spec-cut") scfg.cut = (float) atof(nxt().c_str());
         else if (a == "--spec-debug") scfg.debug = true;
+        else if (a == "--spec-check") scfg.check = true;
         else if (a == "--spec-sabotage") scfg.sabotage = true;
         else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
+        else if (a == "--no-tree") scfg.tree = false;
+        else if (a == "--tree") scfg.tree = true;
+        else if (a == "--spec-early") scfg.early_cut = (float) atof(nxt().c_str());
+        else if (a == "--dfly-override") dfly_override = nxt();
+        else if (a == "--temp") cli_samp.temperature = (float) atof(nxt().c_str());
+        else if (a == "--top-p") cli_samp.top_p = (float) atof(nxt().c_str());
+        else if (a == "--top-k") cli_samp.top_k = atoi(nxt().c_str());
+        else if (a == "--min-p") cli_samp.min_p = (float) atof(nxt().c_str());
+        else if (a == "--seed") cli_samp.seed = (uint64_t) strtoull(nxt().c_str(), nullptr, 10);
         else if (a == "--ab") ab_rounds = atoi(nxt().c_str());
         else if (a == "--bench-m") bench_m = atoi(nxt().c_str());
         else if (a == "--par-m") par_m = atoi(nxt().c_str());
@@ -1296,6 +1522,10 @@ int main(int argc, char** argv) {
         fprintf(stderr, "load: %s\n", err.c_str());
         return 1;
     }
+    if (!dfly_override.empty() && !g.load_dfly_override(cx, dfly_override, err)) {
+        fprintf(stderr, "dfly-override: %s\n", err.c_str());
+        return 1;
+    }
     fprintf(stderr, "[load] mapped %.2f GB (trunk %.2f GB at %llu, experts %.2f GB at %llu), %zu trunk tensors, %.2f s\n", g.fsize / 1e9, g.sec1_bytes / 1e9, (unsigned long long) g.sec1_off,
             g.sec4_bytes / 1e9, (unsigned long long) g.sec4_off, g.man.T.size(), g.t_load);
     if (warm) {
@@ -1311,7 +1541,7 @@ int main(int argc, char** argv) {
         so.vision = vision;
         so.image_max_pixels = image_max_pixels;
         so.max_ctx = max_ctx > 0 ? max_ctx : 131072;
-        so.chunk = chunk;
+        so.chunk = chunk > 0 ? chunk : (g.cold_experts ? 2048 : 4096);
         so.index_topk = index_topk;
         so.no_index = no_index;
         so.no_engram = no_engram;
@@ -1368,12 +1598,15 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (max_ctx <= 0) max_ctx = T0 + gen + 16;
+    tok.reserve(max_ctx + 8);
     if (kernels.empty()) {
         const char* e = getenv("STRATA_HY4_KERNELS");
         kernels = e ? e : extract_embedded_kernels();
         if (kernels.empty()) kernels = "hy4.metal";
     }
-    Runner r(g, cx, max_ctx, std::max(chunk, 1));
+    const int eff_chunk = chunk > 0 ? chunk : (g.cold_experts ? 2048 : 4096);
+    const int alloc_chunk = std::max(1, std::min(eff_chunk, std::max(T0, 16)));
+    Runner r(g, cx, max_ctx, alloc_chunk);
     {
         char rp[4096];
         if (realpath(kernels.c_str(), rp)) kernels = rp;
@@ -1403,6 +1636,7 @@ int main(int argc, char** argv) {
     r.mpp_dec_attn = mpp_dec_attn;
     r.moe_tn_arg = moe_tn_arg;
     r.moe_tm_arg = moe_tm_arg;
+    r.mpp_tile_arg = mpp_tile_arg;
     r.qkvb_on = !no_qkvb;
     r.idxsg_on = !no_idxsg;
     r.sm_verify = sm_verify;
@@ -1422,13 +1656,13 @@ int main(int argc, char** argv) {
         fprintf(stderr, "init: %s\n", err.c_str());
         return 1;
     }
+    if (recs.empty()) r.prefetch_engram(tok.data(), 0, std::min(r.Tc, T0));  // overlap chunk-0 Engram fetch with DFly2 init!
     DFly2 df(r);
     if (spec_mode && !df.init(err)) {
         fprintf(stderr, "dfly2: %s\n", err.c_str());
         return 1;
     }
     fprintf(stderr, "[info] drafter=%s\n", spec_mode ? "dfly2" : (has_df ? "dfly2(off)" : "none"));
-    tok.reserve(max_ctx + 8);
     // HY4-VISION: encode the pictures of an offline run now (the runner hooks do the rest); the Vision shard is mapped for the encode only
     hy4::VitMetal venc;
     hy4::VisionCtxM vctx;
@@ -1444,7 +1678,7 @@ int main(int argc, char** argv) {
     std::string top_out;
     double t0 = now_s();
     int done = 0;
-    r.prefetch_engram(tok.data(), 0, std::min(r.Tc, T0));
+    if (!recs.empty()) r.prefetch_engram(tok.data(), 0, std::min(r.Tc, T0));
     std::vector<float> hl;
     while (done < T0) {
         int T = std::min(r.Tc, T0 - done);
@@ -1474,17 +1708,33 @@ int main(int argc, char** argv) {
     if (prof) r.report("prefill", (T0 + r.Tc - 1) / r.Tc);
     printf("%s", top_out.c_str());
     fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram wait %.2f s, gpu %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_wait, r.gpu_total);
-    auto plain_gen = [&](std::vector<int>& ids_out, bool verbose) -> bool {  // greedy plain decode of `gen` tokens from the prefilled state (logits in hl)
-        int next = (int) (std::max_element(hl.end() - V, hl.end()) - (hl.end() - V));
+    const bool cli_prob = !cli_samp.greedy() || cli_samp.penalties();
+    auto plain_gen = [&](std::vector<int>& ids_out, bool verbose) -> bool {  // plain decode (greedy or sampled) of `gen` tokens from prefilled state
+        std::mt19937_64 prng(cli_samp.seed ? cli_samp.seed : 0x57A7A123456789ABull);
+        int next = 0;
+        if (!cli_prob) {
+            next = (int) (std::max_element(hl.end() - V, hl.end()) - (hl.end() - V));
+        } else {
+            SparseDist d0;
+            compute_dist_full(&hl[hl.size() - V], V, cli_samp, tok, d0);
+            next = sample_from_dist(d0, prng);
+        }
         for (int s = 0; s < gen; ++s) {
             tok.push_back(next);
             ids_out.push_back(next);
             if (next == r.c.eos || s + 1 == gen) break;
             if (!r.forward_chunk(tok.data(), (int) tok.size() - 1, 1, err)) { fprintf(stderr, "forward: %s\n", err.c_str()); return false; }
             r.head(1, 0);
-            r.argmax(V);
-            r.run_all();
-            next = *(const int32_t*) r.d_argmax.ptr;
+            if (!cli_prob) {
+                r.argmax(V);
+                r.run_all();
+                next = *(const int32_t*) r.d_argmax.ptr;
+            } else {
+                r.run_all();
+                SparseDist dk;
+                compute_dist_full((const float*) r.logits.ptr, V, cli_samp, tok, dk);
+                next = sample_from_dist(dk, prng);
+            }
         }
         (void) verbose;
         return true;
@@ -1551,7 +1801,8 @@ int main(int argc, char** argv) {
             std::string finish, e2;
             int made = 0;
             const double ts0 = now_s();
-            sp.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { sids.push_back(t); return true; }, finish, e2, made);
+            std::mt19937_64 srng(cli_samp.seed ? cli_samp.seed : 0x57A7A123456789ABull);
+            sp.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { sids.push_back(t); return true; }, finish, e2, made, cli_prob ? &cli_samp : nullptr, cli_prob ? &srng : nullptr);
             const double tsd = now_s() - ts0;
             if (finish == "error") { fprintf(stderr, "spec: %s\n", e2.c_str()); return 1; }
             size_t same = 0;
@@ -1574,7 +1825,8 @@ int main(int argc, char** argv) {
         std::string finish, e2, gen_ids;
         int made = 0;
         const double t1 = now_s();
-        sp.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { sids.push_back(t); gen_ids += std::to_string(t) + " "; return true; }, finish, e2, made);
+        std::mt19937_64 srng(cli_samp.seed ? cli_samp.seed : 0x57A7A123456789ABull);
+        sp.run(tok, gen, max_ctx, r.c.eos, -1, [&](int t) { sids.push_back(t); gen_ids += std::to_string(t) + " "; return true; }, finish, e2, made, cli_prob ? &cli_samp : nullptr, cli_prob ? &srng : nullptr);
         const double td = now_s() - t1;
         if (finish == "error") { fprintf(stderr, "spec: %s\n", e2.c_str()); return 1; }
         printf("generated ids: %s\n", gen_ids.c_str());
