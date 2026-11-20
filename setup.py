@@ -136,6 +136,9 @@ HF_REVISIONS = {
     "pfnet/plamo-3-translate-2b-GGUF": "4f672106b847200bfdc0f6af6c321cd94eba1aed",                  # 2026-11-09
     "pfnet/plamo-3-translate-0.8b-GGUF": "1cf96ae02133958a20074bfdfab76517bb737d00",                # 2026-11-09
     "pfnet/plamo-3-translate-8b-GGUF": "c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42",                  # 2026-11-09
+    # the QSA GGUFs, and the base model's picture reader (the QSA repository has none)
+    "MistVVK/SenseNova-Loop-9B-QSA-GGUF": "4ac7a2a81287f2d29a533c251f66b1fea129dc93",             # 2026-11-20
+    "sensenova/SenseNova-Loop-9B-GGUF": "11c121055062d33647348cf236a8c543138b282e",                 # 2026-11-20
 }
 
 # The models' terms, the one place About > Model terms reads them from (serve/model_terms.py): for each repository
@@ -315,6 +318,8 @@ MODEL_TERMS: dict[str, dict] = {
              "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
         ],
     },
+    "MistVVK/SenseNova-Loop-9B-QSA-GGUF": {"license": "Apache License", "card": "apache-2.0"},
+    "sensenova/SenseNova-Loop-9B-GGUF": {"license": "Apache License", "card": "apache-2.0"},
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": {
         "license": "Apache License",
         "card": "apache-2.0",
@@ -555,6 +560,36 @@ GYRO_CODER_FILES = {
     "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf":
         (75796732256, "2ecaf3ba6ed7f142ce00bc4a3172052f01bcf4e10d3ff617d8ab4755f4f2d4c4"),
 }
+
+# SenseNova-Loop-9B-QSA: the same four quantizations as the official repository, with trained QSA indexers added.
+# Each row's size and SHA-256 come from the GGUF's LFS pointer at the pinned revision.  A None hash means the file
+# does not exist yet: setup offers no size without a pinned hash.  E5 fills the two missing rows' size and hash,
+# after making those files, and they appear in the family below without another code change.
+SENSENOVA_QSA_REPO = "MistVVK/SenseNova-Loop-9B-QSA-GGUF"
+SENSENOVA_QSA_FILES: dict[str, dict[str, Any]] = {
+    "Q4_K_M": {"file": "Q4_K_M-qsa.gguf", "size": 5965458112,
+               "sha256": "2446cec39015603a224c81a0e75a85e36fba84bd45a006891f52b0ca3a70c4c6",
+               "about": "4-bit, with QSA indexers"},
+    "Q8_0": {"file": "Q8_0-qsa.gguf", "size": 9945475776,
+             "sha256": "72107a8d3be8b7ca4ed829ea3a0ee1fe5b89f49a3264ea57dd72bbc4d0a765b3",
+             "about": "8-bit, with QSA indexers"},
+    "BF16": {"file": "BF16-qsa.gguf", "size": None, "sha256": None,
+             "about": "the unquantized weights, with QSA indexers (E5)"},
+    "Q5_K_M": {"file": "Q5_K_M-qsa.gguf", "size": None, "sha256": None,
+               "about": "5-bit, with QSA indexers (E5)"},
+}
+# The picture reader is the base model's official file; the QSA repository holds no vision encoder.
+_SENSENOVA_QSA_MMPROJ = {"repo": "sensenova/SenseNova-Loop-9B-GGUF",
+                         "path": "mmproj-SenseNova-Loop-9B-F16.gguf", "size": 918165984,
+                         "sha256": "1bb6afd085020f555b3dca73b6d2139f3a7b28455228b0f07285d0f0ebc61481"}
+
+
+def sensenova_qsa_models() -> dict[str, dict]:
+    """The sizes setup offers: only those whose file exists at the pinned revision."""
+    return {name: {"repo": SENSENOVA_QSA_REPO, "file": d["file"], "size": d["size"],
+                   "sha256": d["sha256"], "about": d["about"]}
+            for name, d in SENSENOVA_QSA_FILES.items() if d["sha256"]}
+
 
 MODELS: dict[str, dict[str, Any]] = {
     "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0,
@@ -1515,6 +1550,15 @@ PLAIN_FAMILIES["qwen35"] = {
 # 262144.  Every weight in VRAM, or on the CPU alone (--device cpu, "cpu") on a PC without a GPU.  "default": the size
 # setup recommends where it fits.  Each reads pictures through its own mmproj (Unsloth's, at the same revision), on a
 # GPU only: the CPU's forward reads text
+PLAIN_FAMILIES["sensenova-loop-qsa"] = {
+    "title": "SenseNova-Loop-9B (QSA)", "by": "SenseNova (Apache-2.0); QSA indexers trained separately",
+    "about": "9B dense, 32 layers executed 56 times with two-stream mHC; block-sparse QSA attention, text and "
+             "images, 512K context; the official GGUFs with trained QSA indexers",
+    "tag": "sensenova-qsa-", "name": "sensenova-loop-9b-qsa", "max_context": 524288, "plain": True, "dense": True,
+    "kv_bytes": 57344, "mmproj": _SENSENOVA_QSA_MMPROJ,
+    "license": "Apache License 2.0: https://huggingface.co/sensenova/SenseNova-Loop-9B",
+    "models": sensenova_qsa_models(),
+}
 PLAIN_FAMILIES["qwen35-2b"] = {
     "title": "Qwen3.5-2B", "by": "Qwen (Apache-2.0), GGUFs by Unsloth",
     "about": "2B, dense, reads images: for a small GPU or a PC without one; its answers fall short of the 9B's",
@@ -1602,7 +1646,8 @@ FAMILIES.update(PLAIN_FAMILIES)
 BASES = {"qwen3.8-flash-next": "Qwen3.8-Flash-Next",
          "ornith-1.5": "Ornith-1.5-35B-A3B",
          "qwen3.6": "Qwen3.6-35B-A3B", "qwen3.5-9b": "Qwen3.5-9B", "qwen3.5-2b": "Qwen3.5-2B",
-         "llm-jp-4.1": "llm-jp-4.1-32b-a3b-thinking", "glm-5.3-flash": "GLM-5.3-Flash", "qwen3.5-0.8b": "Qwen3.5-0.8B"}
+         "llm-jp-4.1": "llm-jp-4.1-32b-a3b-thinking", "glm-5.3-flash": "GLM-5.3-Flash", "qwen3.5-0.8b": "Qwen3.5-0.8B",
+         "sensenova-loop-9b": "SenseNova-Loop-9B"}
 VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)",
             "coder": "Coder (half the experts, kept for code)", "sc117": "abliterated by SC117",
             "swift-sc117": "Swift 1.5, abliterated by SC117", "huihui-ai": "abliterated by huihui-ai",
@@ -1612,7 +1657,7 @@ QUANTIZERS = {"gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth",
               "gyro": "Gyro by agentionai",
               "ad": "AD by AtomicChat", "ornith-ai": "GGUFs by Ornith AI", "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
               "dealignai": "GGUFs by dealignai", "llm-jp": "GGUFs by LLM-jp", "apex": "APEX by SC117",
-              "hauhaucs": "GGUFs by HauhauCS", "own": "your own files"}
+              "hauhaucs": "GGUFs by HauhauCS", "qsa": "SenseNova QSA indexers", "own": "your own files"}
 TIERS = {  # family: (model, version, quantization), in the order each level lists them
     "qwen": ("qwen3.8-flash-next", "original", "gsq-rco"),
     "unsloth": ("qwen3.8-flash-next", "original", "unsloth"),
@@ -1635,6 +1680,7 @@ TIERS = {  # family: (model, version, quantization), in the order each level lis
     "llmjp": ("llm-jp-4.1", "original", "llm-jp"),
     "glm53": ("glm-5.3-flash", "original", "unsloth"),
     "qwen35-0.8b": ("qwen3.5-0.8b", "original", "unsloth"),
+    "sensenova-loop-qsa": ("sensenova-loop-9b", "original", "qsa"),
 }
 # a model's line in setup's first question where its original family's "about" does not say what the model is
 BASE_ABOUT = {"qwen3.8-flash-next": "Qwen's model, the one XeStrata is made for"}
