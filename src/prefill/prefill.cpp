@@ -1337,6 +1337,18 @@ constexpr size_t kBih3PassExperts = 32;
 // expert) took 558 tok/s direct against 450 in the matrix passes, of 3.5K (70 rows) 579 against 685 (2026-11-20);
 // the codes are decoded in the tile once a plane, three times a state, which the direct products' few rows do not pay.
 constexpr int64_t kBih3MatrixRows = 48;
+// A mixed layer whose experts average this many rows or more takes the shared FP16 path (each expert dequantized by
+// bih3_r1q2_dequant_f16, the FP16 grouped products, as every native pack without int8 products), where the device has
+// FP16 matrix engines.  XESTRATA_BIH3_PROMPT_F16=0|1 fixes the choice (A/B).
+constexpr int64_t kBih3F16Rows = 48;
+bool bih3_prompt_f16(int64_t rows, int64_t experts) {
+    static const int env = [] {
+        const char* v = strata::env_get("BIH3_PROMPT_F16");
+        return v == nullptr || v[0] == '\0' ? -1 : (int) std::strtol(v, nullptr, 10);
+    }();
+    if (env >= 0) return env != 0;
+    return strata::kernels::xmx_available(strata::kernels::XmxType::f16) && rows >= kBih3F16Rows * experts;
+}
 size_t bih3_meta_ints(size_t T, int64_t k, int64_t n_expert) { return (size_t) (6 * n_expert + 2) + T * (size_t) k; }
 
 uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
@@ -3401,6 +3413,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
                     int64_t routed = 0;   // the experts this layer routes to: a chunk's layer takes MMQ by their mean rows
                     for (int32_t e = 0; e < m.g->n_expert; ++e) routed += m.cnt[(size_t) e] > 0;
+                    // a mixed (bih3 R1Q2) layer: its own products, or dequantized into the FP16 path below
+                    const bool bih3_own = lay.mixed() && !bih3_prompt_f16(T * K, routed);
                     // ---- the latent MoE (Edge0): the experts run at the latent width on the GPU, D and U the
                     // shell's projections around them.  Where this layer takes the int8 products, its experts are the
                     // standard path's below (latent_mmq_d before them, latent_mmq_u after); else the dp4a arm
@@ -3719,7 +3733,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t mmq_db = mmq_dmat + (nv_tail ? strata::kernels::nvfp4::kTailBytes : 0);
                         host_group_ms += ms_since(t_group);
                         pt.mark(kPfGather, cs);
-                        if (lay.mixed()) {
+                        if (bih3_own) {
                             const float* x = m.mixed;
                             if (had_gu) {
                                 strata::kernels::hadamard_rows(x, m.bih3_rotated, T, N, had_block, had_sx, m.cs);
@@ -3972,11 +3986,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // expert) is released once the blob is read
                         // a mixed layer's resident experts: computed together after the walk (bih3_r1q2_prompt_groups),
                         // the streamed ones as each lands
-                        std::vector<const uint8_t*> bih3_res(lay.mixed() ? order.size() : 0, nullptr);
+                        std::vector<const uint8_t*> bih3_res(bih3_own ? order.size() : 0, nullptr);
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
-                            if (lay.mixed() && slot < 0) { bih3_res[j] = blob_dev; return true; }
+                            if (bih3_own && slot < 0) { bih3_res[j] = blob_dev; return true; }
                             pt.mark(kPfDequant, cs);
-                            if (lay.mixed()) {
+                            if (bih3_own) {
                                 const int32_t e = order[j];
                                 const auto& f = lay.format(l, e);
                                 strata::kernels::Bih3R1q2Layer layer;
@@ -4062,7 +4076,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // dequantize into the group's slot q; the group's products once it is full (or the last)
                             const int G = g_expert_group, q = (int) ((j - nf) % (size_t) G);   // groups from nf on
                             uint16_t *gu16 = m.dq_gu + q * GU_ELEMS, *d16 = m.dq_d + q * D_ELEMS;
-                            if (lay.native) {
+                            if (lay.mixed()) {
+                                const auto& f = lay.format(l, order[j]);
+                                strata::kernels::Bih3R1q2Layer layer;
+                                layer.n_embd = (int) f.n_embd; layer.n_ff = (int) f.n_ff;
+                                std::memcpy(layer.p2, f.p2, sizeof layer.p2);
+                                strata::kernels::bih3_r1q2_dequant_f16(layer, blob_dev, f.gu_type - 180, f.d_type - 180,
+                                                                       gu16, d16, m.cs);
+                            } else if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
                                 // STRATA_PF_DQ_FUSED=0: the two launches (upstream 75109596 fused them)
@@ -4162,7 +4183,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             release_to((int32_t) m.g->n_expert);
                         }
-                        if (lay.mixed() && std::any_of(bih3_res.begin(), bih3_res.end(), [](const uint8_t* b) { return b; })) {
+                        if (bih3_own && std::any_of(bih3_res.begin(), bih3_res.end(), [](const uint8_t* b) { return b; })) {
                             pt.mark(kPfDequant, cs);
                             const size_t n = order.size(), E = (size_t) m.g->n_expert;
                             const auto& f = lay.format(l, order[0]);

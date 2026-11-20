@@ -841,6 +841,52 @@ static int check_bih3_grouped(void* stream) {
             if (!(mmq_error < 1e-2)) groups_error = 1;
         }
     }
+    // The FP16 dequantization (bih3_r1q2_dequant_f16) against the CPU's rows: a column of each matrix is its row
+    // products with a one-hot Q8_0 activation (scale 1, one value 1: every other term zero, so the weight exactly)
+    double dq_error = 0;
+    for (int e = 0; e < 2; ++e) {
+        auto* dgu = dev.alloc<uint16_t>((size_t) 2 * FF * H);
+        auto* ddn = dev.alloc<uint16_t>((size_t) H * FF);
+        strata::kernels::bih3_r1q2_dequant_f16(L, reinterpret_cast<const uint8_t*>(ptr[(size_t) e]),
+                                              f[e].gu_type - 180, f[e].d_type - 180, dgu, ddn, stream);
+        std::vector<uint16_t> hgu((size_t) 2 * FF * H), hdn((size_t) H * FF);
+        strata::parity::copy_out(hgu.data(), dgu, hgu.size());
+        strata::parity::copy_out(hdn.data(), ddn, hdn.size());
+        std::vector<float> dq_got, dq_want;
+        for (int m = 0; m < 3; ++m) {
+            const int rows = m == 2 ? H : FF, width = m == 2 ? FF : H;
+            const uint8_t* sp = blobs[(size_t) e].data() + f[e].sc_off + cpu::native_r1q2_scale_offset(f[e], m);
+            const size_t blocks = (size_t) width / 128;
+            cpu::TqR1q2Scales sc{sp, sp + 2 * (size_t) rows, sp + 2 * (size_t) rows + 2 * blocks, (blocks + 3) / 4, {}};
+            for (int q = 0; q < 4; ++q) sc.p2[q] = p2[m][q];
+            const uint8_t* w = blobs[(size_t) e].data() + (m == 0 ? 0 : m == 1 ? f[e].up_off : f[e].down_off);
+            std::vector<uint8_t> onehot((size_t) 8 * (size_t) (width / 32) * 34);
+            std::vector<float> col((size_t) 8 * (size_t) rows);
+            for (int c0 = 0; c0 < width; c0 += 8) {
+                std::fill(onehot.begin(), onehot.end(), 0);
+                const void* a[8];
+                float* o[8];
+                for (int t = 0; t < 8; ++t) {
+                    uint8_t* blk = onehot.data() + (size_t) t * (size_t) (width / 32) * 34 + (size_t) ((c0 + t) / 32) * 34;
+                    blk[0] = 0x00; blk[1] = 0x3c;   // d = 1.0
+                    blk[2 + (c0 + t) % 32] = 1;
+                    a[t] = onehot.data() + (size_t) t * (size_t) (width / 32) * 34;
+                    o[t] = col.data() + (size_t) t * (size_t) rows;
+                }
+                cpu::tq_bih3_r1q2_rows(m == 2 ? f[e].d_type : f[e].gu_type, w, m == 2 ? f[e].d_row : f[e].gu_row,
+                                       width, a, 8, o, 0, rows, sc);
+                for (int t = 0; t < 8; ++t)
+                    for (int r = 0; r < rows; ++r) {
+                        const size_t at = m == 2 ? (size_t) r * FF + (size_t) (c0 + t)
+                                                 : (size_t) (2 * r + m) * H + (size_t) (c0 + t);
+                        dq_want.push_back(col[(size_t) t * rows + r]);
+                        dq_got.push_back(ggml_fp16_to_fp32(m == 2 ? hdn[at] : hgu[at]));
+                    }
+            }
+        }
+        dq_error = std::max(dq_error, rel(dq_got, dq_want));
+    }
+    std::printf("bih3 FP16 dequantization against the CPU rows: rel %.9g\n", dq_error);
     std::vector<float> signs(FF);
     for (int i = 0; i < FF; ++i) signs[i] = i % 3 ? 1.f : -1.f;
     for (auto& fmt : f) { fmt.had_d = true; fmt.had_block = FF; fmt.d_signs = signs.data(); }
@@ -863,7 +909,7 @@ static int check_bih3_grouped(void* stream) {
     std::printf("bih3 grouped scalar with Hadamard: rel %.9g\n", had_error);
     return std::isfinite(error) && error < 1e-2 && std::isfinite(scalar_error) && scalar_error < 1e-2 &&
            std::isfinite(prompt_error) && prompt_error < 1e-2 && std::isfinite(groups_error) && groups_error < 1e-2 &&
-           std::isfinite(had_error) && had_error < 1e-2 ? 0 : 1;
+           std::isfinite(had_error) && had_error < 1e-2 && std::isfinite(dq_error) && dq_error < 1e-3 ? 0 : 1;
 }
 
 // Isolate the product's device time; gathering and activation quantization finish before the warm-up.

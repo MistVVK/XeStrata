@@ -72,6 +72,11 @@ void bih3_r1q2_grouped(const Bih3R1q2Layer& layer, const unsigned long long* grp
 void bih3_r1q2_prompt_groups(const Bih3R1q2Layer& layer, const unsigned long long* ptr, const int32_t* start,
                              const int32_t* k_pack, const int32_t* start_host, int n_groups, const int32_t* tok,
                              const void* x_q8_1, void* scratch, int64_t cap, float* out, void* stream);
+/// One expert's R1Q2 weights (`blob`, gate/up K and down K) to FP16 in iq_dequant_expert_f16's layout: `gu` the gate and
+/// up rows interleaved (2 n_ff rows of n_embd), `d` the down rows (n_embd of n_ff), each value its integer numerator /
+/// 128 times its row base, column scale and p2 (the decode's weights, rounded to FP16), for the shared FP16 products.
+void bih3_r1q2_dequant_f16(const Bih3R1q2Layer& layer, const uint8_t* blob, int gate_k, int down_k, uint16_t* gu,
+                           uint16_t* d, void* stream);
 /// Bytes an expert takes in bih3_r1q2_prompt_mmq's `weights` (its gate/up and down codes as kBih3Code rows).
 size_t bih3_r1q2_code_bytes(int64_t n_embd, int64_t n_ff);
 /// A pass of the prompt's experts through the matrix products (iq_mmq_grouped's kBih3Code): n experts at ptr[e]

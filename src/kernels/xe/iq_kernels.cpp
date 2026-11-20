@@ -3193,6 +3193,58 @@ void bih3_r1q2_prompt_groups(const Bih3R1q2Layer& layer, const unsigned long lon
     if (!stream) q.wait_and_throw();
 }
 
+void bih3_r1q2_dequant_f16(const Bih3R1q2Layer& L, const uint8_t* blob, int gate_k, int down_k, uint16_t* gu,
+                           uint16_t* d, void* stream) {
+    require(blob && gu && d && gate_k >= 2 && gate_k <= 14 && down_k >= 2 && down_k <= 14 && L.n_embd % 128 == 0 &&
+            L.n_ff % 128 == 0, "bih3_r1q2_dequant_f16");
+    const int n = L.n_embd, ff = L.n_ff;
+    const size_t grow = (size_t) (n / 128) * 4 * (size_t) gate_k, drow = (size_t) (ff / 128) * 4 * (size_t) down_k;
+    const size_t up = grow * (size_t) ff, dn = 2 * up;
+    const size_t scale_off = (dn + drow * (size_t) n + 15) & ~(size_t) 15;
+    const size_t gu_scale = (size_t) ff * 2 + (size_t) (n / 128) * 2 + (size_t) ff * (size_t) ((n / 128 + 3) / 4);
+    // one work-item a row's 32 values: the gate and up rows' parts first (2 ff x n / 32), then the down rows'
+    const size_t gu_items = (size_t) (2 * ff) * (size_t) (n / 32), items = gu_items + (size_t) n * (size_t) (ff / 32);
+    float p2[3][4];
+    std::memcpy(p2, L.p2, sizeof p2);
+    auto* gh = reinterpret_cast<sycl::half*>(gu);
+    auto* dh = reinterpret_cast<sycl::half*>(d);
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
+        const size_t i = id[0];
+        const bool down = i >= gu_items;
+        const size_t j = down ? i - gu_items : i;
+        const int width = down ? ff : n, parts = width / 32;
+        const int row_all = (int) (j / (size_t) parts), sb = (int) (j % (size_t) parts);
+        // the gate and up rows interleaved as iq_dequant_gu_f16 writes them: output row 2 r + m is matrix m's row r
+        const int m = down ? 2 : row_all % 2, r = down ? row_all : row_all / 2;
+        const int k = down ? down_k : gate_k, nb = width / 128, qbytes = (nb + 3) / 4, b = sb / 4;
+        const int rows = down ? n : ff;
+        const uint8_t* bases = blob + scale_off + (size_t) m * gu_scale;
+        const uint8_t* cols = bases + (size_t) rows * 2;
+        const uint8_t q = cols[(size_t) nb * 2 + (size_t) r * qbytes + b / 4];
+        const auto half_at = [](const uint8_t* p) {
+            return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+        };
+        // the decode's expression (bih3_grouped_row): the integer numerator / 128 x colscale x p2 x rowbase
+        const float scale = half_at(cols + (size_t) b * 2) * p2[m][(q >> (2 * (b % 4))) & 3] * (1.f / 128.f) *
+                            half_at(bases + (size_t) r * 2);
+        const uint8_t* code = blob + (m == 1 ? up : m == 2 ? dn : 0) + (size_t) r * (down ? drow : grow) +
+                              (size_t) b * 4 * (size_t) k;
+        xe::Bih3Planes planes[8];
+        xe::bih3_block_planes(code, k, sb % 4, planes);
+        sycl::half* out = (down ? dh : gh) + (size_t) row_all * (size_t) width + (size_t) sb * 32;
+        for (int s = 0; s < 8; ++s) {
+            sycl::vec<sycl::half, 4> v;
+            for (int c = 0; c < 4; ++c) {
+                int num = 0;
+                for (int p = 0; p < 3; ++p) num += (int) (int8_t) (planes[s].v[p] >> (8 * c));
+                v[c] = sycl::half((float) num * scale);
+            }
+            *reinterpret_cast<sycl::vec<sycl::half, 4>*>(out + 4 * s) = v;
+        }
+    });
+    sync_if_needed(stream, e, "bih3_r1q2_dequant_f16");
+}
+
 size_t bih3_r1q2_code_bytes(int64_t n_embd, int64_t n_ff) {
     return (size_t) (2 * n_ff) * (size_t) (n_embd / 128) * 64 + (size_t) n_embd * (size_t) (n_ff / 128) * 64;
 }
