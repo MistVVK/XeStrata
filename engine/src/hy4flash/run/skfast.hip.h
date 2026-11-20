@@ -119,7 +119,9 @@ __device__ __forceinline__ void decode_w8(const uint8_t* pl, int u, uint32_t (&w
 
 template <int FMT, int MT, int RW>
 __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M, int bidx) {
-    constexpr int KC = 16384 / MT;  // halves per token in LDS
+    // For MT >= 5, cap LDS at 16 KB (higher CU occupancy) and read xs per m instead of holding uint4 xv[MT] in VGPRs (eliminates 2x VGPR-pressure cliff at M=6..16).
+    // Summation order per (row, m) is 100% bit-identical across all MT=1..16.
+    constexpr int KC = MT <= 4 ? (16384 / MT) : (MT <= 8 ? 1024 : 512);
     constexpr int SB = sk_sb_bytes(FMT);
     __shared__ uint4 xs[MT * KC / 8];
     const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -146,24 +148,45 @@ __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, 
         }
         __syncthreads();
         const int sb0 = k0 >> 8, nsbc = kc >> 8;
+        if constexpr (MT <= 4) {
 #pragma unroll 2
-        for (int s = 0; s < nsbc; ++s) {
-            uint4 xv[MT];
+            for (int s = 0; s < nsbc; ++s) {
+                uint4 xv[MT];
 #pragma unroll
-            for (int m = 0; m < MT; ++m) xv[m] = xs[m * (KC / 8) + s * 32 + lane];
+                for (int m = 0; m < MT; ++m) xv[m] = xs[m * (KC / 8) + s * 32 + lane];
 #pragma unroll
-            for (int r = 0; r < RW; ++r) {
-                const uint8_t* blk = rp[r] + (size_t)(sb0 + s) * SB;
-                const float eff = sk_eff<FMT>(blk, lane >> 3);
-                uint32_t wp[4];
-                decode_w8<FMT>(blk + 6, lane, wp);
+                for (int r = 0; r < RW; ++r) {
+                    const uint8_t* blk = rp[r] + (size_t)(sb0 + s) * SB;
+                    const float eff = sk_eff<FMT>(blk, lane >> 3);
+                    uint32_t wp[4];
+                    decode_w8<FMT>(blk + 6, lane, wp);
 #pragma unroll
-                for (int m = 0; m < MT; ++m) {
-                    float p = dot2f(wp[0], xv[m].x, 0.f);
-                    p = dot2f(wp[1], xv[m].y, p);
-                    p = dot2f(wp[2], xv[m].z, p);
-                    p = dot2f(wp[3], xv[m].w, p);
-                    acc[r][m] += eff * p;
+                    for (int m = 0; m < MT; ++m) {
+                        float p = dot2f(wp[0], xv[m].x, 0.f);
+                        p = dot2f(wp[1], xv[m].y, p);
+                        p = dot2f(wp[2], xv[m].z, p);
+                        p = dot2f(wp[3], xv[m].w, p);
+                        acc[r][m] += eff * p;
+                    }
+                }
+            }
+        } else {
+            for (int s = 0; s < nsbc; ++s) {
+#pragma unroll
+                for (int r = 0; r < RW; ++r) {
+                    const uint8_t* blk = rp[r] + (size_t)(sb0 + s) * SB;
+                    const float eff = sk_eff<FMT>(blk, lane >> 3);
+                    uint32_t wp[4];
+                    decode_w8<FMT>(blk + 6, lane, wp);
+#pragma unroll
+                    for (int m = 0; m < MT; ++m) {
+                        const uint4 xv = xs[m * (KC / 8) + s * 32 + lane];
+                        float p = dot2f(wp[0], xv.x, 0.f);
+                        p = dot2f(wp[1], xv.y, p);
+                        p = dot2f(wp[2], xv.z, p);
+                        p = dot2f(wp[3], xv.w, p);
+                        acc[r][m] += eff * p;
+                    }
                 }
             }
         }
@@ -203,7 +226,7 @@ __global__ void __launch_bounds__(256) k_gemv_multi(const LinJob* __restrict__ j
 
 template <int FMT, int MT>
 inline void launch_gemv(hipStream_t s, const void* W, int N, int K, const __half* X, float* Y, int M) {
-    constexpr int RW = 2;
+    constexpr int RW = MT <= 4 ? 2 : 1;
     dim3 grid((N + 8 * RW - 1) / (8 * RW)), block(256);
     hipLaunchKernelGGL((k_gemv<FMT, MT, RW>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
 }
@@ -213,6 +236,7 @@ inline void gemv_by_m(hipStream_t s, const void* W, int N, int K, const __half* 
     if (M <= 1) launch_gemv<FMT, 1>(s, W, N, K, X, Y, M);
     else if (M <= 2) launch_gemv<FMT, 2>(s, W, N, K, X, Y, M);
     else if (M <= 4) launch_gemv<FMT, 4>(s, W, N, K, X, Y, M);
+    else if (M <= 6) launch_gemv<FMT, 6>(s, W, N, K, X, Y, M);
     else if (M <= 8) launch_gemv<FMT, 8>(s, W, N, K, X, Y, M);
     else launch_gemv<FMT, 16>(s, W, N, K, X, Y, M);
 }

@@ -28,17 +28,20 @@ struct ExpertDev {             // per expert id (0..511) of one MoE layer
 static_assert(sizeof(ExpertDev) == 16, "ExpertDev");
 
 inline size_t moe_align(size_t x) { return (x + 255) & ~(size_t)255; }
-// workspace layout: ints [cnt 512 | off 513 | fill 512 | active 512 | nact 1] | pairs[P] (int) | h2[P][1536] (half) | y[P][1536] (float),  P = M*16
+inline int moe_max128(int P) { return (P >> 7) + (P / 65 < MOE_E ? P / 65 : MOE_E) + 1; }
+// workspace layout: ints [cnt 512 | off 513 | fill 512 | active 512 | nact 1 | wcnt 4 | wl16 512 | wl32 512 | wl64 512] | pairs[P] | wl128_e[M128] | wl128_ty[M128] | h2[P][1536] (half) | y[P][1536] (float),  P = M*16
 inline size_t moe_ws_bytes(int M) {
     const size_t P = (size_t)M * MOE_TOPK;
-    return moe_align(sizeof(int) * 2056) + moe_align(P * 4) + moe_align(P * MOE_D * 2) + moe_align(P * MOE_D * 4);
+    const size_t m128 = (size_t)moe_max128((int)P);
+    return moe_align(sizeof(int) * 3596) + moe_align(P * 4) + moe_align(m128 * 8) + moe_align(P * MOE_D * 2) + moe_align(P * MOE_D * 4);
 }
 
 namespace skd {
 
-// ---------------------------------------------------------------- routing (single block, counting sort by expert)
+// ---------------------------------------------------------------- routing (single block, counting sort by expert + compact tile worklists)
 __global__ void __launch_bounds__(512) k_moe_route(const ExpertDev* __restrict__ ex, const int32_t* __restrict__ idx, int P, int* __restrict__ cnt, int* __restrict__ off, int* __restrict__ pairs,
-                                                    int* __restrict__ active, int* __restrict__ nact) {
+                                                    int* __restrict__ active, int* __restrict__ nact, int* __restrict__ wcnt, int* __restrict__ wl16, int* __restrict__ wl32,
+                                                    int* __restrict__ wl64, int* __restrict__ wl128_e, int* __restrict__ wl128_ty) {
     __shared__ int c[512], sc[512], fl[512], fill[512];
     const int t = threadIdx.x;
     c[t] = 0;
@@ -75,31 +78,58 @@ __global__ void __launch_bounds__(512) k_moe_route(const ExpertDev* __restrict__
         const int pos = atomicAdd(&fill[e], 1);
         pairs[sc[e] + pos] = i;
     }
+    __syncthreads();
+    // build compact per-bucket worklists (zero empty blocks in WMMA dispatch).
+    // When P <= 256 (decode/verify M <= 16), wl32/wl64 are unused by WMMA, so reuse them as wl1 (cnt == 1) and wlm (cnt >= 2) for split-occupancy decode!
+    const int b16 = (cv > 0 && cv <= 16) ? 1 : 0;
+    const int b32 = P <= 256 ? (cv == 1 ? 1 : 0) : ((cv > 16 && cv <= 32) ? 1 : 0);
+    const int b64 = P <= 256 ? (cv > 1 ? 1 : 0) : ((cv > 32 && cv <= 64) ? 1 : 0);
+    const int b128 = (cv > 64) ? ((cv + 127) >> 7) : 0;
+    c[t] = b16;
+    sc[t] = b32;
+    fl[t] = b64;
+    fill[t] = b128;
+    __syncthreads();
+    for (int d = 1; d < 512; d <<= 1) {
+        int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        if (t >= d) { a0 = c[t - d]; a1 = sc[t - d]; a2 = fl[t - d]; a3 = fill[t - d]; }
+        __syncthreads();
+        c[t] += a0; sc[t] += a1; fl[t] += a2; fill[t] += a3;
+        __syncthreads();
+    }
+    if (b16) wl16[c[t] - 1] = t;
+    if (b32) wl32[sc[t] - 1] = t;
+    if (b64) wl64[fl[t] - 1] = t;
+    if (b128 > 0) {
+        const int base128 = fill[t] - b128;
+        for (int ty = 0; ty < b128; ++ty) {
+            wl128_e[base128 + ty] = t;
+            wl128_ty[base128 + ty] = ty;
+        }
+    }
+    if (t == 511) { wcnt[0] = c[511]; wcnt[1] = sc[511]; wcnt[2] = fl[511]; wcnt[3] = fill[511]; }
 }
 
 // ---------------------------------------------------------------- decode path (M <= 16)
 // dot products of one weight row (K = 1536, FMT) with MT x-vectors held in LDS as uint4[MT][192]
+// Streams 1 super-block at a time (keeps VGPRs low so occupancy stays high at MT=4/8; bit-identical to loading all 6).
 template <int FMT, int MT>
 __device__ __forceinline__ void row_dot(const uint8_t* rp, const uint4* xs, int lane, float (&acc)[MT]) {
     constexpr int SB = sk_sb_bytes(FMT);
-    uint32_t wp[6][4];
-    float eff[6];
 #pragma unroll
     for (int s = 0; s < 6; ++s) {
         const uint8_t* blk = rp + s * SB;
-        eff[s] = sk_eff<FMT>(blk, lane >> 3);
-        decode_w8<FMT>(blk + 6, lane, wp[s]);
-    }
-#pragma unroll
-    for (int s = 0; s < 6; ++s) {
+        const float eff = sk_eff<FMT>(blk, lane >> 3);
+        uint32_t wp[4];
+        decode_w8<FMT>(blk + 6, lane, wp);
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
             const uint4 xv = xs[m * 192 + s * 32 + lane];
-            float p = dot2f(wp[s][0], xv.x, 0.f);
-            p = dot2f(wp[s][1], xv.y, p);
-            p = dot2f(wp[s][2], xv.z, p);
-            p = dot2f(wp[s][3], xv.w, p);
-            acc[m] += eff[s] * p;
+            float p = dot2f(wp[0], xv.x, 0.f);
+            p = dot2f(wp[1], xv.y, p);
+            p = dot2f(wp[2], xv.z, p);
+            p = dot2f(wp[3], xv.w, p);
+            acc[m] += eff * p;
         }
     }
 }
@@ -416,7 +446,274 @@ __global__ void __launch_bounds__(256) k_moe_dn_dec1(const uint8_t* __restrict__
     if (threadIdx.x == 0) tk[blockIdx.x] = 0;
 }
 
+// Worklist-split decode kernels for M = 2..16:
+//   - experts with cnt == 1 run the exact 223 GB/s raw-load-pipelined 1-token kernel (3 KB LDS, max occupancy)
+//   - experts with cnt >= 2 run a lean runtime-n loop (no 5-way MTE template bloat -> half the VGPRs)
+// Arithmetic per (token, expert) is 100% bit-identical to k_moe_gu_dec1 / k_moe_dn_dec1!
+__global__ void __launch_bounds__(256) k_moe_gu_dec1_wl(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ ex, const __half* __restrict__ z,
+                                                        const int* __restrict__ off, const int* __restrict__ pairs, const int* __restrict__ wl1, const int* __restrict__ n1,
+                                                        __half* __restrict__ h2, const float* __restrict__ zf) {
+    if ((int)blockIdx.y >= *n1) return;
+    const int e = wl1[blockIdx.y];
+    const int base = off[e];
+    const int tok = pairs[base] >> 4;
+    const ExpertDev ed = ex[e];
+    __shared__ uint4 xs[192];
+    s125_lut_init();
+    uint4 zv = make_uint4(0, 0, 0, 0);
+    if (threadIdx.x < 192) zv = load_z8(z ? z + (size_t)tok * MOE_D : nullptr, zf ? zf + (size_t)tok * MOE_D : nullptr, threadIdx.x);
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = blockIdx.x * 8 + wave;
+    const uint8_t* body = sec4 + ed.body_off;
+    const uint8_t* gu = body + 3072;
+    const __half* sqx = (const __half*)body;
+    switch (ed.gu_code) {
+        case FMT_S2: gu1_fmt<FMT_S2>(gu, r, base, zv, xs, h2, sqx); break;
+        case FMT_S3: gu1_fmt<FMT_S3>(gu, r, base, zv, xs, h2, sqx); break;
+        case FMT_S4: gu1_fmt<FMT_S4>(gu, r, base, zv, xs, h2, sqx); break;
+        case FMT_S5: gu1_fmt<FMT_S5>(gu, r, base, zv, xs, h2, sqx); break;
+        case FMT_S6: gu1_fmt<FMT_S6>(gu, r, base, zv, xs, h2, sqx); break;
+        case FMT_S8: gu1_fmt<FMT_S8>(gu, r, base, zv, xs, h2, sqx); break;
+        default:
+            if (threadIdx.x < 192) xs[threadIdx.x] = zv;
+            __syncthreads();
+            gu_dec_rows<1>(ed, body, r, xs, lane, 1, base, h2);
+            break;
+    }
+}
+
+__global__ void __launch_bounds__(256) k_moe_dn_dec1_wl(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ ex, const float* __restrict__ topk_w,
+                                                        const int* __restrict__ off, const int* __restrict__ pairs, const int* __restrict__ wl1, const int* __restrict__ n1,
+                                                        const __half* __restrict__ h2, float* __restrict__ y) {
+    if ((int)blockIdx.y >= *n1) return;
+    const int e = wl1[blockIdx.y];
+    const int base = off[e];
+    const int pid = pairs[base];
+    const ExpertDev ed = ex[e];
+    __shared__ uint4 xs[192];
+    s125_lut_init();
+    uint4 hv = make_uint4(0, 0, 0, 0);
+    if (threadIdx.x < 192) hv = *(const uint4*)(h2 + (size_t)base * MOE_D + threadIdx.x * 8);
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const uint8_t* dn = sec4 + ed.body_off + ed.dn_off;
+    const int r0 = (blockIdx.x * 8 + wave) * 2;
+    switch (ed.dn_code) {
+        case FMT_S2: dn1_fmt<FMT_S2>(dn, r0, pid, hv, xs, topk_w, y); break;
+        case FMT_S3: dn1_fmt<FMT_S3>(dn, r0, pid, hv, xs, topk_w, y); break;
+        case FMT_S4: dn1_fmt<FMT_S4>(dn, r0, pid, hv, xs, topk_w, y); break;
+        case FMT_S5: dn1_fmt<FMT_S5>(dn, r0, pid, hv, xs, topk_w, y); break;
+        case FMT_S6: dn1_fmt<FMT_S6>(dn, r0, pid, hv, xs, topk_w, y); break;
+        case FMT_S8: dn1_fmt<FMT_S8>(dn, r0, pid, hv, xs, topk_w, y); break;
+        default:
+            if (threadIdx.x < 192) xs[threadIdx.x] = hv;
+            __syncthreads();
+            dn_dec_rows<1>(ed, dn, r0, xs, lane, 1, base, pairs, topk_w, y);
+            break;
+    }
+}
+
 #if HY4_MMA
+#if !HY4_CUDA
+// ---------------------------------------------------------------- gfx11 ALL-8-WAVE WMMA grouped GEMMs (prefill & verify)
+// BM=16,32 use BN=128 BK=128 (gemm_mainloop_128: 1 thread = 1 subgroup = 64 weights, v_pk_mul_f16, global A, zero idle waves).
+// BM=64,128 use BN=64 BK=256 (gemm_mainloop_g: 2 barriers/256 k, v_pk_mul_f16, global A, zero idle waves).
+template <int FMT>
+__device__ __forceinline__ void gu_sg_16(const uint8_t* body, int bx, int n, int base, const int* pairs, const __half* z, __half* h2, half_t* ws) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int drow = tid >> 1;  // 0..127: 0..63 = gate cols, 64..127 = up cols
+    const int wrow = drow < 64 ? bx * 64 + drow : MOE_D + bx * 64 + (drow - 64);
+    const uint8_t* wr = body + 3072 + (size_t)wrow * 6 * SB;
+    int ml = lane & 15;
+    ml = ml < n ? ml : n - 1;
+    const half_t* xrow[1] = {(const half_t*)z + (size_t)(pairs[base + ml] >> 4) * MOE_D};
+    fv8 acc[1][1];
+    acc_zero(acc);
+    // waves 0..3 compute gate cols 0..63; waves 4..7 compute up cols 0..63 -> ALL 8 waves active!
+    const int brow[1] = {wave < 4 ? wave * 16 : 64 + (wave - 4) * 16};
+    gemm_mainloop_128<FMT, 1, 1>(wr, 6, xrow, ws, acc, brow);
+    // reuse ws (34.8 KB) as float s_gate[16][64] (4 KB)
+    float* s_gate = (float*)ws;
+    if (wave < 4) {
+#pragma unroll
+        for (int r = 0; r < 8; ++r) s_gate[acc_m(r, lane) * 64 + wave * 16 + acc_n(r, lane)] = acc[0][0][r];
+    }
+    __syncthreads();
+    if (wave >= 4) {
+        const __half* sqx = (const __half*)body;
+        const int col0 = (wave - 4) * 16;
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int cl = col0 + acc_n(r, lane);
+            const int c = bx * 64 + cl;
+            const int m = acc_m(r, lane);
+            if (m < n) {
+                const float g = s_gate[m * 64 + cl], u = acc[0][0][r];
+                const float sg = g / (1.0f + expf(-g));
+                const float hh = fminf(sg, 10.0f) * fminf(fmaxf(u, -10.0f), 10.0f);
+                h2[(size_t)(base + m) * MOE_D + c] = __float2half(hh / __half2float(sqx[c]));
+            }
+        }
+    }
+}
+
+template <int FMT>
+__device__ __forceinline__ void gu_sg_32(const uint8_t* body, int bx, int n, int base, const int* pairs, const __half* z, __half* h2, half_t* ws) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int wm = wave & 1, wn = wave >> 1;  // 2 M-waves x 4 N-waves = ALL 8 waves active!
+    const int drow = tid >> 1;
+    const int wrow = drow < 64 ? bx * 64 + drow : MOE_D + bx * 64 + (drow - 64);
+    const uint8_t* wr = body + 3072 + (size_t)wrow * 6 * SB;
+    int ml = wm * 16 + (lane & 15);
+    ml = ml < n ? ml : n - 1;
+    const half_t* xrow[1] = {(const half_t*)z + (size_t)(pairs[base + ml] >> 4) * MOE_D};
+    fv8 acc[1][2];
+    acc_zero(acc);
+    const int brow[2] = {wn * 16, 64 + wn * 16};
+    gemm_mainloop_128<FMT, 1, 2>(wr, 6, xrow, ws, acc, brow);
+    const __half* sqx = (const __half*)body;
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int c = bx * 64 + wn * 16 + acc_n(r, lane);
+        const int m = wm * 16 + acc_m(r, lane);
+        if (m < n) {
+            const float g = acc[0][0][r], u = acc[0][1][r];
+            const float sg = g / (1.0f + expf(-g));
+            const float hh = fminf(sg, 10.0f) * fminf(fmaxf(u, -10.0f), 10.0f);
+            h2[(size_t)(base + m) * MOE_D + c] = __float2half(hh / __half2float(sqx[c]));
+        }
+    }
+}
+
+template <int FMT, int BM, int MTW>
+__device__ __forceinline__ void gu_sg_64_128(const uint8_t* body, int bx, int ty, int n, int base, const int* pairs, const __half* z, __half* h2, half_t* ws) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, drow = tid >> 2;
+    const int wm = wave & 3, wn = wave >> 2;  // 4 M-waves x 2 N-waves = ALL 8 waves active!
+    const int wrow = drow < 32 ? bx * 32 + drow : MOE_D + bx * 32 + (drow - 32);
+    const uint8_t* wr = body + 3072 + (size_t)wrow * 6 * SB;
+    const half_t* xrow[MTW];
+#pragma unroll
+    for (int i = 0; i < MTW; ++i) {
+        int ml = ty * BM + wm * MTW * 16 + i * 16 + (lane & 15);
+        ml = ml < n ? ml : n - 1;
+        xrow[i] = (const half_t*)z + (size_t)(pairs[base + ml] >> 4) * MOE_D;
+    }
+    fv8 acc[MTW][2];
+    acc_zero(acc);
+    const int brow[2] = {wn * 16, 32 + wn * 16};
+    gemm_mainloop_g<FMT, MTW, 2>(wr, 6, xrow, ws, acc, brow, true);
+    const __half* sqx = (const __half*)body;
+#pragma unroll
+    for (int i = 0; i < MTW; ++i)
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int c = bx * 32 + wn * 16 + acc_n(r, lane);
+            const int ml = ty * BM + wm * MTW * 16 + i * 16 + acc_m(r, lane);
+            if (ml < n) {
+                const float g = acc[i][0][r], u = acc[i][1][r];
+                const float sg = g / (1.0f + expf(-g));
+                const float hh = fminf(sg, 10.0f) * fminf(fmaxf(u, -10.0f), 10.0f);
+                h2[(size_t)(base + ml) * MOE_D + c] = __float2half(hh / __half2float(sqx[c]));
+            }
+        }
+}
+
+template <int FMT, int BM, int BN, int WM, int MTW, int WN, int NTW>
+__device__ __forceinline__ void dn_sg_body(const uint8_t* dnw, int bx, int ty, int n, int base, const int* pairs, const __half* h2, const float* topk_w,
+                                           float* y, half_t* ws) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int wm = wave % WM, wn = wave / WM;
+    const int drow = BN == 128 ? (tid >> 1) : (tid >> 2);
+    const uint8_t* wr = dnw + (size_t)(bx * BN + drow) * 6 * SB;
+    const half_t* xrow[MTW];
+#pragma unroll
+    for (int i = 0; i < MTW; ++i) {
+        int ml = ty * BM + wm * MTW * 16 + i * 16 + (lane & 15);
+        ml = ml < n ? ml : n - 1;
+        xrow[i] = (const half_t*)h2 + (size_t)(base + ml) * MOE_D;
+    }
+    fv8 acc[MTW][NTW];
+    acc_zero(acc);
+    int brow[NTW];
+#pragma unroll
+    for (int j = 0; j < NTW; ++j) brow[j] = (wn * NTW + j) * 16;
+    if constexpr (BN == 128) gemm_mainloop_128<FMT, MTW, NTW>(wr, 6, xrow, ws, acc, brow);
+    else gemm_mainloop_g<FMT, MTW, NTW>(wr, 6, xrow, ws, acc, brow, true);
+#pragma unroll
+    for (int i = 0; i < MTW; ++i)
+#pragma unroll
+        for (int j = 0; j < NTW; ++j)
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int c = bx * BN + (wn * NTW + j) * 16 + acc_n(r, lane);
+                const int ml = ty * BM + wm * MTW * 16 + i * 16 + acc_m(r, lane);
+                if (ml < n) {
+                    const int pid = pairs[base + ml];
+                    y[(size_t)pid * MOE_D + c] = acc[i][j][r] * topk_w[pid];
+                }
+            }
+}
+
+template <int BM>
+__global__ void __launch_bounds__(256) k_moe_gu_sg(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ ex, const __half* __restrict__ z,
+                                                   const int* __restrict__ cnt, const int* __restrict__ off, const int* __restrict__ pairs,
+                                                   const int* __restrict__ wl_e, const int* __restrict__ wl_ty, const int* __restrict__ wcnt_p, __half* __restrict__ h2) {
+    if ((int)blockIdx.y >= *wcnt_p) return;
+    const int e = wl_e[blockIdx.y];
+    const int ty = wl_ty ? wl_ty[blockIdx.y] : 0;
+    const int n = cnt[e];
+    __shared__ __attribute__((aligned(16))) half_t ws[BM <= 32 ? (128 * BK128_LD) : (GEMM_BN * GEMM_LDW)];
+    const ExpertDev ed = ex[e];
+    const uint8_t* body = sec4 + ed.body_off;
+#define HY4_GU_SG_CASE(F)                                                                                    \
+    case F:                                                                                                  \
+        if constexpr (BM == 16) gu_sg_16<F>(body, blockIdx.x, n, off[e], pairs, z, h2, ws);                  \
+        else if constexpr (BM == 32) gu_sg_32<F>(body, blockIdx.x, n, off[e], pairs, z, h2, ws);             \
+        else if constexpr (BM == 64) gu_sg_64_128<F, 64, 1>(body, blockIdx.x, ty, n, off[e], pairs, z, h2, ws); \
+        else gu_sg_64_128<F, 128, 2>(body, blockIdx.x, ty, n, off[e], pairs, z, h2, ws);                     \
+        break
+    switch (ed.gu_code) {
+        HY4_GU_SG_CASE(FMT_S1_25);
+        HY4_GU_SG_CASE(FMT_S1_5);
+        HY4_GU_SG_CASE(FMT_S2);
+        HY4_GU_SG_CASE(FMT_S3);
+        HY4_GU_SG_CASE(FMT_S4);
+        HY4_GU_SG_CASE(FMT_S5);
+        HY4_GU_SG_CASE(FMT_S6);
+        HY4_GU_SG_CASE(FMT_S8);
+        default: break;
+    }
+#undef HY4_GU_SG_CASE
+}
+
+template <int BM, int BN, int WM, int MTW, int WN, int NTW>
+__global__ void __launch_bounds__(256) k_moe_dn_sg(const uint8_t* __restrict__ sec4, const ExpertDev* __restrict__ ex, const float* __restrict__ topk_w,
+                                                   const int* __restrict__ cnt, const int* __restrict__ off, const int* __restrict__ pairs,
+                                                   const int* __restrict__ wl_e, const int* __restrict__ wl_ty, const int* __restrict__ wcnt_p,
+                                                   const __half* __restrict__ h2, float* __restrict__ y) {
+    if ((int)blockIdx.y >= *wcnt_p) return;
+    const int e = wl_e[blockIdx.y];
+    const int ty = wl_ty ? wl_ty[blockIdx.y] : 0;
+    const int n = cnt[e];
+    __shared__ __attribute__((aligned(16))) half_t ws[BN == 128 ? (128 * BK128_LD) : (GEMM_BN * GEMM_LDW)];
+    const ExpertDev ed = ex[e];
+    const uint8_t* dnw = sec4 + ed.body_off + ed.dn_off;
+    switch (ed.dn_code) {
+        case FMT_S1_25: dn_sg_body<FMT_S1_25, BM, BN, WM, MTW, WN, NTW>(dnw, blockIdx.x, ty, n, off[e], pairs, h2, topk_w, y, ws); break;
+        case FMT_S1_5: dn_sg_body<FMT_S1_5, BM, BN, WM, MTW, WN, NTW>(dnw, blockIdx.x, ty, n, off[e], pairs, h2, topk_w, y, ws); break;
+        case FMT_S2: dn_sg_body<FMT_S2, BM, BN, WM, MTW, WN, NTW>(dnw, blockIdx.x, ty, n, off[e], pairs, h2, topk_w, y, ws); break;
+        case FMT_S3: dn_sg_body<FMT_S3, BM, BN, WM, MTW, WN, NTW>(dnw, blockIdx.x, ty, n, off[e], pairs, h2, topk_w, y, ws); break;
+        case FMT_S4: dn_sg_body<FMT_S4, BM, BN, WM, MTW, WN, NTW>(dnw, blockIdx.x, ty, n, off[e], pairs, h2, topk_w, y, ws); break;
+        case FMT_S5: dn_sg_body<FMT_S5, BM, BN, WM, MTW, WN, NTW>(dnw, blockIdx.x, ty, n, off[e], pairs, h2, topk_w, y, ws); break;
+        case FMT_S6: dn_sg_body<FMT_S6, BM, BN, WM, MTW, WN, NTW>(dnw, blockIdx.x, ty, n, off[e], pairs, h2, topk_w, y, ws); break;
+        case FMT_S8: dn_sg_body<FMT_S8, BM, BN, WM, MTW, WN, NTW>(dnw, blockIdx.x, ty, n, off[e], pairs, h2, topk_w, y, ws); break;
+        default: break;
+    }
+}
+#else  // HY4_CUDA
 // ---------------------------------------------------------------- WMMA grouped GEMMs (prefill and small verify windows)
 // Token tile BM = WM*MTW*16 (16, 32, 64 or 128): the kernel variant handles the experts whose token count n satisfies nlo < n <= nhi, so every expert
 // is processed with the smallest tile that covers it (a 128-token tile wastes 16x the matrix-core work on an expert that sees 8 tokens).
@@ -553,6 +850,7 @@ __global__ void __launch_bounds__(256) k_moe_dn_gemm(const uint8_t* __restrict__
     }
 }
 
+#endif  // !HY4_CUDA
 #endif  // HY4_MMA
 
 __global__ void k_moe_reduce(const float* __restrict__ y, float* __restrict__ z_out, __half* __restrict__ z_out_h) {
@@ -721,7 +1019,7 @@ __global__ void __launch_bounds__(256) k_moe_dn_ref(const uint8_t* __restrict__ 
 }
 
 struct MoeWs {
-    int *cnt, *off, *fill, *active, *nact, *pairs;
+    int *cnt, *off, *fill, *active, *nact, *wcnt, *wl16, *wl32, *wl64, *pairs, *wl128_e, *wl128_ty;
     __half* h2;
     float* y;
 };
@@ -733,9 +1031,17 @@ inline MoeWs moe_ws_split(void* ws, int P) {
     s.fill = s.off + 513;
     s.active = s.fill + 512;
     s.nact = s.active + 512;
-    w += moe_align(sizeof(int) * 2056);
+    s.wcnt = s.nact + 1;
+    s.wl16 = s.wcnt + 4;
+    s.wl32 = s.wl16 + 512;
+    s.wl64 = s.wl32 + 512;
+    w += moe_align(sizeof(int) * 3596);
     s.pairs = (int*)w;
     w += moe_align((size_t)P * 4);
+    const size_t m128 = (size_t)moe_max128(P);
+    s.wl128_e = (int*)w;
+    s.wl128_ty = s.wl128_e + m128;
+    w += moe_align(m128 * 8);
     s.h2 = (__half*)w;
     w += moe_align((size_t)P * MOE_D * 2);
     s.y = (float*)w;
@@ -781,25 +1087,55 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
         return;
     }
     if (skd::moe_has_cpu()) (void)hipMemsetAsync(w.y, 0, (size_t)P * MOE_D * 4, s);
-    hipLaunchKernelGGL(skd::k_moe_route, dim3(1), dim3(512), 0, s, experts, topk_idx, P, w.cnt, w.off, w.pairs, w.active, w.nact);
+    hipLaunchKernelGGL(skd::k_moe_route, dim3(1), dim3(512), 0, s, experts, topk_idx, P, w.cnt, w.off, w.pairs, w.active, w.nact, w.wcnt, w.wl16, w.wl32, w.wl64, w.wl128_e, w.wl128_ty);
     if (M <= skd::moe_dec_max_m() && M <= HY4_MOE_DEC_MAXM) {
-#define HY4_DEC(MT)                                                                                                                                         \
-    hipLaunchKernelGGL((skd::k_moe_gu_dec<MT>), dim3(MOE_D / 8, eb), dim3(256), 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, z_f32); \
-    hipLaunchKernelGGL((skd::k_moe_dn_dec<MT>), dim3(MOE_D / 16, eb), dim3(256), 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.active, w.nact,   \
+        // Experts with cnt == 1 run the fast raw-load-pipelined 1-token kernels (3 KB LDS, ~223 GB/s);
+        // experts with cnt >= 2 run k_moe_*_dec<MT> on the compact wlm list (wl64 / wcnt+2). Bit-identical to M=1!
+        hipLaunchKernelGGL(skd::k_moe_gu_dec1_wl, dim3(MOE_D / 8, eb), dim3(256), 0, s, sec4_base, experts, z, w.off, w.pairs, w.wl32, w.wcnt + 1, w.h2, z_f32);
+        hipLaunchKernelGGL(skd::k_moe_dn_dec1_wl, dim3(MOE_D / 16, eb), dim3(256), 0, s, sec4_base, experts, topk_w, w.off, w.pairs, w.wl32, w.wcnt + 1, w.h2, w.y);
+        if (M > 1) {
+            const int em = (P / 2) < MOE_E ? (P / 2) : MOE_E;
+#define HY4_DEC(MT)                                                                                                                                             \
+    hipLaunchKernelGGL((skd::k_moe_gu_dec<MT>), dim3(MOE_D / 8, em), dim3(256), 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.wl64, w.wcnt + 2, w.h2, z_f32); \
+    hipLaunchKernelGGL((skd::k_moe_dn_dec<MT>), dim3(MOE_D / 16, em), dim3(256), 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.wl64, w.wcnt + 2,   \
                        w.h2, w.y)
-        if (M <= 1) { HY4_DEC(1); }
-        else if (M <= 2) { HY4_DEC(2); }
-        else if (M <= 4) { HY4_DEC(4); }
-        else if (M <= 8) { HY4_DEC(8); }
+            if (M <= 2) { HY4_DEC(2); }
+            else if (M <= 4) { HY4_DEC(4); }
+            else if (M <= 8) { HY4_DEC(8); }
 #if !HY4_CUDA
-        else { HY4_DEC(16); }
+            else { HY4_DEC(16); }
 #endif
 #undef HY4_DEC
+        }
     }
 #if HY4_MMA
     else {
-        const int INF = 1 << 30;
         const dim3 b(256);
+#if !HY4_CUDA
+        const int g16 = eb;
+        hipLaunchKernelGGL((skd::k_moe_gu_sg<16>), dim3(MOE_D / 64, g16), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.wl16, (const int*)nullptr, w.wcnt + 0, w.h2);
+        hipLaunchKernelGGL((skd::k_moe_dn_sg<16, 128, 1, 1, 8, 1>), dim3(MOE_D / 128, g16), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.wl16, (const int*)nullptr, w.wcnt + 0, w.h2, w.y);
+        if (M > 16) {
+            const int g32 = P / 17 < MOE_E ? P / 17 : MOE_E;
+            if (g32 > 0) {
+                hipLaunchKernelGGL((skd::k_moe_gu_sg<32>), dim3(MOE_D / 64, g32), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.wl32, (const int*)nullptr, w.wcnt + 1, w.h2);
+                hipLaunchKernelGGL((skd::k_moe_dn_sg<32, 64, 2, 1, 4, 1>), dim3(MOE_D / 64, g32), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.wl32, (const int*)nullptr, w.wcnt + 1, w.h2, w.y);
+            }
+        }
+        if (M > 32) {
+            const int g64 = P / 33 < MOE_E ? P / 33 : MOE_E;
+            if (g64 > 0) {
+                hipLaunchKernelGGL((skd::k_moe_gu_sg<64>), dim3(MOE_D / 32, g64), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.wl64, (const int*)nullptr, w.wcnt + 2, w.h2);
+                hipLaunchKernelGGL((skd::k_moe_dn_sg<64, 64, 2, 2, 4, 1>), dim3(MOE_D / 64, g64), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.wl64, (const int*)nullptr, w.wcnt + 2, w.h2, w.y);
+            }
+        }
+        if (M > 64) {
+            const int g128 = moe_max128(P);
+            hipLaunchKernelGGL((skd::k_moe_gu_sg<128>), dim3(MOE_D / 32, g128), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.wl128_e, w.wl128_ty, w.wcnt + 3, w.h2);
+            hipLaunchKernelGGL((skd::k_moe_dn_sg<128, 64, 4, 2, 2, 2>), dim3(MOE_D / 64, g128), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.wl128_e, w.wl128_ty, w.wcnt + 3, w.h2, w.y);
+        }
+#else
+        const int INF = 1 << 30;
         // token tiles 16 / 32 / 64 / 128; an expert with n tokens uses the first tile with n <= BM (several 128-tiles above 64 tokens)
         hipLaunchKernelGGL((skd::k_moe_gu_gemm<1, 1>), dim3(MOE_D / 32, 1, eb), b, 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.active, w.nact, w.h2, 0, 16);
         hipLaunchKernelGGL((skd::k_moe_dn_gemm<1, 1, 4, 1>), dim3(MOE_D / skd::GEMM_BN, 1, eb), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.active,
@@ -820,6 +1156,7 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
             hipLaunchKernelGGL((skd::k_moe_dn_gemm<4, 2, 2, 2>), dim3(MOE_D / skd::GEMM_BN, ty, eb), b, 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs,
                                w.active, w.nact, w.h2, w.y, 64, INF);
         }
+#endif
     }
 #endif
     hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out, z_out_h);

@@ -93,6 +93,7 @@ namespace hy4 {
 __device__ __forceinline__ uint32_t h2_bits(__half2 h) { return *reinterpret_cast<uint32_t*>(&h); }
 __device__ __forceinline__ __half2 h2_from(uint32_t u) { return *reinterpret_cast<__half2*>(&u); }
 __device__ __forceinline__ uint32_t h2_sub(uint32_t a, uint32_t b) { return h2_bits(__hsub2(h2_from(a), h2_from(b))); }
+__device__ __forceinline__ uint32_t h2_mul(uint32_t a, uint32_t b) { return h2_bits(__hmul2(h2_from(a), h2_from(b))); }
 __device__ __forceinline__ uint32_t h2_splat(float f) { return h2_bits(__float2half2_rn(f)); }
 // c + a.lo*b.lo + a.hi*b.hi, products and sum in fp32
 __device__ __forceinline__ float h2_dot_f32(uint32_t a, uint32_t b, float c) {
@@ -150,6 +151,7 @@ namespace hy4 {
 inline const char* gpu_arch(const hipDeviceProp_t& p) { return p.gcnArchName; }
 typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ uint32_t h2_sub(uint32_t a, uint32_t b) { return __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, a) - __builtin_bit_cast(hv2, b)); }
+__device__ __forceinline__ uint32_t h2_mul(uint32_t a, uint32_t b) { return __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, a) * __builtin_bit_cast(hv2, b)); }
 __device__ __forceinline__ uint32_t h2_splat(float f) {
     const hv2 h = {(_Float16)f, (_Float16)f};
     return __builtin_bit_cast(uint32_t, h);
