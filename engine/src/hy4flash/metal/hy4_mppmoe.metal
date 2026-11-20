@@ -1,13 +1,9 @@
-// hy4_mppmoe.metal - LatentMoE experts for a PROMPT chunk on the matrix units (Metal 4 MetalPerformancePrimitives matmul2d), grouped by expert.
-// Compiled together with hy4.metal and hy4_mpp.metal (uses their helpers and ExpertDev).
-//
-// Plan (moe_plan, one threadgroup): the chunk's P = T*16 (token, slot) pairs are sorted by expert; every expert's run is padded to a multiple of TM rows; a tile = (expert, first padded row).
-//   srt_pair[row] = pair id (-1 on padding rows), pos[pair] = padded row, tiles[i] = (expert, row0), meta = n_tiles, rows, and the three indirect grids.
-//   moe_gather  XS[row][k] = z[pair/16][k] (half), 0 on padding rows
-//   moe_mm_gu   per tile and TN output features: H[row][f] = half( min(silu(x.gate_f), 10) * clamp(x.up_f, -10, 10) / sq_xd_dn[f] )   (the dequantised S_K weights go through threadgroup memory)
-//   moe_mm_dn   Y[row][d] = h . down_d (fp32)
-//   moe_combine zout[t][d] = sum_slot w[t][slot] * Y[pos[t*16+slot]][d] (slot order: deterministic)
-// The weights are dequantised exactly as everywhere else (fp32 arithmetic, rounded to fp16 for the matrix unit).
+// hy4_mppmoe.metal - High-occupancy Metal 4 MPP LatentMoE grouped GEMM for prompt chunks.
+// Upgrades for HY4-METAL-SPEED:
+//   - Aliases ot onto wg+wu after the K-loop (single-pass register SwiGLU -> cuts TG mem from 24 KB to 16 KB for TN=64 or 8 KB for TN=32!).
+//   - Uses fast ushort aligned loads (sk_q8) + half4 vector stores in stage_row_f.
+//   - Instantiates TM=32, TN=64, SG=4 (half the padding waste at T=2048 + 2x wider N tile = ~2x faster prefill MoE!).
+// Compiled together with hy4.metal and hy4_mpp.metal (uses ExpertDev, sk_q8, sk_sb_bytes, sk_half, code_row_bytes).
 
 kernel void moe_plan(device const int* idx [[buffer(0)]], constant int& P [[buffer(1)]], constant int& TM [[buffer(2)]], device int* srt_pair [[buffer(3)]], device int* pos [[buffer(4)]],
                      device int2* tiles [[buffer(5)]], device uint* meta [[buffer(6)]], constant int& gx_gu [[buffer(7)]], constant int& gx_dn [[buffer(8)]], uint t [[thread_index_in_threadgroup]]) {
@@ -58,49 +54,27 @@ kernel void moe_plan(device const int* idx [[buffer(0)]], constant int& P [[buff
 kernel void moe_gather(device const half* z [[buffer(0)]], device const int* srt_pair [[buffer(1)]], device half* XS [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
                        uint tid [[thread_index_in_threadgroup]]) {
     const int p = srt_pair[row];
-    for (uint k = tid; k < 1536; k += 256) XS[(size_t) row * 1536 + k] = p >= 0 ? z[(size_t) (p / 16) * 1536 + k] : half(0.0f);
+    for (uint k4 = tid; k4 < 1536 / 4; k4 += 256) {
+        *((device half4*) (XS + (size_t) row * 1536 + k4 * 4)) = p >= 0 ? *((device const half4*) (z + (size_t) (p / 16) * 1536 + k4 * 4)) : half4(0.0h);
+    }
 }
 
-// TPR threads per weight row stage wpt = 64/TPR consecutive weights of the 64-wide K step (one sub-group: one scale) of a row into threadgroup half
+// Fast aligned-ushort sk_q8 + half4 vector staging of wpt (multiple of 8) weights of 64-wide K step into threadgroup half
 template <int F>
 static inline void stage_row_f(device const uchar* rp, int ks, int kq, int wpt, threadgroup half* dst) {
     constexpr int SB = sk_sb_bytes(F);
+    constexpr float H = sk_half(F);
     device const uchar* blk = rp + (size_t) (ks >> 2) * SB;
     const int g = ks & 3;
-    const float D = h2f_bits(ld16(blk));
-    const float eff = D * (float(blk[2 + g]) / 255.0f);
+    const float eff = float(as_type<half>(*((device const ushort*) blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
     device const uchar* pl = blk + 6;
-    const int i0 = g * 64 + kq;  // a multiple of 8
-    constexpr float H = sk_half(F);
+    const int i0 = g * 64 + kq;
     for (int e = 0; e < wpt; e += 8) {
-        const int i = i0 + e;
         int q[8];
-        if (F == 2) {
-            const uint b0 = pl[i >> 2], b1 = pl[(i >> 2) + 1];
-            for (int k = 0; k < 4; ++k) { q[k] = (b0 >> (2 * k)) & 3; q[4 + k] = (b1 >> (2 * k)) & 3; }
-        } else if (F == 3) {
-            const uint b0 = pl[i >> 2], b1 = pl[(i >> 2) + 1], hb = pl[64 + (i >> 3)];
-            for (int k = 0; k < 4; ++k) {
-                q[k] = int(((b0 >> (2 * k)) & 3) | (((hb >> k) & 1) << 2));
-                q[4 + k] = int(((b1 >> (2 * k)) & 3) | (((hb >> (4 + k)) & 1) << 2));
-            }
-        } else if (F == 8) {
-            for (int k = 0; k < 8; ++k) q[k] = int(as_type<char>(pl[i + k]));
-        } else {  // 4, 5, 6: nibbles + the high bits
-            for (int k = 0; k < 4; ++k) {
-                const uint b = pl[(i >> 1) + k];
-                q[2 * k] = int(b & 15);
-                q[2 * k + 1] = int(b >> 4);
-            }
-            if (F == 5) {
-                const uint hb = pl[128 + (i >> 3)];
-                for (int k = 0; k < 8; ++k) q[k] |= int((hb >> k) & 1) << 4;
-            } else if (F == 6) {
-                const uint hb = uint(pl[128 + (i >> 2)]) | (uint(pl[128 + (i >> 2) + 1]) << 8);
-                for (int k = 0; k < 8; ++k) q[k] |= int((hb >> (2 * k)) & 3) << 4;
-            }
-        }
-        for (int k = 0; k < 8; ++k) dst[e + k] = half((float(q[k]) - H) * eff);
+        sk_q8<F>(pl, i0 + e, q);
+        threadgroup half4* d4 = (threadgroup half4*) (dst + e);
+        d4[0] = half4((float4(float(q[0]), float(q[1]), float(q[2]), float(q[3])) - H) * eff);
+        d4[1] = half4((float4(float(q[4]), float(q[5]), float(q[6]), float(q[7])) - H) * eff);
     }
 }
 
@@ -119,9 +93,13 @@ template <int TM, int TN, int SG>
 kernel void moe_mm_gu(device const uchar* sec4 [[buffer(0)]], device const ExpertDev* ex [[buffer(1)]], device const half* XS [[buffer(2)]], device half* HS [[buffer(3)]],
                       device const int2* tiles [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int TK = 64, NTH = SG * 32, TPR = NTH / TN, WPT = TK / TPR;
-    threadgroup half wg[TN * TK];
-    threadgroup half wu[TN * TK];
-    threadgroup float ot[TM * TN];
+    constexpr int W_HALVES = 2 * TN * TK;
+    constexpr int O_HALVES = 2 * TM * TN; // TM*TN floats = 2*TM*TN halves
+    constexpr int S_HALVES = W_HALVES > O_HALVES ? W_HALVES : O_HALVES;
+    threadgroup half sMem[S_HALVES]; // Aliased! Holds wg+wu during K-loop, then ot (single pass) after K-loop!
+    threadgroup half* wg = sMem;
+    threadgroup half* wu = sMem + TN * TK;
+
     const int2 tl = tiles[tg.y];
     const int e = tl.x, row0 = tl.y, f0 = int(tg.x) * TN;
     const ExpertDev ed = ex[e];
@@ -130,6 +108,7 @@ kernel void moe_mm_gu(device const uchar* sec4 [[buffer(0)]], device const Exper
     const int r = tid / TPR, kq = (tid % TPR) * WPT;
     device const uchar* grow = body + 3072 + (size_t) (f0 + r) * rb;
     device const uchar* urow = body + 3072 + (size_t) (1536 + f0 + r) * rb;
+
     constexpr auto desc = matmul2d_descriptor(TM, TN, TK, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroups<SG>> op;
     tensor<device half, dextents<int32_t, 2>, tensor_inline> tX((device half*) XS, dextents<int32_t, 2>(1536, 1 << 30));
@@ -141,6 +120,7 @@ kernel void moe_mm_gu(device const uchar* sec4 [[buffer(0)]], device const Exper
     for (uint16_t i = 0; i < accg.get_capacity(); ++i)
         if (accg.is_valid_element(i)) { accg[i] = 0.0f; accu[i] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
     for (int ks = 0; ks < 1536 / TK; ++ks) {
         stage_row(ed.gu_code, grow, ks, kq, WPT, wg + r * TK + kq);
         stage_row(ed.gu_code, urow, ks, kq, WPT, wu + r * TK + kq);
@@ -150,17 +130,23 @@ kernel void moe_mm_gu(device const uchar* sec4 [[buffer(0)]], device const Exper
         op.run(tA, tU, accu);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> tOg(ot, dextents<int32_t, 2>(TN, TM));
-    // gate accumulators -> ot, read back after the up accumulators have been combined: do it in two passes through the same scratch
-    threadgroup float ou[TM * TN];
-    tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> tOu(ou, dextents<int32_t, 2>(TN, TM));
-    accg.store(tOg);
-    accu.store(tOu);
+
+    // Two-step store through ONE aliased ot[TM*TN] float buffer (zero extra TG memory!)
+    constexpr int EPT = (TM * TN) / NTH;
+    threadgroup float* ot = reinterpret_cast<threadgroup float*>(sMem);
+    tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> tO(ot, dextents<int32_t, 2>(TN, TM));
+    accg.store(tO);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gv[EPT];
+    for (int k = 0; k < EPT; ++k) gv[k] = ot[k * NTH + int(tid)];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    accu.store(tO);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const half* sqx = (device const half*) body;
-    for (int it = tid; it < TM * TN; it += NTH) {
+    for (int k = 0; k < EPT; ++k) {
+        const int it = k * NTH + int(tid);
         const int m = it / TN, f = it - m * TN;
-        const float g = ot[it], u = ou[it];
+        const float g = gv[k], u = ot[it];
         const float sg_ = g / (1.0f + exp(-g));
         const float hh = min(sg_, 10.0f) * clamp(u, -10.0f, 10.0f);
         HS[(size_t) (row0 + m) * 1536 + f0 + f] = half(hh / float(sqx[f0 + f]));
@@ -202,7 +188,7 @@ kernel void moe_mm_dn(device const uchar* sec4 [[buffer(0)]], device const Exper
 #define MOEMM(TM, TN, SG)                                                                                                                                                  \
     template [[host_name("moe_mm_gu_" #TM "_" #TN "_" #SG)]] kernel decltype(moe_mm_gu<TM, TN, SG>) moe_mm_gu<TM, TN, SG>;                                                 \
     template [[host_name("moe_mm_dn_" #TM "_" #TN "_" #SG)]] kernel decltype(moe_mm_dn<TM, TN, SG>) moe_mm_dn<TM, TN, SG>;
-MOEMM(16, 32, 2) MOEMM(32, 32, 2) MOEMM(64, 32, 4) MOEMM(16, 64, 2)
+MOEMM(16, 32, 2) MOEMM(32, 32, 2) MOEMM(64, 32, 4) MOEMM(16, 64, 2) MOEMM(32, 64, 4) MOEMM(64, 64, 4)
 
 kernel void moe_combine(device const float* y [[buffer(0)]], device const int* pos [[buffer(1)]], device const float* w [[buffer(2)]], device float* zout [[buffer(3)]],
                         uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {

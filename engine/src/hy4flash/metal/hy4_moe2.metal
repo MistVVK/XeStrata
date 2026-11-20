@@ -1,12 +1,13 @@
 // hy4_moe2.metal - LatentMoE experts for decode / verify windows (T <= 8 tokens): every distinct expert of the window is read once and applied to all the window tokens that picked it.
-// Plan kernel: counts the experts, lists the distinct ones in increasing id order with their (token, slot) pairs in increasing pair order (deterministic), the gate/up and down kernels run
-// one simdgroup per weight row with NT (1, 2, 4 or 8) tokens per pass, selected inside the kernel from the expert's token count. Per (token, row) the arithmetic is the same expression
-// as moe_gu_pair / moe_dn_pair (sum over units in lane order, simd_sum), so a window row equals the same token alone.
-// Compiled with hy4.metal (ExpertDev, sk_w8, code_row_bytes).
+// Upgrades for HY4-METAL-SPEED:
+//   - Indirect dispatch grid written by moe2_plan into meta[2..4] = {192, u_count, 1} (eliminates 30-50% wasted empty threadgroups at M=2..8).
+//   - Exact NT = 1..8 specialization (no wasted n=3->4 or n=5..7->8 work).
+//   - Hoisted sub-group scale + float4 dot inner loop (100% bitwise M-invariant across M=1..8).
+// Compiled with hy4.metal (ExpertDev, sk_q8, sk_half, sk_sb_bytes, code_row_bytes).
 
-// grid 1, 512 threads. idx int [P] (P = T*16 <= 128). meta[0] = number of distinct experts.
+// grid 1, 512 threads. idx int [P] (P = T*16 <= 128). meta[0] = distinct experts, meta[2..4] = indirect grid {192, u_count, 1}.
 kernel void moe2_plan(device const int* idx [[buffer(0)]], constant int& P [[buffer(1)]], device int* uexp [[buffer(2)]], device int* ucnt [[buffer(3)]], device int* upair [[buffer(4)]],
-                      device int* meta [[buffer(5)]], uint e [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+                      device uint* meta [[buffer(5)]], uint e [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup int sums[16];
     int mine[8];
     int c = 0;
@@ -24,27 +25,38 @@ kernel void moe2_plan(device const int* idx [[buffer(0)]], constant int& P [[buf
         ucnt[pos] = c;
         for (int k = 0; k < c; ++k) upair[pos * 8 + k] = mine[k];
     }
-    if (e == 511) meta[0] = base + ex + has;
+    if (e == 511) {
+        const uint n_uniq = uint(base + ex + has);
+        meta[0] = n_uniq;
+        meta[1] = 0u;
+        meta[2] = 192u;
+        meta[3] = n_uniq;
+        meta[4] = 1u;
+    }
 }
 
 template <int F, int NT>
 static inline void m2_gu_rows(device const uchar* rg, device const uchar* ru, device const half* z, thread const int* tk, int lane, thread float* ag, thread float* au) {
     constexpr int SB = sk_sb_bytes(F);
+    constexpr float H = sk_half(F);
     for (int unit = lane; unit < 6 * 32; unit += 32) {
         const int sbi = unit >> 5, u = unit & 31, g = u >> 3, j = (g << 6) + ((u & 7) << 3);
-        float wg[8], wu[8];
-        sk_w8<F>(rg + (size_t) sbi * SB, g, j, wg);
-        sk_w8<F>(ru + (size_t) sbi * SB, g, j, wu);
+        device const uchar* bg = rg + (size_t) sbi * SB;
+        device const uchar* bu = ru + (size_t) sbi * SB;
+        const float effg = float(as_type<half>(*((device const ushort*) bg))) * (float(bg[2 + g]) * (1.0f / 255.0f));
+        const float effu = float(as_type<half>(*((device const ushort*) bu))) * (float(bu[2 + g]) * (1.0f / 255.0f));
+        int qg[8], qu[8];
+        sk_q8<F>(bg + 6, j, qg);
+        sk_q8<F>(bu + 6, j, qu);
+        const float4 wg0 = float4(float(qg[0]), float(qg[1]), float(qg[2]), float(qg[3])) - H;
+        const float4 wg1 = float4(float(qg[4]), float(qg[5]), float(qg[6]), float(qg[7])) - H;
+        const float4 wu0 = float4(float(qu[0]), float(qu[1]), float(qu[2]), float(qu[3])) - H;
+        const float4 wu1 = float4(float(qu[4]), float(qu[5]), float(qu[6]), float(qu[7])) - H;
         for (int t = 0; t < NT; ++t) {
             device const half4* x4 = (device const half4*) (z + (size_t) tk[t] * 1536 + sbi * 256 + j);
             const float4 xa = float4(x4[0]), xb = float4(x4[1]);
-            float a = 0.f, b = 0.f;
-            a += wg[0] * xa.x; a += wg[1] * xa.y; a += wg[2] * xa.z; a += wg[3] * xa.w;
-            a += wg[4] * xb.x; a += wg[5] * xb.y; a += wg[6] * xb.z; a += wg[7] * xb.w;
-            b += wu[0] * xa.x; b += wu[1] * xa.y; b += wu[2] * xa.z; b += wu[3] * xa.w;
-            b += wu[4] * xb.x; b += wu[5] * xb.y; b += wu[6] * xb.z; b += wu[7] * xb.w;
-            ag[t] += a;
-            au[t] += b;
+            ag[t] = fma(effg, dot(wg0, xa) + dot(wg1, xb), ag[t]);
+            au[t] = fma(effu, dot(wu0, xa) + dot(wu1, xb), au[t]);
         }
     }
 }
@@ -61,14 +73,14 @@ static inline void m2_gu_code(int code, device const uchar* rg, device const uch
     }
 }
 
-// grid (192, 16*T), 256 threads. h2 half [P][1536] indexed by pair id
+// indirect grid (192, u_count, 1) from meta[2..4], 256 threads. h2 half [P][1536] indexed by pair id
 kernel void moe2_gu(device const uchar* sec4 [[buffer(0)]], device const ExpertDev* ex [[buffer(1)]], device const half* z [[buffer(2)]], device const int* uexp [[buffer(3)]],
-                    device const int* ucnt [[buffer(4)]], device const int* upair [[buffer(5)]], device const int* meta [[buffer(6)]], device half* h2 [[buffer(7)]], uint2 tgp [[threadgroup_position_in_grid]],
+                    device const int* ucnt [[buffer(4)]], device const int* upair [[buffer(5)]], device const uint* meta [[buffer(6)]], device half* h2 [[buffer(7)]], uint2 tgp [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
-    const int y = tgp.y;
-    if (y >= meta[0]) return;
+    const int y = int(tgp.y);
+    if (y >= int(meta[0])) return;
     const uint sg = tid >> 5, lane = tid & 31;
-    const int r = tgp.x * 8 + sg;
+    const int r = int(tgp.x) * 8 + int(sg);
     const int e = uexp[y], n = ucnt[y];
     const ExpertDev ed = ex[e];
     device const uchar* body = sec4 + ed.body_off;
@@ -84,10 +96,16 @@ kernel void moe2_gu(device const uchar* sec4 [[buffer(0)]], device const ExpertD
     }
     float ag[8], au[8];
     for (int i = 0; i < 8; ++i) { ag[i] = 0.f; au[i] = 0.f; }
-    if (n == 1) m2_gu_code<1>(ed.gu_code, rg, ru, z, tk, lane, ag, au);
-    else if (n == 2) m2_gu_code<2>(ed.gu_code, rg, ru, z, tk, lane, ag, au);
-    else if (n <= 4) m2_gu_code<4>(ed.gu_code, rg, ru, z, tk, lane, ag, au);
-    else m2_gu_code<8>(ed.gu_code, rg, ru, z, tk, lane, ag, au);
+    switch (n) {
+        case 1: m2_gu_code<1>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
+        case 2: m2_gu_code<2>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
+        case 3: m2_gu_code<3>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
+        case 4: m2_gu_code<4>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
+        case 5: m2_gu_code<5>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
+        case 6: m2_gu_code<6>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
+        case 7: m2_gu_code<7>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
+        default: m2_gu_code<8>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
+    }
     const float sq = float(sqx[r]);
     for (int i = 0; i < 8; ++i) {
         if (i >= n) break;
@@ -103,17 +121,18 @@ kernel void moe2_gu(device const uchar* sec4 [[buffer(0)]], device const ExpertD
 template <int F, int NT>
 static inline void m2_dn_rows(device const uchar* rp, device const half* h2, thread const int* pid, int lane, thread float* acc) {
     constexpr int SB = sk_sb_bytes(F);
+    constexpr float H = sk_half(F);
     for (int unit = lane; unit < 6 * 32; unit += 32) {
         const int sbi = unit >> 5, u = unit & 31, g = u >> 3, j = (g << 6) + ((u & 7) << 3);
-        float w[8];
-        sk_w8<F>(rp + (size_t) sbi * SB, g, j, w);
+        device const uchar* blk = rp + (size_t) sbi * SB;
+        const float eff = float(as_type<half>(*((device const ushort*) blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
+        int q[8];
+        sk_q8<F>(blk + 6, j, q);
+        const float4 w0 = float4(float(q[0]), float(q[1]), float(q[2]), float(q[3])) - H;
+        const float4 w1 = float4(float(q[4]), float(q[5]), float(q[6]), float(q[7])) - H;
         for (int t = 0; t < NT; ++t) {
             device const half4* x4 = (device const half4*) (h2 + (size_t) pid[t] * 1536 + sbi * 256 + j);
-            const float4 xa = float4(x4[0]), xb = float4(x4[1]);
-            float a = 0.f;
-            a += w[0] * xa.x; a += w[1] * xa.y; a += w[2] * xa.z; a += w[3] * xa.w;
-            a += w[4] * xb.x; a += w[5] * xb.y; a += w[6] * xb.z; a += w[7] * xb.w;
-            acc[t] += a;
+            acc[t] = fma(eff, dot(w0, float4(x4[0])) + dot(w1, float4(x4[1])), acc[t]);
         }
     }
 }
@@ -130,14 +149,14 @@ static inline void m2_dn_code(int code, device const uchar* rp, device const hal
     }
 }
 
-// grid (192, 16*T), 256 threads. y float [P][1536] = router weight * down(h2)
+// indirect grid (192, u_count, 1) from meta[2..4], 256 threads. y float [P][1536] = router weight * down(h2)
 kernel void moe2_dn(device const uchar* sec4 [[buffer(0)]], device const ExpertDev* ex [[buffer(1)]], device const float* topk_w [[buffer(2)]], device const int* uexp [[buffer(3)]],
-                    device const int* ucnt [[buffer(4)]], device const int* upair [[buffer(5)]], device const int* meta [[buffer(6)]], device const half* h2 [[buffer(7)]], device float* y [[buffer(8)]],
+                    device const int* ucnt [[buffer(4)]], device const int* upair [[buffer(5)]], device const uint* meta [[buffer(6)]], device const half* h2 [[buffer(7)]], device float* y [[buffer(8)]],
                     uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    const int yy = tgp.y;
-    if (yy >= meta[0]) return;
+    const int yy = int(tgp.y);
+    if (yy >= int(meta[0])) return;
     const uint sg = tid >> 5, lane = tid & 31;
-    const int r = tgp.x * 8 + sg;
+    const int r = int(tgp.x) * 8 + int(sg);
     const int e = uexp[yy], n = ucnt[yy];
     const ExpertDev ed = ex[e];
     device const uchar* dn = sec4 + ed.body_off + ed.dn_off;
@@ -146,10 +165,16 @@ kernel void moe2_dn(device const uchar* sec4 [[buffer(0)]], device const ExpertD
     for (int i = 0; i < 8; ++i) pid[i] = i < n ? upair[yy * 8 + i] : 0;
     float acc[8];
     for (int i = 0; i < 8; ++i) acc[i] = 0.f;
-    if (n == 1) m2_dn_code<1>(ed.dn_code, rp, h2, pid, lane, acc);
-    else if (n == 2) m2_dn_code<2>(ed.dn_code, rp, h2, pid, lane, acc);
-    else if (n <= 4) m2_dn_code<4>(ed.dn_code, rp, h2, pid, lane, acc);
-    else m2_dn_code<8>(ed.dn_code, rp, h2, pid, lane, acc);
+    switch (n) {
+        case 1: m2_dn_code<1>(ed.dn_code, rp, h2, pid, lane, acc); break;
+        case 2: m2_dn_code<2>(ed.dn_code, rp, h2, pid, lane, acc); break;
+        case 3: m2_dn_code<3>(ed.dn_code, rp, h2, pid, lane, acc); break;
+        case 4: m2_dn_code<4>(ed.dn_code, rp, h2, pid, lane, acc); break;
+        case 5: m2_dn_code<5>(ed.dn_code, rp, h2, pid, lane, acc); break;
+        case 6: m2_dn_code<6>(ed.dn_code, rp, h2, pid, lane, acc); break;
+        case 7: m2_dn_code<7>(ed.dn_code, rp, h2, pid, lane, acc); break;
+        default: m2_dn_code<8>(ed.dn_code, rp, h2, pid, lane, acc); break;
+    }
     for (int i = 0; i < 8; ++i) {
         if (i >= n) break;
         const float v = simd_sum(acc[i]);
