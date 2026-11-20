@@ -119,6 +119,7 @@ HF_REVISIONS = {
     "unsloth/GLM-5.3-Flash-GGUF": "a38483c8cd5df544f53d70fb281afe97369d5ab6",                        # 2026-10-09
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",          # 2026-10-13
     "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": "b32c7399b57f7a627b8aa9403ef06767e9a444e8",    # 2026-10-24
+    "agentionai/Signal-2-Flash-Next-Gyro-GGUF": "7ac34b1887cff43f28c3339ad25b12a9d3c16b1f",        # 2026-11-20
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": "06a318de4011598a142ee54bcfec47c6921c958e",  # 2026-10-22
     "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": "90a3350cd800ec1fe0d1660a38414ad9e985782f",    # 2026-10-24
     "SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": "3db919a964b1f0ae0d1000ba7be90b3e38b1f7a3",  # 10-24
@@ -252,6 +253,15 @@ MODEL_TERMS: dict[str, dict] = {
         "texts": [
             ("hf:agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF",
              "b32c7399b57f7a627b8aa9403ef06767e9a444e8", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "agentionai/Signal-2-Flash-Next-Gyro-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:agentionai/Signal-2-Flash-Next-Gyro-GGUF",
+             "7ac34b1887cff43f28c3339ad25b12a9d3c16b1f", "LICENSE", 3235,
              "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
         ],
     },
@@ -556,6 +566,14 @@ GYRO_CODER_FILES = {
         (75796732256, "2ecaf3ba6ed7f142ce00bc4a3172052f01bcf4e10d3ff617d8ab4755f4f2d4c4"),
 }
 
+# Signal-2 (agentionai): a fine-tune of Qwen3.8-Flash-Next in Gyro-S' trellis format.  The standard file carries the
+# PLE tensors; the -noPLE file is not listed, as the other Gyro repositories' noPLE files are not.  Its size and SHA-256
+# are the Hub's LFS pointer at the revision pinned in HF_REVISIONS (2026-11-20).
+SIGNAL2_FILES = {
+    "Signal-2-Flash-Next-Gyro-S-TQ1_0.gguf":
+        (59548699008, "76bc87090ef5ab7fb8a3ed9f20df14f81fe4aadb2e8885070302e7169d39262f"),
+}
+
 MODELS: dict[str, dict[str, Any]] = {
     "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0,
              "families": ("qwen", "swift", "sc117", "sc117-swift")},
@@ -655,6 +673,13 @@ MODELS: dict[str, dict[str, Any]] = {
                             "together); lower quality than Gyro-Coder-L",
                    "download_gb": 75.8, "ram_gb": 26.0, "arena_gb": 16.0, "families": ("gyro-coder",),
                    "file": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf", "shards": 1, "vision": True},
+    # Signal-2-Gyro-S: the same 48 layers x 512 experts as Gyro-S (TQK6 / TQK7, 25.8 GB), a fine-tune's weights and a
+    # 59.5 GB download.  Its own size key keeps the file size exact; "S" makes the served name
+    # qwen3.8-flash-next-signal-2-gyro-s.
+    "S": {"about": "Signal-2's fine-tune at Gyro-S' size (36 GB of RAM, or 38 GB of RAM and VRAM together); "
+                   "lower quality than the 2-3-bit sizes",
+          "download_gb": 59.5, "ram_gb": 35.8, "arena_gb": 25.8, "families": ("signal2",),
+          "file": "Signal-2-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1, "vision": True},
     # AtomicChat's AD files (ATOMICCHAT_FILES): IQ3_S gate/up experts in layers 0-3 and 40-47, IQ2_S in the others,
     # IQ4_NL downs (50.6 GB, IQ3_S's size), Q8_0 dense weights; the n-gram table Q5_1 (4.27) or Q8_0 (5.00), the rest of
     # the download.  The RAM as Gyro's ("arena_gb" + LOW_RAM_HEADROOM_GB).  Their AD-3.84bpw is not here: its downs are
@@ -1242,6 +1267,19 @@ FAMILIES: dict[str, dict[str, Any]] = {
                    "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro-Coder files are agentionai's "
                               "pruning and quantization): "
                               "https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF"},
+    # Signal-2 (SIGNAL2_FILES): agentionai's fine-tune of Qwen3.8-Flash-Next, Gyro's TQK6 / TQK7 experts with PLE.
+    # The same pack and mmproj as Gyro; never the default.  The -noPLE file is not listed (as for the other Gyros).
+    "signal2": {"title": "Signal-2-Flash-Next (Gyro)", "by": "agentionai's Signal-2 fine-tune, Gyro quantized",
+                "about": "Signal-2's fine-tune at Gyro-S' size: TQK6/TQK7 experts (25.8 GB), a 59.5 GB download, "
+                         "36 GB of RAM or 38 GB of RAM and VRAM together; not a default",
+                "hf": hf("agentionai/Signal-2-Flash-Next-Gyro-GGUF"),
+                "file": "Signal-2-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1, "tag": "signal2-",
+                "name": "qwen3.8-flash-next-signal-2", "vision": True, "pack_args": ["--compat-bf16"],
+                "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+                "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "sha256": SIGNAL2_FILES,
+                "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; Signal-2 is agentionai's fine-tune "
+                           "and Gyro quantization): "
+                           "https://huggingface.co/agentionai/Signal-2-Flash-Next-Gyro-GGUF"},
     # huihui-ai's abliterated copies (HUIHUI_FILES): Swift 1.5's and Unsloth's files with the refusals removed, in
     # folders of one repository ("dirs": the folder of each size); after the regular families, never the default
     "huihui-swift": {"title": "Swift 1.5 (abliterated)", "by": "huihui-ai's uncensored version of Swift 1.5",
@@ -1607,7 +1645,8 @@ VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)
             "coder": "Coder (half the experts, kept for code)", "sc117": "abliterated by SC117",
             "swift-sc117": "Swift 1.5, abliterated by SC117", "huihui-ai": "abliterated by huihui-ai",
             "swift-huihui-ai": "Swift 1.5, abliterated by huihui-ai", "dealignai": "uncensored by dealignai",
-            "llmfan46": "uncensored by llmfan46", "hauhaucs": "uncensored by HauhauCS"}
+            "llmfan46": "uncensored by llmfan46", "hauhaucs": "uncensored by HauhauCS",
+            "signal-2": "Signal-2, agentionai's fine-tune"}
 QUANTIZERS = {"gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth",
               "gyro": "Gyro by agentionai",
               "ad": "AD by AtomicChat", "ornith-ai": "GGUFs by Ornith AI", "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
@@ -1621,6 +1660,7 @@ TIERS = {  # family: (model, version, quantization), in the order each level lis
     "swift": ("qwen3.8-flash-next", "swift", "gsq-rco"),
     "coder": ("qwen3.8-flash-next", "coder", "gsq-rco"),
     "gyro-coder": ("qwen3.8-flash-next", "coder", "gyro"),
+    "signal2": ("qwen3.8-flash-next", "signal-2", "gyro"),
     "sc117": ("qwen3.8-flash-next", "sc117", "gsq-rco"),
     "sc117-swift": ("qwen3.8-flash-next", "swift-sc117", "gsq-rco"),
     "huihui-unsloth": ("qwen3.8-flash-next", "huihui-ai", "unsloth"),
@@ -1661,6 +1701,7 @@ REPO_PINS: dict[str, dict[str, tuple[int, str]]] = {
     "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_V31_SHARDS, **UNSLOTH_BIG_SHARDS},
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
     "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": GYRO_CODER_FILES,
+    "agentionai/Signal-2-Flash-Next-Gyro-GGUF": SIGNAL2_FILES,
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": HUIHUI_FILES,
     SC117: SC117_FILES,
     SC117_SWIFT: SC117_SWIFT_FILES,

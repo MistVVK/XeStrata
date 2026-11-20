@@ -123,6 +123,9 @@ FALLBACK_MODELS = {
                             "together); lower quality than Gyro-Coder-L",
                    "download_gb": 75.8, "ram_gb": 26.0, "arena_gb": 16.0, "families": ("gyro-coder",),
                    "vision": True},
+    "S": {"about": "Signal-2's fine-tune at Gyro-S' size (36 GB of RAM, or 38 GB of RAM and VRAM together); "
+                   "lower quality than the 2-3-bit sizes",
+          "download_gb": 59.5, "ram_gb": 35.8, "arena_gb": 25.8, "families": ("signal2",), "vision": True},
     "AD-4.27bpw": {"about": "experts of 2.5 to 3.5 bits with 4.5-bit downs, the n-gram table at 5 bits",
                    "download_gb": 94.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "vision": True},
     "AD-5.00bpw": {"about": "the same experts as AD-4.27bpw, the n-gram table at 8 bits",
@@ -145,6 +148,9 @@ FALLBACK_FAMILIES = {
     "gyro-coder": {"title": "Qwen3.8-Flash-Next Gyro-Coder",
                    "about": "half the experts (kept for code): Gyro-Coder-L (35 GB of RAM, or 37 GB of RAM and VRAM "
                             "together) and Gyro-Coder (26 or 28 GB); weaker outside coding", "tag": "gyro-coder-"},
+    "signal2": {"title": "Signal-2-Flash-Next (Gyro)",
+                "about": "Signal-2's fine-tune at Gyro-S' size: TQK6/TQK7 experts (25.8 GB), a 59.5 GB download, "
+                         "36 GB of RAM or 38 GB of RAM and VRAM together; not a default", "tag": "signal2-"},
     "huihui-swift": {"title": "Swift 1.5 (abliterated)", "about": "Swift 1.5 with its refusals removed (abliteration): "
                                                                   "far fewer refusals, and its safety filtering is "
                                                                   "reduced, so check what it writes",
