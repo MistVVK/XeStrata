@@ -116,10 +116,7 @@ __global__ void __launch_bounds__(256) k_write_kv(const float* __restrict__ kv_a
     __half h0 = __float2half(v0 * inv * norm_w[2 * tid]), h1 = __float2half(v1 * inv * norm_w[2 * tid + 1]);
     dst[2 * tid] = h0;
     dst[2 * tid + 1] = h1;
-    // transposed copy for the WMMA PV product: Vt[((slot>>2)*512 + c)*4 + (slot&3)]
-    __half* vt = cache + (size_t)cache_slots * MLA_ROW;
-    vt[((size_t)(slot >> 2) * MLA_KV_LORA + 2 * tid) * 4 + (slot & 3)] = h0;
-    vt[((size_t)(slot >> 2) * MLA_KV_LORA + 2 * tid + 1) * 4 + (slot & 3)] = h1;
+    (void)cache_slots;
     if (tid < 32) {
         float o0, o1;
         rope_pair(row[MLA_KV_LORA + 2 * tid], row[MLA_KV_LORA + 2 * tid + 1], pos, tid, theta, o0, o1);
@@ -227,11 +224,247 @@ __device__ __forceinline__ hv16 pack_hv16(uint2 a, uint2 b, uint2 c, uint2 d) {
 __device__ __forceinline__ fv8 fv8_zero() { return fv8{0, 0, 0, 0, 0, 0, 0, 0}; }
 __device__ __forceinline__ int acc_m(int r, int lane) { return 2 * r + (lane >> 4); }
 __device__ __forceinline__ int acc_n(int r, int lane) { return lane & 15; }
+__device__ __forceinline__ fv8 mla_wmma_f16(hv16 a, hv16 b, fv8 c) {
+#if defined(__HIP_DEVICE_COMPILE__) && !HY4_DEV_WMMA
+    return c;  // unreachable on RDNA2 (host dispatches to k_attend_rdna2 / k_head_gemm_rdna2)
+#else
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#endif
+}
 #endif  // HY4_MMA && !HY4_CUDA
 constexpr int FBK = 64;   // keys per tile
 constexpr int QP = 584;   // sQ pitch (halves)
 constexpr int PP = 72;    // sP pitch (halves)
 constexpr float NEG = -1e30f;
+
+#if !HY4_CUDA
+// ---- 3a. RDNA2 Wave32 tiled fdot2 Flash-MLA (no WMMA, no Vt copy needed) -----------------------------------------------------------------------------
+// Block = 4 waves (128 threads), handles ONE query token and ONE tile of 16 heads across 64-key tiles of a split.
+// Phase 1 (Q @ K^T): tiles 64 keys x 64 dims into sK[64][68] (8.7 KB); each thread computes 4 heads x 2 keys (8 scores) using h2_dot_f32 (v_dot2_f32_f16).
+// Phase 2 (P @ V):   tiles 64 keys x 64 latent cols transposed into sV[64][66] (8.4 KB, reusing sK, zeroing out-of-range keys on load -> exact causality);
+//                    each wave handles 16 of the 64 cols (thread owns 4 heads x 2 cols), accumulating across all 8 chunks (512 cols) in registers!
+// Total LDS: sQ (18.7 KB) + sKV (8.7 KB) + sP (2.3 KB) + s_m/s_l (0.5 KB) = 30.2 KB (2 blocks/WGP on RDNA2).
+// Partial layout for S > 1 is identical to k_attend_wmma so k_combine works unchanged.
+__global__ void __launch_bounds__(128) k_attend_rdna2(const __half* __restrict__ qa, const __half* __restrict__ cache, const float* __restrict__ sinks, __half* __restrict__ out,
+                                                      float* __restrict__ part, MlaAttnArgs a, int S, int tps) {
+    const int rt = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int NH = a.NH, RT = NH / 16, h0 = rt * 16;
+    __shared__ __align__(16) _Float16 sQ[16 * QP];
+    __shared__ __align__(16) _Float16 sP[16 * PP];
+    __shared__ __align__(16) _Float16 sKV[64 * 68];  // reused as sK[64][68] (Phase 1) and sVt[64][66] (Phase 2)
+    __shared__ int s_slot[64];
+    __shared__ uint8_t s_valid[64];
+    __shared__ float s_m[16][4], s_l[16][4];
+
+    {
+        const _Float16* qsrc = reinterpret_cast<const _Float16*>(qa) + ((size_t)t * NH + h0) * MLA_ROW;
+        for (int idx = tid; idx < 16 * (MLA_ROW / 8); idx += 128) {
+            const int r = idx / (MLA_ROW / 8), c = (idx % (MLA_ROW / 8)) * 8;
+            *reinterpret_cast<uint4*>(&sQ[r * QP + c]) = *reinterpret_cast<const uint4*>(qsrc + (size_t)r * MLA_ROW + c);
+        }
+    }
+    const int pos = a.p0 + t;
+    const int mode = a.mode;
+    int lo = 0, lo_al = 0, nk;
+    if (mode == MLA_CAUSAL) nk = pos + 1;
+    else if (mode == MLA_WINDOW) {
+        lo = max(0, pos - a.window + 1);
+        lo_al = lo & ~15;
+        nk = pos - lo_al + 1;
+    } else nk = a.nkeys[t];
+    const int ntiles = (nk + FBK - 1) / FBK;
+    const int tb = sp * tps, te = min(ntiles, tb + tps);
+    const int32_t* klist = a.keys + (size_t)t * a.kmax;
+    const _Float16* rows = reinterpret_cast<const _Float16*>(cache);
+
+    // Within each wave (32 lanes = 4 head-groups x 8 col/key-groups):
+    //   hg = lane >> 3 (0..3) -> 4 heads h_loc = hg*4 + 0..3
+    //   kg = lane & 7  (0..7) -> 2 keys (Phase 1: 16*w + kg*2 + 0..1) or 2 cols (Phase 2: 16*w + kg*2 + 0..1 within each 64-col chunk)
+    const int hg = lane >> 3, kg = lane & 7;
+    const int h_base = hg * 4;
+
+    float mrun[4], lrun[4];
+#pragma unroll
+    for (int hi = 0; hi < 4; ++hi) {
+        mrun[hi] = sp == 0 ? sinks[h0 + h_base + hi] : NEG;
+        lrun[hi] = sp == 0 ? 1.0f : 0.0f;
+    }
+    // Output accumulator: 8 chunks of 64 cols x 4 heads x 2 cols = 64 floats per thread
+    float o[8][4][2];
+#pragma unroll
+    for (int ch = 0; ch < 8; ++ch)
+#pragma unroll
+        for (int hi = 0; hi < 4; ++hi) { o[ch][hi][0] = 0.f; o[ch][hi][1] = 0.f; }
+    __syncthreads();
+
+    for (int tile = tb; tile < te; ++tile) {
+        const int i0 = tile * FBK;
+        if (tid < 64) {
+            const int ie = i0 + tid;
+            bool v = ie < nk;
+            if (mode == MLA_WINDOW) v = v && (lo_al + ie >= lo);
+            int sl = 0;
+            if (ie < nk) sl = mode == MLA_CAUSAL ? (a.ring > 0 ? ie % a.ring : ie) : (mode == MLA_WINDOW ? (lo_al + ie) % a.ring : klist[ie]);
+            s_slot[tid] = sl;
+            s_valid[tid] = v ? 1 : 0;
+        }
+        __syncthreads();
+
+        // ---- Phase 1: S = Q @ K^T (16 heads x 64 keys, 9 chunks of 64 dims)
+        float sc[4][2];
+#pragma unroll
+        for (int hi = 0; hi < 4; ++hi) { sc[hi][0] = 0.f; sc[hi][1] = 0.f; }
+
+        const int k_idx0 = 16 * w + kg * 2;
+        const int k_idx1 = k_idx0 + 1;
+        for (int d0 = 0; d0 < MLA_ROW; d0 += 64) {
+            // 128 threads load 64 keys x 64 halves (512 uint4 loads = 4 per thread)
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int idx = tid + l * 128;  // 0..511 -> key = idx >> 3 (0..63), c8 = (idx & 7) * 8
+                const int k = idx >> 3, c8 = (idx & 7) * 8;
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                if (s_valid[k]) v = *reinterpret_cast<const uint4*>(rows + (size_t)s_slot[k] * MLA_ROW + d0 + c8);
+                *reinterpret_cast<uint4*>(&sKV[k * 68 + c8]) = v;
+            }
+            __syncthreads();
+            const uint32_t* kp0 = reinterpret_cast<const uint32_t*>(&sKV[k_idx0 * 68]);
+            const uint32_t* kp1 = reinterpret_cast<const uint32_t*>(&sKV[k_idx1 * 68]);
+            const uint32_t* qp0 = reinterpret_cast<const uint32_t*>(&sQ[(h_base + 0) * QP + d0]);
+            const uint32_t* qp1 = reinterpret_cast<const uint32_t*>(&sQ[(h_base + 1) * QP + d0]);
+            const uint32_t* qp2 = reinterpret_cast<const uint32_t*>(&sQ[(h_base + 2) * QP + d0]);
+            const uint32_t* qp3 = reinterpret_cast<const uint32_t*>(&sQ[(h_base + 3) * QP + d0]);
+#pragma unroll
+            for (int d2 = 0; d2 < 32; ++d2) {
+                const uint32_t b0 = kp0[d2], b1 = kp1[d2];
+                const uint32_t a0 = qp0[d2], a1 = qp1[d2], a2 = qp2[d2], a3 = qp3[d2];
+                sc[0][0] = h2_dot_f32(a0, b0, sc[0][0]); sc[0][1] = h2_dot_f32(a0, b1, sc[0][1]);
+                sc[1][0] = h2_dot_f32(a1, b0, sc[1][0]); sc[1][1] = h2_dot_f32(a1, b1, sc[1][1]);
+                sc[2][0] = h2_dot_f32(a2, b0, sc[2][0]); sc[2][1] = h2_dot_f32(a2, b1, sc[2][1]);
+                sc[3][0] = h2_dot_f32(a3, b0, sc[3][0]); sc[3][1] = h2_dot_f32(a3, b1, sc[3][1]);
+            }
+            __syncthreads();
+        }
+
+        const bool v0 = s_valid[k_idx0] != 0;
+        const bool v1 = s_valid[k_idx1] != 0;
+        // ---- Online softmax max across wave's 16 keys (8 lanes in kg = 0..7)
+#pragma unroll
+        for (int hi = 0; hi < 4; ++hi) {
+            sc[hi][0] = v0 ? sc[hi][0] * a.scale : NEG;
+            sc[hi][1] = v1 ? sc[hi][1] * a.scale : NEG;
+            float mx = fmaxf(sc[hi][0], sc[hi][1]);
+            mx = fmaxf(mx, __shfl_xor(mx, 1, 8));
+            mx = fmaxf(mx, __shfl_xor(mx, 2, 8));
+            mx = fmaxf(mx, __shfl_xor(mx, 4, 8));
+            if (kg == 0) s_m[h_base + hi][w] = mx;
+        }
+        __syncthreads();
+
+        float corr[4];
+#pragma unroll
+        for (int hi = 0; hi < 4; ++hi) {
+            const int r = h_base + hi;
+            const float tm = fmaxf(fmaxf(s_m[r][0], s_m[r][1]), fmaxf(s_m[r][2], s_m[r][3]));
+            const float nm = fmaxf(mrun[hi], tm);
+            corr[hi] = expf(mrun[hi] - nm);
+            mrun[hi] = nm;
+            const float p0 = v0 ? expf(sc[hi][0] - nm) : 0.f;
+            const float p1 = v1 ? expf(sc[hi][1] - nm) : 0.f;
+            sP[r * PP + k_idx0] = (_Float16)p0;
+            sP[r * PP + k_idx1] = (_Float16)p1;
+            float ps = p0 + p1;
+            ps += __shfl_xor(ps, 1, 8);
+            ps += __shfl_xor(ps, 2, 8);
+            ps += __shfl_xor(ps, 4, 8);
+            if (kg == 0) s_l[r][w] = ps;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int hi = 0; hi < 4; ++hi) {
+            const int r = h_base + hi;
+            lrun[hi] = lrun[hi] * corr[hi] + (s_l[r][0] + s_l[r][1] + s_l[r][2] + s_l[r][3]);
+        }
+#pragma unroll
+        for (int ch = 0; ch < 8; ++ch)
+#pragma unroll
+            for (int hi = 0; hi < 4; ++hi) {
+                o[ch][hi][0] *= corr[hi];
+                o[ch][hi][1] *= corr[hi];
+            }
+
+        // ---- Phase 2: O += P @ V (8 chunks of 64 latent cols; V transposed into sKV[col][key], stride 66 halves = 33 half2s -> zero bank conflicts!)
+        for (int ch = 0; ch < 8; ++ch) {
+            const int c0 = ch * 64;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int idx = tid + l * 128;
+                const int k = idx >> 3, c8 = (idx & 7) * 8;
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                if (s_valid[k]) v = *reinterpret_cast<const uint4*>(rows + (size_t)s_slot[k] * MLA_ROW + c0 + c8);
+                const _Float16* hv = reinterpret_cast<const _Float16*>(&v);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) sKV[(c8 + e) * 66 + k] = hv[e];
+            }
+            __syncthreads();
+            const int col0 = 16 * w + kg * 2;
+            const int col1 = col0 + 1;
+            const uint32_t* vp0 = reinterpret_cast<const uint32_t*>(&sKV[col0 * 66]);
+            const uint32_t* vp1 = reinterpret_cast<const uint32_t*>(&sKV[col1 * 66]);
+            const uint32_t* pp0 = reinterpret_cast<const uint32_t*>(&sP[(h_base + 0) * PP]);
+            const uint32_t* pp1 = reinterpret_cast<const uint32_t*>(&sP[(h_base + 1) * PP]);
+            const uint32_t* pp2 = reinterpret_cast<const uint32_t*>(&sP[(h_base + 2) * PP]);
+            const uint32_t* pp3 = reinterpret_cast<const uint32_t*>(&sP[(h_base + 3) * PP]);
+#pragma unroll
+            for (int k2 = 0; k2 < 32; ++k2) {
+                const uint32_t b0 = vp0[k2], b1 = vp1[k2];
+                const uint32_t a0 = pp0[k2], a1 = pp1[k2], a2 = pp2[k2], a3 = pp3[k2];
+                o[ch][0][0] = h2_dot_f32(a0, b0, o[ch][0][0]); o[ch][0][1] = h2_dot_f32(a0, b1, o[ch][0][1]);
+                o[ch][1][0] = h2_dot_f32(a1, b0, o[ch][1][0]); o[ch][1][1] = h2_dot_f32(a1, b1, o[ch][1][1]);
+                o[ch][2][0] = h2_dot_f32(a2, b0, o[ch][2][0]); o[ch][2][1] = h2_dot_f32(a2, b1, o[ch][2][1]);
+                o[ch][3][0] = h2_dot_f32(a3, b0, o[ch][3][0]); o[ch][3][1] = h2_dot_f32(a3, b1, o[ch][3][1]);
+            }
+            __syncthreads();
+        }
+    }
+
+    // ---- write (exact same layout as k_attend_wmma)
+    const int col_local = 16 * w + kg * 2;
+    if (S == 1) {
+#pragma unroll
+        for (int hi = 0; hi < 4; ++hi) {
+            const float il = 1.0f / lrun[hi];
+            __half* dst = out + ((size_t)t * NH + h0 + h_base + hi) * MLA_KV_LORA + col_local;
+#pragma unroll
+            for (int ch = 0; ch < 8; ++ch) {
+                dst[ch * 64] = __float2half(o[ch][hi][0] * il);
+                dst[ch * 64 + 1] = __float2half(o[ch][hi][1] * il);
+            }
+        }
+    } else {
+        const size_t blk = ((size_t)t * RT + rt) * S + sp;
+        float* po = part + blk * (16 * MLA_KV_LORA + 32);
+#pragma unroll
+        for (int hi = 0; hi < 4; ++hi) {
+            float* dst = po + (size_t)(h_base + hi) * MLA_KV_LORA + col_local;
+#pragma unroll
+            for (int ch = 0; ch < 8; ++ch) {
+                dst[ch * 64] = o[ch][hi][0];
+                dst[ch * 64 + 1] = o[ch][hi][1];
+            }
+        }
+        if (w == 0 && kg == 0) {
+#pragma unroll
+            for (int hi = 0; hi < 4; ++hi) {
+                po[16 * MLA_KV_LORA + (h_base + hi) * 2] = mrun[hi];
+                po[16 * MLA_KV_LORA + (h_base + hi) * 2 + 1] = lrun[hi];
+            }
+        }
+    }
+}
+#endif  // !HY4_CUDA
 
 #if HY4_MMA && !HY4_CUDA
 __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ qa, const __half* __restrict__ cache, const float* __restrict__ sinks, __half* __restrict__ out,
@@ -241,6 +474,9 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     const int NH = a.NH, RT = NH / 16, h0 = rt * 16;
     __shared__ __align__(16) _Float16 sQ[16 * QP];
     __shared__ __align__(16) _Float16 sP[16 * PP];
+    __shared__ __align__(16) _Float16 sVt[MLA_KV_LORA * 18];  // in-LDS transposed V for 16 keys x 512 cols (18.0 KB; eliminates global Vt!)
+    __shared__ int s_slot[64];
+    __shared__ uint8_t s_valid[64];
     __shared__ float s_m[4][16], s_l[4][16];
     {
         const _Float16* qsrc = reinterpret_cast<const _Float16*>(qa) + ((size_t)t * NH + h0) * MLA_ROW;
@@ -262,7 +498,6 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     const int tb = sp * tps, te = min(ntiles, tb + tps);
     const int32_t* klist = a.keys + (size_t)t * a.kmax;
     const _Float16* rows = reinterpret_cast<const _Float16*>(cache);
-    const _Float16* vt = rows + (size_t)a.cache_slots * MLA_ROW;
 
     float mrun[8], lrun[8];
 #pragma unroll
@@ -283,13 +518,17 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         if (mode == MLA_WINDOW) v = v && (lo_al + ie >= lo);
         int slot = 0;
         if (ie < nk) slot = mode == MLA_CAUSAL ? (a.ring > 0 ? ie % a.ring : ie) : (mode == MLA_WINDOW ? (lo_al + ie) % a.ring : klist[ie]);
+        if (hi == 0) {
+            s_slot[16 * w + l16] = slot;
+            s_valid[16 * w + l16] = v ? 1 : 0;
+        }
         const _Float16* krow = rows + (size_t)slot * MLA_ROW;
         fv8 sacc = fv8{};
 #pragma unroll 12
         for (int kk = 0; kk < MLA_ROW / 16; ++kk) {
             hv16 af = ld_hv16(&sQ[l16 * QP + kk * 16]);
             hv16 bf = ld_hv16(krow + kk * 16);
-            sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, sacc);
+            sacc = mla_wmma_f16(af, bf, sacc);
         }
         float sc[8];
 #pragma unroll
@@ -306,21 +545,6 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
 #pragma unroll
             for (int i = 0; i < 8; ++i) s_m[w][2 * i + hi] = pm[i];
         }
-        // group base (slot >> 2) of the 16 key groups of the 4 PV k-steps (entry 4q of the tile)
-        int gidx[16];
-#pragma unroll
-        for (int q = 0; q < 16; ++q) {
-            int e = i0 + 4 * q;
-            int g = 0;
-            if (e < nk) {
-                int sl = mode == MLA_CAUSAL ? (a.ring > 0 ? e % a.ring : e) : (mode == MLA_WINDOW ? (lo_al + e) % a.ring : klist[e]);
-                g = sl >> 2;
-            }
-            gidx[q] = g;
-        }
-        int vv[16];  // valid keys (0..4) of each 4-key group of this tile
-#pragma unroll
-        for (int q = 0; q < 16; ++q) vv[q] = min(max(nk - (i0 + 4 * q), 0), 4);
         __syncthreads();
         float corr[8];
 #pragma unroll
@@ -355,34 +579,31 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         for (int c = 0; c < 8; ++c)
 #pragma unroll
             for (int i = 0; i < 8; ++i) o[c][i] *= corr[i];
-        // ---- P @ V  (this wave: columns 128w .. 128w+127)
+        // ---- P @ V: transpose 16 keys x 512 cols from row-major cache into sVt[512][18] (invalid keys zeroed -> exact vmask causality, no global Vt!)
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
-            hv16 pf = ld_hv16(&sP[l16 * PP + ks * 16]);
-            const bool full = (vv[4 * ks + 0] >= 4) & (vv[4 * ks + 1] >= 4) & (vv[4 * ks + 2] >= 4) & (vv[4 * ks + 3] >= 4);  // uniform: only the last tile of a query has a partial group
-            if (full) {
+            // 128 threads load 16 keys x 512 halves = 1024 uint4 loads (8 per thread, coalesced)
 #pragma unroll
-                for (int ct = 0; ct < 8; ++ct) {
-                    const int c = 128 * w + 16 * ct + l16;
-                    uint2 b0 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 0] * MLA_KV_LORA + c) * 4);
-                    uint2 b1 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 1] * MLA_KV_LORA + c) * 4);
-                    uint2 b2 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2] * MLA_KV_LORA + c) * 4);
-                    uint2 b3 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 3] * MLA_KV_LORA + c) * 4);
-                    o[ct] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, pack_hv16(b0, b1, b2, b3), o[ct]);
-                }
-            } else {
+            for (int l = 0; l < 8; ++l) {
+                const int idx = tid + l * 128;  // 0..1023 -> k16 = idx >> 6 (0..15), c8 = (idx & 63) * 8
+                const int k16 = idx >> 6, c8 = (idx & 63) * 8;
+                const int tk = 16 * ks + k16;
+                uint4 v4 = make_uint4(0u, 0u, 0u, 0u);
+                if (s_valid[tk]) v4 = *reinterpret_cast<const uint4*>(rows + (size_t)s_slot[tk] * MLA_ROW + c8);
+                const _Float16* hv = reinterpret_cast<const _Float16*>(&v4);
 #pragma unroll
-                for (int ct = 0; ct < 8; ++ct) {
-                    const int c = 128 * w + 16 * ct + l16;
-                    uint2 b0 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 0] * MLA_KV_LORA + c) * 4), vv[4 * ks + 0]);
-                    uint2 b1 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 1] * MLA_KV_LORA + c) * 4), vv[4 * ks + 1]);
-                    uint2 b2 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2] * MLA_KV_LORA + c) * 4), vv[4 * ks + 2]);
-                    uint2 b3 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 3] * MLA_KV_LORA + c) * 4), vv[4 * ks + 3]);
-                    o[ct] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, pack_hv16(b0, b1, b2, b3), o[ct]);
-                }
+                for (int e = 0; e < 8; ++e) sVt[(c8 + e) * 18 + k16] = hv[e];
             }
+            __syncthreads();
+            hv16 pf = ld_hv16(&sP[l16 * PP + ks * 16]);
+#pragma unroll
+            for (int ct = 0; ct < 8; ++ct) {
+                const int c = 128 * w + 16 * ct + l16;
+                hv16 vf = ld_hv16(&sVt[c * 18]);
+                o[ct] = mla_wmma_f16(pf, vf, o[ct]);
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
     // ---- write
     if (S == 1) {
@@ -413,9 +634,7 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
 }
 
 #elif HY4_MMA
-// NVIDIA version of the flash kernel (mma.sync m16n8k16). Same block structure and online-softmax state as the gfx11 kernel above; the 16 head rows are rows g and g+8 of
-// every lane quad (g = lane>>2), the 64 keys of a tile are 2 n8 sub-tiles per wave. The k axis of every 16-chunk is permuted identically for A and B (lane quad c owns the 4
-// consecutive k 4c..4c+3): for QK^T these are 4 consecutive latent dims, for PV 4 consecutive keys = one group of the Vt copy of the cache (one 8-byte load per fragment).
+// NVIDIA version of the flash kernel (mma.sync m16n8k16), in-LDS transposed V (eliminates global Vt copy).
 __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ qa, const __half* __restrict__ cache, const float* __restrict__ sinks, __half* __restrict__ out,
                                                       float* __restrict__ part, MlaAttnArgs a, int S, int tps) {
     const int rt = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
@@ -424,6 +643,9 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     const int NH = a.NH, RT = NH / 16, h0 = rt * 16;
     __shared__ __align__(16) half_t sQ[16 * QP];
     __shared__ __align__(16) half_t sP[16 * PP];
+    __shared__ __align__(16) half_t sVt[MLA_KV_LORA * 18];
+    __shared__ int s_slot[64];
+    __shared__ uint8_t s_valid[64];
     __shared__ float s_m[4][16], s_l[4][16];
     {
         const half_t* qsrc = reinterpret_cast<const half_t*>(qa) + ((size_t)t * NH + h0) * MLA_ROW;
@@ -445,7 +667,6 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     const int tb = sp * tps, te = min(ntiles, tb + tps);
     const int32_t* klist = a.keys + (size_t)t * a.kmax;
     const half_t* rows = reinterpret_cast<const half_t*>(cache);
-    const half_t* vt = rows + (size_t)a.cache_slots * MLA_ROW;
 
     float mrun[2], lrun[2];
 #pragma unroll
@@ -453,7 +674,7 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         mrun[i] = sp == 0 ? sinks[h0 + g + 8 * i] : NEG;
         lrun[i] = sp == 0 ? 1.0f : 0.0f;
     }
-    float oc[16][4];  // output accumulators: 16 n8 tiles of this wave's 128 columns
+    float oc[16][4];
 #pragma unroll
     for (int nt = 0; nt < 16; ++nt)
 #pragma unroll
@@ -462,15 +683,19 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
 
     for (int tile = tb; tile < te; ++tile) {
         const int i0 = tile * FBK;
-        // ---- scores of this wave's 16 keys (2 n8 sub-tiles; this lane loads the B rows of keys 8s+g)
+        if (tid < 64) {
+            const int ie = i0 + tid;
+            bool v = ie < nk;
+            if (mode == MLA_WINDOW) v = v && (lo_al + ie >= lo);
+            int sl = 0;
+            if (ie < nk) sl = mode == MLA_CAUSAL ? (a.ring > 0 ? ie % a.ring : ie) : (mode == MLA_WINDOW ? (lo_al + ie) % a.ring : klist[ie]);
+            s_slot[tid] = sl;
+            s_valid[tid] = v ? 1 : 0;
+        }
+        __syncthreads();
         const half_t* kr[2];
 #pragma unroll
-        for (int s = 0; s < 2; ++s) {
-            const int ie = i0 + 16 * w + 8 * s + g;
-            int slot = 0;
-            if (ie < nk) slot = mode == MLA_CAUSAL ? (a.ring > 0 ? ie % a.ring : ie) : (mode == MLA_WINDOW ? (lo_al + ie) % a.ring : klist[ie]);
-            kr[s] = rows + (size_t)slot * MLA_ROW;
-        }
+        for (int s = 0; s < 2; ++s) kr[s] = rows + (size_t)s_slot[16 * w + 8 * s + g] * MLA_ROW;
         float sacc[2][4];
 #pragma unroll
         for (int s = 0; s < 2; ++s)
@@ -492,9 +717,8 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         for (int s = 0; s < 2; ++s)
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                const int kidx = i0 + 16 * w + 8 * s + 2 * c + (e & 1);
-                bool v = kidx < nk;
-                if (mode == MLA_WINDOW) v = v && (lo_al + kidx >= lo);
+                const int tk = 16 * w + 8 * s + 2 * c + (e & 1);
+                bool v = s_valid[tk] != 0;
                 vk[s][e] = v;
                 sc[s][e] = v ? sacc[s][e] * a.scale : NEG;
             }
@@ -509,19 +733,6 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         if (c == 0) {
             s_m[w][g] = pm[0];
             s_m[w][g + 8] = pm[1];
-        }
-        // group base (slot >> 2) of the 4 keys this lane feeds to each of the 4 PV k-steps: keys 4*(4*ks + c) .. +3 of the tile
-        int gidx[4], vv[4];  // vv: valid keys (0..4) of each 4-key group; the V halves of the others must not reach the mma (their P is 0, but the product alignment still sees their exponents)
-#pragma unroll
-        for (int ks = 0; ks < 4; ++ks) {
-            const int e = i0 + 4 * (4 * ks + c);
-            vv[ks] = min(max(nk - e, 0), 4);
-            int gg = 0;
-            if (e < nk) {
-                const int sl = mode == MLA_CAUSAL ? (a.ring > 0 ? e % a.ring : e) : (mode == MLA_WINDOW ? (lo_al + e) % a.ring : klist[e]);
-                gg = sl >> 2;
-            }
-            gidx[ks] = gg;
         }
         __syncthreads();
         float corr[2];
@@ -562,22 +773,31 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         for (int nt = 0; nt < 16; ++nt)
 #pragma unroll
             for (int e = 0; e < 4; ++e) oc[nt][e] *= corr[e >> 1];
-        // ---- P @ V  (this wave: columns 128w .. 128w+127 = 16 n8 tiles)
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
+#pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                const int idx = tid + l * 128;
+                const int k16 = idx >> 6, c8 = (idx & 63) * 8;
+                const int tk = 16 * ks + k16;
+                uint4 v4 = make_uint4(0u, 0u, 0u, 0u);
+                if (s_valid[tk]) v4 = *reinterpret_cast<const uint4*>(rows + (size_t)s_slot[tk] * MLA_ROW + c8);
+                const half_t* hv = reinterpret_cast<const half_t*>(&v4);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) sVt[(c8 + e) * 18 + k16] = hv[e];
+            }
+            __syncthreads();
             const uint2 plo = *reinterpret_cast<const uint2*>(&sP[g * PP + ks * 16 + c4]);
             const uint2 phi = *reinterpret_cast<const uint2*>(&sP[(g + 8) * PP + ks * 16 + c4]);
 #pragma unroll
             for (int nt = 0; nt < 16; ++nt) {
                 const int col = 128 * w + 8 * nt + g;
-                uint2 b = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[ks] * MLA_KV_LORA + col) * 4);
-                if (vv[ks] < 4) b = vmask(b, vv[ks]);
+                const uint2 b = *reinterpret_cast<const uint2*>(&sVt[col * 18 + c4]);
                 mma_16816(oc[nt], plo.x, phi.x, plo.y, phi.y, b.x, b.y);
             }
+            __syncthreads();
         }
-        __syncthreads();
     }
-    // ---- write
     if (S == 1) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
@@ -656,9 +876,8 @@ int choose_splits(int M, int NH, int max_keys) {
     return std::max(S, 1);
 }
 
-#if HY4_MMA
-// ---- 1b/4b. WMMA q-absorb and v-up projections (prefill / verify windows; per-head GEMMs on the matrix cores) ---------------------------------------------------
-// wk_bt: half [NH][512][192]  (wk_b transposed so that a B fragment = 16 contiguous values of the 192-dim contraction axis)
+// ---- 1b/4b. per-head q-absorb and v-up projections (prefill / verify windows) ---------------------------------------------------------------------------------
+// wk_bt: half [NH][512][192]  (wk_b transposed so that a B fragment = contiguous contraction axis)
 __global__ void k_transpose_wk(const __half* __restrict__ wk_b, __half* __restrict__ wk_bt, int NH) {
     const size_t n = (size_t)NH * MLA_NOPE * MLA_KV_LORA;
     for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += (size_t)gridDim.x * blockDim.x) {
@@ -668,6 +887,99 @@ __global__ void k_transpose_wk(const __half* __restrict__ wk_b, __half* __restri
         wk_bt[(h * MLA_KV_LORA + c) * MLA_NOPE + i] = wk_b[idx];
     }
 }
+
+#if !HY4_CUDA
+// RDNA2 Wave32 fdot2 per-head tiled GEMM: 64 tokens x 64 outputs, BK=64, 256 threads (4x4 per thread).
+template <int MODE>
+__global__ void __launch_bounds__(256) k_head_gemm_rdna2(const void* __restrict__ A_, const __half* __restrict__ Bw, const float* __restrict__ gate, __half* __restrict__ out, int M, int NH, int p0,
+                                                         float theta) {
+    constexpr int K = MODE == 0 ? MLA_NOPE : MLA_KV_LORA;
+    constexpr int N = MODE == 0 ? MLA_KV_LORA : MLA_VHEAD;
+    constexpr int LD = 68;
+    __shared__ __align__(16) _Float16 sA[64 * LD];
+    __shared__ __align__(16) _Float16 sB[64 * LD];
+    const int h = blockIdx.z, t0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+    const int tid = threadIdx.x;
+    const int ty = tid >> 4, tx = tid & 15;
+    const _Float16* B = reinterpret_cast<const _Float16*>(Bw) + ((size_t)h * N + n0) * K;
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        // load sB[64][64] (512 uint4 loads -> 2 per thread)
+#pragma unroll
+        for (int l = 0; l < 2; ++l) {
+            const int idx = tid + l * 256, r = idx >> 3, c8 = (idx & 7) * 8;
+            *reinterpret_cast<uint4*>(&sB[r * LD + c8]) = *reinterpret_cast<const uint4*>(B + (size_t)r * K + k0 + c8);
+        }
+        if constexpr (MODE == 0) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int idx = tid + l * 256, r = idx >> 4, c4 = (idx & 15) * 4;
+                const int t = min(t0 + r, M - 1);
+                const float4 v = *reinterpret_cast<const float4*>(reinterpret_cast<const float*>(A_) + ((size_t)t * NH + h) * MLA_QHEAD + k0 + c4);
+                _Float16* d = &sA[r * LD + c4];
+                d[0] = (_Float16)v.x; d[1] = (_Float16)v.y; d[2] = (_Float16)v.z; d[3] = (_Float16)v.w;
+            }
+        } else {
+#pragma unroll
+            for (int l = 0; l < 2; ++l) {
+                const int idx = tid + l * 256, r = idx >> 3, c8 = (idx & 7) * 8;
+                const int t = min(t0 + r, M - 1);
+                *reinterpret_cast<uint4*>(&sA[r * LD + c8]) = *reinterpret_cast<const uint4*>(reinterpret_cast<const _Float16*>(A_) + ((size_t)t * NH + h) * MLA_KV_LORA + k0 + c8);
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 32; ++kk) {
+            uint32_t a[4], b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = reinterpret_cast<const uint32_t*>(&sA[(ty * 4 + i) * LD])[kk];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) b[j] = reinterpret_cast<const uint32_t*>(&sB[(tx + j * 16) * LD])[kk];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = h2_dot_f32(a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int t = t0 + ty * 4 + i;
+        if (t >= M) continue;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int n = n0 + tx + j * 16;
+            float v = acc[i][j];
+            if constexpr (MODE == 0) {
+                out[((size_t)t * NH + h) * MLA_ROW + n] = __float2half(v);
+            } else {
+                const size_t gi = (size_t)t * NH * MLA_VHEAD + (size_t)h * MLA_VHEAD + n;
+                if (gate) v *= 1.0f / (1.0f + expf(-gate[gi]));
+                out[gi] = __float2half(v);
+            }
+        }
+    }
+    if constexpr (MODE == 0) {
+        if (blockIdx.x == 0) {
+            const float* q_b = reinterpret_cast<const float*>(A_);
+            for (int idx = tid; idx < 64 * 32; idx += 256) {
+                const int tt = idx / 32, i = idx % 32, t = t0 + tt;
+                if (t >= M) continue;
+                const float* qp = q_b + ((size_t)t * NH + h) * MLA_QHEAD + MLA_NOPE + 2 * i;
+                float o0, o1;
+                rope_pair(qp[0], qp[1], p0 + t, i, theta, o0, o1);
+                *reinterpret_cast<__half2*>(out + ((size_t)t * NH + h) * MLA_ROW + MLA_KV_LORA + 2 * i) = __floats2half2_rn(o0, o1);
+            }
+        }
+    }
+}
+#endif  // !HY4_CUDA
+
+#if HY4_MMA
 
 #if !HY4_CUDA
 __device__ __forceinline__ hv16 ld_f32_as_hv16(const float* p) {
@@ -782,10 +1094,10 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
             hv16 a1 = ld_hv16(&sA[(wm * 32 + 16 + l16) * HG_LD + kk * 16]);
             hv16 b0 = ld_hv16(&sB[(wn * 32 + l16) * HG_LD + kk * 16]);
             hv16 b1 = ld_hv16(&sB[(wn * 32 + 16 + l16) * HG_LD + kk * 16]);
-            acc[0][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc[0][0]);
-            acc[0][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b1, acc[0][1]);
-            acc[1][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b0, acc[1][0]);
-            acc[1][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc[1][1]);
+            acc[0][0] = mla_wmma_f16(a0, b0, acc[0][0]);
+            acc[0][1] = mla_wmma_f16(a0, b1, acc[0][1]);
+            acc[1][0] = mla_wmma_f16(a1, b0, acc[1][0]);
+            acc[1][1] = mla_wmma_f16(a1, b1, acc[1][1]);
         }
 #endif
         __syncthreads();
@@ -1046,7 +1358,7 @@ size_t mla_workspace_bytes(int M, int NH, int max_keys) {
     return (size_t)M * (NH / 16) * S * (16 * MLA_KV_LORA + 32) * sizeof(float);
 }
 
-size_t mla_cache_bytes(int slots) { return (size_t)slots * (MLA_ROW + MLA_KV_LORA) * sizeof(__half); }
+size_t mla_cache_bytes(int slots) { return (size_t)slots * MLA_ROW * sizeof(__half); }
 
 static int max_keys_of(const MlaAttnArgs& a) {
     if (a.mode == MLA_CAUSAL) return a.p0 + a.M;
@@ -1066,13 +1378,7 @@ void mla_write_kv(hipStream_t s, const float* kv_a, const float* norm_w, __half*
 }
 
 void mla_attend(hipStream_t s, const __half* qa, const __half* cache, const float* sinks, __half* ctx, const MlaAttnArgs& a, void* ws, size_t ws_bytes) {
-#if !HY4_MMA
-    hipLaunchKernelGGL(k_attend_simple, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);
-    (void)ws; (void)ws_bytes;
-    return;
-#else
-    const bool fast_ok = !g_mla_force_simple && (a.NH % 16 == 0) && a.cache_slots > 0 && (a.cache_slots % 16 == 0) && (a.mode != MLA_WINDOW || (a.ring > 0 && a.ring % 16 == 0)) &&
-                         (a.mode != MLA_LIST || (a.kmax % 4 == 0));
+    const bool fast_ok = !g_mla_force_simple && (a.NH % 16 == 0) && a.cache_slots > 0 && (a.cache_slots % 16 == 0) && (a.mode != MLA_WINDOW || (a.ring > 0 && a.ring % 16 == 0));
     if (!fast_ok) {
         hipLaunchKernelGGL(k_attend_simple, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);
         return;
@@ -1086,32 +1392,56 @@ void mla_attend(hipStream_t s, const __half* qa, const __half* cache, const floa
         hipLaunchKernelGGL(k_attend_simple, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);  // no workspace: fall back
         return;
     }
+#if !HY4_CUDA
+    if (!HY4_MMA || hy4_is_rdna2()) {
+        hipLaunchKernelGGL(k_attend_rdna2, dim3(a.NH / 16, S, a.M), dim3(128), 0, s, qa, cache, sinks, ctx, part, a, S, tps);
+        if (S > 1) hipLaunchKernelGGL(k_combine, dim3(16, a.NH / 16, a.M), dim3(256), 0, s, part, ctx, a.NH, S);
+        return;
+    }
+#endif
+#if HY4_MMA
     hipLaunchKernelGGL(k_attend_wmma, dim3(a.NH / 16, S, a.M), dim3(128), 0, s, qa, cache, sinks, ctx, part, a, S, tps);
     if (S > 1) hipLaunchKernelGGL(k_combine, dim3(16, a.NH / 16, a.M), dim3(256), 0, s, part, ctx, a.NH, S);
+#else
+    hipLaunchKernelGGL(k_attend_simple, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);
 #endif
 }
 
 void mla_vup(hipStream_t s, const __half* ctx, const __half* wv_b, const float* gate, __half* o, int M, int NH) {
-#if HY4_MMA
     if (!g_mla_force_simple) {
+#if !HY4_CUDA
+        if (!HY4_MMA || hy4_is_rdna2()) {
+            hipLaunchKernelGGL(k_head_gemm_rdna2<1>, dim3(MLA_VHEAD / 64, (M + 63) / 64, NH), dim3(256), 0, s, (const void*)ctx, wv_b, gate, o, M, NH, 0, 0.f);
+            return;
+        }
+#endif
+#if HY4_MMA
         hipLaunchKernelGGL(k_head_gemm<1>, dim3(MLA_VHEAD / HG_BN, (M + HG_BM - 1) / HG_BM, NH), dim3(256), 0, s, (const void*)ctx, wv_b, gate, o, M, NH, 0, 0.f);
         return;
-    }
 #endif
+    }
     constexpr int TT = 8;
     dim3 grid(NH, (M + TT - 1) / TT);
     hipLaunchKernelGGL((k_vup<TT>), grid, dim3(256), 0, s, ctx, wv_b, gate, o, M, NH);
 }
 
-#if HY4_MMA
 void mla_transpose_wk(hipStream_t s, const __half* wk_b, __half* wk_bt, int NH) {
     hipLaunchKernelGGL(k_transpose_wk, dim3(1024), dim3(256), 0, s, wk_b, wk_bt, NH);
 }
 
 void mla_prep_q_t(hipStream_t s, const float* q_b, const __half* wk_bt, __half* qa, int M, int NH, int p0, float theta) {
-    hipLaunchKernelGGL(k_head_gemm<0>, dim3(MLA_KV_LORA / HG_BN, (M + HG_BM - 1) / HG_BM, NH), dim3(256), 0, s, (const void*)q_b, wk_bt, (const float*)nullptr, qa, M, NH, p0, theta);
-}
+#if !HY4_CUDA
+    if (!HY4_MMA || hy4_is_rdna2()) {
+        hipLaunchKernelGGL(k_head_gemm_rdna2<0>, dim3(MLA_KV_LORA / 64, (M + 63) / 64, NH), dim3(256), 0, s, (const void*)q_b, wk_bt, (const float*)nullptr, qa, M, NH, p0, theta);
+        return;
+    }
 #endif
+#if HY4_MMA
+    hipLaunchKernelGGL(k_head_gemm<0>, dim3(MLA_KV_LORA / HG_BN, (M + HG_BM - 1) / HG_BM, NH), dim3(256), 0, s, (const void*)q_b, wk_bt, (const float*)nullptr, qa, M, NH, p0, theta);
+#else
+    (void)s; (void)q_b; (void)wk_bt; (void)qa; (void)M; (void)NH; (void)p0; (void)theta;
+#endif
+}
 
 void mla_prep_q_dec(hipStream_t s, int fmt, const void* kv_b, const float* q_b, __half* qa, int M, int NH, int p0, float theta) {
     switch (fmt) {

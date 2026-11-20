@@ -42,9 +42,11 @@ __global__ void k_read(const uint4* __restrict__ p, size_t n, unsigned* out) {
 struct Case { const char* name; int fmt; int N, K; };
 
 #ifdef SK_GEMM
+#if HY4_MMA && !HY4_CUDA
 typedef int iv4 __attribute__((ext_vector_type(4)));
 typedef int iv8 __attribute__((ext_vector_type(8)));
 __global__ void __launch_bounds__(256) k_wmma_peak(float* out, int iters) {
+#if HY4_DEV_WMMA
     skd::hv16 a0, a1, b0, b1;
     for (int i = 0; i < 16; ++i) { a0[i] = (_Float16)(threadIdx.x * 0.001f + i); a1[i] = (_Float16)(i * 0.5f); b0[i] = (_Float16)(1.0f + i * 0.01f); b1[i] = (_Float16)(0.5f); }
     skd::fv8 acc[2][2];
@@ -58,8 +60,12 @@ __global__ void __launch_bounds__(256) k_wmma_peak(float* out, int iters) {
     float s = 0;
     for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) for (int r = 0; r < 8; ++r) s += acc[i][j][r];
     if (s == 123.456f) out[0] = s;
+#else
+    (void)out; (void)iters;
+#endif
 }
 __global__ void __launch_bounds__(256) k_wmma_peak_i8(int* out, int iters) {
+#if HY4_DEV_WMMA
     iv4 a0, a1, b0, b1;
     for (int i = 0; i < 4; ++i) { a0[i] = threadIdx.x + i; a1[i] = i * 3; b0[i] = 7 + i; b1[i] = 5; }
     iv8 acc[2][2];
@@ -73,7 +79,39 @@ __global__ void __launch_bounds__(256) k_wmma_peak_i8(int* out, int iters) {
     int s = 0;
     for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) for (int r = 0; r < 8; ++r) s += acc[i][j][r];
     if (s == 123456) out[0] = s;
+#else
+    (void)out; (void)iters;
+#endif
 }
+#endif
+#if !HY4_CUDA
+__global__ void __launch_bounds__(256) k_sdot4_peak(int* out, int iters) {
+    int a0 = 0x01020304 + (int)threadIdx.x, a1 = 0x05060708;
+    int b0 = 0x02030405, b1 = 0x06070809;
+    int c0 = 0, c1 = 1, c2 = 2, c3 = 3;
+    for (int it = 0; it < iters; ++it) {
+        c0 = sdot4_i32(a0, b0, c0);
+        c1 = sdot4_i32(a0, b1, c1);
+        c2 = sdot4_i32(a1, b0, c2);
+        c3 = sdot4_i32(a1, b1, c3);
+    }
+    int s = c0 + c1 + c2 + c3;
+    if (s == 1234567) out[0] = s;
+}
+__global__ void __launch_bounds__(256) k_fdot2_peak(float* out, int iters) {
+    uint32_t a0 = h2_pack(0.01f * (threadIdx.x & 31), 0.5f), a1 = h2_pack(0.25f, 0.75f);
+    uint32_t b0 = h2_pack(1.0f, 0.5f), b1 = h2_pack(0.5f, 1.0f);
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+    for (int it = 0; it < iters; ++it) {
+        c0 = h2_dot_f32(a0, b0, c0);
+        c1 = h2_dot_f32(a0, b1, c1);
+        c2 = h2_dot_f32(a1, b0, c2);
+        c3 = h2_dot_f32(a1, b1, c3);
+    }
+    float s = c0 + c1 + c2 + c3;
+    if (s == 123456.7f) out[0] = s;
+}
+#endif
 #endif
 
 int main(int argc, char** argv) {
@@ -195,7 +233,8 @@ int main(int argc, char** argv) {
                 float ms; hipEventElapsedTime(&ms, e0, e1);
                 ms /= reps;
                 const double flops = 2.0 * 7077888.0 * P;
-                printf("moe %-5s M=%5d pairs=%6d experts_used=%3d weights_read=%7.1f MB  %8.3f ms  %6.1f GB/s  %6.2f TFLOPs  %9.0f tokens/s (1 layer)\n", mode == 0 ? "dec" : "wmma", M, P, nused, wbytes / 1e6,
+                printf("moe %-5s M=%5d pairs=%6d experts_used=%3d weights_read=%7.1f MB  %8.3f ms  %6.1f GB/s  %6.2f TFLOPs  %9.0f tokens/s (1 layer)\n",
+                       mode == 0 ? "dec" : ((!HY4_MMA || hy4_is_rdna2()) ? "rdna2" : "wmma"), M, P, nused, wbytes / 1e6,
                        ms, wbytes / 1e6 / ms, flops / (ms * 1e-3) / 1e12, M / (ms * 1e-3));
             }
             if (M == 1) {  // one-token slot-record path: same numbers as the generic decode kernels, timed the same way
@@ -232,25 +271,52 @@ int main(int argc, char** argv) {
 #ifdef SK_GEMM
     if (only == "peak") {
         float* d_o; CK(hipMalloc(&d_o, 64));
+        const int wgp = hy4_is_rdna2() ? p.multiProcessorCount : std::max(1, p.multiProcessorCount / 2);
         for (int blocks_per_wgp : {1, 2, 4, 8}) {
-            const int blocks = 20 * blocks_per_wgp, iters = 20000;
-            hipLaunchKernelGGL(k_wmma_peak, dim3(blocks), dim3(256), 0, 0, d_o, 100);
-            CK(hipDeviceSynchronize());
-            hipEventRecord(e0);
-            hipLaunchKernelGGL(k_wmma_peak, dim3(blocks), dim3(256), 0, 0, d_o, iters);
-            hipEventRecord(e1);
-            CK(hipEventSynchronize(e1));
-            float ms; hipEventElapsedTime(&ms, e0, e1);
-            const double flops = 2.0 * 16 * 16 * 16 * 4 * (double)iters * 8 * blocks;  // 8 waves per block, 4 wmma per iteration
-            printf("fp16 wmma peak: %d blocks/WGP (x8 waves): %.1f TFLOPs\n", blocks_per_wgp, flops / (ms * 1e-3) / 1e12);
-            hipLaunchKernelGGL(k_wmma_peak_i8, dim3(blocks), dim3(256), 0, 0, (int*)d_o, 100);
-            CK(hipDeviceSynchronize());
-            hipEventRecord(e0);
-            hipLaunchKernelGGL(k_wmma_peak_i8, dim3(blocks), dim3(256), 0, 0, (int*)d_o, iters);
-            hipEventRecord(e1);
-            CK(hipEventSynchronize(e1));
-            hipEventElapsedTime(&ms, e0, e1);
-            printf("int8 wmma peak: %d blocks/WGP (x8 waves): %.1f TOPS\n", blocks_per_wgp, flops / (ms * 1e-3) / 1e12);
+            const int blocks = wgp * blocks_per_wgp, iters = 20000;
+#if HY4_MMA && !HY4_CUDA
+            if (!hy4_is_rdna2()) {
+                hipLaunchKernelGGL(k_wmma_peak, dim3(blocks), dim3(256), 0, 0, d_o, 100);
+                CK(hipDeviceSynchronize());
+                hipEventRecord(e0);
+                hipLaunchKernelGGL(k_wmma_peak, dim3(blocks), dim3(256), 0, 0, d_o, iters);
+                hipEventRecord(e1);
+                CK(hipEventSynchronize(e1));
+                float ms; hipEventElapsedTime(&ms, e0, e1);
+                const double flops = 2.0 * 16 * 16 * 16 * 4 * (double)iters * 8 * blocks;  // 8 waves per block, 4 wmma per iteration
+                printf("fp16 wmma peak: %d blocks/WGP (x8 waves): %.1f TFLOPs\n", blocks_per_wgp, flops / (ms * 1e-3) / 1e12);
+                hipLaunchKernelGGL(k_wmma_peak_i8, dim3(blocks), dim3(256), 0, 0, (int*)d_o, 100);
+                CK(hipDeviceSynchronize());
+                hipEventRecord(e0);
+                hipLaunchKernelGGL(k_wmma_peak_i8, dim3(blocks), dim3(256), 0, 0, (int*)d_o, iters);
+                hipEventRecord(e1);
+                CK(hipEventSynchronize(e1));
+                hipEventElapsedTime(&ms, e0, e1);
+                printf("int8 wmma peak: %d blocks/WGP (x8 waves): %.1f TOPS\n", blocks_per_wgp, flops / (ms * 1e-3) / 1e12);
+            }
+#endif
+#if !HY4_CUDA
+            {
+                hipLaunchKernelGGL(k_sdot4_peak, dim3(blocks), dim3(256), 0, 0, (int*)d_o, 100);
+                CK(hipDeviceSynchronize());
+                hipEventRecord(e0);
+                hipLaunchKernelGGL(k_sdot4_peak, dim3(blocks), dim3(256), 0, 0, (int*)d_o, iters);
+                hipEventRecord(e1);
+                CK(hipEventSynchronize(e1));
+                float ms; hipEventElapsedTime(&ms, e0, e1);
+                const double ops = 2.0 * 4 * 4 * (double)iters * 256 * blocks;  // 4 sdot4/iter * 4 macs * 2 ops * 256 threads
+                printf("int8 sdot4 peak: %d blocks/WGP (x8 waves): %.1f TOPS\n", blocks_per_wgp, ops / (ms * 1e-3) / 1e12);
+                hipLaunchKernelGGL(k_fdot2_peak, dim3(blocks), dim3(256), 0, 0, d_o, 100);
+                CK(hipDeviceSynchronize());
+                hipEventRecord(e0);
+                hipLaunchKernelGGL(k_fdot2_peak, dim3(blocks), dim3(256), 0, 0, d_o, iters);
+                hipEventRecord(e1);
+                CK(hipEventSynchronize(e1));
+                hipEventElapsedTime(&ms, e0, e1);
+                const double flops = 2.0 * 2 * 4 * (double)iters * 256 * blocks;  // 4 fdot2/iter * 2 macs * 2 ops * 256 threads
+                printf("fp16 fdot2 peak: %d blocks/WGP (x8 waves): %.1f TFLOPs\n", blocks_per_wgp, flops / (ms * 1e-3) / 1e12);
+            }
+#endif
         }
         return 0;
     }
@@ -306,8 +372,17 @@ int main(int argc, char** argv) {
 #endif
 #ifdef SK_GEMM
     if (only != "moe") {
-        // WMMA GEMM: correctness (odd M and N, tails) vs the reference kernel, then TFLOPs
-        printf("== WMMA GEMM (linear_h_gemm)\n");
+        auto run_gemm_fn = [&](int fmt, const void* W, int N, int K, const __half* X, float* Y, int M) {
+#if HY4_MMA
+            if (!hy4_is_rdna2()) { linear_h_gemm(0, fmt, W, N, K, X, Y, M); return; }
+#endif
+#if !HY4_CUDA
+            linear_h_rdna2(0, fmt, W, N, K, X, Y, M);
+#else
+            linear_h_ref(0, fmt, W, N, K, X, Y, M);
+#endif
+        };
+        printf("== %s GEMM\n", (!HY4_MMA || hy4_is_rdna2()) ? "RDNA2 sdot4/fdot2" : "WMMA");
         const Case gc[] = {{"gemm q_b sparse S5 [8192,1024]", FMT_S5, 8192, 1024},
                            {"gemm S5 [3072,3072]", FMT_S5, 3072, 3072},
                            {"gemm dense gate S6 [13824,3072]", FMT_S6, 13824, 3072},
@@ -337,18 +412,18 @@ int main(int argc, char** argv) {
                 double me = 0, mx = 0;
                 if (M <= 2048) {
                     linear_h_ref(0, c.fmt, d_pool, c.N, c.K, d_x, d_y, M);
-                    linear_h_gemm(0, c.fmt, d_pool, c.N, c.K, d_x, d_y2, M);
+                    run_gemm_fn(c.fmt, d_pool, c.N, c.K, d_x, d_y2, M);
                     CK(hipDeviceSynchronize());
                     std::vector<float> y((size_t)M * c.N), y2((size_t)M * c.N);
                     CK(hipMemcpy(y.data(), d_y, y.size() * 4, hipMemcpyDeviceToHost));
                     CK(hipMemcpy(y2.data(), d_y2, y2.size() * 4, hipMemcpyDeviceToHost));
                     for (size_t i = 0; i < y.size(); ++i) { mx = std::max(mx, (double)std::fabs(y[i])); me = std::max(me, (double)std::fabs(y[i] - y2[i])); }
                 }
-                for (int w = 0; w < 2; ++w) linear_h_gemm(0, c.fmt, d_pool, c.N, c.K, d_x, d_y2, M);
+                for (int w = 0; w < 2; ++w) run_gemm_fn(c.fmt, d_pool, c.N, c.K, d_x, d_y2, M);
                 CK(hipDeviceSynchronize());
                 const int reps = M >= 2048 ? 5 : 20;
                 hipEventRecord(e0);
-                for (int r = 0; r < reps; ++r) linear_h_gemm(0, c.fmt, d_pool, c.N, c.K, d_x, d_y2, M);
+                for (int r = 0; r < reps; ++r) run_gemm_fn(c.fmt, d_pool, c.N, c.K, d_x, d_y2, M);
                 hipEventRecord(e1);
                 CK(hipEventSynchronize(e1));
                 float ms; hipEventElapsedTime(&ms, e0, e1);
@@ -417,8 +492,18 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < y.size(); ++i) { mx = std::max(mx, (double)std::fabs(y[i])); me = std::max(me, (double)std::fabs(y[i] - y2[i])); }
             float t_ref = 0, t_fast = 0, t_s = 0;
 #ifdef SK_GEMM
+            auto run_skinny = [&](const uint8_t* W) {
+#if HY4_MMA
+                if (!hy4_is_rdna2()) { linear_h_gemm_s(0, c.fmt, W, c.N, c.K, d_x, d_y2, M); return; }
+#endif
+#if !HY4_CUDA
+                linear_h_rdna2(0, c.fmt, W, c.N, c.K, d_x, d_y2, M);
+#else
+                linear_h_ref(0, c.fmt, W, c.N, c.K, d_x, d_y2, M);
+#endif
+            };
             if (c.fmt != FMT_Q8ROW) {
-                linear_h_gemm_s(0, c.fmt, d_pool, c.N, c.K, d_x, d_y2, M);
+                run_skinny(d_pool);
                 CK(hipDeviceSynchronize());
                 CK(hipMemcpy(y2.data(), d_y2, y2.size() * 4, hipMemcpyDeviceToHost));
                 for (size_t i = 0; i < y.size(); ++i) me3 = std::max(me3, (double)std::fabs(y[i] - y2[i]));
@@ -436,7 +521,7 @@ int main(int argc, char** argv) {
                     if (pass == 0) linear_h_ref(0, c.fmt, W, c.N, c.K, d_x, d_y, M);
                     else if (pass == 1) linear_h_gemv(0, c.fmt, W, c.N, c.K, d_x, d_y2, M);
 #ifdef SK_GEMM
-                    else linear_h_gemm_s(0, c.fmt, W, c.N, c.K, d_x, d_y2, M);
+                    else run_skinny(W);
 #endif
                 };
                 for (int w = 0; w < 3; ++w) run(d_pool + (size_t)(w % nmat) * stride);

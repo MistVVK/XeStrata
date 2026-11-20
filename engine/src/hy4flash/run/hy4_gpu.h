@@ -139,15 +139,56 @@ __device__ __forceinline__ const void* shfl_ptr(const void* p, int src) {
 }  // namespace hy4
 
 #else  // ---------------------------------------------------------------- HIP
+// RDNA2 (gfx103x) has no WMMA instructions; guard WMMA cleanly and route to custom Wave32 sdot4/fdot2 kernels.
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+#undef HY4_MMA
+#define HY4_MMA 0
+#ifndef HY4_RDNA2
+#define HY4_RDNA2 1
+#endif
+#endif
+#ifndef HY4_RDNA2
+#define HY4_RDNA2 0
+#endif
 #ifndef HY4_MMA
+#if HY4_RDNA2
+#define HY4_MMA 0
+#else
 #define HY4_MMA 1
+#endif
+#endif
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
+#define HY4_DEV_WMMA 1
+#else
+#define HY4_DEV_WMMA 0
+#endif
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__) || defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__)
+#define HY4_HAVE_SDOT4 1
+#else
+#define HY4_HAVE_SDOT4 0
 #endif
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstring>
 namespace hy4 {
 inline const char* gpu_arch(const hipDeviceProp_t& p) { return p.gcnArchName; }
+inline bool hy4_is_rdna2() {
+#if HY4_RDNA2
+    return true;
+#else
+    static int cached = -1;
+    if (cached < 0) {
+        hipDeviceProp_t dp{};
+        if (hipGetDeviceProperties(&dp, 0) == hipSuccess)
+            cached = (std::strncmp(dp.gcnArchName, "gfx10", 5) == 0) ? 1 : 0;
+        else
+            cached = 0;
+    }
+    return cached != 0;
+#endif
+}
 typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ uint32_t h2_sub(uint32_t a, uint32_t b) { return __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, a) - __builtin_bit_cast(hv2, b)); }
 __device__ __forceinline__ uint32_t h2_splat(float f) {
@@ -155,6 +196,20 @@ __device__ __forceinline__ uint32_t h2_splat(float f) {
     return __builtin_bit_cast(uint32_t, h);
 }
 __device__ __forceinline__ float h2_dot_f32(uint32_t a, uint32_t b, float c) { return __builtin_amdgcn_fdot2(__builtin_bit_cast(hv2, a), __builtin_bit_cast(hv2, b), c, false); }
+__device__ __forceinline__ int sdot4_i32(int a, int b, int c) {
+#if HY4_HAVE_SDOT4
+    return __builtin_amdgcn_sdot4(a, b, c, false);
+#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__) || defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+    int s = c;
+    s += (int)(int8_t)(a & 0xFF) * (int)(int8_t)(b & 0xFF);
+    s += (int)(int8_t)((a >> 8) & 0xFF) * (int)(int8_t)((b >> 8) & 0xFF);
+    s += (int)(int8_t)((a >> 16) & 0xFF) * (int)(int8_t)((b >> 16) & 0xFF);
+    s += (int)(int8_t)((a >> 24) & 0xFF) * (int)(int8_t)((b >> 24) & 0xFF);
+    return s;
+#endif
+}
 __device__ __forceinline__ uint32_t h2_pack(float a, float b) {
     const hv2 h = {(_Float16)a, (_Float16)b};
     return __builtin_bit_cast(uint32_t, h);

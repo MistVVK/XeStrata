@@ -86,9 +86,10 @@ public:
     uint8_t* d_evalid[4] = {};
     EngramDev eng_dev[4];
     ExpertDev* d_experts = nullptr;
-    __half* wk_b = nullptr;  // per layer offsets
-    __half* wv_b = nullptr;
-    std::vector<size_t> wk_off, wv_off;
+    __half* wk_s = nullptr;   // single-layer scratch [64][192][512]
+    __half* wk_st = nullptr;  // single-layer transposed scratch [64][512][192] for mla_prep_q_t
+    __half* wv_s = nullptr;   // single-layer scratch [64][256][512]
+    bool want_all_logits = false;  // when false (default), logits allocates only 16 rows (~7.7 MB vs ~990 MB at Tc=2048)
     std::vector<__half*> kcache;  // per layer
     int ring = 0, slots_sparse = 0;
     // growable KV state (cards that cannot hold the whole context): the sparse-layer KV rows + Vt and the IndexPool state start in VRAM for kv_cap positions and move to pinned host memory
@@ -174,14 +175,16 @@ public:
     // while group k computes. Every group has its own ExpertDev table (the experts of other groups carry pad = 1 and are skipped by the routing; the VRAM-tier experts run in
     // group 0), and the partial sums are added up in fp32.
     struct PfRun { const uint8_t* host; size_t dev_off, bytes; };
-    struct PfGroup { std::vector<PfRun> runs; int seq = 0; ExpertDev* table = nullptr; };
+    struct PfGroup { std::vector<PfRun> runs; size_t total_bytes = 0; int seq = 0; ExpertDev* table = nullptr; };
     std::vector<std::vector<PfGroup>> pf_groups;  // [41 MoE layers][groups]
     std::vector<int> pf_layer_first;              // sequence index of group 0 of each layer
     int pf_nseq = 0, pf_nbuf = 1, pf_next_copy = 0, pf_next_comp = 0;
     uint8_t* d_scratch[2] = {nullptr, nullptr};
+    uint8_t* h_bounce[2] = {nullptr, nullptr};
+    bool pf_bounce = false;
     hipStream_t st2 = nullptr;
     hipEvent_t ev_pf_copy[2] = {nullptr, nullptr}, ev_pf_done[2] = {nullptr, nullptr};
-    bool ev_pf_done_set[2] = {false, false};
+    bool ev_pf_done_set[2] = {false, false}, ev_pf_copy_set[2] = {false, false};
     bool pf_stream = false;
     int pf_min_T = 320;
     bool pf_active(int T) const { return pf_stream && T >= pf_min_T; }
@@ -207,21 +210,41 @@ public:
         }
         if (!maxb) return;
         double t0 = now_s();
+        pf_bounce = false;
         if (hipHostRegister((void*)lo, (size_t)(hi - lo), 0) != hipSuccess) {
-            fprintf(stderr, "[hybrid] prefill streaming disabled: cannot pin the CPU expert arena (%.1f GB)\n", (double)(hi - lo) / 1e9);
             (void)hipGetLastError();
-            return;
+            pf_bounce = true;
+            fprintf(stderr, "[hybrid] cannot pin full CPU expert arena (%.1f GB); falling back to pinned bounce-ring prefill streaming\n", (double)(hi - lo) / 1e9);
         }
         size_t fr = 0, tot = 0;
         HCK(hipMemGetInfo(&fr, &tot));
         const size_t margin = (size_t)200 << 20, tables_est = (size_t)41 * 16 * 8192;
         size_t avail = fr > margin + tables_est ? fr - margin - tables_est : 0;
         size_t cap;
-        if (avail >= maxb) { pf_nbuf = 1; cap = maxb; }
-        else { pf_nbuf = 2; cap = (avail / 2) & ~(size_t)4095; }
+        if (pf_bounce) {
+            pf_nbuf = 2;
+            cap = std::min<size_t>((avail / 2) & ~(size_t)4095, (size_t)256 << 20);
+            if (cap > maxb) cap = (maxb + 4095) & ~(size_t)4095;
+        } else if (avail >= maxb) {
+            pf_nbuf = 1;
+            cap = maxb;
+        } else {
+            pf_nbuf = 2;
+            cap = (avail / 2) & ~(size_t)4095;
+        }
         if (cap < ((size_t)64 << 20)) {
             fprintf(stderr, "[hybrid] prefill streaming disabled: no room for a scratch buffer (free %.2f GB, layer %.2f GB)\n", fr / 1e9, maxb / 1e9);
             return;
+        }
+        if (pf_bounce) {
+            for (int b = 0; b < pf_nbuf; ++b) {
+                if (hipHostMalloc((void**)&h_bounce[b], cap, hipHostMallocDefault) != hipSuccess) {
+                    (void)hipGetLastError();
+                    for (int k = 0; k < b; ++k) { (void)hipHostFree(h_bounce[k]); h_bounce[k] = nullptr; }
+                    fprintf(stderr, "[hybrid] prefill streaming disabled: cannot allocate pinned bounce buffer (%.2f GB)\n", cap / 1e9);
+                    return;
+                }
+            }
         }
         for (int b = 0; b < pf_nbuf; ++b) d_scratch[b] = dalloc<uint8_t>(cap);
         // groups, sequence numbers and tables
@@ -239,6 +262,7 @@ public:
                 CpuExpertView vw = cpu.view(l, pe.second);
                 const size_t sz = al(vw.body_bytes);
                 if (off + sz > cap) {
+                    pf_groups[l].back().total_bytes = off;
                     pf_groups[l].emplace_back();
                     gexp[l].emplace_back();
                     off = 0;
@@ -249,6 +273,7 @@ public:
                 gexp[l].back().push_back(pe.second);
                 off += sz;
             }
+            pf_groups[l].back().total_bytes = off;
             for (size_t gi = 0; gi < pf_groups[l].size(); ++gi) {
                 pf_groups[l][gi].seq = seq++;
             }
@@ -307,8 +332,8 @@ public:
         pf_stream = true;
         size_t ng = 0;
         for (auto& v : pf_groups) ng += v.size();
-        fprintf(stderr, "[hybrid] prefill streaming on: %d buffer(s) of %.2f GB, %zu groups for 41 layers (largest layer %.2f GB), arena pinned in %.1f s, used for chunks >= %d tokens\n", pf_nbuf, cap / 1e9, ng, maxb / 1e9,
-                now_s() - t0, pf_min_T);
+        fprintf(stderr, "[hybrid] prefill streaming on (%s): %d buffer(s) of %.2f GB, %zu groups for 41 layers (largest layer %.2f GB), init in %.1f s, used for chunks >= %d tokens\n",
+                pf_bounce ? "bounce-ring" : "pinned-arena", pf_nbuf, cap / 1e9, ng, maxb / 1e9, now_s() - t0, pf_min_T);
     }
     void pf_begin_chunk() {
         pf_next_copy = 0;
@@ -320,9 +345,18 @@ public:
             const int k = pf_next_copy, b = k % pf_nbuf;
             if (k - pf_nbuf >= pf_next_comp) break;
             const PfGroup* G = pf_find(k);
-            if (ev_pf_done_set[b]) HCK(hipStreamWaitEvent(st2, ev_pf_done[b], 0));
-            for (const PfRun& r : G->runs) HCK(hipMemcpyAsync(d_scratch[b] + r.dev_off, r.host, r.bytes, hipMemcpyHostToDevice, st2));
-            HCK(hipEventRecord(ev_pf_copy[b], st2));
+            if (pf_bounce) {
+                if (ev_pf_copy_set[b]) HCK(hipEventSynchronize(ev_pf_copy[b]));
+                for (const PfRun& r : G->runs) std::memcpy(h_bounce[b] + r.dev_off, r.host, r.bytes);
+                if (ev_pf_done_set[b]) HCK(hipStreamWaitEvent(st2, ev_pf_done[b], 0));
+                if (G->total_bytes) HCK(hipMemcpyAsync(d_scratch[b], h_bounce[b], G->total_bytes, hipMemcpyHostToDevice, st2));
+                HCK(hipEventRecord(ev_pf_copy[b], st2));
+                ev_pf_copy_set[b] = true;
+            } else {
+                if (ev_pf_done_set[b]) HCK(hipStreamWaitEvent(st2, ev_pf_done[b], 0));
+                for (const PfRun& r : G->runs) HCK(hipMemcpyAsync(d_scratch[b] + r.dev_off, r.host, r.bytes, hipMemcpyHostToDevice, st2));
+                HCK(hipEventRecord(ev_pf_copy[b], st2));
+            }
             ++pf_next_copy;
         }
     }
@@ -502,7 +536,8 @@ public:
         moe_w = dalloc<float>((size_t)T * 16);
         moe_ws = dalloc<uint8_t>(moe_ws_bytes(T));
         hfin = dalloc<__half>((size_t)T * HID);
-        logits = dalloc<float>((size_t)T * c.vocab);
+        const int logits_rows = want_all_logits ? T : 16;
+        logits = dalloc<float>((size_t)logits_rows * c.vocab);
         d_argmax = dalloc<int32_t>(T);
         mla_ws_bytes = 0;
         mla_ws = nullptr;
@@ -598,32 +633,11 @@ public:
         score = dalloc<float>((size_t)Tc * ldS);
         keys = dalloc<int32_t>((size_t)Tc * (index_topk + 8));
         nkeys = dalloc<int32_t>((size_t)Tc);
-        // absorbed weights
-        wk_off.resize(c.n_layers);
-        wv_off.resize(c.n_layers);
-        size_t tk = 0, tv = 0;
-        for (int il = 0; il < c.n_layers; ++il) {
-            int NH = heads(il);
-            wk_off[il] = tk;
-            wv_off[il] = tv;
-            tk += (size_t)NH * 192 * 512;
-            tv += (size_t)NH * 256 * 512;
-        }
-        wk_b = dalloc_big<__half>(tk, "absorbed wk_b", 2);
-        wv_b = dalloc_big<__half>(tv, "absorbed wv_b", 2);
-        for (int il = 0; il < c.n_layers; ++il) {
-            int NH = heads(il);
-            const TInfo& t = ti(L(il) + ".self_attn.kv_b_proj.weight");
-            dim3 grid(NH * 448), block(128);
-            switch (t.fmt) {
-                case FMT_S4: hipLaunchKernelGGL((k_split_kvb<FMT_S4>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                case FMT_S5: hipLaunchKernelGGL((k_split_kvb<FMT_S5>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                case FMT_S6: hipLaunchKernelGGL((k_split_kvb<FMT_S6>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                case FMT_S8: hipLaunchKernelGGL((k_split_kvb<FMT_S8>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                default: err = "kv_b_proj format not supported"; return false;
-            }
-        }
-        HCK(hipStreamSynchronize(st));
+        // single-layer absorbed kv_b scratch (dequantized on demand during prefill; saves ~1.02 GB vs 42-layer persistent copy)
+        const int max_nh = std::max(c.heads_swa, c.heads_sparse);
+        wk_s = dalloc_big<__half>((size_t)max_nh * 192 * 512, "kv_b scratch wk", 2);
+        wk_st = dalloc_big<__half>((size_t)max_nh * 512 * 192, "kv_b scratch wk_t", 2);
+        wv_s = dalloc_big<__half>((size_t)max_nh * 256 * 512, "kv_b scratch wv", 2);
         // engram
         if (!load_engram_meta_file(g.path, emeta, err)) return false;
         if (!engram_path.empty()) {
@@ -929,8 +943,23 @@ public:
         { PS _q(this, "mla_write_kv"); mla_write_kv(st, F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
         const bool dec = T <= 8;
         const int kvfmt = ti(pa + ".kv_b_proj.weight").fmt;
+        if (!dec) {
+            PS _q(this, "split_kvb");
+            const uint8_t* wkv = (const uint8_t*)tw(pa + ".kv_b_proj.weight");
+            dim3 grid(NH * 448), block(128);
+            switch (kvfmt) {
+                case FMT_S2: hipLaunchKernelGGL((k_split_kvb<FMT_S2>), grid, block, 0, st, wkv, wk_s, wv_s, NH); break;
+                case FMT_S3: hipLaunchKernelGGL((k_split_kvb<FMT_S3>), grid, block, 0, st, wkv, wk_s, wv_s, NH); break;
+                case FMT_S4: hipLaunchKernelGGL((k_split_kvb<FMT_S4>), grid, block, 0, st, wkv, wk_s, wv_s, NH); break;
+                case FMT_S5: hipLaunchKernelGGL((k_split_kvb<FMT_S5>), grid, block, 0, st, wkv, wk_s, wv_s, NH); break;
+                case FMT_S6: hipLaunchKernelGGL((k_split_kvb<FMT_S6>), grid, block, 0, st, wkv, wk_s, wv_s, NH); break;
+                case FMT_S8: hipLaunchKernelGGL((k_split_kvb<FMT_S8>), grid, block, 0, st, wkv, wk_s, wv_s, NH); break;
+                default: fprintf(stderr, "unsupported kv_b_proj fmt %d\n", kvfmt); exit(3);
+            }
+            mla_transpose_wk(st, wk_s, wk_st, NH);
+        }
         { PS _q(this, "mla_prep_q"); if (dec) mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il));
-        else mla_prep_q(st, F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il)); }
+        else mla_prep_q_t(st, F2, wk_st, qa_h, T, NH, p0, (float)theta(il)); }
         if (vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
             vis->fix_k(st, F1, cache, T, p0, swa ? ring : 0, (float)theta(il));
             vis->fix_q(st, F2, qa_h, T, NH, p0, (float)theta(il));
@@ -974,7 +1003,7 @@ public:
                 maybe_dump("in_gate", T, NH * 256, F3);
             }
         } else {
-            { PS _q(this, "mla_attend_vup_prefill"); mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_b + wv_off[il], F3, o_h, ctx_ws, a, mla_ws, mla_ws_bytes); }
+            { PS _q(this, "mla_attend_vup_prefill"); mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_s, F3, o_h, ctx_ws, a, mla_ws, mla_ws_bytes); }
         }
         lin(pa + ".o_proj.weight", o_h, F1, T);  // [T][3072]
         if (dump && il == dump_layer) maybe_dump("in_oproj", T, HID, F1);
@@ -1101,7 +1130,7 @@ public:
         const double t0 = now_s();
         HCK(hipDeviceSynchronize());
         const size_t os = (size_t)slots_sparse, ns = (size_t)((max_ctx + 8 + 15) / 16) * 16;
-        const size_t row_b = (size_t)576 * 2, vt_b = (size_t)512 * 2;  // MLA_ROW, MLA_KV_LORA halves;  // bytes per slot of the rows and of the Vt copy
+        const size_t row_b = (size_t)576 * 2;  // MLA_ROW halves per slot (no Vt copy)
         auto host_alloc = [&](size_t bytes, void** hp) {
             void* dp = nullptr;
             HCK(hipHostMalloc(hp, bytes, hipHostMallocMapped));
@@ -1113,10 +1142,9 @@ public:
         for (int il = 0; il < c.n_layers; ++il) {
             if (c.is_swa[il]) continue;
             void* hp = nullptr;
-            uint8_t* nd = (uint8_t*)host_alloc(ns * (row_b + vt_b), &hp);
+            uint8_t* nd = (uint8_t*)host_alloc(ns * row_b, &hp);
             uint8_t* od = (uint8_t*)kcache[il];
             HCK(hipMemcpy(nd, od, os * row_b, hipMemcpyDeviceToDevice));
-            HCK(hipMemcpy(nd + ns * row_b, od + os * row_b, os * vt_b, hipMemcpyDeviceToDevice));
             HCK(hipFree(od));
             kcache[il] = (__half*)nd;
             void* hp2 = nullptr;
