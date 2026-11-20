@@ -386,6 +386,7 @@ int main(int argc, char** argv) {
         printf("[trace] M=%d window p0=%d dumped\n", M, p0);
         return 0;
     }
+    const hy4::CpuExpertStats cold0 = r.hyb ? r.cpu.stats() : hy4::CpuExpertStats();
     if (!parity_list.empty()) {
         // verify-window parity: rows of an M-token chunk vs the same positions run one token at a time (M = 1 decode), same prefix
         std::vector<int> ws;
@@ -600,6 +601,13 @@ int main(int argc, char** argv) {
         if (!enq.empty()) { std::sort(enq.begin(), enq.end()); fprintf(stderr, "[decode] median host enqueue time per step %.1f ms (step %.1f ms)\n", enq[enq.size() / 2] * 1000, times.empty() ? 0.0 : times[times.size() / 2] * 1000); }
         std::sort(times.begin(), times.end());
         if (r.hyb) fprintf(stderr, "[hybrid] decode: host waited %.2f ms per step for the CPU experts after queueing the GPU work\n", (r.t_cpu_wait - cpu_wait0) * 1000 / std::max<size_t>(times.size(), 1));
+        if (r.hyb && r.has_cold) {
+            const hy4::CpuExpertStats c1 = r.cpu.stats();
+            const double nt = (double)std::max<size_t>(times.size(), 1);
+            fprintf(stderr, "[cold] decode: %.1f SSD reads per token (%.1f MB), %.1f cache hits per token, SSD %.2f GB/s while reading, pool waited %.2f ms per token for reads, %llu read errors\n", (c1.cold_reads - cold0.cold_reads) / nt,
+                    (c1.cold_bytes - cold0.cold_bytes) / 1e6 / nt, (c1.cold_hits - cold0.cold_hits) / nt, (c1.cold_io_s - cold0.cold_io_s) > 0 ? (c1.cold_bytes - cold0.cold_bytes) / 1e9 / (c1.cold_io_s - cold0.cold_io_s) : 0.0,
+                    (c1.cold_wait_s - cold0.cold_wait_s) * 1000 / nt, (unsigned long long)c1.cold_errors);
+        }
         fprintf(stderr, "[decode] %zu tokens in %.2f s = %.2f tok/s (median step %.1f ms)\n", times.size(), td, times.size() / td, times.empty() ? 0.0 : times[times.size() / 2] * 1000);
         std::ofstream f(out_dir + "/gen_ids.txt");
         f << gen_ids << "\n";

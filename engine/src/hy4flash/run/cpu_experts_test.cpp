@@ -3,7 +3,11 @@
 //   modes: num     numeric check vs an fp32/double dequant reference (+ determinism over thread counts, T>512 chunking)
 //          bench   T = 1,4,8,64 timing, 16 experts/token, nlayers fully resident; DRAM read ceiling
 //          stress  ~10% random residency over all layers, unresident / invalid pairs must be skipped
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -215,7 +219,7 @@ static int test_num(const std::string& path, int nth) {
     {
         int hist[9] = {};
         for (int e : pool) { CpuExpertView v = cx.view(L, e); hist[v.gu_code]++; }
-        std::printf("layer %d: %zu resident experts, kernel=%s, gu code histogram S2..S6,S8: ", L, pool.size(), cx.fast_kernel() ? "fast" : "lib");
+        std::printf("layer %d: %zu resident experts, kernel=%s, gu code histogram S2..S6,S8: ", L, pool.size(), cx.kernel_name());
         for (int c = 0; c <= 8; ++c) if (hist[c]) std::printf("code%d=%d ", c, hist[c]);
         std::printf("\n");
     }
@@ -383,10 +387,10 @@ static int test_bench(const std::string& path, int nlayers, int nth) {
     sum_arena(cx, nlayers, nth, &bw);
     std::printf("DRAM read ceiling (plain sum loop, %d threads over the arena): %.1f GB/s\n", nth, bw);
     Rng rng(11);
-    std::printf("kernel: %s\n", cx.fast_kernel() ? "fast (AVX-512 or AVX2, see init log)" : "lib (gemm_sk_q8_1)");
+    std::printf("kernel: %s\n", cx.kernel_name());
     std::printf("%-14s %-4s %-6s %-10s %-10s %-10s %-12s %-10s\n", "scenario", "T", "reps", "ms/layer", "p50 ms", "min ms", "MB/layer", "GB/s(mean)");
     struct Sc { const char* name; int T; int reps; bool same16; };
-    const Sc scs[] = {{"spread", 1, 60, false}, {"spread", 4, 60, false}, {"spread", 8, 60, false}, {"spread", 64, 12, false},
+    const Sc scs[] = {{"spread", 1, 200, false}, {"spread", 4, 200, false}, {"spread", 8, 200, false}, {"spread", 64, 12, false},
                       {"same16", 16, 12, true}, {"same16", 64, 8, true}, {"same16", 512, 4, true},
                       {"spread(all512)", 512, 4, false}};
     const bool no512 = std::getenv("STRATA_BENCH_NO512") != nullptr;  // skip the T=512 scenarios (slow on the library kernel)
@@ -405,14 +409,23 @@ static int test_bench(const std::string& path, int nlayers, int nth) {
         std::vector<double> ms;
         std::vector<float> out((size_t)T * 1536);
         double bytes_total = 0, wall_total = 0, ph[5] = {0, 0, 0, 0, 0};
+        // STRATA_BENCH_K = number of experts per token actually evaluated on the CPU (slots 0..K-1; the rest are skipped), default all 16
+        const int Kx = std::getenv("STRATA_BENCH_K") ? std::atoi(std::getenv("STRATA_BENCH_K")) : 16;
+        std::vector<uint8_t> use;
+        if (Kx < 16) {
+            use.assign((size_t)T * 16, 0);
+            for (int t = 0; t < T; ++t)
+                for (int s = 0; s < Kx; ++s) use[(size_t)t * 16 + s] = 1;
+        }
+        const uint8_t* usep = use.empty() ? nullptr : use.data();
         // warm-up (one job)
-        { Batch b = make_batch(rng, T, pool16); cx.submit(0, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, out.data()); cx.wait(); }
+        { Batch b = make_batch(rng, T, pool16); cx.submit(0, T, b.z.data(), b.idx.data(), b.w.data(), usep, out.data()); cx.wait(); }
         for (int r = 0; r < reps; ++r) {
             Batch b = make_batch(rng, T, pool16);
             const int layer = r % nlayers;
             cx.reset_stats();
             double t0 = now_s();
-            cx.submit(layer, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, out.data());
+            cx.submit(layer, T, b.z.data(), b.idx.data(), b.w.data(), usep, out.data());
             cx.wait();
             double dt = now_s() - t0;
             CpuExpertStats s = cx.stats();
@@ -512,7 +525,7 @@ static int test_stress(const std::string& path, int nth) {
     if (s.pairs != exp_pairs || s.skipped_unresident != exp_skipped) { std::printf("FAIL counters\n"); ++bad; }
     std::printf("over 41 layers: worst rel-L2 %.3e, worst cos %.8f\n", worst_rel, worst_cos);
     if (worst_rel > 3e-2) ++bad;
-    std::printf("same-activations reference (kernel=%s), worst rel-L2 over 41 layers: %.3e\n", cx.fast_kernel() ? "fast" : "lib", worst_q);
+    std::printf("same-activations reference (kernel=%s), worst rel-L2 over 41 layers: %.3e\n", cx.kernel_name(), worst_q);
     if (worst_q > 2e-3) { std::printf("FAIL kernel differs from same-activation reference\n"); ++bad; }
     // rank-range masks
     {
@@ -545,8 +558,253 @@ static int test_stress(const std::string& path, int nth) {
     return bad ? 1 : 0;
 }
 
+// ==================================================================================================== cold experts
+static void print_cold_stats(const char* tag, const CpuExpertStats& s) {
+    std::printf("  [%s] cold: %llu reads, %.1f MB read, %llu cache hits, %llu errors, wait %.1f ms, io %.1f ms, SSD %.2f GB/s\n", tag, (unsigned long long)s.cold_reads,
+                s.cold_bytes / 1e6, (unsigned long long)s.cold_hits, (unsigned long long)s.cold_errors, s.cold_wait_s * 1e3, s.cold_io_s * 1e3, s.cold_gbps());
+}
+
+// cold vs all-resident must be bit-exact (bodies from the arena, from the slot cache and from the file give identical results)
+static int test_cold(const std::string& path, int nth) {
+    setenv("STRATA_CPUEXP_COLD_CACHE_MB", "16", 1);  // 4 slots of ~4 MB: forces many waves and evictions
+    Rng rng(5);
+    const int layers[2] = {3, 7};
+    std::vector<std::vector<bool>> all(41, std::vector<bool>(512, false)), half(41, std::vector<bool>(512, false)), cold_half(41, std::vector<bool>(512, false)),
+        none(41, std::vector<bool>(512, false));
+    std::vector<int> pool[2];
+    for (int k = 0; k < 2; ++k) {
+        std::set<int> s;
+        while ((int)s.size() < 48) s.insert(rng.below(512));
+        pool[k].assign(s.begin(), s.end());
+        for (size_t i = 0; i < pool[k].size(); ++i) {
+            all[layers[k]][pool[k][i]] = true;
+            (i % 2 == 0 ? half : cold_half)[layers[k]][pool[k][i]] = true;
+        }
+    }
+    CpuExperts A, B, C;
+    std::string err;
+    if (!A.init(path, nth, &all, err) || !B.init(path, nth, &half, err) || !C.init(path, nth, &none, err)) { std::printf("init failed: %s\n", err.c_str()); return 1; }
+    if (!B.set_cold_experts(cold_half, err)) { std::printf("set_cold B failed: %s\n", err.c_str()); return 1; }
+    if (!C.set_cold_experts(all, err)) { std::printf("set_cold C failed: %s\n", err.c_str()); return 1; }
+    int bad = 0;
+    // overlap must be rejected
+    { CpuExperts X; if (!X.init(path, 1, &half, err)) return 1; std::string e2; if (X.set_cold_experts(half, e2)) { std::printf("FAIL: cold/resident overlap accepted\n"); ++bad; } }
+    for (int k = 0; k < 2; ++k)
+        for (int T : {1, 8, 64}) {
+            for (int rep = 0; rep < 2; ++rep) {  // second pass: cache hits
+                Batch b = make_batch(rng, T, pool[k]);
+                std::vector<float> oA((size_t)T * 1536, 1.f), oB((size_t)T * 1536, 2.f), oC((size_t)T * 1536, 3.f);
+                A.submit(layers[k], T, b.z.data(), b.idx.data(), b.w.data(), nullptr, oA.data()); A.wait();
+                B.submit(layers[k], T, b.z.data(), b.idx.data(), b.w.data(), nullptr, oB.data()); B.wait();
+                C.submit(layers[k], T, b.z.data(), b.idx.data(), b.w.data(), nullptr, oC.data()); C.wait();
+                C.submit(layers[k], T, b.z.data(), b.idx.data(), b.w.data(), nullptr, oC.data()); C.wait();  // same job again: cache hits
+                const bool sb = std::memcmp(oA.data(), oB.data(), oA.size() * 4) == 0, sc = std::memcmp(oA.data(), oC.data(), oA.size() * 4) == 0;
+                std::printf("  layer %d T=%-3d pass %d: half-cold vs resident %s, all-cold vs resident %s\n", layers[k], T, rep, sb ? "bit-exact" : "DIFFERENT", sc ? "bit-exact" : "DIFFERENT");
+                if (!sb || !sc) ++bad;
+            }
+        }
+    {   // partial use_pair mask + T > 512 (two chunks) on the all-cold instance
+        const int T = 600;
+        Batch b = make_batch(rng, T, pool[0]);
+        std::vector<uint8_t> use((size_t)T * 16);
+        for (auto& u : use) u = rng.below(4) != 0;
+        std::vector<float> oA((size_t)T * 1536), oC((size_t)T * 1536);
+        A.submit(layers[0], T, b.z.data(), b.idx.data(), b.w.data(), use.data(), oA.data()); A.wait();
+        C.submit(layers[0], T, b.z.data(), b.idx.data(), b.w.data(), use.data(), oC.data()); C.wait();
+        const bool same = std::memcmp(oA.data(), oC.data(), oA.size() * 4) == 0;
+        std::printf("  T=600 (2 chunks) with a use_pair mask, all-cold vs resident: %s\n", same ? "bit-exact" : "DIFFERENT");
+        if (!same) ++bad;
+    }
+    {   // experts in neither mask are skipped, cold ones are computed
+        std::vector<int32_t> idx(16);
+        std::vector<float> w(16, 0.1f), z(1536, 0.5f), o(1536, 7.f);
+        std::vector<int> others;
+        for (int e = 0; e < 512 && others.size() < 8; ++e) if (!all[layers[0]][e]) others.push_back(e);
+        for (int s = 0; s < 16; ++s) idx[s] = s < 8 ? pool[0][s] : others[s - 8];
+        C.reset_stats();
+        C.submit(layers[0], 1, z.data(), idx.data(), w.data(), nullptr, o.data()); C.wait();
+        const CpuExpertStats s = C.stats();
+        std::printf("  GPU-owned experts skipped: pairs %llu (expected 8), skipped %llu (expected 8)\n", (unsigned long long)s.pairs, (unsigned long long)s.skipped_unresident);
+        if (s.pairs != 8 || s.skipped_unresident != 8) ++bad;
+    }
+    print_cold_stats("B half-cold", B.stats());
+    print_cold_stats("C all-cold ", C.stats());
+    if (B.stats().cold_errors || C.stats().cold_errors) ++bad;
+    std::printf("ram_budget_bytes() = %.2f GB\n", CpuExperts::ram_budget_bytes() / 1e9);
+    ram_line("cold end");
+    std::printf("COLD TEST: %s\n", bad ? "FAIL" : "PASS");
+    return bad ? 1 : 0;
+}
+
+// T=1..8 jobs with a given fraction of the used experts cold: ms/layer and the SSD rate
+//   coldbench <model> <nlayers> <threads> <resident_ranks R> <pc: fraction of the 16 picks that are cold> <reps> [T]
+static int test_coldbench(const std::string& path, int nlayers, int nth, int R, double pc, int reps, int T) {
+    std::vector<uint16_t> eor, codes;
+    std::string err;
+    if (!CpuExperts::read_rank_table(path, eor, codes, err)) { std::printf("%s\n", err.c_str()); return 1; }
+    std::vector<std::vector<bool>> res(41, std::vector<bool>(512, false)), cold(41, std::vector<bool>(512, false));
+    std::vector<std::vector<int>> res_ids(nlayers), cold_ids(nlayers);
+    for (int l = 0; l < nlayers; ++l)
+        for (int r = 0; r < 512; ++r) {
+            const int e = eor[(size_t)l * 512 + r];
+            if (r < R) { res[l][e] = true; res_ids[l].push_back(e); }
+            else { cold[l][e] = true; cold_ids[l].push_back(e); }
+        }
+    CpuExperts cx;
+    const double t0 = now_s();
+    if (!cx.init(path, nth, &res, err)) { std::printf("init failed: %s\n", err.c_str()); return 1; }
+    if (!cx.set_cold_experts(cold, err)) { std::printf("set_cold failed: %s\n", err.c_str()); return 1; }
+    std::printf("loaded %llu resident experts (%.2f GB) in %.1f s; %d layers, R=%d, cold fraction of picks %.2f, T=%d\n", (unsigned long long)cx.resident_count(),
+                cx.arena_bytes() / 1e9, now_s() - t0, nlayers, R, pc, T);
+    ram_line("after load");
+    Rng rng(21);
+    std::vector<double> ms;
+    std::vector<float> out((size_t)T * 1536);
+    double ncold_picks = 0;
+    cx.reset_stats();
+    for (int r = -3; r < reps; ++r) {
+        const int layer = (r < 0 ? 0 : r) % nlayers;
+        Batch b;
+        b.T = T;
+        b.z.resize((size_t)T * 1536);
+        b.w.assign((size_t)T * 16, 0.1f);
+        b.idx.resize((size_t)T * 16);
+        for (auto& x : b.z) x = (float)rng.gauss();
+        for (int t = 0; t < T; ++t) {
+            std::set<int> used;
+            for (int s = 0; s < 16; ++s) {
+                const bool c = rng.uni() < pc && !cold_ids[layer].empty();
+                int e;
+                do { e = c ? cold_ids[layer][rng.below((int)cold_ids[layer].size())] : res_ids[layer][rng.below((int)res_ids[layer].size())]; } while (used.count(e));
+                used.insert(e);
+                b.idx[(size_t)t * 16 + s] = e;
+                if (r >= 0 && c) ncold_picks += 1;
+            }
+        }
+        if (r == 0) cx.reset_stats();
+        const double a = now_s();
+        cx.submit(layer, T, b.z.data(), b.idx.data(), b.w.data(), nullptr, out.data());
+        cx.wait();
+        if (r >= 0) ms.push_back((now_s() - a) * 1e3);
+    }
+    const CpuExpertStats s = cx.stats();
+    std::sort(ms.begin(), ms.end());
+    double mean = 0;
+    for (double v : ms) mean += v;
+    mean /= ms.size();
+    std::printf("ms/layer: mean %.3f p50 %.3f min %.3f max %.3f over %d jobs (%.2f cold picks/job)\n", mean, ms[ms.size() / 2], ms[0], ms.back(), reps, ncold_picks / reps);
+    std::printf("per job: %.2f cold reads, %.2f MB read, %.2f cache hits, wait %.3f ms, io %.3f ms; SSD while reading %.2f GB/s; avg read rate over wall time %.2f GB/s\n",
+                (double)s.cold_reads / reps, s.cold_bytes / 1e6 / reps, (double)s.cold_hits / reps, s.cold_wait_s * 1e3 / reps, s.cold_io_s * 1e3 / reps, s.cold_gbps(),
+                s.cold_bytes / (mean * reps * 1e-3) / 1e9);
+    print_cold_stats("total", s);
+    ram_line("bench end");
+    return s.cold_errors ? 1 : 0;
+}
+
+// raw pread throughput of the model file: coldio <file> <block MB> <qd> <seq|rand> <direct|buffered> <seconds>
+static int test_rawio(const std::string& path, double block_mb, int qd, bool rnd, bool direct, double secs) {
+    const int fd = ::open(path.c_str(), O_RDONLY | (direct ? O_DIRECT : 0));
+    if (fd < 0) { std::printf("open failed (%s)\n", direct ? "O_DIRECT" : "buffered"); return 1; }
+    const off_t fsize = lseek(fd, 0, SEEK_END);
+    const size_t blk = ((size_t)(block_mb * 1048576.0) + 4095) & ~(size_t)4095;
+    std::atomic<uint64_t> bytes{0}, ops{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> th;
+    const double t0 = now_s();
+    for (int i = 0; i < qd; ++i)
+        th.emplace_back([&, i]() {
+            void* buf = nullptr;
+            if (posix_memalign(&buf, 4096, blk) != 0) return;
+            Rng r(1000 + i);
+            off_t pos = (off_t)(((uint64_t)fsize / 2 / qd) * i) & ~(off_t)4095;  // sequential: qd interleaved streams in the first half
+            while (!stop.load()) {
+                off_t off;
+                if (rnd) off = (off_t)((r.next() % (uint64_t)(fsize - (off_t)blk)) & ~(uint64_t)4095);
+                else { off = pos; pos += (off_t)blk; if (pos + (off_t)blk > fsize) pos = 0; }
+                const ssize_t n = ::pread(fd, buf, blk, off);
+                if (n <= 0) break;
+                bytes.fetch_add((uint64_t)n);
+                ops.fetch_add(1);
+            }
+            free(buf);
+        });
+    std::this_thread::sleep_for(std::chrono::milliseconds((int)(secs * 1000)));
+    stop.store(true);
+    for (auto& t : th) t.join();
+    const double dt = now_s() - t0;
+    std::printf("rawio %s %s block %.1f MB qd %d: %.2f GB/s, %.0f reads/s (%.1f s)\n", rnd ? "random" : "sequential", direct ? "O_DIRECT" : "buffered", block_mb, qd,
+                bytes.load() / dt / 1e9, ops.load() / dt, dt);
+    ::close(fd);
+    return 0;
+}
+
+// decode-token SSD read rate for a resident rank prefix: p(rank r) ~ 1/(r+8), 16 distinct experts per layer, LRU slot cache
+//   coldsim <model> <resident GB> <cache MB> <tokens>
+static int test_coldsim(const std::string& path, double res_gb, double cache_mb, int tokens) {
+    std::vector<uint32_t> sz;
+    std::vector<uint16_t> eor, codes;
+    std::string err;
+    if (!CpuExperts::read_body_bytes(path, sz, err) || !CpuExperts::read_rank_table(path, eor, codes, err)) { std::printf("%s\n", err.c_str()); return 1; }
+    const int nl = (int)(sz.size() / 512);
+    // uniform rank cut R over all layers: largest R with resident bytes <= budget
+    int R = 0;
+    for (int r = 1; r <= 512; ++r) {
+        double b = 0;
+        for (int l = 0; l < nl; ++l) for (int k = 0; k < r; ++k) b += sz[(size_t)l * 512 + k];
+        if (b > res_gb * 1e9) break;
+        R = r;
+    }
+    double res_b = 0, tot_b = 0;
+    for (int l = 0; l < nl; ++l) for (int k = 0; k < 512; ++k) { tot_b += sz[(size_t)l * 512 + k]; if (k < R) res_b += sz[(size_t)l * 512 + k]; }
+    std::printf("resident budget %.1f GB -> rank cut R=%d of 512 per layer (%.1f GB resident of %.1f GB experts), cold cache %.0f MB\n", res_gb, R, res_b / 1e9, tot_b / 1e9, cache_mb);
+    Rng rng(77);
+    std::vector<double> wgt(512);
+    for (int r = 0; r < 512; ++r) wgt[r] = 1.0 / (r + 8);
+    // LRU of cold bodies by (layer, rank), capacity in bytes
+    std::map<int, uint64_t> lastuse;  // key -> tick
+    std::map<int, uint32_t> size_of;
+    uint64_t tick = 0;
+    double cap = cache_mb * 1e6, used = 0, cold_total_experts = 0, cold_total_bytes = 0, read_bytes = 0, reads = 0;
+    const int warm = tokens / 4;
+    for (int tkn = 0; tkn < tokens; ++tkn) {
+        double tok_reads = 0, tok_bytes = 0, tok_cold = 0;
+        for (int l = 0; l < nl; ++l) {
+            // 16 distinct ranks without replacement ~ weights (exponential-key trick)
+            std::vector<std::pair<double, int>> keys(512);
+            for (int r = 0; r < 512; ++r) keys[r] = {-std::log(rng.uni() + 1e-300) / wgt[r], r};
+            std::partial_sort(keys.begin(), keys.begin() + 16, keys.end());
+            for (int j = 0; j < 16; ++j) {
+                const int r = keys[j].second;
+                if (r < R) continue;
+                ++tok_cold;
+                const int key = l * 512 + r;
+                ++tick;
+                auto it = lastuse.find(key);
+                if (it != lastuse.end()) { it->second = tick; continue; }
+                const uint32_t b = sz[(size_t)l * 512 + r];
+                while (used + b > cap && !lastuse.empty()) {  // evict LRU
+                    auto old = lastuse.begin();
+                    for (auto k = lastuse.begin(); k != lastuse.end(); ++k) if (k->second < old->second) old = k;
+                    used -= size_of[old->first];
+                    lastuse.erase(old);
+                }
+                if (cap >= b) { lastuse[key] = tick; size_of[key] = b; used += b; }
+                tok_reads += 1;
+                tok_bytes += b;
+            }
+        }
+        if (tkn >= warm) { cold_total_experts += tok_cold; cold_total_bytes += tok_bytes; reads += tok_reads; read_bytes += tok_bytes; }
+    }
+    const int n = tokens - warm;
+    std::printf("per decode token (%d tokens after warm-up): %.1f cold expert uses, %.1f SSD reads (%.1f%% of cold uses hit the cache), %.0f MB read from SSD\n", n,
+                cold_total_experts / n, reads / n, cold_total_experts > 0 ? 100.0 * (1.0 - reads / cold_total_experts) : 0.0, read_bytes / n / 1e6);
+    for (double gbps : {1.5, 3.0, 6.0})
+        std::printf("  at %.1f GB/s SSD: %.1f ms of reads per token -> at most %.1f tokens/s from the SSD alone\n", gbps, read_bytes / n / (gbps * 1e9) * 1e3, 1.0 / (read_bytes / n / (gbps * 1e9)));
+    return 0;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 3) { std::printf("usage: %s <model.strata> <num|bench|stress> [nlayers] [threads]\n", argv[0]); return 2; }
+    if (argc < 3) { std::printf("usage: %s <model.strata> <num|bench|stress|cold|coldbench|coldio|coldsim> [nlayers] [threads]\n", argv[0]); return 2; }
     const std::string path = argv[1], mode = argv[2];
     const int nl = argc > 3 ? std::atoi(argv[3]) : 10, nth = argc > 4 ? std::atoi(argv[4]) : 6;
     std::printf("isa %s, threads %d\n", strata::quant::sk::active_sk_isa(), nth);
@@ -564,6 +822,19 @@ int main(int argc, char** argv) {
         for (auto c : codes) ++hist[c];
         for (auto& kv : hist) std::printf("gu=S%d dn=S%d: %d experts\n", kv.first >> 8, kv.first & 255, kv.second);
         return 0;
+    }
+    if (mode == "cold") return test_cold(path, nth);
+    if (mode == "coldbench") {
+        if (argc < 8) { std::printf("usage: coldbench <model> <nlayers> <threads> <R> <pc> <reps> [T]\n"); return 2; }
+        return test_coldbench(path, std::min(nl, 41), nth, std::atoi(argv[5]), std::atof(argv[6]), std::atoi(argv[7]), argc > 8 ? std::atoi(argv[8]) : 1);
+    }
+    if (mode == "coldio") {
+        if (argc < 8) { std::printf("usage: coldio <file> <block MB> <qd> <seq|rand> <direct|buffered> <seconds>\n"); return 2; }
+        return test_rawio(path, std::atof(argv[3]), std::atoi(argv[4]), std::string(argv[5]) == "rand", std::string(argv[6]) == "direct", std::atof(argv[7]));
+    }
+    if (mode == "coldsim") {
+        if (argc < 6) { std::printf("usage: coldsim <model> <resident GB> <cache MB> <tokens>\n"); return 2; }
+        return test_coldsim(path, std::atof(argv[3]), std::atof(argv[4]), std::atoi(argv[5]));
     }
     if (mode == "num") return test_num(path, nth);
     if (mode == "bench") return test_bench(path, std::min(nl, 41), nth);

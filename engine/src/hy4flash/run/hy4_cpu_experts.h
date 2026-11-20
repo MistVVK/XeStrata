@@ -22,7 +22,15 @@ struct CpuExpertStats {
     uint64_t jobs = 0, pairs = 0;     // jobs run, (token,slot) pairs evaluated
     uint64_t skipped_unresident = 0;  // pairs with use_pair != 0 whose expert is not CPU-resident (they are NOT computed)
     double phase_s[5] = {0, 0, 0, 0, 0};  // wall seconds in: plan, quantize z, gate/up(+h), down, combine (sum over jobs)
+    // cold experts (set_cold_experts): bodies read from the .strata file on demand
+    uint64_t cold_bytes = 0;          // expert body bytes read from the file (cache misses only)
+    uint64_t cold_reads = 0;          // body reads issued (one per missed expert per job)
+    uint64_t cold_hits = 0;           // cold experts served from the slot cache (LRU) without a read
+    uint64_t cold_errors = 0;         // failed reads (the job's result is invalid when != 0)
+    double cold_wait_s = 0;           // seconds the pool waited for reads (not hidden behind the compute of earlier waves)
+    double cold_io_s = 0;             // seconds with reads in flight (issue of a wave -> its last read completed)
     double gbps() const { return wall_s > 0 ? (double)bytes / wall_s / 1e9 : 0.0; }
+    double cold_gbps() const { return cold_io_s > 0 ? (double)cold_bytes / cold_io_s / 1e9 : 0.0; }  // SSD read rate while reading
 };
 
 struct CpuExpertView {                // one resident expert body (arena, 4 KiB aligned)
@@ -49,11 +57,27 @@ public:
     // cpu_resident[layer][expert] (41 x 512): which experts are loaded; null = all. layer = MoE layer index 0..40.
     bool init(const std::string& strata_path, int n_threads, const std::vector<std::vector<bool>>* cpu_resident, std::string& err);
 
+    // ---- cold experts: kept in the .strata file, read on demand -----------------------------------------------------------------
+    // Call after init(); replaces the current cold set. cold[layer][expert id] (41 x 512); a cold expert must not be resident.
+    // submit() then computes a pair when use_pair (null = all) != 0 and its expert is resident OR cold; experts in neither mask
+    // (GPU-owned) stay skipped. A job touching cold experts runs in waves: wave 0 = resident experts + cold cache hits, then the
+    // missed cold experts, read by reader threads with large preads (O_DIRECT by default) that were issued when the job started
+    // and overlap the earlier waves' compute. A small LRU slot cache keeps recently used cold bodies in RAM. The result does not
+    // depend on whether a body came from the arena, the cache or the file (bit-exact). Linux only (returns false on Windows).
+    // Env: STRATA_CPUEXP_COLD_CACHE_MB (default 256), STRATA_CPUEXP_COLD_READERS (default 8),
+    //      STRATA_CPUEXP_COLD_IO = direct (default) | buffered (page cache kept, for warm-cache runs) | fadvise (buffered + DONTNEED).
+    bool set_cold_experts(const std::vector<std::vector<bool>>& cold, std::string& err);
+    bool cold_expert(int layer, int expert) const;
+    // RAM the process may use: min(MemTotal, cgroup memory.max / memory.limit_in_bytes) on Linux, total physical memory on Windows.
+    static uint64_t ram_budget_bytes();
+
     // ---- directory helpers (read only the 4 KiB header + Section 3; no model load, no zstd) ------------------------------------
     // Section 4 stores the 512 experts of every MoE layer hot-to-cold by rank: directory index i = layer*512 + rank, and the
     // entry says which expert id sits at that rank. These build the cpu_resident mask for init() from rank ranges.
     // expert_of_rank[layer*512 + rank] = expert id; codes[layer*512 + expert_id] = (gu_code << 8) | dn_code (SkCode values).
     static bool read_rank_table(const std::string& path, std::vector<uint16_t>& expert_of_rank, std::vector<uint16_t>& codes, std::string& err);
+    // body_bytes[layer*512 + rank] = size of that expert's body in the file (for sizing the RAM / cold split)
+    static bool read_body_bytes(const std::string& path, std::vector<uint32_t>& body_bytes, std::string& err);
     // mask[layer][expert] = true for the experts whose rank in that layer is in [first_rank[layer], last_rank[layer]) (half open;
     // 0 = hottest). One entry per layer (41 for Hy4-Flash). E.g. "the coldest 400 of every layer live in RAM, the hottest 112
     // are on the GPU" is first_rank = 112, last_rank = 512 for all layers.
@@ -65,6 +89,8 @@ public:
     // Kernel: AVX-512 VBMI/VNNI "fast" kernel when compiled for it (-march=native on Ice Lake / Zen 4 or newer) and all resident
     // experts are S2..S6, else the library gemm_sk_q8_1 kernel. STRATA_CPUEXP_KERNEL=lib forces the library kernel.
     bool fast_kernel() const;
+    // "lib", "fast(avx2)" or "fast(avx512-vbmi)": the kernel picked at init (CPUID; STRATA_CPUEXP_KERNEL=avx512|avx2|lib overrides)
+    const char* kernel_name() const;
     // Activation precision. Default "q8": z and h2 are quantized to one Q8_1_G64 term (rel-L2 about 1.4e-2 of the expert output vs
     // exact fp32 activations). "hi" (env STRATA_CPUEXP_ACT=hi at init, or set_hi_activations(true) between jobs): two terms
     // x = da*qa + db*qb with qb = Q8_1 of the residual, two dpbusd passes over the same unpacked weights, summed in fp32.

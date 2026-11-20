@@ -9,6 +9,10 @@
 // Build: HIP files are compiled with `-x hip`; CUDA with `nvcc -x cu` (sources keep their .hip.cpp names).
 #pragma once
 
+// HY4_COLD_API: 1 when hy4_cpu_experts has set_cold_experts (SSD-backed cold experts)
+#ifndef HY4_COLD_API
+#define HY4_COLD_API 1
+#endif
 // HY4_MMA: matrix-core kernels (prefill GEMM, grouped expert GEMM, flash attention). 1 = built, 0 = the simple kernels are used instead.
 #if defined(__CUDACC__) || defined(HY4_CUDA_HOST)
 #ifndef HY4_MMA

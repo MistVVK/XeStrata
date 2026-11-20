@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace hy4 {
 
@@ -619,7 +620,8 @@ int choose_splits(int M, int NH, int max_keys) {
     if (base >= g_mla_target_blocks) return 1;
     const int ntiles = (max_keys + FBK - 1) / FBK;
     int S = (g_mla_target_blocks + base - 1) / base;
-    S = std::min(S, std::max(1, ntiles / 2));
+    static const int div = getenv("HY4_MLA_SPLIT_DIV") ? std::max(1, atoi(getenv("HY4_MLA_SPLIT_DIV"))) : 2;  // tiles per split block (min): 2 = at least 2 tiles of 64 keys
+    S = std::min(S, std::max(1, ntiles / div));
     S = std::min(S, 128);
     return std::max(S, 1);
 }

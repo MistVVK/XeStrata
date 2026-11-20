@@ -25,34 +25,47 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
+#include <cerrno>
+#include <deque>
+#include <unordered_map>
 
-// Fast kernels (compile-time selected):
-//   HY4_FAST  = AVX-512 BW + VNNI + VBMI + F16C (Ice Lake / Rocket Lake / Zen 4 and later),
-//   HY4_FAST2 = AVX2 + FMA + F16C (Haswell / Zen 1-3 and later; used only when HY4_FAST is not available, e.g. -march=native on
-//               a Zen 2 PC, or -mno-avx512f to test it on an AVX-512 machine).
-// Without either, the library gemm_sk_q8_1 path is used (also selectable with STRATA_CPUEXP_KERNEL=lib at run time, and used when
-// an S1.5 or S8 expert is resident). Compile-time overrides: -DHY4_NO_FAST (library kernel only), -DHY4_FORCE_AVX2 (skip the
-// AVX-512 kernel even when the build target has AVX-512).
-#if defined(__x86_64__) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__) && defined(__F16C__) && \
-    !defined(HY4_NO_FAST) && !defined(HY4_FORCE_AVX2)
-#define HY4_FAST 1
+// Fast kernels. Both are compiled into every x86-64 build (no -march / -mavx2 flags needed) and chosen at init by CPUID + XGETBV:
+//   k512 = AVX-512 BW + VNNI + VBMI + F16C (Ice Lake / Rocket Lake / Zen 4 and later),
+//   k2   = AVX2 + FMA + F16C (Haswell / Zen 1-3 and later).
+// GCC / Clang: each kernel region is compiled under a target pragma (the generic code around it keeps the baseline ISA, so a
+// binary built for plain x86-64 never executes an instruction the CPU lacks); MSVC needs no flags for intrinsics.
+// Order of preference: k512, k2, library gemm_sk_q8_1 (also the path when an S1.5 / S8 expert is resident or
+// STRATA_CPUEXP_KERNEL=lib). Override: STRATA_CPUEXP_KERNEL=avx512|avx2|lib; STRATA_FORCE_ISA=avx2 (as in the main engine) forbids
+// AVX-512. Compile-time: -DHY4_NO_FAST drops both fast kernels (library only; non-x86 targets get that automatically).
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(HY4_NO_FAST)
+#define HY4_KERNELS 1
 #else
-#define HY4_FAST 0
+#define HY4_KERNELS 0
 #endif
-#if !HY4_FAST && !defined(HY4_NO_FAST) && defined(__x86_64__) && defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
-#define HY4_FAST2 1
+#if defined(__clang__)
+#define HY4_PUSH_AVX512 _Pragma("clang attribute push (__attribute__((target(\"avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,f16c,fma,avx2\"))), apply_to=function)")
+#define HY4_PUSH_AVX2 _Pragma("clang attribute push (__attribute__((target(\"avx2,fma,f16c\"))), apply_to=function)")
+#define HY4_POP_TARGET _Pragma("clang attribute pop")
+#elif defined(__GNUC__)
+#define HY4_PUSH_AVX512 _Pragma("GCC push_options") _Pragma("GCC target(\"avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,f16c,fma,avx2\")")
+#define HY4_PUSH_AVX2 _Pragma("GCC push_options") _Pragma("GCC target(\"avx2,fma,f16c\")")
+#define HY4_POP_TARGET _Pragma("GCC pop_options")
 #else
-#define HY4_FAST2 0
+#define HY4_PUSH_AVX512
+#define HY4_PUSH_AVX2
+#define HY4_POP_TARGET
 #endif
-#define HY4_FASTK (HY4_FAST || HY4_FAST2)
-#if HY4_FAST
-#define HY4_FAST_NAME "fast(avx512-vbmi)"
-#else
-#define HY4_FAST_NAME "fast(avx2)"
+#if HY4_KERNELS && !defined(_MSC_VER)
+#include <cpuid.h>
+#endif
+#if HY4_KERNELS && defined(_MSC_VER)
+#include <intrin.h>
 #endif
 
 namespace hy4 {
@@ -153,10 +166,12 @@ inline float fexpf(float x) {
 }
 
 struct Rec {
-    const uint8_t* body = nullptr;
+    const uint8_t* body = nullptr;  // resident arena pointer (null for cold and GPU-owned experts)
     uint32_t dn_off = 0, body_bytes = 0;
     uint8_t gu = 0, dn = 0;
     uint32_t gu_sb = 0, dn_sb = 0;  // superblock bytes
+    bool cold = false;              // not in the arena: the body is read from the .strata file on demand (set_cold_experts)
+    uint64_t file_off = 0;          // absolute file offset of the body (4 KiB aligned)
 };
 
 struct DirE {
@@ -230,7 +245,8 @@ struct alignas(64) ActRow {
 };
 static_assert(sizeof(ActRow) == 4224, "ActRow");
 
-#if HY4_FAST
+#if HY4_KERNELS
+namespace k512 {
 struct FastConsts {
     alignas(64) uint8_t idx4[4][64];    // vpermi2b index: plane j of the 128-byte nibble array (S4/S5/S6)
     alignas(64) uint8_t ctrl3[4][64];   // vpmultishiftqb control: bit n -> bit 2 of the byte (S3 high plane)
@@ -268,6 +284,7 @@ struct FastConsts {
     }
 };
 static const FastConsts kc;
+HY4_PUSH_AVX512
 
 // block b (0..23) of a row from the library's Q8_1_G64 block
 static inline void store_block(ActRow* a, int b, const BlockQ8_1_G64& blk) {
@@ -474,9 +491,12 @@ static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const
         default: rows_fmt<6, false>(W, nrows, X, m, out); break;
     }
 }
-#endif  // HY4_FAST
+HY4_POP_TARGET
+}  // namespace k512
+#endif  // HY4_KERNELS (k512)
 
-#if HY4_FAST2
+#if HY4_KERNELS
+namespace k2 {
 // ==================================================================================================== AVX2 kernel
 // Same idea as the AVX-512 kernel (planes P_j of unsigned weight codes, activations pre-permuted, float accumulation, one horizontal
 // sum per row) on 256-bit vectors: vpmaddubsw (u8 code x s8 activation, no int16 saturation: codes <= 63 so a pair is <= 16002 and
@@ -521,6 +541,7 @@ struct FastConsts2 {
     }
 };
 static const FastConsts2 kc2;
+HY4_PUSH_AVX2
 
 static inline void store_qs(int8_t* base, int L, const int8_t* qs) {  // base = &xj[sb][0][0]
     const int h = L >> 1, g1 = L & 1;
@@ -740,7 +761,72 @@ static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const
         default: rows_fmt<6, false>(W, nrows, X, m, out); break;
     }
 }
-#endif  // HY4_FAST2
+HY4_POP_TARGET
+}  // namespace k2
+#endif  // HY4_KERNELS (k2)
+
+static const char* kern_name(int k) { return k == 2 ? "fast(avx512-vbmi)" : (k == 1 ? "fast(avx2)" : "lib"); }
+
+#if HY4_KERNELS
+// ---- CPU probe (same checks as the main engine's quant/isa.cpp: CPUID + XGETBV for OS support) and per-call dispatch ------------
+struct KernCaps {
+    bool avx2 = false, avx512 = false;
+};
+static void cpuid_ex(unsigned leaf, unsigned sub, unsigned r[4]) {
+#if defined(_MSC_VER)
+    int a[4];
+    __cpuidex(a, (int)leaf, (int)sub);
+    for (int i = 0; i < 4; ++i) r[i] = (unsigned)a[i];
+#else
+    __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+#endif
+}
+static unsigned long long xgetbv0() {
+#if defined(_MSC_VER)
+    return _xgetbv(0);
+#else
+    unsigned eax, edx;
+    __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
+    return ((unsigned long long)edx << 32) | eax;
+#endif
+}
+static KernCaps probe_kernel_caps() {
+    KernCaps c;
+    unsigned r[4] = {0, 0, 0, 0};
+    cpuid_ex(0, 0, r);
+    const unsigned maxleaf = r[0];
+    cpuid_ex(1, 0, r);
+    const unsigned ecx1 = r[2];
+    const bool osxsave = (ecx1 >> 27) & 1;
+    const unsigned long long xcr0 = osxsave ? xgetbv0() : 0;
+    const bool ymm = (xcr0 & 6) == 6, zmm = ymm && (xcr0 & 0xE0) == 0xE0;
+    const bool avx = ymm && ((ecx1 >> 28) & 1), fma = (ecx1 >> 12) & 1, f16c = (ecx1 >> 29) & 1;
+    if (maxleaf >= 7) {
+        cpuid_ex(7, 0, r);
+        const unsigned ebx = r[1], ecx = r[2];
+        c.avx2 = avx && fma && f16c && ((ebx >> 5) & 1);
+        // AVX-512 F, BW, VL + VNNI + VBMI (+ the OS saving ZMM state)
+        c.avx512 = c.avx2 && zmm && ((ebx >> 16) & 1) && ((ebx >> 30) & 1) && ((ebx >> 31) & 1) && ((ecx >> 11) & 1) && ((ecx >> 1) & 1);
+    }
+    if (const char* f = std::getenv("STRATA_FORCE_ISA")) {  // as in the main engine: avx2 = no AVX-512, avx / sse = no AVX2 kernels either
+        if (!std::strcmp(f, "avx2")) c.avx512 = false;
+        else if (!std::strcmp(f, "avx") || !std::strcmp(f, "sse")) c.avx512 = c.avx2 = false;
+    }
+    return c;
+}
+static inline void kern_store(int k, ActRow* a, int b, const BlockQ8_1_G64& blk) {
+    if (k == 2) k512::store_block(a, b, blk);
+    else k2::store_block(a, b, blk);
+}
+static inline void kern_store_hi(int k, ActRow* a, int b, const BlockQ8_1_G64& blk, const BlockQ8_1_G64& blk2) {
+    if (k == 2) k512::store_block_hi(a, b, blk, blk2);
+    else k2::store_block_hi(a, b, blk, blk2);
+}
+static void kern_gemm(int k, int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi) {
+    if (k == 2) k512::rows_gemm(code, W, nrows, X, m, out, hi);
+    else k2::rows_gemm(code, W, nrows, X, m, out, hi);
+}
+#endif
 
 // hi mode: q2 = Q8_1(x - dq(q)) per 64-block (x: nblocks*64 floats, q: its Q8_1 blocks)
 static inline void residual_blocks(const float* x, const BlockQ8_1_G64* q, BlockQ8_1_G64* q2, int nblocks) {
@@ -753,6 +839,115 @@ static inline void residual_blocks(const float* x, const BlockQ8_1_G64* q, Block
 }
 
 }  // namespace
+
+// ==================================================================================================== cold experts
+// On-demand reader for experts that live in the .strata file instead of the arena: a small slot cache (LRU, slot = one expert
+// body, 4 KiB aligned) filled by a few reader threads with large preads (O_DIRECT by default, so the page cache does not eat the
+// RAM budget). Slot management is done by pool thread 0 only; the readers only see (dst, offset, length) requests.
+#ifndef _WIN32
+struct ColdStore {
+    struct Slot {
+        int64_t key = -1;  // layer * 512 + expert, -1 = empty
+        uint64_t tick = 0;
+        int pin = 0;       // > 0: needed by the wave being computed / in flight
+    };
+    struct Req {
+        uint8_t* dst;
+        uint64_t off;
+        size_t len;
+    };
+    int fd = -1;
+    int io_mode = 0;  // 0 = O_DIRECT, 1 = buffered (page cache kept: "warm cache" runs), 2 = buffered + POSIX_FADV_DONTNEED
+    size_t slot_bytes = 0;
+    int nslots = 0;
+    uint8_t* mem = nullptr;
+    std::vector<Slot> slots;
+    std::unordered_map<int64_t, int> where;
+    uint64_t tick = 0;
+    std::vector<std::thread> readers;
+    std::mutex qm;
+    std::condition_variable qcv;
+    std::deque<Req> q;
+    bool stop = false;
+    std::atomic<int> pending{0};
+    std::atomic<int64_t> last_done_ns{0};
+    std::atomic<bool> err{false};
+    std::atomic<uint64_t> short_reads{0};
+
+    static int64_t now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    bool open(const std::string& path, size_t slot_bytes_, int nslots_, int nreaders, int mode, std::string& e) {
+        slot_bytes = slot_bytes_;
+        nslots = nslots_;
+        io_mode = mode;
+        if (mode == 0) {
+            fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+            if (fd < 0) {
+                std::fprintf(stderr, "[cpuexp] cold: O_DIRECT open failed, using buffered reads + FADV_DONTNEED\n");
+                io_mode = 2;
+            }
+        }
+        if (fd < 0) fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) { e = "cannot open " + path + " for cold reads"; return false; }
+        if (posix_memalign((void**)&mem, 4096, slot_bytes * (size_t)nslots) != 0) { mem = nullptr; e = "cannot allocate the cold-expert cache"; return false; }
+        std::memset(mem, 0, slot_bytes * (size_t)nslots);
+        slots.assign(nslots, Slot());
+        for (int i = 0; i < nreaders; ++i) readers.emplace_back([this]() { reader(); });
+        return true;
+    }
+
+    void enqueue(uint8_t* dst, uint64_t off, size_t len) {
+        pending.fetch_add(1, std::memory_order_acq_rel);
+        {
+            std::lock_guard<std::mutex> lk(qm);
+            q.push_back({dst, off, len});
+        }
+        qcv.notify_one();
+    }
+
+    void reader() {
+        for (;;) {
+            Req r;
+            {
+                std::unique_lock<std::mutex> lk(qm);
+                qcv.wait(lk, [&] { return stop || !q.empty(); });
+                if (stop && q.empty()) return;
+                r = q.front();
+                q.pop_front();
+            }
+            size_t got = 0;
+            while (got < r.len) {
+                const ssize_t n = ::pread(fd, r.dst + got, r.len - got, (off_t)(r.off + got));
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    err.store(true);
+                    break;
+                }
+                if (n == 0) break;  // EOF: the last body of the file may be clipped
+                got += (size_t)n;
+            }
+            if (io_mode == 2) posix_fadvise(fd, (off_t)r.off, (off_t)r.len, POSIX_FADV_DONTNEED);
+            const int64_t t = now_ns();
+            int64_t prev = last_done_ns.load();
+            while (prev < t && !last_done_ns.compare_exchange_weak(prev, t)) {}
+            pending.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+
+    ~ColdStore() {
+        {
+            std::lock_guard<std::mutex> lk(qm);
+            stop = true;
+        }
+        qcv.notify_all();
+        for (auto& t : readers) t.join();
+        if (fd >= 0) ::close(fd);
+        free(mem);
+    }
+};
+#endif
 
 struct CpuExperts::Impl {
     // ---- model
@@ -779,7 +974,8 @@ struct CpuExperts::Impl {
     ABuf<BlockQ8_1_G64> tokq, h2q;  // library path: [Tc][24], [P][24]
     ABuf<ActRow> tokA, h2A;         // fast path:    [Tc],     [P]
     ABuf<BlockQ8_1_G64> tokq2, h2q2;  // library path, hi mode: residual terms
-    bool fast = false;
+    bool fast = false;              // kern != 0
+    int kern = 0;                   // 0 = library gemm_sk_q8_1, 1 = AVX2 kernel (k2), 2 = AVX-512 kernel (k512); chosen at init
     bool hi = false;                // high-precision activations (STRATA_CPUEXP_ACT=hi / set_hi_activations)
     ABuf<float> Y;                  // [P][1536]
     size_t cap_tok = 0;
@@ -788,6 +984,27 @@ struct CpuExperts::Impl {
     PadCnt qctr, guctr, dnctr, cbctr, fctr;  // unit counters, one cache line each
     std::unique_ptr<PadCnt[]> gdone, dn_cc;  // flow scheduler: finished gate/up units per active expert, finished down units per column chunk
     int sched = 0;                           // 0 = barriered phases, 1 = gate/up -> down -> combine dataflow (STRATA_CPUEXP_SCHED)
+    // ---- cold experts (set_cold_experts): body read from the file on demand; jobs touching them run in waves
+    std::string path;
+    std::vector<DirE> dir;
+    uint64_t s4_off = 0;
+#ifndef _WIN32
+    std::unique_ptr<ColdStore> cs;
+#endif
+    std::vector<const uint8_t*> act_body;    // body pointer per active expert (arena, or cold slot)
+    std::vector<int> act_slot;               // cold slot per active expert (-1 = resident)
+    bool cold_job = false, wave_finished = false;
+    int nA = 0;                              // active experts [0, nA) are resident / cache hits (wave 0); the rest are cold misses
+    int cur_a0 = 0, cur_a1 = 0, nxt_a0 = 0, nxt_a1 = 0, next_miss = 0;
+    int64_t batch_start_ns = 0;
+    bool batch_open = false;
+    const Rec* cold_lr = nullptr;            // recs of the layer of the current job (for cold_issue)
+    int cold_layer = 0;
+    bool cold_err_reported = false;
+    void cold_issue();
+    void cold_wait();
+    void cold_advance(int w);
+    bool set_cold(const std::vector<std::vector<bool>>& cold, std::string& err);
     int nact = 0;
     // ---- stats (written by thread 0 only, read after wait())
     CpuExpertStats st;
@@ -895,6 +1112,9 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
     std::vector<DirE> dir;
     uint64_t s4_off = 0, s4_len = 0;
     if (!read_dir(path, dir, s4_off, s4_len, err)) return false;
+    this->path = path;
+    this->dir = dir;
+    this->s4_off = s4_off;
     const size_t ndir = dir.size();
     nlayers = (int)(ndir / E);
     // residency + arena layout
@@ -965,24 +1185,71 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
         r.gu_sb = (uint32_t)superblock_bytes((SkCode)d.gu);
         r.dn_sb = (uint32_t)superblock_bytes((SkCode)d.dn);
     }
-    t_load = now_s() - t0;
-    fast = false;
-#if HY4_FASTK
-    fast = true;
-    if (const char* k = std::getenv("STRATA_CPUEXP_KERNEL"))
-        if (!std::strcmp(k, "lib")) fast = false;
-    for (const Rec& r : recs)
-        if (r.body && !(r.gu <= 6 && r.gu != 1 && r.dn <= 6 && r.dn != 1)) {  // fast kernel: S1.25 (0), S2..S6; S1.5 (1) and S8 use the library kernel
-            if (fast) std::fprintf(stderr, "[cpuexp] S1.5/S8/other expert code resident: using the library kernel for all experts\n");
-            fast = false;
-        }
+#ifndef _WIN32
+    {   // transparent huge pages: report how much of the arena is backed by 2 MiB pages; STRATA_CPUEXP_COLLAPSE=1 asks the kernel
+        // (MADV_COLLAPSE, Linux >= 6.1) to collapse the populated arena into huge pages now (fewer TLB misses on the streaming reads)
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
 #endif
+        auto anon_huge_kb = []() {
+            long v = -1;
+            if (std::FILE* f = std::fopen("/proc/self/smaps_rollup", "r")) {
+                char line[256];
+                while (std::fgets(line, sizeof(line), f))
+                    if (!std::strncmp(line, "AnonHugePages:", 14)) { std::sscanf(line + 14, " %ld", &v); break; }
+                std::fclose(f);
+            }
+            return v;
+        };
+        const long before = anon_huge_kb();
+        size_t okb = 0, badb = 0;
+        const double tc0 = now_s();
+        const char* ce = std::getenv("STRATA_CPUEXP_COLLAPSE");
+        if (ce && ce[0] == '1') {
+            const size_t CH = 64u << 20;
+            for (size_t off = 0; off < arena_size; off += CH) {
+                const size_t len = std::min(CH, arena_size - off) & ~(size_t)((2u << 20) - 1);
+                if (!len) continue;
+                if (madvise(arena + off, len, MADV_COLLAPSE) == 0) okb += len;
+                else badb += len;
+            }
+        }
+        std::fprintf(stderr, "[cpuexp] THP: AnonHugePages %.2f GB -> %.2f GB of %.2f GB arena (collapse %s: %zu MiB ok, %zu MiB failed, %.1f s)\n",
+                     before / 1048576.0, anon_huge_kb() / 1048576.0, arena_size / 1073741824.0, (ce && ce[0] == '1') ? "on" : "off", okb >> 20, badb >> 20, now_s() - tc0);
+    }
+#endif
+    t_load = now_s() - t0;
+    kern = 0;
+#if HY4_KERNELS
+    {
+        const KernCaps kcaps = probe_kernel_caps();
+        const int best = kcaps.avx512 ? 2 : (kcaps.avx2 ? 1 : 0);
+        kern = best;
+        if (const char* k = std::getenv("STRATA_CPUEXP_KERNEL")) {
+            int want = -1;
+            if (!std::strcmp(k, "lib")) want = 0;
+            else if (!std::strcmp(k, "avx2")) want = 1;
+            else if (!std::strcmp(k, "avx512")) want = 2;
+            else std::fprintf(stderr, "[cpuexp] STRATA_CPUEXP_KERNEL=%s is not avx512, avx2 or lib; ignored\n", k);
+            if (want >= 0) {
+                if (want <= best) kern = want;
+                else std::fprintf(stderr, "[cpuexp] STRATA_CPUEXP_KERNEL=%s is not supported by this CPU/OS; using %s\n", k, kern_name(best));
+            }
+        }
+        for (const Rec& r : recs)
+            if (kern && r.body && !(r.gu <= 6 && r.gu != 1 && r.dn <= 6 && r.dn != 1)) {  // fast kernels: S1.25 (0), S2..S6; S1.5 (1) and S8 use the library kernel
+                std::fprintf(stderr, "[cpuexp] S1.5/S8/other expert code resident: using the library kernel for all experts\n");
+                kern = 0;
+            }
+    }
+#endif
+    fast = kern != 0;
     hi = false;
     if (const char* a = std::getenv("STRATA_CPUEXP_ACT"))
         if (!std::strcmp(a, "hi")) hi = true;
     std::fprintf(stderr, "[cpuexp] %llu experts resident, %.2f GB in %.1f s (%.2f GB/s), %zu reads, mlock=%s, isa=%s, kernel=%s, act=%s\n",
                  (unsigned long long)n_resident, arena_size / 1e9, t_load, arena_size / 1e9 / std::max(t_load, 1e-9), runs.size(),
-                 locked ? "yes" : "no", strata::quant::sk::active_sk_isa(), fast ? HY4_FAST_NAME : "lib", hi ? "hi(2xQ8_1)" : "q8");
+                 locked ? "yes" : "no", strata::quant::sk::active_sk_isa(), kern_name(kern), hi ? "hi(2xQ8_1)" : "q8");
     start_threads(n_threads);
     return true;
 }
@@ -1052,6 +1319,8 @@ void CpuExperts::Impl::start_threads(int n) {
     act_e.assign(E, 0);
     act_o.assign(E, 0);
     act_n.assign(E, 0);
+    act_body.assign(E, nullptr);
+    act_slot.assign(E, -1);
     threads.reserve(nth);
     for (int i = 0; i < nth; ++i) {
         threads.emplace_back([this, i]() { worker(i); });
@@ -1101,7 +1370,7 @@ void CpuExperts::Impl::plan(const Job& J, int t0, int Tc) {
             const bool want = J.use ? J.use[q] != 0 : true;
             if (!want) continue;
             const int32_t e = J.idx[q];
-            if (e < 0 || e >= E || !lr[e].body) { ++skipped; continue; }
+            if (e < 0 || e >= E || !(lr[e].body || lr[e].cold)) { ++skipped; continue; }
             ++cnt[e];
             tok_used[t] = 1;
         }
@@ -1115,12 +1384,62 @@ void CpuExperts::Impl::plan(const Job& J, int t0, int Tc) {
             act_e[nact] = e;
             act_o[nact] = off;
             act_n[nact] = cnt[e];
+            act_body[nact] = lr[e].body;
+            act_slot[nact] = -1;
             ++nact;
             bytes += lr[e].body_bytes;
         }
         off += cnt[e];
     }
     aoff[E] = off;
+    cold_job = false;
+#ifndef _WIN32
+    if (cs) {
+        // cold experts: wave 0 = resident experts + cold cache hits, then the cold misses in waves limited by the slot cache
+        bool any_cold = false;
+        for (int a = 0; a < nact; ++a)
+            if (!lr[act_e[a]].body) { any_cold = true; break; }
+        if (any_cold) {
+            std::vector<int> ea, oa, na, mi;
+            std::vector<const uint8_t*> ba;
+            std::vector<int> sa;
+            for (int a = 0; a < nact; ++a) {
+                const int e = act_e[a];
+                const Rec& r = lr[e];
+                if (r.body) {
+                    ea.push_back(e); oa.push_back(act_o[a]); na.push_back(act_n[a]); ba.push_back(r.body); sa.push_back(-1);
+                    continue;
+                }
+                auto it = cs->where.find((int64_t)J.layer * E + e);
+                if (it != cs->where.end()) {  // cache hit
+                    const int s = it->second;
+                    cs->slots[s].pin++;
+                    cs->slots[s].tick = ++cs->tick;
+                    ea.push_back(e); oa.push_back(act_o[a]); na.push_back(act_n[a]); ba.push_back(cs->mem + (size_t)s * cs->slot_bytes); sa.push_back(s);
+                    ++st.cold_hits;
+                } else {
+                    mi.push_back(a);
+                }
+            }
+            nA = (int)ea.size();
+            for (int a : mi) {
+                ea.push_back(act_e[a]); oa.push_back(act_o[a]); na.push_back(act_n[a]); ba.push_back(nullptr); sa.push_back(-1);
+            }
+            for (int a = 0; a < nact; ++a) {
+                act_e[a] = ea[a]; act_o[a] = oa[a]; act_n[a] = na[a]; act_body[a] = ba[a]; act_slot[a] = sa[a];
+            }
+            cold_job = true;
+            wave_finished = false;
+            cur_a0 = cur_a1 = 0;
+            next_miss = nA;
+            nxt_a0 = nxt_a1 = nA;
+            batch_open = false;
+            cold_lr = lr;
+            cold_layer = J.layer;
+            cold_issue();  // start reading the first cold wave now: overlaps the activation quantization and wave 0
+        }
+    }
+#endif
     // fill sorted pair table
     std::vector<int>& fill = cnt;  // reuse: becomes the running write position
     for (int e = 0; e < E; ++e) fill[e] = aoff[e];
@@ -1131,7 +1450,7 @@ void CpuExperts::Impl::plan(const Job& J, int t0, int Tc) {
             const bool want = J.use ? J.use[q] != 0 : true;
             if (!want) continue;
             const int32_t e = J.idx[q];
-            if (e < 0 || e >= E || !lr[e].body) continue;
+            if (e < 0 || e >= E || !(lr[e].body || lr[e].cold)) continue;
             const int p = fill[e]++;
             pair_tok[p] = t;
             posof[(size_t)t * TOPK + s] = p;
@@ -1155,23 +1474,24 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
     const int p0 = act_o[a], m = act_n[a];
     const SkCode gc = (SkCode)r.gu;
     const size_t row_b = 6ull * r.gu_sb;
-    const uint8_t* wgu = r.body + 3072;
+    const uint8_t* body = act_body[a];  // arena pointer or cold slot
+    const uint8_t* wgu = body + 3072;
     const uint8_t* wg = wgu + (size_t)b * RB * row_b;
     const uint8_t* wu = wgu + (size_t)(D + b * RB) * row_b;
     float sq[RB];
     {
-        const uint16_t* h16 = (const uint16_t*)r.body + b * RB;
+        const uint16_t* h16 = (const uint16_t*)body + b * RB;
         for (int i = 0; i < RB; ++i) sq[i] = fp16_to_fp32(h16[i]);
     }
     const int mgmax = fast ? MGF : MG;
     for (int g0 = 0; g0 < m; g0 += mgmax) {
         const int mg = std::min(mgmax, m - g0);
-#if HY4_FASTK
+#if HY4_KERNELS
         if (fast) {
             const ActRow* xp[MGF];
             for (int i = 0; i < mg; ++i) xp[i] = tokA.p + (size_t)pair_tok[p0 + g0 + i];
-            rows_gemm(r.gu, wg, RB, xp, mg, S.tg.p, J.hi);
-            rows_gemm(r.gu, wu, RB, xp, mg, S.tu.p, J.hi);
+            kern_gemm(kern, r.gu, wg, RB, xp, mg, S.tg.p, J.hi);
+            kern_gemm(kern, r.gu, wu, RB, xp, mg, S.tu.p, J.hi);
         } else
 #endif
         {
@@ -1209,16 +1529,16 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
                 const float uc = std::max(-SWIGLU_LIMIT, std::min(u[d], SWIGLU_LIMIT));
                 h[d] = (sc * uc) / sq[d];
             }
-#if HY4_FASTK
+#if HY4_KERNELS
             if (fast) {
                 BlockQ8_1_G64 blk;
                 quantize_q8_1_g64(h, &blk, 64);
                 if (J.hi) {
                     BlockQ8_1_G64 blk2;
                     residual_blocks(h, &blk, &blk2, 1);
-                    store_block_hi(h2A.p + (size_t)(p0 + g0 + i), b, blk, blk2);
+                    kern_store_hi(kern, h2A.p + (size_t)(p0 + g0 + i), b, blk, blk2);
                 } else {
-                    store_block(h2A.p + (size_t)(p0 + g0 + i), b, blk);
+                    kern_store(kern, h2A.p + (size_t)(p0 + g0 + i), b, blk);
                 }
             } else
 #endif
@@ -1237,15 +1557,15 @@ void CpuExperts::Impl::dn_unit(int tid, const Job& J, int a, int c) {
     const Rec& r = recs[(size_t)J.layer * E + act_e[a]];
     const int p0 = act_o[a], m = act_n[a];
     const size_t row_b = 6ull * r.dn_sb;
-    const uint8_t* wd = r.body + r.dn_off + (size_t)c * RB * row_b;
+    const uint8_t* wd = act_body[a] + r.dn_off + (size_t)c * RB * row_b;
     const int mgmax = fast ? MGF : MG;
     for (int g0 = 0; g0 < m; g0 += mgmax) {
         const int mg = std::min(mgmax, m - g0);
-#if HY4_FASTK
+#if HY4_KERNELS
         if (fast) {
             const ActRow* xp[MGF];
             for (int i = 0; i < mg; ++i) xp[i] = h2A.p + (size_t)(p0 + g0 + i);
-            rows_gemm(r.dn, wd, RB, xp, mg, S.tg.p, J.hi);
+            kern_gemm(kern, r.dn, wd, RB, xp, mg, S.tg.p, J.hi);
         } else
 #endif
         {
@@ -1321,6 +1641,97 @@ void CpuExperts::Impl::flow_phase(int tid, const Job& J, int t0, int Tc) {
     }
 }
 
+// ---- cold waves (thread 0 only) -------------------------------------------------------------------------------------------
+// Start reading the next wave of cold misses (at most nslots/2, only into unpinned slots, LRU first). Never called while reads are pending.
+void CpuExperts::Impl::cold_issue() {
+#ifndef _WIN32
+    nxt_a0 = nxt_a1 = next_miss;
+    if (next_miss >= nact || cs->err.load()) return;
+    const int B = std::max(1, cs->nslots / 2);
+    int issued = 0;
+    uint64_t bytes = 0;
+    while (next_miss < nact && issued < B) {
+        int best = -1;
+        uint64_t bt = ~0ull;
+        for (int s = 0; s < cs->nslots; ++s)
+            if (cs->slots[s].pin == 0 && cs->slots[s].tick < bt) { bt = cs->slots[s].tick; best = s; }
+        if (best < 0) break;  // everything pinned by the wave being computed: the rest is read after it finishes
+        const int a = next_miss;
+        const Rec& r = cold_lr[act_e[a]];
+        ColdStore::Slot& sl = cs->slots[best];
+        if (sl.key >= 0) cs->where.erase(sl.key);
+        sl.key = (int64_t)cold_layer * E + act_e[a];
+        sl.tick = ++cs->tick;
+        sl.pin = 1;
+        cs->where[sl.key] = best;
+        act_slot[a] = best;
+        act_body[a] = cs->mem + (size_t)best * cs->slot_bytes;
+        if (issued == 0 && !batch_open) {
+            batch_start_ns = ColdStore::now_ns();
+            batch_open = true;
+        }
+        cs->enqueue(const_cast<uint8_t*>(act_body[a]), r.file_off, ((size_t)r.body_bytes + 4095) & ~(size_t)4095);
+        bytes += r.body_bytes;
+        ++next_miss;
+        ++issued;
+    }
+    nxt_a1 = next_miss;
+    st.cold_reads += (uint64_t)issued;
+    st.cold_bytes += bytes;
+#endif
+}
+
+void CpuExperts::Impl::cold_wait() {
+#ifndef _WIN32
+    const double t0 = now_s();
+    while (cs->pending.load(std::memory_order_acquire) > 0) std::this_thread::sleep_for(std::chrono::microseconds(20));
+    st.cold_wait_s += now_s() - t0;
+    if (batch_open) {
+        const int64_t end = cs->last_done_ns.load();
+        if (end > batch_start_ns) st.cold_io_s += (end - batch_start_ns) * 1e-9;
+        batch_open = false;
+    }
+    if (cs->err.load()) {
+        st.cold_errors += 1;
+        if (!cold_err_reported) {
+            std::fprintf(stderr, "[cpuexp] cold: a read from the .strata file failed; results of this job are invalid\n");
+            cold_err_reported = true;
+        }
+        for (int a = nxt_a0; a < nxt_a1; ++a)
+            if (act_slot[a] >= 0) { cs->where.erase(cs->slots[act_slot[a]].key); cs->slots[act_slot[a]].key = -1; }
+        cs->err.store(false);
+    }
+#endif
+}
+
+// Prepare wave w: wave 0 = resident + cache hits; wave w > 0 = the cold experts read meanwhile (wait for them, then start reading the next wave)
+void CpuExperts::Impl::cold_advance(int w) {
+#ifndef _WIN32
+    guctr.v.store(0);
+    dnctr.v.store(0);
+    if (w == 0) {
+        cur_a0 = 0;
+        cur_a1 = nA;
+        wave_finished = false;
+        return;
+    }
+    for (int a = cur_a0; a < cur_a1; ++a)  // wave w-1 is done: release its slots
+        if (act_slot[a] >= 0) cs->slots[act_slot[a]].pin--;
+    if (nxt_a1 == nxt_a0) {  // nothing in flight
+        if (next_miss >= nact) {
+            cur_a0 = cur_a1 = nact;
+            wave_finished = true;
+            return;
+        }
+        cold_issue();  // slots are free now (not overlapped with compute: all slots were pinned before)
+    }
+    cold_wait();
+    cur_a0 = nxt_a0;
+    cur_a1 = nxt_a1;
+    cold_issue();  // the wave after this one is read while this one is computed
+#endif
+}
+
 void CpuExperts::Impl::run_job(int tid) {
     const Job J = job;  // copy: the submitter may not touch it, but be safe
     int& sense = ts[tid].sense;
@@ -1342,7 +1753,7 @@ void CpuExperts::Impl::run_job(int tid) {
             if (u >= Tc * 3) break;
             const int t = u / 3, part = u % 3;
             if (!tok_used[t]) continue;
-#if HY4_FASTK
+#if HY4_KERNELS
             if (fast) {
                 alignas(64) BlockQ8_1_G64 blk[8];
                 const float* zs = J.z + (size_t)(t0 + t) * D + part * 512;
@@ -1350,9 +1761,9 @@ void CpuExperts::Impl::run_job(int tid) {
                 if (J.hi) {
                     alignas(64) BlockQ8_1_G64 blk2[8];
                     residual_blocks(zs, blk, blk2, 8);
-                    for (int i = 0; i < 8; ++i) store_block_hi(tokA.p + t, part * 8 + i, blk[i], blk2[i]);
+                    for (int i = 0; i < 8; ++i) kern_store_hi(kern, tokA.p + t, part * 8 + i, blk[i], blk2[i]);
                 } else {
-                    for (int i = 0; i < 8; ++i) store_block(tokA.p + t, part * 8 + i, blk[i]);
+                    for (int i = 0; i < 8; ++i) kern_store(kern, tokA.p + t, part * 8 + i, blk[i]);
                 }
                 continue;
             }
@@ -1363,6 +1774,37 @@ void CpuExperts::Impl::run_job(int tid) {
         }
         bar.wait(sense);
         lap(1);
+        if (cold_job) {
+            // waves: [resident + cache hits] then the cold misses as their reads complete; combine once at the end
+            for (int w = 0;; ++w) {
+                if (tid == 0) cold_advance(w);
+                bar.wait(sense);
+                if (wave_finished) break;
+                const int a0 = cur_a0, na = cur_a1 - cur_a0;
+                for (;;) {
+                    const int u = guctr.v.fetch_add(1, std::memory_order_relaxed);
+                    if (u >= na * NUNIT) break;
+                    gu_unit(tid, J, a0 + u / NUNIT, u % NUNIT);
+                }
+                bar.wait(sense);
+                for (;;) {
+                    const int u = dnctr.v.fetch_add(1, std::memory_order_relaxed);
+                    if (u >= na * NUNIT) break;
+                    dn_unit(tid, J, a0 + u / NUNIT, u % NUNIT);
+                }
+                bar.wait(sense);
+            }
+            lap(2);
+            const int cbc = D / 256;
+            for (;;) {
+                const int u = cbctr.v.fetch_add(1, std::memory_order_relaxed);
+                if (u >= Tc * cbc) break;
+                combine_unit(J, t0, u / cbc, (u % cbc) * 256);
+            }
+            bar.wait(sense);
+            lap(4);
+            continue;
+        }
         if (sched == 1) {
             // dataflow: gate/up units of all experts, then down units (expert-major; a down unit waits only for its own expert's
             // gate/up units), and the last down unit of a column chunk does that chunk's slot-ordered combine. One barrier at the end.
@@ -1405,7 +1847,98 @@ void CpuExperts::Impl::run_job(int tid) {
     }
 }
 
+bool CpuExperts::Impl::set_cold(const std::vector<std::vector<bool>>& cold, std::string& err) {
+#ifdef _WIN32
+    for (const auto& v : cold)
+        for (bool b : v)
+            if (b) { err = "cold experts are not supported on Windows"; return false; }
+    return true;
+#else
+    cs.reset();  // joins the readers
+    for (Rec& r : recs)
+        if (r.cold) r = Rec();
+    size_t maxsz = 0;
+    uint64_t n = 0;
+    for (size_t i = 0; i < dir.size(); ++i) {
+        const DirE& d = dir[i];
+        const int layer = (int)(i / E);
+        if (layer >= (int)cold.size() || d.expert_id >= cold[layer].size() || !cold[layer][d.expert_id]) continue;
+        Rec& r = recs[(size_t)layer * E + d.expert_id];
+        if (r.body) { err = "cold expert is also resident: layer " + std::to_string(layer) + " expert " + std::to_string(d.expert_id); return false; }
+        const uint32_t gsb = (uint32_t)superblock_bytes((SkCode)d.gu), dsb = (uint32_t)superblock_bytes((SkCode)d.dn);
+        if (!gsb || !dsb || d.dn_off != 3072u + 18432u * gsb || (uint64_t)d.dn_off + 9216ull * dsb > d.body_bytes) { err = "unsupported or inconsistent expert body layout (cold)"; return false; }
+        if ((s4_off + d.body_off) % 4096) { err = "cold expert body not 4 KiB aligned in file"; return false; }
+        if (kern && !(d.gu <= 6 && d.gu != 1 && d.dn <= 6 && d.dn != 1)) { err = "cold expert with an S1.5/S8 code needs the library kernel (set STRATA_CPUEXP_KERNEL=lib before init)"; return false; }
+        r.cold = true;
+        r.file_off = s4_off + d.body_off;
+        r.dn_off = d.dn_off;
+        r.body_bytes = d.body_bytes;
+        r.gu = d.gu;
+        r.dn = d.dn;
+        r.gu_sb = gsb;
+        r.dn_sb = dsb;
+        maxsz = std::max(maxsz, ((size_t)d.body_bytes + 4095) & ~(size_t)4095);
+        ++n;
+    }
+    if (n == 0) return true;
+    size_t cache_mb = 256;
+    if (const char* e = std::getenv("STRATA_CPUEXP_COLD_CACHE_MB")) cache_mb = (size_t)std::max(1, std::atoi(e));
+    int readers = 8, mode = 0;
+    if (const char* e = std::getenv("STRATA_CPUEXP_COLD_READERS")) readers = std::max(1, std::atoi(e));
+    if (const char* e = std::getenv("STRATA_CPUEXP_COLD_IO")) {
+        if (!std::strcmp(e, "buffered")) mode = 1;
+        else if (!std::strcmp(e, "fadvise")) mode = 2;
+    }
+    const int nslots = (int)std::max<size_t>(2, (cache_mb << 20) / maxsz);
+    cs.reset(new ColdStore);
+    if (!cs->open(path, maxsz, nslots, readers, mode, err)) {
+        cs.reset();
+        for (Rec& r : recs)
+            if (r.cold) r = Rec();
+        return false;
+    }
+    std::fprintf(stderr, "[cpuexp] cold experts: %llu (slot %.2f MB, %d slots = %.0f MB cache, %d readers, io=%s)\n", (unsigned long long)n, maxsz / 1048576.0, nslots,
+                 nslots * (double)maxsz / 1048576.0, readers, cs->io_mode == 0 ? "O_DIRECT" : (cs->io_mode == 1 ? "buffered" : "buffered+fadvise"));
+    return true;
+#endif
+}
+
 // ==================================================================================================== public API
+bool CpuExperts::set_cold_experts(const std::vector<std::vector<bool>>& cold, std::string& err) {
+    wait();
+    return p_->set_cold(cold, err);
+}
+bool CpuExperts::cold_expert(int layer, int e) const {
+    return layer >= 0 && layer < p_->nlayers && e >= 0 && e < E && p_->recs[(size_t)layer * E + e].cold;
+}
+uint64_t CpuExperts::ram_budget_bytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t)ms.ullTotalPhys : 0;
+#else
+    uint64_t total = 0;
+    if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        unsigned long long kb = 0;
+        while (std::fgets(line, sizeof(line), f))
+            if (std::sscanf(line, "MemTotal: %llu kB", &kb) == 1) { total = kb * 1024ull; break; }
+        std::fclose(f);
+    }
+    for (const char* p : {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"}) {
+        if (std::FILE* f = std::fopen(p, "r")) {
+            char buf[64] = {0};
+            if (std::fgets(buf, sizeof(buf), f) && buf[0] >= '0' && buf[0] <= '9') {
+                const unsigned long long v = std::strtoull(buf, nullptr, 10);
+                if (v > 0 && (total == 0 || v < total)) total = v;
+            }
+            std::fclose(f);
+        }
+    }
+    return total;
+#endif
+}
+
 bool CpuExperts::read_rank_table(const std::string& path, std::vector<uint16_t>& expert_of_rank, std::vector<uint16_t>& codes, std::string& err) {
     std::vector<DirE> dir;
     uint64_t s4o, s4l;
@@ -1419,6 +1952,15 @@ bool CpuExperts::read_rank_table(const std::string& path, std::vector<uint16_t>&
         codes[(i / E) * E + dir[i].expert_id] = (uint16_t)((dir[i].gu << 8) | dir[i].dn);
     }
     (void)nl;
+    return true;
+}
+
+bool CpuExperts::read_body_bytes(const std::string& path, std::vector<uint32_t>& body_bytes, std::string& err) {
+    std::vector<DirE> dir;
+    uint64_t s4o, s4l;
+    if (!read_dir(path, dir, s4o, s4l, err)) return false;
+    body_bytes.assign(dir.size(), 0);
+    for (size_t i = 0; i < dir.size(); ++i) body_bytes[i] = dir[i].body_bytes;
     return true;
 }
 
@@ -1489,11 +2031,14 @@ static bool selftest_lib_s15(std::string& report) {
 // Random-weight self test of the fast row kernel for every format S1.25, S2..S6 (the real SQ-64 file only contains S2/S3/S4):
 // random payload bytes / D / u, real quantized activations; reference = dequant_sk_row (double) . dequantized Q8_1 activations.
 bool CpuExperts::selftest_kernels(std::string& report) {
-#if HY4_FASTK
+#if HY4_KERNELS
     uint64_t s = 0x1234567ull;
     auto rnd = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
     bool ok = true;
     char buf[200];
+    const KernCaps kcs = probe_kernel_caps();
+    for (int kk = 1; kk <= 2; ++kk) {
+    if ((kk == 1 && !kcs.avx2) || (kk == 2 && !kcs.avx512)) { report += std::string(kern_name(kk)) + ": not supported by this CPU, skipped\n"; continue; }
     for (int code : {0, 2, 3, 4, 5, 6}) {
         const size_t sb = superblock_bytes((SkCode)code), rb = 6 * sb;
         const int nrows = 5;
@@ -1516,13 +2061,13 @@ bool CpuExperts::selftest_kernels(std::string& report) {
                 BlockQ8_1_G64 blk[24];
                 quantize_q8_1_g64(&xd[(size_t)t * D], blk, D);
                 for (int b = 0; b < 24; ++b) {
-                    store_block(&A.p[t], b, blk[b]);
+                    kern_store(kk, &A.p[t], b, blk[b]);
                     for (int i = 0; i < 64; ++i) xq[(size_t)t * D + b * 64 + i] = blk[b].d * (float)blk[b].qs[i];
                 }
                 xp[t] = &A.p[t];
             }
             std::vector<float> out((size_t)m * nrows);
-            rows_gemm(code, W.data(), nrows, xp, m, out.data());
+            kern_gemm(kk, code, W.data(), nrows, xp, m, out.data(), false);
             std::vector<float> wf(D);
             for (int r = 0; r < nrows; ++r) {
                 strata::quant::sk::dequant_sk_row(&W[r * rb], (SkCode)code, wf.data(), D);
@@ -1542,12 +2087,12 @@ bool CpuExperts::selftest_kernels(std::string& report) {
                 quantize_q8_1_g64(&xd[(size_t)t * D], blk, D);
                 residual_blocks(&xd[(size_t)t * D], blk, blk2, 24);
                 for (int b = 0; b < 24; ++b) {
-                    store_block_hi(&A.p[t], b, blk[b], blk2[b]);
+                    kern_store_hi(kk, &A.p[t], b, blk[b], blk2[b]);
                     for (int i = 0; i < 64; ++i) xq2[(size_t)t * D + b * 64 + i] = blk[b].d * (float)blk[b].qs[i] + blk2[b].d * (float)blk2[b].qs[i];
                 }
             }
             std::vector<float> outh((size_t)m * nrows);
-            rows_gemm(code, W.data(), nrows, xp, m, outh.data(), true);
+            kern_gemm(kk, code, W.data(), nrows, xp, m, outh.data(), true);
             for (int r = 0; r < nrows; ++r) {
                 strata::quant::sk::dequant_sk_row(&W[r * rb], (SkCode)code, wf.data(), D);
                 for (int t = 0; t < m; ++t) {
@@ -1562,10 +2107,11 @@ bool CpuExperts::selftest_kernels(std::string& report) {
                 }
             }
         }
-        std::snprintf(buf, sizeof(buf), "fast kernel %s: worst |err|/sum|w*x| = %.2e (m=1,3,8,11); hi mode vs 2-term ref %.2e; vs exact x: q8 %.1e, hi %.1e\n",
+        std::snprintf(buf, sizeof(buf), "%s %s: worst |err|/sum|w*x| = %.2e (m=1,3,8,11); hi mode vs 2-term ref %.2e; vs exact x: q8 %.1e, hi %.1e\n", kern_name(kk),
                       code == 0 ? "S1.25" : (std::string("S") + std::to_string(code)).c_str(), worst, worst_h, ex_q8, ex_hi);
         report += buf;
         if (!(worst < 2e-6) || !(worst_h < 2e-6)) ok = false;
+    }
     }
     return selftest_lib_s15(report) && ok;
 #else
@@ -1596,6 +2142,7 @@ CpuExpertView CpuExperts::view(int layer, int e) const {
     return v;
 }
 bool CpuExperts::fast_kernel() const { return p_->fast; }
+const char* CpuExperts::kernel_name() const { return kern_name(p_->kern); }
 int CpuExperts::n_layers() const { return p_->nlayers; }
 uint64_t CpuExperts::arena_bytes() const { return p_->arena_size; }
 uint64_t CpuExperts::resident_count() const { return p_->n_resident; }

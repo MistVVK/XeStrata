@@ -52,7 +52,8 @@ struct GpuModel {
     uint8_t* h_arena = nullptr;
     uint64_t vram_expert_bytes = 0, host_expert_bytes = 0, n_vram_experts = 0, n_host_experts = 0;
     std::vector<uint8_t> expert_tier;
-    std::vector<std::vector<bool>> cpu_mask;  // [41][512] by expert id: tier-2 experts (computed by hy4_cpu_experts); empty when none
+    std::vector<std::vector<bool>> cpu_mask;   // [41][512] by expert id: tier-2 experts (resident in host RAM, computed by hy4_cpu_experts); empty when none
+    std::vector<std::vector<bool>> cold_mask;  // [41][512] by expert id: tier-3 experts (do not fit the RAM budget: read from the .strata on demand by hy4_cpu_experts); empty when none
     double t_load_trunk = 0, t_load_experts = 0;
 
     const uint8_t* tensor_dev(const std::string& name) const { return d_trunk + man.get(name).off; }
@@ -165,6 +166,11 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         snprintf(m, sizeof m, "%d", mask);
         hy4_setenv("HY4_KV_HOST", m, 1);
     }
+    {
+        char b[32];
+        snprintf(b, sizeof b, "%.2f", ((mask & 1) ? rows : 0.0) + ((mask & 2) ? wkv : 0.0) + 0.3);
+        hy4_setenv("HY4_HOST_NEED_GB", b, 1);
+    }
     if (!getenv("HY4_RESERVE_GB")) {
         double reserve = work_gb + pivg + ((mask & 1) ? 0.0 : rows) + ((mask & 2) ? 0.0 : wkv) + (tot >= 10.0 && mask == 0 ? 1.45 : 0.0);  // + the prefill streaming scratch when everything else fits
         char b[32];
@@ -174,6 +180,24 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     fprintf(stderr, "[plan] ctx %d chunk %d: buffers ~%.2f GB, KV rows %.2f GB, IndexPool %.2f GB, kv_b copies %.2f GB, trunk %.2f GB on a %.1f GB card -> host mask %d (1 rows, 2 kv_b copies); reserve %s GB\n", max_ctx, chunk, work_gb,
             rows, pivg, wkv, trunk, tot, atoi(getenv("HY4_KV_HOST")), getenv("HY4_RESERVE_GB"));
     return chunk;
+}
+
+inline double host_mem_gb();
+// RAM this process may use: min(MemTotal, the container's cgroup limit), in GB
+inline double ram_limit_gb() {
+    double gb = host_mem_gb();
+#ifndef _WIN32
+    const char* files[2] = {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
+    for (const char* fn : files) {
+        FILE* f = fopen(fn, "r");
+        if (!f) continue;
+        double v = 0;
+        char buf[64] = {0};
+        if (fgets(buf, sizeof buf, f) && sscanf(buf, "%lf", &v) == 1 && v > 1e9 && v < 1e15) gb = std::min(gb, v / 1e9);
+        fclose(f);
+    }
+#endif
+    return gb;
 }
 
 inline double host_mem_gb() {
@@ -213,12 +237,51 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
             off[i] = vb;
             vb += sz;
         }
-    uint64_t n_v = 0, n_h = 0;
+    uint64_t n_v = 0, n_h = 0, n_cold = 0, cold_bytes = 0;
     for (size_t i = 0; i < N; ++i) {
         if (tier[i] == 1 && cpu_mode) tier[i] = 2;
         if (tier[i] == 1) { off[i] = hb; hb += al(dir[i].body_bytes); ++n_h; }
         else if (tier[i] == 0) ++n_v;
         else ++n_h;
+    }
+    if (cpu_mode) {
+        // RAM budget for the host-resident experts: the cold tail (highest ranks, rank-major order) is not loaded and is read from the file on demand (SSD) instead
+        uint64_t host_total = 0;
+        for (size_t i = 0; i < N; ++i)
+            if (tier[i] == 2) host_total += al(dir[i].body_bytes);
+        double budget_gb;
+        if (getenv("HY4_RAM_BUDGET_GB")) budget_gb = atof(getenv("HY4_RAM_BUDGET_GB"));
+        else {
+            const double need = getenv("HY4_HOST_NEED_GB") ? atof(getenv("HY4_HOST_NEED_GB")) : 0.0;
+            budget_gb = ram_limit_gb() - 3.5 - need - 1.5;  // OS and runtime, host KV / kv_b copies, engram cache + pinned staging
+        }
+        const uint64_t budget = budget_gb > 0 ? (uint64_t)(budget_gb * 1e9) : 0;
+        if (host_total > budget) {
+            uint64_t used = 0;
+            bool full = false;
+            for (size_t r = 0; r < 512 && !full; ++r)
+                for (size_t L = 0; L < N / 512; ++L) {
+                    const size_t i = L * 512 + r;
+                    if (tier[i] != 2) continue;
+                    const uint64_t sz = al(dir[i].body_bytes);
+                    if (used + sz > budget) { full = true; break; }
+                    used += sz;
+                }
+            // everything from the first miss on (in rank-major order) is cold
+            uint64_t used2 = 0;
+            bool cold = false;
+            for (size_t r = 0; r < 512; ++r)
+                for (size_t L = 0; L < N / 512; ++L) {
+                    const size_t i = L * 512 + r;
+                    if (tier[i] != 2) continue;
+                    const uint64_t sz = al(dir[i].body_bytes);
+                    if (!cold && used2 + sz > budget) cold = true;
+                    if (cold) { tier[i] = 3; ++n_cold; cold_bytes += sz; --n_h; }
+                    else used2 += sz;
+                }
+            fprintf(stderr, "[load] RAM budget %.1f GB for the host experts (%.1f GB wanted): %llu experts (%.2f GB, the coldest ranks) stay on the SSD\n", budget_gb, host_total / 1e9, (unsigned long long)n_cold,
+                    cold_bytes / 1e9);
+        }
     }
     HCK(hipMalloc((void**)&g.d_sec4, vb ? vb : 4096));
     uint8_t* hbase = nullptr;
@@ -253,7 +316,7 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
                 if (i >= N) break;
                 const uint64_t fo = h.sections[4].file_offset + dir[i].body_offset;
                 const size_t n = dir[i].body_bytes;
-                if (tier[i] == 2) continue;  // loaded by hy4_cpu_experts
+                if (tier[i] == 2 || tier[i] == 3) continue;  // loaded / read on demand by hy4_cpu_experts
                 if (tier[i] == 1) {
                     if (f.read_at(fo, hbase + off[i], n) < n) { failed = 1; break; }
                 } else {
@@ -268,11 +331,13 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     for (auto& t : th) t.join();
     if (failed) { err = "expert read failed"; return false; }
     if (cpu_mode) g.cpu_mask.assign(N / 512, std::vector<bool>(512, false));
+    if (n_cold) g.cold_mask.assign(N / 512, std::vector<bool>(512, false));
     for (size_t i = 0; i < N; ++i) {
         const auto& e = dir[i];
         ExpertRef& er = g.experts[(i / 512) * 512 + e.expert_id];
         er.tier = tier[i];
         if (tier[i] == 2) { g.cpu_mask[i / 512][e.expert_id] = true; continue; }
+        if (tier[i] == 3) { g.cold_mask[i / 512][e.expert_id] = true; continue; }
         uint8_t* dst = tier[i] == 0 ? g.d_sec4 + off[i] : hdev + off[i];
         er.body_off = (uint64_t)(uintptr_t)dst - (uint64_t)(uintptr_t)g.d_sec4;
     }
