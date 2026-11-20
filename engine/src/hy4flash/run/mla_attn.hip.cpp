@@ -209,24 +209,47 @@ __device__ __forceinline__ uint2 vmask(uint2 b, int v) {
 // Per 64-key tile: wave w scores keys 16w..16w+15 (S = Q K^T, 36 WMMA over the 576 dims, B fragments read straight from the row-major cache), the row max / row sums are
 // exchanged through LDS, P (fp16) goes to LDS, then every wave multiplies P into ITS 128-column slice of the 512-wide latent output (V^T fragments read from the Vt copy of the cache).
 // Online softmax state (m, l) is kept identically by all waves; the per-head sink is the initial state of split 0 (m = sink, l = 1).
+#if HY4_GFX12
+typedef _Float16 hv_t __attribute__((ext_vector_type(8)));
+typedef float fv8 __attribute__((ext_vector_type(8)));
+typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
+
+__device__ __forceinline__ hv_t ld_hv(const void* p, int hi) {
+    const uint4 a = *reinterpret_cast<const uint4*>(reinterpret_cast<const _Float16*>(p) + hi * 8);
+    return __builtin_bit_cast(hv_t, a);
+}
+__device__ __forceinline__ hv_t pack_hv_2(uint2 a, uint2 b) {
+    u32x4 v = {a.x, a.y, b.x, b.y};
+    return __builtin_bit_cast(hv_t, v);
+}
+__device__ __forceinline__ fv8 wmma_f16(hv_t a, hv_t b, fv8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+}
+__device__ __forceinline__ fv8 fv8_zero() { return fv8{0, 0, 0, 0, 0, 0, 0, 0}; }
+__device__ __forceinline__ int acc_m(int r, int lane) { return 8 * (lane >> 4) + r; }
+__device__ __forceinline__ int acc_n(int r, int lane) { return lane & 15; }
+#else
 typedef _Float16 hv16 __attribute__((ext_vector_type(16)));
+typedef hv16 hv_t;
 typedef float fv8 __attribute__((ext_vector_type(8)));
 typedef unsigned u32x8 __attribute__((ext_vector_type(8)));
 
-__device__ __forceinline__ hv16 ld_hv16(const void* p) {
+__device__ __forceinline__ hv_t ld_hv(const void* p, int /*hi*/) {
     const uint4 a = *reinterpret_cast<const uint4*>(p), b = *(reinterpret_cast<const uint4*>(p) + 1);
     u32x8 v = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-    return __builtin_bit_cast(hv16, v);
+    return __builtin_bit_cast(hv_t, v);
 }
-__device__ __forceinline__ hv16 pack_hv16(uint2 a, uint2 b, uint2 c, uint2 d) {
+__device__ __forceinline__ hv_t pack_hv16(uint2 a, uint2 b, uint2 c, uint2 d) {
     u32x8 v = {a.x, a.y, b.x, b.y, c.x, c.y, d.x, d.y};
-    return __builtin_bit_cast(hv16, v);
+    return __builtin_bit_cast(hv_t, v);
 }
-
-// (vmask: defined once above for both the gfx11 and the CUDA matrix-core paths; the merge of f-hy4-dfly2 a3bc436fc and f-hy4-cuda a9ed385dd had left a second copy here)
+__device__ __forceinline__ fv8 wmma_f16(hv_t a, hv_t b, fv8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+}
 __device__ __forceinline__ fv8 fv8_zero() { return fv8{0, 0, 0, 0, 0, 0, 0, 0}; }
 __device__ __forceinline__ int acc_m(int r, int lane) { return 2 * r + (lane >> 4); }
 __device__ __forceinline__ int acc_n(int r, int lane) { return lane & 15; }
+#endif
 #endif  // HY4_MMA && !HY4_CUDA
 constexpr int FBK = 64;   // keys per tile
 constexpr int QP = 584;   // sQ pitch (halves)
@@ -267,13 +290,13 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     float mrun[8], lrun[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        mrun[i] = sp == 0 ? sinks[h0 + 2 * i + hi] : NEG;
+        mrun[i] = sp == 0 ? sinks[h0 + acc_m(i, lane)] : NEG;
         lrun[i] = sp == 0 ? 1.0f : 0.0f;
     }
     fv8 o[8];
 #pragma unroll
     for (int c = 0; c < 8; ++c) o[c] = fv8{};
-    __syncthreads();
+    hy4_sync_lds();
 
     for (int tile = tb; tile < te; ++tile) {
         const int i0 = tile * FBK;
@@ -287,9 +310,9 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         fv8 sacc = fv8{};
 #pragma unroll 12
         for (int kk = 0; kk < MLA_ROW / 16; ++kk) {
-            hv16 af = ld_hv16(&sQ[l16 * QP + kk * 16]);
-            hv16 bf = ld_hv16(krow + kk * 16);
-            sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, sacc);
+            hv_t af = ld_hv(&sQ[l16 * QP + kk * 16], hi);
+            hv_t bf = ld_hv(krow + kk * 16, hi);
+            sacc = wmma_f16(af, bf, sacc);
         }
         float sc[8];
 #pragma unroll
@@ -304,7 +327,7 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         }
         if (l16 == 0) {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) s_m[w][2 * i + hi] = pm[i];
+            for (int i = 0; i < 8; ++i) s_m[w][acc_m(i, lane)] = pm[i];
         }
         // group base (slot >> 2) of the 16 key groups of the 4 PV k-steps (entry 4q of the tile)
         int gidx[16];
@@ -321,11 +344,11 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         int vv[16];  // valid keys (0..4) of each 4-key group of this tile
 #pragma unroll
         for (int q = 0; q < 16; ++q) vv[q] = min(max(nk - (i0 + 4 * q), 0), 4);
-        __syncthreads();
+        hy4_sync_lds();
         float corr[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const int r = 2 * i + hi;
+            const int r = acc_m(i, lane);
             float tm = fmaxf(fmaxf(s_m[0][r], s_m[1][r]), fmaxf(s_m[2][r], s_m[3][r]));
             float nm = fmaxf(mrun[i], tm);
             corr[i] = expf(mrun[i] - nm);
@@ -335,7 +358,7 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             float p = v ? expf(sc[i] - mrun[i]) : 0.f;
-            sP[(2 * i + hi) * PP + 16 * w + l16] = (_Float16)p;
+            sP[acc_m(i, lane) * PP + 16 * w + l16] = (_Float16)p;
             float x = p;
 #pragma unroll
             for (int off = 8; off > 0; off >>= 1) x += __shfl_xor(x, off, 16);
@@ -343,12 +366,12 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         }
         if (l16 == 0) {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) s_l[w][2 * i + hi] = ps[i];
+            for (int i = 0; i < 8; ++i) s_l[w][acc_m(i, lane)] = ps[i];
         }
-        __syncthreads();
+        hy4_sync_lds();
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const int r = 2 * i + hi;
+            const int r = acc_m(i, lane);
             lrun[i] = lrun[i] * corr[i] + (s_l[0][r] + s_l[1][r] + s_l[2][r] + s_l[3][r]);
         }
 #pragma unroll
@@ -358,38 +381,50 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         // ---- P @ V  (this wave: columns 128w .. 128w+127)
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
-            hv16 pf = ld_hv16(&sP[l16 * PP + ks * 16]);
+            hv_t pf = ld_hv(&sP[l16 * PP + ks * 16], hi);
             const bool full = (vv[4 * ks + 0] >= 4) & (vv[4 * ks + 1] >= 4) & (vv[4 * ks + 2] >= 4) & (vv[4 * ks + 3] >= 4);  // uniform: only the last tile of a query has a partial group
             if (full) {
 #pragma unroll
                 for (int ct = 0; ct < 8; ++ct) {
                     const int c = 128 * w + 16 * ct + l16;
+#if HY4_GFX12
+                    uint2 b0 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2 * hi + 0] * MLA_KV_LORA + c) * 4);
+                    uint2 b1 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2 * hi + 1] * MLA_KV_LORA + c) * 4);
+                    o[ct] = wmma_f16(pf, pack_hv_2(b0, b1), o[ct]);
+#else
                     uint2 b0 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 0] * MLA_KV_LORA + c) * 4);
                     uint2 b1 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 1] * MLA_KV_LORA + c) * 4);
                     uint2 b2 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2] * MLA_KV_LORA + c) * 4);
                     uint2 b3 = *reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 3] * MLA_KV_LORA + c) * 4);
-                    o[ct] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, pack_hv16(b0, b1, b2, b3), o[ct]);
+                    o[ct] = wmma_f16(pf, pack_hv16(b0, b1, b2, b3), o[ct]);
+#endif
                 }
             } else {
 #pragma unroll
                 for (int ct = 0; ct < 8; ++ct) {
                     const int c = 128 * w + 16 * ct + l16;
+#if HY4_GFX12
+                    uint2 b0 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2 * hi + 0] * MLA_KV_LORA + c) * 4), vv[4 * ks + 2 * hi + 0]);
+                    uint2 b1 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2 * hi + 1] * MLA_KV_LORA + c) * 4), vv[4 * ks + 2 * hi + 1]);
+                    o[ct] = wmma_f16(pf, pack_hv_2(b0, b1), o[ct]);
+#else
                     uint2 b0 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 0] * MLA_KV_LORA + c) * 4), vv[4 * ks + 0]);
                     uint2 b1 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 1] * MLA_KV_LORA + c) * 4), vv[4 * ks + 1]);
                     uint2 b2 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 2] * MLA_KV_LORA + c) * 4), vv[4 * ks + 2]);
                     uint2 b3 = vmask(*reinterpret_cast<const uint2*>(vt + ((size_t)gidx[4 * ks + 3] * MLA_KV_LORA + c) * 4), vv[4 * ks + 3]);
-                    o[ct] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, pack_hv16(b0, b1, b2, b3), o[ct]);
+                    o[ct] = wmma_f16(pf, pack_hv16(b0, b1, b2, b3), o[ct]);
+#endif
                 }
             }
         }
-        __syncthreads();
+        hy4_sync_lds();
     }
     // ---- write
     if (S == 1) {
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const float il = 1.0f / lrun[i];
-            __half* dst = out + ((size_t)t * NH + h0 + 2 * i + hi) * MLA_KV_LORA + 128 * w + l16;
+            __half* dst = out + ((size_t)t * NH + h0 + acc_m(i, lane)) * MLA_KV_LORA + 128 * w + l16;
 #pragma unroll
             for (int ct = 0; ct < 8; ++ct) dst[16 * ct] = __float2half(o[ct][i] * il);
         }
@@ -398,15 +433,15 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
         float* po = part + blk * (16 * MLA_KV_LORA + 32);
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            float* dst = po + (size_t)(2 * i + hi) * MLA_KV_LORA + 128 * w + l16;
+            float* dst = po + (size_t)acc_m(i, lane) * MLA_KV_LORA + 128 * w + l16;
 #pragma unroll
             for (int ct = 0; ct < 8; ++ct) dst[16 * ct] = o[ct][i];
         }
         if (w == 0 && l16 == 0) {
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                po[16 * MLA_KV_LORA + (2 * i + hi) * 2] = mrun[i];
-                po[16 * MLA_KV_LORA + (2 * i + hi) * 2 + 1] = lrun[i];
+                po[16 * MLA_KV_LORA + acc_m(i, lane) * 2] = mrun[i];
+                po[16 * MLA_KV_LORA + acc_m(i, lane) * 2 + 1] = lrun[i];
             }
         }
     }
@@ -669,7 +704,7 @@ __global__ void k_transpose_wk(const __half* __restrict__ wk_b, __half* __restri
     }
 }
 
-#if !HY4_CUDA
+#if !HY4_CUDA && !HY4_GFX12
 __device__ __forceinline__ hv16 ld_f32_as_hv16(const float* p) {
     const float4 a = *reinterpret_cast<const float4*>(p), b = *(reinterpret_cast<const float4*>(p) + 1), c = *(reinterpret_cast<const float4*>(p) + 2),
                  d = *(reinterpret_cast<const float4*>(p) + 3);
@@ -778,17 +813,17 @@ __global__ void __launch_bounds__(256) k_head_gemm(const void* __restrict__ A_, 
 #else
 #pragma unroll
         for (int kk = 0; kk < HG_BK / 16; ++kk) {
-            hv16 a0 = ld_hv16(&sA[(wm * 32 + l16) * HG_LD + kk * 16]);
-            hv16 a1 = ld_hv16(&sA[(wm * 32 + 16 + l16) * HG_LD + kk * 16]);
-            hv16 b0 = ld_hv16(&sB[(wn * 32 + l16) * HG_LD + kk * 16]);
-            hv16 b1 = ld_hv16(&sB[(wn * 32 + 16 + l16) * HG_LD + kk * 16]);
-            acc[0][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc[0][0]);
-            acc[0][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b1, acc[0][1]);
-            acc[1][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b0, acc[1][0]);
-            acc[1][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc[1][1]);
+            hv_t a0 = ld_hv(&sA[(wm * 32 + l16) * HG_LD + kk * 16], hi);
+            hv_t a1 = ld_hv(&sA[(wm * 32 + 16 + l16) * HG_LD + kk * 16], hi);
+            hv_t b0 = ld_hv(&sB[(wn * 32 + l16) * HG_LD + kk * 16], hi);
+            hv_t b1 = ld_hv(&sB[(wn * 32 + 16 + l16) * HG_LD + kk * 16], hi);
+            acc[0][0] = wmma_f16(a0, b0, acc[0][0]);
+            acc[0][1] = wmma_f16(a0, b1, acc[0][1]);
+            acc[1][0] = wmma_f16(a1, b0, acc[1][0]);
+            acc[1][1] = wmma_f16(a1, b1, acc[1][1]);
         }
 #endif
-        __syncthreads();
+        hy4_sync_lds();
     }
 #pragma unroll
     for (int a = 0; a < 2; ++a)

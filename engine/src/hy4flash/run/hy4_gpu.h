@@ -142,12 +142,24 @@ __device__ __forceinline__ const void* shfl_ptr(const void* p, int src) {
 #ifndef HY4_MMA
 #define HY4_MMA 1
 #endif
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define HY4_GFX12 1
+#else
+#define HY4_GFX12 0
+#endif
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
 namespace hy4 {
 inline const char* gpu_arch(const hipDeviceProp_t& p) { return p.gcnArchName; }
+__device__ __forceinline__ void hy4_sync_lds() {
+#if HY4_GFX12
+    asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+#else
+    __syncthreads();
+#endif
+}
 typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ uint32_t h2_sub(uint32_t a, uint32_t b) { return __builtin_bit_cast(uint32_t, __builtin_bit_cast(hv2, a) - __builtin_bit_cast(hv2, b)); }
 __device__ __forceinline__ uint32_t h2_splat(float f) {

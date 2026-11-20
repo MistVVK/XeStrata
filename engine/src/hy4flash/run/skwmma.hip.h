@@ -13,19 +13,40 @@ namespace hy4 {
 namespace skd {
 
 #if !HY4_CUDA
-typedef half_t hv16 __attribute__((ext_vector_type(16)));
+#if HY4_GFX12
+typedef half_t hv_t __attribute__((ext_vector_type(8)));
 typedef float fv8 __attribute__((ext_vector_type(8)));
 __device__ __forceinline__ fv8 fv8_zero() { return fv8{0, 0, 0, 0, 0, 0, 0, 0}; }
 
-__device__ __forceinline__ hv16 ld_hv16(const void* p) {
+__device__ __forceinline__ hv_t ld_hv(const void* p, int hi) {
+    const uint4 a = *(const uint4*)((const half_t*)p + hi * 8);
+    return __builtin_bit_cast(hv_t, a);
+}
+__device__ __forceinline__ fv8 wmma_f16(hv_t a, hv_t b, fv8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+}
+// accumulator element r (0..7) of a lane in a 16x16 output tile: row / column within the tile (gfx12: 8*(lane>>4) + r)
+__device__ __forceinline__ int acc_m(int r, int lane) { return 8 * (lane >> 4) + r; }
+__device__ __forceinline__ int acc_n(int r, int lane) { return lane & 15; }
+#else
+typedef half_t hv16 __attribute__((ext_vector_type(16)));
+typedef hv16 hv_t;
+typedef float fv8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ fv8 fv8_zero() { return fv8{0, 0, 0, 0, 0, 0, 0, 0}; }
+
+__device__ __forceinline__ hv_t ld_hv(const void* p, int /*hi*/) {
     const uint4 a = *(const uint4*)p, b = *((const uint4*)p + 1);
     typedef unsigned u32x8 __attribute__((ext_vector_type(8)));
     u32x8 v = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-    return __builtin_bit_cast(hv16, v);
+    return __builtin_bit_cast(hv_t, v);
+}
+__device__ __forceinline__ fv8 wmma_f16(hv_t a, hv_t b, fv8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 }
 // accumulator element r (0..7) of a lane in a 16x16 output tile: row / column within the tile
 __device__ __forceinline__ int acc_m(int r, int lane) { return 2 * r + (lane >> 4); }
 __device__ __forceinline__ int acc_n(int r, int lane) { return lane & 15; }
+#endif
 #else
 #endif
 
@@ -199,39 +220,39 @@ template <int FMT>
 __device__ __forceinline__ void gemm_mainloop_old(const uint8_t* wr, int nsb, const half_t* xrow0, const half_t* xrow1, half_t* ws, fv8 (&acc)[2][2],
                                               int b0row, int b1row) {
     constexpr int SB = sk_sb_bytes(FMT);
-    const int tid = threadIdx.x, lane = tid & 31;
+    const int tid = threadIdx.x, lane = tid & 31, hi = lane >> 4;
     const int drow = tid >> 2, dg = tid & 3;
     RawSub<FMT> cur, nxt;
     load_raw<FMT>(wr, dg, cur);
     // A operand (activations) is streamed from global memory with a prefetch distance of 4 k-steps (register ring), so the loads never stall a WMMA
     constexpr int PD = 4;
     const int total = nsb * 16;
-    hv16 aq0[PD], aq1[PD];
+    hv_t aq0[PD], aq1[PD];
 #pragma unroll
     for (int i = 0; i < PD; ++i) {
-        aq0[i] = ld_hv16(xrow0 + i * 16);
-        aq1[i] = ld_hv16(xrow1 + i * 16);
+        aq0[i] = ld_hv(xrow0 + i * 16, hi);
+        aq1[i] = ld_hv(xrow1 + i * 16, hi);
     }
     for (int sb = 0; sb < nsb; ++sb) {
         dequant_sub<FMT>(cur, raw_eff<FMT>(cur, dg), &ws[drow * GEMM_LDW + dg * 64]);
         if (sb + 1 < nsb) load_raw<FMT>(wr + (size_t)(sb + 1) * SB, dg, nxt);
-        __syncthreads();
+        hy4_sync_lds();
 #pragma unroll
         for (int kk = 0; kk < 16; ++kk) {
             const int g = sb * 16 + kk;
-            const hv16 a0 = aq0[kk & (PD - 1)], a1 = aq1[kk & (PD - 1)];
+            const hv_t a0 = aq0[kk & (PD - 1)], a1 = aq1[kk & (PD - 1)];
             if (g + PD < total) {
-                aq0[kk & (PD - 1)] = ld_hv16(xrow0 + (g + PD) * 16);
-                aq1[kk & (PD - 1)] = ld_hv16(xrow1 + (g + PD) * 16);
+                aq0[kk & (PD - 1)] = ld_hv(xrow0 + (g + PD) * 16, hi);
+                aq1[kk & (PD - 1)] = ld_hv(xrow1 + (g + PD) * 16, hi);
             }
-            hv16 b0 = ld_hv16(&ws[(b0row + (lane & 15)) * GEMM_LDW + kk * 16]);
-            hv16 b1 = ld_hv16(&ws[(b1row + (lane & 15)) * GEMM_LDW + kk * 16]);
-            acc[0][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc[0][0]);
-            acc[0][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b1, acc[0][1]);
-            acc[1][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b0, acc[1][0]);
-            acc[1][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc[1][1]);
+            hv_t b0 = ld_hv(&ws[(b0row + (lane & 15)) * GEMM_LDW + kk * 16], hi);
+            hv_t b1 = ld_hv(&ws[(b1row + (lane & 15)) * GEMM_LDW + kk * 16], hi);
+            acc[0][0] = wmma_f16(a0, b0, acc[0][0]);
+            acc[0][1] = wmma_f16(a0, b1, acc[0][1]);
+            acc[1][0] = wmma_f16(a1, b0, acc[1][0]);
+            acc[1][1] = wmma_f16(a1, b1, acc[1][1]);
         }
-        __syncthreads();
+        hy4_sync_lds();
         cur = nxt;
     }
 }
@@ -252,47 +273,47 @@ template <int FMT, int MTW, int NTW>
 __device__ __forceinline__ void gemm_mainloop_g(const uint8_t* wr, int nsb, const half_t* const (&xrow)[MTW], half_t* ws, fv8 (&acc)[MTW][NTW],
                                                 const int (&brow)[NTW], bool active) {
     constexpr int SB = sk_sb_bytes(FMT);
-    const int tid = threadIdx.x, lane = tid & 31;
+    const int tid = threadIdx.x, lane = tid & 31, hi = lane >> 4;
     const int drow = tid >> 2, dg = tid & 3;
     if constexpr (FMT == FMT_S1_25) {
         s125_lut_init();
-        __syncthreads();
+        hy4_sync_lds();
     }
     RawSub<FMT> cur, nxt;
     load_raw<FMT>(wr, dg, cur);
     constexpr int PD = 4;
     const int total = nsb * 16;
-    hv16 aq[MTW][PD];
+    hv_t aq[MTW][PD];
     if (active) {
 #pragma unroll
         for (int i = 0; i < PD; ++i)
 #pragma unroll
-            for (int m = 0; m < MTW; ++m) aq[m][i] = ld_hv16(xrow[m] + i * 16);
+            for (int m = 0; m < MTW; ++m) aq[m][i] = ld_hv(xrow[m] + i * 16, hi);
     }
     for (int sb = 0; sb < nsb; ++sb) {
         dequant_sub<FMT>(cur, raw_eff<FMT>(cur, dg), &ws[drow * GEMM_LDW + dg * 64]);
         if (sb + 1 < nsb) load_raw<FMT>(wr + (size_t)(sb + 1) * SB, dg, nxt);
-        __syncthreads();
+        hy4_sync_lds();
         if (active) {
 #pragma unroll
             for (int kk = 0; kk < 16; ++kk) {
                 const int g = sb * 16 + kk;
-                hv16 a[MTW];
+                hv_t a[MTW];
 #pragma unroll
                 for (int m = 0; m < MTW; ++m) {
                     a[m] = aq[m][kk & (PD - 1)];
-                    if (g + PD < total) aq[m][kk & (PD - 1)] = ld_hv16(xrow[m] + (g + PD) * 16);
+                    if (g + PD < total) aq[m][kk & (PD - 1)] = ld_hv(xrow[m] + (g + PD) * 16, hi);
                 }
-                hv16 b[NTW];
+                hv_t b[NTW];
 #pragma unroll
-                for (int j = 0; j < NTW; ++j) b[j] = ld_hv16(&ws[(brow[j] + (lane & 15)) * GEMM_LDW + kk * 16]);
+                for (int j = 0; j < NTW; ++j) b[j] = ld_hv(&ws[(brow[j] + (lane & 15)) * GEMM_LDW + kk * 16], hi);
 #pragma unroll
                 for (int m = 0; m < MTW; ++m)
 #pragma unroll
-                    for (int j = 0; j < NTW; ++j) acc[m][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[m], b[j], acc[m][j]);
+                    for (int j = 0; j < NTW; ++j) acc[m][j] = wmma_f16(a[m], b[j], acc[m][j]);
             }
         }
-        __syncthreads();
+        hy4_sync_lds();
         cur = nxt;
     }
 }
