@@ -80,6 +80,7 @@ def export(source: Path, indexer: Path, output: Path) -> None:
         "sensenova_loop.qsa.rope_length": 64,
         "sensenova_loop.qsa.block_size": 4,
         "sensenova_loop.qsa.budget": 2048,
+        "sensenova_loop.qsa.rope_table_dtype": "bf16",
         "sensenova_loop.qsa.indexer_sha256": digest(indexer),
     }
     if set(metadata) & g.metadata.keys():

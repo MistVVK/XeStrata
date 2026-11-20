@@ -53,6 +53,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -732,7 +733,12 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
         return i8 ? 2 * i8_row : 4 * (uint64_t) hd;
     };
     std::vector<uint64_t> kv_cells((size_t) nl, 0);
+    const char* qsa_dense = strata::env_get("SENSENOVA_QSA_DENSE");
+    const bool qsa = s.arch == ModelArch::SenseNovaLoop && !(qsa_dense && std::strtol(qsa_dense, nullptr, 10) != 0);
     for (int64_t l = 0; l < nl; ++l) {
+        if (qsa && model_->find("blk." + std::to_string(l) + ".indexer.q_proj.weight"))
+            block[(size_t) l] += (uint64_t) (opt_.max_cells / 4 + 1) * 128 * 4 +
+                                 (uint64_t) (4 + 3 * opt_.max_t) * 128 * 4 + 4;
         const int64_t cells = s.layer_swa(l) ? std::min<int64_t>(opt_.max_cells, s.swa_window + chunk) : opt_.max_cells;
         if (s.recurrent[(size_t) l])
             block[(size_t) l] += (uint64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state + (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4;
@@ -1167,6 +1173,63 @@ bool PlainModel::load_qwen(std::string& err) {
         stream_into_ = nullptr;
         if (!ok) return false;
     }
+    if (s.arch == ModelArch::SenseNovaLoop) {
+        const char* const names[] = {"q_proj.weight", "k_proj.weight", "q_norm.weight", "k_norm.weight",
+                                     "k_block_norm.weight"};
+        bool any_indexer = m.meta().get("sensenova_loop.qsa.head_count") != nullptr;
+        for (int64_t l = 0; l < s.n_layer; ++l) {
+            if (s.recurrent[(size_t) l]) continue;
+            const std::string p = "blk." + std::to_string(l) + ".indexer.";
+            for (const char* name : names) any_indexer = any_indexer || m.find(p + name) != nullptr;
+        }
+        if (any_indexer) {
+            for (int64_t l = 0; l < s.n_layer; ++l) {
+                if (s.recurrent[(size_t) l]) continue;
+                const std::string p = "blk." + std::to_string(l) + ".indexer.";
+                for (const char* name : names)
+                    if (!m.find(p + name)) { err = "plain model: missing QSA tensor " + p + name; return false; }
+            }
+            const struct { const char* key; uint64_t value; } fields[] = {
+                {"head_count", 4}, {"key_length", 128}, {"rope_length", 64}, {"block_size", 4}, {"budget", 2048}};
+            for (const auto& field : fields) {
+                const auto* v = m.meta().get(std::string("sensenova_loop.qsa.") + field.key);
+                if (!v || v->type != MetaType::U32 || v->u != field.value) {
+                    err = std::string("plain model: invalid QSA metadata ") + field.key; return false;
+                }
+            }
+            const auto* dtype = m.meta().get("sensenova_loop.qsa.rope_table_dtype");
+            if (!dtype || dtype->type != MetaType::STRING || dtype->s != "bf16") {
+                err = "plain model: unsupported QSA rotary table dtype"; return false;
+            }
+            const auto* hash = m.meta().get("sensenova_loop.qsa.indexer_sha256");
+            if (!hash || hash->type != MetaType::STRING || hash->s.size() != 64 ||
+                hash->s.find_first_not_of("0123456789abcdef") != std::string::npos) {
+                err = "plain model: invalid QSA indexer SHA-256"; return false;
+            }
+        }
+        const char* dense = strata::env_get("SENSENOVA_QSA_DENSE");
+        sparse_qsa_ = any_indexer && !(dense && std::strtol(dense, nullptr, 10) != 0);
+        if (sparse_qsa_) {
+            if (opt_.batch_slots > 0) { err = "plain model: QSA does not yet support --batch"; return false; }
+            qsa_weights_.resize((size_t) n_attn);
+            for (int64_t l = lb_; l < le_; ++l) {
+                const Block& b = blocks_[(size_t) l];
+                if (b.recurrent) continue;
+                QsaWeights& w = qsa_weights_[(size_t) b.attn];
+                const std::string p = "blk." + std::to_string(l) + ".indexer.";
+                if (!upload(m, p + "q_proj.weight", w.q, err, true) ||
+                    !upload(m, p + "k_proj.weight", w.k, err, true) ||
+                    !upload_f32(m, p + "q_norm.weight", 128, w.q_norm, err) ||
+                    !upload_f32(m, p + "k_norm.weight", 128, w.k_norm, err) ||
+                    !upload_f32(m, p + "k_block_norm.weight", 128, w.block_norm, err)) return false;
+                if (w.q.type != kF32 || w.k.type != kF32 || w.q.n_in != s.n_embd || w.k.n_in != s.n_embd ||
+                    w.q.n_out != 512 || w.k.n_out != 128) {
+                    err = "plain model: invalid QSA indexer at visit " + std::to_string(l);
+                    return false;
+                }
+            }
+        }
+    }
     if (!setup_taps(err)) return false;
     // the MTP layer, when the window checks drafts and the file has it (its K/V the last attention block's): the last
     // stage's
@@ -1249,6 +1312,29 @@ bool PlainModel::load_qwen(std::string& err) {
             allocs_.push_back(cv);
             gdn_state_[(size_t) b.gdn] = st;
             gdn_conv_[(size_t) b.gdn] = cv;
+        }
+    }
+    if (sparse_qsa_) {
+        qsa_index_.resize((size_t) n_attn);
+        qsa_tail_snap_.resize((size_t) n_attn);
+        auto take = [&](auto*& p, size_t bytes) {
+            if (!strata::gpu::alloc_device(&p, bytes)) return false;
+            allocs_.push_back(p);
+            return strata::gpu::memset(p, 0, bytes);
+        };
+        for (size_t a = 0; a < qsa_weights_.size(); ++a) {
+            if (!qsa_weights_[a].q.data) continue;
+            auto& ib = qsa_index_[a];
+            if (!take(ib.tail, size_t(3) * 128 * 4) || !take(ib.dead, size_t(128) * 4) ||
+                !take(ib.pooled, (size_t) (opt_.max_cells / 4 + 1) * 128 * 4) || !take(ib.block_pos, 4)) {
+                err = "plain model: no VRAM for the QSA indexer state";
+                return false;
+            }
+            for (int t = 0; t < opt_.max_t - 1; ++t) {
+                float* copy = nullptr;
+                if (!take(copy, size_t(3) * 128 * 4)) { err = "plain model: no VRAM for QSA tail copies"; return false; }
+                qsa_tail_snap_[a].push_back(copy);
+            }
         }
     }
     // the states after a window's rows but its last, for going back to the last accepted draft: a window checks up to
@@ -1481,6 +1567,8 @@ bool PlainModel::load_qwen(std::string& err) {
                 bool mine2 = has_mtp_ && i2 == mtp_.attn;
                 for (int64_t l = lb_; l < le_ && !mine2; ++l) mine2 = blocks_[(size_t) l].attn == i2;
                 if (!mine2 || (opt_.encoder && i2 > 0)) continue;   // an encoder's layers share the first's cells
+                if (sparse_qsa_ && (size_t) i2 < qsa_index_.size() && qsa_index_[(size_t) i2].tail)
+                    total += (uint64_t) (want / 4 + 1) * 128 * 4 + (uint64_t) (4 + 3 * opt_.max_t) * 128 * 4 + 4;
                 if (kv_streamed((size_t) i2))   // streamed: the ring's VRAM, fixed (the rest is the host copy, in RAM)
                     total += kv_block_bytes(kv_stream_slots_ * qs.page_size);
                 else
@@ -1617,7 +1705,8 @@ bool PlainModel::load_qwen(std::string& err) {
         err = "plain model: mapped staging allocation failed";
         return false;
     }
-    attn_scratch_floats_ = (int64_t) k::qsa_decode_attn_scratch_floats(opt_.max_cells, qs);
+    attn_scratch_floats_ = (int64_t) k::qsa_decode_attn_scratch_floats(
+        sparse_qsa_ ? std::max<int64_t>(opt_.max_cells, 2052) : opt_.max_cells, qs);
     const uint64_t max_in = std::max<uint64_t>({N, ZV, NH * HD, FS, has_mtp_ ? 2 * N : 0});
     auto dev = [&](auto** p, uint64_t bytes) {
         void* d = nullptr;
@@ -1639,6 +1728,10 @@ bool PlainModel::load_qwen(std::string& err) {
         !dev(&logits_, T * (uint64_t) n_vocab_ * 4) || (has_mtp_ && !dev(&mtp_h_, T * N * 4))) {
         err = "plain model: no VRAM for the window's buffers";
         return false;
+    }
+    if (sparse_qsa_ && (!dev(&qsa_raw_, T * 128 * 4) || !dev(&qsa_query_, T * 512 * 4) ||
+        !dev(&qsa_scores_, T * (uint64_t) (opt_.max_cells / 4 + 1) * 4) || !dev(&qsa_ids_, T * 2052 * 4))) {
+        err = "plain model: no VRAM for the QSA window buffers"; return false;
     }
     if (loop && (!dev(&g_hs_, T * 2 * N * 4) || !dev(&g_mixes_, T * 8 * 4) ||
                  !dev(&g_post_, T * 2 * 4) || !dev(&g_comb_, T * 4 * 4) || !dev(&g_y_, T * N * 4))) {
@@ -1762,6 +1855,12 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     take(b.kcur, U * NKV * HD * 4); take(b.vcur, U * NKV * HD * 4); take(b.attn, U * NH * HD * 4);
     take(b.attn32, U * NH * HD * 4);
     take(b.steps, U * k::kStepCount * 4); take(b.pos_q, U * NH * 4); take(b.pos_k, U * NKV * 4);
+    if (sparse_qsa_) {
+        const uint64_t rows = std::min<uint64_t>(U, 64);
+        take(b.qsa_raw, U * 128 * 4); take(b.qsa_query, U * 512 * 4);
+        take(b.qsa_scores, rows * (uint64_t) (opt_.max_cells / 4 + 1) * 4);
+        take(b.qsa_ids, rows * 2052 * 4);
+    }
     take(b.rlog, U * E * 4); take(b.ids, TK * 4); take(b.w, TK * 4); take(b.shared, U * N * 4);
     take(b.sh_g, (U + 4) * 4); take(b.sh_gate, U * FS * 4); take(b.sh_up, U * FS * 4);
     // the FP16 path's: the routed rows and the SwiGLU in FP16, kGroup experts' FP16 weights, the down product's rows
@@ -2716,6 +2815,7 @@ k::QsaAttnPools PlainModel::kv_pools(size_t a, int slot) const {
     if (slot < 0 && kv_streamed(a)) {   // the streamed layer: the host copy and the trailing cells the ring holds
         pools.host = kv_host_[a];
         pools.resident = (int32_t) kv_resident_cells_;
+        pools.sparse_host = sparse_qsa_;
     }
     return pools;
 }
@@ -3507,6 +3607,13 @@ std::vector<PlainModel::StatePart> PlainModel::state_parts(int64_t tokens, bool 
         parts.push_back({ss ? ss->gdn_state[g] : gdn_state_[g], state_bytes_, 4});
         parts.push_back({ss ? ss->gdn_conv[g] : gdn_conv_[g], conv_bytes_, 4});
     }
+    for (const auto& ib : qsa_index_) {
+        if (!ib.tail) continue;
+        parts.push_back({ib.tail, size_t(3) * 128 * 4, 4});
+        parts.push_back({ib.dead, size_t(128) * 4, 4});
+        parts.push_back({ib.pooled, (size_t) (tokens / 4 + 1) * 128 * 4, 4});
+        parts.push_back({ib.block_pos, 4, 4});
+    }
     if (recurrent_only && ring_pages_ == 0) return parts;
     if (glm_) {   // per DSA block: its latent and indexer rows a cell, the pools that the cells close
         const int64_t KVR = s.kv_lora_rank, ID = s.idx_key_length;
@@ -3855,6 +3962,12 @@ bool PlainModel::reset(std::string& err) {
         for (const StatePart& p : kv_planes(i, -1, n))
             ok = ok && strata::gpu::memset(p.dev, 0, p.bytes);
     }
+    for (const auto& ib : qsa_index_) {
+        if (!ib.tail) continue;
+        ok = ok && strata::gpu::memset(ib.tail, 0, size_t(3) * 128 * 4) && strata::gpu::memset(ib.dead, 0, size_t(128) * 4) &&
+             strata::gpu::memset(ib.pooled, 0, (size_t) (opt_.max_cells / 4 + 1) * 128 * 4) &&
+             strata::gpu::memset(ib.block_pos, 0, 4);
+    }
     ring_end_ = ring_from_ = 0;
     cur_ = -1;
     drafts_.clear();
@@ -4016,14 +4129,33 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         for (int t = 0; t < T; ++t)
             kv_append_cells((size_t) a, rows ? row_slot_[(size_t) t] : -1, step_ + (size_t) t * k::kStepCount, 1,
                             kcur_ + (size_t) t * NKV * HD, vc + (size_t) t * NKV * HD, cs);
-        if (rows)   // each row over its own slot's cells
+        if (sparse_qsa_ && (size_t) a < qsa_weights_.size() && qsa_weights_[(size_t) a].q.data) {
+            const QsaWeights& w = qsa_weights_[(size_t) a];
+            const auto& ib = qsa_index_[(size_t) a];
+            proj(w.q, hn_, qsa_query_, T, false);
+            proj(w.k, hn_, qsa_raw_, T, false);
+            k::native_qsa_rms_norm_rope(qsa_query_, 128, w.q_norm, qsa_query_, T * 4, 128, 64, eps, rs, pos_k, cs, true);
+            for (int t = 0; t < T; ++t) {
+                k::native_qsa_indexer_append(qsa_raw_ + (size_t) t * 128, step_ + (size_t) t * k::kStepCount,
+                                             0, w.k_norm, eps, ib, qs, opt_.max_cells, rs, cs, w.block_norm, true);
+                if (t < T - 1 && t < (int) qsa_tail_snap_[(size_t) a].size() &&
+                    !strata::gpu::copy_async(qsa_tail_snap_[(size_t) a][(size_t) t], ib.tail, size_t(3) * 128 * 4, cs)) {
+                    err = "plain model: copying the QSA tail"; return false;
+                }
+            }
+            const int64_t blocks = opt_.max_cells / 4 + 1;
+            k::qsa_block_scores(ib.pooled, ib.dead, qsa_query_, step_, T, blocks, qs, qsa_scores_, cs);
+            k::qsa_block_topk_with_current(qsa_scores_, step_, T, blocks, 2052, qs, qsa_ids_, cs);
+            k::qsa_decode_attn_batch(qcur_, kv_pools((size_t) a), qsa_ids_, step_, 2052, qs, attn_scratch_, attn_, T, cs);
+        } else if (rows) {   // each row over its own slot's cells
             for (int t = 0; t < T; ++t)
                 k::qsa_dense_attn_batch(qcur_ + (size_t) t * NH * HD, kv_pools((size_t) a, row_slot_[(size_t) t]),
                                         step_ + (size_t) t * k::kStepCount, opt_.max_cells, qs, attn_scratch_,
                                         attn_ + (size_t) t * NH * HD, 1, cs, window_of(b));
-        else
+        } else {
             k::qsa_dense_attn_batch(qcur_, kv_pools((size_t) a), step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs,
                                     window_of(b));
+        }
         if (opt_.kv_tcq != 0) k::fwht256_signed(attn_, (int64_t) T * NH, true, cs);
         else if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
         if (has_gate_) {
@@ -5466,7 +5598,8 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
 }
 
 bool PlainModel::pipelined_spec() const {
-    return opt_.pipeline_windows >= 2 && root_ != this && root_->next_.size() == 1 && has_mtp_ && n_mtp_ >= 1 && !glm_ &&
+    return !root_->sparse_qsa_ && opt_.pipeline_windows >= 2 && root_ != this && root_->next_.size() == 1 &&
+           has_mtp_ && n_mtp_ >= 1 && !glm_ &&
            root_->pl_ready_;
 }
 
@@ -5749,6 +5882,17 @@ bool PlainModel::rollback(int n, std::string& err) {
                 err = std::string("plain model: restoring the recurrent states: ") + strata::gpu::last_error();
                 return false;
             }
+    }
+    for (PlainModel* st : chain()) {
+        const OnDevice on(st->dev_);
+        for (size_t a = 0; a < st->qsa_index_.size(); ++a) {
+            if (!st->qsa_index_[a].tail) continue;
+            if (n < 0 || (size_t) n >= st->qsa_tail_snap_[a].size() ||
+                !strata::gpu::copy_async(st->qsa_index_[a].tail, st->qsa_tail_snap_[a][(size_t) n], size_t(3) * 128 * 4,
+                                         st->cs_)) {
+                err = "plain model: restoring the QSA tail"; return false;
+            }
+        }
     }
     // the CPU tail's recurrent layers ran the window's rows too: their copies go back as the GPU stages' do
     if (cpu_tail_ != nullptr && cpu_tail_->recurrent() && !cpu_tail_->rollback(n, err)) return false;

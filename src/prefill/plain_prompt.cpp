@@ -31,6 +31,8 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -1416,15 +1418,40 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     // the prompt attention (prompt_attn: K and V read once a block of queries), else the decode's
                     // kernel: every query reads the cells up to its own; the grid as wide as the chunk's last context (not
                     // the cache's capacity: no graph holds it), as many queries a launch as the scratch takes
-                    const int64_t cap = std::min<int64_t>(opt_.max_cells, pa + T);
-                    const int64_t per_q = (int64_t) k::qsa_decode_attn_scratch_floats(cap, qs);
-                    const int64_t nq_max = std::max<int64_t>(1, std::min<int64_t>((int64_t) opt_.max_t * attn_scratch_floats_ / per_q, 4096));
-                    const bool batched =
-                        prompt_attn_on && k::prompt_attn(P.qcur, pools, pa, T, qs, P.attn, cs, window_of(b));
-                    for (int64_t t = 0; !batched && t < T; t += nq_max) {
-                        const int nq = (int) std::min<int64_t>(nq_max, T - t);
-                        k::qsa_dense_attn_batch(P.qcur + t * NH * HD, pools, P.steps + t * k::kStepCount, cap, qs,
-                                                attn_scratch_, P.attn + t * NH * HD, nq, cs, window_of(b));
+                    if (sparse_qsa_ && (size_t) a < qsa_weights_.size() && qsa_weights_[(size_t) a].q.data) {
+                        const QsaWeights& w = qsa_weights_[(size_t) a];
+                        const auto& ib = qsa_index_[(size_t) a];
+                        k::f32_gemm_rows(P.hn, N, static_cast<const float*>(w.q.data), P.qsa_query, 512, N, 512, T, cs);
+                        k::f32_gemm_rows(P.hn, N, static_cast<const float*>(w.k.data), P.qsa_raw, 128, N, 128, T, cs);
+                        for (int64_t t = 0; t < T; t += 65535 / 4)
+                            k::native_qsa_rms_norm_rope(P.qsa_query + t * 512, 128, w.q_norm,
+                                                        P.qsa_query + t * 512, (int) (std::min<int64_t>(65535 / 4, T - t) * 4),
+                                                        128, 64, eps, rope_of(b), P.pos_k + t * 4, cs, true);
+                        k::native_qsa_indexer_append_batch(P.qsa_raw, T, pa, 0, w.k_norm, eps, ib, qs,
+                                                           opt_.max_cells, rope_of(b), cs, w.block_norm, true);
+                        const int64_t blocks = opt_.max_cells / 4 + 1;
+                        const int64_t scratch = (int64_t) k::qsa_decode_attn_scratch_floats(2052, qs);
+                        const int64_t per = std::max<int64_t>(1, std::min<int64_t>(64, opt_.max_t * attn_scratch_floats_ / scratch));
+                        for (int64_t t = 0; t < T; t += per) {
+                            const int64_t nq = std::min<int64_t>(per, T - t);
+                            int32_t* steps = P.steps + t * k::kStepCount;
+                            k::qsa_block_scores(ib.pooled, ib.dead, P.qsa_query + t * 512, steps, nq, blocks, qs,
+                                                P.qsa_scores, cs);
+                            k::qsa_block_topk_with_current(P.qsa_scores, steps, nq, blocks, 2052, qs, P.qsa_ids, cs);
+                            k::qsa_decode_attn_batch(P.qcur + t * NH * HD, pools, P.qsa_ids, steps, 2052, qs,
+                                                     attn_scratch_, P.attn + t * NH * HD, nq, cs);
+                        }
+                    } else {
+                        const int64_t cap = std::min<int64_t>(opt_.max_cells, pa + T);
+                        const int64_t per_q = (int64_t) k::qsa_decode_attn_scratch_floats(cap, qs);
+                        const int64_t nq_max = std::max<int64_t>(1, std::min<int64_t>((int64_t) opt_.max_t * attn_scratch_floats_ / per_q, 4096));
+                        const bool batched =
+                            prompt_attn_on && k::prompt_attn(P.qcur, pools, pa, T, qs, P.attn, cs, window_of(b));
+                        for (int64_t t = 0; !batched && t < T; t += nq_max) {
+                            const int nq = (int) std::min<int64_t>(nq_max, T - t);
+                            k::qsa_dense_attn_batch(P.qcur + t * NH * HD, pools, P.steps + t * k::kStepCount, cap, qs,
+                                                    attn_scratch_, P.attn + t * NH * HD, nq, cs, window_of(b));
+                        }
                     }
                     if (opt_.kv_tcq != 0) k::fwht256_signed(P.attn, T * NH, true, cs);
                     else if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(P.attn, T * NH, cs);

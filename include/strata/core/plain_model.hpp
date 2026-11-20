@@ -725,6 +725,18 @@ private:
         const float* sh_gate_inp = nullptr;                   // F32 [n_embd]
         W sh_gate, sh_up, sh_down;                            // the shared expert, or qwen35's dense FFN
     };
+    // QSA indexers are per visit, even when the loop reuses the attention block's ordinary weights.
+    struct QsaWeights {
+        W q, k;
+        const float *q_norm = nullptr, *k_norm = nullptr, *block_norm = nullptr;
+    };
+    bool sparse_qsa_ = false;
+    std::vector<QsaWeights> qsa_weights_;
+    std::vector<strata::kernels::QsaIndexerBuffers> qsa_index_;
+    std::vector<std::vector<float*>> qsa_tail_snap_;
+    float *qsa_raw_ = nullptr, *qsa_query_ = nullptr, *qsa_scores_ = nullptr;
+    int32_t* qsa_ids_ = nullptr;
+
     /// stream_blocks: each block's matrices in the mapped file (W::data set as the block is bound), and their source
     struct Streamed {
         W* w = nullptr;
@@ -892,6 +904,8 @@ private:
         float *qfull = nullptr, *qcur = nullptr, *kraw = nullptr, *kcur = nullptr, *vcur = nullptr, *attn = nullptr,
               *attn32 = nullptr;
         int32_t *steps = nullptr, *pos_q = nullptr, *pos_k = nullptr;
+        float *qsa_raw = nullptr, *qsa_query = nullptr, *qsa_scores = nullptr;
+        int32_t* qsa_ids = nullptr;
         float *rlog = nullptr, *w = nullptr, *shared = nullptr, *sh_g = nullptr, *sh_gate = nullptr, *sh_up = nullptr;
         int32_t* ids = nullptr;
         uint16_t* xs16 = nullptr;          ///< the routed rows grouped by expert, FP16 [T * k, n_embd]
