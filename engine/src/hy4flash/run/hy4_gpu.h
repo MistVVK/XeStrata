@@ -92,6 +92,9 @@ inline void gpu_launch(void (*k)(KP...), dim3 g, dim3 b, size_t shmem, cudaStrea
 
 // full-mask warp shuffles (every call site is converged)
 template <class T>
+__device__ __forceinline__ T hy4_shfl(T v, int src, int w = 32) { return __shfl_sync(0xffffffffu, v, src, w); }
+#define __shfl(...) hy4_shfl(__VA_ARGS__)
+template <class T>
 __device__ __forceinline__ T hy4_shfl_xor(T v, int o, int w = 32) { return __shfl_xor_sync(0xffffffffu, v, o, w); }
 #define __shfl_xor(...) hy4_shfl_xor(__VA_ARGS__)
 

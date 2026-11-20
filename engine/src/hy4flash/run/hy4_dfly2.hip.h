@@ -677,7 +677,7 @@ struct DFly2 {
                     hipLaunchKernelGGL(k_dfly_corr, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), (const float*)Dn, wf(pf + "confidence_head.proj.weight"),
                                        wf(pf + "confidence_head.proj.bias"), hc_h, d_conf + j);
                     if (N > 0) {
-                        hipLaunchKernelGGL(k_dfly_cand_score, dim3(N), dim3(32), 0, st, (const uint8_t*)lmw, (const int32_t*)(d_cand + (size_t)(j - 1) * N), (const __half*)hc_h, d_cscore);
+                        hipLaunchKernelGGL(k_dfly_cand_score, dim3((N + 7) / 8), dim3(256), 0, st, (const uint8_t*)lmw, (const int32_t*)(d_cand + (size_t)(j - 1) * N), (const __half*)hc_h, d_cscore, N);
                         hipLaunchKernelGGL(k_dfly_cand_argmax, dim3(1), dim3(1024), 0, st, (const float*)d_cscore, (const int32_t*)(d_cand + (size_t)(j - 1) * N), N, d_chain + j);
                     } else {
                         linear_h(st, lm.fmt, lmw, (int)lm.rows(), (int)lm.cols(), hc_h, r.logits, 1);
