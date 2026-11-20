@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
     std::string parity_list;
     bool det_flag = true, want_margins = false;
     int ab_rounds = 0, trace_m = 0;
-    bool ab_sab = false, alloc_only = false, knobs16 = false;
+    bool ab_sab = false, alloc_only = false, knobs16 = false, dfly_warm = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nxt = [&]() {
@@ -147,6 +147,7 @@ int main(int argc, char** argv) {
         else if (a == "--ab-sab") ab_sab = true;
         else if (a == "--dfly-alloc-only") alloc_only = true;
         else if (a == "--knobs16") knobs16 = true;
+        else if (a == "--dfly-warm") dfly_warm = true;
         else if (a == "--trace-m") trace_m = atoi(nxt().c_str());
         else if (a == "--mla-blocks") g_mla_target_blocks = atoi(nxt().c_str());
         else if (a == "--spec-exact") scfg.exact = atoi(nxt().c_str()) != 0;
@@ -582,6 +583,13 @@ int main(int argc, char** argv) {
         {
             const float* lg = &hl[(size_t)(hl.size() / V - 1) * V];
             next = (int)(std::max_element(lg, lg + V) - lg);
+        }
+        if (dfly_warm && df.ok) {
+            // test: run the drafter once (all stages) before the plain decode, to compare plain decode with / without the drafter's kernels having run
+            int yy[9] = {};
+            float cc[9] = {};
+            df.rv = 256;
+            if (!df.draft(T0, next, 7, yy, cc)) fprintf(stderr, "dfly warm-up draft refused\n");
         }
         std::string gen_ids;
         double t1 = now_s();

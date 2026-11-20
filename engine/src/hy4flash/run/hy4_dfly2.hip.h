@@ -302,14 +302,14 @@ struct DFly2 {
                 dcache = shadow[d];
             }
             hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + std::to_string(d) + ".input_layernorm.weight"), (float*)nullptr, hn, HID, c.rms_eps);
-            r.lin(pa + ".q_a_proj.weight", hn, F1, B);  // [B][1024]
+            if (!(skip & 32)) r.lin(pa + ".q_a_proj.weight", hn, F1, B);  // [B][1024]
             hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps);
-            r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);  // [B][8192]
-            r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);  // [B][576]
-            mla_write_kv(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, a, 0, (float)c.theta_sparse, c.rms_eps);
+            if (!(skip & 32)) r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);  // [B][8192]
+            if (!(skip & 32)) r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);  // [B][576]
+            if (!(skip & 8)) mla_write_kv(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, a, 0, (float)c.theta_sparse, c.rms_eps);
             const int kvfmt = r.ti(pa + ".kv_b_proj.weight").fmt;
-            mla_prep_q_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), F2, qa_h, B, 32, a, (float)c.theta_sparse);
-            r.lin(pa + ".linear_gate.weight", hn, F4, B);  // [B][8192]
+            if (!(skip & 8)) mla_prep_q_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), F2, qa_h, B, 32, a, (float)c.theta_sparse);
+            if (!(skip & 32)) r.lin(pa + ".linear_gate.weight", hn, F4, B);  // [B][8192]
             MlaAttnArgs ma;
             ma.M = B;
             ma.NH = 32;
@@ -324,18 +324,18 @@ struct DFly2 {
             } else {
                 ma.mode = MLA_CAUSAL;
             }
-            r.ensure_mla_ws(mla_workspace_bytes(ma));
-            mla_attend(st, qa_h, dcache, wf(pa + ".learnable_sink_param"), ctx_h, ma, r.mla_ws, r.mla_ws_bytes);
-            mla_vup_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), ctx_h, F4, o_h, B, 32);
-            r.lin(pa + ".o_proj.weight", o_h, F1, B);  // [B][3072]
+            if (!(skip & 64)) r.ensure_mla_ws(mla_workspace_bytes(ma));
+            if (!(skip & 8)) mla_attend(st, qa_h, dcache, wf(pa + ".learnable_sink_param"), ctx_h, ma, r.mla_ws, r.mla_ws_bytes);
+            if (!(skip & 8)) mla_vup_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), ctx_h, F4, o_h, B, 32);
+            if (!(skip & 32)) r.lin(pa + ".o_proj.weight", o_h, F1, B);  // [B][3072]
             hipLaunchKernelGGL(k_dfly_rms_resid, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".post_proj_norm.weight"), H, c.rms_eps);
             // dense SwiGLU
             hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + std::to_string(d) + ".post_attention_layernorm.weight"), (float*)nullptr, hn, HID, c.rms_eps);
-            r.lin(pm + ".gate_proj.weight", hn, F1, B);  // [B][9216]
-            r.lin(pm + ".up_proj.weight", hn, F2, B);
+            if (!(skip & 16)) r.lin(pm + ".gate_proj.weight", hn, F1, B);  // [B][9216]
+            if (!(skip & 16)) r.lin(pm + ".up_proj.weight", hn, F2, B);
             const size_t n9 = (size_t)B * 9216;
             hipLaunchKernelGGL(k_swiglu_h, dim3((n9 + 255) / 256), dim3(256), 0, st, (const float*)F1, (const float*)F2, mlp_h, n9);
-            r.lin(pm + ".down_proj.weight", mlp_h, F3, B);  // [B][3072]
+            if (!(skip & 16)) r.lin(pm + ".down_proj.weight", mlp_h, F3, B);  // [B][3072]
             hipLaunchKernelGGL(k_add_inplace, dim3(((size_t)B * HID + 255) / 256), dim3(256), 0, st, H, (const float*)F3, (size_t)B * HID);
         }
         hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)H, wf(pf + "final_norm.weight"), Hf, Hf_h, HID, c.rms_eps);
