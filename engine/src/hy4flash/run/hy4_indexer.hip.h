@@ -26,18 +26,28 @@ __device__ __forceinline__ float bsum128(float v, float* sh) {  // block of 128 
 }
 
 // store iv, ig (fp32 [T][128] each) of tokens p0..p0+T-1 into the fp16 cache rows
-__global__ void k_idx_store(const float* __restrict__ iv, const float* __restrict__ ig, __half* __restrict__ ivg, int p0) {
+__global__ void k_idx_store(const float* __restrict__ iv, const float* __restrict__ ig, __half* __restrict__ ivg, int p0, const int* __restrict__ p0_dev = nullptr) {
     int t = blockIdx.x, d = threadIdx.x;  // 128 threads
-    ivg[(size_t)(p0 + t) * 256 + d] = __float2half(iv[(size_t)t * 128 + d]);
-    ivg[(size_t)(p0 + t) * 256 + 128 + d] = __float2half(ig[(size_t)t * 128 + d]);
+    const int p0_u = p0_dev ? *p0_dev : p0;
+    ivg[(size_t)(p0_u + t) * 256 + d] = __float2half(iv[(size_t)t * 128 + d]);
+    ivg[(size_t)(p0_u + t) * 256 + 128 + d] = __float2half(ig[(size_t)t * 128 + d]);
 }
 
 // pool completed groups g in [g_lo, g_lo + n): softmax over the 4 tokens of (ig + ape), weighted sum of iv, rmsnorm(key_norm), rope at 4g on dims 64..127
 __global__ void k_idx_pool(const __half* __restrict__ ivg, const float* __restrict__ ape /*[4][128]*/, const float* __restrict__ knw /*[128]*/, __half* __restrict__ pooled, int g_lo, float theta,
-                           float eps) {
+                           float eps, const int* __restrict__ p0_dev = nullptr, int T_pool = 0) {
     __shared__ float sh[4];
     __shared__ float sv[128];
-    int g = g_lo + blockIdx.x, d = threadIdx.x;
+    int g;
+    if (p0_dev) {
+        const int p0_u = *p0_dev;
+        const int glo = p0_u / 4, ghi = (p0_u + T_pool) / 4 - 1;
+        g = glo + (int)blockIdx.x;
+        if (g > ghi) return;
+    } else {
+        g = g_lo + (int)blockIdx.x;
+    }
+    int d = threadIdx.x;
     float l[4], mx = -3.0e38f;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -68,14 +78,15 @@ __global__ void k_idx_pool(const __half* __restrict__ ivg, const float* __restri
 }
 
 // iq: fp32 [T][2048] (16 heads x 128) -> rope on dims 64..127 of every head at position p0+t -> half [T][2048]
-__global__ void k_idx_q_rope(const float* __restrict__ iq, __half* __restrict__ out, int p0, float theta) {
+__global__ void k_idx_q_rope(const float* __restrict__ iq, __half* __restrict__ out, int p0, float theta, const int* __restrict__ p0_dev = nullptr) {
     int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;  // 128 threads
+    const int p0_u = p0_dev ? *p0_dev : p0;
     const float* q = iq + (size_t)t * 2048 + h * 128;
     float v = q[d];
     if (d >= 64) {
         int i = (d - 64) >> 1;
         float x0 = q[64 + 2 * i], x1 = q[64 + 2 * i + 1], o0, o1;
-        rope_pair_i(x0, x1, p0 + t, i, theta, o0, o1);
+        rope_pair_i(x0, x1, p0_u + t, i, theta, o0, o1);
         v = (d & 1) ? o1 : o0;
     }
     out[(size_t)t * 2048 + h * 128 + d] = __float2half(v);
@@ -83,15 +94,18 @@ __global__ void k_idx_q_rope(const float* __restrict__ iq, __half* __restrict__ 
 
 // score[t][g] = sum_h relu(iq[t][h] . pooled[g]) * hw[t][h] * hscale, for g < grp(t) = (p0+t)/4, else -inf.  block (64 pools, 1 token), 64 threads.
 __global__ void __launch_bounds__(64) k_idx_score(const __half* __restrict__ iq, const float* __restrict__ hw, const __half* __restrict__ pooled, float* __restrict__ score, int p0, int G, int ldS,
-                                                  float hscale) {
+                                                  float hscale, const int* __restrict__ p0_dev = nullptr, const int* __restrict__ G_dev = nullptr) {
+    const int G_u = G_dev ? *G_dev : G;
+    if ((int)blockIdx.x * 64 >= G_u) return;
+    const int p0_u = p0_dev ? *p0_dev : p0;
     __shared__ float sq[16 * 128];
     __shared__ float shw[16];
     int t = blockIdx.y, g = blockIdx.x * 64 + threadIdx.x;
     for (int i = threadIdx.x; i < 16 * 128; i += 64) sq[i] = __half2float(iq[(size_t)t * 2048 + i]);
     if (threadIdx.x < 16) shw[threadIdx.x] = hw[(size_t)t * 16 + threadIdx.x] * hscale;
     __syncthreads();
-    if (g >= G) return;
-    int grp = (p0 + t) >> 2;
+    if (g >= G_u) return;
+    int grp = (p0_u + t) >> 2;
     float res;
     if (g >= grp) {
         res = -INFINITY;
@@ -122,13 +136,14 @@ __device__ __forceinline__ uint32_t f2key(float f) {
 
 // per token: select the top n_top pools among g < grp (all of them if grp <= n_top), emit the key list (cache slots = positions):
 // the 4 tokens of each selected pool, then the own group's tokens 4*grp..t.  keys [T][kmax], nkeys [T].  256 threads.
-__global__ void k_idx_select(const float* __restrict__ score, int ldS, int p0, int n_top, int kmax, int32_t* __restrict__ keys, int32_t* __restrict__ nkeys) {
+__global__ void k_idx_select(const float* __restrict__ score, int ldS, int p0, int n_top, int kmax, int32_t* __restrict__ keys, int32_t* __restrict__ nkeys,
+                             const int* __restrict__ p0_dev = nullptr) {
     __shared__ int red[8];
     __shared__ int cnt_sel;
     __shared__ uint32_t thr_s;
     __shared__ int n_gt_s;
     int t = blockIdx.x;
-    int pos = p0 + t;
+    int pos = (p0_dev ? *p0_dev : p0) + t;
     int grp = pos >> 2;
     int32_t* kl = keys + (size_t)t * kmax;
     if (grp <= n_top) {  // everything before the own group plus the own group: causal

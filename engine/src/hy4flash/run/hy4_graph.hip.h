@@ -4,6 +4,7 @@
 #include "hy4_gpu.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -95,6 +96,7 @@ public:
     // (all of it, once) when the context passes kv_cap, so short chats in a 128K context run at VRAM speed. kv_cap == 0: not growable.
     int kv_cap = 0;
     bool kv_moved = false;
+    int mla_ws_gen = 0;
     void ensure_mla_ws(size_t need) {
         if (need <= mla_ws_bytes) return;
         HCK(hipStreamSynchronize(st));
@@ -102,6 +104,10 @@ public:
         mla_ws_bytes = need + (need >> 2);
         HCK(hipMalloc(&mla_ws, mla_ws_bytes));
         if (getenv("HY4_POISON")) HCK(hipMemset(mla_ws, 0xFF, mla_ws_bytes));
+        ++mla_ws_gen;
+#if HY4_CUDA
+        cg_clear();
+#endif
     }
     // host side engram
     EngramMeta emeta;
@@ -273,9 +279,9 @@ public:
                     hp[e].dn_off = er.dn_off;
                     hp[e].gu_code = er.gu_code;
                     hp[e].dn_code = er.dn_code;
-                    if (er.tier == 3) {
+                    if (er.tier == 3 || er.tier == 4) {
                         hp[e].body_off = 0;
-                        hp[e].pad = 1;  // cold expert: computed by the CPU pool from the SSD
+                        hp[e].pad = 1;  // cold expert (SSD) or peer-GPU resident: skipped by GPU 0 prefill streaming
                     } else if (er.tier == 2) {
                         if (in_group[e]) {
                             hp[e].body_off = (uint64_t)(uintptr_t)(d_scratch[b] + eoff[e]) - (uint64_t)(uintptr_t)g.d_sec4;
@@ -336,6 +342,91 @@ public:
         return &pf_groups[lo][k - pf_layer_first[lo]];
     }
     double t_cpu_wait = 0;  // host time spent waiting for the CPU experts after the GPU work was queued (layer sum)
+
+    // Multi-GPU expert-parallel peer state (secondary GPUs holding hot experts via --gpus 0,1,...)
+    struct PeerRun {
+        int dev = 0;
+        hipStream_t st = nullptr;
+        hipEvent_t ev_in = nullptr, ev_out = nullptr;
+        ExpertDev* d_experts = nullptr;
+        __half* z_h = nullptr;
+        int32_t* idx = nullptr;
+        float *w = nullptr, *zout = nullptr;
+        void* moe_ws = nullptr;
+        float* d_zpeer0 = nullptr;  // on primary GPU 0
+    };
+    std::vector<PeerRun> peer_runs;
+    void peers_launch(int il, int T) {
+#if HY4_CUDA
+        if (peer_runs.empty()) return;
+        const size_t nz = (size_t)T * 1536;
+        for (size_t p = 0; p < peer_runs.size(); ++p) {
+            PeerRun& pr = peer_runs[p];
+            HCK(cudaEventRecord(pr.ev_in, st));
+            HCK(cudaSetDevice(pr.dev));
+            HCK(cudaStreamWaitEvent(pr.st, pr.ev_in, 0));
+            HCK(cudaMemcpyPeerAsync(pr.z_h, pr.dev, z_h, g.primary_gpu, nz * 2, pr.st));
+            HCK(cudaMemcpyPeerAsync(pr.idx, pr.dev, moe_idx, g.primary_gpu, (size_t)T * 16 * 4, pr.st));
+            HCK(cudaMemcpyPeerAsync(pr.w, pr.dev, moe_w, g.primary_gpu, (size_t)T * 16 * 4, pr.st));
+            moe_experts(pr.st, g.peers[p].d_sec4, pr.d_experts + (size_t)(il - 1) * 512, pr.z_h, pr.idx, pr.w, pr.zout, T, pr.moe_ws);
+            HCK(cudaMemcpyPeerAsync(pr.d_zpeer0, g.primary_gpu, pr.zout, pr.dev, nz * 4, pr.st));
+            HCK(cudaEventRecord(pr.ev_out, pr.st));
+        }
+        HCK(cudaSetDevice(g.primary_gpu));
+#else
+        (void)il; (void)T;
+#endif
+    }
+    void peers_gather(int T) {
+#if HY4_CUDA
+        if (peer_runs.empty()) return;
+        const size_t nz = (size_t)T * 1536;
+        for (auto& pr : peer_runs) {
+            HCK(cudaStreamWaitEvent(st, pr.ev_out, 0));
+            hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)pr.d_zpeer0, nz);
+        }
+#else
+        (void)T;
+#endif
+    }
+
+    // CUDA Graph capture & replay for decode (M=1) and verify (M=2..8): collapses ~2,200 tiny launches into 1-3 graph launches (all-VRAM) or 84 launches (hybrid)
+    struct DevStepArgs { int p0; int idx_G; };
+    DevStepArgs *h_step = nullptr, *d_step = nullptr;
+    int32_t* h_ids = nullptr;  // pinned staging for token ids [<= 16]
+    bool cuda_graph_on = false;
+    bool capturing = false;
+    int cap_score_grid = 0;
+#if HY4_CUDA
+    struct CgKey {
+        int T, use_list, s_causal, s_swa, score_grid, dfly_cap, route_now, nof, kv_moved, engram_ready, hyb, n_peers;
+        int lin_gemv_max, moe_dec_max, int8_mma, dp4a, mla_ws_gen;
+        bool operator==(const CgKey& o) const { return std::memcmp(this, &o, sizeof(CgKey)) == 0; }
+    };
+    struct CgEntry {
+        CgKey key;
+        cudaGraphExec_t g_l0 = nullptr;       // embed + L0 (or all 42 layers when !engram_ready && !hyb && n_peers==0)
+        cudaGraphExec_t g_l1_10 = nullptr;    // L1 .. emeta.layers[1]-1 (when engram_ready && !hyb && n_peers==0)
+        cudaGraphExec_t g_l11_41 = nullptr;   // emeta.layers[1] .. 41 (when engram_ready && !hyb && n_peers==0)
+        cudaGraphExec_t g_pre[41] = {};       // hybrid / multi-GPU: per-MoE-layer pre segment
+        cudaGraphExec_t g_gpuexp[41] = {};    // hybrid / multi-GPU: per-MoE-layer GPU-expert + shared segment
+        cudaGraphExec_t g_tail_last = nullptr; // hybrid / multi-GPU: layer 41 post tail
+        std::vector<std::array<cudaGraphExec_t, 41>> g_peers;  // multi-GPU: per-peer moe_experts graphs
+        void destroy() {
+            auto d = [](cudaGraphExec_t& e) { if (e) { (void)cudaGraphExecDestroy(e); e = nullptr; } };
+            d(g_l0); d(g_l1_10); d(g_l11_41); d(g_tail_last);
+            for (int i = 0; i < 41; ++i) { d(g_pre[i]); d(g_gpuexp[i]); }
+            for (auto& arr : g_peers) for (int i = 0; i < 41; ++i) d(arr[i]);
+            g_peers.clear();
+        }
+    };
+    std::vector<CgEntry> cg_cache;
+    void cg_clear() {
+        for (auto& e : cg_cache) e.destroy();
+        cg_cache.clear();
+    }
+    ~Runner() { cg_clear(); }
+#endif
 
     Runner(GpuModel& gm, int max_ctx_, int max_chunk) : g(gm), c(gm.man.c), max_ctx(max_ctx_), Tc(max_chunk) {}
 
@@ -447,6 +538,16 @@ public:
     bool route_now = false;
     ExpertDev* slot_rec = nullptr;  // [16] ExpertDev records of the chosen experts (one-token decode path)
     LinMulti lm_eng[4];             // per engram module: key_projs 0..3 + value_proj for one token
+    std::vector<LinMulti> lm_attn;  // per layer: q_a + kv_a + linear_gate (T <= 8, same cur_h)
+    std::vector<LinMulti> lm_sh;    // per MoE layer (il-1): shared_experts.gate + up (T <= 8, same cur_h)
+    LinMulti lm_mlp0;               // layer 0: gate_proj + up_proj (T <= 8, same cur_h)
+    bool lm_ok_m(int T) const {
+        if (T > 8 || T > skd::lin_gemv_max_m()) return false;
+#if HY4_CUDA && HY4_MMA
+        if (skd::lin_dp4a()) return false;
+#endif
+        return true;
+    }
     void tune_init() {
         const char* e = getenv("HY4_TUNE");
         tune = e ? atoi(e) : TUNE_DEFAULT;
@@ -471,6 +572,44 @@ public:
                     N[j] = (int)t.rows();
                 }
                 if (ok) lm_eng[mo] = linear_multi_build(fmt, K, 5, W, Y, N);
+            }
+        }
+        // Fuse same-input, same-format projections for decode/verify (T <= 8): q_a+kv_a+linear_gate, shared gate+up, L0 gate+up
+        lm_attn.resize(c.n_layers);
+        for (int il = 0; il < c.n_layers; ++il) {
+            const std::string pa = L(il) + ".self_attn";
+            const std::string nms[3] = {pa + ".q_a_proj.weight", pa + ".kv_a_proj_with_mqa.weight", pa + ".linear_gate.weight"};
+            const void* W[3]; float* Y[3] = {F1, F1 + 8192, F3}; int N[3];
+            bool ok = true; int fmt = -1, K = 0;
+            for (int j = 0; j < 3; ++j) {
+                const TInfo& t = ti(nms[j]);
+                if (j == 0) { fmt = t.fmt; K = (int)t.cols(); }
+                ok = ok && t.fmt == fmt && (int)t.cols() == K && t.fmt != FMT_Q8ROW;
+                W[j] = tw(nms[j]); N[j] = (int)t.rows();
+            }
+            if (ok) lm_attn[il] = linear_multi_build(fmt, K, 3, W, Y, N);
+        }
+        lm_sh.resize(c.n_layers > 1 ? c.n_layers - 1 : 0);
+        for (int il = 1; il < c.n_layers; ++il) {
+            const std::string pm = L(il) + ".mlp";
+            const TInfo& t0 = ti(pm + ".shared_experts.gate_proj.weight");
+            const TInfo& t1 = ti(pm + ".shared_experts.up_proj.weight");
+            if (t0.fmt == t1.fmt && t0.cols() == t1.cols() && t0.fmt != FMT_Q8ROW) {
+                const void* W[2] = {tw(pm + ".shared_experts.gate_proj.weight"), tw(pm + ".shared_experts.up_proj.weight")};
+                float* Y[2] = {F1, F3};
+                int N[2] = {(int)t0.rows(), (int)t1.rows()};
+                lm_sh[il - 1] = linear_multi_build(t0.fmt, (int)t0.cols(), 2, W, Y, N);
+            }
+        }
+        {
+            const std::string pm0 = L(0) + ".mlp";
+            const TInfo& t0 = ti(pm0 + ".gate_proj.weight");
+            const TInfo& t1 = ti(pm0 + ".up_proj.weight");
+            if (t0.fmt == t1.fmt && t0.cols() == t1.cols() && t0.fmt != FMT_Q8ROW) {
+                const void* W[2] = {tw(pm0 + ".gate_proj.weight"), tw(pm0 + ".up_proj.weight")};
+                float* Y[2] = {F1, F2};
+                int N[2] = {(int)t0.rows(), (int)t1.rows()};
+                lm_mlp0 = linear_multi_build(t0.fmt, (int)t0.cols(), 2, W, Y, N);
             }
         }
         fprintf(stderr, "[tune] HY4_TUNE=%d\n", tune);
@@ -515,11 +654,44 @@ public:
                 h[i].dn_off = e.dn_off;
                 h[i].gu_code = e.gu_code;
                 h[i].dn_code = e.dn_code;
-                h[i].pad = (e.tier == 2 || e.tier == 3) ? 1 : 0;  // CPU-computed experts (resident or cold) are skipped by the GPU routing
+                h[i].pad = (e.tier >= 2) ? 1 : 0;  // CPU (2), cold-SSD (3), or peer-GPU (4) skipped by GPU 0; tier 0 (VRAM) & tier 1 (pinned host) run on GPU 0
             }
             d_experts = dalloc<ExpertDev>(41 * 512);
             HCK(hipMemcpy(d_experts, h.data(), h.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
         }
+#if HY4_CUDA
+        if (!g.peers.empty()) {
+            skd::moe_has_cpu() = 1;  // zero w.y on every GPU so partial sums add cleanly
+            peer_runs.resize(g.peers.size());
+            for (size_t p = 0; p < g.peers.size(); ++p) {
+                PeerRun& pr = peer_runs[p];
+                pr.dev = g.peers[p].dev;
+                pr.d_zpeer0 = dalloc<float>((size_t)Tc * 1536);
+                HCK(cudaEventCreateWithFlags(&pr.ev_in, cudaEventDisableTiming));
+                HCK(cudaSetDevice(pr.dev));
+                HCK(cudaStreamCreate(&pr.st));
+                HCK(cudaEventCreateWithFlags(&pr.ev_out, cudaEventDisableTiming));
+                std::vector<ExpertDev> ph(41 * 512);
+                for (int i = 0; i < 41 * 512; ++i) {
+                    const ExpertRef& e = g.peers[p].experts[i];
+                    ph[i].body_off = e.body_off;
+                    ph[i].dn_off = e.dn_off;
+                    ph[i].gu_code = e.gu_code;
+                    ph[i].dn_code = e.dn_code;
+                    ph[i].pad = (e.tier != 0) ? 1 : 0;
+                }
+                HCK(cudaMalloc(&pr.d_experts, ph.size() * sizeof(ExpertDev)));
+                HCK(cudaMemcpy(pr.d_experts, ph.data(), ph.size() * sizeof(ExpertDev), cudaMemcpyHostToDevice));
+                HCK(cudaMalloc(&pr.z_h, (size_t)Tc * 1536 * 2));
+                HCK(cudaMalloc(&pr.idx, (size_t)Tc * 16 * 4));
+                HCK(cudaMalloc(&pr.w, (size_t)Tc * 16 * 4));
+                HCK(cudaMalloc(&pr.zout, (size_t)Tc * 1536 * 4));
+                HCK(cudaMalloc(&pr.moe_ws, moe_ws_bytes(Tc)));
+            }
+            HCK(cudaSetDevice(g.primary_gpu));
+            fprintf(stderr, "[runner] multi-GPU expert-parallel active across %zu GPUs\n", 1 + peer_runs.size());
+        }
+#endif
         if (!g.cpu_mask.empty()) {
             const size_t nz = (size_t)Tc * 1536;
             HCK(hipHostMalloc((void**)&h_z, nz * 4, hipHostMallocDefault));
@@ -662,6 +834,23 @@ public:
         ep_alloc();
         if (hyb && (!getenv("HY4_PF_STREAM") || atoi(getenv("HY4_PF_STREAM")) != 0)) pf_init();  // last: the scratch takes what the other buffers left
         tune_init();
+#if HY4_CUDA
+        cuda_graph_on = getenv("HY4_CUDA_GRAPH") ? atoi(getenv("HY4_CUDA_GRAPH")) != 0 : true;
+        HCK(hipHostMalloc((void**)&h_step, sizeof(DevStepArgs), hipHostMallocDefault));
+        d_step = dalloc<DevStepArgs>(1);
+        HCK(hipHostMalloc((void**)&h_ids, 64, hipHostMallocDefault));
+        if (!hcpart) hcpart = dalloc<float>((size_t)Tc * 24 * 9);
+        {
+            const int nh_max = std::max(c.heads_swa, c.heads_sparse);
+            const size_t need_dec_ws = std::max(mla_workspace_bytes(8, nh_max, std::max(c.window + 16, index_topk + 16)),
+                                                mla_workspace_bytes(8, c.heads_sparse, max_ctx + 16));
+            ensure_mla_ws(need_dec_ws);
+        }
+#if HY4_MMA
+        if (skd::lin_int8_mma()) skd::int8_act_buf().ensure((size_t)Tc * 16384, skd::lin_int8_mma() >= 2);
+#endif
+        if (cuda_graph_on) fprintf(stderr, "[runner] CUDA Graph capture/replay enabled (HY4_CUDA_GRAPH=1)\n");
+#endif
         size_t fr = 0, tot = 0;
         HCK(hipMemGetInfo(&fr, &tot));
         fprintf(stderr, "[runner] kv cache %.2f GB (ctx %d, chunk %d), device free %.1f GiB\n", kvbytes / 1e9, max_ctx, Tc, fr / 1073741824.0);
@@ -877,6 +1066,12 @@ public:
 
     // iHC pre-mix + RMSNorm(nw) of cur = sum_h pre_h x_h  ->  outh (fp16) / outf (fp32, optional); post (4 per token) is produced for nout == 8
     void hc_pre(const float* xin, const float* hfn, const float* hsc, const float* hbs, const float* nw, int nout, int T, __half* outh, float* outf) {
+        if (det_mix) {
+            if (!hcpart) hcpart = dalloc<float>((size_t)Tc * 24 * 9);
+            hipLaunchKernelGGL(k_hc_mix_part_d, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcpart, nout);
+            hipLaunchKernelGGL(k_hc_fin_reduce_norm, dim3(T), dim3(256), 0, st, hcpart, hsc, hbs, pre, post, nout, c.hc_eps, c.hc_mag, xin, nw, outh, outf, c.rms_eps);
+            return;
+        }
         hc_mix_run(xin, hfn, hsc, hbs, nout, T);
         hipLaunchKernelGGL(k_hc_reduce_norm, dim3(T), dim3(256), 0, st, xin, pre, nw, outh, outf, c.rms_eps);
     }
@@ -888,51 +1083,75 @@ public:
         hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(128), 0, st, ik_f, (const float*)tw(p + ".token_key_norm.weight"), (float*)nullptr, ik_h, 128, c.rms_eps);
         lin(p + ".key_value_projection.weight", ik_h, iv_f, T);
         lin(p + ".key_gate_projection.weight", ik_h, ig_f, T);
-        hipLaunchKernelGGL(idx::k_idx_store, dim3(T), dim3(128), 0, st, iv_f, ig_f, ivg[il], p0);
-        int g_lo = p0 / 4, g_hi = (p0 + T) / 4 - 1;
-        if (g_hi >= g_lo)
-            hipLaunchKernelGGL(idx::k_idx_pool, dim3(g_hi - g_lo + 1), dim3(128), 0, st, ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], g_lo,
-                               (float)theta(il), c.rms_eps);
-        if (vis && g_hi >= g_lo && vis->needs_fix(p0, T)) vis->pool_fix(st, pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il));  // HY4-VISION hook
+        const int* p0d = capturing ? &d_step->p0 : nullptr;
+        hipLaunchKernelGGL(idx::k_idx_store, dim3(T), dim3(128), 0, st, iv_f, ig_f, ivg[il], p0, p0d);
+        if (capturing) {
+            const int ngrp = (T + 3) / 4;
+            hipLaunchKernelGGL(idx::k_idx_pool, dim3(ngrp), dim3(128), 0, st, ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], 0,
+                               (float)theta(il), c.rms_eps, p0d, T);
+        } else {
+            int g_lo = p0 / 4, g_hi = (p0 + T) / 4 - 1;
+            if (g_hi >= g_lo)
+                hipLaunchKernelGGL(idx::k_idx_pool, dim3(g_hi - g_lo + 1), dim3(128), 0, st, ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], g_lo,
+                                   (float)theta(il), c.rms_eps, (const int*)nullptr, 0);
+            if (vis && g_hi >= g_lo && vis->needs_fix(p0, T)) vis->pool_fix(st, pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il));  // HY4-VISION hook
+        }
     }
 
     // per-token key lists for the chunk (sparse layer, sequence longer than index_topk)
     void idx_select(int il, int p0, int T) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
+        const int* p0d = capturing ? &d_step->p0 : nullptr;
+        const int* Gd = capturing ? &d_step->idx_G : nullptr;
         lin(p + ".query_projection.weight", qr_h, iq_f, T);  // [T][16*128]
-        if (vis && vis->needs_fix(p0, T)) vis->iq_rope(st, iq_f, iq_h, T, p0, (float)theta(il));  // HY4-VISION hook: 3D positions
-        else hipLaunchKernelGGL(idx::k_idx_q_rope, dim3(T, 16), dim3(128), 0, st, iq_f, iq_h, p0, (float)theta(il));
+        if (!capturing && vis && vis->needs_fix(p0, T)) vis->iq_rope(st, iq_f, iq_h, T, p0, (float)theta(il));  // HY4-VISION hook: 3D positions
+        else hipLaunchKernelGGL(idx::k_idx_q_rope, dim3(T, 16), dim3(128), 0, st, iq_f, iq_h, p0, (float)theta(il), p0d);
         lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);  // [T][16]
         int G = (p0 + T) / 4;
         if (G < 1) G = 1;
-        hipLaunchKernelGGL(idx::k_idx_score, dim3((G + 63) / 64, T), dim3(64), 0, st, iq_h, hw_f, pooled[il], score, p0, G, (int)ldS, 1.0f / sqrtf((float)(128 * 16)));
+        const int sg = capturing ? cap_score_grid : ((G + 63) / 64);
+        hipLaunchKernelGGL(idx::k_idx_score, dim3(sg, T), dim3(64), 0, st, iq_h, hw_f, pooled[il], score, p0, G, (int)ldS, 1.0f / sqrtf((float)(128 * 16)), p0d, Gd);
         int n_top = index_topk / c.kpool - 1;
-        hipLaunchKernelGGL(idx::k_idx_select, dim3(T), dim3(256), 0, st, score, (int)ldS, p0, n_top, index_topk, keys, nkeys);
+        hipLaunchKernelGGL(idx::k_idx_select, dim3(T), dim3(256), 0, st, score, (int)ldS, p0, n_top, index_topk, keys, nkeys, p0d);
     }
 
     void attention_layer(int il, int p0, int T) {
         const std::string pa = L(il) + ".self_attn";
         const int NH = heads(il);
         const bool swa = c.is_swa[il];
+        const int* p0d = capturing ? &d_step->p0 : nullptr;
         // iHC pre + input_layernorm
         const float* hfn = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_fn");
         const float* hsc = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_base");
         { PS _q(this, "hc_mix"); hc_pre(x, hfn, hsc, hbs, (const float*)tw(L(il) + ".input_layernorm.weight"), 8, T, cur_h, (float*)nullptr); }
-        // q path
-        lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
-        { PS _q(this, "q_a_rms"); hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps); }
-        lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
-        lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]  (qr_h already extracted)
+        // q + kv_a + linear_gate: fuse into ONE LinMulti launch on decode/verify (T <= 8) when formats match
+        const bool fused_attn = lm_ok_m(T) && il < (int)lm_attn.size() && lm_attn[il].d_jobs != nullptr;
+        const float* kv_a_out = fused_attn ? (F1 + 8192) : F1;
+        if (fused_attn) {
+            { PS _q(this, "lin attn_qkvg_multi"); linear_h_multi(st, lm_attn[il], cur_h, T); }
+            { PS _q(this, "q_a_rms"); hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps); }
+            lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
+        } else {
+            lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
+            { PS _q(this, "q_a_rms"); hipLaunchKernelGGL(k_rms_rows, dim3(T), dim3(256), 0, st, F1, (const float*)tw(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps); }
+            lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
+            lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]  (qr_h already extracted)
+        }
         __half* cache = kcache[il];
         const int cslots = swa ? ring : slots_sparse;
-        { PS _q(this, "mla_write_kv"); mla_write_kv(st, F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
+        { PS _q(this, "mla_write_kv");
+          if (p0d) mla_write_kv_d(st, kv_a_out, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0d, swa ? ring : 0, (float)theta(il), c.rms_eps);
+          else mla_write_kv(st, kv_a_out, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
         const bool dec = T <= 8;
         const int kvfmt = ti(pa + ".kv_b_proj.weight").fmt;
-        { PS _q(this, "mla_prep_q"); if (dec) mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il));
-        else mla_prep_q(st, F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il)); }
-        if (vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
-            vis->fix_k(st, F1, cache, T, p0, swa ? ring : 0, (float)theta(il));
+        { PS _q(this, "mla_prep_q");
+          if (dec) {
+              if (p0d) mla_prep_q_dec_d(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0d, (float)theta(il));
+              else mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il));
+          } else mla_prep_q(st, F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il)); }
+        if (!capturing && vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
+            vis->fix_k(st, kv_a_out, cache, T, p0, swa ? ring : 0, (float)theta(il));
             vis->fix_q(st, F2, qa_h, T, NH, p0, (float)theta(il));
         }
         bool use_list = false;
@@ -945,11 +1164,12 @@ public:
         }
         last_use_list = use_list;
         if (dfly_cap && !swa) dfly_capture(il, p0, T, use_list);
-        lin(pa + ".linear_gate.weight", cur_h, F3, T);  // [T][NH*256]
+        if (!fused_attn) lin(pa + ".linear_gate.weight", cur_h, F3, T);  // [T][NH*256]
         MlaAttnArgs a;
         a.M = T;
         a.NH = NH;
         a.p0 = p0;
+        a.p0_dev = p0d;
         a.mode = swa ? MLA_WINDOW : (use_list ? MLA_LIST : MLA_CAUSAL);
         a.window = c.window;
         a.ring = swa ? ring : 0;
@@ -959,9 +1179,7 @@ public:
             a.nkeys = nkeys;
             a.kmax = index_topk;
         }
-        // size the split-K workspace AFTER kmax is set: mla_workspace_bytes() takes max_keys = kmax in list mode. (Before: kmax was still 0 here, no workspace was ensured for the
-        // IndexPool layers, and mla_attend fell back to the simple kernel unless another call had happened to grow the buffer: which kernel decode used depended on earlier GPU work.)
-        ensure_mla_ws(mla_workspace_bytes(a));
+        if (!capturing) ensure_mla_ws(mla_workspace_bytes(a));
         if (dec) {
             { PS _q(this, "mla_attend"); mla_attend(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), (__half*)ctx_ws, a, mla_ws, mla_ws_bytes); }
             { PS _q(this, "mla_vup"); mla_vup_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), (const __half*)ctx_ws, F3, o_h, T, NH); }
@@ -995,6 +1213,7 @@ public:
                 HCK(hipEventRecord(ev_hyb, st));
             }
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
+            peers_launch(il, T);
             const std::vector<PfGroup>& gs = pf_groups[il - 1];
             for (size_t gi = 0; gi < gs.size(); ++gi) {
                 const PfGroup& G = gs[gi];
@@ -1008,6 +1227,7 @@ public:
                 ++pf_next_comp;
                 pf_pump(k + pf_nbuf);
             }
+            peers_gather(T);
             if (has_cold) {
                 double t0 = now_s();
                 HCK(hipEventSynchronize(ev_hyb));
@@ -1032,6 +1252,7 @@ public:
         HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
         HCK(hipEventRecord(ev_hyb, st));
         { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
+        peers_launch(il, T);
         { PS _q(this, "moe_experts(gpu part)"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws); }
         lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
         lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
@@ -1042,6 +1263,7 @@ public:
         cpu.submit(il - 1, T, h_z, h_idx, h_w, nullptr, h_zcpu);
         cpu.wait();
         t_cpu_wait += now_s() - t0;
+        peers_gather(T);
         HCK(hipMemcpyAsync(d_zcpu, h_zcpu, nz * 4, hipMemcpyHostToDevice, st));
         hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
         { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
@@ -1056,8 +1278,12 @@ public:
         const float* hbs = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_base");
         { PS _q(this, "hc_mix"); hc_pre(x, hfn, hsc, hbs, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), 8, T, cur_h, cur_f); }
         if (il == 0) {
-            lin(pm + ".gate_proj.weight", cur_h, F1, T);  // [T][13824]
-            lin(pm + ".up_proj.weight", cur_h, F2, T);
+            if (lm_ok_m(T) && lm_mlp0.d_jobs) {
+                PS _q(this, "lin mlp0_gu_multi"); linear_h_multi(st, lm_mlp0, cur_h, T);
+            } else {
+                lin(pm + ".gate_proj.weight", cur_h, F1, T);  // [T][13824]
+                lin(pm + ".up_proj.weight", cur_h, F2, T);
+            }
             size_t n = (size_t)T * 13824;
             { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((n + 255) / 256), dim3(256), 0, st, F1, F2, H1, n); }
             lin(pm + ".down_proj.weight", H1, F3, T);  // [T][3072]
@@ -1065,7 +1291,7 @@ public:
         } else {
             // router
             { PS _q(this, "router_gemv"); if (T <= 16) hipLaunchKernelGGL(k_f32_gemv, dim3(512), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T); else hipLaunchKernelGGL(k_f32_gemm, dim3(8, (T + 63) / 64), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T); }
-            route_now = (tune & TN_ROUTE) && T == 1 && !hyb;
+            route_now = (tune & TN_ROUTE) && T == 1 && !hyb && peer_runs.empty();
             {
                 PS _q(this, "router_topk");
                 const uint4* exl = route_now ? (const uint4*)(d_experts + (size_t)(il - 1) * 512) : nullptr;
@@ -1077,16 +1303,22 @@ public:
             lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536]
             size_t nz = (size_t)T * 1536;
             if (hyb) { moe_hybrid_tail(il, T, pm); } else {
-            const bool nof = T <= 4 && (tune & TN_NOF2H);  // fp32 latent read directly by the expert kernels, fp16 result written by their reduce
+            const bool nof = T <= 4 && (tune & TN_NOF2H) && peer_runs.empty();  // fp32 latent read directly by the expert kernels, fp16 result written by their reduce
             if (nof) { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, nullptr, moe_idx, moe_w, zout_f, T, moe_ws, z_f, z_h, route_now ? slot_rec : nullptr); }
             else {
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
+            peers_launch(il, T);
             { PS _q(this, "moe_experts"); moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws, nullptr, nullptr, route_now ? slot_rec : nullptr); }
+            peers_gather(T);
             { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
             }
             lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
-            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
-            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
+            if (lm_ok_m(T) && (il - 1) < (int)lm_sh.size() && lm_sh[il - 1].d_jobs) {
+                PS _q(this, "lin shared_gu_multi"); linear_h_multi(st, lm_sh[il - 1], cur_h, T);
+            } else {
+                lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
+                lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
+            }
             { PS _q(this, "swiglu"); hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz); }
             lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
             { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
@@ -1137,11 +1369,335 @@ public:
     // make room for positions < need; false when need exceeds the context
     bool kv_ensure(int need) {
         if (need > max_ctx + 8) return false;
-        if (kv_cap && !kv_moved && need > kv_cap) kv_grow();
+        if (kv_cap && !kv_moved && need > kv_cap) {
+            kv_grow();
+#if HY4_CUDA
+            cg_clear();
+#endif
+        }
         return need <= slots_sparse;
     }
+#if HY4_CUDA
+    template <class Fn>
+    cudaGraphExec_t cg_capture_one(Fn&& fn) {
+        cudaGraph_t gr = nullptr;
+        cudaGraphExec_t ex = nullptr;
+        HCK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+        fn();
+        HCK(cudaStreamEndCapture(st, &gr));
+        HCK(cudaGraphInstantiate(&ex, gr, nullptr, nullptr, 0));
+        HCK(cudaGraphDestroy(gr));
+        return ex;
+    }
+    void cg_emit_layer_pre_hyb(int il, int p0, int T) {
+        const size_t nz = (size_t)T * 1536;
+        if (il > 1) {
+            const std::string pm_prev = L(il - 1) + ".mlp";
+            hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
+            hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz);
+            lin(pm_prev + ".routed_expert_up_proj.weight", z_h, F2, T);
+            hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm_prev + ".combine_output_norm.weight"), x, post, c.rms_eps);
+        }
+        int mo = -1;
+        for (int j = 0; j < 4; ++j) if (emeta.layers[j] == il) mo = j;
+        if (mo >= 0 && engram_ready) engram_layer(mo, il, T);
+        attention_layer(il, p0, T);
+        const std::string pm = L(il) + ".mlp";
+        const float* hfn = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_fn");
+        const float* hsc = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_scale");
+        const float* hbs = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_base");
+        hc_pre(x, hfn, hsc, hbs, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), 8, T, cur_h, cur_f);
+        hipLaunchKernelGGL(k_f32_gemv, dim3(512), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T);
+        const float* rb = (const float*)tw(pm + ".gate.e_score_correction_bias");
+        if (tune & TN_TOPK) hipLaunchKernelGGL(k_router_topk_r, dim3(T), dim3(512), 0, st, F1, rb, moe_idx, moe_w, 16, c.routed_scale, (const uint4*)nullptr, (uint4*)nullptr);
+        else hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, rb, moe_idx, moe_w, 512, 16, c.routed_scale, (const uint4*)nullptr, (uint4*)nullptr);
+        lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);
+        HCK(hipMemcpyAsync(h_z, z_f, nz * 4, hipMemcpyDeviceToHost, st));
+        HCK(hipMemcpyAsync(h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+        HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+    }
+    void cg_emit_layer_gpuexp_hyb(int il, int T) {
+        const size_t nz = (size_t)T * 1536;
+        const std::string pm = L(il) + ".mlp";
+        hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz);
+        moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws);
+        if (lm_ok_m(T) && (il - 1) < (int)lm_sh.size() && lm_sh[il - 1].d_jobs) {
+            linear_h_multi(st, lm_sh[il - 1], cur_h, T);
+        } else {
+            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);
+            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
+        }
+        hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz);
+        lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);
+    }
+    void cg_emit_layer_pre_mgpu(int il, int p0, int T) {
+        const size_t nz = (size_t)T * 1536;
+        if (il > 1) {
+            const std::string pm_prev = L(il - 1) + ".mlp";
+            for (const auto& pr : peer_runs)
+                hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)pr.d_zpeer0, nz);
+            hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz);
+            lin(pm_prev + ".routed_expert_up_proj.weight", z_h, F2, T);
+            hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm_prev + ".combine_output_norm.weight"), x, post, c.rms_eps);
+        }
+        int mo = -1;
+        for (int j = 0; j < 4; ++j) if (emeta.layers[j] == il) mo = j;
+        if (mo >= 0 && engram_ready) engram_layer(mo, il, T);
+        attention_layer(il, p0, T);
+        const std::string pm = L(il) + ".mlp";
+        const float* hfn = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_fn");
+        const float* hsc = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_scale");
+        const float* hbs = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_base");
+        hc_pre(x, hfn, hsc, hbs, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), 8, T, cur_h, cur_f);
+        hipLaunchKernelGGL(k_f32_gemv, dim3(512), dim3(256), 0, st, (const float*)tw(pm + ".gate.weight"), (const float*)cur_f, F1, 512, HID, T);
+        const float* rb = (const float*)tw(pm + ".gate.e_score_correction_bias");
+        if (tune & TN_TOPK) hipLaunchKernelGGL(k_router_topk_r, dim3(T), dim3(512), 0, st, F1, rb, moe_idx, moe_w, 16, c.routed_scale, (const uint4*)nullptr, (uint4*)nullptr);
+        else hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, rb, moe_idx, moe_w, 512, 16, c.routed_scale, (const uint4*)nullptr, (uint4*)nullptr);
+        lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);
+        hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz);
+    }
+    void cg_emit_layer_gpuexp_mgpu(int il, int T) {
+        const size_t nz = (size_t)T * 1536;
+        const std::string pm = L(il) + ".mlp";
+        moe_experts(st, g.d_sec4, d_experts + (size_t)(il - 1) * 512, z_h, moe_idx, moe_w, zout_f, T, moe_ws);
+        if (lm_ok_m(T) && (il - 1) < (int)lm_sh.size() && lm_sh[il - 1].d_jobs) {
+            linear_h_multi(st, lm_sh[il - 1], cur_h, T);
+        } else {
+            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);
+            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
+        }
+        hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3, H1, nz);
+        lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);
+    }
+    bool forward_chunk_graph(const int32_t* tok_all, int p0, int T, std::string& err) {
+        const bool use_list = index_on && (p0 + T > index_topk);
+        int G = (p0 + T) / 4;
+        if (G < 1) G = 1;
+        const int score_grid = use_list ? ((((G + 63) / 64) + 15) & ~15) : 0;
+        MlaAttnArgs ma_sp;
+        ma_sp.M = T; ma_sp.NH = c.heads_sparse; ma_sp.p0 = p0;
+        ma_sp.mode = use_list ? MLA_LIST : MLA_CAUSAL;
+        ma_sp.kmax = use_list ? index_topk : 0;
+        const int s_causal = use_list ? 0 : mla_choose_splits(ma_sp);
+        MlaAttnArgs ma_swa;
+        ma_swa.M = T; ma_swa.NH = c.heads_swa; ma_swa.p0 = p0;
+        ma_swa.mode = MLA_WINDOW; ma_swa.window = c.window; ma_swa.ring = ring;
+        const int s_swa = mla_choose_splits(ma_swa);
+        const size_t need_ws = std::max(mla_workspace_bytes(ma_swa), mla_workspace_bytes(T, c.heads_sparse, std::max(index_topk, p0 + T)));
+        ensure_mla_ws(need_ws);
+        if (!hcpart) hcpart = dalloc<float>((size_t)Tc * 24 * 9);
+#if HY4_MMA
+        if (skd::lin_int8_mma()) skd::int8_act_buf().ensure((size_t)T * 16384, skd::lin_int8_mma() >= 2);
+#endif
+        CgKey key{};
+        key.T = T;
+        key.use_list = use_list ? 1 : 0;
+        key.s_causal = s_causal;
+        key.s_swa = s_swa;
+        key.score_grid = score_grid;
+        key.dfly_cap = dfly_cap ? 1 : 0;
+        key.route_now = ((tune & TN_ROUTE) && T == 1 && !hyb && peer_runs.empty()) ? 1 : 0;
+        key.nof = (T <= 4 && (tune & TN_NOF2H) && !hyb && peer_runs.empty()) ? 1 : 0;
+        key.kv_moved = kv_moved ? 1 : 0;
+        key.engram_ready = engram_ready ? 1 : 0;
+        key.hyb = hyb ? 1 : 0;
+        key.n_peers = (int)peer_runs.size();
+        key.lin_gemv_max = skd::lin_gemv_max_m();
+        key.moe_dec_max = skd::moe_dec_max_m();
+#if HY4_MMA
+        key.int8_mma = skd::lin_int8_mma();
+        key.dp4a = skd::lin_dp4a();
+#endif
+        key.mla_ws_gen = mla_ws_gen;
+        CgEntry* ent = nullptr;
+        for (auto& e : cg_cache) if (e.key == key) { ent = &e; break; }
+        if (!ent) {
+            if (cg_cache.size() >= 16) {
+                cg_cache.front().destroy();
+                cg_cache.erase(cg_cache.begin());
+            }
+            cg_cache.emplace_back();
+            ent = &cg_cache.back();
+            ent->key = key;
+            capturing = true;
+            cap_score_grid = score_grid;
+            if (!hyb && peer_runs.empty()) {
+                if (!engram_ready) {
+                    ent->g_l0 = cg_capture_one([&] {
+                        hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
+                        for (int il = 0; il < c.n_layers; ++il) {
+                            attention_layer(il, p0, T);
+                            mlp_layer(il, T);
+                        }
+                    });
+                } else {
+                    const int l_mid = emeta.layers[1];
+                    ent->g_l0 = cg_capture_one([&] {
+                        hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
+                        attention_layer(0, p0, T);
+                        mlp_layer(0, T);
+                    });
+                    ent->g_l1_10 = cg_capture_one([&] {
+                        for (int il = 1; il < l_mid; ++il) {
+                            int mo = -1;
+                            for (int j = 0; j < 4; ++j) if (emeta.layers[j] == il) mo = j;
+                            if (mo >= 0) engram_layer(mo, il, T);
+                            attention_layer(il, p0, T);
+                            mlp_layer(il, T);
+                        }
+                    });
+                    ent->g_l11_41 = cg_capture_one([&] {
+                        for (int il = l_mid; il < c.n_layers; ++il) {
+                            int mo = -1;
+                            for (int j = 0; j < 4; ++j) if (emeta.layers[j] == il) mo = j;
+                            if (mo >= 0) engram_layer(mo, il, T);
+                            attention_layer(il, p0, T);
+                            mlp_layer(il, T);
+                        }
+                    });
+                }
+            } else if (!hyb && !peer_runs.empty()) {
+                // Multi-GPU segmented CUDA Graphs: GPU 0 segments + per-peer moe_experts graphs (zero host sync!)
+                ent->g_l0 = cg_capture_one([&] {
+                    hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
+                    attention_layer(0, p0, T);
+                    mlp_layer(0, T);
+                });
+                ent->g_peers.resize(peer_runs.size());
+                for (auto& arr : ent->g_peers) arr.fill(nullptr);
+                for (int il = 1; il < c.n_layers; ++il) {
+                    ent->g_pre[il - 1] = cg_capture_one([&] { cg_emit_layer_pre_mgpu(il, p0, T); });
+                    ent->g_gpuexp[il - 1] = cg_capture_one([&] { cg_emit_layer_gpuexp_mgpu(il, T); });
+                    for (size_t p = 0; p < peer_runs.size(); ++p) {
+                        PeerRun& pr = peer_runs[p];
+                        HCK(cudaSetDevice(pr.dev));
+                        cudaGraph_t gr = nullptr;
+                        HCK(cudaStreamBeginCapture(pr.st, cudaStreamCaptureModeThreadLocal));
+                        moe_experts(pr.st, g.peers[p].d_sec4, pr.d_experts + (size_t)(il - 1) * 512, pr.z_h, pr.idx, pr.w, pr.zout, T, pr.moe_ws);
+                        HCK(cudaStreamEndCapture(pr.st, &gr));
+                        HCK(cudaGraphInstantiate(&ent->g_peers[p][il - 1], gr, nullptr, nullptr, 0));
+                        HCK(cudaGraphDestroy(gr));
+                    }
+                    HCK(cudaSetDevice(g.primary_gpu));
+                }
+                const size_t nz = (size_t)T * 1536;
+                const std::string pm_last = L(c.n_layers - 1) + ".mlp";
+                ent->g_tail_last = cg_capture_one([&] {
+                    for (const auto& pr : peer_runs)
+                        hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)pr.d_zpeer0, nz);
+                    hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz);
+                    lin(pm_last + ".routed_expert_up_proj.weight", z_h, F2, T);
+                    hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm_last + ".combine_output_norm.weight"), x, post, c.rms_eps);
+                });
+            } else {
+                // Hybrid segmented graphs: layer 0 + 41 (pre, gpuexp) pairs + final layer tail
+                ent->g_l0 = cg_capture_one([&] {
+                    hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
+                    attention_layer(0, p0, T);
+                    mlp_layer(0, T);
+                });
+                for (int il = 1; il < c.n_layers; ++il) {
+                    ent->g_pre[il - 1] = cg_capture_one([&] { cg_emit_layer_pre_hyb(il, p0, T); });
+                    ent->g_gpuexp[il - 1] = cg_capture_one([&] { cg_emit_layer_gpuexp_hyb(il, T); });
+                }
+                const size_t nz = (size_t)T * 1536;
+                const std::string pm_last = L(c.n_layers - 1) + ".mlp";
+                ent->g_tail_last = cg_capture_one([&] {
+                    hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
+                    hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz);
+                    lin(pm_last + ".routed_expert_up_proj.weight", z_h, F2, T);
+                    hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3, (const float*)tw(pm_last + ".combine_output_norm.weight"), x, post, c.rms_eps);
+                });
+            }
+            capturing = false;
+        }
+        // Update per-step inputs via async H2D from pinned memory
+        std::memcpy(h_ids, tok_all + p0, (size_t)T * 4);
+        h_step->p0 = p0;
+        h_step->idx_G = G;
+        HCK(hipMemcpyAsync(d_ids, h_ids, (size_t)T * 4, hipMemcpyHostToDevice, st));
+        HCK(hipMemcpyAsync(d_step, h_step, sizeof(DevStepArgs), hipMemcpyHostToDevice, st));
+        if (engram_ready) {
+            const double t_pf0 = now_s();
+            prefetch_engram(tok_all, p0, T);
+            t_eng_issue += now_s() - t_pf0;
+        }
+        if (!hyb && peer_runs.empty()) {
+            HCK(cudaGraphLaunch(ent->g_l0, st));
+            if (engram_ready) {
+                double tq = now_s();
+                if (!engram_prep(tok_all, p0, T, err)) return false;
+                t_eng_prep += now_s() - tq; ++n_eng_dec;
+                HCK(cudaGraphLaunch(ent->g_l1_10, st));
+                if (!engram_prep_rest(err)) return false;
+                HCK(cudaGraphLaunch(ent->g_l11_41, st));
+            }
+        } else if (!hyb && !peer_runs.empty()) {
+            const size_t nz = (size_t)T * 1536;
+            const int l_mid = engram_ready ? emeta.layers[1] : -1;
+            HCK(cudaGraphLaunch(ent->g_l0, st));
+            for (int il = 1; il < c.n_layers; ++il) {
+                if (engram_ready && il == 1) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err)) return false; t_eng_prep += now_s() - tq; ++n_eng_dec; }
+                if (engram_ready && il == l_mid && !engram_prep_rest(err)) return false;
+                HCK(cudaGraphLaunch(ent->g_pre[il - 1], st));
+                for (size_t p = 0; p < peer_runs.size(); ++p) {
+                    PeerRun& pr = peer_runs[p];
+                    HCK(cudaEventRecord(pr.ev_in, st));
+                    HCK(cudaSetDevice(pr.dev));
+                    HCK(cudaStreamWaitEvent(pr.st, pr.ev_in, 0));
+                    HCK(cudaMemcpyPeerAsync(pr.z_h, pr.dev, z_h, g.primary_gpu, nz * 2, pr.st));
+                    HCK(cudaMemcpyPeerAsync(pr.idx, pr.dev, moe_idx, g.primary_gpu, (size_t)T * 16 * 4, pr.st));
+                    HCK(cudaMemcpyPeerAsync(pr.w, pr.dev, moe_w, g.primary_gpu, (size_t)T * 16 * 4, pr.st));
+                    HCK(cudaGraphLaunch(ent->g_peers[p][il - 1], pr.st));
+                    HCK(cudaMemcpyPeerAsync(pr.d_zpeer0, g.primary_gpu, pr.zout, pr.dev, nz * 4, pr.st));
+                    HCK(cudaEventRecord(pr.ev_out, pr.st));
+                }
+                HCK(cudaSetDevice(g.primary_gpu));
+                HCK(cudaGraphLaunch(ent->g_gpuexp[il - 1], st));
+                for (auto& pr : peer_runs) HCK(cudaStreamWaitEvent(st, pr.ev_out, 0));
+            }
+            HCK(cudaGraphLaunch(ent->g_tail_last, st));
+        } else {
+            const size_t nz = (size_t)T * 1536;
+            const int l_mid = engram_ready ? emeta.layers[1] : -1;
+            HCK(cudaGraphLaunch(ent->g_l0, st));
+            for (int il = 1; il < c.n_layers; ++il) {
+                if (engram_ready && il == 1) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err)) return false; t_eng_prep += now_s() - tq; ++n_eng_dec; }
+                if (engram_ready && il == l_mid && !engram_prep_rest(err)) return false;
+                HCK(cudaGraphLaunch(ent->g_pre[il - 1], st));
+                HCK(hipEventRecord(ev_hyb, st));
+                HCK(cudaGraphLaunch(ent->g_gpuexp[il - 1], st));
+                double t0 = now_s();
+                HCK(hipEventSynchronize(ev_hyb));
+                cpu.submit(il - 1, T, h_z, h_idx, h_w, nullptr, h_zcpu);
+                cpu.wait();
+                t_cpu_wait += now_s() - t0;
+                HCK(hipMemcpyAsync(d_zcpu, h_zcpu, nz * 4, hipMemcpyHostToDevice, st));
+            }
+            HCK(cudaGraphLaunch(ent->g_tail_last, st));
+        }
+        // Update host-side capture metadata for DFly2
+        last_use_list = use_list;
+        if (dfly_cap) {
+            const int nr = std::min(T, 16), r0 = T - nr;
+            cap_p0 = p0 + r0;
+            cap_rows = nr;
+            for (int d = 0; d < 5; ++d) cap_list[d] = use_list;
+        }
+        return true;
+    }
+#endif
     bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err) {
-        if (kv_cap && !kv_moved && p0 + T + 16 > kv_cap) kv_grow();
+        if (kv_cap && !kv_moved && p0 + T + 16 > kv_cap) {
+            kv_grow();
+#if HY4_CUDA
+            cg_clear();
+#endif
+        }
+#if HY4_CUDA
+        if (cuda_graph_on && (peer_runs.empty() || !hyb) && T <= 8 && !dump && !prof && !prof2 && !(vis && vis->needs_fix(p0, T)))
+            return forward_chunk_graph(tok_all, p0, T, err);
+#endif
         HCK(hipMemcpyAsync(d_ids, tok_all + p0, (size_t)T * 4, hipMemcpyHostToDevice, st));
         hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
         if (vis) vis->embed(st, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
