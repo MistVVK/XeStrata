@@ -831,27 +831,49 @@ public:
             else engram_hash(emeta, mo, tok_all, p0, p0 + T, dst_ids, dst_val);
             if (vis && e->tree.M == 0) vis->mask_engram(dst_val, p0, T);
         };
-        if (T <= 8 && e->staged) {  // decode / verify window: module 0 first (published through pm0), then modules 1..3 in one batch
-            const size_t per = (size_t)T * 16;
-            auto fetch_modules = [&](int m0, int m1) -> bool {
-                std::vector<uint64_t> ids((size_t)(m1 - m0) * per);
-                for (int mo = m0; mo < m1; ++mo) hash_mo(mo, ids.data() + (size_t)(mo - m0) * per, e->valid + (size_t)mo * Tc * 16);
-                std::vector<uint8_t> tmp(ids.size() * 100);
-                if (!eio.fetch_raw(ids.data(), ids.size(), tmp.data(), err)) return false;
-                for (int mo = m0; mo < m1; ++mo) std::memcpy(e->raw + (size_t)mo * Tc * 16 * 100, tmp.data() + (size_t)(mo - m0) * per * 100, per * 100);
-                return true;
-            };
-            if (!fetch_modules(0, 1)) {
-                e->ok = false;
-                e->err = err;
-                e->ok_rest = false;
+        if (e->staged) {  // staged async fetch: module 0 first (published through pm0 for layer 1), then modules 1..3 while GPU runs layers 1..10
+            if (T <= 8) {
+                const size_t per = (size_t)T * 16;
+                auto fetch_modules = [&](int m0, int m1) -> bool {
+                    std::vector<uint64_t> ids((size_t)(m1 - m0) * per);
+                    for (int mo = m0; mo < m1; ++mo) hash_mo(mo, ids.data() + (size_t)(mo - m0) * per, e->valid + (size_t)mo * Tc * 16);
+                    std::vector<uint8_t> tmp(ids.size() * 100);
+                    if (!eio.fetch_raw(ids.data(), ids.size(), tmp.data(), err)) return false;
+                    for (int mo = m0; mo < m1; ++mo) std::memcpy(e->raw + (size_t)mo * Tc * 16 * 100, tmp.data() + (size_t)(mo - m0) * per * 100, per * 100);
+                    return true;
+                };
+                if (!fetch_modules(0, 1)) {
+                    e->ok = false;
+                    e->err = err;
+                    e->ok_rest = false;
+                    e->pm0.set_value();
+                    return;
+                }
                 e->pm0.set_value();
+                if (!fetch_modules(1, 4)) {
+                    e->ok_rest = false;
+                    e->err = err;
+                }
                 return;
             }
-            e->pm0.set_value();
-            if (!fetch_modules(1, 4)) {
-                e->ok_rest = false;
-                e->err = err;
+            std::vector<uint64_t> ids((size_t)T * 16);
+            for (int mo = 0; mo < 4; ++mo) {
+                uint8_t* valid = e->valid + (size_t)mo * Tc * 16;
+                hash_mo(mo, ids.data(), valid);
+                uint8_t* raw = e->raw + (size_t)mo * Tc * 16 * 100;
+                if (!eio.fetch_raw(ids.data(), ids.size(), raw, err)) {
+                    if (mo == 0) {
+                        e->ok = false;
+                        e->ok_rest = false;
+                        e->err = err;
+                        e->pm0.set_value();
+                    } else {
+                        e->ok_rest = false;
+                        e->err = err;
+                    }
+                    return;
+                }
+                if (mo == 0) e->pm0.set_value();
             }
             return;
         }
@@ -889,7 +911,7 @@ public:
         e.p0 = p0;
         e.T = T;
         e.pending = true;
-        e.staged = T <= 8;
+        e.staged = true;
         e.ok_rest = true;
         e.tree = tree ? *tree : TreeSpec{};
         if (e.staged) {
@@ -1449,16 +1471,29 @@ public:
         HCK(hipMemcpyAsync(d_ids, is_tree ? tree->tok : (tok_all + p0), (size_t)T * 4, hipMemcpyHostToDevice, st));
         hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
         if (!is_tree && vis) vis->embed(st, x, p0, T);  // HY4-VISION hook: image rows replace the embeddings of the image-pad tokens
-        const bool defer_eng = engram_ready && T <= 8;
+        const bool defer_eng = engram_ready;
         if (pf_active(T)) pf_begin_chunk();
         if (defer_eng) {
-            const double t_pf0 = now_s();
-            prefetch_engram(tok_all, p0, T, tree);
-            t_eng_issue += now_s() - t_pf0;
-        } else if (engram_ready && !engram_prep(tok_all, p0, T, err, tree)) return false;
+            bool have_pf = false;
+            for (int s = 0; s < 2; ++s)
+                if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T && (ep[s].tree.M == (tree ? tree->M : 0))) have_pf = true;
+            if (!have_pf) {
+                const double t_pf0 = now_s();
+                prefetch_engram(tok_all, p0, T, tree);
+                if (T <= 8) t_eng_issue += now_s() - t_pf0;
+            }
+        }
         for (int il = 0; il < c.n_layers; ++il) {
-            if (defer_eng && il == 1) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err, tree)) return false; t_eng_prep += now_s() - tq; ++n_eng_dec; }
-            if (defer_eng && il == emeta.layers[1] && !engram_prep_rest(err)) return false;
+            if (defer_eng && il == emeta.layers[0]) {
+                double tq = now_s();
+                if (!engram_prep(tok_all, p0, T, err, tree)) return false;
+                if (T <= 8) { t_eng_prep += now_s() - tq; ++n_eng_dec; }
+            }
+            if (defer_eng && il == emeta.layers[1]) {
+                double tq = now_s();
+                if (!engram_prep_rest(err)) return false;
+                if (T > 8) t_engram_cpu += now_s() - tq;
+            }
             int mo = -1;
             for (int j = 0; j < 4; ++j)
                 if (emeta.layers[j] == il) mo = j;
