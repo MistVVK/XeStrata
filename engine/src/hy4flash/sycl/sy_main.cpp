@@ -72,17 +72,18 @@ int main(int argc, char** argv) {
     const bool user_sel = std::getenv("ONEAPI_DEVICE_SELECTOR") != nullptr;
     if (!user_sel) {
         const char* be = std::getenv("HY4S_BACKEND");
-        setenv("ONEAPI_DEVICE_SELECTOR", (be && std::string(be) == "level_zero") ? "level_zero:gpu" : "opencl:gpu", 1);
+        hy4s_setenv("ONEAPI_DEVICE_SELECTOR", (be && std::string(be) == "level_zero") ? "level_zero:gpu" : "opencl:gpu", 1);
     }
-    std::string model, engram, tok_path, out_dir = ".", force_route, draft;  // draft: "" = default (serve: auto, CLI runs: off)
+    std::string model, engram, tok_path, out_dir = ".", force_route, draft;
     SpecCfg scfg;
     int wincheck = 0, wincheck_skip = 0, detcheck = 0;
     bool detnotap = false;
-    bool load_only = false, dbg = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false;
+    bool load_only = false, dbg = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, hi_act = false;
     bool serve = false, session_reuse = false, vision_requested = false;
     std::string vision_path;
     int64_t image_max_pixels = 1048576;
-    int kv_host_above = 24000, gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 1024, index_topk = 2048, threads = (int)std::max(2u, std::thread::hardware_concurrency() / 2), expert_act = 1;  // CPU expert threads: half the hardware threads (6 on the 5600X)
+    double vram_experts_gb = -1.0, ram_experts_gb = -1.0;
+    int kv_host_above = 24000, gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 1024, index_topk = 2048, threads = (int)std::max(2u, std::thread::hardware_concurrency() / 2), expert_act = 1;
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--serve") serve = true;
     for (int i = 1; i < argc; ++i) {
@@ -108,13 +109,16 @@ int main(int argc, char** argv) {
         else if (a == "--native" || a == "--model") model = nxt();
         else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
         else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
-        else if (a == "--gpu") {  // device index of the OpenCL runtime (an own ONEAPI_DEVICE_SELECTOR still wins)
+        else if (a == "--gpu") {
             const std::string n = nxt();
-            if (!user_sel) setenv("ONEAPI_DEVICE_SELECTOR", ("opencl:gpu:" + n).c_str(), 1);
+            if (!user_sel) hy4s_setenv("ONEAPI_DEVICE_SELECTOR", ("opencl:gpu:" + n).c_str(), 1);
         } else if (a == "--vision") {
             vision_path = nxt();
             vision_requested = true;
-        } else if (a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner (experts: page cache + GPU ring)\n", a.c_str(), nxt().c_str());
+        } else if (a == "--vram-experts-gb") vram_experts_gb = atof(nxt().c_str());
+        else if (a == "--ram-experts-gb") ram_experts_gb = atof(nxt().c_str());
+        else if (a == "--engram-cache-mib") (void)nxt();
+        else if (a == "--cpu-hi") hi_act = true;
         else if (a == "--kv") {
             const std::string kv = nxt();
             if (kv != "fp16") {
@@ -187,6 +191,9 @@ int main(int argc, char** argv) {
         so.threads = threads;
         so.gx_mb = gx_mb;
         so.kv_host_above = kv_host_above;
+        so.vram_experts_gb = vram_experts_gb;
+        so.ram_experts_gb = ram_experts_gb;
+        so.hi_act = hi_act || (expert_act == 0);
         so.no_index = no_index;
         so.no_engram = no_engram;
         so.session_reuse = session_reuse;
@@ -203,37 +210,33 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        auto dev = Q().get_device();
-        fprintf(stderr, "[gpu] %s, %.2f GiB\n", dev.get_info<sycl::info::device::name>().c_str(), dev.get_info<sycl::info::device::global_mem_size>() / 1073741824.0);
+        const auto& caps = dev_caps();
+        fprintf(stderr, "[gpu] %s, %.2f GiB (runtime: %s, sg8=%d sg16=%d xmx8=%d graph=%d)\n",
+                caps.name.c_str(), caps.global_mem / 1073741824.0, caps.platform.c_str(),
+                (int)caps.has_sg8, (int)caps.has_sg16, (int)caps.has_xmx_sg8, (int)caps.has_graph);
         SyModel g;
         std::string err;
         if (!g.load(model, err)) {
             fprintf(stderr, "load: %s\n", err.c_str());
             return 1;
         }
-        CpuExperts cx;
-        if (!cx.open(model, threads, err, std::max(chunk, 1))) {
-            fprintf(stderr, "experts: %s\n", err.c_str());
-            return 1;
-        }
-        if (std::getenv("HY4S_COLD") && std::getenv("HY4S_COLD")[0] == '1') { cx.drop_cache(); fprintf(stderr, "[experts] cold start: Section 4 dropped from the page cache (HY4S_COLD=1)\n"); }
-        if (warm) { double ws_ = 0; double gbs = cx.warm(threads, &ws_); fprintf(stderr, "[experts] warm %.1f s (%.2f GB/s)\n", ws_, gbs); }
-        if (load_only) return 0;
         std::vector<int32_t> tok;
-        {
+        if (!load_only) {
             std::ifstream f(tok_path);
             long v;
             while (f >> v) tok.push_back((int32_t)v);
+            if (tok.empty()) {
+                fprintf(stderr, "no tokens\n");
+                return 2;
+            }
         }
         const int T0 = (int)tok.size();
-        if (T0 == 0) {
-            fprintf(stderr, "no tokens\n");
-            return 2;
-        }
-        if (max_ctx <= 0) max_ctx = std::max(T0 + gen + 16, 131072);  // owner default for Hy4-Flash: 128K context on every card (the sparse-layer KV then lives in pinned host memory, see kv_host_above)
+        if (max_ctx <= 0) max_ctx = std::max(T0 + gen + 16, 131072);
         const int Tc = std::max(chunk, 1);
         const bool spec_mode = draft == "dfly2" && gen > 0;
-        Runner r(g, cx, max_ctx, Tc, (spec_mode || wincheck > 0 || detcheck > 0) ? 8 : (all_logits ? std::min(Tc, T0) : 1));
+        hy4::CpuExperts ucx;
+        SyVramExpertCache vcache;
+        Runner r(g, ucx, max_ctx, Tc, (spec_mode || wincheck > 0 || detcheck > 0) ? 8 : (all_logits ? std::min(Tc, std::max(T0, 1)) : 1));
         r.dump = dump;
         r.dbg_layers = dbg;
         r.force_route_dir = force_route;
@@ -256,11 +259,23 @@ int main(int argc, char** argv) {
             }
             fprintf(stderr, "[dfly2] drafter ready (K=%d%s, rv=%d), device allocated %.2f GiB\n", scfg.K, scfg.adaptive ? " adaptive" : " fixed", scfg.rv, dev_bytes_allocated() / 1073741824.0);
         }
+        // Size VRAM expert cache + unified CPU expert pool AFTER trunk/KV/DFly2 are allocated
+        if (scfg.check || wincheck > 0 || detcheck > 0) hy4s_setenv("HY4S_VRAM_STATIC", "1", 1);
+        const bool want_gx = (gx_mb > 0 && (load_only || T0 >= gx_min_t));
+        const size_t gx_reserve = want_gx ? ((size_t)gx_mb * 2 / 3 + 220) * (1ull << 20) : 0;
+        const size_t host_oh = r.kv_host_bytes + g.host_bytes_total + ((size_t)std::max(gx_mb, 0) << 20) + (640ull << 20);
+        if (!setup_experts_unified(model, threads, vram_experts_gb, ram_experts_gb, gx_reserve, host_oh, hi_act || (expert_act == 0), vcache, ucx, err)) {
+            fprintf(stderr, "experts: %s\n", err.c_str());
+            return 1;
+        }
+        r.vcache = vcache.active() ? &vcache : nullptr;
+        (void)warm;
+        if (load_only) return 0;
         GpuExperts gxe;
         if (gx_mb > 0 && T0 >= gx_min_t) {
             std::string gerr;
             try {
-                if (gxe.init(cx, (size_t)gx_mb << 20, Tc, gerr, threads)) {
+                if (gxe.init_unified(model, &ucx, r.vcache, (size_t)gx_mb << 20, Tc, gerr, threads)) {
                     r.gx = &gxe;
                     r.gx_min_T = gx_min_t;
                     fprintf(stderr, "[gpu-experts] on for chunks >= %d tokens: %.1f MiB device, device allocated %.2f GiB total\n", gx_min_t, gxe.device_bytes() / 1048576.0, (dev_bytes_allocated() + gxe.device_bytes()) / 1073741824.0);
@@ -309,7 +324,10 @@ int main(int argc, char** argv) {
         printf("%s", top_out.c_str());
         fprintf(stderr, "[prefill] total %.2f s = %.1f ppts (engram cpu %.2f s, cpu experts %.2f s)\n", t_pf, T0 / t_pf, r.t_engram_cpu, r.t_cpu_exp);
         const double io1 = io_read_gb();
-        fprintf(stderr, "[io] prefill: SSD read %.2f GB in %.2f s = %.3f GB/s (storage reads of this process, experts + Engram; direct expert reads %.2f GB, pread misses %.2f GB, from page cache %.2f GB)\n", io1 - io0, t_pf, (io1 - io0) / std::max(t_pf, 1e-9), cx.direct_read_bytes() / 1e9, cx.miss_read_bytes() / 1e9, cx.cached_read_bytes() / 1e9);
+        const auto ucs_pf = ucx.stats();
+        fprintf(stderr, "[io] prefill: SSD read %.2f GB in %.2f s = %.3f GB/s (cold %.2f GB, gx vram_experts %llu)\n",
+                io1 - io0, t_pf, (io1 - io0) / std::max(t_pf, 1e-9), ucs_pf.cold_bytes / 1e9,
+                (unsigned long long)(r.gx ? r.gx->stats().vram_experts : 0));
         if (spec_mode) {
             spec_set_batch_invariant();
             Spec sp(r, df, scfg);
@@ -324,8 +342,17 @@ int main(int argc, char** argv) {
                 return 1;
             }
             printf("generated ids: %s\n", gen_ids.c_str());
-            fprintf(stderr, "[decode] %d tokens in %.2f s = %.2f tok/s (spec dfly2, finish %s, cpu experts %.1f ms/token)\n", made, td, made / td, finish.c_str(), made ? r.t_cpu_exp / made * 1000 : 0.0);
-            fprintf(stderr, "[io] decode: SSD read %.2f GB in %.2f s = %.3f GB/s (storage reads of this process, experts + Engram)\n", io_read_gb() - io1, td, (io_read_gb() - io1) / std::max(td, 1e-9));
+            fprintf(stderr, "[decode] %d tokens in %.2f s = %.2f tok/s (spec dfly2, finish %s, cpu experts %.1f ms/token, graph replays %llu captures %llu)\n",
+                    made, td, made / td, finish.c_str(), made ? r.t_cpu_exp / made * 1000 : 0.0,
+                    (unsigned long long)r.graph_replays, (unsigned long long)r.graph_captures);
+            if (vcache.active()) {
+                const uint64_t ht = vcache.hits(), ms = vcache.misses();
+                fprintf(stderr, "[vram-cache] hits %llu / %llu (%.1f%%), promotions %llu\n",
+                        (unsigned long long)ht, (unsigned long long)(ht + ms),
+                        (ht + ms) ? 100.0 * (double)ht / (double)(ht + ms) : 0.0, (unsigned long long)vcache.promotions());
+            }
+            fprintf(stderr, "[io] decode: SSD read %.2f GB in %.2f s = %.3f GB/s (cpu pool %.1f GB/s)\n",
+                    io_read_gb() - io1, td, (io_read_gb() - io1) / std::max(td, 1e-9), ucx.stats().gbps());
             sp.report(stderr, td * 1000.0);
             std::ofstream f(out_dir + "/gen_ids.txt");
             f << gen_ids << "\n";
@@ -494,6 +521,7 @@ int main(int argc, char** argv) {
                     margins.push_back(b1 - b2);
                 }
                 next = nx;
+                r.step_adapt();
                 times.push_back(now_s() - ts);
             }
             const double td = now_s() - t1;
@@ -501,9 +529,18 @@ int main(int argc, char** argv) {
             r.prof_report("decode");
             r.pacc_report("decode", (int)times.size());
             std::sort(times.begin(), times.end());
-            fprintf(stderr, "[decode] %zu tokens in %.2f s = %.2f tok/s (median step %.1f ms, cpu experts %.1f ms/token)\n", times.size(), td, times.size() / td,
-                    times.empty() ? 0.0 : times[times.size() / 2] * 1000, times.empty() ? 0.0 : r.t_cpu_exp / times.size() * 1000);
-            fprintf(stderr, "[io] decode: SSD read %.2f GB in %.2f s = %.3f GB/s (storage reads of this process, experts + Engram)\n", io_read_gb() - io1, td, (io_read_gb() - io1) / std::max(td, 1e-9));
+            fprintf(stderr, "[decode] %zu tokens in %.2f s = %.2f tok/s (median step %.1f ms, cpu experts %.1f ms/token, graph replays %llu captures %llu)\n",
+                    times.size(), td, times.size() / td,
+                    times.empty() ? 0.0 : times[times.size() / 2] * 1000, times.empty() ? 0.0 : r.t_cpu_exp / times.size() * 1000,
+                    (unsigned long long)r.graph_replays, (unsigned long long)r.graph_captures);
+            if (vcache.active()) {
+                const uint64_t ht = vcache.hits(), ms = vcache.misses();
+                fprintf(stderr, "[vram-cache] hits %llu / %llu (%.1f%%), promotions %llu\n",
+                        (unsigned long long)ht, (unsigned long long)(ht + ms),
+                        (ht + ms) ? 100.0 * (double)ht / (double)(ht + ms) : 0.0, (unsigned long long)vcache.promotions());
+            }
+            fprintf(stderr, "[io] decode: SSD read %.2f GB in %.2f s = %.3f GB/s (cpu pool %.1f GB/s)\n",
+                    io_read_gb() - io1, td, (io_read_gb() - io1) / std::max(td, 1e-9), ucx.stats().gbps());
             std::ofstream f(out_dir + "/gen_ids.txt");
             f << gen_ids << "\n";
             if (!margins.empty()) {

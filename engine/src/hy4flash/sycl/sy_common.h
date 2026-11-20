@@ -6,20 +6,47 @@
 //   * device buffers larger than 4 GiB are never allocated (Arc: relaxed allocation limits are off by default): big weights live in slabs.
 #pragma once
 #include <sycl/sycl.hpp>
+#if __has_include(<sycl/ext/oneapi/experimental/graph.hpp>)
+#include <sycl/ext/oneapi/experimental/graph.hpp>
+#define HY4S_HAS_GRAPH 1
+#else
+#define HY4S_HAS_GRAPH 0
+#endif
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #define REQD_SG32 [[sycl::reqd_sub_group_size(32)]]
 
 namespace hy4s {
 
+inline void hy4s_setenv(const char* k, const char* v, int overwrite = 1) {
+#ifdef _WIN32
+    if (!overwrite && std::getenv(k)) return;
+    _putenv_s(k, v);
+#else
+    setenv(k, v, overwrite);
+#endif
+}
+
+[[noreturn]] inline void hy4s_exit_fast(int code) {
+    fflush(stdout);
+    fflush(stderr);
+    _exit(code);
+}
+
 // storage bytes this process has read (/proc/self/io read_bytes: page-cache misses, O_DIRECT reads, readahead), in GB
 inline double io_read_gb() {
     double v = 0;
+#ifndef _WIN32
     if (FILE* f = fopen("/proc/self/io", "r")) {
         char ln[128];
         while (fgets(ln, sizeof ln, f)) {
@@ -28,8 +55,17 @@ inline double io_read_gb() {
         }
         fclose(f);
     }
+#endif
     return v;
 }
+
+// Device-resident dynamic step parameters for SYCL command_buffer / command_graph replay
+struct StepParams {
+    int32_t p0 = 0;
+    int32_t cap_row = 0;
+    int32_t a = 0;
+    int32_t pad = 0;
+};
 
 using half = sycl::half;
 
@@ -50,6 +86,64 @@ inline sycl::queue& Q() {
 }
 
 inline void wait() { Q().wait_and_throw(); }
+
+struct DevCaps {
+    std::string name;
+    std::string platform;
+    size_t global_mem = 0;
+    size_t max_alloc = 0;
+    size_t local_mem = 0;
+    size_t max_wg = 0;
+    uint32_t eu_count = 0;
+    bool has_sg8 = false;
+    bool has_sg16 = false;
+    bool has_sg32 = false;
+    bool is_level_zero = false;
+    bool has_graph = false;
+    bool has_xmx_sg8 = false;
+    bool has_xmx_sg16 = false;
+};
+
+inline const DevCaps& dev_caps() {
+    static DevCaps c = [] {
+        DevCaps d;
+        auto dev = Q().get_device();
+        d.name = dev.get_info<sycl::info::device::name>();
+        d.platform = dev.get_platform().get_info<sycl::info::platform::name>();
+        d.global_mem = dev.get_info<sycl::info::device::global_mem_size>();
+        d.max_alloc = dev.get_info<sycl::info::device::max_mem_alloc_size>();
+        d.local_mem = dev.get_info<sycl::info::device::local_mem_size>();
+        d.max_wg = dev.get_info<sycl::info::device::max_work_group_size>();
+        d.eu_count = dev.get_info<sycl::info::device::max_compute_units>();
+        for (auto s : dev.get_info<sycl::info::device::sub_group_sizes>()) {
+            if (s == 8) d.has_sg8 = true;
+            if (s == 16) d.has_sg16 = true;
+            if (s == 32) d.has_sg32 = true;
+        }
+        d.is_level_zero = (dev.get_backend() == sycl::backend::ext_oneapi_level_zero);
+#if HY4S_HAS_GRAPH
+        d.has_graph = dev.has(sycl::aspect::ext_oneapi_limited_graph) || dev.has(sycl::aspect::ext_oneapi_graph);
+#endif
+        // Alchemist (DG2 / Arc A-series) supports SG=8 XMX (8x8x16 fp16, 8x8x32 int8);
+        // Battlemage Xe2 (Arc B-series / Lunar Lake) / PVC supports SG=16 XMX (8x16x16 fp16, 8x16x32 int8) and has no SG=8.
+        // Older/non-XMX Intel iGPUs fall back to SG=32 SIMT tiled GEMM when HY4S_NO_XMX=1 or when joint_matrix is unsupported.
+        const bool no_xmx = std::getenv("HY4S_NO_XMX") && std::getenv("HY4S_NO_XMX")[0] == '1';
+        if (!no_xmx) {
+            bool is_arc_or_xmx = (d.name.find("Arc") != std::string::npos || d.name.find("Data Center") != std::string::npos ||
+                                  d.name.find("A7") != std::string::npos || d.name.find("A5") != std::string::npos ||
+                                  d.name.find("A3") != std::string::npos || d.name.find("B5") != std::string::npos ||
+                                  d.name.find("140V") != std::string::npos || d.name.find("130V") != std::string::npos ||
+                                  d.name.find("Battlemage") != std::string::npos || d.name.find("Alchemist") != std::string::npos ||
+                                  d.name.find("DG2") != std::string::npos || d.name.find("BMG") != std::string::npos);
+            if (is_arc_or_xmx) {
+                if (d.has_sg8) d.has_xmx_sg8 = true;
+                else if (d.has_sg16) d.has_xmx_sg16 = true;
+            }
+        }
+        return d;
+    }();
+    return c;
+}
 
 inline size_t& dev_bytes_allocated() { static size_t b = 0; return b; }  // running total of dalloc bytes (the free-memory query of the driver reports the whole card)
 template <class T> inline T* dalloc(size_t n) {

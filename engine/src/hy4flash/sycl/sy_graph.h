@@ -1,16 +1,21 @@
-// sy_graph.h - the 42-layer hy_v4_flash forward on an Intel Arc GPU (SYCL): trunk + KV on the GPU, routed experts on the CPU.
-// Port of run/hy4_graph.hip.h: chunked prefill + decode, KV fp16 MLA latent cache, absorbed MLA, IndexPool, LatentMoE (experts via CpuExperts), Engram.
+// sy_graph.h - 42-layer hy_v4_flash forward on Intel Arc (SYCL):
+//   * SYCL command_graph / command_buffer capture & replay for decode (T=1) and verify (T=2..8): ~1300 launches -> 85 replays
+//   * Quantized S_K kv_b decode/verify + single-layer 29 MB prefill scratch (-0.76 GiB VRAM, 3x less decode kv_b bandwidth)
+//   * Scratch buffer aliasing (o_h=H1, kv_f=F1, ctx_h=F2 -> -164 MB at Tc=1024, -327 MB at Tc=2048)
+//   * Unified hy4::CpuExperts (AVX-512 VBMI/VNNI + AVX2 + two-term hi + cold SSD) + multi-slab SyVramExpertCache
+//   * Deterministic two-launch hc_mix2 (f96da6f22) and batch-invariant MLA split-K (61e7db340) preserved intact
 #pragma once
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <future>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "hy4_cpu_experts.h"
 #include "hy4_engram.h"
-#include "hy4s_cpuexp.h"
 #include "sy_common.h"
 #include "sy_gemm_xmx.h"
 #include "sy_gpuexp.h"
@@ -20,6 +25,7 @@
 #include "sy_mla.h"
 #include "sy_model.h"
 #include "sy_vision.h"
+#include "sy_vram_cache.h"
 
 namespace hy4s {
 
@@ -60,55 +66,155 @@ static void save_npy_f32(const std::string& path, const float* d, const std::vec
     fclose(f);
 }
 
-struct EngramDev {  // per module, gathered at init
-    float* lnw = nullptr;        // [16][96]
-    float* kvb = nullptr;        // [5][3072]
-    float* egate = nullptr;      // [4][3072] norm_key*norm_query
-    float* pre_gamma = nullptr;  // [3072]
-    float* hcs = nullptr;        // [4][3072]
+struct EngramDev {
+    float* lnw = nullptr;
+    float* kvb = nullptr;
+    float* egate = nullptr;
+    float* pre_gamma = nullptr;
+    float* hcs = nullptr;
 };
+
+// Shared placement helper for sy_main & sy_serve: partitions Section 4 experts across
+//   Tier 0: SyVramExpertCache (multi-slab <= 1.4 GiB/slab, auto-sized from free VRAM or --vram-experts-gb)
+//   Tier 1: hy4::CpuExperts RAM arena (AVX-512 VBMI/VNNI or AVX2 + optional two-term "hi")
+//   Tier 2: hy4::CpuExperts cold SSD tier (when remaining experts exceed RAM budget)
+inline bool setup_experts_unified(const std::string& model_path, int threads, double vram_experts_gb_arg, double ram_experts_gb_arg,
+                                  size_t reserve_vram_bytes, size_t host_overhead_bytes, bool hi_act,
+                                  SyVramExpertCache& vcache, hy4::CpuExperts& ucx, std::string& err) {
+    // 1. Determine VRAM expert cache budget
+    size_t vram_budget = 0;
+    if (vram_experts_gb_arg >= 0.0) {
+        vram_budget = (size_t)(vram_experts_gb_arg * 1073741824.0);
+    } else if (const char* env_v = std::getenv("HY4S_VRAM_EXPERTS_GB")) {
+        const double g = atof(env_v);
+        vram_budget = g > 0.0 ? (size_t)(g * 1073741824.0) : 0;
+    } else {
+        const size_t tot = dev_caps().global_mem;
+        const size_t used = dev_bytes_allocated() + reserve_vram_bytes;
+        const size_t safe_cap = (size_t)((double)tot * 0.94);
+        if (safe_cap > used + (256ull << 20)) vram_budget = safe_cap - used;
+    }
+
+    if (!vcache.init(model_path, vram_budget, err, 1400)) return false;
+
+    // 2. Partition remaining experts into RAM arena vs cold SSD using Section 3 rank order
+    std::vector<uint16_t> eor, codes;
+    std::vector<uint32_t> bbytes;
+    if (!hy4::CpuExperts::read_rank_table(model_path, eor, codes, err)) return false;
+    if (!hy4::CpuExperts::read_body_bytes(model_path, bbytes, err)) return false;
+    const int NL = (int)(eor.size() / 512);
+
+    std::vector<std::vector<bool>> vram_mask;
+    vcache.build_vram_mask(vram_mask);
+
+    uint64_t ram_budget = 0;
+    if (ram_experts_gb_arg > 0.0) {
+        ram_budget = (uint64_t)(ram_experts_gb_arg * 1e9);
+    } else if (const char* env_r = std::getenv("HY4S_RAM_BUDGET_GB")) {
+        ram_budget = (uint64_t)(atof(env_r) * 1e9);
+    } else {
+        const uint64_t sys_ram = hy4::CpuExperts::ram_budget_bytes();
+        const uint64_t keep = host_overhead_bytes + (uint64_t)(8.5 * 1e9);  // OS + SYCL runtime + KV + bounce ring + Engram
+        ram_budget = sys_ram > keep ? (sys_ram - keep) : 0;
+    }
+
+    std::vector<std::vector<bool>> cpu_mask(NL, std::vector<bool>(512, false));
+    std::vector<std::vector<bool>> cold_mask(NL, std::vector<bool>(512, false));
+    uint64_t ram_used = 0, n_cpu = 0, n_cold = 0, cold_bytes = 0;
+    bool ram_full = false;
+    for (int rk = 0; rk < 512; ++rk) {
+        for (int L = 0; L < NL; ++L) {
+            const size_t idx = (size_t)L * 512 + rk;
+            const int e = eor[idx];
+            const uint64_t sz = ((uint64_t)bbytes[idx] + 4095ull) & ~4095ull;
+            if (vcache.active() && vram_mask[L][e]) {
+                // Initially in VRAM; mark cold_mask as on-disk fallback in case adaptive cache evicts it later (0 RAM cost!)
+                cold_mask[L][e] = true;
+                continue;
+            }
+            if (!ram_full && ram_used + sz <= ram_budget) {
+                cpu_mask[L][e] = true;
+                ram_used += sz;
+                ++n_cpu;
+            } else {
+                ram_full = true;
+                cold_mask[L][e] = true;
+                ++n_cold;
+                cold_bytes += sz;
+            }
+        }
+    }
+
+    if (!ucx.init(model_path, threads, &cpu_mask, err)) return false;
+    if (hi_act) ucx.set_hi_activations(true);
+
+    bool any_cold = false;
+    for (int L = 0; L < NL && !any_cold; ++L)
+        for (int e = 0; e < 512; ++e)
+            if (cold_mask[L][e]) { any_cold = true; break; }
+#ifndef _WIN32
+    if (any_cold) {
+        // When cold tail is small (< 12 GB, e.g. 62 GB RAM box with SQ-64), default to buffered IO so Linux page cache holds it fast
+        if (!std::getenv("STRATA_CPUEXP_COLD_IO") && cold_bytes < (uint64_t)(12.0 * 1e9))
+            hy4s_setenv("STRATA_CPUEXP_COLD_IO", "buffered", 0);
+        if (!ucx.set_cold_experts(cold_mask, err)) return false;
+    }
+#endif
+    fprintf(stderr, "[experts] unified pool (%s, %d thr, act=%s): %d VRAM (%.2f GiB), %llu RAM (%.2f GB, load %.1f s), %llu cold SSD (%.2f GB)\n",
+            ucx.kernel_name(), ucx.n_threads(), ucx.hi_activations() ? "hi" : "q8",
+            vcache.num_slots(), vcache.device_bytes() / 1073741824.0,
+            (unsigned long long)n_cpu, ucx.arena_bytes() / 1e9, ucx.load_seconds(),
+            (unsigned long long)n_cold, cold_bytes / 1e9);
+    return true;
+}
 
 class Runner {
 public:
     SyModel& g;
     const hy4::Cfg& c;
-    CpuExperts& cx;
+    hy4::CpuExperts& ucx;
+    SyVramExpertCache* vcache = nullptr;
     int max_ctx, Tc;
-    int expert_act = 1;  // 0 float activations (oracle math), 1 Q8_1 activations (fast integer path)
-    GpuExperts* gx = nullptr;  // routed experts on the GPU for chunks of >= gx_min_T tokens (prefill); null: CPU only
+    int expert_act = 1;
+    GpuExperts* gx = nullptr;
     int gx_min_T = 32;
-    int kv_host_above = 24000;  // max_ctx above which the sparse layers' KV caches stay in pinned host memory
+    int kv_host_above = 24000;
     size_t kv_host_bytes = 0;
     int iring = 0;
     int score_rows = 256;
-    // buffers
+
+    // Device buffers
     int32_t* d_ids = nullptr;
+    StepParams* d_step = nullptr;
+    StepParams* h_step = nullptr;
     float *x = nullptr, *pre = nullptr, *post = nullptr, *cur_f = nullptr, *F1 = nullptr, *F2 = nullptr, *F3 = nullptr, *sub = nullptr;
     half *cur_h = nullptr, *qr_h = nullptr, *qa_h = nullptr, *o_h = nullptr, *H1 = nullptr, *z_h = nullptr, *er_h = nullptr, *hfin = nullptr, *ctx_h = nullptr;
-    float *z_f = nullptr, *zout_f = nullptr, *moe_w = nullptr, *logits = nullptr;
+    float *z_f = nullptr, *zout_f = nullptr, *zout_gpu_f = nullptr, *moe_w = nullptr, *logits = nullptr;
     int32_t *moe_idx = nullptr, *d_argmax = nullptr;
-    float* d_pack = nullptr;  // device buffer of the MoE router/fold outputs (idx, w, z; see init) and its pinned host mirror
+    float* d_pack = nullptr;
     float* h_pack = nullptr;
     float* hc_part = nullptr;
     uint32_t* hc_cnt = nullptr;
-    float* h_z = nullptr;     // pinned host: z [T][1536]
-    float* h_zout = nullptr;  // pinned host: expert output [T][1536]
+    float* h_z = nullptr;
+    float* h_zout = nullptr;
     int32_t* h_idx = nullptr;
     float* h_w = nullptr;
+    uint8_t h_use_cpu[16 * 16] = {};
     void* mla_ws = nullptr;
     size_t mla_ws_bytes = 0;
-    float* kv_f = nullptr;
+    float* kv_f = nullptr;  // aliased to F1!
     uint8_t* d_eraw[4] = {};
     uint8_t* d_evalid[4] = {};
     EngramDev eng_dev[4];
-    half* wk_b = nullptr;
-    half* wv_b = nullptr;
-    std::vector<size_t> wk_off, wv_off;
+    // Single-layer reusable fp16 kv_b scratch for prefill (29.4 MB instead of 1.06 GB persistent!)
+    half* wk_tmp = nullptr;
+    half* wv_tmp = nullptr;
     std::vector<half*> kcache;
-    // DFly2 hook: the top-index_topk key lists of target layers 25,29,33,37,41 for the last (up to 16) rows of the most recent forward chunk (sy_dfly2.h reads them)
-    VisionCtx* vis = nullptr;  // the pictures of the running request (sy_vision.h); null for a text-only request: every hook is a no-op then
+
+    // Vision & DFly2 capture
+    VisionCtx* vis = nullptr;
     bool dfly_cap = false;
-    int32_t *dkeys[5] = {}, *dnkc[5] = {};  // [16][index_topk], [16]
+    int32_t *dkeys[5] = {}, *dnkc[5] = {};
     int cap_p0 = -1, cap_rows = 0;
     bool cap_list[5] = {};
     static int dfly_slot(int il) { return il == 25 ? 0 : il == 29 ? 1 : il == 33 ? 2 : il == 37 ? 3 : il == 41 ? 4 : -1; }
@@ -120,6 +226,13 @@ public:
             }
         dfly_cap = true;
     }
+    void dfly_capture_copy(int il, int T, bool use_list) {
+        const int d = dfly_slot(il);
+        if (d < 0 || !use_list) return;
+        const int nr = std::min(T, 16), r0 = T - nr;
+        d2d(dkeys[d], keys + (size_t)r0 * index_topk, (size_t)nr * index_topk * 4);
+        d2d(dnkc[d], nkeys + r0, (size_t)nr * 4);
+    }
     void dfly_capture(int il, int p0, int T, bool use_list) {
         const int d = dfly_slot(il);
         if (d < 0) return;
@@ -127,24 +240,22 @@ public:
         cap_p0 = p0 + r0;
         cap_rows = nr;
         cap_list[d] = use_list;
-        if (use_list) {
-            d2d(dkeys[d], keys + (size_t)r0 * index_topk, (size_t)nr * index_topk * 4);
-            d2d(dnkc[d], nkeys + r0, (size_t)nr * 4);
-        }
+        dfly_capture_copy(il, T, use_list);
     }
+
     int ring = 0, slots_sparse = 0, logit_rows = 1;
-    // host side engram
     hy4::EngramMeta emeta;
     hy4::EngramIO eio;
     bool engram_ready = false;
     double t_engram_cpu = 0, t_engram_wait = 0, t_cpu_exp = 0;
     bool dump = false, dbg_layers = false;
     std::string force_route_dir;
-    int cur_p0 = 0;  // first position of the chunk being processed (forced routing rows)
+    int cur_p0 = 0;
     std::string dump_dir = ".";
     int index_on = 1;
     int index_topk = 2048;
-    // indexer state
+
+    // Indexer state
     std::vector<half*> ivg, pooled;
     float *ik_f = nullptr, *iv_f = nullptr, *ig_f = nullptr, *iq_f = nullptr, *hw_f = nullptr, *score = nullptr;
     half *ik_h = nullptr, *iq_h = nullptr;
@@ -152,7 +263,35 @@ public:
     size_t ldS = 0;
     bool last_use_list = false;
 
-    Runner(SyModel& gm, CpuExperts& cxe, int max_ctx_, int max_chunk, int logit_rows_) : g(gm), c(gm.man.c), cx(cxe), max_ctx(max_ctx_), Tc(max_chunk), logit_rows(logit_rows_) {}
+    // SYCL command_graph state
+    bool graph_enabled = false;
+    uint64_t graph_replays = 0, graph_captures = 0;
+
+#if HY4S_HAS_GRAPH
+    struct GraphKey {
+        int T = 0, use_list = 0, dfly_cap = 0, engram_on = 0;
+        int swa_TK = 0, swa_S = 0, swa_tps = 0;
+        int sp_TK = 0, sp_S = 0, sp_tps = 0;
+        bool operator==(const GraphKey& o) const {
+            return T == o.T && use_list == o.use_list && dfly_cap == o.dfly_cap && engram_on == o.engram_on &&
+                   swa_TK == o.swa_TK && swa_S == o.swa_S && swa_tps == o.swa_tps &&
+                   sp_TK == o.sp_TK && sp_S == o.sp_S && sp_tps == o.sp_tps;
+        }
+    };
+    using ExecGraph = sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>;
+    struct GraphSet {
+        GraphKey key;
+        std::unique_ptr<ExecGraph> g_init;
+        std::unique_ptr<ExecGraph> g_l1_pre;
+        std::vector<std::unique_ptr<ExecGraph>> g_shared;     // [42]
+        std::vector<std::unique_ptr<ExecGraph>> g_post_next;  // [42]
+    };
+    std::vector<std::unique_ptr<GraphSet>> gcache_;
+    std::unique_ptr<ExecGraph> g_head_[9];  // cached head(T, 0) for T = 1..8
+#endif
+
+    Runner(SyModel& gm, hy4::CpuExperts& cxe, int max_ctx_, int max_chunk, int logit_rows_)
+        : g(gm), c(gm.man.c), ucx(cxe), max_ctx(max_ctx_), Tc(max_chunk), logit_rows(logit_rows_) {}
 
     const void* tw(const std::string& name) const { return g.tw(name); }
     const hy4::TInfo& ti(const std::string& name) const { return g.ti(name); }
@@ -160,8 +299,13 @@ public:
     int heads(int il) const { return c.is_swa[il] ? c.heads_swa : c.heads_sparse; }
     double theta(int il) const { return c.is_swa[il] ? c.theta_swa : c.theta_sparse; }
 
-    // per-section GPU timeline (prof2, needs the profiling queue: HY4S_PROF=1): every labelled section is bracketed by two marker kernels whose GPU start times are read back at
-    // the report, so the sections show real GPU time including launch gaps, without draining the queue (the queue keeps running between the markers).
+    // Call strictly between decode/verify steps for adaptive VRAM expert promotion (disabled during checks)
+    void step_adapt() {
+        if (!vcache || !vcache->active() || dump || tap || !force_route_dir.empty()) return;
+        vcache->step_adapt([&](int L, int e) -> const uint8_t* { return ucx.view(L, e).body; });
+    }
+
+    // Per-section GPU timeline (prof2)
     bool prof2 = false;
     std::map<std::string, std::pair<double, int>> pacc;
     struct PEv { sycl::event a, b; std::string nm; };
@@ -175,7 +319,7 @@ public:
         bool on;
         PEv e;
         PS(Runner* r_, const std::string& n) : r(r_), on(r_->prof2) {
-            if (sync_all_env()) wait();  // HY4S_SYNCALL=1: debug, a full device sync around every scoped stage
+            if (sync_all_env()) wait();
             if (!on) return;
             e.nm = n;
             e.a = Q().single_task([]() {});
@@ -230,6 +374,8 @@ public:
     bool init(const std::string& engram_path, std::string& err) {
         const int T = Tc;
         d_ids = dalloc<int32_t>(T);
+        d_step = dalloc<StepParams>(1);
+        h_step = halloc<StepParams>(1);
         x = dalloc<float>((size_t)T * 4 * HID);
         pre = dalloc<float>(T * 4);
         post = dalloc<float>(T * 4);
@@ -246,9 +392,10 @@ public:
         H1 = dalloc<half>(big);
         qr_h = dalloc<half>((size_t)T * 1024);
         qa_h = dalloc<half>((size_t)T * 64 * 576);
-        o_h = dalloc<half>((size_t)T * 16384);
-        ctx_h = dalloc<half>((size_t)T * 64 * 512);
-        // routing + folded activations share one device buffer and one pinned host buffer: [idx T*16 | w T*16 | z T*1536], so a decode step needs ONE device->host copy per MoE layer
+        // Buffer aliasing (non-overlapping lifetimes -> saves ~164 MB at Tc=1024, ~327 MB at Tc=2048!)
+        o_h = H1;                            // o_h only live in attention; H1 only live in MLP
+        ctx_h = reinterpret_cast<half*>(F2); // F2 dead between mla_prep_q and mla_vup; sizeof(F2) == T*64*512*2
+        kv_f = F1;                           // kv_f only live in engram_layer (5*T*3072 = 15360*T <= 16384*T)
         if (std::getenv("HY4S_HASH")) d_hash = dalloc<uint64_t>(65536);
         d_pack = dalloc<float>((size_t)T * (32 + 1536));
         h_pack = halloc<float>((size_t)T * (32 + 1536));
@@ -260,11 +407,17 @@ public:
         h_w = h_pack + (size_t)T * 16;
         z_h = dalloc<half>((size_t)T * 1536);
         zout_f = dalloc<float>((size_t)T * 1536);
+        zout_gpu_f = dalloc<float>((size_t)16 * 1536);
         h_zout = halloc<float>((size_t)T * 1536);
         hfin = dalloc<half>((size_t)T * HID);
         logits = dalloc<float>((size_t)logit_rows * c.vocab);
         d_argmax = dalloc<int32_t>(16);
-        // kv caches
+
+        // Pre-allocate split-K MLA workspace big enough for decode/verify so command_graph pointer never reallocates!
+        mla_ws_bytes = (size_t)8 * 4 * 16 * (16 * 512 + 32) * sizeof(float);  // ~17 MB (covers up to M=8, NH=64, S=16)
+        mla_ws = dalloc<uint8_t>(mla_ws_bytes);
+
+        // KV caches
         ring = ((512 + Tc + 15) / 16) * 16;
         slots_sparse = ((max_ctx + 8 + 15) / 16) * 16;
         kcache.resize(c.n_layers);
@@ -272,8 +425,7 @@ public:
         for (int il = 0; il < c.n_layers; ++il) {
             const int slots = c.is_swa[il] ? ring : slots_sparse;
             const size_t by = mla_cache_bytes(slots);
-            // long contexts: the 12 sparse layers' caches (1152 B/token each) live in pinned host memory that the GPU reads over PCIe (the IndexPool attends only ~2052 keys per
-            // query on these layers, ~2.4 MB per layer and token), because 128K tokens of KV (1.8 GB) do not fit next to the 6.4 GB trunk in 7.5 GB of VRAM
+            // Put sparse KV in VRAM if card has >= 14 GiB and max_ctx fits comfortably; otherwise host-mapped for > kv_host_above
             const bool host_kv = !c.is_swa[il] && max_ctx > kv_host_above;
             if (host_kv) {
                 kcache[il] = (half*)halloc<uint8_t>(by);
@@ -285,7 +437,8 @@ public:
             }
             kvbytes += by;
         }
-        // indexer state (sparse layers only): iv/ig rows are a ring (the groups of 4 are pooled as soon as they are complete)
+
+        // Indexer state
         iring = ((Tc + 8 + 3) / 4) * 4;
         ivg.assign(c.n_layers, nullptr);
         pooled.assign(c.n_layers, nullptr);
@@ -305,28 +458,12 @@ public:
         score = dalloc<float>((size_t)std::min(Tc, score_rows) * ldS);
         keys = dalloc<int32_t>((size_t)Tc * (index_topk + 8));
         nkeys = dalloc<int32_t>((size_t)Tc);
-        // absorbed weights
-        wk_off.resize(c.n_layers);
-        wv_off.resize(c.n_layers);
-        size_t tk = 0, tv = 0;
-        for (int il = 0; il < c.n_layers; ++il) {
-            const int NH = heads(il);
-            wk_off[il] = tk;
-            wv_off[il] = tv;
-            tk += (size_t)NH * 192 * 512;
-            tv += (size_t)NH * 256 * 512;
-        }
-        wk_b = dalloc<half>(tk);
-        wv_b = dalloc<half>(tv);
-        for (int il = 0; il < c.n_layers; ++il) {
-            const std::string nm = L(il) + ".self_attn.kv_b_proj.weight";
-            if (!split_kvb(ti(nm).fmt, tw(nm), wk_b + wk_off[il], wv_b + wv_off[il], heads(il))) {
-                err = "kv_b_proj format not supported";
-                return false;
-            }
-        }
-        wait();
-        // engram
+
+        // Single-layer reusable fp16 kv_b scratch for prefill (29.4 MB vs 1.06 GB persistent!)
+        wk_tmp = dalloc<half>((size_t)64 * 192 * 512);
+        wv_tmp = dalloc<half>((size_t)64 * 256 * 512);
+
+        // Engram
         if (!hy4::load_engram_meta_file(g.path, emeta, err)) return false;
         if (!engram_path.empty()) {
             if (!eio.open(engram_path, g.seed.data(), g.seed.size(), hy4::ENGRAM_DEFAULT_LRU_ROWS, 16, 8, err)) return false;
@@ -359,17 +496,26 @@ public:
             d_evalid[mo] = dalloc<uint8_t>((size_t)Tc * 16);
         }
         er_h = dalloc<half>((size_t)Tc * 1536);
-        kv_f = dalloc<float>((size_t)5 * Tc * HID);
         ep_alloc();
         build_fuse();
+
+        // Enable SYCL command_graph when supported by device & runtime (HY4S_GRAPH=0 disables)
+#if HY4S_HAS_GRAPH
+        {
+            const char* eg = std::getenv("HY4S_GRAPH");
+            graph_enabled = dev_caps().has_graph && !(eg && eg[0] == '0');
+        }
+#endif
         wait();
-        fprintf(stderr, "[runner] kv cache %.2f GB (%.2f GB of it pinned host), ctx %d, chunk %d, device allocated %.2f GiB of 7.54\n", kvbytes / 1e9, kv_host_bytes / 1e9, max_ctx, Tc, dev_bytes_allocated() / 1073741824.0);
+        fprintf(stderr, "[runner] kv cache %.2f GB (%.2f GB host), ctx %d, chunk %d, graph=%d, device allocated %.2f GiB of %.2f GiB\n",
+                kvbytes / 1e9, kv_host_bytes / 1e9, max_ctx, Tc, (int)graph_enabled,
+                dev_bytes_allocated() / 1073741824.0, dev_caps().global_mem / 1073741824.0);
         return true;
     }
 
-    // Engram rows of one chunk for all 4 modules (CPU hash + page reads), uploaded to the device
+    // Engram prefetch / upload
     struct EPrep {
-        std::vector<uint8_t> raw, valid;  // [4][Tc*16*100], [4][Tc*16]
+        std::vector<uint8_t> raw, valid;
         int p0 = -1, T = 0;
         bool ok = false, pending = false;
         std::string err;
@@ -392,7 +538,7 @@ public:
             std::vector<uint64_t> ids((size_t)T * 16);
             uint8_t* valid = e->valid.data() + (size_t)mo * Tc * 16;
             hy4::engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), valid);
-            if (vis) vis->mask_engram(valid, p0, T);  // pictures: no Engram contribution at image positions
+            if (vis) vis->mask_engram(valid, p0, T);
             uint8_t* raw = e->raw.data() + (size_t)mo * Tc * 16 * 100;
             if (!eio.fetch_raw(ids.data(), ids.size(), raw, err)) {
                 e->ok = false;
@@ -443,8 +589,7 @@ public:
         return true;
     }
 
-    // HY4S_HASH=1: order-independent 64-bit hash of selected arrays, computed ON THE DEVICE without any host synchronisation inside the chunk (a tap with a wait() hid the race),
-    // printed to stderr at the end of every forward_chunk as "[hash] c<p0> <name> <hex>": compare two runs line by line to find the first stage whose result differs.
+    // Diagnostics (hash / tap / dump)
     uint64_t* d_hash = nullptr;
     std::vector<std::string> hash_names;
     void tap_hash(const std::string& name, const float* dev, size_t n) {
@@ -482,9 +627,8 @@ public:
         hash_names.clear();
     }
 
-    // --wincheck: every tapped array (in execution order) of one forward call, as float rows [T][per_row]
     std::vector<std::pair<std::string, std::vector<float>>>* tap = nullptr;
-    void tap_dev(const std::string& name, const void* dev, size_t n, int kind /*0 f32, 1 half, 2 int32*/) {
+    void tap_dev(const std::string& name, const void* dev, size_t n, int kind) {
         if (!tap) return;
         wait();
         std::vector<float> h(n);
@@ -503,7 +647,6 @@ public:
         wait();
         tap->push_back({name, std::move(h)});
     }
-    // IndexPool key lists of T rows: only the first nkeys entries of a row count
     void tap_keys(const std::string& name, int T) {
         if (!tap) return;
         wait();
@@ -533,6 +676,13 @@ public:
         else save_npy_f32(dump_dir + "/" + name + ".npy", h.data(), {T, D});
     }
 
+    int engram_mod_of(int il) const {
+        if (!engram_ready) return -1;
+        for (int j = 0; j < 4; ++j)
+            if (emeta.layers[j] == il) return j;
+        return -1;
+    }
+
     void engram_layer(int mo, int il, int T) {
         const std::string p = L(il) + ".engram_layer";
         EngramDev& e = eng_dev[mo];
@@ -545,10 +695,10 @@ public:
         engram_apply(x, kv_f, e.kvb, e.egate, e.pre_gamma, e.hcs, d_evalid[mo], T);
     }
 
+    // Deterministic two-launch hc_mix2 (f96da6f22) kept strictly intact!
     void hc_mix_run(const float* xin, const float* hfn, const float* hsc, const float* hbs, int nout, int T) {
         hc_mix2(xin, hfn, hsc, hbs, pre, post, nout, c.rms_eps, c.hc_eps, c.hc_mag, T, hc_part, hc_cnt);
     }
-    // iHC mix + reduce + RMSNorm(nw) of cur = sum_h pre_h x_h -> outh (fp16) / outf (fp32): one launch for T <= 8 (decode, verify windows), two for prefill chunks
     void hc_pre_run(const float* hfn, const float* hsc, const float* hbs, const float* nw, int nout, int T, const float* xin, half* outh, float* outf) {
         if (T <= 8 && fuse_dec) {
             hc_pre2(xin, hfn, hsc, hbs, nw, hc_part, hc_cnt, pre, post, outh, outf, nout, c.rms_eps, c.hc_eps, c.hc_mag, c.rms_eps, T);
@@ -557,8 +707,8 @@ public:
             hc_reduce_norm(xin, pre, nw, outh, outf, c.rms_eps, T);
         }
     }
-    // decode launch fusions (T == 1; HY4S_FUSE=0 turns them off): GEMV sets of the same input width in one launch (sy_rp.h GemvMulti), built once per layer
-    bool fuse_dec = true;
+
+    bool fuse_dec = false;
     float *kva2 = nullptr, *sg_f = nullptr, *su_f = nullptr, *so_f = nullptr;
     std::vector<GemvMulti> mg_att, mg_m1, mg_shd, mg_up;
     std::vector<char> mg_att_ok, mg_moe_ok;
@@ -569,11 +719,7 @@ public:
         else if (m.K != (int)t.cols()) return false;
         GemvJob& j = m.j[m.n++];
         j.W = (const uint8_t*)tw(name);
-        j.Y = Y;
-        j.Xh = Xh;
-        j.Xf = Xf;
-        j.Xg = Xg;
-        j.Xu = Xu;
+        j.Y = Y; j.Xh = Xh; j.Xf = Xf; j.Xg = Xg; j.Xu = Xu;
         j.N = (int)t.rows();
         j.row0 = m.total;
         j.xmode = xmode;
@@ -582,7 +728,7 @@ public:
     }
     void build_fuse() {
         const char* e = std::getenv("HY4S_FUSE");
-        fuse_dec = e && e[0] == '1';  // default off: measured 2.6 ms/token slower on the A750 (multi-GEMV with runtime input modes), numerically equivalent
+        fuse_dec = e && e[0] == '1';
         const int NL = c.n_layers;
         mg_att.assign(NL, GemvMulti());
         mg_m1.assign(NL, GemvMulti());
@@ -595,7 +741,7 @@ public:
         sg_f = dalloc<float>(1536);
         su_f = dalloc<float>(1536);
         so_f = dalloc<float>(HID);
-        float* z1 = d_pack + 32;  // z of the one-token pack layout [idx 16 | w 16 | z 1536]
+        float* z1 = d_pack + 32;
         for (int il = 0; il < NL; ++il) {
             const std::string pa = L(il) + ".self_attn", pm = L(il) + ".mlp";
             mg_att_ok[il] = mg_add(mg_att[il], pa + ".q_a_proj.weight", F1, 0, cur_h, nullptr, nullptr, nullptr) && mg_add(mg_att[il], pa + ".kv_a_proj_with_mqa.weight", kva2, 0, cur_h, nullptr, nullptr, nullptr);
@@ -608,38 +754,52 @@ public:
         }
     }
 
-    // IndexPool: cache iv/ig of the chunk's tokens and pool the groups completed by this chunk
-    void idx_update(int il, int p0, int T) {
+    // IndexPool helpers (both eager host-p0 and graph device-p0)
+    void idx_update(int il, int p0, int T, const StepParams* dp = nullptr) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".token_key_projection.weight", cur_h, ik_f, T);
         rms_rows(ik_f, (const float*)tw(p + ".token_key_norm.weight"), nullptr, ik_h, 128, c.rms_eps, T, 128);
         lin(p + ".key_value_projection.weight", ik_h, iv_f, T);
         lin(p + ".key_gate_projection.weight", ik_h, ig_f, T);
-        idx::store(iv_f, ig_f, ivg[il], p0, T, iring);
-        const int g_lo = p0 / 4, g_hi = (p0 + T) / 4 - 1;
-        if (g_hi >= g_lo) idx::pool(ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il), c.rms_eps, iring);
-        if (vis && g_hi >= g_lo && vis->needs_fix(p0, T)) vis->pool_fix(pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il));
-    }
-
-    // per-token key lists for the chunk (sparse layer, sequence longer than index_topk)
-    void idx_select(int il, int p0, int T) {
-        const std::string p = L(il) + ".self_attn.compressed_indexer";
-        lin(p + ".query_projection.weight", qr_h, iq_f, T);
-        if (vis && vis->needs_fix(p0, T)) vis->iq_rope(iq_f, iq_h, T, p0, (float)theta(il));  // pictures: 3D positions
-        else idx::q_rope(iq_f, iq_h, p0, (float)theta(il), T);
-        lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
-        const int n_top = index_topk / c.kpool - 1;
-        // scores are computed and consumed in batches of <= score_rows tokens (the score buffer is [score_rows][ctx/4] floats: 33 MB at 128K instead of 134 MB for a 1024 chunk)
-        for (int t0 = 0; t0 < T; t0 += score_rows) {
-            const int tb = std::min(score_rows, T - t0);
-            int G = (p0 + t0 + tb) / 4;
-            if (G < 1) G = 1;
-            idx::score(iq_h + (size_t)t0 * 2048, hw_f + (size_t)t0 * 16, pooled[il], score, p0 + t0, G, (int)ldS, 1.0f / std::sqrt((float)(128 * 16)), tb);
-            idx::select(score, (int)ldS, p0 + t0, n_top, index_topk, keys + (size_t)t0 * index_topk, nkeys + t0, tb);
+        if (dp) {
+            idx::store_dev(iv_f, ig_f, ivg[il], dp, T, iring);
+            idx::pool_dev(ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], dp, T, (float)theta(il), c.rms_eps, iring);
+        } else {
+            idx::store(iv_f, ig_f, ivg[il], p0, T, iring);
+            const int g_lo = p0 / 4, g_hi = (p0 + T) / 4 - 1;
+            if (g_hi >= g_lo) idx::pool(ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il), c.rms_eps, iring);
+            if (vis && g_hi >= g_lo && vis->needs_fix(p0, T)) vis->pool_fix(pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il));
         }
     }
 
-    void attention_layer(int il, int p0, int T) {
+    void idx_select(int il, int p0, int T, const StepParams* dp = nullptr) {
+        const std::string p = L(il) + ".self_attn.compressed_indexer";
+        lin(p + ".query_projection.weight", qr_h, iq_f, T);
+        if (dp) {
+            idx::q_rope_dev(iq_f, iq_h, dp, (float)theta(il), T);
+        } else {
+            if (vis && vis->needs_fix(p0, T)) vis->iq_rope(iq_f, iq_h, T, p0, (float)theta(il));
+            else idx::q_rope(iq_f, iq_h, p0, (float)theta(il), T);
+        }
+        lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
+        const int n_top = index_topk / c.kpool - 1;
+        if (dp) {
+            idx::score_dev(iq_h, hw_f, pooled[il], score, dp, (int)ldS, 1.0f / std::sqrt((float)(128 * 16)), T);
+            idx::select_dev(score, (int)ldS, dp, n_top, index_topk, keys, nkeys, T);
+        } else {
+            for (int t0 = 0; t0 < T; t0 += score_rows) {
+                const int tb = std::min(score_rows, T - t0);
+                int G = (p0 + t0 + tb) / 4;
+                if (G < 1) G = 1;
+                idx::score(iq_h + (size_t)t0 * 2048, hw_f + (size_t)t0 * 16, pooled[il], score, p0 + t0, G, (int)ldS, 1.0f / std::sqrt((float)(128 * 16)), tb);
+                idx::select(score, (int)ldS, p0 + t0, n_top, index_topk, keys + (size_t)t0 * index_topk, nkeys + t0, tb);
+            }
+        }
+    }
+
+    // Core attention kernels (works for both eager host-p0 and command_graph device-p0!)
+    void attention_layer_core(int il, int p0, int T, const StepParams* dp, bool force_use_list,
+                              int g_TK, int g_S, int g_tps) {
         const std::string pa = L(il) + ".self_attn";
         const int NH = heads(il);
         const bool swa = c.is_swa[il];
@@ -647,140 +807,366 @@ public:
         const float* hsc = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_base");
         { PS _q(this, "hc_pre"); hc_pre_run(hfn, hsc, hbs, (const float*)tw(L(il) + ".input_layernorm.weight"), 8, T, x, cur_h, nullptr); }
-        const bool fz = T == 1 && fuse_dec && !dump && mg_att_ok[il];  // q_a + kv_a in one launch (decode)
-        if (fz) { PS _q(this, "lin q_a+kv_a"); k_gemv_multi(mg_att[il]); }  // F1 = q_a [1024], kva2 = kv_a [576]
-        else lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
+        const bool fz = T == 1 && fuse_dec && !dump && mg_att_ok[il];
+        if (fz) { PS _q(this, "lin q_a+kv_a"); k_gemv_multi(mg_att[il]); }
+        else lin(pa + ".q_a_proj.weight", cur_h, F1, T);
         { PS _q(this, "q_a_rms"); rms_rows(F1, (const float*)tw(pa + ".q_a_layernorm.weight"), nullptr, qr_h, c.q_lora, c.rms_eps, T, 256); }
-        lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
-        if (!fz) lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]
+        lin(pa + ".q_b_proj.weight", qr_h, F2, T);
+        if (!fz) lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);
         half* cache = kcache[il];
         const int cslots = swa ? ring : slots_sparse;
-        { PS _q(this, "mla_write_kv"); mla_write_kv(fz ? kva2 : F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
-        { PS _q(this, "mla_prep_q"); mla_prep_q(F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il)); }
-        if (vis && vis->needs_fix(p0, T)) {  // pictures in the context: rope of q and of the new keys with the picture-aware (t, h, w) positions
+        if (dp) {
+            mla_write_kv_dev(fz ? kva2 : F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, dp, false, swa ? ring : 0, (float)theta(il), c.rms_eps);
+        } else {
+            PS _q(this, "mla_write_kv");
+            mla_write_kv(fz ? kva2 : F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps);
+        }
+
+        const std::string kvb_nm = pa + ".kv_b_proj.weight";
+        const int kvb_fmt = ti(kvb_nm).fmt;
+        const void* kvb_w = tw(kvb_nm);
+        if (T <= 16) {
+            PS _q(this, "mla_prep_q_sk");
+            mla_prep_q_sk(kvb_fmt, kvb_w, F2, qa_h, T, NH, p0, dp, false, (float)theta(il));
+        } else {
+            PS _q(this, "mla_prep_q_xmx");
+            split_kvb(kvb_fmt, kvb_w, wk_tmp, wv_tmp, NH);
+            mla_prep_q(F2, wk_tmp, qa_h, T, NH, p0, (float)theta(il));
+        }
+        if (!dp && vis && vis->needs_fix(p0, T)) {
             vis->fixk(fz ? kva2 : F1, cache, T, p0, swa ? ring : 0, (float)theta(il));
             vis->fixq(F2, qa_h, T, NH, p0, (float)theta(il));
         }
+
         bool use_list = false;
         if (!swa && index_on) {
-            { PS _q(this, "idx_update"); idx_update(il, p0, T); }
-            if (p0 + T > index_topk) {
-                { PS _q(this, "idx_select"); idx_select(il, p0, T); }
-                if (tap) tap_keys("L" + std::to_string(il) + "_keys", T);
+            { PS _q(this, "idx_update"); idx_update(il, p0, T, dp); }
+            const bool do_sel = dp ? force_use_list : (p0 + T > index_topk);
+            if (do_sel) {
+                { PS _q(this, "idx_select"); idx_select(il, p0, T, dp); }
+                if (!dp && tap) tap_keys("L" + std::to_string(il) + "_keys", T);
                 use_list = true;
             }
         }
-        last_use_list = use_list;
-        if (dfly_cap && !swa) dfly_capture(il, p0, T, use_list);
-        lin(pa + ".linear_gate.weight", cur_h, F3, T);  // [T][NH*256]
+        if (!dp) last_use_list = use_list;
+        if (dfly_cap && !swa) {
+            if (dp) dfly_capture_copy(il, T, use_list);
+            else dfly_capture(il, p0, T, use_list);
+        }
+
+        lin(pa + ".linear_gate.weight", cur_h, F3, T);
         MlaAttnArgs a;
-        a.M = T;
-        a.NH = NH;
-        a.p0 = p0;
+        a.M = T; a.NH = NH; a.p0 = p0;
         a.mode = swa ? MLA_WINDOW : (use_list ? MLA_LIST : MLA_CAUSAL);
         a.window = c.window;
         a.ring = swa ? ring : 0;
         a.cache_slots = cslots;
-        if (use_list) {
-            a.keys = keys;
-            a.nkeys = nkeys;
-            a.kmax = index_topk;
+        if (use_list) { a.keys = keys; a.nkeys = nkeys; a.kmax = index_topk; }
+        if (dp) {
+            mla_attend_dev(qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), ctx_h, a, dp, false, g_TK, g_S, g_tps, mla_ws, mla_ws_bytes);
+        } else {
+            ensure_mla_ws(mla_workspace_bytes(a));
+            PS _q(this, "mla_attend");
+            mla_attend(qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), ctx_h, a, mla_ws, mla_ws_bytes);
         }
-        ensure_mla_ws(mla_workspace_bytes(a));
-        { PS _q(this, "mla_attend"); mla_attend(qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), ctx_h, a, mla_ws, mla_ws_bytes); }
-        if (tap) tap_dev("L" + std::to_string(il) + "_ctx", ctx_h, (size_t)T * NH * 512, 1);
-        { PS _q(this, "mla_vup"); mla_vup(ctx_h, wv_b + wv_off[il], F3, o_h, T, NH); }
-        lin(pa + ".o_proj.weight", o_h, F1, T);  // [T][3072]
+        if (!dp && tap) tap_dev("L" + std::to_string(il) + "_ctx", ctx_h, (size_t)T * NH * 512, 1);
+        if (T <= 16) {
+            PS _q(this, "mla_vup_sk");
+            mla_vup_sk(kvb_fmt, kvb_w, ctx_h, F3, o_h, T, NH);
+        } else {
+            PS _q(this, "mla_vup_xmx");
+            mla_vup(ctx_h, wv_tmp, F3, o_h, T, NH);
+        }
+        lin(pa + ".o_proj.weight", o_h, F1, T);
         { PS _q(this, "o_norm_post"); add_rms_post(F1, nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), x, post, HID, c.rms_eps, T); }
     }
 
-    void mlp_layer(int il, int T) {
+    void attention_layer(int il, int p0, int T) {
+        attention_layer_core(il, p0, T, nullptr, false, 0, 0, 0);
+    }
+
+    // MoE layer sub-stages (shared between eager and command_graph!)
+    void mlp_dense0(int T) {
+        const std::string pm = L(0) + ".mlp";
+        const float* hfn = (const float*)tw(L(0) + ".hc_mlp_layer.hc_pre.hc_fn");
+        const float* hsc = (const float*)tw(L(0) + ".hc_mlp_layer.hc_pre.hc_scale");
+        const float* hbs = (const float*)tw(L(0) + ".hc_mlp_layer.hc_pre.hc_base");
+        { PS _q(this, "hc_pre"); hc_pre_run(hfn, hsc, hbs, (const float*)tw(L(0) + ".post_attention_layernorm.weight"), 8, T, x, cur_h, cur_f); }
+        lin(pm + ".gate_proj.weight", cur_h, F1, T);
+        lin(pm + ".up_proj.weight", cur_h, F2, T);
+        { PS _q(this, "swiglu"); swiglu_h(F1, F2, H1, (size_t)T * 13824); }
+        lin(pm + ".down_proj.weight", H1, F3, T);
+        { PS _q(this, "o_norm_post"); add_rms_post(F3, nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), x, post, HID, c.rms_eps, T); }
+    }
+
+    void mlp_moe_pre(int il, int T) {
         const std::string pm = L(il) + ".mlp";
         const float* hfn = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_fn");
         const float* hsc = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_base");
         { PS _q(this, "hc_pre"); hc_pre_run(hfn, hsc, hbs, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), 8, T, x, cur_h, cur_f); }
-        if (il == 0) {
-            lin(pm + ".gate_proj.weight", cur_h, F1, T);  // [T][13824]
-            lin(pm + ".up_proj.weight", cur_h, F2, T);
-            const size_t n = (size_t)T * 13824;
-            { PS _q(this, "swiglu"); swiglu_h(F1, F2, H1, n); }
-            lin(pm + ".down_proj.weight", H1, F3, T);  // [T][3072]
-            { PS _q(this, "o_norm_post"); add_rms_post(F3, nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), x, post, HID, c.rms_eps, T); }
+        moe_idx = (int32_t*)d_pack; moe_w = d_pack + (size_t)T * 16; z_f = d_pack + (size_t)T * 32;
+        h_idx = (int32_t*)h_pack; h_w = h_pack + (size_t)T * 16; h_z = h_pack + (size_t)T * 32;
+        { PS _q(this, "router"); linear_f32((const float*)tw(pm + ".gate.weight"), 512, HID, cur_f, F1, T); }
+        { PS _q(this, "router_topk"); router_topk_sg(F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 16, c.routed_scale, T); }
+        if (d_hash) { tap_hash("L" + std::to_string(il) + "_router_logits", F1, (size_t)T * 512); tap_hash("L" + std::to_string(il) + "_router_w", moe_w, (size_t)T * 16); tap_hash("L" + std::to_string(il) + "_router_idx", (const float*)moe_idx, (size_t)T * 16); }
+        const bool fm = T == 1 && fuse_dec && !dump && mg_moe_ok[il];
+        if (fm) { PS _q(this, "lin down+shared gate/up"); k_gemv_multi(mg_m1[il]); }
+        else lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);
+        if (d_hash) tap_hash("L" + std::to_string(il) + "_routed_down_z", z_f, (size_t)T * 1536);
+    }
+
+    void mlp_moe_shared(int il, int T) {
+        const std::string pm = L(il) + ".mlp";
+        const size_t nz = (size_t)T * 1536;
+        const bool fm = T == 1 && fuse_dec && !dump && mg_moe_ok[il];
+        if (fm) {
+            k_gemv_multi(mg_shd[il]);
         } else {
-            const size_t nz = (size_t)T * 1536;
-            moe_idx = (int32_t*)d_pack; moe_w = d_pack + (size_t)T * 16; z_f = d_pack + (size_t)T * 32;  // pack layout of this call (see init)
-            h_idx = (int32_t*)h_pack; h_w = h_pack + (size_t)T * 16; h_z = h_pack + (size_t)T * 32;
-            { PS _q(this, "router"); linear_f32((const float*)tw(pm + ".gate.weight"), 512, HID, cur_f, F1, T); }
-            { PS _q(this, "router_topk"); router_topk_sg(F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 16, c.routed_scale, T); }
-            if (d_hash) { tap_hash("L" + std::to_string(il) + "_router_logits", F1, (size_t)T * 512); tap_hash("L" + std::to_string(il) + "_router_w", moe_w, (size_t)T * 16); tap_hash("L" + std::to_string(il) + "_router_idx", (const float*)moe_idx, (size_t)T * 16); }
-            const bool fm = T == 1 && fuse_dec && !dump && mg_moe_ok[il];  // decode launch fusions (see build_fuse)
-            if (fm) { PS _q(this, "lin down+shared gate/up"); k_gemv_multi(mg_m1[il]); }  // z_f (pack), sg_f, su_f
-            else lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536] fp32
-            if (d_hash) tap_hash("L" + std::to_string(il) + "_routed_down_z", z_f, (size_t)T * 1536);
-            // the pack layout depends on T: [idx T*16 | w T*16 | z T*1536]; the GPU-expert path needs only idx and w on the host (z stays on the device)
-            const bool gx_now = gx != nullptr && T >= gx_min_T;
-            sycl::event evw = Q().memcpy(h_pack, d_pack, ((size_t)T * 32 + ((gx_now && !(dump && dbg_layers)) ? 0 : nz)) * 4);
-            // shared expert on the GPU while the CPU computes the routed experts
-            if (fm) {
-                k_gemv_multi(mg_shd[il]);  // shared down_proj with the SwiGLU of sg_f/su_f folded into its input: so_f [3072]
-            } else {
-                lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
-                lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
-                { PS _q(this, "swiglu"); swiglu_h(F1, F3, H1, nz); }
-                lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
+            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);
+            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
+            { PS _q(this, "swiglu"); swiglu_h(F1, F3, H1, nz); }
+            lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);
+        }
+        if (d_hash && !fm) tap_hash("L" + std::to_string(il) + "_shared_out", F3, (size_t)T * HID);
+    }
+
+    void mlp_moe_post(int il, int T) {
+        const std::string pm = L(il) + ".mlp";
+        const size_t nz = (size_t)T * 1536;
+        const bool fm = T == 1 && fuse_dec && !dump && mg_moe_ok[il];
+        if (d_hash) tap_hash("L" + std::to_string(il) + "_routed_zout", zout_f, nz);
+        if (fm) {
+            k_gemv_multi(mg_up[il]);
+        } else {
+            f2h(zout_f, z_h, nz);
+            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);
+        }
+        if (d_hash) tap_hash("L" + std::to_string(il) + "_routed_up_out", F2, (size_t)T * HID);
+        { PS _q(this, "combine_norm_post"); add_rms_post(F2, fm ? so_f : F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, HID, c.rms_eps, T); }
+    }
+
+    // Evaluate routed experts for MoE layer `il` (1..41) after `evw.wait()` (works identically for eager and graphed paths!)
+    void run_routed_experts(int il, int T, bool use_gx) {
+        const size_t nz = (size_t)T * 1536;
+        const double tc = now_s();
+        if (!force_route_dir.empty()) {
+            std::vector<float> fi, fw;
+            if (!load_npy_f32(force_route_dir + "/L" + std::to_string(il) + "_topk_idx.npy", fi) ||
+                !load_npy_f32(force_route_dir + "/L" + std::to_string(il) + "_topk_w.npy", fw) ||
+                fi.size() < (size_t)(cur_p0 + T) * 16) {
+                fprintf(stderr, "force-route: cannot load layer %d\n", il);
+                exit(5);
             }
-            if (d_hash && !fm) tap_hash("L" + std::to_string(il) + "_shared_out", F3, (size_t)T * HID);
-            evw.wait();
-            double tc = now_s();
-            if (!force_route_dir.empty()) {  // teacher-forced routing from an oracle dump (L<il>_topk_idx.npy / L<il>_topk_w.npy, float32 [T][16]): isolates numeric noise from routing flips
-                std::vector<float> fi, fw;
-                if (!load_npy_f32(force_route_dir + "/L" + std::to_string(il) + "_topk_idx.npy", fi) || !load_npy_f32(force_route_dir + "/L" + std::to_string(il) + "_topk_w.npy", fw) || fi.size() < (size_t)(cur_p0 + T) * 16) {
-                    fprintf(stderr, "force-route: cannot load layer %d\n", il);
-                    exit(5);
-                }
-                wait();
-                for (size_t i = 0; i < (size_t)T * 16; ++i) { h_idx[i] = (int32_t)fi[(size_t)cur_p0 * 16 + i]; h_w[i] = fw[(size_t)cur_p0 * 16 + i]; }
-            }
-            const bool use_gx = gx != nullptr && T >= gx_min_T;
-            if (use_gx) {
-                // prefill: routed experts on the GPU (streamed from the page cache), result stays on the device
-                gx->run(il - 1, T, z_f, h_idx, h_w, zout_f, nullptr);
-            } else if (!std::getenv("HY4S_SKIP_EXPERTS")) {  // timing experiment: no routed experts at all (wrong output)
-                if (cx.streaming()) cx.prefetch_experts(il - 1, h_idx, T * 16);  // experts larger than the page cache: start the SSD reads of the routed bodies now
-                cx.run(il - 1, T, h_z, h_idx, h_w, h_zout, expert_act);
-            }
-            if (dump && dbg_layers) {
-                wait();
-                const std::string nm = "L" + std::to_string(il) + "_";
-                save_npy_f32(dump_dir + "/" + nm + "z_folded.npy", h_z, {T, 1536});
-                std::vector<float> ti((size_t)T * 16);
-                for (size_t i = 0; i < ti.size(); ++i) ti[i] = (float)h_idx[i];
-                save_npy_f32(dump_dir + "/" + nm + "topk_idx.npy", ti.data(), {T, 16});
-                save_npy_f32(dump_dir + "/" + nm + "topk_w.npy", h_w, {T, 16});
-                save_npy_f32(dump_dir + "/" + nm + "z_out.npy", h_zout, {T, 1536});
-                maybe_dump(nm + "shared_out", T, HID, F3);
-            }
+            wait();
+            for (size_t i = 0; i < (size_t)T * 16; ++i) { h_idx[i] = (int32_t)fi[(size_t)cur_p0 * 16 + i]; h_w[i] = fw[(size_t)cur_p0 * 16 + i]; }
+        }
+        if (use_gx) {
+            gx->run(il - 1, T, z_f, h_idx, h_w, zout_f, nullptr);
             t_cpu_exp += now_s() - tc;
-            if (!use_gx) h2d(zout_f, h_zout, nz * 4);
-            if (d_hash) tap_hash("L" + std::to_string(il) + "_routed_zout", zout_f, nz);
-            if (fm) {
-                k_gemv_multi(mg_up[il]);  // routed up_proj reading zout_f rounded to fp16 (no f2h pass): F2 = [3072]
-            } else {
-                f2h(zout_f, z_h, nz);
-                lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
+            return;
+        }
+        if (std::getenv("HY4S_SKIP_EXPERTS")) {
+            dzero(zout_f, nz * 4);
+            t_cpu_exp += now_s() - tc;
+            return;
+        }
+        // Decode / Verify (T <= 16): hybrid GPU VRAM cache hits (overlapped on Q()!) + unified CPU pool misses!
+        int vhits = 0;
+        if (vcache && vcache->active() && T <= SyVramExpertCache::MAX_T) {
+            vhits = vcache->run_decode(il - 1, T, z_f, h_idx, h_w, h_use_cpu, zout_gpu_f);
+            if (vhits < T * 16) {
+                ucx.submit(il - 1, T, h_z, h_idx, h_w, h_use_cpu, h_zout, false);
+                ucx.wait();
             }
-            if (d_hash) tap_hash("L" + std::to_string(il) + "_routed_up_out", F2, (size_t)T * HID);
-            { PS _q(this, "combine_norm_post"); add_rms_post(F2, fm ? so_f : F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, HID, c.rms_eps, T); }
+        } else {
+            ucx.submit(il - 1, T, h_z, h_idx, h_w, nullptr, h_zout, false);
+            ucx.wait();
+        }
+        t_cpu_exp += now_s() - tc;
+
+        if (vhits == T * 16) {
+            d2d(zout_f, zout_gpu_f, nz * 4);
+        } else if (vhits == 0) {
+            h2d(zout_f, h_zout, nz * 4);
+        } else {
+            h2d(zout_f, h_zout, nz * 4);
+            SyVramExpertCache::add_zout(zout_f, zout_gpu_f, nz);
+        }
+        if (dump && dbg_layers) {
+            wait();
+            const std::string nm = "L" + std::to_string(il) + "_";
+            save_npy_f32(dump_dir + "/" + nm + "z_folded.npy", h_z, {T, 1536});
+            std::vector<float> ti_((size_t)T * 16);
+            for (size_t i = 0; i < ti_.size(); ++i) ti_[i] = (float)h_idx[i];
+            save_npy_f32(dump_dir + "/" + nm + "topk_idx.npy", ti_.data(), {T, 16});
+            save_npy_f32(dump_dir + "/" + nm + "topk_w.npy", h_w, {T, 16});
+            std::vector<float> hzo(nz);
+            d2h(hzo.data(), zout_f, nz * 4);
+            wait();
+            save_npy_f32(dump_dir + "/" + nm + "z_out.npy", hzo.data(), {T, 1536});
+            maybe_dump(nm + "shared_out", T, HID, F3);
         }
     }
 
-    // process tokens [p0, p0+T) (T <= Tc) of the sequence tok_all (host, positions 0..p0+T-1). Returns false on error.
+    void mlp_layer(int il, int T) {
+        if (il == 0) {
+            mlp_dense0(T);
+            return;
+        }
+        const size_t nz = (size_t)T * 1536;
+        mlp_moe_pre(il, T);
+        const bool gx_now = gx != nullptr && T >= gx_min_T;
+        sycl::event evw = Q().memcpy(h_pack, d_pack, ((size_t)T * 32 + ((gx_now && !(dump && dbg_layers)) ? 0 : nz)) * 4);
+        mlp_moe_shared(il, T);
+        evw.wait();
+        run_routed_experts(il, T, gx_now);
+        mlp_moe_post(il, T);
+    }
+
+#if HY4S_HAS_GRAPH
+    GraphSet* get_or_build_graph(int p0, int T) {
+        const bool use_list = index_on && (p0 + T > index_topk);
+        MlaAttnArgs a_swa, a_sp;
+        a_swa.M = T; a_swa.NH = c.heads_swa; a_swa.p0 = p0; a_swa.mode = MLA_WINDOW; a_swa.window = c.window; a_swa.ring = ring; a_swa.cache_slots = ring;
+        a_sp.M = T; a_sp.NH = c.heads_sparse; a_sp.p0 = p0; a_sp.mode = use_list ? MLA_LIST : MLA_CAUSAL; a_sp.kmax = index_topk; a_sp.cache_slots = slots_sparse;
+        GraphKey k;
+        k.T = T;
+        k.use_list = use_list ? 1 : 0;
+        k.dfly_cap = dfly_cap ? 1 : 0;
+        k.engram_on = engram_ready ? 1 : 0;
+        mla_choose_splits(a_swa, k.swa_TK, k.swa_S, k.swa_tps);
+        mla_choose_splits(a_sp, k.sp_TK, k.sp_S, k.sp_tps);
+        ensure_mla_ws(std::max(mla_workspace_bytes(a_swa), mla_workspace_bytes(a_sp)));
+
+        for (auto& gs : gcache_)
+            if (gs->key == k) return gs.get();
+
+        // Cap cache at 12 graph sets to bound driver command-buffer memory
+        if (gcache_.size() >= 12) {
+            wait();
+            gcache_.clear();
+        }
+
+        auto record = [&](auto&& fn) -> std::unique_ptr<ExecGraph> {
+            sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::modifiable> cg(Q().get_context(), Q().get_device());
+            cg.begin_recording(Q());
+            fn();
+            cg.end_recording(Q());
+            return std::make_unique<ExecGraph>(cg.finalize());
+        };
+
+        try {
+            wait();
+            auto gs = std::make_unique<GraphSet>();
+            gs->key = k;
+            gs->g_shared.resize(c.n_layers);
+            gs->g_post_next.resize(c.n_layers);
+
+            auto att_dev = [&](int il) {
+                const bool swa = c.is_swa[il];
+                attention_layer_core(il, p0, T, d_step, use_list,
+                                     swa ? k.swa_TK : k.sp_TK, swa ? k.swa_S : k.sp_S, swa ? k.swa_tps : k.sp_tps);
+            };
+
+            // 1. g_init: embed + Layer 0 (engram if on L0 + attn + dense MLP)
+            gs->g_init = record([&]() {
+                embed_hc((const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
+                const int mo0 = engram_mod_of(0);
+                if (mo0 >= 0) engram_layer(mo0, 0, T);
+                att_dev(0);
+                mlp_dense0(T);
+            });
+
+            // 2. g_l1_pre: Layer 1 (engram + attn + moe_pre)
+            gs->g_l1_pre = record([&]() {
+                const int mo1 = engram_mod_of(1);
+                if (mo1 >= 0) engram_layer(mo1, 1, T);
+                att_dev(1);
+                mlp_moe_pre(1, T);
+            });
+
+            // 3. Per MoE layer il = 1..41: g_shared[il] and g_post_next[il] (post(il) fused with pre(il+1)!)
+            for (int il = 1; il < c.n_layers; ++il) {
+                gs->g_shared[il] = record([&]() {
+                    mlp_moe_shared(il, T);
+                });
+                gs->g_post_next[il] = record([&]() {
+                    mlp_moe_post(il, T);
+                    if (il + 1 < c.n_layers) {
+                        const int mo = engram_mod_of(il + 1);
+                        if (mo >= 0) engram_layer(mo, il + 1, T);
+                        att_dev(il + 1);
+                        mlp_moe_pre(il + 1, T);
+                    }
+                });
+            }
+            ++graph_captures;
+            GraphSet* ret = gs.get();
+            gcache_.push_back(std::move(gs));
+            return ret;
+        } catch (const sycl::exception& e) {
+            fprintf(stderr, "[graph] capture failed (%s), falling back to eager queue\n", e.what());
+            graph_enabled = false;
+            return nullptr;
+        }
+    }
+
+    bool forward_chunk_graphed(const int32_t* tok_all, int p0, int T, std::string& err) {
+        GraphSet* gs = get_or_build_graph(p0, T);
+        if (!gs) return false;
+        const size_t nz = (size_t)T * 1536;
+        moe_idx = (int32_t*)d_pack; moe_w = d_pack + (size_t)T * 16; z_f = d_pack + (size_t)T * 32;
+        h_idx = (int32_t*)h_pack; h_w = h_pack + (size_t)T * 16; h_z = h_pack + (size_t)T * 32;
+
+        h_step->p0 = p0;
+        h2d(d_step, h_step, sizeof(StepParams));
+        h2d(d_ids, tok_all + p0, (size_t)T * 4);
+        const bool defer_eng = engram_ready;
+        if (defer_eng) prefetch_engram(tok_all, p0, T);
+
+        Q().ext_oneapi_graph(*gs->g_init);
+
+        if (defer_eng) {
+            const double tw0 = now_s();
+            if (!engram_prep(tok_all, p0, T, err)) return false;
+            t_engram_wait += now_s() - tw0;
+        }
+
+        Q().ext_oneapi_graph(*gs->g_l1_pre);
+        for (int il = 1; il < c.n_layers; ++il) {
+            sycl::event evw = Q().memcpy(h_pack, d_pack, ((size_t)T * 32 + nz) * 4);
+            Q().ext_oneapi_graph(*gs->g_shared[il]);
+            evw.wait();
+            run_routed_experts(il, T, false);
+            Q().ext_oneapi_graph(*gs->g_post_next[il]);
+        }
+
+        const bool use_list = gs->key.use_list != 0;
+        last_use_list = use_list;
+        if (dfly_cap) {
+            cap_p0 = p0;
+            cap_rows = T;
+            for (int d = 0; d < 5; ++d) cap_list[d] = use_list;
+        }
+        ++graph_replays;
+        return true;
+    }
+#endif
+
+    // Process tokens [p0, p0+T) (T <= Tc) of tok_all. Returns false on error.
     bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err) {
         cur_p0 = p0;
+#if HY4S_HAS_GRAPH
+        if (graph_enabled && T <= 8 && !dump && !tap && !prof && !prof2 && !d_hash && vis == nullptr && force_route_dir.empty()) {
+            if (forward_chunk_graphed(tok_all, p0, T, err)) return true;
+            if (!err.empty()) return false;
+            // Fallback to eager if capture disabled graph_enabled
+        }
+#endif
         h2d(d_ids, tok_all + p0, (size_t)T * 4);
         embed_hc((const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
-        if (vis) vis->embed(x, p0, T);  // pictures: image rows replace the embeddings of the image-pad tokens
+        if (vis) vis->embed(x, p0, T);
         const bool defer_eng = engram_ready && T <= 8;
         if (defer_eng) prefetch_engram(tok_all, p0, T);
         else if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
@@ -790,9 +1176,7 @@ public:
                 if (!engram_prep(tok_all, p0, T, err)) return false;
                 t_engram_wait += now_s() - tw0;
             }
-            int mo = -1;
-            for (int j = 0; j < 4; ++j)
-                if (emeta.layers[j] == il) mo = j;
+            const int mo = engram_mod_of(il);
             double ta = 0;
             if (prof) { wait(); ta = now_s(); }
             if (mo >= 0 && engram_ready) {
@@ -810,17 +1194,44 @@ public:
         hash_flush();
         return true;
     }
+
     bool prof = false;
     double p_eng = 0, p_attn_swa = 0, p_attn_sp = 0, p_mlp0 = 0, p_moe = 0;
     void prof_report(const char* what) {
         if (!prof) return;
-        fprintf(stderr, "[prof %s] engram %.3f s | attn swa(30) %.3f s sparse(12) %.3f s | mlp0 %.3f s | moe(41) %.3f s (cpu experts %.3f s)\n", what, p_eng, p_attn_swa, p_attn_sp, p_mlp0, p_moe, t_cpu_exp);
+        fprintf(stderr, "[prof %s] engram %.3f s | attn swa(30) %.3f s sparse(12) %.3f s | mlp0 %.3f s | moe(41) %.3f s (cpu experts %.3f s)\n",
+                what, p_eng, p_attn_swa, p_attn_sp, p_mlp0, p_moe, t_cpu_exp);
         p_eng = p_attn_swa = p_attn_sp = p_mlp0 = p_moe = 0;
     }
 
-    // logits of chunk positions [first, T) into d logits [(T-first)][V]  (T-first <= logit_rows)
+    // logits of chunk positions [first, T) into d logits [(T-first)][V]
     void head(int T, int first) {
         const int n = T - first;
+#if HY4S_HAS_GRAPH
+        if (graph_enabled && first == 0 && n >= 1 && n <= 8 && !prof2 && !dump && !tap) {
+            if (!g_head_[n]) {
+                try {
+                    wait();
+                    sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::modifiable> cg(Q().get_context(), Q().get_device());
+                    cg.begin_recording(Q());
+                    const float* hfn = (const float*)tw("model.hc_head.hc_head_fn");
+                    const float* hsc = (const float*)tw("model.hc_head.hc_head_scale");
+                    const float* hbs = (const float*)tw("model.hc_head.hc_head_base");
+                    hc_pre_run(hfn, hsc, hbs, (const float*)tw("model.norm.weight"), 4, n, x, hfin, nullptr);
+                    const hy4::TInfo& lm = ti("lm_head.weight");
+                    linear_auto(lm.fmt, tw("lm_head.weight"), (int)lm.rows(), (int)lm.cols(), hfin, logits, n, g.is_rp("lm_head.weight"));
+                    cg.end_recording(Q());
+                    g_head_[n] = std::make_unique<ExecGraph>(cg.finalize());
+                } catch (const sycl::exception&) {
+                    graph_enabled = false;
+                }
+            }
+            if (g_head_[n]) {
+                Q().ext_oneapi_graph(*g_head_[n]);
+                return;
+            }
+        }
+#endif
         const float* hfn = (const float*)tw("model.hc_head.hc_head_fn");
         const float* hsc = (const float*)tw("model.hc_head.hc_head_scale");
         const float* hbs = (const float*)tw("model.hc_head.hc_head_base");

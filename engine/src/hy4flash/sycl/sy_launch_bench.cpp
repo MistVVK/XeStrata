@@ -39,5 +39,32 @@ int main() {
         wait();
         printf("sg32 1024x256 reading 4 floats/thread: %.2f us/kernel\n", (now() - t0) / n * 1e6);
     }
+#if HY4S_HAS_GRAPH
+    if (dev_caps().has_graph) {
+        for (int n : {100, 1000}) {
+            try {
+                sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::modifiable> cg(Q().get_context(), Q().get_device());
+                cg.begin_recording(Q());
+                for (int i = 0; i < n; ++i)
+                    Q().parallel_for(NR(8, 256), [=](sycl::nd_item<1> it) { a[it.get_global_id(0)] += 1.0f; });
+                cg.end_recording(Q());
+                auto exec = cg.finalize();
+                Q().ext_oneapi_graph(exec);
+                wait();
+                const double t0 = now();
+                for (int r = 0; r < 10; ++r) Q().ext_oneapi_graph(exec);
+                const double t1 = now();
+                wait();
+                const double t2 = now();
+                printf("%-34s n=%-5d submit %.2f us/kernel, total %.2f us/kernel (10 replays)\n",
+                       "command_graph 8x256", n, (t1 - t0) / (10.0 * n) * 1e6, (t2 - t0) / (10.0 * n) * 1e6);
+            } catch (const sycl::exception& e) {
+                printf("command_graph n=%d failed: %s\n", n, e.what());
+            }
+        }
+    } else {
+        printf("command_graph not supported on this device/runtime\n");
+    }
+#endif
     return 0;
 }

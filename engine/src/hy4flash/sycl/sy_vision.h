@@ -7,9 +7,12 @@
 #pragma once
 #include <atomic>
 #include <chrono>
+#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
+#include "hy4_io.h"
 #include "hy4_vision.h"
 #include "sy_common.h"
 
@@ -344,16 +347,10 @@ struct VisionEncoder {
         if (const char* g = std::getenv("HY4_VIT_GELU")) gelu_tanh_ffn = std::string(g) != "erf";
         const double t0 = vit::tnow();
         h_w = halloc<uint8_t>(vi.sec1_len + 4096);
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) { err = "cannot open the vision shard"; return false; }
-        size_t got = 0;
-        while (got < vi.sec1_len) {
-            const ssize_t r = pread(fd, h_w + got, std::min<uint64_t>(256ull << 20, vi.sec1_len - got), (off_t)(vi.sec1_off + got));
-            if (r <= 0) { err = "short read of the vision shard"; ::close(fd); return false; }
-            got += (size_t)r;
-        }
-        posix_fadvise(fd, (off_t)vi.sec1_off, (off_t)vi.sec1_len, POSIX_FADV_DONTNEED);
-        ::close(fd);
+        hy4::AlignedFile af;
+        if (!af.open(path, false)) { err = "cannot open the vision shard"; return false; }
+        if (af.read_at(vi.sec1_off, h_w, vi.sec1_len) < vi.sec1_len) { err = "short read of the vision shard"; af.close(); return false; }
+        af.close();
         arena_cap = 96ull << 20;
         arena = dalloc<uint8_t>(arena_cap);
         loaded = true;

@@ -282,6 +282,7 @@ public:
             const double itms = (now_s() - ti0) * 1000.0;
             S.t_spec_total += itms;
             note_iter(itms, n + 1, true);
+            if (!cfg.check) r.step_adapt();
             if (!alive) break;
         }
         made_out = made;
