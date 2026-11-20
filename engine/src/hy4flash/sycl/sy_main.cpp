@@ -41,7 +41,7 @@ static int export_tokenizer(const std::string& file, const std::string& dir) {
     return 0;
 }
 
-// `strata-hy4 --info FILE.strata`: one line of key=value facts, no GPU needed. drafter= and images= are what THIS engine can do with this file (images: not ported to SYCL yet).
+// `strata-hy4 --info FILE.strata`: one line of key=value facts, no GPU needed. drafter= and images= are what THIS engine can do with this file (images=1: the SYCL engine reads pictures when it is started with --vision).
 static int print_info(const std::string& file) {
     strata::artifact::StrataFileReader rd;
     std::string err;
@@ -52,7 +52,7 @@ static int print_info(const std::string& file) {
     hy4::Manifest m;
     hy4::parse_manifest(rd.manifest_json(), m, false);
     printf("arch=hy4flash layers=%d hidden=%d vocab=%d experts=%d eos=%d drafter=%s images=%d backend=sycl\n", m.c.n_layers, m.c.hidden, m.c.vocab, m.c.n_experts, m.c.eos,
-           manifest_has_drafter(m) ? "dfly2" : "none", 0);
+           manifest_has_drafter(m) ? "dfly2" : "none", 1);
     return 0;
 }
 
@@ -78,6 +78,8 @@ int main(int argc, char** argv) {
     SpecCfg scfg;
     bool load_only = false, dbg = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false;
     bool serve = false, session_reuse = false, vision_requested = false;
+    std::string vision_path;
+    int64_t image_max_pixels = 1048576;
     int kv_host_above = 24000, gx_mb = 384, gx_min_t = 32, gen = 0, max_ctx = 0, chunk = 1024, index_topk = 2048, threads = (int)std::max(2u, std::thread::hardware_concurrency() / 2), expert_act = 1;  // CPU expert threads: half the hardware threads (6 on the 5600X)
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--serve") serve = true;
@@ -108,7 +110,7 @@ int main(int argc, char** argv) {
             const std::string n = nxt();
             if (!user_sel) setenv("ONEAPI_DEVICE_SELECTOR", ("opencl:gpu:" + n).c_str(), 1);
         } else if (a == "--vision") {
-            nxt();
+            vision_path = nxt();
             vision_requested = true;
         } else if (a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner (experts: page cache + GPU ring)\n", a.c_str(), nxt().c_str());
         else if (a == "--kv") {
@@ -119,7 +121,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
-        else if (a == "--engram-path") engram = nxt();
+        else if (a == "--image-max-pixels") image_max_pixels = atoll(nxt().c_str());
         else if (a == "--engram") engram = nxt();
         else if (a == "--tokens") tok_path = nxt();
         else if (a == "--out") out_dir = nxt();
@@ -182,6 +184,8 @@ int main(int argc, char** argv) {
         so.session_reuse = session_reuse;
         so.draft = draft.empty() ? "auto" : draft;
         so.vision_requested = vision_requested;
+        so.vision = vision_path;
+        so.image_max_pixels = image_max_pixels;
         so.spec = scfg;
         return hy4s_serve_main(so);
     }

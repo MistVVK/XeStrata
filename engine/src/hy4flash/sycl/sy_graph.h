@@ -19,6 +19,7 @@
 #include "sy_linear.h"
 #include "sy_mla.h"
 #include "sy_model.h"
+#include "sy_vision.h"
 
 namespace hy4s {
 
@@ -105,6 +106,7 @@ public:
     std::vector<size_t> wk_off, wv_off;
     std::vector<half*> kcache;
     // DFly2 hook: the top-index_topk key lists of target layers 25,29,33,37,41 for the last (up to 16) rows of the most recent forward chunk (sy_dfly2.h reads them)
+    VisionCtx* vis = nullptr;  // the pictures of the running request (sy_vision.h); null for a text-only request: every hook is a no-op then
     bool dfly_cap = false;
     int32_t *dkeys[5] = {}, *dnkc[5] = {};  // [16][index_topk], [16]
     int cap_p0 = -1, cap_rows = 0;
@@ -383,6 +385,7 @@ public:
             std::vector<uint64_t> ids((size_t)T * 16);
             uint8_t* valid = e->valid.data() + (size_t)mo * Tc * 16;
             hy4::engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), valid);
+            if (vis) vis->mask_engram(valid, p0, T);  // pictures: no Engram contribution at image positions
             uint8_t* raw = e->raw.data() + (size_t)mo * Tc * 16 * 100;
             if (!eio.fetch_raw(ids.data(), ids.size(), raw, err)) {
                 e->ok = false;
@@ -529,13 +532,15 @@ public:
         idx::store(iv_f, ig_f, ivg[il], p0, T, iring);
         const int g_lo = p0 / 4, g_hi = (p0 + T) / 4 - 1;
         if (g_hi >= g_lo) idx::pool(ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il), c.rms_eps, iring);
+        if (vis && g_hi >= g_lo && vis->needs_fix(p0, T)) vis->pool_fix(pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il));
     }
 
     // per-token key lists for the chunk (sparse layer, sequence longer than index_topk)
     void idx_select(int il, int p0, int T) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".query_projection.weight", qr_h, iq_f, T);
-        idx::q_rope(iq_f, iq_h, p0, (float)theta(il), T);
+        if (vis && vis->needs_fix(p0, T)) vis->iq_rope(iq_f, iq_h, T, p0, (float)theta(il));  // pictures: 3D positions
+        else idx::q_rope(iq_f, iq_h, p0, (float)theta(il), T);
         lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
         const int n_top = index_topk / c.kpool - 1;
         // scores are computed and consumed in batches of <= score_rows tokens (the score buffer is [score_rows][ctx/4] floats: 33 MB at 128K instead of 134 MB for a 1024 chunk)
@@ -566,6 +571,10 @@ public:
         const int cslots = swa ? ring : slots_sparse;
         { PS _q(this, "mla_write_kv"); mla_write_kv(fz ? kva2 : F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
         { PS _q(this, "mla_prep_q"); mla_prep_q(F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il)); }
+        if (vis && vis->needs_fix(p0, T)) {  // pictures in the context: rope of q and of the new keys with the picture-aware (t, h, w) positions
+            vis->fixk(fz ? kva2 : F1, cache, T, p0, swa ? ring : 0, (float)theta(il));
+            vis->fixq(F2, qa_h, T, NH, p0, (float)theta(il));
+        }
         bool use_list = false;
         if (!swa && index_on) {
             { PS _q(this, "idx_update"); idx_update(il, p0, T); }
@@ -677,6 +686,7 @@ public:
         cur_p0 = p0;
         h2d(d_ids, tok_all + p0, (size_t)T * 4);
         embed_hc((const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
+        if (vis) vis->embed(x, p0, T);  // pictures: image rows replace the embeddings of the image-pad tokens
         const bool defer_eng = engram_ready && T <= 8;
         if (defer_eng) prefetch_engram(tok_all, p0, T);
         else if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;

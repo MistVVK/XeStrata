@@ -36,6 +36,8 @@ struct ServeOpts {
     bool no_index = false, no_engram = false;
     bool session_reuse = false;
     std::string draft = "auto";  // auto = dfly2 when the file carries the drafter; off; dfly2 (error without it)
+    std::string vision;            // path of Hy4-Flash-Vision.strata (--vision); empty = text only
+    int64_t image_max_pixels = 1048576;  // picture size cap (1024 x 1024): the ViT workspace has to fit next to the trunk in 8 GB of VRAM
     bool vision_requested = false;
     SpecCfg spec;
 };
@@ -151,7 +153,7 @@ inline bool parse_gen(const std::string& line, GenReq& r, std::string& err) {
         else if (key == "penalty_last_n") r.s.last_n = (int)d;
         else if (key == "seed") r.s.seed = (uint64_t)strtoull(val.c_str(), nullptr, 10);
         else if (key == "prefill") r.prefill_only = d != 0;
-        else if (key == "image") r.images.push_back(val);
+        else if (key == "image") r.images.push_back(hy4::pct_decode(val));
         else if (key == "pcie_frac" || key == "spec_min_p" || key == "prefill_pipe") continue;  // tuning keys of the Strata engine: not ours
         else {
             err = "unsupported key " + key;
@@ -305,7 +307,16 @@ inline int hy4s_serve_main(const ServeOpts& o) {
             spec.reset(new Spec(r, df, sc));
         }
         fprintf(stderr, "[load] total %.1f s, device allocated %.2f GiB of 7.54\n", now_s() - t_load0, (dev_bytes_allocated() + (r.gx ? gxe.device_bytes() : 0)) / 1073741824.0);
-        if (o.vision_requested) fprintf(stderr, "[args] --vision: this engine does not read images yet (images=0)\n");
+        // pictures need the Vision shard: probe it now (cheap, no GPU) so INFO tells serve the truth; it is read into pinned host memory on the first picture request, not at start
+        bool images_ok = false;
+        VisionEncoder venc;
+        VisionCtx vctx;
+        if (!o.vision.empty()) {
+            std::string verr;
+            hy4::VisionShardInfo vprobe;
+            if (hy4::vision_probe(o.vision, vprobe, verr)) images_ok = true;
+            else fprintf(stderr, "[vision] disabled: %s\n", verr.c_str());
+        }
         const int V = r.c.vocab, EOS = r.c.eos, EOT = 120008;
         std::vector<int32_t> tok;
         tok.reserve((size_t)max_ctx + 16);  // a stable host buffer: the Engram prefetch thread reads it
@@ -314,8 +325,8 @@ inline int hy4s_serve_main(const ServeOpts& o) {
         std::string base = o.model;
         size_t sl = base.find_last_of("/\\");
         if (sl != std::string::npos) base = base.substr(sl + 1);
-        proto("INFO engine=hy4-serve-sycl-0 arch=hy4flash backend=sycl model=%s layers=%d vocab=%d chunk=%d session_reuse=%d drafter=%s draft_window=%d images=0", base.c_str(), r.c.n_layers, V,
-              r.Tc, o.session_reuse ? 1 : 0, use_spec ? "dfly2" : "off", use_spec ? o.spec.K : 0);
+        proto("INFO engine=hy4-serve-sycl-0 arch=hy4flash backend=sycl model=%s layers=%d vocab=%d chunk=%d session_reuse=%d drafter=%s draft_window=%d images=%d", base.c_str(), r.c.n_layers, V,
+              r.Tc, o.session_reuse ? 1 : 0, use_spec ? "dfly2" : "off", use_spec ? o.spec.K : 0, images_ok ? 1 : 0);
         proto("READY %d stop", max_ctx);
 
         LineInput in;
@@ -331,8 +342,36 @@ inline int hy4s_serve_main(const ServeOpts& o) {
                 continue;
             }
             in.stop.store(false);
-            if (!q.images.empty()) {
-                proto("ERR image: this engine does not read images yet (%d files)", (int)q.images.size());
+            // pictures (protocol 1.6b): image=<path> keys, one per image-pad token of the ids. Decode + resize the pictures (CPU), expand each pad to its run, tell serve with IMG lines.
+            r.vis = nullptr;
+            vctx.release();
+            const bool has_images = !q.images.empty();
+            const double t_req = now_s();
+            std::vector<hy4::ImageRec> recs;
+            if (has_images) {
+                std::string ierr;
+                if (!images_ok) {
+                    proto("ERR image: this engine was started without the Vision shard (--vision Hy4-Flash-Vision.strata)");
+                    continue;
+                }
+                bool bad = false;
+                for (const std::string& f : q.images) {
+                    hy4::ImageRec rc;
+                    if (!hy4::prepare_picture(f, hy4::VitCfg().min_pixels, o.image_max_pixels, rc, ierr)) {
+                        bad = true;
+                        break;
+                    }
+                    recs.push_back(std::move(rc));
+                }
+                std::vector<int32_t> ex;
+                if (bad || !hy4::expand_image_pads(q.ids, hy4::VitCfg().image_token, recs, ex, ierr)) {
+                    proto("ERR image: %s", ierr.c_str());
+                    continue;
+                }
+                q.ids.swap(ex);
+                for (size_t i = 0; i < recs.size(); ++i) proto("IMG %zu %d", i + 1, hy4::image_token_count(recs[i].h, recs[i].w));
+            } else if (std::find(q.ids.begin(), q.ids.end(), (int32_t)hy4::VitCfg().image_token) != q.ids.end()) {
+                proto("ERR image: 0 files for %d image placeholders", (int)std::count(q.ids.begin(), q.ids.end(), (int32_t)hy4::VitCfg().image_token));
                 continue;
             }
             const int T0 = (int)q.ids.size();
@@ -348,14 +387,29 @@ inline int hy4s_serve_main(const ServeOpts& o) {
                 proto("ERR prefill=1 is not supported");
                 continue;
             }
+            // encode the pictures now (reads the shard on first use); the runner hooks fill the prompt's image rows. No KV reuse across picture requests.
+            if (has_images) {
+                std::string ierr;
+                venc.cancel = &in.stop;
+                if (!venc.load(o.vision, ierr) || !vctx.setup(venc, q.ids, recs, r.Tc, ierr)) {
+                    if (in.stop.load()) {
+                        proto("DONE 0 %d %.1f 0.0 cancel", T0, (now_s() - t_req) * 1000.0);
+                        continue;
+                    }
+                    proto("ERR image: %s", ierr.c_str());
+                    continue;
+                }
+                fprintf(stderr, "[vision] %zu picture(s), %d image rows, encoded in %.2f s\n", recs.size(), vctx.n_rows, vctx.t_encode);
+                r.vis = &vctx;
+            }
             // KV reuse: only a pure extension of what is resident
             int start = 0;
-            if (o.session_reuse && fwd > 0 && fwd < T0 && (int)tok.size() >= fwd && std::equal(tok.begin(), tok.begin() + fwd, q.ids.begin())) start = fwd;
+            if (!has_images && o.session_reuse && fwd > 0 && fwd < T0 && (int)tok.size() >= fwd && std::equal(tok.begin(), tok.begin() + fwd, q.ids.begin())) start = fwd;
             tok.assign(q.ids.begin(), q.ids.end());
             fwd = 0;
             if (start > 0) proto("RESUME %d", start);
             std::mt19937_64 rng(q.s.seed ? q.s.seed : std::random_device{}());
-            const double t0 = now_s();
+            const double t0 = has_images ? t_req : now_s();  // the prompt time of a picture request includes the picture encoding
             int done = start;
             bool cancelled = false, failed = false;
             r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
@@ -398,7 +452,7 @@ inline int hy4s_serve_main(const ServeOpts& o) {
             const int limit = std::min(q.max_new, std::max(0, room));
             bool nonfinite = false;
             const bool greedy_fast = q.s.greedy() && !q.s.penalties();
-            const bool spec_path = use_spec && greedy_fast && limit > 0;
+            const bool spec_path = use_spec && greedy_fast && limit > 0 && !has_images;  // the drafter does not apply the 3D picture positions
             long acc0 = spec ? spec->S.accepted : 0, off0 = spec ? spec->S.drafted : 0;
             if (spec_path) {
                 std::string fin, e2;
@@ -452,12 +506,17 @@ inline int hy4s_serve_main(const ServeOpts& o) {
                 return 1;
             }
             if (nonfinite) finish = "nonfinite";
-            if (!o.session_reuse) fwd = 0;
+            if (!o.session_reuse || has_images) fwd = 0;
+            r.vis = nullptr;
             const double decode_ms = (now_s() - t1) * 1000.0;
             proto("DONE %d %d %.1f %.1f %s %ld %ld %d", made, T0, prompt_ms, decode_ms, finish, spec ? spec->S.accepted - acc0 : 0L, spec ? spec->S.drafted - off0 : 0L, start);
         }
         wait();
-        return 0;
+        // QUIT / EOF: leave without running the destructors. After some request mixes (cancel, errors) the teardown of the async Engram tasks / runtime threads did not return in
+        // tests on p1006 (main thread in a futex wait for >60 s); everything the process holds (device memory, pinned memory, mmaps) is released by the OS.
+        fflush(stdout);
+        fflush(stderr);
+        _exit(0);
     } catch (const sycl::exception& e) {
         proto("ERR sycl: %s", e.what());
         return 1;
