@@ -531,6 +531,72 @@ __global__ void k_hc_mix_part_d(const float* __restrict__ x, const float* __rest
         part[((size_t)t * 24 + slab) * 9 + j] = (shv[j][0] + shv[j][1]) + (shv[j][2] + shv[j][3]);
     }
 }
+// ---- batched deterministic iHC mix for prefill (T >= 16): stages fn[0..nout-1][slab*512..+511] once into LDS (16 KB) and processes up to 32 tokens per block in 8x4 sub-batches.
+// Exact bit-for-bit identical summation order to k_hc_mix_part_d, with 32x less fn global read traffic.
+__global__ void __launch_bounds__(128) k_hc_mix_part_d_batch(const float* __restrict__ x, const float* __restrict__ fn, float* __restrict__ part, int nout, int T) {
+    constexpr int K = NHC * HID;
+    const int t0 = blockIdx.x * 32;
+    const int slab = blockIdx.y;
+    const int tid = threadIdx.x;
+    __shared__ float sfn[8][512];
+    __shared__ float shv[9][4];
+    const int base_k = slab * 512;
+    for (int j = 0; j < nout; ++j) {
+        const float* fp = fn + (size_t)j * K + base_k;
+#pragma unroll
+        for (int st = 0; st < 4; ++st) sfn[j][st * 128 + tid] = fp[st * 128 + tid];
+    }
+    __syncthreads();
+    for (int b0 = 0; b0 < 32; b0 += 4) {
+        if (t0 + b0 >= T) break;
+        float ss[4] = {0.f, 0.f, 0.f, 0.f};
+        float a[4][8];
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) a[b][j] = 0.f;
+#pragma unroll
+        for (int st = 0; st < 4; ++st) {
+            const int kl = st * 128 + tid;
+            const int kg = base_k + kl;
+            float f[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) f[j] = j < nout ? sfn[j][kl] : 0.f;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int t = t0 + b0 + b;
+                if (t < T) {
+                    const float v = x[(size_t)t * K + kg];
+                    ss[b] += v * v;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        if (j < nout) a[b][j] += v * f[j];
+                }
+            }
+        }
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const int t = t0 + b0 + b;
+            if (t >= T) break;
+            float vals[9];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) vals[j] = a[b][j];
+            vals[8] = ss[b];
+#pragma unroll
+            for (int j = 0; j < 9; ++j)
+                for (int o = 16; o > 0; o >>= 1) vals[j] += __shfl_xor(vals[j], o);
+            if ((tid & 31) == 0)
+#pragma unroll
+                for (int j = 0; j < 9; ++j) shv[j][tid >> 5] = vals[j];
+            __syncthreads();
+            if (tid < 9) {
+                part[((size_t)t * 24 + slab) * 9 + tid] = (shv[tid][0] + shv[tid][1]) + (shv[tid][2] + shv[tid][3]);
+            }
+            __syncthreads();
+        }
+    }
+}
+
 __global__ void k_hc_mix_fin_d(const float* __restrict__ part, const float* __restrict__ scale, const float* __restrict__ base, float* __restrict__ pre, float* __restrict__ post, int nout,
                                float eps, float hc_eps, float hc_mag) {
     int t = blockIdx.x;

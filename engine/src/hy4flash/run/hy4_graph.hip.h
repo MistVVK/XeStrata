@@ -26,7 +26,37 @@
 
 namespace hy4 {
 
-// device dequantization of kv_b_proj [NH*448][512] (any S_K fmt) into wk_b [NH][192][512] and wv_b [NH][256][512] fp16
+// device dequantization of one layer's kv_b_proj [NH*448][512] (any S_K fmt) into wk_bt [NH][512][192] (transposed for WMMA mla_prep_q_t) and wv_b [NH][256][512] fp16
+template <int FMT>
+__global__ void __launch_bounds__(256) k_dequant_wkt(const uint8_t* __restrict__ W, __half* __restrict__ wk_bt, int NH) {
+    // grid (NH * 6, 16): block (h*6 + it, ct) transposes 32 rows (i0..i0+31) x 32 cols (c0..c0+31) via LDS
+    __shared__ __half sh[32][33];
+    const int h = blockIdx.x / 6, i0 = (blockIdx.x % 6) * 32, c0 = blockIdx.y * 32;
+    const int tid = threadIdx.x, r0 = tid >> 5, col = tid & 31;
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int sb = c0 >> 8, c_in = (c0 & 255) + col;
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const int ri = r0 + p * 8;
+        const uint8_t* rp = W + ((size_t)h * 448 + i0 + ri) * (2 * SB) + (size_t)sb * SB;
+        sh[ri][col] = __float2half(skd::sk_weight<FMT>(rp, c_in));
+    }
+    __syncthreads();
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const int rc = r0 + p * 8;
+        wk_bt[((size_t)h * 512 + c0 + rc) * 192 + i0 + col] = sh[col][rc];
+    }
+}
+template <int FMT>
+__global__ void __launch_bounds__(256) k_dequant_wv(const uint8_t* __restrict__ W, __half* __restrict__ wv, int NH) {
+    // grid (NH * 256): one block per v row (512 cols = 2 per thread)
+    const int r = blockIdx.x, h = r >> 8, j = r & 255;
+    constexpr int SB = sk_sb_bytes(FMT);
+    const uint8_t* rp = W + ((size_t)h * 448 + 192 + j) * (2 * SB);
+    __half* dst = wv + ((size_t)h * 256 + j) * 512;
+    for (int k = threadIdx.x; k < 512; k += 256) dst[k] = __float2half(skd::sk_weight<FMT>(rp + (size_t)(k >> 8) * SB, k & 255));
+}
 template <int FMT>
 __global__ void k_split_kvb(const uint8_t* __restrict__ W, __half* __restrict__ wk, __half* __restrict__ wv, int NH) {
     int r = blockIdx.x;  // row in [0, NH*448)
@@ -78,6 +108,7 @@ public:
     float *x = nullptr, *pre = nullptr, *post = nullptr, *cur_f = nullptr, *F1 = nullptr, *F2 = nullptr, *F3 = nullptr, *sub = nullptr, *ctx_ws = nullptr;
     __half *cur_h = nullptr, *qr_h = nullptr, *qa_h = nullptr, *o_h = nullptr, *H1 = nullptr, *z_h = nullptr, *er_h = nullptr, *hfin = nullptr;
     float *z_f = nullptr, *zout_f = nullptr, *moe_w = nullptr, *logits = nullptr;
+    int logits_cap = 0;
     int32_t *moe_idx = nullptr, *d_argmax = nullptr;
     void *moe_ws = nullptr, *mla_ws = nullptr;
     size_t mla_ws_bytes = 0;
@@ -86,15 +117,21 @@ public:
     uint8_t* d_evalid[4] = {};
     EngramDev eng_dev[4];
     ExpertDev* d_experts = nullptr;
-    __half* wk_b = nullptr;  // per layer offsets
-    __half* wv_b = nullptr;
-    std::vector<size_t> wk_off, wv_off;
+    __half* wk_bt_tmp = nullptr;  // single-layer temporary [64][512][192] (12.6 MB) for prefill WMMA mla_prep_q_t
+    __half* wv_b_tmp = nullptr;   // single-layer temporary [64][256][512] (16.8 MB) for prefill WMMA mla_vup
     std::vector<__half*> kcache;  // per layer
     int ring = 0, slots_sparse = 0;
-    // growable KV state (cards that cannot hold the whole context): the sparse-layer KV rows + Vt and the IndexPool state start in VRAM for kv_cap positions and move to pinned host memory
+    // growable KV state (cards that cannot hold the whole context): the sparse-layer KV rows and the IndexPool state start in VRAM for kv_cap positions and move to pinned host memory
     // (all of it, once) when the context passes kv_cap, so short chats in a 128K context run at VRAM speed. kv_cap == 0: not growable.
     int kv_cap = 0;
     bool kv_moved = false;
+    void ensure_logits(int n) {
+        if (n <= logits_cap) return;
+        HCK(hipStreamSynchronize(st));
+        if (logits) HCK(hipFree(logits));
+        logits_cap = n;
+        logits = dalloc<float>((size_t)logits_cap * c.vocab);
+    }
     void ensure_mla_ws(size_t need) {
         if (need <= mla_ws_bytes) return;
         HCK(hipStreamSynchronize(st));
@@ -502,7 +539,8 @@ public:
         moe_w = dalloc<float>((size_t)T * 16);
         moe_ws = dalloc<uint8_t>(moe_ws_bytes(T));
         hfin = dalloc<__half>((size_t)T * HID);
-        logits = dalloc<float>((size_t)T * c.vocab);
+        logits_cap = std::min(T, 16);
+        logits = dalloc<float>((size_t)logits_cap * c.vocab);
         d_argmax = dalloc<int32_t>(T);
         mla_ws_bytes = 0;
         mla_ws = nullptr;
@@ -598,32 +636,9 @@ public:
         score = dalloc<float>((size_t)Tc * ldS);
         keys = dalloc<int32_t>((size_t)Tc * (index_topk + 8));
         nkeys = dalloc<int32_t>((size_t)Tc);
-        // absorbed weights
-        wk_off.resize(c.n_layers);
-        wv_off.resize(c.n_layers);
-        size_t tk = 0, tv = 0;
-        for (int il = 0; il < c.n_layers; ++il) {
-            int NH = heads(il);
-            wk_off[il] = tk;
-            wv_off[il] = tv;
-            tk += (size_t)NH * 192 * 512;
-            tv += (size_t)NH * 256 * 512;
-        }
-        wk_b = dalloc_big<__half>(tk, "absorbed wk_b", 2);
-        wv_b = dalloc_big<__half>(tv, "absorbed wv_b", 2);
-        for (int il = 0; il < c.n_layers; ++il) {
-            int NH = heads(il);
-            const TInfo& t = ti(L(il) + ".self_attn.kv_b_proj.weight");
-            dim3 grid(NH * 448), block(128);
-            switch (t.fmt) {
-                case FMT_S4: hipLaunchKernelGGL((k_split_kvb<FMT_S4>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                case FMT_S5: hipLaunchKernelGGL((k_split_kvb<FMT_S5>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                case FMT_S6: hipLaunchKernelGGL((k_split_kvb<FMT_S6>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                case FMT_S8: hipLaunchKernelGGL((k_split_kvb<FMT_S8>), grid, block, 0, st, (const uint8_t*)tw(L(il) + ".self_attn.kv_b_proj.weight"), wk_b + wk_off[il], wv_b + wv_off[il], NH); break;
-                default: err = "kv_b_proj format not supported"; return false;
-            }
-        }
-        HCK(hipStreamSynchronize(st));
+        // single-layer temporary absorbed kv_b buffers (29.4 MB instead of 1.06 GB persistent across 42 layers; populated on the fly only for prefill T > 8)
+        wk_bt_tmp = dalloc<__half>((size_t)64 * 512 * 192);
+        wv_b_tmp = dalloc<__half>((size_t)64 * 256 * 512);
         // engram
         if (!load_engram_meta_file(g.path, emeta, err)) return false;
         if (!engram_path.empty()) {
@@ -865,7 +880,8 @@ public:
     void hc_mix_run(const float* xin, const float* hfn, const float* hsc, const float* hbs, int nout, int T) {
         if (det_mix) {
             if (!hcpart) hcpart = dalloc<float>((size_t)Tc * 24 * 9);
-            hipLaunchKernelGGL(k_hc_mix_part_d, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcpart, nout);
+            if (T >= 16) hipLaunchKernelGGL(k_hc_mix_part_d_batch, dim3((T + 31) / 32, 24), dim3(128), 0, st, xin, hfn, hcpart, nout, T);
+            else hipLaunchKernelGGL(k_hc_mix_part_d, dim3(T, 24), dim3(128), 0, st, xin, hfn, hcpart, nout);
             hipLaunchKernelGGL(k_hc_mix_fin_d, dim3(T), dim3(32), 0, st, hcpart, hsc, hbs, pre, post, nout, c.rms_eps, c.hc_eps, c.hc_mag);
             return;
         }
@@ -910,6 +926,31 @@ public:
         hipLaunchKernelGGL(idx::k_idx_select, dim3(T), dim3(256), 0, st, score, (int)ldS, p0, n_top, index_topk, keys, nkeys);
     }
 
+    void dequant_kvb_layer(int fmt, const void* wptr, int NH) {
+        const uint8_t* W = (const uint8_t*)wptr;
+#if HY4_MMA
+        dim3 gk(NH * 6, 16), gv(NH * 256), blk(256);
+        switch (fmt) {
+            case FMT_S2: hipLaunchKernelGGL((k_dequant_wkt<FMT_S2>), gk, blk, 0, st, W, wk_bt_tmp, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S2>), gv, blk, 0, st, W, wv_b_tmp, NH); break;
+            case FMT_S3: hipLaunchKernelGGL((k_dequant_wkt<FMT_S3>), gk, blk, 0, st, W, wk_bt_tmp, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S3>), gv, blk, 0, st, W, wv_b_tmp, NH); break;
+            case FMT_S4: hipLaunchKernelGGL((k_dequant_wkt<FMT_S4>), gk, blk, 0, st, W, wk_bt_tmp, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S4>), gv, blk, 0, st, W, wv_b_tmp, NH); break;
+            case FMT_S5: hipLaunchKernelGGL((k_dequant_wkt<FMT_S5>), gk, blk, 0, st, W, wk_bt_tmp, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S5>), gv, blk, 0, st, W, wv_b_tmp, NH); break;
+            case FMT_S6: hipLaunchKernelGGL((k_dequant_wkt<FMT_S6>), gk, blk, 0, st, W, wk_bt_tmp, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S6>), gv, blk, 0, st, W, wv_b_tmp, NH); break;
+            default:     hipLaunchKernelGGL((k_dequant_wkt<FMT_S8>), gk, blk, 0, st, W, wk_bt_tmp, NH); hipLaunchKernelGGL((k_dequant_wv<FMT_S8>), gv, blk, 0, st, W, wv_b_tmp, NH); break;
+        }
+#else
+        dim3 grid(NH * 448), block(128);
+        switch (fmt) {
+            case FMT_S2: hipLaunchKernelGGL((k_split_kvb<FMT_S2>), grid, block, 0, st, W, wk_bt_tmp, wv_b_tmp, NH); break;
+            case FMT_S3: hipLaunchKernelGGL((k_split_kvb<FMT_S3>), grid, block, 0, st, W, wk_bt_tmp, wv_b_tmp, NH); break;
+            case FMT_S4: hipLaunchKernelGGL((k_split_kvb<FMT_S4>), grid, block, 0, st, W, wk_bt_tmp, wv_b_tmp, NH); break;
+            case FMT_S5: hipLaunchKernelGGL((k_split_kvb<FMT_S5>), grid, block, 0, st, W, wk_bt_tmp, wv_b_tmp, NH); break;
+            case FMT_S6: hipLaunchKernelGGL((k_split_kvb<FMT_S6>), grid, block, 0, st, W, wk_bt_tmp, wv_b_tmp, NH); break;
+            default:     hipLaunchKernelGGL((k_split_kvb<FMT_S8>), grid, block, 0, st, W, wk_bt_tmp, wv_b_tmp, NH); break;
+        }
+#endif
+    }
+
     void attention_layer(int il, int p0, int T) {
         const std::string pa = L(il) + ".self_attn";
         const int NH = heads(il);
@@ -929,8 +970,15 @@ public:
         { PS _q(this, "mla_write_kv"); mla_write_kv(st, F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
         const bool dec = T <= 8;
         const int kvfmt = ti(pa + ".kv_b_proj.weight").fmt;
-        { PS _q(this, "mla_prep_q"); if (dec) mla_prep_q_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), F2, qa_h, T, NH, p0, (float)theta(il));
-        else mla_prep_q(st, F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il)); }
+        const void* kvb_w = tw(pa + ".kv_b_proj.weight");
+        if (!dec) { PS _q(this, "dequant_kvb"); dequant_kvb_layer(kvfmt, kvb_w, NH); }
+        { PS _q(this, "mla_prep_q"); if (dec) mla_prep_q_dec(st, kvfmt, kvb_w, F2, qa_h, T, NH, p0, (float)theta(il));
+#if HY4_MMA
+        else mla_prep_q_t(st, F2, wk_bt_tmp, qa_h, T, NH, p0, (float)theta(il));
+#else
+        else mla_prep_q(st, F2, wk_bt_tmp, qa_h, T, NH, p0, (float)theta(il));
+#endif
+        }
         if (vis && vis->needs_fix(p0, T)) {  // HY4-VISION hook: rope of q and of the new keys with the picture-aware (t, h, w) positions
             vis->fix_k(st, F1, cache, T, p0, swa ? ring : 0, (float)theta(il));
             vis->fix_q(st, F2, qa_h, T, NH, p0, (float)theta(il));
@@ -964,7 +1012,7 @@ public:
         ensure_mla_ws(mla_workspace_bytes(a));
         if (dec) {
             { PS _q(this, "mla_attend"); mla_attend(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), (__half*)ctx_ws, a, mla_ws, mla_ws_bytes); }
-            { PS _q(this, "mla_vup"); mla_vup_dec(st, kvfmt, tw(pa + ".kv_b_proj.weight"), (const __half*)ctx_ws, F3, o_h, T, NH); }
+            { PS _q(this, "mla_vup"); mla_vup_dec(st, kvfmt, kvb_w, (const __half*)ctx_ws, F3, o_h, T, NH); }
             if (dump && il == dump_layer) {
                 dump_half("in_cur_h", cur_h, (size_t)T * HID, T);
                 maybe_dump("in_qb", T, NH * 256, F2);
@@ -974,7 +1022,7 @@ public:
                 maybe_dump("in_gate", T, NH * 256, F3);
             }
         } else {
-            { PS _q(this, "mla_attend_vup_prefill"); mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_b + wv_off[il], F3, o_h, ctx_ws, a, mla_ws, mla_ws_bytes); }
+            { PS _q(this, "mla_attend_vup_prefill"); mla_attention(st, qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), wv_b_tmp, F3, o_h, ctx_ws, a, mla_ws, mla_ws_bytes); }
         }
         lin(pa + ".o_proj.weight", o_h, F1, T);  // [T][3072]
         if (dump && il == dump_layer) maybe_dump("in_oproj", T, HID, F1);
@@ -1101,7 +1149,7 @@ public:
         const double t0 = now_s();
         HCK(hipDeviceSynchronize());
         const size_t os = (size_t)slots_sparse, ns = (size_t)((max_ctx + 8 + 15) / 16) * 16;
-        const size_t row_b = (size_t)576 * 2, vt_b = (size_t)512 * 2;  // MLA_ROW, MLA_KV_LORA halves;  // bytes per slot of the rows and of the Vt copy
+        const size_t row_b = (size_t)576 * 2;  // MLA_ROW halves per slot (no Vt duplicate)
         auto host_alloc = [&](size_t bytes, void** hp) {
             void* dp = nullptr;
             HCK(hipHostMalloc(hp, bytes, hipHostMallocMapped));
@@ -1113,10 +1161,9 @@ public:
         for (int il = 0; il < c.n_layers; ++il) {
             if (c.is_swa[il]) continue;
             void* hp = nullptr;
-            uint8_t* nd = (uint8_t*)host_alloc(ns * (row_b + vt_b), &hp);
+            uint8_t* nd = (uint8_t*)host_alloc(ns * row_b, &hp);
             uint8_t* od = (uint8_t*)kcache[il];
             HCK(hipMemcpy(nd, od, os * row_b, hipMemcpyDeviceToDevice));
-            HCK(hipMemcpy(nd + ns * row_b, od + os * row_b, os * vt_b, hipMemcpyDeviceToDevice));
             HCK(hipFree(od));
             kcache[il] = (__half*)nd;
             void* hp2 = nullptr;
@@ -1186,6 +1233,7 @@ public:
     // logits of chunk positions [first, T) into d logits [(T-first)][V]; h_final dumped if dump
     void head(int T, int first) {
         int n = T - first;
+        ensure_logits(n);
         const float* hfn = (const float*)tw("model.hc_head.hc_head_fn");
         const float* hsc = (const float*)tw("model.hc_head.hc_head_scale");
         const float* hbs = (const float*)tw("model.hc_head.hc_head_base");

@@ -141,30 +141,30 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         if (rd.open(model_path, e)) trunk = (double)rd.header().sections[1].byte_length / GB;
     }
     if (chunk <= 0) {
-        // ~1.4 MB of working buffers per chunk token; keep them near 12% of the card
-        int c = 2048;
-        while (c > 256 && c * 1.4e6 > 0.12 * (double)total) c >>= 1;
+        // ~1.0 MB of working buffers per chunk token (logits is allocated for 16 rows, lazily grown only for --all-logits); keep them near 12% of the card
+        int c = tot >= 96.0 ? 8192 : 2048;
+        while (c > 256 && c * 1.0e6 > 0.12 * (double)total) c >>= 1;
         // work_gb cards: shrink further until trunk + buffers + the IndexPool state leave room for the KV rows
         const double slots0 = (double)((max_ctx + 8 + 15) / 16 * 16);
-        const double rows0 = 12.0 * slots0 * 2176.0 / GB, pivg0 = 12.0 * (double)max_ctx * 512.0 / GB + 12.0 * (double)(max_ctx / 4 + 8) * 256.0 / GB;
-        while (c > 256 && trunk + c * 1.5e6 / GB + 0.4 + pivg0 + rows0 + 0.3 > tot) c >>= 1;
+        const double rows0 = 12.0 * slots0 * 1152.0 / GB, pivg0 = 12.0 * (double)max_ctx * 512.0 / GB + 12.0 * (double)(max_ctx / 4 + 8) * 256.0 / GB;
+        while (c > 256 && trunk + c * 1.0e6 / GB + 0.4 + pivg0 + rows0 + 0.3 > tot) c >>= 1;
         chunk = c;
     }
     const double slots = (double)((max_ctx + 8 + 15) / 16 * 16);
-    const double rows = 12.0 * slots * 2176.0 / GB;                                                                                              // sparse-layer KV rows + Vt
+    const double rows = 12.0 * slots * 1152.0 / GB;                                                                                              // sparse-layer KV rows (no Vt duplicate)
     const double pivg = 12.0 * (double)max_ctx * 512.0 / GB + 12.0 * (double)(max_ctx / 4 + 8) * 256.0 / GB;                                       // IndexPool iv/ig + pooled keys
-    const double wkv = 1.06;                                                                                                                       // absorbed kv_b copies
-    const double work_gb = chunk * 1.5e6 / GB + 0.4 + 30.0 * (512.0 + chunk) * 2176.0 / GB;                                                          // chunk buffers + engram/misc + SWA rings
+    const double wkv = 0.03;                                                                                                                       // single-layer temporary wk_bt + wv_b (29.4 MB)
+    const double work_gb = chunk * 1.0e6 / GB + 0.4 + 30.0 * (512.0 + chunk) * 1152.0 / GB;                                                        // chunk buffers + engram/misc + SWA rings
     // The kernels read host-mapped KV rows over PCIe with work_gb gathers (~30x slower prefill at 128K), so the rows stay in VRAM whenever trunk + buffers + state + rows fit;
     // the rarely-read absorbed copies go to host first, the rows only on cards that cannot hold them (8 GB at 128K).
     int mask = 0;
     if (trunk + work_gb + pivg + rows + wkv + 0.3 > tot) mask |= 2;
     if (trunk + work_gb + pivg + rows + 0.3 > tot) mask |= 1;
-    // Cards that cannot hold the whole context: keep the first dev_pos positions of the KV rows + Vt + IndexPool state in VRAM and move all of it to pinned host memory when the context
+    // Cards that cannot hold the whole context: keep the first dev_pos positions of the KV rows + IndexPool state in VRAM and move all of it to pinned host memory when the context
     // passes dev_pos (Runner::kv_grow), so a short chat in the 128K context runs at VRAM speed. HY4_KV_DEVPOS = dev_pos; the rows are then not forced to host.
     long dev_pos = 0;
     if ((mask & 1) && !getenv("HY4_KV_HOST")) {
-        const double per_pos = 12.0 * 2176.0 + 12.0 * 512.0 + 12.0 * 64.0;  // rows + Vt, iv/ig, pooled keys per position (bytes)
+        const double per_pos = 12.0 * 1152.0 + 12.0 * 512.0 + 12.0 * 64.0;  // rows, iv/ig, pooled keys per position (bytes)
         const double avail = tot - trunk - work_gb - 0.3;
         dev_pos = avail > 0 ? (long)(avail * GB / per_pos) / 1024 * 1024 : 0;
         if (dev_pos >= 4096 && dev_pos < max_ctx) {
@@ -186,7 +186,7 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         hy4_setenv("HY4_HOST_NEED_GB", b, 1);
     }
     if (!getenv("HY4_RESERVE_GB")) {
-        double reserve = work_gb + (dev_pos ? dev_pos * (12.0 * 2176.0 + 12.0 * 512.0 + 12.0 * 64.0) / GB : pivg + ((mask & 1) ? 0.0 : rows)) + ((mask & 2) ? 0.0 : wkv) + (tot >= 10.0 && mask == 0 ? 1.45 : 0.0);  // + the prefill streaming scratch when everything else fits
+        double reserve = work_gb + (dev_pos ? dev_pos * (12.0 * 1152.0 + 12.0 * 512.0 + 12.0 * 64.0) / GB : pivg + ((mask & 1) ? 0.0 : rows)) + ((mask & 2) ? 0.0 : wkv) + (tot >= 10.0 && mask == 0 ? 1.45 : 0.0);  // + the prefill streaming scratch when everything else fits
         char b[32];
         snprintf(b, sizeof b, "%.2f", reserve);
         hy4_setenv("HY4_RESERVE_GB", b, 1);

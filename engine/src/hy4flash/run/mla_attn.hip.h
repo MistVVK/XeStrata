@@ -6,9 +6,7 @@
 // KV cache row (576 halves) = [ kv_cmpr (512, RMSNormed * kv_a_layernorm.weight) | k_pe (64, rope-rotated) ]. The value of a key is kv_cmpr (first 512).
 // CACHE LAYOUT (one buffer per layer, allocate mla_cache_bytes(slots) bytes, slots % 16 == 0, ZERO-INITIALISED once with hipMemset):
 //     rows : slots x 576 halves  (the layout above, slot s at  cache + s*576)
-//     Vt   : (slots/4) x 512 x 4 halves = the same 512 latent values transposed in groups of 4 consecutive slots:
-//            Vt[((s>>2)*512 + c)*4 + (s&3)] = rows[s][c]   (lets the WMMA kernel read 16-key B fragments of the PV product with 8-byte loads)
-//   mla_write_kv writes both parts. Total 2176 B per slot (1152 rows + 1024 Vt).
+//   Total 1152 B per slot (V fragments for WMMA PV are transposed in wave-private LDS directly from rows).
 //   Ring (SWA layers): slots = ring = 512 + chunk_max rounded up to a multiple of 16, slot = position % ring.
 // Per head h: kv_b_proj rows are 448 per head (192 k_nope rows, then 256 v rows), cols = 512, so
 //     wk_b[h][i][c] = Wkvb[h*448 + i][c]        (i < 192)       -> absorbed into the query:  qa[0:512][c] = sum_i q_nope[i] * wk_b[h][i][c]
