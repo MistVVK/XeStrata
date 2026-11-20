@@ -6,6 +6,7 @@
 namespace hy4s {
 
 int g_mla_target_blocks = 56;
+int g_mla_batch_invariant = 0;  // 1: a window of M <= 16 query rows is split exactly like the 1-token step (same summation order per row: speculative verify == plain decode)
 
 namespace {
 
@@ -41,7 +42,7 @@ int max_keys_of(const MlaAttnArgs& a) {
 
 // tile size TK in {128, 64, 32} (largest one that still gives >= g_mla_target_blocks work-groups), number of splits S and tiles per split
 void choose_splits(const MlaAttnArgs& a, int& TK, int& S, int& tps) {
-    const int base = a.M * (a.NH / HG);
+    const int base = ((g_mla_batch_invariant && a.M <= 16) ? 1 : a.M) * (a.NH / HG);
     const int mk = std::max(1, max_keys_of(a));
     const int target = mk > 4096 ? 2 * g_mla_target_blocks : g_mla_target_blocks;  // long causal decode wants more split-K work-groups
     TK = 32;

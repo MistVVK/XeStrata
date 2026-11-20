@@ -12,6 +12,13 @@
 
 namespace hy4s {
 
+// Speculative decoding verifies windows of 2..8 rows: make their attention split the keys like the 1-token step so that a row has the same fp32 summation order in a window and in plain decode
+// (otherwise spec output differs from plain greedy at near-ties). HY4S_BATCH_INV=0 turns it off.
+inline void spec_set_batch_invariant() {
+    const char* e = std::getenv("HY4S_BATCH_INV");
+    g_mla_batch_invariant = (e && e[0] == '0') ? 0 : 1;
+}
+
 struct SpecCfg {
     int K = 5;             // drafted tokens per block (1..7)
     bool adaptive = true;  // false: always verify K (fixed window, no back-off); for sweeps
