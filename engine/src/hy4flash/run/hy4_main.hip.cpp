@@ -405,6 +405,8 @@ int main(int argc, char** argv) {
     const EngramStats es0 = r.engram_ready ? r.eio.stats() : EngramStats();
     if (!parity_list.empty()) {
         // verify-window parity: rows of an M-token chunk vs the same positions run one token at a time (M = 1 decode), same prefix
+        r.vcache_flush();
+        r.vcache_frozen = true;
         std::vector<int> ws;
         for (size_t p = 0; p < parity_list.size();) {
             ws.push_back(atoi(parity_list.c_str() + p));
@@ -495,6 +497,8 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (ab_rounds > 0 && spec_mode) {
+        r.vcache_flush();
+        r.vcache_frozen = true;  // both plain and dfly2 rounds share the identical prompt-adapted VRAM expert cache for exact 256/256 comparison
         // DFly2 off vs on from ONE prefill: each mode starts from the resident prompt state (the last prefill chunk is re-run, which rebuilds the logits, h_final and the key-list capture;
         // decode rows beyond the prompt are overwritten). Only the LAST 16 prompt positions are re-run: a longer re-run would need SWA ring slots of the early part of the last chunk,
         // which decode has overwritten (ring = 512 + chunk). Both modes start from this same re-run state. Rounds alternate plain / spec, same prompt, same flags.
@@ -654,6 +658,11 @@ int main(int argc, char** argv) {
         if (r.n_eng_dec && r.engram_ready) { const EngramStats e1 = r.eio.stats(); const double n = r.n_eng_dec; fprintf(stderr, "[decode] engram io per step: %.1f pages, page-read wall %.3f ms, whole fetch %.3f ms, lookups %.0f (seed+lru hits %.0f)\n", (e1.page_reads - es0.page_reads) / n, (e1.io_seconds - es0.io_seconds) * 1000 / n, (e1.fetch_seconds - es0.fetch_seconds) * 1000 / n, (e1.lookups - es0.lookups) / n, (e1.seed_hits + e1.lru_hits - es0.seed_hits - es0.lru_hits) / n); }
         if (r.n_eng_dec) fprintf(stderr, "[decode] engram per step: prefetch issue %.3f ms, host wait+upload at layer 1 %.3f ms\n", r.t_eng_issue * 1000 / r.n_eng_dec, r.t_eng_prep * 1000 / r.n_eng_dec);
         if (r.hyb) fprintf(stderr, "[hybrid] decode: host waited %.2f ms per step for the CPU experts after queueing the GPU work\n", (r.t_cpu_wait - cpu_wait0) * 1000 / std::max<size_t>(times.size(), 1));
+        if (r.vcache_nslots > 1 && (r.vc_hits + r.vc_misses) > 0) {
+            const uint64_t tot_p = r.vc_hits + r.vc_misses;
+            fprintf(stderr, "[vcache] decode: %.1f%% VRAM expert hit rate (%llu / %llu pairs), %llu promotions\n", 100.0 * (double)r.vc_hits / (double)tot_p,
+                    (unsigned long long)r.vc_hits, (unsigned long long)tot_p, (unsigned long long)r.vc_promotes);
+        }
         if (r.hyb && r.has_cold) {
             const hy4::CpuExpertStats c1 = r.cpu.stats();
             const double nt = (double)std::max<size_t>(times.size(), 1);
@@ -674,6 +683,11 @@ int main(int argc, char** argv) {
     {
         std::ofstream f(out_dir + "/top5.txt");
         f << top_out;
+    }
+    if (r.vcache_nslots > 1 && (r.vc_hits + r.vc_misses) > 0) {
+        const uint64_t tot_p = r.vc_hits + r.vc_misses;
+        fprintf(stderr, "[vcache] session: %.1f%% VRAM expert hit rate (%llu / %llu pairs), %llu promotions\n", 100.0 * (double)r.vc_hits / (double)tot_p,
+                (unsigned long long)r.vc_hits, (unsigned long long)tot_p, (unsigned long long)r.vc_promotes);
     }
     {
         size_t f2 = 0, t2 = 0;
