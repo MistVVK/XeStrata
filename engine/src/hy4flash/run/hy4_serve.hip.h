@@ -373,6 +373,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
         if (has_images) {
             std::string ierr;
             venc.cancel = &in.stop;
+            r.vcache_release_vram(1280ull << 20);  // reclaim ~1.25 GiB from tail vcache slabs for vision weights + encode scratch
             if (!venc.load(o.vision, ierr) || !vctx.setup(venc, r.st, q.ids, recs, r.Tc, ierr)) {
                 if (in.stop.load()) {
                     proto("DONE 0 %d %.1f 0.0 cancel", T0, (now_s() - t_req) * 1000.0);
