@@ -49,12 +49,14 @@ struct MlaAttnArgs {
     const int32_t* nkeys = nullptr;  // [M]
     int kmax = 0;
     float scale = 0.0625f;  // 1/sqrt(256)
+    const int* p0_dev = nullptr;  // optional device pointer to step-varying p0 (for CUDA/HIP Graph replay)
 };
 
 // ---- host helpers (not device code) --------------------------------------------------------------------------------------------------------------------
 // bytes of workspace needed by mla_attention() (the fp32 ctx buffer [M][NH][512] plus split-K partials for the decode path)
 size_t mla_workspace_bytes(int M, int NH, int max_keys);
 size_t mla_workspace_bytes(const struct MlaAttnArgs& a);   // exact for this call (derives max_keys from the mode; use this one)
+int mla_choose_splits(const struct MlaAttnArgs& a);        // exact split count S that mla_attend will use for these args
 // bytes of one layer's KV cache buffer with `slots` slots (rows + Vt)
 size_t mla_cache_bytes(int slots);
 
@@ -72,11 +74,13 @@ void mla_prep_q_t(hipStream_t s, const float* q_b, const __half* wk_bt, __half* 
 //     [NH*448][512], 2 super-blocks per row): no fp16 absorbed copies are needed for decode and ~3x fewer weight bytes are read per token.
 //     mla_prep_q_dec == mla_prep_q (q absorb + rope), mla_vup_dec == mla_vup (v up-projection + gate), given the raw kv_b_proj bytes on the device.
 void mla_prep_q_dec(hipStream_t s, int fmt, const void* kv_b, const float* q_b, __half* qa, int M, int NH, int p0, float theta);
+void mla_prep_q_dec_d(hipStream_t s, int fmt, const void* kv_b, const float* q_b, __half* qa, int M, int NH, const int* p0_dev, float theta);
 void mla_vup_dec(hipStream_t s, int fmt, const void* kv_b, const __half* ctx, const float* gate, __half* o, int M, int NH);
 
 // 2. KV cache write.  kv_a: fp32 [M][576] (output of kv_a_proj_with_mqa: 512 latent | 64 pe). Writes cache slot (p0+t) % ring (ring = 0: slot = p0+t):
 //    cache[slot][0:512] = half(kv_a[t][0:512] * rsqrt(mean(kv_a[t][0:512]^2) + eps) * norm_w[c]);  cache[slot][512:576] = rope(kv_a[t][512:576], p0+t, theta).
 void mla_write_kv(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, int p0, int ring, float theta, float eps);
+void mla_write_kv_d(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, const int* p0_dev, int ring, float theta, float eps);
 
 // 3. attention, latent output.  qa: half [M][NH][576]; cache: half rows; sinks: fp32 [NH]; ctx: HALF [M][NH][512] (softmax-weighted latent rows).
 //    The cache must already hold every key position the chunk can see (write the chunk's own K/V first).  ws: scratch (>= mla_workspace_bytes()), may be null for tiny M*keys.

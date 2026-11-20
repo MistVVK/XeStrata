@@ -17,6 +17,11 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#if defined(_MSC_VER) && !defined(__clang__)
+static inline float _cvtsh_ss(unsigned short h) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)h)));
+}
+#endif
 #define HY4_RELAX() _mm_pause()
 #elif defined(__aarch64__)
 #define HY4_RELAX() __asm__ __volatile__("yield" ::: "memory")

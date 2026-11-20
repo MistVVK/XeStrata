@@ -117,13 +117,15 @@ __device__ __forceinline__ void decode_w8(const uint8_t* pl, int u, uint32_t (&w
     }
 }
 
-template <int FMT, int MT, int RW>
+template <int FMT, int MT, int RW, int NW = 8>
 __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M, int bidx) {
-    constexpr int KC = 16384 / MT;  // halves per token in LDS
+    // Tight LDS budget for small MT (8 KB at MT=1 vs 32 KB -> 4x higher SM occupancy on 128-188 SM Ada/Blackwell GPUs!)
+    constexpr int KC = (MT == 1) ? 4096 : ((MT == 2) ? 4096 : ((MT == 4) ? 2048 : (16384 / MT)));
     constexpr int SB = sk_sb_bytes(FMT);
+    constexpr int NTHR = NW * 32;
     __shared__ uint4 xs[MT * KC / 8];
     const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row0 = (bidx * 8 + wave) * RW;
+    const int row0 = (bidx * NW + wave) * RW;
     const int nsb = K >> 8;
     float acc[RW][MT];
 #pragma unroll
@@ -138,7 +140,7 @@ __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, 
     for (int k0 = 0; k0 < K; k0 += KC) {
         const int kc = (K - k0) < KC ? (K - k0) : KC;
         const int n8 = kc >> 3;
-        for (int i = threadIdx.x; i < MT * n8; i += 256) {
+        for (int i = threadIdx.x; i < MT * n8; i += NTHR) {
             const int mm = i / n8, c = i - mm * n8;
             uint4 v = make_uint4(0, 0, 0, 0);
             if (mm < M) v = *(const uint4*)(X + (size_t)mm * K + k0 + c * 8);
@@ -180,9 +182,9 @@ __device__ __forceinline__ void gemv_body(const uint8_t* __restrict__ W, int N, 
         }
 }
 
-template <int FMT, int MT, int RW>
-__global__ void __launch_bounds__(256) k_gemv(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M) {
-    gemv_body<FMT, MT, RW>(W, N, K, X, Y, M, blockIdx.x);
+template <int FMT, int MT, int RW, int NW = 8>
+__global__ void __launch_bounds__(NW * 32) k_gemv(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M) {
+    gemv_body<FMT, MT, RW, NW>(W, N, K, X, Y, M, blockIdx.x);
 }
 
 // several independent GEMVs on the same activations in ONE launch (q_a + kv_a + linear_gate, shared + latent, ...): jobs live in a device array
@@ -193,19 +195,28 @@ struct LinJob {
     int blk0;  // first block of this job in the combined grid
 };
 
-template <int FMT, int MT, int RW>
-__global__ void __launch_bounds__(256) k_gemv_multi(const LinJob* __restrict__ jobs, int njobs, int K, const __half* __restrict__ X, int M) {
+template <int FMT, int MT, int RW, int NW = 8>
+__global__ void __launch_bounds__(NW * 32) k_gemv_multi(const LinJob* __restrict__ jobs, int njobs, int K, const __half* __restrict__ X, int M) {
     int j = 0;
     while (j + 1 < njobs && (int)blockIdx.x >= jobs[j + 1].blk0) ++j;
     const LinJob jb = jobs[j];
-    gemv_body<FMT, MT, RW>(jb.W, jb.N, K, X, jb.Y, M, (int)blockIdx.x - jb.blk0);
+    gemv_body<FMT, MT, RW, NW>(jb.W, jb.N, K, X, jb.Y, M, (int)blockIdx.x - jb.blk0);
 }
 
 template <int FMT, int MT>
 inline void launch_gemv(hipStream_t s, const void* W, int N, int K, const __half* X, float* Y, int M) {
-    constexpr int RW = 2;
-    dim3 grid((N + 8 * RW - 1) / (8 * RW)), block(256);
-    hipLaunchKernelGGL((k_gemv<FMT, MT, RW>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
+#if HY4_CUDA
+    if constexpr (MT <= 4) {
+        // 4 rows/block (128 threads, 4 warps, 8-16 KB LDS): 4x more threadblocks to saturate 128-188 SM Ada/Blackwell GPUs
+        constexpr int RW = 1, NW = 4;
+        dim3 grid((N + NW * RW - 1) / (NW * RW)), block(NW * 32);
+        hipLaunchKernelGGL((k_gemv<FMT, MT, RW, NW>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
+        return;
+    }
+#endif
+    constexpr int RW = 2, NW = 8;
+    dim3 grid((N + NW * RW - 1) / (NW * RW)), block(NW * 32);
+    hipLaunchKernelGGL((k_gemv<FMT, MT, RW, NW>), grid, block, 0, s, (const uint8_t*)W, N, K, X, Y, M);
 }
 
 template <int FMT>
@@ -261,7 +272,11 @@ inline LinMulti linear_multi_build(int fmt, int K, int n, const void* const* W, 
         h[i].Y = Y[i];
         h[i].N = N[i];
         h[i].blk0 = blk;
-        blk += (N[i] + 15) / 16;  // RW = 2 rows per wave, 8 waves per block
+#if HY4_CUDA
+        blk += (N[i] + 3) / 4;   // CUDA: RW = 1, NW = 4 (4 rows/block)
+#else
+        blk += (N[i] + 15) / 16;  // HIP: RW = 2, NW = 8 (16 rows/block)
+#endif
     }
     d.total_blocks = blk;
     if (hipMalloc((void**)&d.d_jobs, sizeof(skd::LinJob) * n) != hipSuccess) abort();
@@ -276,7 +291,11 @@ inline void linear_multi_free(LinMulti& d) {
 namespace skd {
 template <int FMT>
 inline void multi_by_m(hipStream_t s, const LinMulti& d, const __half* X, int M) {
-#define HY4_MULTI(MT) hipLaunchKernelGGL((k_gemv_multi<FMT, MT, 2>), dim3(d.total_blocks), dim3(256), 0, s, d.d_jobs, d.njobs, d.K, X, M)
+#if HY4_CUDA
+#define HY4_MULTI(MT) hipLaunchKernelGGL((k_gemv_multi<FMT, MT, 1, 4>), dim3(d.total_blocks), dim3(128), 0, s, d.d_jobs, d.njobs, d.K, X, M)
+#else
+#define HY4_MULTI(MT) hipLaunchKernelGGL((k_gemv_multi<FMT, MT, 2, 8>), dim3(d.total_blocks), dim3(256), 0, s, d.d_jobs, d.njobs, d.K, X, M)
+#endif
     if (M <= 1) { HY4_MULTI(1); }
     else if (M <= 2) { HY4_MULTI(2); }
     else if (M <= 4) { HY4_MULTI(4); }

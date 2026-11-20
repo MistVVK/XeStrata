@@ -101,6 +101,7 @@ int main(int argc, char** argv) {
     int gen = 0, max_ctx = 0, chunk = 0 /* 0: auto from the card */, index_topk = 2048;
     bool serve = false, session_reuse = false;
     int gpu = -1;
+    std::string gpus_csv = getenv("HY4_GPUS") ? getenv("HY4_GPUS") : "";
     std::string draft = "auto";  // auto: dfly2 under --serve (when the file carries the drafter), off for the CLI runs (gates / benches); "off" and "dfly2" force
     SpecCfg scfg;
     std::string parity_list;
@@ -133,6 +134,7 @@ int main(int argc, char** argv) {
         else if (a == "--model" || a == "--native") model = nxt();
         else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
         else if (a == "--gpu") gpu = atoi(nxt().c_str());
+        else if (a == "--gpus") gpus_csv = nxt();
         else if (a == "--draft") draft = nxt();
         else if (a == "--spec-k") scfg.K = atoi(nxt().c_str());
         else if (a == "--spec-fixed") scfg.adaptive = false;
@@ -196,6 +198,23 @@ int main(int argc, char** argv) {
         }
     }
     if (!info_file.empty()) return print_info(info_file, vision_path);
+    std::vector<int> peer_devs;
+    int primary_gpu = gpu >= 0 ? gpu : 0;
+    if (!gpus_csv.empty()) {
+        std::vector<int> ids;
+        for (size_t pos = 0; pos < gpus_csv.size();) {
+            ids.push_back(atoi(gpus_csv.c_str() + pos));
+            size_t q = gpus_csv.find(',', pos);
+            if (q == std::string::npos) break;
+            pos = q + 1;
+        }
+        if (!ids.empty()) {
+            primary_gpu = ids[0];
+            for (size_t k = 1; k < ids.size(); ++k)
+                if (ids[k] != primary_gpu) peer_devs.push_back(ids[k]);
+            gpu = primary_gpu;
+        }
+    }
     if (gpu >= 0) HCK(hipSetDevice(gpu));
     if (serve) {
         if (model.empty()) {
@@ -221,14 +240,16 @@ int main(int argc, char** argv) {
         so.draft = draft;
         so.vision = vision_path;  // HY4-VISION
         so.image_max_pixels = image_max_pixels;
+        so.primary_gpu = primary_gpu;
+        so.peer_devs = peer_devs;
         return hy4_serve_main(so);
     }
     if (model.empty()) {
-        fprintf(stderr, "usage: strata-hy4 --model SQ64.strata --engram Engram-Q8.strata --tokens ids.txt [--gen N] [--chunk N] [--ctx N] [--dump] [--all-logits] [--out dir]\n");
+        fprintf(stderr, "usage: strata-hy4 --model SQ64.strata --engram Engram-Q8.strata --tokens ids.txt [--gen N] [--chunk N] [--ctx N] [--gpus 0,1] [--dump] [--all-logits] [--out dir]\n");
         return 2;
     }
     hipDeviceProp_t p;
-    HCK(hipGetDeviceProperties(&p, 0));
+    HCK(hipGetDeviceProperties(&p, primary_gpu));
     size_t fr = 0, tot = 0;
     gpu_mem_avail(fr, tot);
     fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB%s\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0, p.integrated ? " (UMA)" : "");
@@ -252,6 +273,8 @@ int main(int argc, char** argv) {
     }
     chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, model);
     GpuModel g;
+    g.primary_gpu = primary_gpu;
+    g.peer_devs = peer_devs;
     double t_load0 = now_s();
     if (!load_gpu_model(g, model, true)) return 1;
     fprintf(stderr, "[load] total %.1f s\n", now_s() - t_load0);

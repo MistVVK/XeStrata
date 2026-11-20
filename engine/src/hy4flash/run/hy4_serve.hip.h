@@ -50,6 +50,8 @@ struct ServeOpts {
     SpecCfg spec;
     std::string vision;                   // HY4-VISION: path of Hy4-Flash-Vision.strata (--vision); empty = text only, GENI is refused
     int64_t image_max_pixels = 4194304;
+    int primary_gpu = 0;
+    std::vector<int> peer_devs;
 };
 
 struct SampleOpts {
@@ -65,7 +67,9 @@ struct SampleOpts {
 };
 
 // ---- protocol output: one line at a time, flushed -------------------------------------------------------------------------------------------------------------
+#ifndef _MSC_VER
 inline void proto(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+#endif
 inline void proto(const char* fmt, ...) {
     char buf[512];
     va_list ap;
@@ -251,12 +255,14 @@ inline bool finite_row(const float* lg, int V) {
 // ---- the loop --------------------------------------------------------------------------------------------------------------------------------------------------
 inline int hy4_serve_main(const ServeOpts& o) {
     hipDeviceProp_t p;
-    HCK(hipGetDeviceProperties(&p, 0));
+    HCK(hipGetDeviceProperties(&p, o.primary_gpu));
     size_t fr = 0, tot = 0;
     HCK(hipMemGetInfo(&fr, &tot));
     fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0);
     const int serve_chunk = plan_memory(o.max_ctx, o.chunk, tot, o.model);
     GpuModel g;
+    g.primary_gpu = o.primary_gpu;
+    g.peer_devs = o.peer_devs;
     double t_load0 = now_s();
     if (!load_gpu_model(g, o.model, true)) {
         proto("ERR cannot load %s", o.model.c_str());

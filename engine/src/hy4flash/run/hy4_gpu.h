@@ -52,6 +52,7 @@
 #define hipEventRecord cudaEventRecord
 #define hipEventSynchronize cudaEventSynchronize
 #define hipEventElapsedTime cudaEventElapsedTime
+#define hipEventDestroy cudaEventDestroy
 #define hipHostMallocDefault cudaHostAllocDefault
 #define hipHostMalloc(p, n, f) cudaHostAlloc((p), (n), (f))
 #define hipHostFree cudaFreeHost
@@ -168,6 +169,60 @@ static __device__ __noinline__ void mma_16816_shfl(float& c0, float& c1, float& 
         c3 = h2_dot_f32(ar10, bc10, h2_dot_f32(ar11, bc11, c3));
     }
 }
+// Volta sm_70 native HMMA.884: each quad-pair computes 8x8x4 (4 quad-pairs per warp = 1024 FMAs/inst).
+__device__ __forceinline__ void mma_884(float (&d)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#else
+    (void)d; (void)a0; (void)a1; (void)b0; (void)b1;
+#endif
+}
+__device__ __forceinline__ void mma_16816_sm70(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    // Map m16n8k16 fragment layout onto 2x Volta HMMA.884 instructions using all 4 quad-pairs (0 shared memory):
+    //   qp = (lane >> 2) & 3: qp 0,1 compute M[0..7] (k_half 0,1); qp 2,3 compute M[8..15] (k_half 0,1).
+    //   rl = (lane & 3) + ((lane >> 4) & 1) * 4: row/col index 0..7 within each quad-pair.
+    const int lane = threadIdx.x & 31;
+    const int qp = (lane >> 2) & 3;
+    const int rl = (lane & 3) + ((lane >> 4) & 1) * 4;
+    const int s0 = (rl << 2) | ((qp & 1) << 1);
+    const int s1 = s0 + 1;
+    const uint32_t a0_0 = __shfl_sync(0xffffffffu, a0, s0), a1_0 = __shfl_sync(0xffffffffu, a1, s0);
+    const uint32_t a0_1 = __shfl_sync(0xffffffffu, a0, s1), a1_1 = __shfl_sync(0xffffffffu, a1, s1);
+    const uint32_t a2_0 = __shfl_sync(0xffffffffu, a2, s0), a3_0 = __shfl_sync(0xffffffffu, a3, s0);
+    const uint32_t a2_1 = __shfl_sync(0xffffffffu, a2, s1), a3_1 = __shfl_sync(0xffffffffu, a3, s1);
+    const uint32_t ra0 = (qp & 2) ? a1_0 : a0_0;
+    const uint32_t ra1 = (qp & 2) ? a1_1 : a0_1;
+    const uint32_t ra2 = (qp & 2) ? a3_0 : a2_0;
+    const uint32_t ra3 = (qp & 2) ? a3_1 : a2_1;
+    const uint32_t rb0 = __shfl_sync(0xffffffffu, b0, s0);
+    const uint32_t rb1 = __shfl_sync(0xffffffffu, b0, s1);
+    const uint32_t rb2 = __shfl_sync(0xffffffffu, b1, s0);
+    const uint32_t rb3 = __shfl_sync(0xffffffffu, b1, s1);
+    float d[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    mma_884(d, ra0, ra1, rb0, rb1);
+    mma_884(d, ra2, ra3, rb2, rb3);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) d[i] += __shfl_xor_sync(0xffffffffu, d[i], 4);
+    // qp 0,2 publish rows r0 (d[0,1,4,5]); qp 1,3 publish rows r0+2 (d[2,3,6,7])
+    const float x0 = (qp & 1) ? d[2] : d[0];
+    const float x1 = (qp & 1) ? d[3] : d[1];
+    const float y0 = (qp & 1) ? d[6] : d[4];
+    const float y1 = (qp & 1) ? d[7] : d[5];
+    const int g = lane >> 2, q = lane & 3;
+    const int src_top = ((g >> 2) << 4) | (((g >> 1) & 1) << 2) | ((q & 1) << 1) | (g & 1);
+    const int src_bot = src_top | 8;
+    const float t_x0 = __shfl_sync(0xffffffffu, x0, src_top), t_x1 = __shfl_sync(0xffffffffu, x1, src_top);
+    const float t_y0 = __shfl_sync(0xffffffffu, y0, src_top), t_y1 = __shfl_sync(0xffffffffu, y1, src_top);
+    const float b_x0 = __shfl_sync(0xffffffffu, x0, src_bot), b_x1 = __shfl_sync(0xffffffffu, x1, src_bot);
+    const float b_y0 = __shfl_sync(0xffffffffu, y0, src_bot), b_y1 = __shfl_sync(0xffffffffu, y1, src_bot);
+    c[0] += (q & 2) ? t_y0 : t_x0;
+    c[1] += (q & 2) ? t_y1 : t_x1;
+    c[2] += (q & 2) ? b_y0 : b_x0;
+    c[3] += (q & 2) ? b_y1 : b_x1;
+}
 __device__ __forceinline__ void mma_16816(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(HY4_FORCE_SM75_MMA) && !defined(HY4_FORCE_MMA_SHFL)
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -182,8 +237,32 @@ __device__ __forceinline__ void mma_16816(float* c, uint32_t a0, uint32_t a1, ui
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a2), "r"(a3), "r"(b1));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700 && !defined(HY4_FORCE_MMA_SHFL)
+    mma_16816_sm70(c, a0, a1, a2, a3, b0, b1);
 #else
     mma_16816_shfl(c[0], c[1], c[2], c[3], a0, a1, a2, a3, b0, b1);
+#endif
+}
+// Native INT8 Tensor Core m16n8k32 (sm_80+: Ampere/Ada/Hopper/Blackwell). A: s8 [16x32] row-major, B: s8 [8x32] row-major (col-major 32x8), C: s32 [16x8].
+// Note: all S2..S6 weights q in [0..63] and S8 weights in [-127..127] fit in signed s8.
+__device__ __forceinline__ void mma_16832_s8s8(int32_t* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
+#endif
+}
+// Portable 4-way int8 dot product: hardware dp4a on sm_61+, scalar fallback on sm_60 (P100)
+__device__ __forceinline__ int32_t dp4a_s8(uint32_t a, uint32_t b, int32_t c) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 610
+    return __dp4a((int)a, (int)b, c);
+#else
+    int32_t r = c;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r += (int32_t)(int8_t)((a >> (8 * i)) & 0xFFu) * (int32_t)(int8_t)((b >> (8 * i)) & 0xFFu);
+    return r;
 #endif
 }
 __device__ __forceinline__ const void* shfl_ptr(const void* p, int src) {

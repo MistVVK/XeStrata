@@ -42,10 +42,20 @@ struct ExpertRef {  // per (moe_layer, expert id); offsets relative to the arena
     uint8_t tier = 0;  // 0 device arena, 1 pinned host memory read by the GPU, 2 host RAM computed by the CPU (hybrid)
 };
 
+struct PeerGpu {
+    int dev = 0;
+    uint8_t* d_sec4 = nullptr;
+    uint64_t vram_bytes = 0, n_experts = 0;
+    std::vector<ExpertRef> experts;  // [41*512], tier=0 on this peer, tier=4 elsewhere
+};
+
 struct GpuModel {
     Manifest man;
     strata::artifact::StrataFileReader rd;
     std::string path;
+    int primary_gpu = 0;
+    std::vector<int> peer_devs;   // secondary GPU device ids for multi-GPU expert split (--gpus 0,1,...)
+    std::vector<PeerGpu> peers;
     uint8_t* d_trunk = nullptr;   // Section 1
     uint8_t* d_sec4 = nullptr;    // Section 4 (expert bodies), 4 KiB aligned bodies, same offsets as the file's directory
     uint64_t trunk_bytes = 0, sec4_bytes = 0;
@@ -448,16 +458,18 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     const size_t N = dir.size();
     auto al = [](uint64_t x) { return (x + 4095) & ~4095ull; };
     std::vector<uint8_t> tier(N, 1);
+    std::vector<int> owner(N, -1);  // 0 = primary GPU, 1..ng-1 = peer GPU, -1 = host
     std::vector<uint64_t> off(N, 0);
-    // Adaptive VRAM expert cache (cpu_mode): when host RAM fits all experts (e.g. 64 GB+ Hero cards), use 100% dynamic slots
-    // (core_frac = 0, proven +5-6 pp better than static-pinned cores on code/json/prose traces); when RAM is tight (cold-tier SSD),
-    // put the hottest static core in VRAM-only so it does not duplicate in RAM and minimizes SSD spills.
+    const size_t ng = 1 + g.peer_devs.size();
+    std::vector<uint64_t> vcap(ng, 0), vb_gpu(ng, 0), nv_gpu(ng, 0);
+    // Adaptive VRAM expert cache (single-GPU cpu_mode): use 100% dynamic slots when host RAM fits all experts;
+    // when multi-GPU (--gpus 0,1...), distribute static experts across all GPUs (e.g. 2x V100 32 GB = 64 GB HBM2).
     double ram_budget_gb = 0.0;
     if (cpu_mode) {
         if (getenv("HY4_RAM_BUDGET_GB")) ram_budget_gb = atof(getenv("HY4_RAM_BUDGET_GB"));
         else {
             const double need = getenv("HY4_HOST_NEED_GB") ? atof(getenv("HY4_HOST_NEED_GB")) : 0.0;
-            ram_budget_gb = ram_limit_gb() - 3.5 - need - 1.5;  // OS and runtime, host KV / kv_b copies, engram cache + pinned staging
+            ram_budget_gb = ram_limit_gb() - 3.5 - need - 1.5;
         }
     }
     const uint64_t ram_budget_bytes = ram_budget_gb > 0 ? (uint64_t)(ram_budget_gb * 1e9) : 0;
@@ -468,48 +480,78 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         all_al_bytes += sz;
         max_body_sz = std::max<size_t>(max_body_sz, (size_t)sz);
     }
-    double dyn_frac = 1.0;
-    if (getenv("HY4_VCACHE_FRAC")) {
-        dyn_frac = std::max(0.0, std::min(1.0, atof(getenv("HY4_VCACHE_FRAC"))));
-    } else if (cpu_mode && all_al_bytes > ram_budget_bytes && vram_budget > 0) {
-        // RAM is tight (cold tier): keep static VRAM core up to the RAM overflow so we don't needlessly push hot ranks to SSD,
-        // while still keeping at least 25% of VRAM dynamic if room allows.
-        const uint64_t overflow = all_al_bytes - ram_budget_bytes;
-        const double static_share = std::min(0.75, (double)overflow / (double)vram_budget);
-        dyn_frac = std::max(0.25, 1.0 - static_share);
+    double dyn_frac = (ng == 1) ? 1.0 : 0.0;
+    if (ng == 1) {
+        if (getenv("HY4_VCACHE_FRAC")) {
+            dyn_frac = std::max(0.0, std::min(1.0, atof(getenv("HY4_VCACHE_FRAC"))));
+        } else if (cpu_mode && all_al_bytes > ram_budget_bytes && vram_budget > 0) {
+            const uint64_t overflow = all_al_bytes - ram_budget_bytes;
+            const double static_share = std::min(0.75, (double)overflow / (double)vram_budget);
+            dyn_frac = std::max(0.25, 1.0 - static_share);
+        }
     }
     size_t static_budget = vram_budget;
     int dyn_slots = 0;
     size_t dyn_bytes = 0;
-    if (cpu_mode && dyn_frac > 0.01 && vram_budget >= 2 * max_body_sz && max_body_sz > 0) {
+    if (ng == 1 && cpu_mode && dyn_frac > 0.01 && vram_budget >= 2 * max_body_sz && max_body_sz > 0) {
         size_t want_dyn = (size_t)((double)vram_budget * dyn_frac);
         dyn_slots = (int)(want_dyn / max_body_sz);
         dyn_bytes = (size_t)dyn_slots * max_body_sz;
         static_budget = vram_budget - dyn_bytes;
     }
-    uint64_t vb = 0, hb = 0;
-    bool full = false;
-    for (size_t r = 0; r < 512 && !full; ++r)
+    vcap[0] = static_budget;
+#if HY4_CUDA
+    for (size_t p = 0; p < g.peer_devs.size(); ++p) {
+        const int pd = g.peer_devs[p];
+        HCK(hipSetDevice(pd));
+        size_t pfr = 0, ptot = 0;
+        HCK(hipMemGetInfo(&pfr, &ptot));
+        const size_t preserve = (size_t)512 << 20;  // 512 MiB for peer moe_ws + buffers + runtime
+        vcap[1 + p] = pfr > preserve ? (uint64_t)(pfr - preserve) : 0;
+        int can = 0;
+        if (cudaDeviceCanAccessPeer(&can, g.primary_gpu, pd) == cudaSuccess && can) {
+            (void)cudaSetDevice(g.primary_gpu); (void)cudaDeviceEnablePeerAccess(pd, 0); (void)cudaGetLastError();
+            (void)cudaSetDevice(pd); (void)cudaDeviceEnablePeerAccess(g.primary_gpu, 0); (void)cudaGetLastError();
+        }
+    }
+    HCK(hipSetDevice(g.primary_gpu));
+#endif
+    uint64_t hb = 0;
+    for (size_t r = 0; r < 512; ++r) {
+        bool any_placed = false;
         for (size_t L = 0; L < N / 512; ++L) {
             size_t i = L * 512 + r;
             uint64_t sz = al(dir[i].body_bytes);
-            if (vb + sz > static_budget) { full = true; break; }
-            tier[i] = 0;
-            off[i] = vb;
-            vb += sz;
+            int best_g = -1;
+            double best_frac = -1.0;
+            for (size_t gi = 0; gi < ng; ++gi) {
+                if (vcap[gi] > 0 && vb_gpu[gi] + sz <= vcap[gi]) {
+                    const double frac = (double)(vcap[gi] - vb_gpu[gi]) / (double)vcap[gi];
+                    if (frac > best_frac) { best_frac = frac; best_g = (int)gi; }
+                }
+            }
+            if (best_g >= 0) {
+                owner[i] = best_g;
+                tier[i] = (best_g == 0) ? 0 : 4;  // 4 = peer-GPU resident
+                off[i] = vb_gpu[best_g];
+                vb_gpu[best_g] += sz;
+                ++nv_gpu[best_g];
+                any_placed = true;
+            }
         }
-    // Reclaim any leftover static_budget slack into additional dynamic slots
-    if (cpu_mode && dyn_frac > 0.01 && max_body_sz > 0 && vram_budget > vb + dyn_bytes + max_body_sz) {
+        if (!any_placed) break;
+    }
+    uint64_t vb = vb_gpu[0];
+    if (ng == 1 && cpu_mode && dyn_frac > 0.01 && max_body_sz > 0 && vram_budget > vb + dyn_bytes + max_body_sz) {
         int extra = (int)((vram_budget - vb - dyn_bytes) / max_body_sz);
         dyn_slots += extra;
         dyn_bytes = (size_t)dyn_slots * max_body_sz;
     }
-    uint64_t n_v = 0, n_h = 0, n_cold = 0, cold_bytes = 0;
+    uint64_t n_v = nv_gpu[0], n_h = 0, n_cold = 0, cold_bytes = 0;
     for (size_t i = 0; i < N; ++i) {
         if (tier[i] == 1 && cpu_mode) tier[i] = 2;
         if (tier[i] == 1) { off[i] = hb; hb += al(dir[i].body_bytes); ++n_h; }
-        else if (tier[i] == 0) ++n_v;
-        else ++n_h;
+        else if (tier[i] == 2) ++n_h;
     }
     if (cpu_mode) {
         // RAM budget for the host-resident experts: the cold tail (highest ranks, rank-major order) is not loaded and is read from the file on demand (SSD) instead
@@ -540,6 +582,7 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         }
     }
     const uint64_t total_vram_arena = vb + dyn_bytes;
+    HCK(hipSetDevice(g.primary_gpu));
     HCK(hipMalloc((void**)&g.d_sec4, vb ? vb : 4096));
     g.vcache_slabs.clear();
     g.vcache_slot_bytes = max_body_sz;
@@ -555,6 +598,17 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     dyn_slots = actual_dyn;
     dyn_bytes = (size_t)dyn_slots * max_body_sz;
     g.vcache_nslots = dyn_slots;
+    g.peers.clear();
+    g.peers.resize(g.peer_devs.size());
+    for (size_t p = 0; p < g.peer_devs.size(); ++p) {
+        g.peers[p].dev = g.peer_devs[p];
+        g.peers[p].vram_bytes = vb_gpu[1 + p];
+        g.peers[p].n_experts = nv_gpu[1 + p];
+        g.peers[p].experts.assign(41 * 512, ExpertRef{0, 0, 0, 0, 4});
+        HCK(hipSetDevice(g.peer_devs[p]));
+        HCK(hipMalloc((void**)&g.peers[p].d_sec4, vb_gpu[1 + p] ? vb_gpu[1 + p] : 4096));
+    }
+    HCK(hipSetDevice(g.primary_gpu));
     uint8_t* hbase = nullptr;
     uint8_t* hdev = nullptr;
     if (hb) {
@@ -579,9 +633,13 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
             AlignedFile f;
             if (!f.open(path, false)) { failed = 1; return; }
             void* stg = nullptr;
-            hipStream_t st;
+            HCK(hipSetDevice(g.primary_gpu));
             HCK(hipHostMalloc(&stg, 8u << 20, hipHostMallocDefault));
-            HCK(hipStreamCreate(&st));
+            std::vector<hipStream_t> sts(ng, nullptr);
+            for (size_t gi = 0; gi < ng; ++gi) {
+                HCK(hipSetDevice(gi == 0 ? g.primary_gpu : g.peer_devs[gi - 1]));
+                HCK(hipStreamCreate(&sts[gi]));
+            }
             for (;;) {
                 size_t i = next.fetch_add(1);
                 if (i >= N) break;
@@ -591,31 +649,60 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
                 if (tier[i] == 1) {
                     if (f.read_at(fo, hbase + off[i], n) < n) { failed = 1; break; }
                 } else {
+                    const int gi = owner[i];
                     if (n > (8u << 20) || f.read_at(fo, stg, n) < n) { failed = 1; break; }
-                    HCK(hipMemcpyAsync(g.d_sec4 + off[i], stg, n, hipMemcpyHostToDevice, st));
-                    HCK(hipStreamSynchronize(st));
+                    const int dev = gi == 0 ? g.primary_gpu : g.peer_devs[gi - 1];
+                    uint8_t* dst = (gi == 0 ? g.d_sec4 : g.peers[gi - 1].d_sec4) + off[i];
+                    HCK(hipSetDevice(dev));
+                    HCK(hipMemcpyAsync(dst, stg, n, hipMemcpyHostToDevice, sts[gi]));
+                    HCK(hipStreamSynchronize(sts[gi]));
                 }
             }
-            HCK(hipStreamDestroy(st));
+            for (size_t gi = 0; gi < ng; ++gi) {
+                HCK(hipSetDevice(gi == 0 ? g.primary_gpu : g.peer_devs[gi - 1]));
+                HCK(hipStreamDestroy(sts[gi]));
+            }
+            HCK(hipSetDevice(g.primary_gpu));
             HCK(hipHostFree(stg));
         });
     for (auto& t : th) t.join();
+    HCK(hipSetDevice(g.primary_gpu));
     if (failed) { err = "expert read failed"; return false; }
-    if (cpu_mode) g.cpu_mask.assign(N / 512, std::vector<bool>(512, false));
+    if (cpu_mode && (n_h > 0 || n_cold > 0)) g.cpu_mask.assign(N / 512, std::vector<bool>(512, false));
     if (n_cold) g.cold_mask.assign(N / 512, std::vector<bool>(512, false));
     for (size_t i = 0; i < N; ++i) {
         const auto& e = dir[i];
-        ExpertRef& er = g.experts[(i / 512) * 512 + e.expert_id];
+        const size_t idx = (i / 512) * 512 + e.expert_id;
+        ExpertRef& er = g.experts[idx];
         er.tier = tier[i];
         if (tier[i] == 2) { g.cpu_mask[i / 512][e.expert_id] = true; continue; }
         if (tier[i] == 3) { g.cold_mask[i / 512][e.expert_id] = true; continue; }
+        if (tier[i] == 4) {
+            const int p = owner[i] - 1;
+            ExpertRef& pr = g.peers[p].experts[idx];
+            pr.body_off = off[i];
+            pr.dn_off = er.dn_off;
+            pr.gu_code = er.gu_code;
+            pr.dn_code = er.dn_code;
+            pr.tier = 0;
+            er.body_off = 0;
+            continue;
+        }
         uint8_t* dst = tier[i] == 0 ? g.d_sec4 + off[i] : hdev + off[i];
         er.body_off = (uint64_t)(uintptr_t)dst - (uint64_t)(uintptr_t)g.d_sec4;
     }
     g.t_load_experts = now_s() - t0;
-    fprintf(stderr, "[load] experts tiered: %llu static VRAM (%.2f GB) + %d adaptive VRAM slots (%.2f GB) = %.2f GB VRAM, %llu in %s (%.2f GB), %.1f s\n",
-            (unsigned long long)n_v, vb / 1e9, dyn_slots, dyn_bytes / 1e9, total_vram_arena / 1e9, (unsigned long long)n_h,
-            cpu_mode ? "host RAM computed by the CPU" : "pinned host memory read by the GPU", cpu_mode ? (double)(g.sec4_bytes - vb) / 1e9 : hb / 1e9, g.t_load_experts);
+    if (g.peers.empty()) {
+        fprintf(stderr, "[load] experts tiered: %llu static VRAM (%.2f GB) + %d adaptive VRAM slots (%.2f GB) = %.2f GB VRAM, %llu in %s (%.2f GB), %.1f s\n",
+                (unsigned long long)n_v, vb / 1e9, dyn_slots, dyn_bytes / 1e9, total_vram_arena / 1e9, (unsigned long long)n_h,
+                cpu_mode ? "host RAM computed by the CPU" : "pinned host memory read by the GPU", cpu_mode ? (double)(g.sec4_bytes - vb) / 1e9 : hb / 1e9, g.t_load_experts);
+    } else {
+        uint64_t tot_vram_b = vb, tot_vram_n = n_v;
+        for (const auto& pr : g.peers) { tot_vram_b += pr.vram_bytes; tot_vram_n += pr.n_experts; }
+        fprintf(stderr, "[load] multi-GPU experts (%zu GPUs): total %llu in VRAM (%.2f GB: GPU%d=%llu/%.2fGB", ng, (unsigned long long)tot_vram_n, tot_vram_b / 1e9, g.primary_gpu, (unsigned long long)n_v, vb / 1e9);
+        for (const auto& pr : g.peers) fprintf(stderr, ", GPU%d=%llu/%.2fGB", pr.dev, (unsigned long long)pr.n_experts, pr.vram_bytes / 1e9);
+        fprintf(stderr, "), %llu in host/CPU (%.2f GB), %.1f s\n", (unsigned long long)n_h, (double)(g.sec4_bytes > tot_vram_b ? g.sec4_bytes - tot_vram_b : 0) / 1e9, g.t_load_experts);
+    }
     return true;
 }
 
@@ -702,7 +789,7 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
         if (getenv("HY4_EXPERT_VRAM_GB")) budget = atof(getenv("HY4_EXPERT_VRAM_GB")) * 1073741824.0;
         const uint64_t sec4_al = (g.sec4_bytes + 4095) & ~4095ull;
         bool loaded_full = false;
-        if (budget >= (double)sec4_al) {
+        if (g.peer_devs.empty() && budget >= (double)sec4_al) {
             if (uma_mapped) {
                 void* hp = nullptr;
                 if (hipHostMalloc(&hp, sec4_al, hipHostMallocMapped) == hipSuccess) {
