@@ -337,6 +337,7 @@ int main(int argc, char** argv) {
     bool serve = false, session_reuse = false;
     int gpu = -1;
     std::string draft = "auto";  // auto: dfly2 under --serve (when the file carries the drafter), off for the CLI runs (gates / benches); "off" and "dfly2" force
+    std::string dfly_override;
     SpecCfg scfg;
     SampleOpts cli_samp;
     int tail_skip_arg = 0;  // opt-in only (0 = OFF by default)
@@ -374,6 +375,7 @@ int main(int argc, char** argv) {
         else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
         else if (a == "--gpu") gpu = atoi(nxt().c_str());
         else if (a == "--draft") draft = nxt();
+        else if (a == "--dfly-override") dfly_override = nxt();
         else if (a == "--spec-k") scfg.K = atoi(nxt().c_str());
         else if (a == "--spec-fixed") scfg.adaptive = false;
         else if (a == "--spec-cut") scfg.cut = (float)atof(nxt().c_str());
@@ -472,6 +474,7 @@ int main(int argc, char** argv) {
         so.session_reuse = session_reuse;
         so.tail_skip = tail_skip_arg;
         so.draft = draft;
+        so.dfly_override = dfly_override;
         so.vision = vision_path;  // HY4-VISION
         so.image_max_pixels = image_max_pixels;
         return hy4_serve_main(so);
@@ -507,6 +510,13 @@ int main(int argc, char** argv) {
     GpuModel g;
     double t_load0 = now_s();
     if (!load_gpu_model(g, model, true)) return 1;
+    if (!dfly_override.empty()) {
+        std::string oerr;
+        if (!apply_dfly_override(g, dfly_override, oerr)) {
+            fprintf(stderr, "dfly-override: %s\n", oerr.c_str());
+            return 1;
+        }
+    }
     fprintf(stderr, "[load] total %.1f s\n", now_s() - t_load0);
     if (load_only) return 0;
     // HY4-VISION: decode + resize the pictures and expand each image-pad token of the prompt to the picture's run of pads (CPU only; the ViT runs after the runner is up)

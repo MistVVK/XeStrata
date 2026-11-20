@@ -413,4 +413,50 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
     return true;
 }
 
+// Overwrite DFly2 drafter tensors in g.d_trunk from a flat DFOV0001 override file (never touches target model weights).
+inline bool apply_dfly_override(GpuModel& g, const std::string& path, std::string& err) {
+    if (path.empty()) return true;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open dfly-override: " + path; return false; }
+    char magic[8] = {};
+    uint32_t count = 0;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "DFOV0001", 8) != 0 || fread(&count, 4, 1, f) != 1 || count == 0 || count > 1024) {
+        fclose(f);
+        err = "bad DFOV0001 header in " + path;
+        return false;
+    }
+    uint64_t total_bytes = 0;
+    std::vector<uint8_t> buf;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t nlen = 0;
+        if (fread(&nlen, 4, 1, f) != 1 || nlen == 0 || nlen > 1024) { fclose(f); err = "bad name length in dfly-override"; return false; }
+        std::string name(nlen, '\0');
+        uint64_t blen = 0;
+        if (fread(&name[0], 1, nlen, f) != nlen || fread(&blen, 8, 1, f) != 1) { fclose(f); err = "truncated header in dfly-override"; return false; }
+        if (name.rfind("model.dfly_layers.", 0) != 0) {
+            fclose(f);
+            err = "refusing non-dfly tensor in override: " + name;
+            return false;
+        }
+        auto it = g.man.T.find(name);
+        if (it == g.man.T.end()) {
+            fclose(f);
+            err = "override tensor not in manifest: " + name;
+            return false;
+        }
+        if (blen != it->second.bytes) {
+            fclose(f);
+            err = "override byte length mismatch for " + name + ": got " + std::to_string(blen) + " expected " + std::to_string(it->second.bytes);
+            return false;
+        }
+        buf.resize((size_t)blen);
+        if (fread(buf.data(), 1, (size_t)blen, f) != (size_t)blen) { fclose(f); err = "truncated payload in dfly-override for " + name; return false; }
+        HCK(hipMemcpy(g.d_trunk + it->second.off, buf.data(), (size_t)blen, hipMemcpyHostToDevice));
+        total_bytes += blen;
+    }
+    fclose(f);
+    fprintf(stderr, "[dfly-override] loaded %u tensors (%.2f MB) from %s\n", count, total_bytes / 1e6, path.c_str());
+    return true;
+}
+
 }  // namespace hy4
