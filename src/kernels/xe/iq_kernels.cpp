@@ -2845,7 +2845,7 @@ void bih3_r1q2_grouped_scalar(const Bih3R1q2Layer& L, const unsigned long long* 
 namespace {
 // Lanes a row and rows a work-group of the direct grouped products: the gate/up rows are 2560 values (80 blocks of 32)
 // and the down rows 640 (20), as the native experts' GU_LPR / DOWN_LPR.
-constexpr int kBih3GuLpr = 16, kBih3DownLpr = 8, kBih3Rows = 8;
+constexpr int kBih3GuLpr = 16, kBih3DownLpr = 2, kBih3Rows = 8;
 // a single group of up to this many entries goes straight from the blob, more are gathered for the matrix kernel
 constexpr int64_t kBih3DirectRows = 16;
 
@@ -2893,7 +2893,7 @@ inline void bih3_direct_row(const sycl::sub_group& sg, const Bih3R1q2Layer& L, c
         const uint8_t* code = codes + (size_t) b * 4 * (size_t) k;
         const float scale = half_at(cols + (size_t) b * 2) * L.p2[matrix][(qs[b / 4] >> (2 * (b % 4))) & 3];
         xe::Bih3Planes planes[8];
-        for (int j = 0; j < 8; ++j) planes[j] = xe::bih3_planes_w(code, k, q * 8 + j);
+        xe::bih3_block_planes(code, k, q, planes);
         for (int e = 0; e < NE; ++e)
             if (e < n) {
                 const block_q8_1& xq = x[(size_t) ((uint32_t) rows_of[e] * (uint32_t) xb + (uint32_t) sb)];

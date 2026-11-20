@@ -61,4 +61,24 @@ inline Bih3Planes bih3_planes_w(const uint8_t* code, int k, int step) {
     return bih3_state_planes(bih3_state_w(code, k, step));
 }
 
+// The eight states of a block's 32-value part q (steps 8q .. 8q + 7) as planes, their K-bit windows read in the
+// stream's order with two words held: about K / 4 + 2 word loads where bih3_planes_w takes two a state.
+inline void bih3_block_planes(const uint8_t* code, int k, int q, Bih3Planes (&out)[8]) {
+    if (k == 8) {
+        for (int j = 0; j < 8; ++j) out[j] = bih3_planes(code, k, q * 8 + j);
+        return;
+    }
+    const auto* words = reinterpret_cast<const uint32_t*>(code);
+    int off = (24 - 8 * q) * k, w = off >> 5;   // step 8q + 7's window, the lowest of the part's
+    uint32_t cur = words[w], nxt = words[w + 1 == k ? 0 : w + 1];
+    for (int m = 0; m < 8; ++m, off += k) {
+        if ((off >> 5) != w) {
+            ++w;
+            cur = nxt;
+            nxt = words[w + 1 == k ? 0 : w + 1];
+        }
+        out[7 - m] = bih3_state_planes((uint32_t) ((((uint64_t) nxt << 32) | cur) >> (off & 31)));
+    }
+}
+
 }  // namespace strata::kernels::xe
