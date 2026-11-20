@@ -1685,7 +1685,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4295,
+     "line": 4296,
      "value": "\"1\""
     }
    ],
@@ -2725,10 +2725,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "9f3cc07a53",
+   "first_commit": "e36e94a8eb",
    "first_date": "2026-11-20",
    "since": null,
-   "last_commit": "9f3cc07a53",
+   "last_commit": "e36e94a8eb",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -2764,10 +2764,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "259b51066d",
+   "first_commit": "bf3d2f68ba",
    "first_date": "2026-11-20",
    "since": null,
-   "last_commit": "259b51066d",
+   "last_commit": "bf3d2f68ba",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -2803,10 +2803,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "9f3cc07a53",
+   "first_commit": "e36e94a8eb",
    "first_date": "2026-11-20",
    "since": null,
-   "last_commit": "9f3cc07a53",
+   "last_commit": "e36e94a8eb",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -2836,10 +2836,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "8927b2f163",
+   "first_commit": "7719d2b219",
    "first_date": "2026-11-20",
    "since": null,
-   "last_commit": "8927b2f163",
+   "last_commit": "7719d2b219",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -3828,11 +3828,11 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "2d3da9b214",
+   "first_commit": "c437e1ac1b",
    "first_date": "2026-11-19",
    "since": null,
-   "last_commit": "2b67da9a53",
-   "last_date": "2026-11-19",
+   "last_commit": "a24854fd94",
+   "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
    "note": "",
@@ -3870,10 +3870,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "259b51066d",
+   "first_commit": "bf3d2f68ba",
    "first_date": "2026-11-20",
    "since": null,
-   "last_commit": "259b51066d",
+   "last_commit": "f3dce58cd4",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -3914,10 +3914,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "259b51066d",
+   "first_commit": "bf3d2f68ba",
    "first_date": "2026-11-20",
    "since": null,
-   "last_commit": "259b51066d",
+   "last_commit": "ffe7c20027",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -3947,10 +3947,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "259b51066d",
+   "first_commit": "bf3d2f68ba",
    "first_date": "2026-11-20",
    "since": null,
-   "last_commit": "259b51066d",
+   "last_commit": "bf3d2f68ba",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -3980,10 +3980,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "259b51066d",
+   "first_commit": "bf3d2f68ba",
    "first_date": "2026-11-20",
    "since": null,
-   "last_commit": "259b51066d",
+   "last_commit": "bf3d2f68ba",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -4019,10 +4019,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "b1f71a7f84",
+   "first_commit": "2ee8fc9072",
    "first_date": "2026-11-19",
    "since": null,
-   "last_commit": "259b51066d",
+   "last_commit": "02d6976c78",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -4052,10 +4052,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "9f3cc07a53",
+   "first_commit": "e36e94a8eb",
    "first_date": "2026-11-20",
    "since": null,
-   "last_commit": "9f3cc07a53",
+   "last_commit": "a24854fd94",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -4091,11 +4091,11 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "e42cada7f7",
+   "first_commit": "f1d145ecd6",
    "first_date": "2026-11-19",
    "since": null,
-   "last_commit": "e42cada7f7",
-   "last_date": "2026-11-19",
+   "last_commit": "a24854fd94",
+   "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
    "note": "",
@@ -4124,10 +4124,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "9f3cc07a53",
+   "first_commit": "e36e94a8eb",
    "first_date": "2026-11-20",
    "since": null,
-   "last_commit": "9f3cc07a53",
+   "last_commit": "e36e94a8eb",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -4157,10 +4157,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "e42cada7f7",
+   "first_commit": "f1d145ecd6",
    "first_date": "2026-11-19",
    "since": null,
-   "last_commit": "e42cada7f7",
+   "last_commit": "f1d145ecd6",
    "last_date": "2026-11-19",
    "status": "research",
    "owner": "",
@@ -4322,7 +4322,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4293,
+     "line": 4294,
      "value": "\"1\""
     }
    ],
@@ -4922,7 +4922,7 @@
    "launch_reads": [
     {
      "file": "terminal/setup.py",
-     "line": 8737
+     "line": 8741
     }
    ],
    "doc_mentions": [
@@ -8148,7 +8148,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4296,
+     "line": 4297,
      "value": "\"1\""
     }
    ],
@@ -8910,7 +8910,7 @@
    "first_commit": "4058aa782b",
    "first_date": "2026-11-17",
    "since": "v0.2.16",
-   "last_commit": "259b51066d",
+   "last_commit": "02d6976c78",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "kernels/cpu",
@@ -9694,7 +9694,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4292,
+     "line": 4293,
      "value": "\"1\""
     }
    ],
@@ -9837,7 +9837,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4292,
+     "line": 4293,
      "value": "\"1\""
     }
    ],
@@ -9943,7 +9943,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4292,
+     "line": 4293,
      "value": "\"1\""
     }
    ],
@@ -10082,7 +10082,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4292,
+     "line": 4293,
      "value": "\"2\""
     }
    ],
@@ -10248,7 +10248,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4296,
+     "line": 4297,
      "value": "\"1\""
     }
    ],
@@ -13755,10 +13755,10 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "first_commit": "11da024eef",
+   "first_commit": "cfe2dd9274",
    "first_date": "2026-11-19",
    "since": null,
-   "last_commit": "769845bcac",
+   "last_commit": "dac507028b",
    "last_date": "2026-11-20",
    "status": "research",
    "owner": "",
@@ -13788,6 +13788,11 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
+   "first_commit": "f578665ea1",
+   "first_date": "2026-11-20",
+   "since": null,
+   "last_commit": "f578665ea1",
+   "last_date": "2026-11-20",
    "status": "opt-in",
    "owner": "hy4-dfly-distill",
    "note": "Opt-in rank cutoff (1..15) for skipping missed CPU/cold-tier routed experts in Hy4-Flash decode/verify; 0 = off by default (exact lossless).",
@@ -17580,7 +17585,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4296,
+     "line": 4297,
      "value": "\"1\""
     }
    ],
@@ -18656,6 +18661,11 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
+   "first_commit": "10fdac768f",
+   "first_date": "2026-11-20",
+   "since": null,
+   "last_commit": "10fdac768f",
+   "last_date": "2026-11-20",
    "status": "opt-in",
    "owner": "hy4flash/metal",
    "note": "Override Metal LRU GPU expert cache budget (GB) when cold experts are enabled",
@@ -20494,7 +20504,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 10283,
+     "line": 10291,
      "value": "\"1\" if stream else \"0\""
     }
    ],
@@ -20988,7 +20998,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4575,
+     "line": 4576,
      "value": "\"1\""
     }
    ],
@@ -21207,7 +21217,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4295,
+     "line": 4296,
      "value": "\"1\""
     }
    ],
@@ -24368,7 +24378,7 @@
    "launch_reads": [
     {
      "file": "terminal/setup.py",
-     "line": 8736
+     "line": 8740
     }
    ],
    "doc_mentions": [
@@ -27799,7 +27809,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4293,
+     "line": 4294,
      "value": "\"1\""
     }
    ],
@@ -30323,7 +30333,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4297,
+     "line": 4298,
      "value": "\"1\""
     }
    ],
@@ -34924,7 +34934,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4295,
+     "line": 4296,
      "value": "\"1\""
     }
    ],
@@ -35108,7 +35118,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4295,
+     "line": 4296,
      "value": "\"1\""
     }
    ],
@@ -35264,7 +35274,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4297,
+     "line": 4298,
      "value": "\"1\""
     }
    ],
@@ -36348,7 +36358,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 3843,
+     "line": 3844,
      "value": "base.get(\"ramKeep\""
     }
    ],
@@ -36701,7 +36711,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 8711,
+     "line": 8715,
      "value": "6"
     }
    ],
@@ -36780,7 +36790,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 7322,
+     "line": 7323,
      "value": "frozenset({\"0\""
     }
    ],
@@ -37429,7 +37439,7 @@
     },
     {
      "file": "terminal/setup.py",
-     "line": 4576,
+     "line": 4577,
      "value": "\"0\""
     },
     {
@@ -38803,7 +38813,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4297,
+     "line": 4298,
      "value": "\"1\""
     }
    ],
@@ -44826,7 +44836,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 4296,
+     "line": 4297,
      "value": "\"1\""
     }
    ],
