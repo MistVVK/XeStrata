@@ -296,7 +296,7 @@ bool GpuExperts::init(const CpuExperts& cx, size_t stage_bytes, int max_tokens, 
         }
     const size_t maxP = (size_t)I.max_tokens * NTOP;
     for (int i = 0; i < 3; ++i) {
-        I.h_slot[i] = sycl::malloc_host<uint8_t>(I.slot_bytes, I.cq);
+        I.h_slot[i] = sycl::aligned_alloc_host<uint8_t>(4096, I.slot_bytes, I.cq);
         I.h_items[i] = sycl::malloc_host<Item>(Impl::MAXITEMS, I.cq);
         if (!I.h_slot[i] || !I.h_items[i]) {
             err = "pinned host allocation failed";
