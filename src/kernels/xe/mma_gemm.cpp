@@ -673,7 +673,7 @@ sycl::event mma_gemm_grouped(sycl::queue& q, const uint16_t* X, const uint16_t* 
 }
 
 bool mma_gemm_kn_usable(const sycl::queue& q) {
-    if (!amd_wmma(q.get_device()) || !mma_usable(q, false)) return false;
+    if (!has_form(q.get_device(), MatrixForm::f16_kn) || !mma_usable(q, false)) return false;
     const int s = shape(q, false);
     return (s == 3 && layout_fits<3, false>(q)) || (s == 4 && layout_fits<4, false>(q));
 }

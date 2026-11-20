@@ -31,7 +31,7 @@ bool mma_shape_is(const sycl::queue& q, int m, int n, int k, int sg);
 sycl::event mma_gemm(sycl::queue& q, bool bf16, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
                      int64_t K, int64_t ldy, bool accumulate);
 
-/// Whether mma_gemm_kn runs on `q`'s device: an RDNA3 or RDNA4 GPU (amd_wmma) whose FP16 products mma_gemm takes.
+/// Whether mma_gemm_kn runs on `q`'s device: the f16_kn form (matrix_report.hpp) and mma_gemm's FP16 products.
 bool mma_gemm_kn_usable(const sycl::queue& q);
 
 /// Y[T, N] (row stride ldy) = X[T, K] . W[K, N], W as it is (row stride ldw), FP16, where mma_gemm_kn_usable: a

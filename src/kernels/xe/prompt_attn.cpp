@@ -53,10 +53,6 @@ using xe::attn::pool_format;
 using xe::attn::q4_row8;
 using xe::attn::tcq_row8;
 
-// the shared attention for the pools (below)
-bool flash_pools(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int fmt, int64_t pos0, int64_t T,
-                 const QsaShapes& s, float* attn, int64_t window = 0);
-
 }  // namespace
 
 bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,
@@ -64,39 +60,27 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
     if (T <= 0) return true;
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv != 0 || s.page_size <= 0) return false;
     sycl::queue& queue = core::Runtime::get().stream(stream);
-    static const bool no_mma = [] {   // STRATA_PROMPT_ATTN_MMA=0: the FMA kernel on every GPU
-        const char* v = strata::env_get("PROMPT_ATTN_MMA");
-        return v != nullptr && std::strtol(v, nullptr, 10) == 0;
-    }();
-    // the WMMA form (RDNA3 and RDNA4): the shared attention's (flash_attn.hpp), which these GPUs' FMA form is far behind;
-    // elsewhere its FMA form (FP32 FMAs, K and V from FP16)
-    QsaAttnPools pools;
-    pools.k_pool = k_pool;
-    pools.v_pool = v_pool;
-    pools.page_table = page_table;
-    if (!no_mma && has_form(queue.get_device(), MatrixForm::wmma)) {
-        if (!flash_pools(queue, q, pools, kFmtF16, pos0, T, s, attn, window)) return false;
-    } else {
-        FlashAttnArgs a;
-        a.q32 = q;
-        a.q_ld = a.out_ld = s.n_head * s.head_dim;
-        a.k = k_pool;
-        a.v = v_pool;
-        a.page_table = page_table;
-        a.page_size = s.page_size;
-        a.n_head = s.n_head;
-        a.n_kv = s.n_head_kv;
-        a.head_dim = s.head_dim;
-        a.rows = a.n_causal = a.row_end = T;
-        a.keys = pos0 + T;
-        a.pos0 = pos0;
-        a.window = window;
-        a.out = attn;
-        a.out_f32 = true;
-        a.scale = 1.0f / std::sqrt((float) s.head_dim);
-        a.fma = true;
-        if (!flash_attn(a, &queue)) return false;
-    }
+    // the shared attention's FMA form (FP32 FMAs, K and V from FP16) on every GPU: its matrix forms, RDNA's WMMA among
+    // them, are the pools overload's other kernel (run_mma), timed against this one (prompt_attn_tune)
+    FlashAttnArgs a;
+    a.q32 = q;
+    a.q_ld = a.out_ld = s.n_head * s.head_dim;
+    a.k = k_pool;
+    a.v = v_pool;
+    a.page_table = page_table;
+    a.page_size = s.page_size;
+    a.n_head = s.n_head;
+    a.n_kv = s.n_head_kv;
+    a.head_dim = s.head_dim;
+    a.rows = a.n_causal = a.row_end = T;
+    a.keys = pos0 + T;
+    a.pos0 = pos0;
+    a.window = window;
+    a.out = attn;
+    a.out_f32 = true;
+    a.scale = 1.0f / std::sqrt((float) s.head_dim);
+    a.fma = true;
+    if (!flash_attn(a, &queue)) return false;
     if (stream == nullptr) queue.wait_and_throw();
     return true;
 }
@@ -104,7 +88,7 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
 namespace {
 
 // The kernel a prompt's attention takes, for a GPU, a shape and a pool format (prompt_attn_tune): the matrix
-// engines' (JmKernel, or WmmaKernel's INT8 form on RDNA3 and RDNA4), the FP16 pools' FMA or WMMA kernel, or none: the
+// engines' (JmKernel, or WmmaKernel's INT8 form on RDNA3 and RDNA4), the FP16 pools' FMA kernel, or none: the
 // caller's decode kernel (qsa_dense_attn_batch).  Their order changes with the GPU, the pools and the context: over a
 // 2,048-query chunk after 28K cells of Qwen3.6-35B-A3B's 16/2 heads of 256 they ran 222, 256 and 216 ms on a B70 with
 // FP16 pools (237, -, 272 with INT8 ones), 217, 166 and 397 ms on an RTX 4070 (222, -, 391); llm-jp-4.1's 40/4 heads

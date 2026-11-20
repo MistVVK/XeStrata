@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/matrix_report.cpp - see include/strata/kernels/matrix_report.hpp.
 #include "strata/kernels/matrix_report.hpp"
+#include "mma_gemm.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/platform/env.hpp"
@@ -54,14 +55,25 @@ int wmma_gfx(const sycl::device& d) {
 }
 
 bool has_form(const sycl::device& d, MatrixForm f) {
-    if (f == MatrixForm::wmma) return !no_xmx() && wmma_gfx(d) != 0;
+    if (no_xmx() && !xe::mma_forced()) return false;
+    switch (f) {
+        case MatrixForm::wmma:
+        case MatrixForm::f16_from_int8:
+        case MatrixForm::f16_kn: return wmma_gfx(d) != 0;
+        case MatrixForm::mma_s8: {
+            if (d.get_backend() != sycl::backend::ext_oneapi_cuda) return false;
+            const auto a = static_cast<uint64_t>(d.get_info<syclex::info::device::architecture>());
+            return a >= static_cast<uint64_t>(syclex::architecture::nvidia_gpu_sm_80) && a < 0x0200000000000000ull;
+        }
+        default: break;
+    }
     if (d != core::Runtime::get().compute().get_device())
         throw std::logic_error(std::string("has_form: ") + form_name(f) + " asked of a device other than the compute one");
     switch (f) {
         case MatrixForm::xmx_f16:
         case MatrixForm::f16_from_blocks: return xmx_available(XmxType::f16);
         case MatrixForm::f16_grouped: return f16_matrix_engines();
-        case MatrixForm::wmma: break;
+        default: break;
     }
     return false;
 }
@@ -73,7 +85,10 @@ const char* form_name(MatrixForm f) {
         case MatrixForm::xmx_f16: return "xmx_f16";
         case MatrixForm::f16_grouped: return "f16_grouped";
         case MatrixForm::f16_from_blocks: return "f16_from_blocks";
+        case MatrixForm::f16_from_int8: return "f16_from_int8";
+        case MatrixForm::f16_kn: return "f16_kn";
         case MatrixForm::wmma: return "wmma";
+        case MatrixForm::mma_s8: return "mma_s8";
     }
     return "?";
 }

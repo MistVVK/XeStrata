@@ -3484,7 +3484,7 @@ bool iq_mmq_f16_ok(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols) {
     static core::PerDevice<bool> per_device;
     return per_device.get(q.get_device(), [&q] {
         const sycl::device d = q.get_device();
-        return has_form(d, MatrixForm::wmma) && d.get_info<sycl::info::device::local_mem_size>() >=
+        return has_form(d, MatrixForm::f16_from_int8) && d.get_info<sycl::info::device::local_mem_size>() >=
                                                     (size_t) IqWmmaKernel<16, 4>::LOCAL * sizeof(sycl::half);
     });
 }
