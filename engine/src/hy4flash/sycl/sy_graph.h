@@ -19,6 +19,7 @@
 #include "sy_linear.h"
 #include "sy_mla.h"
 #include "sy_model.h"
+#include "sy_vision.h"
 
 namespace hy4s {
 
@@ -105,6 +106,7 @@ public:
     std::vector<size_t> wk_off, wv_off;
     std::vector<half*> kcache;
     // DFly2 hook: the top-index_topk key lists of target layers 25,29,33,37,41 for the last (up to 16) rows of the most recent forward chunk (sy_dfly2.h reads them)
+    VisionCtx* vis = nullptr;  // the pictures of the running request (sy_vision.h); null for a text-only request: every hook is a no-op then
     bool dfly_cap = false;
     int32_t *dkeys[5] = {}, *dnkc[5] = {};  // [16][index_topk], [16]
     int cap_p0 = -1, cap_rows = 0;
@@ -352,6 +354,7 @@ public:
         er_h = dalloc<half>((size_t)Tc * 1536);
         kv_f = dalloc<float>((size_t)5 * Tc * HID);
         ep_alloc();
+        build_fuse();
         wait();
         fprintf(stderr, "[runner] kv cache %.2f GB (%.2f GB of it pinned host), ctx %d, chunk %d, device allocated %.2f GiB of 7.54\n", kvbytes / 1e9, kv_host_bytes / 1e9, max_ctx, Tc, dev_bytes_allocated() / 1073741824.0);
         return true;
@@ -382,6 +385,7 @@ public:
             std::vector<uint64_t> ids((size_t)T * 16);
             uint8_t* valid = e->valid.data() + (size_t)mo * Tc * 16;
             hy4::engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), valid);
+            if (vis) vis->mask_engram(valid, p0, T);  // pictures: no Engram contribution at image positions
             uint8_t* raw = e->raw.data() + (size_t)mo * Tc * 16 * 100;
             if (!eio.fetch_raw(ids.data(), ids.size(), raw, err)) {
                 e->ok = false;
@@ -458,6 +462,65 @@ public:
     void hc_mix_run(const float* xin, const float* hfn, const float* hsc, const float* hbs, int nout, int T) {
         hc_mix2(xin, hfn, hsc, hbs, pre, post, nout, c.rms_eps, c.hc_eps, c.hc_mag, T, hc_part, hc_cnt);
     }
+    // iHC mix + reduce + RMSNorm(nw) of cur = sum_h pre_h x_h -> outh (fp16) / outf (fp32): one launch for T <= 8 (decode, verify windows), two for prefill chunks
+    void hc_pre_run(const float* hfn, const float* hsc, const float* hbs, const float* nw, int nout, int T, const float* xin, half* outh, float* outf) {
+        if (T <= 8 && fuse_dec) {
+            hc_pre2(xin, hfn, hsc, hbs, nw, hc_part, hc_cnt, pre, post, outh, outf, nout, c.rms_eps, c.hc_eps, c.hc_mag, c.rms_eps, T);
+        } else {
+            hc_mix_run(xin, hfn, hsc, hbs, nout, T);
+            hc_reduce_norm(xin, pre, nw, outh, outf, c.rms_eps, T);
+        }
+    }
+    // decode launch fusions (T == 1; HY4S_FUSE=0 turns them off): GEMV sets of the same input width in one launch (sy_rp.h GemvMulti), built once per layer
+    bool fuse_dec = true;
+    float *kva2 = nullptr, *sg_f = nullptr, *su_f = nullptr, *so_f = nullptr;
+    std::vector<GemvMulti> mg_att, mg_m1, mg_shd, mg_up;
+    std::vector<char> mg_att_ok, mg_moe_ok;
+    bool mg_add(GemvMulti& m, const std::string& name, float* Y, int xmode, const half* Xh, const float* Xf, const float* Xg, const float* Xu) {
+        const hy4::TInfo& t = ti(name);
+        if (!g.is_rp(name) || t.fmt != FMT_S4 || t.shape.size() != 2 || m.n >= 3) return false;
+        if (m.n == 0) m.K = (int)t.cols();
+        else if (m.K != (int)t.cols()) return false;
+        GemvJob& j = m.j[m.n++];
+        j.W = (const uint8_t*)tw(name);
+        j.Y = Y;
+        j.Xh = Xh;
+        j.Xf = Xf;
+        j.Xg = Xg;
+        j.Xu = Xu;
+        j.N = (int)t.rows();
+        j.row0 = m.total;
+        j.xmode = xmode;
+        m.total += j.N;
+        return true;
+    }
+    void build_fuse() {
+        const char* e = std::getenv("HY4S_FUSE");
+        fuse_dec = e && e[0] == '1';  // default off: measured 2.6 ms/token slower on the A750 (multi-GEMV with runtime input modes), numerically equivalent
+        const int NL = c.n_layers;
+        mg_att.assign(NL, GemvMulti());
+        mg_m1.assign(NL, GemvMulti());
+        mg_shd.assign(NL, GemvMulti());
+        mg_up.assign(NL, GemvMulti());
+        mg_att_ok.assign(NL, 0);
+        mg_moe_ok.assign(NL, 0);
+        if (!fuse_dec) return;
+        kva2 = dalloc<float>(576);
+        sg_f = dalloc<float>(1536);
+        su_f = dalloc<float>(1536);
+        so_f = dalloc<float>(HID);
+        float* z1 = d_pack + 32;  // z of the one-token pack layout [idx 16 | w 16 | z 1536]
+        for (int il = 0; il < NL; ++il) {
+            const std::string pa = L(il) + ".self_attn", pm = L(il) + ".mlp";
+            mg_att_ok[il] = mg_add(mg_att[il], pa + ".q_a_proj.weight", F1, 0, cur_h, nullptr, nullptr, nullptr) && mg_add(mg_att[il], pa + ".kv_a_proj_with_mqa.weight", kva2, 0, cur_h, nullptr, nullptr, nullptr);
+            if (il == 0) continue;
+            mg_moe_ok[il] = mg_add(mg_m1[il], pm + ".routed_expert_down_proj.weight", z1, 0, cur_h, nullptr, nullptr, nullptr) &&
+                            mg_add(mg_m1[il], pm + ".shared_experts.gate_proj.weight", sg_f, 0, cur_h, nullptr, nullptr, nullptr) &&
+                            mg_add(mg_m1[il], pm + ".shared_experts.up_proj.weight", su_f, 0, cur_h, nullptr, nullptr, nullptr) &&
+                            mg_add(mg_shd[il], pm + ".shared_experts.down_proj.weight", so_f, 2, nullptr, nullptr, sg_f, su_f) &&
+                            mg_add(mg_up[il], pm + ".routed_expert_up_proj.weight", F2, 1, nullptr, zout_f, nullptr, nullptr);
+        }
+    }
 
     // IndexPool: cache iv/ig of the chunk's tokens and pool the groups completed by this chunk
     void idx_update(int il, int p0, int T) {
@@ -469,13 +532,15 @@ public:
         idx::store(iv_f, ig_f, ivg[il], p0, T, iring);
         const int g_lo = p0 / 4, g_hi = (p0 + T) / 4 - 1;
         if (g_hi >= g_lo) idx::pool(ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il), c.rms_eps, iring);
+        if (vis && g_hi >= g_lo && vis->needs_fix(p0, T)) vis->pool_fix(pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il));
     }
 
     // per-token key lists for the chunk (sparse layer, sequence longer than index_topk)
     void idx_select(int il, int p0, int T) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".query_projection.weight", qr_h, iq_f, T);
-        idx::q_rope(iq_f, iq_h, p0, (float)theta(il), T);
+        if (vis && vis->needs_fix(p0, T)) vis->iq_rope(iq_f, iq_h, T, p0, (float)theta(il));  // pictures: 3D positions
+        else idx::q_rope(iq_f, iq_h, p0, (float)theta(il), T);
         lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
         const int n_top = index_topk / c.kpool - 1;
         // scores are computed and consumed in batches of <= score_rows tokens (the score buffer is [score_rows][ctx/4] floats: 33 MB at 128K instead of 134 MB for a 1024 chunk)
@@ -495,16 +560,21 @@ public:
         const float* hfn = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_fn");
         const float* hsc = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_base");
-        { PS _q(this, "hc_mix"); hc_mix_run(x, hfn, hsc, hbs, 8, T); }
-        { PS _q(this, "hc_reduce_norm"); hc_reduce_norm(x, pre, (const float*)tw(L(il) + ".input_layernorm.weight"), cur_h, nullptr, c.rms_eps, T); }
-        lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
+        { PS _q(this, "hc_pre"); hc_pre_run(hfn, hsc, hbs, (const float*)tw(L(il) + ".input_layernorm.weight"), 8, T, x, cur_h, nullptr); }
+        const bool fz = T == 1 && fuse_dec && !dump && mg_att_ok[il];  // q_a + kv_a in one launch (decode)
+        if (fz) { PS _q(this, "lin q_a+kv_a"); k_gemv_multi(mg_att[il]); }  // F1 = q_a [1024], kva2 = kv_a [576]
+        else lin(pa + ".q_a_proj.weight", cur_h, F1, T);  // [T][1024]
         { PS _q(this, "q_a_rms"); rms_rows(F1, (const float*)tw(pa + ".q_a_layernorm.weight"), nullptr, qr_h, c.q_lora, c.rms_eps, T, 256); }
         lin(pa + ".q_b_proj.weight", qr_h, F2, T);  // [T][NH*256]
-        lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]
+        if (!fz) lin(pa + ".kv_a_proj_with_mqa.weight", cur_h, F1, T);  // [T][576]
         half* cache = kcache[il];
         const int cslots = swa ? ring : slots_sparse;
-        { PS _q(this, "mla_write_kv"); mla_write_kv(F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
+        { PS _q(this, "mla_write_kv"); mla_write_kv(fz ? kva2 : F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps); }
         { PS _q(this, "mla_prep_q"); mla_prep_q(F2, wk_b + wk_off[il], qa_h, T, NH, p0, (float)theta(il)); }
+        if (vis && vis->needs_fix(p0, T)) {  // pictures in the context: rope of q and of the new keys with the picture-aware (t, h, w) positions
+            vis->fixk(fz ? kva2 : F1, cache, T, p0, swa ? ring : 0, (float)theta(il));
+            vis->fixq(F2, qa_h, T, NH, p0, (float)theta(il));
+        }
         bool use_list = false;
         if (!swa && index_on) {
             { PS _q(this, "idx_update"); idx_update(il, p0, T); }
@@ -533,8 +603,7 @@ public:
         { PS _q(this, "mla_attend"); mla_attend(qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), ctx_h, a, mla_ws, mla_ws_bytes); }
         { PS _q(this, "mla_vup"); mla_vup(ctx_h, wv_b + wv_off[il], F3, o_h, T, NH); }
         lin(pa + ".o_proj.weight", o_h, F1, T);  // [T][3072]
-        { PS _q(this, "o_norm"); add_rms(F1, nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), sub, HID, c.rms_eps, T); }
-        { PS _q(this, "hc_post"); hc_post(x, sub, post, T); }
+        { PS _q(this, "o_norm_post"); add_rms_post(F1, nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), x, post, HID, c.rms_eps, T); }
     }
 
     void mlp_layer(int il, int T) {
@@ -542,30 +611,35 @@ public:
         const float* hfn = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_fn");
         const float* hsc = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_mlp_layer.hc_pre.hc_base");
-        { PS _q(this, "hc_mix"); hc_mix_run(x, hfn, hsc, hbs, 8, T); }
-        { PS _q(this, "hc_reduce_norm"); hc_reduce_norm(x, pre, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), cur_h, cur_f, c.rms_eps, T); }
+        { PS _q(this, "hc_pre"); hc_pre_run(hfn, hsc, hbs, (const float*)tw(L(il) + ".post_attention_layernorm.weight"), 8, T, x, cur_h, cur_f); }
         if (il == 0) {
             lin(pm + ".gate_proj.weight", cur_h, F1, T);  // [T][13824]
             lin(pm + ".up_proj.weight", cur_h, F2, T);
             const size_t n = (size_t)T * 13824;
             { PS _q(this, "swiglu"); swiglu_h(F1, F2, H1, n); }
             lin(pm + ".down_proj.weight", H1, F3, T);  // [T][3072]
-            { PS _q(this, "o_norm"); add_rms(F3, nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), sub, HID, c.rms_eps, T); }
+            { PS _q(this, "o_norm_post"); add_rms_post(F3, nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), x, post, HID, c.rms_eps, T); }
         } else {
             const size_t nz = (size_t)T * 1536;
             moe_idx = (int32_t*)d_pack; moe_w = d_pack + (size_t)T * 16; z_f = d_pack + (size_t)T * 32;  // pack layout of this call (see init)
             h_idx = (int32_t*)h_pack; h_w = h_pack + (size_t)T * 16; h_z = h_pack + (size_t)T * 32;
             { PS _q(this, "router"); linear_f32((const float*)tw(pm + ".gate.weight"), 512, HID, cur_f, F1, T); }
             { PS _q(this, "router_topk"); router_topk_sg(F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 16, c.routed_scale, T); }
-            lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536] fp32
+            const bool fm = T == 1 && fuse_dec && !dump && mg_moe_ok[il];  // decode launch fusions (see build_fuse)
+            if (fm) { PS _q(this, "lin down+shared gate/up"); k_gemv_multi(mg_m1[il]); }  // z_f (pack), sg_f, su_f
+            else lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);  // [T][1536] fp32
             // the pack layout depends on T: [idx T*16 | w T*16 | z T*1536]; the GPU-expert path needs only idx and w on the host (z stays on the device)
             const bool gx_now = gx != nullptr && T >= gx_min_T;
             sycl::event evw = Q().memcpy(h_pack, d_pack, ((size_t)T * 32 + ((gx_now && !(dump && dbg_layers)) ? 0 : nz)) * 4);
             // shared expert on the GPU while the CPU computes the routed experts
-            lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
-            lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
-            { PS _q(this, "swiglu"); swiglu_h(F1, F3, H1, nz); }
-            lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
+            if (fm) {
+                k_gemv_multi(mg_shd[il]);  // shared down_proj with the SwiGLU of sg_f/su_f folded into its input: so_f [3072]
+            } else {
+                lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);  // [T][1536]
+                lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
+                { PS _q(this, "swiglu"); swiglu_h(F1, F3, H1, nz); }
+                lin(pm + ".shared_experts.down_proj.weight", H1, F3, T);  // [T][3072]
+            }
             evw.wait();
             double tc = now_s();
             if (!force_route_dir.empty()) {  // teacher-forced routing from an oracle dump (L<il>_topk_idx.npy / L<il>_topk_w.npy, float32 [T][16]): isolates numeric noise from routing flips
@@ -597,11 +671,14 @@ public:
             }
             t_cpu_exp += now_s() - tc;
             if (!use_gx) h2d(zout_f, h_zout, nz * 4);
-            f2h(zout_f, z_h, nz);
-            lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
-            { PS _q(this, "combine_norm"); add_rms(F2, F3, (const float*)tw(pm + ".combine_output_norm.weight"), sub, HID, c.rms_eps, T); }
+            if (fm) {
+                k_gemv_multi(mg_up[il]);  // routed up_proj reading zout_f rounded to fp16 (no f2h pass): F2 = [3072]
+            } else {
+                f2h(zout_f, z_h, nz);
+                lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
+            }
+            { PS _q(this, "combine_norm_post"); add_rms_post(F2, fm ? so_f : F3, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, HID, c.rms_eps, T); }
         }
-        { PS _q(this, "hc_post"); hc_post(x, sub, post, T); }
     }
 
     // process tokens [p0, p0+T) (T <= Tc) of the sequence tok_all (host, positions 0..p0+T-1). Returns false on error.
@@ -609,6 +686,7 @@ public:
         cur_p0 = p0;
         h2d(d_ids, tok_all + p0, (size_t)T * 4);
         embed_hc((const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
+        if (vis) vis->embed(x, p0, T);  // pictures: image rows replace the embeddings of the image-pad tokens
         const bool defer_eng = engram_ready && T <= 8;
         if (defer_eng) prefetch_engram(tok_all, p0, T);
         else if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
@@ -652,8 +730,7 @@ public:
         const float* hsc = (const float*)tw("model.hc_head.hc_head_scale");
         const float* hbs = (const float*)tw("model.hc_head.hc_head_base");
         const float* xs = x + (size_t)first * 4 * HID;
-        { PS _q(this, "head_hc_mix"); hc_mix_run(xs, hfn, hsc, hbs, 4, n); }
-        { PS _q(this, "head_reduce_norm"); hc_reduce_norm(xs, pre, (const float*)tw("model.norm.weight"), hfin, nullptr, c.rms_eps, n); }
+        { PS _q(this, "head_hc_pre"); hc_pre_run(hfn, hsc, hbs, (const float*)tw("model.norm.weight"), 4, n, xs, hfin, nullptr); }
         const hy4::TInfo& lm = ti("lm_head.weight");
         linear_auto(lm.fmt, tw("lm_head.weight"), (int)lm.rows(), (int)lm.cols(), hfin, logits, n, g.is_rp("lm_head.weight"));
     }
