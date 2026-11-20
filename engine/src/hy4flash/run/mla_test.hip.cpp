@@ -1,6 +1,6 @@
 // mla_test.hip.cpp - unit tests + timings for mla_attn.hip.cpp (Hy4-Flash MLA attention, gfx1151)
 // usage: mla_test.exe [--model <Hy4-Flash-SQ-64.strata>] [--perf] [--noref] [--layers 5,2]
-#include <hip/hip_runtime.h>
+#include "hy4_gpu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -501,7 +501,7 @@ int main(int argc, char** argv) {
     }
     hipDeviceProp_t prop;
     CK(hipGetDeviceProperties(&prop, 0));
-    printf("device %s %s CUs=%d\n", prop.name, prop.gcnArchName, prop.multiProcessorCount);
+    printf("device %s %s CUs=%d\n", prop.name, gpu_arch(prop), prop.multiProcessorCount);
     int fails = 0;
     std::mt19937_64 rng(1234);
     const double TOL = 2e-3;
