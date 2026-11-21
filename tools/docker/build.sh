@@ -24,11 +24,13 @@ set -eu
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 repo=$(CDPATH= cd -- "$here/../.." && pwd -P)
 flavor=""; tag=""; base=""; version=""; ctx=""; nocache=""; ctxonly=""
-engines=""
+engines=""; shape_engines=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --flavor) flavor=$2; shift 2 ;;
     --engine) engines="$engines
+$2"; shift 2 ;;
+    --shape-engine) shape_engines="$shape_engines
 $2"; shift 2 ;;
     --tag) tag=$2; shift 2 ;;
     --base) base=$2; shift 2 ;;
@@ -52,7 +54,7 @@ fi
 
 own_ctx=""
 if [ -z "$ctx" ]; then ctx=$(mktemp -d "${TMPDIR:-/tmp}/strata-docker-ctx.XXXXXX"); own_ctx=1; fi
-mkdir -p "$ctx/terminal-src" "$ctx/engine" "$ctx/docker"
+mkdir -p "$ctx/terminal-src" "$ctx/engine" "$ctx/shapes" "$ctx/docker"
 cleanup() { if [ -n "$own_ctx" ] && [ -z "$ctxonly" ]; then rm -rf "$ctx"; fi; }
 trap cleanup EXIT
 
@@ -90,6 +92,25 @@ for e in $engines; do
   if [ -n "$entry" ] && [ -f "$dest/$entry" ] && [ ! -x "$dest/$entry" ]; then
     echo "note: $entry in $e is not executable; making it executable in the image copy"
     cp --remove-destination "$e/$entry" "$dest/$entry" && chmod 0755 "$dest/$entry"
+  fi
+done
+
+# 2b. optional shape engine package(s) (e.g. strata-hy4 -> /opt/strata/components/shapes/hy4/engine/<pkg>)
+for se in $shape_engines; do
+  case "$se" in
+    *:*) shape=${se%%:*}; sdir=${se#*:} ;;
+    *) sdir=$se; shape=$(sed -n 's/.*"shape": *"\([^"]*\)".*/\1/p' "$sdir/engine-component.json" | head -1) ;;
+  esac
+  [ -n "$shape" ] || { echo "build.sh: --shape-engine $se has no shape name" >&2; exit 2; }
+  [ -f "$sdir/engine-component.json" ] || { echo "build.sh: $sdir has no engine-component.json" >&2; exit 2; }
+  mkdir -p "$ctx/shapes/$shape/engine"
+  sdest="$ctx/shapes/$shape/engine/$(basename "$sdir")"
+  rm -rf "$sdest"
+  cp -al "$sdir" "$sdest" 2>/dev/null || { rm -rf "$sdest"; cp -a "$sdir" "$sdest"; }
+  sentry=$(sed -n 's/.*"entrypoint": *"\([^"]*\)".*/\1/p' "$sdest/engine-component.json" | head -1)
+  if [ -n "$sentry" ] && [ -f "$sdest/$sentry" ] && [ ! -x "$sdest/$sentry" ]; then
+    echo "note: $sentry in $sdir is not executable; making it executable in the image copy"
+    cp --remove-destination "$sdir/$sentry" "$sdest/$sentry" && chmod 0755 "$sdest/$sentry"
   fi
 done
 

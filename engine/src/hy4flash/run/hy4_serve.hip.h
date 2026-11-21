@@ -252,6 +252,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
     const int serve_chunk = plan_memory(o.max_ctx, o.chunk, tot, o.model, !o.peer_devs.empty());
     GpuModel g;
     g.primary_gpu = o.primary_gpu;
+    g.has_vision = !o.vision.empty();
     g.peer_devs = o.peer_devs;
     double t_load0 = now_s();
     if (!load_gpu_model(g, o.model, true)) {

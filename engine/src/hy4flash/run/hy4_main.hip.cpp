@@ -529,6 +529,7 @@ int main(int argc, char** argv) {
     chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, model, !peer_devs.empty());
     GpuModel g;
     g.primary_gpu = primary_gpu;
+    g.has_vision = !vision_path.empty();
     g.peer_devs = peer_devs;
     double t_load0 = now_s();
     if (!load_gpu_model(g, model, true)) return 1;

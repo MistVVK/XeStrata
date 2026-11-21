@@ -1306,7 +1306,7 @@ public:
             HCK(hipHostMalloc((void**)&h_idx, (size_t)Tc * 16 * 4, hipHostMallocDefault));
             d_zcpu = dalloc<float>(nz);
             HCK(hipEventCreateWithFlags(&ev_hyb, hipEventDisableTiming));
-            int nth = getenv("HY4_CPU_THREADS") ? atoi(getenv("HY4_CPU_THREADS")) : std::max(1, (int)std::thread::hardware_concurrency() / 2);
+            int nth = getenv("HY4_CPU_THREADS") ? atoi(getenv("HY4_CPU_THREADS")) : CpuExperts::default_threads();
             if (!cpu.init(g.path, nth, &g.cpu_mask, err)) return false;
             if (!g.cold_mask.empty()) {
 #if HY4_COLD_API

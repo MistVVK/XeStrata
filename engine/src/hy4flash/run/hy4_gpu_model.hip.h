@@ -125,6 +125,7 @@ struct GpuModel {
     strata::artifact::StrataFileReader rd;
     std::string path;
     int primary_gpu = 0;
+    bool has_vision = false;
     std::vector<int> peer_devs;   // secondary GPU device ids for multi-GPU expert split (--gpus 0,1,...)
     std::vector<PeerGpu> peers;
     uint8_t* d_trunk = nullptr;   // Section 1
@@ -423,7 +424,7 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
 }
 
 inline double host_mem_gb();
-// RAM this process may use: min(MemTotal, the container's cgroup limit), in GB
+// RAM this process may use: min(MemTotal, the container's cgroup limit), in GiB (matching host_mem_gb())
 inline double ram_limit_gb() {
     double gb = host_mem_gb();
 #ifndef _WIN32
@@ -433,7 +434,7 @@ inline double ram_limit_gb() {
         if (!f) continue;
         double v = 0;
         char buf[64] = {0};
-        if (fgets(buf, sizeof buf, f) && sscanf(buf, "%lf", &v) == 1 && v > 1e9 && v < 1e15) gb = std::min(gb, v / 1e9);
+        if (fgets(buf, sizeof buf, f) && sscanf(buf, "%lf", &v) == 1 && v > 1e9 && v < 1e15) gb = std::min(gb, v / 1073741824.0);
         fclose(f);
     }
 #endif
@@ -474,12 +475,15 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     std::vector<uint64_t> vcap(ng, 0), vb_gpu(ng, 0), nv_gpu(ng, 0);
     // Adaptive VRAM expert cache (single-GPU cpu_mode): when host RAM fits all experts (e.g. 64 GB+ Hero cards), use 100% dynamic slots;
     // when multi-GPU (--gpus 0,1...), distribute static experts across all GPUs (e.g. 2x V100 32 GB = 64 GB HBM2).
+    const double host_gb = host_mem_gb(), lim_gb = ram_limit_gb();
+    const bool cgroup_limited = (lim_gb < host_gb - 1.0);
     double ram_budget_gb = 0.0;
     if (cpu_mode) {
         if (getenv("HY4_RAM_BUDGET_GB")) ram_budget_gb = atof(getenv("HY4_RAM_BUDGET_GB"));
         else {
             const double need = getenv("HY4_HOST_NEED_GB") ? atof(getenv("HY4_HOST_NEED_GB")) : 0.0;
-            ram_budget_gb = ram_limit_gb() - 3.5 - need - 1.5;  // OS and runtime, host KV / kv_b copies, engram cache + pinned staging
+            const double vis_extra = (cgroup_limited && g.has_vision) ? 1.5 : 0.0;  // vision shard (0.93 GB) + serve/server.py RSS inside cgroup limit
+            ram_budget_gb = lim_gb - 3.5 - need - 1.5 - vis_extra;  // OS and runtime, host KV / kv_b copies, engram cache + pinned staging
         }
     }
     const uint64_t ram_budget_bytes = ram_budget_gb > 0 ? (uint64_t)(ram_budget_gb * 1e9) : 0;
@@ -495,7 +499,8 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         if (getenv("HY4_VCACHE_FRAC")) {
             dyn_frac = std::max(0.0, std::min(1.0, atof(getenv("HY4_VCACHE_FRAC"))));
         } else if (cpu_mode && all_al_bytes > ram_budget_bytes && vram_budget > 0) {
-            const uint64_t overflow = all_al_bytes - ram_budget_bytes;
+            uint64_t overflow = all_al_bytes - ram_budget_bytes;
+            if (cgroup_limited) overflow += (3500ull << 20);  // keep >= 3.5 GiB RSS safety margin below cgroup memory.max
             const double static_share = std::min(0.75, (double)overflow / (double)vram_budget);
             dyn_frac = std::max(0.25, 1.0 - static_share);
         }
@@ -569,13 +574,8 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         uint64_t host_total = 0;
         for (size_t i = 0; i < N; ++i)
             if (tier[i] == 2) host_total += al(dir[i].body_bytes);
-        double budget_gb;
-        if (getenv("HY4_RAM_BUDGET_GB")) budget_gb = atof(getenv("HY4_RAM_BUDGET_GB"));
-        else {
-            const double need = getenv("HY4_HOST_NEED_GB") ? atof(getenv("HY4_HOST_NEED_GB")) : 0.0;
-            budget_gb = ram_limit_gb() - 3.5 - need - 1.5;  // OS and runtime, host KV / kv_b copies, engram cache + pinned staging
-        }
-        const uint64_t budget = budget_gb > 0 ? (uint64_t)(budget_gb * 1e9) : 0;
+        const double budget_gb = ram_budget_gb;
+        const uint64_t budget = ram_budget_bytes;
         if (host_total > budget) {
             uint64_t used2 = 0;
             bool cold = false;

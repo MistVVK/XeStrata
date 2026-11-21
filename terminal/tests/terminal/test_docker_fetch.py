@@ -81,6 +81,26 @@ class FetchEngines(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not trusted", r.stderr + r.stdout)
 
+    def test_fetches_and_verifies_hy4_shape_engine_when_in_feed(self):
+        shapes_dir = self.root / "shapes-rel"
+        shapes_dir.mkdir()
+        hy4_folder = fx.build_package(self.root / "pub-hy4", "0.1.64", key=self.key, backend="cuda", variant="cuda13", shape="hy4")
+        from feed_tool import build_feed, pack_engine
+        pack_engine(hy4_folder, shapes_dir, url_prefix="")
+        for f in shapes_dir.iterdir():
+            if f.is_file() and not f.name.endswith(".entry.json") and not (self.release / f.name).exists():
+                (self.release / f.name).write_bytes(f.read_bytes())
+        build_feed(self.release, key=self.key, sequence=2, engine_dir=self.release, shapes_dir=shapes_dir)
+        r = self.run_script("--flavors", "cuda13")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        parts = r.stdout.strip().split("\t")
+        self.assertEqual(len(parts), 4, r.stdout)
+        flavor, build_flavor, folder, hy4_out = parts
+        self.assertEqual((flavor, build_flavor), ("cuda13", "cuda"))
+        self.assertTrue((Path(folder) / "engine-component.json").is_file())
+        self.assertTrue((Path(hy4_out) / "engine-component.json").is_file())
+        self.assertEqual(json.loads((Path(hy4_out) / "engine-component.json").read_text(encoding="utf-8")).get("shape"), "hy4")
+
 
 if __name__ == "__main__":
     unittest.main()

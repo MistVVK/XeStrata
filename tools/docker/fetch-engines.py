@@ -27,7 +27,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "terminal"))
 
-from strata_control import engine_component as ec, feed as feedmod, signing, transfer, updater  # noqa: E402
+from strata_control import engine_component as ec, feed as feedmod, shape_engine, signing, transfer, updater  # noqa: E402
 
 #: image flavor (the tag suffix) -> (feed backend, feed variant or None for any, tools/docker/build.sh --flavor)
 FLAVORS = {
@@ -53,8 +53,28 @@ def pick(feed: feedmod.Feed, flavor: str) -> feedmod.EnginePackage | None:
     return max(found, key=lambda p: feedmod.version_key(p.version))
 
 
-def fetch_one(feed: feedmod.Feed, pkg: feedmod.EnginePackage, out: Path, trusted: dict) -> Path:
-    folder = out / updater.folder_name(pkg)
+def pick_shape(feed: feedmod.Feed, shape: str, flavor: str, main_pkg: feedmod.EnginePackage | None = None) -> feedmod.EnginePackage | None:
+    backend, variant, _ = FLAVORS[flavor]
+    pool = [p for p in feed.shape_engines if p.shape == shape and p.platform == PLATFORM and p.backend == backend]
+    if not pool:
+        return None
+    if variant is not None:
+        exact = [p for p in pool if p.variant == variant]
+        if exact:
+            return max(exact, key=lambda p: feedmod.version_key(p.version))
+        if main_pkg is not None and main_pkg.archs:
+            want = set(main_pkg.archs)
+            overlap = [p for p in pool if set(p.archs) & want]
+            if overlap:
+                return max(overlap, key=lambda p: feedmod.version_key(p.version))
+        return None
+    return max(pool, key=lambda p: feedmod.version_key(p.version))
+
+
+def fetch_one(feed: feedmod.Feed, pkg: feedmod.EnginePackage, out: Path, trusted: dict, *, subdir: str = "") -> Path:
+    base = (out / subdir) if subdir else out
+    base.mkdir(parents=True, exist_ok=True)
+    folder = base / updater.folder_name(pkg)
     archive = out / ".partial" / pkg.url.rsplit("/", 1)[-1]
     if folder.is_dir() and (folder / ec.MANIFEST).is_file() and transfer.sha256_file(folder / ec.MANIFEST) == pkg.manifest_sha256:
         log(f"  {folder.name}: already unpacked, manifest matches the feed")
@@ -74,12 +94,14 @@ def fetch_one(feed: feedmod.Feed, pkg: feedmod.EnginePackage, out: Path, trusted
     manifest = folder / ec.MANIFEST
     if transfer.sha256_file(manifest) != pkg.manifest_sha256:
         raise SystemExit(f"fetch-engines: {folder.name} has a manifest the signed feed does not name")
+    expected_id = shape_engine.component_id(pkg.shape) if pkg.shape else ec.COMPONENT_ID
     try:
-        component = ec.read_manifest(folder)
+        component = ec.read_manifest(folder, component_id=expected_id)
     except ec.ComponentProblem as exc:
         raise SystemExit(f"fetch-engines: {folder.name}: the package manifest is invalid: {exc}")
     for name, a, b in (("version", component.version, pkg.version), ("platform", component.platform, pkg.platform),
                        ("backend", component.backend, pkg.backend), ("variant", component.variant, pkg.variant),
+                       ("shape", component.shape, pkg.shape),
                        ("build_id", component.build_id, pkg.build_id), ("archs", set(component.archs), set(pkg.archs))):
         if a != b:
             raise SystemExit(f"fetch-engines: {folder.name}: the manifest says a different {name} than the signed feed")
@@ -132,13 +154,20 @@ def main() -> int:
             else:
                 print(f"{flavor}\t{FLAVORS[flavor][2]}\tSKIP")
             continue
+        hy4_pkg = pick_shape(feed, "hy4", flavor, pkg)
         log(f"{flavor}: {pkg.label} ({pkg.url})")
+        if hy4_pkg is not None:
+            log(f"{flavor} [hy4]: {hy4_pkg.label} ({hy4_pkg.url})")
         if a.list:
             print(f"{flavor}\t{FLAVORS[flavor][2]}\t{pkg.url}\t{pkg.size}\t{pkg.sha256}")
             continue
         a.out.mkdir(parents=True, exist_ok=True)
         folder = fetch_one(feed, pkg, a.out, trusted)
-        print(f"{flavor}\t{FLAVORS[flavor][2]}\t{folder}", flush=True)
+        if hy4_pkg is not None:
+            hy4_folder = fetch_one(feed, hy4_pkg, a.out, trusted, subdir="shapes/hy4")
+            print(f"{flavor}\t{FLAVORS[flavor][2]}\t{folder}\t{hy4_folder}", flush=True)
+        else:
+            print(f"{flavor}\t{FLAVORS[flavor][2]}\t{folder}", flush=True)
     if a.out and (a.out / ".partial").is_dir():
         shutil.rmtree(a.out / ".partial", ignore_errors=True)
     return status

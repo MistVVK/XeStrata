@@ -69,14 +69,19 @@ for flavor in $(echo "$flavor_list" | tr ',' ' '); do
   # a failed fetch (bad signature, bad hash) must stop the run: it is not a skipped flavor
   $PY "$here/fetch-engines.py" --out "$work" --skip-missing --flavors "$flavor" $src_arg > "$work/.fetch.out"
   line=$(tail -1 "$work/.fetch.out")
-  bflavor=$(echo "$line" | cut -f2); folder=$(echo "$line" | cut -f3)
+  bflavor=$(echo "$line" | cut -f2); folder=$(echo "$line" | cut -f3); hy4_folder=$(echo "$line" | cut -f4)
   if [ "$folder" = "SKIP" ] || [ -z "$folder" ]; then echo "$flavor: no package in this release, skipped"; continue; fi
   img="$image:$version-$flavor"
-  "$here/build.sh" --flavor "$bflavor" --engine "$folder" --tag "$img" --version "$version" --repo "$repo"
+  if [ -n "$hy4_folder" ] && [ -d "$hy4_folder" ]; then
+    "$here/build.sh" --flavor "$bflavor" --engine "$folder" --shape-engine "hy4:$hy4_folder" --tag "$img" --version "$version" --repo "$repo"
+  else
+    "$here/build.sh" --flavor "$bflavor" --engine "$folder" --tag "$img" --version "$version" --repo "$repo"
+  fi
   [ -n "$latest" ] && docker tag "$img" "$image:latest-$flavor"
   # the image starts and its Terminal runs (no GPU needed for this)
   docker run --rm --entrypoint /opt/strata/terminal/bin/strata "$img" --version
   rm -rf "$folder"
+  [ -n "$hy4_folder" ] && rm -rf "$hy4_folder"
   if [ -n "$push" ]; then
     docker push "$img"
     [ -n "$latest" ] && docker push "$image:latest-$flavor"

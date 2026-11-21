@@ -49,12 +49,20 @@ FROM ${BASE_IMAGE} AS verify
 COPY --from=terminal /opt/strata/terminal /opt/strata/terminal
 COPY terminal-src/tools/packaging/package_engine.py terminal-src/tools/packaging/binary_deps.py /opt/strata/terminal/packaging/
 COPY engine/ /engine/
+COPY shapes/ /shapes/
 RUN set -e; n=0; for d in /engine/*/; do \
+      [ -d "$d" ] || continue; \
       echo "== $d"; \
       /opt/strata/terminal/python/bin/python3 /opt/strata/terminal/packaging/package_engine.py --verify "$d"; \
       /opt/strata/terminal/python/bin/python3 /opt/strata/terminal/packaging/binary_deps.py "$d"; \
       n=$((n+1)); \
-    done; [ "$n" -ge 1 ] || { echo "no engine package in the build context (engine/<package>/engine-component.json)"; exit 1; }
+    done; [ "$n" -ge 1 ] || { echo "no engine package in the build context (engine/<package>/engine-component.json)"; exit 1; }; \
+    for d in /shapes/*/engine/*/; do \
+      [ -d "$d" ] || continue; \
+      echo "== shape $d"; \
+      /opt/strata/terminal/python/bin/python3 /opt/strata/terminal/packaging/package_engine.py --verify "$d"; \
+      /opt/strata/terminal/python/bin/python3 /opt/strata/terminal/packaging/binary_deps.py "$d"; \
+    done
 
 # ---- 3. the runtime image
 FROM ${BASE_IMAGE}
@@ -77,13 +85,15 @@ RUN set -e; \
 
 COPY --from=terminal /opt/strata/terminal /opt/strata/terminal
 COPY --from=verify /engine/ /opt/strata/components/engine/
+COPY --from=verify /shapes/ /opt/strata/components/shapes/
 COPY docker/entrypoint.sh docker/healthcheck.sh /opt/strata/
 COPY docker/strata-wrapper.sh /usr/local/bin/strata
 RUN chmod 0755 /opt/strata/entrypoint.sh /opt/strata/healthcheck.sh /usr/local/bin/strata
 
 # Does the dynamic linker find every library of the package inside this image? (the GPU driver's libcuda / libnvidia-* come from the host)
 RUN set -e; \
-    for d in /opt/strata/components/engine/*/; do \
+    for d in /opt/strata/components/engine/*/ /opt/strata/components/shapes/*/engine/*/; do \
+      [ -d "$d" ] || continue; \
       miss=$(find "$d" -type f \( -name 'strata*' -o -name '*.so' -o -name '*.so.*' \) ! -name '*.json' ! -name '*.txt' | while read -r f; do \
                head -c4 "$f" | grep -q ELF || continue; \
                LD_LIBRARY_PATH="$d" ldd "$f" 2>/dev/null | grep 'not found' | grep -v -E 'libcuda\.so|libnvidia|libnvcuvid|libze_intel_gpu|libhsa-runtime64|libdrm_amdgpu' | sed "s|^|$(basename "$f"): |"; \

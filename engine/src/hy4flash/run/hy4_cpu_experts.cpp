@@ -68,16 +68,24 @@ static inline float _cvtsh_ss(unsigned short h) {
 #define HY4_NEON_KERNELS 0
 #endif
 #define HY4_ANY_FAST (HY4_KERNELS || HY4_NEON_KERNELS)
+#if HY4_KERNELS && ((defined(__clang__) && __clang_major__ >= 12) || (defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11) || (defined(_MSC_VER) && _MSC_VER >= 1930))
+#define HY4_AVX_VNNI 1
+#else
+#define HY4_AVX_VNNI 0
+#endif
 #if defined(__clang__)
 #define HY4_PUSH_AVX512 _Pragma("clang attribute push (__attribute__((target(\"avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,f16c,fma,avx2\"))), apply_to=function)")
+#define HY4_PUSH_AVX2_VNNI _Pragma("clang attribute push (__attribute__((target(\"avx2,fma,f16c,avxvnni\"))), apply_to=function)")
 #define HY4_PUSH_AVX2 _Pragma("clang attribute push (__attribute__((target(\"avx2,fma,f16c\"))), apply_to=function)")
 #define HY4_POP_TARGET _Pragma("clang attribute pop")
 #elif defined(__GNUC__)
 #define HY4_PUSH_AVX512 _Pragma("GCC push_options") _Pragma("GCC target(\"avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,f16c,fma,avx2\")")
+#define HY4_PUSH_AVX2_VNNI _Pragma("GCC push_options") _Pragma("GCC target(\"avx2,fma,f16c,avxvnni\")")
 #define HY4_PUSH_AVX2 _Pragma("GCC push_options") _Pragma("GCC target(\"avx2,fma,f16c\")")
 #define HY4_POP_TARGET _Pragma("GCC pop_options")
 #else
 #define HY4_PUSH_AVX512
+#define HY4_PUSH_AVX2_VNNI
 #define HY4_PUSH_AVX2
 #define HY4_POP_TARGET
 #endif
@@ -411,6 +419,25 @@ static inline void unpack_planes(const uint8_t* pl, __m512i (&P)[4]) {
     }
 }
 
+// S8_K specialization for k512: 256 signed int8 weights -> 4 planes of unsigned (q + 128 = q ^ 0x80)
+template <>
+inline void unpack_planes<8>(const uint8_t* pl, __m512i (&P)[4]) {
+    const __m512i tr = _mm512_load_si512((const void*)kc.tr);
+    const __m512i x80 = _mm512_set1_epi8((char)0x80);
+    const __m512i q0 = _mm512_permutexvar_epi8(tr, _mm512_loadu_si512((const void*)(pl)));
+    const __m512i q1 = _mm512_permutexvar_epi8(tr, _mm512_loadu_si512((const void*)(pl + 64)));
+    const __m512i q2 = _mm512_permutexvar_epi8(tr, _mm512_loadu_si512((const void*)(pl + 128)));
+    const __m512i q3 = _mm512_permutexvar_epi8(tr, _mm512_loadu_si512((const void*)(pl + 192)));
+    const __m512i t0 = _mm512_shuffle_i32x4(q0, q1, 0x44);
+    const __m512i t1 = _mm512_shuffle_i32x4(q0, q1, 0xEE);
+    const __m512i t2 = _mm512_shuffle_i32x4(q2, q3, 0x44);
+    const __m512i t3 = _mm512_shuffle_i32x4(q2, q3, 0xEE);
+    P[0] = _mm512_xor_si512(_mm512_shuffle_i32x4(t0, t2, 0x88), x80);
+    P[1] = _mm512_xor_si512(_mm512_shuffle_i32x4(t0, t2, 0xDD), x80);
+    P[2] = _mm512_xor_si512(_mm512_shuffle_i32x4(t1, t3, 0x88), x80);
+    P[3] = _mm512_xor_si512(_mm512_shuffle_i32x4(t1, t3, 0xDD), x80);
+}
+
 template <int FMT>
 struct FmtInfo;
 template <> struct FmtInfo<0> { static constexpr int SB = 48;  static constexpr float HALF = 2.0f; };  // S1.25: q+2 in 0..4, (P-2)*eff
@@ -419,6 +446,7 @@ template <> struct FmtInfo<3> { static constexpr int SB = 102; static constexpr 
 template <> struct FmtInfo<4> { static constexpr int SB = 134; static constexpr float HALF = 7.5f; };
 template <> struct FmtInfo<5> { static constexpr int SB = 166; static constexpr float HALF = 15.5f; };
 template <> struct FmtInfo<6> { static constexpr int SB = 198; static constexpr float HALF = 31.5f; };
+template <> struct FmtInfo<8> { static constexpr int SB = 262; static constexpr float HALF = 128.0f; };  // S8_K: signed int8 q -> unsigned q^0x80 = q+128
 
 static inline float cvt_f16_f32(uint16_t h) {
 #ifdef _MSC_VER
@@ -512,7 +540,7 @@ static void rows_fmt(const uint8_t* W, int nrows, const ActRow* const* X, int m,
     }
 }
 
-// W: nrows rows of K=1536 in format `code` (2..6); X[m] activation rows; out[m][nrows]
+// W: nrows rows of K=1536 in format `code` (0, 2..6, 8); X[m] activation rows; out[m][nrows]
 static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi = false) {
     if (hi) {
         switch (code) {
@@ -521,6 +549,7 @@ static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const
             case 3: rows_fmt<3, true>(W, nrows, X, m, out); break;
             case 4: rows_fmt<4, true>(W, nrows, X, m, out); break;
             case 5: rows_fmt<5, true>(W, nrows, X, m, out); break;
+            case 8: rows_fmt<8, true>(W, nrows, X, m, out); break;
             default: rows_fmt<6, true>(W, nrows, X, m, out); break;
         }
         return;
@@ -531,6 +560,7 @@ static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const
         case 3: rows_fmt<3, false>(W, nrows, X, m, out); break;
         case 4: rows_fmt<4, false>(W, nrows, X, m, out); break;
         case 5: rows_fmt<5, false>(W, nrows, X, m, out); break;
+        case 8: rows_fmt<8, false>(W, nrows, X, m, out); break;
         default: rows_fmt<6, false>(W, nrows, X, m, out); break;
     }
 }
@@ -555,6 +585,7 @@ struct FastConsts2 {
     alignas(32) uint8_t cb_hi[4][32];    // entries 16..31
     alignas(32) uint8_t ctl125[32];      // S1.25: pshufb control, word j <- bytes (5j>>3, +1)
     alignas(32) int16_t mul125[16];      // S1.25: 2^(11 - (5j&7)): (word * mul) >> 11 = 5-bit field
+    alignas(32) uint8_t tr8[32];         // S8_K: pshufb de-interleave 4x4 bytes per 128-bit lane
     alignas(32) int32_t effidx[2][8];
     FastConsts2() {
         static const int8_t cbk[32][4] = {  // = S125_CODEBOOK of sk_codecs.cpp / tools/squant/codecs.py
@@ -579,6 +610,9 @@ struct FastConsts2 {
                 ctl125[16 * lane + 2 * j + 1] = (uint8_t)(b0[j] + 1);
                 mul125[8 * lane + j] = (int16_t)(1 << (11 - off[j]));
             }
+        for (int lane = 0; lane < 2; ++lane)
+            for (int j = 0; j < 4; ++j)
+                for (int k = 0; k < 4; ++k) tr8[16 * lane + 4 * j + k] = (uint8_t)(4 * k + j);
         for (int h = 0; h < 2; ++h)
             for (int i = 0; i < 8; ++i) effidx[h][i] = 2 * h + ((i >> 1) & 1);
     }
@@ -677,6 +711,26 @@ static inline void unpack_half(const uint8_t* pl, int h, __m256i (&P)[4]) {
     }
 }
 
+// S8_K specialization for k2: 128 signed int8 weights for half h -> 4 signed int8 planes in layout Z
+template <>
+inline void unpack_half<8>(const uint8_t* pl, int h, __m256i (&P)[4]) {
+    const uint8_t* g0 = pl + 128 * h;
+    const uint8_t* g1 = g0 + 64;
+    const __m256i tr = _mm256_load_si256((const __m256i*)kc2.tr8);
+    const __m256i a0 = _mm256_shuffle_epi8(_mm256_loadu2_m128i((const __m128i*)(g0 + 32), (const __m128i*)(g0)), tr);
+    const __m256i a1 = _mm256_shuffle_epi8(_mm256_loadu2_m128i((const __m128i*)(g0 + 48), (const __m128i*)(g0 + 16)), tr);
+    const __m256i b0 = _mm256_shuffle_epi8(_mm256_loadu2_m128i((const __m128i*)(g1 + 32), (const __m128i*)(g1)), tr);
+    const __m256i b1 = _mm256_shuffle_epi8(_mm256_loadu2_m128i((const __m128i*)(g1 + 48), (const __m128i*)(g1 + 16)), tr);
+    const __m256i u0 = _mm256_unpacklo_epi32(a0, a1);
+    const __m256i u1 = _mm256_unpackhi_epi32(a0, a1);
+    const __m256i v0 = _mm256_unpacklo_epi32(b0, b1);
+    const __m256i v1 = _mm256_unpackhi_epi32(b0, b1);
+    P[0] = _mm256_unpacklo_epi64(u0, v0);
+    P[1] = _mm256_unpackhi_epi64(u0, v0);
+    P[2] = _mm256_unpacklo_epi64(u1, v1);
+    P[3] = _mm256_unpackhi_epi64(u1, v1);
+}
+
 template <int FMT>
 struct FmtInfo;
 template <> struct FmtInfo<0> { static constexpr int SB = 48;  static constexpr float HALF = 2.0f; };
@@ -685,6 +739,7 @@ template <> struct FmtInfo<3> { static constexpr int SB = 102; static constexpr 
 template <> struct FmtInfo<4> { static constexpr int SB = 134; static constexpr float HALF = 7.5f; };
 template <> struct FmtInfo<5> { static constexpr int SB = 166; static constexpr float HALF = 15.5f; };
 template <> struct FmtInfo<6> { static constexpr int SB = 198; static constexpr float HALF = 31.5f; };
+template <> struct FmtInfo<8> { static constexpr int SB = 262; static constexpr float HALF = 0.0f; };
 
 static inline float hsum256(__m256 v) {
     __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
@@ -696,6 +751,18 @@ static inline float hsum256(__m256 v) {
 // int32 lanes [g0 g0 g1 g1 g0 g0 g1 g1] = sum over the 4 planes of (P_j . x_j) for one half
 template <int FMT>
 static inline __m256i dot_half(const __m256i (&P)[4], const int8_t* xj, const __m256i ones) {
+    if constexpr (FMT == 8) {
+        // Signed int8 x signed int8 widened to int16 -> madd_epi16 (zero int16 saturation even for -128 * -128)
+        __m256i acc_lo = _mm256_setzero_si256(), acc_hi = _mm256_setzero_si256();
+        for (int j = 0; j < 4; ++j) {
+            const __m256i xv = _mm256_load_si256((const __m256i*)(xj + j * 64));
+            acc_lo = _mm256_add_epi32(acc_lo, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(P[j])),
+                                                                _mm256_cvtepi8_epi16(_mm256_castsi256_si128(xv))));
+            acc_hi = _mm256_add_epi32(acc_hi, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(P[j], 1)),
+                                                                _mm256_cvtepi8_epi16(_mm256_extracti128_si256(xv, 1))));
+        }
+        return _mm256_permute4x64_epi64(_mm256_hadd_epi32(acc_lo, acc_hi), 0xD8);
+    }
     const __m256i m0 = _mm256_maddubs_epi16(P[0], _mm256_load_si256((const __m256i*)(xj)));
     const __m256i m1 = _mm256_maddubs_epi16(P[1], _mm256_load_si256((const __m256i*)(xj + 64)));
     const __m256i m2 = _mm256_maddubs_epi16(P[2], _mm256_load_si256((const __m256i*)(xj + 128)));
@@ -748,7 +815,7 @@ static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* ou
                     const __m256i accb = dot_half<FMT>(P, &a->xjb[s][0][32 * h], ones);
                     facc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(accb), _mm256_mul_ps(effv, _mm256_load_ps(&a->xdb[s][8 * h])), facc[t]);
                 }
-                facc[t] = _mm256_fnmadd_ps(effh, _mm256_load_ps(&a->xs4[s][8 * h]), facc[t]);
+                if constexpr (FMT != 8) facc[t] = _mm256_fnmadd_ps(effh, _mm256_load_ps(&a->xs4[s][8 * h]), facc[t]);
             }
         }
     }
@@ -786,7 +853,7 @@ static void rows_fmt(const uint8_t* W, int nrows, const ActRow* const* X, int m,
     }
 }
 
-// W: nrows rows of K=1536 in format `code` (0 = S1.25, 2..6); X[m] activation rows; out[m][nrows]
+// W: nrows rows of K=1536 in format `code` (0 = S1.25, 2..6, 8); X[m] activation rows; out[m][nrows]
 static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi = false) {
     if (hi) {
         switch (code) {
@@ -795,6 +862,7 @@ static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const
             case 3: rows_fmt<3, true>(W, nrows, X, m, out); break;
             case 4: rows_fmt<4, true>(W, nrows, X, m, out); break;
             case 5: rows_fmt<5, true>(W, nrows, X, m, out); break;
+            case 8: rows_fmt<8, true>(W, nrows, X, m, out); break;
             default: rows_fmt<6, true>(W, nrows, X, m, out); break;
         }
         return;
@@ -805,11 +873,226 @@ static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const
         case 3: rows_fmt<3, false>(W, nrows, X, m, out); break;
         case 4: rows_fmt<4, false>(W, nrows, X, m, out); break;
         case 5: rows_fmt<5, false>(W, nrows, X, m, out); break;
+        case 8: rows_fmt<8, false>(W, nrows, X, m, out); break;
         default: rows_fmt<6, false>(W, nrows, X, m, out); break;
     }
 }
 HY4_POP_TARGET
 }  // namespace k2
+
+#if HY4_AVX_VNNI
+namespace k2_vnni {
+// ==================================================================================================== AVX2 + AVX-VNNI kernel
+// Targets CPUs without AVX-512 that support VEX AVX-VNNI (Intel Alder Lake / Raptor Lake / Meteor Lake / Arrow Lake, e.g. Core Ultra 9 275HX).
+// Reuses k2's ActRow layout ("Z") and constant tables (k2::kc2), replacing k2's 8-10 op maddubs+add+madd chain with 4x _mm256_dpbusd_epi32.
+HY4_PUSH_AVX2_VNNI
+
+static inline __m256i make_hsel(const uint8_t* p16) {
+    const __m256i hb = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)p16));
+    const __m256i hs = _mm256_shuffle_epi8(hb, _mm256_load_si256((const __m256i*)k2::kc2.hsidx));
+    return _mm256_blendv_epi8(hs, _mm256_srli_epi16(hs, 4), _mm256_load_si256((const __m256i*)k2::kc2.oddmask));
+}
+
+template <int FMT>
+static inline void unpack_half(const uint8_t* pl, int h, __m256i (&P)[4]) {
+    const __m256i m3 = _mm256_set1_epi8(3), m4 = _mm256_set1_epi8(4), m15 = _mm256_set1_epi8(15), m16 = _mm256_set1_epi8(16),
+                  m30 = _mm256_set1_epi8(0x30), m00FF = _mm256_set1_epi16(0x00FF);
+    (void)m3; (void)m4; (void)m16; (void)m30; (void)m00FF; (void)m15;
+    if constexpr (FMT == 0) {
+        const uint8_t* g = pl + 20 * h;
+        const __m256i ctl = _mm256_load_si256((const __m256i*)k2::kc2.ctl125), mulc = _mm256_load_si256((const __m256i*)k2::kc2.mul125);
+        const __m256i X = _mm256_loadu2_m128i((const __m128i*)(g + 5), (const __m128i*)g);
+        const __m256i Y = _mm256_loadu2_m128i((const __m128i*)(g + 15), (const __m128i*)(g + 10));
+        const __m256i Xf = _mm256_srli_epi16(_mm256_mullo_epi16(_mm256_shuffle_epi8(X, ctl), mulc), 11);
+        const __m256i Yf = _mm256_srli_epi16(_mm256_mullo_epi16(_mm256_shuffle_epi8(Y, ctl), mulc), 11);
+        const __m256i idx = _mm256_packus_epi16(Xf, Yf);
+        const __m256i sel = _mm256_slli_epi16(idx, 3);
+        for (int j = 0; j < 4; ++j)
+            P[j] = _mm256_blendv_epi8(_mm256_shuffle_epi8(_mm256_load_si256((const __m256i*)k2::kc2.cb_lo[j]), idx),
+                                      _mm256_shuffle_epi8(_mm256_load_si256((const __m256i*)k2::kc2.cb_hi[j]), idx), sel);
+    } else if constexpr (FMT == 2 || FMT == 3) {
+        const __m256i wz = _mm256_permute4x64_epi64(_mm256_loadu_si256((const __m256i*)(pl + 32 * h)), 0xD8);
+        P[0] = _mm256_and_si256(wz, m3);
+        P[1] = _mm256_and_si256(_mm256_srli_epi16(wz, 2), m3);
+        P[2] = _mm256_and_si256(_mm256_srli_epi16(wz, 4), m3);
+        P[3] = _mm256_and_si256(_mm256_srli_epi16(wz, 6), m3);
+        if constexpr (FMT == 3) {
+            const __m256i hsel = make_hsel(pl + 64 + 16 * h);
+            P[0] = _mm256_or_si256(P[0], _mm256_and_si256(_mm256_slli_epi16(hsel, 2), m4));
+            P[1] = _mm256_or_si256(P[1], _mm256_and_si256(_mm256_slli_epi16(hsel, 1), m4));
+            P[2] = _mm256_or_si256(P[2], _mm256_and_si256(hsel, m4));
+            P[3] = _mm256_or_si256(P[3], _mm256_and_si256(_mm256_srli_epi16(hsel, 1), m4));
+        }
+    } else if constexpr (FMT == 8) {
+        const uint8_t* g0 = pl + 128 * h;
+        const uint8_t* g1 = g0 + 64;
+        const __m256i tr = _mm256_load_si256((const __m256i*)k2::kc2.tr8);
+        const __m256i x80 = _mm256_set1_epi8((char)0x80);
+        const __m256i a0 = _mm256_shuffle_epi8(_mm256_loadu2_m128i((const __m128i*)(g0 + 32), (const __m128i*)(g0)), tr);
+        const __m256i a1 = _mm256_shuffle_epi8(_mm256_loadu2_m128i((const __m128i*)(g0 + 48), (const __m128i*)(g0 + 16)), tr);
+        const __m256i b0 = _mm256_shuffle_epi8(_mm256_loadu2_m128i((const __m128i*)(g1 + 32), (const __m128i*)(g1)), tr);
+        const __m256i b1 = _mm256_shuffle_epi8(_mm256_loadu2_m128i((const __m128i*)(g1 + 48), (const __m128i*)(g1 + 16)), tr);
+        const __m256i u0 = _mm256_unpacklo_epi32(a0, a1);
+        const __m256i u1 = _mm256_unpackhi_epi32(a0, a1);
+        const __m256i v0 = _mm256_unpacklo_epi32(b0, b1);
+        const __m256i v1 = _mm256_unpackhi_epi32(b0, b1);
+        P[0] = _mm256_xor_si256(_mm256_unpacklo_epi64(u0, v0), x80);
+        P[1] = _mm256_xor_si256(_mm256_unpackhi_epi64(u0, v0), x80);
+        P[2] = _mm256_xor_si256(_mm256_unpacklo_epi64(u1, v1), x80);
+        P[3] = _mm256_xor_si256(_mm256_unpackhi_epi64(u1, v1), x80);
+    } else {
+        const __m256i wa = _mm256_loadu_si256((const __m256i*)(pl + 64 * h)), wb = _mm256_loadu_si256((const __m256i*)(pl + 64 * h + 32));
+        const __m256i E = _mm256_packus_epi16(_mm256_and_si256(wa, m00FF), _mm256_and_si256(wb, m00FF));
+        const __m256i O = _mm256_packus_epi16(_mm256_srli_epi16(wa, 8), _mm256_srli_epi16(wb, 8));
+        P[0] = _mm256_and_si256(E, m15);
+        P[1] = _mm256_and_si256(_mm256_srli_epi16(E, 4), m15);
+        P[2] = _mm256_and_si256(O, m15);
+        P[3] = _mm256_and_si256(_mm256_srli_epi16(O, 4), m15);
+        if constexpr (FMT == 5) {
+            const __m256i hsel = make_hsel(pl + 128 + 16 * h);
+            P[0] = _mm256_or_si256(P[0], _mm256_and_si256(_mm256_slli_epi16(hsel, 4), m16));
+            P[1] = _mm256_or_si256(P[1], _mm256_and_si256(_mm256_slli_epi16(hsel, 3), m16));
+            P[2] = _mm256_or_si256(P[2], _mm256_and_si256(_mm256_slli_epi16(hsel, 2), m16));
+            P[3] = _mm256_or_si256(P[3], _mm256_and_si256(_mm256_slli_epi16(hsel, 1), m16));
+        } else if constexpr (FMT == 6) {
+            const __m256i w6 = _mm256_permute4x64_epi64(_mm256_loadu_si256((const __m256i*)(pl + 128 + 32 * h)), 0xD8);
+            P[0] = _mm256_or_si256(P[0], _mm256_and_si256(_mm256_slli_epi16(w6, 4), m30));
+            P[1] = _mm256_or_si256(P[1], _mm256_and_si256(_mm256_slli_epi16(w6, 2), m30));
+            P[2] = _mm256_or_si256(P[2], _mm256_and_si256(w6, m30));
+            P[3] = _mm256_or_si256(P[3], _mm256_and_si256(_mm256_srli_epi16(w6, 2), m30));
+        }
+    }
+}
+
+template <int FMT>
+struct FmtInfo;
+template <> struct FmtInfo<0> { static constexpr int SB = 48;  static constexpr float HALF = 2.0f; };
+template <> struct FmtInfo<2> { static constexpr int SB = 70;  static constexpr float HALF = 1.5f; };
+template <> struct FmtInfo<3> { static constexpr int SB = 102; static constexpr float HALF = 3.5f; };
+template <> struct FmtInfo<4> { static constexpr int SB = 134; static constexpr float HALF = 7.5f; };
+template <> struct FmtInfo<5> { static constexpr int SB = 166; static constexpr float HALF = 15.5f; };
+template <> struct FmtInfo<6> { static constexpr int SB = 198; static constexpr float HALF = 31.5f; };
+template <> struct FmtInfo<8> { static constexpr int SB = 262; static constexpr float HALF = 128.0f; };
+
+static inline float hsum256(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+template <int FMT>
+static inline __m256i dot_half(const __m256i (&P)[4], const int8_t* xj) {
+    __m256i acc = _mm256_dpbusd_epi32(_mm256_setzero_si256(), P[0], _mm256_load_si256((const __m256i*)(xj)));
+    acc = _mm256_dpbusd_epi32(acc, P[1], _mm256_load_si256((const __m256i*)(xj + 64)));
+    acc = _mm256_dpbusd_epi32(acc, P[2], _mm256_load_si256((const __m256i*)(xj + 128)));
+    acc = _mm256_dpbusd_epi32(acc, P[3], _mm256_load_si256((const __m256i*)(xj + 192)));
+    return acc;
+}
+
+template <int FMT, int M, bool HI>
+static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* out) {
+    constexpr int SB = FmtInfo<FMT>::SB;
+    __m256 facc[M];
+    for (int t = 0; t < M; ++t) facc[t] = _mm256_setzero_ps();
+    const __m128 inv255 = _mm_set1_ps(255.0f);
+    const __m256 halfv = _mm256_set1_ps(FmtInfo<FMT>::HALF);
+    for (int s = 0; s < 6; ++s) {
+        const uint8_t* blk = row + (size_t)s * SB;
+        uint16_t dh;
+        uint32_t u32;
+        std::memcpy(&dh, blk, 2);
+        std::memcpy(&u32, blk + 2, 4);
+        __m128 u4 = _mm_div_ps(_mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)u32))), inv255);
+#ifdef _MSC_VER
+        u4 = _mm_mul_ps(u4, _mm_set1_ps(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)dh)))));
+#else
+        u4 = _mm_mul_ps(u4, _mm_set1_ps(_cvtsh_ss(dh)));
+#endif
+        if constexpr (FMT == 0) {
+            uint16_t fn;
+            std::memcpy(&fn, blk + 46, 2);
+            __m128i fv = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32((int)fn), _mm_setr_epi32(0, 4, 8, 12)), _mm_set1_epi32(15));
+            u4 = _mm_mul_ps(u4, _mm_add_ps(_mm_div_ps(_mm_cvtepi32_ps(fv), _mm_set1_ps(15.0f)), _mm_set1_ps(0.5f)));
+        }
+        const __m256 effc = _mm256_castps128_ps256(u4);
+        for (int h = 0; h < 2; ++h) {
+            const __m256 effv = _mm256_permutevar8x32_ps(effc, _mm256_load_si256((const __m256i*)k2::kc2.effidx[h]));
+            const __m256 effh = _mm256_mul_ps(effv, halfv);
+            __m256i P[4];
+            unpack_half<FMT>(blk + 6, h, P);
+            for (int t = 0; t < M; ++t) {
+                const ActRow* a = X[t];
+                const __m256i acc = dot_half<FMT>(P, &a->xj[s][0][32 * h]);
+                const __m256 sc = _mm256_mul_ps(effv, _mm256_load_ps(&a->xd[s][8 * h]));
+                facc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), sc, facc[t]);
+                if constexpr (HI) {
+                    const __m256i accb = dot_half<FMT>(P, &a->xjb[s][0][32 * h]);
+                    facc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(accb), _mm256_mul_ps(effv, _mm256_load_ps(&a->xdb[s][8 * h])), facc[t]);
+                }
+                facc[t] = _mm256_fnmadd_ps(effh, _mm256_load_ps(&a->xs4[s][8 * h]), facc[t]);
+            }
+        }
+    }
+    for (int t = 0; t < M; ++t) out[t] = hsum256(facc[t]);
+}
+
+template <int FMT, int M, bool HI>
+static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* out) {
+    constexpr size_t RBYTES = 6 * (size_t)FmtInfo<FMT>::SB;
+    const int pf = g_pf_rows;
+    for (int r = 0; r < nrows; ++r) {
+        if (pf && r + pf < nrows) {
+            const char* pp = (const char*)(W + (size_t)(r + pf) * RBYTES);
+            for (size_t o = 0; o < RBYTES; o += 64) _mm_prefetch(pp + o, _MM_HINT_T0);
+        }
+        float o[M];
+        row_dot<FMT, M, HI>(W + r * RBYTES, X, o);
+        for (int i = 0; i < M; ++i) out[(size_t)i * nrows + r] = o[i];
+    }
+}
+
+template <int FMT, bool HI>
+static void rows_fmt(const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out) {
+    for (int g0 = 0; g0 < m; g0 += 4) {
+        const int mg = std::min(4, m - g0);
+        const ActRow* const* x = X + g0;
+        float* o = out + (size_t)g0 * nrows;
+        switch (mg) {
+            case 1: rows_m<FMT, 1, HI>(W, nrows, x, o); break;
+            case 2: rows_m<FMT, 2, HI>(W, nrows, x, o); break;
+            case 3: rows_m<FMT, 3, HI>(W, nrows, x, o); break;
+            default: rows_m<FMT, 4, HI>(W, nrows, x, o); break;
+        }
+    }
+}
+
+static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi = false) {
+    if (hi) {
+        switch (code) {
+            case 0: rows_fmt<0, true>(W, nrows, X, m, out); break;
+            case 2: rows_fmt<2, true>(W, nrows, X, m, out); break;
+            case 3: rows_fmt<3, true>(W, nrows, X, m, out); break;
+            case 4: rows_fmt<4, true>(W, nrows, X, m, out); break;
+            case 5: rows_fmt<5, true>(W, nrows, X, m, out); break;
+            case 8: rows_fmt<8, true>(W, nrows, X, m, out); break;
+            default: rows_fmt<6, true>(W, nrows, X, m, out); break;
+        }
+        return;
+    }
+    switch (code) {
+        case 0: rows_fmt<0, false>(W, nrows, X, m, out); break;
+        case 2: rows_fmt<2, false>(W, nrows, X, m, out); break;
+        case 3: rows_fmt<3, false>(W, nrows, X, m, out); break;
+        case 4: rows_fmt<4, false>(W, nrows, X, m, out); break;
+        case 5: rows_fmt<5, false>(W, nrows, X, m, out); break;
+        case 8: rows_fmt<8, false>(W, nrows, X, m, out); break;
+        default: rows_fmt<6, false>(W, nrows, X, m, out); break;
+    }
+}
+HY4_POP_TARGET
+}  // namespace k2_vnni
+#endif  // HY4_AVX_VNNI
 #endif  // HY4_KERNELS (k2)
 
 #if HY4_NEON_KERNELS
@@ -846,6 +1129,7 @@ template <> struct FmtInfo<3> { static constexpr int SB = 102; static constexpr 
 template <> struct FmtInfo<4> { static constexpr int SB = 134; static constexpr float HALF = 7.5f; };
 template <> struct FmtInfo<5> { static constexpr int SB = 166; static constexpr float HALF = 15.5f; };
 template <> struct FmtInfo<6> { static constexpr int SB = 198; static constexpr float HALF = 31.5f; };
+template <> struct FmtInfo<8> { static constexpr int SB = 262; static constexpr float HALF = 0.0f; };
 
 HY4_PUSH_NEON_DP
 
@@ -943,6 +1227,15 @@ static inline void unpack_group(const uint8_t* pl, int L, int8x16_t (&P)[4]) {
     }
 }
 
+template <>
+inline void unpack_group<8>(const uint8_t* pl, int L, int8x16_t (&P)[4]) {
+    const int8x16x4_t v = vld4q_s8(reinterpret_cast<const int8_t*>(pl + L * 64));
+    P[0] = v.val[0];
+    P[1] = v.val[1];
+    P[2] = v.val[2];
+    P[3] = v.val[3];
+}
+
 template <int FMT, int M, bool HI>
 static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* out) {
     constexpr int SB = FmtInfo<FMT>::SB;
@@ -996,7 +1289,7 @@ static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* ou
                 const int32x4_t sum4b = vpaddq_s32(vpaddq_s32(acc_b[t][0], acc_b[t][1]), vpaddq_s32(acc_b[t][2], acc_b[t][3]));
                 facc[t] = vfmaq_f32(facc[t], vcvtq_f32_s32(sum4b), vmulq_f32(effv, vld1q_f32(a->xdb[s])));
             }
-            facc[t] = vfmsq_f32(facc[t], effh, vld1q_f32(a->xs4[s]));
+            if constexpr (FMT != 8) facc[t] = vfmsq_f32(facc[t], effh, vld1q_f32(a->xs4[s]));
         }
     }
     for (int t = 0; t < M; ++t) out[t] = vaddvq_f32(facc[t]);
@@ -1040,6 +1333,7 @@ static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const
             case 3: rows_fmt<3, true>(W, nrows, X, m, out); break;
             case 4: rows_fmt<4, true>(W, nrows, X, m, out); break;
             case 5: rows_fmt<5, true>(W, nrows, X, m, out); break;
+            case 8: rows_fmt<8, true>(W, nrows, X, m, out); break;
             default: rows_fmt<6, true>(W, nrows, X, m, out); break;
         }
         return;
@@ -1050,6 +1344,7 @@ static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const
         case 3: rows_fmt<3, false>(W, nrows, X, m, out); break;
         case 4: rows_fmt<4, false>(W, nrows, X, m, out); break;
         case 5: rows_fmt<5, false>(W, nrows, X, m, out); break;
+        case 8: rows_fmt<8, false>(W, nrows, X, m, out); break;
         default: rows_fmt<6, false>(W, nrows, X, m, out); break;
     }
 }
@@ -1057,12 +1352,16 @@ HY4_POP_NEON
 }  // namespace kneon
 #endif  // HY4_NEON_KERNELS
 
-static const char* kern_name(int k) { return k == 3 ? "fast(neon-dotprod)" : (k == 2 ? "fast(avx512-vbmi)" : (k == 1 ? "fast(avx2)" : "lib")); }
+static const char* kern_name(int k) {
+    return k == 4 ? "fast(avx2-vnni)" : (k == 3 ? "fast(neon-dotprod)" : (k == 2 ? "fast(avx512-vbmi)" : (k == 1 ? "fast(avx2)" : "lib")));
+}
+
+static inline bool fast_code_ok(uint8_t c) { return c == 0 || (c >= 2 && c <= 6) || c == 8; }
 
 #if HY4_KERNELS
 // ---- CPU probe (same checks as the main engine's quant/isa.cpp: CPUID + XGETBV for OS support) and per-call dispatch ------------
 struct KernCaps {
-    bool avx2 = false, avx512 = false;
+    bool avx2 = false, avx_vnni = false, avx512 = false;
 };
 static void cpuid_ex(unsigned leaf, unsigned sub, unsigned r[4]) {
 #if defined(_MSC_VER)
@@ -1095,14 +1394,23 @@ static KernCaps probe_kernel_caps() {
     const bool avx = ymm && ((ecx1 >> 28) & 1), fma = (ecx1 >> 12) & 1, f16c = (ecx1 >> 29) & 1;
     if (maxleaf >= 7) {
         cpuid_ex(7, 0, r);
-        const unsigned ebx = r[1], ecx = r[2];
+        const unsigned maxsub = r[0], ebx = r[1], ecx = r[2];
         c.avx2 = avx && fma && f16c && ((ebx >> 5) & 1);
         // AVX-512 F, BW, VL + VNNI + VBMI (+ the OS saving ZMM state)
         c.avx512 = c.avx2 && zmm && ((ebx >> 16) & 1) && ((ebx >> 30) & 1) && ((ebx >> 31) & 1) && ((ecx >> 11) & 1) && ((ecx >> 1) & 1);
+#if HY4_AVX_VNNI
+        if (c.avx2 && maxsub >= 1) {
+            cpuid_ex(7, 1, r);
+            c.avx_vnni = ((r[0] >> 4) & 1) != 0;  // CPUID.07H.01H:EAX[4] = AVX-VNNI
+        }
+#else
+        (void)maxsub;
+#endif
     }
-    if (const char* f = std::getenv("STRATA_FORCE_ISA")) {  // as in the main engine: avx2 = no AVX-512, avx / sse = no AVX2 kernels either
-        if (!std::strcmp(f, "avx2")) c.avx512 = false;
-        else if (!std::strcmp(f, "avx") || !std::strcmp(f, "sse")) c.avx512 = c.avx2 = false;
+    if (const char* f = std::getenv("STRATA_FORCE_ISA")) {  // as in the main engine: avx2 = no AVX-512/VNNI, avx / sse = no AVX2 kernels either
+        if (!std::strcmp(f, "avx2")) { c.avx512 = false; c.avx_vnni = false; }
+        else if (!std::strcmp(f, "avx2-vnni")) c.avx512 = false;
+        else if (!std::strcmp(f, "avx") || !std::strcmp(f, "sse")) c.avx512 = c.avx_vnni = c.avx2 = false;
     }
     return c;
 }
@@ -1116,6 +1424,9 @@ static inline void kern_store_hi(int k, ActRow* a, int b, const BlockQ8_1_G64& b
 }
 static void kern_gemm(int k, int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi) {
     if (k == 2) k512::rows_gemm(code, W, nrows, X, m, out, hi);
+#if HY4_AVX_VNNI
+    else if (k == 4) k2_vnni::rows_gemm(code, W, nrows, X, m, out, hi);
+#endif
     else k2::rows_gemm(code, W, nrows, X, m, out, hi);
 }
 #elif HY4_NEON_KERNELS
@@ -1138,6 +1449,66 @@ static inline void kern_store(int, ActRow* a, int b, const BlockQ8_1_G64& blk) {
 static inline void kern_store_hi(int, ActRow* a, int b, const BlockQ8_1_G64& blk, const BlockQ8_1_G64& blk2) { kneon::store_block_hi(a, b, blk, blk2); }
 static void kern_gemm(int, int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi) {
     kneon::rows_gemm(code, W, nrows, X, m, out, hi);
+}
+#endif
+
+#if HY4_ANY_FAST
+// Reconstruct BlockQ8_1_G64[24] from an ActRow for rare per-call library fallback (e.g. S1.5 matrix while fast kernel handles S1.25/S2..S6/S8).
+static void unpack_act_row_blocks(int kern, const ActRow* a, bool hi, BlockQ8_1_G64* q1, BlockQ8_1_G64* q2) {
+    const bool z_layout = (kern == 1 || kern == 4);
+    for (int b = 0; b < NB; ++b) {
+        const int sb = b >> 2, L = b & 3;
+        int32_t sum1 = 0, sum2 = 0;
+        if (z_layout) {
+            const int h = L >> 1, g1 = L & 1;
+            for (int j = 0; j < 4; ++j) {
+                const int8_t* s1 = &a->xj[sb][j][32 * h + 8 * g1];
+                const int8_t* s2 = hi ? &a->xjb[sb][j][32 * h + 8 * g1] : nullptr;
+                for (int k = 0; k < 16; ++k) {
+                    const int idx = 16 * (k >> 3) + (k & 7);
+                    q1[b].qs[4 * k + j] = s1[idx];
+                    sum1 += (int32_t)s1[idx];
+                    if (hi) { q2[b].qs[4 * k + j] = s2[idx]; sum2 += (int32_t)s2[idx]; }
+                }
+            }
+            q1[b].d = a->xd[sb][8 * h + 2 * g1];
+            q1[b].s = q1[b].d * (float)sum1;
+            if (hi) { q2[b].d = a->xdb[sb][8 * h + 2 * g1]; q2[b].s = q2[b].d * (float)sum2; }
+        } else {
+            for (int j = 0; j < 4; ++j) {
+                const int8_t* s1 = &a->xj[sb][j][L * 16];
+                const int8_t* s2 = hi ? &a->xjb[sb][j][L * 16] : nullptr;
+                for (int k = 0; k < 16; ++k) {
+                    q1[b].qs[4 * k + j] = s1[k];
+                    sum1 += (int32_t)s1[k];
+                    if (hi) { q2[b].qs[4 * k + j] = s2[k]; sum2 += (int32_t)s2[k]; }
+                }
+            }
+            q1[b].d = (kern == 3) ? a->xd[sb][L] : a->xd[sb][L * 4];
+            q1[b].s = q1[b].d * (float)sum1;
+            if (hi) { q2[b].d = (kern == 3) ? a->xdb[sb][L] : a->xdb[sb][L * 4]; q2[b].s = q2[b].d * (float)sum2; }
+        }
+    }
+}
+
+static void kern_gemm_dispatch(int kern, int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi) {
+    if (fast_code_ok((uint8_t)code)) {
+        kern_gemm(kern, code, W, nrows, X, m, out, hi);
+        return;
+    }
+    // Per-call library fallback for non-fast formats (e.g. S1.5) so one matrix never disables fast kernels globally.
+    BlockQ8_1_G64 q1[MG * NB], q2[MG * NB];
+    float tmp2[MG * RB];
+    for (int g0 = 0; g0 < m; g0 += MG) {
+        const int mg = std::min(MG, m - g0);
+        for (int i = 0; i < mg; ++i) unpack_act_row_blocks(kern, X[g0 + i], hi, q1 + (size_t)i * NB, q2 + (size_t)i * NB);
+        float* o = out + (size_t)g0 * nrows;
+        gemm_sk_q8_1(W, (SkCode)code, q1, o, nrows, D, mg);
+        if (hi) {
+            gemm_sk_q8_1(W, (SkCode)code, q2, tmp2, nrows, D, mg);
+            for (int i = 0; i < mg * nrows; ++i) o[i] += tmp2[i];
+        }
+    }
 }
 #endif
 
@@ -1596,24 +1967,21 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
 #if HY4_KERNELS
     {
         const KernCaps kcaps = probe_kernel_caps();
-        const int best = kcaps.avx512 ? 2 : (kcaps.avx2 ? 1 : 0);
+        const int best = kcaps.avx512 ? 2 : (kcaps.avx_vnni ? 4 : (kcaps.avx2 ? 1 : 0));
         kern = best;
         if (const char* k = std::getenv("STRATA_CPUEXP_KERNEL")) {
             int want = -1;
             if (!std::strcmp(k, "lib")) want = 0;
             else if (!std::strcmp(k, "avx2")) want = 1;
+            else if (!std::strcmp(k, "avx2-vnni") || !std::strcmp(k, "avxvnni")) want = 4;
             else if (!std::strcmp(k, "avx512")) want = 2;
-            else std::fprintf(stderr, "[cpuexp] STRATA_CPUEXP_KERNEL=%s is not avx512, avx2 or lib; ignored\n", k);
+            else std::fprintf(stderr, "[cpuexp] STRATA_CPUEXP_KERNEL=%s is not avx512, avx2-vnni, avx2 or lib; ignored\n", k);
             if (want >= 0) {
-                if (want <= best) kern = want;
+                const bool ok_want = (want == 0) || (want == 1 && kcaps.avx2) || (want == 4 && kcaps.avx_vnni) || (want == 2 && kcaps.avx512);
+                if (ok_want) kern = want;
                 else std::fprintf(stderr, "[cpuexp] STRATA_CPUEXP_KERNEL=%s is not supported by this CPU/OS; using %s\n", k, kern_name(best));
             }
         }
-        for (const Rec& r : recs)
-            if (kern && r.body && !(r.gu <= 6 && r.gu != 1 && r.dn <= 6 && r.dn != 1)) {  // fast kernels: S1.25 (0), S2..S6; S1.5 (1) and S8 use the library kernel
-                std::fprintf(stderr, "[cpuexp] S1.5/S8/other expert code resident: using the library kernel for all experts\n");
-                kern = 0;
-            }
     }
 #elif HY4_NEON_KERNELS
     {
@@ -1630,15 +1998,10 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
                 else std::fprintf(stderr, "[cpuexp] STRATA_CPUEXP_KERNEL=%s is not supported by this CPU/OS; using %s\n", k, kern_name(best));
             }
         }
-        for (const Rec& r : recs)
-            if (kern && r.body && !(r.gu <= 6 && r.gu != 1 && r.dn <= 6 && r.dn != 1)) {
-                std::fprintf(stderr, "[cpuexp] S1.5/S8/other expert code resident: using the library kernel for all experts\n");
-                kern = 0;
-            }
     }
 #endif
     fast = kern != 0;
-    hi = (kern == 1);  // AVX2 is DRAM-bound so high-precision residual costs ~1% while cutting short-prompt KL in half
+    hi = (kern == 1 || kern == 4);  // AVX2 / AVX2-VNNI are DRAM-bound so high-precision residual costs ~1% while cutting short-prompt KL in half
     if (const char* a = std::getenv("STRATA_CPUEXP_ACT")) {
         if (!std::strcmp(a, "hi")) hi = true;
         else if (!std::strcmp(a, "q8")) hi = false;
@@ -1740,6 +2103,36 @@ std::vector<int> pin_list(int want) {
     if (all.empty() || want > (int)all.size()) return {};
     return all;
 }
+// Linux cgroup CPU quota in cores (> 0 when limited, else 0.0)
+static double cgroup_cpu_limit() {
+#ifdef _WIN32
+    return 0.0;
+#else
+    double lim = 0.0;
+    if (std::FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {
+        char qbuf[64] = {0};
+        long long period = 0;
+        if (std::fscanf(f, "%63s %lld", qbuf, &period) == 2 && std::strcmp(qbuf, "max") != 0 && period > 0) {
+            const long long quota = std::atoll(qbuf);
+            if (quota > 0) lim = (double)quota / (double)period;
+        }
+        std::fclose(f);
+    }
+    if (lim <= 0.0) {
+        long long quota = -1, period = 0;
+        if (std::FILE* fq = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r")) {
+            if (std::fscanf(fq, "%lld", &quota) != 1) quota = -1;
+            std::fclose(fq);
+        }
+        if (std::FILE* fp = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r")) {
+            if (std::fscanf(fp, "%lld", &period) != 1) period = 0;
+            std::fclose(fp);
+        }
+        if (quota > 0 && period > 0) lim = (double)quota / (double)period;
+    }
+    return lim;
+#endif
+}
 }  // namespace
 
 void CpuExperts::Impl::start_threads(int n) {
@@ -1761,7 +2154,11 @@ void CpuExperts::Impl::start_threads(int n) {
     if (const char* e = std::getenv("STRATA_CPUEXP_SPIN_US")) spin_us = std::atoi(e);
     std::vector<int> pins;
     const char* pe = std::getenv("STRATA_CPUEXP_PIN");
-    if (!(pe && pe[0] == '0')) pins = pin_list(nth);
+    const int host_cpus = (int)std::max(1u, std::thread::hardware_concurrency());
+    const double cg_cpus = cgroup_cpu_limit();
+    const bool cg_constrained = (cg_cpus > 0.0 && cg_cpus < (double)host_cpus);
+    // In a CFS-quota container (cgroup_cpus < host_cpus), rigid pinning hurts scheduling across unthrottled cores; skip unless explicitly enabled.
+    if (pe ? (pe[0] != '0') : !cg_constrained) pins = pin_list(nth);
     cnt.assign(E, 0);
     aoff.assign(E + 1, 0);
     act_e.assign(E, 0);
@@ -1783,7 +2180,8 @@ void CpuExperts::Impl::start_threads(int n) {
 #endif
         }
     }
-    std::fprintf(stderr, "[cpuexp] %d pool threads%s, spin %d us, sched=%d, pf=%d rows\n", nth, pins.empty() ? " (not pinned)" : " (pinned, physical cores first)", spin_us, sched, g_pf_rows);
+    const char* pin_note = !pins.empty() ? " (pinned, physical cores first)" : (cg_constrained ? " (not pinned: cgroup CPU quota)" : " (not pinned)");
+    std::fprintf(stderr, "[cpuexp] %d pool threads%s, spin %d us, sched=%d, pf=%d rows\n", nth, pin_note, spin_us, sched, g_pf_rows);
 }
 
 void CpuExperts::Impl::worker(int tid) {
@@ -1936,8 +2334,8 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
         if (fast) {
             const ActRow* xp[MGF];
             for (int i = 0; i < mg; ++i) xp[i] = tokA.p + (size_t)pair_tok[p0 + g0 + i];
-            kern_gemm(kern, r.gu, wg, RB, xp, mg, S.tg.p, J.hi);
-            kern_gemm(kern, r.gu, wu, RB, xp, mg, S.tu.p, J.hi);
+            kern_gemm_dispatch(kern, r.gu, wg, RB, xp, mg, S.tg.p, J.hi);
+            kern_gemm_dispatch(kern, r.gu, wu, RB, xp, mg, S.tu.p, J.hi);
         } else
 #endif
         {
@@ -2011,7 +2409,7 @@ void CpuExperts::Impl::dn_unit(int tid, const Job& J, int a, int c) {
         if (fast) {
             const ActRow* xp[MGF];
             for (int i = 0; i < mg; ++i) xp[i] = h2A.p + (size_t)(p0 + g0 + i);
-            kern_gemm(kern, r.dn, wd, RB, xp, mg, S.tg.p, J.hi);
+            kern_gemm_dispatch(kern, r.dn, wd, RB, xp, mg, S.tg.p, J.hi);
         } else
 #endif
         {
@@ -2302,7 +2700,6 @@ bool CpuExperts::Impl::set_cold(const std::vector<std::vector<bool>>& cold, std:
         const uint32_t gsb = (uint32_t)superblock_bytes((SkCode)d.gu), dsb = (uint32_t)superblock_bytes((SkCode)d.dn);
         if (!gsb || !dsb || d.dn_off != 3072u + 18432u * gsb || (uint64_t)d.dn_off + 9216ull * dsb > d.body_bytes) { err = "unsupported or inconsistent expert body layout (cold)"; return false; }
         if ((s4_off + d.body_off) % 4096) { err = "cold expert body not 4 KiB aligned in file"; return false; }
-        if (kern && !(d.gu <= 6 && d.gu != 1 && d.dn <= 6 && d.dn != 1)) { err = "cold expert with an S1.5/S8 code needs the library kernel (set STRATA_CPUEXP_KERNEL=lib before init)"; return false; }
         r.cold = true;
         r.file_off = s4_off + d.body_off;
         r.dn_off = d.dn_off;
@@ -2375,6 +2772,13 @@ uint64_t CpuExperts::ram_budget_bytes() {
     }
     return total;
 #endif
+}
+
+int CpuExperts::default_threads() {
+    const int host_cpus = (int)std::max(1u, std::thread::hardware_concurrency());
+    const double cg = cgroup_cpu_limit();
+    if (cg > 0.0 && cg < (double)host_cpus) return std::max(1, (int)std::floor(cg) - 2);
+    return std::max(1, host_cpus / 2);
 }
 
 bool CpuExperts::read_rank_table(const std::string& path, std::vector<uint16_t>& expert_of_rank, std::vector<uint16_t>& codes, std::string& err) {
@@ -2476,17 +2880,17 @@ bool CpuExperts::selftest_kernels(std::string& report) {
     char buf[200];
     const KernCaps kcs = probe_kernel_caps();
 #if HY4_KERNELS
-    const int klist[] = {1, 2};
+    const int klist[] = {1, 4, 2};
 #else
     const int klist[] = {3};
 #endif
     for (int kk : klist) {
 #if HY4_KERNELS
-    if ((kk == 1 && !kcs.avx2) || (kk == 2 && !kcs.avx512)) { report += std::string(kern_name(kk)) + ": not supported by this CPU, skipped\n"; continue; }
+    if ((kk == 1 && !kcs.avx2) || (kk == 4 && !kcs.avx_vnni) || (kk == 2 && !kcs.avx512)) { report += std::string(kern_name(kk)) + ": not supported by this CPU, skipped\n"; continue; }
 #else
     if (!kcs.neon_dp) { report += std::string(kern_name(kk)) + ": not supported by this CPU, skipped\n"; continue; }
 #endif
-    for (int code : {0, 2, 3, 4, 5, 6}) {
+    for (int code : {0, 2, 3, 4, 5, 6, 8}) {
         const size_t sb = superblock_bytes((SkCode)code), rb = 6 * sb;
         const int nrows = 5;
         std::vector<uint8_t> W(rb * nrows);
@@ -2571,7 +2975,7 @@ CpuExperts::CpuExperts() : p_(new Impl) {}
 CpuExperts::~CpuExperts() = default;
 
 bool CpuExperts::init(const std::string& path, int n_threads, const std::vector<std::vector<bool>>* mask, std::string& err) {
-    if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency() / 2);
+    if (n_threads <= 0) n_threads = default_threads();
     return p_->load(path, n_threads, mask, err);
 }
 bool CpuExperts::resident(int layer, int e) const {

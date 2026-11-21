@@ -54,6 +54,19 @@ class Scripts(unittest.TestCase):
             self.assertTrue((ctx / "Dockerfile").is_file())
             self.assertTrue((ctx / "terminal-src" / "docs" / "TERMINAL_LAUNCH.md").is_file())
             self.assertTrue((ctx / "engine" / "pkg" / "engine-component.json").is_file())
+            self.assertTrue((ctx / "shapes").is_dir())
+            # --shape-engine stages a Hy4 shape engine into shapes/<shape>/engine/<pkg>
+            hy4pkg = Path(tmp) / "hy4pkg"
+            hy4pkg.mkdir()
+            (hy4pkg / "engine-component.json").write_text('{"shape": "hy4", "entrypoint": "strata-hy4"}', encoding="utf-8")
+            (hy4pkg / "strata-hy4").write_text("#!/bin/sh\n", encoding="utf-8")
+            ctx2 = Path(tmp) / "ctx2"
+            r2 = subprocess.run([SH, sh_path(DOCKER / "build.sh"), "--flavor", "cuda", "--engine", sh_path(pkg),
+                                 "--shape-engine", f"hy4:{sh_path(hy4pkg)}", "--ctx", sh_path(ctx2), "--ctx-only"],
+                                capture_output=True, text=True)
+            self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+            self.assertTrue((ctx2 / "shapes" / "hy4" / "engine" / "hy4pkg" / "engine-component.json").is_file())
+            self.assertTrue((ctx2 / "shapes" / "hy4" / "engine" / "hy4pkg" / "strata-hy4").is_file())
             # the bundle reads tools/ modules by path as well (INSTALLER_SCRIPTS), and the DeepSeek ones are nested: every name must be in the
             # context, or package_terminal.py stops the build at "installer tool missing: tools/<name>.py" (the image build after v0.2.4.1 was broken this way)
             pt = ast.parse((ROOT.parent / "tools" / "packaging" / "package_terminal.py").read_text(encoding="utf-8"))

@@ -70,6 +70,8 @@ public:
     bool cold_expert(int layer, int expert) const;
     // RAM the process may use: min(MemTotal, cgroup memory.max / memory.limit_in_bytes) on Linux, total physical memory on Windows.
     static uint64_t ram_budget_bytes();
+    // Default pool thread count: respects Linux cgroup cpu.max / cfs_quota_us (leaves ~2 cores for CUDA/Engram when cgroup-constrained).
+    static int default_threads();
 
     // ---- directory helpers (read only the 4 KiB header + Section 3; no model load, no zstd) ------------------------------------
     // Section 4 stores the 512 experts of every MoE layer hot-to-cold by rank: directory index i = layer*512 + rank, and the

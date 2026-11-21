@@ -77,7 +77,7 @@ def cuda_pc(case):
 
 def build_package(parent: Path, version: str, *, engine_source: str = GOOD_ENGINE, key: dict | None = None,
                   backend: str | None = None, variant: str | None = None, build_id: str | None = None,
-                  archs: tuple[str, ...] | None = None, min_driver=None, padding: int = 0) -> Path:
+                  archs: tuple[str, ...] | None = None, min_driver=None, padding: int = 0, shape: str = "") -> Path:
     """A schema-2 package made by the real packager (a stub engine behind a manifest-declared entrypoint). `padding` bytes of
     an incompressible 'library' make the archive big enough for a transfer to be cut part-way. The family defaults to what
     this machine takes (`local_family()`); a test that is about another family says so, and `cuda_pc` names the platform it is for."""
@@ -90,11 +90,11 @@ def build_package(parent: Path, version: str, *, engine_source: str = GOOD_ENGIN
     src.mkdir(parents=True)
     (src / "engine_main.py").write_text(engine_source, encoding="utf-8")
     if WINDOWS:
-        entry = "strata.cmd"
+        entry = "strata-hy4.cmd" if shape == "hy4" else "strata.cmd"
         (src / entry).write_bytes(f'@echo off\r\n"{sys.executable}" "%~dp0engine_main.py" %*\r\n'.encode())
         library = "cudart64_13.dll" if backend == "cuda" else family["library"]
     else:
-        entry = "strata"
+        entry = "strata-hy4" if shape == "hy4" else "strata"
         (src / entry).write_text(f'#!/bin/sh\nexec "{sys.executable}" "$(dirname "$0")/engine_main.py" "$@"\n')
         (src / entry).chmod(0o755)
         library = "libcudart.so.13" if backend == "cuda" else family["library"]
@@ -108,7 +108,7 @@ def build_package(parent: Path, version: str, *, engine_source: str = GOOD_ENGIN
     out.mkdir(parents=True, exist_ok=True)
     folder = package_engine.build(src, backend, version, components.host_platform(), out, entry=entry, archs=tuple(archs),
                                   min_driver=min_driver, build_id=build_id or f"stub-{version}",
-                                  variant=variant, include=["engine_main.py"])
+                                  variant=variant, include=["engine_main.py"], shape=shape)
     if key is not None:
         feed_tool.sign_package(folder, key)
     return folder

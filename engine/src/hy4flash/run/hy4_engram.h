@@ -68,6 +68,7 @@ public:
 private:
     uint64_t size_ = 0;
     void* h_ = nullptr;   // HANDLE (Windows) or (intptr_t)fd
+    bool fadv_dontneed_ = false;
 };
 
 void* engram_aligned_alloc(size_t bytes);   // 4096-aligned

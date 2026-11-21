@@ -317,14 +317,46 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
     return true;
 }
 #else
+static bool engram_in_cgroup_mem_limit() {
+    uint64_t host_bytes = 0;
+    if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        unsigned long long kb = 0;
+        while (std::fgets(line, sizeof(line), f))
+            if (std::sscanf(line, "MemTotal: %llu kB", &kb) == 1) { host_bytes = kb * 1024ull; break; }
+        std::fclose(f);
+    }
+    for (const char* fn : {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"}) {
+        if (std::FILE* f = std::fopen(fn, "r")) {
+            char buf[64] = {0};
+            if (std::fgets(buf, sizeof(buf), f) && buf[0] >= '0' && buf[0] <= '9') {
+                const unsigned long long v = std::strtoull(buf, nullptr, 10);
+                if (v > (1ull << 30) && v < (1ull << 50) && (host_bytes == 0 || v + (1ull << 30) < host_bytes)) {
+                    std::fclose(f);
+                    return true;
+                }
+            }
+            std::fclose(f);
+        }
+    }
+    return false;
+}
 bool PageFile::open_impl(const std::string& path, std::string& err, bool direct) {
     close();
-    // HY4_ENGRAM_ODIRECT=1: bypass the page cache (Linux boxes where the routed experts must keep the RAM; the page buffers are 4 KiB aligned)
-    int oflags = O_RDONLY;
+    fadv_dontneed_ = false;
+    // Bypass Linux page cache with O_DIRECT when explicitly requested (HY4_ENGRAM_ODIRECT=1) OR when running inside a
+    // cgroup memory limit (unless HY4_ENGRAM_ODIRECT=0), so 67 GB Engram reads never charge cgroup v2 memory.current.
+    const char* od_env = std::getenv("HY4_ENGRAM_ODIRECT");
+    const bool want_direct = direct && !(od_env && od_env[0] == '0') &&
+                             ((od_env && od_env[0] == '1') || engram_in_cgroup_mem_limit());
+    int fd = -1;
 #ifdef O_DIRECT
-    if (direct && getenv("HY4_ENGRAM_ODIRECT") && getenv("HY4_ENGRAM_ODIRECT")[0] == '1') oflags |= O_DIRECT;
+    if (want_direct) {
+        fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+        if (fd < 0) fadv_dontneed_ = true;  // filesystem lacks O_DIRECT (e.g. tmpfs/overlayfs): fall back + DONTNEED
+    }
 #endif
-    int fd = ::open(path.c_str(), oflags);
+    if (fd < 0) fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) { err = "open failed for " + path; return false; }
     off_t sz = lseek(fd, 0, SEEK_END);
     h_ = (void*)(intptr_t)(fd + 1);
@@ -337,10 +369,12 @@ bool PageFile::open_impl(const std::string& path, std::string& err, bool direct)
 void PageFile::close() {
     if (h_) { ::close((int)((intptr_t)h_ - 1)); h_ = nullptr; }
     size_ = 0;
+    fadv_dontneed_ = false;
 }
 bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int threads, int qd, std::string& err) {
     if (!h_) { err = "PageFile not open"; return false; }
     int fd = (int)((intptr_t)h_ - 1);
+    const bool dontneed = fadv_dontneed_;
     int nt = (int)std::min<size_t>((size_t)std::max(1, threads) * (size_t)std::max(1, qd), n);
     if (n <= 256) nt = std::min(nt, 16);  // decode-sized fetches: persistent helper threads
     std::atomic<size_t> next{0};
@@ -351,11 +385,15 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
         for (;;) {
             size_t i = next.fetch_add(1);
             if (i >= n || bad.load()) break;
-            ssize_t g = pread(fd, dst + i * ENGRAM_PAGE, ENGRAM_PAGE, (off_t)(pages[i] * ENGRAM_PAGE));
+            const off_t off = (off_t)(pages[i] * ENGRAM_PAGE);
+            ssize_t g = pread(fd, dst + i * ENGRAM_PAGE, ENGRAM_PAGE, off);
             if (g != (ssize_t)ENGRAM_PAGE) {
                 std::lock_guard<std::mutex> lk(emu);
                 if (!bad.exchange(true)) first_err = "short pread at page " + std::to_string(pages[i]);
             }
+#if defined(POSIX_FADV_DONTNEED)
+            else if (dontneed) posix_fadvise(fd, off, ENGRAM_PAGE, POSIX_FADV_DONTNEED);
+#endif
         }
     };
     if (n <= 256) {
