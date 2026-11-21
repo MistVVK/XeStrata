@@ -239,7 +239,7 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
      one in the signed feed) through Control's component updater, and shows it in the job's own progress (install.engine, install.parts,
      one combined download total). A failed engine download keeps the model files and ends with a retry message. */
   job.engineAbort=new AbortController();
-  const engineStep=packaged&&typeof control.update==='function'?createEngineStep({control,signal:job.engineAbort.signal,onChange:()=>{if(job.rawResult)publish(job.rawResult);else emit();}}):null;
+  const engineStep=!isHy4Family(args.family)&&packaged&&typeof control.update==='function'?createEngineStep({control,signal:job.engineAbort.signal,onChange:()=>{if(job.rawResult)publish(job.rawResult);else emit();}}):null;
   const publish=r=>{job.rawResult=r;job.summary=r.summary;job.result=engineStep&&r.install?{...r,install:engineStep.merge(r.install)}:r;emit();};
   /* No usable engine on this PC yet (a first run): the engine comes first, then setup. Setup reads the picture reader and the model families
      from the engine folder (step 4); while the engine was still coming it set pictures off, and Qwen3.6 came up text-only (0.2.15 release

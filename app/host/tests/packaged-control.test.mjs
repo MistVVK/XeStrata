@@ -855,3 +855,21 @@ test('quit: a cancel that did not take is repeated until the installer says no i
     assert.equal(w.state.cancels.length, 2, 'one cancel that did not take, one that did');
   } finally { f.cleanup(); }
 });
+
+test('packaged: installing Hy4-Flash skips the Qwen strata-engine update step so fresh installs and 0.2.17->0.2.18 upgrades never race update_lock', async () => {
+  for (const engineUsable of [false, true]) {
+    const f = packagedFixture({
+      engineUsable,
+      updater: {
+        report: { engine: { status: engineUsable ? 'update' : 'install', installed: engineUsable ? { version: '0.1.63' } : null, offered: { version: '0.1.64' }, download_bytes: 5e8 } },
+        update: async () => { throw new Error('Hy4-Flash install must not run strata-engine update'); },
+      },
+    });
+    try {
+      await f.native.refresh(true);
+      const job = await finish(f.native, f.native.operation('install', { family: 'hy4-flash', model: 'SQ-64' }).id);
+      assert.equal(job.state, 'done', `engineUsable=${engineUsable}: ${job.error}`);
+      assert.equal(f.calls.some(c => c[0] === 'updateCheck' || c[0] === 'update'), false, `engineUsable=${engineUsable}: updateCheck/update must not be called`);
+    } finally { await f.native.close(); f.cleanup(); }
+  }
+});

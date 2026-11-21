@@ -845,5 +845,73 @@ class EveryEngineProgramAnswersTheShapeFlags(unittest.TestCase):
         self.assertFalse([ln for ln in printed if "qwen35moe" in ln], "the Intel engine has no qwen35moe path")
 
 
+class EnsureLockWaitAndDarwinLibPath(Base):
+    def test_ensure_waits_out_concurrent_update_lock_when_not_automatic(self):
+        self.publish("0.1.64")
+        calls = [0]
+        real_lock = updater.update_lock
+
+        def flaky_lock(comp):
+            calls[0] += 1
+            if calls[0] <= 2:
+                raise updater.UpdateError("another update is already running", 7)
+            return real_lock(comp)
+
+        with mock.patch.object(shape_engine, "LOCK_POLL_S", 0.01), \
+                mock.patch.object(shape_engine, "LOCK_WAIT_S", 2.0), \
+                mock.patch.object(shape_engine, "_test_start", return_value=(True, "strata 0.1.64")), \
+                mock.patch.object(updater, "update_lock", side_effect=flaky_lock):
+            exe = self.ensure()
+        self.assertIsNotNone(exe)
+        self.assertGreaterEqual(calls[0], 3)
+
+    def test_ensure_respects_cancel_and_automatic_does_not_wait_on_lock(self):
+        self.publish("0.1.64")
+        import threading
+        ev = threading.Event()
+        calls = [0]
+
+        def always_locked(_comp):
+            calls[0] += 1
+            if calls[0] >= 2:
+                ev.set()
+            raise updater.UpdateError("another update is already running", 7)
+
+        notes = []
+        with mock.patch.object(shape_engine, "LOCK_POLL_S", 0.01), \
+                mock.patch.object(shape_engine, "LOCK_WAIT_S", 5.0), \
+                mock.patch.object(updater, "update_lock", side_effect=always_locked):
+            exe = self.ensure(lines=notes, cancel=ev)
+        self.assertIsNone(exe)
+        self.assertEqual(calls[0], 2)
+
+        calls[0] = 0
+        with mock.patch.object(shape_engine, "LOCK_POLL_S", 0.01), \
+                mock.patch.object(shape_engine, "LOCK_WAIT_S", 5.0), \
+                mock.patch.object(updater, "update_lock", side_effect=always_locked):
+            exe2 = self.ensure(automatic=True)
+        self.assertIsNone(exe2)
+        self.assertEqual(calls[0], 1)
+
+    def test_test_start_uses_dyld_library_path_on_darwin(self):
+        pkg = self.root / "mac_hy4"
+        pkg.mkdir()
+        exe = pkg / "strata-hy4"
+        exe.write_bytes(b"")
+        seen = []
+
+        def fake_run(cmd, **kw):
+            seen.append(kw.get("env") or {})
+            return mock.Mock(returncode=0, stdout="strata-hy4 0.1.64\n", stderr="")
+
+        with mock.patch.object(shape_engine.sys, "platform", "darwin"), \
+                mock.patch.object(ec, "package_lib_dirs", return_value=[str(pkg)]), \
+                mock.patch("subprocess.run", side_effect=fake_run):
+            ok, msg = shape_engine._test_start(exe, shape="hy4")
+        self.assertTrue(ok, msg)
+        self.assertIn("DYLD_LIBRARY_PATH", seen[0])
+        self.assertIn(str(pkg), seen[0]["DYLD_LIBRARY_PATH"])
+
+
 if __name__ == "__main__":
     unittest.main()
