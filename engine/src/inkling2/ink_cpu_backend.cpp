@@ -449,8 +449,12 @@ public:
             // Note: tokens belonging to the SAME slot in batch MUST be processed in ascending position order for causal ShortConv & KV visibility.
             const float* k_sw = static_sconv_.at(p + ".k_sconv").data();
             const float* v_sw = static_sconv_.at(p + ".v_sconv").data();
-            const float* q_clip_sc = trunk_f32_.at(p + ".attn.q_l2_clip.scale").data();
-            const float* r_clip_sc = trunk_f32_.at(p + ".attn.rel_l2_clip.scale").data();
+            const auto& q_clip_vec = trunk_f32_.at(p + ".attn.q_l2_clip.scale");
+            const auto& r_clip_vec = trunk_f32_.at(p + ".attn.rel_l2_clip.scale");
+            const float* q_clip_sc = q_clip_vec.data();
+            const float* r_clip_sc = r_clip_vec.data();
+            const bool q_clip_per_head = q_clip_vec.size() >= static_cast<size_t>(c_.n_head * c_.head_dim);
+            const bool r_clip_per_head = r_clip_vec.size() >= static_cast<size_t>(c_.n_head * c_.d_rel);
             const float* rel_proj = trunk_f32_.at(p + ".attn.rel_logits_proj.proj").data();  // [16, 1024]
 
             std::vector<float> attn_out(B * q_dim, 0.0f);
@@ -497,8 +501,10 @@ public:
                 float* qb = q.data() + static_cast<size_t>(b) * q_dim;
                 float* rb = r_raw.data() + static_cast<size_t>(b) * c_.n_head * c_.d_rel;
                 for (int h = 0; h < c_.n_head; ++h) {
-                    l2_clip_f32(qb + h * c_.head_dim, q_clip_sc, qb + h * c_.head_dim, c_.head_dim, c_.qk_l2_clip);
-                    l2_clip_f32(rb + h * c_.d_rel, r_clip_sc, rb + h * c_.d_rel, c_.d_rel, c_.rel_l2_clip);
+                    const float* qsc = q_clip_per_head ? (q_clip_sc + h * c_.head_dim) : q_clip_sc;
+                    const float* rsc = r_clip_per_head ? (r_clip_sc + h * c_.d_rel) : r_clip_sc;
+                    l2_clip_f32(qb + h * c_.head_dim, qsc, qb + h * c_.head_dim, c_.head_dim, c_.qk_l2_clip);
+                    l2_clip_f32(rb + h * c_.d_rel, rsc, rb + h * c_.d_rel, c_.d_rel, c_.rel_l2_clip);
                     if (!is_swa) {
                         for (int j = 0; j < c_.head_dim; ++j) qb[h * c_.head_dim + j] *= tau[b];
                         for (int j = 0; j < c_.d_rel; ++j) rb[h * c_.d_rel + j] *= tau[b];

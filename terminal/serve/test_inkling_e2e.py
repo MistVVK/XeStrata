@@ -26,6 +26,9 @@ import inkling_tokenizer
 
 
 def _find_inkling_exe() -> Path | None:
+    env_bin = os.environ.get("STRATA_INKLING_BIN")
+    if env_bin and Path(env_bin).is_file():
+        return Path(env_bin)
     repo = ROOT.parent
     for cand in (
         repo / "build-ink" / "strata-inkling.exe",
@@ -121,8 +124,8 @@ def _build_mini_inkling_strata(out_path: Path, vision_path: Path) -> None:
         add_t(f"{p}.attn.gate_attn.weight", make_f32((q_dim, D), 0.04), "BF16")
         add_t(f"{p}.attn.attn_sink_proj.weight", make_f32((H, D), 0.02), "F32")
         add_t(f"{p}.attn.rel_logits_proj.proj", make_f32((D_REL, REL_EXT), 0.02), "F32")
-        add_t(f"{p}.attn.q_l2_clip.scale", np.ones((HD,), np.float32), "F32")
-        add_t(f"{p}.attn.rel_l2_clip.scale", np.ones((D_REL,), np.float32), "F32")
+        add_t(f"{p}.attn.q_l2_clip.scale", np.ones((H, HD), np.float32) + make_f32((H, HD), 0.05), "F32")
+        add_t(f"{p}.attn.rel_l2_clip.scale", np.ones((H, D_REL), np.float32) + make_f32((H, D_REL), 0.05), "F32")
         add_t(f"{p}.attn_sconv.weight", make_f32((D, 1, 4), 0.02), "F32")
         add_t(f"{p}.mlp_sconv.weight", make_f32((D, 1, 4), 0.02), "F32")
         add_t(f"{p}.mlp_norm.weight", np.ones((D,), np.float32), "F32")
