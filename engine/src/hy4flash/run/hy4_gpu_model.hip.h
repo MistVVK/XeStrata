@@ -405,13 +405,13 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         char b[32];
         const double host_kv = ((mask & 1) || dev_pos) ? (rows + (dev_pos ? pivg : 0.0)) : 0.0;
         const double host_emb = host_embed ? 0.40 : 0.0;
-        const double host_bounce = (tot < 48.0) ? 0.55 : 0.0;  // 2 x 256 MiB pinned prefill bounce ring
+        const double host_bounce = (tot < 48.0) ? ((tot >= 20.0) ? 0.82 : 0.55) : 0.0;  // 2 x 384 MiB (>= 20 GiB) or 2 x 256 MiB pinned prefill bounce ring
         snprintf(b, sizeof b, "%.2f", host_kv + host_emb + host_bounce + 0.3);
         hy4_setenv("HY4_HOST_NEED_GB", b, 1);
     }
     if (!getenv("HY4_RESERVE_GB")) {
         const double kv_res = (mask & 1) ? 0.0 : (init_slots < max_ctx ? kv_init_gb : (dev_pos ? dev_pos * per_pos / GB : (rows + pivg)));
-        const double pf_res = (tot >= 10.0 && tot < 64.0 && mask == 0) ? 0.56 : 0.0;  // 2 x 256 MiB device scratch for prefill streaming
+        const double pf_res = (tot >= 21.5 && tot < 64.0 && mask == 0) ? 0.82 : ((tot >= 10.0 && tot < 64.0 && mask == 0) ? 0.56 : 0.0);  // 2 x 384 MiB (>= 21.5 GiB) or 2 x 256 MiB device scratch for prefill streaming
         const double reserve = work_gb + kv_res + wkv + cublas_gb + pf_res + 0.45;
         char b[32];
         snprintf(b, sizeof b, "%.2f", reserve);
@@ -499,8 +499,7 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         if (getenv("HY4_VCACHE_FRAC")) {
             dyn_frac = std::max(0.0, std::min(1.0, atof(getenv("HY4_VCACHE_FRAC"))));
         } else if (cpu_mode && all_al_bytes > ram_budget_bytes && vram_budget > 0) {
-            uint64_t overflow = all_al_bytes - ram_budget_bytes;
-            if (cgroup_limited) overflow += (3500ull << 20);  // keep >= 3.5 GiB RSS safety margin below cgroup memory.max
+            const uint64_t overflow = all_al_bytes - ram_budget_bytes;
             const double static_share = std::min(0.75, (double)overflow / (double)vram_budget);
             dyn_frac = std::max(0.25, 1.0 - static_share);
         }

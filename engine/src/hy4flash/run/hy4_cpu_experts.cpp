@@ -208,6 +208,53 @@ inline float fexpf(float x) {
     return p * s;
 }
 
+#if HY4_KERNELS
+HY4_PUSH_AVX2
+static void swiglu_64_avx2(const float* g, const float* u, const float* sq, float* h) {
+    const __m256 v_lo = _mm256_set1_ps(-87.0f);
+    const __m256 v_hi = _mm256_set1_ps(88.0f);
+    const __m256 v_log2e = _mm256_set1_ps(1.44269504088896341f);
+    const __m256 v_magic = _mm256_set1_ps(12582912.0f);
+    const __m256 v_ln2_hi = _mm256_set1_ps(0.693359375f);
+    const __m256 v_ln2_lo = _mm256_set1_ps(-2.12194440e-4f);
+    const __m256 c0 = _mm256_set1_ps(1.9875691500E-4f);
+    const __m256 c1 = _mm256_set1_ps(1.3981999507E-3f);
+    const __m256 c2 = _mm256_set1_ps(8.3334519073E-3f);
+    const __m256 c3 = _mm256_set1_ps(4.1665795894E-2f);
+    const __m256 c4 = _mm256_set1_ps(1.6666665459E-1f);
+    const __m256 c5 = _mm256_set1_ps(5.0000001201E-1f);
+    const __m256 v_one = _mm256_set1_ps(1.0f);
+    const __m256 v_lim = _mm256_set1_ps(SWIGLU_LIMIT);
+    const __m256 v_nlim = _mm256_set1_ps(-SWIGLU_LIMIT);
+    const __m256i v_127 = _mm256_set1_epi32(127);
+    for (int d = 0; d < RB; d += 8) {
+        const __m256 gv = _mm256_loadu_ps(g + d);
+        const __m256 uv = _mm256_loadu_ps(u + d);
+        const __m256 sqv = _mm256_loadu_ps(sq + d);
+        __m256 x = _mm256_sub_ps(_mm256_setzero_ps(), gv);
+        x = _mm256_min_ps(_mm256_max_ps(x, v_lo), v_hi);
+        const __m256 t = _mm256_mul_ps(x, v_log2e);
+        const __m256 n = _mm256_sub_ps(_mm256_add_ps(t, v_magic), v_magic);
+        __m256 r = _mm256_fnmadd_ps(n, v_ln2_hi, x);
+        r = _mm256_fnmadd_ps(n, v_ln2_lo, r);
+        __m256 p = _mm256_fmadd_ps(c0, r, c1);
+        p = _mm256_fmadd_ps(p, r, c2);
+        p = _mm256_fmadd_ps(p, r, c3);
+        p = _mm256_fmadd_ps(p, r, c4);
+        p = _mm256_fmadd_ps(p, r, c5);
+        p = _mm256_fmadd_ps(p, _mm256_mul_ps(r, r), _mm256_add_ps(r, v_one));
+        const __m256i ni = _mm256_add_epi32(_mm256_cvttps_epi32(n), v_127);
+        const __m256 s = _mm256_castsi256_ps(_mm256_slli_epi32(ni, 23));
+        const __m256 ex = _mm256_mul_ps(p, s);
+        const __m256 si = _mm256_div_ps(gv, _mm256_add_ps(v_one, ex));
+        const __m256 sc = _mm256_min_ps(si, v_lim);
+        const __m256 uc = _mm256_max_ps(v_nlim, _mm256_min_ps(uv, v_lim));
+        _mm256_storeu_ps(h + d, _mm256_div_ps(_mm256_mul_ps(sc, uc), sqv));
+    }
+}
+HY4_POP_TARGET
+#endif
+
 struct Rec {
     const uint8_t* body = nullptr;  // resident arena pointer (null for cold and GPU-owned experts)
     uint32_t dn_off = 0, body_bytes = 0;
@@ -1054,15 +1101,19 @@ static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* o
 
 template <int FMT, bool HI>
 static void rows_fmt(const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out) {
-    for (int g0 = 0; g0 < m; g0 += 4) {
-        const int mg = std::min(4, m - g0);
+    for (int g0 = 0; g0 < m; g0 += 8) {
+        const int mg = std::min(8, m - g0);
         const ActRow* const* x = X + g0;
         float* o = out + (size_t)g0 * nrows;
         switch (mg) {
             case 1: rows_m<FMT, 1, HI>(W, nrows, x, o); break;
             case 2: rows_m<FMT, 2, HI>(W, nrows, x, o); break;
             case 3: rows_m<FMT, 3, HI>(W, nrows, x, o); break;
-            default: rows_m<FMT, 4, HI>(W, nrows, x, o); break;
+            case 4: rows_m<FMT, 4, HI>(W, nrows, x, o); break;
+            case 5: rows_m<FMT, 5, HI>(W, nrows, x, o); break;
+            case 6: rows_m<FMT, 6, HI>(W, nrows, x, o); break;
+            case 7: rows_m<FMT, 7, HI>(W, nrows, x, o); break;
+            default: rows_m<FMT, 8, HI>(W, nrows, x, o); break;
         }
     }
 }
@@ -2001,7 +2052,7 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
     }
 #endif
     fast = kern != 0;
-    hi = (kern == 1 || kern == 4);  // AVX2 / AVX2-VNNI are DRAM-bound so high-precision residual costs ~1% while cutting short-prompt KL in half
+    hi = (kern == 1);  // plain AVX2 is DRAM-bound so high-precision residual costs ~1%; AVX2-VNNI/AVX-512/NEON default to q8 for 2x throughput (STRATA_CPUEXP_ACT=hi overrides)
     if (const char* a = std::getenv("STRATA_CPUEXP_ACT")) {
         if (!std::strcmp(a, "hi")) hi = true;
         else if (!std::strcmp(a, "q8")) hi = false;
@@ -2144,6 +2195,7 @@ void CpuExperts::Impl::start_threads(int n) {
     if (const char* e = std::getenv("STRATA_CPUEXP_SCHED")) sched = std::atoi(e);
     else if (nth >= 8) sched = 1;  // dataflow scheduler avoids phase barriers on multi-core CPUs
     if (const char* e = std::getenv("STRATA_CPUEXP_PF")) g_pf_rows = std::atoi(e);
+    else if (fast) g_pf_rows = 2;  // prefetch 2 weight rows ahead to cross 4 KiB page boundaries on fast kernels
     for (int ti = 0; ti < nth; ++ti) {
         TScratch& s = ts[ti];
         if (!fast) { s.xg.alloc((size_t)MG * NB); s.xg2.alloc((size_t)MG * NB); }
@@ -2366,6 +2418,11 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
             float h[RB];
             const float* g = S.tg.p + i * RB;
             const float* u = S.tu.p + i * RB;
+#if HY4_KERNELS
+            if (fast && (kern == 1 || kern == 2 || kern == 4)) {
+                swiglu_64_avx2(g, u, sq, h);
+            } else
+#endif
             for (int d = 0; d < RB; ++d) {
                 const float gv = g[d];
                 const float si = gv / (1.0f + fexpf(-gv));

@@ -256,19 +256,21 @@ struct IdxTree {
 // Per-node temporary pooled keys for up to 2 groups g in [g0, grp_t) completed inside the tree along node t's ancestor chain.
 // grid (M, 2), block 128. tmp_pooled: half [M * 2][128].
 __global__ void k_idx_pool_tree(const __half* __restrict__ ivg, const float* __restrict__ ape, const float* __restrict__ knw, __half* __restrict__ tmp_pooled, int p0, IdxTree tp,
-                                float theta, float eps) {
+                                float theta, float eps, const int* __restrict__ p0_dev = nullptr, const IdxTree* __restrict__ tp_dev = nullptr) {
     __shared__ float sh[4];
     __shared__ float sv[128];
     const int t = blockIdx.x, k = blockIdx.y, d = threadIdx.x;
-    const int g0 = p0 >> 2;
-    const int grp_t = (p0 + (int)tp.depth[t]) >> 2;
+    const int p0_use = p0_dev ? *p0_dev : p0;
+    const int depth_t = (int)(tp_dev ? tp_dev->depth[t] : tp.depth[t]);
+    const int g0 = p0_use >> 2;
+    const int grp_t = (p0_use + depth_t) >> 2;
     const int g = g0 + k;
     if (g >= grp_t) return;
     int sl[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const int lp = 4 * g + j;
-        sl[j] = lp < p0 ? lp : p0 + (int)tp.anc[t][(lp - p0) & 7];
+        sl[j] = lp < p0_use ? lp : p0_use + (int)(tp_dev ? tp_dev->anc[t][(lp - p0_use) & 7] : tp.anc[t][(lp - p0_use) & 7]);
     }
     float l[4], mx = -3.0e38f;
 #pragma unroll
@@ -299,21 +301,27 @@ __global__ void k_idx_pool_tree(const __half* __restrict__ ivg, const float* __r
     tmp_pooled[(size_t)(t * 2 + k) * 128 + d] = __float2half(v);
 }
 
-__global__ void k_idx_q_rope_tree(const float* __restrict__ iq, __half* __restrict__ out, int p0, IdxTree tp, float theta) {
+__global__ void k_idx_q_rope_tree(const float* __restrict__ iq, __half* __restrict__ out, int p0, IdxTree tp, float theta,
+                                  const int* __restrict__ p0_dev = nullptr, const IdxTree* __restrict__ tp_dev = nullptr) {
     int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const float* q = iq + (size_t)t * 2048 + h * 128;
     float v = q[d];
     if (d >= 64) {
         int i = (d - 64) >> 1;
+        const int p0_use = p0_dev ? *p0_dev : p0;
+        const int depth_t = (int)(tp_dev ? tp_dev->depth[t] : tp.depth[t]);
         float x0 = q[64 + 2 * i], x1 = q[64 + 2 * i + 1], o0, o1;
-        rope_pair_i(x0, x1, p0 + (int)tp.depth[t], i, theta, o0, o1);
+        rope_pair_i(x0, x1, p0_use + depth_t, i, theta, o0, o1);
         v = (d & 1) ? o1 : o0;
     }
     out[(size_t)t * 2048 + h * 128 + d] = __float2half(v);
 }
 
 __global__ void __launch_bounds__(64) k_idx_score_tree(const __half* __restrict__ iq, const float* __restrict__ hw, const __half* __restrict__ pooled, const __half* __restrict__ tmp_pooled,
-                                                       float* __restrict__ score, int p0, IdxTree tp, int G, int ldS, float hscale) {
+                                                       float* __restrict__ score, int p0, IdxTree tp, int G, int ldS, float hscale,
+                                                       const int* __restrict__ p0_dev = nullptr, const int* __restrict__ G_dev = nullptr, const IdxTree* __restrict__ tp_dev = nullptr) {
+    const int G_use = G_dev ? *G_dev : G;
+    if ((int)blockIdx.x * 64 >= G_use) return;
     __shared__ uint32_t sq[16 * 64];
     __shared__ float shw[16];
     int t = blockIdx.y, g = blockIdx.x * 64 + threadIdx.x;
@@ -321,9 +329,11 @@ __global__ void __launch_bounds__(64) k_idx_score_tree(const __half* __restrict_
     for (int i = threadIdx.x; i < 16 * 64; i += 64) sq[i] = iq2[i];
     if (threadIdx.x < 16) shw[threadIdx.x] = hw[(size_t)t * 16 + threadIdx.x] * hscale;
     __syncthreads();
-    if (g >= G) return;
-    const int g0 = p0 >> 2;
-    const int grp = (p0 + (int)tp.depth[t]) >> 2;
+    if (g >= G_use) return;
+    const int p0_use = p0_dev ? *p0_dev : p0;
+    const int depth_t = (int)(tp_dev ? tp_dev->depth[t] : tp.depth[t]);
+    const int g0 = p0_use >> 2;
+    const int grp = (p0_use + depth_t) >> 2;
     float res;
     if (g >= grp) {
         res = -INFINITY;
@@ -351,13 +361,16 @@ __global__ void __launch_bounds__(64) k_idx_score_tree(const __half* __restrict_
     score[(size_t)t * ldS + g] = res;
 }
 
-__global__ void k_idx_select_tree(const float* __restrict__ score, int ldS, int p0, IdxTree tp, int n_top, int kmax, int32_t* __restrict__ keys, int32_t* __restrict__ nkeys) {
+__global__ void k_idx_select_tree(const float* __restrict__ score, int ldS, int p0, IdxTree tp, int n_top, int kmax, int32_t* __restrict__ keys, int32_t* __restrict__ nkeys,
+                                  const int* __restrict__ p0_dev = nullptr, const IdxTree* __restrict__ tp_dev = nullptr) {
     __shared__ int red[8];
     __shared__ int cnt_sel;
     __shared__ uint32_t thr_s;
     __shared__ int n_gt_s;
     int t = blockIdx.x;
-    int pos = p0 + (int)tp.depth[t];
+    const int p0_use = p0_dev ? *p0_dev : p0;
+    const int depth_t = (int)(tp_dev ? tp_dev->depth[t] : tp.depth[t]);
+    int pos = p0_use + depth_t;
     int grp = pos >> 2;
     int32_t* kl = keys + (size_t)t * kmax;
     if (grp <= n_top) {
