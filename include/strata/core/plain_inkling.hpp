@@ -28,8 +28,11 @@ public:
 
     bool load(const GgufModel& m, const ModelSpec& s, std::string& err);
     /// `tokens[n]` at `pos`, the last `rows` logits into `logits` [rows][n_vocab_unpadded].
-    bool run(const int32_t* tokens, int64_t n, int64_t pos, float* logits, std::string& err);
+    bool run(const int32_t* tokens, int64_t n, int64_t pos, int rows, float* logits, std::string& err);
+    /// Last token's ordered DSpark tap row, in device memory until the next run or reset.
+    const float* gpu_taps() const;
     void reset();
+    bool enable_gpu(std::string& err);
 
     bool load_dspark(const std::string& path, std::string& err);
     bool propose_dspark(int32_t anchor, int64_t pos, int count, std::vector<int32_t>& tokens, std::string& err) const;

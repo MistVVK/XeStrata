@@ -134,7 +134,7 @@ PlainModel::PlainModel() = default;
 
 PlainModel::~PlainModel() {
     if (hash_file_ != nullptr) std::fclose(hash_file_);
-    if (cpu_ != nullptr) {   // --device cpu: no GPU was opened, nothing of its to give back
+    if (opt_.cpu && (cpu_ != nullptr || inkling_ != nullptr)) {   // --device cpu: no GPU was opened, nothing of its to give back
         if (route_dump_ != nullptr) std::fclose(route_dump_);
         return;
     }
@@ -484,6 +484,18 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         return false;
     }
     if (!read_model_spec(model_->meta(), spec_, err)) return false;
+    if (spec_.arch == ModelArch::Inkling2Loop) {
+        if (serve_ || opt_.vision || opt_.encoder || opt_.batch_slots > 0 || opt_.split_auto || !opt_.split_at.empty()) {
+            err = "inkling2: GPU reference supports single-device text CLI only";
+            return false;
+        }
+        opt_.prompt_chunk = 0;
+        opt_.spec = 0;
+        inkling_ = std::make_unique<PlainInkling>();
+        if (!inkling_->load(*model_, spec_, err) || !inkling_->enable_gpu(err)) return false;
+        n_vocab_ = inkling_->vocab();
+        return true;
+    }
     // the layer split: its points (given, or from the GPUs' memory), each rising inside the trunk, a GPU each
     const int64_t nl = spec_.n_layer;
     // the GPUs a split takes, as generate.cpp's: the runtime's first, then the ones --split-device names, else the
@@ -3256,6 +3268,10 @@ bool PlainModel::cpu_load(std::string& err) {
     return true;
 }
 
+const float* PlainModel::inkling_tap_dev() const {
+    return inkling_ ? inkling_->gpu_taps() : nullptr;
+}
+
 bool PlainModel::propose_dspark(int32_t anchor, int64_t pos, int count, std::vector<int32_t>& tokens,
                                 std::string& err) const {
     return inkling_ && inkling_->propose_dspark(anchor, pos, count, tokens, err);
@@ -3266,11 +3282,7 @@ bool PlainModel::cpu_run(const int32_t* tokens, int64_t n, int64_t pos, int rows
                          std::string& err) {
     cpu_logits_.resize((size_t) rows * (size_t) n_vocab_);
     if (inkling_ != nullptr) {
-        // the reference returns the last token's logits; a window's rows are answered one at a time
-        std::vector<float> one((size_t) n_vocab_);
-        if (!inkling_->run(tokens, n, pos, one.data(), err)) return false;
-        for (int r = 0; r < rows; ++r)
-            std::memcpy(cpu_logits_.data() + (size_t) r * n_vocab_, one.data(), (size_t) n_vocab_ * 4);
+        if (!inkling_->run(tokens, n, pos, rows, cpu_logits_.data(), err)) return false;
     } else if (!cpu_->run(tokens, n, pos, rows, cpu_logits_.data(), err)) return false;
     k::SamplerParams sp = sampler_;
     sp.counter = (uint64_t) (pos + n - rows);

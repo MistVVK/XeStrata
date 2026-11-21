@@ -295,7 +295,7 @@ public:
     /// tokens put back from a snapshot (its rings: the window before `end`).
     bool can_rewind(int64_t to, int64_t end = -1) const;
     /// The forward runs on the CPU (--device cpu): no GPU, no drafts, no pictures, no batches.
-    bool on_cpu() const { return cpu_ != nullptr; }
+    bool on_cpu() const { return opt_.cpu; }
     int64_t max_cells() const { return opt_.max_cells; }
     /// The options as loaded (the --kv format auto_gpu_layers chose)
     const PlainOptions& options() const { return opt_; }
@@ -368,6 +368,7 @@ public:
                    const strata::kernels::SamplerParams* sp, int T, int32_t* drafts, std::string& err);
     /// The bytes save_state would take for `tokens` tokens
     size_t state_bytes(int64_t tokens) const;
+    const float* inkling_tap_dev() const;
     bool propose_dspark(int32_t anchor, int64_t pos, int count, std::vector<int32_t>& tokens, std::string& err) const;
 
     /// Tokens [0, T) at positions pos .. pos + T - 1 (T <= max_t): out[t] is the greedy token after token t, and with

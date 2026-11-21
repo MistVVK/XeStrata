@@ -4,6 +4,7 @@
 #include "strata/core/plain_inkling.hpp"
 
 #include "plain_dspark.hpp"
+#include "plain_inkling_gpu.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -116,7 +117,9 @@ struct PlainInkling::Impl {
     int64_t n_cells = 0;
     std::vector<float> last_logits_;
     std::unique_ptr<PlainDspark> dspark;
+    std::unique_ptr<InklingProducts> products;
     std::vector<float> draft_features;
+    bool taps_valid = false;
 
     bool embedding(int32_t tok, float* x) const {
         return emb_row && kc::native_row_to_float(emb_type, emb_data + (size_t) tok * emb_row, x, N);
@@ -421,6 +424,7 @@ void PlainInkling::Impl::reset_state() {
 
 void PlainInkling::reset() {
     p_->reset_state();
+    p_->taps_valid = false;
     if (p_->dspark) p_->dspark->reset();
 }
 
@@ -541,7 +545,7 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
     // The draft taps the layer inputs in visit order, not the slots used for recurrent state.
     int visit = 0;
     const auto tap = [&](int id, const float* row) {
-        if (!dspark) return;
+        if (!dspark && !products) return;
         for (size_t j = 0; j < PlainDspark::taps.size(); ++j)
             if (PlainDspark::taps[j] == id) std::copy_n(row, N, draft_features.data() + j * N);
     };
@@ -633,35 +637,40 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
         std::vector<float> sink(NH);
         multiply(L.sink, inputs[0], sink.data(), N, NH);
         if (!err.empty()) return;
-        for (int64_t h = 0; h < NH; ++h) {
-            const int64_t hkv = h / (NH / NKV);
-            std::vector<float> scores((size_t) cell + 1), p((size_t) cell + 1);
-            for (int64_t c = 0; c < cell; ++c) {
-                const int64_t dist = pos - sl.pos[(size_t) c];
-                if (dist < 0 || dist >= extent || (L.swa && dist >= s.swa_window)) { scores[(size_t) c] = -1e30f; continue; }
-                double ss = 0;
+        if (products) {
+            products->attention(q.data(), sl.k.data(), sl.v.data(), r.data(), relbias.data(), sink.data(), sl.pos.data(),
+                                pos, cell, NH, NKV, HD, nrel, extent, L.swa ? s.swa_window : 0, att.data());
+        } else {
+            for (int64_t h = 0; h < NH; ++h) {
+                const int64_t hkv = h / (NH / NKV);
+                std::vector<float> scores((size_t) cell + 1), p((size_t) cell + 1);
+                for (int64_t c = 0; c < cell; ++c) {
+                    const int64_t dist = pos - sl.pos[(size_t) c];
+                    if (dist < 0 || dist >= extent || (L.swa && dist >= s.swa_window)) { scores[(size_t) c] = -1e30f; continue; }
+                    double ss = 0;
+                    for (int64_t d = 0; d < HD; ++d)
+                        ss += (double) q[h * HD + d] * sl.k.data()[((size_t) c * NKV + hkv) * HD + d];
+                    double bias = -(double) sink[h];
+                    for (int64_t d = 0; d < nrel; ++d)
+                        bias += (double) r[h * nrel + d] * relbias[(size_t) dist * nrel + d];
+                    scores[(size_t) c] = (float) (ss * inv_sqrt_hd + bias);
+                }
+                scores[(size_t) cell] = 0.0f;   // the zero sink
+                const float mx = *std::max_element(scores.begin(), scores.end());
+                double sum = 0;
+                for (auto& z : scores) { z = std::exp(z - mx); sum += z; }
+                double acc = 0;
+                for (int64_t c = 0; c < cell; ++c) acc += (double) (scores[(size_t) c] / sum);
                 for (int64_t d = 0; d < HD; ++d)
-                    ss += (double) q[h * HD + d] * sl.k.data()[((size_t) c * NKV + hkv) * HD + d];
-                double bias = -(double) sink[h];
-                for (int64_t d = 0; d < nrel; ++d)
-                    bias += (double) r[h * nrel + d] * relbias[(size_t) dist * nrel + d];
-                scores[(size_t) c] = (float) (ss * inv_sqrt_hd + bias);
+                    att[h * HD + d] = 0.0f;
+                for (int64_t c = 0; c < cell; ++c) {
+                    if (scores[(size_t) c] < 0) continue;
+                    const float pw = scores[(size_t) c] / sum;
+                    const float* vc = sl.v.data() + ((size_t) c * NKV + hkv) * HD;
+                    for (int64_t d = 0; d < HD; ++d) att[h * HD + d] += pw * vc[d];
+                }
+                (void) acc;
             }
-            scores[(size_t) cell] = 0.0f;   // the zero sink
-            const float mx = *std::max_element(scores.begin(), scores.end());
-            double sum = 0;
-            for (auto& z : scores) { z = std::exp(z - mx); sum += z; }
-            double acc = 0;
-            for (int64_t c = 0; c < cell; ++c) acc += (double) (scores[(size_t) c] / sum);
-            for (int64_t d = 0; d < HD; ++d)
-                att[h * HD + d] = 0.0f;
-            for (int64_t c = 0; c < cell; ++c) {
-                if (scores[(size_t) c] < 0) continue;
-                const float pw = scores[(size_t) c] / sum;
-                const float* vc = sl.v.data() + ((size_t) c * NKV + hkv) * HD;
-                for (int64_t d = 0; d < HD; ++d) att[h * HD + d] += pw * vc[d];
-            }
-            (void) acc;
         }
 
         multiply(L.gate, inputs[0], gate_tmp.data(), N, NH * HD);
@@ -698,16 +707,35 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
         for (auto& z : w) z = (float) (z / (wsum + 1e-20) * s.expert_weights_scale);
 
         std::fill(out.begin(), out.end(), 0.0f);
-        for (int64_t j = 0; j < NK; ++j) {
-            const int64_t eid = ids[(size_t) j];
-            // the fused gate/up matrix has 2*FF rows: row i is the gate, row FF+i the up
-            for (int64_t i = 0; i < FF; ++i) {
-                const float g = expert_row_dot(L.gu, (int) eid, i, normed.data(), rowbuf);
-                const float u = expert_row_dot(L.gu, (int) eid, FF + i, normed.data(), rowbuf);
-                hv[(size_t) i] = situ(g, u, (float) s.situ_beta, (float) s.situ_linear_beta);
+        if (products) {
+            std::vector<float> gu((size_t) (NK * 2 * FF)), hidden((size_t) (NK * FF)), down((size_t) (NK * N));
+            products->grouped(L.gu.type, L.gu.data, (size_t) L.gu.rows * L.gu.row_bytes, ids.data(), (int) NK,
+                              normed.data(), true, N, 2 * FF, gu.data());
+            for (int64_t j = 0; j < NK; ++j) {
+                const float scale = L.gu.scale ? L.gu.scale[ids[(size_t) j]] : 1.0f;
+                for (int64_t i = 0; i < FF; ++i)
+                    hidden[(size_t) (j * FF + i)] = situ(gu[(size_t) (j * 2 * FF + i)] * scale,
+                        gu[(size_t) (j * 2 * FF + FF + i)] * scale, (float) s.situ_beta, (float) s.situ_linear_beta);
             }
-            for (int64_t i = 0; i < N; ++i)
-                out[i] += w[(size_t) j] * expert_row_dot(L.down, (int) eid, i, hv.data(), rowbuf);
+            products->grouped(L.down.type, L.down.data, (size_t) L.down.rows * L.down.row_bytes, ids.data(),
+                              (int) NK, hidden.data(), false, FF, N, down.data());
+            for (int64_t j = 0; j < NK; ++j) {
+                const float scale = L.down.scale ? L.down.scale[ids[(size_t) j]] : 1.0f;
+                for (int64_t i = 0; i < N; ++i)
+                    out[(size_t) i] += w[(size_t) j] * (down[(size_t) (j * N + i)] * scale);
+            }
+        } else {
+            for (int64_t j = 0; j < NK; ++j) {
+                const int64_t eid = ids[(size_t) j];
+                // the fused gate/up matrix has 2*FF rows: row i is the gate, row FF+i the up
+                for (int64_t i = 0; i < FF; ++i) {
+                    const float g = expert_row_dot(L.gu, (int) eid, i, normed.data(), rowbuf);
+                    const float u = expert_row_dot(L.gu, (int) eid, FF + i, normed.data(), rowbuf);
+                    hv[(size_t) i] = situ(g, u, (float) s.situ_beta, (float) s.situ_linear_beta);
+                }
+                for (int64_t i = 0; i < N; ++i)
+                    out[i] += w[(size_t) j] * expert_row_dot(L.down, (int) eid, i, hv.data(), rowbuf);
+            }
         }
         convolve(out.data(), N, L.ffnconv, nullptr, sl, 2 * NKV * HD + N, tmp.data());
         for (int64_t i = 0; i < N; ++i) cur_in[i] = ffn_inp[i] + tmp[i];
@@ -755,6 +783,8 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
     const float cap = (float) s.final_logit_softcap;
     if (cap > 0)
         for (float& z : last_logits_) z = cap * std::tanh(z / cap);
+    if (products) products->capture(draft_features.data(), draft_features.size());
+    taps_valid = true;
     if (dspark) dspark->commit(draft_features.data());
     return true;
 }
@@ -766,8 +796,9 @@ bool PlainInkling::load(const GgufModel& m, const ModelSpec& s, std::string& err
     return p_->load(m, s, err);
 }
 
-bool PlainInkling::run(const int32_t* tokens, int64_t n, int64_t pos, float* logits, std::string& err) {
-    if (n < 1 || tokens == nullptr) {
+bool PlainInkling::run(const int32_t* tokens, int64_t n, int64_t pos, int rows, float* logits, std::string& err) {
+    p_->taps_valid = false;
+    if (n < 1 || rows < 1 || rows > n || tokens == nullptr) {
         err = "inkling2: no tokens to run";
         return false;
     }
@@ -776,10 +807,38 @@ bool PlainInkling::run(const int32_t* tokens, int64_t n, int64_t pos, float* log
     // on this machine while this reference is used.
     const unsigned hw = std::thread::hardware_concurrency();
     const int threads = std::max(1, (int) hw / 8);
-    for (int64_t t = 0; t < n; ++t)
-        if (!p_->token(tokens[t], pos + t, threads, err)) return false;
-    if (logits != nullptr)
-        std::memcpy(logits, p_->last_logits_.data(), (size_t) p_->s.vocab_unpadded * sizeof(float));
+    try {
+        for (int64_t t = 0; t < n; ++t) {
+            if (!p_->token(tokens[t], pos + t, threads, err)) return false;
+            if (logits != nullptr && t >= n - rows)
+                std::copy_n(p_->last_logits_.data(), p_->s.vocab_unpadded,
+                            logits + (t - (n - rows)) * p_->s.vocab_unpadded);
+        }
+    } catch (const std::exception& e) { p_->taps_valid = false; err = e.what(); return false; }
+    return true;
+}
+
+const float* PlainInkling::gpu_taps() const {
+    return p_->products && p_->taps_valid ? p_->products->taps() : nullptr;
+}
+
+bool PlainInkling::enable_gpu(std::string& err) {
+    size_t raw = 0;
+    for (const auto& layer : p_->layers) {
+        for (const auto* e : {&layer.gu, &layer.down}) {
+            if (!kernels::iq_supported(e->type) || (e->rows * e->cols) % 256 != 0) {
+                err = "inkling2: expert format has no shared GPU dequantizer";
+                return false;
+            }
+            raw = std::max(raw, e->row_bytes * (size_t) e->rows);
+        }
+    }
+    try {
+        p_->draft_features.resize(PlainDspark::taps.size() * (size_t) p_->N);
+        p_->products = std::make_unique<InklingProducts>(p_->NK, p_->N, p_->FF, raw * (size_t) p_->NK,
+                                                        p_->NH, p_->NKV, p_->HD, p_->s.relative_length,
+                                                        p_->s.relative_extent);
+    } catch (const std::exception& e) { err = e.what(); return false; }
     return true;
 }
 

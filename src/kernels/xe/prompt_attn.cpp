@@ -587,4 +587,42 @@ bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_
     return prompt_attn(q, pools.k_pool, pools.v_pool, pools.page_table, pos0, T, s, attn, stream, window);
 }
 
+void relative_prompt_attn(const float* q, const float* k, const float* v, const float* rel,
+                          const float* table, const float* sink, const int32_t* positions,
+                          int64_t pos, int64_t cells, int64_t heads, int64_t kv_heads, int64_t dim,
+                          int64_t relative_dim, int64_t extent, int64_t window, float* scores, float* out, void* stream) {
+    auto& queue = core::Runtime::get().stream(stream);
+    const float scale = 1.0f / std::sqrt((float) dim);
+    if (cells > 0) queue.parallel_for(sycl::range<2>((size_t) heads, (size_t) cells), [=](sycl::id<2> id) {
+        const int64_t h = (int64_t) id[0], c = (int64_t) id[1];
+        const int64_t d = pos - positions[c], kv = h / (heads / kv_heads);
+        float score = -1e30f;
+        if (d >= 0 && d < extent && (window == 0 || d < window)) {
+            float dot = 0, bias = -sink[h];
+            for (int64_t i = 0; i < dim; ++i) dot += q[h * dim + i] * k[(c * kv_heads + kv) * dim + i];
+            for (int64_t i = 0; i < relative_dim; ++i) bias += rel[h * relative_dim + i] * table[d * relative_dim + i];
+            score = dot * scale + bias;
+        }
+        scores[h * cells + c] = score;
+    });
+    queue.parallel_for(sycl::range<1>((size_t) heads), [=](sycl::id<1> id) {
+        const auto h = (int64_t) id[0];
+        float peak = 0;
+        for (int64_t c = 0; c < cells; ++c) peak = sycl::fmax(peak, scores[h * cells + c]);
+        float sum = sycl::exp(-peak);
+        for (int64_t c = 0; c < cells; ++c) {
+            float& x = scores[h * cells + c];
+            x = sycl::exp(x - peak);
+            sum += x;
+        }
+        for (int64_t c = 0; c < cells; ++c) scores[h * cells + c] /= sum;
+    });
+    queue.parallel_for(sycl::range<2>((size_t) heads, (size_t) dim), [=](sycl::id<2> id) {
+        const int64_t h = (int64_t) id[0], d = (int64_t) id[1], kv = h / (heads / kv_heads);
+        float y = 0;
+        for (int64_t c = 0; c < cells; ++c) y += scores[h * cells + c] * v[(c * kv_heads + kv) * dim + d];
+        out[h * dim + d] = y;
+    });
+}
+
 }  // namespace strata::kernels
