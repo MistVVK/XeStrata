@@ -662,8 +662,11 @@ class Strata:
         if ram is None:
             return None
         from strata_control import hy4_fit
+        uni = next((g for g in usable if g.get("unified_gb")), None)
         uma = next((g for g in usable if g.get("uma")), None)
-        if uma:
+        if uni:
+            vram_gib, ram_gib, unified = None, float(uni["unified_gb"]), True
+        elif uma:
             vram_gib, ram_gib, unified = None, float(uma.get("vram_gb") or ram) / hy4_fit.GIB_TO_GB, True
         else:
             vram_gib, ram_gib, unified = max((float(g["vram_gb"]) for g in usable), default=0.0), float(ram), False
@@ -1307,6 +1310,27 @@ class Strata:
             if sizes:
                 out.append({"family": family, "title": fd["title"], "about": fd.get("about"), "experimental": False,
                             "images": any(x["images"] for x in sizes), "sizes": sizes})
+        if self.hy4_visible():
+            usable = self.engine_gpus(hw) or ([{"unified_gb": ram}] if ram else [])
+            S = self.setup_module()
+            for f, fd in (getattr(S, "HY4_FAMILIES", None) or {}).items():
+                sizes = []
+                for m in self.sizes_of(models, f):
+                    d = self.hy4_size(f, m)
+                    if not d:
+                        continue
+                    tag = (fd.get("tag", "") + m).lower()
+                    hy4 = self.hy4_fit_row(m, ram if ram else None, usable)
+                    verdict = None if hy4 is None else ("may run slower" if hy4["mode"] == "cross_tier_ssd" else "fits")
+                    sizes.append({"model": m, "about": d["about"], "download_gb": d["download_gb"],
+                                  **({"hy4": hy4} if hy4 else {}),
+                                  "experimental": False, "images": True,
+                                  "ram_needed_gb": d["ram_gb"], "experts_gb": d.get("arena_gb"), "mem_total": False,
+                                  "memory_gb": d["footprint_gb"], "fit_gb": d["footprint_gb"],
+                                  "on_this_pc": verdict, "installed": tag in have, "id": tag, "gpu_options": None})
+                if sizes:
+                    out.append({"family": f, "title": fd["title"], "about": fd.get("about"), "experimental": False,
+                                "images": True, "sizes": sizes})
         return self._feed_rows(out, self.setup_module())
 
     def recommend(self, hw: dict) -> dict:
@@ -2415,10 +2439,14 @@ class Tools:
         md = s.own_size(family, model) or models[model]   # Qwen3.6-35B-A3B: its sizes are not in setup's MODELS
         mac = bool(hw.get("mac"))
         if mac:                                         # a Mac: no card to pick, no KV choice, no RAM mode: unified memory decides
-            if rec.get("model") is None and model is not None and s.mac() and hw.get("ram_gb", 0) < s.mac().MIN_STREAM_RAM_GB:
+            if not md.get("hy4") and rec.get("model") is None and model is not None and s.mac() and hw.get("ram_gb", 0) < s.mac().MIN_STREAM_RAM_GB:
                 raise ToolError(f"{model} does not fit this Mac: {rec['why']}")
             gpu = gpus = kv = low_ram = None
-            context = context or (s.mac().recommend_context(hw.get("ram_gb") or 0) if s.mac() else 32768)
+            if md.get("hy4"):
+                from strata_control import hy4_family
+                context = context or hy4_family.DEFAULT_CONTEXT
+            else:
+                context = context or (s.mac().recommend_context(hw.get("ram_gb") or 0) if s.mac() else 32768)
         if context is None:
             usable = s.engine_gpus(hw)
             vram = max((g["vram_gb"] for g in usable), default=12)
@@ -2453,10 +2481,12 @@ class Tools:
         if md.get("hy4"):                                       # Hy4-Flash: the files are in <models>/hy4-flash (the build, the shared Engram shard); the disk need is what is not there yet
             from strata_control import hy4_family
             have_files = hy4_family.local_files(target / "models" / hy4_family.FAMILY)
-            md = {**md, "download_gb": round(sum(hy4_family.size_of(n) / 1e9 for n in hy4_family.files_of(model) if n not in have_files), 1)}
+            md = {**md, "download_gb": round(sum(hy4_family.size_of(n) / 1e9 for n in hy4_family.files_of(model, vision != "no") if n not in have_files), 1)}
         partly = (have_dir.is_dir() and any(have_dir.glob("*.gguf*"))) or bool(gguf_dir) \
             or (ready_dir is not None and ready_dir.is_dir() and any(ready_dir.glob("*.gguf*")))   # a local folder: nothing to download
-        need = (8 if partly else md["download_gb"] + 8) + (1 if vision in ("yes", "gpu", "cpu") else 0)             + (s.mac().repacked_gb(model) if mac and s.mac() else 0)       # a Mac repacks Unsloth's shards into one file for the GPU (mac_fit.repacked_gb)
+        repack_gb = 0 if md.get("hy4") else (s.mac().repacked_gb(model) if mac and s.mac() else 0)
+        vision_extra = 0 if md.get("hy4") else (1 if vision in ("yes", "gpu", "cpu") else 0)
+        need = (8 if partly else md["download_gb"] + 8) + vision_extra + repack_gb       # a Mac repacks Unsloth's shards into one file for the GPU (mac_fit.repacked_gb)
         free = s.disk_free(target)
         short = None
         if free is not None and free < need:

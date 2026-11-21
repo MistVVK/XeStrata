@@ -615,7 +615,7 @@ class Catalog:
         the one rule of the app, the Terminal and setup). A Mac keeps its unified-memory rule."""
         from strata_control import default_context
         hw = hw or self.hardware()
-        if hw.get("mac") and hw.get("ram_gb"):
+        if hw.get("mac") and hw.get("ram_gb") and family != "hy4-flash":
             mac = self.strata.mac()                           # a Mac: the context by unified memory (strata_control/mac_fit.py)
             if mac is not None:
                 return int(mac.recommend_context(float(hw["ram_gb"])))

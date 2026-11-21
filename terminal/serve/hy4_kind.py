@@ -7,6 +7,7 @@ arguments plus the few it owns, and every step that would rewrite them is skippe
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 ARCH = "hy4flash"
@@ -78,7 +79,7 @@ def probe(exe: str | None, args: list, cfg: dict | None = None, timeout: float =
     env = quiet_crash_env(dict(os.environ))          # no debugger on a user's machine (the same rule every program of ours is started with)
     dirs = [d for d in ((cfg or {}).get("lib_dirs") or []) if Path(d).is_dir()]
     if dirs:
-        var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+        var = "PATH" if os.name == "nt" else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
     try:
         done = subprocess.run([str(exe), "--info", str(model)], capture_output=True, text=True, errors="replace", timeout=timeout, env=env, cwd=str(Path(str(exe)).parent))

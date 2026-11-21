@@ -412,5 +412,159 @@ class Catalog(unittest.TestCase):
         self.assertEqual(files[2]["bytes"], 934_092_800)
 
 
+class MacHy4Flash(unittest.TestCase):
+    def _mac_hw(self, ram_gib: float) -> dict:
+        return {
+            "ram_gb": ram_gib,
+            "cpu": {"name": "Apple M4 Max", "cores": 16, "avx2": None, "avx512": None},
+            "gpus": [{"index": 0, "name": "Apple M4 Max", "vendor": "apple", "vram_gb": 0.0, "unified_gb": ram_gib, "arch": "apple-gpu", "problem": None, "usable": True}],
+            "mac": {"chip": "Apple M4 Max", "macos": "15.4", "unified_gb": ram_gib},
+            "nvidia_smi": False,
+        }
+
+    def test_mac_model_table_lists_hy4_flash_with_unified_fit_on_32gb_and_128gb(self):
+        with mock.patch.dict(os.environ, {"STRATA_HY4_SHOW": "1"}):
+            s = M.Strata(HERE.parent)
+            rows_32 = s.model_table(self._mac_hw(32.0))
+            fam_32 = next(f for f in rows_32 if f["family"] == "hy4-flash")
+            by_32 = {x["model"]: x for x in fam_32["sizes"]}
+            self.assertEqual(list(by_32), ["SQ-64", "SQ-96", "SQ-128"])
+            self.assertTrue(fam_32["images"])
+            self.assertTrue(by_32["SQ-64"]["hy4"]["unified"])
+            self.assertTrue(by_32["SQ-64"]["hy4"]["recommended"])
+            self.assertEqual(by_32["SQ-64"]["on_this_pc"], "may run slower")
+            self.assertEqual(by_32["SQ-64"]["id"], "hy4-flash-sq-64")
+
+            rows_128 = s.model_table(self._mac_hw(128.0))
+            fam_128 = next(f for f in rows_128 if f["family"] == "hy4-flash")
+            by_128 = {x["model"]: x for x in fam_128["sizes"]}
+            self.assertTrue(by_128["SQ-128"]["hy4"]["unified"])
+            self.assertTrue(by_128["SQ-128"]["hy4"]["recommended"])
+            self.assertEqual(by_128["SQ-128"]["hy4"]["mode"], "ram_vram_zero_ssd")
+            self.assertEqual(by_128["SQ-128"]["hy4"]["placement"]["ssd_gb"], 0.0)
+            self.assertEqual(by_128["SQ-128"]["on_this_pc"], "fits")
+            self.assertEqual(by_128["SQ-96"]["on_this_pc"], "fits")
+            self.assertEqual(by_128["SQ-64"]["on_this_pc"], "fits")
+
+    def test_mac_model_table_hides_hy4_when_not_visible(self):
+        s = M.Strata(HERE.parent)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("STRATA_HY4_SHOW", None)
+            with mock.patch.object(hy4_family, "sources", return_value=[]), mock.patch.object(hy4_family, "local_files", return_value={}):
+                fams = [f["family"] for f in s.model_table(self._mac_hw(128.0))]
+                self.assertNotIn("hy4-flash", fams)
+
+    def test_mac_install_plan_defaults_to_128k_and_unified_fit(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"STRATA_HY4_SHOW": "1"}):
+            data_dir = str(Path(d) / "Strata-data")
+            s = M.Strata(HERE.parent)
+            tools = M.Tools(s)
+            hw128 = self._mac_hw(128.0)
+            with mock.patch.object(s, "hardware", return_value=hw128), mock.patch.object(s, "disk_free", return_value=500.0):
+                plan, args = tools.install_plan("hy4-flash", "SQ-128", None, None, None, None, None, None, None, None, data_dir=data_dir)
+            self.assertEqual(plan["context"], 131072)
+            self.assertEqual(plan["ram"], "fits")
+            self.assertEqual(plan["images"], "yes")
+            self.assertEqual(args[:9], ["--yes", "--no-start", "--family", "hy4-flash", "--model", "SQ-128", "--context", "131072", "--vision"])
+            for flag in ("--kv", "--low-ram", "--gpu", "--gpus", "--drafter", "--mtp"):
+                self.assertNotIn(flag, args)
+            hw32 = self._mac_hw(32.0)
+            with mock.patch.object(s, "hardware", return_value=hw32), mock.patch.object(s, "disk_free", return_value=500.0):
+                plan32, _args32 = tools.install_plan("hy4-flash", "SQ-64", None, None, None, None, None, None, None, None, data_dir=data_dir)
+            self.assertEqual(plan32["context"], 131072)
+            self.assertEqual(plan32["ram"], "may run slower")
+
+    def test_mac_hy4_pc_and_control_setup_writes_metal_hy4_config(self):
+        self.assertEqual(setup.hy4_pc({"vendor": "apple", "vram_gb": 0.0, "unified_gb": 128.0, "uma": True}, 128.0), (None, 128.0, True))
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            names = ("Hy4-Flash-SQ-64.strata", hy4_family.ENGRAM_FILE, hy4_family.VISION_FILE)
+            table, data = tiny_files(names)
+            folder = root / "models" / "hy4-flash"
+            folder.mkdir(parents=True)
+            for n in names:
+                (folder / n).write_bytes(data[n])
+                setup.mark(folder / n)
+            written = {}
+            fake_info = {"chip": "Apple M4 Max", "ram_gb": 128.0, "macos": "15.4", "arm64": True, "clt": "x"}
+            import contextlib
+            with contextlib.ExitStack() as stack:
+                for cm in (
+                    mock.patch.object(setup.sys, "platform", "darwin"),
+                    mock.patch.object(setup, "CONTROL", True),
+                    mock.patch.object(sys, "argv", ["setup.py", "--family", "hy4-flash", "--model", "SQ-64", "--yes", "--no-start", "--models-dir", str(root / "models")]),
+                    mock.patch.object(hy4_family, "FILES", table),
+                    mock.patch.object(setup, "home", return_value=root),
+                    mock.patch.object(setup, "pip_install"),
+                    mock.patch.object(setup, "runtime_packages", return_value=[]),
+                    mock.patch.object(setup, "step"),
+                    mock.patch.object(setup, "ok"),
+                    mock.patch.object(setup, "say"),
+                    mock.patch.object(setup, "warn"),
+                    mock.patch.object(setup, "move_over_old_layout"),
+                    mock.patch.object(setup, "mac_control_setup", side_effect=AssertionError("mac_control_setup must not handle hy4-flash")),
+                    mock.patch.object(setup, "mac_setup", side_effect=AssertionError("mac_setup must not handle hy4-flash")),
+                    mock.patch("strata_control.mac_fit.mac_info", return_value=fake_info),
+                    mock.patch("strata_control.mac_fit.mac_problems", return_value=[]),
+                    mock.patch.object(setup, "engine_step", return_value=(None, root / "engine", {"component": "missing"}, [], {"index": 0, "count": 1}, "none")),
+                    mock.patch.object(setup, "data_folder_for", return_value=(root / "data", [])),
+                    mock.patch.object(setup, "hy4_tokenizer_dir", return_value=root / "tok"),
+                    mock.patch.object(setup, "write_setup_config", lambda path, cfg, *x, **k: written.update(cfg)),
+                    mock.patch.object(setup, "write_run_script", return_value=Path("run.sh")),
+                    mock.patch.object(setup, "explicit_args", return_value=[]),
+                ):
+                    stack.enter_context(cm)
+                rc = setup.main()
+            self.assertEqual(rc, 0)
+            self.assertEqual(written["exe"], "component:strata-hy4")
+            self.assertEqual(written["arch"], "hy4flash")
+            self.assertEqual(written["backend"], "metal")
+            self.assertEqual(written["drafting"], "dfly2")
+            self.assertIn("--max-context", written["args"])
+            self.assertEqual(written["args"][written["args"].index("--max-context") + 1], "131072")
+            self.assertIn("--vision", written["args"])
+            self.assertNotIn("--vram-experts-gb", written["args"])
+            self.assertNotIn("--ram-experts-gb", written["args"])
+
+    def test_darwin_non_control_does_not_redirect_hy4_to_mac_setup_and_uses_dyld_library_path(self):
+        with mock.patch.object(setup.sys, "platform", "darwin"), mock.patch.object(setup, "CONTROL", False), \
+                mock.patch.object(sys, "argv", ["setup.py", "--family", "hy4-flash", "--model", "SQ-64", "--check"]), \
+                mock.patch.object(setup, "mac_setup", side_effect=AssertionError("mac_setup must not run for hy4-flash")), \
+                mock.patch.object(setup, "mac_hy4_setup", return_value=0) as m_hy4, \
+                mock.patch.object(setup, "move_over_old_layout"):
+            self.assertEqual(setup.main(), 0)
+        m_hy4.assert_called_once()
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            eng = root / "strata-hy4"
+            eng.write_bytes(b"")
+            model = root / "Hy4-Flash-SQ-64.strata"
+            model.write_bytes(b"STRATA\x00\x01")
+            out = root / "tok"
+            seen_env = []
+
+            def fake_subproc(cmd, **kw):
+                seen_env.append(kw.get("env") or {})
+                raw = Path(cmd[3])
+                raw.mkdir(parents=True, exist_ok=True)
+                (raw / "tokenizer.hf.json").write_text("{}", encoding="utf-8")
+                (raw / "chat_template.jinja").write_text("T", encoding="utf-8")
+                return mock.Mock(returncode=0, stdout="")
+
+            with mock.patch.object(setup, "WIN", False), mock.patch.object(setup.sys, "platform", "darwin"), \
+                    mock.patch.object(setup, "say"), mock.patch("subprocess.run", side_effect=fake_subproc), \
+                    mock.patch("hy4_tokenizer.read_manifest", side_effect=RuntimeError("no zstd")), \
+                    mock.patch("hy4_tokenizer.convert_files", return_value={}):
+                self.assertEqual(setup.hy4_tokenizer_dir(model, out, eng), out)
+            self.assertIn("DYLD_LIBRARY_PATH", seen_env[0])
+            self.assertIn(str(eng.resolve().parent), seen_env[0]["DYLD_LIBRARY_PATH"])
+
+    def test_launch_catalog_max_context_is_128k_for_hy4_on_mac(self):
+        from strata_cli.launch.catalog import Catalog as LaunchCatalog
+        cat = LaunchCatalog(HERE.parent)
+        self.assertEqual(cat.max_context("hy4-flash", "SQ-64", self._mac_hw(32.0)), 131072)
+
+
 if __name__ == "__main__":
     unittest.main()

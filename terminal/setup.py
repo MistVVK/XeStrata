@@ -9689,6 +9689,8 @@ def hy4_offered(a=None) -> bool:
 def hy4_pc(gpu, ram) -> tuple:
     """(vram_gib or None, ram_gib, unified) of this PC for strata_control/hy4_fit.py: an APU / unified-memory PC has one pool (what the GPU can map), a card has its VRAM."""
     g = gpu or {}
+    if g.get("unified_gb"):
+        return None, float(g["unified_gb"]), True
     if g.get("uma"):
         return None, float(g.get("vram_gb") or ram) / hy4_fit.GIB_TO_GB, True
     return float(g.get("vram_gb") or 0.0), float(ram), False
@@ -9780,7 +9782,7 @@ def hy4_tokenizer_dir(model: Path, out: Path, engine: Path | None) -> Path | Non
         raw = out.with_name(out.name + "-export")
         raw.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ)
-        var = "PATH" if WIN else "LD_LIBRARY_PATH"
+        var = "PATH" if WIN else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
         eng_dir = str(Path(engine).resolve().parent)
         env[var] = os.pathsep.join([eng_dir, env[var]]) if env.get(var) else eng_dir
         run([str(engine), "--export-tokenizer", str(model), str(raw)], env=env)
@@ -9888,6 +9890,8 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
            "log": str(home() / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port, "drafting": hy4_family.DEFAULT_DRAFTER}
     if hip:
         cfg["backend"] = "hip"
+    elif sys.platform == "darwin":
+        cfg["backend"] = "metal"
     if gpu.get("count", 1) > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]
         cfg["gpus_asked"] = True
@@ -10316,6 +10320,30 @@ def mac_control_setup(a) -> int:
     return 0
 
 
+def mac_hy4_setup(a) -> int:
+    """Tencent Hy4-Flash on a Mac (Apple Silicon, Metal): unified memory, strata-hy4 Metal component, no Flash-Next repack."""
+    from strata_control import mac_fit as MF
+    say("Strata - Tencent Hy4-Flash 220B-A12B on a Mac (Apple Silicon, Metal)")
+    step(1, "checking your Mac")
+    info = MF.mac_info()
+    ram = float(info["ram_gb"] or ram_gb())
+    ok(f"{info['chip']}, {ram:.0f} GB unified memory, macOS {info['macos'] or '?'}")
+    problems = MF.mac_problems(info, need_compiler=False)
+    for p in problems:
+        warn(p)
+    data, _ = data_folder_for(a)
+    if a.models_dir is None:
+        a.models_dir = str(data / "models")
+    free = free_gb(data if data.exists() else home())
+    ok(f"free disk: {free:.0f} GB at {data}")
+    if a.check:
+        return 1 if problems else 0
+    if problems:
+        fail(problems[0])
+    gpu = {"index": 0, "name": info["chip"], "vendor": "apple", "vram_gb": 0.0, "unified_gb": ram, "uma": True, "count": 1}
+    return install_hy4_flash(a, a.family or hy4_family.FAMILY, gpu, False, False, None, False, a.port or 8080, ram, None)
+
+
 def main() -> int:
     try:                                               # the engine programs setup runs start no debugger on a user's machine (strata_control/childenv.py)
         from strata_control.childenv import quiet_crash_env
@@ -10334,7 +10362,8 @@ def main() -> int:
                                               and (not _peek("--family") or retired.is_name(_peek("--family")))):
         say("  " + retired.NOT_OFFERED)                # DeepSeek: no longer offered (strata_control/retired.py)
         return 2
-    if sys.platform == "darwin" and not CONTROL:       # a Mac: metal/setup_mac.py (the Metal engine); the app (Control mode) goes on below.
+    _hy4_ask = _peek("--family") in HY4_FAMILIES or bool(_peek("--model") and model_alias(_peek("--model")) in HY4_FAMILIES["hy4-flash"]["models"])
+    if sys.platform == "darwin" and not CONTROL and not _hy4_ask:       # a Mac: metal/setup_mac.py (the Metal engine); the app (Control mode) and Hy4-Flash go on below.
         return mac_setup(sys.argv[1:])                 # (after the retired names above, so a Mac gets the same sentence and exit 2, M1 11-16)
     if (_peek("--family") and _peek("--family") not in {**FAMILIES, **OWN_PATH_FAMILIES, **HY4_FAMILIES}) \
             or (_peek("--model") and not _peek("--family") and model_alias(_peek("--model")) not in MODELS
@@ -10521,8 +10550,11 @@ def main() -> int:
         return prepare_pack_only(a)
     if a.inspect:                                      # headers only: nothing is installed
         sys.exit(subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode)
-    if sys.platform == "darwin" and CONTROL:           # the app on a Mac: model files only; the Metal engine is a component
-        return mac_control_setup(a)
+    if sys.platform == "darwin":
+        if a.family in HY4_FAMILIES or (not a.family and a.model in HY4_FAMILIES["hy4-flash"]["models"]):
+            return mac_hy4_setup(a)
+        if CONTROL:           # the app on a Mac: model files only; the Metal engine is a component
+            return mac_control_setup(a)
     if a.backend == "sycl":                            # Intel Arc: the app / Terminal's installer mode prepares the files and writes the config; a checkout builds from source
         if CONTROL:
             return intel_control_setup(a)

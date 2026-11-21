@@ -879,8 +879,8 @@ class MacCatalog(unittest.TestCase):
     def test_the_model_list_is_the_macs_sizes_with_unified_memory_verdicts(self):
         s, hw = self.hw(32)
         fams = s.model_table(hw)
-        self.assertEqual([f["family"] for f in fams], ["qwen", "unsloth", "gyro"],
-                         "Unsloth's sets since round 0214 (the app repacks them), no Swift or NVFP4 on a Mac; Gyro after the regular sizes")
+        self.assertEqual([f["family"] for f in fams], ["qwen", "unsloth", "gyro", "hy4-flash"],
+                         "Unsloth's sets since round 0214 (the app repacks them), no Swift or NVFP4 on a Mac; Gyro after the regular sizes; Hy4-Flash when offered")
         by = {x["model"]: x for x in fams[0]["sizes"]}
         self.assertEqual(list(by), ["Q2_0", "IQ3_XXS", "IQ3_S"])
         un = {x["model"]: x for x in fams[1]["sizes"]}
@@ -896,12 +896,15 @@ class MacCatalog(unittest.TestCase):
         self.assertEqual(by["IQ3_S"]["on_this_pc"], "may run slower")
         self.assertTrue(all(x["images"] for x in by.values()), "the Mac engine carries the Metal picture reader: pictures are on")
         s, hw = self.hw(128)
-        fits = {x["model"]: x["on_this_pc"] for f in s.model_table(hw) for x in f["sizes"]}
+        table_128 = s.model_table(hw)
+        fits = {x["model"]: x["on_this_pc"] for f in table_128 if f["family"] != "hy4-flash" for x in f["sizes"]}
         from strata_control import mac_fit
         for m, v in fits.items():                       # the 128 GB Mac keeps ~96 GB resident: UD-Q5_K_XL and UD-Q6_K_XL (104 / 115 GB to map) stream, said not refused
             self.assertEqual(v == "fits", not mac_fit.streams(m, 128.0), m)
             self.assertIn(v, ("fits", "may run slower"), m)
         self.assertEqual({m for m, v in fits.items() if v != "fits"}, {"UD-Q5_K_XL", "UD-Q6_K_XL"})
+        hy4_128 = {x["model"]: x["on_this_pc"] for f in table_128 if f["family"] == "hy4-flash" for x in f["sizes"]}
+        self.assertEqual(hy4_128, {"SQ-64": "fits", "SQ-96": "fits", "SQ-128": "fits"})
         s, hw = self.hw(8)
         self.assertEqual({x["on_this_pc"] for f in s.model_table(hw) for x in f["sizes"]}, {"may run slower"})      # too little memory: the same two words
 
