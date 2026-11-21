@@ -50,37 +50,36 @@ __global__ void __launch_bounds__(256) k1_attn_res_mix(
     const float inv_sqrt_d = rsqrtf(static_cast<float>(D));
     const float* qv = queries + static_cast<size_t>(q) * D;
 
-    __shared__ float s_wave[8];
+    __shared__ float s_ss[8];
+    __shared__ float s_dot[8];
     __shared__ float s_scores[16];
     __shared__ float s_inv_rms[16];
 
-    // Pass 1: compute RMSNorm inv_rms and dot(norm(state[s]), qv) for each depth state s
+    // Pass 1: vectorized float4 loads + merged ss/dot reduction (2x fewer __syncthreads()!)
+    const int d4 = D >> 2;
+    const float4* qv4 = reinterpret_cast<const float4*>(qv);
     for (int s = 0; s < n_states; ++s) {
-        const float* sv = (s < n_blocks) ? (bp.p[s] + static_cast<size_t>(m) * D)
-                                         : (cur + static_cast<size_t>(m) * D);
+        const float4* sv4 = reinterpret_cast<const float4*>(
+            (s < n_blocks) ? (bp.p[s] + static_cast<size_t>(m) * D)
+                           : (cur + static_cast<size_t>(m) * D));
         float ss = 0.0f;
         float dot = 0.0f;
-        for (int d = tid; d < D; d += 256) {
-            const float x = sv[d];
-            ss = fmaf(x, x, ss);
-            dot = fmaf(x, qv[d], dot);
+        for (int i = tid; i < d4; i += 256) {
+            const float4 x = sv4[i];
+            const float4 q4 = qv4[i];
+            ss  = fmaf(x.x, x.x, fmaf(x.y, x.y, fmaf(x.z, x.z, fmaf(x.w, x.w, ss))));
+            dot = fmaf(x.x, q4.x, fmaf(x.y, q4.y, fmaf(x.z, q4.z, fmaf(x.w, q4.w, dot))));
         }
         ss = wave32_sum(ss);
         dot = wave32_sum(dot);
-        if (lane == 0) s_wave[wave] = ss;
-        __syncthreads();
-        float total_ss = 0.0f;
-        if (tid == 0) {
-            for (int w = 0; w < 8; ++w) total_ss += s_wave[w];
-            s_inv_rms[s] = rsqrtf(total_ss / static_cast<float>(D) + kRmsEps);
-        }
-        __syncthreads();
-        if (lane == 0) s_wave[wave] = dot;
+        if (lane == 0) { s_ss[wave] = ss; s_dot[wave] = dot; }
         __syncthreads();
         if (tid == 0) {
-            float total_dot = 0.0f;
-            for (int w = 0; w < 8; ++w) total_dot += s_wave[w];
-            s_scores[s] = total_dot * s_inv_rms[s] * inv_sqrt_d;
+            float tss = 0.0f, tdot = 0.0f;
+            for (int w = 0; w < 8; ++w) { tss += s_ss[w]; tdot += s_dot[w]; }
+            const float ir = rsqrtf(tss / static_cast<float>(D) + kRmsEps);
+            s_inv_rms[s] = ir;
+            s_scores[s] = tdot * ir * inv_sqrt_d;
         }
         __syncthreads();
     }
@@ -99,16 +98,20 @@ __global__ void __launch_bounds__(256) k1_attn_res_mix(
     }
     __syncthreads();
 
-    // Pass 2: weighted sum across RMS-normalized depth states (matches strata::inkling2::attn_res_mix_f32!)
-    float* dst = out + (static_cast<size_t>(m) * n_queries + q) * D;
-    for (int d = tid; d < D; d += 256) {
-        float acc = 0.0f;
+    // Pass 2: vectorized float4 weighted sum across RMS-normalized depth states
+    float4* dst4 = reinterpret_cast<float4*>(out + (static_cast<size_t>(m) * n_queries + q) * D);
+    for (int i = tid; i < d4; i += 256) {
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
         for (int s = 0; s < n_states; ++s) {
-            const float* sv = (s < n_blocks) ? (bp.p[s] + static_cast<size_t>(m) * D)
-                                             : (cur + static_cast<size_t>(m) * D);
-            acc = fmaf(s_scores[s], sv[d], acc);
+            const float4* sv4 = reinterpret_cast<const float4*>(
+                (s < n_blocks) ? (bp.p[s] + static_cast<size_t>(m) * D)
+                               : (cur + static_cast<size_t>(m) * D));
+            const float4 x = sv4[i];
+            const float w = s_scores[s];
+            a0 = fmaf(w, x.x, a0); a1 = fmaf(w, x.y, a1);
+            a2 = fmaf(w, x.z, a2); a3 = fmaf(w, x.w, a3);
         }
-        dst[d] = acc;
+        dst4[i] = make_float4(a0, a1, a2, a3);
     }
 }
 
@@ -629,7 +632,9 @@ __global__ void __launch_bounds__(256) k3_kv_paged_store(
 }
 
 // Flash-SWA / Flash-GQA Attention Kernel with RelPos Bias + Per-Query Attention Sinks + Sigmoid Gate!
-// Grid: (n_q_heads, M), Block: 128 (4 waves = 128 threads, 1 thread per head_dim element d=0..127!)
+// Wave32 Zero-Barrier Design: 1 Wave32 per (qh, m), 4 dims per lane (32*4 = head_dim 128), 4 Q-heads per 128-thread block!
+// Coalesced uint2 (FP16) / uint32_t (FP8) KV loads + pure register DPP wave32_sum -> ZERO __syncthreads(), ZERO LDS!
+// Grid: ((n_q_heads + 3) / 4, M), Block: 128
 template <bool FP8_KV>
 __global__ void __launch_bounds__(128) k3_flash_swa_gqa(
     const float* __restrict__ Q,            // [M, n_q_heads, 128]
@@ -646,75 +651,201 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa(
     const float* __restrict__ v_scales,     // nullptr or [n_phys_pages, 64]
     float* __restrict__ O_out,              // [M, n_q_heads, 128]
     int M, int n_q_heads, int n_kv_heads, int swa_window, int max_rel) {
-    const int qh = blockIdx.x;
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int qh = blockIdx.x * 4 + wave;
     const int m = blockIdx.y;
     if (qh >= n_q_heads || m >= M) return;
 
-    const int d = threadIdx.x;  // 0..127 (head_dim = 128!)
-    const int wave = d >> 5;
-    const int lane = d & 31;
+    const int d0 = lane * 4;  // 0, 4, ..., 124 (4 dims per lane across 32 lanes = 128!)
     const int kvh = qh / (n_q_heads / n_kv_heads);
     const int slot = slot_ids[m];
     const int cur_pos = pos[m];
     const int k_start = (swa_window > 0 && cur_pos >= swa_window) ? (cur_pos - swa_window + 1) : 0;
     const float scale = rsqrtf(128.0f);
-    const float q_val = Q[(static_cast<size_t>(m) * n_q_heads + qh) * 128 + d] * scale;
+    const float4 qv = *reinterpret_cast<const float4*>(Q + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0);
+    const float q0 = qv.x * scale, q1 = qv.y * scale, q2 = qv.z * scale, q3 = qv.w * scale;
 
-    __shared__ float s_wave[4];
-    __shared__ float s_score;
-
-    // Initialize online softmax state with per-query attention sink (acts as virtual zero-value token!)
     float max_l = sink_logit ? sink_logit[static_cast<size_t>(m) * n_q_heads + qh] : -1e30f;
     float sum_exp = sink_logit ? 1.0f : 0.0f;
-    float o_acc = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
 
     const int elems = n_kv_heads * 128;
-    const int kv_off = kvh * 128 + d;
+    const int kv_off = kvh * 128 + d0;
     const float* rb_row = rel_bias ? (rel_bias + (static_cast<size_t>(m) * n_q_heads + qh) * max_rel) : nullptr;
+    const int32_t* pt_row = page_table + slot * max_pages_per_slot;
 
     for (int kp = k_start; kp <= cur_pos; ++kp) {
         const int ring_p = (swa_window > 0) ? (kp % swa_window) : kp;
-        const int phys = page_table[slot * max_pages_per_slot + (ring_p >> 6)];
+        const int phys = pt_row[ring_p >> 6];
         const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
         const size_t base = tok_base * elems + kv_off;
 
-        float k_val, v_val;
+        float k0, k1, k2, k3, v0, v1, v2, v3;
         if constexpr (FP8_KV) {
             const float ks = k_scales ? k_scales[tok_base] : 1.0f;
             const float vs = v_scales ? v_scales[tok_base] : 1.0f;
-            k_val = e4m3fn_to_f32(static_cast<const uint8_t*>(k_pool)[base]) * ks;
-            v_val = e4m3fn_to_f32(static_cast<const uint8_t*>(v_pool)[base]) * vs;
+            const uint32_t kw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(k_pool) + base);
+            const uint32_t vw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(v_pool) + base);
+            k0 = e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks;
+            k1 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks;
+            k2 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks;
+            k3 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks;
+            v0 = e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs;
+            v1 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs;
+            v2 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs;
+            v3 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs;
         } else {
-            k_val = static_cast<float>(static_cast<const half_t*>(k_pool)[base]);
-            v_val = static_cast<float>(static_cast<const half_t*>(v_pool)[base]);
+            const uint2 kw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(k_pool) + base);
+            const uint2 vw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(v_pool) + base);
+            h2_unpack(kw.x, k0, k1); h2_unpack(kw.y, k2, k3);
+            h2_unpack(vw.x, v0, v1); h2_unpack(vw.y, v2, v3);
         }
 
-        float dot = wave32_sum(q_val * k_val);
-        if (lane == 0) s_wave[wave] = dot;
-        __syncthreads();
-        if (d == 0) {
-            float sc = s_wave[0] + s_wave[1] + s_wave[2] + s_wave[3];
-            const int dist = cur_pos - kp;
-            if (rb_row && dist < max_rel) sc += rb_row[dist];
-            s_score = sc;
-        }
-        __syncthreads();
+        float sc = wave32_sum(fmaf(q0, k0, fmaf(q1, k1, fmaf(q2, k2, q3 * k3))));
+        const int dist = cur_pos - kp;
+        if (rb_row && dist < max_rel) sc += rb_row[dist];
 
-        const float sc = s_score;
         const float new_max = fmaxf(max_l, sc);
         const float alpha = __expf(max_l - new_max);
         const float beta = __expf(sc - new_max);
-        o_acc = fmaf(o_acc, alpha, beta * v_val);
+        o0 = fmaf(o0, alpha, beta * v0);
+        o1 = fmaf(o1, alpha, beta * v1);
+        o2 = fmaf(o2, alpha, beta * v2);
+        o3 = fmaf(o3, alpha, beta * v3);
         sum_exp = fmaf(sum_exp, alpha, beta);
         max_l = new_max;
     }
 
-    float res = o_acc / fmaxf(sum_exp, 1e-30f);
+    const float inv_s = 1.0f / fmaxf(sum_exp, 1e-30f);
+    o0 *= inv_s; o1 *= inv_s; o2 *= inv_s; o3 *= inv_s;
     if (gate_attn != nullptr) {
-        const float g = gate_attn[(static_cast<size_t>(m) * n_q_heads + qh) * 128 + d];
-        res *= 1.0f / (1.0f + __expf(-g));
+        const float4 gv = *reinterpret_cast<const float4*>(gate_attn + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0);
+        o0 *= 1.0f / (1.0f + __expf(-gv.x));
+        o1 *= 1.0f / (1.0f + __expf(-gv.y));
+        o2 *= 1.0f / (1.0f + __expf(-gv.z));
+        o3 *= 1.0f / (1.0f + __expf(-gv.w));
     }
-    O_out[(static_cast<size_t>(m) * n_q_heads + qh) * 128 + d] = res;
+    *reinterpret_cast<float4*>(O_out + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0) = make_float4(o0, o1, o2, o3);
+}
+
+// 4-Wave Split-KV Flash-SWA / Flash-GQA for small batches (M <= 8: B=1 decode & B=8 DSpark verify!):
+// Launches 1 block per (qh, m) = 24 blocks x 4 waves = 96 waves at B=1 (4x-8x faster at P=256..2048!).
+// Zero barrier in the entire KV loop; 1 single __syncthreads() at the end merges the 4 waves' online softmax!
+// Grid: (n_q_heads, M), Block: 128
+template <bool FP8_KV>
+__global__ void __launch_bounds__(128) k3_flash_swa_gqa_splitkv(
+    const float* __restrict__ Q,            // [M, n_q_heads, 128]
+    const float* __restrict__ gate_attn,    // nullptr or [M, n_q_heads, 128]
+    const float* __restrict__ rel_bias,     // nullptr or [M, n_q_heads, max_rel]
+    const float* __restrict__ sink_logit,   // nullptr or [M, n_q_heads]
+    const int32_t* __restrict__ slot_ids,   // [M]
+    const int32_t* __restrict__ pos,        // [M]
+    const int32_t* __restrict__ page_table, // [max_slots, max_pages_per_slot]
+    int max_pages_per_slot,
+    const void* __restrict__ k_pool,
+    const void* __restrict__ v_pool,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    float* __restrict__ O_out,
+    int M, int n_q_heads, int n_kv_heads, int swa_window, int max_rel) {
+    const int wave = threadIdx.x >> 5;  // 0..3 split across KV sequence!
+    const int lane = threadIdx.x & 31;
+    const int qh = blockIdx.x;
+    const int m = blockIdx.y;
+    if (qh >= n_q_heads || m >= M) return;
+
+    const int d0 = lane * 4;
+    const int kvh = qh / (n_q_heads / n_kv_heads);
+    const int slot = slot_ids[m];
+    const int cur_pos = pos[m];
+    const int k_start = (swa_window > 0 && cur_pos >= swa_window) ? (cur_pos - swa_window + 1) : 0;
+    const float scale = rsqrtf(128.0f);
+    const float4 qv = *reinterpret_cast<const float4*>(Q + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0);
+    const float q0 = qv.x * scale, q1 = qv.y * scale, q2 = qv.z * scale, q3 = qv.w * scale;
+
+    float max_l = (wave == 0 && sink_logit) ? sink_logit[static_cast<size_t>(m) * n_q_heads + qh] : -1e30f;
+    float sum_exp = (wave == 0 && sink_logit) ? 1.0f : 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    const int elems = n_kv_heads * 128;
+    const int kv_off = kvh * 128 + d0;
+    const float* rb_row = rel_bias ? (rel_bias + (static_cast<size_t>(m) * n_q_heads + qh) * max_rel) : nullptr;
+    const int32_t* pt_row = page_table + slot * max_pages_per_slot;
+
+    for (int kp = k_start + wave; kp <= cur_pos; kp += 4) {
+        const int ring_p = (swa_window > 0) ? (kp % swa_window) : kp;
+        const int phys = pt_row[ring_p >> 6];
+        const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
+        const size_t base = tok_base * elems + kv_off;
+
+        float k0, k1, k2, k3, v0, v1, v2, v3;
+        if constexpr (FP8_KV) {
+            const float ks = k_scales ? k_scales[tok_base] : 1.0f;
+            const float vs = v_scales ? v_scales[tok_base] : 1.0f;
+            const uint32_t kw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(k_pool) + base);
+            const uint32_t vw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(v_pool) + base);
+            k0 = e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks;
+            k1 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks;
+            k2 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks;
+            k3 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks;
+            v0 = e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs;
+            v1 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs;
+            v2 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs;
+            v3 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs;
+        } else {
+            const uint2 kw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(k_pool) + base);
+            const uint2 vw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(v_pool) + base);
+            h2_unpack(kw.x, k0, k1); h2_unpack(kw.y, k2, k3);
+            h2_unpack(vw.x, v0, v1); h2_unpack(vw.y, v2, v3);
+        }
+
+        float sc = wave32_sum(fmaf(q0, k0, fmaf(q1, k1, fmaf(q2, k2, q3 * k3))));
+        const int dist = cur_pos - kp;
+        if (rb_row && dist < max_rel) sc += rb_row[dist];
+
+        const float new_max = fmaxf(max_l, sc);
+        const float alpha = __expf(max_l - new_max);
+        const float beta = __expf(sc - new_max);
+        o0 = fmaf(o0, alpha, beta * v0);
+        o1 = fmaf(o1, alpha, beta * v1);
+        o2 = fmaf(o2, alpha, beta * v2);
+        o3 = fmaf(o3, alpha, beta * v3);
+        sum_exp = fmaf(sum_exp, alpha, beta);
+        max_l = new_max;
+    }
+
+    // 1 single __syncthreads() to merge the 4 waves' online-softmax accumulators!
+    __shared__ float s_max[4];
+    __shared__ float s_sum[4];
+    __shared__ alignas(16) float4 s_o[4][32];
+    if (lane == 0) { s_max[wave] = max_l; s_sum[wave] = sum_exp; }
+    s_o[wave][lane] = make_float4(o0, o1, o2, o3);
+    __syncthreads();
+
+    if (wave == 0) {
+        const float gmax = fmaxf(fmaxf(s_max[0], s_max[1]), fmaxf(s_max[2], s_max[3]));
+        float w0 = (s_sum[0] > 0.0f) ? __expf(s_max[0] - gmax) : 0.0f;
+        float w1 = (s_sum[1] > 0.0f) ? __expf(s_max[1] - gmax) : 0.0f;
+        float w2 = (s_sum[2] > 0.0f) ? __expf(s_max[2] - gmax) : 0.0f;
+        float w3 = (s_sum[3] > 0.0f) ? __expf(s_max[3] - gmax) : 0.0f;
+        const float tot_s = w0 * s_sum[0] + w1 * s_sum[1] + w2 * s_sum[2] + w3 * s_sum[3];
+        const float inv_s = 1.0f / fmaxf(tot_s, 1e-30f);
+        w0 *= inv_s; w1 *= inv_s; w2 *= inv_s; w3 *= inv_s;
+        const float4 p0 = s_o[0][lane], p1 = s_o[1][lane], p2 = s_o[2][lane], p3 = s_o[3][lane];
+        float r0 = w0 * p0.x + w1 * p1.x + w2 * p2.x + w3 * p3.x;
+        float r1 = w0 * p0.y + w1 * p1.y + w2 * p2.y + w3 * p3.y;
+        float r2 = w0 * p0.z + w1 * p1.z + w2 * p2.z + w3 * p3.z;
+        float r3 = w0 * p0.w + w1 * p1.w + w2 * p2.w + w3 * p3.w;
+        if (gate_attn != nullptr) {
+            const float4 gv = *reinterpret_cast<const float4*>(gate_attn + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0);
+            r0 *= 1.0f / (1.0f + __expf(-gv.x));
+            r1 *= 1.0f / (1.0f + __expf(-gv.y));
+            r2 *= 1.0f / (1.0f + __expf(-gv.z));
+            r3 *= 1.0f / (1.0f + __expf(-gv.w));
+        }
+        *reinterpret_cast<float4*>(O_out + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0) = make_float4(r0, r1, r2, r3);
+    }
 }
 
 // =================================================================================================
@@ -731,33 +862,51 @@ __global__ void __launch_bounds__(128) k4_moe_router_topk(
     const int m = blockIdx.x;
     if (m >= M) return;
     const int e = threadIdx.x;
+    const int wave = e >> 5;
+    const int lane = e & 31;
 
     __shared__ float s_prob[128];
-    __shared__ float s_score[128];
+    __shared__ float s_wmax[4];
+    __shared__ int32_t s_wid[4];
+    __shared__ int32_t s_chosen[8];
 
     const float lg = logits[static_cast<size_t>(m) * 128 + e];
     // Inkling-2-Mini exact sigmoid router!
     const float p = 1.0f / (1.0f + __expf(-lg));
     s_prob[e] = p;
-    s_score[e] = p + (bias ? bias[e] : 0.0f);
+    float my_sc = p + (bias ? bias[e] : 0.0f);
     __syncthreads();
 
+    // 4-Wave parallel deterministic Top-K argmax (strictly greater, smallest eid wins ties -> 8x faster than 1-thread!)
+    for (int k = 0; k < K_top; ++k) {
+        float bv = my_sc;
+        int32_t bi = e;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor(bv, off, 32);
+            const int32_t oi = __shfl_xor(bi, off, 32);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { s_wmax[wave] = bv; s_wid[wave] = bi; }
+        __syncthreads();
+        if (e == 0) {
+            float gv = s_wmax[0]; int32_t gi = s_wid[0];
+            for (int w = 1; w < 4; ++w) {
+                if (s_wmax[w] > gv || (s_wmax[w] == gv && s_wid[w] < gi)) { gv = s_wmax[w]; gi = s_wid[w]; }
+            }
+            s_chosen[k] = gi;
+        }
+        __syncthreads();
+        if (e == s_chosen[k]) my_sc = -1e30f;
+    }
     if (e == 0) {
         float wsum = 0.0f;
         for (int k = 0; k < K_top; ++k) {
-            int best_e = 0;
-            float best_s = -1e30f;
-            for (int i = 0; i < 128; ++i) {
-                if (s_score[i] > best_s) {  // strictly greater scanning 0..127 -> smallest eid wins ties!
-                    best_s = s_score[i];
-                    best_e = i;
-                }
-            }
+            const int best_e = s_chosen[k];
             topk_ids[m * K_top + k] = best_e;
             const float w = s_prob[best_e];
             topk_weights[m * K_top + k] = w;
             wsum += w;
-            s_score[best_e] = -1e30f;
         }
         const float inv_w = route_scale / (wsum + 1e-20f);
         for (int k = 0; k < K_top; ++k) topk_weights[m * K_top + k] *= inv_w;
@@ -796,7 +945,10 @@ __global__ void __launch_bounds__(256) k5_dspark_markov_rnn_update(
     const int in_dim = 2 * rank + 2 * D;
     const float* mw_row = markov_w1 + static_cast<size_t>(prev_tok) * rank;
 
+    __shared__ float s_state[256];
     __shared__ float s_latent[256];
+    if (tid < rank) s_state[tid] = state[tid];
+    __syncthreads();
 
     // 1. Compute 3*rank projections using 8 waves (each wave handles 1 row per iteration)
     for (int r0 = 0; r0 < rank; r0 += 8) {
@@ -807,7 +959,7 @@ __global__ void __launch_bounds__(256) k5_dspark_markov_rnn_update(
             const float* w1 = rnn_proj_w + static_cast<size_t>(rank + r) * in_dim;
             const float* w2 = rnn_proj_w + static_cast<size_t>(2 * rank + r) * in_dim;
             for (int i = lane; i < rank; i += 32) {
-                const float sv = state[i];
+                const float sv = s_state[i];
                 const float mv = mw_row[i];
                 d0 = fmaf(w0[i], sv, fmaf(w0[rank + i], mv, d0));
                 d1 = fmaf(w1[i], sv, fmaf(w1[rank + i], mv, d1));
@@ -826,7 +978,7 @@ __global__ void __launch_bounds__(256) k5_dspark_markov_rnn_update(
             if (lane == 0) {
                 const float gate = 1.0f / (1.0f + __expf(-d0));
                 const float cand = tanhf(d1);
-                state[r] = fmaf(gate, state[r] - cand, cand);
+                state[r] = fmaf(gate, s_state[r] - cand, cand);
                 s_latent[r] = tanhf(d2);
             }
         }
@@ -840,6 +992,99 @@ __global__ void __launch_bounds__(256) k5_dspark_markov_rnn_update(
         for (int r = 0; r < rank; ++r) acc = fmaf(wh[r], s_latent[r], acc);
         corr_out[d] = acc;
     }
+}
+
+// Multi-CU Parallel Markov RNN Step A1: 32 blocks x 8 waves = 256 waves (1 wave per r=0..255!)
+// Eliminates single-CU bottleneck on [768, 5120] F32 rnn_proj_w (25x faster than 1-block version!).
+__global__ void __launch_bounds__(256) k5_dspark_markov_proj(
+    const int32_t* __restrict__ prev_tok_ptr,
+    const float* __restrict__ state_in,        // [rank]
+    float* __restrict__ state_out,             // [rank] (double-buffered -> zero race!)
+    float* __restrict__ latent_out,            // [rank]
+    const float* __restrict__ hidden,          // [D]
+    const float* __restrict__ context,         // [D]
+    const float* __restrict__ markov_w1,       // [V, rank]
+    const float* __restrict__ rnn_proj_w,      // [3*rank, 2*rank + 2*D]
+    const float* __restrict__ rnn_proj_b,      // [3*rank]
+    int D, int rank) {
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.x * 8 + wave;
+    if (r >= rank) return;
+
+    const int prev_tok = *prev_tok_ptr;
+    const int in_dim = 2 * rank + 2 * D;
+    const float* mw_row = markov_w1 + static_cast<size_t>(prev_tok) * rank;
+    const float* w0 = rnn_proj_w + static_cast<size_t>(r) * in_dim;
+    const float* w1 = rnn_proj_w + static_cast<size_t>(rank + r) * in_dim;
+    const float* w2 = rnn_proj_w + static_cast<size_t>(2 * rank + r) * in_dim;
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
+    for (int i = lane * 4; i < rank; i += 128) {
+        const float4 sv = *reinterpret_cast<const float4*>(state_in + i);
+        const float4 mv = *reinterpret_cast<const float4*>(mw_row + i);
+        const float4 a0 = *reinterpret_cast<const float4*>(w0 + i);
+        const float4 b0 = *reinterpret_cast<const float4*>(w0 + rank + i);
+        const float4 a1 = *reinterpret_cast<const float4*>(w1 + i);
+        const float4 b1 = *reinterpret_cast<const float4*>(w1 + rank + i);
+        const float4 a2 = *reinterpret_cast<const float4*>(w2 + i);
+        const float4 b2 = *reinterpret_cast<const float4*>(w2 + rank + i);
+        d0 = fmaf(a0.x, sv.x, fmaf(a0.y, sv.y, fmaf(a0.z, sv.z, fmaf(a0.w, sv.w, d0))));
+        d0 = fmaf(b0.x, mv.x, fmaf(b0.y, mv.y, fmaf(b0.z, mv.z, fmaf(b0.w, mv.w, d0))));
+        d1 = fmaf(a1.x, sv.x, fmaf(a1.y, sv.y, fmaf(a1.z, sv.z, fmaf(a1.w, sv.w, d1))));
+        d1 = fmaf(b1.x, mv.x, fmaf(b1.y, mv.y, fmaf(b1.z, mv.z, fmaf(b1.w, mv.w, d1))));
+        d2 = fmaf(a2.x, sv.x, fmaf(a2.y, sv.y, fmaf(a2.z, sv.z, fmaf(a2.w, sv.w, d2))));
+        d2 = fmaf(b2.x, mv.x, fmaf(b2.y, mv.y, fmaf(b2.z, mv.z, fmaf(b2.w, mv.w, d2))));
+    }
+    const int off_h = 2 * rank;
+    const int off_c = 2 * rank + D;
+    for (int i = lane * 4; i < D; i += 128) {
+        const float4 hv = *reinterpret_cast<const float4*>(hidden + i);
+        const float4 cv = *reinterpret_cast<const float4*>(context + i);
+        const float4 a0 = *reinterpret_cast<const float4*>(w0 + off_h + i);
+        const float4 b0 = *reinterpret_cast<const float4*>(w0 + off_c + i);
+        const float4 a1 = *reinterpret_cast<const float4*>(w1 + off_h + i);
+        const float4 b1 = *reinterpret_cast<const float4*>(w1 + off_c + i);
+        const float4 a2 = *reinterpret_cast<const float4*>(w2 + off_h + i);
+        const float4 b2 = *reinterpret_cast<const float4*>(w2 + off_c + i);
+        d0 = fmaf(a0.x, hv.x, fmaf(a0.y, hv.y, fmaf(a0.z, hv.z, fmaf(a0.w, hv.w, d0))));
+        d0 = fmaf(b0.x, cv.x, fmaf(b0.y, cv.y, fmaf(b0.z, cv.z, fmaf(b0.w, cv.w, d0))));
+        d1 = fmaf(a1.x, hv.x, fmaf(a1.y, hv.y, fmaf(a1.z, hv.z, fmaf(a1.w, hv.w, d1))));
+        d1 = fmaf(b1.x, cv.x, fmaf(b1.y, cv.y, fmaf(b1.z, cv.z, fmaf(b1.w, cv.w, d1))));
+        d2 = fmaf(a2.x, hv.x, fmaf(a2.y, hv.y, fmaf(a2.z, hv.z, fmaf(a2.w, hv.w, d2))));
+        d2 = fmaf(b2.x, cv.x, fmaf(b2.y, cv.y, fmaf(b2.z, cv.z, fmaf(b2.w, cv.w, d2))));
+    }
+    d0 = wave32_sum(d0) + rnn_proj_b[r];
+    d1 = wave32_sum(d1) + rnn_proj_b[rank + r];
+    d2 = wave32_sum(d2) + rnn_proj_b[2 * rank + r];
+    if (lane == 0) {
+        const float gate = 1.0f / (1.0f + __expf(-d0));
+        const float cand = tanhf(d1);
+        state_out[r] = fmaf(gate, state_in[r] - cand, cand);
+        latent_out[r] = tanhf(d2);
+    }
+}
+
+// Multi-CU Parallel Markov RNN Step A2: (D+7)/8 blocks x 8 waves -> 1 wave per output dim d! (< 10 us!)
+__global__ void __launch_bounds__(256) k5_dspark_markov_corr(
+    const float* __restrict__ latent,          // [rank]
+    const float* __restrict__ hidden_out_w,    // [D, rank]
+    const float* __restrict__ hidden_out_b,    // [D]
+    float* __restrict__ corr_out,              // [D]
+    int D, int rank) {
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int d = blockIdx.x * 8 + wave;
+    if (d >= D) return;
+    const float* wh = hidden_out_w + static_cast<size_t>(d) * rank;
+    float acc = 0.0f;
+    for (int r = lane * 4; r < rank; r += 128) {
+        const float4 wv = *reinterpret_cast<const float4*>(wh + r);
+        const float4 lv = *reinterpret_cast<const float4*>(latent + r);
+        acc = fmaf(wv.x, lv.x, fmaf(wv.y, lv.y, fmaf(wv.z, lv.z, fmaf(wv.w, lv.w, acc))));
+    }
+    acc = wave32_sum(acc) + hidden_out_b[d];
+    if (lane == 0) corr_out[d] = acc;
 }
 
 // Step B: Fused unembed bias + softcap + two-stage deterministic first-max argmax across V=200058!
@@ -1089,7 +1334,7 @@ __global__ void __launch_bounds__(256) k_scatter_add_expert(
 }
 
 // Project RelPos bias: rel_bias[m, h, d] = sum_{rc=0..d_rel-1} r[m, h, rc] * rel_proj[rc, d]
-// Only computes d in [0 .. active_extent-1] where active_extent = min(pos[m]+1, rel_extent) -> up to 16x faster!
+// Register-caches r[m, h, 0..15] once + vectorized float4 loads on rel_proj -> 3x faster at P=256..2048!
 // Grid: (n_heads, M), Block: 256
 __global__ void __launch_bounds__(256) k_relpos_bias_proj(
     const float* __restrict__ r_in,     // [M, n_heads, d_rel]
@@ -1103,12 +1348,40 @@ __global__ void __launch_bounds__(256) k_relpos_bias_proj(
     const int lim = pos ? min(pos[m] + 1, rel_extent) : rel_extent;
     const float* rh = r_in + (static_cast<size_t>(m) * n_heads + h) * d_rel;
     float* dst = rel_bias + (static_cast<size_t>(m) * n_heads + h) * rel_extent;
-    for (int d = threadIdx.x; d < lim; d += 256) {
-        float acc = 0.0f;
-        for (int rc = 0; rc < d_rel; ++rc) {
-            acc = fmaf(rh[rc], rel_proj[static_cast<size_t>(rc) * rel_extent + d], acc);
+
+    float rloc[16];
+    const int dr = min(d_rel, 16);
+#pragma unroll
+    for (int rc = 0; rc < 16; ++rc) rloc[rc] = (rc < dr) ? rh[rc] : 0.0f;
+
+    const int lim4 = lim >> 2;
+    const int tid = threadIdx.x;
+    if ((rel_extent & 3) == 0 && d_rel <= 16) {
+        for (int d4 = tid; d4 < lim4; d4 += 256) {
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#pragma unroll
+            for (int rc = 0; rc < 16; ++rc) {
+                if (rc < dr) {
+                    const float rv = rloc[rc];
+                    const float4 pv = *reinterpret_cast<const float4*>(rel_proj + static_cast<size_t>(rc) * rel_extent + d4 * 4);
+                    a0 = fmaf(rv, pv.x, a0); a1 = fmaf(rv, pv.y, a1);
+                    a2 = fmaf(rv, pv.z, a2); a3 = fmaf(rv, pv.w, a3);
+                }
+            }
+            *reinterpret_cast<float4*>(dst + d4 * 4) = make_float4(a0, a1, a2, a3);
         }
-        dst[d] = acc;
+        const int d_rem = (lim4 << 2) + tid;
+        if (d_rem < lim) {
+            float acc = 0.0f;
+            for (int rc = 0; rc < dr; ++rc) acc = fmaf(rloc[rc], rel_proj[static_cast<size_t>(rc) * rel_extent + d_rem], acc);
+            dst[d_rem] = acc;
+        }
+    } else {
+        for (int d = tid; d < lim; d += 256) {
+            float acc = 0.0f;
+            for (int rc = 0; rc < d_rel; ++rc) acc = fmaf(rh[rc], rel_proj[static_cast<size_t>(rc) * rel_extent + d], acc);
+            dst[d] = acc;
+        }
     }
 }
 
@@ -1191,8 +1464,8 @@ __global__ void __launch_bounds__(256) k_embed_lookup(
     }
 }
 
-// Multi-format Unembed + softcap(30.0) over vocab_unpadded for `n_want` hidden rows!
-// Grid: ((V + 7) / 8, n_want), Block: 256 (8 waves = 8 vocab rows!)
+// Multi-format Unembed + softcap(30.0) over vocab_unpadded for up to 8 hidden rows per block in ONE weight pass!
+// Grid: ((V + 7) / 8, (n_want + 7) / 8), Block: 256 (8 waves = 8 vocab rows; up to 8 tokens share every weight load!)
 __global__ void __launch_bounds__(256) k_unembed_softcap(
     const uint8_t* __restrict__ unemb_raw,
     int fmt, int vocab_rows,
@@ -1203,41 +1476,67 @@ __global__ void __launch_bounds__(256) k_unembed_softcap(
     const int wave = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int v = blockIdx.x * 8 + wave;
-    const int wi = blockIdx.y;
-    if (v >= V || wi >= n_want) return;
+    const int wi0 = blockIdx.y * 8;
+    if (v >= V || wi0 >= n_want) return;
+    const int n_loc = (n_want - wi0 < 8) ? (n_want - wi0) : 8;
 
-    const float* hb = h_norm + static_cast<size_t>(want_idx[wi]) * D;
-    float acc = 0.0f;
+    const float* hbs[8];
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        hbs[t] = (t < n_loc) ? (h_norm + static_cast<size_t>(want_idx[wi0 + t]) * D) : nullptr;
+    }
+
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
     if (fmt == 102) {
         const uint16_t* wr = reinterpret_cast<const uint16_t*>(unemb_raw) + static_cast<size_t>(v) * D;
-        for (int k = lane * 4; k < D; k += 128) {
-            const uint2 w4 = *reinterpret_cast<const uint2*>(wr + k);
-            const float4 xv = *reinterpret_cast<const float4*>(hb + k);
-            acc = fmaf(bf16_to_f32(w4.x & 0xFFFFu), xv.x, acc);
-            acc = fmaf(bf16_to_f32(w4.x >> 16), xv.y, acc);
-            acc = fmaf(bf16_to_f32(w4.y & 0xFFFFu), xv.z, acc);
-            acc = fmaf(bf16_to_f32(w4.y >> 16), xv.w, acc);
+        for (int k = lane * 8; k < D; k += 256) {
+            const uint4 w8 = *reinterpret_cast<const uint4*>(wr + k);
+            const float f0 = bf16_to_f32(w8.x & 0xFFFFu), f1 = bf16_to_f32(w8.x >> 16);
+            const float f2 = bf16_to_f32(w8.y & 0xFFFFu), f3 = bf16_to_f32(w8.y >> 16);
+            const float f4 = bf16_to_f32(w8.z & 0xFFFFu), f5 = bf16_to_f32(w8.z >> 16);
+            const float f6 = bf16_to_f32(w8.w & 0xFFFFu), f7 = bf16_to_f32(w8.w >> 16);
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                if (t < n_loc) {
+                    const float4 x0 = *reinterpret_cast<const float4*>(hbs[t] + k);
+                    const float4 x1 = *reinterpret_cast<const float4*>(hbs[t] + k + 4);
+                    acc[t] = fmaf(f0, x0.x, fmaf(f1, x0.y, fmaf(f2, x0.z, fmaf(f3, x0.w, acc[t]))));
+                    acc[t] = fmaf(f4, x1.x, fmaf(f5, x1.y, fmaf(f6, x1.z, fmaf(f7, x1.w, acc[t]))));
+                }
+            }
         }
     } else if (fmt == 101) {
         const float* wr = reinterpret_cast<const float*>(unemb_raw) + static_cast<size_t>(v) * D;
         for (int k = lane * 4; k < D; k += 128) {
             const float4 wv = *reinterpret_cast<const float4*>(wr + k);
-            const float4 xv = *reinterpret_cast<const float4*>(hb + k);
-            acc = fmaf(wv.x, xv.x, fmaf(wv.y, xv.y, fmaf(wv.z, xv.z, fmaf(wv.w, xv.w, acc))));
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                if (t < n_loc) {
+                    const float4 xv = *reinterpret_cast<const float4*>(hbs[t] + k);
+                    acc[t] = fmaf(wv.x, xv.x, fmaf(wv.y, xv.y, fmaf(wv.z, xv.z, fmaf(wv.w, xv.w, acc[t]))));
+                }
+            }
         }
     } else if (fmt == 100) {
         const float sc = reinterpret_cast<const float*>(unemb_raw)[v];
         const int8_t* wr = reinterpret_cast<const int8_t*>(unemb_raw + static_cast<size_t>(vocab_rows) * 4) + static_cast<size_t>(v) * D;
         for (int k = lane * 4; k < D; k += 128) {
             const uint32_t w4 = *reinterpret_cast<const uint32_t*>(wr + k);
-            const float4 xv = *reinterpret_cast<const float4*>(hb + k);
-            acc = fmaf(static_cast<float>(static_cast<int8_t>(w4 & 0xFFu)), xv.x, acc);
-            acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 8) & 0xFFu)), xv.y, acc);
-            acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 16) & 0xFFu)), xv.z, acc);
-            acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 24) & 0xFFu)), xv.w, acc);
+            const float f0 = static_cast<float>(static_cast<int8_t>(w4 & 0xFFu));
+            const float f1 = static_cast<float>(static_cast<int8_t>((w4 >> 8) & 0xFFu));
+            const float f2 = static_cast<float>(static_cast<int8_t>((w4 >> 16) & 0xFFu));
+            const float f3 = static_cast<float>(static_cast<int8_t>((w4 >> 24) & 0xFFu));
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                if (t < n_loc) {
+                    const float4 xv = *reinterpret_cast<const float4*>(hbs[t] + k);
+                    acc[t] = fmaf(f0, xv.x, fmaf(f1, xv.y, fmaf(f2, xv.z, fmaf(f3, xv.w, acc[t]))));
+                }
+            }
         }
-        acc *= sc;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) acc[t] *= sc;
     } else {
         const int sb_b = sk_sb_bytes(fmt);
         const int nsb = D >> 8;
@@ -1246,25 +1545,39 @@ __global__ void __launch_bounds__(256) k_unembed_softcap(
             const uint8_t* blk = wr + static_cast<size_t>(s) * sb_b;
             const int j0 = lane * 8;
             const float eff = decode_sk_sub_eff_i8(blk, fmt, j0 >> 6);
-            const uint8_t* pl = blk + 6;
-            const float* xp = hb + (s << 8) + j0;
-            float d = 0.0f;
+            const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, fmt, j0);
+            const int base = (s << 8) + j0;
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                d = fmaf(static_cast<float>(decode_sk_w_i8(pl, fmt, j0 + i)), xp[i], d);
+            for (int t = 0; t < 8; ++t) {
+                if (t < n_loc) {
+                    const float4 x0 = *reinterpret_cast<const float4*>(hbs[t] + base);
+                    const float4 x1 = *reinterpret_cast<const float4*>(hbs[t] + base + 4);
+                    const uint32_t h0 = h2_pack(x0.x, x0.y), h1 = h2_pack(x0.z, x0.w);
+                    const uint32_t h2 = h2_pack(x1.x, x1.y), h3 = h2_pack(x1.z, x1.w);
+                    float d = fdot2_f32(wv.x, h0, 0.0f);
+                    d = fdot2_f32(wv.y, h1, d);
+                    d = fdot2_f32(wv.z, h2, d);
+                    d = fdot2_f32(wv.w, h3, d);
+                    acc[t] = fmaf(d, eff, acc[t]);
+                }
             }
-            acc = fmaf(d, eff, acc);
         }
     }
 
-    const float z = wave32_sum(acc);
-    if (lane == 0) {
-        logits_out[static_cast<size_t>(wi) * V + v] = softcap * tanhf(z / softcap);
+    const float inv_cap = 1.0f / softcap;
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        if (t < n_loc) {
+            const float z = wave32_sum(acc[t]);
+            if (lane == 0) {
+                logits_out[static_cast<size_t>(wi0 + t) * V + v] = softcap * tanhf(z * inv_cap);
+            }
+        }
     }
 }
 
 // Multi-format DSpark combined unembed argmax stage 1: computes dot(unemb[v], combined) for all V, deterministic first-max!
-// (Exploits exact identity: softcap(z) is strictly monotone AND base_logits + unembed@corr == unembed@(cur+corr)!)
+// Uses LDS-cached FP16 combined vector + fast 32-bit S_K unpack + fdot2_f32 for 3x faster Markov drafting!
 __global__ void __launch_bounds__(256) k5_dspark_packed_argmax_stage1(
     const uint8_t* __restrict__ unemb_raw,
     int fmt, int vocab_rows,
@@ -1277,6 +1590,15 @@ __global__ void __launch_bounds__(256) k5_dspark_packed_argmax_stage1(
     const int wave = tid >> 5;
     const int lane = tid & 31;
 
+    __shared__ alignas(16) float s_comb[2304];
+    __shared__ alignas(16) half_t s_comb_h[2304];
+    for (int d = tid; d < D; d += 256) {
+        const float c = cur_step[d] + corr[d];
+        s_comb[d] = c;
+        s_comb_h[d] = static_cast<half_t>(c);
+    }
+    __syncthreads();
+
     float best_v = -1e30f;
     int32_t best_i = V;
     const int stride = gridDim.x * 8;
@@ -1287,32 +1609,29 @@ __global__ void __launch_bounds__(256) k5_dspark_packed_argmax_stage1(
             const uint16_t* wr = reinterpret_cast<const uint16_t*>(unemb_raw) + static_cast<size_t>(v) * D;
             for (int k = lane * 4; k < D; k += 128) {
                 const uint2 w4 = *reinterpret_cast<const uint2*>(wr + k);
-                const float4 cv = *reinterpret_cast<const float4*>(cur_step + k);
-                const float4 dv = *reinterpret_cast<const float4*>(corr + k);
-                acc = fmaf(bf16_to_f32(w4.x & 0xFFFFu), cv.x + dv.x, acc);
-                acc = fmaf(bf16_to_f32(w4.x >> 16), cv.y + dv.y, acc);
-                acc = fmaf(bf16_to_f32(w4.y & 0xFFFFu), cv.z + dv.z, acc);
-                acc = fmaf(bf16_to_f32(w4.y >> 16), cv.w + dv.w, acc);
+                const float4 cv = *reinterpret_cast<const float4*>(s_comb + k);
+                acc = fmaf(bf16_to_f32(w4.x & 0xFFFFu), cv.x, acc);
+                acc = fmaf(bf16_to_f32(w4.x >> 16), cv.y, acc);
+                acc = fmaf(bf16_to_f32(w4.y & 0xFFFFu), cv.z, acc);
+                acc = fmaf(bf16_to_f32(w4.y >> 16), cv.w, acc);
             }
         } else if (fmt == 101) {
             const float* wr = reinterpret_cast<const float*>(unemb_raw) + static_cast<size_t>(v) * D;
             for (int k = lane * 4; k < D; k += 128) {
                 const float4 wv = *reinterpret_cast<const float4*>(wr + k);
-                const float4 cv = *reinterpret_cast<const float4*>(cur_step + k);
-                const float4 dv = *reinterpret_cast<const float4*>(corr + k);
-                acc = fmaf(wv.x, cv.x + dv.x, fmaf(wv.y, cv.y + dv.y, fmaf(wv.z, cv.z + dv.z, fmaf(wv.w, cv.w + dv.w, acc))));
+                const float4 cv = *reinterpret_cast<const float4*>(s_comb + k);
+                acc = fmaf(wv.x, cv.x, fmaf(wv.y, cv.y, fmaf(wv.z, cv.z, fmaf(wv.w, cv.w, acc))));
             }
         } else if (fmt == 100) {
             const float sc = reinterpret_cast<const float*>(unemb_raw)[v];
             const int8_t* wr = reinterpret_cast<const int8_t*>(unemb_raw + static_cast<size_t>(vocab_rows) * 4) + static_cast<size_t>(v) * D;
             for (int k = lane * 4; k < D; k += 128) {
                 const uint32_t w4 = *reinterpret_cast<const uint32_t*>(wr + k);
-                const float4 cv = *reinterpret_cast<const float4*>(cur_step + k);
-                const float4 dv = *reinterpret_cast<const float4*>(corr + k);
-                acc = fmaf(static_cast<float>(static_cast<int8_t>(w4 & 0xFFu)), cv.x + dv.x, acc);
-                acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 8) & 0xFFu)), cv.y + dv.y, acc);
-                acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 16) & 0xFFu)), cv.z + dv.z, acc);
-                acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 24) & 0xFFu)), cv.w + dv.w, acc);
+                const float4 cv = *reinterpret_cast<const float4*>(s_comb + k);
+                acc = fmaf(static_cast<float>(static_cast<int8_t>(w4 & 0xFFu)), cv.x, acc);
+                acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 8) & 0xFFu)), cv.y, acc);
+                acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 16) & 0xFFu)), cv.z, acc);
+                acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 24) & 0xFFu)), cv.w, acc);
             }
             acc *= sc;
         } else {
@@ -1323,13 +1642,12 @@ __global__ void __launch_bounds__(256) k5_dspark_packed_argmax_stage1(
                 const uint8_t* blk = wr + static_cast<size_t>(s) * sb_b;
                 const int j0 = lane * 8;
                 const float eff = decode_sk_sub_eff_i8(blk, fmt, j0 >> 6);
-                const uint8_t* pl = blk + 6;
-                const int base = (s << 8) + j0;
-                float d = 0.0f;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    d = fmaf(static_cast<float>(decode_sk_w_i8(pl, fmt, j0 + i)), cur_step[base + i] + corr[base + i], d);
-                }
+                const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, fmt, j0);
+                const uint4 xv = *reinterpret_cast<const uint4*>(s_comb_h + (s << 8) + j0);
+                float d = fdot2_f32(wv.x, xv.x, 0.0f);
+                d = fdot2_f32(wv.y, xv.y, d);
+                d = fdot2_f32(wv.z, xv.z, d);
+                d = fdot2_f32(wv.w, xv.w, d);
                 acc = fmaf(d, eff, acc);
             }
         }
@@ -1345,6 +1663,261 @@ __global__ void __launch_bounds__(256) k5_dspark_packed_argmax_stage1(
     __shared__ float s_val[8];
     __shared__ int32_t s_id[8];
     if (lane == 0) { s_val[wave] = best_v; s_id[wave] = best_i; }
+    __syncthreads();
+    if (tid == 0) {
+        float bv = -1e30f;
+        int32_t bi = V;
+        for (int w = 0; w < 8; ++w) {
+            if (s_val[w] > bv || (s_val[w] == bv && s_id[w] < bi)) { bv = s_val[w]; bi = s_id[w]; }
+        }
+        blk_max_val[blockIdx.x] = bv;
+        blk_max_id[blockIdx.x] = bi;
+    }
+}
+
+// Single-Pass Multi-Step DSpark Base Unembed Top-2 Candidate Screen (7x LESS UNEMBED BANDWIDTH!!):
+// Reads unembed[V, D] ONCE across ALL n_draft (<= 7) cur[1..n_draft] rows simultaneously!
+// Grid: (512,), Block: 256 (8 waves/block) -> writes top-2 (val, id) per block = 1,024 top candidates per step!
+__global__ void __launch_bounds__(256) k5_dspark_base_top2_screen(
+    const uint8_t* __restrict__ unemb_raw,
+    int fmt, int vocab_rows,
+    const float* __restrict__ cur_steps,    // [n_draft, D] (cur + 1 * D)
+    float* __restrict__ cand_val,           // [n_draft, gridDim.x * 2]
+    int32_t* __restrict__ cand_id,          // [n_draft, gridDim.x * 2]
+    int n_draft, int D, int V) {
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+
+    // Cache FP16 cur_steps[7][2304] in LDS (32.3 KB) for fast S_K fdot2_f32!
+    __shared__ alignas(16) half_t s_cur_h[7 * 2304];
+    if (fmt < 100) {
+        const int tot = n_draft * D;
+        for (int idx = tid; idx < tot; idx += 256) {
+            s_cur_h[idx] = static_cast<half_t>(cur_steps[idx]);
+        }
+        __syncthreads();
+    }
+
+    float best1_v[7], best2_v[7];
+    int32_t best1_i[7], best2_i[7];
+#pragma unroll
+    for (int t = 0; t < 7; ++t) {
+        best1_v[t] = -1e30f; best2_v[t] = -1e30f;
+        best1_i[t] = V;      best2_i[t] = V;
+    }
+
+    const int stride = gridDim.x * 8;
+    for (int v = blockIdx.x * 8 + wave; v < V; v += stride) {
+        float acc[7] = {0, 0, 0, 0, 0, 0, 0};
+        if (fmt == 102) {
+            const uint16_t* wr = reinterpret_cast<const uint16_t*>(unemb_raw) + static_cast<size_t>(v) * D;
+            for (int k = lane * 8; k < D; k += 256) {
+                const uint4 w8 = *reinterpret_cast<const uint4*>(wr + k);
+                const float f0 = bf16_to_f32(w8.x & 0xFFFFu), f1 = bf16_to_f32(w8.x >> 16);
+                const float f2 = bf16_to_f32(w8.y & 0xFFFFu), f3 = bf16_to_f32(w8.y >> 16);
+                const float f4 = bf16_to_f32(w8.z & 0xFFFFu), f5 = bf16_to_f32(w8.z >> 16);
+                const float f6 = bf16_to_f32(w8.w & 0xFFFFu), f7 = bf16_to_f32(w8.w >> 16);
+#pragma unroll
+                for (int t = 0; t < 7; ++t) {
+                    if (t < n_draft) {
+                        const float* cp = cur_steps + static_cast<size_t>(t) * D + k;
+                        const float4 c0 = *reinterpret_cast<const float4*>(cp);
+                        const float4 c1 = *reinterpret_cast<const float4*>(cp + 4);
+                        acc[t] = fmaf(f0, c0.x, fmaf(f1, c0.y, fmaf(f2, c0.z, fmaf(f3, c0.w, acc[t]))));
+                        acc[t] = fmaf(f4, c1.x, fmaf(f5, c1.y, fmaf(f6, c1.z, fmaf(f7, c1.w, acc[t]))));
+                    }
+                }
+            }
+        } else if (fmt == 101) {
+            const float* wr = reinterpret_cast<const float*>(unemb_raw) + static_cast<size_t>(v) * D;
+            for (int k = lane * 4; k < D; k += 128) {
+                const float4 wv = *reinterpret_cast<const float4*>(wr + k);
+#pragma unroll
+                for (int t = 0; t < 7; ++t) {
+                    if (t < n_draft) {
+                        const float4 cv = *reinterpret_cast<const float4*>(cur_steps + static_cast<size_t>(t) * D + k);
+                        acc[t] = fmaf(wv.x, cv.x, fmaf(wv.y, cv.y, fmaf(wv.z, cv.z, fmaf(wv.w, cv.w, acc[t]))));
+                    }
+                }
+            }
+        } else if (fmt == 100) {
+            const float sc = reinterpret_cast<const float*>(unemb_raw)[v];
+            const int8_t* wr = reinterpret_cast<const int8_t*>(unemb_raw + static_cast<size_t>(vocab_rows) * 4) + static_cast<size_t>(v) * D;
+            for (int k = lane * 4; k < D; k += 128) {
+                const uint32_t w4 = *reinterpret_cast<const uint32_t*>(wr + k);
+                const float f0 = static_cast<float>(static_cast<int8_t>(w4 & 0xFFu));
+                const float f1 = static_cast<float>(static_cast<int8_t>((w4 >> 8) & 0xFFu));
+                const float f2 = static_cast<float>(static_cast<int8_t>((w4 >> 16) & 0xFFu));
+                const float f3 = static_cast<float>(static_cast<int8_t>((w4 >> 24) & 0xFFu));
+#pragma unroll
+                for (int t = 0; t < 7; ++t) {
+                    if (t < n_draft) {
+                        const float4 cv = *reinterpret_cast<const float4*>(cur_steps + static_cast<size_t>(t) * D + k);
+                        acc[t] = fmaf(f0, cv.x, fmaf(f1, cv.y, fmaf(f2, cv.z, fmaf(f3, cv.w, acc[t]))));
+                    }
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < 7; ++t) acc[t] *= sc;
+        } else {
+            const int sb_b = sk_sb_bytes(fmt);
+            const int nsb = D >> 8;
+            const uint8_t* wr = unemb_raw + static_cast<size_t>(v) * nsb * sb_b;
+            for (int s = 0; s < nsb; ++s) {
+                const uint8_t* blk = wr + static_cast<size_t>(s) * sb_b;
+                const int j0 = lane * 8;
+                const float eff = decode_sk_sub_eff_i8(blk, fmt, j0 >> 6);
+                const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, fmt, j0);
+                const int base = (s << 8) + j0;
+#pragma unroll
+                for (int t = 0; t < 7; ++t) {
+                    if (t < n_draft) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(s_cur_h + t * 2304 + base);
+                        float d = fdot2_f32(wv.x, xv.x, 0.0f);
+                        d = fdot2_f32(wv.y, xv.y, d);
+                        d = fdot2_f32(wv.z, xv.z, d);
+                        d = fdot2_f32(wv.w, xv.w, d);
+                        acc[t] = fmaf(d, eff, acc[t]);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < 7; ++t) {
+            if (t < n_draft) {
+                const float z = wave32_sum(acc[t]);
+                if (lane == 0) {
+                    if (z > best1_v[t] || (z == best1_v[t] && v < best1_i[t])) {
+                        best2_v[t] = best1_v[t]; best2_i[t] = best1_i[t];
+                        best1_v[t] = z;          best1_i[t] = v;
+                    } else if (z > best2_v[t] || (z == best2_v[t] && v < best2_i[t])) {
+                        best2_v[t] = z;          best2_i[t] = v;
+                    }
+                }
+            }
+        }
+    }
+
+    __shared__ float s_v[7 * 16];
+    __shared__ int32_t s_i[7 * 16];
+    if (lane == 0) {
+        for (int t = 0; t < n_draft; ++t) {
+            s_v[t * 16 + wave * 2 + 0] = best1_v[t];
+            s_i[t * 16 + wave * 2 + 0] = best1_i[t];
+            s_v[t * 16 + wave * 2 + 1] = best2_v[t];
+            s_i[t * 16 + wave * 2 + 1] = best2_i[t];
+        }
+    }
+    __syncthreads();
+    if (tid < n_draft) {
+        const int t = tid;
+        float b1 = -1e30f, b2 = -1e30f;
+        int32_t i1 = V, i2 = V;
+        for (int k = 0; k < 16; ++k) {
+            const float val = s_v[t * 16 + k];
+            const int32_t id = s_i[t * 16 + k];
+            if (val > b1 || (val == b1 && id < i1)) {
+                b2 = b1; i2 = i1;
+                b1 = val; i1 = id;
+            } else if (val > b2 || (val == b2 && id < i2)) {
+                b2 = val; i2 = id;
+            }
+        }
+        const int out_stride = gridDim.x * 2;
+        cand_val[t * out_stride + blockIdx.x * 2 + 0] = b1;
+        cand_id[t * out_stride + blockIdx.x * 2 + 0]  = i1;
+        cand_val[t * out_stride + blockIdx.x * 2 + 1] = b2;
+        cand_id[t * out_stride + blockIdx.x * 2 + 1]  = i2;
+    }
+}
+
+// Fast 1,024-Candidate Markov Argmax Stage 1: scores ONLY the shortlisted candidates (< 0.02 ms/step!)
+// Grid: ((n_cand + 7) / 8,), Block: 256 (8 waves = 8 candidates/block)
+__global__ void __launch_bounds__(256) k5_dspark_cand_argmax_stage1(
+    const uint8_t* __restrict__ unemb_raw,
+    int fmt, int vocab_rows,
+    const float* __restrict__ cand_base_val, // [n_cand]
+    const int32_t* __restrict__ cand_id,     // [n_cand]
+    const float* __restrict__ corr,          // [D]
+    float* __restrict__ blk_max_val,
+    int32_t* __restrict__ blk_max_id,
+    int n_cand, int D, int V) {
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+
+    __shared__ alignas(16) float s_corr[2304];
+    __shared__ alignas(16) half_t s_corr_h[2304];
+    for (int d = tid; d < D; d += 256) {
+        const float c = corr[d];
+        s_corr[d] = c;
+        s_corr_h[d] = static_cast<half_t>(c);
+    }
+    __syncthreads();
+
+    const int ci = blockIdx.x * 8 + wave;
+    float my_v = -1e30f;
+    int32_t my_i = V;
+    if (ci < n_cand) {
+        const int v = cand_id[ci];
+        if (v >= 0 && v < V) {
+            float acc = 0.0f;
+            if (fmt == 102) {
+                const uint16_t* wr = reinterpret_cast<const uint16_t*>(unemb_raw) + static_cast<size_t>(v) * D;
+                for (int k = lane * 8; k < D; k += 256) {
+                    const uint4 w8 = *reinterpret_cast<const uint4*>(wr + k);
+                    const float4 c0 = *reinterpret_cast<const float4*>(s_corr + k);
+                    const float4 c1 = *reinterpret_cast<const float4*>(s_corr + k + 4);
+                    acc = fmaf(bf16_to_f32(w8.x & 0xFFFFu), c0.x, fmaf(bf16_to_f32(w8.x >> 16), c0.y, acc));
+                    acc = fmaf(bf16_to_f32(w8.y & 0xFFFFu), c0.z, fmaf(bf16_to_f32(w8.y >> 16), c0.w, acc));
+                    acc = fmaf(bf16_to_f32(w8.z & 0xFFFFu), c1.x, fmaf(bf16_to_f32(w8.z >> 16), c1.y, acc));
+                    acc = fmaf(bf16_to_f32(w8.w & 0xFFFFu), c1.z, fmaf(bf16_to_f32(w8.w >> 16), c1.w, acc));
+                }
+            } else if (fmt == 101) {
+                const float* wr = reinterpret_cast<const float*>(unemb_raw) + static_cast<size_t>(v) * D;
+                for (int k = lane * 4; k < D; k += 128) {
+                    const float4 wv = *reinterpret_cast<const float4*>(wr + k);
+                    const float4 cv = *reinterpret_cast<const float4*>(s_corr + k);
+                    acc = fmaf(wv.x, cv.x, fmaf(wv.y, cv.y, fmaf(wv.z, cv.z, fmaf(wv.w, cv.w, acc))));
+                }
+            } else if (fmt == 100) {
+                const float sc = reinterpret_cast<const float*>(unemb_raw)[v];
+                const int8_t* wr = reinterpret_cast<const int8_t*>(unemb_raw + static_cast<size_t>(vocab_rows) * 4) + static_cast<size_t>(v) * D;
+                for (int k = lane * 4; k < D; k += 128) {
+                    const uint32_t w4 = *reinterpret_cast<const uint32_t*>(wr + k);
+                    const float4 cv = *reinterpret_cast<const float4*>(s_corr + k);
+                    acc = fmaf(static_cast<float>(static_cast<int8_t>(w4 & 0xFFu)), cv.x, acc);
+                    acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 8) & 0xFFu)), cv.y, acc);
+                    acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 16) & 0xFFu)), cv.z, acc);
+                    acc = fmaf(static_cast<float>(static_cast<int8_t>((w4 >> 24) & 0xFFu)), cv.w, acc);
+                }
+                acc *= sc;
+            } else {
+                const int sb_b = sk_sb_bytes(fmt);
+                const int nsb = D >> 8;
+                const uint8_t* wr = unemb_raw + static_cast<size_t>(v) * nsb * sb_b;
+                for (int s = 0; s < nsb; ++s) {
+                    const uint8_t* blk = wr + static_cast<size_t>(s) * sb_b;
+                    const int j0 = lane * 8;
+                    const float eff = decode_sk_sub_eff_i8(blk, fmt, j0 >> 6);
+                    const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, fmt, j0);
+                    const uint4 xv = *reinterpret_cast<const uint4*>(s_corr_h + (s << 8) + j0);
+                    float d = fdot2_f32(wv.x, xv.x, 0.0f);
+                    d = fdot2_f32(wv.y, xv.y, d);
+                    d = fdot2_f32(wv.z, xv.z, d);
+                    d = fdot2_f32(wv.w, xv.w, d);
+                    acc = fmaf(d, eff, acc);
+                }
+            }
+            my_v = cand_base_val[ci] + wave32_sum(acc);
+            my_i = v;
+        }
+    }
+
+    __shared__ float s_val[8];
+    __shared__ int32_t s_id[8];
+    if (lane == 0) { s_val[wave] = my_v; s_id[wave] = my_i; }
     __syncthreads();
     if (tid == 0) {
         float bv = -1e30f;
@@ -1416,8 +1989,8 @@ __global__ void __launch_bounds__(256) k_dspark_fuse_mix(
     for (int d = tid; d < D; d += 256) dst[d] = dst[d] * inv * norm_w[d];
 }
 
-// DSpark Non-Causal Block-8 Attention (attending to ctx [c0..anchor_pos-1] in BF16 + B=8 draft tokens in F32)
-// Grid: (n_heads, B), Block: 128 (head_dim=128)
+// DSpark Non-Causal Block-8 Attention (Zero-Barrier Wave32: 1 wave per (hh, qi), 4 dims/lane, 4 heads/block!)
+// Grid: ((H + 3) / 4, B), Block: 128 -> ZERO LDS, ZERO __syncthreads(), coalesced uint2 BF16 / float4 loads!
 __global__ void __launch_bounds__(128) k_dspark_block_attn(
     const float* __restrict__ Q,          // [B, H, 128]
     const uint16_t* __restrict__ ctx_K,   // [max_ctx, KV, 128] BF16
@@ -1426,49 +1999,52 @@ __global__ void __launch_bounds__(128) k_dspark_block_attn(
     const float* __restrict__ drf_V,      // [B, KV, 128] F32
     float* __restrict__ O_out,            // [B, H, 128]
     int B, int H, int KV, int c0, int c_len) {
-    const int hh = blockIdx.x;
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int hh = blockIdx.x * 4 + wave;
     const int qi = blockIdx.y;
     if (hh >= H || qi >= B) return;
-    const int d = threadIdx.x;
-    const int wave = d >> 5;
-    const int lane = d & 31;
+    const int d0 = lane * 4;
     const int kvh = hh / (H / KV);
     const float scale = rsqrtf(128.0f);
-    const float qv = Q[(static_cast<size_t>(qi) * H + hh) * 128 + d] * scale;
+    const float4 qv = *reinterpret_cast<const float4*>(Q + (static_cast<size_t>(qi) * H + hh) * 128 + d0);
+    const float q0 = qv.x * scale, q1 = qv.y * scale, q2 = qv.z * scale, q3 = qv.w * scale;
 
-    __shared__ float s_wave[4];
-    __shared__ float s_sc;
     float max_l = -1e30f;
     float sum_e = 0.0f;
-    float o_acc = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
 
     const int tot = c_len + B;
     for (int t = 0; t < tot; ++t) {
-        float kv, vv;
+        float k0, k1, k2, k3, v0, v1, v2, v3;
         if (t < c_len) {
-            const size_t idx = (static_cast<size_t>(c0 + t) * KV + kvh) * 128 + d;
-            kv = bf16_to_f32(ctx_K[idx]);
-            vv = bf16_to_f32(ctx_V[idx]);
+            const size_t idx = (static_cast<size_t>(c0 + t) * KV + kvh) * 128 + d0;
+            const uint2 kw = *reinterpret_cast<const uint2*>(ctx_K + idx);
+            const uint2 vw = *reinterpret_cast<const uint2*>(ctx_V + idx);
+            k0 = bf16_to_f32(kw.x & 0xFFFFu); k1 = bf16_to_f32(kw.x >> 16);
+            k2 = bf16_to_f32(kw.y & 0xFFFFu); k3 = bf16_to_f32(kw.y >> 16);
+            v0 = bf16_to_f32(vw.x & 0xFFFFu); v1 = bf16_to_f32(vw.x >> 16);
+            v2 = bf16_to_f32(vw.y & 0xFFFFu); v3 = bf16_to_f32(vw.y >> 16);
         } else {
             const int di = t - c_len;
-            const size_t idx = (static_cast<size_t>(di) * KV + kvh) * 128 + d;
-            kv = drf_K[idx];
-            vv = drf_V[idx];
+            const size_t idx = (static_cast<size_t>(di) * KV + kvh) * 128 + d0;
+            const float4 kw = *reinterpret_cast<const float4*>(drf_K + idx);
+            const float4 vw = *reinterpret_cast<const float4*>(drf_V + idx);
+            k0 = kw.x; k1 = kw.y; k2 = kw.z; k3 = kw.w;
+            v0 = vw.x; v1 = vw.y; v2 = vw.z; v3 = vw.w;
         }
-        float dot = wave32_sum(qv * kv);
-        if (lane == 0) s_wave[wave] = dot;
-        __syncthreads();
-        if (d == 0) s_sc = s_wave[0] + s_wave[1] + s_wave[2] + s_wave[3];
-        __syncthreads();
-        const float sc = s_sc;
+        const float sc = wave32_sum(fmaf(q0, k0, fmaf(q1, k1, fmaf(q2, k2, q3 * k3))));
         const float nm = fmaxf(max_l, sc);
         const float a = __expf(max_l - nm);
         const float b = __expf(sc - nm);
-        o_acc = fmaf(o_acc, a, b * vv);
+        o0 = fmaf(o0, a, b * v0); o1 = fmaf(o1, a, b * v1);
+        o2 = fmaf(o2, a, b * v2); o3 = fmaf(o3, a, b * v3);
         sum_e = fmaf(sum_e, a, b);
         max_l = nm;
     }
-    O_out[(static_cast<size_t>(qi) * H + hh) * 128 + d] = o_acc / fmaxf(sum_e, 1e-30f);
+    const float inv = 1.0f / fmaxf(sum_e, 1e-30f);
+    *reinterpret_cast<float4*>(O_out + (static_cast<size_t>(qi) * H + hh) * 128 + d0) =
+        make_float4(o0 * inv, o1 * inv, o2 * inv, o3 * inv);
 }
 
 // DSpark SwiGLU: out[i] = silu(gate[i]) * up[i]

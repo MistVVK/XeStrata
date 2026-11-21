@@ -96,21 +96,59 @@ __global__ void __launch_bounds__(256) k_dspark_ctx_scatter(
     dst[c] = strata::inkling2::hip::f32_to_bf16(src[static_cast<size_t>(b) * cols + c]);
 }
 
-// Reconstruct exact 3-lag BF16 ShortConv history at `keep_steps` (0..8) from pre-verify snapshot [3, C]
-// + recorded verify inputs [n_rec, C] so partial DSpark acceptance is 100% bit-exact!
-__global__ void __launch_bounds__(256) k_sconv_rollback_exact(
-    const uint16_t* __restrict__ snap3,  // [3, C] (h0, h1, h2 at snap_seq_len)
-    const uint16_t* __restrict__ rec,    // [8, C] (verify inputs x[0..n_rec-1])
-    uint16_t* __restrict__ dst3,         // [3, C] (slot's active ShortConv history)
-    int keep_steps, int C) {
+// Single-launch batched ShortConv clear across ALL n_visits for a pair of contiguous pools [n_visits, max_slots, 3, C]!
+__global__ void __launch_bounds__(256) k_sconv_clear_pair(
+    uint16_t* __restrict__ pool_a,
+    uint16_t* __restrict__ pool_b,
+    int slot, int max_slots, int n_visits, int C) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= C) return;
-    // Timeline of inputs ending at snap_seq_len + keep_steps - 1:
-    // index -3..-1 -> snap3[0..2], index 0..keep_steps-1 -> rec[0..keep_steps-1]
+    const int v = blockIdx.y;
+    if (c >= C || v >= n_visits) return;
+    const size_t base = (static_cast<size_t>(v) * max_slots + slot) * 3 * C;
+    uint16_t* da = pool_a + base;
+    uint16_t* db = pool_b + base;
+    da[0 * C + c] = 0; da[1 * C + c] = 0; da[2 * C + c] = 0;
+    db[0 * C + c] = 0; db[1 * C + c] = 0; db[2 * C + c] = 0;
+}
+
+// Single-launch batched ShortConv snapshot across ALL n_visits (replaces 96 hipMemcpyAsync calls with 1 kernel!)
+__global__ void __launch_bounds__(256) k_sconv_snapshot_pair(
+    const uint16_t* __restrict__ pool_a,  // [n_visits, max_slots, 3, C]
+    const uint16_t* __restrict__ pool_b,  // [n_visits, max_slots, 3, C]
+    uint16_t* __restrict__ snap_a,        // [n_visits, 3, C]
+    uint16_t* __restrict__ snap_b,        // [n_visits, 3, C]
+    int slot, int max_slots, int n_visits, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int v = blockIdx.y;
+    if (c >= C || v >= n_visits) return;
+    const size_t sbase = (static_cast<size_t>(v) * max_slots + slot) * 3 * C;
+    const size_t dbase = static_cast<size_t>(v) * 3 * C;
+    for (int lag = 0; lag < 3; ++lag) {
+        snap_a[dbase + lag * C + c] = pool_a[sbase + lag * C + c];
+        snap_b[dbase + lag * C + c] = pool_b[sbase + lag * C + c];
+    }
+}
+
+// Single-launch batched ShortConv exact rollback across ALL n_visits for keep_steps in [0..8]
+// (replaces 96 k_sconv_rollback_exact launches with 1 kernel -> 2 total launches instead of 192 per DSpark round!)
+__global__ void __launch_bounds__(256) k_sconv_rollback_pair(
+    const uint16_t* __restrict__ snap_a,  // [n_visits, 3, C]
+    const uint16_t* __restrict__ rec_a,   // [n_visits, 8, C]
+    uint16_t* __restrict__ pool_a,        // [n_visits, max_slots, 3, C]
+    const uint16_t* __restrict__ snap_b,  // [n_visits, 3, C]
+    const uint16_t* __restrict__ rec_b,   // [n_visits, 8, C]
+    uint16_t* __restrict__ pool_b,        // [n_visits, max_slots, 3, C]
+    int slot, int max_slots, int n_visits, int keep_steps, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int v = blockIdx.y;
+    if (c >= C || v >= n_visits) return;
+    const size_t dbase = (static_cast<size_t>(v) * max_slots + slot) * 3 * C;
+    const size_t sbase = static_cast<size_t>(v) * 3 * C;
+    const size_t rbase = static_cast<size_t>(v) * 8 * C;
     for (int lag = 0; lag < 3; ++lag) {
         const int t = keep_steps - 3 + lag;
-        uint16_t val = (t < 0) ? snap3[(t + 3) * C + c] : rec[t * C + c];
-        dst3[lag * C + c] = val;
+        pool_a[dbase + lag * C + c] = (t < 0) ? snap_a[sbase + (t + 3) * C + c] : rec_a[rbase + t * C + c];
+        pool_b[dbase + lag * C + c] = (t < 0) ? snap_b[sbase + (t + 3) * C + c] : rec_b[rbase + t * C + c];
     }
 }
 
@@ -513,10 +551,14 @@ public:
                 }
             }
             if (!hip_ok(alloc_gpu_buffer(d_dspark_state_, static_cast<size_t>(dspark_cfg_.markov_rank) * 4, mem_info_.is_uma), "dspark state", err) ||
+                !hip_ok(alloc_gpu_buffer(d_dspark_state2_, static_cast<size_t>(dspark_cfg_.markov_rank) * 4, mem_info_.is_uma), "dspark state2", err) ||
+                !hip_ok(alloc_gpu_buffer(d_dspark_latent_, static_cast<size_t>(dspark_cfg_.markov_rank) * 4, mem_info_.is_uma), "dspark latent", err) ||
                 !hip_ok(alloc_gpu_buffer(d_dspark_corr_, static_cast<size_t>(dspark_cfg_.hidden) * 4, mem_info_.is_uma), "dspark corr", err) ||
                 !hip_ok(alloc_gpu_buffer(d_dspark_toks_, 16 * sizeof(int32_t), mem_info_.is_uma), "dspark toks", err) ||
                 !hip_ok(alloc_gpu_buffer(d_dspark_blk_v_, 1024 * sizeof(float), mem_info_.is_uma), "dspark blkv", err) ||
-                !hip_ok(alloc_gpu_buffer(d_dspark_blk_i_, 1024 * sizeof(int32_t), mem_info_.is_uma), "dspark blki", err)) {
+                !hip_ok(alloc_gpu_buffer(d_dspark_blk_i_, 1024 * sizeof(int32_t), mem_info_.is_uma), "dspark blki", err) ||
+                !hip_ok(alloc_gpu_buffer(d_dspark_cand_v_, 7u * 1024u * sizeof(float), mem_info_.is_uma), "dspark candv", err) ||
+                !hip_ok(alloc_gpu_buffer(d_dspark_cand_i_, 7u * 1024u * sizeof(int32_t), mem_info_.is_uma), "dspark candi", err)) {
                 return false;
             }
         }
@@ -642,22 +684,16 @@ public:
             if (!glob_pools_[i].init(false, is_fp8, mem_info_.is_uma, max_slots_, max_glob_pages, kv_dim, err)) return false;
         }
 
-        d_sconv_k_.resize(c_.n_visits);
-        d_sconv_v_.resize(c_.n_visits);
-        d_sconv_attn_.resize(c_.n_visits);
-        d_sconv_mlp_.resize(c_.n_visits);
-        for (int v = 0; v < c_.n_visits; ++v) {
-            const size_t kvb = static_cast<size_t>(max_slots_) * 3 * kv_dim * sizeof(uint16_t);
-            const size_t hb  = static_cast<size_t>(max_slots_) * 3 * c_.hidden * sizeof(uint16_t);
-            if (!hip_ok(alloc_gpu_buffer(d_sconv_k_[v], kvb, mem_info_.is_uma), "sconv k", err) ||
-                !hip_ok(alloc_gpu_buffer(d_sconv_v_[v], kvb, mem_info_.is_uma), "sconv v", err) ||
-                !hip_ok(alloc_gpu_buffer(d_sconv_attn_[v], hb, mem_info_.is_uma), "sconv attn", err) ||
-                !hip_ok(alloc_gpu_buffer(d_sconv_mlp_[v], hb, mem_info_.is_uma), "sconv mlp", err)) {
-                return false;
-            }
-            HIP_ZERO(d_sconv_k_[v]); HIP_ZERO(d_sconv_v_[v]);
-            HIP_ZERO(d_sconv_attn_[v]); HIP_ZERO(d_sconv_mlp_[v]);
+        const size_t kv_all_b = static_cast<size_t>(c_.n_visits) * max_slots_ * 3 * kv_dim * sizeof(uint16_t);
+        const size_t h_all_b  = static_cast<size_t>(c_.n_visits) * max_slots_ * 3 * c_.hidden * sizeof(uint16_t);
+        if (!hip_ok(alloc_gpu_buffer(d_sconv_k_all_, kv_all_b, mem_info_.is_uma), "sconv k all", err) ||
+            !hip_ok(alloc_gpu_buffer(d_sconv_v_all_, kv_all_b, mem_info_.is_uma), "sconv v all", err) ||
+            !hip_ok(alloc_gpu_buffer(d_sconv_attn_all_, h_all_b, mem_info_.is_uma), "sconv attn all", err) ||
+            !hip_ok(alloc_gpu_buffer(d_sconv_mlp_all_, h_all_b, mem_info_.is_uma), "sconv mlp all", err)) {
+            return false;
         }
+        HIP_ZERO(d_sconv_k_all_); HIP_ZERO(d_sconv_v_all_);
+        HIP_ZERO(d_sconv_attn_all_); HIP_ZERO(d_sconv_mlp_all_);
 
         slots_.resize(max_slots_);
         return true;
@@ -710,12 +746,19 @@ public:
             hip_ign(alloc_gpu_buffer(sl.sconv_rec_attn, static_cast<size_t>(c_.n_visits) * h_rec, mem_info_.is_uma));
             hip_ign(alloc_gpu_buffer(sl.sconv_rec_mlp, static_cast<size_t>(c_.n_visits) * h_rec, mem_info_.is_uma));
         }
-        for (int v = 0; v < c_.n_visits; ++v) {
-            hip_ign(hipMemcpyAsync(sl.sconv_snap_k.dev_ptr + v * kv_one, d_sconv_k_[v].dev_ptr + slot * kv_one, kv_one, hipMemcpyDeviceToDevice, stream_));
-            hip_ign(hipMemcpyAsync(sl.sconv_snap_v.dev_ptr + v * kv_one, d_sconv_v_[v].dev_ptr + slot * kv_one, kv_one, hipMemcpyDeviceToDevice, stream_));
-            hip_ign(hipMemcpyAsync(sl.sconv_snap_attn.dev_ptr + v * h_one, d_sconv_attn_[v].dev_ptr + slot * h_one, h_one, hipMemcpyDeviceToDevice, stream_));
-            hip_ign(hipMemcpyAsync(sl.sconv_snap_mlp.dev_ptr + v * h_one, d_sconv_mlp_[v].dev_ptr + slot * h_one, h_one, hipMemcpyDeviceToDevice, stream_));
-        }
+        // 2 batched launches across all 48 visits instead of 192 hipMemcpyAsync calls!
+        k_sconv_snapshot_pair<<<dim3((kv_dim + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(d_sconv_k_all_.dev_ptr),
+            reinterpret_cast<const uint16_t*>(d_sconv_v_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_snap_k.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_snap_v.dev_ptr),
+            slot, max_slots_, c_.n_visits, kv_dim);
+        k_sconv_snapshot_pair<<<dim3((c_.hidden + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(d_sconv_attn_all_.dev_ptr),
+            reinterpret_cast<const uint16_t*>(d_sconv_mlp_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_snap_attn.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_snap_mlp.dev_ptr),
+            slot, max_slots_, c_.n_visits, c_.hidden);
         sl.snap_seq_len = sl.seq_len;
         sl.sconv_rec_n = 0;
         sl.has_snap = true;
@@ -729,36 +772,24 @@ public:
         if (sl.has_snap) {
             const int keep_steps = keep_len - sl.snap_seq_len;
             const int kv_dim = c_.n_kv * c_.head_dim;
-            const size_t kv_one = 3u * kv_dim * sizeof(uint16_t);
-            const size_t h_one  = 3u * c_.hidden * sizeof(uint16_t);
-            const size_t kv_rec = 8u * kv_dim * sizeof(uint16_t);
-            const size_t h_rec  = 8u * c_.hidden * sizeof(uint16_t);
-            if (keep_steps == 0) {
-                for (int v = 0; v < c_.n_visits; ++v) {
-                    hip_ign(hipMemcpyAsync(d_sconv_k_[v].dev_ptr + slot * kv_one, sl.sconv_snap_k.dev_ptr + v * kv_one, kv_one, hipMemcpyDeviceToDevice, stream_));
-                    hip_ign(hipMemcpyAsync(d_sconv_v_[v].dev_ptr + slot * kv_one, sl.sconv_snap_v.dev_ptr + v * kv_one, kv_one, hipMemcpyDeviceToDevice, stream_));
-                    hip_ign(hipMemcpyAsync(d_sconv_attn_[v].dev_ptr + slot * h_one, sl.sconv_snap_attn.dev_ptr + v * h_one, h_one, hipMemcpyDeviceToDevice, stream_));
-                    hip_ign(hipMemcpyAsync(d_sconv_mlp_[v].dev_ptr + slot * h_one, sl.sconv_snap_mlp.dev_ptr + v * h_one, h_one, hipMemcpyDeviceToDevice, stream_));
-                }
-            } else if (keep_steps > 0 && keep_steps <= sl.sconv_rec_n) {
-                for (int v = 0; v < c_.n_visits; ++v) {
-                    k_sconv_rollback_exact<<<(kv_dim + 255) / 256, 256, 0, stream_>>>(
-                        reinterpret_cast<const uint16_t*>(sl.sconv_snap_k.dev_ptr + v * kv_one),
-                        reinterpret_cast<const uint16_t*>(sl.sconv_rec_k.dev_ptr + v * kv_rec),
-                        reinterpret_cast<uint16_t*>(d_sconv_k_[v].dev_ptr + slot * kv_one), keep_steps, kv_dim);
-                    k_sconv_rollback_exact<<<(kv_dim + 255) / 256, 256, 0, stream_>>>(
-                        reinterpret_cast<const uint16_t*>(sl.sconv_snap_v.dev_ptr + v * kv_one),
-                        reinterpret_cast<const uint16_t*>(sl.sconv_rec_v.dev_ptr + v * kv_rec),
-                        reinterpret_cast<uint16_t*>(d_sconv_v_[v].dev_ptr + slot * kv_one), keep_steps, kv_dim);
-                    k_sconv_rollback_exact<<<(c_.hidden + 255) / 256, 256, 0, stream_>>>(
-                        reinterpret_cast<const uint16_t*>(sl.sconv_snap_attn.dev_ptr + v * h_one),
-                        reinterpret_cast<const uint16_t*>(sl.sconv_rec_attn.dev_ptr + v * h_rec),
-                        reinterpret_cast<uint16_t*>(d_sconv_attn_[v].dev_ptr + slot * h_one), keep_steps, c_.hidden);
-                    k_sconv_rollback_exact<<<(c_.hidden + 255) / 256, 256, 0, stream_>>>(
-                        reinterpret_cast<const uint16_t*>(sl.sconv_snap_mlp.dev_ptr + v * h_one),
-                        reinterpret_cast<const uint16_t*>(sl.sconv_rec_mlp.dev_ptr + v * h_rec),
-                        reinterpret_cast<uint16_t*>(d_sconv_mlp_[v].dev_ptr + slot * h_one), keep_steps, c_.hidden);
-                }
+            if (keep_steps >= 0 && keep_steps <= sl.sconv_rec_n) {
+                // 2 batched launches across all 48 visits instead of 192 kernel/memcpy submissions!
+                k_sconv_rollback_pair<<<dim3((kv_dim + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+                    reinterpret_cast<const uint16_t*>(sl.sconv_snap_k.dev_ptr),
+                    reinterpret_cast<const uint16_t*>(sl.sconv_rec_k.dev_ptr),
+                    reinterpret_cast<uint16_t*>(d_sconv_k_all_.dev_ptr),
+                    reinterpret_cast<const uint16_t*>(sl.sconv_snap_v.dev_ptr),
+                    reinterpret_cast<const uint16_t*>(sl.sconv_rec_v.dev_ptr),
+                    reinterpret_cast<uint16_t*>(d_sconv_v_all_.dev_ptr),
+                    slot, max_slots_, c_.n_visits, keep_steps, kv_dim);
+                k_sconv_rollback_pair<<<dim3((c_.hidden + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+                    reinterpret_cast<const uint16_t*>(sl.sconv_snap_attn.dev_ptr),
+                    reinterpret_cast<const uint16_t*>(sl.sconv_rec_attn.dev_ptr),
+                    reinterpret_cast<uint16_t*>(d_sconv_attn_all_.dev_ptr),
+                    reinterpret_cast<const uint16_t*>(sl.sconv_snap_mlp.dev_ptr),
+                    reinterpret_cast<const uint16_t*>(sl.sconv_rec_mlp.dev_ptr),
+                    reinterpret_cast<uint16_t*>(d_sconv_mlp_all_.dev_ptr),
+                    slot, max_slots_, c_.n_visits, keep_steps, c_.hidden);
             }
             sl.has_snap = false;
             sl.sconv_rec_n = 0;
@@ -870,7 +901,7 @@ public:
 
             const int c0 = dspark_cfg_.is_swa[il] ? std::max(0, anchor_pos - dspark_cfg_.swa_win + 1) : 0;
             const int c_len = anchor_pos - c0;
-            k_dspark_block_attn<<<dim3(H, B), 128, 0, stream_>>>(
+            k_dspark_block_attn<<<dim3((H + 3) / 4, B), 128, 0, stream_>>>(
                 q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
                 reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
                 kd, vd, ao, B, H, KV, c0, c_len);
@@ -887,7 +918,7 @@ public:
             k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, h, cur, B * D);
         }
 
-        // 3. Final norm + 7-step Persistent On-GPU Recurrent Markov Head (ZERO host sync between steps!)
+        // 3. Final norm + Single-Pass Base Unembed Top-1024 Screen + 7-Step Multi-CU Recurrent Markov Head!
         k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32("norm.weight"), cur, B, D, dspark_cfg_.rms_eps);
         // Convert slot's f_rnn BF16 vector at (anchor_pos - 1) to FP32 in ds_res_ (reusing first D floats)
         k_bf16_to_f32_vec<<<(D + 255) / 256, 256, 0, stream_>>>(
@@ -897,33 +928,52 @@ public:
         (void)hipMemsetAsync(d_dspark_state_.dev_ptr, 0, static_cast<size_t>(rank) * sizeof(float), stream_);
         const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
         const int V = c_.vocab_unpadded;
-        const int arg_blks = std::min(512, (V + 7) / 8);
+        constexpr int kScreenBlks = 512;
+        constexpr int kNumCand = kScreenBlks * 2;  // 1,024 top candidates per step
+        constexpr int kCandArgBlks = (kNumCand + 7) / 8;  // 128 blocks x 8 waves = 1,024
+
+        // Read unembed[V, D] ONCE across all n_draft steps -> 7x less memory bandwidth!
+        k5_dspark_base_top2_screen<<<kScreenBlks, 256, 0, stream_>>>(
+            unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
+            cur + D,
+            reinterpret_cast<float*>(d_dspark_cand_v_.dev_ptr),
+            reinterpret_cast<int32_t*>(d_dspark_cand_i_.dev_ptr),
+            n_draft, D, V);
 
         int32_t* d_toks = reinterpret_cast<int32_t*>(d_dspark_toks_.dev_ptr);
+        float* st_a = reinterpret_cast<float*>(d_dspark_state_.dev_ptr);
+        float* st_b = reinterpret_cast<float*>(d_dspark_state2_.dev_ptr);
+        float* d_lat = reinterpret_cast<float*>(d_dspark_latent_.dev_ptr);
+        float* d_corr = reinterpret_cast<float*>(d_dspark_corr_.dev_ptr);
         for (int step = 1; step <= n_draft; ++step) {
-            k5_dspark_markov_rnn_update<<<1, 256, 0, stream_>>>(
+            float* st_in  = (step & 1) ? st_a : st_b;
+            float* st_out = (step & 1) ? st_b : st_a;
+            k5_dspark_markov_proj<<<(rank + 7) / 8, 256, 0, stream_>>>(
                 d_toks + (step - 1),
-                reinterpret_cast<float*>(d_dspark_state_.dev_ptr),
+                st_in, st_out, d_lat,
                 cur + static_cast<size_t>(step) * D,
                 res,
                 ds_f32("markov_head.markov_w1.weight"),
                 ds_f32("markov_head.rnn_proj.weight"),
                 ds_f32("markov_head.rnn_proj.bias"),
+                D, rank);
+            k5_dspark_markov_corr<<<(D + 7) / 8, 256, 0, stream_>>>(
+                d_lat,
                 ds_f32("markov_head.hidden_out.weight"),
                 ds_f32("markov_head.hidden_out.bias"),
-                reinterpret_cast<float*>(d_dspark_corr_.dev_ptr),
-                D, rank);
-            k5_dspark_packed_argmax_stage1<<<arg_blks, 256, 0, stream_>>>(
+                d_corr, D, rank);
+            k5_dspark_cand_argmax_stage1<<<kCandArgBlks, 256, 0, stream_>>>(
                 unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
-                cur + static_cast<size_t>(step) * D,
-                reinterpret_cast<const float*>(d_dspark_corr_.dev_ptr),
+                reinterpret_cast<const float*>(d_dspark_cand_v_.dev_ptr) + static_cast<size_t>(step - 1) * kNumCand,
+                reinterpret_cast<const int32_t*>(d_dspark_cand_i_.dev_ptr) + static_cast<size_t>(step - 1) * kNumCand,
+                d_corr,
                 reinterpret_cast<float*>(d_dspark_blk_v_.dev_ptr),
                 reinterpret_cast<int32_t*>(d_dspark_blk_i_.dev_ptr),
-                D, V);
+                kNumCand, D, V);
             k5_dspark_argmax_stage2<<<1, 256, 0, stream_>>>(
                 reinterpret_cast<const float*>(d_dspark_blk_v_.dev_ptr),
                 reinterpret_cast<const int32_t*>(d_dspark_blk_i_.dev_ptr),
-                arg_blks, d_toks + step);
+                kCandArgBlks, d_toks + step);
         }
 
         // Single tiny 28-byte D2H copy for all drafted tokens!
@@ -1213,14 +1263,14 @@ private:
 
     void clear_slot_sconv(int slot) {
         const int kv_dim = c_.n_kv * c_.head_dim;
-        const size_t kv_one = 3u * kv_dim * sizeof(uint16_t);
-        const size_t h_one  = 3u * c_.hidden * sizeof(uint16_t);
-        for (int v = 0; v < c_.n_visits; ++v) {
-            (void)hipMemsetAsync(d_sconv_k_[v].dev_ptr + slot * kv_one, 0, kv_one, stream_);
-            (void)hipMemsetAsync(d_sconv_v_[v].dev_ptr + slot * kv_one, 0, kv_one, stream_);
-            (void)hipMemsetAsync(d_sconv_attn_[v].dev_ptr + slot * h_one, 0, h_one, stream_);
-            (void)hipMemsetAsync(d_sconv_mlp_[v].dev_ptr + slot * h_one, 0, h_one, stream_);
-        }
+        k_sconv_clear_pair<<<dim3((kv_dim + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<uint16_t*>(d_sconv_k_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_v_all_.dev_ptr),
+            slot, max_slots_, c_.n_visits, kv_dim);
+        k_sconv_clear_pair<<<dim3((c_.hidden + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<uint16_t*>(d_sconv_attn_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_mlp_all_.dev_ptr),
+            slot, max_slots_, c_.n_visits, c_.hidden);
     }
 
     size_t vram_used_bytes() const noexcept {
@@ -1234,10 +1284,7 @@ private:
         for (const auto& kv : dspark_f32_) tot += kv.second.bytes;
         for (const auto& p : swa_pools_) tot += p.allocated_bytes();
         for (const auto& p : glob_pools_) tot += p.allocated_bytes();
-        for (const auto& b : d_sconv_k_) tot += b.bytes;
-        for (const auto& b : d_sconv_v_) tot += b.bytes;
-        for (const auto& b : d_sconv_attn_) tot += b.bytes;
-        for (const auto& b : d_sconv_mlp_) tot += b.bytes;
+        tot += d_sconv_k_all_.bytes + d_sconv_v_all_.bytes + d_sconv_attn_all_.bytes + d_sconv_mlp_all_.bytes;
         return tot;
     }
 
@@ -1466,7 +1513,7 @@ private:
         }
 
         auto run_sconv = [&](const float* in_ptr, const std::string& sw_key, const float* dyn_ptr,
-                             GpuBuffer& hist_pool, float* out_ptr, int C, int n_heads,
+                             GpuBuffer& hist_pool_all, float* out_ptr, int C, int n_heads,
                              GpuBuffer* rec_pool = nullptr, int rec_visit = 0) {
             if (rec_slot >= 0 && rec_pool && rec_pool->dev_ptr) {
                 const size_t one_visit = 8u * static_cast<size_t>(C) * sizeof(uint16_t);
@@ -1474,7 +1521,8 @@ private:
                     in_ptr, reinterpret_cast<uint16_t*>(rec_pool->dev_ptr + rec_visit * one_visit), B * C);
             }
             const float* sw = reinterpret_cast<const float*>(static_sconv_.at(sw_key).dev_ptr);
-            uint16_t* hp = reinterpret_cast<uint16_t*>(hist_pool.dev_ptr);
+            const size_t visit_stride = static_cast<size_t>(max_slots_) * 3u * static_cast<size_t>(C) * sizeof(uint16_t);
+            uint16_t* hp = reinterpret_cast<uint16_t*>(hist_pool_all.dev_ptr + rec_visit * visit_stride);
             if (all_distinct_slots) {
                 k2_shortconv4_batched<<<dim3((C + 255) / 256, B), 256, 0, stream_>>>(
                     in_ptr, sw, dyn_ptr, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), hp, out_ptr, B, C, n_heads);
@@ -1505,9 +1553,10 @@ private:
         for (const auto& p : swa_pools_) kv_gen_sum += p.pool_gen;
         for (const auto& p : glob_pools_) kv_gen_sum += p.pool_gen;
 
-        const bool use_graph = all_distinct_slots && all_gpu_layers && all_want_logits &&
-                               max_img_row < 0 && taps_out == nullptr && rec_slot < 0 &&
-                               (B <= 64);
+        const bool use_graph = all_gpu_layers && all_want_logits && max_img_row < 0 && taps_out == nullptr &&
+                               ((all_distinct_slots && rec_slot < 0 && B <= 64) ||
+                                (!all_distinct_slots && rec_slot >= 0 && n_groups == 1 && B >= 2 && B <= 8));
+        const bool is_verify_graph = use_graph && !all_distinct_slots;
 
         if (use_graph) {
             const int V = c_.vocab_unpadded;
@@ -1521,9 +1570,15 @@ private:
             for (int b = 0; b < B; ++b) want_seq[b] = b;
             (void)hipMemcpyAsync(sc_want_idx_.dev_ptr, want_seq.data(), B * 4, hipMemcpyHostToDevice, stream_);
 
-            if (graph_exec_ != nullptr && graph_B_ == B && graph_need_taps_ == need_taps &&
-                graph_kv_gen_ == kv_gen_sum && graph_scratch_B_ == scratch_B_) {
-                if (!hip_ok(hipGraphLaunch(graph_exec_, stream_), "hipGraphLaunch", err)) return false;
+            hipGraphExec_t& g_exec = is_verify_graph ? graph_verify_exec_ : graph_exec_;
+            const bool g_hit = is_verify_graph
+                ? (g_exec != nullptr && vgraph_B_ == B && vgraph_slot_ == rec_slot &&
+                   vgraph_need_taps_ == need_taps && vgraph_kv_gen_ == kv_gen_sum && vgraph_scratch_B_ == scratch_B_)
+                : (g_exec != nullptr && graph_B_ == B && graph_need_taps_ == need_taps &&
+                   graph_kv_gen_ == kv_gen_sum && graph_scratch_B_ == scratch_B_);
+
+            if (g_hit) {
+                if (!hip_ok(hipGraphLaunch(g_exec, stream_), "hipGraphLaunch", err)) return false;
                 for (int b = 0; b < B; ++b) {
                     auto& sl = slots_[batch.slot_ids[b]];
                     sl.seq_len = std::max(sl.seq_len, batch.pos[b] + 1);
@@ -1535,7 +1590,11 @@ private:
                             "logits D2H", err)) return false;
                 return hip_ok(hipStreamSynchronize(stream_), "graph sync", err);
             }
-            invalidate_graph();
+            if (is_verify_graph) {
+                if (graph_verify_exec_) { (void)hipGraphExecDestroy(graph_verify_exec_); graph_verify_exec_ = nullptr; }
+            } else {
+                if (graph_exec_) { (void)hipGraphExecDestroy(graph_exec_); graph_exec_ = nullptr; }
+            }
             if (!hip_ok(hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal), "hipStreamBeginCapture", err)) {
                 return false;
             }
@@ -1704,8 +1763,8 @@ private:
 
             // k2: ShortConv K & V + L2 clip + V RMSNorm + global tau
             GpuSlotMeta* rsl = (rec_slot >= 0) ? &slots_[rec_slot] : nullptr;
-            run_sconv(k_raw, p + ".k_sconv", is_swa ? nullptr : k_dyn, d_sconv_k_[visit], k_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_k : nullptr, visit);
-            run_sconv(v_raw, p + ".v_sconv", is_swa ? nullptr : v_dyn, d_sconv_v_[visit], v_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_v : nullptr, visit);
+            run_sconv(k_raw, p + ".k_sconv", is_swa ? nullptr : k_dyn, d_sconv_k_all_, k_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_k : nullptr, visit);
+            run_sconv(v_raw, p + ".v_sconv", is_swa ? nullptr : v_dyn, d_sconv_v_all_, v_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_v : nullptr, visit);
 
             const int32_t* pos_dev = reinterpret_cast<const int32_t*>(sc_pos_.dev_ptr);
             const std::string q_sc_k = p + ".attn.q_l2_clip.scale";
@@ -1741,15 +1800,30 @@ private:
             k_relpos_bias_proj<<<dim3(c_.n_head, B), 256, 0, stream_>>>(
                 r_raw, f32_ptr(p + ".attn.rel_logits_proj.proj"), pos_dev, rbias, B, c_.n_head, c_.d_rel, c_.rel_extent);
 
-            if (is_fp8) {
-                k3_flash_swa_gqa<true><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+            if (B <= 8) {
+                if (is_fp8) {
+                    k3_flash_swa_gqa_splitkv<true><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                        q, gatea, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                        reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                        aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+                } else {
+                    k3_flash_swa_gqa_splitkv<false><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                        q, gatea, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
+                        aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+                }
+            } else if (is_fp8) {
+                k3_flash_swa_gqa<true><<<dim3((c_.n_head + 3) / 4, B), 128, 0, stream_>>>(
                     q, gatea, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
                     reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
                     kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
                     reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
                     aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
             } else {
-                k3_flash_swa_gqa<false><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                k3_flash_swa_gqa<false><<<dim3((c_.n_head + 3) / 4, B), 128, 0, stream_>>>(
                     q, gatea, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
                     reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
                     kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
@@ -1758,7 +1832,7 @@ private:
 
             // O-proj + post-attention ShortConv + AttnRes block boundary rule
             launch_trunk_linear(p + ".attn.wo_ud.weight", aout, oproj, B, D, q_dim);
-            run_sconv(oproj, p + ".attn_sconv", nullptr, d_sconv_attn_[visit], asc, D, 0, rsl ? &rsl->sconv_rec_attn : nullptr, visit);
+            run_sconv(oproj, p + ".attn_sconv", nullptr, d_sconv_attn_all_, asc, D, 0, rsl ? &rsl->sconv_rec_attn : nullptr, visit);
 
             if (ip % c_.block_size == 0) {
                 (void)hipMemcpyAsync(sc_blocks_[n_blocks].dev_ptr, res, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
@@ -1782,9 +1856,9 @@ private:
             k4_moe_router_topk<<<B, 128, 0, stream_>>>(rlog, f32_ptr(p + ".mlp.gate.bias"), tk_i, tk_w, B, c_.top_k, c_.route_scale);
 
             // MoE Expert Execution:
-            // Fast Path A1 (B == 1, all GPU-resident): 2-launch ZERO-SYNC fused GPU MoE!
-            // Fast Path A2 (B >= 2, all GPU-resident): 4-launch ZERO-SYNC Fused GPU Grouped-MoE (collapses 128 host loops -> 4 GPU launches!)
-            if (layer_all_gpu_[ip] && B == 1) {
+            // Fast Path A1 (B <= 4, all GPU-resident): 2-launch ZERO-SYNC active-only direct MoE
+            // Fast Path A2 (B >= 5, all GPU-resident): 4-launch ZERO-SYNC BM=64 BN=128 Wave32 WMMA Grouped-MoE (deduplicates active experts!)
+            if (layer_all_gpu_[ip] && B <= 4) {
                 k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
                 const GpuExpertDesc* d_exps = reinterpret_cast<const GpuExpertDesc*>(d_layer_exps_[ip].dev_ptr);
                 k_moe_direct_w13_situ<<<dim3((c_.inter + 3) / 4, B * c_.top_k), 256, 0, stream_>>>(
@@ -1802,10 +1876,11 @@ private:
                 half_t*  d_act = reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr);
                 float*   d_by  = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
                 k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
-                if (B >= 32 && mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
-                    k_moe_grouped_w13_situ_wmma<<<dim3((2 * c_.inter + 63) / 64, c_.n_experts), 128, 0, stream_>>>(
+                if (mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
+                    const int m_tiles = (B >= 256) ? 4 : ((B >= 64) ? 2 : 1);
+                    k_moe_grouped_w13_situ_wmma<<<dim3((2 * c_.inter + 127) / 128, c_.n_experts, m_tiles), 256, 0, stream_>>>(
                         d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
-                    k_moe_grouped_w2_wmma<<<dim3((D + 63) / 64, c_.n_experts), 128, 0, stream_>>>(
+                    k_moe_grouped_w2_wmma<<<dim3((D + 127) / 128, c_.n_experts, m_tiles), 256, 0, stream_>>>(
                         d_exps, d_off, d_act, d_by, D, c_.inter);
                 } else {
                     k_moe_grouped_w13_situ<<<dim3((c_.inter + 3) / 4, c_.n_experts), 256, 0, stream_>>>(
@@ -1919,7 +1994,7 @@ private:
             }
 
             // Post-MLP ShortConv + residual add
-            run_sconv(moeout, p + ".mlp_sconv", nullptr, d_sconv_mlp_[visit], msc, D, 0, rsl ? &rsl->sconv_rec_mlp : nullptr, visit);
+            run_sconv(moeout, p + ".mlp_sconv", nullptr, d_sconv_mlp_all_, msc, D, 0, rsl ? &rsl->sconv_rec_mlp : nullptr, visit);
             k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, msc, cur, B * D);
             ++visit;
 
@@ -1972,22 +2047,31 @@ private:
         if (use_graph) {
             const int V = c_.vocab_unpadded;
             const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
-            k_unembed_softcap<<<dim3((V + 7) / 8, B), 256, 0, stream_>>>(
+            k_unembed_softcap<<<dim3((V + 7) / 8, (B + 7) / 8), 256, 0, stream_>>>(
                 unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
                 h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
                 reinterpret_cast<float*>(sc_logits_.dev_ptr), B, V, D, c_.logit_softcap);
 
             hipGraph_t g = nullptr;
             if (!hip_ok(hipStreamEndCapture(stream_, &g), "hipStreamEndCapture", err)) return false;
-            hipError_t ie = hipGraphInstantiate(&graph_exec_, g, nullptr, nullptr, 0);
+            hipGraphExec_t& g_exec = is_verify_graph ? graph_verify_exec_ : graph_exec_;
+            hipError_t ie = hipGraphInstantiate(&g_exec, g, nullptr, nullptr, 0);
             (void)hipGraphDestroy(g);
             if (!hip_ok(ie, "hipGraphInstantiate", err)) return false;
-            graph_B_ = B;
-            graph_need_taps_ = need_taps;
-            graph_kv_gen_ = kv_gen_sum;
-            graph_scratch_B_ = scratch_B_;
+            if (is_verify_graph) {
+                vgraph_B_ = B;
+                vgraph_slot_ = rec_slot;
+                vgraph_need_taps_ = need_taps;
+                vgraph_kv_gen_ = kv_gen_sum;
+                vgraph_scratch_B_ = scratch_B_;
+            } else {
+                graph_B_ = B;
+                graph_need_taps_ = need_taps;
+                graph_kv_gen_ = kv_gen_sum;
+                graph_scratch_B_ = scratch_B_;
+            }
 
-            if (!hip_ok(hipGraphLaunch(graph_exec_, stream_), "hipGraphLaunch(first)", err)) return false;
+            if (!hip_ok(hipGraphLaunch(g_exec, stream_), "hipGraphLaunch(first)", err)) return false;
             for (int b = 0; b < B; ++b) {
                 auto& sl = slots_[batch.slot_ids[b]];
                 sl.seq_len = std::max(sl.seq_len, batch.pos[b] + 1);
@@ -2031,7 +2115,7 @@ private:
                 }
                 (void)hipMemcpyAsync(sc_want_idx_.dev_ptr, want_idx.data(), n_want * 4, hipMemcpyHostToDevice, stream_);
                 const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
-                k_unembed_softcap<<<dim3((V + 7) / 8, n_want), 256, 0, stream_>>>(
+                k_unembed_softcap<<<dim3((V + 7) / 8, (n_want + 7) / 8), 256, 0, stream_>>>(
                     unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
                     h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
                     reinterpret_cast<float*>(sc_logits_.dev_ptr), n_want, V, D, c_.logit_softcap);
@@ -2124,9 +2208,17 @@ private:
             (void)hipGraphExecDestroy(graph_exec_);
             graph_exec_ = nullptr;
         }
+        if (graph_verify_exec_) {
+            (void)hipGraphExecDestroy(graph_verify_exec_);
+            graph_verify_exec_ = nullptr;
+        }
         graph_B_ = 0;
         graph_kv_gen_ = 0;
         graph_scratch_B_ = 0;
+        vgraph_B_ = 0;
+        vgraph_slot_ = -1;
+        vgraph_kv_gen_ = 0;
+        vgraph_scratch_B_ = 0;
     }
 
     void cleanup() {
@@ -2141,11 +2233,8 @@ private:
         for (auto& p : swa_pools_) p.release();
         for (auto& p : glob_pools_) p.release();
         swa_pools_.clear(); glob_pools_.clear();
-        for (auto& b : d_sconv_k_) free_gpu_buffer(b);
-        for (auto& b : d_sconv_v_) free_gpu_buffer(b);
-        for (auto& b : d_sconv_attn_) free_gpu_buffer(b);
-        for (auto& b : d_sconv_mlp_) free_gpu_buffer(b);
-        d_sconv_k_.clear(); d_sconv_v_.clear(); d_sconv_attn_.clear(); d_sconv_mlp_.clear();
+        free_gpu_buffer(d_sconv_k_all_); free_gpu_buffer(d_sconv_v_all_);
+        free_gpu_buffer(d_sconv_attn_all_); free_gpu_buffer(d_sconv_mlp_all_);
         for (auto& kv : trunk_bf16_) free_gpu_buffer(kv.second);
         for (auto& kv : trunk_f32_) free_gpu_buffer(kv.second);
         for (auto& kv : packed_trunk_) free_gpu_buffer(kv.second.buf);
@@ -2157,8 +2246,10 @@ private:
         trunk_bf16_.clear(); trunk_f32_.clear(); packed_trunk_.clear();
         static_sconv_.clear(); d_msg_queries_.clear(); dspark_bf16_.clear(); dspark_f32_.clear(); d_layer_exps_.clear();
         free_gpu_buffer(expert_gpu_arena_); free_gpu_buffer(d_exp_stage_);
-        free_gpu_buffer(d_dspark_state_); free_gpu_buffer(d_dspark_corr_); free_gpu_buffer(d_dspark_toks_);
+        free_gpu_buffer(d_dspark_state_); free_gpu_buffer(d_dspark_state2_); free_gpu_buffer(d_dspark_latent_);
+        free_gpu_buffer(d_dspark_corr_); free_gpu_buffer(d_dspark_toks_);
         free_gpu_buffer(d_dspark_blk_v_); free_gpu_buffer(d_dspark_blk_i_);
+        free_gpu_buffer(d_dspark_cand_v_); free_gpu_buffer(d_dspark_cand_i_);
         free_gpu_buffer(ds_cur_); free_gpu_buffer(ds_res_); free_gpu_buffer(ds_h_);
         free_gpu_buffer(ds_q_); free_gpu_buffer(ds_k_); free_gpu_buffer(ds_v_);
         free_gpu_buffer(ds_ao_); free_gpu_buffer(ds_mg_); free_gpu_buffer(ds_mu_);
@@ -2209,7 +2300,8 @@ private:
     std::unordered_map<std::string, GpuBuffer> dspark_bf16_;
     std::unordered_map<std::string, GpuBuffer> dspark_f32_;
     std::vector<float> h_dspark_fuse_;
-    GpuBuffer d_dspark_state_, d_dspark_corr_, d_dspark_toks_, d_dspark_blk_v_, d_dspark_blk_i_;
+    GpuBuffer d_dspark_state_, d_dspark_state2_, d_dspark_latent_, d_dspark_corr_, d_dspark_toks_;
+    GpuBuffer d_dspark_blk_v_, d_dspark_blk_i_, d_dspark_cand_v_, d_dspark_cand_i_;
     GpuBuffer ds_cur_, ds_res_, ds_h_, ds_q_, ds_k_, ds_v_, ds_ao_, ds_mg_, ds_mu_;
     GpuBuffer d_ds_k_ptrs_[3], d_ds_v_ptrs_[3], d_ds_frnn_ptrs_;
 
@@ -2225,7 +2317,7 @@ private:
 
     std::vector<VisitKvPool> swa_pools_;
     std::vector<VisitKvPool> glob_pools_;
-    std::vector<GpuBuffer> d_sconv_k_, d_sconv_v_, d_sconv_attn_, d_sconv_mlp_;
+    GpuBuffer d_sconv_k_all_, d_sconv_v_all_, d_sconv_attn_all_, d_sconv_mlp_all_;
     std::vector<GpuSlotMeta> slots_;
     GpuVisionState vision_;
 
@@ -2248,6 +2340,12 @@ private:
     bool graph_need_taps_ = false;
     uint64_t graph_kv_gen_ = 0;
     int graph_scratch_B_ = 0;
+    hipGraphExec_t graph_verify_exec_ = nullptr;
+    int vgraph_B_ = 0;
+    int vgraph_slot_ = -1;
+    bool vgraph_need_taps_ = false;
+    uint64_t vgraph_kv_gen_ = 0;
+    int vgraph_scratch_B_ = 0;
 };
 
 }  // namespace

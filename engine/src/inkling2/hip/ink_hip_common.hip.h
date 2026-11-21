@@ -62,6 +62,8 @@ using half_t = _Float16;
 typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
 typedef _Float16 hv8 __attribute__((ext_vector_type(8)));
 typedef _Float16 hv16 __attribute__((ext_vector_type(16)));
+typedef short bf8 __attribute__((ext_vector_type(8)));
+typedef short bf16v __attribute__((ext_vector_type(16)));
 typedef float fv8 __attribute__((ext_vector_type(8)));
 typedef int iv2 __attribute__((ext_vector_type(2)));
 typedef int iv4 __attribute__((ext_vector_type(4)));
@@ -272,12 +274,20 @@ __device__ __forceinline__ iv8 iv8_zero() { return iv8{0, 0, 0, 0, 0, 0, 0, 0}; 
 
 #if INK_GFX12
 using wmma_h_t = hv8;
+using wmma_bf_t = bf8;
 __device__ __forceinline__ wmma_h_t wmma_ld_h(const half_t* p, int hi) {
     const uint4 v = *reinterpret_cast<const uint4*>(p + hi * 8);
     return __builtin_bit_cast(hv8, v);
 }
 __device__ __forceinline__ fv8 wmma_f16(wmma_h_t a, wmma_h_t b, fv8 c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+}
+__device__ __forceinline__ wmma_bf_t wmma_ld_bf(const uint16_t* p, int hi) {
+    const uint4 v = *reinterpret_cast<const uint4*>(p + hi * 8);
+    return __builtin_bit_cast(bf8, v);
+}
+__device__ __forceinline__ fv8 wmma_bf16(wmma_bf_t a, wmma_bf_t b, fv8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
 }
 // RDNA4 2x-rate INT8 WMMA: 16x16x32 iu8 (iv4 = 16 int8 per half-wave!) and 16x16x16 iu8 (iv2 = 8 int8 per half-wave)
 __device__ __forceinline__ iv4 wmma_ld_i8_k32(const int8_t* p, int hi) {
@@ -305,6 +315,7 @@ __device__ __forceinline__ int wmma_acc_m(int r, int lane) { return 8 * (lane >>
 __device__ __forceinline__ int wmma_acc_n(int r, int lane) { (void)r; return lane & 15; }
 #elif INK_GFX11
 using wmma_h_t = hv16;
+using wmma_bf_t = bf16v;
 __device__ __forceinline__ wmma_h_t wmma_ld_h(const half_t* p, int /*hi*/) {
     const uint4 a = *reinterpret_cast<const uint4*>(p);
     const uint4 b = *reinterpret_cast<const uint4*>(p + 8);
@@ -314,6 +325,16 @@ __device__ __forceinline__ wmma_h_t wmma_ld_h(const half_t* p, int /*hi*/) {
 }
 __device__ __forceinline__ fv8 wmma_f16(wmma_h_t a, wmma_h_t b, fv8 c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+}
+__device__ __forceinline__ wmma_bf_t wmma_ld_bf(const uint16_t* p, int /*hi*/) {
+    const uint4 a = *reinterpret_cast<const uint4*>(p);
+    const uint4 b = *reinterpret_cast<const uint4*>(p + 8);
+    typedef unsigned u32x8 __attribute__((ext_vector_type(8)));
+    const u32x8 v = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    return __builtin_bit_cast(bf16v, v);
+}
+__device__ __forceinline__ fv8 wmma_bf16(wmma_bf_t a, wmma_bf_t b, fv8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
 }
 __device__ __forceinline__ iv4 wmma_ld_i8_k16_g11(const int8_t* p) {
     const uint4 v = *reinterpret_cast<const uint4*>(p);

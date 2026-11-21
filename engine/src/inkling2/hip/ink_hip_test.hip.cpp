@@ -275,7 +275,7 @@ bool test_flash_swa_and_dspark(bool is_uma) {
     INK_HCK(hipMemcpy(d_kp.dev_ptr, h_kpool.data(), h_kpool.size() * sizeof(half_t), hipMemcpyHostToDevice));
     INK_HCK(hipMemcpy(d_vp.dev_ptr, h_vpool.data(), h_vpool.size() * sizeof(half_t), hipMemcpyHostToDevice));
 
-    k3_flash_swa_gqa<false><<<dim3(n_qh, B), 128>>>(
+    k3_flash_swa_gqa<false><<<dim3((n_qh + 3) / 4, B), 128>>>(
         reinterpret_cast<const float*>(d_q.dev_ptr), nullptr, nullptr,
         reinterpret_cast<const float*>(d_sink.dev_ptr),
         reinterpret_cast<const int32_t*>(d_slots.dev_ptr),
