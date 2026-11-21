@@ -55,6 +55,9 @@ void p1a_input(const void* x16, size_t h_bytes);
 bool p1a_used();
 /// p1a_wanted() and a layer of this gate/up + down type pair would take the P1A kernels (the buffers grow only for such a pack).
 bool p1a_takes_pair(int gu_type, int d_type);
+/// STRATA_PF_F16=2 on gfx11 WMMA targets (gfx1100..gfx1151): 128-token pair FP16 WMMA kernel (native_h11p_kernel).
+bool h11p_wanted();
+bool h11p_takes_pair(int gu_type, int d_type);
 /// (CUDA, STRATA_PF_FUSED_TQ=1) a Hadamard-folded down for the next experts_native calls of a trellis pair: the gate/up writes H as FP32
 /// into the first n_ff floats of each row's own down-output row in `dm` (no other buffer), which is rotated there (y = H_128 (signs * h) /
 /// sqrt(128) per 128 features; signs nullptr = identity, else n_ff values on the device) and quantized into `ha` before the down product

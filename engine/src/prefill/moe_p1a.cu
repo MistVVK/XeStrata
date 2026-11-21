@@ -31,6 +31,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "moe_p1a.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 
 #include <hip/hip_fp16.h>
 
@@ -43,7 +44,7 @@
 namespace strata::prefill::fused::p1a {
 namespace {
 
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
 #define P1A_DEVICE 1
 #else
 #define P1A_DEVICE 0
@@ -510,22 +511,50 @@ bool takes(int gu_type, int d_type, bool l2) {
     return l2 && (gu_type == kQ4K || gu_type == kQ5K) && (d_type == kQ51 || d_type == kQ80);
 }
 
+inline bool p1a_fast_flags() {
+    static const int env = [] {
+        if (const char* p = std::getenv("STRATA_PF_P1A_PLAIN"); p != nullptr && p[0] == '1') return 0;
+        if (const char* f = std::getenv("STRATA_PF_P1A_FL3"); f != nullptr && f[0] != '\0') return f[0] == '1' ? 1 : 0;
+        return -1;
+    }();
+    if (env >= 0) return env == 1;
+    // FL=3 (IL+DB, 32 KB LDS) wins on discrete gfx1100/1101/1102 (54..96 CUs), whereas 40-CU Strix Halo (gfx1151)
+    // measured ~2.5% faster with FL=0 (16 KB LDS, 2x wave occupancy) at 0.000000e+00 KL.
+    static int arch_fl3[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (arch_fl3[dev] == 0) {
+        cudaDeviceProp prop{};
+        arch_fl3[dev] = (cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+                         !prop.integrated && strata::kernels::gfx_arch_is_discrete_rdna3(prop.gcnArchName)) ? 2 : 1;
+    }
+    return arch_fl3[dev] == 2;
+}
+
 void gate_up(const Batch& b, const NativeGeom& g, const int32_t* ts, const int2* tiles, const int32_t* off, int64_t work_bound,
              const void* x16, const int32_t* src, void* h16, cudaStream_t s) {
     const dim3 grid((unsigned) (kMoeFF / 64), (unsigned) std::max<int64_t>(1, work_bound));
-    if (g.gu_type == kQ5K)
-        pair_kernel<kQ5K><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) x16, off, src, (__half*) h16, kMoeFF, kMoeEmbd);
-    else
-        pair_kernel<kQ4K><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) x16, off, src, (__half*) h16, kMoeFF, kMoeEmbd);
+    const bool fast = p1a_fast_flags();   // FL = 3: IL (interleaved dual-tile accumulators) + DB (XOR-swizzled double-buffered 32 KB LDS)
+    if (g.gu_type == kQ5K) {
+        if (fast) pair_kernel<kQ5K, 0, 0, 3><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) x16, off, src, (__half*) h16, kMoeFF, kMoeEmbd);
+        else pair_kernel<kQ5K><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) x16, off, src, (__half*) h16, kMoeFF, kMoeEmbd);
+    } else {
+        if (fast) pair_kernel<kQ4K, 0, 0, 3><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) x16, off, src, (__half*) h16, kMoeFF, kMoeEmbd);
+        else pair_kernel<kQ4K><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) x16, off, src, (__half*) h16, kMoeFF, kMoeEmbd);
+    }
 }
 
 void down(const Batch& b, const NativeGeom& g, const int32_t* ts, const int2* tiles, const int32_t* off, int64_t work_bound,
           const void* h16, void* d16, cudaStream_t s) {
     const dim3 grid((unsigned) ((kMoeEmbd + 127) / 128), (unsigned) std::max<int64_t>(1, work_bound));
-    if (g.d_type == kQ80)
-        down_kernel<kQ80><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) h16, off, (__half*) d16, kMoeEmbd, kMoeFF);
-    else
-        down_kernel<kQ51><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) h16, off, (__half*) d16, kMoeEmbd, kMoeFF);
+    const bool fast = p1a_fast_flags();
+    if (g.d_type == kQ80) {
+        if (fast) down_kernel<kQ80, 0, 0, 2, 3><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) h16, off, (__half*) d16, kMoeEmbd, kMoeFF);
+        else down_kernel<kQ80><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) h16, off, (__half*) d16, kMoeEmbd, kMoeFF);
+    } else {
+        if (fast) down_kernel<kQ51, 0, 0, 2, 3><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) h16, off, (__half*) d16, kMoeEmbd, kMoeFF);
+        else down_kernel<kQ51><<<grid, 256, 0, s>>>(b, g, ts, tiles, (const __half*) h16, off, (__half*) d16, kMoeEmbd, kMoeFF);
+    }
 }
 
 }  // namespace strata::prefill::fused::p1a

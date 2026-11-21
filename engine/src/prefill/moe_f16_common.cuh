@@ -36,7 +36,7 @@
 #include "strata/prefill/moe_fused.hpp"
 
 #if defined(__HIPCC__) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
-                           defined(__gfx1150__) || defined(__gfx1151__))
+                           defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__))
 #define STRATA_F16_DEVICE 1
 #else
 #define STRATA_F16_DEVICE 0
@@ -52,11 +52,11 @@ static_assert(kMoeFF % 64 == 0 && kMoeEmbd % ROWS == 0, "the F16 expert kernels:
 constexpr int GU_NFB = kMoeFF / 64, D_NFB = kMoeEmbd / ROWS;   // work items per tile: 64 features, 128 output rows
 constexpr int GU_ACT_LD = kMoeEmbd / 64 * AB, H_LD = kMoeFF / 64 * AB;   // bytes per activation / H row
 
-/// STRATA_PF_F16=1 (on top of STRATA_PF_FUSED=1): the covered formats take the F16 kernels on gfx11.
+/// STRATA_PF_F16=1 (or =2, on top of STRATA_PF_FUSED=1): the covered formats take the F16 kernels on gfx11.
 inline bool requested() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_PF_F16");
-        return v != nullptr && v[0] == '1';
+        return v != nullptr && (v[0] == '1' || v[0] == '2');
     }();
     return on;
 }
