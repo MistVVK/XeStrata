@@ -10,7 +10,7 @@ export const catalogVersionLabel=(version:CatalogVersion)=>{const label=nativeVe
  * NVFP4 packs and Qwen3.6 keep the installer for their pictures. With these the Load of a model that is on this computer never runs the installer again just
  * because the picture files are missing.
  */
-export const PICTURE_FETCH_FAMILIES = ['qwen', 'coder', 'unsloth', 'gyro', 'swift'];
+export const PICTURE_FETCH_FAMILIES = ['qwen', 'coder', 'unsloth', 'gyro', 'swift', 'hy4-flash'];
 export const fetchesPictures = (version: { sourceFamily?: string } | undefined, packaged: boolean | undefined) => !!version && packaged === true && PICTURE_FETCH_FAMILIES.includes(version.sourceFamily ?? '');
 /** The one line that says how a version differs from its neighbours (the three NVFP4 versions); empty for the rest. */
 export const versionNote=(model:string)=>{const nv=nvfp4Version(model);return nv?tr(nv.note):'';};

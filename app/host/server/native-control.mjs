@@ -202,7 +202,7 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
  function checkedSettingsConfig(text){const check=checkAndParseRunConfig(text);if(!check.ok)throw new Error(`The settings file for this model has a mistake, so the model was not started. ${describeIssues(check.issues,'error').join(' ')}`);return check.config;}
  function settings(model){const {entry,config}=record(model);const values=Object.fromEntries(NATIVE_FIELDS.map(f=>[f.id,config[f.id]??null]));if(typeof values.aliases==='string')values.aliases=values.aliases.split(',').map(v=>v.trim()).filter(Boolean);values.sampling=config.sampling??{};values.args=config.args??[];values.env=publicNativeEnv(config.env??{});return {model,values,mcp:publicMcpServers(config.mcp_servers??config.mcpServers??{}),restartNeeded:true,speedSwitches:speedSwitchRows(config.env??{},{deepseek:retiredDeepSeek(config),arch:config.arch??null,vision:!!config.vision,backend:config.backend??entry?.backend??snapshot.installed?.engine?.backend??null,gpus:snapshot.hardware?.gpus??[]})};}
  /* The Drafting hint of this model's settings: the size of the drafter DFlash2 would fetch for it (Control's plan with the choice DFlash2); the generic hint when Control does not say. */
- async function settingsHints(model){try{if(!packaged||typeof control.draftingPlan!=='function')return {};const {path}=recordFile(model),d=await control.draftingPlan({configPath:path,mode:'dflash2'});return Number(d?.drafter_gb)>0?{drafting:draftingHint(d.drafter_gb)}:{};}catch{return {};}}
+ async function settingsHints(model){try{const {path,config}=record(model);if(isHy4(config))return {drafting:'DFly2 is Hy4-Flash’s built-in speculative drafter (on by default). Off disables speculative drafting.'};if(!packaged||typeof control.draftingPlan!=='function')return {};const d=await control.draftingPlan({configPath:path,mode:'dflash2'});return Number(d?.drafter_gb)>0?{drafting:draftingHint(d.drafter_gb)}:{};}catch{return {};}}
  function save(model,{values,mcp}){if([...jobs.values()].some(j=>j.state==='running'))throw new Error('Finish the current operation before saving native settings.');const {path,config}=record(model);if(busy(requests().filter(r=>instances.get(r.instanceId)?.model===model)))throw new Error('Finish this model’s requests before saving its settings.');const patch=validateNativeSettings(values??{}),next={...config};for(const field of nativeFields())if(field.supported===false&&patch[field.id]!=null&&JSON.stringify(patch[field.id])!==JSON.stringify(config[field.id]))throw new Error(`${field.label} needs a newer native Strata installation. Update it in Settings → About.`);for(const [key,value] of Object.entries(patch)){if(key==='env')next.env=restoreNativeEnv(value,config.env??{});else if(value===null)delete next[key];else next[key]=value;}if('vram_reserve_mib' in patch){const base=captureUserArgs(next);const mine=setUserFlag(base,'--vram-reserve-mib',patch.vram_reserve_mib);if(mine.length)next[USER_KEY]=mine;else delete next[USER_KEY];next.args=mine.length&&patch.vram_reserve_mib!==null?mergeUserArgs(next.args??[],mine):setUserFlag(next.args??[],'--vram-reserve-mib',null);delete next.ui_reserve_applied;if(Array.isArray(next.args_written))next.args_written=[...next.args];}if(mcp!==undefined){next.mcp_servers=validateMcpServers(mcp,config.mcp_servers??config.mcpServers??{});delete next.mcpServers;}copyFileSync(path,path+'.bak');chmodSync(path+'.bak',0o600);const temp=path+'.ui-tmp';writeFileSync(temp,JSON.stringify(next,null,2)+'\n',{mode:0o600});renameSync(temp,path);return settings(model);}
  function previousEngine(){if(packaged)return !!snapshot.engine?.previous;try{const data=snapshot.installed?.data_dir??snapshot.installed?.data_folder;return [join(repo(),'engine/.previous'),data&&join(data,'engine/.previous')].filter(Boolean).some(existsSync)&&readFileSync(join(repo(),'setup.py'),'utf8').includes('--rollback-engine');}catch{return false;}}
  async function plan(args){await refresh();if(!snapshot.available)throw new Error(snapshot.error);args=await controlDrafter(args);const result=await tool('strata_install',installArgs(args,false));
@@ -460,10 +460,36 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   const keep={config,args,note:null};
   if(!packaged||args.visionUnavailable===true)return keep;
   if(isHy4(config)){
-   const shard=hy4VisionShard(config);
-   if(shard&&existsSync(resolve(repo(),shard)))return keep;
-   if(askedPictures(args.vision))return {config,args:{...args,vision:'no',visionUnavailable:true},note:PICTURES_WORDS.gone};
-   return keep;
+   const shard=hy4VisionShard(config),asked=askedPictures(args.vision);
+   if(shard&&!missing&&existsSync(resolve(repo(),shard)))return keep;
+   if(!asked){const none={...args,vision:'no',visionUnavailable:true};return shard?{config,args:none,note:PICTURES_WORDS.gone}:keep;}
+   if(typeof control.picturesFetch!=='function')return {config,args:{...args,vision:'no',visionUnavailable:true},note:PICTURES_WORDS.gone};
+   job.abort=new AbortController();job.summary=PICTURES_WORDS.download;job.details=undefined;emit();
+   try{
+    const engine=await control.engine().catch(()=>null),engineDir=engine?.engine?.root??'';
+    const here=snapshot.installed?.models?.find(m=>m.model===args.model);
+    let fallbackData=null;try{fallbackData=here?.runDataFolder??here?.dataFolder??nativeDataDirectory(preferences.downloadDirectory??modelsDirectory?.())??null;}catch{fallbackData=here?.runDataFolder??here?.dataFolder??null;}
+    const got=await control.picturesFetch({configPath:configFile,engineDir,vision:args.vision,dataDir:fallbackData,family:'hy4-flash',hardware:pictureCard(config),signal:job.abort.signal,
+     onEvent:event=>{if(event?.event!=='progress'||job.state!=='running')return;const total=Number(event.total)||0,done=Number(event.done)||0;
+      if(/^Checking/i.test(String(event.step))){job.summary=PICTURES_WORDS.check;}
+      else{job.summary=PICTURES_WORDS.download;if(total>0)job.result={install:{download:{file:'picture reader',done_gb:done/1e9,total_gb:total/1e9,remaining_gb:Math.max(0,total-done)/1e9,percent:Math.min(99,Math.floor(100*done/total))}}};}
+      emit();}});
+    if(job.state!=='running')return keep;
+    const nextArgs=[...withoutHy4Vision(config.args),'--vision',got.mmproj];
+    const next={...config,args:nextArgs,...(Array.isArray(config.args_written)?{args_written:[...nextArgs]}:{})};
+    writeModelConfig(configFile,next);
+    if(got.note)append(args.model,`Picture files: ${got.note}`);
+    job.result=null;job.summary=PICTURES_WORDS.loading;job.details=undefined;emit();
+    return {config:next,args,note:null};
+   }catch(error){
+    job.result=null;
+    if(job.state!=='running')return keep;
+    const code=error?.code,details=error?.output?.error?.details;
+    append(args.model,`Picture files: ${error?.message??error}${details?` (${details})`:''}`);
+    if(strict)throw Object.assign(new Error(PLAIN_PICTURE_CODES.includes(code)?String(error.message):'The picture files could not be downloaded. Try again.'),{details:details?[details]:undefined});
+    job.summary=PICTURES_WORDS.loading;job.details=undefined;emit();
+    return {config,args:{...args,vision:'no',visionUnavailable:true},note:code==='offline'?PICTURES_WORDS.offline:code==='disk'?PICTURES_WORDS.disk:PICTURES_WORDS.failed};
+   }
   }
   const prepared=!!config.vision,asked=askedPictures(args.vision);
   /* Control says the picture file is gone (missing) or, when pictures were asked for, this look at the disk says so; a load that asked for nothing never second-guesses Control. */
@@ -504,7 +530,8 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   const {path:configFile}=recordFile(args.model);const config=checkedSettingsConfig(readFileSync(configFile,'utf8'));
   if(!packaged)throw new Error('The picture files are downloaded by the installed app.');
   const {entry}=recordFile(args.model);
-  if(config.vision&&!entry.picturesMissing&&!pictureFileGone(config))return {summary:'The picture files are ready.'};
+  const hy4Shard=hy4VisionShard(config);
+  if(isHy4(config)?(hy4Shard&&!entry.picturesMissing&&existsSync(resolve(repo(),hy4Shard))):(config.vision&&!entry.picturesMissing&&!pictureFileGone(config)))return {summary:'The picture files are ready.'};
   await ensurePictures(job,{...args,vision:askedPictures(args.vision)?args.vision:'yes'},configFile,config,{strict:true,missing:entry.picturesMissing===true});
   if(job.state!=='running')return;
   await refresh(true);
@@ -791,7 +818,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   const next={...current.config,...values,ui_resource_profile:args.profile};
   writeModelConfig(current.path,next);
   job.summary='Applying your resource preference and loading the model…';emit();
-  const loaded=await loadEngine(job,{model:args.model,multiple:false,vision:current.config.vision?args.vision:'no',...(args.visionUnavailable===true?{visionUnavailable:true}:{})});
+  const loaded=await loadEngine(job,{model:args.model,multiple:false,vision:(isHy4(current.config)||current.config.vision)?args.vision:'no',...(args.visionUnavailable===true?{visionUnavailable:true}:{})});
   if(job.state!=='running'||!loaded?.instanceId)return;
   job.summary='Checking your model’s speed…';emit();
   const measured=await benchmark(job,{instanceId:loaded.instanceId});

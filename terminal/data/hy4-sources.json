@@ -1,12 +1,9 @@
 {
- "note": "Public Hugging Face mirror for Tencent Hy4-Flash (.strata v1.0, 42 GiB split parts + unsplit Vision shard). Overridden by STRATA_HY4_SOURCE or config key hy4_source.",
+ "note": "Hugging Face repository for Tencent Hy4-Flash (.strata v1.0). Overridden by STRATA_HY4_SOURCE or config key hy4_source.",
  "sources": [
   {
-   "kind": "http-parts",
-   "base": "https://huggingface.co/Niko1221/Hy4-Flash-Strata/resolve/main",
-   "files": {
-    "Hy4-Flash-Vision.strata": "https://huggingface.co/Niko1221/Hy4-Flash-Strata/resolve/main/Hy4-Flash-Vision.strata"
-   }
+   "kind": "http",
+   "base": "https://huggingface.co/strata-engine/Hy4-Flash-Strata/resolve/main"
   }
  ]
 }

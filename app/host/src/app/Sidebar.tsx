@@ -72,9 +72,10 @@ export function Sidebar({ containerRef }: {
     // A model picked from an API connection (chat header) is a model to chat with: the chip names it and its connection while no local model is loaded.
     const remoteChoice = useStore(s => s.remoteModel), remoteProviders = useStore(s => s.providers);
     const remoteChosen = !current && !nativeCurrent ? chosenRemote(remoteProviders, remoteChoice) : null;
-    const modelName = nativeCurrent?.label ?? (current?.local ? current.name : current?.family) ?? remoteChosen?.model.name ?? tr('No model loaded');
+    const nativeFamily = nativeCurrent ? native?.catalog?.families.find(f => f.sizes.some(s => s.id === nativeCurrent.model)) : undefined;
+    const modelName = nativeFamily?.title ?? nativeCurrent?.label ?? (current?.local ? current.name : current?.family) ?? remoteChosen?.model.name ?? tr('No model loaded');
     // The version from the catalog and the card it runs on ("Q2_0 · GPU 2"), not the file id.
-    const nativeSize = nativeCurrent ? native?.catalog?.families.flatMap(f => f.sizes).find(s => s.id === nativeCurrent.model) : undefined;
+    const nativeSize = nativeCurrent ? nativeFamily?.sizes.find(s => s.id === nativeCurrent.model) : undefined;
     const nativeSecond = nativeCurrent ? [nativeSize?.model ?? nativeCurrent.model.toUpperCase(), nativeCurrent.gpus.length ? nativeCurrent.gpus.map(g => `GPU ${g + 1}`).join(' + ') : ''].filter(Boolean).join(' · ') : null;
     const modelQuant = nativeSecond ?? current?.quant ?? remoteChosen?.connection.name ?? tr('View model versions');
     const phase = nativeCurrent ? (nativeCurrent.status === 'ready' ? nativeCurrent.phase : nativeCurrent.status) : monitor?.phase ?? 'idle';

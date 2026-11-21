@@ -818,7 +818,7 @@ from strata_control import hy4_family, hy4_fit  # noqa: E402
 HY4_FAMILIES = {
     hy4_family.FAMILY: {
         "title": hy4_family.TITLE, "by": hy4_family.BY, "tag": hy4_family.TAG, "name": hy4_family.FAMILY, "arch": hy4_family.ARCH, "hy4": True, "vision": hy4_family.DEFAULT_VISION,
-        "about": "a very large mixture-of-experts model (12B active): runs from RAM and the SSD on a PC with 32 GB or more; the Engram file is read from the SSD",
+        "about": "a very large 220B-A12B mixture-of-experts model (12B active): runs from RAM and the SSD on a PC with 32 GB or more; the Engram file is read from the SSD",
         "license": "Tencent's base model license: https://huggingface.co/tencent/Hy4-flash",
         "models": {b: {"about": hy4_family.BUILD_ABOUT[b], "ram_gb": int(-(-hy4_fit.BUILDS[b]["footprint_gb"] // 1))} for b in hy4_fit.ORDER[::-1]},
     }

@@ -226,6 +226,8 @@ export function compactionThreshold(context, outputBudget, env = process.env) {
  * chat_template_kwargs.enable_thinking false; the rest send it true plus reasoning_effort (the server maps high and max to its top level).
  */
 export const LOCAL_EFFORTS = Object.freeze({ off: null, low: 'low', medium: 'medium', high: 'high', max: 'high' });
+/** Thinking levels for Tencent Hy4-Flash: Off, High (default), Max (passes max through to strata-hy4's max reasoning budget). */
+export const HY4_LOCAL_EFFORTS = Object.freeze({ off: null, low: 'high', medium: 'high', high: 'high', max: 'max' });
 /** The menu's words to the Harness's level names. */
 export const EFFORT_LEVEL = Object.freeze({ off: 'off', low: 'low', medium: 'medium', high: 'high', max: 'max' });
 /**
@@ -319,13 +321,13 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
       models: [{
         id: inst.modelId, name: inst.label || inst.modelId, contextWindow: context, maxTokens: localOutputBudget(context),
         input: inst.vision ? ['text', 'image'] : ['text'],
-        reasoning: true, reasoningEfforts: LOCAL_EFFORTS,
+        reasoning: true, reasoningEfforts: /^hy4-flash/i.test(String(inst.modelId ?? '')) ? HY4_LOCAL_EFFORTS : LOCAL_EFFORTS,
       }],
     };
     compaction.push({ provider: route, model: inst.modelId, headroomTokens: compactionHeadroom(context, localOutputBudget(context)), thresholdRatio: thresholdRatio() });
     slots = Math.max(slots, Number.isFinite(inst.slots) && inst.slots >= 1 ? Math.floor(inst.slots) : 1);
     const shaped = addShaped(route, providers[route], inst.baseUrl);
-    routes.push({ route, fp: fingerprint(providers[route], env[keyEnv]), kind: 'local', connectionName: 'this computer', instanceId: inst.id, modelId: inst.modelId, name: inst.label || inst.modelId, contextWindow: context, ...(shaped ? { shaped } : {}) });
+    routes.push({ route, fp: fingerprint(providers[route], env[keyEnv]), kind: 'local', connectionName: 'this computer', instanceId: inst.id, modelId: inst.modelId, name: inst.label || inst.modelId, contextWindow: context, vision: !!inst.vision, ...(shaped ? { shaped } : {}) });
   });
 
   connections.forEach(conn => {

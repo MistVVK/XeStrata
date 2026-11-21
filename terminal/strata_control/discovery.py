@@ -353,6 +353,10 @@ def footprint(cfg: dict, config: Path | None = None) -> Footprint:
         v = _flag_value(args, flag)
         if v and v.lower().endswith(".gguf") and Path(v) not in fp.weights and flag != "--ple-gguf":
             fp.weights.append(Path(v))
+    if not fp.weights and str(cfg.get("arch") or "").lower() == "hy4flash":
+        v = _flag_value(args, "--native")
+        if v and v.lower().endswith(".strata"):
+            fp.weights.append(Path(v))
     if not fp.weights:
         fp.weights = [Path(a) for a in args if a.lower().endswith(".gguf")][:1]
     pack = _flag_value(args, "--pack")
@@ -364,6 +368,9 @@ def footprint(cfg: dict, config: Path | None = None) -> Footprint:
         fp.mmproj = Path(str(vision["mmproj"]))
         fp.pictures_wanted = True
     elif "--vision" in args:
+        v = _flag_value(args, "--vision")
+        if v and not v.startswith("--") and v.lower().endswith(".strata"):
+            fp.mmproj = Path(v)
         fp.pictures_wanted = True
     fp.data_dir = data_dir_of(fp)
     return fp

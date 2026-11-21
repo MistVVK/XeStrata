@@ -348,15 +348,21 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     }
   }
 
-  async function sessionFor(c, cwd, runtime, { onWait = () => {} } = {}) {
+  async function sessionFor(c, cwd, runtime, { vision, onWait = () => {} } = {}) {
     let known = sessionMap[c.id];
     // The chat's folder changed: the agent's working folder and sandbox are fixed when its session starts, so the chat gets a new session
     // in the new folder (the earlier conversation is carried into its first message, as for any fresh session).
     if (known && cwd && known.cwd && resolve(known.cwd) !== resolve(cwd)) { delete sessionMap[c.id]; persist(); known = null; }
-    if (known) return { sessionId: known.sessionId, fresh: false };
+    // The model gained picture reading since this session was created: start a fresh Harness session so read_image sees the new image capability
+    // (the earlier conversation is carried into its first message, as for any fresh session).
+    if (known && known.vision === false && vision === true) { delete sessionMap[c.id]; persist(); known = null; }
+    if (known) {
+      if (typeof vision === 'boolean' && known.vision !== vision) { sessionMap[c.id] = { ...known, vision }; persist(); }
+      return { sessionId: known.sessionId, fresh: false };
+    }
     const created = await createSessionWhenReady(() => runtime.gw.rpc('session/create', { request: { cwd } }), { readyMs: sessionReadyMs, retryMs: sessionRetryMs, onWait, cancelled: () => c.cancelStart });
     if (!created) return null;
-    sessionMap[c.id] = { sessionId: created.sessionId, cwd, createdAt: new Date().toISOString() };
+    sessionMap[c.id] = { sessionId: created.sessionId, cwd, ...(typeof vision === 'boolean' ? { vision } : {}), createdAt: new Date().toISOString() };
     persist();
     return { sessionId: created.sessionId, fresh: true };
   }
@@ -488,21 +494,23 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     reporter.set({ phase: 'starting', code: 'starting', text: 'Starting…' });
     const { rt: runtime, route } = await ensureRuntime(choice, signal);
     c.holding = true;   // this chat now works on `runtime`: a restart of the Harness waits for it (busyChats); cleared when its turn exists or the start ends (runTurn)
-    const made = await sessionFor(c, workspacePath, runtime, { onWait: () => reporter.set({ phase: 'starting', code: 'assistant-starting', text: 'Starting the assistant…' }) });
+    const made = await sessionFor(c, workspacePath, runtime, { vision: route.vision, onWait: () => reporter.set({ phase: 'starting', code: 'assistant-starting', text: 'Starting the assistant…' }) });
     const { sessionId, fresh } = made ?? {};
     const cancelled = () => { reporter.clear(); emit({ type: 'done', finishReason: 'aborted', cancelled: true, tokensIn: null, tokensOut: null, usageSource: 'unavailable', durationMs: 0, model: route.name, contextMax: route.contextWindow }); return { cancelled: true }; };
     if (c.cancelStart || !made) return cancelled();
 
     // The model and the chat's thinking level (the Reasoning menu) are sent to the Harness when either changed. A level the route does
     // not have (an API model with its own vocabulary) is dropped and the model's own default stands: never an error for the person.
-    const level = effortOf(thinking ?? 'Medium');   // the menu's default is Medium
+    const isHy4Route = route.kind === 'local' && /^hy4-flash/i.test(String(route.modelId ?? ''));
+    const rawLevel = effortOf(thinking ?? (isHy4Route ? 'High' : 'Medium'));   // Hy4-Flash defaults to High (Off/High/Max); others default to Medium
+    const level = isHy4Route && (rawLevel === 'low' || rawLevel === 'medium') ? 'high' : rawLevel;
     // Response settings the Harness cannot send itself (the thinking budget, the Expert sampling) go through this host's forwarding
     // endpoint, on a copy of the route; with every setting at its default the route is used directly, as before.
     const budget = level === 'off' ? 0 : nearestBudget(thinkingBudget);
     const sampling = proxyBase && route.shaped ? expertSampling() : null;
     const provider = agentProvider(route, { budget, sampling, forwardAlways });
-    const wanted = `${provider}/${route.modelId}/${level ?? ''}`;
-    if (c.route !== wanted || c.routeGeneration !== runtime.generation) {
+    const wanted = `${provider}/${route.modelId}/${level ?? ''}/${route.vision ? 'v' : ''}`;
+    if (c.route !== wanted || c.routeGeneration !== runtime.generation || c.vision !== !!route.vision) {
       const select = effort => runtime.gw.rpc('session/selectModel', { request: { sessionId, provider, model: route.modelId, ...(effort ? { reasoningEffort: effort } : {}) } });
       try {
         try { await select(level); } catch (e) { if (!level || e.code === 'session/not-found') throw e; await select(null); }
@@ -510,7 +518,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
         if (e.code === 'session/not-found') { delete sessionMap[c.id]; persist(); }
         throw new AgentUnavailable(`The coding assistant could not use ${route.name}. Pick the model again and retry.`, 'model-unavailable', e.message);
       }
-      c.route = wanted; c.routeGeneration = runtime.generation;
+      c.route = wanted; c.routeGeneration = runtime.generation; c.vision = !!route.vision;
     }
 
     // The chat's permission mode is read once, here, for this whole turn. A change the user makes while the

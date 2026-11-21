@@ -20,7 +20,7 @@ ARCH = "hy4flash"                     # the run config's "arch"; serve and Contr
 SHAPE = "hy4"                         # the engine component is shape `hy4`: component:strata-hy4 (strata_control/shape_engine.py)
 COMPONENT = "strata-hy4"
 EXE = "strata-hy4.exe" if os.name == "nt" else "strata-hy4"
-TITLE = "Tencent Hy4-Flash 220B-A12B"
+TITLE = "Tencent Hy4-Flash"
 BY = "Strata's own quantization of Tencent's model"
 ENGRAM_SECTION4_SHA256 = "176944953bf2b601645d206171964f7fa51b77522ef5dc14ae61b0eb1c803d74"
 ENGRAM_FILE = "Hy4-Flash-Engram-Q8.strata"

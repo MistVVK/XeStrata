@@ -187,7 +187,7 @@ test('the tune dialog also runs without pictures and saves nothing when the engi
   assert.match(models, /vision=\{selectedSize\.images \? vision : 'no'\} visionUnavailable=\{noReader\}/);
   assert.match(read('src/components/NativeTune.tsx'), /\.\.\.\(visionUnavailable \? \{ visionUnavailable: true \} : \{\}\)/);
   const host = read('server/native-control.mjs');
-  assert.match(host, /vision:current\.config\.vision\?args\.vision:'no',\.\.\.\(args\.visionUnavailable===true\?\{visionUnavailable:true\}:\{\}\)/);
+  assert.match(host, /vision:\(isHy4\(current\.config\)\|\|current\.config\.vision\)\?args\.vision:'no',\.\.\.\(args\.visionUnavailable===true\?\{visionUnavailable:true\}:\{\}\)/);
   assert.match(host, /args\.contextChosen===true\|\|JSON\.stringify\(cfg\[USER_KEY\]/, 'a load that carries the context marker writes it to the saved settings');
 });
 

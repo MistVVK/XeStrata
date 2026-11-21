@@ -27,9 +27,9 @@ class Which(unittest.TestCase):
         self.assertTrue(runner_for("hy4-flash").is_hy4())
         self.assertFalse(runner_for("qwen").is_hy4())
         with mock.patch.object(R.Runner, "catalog", create=True) as cat:
-            cat.strata.setup_module.return_value = mock.Mock(FAMILIES={"qwen": {}}, HY4_FAMILIES={"hy4-flash": {"title": "Tencent Hy4-Flash 220B-A12B"}})
+            cat.strata.setup_module.return_value = mock.Mock(FAMILIES={"qwen": {}}, HY4_FAMILIES={"hy4-flash": {"title": "Tencent Hy4-Flash"}})
             self.assertIsNone(runner_for("qwen").model_shape())
-            self.assertEqual(runner_for("hy4-flash").model_title(), "Tencent Hy4-Flash 220B-A12B")
+            self.assertEqual(runner_for("hy4-flash").model_title(), "Tencent Hy4-Flash")
 
 
 class Steps(unittest.TestCase):
@@ -109,8 +109,8 @@ class CatalogAndHarness(unittest.TestCase):
     def test_harness_display_name_uses_hy4_flash_title(self):
         from strata_cli.launch import harness
         t_hy4 = harness.Target(url="http://127.0.0.1:8095", key="k", model="hy4-flash-sq-64", context=131072)
-        self.assertIn("name: Tencent Hy4-Flash 220B-A12B (Strata, local)", harness.omp_models(t_hy4))
-        self.assertIn("Tencent Hy4-Flash 220B-A12B (Strata, local)", harness.pi_models(t_hy4))
+        self.assertIn("name: Tencent Hy4-Flash (Strata, local)", harness.omp_models(t_hy4))
+        self.assertIn("Tencent Hy4-Flash (Strata, local)", harness.pi_models(t_hy4))
         t_qwen = harness.Target(url="http://127.0.0.1:8095", key="k", model="qwen3.8-flash-next-iq3_s", context=32768)
         self.assertIn("name: Qwen3.8-Flash-Next (Strata, local)", harness.omp_models(t_qwen))
 

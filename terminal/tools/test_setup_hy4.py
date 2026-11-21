@@ -126,19 +126,16 @@ class Offered(unittest.TestCase):
         srcs = hy4_family.sources(env={}, shipped=hy4_family.SOURCES_FILE)
         self.assertEqual(len(srcs), 1)
         src = srcs[0]
-        base = "https://huggingface.co/Niko1221/Hy4-Flash-Strata/resolve/main"
-        self.assertEqual(src["kind"], "http-parts")
+        base = "https://huggingface.co/strata-engine/Hy4-Flash-Strata/resolve/main"
+        self.assertEqual(src["kind"], "http")
         self.assertEqual(src["base"], base)
-        self.assertEqual(hy4_family.urls_for("Hy4-Flash-SQ-64.strata", src),
-                         [f"{base}/Hy4-Flash-SQ-64.strata.part-aa", f"{base}/Hy4-Flash-SQ-64.strata.part-ab"])
-        self.assertEqual(hy4_family.urls_for("Hy4-Flash-SQ-96.strata", src),
-                         [f"{base}/Hy4-Flash-SQ-96.strata.part-aa", f"{base}/Hy4-Flash-SQ-96.strata.part-ab"])
-        self.assertEqual(hy4_family.urls_for("Hy4-Flash-SQ-128.strata", src),
-                         [f"{base}/Hy4-Flash-SQ-128.strata.part-aa", f"{base}/Hy4-Flash-SQ-128.strata.part-ab", f"{base}/Hy4-Flash-SQ-128.strata.part-ac"])
-        self.assertEqual(hy4_family.urls_for(hy4_family.ENGRAM_FILE, src),
-                         [f"{base}/{hy4_family.ENGRAM_FILE}.part-aa", f"{base}/{hy4_family.ENGRAM_FILE}.part-ab"])
-        self.assertEqual(hy4_family.urls_for(hy4_family.VISION_FILE, src),
-                         [f"{base}/{hy4_family.VISION_FILE}"])
+        self.assertEqual(hy4_family.urls_for("Hy4-Flash-SQ-64.strata", src), [f"{base}/Hy4-Flash-SQ-64.strata"])
+        self.assertEqual(hy4_family.urls_for("Hy4-Flash-SQ-96.strata", src), [f"{base}/Hy4-Flash-SQ-96.strata"])
+        self.assertEqual(hy4_family.urls_for("Hy4-Flash-SQ-128.strata", src), [f"{base}/Hy4-Flash-SQ-128.strata"])
+        self.assertEqual(hy4_family.urls_for(hy4_family.ENGRAM_FILE, src), [f"{base}/{hy4_family.ENGRAM_FILE}"])
+        self.assertEqual(hy4_family.urls_for(hy4_family.VISION_FILE, src), [f"{base}/{hy4_family.VISION_FILE}"])
+        self.assertEqual(hy4_family.TITLE, "Tencent Hy4-Flash")
+        self.assertIn("220B-A12B", setup.HY4_FAMILIES["hy4-flash"]["about"])
 
     def test_cli_accepts_family_hy4_flash_with_model_sq64_and_rejects_bare_sq64_cleanly(self):
         import subprocess
@@ -151,7 +148,78 @@ class Offered(unittest.TestCase):
         r2 = subprocess.run([sys.executable, str(HERE.parent / "setup.py"), "--family", "hy4-flash", "--model", "SQ-64", "--context", "131072", "--vision", "yes", "--check"],
                             capture_output=True, text=True, timeout=120)
         self.assertNotIn("is a size of", r2.stderr)
-        self.assertIn("Tencent Hy4-Flash 220B-A12B", r2.stdout)
+        self.assertIn("Tencent Hy4-Flash", r2.stdout)
+
+    def test_http_server_e2e_install_doctor_and_on_demand_vision_fetch(self):
+        import functools
+        import http.server
+        import json
+        import threading
+        from strata_control import doctor, pictures
+
+        names = ("Hy4-Flash-SQ-64.strata", hy4_family.ENGRAM_FILE, hy4_family.VISION_FILE)
+        table, data = tiny_files(names)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            served = root / "served"
+            served.mkdir()
+            for name, blob in data.items():
+                (served / name).write_bytes(blob)
+            handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(served))
+            class QuietServer(http.server.ThreadingHTTPServer):
+                allow_reuse_address = True
+            class QuietHandler(http.server.SimpleHTTPRequestHandler):
+                def log_message(self, *args):
+                    pass
+            srv = QuietServer(("127.0.0.1", 0), functools.partial(QuietHandler, directory=str(served)))
+            port = srv.server_address[1]
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            try:
+                base_url = f"http://127.0.0.1:{port}"
+                data_dir = root / "data"
+                model_dir = data_dir / "models" / "hy4-flash"
+                model_dir.mkdir(parents=True)
+                tok_dir = data_dir / "tokenizers" / "hy4-flash"
+                tok_dir.mkdir(parents=True)
+                for fn in ("vocab.json", "merges.txt", "token_type.json"):
+                    (tok_dir / fn).write_text("{}", encoding="utf-8")
+                eng = root / ("strata-hy4.exe" if os.name == "nt" else "strata-hy4")
+                eng.write_bytes(b"exe")
+                if os.name != "nt":
+                    os.chmod(eng, 0o755)
+                for fn in ("Hy4-Flash-SQ-64.strata", hy4_family.ENGRAM_FILE):
+                    (model_dir / fn).write_bytes(data[fn])
+                vis_path = model_dir / hy4_family.VISION_FILE
+                cfg_path = root / "strata-hy4-flash-sq-64.json"
+                cfg = {
+                    "exe": str(eng), "arch": "hy4flash", "model_name": "hy4-flash-sq-64", "tokenizer": str(tok_dir),
+                    "args": ["--native", str(model_dir / "Hy4-Flash-SQ-64.strata"), "--engram", str(model_dir / hy4_family.ENGRAM_FILE),
+                             "--vision", str(vis_path), "--max-context", "131072"],
+                }
+                cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+                # Missing Vision shard -> doctor reports ONLY vision/mmproj missing
+                rep = doctor.inspect(cfg_path)
+                self.assertFalse(rep["ok"])
+                missing_parts = [c["name"] for c in rep["components"] if c["required"] and c["status"] != "ok"]
+                self.assertEqual(missing_parts, ["vision/mmproj"])
+                # On-demand pictures.fetch downloads Hy4-Flash-Vision.strata over real HTTP via STRATA_HY4_SOURCE
+                with mock.patch.object(hy4_family, "FILES", table), mock.patch.dict(os.environ, {"STRATA_HY4_SOURCE": base_url, "STRATA_NO_ACQUIRE": ""}):
+                    got = pictures.fetch(cfg_path, engine_dir=root, asked="yes", data_dir=data_dir, family="hy4-flash")
+                    self.assertTrue(got["fetched"])
+                    self.assertEqual(Path(got["mmproj"]), vis_path)
+                    self.assertEqual(vis_path.read_bytes(), data[hy4_family.VISION_FILE])
+                    self.assertIsNone(got["vision"])
+                    # Second call reuses the verified file on disk without downloading
+                    got2 = pictures.fetch(cfg_path, engine_dir=root, asked="yes", data_dir=data_dir, family="hy4-flash",
+                                          online=lambda url: self.fail("must reuse existing verified shard"))
+                    self.assertFalse(got2["fetched"])
+                    self.assertEqual(Path(got2["mmproj"]), vis_path)
+                rep2 = doctor.inspect(cfg_path)
+                self.assertTrue(rep2["ok"], rep2["issues"])
+            finally:
+                srv.shutdown()
+                srv.server_close()
 
     def test_control_mode_allows_strata_hy4_export_tokenizer_fallback(self):
         # P0 #4 regression: bundled CONTROL=True mode permits strata-hy4[.exe] --export-tokenizer fallback when Python lacks zstd

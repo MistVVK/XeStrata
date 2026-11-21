@@ -131,7 +131,7 @@ def claude_file(t: Target) -> str:
 def _display_name(t: Target) -> str:
     m = (t.model or "").lower()
     if m.startswith("hy4-flash"):
-        return "Tencent Hy4-Flash 220B-A12B (Strata, local)"
+        return "Tencent Hy4-Flash (Strata, local)"
     if m.startswith("qwen3.6") or m.startswith("qwen36"):
         return "Qwen3.6-35B-A3B (Strata, local)"
     return "Qwen3.8-Flash-Next (Strata, local)"
