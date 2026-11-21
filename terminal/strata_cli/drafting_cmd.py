@@ -150,6 +150,28 @@ def _signals(a, want: dict) -> dict:
 
 
 HY4_DRAFTING_LINE = "Tencent Hy4-Flash has its DFly2 drafter built into the model file; no separate drafter download is needed."
+INKLING_DRAFTING_LINE = "Inkling-2-Mini has its DSpark Block-8 drafter built into the model file; no separate drafter download is needed."
+
+
+def _is_inkling_drafting(a) -> bool:
+    from serve import inkling_kind
+    fam = (getattr(a, "family", None) or "").strip().lower()
+    if fam == "inkling-2-mini":
+        return True
+    model = getattr(a, "model", None)
+    if model:
+        low = str(model).strip().lower()
+        if low.startswith("inkling-2-mini") or low in ("sq-10", "sq-15", "sq-20"):
+            return True
+    try:
+        from strata_cli.launch.catalog import Catalog
+        for p in Catalog().strata.configs():
+            cfg = json.loads(p.read_text(encoding="utf-8-sig"))
+            if model and str(cfg.get("model_name") or "").lower() == str(model).strip().lower() and inkling_kind.is_inkling(cfg):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _is_hy4_drafting(a) -> bool:
@@ -189,22 +211,25 @@ def _is_hy4_drafting(a) -> bool:
 def run(a) -> int:
     from strata_control import drafting_fetch      # here, not at the top: it pulls in the network code, which a started engine's command line must not load
     machine = a.output in ("json", "jsonl")
-    if _is_hy4_drafting(a):
+    if _is_hy4_drafting(a) or _is_inkling_drafting(a):
+        is_ink = _is_inkling_drafting(a)
+        line = INKLING_DRAFTING_LINE if is_ink else HY4_DRAFTING_LINE
+        drafter_id = "dspark" if is_ink else "dfly2"
         if a.drafting_command == "plan":
             if machine:
                 print(json.dumps({"schema_version": 1, "ok": True, "needed": False, "tuned_needed": False, "mtp_here": False,
                                   "mtp_needed": False, "mtp_gb": 0.0, "serves": False, "ready": True, "gb": 0.0,
-                                  "drafter": "dfly2", "choice": "off" if getattr(a, "mode", None) == "off" else "auto",
-                                  "split": False, "note": "", "line": HY4_DRAFTING_LINE, "text": HY4_DRAFTING_LINE,
-                                  "support": "none", "support_line": HY4_DRAFTING_LINE}, ensure_ascii=False))
+                                  "drafter": drafter_id, "choice": "off" if getattr(a, "mode", None) == "off" else "auto",
+                                  "split": False, "note": "", "line": line, "text": line,
+                                  "support": "none", "support_line": line}, ensure_ascii=False))
             else:
-                print(HY4_DRAFTING_LINE)
+                print(line)
             return 0
         if machine:
             print(json.dumps({"schema_version": 1, "ok": True, "event": "result", "pack": None, "skipped": True,
-                              "message": HY4_DRAFTING_LINE}, ensure_ascii=False))
+                              "message": line}, ensure_ascii=False))
         else:
-            print(HY4_DRAFTING_LINE)
+            print(line)
         return 0
     if len(_installed_dflash2_configs(a)) > 1:               # which model's drafter? the generic fetch would take the stock one for a set that has a tuned one
         if machine:

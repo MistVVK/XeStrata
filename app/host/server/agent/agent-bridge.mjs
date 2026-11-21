@@ -502,8 +502,9 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     // The model and the chat's thinking level (the Reasoning menu) are sent to the Harness when either changed. A level the route does
     // not have (an API model with its own vocabulary) is dropped and the model's own default stands: never an error for the person.
     const isHy4Route = route.kind === 'local' && /^hy4-flash/i.test(String(route.modelId ?? ''));
-    const rawLevel = effortOf(thinking ?? (isHy4Route ? 'High' : 'Medium'));   // Hy4-Flash defaults to High (Off/High/Max); others default to Medium
-    const level = isHy4Route && (rawLevel === 'low' || rawLevel === 'medium') ? 'high' : rawLevel;
+    const isInklingRoute = route.kind === 'local' && /^inkling-2-mini/i.test(String(route.modelId ?? ''));
+    const rawLevel = effortOf(thinking ?? ((isHy4Route || isInklingRoute) ? 'High' : 'Medium'));
+    const level = isHy4Route && (rawLevel === 'low' || rawLevel === 'medium' || rawLevel === 'minimal') ? 'high' : rawLevel;
     // Response settings the Harness cannot send itself (the thinking budget, the Expert sampling) go through this host's forwarding
     // endpoint, on a copy of the route; with every setting at its default the route is used directly, as before.
     const budget = level === 'off' ? 0 : nearestBudget(thinkingBudget);

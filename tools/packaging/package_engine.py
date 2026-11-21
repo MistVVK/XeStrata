@@ -181,15 +181,15 @@ def build(src: Path, backend: str, version: str, target: str, out: Path, *, entr
         # sm_75 and up starts a restart loop on those cards ("this PC's GPU is sm_60")
         raise SystemExit("refusing to package the cuda12 engine without sm_60, sm_61 or sm_70: it is the Pascal and Volta build "
                          "(CUDA 12.9, -DSTRATA_EXPERIMENTAL_SM60=ON, --arch sm_60 --arch sm_61 --arch sm_70 ...; see packaging/build_cuda_linux.sh)")
-    if backend == "hip" and shape != shape_engine.HY4_SHAPE:         # the Hy4-Flash runner has its own kernels: no hipBLASLt, so no tuning table to match
+    if backend == "hip" and shape not in shape_engine.CUSTOM_SHAPES:         # custom shape runners (Hy4-Flash, Inkling-2-Mini) carry their own kernels (no hipBLASLt)
         from strata_control import hipblaslt_tuning
         problems = hipblaslt_tuning.check_stage(src, archs)
         if problems:
             raise SystemExit("refusing to package the AMD engine:\n  " + "\n  ".join(problems))
-    entrypoint = entry or ("strata.exe" if target.startswith("windows") else "strata")
+    entrypoint = entry or (shape_engine.exe_name(shape) if shape in shape_engine.CUSTOM_SHAPES else ("strata.exe" if target.startswith("windows") else "strata"))
     if not (src / entrypoint).is_file():
         raise SystemExit(f"{src / entrypoint} does not exist")
-    if check_reader and shape != shape_engine.HY4_SHAPE:   # the release recipes and the CLI ask for it; the library call keeps its old behaviour. Hy4-Flash reads pictures inside its runner (no strata-vision)
+    if check_reader and shape not in shape_engine.CUSTOM_SHAPES:   # custom shape runners (Hy4-Flash, Inkling-2-Mini) read pictures inside their runner (no strata-vision)
         for note in check_picture_reader(src, backend, target, archs, variant=variant, allow_stale=allow_stale_vision,
                                          allow_none=allow_no_reader):
             print("note: " + note)

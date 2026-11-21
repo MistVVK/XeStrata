@@ -34,7 +34,7 @@ import { NativePresets } from './NativePresets';
 import { NativeTune } from './NativeTune';
 import { NativeTuneBadge } from './NativeTuneBadge';
 import { commitWarning } from '../lib/commit-warning';
-import { nativeCatalogModels, catalogVersionLabel, fetchesPictures, hasKvChoice, HY4_FAMILY } from '../lib/native-catalog';
+import { nativeCatalogModels, catalogVersionLabel, fetchesPictures, hasKvChoice, HY4_FAMILY, INKLING_FAMILY } from '../lib/native-catalog';
 export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine }: {
     onOtherModels: () => void;
     onImport?: () => void;
@@ -69,7 +69,7 @@ export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine
         return () => cancelAnimationFrame(frame);
     }, [expert]);
     const selectedFamily = families.find(f => f.family === family || f.sizes.some(size => size.sourceFamily === family)) ?? families[0], selectedSize = selectedFamily?.sizes.find(s => s.id === size) ?? selectedFamily?.sizes[0];
-    const isHy4Selected = selectedFamily?.family === HY4_FAMILY;
+    const isHy4Selected = selectedFamily?.family === HY4_FAMILY || selectedFamily?.family === INKLING_FAMILY;
     const installed = native?.installed?.models.find(m => m.model === selectedSize?.id), listPending = installedListPending(native);
     // The sizes this model offers for the conversation context; it opens at 128K (or its largest size when that is smaller).
     const contextList = native?.catalog?.contexts ?? [8192, 32768, 65536, 131072, 262144];

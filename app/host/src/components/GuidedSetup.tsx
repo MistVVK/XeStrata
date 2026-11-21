@@ -20,7 +20,7 @@ import { FirstRunLanguage } from './FirstRunLanguage';
 import { DownloadParts } from './DownloadParts';
 import { EngineWarning } from './EngineWarning';
 import { OTHER_NOTE, PICK_NOTE, cardRoomGb, recommendedVersions } from '../lib/native-fit';
-import { nativeCatalogModels, catalogVersionLabel, startingChoice, HY4_FAMILY } from '../lib/native-catalog';
+import { nativeCatalogModels, catalogVersionLabel, startingChoice, HY4_FAMILY, INKLING_FAMILY } from '../lib/native-catalog';
 type Choices = NonNullable<NonNullable<SetupState['choices']>['onboarding']>;
 function radioKeys(event: KeyboardEvent<HTMLDivElement>) { if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key))
     return; event.preventDefault(); const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role=radio]')); const current = items.indexOf(event.target as HTMLButtonElement); const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (current + (['ArrowLeft', 'ArrowUp'].includes(event.key) ? -1 : 1) + items.length) % items.length; items[next]?.focus(); items[next]?.click(); }
@@ -57,7 +57,7 @@ export function GuidedSetup() {
     const [pending, setPending] = useState(false), [checkingPlan, setCheckingPlan] = useState(false), [error, setError] = useState(''), [calibrate, setCalibrate] = useState(saved?.calibrate ?? true);
     const writes = useRef(Promise.resolve()), leaving = useRef(false), saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null), titleRef = useRef<HTMLHeadingElement>(null);
     const selectedFamily = families.find(f => f.family === family || f.sizes.some(size => size.sourceFamily === family)) ?? families[0];
-    const isHy4Selected = selectedFamily?.family === HY4_FAMILY;
+    const isHy4Selected = selectedFamily?.family === HY4_FAMILY || selectedFamily?.family === INKLING_FAMILY;
     const version = selectedFamily?.sizes.find(s => s.id === size) ?? selectedFamily?.sizes[0];
     const installed = native?.installed?.models.find(m => m.model === version?.id);
     const contextList = native?.catalog?.contexts ?? [131072];

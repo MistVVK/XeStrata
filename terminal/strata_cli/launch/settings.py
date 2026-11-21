@@ -229,9 +229,12 @@ def check_parallel(s: LaunchSettings, *, vram_gb: float | None, fitted: int | No
     out: list[Notice] = []
     if s.parallel is None:
         return out
-    if not 1 <= int(s.parallel) <= 8:
-        out.append(Notice("error", f"{s.parallel} requests at once is outside what the engine can do (1 to 8).",
-                          "Pick a number from 1 to 8."))
+    max_p = 64 if s.family == "inkling-2-mini" else 8
+    if not 1 <= int(s.parallel) <= max_p:
+        out.append(Notice("error", f"{s.parallel} requests at once is outside what the engine can do (1 to {max_p}).",
+                          f"Pick a number from 1 to {max_p}."))
+        return out
+    if s.family == "inkling-2-mini":
         return out
     fitted = fit_parallel(vram_gb) if fitted is None else fitted
     if vram_gb and s.parallel > fitted:

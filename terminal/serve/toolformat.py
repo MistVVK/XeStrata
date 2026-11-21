@@ -16,6 +16,7 @@ import re
 
 _DSML = "｜DSML｜"          # the full-width bars DeepSeek's template writes
 _HY4 = "<tool_calls{}>"          # Tencent Hy4-Flash: its template builds `<tool_calls:opensource>` from this and the suffix variable
+_INKLING2 = "<|content_invoke_tool_json|>"   # Thinking Machines Inkling-2-Mini: tool_declare<|content_xml|> + <|content_invoke_tool_json|>
 _XML_OPEN = re.compile(r"<function=[^>]*>")
 
 
@@ -27,6 +28,8 @@ def tool_format(source: str) -> str:
         return "dsml"
     if _HY4 in source:
         return "hy4"
+    if _INKLING2 in source or "tool_declare<|content_xml|>" in source:
+        return "inkling2"
     has_call = "<tool_call>" in source
     if has_call and _XML_OPEN.search(source) and "<parameter=" in source:
         return "xml"

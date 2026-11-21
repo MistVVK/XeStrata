@@ -1,11 +1,16 @@
 /** Prepared vision files stay in the source config; activation belongs to a loaded instance. */
 import { isHy4, isHy4Family, hy4VisionShard } from './hy4.mjs';
+import { isInkling, isInklingFamily, inklingVisionShard } from './inkling.mjs';
 
 export function runtimeVision(config,requested){
  const mode=requested??(config.ui_vision_enabled===false?'no':config.ui_vision_device);
  if(mode!==undefined&&!['yes','no','cpu','gpu'].includes(mode))throw new Error('Choose whether to enable picture reading.');
  if(isHy4(config)){
   if(mode&&mode!=='no'&&!hy4VisionShard(config))throw new Error('Prepare this model’s vision files before enabling picture reading.');
+  return undefined;
+ }
+ if(isInkling(config)){
+  if(mode&&mode!=='no'&&!inklingVisionShard(config))throw new Error('Prepare this model’s vision files before enabling picture reading.');
   return undefined;
  }
  if(mode==='no')return undefined;
@@ -17,12 +22,12 @@ export function runtimeVision(config,requested){
 
 /**
  * The catalog with each picture-capable size marked as ready (`images`) or not (`imagesCapable` stays true either way). The Qwen engines
- * read pictures with a separate program (strata-vision) that has to sit in the engine folder; Hy4-Flash reads pictures inside strata-hy4 itself.
+ * read pictures with a separate program (strata-vision) that has to sit in the engine folder; Hy4-Flash and Inkling-2-Mini read pictures inside their runners.
  */
 export function markPictures(catalog,visionReader){
  if(!catalog||!Array.isArray(catalog.families))return catalog;
  return {...catalog,families:catalog.families.map(f=>{
-  const builtin=isHy4Family(f.family);
+  const builtin=isHy4Family(f.family)||isInklingFamily(f.family);
   const ready=(s)=>!!s.images&&(builtin||visionReader===true);
   const sizes=(f.sizes??[]).map(s=>({...s,imagesCapable:!!s.images,images:ready(s)}));
   return {...f,imagesCapable:!!f.images,images:sizes.length?sizes.some(s=>s.images):!!f.images&&(builtin||visionReader===true),sizes};

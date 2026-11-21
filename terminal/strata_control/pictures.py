@@ -103,15 +103,19 @@ def family_of(cfg: dict, gguf: Path | None, asked: str | None = None) -> str | N
     without it the model's own file name and name decide (Swift's files are called Swift-..., Qwen3.6's start with Qwen3.6)."""
     if asked:
         low = asked.lower()
-        if low == "hy4-flash":
+        if low in ("hy4-flash", "inkling-2-mini"):
             return low
         return low if low in PROJECTOR_BY_FAMILY else None
     arch = str(cfg.get("arch") or "").lower()
     if arch == "hy4flash" or "strata-hy4" in str(cfg.get("exe") or "").lower():
         return "hy4-flash"
+    if arch == "inkling2_loop" or "strata-inkling" in str(cfg.get("exe") or "").lower():
+        return "inkling-2-mini"
     names = [str(cfg.get("model_name") or "").lower(), (gguf.name.lower() if gguf else "")]
     if any(n.startswith("hy4-flash") for n in names):
         return "hy4-flash"
+    if any(n.startswith("inkling-2-mini") for n in names):
+        return "inkling-2-mini"
     from strata_control import retired
     if retired.config_reason(cfg) or any("deepseek" in n for n in names):      # never a DeepSeek config (retired.py)
         return None
@@ -327,13 +331,12 @@ def reader_section(engine_dir: Path, mmproj: Path, gguf: Path, asked: str, hardw
 
 # ------------------------------------------------------------------------------------------------------------- the step
 
-def _fetch_hy4(config: Path, cfg: dict, foot: "discovery.Footprint", *, data_dir: str | Path | None = None,
-               progress: Progress | None = None, cancel: threading.Event | None = None,
-               endpoint: str | None = None, online: Callable[[str], bool] | None = None) -> dict:
-    from strata_control import hy4_family
+def _fetch_strata_vision(fam_mod, config: Path, cfg: dict, foot: "discovery.Footprint", *, data_dir: str | Path | None = None,
+                         progress: Progress | None = None, cancel: threading.Event | None = None,
+                         endpoint: str | None = None, online: Callable[[str], bool] | None = None) -> dict:
     report = progress or (lambda *_: None)
-    size, sha = hy4_family.FILES[hy4_family.VISION_FILE]
-    projector = Projector(hy4_family.VISION_FILE, size, sha, "", "")
+    size, sha = fam_mod.FILES[fam_mod.VISION_FILE]
+    projector = Projector(fam_mod.VISION_FILE, size, sha, "", "")
     args = [str(a) for a in cfg.get("args") or []]
     native_raw = discovery._flag_value(args, "--native")
     native_path = Path(native_raw) if native_raw else None
@@ -351,7 +354,7 @@ def _fetch_hy4(config: Path, cfg: dict, foot: "discovery.Footprint", *, data_dir
     if native_path is not None:
         cands.append(native_path.parent / projector.name)
     if data is not None:
-        cands.append(models_root(data) / hy4_family.FAMILY / projector.name)
+        cands.append(models_root(data) / fam_mod.FAMILY / projector.name)
         cands.append(models_root(data) / projector.name)
     seen: set[str] = set()
     unique: list[Path] = []
@@ -368,16 +371,16 @@ def _fetch_hy4(config: Path, cfg: dict, foot: "discovery.Footprint", *, data_dir
         elif native_path is not None:
             out = native_path.parent / projector.name
         elif data is not None:
-            out = models_root(data) / hy4_family.FAMILY / projector.name
+            out = models_root(data) / fam_mod.FAMILY / projector.name
         else:
             raise PicturesError("no_folder", WORDS["no_folder"])
         acquisition.require("the picture files", "Load in the app, or strata install")
         if endpoint is not None:
             urls = [f"{endpoint.rstrip('/')}/{projector.name}"]
         else:
-            urls = [u for src in hy4_family.sources(cfg=cfg) for u in hy4_family.urls_for(projector.name, src)]
+            urls = [u for src in fam_mod.sources(cfg=cfg) for u in fam_mod.urls_for(projector.name, src)]
         if not urls:
-            raise PicturesError("failed", WORDS["failed"], "no Hy4-Flash download source is configured")
+            raise PicturesError("failed", WORDS["failed"], f"no {fam_mod.TITLE} download source is configured")
         _room(out.parent, projector.size)
         probe = online or _online
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -410,7 +413,21 @@ def _fetch_hy4(config: Path, cfg: dict, foot: "discovery.Footprint", *, data_dir
             pass
         found, fetched = out, True
     report("The picture files are ready.", projector.size, projector.size)
-    return {"mmproj": str(found), "vision": None, "fetched": fetched, "note": "", "data_dir": str(data) if data else None, "family": hy4_family.FAMILY}
+    return {"mmproj": str(found), "vision": None, "fetched": fetched, "note": "", "data_dir": str(data) if data else None, "family": fam_mod.FAMILY}
+
+
+def _fetch_hy4(config: Path, cfg: dict, foot: "discovery.Footprint", *, data_dir: str | Path | None = None,
+               progress: Progress | None = None, cancel: threading.Event | None = None,
+               endpoint: str | None = None, online: Callable[[str], bool] | None = None) -> dict:
+    from strata_control import hy4_family
+    return _fetch_strata_vision(hy4_family, config, cfg, foot, data_dir=data_dir, progress=progress, cancel=cancel, endpoint=endpoint, online=online)
+
+
+def _fetch_inkling(config: Path, cfg: dict, foot: "discovery.Footprint", *, data_dir: str | Path | None = None,
+                   progress: Progress | None = None, cancel: threading.Event | None = None,
+                   endpoint: str | None = None, online: Callable[[str], bool] | None = None) -> dict:
+    from strata_control import inkling_family
+    return _fetch_strata_vision(inkling_family, config, cfg, foot, data_dir=data_dir, progress=progress, cancel=cancel, endpoint=endpoint, online=online)
 
 
 def fetch(config_path: str | Path, *, engine_dir: str | Path, asked: str = "yes", data_dir: str | Path | None = None, family: str | None = None,
@@ -433,6 +450,8 @@ def fetch(config_path: str | Path, *, engine_dir: str | Path, asked: str = "yes"
     name = family_of(cfg, gguf, family)
     if name == "hy4-flash":
         return _fetch_hy4(config, cfg, foot, data_dir=data_dir, progress=progress, cancel=cancel, endpoint=endpoint, online=online)
+    if name == "inkling-2-mini":
+        return _fetch_inkling(config, cfg, foot, data_dir=data_dir, progress=progress, cancel=cancel, endpoint=endpoint, online=online)
     projector = PROJECTOR_BY_FAMILY.get(name) if name else None
     if projector is None or gguf is None:
         raise PicturesError("unsupported", WORDS["unsupported"])

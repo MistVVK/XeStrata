@@ -101,6 +101,18 @@ QWEN2_PATTERN = (
 )
 
 
+# The `o200k` pre-tokenizer (OpenAI o200k_base / Thinking Machines Inkling-2-Mini; exact Regex from tokenizer.json).
+O200K_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
 def _sequence_findall(patterns, text: str) -> list[str]:
     """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
     matches and the unmatched spans between them."""
@@ -125,7 +137,7 @@ class UnknownPreTokenizer(ValueError):
 
 
 def pre_tokenizer_kind(pre) -> str | None:
-    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "qwen2", "deepseek3", or
+    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "qwen2", "deepseek3", "o200k", or
     None for a type this file does not know.  An empty or missing value is the qwen35 default, as it always was."""
     p = "qwen35" if pre is None or pre == "" else str(pre)
     if p == "qwen35":
@@ -134,6 +146,8 @@ def pre_tokenizer_kind(pre) -> str | None:
         return "qwen2"
     if p.startswith("deepseek"):
         return "deepseek3"
+    if p in ("o200k", "o200k_base", "gpt-4o", "inkling2"):
+        return "o200k"
     return None
 
 
@@ -167,6 +181,9 @@ class Tokenizer:
         if pre_tokenizer_kind(pre) == "deepseek3":
             seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
             self._split = lambda text: _sequence_findall(seq, text)
+        elif pre_tokenizer_kind(pre) == "o200k":
+            self._re = regex.compile(O200K_PATTERN)
+            self._split = self._re.findall
         elif pre_tokenizer_kind(pre) == "qwen2":
             self._re = regex.compile(QWEN2_PATTERN)
             self._split = self._re.findall

@@ -276,7 +276,7 @@ def inspect(config_path: Path | None, *, profile_id: str | None = None, live: bo
             else:
                 components.append({"name": f"vision/{key}", "status": "invalid", "kind": "file",
                                    "required": True, "reason": "missing path"})
-    elif str(cfg.get("arch") or "").lower() == "hy4flash" and "--vision" in args:
+    elif str(cfg.get("arch") or "").lower() in ("hy4flash", "inkling2_loop") and "--vision" in args:
         vi = args.index("--vision")
         if vi + 1 < len(args) and isinstance(args[vi + 1], str) and args[vi + 1] and not args[vi + 1].startswith("--"):
             components.append(_item("vision/mmproj", _location(args[vi + 1], cfg, config_path), "file"))
