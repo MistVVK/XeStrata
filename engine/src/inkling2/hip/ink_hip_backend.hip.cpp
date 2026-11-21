@@ -14,6 +14,8 @@
 #include "ink_backend.h"
 #include "ink_vision.h"
 #include "ink_hip_ops.hip.h"
+#include "ink_hip_blaslt.hpp"
+#include "ink_hip_hybrid.hpp"
 #include "strata/hip_uma_guard.hpp"
 #include "strata/inkling2/inkling2_loop.hpp"
 #include "strata/quant/sk_codecs.hpp"
@@ -80,6 +82,16 @@ __global__ void __launch_bounds__(256) k_bf16_to_f32_vec(const uint16_t* src, fl
 __global__ void __launch_bounds__(256) k_f32_to_bf16_vec(const float* src, uint16_t* dst, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = strata::inkling2::hip::f32_to_bf16(src[i]);
+}
+
+__global__ void __launch_bounds__(256) k_add_bias_rows(float* Y, const float* bias, int M, int N) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < M * N) Y[idx] += bias[idx % N];
+}
+
+__global__ void __launch_bounds__(256) k_fill_dspark_masks(const float* mask_e, float* dst_rows, int n_masks, int D) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_masks * D) dst_rows[idx] = mask_e[idx % D];
 }
 
 // Batched DSpark context scatter: copies [B, cols] FP32 -> per-slot BF16 ring at pos[b] in 1 kernel launch!
@@ -398,12 +410,14 @@ public:
     const char* backend_name() const noexcept override { return "hip"; }
 
     std::string device_info() const override {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "%s (%s, %d CUs, UMA=%d, eff=%.2f GiB, chunk<=%d)",
+        char buf[320];
+        std::snprintf(buf, sizeof(buf), "%s (%s, %d CUs, UMA=%d, eff=%.2f GiB, chunk<=%d, blasLt=%d, hybrid=%d)",
                       mem_info_.device_name, mem_info_.arch_name, mem_info_.cu_count,
                       mem_info_.is_uma ? 1 : 0,
                       static_cast<double>(mem_info_.effective_total_bytes) / 1073741824.0,
-                      guard_.max_prefill_chunk);
+                      guard_.max_prefill_chunk,
+                      blaslt_.ready() ? 1 : 0,
+                      hybrid_.active() ? 1 : 0);
         return std::string(buf);
     }
 
@@ -446,6 +460,34 @@ public:
         }
         max_slots_ = std::max(1, std::min(kMaxParallelSlots, opts.parallel));
         max_ctx_ = std::max(256, opts.max_ctx);
+
+        // Initialize dynamic hipBLASLt Tensile runner (RDNA3/3.5/4; cleanly falls back on RDNA2 or missing DLL/SO)
+        (void)blaslt_.init(mem_info_.is_uma, mem_info_.gen);
+        blaslt_.warmup(mem_info_.is_uma, stream_);
+        // M >= 8 unlocks hipBLASLt for B=8 DSpark verify, DSpark 3L drafter, and c=8..64 batching!
+        blaslt_min_m_ = 8;
+        if (const char* ev = std::getenv("STRATA_HIPBLASLT_MIN_M")) {
+            const int v = std::atoi(ev);
+            if (v >= 1) blaslt_min_m_ = v;
+        }
+        // Fused zero-DRAM-write 2-launch INT8/FP16 WMMA Grouped-MoE beats unpack-once on both R9700 & Strix Halo
+        // (10x less memory traffic, 300x fewer launches!). Keep unpack-once env-tunable via STRATA_HIPBLASLT_MOE_MIN_B.
+        blaslt_moe_min_b_ = 999999;
+        if (const char* ev = std::getenv("STRATA_HIPBLASLT_MOE_MIN_B")) {
+            const int v = std::atoi(ev);
+            if (v >= 16) blaslt_moe_min_b_ = v;
+        }
+        // RDNA4 (gfx120x) has true 2x-rate 16x16x32 iu8 WMMA (96 TOPS); RDNA3/3.5 (gfx11xx) uses 16x16x16 so FP16 WMMA avoids Q8 quant overhead!
+        use_i8_moe_wmma_ = (mem_info_.gen == AmdGen::Rdna4);
+        if (const char* ev = std::getenv("STRATA_HIP_MOE_I8")) {
+            use_i8_moe_wmma_ = (std::atoi(ev) != 0);
+        }
+        if (blaslt_.ready() && blaslt_moe_min_b_ < 999999) {
+            const size_t w13_b = static_cast<size_t>(2 * c_.inter) * c_.hidden * sizeof(half_t);
+            const size_t w2_b  = static_cast<size_t>(c_.hidden) * c_.inter * sizeof(half_t);
+            (void)alloc_gpu_buffer(d_exp_w13_f16_, w13_b, mem_info_.is_uma);
+            (void)alloc_gpu_buffer(d_exp_w2_f16_,  w2_b,  mem_info_.is_uma);
+        }
 
         // 1. Load Section 1 trunk + DSpark arena from .strata file
         std::vector<uint8_t> sec1;
@@ -529,6 +571,40 @@ public:
         }
         host_tmp_.clear();
 
+        // Concatenate [wq(q_dim); wr(r_dim); gate_a(q_dim); wk(kv_dim); wv(kv_dim)] per layer into 1 contiguous BF16 matrix
+        // (0 extra VRAM — frees the 5 individual BF16 buffers immediately -> 1 GEMM instead of 5 per visit!)
+        trunk_qkvrg_.resize(c_.n_phys);
+        for (int il = 0; il < c_.n_phys; ++il) {
+            const std::string p = "model.llm.layers." + std::to_string(il) + ".attn.";
+            const std::string ks[5] = {
+                p + "wq_du.weight", p + "wr_du.weight", p + "gate_attn.weight",
+                p + "wk_dv.weight", p + "wv_dv.weight"
+            };
+            bool all_bf = true;
+            size_t tot_b = 0;
+            for (int j = 0; j < 5; ++j) {
+                auto it = trunk_bf16_.find(ks[j]);
+                if (it == trunk_bf16_.end()) { all_bf = false; break; }
+                tot_b += it->second.bytes;
+            }
+            if (all_bf && tot_b > 0) {
+                GpuBuffer cat;
+                if (alloc_gpu_buffer(cat, tot_b, mem_info_.is_uma) == hipSuccess) {
+                    size_t off = 0;
+                    for (int j = 0; j < 5; ++j) {
+                        auto& b = trunk_bf16_.at(ks[j]);
+                        (void)hipMemcpy(cat.dev_ptr + off, b.dev_ptr, b.bytes, hipMemcpyDeviceToDevice);
+                        off += b.bytes;
+                    }
+                    for (int j = 0; j < 5; ++j) {
+                        free_gpu_buffer(trunk_bf16_.at(ks[j]));
+                        trunk_bf16_.erase(ks[j]);
+                    }
+                    trunk_qkvrg_[il] = cat;
+                }
+            }
+        }
+
         // 2. Load embedded DSpark tensors to GPU if present & enabled
         has_dspark_ = opts.enable_dspark && dspark_cfg_.present;
         if (has_dspark_) {
@@ -539,7 +615,11 @@ public:
                 if (k == "fuse_weight" || k.find("fuse") != std::string::npos) {
                     h_dspark_fuse_ = f32;
                 }
-                if (kv.second.shape.size() == 2 && k.find("layers.") == 0) {
+                const bool store_bf16 = (kv.second.shape.size() == 2) &&
+                    (k.find("layers.") == 0 ||
+                     k == "markov_head.rnn_proj.weight" ||
+                     k == "markov_head.hidden_out.weight");
+                if (store_bf16) {
                     auto bf16 = f32_vec_to_bf16(f32);
                     GpuBuffer b;
                     if (!upload_raw(b, bf16.data(), bf16.size() * sizeof(uint16_t), err)) return false;
@@ -587,7 +667,28 @@ public:
             }
         }
 
-        // Plan contiguous GPU arena for all experts fitting in vram_budget
+        // Check whether all experts fit in vram_budget; if hybrid (partial VRAM), reserve elastic VRAM cache inside budget!
+        size_t total_all_exp_bytes = 0;
+        size_t max_exp_bytes = 0;
+        for (uint16_t idx : model.vram_load_order) {
+            if (idx >= n_dir) continue;
+            const size_t aligned = (dir[idx].body_bytes + 63u) & ~size_t(63u);
+            total_all_exp_bytes += aligned;
+            max_exp_bytes = std::max(max_exp_bytes, aligned);
+        }
+        size_t hybrid_cache_budget = 0;
+        size_t static_vram_budget = vram_budget;
+        if (total_all_exp_bytes > vram_budget && max_exp_bytes > 0) {
+            const size_t stage2_b = 2u * max_exp_bytes;
+            if (static_vram_budget > stage2_b + 16u * max_exp_bytes) {
+                hybrid_cache_budget = std::min<size_t>(256ULL << 20, std::max<size_t>(16u * max_exp_bytes, static_vram_budget / 10));
+                static_vram_budget -= (hybrid_cache_budget + stage2_b);
+            } else if (static_vram_budget > stage2_b) {
+                static_vram_budget -= stage2_b;
+            }
+        }
+
+        // Plan contiguous GPU arena for all experts fitting in static_vram_budget
         size_t arena_bytes = 0;
         std::vector<uint16_t> gpu_plan;
         std::vector<uint16_t> ram_plan;
@@ -595,14 +696,12 @@ public:
             ? static_cast<size_t>(opts.ram_experts_gb * 1073741824.0)
             : static_cast<size_t>(-1);
         size_t ram_bytes = 0;
-        size_t max_exp_bytes = 0;
 
         for (uint16_t idx : model.vram_load_order) {
             if (idx >= n_dir) continue;
             const size_t sz = dir[idx].body_bytes;
             const size_t aligned = (sz + 63u) & ~size_t(63u);
-            max_exp_bytes = std::max(max_exp_bytes, aligned);
-            if (arena_bytes + aligned <= vram_budget) {
+            if (arena_bytes + aligned <= static_vram_budget) {
                 expert_gpu_offset_[idx] = arena_bytes;
                 arena_bytes += aligned;
                 gpu_plan.push_back(idx);
@@ -646,13 +745,21 @@ public:
             if (!hip_ok(alloc_gpu_buffer(d_exp_stage_, max_exp_bytes, mem_info_.is_uma), "expert stage alloc", err)) {
                 return false;
             }
+            if (!hybrid_.init(n_dir, max_exp_bytes, hybrid_cache_budget, mem_info_.is_uma, opts.threads, err)) {
+                return false;
+            }
         }
 
-        // Build per-layer GPU expert descriptor tables [128] for zero-sync GPU MoE!
+        // Build per-layer GPU expert descriptor tables [128] & per-layer codec class (0=all S_K, 1=all SF4, 2=MX8/mixed)
         d_layer_exps_.resize(c_.n_phys);
+        h_layer_exps_.resize(c_.n_phys);
         layer_all_gpu_.assign(c_.n_phys, true);
+        layer_gu_class_.assign(c_.n_phys, 2);
+        layer_dn_class_.assign(c_.n_phys, 2);
         for (int il = 0; il < c_.n_phys; ++il) {
             std::vector<GpuExpertDesc> tbl(c_.n_experts);
+            bool all_gu_sk = true, all_gu_sf4 = true;
+            bool all_dn_sk = true, all_dn_sf4 = true;
             for (int e = 0; e < c_.n_experts; ++e) {
                 const int dir_idx = model.dir_index_of[il * c_.n_experts + e];
                 GpuExpertDesc d{};
@@ -661,11 +768,19 @@ public:
                     d.dn_offset = dir[dir_idx].dn_offset;
                     d.gu_code = dir[dir_idx].gu_code_id;
                     d.dn_code = dir[dir_idx].dn_code_id;
+                    if (d.gu_code != CODE_SF4) all_gu_sf4 = false;
+                    if (d.gu_code == CODE_SF4 || d.gu_code == CODE_MX8) all_gu_sk = false;
+                    if (d.dn_code != CODE_SF4) all_dn_sf4 = false;
+                    if (d.dn_code == CODE_SF4 || d.dn_code == CODE_MX8) all_dn_sk = false;
                 } else {
                     layer_all_gpu_[il] = false;
+                    all_gu_sk = all_gu_sf4 = all_dn_sk = all_dn_sf4 = false;
                 }
                 tbl[e] = d;
             }
+            layer_gu_class_[il] = all_gu_sk ? 0 : (all_gu_sf4 ? 1 : 2);
+            layer_dn_class_[il] = all_dn_sk ? 0 : (all_dn_sf4 ? 1 : 2);
+            h_layer_exps_[il] = tbl;
             if (!upload_raw(d_layer_exps_[il], tbl.data(), tbl.size() * sizeof(GpuExpertDesc), err)) return false;
         }
 
@@ -869,10 +984,8 @@ public:
             reinterpret_cast<const int32_t*>(d_dspark_toks_.dev_ptr), nullptr, nullptr,
             reinterpret_cast<float*>(ds_cur_.dev_ptr), 1, D, c_.rms_eps);
         const float* mask_e = reinterpret_cast<const float*>(dspark_f32_.at("mask_embed").dev_ptr);
-        for (int i = 1; i < B; ++i) {
-            (void)hipMemcpyAsync(reinterpret_cast<float*>(ds_cur_.dev_ptr) + static_cast<size_t>(i) * D,
-                           mask_e, D * sizeof(float), hipMemcpyDeviceToDevice, stream_);
-        }
+        k_fill_dspark_masks<<<((B - 1) * D + 255) / 256, 256, 0, stream_>>>(
+            mask_e, reinterpret_cast<float*>(ds_cur_.dev_ptr) + D, B - 1, D);
 
         // 2. Run 3 non-causal block-8 attention + SwiGLU layers on GPU!
         float* cur = reinterpret_cast<float*>(ds_cur_.dev_ptr);
@@ -890,9 +1003,9 @@ public:
             (void)hipMemcpyAsync(res, cur, static_cast<size_t>(B) * D * sizeof(float), hipMemcpyDeviceToDevice, stream_);
             k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32(p + ".input_layernorm.weight"), h, B, D, dspark_cfg_.rms_eps);
 
-            launch_bf16_linear(ds_bf16(p + ".self_attn.q_proj.weight"), h, nullptr, q,  B, q_dim,  D, mem_info_.gen, stream_);
-            launch_bf16_linear(ds_bf16(p + ".self_attn.k_proj.weight"), h, nullptr, kd, B, kv_dim, D, mem_info_.gen, stream_);
-            launch_bf16_linear(ds_bf16(p + ".self_attn.v_proj.weight"), h, nullptr, vd, B, kv_dim, D, mem_info_.gen, stream_);
+            launch_bf16_opt(ds_bf16(p + ".self_attn.q_proj.weight"), h, nullptr, q,  B, q_dim,  D);
+            launch_bf16_opt(ds_bf16(p + ".self_attn.k_proj.weight"), h, nullptr, kd, B, kv_dim, D);
+            launch_bf16_opt(ds_bf16(p + ".self_attn.v_proj.weight"), h, nullptr, vd, B, kv_dim, D);
 
             k_rms_norm_rows<<<B * H, 256, 0, stream_>>>(q, ds_f32(p + ".self_attn.q_norm.weight"), q, B * H, hd, dspark_cfg_.rms_eps);
             k_rms_norm_rows<<<B * KV, 256, 0, stream_>>>(kd, ds_f32(p + ".self_attn.k_norm.weight"), kd, B * KV, hd, dspark_cfg_.rms_eps);
@@ -906,15 +1019,15 @@ public:
                 reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
                 kd, vd, ao, B, H, KV, c0, c_len);
 
-            launch_bf16_linear(ds_bf16(p + ".self_attn.o_proj.weight"), ao, nullptr, h, B, D, q_dim, mem_info_.gen, stream_);
+            launch_bf16_opt(ds_bf16(p + ".self_attn.o_proj.weight"), ao, nullptr, h, B, D, q_dim);
             k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, h, cur, B * D);
 
             (void)hipMemcpyAsync(res, cur, static_cast<size_t>(B) * D * sizeof(float), hipMemcpyDeviceToDevice, stream_);
             k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32(p + ".post_attention_layernorm.weight"), h, B, D, dspark_cfg_.rms_eps);
-            launch_bf16_linear(ds_bf16(p + ".mlp.gate_proj.weight"), h, nullptr, mg, B, inter, D, mem_info_.gen, stream_);
-            launch_bf16_linear(ds_bf16(p + ".mlp.up_proj.weight"),   h, nullptr, mu, B, inter, D, mem_info_.gen, stream_);
+            launch_bf16_opt(ds_bf16(p + ".mlp.gate_proj.weight"), h, nullptr, mg, B, inter, D);
+            launch_bf16_opt(ds_bf16(p + ".mlp.up_proj.weight"),   h, nullptr, mu, B, inter, D);
             k_swiglu_f32<<<(B * inter + 255) / 256, 256, 0, stream_>>>(mg, mu, mg, B * inter);
-            launch_bf16_linear(ds_bf16(p + ".mlp.down_proj.weight"), mg, nullptr, h, B, D, inter, mem_info_.gen, stream_);
+            launch_bf16_opt(ds_bf16(p + ".mlp.down_proj.weight"), mg, nullptr, h, B, D, inter);
             k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, h, cur, B * D);
         }
 
@@ -948,18 +1061,18 @@ public:
         for (int step = 1; step <= n_draft; ++step) {
             float* st_in  = (step & 1) ? st_a : st_b;
             float* st_out = (step & 1) ? st_b : st_a;
-            k5_dspark_markov_proj<<<(rank + 7) / 8, 256, 0, stream_>>>(
+            k5_dspark_markov_proj_bf16<<<(rank + 7) / 8, 256, 0, stream_>>>(
                 d_toks + (step - 1),
                 st_in, st_out, d_lat,
                 cur + static_cast<size_t>(step) * D,
                 res,
                 ds_f32("markov_head.markov_w1.weight"),
-                ds_f32("markov_head.rnn_proj.weight"),
+                ds_bf16("markov_head.rnn_proj.weight"),
                 ds_f32("markov_head.rnn_proj.bias"),
                 D, rank);
-            k5_dspark_markov_corr<<<(D + 7) / 8, 256, 0, stream_>>>(
+            k5_dspark_markov_corr_bf16<<<(D + 7) / 8, 256, 0, stream_>>>(
                 d_lat,
-                ds_f32("markov_head.hidden_out.weight"),
+                ds_bf16("markov_head.hidden_out.weight"),
                 ds_f32("markov_head.hidden_out.bias"),
                 d_corr, D, rank);
             k5_dspark_cand_argmax_stage1<<<kCandArgBlks, 256, 0, stream_>>>(
@@ -1096,10 +1209,16 @@ public:
         }
 
         float* cur = reinterpret_cast<float*>(d_cur.dev_ptr);
+        const int merged_dim = merge * merge * D;
+        const size_t vit_xbf_need = static_cast<size_t>(std::max(S, n_tok)) * std::max({D, vc.inter, merged_dim, vc.proj_hidden}) * sizeof(uint16_t);
+        if (blaslt_.ready() && sc_x_bf16_.bytes < vit_xbf_need) {
+            free_gpu_buffer(sc_x_bf16_);
+            (void)alloc_gpu_buffer(sc_x_bf16_, vit_xbf_need, mem_info_.is_uma);
+        }
         (void)hipMemsetAsync(cur, 0, static_cast<size_t>(D) * 4, stream_);
-        launch_bf16_linear(vit_bf16("model.visual.backbone.embeddings.patch_embedding.weight"),
-                           reinterpret_cast<const float*>(d_patch.dev_ptr), nullptr, cur + D,
-                           n_patches, D, patch_in, mem_info_.gen, stream_);
+        launch_bf16_opt(vit_bf16("model.visual.backbone.embeddings.patch_embedding.weight"),
+                        reinterpret_cast<const float*>(d_patch.dev_ptr), nullptr, cur + D,
+                        n_patches, D, patch_in);
         k_vec_add<<<(S * D + 255) / 256, 256, 0, stream_>>>(cur, reinterpret_cast<const float*>(d_pos.dev_ptr), cur, S * D);
         k_vit_layernorm_f32<<<S, 256, 0, stream_>>>(cur, vit_f32("model.visual.backbone.ln_pre.weight"),
                                                     vit_f32("model.visual.backbone.ln_pre.bias"), cur, S, D, vc.ln_eps);
@@ -1108,30 +1227,30 @@ public:
             const std::string p = "model.visual.backbone.layers." + std::to_string(il);
             k_vit_layernorm_f32<<<S, 256, 0, stream_>>>(cur, vit_f32(p + ".ln_1.weight"), vit_f32(p + ".ln_1.bias"),
                                                         reinterpret_cast<float*>(d_norm.dev_ptr), S, D, vc.ln_eps);
-            launch_bf16_linear(vit_bf16(p + ".self_attn.q_proj.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
-                               vit_f32(p + ".self_attn.q_proj.bias"), reinterpret_cast<float*>(d_q.dev_ptr), S, D, D, mem_info_.gen, stream_);
-            launch_bf16_linear(vit_bf16(p + ".self_attn.k_proj.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
-                               vit_f32(p + ".self_attn.k_proj.bias"), reinterpret_cast<float*>(d_k.dev_ptr), S, D, D, mem_info_.gen, stream_);
-            launch_bf16_linear(vit_bf16(p + ".self_attn.v_proj.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
-                               vit_f32(p + ".self_attn.v_proj.bias"), reinterpret_cast<float*>(d_v.dev_ptr), S, D, D, mem_info_.gen, stream_);
+            launch_bf16_opt(vit_bf16(p + ".self_attn.q_proj.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
+                            vit_f32(p + ".self_attn.q_proj.bias"), reinterpret_cast<float*>(d_q.dev_ptr), S, D, D);
+            launch_bf16_opt(vit_bf16(p + ".self_attn.k_proj.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
+                            vit_f32(p + ".self_attn.k_proj.bias"), reinterpret_cast<float*>(d_k.dev_ptr), S, D, D);
+            launch_bf16_opt(vit_bf16(p + ".self_attn.v_proj.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
+                            vit_f32(p + ".self_attn.v_proj.bias"), reinterpret_cast<float*>(d_v.dev_ptr), S, D, D);
             k_vit_rope_2d<<<dim3(H, S), hd / 2, 0, stream_>>>(
                 reinterpret_cast<float*>(d_q.dev_ptr), reinterpret_cast<float*>(d_k.dev_ptr),
                 reinterpret_cast<const float*>(d_rc.dev_ptr), reinterpret_cast<const float*>(d_rs.dev_ptr), S, H, hd);
             k_vit_full_attn<<<dim3(H, S), 64, 0, stream_>>>(
                 reinterpret_cast<const float*>(d_q.dev_ptr), reinterpret_cast<const float*>(d_k.dev_ptr),
                 reinterpret_cast<const float*>(d_v.dev_ptr), reinterpret_cast<float*>(d_ao.dev_ptr), S, H, hd);
-            launch_bf16_linear(vit_bf16(p + ".self_attn.out_proj.weight"), reinterpret_cast<const float*>(d_ao.dev_ptr),
-                               vit_f32(p + ".self_attn.out_proj.bias"), reinterpret_cast<float*>(d_proj.dev_ptr), S, D, D, mem_info_.gen, stream_);
+            launch_bf16_opt(vit_bf16(p + ".self_attn.out_proj.weight"), reinterpret_cast<const float*>(d_ao.dev_ptr),
+                            vit_f32(p + ".self_attn.out_proj.bias"), reinterpret_cast<float*>(d_proj.dev_ptr), S, D, D);
             k_vit_layerscale_res<<<(S * D + 255) / 256, 256, 0, stream_>>>(cur, reinterpret_cast<const float*>(d_proj.dev_ptr),
                                                                            vit_f32(p + ".ls_1.gamma"), S, D);
 
             k_vit_layernorm_f32<<<S, 256, 0, stream_>>>(cur, vit_f32(p + ".ln_2.weight"), vit_f32(p + ".ln_2.bias"),
                                                         reinterpret_cast<float*>(d_norm.dev_ptr), S, D, vc.ln_eps);
-            launch_bf16_linear(vit_bf16(p + ".mlp.c_fc.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
-                               vit_f32(p + ".mlp.c_fc.bias"), reinterpret_cast<float*>(d_mlp.dev_ptr), S, vc.inter, D, mem_info_.gen, stream_);
+            launch_bf16_opt(vit_bf16(p + ".mlp.c_fc.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
+                            vit_f32(p + ".mlp.c_fc.bias"), reinterpret_cast<float*>(d_mlp.dev_ptr), S, vc.inter, D);
             k_vit_gelu_exact<<<(S * vc.inter + 255) / 256, 256, 0, stream_>>>(reinterpret_cast<float*>(d_mlp.dev_ptr), S * vc.inter);
-            launch_bf16_linear(vit_bf16(p + ".mlp.c_proj.weight"), reinterpret_cast<const float*>(d_mlp.dev_ptr),
-                               vit_f32(p + ".mlp.c_proj.bias"), reinterpret_cast<float*>(d_proj.dev_ptr), S, D, vc.inter, mem_info_.gen, stream_);
+            launch_bf16_opt(vit_bf16(p + ".mlp.c_proj.weight"), reinterpret_cast<const float*>(d_mlp.dev_ptr),
+                            vit_f32(p + ".mlp.c_proj.bias"), reinterpret_cast<float*>(d_proj.dev_ptr), S, D, vc.inter);
             k_vit_layerscale_res<<<(S * D + 255) / 256, 256, 0, stream_>>>(cur, reinterpret_cast<const float*>(d_proj.dev_ptr),
                                                                            vit_f32(p + ".ls_2.gamma"), S, D);
             if (guard_.visit_flush_stride > 0 && ((il + 1) % guard_.visit_flush_stride == 0)) {
@@ -1140,12 +1259,11 @@ public:
         }
 
         // 2x2 merge projector (drop CLS at index 0)
-        const int merged_dim = merge * merge * D;
-        launch_bf16_linear(vit_bf16("model.visual.proj_in.weight"), cur + D, nullptr,
-                           reinterpret_cast<float*>(d_mid.dev_ptr), n_tok, vc.proj_hidden, merged_dim, mem_info_.gen, stream_);
+        launch_bf16_opt(vit_bf16("model.visual.proj_in.weight"), cur + D, nullptr,
+                        reinterpret_cast<float*>(d_mid.dev_ptr), n_tok, vc.proj_hidden, merged_dim);
         k_vit_gelu_exact<<<(n_tok * vc.proj_hidden + 255) / 256, 256, 0, stream_>>>(reinterpret_cast<float*>(d_mid.dev_ptr), n_tok * vc.proj_hidden);
-        launch_bf16_linear(vit_bf16("model.visual.proj_out.weight"), reinterpret_cast<const float*>(d_mid.dev_ptr), nullptr,
-                           reinterpret_cast<float*>(d_out.dev_ptr), n_tok, vc.out_hidden, vc.proj_hidden, mem_info_.gen, stream_);
+        launch_bf16_opt(vit_bf16("model.visual.proj_out.weight"), reinterpret_cast<const float*>(d_mid.dev_ptr), nullptr,
+                        reinterpret_cast<float*>(d_out.dev_ptr), n_tok, vc.out_hidden, vc.proj_hidden);
 
         out_embeds.resize(static_cast<size_t>(n_tok) * vc.out_hidden);
         const bool ok = hip_ok(hipMemcpyAsync(out_embeds.data(), d_out.dev_ptr, out_embeds.size() * 4, hipMemcpyDeviceToHost, stream_), "vit D2H", err)
@@ -1252,10 +1370,97 @@ private:
         return reinterpret_cast<const uint16_t*>(vision_.w_bf16.at(k).dev_ptr);
     }
 
+    void launch_bf16_opt(const uint16_t* W, const float* X, const float* bias, float* Y, int M, int N, int K) {
+        if (blaslt_.ready() && M >= blaslt_min_m_ && N >= 64 && K >= 64) {
+            const size_t need = static_cast<size_t>(M) * K * sizeof(uint16_t);
+            if (sc_x_bf16_.bytes >= need) {
+                uint16_t* x_bf = reinterpret_cast<uint16_t*>(sc_x_bf16_.dev_ptr);
+                k_f32_to_bf16_vec<<<(M * K + 255) / 256, 256, 0, stream_>>>(X, x_bf, M * K);
+                if (blaslt_.gemm_bf16_f32(W, x_bf, Y, M, N, K, stream_, 1.0f)) {
+                    if (bias) {
+                        k_add_bias_rows<<<(M * N + 255) / 256, 256, 0, stream_>>>(Y, bias, M, N);
+                    }
+                    return;
+                }
+            }
+        }
+        launch_bf16_linear(W, X, bias, Y, M, N, K, mem_info_.gen, stream_);
+    }
+
+    // L3-Resident Expert Unpack-Once + hipBLASLt FP16 GEMM helper (used by both full-GPU prefill & double-buffered hybrid prefill!)
+    void run_single_expert_blaslt(
+        const uint8_t* body_dev, uint8_t gu_code, uint8_t dn_code, uint32_t dn_offset,
+        float sf4_w13_outer, float sf4_w2_outer,
+        const half_t* x_in_f16, float* gu_buf, half_t* act_buf, float* y_out_f32,
+        int m_e, int D, int inter) {
+        half_t* w13_f16 = reinterpret_cast<half_t*>(d_exp_w13_f16_.dev_ptr);
+        half_t* w2_f16  = reinterpret_cast<half_t*>(d_exp_w2_f16_.dev_ptr);
+        const int n13 = 2 * inter;
+
+        // 1. Unpack w13 [2*inter, D] -> L3/MALL-resident 11.8 MB FP16 buffer -> hipBLASLt FP16 GEMM!
+        float alpha13 = 1.0f;
+        if (gu_code == CODE_SF4) {
+            const uint8_t* p = body_dev + 16;
+            const uint8_t* s = p + static_cast<size_t>(n13) * (D >> 1);
+            k_unpack_sf4_f16<<<(n13 * (D >> 4) + 255) / 256, 256, 0, stream_>>>(p, s, w13_f16, n13, D);
+            alpha13 = sf4_w13_outer * 16.0f;
+        } else if (gu_code == CODE_MX8) {
+            const uint8_t* w = body_dev;
+            const uint8_t* s = w + static_cast<size_t>(n13) * D;
+            k_unpack_mx8_f16<<<(n13 * (D >> 5) + 255) / 256, 256, 0, stream_>>>(w, s, w13_f16, n13, D);
+        } else {
+            const uint8_t* gu_ptr = body_dev + static_cast<size_t>(inter) * 2;
+            launch_unpack_sk_f16_dispatch(gu_ptr, gu_code, w13_f16, n13, D, stream_);
+        }
+        if (!blaslt_.gemm_f16_f32(w13_f16, x_in_f16, gu_buf, m_e, n13, D, stream_, alpha13)) {
+            if (gu_code == CODE_SF4) {
+                const uint8_t* p = body_dev + 16;
+                launch_sf4_linear(p, p + static_cast<size_t>(n13) * (D >> 1), sf4_w13_outer, x_in_f16, gu_buf, m_e, n13, D, mem_info_.gen, stream_, false);
+            } else if (gu_code == CODE_MX8) {
+                launch_mx8_linear(body_dev, body_dev + static_cast<size_t>(n13) * D, x_in_f16, gu_buf, m_e, n13, D, mem_info_.gen, stream_);
+            } else {
+                launch_sk_linear(body_dev + static_cast<size_t>(inter) * 2, gu_code, x_in_f16, gu_buf, m_e, n13, D, mem_info_.gen, stream_);
+            }
+        }
+
+        // 2. Fused SITU + optional S_K sq_xd_dn divide directly on FP32 gu_buf -> FP16 act_buf!
+        const half_t* sq_dn = (dn_code != CODE_SF4 && dn_code != CODE_MX8)
+            ? reinterpret_cast<const half_t*>(body_dev) : nullptr;
+        k_situ_interleaved_sq<<<(m_e * inter + 255) / 256, 256, 0, stream_>>>(
+            gu_buf, sq_dn, act_buf, m_e, inter, c_.situ_beta, c_.situ_lb);
+
+        // 3. Unpack w2 [D, inter] -> L3/MALL-resident 5.9 MB FP16 buffer -> hipBLASLt FP16 GEMM!
+        float alpha2 = 1.0f;
+        if (dn_code == CODE_SF4) {
+            const uint8_t* p = body_dev + dn_offset;
+            const uint8_t* s = p + static_cast<size_t>(D) * (inter >> 1);
+            k_unpack_sf4_f16<<<(D * (inter >> 4) + 255) / 256, 256, 0, stream_>>>(p, s, w2_f16, D, inter);
+            alpha2 = sf4_w2_outer * 16.0f;
+        } else if (dn_code == CODE_MX8) {
+            const uint8_t* w = body_dev + dn_offset;
+            const uint8_t* s = w + static_cast<size_t>(D) * inter;
+            k_unpack_mx8_f16<<<(D * (inter >> 5) + 255) / 256, 256, 0, stream_>>>(w, s, w2_f16, D, inter);
+        } else {
+            launch_unpack_sk_paired2_f16_dispatch(body_dev + dn_offset, dn_code, w2_f16, D, inter, stream_);
+        }
+        if (!blaslt_.gemm_f16_f32(w2_f16, act_buf, y_out_f32, m_e, D, inter, stream_, alpha2)) {
+            if (dn_code == CODE_SF4) {
+                const uint8_t* p = body_dev + dn_offset;
+                launch_sf4_linear(p, p + static_cast<size_t>(D) * (inter >> 1), sf4_w2_outer, act_buf, y_out_f32, m_e, D, inter, mem_info_.gen, stream_, false);
+            } else if (dn_code == CODE_MX8) {
+                launch_mx8_linear(body_dev + dn_offset, body_dev + dn_offset + static_cast<size_t>(D) * inter, act_buf, y_out_f32, m_e, D, inter, mem_info_.gen, stream_);
+            } else {
+                // act_buf already divided by sq_xd_dn; pass nullptr? No, launch_sk_paired2_linear expects undivided act.
+                // Note: blaslt_.gemm_f16_f32 only fails if blaslt is disabled, which never enters this helper.
+                launch_sk_paired2_linear(body_dev + dn_offset, dn_code, reinterpret_cast<const half_t*>(body_dev), act_buf, y_out_f32, m_e, D, inter, stream_);
+            }
+        }
+    }
+
     void launch_trunk_linear(const std::string& key, const float* X, float* Y, int M, int N, int K) {
         auto it_bf = trunk_bf16_.find(key);
         if (it_bf != trunk_bf16_.end()) {
-            launch_bf16_linear(reinterpret_cast<const uint16_t*>(it_bf->second.dev_ptr), X, nullptr, Y, M, N, K, mem_info_.gen, stream_);
+            launch_bf16_opt(reinterpret_cast<const uint16_t*>(it_bf->second.dev_ptr), X, nullptr, Y, M, N, K);
         } else {
             launch_f32_linear(reinterpret_cast<const float*>(trunk_f32_.at(key).dev_ptr), X, nullptr, Y, M, N, K, stream_, mem_info_.gen);
         }
@@ -1274,7 +1479,9 @@ private:
     }
 
     size_t vram_used_bytes() const noexcept {
-        size_t tot = expert_gpu_arena_.bytes + d_exp_stage_.bytes;
+        size_t tot = expert_gpu_arena_.bytes + d_exp_stage_.bytes + d_exp_w13_f16_.bytes + d_exp_w2_f16_.bytes;
+        tot += hybrid_.allocated_bytes();
+        for (const auto& b : trunk_qkvrg_) tot += b.bytes;
         for (const auto& kv : trunk_bf16_) tot += kv.second.bytes;
         for (const auto& kv : trunk_f32_) tot += kv.second.bytes;
         for (const auto& kv : packed_trunk_) tot += kv.second.buf.bytes;
@@ -1293,14 +1500,19 @@ private:
         const int D = c_.hidden;
         const int q_dim = c_.n_head * c_.head_dim;
         const int kv_dim = c_.n_kv * c_.head_dim;
+        const int r_dim = c_.n_head * c_.d_rel;
+        const int qkvrg_dim = 2 * q_dim + r_dim + 2 * kv_dim;
         const int inter = c_.inter;
         const int n_exp = c_.n_experts;
+        const size_t x_bf16_k = static_cast<size_t>(std::max({2 * D, q_dim, 4096}));
         auto re = [&](GpuBuffer& b, size_t bytes) -> bool {
             free_gpu_buffer(b);
             return hip_ok(alloc_gpu_buffer(b, bytes, mem_info_.is_uma), "scratch alloc", err);
         };
         if (!re(sc_slot_ids_, B * 4) || !re(sc_pos_, B * 4) || !re(sc_tok_ids_, B * 4) || !re(sc_img_idx_, B * 4) ||
             !re(sc_want_idx_, B * 4) || !re(sc_grp_slot_, B * 4) || !re(sc_grp_off_, (B + 1) * 4) || !re(sc_grp_tok_, B * 4) ||
+            !re(sc_x_bf16_, static_cast<size_t>(std::max(B, 1025)) * x_bf16_k * sizeof(uint16_t)) ||
+            !re(sc_qkvrg_out_, static_cast<size_t>(B) * qkvrg_dim * 4) ||
             !re(sc_cur_, static_cast<size_t>(B) * D * 4) || !re(sc_res_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_in0_, static_cast<size_t>(B) * D * 4) || !re(sc_in1_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_in2_, static_cast<size_t>(B) * D * 4) || !re(sc_mx3_, static_cast<size_t>(B) * 3 * D * 4) ||
@@ -1309,11 +1521,13 @@ private:
             !re(sc_ctrl_forget_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_q_, static_cast<size_t>(B) * q_dim * 4) || !re(sc_k_raw_, static_cast<size_t>(B) * kv_dim * 4) ||
             !re(sc_v_raw_, static_cast<size_t>(B) * kv_dim * 4) || !re(sc_k_conv_, static_cast<size_t>(B) * kv_dim * 4) ||
-            !re(sc_v_conv_, static_cast<size_t>(B) * kv_dim * 4) || !re(sc_r_raw_, static_cast<size_t>(B) * c_.n_head * c_.d_rel * 4) ||
+            !re(sc_v_conv_, static_cast<size_t>(B) * kv_dim * 4) || !re(sc_r_raw_, static_cast<size_t>(B) * r_dim * 4) ||
             !re(sc_rel_bias_, static_cast<size_t>(B) * c_.n_head * c_.rel_extent * 4) ||
             !re(sc_sinks_, static_cast<size_t>(B) * c_.n_head * 4) || !re(sc_gate_a_, static_cast<size_t>(B) * q_dim * 4) ||
             !re(sc_k_dyn_, static_cast<size_t>(B) * c_.n_kv * 4 * 4) || !re(sc_v_dyn_, static_cast<size_t>(B) * c_.n_kv * 4 * 4) ||
-            !re(sc_attn_out_, static_cast<size_t>(B) * q_dim * 4) || !re(sc_o_proj_, static_cast<size_t>(B) * D * 4) ||
+            !re(sc_attn_out_, static_cast<size_t>(B) * q_dim * 4) ||
+            !re(sc_splitkv_part_, static_cast<size_t>(std::max(B, 4)) * c_.n_head * 4 * 130 * 4) ||
+            !re(sc_o_proj_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_a_sconv_, static_cast<size_t>(B) * D * 4) || !re(sc_mlp_in_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_mlp_f16_, static_cast<size_t>(B) * D * sizeof(half_t)) ||
             !re(sc_r_logits_, static_cast<size_t>(B) * n_exp * 4) ||
@@ -1324,6 +1538,7 @@ private:
             !re(sc_exp_off_, 129 * 4) ||
             !re(sc_bucket_tok_, static_cast<size_t>(B) * c_.top_k * 4) ||
             !re(sc_slotk_bidx_, static_cast<size_t>(B) * c_.top_k * 4) ||
+            !re(sc_bucket_x_f16_, static_cast<size_t>(B) * c_.top_k * D * sizeof(half_t)) ||
             !re(sc_bucket_y_, static_cast<size_t>(B) * c_.top_k * D * 4) ||
             !re(sc_moe_out_, static_cast<size_t>(B) * D * 4) || !re(sc_m_sconv_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_exp_tok_idx_, static_cast<size_t>(B) * 4) || !re(sc_exp_tok_w_, static_cast<size_t>(B) * 4) ||
@@ -1512,6 +1727,13 @@ private:
             }
         }
 
+        bool is_contiguous_single_slot = (!all_distinct_slots && n_groups == 1 && B >= 16);
+        for (int b = 1; b < B && is_contiguous_single_slot; ++b) {
+            if (batch.slot_ids[b] != batch.slot_ids[0] || batch.pos[b] != batch.pos[0] + b) {
+                is_contiguous_single_slot = false;
+            }
+        }
+
         auto run_sconv = [&](const float* in_ptr, const std::string& sw_key, const float* dyn_ptr,
                              GpuBuffer& hist_pool_all, float* out_ptr, int C, int n_heads,
                              GpuBuffer* rec_pool = nullptr, int rec_visit = 0) {
@@ -1526,6 +1748,11 @@ private:
             if (all_distinct_slots) {
                 k2_shortconv4_batched<<<dim3((C + 255) / 256, B), 256, 0, stream_>>>(
                     in_ptr, sw, dyn_ptr, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), hp, out_ptr, B, C, n_heads);
+            } else if (is_contiguous_single_slot) {
+                uint16_t* h_slot = hp + static_cast<size_t>(batch.slot_ids[0]) * 3 * C;
+                k2_shortconv4_prefill_par<<<dim3((C + 255) / 256, B), 256, 0, stream_>>>(
+                    in_ptr, sw, dyn_ptr, h_slot, out_ptr, B, C, n_heads);
+                k2_shortconv4_update_hist<<<(C + 255) / 256, 256, 0, stream_>>>(in_ptr, h_slot, B, C);
             } else {
                 k2_shortconv4_grouped_seq<<<dim3((C + 255) / 256, n_groups), 256, 0, stream_>>>(
                     in_ptr, sw, dyn_ptr, reinterpret_cast<const int32_t*>(sc_grp_slot_.dev_ptr),
@@ -1702,9 +1929,9 @@ private:
                     k1_loop_ctrl_pack_in<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
                         target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, cin, B, D);
                     if (is_bf) {
-                        launch_bf16_linear(bf16_ptr(cp + ".down_weight"),   cin,       nullptr, ctrl_gate, B, c_.gate_rank, 2 * D, mem_info_.gen, stream_);
-                        launch_bf16_linear(bf16_ptr(cp + ".gain_weight"),   ctrl_gate, nullptr, cg,        B, D, c_.gate_rank,    mem_info_.gen, stream_);
-                        launch_bf16_linear(bf16_ptr(cp + ".forget_weight"), ctrl_gate, nullptr, cf,        B, D, c_.gate_rank,    mem_info_.gen, stream_);
+                        launch_bf16_opt(bf16_ptr(cp + ".down_weight"),   cin,       nullptr, ctrl_gate, B, c_.gate_rank, 2 * D);
+                        launch_bf16_opt(bf16_ptr(cp + ".gain_weight"),   ctrl_gate, nullptr, cg,        B, D, c_.gate_rank);
+                        launch_bf16_opt(bf16_ptr(cp + ".forget_weight"), ctrl_gate, nullptr, cf,        B, D, c_.gate_rank);
                     } else {
                         launch_f32_linear(f32_ptr(cp + ".down_weight"),   cin,       nullptr, ctrl_gate, B, c_.gate_rank, 2 * D, stream_, mem_info_.gen);
                         launch_f32_linear(f32_ptr(cp + ".gain_weight"),   ctrl_gate, nullptr, cg,        B, D, c_.gate_rank,    stream_, mem_info_.gen);
@@ -1749,13 +1976,32 @@ private:
                 k_rms_norm_rows<<<B, 256, 0, stream_>>>(in2, f32_ptr(p + ".v_input_norm.weight"), in2, B, D, c_.rms_eps);
             }
 
-            // Batched Q/K/V/R/Sink/Gate projections
-            launch_trunk_linear(p + ".attn.wq_du.weight", q_in, q,     B, q_dim, D);
-            launch_trunk_linear(p + ".attn.wk_dv.weight", k_in, k_raw, B, kv_dim, D);
-            launch_trunk_linear(p + ".attn.wv_dv.weight", v_in, v_raw, B, kv_dim, D);
-            launch_trunk_linear(p + ".attn.wr_du.weight", q_in, r_raw, B, c_.n_head * c_.d_rel, D);
+            // Batched Q/K/V/R/Sink/Gate projections (1 fused concatenated GEMM + 1-launch splitter!)
+            const int r_dim = c_.n_head * c_.d_rel;
+            if (trunk_qkvrg_[ip].dev_ptr != nullptr) {
+                const uint16_t* w_cat = reinterpret_cast<const uint16_t*>(trunk_qkvrg_[ip].dev_ptr);
+                float* cat_out = reinterpret_cast<float*>(sc_qkvrg_out_.dev_ptr);
+                if (!has_msgs && is_swa) {
+                    const int tot_n = 2 * q_dim + r_dim + 2 * kv_dim;
+                    launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, tot_n, D);
+                    k_split_qkvrg<<<dim3(((tot_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
+                        cat_out, q, r_raw, gatea, k_raw, v_raw, B, q_dim, r_dim, kv_dim, tot_n);
+                } else {
+                    const int qrg_n = 2 * q_dim + r_dim;
+                    launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, qrg_n, D);
+                    k_split_qkvrg<<<dim3(((qrg_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
+                        cat_out, q, r_raw, gatea, nullptr, nullptr, B, q_dim, r_dim, kv_dim, qrg_n);
+                    launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n) * D, k_in, nullptr, k_raw, B, kv_dim, D);
+                    launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n + kv_dim) * D, v_in, nullptr, v_raw, B, kv_dim, D);
+                }
+            } else {
+                launch_trunk_linear(p + ".attn.wq_du.weight", q_in, q,     B, q_dim, D);
+                launch_trunk_linear(p + ".attn.wk_dv.weight", k_in, k_raw, B, kv_dim, D);
+                launch_trunk_linear(p + ".attn.wv_dv.weight", v_in, v_raw, B, kv_dim, D);
+                launch_trunk_linear(p + ".attn.wr_du.weight", q_in, r_raw, B, r_dim, D);
+                launch_trunk_linear(p + ".attn.gate_attn.weight", q_in, gatea, B, q_dim, D);
+            }
             launch_trunk_linear(p + ".attn.attn_sink_proj.weight", q_in, sinks, B, c_.n_head, D);
-            launch_trunk_linear(p + ".attn.gate_attn.weight", q_in, gatea, B, q_dim, D);
             if (!is_swa) {
                 launch_trunk_linear(p + ".attn.k_sconv.weight_proj", k_in, k_dyn, B, c_.n_kv * 4, D);
                 launch_trunk_linear(p + ".attn.v_sconv.weight_proj", v_in, v_dyn, B, c_.n_kv * 4, D);
@@ -1800,7 +2046,43 @@ private:
             k_relpos_bias_proj<<<dim3(c_.n_head, B), 256, 0, stream_>>>(
                 r_raw, f32_ptr(p + ".attn.rel_logits_proj.proj"), pos_dev, rbias, B, c_.n_head, c_.d_rel, c_.rel_extent);
 
-            if (B <= 8) {
+            if (is_contiguous_single_slot && B >= 64 && mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
+                // Wave32 WMMA FlashAttention-2 Prefill (BQ=64, BK=64, 27 KB LDS, register online softmax!)
+                const dim3 fgrid(c_.n_head, (B + 63) / 64);
+                if (is_fp8) {
+                    k3_flash_swa_gqa_prefill_wmma<true><<<fgrid, 128, 0, stream_>>>(
+                        q, gatea, rbias, sinks, batch.slot_ids[0], batch.pos[0],
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                        reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                        aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+                } else {
+                    k3_flash_swa_gqa_prefill_wmma<false><<<fgrid, 128, 0, stream_>>>(
+                        q, gatea, rbias, sinks, batch.slot_ids[0], batch.pos[0],
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
+                        aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+                }
+            } else if (B <= 4) {
+                // 2-Stage FlashDecoding Split-KV (96 blocks x 8 waves = 768 waves at B=1 -> saturates ALL CUs!)
+                float* sp_part = reinterpret_cast<float*>(sc_splitkv_part_.dev_ptr);
+                if (is_fp8) {
+                    k3_flash_splitkv_part<true, 4><<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
+                        q, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                        reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                        sp_part, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+                } else {
+                    k3_flash_splitkv_part<false, 4><<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
+                        q, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
+                        sp_part, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+                }
+                k3_flash_splitkv_reduce<4><<<dim3(c_.n_head, B), 32, 0, stream_>>>(
+                    sp_part, gatea, aout, B, c_.n_head);
+            } else if (B <= 8) {
                 if (is_fp8) {
                     k3_flash_swa_gqa_splitkv<true><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
                         q, gatea, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
@@ -1857,7 +2139,10 @@ private:
 
             // MoE Expert Execution:
             // Fast Path A1 (B <= 4, all GPU-resident): 2-launch ZERO-SYNC active-only direct MoE
-            // Fast Path A2 (B >= 5, all GPU-resident): 4-launch ZERO-SYNC BM=64 BN=128 Wave32 WMMA Grouped-MoE (deduplicates active experts!)
+            // Fast Path A2 (B >= blaslt_moe_min_b_, all GPU-resident, hipBLASLt ready): L3/MALL-resident unpack-once + hipBLASLt FP16 GEMM!
+            // Fast Path A3 (B >= 5, all GPU-resident): 4-launch ZERO-SYNC BM=64 BN=128 Wave32 WMMA Grouped-MoE
+            // Fast Path B1 (Hybrid partial-VRAM, B <= 16): Strata Predictive CPU/RAM Hybrid (GPU VRAM+ElasticCache || Spin-Wait CPU Pool + 3x-Loop Async DMA Prefetch!)
+            // Fast Path B2 (Hybrid partial-VRAM, B > 16): Chunked Double-Buffered GPU Matrix-Core Expert Streaming!
             if (layer_all_gpu_[ip] && B <= 4) {
                 k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
                 const GpuExpertDesc* d_exps = reinterpret_cast<const GpuExpertDesc*>(d_layer_exps_[ip].dev_ptr);
@@ -1867,6 +2152,43 @@ private:
                 k_moe_direct_w2_reduce<<<dim3((D + 7) / 8, B), 256, 0, stream_>>>(
                     d_exps, tk_i, tk_w, reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr),
                     moeout, B, c_.top_k, D, c_.inter);
+            } else if (layer_all_gpu_[ip] && B >= blaslt_moe_min_b_ && blaslt_.ready() &&
+                       d_exp_w13_f16_.dev_ptr != nullptr && d_exp_w2_f16_.dev_ptr != nullptr && !use_graph) {
+                int32_t* d_off = reinterpret_cast<int32_t*>(sc_exp_off_.dev_ptr);
+                int32_t* d_btk = reinterpret_cast<int32_t*>(sc_bucket_tok_.dev_ptr);
+                int32_t* d_s2b = reinterpret_cast<int32_t*>(sc_slotk_bidx_.dev_ptr);
+                half_t*  d_bx  = reinterpret_cast<half_t*>(sc_bucket_x_f16_.dev_ptr);
+                float*   d_gu  = reinterpret_cast<float*>(sc_moe_gu_.dev_ptr);
+                half_t*  d_act = reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr);
+                float*   d_by  = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
+
+                k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
+                k_gather_rows_f16<<<(B * c_.top_k * D + 255) / 256, 256, 0, stream_>>>(
+                    mlpin, d_btk, d_bx, B * c_.top_k, D);
+
+                int32_t h_off[129];
+                if (!hip_ok(hipMemcpyAsync(h_off, d_off, 129 * sizeof(int32_t), hipMemcpyDeviceToHost, stream_), "moe off D2H", err) ||
+                    !hip_ok(hipStreamSynchronize(stream_), "moe off sync", err)) {
+                    return false;
+                }
+                const auto& dir = model_->rd.expert_directory();
+                for (int eid = 0; eid < c_.n_experts; ++eid) {
+                    const int beg = h_off[eid];
+                    const int m_e = h_off[eid + 1] - beg;
+                    if (m_e <= 0) continue;
+                    const int dir_idx = model_->dir_index_of[ip * c_.n_experts + eid];
+                    if (dir_idx < 0) continue;
+                    const auto& ent = dir[dir_idx];
+                    const uint8_t* body_dev = expert_gpu_arena_.dev_ptr + expert_gpu_offset_[dir_idx];
+                    run_single_expert_blaslt(
+                        body_dev, ent.gu_code_id, ent.dn_code_id, ent.dn_offset,
+                        expert_sf4_outer_[dir_idx].first, expert_sf4_outer_[dir_idx].second,
+                        d_bx + static_cast<size_t>(beg) * D,
+                        d_gu, d_act, d_by + static_cast<size_t>(beg) * D,
+                        m_e, D, c_.inter);
+                }
+                k_moe_reduce_buckets<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                    d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
             } else if (layer_all_gpu_[ip]) {
                 k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
                 const GpuExpertDesc* d_exps = reinterpret_cast<const GpuExpertDesc*>(d_layer_exps_[ip].dev_ptr);
@@ -1877,11 +2199,29 @@ private:
                 float*   d_by  = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
                 k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
                 if (mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
-                    const int m_tiles = (B >= 256) ? 4 : ((B >= 64) ? 2 : 1);
-                    k_moe_grouped_w13_situ_wmma<<<dim3((2 * c_.inter + 127) / 128, c_.n_experts, m_tiles), 256, 0, stream_>>>(
-                        d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
-                    k_moe_grouped_w2_wmma<<<dim3((D + 127) / 128, c_.n_experts, m_tiles), 256, 0, stream_>>>(
-                        d_exps, d_off, d_act, d_by, D, c_.inter);
+                    const int m_tiles = (B >= 1024) ? 4 : ((B >= 512) ? 2 : 1);
+                    const dim3 g13((2 * c_.inter + 127) / 128, c_.n_experts, m_tiles);
+                    const dim3 g2((D + 127) / 128, c_.n_experts, m_tiles);
+                    if (use_i8_moe_wmma_ && layer_gu_class_[ip] == 0) {
+                        k_moe_grouped_w13_situ_wmma_sk_i8<<<g13, 256, 0, stream_>>>(
+                            d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                    } else if (use_i8_moe_wmma_ && layer_gu_class_[ip] == 1) {
+                        k_moe_grouped_w13_situ_wmma_sf4_i8<<<g13, 256, 0, stream_>>>(
+                            d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                    } else {
+                        k_moe_grouped_w13_situ_wmma<<<g13, 256, 0, stream_>>>(
+                            d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                    }
+                    if (use_i8_moe_wmma_ && layer_dn_class_[ip] == 0) {
+                        k_moe_grouped_w2_wmma_sk_i8<<<g2, 256, 0, stream_>>>(
+                            d_exps, d_off, d_act, d_by, D, c_.inter);
+                    } else if (use_i8_moe_wmma_ && layer_dn_class_[ip] == 1) {
+                        k_moe_grouped_w2_wmma_sf4_i8<<<g2, 256, 0, stream_>>>(
+                            d_exps, d_off, d_act, d_by, D, c_.inter);
+                    } else {
+                        k_moe_grouped_w2_wmma<<<g2, 256, 0, stream_>>>(
+                            d_exps, d_off, d_act, d_by, D, c_.inter);
+                    }
                 } else {
                     k_moe_grouped_w13_situ<<<dim3((c_.inter + 3) / 4, c_.n_experts), 256, 0, stream_>>>(
                         d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
@@ -1890,107 +2230,287 @@ private:
                 }
                 k_moe_reduce_buckets<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
                     d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
-            } else {
-                // Fast Path B / Hybrid: Coalesced batched WMMA/GEMV MoE across B=1..64/512 (reads each active expert ONCE!)
-                std::vector<int32_t> h_ids(static_cast<size_t>(B) * c_.top_k);
-                std::vector<float>   h_ws(static_cast<size_t>(B) * c_.top_k);
-                if (!hip_ok(hipMemcpyAsync(h_ids.data(), tk_i, h_ids.size() * 4, hipMemcpyDeviceToHost, stream_), "moe ids D2H", err) ||
-                    !hip_ok(hipMemcpyAsync(h_ws.data(),  tk_w, h_ws.size() * 4, hipMemcpyDeviceToHost, stream_), "moe ws D2H", err) ||
-                    !hip_ok(hipStreamSynchronize(stream_), "moe route sync", err)) {
+            } else if (hybrid_.active() && B <= 16) {
+                // Fast Path B1: Strata Predictive CPU/RAM Hybrid Decode!
+                // Coherent Host Doorbell + Spin-Wait AVX-512/AVX2 CPU Worker Pool overlapped with GPU VRAM + Elastic Cache + 3x-Loop Predictive Async DMA Prefetch!
+                if (!hybrid_.ensure_doorbell_cap(B, D, c_.top_k)) {
+                    err = "hybrid doorbell resize failed";
                     return false;
                 }
-                std::vector<std::vector<int32_t>> exp_toks(c_.n_experts);
-                std::vector<std::vector<float>>   exp_ws(c_.n_experts);
+                if (!hip_ok(hipMemcpyAsync(hybrid_.h_ids(), tk_i, static_cast<size_t>(B) * c_.top_k * 4, hipMemcpyDeviceToHost, stream_), "hyb ids D2H", err) ||
+                    !hip_ok(hipMemcpyAsync(hybrid_.h_ws(),  tk_w, static_cast<size_t>(B) * c_.top_k * 4, hipMemcpyDeviceToHost, stream_), "hyb ws D2H", err) ||
+                    !hip_ok(hipMemcpyAsync(hybrid_.h_x(),   mlpin, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToHost, stream_), "hyb x D2H", err) ||
+                    !hip_ok(hipStreamSynchronize(stream_), "hyb route sync", err)) {
+                    return false;
+                }
+                const auto& dir = model_->rd.expert_directory();
+                const bool is_core_repeat_candidate = (ip >= c_.core_start && ip < c_.core_end && visit < (c_.core_start + 2 * (c_.core_end - c_.core_start)));
+
+                std::vector<GpuExpertDesc> step_exps = h_layer_exps_[ip];
+                bool any_gpu_exp = false;
+                bool any_cache_patch = false;
+                std::vector<HybridCpuExpertPool::CpuJob> cpu_jobs;
+                std::vector<HybridCpuExpertPool::CpuJob> mx8_stream_jobs;
+                std::vector<std::vector<uint8_t>> disk_fallback_bufs;
+
+                int eid_to_job[128];
+                int eid_to_mx8[128];
+                std::memset(eid_to_job, -1, sizeof(eid_to_job));
+                std::memset(eid_to_mx8, -1, sizeof(eid_to_mx8));
+                const int32_t* h_ids = hybrid_.h_ids();
+                const float*   h_ws  = hybrid_.h_ws();
+
                 for (int b = 0; b < B; ++b) {
                     for (int k = 0; k < c_.top_k; ++k) {
                         const int eid = h_ids[b * c_.top_k + k];
-                        exp_toks[eid].push_back(b);
-                        exp_ws[eid].push_back(h_ws[b * c_.top_k + k]);
+                        const float rw = h_ws[b * c_.top_k + k];
+                        const int dir_idx = model_->dir_index_of[ip * c_.n_experts + eid];
+                        if (dir_idx < 0) continue;
+                        if (step_exps[eid].body != nullptr) {
+                            any_gpu_exp = true;
+                            continue;
+                        }
+                        // Probe elastic VRAM cache ring first (zero stall!)
+                        const uint8_t* cached_dev = hybrid_.probe_ready(dir_idx);
+                        if (cached_dev != nullptr) {
+                            step_exps[eid].body = cached_dev;
+                            step_exps[eid].dn_offset = dir[dir_idx].dn_offset;
+                            step_exps[eid].gu_code = dir[dir_idx].gu_code_id;
+                            step_exps[eid].dn_code = dir[dir_idx].dn_code_id;
+                            any_gpu_exp = true;
+                            any_cache_patch = true;
+                            continue;
+                        }
+                        // MX8 RAM experts stream to GPU via double-buffered PCIe DMA (15x faster than scalar CPU MX8!)
+                        if (dir[dir_idx].gu_code_id == CODE_MX8 || dir[dir_idx].dn_code_id == CODE_MX8) {
+                            int mi = eid_to_mx8[eid];
+                            if (mi < 0) {
+                                const uint8_t* host_body = nullptr;
+                                if (!expert_ram_bodies_[dir_idx].empty()) {
+                                    host_body = expert_ram_bodies_[dir_idx].data();
+                                    hybrid_.prefetch_async(dir_idx, host_body, dir[dir_idx].body_bytes, false);
+                                } else {
+                                    disk_fallback_bufs.emplace_back();
+                                    if (!model_->rd.read_expert_body(dir_idx, disk_fallback_bufs.back(), err)) return false;
+                                    host_body = disk_fallback_bufs.back().data();
+                                }
+                                mi = static_cast<int>(mx8_stream_jobs.size());
+                                eid_to_mx8[eid] = mi;
+                                HybridCpuExpertPool::CpuJob job;
+                                job.dir_idx = dir_idx;
+                                job.body = host_body;
+                                job.gu_code = dir[dir_idx].gu_code_id;
+                                job.dn_code = dir[dir_idx].dn_code_id;
+                                job.dn_offset = dir[dir_idx].dn_offset;
+                                mx8_stream_jobs.push_back(std::move(job));
+                            }
+                            mx8_stream_jobs[mi].tok_idx.push_back(b);
+                            mx8_stream_jobs[mi].tok_w.push_back(rw);
+                            continue;
+                        }
+                        // S_K / SF4 RAM expert -> dispatch to CPU AVX-512/AVX2 pool + trigger predictive async DMA prefetch!
+                        int ji = eid_to_job[eid];
+                        if (ji < 0) {
+                            const uint8_t* host_body = nullptr;
+                            if (!expert_ram_bodies_[dir_idx].empty()) {
+                                host_body = expert_ram_bodies_[dir_idx].data();
+                                hybrid_.prefetch_async(dir_idx, host_body, dir[dir_idx].body_bytes, is_core_repeat_candidate);
+                            } else {
+                                disk_fallback_bufs.emplace_back();
+                                if (!model_->rd.read_expert_body(dir_idx, disk_fallback_bufs.back(), err)) return false;
+                                host_body = disk_fallback_bufs.back().data();
+                            }
+                            ji = static_cast<int>(cpu_jobs.size());
+                            eid_to_job[eid] = ji;
+                            HybridCpuExpertPool::CpuJob job;
+                            job.dir_idx = dir_idx;
+                            job.body = host_body;
+                            job.gu_code = dir[dir_idx].gu_code_id;
+                            job.dn_code = dir[dir_idx].dn_code_id;
+                            job.dn_offset = dir[dir_idx].dn_offset;
+                            cpu_jobs.push_back(std::move(job));
+                        }
+                        cpu_jobs[ji].tok_idx.push_back(b);
+                        cpu_jobs[ji].tok_w.push_back(rw);
                     }
                 }
 
-                (void)hipMemsetAsync(moeout, 0, static_cast<size_t>(B) * D * 4, stream_);
-                const auto& dir = model_->rd.expert_directory();
-                for (int eid = 0; eid < c_.n_experts; ++eid) {
-                    if (exp_toks[eid].empty()) continue;
-                    const int dir_idx = model_->dir_index_of[ip * c_.n_experts + eid];
-                    if (dir_idx < 0) continue;
-                    const auto& ent = dir[dir_idx];
-                    const int m = static_cast<int>(exp_toks[eid].size());
-
-                    const uint8_t* body_dev = nullptr;
-                    if (expert_gpu_offset_[dir_idx] != static_cast<size_t>(-1)) {
-                        body_dev = expert_gpu_arena_.dev_ptr + expert_gpu_offset_[dir_idx];
-                    } else {
-                        const uint8_t* src_host = nullptr;
-                        std::vector<uint8_t> disk_buf;
-                        if (!expert_ram_bodies_[dir_idx].empty()) {
-                            src_host = expert_ram_bodies_[dir_idx].data();
-                        } else {
-                            if (!model_->rd.read_expert_body(dir_idx, disk_buf, err)) return false;
-                            src_host = disk_buf.data();
-                        }
-                        if (!hip_ok(hipMemcpyAsync(d_exp_stage_.dev_ptr, src_host, ent.body_bytes, hipMemcpyHostToDevice, stream_),
-                                    "exp stage H2D", err)) return false;
-                        body_dev = d_exp_stage_.dev_ptr;
+                // OVERLAPPED EXECUTION: CPU computes S_K/SF4 RAM experts in DDR5 WHILE GPU computes VRAM + ElasticCache + double-buffered MX8!
+                if (!cpu_jobs.empty()) {
+                    hybrid_.pool().launch_async(&cpu_jobs, hybrid_.h_x(), hybrid_.h_y(), B, D, c_.inter);
+                }
+                for (int p_i = 0; p_i < 2 && p_i < static_cast<int>(mx8_stream_jobs.size()); ++p_i) {
+                    (void)hybrid_.stage_prefill_async(p_i, mx8_stream_jobs[p_i].body, dir[mx8_stream_jobs[p_i].dir_idx].body_bytes, false);
+                }
+                if (any_gpu_exp) {
+                    const GpuExpertDesc* d_exps = reinterpret_cast<const GpuExpertDesc*>(d_layer_exps_[ip].dev_ptr);
+                    if (any_cache_patch) {
+                        (void)hipMemcpyAsync(hybrid_.d_step_exps(), step_exps.data(),
+                                             step_exps.size() * sizeof(GpuExpertDesc), hipMemcpyHostToDevice, stream_);
+                        d_exps = hybrid_.d_step_exps();
                     }
-
-                    (void)hipMemcpyAsync(sc_exp_tok_idx_.dev_ptr, exp_toks[eid].data(), m * 4, hipMemcpyHostToDevice, stream_);
-                    (void)hipMemcpyAsync(sc_exp_tok_w_.dev_ptr,   exp_ws[eid].data(),   m * 4, hipMemcpyHostToDevice, stream_);
+                    k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
+                    k_moe_direct_w13_situ<<<dim3((c_.inter + 3) / 4, B * c_.top_k), 256, 0, stream_>>>(
+                        d_exps, tk_i, mlpf16, reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr),
+                        B, c_.top_k, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                    k_moe_direct_w2_reduce<<<dim3((D + 7) / 8, B), 256, 0, stream_>>>(
+                        d_exps, tk_i, tk_w, reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr),
+                        moeout, B, c_.top_k, D, c_.inter);
+                } else {
+                    (void)hipMemsetAsync(moeout, 0, static_cast<size_t>(B) * D * 4, stream_);
+                }
+                for (int mi = 0; mi < static_cast<int>(mx8_stream_jobs.size()); ++mi) {
+                    const auto& mj = mx8_stream_jobs[mi];
+                    const int m = static_cast<int>(mj.tok_idx.size());
+                    const uint8_t* body_dev = hybrid_.wait_prefill_stage(mi, stream_);
+                    (void)hipMemcpyAsync(sc_exp_tok_idx_.dev_ptr, mj.tok_idx.data(), m * 4, hipMemcpyHostToDevice, stream_);
+                    (void)hipMemcpyAsync(sc_exp_tok_w_.dev_ptr,   mj.tok_w.data(),   m * 4, hipMemcpyHostToDevice, stream_);
                     k_gather_rows_f16<<<(m * D + 255) / 256, 256, 0, stream_>>>(
                         mlpin, reinterpret_cast<const int32_t*>(sc_exp_tok_idx_.dev_ptr), mlpf16, m, D);
-
                     float* gu_buf = reinterpret_cast<float*>(sc_moe_gu_.dev_ptr);
                     half_t* act_buf = reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr);
                     float* ye_buf = reinterpret_cast<float*>(sc_moe_ye_.dev_ptr);
-
-                    // w13 [2*inter, D] (uses cached SF4 outer scales -> ZERO host syncs per expert!)
-                    float sf4_w13_outer = expert_sf4_outer_[dir_idx].first;
-                    float sf4_w2_outer  = expert_sf4_outer_[dir_idx].second;
-                    if (expert_gpu_offset_[dir_idx] == static_cast<size_t>(-1) && expert_ram_bodies_[dir_idx].empty() &&
-                        (ent.gu_code_id == CODE_SF4 || ent.dn_code_id == CODE_SF4)) {
-                        float hdr[4];
-                        hip_ign(hipMemcpyAsync(hdr, body_dev, 16, hipMemcpyDeviceToHost, stream_));
-                        hip_ign(hipStreamSynchronize(stream_));
-                        sf4_w13_outer = hdr[0] / hdr[1];
-                        sf4_w2_outer  = hdr[2] / hdr[3];
+                    launch_mx8_linear(body_dev, body_dev + static_cast<size_t>(2 * c_.inter) * D, mlpf16, gu_buf, m, 2 * c_.inter, D, mem_info_.gen, stream_);
+                    k_situ_interleaved<<<(m * c_.inter + 255) / 256, 256, 0, stream_>>>(gu_buf, act_buf, m, c_.inter, c_.situ_beta, c_.situ_lb);
+                    launch_mx8_linear(body_dev + mj.dn_offset, body_dev + mj.dn_offset + static_cast<size_t>(D) * c_.inter, act_buf, ye_buf, m, D, c_.inter, mem_info_.gen, stream_);
+                    hybrid_.mark_prefill_compute_done(mi, stream_);
+                    if (mi + 2 < static_cast<int>(mx8_stream_jobs.size())) {
+                        (void)hybrid_.stage_prefill_async(mi + 2, mx8_stream_jobs[mi + 2].body, dir[mx8_stream_jobs[mi + 2].dir_idx].body_bytes, true);
                     }
-                    if (ent.gu_code_id == CODE_SF4) {
-                        const uint8_t* w13_p = body_dev + 16;
-                        const uint8_t* w13_s = w13_p + static_cast<size_t>(2 * c_.inter) * (D / 2);
-                        launch_sf4_linear(w13_p, w13_s, sf4_w13_outer, mlpf16, gu_buf, m, 2 * c_.inter, D, mem_info_.gen, stream_, false);
-                    } else if (ent.gu_code_id == CODE_MX8) {
-                        const uint8_t* w13_w = body_dev;
-                        const uint8_t* w13_s = w13_w + static_cast<size_t>(2 * c_.inter) * D;
-                        launch_mx8_linear(w13_w, w13_s, mlpf16, gu_buf, m, 2 * c_.inter, D, mem_info_.gen, stream_);
-                    } else {
-                        const uint8_t* gu_ptr = body_dev + static_cast<size_t>(c_.inter) * 2;
-                        launch_sk_linear(gu_ptr, ent.gu_code_id, mlpf16, gu_buf, m, 2 * c_.inter, D, mem_info_.gen, stream_);
-                    }
-
-                    // Fused SITU
-                    k_situ_interleaved<<<(m * c_.inter + 255) / 256, 256, 0, stream_>>>(
-                        gu_buf, act_buf, m, c_.inter, c_.situ_beta, c_.situ_lb);
-
-                    // w2 [D, inter]
-                    if (ent.dn_code_id == CODE_SF4) {
-                        const uint8_t* w2_p = body_dev + ent.dn_offset;
-                        const uint8_t* w2_s = w2_p + static_cast<size_t>(D) * (c_.inter / 2);
-                        launch_sf4_linear(w2_p, w2_s, sf4_w2_outer, act_buf, ye_buf, m, D, c_.inter, mem_info_.gen, stream_, false);
-                    } else if (ent.dn_code_id == CODE_MX8) {
-                        const uint8_t* w2_w = body_dev + ent.dn_offset;
-                        const uint8_t* w2_s = w2_w + static_cast<size_t>(D) * c_.inter;
-                        launch_mx8_linear(w2_w, w2_s, act_buf, ye_buf, m, D, c_.inter, mem_info_.gen, stream_);
-                    } else {
-                        launch_sk_paired2_linear(body_dev + ent.dn_offset, ent.dn_code_id,
-                                                 reinterpret_cast<const half_t*>(body_dev),
-                                                 act_buf, ye_buf, m, D, c_.inter, stream_);
-                    }
-
                     k_scatter_add_expert<<<(D + 255) / 256, 256, 0, stream_>>>(
                         ye_buf, reinterpret_cast<const int32_t*>(sc_exp_tok_idx_.dev_ptr),
                         reinterpret_cast<const float*>(sc_exp_tok_w_.dev_ptr), moeout, m, D);
                 }
+                if (!cpu_jobs.empty()) {
+                    hybrid_.pool().wait_and_reduce();
+                    // Upload ONLY the tiny 9 KB/tok output vector (NOT 4.5 MB expert weights!) and accumulate!
+                    (void)hipMemcpyAsync(hybrid_.d_cpu_y(), hybrid_.h_y(), static_cast<size_t>(B) * D * 4, hipMemcpyHostToDevice, stream_);
+                    k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(moeout, hybrid_.d_cpu_y(), moeout, B * D);
+                }
+            } else {
+                // Fast Path B2: Chunked Double-Buffered GPU Matrix-Core Expert Streaming for Hybrid Prefill!
+                // Overlaps PCIe H2D of RAM expert i+1 on dma_stream_ with GPU hipBLASLt/WMMA compute of expert i!
+                int32_t* d_off = reinterpret_cast<int32_t*>(sc_exp_off_.dev_ptr);
+                int32_t* d_btk = reinterpret_cast<int32_t*>(sc_bucket_tok_.dev_ptr);
+                int32_t* d_s2b = reinterpret_cast<int32_t*>(sc_slotk_bidx_.dev_ptr);
+                half_t*  d_bx  = reinterpret_cast<half_t*>(sc_bucket_x_f16_.dev_ptr);
+                float*   d_gu  = reinterpret_cast<float*>(sc_moe_gu_.dev_ptr);
+                half_t*  d_act = reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr);
+                float*   d_by  = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
+
+                k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
+                k_gather_rows_f16<<<(B * c_.top_k * D + 255) / 256, 256, 0, stream_>>>(
+                    mlpin, d_btk, d_bx, B * c_.top_k, D);
+
+                int32_t h_off[129];
+                if (!hip_ok(hipMemcpyAsync(h_off, d_off, 129 * sizeof(int32_t), hipMemcpyDeviceToHost, stream_), "moe off D2H", err) ||
+                    !hip_ok(hipStreamSynchronize(stream_), "moe off sync", err)) {
+                    return false;
+                }
+
+                const auto& dir = model_->rd.expert_directory();
+                struct ActiveExp {
+                    int eid, dir_idx, beg, m_e;
+                    const uint8_t* dev_ptr;
+                    const uint8_t* host_ptr;
+                };
+                std::vector<ActiveExp> gpu_exps, ram_exps;
+                std::vector<std::vector<uint8_t>> disk_bufs;
+
+                for (int eid = 0; eid < c_.n_experts; ++eid) {
+                    const int beg = h_off[eid];
+                    const int m_e = h_off[eid + 1] - beg;
+                    if (m_e <= 0) continue;
+                    const int dir_idx = model_->dir_index_of[ip * c_.n_experts + eid];
+                    if (dir_idx < 0) continue;
+                    const uint8_t* dev_p = nullptr;
+                    if (expert_gpu_offset_[dir_idx] != static_cast<size_t>(-1)) {
+                        dev_p = expert_gpu_arena_.dev_ptr + expert_gpu_offset_[dir_idx];
+                    } else if (hybrid_.active()) {
+                        dev_p = hybrid_.probe_ready(dir_idx);
+                    }
+                    if (dev_p != nullptr) {
+                        gpu_exps.push_back({eid, dir_idx, beg, m_e, dev_p, nullptr});
+                    } else {
+                        const uint8_t* hp = nullptr;
+                        if (!expert_ram_bodies_[dir_idx].empty()) {
+                            hp = expert_ram_bodies_[dir_idx].data();
+                        } else {
+                            disk_bufs.emplace_back();
+                            if (!model_->rd.read_expert_body(dir_idx, disk_bufs.back(), err)) return false;
+                            hp = disk_bufs.back().data();
+                        }
+                        ram_exps.push_back({eid, dir_idx, beg, m_e, nullptr, hp});
+                    }
+                }
+
+                auto exec_one = [&](const ActiveExp& ae, const uint8_t* body_dev) {
+                    const auto& ent = dir[ae.dir_idx];
+                    float sf4_w13 = expert_sf4_outer_[ae.dir_idx].first;
+                    float sf4_w2  = expert_sf4_outer_[ae.dir_idx].second;
+                    if (ae.host_ptr && expert_ram_bodies_[ae.dir_idx].empty() &&
+                        (ent.gu_code_id == CODE_SF4 || ent.dn_code_id == CODE_SF4)) {
+                        float hdr[4];
+                        std::memcpy(hdr, ae.host_ptr, 16);
+                        sf4_w13 = hdr[0] / hdr[1];
+                        sf4_w2  = hdr[2] / hdr[3];
+                    }
+                    const half_t* x_slice = d_bx + static_cast<size_t>(ae.beg) * D;
+                    float* y_slice = d_by + static_cast<size_t>(ae.beg) * D;
+                    if (blaslt_.ready() && ae.m_e >= 8 && d_exp_w13_f16_.dev_ptr && d_exp_w2_f16_.dev_ptr) {
+                        run_single_expert_blaslt(body_dev, ent.gu_code_id, ent.dn_code_id, ent.dn_offset,
+                                                 sf4_w13, sf4_w2, x_slice, d_gu, d_act, y_slice, ae.m_e, D, c_.inter);
+                    } else {
+                        if (ent.gu_code_id == CODE_SF4) {
+                            const uint8_t* p = body_dev + 16;
+                            launch_sf4_linear(p, p + static_cast<size_t>(2 * c_.inter) * (D >> 1), sf4_w13, x_slice, d_gu, ae.m_e, 2 * c_.inter, D, mem_info_.gen, stream_, false);
+                        } else if (ent.gu_code_id == CODE_MX8) {
+                            launch_mx8_linear(body_dev, body_dev + static_cast<size_t>(2 * c_.inter) * D, x_slice, d_gu, ae.m_e, 2 * c_.inter, D, mem_info_.gen, stream_);
+                        } else {
+                            launch_sk_linear(body_dev + static_cast<size_t>(c_.inter) * 2, ent.gu_code_id, x_slice, d_gu, ae.m_e, 2 * c_.inter, D, mem_info_.gen, stream_);
+                        }
+                        k_situ_interleaved<<<(ae.m_e * c_.inter + 255) / 256, 256, 0, stream_>>>(
+                            d_gu, d_act, ae.m_e, c_.inter, c_.situ_beta, c_.situ_lb);
+                        if (ent.dn_code_id == CODE_SF4) {
+                            const uint8_t* p = body_dev + ent.dn_offset;
+                            launch_sf4_linear(p, p + static_cast<size_t>(D) * (c_.inter >> 1), sf4_w2, d_act, y_slice, ae.m_e, D, c_.inter, mem_info_.gen, stream_, false);
+                        } else if (ent.dn_code_id == CODE_MX8) {
+                            launch_mx8_linear(body_dev + ent.dn_offset, body_dev + ent.dn_offset + static_cast<size_t>(D) * c_.inter, d_act, y_slice, ae.m_e, D, c_.inter, mem_info_.gen, stream_);
+                        } else {
+                            launch_sk_paired2_linear(body_dev + ent.dn_offset, ent.dn_code_id,
+                                                     reinterpret_cast<const half_t*>(body_dev), d_act, y_slice, ae.m_e, D, c_.inter, stream_);
+                        }
+                    }
+                };
+
+                // Kick off initial 2 RAM expert DMAs BEFORE running GPU-resident experts -> full PCIe overlap!
+                if (hybrid_.active()) {
+                    for (int p_i = 0; p_i < 2 && p_i < static_cast<int>(ram_exps.size()); ++p_i) {
+                        (void)hybrid_.stage_prefill_async(p_i, ram_exps[p_i].host_ptr, dir[ram_exps[p_i].dir_idx].body_bytes, false);
+                    }
+                }
+                for (const auto& ge : gpu_exps) exec_one(ge, ge.dev_ptr);
+
+                for (int ri = 0; ri < static_cast<int>(ram_exps.size()); ++ri) {
+                    const auto& re = ram_exps[ri];
+                    const uint8_t* body_dev = nullptr;
+                    if (hybrid_.active()) {
+                        body_dev = hybrid_.wait_prefill_stage(ri, stream_);
+                        exec_one(re, body_dev);
+                        hybrid_.mark_prefill_compute_done(ri, stream_);
+                        if (ri + 2 < static_cast<int>(ram_exps.size())) {
+                            const auto& nxt = ram_exps[ri + 2];
+                            (void)hybrid_.stage_prefill_async(ri + 2, nxt.host_ptr, dir[nxt.dir_idx].body_bytes, true);
+                        }
+                    } else {
+                        if (!hip_ok(hipMemcpyAsync(d_exp_stage_.dev_ptr, re.host_ptr, dir[re.dir_idx].body_bytes, hipMemcpyHostToDevice, stream_),
+                                    "exp stage H2D", err)) return false;
+                        exec_one(re, d_exp_stage_.dev_ptr);
+                    }
+                }
+
+                k_moe_reduce_buckets<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                    d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
             }
 
             // Post-MLP ShortConv + residual add
@@ -2181,8 +2701,8 @@ private:
             softmax4(il, w);
             k_dspark_fuse_mix<<<B, 256, 0, stream_>>>(t0, t1, t2, t3, w[0], w[1], w[2], w[3],
                                                       ds_f32(p + ".dflare_norm.weight"), ctx, B, D, dspark_cfg_.rms_eps);
-            launch_bf16_linear(ds_bf16(p + ".self_attn.k_proj_ctx.weight"), ctx, nullptr, kc, B, kv_dim, D, mem_info_.gen, stream_);
-            launch_bf16_linear(ds_bf16(p + ".self_attn.v_proj_ctx.weight"), ctx, nullptr, vc, B, kv_dim, D, mem_info_.gen, stream_);
+            launch_bf16_opt(ds_bf16(p + ".self_attn.k_proj_ctx.weight"), ctx, nullptr, kc, B, kv_dim, D);
+            launch_bf16_opt(ds_bf16(p + ".self_attn.v_proj_ctx.weight"), ctx, nullptr, vc, B, kv_dim, D);
             k_rms_norm_rows<<<B * KV, 256, 0, stream_>>>(kc, ds_f32(p + ".self_attn.k_norm_ctx.weight"), kc, B * KV, hd, dspark_cfg_.rms_eps);
             k_half_rope<<<dim3(KV, B), hd / 2, 0, stream_>>>(kc, pos_d, 0, B, KV, hd, dspark_cfg_.rope_theta);
             k_dspark_ctx_scatter<<<dim3((kv_dim + 255) / 256, B), 256, 0, stream_>>>(
@@ -2223,6 +2743,8 @@ private:
 
     void cleanup() {
         invalidate_graph();
+        hybrid_.release();
+        blaslt_.release();
         if (stream_) {
             (void)hipStreamSynchronize(stream_);
             (void)hipStreamDestroy(stream_);
@@ -2235,6 +2757,8 @@ private:
         swa_pools_.clear(); glob_pools_.clear();
         free_gpu_buffer(d_sconv_k_all_); free_gpu_buffer(d_sconv_v_all_);
         free_gpu_buffer(d_sconv_attn_all_); free_gpu_buffer(d_sconv_mlp_all_);
+        for (auto& b : trunk_qkvrg_) free_gpu_buffer(b);
+        trunk_qkvrg_.clear();
         for (auto& kv : trunk_bf16_) free_gpu_buffer(kv.second);
         for (auto& kv : trunk_f32_) free_gpu_buffer(kv.second);
         for (auto& kv : packed_trunk_) free_gpu_buffer(kv.second.buf);
@@ -2244,8 +2768,10 @@ private:
         for (auto& kv : dspark_f32_) free_gpu_buffer(kv.second);
         for (auto& b : d_layer_exps_) free_gpu_buffer(b);
         trunk_bf16_.clear(); trunk_f32_.clear(); packed_trunk_.clear();
-        static_sconv_.clear(); d_msg_queries_.clear(); dspark_bf16_.clear(); dspark_f32_.clear(); d_layer_exps_.clear();
+        static_sconv_.clear(); d_msg_queries_.clear(); dspark_bf16_.clear(); dspark_f32_.clear();
+        d_layer_exps_.clear(); h_layer_exps_.clear();
         free_gpu_buffer(expert_gpu_arena_); free_gpu_buffer(d_exp_stage_);
+        free_gpu_buffer(d_exp_w13_f16_); free_gpu_buffer(d_exp_w2_f16_);
         free_gpu_buffer(d_dspark_state_); free_gpu_buffer(d_dspark_state2_); free_gpu_buffer(d_dspark_latent_);
         free_gpu_buffer(d_dspark_corr_); free_gpu_buffer(d_dspark_toks_);
         free_gpu_buffer(d_dspark_blk_v_); free_gpu_buffer(d_dspark_blk_i_);
@@ -2257,17 +2783,19 @@ private:
         free_gpu_buffer(d_ds_frnn_ptrs_);
         free_gpu_buffer(sc_slot_ids_); free_gpu_buffer(sc_pos_); free_gpu_buffer(sc_tok_ids_); free_gpu_buffer(sc_img_idx_);
         free_gpu_buffer(sc_want_idx_); free_gpu_buffer(sc_grp_slot_); free_gpu_buffer(sc_grp_off_); free_gpu_buffer(sc_grp_tok_);
+        free_gpu_buffer(sc_x_bf16_); free_gpu_buffer(sc_qkvrg_out_);
         free_gpu_buffer(sc_cur_); free_gpu_buffer(sc_res_); free_gpu_buffer(sc_in0_); free_gpu_buffer(sc_in1_);
         free_gpu_buffer(sc_in2_); free_gpu_buffer(sc_mx3_); free_gpu_buffer(sc_msgs_); free_gpu_buffer(sc_ctrl_tmp_);
         free_gpu_buffer(sc_ctrl_in_); free_gpu_buffer(sc_ctrl_gain_); free_gpu_buffer(sc_ctrl_forget_);
         free_gpu_buffer(sc_q_); free_gpu_buffer(sc_k_raw_); free_gpu_buffer(sc_v_raw_); free_gpu_buffer(sc_k_conv_);
         free_gpu_buffer(sc_v_conv_); free_gpu_buffer(sc_r_raw_); free_gpu_buffer(sc_rel_bias_);
         free_gpu_buffer(sc_sinks_); free_gpu_buffer(sc_gate_a_); free_gpu_buffer(sc_k_dyn_); free_gpu_buffer(sc_v_dyn_);
-        free_gpu_buffer(sc_attn_out_); free_gpu_buffer(sc_o_proj_); free_gpu_buffer(sc_a_sconv_);
+        free_gpu_buffer(sc_attn_out_); free_gpu_buffer(sc_splitkv_part_); free_gpu_buffer(sc_o_proj_); free_gpu_buffer(sc_a_sconv_);
         free_gpu_buffer(sc_mlp_in_); free_gpu_buffer(sc_mlp_f16_); free_gpu_buffer(sc_r_logits_);
         free_gpu_buffer(sc_topk_ids_); free_gpu_buffer(sc_topk_w_); free_gpu_buffer(sc_moe_act_);
         free_gpu_buffer(sc_moe_gu_); free_gpu_buffer(sc_moe_ye_); free_gpu_buffer(sc_moe_out_); free_gpu_buffer(sc_m_sconv_);
-        free_gpu_buffer(sc_exp_off_); free_gpu_buffer(sc_bucket_tok_); free_gpu_buffer(sc_slotk_bidx_); free_gpu_buffer(sc_bucket_y_);
+        free_gpu_buffer(sc_exp_off_); free_gpu_buffer(sc_bucket_tok_); free_gpu_buffer(sc_slotk_bidx_);
+        free_gpu_buffer(sc_bucket_x_f16_); free_gpu_buffer(sc_bucket_y_);
         free_gpu_buffer(sc_exp_tok_idx_); free_gpu_buffer(sc_exp_tok_w_); free_gpu_buffer(sc_h_norm_);
         free_gpu_buffer(sc_blk_ptrs_); free_gpu_buffer(sc_prelude_); free_gpu_buffer(sc_bank_out_); free_gpu_buffer(sc_logits_);
         for (auto& b : sc_blocks_) free_gpu_buffer(b);
@@ -2285,11 +2813,17 @@ private:
     DeviceMemoryInfo mem_info_;
     DispatchGuard guard_;
     hipStream_t stream_ = nullptr;
+    HipBlasLtRunner blaslt_;
+    HipHybridController hybrid_;
+    int blaslt_min_m_ = 16;
+    int blaslt_moe_min_b_ = 999999;
+    bool use_i8_moe_wmma_ = true;
     KvDtype default_kv_dtype_ = KvDtype::FP16;
     bool has_dspark_ = false;
     int max_slots_ = 1;
     int max_ctx_ = 32768;
 
+    std::vector<GpuBuffer> trunk_qkvrg_;
     std::unordered_map<std::string, GpuBuffer> trunk_bf16_;
     std::unordered_map<std::string, GpuBuffer> trunk_f32_;
     std::unordered_map<std::string, GpuPackedTensor> packed_trunk_;
@@ -2307,11 +2841,15 @@ private:
 
     GpuBuffer expert_gpu_arena_;
     GpuBuffer d_exp_stage_;
+    GpuBuffer d_exp_w13_f16_, d_exp_w2_f16_;
     std::vector<size_t> expert_gpu_offset_;
     std::vector<std::vector<uint8_t>> expert_ram_bodies_;
     std::vector<std::pair<float, float>> expert_sf4_outer_;
     std::vector<GpuBuffer> d_layer_exps_;
+    std::vector<std::vector<GpuExpertDesc>> h_layer_exps_;
     std::vector<bool> layer_all_gpu_;
+    std::vector<uint8_t> layer_gu_class_;
+    std::vector<uint8_t> layer_dn_class_;
     size_t vram_experts_loaded_ = 0;
     size_t ram_experts_loaded_ = 0;
 
@@ -2324,12 +2862,13 @@ private:
     int scratch_B_ = 0;
     GpuBuffer sc_slot_ids_, sc_pos_, sc_tok_ids_, sc_img_idx_, sc_want_idx_;
     GpuBuffer sc_grp_slot_, sc_grp_off_, sc_grp_tok_;
+    GpuBuffer sc_x_bf16_, sc_qkvrg_out_;
     GpuBuffer sc_cur_, sc_res_, sc_in0_, sc_in1_, sc_in2_, sc_mx3_, sc_msgs_, sc_ctrl_tmp_, sc_ctrl_in_, sc_ctrl_gain_, sc_ctrl_forget_;
     GpuBuffer sc_q_, sc_k_raw_, sc_v_raw_, sc_k_conv_, sc_v_conv_, sc_r_raw_, sc_rel_bias_;
-    GpuBuffer sc_sinks_, sc_gate_a_, sc_k_dyn_, sc_v_dyn_, sc_attn_out_, sc_o_proj_, sc_a_sconv_;
+    GpuBuffer sc_sinks_, sc_gate_a_, sc_k_dyn_, sc_v_dyn_, sc_attn_out_, sc_splitkv_part_, sc_o_proj_, sc_a_sconv_;
     GpuBuffer sc_mlp_in_, sc_mlp_f16_, sc_r_logits_, sc_topk_ids_, sc_topk_w_;
     GpuBuffer sc_moe_act_, sc_moe_gu_, sc_moe_ye_, sc_moe_out_, sc_m_sconv_;
-    GpuBuffer sc_exp_off_, sc_bucket_tok_, sc_slotk_bidx_, sc_bucket_y_;
+    GpuBuffer sc_exp_off_, sc_bucket_tok_, sc_slotk_bidx_, sc_bucket_x_f16_, sc_bucket_y_;
     GpuBuffer sc_exp_tok_idx_, sc_exp_tok_w_, sc_h_norm_, sc_blk_ptrs_, sc_prelude_, sc_bank_out_, sc_logits_;
     std::vector<GpuBuffer> sc_blocks_;
     std::vector<GpuBuffer> sc_bank_;

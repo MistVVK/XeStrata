@@ -56,6 +56,8 @@ add_custom_command(
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_common.hip.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_codecs.hip.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_ops.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_blaslt.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_hybrid.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../../include/strata/hip_uma_guard.hpp"
   COMMENT "Compiling strata-inkling multi-gen HIP backend (${STRATA_HIP_ARCHS})"
   VERBATIM
@@ -72,6 +74,10 @@ else()
   if(_ink_amdhip64)
     target_link_libraries(strata_inkling_hip PUBLIC "${_ink_amdhip64}")
   endif()
+endif()
+
+if(UNIX)
+  target_link_libraries(strata_inkling_hip PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
 target_compile_definitions(strata-inkling PRIVATE INKLING_ENABLE_HIP=1)
