@@ -76,6 +76,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/i8_expert_rule.hpp"
 #include "strata/prefill/i8_group.hpp"
+#include "strata/prefill/moe_fp4_tc.hpp"
 #include "strata/prefill/routed_stream.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/expert_nibble.hpp"
@@ -206,6 +207,14 @@ bool p1a_used() { return false; }
 bool p1a_takes_pair(int, int) { return false; }
 void hadamard128_rows(float*, int64_t, int64_t, const float*, void*) {}
 }  // namespace strata::prefill::fused
+namespace strata::prefill::fp4_tc {
+bool built() { return false; }
+bool available() { return false; }
+bool wanted() { return false; }
+void quantize_act(const float*, int64_t, int64_t, void*, void*) {}
+void experts(const strata::prefill::fused::Batch&, const strata::prefill::fused::NativeGeom&, int, int64_t, const void*,
+             const void*, const int32_t*, void*, float*, void*) {}
+}  // namespace strata::prefill::fp4_tc
 #endif
 #if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
 // P4-SPLIT: built with Strata's own prompt kernels and without llama.cpp's MMQ (-DSTRATA_MMQ=OFF, or HIP without STRATA_PREFILL_MMQ)
@@ -5666,14 +5675,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (fused_l && nib_l.on) core::nibble::fatal(l, "the prompt path's fused experts", "they read GGUF blocks");
 #endif
                     if (fused_l) {
-                        if (static bool said = false; !said) {
+                        constexpr int kTypeNvfp4 = (int) strata::quant::Type::NVFP4;
+                        const bool fp4_nat = fused_nat && !had_gu && !had_d && mmq_gt == kTypeNvfp4 &&
+                                             mmq_dt == kTypeNvfp4 && fp4_tc::wanted();
+                        if (fp4_nat) {
+                            if (static bool said_fp4 = false; !said_fp4) {
+                                said_fp4 = true;
+                                std::fprintf(stderr, "strata: prompt NVFP4 experts on the Blackwell mxf4nvf4 tensor-core "
+                                                     "kernels (STRATA_PREFILL_NVFP4=w4a4)\n");
+                            }
+                        } else if (static bool said = false; !said) {
                             said = true;
                             std::fprintf(stderr, "strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, "
                                                  "#136)\n");
                         }
                         pt.mark(kPfGather, cs);
-                        // the layer's input to int8 once per token; the rows of each expert from the router's ids
-                        if (fused_nat && had_gu) {   // (a folded trellis gate/up: its input rotated, as the MMQ path's xsrc = m.Xr)
+                        // the layer's input to NVFP4 (Blackwell w4a4) or int8 once per token; the rows of each expert from the router's ids
+                        if (fp4_nat) fp4_tc::quantize_act(m.mixed, T, N, m.Xq, m.cs);
+                        else if (fused_nat && had_gu) {   // (a folded trellis gate/up: its input rotated, as the MMQ path's xsrc = m.Xr)
                             strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);
                             fused::quantize_act_native(m.Xr, T, N, m.Xq, m.cs);
                         } else if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
@@ -5681,7 +5700,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // (a folded trellis down: H rotated inside experts_native; off again after the layer's launches)
                         if (fused_nat && had_d) fused::set_down_rotation(true, had_sh);
                         // STRATA_PF_P1A=1 (gfx1151): the layer input's FP16 rows for the P1A kernels (p1a_input keeps nullptr otherwise)
-                        if (fused_nat) fused::p1a_input(had_gu ? nullptr : m.mixed_h, m.H_bytes);
+                        if (fused_nat && !fp4_nat) fused::p1a_input(had_gu ? nullptr : m.mixed_h, m.H_bytes);
                         bool p1a_layer = false;
                         fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
                         // launches over the experts in id order, each at most kMaxBatch experts (STRATA_PF_BATCH: below)
@@ -5699,7 +5718,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int n = v ? std::atoi(v) : 0;
                             return n > 0 ? std::min(n, fused::kBatchRoom) : fused::kMaxBatch;
                         }();
-                        const bool wide = fused_nat && pf_batch > fused::kMaxBatch && fused::native_wide();
+                        const bool wide = fused_nat && !fp4_nat && pf_batch > fused::kMaxBatch && fused::native_wide();
                         const int per_launch = wide ? pf_batch : std::min(pf_batch, fused::kMaxBatch);
                         for (int32_t e = 0; e < m.g->n_expert;) {
                             fused::Batch b;
@@ -5728,7 +5747,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 wait_copied(k - 1, (k - 1) % (size_t) m.ring);
                             }
                             pt.mark(kPfGemmGU, cs);
-                            if (fused_nat) {
+                            if (fp4_nat) {
+                                const auto& f = lay.fmt[(size_t) l];
+                                const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+                                fp4_tc::experts(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                            } else if (fused_nat) {
                                 fused::want_dm_f16(pf_dm16() && rows_cpu == 0 && !peer_now && ((reinterpret_cast<uintptr_t>(m.shared) | reinterpret_cast<uintptr_t>(m.bo)) & 15) == 0);
                                 const auto& f = lay.fmt[(size_t) l];
                                 const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
@@ -6274,6 +6297,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // the routed experts' input: `mixed`, or (APR) its rotated copy, which the peer / the layer
                         // split's helper also take (one rotation for both cards; `mixed` itself feeds the shared expert)
                         const float* xsrc = m.mixed;
+                        constexpr int kTypeNvfp4Staged = (int) strata::quant::Type::NVFP4;
+                        const bool fz_fp4 = fz_staged && mmq_gt == kTypeNvfp4Staged && mmq_dt == kTypeNvfp4Staged && fp4_tc::wanted();
                         if (fz_staged) {
                             fz_staged_l = true;
                             if (!use_mmq) {   // a fused-only layer (the class default, or STRATA_PF_STAGED_FO=1): said once
@@ -6286,7 +6311,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
 #endif
                             }
-                            fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
+                            if (fz_fp4) fp4_tc::quantize_act(m.mixed, T, N, m.Xq, m.cs);
+                            else fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         }
                         if (i8_l) {   // the layer's T tokens as q8_1 rows, once (the grouped kernels' activations)
                             if (static bool said = false; !said) {
@@ -7060,7 +7086,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 pt.mark(kPfGemmGU, cs);
                                 fused::want_dm_f16(false);
                                 // the layer's tables (group_bounds, before the walk) and rows: the batch's experts are local indices of them
-                                fused::experts_native(fz_b, fz_geom, (int) order.size(), T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                                if (fz_fp4) fp4_tc::experts(fz_b, fz_geom, (int) order.size(), T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                                else fused::experts_native(fz_b, fz_geom, (int) order.size(), T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                                 if (gg_nslots > 0) {   // the batch's staged blobs are read: one event releases their slots
                                     const int rel = gg_slots[gg_nslots - 1];
                                     cudaEventRecord(m.used[rel], m.cs);
@@ -8669,10 +8696,14 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         int fz_rel[MMQ_GROUP] = {};
         int fz_nrel = 0;
         fused::NativeGeom fz_geom{};
+        bool lm_fp4 = false;
         if (fz_l) {
             const auto& f = lay.fmt[(size_t) l];
             fz_geom = fused::NativeGeom{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
-            fused::quantize_act_native(lb.mixed, Sn, N, lb.xa, cs);
+            constexpr int kTypeNvfp4Lm = (int) strata::quant::Type::NVFP4;
+            lm_fp4 = !f.had_gu && !f.had_d && f.gu_type == kTypeNvfp4Lm && f.d_type == kTypeNvfp4Lm && fp4_tc::wanted();
+            if (lm_fp4) fp4_tc::quantize_act(lb.mixed, Sn, N, lb.xa, cs);
+            else fused::quantize_act_native(lb.mixed, Sn, N, lb.xa, cs);
         }
         mmq::GatherGroup gg;
         int gg_slots[MMQ_GROUP];
@@ -8753,7 +8784,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 fb.e1 = ngx;
                 for (int i = 0; i < ngx; ++i) fb.blob[i] = fz_blob[i];
                 fused::want_dm_f16(false);
-                fused::experts_native(fb, fz_geom, ngx, gp.nr, m.GU, lb.xa, d_row_tok + gp.r0, m.H, m.Dm, cs);
+                if (lm_fp4) fp4_tc::experts(fb, fz_geom, ngx, gp.nr, m.GU, lb.xa, d_row_tok + gp.r0, m.H, m.Dm, cs);
+                else fused::experts_native(fb, fz_geom, ngx, gp.nr, m.GU, lb.xa, d_row_tok + gp.r0, m.H, m.Dm, cs);
                 for (int i = 0; i < fz_nrel; ++i) {   // the group's staged blobs are read: their slots are free
                     cudaEventRecord(m.used[fz_rel[i]], cs);
                     m.used_of[fz_rel[i]] = fz_rel[i];

@@ -139,6 +139,17 @@ void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, in
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
+/// Partial-VRAM on-device hit plan (`STRATA_VERIFY_DEVICE_HITS=1`, `--pcie-frac 0`, CUDA / HIP): groups only the
+/// resident routed experts (`res_layer[e] >= 0`) in first-occurrence routing order into `plan` (`counts = {hit_groups,
+/// hit_entries, 0}`), matching `expert_pool_dispatch_multi` when `fetches == 0` without waiting on `m_flagA_`/`m_flagB_`.
+void resident_hits_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                        const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+                        long long capx, void* stream);
+/// Opt-in `STRATA_ROUTE_TAIL_RENORM=1` (CUDA / HIP): zeroes routing weights of missed experts (`res_layer[e] < 0`)
+/// routed exclusively at rank >= `tail_rank` across the `n_tok` rows of the window, and rescales each row's remaining
+/// weights so their sum equals the row's original router weight sum.
+void route_tail_renorm(const int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, int k, int n_expert,
+                       int tail_rank, void* stream);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.

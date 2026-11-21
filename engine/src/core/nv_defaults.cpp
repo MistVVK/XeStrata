@@ -105,11 +105,9 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             // text twice byte for byte on both sides (repeat floor 0); prompt speed kq / MMQ, 10 interleaved pairs, median of the per-round ratios 1.10 / 1.26 / 1.18 / 1.53 at 2K / 4K / 8K / 20K (faster in 7 / 8 / 8 / 9 of 10; the rounds scatter 0.5 to 2.0)
             // (phaseA-tests/par/RESULTS-SPARK-KQ.md).  STRATA_PF_FUSED_KQ=0 is the way back (a switch you set is kept); it is off with the rest of the table by STRATA_SM121_PERF=0.
             {"STRATA_PF_FUSED_KQ", "1"},
-            // NVFP4 prompt MMQ with FP4 activations (W4A4), the Blackwell path the engine keeps opt-in.  On this part, the
-            // NVFP4 pack measured prompt 1.106x at 4K and 1.229x at 16K against the default W4A8 MMQ, decode unchanged
-            // (1.015x), and 24 of 24 greedy answers byte-identical with it on and off.  Opt-in upstream because it is only
-            // checked on Blackwell; switched on here for the same reason as the row above, with the same off switch.
-            {"STRATA_PREFILL_NVFP4", "w4a4"},
+            // (STRATA_PREFILL_NVFP4=w4a4 was an MMQ switch before 0.2.16 removed llama.cpp's MMQ from the tree; leaving it
+            // here made moe_fused_iq.cu decline NVFP4 layers onto FP16 cuBLAS.  Strata's own sm_120a/sm_121a mxf4nvf4 path
+            // stays opt-in via STRATA_PREFILL_NVFP4=w4a4 until paired GB10 measurements land.)
             // the hyper-connection read's fused up projection + mix (gr_upmix).  Measured on IQ3_S against the unfused read:
             // decode 1.054x [1.007, 1.089], prompt unchanged, and 24 of 24 greedy answers byte-identical (the parity test
             // src/prefill/gr_upmix_parity.cu covers it upstream).  The HC read is ~13% of a decode round here, which is

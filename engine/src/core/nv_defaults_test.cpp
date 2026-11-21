@@ -2,6 +2,7 @@
 // two off switches, and that no other card's table changed.
 #include "strata/core/nv_chunk.hpp"
 #include "strata/core/nv_defaults.hpp"
+#include "strata/prefill/nvfp4_prefill_mode.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -37,13 +38,13 @@ int main() {
     unset("STRATA_SM86_PERF");
     unset("STRATA_SM60_PERF");
     unset("STRATA_EMULATE_CC");
-    // GB10 (12.1): the six measured switches, and nothing else
+    // GB10 (12.1): the five measured own-stack switches, and no stale MMQ STRATA_PREFILL_NVFP4=w4a4 default
     {
         const auto t = nv_default_env(12, 1, false);
-        CHECK(t.size() == 6);
+        CHECK(t.size() == 5);
         CHECK(find(t, "STRATA_PF_FUSED") && *find(t, "STRATA_PF_FUSED") == "1");
         CHECK(find(t, "STRATA_PF_FUSED_KQ") && *find(t, "STRATA_PF_FUSED_KQ") == "1");
-        CHECK(find(t, "STRATA_PREFILL_NVFP4") && *find(t, "STRATA_PREFILL_NVFP4") == "w4a4");
+        CHECK(!find(t, "STRATA_PREFILL_NVFP4"));
         CHECK(find(t, "STRATA_HC_UPMIX") && *find(t, "STRATA_HC_UPMIX") == "1");
         CHECK(find(t, "STRATA_SIDE_MIXER") && *find(t, "STRATA_SIDE_MIXER") == "2");
         CHECK(find(t, "STRATA_SPEC_COST") && *find(t, "STRATA_SPEC_COST") == "1");
@@ -54,8 +55,25 @@ int main() {
     put("STRATA_SM121_PERF", "0");
     CHECK(nv_default_env(12, 1, false).empty());
     put("STRATA_SM121_PERF", "1");
-    CHECK(nv_default_env(12, 1, false).size() == 6);
+    CHECK(nv_default_env(12, 1, false).size() == 5);
     unset("STRATA_SM121_PERF");
+    // STRATA_PREFILL_NVFP4 resolution in builds without MMQ: w4a4 routes to fp4_tc where available and degrades to w4a8 (never FP16 cuBLAS) elsewhere
+    {
+        using strata::prefill::Nvfp4PrefillPath;
+        using strata::prefill::nvfp4_fused_covers;
+        using strata::prefill::resolve_nvfp4_prefill_path;
+        bool deg = true;
+        CHECK(resolve_nvfp4_prefill_path(nullptr, false, false, &deg) == Nvfp4PrefillPath::FusedW4A8 && !deg);
+        CHECK(resolve_nvfp4_prefill_path("", true, false, &deg) == Nvfp4PrefillPath::FusedW4A8 && !deg);
+        CHECK(resolve_nvfp4_prefill_path("w4a8", true, false, &deg) == Nvfp4PrefillPath::FusedW4A8 && !deg);
+        CHECK(resolve_nvfp4_prefill_path("w4a4", true, false, &deg) == Nvfp4PrefillPath::FusedW4A4 && !deg);
+        CHECK(resolve_nvfp4_prefill_path("w4a4", false, false, &deg) == Nvfp4PrefillPath::FusedW4A8 && deg);
+        CHECK(resolve_nvfp4_prefill_path("w4a4", false, true, &deg) == Nvfp4PrefillPath::LegacyMmqOrF16 && !deg);
+        CHECK(resolve_nvfp4_prefill_path("fp16", true, false, &deg) == Nvfp4PrefillPath::LegacyMmqOrF16 && !deg);
+        CHECK(nvfp4_fused_covers("w4a4", true, false));
+        CHECK(nvfp4_fused_covers("w4a4", false, false));
+        CHECK(!nvfp4_fused_covers("fp16", true, false));
+    }
     // sm_120 (RTX 50 / PRO Blackwell, BW-13 and BW-G): the fused hyper-connection up projection + mix, L2 prefetch, the one-row Q8_0 kernel, EXP_MODE=8; STRATA_DEFAULTS=026 and STRATA_SM120_PERF=0 leave it out
     {
         unset("STRATA_SM120_PERF");

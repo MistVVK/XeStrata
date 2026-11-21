@@ -351,12 +351,12 @@ public:
     /// (its graphs are captured there).
     void set_always_publish(bool on) {
         always_publish_ = on;
-        if (on) device_plan_ = false;
+        if (on) { device_plan_ = false; device_hits_ = false; }
     }
     /// 0.1.43: the adaptive tier's overlap gate (see AdaptGate).  Refused (false) with the device-planned layers (E-6),
     /// which never ask the host.  The pointer must outlive the verifier's windows.
     bool set_adapt_gate(AdaptGate* g) {
-        if (g != nullptr && device_plan_) return false;
+        if (g != nullptr && (device_plan_ || device_hits_)) return false;
         adapt_gate_ = g;
         return true;
     }
@@ -435,6 +435,11 @@ public:
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
     void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    void set_no_pcie_share(bool on) { no_pcie_share_ = on; }
+    bool device_hits_active() const {
+        return device_hits_ && no_pcie_share_ && !ar_on() && !always_publish_ && remote_opt_ == nullptr &&
+               adapt_gate_ == nullptr && m_bal_ == nullptr;
+    }
 
     /// The PCIe count of each layer from measured costs (PcieModel) instead of a fixed share: the spin kernels stamp
     /// each step's GPU work (the plan's arrival, the PCIe part's start, the wait for the CPU's rows; GPU clock), the host
@@ -599,6 +604,8 @@ private:
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
+    bool device_hits_ = false;            ///< STRATA_VERIFY_DEVICE_HITS: partial-VRAM hit groups planned on the device
+    bool no_pcie_share_ = false;          ///< set_no_pcie_share: --pcie-frac 0 without dynamic PCIe staging
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
