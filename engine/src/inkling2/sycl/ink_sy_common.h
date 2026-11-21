@@ -67,6 +67,14 @@ inline sycl::queue& Q() {
     return q;
 }
 
+// Secondary async DMA/prefetch queue on the same Intel Arc context & device (overlaps H2D with compute!)
+inline sycl::queue& Q_copy() {
+    static sycl::queue qc = [] {
+        return sycl::queue{Q().get_context(), Q().get_device(), sycl::property_list{sycl::property::queue::in_order()}};
+    }();
+    return qc;
+}
+
 inline void wait() { Q().wait_and_throw(); }
 
 struct SyDevCaps {
@@ -157,14 +165,14 @@ inline float sg_sum(const It& it, float v) {
     return sycl::reduce_over_group(it.get_sub_group(), v, sycl::plus<float>());
 }
 
-// Work-group sum for 1-D group whose size is a multiple of 16 (up to 256 -> max 16 subgroups)
+// Work-group sum for 1-D or 2-D group whose size is a multiple of 16 (up to 256 -> max 16 subgroups)
 template <class It, class P>
 inline float wg_sum16(const It& it, float v, P sh) {
     auto sg = it.get_sub_group();
     v = sycl::reduce_over_group(sg, v, sycl::plus<float>());
     const int w = (int)sg.get_group_linear_id();
     const int l = (int)sg.get_local_linear_id();
-    const int nw = (int)it.get_local_range(0) >> 4;
+    const int nw = (int)sg.get_group_linear_range();
     sycl::group_barrier(it.get_group());
     if (l == 0) sh[w] = v;
     sycl::group_barrier(it.get_group());
@@ -470,7 +478,13 @@ struct InkSyclModel {
     int n_vram_experts = 0;
     int n_host_experts = 0;
     size_t vram_expert_bytes = 0;
+    size_t max_expert_bytes = 0;
     double t_load = 0.0;
+
+    // Host shadow metadata for Strata Predictive CPU/RAM Hybrid + Elastic VRAM Cache Ring
+    std::vector<InkSyExpertDev> h_ed;
+    std::vector<const uint8_t*> host_body_ptrs;
+    std::vector<uint32_t> expert_body_bytes;
 
     static constexpr size_t kSconvLayerFloats = (1024 + 1024 + 2304 + 2304) * 4;
     static constexpr size_t kSconvKOff = 0;
@@ -544,6 +558,7 @@ struct InkSyclModel {
                         return false;
                     }
                     h2d(dev_slab + cur_off, staging.data(), ti->bytes);
+                    wait();
                     ti->dev_ptr = dev_slab + cur_off;
                     // Keep tiny pre-orientation tensors on host temporarily
                     if (ti->name.find("sconv") != std::string::npos ||
@@ -601,9 +616,10 @@ struct InkSyclModel {
         // 3. Auto-compute VRAM expert budget for 8 GB (A750), 12 GB (B580), 16 GB (A770), 32 GB (Arc Pro B70)
         // Reserve ~1.6 GiB for KV/workspace on 8 GB cards, ~2.2 GiB on 12-16 GB, ~4.0 GiB on 32 GB!
         const size_t gpu_mem = dev_caps().global_mem;
-        const size_t reserve = gpu_mem >= (24ull << 30) ? (3584ull << 20)
-                             : gpu_mem >= (11ull << 30) ? (2048ull << 20)
-                                                        : (1536ull << 20);
+        const size_t base_reserve = gpu_mem >= (24ull << 30) ? (2560ull << 20)
+                                  : gpu_mem >= (11ull << 30) ? (1536ull << 20)
+                                                             : (1024ull << 20);
+        const size_t reserve = (extra_reserve_bytes > 0) ? (extra_reserve_bytes + (768ull << 20)) : base_reserve;
         const size_t used = dev_bytes_allocated();
         size_t vram_budget = (gpu_mem > used + reserve) ? (gpu_mem - used - reserve) : 0;
         if (vram_experts_gb_override >= 0.0) {
@@ -629,7 +645,10 @@ struct InkSyclModel {
         n_host_experts = (int)host_gids.size();
         vram_expert_bytes = vram_acc;
 
-        std::vector<InkSyExpertDev> h_ed(n_total);
+        h_ed.assign(n_total, InkSyExpertDev{});
+        host_body_ptrs.assign(n_total, nullptr);
+        expert_body_bytes.assign(n_total, 0);
+        max_expert_bytes = 0;
         auto populate_experts = [&](const std::vector<size_t>& gids, bool to_device) -> bool {
             size_t i = 0;
             std::vector<uint8_t> buf;
@@ -653,11 +672,15 @@ struct InkSyclModel {
                             err = "short read expert body"; return false;
                         }
                         h2d(slab + off, buf.data(), e.body_bytes);
+                        wait();
                     } else {
                         if (!seek_abs(fp, secs[4].file_offset + e.body_offset) || std::fread(slab + off, 1, e.body_bytes, fp) != e.body_bytes) {
                             err = "short read host expert body"; return false;
                         }
+                        host_body_ptrs[gid] = slab + off;
                     }
+                    expert_body_bytes[gid] = e.body_bytes;
+                    max_expert_bytes = std::max<size_t>(max_expert_bytes, e.body_bytes);
                     h_ed[gid] = InkSyExpertDev{slab + off, e.dn_offset, e.gu_code_id, e.dn_code_id, (uint8_t)(to_device ? 1 : 0), 0};
                     off += ((e.body_bytes + 4095) / 4096) * 4096;
                 }

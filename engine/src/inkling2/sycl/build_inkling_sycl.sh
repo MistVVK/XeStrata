@@ -43,6 +43,17 @@ done
   -c "${ENG_ROOT}/src/artifact/strata_reader.cpp" -o "${OUT_DIR}/strata_reader.o"
 OBJS+=("${OUT_DIR}/strata_reader.o")
 
+# Compile native AVX-512/AVX2 S_K/SF4/MX8 CPU expert kernels for Strata Predictive CPU/RAM Hybrid pool
+CPU_ISA_FLAGS=()
+if [ "$(uname -m)" = "x86_64" ]; then
+  CPU_ISA_FLAGS=(-mavx2 -mfma -mf16c)
+fi
+"${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -I"${ENG_ROOT}/include" \
+  -c "${ENG_ROOT}/src/quant/sk_codecs.cpp" -o "${OUT_DIR}/sk_codecs.o"
+"${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -I"${ENG_ROOT}/include" \
+  -c "${ENG_ROOT}/src/inkling2/inkling2_loop.cpp" -o "${OUT_DIR}/inkling2_loop.o"
+OBJS+=("${OUT_DIR}/sk_codecs.o" "${OUT_DIR}/inkling2_loop.o")
+
 # 2. Target flags (Alchemist dg2 + Battlemage bmg_g21 + Arc Pro B70 bmg_g31 + portable spir64 JIT!)
 SYCL_FLAGS=(-fsycl -std=c++20 -O3 -fno-fast-math)
 case "${TARGET_MODE}" in
@@ -72,7 +83,15 @@ case "${TARGET_MODE}" in
     ;;
 esac
 
-"${ICPX}" "${SYCL_FLAGS[@]}" \
+MKL_FLAGS=()
+MKL_LIBS=()
+if [ -n "${MKLROOT:-}" ] && [ -f "${MKLROOT}/include/oneapi/mkl/blas.hpp" ]; then
+  echo "[build_inkling_sycl] Enabling Intel oneMKL XMX GEMM (${MKLROOT})"
+  MKL_FLAGS=(-DINK_SYCL_USE_ONEMKL=1 "-I${MKLROOT}/include")
+  MKL_LIBS=("-L${MKLROOT}/lib" "-Wl,-rpath,${MKLROOT}/lib" -lmkl_sycl_blas -lmkl_intel_lp64 -lmkl_sequential -lmkl_core)
+fi
+
+"${ICPX}" "${SYCL_FLAGS[@]}" "${MKL_FLAGS[@]}" \
   -I"${SCRIPT_DIR}" \
   -I"${ENG_ROOT}/include" \
   -I"${ENG_ROOT}/src/hy4flash/run" \
@@ -81,6 +100,7 @@ esac
   -I"${ZSTD_DIR}" \
   "${SCRIPT_DIR}/ink_sy_main.cpp" \
   "${OBJS[@]}" \
+  "${MKL_LIBS[@]}" \
   -lpthread \
   -o "${OUT_DIR}/strata-inkling-sycl"
 

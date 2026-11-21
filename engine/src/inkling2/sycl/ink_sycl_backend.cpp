@@ -41,10 +41,26 @@ public:
 
     bool init(const InkModelFile& model, const BackendOpts& opts, std::string& err) override {
         kv_dtype_ = opts.kv_dtype;
-        if (!mod_.load(model.path, opts.vram_experts_gb, err)) return false;
         const int par = std::max(1, std::min(64, opts.parallel));
+        const int ctx = std::max(256, opts.max_ctx);
         const int batch_cap = std::max(256, std::max(opts.chunk, par));
-        if (!runner_.init(mod_, par, std::max(256, opts.max_ctx), batch_cap, opts.enable_dspark, err)) {
+        // Compute exact runner + KV + DSpark + Vision + XMX/Hybrid reserve so 8-16 GB Arc cards NEVER OOM!
+        size_t kv_est = 0;
+        const auto& mc = model.m.c;
+        for (int v = 0; v < mc.n_visits; ++v) {
+            const int ip = mc.phys_for_visit(v);
+            const size_t stride = (size_t)(mc.is_swa[ip] ? mc.swa_win : ctx);
+            kv_est += 2ull * (size_t)par * stride * (size_t)mc.n_kv * (size_t)mc.head_dim * 2ull;
+        }
+        const size_t dsp_kv = (opts.enable_dspark && model.m.dspark.present)
+            ? (3ull * 2ull * (size_t)par * (size_t)ctx * 1024ull * 2ull) : 0ull;
+        const size_t sc_est = (size_t)mc.n_visits * (size_t)par * 3ull * (2048ull + 2ull * (size_t)mc.hidden) * 8ull;
+        const size_t act_est = (size_t)batch_cap * 512ull * 1024ull + (128ull << 20);
+        const size_t vis_est = !opts.vision_path.empty() ? (700ull << 20) : 0ull;
+        const size_t hyb_xmx_est = (320ull << 20);  // Elastic VRAM cache ring (<=256 MiB) + XMX scratch (~32 MiB) + ping-pong
+        const size_t extra_reserve = kv_est + dsp_kv + sc_est + act_est + vis_est + hyb_xmx_est;
+        if (!mod_.load(model.path, opts.vram_experts_gb, err, extra_reserve)) return false;
+        if (!runner_.init(mod_, par, ctx, batch_cap, opts.enable_dspark, err)) {
             return false;
         }
         if (!opts.vision_path.empty()) {
@@ -75,56 +91,49 @@ public:
 
     bool forward_batch(const StepBatch& batch, float* logits_out, TapCapture* taps_out, std::string& err) override {
         if (batch.n_tokens <= 0) return true;
-        const int M = batch.n_tokens;
+        const int M_tot = batch.n_tokens;
         const int D = mod_.man.c.hidden;
-
-        std::vector<uint8_t> is_img;
-        std::vector<float> img_emb;
-        bool any_img = false;
-        for (int idx : batch.img_embed_idx) if (idx >= 0) { any_img = true; break; }
-        if (any_img && batch.img_embeds) {
-            is_img.assign((size_t)M, 0);
-            img_emb.assign((size_t)M * D, 0.0f);
-            for (int m = 0; m < M; ++m) {
-                if (batch.img_embed_idx[m] >= 0) {
-                    is_img[m] = 1;
-                    std::memcpy(img_emb.data() + (size_t)m * D,
-                                batch.img_embeds + (size_t)batch.img_embed_idx[m] * D,
-                                (size_t)D * sizeof(float));
-                }
-            }
-        }
-
-        const int n_want = batch.count_logits();
         const int V = mod_.man.c.vocab_unpadded;
-        if (n_want > 0 && logits_out != nullptr) {
-            if (n_want == 1 && batch.want_logits[M - 1] != 0) {
-                if (!runner_.forward_batch(batch.token_ids.data(), batch.slot_ids.data(), batch.pos.data(), M,
-                                           any_img ? is_img.data() : nullptr, any_img ? img_emb.data() : nullptr,
-                                           1, logits_out, nullptr, batch.capture_taps)) {
-                    err = "sycl forward_batch failed"; return false;
-                }
-            } else {
-                std::vector<float> all_lg((size_t)M * V);
-                if (!runner_.forward_batch(batch.token_ids.data(), batch.slot_ids.data(), batch.pos.data(), M,
-                                           any_img ? is_img.data() : nullptr, any_img ? img_emb.data() : nullptr,
-                                           2, all_lg.data(), nullptr, batch.capture_taps)) {
-                    err = "sycl forward_batch failed"; return false;
-                }
-                int dst_row = 0;
+        const int cap = runner_.max_batch;
+
+        int dst_logit_row = 0;
+        for (int off = 0; off < M_tot; off += cap) {
+            const int M = std::min(cap, M_tot - off);
+            std::vector<uint8_t> is_img;
+            std::vector<float> img_emb;
+            bool any_img = false;
+            for (int m = 0; m < M; ++m) if (batch.img_embed_idx[off + m] >= 0) { any_img = true; break; }
+            if (any_img && batch.img_embeds) {
+                is_img.assign((size_t)M, 0);
+                img_emb.assign((size_t)M * D, 0.0f);
                 for (int m = 0; m < M; ++m) {
-                    if (batch.want_logits[m]) {
-                        std::memcpy(logits_out + (size_t)dst_row * V, all_lg.data() + (size_t)m * V, (size_t)V * 4);
-                        ++dst_row;
+                    const int idx = batch.img_embed_idx[off + m];
+                    if (idx >= 0) {
+                        is_img[m] = 1;
+                        std::memcpy(img_emb.data() + (size_t)m * D,
+                                    batch.img_embeds + (size_t)idx * D,
+                                    (size_t)D * sizeof(float));
                     }
                 }
             }
-        } else {
-            if (!runner_.forward_batch(batch.token_ids.data(), batch.slot_ids.data(), batch.pos.data(), M,
+
+            std::vector<int> want_idx;
+            if (logits_out != nullptr) {
+                for (int m = 0; m < M; ++m) if (batch.want_logits[off + m] != 0) want_idx.push_back(m);
+            }
+            const int n_want = (int)want_idx.size();
+            float* chunk_lg = (n_want > 0 && logits_out != nullptr) ? (logits_out + (size_t)dst_logit_row * V) : nullptr;
+            int mode = 0;
+            if (n_want == 1 && want_idx[0] == M - 1) mode = 1;
+            else if (n_want > 0) mode = 2;
+
+            if (!runner_.forward_batch(batch.token_ids.data() + off, batch.slot_ids.data() + off, batch.pos.data() + off, M,
                                        any_img ? is_img.data() : nullptr, any_img ? img_emb.data() : nullptr,
-                                       0, nullptr, nullptr, batch.capture_taps)) {
+                                       mode, chunk_lg, nullptr, batch.capture_taps,
+                                       (mode == 2) ? want_idx.data() : nullptr, n_want)) {
                 err = "sycl forward_batch failed"; return false;
             }
+            dst_logit_row += n_want;
         }
         (void)taps_out;
         return true;

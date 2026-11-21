@@ -159,9 +159,10 @@ inline void k_quantize_x_q8_sg16(const float* X, int M, int K, int8_t* xq, float
 }
 
 // Q8_ROW SG16 dp4a GEMV (deterministic dot_acc on int8x4!)
-inline void k_linear_q8row_dp4a_sg16(const uint8_t* W, int N, int K, const int8_t* xq, const float* xsc, float* Y, int M) {
+inline void k_linear_q8row_dp4a_sg16(const uint8_t* W, int N, int K, const int8_t* xq, const float* xsc, float* Y, int M, int N_total = -1) {
+    const int n_scales = (N_total > 0) ? N_total : N;
     const float* scales = reinterpret_cast<const float*>(W);
-    const int32_t* qw4 = reinterpret_cast<const int32_t*>(W + (size_t)N * 4);
+    const int32_t* qw4 = reinterpret_cast<const int32_t*>(W + (size_t)n_scales * 4);
     const int32_t* xq4 = reinterpret_cast<const int32_t*>(xq);
     const int K4 = K >> 2;
     Q().parallel_for(NR((N + 15) / 16, 256), [=](sycl::nd_item<1> it) INK_REQD_SG16 {
@@ -188,10 +189,11 @@ inline void k_linear_q8row_dp4a_sg16(const uint8_t* W, int N, int K, const int8_
 }
 
 // Q8_ROW SG16 exact FP32-act fallback & tiled GEMM for M >= 16
-inline void k_gemm_q8row_sg16(const uint8_t* W, int N, int K, const float* X, float* Y, int M) {
+inline void k_gemm_q8row_sg16(const uint8_t* W, int N, int K, const float* X, float* Y, int M, int N_total = -1) {
     const int nbm = (M + 31) / 32, nbn = (N + 63) / 64;
+    const int n_scales = (N_total > 0) ? N_total : N;
     const float* scales = reinterpret_cast<const float*>(W);
-    const int8_t* qw = reinterpret_cast<const int8_t*>(W + (size_t)N * 4);
+    const int8_t* qw = reinterpret_cast<const int8_t*>(W + (size_t)n_scales * 4);
     Q().submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sA(32 * 17, h);
         sycl::local_accessor<float, 1> sB(64 * 17, h);

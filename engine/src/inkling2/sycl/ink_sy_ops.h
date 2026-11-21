@@ -330,8 +330,8 @@ inline void k_router_topk8_sg16(const float* r_logits, const float* r_bias, int*
             if (tid == 0) {
                 int sel[8]; float pw[8]; float sum = 0.0f;
                 for (int k = 0; k < 8; ++k) {
-                    int bi = -1; float bs = -1e30f;
-                    for (int e = 0; e < 128; ++e) if (sh_s[e] > bs) { bs = sh_s[e]; bi = e; }
+                    int bi = 0; float bs = sh_s[0];
+                    for (int e = 1; e < 128; ++e) if (sh_s[e] > bs) { bs = sh_s[e]; bi = e; }
                     sel[k] = bi; pw[k] = sh_p[bi]; sum += pw[k]; sh_s[bi] = -1e30f;
                 }
                 const float inv = route_scale / (sum + 1e-20f);

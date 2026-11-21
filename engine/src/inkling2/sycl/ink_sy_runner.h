@@ -20,8 +20,10 @@
 #include <vector>
 
 #include "ink_sy_codecs.h"
+#include "ink_sy_xmx.h"
 #include "ink_sy_common.h"
 #include "ink_sy_dspark.h"
+#include "ink_sy_hybrid.h"
 #include "ink_sy_ops.h"
 #include "ink_sy_vision.h"
 
@@ -140,10 +142,12 @@ struct InkSyRunner {
     float* xsc_dev = nullptr;
 
     InkSyVision vis;
+    InkSyHybridEngine hybrid;
 
     ~InkSyRunner() { release(); }
 
     void release() {
+        hybrid.release();
         for (auto* p : kv_k) dfree(p);
         for (auto* p : kv_v) dfree(p);
         for (auto* p : sc_hist_k) dfree(p);
@@ -270,8 +274,9 @@ struct InkSyRunner {
         }
 
         wait();
-        fprintf(stderr, "[ink_sycl] runner ready: slots=%d ctx=%d batch=%d dspark=%d | KV=%.1f MiB SC=%.1f MiB DevAlloc=%.2f GiB\n",
-                max_slots, max_ctx, max_batch, (int)use_dspark,
+        hybrid.init(m);
+        fprintf(stderr, "[ink_sycl] runner ready: slots=%d ctx=%d batch=%d dspark=%d hybrid=%d | KV=%.1f MiB SC=%.1f MiB DevAlloc=%.2f GiB\n",
+                max_slots, max_ctx, max_batch, (int)use_dspark, (int)hybrid.active,
                 kv_tot / (1024.0 * 1024.0), sc_tot / (1024.0 * 1024.0),
                 dev_bytes_allocated() / (1024.0 * 1024.0 * 1024.0));
         (void)err;
@@ -330,26 +335,28 @@ struct InkSyRunner {
         const int K = (int)ti.cols();
         switch (ti.fmt) {
             case FMT_BF16:
+                if (ink_xmx_linear_bf16(reinterpret_cast<const uint16_t*>(ti.dev_ptr), N, K, X, Y, M)) break;
                 if (M >= 16) k_gemm_bf16_sg16(reinterpret_cast<const uint16_t*>(ti.dev_ptr), N, K, X, Y, M);
                 else k_linear_bf16_sg16(reinterpret_cast<const uint16_t*>(ti.dev_ptr), N, K, X, Y, M);
                 break;
             case FMT_Q8ROW:
+                if (ink_xmx_linear_q8row(ti.dev_ptr, N, K, X, Y, M, (int)ti.rows())) break;
                 if (M >= 16) {
-                    k_gemm_q8row_sg16(ti.dev_ptr, N, K, X, Y, M);
+                    k_gemm_q8row_sg16(ti.dev_ptr, N, K, X, Y, M, (int)ti.rows());
                 } else {
                     k_quantize_x_q8_sg16(X, M, K, xq_s8_dev, xsc_dev);
-                    k_linear_q8row_dp4a_sg16(ti.dev_ptr, N, K, xq_s8_dev, xsc_dev, Y, M);
+                    k_linear_q8row_dp4a_sg16(ti.dev_ptr, N, K, xq_s8_dev, xsc_dev, Y, M, (int)ti.rows());
                 }
                 break;
             case FMT_F32:
                 k_linear_f32_sg16(reinterpret_cast<const float*>(ti.dev_ptr), N, K, X, Y, M);
                 break;
-            case FMT_S2: k_linear_sk_sg16<FMT_S2>(ti.dev_ptr, N, K, X, Y, M); break;
-            case FMT_S3: k_linear_sk_sg16<FMT_S3>(ti.dev_ptr, N, K, X, Y, M); break;
-            case FMT_S4: k_linear_sk_sg16<FMT_S4>(ti.dev_ptr, N, K, X, Y, M); break;
-            case FMT_S5: k_linear_sk_sg16<FMT_S5>(ti.dev_ptr, N, K, X, Y, M); break;
-            case FMT_S6: k_linear_sk_sg16<FMT_S6>(ti.dev_ptr, N, K, X, Y, M); break;
-            case FMT_S8: k_linear_sk_sg16<FMT_S8>(ti.dev_ptr, N, K, X, Y, M); break;
+            case FMT_S2: if (!ink_xmx_linear_sk<FMT_S2>(ti.dev_ptr, N, K, X, Y, M)) k_linear_sk_sg16<FMT_S2>(ti.dev_ptr, N, K, X, Y, M); break;
+            case FMT_S3: if (!ink_xmx_linear_sk<FMT_S3>(ti.dev_ptr, N, K, X, Y, M)) k_linear_sk_sg16<FMT_S3>(ti.dev_ptr, N, K, X, Y, M); break;
+            case FMT_S4: if (!ink_xmx_linear_sk<FMT_S4>(ti.dev_ptr, N, K, X, Y, M)) k_linear_sk_sg16<FMT_S4>(ti.dev_ptr, N, K, X, Y, M); break;
+            case FMT_S5: if (!ink_xmx_linear_sk<FMT_S5>(ti.dev_ptr, N, K, X, Y, M)) k_linear_sk_sg16<FMT_S5>(ti.dev_ptr, N, K, X, Y, M); break;
+            case FMT_S6: if (!ink_xmx_linear_sk<FMT_S6>(ti.dev_ptr, N, K, X, Y, M)) k_linear_sk_sg16<FMT_S6>(ti.dev_ptr, N, K, X, Y, M); break;
+            case FMT_S8: if (!ink_xmx_linear_sk<FMT_S8>(ti.dev_ptr, N, K, X, Y, M)) k_linear_sk_sg16<FMT_S8>(ti.dev_ptr, N, K, X, Y, M); break;
             default:
                 fprintf(stderr, "[ink_sycl] unsupported linear fmt %d for %s\n", ti.fmt, ti.name.c_str());
                 std::exit(2);
@@ -361,10 +368,12 @@ struct InkSyRunner {
 
     bool forward_batch(const int* tok_ids, const int* slot_ids, const int* positions, int M,
                        const uint8_t* is_img_host, const float* img_emb_host,
-                       int logits_mode,  // 0=none, 1=last token only, 2=all M tokens
+                       int logits_mode,  // 0=none, 1=last token only, 2=all M tokens (or want_idx_host[0..n_want-1])
                        float* out_logits_host, int* out_argmax_host,
-                       bool record_dspark_ctx) {
+                       bool record_dspark_ctx,
+                       const int* want_idx_host = nullptr, int n_want = 0) {
         if (M <= 0 || M > max_batch) return false;
+        hybrid.decay_step();
         const auto& man = mod->man;
         const auto& c = man.c;
         const int D = c.hidden;
@@ -408,10 +417,26 @@ struct InkSyRunner {
         k_embed_sg16(man.get("model.llm.embed.weight"), tf32("model.llm.embed_norm.weight"),
                      b_tok_ids, b_is_img, b_img_emb, b_cur, M, c.vocab_padded);
 
+        const bool dbg = (std::getenv("INK_SY_DEBUG") && std::getenv("INK_SY_DEBUG")[0] == '1' && M == 1);
+        auto dbg_buf = [&](const char* tag, const float* p, int n) {
+            if (!dbg) return;
+            std::vector<float> h(n);
+            d2h(h.data(), p, (size_t)n * 4);
+            wait();
+            int nans = 0, infs = 0; float mn = 1e30f, mx = -1e30f; double ss = 0;
+            for (float v : h) {
+                if (std::isnan(v)) nans++;
+                else if (!std::isfinite(v)) infs++;
+                else { mn = std::min(mn, v); mx = std::max(mx, v); ss += (double)v * v; }
+            }
+            fprintf(stderr, "  [DBG %s] n=%d nan=%d inf=%d min=%.4g max=%.4g l2=%.4g\n", tag, n, nans, infs, mn, mx, std::sqrt(ss));
+        };
+        dbg_buf("embed", b_cur, M * D);
+
         int n_blocks = 0;
         int prelude_n_blocks = 0;
 
-        auto run_visit = [&](int ip, int visit, bool has_msgs) {
+        auto run_visit = [&](int ip, int visit, int visit_pass, bool has_msgs) {
             if (record_dspark_ctx && use_dspark) {
                 for (int ti = 0; ti < 3; ++ti) {
                     if (visit == c.dspark_taps[ti]) {
@@ -503,12 +528,17 @@ struct InkSyRunner {
                                    b_sinks, b_gate_attn, kv_k[visit], kv_v[visit],
                                    b_slot_ids, b_pos, b_attn_out, M, is_swa ? 1 : 0,
                                    c.swa_win, c.rel_extent, visit_kv_stride[visit]);
+            if (visit == 0) {
+                dbg_buf("v0_q", b_q, 3072); dbg_buf("v0_k", b_k, 1024); dbg_buf("v0_v", b_v, 1024);
+                dbg_buf("v0_sinks", b_sinks, 24); dbg_buf("v0_attn", b_attn_out, 3072);
+            }
 
             // Output projection + attn_sconv
             dispatch_linear(man.get(p + ".attn.wo_ud.weight"), b_attn_out, b_wo_raw, M);
             k_sconv4_multi_sg16(b_wo_raw, sc_layer + InkSyModel::kSconvAttnOff, nullptr, sc_hist_attn[visit],
                                 b_active_slots, b_slot_tok_off, b_slot_tok_cnt, b_slot_tok_idx,
                                 b_wo, n_active_slots, D, 0, sc_ring_attn[visit], save_ring);
+            if (visit == 0) { dbg_buf("v0_wo_raw", b_wo_raw, D); dbg_buf("v0_wo", b_wo, D); }
 
             // Attention-Residual block boundary rule (matches inkling2_loop.py:418!)
             if (ip % c.block_size == 0) {
@@ -538,23 +568,69 @@ struct InkSyRunner {
             dispatch_linear(man.get(p + ".mlp.gate.weight"), b_mlp_in, b_r_logits, M);
             k_router_topk8_sg16(b_r_logits, tf32(p + ".mlp.gate.bias"), b_topk_idx, b_topk_w, c.route_scale, M);
 
-            const int P = M * 8;
-            const int max_uniq = std::min(128, P);
-            k_moe_plan_sg16(b_topk_idx, P, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq);
-            const InkSyExpertDev* ex_layer = mod->expert_dev + (size_t)ip * c.n_experts;
-            k_moe_gu_situ_sg16(ex_layer, b_mlp_in, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, max_uniq, b_moe_h);
-            k_moe_dn_sg16(ex_layer, b_topk_w, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, max_uniq, b_moe_h, b_moe_yp);
-            k_moe_reduce8_sg16(b_moe_yp, b_moe_raw, M);
+            if (hybrid.active) {
+                hybrid.run_moe_hybrid(ip, visit_pass, M,
+                                      b_mlp_in, b_topk_idx, b_topk_w,
+                                      b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq,
+                                      b_moe_h, b_moe_yp, b_moe_raw);
+            } else if (xmx_enabled() && M >= 32) {
+                const int P = M * 8;
+                std::vector<int32_t> h_topk((size_t)P);
+                d2h(h_topk.data(), b_topk_idx, (size_t)P * sizeof(int32_t));
+                wait();
+                std::vector<std::vector<int>> by_exp((size_t)c.n_experts);
+                for (int pid = 0; pid < P; ++pid) { const int e = h_topk[pid]; if (e >= 0 && e < c.n_experts) by_exp[e].push_back(pid); }
+                std::vector<int> all_pairs, sm_uexp, sm_uoff, sm_ucnt;
+                struct XmxItem { int e, off, cnt; };
+                std::vector<XmxItem> xmx_items;
+                const int xmx_min = xmx_moe_min_n();
+                for (int e = 0; e < c.n_experts; ++e) {
+                    const int cnt = (int)by_exp[e].size();
+                    if (cnt == 0) continue;
+                    const int off = (int)all_pairs.size();
+                    for (int pid : by_exp[e]) all_pairs.push_back(pid);
+                    if (cnt >= xmx_min) xmx_items.push_back({e, off, cnt});
+                    else { sm_uexp.push_back(e); sm_uoff.push_back(off); sm_ucnt.push_back(cnt); }
+                }
+                h2d(b_moe_pairs, all_pairs.data(), all_pairs.size() * sizeof(int));
+                const InkSyExpertDev* ex_layer = mod->expert_dev + (size_t)ip * c.n_experts;
+                for (const auto& it : xmx_items) {
+                    ink_xmx_moe_single(ex_layer + it.e, b_mlp_in, b_topk_w, b_moe_pairs, it.off, it.cnt, b_moe_yp);
+                }
+                if (!sm_uexp.empty()) {
+                    const int n_su = (int)sm_uexp.size();
+                    h2d(b_moe_uexp, sm_uexp.data(), (size_t)n_su * sizeof(int));
+                    h2d(b_moe_uoff, sm_uoff.data(), (size_t)n_su * sizeof(int));
+                    h2d(b_moe_ucnt, sm_ucnt.data(), (size_t)n_su * sizeof(int));
+                    h2d(b_moe_n_uniq, &n_su, sizeof(int));
+                    k_moe_gu_situ_sg16(ex_layer, b_mlp_in, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, n_su, b_moe_h);
+                    k_moe_dn_sg16(ex_layer, b_topk_w, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, n_su, b_moe_h, b_moe_yp);
+                }
+                k_moe_reduce8_sg16(b_moe_yp, b_moe_raw, M);
+            } else {
+                const int P = M * 8;
+                const int max_uniq = std::min(128, P);
+                k_moe_plan_sg16(b_topk_idx, P, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq);
+                const InkSyExpertDev* ex_layer = mod->expert_dev + (size_t)ip * c.n_experts;
+                k_moe_gu_situ_sg16(ex_layer, b_mlp_in, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, max_uniq, b_moe_h);
+                k_moe_dn_sg16(ex_layer, b_topk_w, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, max_uniq, b_moe_h, b_moe_yp);
+                k_moe_reduce8_sg16(b_moe_yp, b_moe_raw, M);
+            }
 
             k_sconv4_multi_sg16(b_moe_raw, sc_layer + InkSyModel::kSconvMlpOff, nullptr, sc_hist_mlp[visit],
                                 b_active_slots, b_slot_tok_off, b_slot_tok_cnt, b_slot_tok_idx,
                                 b_moe_out, n_active_slots, D, 0, sc_ring_mlp[visit], save_ring);
             k_add_sg16(b_res, b_moe_out, b_cur, M_stride);
+            if (dbg) {
+                char tb[64];
+                std::snprintf(tb, sizeof(tb), "v%d_ip%d_moeh", visit, ip); dbg_buf(tb, b_moe_h, 8 * 1152);
+                std::snprintf(tb, sizeof(tb), "v%d_ip%d_cur", visit, ip); dbg_buf(tb, b_cur, D);
+            }
         };
 
         // 2. Prelude (0..5)
         int visit = 0;
-        for (int ip = 0; ip < c.core_start; ++ip) run_visit(ip, visit++, false);
+        for (int ip = 0; ip < c.core_start; ++ip) run_visit(ip, visit++, 0, false);
 
         // 3. Looped Core (6..17 x 3 passes)
         d2d(b_prelude, b_cur, (size_t)M_stride * 4);
@@ -577,12 +653,12 @@ struct InkSyRunner {
                                         mod->msg_queries_dev + (size_t)(ip - c.core_start) * 4 * D,
                                         b_msgs, bank_n, block_stride, M, 4);
                 }
-                run_visit(ip, visit++, p_idx > 0);
+                run_visit(ip, visit++, p_idx, p_idx > 0);
             }
         }
 
         // 4. Coda (18..23)
-        for (int ip = c.core_end; ip < c.n_phys; ++ip) run_visit(ip, visit++, false);
+        for (int ip = c.core_end; ip < c.n_phys; ++ip) run_visit(ip, visit++, 0, false);
 
         // 5. Final Output Attention-Residual + model.llm.norm
         k_attn_res_mix_sg16(b_blocks, b_cur, tf32("model.llm.attn_res.output_query"), b_h_out, n_blocks, block_stride, M, 1);
@@ -608,19 +684,43 @@ struct InkSyRunner {
             }
         }
 
-        // 7. Unembed + softcap(30.0) + argmax
+        // 7. Unembed + softcap(30.0) + argmax (supports arbitrary want_idx_host rows & >64 rows via chunking!)
         if (logits_mode > 0) {
-            const int out_rows = (logits_mode == 1) ? 1 : std::min(M, 64);
-            const float* x_un = (logits_mode == 1) ? (b_h_norm + (size_t)(M - 1) * D) : b_h_norm;
             const int V_un = c.vocab_unpadded;
-            dispatch_linear(man.get("model.llm.unembed.weight"), x_un, b_logits, out_rows, V_un);
-            k_softcap_sg16(b_logits, out_rows * V_un, c.logit_softcap);
-            if (out_argmax_host) {
-                k_argmax_rows_sg16(b_logits, b_argmax, V_un, out_rows);
-                d2h(out_argmax_host, b_argmax, (size_t)out_rows * 4);
-            }
-            if (out_logits_host) {
-                d2h(out_logits_host, b_logits, (size_t)out_rows * V_un * 4);
+            if (logits_mode == 1) {
+                const float* x_un = b_h_norm + (size_t)(M - 1) * D;
+                dispatch_linear(man.get("model.llm.unembed.weight"), x_un, b_logits, 1, V_un);
+                k_softcap_sg16(b_logits, V_un, c.logit_softcap);
+                if (out_argmax_host) {
+                    k_argmax_rows_sg16(b_logits, b_argmax, V_un, 1);
+                    d2h(out_argmax_host, b_argmax, 4);
+                }
+                if (out_logits_host) {
+                    d2h(out_logits_host, b_logits, (size_t)V_un * 4);
+                }
+            } else {
+                const int total_out = (want_idx_host && n_want > 0) ? n_want : M;
+                const int logit_cap = std::min(max_batch, 64);
+                for (int r0 = 0; r0 < total_out; r0 += logit_cap) {
+                    const int rc = std::min(logit_cap, total_out - r0);
+                    const float* x_src = b_h_norm + (size_t)r0 * D;
+                    if (want_idx_host && n_want > 0) {
+                        for (int j = 0; j < rc; ++j) {
+                            d2d(b_h_out + (size_t)j * D, b_h_norm + (size_t)want_idx_host[r0 + j] * D, (size_t)D * 4);
+                        }
+                        x_src = b_h_out;
+                    }
+                    dispatch_linear(man.get("model.llm.unembed.weight"), x_src, b_logits, rc, V_un);
+                    k_softcap_sg16(b_logits, rc * V_un, c.logit_softcap);
+                    if (out_argmax_host) {
+                        k_argmax_rows_sg16(b_logits, b_argmax, V_un, rc);
+                        d2h(out_argmax_host + r0, b_argmax, (size_t)rc * 4);
+                    }
+                    if (out_logits_host) {
+                        d2h(out_logits_host + (size_t)r0 * V_un, b_logits, (size_t)rc * V_un * 4);
+                    }
+                    wait();
+                }
             }
         }
 

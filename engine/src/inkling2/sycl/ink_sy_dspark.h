@@ -199,15 +199,17 @@ inline void k_dspark_markov_joint_sg16(const float* state_buf, const InkTensorIn
                                        const float* cur_all, const float* ctx_vec,
                                        const int* tok_chain, float* joint_out, int slot_i, int V_padded) {
     const uint8_t* w1 = mw1.dev_ptr;
-    const bool is_bf16 = (mw1.fmt == FMT_BF16);
+    const int fmt = mw1.fmt;
     Q().parallel_for(NR((512 + 2 * INK_D + 255) / 256, 256), [=](sycl::nd_item<1> it) INK_REQD_SG16 {
         const int g = (int)it.get_global_id(0);
         if (g < 256) {
             joint_out[g] = state_buf[g];
         } else if (g < 512) {
             const int prev_tok = tok_chain[slot_i - 1];
-            if (is_bf16) {
+            if (fmt == FMT_BF16) {
                 joint_out[g] = bf16_to_f32(reinterpret_cast<const uint16_t*>(w1)[(size_t)prev_tok * 256 + (g - 256)]);
+            } else if (fmt == FMT_F32) {
+                joint_out[g] = reinterpret_cast<const float*>(w1)[(size_t)prev_tok * 256 + (g - 256)];
             } else {
                 const float sc = reinterpret_cast<const float*>(w1)[prev_tok];
                 const int8_t* row = reinterpret_cast<const int8_t*>(w1 + (size_t)V_padded * 4) + (size_t)prev_tok * 256;

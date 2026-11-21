@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "ink_sy_codecs.h"
+#include "ink_sy_xmx.h"
 #include "ink_sy_common.h"
 
 #ifdef INK_DEFINE_STBI
@@ -142,6 +143,7 @@ struct InkSyVision {
         });
 
         auto mm = [&](const std::string& wn, const float* X, float* Y, int N, int K, int M) {
+            if (ink_xmx_linear_bf16(tw(wn), N, K, X, Y, M)) return;
             if (M >= 16) k_gemm_bf16_sg16(tw(wn), N, K, X, Y, M);
             else k_linear_bf16_sg16(tw(wn), N, K, X, Y, M);
         };
