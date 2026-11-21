@@ -1418,7 +1418,16 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     // the prompt attention (prompt_attn: K and V read once a block of queries), else the decode's
                     // kernel: every query reads the cells up to its own; the grid as wide as the chunk's last context (not
                     // the cache's capacity: no graph holds it), as many queries a launch as the scratch takes
-                    if (sparse_qsa_ && (size_t) a < qsa_weights_.size() && qsa_weights_[(size_t) a].q.data) {
+                    // a chunk whose last row is within the indexer's budget selects every cell: its keys for the later
+                    // chunks, the attention as the dense one's
+                    const bool qsa = sparse_qsa_ && (size_t) a < qsa_weights_.size() && qsa_weights_[(size_t) a].q.data;
+                    if (qsa && pa + T <= qs.idx_top_k) {
+                        const QsaWeights& w = qsa_weights_[(size_t) a];
+                        k::f32_gemm_rows(P.hn, N, static_cast<const float*>(w.k.data), P.qsa_raw, 128, N, 128, T, cs);
+                        k::native_qsa_indexer_append_batch(P.qsa_raw, T, pa, 0, w.k_norm, eps, qsa_index_[(size_t) a], qs,
+                                                           opt_.max_cells, rope_of(b), cs, w.block_norm, true);
+                    }
+                    if (qsa && pa + T > qs.idx_top_k) {
                         const QsaWeights& w = qsa_weights_[(size_t) a];
                         const auto& ib = qsa_index_[(size_t) a];
                         k::f32_gemm_rows(P.hn, N, static_cast<const float*>(w.q.data), P.qsa_query, 512, N, 512, T, cs);

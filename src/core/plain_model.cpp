@@ -153,9 +153,11 @@ PlainModel::~PlainModel() {
     strata::gpu::free(prompt_host_);
     if (opt_.encoder)   // an encoder's prompt buffers are its own (encoder_buffers)
         for (uint8_t* p : prompt_dev_.at) strata::gpu::free(p);
-    for (auto* g : exec_) strata::gpu::graph_destroy(g);
-    for (auto& v : segs_)
-        for (auto* g : v) strata::gpu::graph_destroy(g);
+    for (auto* m : {&exec_, &sexec_})
+        for (auto* g : *m) strata::gpu::graph_destroy(g);
+    for (auto* m : {&segs_, &ssegs_})
+        for (auto& v : *m)
+            for (auto* g : v) strata::gpu::graph_destroy(g);
     for (auto* g : mexec_) strata::gpu::graph_destroy(g);
     for (auto* m : {&rexec_, &mrexec_})
         for (auto* g : *m) strata::gpu::graph_destroy(g);
@@ -1747,6 +1749,8 @@ bool PlainModel::load_qwen(std::string& err) {
     if (!(dense_ ? open_dense(err) : open_experts(err))) return false;
     exec_.assign((size_t) opt_.max_t + 1, nullptr);
     segs_.assign((size_t) opt_.max_t + 1, {});
+    sexec_.assign((size_t) opt_.max_t + 1, nullptr);
+    ssegs_.assign((size_t) opt_.max_t + 1, {});
     mexec_.assign((size_t) opt_.max_t + 1, nullptr);
     msegs_.assign((size_t) opt_.max_t + 1, {});
     rexec_.assign((size_t) opt_.max_t + 1, nullptr);
@@ -4131,7 +4135,22 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         for (int t = 0; t < T; ++t)
             kv_append_cells((size_t) a, rows ? row_slot_[(size_t) t] : -1, step_ + (size_t) t * k::kStepCount, 1,
                             kcur_ + (size_t) t * NKV * HD, vc + (size_t) t * NKV * HD, cs);
-        if (sparse_qsa_ && (size_t) a < qsa_weights_.size() && qsa_weights_[(size_t) a].q.data) {
+        if (sparse_qsa_ && qsa_short_ && (size_t) a < qsa_weights_.size() && qsa_weights_[(size_t) a].q.data) {
+            // every cell selected: the keys for the later windows, the attention as the dense one's
+            const QsaWeights& w = qsa_weights_[(size_t) a];
+            const auto& ib = qsa_index_[(size_t) a];
+            proj(w.k, hn_, qsa_raw_, T, false);
+            for (int t = 0; t < T; ++t) {
+                k::native_qsa_indexer_append(qsa_raw_ + (size_t) t * 128, step_ + (size_t) t * k::kStepCount,
+                                             0, w.k_norm, eps, ib, qs, opt_.max_cells, rs, cs, w.block_norm, true);
+                if (t < T - 1 && t < (int) qsa_tail_snap_[(size_t) a].size() &&
+                    !strata::gpu::copy_async(qsa_tail_snap_[(size_t) a][(size_t) t], ib.tail, size_t(3) * 128 * 4, cs)) {
+                    err = "plain model: copying the QSA tail"; return false;
+                }
+            }
+            k::qsa_dense_attn_batch(qcur_, kv_pools((size_t) a), step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs,
+                                    window_of(b));
+        } else if (sparse_qsa_ && (size_t) a < qsa_weights_.size() && qsa_weights_[(size_t) a].q.data) {
             const QsaWeights& w = qsa_weights_[(size_t) a];
             const auto& ib = qsa_index_[(size_t) a];
             proj(w.q, hn_, qsa_query_, T, false);
@@ -4362,12 +4381,14 @@ void PlainModel::taps_off() {
 
 void PlainModel::drop_window_graphs() {
     if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
-    for (auto& g : exec_)
-        if (g) { strata::gpu::graph_destroy(g); g = nullptr; }
-    for (auto& v : segs_) {
-        for (auto* g : v) strata::gpu::graph_destroy(g);
-        v.clear();
-    }
+    for (auto* m : {&exec_, &sexec_})
+        for (auto& g : *m)
+            if (g) { strata::gpu::graph_destroy(g); g = nullptr; }
+    for (auto* m : {&segs_, &ssegs_})
+        for (auto& v : *m) {
+            for (auto* g : v) strata::gpu::graph_destroy(g);
+            v.clear();
+        }
     for (auto& g : rexec_)
         if (g) { strata::gpu::graph_destroy(g); g = nullptr; }
 }
@@ -4690,7 +4711,8 @@ void PlainModel::setup_int2() {
 // The graph of a window of T rows, the trunk's or (`mtp`) the MTP layer's, recorded once.
 bool PlainModel::record(int T, bool mtp, std::string& err) {
     if (step_form_.form() == 1) return true;   // run by run_window each time
-    return capture(T, mtp, (mtp ? mexec_ : exec_)[(size_t) T], (mtp ? msegs_ : segs_)[(size_t) T], err);
+    return capture(T, mtp, (mtp ? mexec_ : qsa_short_ ? sexec_ : exec_)[(size_t) T],
+                   (mtp ? msegs_ : qsa_short_ ? ssegs_ : segs_)[(size_t) T], err);
 }
 
 bool PlainModel::capture(int T, bool mtp, strata::gpu::Graph*& exec, std::vector<strata::gpu::Graph*>& segs,
@@ -4952,12 +4974,17 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
     const bool timing = step_form_.form() == -1 && T == 1;
     const bool eager = step_form_.form() == 1 || (timing && step_form_.straight());
     const bool res = !eager && res_window(moe_trunk_, moe_local_.data(), err);
-    if (!err.empty() || (!res && !record(T, false, err))) return false;
+    // the last row within the budget: every row's selection is all its cells (qsa_block_topk_with_current)
+    qsa_short_ = sparse_qsa_ && !res && pos + T <= attn_shapes().idx_top_k;
+    auto& ex = qsa_short_ ? sexec_ : exec_;
+    auto& sg = qsa_short_ ? ssegs_ : segs_;
+    if (!err.empty() || (!res && !record(T, false, err))) { qsa_short_ = false; return false; }
     const auto t0 = std::chrono::steady_clock::now();
-    if (!(eager ? run_window(T, false, err)
-                : res ? launch_res(T, false, rexec_[(size_t) T], moe_trunk_, moe_local_.data(), err)
-                      : launch_serve(exec_[(size_t) T], segs_[(size_t) T], moe_trunk_, moe_local_.data(), T, err)))
-        return false;
+    const bool ok = eager ? run_window(T, false, err)
+                    : res ? launch_res(T, false, rexec_[(size_t) T], moe_trunk_, moe_local_.data(), err)
+                          : launch_serve(ex[(size_t) T], sg[(size_t) T], moe_trunk_, moe_local_.data(), T, err);
+    qsa_short_ = false;   // (the batch windows and the MTP layer record the full form)
+    if (!ok) return false;
     if (cpu_tail_ != nullptr && !tail_and_head(T, pos, err)) return false;
     if (last()) pick(logits_, T, pos, m_out_, cs_);
     if (!strata::gpu::stream_sync(cs_)) {

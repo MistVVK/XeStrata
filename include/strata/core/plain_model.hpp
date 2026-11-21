@@ -731,6 +731,9 @@ private:
         const float *q_norm = nullptr, *k_norm = nullptr, *block_norm = nullptr;
     };
     bool sparse_qsa_ = false;
+    /// This window's rows all within the indexer's budget, where the selection is every cell: the QSA layers append
+    /// their indexer keys and attend densely, without the query, the scores and the top-k (stage_forward; sexec_)
+    bool qsa_short_ = false;
     std::vector<QsaWeights> qsa_weights_;
     std::vector<strata::kernels::QsaIndexerBuffers> qsa_index_;
     std::vector<std::vector<float*>> qsa_tail_snap_;
@@ -1365,6 +1368,8 @@ private:
     std::vector<PendingSwap> pending_;
     std::vector<strata::gpu::Graph*> exec_;                      ///< per T: the whole window
     std::vector<std::vector<strata::gpu::Graph*>> segs_;         ///< per T: the segments (MoeWindow::segmented)
+    std::vector<strata::gpu::Graph*> sexec_;                     ///< per T: the whole window, qsa_short_'s form
+    std::vector<std::vector<strata::gpu::Graph*>> ssegs_;        ///< per T: its segments
     std::vector<strata::gpu::Graph*> mexec_;                     ///< per T: the MTP layer
     std::vector<strata::gpu::Graph*> rexec_, mrexec_;            ///< per T: the two with every routed expert in VRAM
     bool res_rec_ = false;                                       ///< recording rexec_ / mrexec_
