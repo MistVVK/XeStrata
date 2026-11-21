@@ -754,6 +754,49 @@ public:
                 p2p_ok_ = ((e1 == cudaSuccess || e1 == cudaErrorPeerAccessAlreadyEnabled) &&
                            (e2 == cudaSuccess || e2 == cudaErrorPeerAccessAlreadyEnabled));
             }
+            // Hardware 16-byte roundtrip P2P probe: some AMD Threadripper/EPYC/Xeon
+            // PCIe root complexes with IOMMU/ACS report CanAccessPeer=1 and EnablePeerAccess=ok
+            // yet silently transfer all zeroes on BAR-to-BAR cudaMemcpyPeer.
+            if (p2p_ok_) {
+                uint32_t h_tx[4] = {0x12345678u, 0xCAFEBABEu, 0xA5A55A5Au, 0xDEADBEEFu};
+                uint32_t h_rx01[4] = {0, 0, 0, 0};
+                uint32_t h_rx10[4] = {0, 0, 0, 0};
+                uint32_t *d_p0 = nullptr, *d_p1 = nullptr;
+                cudaSetDevice(gpu_ids_[0]);
+                cudaError_t pa0 = cudaMalloc(&d_p0, sizeof(h_tx));
+                cudaSetDevice(gpu_ids_[1]);
+                cudaError_t pa1 = cudaMalloc(&d_p1, sizeof(h_tx));
+                bool hw_ok = false;
+                if (pa0 == cudaSuccess && pa1 == cudaSuccess) {
+                    cudaSetDevice(gpu_ids_[0]);
+                    cudaMemcpy(d_p0, h_tx, sizeof(h_tx), cudaMemcpyHostToDevice);
+                    cudaSetDevice(gpu_ids_[1]);
+                    cudaMemset(d_p1, 0, sizeof(h_tx));
+                    cudaError_t ep01 = cudaMemcpyPeer(d_p1, gpu_ids_[1], d_p0, gpu_ids_[0], sizeof(h_tx));
+                    cudaMemcpy(h_rx01, d_p1, sizeof(h_tx), cudaMemcpyDeviceToHost);
+                    cudaSetDevice(gpu_ids_[0]);
+                    cudaMemset(d_p0, 0, sizeof(h_tx));
+                    cudaError_t ep10 = cudaMemcpyPeer(d_p0, gpu_ids_[0], d_p1, gpu_ids_[1], sizeof(h_tx));
+                    cudaMemcpy(h_rx10, d_p0, sizeof(h_tx), cudaMemcpyDeviceToHost);
+                    hw_ok = (ep01 == cudaSuccess && ep10 == cudaSuccess &&
+                             std::memcmp(h_tx, h_rx01, sizeof(h_tx)) == 0 &&
+                             std::memcmp(h_tx, h_rx10, sizeof(h_tx)) == 0);
+                }
+                if (d_p0) { cudaSetDevice(gpu_ids_[0]); cudaFree(d_p0); }
+                if (d_p1) { cudaSetDevice(gpu_ids_[1]); cudaFree(d_p1); }
+                if (!hw_ok) {
+                    std::fprintf(stderr,
+                                 "[inkling2-ep] Hardware P2P roundtrip probe FAILED "
+                                 "(rx01=0x%08x rx10=0x%08x, expected 0x%08x); "
+                                 "disabling peer access and using pinned-host async DMA fallback\n",
+                                 h_rx01[0], h_rx10[0], h_tx[0]);
+                    cudaSetDevice(gpu_ids_[0]);
+                    if (cudaDeviceDisablePeerAccess(gpu_ids_[1]) != cudaSuccess) cudaGetLastError();
+                    cudaSetDevice(gpu_ids_[1]);
+                    if (cudaDeviceDisablePeerAccess(gpu_ids_[0]) != cudaSuccess) cudaGetLastError();
+                    p2p_ok_ = false;
+                }
+            }
         }
         EP_CK(cudaSetDevice(gpu_ids_[0]));
 
