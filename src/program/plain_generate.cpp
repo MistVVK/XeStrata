@@ -3016,6 +3016,9 @@ int plain_main(int argc, char** argv) {
     }
     // the CPU: asked for, or a dense model (Qwen3.5, PLaMo 3) on a PC whose SYCL runtime lists no GPU it can use
     const bool dense_arch = arch == "qwen35" || arch == "plamo3";
+    // inkling2_loop's CPU reference (plain_inkling.cpp) is not dense, but it is the only path for this arch in this
+    // stage; --device cpu must reach it rather than the dense-only guard below.
+    const bool cpu_arch = dense_arch || arch == "inkling2_loop";
     if (!opt.cpu && !device_given && dense_arch) {
         int gpus = 0;
         try {
@@ -3029,8 +3032,9 @@ int plain_main(int argc, char** argv) {
         }
     }
     if (opt.cpu) {
-        if (!dense_arch) {
-            std::fprintf(stderr, "xestrata (%s): --device cpu runs the dense models (qwen35, plamo3) only\n", arch.c_str());
+        if (!cpu_arch) {
+            std::fprintf(stderr, "xestrata (%s): --device cpu runs the dense models (qwen35, plamo3) and "
+                                 "inkling2_loop only\n", arch.c_str());
             return 2;
         }
         if (opt.vision) {

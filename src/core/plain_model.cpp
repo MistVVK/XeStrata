@@ -26,6 +26,7 @@
 #include "strata/core/constraint_upload.hpp"
 
 #include "strata/core/plain_cpu.hpp"
+#include "strata/core/plain_inkling.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/device.hpp"
@@ -615,6 +616,11 @@ bool PlainModel::load_stage(const PlainOptions& opt, PlainModel* root, int64_t l
 }
 
 bool PlainModel::load_arch(std::string& err) {
+    if (spec_.arch == ModelArch::Inkling2Loop) {
+        err = "plain model: inkling2_loop runs on the CPU reference in this stage (--device cpu); the GPU graph is "
+              "not implemented yet";
+        return false;
+    }
     return spec_.arch == ModelArch::Glm5Next ? load_glm5(err) : load_qwen(err);
 }
 
@@ -3229,6 +3235,13 @@ bool PlainModel::cpu_load(std::string& err) {
         return false;
     }
     opt_.spec = 0;   // no MTP layer read: no drafts
+    if (spec_.arch == ModelArch::Inkling2Loop) {
+        inkling_ = std::make_unique<PlainInkling>();
+        if (!inkling_->load(*model_, spec_, err)) { inkling_.reset(); return false; }
+        n_vocab_ = inkling_->vocab();
+        std::fprintf(stderr, "xestrata plain: %s\n", inkling_->describe().c_str());
+        return true;
+    }
     cpu_ = std::make_unique<PlainCpu>();
     if (!cpu_->load(*model_, spec_, opt_, err)) {
         cpu_.reset();
@@ -3243,6 +3256,14 @@ bool PlainModel::cpu_load(std::string& err) {
 bool PlainModel::cpu_run(const int32_t* tokens, int64_t n, int64_t pos, int rows, int32_t* out, float* logits,
                          std::string& err) {
     cpu_logits_.resize((size_t) rows * (size_t) n_vocab_);
+    if (inkling_ != nullptr) {
+        // the reference returns the last token's logits; a window's rows are answered one at a time
+        std::vector<float> one((size_t) n_vocab_);
+        if (!inkling_->run(tokens, n, pos, one.data(), err)) return false;
+        for (int r = 0; r < rows; ++r)
+            std::memcpy(cpu_logits_.data() + (size_t) r * n_vocab_, one.data(), (size_t) n_vocab_ * 4);
+        return true;
+    }
     if (!cpu_->run(tokens, n, pos, rows, cpu_logits_.data(), err)) return false;
     k::SamplerParams sp = sampler_;
     sp.counter = (uint64_t) (pos + n - rows);
@@ -3260,7 +3281,7 @@ bool PlainModel::cpu_run(const int32_t* tokens, int64_t n, int64_t pos, int rows
 }
 
 bool PlainModel::set_logit_bias(const std::vector<float>& bias, std::string& err) {
-    if (cpu_ != nullptr) {
+    if (cpu_ != nullptr || inkling_ != nullptr) {
         if (!bias.empty() && bias.size() != (size_t) n_vocab_) {
             err = "plain model: a logit bias of another vocabulary";
             return false;
@@ -3284,7 +3305,7 @@ bool PlainModel::set_logit_bias(const std::vector<float>& bias, std::string& err
 }
 
 bool PlainModel::set_allowed(const uint32_t* row, std::string& err) {
-    if (cpu_ != nullptr) {   // the same row for each of a window's rows
+    if (cpu_ != nullptr || inkling_ != nullptr) {   // the same row for each of a window's rows
         const size_t words = (size_t) (n_vocab_ + 31) / 32;
         cpu_allowed_.clear();
         if (row != nullptr)
@@ -3337,7 +3358,7 @@ bool PlainModel::set_allowed_rows(const uint32_t* rows, int T, std::string& err)
 }
 
 bool PlainModel::set_history(const int32_t* tokens, int n, std::string& err) {
-    if (cpu_ != nullptr) {   // the same history for each of a window's rows
+    if (cpu_ != nullptr || inkling_ != nullptr) {   // the same history for each of a window's rows
         cpu_hist_len_ = std::max(0, n);
         cpu_hist_.clear();
         for (int r = 0; r < opt_.max_t && cpu_hist_len_ > 0; ++r) cpu_hist_.insert(cpu_hist_.end(), tokens, tokens + n);
@@ -3492,6 +3513,7 @@ size_t PlainModel::Snapshot::bytes() const {
 
 size_t PlainModel::state_bytes(int64_t tokens) const {
     if (cpu_ != nullptr) return cpu_->state_bytes(tokens, true);
+    if (inkling_ != nullptr) return 0;
     size_t n = 0;
     for (const StatePart& p : state_parts(tokens)) n += p.bytes;
     for (const auto& st : next_) n += st->state_bytes(tokens);

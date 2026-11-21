@@ -67,6 +67,7 @@ namespace strata::core {
 
 class RemoteExperts;
 class PlainCpu;
+class PlainInkling;
 
 struct PlainOptions {
     std::string gguf;               ///< any shard of the model
@@ -1089,6 +1090,8 @@ private:
     std::unique_ptr<GgufModel> model_;
     // --device cpu: the forward, and the picks' constraints on the host (set_logit_bias, set_allowed, set_history)
     std::unique_ptr<PlainCpu> cpu_;
+    /// inkling2_loop's CPU reference forward (--device cpu); the GPU path is not implemented in this stage.
+    std::unique_ptr<PlainInkling> inkling_;
     /// --gpu-layers not given, a dense model on one GPU: the blocks its free VRAM holds after the head, their K/V and a
     /// reserve (opt_.gpu_layers set: all of them, N, or 0 for the CPU alone)
     bool auto_gpu_layers(std::string& err);
