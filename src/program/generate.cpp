@@ -319,7 +319,10 @@ struct Options {
     bool resident_pin = false;
     std::string shared_expert_arena;
     bool coupled_draft = strata::core::coupled_draft_env();
-    /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
+    /// R4: slots of VRAM-resident experts.  **-1 = auto, 0 = an explicit off.**  Auto sizes the tier from what
+    /// the device reports after the weights, session and K/V, and the adaptive tier fills it from the routing
+    /// the run sees; a profile is an optional head start, not a precondition (core/expert_tier.hpp).  The same
+    /// option means the same thing in the plain engine (plain_generate.cpp).  Only an explicit 0 turns it off.
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
     /// saves nothing".  The kernel exists (`Strata's src/kernels/cuda/s2_expert_grouped.cu`), it is wired at line ~660
@@ -327,7 +330,7 @@ struct Options {
     /// **19.076 -> 10.312 ms/token** at 4096 per-layer slots, for **-2.7 ms/token** end to end.  What was
     /// true is that the ADMISSION POLICY gave every slot to the first position, which is why the earlier
     /// measurement found nothing - see `expert_cache_per_layer`.
-    int expert_cache = 0;
+    int expert_cache = -1;
     std::array<int, 3> expert_cache_remote{}; ///< CUDA1..3 slots; CUDA0 keeps dense/state/MTP
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
     bool expert_cache_cpu_order = false;
@@ -795,8 +798,10 @@ void usage() {
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
-                 "  --expert-cache N     R4: keep N expert blobs resident in VRAM and compute their rows on the\n"
-                 "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  Measured at 4096 slots\n"
+                 "  --expert-cache N|auto  keep N expert blobs resident in VRAM and compute their rows on the\n"
+                 "                       GPU via `moe_hit_grouped_s2`.  DEFAULT auto: size the tier from the\n"
+                 "                       device's free VRAM, fill it from this run's routing.  0 turns it off.\n"
+                 "                       Measured at 4096 slots\n"
                  "                       with --expert-cache-per-layer: 54.4%% hits, CPU pool drain 19.1 -> 10.3\n"
                  "                       ms/token, -2.7 ms/token end to end.\n"
                  "  --vram-free-mib N    size the auto expert cache as if at most N MiB of VRAM were free at the\n"
@@ -5452,10 +5457,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
             return 1;
         }
-        // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the
-        // file).  `--expert-cache 0` used to take the count the profile was built for; the profile now ranks
-        // every pair (issue #46: a card that holds more than the old 8,000 used to stop there), so it means auto.
-        if (o.expert_cache == 0) o.expert_cache = -1;
+        // A profile ranks every pair, so it no longer carries a slot count to use when --expert-cache is 0.
+        // 0 is an explicit off (the same in the plain engine); auto is -1, and is what the default asks for.
         std::fprintf(stderr, "xestrata generate: profile %s: %zu ranked pairs, built for %lld slots\n",
                      o.expert_profile.c_str(), profile.size(), (long long) pslots);
     }

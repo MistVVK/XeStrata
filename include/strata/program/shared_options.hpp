@@ -24,6 +24,13 @@
 
 namespace strata::program {
 
+/// --expert-cache means the same thing in both engines: `auto` asks for a capacity-led tier (-1), an explicit
+/// 0 is off (a profile must not turn it back on), and a positive number caps the slots.  The engines' defaults
+/// are auto; the tier is filled from this run's routing unless a profile is given as a head start.
+inline int64_t expert_cache_request(const std::string& value) {
+    return value == "auto" || value.empty() ? -1 : (int64_t) std::strtoll(value.c_str(), nullptr, 10);
+}
+
 struct SharedOptionFields {
     const char* who = "xestrata";   ///< the engine's name in its messages
     // the adaptive tier
@@ -304,7 +311,7 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
     }
     if (a == "--expert-cache" && f.expert_cache) {
         const std::string v = next(a.c_str());
-        *f.expert_cache = (v == "auto") ? -1 : (int) std::strtol(v.c_str(), nullptr, 10);
+        *f.expert_cache = (int) expert_cache_request(v);
         return 1;
     }
     if (a == "--gpu" && f.gpu_consume) { (void) next(a.c_str()); return 1; }   // applied at startup, before the runtime
