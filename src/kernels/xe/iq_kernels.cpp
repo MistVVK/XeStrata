@@ -2215,12 +2215,9 @@ struct IqGemmKernel {
                 const uint8_t* code = blob + (m == 1 ? up : m == 2 ? dn : 0) + (size_t) r * (bt.down ? drow : grow) +
                                       (size_t) b * 4 * (size_t) k;
                 for (int s = 0; s < 4; ++s) {
-                    const xe::Bih3Planes pl = xe::bih3_planes_w(code, k, 4 * part + s);
-                    for (int c = 0; c < 4; ++c) {
-                        int num = 0;
-                        for (int p = 0; p < 3; ++p) num += (int) (int8_t) (pl.v[p] >> (8 * c));
-                        v[q][4 * s + c] = sycl::half((float) num * scale);
-                    }
+                    int num[4];
+                    xe::bih3_state_values(xe::bih3_state_w(code, k, 4 * part + s), num);
+                    for (int c = 0; c < 4; ++c) v[q][4 * s + c] = sycl::half((float) num[c] * scale);
                 }
             }
             for (int j = 0; j < 16; ++j)
@@ -3286,13 +3283,10 @@ void bih3_r1q2_dequant_f16(const Bih3R1q2Layer& L, const uint8_t* blob, int gate
                                 half_at(bases + (size_t) r * 2);
             const uint8_t* code = blob + (m == 1 ? up : m == 2 ? dn : 0) + (size_t) r * (down ? drow : grow) +
                                   (size_t) b * 4 * (size_t) k;
-            const xe::Bih3Planes pl = xe::bih3_planes_w(code, k, st % 32);
+            int num[4];
+            xe::bih3_state_values(xe::bih3_state_w(code, k, st % 32), num);
             sycl::vec<sycl::half, 4> v;
-            for (int c = 0; c < 4; ++c) {
-                int num = 0;
-                for (int p = 0; p < 3; ++p) num += (int) (int8_t) (pl.v[p] >> (8 * c));
-                v[c] = sycl::half((float) num * scale);
-            }
+            for (int c = 0; c < 4; ++c) v[c] = sycl::half((float) num[c] * scale);
             sycl::half* out = out_h + (size_t) row_all * (size_t) width + 4 * (size_t) st;
             *reinterpret_cast<sycl::vec<sycl::half, 4>*>(out) = v;
         });
