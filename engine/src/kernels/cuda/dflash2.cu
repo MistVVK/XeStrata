@@ -4,6 +4,7 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/per_device_flag.hpp"
+#include "s26_tsum.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -31,6 +32,65 @@ void check(const char* what) {
 }
 
 __device__ __forceinline__ float bf16f(uint16_t h) { return __uint_as_float((uint32_t) h << 16); }
+
+// Bit-exact Wave32 register-only butterfly reductions via s26ts::xmov (v_permlanex16_b32 + DPP row_xmask on gfx10+,
+// __shfl_xor_sync on CUDA / gfx906), eliminating ds_bpermute LDS round-trips across all DFlash2 drafter kernels.
+__device__ __forceinline__ float df2_wave_sum(float v) { return s26ts::tplain<16>(v); }
+
+__device__ __forceinline__ float df2_wave_max(float v) {
+    v = fmaxf(v, s26ts::xmov<16>(v));
+    v = fmaxf(v, s26ts::xmov<8>(v));
+    v = fmaxf(v, s26ts::xmov<4>(v));
+    v = fmaxf(v, s26ts::xmov<2>(v));
+    v = fmaxf(v, s26ts::xmov<1>(v));
+    return v;
+}
+
+template <int O>
+__device__ __forceinline__ int df2_xmov_i32(int v) {
+#if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906)
+    if constexpr (O == 16) return __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false);
+    else return __builtin_amdgcn_update_dpp(0, v, 0x160 + O, 0xf, 0xf, false);
+#else
+    return __shfl_xor_sync(0xffffffffu, v, O);
+#endif
+}
+
+template <int O>
+__device__ __forceinline__ void df2_topk_step(float& bv, int& bi) {
+    const float ov = s26ts::xmov<O>(bv);
+    const int oi = df2_xmov_i32<O>(bi);
+    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+}
+
+template <int O>
+__device__ __forceinline__ void df2_topk_step3(float& bv, int& bi, int& bp) {
+    const float ov = s26ts::xmov<O>(bv);
+    const int oi = df2_xmov_i32<O>(bi);
+    const int op = df2_xmov_i32<O>(bp);
+    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; bp = op; }
+}
+
+template <int R, typename SegT>
+__device__ __forceinline__ void df2_reduce_store_cols(float (&acc)[R][8], int lane, int ncols, const SegT& sg, int row_base) {
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        if (c >= ncols) break;
+        float vr[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) vr[r] = acc[r][c];
+        const float sum = s26ts::tsum<R>(vr, lane);
+        const int r_out = s26ts::tsum_token<R>(lane);
+        if (lane == s26ts::tsum_lane<R>(r_out)) sg.y[(size_t) c * sg.n_out + row_base + r_out] = sum;
+    }
+}
+
+#if defined(__HIP_PLATFORM_AMD__) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__))
+#define STRATA_DF2_WMMA_GFX11 1
+#else
+#define STRATA_DF2_WMMA_GFX11 0
+#endif
 
 // ---- the grouped dynamic 2-tap convolution over the block's rows
 __global__ void conv_kernel(const float* __restrict__ x, const float* __restrict__ dyn, int dyn_stride, const float* __restrict__ base,
@@ -88,7 +148,7 @@ __global__ void norm_rope_kernel(const float* __restrict__ in, int in_stride, co
     __shared__ float y[HD];
     const float x = in[(size_t) r * in_stride + h * HD + d];
     float ss = x * x;
-    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    ss = df2_wave_sum(ss);
     if ((d & 31) == 0) red[d >> 5] = ss;
     __syncthreads();
     const float tot = red[0] + red[1] + red[2] + red[3];
@@ -221,8 +281,8 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
             float v[8], tmax = -INFINITY;
 #pragma unroll
             for (int u = 0; u < 8; ++u) { v[u] = Sc[qi * 33 + sub * 8 + u]; tmax = fmaxf(tmax, v[u]); }
-            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
-            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 2));
+            tmax = fmaxf(tmax, s26ts::xmov<1>(tmax));
+            tmax = fmaxf(tmax, s26ts::xmov<2>(tmax));
             const float m_old = m_s[qi];
             const float mn = fmaxf(m_old, tmax);
             const float corr = (m_old == -INFINITY) ? 0.0f : __expf(m_old - mn);
@@ -233,8 +293,8 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
                 Ps[(sub * 8 + u) * PS + qi] = p;
                 psum += p;
             }
-            psum += __shfl_xor_sync(0xffffffffu, psum, 1);
-            psum += __shfl_xor_sync(0xffffffffu, psum, 2);
+            psum += s26ts::xmov<1>(psum);
+            psum += s26ts::xmov<2>(psum);
             if (sub == 0) { l_s[qi] = l_s[qi] * corr + psum; m_s[qi] = mn; corr_s[qi] = corr; }
         }
         __syncthreads();   // Ps, corr_s complete; every read of Ks (the S tile) done
@@ -273,6 +333,225 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
         *reinterpret_cast<float2*>(o + 6) = make_float2(O[i][6], O[i][7]);
     }
 }
+
+#if defined(__HIP_PLATFORM_AMD__)
+// Wave32 FP16 WMMA DFlash2 attention (gfx1100..gfx1151, STRATA_DFLASH_WMMA=1):
+// Stages Q[32][136] and K[32][136] / V^T[128][36] in _Float16 (~24.4 KiB LDS vs ~42 KiB FP32 -> 2x CTA occupancy).
+// All 4 Wave32s stay 100% active on S = Q * K^T (2x2 tiles of 16x16x16) and O += P * V (2x8 tiles of 16x16x16)
+// via direct __builtin_amdgcn_wmma_f32_16x16x16_f16_w32 (zero rocWMMA dependency).
+typedef _Float16 df2_h16 __attribute__((ext_vector_type(16)));
+typedef float df2_f8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ df2_f8 df2_wmma_f16(df2_h16 a, df2_h16 b, df2_f8 c) {
+#if STRATA_DF2_WMMA_GFX11
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#else
+    (void) a; (void) b;
+    __builtin_trap();
+    return c;
+#endif
+}
+__device__ __forceinline__ df2_h16 df2_ld_h16(const _Float16* p) {
+    const uint4 a = *reinterpret_cast<const uint4*>(p);
+    const uint4 b = *reinterpret_cast<const uint4*>(p + 8);
+    struct { uint4 x, y; } t{a, b};
+    return __builtin_bit_cast(df2_h16, t);
+}
+
+constexpr int AS_H = 136;   // 16-byte aligned FP16 Q/K stride (272 B)
+constexpr int VS_H = 40;    // 16-byte aligned FP16 transposed V[d][t] stride (80 B = 32 keys + 8 pad)
+constexpr int PS_H = 40;    // 16-byte aligned FP16 P[q][t] stride (80 B = 32 keys + 8 pad)
+
+__global__ void __launch_bounds__(128) attn_part_wmma_gfx11_kernel(
+    const float* __restrict__ q, const float* __restrict__ kring, const float* __restrict__ vring,
+    const float* __restrict__ kblk, const float* __restrict__ vblk,
+    const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part,
+    const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
+#if STRATA_DF2_WMMA_GFX11
+    __shared__ __align__(16) _Float16 Qs[32 * AS_H];
+    __shared__ __align__(16) union {
+        _Float16 Ks[32 * AS_H];
+        _Float16 Vt[HD * VS_H];
+    } KV;
+    __shared__ __align__(16) _Float16 Ps[32 * PS_H];
+    __shared__ float Sc[32 * 33];
+    __shared__ float m_s[32], l_s[32], corr_s[32];
+    __shared__ unsigned char kvalid[32];
+
+    const int kvh = blockIdx.x, chunk = blockIdx.y, tid = threadIdx.x;
+    const int wave = tid >> 5, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
+    const int s = *anchor_pos;
+    const int lo = s - (window - 1) > 0 ? s - (window - 1) : 0;
+    const int nctx = s - lo;
+    const int nkeys = nctx + kDf2Rows;
+    const int k_begin = chunk * kDf2Chunk;
+    const int64_t ep = tag != nullptr ? ((int64_t) *epoch_ptr << 32) : 0;
+    float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * 32) * 130;
+    if (k_begin >= nkeys) {
+        for (int i = tid; i < 32 * 130; i += 128) pbase[i] = (i % 130 == 0) ? -INFINITY : 0.0f;
+        return;
+    }
+    const float scale = rsqrtf((float) HD);
+    for (int i = tid; i < 32 * HD / 4; i += 128) {
+        const int a = i / (HD / 4), d4 = i % (HD / 4);
+        const int row = a >> 2, g = a & 3;
+        const float4 v = *reinterpret_cast<const float4*>(q + ((size_t) row * 32 + kvh * kDf2Gqa + g) * HD + d4 * 4);
+        _Float16 h4[4] = {(_Float16) (v.x * scale), (_Float16) (v.y * scale), (_Float16) (v.z * scale), (_Float16) (v.w * scale)};
+        *reinterpret_cast<uint2*>(&Qs[a * AS_H + d4 * 4]) = *reinterpret_cast<const uint2*>(h4);
+    }
+    if (tid < 32) { m_s[tid] = -INFINITY; l_s[tid] = 0.0f; }
+
+    // Each wave covers 16 queries (q_tile = (wave >> 1) * 16) and 64 output dims (d_base = (wave & 1) * 64, 4 tiles of 16)
+    const int q_tile = (wave >> 1) * 16;
+    const int k_tile = (wave & 1) * 16;
+    const int d_base = (wave & 1) * 64;
+    df2_f8 O[4];
+#pragma unroll
+    for (int dt = 0; dt < 4; ++dt) O[dt] = df2_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const int k_end = min(k_begin + kDf2Chunk, nkeys);
+    auto fetch = [&](int k0, float4 (&reg)[8], const float* ring, const float* blk) {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4), k = k0 + t;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (k < nctx) v = *reinterpret_cast<const float4*>(ring + ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
+            else if (k < nkeys) v = *reinterpret_cast<const float4*>(blk + ((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d4 * 4);
+            reg[u] = v;
+        }
+    };
+    float4 kreg[8], vreg[8];
+    fetch(k_begin, kreg, kring, kblk);
+    for (int k0 = k_begin; k0 < k_end; k0 += 32) {
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
+            const float4 v = kreg[u];
+            _Float16 h4[4] = {(_Float16) v.x, (_Float16) v.y, (_Float16) v.z, (_Float16) v.w};
+            *reinterpret_cast<uint2*>(&KV.Ks[t * AS_H + d4 * 4]) = *reinterpret_cast<const uint2*>(h4);
+        }
+        if (tid < 32) {
+            const int k = k0 + tid;
+            kvalid[tid] = (tag == nullptr || k >= nctx || k >= nkeys) ? 1 : (tag[(lo + k) % ring_slots] == (ep | (int64_t) (lo + k)) ? 1 : 0);
+        }
+        fetch(k0, vreg, vring, vblk);
+        __syncthreads();
+
+        // S = Q * K^T: all 4 Wave32s active on 2x2 grid of 16x16 tiles, 8 K-steps of 16
+        df2_f8 sc_acc = df2_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int d = 0; d < HD; d += 16) {
+            const df2_h16 qa = df2_ld_h16(&Qs[(q_tile + l16) * AS_H + d]);
+            const df2_h16 kb = df2_ld_h16(&KV.Ks[(k_tile + l16) * AS_H + d]);
+            sc_acc = df2_wmma_f16(qa, kb, sc_acc);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int qi = q_tile + 2 * i + hi;
+            const int t = k_tile + l16;
+            const int k = k0 + t;
+            const int row = qi >> 2;
+            bool ok = k < nkeys;
+            if (ok && k < nctx) ok = (lo + k) > (s + row - window) && kvalid[t];
+            Sc[qi * 33 + t] = ok ? sc_acc[i] : -INFINITY;
+        }
+        __syncthreads();
+
+        // Online softmax: 4 lanes per query, DPP register reduction, writes row-major FP16 Ps[qi][t]
+        {
+            const int qi = tid >> 2, sub = tid & 3;
+            float v[8], tmax = -INFINITY;
+#pragma unroll
+            for (int u = 0; u < 8; ++u) { v[u] = Sc[qi * 33 + sub * 8 + u]; tmax = fmaxf(tmax, v[u]); }
+            tmax = fmaxf(tmax, s26ts::xmov<1>(tmax));
+            tmax = fmaxf(tmax, s26ts::xmov<2>(tmax));
+            const float m_old = m_s[qi];
+            const float mn = fmaxf(m_old, tmax);
+            const float corr = (m_old == -INFINITY) ? 0.0f : __expf(m_old - mn);
+            float psum = 0.0f;
+            _Float16 ph[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const float p = v[u] == -INFINITY ? 0.0f : __expf(v[u] - mn);
+                ph[u] = (_Float16) p;
+                psum += p;
+            }
+            *reinterpret_cast<uint4*>(&Ps[qi * PS_H + sub * 8]) = *reinterpret_cast<const uint4*>(ph);
+            psum += s26ts::xmov<1>(psum);
+            psum += s26ts::xmov<2>(psum);
+            if (sub == 0) { l_s[qi] = l_s[qi] * corr + psum; m_s[qi] = mn; corr_s[qi] = corr; }
+        }
+        __syncthreads();
+
+        // Stage V transposed as Vt[d][t] so both P[q][0..15] and Vt[d][0..15] are contiguous 32B WMMA fragment loads
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
+            const float4 v = vreg[u];
+            KV.Vt[(d4 * 4 + 0) * VS_H + t] = (_Float16) v.x;
+            KV.Vt[(d4 * 4 + 1) * VS_H + t] = (_Float16) v.y;
+            KV.Vt[(d4 * 4 + 2) * VS_H + t] = (_Float16) v.z;
+            KV.Vt[(d4 * 4 + 3) * VS_H + t] = (_Float16) v.w;
+        }
+        if (k0 + 32 < k_end) fetch(k0 + 32, kreg, kring, kblk);
+        __syncthreads();
+
+        // Rescale O and accumulate O += P * V via 2 K-steps of 16 keys across 4 dim tiles (64 dims/wave)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float cr = corr_s[q_tile + 2 * i + hi];
+#pragma unroll
+            for (int dt = 0; dt < 4; ++dt) O[dt][i] *= cr;
+        }
+        const df2_h16 pa0 = df2_ld_h16(&Ps[(q_tile + l16) * PS_H + 0]);
+        const df2_h16 pa1 = df2_ld_h16(&Ps[(q_tile + l16) * PS_H + 16]);
+#pragma unroll
+        for (int dt = 0; dt < 4; ++dt) {
+            const df2_h16 vb0 = df2_ld_h16(&KV.Vt[(d_base + dt * 16 + l16) * VS_H + 0]);
+            const df2_h16 vb1 = df2_ld_h16(&KV.Vt[(d_base + dt * 16 + l16) * VS_H + 16]);
+            O[dt] = df2_wmma_f16(pa0, vb0, O[dt]);
+            O[dt] = df2_wmma_f16(pa1, vb1, O[dt]);
+        }
+    }
+    __syncthreads();
+    if (tid < 32) { pbase[tid * 130] = m_s[tid]; pbase[tid * 130 + 1] = l_s[tid]; }
+#pragma unroll
+    for (int dt = 0; dt < 4; ++dt) {
+        const int col = d_base + dt * 16 + l16;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int qi = q_tile + 2 * i + hi;
+            pbase[(size_t) qi * 130 + 2 + col] = O[dt][i];
+        }
+    }
+#else
+    (void) q; (void) kring; (void) vring; (void) kblk; (void) vblk; (void) anchor_pos;
+    (void) ring_slots; (void) window; (void) part; (void) tag; (void) epoch_ptr;
+    __builtin_trap();
+#endif
+}
+
+static bool df2_attn_wmma_enabled() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_DFLASH_WMMA");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return v[0] != '0' ? 1 : 0;
+    }();
+    if (env == 0) return false;
+    static strata::core::PerDeviceFlag<> g11_dev;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    const bool g11 = g11_dev.get(dev, [](int d) {
+        cudaDeviceProp p;
+        return cudaGetDeviceProperties(&p, d) == cudaSuccess && strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
+    });
+    if (!g11) return false;
+    if (env > 0) return true;
+    const char* off11 = std::getenv("STRATA_GFX11_DEFAULTS");
+    const char* woff11 = std::getenv("STRATA_GFX11_WMMA_DEFAULTS");
+    return !(off11 != nullptr && off11[0] == '0') && !(woff11 != nullptr && woff11[0] == '0');
+}
+#endif  // __HIP_PLATFORM_AMD__
 
 __device__ __forceinline__ void quant_block(float v, int blk, int col, int K, int8_t* __restrict__ xq, float* __restrict__ xd);
 
@@ -356,18 +635,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemm8_kernel(Df2Segs segs, const i
             }
         }
     }
-#pragma unroll
-    for (int r = 0; r < R; ++r)
-#pragma unroll
-        for (int c = 0; c < 8; ++c) {
-            float v = acc[r][c];
-            v += __shfl_xor_sync(0xffffffffu, v, 16);
-            v += __shfl_xor_sync(0xffffffffu, v, 8);
-            v += __shfl_xor_sync(0xffffffffu, v, 4);
-            v += __shfl_xor_sync(0xffffffffu, v, 2);
-            v += __shfl_xor_sync(0xffffffffu, v, 1);
-            if (lane == 0 && c < ncols) sg.y[(size_t) c * sg.n_out + row0 + r] = v;
-        }
+    df2_reduce_store_cols<R>(acc, lane, ncols, sg, row0);
 }
 
 // The same GEMM with R rows a warp instead of 8 (R = 4, 2, 1): a group of 8 rows is shared by 8 / R warps, each reading only its rows' weights.  Every output keeps
@@ -416,18 +684,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemm_rows_kernel(Df2Segs segs, con
             }
         }
     }
-#pragma unroll
-    for (int r = 0; r < R; ++r)
-#pragma unroll
-        for (int c = 0; c < 8; ++c) {
-            float v = acc[r][c];
-            v += __shfl_xor_sync(0xffffffffu, v, 16);
-            v += __shfl_xor_sync(0xffffffffu, v, 8);
-            v += __shfl_xor_sync(0xffffffffu, v, 4);
-            v += __shfl_xor_sync(0xffffffffu, v, 2);
-            v += __shfl_xor_sync(0xffffffffu, v, 1);
-            if (lane == 0 && c < ncols) sg.y[(size_t) c * sg.n_out + row0 + sub * R + r] = v;
-        }
+    df2_reduce_store_cols<R>(acc, lane, ncols, sg, row0 + sub * R);
 }
 
 // ---- Q4_0 variant of the same GEMM (opt-in drafter pack, dtype "q4_0"; a weight is 4 bits, the activations stay int8)
@@ -483,18 +740,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_kernel(Df2Segs segs, const i
             }
         }
     }
-#pragma unroll
-    for (int r = 0; r < R; ++r)
-#pragma unroll
-        for (int c = 0; c < 8; ++c) {
-            float v = acc[r][c];
-            v += __shfl_xor_sync(0xffffffffu, v, 16);
-            v += __shfl_xor_sync(0xffffffffu, v, 8);
-            v += __shfl_xor_sync(0xffffffffu, v, 4);
-            v += __shfl_xor_sync(0xffffffffu, v, 2);
-            v += __shfl_xor_sync(0xffffffffu, v, 1);
-            if (lane == 0 && c < ncols) sg.y[(size_t) c * sg.n_out + row0 + r] = v;
-        }
+    df2_reduce_store_cols<R>(acc, lane, ncols, sg, row0);
 }
 
 // The Q4_0 GEMM with R rows a warp (R = 4, 2, 1) instead of 8, as gemm_rows_kernel is to gemm8_kernel: a group of 8 rows is shared by 8 / R warps, each reading only its
@@ -547,25 +793,13 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_rows_kernel(Df2Segs segs, co
             }
         }
     }
-#pragma unroll
-    for (int r = 0; r < R; ++r)
-#pragma unroll
-        for (int c = 0; c < 8; ++c) {
-            float v = acc[r][c];
-            v += __shfl_xor_sync(0xffffffffu, v, 16);
-            v += __shfl_xor_sync(0xffffffffu, v, 8);
-            v += __shfl_xor_sync(0xffffffffu, v, 4);
-            v += __shfl_xor_sync(0xffffffffu, v, 2);
-            v += __shfl_xor_sync(0xffffffffu, v, 1);
-            if (lane == 0 && c < ncols) sg.y[(size_t) c * sg.n_out + row0 + sub * R + r] = v;
-        }
+    df2_reduce_store_cols<R>(acc, lane, ncols, sg, row0 + sub * R);
 }
 
 // quantize one 32-block of one row to the planar activation layout (a warp: lane = element)
 __device__ __forceinline__ void quant_block(float v, int blk, int col, int K, int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int lane = threadIdx.x & 31;
-    float amax = fabsf(v);
-    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float amax = df2_wave_max(fabsf(v));
     const float d = amax / 127.0f;
     const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
     const int q = __float2int_rn(v * inv);
@@ -587,7 +821,7 @@ __global__ void rms_quant_kernel(const float* __restrict__ h, const float* __res
     __shared__ float red[8];
     float ss = 0.0f;
     for (int i = tid; i < N; i += 256) { const float v = h[(size_t) col * N + i]; ss += v * v; }
-    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    ss = df2_wave_sum(ss);
     if (lane == 0) red[warp] = ss;
     __syncthreads();
     float tot = 0.0f;
@@ -645,7 +879,7 @@ __global__ void __launch_bounds__(1024) conv_rms_quant_kernel(const float* __res
             ss += v[j] * v[j];
         }
     }
-    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    ss = df2_wave_sum(ss);
     if (lane == 0) red[warp] = ss;
     __syncthreads();
     float tot = 0.0f;
@@ -676,7 +910,7 @@ __global__ void norm_rope_qk_kernel(const float* __restrict__ q, const float* __
     __shared__ float y[HD];
     const float x = in[((size_t) r * heads + h) * HD + d];
     float ss = x * x;
-    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    ss = df2_wave_sum(ss);
     if ((d & 31) == 0) red[d >> 5] = ss;
     __syncthreads();
     const float v = x * rsqrtf((red[0] + red[1] + red[2] + red[3]) / (float) HD + eps) * gamma[d];
@@ -696,7 +930,7 @@ __global__ void kv_ring_kernel(const float* __restrict__ kin, const float* __res
     __shared__ float y[HD];
     const float x = kin[((size_t) r * heads + h) * HD + d];
     float ss = x * x;
-    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    ss = df2_wave_sum(ss);
     if ((d & 31) == 0) red[d >> 5] = ss;
     __syncthreads();
     const float v = x * rsqrtf((red[0] + red[1] + red[2] + red[3]) / (float) HD + eps) * gk[d];
@@ -784,11 +1018,11 @@ __global__ void topk_part_kernel(const float* __restrict__ logits, int n, float*
         int bi = 0x7fffffff;
         for (int i = tid; i < cs; i += 256)
             if (better(vals[i], i, bv, bi)) { bv = vals[i]; bi = i; }
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            if (better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
-        }
+        df2_topk_step<16>(bv, bi);
+        df2_topk_step<8>(bv, bi);
+        df2_topk_step<4>(bv, bi);
+        df2_topk_step<2>(bv, bi);
+        df2_topk_step<1>(bv, bi);
         if ((tid & 31) == 0) { wv[tid >> 5] = bv; wi[tid >> 5] = bi; }
         __syncthreads();
         if (tid == 0) {
@@ -821,12 +1055,11 @@ __global__ void topk_merge_kernel(const float* __restrict__ cval, const int32_t*
         int bi = 0x7fffffff, bp = -1;
         for (int i = tid; i < NC; i += 256)
             if (si[i] >= 0 && better(sv[i], si[i], bv, bi)) { bv = sv[i]; bi = si[i]; bp = i; }
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            const int op = __shfl_xor_sync(0xffffffffu, bp, o);
-            if (better(ov, oi, bv, bi)) { bv = ov; bi = oi; bp = op; }
-        }
+        df2_topk_step3<16>(bv, bi, bp);
+        df2_topk_step3<8>(bv, bi, bp);
+        df2_topk_step3<4>(bv, bi, bp);
+        df2_topk_step3<2>(bv, bi, bp);
+        df2_topk_step3<1>(bv, bi, bp);
         if ((tid & 31) == 0) { wv[tid >> 5] = bv; wi[tid >> 5] = bi; wp[tid >> 5] = bp; }
         __syncthreads();
         if (tid == 0) {
@@ -881,7 +1114,7 @@ __global__ void select_kernel(const float* __restrict__ hp, const float* __restr
                     acc = fmaf(__uint_as_float(u[e] & 0xffff0000u), vp[lane * 8 + e * 2 + 1], acc);
                 }
             }
-            for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+            acc = df2_wave_sum(acc);
             if (lane == 0) sc[j] = unary[i * kDf2TopK + j] + acc;
         }
         __syncthreads();
@@ -958,8 +1191,16 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
 
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
                    int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
-    attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
-    check("attn_part");
+#if defined(__HIP_PLATFORM_AMD__)
+    if (g_attn_variant == 0 && df2_attn_wmma_enabled()) {
+        attn_part_wmma_gfx11_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, tag, epoch);
+        check("attn_part_wmma_gfx11");
+    } else
+#endif
+    {
+        attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+        check("attn_part");
+    }
     attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
     check("attn_merge");
 }
@@ -1002,14 +1243,15 @@ void df2_attention_variant(int v) { g_attn_variant = v; }
 // warp a row with unroll 1 (31) is 2x faster on the 256 and 640 row matrices (akp / mkp 12.1 -> 6.3 us, selector 11.1 -> 5.2); all bitwise the same results.
 static int df2_q4_auto(int rows) {
 #if defined(STRATA_USE_HIP)
-    static strata::core::PerDeviceFlag<> gfx12_dev;   // per card (#4431)
+    static strata::core::PerDeviceFlag<> rdna34_dev;   // per card (#4431): RDNA3 (gfx1100..gfx1151) + RDNA4 (gfx12) Wave32 tuning
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) (void) cudaGetLastError();
-    const bool gfx12 = gfx12_dev.get(dev, [](int d) {
+    const bool rdna34 = rdna34_dev.get(dev, [](int d) {
         cudaDeviceProp p;
-        return cudaGetDeviceProperties(&p, d) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
+        return cudaGetDeviceProperties(&p, d) == cudaSuccess &&
+               (strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) || strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName));
     });
-    if (gfx12) return rows <= 640 ? 31 : 26;
+    if (rdna34) return rows <= 640 ? 31 : 26;
 #endif
     (void) rows;
     return 17;

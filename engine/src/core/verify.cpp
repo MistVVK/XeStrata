@@ -52,6 +52,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/megakernel.hpp"
 #include "strata/core/dispatch_stats.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
@@ -363,6 +364,18 @@ bool qsa_slots_on() { static const bool v = env_on("STRATA_QSA_SLOTS"); return v
 bool env_nonzero(const char* name) {
     const char* v = std::getenv(name);
     return v != nullptr && std::atoi(v) != 0;
+}
+std::atomic<bool> g_mk_off{false};
+bool g_megakernel() {
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MEGAKERNEL");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on && !g_mk_off.load(std::memory_order_relaxed);
+#else
+    return false;
+#endif
 }
 bool batch_attn_rows_on() { static const bool v = env_nonzero("STRATA_BATCH_ATTN_ROWS"); return v; }
 bool batch_gdn_groups_on() { static const bool v = env_nonzero("STRATA_BATCH_GDN_GROUPS"); return v; }
@@ -804,9 +817,10 @@ Verifier::~Verifier() {
     for (cudaEvent_t e : df_join_)
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
+    if (mk_counters_) cudaFree(mk_counters_);
     if (hcount_d_) cudaFree(hcount_d_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_mk_stall_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -1030,8 +1044,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
+              mapped(64, (void**) &h_mk_stall_, (void**) &m_mk_stall_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
+    if (h_mk_stall_ != nullptr) *h_mk_stall_ = 0u;
+    if (g_megakernel() && mk_counters_ == nullptr) mk_counters_ = strata::kernels::mk_counters_alloc();
     // DFlash2 taps: set_taps (the drafter) or STRATA_TAP_FILE (the research dump); off, and nothing is allocated or captured, otherwise
     const char* tap_path = std::getenv("STRATA_TAP_FILE");
     if (tap_path != nullptr && tap_path[0] == '\0') tap_path = nullptr;
@@ -1383,10 +1400,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the mixer branch's stream / events could not be created";
         return false;
     }
-    // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
-    // exact, but neutral on RIBPC 1-2 GPUs: off by default)
+    // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1 or
+    // STRATA_VERIFY_DEVICE_HITS=1: on; bitwise exact, off by default unless arch defaults opt in)
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
+        if (v == nullptr) v = std::getenv("STRATA_VERIFY_DEVICE_HITS");
         // (not with set_always_publish: the device table may lag the host's while windows are in flight)
         device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
     }
@@ -1831,6 +1849,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* hb = h_L_ + (size_t) gi * MT * C;
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
+                const bool use_mk = g_megakernel() && mk_counters_ != nullptr && lb_ == 0 && le_ == g.n_layers &&
+                                    next_ == nullptr && !br && !sidem && !side_proj && !batch_rec_ && !self_commit &&
+                                    tb == 0 && n >= 1 && n <= 8 && wqkv->native_type == 8 && wg->native_type == 8 &&
+                                    wout->native_type == 8;
+                if (use_mk) {
+                    mk_in_graph_ = true;
+                    strata::kernels::MkGdnArgs mka;
+                    mka.x = xm; mka.xq = xq_; mka.w_qkv = wqkv->native_data; mka.w_z = wg->native_data; mka.w_out = wout->native_data;
+                    mka.qkv = qkv; mka.z = z_; mka.hist = conv; mka.w_conv = (const float*) wc->data; mka.h = hb;
+                    mka.w_alpha = (const uint16_t*) wa->data; mka.w_beta = (const uint16_t*) wb->data;
+                    mka.dt = (const float*) wdt->data; mka.ssm_a = (const float*) wsa->data; mka.gate = gate; mka.beta = beta;
+                    mka.state = state; mka.gamma = (const float*) wnm->data; mka.y = y_; mka.yq = xq_; mka.bo = bo_;
+                    mka.n_embd = (int) N; mka.conv_channels = (int) C; mka.value_dim = (int) ZV; mka.h_k = (int) HK; mka.h_v = (int) HV;
+                    mka.eps = EPS; mka.counters = mk_counters_; mka.stall = m_mk_stall_;
+                    if (q8_attn) mka.diag |= 32;
+                    strata::kernels::mk_gdn_dense(mka, n, cs);
+                    stamp(l, 2, grp); stamp(l, 3, grp); stamp(l, 4, grp); stamp(l, 5, grp); stamp(l, 6, grp);
+                    il_ready = false;
+                } else {
                 if (sidem) {   // the gates (a few blocks, latency-bound) beside the projections, joined below
                     if (!branch(mfork_, cs, side_, "fork")) return false;
                     gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
@@ -1948,6 +1985,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                }
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -3948,10 +3986,37 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     VDBG("window done\n");
+    if (megakernel_stall_take()) {
+        megakernel_off();
+        return run(T, tokens, pos0, pool, user, out, err);
+    }
     ++windows;
     progress_at("decode");
     progress_beat();
     return true;
+}
+
+bool Verifier::megakernel_stall_take() {
+    if (h_mk_stall_ == nullptr) return false;
+    const unsigned w = *(volatile unsigned*) h_mk_stall_;
+    if (w == 0u) return false;
+    std::fprintf(stderr, "strata verify: STRATA_MEGAKERNEL: phase %u stalled on CUDA%d (WDDM/occupancy guard); "
+                         "disabling megakernel and replaying window with plain kernels\n", w - 1u, device_);
+    *(volatile unsigned*) h_mk_stall_ = 0u;
+    return true;
+}
+
+void Verifier::megakernel_off() {
+    g_mk_off.store(true, std::memory_order_relaxed);
+    const OnDevice on(device_);
+    if (cs_) (void) cudaStreamSynchronize(cs_);
+    mk_in_graph_ = false;
+    for (auto& row : exec_)
+        for (auto& e : row)
+            if (e != nullptr) { (void) cudaGraphExecDestroy(e); e = nullptr; }
+    for (auto& row : exec_nr_)
+        for (auto& e : row)
+            if (e != nullptr) { (void) cudaGraphExecDestroy(e); e = nullptr; }
 }
 
 // set_pcie_balance: each stamped step's times into the model's fits (PcieModel::sample), solved once a window.

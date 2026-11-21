@@ -29,6 +29,12 @@
 #include <vector>
 
 namespace strata::kernels {
+bool rdna_gr_enabled();
+void rdna_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* stream,
+                        unsigned long long* sb = nullptr, int si = 0);
+}  // namespace strata::kernels
+
+namespace strata::kernels {
 namespace {
 
 constexpr int N = strata::core::kCompiledGeometry.n_embd;         // 2560 in Flash-Next
@@ -2860,6 +2866,15 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
         const cudaError_t eq = cudaGetLastError();
         if (eq != cudaSuccess) {
             std::fprintf(stderr, "fused_gr_read_multi q8: %s\n", cudaGetErrorString(eq));
+            std::exit(1);
+        }
+        return q8;
+    }
+    if (rdna_gr_enabled()) {
+        rdna_gr_read_multi(m.a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);
+        const cudaError_t er = cudaGetLastError();
+        if (er != cudaSuccess) {
+            std::fprintf(stderr, "fused_gr_read_multi rdna: %s\n", cudaGetErrorString(er));
             std::exit(1);
         }
         return q8;
