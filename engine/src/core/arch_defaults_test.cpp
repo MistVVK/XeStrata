@@ -331,10 +331,11 @@ int main() {
     put("STRATA_IGPU_PROMPT_SET", "0");
     CHECK(igpu_default_env("gfx1103", true).empty());
     put("STRATA_IGPU_PROMPT_SET", "1");
-    // apply: a discrete card sets nothing, an iGPU sets the five, a switch the user set (even to 0) is kept
+    // apply: an unconfigured discrete card (gfx1030) sets nothing, an iGPU sets the five, a switch the user set (even to 0) is kept
+    // (discrete RDNA3 gfx1100/1101/1102 has its own suite in gfx11_extra.hpp, tested in gfx11_extra_test)
     const char* five[] = {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"};
     for (const char* k : five) unset(k);
-    CHECK(apply_arch_defaults("gfx1100", false).empty());
+    CHECK(apply_arch_defaults("gfx1030", false).empty());
     // gfx12: a discrete RDNA4 card gets its own twelve switches (five prompt, seven decode); a second call has nothing to do
     const char* g12[] = {"STRATA_GDN_HEAD", "STRATA_GDN_PP",  "STRATA_GDN_CONVL2",    "STRATA_GDN_NOY", "STRATA_CVEC_FUSE",
                          "STRATA_ATTN_LANECELL", "STRATA_ATTN_MERGE_V2", "STRATA_TSUM", "STRATA_EXPDEC"};
@@ -448,8 +449,8 @@ int main() {
 #if !defined(_WIN32)
     {   // apply: nothing set -> STRATA_PF_FUSED=1 on the class, =0 (the way back) and =1 as the user set them are kept, other devices get nothing
         unset("STRATA_PF_FUSED");
-        apply_arch_defaults("gfx1100", false);
-        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);       // discrete
+        apply_arch_defaults("gfx1030", false);
+        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);       // unconfigured discrete (discrete RDNA3 is tested in gfx11_extra_test)
         apply_arch_defaults("gfx1103", false);
         CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);       // a mixed box (iGPU + dGPU)
         apply_arch_defaults("gfx1201", false);

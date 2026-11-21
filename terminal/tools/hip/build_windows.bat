@@ -24,7 +24,7 @@ rem   STRATA_NO_VISION     1 = skip the two picture readers (strata-vision.exe f
 rem   STRATA_CMAKE_EXTRA   extra cmake configure arguments (for example -DSTRATA_WINDOW_MAX_T=8)
 setlocal EnableDelayedExpansion
 for %%I in ("%~dp0..\..\..") do set "SRC=%%~fI"
-if not defined STRATA_HIP_ARCHS set "STRATA_HIP_ARCHS=gfx1100;gfx1101;gfx1102;gfx1200;gfx1201;gfx1030;gfx1031;gfx1151"
+if not defined STRATA_HIP_ARCHS set "STRATA_HIP_ARCHS=gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1200;gfx1201;gfx1030;gfx1031"
 if not defined STRATA_ROCM_VERSION set "STRATA_ROCM_VERSION=10.2.0a20260930"
 if not defined STRATA_ROCM_INDEX set "STRATA_ROCM_INDEX=https://nightly.repo.amd.com/rocm/whl-next/"
 if not defined ROCM_VENV set "ROCM_VENV=%SRC%\.rocm-win"

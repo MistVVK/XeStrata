@@ -9,6 +9,7 @@
 #define NOMINMAX
 #endif
 #endif
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <hip/hip_version.h>
 // Do not let HIP's legacy macro corrupt libstdc++ attribute names.
@@ -65,7 +66,7 @@
 #define cudaGraphLaunch hipGraphLaunch
 #define cudaGraphUpload hipGraphUpload
 #define cudaGraph_t hipGraph_t
-#define cudaHostAlloc hipHostMalloc
+#define cudaHostAlloc(...) (::strata::hip_compat::host_alloc(__VA_ARGS__))
 #if HIP_VERSION_MAJOR < 7
 #define cudaHostAllocDefault hipHostMallocDefault
 #define cudaHostAllocMapped hipHostMallocMapped
@@ -127,6 +128,25 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
 #define cudaSuccess hipSuccess
 
 namespace strata::hip_compat {
+inline bool mapped_coherent_enabled() noexcept {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HIP_MAPPED_COHERENT");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    return on;
+}
+template <typename T>
+inline hipError_t host_alloc(T** pointer, size_t bytes, unsigned int flags = cudaHostAllocDefault) {
+#if defined(_WIN32)
+    // Windows WDDM: hipHostMallocMapped without hipHostMallocCoherent allocates cached host pages
+    // whose CPU writes and GPU PCIe reads/atomics do not snoop each other, causing doorbell hangs
+    // and stale y_miss reads.  STRATA_HIP_MAPPED_COHERENT=0 restores plain flags for diagnostics.
+    if ((flags & cudaHostAllocMapped) != 0u && mapped_coherent_enabled()) {
+        flags |= hipHostMallocCoherent;
+    }
+#endif
+    return hipHostMalloc(reinterpret_cast<void**>(pointer), bytes, flags);
+}
 template <typename T>
 inline hipError_t malloc_host(T** pointer, size_t bytes) {
     return hipHostMalloc(reinterpret_cast<void**>(pointer), bytes, hipHostMallocDefault);

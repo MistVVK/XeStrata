@@ -1,4 +1,5 @@
 #include "strata/core/native_dense.hpp"
+#include "strata/core/gfx11_extra.hpp"
 #include "strata/core/run_manifest.hpp"
 #include <cstdlib>
 #include "strata/core/weights.hpp"
@@ -65,6 +66,20 @@ bool hc_q8_env() {
                 std::fprintf(stderr, "strata: Strix Halo (gfx1151): 8-bit hyper-connection weights are on (decode about 9%% faster, "
                                      "answers can differ in near-tie tokens); STRATA_HC_Q8=0 keeps the bf16 read\n");
                 return true;
+            }
+        }
+        {   // Discrete RDNA3 (gfx1100 / gfx1101 / gfx1102): Q8_0 hyper-connection projections halve verify HC memory traffic
+            if (!strata::core::gfx11_wmma_defaults_disabled(strata::qwen_defaults_026())) {
+                int dev11 = 0;
+                cudaDeviceProp p11;
+                const bool g11 = cudaGetDevice(&dev11) == cudaSuccess && cudaGetDeviceProperties(&p11, dev11) == cudaSuccess &&
+                                 !p11.integrated && strata::kernels::gfx_arch_is_discrete_rdna3(p11.gcnArchName);
+                (void) cudaGetLastError();
+                if (g11) {
+                    std::fprintf(stderr, "strata: gfx11 (RDNA3): 8-bit hyper-connection weights are on (quantized at load, "
+                                         "decode faster, answers can differ slightly); STRATA_HC_Q8=0 or STRATA_GFX11_DEFAULTS=0 keeps the bf16 read\n");
+                    return true;
+                }
             }
         }
         const char* d = std::getenv("STRATA_GFX12_DEFAULTS");

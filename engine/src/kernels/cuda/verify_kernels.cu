@@ -1328,11 +1328,6 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 }
 
 namespace {
-__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
-    while (*flag < value) strata_spin_pause();
-    __threadfence_system();
-}
-
 // the GPU's clock in ns (the same sources as gpu_stamp_kernel)
 __device__ __forceinline__ unsigned long long strata_now_ns() {
     unsigned long long t;
@@ -1346,11 +1341,32 @@ __device__ __forceinline__ unsigned long long strata_now_ns() {
     return t;
 }
 
+__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+#if defined(__HIPCC__) && defined(_WIN32)
+    // Windows WDDM enforces a strict 2,000 ms TdrDelay; cap a single spin to 1,200 ms so an extreme
+    // host/NVMe stall never resets the display driver.
+    constexpr unsigned long long kWddmTdrEscapeNs = 1'200'000'000ull;
+    const unsigned long long t0 = strata_now_ns();
+    uint32_t iter = 0;
+    while (*flag < value) {
+        strata_spin_pause();
+        if ((++iter & 255u) == 0u && strata_now_ns() - t0 > kWddmTdrEscapeNs) break;
+    }
+#else
+    while (*flag < value) strata_spin_pause();
+#endif
+    __threadfence_system();
+}
+
 // the overlapped split's hand-off wait, bounded: spin until *flag >= value, or give up after timeout_ns (0: never),
 // marking *err = 1 (mapped) so the host fails the window instead of using a stale hand-off.  The window's later
 // kernels still run (on whatever the hand-off buffer holds) so the graph completes and no stream is left hanging.
 __global__ void wait_handoff_kernel(const volatile uint32_t* flag, uint32_t value, uint32_t* err,
                                     unsigned long long timeout_ns) {
+#if defined(__HIPCC__) && defined(_WIN32)
+    constexpr unsigned long long kWddmCapNs = 1'200'000'000ull;
+    if (timeout_ns == 0ull || timeout_ns > kWddmCapNs) timeout_ns = kWddmCapNs;
+#endif
     const unsigned long long t0 = timeout_ns ? strata_now_ns() : 0ull;
     while (*flag < value) {
         strata_spin_pause();
