@@ -570,7 +570,7 @@ inline void k_gemm_xmx_sg16(const uint8_t* W, int N, int K, const half* X, float
     const int nbm = (M + 63) / 64, nbn = N / 64;
     const size_t pay_off = RP ? rp_pay_off(N, K >> 8) : 0;
     Q().submit([&](sycl::handler& h) {
-        sycl::local_accessor<half, 1> sB(64 * 64, h);
+        sycl::local_accessor<half, 1> sB(32 * xmx_detail::SB_FP16_LD, h);
         h.parallel_for(sycl::nd_range<1>((size_t)nbm * nbn * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
             const int gid = (int)it.get_group(0);
             const int bn = gid % nbn, bm = gid / nbn;
@@ -611,7 +611,7 @@ inline void k_gemm_xmx_sg16(const uint8_t* W, int N, int K, const half* X, float
                             xm::joint_matrix_load(sg, ma, xp, (size_t)K);
 #pragma unroll
                             for (int j = 0; j < 4; ++j) {
-                                xm::joint_matrix_load(sg, mb, sB_mp + (size_t)(s * 8) * 128 + (size_t)j * 32, (size_t)128);
+                                xm::joint_matrix_load(sg, mb, sB_mp + (size_t)(s * 8) * xmx_detail::SB_FP16_LD + (size_t)j * 32, (size_t)xmx_detail::SB_FP16_LD);
                                 xm::joint_matrix_mad(sg, mc[j], ma, mb, mc[j]);
                             }
                         }
@@ -641,7 +641,7 @@ inline void k_gemm_simt_sg32(const uint8_t* W, int N, int K, const half* X, floa
     const int nbm = (M + 31) / 32, nbn = N / 64;
     const size_t pay_off = RP ? rp_pay_off(N, K >> 8) : 0;
     Q().submit([&](sycl::handler& h) {
-        sycl::local_accessor<half, 1> sB(64 * 64, h);
+        sycl::local_accessor<half, 1> sB(32 * xmx_detail::SB_FP16_LD, h);
         h.parallel_for(sycl::nd_range<1>((size_t)nbm * nbn * 128, 128), [=](sycl::nd_item<1> it) REQD_SG32 {
             const int gid = (int)it.get_group(0);
             const int bn = gid % nbn, bm = gid / nbn;
@@ -669,7 +669,7 @@ inline void k_gemm_simt_sg32(const uint8_t* W, int N, int K, const half* X, floa
                     sycl::group_barrier(it.get_group());
                     const int k0 = sbi * 256 + g * 64;
                     for (int kp = 0; kp < 32; ++kp) {
-                        const half* bp0 = sb_ptr + kp * 128 + nc * 2;
+                        const half* bp0 = sb_ptr + kp * xmx_detail::SB_FP16_LD + nc * 2;
                         const float b00 = (float)bp0[0], b01 = (float)bp0[1];
                         const float b10 = (float)bp0[2], b11 = (float)bp0[3];
 #pragma unroll
