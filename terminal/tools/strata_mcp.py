@@ -692,16 +692,19 @@ class Strata:
             return None
         from strata_control import inkling_fit
         uni = next((g for g in usable if g.get("unified_gb")), None)
-        uma = next((g for g in usable if g.get("uma")), None)
-        igpu_dev = next((g for g in usable if g.get("integrated") or inkling_fit.is_igpu_arch(g.get("arch"))), None)
+        uma = next((g for g in usable if g.get("uma") or g.get("unified") or inkling_fit.is_big_uma_arch(g.get("arch"), g.get("name"))), None)
+        igpu_dev = next((g for g in usable if inkling_fit.is_igpu_arch(g.get("arch")) or (
+            g.get("integrated") and not g.get("uma") and not g.get("unified") and not inkling_fit.is_big_uma_arch(g.get("arch"), g.get("name"))
+        )), None)
         arch = str((igpu_dev or uma or uni or (usable[0] if usable else {})).get("arch") or "").lower() or None
         igpu = bool(igpu_dev)
         if uni:
             vram_gib, ram_gib, unified = None, float(uni["unified_gb"]), True
+        elif uma:
+            v = float(uma.get("vram_gb") or 0.0)
+            vram_gib, ram_gib, unified = None, (float(ram) if v <= 0.0 else max(float(ram), v / inkling_fit.GIB_TO_GB)), True
         elif igpu:
             vram_gib, ram_gib, unified = None, float(ram), True
-        elif uma:
-            vram_gib, ram_gib, unified = None, float(uma.get("vram_gb") or ram) / inkling_fit.GIB_TO_GB, True
         else:
             vram_gib, ram_gib, unified = max((float(g["vram_gb"]) for g in usable), default=0.0), float(ram), False
         rec = inkling_fit.recommend(vram_gib, ram_gib, unified, None, vision, igpu=igpu, arch=arch)

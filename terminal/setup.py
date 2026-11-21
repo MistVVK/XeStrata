@@ -9955,11 +9955,14 @@ def inkling_pc(gpu, ram) -> tuple:
     """(vram_gib or None, ram_gib, unified, igpu, arch) for strata_control/inkling_fit.py."""
     g = gpu or {}
     arch = str(g.get("arch") or "").lower()
-    igpu = bool(g.get("integrated") or inkling_fit.is_igpu_arch(arch))
+    name = str(g.get("name") or "")
+    big_uma = inkling_fit.is_big_uma_arch(arch, name)
+    igpu = bool(inkling_fit.is_igpu_arch(arch) or (g.get("integrated") and not big_uma and not g.get("uma") and not g.get("unified")))
     if g.get("unified_gb"):
         return None, float(g["unified_gb"]), True, igpu, arch
-    if g.get("uma") or igpu:
-        pool = float(ram) if igpu else float(g.get("vram_gb") or ram) / inkling_fit.GIB_TO_GB
+    if big_uma or g.get("uma") or g.get("unified") or igpu:
+        v = float(g.get("vram_gb") or 0.0)
+        pool = float(ram) if (igpu or v <= 0.0) else max(float(ram), v / inkling_fit.GIB_TO_GB)
         return None, pool, True, igpu, arch
     return float(g.get("vram_gb") or 0.0), float(ram), False, False, arch
 

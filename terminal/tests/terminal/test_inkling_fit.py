@@ -122,6 +122,37 @@ class TestInklingFitAndHardwareSelection(unittest.TestCase):
             h_pub = transfer.hf_auth_headers("https://huggingface.co/strata-engine/Hy4-Flash-Strata/resolve/main/README.md")
             self.assertEqual(h_pub, {})
 
+    def test_dgx_spark_gb10_linux_aarch64_auto_selects_sq20(self):
+        from strata_control import targets
+        import setup as setup_mod
+        from tools import strata_mcp
+
+        ok, why = targets.backend_supported("cuda", "linux-aarch64")
+        self.assertTrue(ok, why)
+        self.assertTrue(inkling_fit.is_big_uma_arch("121", "NVIDIA GB10"))
+        self.assertTrue(inkling_fit.is_big_uma_arch("sm_121", "NVIDIA GB10"))
+        self.assertTrue(inkling_fit.is_big_uma_arch("gfx1151", "AMD Radeon Graphics"))
+        self.assertFalse(inkling_fit.is_big_uma_arch("gfx1103", "Radeon 780M"))
+
+        # Even if hardware probe tags GB10 with integrated=True, unified=True, or vram_gb=0, it MUST pick SQ-20 (never SQ-10)
+        for gpu in (
+            {"name": "NVIDIA GB10", "vendor": "nvidia", "arch": "121", "vram_gb": 120.0, "uma": True},
+            {"name": "NVIDIA GB10", "vendor": "nvidia", "arch": "sm_121", "vram_gb": 0.0, "unified": True, "integrated": True},
+            {"name": "NVIDIA GB10", "vendor": "nvidia", "arch": "121", "vram_gb": None, "integrated": True},
+        ):
+            vram_gib, ram_gib, unified, igpu, arch = setup_mod.inkling_pc(gpu, 128.0)
+            self.assertTrue(unified)
+            self.assertFalse(igpu)
+            rec = inkling_fit.recommend(vram_gib, ram_gib, unified, igpu=igpu, arch=arch)
+            self.assertEqual(rec["build"], "SQ-20")
+            self.assertTrue(rec["fits"])
+            self.assertEqual(rec["mode"], "full_vram")
+            row = strata_mcp.Strata.inkling_fit_row(None, "SQ-20", 128.0, [gpu])
+            self.assertIsNotNone(row)
+            self.assertTrue(row["recommended"])
+            self.assertTrue(row["unified"])
+            self.assertEqual(row["mode"], "full_vram")
+
 
 if __name__ == "__main__":
     unittest.main()

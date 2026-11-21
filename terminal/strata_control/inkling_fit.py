@@ -45,6 +45,8 @@ FAMILY_NAME = "inkling-2-mini"
 
 #: AMD iGPU architectures that auto-select SQ-10 via coherent UMA/GTT allocation (even with small BIOS VRAM carve-out).
 IGPU_SQ10_ARCHS = frozenset({"gfx1103", "gfx1150"})
+#: High-bandwidth unified-memory GPUs (DGX Spark GB10 sm_121, Strix Halo gfx1151) that scale to SQ-20 on >= 32 GiB UMA.
+BIG_UMA_ARCHS = frozenset({"121", "sm_121", "gfx1151"})
 
 #: name -> exact Section 1 (dense + DSpark) and Section 4 (expert bodies) sizes from the verified .strata v1.1 binaries.
 BUILDS = {
@@ -61,6 +63,14 @@ def build_names() -> list[str]:
 
 def is_igpu_arch(arch: str | None) -> bool:
     return str(arch or "").strip().lower() in IGPU_SQ10_ARCHS
+
+
+def is_big_uma_arch(arch: str | None, name: str | None = None) -> bool:
+    a = str(arch or "").strip().lower()
+    if a in BIG_UMA_ARCHS:
+        return True
+    low = str(name or "").lower()
+    return "gb10" in low or "dgx spark" in low or "strix halo" in low
 
 
 def kv_cache_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False) -> float:

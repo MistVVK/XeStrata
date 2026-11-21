@@ -1,5 +1,5 @@
 /**
- * Thinking Machines Inkling-2-Mini runs on its own shape engine program (strata-inkling, component "strata-inkling2"),
+ * Thinking Machines Inkling-2-Mini runs on its own shape engine program (strata-inkling, component "strata-inkling"),
  * which uses its own flags (--native, --vision, --max-context, --parallel 1..64, --draft dspark|off, --vram-experts-gb,
  * --ram-experts-gb) rather than Qwen Flash-Next flags.
  */
