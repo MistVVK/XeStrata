@@ -126,6 +126,8 @@ HF_REVISIONS = {
     "unsloth/Qwen3.5-9B-GGUF": "3885219b6810b007914f3a7950a8d1b469d598a5",                          # 2026-10-26
     "unsloth/Qwen3.5-2B-GGUF": "f6d5376be1edb4d416d56da11e5397a961aca8ae",                          # 2026-11-08
     "unsloth/Qwen3.5-0.8B-GGUF": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",                        # 2026-11-08
+    # 2026-11-21: Inkling-2-Mini's mainline-inkling2_loop files (the Mainline_Support folder)
+    "unsloth/Inkling-2-Mini-GGUF": "ea0c79b2ecd73669e774c8519b79bfabfddbc027",                      # 2026-11-21
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
     "AtomicChat/Qwen3.8-Flash-Next-GGUF": "f5b0b790eebb89033c48091c26abf74c1b385940",               # 2026-11-03
     "hiru2005/Sync-XS": "7caf39170ffd473ec37ffc15e853ba9b79f55648",
@@ -194,6 +196,11 @@ MODEL_TERMS: dict[str, dict] = {
     "ornith-ai/Ornith-1.5-35B-A3B-GGUF": {
         "license": "MIT",
         "card": "mit",
+        "texts": [],
+    },
+    "unsloth/Inkling-2-Mini-GGUF": {
+        "license": "Apache-2.0",
+        "card": "apache-2.0",
         "texts": [],
     },
     "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF": {
@@ -1403,7 +1410,70 @@ _GLM53_IQ4 = _glm53_parts("UD-IQ4_XS", [
     (49607025280, "7c2c63c9c30f8060428fdf2ac935dbf2ee9ad8f771d62b6ae47a7f7f2c1520e7"),
     (49486530144, "06c90f191871317c92dd9d25a353b687aed44c50f3ac6c713e9fe410bc2d26dd"),
     (7729791616, "66ebf9ec85e04d3f44af674ae4f694acbc89cc53db75e42f2f4d3646bf321c0d")])
+# Inkling-2-Mini (Thinking Machines, Apache-2.0).  Unsloth publishes two layouts of the same tensor bytes: its
+# root files use an Unsloth-only looped layout, while Mainline_Support uses the inkling2_loop names that mainline
+# llama.cpp reads (PR #32694).  XeStrata reads the mainline layout, so the published path is Mainline_Support's
+# `.gguf_file` and the file is installed under its `.gguf` name ("local" below).  Sizes and SHA-256 are the Hub's
+# LFS pointers at the revision pinned in HF_REVISIONS (2026-11-21); each was also checked after download.
+_INKLING = "unsloth/Inkling-2-Mini-GGUF"
+INKLING_FILES = {
+    "Inkling-2-Mini-UD-IQ1_M.gguf":
+        (8024442304, "af7b45e1c0097fb2602d4c69abf72a009cad78e54201da2265853f5ef11a514a"),
+    "Inkling-2-Mini-UD-IQ1_S.gguf":
+        (7764293056, "17a7ff34acb0e1fe878309962458e0633172c7f93ffe3b1c4f5f6b317dc317db"),
+    "Inkling-2-Mini-UD-IQ2_XXS.gguf":
+        (8486237632, "2f953a44281cf861b19ccfdb2ce65f7648e1e92bda4af3729893604fd907c544"),
+    "Inkling-2-Mini-UD-IQ3_XXS.gguf":
+        (11663310784, "fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657"),
+    "Inkling-2-Mini-UD-IQ4_XS.gguf":
+        (15733756512, "374970bf6f151fc50da49419751c3e77b82e373a3b9445ded617bd386cd12163"),
+    "Inkling-2-Mini-UD-Q2_K_XL.gguf":
+        (9138716608, "b42841608ea380ddde5a3f1125081357128a3c71b80d006246de4e31292fc6c1"),
+    "Inkling-2-Mini-UD-Q3_K_XL.gguf":
+        (13631779296, "e2d03e8c92ac21cff0e3309b95f40dfd27d1825184f0d2bc09db249797273639"),
+    "Inkling-2-Mini-UD-Q4_K_M.gguf":
+        (16610544608, "78fcedcf93c5d1bfe83e225513b71392bb52259be0eaa5f8899c856a2e5834ae"),
+    "Inkling-2-Mini-UD-Q4_K_XL.gguf":
+        (17629760736, "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3"),
+    "Inkling-2-Mini-UD-Q8_K_XL.gguf":
+        (22867452896, "2da51788d43a17e1f033bec420fa83ba9cb87ac1f0130dc9135a4d2ed2678b68"),
+}
+# Optional components of the same family.  The picture readers are inkling2v GGUFs (not read by the text-only
+# engine); the DSpark drafters are dflash GGUFs (a separate speculative path, K2-1).  None is downloaded by the
+# family; each is pinned so a user's copy can be verified like a model's.
+INKLING_EXTRAS = {
+    "mmproj-BF16.gguf": (641805760, "2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7", "mmproj"),
+    "mmproj-F16.gguf": (639348160, "3bff75ffeb2d6e0371ba7bd42e30d26a7d98aea681fa44b03b5a20891cfa2c5f", "mmproj"),
+    "mmproj-F32.gguf": (1273048512, "fa6f2478812f33876e279b6fe8e9f00ea5ff4e9db40868c98c0a39277a439e25", "mmproj"),
+    "dspark-Inkling-2-Mini-Q8_0.gguf":
+        (402278560, "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773", "dspark"),
+    "dspark/dspark-Inkling-2-Mini-BF16.gguf":
+        (647792800, "b8985695c949a4e3270666b44b65959a8c3a599c6e599e0e3e5028f8c217f7b2", "dspark"),
+}
+INKLING_SIZES = ("UD-IQ1_M", "UD-IQ1_S", "UD-IQ2_XXS", "UD-IQ3_XXS", "UD-IQ4_XS", "UD-Q2_K_XL", "UD-Q3_K_XL",
+                 "UD-Q4_K_M", "UD-Q4_K_XL", "UD-Q8_K_XL")
+INKLING_ABOUT = {"UD-IQ1_M": "1-bit, the smallest", "UD-IQ1_S": "1-bit", "UD-IQ2_XXS": "2-bit",
+                 "UD-IQ3_XXS": "3-bit", "UD-IQ4_XS": "4-bit", "UD-Q2_K_XL": "2-bit K-quant",
+                 "UD-Q3_K_XL": "3-bit K-quant", "UD-Q4_K_M": "4-bit K-quant",
+                 "UD-Q4_K_XL": "4-bit K-quant", "UD-Q8_K_XL": "8-bit K-quant"}
+
 PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
+    # Inkling-2-Mini: the text model only.  The ten Unsloth dynamic quants all hold the same 128-expert / top-8
+    # MoE and the 3-pass loop; the first install never picks it (the GPU path is still being built).
+    "inkling": {"title": "Inkling-2-Mini", "by": "Thinking Machines (Apache-2.0), GGUFs by Unsloth",
+                "about": "1.8B active of 128 experts, a 3-pass loop and hybrid attention; mainline GGUF layout; "
+                         "text only, no picture reader in the text engine",
+                "tag": "inkling-", "name": "inkling-2-mini", "max_context": 32768, "plain": True,
+                "kv_bytes": 8192, "vision": False, "mmproj": None,
+                "models": {m: {"repo": _INKLING, "file": f"Inkling-2-Mini-{m}.gguf",
+                               "size": INKLING_FILES[f"Inkling-2-Mini-{m}.gguf"][0],
+                               "sha256": INKLING_FILES[f"Inkling-2-Mini-{m}.gguf"][1],
+                               "parts": [{"path": f"Mainline_Support/Inkling-2-Mini-{m}.gguf_file",
+                                          "local": f"Inkling-2-Mini-{m}.gguf",
+                                          "size": INKLING_FILES[f"Inkling-2-Mini-{m}.gguf"][0],
+                                          "sha256": INKLING_FILES[f"Inkling-2-Mini-{m}.gguf"][1]}],
+                               "about": INKLING_ABOUT[m]} for m in INKLING_SIZES},
+                "license": "Apache-2.0"},
     "ornith": {"title": "Ornith-1.5-35B-A3B", "by": "Ornith AI (MIT)",
                "about": "35B, 3B active; a Qwen3.5 MoE that reads images: Q4_K_M to BF16, and community GSQ-RCO 3 "
                         "and 3.5 bits",
@@ -1631,7 +1701,8 @@ FAMILIES.update(PLAIN_FAMILIES)
 BASES = {"qwen3.8-flash-next": "Qwen3.8-Flash-Next",
          "ornith-1.5": "Ornith-1.5-35B-A3B",
          "qwen3.6": "Qwen3.6-35B-A3B", "qwen3.5-9b": "Qwen3.5-9B", "qwen3.5-2b": "Qwen3.5-2B",
-         "llm-jp-4.1": "llm-jp-4.1-32b-a3b-thinking", "glm-5.3-flash": "GLM-5.3-Flash", "qwen3.5-0.8b": "Qwen3.5-0.8B"}
+         "llm-jp-4.1": "llm-jp-4.1-32b-a3b-thinking", "glm-5.3-flash": "GLM-5.3-Flash", "qwen3.5-0.8b": "Qwen3.5-0.8B",
+         "inkling2-mini": "Inkling-2-Mini"}
 VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)",
             "coder": "Coder (half the experts, kept for code)", "sc117": "abliterated by SC117",
             "swift-sc117": "Swift 1.5, abliterated by SC117", "huihui-ai": "abliterated by huihui-ai",
@@ -1641,7 +1712,7 @@ QUANTIZERS = {"gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth",
               "gyro": "Gyro by agentionai", "sync": "Sync by hiruhiru2005",
               "ad": "AD by AtomicChat", "ornith-ai": "GGUFs by Ornith AI", "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
               "dealignai": "GGUFs by dealignai", "llm-jp": "GGUFs by LLM-jp", "apex": "APEX by SC117",
-              "hauhaucs": "GGUFs by HauhauCS", "own": "your own files"}
+              "hauhaucs": "GGUFs by HauhauCS", "inkling-unsloth": "UD quants by Unsloth", "own": "your own files"}
 TIERS = {  # family: (model, version, quantization), in the order each level lists them
     "qwen": ("qwen3.8-flash-next", "original", "gsq-rco"),
     "unsloth": ("qwen3.8-flash-next", "original", "unsloth"),
@@ -1665,6 +1736,7 @@ TIERS = {  # family: (model, version, quantization), in the order each level lis
     "llmjp": ("llm-jp-4.1", "original", "llm-jp"),
     "glm53": ("glm-5.3-flash", "original", "unsloth"),
     "qwen35-0.8b": ("qwen3.5-0.8b", "original", "unsloth"),
+    "inkling": ("inkling2-mini", "original", "inkling-unsloth"),
 }
 # a model's line in setup's first question where its original family's "about" does not say what the model is
 BASE_ABOUT = {"qwen3.8-flash-next": "Qwen's model, the one XeStrata is made for"}
@@ -1703,6 +1775,12 @@ for _fam in PLAIN_FAMILIES.values():                 # the other models' files, 
     if _fam.get("mmproj"):
         _m = _fam["mmproj"]
         REPO_PINS.setdefault(_m["repo"], {})[_m["path"].rsplit("/", 1)[-1]] = (_m["size"], _m["sha256"])
+REPO_PINS[_INKLING] = {
+    **{k: INKLING_FILES[k] for k in INKLING_FILES},
+    # the downloaded name is the Mainline_Support `.gguf_file`; file_pin() keys on the URL's basename
+    **{k.replace(".gguf", ".gguf_file"): INKLING_FILES[k] for k in INKLING_FILES},
+    **{k.rsplit("/", 1)[-1]: (v[0], v[1]) for k, v in INKLING_EXTRAS.items()},
+}
 
 
 # the translation models' GGUFs (serve/translate.py's MODELS), at HF_REVISIONS' commits: file -> (bytes, sha256)
@@ -4735,7 +4813,8 @@ def gguf_dir_renamed(shards: list, fam: dict, model: str) -> None:
 
 CUSTOM = "custom"                                      # the family of a model from the user's own files (--gguf)
 # the architectures the plain engine runs (plain_generate.cpp) besides Qwen3.8-Flash-Next's qwen4exp
-PLAIN_ARCHS = ("qwen35moe", "qwen35", "qwen3moe", "glm5-next", "glm5next")   # the last: GLM's other spelling
+PLAIN_ARCHS = ("qwen35moe", "qwen35", "qwen3moe", "glm5-next", "glm5next", "inkling2_loop")
+# the last: GLM's other spelling; inkling2_loop: Inkling-2-Mini's CPU reference
 
 
 def custom_id(name: str) -> str:
@@ -9125,7 +9204,9 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
              f"{ctx // 1024}K context, and the GPU has {gpu_gb:.0f} GB, so the engine may not start; a smaller size "
              "or context fits")
     parts = plain_parts(d)
-    names_of = [Path(x["path"]).name for x in parts]   # side by side in one folder: the engine finds them by name
+    # a file whose published name differs from its name on disk (Inkling-2-Mini's Mainline_Support .gguf_file
+    # must be a .gguf for the engine and the model folder's scan) gets its local name from "local".
+    names_of = [Path(x.get("local", x["path"])).name for x in parts]
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     if d.get("custom"):
         models_dir = Path(a.custom["files"][0]["path"]).parent
