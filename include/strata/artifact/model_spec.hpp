@@ -220,6 +220,20 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.norm_eps = spec_num(g, A, "attention.layer_norm_epsilon");
 
     s.n_head = spec_int(g, A, "attention.head_count");
+    if (s.arch == ModelArch::Inkling2Loop && s.n_head == 0) {
+        // inkling2 writes one head count per layer; the engine uses one value and checks the layers below
+        std::vector<double> heads;
+        if (!spec_per_layer(g, A, "attention.head_count", n_all, heads) || heads.empty()) {
+            err = A + ".attention.head_count is neither a number nor one per layer";
+            return false;
+        }
+        s.n_head = (int64_t) heads[0];
+        for (size_t i = 1; i < heads.size(); ++i)
+            if (heads[i] != heads[0]) {
+                err = A + ".attention.head_count differs between layers";
+                return false;
+            }
+    }
     std::vector<double> kv;
     if (spec_get(g, A, "attention.head_count_kv") && !spec_per_layer(g, A, "attention.head_count_kv", n_all, kv)) {
         err = A + ".attention.head_count_kv is neither a number nor one per layer";

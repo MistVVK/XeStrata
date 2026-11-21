@@ -13,6 +13,8 @@
 #include <numeric>
 #include <stdexcept>
 #include <thread>
+#include <cstdlib>
+#include <cstdio>
 #include <unordered_map>
 
 namespace strata::core {
@@ -186,14 +188,14 @@ struct PlainInkling::Impl {
         return err.empty();
     }
 
-    /// One expert's row range into `out` [rows][cols], with its per-expert scale applied.
-    void expert_rows(const Expert& e, int ex, int64_t r0, int64_t r1, float* out) {
-        const uint8_t* src = e.data + (size_t) ex * (size_t) e.rows * e.row_bytes;
-        const float scale = e.scale != nullptr ? e.scale[ex] : 1.0f;
-        for (int64_t r = r0; r < r1; ++r)
-            kc::native_row_to_float(e.type, src + (size_t) r * e.row_bytes, out + (size_t) r * e.cols, e.cols);
-        if (scale != 1.0f)
-            for (int64_t i = 0; i < (r1 - r0) * e.cols; ++i) out[i] *= scale;
+    /// One row of one expert, dequantized and dotted with `x`.  The blob is [n_in][rows][n_expert], so a row is
+    /// `row_bytes` apart and expert `ex` starts `rows` rows in.  Scratch stays at one row.
+    float expert_row_dot(const Expert& e, int ex, int64_t r, const float* x, std::vector<float>& buf) {
+        const uint8_t* src = e.data + (size_t) ex * (size_t) e.rows * e.row_bytes + (size_t) r * e.row_bytes;
+        if (!kc::native_row_to_float(e.type, src, buf.data(), e.cols)) return 0.0f;
+        double ss = 0;
+        for (int64_t i = 0; i < e.cols; ++i) ss += (double) buf[(size_t) i] * x[i];
+        return (float) ss * (e.scale != nullptr ? e.scale[ex] : 1.0f);
     }
 
     void matvec(const std::vector<float>& w, const float* x, float* y, int64_t n_in, int64_t n_out, int threads) {
@@ -315,24 +317,38 @@ bool PlainInkling::Impl::load(const GgufModel& model, const ModelSpec& spec, std
         L.ffnnorm = p + "ffn_norm.weight";
         L.router = p + "ffn_gate_inp.weight";
         // allocate the norm and router vectors (and check every other dense tensor's presence/shape)
+        // only 2-D tensors go through matrix(); the 1-D norms and res queries are loaded with vector()
         std::vector<std::string> dense_names = {L.q, L.k, L.v, L.o, L.gate, L.qclip, L.sink, L.rel, L.relbias,
-                                                L.relclip, L.kconv, L.vconv, L.postconv, L.ffnconv, L.ffnq,
-                                                L.ffnnorm, L.router};
-        if (L.swa) dense_names.push_back(L.attn_norm);
-        else {
-            dense_names.push_back(L.qin);
-            dense_names.push_back(L.kin);
-            dense_names.push_back(L.vin);
+                                                L.relclip, L.kconv, L.vconv, L.postconv, L.ffnconv, L.router};
+        // attn_res_query is [N] on sliding-window layers and [N,3] on full-attention layers
+        if (l > 0) {
+            size_t rat = 0;
+            const TensorInfo* rt = m->find(L.resq, &rat);
+            if (rt != nullptr && rt->shape.size() >= 2) dense_names.push_back(L.resq);
+        }
+        if (!L.swa) {
             dense_names.push_back(L.kproj);
             dense_names.push_back(L.vproj);
         }
-        if (l > 0) dense_names.push_back(L.resq);
         for (const auto& name : dense_names) {
             std::string e;
             (void) matrix(name, e);
             if (!e.empty()) { err = e; return false; }
         }
-        if (!need_vec(L.ffnq.c_str(), N) || !need_vec(L.ffnnorm.c_str(), N)) return false;
+        std::vector<std::string> vec_names = {L.ffnq, L.ffnnorm};
+        if (l > 0) {
+            size_t rat = 0;
+            const TensorInfo* rt = m->find(L.resq, &rat);
+            if (rt != nullptr && rt->shape.size() == 1) vec_names.push_back(L.resq);
+        }
+        if (L.swa) vec_names.push_back(L.attn_norm);
+        else {
+            vec_names.push_back(L.qin);
+            vec_names.push_back(L.kin);
+            vec_names.push_back(L.vin);
+        }
+        for (const auto& name : vec_names)
+            if (!need_vec(name.c_str(), N)) return false;
         const std::string b = p + "exp_probs_b.bias";
         std::string e;
         L.exp_b = vector(b, NE, e);
@@ -348,6 +364,9 @@ bool PlainInkling::Impl::load(const GgufModel& model, const ModelSpec& spec, std
         Loop& C = loops[(size_t) (ip - s.loop_start)];
         const std::string p = "blk." + std::to_string(ip) + ".";
         C.query = p + "loop_msg_query.weight";
+        std::string qe;
+        (void) matrix(C.query, qe);   // [n_embd, 4]: one query per controller
+        if (!qe.empty()) { err = qe; return false; }
         const char* ctrl[4] = {"q", "k", "v", "ffn"};
         for (int c = 0; c < 4; ++c) {
             const std::string pre = p + "loop_" + ctrl[c] + "_ctrl_";
@@ -395,7 +414,7 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
     const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
     std::vector<float> x(N), hn(N), q(NH * HD), k(NKV * HD), v(NKV * HD), r(NH * nrel), att(NH * HD);
     std::vector<float> in0(N), in1(N), in2(N), normed(N), mixed(N), tmp(N), out(N);
-    std::vector<float> gu(2 * FF), hv(FF), exout(N), gate_tmp(NH * HD), msg[4];
+    std::vector<float> hv(FF), gate_tmp(NH * HD), rowbuf((size_t) std::max(N, FF)), msg[4];
     for (auto& m : msg) m.resize(N);
     std::vector<std::vector<float>> blocks;
 
@@ -507,10 +526,20 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
         const float* inputs[3] = {cur_in, cur_in, cur_in};
         std::vector<float> mx;
         if (dense_of(L.resq) != nullptr) {
-            mx.resize(N);
-            mix(bl, cur_in, dense_of(L.resq), mx.data());
-            inputs[0] = inputs[1] = inputs[2] = mx.data();
-            if (!L.swa) { in1 = mx; in2 = mx; inputs[1] = in1.data(); inputs[2] = in2.data(); }
+            // one learned query on a sliding-window layer, three on a full-attention layer (one per Q/K/V input)
+            mx.resize(3 * N);
+            const float* rq = dense_of(L.resq);
+            mix(bl, cur_in, rq, mx.data());
+            if (L.swa) {
+                inputs[0] = inputs[1] = inputs[2] = mx.data();
+            } else {
+                mix(bl, cur_in, rq + N, mx.data() + N);
+                mix(bl, cur_in, rq + 2 * N, mx.data() + 2 * N);
+                in0.assign(mx.begin(), mx.begin() + N);
+                in1.assign(mx.begin() + N, mx.begin() + 2 * N);
+                in2.assign(mx.begin() + 2 * N, mx.begin() + 3 * N);
+                inputs[0] = in0.data(); inputs[1] = in1.data(); inputs[2] = in2.data();
+            }
         }
         if (messages_present && loop != nullptr) {
             for (int j = 0; j < 3; ++j) {
@@ -642,12 +671,14 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
         std::fill(out.begin(), out.end(), 0.0f);
         for (int64_t j = 0; j < NK; ++j) {
             const int64_t eid = ids[(size_t) j];
-            expert_rows(L.gu, (int) eid, 0, 2 * FF, gu.data());
-            for (int64_t i = 0; i < FF; ++i)
-                hv[(size_t) i] = situ(gu[(size_t) i], gu[(size_t) (FF + i)], (float) s.situ_beta,
-                                      (float) s.situ_linear_beta);
-            expert_rows(L.down, (int) eid, 0, N, exout.data());
-            for (int64_t i = 0; i < N; ++i) out[i] += w[(size_t) j] * exout[i];
+            // the fused gate/up matrix has 2*FF rows: row i is the gate, row FF+i the up
+            for (int64_t i = 0; i < FF; ++i) {
+                const float g = expert_row_dot(L.gu, (int) eid, i, normed.data(), rowbuf);
+                const float u = expert_row_dot(L.gu, (int) eid, FF + i, normed.data(), rowbuf);
+                hv[(size_t) i] = situ(g, u, (float) s.situ_beta, (float) s.situ_linear_beta);
+            }
+            for (int64_t i = 0; i < N; ++i)
+                out[i] += w[(size_t) j] * expert_row_dot(L.down, (int) eid, i, hv.data(), rowbuf);
         }
         convolve(out.data(), N, L.ffnconv, nullptr, sl, 2 * NKV * HD + N, tmp.data());
         for (int64_t i = 0; i < N; ++i) cur_in[i] = ffn_inp[i] + tmp[i];
@@ -674,7 +705,9 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
             if (pass == 0) { layer(ip, ip, cur.data(), blocks, nullptr, nullptr, false); continue; }
             const Loop& C = loops[(size_t) (ip - s.loop_start)];
             std::vector<float> message(4 * N);
-            mix(bank, bank_out.data(), dense_of(C.query), message.data());
+            const float* mq = dense_of(C.query);
+            for (int c = 0; c < 4; ++c)
+                mix(bank, bank_out.data(), mq + (size_t) c * N, message.data() + (size_t) c * N);
             layer(ip, il, cur.data(), blocks, message.data(), &C, true);
         }
     }
@@ -684,23 +717,23 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
     // ---- the head ----
     mix(blocks, cur.data(), out_query.data(), tmp.data());
     rms_norm(tmp.data(), out_norm.data(), hn.data(), N, eps);
-    std::vector<float> logits((size_t) s.vocab_padded);
+    std::vector<float> logits((size_t) s.vocab_padded), hrow((size_t) N);
     const size_t hrb = kc::native_row_bytes(head_type, N);
     if (hrb == 0) {
         err = "inkling2: the head has no host dequantizer";
         return false;
     }
-    for (int64_t i = 0; i < s.vocab_padded; ++i)
-        if (!kc::native_row_to_float(head_type, head_data + (size_t) i * hrb, logits.data() + i, N)) {
+    // the head's dot products, in F32 as mainline's ggml_prec_set_acc(F32).  A row is dequantized into its own
+    // scratch: `logits` holds one value per vocabulary row, not one row's N values.
+    const float cap = (float) s.final_logit_softcap;
+    for (int64_t i = 0; i < s.vocab_padded; ++i) {
+        if (!kc::native_row_to_float(head_type, head_data + (size_t) i * hrb, hrow.data(), N)) {
             err = "inkling2: cannot dequantize a head row";
             return false;
         }
-    // the head's dot products, in F32 as mainline's ggml_prec_set_acc(F32)
-    const float cap = (float) s.final_logit_softcap;
-    for (int64_t i = 0; i < s.vocab_unpadded; ++i) {
         double ss = 0;
-        for (int64_t d = 0; d < N; ++d) ss += (double) logits[(size_t) i * N + d] * hn[d];
-        float z = (float) ss;
+        for (int64_t d = 0; d < N; ++d) ss += (double) hrow[(size_t) d] * hn[d];
+        const float z = (float) ss;
         logits[(size_t) i] = cap > 0 ? cap * std::tanh(z / cap) : z;
     }
     last_logits_ = std::move(logits);

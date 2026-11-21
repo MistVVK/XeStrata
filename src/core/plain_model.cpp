@@ -3262,9 +3262,7 @@ bool PlainModel::cpu_run(const int32_t* tokens, int64_t n, int64_t pos, int rows
         if (!inkling_->run(tokens, n, pos, one.data(), err)) return false;
         for (int r = 0; r < rows; ++r)
             std::memcpy(cpu_logits_.data() + (size_t) r * n_vocab_, one.data(), (size_t) n_vocab_ * 4);
-        return true;
-    }
-    if (!cpu_->run(tokens, n, pos, rows, cpu_logits_.data(), err)) return false;
+    } else if (!cpu_->run(tokens, n, pos, rows, cpu_logits_.data(), err)) return false;
     k::SamplerParams sp = sampler_;
     sp.counter = (uint64_t) (pos + n - rows);
     sp.logit_bias = cpu_bias_.empty() ? nullptr : cpu_bias_.data();
@@ -3332,7 +3330,7 @@ bool PlainModel::set_allowed(const uint32_t* row, std::string& err) {
 }
 
 bool PlainModel::set_allowed_rows(const uint32_t* rows, int T, std::string& err) {
-    if (cpu_ != nullptr) {
+    if (cpu_ != nullptr || inkling_ != nullptr) {
         if (rows != nullptr && (T < 1 || T > opt_.max_t)) { err = "plain model: mask rows out of range"; return false; }
         const size_t words = (size_t) (n_vocab_ + 31) / 32;
         cpu_allowed_.assign(rows, rows == nullptr ? rows : rows + words * (size_t) T);
@@ -3783,6 +3781,10 @@ bool PlainModel::restore_parts(const Snapshot& snap, bool recurrent_only, std::s
 }
 
 bool PlainModel::reset(std::string& err) {
+    if (inkling_ != nullptr) {
+        inkling_->reset();
+        return true;
+    }
     if (cpu_ != nullptr) {
         cpu_->reset();
         return true;
@@ -4635,7 +4637,7 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
         err = "plain model: the window is out of range";
         return false;
     }
-    if (cpu_ != nullptr) return cpu_run(tokens, T, pos, T, out, logits, err);
+    if (cpu_ != nullptr || inkling_ != nullptr) return cpu_run(tokens, T, pos, T, out, logits, err);
     const float* hand = nullptr;   // each stage's rows to the next
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
@@ -4656,7 +4658,7 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
 
 bool PlainModel::forward_run(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits,
                              std::string& err, const std::function<void(int64_t)>& progress) {
-    if (cpu_ != nullptr) {   // one run; out and logits the last window's rows, as the windows would leave them
+    if (cpu_ != nullptr || inkling_ != nullptr) {   // one run; out and logits the last window's rows
         if (n < 1) { err = "plain model: no tokens to run"; return false; }
         const int last = (int) ((n - 1) % opt_.max_t) + 1;
         if (!cpu_run(tokens, n, pos, last, out, logits, err)) return false;
