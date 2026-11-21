@@ -821,6 +821,14 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
         if isinstance(n, int) and not isinstance(n, bool) and n >= 1:
             args[args.index("--batch") + 1] = str(min(n, SPLIT_MAX_LANES))
         return []
+    if cfg.get("arch") in ("inkling2_loop", "inkling2", "inkling2_loop_text"):
+        # Inkling-2-Mini supports native 1..64 continuous batching (`--parallel 1|4|8|32|64`)!
+        if "--parallel" in args or "--batch" in args or "--slots" in args:
+            return []
+        n = cfg.get("parallel")
+        if isinstance(n, bool) or not isinstance(n, int) or n <= 1:
+            return []
+        return ["--parallel", str(min(n, 64))]
     if "--batch" in args or "--slots" in args:
         return []
     n = cfg.get("parallel")

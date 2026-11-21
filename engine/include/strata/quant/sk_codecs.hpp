@@ -21,6 +21,8 @@ enum class SkCode : uint8_t {
     S5_K  = 5,  // 166 B (6 B hdr + 160 B 5-bit symmetric half-integer q in 0..31)
     S6_K  = 6,  // 198 B (6 B hdr + 192 B 6-bit symmetric half-integer q in 0..63)
     S8_K  = 8,  // 262 B (6 B hdr + 256 B 8-bit signed int8 q in [-127..127])
+    SF4   = 15, // Lossless NVFP4: E2M1 nibbles + F8_E4M3/16w block scales + F32 amax/denom (.strata v1.1)
+    MX8   = 16, // Lossless MXFP8: F8_E4M3 weights + UE8M0/32w block scales (.strata v1.1)
 };
 
 constexpr size_t superblock_bytes(SkCode code) noexcept {
@@ -65,7 +67,69 @@ void gemm_sk_q8_1(
     size_t ncols,
     size_t m) noexcept;
 
-// Runtime ISA name ("avx512-vnni", "avx2", or "scalar")
+// Runtime ISA name ("avx512-vnni", "avx2", "neon-dotprod", or "scalar")
 const char* active_sk_isa() noexcept;
+
+// --- .strata v1.1 Lossless Native Codecs (SF4=NVFP4 & MX8=MXFP8) & Paired 2-Row Down (SB_0..SB_8) ---
+
+// Decode 1 row of ncols (ncols % 16 == 0) SF4 (NVFP4) weights:
+// packed_e2m1: [ncols/2] uint8 (low nibble = even col, high nibble = odd col)
+// scales_e4m3: [ncols/16] uint8 (F8_E4M3FN)
+// outer_scale = amax / denom
+void dequant_sf4_row(
+    const uint8_t* packed_e2m1,
+    const uint8_t* scales_e4m3,
+    float outer_scale,
+    float* out,
+    size_t ncols) noexcept;
+
+// Fast dot product of 1 SF4 row against float32 x (uses 1-instruction pshufb/vtbl register LUT on AVX512/AVX2/NEON)
+float dot_sf4_f32_row(
+    const uint8_t* packed_e2m1,
+    const uint8_t* scales_e4m3,
+    float outer_scale,
+    const float* x,
+    size_t ncols) noexcept;
+
+// Decode 1 row of ncols (ncols % 32 == 0) MX8 (MXFP8) weights:
+// weights_e4m3: [ncols] uint8 (F8_E4M3FN)
+// scales_ue8m0: [ncols/32] uint8 (2^(e - 127))
+void dequant_mx8_row(
+    const uint8_t* weights_e4m3,
+    const uint8_t* scales_ue8m0,
+    float* out,
+    size_t ncols) noexcept;
+
+float dot_mx8_f32_row(
+    const uint8_t* weights_e4m3,
+    const uint8_t* scales_ue8m0,
+    const float* x,
+    size_t ncols) noexcept;
+
+// Paired 2-row S_K decode/GEMV/GEMM for ncols % 256 == 128 (e.g. Inkling 2 Mini w2 [2304, 1152]):
+// Each pair (2r, 2r+1) packs 2 * ncols weights into (2*ncols)/256 exact super-blocks (SB_0..SB_8).
+void dequant_paired2_sk_rows(
+    const uint8_t* pair_raw,
+    SkCode code,
+    float* out_row0,
+    float* out_row1,
+    size_t ncols) noexcept;
+
+void gemv_paired2_sk_q8_1(
+    const uint8_t* weights,
+    SkCode code,
+    const BlockQ8_1_G64* x,
+    float* out,
+    size_t nrows,  // even
+    size_t ncols) noexcept;
+
+void gemm_paired2_sk_q8_1(
+    const uint8_t* weights,
+    SkCode code,
+    const BlockQ8_1_G64* xs,  // [m, ncols/64]
+    float* out,               // [m, nrows]
+    size_t nrows,             // even
+    size_t ncols,
+    size_t m) noexcept;
 
 }  // namespace strata::quant::sk

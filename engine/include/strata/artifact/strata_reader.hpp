@@ -65,8 +65,10 @@ public:
     bool is_open() const noexcept { return fp_ != nullptr; }
 
     const StrataHeader& header() const noexcept { return hdr_; }
+    uint8_t format_minor() const noexcept { return static_cast<uint8_t>(hdr_.flags & 0xFFu); }
     const std::string& manifest_json() const noexcept { return manifest_json_; }
     const std::vector<StrataExpertEntry>& expert_directory() const noexcept { return experts_; }
+    const std::vector<uint16_t>& vram_load_order() const noexcept { return vram_load_order_; }
 
     bool read_section(uint32_t section_id, std::vector<uint8_t>& out, std::string& err) const;
     bool read_at(uint64_t abs_offset, void* dst, size_t bytes, std::string& err) const;
@@ -79,6 +81,7 @@ private:
     StrataHeader hdr_{};
     std::string manifest_json_;
     std::vector<StrataExpertEntry> experts_;
+    std::vector<uint16_t> vram_load_order_;
 };
 
 }  // namespace strata::artifact

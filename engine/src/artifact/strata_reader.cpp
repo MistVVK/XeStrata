@@ -27,6 +27,7 @@ void StrataFileReader::close() {
     }
     manifest_json_.clear();
     experts_.clear();
+    vram_load_order_.clear();
 }
 
 bool StrataFileReader::open(const std::string& path, std::string& err) {
@@ -109,21 +110,37 @@ bool StrataFileReader::open(const std::string& path, std::string& err) {
         }
     }
 
-    // Load Section 3 expert directory (if present)
+    // Load Section 3 expert directory (and optional v1.1 vram_load_order priority table when section[3].flags & 1)
     if (hdr_.sections[3].byte_length > 0) {
         std::vector<uint8_t> s3;
         if (!read_section(3, s3, err)) {
             close();
             return false;
         }
-        if (s3.size() % sizeof(StrataExpertEntry) != 0) {
-            err = "Section 3 byte_length not a multiple of 32 B StrataExpertEntry";
-            close();
-            return false;
+        const bool has_vram_order = ((hdr_.sections[3].flags & 1u) != 0);
+        if (has_vram_order) {
+            constexpr size_t kEntryPlusOrder = sizeof(StrataExpertEntry) + sizeof(uint16_t);
+            if (s3.size() % kEntryPlusOrder != 0) {
+                err = "Section 3 v1.1 byte_length not a multiple of 34 B (32 B entry + 2 B vram_load_order)";
+                close();
+                return false;
+            }
+            const size_t n = s3.size() / kEntryPlusOrder;
+            experts_.resize(n);
+            vram_load_order_.resize(n);
+            const size_t dir_bytes = n * sizeof(StrataExpertEntry);
+            std::memcpy(experts_.data(), s3.data(), dir_bytes);
+            std::memcpy(vram_load_order_.data(), s3.data() + dir_bytes, n * sizeof(uint16_t));
+        } else {
+            if (s3.size() % sizeof(StrataExpertEntry) != 0) {
+                err = "Section 3 byte_length not a multiple of 32 B StrataExpertEntry";
+                close();
+                return false;
+            }
+            const size_t n = s3.size() / sizeof(StrataExpertEntry);
+            experts_.resize(n);
+            std::memcpy(experts_.data(), s3.data(), s3.size());
         }
-        const size_t n = s3.size() / sizeof(StrataExpertEntry);
-        experts_.resize(n);
-        std::memcpy(experts_.data(), s3.data(), s3.size());
     }
 
     return true;

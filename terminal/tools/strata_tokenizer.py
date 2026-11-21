@@ -83,6 +83,19 @@ DEEPSEEK3_PATTERNS = (
 )
 
 
+# Inkling-2-Mini pre-tokenizer: o200k regex before byte-level BPE with ignore_merges.
+O200K_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+O200K_PRES = ("gpt-4o", "inkling", "inkling2", "o200k")
+
+
 # The `qwen2` pre-tokenizer (Qwen2 / Qwen3-Next; llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2,
 # `.ref`-equivalent src/llama-vocab.cpp L391-398, fetched master 2026-11-12).  It is the `qwen35` pattern
 # WITHOUT `p{M}`: same contraction classes, same digit/punctuation/whitespace arms.  The two families differ
@@ -125,7 +138,7 @@ class UnknownPreTokenizer(ValueError):
 
 
 def pre_tokenizer_kind(pre) -> str | None:
-    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "qwen2", "deepseek3", or
+    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "qwen2", "deepseek3", "inkling2", or
     None for a type this file does not know.  An empty or missing value is the qwen35 default, as it always was."""
     p = "qwen35" if pre is None or pre == "" else str(pre)
     if p == "qwen35":
@@ -134,6 +147,8 @@ def pre_tokenizer_kind(pre) -> str | None:
         return "qwen2"
     if p.startswith("deepseek"):
         return "deepseek3"
+    if p in O200K_PRES:
+        return "inkling2"
     return None
 
 
@@ -142,6 +157,7 @@ class Tokenizer:
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
         self.tokens = tokens
         self.pre = pre
+        self.ignore_merges = pre in O200K_PRES
         if pre_tokenizer_kind(pre) is None:
             # Not a fallback: another model's pre-tokenizer splits text differently, so encoding with the qwen35 rule would
             # change every prompt without any error (llama.cpp has one rule per `tokenizer.ggml.pre` type for the same reason).
@@ -169,6 +185,9 @@ class Tokenizer:
             self._split = lambda text: _sequence_findall(seq, text)
         elif pre_tokenizer_kind(pre) == "qwen2":
             self._re = regex.compile(QWEN2_PATTERN)
+            self._split = self._re.findall
+        elif pre_tokenizer_kind(pre) == "inkling2":
+            self._re = regex.compile(O200K_PATTERN)
             self._split = self._re.findall
         else:
             self._re = regex.compile(QWEN35_PATTERN)
@@ -311,12 +330,15 @@ class Tokenizer:
             got = cache.get(piece)
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
-                got = []
-                for tok in self._bpe(mapped):
-                    i = self.ids.get(tok)
-                    if i is None:
-                        raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
-                    got.append(i)
+                if self.ignore_merges and mapped in self.ids:
+                    got = [self.ids[mapped]]
+                else:
+                    got = []
+                    for tok in self._bpe(mapped):
+                        i = self.ids.get(tok)
+                        if i is None:
+                            raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+                        got.append(i)
                 if len(cache) < self.PIECE_CACHE_MAX:
                     cache[piece] = got
             out.extend(got)

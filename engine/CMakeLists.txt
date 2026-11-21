@@ -830,6 +830,12 @@ if(STRATA_BUILD_SPLIT)
   add_subdirectory(src/split)
 endif()
 
+# ---- strata-inkling: standalone Inkling-2-Mini (.strata v1.1) shape-engine binary (CMake component `inkling2`) ----
+option(STRATA_BUILD_INKLING2 "Build strata-inkling: Inkling-2-Mini (.strata v1.1) looped MoE engine + Vision + 1..64 continuous batching" ON)
+if(STRATA_BUILD_INKLING2 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2/CMakeLists.txt")
+  add_subdirectory(src/inkling2)
+endif()
+
 # What this configure registered, so a missing capability is a stated skip (tools/check prints this line too).
 if(STRATA_BUILD_TESTS)
   set(_strata_test_kinds "cpu")
