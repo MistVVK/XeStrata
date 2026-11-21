@@ -122,16 +122,17 @@ __global__ void __launch_bounds__(256) k_ink_attn_res_mix(
     const float* __restrict__ nw2 = nullptr) {
     const int m = blockIdx.x;
     if (m >= M) return;
-    const int tid = threadIdx.x;
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
     const int S = states.count;
     const int D4 = D >> 2;
     __shared__ float sh[32];
-    __shared__ float s_inv[8];
+    __shared__ float s_wred[8][5][8];  // [s][0=ss, 1..4=dots[0..3]][warp 0..7] -> ONE barrier for ALL S x n_q!
     __shared__ float s_prob[4][8];
 
-    // Fused Pass 1+2: read each depth state ONCE to compute BOTH RMS inv scale AND all n_q query dot products (-33% DRAM traffic!)
+    // Fused Pass 1+2 with ONE single __syncthreads() across all S states and n_q queries!
     const float inv_sqrt_d = rsqrtf((float)D);
-    float sc_local[4][8];
     for (int s = 0; s < S; ++s) {
         const float4* sp4 = reinterpret_cast<const float4*>(states.p[s] + (size_t)m * D);
         float ss = 0.0f;
@@ -148,15 +149,33 @@ __global__ void __launch_bounds__(256) k_ink_attn_res_mix(
                 }
             }
         }
-        ss = block_sum(ss, sh);
-        const float inv = rsqrtf(ss / (float)D + kInkRmsEps);
-        if (tid == 0) s_inv[s] = inv;
-        for (int q = 0; q < n_q; ++q) {
-            float dsum = block_sum(dots[q], sh);
-            if (tid == 0) sc_local[q][s] = dsum * inv * inv_sqrt_d;
+        ss = warp_sum(ss);
+        if (lane == 0) s_wred[s][0][warp] = ss;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            if (q < n_q) {
+                float dq = warp_sum(dots[q]);
+                if (lane == 0) s_wred[s][1 + q][warp] = dq;
+            }
         }
     }
+    __syncthreads();
     if (tid == 0) {
+        float sc_local[4][8];
+        float s_inv[8];
+        for (int s = 0; s < S; ++s) {
+            float ss = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) ss += s_wred[s][0][w];
+            const float inv = rsqrtf(ss / (float)D + kInkRmsEps);
+            s_inv[s] = inv;
+            for (int q = 0; q < n_q; ++q) {
+                float dsum = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 8; ++w) dsum += s_wred[s][1 + q][w];
+                sc_local[q][s] = dsum * inv * inv_sqrt_d;
+            }
+        }
         for (int q = 0; q < n_q; ++q) {
             float mx = -1e30f;
             for (int s = 0; s < S; ++s) mx = fmaxf(mx, sc_local[q][s]);
@@ -1020,15 +1039,17 @@ struct InkMultiProj {
     int            count;
 };
 
-template <int MAX_M>
+// 256B-Coalesced 16-Lane Multi-Projection BF16 GEMV (8 output rows/CTA, 16 lanes x 16B uint4 = 256B!)
+// 2x wave occupancy on wo_ud (288 CTAs > 170 SMs!) + zero tiling at M=1 -> saturates 1,500+ GB/s GDDR7!
+template <int MAX_M, bool IS_FP16 = false>
 __global__ void __launch_bounds__(128) k_ink_gemv_multi_bf16(
     InkMultiProj mp,
     const float* __restrict__ X,     // [M, K] F32
     int M, int K) {
     const int tid  = threadIdx.x;
-    const int warp = tid >> 5;       // 0..3
-    const int lane = tid & 31;
-    const int grow = blockIdx.x * 4 + warp;
+    const int sub  = tid >> 4;       // 0..7 output rows per CTA
+    const int lg   = tid & 15;       // 0..15 lanes per row (16 x 16B = 256B coalesced!)
+    const int grow = blockIdx.x * 8 + sub;
 
     int pid = -1, lrow = 0;
     if (grow < mp.cumN[mp.count]) {
@@ -1044,7 +1065,7 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_bf16(
     const uint4* wr = (pid >= 0) ? reinterpret_cast<const uint4*>(reinterpret_cast<const uint16_t*>(mp.W[pid]) + (size_t)lrow * K) : nullptr;
     float acc[MAX_M] = {};
 
-    constexpr int KT = (MAX_M <= 8) ? 512 : 256;
+    constexpr int KT = (MAX_M == 1) ? 2304 : ((MAX_M <= 8) ? 576 : 256);
     __shared__ alignas(16) float s_x[MAX_M][KT];
     for (int k0 = 0; k0 < K; k0 += KT) {
         const int kl = min(KT, K - k0);
@@ -1058,12 +1079,20 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_bf16(
         if (pid >= 0) {
             const int kl8 = kl >> 3;
             const uint4* wrt = wr + (k0 >> 3);
-            for (int k8 = lane; k8 < kl8; k8 += 32) {
+            for (int k8 = lg; k8 < kl8; k8 += 16) {
                 const uint4 wv = wrt[k8];
-                const float2 w0 = bf16x2_to_f32x2(wv.x);
-                const float2 w1 = bf16x2_to_f32x2(wv.y);
-                const float2 w2 = bf16x2_to_f32x2(wv.z);
-                const float2 w3 = bf16x2_to_f32x2(wv.w);
+                float2 w0, w1, w2, w3;
+                if constexpr (IS_FP16) {
+                    w0 = __half22float2(*reinterpret_cast<const __half2*>(&wv.x));
+                    w1 = __half22float2(*reinterpret_cast<const __half2*>(&wv.y));
+                    w2 = __half22float2(*reinterpret_cast<const __half2*>(&wv.z));
+                    w3 = __half22float2(*reinterpret_cast<const __half2*>(&wv.w));
+                } else {
+                    w0 = bf16x2_to_f32x2(wv.x);
+                    w1 = bf16x2_to_f32x2(wv.y);
+                    w2 = bf16x2_to_f32x2(wv.z);
+                    w3 = bf16x2_to_f32x2(wv.w);
+                }
 #pragma unroll
                 for (int m = 0; m < MAX_M; ++m) {
                     if (m < M) {
@@ -1085,8 +1114,139 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_bf16(
 #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
         if (m < M) {
-            float v = warp_sum(acc[m]);
-            if (lane == 0) Yp[(size_t)m * Np + lrow] = v;
+            float v = acc[m];
+#pragma unroll
+            for (int o = 8; o >= 1; o >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, o);
+            if (lg == 0) Yp[(size_t)m * Np + lrow] = v;
+        }
+    }
+}
+
+// Zero-Extra-Launch 16-Lane M=1 Q8_ROW Multi-Projection GEMV (8 rows/CTA = 288 CTAs on wo_ud, inline L1 quantize -> eliminates 192 launches!)
+__global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row_m1(
+    InkMultiProj mp,
+    const float* __restrict__ X,     // [1, K] F32 (K <= 3072, multiple of 64)
+    int K) {
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int ng_tot = K >> 6;       // 36 for K=2304, 48 for K=3072
+    __shared__ alignas(16) uint32_t s_xq[3072 / 4];  // 3,072 B!
+    __shared__ float                s_xs[48];         // 192 B!
+    for (int g = warp; g < ng_tot; g += 4) {
+        const float* xp = X + g * 64;
+        const float v0 = xp[2 * lane], v1 = xp[2 * lane + 1];
+        const float am = warp_max(fmaxf(fabsf(v0), fabsf(v1)));
+        const float d  = am * (1.0f / 127.0f);
+        const float inv = d > 0.0f ? (127.0f / am) : 0.0f;
+        int8_t* dst = reinterpret_cast<int8_t*>(s_xq) + g * 64;
+        dst[2 * lane]     = (int8_t)max(-127, min(127, __float2int_rn(v0 * inv)));
+        dst[2 * lane + 1] = (int8_t)max(-127, min(127, __float2int_rn(v1 * inv)));
+        if (lane == 0) s_xs[g] = d;
+    }
+    __syncthreads();
+
+    const int sub  = tid >> 4;       // 0..7 output rows per CTA
+    const int lg   = tid & 15;       // 0..15 lanes per row (16 x 16B = 256B!)
+    const int grow = blockIdx.x * 8 + sub;
+    int pid = -1, lrow = 0;
+    if (grow < mp.cumN[mp.count]) {
+#pragma unroll
+        for (int p = 0; p < 5; ++p) {
+            if (p < mp.count && grow < mp.cumN[p + 1]) { pid = p; lrow = grow - mp.cumN[p]; break; }
+        }
+    }
+    if (pid < 0) return;
+    const float sc = reinterpret_cast<const float*>(mp.W[pid])[lrow];
+    const uint4* w16 = reinterpret_cast<const uint4*>(
+        reinterpret_cast<const int8_t*>(mp.W[pid] + (size_t)mp.N[pid] * 4) + (size_t)lrow * K);
+    const int n16 = K >> 4;
+    float acc = 0.0f;
+    for (int k16 = lg; k16 < n16; k16 += 16) {
+        const uint4 wv = w16[k16];
+        const uint4 xv = *reinterpret_cast<const uint4*>(s_xq + k16 * 4);
+        int32_t s = dp4a_i8(wv.x, xv.x, 0);
+        s = dp4a_i8(wv.y, xv.y, s);
+        s = dp4a_i8(wv.z, xv.z, s);
+        s = dp4a_i8(wv.w, xv.w, s);
+        acc = fmaf((float)s, s_xs[k16 >> 2], acc);
+    }
+#pragma unroll
+    for (int o = 8; o >= 1; o >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, o);
+    if (lg == 0) mp.Y[pid][lrow] = acc * sc;
+}
+
+// 256B-Coalesced 16-Lane Pre-Quantized Q8_ROW Multi-Projection GEMV (8 rows/CTA, pure dp4a_i8, ZERO per-CTA quantization!)
+template <int MAX_M>
+__global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row_preq(
+    InkMultiProj mp,
+    const InkQ8_1_G64* __restrict__ Xq,  // [M, K/64]
+    int M, int K) {
+    const int tid  = threadIdx.x;
+    const int sub  = tid >> 4;       // 0..7 output rows per CTA (2x wave occupancy!)
+    const int lg   = tid & 15;       // 0..15 lanes per row (16 x 16B = 256B!)
+    const int grow = blockIdx.x * 8 + sub;
+
+    int pid = -1, lrow = 0;
+    if (grow < mp.cumN[mp.count]) {
+#pragma unroll
+        for (int p = 0; p < 5; ++p) {
+            if (p < mp.count && grow < mp.cumN[p + 1]) {
+                pid = p;
+                lrow = grow - mp.cumN[p];
+                break;
+            }
+        }
+    }
+    const float sc = (pid >= 0) ? reinterpret_cast<const float*>(mp.W[pid])[lrow] : 0.0f;
+    const uint4* w16 = (pid >= 0) ? reinterpret_cast<const uint4*>(
+        reinterpret_cast<const int8_t*>(mp.W[pid] + (size_t)mp.N[pid] * 4) + (size_t)lrow * K) : nullptr;
+    float acc[MAX_M] = {};
+
+    constexpr int GT = (MAX_M <= 8) ? 36 : 18;
+    const int ng_tot = K >> 6;
+    __shared__ alignas(16) InkQ8_1_G64 s_xq[MAX_M][GT];
+    for (int g0 = 0; g0 < ng_tot; g0 += GT) {
+        const int ng = min(GT, ng_tot - g0);
+        const int n4 = ng * 5;
+        for (int m = 0; m < M; ++m) {
+            const uint4* sx = reinterpret_cast<const uint4*>(Xq + (size_t)m * ng_tot + g0);
+            uint4* dx = reinterpret_cast<uint4*>(s_xq[m]);
+            for (int i = tid; i < n4; i += 128) dx[i] = sx[i];
+        }
+        __syncthreads();
+        if (pid >= 0) {
+            const int n16 = ng * 4;
+            const uint4* wt = w16 + g0 * 4;
+            for (int k16 = lg; k16 < n16; k16 += 16) {
+                const uint4 wv = wt[k16];
+                const int g = k16 >> 2;
+                const int sub4 = (k16 & 3) * 16;
+#pragma unroll
+                for (int m = 0; m < MAX_M; ++m) {
+                    if (m < M) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(s_xq[m][g].qs + sub4);
+                        int32_t s = dp4a_i8(wv.x, xv.x, 0);
+                        s = dp4a_i8(wv.y, xv.y, s);
+                        s = dp4a_i8(wv.z, xv.z, s);
+                        s = dp4a_i8(wv.w, xv.w, s);
+                        acc[m] = fmaf((float)s, s_xq[m][g].d, acc[m]);
+                    }
+                }
+            }
+        }
+        if (g0 + GT < ng_tot) __syncthreads();
+    }
+    if (pid < 0) return;
+    float* Yp = mp.Y[pid];
+    const int Np = mp.N[pid];
+#pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            float v = acc[m];
+#pragma unroll
+            for (int o = 8; o >= 1; o >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, o);
+            if (lg == 0) Yp[(size_t)m * Np + lrow] = v * sc;
         }
     }
 }
@@ -1117,38 +1277,50 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row(
         reinterpret_cast<const int8_t*>(mp.W[pid] + (size_t)mp.N[pid] * 4) + (size_t)lrow * K) : nullptr;
     float acc[MAX_M] = {};
 
-    constexpr int KT = (MAX_M <= 8) ? 512 : 256;
-    __shared__ alignas(16) float s_x[MAX_M][KT];
+    // High-speed Q8_1 dp4a_i8 tiled GEMV: quantize X[m, k0..k0+KT-1] in 64-elem groups ONCE into shared memory (4x faster ALU!)
+    constexpr int KT = 512;
+    constexpr int NG = KT / 64;  // 8 groups of 64 elements
+    __shared__ alignas(16) uint32_t s_xq[MAX_M][KT / 4];   // MAX_M * 512 B (<= 8 KB for MAX_M=16!)
+    __shared__ float                s_xs[MAX_M][NG];       // MAX_M * 32 B
     for (int k0 = 0; k0 < K; k0 += KT) {
         const int kl = min(KT, K - k0);
-        const int kl4 = kl >> 2;
-        for (int m = 0; m < M; ++m) {
-            const float4* sx = reinterpret_cast<const float4*>(X + (size_t)m * K + k0);
-            float4* dx = reinterpret_cast<float4*>(s_x[m]);
-            for (int i = tid; i < kl4; i += 128) dx[i] = sx[i];
+        const int ng = kl >> 6;  // <= 8 groups of 64
+        // 4 warps cooperate to quantize M * ng groups of 64 floats (each warp handles 1 group of 64: 2 floats/lane!)
+        const int tot_g = M * ng;
+        for (int g_i = warp; g_i < tot_g; g_i += 4) {
+            const int m = g_i / ng;
+            const int g = g_i % ng;
+            const float* xp = X + (size_t)m * K + k0 + g * 64;
+            const float v0 = xp[2 * lane];
+            const float v1 = xp[2 * lane + 1];
+            const float am = warp_max(fmaxf(fabsf(v0), fabsf(v1)));
+            const float d  = am * (1.0f / 127.0f);
+            const float inv = d > 0.0f ? (127.0f / am) : 0.0f;
+            const int8_t q0 = (int8_t)max(-127, min(127, __float2int_rn(v0 * inv)));
+            const int8_t q1 = (int8_t)max(-127, min(127, __float2int_rn(v1 * inv)));
+            int8_t* dst = reinterpret_cast<int8_t*>(s_xq[m]) + g * 64;
+            dst[2 * lane]     = q0;
+            dst[2 * lane + 1] = q1;
+            if (lane == 0) s_xs[m][g] = d;
         }
         __syncthreads();
         if (pid >= 0) {
+            // 8 groups of 64 = 32 uint4s (each lane handles 1 uint4 = 16 weights -> group = k16 >> 2!)
             const int kl16 = kl >> 4;
             const uint4* wt = w16 + (k0 >> 4);
             for (int k16 = lane; k16 < kl16; k16 += 32) {
                 const uint4 wv = wt[k16];
-                const uint32_t u[4] = {wv.x, wv.y, wv.z, wv.w};
+                const int g = k16 >> 2;
+                const int b4 = k16 * 4;
 #pragma unroll
-                for (int q = 0; q < 4; ++q) {
-                    const uint32_t p = u[q];
-                    const float f0 = (float)(int8_t)(p & 0xFFu);
-                    const float f1 = (float)(int8_t)((p >> 8) & 0xFFu);
-                    const float f2 = (float)(int8_t)((p >> 16) & 0xFFu);
-                    const float f3 = (float)(int8_t)(p >> 24);
-                    const int idx4 = k16 * 4 + q;
-#pragma unroll
-                    for (int m = 0; m < MAX_M; ++m) {
-                        if (m < M) {
-                            const float4 xv = reinterpret_cast<const float4*>(s_x[m])[idx4];
-                            acc[m] = fmaf(f0, xv.x, acc[m]); acc[m] = fmaf(f1, xv.y, acc[m]);
-                            acc[m] = fmaf(f2, xv.z, acc[m]); acc[m] = fmaf(f3, xv.w, acc[m]);
-                        }
+                for (int m = 0; m < MAX_M; ++m) {
+                    if (m < M) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(s_xq[m] + b4);
+                        int32_t s = dp4a_i8(wv.x, xv.x, 0);
+                        s = dp4a_i8(wv.y, xv.y, s);
+                        s = dp4a_i8(wv.z, xv.z, s);
+                        s = dp4a_i8(wv.w, xv.w, s);
+                        acc[m] = fmaf((float)s, s_xs[m][g], acc[m]);
                     }
                 }
             }
@@ -1178,6 +1350,67 @@ __global__ void __launch_bounds__(256) k_ink_f32_to_bf16(const float* __restrict
         d2[i4 * 2 + 1] = __floats2bfloat162_rn(v.z, v.w);
     } else if (i4 == n4) {
         for (size_t i = n4 * 4; i < n; ++i) dst[i] = __float2bfloat16_rn(src[i]);
+    }
+}
+
+// Convert F32 -> FP16 (clamped to [-65504, 65504]) for Volta sm_70 / Turing sm_75 FP16 Tensor Cores
+__global__ void __launch_bounds__(256) k_ink_f32_to_fp16(const float* __restrict__ src, __half* __restrict__ dst, size_t n) {
+    const size_t i = (size_t)blockIdx.x * 256 + threadIdx.x;
+    if (i < n) {
+        float v = src[i];
+        v = fminf(fmaxf(v, -65504.0f), 65504.0f);
+        dst[i] = __float2half_rn(v);
+    }
+}
+
+// Convert BF16 -> FP16 (supports in-place dst == (__half*)src) for Volta sm_70 / Turing sm_75 FP16 TC
+__global__ void __launch_bounds__(256) k_ink_bf16_to_fp16(const __nv_bfloat16* __restrict__ src, __half* __restrict__ dst, size_t n) {
+    const size_t i = (size_t)blockIdx.x * 256 + threadIdx.x;
+    if (i < n) {
+        float v = __bfloat162float(src[i]);
+        v = fminf(fmaxf(v, -65504.0f), 65504.0f);
+        dst[i] = __float2half_rn(v);
+    }
+}
+
+// Convert BF16 -> F32 for Pascal sm_60 / sm_61 FP32 cuBLAS GEMM
+__global__ void __launch_bounds__(256) k_ink_bf16_to_f32(const __nv_bfloat16* __restrict__ src, float* __restrict__ dst, size_t n) {
+    const size_t i = (size_t)blockIdx.x * 256 + threadIdx.x;
+    if (i < n) dst[i] = __bfloat162float(src[i]);
+}
+
+// Per-row symmetric INT8 quantization of X [M, K] -> Xq [M, K] int8 + x_sc [M] (for 45 TOPS sm_61 / 220 TOPS sm_75 INT8 GEMM!)
+__global__ void __launch_bounds__(256) k_ink_quant_x_row_i8(
+    const float* __restrict__ X, int8_t* __restrict__ Xq, float* __restrict__ x_sc, int M, int K) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int tid = threadIdx.x;
+    const float* xp = X + (size_t)m * K;
+    float am = 0.0f;
+    for (int k = tid; k < K; k += 256) am = fmaxf(am, fabsf(xp[k]));
+    am = warp_max(am);
+    __shared__ float sm[8];
+    if ((tid & 31) == 0) sm[tid >> 5] = am;
+    __syncthreads();
+    am = fmaxf(fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3])),
+               fmaxf(fmaxf(sm[4], sm[5]), fmaxf(sm[6], sm[7])));
+    const float sc = am * (1.0f / 127.0f);
+    const float inv = sc > 0.0f ? (127.0f / am) : 0.0f;
+    int8_t* dst = Xq + (size_t)m * K;
+    for (int k = tid; k < K; k += 256) dst[k] = (int8_t)max(-127, min(127, __float2int_rn(xp[k] * inv)));
+    if (tid == 0) x_sc[m] = sc;
+}
+
+// In-place INT32 -> F32 scaling of cuBLAS INT8 GEMM output Y[M, N] = (float)Y_i32[m, n] * w_sc[n] * x_sc[m]
+__global__ void __launch_bounds__(256) k_ink_i32_to_f32_scale(
+    int32_t* __restrict__ Y_i32, float* __restrict__ Y_f32,
+    const float* __restrict__ w_sc, const float* __restrict__ x_sc, int M, int N) {
+    const size_t idx = (size_t)blockIdx.x * 256 + threadIdx.x;
+    const size_t tot = (size_t)M * N;
+    if (idx < tot) {
+        const int m = (int)(idx / (size_t)N);
+        const int n = (int)(idx % (size_t)N);
+        Y_f32[idx] = (float)Y_i32[idx] * w_sc[n] * x_sc[m];
     }
 }
 

@@ -128,7 +128,7 @@ public:
         const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * strata::ink::kInkKVDim * bpe
                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
                                   + (size_t)8 * max_slots_ * 256 * strata::ink::kInkKVDim * bpe;
-        const size_t min_reserve_bytes = min_kv_bytes + (1600ull << 20);
+        const size_t min_reserve_bytes = min_kv_bytes + ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20) : (320ull << 20));
 
         // Load .strata v1.1 trunk + experts (100% VRAM or 3x loop-weighted vram_load_order!)
         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
@@ -144,7 +144,7 @@ public:
 
         if (opts.enable_dspark && model_.man.has_dspark) {
             dspark_ = std::make_unique<strata::ink::InkDSpark>(*runner_);
-            dspark_->init(eff_max_ctx_, 256);
+            dspark_->init(eff_max_ctx_, 512);
         }
 
         // Allocate snapshot buffer (3.83 MB) + selected hidden gather buffers + pinned D2H logits staging

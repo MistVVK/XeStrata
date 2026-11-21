@@ -39,8 +39,19 @@ else
     SM120A_FLAGS="-gencode arch=compute_120a,code=sm_120a"
 fi
 
-INC="-I$SCRIPT_DIR -I$REPO_ROOT/engine/include -I$REPO_ROOT/engine/src/hy4flash/run"
+INC="-I$SCRIPT_DIR -I$REPO_ROOT/engine/include -I$REPO_ROOT/engine/src/hy4flash/run -I$REPO_ROOT/engine/third_party/zstd-dec -I$REPO_ROOT/engine/third_party/zstd-dec/common -I$REPO_ROOT/engine/third_party/zstd-dec/decompress"
 COMMON_FLAGS="-O3 -std=c++20 --expt-relaxed-constexpr -Xcompiler -fPIC"
+
+echo "== Compiling vendored zstd-dec =="
+ZSTD_OBJS=""
+for f in "$REPO_ROOT/engine/third_party/zstd-dec/common/"*.c "$REPO_ROOT/engine/third_party/zstd-dec/decompress/"*.c; do
+    base="$(basename "$f" .c)"
+    obj="$OUT_DIR/zstd_${base}.o"
+    if [ ! -f "$obj" ]; then
+        gcc -O3 -fPIC -DZSTD_DISABLE_ASM=1 -I"$REPO_ROOT/engine/third_party/zstd-dec" -I"$REPO_ROOT/engine/third_party/zstd-dec/common" -I"$REPO_ROOT/engine/third_party/zstd-dec/decompress" -c "$f" -o "$obj"
+    fi
+    ZSTD_OBJS="$ZSTD_OBJS $obj"
+done
 
 echo "== Compiling ink_moe_fp4_sm120.cu ($SM120A_FLAGS) =="
 $NVCC $COMMON_FLAGS $SM120A_FLAGS $INC -c "$SCRIPT_DIR/ink_moe_fp4_sm120.cu" -o "$OUT_DIR/ink_moe_fp4_sm120.o"
@@ -52,6 +63,6 @@ echo "== Building ink_kernel_test ($PORTABLE_FLAGS) =="
 $NVCC $COMMON_FLAGS $PORTABLE_FLAGS $INC "$SCRIPT_DIR/ink_kernel_test.cu" "$OUT_DIR/ink_moe_fp4_sm120.o" -lcublas -o "$OUT_DIR/ink_kernel_test"
 
 echo "== Building strata-inkling-cuda ($PORTABLE_FLAGS) =="
-$NVCC $COMMON_FLAGS $PORTABLE_FLAGS $INC "$SCRIPT_DIR/ink_cuda_main.cu" "$OUT_DIR/ink_moe_fp4_sm120.o" "$OUT_DIR/strata_reader.o" -lcublas -lzstd -o "$OUT_DIR/strata-inkling-cuda"
+$NVCC $COMMON_FLAGS $PORTABLE_FLAGS $INC "$SCRIPT_DIR/ink_cuda_main.cu" "$OUT_DIR/ink_moe_fp4_sm120.o" "$OUT_DIR/strata_reader.o" $ZSTD_OBJS -lcublas -o "$OUT_DIR/strata-inkling-cuda"
 
 ls -lh "$OUT_DIR/ink_kernel_test" "$OUT_DIR/strata-inkling-cuda"

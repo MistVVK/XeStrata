@@ -225,4 +225,101 @@ inline int ink_spec_step_block8(
     return n_emit;
 }
 
+// Build 2-branch Markov Beam Tree (M <= 12..16 nodes) from DSpark top-2 candidates per slot!
+// Main chain: nodes 0..n_draft (anchor + primary chain); runner-up top2[s] attached as second child of node s when p2 >= thr!
+inline InkTreeSpec make_beam_tree(
+    int32_t anchor, const int32_t* top2_ids, const float* top2_probs,
+    int n_draft, int max_nodes = 12, float p2_thr = 0.05f) {
+    InkTreeSpec tr{};
+    tr.M = 1 + n_draft;
+    tr.tok[0] = anchor;
+    tr.parent[0] = -1;
+    tr.depth[0] = 0;
+    for (int i = 0; i < n_draft; ++i) {
+        tr.tok[i + 1] = top2_ids[2 * i];
+        tr.parent[i + 1] = (int8_t)i;
+        tr.depth[i + 1] = (uint8_t)(i + 1);
+    }
+    // Attach runner-up branches on early uncertain slots (depth 1..4) up to max_nodes (<= 16)
+    const int cap = std::min(16, max_nodes);
+    for (int s = 0; s < std::min(n_draft, 5) && tr.M < cap; ++s) {
+        const int32_t alt = top2_ids[2 * s + 1];
+        if (alt != top2_ids[2 * s] && top2_probs[2 * s + 1] >= p2_thr) {
+            const int idx = tr.M++;
+            tr.tok[idx] = alt;
+            tr.parent[idx] = (int8_t)s;
+            tr.depth[idx] = (uint8_t)(s + 1);
+        }
+    }
+    tr.build();
+    return tr;
+}
+
+// Run 1 lossless Tree-12/16 speculative decode step (exact greedy tree walk -> 100.000% bitwise parity with plain M=1!)
+inline int ink_spec_step_tree(
+    InkCudaRunner& runner,
+    InkDSpark& dspark,
+    int32_t& cur_tok,
+    int& pos,
+    int n_draft,
+    int max_nodes,
+    int32_t* out_emitted,
+    InkSpecStats& st) {
+    double t0 = now_s();
+    int32_t draft_ids[8] = {};
+    float draft_conf[8] = {};
+    dspark.draft_block8(cur_tok, pos, draft_ids, draft_conf);
+    double t1 = now_s();
+
+    InkTreeSpec tr = make_beam_tree(cur_tok, dspark.h_top2_ids, dspark.h_top2_probs, n_draft, max_nodes);
+    runner.forward_tree_verify(tr, pos, 0, true);
+    int32_t target_next[16] = {};
+    runner.head_argmax_exact(tr.M, target_next);
+    double t2 = now_s();
+
+    // Exact greedy walk down the verified tree: match ANY child of cur_node whose token == target_next[cur_node]!
+    int32_t path[16] = {};
+    int n_acc_nodes = 0;
+    int n_emit = 0;
+    int cur_node = 0;
+    while (true) {
+        path[n_acc_nodes++] = cur_node;
+        const int32_t tok_next = target_next[cur_node];
+        out_emitted[n_emit++] = tok_next;
+        int next_child = -1;
+        for (int j = cur_node + 1; j < tr.M; ++j) {
+            if (tr.parent[j] == cur_node && tr.tok[j] == tok_next) {
+                next_child = j;
+                break;
+            }
+        }
+        if (next_child >= 0) cur_node = next_child;
+        else break;
+    }
+
+    INK_CK(cudaMemcpyAsync(runner.d_acc_path, path, (size_t)n_acc_nodes * 4, cudaMemcpyHostToDevice, runner.st));
+    k_ink_commit_sconv_all48<<<dim3(kInkVisits, 4), 256, 0, runner.st>>>(
+        runner.d_sconv_pool_arr, runner.d_stage_sconv, runner.d_acc_path, n_acc_nodes, 0, runner.max_slots);
+    k_ink_commit_kv_all48<<<dim3(kInkVisits, kInkKVHeads), 128, 0, runner.st>>>(
+        runner.d_kv_desc_arr, runner.d_stage_k, runner.d_stage_v, runner.d_acc_path, pos, n_acc_nodes, 0);
+    for (int t = 0; t < 4; ++t) {
+        k_ink_compact_taps<<<n_acc_nodes, 256, 0, runner.st>>>(runner.d_taps[t], runner.d_taps_compact[t], runner.d_acc_path, n_acc_nodes);
+    }
+    dspark.ingest_taps_from(runner.d_taps_compact, pos, n_acc_nodes);
+    double t3 = now_s();
+
+    pos += n_acc_nodes;
+    cur_tok = out_emitted[n_emit - 1];
+
+    st.iters++;
+    st.tokens += n_emit;
+    st.drafted += (tr.M - 1);
+    st.accepted += (n_acc_nodes - 1);
+    st.t_draft_ms += (t1 - t0) * 1000.0;
+    st.t_verify_ms += (t2 - t1) * 1000.0;
+    st.t_commit_ms += (t3 - t2) * 1000.0;
+    if (n_emit < 17) st.hist[n_emit]++;
+    return n_emit;
+}
+
 }  // namespace strata::ink

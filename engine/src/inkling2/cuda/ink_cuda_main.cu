@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
     runner.init(parallel, max_ctx, chunk, kvd);
 
     InkDSpark dspark(runner);
-    if (use_dspark && model.man.has_dspark) dspark.init(max_ctx, 256);
+    if (use_dspark && model.man.has_dspark) dspark.init(max_ctx, 512);
 
     // Build prompt token IDs (realistic default prompt if --tokens not passed)
     std::vector<int32_t> prompt;
@@ -231,6 +231,50 @@ int main(int argc, char** argv) {
                 if (first_diff >= 0) {
                     std::printf("    plain[%d]=%d vs spec[%d]=%d\n", first_diff, plain_toks[first_diff], first_diff, spec_toks[first_diff]);
                 }
+            }
+        }
+        // Also benchmark Lossless Tree-12 2-branch Markov Beam!
+        {
+            runner.reset_slot(0);
+            for (int off = 0; off < P; off += chunk) {
+                const int n = std::min(chunk, P - off);
+                runner.forward_seq(prompt.data() + off, off, n, 0, true);
+                dspark.ingest_taps(off, n);
+            }
+            INK_CK(cudaStreamSynchronize(runner.st));
+            std::vector<int32_t> spec_toks;
+            spec_toks.reserve(gen_n + 16);
+            spec_toks.push_back(first_tok);
+            int32_t cur = first_tok;
+            int pos = P;
+            InkSpecStats warm_st{}, st{};
+            int32_t emit[16];
+            int n0 = ink_spec_step_tree(runner, dspark, cur, pos, 7, 12, emit, warm_st);
+            for (int i = 0; i < n0 && (int)spec_toks.size() < gen_n; ++i) spec_toks.push_back(emit[i]);
+            INK_CK(cudaStreamSynchronize(runner.st));
+            double t_sp0 = now_s();
+            while ((int)spec_toks.size() < gen_n) {
+                int ne = ink_spec_step_tree(runner, dspark, cur, pos, 7, 12, emit, st);
+                for (int i = 0; i < ne && (int)spec_toks.size() < gen_n; ++i) spec_toks.push_back(emit[i]);
+            }
+            INK_CK(cudaStreamSynchronize(runner.st));
+            double dt_sp = now_s() - t_sp0;
+            const int meas_toks = (int)st.tokens;
+            const double mean_acc = st.iters > 0 ? (double)st.tokens / (double)st.iters : 0.0;
+            std::printf("[DSPARK TREE-12 c=1] %d tokens (%ld iters, %.2f tok/iter) in %.2f ms -> %.1f tps (draft=%.2fms verify=%.2fms commit=%.2fms /iter)\n",
+                        meas_toks, st.iters, mean_acc, dt_sp * 1000.0,
+                        (double)meas_toks / dt_sp,
+                        st.t_draft_ms / std::max(1L, st.iters),
+                        st.t_verify_ms / std::max(1L, st.iters),
+                        st.t_commit_ms / std::max(1L, st.iters));
+            if (check_parity) {
+                int match = 0, cmp_n = std::min((int)plain_toks.size(), (int)spec_toks.size());
+                int first_diff = -1;
+                for (int i = 0; i < cmp_n; ++i) {
+                    if (plain_toks[i] == spec_toks[i]) ++match;
+                    else if (first_diff < 0) first_diff = i;
+                }
+                std::printf("  [PARITY vs PLAIN] %d/%d EXACT (first_diff=%d)\n", match, cmp_n, first_diff);
             }
         }
     }

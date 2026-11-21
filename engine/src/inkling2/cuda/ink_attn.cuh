@@ -46,7 +46,8 @@ struct InkKvVisitDesc {
 __global__ void __launch_bounds__(128) k_ink_kv_write(
     const float* __restrict__ k_in,     // [M, 8, 128]
     const float* __restrict__ v_in,     // [M, 8, 128]
-    const int32_t* __restrict__ slots,  // [M] (null -> slot 0)
+    const int32_t* __restrict__ slots,  // [M] (null -> slot0)
+    int slot0,
     const int32_t* __restrict__ pos,    // [M]
     InkKvVisitDesc kv,
     int M) {
@@ -55,7 +56,7 @@ __global__ void __launch_bounds__(128) k_ink_kv_write(
     const int d = threadIdx.x; // 0..127
     if (m >= M || h >= kInkKVHeads) return;
 
-    const int sl = slots ? slots[m] : 0;
+    const int sl = slots ? slots[m] : slot0;
     const int p = pos[m];
     const int p_idx = kv.is_swa ? (p % kv.cap_pos) : p;
     const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + h) * kInkHeadDim;
@@ -80,6 +81,11 @@ __global__ void __launch_bounds__(128) k_ink_kv_write(
         const __nv_fp8_e4m3 qv(fminf(fmaxf(vv_val / sc_v, -448.0f), 448.0f));
         kv.k_f8[base + d] = qk.__x;
         kv.v_f8[base + d] = qv.__x;
+        if (d == 0) {
+            const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + h;
+            kv.k_sc[sidx] = sc_k;
+            kv.v_sc[sidx] = sc_v;
+        }
     }
 }
 
@@ -410,14 +416,15 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa(
 // Grid: (8 KV heads, kInkAttnSplits=16 splits, M tokens) = 128*M CTAs across 170 SMs!
 // Each CTA reads K and V ONCE for KV head kh and attends all 3 Q heads (3*kh + 0..2)!
 // ============================================================================
-constexpr int kInkAttnSplits = 16;
+constexpr int kInkAttnSplits = 8;
 
 __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     const float* __restrict__ q,          // [M, 24, 128]
     const float* __restrict__ rel_table,  // [M, 24, 1025]
     const float* __restrict__ sinks,      // [M, 24]
     InkKvVisitDesc kv,
-    const int32_t* __restrict__ slots,    // [M] (null -> slot 0)
+    const int32_t* __restrict__ slots,    // [M] (null -> slot0)
+    int slot0,
     const int32_t* __restrict__ q_pos,    // [M]
     const float* __restrict__ tree_k,     // [M, 8, 128] optional
     const float* __restrict__ tree_v,     // [M, 8, 128] optional
@@ -429,14 +436,14 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     float* __restrict__ part_o,           // [M, 24, kInkAttnSplits, 128]
     int M) {
     const int kh = blockIdx.x;  // 0..7
-    const int sp = blockIdx.y;  // 0..15
+    const int sp = blockIdx.y;  // 0..kInkAttnSplits-1
     const int m  = blockIdx.z;  // 0..M-1
     if (kh >= kInkKVHeads || sp >= kInkAttnSplits || m >= M) return;
 
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;  // 0..3
     const int lane = tid & 31;  // 0..31 -> dims 4*lane .. 4*lane+3
-    const int sl   = slots ? slots[m] : 0;
+    const int sl   = slots ? slots[m] : slot0;
     const int qp   = q_pos[m];
     const float scale = 0.08838834764831845f;
 
@@ -605,6 +612,7 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_gqa3(
     const float* __restrict__ gate_attn,  // [M, 24, 128]
     InkKvVisitDesc kv,
     const int32_t* __restrict__ slots,    // [M]
+    int slot0,
     const int32_t* __restrict__ q_pos,    // [M]
     float* __restrict__ out,              // [M, 24, 128]
     int M) {
@@ -615,7 +623,7 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_gqa3(
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int sl   = slots ? slots[m] : 0;
+    const int sl   = slots ? slots[m] : slot0;
     const int qp   = q_pos[m];
     const float scale = 0.08838834764831845f;
 
@@ -714,25 +722,39 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_gqa3(
 }
 
 // ============================================================================
-// Tensor Core Prefill Flash-GQA Helpers (cuBLAS BF16 StridedBatched QK^T & PV -> 15x faster prefill at M=512..2048!)
+// Tensor Core Prefill Flash-GQA Helpers (cuBLAS BF16 on sm_80+ and FP16 on sm_60..sm_75 -> 6-15x faster prefill!)
 // ============================================================================
-// Transpose Q [M, 24, 128] -> q_bhsd [24, M, 128] BF16, and KV [M, 8, 128] (or committed KV [k0..k1-1]) -> [24, K, 128] BF16!
+template <bool USE_FP16>
+__device__ __forceinline__ uint16_t pf_cvt_from_f32(float v) {
+    if constexpr (USE_FP16) {
+        v = fminf(fmaxf(v, -65504.0f), 65504.0f);
+        __half h = __float2half_rn(v);
+        return *reinterpret_cast<const uint16_t*>(&h);
+    } else {
+        __nv_bfloat16 b = __float2bfloat16_rn(v);
+        return *reinterpret_cast<const uint16_t*>(&b);
+    }
+}
+
+template <bool USE_FP16 = false>
 __global__ void __launch_bounds__(128) k_ink_pf_pack_q(
     const float* __restrict__ q,        // [M, 24, 128]
-    __nv_bfloat16* __restrict__ q_out,  // [24, M, 128]
+    void* __restrict__ q_out_v,         // [24, M, 128] BF16 or FP16
     int M) {
     const int h = blockIdx.x;  // 0..23
     const int m = blockIdx.y;  // 0..M-1
     const int d = threadIdx.x; // 0..127
     if (h >= kInkHeads || m >= M) return;
-    q_out[((size_t)h * M + m) * kInkHeadDim + d] = __float2bfloat16_rn(q[((size_t)m * kInkHeads + h) * kInkHeadDim + d]);
+    uint16_t* q_out = reinterpret_cast<uint16_t*>(q_out_v);
+    q_out[((size_t)h * M + m) * kInkHeadDim + d] = pf_cvt_from_f32<USE_FP16>(q[((size_t)m * kInkHeads + h) * kInkHeadDim + d]);
 }
 
+template <bool USE_FP16 = false>
 __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
     InkKvVisitDesc kv,
     int slot0, int k_start, int K_len,
-    __nv_bfloat16* __restrict__ k_out,  // [24, K_len, 128]
-    __nv_bfloat16* __restrict__ v_out) { // [24, K_len, 128]
+    void* __restrict__ k_out_v,         // [24, K_len, 128] BF16 or FP16
+    void* __restrict__ v_out_v) {       // [24, K_len, 128] BF16 or FP16
     const int kh = blockIdx.x;  // 0..7
     const int ki = blockIdx.y;  // 0..K_len-1
     const int d  = threadIdx.x; // 0..127
@@ -740,17 +762,31 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
     const int kp = k_start + ki;
     const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
     const size_t base = (((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim + d;
-    float kf, vf;
-    if (!kv.is_fp8) {
-        kf = __half2float(kv.k_f16[base]);
-        vf = __half2float(kv.v_f16[base]);
+    uint16_t kb, vb;
+    if constexpr (USE_FP16) {
+        if (!kv.is_fp8) {
+            kb = *reinterpret_cast<const uint16_t*>(&kv.k_f16[base]);
+            vb = *reinterpret_cast<const uint16_t*>(&kv.v_f16[base]);
+        } else {
+            const size_t sidx = ((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + kh;
+            kb = pf_cvt_from_f32<true>(e4m3_to_f32(kv.k_f8[base]) * kv.k_sc[sidx]);
+            vb = pf_cvt_from_f32<true>(e4m3_to_f32(kv.v_f8[base]) * kv.v_sc[sidx]);
+        }
     } else {
-        const size_t sidx = ((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-        kf = e4m3_to_f32(kv.k_f8[base]) * kv.k_sc[sidx];
-        vf = e4m3_to_f32(kv.v_f8[base]) * kv.v_sc[sidx];
+        float kf, vf;
+        if (!kv.is_fp8) {
+            kf = __half2float(kv.k_f16[base]);
+            vf = __half2float(kv.v_f16[base]);
+        } else {
+            const size_t sidx = ((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + kh;
+            kf = e4m3_to_f32(kv.k_f8[base]) * kv.k_sc[sidx];
+            vf = e4m3_to_f32(kv.v_f8[base]) * kv.v_sc[sidx];
+        }
+        kb = pf_cvt_from_f32<false>(kf);
+        vb = pf_cvt_from_f32<false>(vf);
     }
-    const __nv_bfloat16 kb = __float2bfloat16_rn(kf);
-    const __nv_bfloat16 vb = __float2bfloat16_rn(vf);
+    uint16_t* k_out = reinterpret_cast<uint16_t*>(k_out_v);
+    uint16_t* v_out = reinterpret_cast<uint16_t*>(v_out_v);
     const int h0 = 3 * kh;
     k_out[((size_t)(h0 + 0) * K_len + ki) * kInkHeadDim + d] = kb;
     k_out[((size_t)(h0 + 1) * K_len + ki) * kInkHeadDim + d] = kb;
@@ -760,14 +796,13 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
     v_out[((size_t)(h0 + 2) * K_len + ki) * kInkHeadDim + d] = vb;
 }
 
-// 1-Pass Register-Cached RelPos + Causal/SWA Mask + Exact Per-Query Sink Softmax -> BF16 probs [24, C, K_sub]!
-// Reads scores & rel_table ONCE (6x less DRAM traffic than 3-pass -> attn at M=2048 drops 70.7ms -> ~14ms!)
-// Grid: (C, 24), Block: 256
+// 1-Pass Register-Cached RelPos + Causal/SWA Mask + Exact Per-Query Sink Softmax -> BF16/FP16 probs [24, C, K_sub]!
+template <bool USE_FP16 = false>
 __global__ void __launch_bounds__(256) k_ink_pf_softmax_rel_sink(
     const float* __restrict__ scores,     // [24, C, K_len] F32 (already scaled by 1/sqrt(128))
     const float* __restrict__ rel_table,  // [M, 24, 1025]
     const float* __restrict__ sinks,      // [M, 24]
-    __nv_bfloat16* __restrict__ probs,    // [24, C, K_len] BF16
+    void* __restrict__ probs_v,           // [24, C, K_len] BF16 or FP16
     int q0, int C, int k_start, int K_len, int p0, bool is_swa) {
     const int ci = blockIdx.x;  // 0..C-1
     const int h  = blockIdx.y;  // 0..23
@@ -778,11 +813,10 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_rel_sink(
     const float* sc_row = scores + ((size_t)h * C + ci) * K_len;
     const float* rt = rel_table + ((size_t)m * kInkHeads + h) * (kInkRelExtent + 1);
     const float sk = sinks[(size_t)m * kInkHeads + h];
-    __nv_bfloat16* pr_row = probs + ((size_t)h * C + ci) * K_len;
+    uint16_t* pr_row = reinterpret_cast<uint16_t*>(probs_v) + ((size_t)h * C + ci) * K_len;
     __shared__ float sh[32];
 
     if (K_len <= 2048) {
-        // Fast 1-Pass Register-Cached path (<= 8 floats/thread -> ZERO global re-reads, single __expf!)
         float reg_v[8];
         uint8_t reg_ok[8];
         float mx = (tid == 0) ? sk : -1e30f;
@@ -813,6 +847,7 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_rel_sink(
         }
         __syncthreads();
         const float mg = sh[0];
+        __syncthreads();
 
         float lsum = (tid == 0) ? __expf(sk - mg) : 0.0f;
 #pragma unroll
@@ -830,7 +865,7 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_rel_sink(
         for (int t = 0; t < 8; ++t) {
             const int ki = t * 256 + tid;
             if (ki < K_len) {
-                pr_row[ki] = __float2bfloat16_rn(reg_ok[t] ? (reg_v[t] * inv_l) : 0.0f);
+                pr_row[ki] = pf_cvt_from_f32<USE_FP16>(reg_ok[t] ? (reg_v[t] * inv_l) : 0.0f);
             }
         }
         return;
@@ -873,7 +908,7 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_rel_sink(
         if ((kp <= qp) && (!is_swa || dist < kInkSwaWin)) {
             p = __expf(sc_row[ki] + rt[min(dist, kInkRelExtent)] - mg) * inv_l;
         }
-        pr_row[ki] = __float2bfloat16_rn(p);
+        pr_row[ki] = pf_cvt_from_f32<USE_FP16>(p);
     }
 }
 

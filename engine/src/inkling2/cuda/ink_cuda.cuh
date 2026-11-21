@@ -233,22 +233,39 @@ __device__ __forceinline__ float2 e2m1x2_byte_to_f32x2(uint8_t byte) {
 #endif
 }
 
-// Exact F8_E4M3FN byte -> float (matching tools/squant/codecs.py kE4M3Lut bit-for-bit!).
-__device__ __forceinline__ float e4m3_to_f32(uint8_t c) {
+// Exact F8_E4M3FN byte -> float (1-cycle constant-cache LUT on sm_60..sm_86, hardware cvt on sm_89+!).
+#if defined(__CUDACC__)
+__device__ __forceinline__ float e4m3_to_f32_compute(uint8_t c) {
     const uint32_t sgn = ((uint32_t)c & 0x80u) << 24;
     const uint32_t mag = (uint32_t)c & 0x7Fu;
-    if (mag == 0x7Fu) return 0.0f;  // NaN sentinel guarded in encoder
+    if (mag == 0x7Fu) return 0.0f;
     if (mag == 0u) return __uint_as_float(sgn);
     const uint32_t exp = mag >> 3;
     const uint32_t man = mag & 7u;
     if (exp == 0u) {
-        // Subnormal: man * 2^-9
         float v = (float)man * (1.0f / 512.0f);
         return sgn ? -v : v;
     }
-    const uint32_t f32_bits = sgn | ((exp + 120u) << 23) | (man << 20);
-    return __uint_as_float(f32_bits);
+    return __uint_as_float(sgn | ((exp + 120u) << 23) | (man << 20));
 }
+
+__device__ __forceinline__ float e4m3_to_f32(uint8_t c) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+    const __half_raw hr = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)c, __NV_E4M3);
+    return __half2float(__half(hr));
+#else
+    // Branchless bit-math (~4 ALU ops, ZERO divergent branches on Volta/Turing/Ampere/Pascal!)
+    const uint32_t sgn = ((uint32_t)c & 0x80u) << 24;
+    const uint32_t mag = (uint32_t)c & 0x7Fu;
+    const uint32_t exp = mag >> 3;
+    const uint32_t man = mag & 7u;
+    const float norm = __uint_as_float(sgn | ((exp + 120u) << 23) | (man << 20));
+    const float subn = __uint_as_float(sgn | __float_as_uint((float)man * (1.0f / 512.0f)));
+    float res = (exp == 0u) ? subn : norm;
+    return (mag == 0x7Fu) ? 0.0f : res;
+#endif
+}
+#endif
 
 // Fast 2x E4M3FN bytes packed in low 16 bits -> float2 (hardware cvt on sm_89+ / Blackwell via <cuda_fp8.h>!).
 __device__ __forceinline__ float2 e4m3x2_to_f32x2(uint16_t pair) {
@@ -275,15 +292,17 @@ __device__ __forceinline__ float situ_f32(float g, float u) {
     return ga * ua;
 }
 
+// Hardware dp4a.s32.s32 exists ONLY on sm_61 (Pascal GP102/104/106) and sm_75+ (Turing..Blackwell).
+// On sm_60 (P100) and sm_70 (V100), PTX dp4a is software-emulated; use single-instruction PRMT.S4E + IMAD!
 __device__ __forceinline__ int32_t dp4a_i8(uint32_t a, uint32_t b, int32_t c) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 610)
+#if defined(__CUDA_ARCH__) && ((__CUDA_ARCH__ == 610) || (__CUDA_ARCH__ >= 750))
     return __dp4a((int)a, (int)b, c);
 #else
-    int32_t s = c;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-        s += (int32_t)(int8_t)((a >> (8 * i)) & 0xFFu) * (int32_t)(int8_t)((b >> (8 * i)) & 0xFFu);
-    return s;
+    const int32_t a0 = (int32_t)(int8_t)(a),        b0 = (int32_t)(int8_t)(b);
+    const int32_t a1 = (int32_t)(int8_t)(a >> 8),   b1 = (int32_t)(int8_t)(b >> 8);
+    const int32_t a2 = (int32_t)(int8_t)(a >> 16),  b2 = (int32_t)(int8_t)(b >> 16);
+    const int32_t a3 = (int32_t)(int8_t)(a >> 24),  b3 = (int32_t)(int8_t)(b >> 24);
+    return c + a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
 #endif
 }
 
@@ -316,18 +335,14 @@ __device__ __forceinline__ float block_sum(float v, float* sh) {
     return res;
 }
 
-// Unaligned-safe 16-bit and 32-bit loads from arbitrary byte-aligned weight buffers
+// Branchless 2-byte-aligned-safe 16-bit and 32-bit loads (all S_K superblocks are guaranteed 2-byte aligned!)
 __device__ __forceinline__ uint16_t ld16_u(const uint8_t* p) {
-    uint16_t v;
-    memcpy(&v, p, 2);
-    return v;
+    return *reinterpret_cast<const uint16_t*>(p);
 }
 
 __device__ __forceinline__ uint32_t ld32_u(const uint8_t* p) {
-    if (((uintptr_t)p & 3u) == 0u) return *(const uint32_t*)p;
-    uint32_t v;
-    memcpy(&v, p, 4);
-    return v;
+    const uint16_t* p16 = reinterpret_cast<const uint16_t*>(p);
+    return (uint32_t)p16[0] | ((uint32_t)p16[1] << 16);
 }
 
 // Native INT8 Tensor Core m16n8k32 (sm_80+: RTX 3090, A100, 4090, 5090, GB10)
@@ -337,6 +352,19 @@ __device__ __forceinline__ void mma_m16n8k32_s8(int32_t (&c)[4], uint32_t a0, ui
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
+#endif
+}
+
+// Native FP16 Tensor Core m16n8k16 with FP32 accumulation (sm_80+: RTX 3090, A100, 4090, 5090, GB10)
+__device__ __forceinline__ void mma_m16n8k16_f16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                 uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #else
     (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;

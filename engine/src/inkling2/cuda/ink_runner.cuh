@@ -6,6 +6,7 @@
 
 #include "ink_attn.cuh"
 #include "ink_cuda.cuh"
+#include "ink_hybrid.cuh"
 #include "ink_kernels.cuh"
 #include "ink_manifest.hpp"
 #include "ink_moe_cuda.cuh"
@@ -65,6 +66,8 @@ struct InkCudaModel {
     strata::artifact::StrataFileReader rd;
     std::string path;
     int primary_gpu = 0;
+    int sm_cc = 0;  // major * 10 + minor (e.g. 60, 61, 70, 75, 86, 89, 120, 121)
+    bool trunk_attn_fp16 = false;  // true on sm_70/75: .attn.* BF16 weights converted in-place to FP16 at load!
 
     uint8_t* d_trunk = nullptr;
     uint8_t* d_sec4  = nullptr;
@@ -79,9 +82,11 @@ struct InkCudaModel {
     float* d_sconv_attn[24] = {};       // [2304, 4] F32
     float* d_sconv_mlp[24] = {};        // [2304, 4] F32
 
-    // Per-physical-layer expert directory on GPU
+    // Per-physical-layer expert directory on GPU + Strata Hyper-Inference Hybrid Engine (for 8/12/16 GB GPUs!)
     InkExpertDev* d_experts[24] = {};
     InkLayerMoeInfo moe_info[24]{};
+    bool layer_has_host[24] = {};
+    InkHybridEngine hybrid;
 
     // Exact 2-stage unembed screening index (for BF16 unembed in SQ-20)
     UnembedScreenIndex unembed_screen;
@@ -97,6 +102,11 @@ struct InkCudaModel {
         path = strata_path;
         primary_gpu = gpu_id;
         INK_CK(cudaSetDevice(primary_gpu));
+        {
+            cudaDeviceProp prop{};
+            INK_CK(cudaGetDeviceProperties(&prop, primary_gpu));
+            sm_cc = prop.major * 10 + prop.minor;
+        }
         if (!rd.open(strata_path, err)) return false;
         parse_ink_manifest(rd.manifest_json(), man, true);
 
@@ -124,6 +134,20 @@ struct InkCudaModel {
         }
         double t_trunk = now_s() - t0;
 
+        // 1B. On Volta sm_70 (V100) & Turing sm_75 (2080 Ti), convert .attn.* BF16 weights IN-PLACE to IEEE FP16 once!
+        //     Eliminates 336+ per-visit conversion launches & unlocks 125 TFLOPS direct FP16 Tensor Core GEMMs!
+        trunk_attn_fp16 = (sm_cc >= 70 && sm_cc < 80);
+        if (trunk_attn_fp16) {
+            for (const auto& kv : man.trunk) {
+                if (kv.second.fmt == FMT_BF16 && kv.first.find(".attn.") != std::string::npos) {
+                    const size_t nw = (size_t)kv.second.rows() * kv.second.cols();
+                    __nv_bfloat16* ptr = reinterpret_cast<__nv_bfloat16*>(d_trunk + kv.second.off);
+                    k_ink_bf16_to_fp16<<<(nw + 255) / 256, 256>>>(ptr, reinterpret_cast<__half*>(ptr), nw);
+                }
+            }
+            INK_CK(cudaDeviceSynchronize());
+        }
+
         // 2. Check free VRAM -> load Section 4 experts (100% VRAM when fits, else 3x loop-weighted vram_load_order!)
         size_t vfree = 0, vtot = 0;
         INK_CK(cudaMemGetInfo(&vfree, &vtot));
@@ -148,9 +172,11 @@ struct InkCudaModel {
         }
 
         double t1 = now_s();
-        // Keep exact minimum headroom for KV cache + workspace + DSpark + screen without over-spilling on 32 GB GPUs!
-        const size_t base_reserve = (vtot >= (20ull << 30)) ? (2600ull << 20) : (1900ull << 20);
+        // Tight on-demand VRAM reserve: lets SQ-10 fit 100% in 12 GB RTX 5070 and SQ-15 fit 100% in 16 GB RTX 5070 Ti,
+        // while keeping full headroom (~1.25 GiB) for KV + workspaces + DSpark + CUDA Graph (spilling cleanly to Hybrid on 11 GB GPUs)!
+        const size_t base_reserve = (vtot >= (20ull << 30)) ? (1600ull << 20) : (1280ull << 20);
         const size_t reserve = std::max(base_reserve, extra_reserve_bytes);
+        for (int il = 0; il < 24; ++il) layer_has_host[il] = false;
         if (vfree > sec4_bytes + reserve) {
             // 100% VRAM resident! Single sequential streaming DMA!
             INK_CK(cudaMalloc(&d_sec4, sec4_bytes));
@@ -170,7 +196,7 @@ struct InkCudaModel {
             n_vram_experts = n_total;
             n_host_experts = 0;
         } else {
-            // 3x Loop-Weighted Tiered Residency using Section 3 vram_load_order!
+            // 3x Loop-Weighted Tiered Residency + Strata Predictive CPU/RAM Hybrid Engine (Doorbell + Ping-Pong DMA)!
             const auto& vorder = rd.vram_load_order();
             std::vector<uint16_t> order;
             if ((int)vorder.size() == n_total) {
@@ -179,44 +205,67 @@ struct InkCudaModel {
                 order.resize(n_total);
                 for (int i = 0; i < n_total; ++i) order[i] = (uint16_t)i;
             }
-            const size_t vram_budget = (vfree > reserve) ? (vfree - reserve) : 0;
-            size_t vram_used = 0, host_used = 0;
+            // Reserve full headroom (1.66 GiB for runner+DSpark+cuBLAS+Graph + 256 MiB for ping-pong DMA + promo ring)!
+            const size_t hyb_post_res = std::max(reserve, (size_t)(1664ull << 20));
+            const size_t hyb_reserve = hyb_post_res + (256ull << 20);
+            const size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
+            size_t vram_used = 0, host_used = 0, max_exp_bytes = 0;
             std::vector<uint8_t> in_vram(n_total, 0);
             for (uint16_t di : order) {
                 const auto& e = dir[di];
+                max_exp_bytes = std::max<size_t>(max_exp_bytes, e.body_bytes);
                 if (vram_used + e.body_bytes <= vram_budget) {
                     in_vram[di] = 1;
                     vram_used += e.body_bytes;
                     ++n_vram_experts;
                 } else {
-                    host_used += e.body_bytes;
+                    host_used += (size_t)((e.body_bytes + 63ull) & ~63ull);
                     ++n_host_experts;
                 }
             }
-            if (vram_used > 0) INK_CK(cudaMalloc(&d_sec4, vram_used));
-            if (host_used > 0) INK_CK(cudaHostAlloc(&h_sec4_pinned, host_used, cudaHostAllocMapped));
-            uint8_t* d_host_mapped = nullptr;
-            if (h_sec4_pinned) INK_CK(cudaHostGetDevicePointer(&d_host_mapped, h_sec4_pinned, 0));
+            INK_CK(cudaMalloc(&d_sec4, std::max<size_t>(256, vram_used)));
+            if (host_used > 0) {
+                INK_CK(cudaHostAlloc(&hybrid.h_sec4_pinned, host_used, cudaHostAllocDefault));
+                hybrid.h_sec4_bytes = host_used;
+                hybrid.host_meta.assign((size_t)man.c.n_phys * man.c.n_experts, {});
+                hybrid.orig_host_off.assign((size_t)man.c.n_phys * man.c.n_experts, 0);
+            }
 
             size_t v_cur = 0, h_cur = 0;
             std::vector<uint8_t> tmp_body;
             for (int di = 0; di < n_total; ++di) {
                 const auto& e = dir[di];
                 const int il = di / man.c.n_experts;
+                const int key = il * man.c.n_experts + e.expert_id;
                 tmp_body.resize(e.body_bytes);
                 if (!rd.read_at(hdr.sections[4].file_offset + e.body_offset, tmp_body.data(), e.body_bytes, err)) return false;
-                auto& dev = h_exp[(size_t)il * man.c.n_experts + e.expert_id];
+                auto& dev = h_exp[key];
                 if (in_vram[di]) {
                     INK_CK(cudaMemcpy(d_sec4 + v_cur, tmp_body.data(), e.body_bytes, cudaMemcpyHostToDevice));
                     dev.body_off = v_cur;
                     dev.tier = 0;
                     v_cur += e.body_bytes;
                 } else {
-                    std::memcpy(h_sec4_pinned + h_cur, tmp_body.data(), e.body_bytes);
-                    dev.body_off = (uint64_t)((uintptr_t)(d_host_mapped + h_cur) - (uintptr_t)d_sec4);
-                    dev.tier = 1;
-                    h_cur += e.body_bytes;
+                    uint8_t* hdst = hybrid.h_sec4_pinned + h_cur;
+                    std::memcpy(hdst, tmp_body.data(), e.body_bytes);
+                    hybrid.host_meta[key].body       = hdst;
+                    hybrid.host_meta[key].body_bytes = e.body_bytes;
+                    hybrid.host_meta[key].dn_off     = e.dn_offset;
+                    hybrid.host_meta[key].gu_code    = e.gu_code_id;
+                    hybrid.host_meta[key].dn_code    = e.dn_code_id;
+                    hybrid.orig_host_off[key]        = h_cur;
+                    dev.body_off = h_cur;
+                    dev.tier = 2;  // CPU Doorbell (M=1) + Ping-Pong DMA Streaming (M>=2)!
+                    layer_has_host[il] = true;
+                    h_cur += (size_t)((e.body_bytes + 63ull) & ~63ull);
                 }
+            }
+            if (n_host_experts > 0) {
+                hybrid.start_workers();
+                size_t vf_now = 0, vt_now = 0;
+                INK_CK(cudaMemGetInfo(&vf_now, &vt_now));
+                const size_t avail = (vf_now > hyb_post_res) ? (vf_now - hyb_post_res) : 0;
+                hybrid.alloc_staging(max_exp_bytes, avail);
             }
         }
         double t_exp = now_s() - t1;
@@ -272,7 +321,7 @@ struct InkCudaModel {
         const auto& ui = man.get("model.llm.unembed.weight");
         if (build_screen && (ui.fmt == FMT_BF16 || ui.fmt == FMT_S6_K)) {
             INK_CK(cudaMemGetInfo(&vfree, &vtot));
-            if (vfree > (1536ull << 20)) {
+            if (vfree > (2048ull << 20)) {
                 unembed_screen.V = man.c.vocab_unpadded;
                 unembed_screen.q8  = dalloc<int8_t>((size_t)unembed_screen.V * kInkHidden);
                 unembed_screen.sc  = dalloc<float>(unembed_screen.V);
@@ -291,13 +340,15 @@ struct InkCudaModel {
             }
         }
 
-        std::fprintf(stderr, "[InkCUDA] Loaded %s (%s): trunk=%.2f GB (%.2fs), experts=%zu VRAM / %zu host (%.2fs), sm120_tc=%d, screen=%d\n",
+        std::fprintf(stderr, "[InkCUDA] Loaded %s (%s): trunk=%.2f GB (%.2fs), experts=%zu VRAM / %zu host (%.2fs, hyb=%d, promo=%d, pf_buf=%.0fMB), sm120_tc=%d, screen=%d\n",
                      strata_path.c_str(), man.build.c_str(), (double)trunk_bytes / 1e9, t_trunk,
-                     n_vram_experts, n_host_experts, t_exp, (int)sm120::available(), (int)unembed_screen.ready);
+                     n_vram_experts, n_host_experts, t_exp, (int)hybrid.active, hybrid.n_promo_slots,
+                     (double)hybrid.pf_stage_bytes / (1024.0 * 1024.0), (int)sm120::available(), (int)unembed_screen.ready);
         return true;
     }
 
     void free_all() {
+        hybrid.free_all();
         unembed_screen.free_all();
         for (int i = 0; i < 12; ++i) if (d_msg_queries[i]) { cudaFree(d_msg_queries[i]); d_msg_queries[i] = nullptr; }
         for (int il = 0; il < 24; ++il) {
@@ -541,18 +592,26 @@ struct InkCudaRunner {
         d_x_bf16    = dalloc<__nv_bfloat16>(MB * std::max(kInkDsparkInter, std::max(kInkQDim, kInkHidden)));
         d_w_scratch = dalloc<__nv_bfloat16>((size_t)kInkDsparkInter * kInkHidden);
 
-        // Warmup cuBLAS BF16 & TF32 Tensor Cores once at init (eliminates 61 ms first-call JIT tax from prompt #1!)
+        // Warmup cuBLAS Tensor Cores once at init (eliminates 61 ms first-call JIT tax from prompt #1!)
         {
             INK_CK(cudaMemsetAsync(d_w_scratch, 0, 64 * 64 * sizeof(__nv_bfloat16), st));
             INK_CK(cudaMemsetAsync(d_x_bf16, 0, 64 * 64 * sizeof(__nv_bfloat16), st));
             INK_CK(cudaMemsetAsync(d_ctrl_cat, 0, 64 * 64 * sizeof(float), st));
             const float a = 1.0f, b = 0.0f;
-            cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64, 64, 64, &a,
-                         d_w_scratch, CUDA_R_16BF, 64, d_x_bf16, CUDA_R_16BF, 64, &b,
-                         d_ctrl_gain, CUDA_R_32F, 64, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (m.sm_cc >= 80) {
+                cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64, 64, 64, &a,
+                             d_w_scratch, CUDA_R_16BF, 64, d_x_bf16, CUDA_R_16BF, 64, &b,
+                             d_ctrl_gain, CUDA_R_32F, 64, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            } else if (m.sm_cc >= 70) {
+                cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64, 64, 64, &a,
+                             d_w_scratch, CUDA_R_16F, 64, d_x_bf16, CUDA_R_16F, 64, &b,
+                             d_ctrl_gain, CUDA_R_32F, 64, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            }
             cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64, 64, 64, &a,
                          d_ctrl_cat, CUDA_R_32F, 64, d_ctrl_cat, CUDA_R_32F, 64, &b,
-                         d_ctrl_gain, CUDA_R_32F, 64, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                         d_ctrl_gain, CUDA_R_32F, 64,
+                         m.sm_cc >= 80 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
             INK_CK(cudaStreamSynchronize(st));
         }
 
@@ -576,8 +635,12 @@ struct InkCudaRunner {
         h_meta_pin  = halloc_pinned<int32_t>(64ull * meta_ring_stride);
 
         moe_ws.alloc(max_batch);
-        // Pre-allocate BF16 TC prefill attention workspace outside timed prefill loop (Q_CH=256 -> ~140 MB)!
-        if (max_slots <= 4 && max_batch >= 128) ensure_pf_attn(std::min(max_ctx, std::max(max_batch, 2048)));
+        // Pre-allocate Tensor Core prefill attention workspace outside timed prefill loop when VRAM allows (~140 MB)!
+        if (m.sm_cc >= 60 && max_slots <= 4 && max_batch >= 128) {
+            size_t vf = 0, vt = 0;
+            INK_CK(cudaMemGetInfo(&vf, &vt));
+            if (vf > (640ull << 20)) ensure_pf_attn(std::min(max_ctx, std::max(max_batch, 2048)));
+        }
     }
 
     void reset_slot(int slot) {
@@ -624,87 +687,239 @@ struct InkCudaRunner {
             if (norm_w) k_ink_rms_norm<<<M, 256, 0, st>>>(out, norm_w, out, nullptr, M, D);
         } else {
             const float alpha = 1.0f, beta = 0.0f;
-            INK_CUBLAS_CK(cublasGemmEx(
-                cublas, CUBLAS_OP_T, CUBLAS_OP_N, kInkGateRank, M, D2, &alpha,
-                w_down, CUDA_R_32F, D2, d_ctrl_cat, CUDA_R_32F, D2, &beta,
-                d_ctrl_gate, CUDA_R_32F, kInkGateRank,
-                CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            INK_CUBLAS_CK(cublasGemmEx(
-                cublas, CUBLAS_OP_T, CUBLAS_OP_N, D, M, kInkGateRank, &alpha,
-                w_gain, CUDA_R_32F, kInkGateRank, d_ctrl_gate, CUDA_R_32F, kInkGateRank, &beta,
-                d_ctrl_gain, CUDA_R_32F, D,
-                CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            INK_CUBLAS_CK(cublasGemmEx(
-                cublas, CUBLAS_OP_T, CUBLAS_OP_N, D, M, kInkGateRank, &alpha,
-                w_forget, CUDA_R_32F, kInkGateRank, d_ctrl_gate, CUDA_R_32F, kInkGateRank, &beta,
-                d_ctrl_forget, CUDA_R_32F, D,
-                CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            if (m.sm_cc >= 70 && m.sm_cc < 80) {
+                // Volta sm_70 (V100) / Turing sm_75 (2080 Ti): 125 TFLOPS FP16 TC for loop controller GEMMs (4x faster than FP32!)
+                __half* x_h = reinterpret_cast<__half*>(d_x_bf16);
+                __half* w_h = reinterpret_cast<__half*>(d_w_scratch);
+                const size_t nx_d = (size_t)M * D2;
+                const size_t nw_d = (size_t)kInkGateRank * D2;
+                k_ink_f32_to_fp16<<<(nx_d + 255) / 256, 256, 0, st>>>(d_ctrl_cat, x_h, nx_d);
+                k_ink_f32_to_fp16<<<(nw_d + 255) / 256, 256, 0, st>>>(w_down, w_h, nw_d);
+                INK_CUBLAS_CK(cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N, kInkGateRank, M, D2, &alpha,
+                    w_h, CUDA_R_16F, D2, x_h, CUDA_R_16F, D2, &beta,
+                    d_ctrl_gate, CUDA_R_32F, kInkGateRank, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                const size_t nx_g = (size_t)M * kInkGateRank;
+                const size_t nw_g = (size_t)D * kInkGateRank;
+                k_ink_f32_to_fp16<<<(nx_g + 255) / 256, 256, 0, st>>>(d_ctrl_gate, x_h, nx_g);
+                k_ink_f32_to_fp16<<<(nw_g + 255) / 256, 256, 0, st>>>(w_gain, w_h, nw_g);
+                INK_CUBLAS_CK(cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N, D, M, kInkGateRank, &alpha,
+                    w_h, CUDA_R_16F, kInkGateRank, x_h, CUDA_R_16F, kInkGateRank, &beta,
+                    d_ctrl_gain, CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                k_ink_f32_to_fp16<<<(nw_g + 255) / 256, 256, 0, st>>>(w_forget, w_h, nw_g);
+                INK_CUBLAS_CK(cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N, D, M, kInkGateRank, &alpha,
+                    w_h, CUDA_R_16F, kInkGateRank, x_h, CUDA_R_16F, kInkGateRank, &beta,
+                    d_ctrl_forget, CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            } else {
+                const cublasComputeType_t ctype = (m.sm_cc >= 80) ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+                INK_CUBLAS_CK(cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N, kInkGateRank, M, D2, &alpha,
+                    w_down, CUDA_R_32F, D2, d_ctrl_cat, CUDA_R_32F, D2, &beta,
+                    d_ctrl_gate, CUDA_R_32F, kInkGateRank, ctype, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                INK_CUBLAS_CK(cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N, D, M, kInkGateRank, &alpha,
+                    w_gain, CUDA_R_32F, kInkGateRank, d_ctrl_gate, CUDA_R_32F, kInkGateRank, &beta,
+                    d_ctrl_gain, CUDA_R_32F, D, ctype, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                INK_CUBLAS_CK(cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N, D, M, kInkGateRank, &alpha,
+                    w_forget, CUDA_R_32F, kInkGateRank, d_ctrl_gate, CUDA_R_32F, kInkGateRank, &beta,
+                    d_ctrl_forget, CUDA_R_32F, D, ctype, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
             k_ink_ctrl_blend_norm<<<M, 256, 0, st>>>(cur, msg, d_ctrl_gain, d_ctrl_forget, norm_w, out, M, D);
         }
     }
 
+    // ---- Cross-Architecture cuBLAS GEMM for BF16 weights: sm_80+ native BF16 TC, sm_70/75 FP16 TC, sm_60/61 FP32 ----
+    // When w_is_scratch==true, caller placed BF16 weights at d_w_scratch (or at d_w_scratch + 2*(cap/3) when sm_cc < 70).
+    void gemm_bf16_compat(const __nv_bfloat16* W_bf16, const float* X, float* Y, int M, int N, int K,
+                          int ldY, bool reuse_x, bool w_is_scratch) {
+        const float alpha = 1.0f, beta = 0.0f;
+        if (m.sm_cc >= 80) {
+            if (!reuse_x) {
+                const size_t nx = (size_t)M * K;
+                k_ink_f32_to_bf16<<<((nx + 3) / 4 + 255) / 256, 256, 0, st>>>(X, d_x_bf16, nx);
+            }
+            INK_CUBLAS_CK(cublasGemmEx(
+                cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                N, M, K, &alpha,
+                W_bf16, CUDA_R_16BF, K,
+                d_x_bf16, CUDA_R_16BF, K,
+                &beta, Y, CUDA_R_32F, ldY,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        } else if (m.sm_cc >= 70) {
+            // Volta (sm_70) / Turing (sm_75): IEEE FP16 Tensor Cores (110-125 TFLOPS!)
+            __half* x_fp16 = reinterpret_cast<__half*>(d_x_bf16);
+            if (!reuse_x) {
+                const size_t nx = (size_t)M * K;
+                k_ink_f32_to_fp16<<<(nx + 255) / 256, 256, 0, st>>>(X, x_fp16, nx);
+            }
+            const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
+            if (w_is_scratch) {
+                const size_t nw = (size_t)N * K;
+                __half* w_fp16 = reinterpret_cast<__half*>(d_w_scratch);
+                k_ink_bf16_to_fp16<<<(nw + 255) / 256, 256, 0, st>>>(W_bf16, w_fp16, nw);
+                cublasStatus_t st_fp16 = cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    N, M, K, &alpha,
+                    w_fp16, CUDA_R_16F, K,
+                    x_fp16, CUDA_R_16F, K,
+                    &beta, Y, CUDA_R_32F, ldY,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                if (st_fp16 != CUBLAS_STATUS_SUCCESS) {
+                    INK_CUBLAS_CK(cublasGemmEx(
+                        cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        N, M, K, &alpha,
+                        w_fp16, CUDA_R_16F, K,
+                        x_fp16, CUDA_R_16F, K,
+                        &beta, Y, CUDA_R_32F, ldY,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                }
+            } else {
+                const int tile_n = std::min(N, (int)(cap / (size_t)K));
+                __half* w_fp16 = reinterpret_cast<__half*>(d_w_scratch);
+                for (int n0 = 0; n0 < N; n0 += tile_n) {
+                    const int nt = std::min(tile_n, N - n0);
+                    const size_t nw = (size_t)nt * K;
+                    k_ink_bf16_to_fp16<<<(nw + 255) / 256, 256, 0, st>>>(W_bf16 + (size_t)n0 * K, w_fp16, nw);
+                    INK_CUBLAS_CK(cublasGemmEx(
+                        cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nt, M, K, &alpha,
+                        w_fp16, CUDA_R_16F, K,
+                        x_fp16, CUDA_R_16F, K,
+                        &beta, Y + n0, CUDA_R_32F, ldY,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                }
+            }
+        } else {
+            // Pascal (sm_60 / sm_61): exact IEEE FP32 cuBLAS SGEMM (full 11 TFLOPS on GTX 1080 Ti!)
+            // Non-overlapping staging inside d_w_scratch: float[0..cap/3) vs bf16[2*(cap/3)..cap)
+            const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
+            const size_t max_elems = cap / 3;
+            float* w_f32 = reinterpret_cast<float*>(d_w_scratch);
+            if (w_is_scratch) {
+                const size_t nw = (size_t)N * K;
+                k_ink_bf16_to_f32<<<(nw + 255) / 256, 256, 0, st>>>(W_bf16, w_f32, nw);
+                INK_CUBLAS_CK(cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    N, M, K, &alpha,
+                    w_f32, CUDA_R_32F, K,
+                    X, CUDA_R_32F, K,
+                    &beta, Y, CUDA_R_32F, ldY,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            } else {
+                const int tile_n = std::min(N, (int)(max_elems / (size_t)K));
+                for (int n0 = 0; n0 < N; n0 += tile_n) {
+                    const int nt = std::min(tile_n, N - n0);
+                    const size_t nw = (size_t)nt * K;
+                    k_ink_bf16_to_f32<<<(nw + 255) / 256, 256, 0, st>>>(W_bf16 + (size_t)n0 * K, w_f32, nw);
+                    INK_CUBLAS_CK(cublasGemmEx(
+                        cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nt, M, K, &alpha,
+                        w_f32, CUDA_R_32F, K,
+                        X, CUDA_R_32F, K,
+                        &beta, Y + n0, CUDA_R_32F, ldY,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                }
+            }
+        }
+    }
+
     // ---- Dense linear projection helper: Y[M, N] = X[M, K] @ W[N, K]^T ----
-    void linear_multi(const std::string* names, float* const* Ys, int count, const float* X, int M) {
+    void linear_multi(const std::string* names, float* const* Ys, int count, const float* X, int M, bool exact_fp32_x = false) {
         if (count <= 0) return;
         const auto& ti0 = m.tinfo(names[0]);
         const int K = (int)ti0.cols();
-        bool can_fuse = (M <= 16) && (count <= 5) && (ti0.fmt == FMT_BF16 || ti0.fmt == FMT_Q8ROW);
+        const bool is_fp16 = m.trunk_attn_fp16 && (names[0].find(".attn.") != std::string::npos);
+        // BF16/FP16: sm_70/75 direct FP16 TC at M>=4; sm_80+ exact GEMV up to M<=16 during spec verify & cuBLAS TC at M>=8!
+        const int bf16_gemv_max = is_fp16 ? 3 : ((exact_fp32_x || m.sm_cc < 80) ? 16 : 7);
+        bool can_fuse = (count <= 5) && ((ti0.fmt == FMT_BF16 && M <= bf16_gemv_max) || (ti0.fmt == FMT_Q8ROW && M <= 16));
         InkMultiProj mp{};
         mp.count = count;
         mp.cumN[0] = 0;
         for (int i = 0; i < count; ++i) {
             const auto& ti = m.tinfo(names[i]);
             if (ti.fmt != ti0.fmt || (int)ti.cols() != K) { can_fuse = false; break; }
+            if (m.trunk_attn_fp16 && ((names[i].find(".attn.") != std::string::npos) != is_fp16)) { can_fuse = false; break; }
             mp.W[i] = m.d_trunk + ti.off;
             mp.Y[i] = Ys[i];
             mp.N[i] = (int)ti.rows();
             mp.cumN[i + 1] = mp.cumN[i] + mp.N[i];
         }
         if (can_fuse) {
-            const int grid = (mp.cumN[count] + 3) / 4;
+            const int grid = (mp.cumN[count] + 7) / 8;
             if (ti0.fmt == FMT_BF16) {
-                if (M == 1)      k_ink_gemv_multi_bf16<1><<<grid, 128, 0, st>>>(mp, X, M, K);
-                else if (M <= 4) k_ink_gemv_multi_bf16<4><<<grid, 128, 0, st>>>(mp, X, M, K);
-                else if (M <= 8) k_ink_gemv_multi_bf16<8><<<grid, 128, 0, st>>>(mp, X, M, K);
-                else             k_ink_gemv_multi_bf16<16><<<grid, 128, 0, st>>>(mp, X, M, K);
+                if (is_fp16) {
+                    if (M == 1)      k_ink_gemv_multi_bf16<1, true><<<grid, 128, 0, st>>>(mp, X, M, K);
+                    else             k_ink_gemv_multi_bf16<4, true><<<grid, 128, 0, st>>>(mp, X, M, K);
+                } else {
+                    if (M == 1)      k_ink_gemv_multi_bf16<1, false><<<grid, 128, 0, st>>>(mp, X, M, K);
+                    else if (M <= 4) k_ink_gemv_multi_bf16<4, false><<<grid, 128, 0, st>>>(mp, X, M, K);
+                    else if (M <= 8) k_ink_gemv_multi_bf16<8, false><<<grid, 128, 0, st>>>(mp, X, M, K);
+                    else             k_ink_gemv_multi_bf16<16, false><<<grid, 128, 0, st>>>(mp, X, M, K);
+                }
+            } else if ((K % 64) == 0 && K <= kInkQDim && (m.sm_cc == 61 || m.sm_cc >= 75)) {
+                if (M == 1) {
+                    k_ink_gemv_multi_q8row_m1<<<grid, 128, 0, st>>>(mp, X, K);
+                } else {
+                    const int nblk = M * (K / 64);
+                    k_ink_quant_q8_1<<<(nblk + 7) / 8, 256, 0, st>>>(X, moe_ws.xq_sk, M, K);
+                    if (M <= 4)      k_ink_gemv_multi_q8row_preq<4><<<grid, 128, 0, st>>>(mp, moe_ws.xq_sk, M, K);
+                    else if (M <= 8) k_ink_gemv_multi_q8row_preq<8><<<grid, 128, 0, st>>>(mp, moe_ws.xq_sk, M, K);
+                    else             k_ink_gemv_multi_q8row_preq<16><<<grid, 128, 0, st>>>(mp, moe_ws.xq_sk, M, K);
+                }
             } else {
-                if (M == 1)      k_ink_gemv_multi_q8row<1><<<grid, 128, 0, st>>>(mp, X, M, K);
-                else if (M <= 4) k_ink_gemv_multi_q8row<4><<<grid, 128, 0, st>>>(mp, X, M, K);
-                else if (M <= 8) k_ink_gemv_multi_q8row<8><<<grid, 128, 0, st>>>(mp, X, M, K);
-                else             k_ink_gemv_multi_q8row<16><<<grid, 128, 0, st>>>(mp, X, M, K);
+                const int g4 = (mp.cumN[count] + 3) / 4;
+                if (M == 1)      k_ink_gemv_multi_q8row<1><<<g4, 128, 0, st>>>(mp, X, M, K);
+                else if (M <= 4) k_ink_gemv_multi_q8row<4><<<g4, 128, 0, st>>>(mp, X, M, K);
+                else if (M <= 8) k_ink_gemv_multi_q8row<8><<<g4, 128, 0, st>>>(mp, X, M, K);
+                else             k_ink_gemv_multi_q8row<16><<<g4, 128, 0, st>>>(mp, X, M, K);
             }
             return;
         }
-        for (int i = 0; i < count; ++i) linear(names[i], X, Ys[i], M, 0, i > 0);
+        for (int i = 0; i < count; ++i) linear(names[i], X, Ys[i], M, 0, i > 0, exact_fp32_x);
     }
 
-    void linear(const std::string& tname, const float* X, float* Y, int M, int N_override = 0, bool reuse_x_bf16 = false) {
+    void linear(const std::string& tname, const float* X, float* Y, int M, int N_override = 0, bool reuse_x_bf16 = false, bool exact_fp32_x = false) {
         const auto& ti = m.tinfo(tname);
         const int N = N_override > 0 ? N_override : (int)ti.rows();
         const int K = (int)ti.cols();
         const uint8_t* W = m.d_trunk + ti.off;
 
         if (ti.fmt == FMT_BF16) {
-            if (M <= 16) {
+            const bool is_fp16 = m.trunk_attn_fp16 && (tname.find(".attn.") != std::string::npos);
+            const int bf16_gemv_max = is_fp16 ? 3 : ((exact_fp32_x || m.sm_cc < 80) ? 16 : 7);
+            if (M <= bf16_gemv_max) {
+                InkMultiProj mp{};
+                mp.W[0] = W; mp.Y[0] = Y; mp.N[0] = N; mp.cumN[0] = 0; mp.cumN[1] = N; mp.count = 1;
                 const int grid = (N + 7) / 8;
-                if (M == 1)      k_ink_gemv_bf16<1><<<grid, 256, 0, st>>>((const uint16_t*)W, X, Y, M, N, K);
-                else if (M <= 4) k_ink_gemv_bf16<4><<<grid, 256, 0, st>>>((const uint16_t*)W, X, Y, M, N, K);
-                else if (M <= 8) k_ink_gemv_bf16<8><<<grid, 256, 0, st>>>((const uint16_t*)W, X, Y, M, N, K);
-                else             k_ink_gemv_bf16<16><<<grid, 256, 0, st>>>((const uint16_t*)W, X, Y, M, N, K);
-            } else {
+                if (is_fp16) {
+                    if (M == 1)      k_ink_gemv_multi_bf16<1, true><<<grid, 128, 0, st>>>(mp, X, M, K);
+                    else             k_ink_gemv_multi_bf16<4, true><<<grid, 128, 0, st>>>(mp, X, M, K);
+                } else {
+                    if (M == 1)      k_ink_gemv_multi_bf16<1, false><<<grid, 128, 0, st>>>(mp, X, M, K);
+                    else if (M <= 4) k_ink_gemv_multi_bf16<4, false><<<grid, 128, 0, st>>>(mp, X, M, K);
+                    else if (M <= 8) k_ink_gemv_multi_bf16<8, false><<<grid, 128, 0, st>>>(mp, X, M, K);
+                    else             k_ink_gemv_multi_bf16<16, false><<<grid, 128, 0, st>>>(mp, X, M, K);
+                }
+            } else if (is_fp16) {
+                // Volta sm_70 / Turing sm_75: direct FP16 Tensor Core GEMM (ZERO weight conversion, 125 TFLOPS!)
+                __half* x_fp16 = reinterpret_cast<__half*>(d_x_bf16);
                 if (!reuse_x_bf16) {
                     const size_t nx = (size_t)M * K;
-                    k_ink_f32_to_bf16<<<((nx + 3) / 4 + 255) / 256, 256, 0, st>>>(X, d_x_bf16, nx);
+                    k_ink_f32_to_fp16<<<(nx + 255) / 256, 256, 0, st>>>(X, x_fp16, nx);
                 }
                 const float alpha = 1.0f, beta = 0.0f;
-                // Row-major Y[M, N] = X[M, K] * W[N, K]^T  <==>  Col-major Y^T[N, M] = W^T[N, K]^T * X^T[K, M]
                 INK_CUBLAS_CK(cublasGemmEx(
                     cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                     N, M, K, &alpha,
-                    W, CUDA_R_16BF, K,
-                    d_x_bf16, CUDA_R_16BF, K,
+                    W, CUDA_R_16F, K,
+                    x_fp16, CUDA_R_16F, K,
                     &beta, Y, CUDA_R_32F, N,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            } else {
+                gemm_bf16_compat(reinterpret_cast<const __nv_bfloat16*>(W), X, Y, M, N, K, N, reuse_x_bf16, false);
             }
         } else if (ti.fmt == FMT_F32) {
             if (M <= 16) {
@@ -718,54 +933,79 @@ struct InkCudaRunner {
                 INK_CUBLAS_CK(cublasGemmEx(
                     cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
                     W, CUDA_R_32F, K, X, CUDA_R_32F, K, &beta, Y, CUDA_R_32F, N,
-                    CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    m.sm_cc >= 80 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             }
         } else if (ti.fmt == FMT_Q8ROW) {
-            if (M <= 16 || (size_t)N * K > (size_t)kInkDsparkInter * kInkHidden) {
+            // Hardware INT8 GEMM (45 TOPS dp4a on GTX 1080 Ti sm_61!)
+            if (M > 16 && m.sm_cc == 61 && (K % 4 == 0) && (N % 4 == 0) && N_override == 0) {
+                int8_t* x_i8 = reinterpret_cast<int8_t*>(d_x_bf16);
+                float*  x_sc = d_ctrl_gain;  // [max_batch * 2304] -> plenty of room for M floats!
+                if (!reuse_x_bf16) {
+                    k_ink_quant_x_row_i8<<<M, 256, 0, st>>>(X, x_i8, x_sc, M, K);
+                }
+                const float*  w_sc = reinterpret_cast<const float*>(W);
+                const int8_t* w_i8 = reinterpret_cast<const int8_t*>(W + (size_t)ti.rows() * 4);
+                const int32_t alpha_i = 1, beta_i = 0;
+                INK_CUBLAS_CK(cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    N, M, K, &alpha_i,
+                    w_i8, CUDA_R_8I, K,
+                    x_i8, CUDA_R_8I, K,
+                    &beta_i, Y, CUDA_R_32I, N,
+                    CUBLAS_COMPUTE_32I,
+                    (m.sm_cc >= 75) ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
+                const size_t tot = (size_t)M * N;
+                k_ink_i32_to_f32_scale<<<(tot + 255) / 256, 256, 0, st>>>(
+                    reinterpret_cast<int32_t*>(Y), Y, w_sc, x_sc, M, N);
+                return;
+            }
+            const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
+            const size_t max_tile = (m.sm_cc < 70) ? (cap / 3) : cap;
+            if (M <= 16 || (size_t)N * K > max_tile) {
                 InkMultiProj mp{};
                 mp.W[0] = W; mp.Y[0] = Y; mp.N[0] = N; mp.cumN[0] = 0; mp.cumN[1] = N; mp.count = 1;
+                if ((K % 64) == 0 && K <= kInkQDim && M <= 16 && (m.sm_cc == 61 || m.sm_cc >= 75)) {
+                    const int grid = (N + 7) / 8;
+                    if (M == 1) {
+                        k_ink_gemv_multi_q8row_m1<<<grid, 128, 0, st>>>(mp, X, K);
+                        return;
+                    }
+                    const int nblk = M * (K / 64);
+                    if ((size_t)nblk <= (size_t)moe_ws.cap_M * (kInkHidden / 64)) {
+                        k_ink_quant_q8_1<<<(nblk + 7) / 8, 256, 0, st>>>(X, moe_ws.xq_sk, M, K);
+                        if (M <= 4)      k_ink_gemv_multi_q8row_preq<4><<<grid, 128, 0, st>>>(mp, moe_ws.xq_sk, M, K);
+                        else if (M <= 8) k_ink_gemv_multi_q8row_preq<8><<<grid, 128, 0, st>>>(mp, moe_ws.xq_sk, M, K);
+                        else             k_ink_gemv_multi_q8row_preq<16><<<grid, 128, 0, st>>>(mp, moe_ws.xq_sk, M, K);
+                        return;
+                    }
+                }
                 const int grid = (N + 3) / 4;
                 if (M == 1)      k_ink_gemv_multi_q8row<1><<<grid, 128, 0, st>>>(mp, X, M, K);
                 else if (M <= 4) k_ink_gemv_multi_q8row<4><<<grid, 128, 0, st>>>(mp, X, M, K);
                 else if (M <= 8) k_ink_gemv_multi_q8row<8><<<grid, 128, 0, st>>>(mp, X, M, K);
                 else             k_ink_gemv_multi_q8row<16><<<grid, 128, 0, st>>>(mp, X, M, K);
             } else {
+                __nv_bfloat16* w_dst = (m.sm_cc < 70) ? (d_w_scratch + 2 * (cap / 3)) : d_w_scratch;
                 dim3 dg((K + 255) / 256, N);
-                k_ink_q8row_to_bf16<<<dg, 256, 0, st>>>(W, d_w_scratch, N, K);
-                if (!reuse_x_bf16) {
-                    const size_t nx = (size_t)M * K;
-                    k_ink_f32_to_bf16<<<((nx + 3) / 4 + 255) / 256, 256, 0, st>>>(X, d_x_bf16, nx);
-                }
-                const float alpha = 1.0f, beta = 0.0f;
-                INK_CUBLAS_CK(cublasGemmEx(
-                    cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                    N, M, K, &alpha,
-                    d_w_scratch, CUDA_R_16BF, K,
-                    d_x_bf16, CUDA_R_16BF, K,
-                    &beta, Y, CUDA_R_32F, N,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                k_ink_q8row_to_bf16<<<dg, 256, 0, st>>>(W, w_dst, N, K);
+                gemm_bf16_compat(w_dst, X, Y, M, N, K, N, reuse_x_bf16, true);
             }
         } else {
-            // S5_K / S6_K / S8_K dense trunk tensor (dequant tile -> cuBLAS BF16 TC!)
-            const int tile_n = std::min(N, (int)((size_t)kInkDsparkInter * kInkHidden / K));
-            const size_t nx = (size_t)M * K;
-            k_ink_f32_to_bf16<<<((nx + 3) / 4 + 255) / 256, 256, 0, st>>>(X, d_x_bf16, nx);
-            const float alpha = 1.0f, beta = 0.0f;
+            // S5_K / S6_K / S8_K dense trunk tensor (dequant tile -> cuBLAS BF16/FP16/FP32 GEMM!)
+            const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
+            const size_t max_tile = (m.sm_cc < 70) ? (cap / 3) : cap;
+            const int tile_n = std::min(N, (int)(max_tile / (size_t)K));
             const size_t row_b = (size_t)(K / 256) * ink_sb_bytes(ti.fmt);
+            __nv_bfloat16* w_dst = (m.sm_cc < 70) ? (d_w_scratch + 2 * (cap / 3)) : d_w_scratch;
             for (int n0 = 0; n0 < N; n0 += tile_n) {
                 const int nt = std::min(tile_n, N - n0);
                 dim3 dg((K + 255) / 256, nt);
                 const uint8_t* Wsub = W + (size_t)n0 * row_b;
-                if (ti.fmt == FMT_S5_K)      k_ink_sk_to_bf16<FMT_S5_K><<<dg, 256, 0, st>>>(Wsub, d_w_scratch, nt, K);
-                else if (ti.fmt == FMT_S6_K) k_ink_sk_to_bf16<FMT_S6_K><<<dg, 256, 0, st>>>(Wsub, d_w_scratch, nt, K);
-                else                         k_ink_sk_to_bf16<FMT_S8_K><<<dg, 256, 0, st>>>(Wsub, d_w_scratch, nt, K);
-                INK_CUBLAS_CK(cublasGemmEx(
-                    cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                    nt, M, K, &alpha,
-                    d_w_scratch, CUDA_R_16BF, K,
-                    d_x_bf16, CUDA_R_16BF, K,
-                    &beta, Y + n0, CUDA_R_32F, N,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                if (ti.fmt == FMT_S5_K)      k_ink_sk_to_bf16<FMT_S5_K><<<dg, 256, 0, st>>>(Wsub, w_dst, nt, K);
+                else if (ti.fmt == FMT_S6_K) k_ink_sk_to_bf16<FMT_S6_K><<<dg, 256, 0, st>>>(Wsub, w_dst, nt, K);
+                else                         k_ink_sk_to_bf16<FMT_S8_K><<<dg, 256, 0, st>>>(Wsub, w_dst, nt, K);
+                gemm_bf16_compat(w_dst, X, Y + n0, M, nt, K, N, n0 > 0, true);
             }
         }
     }
@@ -860,23 +1100,24 @@ struct InkCudaRunner {
         // 3. Fused Q, K, V, R, Gate_Attn, Sinks projections (1 launch on SWA-no-msg at M<=16 -> 1,500+ GB/s!)
         prof_mark_end(0); prof_mark_start();
         const bool share_qkv = (in_q == in_k && in_q == in_v);
+        const bool exact_x = (mode == 2);
         if (M <= 16 && share_qkv) {
             const std::string names[5] = {
                 p + ".attn.wq_du.weight", p + ".attn.wr_du.weight", p + ".attn.gate_attn.weight",
                 p + ".attn.wk_dv.weight", p + ".attn.wv_dv.weight"
             };
             float* ys[5] = { d_q, d_r, d_gate_attn, d_k_raw, d_v_raw };
-            linear_multi(names, ys, 5, in_q, M);
-            linear(p + ".attn.attn_sink_proj.weight", in_q, d_sinks, M);
+            linear_multi(names, ys, 5, in_q, M, exact_x);
+            linear(p + ".attn.attn_sink_proj.weight", in_q, d_sinks, M, 0, false, exact_x);
         } else if (M <= 16) {
             const std::string names[3] = {
                 p + ".attn.wq_du.weight", p + ".attn.wr_du.weight", p + ".attn.gate_attn.weight"
             };
             float* ys[3] = { d_q, d_r, d_gate_attn };
-            linear_multi(names, ys, 3, in_q, M);
-            linear(p + ".attn.attn_sink_proj.weight", in_q, d_sinks, M);
-            linear(p + ".attn.wk_dv.weight", in_k, d_k_raw, M);
-            linear(p + ".attn.wv_dv.weight", in_v, d_v_raw, M);
+            linear_multi(names, ys, 3, in_q, M, exact_x);
+            linear(p + ".attn.attn_sink_proj.weight", in_q, d_sinks, M, 0, false, exact_x);
+            linear(p + ".attn.wk_dv.weight", in_k, d_k_raw, M, 0, false, exact_x);
+            linear(p + ".attn.wv_dv.weight", in_v, d_v_raw, M, 0, false, exact_x);
         } else {
             linear(p + ".attn.wq_du.weight", in_q, d_q, M, 0, false);
             linear(p + ".attn.wr_du.weight", in_q, d_r, M, 0, true);
@@ -944,7 +1185,7 @@ struct InkCudaRunner {
                 d_q, (const float*)(m.d_trunk + ti_qc.off), qc_elems,
                 d_k, d_v, d_r, (const float*)(m.d_trunk + ti_rc.off), rc_elems,
                 d_pos, !is_swa, M);
-            k_ink_kv_write<<<dim3(kInkKVHeads, M), 128, 0, st>>>(d_k, d_v, nullptr, d_pos, kv_desc[visit], M);
+            k_ink_kv_write<<<dim3(kInkKVHeads, M), 128, 0, st>>>(d_k, d_v, nullptr, slot0, d_pos, kv_desc[visit], M);
         }
 
         // 7. RelPos Table + Fused Sink Flash-GQA (Split-K for M<=16, BF16 TC Batched GEMM for prefill M>=128!)
@@ -956,19 +1197,26 @@ struct InkCudaRunner {
                 dim3 gsp(kInkKVHeads, kInkAttnSplits, M);
                 k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
                     d_q, d_rel_table, d_sinks,
-                    kv_desc[visit], (mode == 1) ? d_slots : nullptr, d_pos,
+                    kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
                     (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
                     (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
                     p0_val, d_attn_pm, d_attn_pl, d_attn_po, M);
                 k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M);
-            } else if (mode == 0 && M >= 128) {
-                // High-speed Causal/SWA-Sliced BF16 Tensor Core Prefill Attention (Q_CH=256 + 1-pass register softmax!)
-                // Slices [k_sub_beg, k_sub_end) per chunk -> skips 100% of upper-triangle & out-of-window keys (5x faster at M=2048!)
+            } else if (mode == 0 && M >= 128 && (m.sm_cc >= 70 || m.sm_cc == 60) && (d_pf_q != nullptr || [&](){ size_t vf=0,vt=0; cudaMemGetInfo(&vf,&vt); return vf > (480ull<<20); }())) {
+                // High-speed Causal/SWA-Sliced Tensor Core Prefill Attention (BF16 on sm_80+, FP16 on sm_60..75!)
+                const bool use_fp16_pf = (m.sm_cc < 80);
+                const cudaDataType_t pf_dt = use_fp16_pf ? CUDA_R_16F : CUDA_R_16BF;
+                const cublasGemmAlgo_t pf_algo = (m.sm_cc >= 70) ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
                 const int k_start = is_swa ? std::max(0, p0_val - kInkSwaWin + 1) : 0;
                 const int K_len = (p0_val + M) - k_start;
                 ensure_pf_attn(K_len);
-                k_ink_pf_pack_q<<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
-                k_ink_pf_pack_kv<<<dim3(kInkKVHeads, K_len), 128, 0, st>>>(kv_desc[visit], slot0, k_start, K_len, d_pf_k, d_pf_v);
+                if (use_fp16_pf) {
+                    k_ink_pf_pack_q<true><<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
+                    k_ink_pf_pack_kv<true><<<dim3(kInkKVHeads, K_len), 128, 0, st>>>(kv_desc[visit], slot0, k_start, K_len, d_pf_k, d_pf_v);
+                } else {
+                    k_ink_pf_pack_q<false><<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
+                    k_ink_pf_pack_kv<false><<<dim3(kInkKVHeads, K_len), 128, 0, st>>>(kv_desc[visit], slot0, k_start, K_len, d_pf_k, d_pf_v);
+                }
                 constexpr int Q_CH = 256;
                 const float sc_qk = 0.08838834764831845f;
                 const float one = 1.0f, zero = 0.0f;
@@ -982,34 +1230,39 @@ struct InkCudaRunner {
                     INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                         cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                         K_sub, C, kInkHeadDim, &sc_qk,
-                        d_pf_k + (size_t)k_off * kInkHeadDim, CUDA_R_16BF, kInkHeadDim, (long long)K_len * kInkHeadDim,
-                        d_pf_q + (size_t)q0 * kInkHeadDim, CUDA_R_16BF, kInkHeadDim, (long long)M * kInkHeadDim,
+                        d_pf_k + (size_t)k_off * kInkHeadDim, pf_dt, kInkHeadDim, (long long)K_len * kInkHeadDim,
+                        d_pf_q + (size_t)q0 * kInkHeadDim, pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
                         &zero, d_pf_s, CUDA_R_32F, K_sub, (long long)C * K_sub,
-                        kInkHeads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                    k_ink_pf_softmax_rel_sink<<<dim3(C, kInkHeads), 256, 0, st>>>(
-                        d_pf_s, d_rel_table, d_sinks, d_pf_p, q0, C, k_sub_beg, K_sub, p0_val, is_swa);
+                        kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                    if (use_fp16_pf) {
+                        k_ink_pf_softmax_rel_sink<true><<<dim3(C, kInkHeads), 256, 0, st>>>(
+                            d_pf_s, d_rel_table, d_sinks, d_pf_p, q0, C, k_sub_beg, K_sub, p0_val, is_swa);
+                    } else {
+                        k_ink_pf_softmax_rel_sink<false><<<dim3(C, kInkHeads), 256, 0, st>>>(
+                            d_pf_s, d_rel_table, d_sinks, d_pf_p, q0, C, k_sub_beg, K_sub, p0_val, is_swa);
+                    }
                     // O[h, C, 128] = P[h, C, K_sub] @ V[h, k_off..k_off+K_sub, 128]
                     INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                         cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                         kInkHeadDim, C, K_sub, &one,
-                        d_pf_v + (size_t)k_off * kInkHeadDim, CUDA_R_16BF, kInkHeadDim, (long long)K_len * kInkHeadDim,
-                        d_pf_p, CUDA_R_16BF, K_sub, (long long)C * K_sub,
+                        d_pf_v + (size_t)k_off * kInkHeadDim, pf_dt, kInkHeadDim, (long long)K_len * kInkHeadDim,
+                        d_pf_p, pf_dt, K_sub, (long long)C * K_sub,
                         &zero, d_pf_o, CUDA_R_32F, kInkHeadDim, (long long)C * kInkHeadDim,
-                        kInkHeads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                        kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
                     k_ink_pf_unpack_o_gate<<<dim3(kInkHeads, C), 128, 0, st>>>(d_pf_o, d_gate_attn, d_attn_out, q0, C);
                 }
             } else {
                 dim3 g3(kInkKVHeads, M);
                 k_ink_flash_gqa_gqa3<<<g3, 128, 0, st>>>(
                     d_q, d_rel_table, d_sinks, d_gate_attn,
-                    kv_desc[visit], (mode == 1) ? d_slots : nullptr, d_pos,
+                    kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
                     d_attn_out, M);
             }
         }
         prof_mark_end(3); prof_mark_start();
 
         // 8. Output projection wo + FUSED post-attn ShortConv + residual add / block boundary!
-        linear(p + ".attn.wo_ud.weight", d_attn_out, d_wo_raw, M);
+        linear(p + ".attn.wo_ud.weight", d_attn_out, d_wo_raw, M, 0, false, (mode == 2));
         prof_mark_end(4); prof_mark_start();
         if (ip % m.man.c.block_size == 0) {
             // Append residual (d_cur) to blocks, then overwrite d_cur directly with ShortConv(d_wo_raw)!
@@ -1041,11 +1294,19 @@ struct InkCudaRunner {
         }
         prof_mark_end(0); prof_mark_start();
 
-        launch_ink_moe(
-            st, cublas, m.d_sec4, m.d_experts[ip], m.moe_info[ip],
-            (const float*)m.trunk_ptr(p + ".mlp.gate.weight"),
-            (const float*)m.trunk_ptr(p + ".mlp.gate.bias"),
-            d_moe_in, d_moe_raw, M, moe_ws, m.man.c.route_scale, (mode == 2));
+        if (m.layer_has_host[ip] && m.hybrid.active) {
+            launch_ink_moe_hybrid(
+                st, cublas, m.d_sec4, m.d_experts[ip], m.moe_info[ip], ip, m.hybrid,
+                (const float*)m.trunk_ptr(p + ".mlp.gate.weight"),
+                (const float*)m.trunk_ptr(p + ".mlp.gate.bias"),
+                d_moe_in, d_moe_raw, M, moe_ws, m.man.c.route_scale, (mode == 2));
+        } else {
+            launch_ink_moe(
+                st, cublas, m.d_sec4, m.d_experts[ip], m.moe_info[ip],
+                (const float*)m.trunk_ptr(p + ".mlp.gate.weight"),
+                (const float*)m.trunk_ptr(p + ".mlp.gate.bias"),
+                d_moe_in, d_moe_raw, M, moe_ws, m.man.c.route_scale, (mode == 2));
+        }
         prof_mark_end(5); prof_mark_start();
 
         run_sconv_uniform(d_moe_raw, m.d_sconv_mlp[ip], nullptr, d_cur, kInkHidden, 2 * kInkKVDim + kInkHidden, 0, true);
@@ -1161,12 +1422,14 @@ struct InkCudaRunner {
                 graph_cache.push_back({key, exec});
             }
             INK_CK(cudaGraphLaunch(exec, st));
+            if (m.hybrid.active && m.n_host_experts > 0) m.hybrid.step_promote(m.d_sec4, m.d_experts, st);
             return;
         }
         emit_48_visits(M, 0, slot0, p0, want_taps);
+        if (M == 1 && m.hybrid.active && m.n_host_experts > 0) m.hybrid.step_promote(m.d_sec4, m.d_experts, st);
     }
 
-    // Speculative Tree-16 / Block-8 verify (100% CUDA-Graph capturable across ALL p0!)
+    // Speculative Tree-16 / Block-8 verify (100% CUDA-Graph capturable across ALL p0 when 100% VRAM!)
     void forward_tree_verify(const InkTreeSpec& tree, int p0, int slot0, bool want_taps) {
         const int M = tree.M;
         int32_t* slot_buf = h_meta_pin + (meta_ring_idx++ & 63ull) * meta_ring_stride;
@@ -1187,7 +1450,7 @@ struct InkCudaRunner {
         INK_CK(cudaMemcpyAsync(d_tree_anc, h_bytes + 64, 16 * 16, cudaMemcpyHostToDevice, st));
         INK_CK(cudaMemcpyAsync(d_tree_dep, h_bytes + 320, 16, cudaMemcpyHostToDevice, st));
 
-        if (use_cuda_graph && slot0 == 0 && M <= 16) {
+        if (use_cuda_graph && slot0 == 0 && M <= 16 && m.n_host_experts == 0) {
             GraphKey key{M, 2, want_taps ? 1 : 0, (int)kv_dtype};
             cudaGraphExec_t exec = nullptr;
             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
@@ -1206,7 +1469,7 @@ struct InkCudaRunner {
         emit_48_visits(M, 2, slot0, p0, want_taps);
     }
 
-    // Batched multi-slot 1-token-per-slot step (B = 1..64 concurrent requests, captured in CUDA Graph!)
+    // Batched multi-slot 1-token-per-slot step (B = 1..64 concurrent requests, captured in CUDA Graph when 100% VRAM!)
     void forward_batched(const int32_t* tok_ids, const int32_t* slot_ids, const int32_t* pos_arr, int B, bool want_taps = false) {
         int32_t* slot_buf = h_meta_pin + (meta_ring_idx++ & 63ull) * meta_ring_stride;
         std::memcpy(slot_buf, tok_ids, (size_t)B * 4);
@@ -1216,7 +1479,7 @@ struct InkCudaRunner {
         INK_CK(cudaMemcpyAsync(d_slots, slot_buf + B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
         INK_CK(cudaMemcpyAsync(d_pos, slot_buf + 2 * B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
 
-        if (use_cuda_graph && B <= 64) {
+        if (use_cuda_graph && B <= 64 && (m.n_host_experts == 0 || B == 1)) {
             GraphKey key{B, 10, want_taps ? 1 : 0, (int)kv_dtype};
             cudaGraphExec_t exec = nullptr;
             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }

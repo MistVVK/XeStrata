@@ -175,6 +175,34 @@ __global__ void __launch_bounds__(256) k_dspark_fill_mask(
     for (int i = tid; i < (kInkHidden / 4); i += 256) dst4[i] = src4[i];
 }
 
+__global__ void __launch_bounds__(256) k_dspark_split_qkv(
+    const float* __restrict__ qkv,  // [B, 5120]
+    float* __restrict__ q,          // [B, 3072]
+    float* __restrict__ k,          // [B, 1024]
+    float* __restrict__ v,          // [B, 1024]
+    int B) {
+    constexpr int TOT = kInkQDim + 2 * kInkKVDim;  // 5120
+    const int b = blockIdx.y;
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (b >= B || i >= TOT) return;
+    const float val = qkv[(size_t)b * TOT + i];
+    if (i < kInkQDim) q[(size_t)b * kInkQDim + i] = val;
+    else if (i < kInkQDim + kInkKVDim) k[(size_t)b * kInkKVDim + (i - kInkQDim)] = val;
+    else v[(size_t)b * kInkKVDim + (i - kInkQDim - kInkKVDim)] = val;
+}
+
+__global__ void __launch_bounds__(256) k_dspark_swiglu_fused(
+    const float* __restrict__ gu,   // [B, 2 * 9216]
+    float* __restrict__ out,        // [B, 9216]
+    int B) {
+    const int b = blockIdx.y;
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (b >= B || i >= kInkDsparkInter) return;
+    const float* row = gu + (size_t)b * (2 * kInkDsparkInter);
+    const float gv = row[i];
+    out[(size_t)b * kInkDsparkInter + i] = (gv / (1.0f + __expf(-gv))) * row[kInkDsparkInter + i];
+}
+
 __global__ void __launch_bounds__(256) k_dspark_swiglu(const float* __restrict__ g, const float* __restrict__ u, float* __restrict__ out, size_t n) {
     const size_t i = (size_t)blockIdx.x * 256 + threadIdx.x;
     if (i < n) {
@@ -260,23 +288,94 @@ __global__ void __launch_bounds__(128) k_dspark_screen_dp4a7(
     }
 }
 
-// ---- Ultra-Fast 2-Stage 448-CTA Parallel Top-256 Extractor (0.03 ms vs 0.65 ms -> 20x faster!) ----
-// Stage 1: Grid = (64 striped chunks, 7 slots) = 448 CTAs across 170 SMs; each CTA finds Top-16 of its striped slice -> 1,024 pairs/slot!
+// Zero-Emulated-dp4a Bank-Conflict-Free FP32-FMA Screener for Volta sm_70 (V100 15.7 TFLOPS) & Pascal sm_60 (P100)!
+// Zero shared-memory LUT bank conflicts -> HBM2 bandwidth bound (~0.55 ms on V100 vs 4.9-6.7 ms emulated dp4a!)
+__global__ void __launch_bounds__(128) k_dspark_screen_h2_7(
+    const int8_t* __restrict__ q8,    // [V, 2304]
+    const float* __restrict__ sc,     // [V]
+    const int8_t* __restrict__ h_q8,  // [7, 2304]
+    const float* __restrict__ h_sc,   // [7]
+    float* __restrict__ base_logits,  // [7, V]
+    int V) {
+    __shared__ alignas(16) __half2 s_h[7][kInkHidden / 2];  // 32,256 B (linear read -> ZERO bank conflicts!)
+    const int tid = threadIdx.x;
+    for (int m = 0; m < 7; ++m) {
+        const int8_t* src = h_q8 + (size_t)m * kInkHidden;
+        for (int i = tid; i < (kInkHidden / 2); i += 128) {
+            s_h[m][i] = __halves2half2(
+                __float2half_rn((float)src[2 * i] * (1.0f / 127.0f)),
+                __float2half_rn((float)src[2 * i + 1] * (1.0f / 127.0f)));
+        }
+    }
+    __syncthreads();
+
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int row  = blockIdx.x * 4 + warp;
+    if (row >= V) return;
+
+    const uint4* q16 = reinterpret_cast<const uint4*>(q8 + (size_t)row * kInkHidden);
+    __half2 acc[7];
+#pragma unroll
+    for (int m = 0; m < 7; ++m) acc[m] = __float2half2_rn(0.0f);
+
+    for (int i = lane; i < (kInkHidden / 16); i += 32) {
+        const uint4 v = q16[i];
+        const __half2 w0 = __halves2half2(__int2half_rn((int)(int8_t)(v.x)),       __int2half_rn((int)(int8_t)(v.x >> 8)));
+        const __half2 w1 = __halves2half2(__int2half_rn((int)(int8_t)(v.x >> 16)), __int2half_rn((int)(int8_t)(v.x >> 24)));
+        const __half2 w2 = __halves2half2(__int2half_rn((int)(int8_t)(v.y)),       __int2half_rn((int)(int8_t)(v.y >> 8)));
+        const __half2 w3 = __halves2half2(__int2half_rn((int)(int8_t)(v.y >> 16)), __int2half_rn((int)(int8_t)(v.y >> 24)));
+        const __half2 w4 = __halves2half2(__int2half_rn((int)(int8_t)(v.z)),       __int2half_rn((int)(int8_t)(v.z >> 8)));
+        const __half2 w5 = __halves2half2(__int2half_rn((int)(int8_t)(v.z >> 16)), __int2half_rn((int)(int8_t)(v.z >> 24)));
+        const __half2 w6 = __halves2half2(__int2half_rn((int)(int8_t)(v.w)),       __int2half_rn((int)(int8_t)(v.w >> 8)));
+        const __half2 w7 = __halves2half2(__int2half_rn((int)(int8_t)(v.w >> 16)), __int2half_rn((int)(int8_t)(v.w >> 24)));
+        const int base = i * 8;
+#pragma unroll
+        for (int m = 0; m < 7; ++m) {
+            const __half2* hp = &s_h[m][base];
+            __half2 a = acc[m];
+            a = __hfma2(w0, hp[0], a); a = __hfma2(w1, hp[1], a);
+            a = __hfma2(w2, hp[2], a); a = __hfma2(w3, hp[3], a);
+            a = __hfma2(w4, hp[4], a); a = __hfma2(w5, hp[5], a);
+            a = __hfma2(w6, hp[6], a); a = __hfma2(w7, hp[7], a);
+            acc[m] = a;
+        }
+    }
+    const float sc_r = sc[row] * 127.0f;
+#pragma unroll
+    for (int m = 0; m < 7; ++m) {
+        const float2 f2 = __half22float2(acc[m]);
+        float s = warp_sum(f2.x + f2.y);
+        if (lane == 0) base_logits[(size_t)m * V + row] = s * sc_r * h_sc[m];
+    }
+}
+
+// Split fused kv_ctx [M, 2048] -> kc [M, 1024], vc [M, 1024]
+__global__ void __launch_bounds__(256) k_dspark_split_kv(
+    const float* __restrict__ kv_fused, float* __restrict__ kc, float* __restrict__ vc, int M) {
+    const int m = blockIdx.y;
+    const int c = blockIdx.x * 256 + threadIdx.x;
+    if (m >= M || c >= 2 * kInkKVDim) return;
+    const float v = kv_fused[(size_t)m * (2 * kInkKVDim) + c];
+    if (c < kInkKVDim) kc[(size_t)m * kInkKVDim + c] = v;
+    else               vc[(size_t)m * kInkKVDim + (c - kInkKVDim)] = v;
+}
+
+// ---- Ultra-Fast 2-Stage 896-CTA Parallel Top-512 Extractor (~0.03 ms on RTX 5090!) ----
+// Stage 1: Grid = (128 striped chunks, 7 slots) = 896 CTAs across 170 SMs; each CTA finds Top-16 -> 2,048 pairs/slot!
 __global__ void __launch_bounds__(256) k_dspark_top_cand_s1(
     const float* __restrict__ base_logits,  // [7, V]
     int V,
-    int32_t* __restrict__ tmp_ids,          // [7, 64 * 16 = 1024]
-    float* __restrict__ tmp_vals) {         // [7, 1024]
+    int32_t* __restrict__ tmp_ids,          // [7, 128 * 16 = 2048]
+    float* __restrict__ tmp_vals) {         // [7, 2048]
     const int s = blockIdx.y;   // 0..6
-    const int ch = blockIdx.x;  // 0..63
+    const int ch = blockIdx.x;  // 0..127
     const int tid = threadIdx.x;
     const float* lg = base_logits + (size_t)s * V;
 
-    // Each of 256 threads scans V/(64*256) ~= 13 elements in striped order (zero vocab-cluster bias, 100% coalesced!)
-    // Keep top-2 per thread -> 512 elements -> warp reduce 8x -> 16 top values per CTA!
     float b0 = -3e38f, b1 = -3e38f;
     int32_t i0 = 0, i1 = 0;
-    for (int base = ch * 256; base < V; base += 64 * 256) {
+    for (int base = ch * 256; base < V; base += 128 * 256) {
         const int idx = base + tid;
         if (idx < V) {
             const float v = lg[idx];
@@ -284,10 +383,8 @@ __global__ void __launch_bounds__(256) k_dspark_top_cand_s1(
             else if (v > b1) { b1 = v; i1 = idx; }
         }
     }
-    // Each of 8 warps reduces its top-2 -> 8*2 = 16 outputs per CTA!
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    // Extract top-2 in warp: first find warp max (b0, i0), zero it out, find second max!
     float wv0 = b0; int32_t wi0 = i0;
 #pragma unroll
     for (int o = 16; o >= 1; o >>= 1) {
@@ -305,29 +402,29 @@ __global__ void __launch_bounds__(256) k_dspark_top_cand_s1(
         if (ov > wv1 || (ov == wv1 && oi < wi1)) { wv1 = ov; wi1 = oi; }
     }
     if (lane == 0) {
-        const size_t ob = (size_t)s * 1024 + ch * 16 + warp * 2;
+        const size_t ob = (size_t)s * 2048 + ch * 16 + warp * 2;
         tmp_ids[ob + 0]  = wi0; tmp_vals[ob + 0] = wv0;
         tmp_ids[ob + 1]  = wi1; tmp_vals[ob + 1] = wv1;
     }
 }
 
-// Stage 2: 7 CTAs x 256 threads pick exact Top-K_cand (256) from the 1,024 Stage-1 candidates in shared memory (~2 us)!
+// Stage 2: 7 CTAs x 256 threads pick exact Top-K_cand (512) from the 2,048 Stage-1 candidates in shared memory (~3 us)!
 __global__ void __launch_bounds__(256) k_dspark_top_cand_s2(
-    const int32_t* __restrict__ tmp_ids,    // [7, 1024]
-    const float* __restrict__ tmp_vals,     // [7, 1024]
+    const int32_t* __restrict__ tmp_ids,    // [7, 2048]
+    const float* __restrict__ tmp_vals,     // [7, 2048]
     int K_cand,
     int32_t* __restrict__ cand_ids,         // [7, K_cand]
     float* __restrict__ cand_base) {        // [7, K_cand]
-    __shared__ int32_t s_id[1024];
-    __shared__ float   s_val[1024];
+    __shared__ int32_t s_id[2048];
+    __shared__ float   s_val[2048];
     __shared__ int hist[256];
     __shared__ uint32_t prefix_s, thr_s;
     __shared__ int need_s, cnt;
     const int s = blockIdx.x;
     const int tid = threadIdx.x;
-    for (int i = tid; i < 1024; i += 256) {
-        s_id[i]  = tmp_ids[(size_t)s * 1024 + i];
-        s_val[i] = tmp_vals[(size_t)s * 1024 + i];
+    for (int i = tid; i < 2048; i += 256) {
+        s_id[i]  = tmp_ids[(size_t)s * 2048 + i];
+        s_val[i] = tmp_vals[(size_t)s * 2048 + i];
     }
     if (tid == 0) { prefix_s = 0; need_s = K_cand; }
     __syncthreads();
@@ -336,7 +433,7 @@ __global__ void __launch_bounds__(256) k_dspark_top_cand_s2(
         hist[tid] = 0;
         __syncthreads();
         const uint32_t pre = prefix_s;
-        for (int i = tid; i < 1024; i += 256) {
+        for (int i = tid; i < 2048; i += 256) {
             const uint32_t k = dspark_f2key(s_val[i]);
             if (pass == 0 || (k >> (shift + 8)) == (pre >> (shift + 8))) atomicAdd(&hist[(k >> shift) & 255u], 1);
         }
@@ -358,7 +455,7 @@ __global__ void __launch_bounds__(256) k_dspark_top_cand_s2(
     const uint32_t thr = thr_s;
     int32_t* o_id = cand_ids + (size_t)s * K_cand;
     float* o_val = cand_base + (size_t)s * K_cand;
-    for (int i = tid; i < 1024; i += 256) {
+    for (int i = tid; i < 2048; i += 256) {
         if (dspark_f2key(s_val[i]) > thr) {
             int p = atomicAdd(&cnt, 1);
             if (p < K_cand) { o_id[p] = s_id[i]; o_val[p] = s_val[i]; }
@@ -366,7 +463,7 @@ __global__ void __launch_bounds__(256) k_dspark_top_cand_s2(
     }
     __syncthreads();
     if (cnt < K_cand) {
-        for (int i = tid; i < 1024; i += 256) {
+        for (int i = tid; i < 2048; i += 256) {
             if (dspark_f2key(s_val[i]) == thr) {
                 int p = atomicAdd(&cnt, 1);
                 if (p < K_cand) { o_id[p] = s_id[i]; o_val[p] = s_val[i]; }
@@ -591,8 +688,9 @@ struct InkDSpark {
 
     // Working buffers for Block-8 forward
     float *d_cur = nullptr, *d_h = nullptr, *d_q = nullptr, *d_k = nullptr, *d_v = nullptr;
+    float *d_qkv_fused = nullptr, *d_gu_fused = nullptr;
     float *d_attn_out = nullptr, *d_proj = nullptr, *d_g = nullptr, *d_u = nullptr, *d_act = nullptr;
-    float *d_ctx_tmp = nullptr, *d_kc_tmp = nullptr, *d_vc_tmp = nullptr;
+    float *d_ctx_tmp = nullptr, *d_kc_tmp = nullptr, *d_vc_tmp = nullptr, *d_kv_ctx_fused = nullptr;
     float *d_base_logits = nullptr;  // [7, V_unpadded] (slots 1..7)
     int32_t *d_cand_ids = nullptr;   // [7, K_cand]
     float   *d_cand_base = nullptr;  // [7, K_cand]
@@ -615,14 +713,17 @@ struct InkDSpark {
     int32_t *h_top2_ids = nullptr;   // pinned [7, 2]
     float   *h_top2_probs = nullptr; // pinned [7, 2]
     int32_t *h_meta_pin = nullptr;   // pinned [16] for async anchor/apos/pos
+    int32_t *h_pos_pin = nullptr;    // pinned [max_batch] for zero-sync ingest_taps_from!
     cudaGraphExec_t draft_graph = nullptr;
-    // Pre-dequantized BF16 cache of DSpark's 3 tiny layers (380 MB -> runs on BF16 Tensor Cores in ~0.18 ms across SQ-20/15/10!)
-    std::unordered_map<std::string, __nv_bfloat16*> bf16_cache;
-    __nv_bfloat16* d_bf16_pool = nullptr;
+    // Pre-dequantized BF16 (sm_80+) or FP16 (sm_70/75) cache of DSpark's 3 tiny layers (+ fused kv_ctx!)
+    std::unordered_map<std::string, uint16_t*> bf16_cache;
+    uint16_t* d_bf16_pool = nullptr;
+    __half*   d_unembed_fp16 = nullptr;  // Optional FP16 unembed on V100 sm_70 (32GB) -> 0.67 ms TC screening!
+    bool cache_is_fp16 = false;
 
     InkDSpark(InkCudaRunner& runner) : r(runner), m(runner.m) {}
 
-    void init(int ctx, int k_cand = 256) {
+    void init(int ctx, int k_cand = 512) {
         if (!m.man.has_dspark) return;
         max_ctx = ctx;
         K_cand = k_cand;
@@ -638,6 +739,8 @@ struct InkDSpark {
         d_q           = dalloc<float>(B * kInkQDim);
         d_k           = dalloc<float>(B * kInkKVDim);
         d_v           = dalloc<float>(B * kInkKVDim);
+        d_qkv_fused   = dalloc<float>(B * (kInkQDim + 2 * kInkKVDim));
+        d_gu_fused    = dalloc<float>(B * (2 * kInkDsparkInter));
         d_attn_out    = dalloc<float>(B * kInkQDim);
         d_proj        = dalloc<float>(B * kInkHidden);
         d_g           = dalloc<float>(B * kInkDsparkInter);
@@ -646,11 +749,12 @@ struct InkDSpark {
         d_ctx_tmp     = dalloc<float>((size_t)r.max_batch * kInkHidden);
         d_kc_tmp      = dalloc<float>((size_t)r.max_batch * kInkKVDim);
         d_vc_tmp      = dalloc<float>((size_t)r.max_batch * kInkKVDim);
-        d_base_logits = dalloc<float>(7ull * m.man.c.vocab_unpadded);
+        d_kv_ctx_fused= dalloc<float>((size_t)r.max_batch * 2 * kInkKVDim);
+        d_base_logits = dalloc<float>(8ull * m.man.c.vocab_unpadded);
         d_cand_ids    = dalloc<int32_t>(7ull * K_cand);
         d_cand_base   = dalloc<float>(7ull * K_cand);
-        d_top_tmp_ids = dalloc<int32_t>(7ull * 1024);
-        d_top_tmp_vals= dalloc<float>(7ull * 1024);
+        d_top_tmp_ids = dalloc<int32_t>(7ull * 2048);
+        d_top_tmp_vals= dalloc<float>(7ull * 2048);
         d_h_q8        = dalloc<int8_t>(7ull * kInkHidden);
         d_h_sc        = dalloc<float>(7);
         d_cand_scores = dalloc<float>(K_cand);
@@ -668,76 +772,157 @@ struct InkDSpark {
         h_top2_ids    = halloc_pinned<int32_t>(14);
         h_top2_probs  = halloc_pinned<float>(14);
         h_meta_pin    = halloc_pinned<int32_t>(16);
+        h_pos_pin     = halloc_pinned<int32_t>(std::max(r.max_batch, 16));
 
-        // Pre-dequantize the 3 tiny DSpark layers (Q8_ROW/S5_K) to BF16 once when VRAM allows (~380 MB -> 8x faster DSpark!)
+        // Pre-pack the 3 tiny DSpark layers into fused BF16 (sm_80+) or FP16 (sm_70/75) QKV, GU, KV_CTX, O, DOWN!
+        // Collapses 21+6 cuBLAS calls -> 12+3 Tensor Core calls (< 0.35 ms on 5090 & V100!)
         size_t vfree = 0, vtot = 0;
         INK_CK(cudaMemGetInfo(&vfree, &vtot));
-        std::vector<std::string> wnames;
-        for (int il = 0; il < 3; ++il) {
-            const std::string p = "dspark.layers." + std::to_string(il);
-            wnames.push_back(p + ".self_attn.q_proj.weight");
-            wnames.push_back(p + ".self_attn.k_proj.weight");
-            wnames.push_back(p + ".self_attn.v_proj.weight");
-            wnames.push_back(p + ".self_attn.o_proj.weight");
-            wnames.push_back(p + ".mlp.gate_proj.weight");
-            wnames.push_back(p + ".mlp.up_proj.weight");
-            wnames.push_back(p + ".mlp.down_proj.weight");
-        }
-        size_t tot_elems = 0;
-        for (const auto& wn : wnames) {
+        cache_is_fp16 = (m.sm_cc >= 70 && m.sm_cc < 80);
+        auto load_to_tc = [&](const std::string& wn, uint16_t* dst_u16) {
             const auto& ti = m.tinfo(wn);
-            if (ti.fmt != FMT_BF16) tot_elems += (size_t)ti.rows() * ti.cols();
-        }
-        if (tot_elems > 0 && vfree > tot_elems * 2 + (1024ull << 20)) {
-            d_bf16_pool = dalloc<__nv_bfloat16>(tot_elems);
-            size_t cur = 0;
-            for (const auto& wn : wnames) {
-                const auto& ti = m.tinfo(wn);
-                if (ti.fmt == FMT_BF16) continue;
-                const int N = (int)ti.rows(), K = (int)ti.cols();
-                __nv_bfloat16* dst = d_bf16_pool + cur;
-                cur += (size_t)N * K;
+            const int N = (int)ti.rows(), K = (int)ti.cols();
+            const uint8_t* W = m.d_trunk + ti.off;
+            __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(dst_u16);
+            if (ti.fmt == FMT_BF16) {
+                if (cache_is_fp16) {
+                    const size_t nw = (size_t)N * K;
+                    k_ink_bf16_to_fp16<<<(nw + 255) / 256, 256, 0, r.st>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(W), reinterpret_cast<__half*>(dst_u16), nw);
+                    return;
+                }
+                INK_CK(cudaMemcpyAsync(dst, W, (size_t)N * K * 2, cudaMemcpyDeviceToDevice, r.st));
+            } else {
                 dim3 dg((K + 255) / 256, N);
-                const uint8_t* W = m.d_trunk + ti.off;
                 if (ti.fmt == FMT_Q8ROW)     k_ink_q8row_to_bf16<<<dg, 256, 0, r.st>>>(W, dst, N, K);
                 else if (ti.fmt == FMT_S5_K) k_ink_sk_to_bf16<FMT_S5_K><<<dg, 256, 0, r.st>>>(W, dst, N, K);
                 else if (ti.fmt == FMT_S6_K) k_ink_sk_to_bf16<FMT_S6_K><<<dg, 256, 0, r.st>>>(W, dst, N, K);
                 else if (ti.fmt == FMT_S8_K) k_ink_sk_to_bf16<FMT_S8_K><<<dg, 256, 0, r.st>>>(W, dst, N, K);
-                bf16_cache[wn] = dst;
+                if (cache_is_fp16) {
+                    const size_t nw = (size_t)N * K;
+                    k_ink_bf16_to_fp16<<<(nw + 255) / 256, 256, 0, r.st>>>(dst, reinterpret_cast<__half*>(dst_u16), nw);
+                }
+            }
+        };
+        size_t tot_elems = 0;
+        for (int il = 0; il < 3; ++il) {
+            const std::string p = "dspark.layers." + std::to_string(il);
+            tot_elems += (size_t)(kInkQDim + 2 * kInkKVDim) * kInkHidden;   // fused QKV [5120, 2304]
+            tot_elems += (size_t)(2 * kInkDsparkInter) * kInkHidden;        // fused GU  [18432, 2304]
+            tot_elems += (size_t)(2 * kInkKVDim) * kInkHidden;              // fused KV_CTX [2048, 2304]
+            if (cache_is_fp16 || m.tinfo(p + ".self_attn.o_proj.weight").fmt != FMT_BF16) tot_elems += (size_t)kInkHidden * kInkQDim;
+            if (cache_is_fp16 || m.tinfo(p + ".mlp.down_proj.weight").fmt != FMT_BF16)    tot_elems += (size_t)kInkHidden * kInkDsparkInter;
+        }
+        if (m.sm_cc >= 70 && vfree > tot_elems * 2 + (768ull << 20)) {
+            d_bf16_pool = dalloc<uint16_t>(tot_elems);
+            size_t cur = 0;
+            for (int il = 0; il < 3; ++il) {
+                const std::string p = "dspark.layers." + std::to_string(il);
+                uint16_t* qkv = d_bf16_pool + cur;
+                load_to_tc(p + ".self_attn.q_proj.weight", qkv);
+                load_to_tc(p + ".self_attn.k_proj.weight", qkv + (size_t)kInkQDim * kInkHidden);
+                load_to_tc(p + ".self_attn.v_proj.weight", qkv + (size_t)(kInkQDim + kInkKVDim) * kInkHidden);
+                bf16_cache[p + ".qkv_fused"] = qkv;
+                cur += (size_t)(kInkQDim + 2 * kInkKVDim) * kInkHidden;
+
+                uint16_t* gu = d_bf16_pool + cur;
+                load_to_tc(p + ".mlp.gate_proj.weight", gu);
+                load_to_tc(p + ".mlp.up_proj.weight",   gu + (size_t)kInkDsparkInter * kInkHidden);
+                bf16_cache[p + ".gu_fused"] = gu;
+                cur += (size_t)(2 * kInkDsparkInter) * kInkHidden;
+
+                uint16_t* kv_ctx = d_bf16_pool + cur;
+                load_to_tc(p + ".self_attn.k_proj_ctx.weight", kv_ctx);
+                load_to_tc(p + ".self_attn.v_proj_ctx.weight", kv_ctx + (size_t)kInkKVDim * kInkHidden);
+                bf16_cache[p + ".kv_ctx_fused"] = kv_ctx;
+                cur += (size_t)(2 * kInkKVDim) * kInkHidden;
+
+                const std::string op = p + ".self_attn.o_proj.weight";
+                if (cache_is_fp16 || m.tinfo(op).fmt != FMT_BF16) {
+                    load_to_tc(op, d_bf16_pool + cur);
+                    bf16_cache[op] = d_bf16_pool + cur;
+                    cur += (size_t)kInkHidden * kInkQDim;
+                }
+                const std::string dp = p + ".mlp.down_proj.weight";
+                if (cache_is_fp16 || m.tinfo(dp).fmt != FMT_BF16) {
+                    load_to_tc(dp, d_bf16_pool + cur);
+                    bf16_cache[dp] = d_bf16_pool + cur;
+                    cur += (size_t)kInkHidden * kInkDsparkInter;
+                }
             }
             INK_CK(cudaStreamSynchronize(r.st));
+        }
+        // On Volta sm_70 (V100 32GB, lacks hardware dp4a), pre-pack FP16 unembed [V, 2304] (~604 MB) when >2 GiB free
+        // so DSpark base-logit screening runs on 125 TFLOPS FP16 Tensor Cores in ~0.67 ms (instead of 4.6 ms)!
+        if (m.sm_cc == 70 && m.unembed_screen.ready) {
+            INK_CK(cudaMemGetInfo(&vfree, &vtot));
+            const size_t u_elems = (size_t)m.man.c.vocab_unpadded * kInkHidden;
+            if (vfree > u_elems * 2 + (2048ull << 20)) {
+                d_unembed_fp16 = dalloc<__half>(u_elems);
+                const auto& ui = m.tinfo("model.llm.unembed.weight");
+                const uint8_t* W = m.d_trunk + ui.off;
+                const int V = m.man.c.vocab_unpadded;
+                if (ui.fmt == FMT_BF16) {
+                    k_ink_bf16_to_fp16<<<(u_elems + 255) / 256, 256, 0, r.st>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(W), d_unembed_fp16, u_elems);
+                } else {
+                    // Convert Q8 unembed_screen directly to FP16 (identical to dp4a7 screen, 6x faster via FP16 TC!)
+                    dim3 dg((kInkHidden + 255) / 256, V);
+                    k_ink_sk_to_bf16<FMT_S6_K><<<dg, 256, 0, r.st>>>(W, reinterpret_cast<__nv_bfloat16*>(d_unembed_fp16), V, kInkHidden);
+                    k_ink_bf16_to_fp16<<<(u_elems + 255) / 256, 256, 0, r.st>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(d_unembed_fp16), d_unembed_fp16, u_elems);
+                }
+                INK_CK(cudaStreamSynchronize(r.st));
+            }
         }
         ready = true;
     }
 
-    // Fast BF16 Tensor Core linear for DSpark B=8 (uses pre-dequantized BF16 cache when available!)
-    void dspark_linear_b8(const std::string& wn, const float* X, float* Y, int B, bool reuse_x = false) {
-        const auto& ti = m.tinfo(wn);
-        const int N = (int)ti.rows(), K = (int)ti.cols();
-        auto it = bf16_cache.find(wn);
-        const __nv_bfloat16* Wbf = (it != bf16_cache.end()) ? it->second
-                                  : (ti.fmt == FMT_BF16 ? reinterpret_cast<const __nv_bfloat16*>(m.d_trunk + ti.off) : nullptr);
-        if (Wbf) {
+    // Fast cuBLAS BF16 (sm_80+) or FP16 (sm_70/75) Tensor Core linear for DSpark!
+    void dspark_gemm_bf16(const uint16_t* W16, const float* X, float* Y, int B, int N, int K, bool reuse_x = false) {
+        const float a = 1.0f, b = 0.0f;
+        if (cache_is_fp16) {
+            __half* x_fp16 = reinterpret_cast<__half*>(r.d_x_bf16);
+            if (!reuse_x) {
+                const size_t nx = (size_t)B * K;
+                k_ink_f32_to_fp16<<<(nx + 255) / 256, 256, 0, r.st>>>(X, x_fp16, nx);
+            }
+            INK_CUBLAS_CK(cublasGemmEx(
+                r.cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, B, K, &a,
+                W16, CUDA_R_16F, K, x_fp16, CUDA_R_16F, K, &b,
+                Y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        } else {
             if (!reuse_x) {
                 const size_t nx = (size_t)B * K;
                 k_ink_f32_to_bf16<<<((nx + 3) / 4 + 255) / 256, 256, 0, r.st>>>(X, r.d_x_bf16, nx);
             }
-            const float a = 1.0f, b = 0.0f;
             INK_CUBLAS_CK(cublasGemmEx(
                 r.cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, B, K, &a,
-                Wbf, CUDA_R_16BF, K, r.d_x_bf16, CUDA_R_16BF, K, &b,
+                W16, CUDA_R_16BF, K, r.d_x_bf16, CUDA_R_16BF, K, &b,
                 Y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            return;
+        }
+    }
+
+    void dspark_linear_b8(const std::string& wn, const float* X, float* Y, int B, bool reuse_x = false) {
+        if (m.sm_cc >= 70) {
+            const auto& ti = m.tinfo(wn);
+            const int N = (int)ti.rows(), K = (int)ti.cols();
+            auto it = bf16_cache.find(wn);
+            const uint16_t* W16 = (it != bf16_cache.end()) ? it->second
+                                : ((!cache_is_fp16 && ti.fmt == FMT_BF16) ? reinterpret_cast<const uint16_t*>(m.d_trunk + ti.off) : nullptr);
+            if (W16) {
+                dspark_gemm_bf16(W16, X, Y, B, N, K, reuse_x);
+                return;
+            }
         }
         r.linear(wn, X, Y, B);
     }
 
-    // Ingest target taps [4, M, 2304] at positions [p0 .. p0 + M - 1] into DSpark context KV & f_rnn!
+    // Ingest target taps [4, M, 2304] at positions [p0 .. p0 + M - 1] into DSpark context KV & f_rnn (ZERO host sync!)
     void ingest_taps_from(float* const taps[4], int p0, int M) {
         if (!ready || M <= 0) return;
-        std::vector<int32_t> hp(M);
-        for (int i = 0; i < M; ++i) hp[i] = p0 + i;
-        INK_CK(cudaMemcpy(d_pos, hp.data(), (size_t)M * 4, cudaMemcpyHostToDevice));
+        for (int i = 0; i < M; ++i) h_pos_pin[i] = p0 + i;
+        INK_CK(cudaMemcpyAsync(d_pos, h_pos_pin, (size_t)M * 4, cudaMemcpyHostToDevice, r.st));
         const float* fw = (const float*)m.trunk_ptr("dspark.fuse_weight");
 
         for (int il = 0; il < 3; ++il) {
@@ -745,8 +930,14 @@ struct InkDSpark {
             k_dspark_mix_taps<<<M, 256, 0, r.st>>>(
                 taps[0], taps[1], taps[2], taps[3], fw, il,
                 (const float*)m.trunk_ptr(p + ".dflare_norm.weight"), d_ctx_tmp, M);
-            r.linear(p + ".self_attn.k_proj_ctx.weight", d_ctx_tmp, d_kc_tmp, M);
-            r.linear(p + ".self_attn.v_proj_ctx.weight", d_ctx_tmp, d_vc_tmp, M);
+            auto it_kv = bf16_cache.find(p + ".kv_ctx_fused");
+            if (it_kv != bf16_cache.end()) {
+                dspark_gemm_bf16(it_kv->second, d_ctx_tmp, d_kv_ctx_fused, M, 2 * kInkKVDim, kInkHidden, false);
+                k_dspark_split_kv<<<dim3((2 * kInkKVDim + 255) / 256, M), 256, 0, r.st>>>(d_kv_ctx_fused, d_kc_tmp, d_vc_tmp, M);
+            } else {
+                r.linear(p + ".self_attn.k_proj_ctx.weight", d_ctx_tmp, d_kc_tmp, M);
+                r.linear(p + ".self_attn.v_proj_ctx.weight", d_ctx_tmp, d_vc_tmp, M);
+            }
             dim3 g(kInkKVHeads, M);
             k_dspark_rmsnorm_rope<<<g, 128, 0, r.st>>>(
                 d_kc_tmp, (const float*)m.trunk_ptr(p + ".self_attn.k_norm_ctx.weight"),
@@ -757,7 +948,7 @@ struct InkDSpark {
             desc.cap_pos = max_ctx;
             desc.is_swa = false;
             desc.is_fp8 = false;
-            k_ink_kv_write<<<g, 128, 0, r.st>>>(d_kc_tmp, d_vc_tmp, nullptr, d_pos, desc, M);
+            k_ink_kv_write<<<g, 128, 0, r.st>>>(d_kc_tmp, d_vc_tmp, nullptr, 0, d_pos, desc, M);
         }
         k_dspark_mix_taps<<<M, 256, 0, r.st>>>(
             taps[0], taps[1], taps[2], taps[3], fw, 3,
@@ -780,13 +971,19 @@ struct InkDSpark {
         const float* mask_e = (const float*)m.trunk_ptr("dspark.mask_embed");
         k_dspark_fill_mask<<<B - 1, 256, 0, r.st>>>(mask_e, d_cur, B);
 
-        // 2. 3 non-causal block-attention layers (Blackwell BF16 Tensor Cores!)
+        // 2. 3 non-causal block-attention layers (Fused QKV + Fused GU cuBLAS BF16 Tensor Cores -> < 0.85 ms total!)
         for (int il = 0; il < 3; ++il) {
             const std::string p = "dspark.layers." + std::to_string(il);
             k_ink_rms_norm<<<B, 256, 0, r.st>>>(d_cur, (const float*)m.trunk_ptr(p + ".input_layernorm.weight"), d_h, nullptr, B, kInkHidden);
-            dspark_linear_b8(p + ".self_attn.q_proj.weight", d_h, d_q, B, false);
-            dspark_linear_b8(p + ".self_attn.k_proj.weight", d_h, d_k, B, true);
-            dspark_linear_b8(p + ".self_attn.v_proj.weight", d_h, d_v, B, true);
+            auto it_qkv = bf16_cache.find(p + ".qkv_fused");
+            if (it_qkv != bf16_cache.end()) {
+                dspark_gemm_bf16(it_qkv->second, d_h, d_qkv_fused, B, kInkQDim + 2 * kInkKVDim, kInkHidden, false);
+                k_dspark_split_qkv<<<dim3((kInkQDim + 2 * kInkKVDim + 255) / 256, B), 256, 0, r.st>>>(d_qkv_fused, d_q, d_k, d_v, B);
+            } else {
+                dspark_linear_b8(p + ".self_attn.q_proj.weight", d_h, d_q, B, false);
+                dspark_linear_b8(p + ".self_attn.k_proj.weight", d_h, d_k, B, true);
+                dspark_linear_b8(p + ".self_attn.v_proj.weight", d_h, d_v, B, true);
+            }
             k_dspark_rmsnorm_rope<<<dim3(kInkHeads, B), 128, 0, r.st>>>(
                 d_q, (const float*)m.trunk_ptr(p + ".self_attn.q_norm.weight"), d_pos, m.man.c.dspark_rope_theta, B, kInkHeads);
             k_dspark_rmsnorm_rope<<<dim3(kInkKVHeads, B), 128, 0, r.st>>>(
@@ -798,24 +995,48 @@ struct InkDSpark {
             k_ink_add<<<(B * kInkHidden + 255) / 256, 256, 0, r.st>>>(d_cur, d_cur, d_proj, B * kInkHidden);
 
             k_ink_rms_norm<<<B, 256, 0, r.st>>>(d_cur, (const float*)m.trunk_ptr(p + ".post_attention_layernorm.weight"), d_h, nullptr, B, kInkHidden);
-            dspark_linear_b8(p + ".mlp.gate_proj.weight", d_h, d_g, B, false);
-            dspark_linear_b8(p + ".mlp.up_proj.weight", d_h, d_u, B, true);
-            k_dspark_swiglu<<<(B * kInkDsparkInter + 255) / 256, 256, 0, r.st>>>(d_g, d_u, d_act, B * kInkDsparkInter);
+            auto it_gu = bf16_cache.find(p + ".gu_fused");
+            if (it_gu != bf16_cache.end()) {
+                dspark_gemm_bf16(it_gu->second, d_h, d_gu_fused, B, 2 * kInkDsparkInter, kInkHidden, false);
+                k_dspark_swiglu_fused<<<dim3((kInkDsparkInter + 255) / 256, B), 256, 0, r.st>>>(d_gu_fused, d_act, B);
+            } else {
+                dspark_linear_b8(p + ".mlp.gate_proj.weight", d_h, d_g, B, false);
+                dspark_linear_b8(p + ".mlp.up_proj.weight", d_h, d_u, B, true);
+                k_dspark_swiglu<<<(B * kInkDsparkInter + 255) / 256, 256, 0, r.st>>>(d_g, d_u, d_act, B * kInkDsparkInter);
+            }
             dspark_linear_b8(p + ".mlp.down_proj.weight", d_act, d_proj, B, false);
             k_ink_add<<<(B * kInkHidden + 255) / 256, 256, 0, r.st>>>(d_cur, d_cur, d_proj, B * kInkHidden);
         }
 
-        // 3. Final norm + ultra-fast dp4a INT8 base logits (~0.30 ms!) + 448-CTA 2-stage Top-256 (~0.03 ms!)
+        // 3. Final norm + ultra-fast dp4a INT8 base logits (~0.30 ms!) + 896-CTA 2-stage Top-512 (~0.03 ms!)
         k_ink_rms_norm<<<B, 256, 0, r.st>>>(d_cur, (const float*)m.trunk_ptr("dspark.norm.weight"), d_cur, nullptr, B, kInkHidden);
         const int V = m.man.c.vocab_unpadded;
-        if (m.unembed_screen.ready) {
+        const float* base_logits_7 = d_base_logits;
+        if (d_unembed_fp16) {
+            // Volta sm_70 V100: N=8 (multiple of 8!) engages 125 TFLOPS FP16 Tensor Cores (~0.67 ms vs 4.6 ms!)
+            const size_t nx = 8ull * kInkHidden;
+            __half* x_fp16 = reinterpret_cast<__half*>(r.d_x_bf16);
+            k_ink_f32_to_fp16<<<(nx + 255) / 256, 256, 0, r.st>>>(d_cur, x_fp16, nx);
+            const float a = 1.0f, b = 0.0f;
+            INK_CUBLAS_CK(cublasGemmEx(
+                r.cublas, CUBLAS_OP_T, CUBLAS_OP_N, V, 8, kInkHidden, &a,
+                d_unembed_fp16, CUDA_R_16F, kInkHidden, x_fp16, CUDA_R_16F, kInkHidden, &b,
+                d_base_logits, CUDA_R_32F, V, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            base_logits_7 = d_base_logits + V;
+        } else if (m.unembed_screen.ready) {
             k_dspark_quant_h_q8<<<7, 256, 0, r.st>>>(d_cur + kInkHidden, d_h_q8, d_h_sc);
-            k_dspark_screen_dp4a7<<<(V + 3) / 4, 128, 0, r.st>>>(
-                m.unembed_screen.q8, m.unembed_screen.sc, d_h_q8, d_h_sc, d_base_logits, V);
+            if (m.sm_cc == 70 || m.sm_cc == 60) {
+                // Volta sm_70 (V100) & Pascal sm_60 (P100) lack hardware dp4a -> use 31.4/21.2 TFLOPS FP16x2 __hfma2!
+                k_dspark_screen_h2_7<<<(V + 3) / 4, 128, 0, r.st>>>(
+                    m.unembed_screen.q8, m.unembed_screen.sc, d_h_q8, d_h_sc, d_base_logits, V);
+            } else {
+                k_dspark_screen_dp4a7<<<(V + 3) / 4, 128, 0, r.st>>>(
+                    m.unembed_screen.q8, m.unembed_screen.sc, d_h_q8, d_h_sc, d_base_logits, V);
+            }
         } else {
             r.linear("model.llm.unembed.weight", d_cur + kInkHidden, d_base_logits, 7, V);
         }
-        k_dspark_top_cand_s1<<<dim3(64, 7), 256, 0, r.st>>>(d_base_logits, V, d_top_tmp_ids, d_top_tmp_vals);
+        k_dspark_top_cand_s1<<<dim3(128, 7), 256, 0, r.st>>>(base_logits_7, V, d_top_tmp_ids, d_top_tmp_vals);
         k_dspark_top_cand_s2<<<7, 256, 0, r.st>>>(d_top_tmp_ids, d_top_tmp_vals, K_cand, d_cand_ids, d_cand_base);
 
         // 4. Multi-CTA 7-step on-GPU Markov RNN loop (~0.06 ms total for all 7 steps!)
@@ -885,13 +1106,14 @@ struct InkDSpark {
         if (draft_graph) { cudaGraphExecDestroy(draft_graph); draft_graph = nullptr; }
         bf16_cache.clear();
         if (d_bf16_pool) { cudaFree(d_bf16_pool); d_bf16_pool = nullptr; }
+        if (d_unembed_fp16) { cudaFree(d_unembed_fp16); d_unembed_fp16 = nullptr; }
         for (int il = 0; il < 3; ++il) {
             if (d_ctx_k[il]) { cudaFree(d_ctx_k[il]); d_ctx_k[il] = nullptr; }
             if (d_ctx_v[il]) { cudaFree(d_ctx_v[il]); d_ctx_v[il] = nullptr; }
         }
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
-        fr(d_f_rnn); fr(d_cur); fr(d_h); fr(d_q); fr(d_k); fr(d_v); fr(d_attn_out);
-        fr(d_proj); fr(d_g); fr(d_u); fr(d_act); fr(d_ctx_tmp); fr(d_kc_tmp); fr(d_vc_tmp);
+        fr(d_f_rnn); fr(d_cur); fr(d_h); fr(d_q); fr(d_k); fr(d_v); fr(d_qkv_fused); fr(d_gu_fused); fr(d_attn_out);
+        fr(d_proj); fr(d_g); fr(d_u); fr(d_act); fr(d_ctx_tmp); fr(d_kc_tmp); fr(d_vc_tmp); fr(d_kv_ctx_fused);
         fr(d_base_logits); fr(d_cand_ids); fr(d_cand_base); fr(d_top_tmp_ids); fr(d_top_tmp_vals); fr(d_h_q8); fr(d_h_sc); fr(d_cand_scores);
         fr(d_rnn_state); fr(d_rnn_joint); fr(d_rnn_proj); fr(d_rnn_lat);
         fr(d_corr); fr(d_pos); fr(d_apos); fr(d_anchor_id); fr(d_draft_ids);
@@ -899,6 +1121,7 @@ struct InkDSpark {
         if (h_top2_ids) { cudaFreeHost(h_top2_ids); h_top2_ids = nullptr; }
         if (h_top2_probs) { cudaFreeHost(h_top2_probs); h_top2_probs = nullptr; }
         if (h_meta_pin) { cudaFreeHost(h_meta_pin); h_meta_pin = nullptr; }
+        if (h_pos_pin) { cudaFreeHost(h_pos_pin); h_pos_pin = nullptr; }
         ready = false;
     }
 };
