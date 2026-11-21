@@ -147,6 +147,15 @@ constexpr int kIqGemmTileRows = 256;
 void iq_gemm_grouped_f16(int ggml_type, const uint16_t* X, const void* const* W, int64_t interleave, float* Y,
                          int64_t ldy, const int32_t* bounds, int G, int64_t max_rows, int64_t N, int64_t K,
                          void* stream);
+/// iq_gemm_grouped_f16 for R1Q2 experts (a mixed layer's bih3 blobs): expert e < G's blob at device address blob[e]
+/// (a host array), its K in k[e] (gate/up | down << 8, as bih3_r1q2_prompt_groups' k_pack).  `down` picks the
+/// product: false the gate and up rows interleaved (N = 2 n_ff, K = n_embd: iq_dequant_gu_f16's layout), true the down
+/// rows (N = n_embd, K = n_ff).  The weights are dequantized in local memory to the values bih3_r1q2_dequant_f16
+/// writes, so Y is that of dequantizing and multiplying with xmx_gemm_grouped, without the FP16 weights in memory.
+/// Needs the f16_from_blocks form and n_embd, n_ff multiples of 128.
+void bih3_r1q2_gemm_grouped_f16(const Bih3R1q2Layer& layer, bool down, const uint16_t* X, const void* const* blob,
+                                const int32_t* k, float* Y, int64_t ldy, const int32_t* bounds, int G,
+                                int64_t max_rows, void* stream);
 
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
 struct NativeExpertLayout {
