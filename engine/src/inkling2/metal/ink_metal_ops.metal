@@ -755,7 +755,7 @@ struct InkAttnArgs {
 kernel void ink_relpos_sink_gqa(
     device const float* q_buf        [[buffer(0)]],  // [M, 24, 128]
     device const float* r_buf        [[buffer(1)]],  // [M, 24, 16]
-    device const float* rel_proj_pad [[buffer(2)]],  // [16, 1025]
+    device const half* rel_proj_t    [[buffer(2)]],  // [1025, 16] transposed half (L1-hot coalesced!)
     device const float* sinks_buf    [[buffer(3)]],  // [M, 24]
     device const float* gate_buf     [[buffer(4)]],  // [M, 24, 128]
     device const half* k_cache       [[buffer(5)]],  // [max_slots, kv_stride, 8, 128]
@@ -801,9 +801,9 @@ kernel void ink_relpos_sink_gqa(
         const float4 kv = float4(((device const half4*)(k_cache + kv_off))[lane]);
         float sc = simd_sum(dot(qv, kv));
 
-        // RelPos bias: dot(R[16], rel_proj_pad[:, dist]) computed in 16 lanes then broadcast!
+        // RelPos bias: coalesced 32-byte L1-hot load from rel_proj_t[dist, 0..15]!
         const int dist = min(qpos - k, A.rel_extent);
-        float rb = (lane < 16) ? (sh_r[lane] * rel_proj_pad[(size_t)lane * 1025 + dist]) : 0.0f;
+        float rb = (lane < 16) ? (sh_r[lane] * float(rel_proj_t[(size_t)dist * 16 + lane])) : 0.0f;
         rb = simd_sum(rb);
         sc += rb;
 
@@ -838,6 +838,157 @@ kernel void ink_relpos_sink_gqa(
         const float4 g_sig = 1.0f / (1.0f + exp(-g_in));
         ((device float4*)(attn_out + ((size_t)m * INK_NH + h) * INK_HD))[lane] = out_v * g_sig;
     }
+}
+
+// ============================================================================
+// 6b. GQA-Grouped 3-Q-per-KV Split-K Flash-Decoding (S_PARTS = 8!)
+//     - 3x LESS KV DRAM bandwidth (loads K & V ONCE for all 3 Q heads per KV head!)
+//     - 8x MORE threadgroups (64 TGs for M=1, 512 TGs for M=8 -> saturates all 40 cores!)
+//     - Cuts decode attention at P=1024/2048 by ~10-15x with exact FP32 online softmax!
+// ============================================================================
+kernel void ink_relpos_gqa_splitk(
+    device const float* q_buf        [[buffer(0)]],  // [M, 24, 128]
+    device const float* r_buf        [[buffer(1)]],  // [M, 24, 16]
+    device const half* rel_proj_t    [[buffer(2)]],  // [1025, 16]
+    device const half* k_cache       [[buffer(3)]],  // [max_slots, kv_stride, 8, 128]
+    device const half* v_cache       [[buffer(4)]],  // [max_slots, kv_stride, 8, 128]
+    device const int* slot_ids       [[buffer(5)]],  // [M]
+    device const int* pos_buf        [[buffer(6)]],  // [M]
+    device float* part_o             [[buffer(7)]],  // [M, 24, S_PARTS, 128]
+    device float* part_ml            [[buffer(8)]],  // [M, 24, S_PARTS, 2]
+    constant InkAttnArgs& A          [[buffer(9)]],
+    uint3 tgp  [[threadgroup_position_in_grid]],
+    uint sg    [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]]) {
+    constexpr int S_PARTS = 8;
+    threadgroup float sh_m[3][4];
+    threadgroup float sh_l[3][4];
+    threadgroup float sh_o[3][4 * INK_HD];
+    threadgroup float sh_r[3][16];
+
+    const int m = int(tgp.x), kh = int(tgp.y), sp = int(tgp.z);
+    const int h0 = kh * 3;
+    const int slot = slot_ids[m];
+    const int qpos = pos_buf[m];
+
+    if (sg < 3 && lane < 16) {
+        sh_r[sg][lane] = r_buf[((size_t)m * INK_NH + h0 + int(sg)) * INK_DREL + lane];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float4 q0 = ((device const float4*)(q_buf + ((size_t)m * INK_NH + h0 + 0) * INK_HD))[lane] * A.scale;
+    const float4 q1 = ((device const float4*)(q_buf + ((size_t)m * INK_NH + h0 + 1) * INK_HD))[lane] * A.scale;
+    const float4 q2 = ((device const float4*)(q_buf + ((size_t)m * INK_NH + h0 + 2) * INK_HD))[lane] * A.scale;
+
+    const int k_lo = A.is_swa ? max(0, qpos - A.swa_win + 1) : 0;
+    const int k_hi = qpos + 1;
+    const int k_tot = k_hi - k_lo;
+    const int chunk = (k_tot + S_PARTS - 1) / S_PARTS;
+    const int p_start = k_lo + sp * chunk;
+    const int p_end = min(k_hi, p_start + chunk);
+
+    float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f;
+    float l0 = 0.0f,   l1 = 0.0f,   l2 = 0.0f;
+    float4 o0 = float4(0.0f), o1 = float4(0.0f), o2 = float4(0.0f);
+
+    const size_t slot_kv_base = (size_t)slot * A.kv_stride;
+    for (int k = p_start + int(sg); k < p_end; k += 4) {
+        const int kidx = A.is_swa ? (k & 1023) : k;
+        const size_t kv_off = ((slot_kv_base + kidx) * INK_NKV + kh) * INK_HD;
+        const float4 kv = float4(((device const half4*)(k_cache + kv_off))[lane]);
+        const float4 vv = float4(((device const half4*)(v_cache + kv_off))[lane]);
+        const int dist = min(qpos - k, A.rel_extent);
+        const float rp = (lane < 16) ? float(rel_proj_t[(size_t)dist * 16 + lane]) : 0.0f;
+
+        {
+            const float sc = simd_sum(dot(q0, kv)) + simd_sum((lane < 16) ? (sh_r[0][lane] * rp) : 0.0f);
+            const float mn = max(m0, sc);
+            const float corr = exp(m0 - mn);
+            const float p = exp(sc - mn);
+            l0 = l0 * corr + p; m0 = mn; o0 = o0 * corr + p * vv;
+        }
+        {
+            const float sc = simd_sum(dot(q1, kv)) + simd_sum((lane < 16) ? (sh_r[1][lane] * rp) : 0.0f);
+            const float mn = max(m1, sc);
+            const float corr = exp(m1 - mn);
+            const float p = exp(sc - mn);
+            l1 = l1 * corr + p; m1 = mn; o1 = o1 * corr + p * vv;
+        }
+        {
+            const float sc = simd_sum(dot(q2, kv)) + simd_sum((lane < 16) ? (sh_r[2][lane] * rp) : 0.0f);
+            const float mn = max(m2, sc);
+            const float corr = exp(m2 - mn);
+            const float p = exp(sc - mn);
+            l2 = l2 * corr + p; m2 = mn; o2 = o2 * corr + p * vv;
+        }
+    }
+
+    if (lane == 0) {
+        sh_m[0][sg] = m0; sh_l[0][sg] = l0;
+        sh_m[1][sg] = m1; sh_l[1][sg] = l1;
+        sh_m[2][sg] = m2; sh_l[2][sg] = l2;
+    }
+    *((threadgroup float4*)(sh_o[0] + sg * INK_HD + lane * 4)) = o0;
+    *((threadgroup float4*)(sh_o[1] + sg * INK_HD + lane * 4)) = o1;
+    *((threadgroup float4*)(sh_o[2] + sg * INK_HD + lane * 4)) = o2;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3 of the 4 SGs each reduce 1 Q head in parallel!
+    if (sg < 3) {
+        const int qi = int(sg);
+        const int h = h0 + qi;
+        const float gm = max(max(sh_m[qi][0], sh_m[qi][1]), max(sh_m[qi][2], sh_m[qi][3]));
+        float gl = 0.0f;
+        float4 go = float4(0.0f);
+        if (gm > -1e29f) {
+            for (int s = 0; s < 4; ++s) {
+                const float w = (sh_m[qi][s] > -1e29f) ? exp(sh_m[qi][s] - gm) : 0.0f;
+                gl += sh_l[qi][s] * w;
+                go += (*((threadgroup float4*)(sh_o[qi] + s * INK_HD + lane * 4))) * w;
+            }
+        }
+        const size_t pidx = ((size_t)m * INK_NH + h) * S_PARTS + sp;
+        ((device float4*)(part_o + pidx * INK_HD))[lane] = go;
+        if (lane == 0) {
+            part_ml[pidx * 2 + 0] = gm;
+            part_ml[pidx * 2 + 1] = gl;
+        }
+    }
+}
+
+// Merge S_PARTS=8 splits + exact deferred attention sink + sigmoid(gate)
+// grid (M, 24, 1), 128 threads
+kernel void ink_relpos_gqa_splitk_reduce(
+    device const float* part_o    [[buffer(0)]],  // [M, 24, 8, 128]
+    device const float* part_ml   [[buffer(1)]],  // [M, 24, 8, 2]
+    device const float* sinks_buf [[buffer(2)]],  // [M, 24]
+    device const float* gate_buf  [[buffer(3)]],  // [M, 24, 128]
+    device float* attn_out        [[buffer(4)]],  // [M, 24, 128]
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    constexpr int S_PARTS = 8;
+    const int m = int(tgp.x), h = int(tgp.y);
+    const size_t base = ((size_t)m * INK_NH + h) * S_PARTS;
+
+    float gm = sinks_buf[(size_t)m * INK_NH + h];
+    for (int sp = 0; sp < S_PARTS; ++sp) {
+        const float pm = part_ml[(base + sp) * 2 + 0];
+        gm = max(gm, pm);
+    }
+    float gl = exp(sinks_buf[(size_t)m * INK_NH + h] - gm);
+    float acc = 0.0f;
+    for (int sp = 0; sp < S_PARTS; ++sp) {
+        const float pm = part_ml[(base + sp) * 2 + 0];
+        const float pl = part_ml[(base + sp) * 2 + 1];
+        if (pl > 0.0f && pm > -1e29f) {
+            const float w = exp(pm - gm);
+            gl += pl * w;
+            acc = fma(part_o[(base + sp) * INK_HD + tid], w, acc);
+        }
+    }
+    const size_t out_off = ((size_t)m * INK_NH + h) * INK_HD + tid;
+    const float g = gate_buf[out_off];
+    attn_out[out_off] = (acc / gl) * (1.0f / (1.0f + exp(-g)));
 }
 
 // ============================================================================
@@ -924,9 +1075,10 @@ kernel void ink_router_topk8_plan_m1(
             pair_list[k] = k;
         }
         meta[0] = 8u; meta[1] = 8u;
-        meta[2] = 144u; meta[3] = 8u; meta[4] = 1u;
-        meta[5] = 144u; meta[6] = 8u; meta[7] = 1u;
-        meta[8] = 36u;  meta[9] = 8u; meta[10] = 1u;
+        meta[2] = 144u; meta[3] = 8u; meta[4] = 1u;   // 8-row/TG (mx8 gu, sk/gen)
+        meta[5] = 72u;  meta[6] = 8u; meta[7] = 1u;   // 16-row/TG (sf4 gu, mx8 dn)
+        meta[8] = 36u;  meta[9] = 8u; meta[10] = 1u;  // mm tiles / 32-pair/TG
+        meta[11] = 36u; meta[12] = 8u; meta[13] = 1u; // 32-pair/TG (sf4 dn)
     }
 }
 

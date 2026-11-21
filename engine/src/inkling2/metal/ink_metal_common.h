@@ -316,6 +316,7 @@ struct InkMetalModel {
     mtl::Buffer msg_queries_buf;           // [12 * 4 * 2304] F32 pre-stacked cross-pass queries
     mtl::Buffer static_sconv_buf;          // [24 * (1024+1024+2304+2304) * 4] F32 pre-oriented [C, 4] lag3..lag0
     mtl::Buffer rel_proj_pad_buf;          // [24 * 16 * 1025] F32 zero-padded col 1024
+    mtl::Buffer rel_proj_t_f16_buf;        // [24 * 1025 * 16] FP16 transposed (L1-hot for Metal 4 FlashAttention-2!)
     std::vector<InkExpertDev> experts;     // [24 * 128] indexed by layer * 128 + expert_id
     std::vector<uint16_t> vram_load_order; // [3072] 3x loop-weighted priority order from Section 3
     double t_load = 0.0;
@@ -500,16 +501,21 @@ struct InkMetalModel {
             }
         }
 
-        // 3. RelPos projection padded [24, 16, 1025] (col 1024 = 0.0f)
+        // 3. RelPos projection padded [24, 16, 1025] (col 1024 = 0.0f) + transposed FP16 [24, 1025, 16]
         rel_proj_pad_buf = cx.alloc((size_t)man.c.n_phys * 16 * 1025 * sizeof(float));
+        rel_proj_t_f16_buf = cx.alloc((size_t)man.c.n_phys * 1025 * 16 * sizeof(uint16_t));
         float* rp_all = rel_proj_pad_buf.as<float>();
+        __fp16* rpt_all = rel_proj_t_f16_buf.as<__fp16>();
         for (int il = 0; il < man.c.n_phys; ++il) {
             std::string p = "model.llm.layers." + std::to_string(il) + ".attn.rel_logits_proj.proj";
             const float* src = reinterpret_cast<const float*>(sec1_ptr(p));
             float* dst = rp_all + (size_t)il * 16 * 1025;
+            __fp16* tdst = rpt_all + (size_t)il * 1025 * 16;
             for (int r = 0; r < 16; ++r) {
                 std::memcpy(dst + r * 1025, src + r * 1024, 1024 * sizeof(float));
                 dst[r * 1025 + 1024] = 0.0f;
+                for (int d = 0; d < 1024; ++d) tdst[d * 16 + r] = (__fp16)src[r * 1024 + d];
+                tdst[1024 * 16 + r] = (__fp16)0.0f;
             }
         }
     }

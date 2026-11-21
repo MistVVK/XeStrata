@@ -19,6 +19,7 @@ pairs = [
   ('kInkMetalOpsSrc', 'ink_metal_ops.metal'),
   ('kInkMetalDsparkSrc', 'ink_metal_dspark.metal'),
   ('kInkMetalVisionSrc', 'ink_metal_vision.metal'),
+  ('kInkMetalMppSrc', 'ink_metal_mpp.metal'),
 ]
 base = pathlib.Path(sys.argv[1])
 for var, fn in pairs:
@@ -32,6 +33,7 @@ pathlib.Path(sys.argv[2]).write_text('\\n'.join(out), encoding='utf-8')
     "${CMAKE_CURRENT_SOURCE_DIR}/ink_metal_ops.metal"
     "${CMAKE_CURRENT_SOURCE_DIR}/ink_metal_dspark.metal"
     "${CMAKE_CURRENT_SOURCE_DIR}/ink_metal_vision.metal"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ink_metal_mpp.metal"
   COMMENT "Embedding Inkling-2-Mini Metal shaders"
 )
 
@@ -50,6 +52,7 @@ target_include_directories(strata_inkling_metal PRIVATE
 )
 target_compile_definitions(strata_inkling_metal PRIVATE
   INK_METAL_EMBEDDED_SHADERS=1
+  INK_METAL_HAS_MPP_SRC=1
   STRATA_GGML_COMMON_DEFAULT=""
   STRATA_METAL_KERNELS_DEFAULT=""
 )

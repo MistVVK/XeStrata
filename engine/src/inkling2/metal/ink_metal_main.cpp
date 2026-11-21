@@ -51,6 +51,15 @@ bool InkMetalRunner::compile_shaders(const std::string& kernel_dir, std::string&
     if (!compile_one("ink_metal_ops.metal", lib_ops)) return false;
     if (!compile_one("ink_metal_dspark.metal", lib_dspark)) return false;
     if (!compile_one("ink_metal_vision.metal", lib_vis)) return false;
+    lib_mpp = -1;
+    if (cx->supports_metal4()) {
+        std::string msrc = find_emb("ink_metal_mpp.metal");
+        if (!msrc.empty()) {
+            std::string mwhy;
+            lib_mpp = cx->compile_try({}, msrc, false, &mwhy);
+            if (lib_mpp < 0) fprintf(stderr, "[ink_metal] Metal 4 MPP optional compile skipped: %s\n", mwhy.c_str());
+        }
+    }
     return true;
 #else
     auto compile_file = [&](const std::string& fname, int& out_lib) -> bool {
@@ -64,6 +73,13 @@ bool InkMetalRunner::compile_shaders(const std::string& kernel_dir, std::string&
     if (!compile_file("ink_metal_ops.metal", lib_ops)) return false;
     if (!compile_file("ink_metal_dspark.metal", lib_dspark)) return false;
     if (!compile_file("ink_metal_vision.metal", lib_vis)) return false;
+    lib_mpp = -1;
+    if (cx->supports_metal4()) {
+        std::string mp = kernel_dir.empty() ? "ink_metal_mpp.metal" : (kernel_dir + "/ink_metal_mpp.metal");
+        std::string mwhy;
+        lib_mpp = cx->compile_try({mp}, "", false, &mwhy);
+        if (lib_mpp < 0) fprintf(stderr, "[ink_metal] Metal 4 MPP optional compile skipped: %s\n", mwhy.c_str());
+    }
     return true;
 #endif
 }
@@ -119,7 +135,7 @@ static bool run_greedy_decode(
 
     // 1. Chunked prefill
     const int P = (int)prompt.size();
-    const int chunk = std::min(r.max_batch, 256);
+    const int chunk = std::min(r.max_batch, 2048);
     int32_t next_tok = 0;
     double tp0 = mtl::now_s();
     for (int p0 = 0; p0 < P; p0 += chunk) {
@@ -145,10 +161,11 @@ static bool run_greedy_decode(
     out_ids.push_back(next_tok);
     int cur_pos = P;
 
-    // 2. Decode loop
+    // 2. Decode loop (adaptive DSpark draft length 3..7 maximizes tok/s across code, math & chat!)
     double td0 = mtl::now_s();
     InkMetalRunner::SlotSconvSnap snap;
     std::vector<float> frnn_backup;
+    int cur_k = 5;
 
     while ((int)out_ids.size() < max_new && cur_pos + 1 < r.max_ctx) {
         if (next_tok == r.mod->man.c.eos_id) break;
@@ -165,9 +182,9 @@ static bool run_greedy_decode(
             ++cur_pos;
             out_ids.push_back(next_tok);
         } else {
-            // Draft 7 tokens on GPU via DSpark Block-8 Recurrent Markov!
+            // Draft `cur_k` (3..7) tokens on GPU via Exact Low-Rank M_eff DSpark!
             int32_t draft[7] = {};
-            const int nd = r.dspark_draft_block8(slot, next_tok, cur_pos, draft);
+            const int nd = r.dspark_draft_block8(slot, next_tok, cur_pos, draft, cur_k);
             if (nd <= 0) {
                 InkBatchStep st;
                 st.M = 1; st.slot_ids = {slot}; st.pos = {cur_pos}; st.tok_ids = {next_tok};
@@ -221,6 +238,7 @@ static bool run_greedy_decode(
             if (accepted < rem) {
                 r.restore_verify_step(slot, accepted);
             }
+            cur_k = (accepted >= cur_k) ? std::min(7, cur_k + 1) : std::max(3, std::min(7, accepted + 1));
             cur_pos += (1 + accepted);
         }
     }

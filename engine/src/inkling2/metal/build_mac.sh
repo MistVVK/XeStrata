@@ -34,7 +34,8 @@ python3 "$ENGINE_DIR/src/hy4flash/metal/embed_metal.py" "$OUT_DIR/gen/ink_metal_
   "$SCRIPT_DIR/ink_metal_codecs.metal" \
   "$SCRIPT_DIR/ink_metal_ops.metal" \
   "$SCRIPT_DIR/ink_metal_dspark.metal" \
-  "$SCRIPT_DIR/ink_metal_vision.metal"
+  "$SCRIPT_DIR/ink_metal_vision.metal" \
+  "$SCRIPT_DIR/ink_metal_mpp.metal"
 
 # 4. Build strata-inkling-metal
 clang++ $CXXF $INC -I"$Z" -I"$OUT_DIR/gen" -DINK_EMBED_KERNELS \

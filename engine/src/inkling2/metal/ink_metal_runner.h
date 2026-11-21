@@ -82,30 +82,47 @@ struct InkMetalRunner {
     InkMetalModel* mod = nullptr;
     InkMetalVision vis;
 
-    int lib_codecs = -1, lib_ops = -1, lib_dspark = -1, lib_vis = -1;
+    int lib_codecs = -1, lib_ops = -1, lib_dspark = -1, lib_vis = -1, lib_mpp = -1;
+    bool use_mpp = false, use_mpp_trunk_f16 = false;
+    int mpp_decomp_cap = 0;
+
+    // Metal 4 MPP Neural Accelerator pipelines (active when lib_mpp >= 0)
+    mtl::Pipeline p_mpp_f32_to_f16, p_mpp_bf16_to_f16, p_mpp_q8_to_f16, p_mpp_sk_to_f16;
+    mtl::Pipeline p_mpp_mm_16_64, p_mpp_mm_32_64, p_mpp_mm_64_64, p_mpp_mm_64_128, p_mpp_mm_128_64;
+    mtl::Pipeline p_mpp_split_qrsg, p_mpp_split_kv, p_mpp_ctrl_fuse_gf;
+    mtl::Pipeline p_mpp_moe_plan, p_mpp_moe_gather;
+    // [codec: 0=sf4, 1=mx8, 2=gen][bucket: 0=16, 1=32, 2=64, 3=128]
+    mtl::Pipeline p_mpp_moe_gu_dir[3][4], p_mpp_moe_dn_dir[3][4];
+    mtl::Pipeline p_mpp_moe_combine, p_mpp_prep_qr, p_mpp_relpos_gqa_pf;
 
     // Pipelines
     mtl::Pipeline p_lin_bf16_mv1, p_lin_bf16_mv, p_lin_bf16_mm8, p_lin_bf16_mm;
     mtl::Pipeline p_lin_q8_mv1, p_lin_q8_mv, p_lin_q8_mm8, p_lin_q8_mm;
-    mtl::Pipeline p_lin_f32, p_lin_f32_mm;
+    mtl::Pipeline p_lin_f32, p_lin_f32_mm, p_lin_f32_exact_mm;
     mtl::Pipeline p_lin_sk[9], p_lin_sk6_mm8;
     mtl::Pipeline p_unemb_argmax_q8, p_unemb_argmax_bf16, p_unemb_argmax_sk6, p_argmax_part;
     mtl::Pipeline p_moe_plan, p_moe_gu, p_moe_dn, p_moe_red8;
     mtl::Pipeline p_moe_gu_sf4, p_moe_dn_sf4, p_moe_gu_mx8, p_moe_dn_mx8;
+    mtl::Pipeline p_moe_gu_sk2, p_moe_dn_sk2, p_moe_gu_sk3, p_moe_dn_sk3, p_moe_gu_sk4, p_moe_dn_sk4, p_moe_gu_sk5, p_moe_dn_sk5;
     mtl::Pipeline p_moe_gu_mm_sf4, p_moe_dn_mm_sf4, p_moe_gu_mm_mx8, p_moe_dn_mm_mx8, p_moe_gu_mm_gen, p_moe_dn_mm_gen;
     int layer_homog_gu[24]{};
     int layer_homog_dn[24]{};
+    uint32_t layer_gu_mask[24]{};
+    uint32_t layer_dn_mask[24]{};
 
     mtl::Pipeline p_emb_bf16, p_emb_q8;
     mtl::Pipeline p_attn_res_mix, p_attn_res_mix_norm, p_ctrl_cat, p_ctrl_apply, p_ctrl_gf_64, p_ctrl_fuse_norm, p_rms_norm, p_add;
     mtl::Pipeline p_sconv4_multi, p_sconv4_attn_res, p_moe_red8_sconv_add, p_sconv4_pf, p_sconv4_pf_commit;
-    mtl::Pipeline p_qr_clip_tau, p_kv_store_f16, p_relpos_gqa;
+    mtl::Pipeline p_qr_clip_tau, p_kv_store_f16, p_relpos_gqa, p_relpos_gqa_splitk, p_relpos_gqa_splitk_red;
     mtl::Pipeline p_router_topk8, p_router_topk8_plan_m1, p_softcap, p_argmax_rows;
 
     mtl::Pipeline p_dsp_mix, p_dsp_ctx_kv, p_dsp_init_bf16, p_dsp_init_q8;
     mtl::Pipeline p_dsp_qk_rope, p_dsp_attn, p_dsp_swiglu;
     mtl::Pipeline p_dsp_mjoint_bf16, p_dsp_mjoint_q8, p_dsp_mrnn, p_dsp_add_bias;
     mtl::Pipeline p_dsp_comb_s1, p_dsp_comb_s2;
+    mtl::Pipeline p_dsp_add_bias7, p_dsp_top512, p_dsp_score512_bf16, p_dsp_score512_q8, p_dsp_score512_sk6, p_dsp_score512_red;
+    mtl::Pipeline p_dsp_build_meff_q8, p_dsp_meff_argmax_q8;
+    bool use_dspark_meff = false;
 
     // Limits & capacities
     int max_slots = 1;
@@ -148,7 +165,7 @@ struct InkMetalRunner {
     mtl::Buffer b_in3;                     // [3, max_batch, 2304] (Q/K/V inputs)
     mtl::Buffer b_cat, b_ctrl_gate;        // [max_batch, 4608], [max_batch, 64]
     mtl::Buffer b_q, b_k_raw, b_v_raw, b_k, b_v, b_r, b_kd_taps, b_vd_taps;
-    mtl::Buffer b_sinks, b_gate_attn, b_attn_out, b_wo_raw, b_wo;
+    mtl::Buffer b_sinks, b_gate_attn, b_attn_out, b_attn_part_o, b_attn_part_ml, b_wo_raw, b_wo;
     mtl::Buffer b_mlp_in, b_r_logits, b_topk_idx, b_topk_w;
     mtl::Buffer b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_meta, b_moe_tiles;
     mtl::Buffer b_moe_h, b_moe_yp, b_moe_raw, b_moe_out;
@@ -159,7 +176,17 @@ struct InkMetalRunner {
     mtl::Buffer bd_cur, bd_res, bd_h, bd_q, bd_k, bd_v, bd_ao, bd_proj;
     mtl::Buffer bd_mg, bd_mu, bd_mh, bd_logits, bd_comb;
     mtl::Buffer bd_state, bd_joint, bd_rproj, bd_latent, bd_corr;
-    mtl::Buffer bd_tok_chain, bd_part_val, bd_part_idx;
+    mtl::Buffer bd_tok_chain, bd_part_val, bd_part_idx, bd_cand_val, bd_cand_idx;
+    mtl::Buffer bd_meff_sc, bd_meff_q;
+
+    // Metal 4 MPP workspace & optional concatenated FP16 trunk cache (on >= 24 GiB working-set Macs)
+    mtl::Buffer b_mpp_x_f16, b_mpp_tmp_out, b_mpp_qh, b_mpp_rh;
+    mtl::Buffer b_mpp_srt_pair, b_mpp_pair_pos, b_mpp_tiles_128, b_mpp_tiles_64, b_mpp_tiles_sm, b_mpp_meta;
+    mtl::Buffer b_mpp_xs, b_mpp_hs, b_mpp_ye;
+    mtl::Buffer w_qrsg_f16[24], w_k_f16[24], w_v_f16[24], w_wo_f16[24];
+    mtl::Buffer w_ctrl_dn_f16[12][4], w_ctrl_gf_f16[12][4];
+    mtl::Buffer w_dsp_q_f16[3], w_dsp_k_f16[3], w_dsp_v_f16[3], w_dsp_o_f16[3];
+    mtl::Buffer w_dsp_g_f16[3], w_dsp_u_f16[3], w_dsp_d_f16[3];
 
     double last_gpu_ms = 0.0;
 
@@ -187,6 +214,7 @@ struct InkMetalRunner {
         p_lin_q8_mm    = cx->pipeline(lib_codecs, "ink_linear_q8row_mm");
         p_lin_f32      = cx->pipeline(lib_codecs, "ink_linear_f32");
         p_lin_f32_mm   = cx->pipeline(lib_codecs, "ink_linear_f32_mm");
+        p_lin_f32_exact_mm = cx->pipeline(lib_codecs, "ink_linear_f32_exact_mm");
         p_unemb_argmax_q8   = cx->pipeline(lib_codecs, "ink_unembed_argmax_q8row");
         p_unemb_argmax_bf16 = cx->pipeline(lib_codecs, "ink_unembed_argmax_bf16");
         p_unemb_argmax_sk6  = cx->pipeline(lib_codecs, "ink_unembed_argmax_sk6");
@@ -202,6 +230,14 @@ struct InkMetalRunner {
         p_moe_dn_sf4    = cx->pipeline(lib_codecs, "ink_moe_dn_sf4");
         p_moe_gu_mx8    = cx->pipeline(lib_codecs, "ink_moe_gu_mx8");
         p_moe_dn_mx8    = cx->pipeline(lib_codecs, "ink_moe_dn_mx8");
+        p_moe_gu_sk2    = cx->pipeline(lib_codecs, "ink_moe_gu_sk2");
+        p_moe_dn_sk2    = cx->pipeline(lib_codecs, "ink_moe_dn_sk2");
+        p_moe_gu_sk3    = cx->pipeline(lib_codecs, "ink_moe_gu_sk3");
+        p_moe_dn_sk3    = cx->pipeline(lib_codecs, "ink_moe_dn_sk3");
+        p_moe_gu_sk4    = cx->pipeline(lib_codecs, "ink_moe_gu_sk4");
+        p_moe_dn_sk4    = cx->pipeline(lib_codecs, "ink_moe_dn_sk4");
+        p_moe_gu_sk5    = cx->pipeline(lib_codecs, "ink_moe_gu_sk5");
+        p_moe_dn_sk5    = cx->pipeline(lib_codecs, "ink_moe_dn_sk5");
         p_moe_gu_mm_sf4 = cx->pipeline(lib_codecs, "ink_moe_gu_mm_sf4");
         p_moe_dn_mm_sf4 = cx->pipeline(lib_codecs, "ink_moe_dn_mm_sf4");
         p_moe_gu_mm_mx8 = cx->pipeline(lib_codecs, "ink_moe_gu_mm_mx8");
@@ -210,19 +246,24 @@ struct InkMetalRunner {
         p_moe_dn_mm_gen = cx->pipeline(lib_codecs, "ink_moe_dn_mm_gen");
         p_moe_red8      = cx->pipeline(lib_codecs, "ink_moe_reduce8");
 
-        // Detect homogeneous SF4/MX8 layers for low-register specialized Metal pipelines!
+        // Detect homogeneous layers & per-layer codec bitmasks for zero-spill concurrent dispatch!
         const auto* ed_host = mod->expert_dev_buf.as<InkExpertDev>();
         for (int il = 0; il < mod->man.c.n_phys; ++il) {
             int g0 = ed_host[il * mod->man.c.n_experts].gu_code;
             int d0 = ed_host[il * mod->man.c.n_experts].dn_code;
             bool hg = true, hd = true;
-            for (int e = 1; e < mod->man.c.n_experts; ++e) {
+            uint32_t gm = 0, dm = 0;
+            for (int e = 0; e < mod->man.c.n_experts; ++e) {
                 const auto& ed = ed_host[il * mod->man.c.n_experts + e];
                 if (ed.gu_code != g0) hg = false;
                 if (ed.dn_code != d0) hd = false;
+                if (ed.gu_code < 32) gm |= (1u << ed.gu_code);
+                if (ed.dn_code < 32) dm |= (1u << ed.dn_code);
             }
             layer_homog_gu[il] = hg ? g0 : -1;
             layer_homog_dn[il] = hd ? d0 : -1;
+            layer_gu_mask[il] = gm;
+            layer_dn_mask[il] = dm;
         }
 
         p_emb_bf16     = cx->pipeline(lib_ops, "ink_embed_bf16");
@@ -244,6 +285,8 @@ struct InkMetalRunner {
         p_qr_clip_tau         = cx->pipeline(lib_ops, "ink_qr_clip_tau");
         p_kv_store_f16        = cx->pipeline(lib_ops, "ink_kv_norm_store_f16");
         p_relpos_gqa          = cx->pipeline(lib_ops, "ink_relpos_sink_gqa");
+        p_relpos_gqa_splitk   = cx->pipeline(lib_ops, "ink_relpos_gqa_splitk");
+        p_relpos_gqa_splitk_red = cx->pipeline(lib_ops, "ink_relpos_gqa_splitk_reduce");
         p_router_topk8        = cx->pipeline(lib_ops, "ink_router_topk8");
         p_router_topk8_plan_m1 = cx->pipeline(lib_ops, "ink_router_topk8_plan_m1");
         p_softcap             = cx->pipeline(lib_ops, "ink_softcap_f32");
@@ -262,6 +305,14 @@ struct InkMetalRunner {
         p_dsp_add_bias    = cx->pipeline(lib_dspark, "dspark_add_bias");
         p_dsp_comb_s1     = cx->pipeline(lib_dspark, "dspark_combine_argmax_s1");
         p_dsp_comb_s2     = cx->pipeline(lib_dspark, "dspark_combine_argmax_s2");
+        p_dsp_add_bias7     = cx->pipeline(lib_dspark, "dspark_add_bias_7");
+        p_dsp_top512        = cx->pipeline(lib_dspark, "dspark_top512_shortlist");
+        p_dsp_score512_bf16 = cx->pipeline(lib_dspark, "dspark_score_512_bf16");
+        p_dsp_score512_q8   = cx->pipeline(lib_dspark, "dspark_score_512_q8row");
+        p_dsp_score512_sk6  = cx->pipeline(lib_dspark, "dspark_score_512_sk6");
+        p_dsp_score512_red  = cx->pipeline(lib_dspark, "dspark_score_512_reduce");
+        p_dsp_build_meff_q8 = cx->pipeline(lib_dspark, "dspark_build_meff_q8");
+        p_dsp_meff_argmax_q8 = cx->pipeline(lib_dspark, "dspark_meff_argmax_q8");
 
         // Allocate KV caches & ShortConv state pools
         const auto& c = mod->man.c;
@@ -332,10 +383,12 @@ struct InkMetalRunner {
         b_r         = cx->alloc(MB * (c.n_head * c.d_rel) * 4);
         b_kd_taps   = cx->alloc(MB * 32 * 4);
         b_vd_taps   = cx->alloc(MB * 32 * 4);
-        b_sinks     = cx->alloc(MB * c.n_head * 4);
-        b_gate_attn = cx->alloc(MB * (c.n_head * c.head_dim) * 4);
-        b_attn_out  = cx->alloc(MB * (c.n_head * c.head_dim) * 4);
-        b_wo_raw    = cx->alloc(MB * D * 4);
+        b_sinks        = cx->alloc(MB * c.n_head * 4);
+        b_gate_attn    = cx->alloc(MB * (c.n_head * c.head_dim) * 4);
+        b_attn_out     = cx->alloc(MB * (c.n_head * c.head_dim) * 4);
+        b_attn_part_o  = cx->alloc(16ul * c.n_head * 8ul * c.head_dim * 4);
+        b_attn_part_ml = cx->alloc(16ul * c.n_head * 8ul * 2ul * 4);
+        b_wo_raw       = cx->alloc(MB * D * 4);
         b_wo        = cx->alloc(MB * D * 4);
 
         b_mlp_in    = cx->alloc(MB * D * 4);
@@ -390,6 +443,55 @@ struct InkMetalRunner {
             bd_latent      = cx->alloc(256 * 4);
             bd_corr        = cx->alloc(D * 4);
             bd_tok_chain   = cx->alloc(8 * 4);
+            bd_cand_val    = cx->alloc(7ul * 512ul * sizeof(float));
+            bd_cand_idx    = cx->alloc(7ul * 512ul * sizeof(int32_t));
+
+            // Precompute EXACT low-rank M_eff = unembed @ hidden_out.weight [V, 256] as Q8_ROW (~52 MiB, ~12 ms at init)!
+            const auto& uti = mod->man.get("model.llm.unembed.weight");
+            const auto& hti = mod->man.get_d("dspark.markov_head.hidden_out.weight");
+            if ((uti.fmt == FMT_BF16 || uti.fmt == FMT_Q8ROW || uti.fmt == FMT_S6) &&
+                (hti.fmt == FMT_F32 || hti.fmt == FMT_BF16 || hti.fmt == FMT_Q8ROW) &&
+                hti.rows() == (uint64_t)D && hti.cols() == 256ul) {
+                bd_meff_sc = cx->alloc((size_t)c.vocab_unpadded * sizeof(float));
+                bd_meff_q  = cx->alloc((size_t)c.vocab_unpadded * 256ul);
+                mtl::Buffer w_hout_t = cx->alloc(256ul * D * sizeof(uint16_t));
+                uint16_t* dst_t = w_hout_t.as<uint16_t>();
+                auto f32_to_f16 = [](float f) -> uint16_t {
+                    __fp16 h = (__fp16)f;
+                    uint16_t u;
+                    std::memcpy(&u, &h, 2);
+                    return u;
+                };
+                const uint8_t* hraw = mod->base + mod->sec1_off + hti.off;
+                for (int d = 0; d < (int)D; ++d) {
+                    if (hti.fmt == FMT_F32) {
+                        const float* rp = reinterpret_cast<const float*>(hraw) + (size_t)d * 256;
+                        for (int r = 0; r < 256; ++r) dst_t[(size_t)r * D + d] = f32_to_f16(rp[r]);
+                    } else if (hti.fmt == FMT_BF16) {
+                        const uint16_t* rp = reinterpret_cast<const uint16_t*>(hraw) + (size_t)d * 256;
+                        for (int r = 0; r < 256; ++r) {
+                            uint32_t bits = (uint32_t)rp[r] << 16;
+                            float fv; std::memcpy(&fv, &bits, 4);
+                            dst_t[(size_t)r * D + d] = f32_to_f16(fv);
+                        }
+                    } else {
+                        const float sc = reinterpret_cast<const float*>(hraw)[d];
+                        const int8_t* rp = reinterpret_cast<const int8_t*>(hraw + (size_t)D * 4) + (size_t)d * 256;
+                        for (int r = 0; r < 256; ++r) dst_t[(size_t)r * D + d] = f32_to_f16((float)rp[r] * sc);
+                    }
+                }
+                int ufmt = (uti.fmt == FMT_BF16) ? 0 : (uti.fmt == FMT_Q8ROW) ? 1 : 2;
+                mtl::Dispatch dm;
+                dm.p = &p_dsp_build_meff_q8;
+                dm.grid[0] = (uint32_t)((c.vocab_unpadded + 15) / 16);
+                dm.tg[0] = 256;
+                dm.args = {mod->tw("model.llm.unembed.weight"), mtl::Arg::B(w_hout_t),
+                           mtl::Arg::B(bd_meff_sc), mtl::Arg::B(bd_meff_q),
+                           mtl::Arg::V(c.vocab_unpadded), mtl::Arg::V(c.vocab_padded), mtl::Arg::V(ufmt)};
+                std::vector<mtl::Dispatch> one; one.push_back(std::move(dm));
+                cx->run_graph(one);
+                use_dspark_meff = true;
+            }
         }
 
         if (!vision_path.empty()) {
@@ -398,9 +500,141 @@ struct InkMetalRunner {
             }
         }
 
+        // Optional Metal 4 Neural Accelerator (mpp::tensor_ops::matmul2d) pipelines & FP16 cache!
+        if (lib_mpp >= 0) {
+            use_mpp = true;
+            p_mpp_f32_to_f16    = cx->pipeline(lib_mpp, "ink_mpp_f32_to_f16");
+            p_mpp_bf16_to_f16   = cx->pipeline(lib_mpp, "ink_mpp_bf16_to_f16");
+            p_mpp_q8_to_f16     = cx->pipeline(lib_mpp, "ink_mpp_q8row_to_f16");
+            p_mpp_sk_to_f16     = cx->pipeline(lib_mpp, "ink_mpp_sk_to_f16");
+            p_mpp_mm_16_64      = cx->pipeline(lib_mpp, "ink_mpp_mm_f16_16_64_4");
+            p_mpp_mm_32_64      = cx->pipeline(lib_mpp, "ink_mpp_mm_f16_32_64_4");
+            p_mpp_mm_64_64      = cx->pipeline(lib_mpp, "ink_mpp_mm_f16_64_64_4");
+            p_mpp_mm_64_128     = cx->pipeline(lib_mpp, "ink_mpp_mm_f16_64_128_4");
+            p_mpp_mm_128_64     = cx->pipeline(lib_mpp, "ink_mpp_mm_f16_128_64_4");
+            p_mpp_split_qrsg    = cx->pipeline(lib_mpp, "ink_mpp_split_qrsg");
+            p_mpp_split_kv      = cx->pipeline(lib_mpp, "ink_mpp_split_kv_dyn");
+            p_mpp_ctrl_fuse_gf  = cx->pipeline(lib_mpp, "ink_mpp_ctrl_fuse_gf_norm");
+            p_mpp_moe_plan       = cx->pipeline(lib_mpp, "ink_mpp_moe_plan");
+            p_mpp_moe_gather     = cx->pipeline(lib_mpp, "ink_mpp_moe_gather");
+            const char* ctags[3] = {"sf4", "mx8", "gen"};
+            const char* btags[4] = {"16", "32", "64", "128"};
+            for (int ci = 0; ci < 3; ++ci) {
+                for (int bi = 0; bi < 4; ++bi) {
+                    p_mpp_moe_gu_dir[ci][bi] = cx->pipeline(lib_mpp, std::string("ink_mpp_moe_gu_") + ctags[ci] + "_" + btags[bi]);
+                    p_mpp_moe_dn_dir[ci][bi] = cx->pipeline(lib_mpp, std::string("ink_mpp_moe_dn_") + ctags[ci] + "_" + btags[bi]);
+                }
+            }
+            p_mpp_moe_combine    = cx->pipeline(lib_mpp, "ink_mpp_moe_combine");
+            p_mpp_prep_qr        = cx->pipeline(lib_mpp, "ink_mpp_prep_qr");
+            p_mpp_relpos_gqa_pf  = cx->pipeline(lib_mpp, "ink_mpp_relpos_gqa_pf");
+
+            const size_t mb_pad = (MB + 31ul) & ~31ul;
+            const size_t max_tot_rows = MB * (size_t)c.top_k + (size_t)c.n_experts * 128ul;
+            b_mpp_x_f16     = cx->alloc(std::max((size_t)8 * 9216, 3ul * MB * 4608ul) * sizeof(uint16_t));
+            b_mpp_tmp_out   = cx->alloc(MB * (6552ul + 2112ul) * sizeof(float));
+            b_mpp_qh        = cx->alloc(24ul * mb_pad * 128ul * sizeof(uint16_t));
+            b_mpp_rh        = cx->alloc(24ul * mb_pad * 16ul * sizeof(uint16_t));
+            b_mpp_srt_pair  = cx->alloc(max_tot_rows * sizeof(int32_t));
+            b_mpp_pair_pos  = cx->alloc(MB * (size_t)c.top_k * sizeof(int32_t));
+            b_mpp_tiles_128 = cx->alloc((max_tot_rows / 64ul + 256ul) * 16ul);
+            b_mpp_tiles_64  = cx->alloc((max_tot_rows / 32ul + 256ul) * 16ul);
+            b_mpp_tiles_sm  = cx->alloc((max_tot_rows / 16ul + 256ul) * 16ul);
+            b_mpp_meta      = cx->alloc(24ul * sizeof(uint32_t));
+            b_mpp_xs        = cx->alloc(max_tot_rows * D * sizeof(uint16_t));
+            b_mpp_hs        = cx->alloc(max_tot_rows * (size_t)c.inter * sizeof(uint16_t));
+            b_mpp_ye        = cx->alloc(max_tot_rows * D * sizeof(float));
+
+            const uint64_t ws = cx->recommended_working_set();
+            mpp_decomp_cap = 0;
+            use_mpp_trunk_f16 = (ws >= (24ull << 30));
+            if (use_mpp_trunk_f16) {
+                std::vector<mtl::Dispatch> init_ds;
+                init_ds.reserve(512);
+                auto cvt_tensor = [&](const InkTensorInfo& ti, const mtl::Arg& src_w, const mtl::Buffer& dst_b, size_t dst_row_off) {
+                    const int N = (int)ti.rows(), K = (int)ti.cols();
+                    const size_t byte_off = dst_row_off * (size_t)K * sizeof(uint16_t);
+                    mtl::Dispatch d;
+                    d.barrier = false;
+                    if (ti.fmt == FMT_BF16) {
+                        int tot = N * K;
+                        d.p = &p_mpp_bf16_to_f16; d.grid[0] = (uint32_t)((tot + 1023) / 1024); d.tg[0] = 256;
+                        d.args = {src_w, mtl::Arg::B(dst_b, byte_off), mtl::Arg::V(tot)};
+                    } else if (ti.fmt == FMT_F32) {
+                        int tot = N * K;
+                        d.p = &p_mpp_f32_to_f16; d.grid[0] = (uint32_t)((tot + 1023) / 1024); d.tg[0] = 256;
+                        d.args = {src_w, mtl::Arg::B(dst_b, byte_off), mtl::Arg::V(tot)};
+                    } else if (ti.fmt == FMT_Q8ROW) {
+                        d.p = &p_mpp_q8_to_f16; d.grid[0] = (uint32_t)((K + 255) / 256); d.grid[1] = (uint32_t)N; d.tg[0] = 256;
+                        d.args = {src_w, mtl::Arg::B(dst_b, byte_off), mtl::Arg::V(N), mtl::Arg::V(K)};
+                    } else if (ti.fmt >= FMT_S2 && ti.fmt <= FMT_S8) {
+                        int fmt_i = (int)ti.fmt;
+                        d.p = &p_mpp_sk_to_f16; d.grid[0] = (uint32_t)((K + 255) / 256); d.grid[1] = (uint32_t)N; d.tg[0] = 32;
+                        d.args = {src_w, mtl::Arg::B(dst_b, byte_off), mtl::Arg::V(N), mtl::Arg::V(K), mtl::Arg::V(fmt_i)};
+                    }
+                    init_ds.push_back(std::move(d));
+                };
+                auto cvt_trunk = [&](const std::string& name, const mtl::Buffer& dst_b, size_t dst_row_off) {
+                    cvt_tensor(mod->man.get(name), mod->tw(name), dst_b, dst_row_off);
+                };
+                for (int il = 0; il < c.n_phys; ++il) {
+                    std::string p = "model.llm.layers." + std::to_string(il);
+                    const bool is_swa = (c.is_swa[il] != 0);
+                    w_qrsg_f16[il] = cx->alloc(6552ul * D * sizeof(uint16_t));
+                    cvt_trunk(p + ".attn.wq_du.weight",           w_qrsg_f16[il], 0);
+                    cvt_trunk(p + ".attn.wr_du.weight",           w_qrsg_f16[il], 3072);
+                    cvt_trunk(p + ".attn.attn_sink_proj.weight",  w_qrsg_f16[il], 3456);
+                    cvt_trunk(p + ".attn.gate_attn.weight",       w_qrsg_f16[il], 3480);
+
+                    const size_t krows = is_swa ? 1024ul : 1056ul;
+                    w_k_f16[il] = cx->alloc(krows * D * sizeof(uint16_t));
+                    w_v_f16[il] = cx->alloc(krows * D * sizeof(uint16_t));
+                    cvt_trunk(p + ".attn.wk_dv.weight", w_k_f16[il], 0);
+                    cvt_trunk(p + ".attn.wv_dv.weight", w_v_f16[il], 0);
+                    if (!is_swa) {
+                        cvt_trunk(p + ".attn.k_sconv.weight_proj", w_k_f16[il], 1024);
+                        cvt_trunk(p + ".attn.v_sconv.weight_proj", w_v_f16[il], 1024);
+                    }
+                    w_wo_f16[il] = cx->alloc(D * 3072ul * sizeof(uint16_t));
+                    cvt_trunk(p + ".attn.wo_ud.weight", w_wo_f16[il], 0);
+                }
+                const char* cnames[4] = {"attn", "k", "v", "mlp"};
+                for (int il = c.core_start; il < c.core_end; ++il) {
+                    std::string p = "model.llm.layers." + std::to_string(il);
+                    const int ci = il - c.core_start;
+                    for (int j = 0; j < 4; ++j) {
+                        w_ctrl_dn_f16[ci][j] = cx->alloc((size_t)c.gate_rank * (2ul * D) * sizeof(uint16_t));
+                        w_ctrl_gf_f16[ci][j] = cx->alloc((2ul * D) * (size_t)c.gate_rank * sizeof(uint16_t));
+                        cvt_trunk(p + ".controllers." + cnames[j] + ".down_weight",   w_ctrl_dn_f16[ci][j], 0);
+                        cvt_trunk(p + ".controllers." + cnames[j] + ".gain_weight",   w_ctrl_gf_f16[ci][j], 0);
+                        cvt_trunk(p + ".controllers." + cnames[j] + ".forget_weight", w_ctrl_gf_f16[ci][j], D);
+                    }
+                }
+                if (use_dspark) {
+                    auto cvt_dsp = [&](const std::string& name, mtl::Buffer& dst_b) {
+                        const auto& ti = mod->man.get_d(name);
+                        dst_b = cx->alloc((size_t)ti.rows() * (size_t)ti.cols() * sizeof(uint16_t));
+                        cvt_tensor(ti, mod->dw(name), dst_b, 0);
+                    };
+                    for (int dl = 0; dl < 3; ++dl) {
+                        std::string lp = "dspark.layers." + std::to_string(dl);
+                        cvt_dsp(lp + ".self_attn.q_proj.weight", w_dsp_q_f16[dl]);
+                        cvt_dsp(lp + ".self_attn.k_proj.weight", w_dsp_k_f16[dl]);
+                        cvt_dsp(lp + ".self_attn.v_proj.weight", w_dsp_v_f16[dl]);
+                        cvt_dsp(lp + ".self_attn.o_proj.weight", w_dsp_o_f16[dl]);
+                        cvt_dsp(lp + ".mlp.gate_proj.weight",    w_dsp_g_f16[dl]);
+                        cvt_dsp(lp + ".mlp.up_proj.weight",      w_dsp_u_f16[dl]);
+                        cvt_dsp(lp + ".mlp.down_proj.weight",    w_dsp_d_f16[dl]);
+                    }
+                }
+                cx->run_graph(init_ds);
+            }
+        }
+
         fprintf(stderr,
-                "[ink_metal] runner ready: slots=%d ctx=%d batch=%d dspark=%d vision=%d | KV=%.1f MiB SC=%.1f MiB TotalAlloc=%.2f GiB\n",
+                "[ink_metal] runner ready: slots=%d ctx=%d batch=%d dspark=%d vision=%d mpp=%d(trunk=%d,hot=%d) | KV=%.1f MiB SC=%.1f MiB TotalAlloc=%.2f GiB\n",
                 max_slots, max_ctx, max_batch, (int)use_dspark, (int)vis.loaded,
+                (int)use_mpp, (int)use_mpp_trunk_f16, mpp_decomp_cap,
                 kv_bytes_tot / (1024.0 * 1024.0), sc_bytes_tot / (1024.0 * 1024.0),
                 cx->allocated() / (1024.0 * 1024.0 * 1024.0));
         return true;
@@ -519,9 +753,15 @@ struct InkMetalRunner {
                 d.grid[0] = (uint32_t)((N + 63) / 64);
                 d.grid[1] = (uint32_t)((M + 31) / 32);
                 d.tg[0] = 256;
+            } else if (M >= 64 && exact_f32) {
+                d.p = &p_lin_f32_exact_mm;
+                d.grid[0] = (uint32_t)((N + 31) / 32);
+                d.grid[1] = (uint32_t)((M + 31) / 32);
+                d.tg[0] = 128;
             } else {
                 d.p = &p_lin_f32;
                 d.grid[0] = (uint32_t)((N + 3) / 4);
+                d.grid[1] = (uint32_t)((M + 3) / 4);
                 d.tg[0] = 128;
             }
         } else if (ti.fmt >= FMT_S2 && ti.fmt <= FMT_S8) {
@@ -549,6 +789,53 @@ struct InkMetalRunner {
         const int N = N_override > 0 ? N_override : (int)ti.rows();
         const int K = (int)ti.cols();
         push_linear(ds, ti, mod->tw(name), x_arg, y_arg, N, K, M, barrier, exact_f32);
+    }
+
+    struct InkMppMmArgs {
+        int M, N, K, out_stride;
+    };
+    struct InkMppAttnArgs {
+        int M, M_pad, slot, pos0, is_swa, swa_win, rel_extent, kv_stride;
+        float scale;
+        int pad;
+    };
+
+    void push_f32_to_f16(std::vector<mtl::Dispatch>& ds, const mtl::Arg& src, const mtl::Arg& dst, int n_floats, bool barrier = true) {
+        mtl::Dispatch d;
+        d.barrier = barrier;
+        d.p = &p_mpp_f32_to_f16;
+        d.grid[0] = (uint32_t)((n_floats + 1023) / 1024);
+        d.tg[0] = 256;
+        d.args = {src, dst, mtl::Arg::V(n_floats)};
+        ds.push_back(std::move(d));
+    }
+
+    void push_mpp_gemm(std::vector<mtl::Dispatch>& ds, const mtl::Arg& w_f16, const mtl::Arg& x_f16, const mtl::Arg& y_f32,
+                       int M, int N, int K, int out_stride = -1, bool barrier = true) {
+        if (out_stride <= 0) out_stride = N;
+        InkMppMmArgs a{M, N, K, out_stride};
+        mtl::Dispatch d;
+        d.barrier = barrier;
+        d.tg[0] = 128;
+        if (M <= 16) {
+            d.p = &p_mpp_mm_16_64;
+            d.grid[0] = (uint32_t)((N + 63) / 64);
+            d.grid[1] = (uint32_t)((M + 15) / 16);
+        } else if (M <= 32) {
+            d.p = &p_mpp_mm_32_64;
+            d.grid[0] = (uint32_t)((N + 63) / 64);
+            d.grid[1] = (uint32_t)((M + 31) / 32);
+        } else if (M >= 128 && N >= 2304) {
+            d.p = &p_mpp_mm_64_128;
+            d.grid[0] = (uint32_t)((N + 127) / 128);
+            d.grid[1] = (uint32_t)((M + 63) / 64);
+        } else {
+            d.p = &p_mpp_mm_64_64;
+            d.grid[0] = (uint32_t)((N + 63) / 64);
+            d.grid[1] = (uint32_t)((M + 63) / 64);
+        }
+        d.args = {w_f16, x_f16, y_f32, mtl::Arg::V(a)};
+        ds.push_back(std::move(d));
     }
 
     void push_dspark_linear(std::vector<mtl::Dispatch>& ds, const std::string& name,
@@ -705,41 +992,80 @@ struct InkMetalRunner {
                     d.args = {mtl::Arg::B(b_in3, src_off), mtl::Arg::B(b_msgs, moff), mtl::Arg::B(b_cat, coff)};
                     ds.push_back(std::move(d));
                 }
-                for (int j = 0; j < 3; ++j) {
-                    const size_t coff = (size_t)j * (size_t)M * 2 * D * 4;
-                    const size_t goff = (size_t)j * (size_t)M * c.gate_rank * 4;
-                    push_trunk_linear(ds, p + ".controllers." + cnames[j] + ".down_weight",
-                                      mtl::Arg::B(b_cat, coff), mtl::Arg::B(b_ctrl_gate, goff), M, -1, (j == 0));
-                }
                 if (M > 8) {
-                    // Run ALL 3 (attn, k, v) gain & forget GEMMs CONCURRENTLY into b_cat[0..5], then 3-way concurrent fuse_norm (-96 barriers)!
-                    for (int j = 0; j < 3; ++j) {
-                        const size_t goff = (size_t)j * (size_t)M * c.gate_rank * 4;
-                        const size_t sg_off = (size_t)(2 * j + 0) * M_stride * 4;
-                        const size_t sf_off = (size_t)(2 * j + 1) * M_stride * 4;
-                        push_trunk_linear(ds, p + ".controllers." + cnames[j] + ".gain_weight",
-                                          mtl::Arg::B(b_ctrl_gate, goff), mtl::Arg::B(b_cat, sg_off), M, -1, (j == 0));
-                        push_trunk_linear(ds, p + ".controllers." + cnames[j] + ".forget_weight",
-                                          mtl::Arg::B(b_ctrl_gate, goff), mtl::Arg::B(b_cat, sf_off), M, -1, false);
-                    }
-                    const int order[3] = {1, 2, 0};
-                    for (int oi = 0; oi < 3; ++oi) {
-                        const int j = is_swa ? order[oi] : oi;
-                        const size_t src_off = is_swa ? 0 : ((size_t)j * M_stride * 4);
-                        const size_t dst_off = (size_t)j * M_stride * 4;
-                        const size_t moff = (size_t)j * M_stride * 4;
-                        const size_t sg_off = (size_t)(2 * j + 0) * M_stride * 4;
-                        const size_t sf_off = (size_t)(2 * j + 1) * M_stride * 4;
-                        std::string nkey = is_swa ? (p + ".attn_norm.weight") : (p + "." + nnames[j]);
-                        mtl::Dispatch df;
-                        df.barrier = (oi == 0) || (is_swa && oi == 2);
-                        df.p = &p_ctrl_fuse_norm; df.grid[0] = (uint32_t)M; df.tg[0] = 256;
-                        df.args = {mtl::Arg::B(b_in3, src_off), mtl::Arg::B(b_msgs, moff),
-                                   mtl::Arg::B(b_cat, sg_off), mtl::Arg::B(b_cat, sf_off),
-                                   mod->tw(nkey), mtl::Arg::B(b_in3, dst_off)};
-                        ds.push_back(std::move(df));
+                    if (use_mpp && use_mpp_trunk_f16) {
+                        const int ci = ip - c.core_start;
+                        push_f32_to_f16(ds, mtl::Arg::B(b_cat), mtl::Arg::B(b_mpp_x_f16), 3 * M * 2 * D, true);
+                        for (int j = 0; j < 3; ++j) {
+                            const size_t xoff = (size_t)j * (size_t)M * 2 * D * 2;
+                            const size_t goff = (size_t)j * (size_t)M * c.gate_rank * 4;
+                            push_mpp_gemm(ds, mtl::Arg::B(w_ctrl_dn_f16[ci][j]), mtl::Arg::B(b_mpp_x_f16, xoff),
+                                          mtl::Arg::B(b_ctrl_gate, goff), M, c.gate_rank, 2 * D, c.gate_rank, (j == 0));
+                        }
+                        push_f32_to_f16(ds, mtl::Arg::B(b_ctrl_gate), mtl::Arg::B(b_mpp_x_f16), 3 * M * c.gate_rank, true);
+                        for (int j = 0; j < 3; ++j) {
+                            const size_t goff = (size_t)j * (size_t)M * c.gate_rank * 2;
+                            const size_t gf_off = (size_t)j * (size_t)M * 2 * D * 4;
+                            push_mpp_gemm(ds, mtl::Arg::B(w_ctrl_gf_f16[ci][j]), mtl::Arg::B(b_mpp_x_f16, goff),
+                                          mtl::Arg::B(b_cat, gf_off), M, 2 * D, c.gate_rank, 2 * D, (j == 0));
+                        }
+                        const int order[3] = {1, 2, 0};
+                        for (int oi = 0; oi < 3; ++oi) {
+                            const int j = is_swa ? order[oi] : oi;
+                            const size_t src_off = is_swa ? 0 : ((size_t)j * M_stride * 4);
+                            const size_t dst_off = (size_t)j * M_stride * 4;
+                            const size_t moff = (size_t)j * M_stride * 4;
+                            const size_t gf_off = (size_t)j * (size_t)M * 2 * D * 4;
+                            std::string nkey = is_swa ? (p + ".attn_norm.weight") : (p + "." + nnames[j]);
+                            mtl::Dispatch df;
+                            df.barrier = (oi == 0) || (is_swa && oi == 2);
+                            df.p = &p_mpp_ctrl_fuse_gf; df.grid[0] = (uint32_t)M; df.tg[0] = 256;
+                            df.args = {mtl::Arg::B(b_in3, src_off), mtl::Arg::B(b_msgs, moff),
+                                       mtl::Arg::B(b_cat, gf_off), mod->tw(nkey), mtl::Arg::B(b_in3, dst_off)};
+                            ds.push_back(std::move(df));
+                        }
+                    } else {
+                        for (int j = 0; j < 3; ++j) {
+                            const size_t coff = (size_t)j * (size_t)M * 2 * D * 4;
+                            const size_t goff = (size_t)j * (size_t)M * c.gate_rank * 4;
+                            push_trunk_linear(ds, p + ".controllers." + cnames[j] + ".down_weight",
+                                              mtl::Arg::B(b_cat, coff), mtl::Arg::B(b_ctrl_gate, goff), M, -1, (j == 0));
+                        }
+                        // Run ALL 3 (attn, k, v) gain & forget GEMMs CONCURRENTLY into b_cat[0..5], then 3-way concurrent fuse_norm (-96 barriers)!
+                        for (int j = 0; j < 3; ++j) {
+                            const size_t goff = (size_t)j * (size_t)M * c.gate_rank * 4;
+                            const size_t sg_off = (size_t)(2 * j + 0) * M_stride * 4;
+                            const size_t sf_off = (size_t)(2 * j + 1) * M_stride * 4;
+                            push_trunk_linear(ds, p + ".controllers." + cnames[j] + ".gain_weight",
+                                              mtl::Arg::B(b_ctrl_gate, goff), mtl::Arg::B(b_cat, sg_off), M, -1, (j == 0));
+                            push_trunk_linear(ds, p + ".controllers." + cnames[j] + ".forget_weight",
+                                              mtl::Arg::B(b_ctrl_gate, goff), mtl::Arg::B(b_cat, sf_off), M, -1, false);
+                        }
+                        const int order[3] = {1, 2, 0};
+                        for (int oi = 0; oi < 3; ++oi) {
+                            const int j = is_swa ? order[oi] : oi;
+                            const size_t src_off = is_swa ? 0 : ((size_t)j * M_stride * 4);
+                            const size_t dst_off = (size_t)j * M_stride * 4;
+                            const size_t moff = (size_t)j * M_stride * 4;
+                            const size_t sg_off = (size_t)(2 * j + 0) * M_stride * 4;
+                            const size_t sf_off = (size_t)(2 * j + 1) * M_stride * 4;
+                            std::string nkey = is_swa ? (p + ".attn_norm.weight") : (p + "." + nnames[j]);
+                            mtl::Dispatch df;
+                            df.barrier = (oi == 0) || (is_swa && oi == 2);
+                            df.p = &p_ctrl_fuse_norm; df.grid[0] = (uint32_t)M; df.tg[0] = 256;
+                            df.args = {mtl::Arg::B(b_in3, src_off), mtl::Arg::B(b_msgs, moff),
+                                       mtl::Arg::B(b_cat, sg_off), mtl::Arg::B(b_cat, sf_off),
+                                       mod->tw(nkey), mtl::Arg::B(b_in3, dst_off)};
+                            ds.push_back(std::move(df));
+                        }
                     }
                 } else {
+                    for (int j = 0; j < 3; ++j) {
+                        const size_t coff = (size_t)j * (size_t)M * 2 * D * 4;
+                        const size_t goff = (size_t)j * (size_t)M * c.gate_rank * 4;
+                        push_trunk_linear(ds, p + ".controllers." + cnames[j] + ".down_weight",
+                                          mtl::Arg::B(b_cat, coff), mtl::Arg::B(b_ctrl_gate, goff), M, -1, (j == 0));
+                    }
                     // 40-core parallel ink_ctrl_gf_64 (144 TGs each!) writing to scratch b_cat[0..2] -> ALL 3 run 100% CONCURRENTLY even for is_swa (-12 barriers!)
                     for (int j = 0; j < 3; ++j) {
                         const size_t src_off = is_swa ? 0 : ((size_t)j * M_stride * 4);
@@ -773,17 +1099,60 @@ struct InkMetalRunner {
             const mtl::Arg in_v = (is_swa && !has_msgs) ? mtl::Arg::B(b_in3, 0) : mtl::Arg::B(b_in3, (size_t)2 * M_stride * 4);
 
             // Q, K, V, R, Sinks, GateAttn, k_sconv.weight_proj, v_sconv.weight_proj:
-            // ALL 6-8 projections read from b_in3 and write disjoint outputs -> run 100% CONCURRENTLY on Apple Silicon!
-            push_trunk_linear(ds, p + ".attn.wq_du.weight", in_q, mtl::Arg::B(b_q), M, -1, true);
-            push_trunk_linear(ds, p + ".attn.wk_dv.weight", in_k, mtl::Arg::B(b_k_raw), M, -1, false);
-            push_trunk_linear(ds, p + ".attn.wv_dv.weight", in_v, mtl::Arg::B(b_v_raw), M, -1, false);
-            push_trunk_linear(ds, p + ".attn.wr_du.weight", in_q, mtl::Arg::B(b_r), M, -1, false);
-            push_trunk_linear(ds, p + ".attn.attn_sink_proj.weight", in_q, mtl::Arg::B(b_sinks), M, -1, false);
-            push_trunk_linear(ds, p + ".attn.gate_attn.weight", in_q, mtl::Arg::B(b_gate_attn), M, -1, false);
+            if (use_mpp && use_mpp_trunk_f16 && M >= 8) {
+                const bool shared_qkv = (is_swa && !has_msgs);
+                const int n_in_floats = (shared_qkv ? 1 : 3) * M_stride;
+                push_f32_to_f16(ds, mtl::Arg::B(b_in3, 0), mtl::Arg::B(b_mpp_x_f16, 0), n_in_floats, true);
+                const mtl::Arg xq = mtl::Arg::B(b_mpp_x_f16, 0);
+                const mtl::Arg xk = shared_qkv ? xq : mtl::Arg::B(b_mpp_x_f16, (size_t)M_stride * 2);
+                const mtl::Arg xv = shared_qkv ? xq : mtl::Arg::B(b_mpp_x_f16, (size_t)2 * M_stride * 2);
 
-            if (!is_swa) {
-                push_trunk_linear(ds, p + ".attn.k_sconv.weight_proj", in_k, mtl::Arg::B(b_kd_taps), M, -1, false);
-                push_trunk_linear(ds, p + ".attn.v_sconv.weight_proj", in_v, mtl::Arg::B(b_vd_taps), M, -1, false);
+                const int kv_rows = is_swa ? 1024 : 1056;
+                const size_t tmp_k_off = (size_t)M * 6552 * 4;
+                const size_t tmp_v_off = (size_t)M * (6552 + 1056) * 4;
+                // 3 CONCURRENT Metal 4 Neural Accelerator GEMMs (replaces 6-8 separate dispatches!)
+                push_mpp_gemm(ds, mtl::Arg::B(w_qrsg_f16[ip]), xq, mtl::Arg::B(b_mpp_tmp_out, 0), M, 6552, D, 6552, true);
+                push_mpp_gemm(ds, mtl::Arg::B(w_k_f16[ip]), xk,
+                              is_swa ? mtl::Arg::B(b_k_raw) : mtl::Arg::B(b_mpp_tmp_out, tmp_k_off), M, kv_rows, D, kv_rows, false);
+                push_mpp_gemm(ds, mtl::Arg::B(w_v_f16[ip]), xv,
+                              is_swa ? mtl::Arg::B(b_v_raw) : mtl::Arg::B(b_mpp_tmp_out, tmp_v_off), M, kv_rows, D, kv_rows, false);
+                {
+                    int st_q = 6552;
+                    mtl::Dispatch dq;
+                    dq.barrier = true;
+                    dq.p = &p_mpp_split_qrsg; dq.grid[0] = (uint32_t)M; dq.grid[1] = 26; dq.tg[0] = 256;
+                    dq.args = {mtl::Arg::B(b_mpp_tmp_out, 0), mtl::Arg::B(b_q), mtl::Arg::B(b_r),
+                               mtl::Arg::B(b_sinks), mtl::Arg::B(b_gate_attn), mtl::Arg::V(st_q)};
+                    ds.push_back(std::move(dq));
+                }
+                if (!is_swa) {
+                    int hd = 1, st_kv = 1056;
+                    mtl::Dispatch dk;
+                    dk.barrier = false;
+                    dk.p = &p_mpp_split_kv; dk.grid[0] = (uint32_t)M; dk.grid[1] = 5; dk.tg[0] = 256;
+                    dk.args = {mtl::Arg::B(b_mpp_tmp_out, tmp_k_off), mtl::Arg::B(b_k_raw), mtl::Arg::B(b_kd_taps),
+                               mtl::Arg::V(hd), mtl::Arg::V(st_kv)};
+                    ds.push_back(std::move(dk));
+                    mtl::Dispatch dv;
+                    dv.barrier = false;
+                    dv.p = &p_mpp_split_kv; dv.grid[0] = (uint32_t)M; dv.grid[1] = 5; dv.tg[0] = 256;
+                    dv.args = {mtl::Arg::B(b_mpp_tmp_out, tmp_v_off), mtl::Arg::B(b_v_raw), mtl::Arg::B(b_vd_taps),
+                               mtl::Arg::V(hd), mtl::Arg::V(st_kv)};
+                    ds.push_back(std::move(dv));
+                }
+            } else {
+                // ALL 6-8 projections read from b_in3 and write disjoint outputs -> run 100% CONCURRENTLY on Apple Silicon!
+                push_trunk_linear(ds, p + ".attn.wq_du.weight", in_q, mtl::Arg::B(b_q), M, -1, true);
+                push_trunk_linear(ds, p + ".attn.wk_dv.weight", in_k, mtl::Arg::B(b_k_raw), M, -1, false);
+                push_trunk_linear(ds, p + ".attn.wv_dv.weight", in_v, mtl::Arg::B(b_v_raw), M, -1, false);
+                push_trunk_linear(ds, p + ".attn.wr_du.weight", in_q, mtl::Arg::B(b_r), M, -1, false);
+                push_trunk_linear(ds, p + ".attn.attn_sink_proj.weight", in_q, mtl::Arg::B(b_sinks), M, -1, false);
+                push_trunk_linear(ds, p + ".attn.gate_attn.weight", in_q, mtl::Arg::B(b_gate_attn), M, -1, false);
+
+                if (!is_swa) {
+                    push_trunk_linear(ds, p + ".attn.k_sconv.weight_proj", in_k, mtl::Arg::B(b_kd_taps), M, -1, false);
+                    push_trunk_linear(ds, p + ".attn.v_sconv.weight_proj", in_v, mtl::Arg::B(b_vd_taps), M, -1, false);
+                }
             }
 
             // Helper: 4-tap causal ShortConv (parallel across M*C for single-slot prefill M >= 16!)
@@ -849,28 +1218,89 @@ struct InkMetalRunner {
 
             // Fused RelPos + Sink 24:8 GQA Flash Attention + sigmoid(gate_attn)
             {
-                InkAttnArgs aa{};
-                aa.M = M;
-                aa.is_swa = is_swa ? 1 : 0;
-                aa.swa_win = c.swa_win;
-                aa.rel_extent = c.rel_extent;
-                aa.kv_stride = visit_kv_stride[visit];
-                aa.kv_fp8 = 0;
-                aa.scale = 1.0f / std::sqrt((float)c.head_dim);
-                mtl::Dispatch da;
-                da.p = &p_relpos_gqa;
-                da.grid[0] = (uint32_t)M; da.grid[1] = (uint32_t)c.n_head; da.tg[0] = 128;
-                da.args = {mtl::Arg::B(b_q), mtl::Arg::B(b_r),
-                           mtl::Arg::B(mod->rel_proj_pad_buf, (size_t)ip * 16 * 1025 * 4),
-                           mtl::Arg::B(b_sinks), mtl::Arg::B(b_gate_attn),
-                           mtl::Arg::B(kv_k[visit]), mtl::Arg::B(kv_v[visit]),
-                           mtl::Arg::B(b_slot_ids), mtl::Arg::B(b_pos),
-                           mtl::Arg::B(b_attn_out), mtl::Arg::V(aa)};
-                ds.push_back(std::move(da));
+                bool use_mpp_attn = false;
+                if (use_mpp && n_active_slots == 1 && M >= 32) {
+                    use_mpp_attn = true;
+                    for (int m = 1; m < M; ++m) if (step.pos[m] != step.pos[0] + m) { use_mpp_attn = false; break; }
+                }
+                if (use_mpp_attn) {
+                    const int M_pad = (M + 31) & ~31;
+                    const float sc = 1.0f / std::sqrt((float)c.head_dim);
+                    {
+                        mtl::Dispatch dp;
+                        dp.p = &p_mpp_prep_qr; dp.grid[0] = (uint32_t)M_pad; dp.grid[1] = 24; dp.tg[0] = 128;
+                        dp.args = {mtl::Arg::B(b_q), mtl::Arg::B(b_r), mtl::Arg::B(b_mpp_qh), mtl::Arg::B(b_mpp_rh),
+                                   mtl::Arg::V(M), mtl::Arg::V(M_pad), mtl::Arg::V(sc)};
+                        ds.push_back(std::move(dp));
+                    }
+                    InkMppAttnArgs ma{};
+                    ma.M = M;
+                    ma.M_pad = M_pad;
+                    ma.slot = as_p[0];
+                    ma.pos0 = step.pos[0];
+                    ma.is_swa = is_swa ? 1 : 0;
+                    ma.swa_win = c.swa_win;
+                    ma.rel_extent = c.rel_extent;
+                    ma.kv_stride = visit_kv_stride[visit];
+                    ma.scale = sc;
+                    mtl::Dispatch da;
+                    da.p = &p_mpp_relpos_gqa_pf;
+                    da.grid[0] = (uint32_t)(M_pad / 32); da.grid[1] = 24; da.tg[0] = 128;
+                    da.args = {mtl::Arg::B(b_mpp_qh), mtl::Arg::B(b_mpp_rh),
+                               mtl::Arg::B(mod->rel_proj_t_f16_buf, (size_t)ip * 1025 * 16 * 2),
+                               mtl::Arg::B(b_sinks), mtl::Arg::B(b_gate_attn),
+                               mtl::Arg::B(kv_k[visit]), mtl::Arg::B(kv_v[visit]),
+                               mtl::Arg::B(b_attn_out), mtl::Arg::V(ma)};
+                    ds.push_back(std::move(da));
+                } else {
+                    InkAttnArgs aa{};
+                    aa.M = M;
+                    aa.is_swa = is_swa ? 1 : 0;
+                    aa.swa_win = c.swa_win;
+                    aa.rel_extent = c.rel_extent;
+                    aa.kv_stride = visit_kv_stride[visit];
+                    aa.kv_fp8 = 0;
+                    aa.scale = 1.0f / std::sqrt((float)c.head_dim);
+                    int max_p = 0;
+                    for (int m = 0; m < M; ++m) if (step.pos[m] > max_p) max_p = step.pos[m];
+                    if (M <= 16 && max_p >= 64) {
+                        mtl::Dispatch d1;
+                        d1.p = &p_relpos_gqa_splitk;
+                        d1.grid[0] = (uint32_t)M; d1.grid[1] = (uint32_t)c.n_kv; d1.grid[2] = 8u; d1.tg[0] = 128;
+                        d1.args = {mtl::Arg::B(b_q), mtl::Arg::B(b_r),
+                                   mtl::Arg::B(mod->rel_proj_t_f16_buf, (size_t)ip * 1025 * 16 * 2),
+                                   mtl::Arg::B(kv_k[visit]), mtl::Arg::B(kv_v[visit]),
+                                   mtl::Arg::B(b_slot_ids), mtl::Arg::B(b_pos),
+                                   mtl::Arg::B(b_attn_part_o), mtl::Arg::B(b_attn_part_ml), mtl::Arg::V(aa)};
+                        ds.push_back(std::move(d1));
+                        mtl::Dispatch d2;
+                        d2.p = &p_relpos_gqa_splitk_red;
+                        d2.grid[0] = (uint32_t)M; d2.grid[1] = (uint32_t)c.n_head; d2.tg[0] = 128;
+                        d2.args = {mtl::Arg::B(b_attn_part_o), mtl::Arg::B(b_attn_part_ml),
+                                   mtl::Arg::B(b_sinks), mtl::Arg::B(b_gate_attn), mtl::Arg::B(b_attn_out)};
+                        ds.push_back(std::move(d2));
+                    } else {
+                        mtl::Dispatch da;
+                        da.p = &p_relpos_gqa;
+                        da.grid[0] = (uint32_t)M; da.grid[1] = (uint32_t)c.n_head; da.tg[0] = 128;
+                        da.args = {mtl::Arg::B(b_q), mtl::Arg::B(b_r),
+                                   mtl::Arg::B(mod->rel_proj_t_f16_buf, (size_t)ip * 1025 * 16 * 2),
+                                   mtl::Arg::B(b_sinks), mtl::Arg::B(b_gate_attn),
+                                   mtl::Arg::B(kv_k[visit]), mtl::Arg::B(kv_v[visit]),
+                                   mtl::Arg::B(b_slot_ids), mtl::Arg::B(b_pos),
+                                   mtl::Arg::B(b_attn_out), mtl::Arg::V(aa)};
+                        ds.push_back(std::move(da));
+                    }
+                }
             }
 
             // Output projection wo_ud + FUSED 4-tap attn_sconv + residual/block update (kills 56+ barriers/tok!)
-            push_trunk_linear(ds, p + ".attn.wo_ud.weight", mtl::Arg::B(b_attn_out), mtl::Arg::B(b_wo_raw), M);
+            if (use_mpp && use_mpp_trunk_f16 && M >= 8) {
+                push_f32_to_f16(ds, mtl::Arg::B(b_attn_out), mtl::Arg::B(b_mpp_x_f16), M * 3072, true);
+                push_mpp_gemm(ds, mtl::Arg::B(w_wo_f16[ip]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(b_wo_raw), M, D, 3072, D, true);
+            } else {
+                push_trunk_linear(ds, p + ".attn.wo_ud.weight", mtl::Arg::B(b_attn_out), mtl::Arg::B(b_wo_raw), M);
+            }
             const bool is_blk = (ip % c.block_size == 0);
             if (n_active_slots == 1 && M >= 16 && !save_ring) {
                 push_sconv(b_wo_raw, sc_lbase + InkMetalModel::kSconvAttnOff, b_kd_taps, sc_hist_attn[visit], sc_ring_attn[visit], b_wo, D, 0, true);
@@ -930,19 +1360,35 @@ struct InkMetalRunner {
                     d.args = {mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_msgs, (size_t)3 * M_stride * 4), mtl::Arg::B(b_cat)};
                     ds.push_back(std::move(d));
                 }
-                push_trunk_linear(ds, p + ".controllers.mlp.down_weight", mtl::Arg::B(b_cat), mtl::Arg::B(b_ctrl_gate), M);
                 if (M > 8) {
-                    push_trunk_linear(ds, p + ".controllers.mlp.gain_weight",
-                                      mtl::Arg::B(b_ctrl_gate), mtl::Arg::B(b_wo_raw), M, -1, true);
-                    push_trunk_linear(ds, p + ".controllers.mlp.forget_weight",
-                                      mtl::Arg::B(b_ctrl_gate), mtl::Arg::B(b_wo), M, -1, false);
-                    mtl::Dispatch df;
-                    df.p = &p_ctrl_fuse_norm; df.grid[0] = (uint32_t)M; df.tg[0] = 256;
-                    df.args = {mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_msgs, (size_t)3 * M_stride * 4),
-                               mtl::Arg::B(b_wo_raw), mtl::Arg::B(b_wo),
-                               mod->tw(p + ".mlp_norm.weight"), mtl::Arg::B(b_mlp_in)};
-                    ds.push_back(std::move(df));
+                    if (use_mpp && use_mpp_trunk_f16) {
+                        const int ci = ip - c.core_start;
+                        push_f32_to_f16(ds, mtl::Arg::B(b_cat), mtl::Arg::B(b_mpp_x_f16), M * 2 * D, true);
+                        push_mpp_gemm(ds, mtl::Arg::B(w_ctrl_dn_f16[ci][3]), mtl::Arg::B(b_mpp_x_f16),
+                                      mtl::Arg::B(b_ctrl_gate), M, c.gate_rank, 2 * D, c.gate_rank, true);
+                        push_f32_to_f16(ds, mtl::Arg::B(b_ctrl_gate), mtl::Arg::B(b_mpp_x_f16), M * c.gate_rank, true);
+                        push_mpp_gemm(ds, mtl::Arg::B(w_ctrl_gf_f16[ci][3]), mtl::Arg::B(b_mpp_x_f16),
+                                      mtl::Arg::B(b_cat), M, 2 * D, c.gate_rank, 2 * D, true);
+                        mtl::Dispatch df;
+                        df.p = &p_mpp_ctrl_fuse_gf; df.grid[0] = (uint32_t)M; df.tg[0] = 256;
+                        df.args = {mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_msgs, (size_t)3 * M_stride * 4),
+                                   mtl::Arg::B(b_cat), mod->tw(p + ".mlp_norm.weight"), mtl::Arg::B(b_mlp_in)};
+                        ds.push_back(std::move(df));
+                    } else {
+                        push_trunk_linear(ds, p + ".controllers.mlp.down_weight", mtl::Arg::B(b_cat), mtl::Arg::B(b_ctrl_gate), M);
+                        push_trunk_linear(ds, p + ".controllers.mlp.gain_weight",
+                                          mtl::Arg::B(b_ctrl_gate), mtl::Arg::B(b_wo_raw), M, -1, true);
+                        push_trunk_linear(ds, p + ".controllers.mlp.forget_weight",
+                                          mtl::Arg::B(b_ctrl_gate), mtl::Arg::B(b_wo), M, -1, false);
+                        mtl::Dispatch df;
+                        df.p = &p_ctrl_fuse_norm; df.grid[0] = (uint32_t)M; df.tg[0] = 256;
+                        df.args = {mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_msgs, (size_t)3 * M_stride * 4),
+                                   mtl::Arg::B(b_wo_raw), mtl::Arg::B(b_wo),
+                                   mod->tw(p + ".mlp_norm.weight"), mtl::Arg::B(b_mlp_in)};
+                        ds.push_back(std::move(df));
+                    }
                 } else {
+                    push_trunk_linear(ds, p + ".controllers.mlp.down_weight", mtl::Arg::B(b_cat), mtl::Arg::B(b_ctrl_gate), M);
                     mtl::Dispatch d;
                     d.p = &p_ctrl_gf_64; d.grid[0] = 144; d.grid[1] = (uint32_t)M; d.tg[0] = 256;
                     d.args = {mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_msgs, (size_t)3 * M_stride * 4), mtl::Arg::B(b_ctrl_gate),
@@ -959,15 +1405,8 @@ struct InkMetalRunner {
 
             // Router (exact FP32!) + Top-8 (+ fused M==1 moe_plan -> kills 48 barriers!) + MoE
             push_trunk_linear(ds, p + ".mlp.gate.weight", mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_r_logits), M, -1, true, true);
-            if (M == 1) {
-                mtl::Dispatch d;
-                d.p = &p_router_topk8_plan_m1; d.grid[0] = 1; d.tg[0] = 128;
-                d.args = {mtl::Arg::B(b_r_logits), mod->tw(p + ".mlp.gate.bias"),
-                          mtl::Arg::B(b_topk_idx), mtl::Arg::B(b_topk_w),
-                          mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
-                          mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::V(c.route_scale)};
-                ds.push_back(std::move(d));
-            } else {
+            const size_t ex_off = (size_t)ip * c.n_experts * sizeof(InkExpertDev);
+            if (use_mpp && M >= 16) {
                 {
                     mtl::Dispatch d;
                     d.p = &p_router_topk8; d.grid[0] = (uint32_t)M; d.tg[0] = 128;
@@ -975,64 +1414,80 @@ struct InkMetalRunner {
                               mtl::Arg::B(b_topk_idx), mtl::Arg::B(b_topk_w), mtl::Arg::V(c.route_scale)};
                     ds.push_back(std::move(d));
                 }
-                {
-                    int P = M * c.top_k;
-                    mtl::Dispatch d;
-                    d.p = &p_moe_plan; d.grid[0] = 1; d.tg[0] = 128;
-                    d.args = {mtl::Arg::B(b_topk_idx), mtl::Arg::V(P),
-                              mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
-                              mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_tiles)};
-                    ds.push_back(std::move(d));
-                }
-            }
-            const size_t ex_off = (size_t)ip * c.n_experts * sizeof(InkExpertDev);
-            // Flattened parallel (expert, m_tile) BM=32 BN=64 BK=64 simdgroup_matrix MoE for M >= 48 (zero tail straggler!)
-            const bool use_moe_mm = (M >= 48);
-            {
-                mtl::Dispatch d;
-                if (use_moe_mm) {
-                    d.p = (layer_homog_gu[ip] == 15) ? &p_moe_gu_mm_sf4
-                        : (layer_homog_gu[ip] == 16) ? &p_moe_gu_mm_mx8 : &p_moe_gu_mm_gen;
-                    d.ind_off = 8 * sizeof(uint32_t);
-                } else {
-                    d.p = (layer_homog_gu[ip] == 15) ? &p_moe_gu_sf4
-                        : (layer_homog_gu[ip] == 16) ? &p_moe_gu_mx8 : &p_moe_gu;
-                    d.ind_off = 2 * sizeof(uint32_t);
-                }
-                d.tg[0] = 256;
-                d.indirect = &b_moe_meta;
-                d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_mlp_in),
-                          use_moe_mm ? mtl::Arg::B(b_moe_tiles) : mtl::Arg::B(b_moe_uexp),
-                          mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
-                          mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h)};
-                ds.push_back(std::move(d));
-            }
-            {
-                mtl::Dispatch d;
-                if (use_moe_mm) {
-                    d.p = (layer_homog_dn[ip] == 15) ? &p_moe_dn_mm_sf4
-                        : (layer_homog_dn[ip] == 16) ? &p_moe_dn_mm_mx8 : &p_moe_dn_mm_gen;
-                    d.ind_off = 8 * sizeof(uint32_t);
-                } else {
-                    d.p = (layer_homog_dn[ip] == 15) ? &p_moe_dn_sf4
-                        : (layer_homog_dn[ip] == 16) ? &p_moe_dn_mx8 : &p_moe_dn;
-                    d.ind_off = 5 * sizeof(uint32_t);
-                }
-                d.tg[0] = 256;
-                d.indirect = &b_moe_meta;
-                d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_topk_w),
-                          use_moe_mm ? mtl::Arg::B(b_moe_tiles) : mtl::Arg::B(b_moe_uexp),
-                          mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
-                          mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h), mtl::Arg::B(b_moe_yp)};
-                ds.push_back(std::move(d));
-            }
-            // Fused MoE reduce8 + mlp_sconv + residual add (kills 96 dispatches & 96 barriers/tok!)
-            if (n_active_slots == 1 && M >= 16 && !save_ring) {
+                const int P = M * c.top_k;
+                const int TM_sm = (M >= 128) ? 32 : 16;
+                const int sm_bi = (TM_sm == 32) ? 1 : 0;
+                const int gu_ci = (layer_homog_gu[ip] == 15) ? 0 : (layer_homog_gu[ip] == 16) ? 1 : 2;
+                const int dn_ci = (layer_homog_dn[ip] == 15) ? 0 : (layer_homog_dn[ip] == 16) ? 1 : 2;
                 {
                     mtl::Dispatch d;
-                    d.p = &p_moe_red8; d.grid[0] = (uint32_t)M; d.grid[1] = 9; d.tg[0] = 256;
-                    d.args = {mtl::Arg::B(b_moe_yp), mtl::Arg::B(b_moe_raw)};
+                    d.p = &p_mpp_moe_plan; d.grid[0] = 1; d.tg[0] = 128;
+                    d.args = {mtl::Arg::B(b_topk_idx), mtl::Arg::V(P), mtl::Arg::V(TM_sm),
+                              mtl::Arg::B(b_mpp_srt_pair), mtl::Arg::B(b_mpp_pair_pos),
+                              mtl::Arg::B(b_mpp_tiles_128), mtl::Arg::B(b_mpp_tiles_64), mtl::Arg::B(b_mpp_tiles_sm),
+                              mtl::Arg::B(b_mpp_meta)};
                     ds.push_back(std::move(d));
+                }
+                {
+                    mtl::Dispatch dg;
+                    dg.p = &p_mpp_moe_gather; dg.ind_off = 4 * sizeof(uint32_t); dg.tg[0] = 256; dg.indirect = &b_mpp_meta;
+                    dg.args = {mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_mpp_srt_pair), mtl::Arg::B(b_mpp_xs)};
+                    ds.push_back(std::move(dg));
+                }
+                // All 3 tile buckets (128, 64, sm) write disjoint rows of HS -> run 100% CONCURRENTLY!
+                if (TM_sm >= 32) {
+                    mtl::Dispatch d128;
+                    d128.p = &p_mpp_moe_gu_dir[gu_ci][3]; d128.ind_off = 7 * sizeof(uint32_t); d128.tg[0] = 128; d128.indirect = &b_mpp_meta;
+                    d128.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                 mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_128)};
+                    ds.push_back(std::move(d128));
+                }
+                {
+                    mtl::Dispatch d64;
+                    d64.barrier = (TM_sm < 32);
+                    d64.p = &p_mpp_moe_gu_dir[gu_ci][2]; d64.ind_off = 10 * sizeof(uint32_t); d64.tg[0] = 128; d64.indirect = &b_mpp_meta;
+                    d64.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_64)};
+                    ds.push_back(std::move(d64));
+                }
+                {
+                    mtl::Dispatch dsm;
+                    dsm.barrier = false;
+                    dsm.p = &p_mpp_moe_gu_dir[gu_ci][sm_bi]; dsm.ind_off = 13 * sizeof(uint32_t); dsm.tg[0] = 128; dsm.indirect = &b_mpp_meta;
+                    dsm.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_sm)};
+                    ds.push_back(std::move(dsm));
+                }
+                // All 3 w2 buckets (128, 64, sm) write disjoint rows of YE -> run 100% CONCURRENTLY!
+                if (TM_sm >= 32) {
+                    mtl::Dispatch d128;
+                    d128.p = &p_mpp_moe_dn_dir[dn_ci][3]; d128.ind_off = 7 * sizeof(uint32_t); d128.tg[0] = 128; d128.indirect = &b_mpp_meta;
+                    d128.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                 mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_128)};
+                    ds.push_back(std::move(d128));
+                }
+                {
+                    mtl::Dispatch d64;
+                    d64.barrier = (TM_sm < 32);
+                    d64.p = &p_mpp_moe_dn_dir[dn_ci][2]; d64.ind_off = 10 * sizeof(uint32_t); d64.tg[0] = 128; d64.indirect = &b_mpp_meta;
+                    d64.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_64)};
+                    ds.push_back(std::move(d64));
+                }
+                {
+                    mtl::Dispatch dsm;
+                    dsm.barrier = false;
+                    dsm.p = &p_mpp_moe_dn_dir[dn_ci][sm_bi]; dsm.ind_off = 13 * sizeof(uint32_t); dsm.tg[0] = 128; dsm.indirect = &b_mpp_meta;
+                    dsm.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_sm)};
+                    ds.push_back(std::move(dsm));
+                }
+                {
+                    mtl::Dispatch dc;
+                    dc.p = &p_mpp_moe_combine; dc.grid[0] = (uint32_t)M; dc.grid[1] = 9; dc.tg[0] = 256;
+                    dc.args = {mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_pair_pos),
+                               mtl::Arg::B(b_topk_w), mtl::Arg::B(b_moe_raw)};
+                    ds.push_back(std::move(dc));
                 }
                 push_sconv(b_moe_raw, sc_lbase + InkMetalModel::kSconvMlpOff, b_kd_taps, sc_hist_mlp[visit], sc_ring_mlp[visit], b_moe_out, D, 0, true);
                 {
@@ -1042,14 +1497,113 @@ struct InkMetalRunner {
                     ds.push_back(std::move(d));
                 }
             } else {
-                mtl::Dispatch d;
-                d.p = &p_moe_red8_sconv_add;
-                d.grid[0] = (uint32_t)n_active_slots; d.grid[1] = 9; d.tg[0] = 256;
-                d.args = {mtl::Arg::B(b_moe_yp), mtl::Arg::B(mod->static_sconv_buf, (sc_lbase + InkMetalModel::kSconvMlpOff) * 4),
-                          mtl::Arg::B(sc_hist_mlp[visit]),
-                          mtl::Arg::B(b_active_slots), mtl::Arg::B(b_slot_tok_off), mtl::Arg::B(b_slot_tok_cnt), mtl::Arg::B(b_slot_tok_idx),
-                          mtl::Arg::B(b_cur), mtl::Arg::B(sc_ring_mlp[visit]), mtl::Arg::V(save_ring)};
-                ds.push_back(std::move(d));
+                if (M == 1) {
+                    mtl::Dispatch d;
+                    d.p = &p_router_topk8_plan_m1; d.grid[0] = 1; d.tg[0] = 128;
+                    d.args = {mtl::Arg::B(b_r_logits), mod->tw(p + ".mlp.gate.bias"),
+                              mtl::Arg::B(b_topk_idx), mtl::Arg::B(b_topk_w),
+                              mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
+                              mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::V(c.route_scale)};
+                    ds.push_back(std::move(d));
+                } else {
+                    {
+                        mtl::Dispatch d;
+                        d.p = &p_router_topk8; d.grid[0] = (uint32_t)M; d.tg[0] = 128;
+                        d.args = {mtl::Arg::B(b_r_logits), mod->tw(p + ".mlp.gate.bias"),
+                                  mtl::Arg::B(b_topk_idx), mtl::Arg::B(b_topk_w), mtl::Arg::V(c.route_scale)};
+                        ds.push_back(std::move(d));
+                    }
+                    {
+                        int P = M * c.top_k;
+                        mtl::Dispatch d;
+                        d.p = &p_moe_plan; d.grid[0] = 1; d.tg[0] = 128;
+                        d.args = {mtl::Arg::B(b_topk_idx), mtl::Arg::V(P),
+                                  mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
+                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_tiles)};
+                        ds.push_back(std::move(d));
+                    }
+                }
+                const bool use_moe_mm = (M >= 48);
+                if (use_moe_mm) {
+                    {
+                        mtl::Dispatch d;
+                        d.p = (layer_homog_gu[ip] == 15) ? &p_moe_gu_mm_sf4
+                            : (layer_homog_gu[ip] == 16) ? &p_moe_gu_mm_mx8 : &p_moe_gu_mm_gen;
+                        d.ind_off = 8 * sizeof(uint32_t);
+                        d.tg[0] = 256; d.indirect = &b_moe_meta;
+                        d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_mlp_in),
+                                  mtl::Arg::B(b_moe_tiles), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
+                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h)};
+                        ds.push_back(std::move(d));
+                    }
+                    {
+                        mtl::Dispatch d;
+                        d.p = (layer_homog_dn[ip] == 15) ? &p_moe_dn_mm_sf4
+                            : (layer_homog_dn[ip] == 16) ? &p_moe_dn_mm_mx8 : &p_moe_dn_mm_gen;
+                        d.ind_off = 8 * sizeof(uint32_t);
+                        d.tg[0] = 256; d.indirect = &b_moe_meta;
+                        d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_topk_w),
+                                  mtl::Arg::B(b_moe_tiles), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
+                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h), mtl::Arg::B(b_moe_yp)};
+                        ds.push_back(std::move(d));
+                    }
+                } else {
+                    // Homogeneous layers use lean specialized zero-idle-lane kernels; mixed layers use single dispatch to avoid 3x TG launch overhead!
+                    {
+                        mtl::Dispatch d;
+                        if (layer_homog_gu[ip] == 15)      { d.p = &p_moe_gu_sf4; d.ind_off = 5 * sizeof(uint32_t); }
+                        else if (layer_homog_gu[ip] == 16) { d.p = &p_moe_gu_mx8; d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_gu[ip] == 2)  { d.p = &p_moe_gu_sk2; d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_gu[ip] == 3)  { d.p = &p_moe_gu_sk3; d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_gu[ip] == 4)  { d.p = &p_moe_gu_sk4; d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_gu[ip] == 5)  { d.p = &p_moe_gu_sk5; d.ind_off = 2 * sizeof(uint32_t); }
+                        else                               { d.p = &p_moe_gu;     d.ind_off = 2 * sizeof(uint32_t); }
+                        d.tg[0] = 256; d.indirect = &b_moe_meta;
+                        d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_mlp_in),
+                                  mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
+                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h)};
+                        ds.push_back(std::move(d));
+                    }
+                    {
+                        mtl::Dispatch d;
+                        if (layer_homog_dn[ip] == 15)      { d.p = &p_moe_dn_sf4; d.ind_off = 11 * sizeof(uint32_t); }
+                        else if (layer_homog_dn[ip] == 16) { d.p = &p_moe_dn_mx8; d.ind_off = 5 * sizeof(uint32_t); }
+                        else if (layer_homog_dn[ip] == 2)  { d.p = &p_moe_dn_sk2; d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_dn[ip] == 3)  { d.p = &p_moe_dn_sk3; d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_dn[ip] == 4)  { d.p = &p_moe_dn_sk4; d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_dn[ip] == 5)  { d.p = &p_moe_dn_sk5; d.ind_off = 2 * sizeof(uint32_t); }
+                        else                               { d.p = &p_moe_dn;     d.ind_off = 2 * sizeof(uint32_t); }
+                        d.tg[0] = 256; d.indirect = &b_moe_meta;
+                        d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_topk_w),
+                                  mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
+                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h), mtl::Arg::B(b_moe_yp)};
+                        ds.push_back(std::move(d));
+                    }
+                }
+                if (n_active_slots == 1 && M >= 16 && !save_ring) {
+                    {
+                        mtl::Dispatch d;
+                        d.p = &p_moe_red8; d.grid[0] = (uint32_t)M; d.grid[1] = 9; d.tg[0] = 256;
+                        d.args = {mtl::Arg::B(b_moe_yp), mtl::Arg::B(b_moe_raw)};
+                        ds.push_back(std::move(d));
+                    }
+                    push_sconv(b_moe_raw, sc_lbase + InkMetalModel::kSconvMlpOff, b_kd_taps, sc_hist_mlp[visit], sc_ring_mlp[visit], b_moe_out, D, 0, true);
+                    {
+                        mtl::Dispatch d;
+                        d.p = &p_add; d.grid[0] = (uint32_t)((M_stride + 255) / 256); d.tg[0] = 256;
+                        d.args = {mtl::Arg::B(b_cur), mtl::Arg::B(b_moe_out), mtl::Arg::B(b_cur), mtl::Arg::V(M_stride)};
+                        ds.push_back(std::move(d));
+                    }
+                } else {
+                    mtl::Dispatch d;
+                    d.p = &p_moe_red8_sconv_add;
+                    d.grid[0] = (uint32_t)n_active_slots; d.grid[1] = 9; d.tg[0] = 256;
+                    d.args = {mtl::Arg::B(b_moe_yp), mtl::Arg::B(mod->static_sconv_buf, (sc_lbase + InkMetalModel::kSconvMlpOff) * 4),
+                              mtl::Arg::B(sc_hist_mlp[visit]),
+                              mtl::Arg::B(b_active_slots), mtl::Arg::B(b_slot_tok_off), mtl::Arg::B(b_slot_tok_cnt), mtl::Arg::B(b_slot_tok_idx),
+                              mtl::Arg::B(b_cur), mtl::Arg::B(sc_ring_mlp[visit]), mtl::Arg::V(save_ring)};
+                    ds.push_back(std::move(d));
+                }
             }
         };
 
@@ -1231,9 +1785,10 @@ struct InkMetalRunner {
     }
 
     // Persistent 100% On-GPU DSpark Block-8 Recurrent Markov Drafting (ONE command buffer, ZERO host sync!)
-    // Generates 7 draft tokens in out_draft[0..6] conditioned on `anchor_tok` at `anchor_pos` (using committed ctx_kv < anchor_pos & f_rnn[slot])!
-    int dspark_draft_block8(int slot, int32_t anchor_tok, int anchor_pos, int32_t* out_draft) {
-        if (!use_dspark || anchor_pos <= 0 || anchor_pos + 8 >= max_ctx) return 0;
+    // Generates `n_steps` (1..7) draft tokens in out_draft[0..n_steps-1] conditioned on `anchor_tok` at `anchor_pos`!
+    int dspark_draft_block8(int slot, int32_t anchor_tok, int anchor_pos, int32_t* out_draft, int n_steps = 7) {
+        n_steps = std::max(1, std::min(7, n_steps));
+        if (!use_dspark || anchor_pos <= 0 || anchor_pos + n_steps + 1 >= max_ctx) return 0;
         const auto& c = mod->man.c;
         const int D = c.hidden;
 
@@ -1280,9 +1835,16 @@ struct InkMetalRunner {
                 d.args = {mtl::Arg::B(bd_cur), mod->dw(lp + ".input_layernorm.weight"), mtl::Arg::B(bd_h), mtl::Arg::V(D)};
                 ds.push_back(std::move(d));
             }
-            push_dspark_linear(ds, lp + ".self_attn.q_proj.weight", mtl::Arg::B(bd_h), mtl::Arg::B(bd_q), 8, true);
-            push_dspark_linear(ds, lp + ".self_attn.k_proj.weight", mtl::Arg::B(bd_h), mtl::Arg::B(bd_k), 8, false);
-            push_dspark_linear(ds, lp + ".self_attn.v_proj.weight", mtl::Arg::B(bd_h), mtl::Arg::B(bd_v), 8, false);
+            if (use_mpp && use_mpp_trunk_f16) {
+                push_f32_to_f16(ds, mtl::Arg::B(bd_h), mtl::Arg::B(b_mpp_x_f16), 8 * D, true);
+                push_mpp_gemm(ds, mtl::Arg::B(w_dsp_q_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_q), 8, 3072, D, 3072, true);
+                push_mpp_gemm(ds, mtl::Arg::B(w_dsp_k_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_k), 8, 1024, D, 1024, false);
+                push_mpp_gemm(ds, mtl::Arg::B(w_dsp_v_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_v), 8, 1024, D, 1024, false);
+            } else {
+                push_dspark_linear(ds, lp + ".self_attn.q_proj.weight", mtl::Arg::B(bd_h), mtl::Arg::B(bd_q), 8, true);
+                push_dspark_linear(ds, lp + ".self_attn.k_proj.weight", mtl::Arg::B(bd_h), mtl::Arg::B(bd_k), 8, false);
+                push_dspark_linear(ds, lp + ".self_attn.v_proj.weight", mtl::Arg::B(bd_h), mtl::Arg::B(bd_v), 8, false);
+            }
             {
                 int nh = 24, nkv = 8;
                 mtl::Dispatch dq; dq.p = &p_dsp_qk_rope; dq.grid[0] = 8; dq.grid[1] = 24; dq.tg[0] = 128;
@@ -1303,7 +1865,12 @@ struct InkMetalRunner {
                            mtl::Arg::V(c.dspark_swa_win), mtl::Arg::V(max_ctx)};
                 ds.push_back(std::move(da));
             }
-            push_dspark_linear(ds, lp + ".self_attn.o_proj.weight", mtl::Arg::B(bd_ao), mtl::Arg::B(bd_proj), 8);
+            if (use_mpp && use_mpp_trunk_f16) {
+                push_f32_to_f16(ds, mtl::Arg::B(bd_ao), mtl::Arg::B(b_mpp_x_f16), 8 * 3072, true);
+                push_mpp_gemm(ds, mtl::Arg::B(w_dsp_o_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_proj), 8, D, 3072, D, true);
+            } else {
+                push_dspark_linear(ds, lp + ".self_attn.o_proj.weight", mtl::Arg::B(bd_ao), mtl::Arg::B(bd_proj), 8);
+            }
             {
                 int n8d = 8 * D;
                 mtl::Dispatch d; d.p = &p_add; d.grid[0] = (uint32_t)((n8d + 255) / 256); d.tg[0] = 256;
@@ -1317,15 +1884,26 @@ struct InkMetalRunner {
                 d.args = {mtl::Arg::B(bd_cur), mod->dw(lp + ".post_attention_layernorm.weight"), mtl::Arg::B(bd_h), mtl::Arg::V(D)};
                 ds.push_back(std::move(d));
             }
-            push_dspark_linear(ds, lp + ".mlp.gate_proj.weight", mtl::Arg::B(bd_h), mtl::Arg::B(bd_mg), 8, true);
-            push_dspark_linear(ds, lp + ".mlp.up_proj.weight", mtl::Arg::B(bd_h), mtl::Arg::B(bd_mu), 8, false);
+            if (use_mpp && use_mpp_trunk_f16) {
+                push_f32_to_f16(ds, mtl::Arg::B(bd_h), mtl::Arg::B(b_mpp_x_f16), 8 * D, true);
+                push_mpp_gemm(ds, mtl::Arg::B(w_dsp_g_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_mg), 8, 9216, D, 9216, true);
+                push_mpp_gemm(ds, mtl::Arg::B(w_dsp_u_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_mu), 8, 9216, D, 9216, false);
+            } else {
+                push_dspark_linear(ds, lp + ".mlp.gate_proj.weight", mtl::Arg::B(bd_h), mtl::Arg::B(bd_mg), 8, true);
+                push_dspark_linear(ds, lp + ".mlp.up_proj.weight", mtl::Arg::B(bd_h), mtl::Arg::B(bd_mu), 8, false);
+            }
             {
                 int n8i = 8 * 9216;
                 mtl::Dispatch d; d.p = &p_dsp_swiglu; d.grid[0] = (uint32_t)((n8i + 255) / 256); d.tg[0] = 256;
                 d.args = {mtl::Arg::B(bd_mg), mtl::Arg::B(bd_mu), mtl::Arg::B(bd_mh), mtl::Arg::V(n8i)};
                 ds.push_back(std::move(d));
             }
-            push_dspark_linear(ds, lp + ".mlp.down_proj.weight", mtl::Arg::B(bd_mh), mtl::Arg::B(bd_proj), 8);
+            if (use_mpp && use_mpp_trunk_f16) {
+                push_f32_to_f16(ds, mtl::Arg::B(bd_mh), mtl::Arg::B(b_mpp_x_f16), 8 * 9216, true);
+                push_mpp_gemm(ds, mtl::Arg::B(w_dsp_d_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_proj), 8, D, 9216, D, true);
+            } else {
+                push_dspark_linear(ds, lp + ".mlp.down_proj.weight", mtl::Arg::B(bd_mh), mtl::Arg::B(bd_proj), 8);
+            }
             {
                 int n8d = 8 * D;
                 mtl::Dispatch d; d.p = &p_add; d.grid[0] = (uint32_t)((n8d + 255) / 256); d.tg[0] = 256;
@@ -1341,9 +1919,22 @@ struct InkMetalRunner {
             ds.push_back(std::move(d));
         }
 
-        // 4. 7-step Recurrent Markov RNN chain — 100% on GPU inside the SAME command buffer!
+        // 4. EXACT Full-Vocab Low-Rank Markov Chain (M_eff = unembed @ hidden_out.weight, 51 MiB Q8_ROW!)
+        //    - ONE batched mm8 unembed for all 7 base rows (~1.5 ms)
+        //    - 7 exact full-vocab (200,058 tokens!) Markov steps via M_eff (~0.10 ms/step -> 0.7 ms total, 0% alpha loss!)
         const auto& mw1_ti = mod->man.get_d("dspark.markov_head.markov_w1.weight");
-        for (int s = 1; s < 8; ++s) {
+        if (use_dspark_meff) {
+            {
+                mtl::Dispatch db;
+                db.p = &p_dsp_add_bias7; db.grid[0] = 7; db.tg[0] = 256;
+                db.args = {mtl::Arg::B(bd_cur), mod->dw("dspark.markov_head.hidden_out.bias"), mtl::Arg::B(bd_h)};
+                ds.push_back(std::move(db));
+            }
+            push_trunk_linear(ds, "model.llm.unembed.weight", mtl::Arg::B(bd_h), mtl::Arg::B(b_logits), 7, c.vocab_unpadded);
+        }
+        const int V = c.vocab_unpadded;
+        const int nparts_meff = (V + 31) / 32;
+        for (int s = 1; s <= n_steps; ++s) {
             {
                 mtl::Dispatch d;
                 d.grid[0] = (5120 + 255) / 256; d.tg[0] = 256;
@@ -1368,37 +1959,31 @@ struct InkMetalRunner {
                           mtl::Arg::B(bd_state), mtl::Arg::B(bd_latent)};
                 ds.push_back(std::move(d));
             }
-            push_dspark_linear(ds, "dspark.markov_head.hidden_out.weight", mtl::Arg::B(bd_latent), mtl::Arg::B(bd_corr), 1);
-            {
-                mtl::Dispatch d; d.p = &p_dsp_add_bias; d.grid[0] = (D + 255) / 256; d.tg[0] = 256;
-                d.args = {mtl::Arg::B(bd_corr), mod->dw("dspark.markov_head.hidden_out.bias"), mtl::Arg::V(D)};
-                ds.push_back(std::move(d));
-            }
-            {
-                mtl::Dispatch d; d.p = &p_add; d.grid[0] = (D + 255) / 256; d.tg[0] = 256;
-                d.args = {mtl::Arg::B(bd_cur, (size_t)s * D * 4), mtl::Arg::B(bd_corr), mtl::Arg::B(bd_comb), mtl::Arg::V(D)};
-                ds.push_back(std::move(d));
-            }
-            // Fused Unembed + Argmax directly on un-softcapped logits (ZERO 800 KB bd_logits DRAM write/read!)
-            const auto& uti = mod->man.get("model.llm.unembed.weight");
-            if (uti.fmt == FMT_Q8ROW || uti.fmt == FMT_BF16 || uti.fmt == FMT_S6) {
-                const int V = c.vocab_unpadded;
-                const int rpt = (uti.fmt == FMT_S6) ? 16 : 32;
-                const int nparts = (V + rpt - 1) / rpt;
-                mtl::Dispatch du;
-                du.p = (uti.fmt == FMT_Q8ROW) ? &p_unemb_argmax_q8
-                     : (uti.fmt == FMT_BF16)  ? &p_unemb_argmax_bf16 : &p_unemb_argmax_sk6;
-                du.grid[0] = (uint32_t)nparts; du.tg[0] = 256;
-                du.args = {mod->tw("model.llm.unembed.weight"), mtl::Arg::B(bd_comb),
-                           mtl::Arg::B(bd_part_val), mtl::Arg::B(bd_part_idx),
-                           mtl::Arg::V(V), mtl::Arg::V(D)};
-                ds.push_back(std::move(du));
+            if (use_dspark_meff) {
+                const size_t boff = (size_t)(s - 1) * (size_t)V * sizeof(float);
+                mtl::Dispatch dm;
+                dm.p = &p_dsp_meff_argmax_q8;
+                dm.grid[0] = (uint32_t)nparts_meff; dm.tg[0] = 256;
+                dm.args = {mtl::Arg::B(b_logits, boff), mtl::Arg::B(bd_meff_sc), mtl::Arg::B(bd_meff_q),
+                           mtl::Arg::B(bd_latent), mtl::Arg::B(bd_part_val), mtl::Arg::B(bd_part_idx), mtl::Arg::V(V)};
+                ds.push_back(std::move(dm));
                 mtl::Dispatch dr;
                 dr.p = &p_argmax_part; dr.grid[0] = 1; dr.tg[0] = 256;
                 dr.args = {mtl::Arg::B(bd_part_val), mtl::Arg::B(bd_part_idx),
-                           mtl::Arg::B(bd_tok_chain, (size_t)s * 4), mtl::Arg::V(nparts)};
+                           mtl::Arg::B(bd_tok_chain, (size_t)s * 4), mtl::Arg::V(nparts_meff)};
                 ds.push_back(std::move(dr));
             } else {
+                push_dspark_linear(ds, "dspark.markov_head.hidden_out.weight", mtl::Arg::B(bd_latent), mtl::Arg::B(bd_corr), 1);
+                {
+                    mtl::Dispatch d; d.p = &p_dsp_add_bias; d.grid[0] = (D + 255) / 256; d.tg[0] = 256;
+                    d.args = {mtl::Arg::B(bd_corr), mod->dw("dspark.markov_head.hidden_out.bias"), mtl::Arg::V(D)};
+                    ds.push_back(std::move(d));
+                }
+                {
+                    mtl::Dispatch d; d.p = &p_add; d.grid[0] = (D + 255) / 256; d.tg[0] = 256;
+                    d.args = {mtl::Arg::B(bd_cur, (size_t)s * D * 4), mtl::Arg::B(bd_corr), mtl::Arg::B(bd_comb), mtl::Arg::V(D)};
+                    ds.push_back(std::move(d));
+                }
                 push_trunk_linear(ds, "model.llm.unembed.weight", mtl::Arg::B(bd_comb), mtl::Arg::B(bd_logits),
                                   1, c.vocab_unpadded);
                 mtl::Dispatch da; da.p = &p_argmax_rows; da.grid[0] = 1; da.tg[0] = 256;
@@ -1409,8 +1994,8 @@ struct InkMetalRunner {
 
         cx->run_graph(ds);
         const int32_t* chain = bd_tok_chain.as<int32_t>();
-        for (int i = 0; i < 7; ++i) out_draft[i] = chain[i + 1];
-        return 7;
+        for (int i = 0; i < n_steps; ++i) out_draft[i] = chain[i + 1];
+        return n_steps;
     }
 
 private:

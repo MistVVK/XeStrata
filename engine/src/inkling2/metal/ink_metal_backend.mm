@@ -30,6 +30,14 @@ inline bool InkMetalRunner::compile_shaders(const std::string& kernel_dir, std::
     if (lib_dspark < 0) { err = "dspark MSL: " + why; return false; }
     lib_vis = cx->compile_try({}, kInkMetalVisionSrc, false, &why);
     if (lib_vis < 0) { err = "vision MSL: " + why; return false; }
+    lib_mpp = -1;
+#ifdef INK_METAL_HAS_MPP_SRC
+    if (cx->supports_metal4()) {
+        std::string mwhy;
+        lib_mpp = cx->compile_try({}, kInkMetalMppSrc, false, &mwhy);
+        if (lib_mpp < 0) fprintf(stderr, "[ink_metal] Metal 4 MPP optional compile skipped: %s\n", mwhy.c_str());
+    }
+#endif
     return true;
 #else
     std::string why;
@@ -41,6 +49,12 @@ inline bool InkMetalRunner::compile_shaders(const std::string& kernel_dir, std::
     if (lib_dspark < 0) { err = "dspark MSL: " + why; return false; }
     lib_vis = cx->compile_try({kernel_dir + "/ink_metal_vision.metal"}, "", false, &why);
     if (lib_vis < 0) { err = "vision MSL: " + why; return false; }
+    lib_mpp = -1;
+    if (cx->supports_metal4()) {
+        std::string mwhy;
+        lib_mpp = cx->compile_try({kernel_dir + "/ink_metal_mpp.metal"}, "", false, &mwhy);
+        if (lib_mpp < 0) fprintf(stderr, "[ink_metal] Metal 4 MPP optional compile skipped: %s\n", mwhy.c_str());
+    }
     return true;
 #endif
 }
@@ -198,11 +212,11 @@ public:
     int dspark_draft(int slot, int32_t anchor_tok, int anchor_pos, int max_draft,
                      int32_t* out_draft_ids, std::string& /*err*/) override {
         if (!runner_.use_dspark || max_draft <= 0) return 0;
+        const int req = std::min(7, max_draft);
         int32_t tmp[7]{};
-        int n = runner_.dspark_draft_block8(slot, anchor_tok, anchor_pos, tmp);
-        int ret = std::min(n, max_draft);
-        for (int i = 0; i < ret; ++i) out_draft_ids[i] = tmp[i];
-        return ret;
+        int n = runner_.dspark_draft_block8(slot, anchor_tok, anchor_pos, tmp, req);
+        for (int i = 0; i < n; ++i) out_draft_ids[i] = tmp[i];
+        return n;
     }
 
     bool encode_image(const ImageRec& img, std::vector<float>& out_embeds, std::string& err) override {

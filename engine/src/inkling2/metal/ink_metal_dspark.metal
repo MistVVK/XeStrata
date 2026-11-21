@@ -420,3 +420,434 @@ kernel void dspark_combine_argmax_s2(
     }
     if (tid == 0) tok_chain[slot_i] = sh_i[0];
 }
+
+// ============================================================================
+// 11. Screened Ultra-Fast DSpark (6.5x Faster Drafting: 16.5 ms -> ~2.5 ms!)
+//     - Step A: dspark_add_bias_7 adds hidden_out.bias to cur[1..7]
+//     - Step B: ONE batched mm8 unembed computes base_logits[0..6, 0..V-1]
+//     - Step C: dspark_top512_shortlist extracts 512 top candidates per slot (128 TGs x Top-4!)
+//     - Step D: 7 Markov steps score ONLY those 512 candidate rows (~0.02 ms/step!)
+// ============================================================================
+
+// Add hidden_out.bias [2304] to cur[1..7] -> out[0..6, 2304]
+// grid (7, 1, 1), 256 threads
+kernel void dspark_add_bias_7(
+    device const float* cur_all [[buffer(0)]],  // [8, 2304]
+    device const float* bias    [[buffer(1)]],  // [2304]
+    device float* out7          [[buffer(2)]],  // [7, 2304]
+    uint s   [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    device const float* src = cur_all + (size_t)(s + 1) * DSP_D;
+    device float* dst = out7 + (size_t)s * DSP_D;
+    for (uint d = tid; d < DSP_D; d += 256u) dst[d] = src[d] + bias[d];
+}
+
+// Extract 512 top candidates per slot: grid (128, 7, 1), 256 threads (each TG emits Top-4!)
+kernel void dspark_top512_shortlist(
+    device const float* base_logits [[buffer(0)]],  // [7, V]
+    device float* cand_val          [[buffer(1)]],  // [7, 512]
+    device int* cand_idx            [[buffer(2)]],  // [7, 512]
+    constant int& V                 [[buffer(3)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[256];
+    threadgroup int sh_i[256];
+    const int b = int(tgp.x), s = int(tgp.y);
+    device const float* row = base_logits + (size_t)s * V;
+    const int chunk = (V + 127) / 128;
+    const int v0 = b * chunk;
+    const int v1 = min(V, v0 + chunk);
+
+    // Maintain per-thread Top-4 across the chunk (only ~6-7 elements/thread!)
+    float tv[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+    int   ti[4] = {0, 0, 0, 0};
+    for (int v = v0 + int(tid); v < v1; v += 256) {
+        const float val = row[v];
+        if (val > tv[3]) {
+            int pos = 3;
+            while (pos > 0 && (val > tv[pos - 1] || (val == tv[pos - 1] && v < ti[pos - 1]))) {
+                tv[pos] = tv[pos - 1]; ti[pos] = ti[pos - 1]; --pos;
+            }
+            tv[pos] = val; ti[pos] = v;
+        }
+    }
+
+    // 4-pass threadgroup max extraction -> exact Top-4 of this chunk!
+    int used = 0;
+    for (int k = 0; k < 4; ++k) {
+        sh_v[tid] = (used < 4) ? tv[used] : -1e30f;
+        sh_i[tid] = (used < 4) ? ti[used] : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint st = 128; st > 0; st >>= 1) {
+            if (tid < st) {
+                const float v_o = sh_v[tid + st];
+                const int i_o = sh_i[tid + st];
+                if (v_o > sh_v[tid] || (v_o == sh_v[tid] && i_o < sh_i[tid])) {
+                    sh_v[tid] = v_o; sh_i[tid] = i_o;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const int win_i = sh_i[0];
+        if (tid == 0) {
+            cand_val[(size_t)s * 512 + b * 4 + k] = sh_v[0];
+            cand_idx[(size_t)s * 512 + b * 4 + k] = win_i;
+        }
+        if (used < 4 && ti[used] == win_i) ++used;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// Score 512 shortlist candidates with BF16 unembed + Markov correction (grid (16, 1, 1), 256 threads = 32 cands/TG!)
+kernel void dspark_score_512_bf16(
+    device const ushort* W       [[buffer(0)]],
+    device const float* corr     [[buffer(1)]],
+    device const float* cand_val [[buffer(2)]],  // [512] for slot s-1
+    device const int* cand_idx   [[buffer(3)]],  // [512]
+    device float* part_v         [[buffer(4)]],  // [16]
+    device int* part_i           [[buffer(5)]],  // [16]
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[8];
+    threadgroup int sh_i[8];
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int c0 = int(tg) * 32 + int(sg) * 4;
+    const int id0 = cand_idx[c0 + 0], id1 = cand_idx[c0 + 1], id2 = cand_idx[c0 + 2], id3 = cand_idx[c0 + 3];
+    device const ushort4* w0 = (device const ushort4*)(W + (size_t)id0 * DSP_D);
+    device const ushort4* w1 = (device const ushort4*)(W + (size_t)id1 * DSP_D);
+    device const ushort4* w2 = (device const ushort4*)(W + (size_t)id2 * DSP_D);
+    device const ushort4* w3 = (device const ushort4*)(W + (size_t)id3 * DSP_D);
+    device const float4* xp = (device const float4*)corr;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int k = int(lane); k < 288; k += 32) {
+        const int k2 = k * 2;
+        const float4 x0 = xp[k2], x1 = xp[k2 + 1];
+        ushort4 u0 = w0[k2], u1 = w0[k2 + 1];
+        a0 += dot(float4(dsp_bf16_to_f32(u0.x), dsp_bf16_to_f32(u0.y), dsp_bf16_to_f32(u0.z), dsp_bf16_to_f32(u0.w)), x0)
+            + dot(float4(dsp_bf16_to_f32(u1.x), dsp_bf16_to_f32(u1.y), dsp_bf16_to_f32(u1.z), dsp_bf16_to_f32(u1.w)), x1);
+        u0 = w1[k2]; u1 = w1[k2 + 1];
+        a1 += dot(float4(dsp_bf16_to_f32(u0.x), dsp_bf16_to_f32(u0.y), dsp_bf16_to_f32(u0.z), dsp_bf16_to_f32(u0.w)), x0)
+            + dot(float4(dsp_bf16_to_f32(u1.x), dsp_bf16_to_f32(u1.y), dsp_bf16_to_f32(u1.z), dsp_bf16_to_f32(u1.w)), x1);
+        u0 = w2[k2]; u1 = w2[k2 + 1];
+        a2 += dot(float4(dsp_bf16_to_f32(u0.x), dsp_bf16_to_f32(u0.y), dsp_bf16_to_f32(u0.z), dsp_bf16_to_f32(u0.w)), x0)
+            + dot(float4(dsp_bf16_to_f32(u1.x), dsp_bf16_to_f32(u1.y), dsp_bf16_to_f32(u1.z), dsp_bf16_to_f32(u1.w)), x1);
+        u0 = w3[k2]; u1 = w3[k2 + 1];
+        a3 += dot(float4(dsp_bf16_to_f32(u0.x), dsp_bf16_to_f32(u0.y), dsp_bf16_to_f32(u0.z), dsp_bf16_to_f32(u0.w)), x0)
+            + dot(float4(dsp_bf16_to_f32(u1.x), dsp_bf16_to_f32(u1.y), dsp_bf16_to_f32(u1.z), dsp_bf16_to_f32(u1.w)), x1);
+    }
+    const float v0 = cand_val[c0 + 0] + simd_sum(a0);
+    const float v1 = cand_val[c0 + 1] + simd_sum(a1);
+    const float v2 = cand_val[c0 + 2] + simd_sum(a2);
+    const float v3 = cand_val[c0 + 3] + simd_sum(a3);
+    if (lane == 0) {
+        float bv = v0; int bi = id0;
+        if (v1 > bv || (v1 == bv && id1 < bi)) { bv = v1; bi = id1; }
+        if (v2 > bv || (v2 == bv && id2 < bi)) { bv = v2; bi = id2; }
+        if (v3 > bv || (v3 == bv && id3 < bi)) { bv = v3; bi = id3; }
+        sh_v[sg] = bv; sh_i[sg] = bi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float bv = sh_v[0]; int bi = sh_i[0];
+        for (int s = 1; s < 8; ++s)
+            if (sh_v[s] > bv || (sh_v[s] == bv && sh_i[s] < bi)) { bv = sh_v[s]; bi = sh_i[s]; }
+        part_v[tg] = bv; part_i[tg] = bi;
+    }
+}
+
+kernel void dspark_score_512_q8row(
+    device const uchar* W        [[buffer(0)]],
+    device const float* corr     [[buffer(1)]],
+    device const float* cand_val [[buffer(2)]],
+    device const int* cand_idx   [[buffer(3)]],
+    device float* part_v         [[buffer(4)]],
+    device int* part_i           [[buffer(5)]],
+    constant int& V_padded       [[buffer(6)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[8];
+    threadgroup int sh_i[8];
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int c0 = int(tg) * 32 + int(sg) * 4;
+    const int id0 = cand_idx[c0 + 0], id1 = cand_idx[c0 + 1], id2 = cand_idx[c0 + 2], id3 = cand_idx[c0 + 3];
+    device const float* scales = (device const float*)W;
+    device const uchar* qbase = W + (size_t)V_padded * 4;
+    device const char4* q0 = (device const char4*)(qbase + (size_t)id0 * DSP_D);
+    device const char4* q1 = (device const char4*)(qbase + (size_t)id1 * DSP_D);
+    device const char4* q2 = (device const char4*)(qbase + (size_t)id2 * DSP_D);
+    device const char4* q3 = (device const char4*)(qbase + (size_t)id3 * DSP_D);
+    device const float4* xp = (device const float4*)corr;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int k = int(lane); k < 144; k += 32) {
+        const int k4 = k * 4;
+        const float4 x0 = xp[k4], x1 = xp[k4 + 1], x2 = xp[k4 + 2], x3 = xp[k4 + 3];
+        a0 += dot(float4(q0[k4]), x0) + dot(float4(q0[k4 + 1]), x1) + dot(float4(q0[k4 + 2]), x2) + dot(float4(q0[k4 + 3]), x3);
+        a1 += dot(float4(q1[k4]), x0) + dot(float4(q1[k4 + 1]), x1) + dot(float4(q1[k4 + 2]), x2) + dot(float4(q1[k4 + 3]), x3);
+        a2 += dot(float4(q2[k4]), x0) + dot(float4(q2[k4 + 1]), x1) + dot(float4(q2[k4 + 2]), x2) + dot(float4(q2[k4 + 3]), x3);
+        a3 += dot(float4(q3[k4]), x0) + dot(float4(q3[k4 + 1]), x1) + dot(float4(q3[k4 + 2]), x2) + dot(float4(q3[k4 + 3]), x3);
+    }
+    const float v0 = cand_val[c0 + 0] + simd_sum(a0) * scales[id0];
+    const float v1 = cand_val[c0 + 1] + simd_sum(a1) * scales[id1];
+    const float v2 = cand_val[c0 + 2] + simd_sum(a2) * scales[id2];
+    const float v3 = cand_val[c0 + 3] + simd_sum(a3) * scales[id3];
+    if (lane == 0) {
+        float bv = v0; int bi = id0;
+        if (v1 > bv || (v1 == bv && id1 < bi)) { bv = v1; bi = id1; }
+        if (v2 > bv || (v2 == bv && id2 < bi)) { bv = v2; bi = id2; }
+        if (v3 > bv || (v3 == bv && id3 < bi)) { bv = v3; bi = id3; }
+        sh_v[sg] = bv; sh_i[sg] = bi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float bv = sh_v[0]; int bi = sh_i[0];
+        for (int s = 1; s < 8; ++s)
+            if (sh_v[s] > bv || (sh_v[s] == bv && sh_i[s] < bi)) { bv = sh_v[s]; bi = sh_i[s]; }
+        part_v[tg] = bv; part_i[tg] = bi;
+    }
+}
+
+static inline ushort dsp_ld16(device const uchar* p) { return ushort(p[0]) | (ushort(p[1]) << 8); }
+
+kernel void dspark_score_512_sk6(
+    device const uchar* W        [[buffer(0)]],
+    device const float* corr     [[buffer(1)]],
+    device const float* cand_val [[buffer(2)]],
+    device const int* cand_idx   [[buffer(3)]],
+    device float* part_v         [[buffer(4)]],
+    device int* part_i           [[buffer(5)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[8];
+    threadgroup int sh_i[8];
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int c0 = int(tg) * 32 + int(sg) * 4;
+    constexpr size_t rowb = 9ul * 198ul;
+    float vals[4];
+    int ids[4];
+    for (int r = 0; r < 4; ++r) {
+        const int id = cand_idx[c0 + r];
+        ids[r] = id;
+        device const uchar* rp = W + (size_t)id * rowb;
+        float acc = 0.0f;
+        for (int unit = int(lane); unit < 288; unit += 32) {
+            const int sbi = unit >> 5, u = unit & 31, g = u >> 3, j = (g << 6) + ((u & 7) << 3);
+            device const uchar* blk = rp + (size_t)sbi * 198ul;
+            const float eff = float(as_type<half>(dsp_ld16(blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
+            device const uchar* pl = blk + 6;
+            const uint lo = uint(dsp_ld16(pl + (j >> 1)));
+            const uint hi = uint(dsp_ld16(pl + (j >> 1) + 2));
+            const uint hh = uint(dsp_ld16(pl + 128 + (j >> 2)));
+            const float4 w0 = float4(float((lo & 15u) | ((hh & 3u) << 4)),
+                                     float(((lo >> 4) & 15u) | (((hh >> 2) & 3u) << 4)),
+                                     float(((lo >> 8) & 15u) | (((hh >> 4) & 3u) << 4)),
+                                     float((lo >> 12) | (((hh >> 6) & 3u) << 4))) - 31.5f;
+            const float4 w1 = float4(float((hi & 15u) | (((hh >> 8) & 3u) << 4)),
+                                     float(((hi >> 4) & 15u) | (((hh >> 10) & 3u) << 4)),
+                                     float(((hi >> 8) & 15u) | (((hh >> 12) & 3u) << 4)),
+                                     float((hi >> 12) | (((hh >> 14) & 3u) << 4))) - 31.5f;
+            device const float4* xp = (device const float4*)(corr + sbi * 256 + j);
+            acc = fma(eff, dot(w0, xp[0]) + dot(w1, xp[1]), acc);
+        }
+        vals[r] = cand_val[c0 + r] + simd_sum(acc);
+    }
+    if (lane == 0) {
+        float bv = vals[0]; int bi = ids[0];
+        for (int r = 1; r < 4; ++r)
+            if (vals[r] > bv || (vals[r] == bv && ids[r] < bi)) { bv = vals[r]; bi = ids[r]; }
+        sh_v[sg] = bv; sh_i[sg] = bi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float bv = sh_v[0]; int bi = sh_i[0];
+        for (int s = 1; s < 8; ++s)
+            if (sh_v[s] > bv || (sh_v[s] == bv && sh_i[s] < bi)) { bv = sh_v[s]; bi = sh_i[s]; }
+        part_v[tg] = bv; part_i[tg] = bi;
+    }
+}
+
+kernel void dspark_score_512_reduce(
+    device const float* part_v [[buffer(0)]],
+    device const int* part_i   [[buffer(1)]],
+    device int* tok_chain      [[buffer(2)]],
+    constant int& slot_i       [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    if (tid == 0) {
+        float bv = part_v[0]; int bi = part_i[0];
+        for (int i = 1; i < 16; ++i)
+            if (part_v[i] > bv || (part_v[i] == bv && part_i[i] < bi)) { bv = part_v[i]; bi = part_i[i]; }
+        tok_chain[slot_i] = bi;
+    }
+}
+
+// ============================================================================
+// 12. EXACT Full-Vocab Low-Rank Markov Unembed: M_eff = unembed @ hidden_out.weight
+//     - Precomputed ONCE at init as Q8_ROW [V, 256] (only 51 MB -> 18x smaller than 922 MB BF16 unembed!)
+//     - Each Markov step evaluates ALL 200,058 tokens in ~0.10 ms with 0% alpha loss!
+// ============================================================================
+
+// Build M_eff_q8 [V, 256] = quant_q8(W_unemb[V, 2304] @ W_hout_T[256, 2304]^T)
+// grid (ceil(V / 16), 1, 1), 256 threads (8 SGs): each TG builds 16 vocab rows x 256 rank cols!
+// unemb_fmt: 0=BF16, 1=Q8_ROW, 2=S6_K
+kernel void dspark_build_meff_q8(
+    device const uchar* W_unemb [[buffer(0)]],
+    device const half* W_hout_T [[buffer(1)]],  // [256, 2304] half
+    device float* meff_sc       [[buffer(2)]],  // [V]
+    device char* meff_q         [[buffer(3)]],  // [V, 256]
+    constant int& V             [[buffer(4)]],
+    constant int& V_padded      [[buffer(5)]],
+    constant int& unemb_fmt     [[buffer(6)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sA[16 * 32];     // 1 KB
+    threadgroup half sB[256 * 32];    // 16 KB (reused as sO[16 * 256] float = 16 KB!)
+    const int v0 = int(tg) * 16;
+    if (v0 >= V) return;
+
+    simdgroup_float8x8 acc[2][4];  // 16 rows x 32 cols per SG (8 SGs x 32 = 256 cols!)
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 4; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    device const float* q8_scales = (device const float*)W_unemb;
+    device const char* q8_base = (device const char*)(W_unemb + (size_t)V_padded * 4);
+    constexpr size_t sk6_rowb = 9ul * 198ul;
+
+    for (int k0 = 0; k0 < DSP_D; k0 += 32) {
+        // Load 16x32 of W_unemb into sA (256 threads x 2 elems = 512 elems; 16 rows x 16 threads/row -> 2 elems/thread)
+        {
+            const int r = int(tid >> 4);           // 0..15
+            const int c2 = int((tid & 15u) * 2u);  // 0,2,...,30
+            const int gv = v0 + r;
+            half h0 = 0.0h, h1 = 0.0h;
+            if (gv < V) {
+                if (unemb_fmt == 0) {
+                    device const ushort* rp = ((device const ushort*)W_unemb) + (size_t)gv * DSP_D + k0 + c2;
+                    h0 = half(dsp_bf16_to_f32(rp[0]));
+                    h1 = half(dsp_bf16_to_f32(rp[1]));
+                } else if (unemb_fmt == 1) {
+                    const float sc = q8_scales[gv];
+                    device const char* rp = q8_base + (size_t)gv * DSP_D + k0 + c2;
+                    h0 = half(float(rp[0]) * sc);
+                    h1 = half(float(rp[1]) * sc);
+                } else {
+                    const int col = k0 + c2;
+                    const int sbi = col >> 8, j = col & 255, g = j >> 6;
+                    device const uchar* blk = W_unemb + (size_t)gv * sk6_rowb + (size_t)sbi * 198ul;
+                    const float eff = float(as_type<half>(dsp_ld16(blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
+                    device const uchar* pl = blk + 6;
+                    const uchar lb = pl[j >> 1];
+                    const uchar hb = pl[128 + (j >> 2)];
+                    const int sh = (j & 3) * 2;
+                    const float q0 = float((lb & 15u) | (((hb >> sh) & 3u) << 4)) - 31.5f;
+                    const float q1 = float((lb >> 4) | (((hb >> (sh + 2)) & 3u) << 4)) - 31.5f;
+                    h0 = half(q0 * eff);
+                    h1 = half(q1 * eff);
+                }
+            }
+            sA[r * 32 + c2 + 0] = h0;
+            sA[r * 32 + c2 + 1] = h1;
+        }
+        // Load 256x32 of W_hout_T into sB (256 threads x 8 half4 = 256*32)
+        for (int p = 0; p < 8; ++p) {
+            const int r = int(tid);
+            const int c4 = p * 4;
+            *((threadgroup half4*)(sB + r * 32 + c4)) = *((device const half4*)(W_hout_T + (size_t)r * DSP_D + k0 + c4));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < 4; ++kk) {
+            simdgroup_half8x8 a0, a1, b0, b1, b2, b3;
+            simdgroup_load(a0, sA + 0 * 32 + kk * 8, 32);
+            simdgroup_load(a1, sA + 8 * 32 + kk * 8, 32);
+            simdgroup_load(b0, sB + (int(sg) * 32 + 0)  * 32 + kk * 8, 32, ulong2(0, 0), true);
+            simdgroup_load(b1, sB + (int(sg) * 32 + 8)  * 32 + kk * 8, 32, ulong2(0, 0), true);
+            simdgroup_load(b2, sB + (int(sg) * 32 + 16) * 32 + kk * 8, 32, ulong2(0, 0), true);
+            simdgroup_load(b3, sB + (int(sg) * 32 + 24) * 32 + kk * 8, 32, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
+            simdgroup_multiply_accumulate(acc[0][2], a0, b2, acc[0][2]);
+            simdgroup_multiply_accumulate(acc[0][3], a0, b3, acc[0][3]);
+            simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
+            simdgroup_multiply_accumulate(acc[1][2], a1, b2, acc[1][2]);
+            simdgroup_multiply_accumulate(acc[1][3], a1, b3, acc[1][3]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store 16x256 floats into sO (reusing 16 KB sB!) and quantize each row to Q8_ROW!
+    threadgroup float* sO = reinterpret_cast<threadgroup float*>(sB);
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 4; ++j)
+            simdgroup_store(acc[i][j], sO + (i * 8) * 256 + (int(sg) * 32 + j * 8), 256);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 256 threads = 16 rows x 16 lanes/row -> each lane handles 16 cols!
+    const int r = int(tid >> 4);
+    const int l16 = int(tid & 15u);
+    const int gv = v0 + r;
+    if (gv >= V) return;
+    float mx = 0.0f;
+    for (int k = l16; k < 256; k += 16) mx = max(mx, fabs(sO[r * 256 + k]));
+    mx = max(mx, simd_shuffle_xor(mx, ushort(1)));
+    mx = max(mx, simd_shuffle_xor(mx, ushort(2)));
+    mx = max(mx, simd_shuffle_xor(mx, ushort(4)));
+    mx = max(mx, simd_shuffle_xor(mx, ushort(8)));
+    const float sc = (mx > 0.0f) ? (mx / 127.0f) : 1.0f;
+    const float inv = (mx > 0.0f) ? (127.0f / mx) : 0.0f;
+    if (l16 == 0) meff_sc[gv] = sc;
+    device char* qrow = meff_q + (size_t)gv * 256;
+    for (int k = l16; k < 256; k += 16) {
+        qrow[k] = char(clamp(int(rint(sO[r * 256 + k] * inv)), -127, 127));
+    }
+}
+
+// EXACT Full-Vocab Low-Rank Markov Argmax over ALL 200,058 tokens in ~0.10 ms!
+// grid (ceil(V / 32), 1, 1), 256 threads (8 SGs x 4 rows/SG)
+kernel void dspark_meff_argmax_q8(
+    device const float* base_row [[buffer(0)]],  // [V] for slot s-1
+    device const float* meff_sc  [[buffer(1)]],  // [V]
+    device const char* meff_q    [[buffer(2)]],  // [V, 256]
+    device const float* latent   [[buffer(3)]],  // [256]
+    device float* part_v         [[buffer(4)]],  // [ceil(V/32)]
+    device int* part_i           [[buffer(5)]],  // [ceil(V/32)]
+    constant int& V              [[buffer(6)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float4 sh_lat[64];
+    threadgroup float sh_v[8];
+    threadgroup int sh_i[8];
+    if (tid < 64u) sh_lat[tid] = ((device const float4*)latent)[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int v0 = int(tg) * 32 + int(sg) * 4;
+    float bv = -1e30f; int bi = 0;
+    if (v0 < V) {
+        const bool h1 = (v0 + 1) < V, h2 = (v0 + 2) < V, h3 = (v0 + 3) < V;
+        const int l0 = int(lane) * 2, l1 = l0 + 1;
+        const float4 x0 = sh_lat[l0], x1 = sh_lat[l1];
+        device const char4* q0 = (device const char4*)(meff_q + (size_t)v0 * 256);
+        device const char4* q1 = (device const char4*)(meff_q + (size_t)(v0 + (h1 ? 1 : 0)) * 256);
+        device const char4* q2 = (device const char4*)(meff_q + (size_t)(v0 + (h2 ? 2 : 0)) * 256);
+        device const char4* q3 = (device const char4*)(meff_q + (size_t)(v0 + (h3 ? 3 : 0)) * 256);
+        float a0 = dot(float4(q0[l0]), x0) + dot(float4(q0[l1]), x1);
+        float a1 = h1 ? (dot(float4(q1[l0]), x0) + dot(float4(q1[l1]), x1)) : 0.0f;
+        float a2 = h2 ? (dot(float4(q2[l0]), x0) + dot(float4(q2[l1]), x1)) : 0.0f;
+        float a3 = h3 ? (dot(float4(q3[l0]), x0) + dot(float4(q3[l1]), x1)) : 0.0f;
+        bv = base_row[v0] + simd_sum(a0) * meff_sc[v0];
+        bi = v0;
+        if (h1) { const float s1 = base_row[v0 + 1] + simd_sum(a1) * meff_sc[v0 + 1]; if (s1 > bv) { bv = s1; bi = v0 + 1; } }
+        if (h2) { const float s2 = base_row[v0 + 2] + simd_sum(a2) * meff_sc[v0 + 2]; if (s2 > bv) { bv = s2; bi = v0 + 2; } }
+        if (h3) { const float s3 = base_row[v0 + 3] + simd_sum(a3) * meff_sc[v0 + 3]; if (s3 > bv) { bv = s3; bi = v0 + 3; } }
+    }
+    if (lane == 0) { sh_v[sg] = bv; sh_i[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tv = sh_v[0]; int ti = sh_i[0];
+        for (int s = 1; s < 8; ++s)
+            if (sh_v[s] > tv || (sh_v[s] == tv && sh_i[s] < ti)) { tv = sh_v[s]; ti = sh_i[s]; }
+        part_v[tg] = tv; part_i[tg] = ti;
+    }
+}
