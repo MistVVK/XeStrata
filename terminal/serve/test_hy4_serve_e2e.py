@@ -150,6 +150,14 @@ class Hy4Serve(unittest.TestCase):
         c.close()
         return r.status, data
 
+    def get(self, path: str, headers=None):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+        c.request("GET", path, headers=headers or {})
+        r = c.getresponse()
+        data = r.read().decode("utf-8")
+        c.close()
+        return r.status, data
+
     def gens(self) -> list[str]:
         return [x for x in self.record.read_text(encoding="utf-8").splitlines() if x.strip()]
 
@@ -276,6 +284,61 @@ class Hy4Serve(unittest.TestCase):
         from serve import hy4_kind
         for p in images:
             self.assertFalse(Path(hy4_kind.decode_path(p)).exists(), "the picture files are removed when the request is over")
+        # /health, /v1/models, /props, and /v1/status must all advertise in-process vision when images=1
+        st_h, body_h = self.get("/health")
+        self.assertEqual(st_h, 200, body_h)
+        self.assertTrue(json.loads(body_h)["images"], body_h)
+        st_m, body_m = self.get("/v1/models")
+        self.assertEqual(st_m, 200, body_m)
+        self.assertIn("image", json.loads(body_m)["data"][0]["architecture"]["input_modalities"], body_m)
+        st_p, body_p = self.get("/props")
+        self.assertEqual(st_p, 200, body_p)
+        self.assertTrue(json.loads(body_p)["modalities"]["vision"], body_p)
+
+    def test_tool_result_image_reaches_hy4_engine_when_images_enabled(self):
+        import base64
+        self.start([self.ids_of("It is a red pixel.</think:opensource>Red pixel." + END)], caps="drafter=dfly2 images=1")
+        data_url = "data:image/png;base64," + base64.b64encode(PNG).decode()
+        msgs = [
+            {"role": "user", "content": "read pixel.png"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_image", "arguments": "{\"path\":\"pixel.png\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "loaded"}, {"type": "image_url", "image_url": {"url": data_url}}]},
+        ]
+        tools = [{"type": "function", "function": {"name": "read_image", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+        status, data = self.call("/v1/chat/completions", {"messages": msgs, "tools": tools, "max_tokens": 60})
+        self.assertEqual(status, 200, data)
+        sent = self.gens()[-1].split()
+        images = [p[len("image="):] for p in sent[2:-1] if p.startswith("image=")]
+        self.assertEqual(len(images), 1, f"tool image must reach strata-hy4 as image=<path>, got {sent[:-1]}")
+        prompt = self.tk.decode([int(x) for x in sent[-1].split(",")])
+        self.assertNotIn("image omitted", prompt)
+
+    def test_health_and_models_report_no_vision_when_images_disabled(self):
+        self.start([self.ids_of("Hi." + END)], caps="")
+        st_h, body_h = self.get("/health")
+        self.assertEqual(st_h, 200, body_h)
+        self.assertFalse(json.loads(body_h)["images"], body_h)
+        st_m, body_m = self.get("/v1/models")
+        self.assertEqual(st_m, 200, body_m)
+        self.assertEqual(json.loads(body_m)["data"][0]["architecture"]["input_modalities"], ["text"], body_m)
+
+    def test_max_thinking_and_unsupported_flash_next_gen_keys_are_stripped(self):
+        self.start([self.ids_of("deep thought</think:opensource>42" + END)], caps="drafter=dfly2 images=1")
+        status, data = self.call("/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "answer 42"}],
+            "max_tokens": 60,
+            "reasoning_effort": "max",
+            "experimental_speed_projection": True,
+            "strata_checkpoint": False,
+        })
+        self.assertEqual(status, 200, data)
+        self.assertEqual(json.loads(data)["choices"][0]["message"]["content"].strip(), "42")
+        sent = self.gens()[-1].split()
+        key_names = {p.split("=", 1)[0] for p in sent[2:-1]}
+        for bad in ("cvec", "ckpt", "pin", "hold", "img_keys", "aux_cpus", "pipe", "pen_from"):
+            self.assertNotIn(bad, key_names, f"strata-hy4 rejects {bad}=, got {sent[:-1]}")
+        prompt = self.tk.decode([int(x) for x in sent[-1].split(",")])
+        self.assertIn("reasoning_effort:max", prompt)
 
     def test_the_person_can_turn_the_drafter_off(self):
         cfg = json.loads(self.cfg_path.read_text(encoding="utf-8"))

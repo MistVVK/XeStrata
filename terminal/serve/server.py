@@ -1254,14 +1254,13 @@ class StrataEngine:
 
     def pen_from_key(self, orig_len: int, prompt_len: int) -> str:
         """` pen_from=N` for a leg that continues a request (prompt + what it generated): where the reply began, Strata's penalty window start. The all-cards split engine
-        (sFNX) counts its penalty window over the last penalty_last_n tokens of the whole context, so the continued prompt gives it the same window and the engine refuses the
-        key (GEN: unknown key pen_from): it is not sent."""
-        if self.split_engine or prompt_len <= orig_len:
+        (sFNX) and Hy4-Flash (`strata-hy4`) refuse the key (GEN: unknown/unsupported key pen_from): it is not sent."""
+        if getattr(self, "split_engine", False) or getattr(self, "hy4_engine", False) or prompt_len <= orig_len:
             return ""
         return f" pen_from={orig_len - 1}"
 
     @staticmethod
-    def sampling_keys(sampling: dict) -> str:
+    def sampling_keys(sampling: dict, *, hy4: bool = False) -> str:
         keys = ""
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
@@ -1298,6 +1297,12 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        if hy4:
+            # Hy4-Flash (serve/hy4_kind.py): its GEN parser strictly rejects Flash-Next-only keys
+            # (cvec, ckpt, pin, hold, pipe, aux_cpus, img_keys, logprobs, allowed, bias).
+            for p in sampling.get("strata_hy4_images") or []:
+                keys += " image=" + hy4_kind.encode_path(p)
+            return keys
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -1915,7 +1920,7 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         hold = (sampling or {}).get(HOLD_KEY)           # the thinking budget's hold (P2b): the reasoning tokens left when this pass starts, and </think>'s id
-        keys0 = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY})   # (the hold's key goes on per leg: leg_keys below)
+        keys0 = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY}, hy4=getattr(self, "hy4_engine", False))   # (the hold's key goes on per leg: leg_keys below)
         # logprobs: only an admission's token can have an LP line here (the slot's "BT" lines carry none), so the
         # server refuses these requests unless max_tokens is 1.  The lines go to the request itself, through its
         # cancel Event: several requests read control lines at once, and the engine's lp_lines is one attribute.
@@ -2465,8 +2470,8 @@ class StrataEngine:
         self.lp_lines = LPLines(cancel)
         carry = NO_LINE                  # a line read for a token's LP line, held until it is used
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {}, hy4=getattr(self, 'hy4_engine', False))} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{self.sampling_keys(sampling or {}, hy4=getattr(self, 'hy4_engine', False))}"
         if prefill_only:                                 # split serving (serve/split.py): read the prompt, make no token
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
@@ -4216,6 +4221,13 @@ class Service:
         prompt from it would send nothing, #351).  Reporting only: requests are checked in prepare()."""
         return int(getattr(self.engine, "max_context", 0) or getattr(self.engine, "known_ctx", 0) or 0)
 
+    def has_vision(self) -> bool:
+        """Whether this server can read images: either a separate vision encoder (Flash-Next)
+        or an in-process Hy4-Flash engine that reported `images=1`."""
+        if self.vision is not None:
+            return True
+        return bool(self.hy4 and (getattr(self.engine, "info", None) or {}).get("images") == 1)
+
     def reasoning_budget(self, req) -> int | None:
         """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens` (or, as
         llama.cpp reads it, `thinking_budget_tokens`; or vLLM's `thinking_token_budget`, or Qwen's `thinking_budget`: the
@@ -4827,7 +4839,7 @@ class Service:
             live["replicas"] = self.engine.replica_view()
         if hasattr(self.engine, "split_view"):          # opt-in split serving: the hand-overs so far (serve/split.py)
             live["split_serve"] = self.engine.split_view()
-        engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
+        engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.has_vision(),
                   # #4636: the engine process generation; a history record from an earlier one is from before a restart, so its
                   # KV cache is gone and the Context gauge must not show it as cached
                   "gen": getattr(self.engine, "gen", None),
@@ -4909,7 +4921,7 @@ class Service:
             return round(v / unit, digits) if isinstance(v, (int, float)) else None
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
-        images = self.vision is not None
+        images = self.has_vision()
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
@@ -5004,7 +5016,7 @@ class Service:
             for n, item in enumerate(content):
                 if not isinstance(item, dict) or item.get("type") != "image":
                     continue
-                why = "this server has no image encoder" if self.vision is None else None
+                why = None if self.has_vision() else "this server has no image encoder"
                 if why is None:
                     src = item["source"]
                     try:
@@ -5014,9 +5026,13 @@ class Service:
                             raise ValueError("offline mode cannot download an image URL")
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
-                        with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
-                            self._vision_up()         # an elastic encoder is not running until a picture needs it
-                            self.vision.encode(src)
+                        if self.vision is not None:
+                            with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
+                                self._vision_up()         # an elastic encoder is not running until a picture needs it
+                                self.vision.encode(src)
+                        else:
+                            # Hy4-Flash in-process vision: validate readability without invoking a sidecar encoder
+                            Vision.normalize(src if isinstance(src, bytes) else Vision.load(src))
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
                         why = str(e)
                 if why is not None:
@@ -5066,7 +5082,8 @@ class Service:
                 raise ValueError(hy4_kind.NO_IMAGES_REPLY)
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
                 raise ValueError("offline mode cannot download an image URL; send a data: image instead")
-            self.embeddings.hy4 = hy4_kind.write_images(images, Vision.load, Vision.normalize, cancel)
+            self.embeddings.hy4 = hy4_kind.write_images(
+                images, lambda s: fetched[s] if s in fetched else Vision.load(s), Vision.normalize, cancel)
             images = []
         if images:
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
@@ -5514,7 +5531,8 @@ class Service:
                     hold_end = None
                     if (budget and getattr(self.engine, "can_hold", False) is True
                             and (not getattr(self.engine, "batch", 0) or getattr(self.engine, "can_hold_batch", False) is True)
-                            and getattr(self.engine, "split_engine", False) is not True):   # (the split engine's parser refuses the key: tests/split/test_split_gen_keys.py)
+                            and getattr(self.engine, "split_engine", False) is not True
+                            and getattr(self.engine, "hy4_engine", False) is not True):   # (the split & Hy4 parsers refuse hold=)
                         te = self.tok.encode(THINK_END, parse_special=True)
                         hold_end = te[0] if len(te) == 1 else None
                     for ev in opening:
@@ -6084,9 +6102,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             r = box["r"]
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            results.append(r.get("model_content", r["text"]) if svc.vision is not None else r["text"])
+            results.append(r.get("model_content", r["text"]) if svc.has_vision() else r["text"])
             yield "mcp", {"event": "result", "id": c.id,
-                          **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
+                          **({"images": r["images"], "vision": svc.has_vision()} if r.get("images") else {}),
                           **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
@@ -6982,7 +7000,7 @@ def make_handler(svc: Service):
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                 "images": svc.has_vision(), "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
@@ -7020,7 +7038,7 @@ def make_handler(svc: Service):
                     # context_length), so a client that sizes its window from /v1/models reads it
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
                              "max_model_len": ctx, "context_length": ctx, "max_context_length": ctx, "meta": {"n_ctx": ctx},
-                             "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
+                             "architecture": {"input_modalities": ["text", "image"] if svc.has_vision() else ["text"],
                                               "output_modalities": ["text"]}}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
@@ -7327,7 +7345,7 @@ def make_handler(svc: Service):
                      "total_slots": max(1, int(getattr(svc.engine, "batch", 0) or 0)),   # #1004: the batch slots
                      "model_alias": svc.model, "chat_template": svc.template.source,
                      "chat_template_caps": svc.template.caps,
-                     "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
+                     "modalities": {"vision": svc.has_vision()}, "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
@@ -8738,7 +8756,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         import atexit
         svc.mcp = hub
         # #2343: tool images reach a model that reads pictures unless the config says "image_results": false
-        hub.settings["image_results"] = resolve_image_results(hub.settings, svc.vision is not None)
+        hub.settings["image_results"] = resolve_image_results(hub.settings, svc.has_vision())
         if hub.settings["image_results"]:
             hub.media_dir = Path(a.config).with_suffix(".tool-media") if a.config else Path.cwd() / ".tool-media"
         print(f"[strata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
@@ -8751,7 +8769,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.start_vision_idle()
     here = "[::1]" if a.host == "::" else "127.0.0.1" if a.host in ("0.0.0.0", "") else f"[{a.host}]" if ":" in a.host else a.host
     print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
-          f"context {engine.max_context} tokens{', images on' if vision else ''}"
+          f"context {engine.max_context} tokens{', images on' if svc.has_vision() else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
     print(f"       open http://{here}:{bound_port}/ in a browser to chat; close this window to stop the model", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
