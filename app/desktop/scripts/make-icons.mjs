@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * The app and installer icon, refined from the existing Strata mark (apps/host/public/brand/strata-mark-*.svg and the current
+ * The app and installer icon, refined from the existing Strata mark (app/host/public/brand/strata-mark-*.svg and the current
  * icons/icon.png): the same three rounded bars on the same dark tile, in the same colours. Nothing is redrawn. What changes is
  * how it is cut for small sizes: at 16-48 px the bars are snapped to whole pixels and made a little bolder and wider so they
  * stay crisp instead of blurring; from 64 px up the geometry is the mark's own proportions.
  *
- *   node apps/desktop/scripts/make-icons.mjs [--out <folder>]    writes icon-<size>.png for every size and icon.ico
+ *   node app/desktop/scripts/make-icons.mjs [--out <folder>]    writes icon-<size>.png for every size and icon.ico
  */
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';

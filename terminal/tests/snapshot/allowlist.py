@@ -28,5 +28,5 @@ MODELS_SCREEN = {
 #: The request-slot rule (CLEAN-1A item 1a.6, owner decision 11-07).  Not a difference to allow but a fact the golden files pin: with the plain Load following Auto, NVIDIA 72 GB
 #: runs DFlash2, which answers one request at a time, so the app writes no `parallel` and no `--batch ... --batch-mtp` there, exactly as the Models-screen Load always did.
 #: (On main the plain Load ran the MTP and wrote `parallel: 3`; that was a consequence of the missing drafter, not a policy.)  The app's own default of several request slots
-#: (apps/host/server/native-parallel.mjs) applies to a run that is not DFlash2; no cell of the matrix needs it.
+#: (app/host/server/native-parallel.mjs) applies to a run that is not DFlash2; no cell of the matrix needs it.
 REQUEST_SLOTS = "no cell writes `parallel` from either app entry point"

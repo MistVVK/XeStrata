@@ -6,7 +6,7 @@ start-up by reading its own `.dynamic` section through a fixed offset in its cod
 as a library to fix up and rewrites its RPATH; for a static PIE that moves `.dynamic` to a new segment and leaves the old place filled with a filler
 byte, so the start-up code reads garbage. Reporters on #4337 see the same crash offset in every run (`rg + 0x3ffcf1`) and filler bytes (0x5A) where
 `.rela.dyn` and `.dynamic` were. A static PIE whose `.dynamic` is filled does not start: tools/test_appimage_elf.py shows that on a real one.
-apps/desktop/scripts/repack-appimage.sh puts the staged bytes back; this file is the check that says whether it did.
+app/desktop/scripts/repack-appimage.sh puts the staged bytes back; this file is the check that says whether it did.
 
     appimage_elf.py scan <folder>                      every static PIE under <folder> must have a sound .dynamic (exit 1 if not)
     appimage_elf.py compare <staged-folder> <folder>   the same files, byte for byte, plus what differs in their ELF headers

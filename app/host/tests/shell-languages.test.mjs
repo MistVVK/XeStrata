@@ -1,12 +1,13 @@
 // Every language the app offers is a language of the desktop shell too: the host's shell prefs (server/shell-prefs.mjs) and the Tauri
-// shell (apps/desktop/src-tauri/src/shell.rs: LANGUAGES and the tray menu's own words). French was missing from both, so a person who
+// shell (app/desktop/src-tauri/src/shell.rs:LANGUAGES and the tray menu's own words). French was missing from both, so a person who
 // chose Français kept the tray of the language before (or English), and the shell prefs refused the choice.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { LANGUAGES as SHELL } from '../server/shell-prefs.mjs';
 
-const read = rel => readFileSync(new URL(rel, import.meta.url), 'utf8');
+// a checkout with CRLF line ends (Git for Windows' default, GitHub's Windows runner) must read the same as one with LF
+const read = rel => readFileSync(new URL(rel, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const app = [...read('../src/lib/i18n.ts').match(/export const LANGUAGES=\[(.*?)\] as const;/s)[1].matchAll(/value:'([a-z]{2})'/g)].map(m => m[1]);
 const rs = read('../../desktop/src-tauri/src/shell.rs');
 const rsLanguages = [...rs.match(/pub const LANGUAGES: \[&str; \d+\] = \[(.*?)\];/s)[1].matchAll(/"([a-z]{2})"/g)].map(m => m[1]);

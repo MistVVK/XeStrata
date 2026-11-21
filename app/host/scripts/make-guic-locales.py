@@ -1,5 +1,5 @@
 """Writes src/locales/guic-<lang>.json: the strings of the 0.2.16 new-UI features of lane GUI-C (#6051 move a chat to another workspace, ...).
-Run from apps/host:  python scripts/make-guic-locales.py
+Run from app/host:  python scripts/make-guic-locales.py
 The languages are the app's own list (LANGUAGES in src/lib/i18n.ts), not a list kept here: a language added there makes this script stop until
 every entry below names it, so a new language is one step (add its text to each entry, run the script). Each entry names its text per language
 code; the keys are guic01.. in the order of S, so a new string is always appended at the end. guic-en.json is the English source. Placeholders

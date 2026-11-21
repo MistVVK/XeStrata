@@ -54,7 +54,7 @@ SKEW_FREE_BYTES = 1.15
 
 def megabytes(n) -> int:
     """Decimal megabytes (1 MB = 1,000,000 bytes), rounded half up, at least 1: the one figure for an engine's size in the Terminal, the app
-    (apps/host/src/lib/format.ts megabytes) and the release page. Both sides are tested on the same numbers."""
+    (app/host/src/lib/format.ts megabytes) and the release page. Both sides are tested on the same numbers."""
     return max(1, int((n or 0) / 1_000_000 + 0.5))
 
 

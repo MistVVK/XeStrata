@@ -1,5 +1,5 @@
 """Writes src/locales/sav-<lang>.json: the notice for chats the host could not write (owner wording 11-04, #5192).
-Run from apps/host:  python scripts/make-chatsave-locales.py
+Run from app/host:  python scripts/make-chatsave-locales.py
 Every entry names all nine languages; the keys are sav01.. in the order of S. sav-en.json is the English source. Placeholders ({0}) must be kept in every
 language. A separate file keeps this work from colliding with the other catalogs (the same reason upd-, df2-, pick- and the others exist)."""
 import json

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Put the bundled payloads back to the bytes they were staged with, inside a finished AppImage.
 #
-#   apps/desktop/scripts/repack-appimage.sh <in.AppImage> <out.AppImage> [--resources <src-tauri/resources>] [--check]
+#   app/desktop/scripts/repack-appimage.sh <in.AppImage> <out.AppImage> [--resources <src-tauri/resources>] [--check]
 #
 # Why: Tauri hands the AppDir to linuxdeploy, which treats every ELF file under usr/lib as a library to fix up: it rewrites the RPATH of
 # the engine (strata, libstrata_kq.so, libcudart), of the bundled Python and Node and of the Harness's native modules. The files then no
@@ -78,7 +78,7 @@ done
 elf_and_rg_check || { echo "the restored AppDir failed the static PIE / ripgrep check; not packing" >&2; exit 1; }
 # The launcher records the environment the AppImage was started from, before its own hooks add the AppImage's libraries and GTK/GIO
 # settings (LD_LIBRARY_PATH, GTK_*, XDG_DATA_DIRS ...). The host gives it back to every program that is not Strata's own (zenity,
-# kdialog, xdg-open, the assistant's shell): apps/host/server/external-env.mjs. Without it a system program loads the AppImage's libssl
+# kdialog, xdg-open, the assistant's shell): app/host/server/external-env.mjs. Without it a system program loads the AppImage's libssl
 # and dies ("OPENSSL_3.2.0 not found"). The line goes right after `this_dir=...`, ahead of every hook.
 if ! grep -q STRATA_ORIGINAL_ENV "$WORK/AppDir/AppRun"; then
   sed -i '/^this_dir=/a # Strata: the environment this AppImage was started from (given back to programs that are not Strata'"'"'s own)\nexport STRATA_ORIGINAL_ENV="$(env -0 | base64 -w0)"' "$WORK/AppDir/AppRun"
@@ -89,7 +89,7 @@ head -c "$OFFSET" "$IN" > "$OUT"
 cat "$WORK/app.squashfs" >> "$OUT"
 chmod +x "$OUT"
 # The checksum is computed here, from the finished file, every time: a README or a note must take it from this file
-# (apps/desktop/scripts/make-tester-readme.sh) and never from an older build.
+# (app/desktop/scripts/make-tester-readme.sh) and never from an older build.
 ( cd "$(dirname "$OUT")" && sha256sum "$(basename "$OUT")" > "$(basename "$OUT").sha256" )
 echo "repacked: $OUT ($(stat -c %s "$OUT") bytes)"
 cat "$OUT.sha256"

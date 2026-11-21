@@ -356,7 +356,8 @@ Object.assign(cases, {
     assert.match(app, /reasoning_effort: finishing \? "none" : settings\.thinking/, "the finishing request has thinking off");
   },
   the_composer_attaches_first_and_adds_the_preview_later() {
-    const app = require("node:fs").readFileSync(path.join(__dirname, "web", "app.js"), "utf8");
+    // a checkout with CRLF line ends (Git for Windows' default, GitHub's Windows runner) must read the same as one with LF
+    const app = require("node:fs").readFileSync(path.join(__dirname, "web", "app.js"), "utf8").replace(/\r\n/g, "\n");
     const onload = app.slice(app.indexOf("r.onload = () => {\n        const url = r.result;"), app.indexOf("r.readAsDataURL(f);"));
     assert.ok(onload.length > 0, "the picture reader's onload");
     assert.ok(onload.indexOf("attachments.push(entry)") < onload.indexOf("StrataHistory.makeThumb(url, thumbDeps)"), "attached before the preview");

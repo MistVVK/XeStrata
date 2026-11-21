@@ -135,7 +135,7 @@ const control = createControl({ control: CONTROL, log: line => console.log(line)
 if (control && process.platform === 'win32' && !process.env.STRATA_NO_REPAIR_ACCESS) void control.repairAccess().catch(() => {});
 /* Which window shows the page (the app window or, when that cannot run, a browser tab) and what only the app window can do: app-ui.mjs. */
 const appUi = createAppUi({ shutdown: () => shutdown() });
-/* The app's version has one source: the desktop shell passes it (STRATA_APP_VERSION, from apps/desktop/src-tauri/Cargo.toml). Outside the app it is read from the same file in a checkout, else 'dev'. */
+/* The app's version has one source: the desktop shell passes it (STRATA_APP_VERSION, from app/desktop/src-tauri/Cargo.toml). Outside the app it is read from the same file in a checkout, else 'dev'. */
 function appVersion() { return appVersionFrom({ env: process.env, here: HERE }); }
 const appUpdater = appUi.updater;
 const shellNotifier = createShellNotifier();

@@ -2,7 +2,7 @@
 /**
  * Prove the INSTALLED app layout can start and stop an engine with nothing acquired, using a stub engine.
  *
- *   node apps/desktop/scripts/installed-flow.mjs --install <folder the installer wrote> [--work <scratch>] [--spy <acquire-spy.mjs>]
+ *   node app/desktop/scripts/installed-flow.mjs --install <folder the installer wrote> [--work <scratch>] [--spy <acquire-spy.mjs>]
  *
  * It starts the installed host with the installed node.exe exactly as the Tauri shell does (STRATA_PACKAGED=1,
  * STRATA_NO_ACQUIRE=1; Control found beside the host), against a scratch component folder holding a fake engine

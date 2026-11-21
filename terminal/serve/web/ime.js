@@ -1,5 +1,5 @@
 // serve/web/ime.js - the Enter that commits an IME conversion (Japanese, Chinese, Korean) belongs to the IME, not to the page (#5071).
-// The same rule as the app's composer (apps/host/src/lib/ime-enter.ts; apps/host/tests/ime-fields.test.mjs checks that the two agree).
+// The same rule as the app's composer (app/host/src/lib/ime-enter.ts; app/host/tests/ime-fields.test.mjs checks that the two agree).
 //
 // The browsers disagree on the order of the events when Enter commits a conversion:
 //   Chrome, Edge, Firefox:  keydown(Enter, keyCode 229, isComposing true)  ->  compositionend

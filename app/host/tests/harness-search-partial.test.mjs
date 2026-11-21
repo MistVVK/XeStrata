@@ -1,5 +1,5 @@
 // #5964: one folder the person may not read blanked a whole glob / grep in the agent ("glob search failed (exit 2): rg: ...\locked: IO
-// error ... (os error 5)"). The staged Harness's search module is patched at staging (apps/desktop/scripts/harness-search-partial.mjs).
+// error ... (os error 5)"). The staged Harness's search module is patched at staging (app/desktop/scripts/harness-search-partial.mjs).
 // The fixture is the exact MIT-licensed @deepseek-ai/dsh-tool-fs-search 0.2.1-alpha.3 lib/index.js (fixtures/dsh-tool-fs-search-LICENSE),
 // run here with its Harness imports stubbed and a fake ripgrep subprocess: the module's own run, parse and render code is what is tested.
 import test from 'node:test';

@@ -3,7 +3,7 @@
  * Headless UI flows of the installed app against a packaged host with a FAKE installer and a FAKE engine (nothing is
  * downloaded, no real engine runs; the real Control starts the fake engine through the owner runtime):
  *
- *   node apps/desktop/scripts/ui-flows.mjs [--control <staged control>] [--node <node.exe>] [--shots <dir>] [--only download,models,tune,fail,theme]
+ *   node app/desktop/scripts/ui-flows.mjs [--control <staged control>] [--node <node.exe>] [--shots <dir>] [--only download,models,tune,fail,theme]
  *
  *   download  the onboarding download: ONE combined bar over both files, an ETA in minutes left of Stop, Finish later closes the
  *             pop-up with the download still running, the Models screen shows the same progress, Stop stops it

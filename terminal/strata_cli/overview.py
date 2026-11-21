@@ -3,7 +3,7 @@
 A model-state bar, eight tiles with sparklines (speed, GPU load, VRAM, GPU temperature, power, PCIe, CPU, disk), bars for context fill,
 experts in VRAM and system RAM, and the recent requests. It reads what the browser Monitor reads: the server's `/metrics`
 (live state, engine facts, the hardware sample and a minute of history per series, the last requests) as the app's
-apps/host/src/lib/native-monitor.ts maps it: the context used is the current request's prompt + generated tokens while one runs, else the
+app/host/src/lib/native-monitor.ts maps it: the context used is the current request's prompt + generated tokens while one runs, else the
 last request's; the speed is the live rate while generating, else the last request's.
 
 `build(metrics)` turns the raw metrics into plain numbers (None where the server did not report one: never a made-up zero);

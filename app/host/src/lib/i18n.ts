@@ -34,7 +34,7 @@ import gtui_en from '../locales/gtui-en.json';
 
 export const LANGUAGES=[{value:'en',label:'English'},{value:'zh',label:'中文（简体）'},{value:'ja',label:'日本語'},{value:'de',label:'Deutsch'},{value:'fr',label:'Français'},{value:'es',label:'Español'},{value:'ru',label:'Русский'},{value:'pt',label:'Português'},{value:'ko',label:'한국어'},{value:'he',label:'עברית'}] as const;
 export type Language=typeof LANGUAGES[number]['value'];
-/* The Tune model dialog's strings live in tune-<lang>.json (apps/host/scripts/make-tune-locales.py) so other interface work does not collide with them. */
+/* The Tune model dialog's strings live in tune-<lang>.json (app/host/scripts/make-tune-locales.py) so other interface work does not collide with them. */
 /* The tool-server, picture and agent-result strings of the tools and images fixes live in tools-<lang>.json for the same reason. */
 /* The strings that had no key in the files above (#3479, #3825) and the 0.2.4.3 fixes live in fix-<lang>.json (scripts/make-fix-locales.py). */
 const english:Record<string,string>={...baseEnglish,...tune_en,...tools_en,...fix_en,...gh_en,...ui_en,...engine_en,...pick_en,...df2_en,...upd_en,...r3_en,...pic_en,...gui_en,...sav_en,...net_en,...dmg_en,...guic_en,...fixa_en,...gtui_en};

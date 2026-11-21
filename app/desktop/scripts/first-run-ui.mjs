@@ -3,7 +3,7 @@
  * The first run of the installed app, headless: the host as the Tauri shell starts it (STRATA_PACKAGED=1, STRATA_NO_ACQUIRE=1,
  * the staged Control, nothing installed, nothing in the per-user folders) and Chrome on its onboarding.
  *
- *   node apps/desktop/scripts/first-run-ui.mjs [--control <staged control>] [--node <node.exe>] [--work <scratch>] [--shots <dir>]
+ *   node app/desktop/scripts/first-run-ui.mjs [--control <staged control>] [--node <node.exe>] [--work <scratch>] [--shots <dir>]
  *
  * Checks, one line each (exit 1 if any fails):
  *   the host answers; /api/native has a real catalog (families with sizes), a recommendation and the GPUs of this PC
@@ -40,7 +40,7 @@ const check = (ok, label, detail = '') => { console.log(`${ok ? 'ok  ' : 'FAIL'}
 const delay = ms => new Promise(r => setTimeout(r, ms));
 const freePort = async () => { const s = createServer(); await new Promise(r => s.listen(0, '127.0.0.1', r)); const p = s.address().port; await new Promise(r => s.close(r)); return p; };
 
-for (const need of [nodeExe, join(control, 'strata.py'), join(repoHost, 'dist', 'index.html')]) if (!existsSync(need)) { console.error(`missing ${need} (run stage-control.py, fetch-node and "npm run build" in apps/host first)`); process.exit(2); }
+for (const need of [nodeExe, join(control, 'strata.py'), join(repoHost, 'dist', 'index.html')]) if (!existsSync(need)) { console.error(`missing ${need} (run stage-control.py, fetch-node and "npm run build" in app/host first)`); process.exit(2); }
 
 const dirs = { home: join(work, 'home'), appdata: join(work, 'appdata'), local: join(work, 'local'), components: join(work, 'local', 'Strata', 'components') };
 for (const d of Object.values(dirs)) mkdirSync(d, { recursive: true });

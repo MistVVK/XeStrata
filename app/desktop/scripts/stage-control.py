@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Stage the Control component the installer ships: src-tauri/resources/control.
 
-    python apps/desktop/scripts/stage-control.py                       # build the terminal bundle, stage it
-    python apps/desktop/scripts/stage-control.py --archive X.zip       # stage an archive you already built
-    python apps/desktop/scripts/stage-control.py --wheelhouse DIR      # build with no network (wheels from DIR)
-    python apps/desktop/scripts/stage-control.py --check               # verify what is staged
+    python app/desktop/scripts/stage-control.py                       # build the terminal bundle, stage it
+    python app/desktop/scripts/stage-control.py --archive X.zip       # stage an archive you already built
+    python app/desktop/scripts/stage-control.py --wheelhouse DIR      # build with no network (wheels from DIR)
+    python app/desktop/scripts/stage-control.py --check               # verify what is staged
 
 What lands in `control/`: the pinned CPython 3.12.15 (python-build-standalone, digest-checked), the hash-locked wheels
 (`packaging/locks/runtime-<target>-cp312.txt`, installed with --require-hashes at build time), strata_control,

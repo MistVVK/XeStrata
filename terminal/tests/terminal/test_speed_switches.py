@@ -1,6 +1,6 @@
 """The 0.2.7 speed features and their switches: the contract names, the defaults (Faster long prompts OFF, the other two ON), where each applies, and how the Terminal carries them.
 
-The app (apps/host/server/native-settings.mjs SPEED_SWITCHES) and Control (strata_control/speed_switches.py) say the same thing; the last test reads the
+The app (app/host/server/native-settings.mjs SPEED_SWITCHES) and Control (strata_control/speed_switches.py) say the same thing; the last test reads the
 app's table with node and fails when the two differ.  `strata launch` shows the environment entries as rows of its Advanced table and writes them into
 the run config's "env" (`--set STRATA_KVA=1` turns Faster long prompts on); a default launch has none of them.
 """

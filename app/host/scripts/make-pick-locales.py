@@ -1,5 +1,5 @@
 """Writes src/locales/pick-<lang>.json: the strings of the model version list (VersionPicker), the code-block preview button and the This computer panel (branch f-0291-ui-fixes2).
-Run from apps/host:  python scripts/make-pick-locales.py
+Run from app/host:  python scripts/make-pick-locales.py
 Every entry names all nine languages; the keys are vp01.. in the order of S. pick-en.json is the English source. Placeholders ({0}, {1}) must be kept
 in every language. A separate file keeps this work from colliding with the other catalogs (the same reason tune-, tools-, fix-, gh-, ui- and engine- exist)."""
 import json

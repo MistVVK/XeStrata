@@ -1,6 +1,6 @@
 // #6014, the desktop agent's side: an MCP server at an address that was restarted (the UE5 editor) forgot the session, and every tool
 // call failed with "-32600 Unknown session id ...; client should reinitialize" until the model was unloaded. The staged Harness's MCP
-// client is patched at staging (apps/desktop/scripts/harness-mcp-session.mjs). The fixture is the exact MIT-licensed
+// client is patched at staging (app/desktop/scripts/harness-mcp-session.mjs). The fixture is the exact MIT-licensed
 // @deepseek-ai/dsh-mcp-client 0.2.1-alpha.3 lib/index.js (the same DeepSeek licence as fixtures/dsh-tool-fs-search-LICENSE), run here with
 // its imports stubbed and a fake MCP server behind a fake SDK client: the module's own connection, reconnect and tool code is tested.
 import test from 'node:test';

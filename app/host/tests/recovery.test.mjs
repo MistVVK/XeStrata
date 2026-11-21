@@ -1,5 +1,5 @@
 // #5079: after the desktop shell loads the page again because its renderer died, the page starts with the sidebar previews closed, once.
-// The shell side (which failures reload, the limit of two in two minutes, the address) is unit-tested in apps/desktop/src-tauri/src/recovery.rs.
+// The shell side (which failures reload, the limit of two in two minutes, the address) is unit-tested in app/desktop/src-tauri/src/recovery.rs.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';

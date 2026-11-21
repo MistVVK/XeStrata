@@ -1,5 +1,5 @@
 {
-  "_about": "Shared by tests/terminal/test_gpu_roles.py (strata_control/gpu_roles.py) and apps/host/tests/gpu-roles.test.mjs (apps/host/src/lib/gpu-roles.ts). Roles are keyed by card number.",
+  "_about": "Shared by tests/terminal/test_gpu_roles.py (strata_control/gpu_roles.py) and app/host/tests/gpu-roles.test.mjs (app/host/src/lib/gpu-roles.ts). Roles are keyed by card number.",
   "hw": {
     "one": [{"index": 0, "name": "NVIDIA GeForce RTX 4070 Ti", "vram_gb": 12, "speed": 100}],
     "two": [{"index": 0, "name": "NVIDIA GeForce RTX 3060", "vram_gb": 12, "speed": 60}, {"index": 1, "name": "NVIDIA GeForce RTX 4070 Ti", "vram_gb": 12, "speed": 100}],

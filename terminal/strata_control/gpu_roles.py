@@ -7,7 +7,7 @@ A card has one of three roles:
 
 The engine takes the cards in stage order (`"gpu": [helper, ..., main]` with `"gpu_order": "as_given"`), so the Main card is the LAST one. This
 module turns roles into that list (and back), recommends roles, and words the few warnings a person could not work out alone.
-The app has the same rules in apps/host/src/lib/gpu-roles.ts; both run tests/data/gpu_roles_vectors.json.
+The app has the same rules in app/host/src/lib/gpu-roles.ts; both run tests/data/gpu_roles_vectors.json.
 
 Pure functions, no I/O.
 """

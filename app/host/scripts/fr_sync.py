@@ -2,7 +2,7 @@
 
 The French texts live in src/locales/fr.json, fix-fr.json, tune-fr.json and tools-fr.json, next to the other languages.
 They are edited by hand (they are the translations, not generated), so a string added to an English catalog later has no
-French yet. This script lists and merges those. From apps/host:
+French yet. This script lists and merges those. From app/host:
 
     python scripts/fr_sync.py missing [out.tsv]        write every English string that has no French yet
     python scripts/fr_sync.py apply done.tsv           merge translations, rewrite the four fr files in English key order

@@ -2,7 +2,7 @@
 
 There is ONE catalog: setup.py's MODELS / FAMILIES / CONTEXTS, which the desktop app reads through tools/strata_mcp.py
 (`Strata.model_table`, `Strata.hardware`, `Strata.recommend`; the app page's own fit arithmetic is
-apps/host/src/lib/native-fit.ts `fitOn`). This module loads that same file from the installer folder and ports `fitOn` line by
+app/host/src/lib/native-fit.ts `fitOn`). This module loads that same file from the installer folder and ports `fitOn` line by
 line; it holds no table of its own. Without the installer files (a Terminal bundle made before launch existed) it says so in
 words instead of guessing.
 """
@@ -25,7 +25,7 @@ class CatalogUnavailable(RuntimeError):
     """The installer files (setup.py, tools/strata_mcp.py) are not there; the message is for the user."""
 
 
-# --- apps/host/src/lib/native-fit.ts, ported (same constants, same rules) ------------------------------------------------
+# --- app/host/src/lib/native-fit.ts, ported (same constants, same rules) ------------------------------------------------
 DENSE_GB = 5.0
 SYSTEM_ROOM_GB = 10.0
 DENSE_EXTRA_GB = 1.0

@@ -158,6 +158,29 @@ def _arg_files(args) -> list[Path]:
     return found
 
 
+def ple_table_file(args) -> Path | None:
+    """The file named by --ple-gguf when the engine keeps its table in RAM or maps it (--ple-io ram / mmap / not given); None for --ple-io direct (random 4 KiB reads: it
+    gains nothing from the cache) and when there is no --ple-gguf. Its cache is the one the engine needs again at its start: make_room leaves it."""
+    items = [str(a) for a in args]
+    io = None
+    for i, a in enumerate(items):
+        if a == "--ple-io" and i + 1 < len(items):
+            io = items[i + 1]
+    if io == "direct":
+        return None
+    for i, a in enumerate(items):
+        if a == "--ple-gguf" and i + 1 < len(items) and os.path.isabs(items[i + 1]):
+            return Path(items[i + 1])
+    return None
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return a == b or os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def _drop_cache(path: Path) -> bool:
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -250,7 +273,10 @@ def make_room(args, say=None, environ=None, *, found=None, drop=_drop_cache, cac
         free = (free_of or _mem_free)()
         if not files or total <= 0 or free is None or free >= fraction * total:
             return why(f"enough room: free {free}, files {len(files)}, bytes {total}")
+        kept = ple_table_file(args)
         for p in files:
+            if kept is not None and _same_file(p, kept):
+                continue                                   # the engine reads the table through the cache at its start: dropping it costs a cold read of its whole size (GB10, 26.8 GiB: +48 s)
             drop(p)
         after = cache()
         freed = max(0, before - (after if after is not None else before))

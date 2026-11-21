@@ -1,7 +1,7 @@
 """Writes src/locales/gui-<lang>.json: the strings of the GUI feedback round 2 (branch f-0291-gui-fb2): the new name and hint of the "Leave room for my work"
 choice (it keeps 5-8 GB of memory free; it was "Leave 20% for my work"), the memory-error sentence that names it, and the words of the compact files block
 ("Delivered to", "Working folder", "{0} files").
-Run from apps/host:  python scripts/make-gui-locales.py
+Run from app/host:  python scripts/make-gui-locales.py
 Every entry names all nine languages; the keys are gf01.. in the order of S. gui-en.json is the English source. Placeholders ({0}) must be kept in every language.
 A separate file keeps this work from colliding with the other catalogs (the same reason pick-, tune-, tools-, fix-, gh-, ui-, engine- and df2- exist)."""
 import json

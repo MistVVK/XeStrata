@@ -1,6 +1,6 @@
 """Writes src/locales/gh-<lang>.json: the interface strings of the 0.2.7 GitHub items done in f-027-gh-app (the Monitor's Power card #3628,
 approval notifications and the tray #3477, the finished-task sound #3586, the pinned port #3402, the interface size #3970).
-Run from apps/host:  python scripts/make-gh-locales.py
+Run from app/host:  python scripts/make-gh-locales.py
 The keys are gh01.. in this order; gh-en.json is the English source. Placeholders ({0}, {1}) must be kept in every language.
 A separate file keeps this work from colliding with the other catalogs (the same reason tune-, tools- and fix- exist)."""
 import json

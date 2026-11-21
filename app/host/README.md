@@ -10,7 +10,7 @@ You need **Node 24.12 or newer** (`engines` in `package.json`) and npm. Nothing 
 sibling design folder.
 
 ```sh
-cd apps/host
+cd app/host
 npm ci
 npm run build          # makes dist/, which the preview and `npm run serve` need (dist/ is not checked in)
 npm run preview:ui     # simulated hardware and models; open http://localhost:5272/#/models

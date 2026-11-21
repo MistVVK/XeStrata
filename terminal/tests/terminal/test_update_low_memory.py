@@ -199,7 +199,7 @@ class StartFallsBack(unittest.TestCase):
 
 
 class TheAppsStartPath(unittest.TestCase):
-    """The app starts a model with `strata runtime start --profile P --wait N --output json` (apps/host/server/control-runtime.mjs): the same
+    """The app starts a model with `strata runtime start --profile P --wait N --output json` (app/host/server/control-runtime.mjs): the same
     runtime.start, and its JSON carries the fallback and its line."""
 
     def test_runtime_start_from_the_command_line(self):

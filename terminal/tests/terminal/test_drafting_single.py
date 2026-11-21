@@ -1,6 +1,6 @@
 """One drafter per run, from every way in (owner, 2026-11-02): DFlash2 alone or the MTP alone, never both.
 
-strata_control/drafting.py decides; the app (apps/host, through Control and serve/server.py) and the Terminal (strata launch, its Drafting step, a saved preset)
+strata_control/drafting.py decides; the app (app/host, through Control and serve/server.py) and the Terminal (strata launch, its Drafting step, a saved preset)
 both end at serve/server.py engine_args(). These tests lock in the engine arguments of every choice on the main backends, the old saved values, and the Terminal
 path from the launch settings to the argument list. (tests/terminal/test_drafting.py has the table, the flags and the downloads one by one.)
 """

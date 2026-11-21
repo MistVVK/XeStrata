@@ -1,7 +1,7 @@
 """Writes src/locales/df2-<lang>.json: the strings of the Drafting choice that came with the DFlash2 option (branch f-0291-df2-option): the plain-words
 paragraph under the dropdown, the three lines about the person's graphics card, the "not on this card" and "no internet" lines, and the SSD line of the
 This computer panel.
-Run from apps/host:  python scripts/make-df2-locales.py
+Run from app/host:  python scripts/make-df2-locales.py
 Every entry names all nine languages; the keys are df01.. in the order of S. df2-en.json is the English source. Placeholders ({0}) must be kept in every
 language. A separate file keeps this work from colliding with the other catalogs (the same reason pick-, tune-, tools-, fix-, gh-, ui- and engine- exist).
 The English lines of df03-df07 and df09 are also written in strata_control/drafting.py and strata_control/drafting_fetch.py; tests/drafting.test.mjs keeps the two the same."""

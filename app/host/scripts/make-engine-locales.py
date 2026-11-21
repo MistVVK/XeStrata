@@ -1,5 +1,5 @@
 """Writes src/locales/engine-<lang>.json: the strings of Settings > Engine (the list of installed engines: switch, delete) and the words that now point to
-About for updating (branch f-0291-engine-tab).  Run from apps/host:  python scripts/make-engine-locales.py
+About for updating (branch f-0291-engine-tab).  Run from app/host:  python scripts/make-engine-locales.py
 Every entry names all nine languages; the keys are et01.. in the order of S. engine-en.json is the English source. Placeholders ({0}, {1}) must be kept in
 every language. A separate file keeps this work from colliding with the other catalogs (the same reason tune-, tools-, fix-, gh- and ui- exist)."""
 import json

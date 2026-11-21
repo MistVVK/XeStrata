@@ -350,7 +350,7 @@ def npm_cmd():
 
 
 def host_ready(ctx, r):
-    """Node, npm and apps/host/node_modules. Installs the packages with `npm ci` when they are missing."""
+    """Node, npm and app/host/node_modules. Installs the packages with `npm ci` when they are missing."""
     node, why = node_version()
     if not node:
         r.reason = why

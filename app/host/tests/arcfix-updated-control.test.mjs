@@ -43,7 +43,7 @@ function fixture() {
 test('a four-part Control (0.1.59.1) from the feed beats the bundled 0.1.59, whether the shell names the bundled one or it sits beside the host', () => {
   const f = fixture();
   try {
-    // the Tauri shell sets STRATA_CONTROL_DIR to the bundled folder (apps/desktop/src-tauri/src/main.rs apply_runtime_policy)
+    // the Tauri shell sets STRATA_CONTROL_DIR to the bundled folder (app/desktop/src-tauri/src/main.rs apply_runtime_policy)
     const viaShell = findControl({ env: { STRATA_CONTROL_DIR: f.bundled }, hostDir: f.hostDir, components: f.components });
     assert.equal(viaShell.dir, f.updated);
     assert.equal(viaShell.bundle.version, '0.1.59.1');

@@ -174,7 +174,7 @@ def plan(report: dict, set_index: int, a, prev: dict) -> dict:
             nm = re.sub(r"Strata-\d[\d.]*-", "Strata-%s-" % a.app_version, e["name"])
             changed.append({"name": nm, "size": e["size"], "est": True, "why": "app rebuilt with the Models page text"})
         step("%d" % n, "App text for the model (Models page) and the app bundles", "owner PC (Windows installer), a Linux box (AppImage), m1002 (Mac, unsigned; the owner signs)", 40,
-             ["# edit apps/host/src (the model's name and one line), then the 0.2.11 app recipe: scripts/relwin/win_installer_rc1.ps1, the AppImage and Mac scripts",
+             ["# edit app/host/src (the model's name and one line), then the 0.2.11 app recipe: scripts/relwin/win_installer_rc1.ps1, the AppImage and Mac scripts",
               "python packaging/feed_tool.py set-app-platform --app-json latest.json --target <target> --archive <installer> --sig <installer.sig> --version %s" % a.app_version],
              [c["name"] for c in changed if APP_RE.match(c["name"])])
         n += 1

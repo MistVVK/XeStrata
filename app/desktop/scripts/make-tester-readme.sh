@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Write a tester's README with the checksums and sizes of the files it names, computed from the files themselves.
 #
-#   apps/desktop/scripts/make-tester-readme.sh <template> <out.txt> --appimage <file name> --files-dir <dir> [--files-dir <dir> ...]
+#   app/desktop/scripts/make-tester-readme.sh <template> <out.txt> --appimage <file name> --files-dir <dir> [--files-dir <dir> ...]
 #
 # Why: a README that carries a hand-pasted sha256 goes stale the moment the file is rebuilt (the Ubuntu 26.04 tester compared the file
 # with the old build's hash). The template holds placeholders instead, and this script fills them from the real files:
 #   @APPIMAGE@            the AppImage's file name
-#   @APP_VERSION@         the app version, read from apps/desktop/src-tauri/Cargo.toml
+#   @APP_VERSION@         the app version, read from app/desktop/src-tauri/Cargo.toml
 #   @SHA256:<name>@       sha256 of the file <name> found in one of the --files-dir folders
 #   @SIZE_GB:<name>@      its size in GB with one decimal
 #   @INCLUDE:<file>@      (alone on a line) the contents of <file> from the template's folder, with the same placeholders

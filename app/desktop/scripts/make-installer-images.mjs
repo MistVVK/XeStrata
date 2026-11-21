@@ -3,7 +3,7 @@
  * The installer's pictures, drawn from the app's own design: the light surface and ink colours of the app (src/styles tokens), the
  * brand lockup and mark files, GT Walsheim Bold for the words (baked into the pictures, because NSIS cannot use a web font).
  *
- *   node apps/desktop/scripts/make-installer-images.mjs [--out <folder>] [--preview <folder>]
+ *   node app/desktop/scripts/make-installer-images.mjs [--out <folder>] [--preview <folder>]
  *
  * Writes sidebar.bmp (164x314, the welcome and finish pages) and header.bmp (150x57, the other pages) as 24-bit BMPs, and with
  * --preview the same as PNGs at 3x.

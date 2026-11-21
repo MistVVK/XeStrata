@@ -2,7 +2,7 @@
 
 A switch has a default (``on`` or ``off``).  In its other state it writes exactly the engine environment below into the model's run config ("env"); back in
 its default it removes those entries, so a default launch carries none of them and is byte for byte what 0.2.6 started.  The names are the engine switch
-contract (phaseA-tests/notes-027-plan.md).  The app does the same in apps/host/server/native-settings.mjs (SPEED_SWITCHES); tests/terminal/test_speed_switches.py
+contract (phaseA-tests/notes-027-plan.md).  The app does the same in app/host/server/native-settings.mjs (SPEED_SWITCHES); tests/terminal/test_speed_switches.py
 reads that file and fails when the two disagree, so the Terminal and the app cannot drift apart.
 
 - "Faster long prompts" (Qwen KVA) is OFF by default (owner decision, 26 October): ``STRATA_KVA=1`` turns it on.  A file that holds ``STRATA_KVA=0`` (the
@@ -135,7 +135,7 @@ def applicable(cfg: Mapping[str, Any] | None, gpus: Iterable[Mapping[str, Any]] 
 
 
 def app_switches() -> list[Switch]:
-    """The switches the app shows (apps/host/server/native-settings.mjs SPEED_SWITCHES): all but the Terminal-only ones."""
+    """The switches the app shows (app/host/server/native-settings.mjs SPEED_SWITCHES): all but the Terminal-only ones."""
     return [s for s in SWITCHES if not s.terminal_only]
 
 

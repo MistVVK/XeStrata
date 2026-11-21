@@ -1,4 +1,4 @@
-"""Tests for apps/desktop/scripts/appimage_elf.py (#4337: the bundled ripgrep, a static PIE, crashed in the Linux AppImage).
+"""Tests for app/desktop/scripts/appimage_elf.py (#4337: the bundled ripgrep, a static PIE, crashed in the Linux AppImage).
 
 A static PIE relocates itself at start-up by reading its own `.dynamic` section. linuxdeploy's RPATH rewrite moves that section and fills the old
 place; the program then does not start. The checks here: ELF files built in memory (run everywhere), and, on Linux with gcc and -static-pie, a real

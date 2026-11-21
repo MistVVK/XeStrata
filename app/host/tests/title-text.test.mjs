@@ -1,5 +1,5 @@
 // #4533: titles with emoji and other scripts are cut without cutting a character in half, and survive a save and restore unchanged.
-// (The crash itself is WebKitGTK drawing a COLRv1 colour font: apps/desktop/src-tauri/src/fontguard.rs. Needs a real WebKitGTK to show.)
+// (The crash itself is WebKitGTK drawing a COLRv1 colour font: app/desktop/src-tauri/src/fontguard.rs. Needs a real WebKitGTK to show.)
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';

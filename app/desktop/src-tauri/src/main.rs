@@ -295,7 +295,7 @@ fn resource_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
             return Ok(plain_path(dir));
         }
     }
-    // development: apps/desktop/src-tauri -> ../../host  and  ./resources
+    // development: app/desktop/src-tauri -> ../../host  and  ./resources
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     Ok(manifest)
 }
@@ -1006,14 +1006,14 @@ fn open_window(app: &tauri::App, port: u16, shell_token: &str) -> Result<(), Box
     let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url)).title("Strata").inner_size(1440.0, 920.0).min_inner_size(900.0, 600.0)
         .devtools(devtools_wanted(std::env::var("STRATA_DEVTOOLS").ok().as_deref()));
     // Dropping pictures on the chat (QA report 1, item 4). Windows: the shell's own file-drop handler is off, because with it on the system hands
-    // the dropped file to the shell and the page never sees it; with it off the page gets ordinary drag and drop events (apps/host DropZone), as
+    // the dropped file to the shell and the page never sees it; with it off the page gets ordinary drag and drop events (app/host DropZone), as
     // in a browser. Linux and macOS: the page gets the drag events but WebKit gives it no files, so the handler stays on and the shell passes the
     // drop on (see drop_script and hand_over_drop below).
     #[cfg(windows)]
     let builder = builder.disable_drag_drop_handler();
     // WebKitGTK (2.50 to 2.52 at least) dereferences a null pointer in AcceleratedBackingStore::update in its UI process when a page calls
     // document.startViewTransition (the web process asks the UI process to enter accelerated compositing, and the backing store is not
-    // there). The page itself does not call it on that engine (apps/host/src/lib/router.ts), and this line keeps any other script from doing
+    // there). The page itself does not call it on that engine (app/host/src/lib/router.ts), and this line keeps any other script from doing
     // it either: the API is simply absent, as in older WebKit versions.
     #[cfg(target_os = "linux")]
     let builder = builder.initialization_script(
@@ -1223,7 +1223,7 @@ fn pointer_buttons_up(widget: &webkit2gtk::WebView) -> bool {
     !mask.intersects(gtk::gdk::ModifierType::BUTTON1_MASK | gtk::gdk::ModifierType::BUTTON2_MASK | gtk::gdk::ModifierType::BUTTON3_MASK)
 }
 
-/// The script that tells the page a file drag is over the window (`state` is "enter" or "leave"); the page shows its drop box (apps/host DropZone).
+/// The script that tells the page a file drag is over the window (`state` is "enter" or "leave"); the page shows its drop box (app/host DropZone).
 #[cfg_attr(windows, allow(dead_code))]
 fn drag_script(state: &str) -> String {
     format!("window.dispatchEvent(new CustomEvent('strata:native-drag', {{ detail: '{state}' }}));")

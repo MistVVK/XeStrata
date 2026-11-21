@@ -27,8 +27,10 @@ test('without the setting the client keeps its own default', () => {
 });
 
 test('the host hands the model\'s setting to the agent', () => {
-  const index = readFileSync(new URL('../server/index.mjs', import.meta.url), 'utf8');
+  // a checkout with CRLF line ends (Git for Windows' default, GitHub's Windows runner) must read the same as one with LF
+  const lf = rel => readFileSync(new URL(rel, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  const index = lf('../server/index.mjs');
   assert.match(index, /mcpServers: i\.mcpServers,\n[^\n]*\n\s*mcpTimeoutS: i\.mcpTimeoutS \?\? null,/);
-  const control = readFileSync(new URL('../server/native-control.mjs', import.meta.url), 'utf8');
+  const control = lf('../server/native-control.mjs');
   assert.match(control, /mcpServers:cfg\.mcp_servers\?\?cfg\.mcpServers\?\?\{\},mcpTimeoutS:cfg\.mcp_timeout_s\?\?null,/);
 });

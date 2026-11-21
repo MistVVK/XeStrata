@@ -400,7 +400,7 @@ class CudaSpill(unittest.TestCase):
 
 
 class Reserve3750(unittest.TestCase):
-    """#3750: 256K context + Q4 KV on a small card.  The app's reserve for a card of 16 GB or less is 1536 MiB (apps/host native-resources.mjs), no longer a fifth of the
+    """#3750: 256K context + Q4 KV on a small card.  The app's reserve for a card of 16 GB or less is 1536 MiB (app/host native-resources.mjs), no longer a fifth of the
     card (3256 on the reporter's RX 9070 XT).  The fit arithmetic prices the expert cache that is left, and it is positive at 12 GiB with the app's reserve on both
     discrete backends; the old 3256 left the CUDA engine's measured base at its threshold (a start on the edge, which the reporter's 83 GB model fell over)."""
 

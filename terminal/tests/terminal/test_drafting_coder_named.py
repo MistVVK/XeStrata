@@ -1,6 +1,6 @@
 """#5240: DFlash2 on the Coder is an explicit opt-in. A DFlash2 chosen by name on the Coder starts DFlash2 with the stock pack (the Coder has no tuned pack) and no MTP
 layer; Auto (and no choice) keeps the MTP on the Coder; Swift and NVFP4 stay refused (the MTP, with the NOT_SUPPORTED line); setup fetches the stock pack only for the
-named choice. The app's copies (resolveDrafter) are checked against the same rule by apps/host/tests/policy-generated.test.mjs."""
+named choice. The app's copies (resolveDrafter) are checked against the same rule by app/host/tests/policy-generated.test.mjs."""
 
 from __future__ import annotations
 

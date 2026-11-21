@@ -5242,7 +5242,7 @@ class ForcedToolChoice(unittest.TestCase):
 
     def test_any_model_name_on_the_anthropic_route_is_the_loaded_model(self):
         """#5312: Claude Desktop sends the model name `claude-5-5-sonnet` and cannot change it; the route serves the loaded model whatever
-        the request calls it, and answers with that model's name (the Desktop app's own gateway is a separate check in apps/host)."""
+        the request calls it, and answers with that model's name (the Desktop app's own gateway is a separate check in app/host)."""
         self.says("Hello there.")
         for name in ("claude-5-5-sonnet", "claude-opus-4-1", "gpt-4o", "nonsense"):
             for stream in (False, True):
