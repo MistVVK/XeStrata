@@ -181,6 +181,77 @@ kernel void ink_attn_res_mix(
     }
 }
 
+// Fused Attention-Residual Depth Mix + RMSNorm (kills 90+ GPU barriers/token when !has_msgs!)
+// norm_w_all: [n_queries, INK_D] OR single [INK_D] when n_queries == 1; norm_stride = 0 for shared or INK_D for per-query
+kernel void ink_attn_res_mix_norm(
+    device const float* blocks_buf [[buffer(0)]],
+    device const float* cur_buf    [[buffer(1)]],
+    device const float* queries    [[buffer(2)]],
+    device const float* norm_w0    [[buffer(3)]],
+    device const float* norm_w1    [[buffer(4)]],
+    device const float* norm_w2    [[buffer(5)]],
+    device float* out_buf          [[buffer(6)]],
+    constant int& n_blocks         [[buffer(7)]],
+    constant int& block_stride     [[buffer(8)]],
+    constant int& M_stride         [[buffer(9)]],
+    constant int& n_queries        [[buffer(10)]],
+    uint m   [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh[8];
+    threadgroup float inv_s[8];
+    threadgroup float probs[4][8];
+    const int S = n_blocks + 1;
+    for (int s = 0; s < S; ++s) {
+        device const float* sp = (s < n_blocks)
+            ? (blocks_buf + (size_t)s * block_stride + (size_t)m * INK_D)
+            : (cur_buf + (size_t)m * INK_D);
+        float ss = 0.0f;
+        for (uint d = tid; d < INK_D; d += 256) { const float v = sp[d]; ss += v * v; }
+        const float tot = ops_tg_sum(ss, sh, tid, 256);
+        if (tid == 0) inv_s[s] = rsqrt(tot / float(INK_D) + INK_RMS_EPS);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_sqrt_d = 1.0f / 48.0f;
+    for (int q = 0; q < n_queries; ++q) {
+        device const float* qv = queries + (size_t)q * INK_D;
+        for (int s = 0; s < S; ++s) {
+            device const float* sp = (s < n_blocks)
+                ? (blocks_buf + (size_t)s * block_stride + (size_t)m * INK_D)
+                : (cur_buf + (size_t)m * INK_D);
+            float dt = 0.0f;
+            for (uint d = tid; d < INK_D; d += 256) dt += sp[d] * qv[d];
+            const float score = ops_tg_sum(dt, sh, tid, 256) * inv_s[s] * inv_sqrt_d;
+            if (tid == 0) probs[q][s] = score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float mx = -1e30f;
+            for (int s = 0; s < S; ++s) mx = max(mx, probs[q][s]);
+            float sum = 0.0f;
+            for (int s = 0; s < S; ++s) { probs[q][s] = exp(probs[q][s] - mx); sum += probs[q][s]; }
+            const float isum = 1.0f / sum;
+            for (int s = 0; s < S; ++s) probs[q][s] *= isum * inv_s[s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device float* dst = out_buf + (size_t)q * M_stride + (size_t)m * INK_D;
+        device const float* nw = (q == 0) ? norm_w0 : ((q == 1) ? norm_w1 : norm_w2);
+        float ss = 0.0f;
+        for (uint d = tid; d < INK_D; d += 256) {
+            float acc = 0.0f;
+            for (int s = 0; s < S; ++s) {
+                device const float* sp = (s < n_blocks)
+                    ? (blocks_buf + (size_t)s * block_stride + (size_t)m * INK_D)
+                    : (cur_buf + (size_t)m * INK_D);
+                acc = fma(probs[q][s], sp[d], acc);
+            }
+            dst[d] = acc;
+            ss += acc * acc;
+        }
+        const float invn = rsqrt(ops_tg_sum(ss, sh, tid, 256) / float(INK_D) + INK_RMS_EPS);
+        for (uint d = tid; d < INK_D; d += 256) dst[d] = dst[d] * invn * nw[d];
+    }
+}
+
 // ============================================================================
 // 3. Fused Rank-64 tanh Loop Controller + Optional RMSNorm
 //    Step A (ink_ctrl_cat_rms): build cat [M, 4608] = [rms(cur); rms(msg)]
@@ -252,6 +323,69 @@ kernel void ink_ctrl_apply_norm(
     if (do_norm) {
         const float inv = rsqrt(ops_tg_sum(ss, sh, tid, 256) / float(INK_D) + INK_RMS_EPS);
         for (uint d = tid; d < INK_D; d += 256) dst[d] = dst[d] * inv * norm_w[d];
+    }
+}
+
+// Fast batched controller fuse + RMSNorm for M > 8 (sg_buf = W_gain @ gate, sf_buf = W_forget @ gate via simdgroup_matrix!)
+kernel void ink_ctrl_fuse_norm(
+    device const float* cur_buf [[buffer(0)]],
+    device const float* msg_buf [[buffer(1)]],
+    device const float* sg_buf  [[buffer(2)]],
+    device const float* sf_buf  [[buffer(3)]],
+    device const float* norm_w  [[buffer(4)]],
+    device float* out_buf       [[buffer(5)]],
+    uint m   [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh[8];
+    const size_t off = (size_t)m * INK_D;
+    device const float* cp = cur_buf + off;
+    device const float* mp = msg_buf + off;
+    device const float* sgp = sg_buf + off;
+    device const float* sfp = sf_buf + off;
+    device float* dst = out_buf + off;
+    float ss = 0.0f;
+    for (uint d = tid; d < INK_D; d += 256) {
+        const float v = (1.0f - tanh(clamp(sfp[d], -15.0f, 15.0f))) * cp[d]
+                      + tanh(clamp(sgp[d], -15.0f, 15.0f)) * mp[d];
+        dst[d] = v;
+        ss += v * v;
+    }
+    const float inv = rsqrt(ops_tg_sum(ss, sh, tid, 256) / float(INK_D) + INK_RMS_EPS);
+    for (uint d = tid; d < INK_D; d += 256) dst[d] = dst[d] * inv * norm_w[d];
+}
+
+// Ultra-fast 40-core parallel Rank-64 controller Gain/Forget apply for M <= 8!
+// grid (144, M, 1), 256 threads = 16 rows/TG x 16 lanes/row (100% coalesced 256-byte reads, 40x faster than 1-TG!)
+kernel void ink_ctrl_gf_64(
+    device const float* cur_buf  [[buffer(0)]],
+    device const float* msg_buf  [[buffer(1)]],
+    device const float* gate_buf [[buffer(2)]],  // [M, 64]
+    device const float* w_gain   [[buffer(3)]],  // [2304, 64]
+    device const float* w_forget [[buffer(4)]],  // [2304, 64]
+    device float* out_buf        [[buffer(5)]],  // [M, 2304]
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    threadgroup float g_sh[64];
+    const int m = int(tgp.y);
+    if (tid < 64) g_sh[tid] = gate_buf[(size_t)m * 64 + tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int local_row = int(tid >> 4);   // 0..15
+    const int k4 = int(tid & 15u);         // 0..15 -> 4 floats each = 64 floats total!
+    const int d = int(tgp.x) * 16 + local_row;
+    if (d >= INK_D) return;
+    const float4 gv = float4(g_sh[4 * k4], g_sh[4 * k4 + 1], g_sh[4 * k4 + 2], g_sh[4 * k4 + 3]);
+    float sg = dot(((device const float4*)(w_gain + (size_t)d * 64))[k4], gv);
+    float sf = dot(((device const float4*)(w_forget + (size_t)d * 64))[k4], gv);
+    // 16-lane butterfly reduction within half-simdgroup (zero barriers!)
+    sg += simd_shuffle_xor(sg, ushort(1)); sf += simd_shuffle_xor(sf, ushort(1));
+    sg += simd_shuffle_xor(sg, ushort(2)); sf += simd_shuffle_xor(sf, ushort(2));
+    sg += simd_shuffle_xor(sg, ushort(4)); sf += simd_shuffle_xor(sf, ushort(4));
+    sg += simd_shuffle_xor(sg, ushort(8)); sf += simd_shuffle_xor(sf, ushort(8));
+    if (k4 == 0) {
+        const size_t idx = (size_t)m * INK_D + d;
+        out_buf[idx] = (1.0f - tanh(clamp(sf, -15.0f, 15.0f))) * cur_buf[idx]
+                     + tanh(clamp(sg, -15.0f, 15.0f)) * msg_buf[idx];
     }
 }
 
@@ -374,6 +508,87 @@ kernel void ink_sconv4_multi(
     h[0 * C + c] = h0;
     h[1 * C + c] = h1;
     h[2 * C + c] = h2;
+}
+
+// Fused attn_sconv + residual update (or block boundary save) — kills 48+ barriers/token!
+kernel void ink_sconv4_attn_res(
+    device const float* x_in        [[buffer(0)]],
+    device const float* static_w    [[buffer(1)]],
+    device float* hist_pool         [[buffer(2)]],
+    device const int* active_slots  [[buffer(3)]],
+    device const int* slot_tok_off  [[buffer(4)]],
+    device const int* slot_tok_cnt  [[buffer(5)]],
+    device const int* slot_tok_idx  [[buffer(6)]],
+    device float* cur_buf           [[buffer(7)]],
+    device float* block_dst         [[buffer(8)]],
+    device float* ring_out          [[buffer(9)]],
+    constant int& save_block        [[buffer(10)]],
+    constant int& save_ring         [[buffer(11)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    const int c = int(tgp.y) * 256 + int(tid);
+    if (c >= INK_D) return;
+    const int si = int(tgp.x);
+    const int slot = active_slots[si], off = slot_tok_off[si], cnt = slot_tok_cnt[si];
+    device float* h = hist_pool + (size_t)slot * 3 * INK_D;
+    float h0 = h[0 * INK_D + c], h1 = h[1 * INK_D + c], h2 = h[2 * INK_D + c];
+    const float4 sw = *((device const float4*)(static_w + (size_t)c * 4));
+    const float scale = 0.4472135954999579f;
+    for (int k = 0; k < cnt; ++k) {
+        const int m = slot_tok_idx[off + k];
+        const size_t idx = (size_t)m * INK_D + c;
+        const float cur = x_in[idx];
+        const float y = (cur + h0 * sw.x + h1 * sw.y + h2 * sw.z + cur * sw.w) * scale;
+        if (save_block) {
+            block_dst[idx] = cur_buf[idx];
+            cur_buf[idx] = y;
+        } else {
+            cur_buf[idx] += y;
+        }
+        h0 = h1; h1 = h2; h2 = cur;
+        if (save_ring && si == 0 && k < 8) {
+            device float* rdst = ring_out + (size_t)k * 3 * INK_D;
+            rdst[0 * INK_D + c] = h0; rdst[1 * INK_D + c] = h1; rdst[2 * INK_D + c] = h2;
+        }
+    }
+    h[0 * INK_D + c] = h0; h[1 * INK_D + c] = h1; h[2 * INK_D + c] = h2;
+}
+
+// Fused MoE reduce8 + mlp_sconv + residual add — kills 96 dispatches & 96 barriers/token!
+kernel void ink_moe_red8_sconv_add(
+    device const float* y_pairs     [[buffer(0)]],
+    device const float* static_w    [[buffer(1)]],
+    device float* hist_pool         [[buffer(2)]],
+    device const int* active_slots  [[buffer(3)]],
+    device const int* slot_tok_off  [[buffer(4)]],
+    device const int* slot_tok_cnt  [[buffer(5)]],
+    device const int* slot_tok_idx  [[buffer(6)]],
+    device float* cur_buf           [[buffer(7)]],
+    device float* ring_out          [[buffer(8)]],
+    constant int& save_ring         [[buffer(9)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    const int c = int(tgp.y) * 256 + int(tid);
+    if (c >= INK_D) return;
+    const int si = int(tgp.x);
+    const int slot = active_slots[si], off = slot_tok_off[si], cnt = slot_tok_cnt[si];
+    device float* h = hist_pool + (size_t)slot * 3 * INK_D;
+    float h0 = h[0 * INK_D + c], h1 = h[1 * INK_D + c], h2 = h[2 * INK_D + c];
+    const float4 sw = *((device const float4*)(static_w + (size_t)c * 4));
+    const float scale = 0.4472135954999579f;
+    for (int k = 0; k < cnt; ++k) {
+        const int m = slot_tok_idx[off + k];
+        float cur = 0.0f;
+        for (int e = 0; e < 8; ++e) cur += y_pairs[((size_t)m * 8 + e) * INK_D + c];
+        const float y = (cur + h0 * sw.x + h1 * sw.y + h2 * sw.z + cur * sw.w) * scale;
+        cur_buf[(size_t)m * INK_D + c] += y;
+        h0 = h1; h1 = h2; h2 = cur;
+        if (save_ring && si == 0 && k < 8) {
+            device float* rdst = ring_out + (size_t)k * 3 * INK_D;
+            rdst[0 * INK_D + c] = h0; rdst[1 * INK_D + c] = h1; rdst[2 * INK_D + c] = h2;
+        }
+    }
+    h[0 * INK_D + c] = h0; h[1 * INK_D + c] = h1; h[2 * INK_D + c] = h2;
 }
 
 // Ultra-fast parallel single-slot prefill ShortConv (100% parallel over M AND C!)
@@ -670,6 +885,48 @@ kernel void ink_router_topk8(
             topk_idx[(size_t)m * 8 + k] = sel[k];
             topk_w[(size_t)m * 8 + k] = pw[k] * inv;
         }
+    }
+}
+
+// Fused M==1 Router Top-8 + MoE Plan — eliminates 48 ink_moe_plan dispatches & 48 barriers!
+kernel void ink_router_topk8_plan_m1(
+    device const float* r_logits [[buffer(0)]],
+    device const float* r_bias   [[buffer(1)]],
+    device int* topk_idx         [[buffer(2)]],
+    device float* topk_w         [[buffer(3)]],
+    device int* uexp             [[buffer(4)]],
+    device int* uoff             [[buffer(5)]],
+    device int* ucnt             [[buffer(6)]],
+    device int* pair_list        [[buffer(7)]],
+    device uint* meta            [[buffer(8)]],
+    constant float& route_scale  [[buffer(9)]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_prob[128];
+    threadgroup float sh_score[128];
+    const float p = 1.0f / (1.0f + exp(-r_logits[tid]));
+    sh_prob[tid] = p;
+    sh_score[tid] = p + r_bias[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        int sel[8]; float pw[8]; float sum = 0.0f;
+        for (int k = 0; k < 8; ++k) {
+            int bi = -1; float bs = -1e30f;
+            for (int e = 0; e < 128; ++e) if (sh_score[e] > bs) { bs = sh_score[e]; bi = e; }
+            sel[k] = bi; pw[k] = sh_prob[bi]; sum += pw[k]; sh_score[bi] = -1e30f;
+        }
+        const float inv = route_scale / (sum + 1e-20f);
+        for (int k = 0; k < 8; ++k) {
+            topk_idx[k] = sel[k];
+            topk_w[k] = pw[k] * inv;
+            uexp[k] = sel[k];
+            uoff[k] = k;
+            ucnt[k] = 1;
+            pair_list[k] = k;
+        }
+        meta[0] = 8u; meta[1] = 8u;
+        meta[2] = 144u; meta[3] = 8u; meta[4] = 1u;
+        meta[5] = 144u; meta[6] = 8u; meta[7] = 1u;
+        meta[8] = 36u;  meta[9] = 8u; meta[10] = 1u;
     }
 }
 

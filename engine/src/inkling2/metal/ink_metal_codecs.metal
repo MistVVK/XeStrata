@@ -123,7 +123,96 @@ static inline void sk_w8(device const uchar* pl, int j, thread float4& w0, threa
 // 3. Dense Trunk & DSpark Linear Kernels (BF16, Q8_ROW, F32, S_K)
 // ============================================================================
 
-// --- BF16 GEMV for M=1..8 (8 SGs = 256 threads/TG, 4 rows/SG = 32 rows/TG when M==1, 2 rows/SG for M=2..8)
+// --- BF16 GEMV for M==1 (32 rows/TG = 4 rows/SG, vectorized 16-byte ushort4x2 loads for peak M5 Max BW!)
+kernel void ink_linear_bf16_mv1(
+    device const ushort* W [[buffer(0)]],
+    device const float* X  [[buffer(1)]],
+    device float* Y        [[buffer(2)]],
+    constant int& N        [[buffer(3)]],
+    constant int& K        [[buffer(4)]],
+    constant int& M        [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    (void)M;
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int row0 = int(tg) * 32 + int(sg) * 4;
+    if (row0 >= N) return;
+    const bool h1 = (row0 + 1) < N, h2 = (row0 + 2) < N, h3 = (row0 + 3) < N;
+    const int K8 = K >> 3;
+    device const ushort4* w0p = (device const ushort4*)(W + (size_t)row0 * K);
+    device const ushort4* w1p = (device const ushort4*)(W + (size_t)(row0 + (h1 ? 1 : 0)) * K);
+    device const ushort4* w2p = (device const ushort4*)(W + (size_t)(row0 + (h2 ? 2 : 0)) * K);
+    device const ushort4* w3p = (device const ushort4*)(W + (size_t)(row0 + (h3 ? 3 : 0)) * K);
+    device const float4* xp = (device const float4*)X;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int k = int(lane); k < K8; k += 32) {
+        const int k2 = k * 2;
+        const float4 x0 = xp[k2], x1 = xp[k2 + 1];
+        a0 += dot(bf16x4_to_f32(w0p[k2]), x0) + dot(bf16x4_to_f32(w0p[k2 + 1]), x1);
+        if (h1) a1 += dot(bf16x4_to_f32(w1p[k2]), x0) + dot(bf16x4_to_f32(w1p[k2 + 1]), x1);
+        if (h2) a2 += dot(bf16x4_to_f32(w2p[k2]), x0) + dot(bf16x4_to_f32(w2p[k2 + 1]), x1);
+        if (h3) a3 += dot(bf16x4_to_f32(w3p[k2]), x0) + dot(bf16x4_to_f32(w3p[k2 + 1]), x1);
+    }
+    if ((K & 4) != 0 && lane == 0) {
+        const int k2 = K8 * 2;
+        const float4 x0 = xp[k2];
+        a0 += dot(bf16x4_to_f32(w0p[k2]), x0);
+        if (h1) a1 += dot(bf16x4_to_f32(w1p[k2]), x0);
+        if (h2) a2 += dot(bf16x4_to_f32(w2p[k2]), x0);
+        if (h3) a3 += dot(bf16x4_to_f32(w3p[k2]), x0);
+    }
+    const float v0 = simd_sum(a0); if (lane == 0) Y[row0] = v0;
+    if (h1) { const float v1 = simd_sum(a1); if (lane == 0) Y[row0 + 1] = v1; }
+    if (h2) { const float v2 = simd_sum(a2); if (lane == 0) Y[row0 + 2] = v2; }
+    if (h3) { const float v3 = simd_sum(a3); if (lane == 0) Y[row0 + 3] = v3; }
+}
+
+// --- BF16 simdgroup_matrix 8x64 GEMM for M=2..8 (ZERO M-waste for DSpark M=8 verify & draft!)
+kernel void ink_linear_bf16_mm8(
+    device const ushort* W [[buffer(0)]],
+    device const float* X  [[buffer(1)]],
+    device float* Y        [[buffer(2)]],
+    constant int& N        [[buffer(3)]],
+    constant int& K        [[buffer(4)]],
+    constant int& M        [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sA[8 * 32];
+    threadgroup half sB[64 * 32];
+    const int n0 = int(tg) * 64;
+    if (n0 >= N) return;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        const int ar = int(tid >> 5), ac = int(tid & 31u);
+        sA[tid] = (ar < M && k0 + ac < K) ? half(X[(size_t)ar * K + k0 + ac]) : half(0.0h);
+        for (uint idx = tid * 4; idx < 64 * 32; idx += 256 * 4) {
+            const int r = int(idx >> 5), c = int(idx & 31u), gn = n0 + r;
+            if (gn < N && k0 + c + 3 < K)
+                *((threadgroup half4*)(sB + r * 32 + c)) = half4(bf16x4_to_f32(*((device const ushort4*)(W + (size_t)gn * K + k0 + c))));
+            else
+                for (int u = 0; u < 4; ++u) sB[r * 32 + c + u] = (gn < N && k0 + c + u < K) ? half(bf16_to_f32(W[(size_t)gn * K + k0 + c + u])) : half(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < 4; ++kk) {
+            simdgroup_half8x8 a0, b0;
+            simdgroup_load(a0, sA + kk * 8, 32);
+            simdgroup_load(b0, sB + (int(sg) * 8) * 32 + kk * 8, 32, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc, a0, b0, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint qid = lane >> 2;
+    const int gm = int((qid & 4u) + ((lane >> 1) & 3u));
+    const int gn = n0 + int(sg) * 8 + int((qid & 2u) * 2u + (lane & 1u) * 2u);
+    if (gm < M) {
+        if (gn < N) Y[(size_t)gm * N + gn] = acc.thread_elements()[0];
+        if (gn + 1 < N) Y[(size_t)gm * N + gn + 1] = acc.thread_elements()[1];
+    }
+}
+
+// --- BF16 GEMV for M=1..8 (fallback)
 kernel void ink_linear_bf16_mv(
     device const ushort* W [[buffer(0)]],
     device const float* X  [[buffer(1)]],
@@ -181,7 +270,7 @@ kernel void ink_linear_bf16_mv(
     }
 }
 
-// --- BF16 simdgroup_matrix 8x8 GEMM for M > 8 (BM=32, BN=64, BK=32, 8 SGs = 256 threads)
+// --- BF16 simdgroup_matrix 8x8 GEMM for M > 8 (BM=64, BN=64, BK=32, 8 SGs = 256 threads -> 2x W reuse!)
 kernel void ink_linear_bf16_mm(
     device const ushort* W [[buffer(0)]],
     device const float* X  [[buffer(1)]],
@@ -193,20 +282,20 @@ kernel void ink_linear_bf16_mm(
     uint tid  [[thread_index_in_threadgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup half sA[32 * 32];
+    threadgroup half sA[64 * 32];
     threadgroup half sB[64 * 32];
-    const int m0 = int(tgp.y) * 32;
+    const int m0 = int(tgp.y) * 64;
     const int n0 = int(tgp.x) * 64;
     if (m0 >= M || n0 >= N) return;
 
     const int sgm = int(sg >> 2), sgn = int(sg & 3u);
-    simdgroup_float8x8 acc[2][2];
-    for (int i = 0; i < 2; ++i)
+    simdgroup_float8x8 acc[4][2];
+    for (int i = 0; i < 4; ++i)
         for (int j = 0; j < 2; ++j)
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     for (int k0 = 0; k0 < K; k0 += 32) {
-        for (uint idx = tid * 4; idx < 32 * 32; idx += 256 * 4) {
+        for (uint idx = tid * 4; idx < 64 * 32; idx += 256 * 4) {
             const int r = int(idx >> 5), c = int(idx & 31u), gm = m0 + r;
             if (gm < M && k0 + c + 3 < K) {
                 *((threadgroup half4*)(sA + r * 32 + c)) = half4(*((device const float4*)(X + (size_t)gm * K + k0 + c)));
@@ -226,15 +315,21 @@ kernel void ink_linear_bf16_mm(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int kk = 0; kk < 4; ++kk) {
-            simdgroup_half8x8 a0, a1, b0, b1;
-            simdgroup_load(a0, sA + (sgm * 16 + 0) * 32 + kk * 8, 32);
-            simdgroup_load(a1, sA + (sgm * 16 + 8) * 32 + kk * 8, 32);
+            simdgroup_half8x8 a0, a1, a2, a3, b0, b1;
+            simdgroup_load(a0, sA + (sgm * 32 + 0) * 32 + kk * 8, 32);
+            simdgroup_load(a1, sA + (sgm * 32 + 8) * 32 + kk * 8, 32);
+            simdgroup_load(a2, sA + (sgm * 32 + 16) * 32 + kk * 8, 32);
+            simdgroup_load(a3, sA + (sgm * 32 + 24) * 32 + kk * 8, 32);
             simdgroup_load(b0, sB + (sgn * 16 + 0) * 32 + kk * 8, 32, ulong2(0, 0), true);
             simdgroup_load(b1, sB + (sgn * 16 + 8) * 32 + kk * 8, 32, ulong2(0, 0), true);
             simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
             simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
             simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
             simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
+            simdgroup_multiply_accumulate(acc[2][0], a2, b0, acc[2][0]);
+            simdgroup_multiply_accumulate(acc[2][1], a2, b1, acc[2][1]);
+            simdgroup_multiply_accumulate(acc[3][0], a3, b0, acc[3][0]);
+            simdgroup_multiply_accumulate(acc[3][1], a3, b1, acc[3][1]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -242,8 +337,8 @@ kernel void ink_linear_bf16_mm(
     const uint qid = lane >> 2;
     const uint fm = (qid & 4u) + ((lane >> 1) & 3u);
     const uint fn = (qid & 2u) * 2u + (lane & 1u) * 2u;
-    for (int i = 0; i < 2; ++i) {
-        const int gm = m0 + sgm * 16 + i * 8 + int(fm);
+    for (int i = 0; i < 4; ++i) {
+        const int gm = m0 + sgm * 32 + i * 8 + int(fm);
         if (gm < M) {
             for (int j = 0; j < 2; ++j) {
                 const int gn = n0 + sgn * 16 + j * 8 + int(fn);
@@ -254,7 +349,271 @@ kernel void ink_linear_bf16_mm(
     }
 }
 
-// --- Q8_ROW GEMV for M=1..8 (vectorized char4, specialized M==1 fast path!)
+// --- Q8_ROW GEMV for M==1 (32 rows/TG = 4 rows/SG, vectorized 16-byte char4x4 loads!)
+kernel void ink_linear_q8row_mv1(
+    device const uchar* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* Y       [[buffer(2)]],
+    constant int& N       [[buffer(3)]],
+    constant int& K       [[buffer(4)]],
+    constant int& M       [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    (void)M;
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int row0 = int(tg) * 32 + int(sg) * 4;
+    if (row0 >= N) return;
+    const bool h1 = (row0 + 1) < N, h2 = (row0 + 2) < N, h3 = (row0 + 3) < N;
+    device const float* scales = (device const float*)W;
+    const float sc0 = scales[row0], sc1 = h1 ? scales[row0 + 1] : 0.0f;
+    const float sc2 = h2 ? scales[row0 + 2] : 0.0f, sc3 = h3 ? scales[row0 + 3] : 0.0f;
+    device const uchar* qbase = W + (size_t)N * 4;
+    device const char4* q0p = (device const char4*)(qbase + (size_t)row0 * K);
+    device const char4* q1p = (device const char4*)(qbase + (size_t)(row0 + (h1 ? 1 : 0)) * K);
+    device const char4* q2p = (device const char4*)(qbase + (size_t)(row0 + (h2 ? 2 : 0)) * K);
+    device const char4* q3p = (device const char4*)(qbase + (size_t)(row0 + (h3 ? 3 : 0)) * K);
+    device const float4* xp = (device const float4*)X;
+    const int K16 = K >> 4;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int k = int(lane); k < K16; k += 32) {
+        const int k4 = k * 4;
+        const float4 x0 = xp[k4], x1 = xp[k4 + 1], x2 = xp[k4 + 2], x3 = xp[k4 + 3];
+        a0 += dot(float4(q0p[k4]), x0) + dot(float4(q0p[k4 + 1]), x1) + dot(float4(q0p[k4 + 2]), x2) + dot(float4(q0p[k4 + 3]), x3);
+        if (h1) a1 += dot(float4(q1p[k4]), x0) + dot(float4(q1p[k4 + 1]), x1) + dot(float4(q1p[k4 + 2]), x2) + dot(float4(q1p[k4 + 3]), x3);
+        if (h2) a2 += dot(float4(q2p[k4]), x0) + dot(float4(q2p[k4 + 1]), x1) + dot(float4(q2p[k4 + 2]), x2) + dot(float4(q2p[k4 + 3]), x3);
+        if (h3) a3 += dot(float4(q3p[k4]), x0) + dot(float4(q3p[k4 + 1]), x1) + dot(float4(q3p[k4 + 2]), x2) + dot(float4(q3p[k4 + 3]), x3);
+    }
+    const float v0 = simd_sum(a0) * sc0; if (lane == 0) Y[row0] = v0;
+    if (h1) { const float v1 = simd_sum(a1) * sc1; if (lane == 0) Y[row0 + 1] = v1; }
+    if (h2) { const float v2 = simd_sum(a2) * sc2; if (lane == 0) Y[row0 + 2] = v2; }
+    if (h3) { const float v3 = simd_sum(a3) * sc3; if (lane == 0) Y[row0 + 3] = v3; }
+}
+
+// --- Q8_ROW simdgroup_matrix 8x64 GEMM for M=2..8
+kernel void ink_linear_q8row_mm8(
+    device const uchar* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* Y       [[buffer(2)]],
+    constant int& N       [[buffer(3)]],
+    constant int& K       [[buffer(4)]],
+    constant int& M       [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sA[8 * 32];
+    threadgroup half sB[64 * 32];
+    const int n0 = int(tg) * 64;
+    if (n0 >= N) return;
+    device const float* scales = (device const float*)W;
+    device const char* qw = (device const char*)(W + (size_t)N * 4);
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        const int ar = int(tid >> 5), ac = int(tid & 31u);
+        sA[tid] = (ar < M && k0 + ac < K) ? half(X[(size_t)ar * K + k0 + ac]) : half(0.0h);
+        for (uint idx = tid * 4; idx < 64 * 32; idx += 256 * 4) {
+            const int r = int(idx >> 5), c = int(idx & 31u), gn = n0 + r;
+            if (gn < N && k0 + c + 3 < K)
+                *((threadgroup half4*)(sB + r * 32 + c)) = half4(float4(*((device const char4*)(qw + (size_t)gn * K + k0 + c))));
+            else
+                for (int u = 0; u < 4; ++u) sB[r * 32 + c + u] = (gn < N && k0 + c + u < K) ? half(float(qw[(size_t)gn * K + k0 + c + u])) : half(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < 4; ++kk) {
+            simdgroup_half8x8 a0, b0;
+            simdgroup_load(a0, sA + kk * 8, 32);
+            simdgroup_load(b0, sB + (int(sg) * 8) * 32 + kk * 8, 32, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc, a0, b0, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint qid = lane >> 2;
+    const int gm = int((qid & 4u) + ((lane >> 1) & 3u));
+    const int gn = n0 + int(sg) * 8 + int((qid & 2u) * 2u + (lane & 1u) * 2u);
+    if (gm < M) {
+        if (gn < N) Y[(size_t)gm * N + gn] = acc.thread_elements()[0] * scales[gn];
+        if (gn + 1 < N) Y[(size_t)gm * N + gn + 1] = acc.thread_elements()[1] * scales[gn + 1];
+    }
+}
+
+// --- Fused Unembed + Per-TG Argmax (ZERO 800 KB bd_logits DRAM write/read for DSpark Markov steps!)
+kernel void ink_unembed_argmax_q8row(
+    device const uchar* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* part_v  [[buffer(2)]],
+    device int* part_i    [[buffer(3)]],
+    constant int& N       [[buffer(4)]],
+    constant int& K       [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[8];
+    threadgroup int sh_i[8];
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int row0 = int(tg) * 32 + int(sg) * 4;
+    float bv = -1e30f; int bi = 0;
+    if (row0 < N) {
+        const bool h1 = (row0 + 1) < N, h2 = (row0 + 2) < N, h3 = (row0 + 3) < N;
+        device const float* scales = (device const float*)W;
+        device const uchar* qbase = W + (size_t)N * 4;
+        device const char4* q0p = (device const char4*)(qbase + (size_t)row0 * K);
+        device const char4* q1p = (device const char4*)(qbase + (size_t)(row0 + (h1 ? 1 : 0)) * K);
+        device const char4* q2p = (device const char4*)(qbase + (size_t)(row0 + (h2 ? 2 : 0)) * K);
+        device const char4* q3p = (device const char4*)(qbase + (size_t)(row0 + (h3 ? 3 : 0)) * K);
+        device const float4* xp = (device const float4*)X;
+        const int K16 = K >> 4;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (int k = int(lane); k < K16; k += 32) {
+            const int k4 = k * 4;
+            const float4 x0 = xp[k4], x1 = xp[k4 + 1], x2 = xp[k4 + 2], x3 = xp[k4 + 3];
+            a0 += dot(float4(q0p[k4]), x0) + dot(float4(q0p[k4 + 1]), x1) + dot(float4(q0p[k4 + 2]), x2) + dot(float4(q0p[k4 + 3]), x3);
+            if (h1) a1 += dot(float4(q1p[k4]), x0) + dot(float4(q1p[k4 + 1]), x1) + dot(float4(q1p[k4 + 2]), x2) + dot(float4(q1p[k4 + 3]), x3);
+            if (h2) a2 += dot(float4(q2p[k4]), x0) + dot(float4(q2p[k4 + 1]), x1) + dot(float4(q2p[k4 + 2]), x2) + dot(float4(q2p[k4 + 3]), x3);
+            if (h3) a3 += dot(float4(q3p[k4]), x0) + dot(float4(q3p[k4 + 1]), x1) + dot(float4(q3p[k4 + 2]), x2) + dot(float4(q3p[k4 + 3]), x3);
+        }
+        const float v0 = simd_sum(a0) * scales[row0];
+        bv = v0; bi = row0;
+        if (h1) { const float v1 = simd_sum(a1) * scales[row0 + 1]; if (v1 > bv) { bv = v1; bi = row0 + 1; } }
+        if (h2) { const float v2 = simd_sum(a2) * scales[row0 + 2]; if (v2 > bv) { bv = v2; bi = row0 + 2; } }
+        if (h3) { const float v3 = simd_sum(a3) * scales[row0 + 3]; if (v3 > bv) { bv = v3; bi = row0 + 3; } }
+    }
+    if (lane == 0) { sh_v[sg] = bv; sh_i[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tv = sh_v[0]; int ti = sh_i[0];
+        for (int s = 1; s < 8; ++s) {
+            if (sh_v[s] > tv || (sh_v[s] == tv && sh_i[s] < ti)) { tv = sh_v[s]; ti = sh_i[s]; }
+        }
+        part_v[tg] = tv; part_i[tg] = ti;
+    }
+}
+
+kernel void ink_unembed_argmax_bf16(
+    device const ushort* W [[buffer(0)]],
+    device const float* X  [[buffer(1)]],
+    device float* part_v   [[buffer(2)]],
+    device int* part_i     [[buffer(3)]],
+    constant int& N        [[buffer(4)]],
+    constant int& K        [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[8];
+    threadgroup int sh_i[8];
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int row0 = int(tg) * 32 + int(sg) * 4;
+    float bv = -1e30f; int bi = 0;
+    if (row0 < N) {
+        const bool h1 = (row0 + 1) < N, h2 = (row0 + 2) < N, h3 = (row0 + 3) < N;
+        device const ushort4* w0p = (device const ushort4*)(W + (size_t)row0 * K);
+        device const ushort4* w1p = (device const ushort4*)(W + (size_t)(row0 + (h1 ? 1 : 0)) * K);
+        device const ushort4* w2p = (device const ushort4*)(W + (size_t)(row0 + (h2 ? 2 : 0)) * K);
+        device const ushort4* w3p = (device const ushort4*)(W + (size_t)(row0 + (h3 ? 3 : 0)) * K);
+        device const float4* xp = (device const float4*)X;
+        const int K8 = K >> 3;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (int k = int(lane); k < K8; k += 32) {
+            const int k2 = k * 2;
+            const float4 x0 = xp[k2], x1 = xp[k2 + 1];
+            a0 += dot(bf16x4_to_f32(w0p[k2]), x0) + dot(bf16x4_to_f32(w0p[k2 + 1]), x1);
+            if (h1) a1 += dot(bf16x4_to_f32(w1p[k2]), x0) + dot(bf16x4_to_f32(w1p[k2 + 1]), x1);
+            if (h2) a2 += dot(bf16x4_to_f32(w2p[k2]), x0) + dot(bf16x4_to_f32(w2p[k2 + 1]), x1);
+            if (h3) a3 += dot(bf16x4_to_f32(w3p[k2]), x0) + dot(bf16x4_to_f32(w3p[k2 + 1]), x1);
+        }
+        bv = simd_sum(a0); bi = row0;
+        if (h1) { const float v1 = simd_sum(a1); if (v1 > bv) { bv = v1; bi = row0 + 1; } }
+        if (h2) { const float v2 = simd_sum(a2); if (v2 > bv) { bv = v2; bi = row0 + 2; } }
+        if (h3) { const float v3 = simd_sum(a3); if (v3 > bv) { bv = v3; bi = row0 + 3; } }
+    }
+    if (lane == 0) { sh_v[sg] = bv; sh_i[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tv = sh_v[0]; int ti = sh_i[0];
+        for (int s = 1; s < 8; ++s) {
+            if (sh_v[s] > tv || (sh_v[s] == tv && sh_i[s] < ti)) { tv = sh_v[s]; ti = sh_i[s]; }
+        }
+        part_v[tg] = tv; part_i[tg] = ti;
+    }
+}
+
+kernel void ink_unembed_argmax_sk6(
+    device const uchar* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* part_v  [[buffer(2)]],
+    device int* part_i    [[buffer(3)]],
+    constant int& N       [[buffer(4)]],
+    constant int& K       [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[8];
+    threadgroup int sh_i[8];
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int row0 = int(tg) * 16 + int(sg) * 2;
+    float bv = -1e30f; int bi = 0;
+    if (row0 < N) {
+        const bool h1 = (row0 + 1) < N;
+        constexpr int SB = 198;
+        const int nsb = K >> 8;
+        const size_t rowb = (size_t)nsb * SB;
+        device const uchar* r0 = W + (size_t)row0 * rowb;
+        device const uchar* r1 = h1 ? (r0 + rowb) : r0;
+        float a0 = 0.0f, a1 = 0.0f;
+        for (int unit = int(lane); unit < nsb * 32; unit += 32) {
+            const int sbi = unit >> 5, u = unit & 31, g = u >> 3, j = (g << 6) + ((u & 7) << 3);
+            device const float4* xp = (device const float4*)(X + sbi * 256 + j);
+            const float4 x0 = xp[0], x1 = xp[1];
+            {
+                device const uchar* blk = r0 + (size_t)sbi * SB;
+                const float eff = float(as_type<half>(ld16(blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
+                float4 w0, w1; sk_w8<6>(blk + 6, j, w0, w1);
+                a0 = fma(eff, dot(w0, x0) + dot(w1, x1), a0);
+            }
+            if (h1) {
+                device const uchar* blk = r1 + (size_t)sbi * SB;
+                const float eff = float(as_type<half>(ld16(blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
+                float4 w0, w1; sk_w8<6>(blk + 6, j, w0, w1);
+                a1 = fma(eff, dot(w0, x0) + dot(w1, x1), a1);
+            }
+        }
+        bv = simd_sum(a0); bi = row0;
+        if (h1) { const float v1 = simd_sum(a1); if (v1 > bv) { bv = v1; bi = row0 + 1; } }
+    }
+    if (lane == 0) { sh_v[sg] = bv; sh_i[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tv = sh_v[0]; int ti = sh_i[0];
+        for (int s = 1; s < 8; ++s) {
+            if (sh_v[s] > tv || (sh_v[s] == tv && sh_i[s] < ti)) { tv = sh_v[s]; ti = sh_i[s]; }
+        }
+        part_v[tg] = tv; part_i[tg] = ti;
+    }
+}
+
+kernel void ink_argmax_part_reduce(
+    device const float* part_v [[buffer(0)]],
+    device const int* part_i   [[buffer(1)]],
+    device int* out_id         [[buffer(2)]],
+    constant int& n_parts      [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[256];
+    threadgroup int sh_i[256];
+    float bv = -1e30f; int bi = 0;
+    for (int i = int(tid); i < n_parts; i += 256) {
+        const float v = part_v[i]; const int idx = part_i[i];
+        if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
+    }
+    sh_v[tid] = bv; sh_i[tid] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sh_v[tid + s] > sh_v[tid] || (sh_v[tid + s] == sh_v[tid] && sh_i[tid + s] < sh_i[tid])) {
+                sh_v[tid] = sh_v[tid + s]; sh_i[tid] = sh_i[tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) out_id[0] = sh_i[0];
+}
+
+// --- Q8_ROW GEMV for M=1..8 (fallback)
 kernel void ink_linear_q8row_mv(
     device const uchar* W [[buffer(0)]],
     device const float* X [[buffer(1)]],
@@ -383,7 +742,72 @@ kernel void ink_linear_q8row_mm(
     }
 }
 
-// --- F32 Linear
+// --- F32 simdgroup_matrix 8x8 GEMM for M > 8 (prefill controllers, sinks, dynamic sconv projs!)
+kernel void ink_linear_f32_mm(
+    device const float* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* Y       [[buffer(2)]],
+    constant int& N       [[buffer(3)]],
+    constant int& K       [[buffer(4)]],
+    constant int& M       [[buffer(5)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sA[32 * 32];
+    threadgroup half sB[64 * 32];
+    const int m0 = int(tgp.y) * 32, n0 = int(tgp.x) * 64;
+    if (m0 >= M || n0 >= N) return;
+    const int sgm = int(sg >> 2), sgn = int(sg & 3u);
+    simdgroup_float8x8 acc[2][2];
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        for (uint idx = tid * 4; idx < 32 * 32; idx += 256 * 4) {
+            const int r = int(idx >> 5), c = int(idx & 31u), gm = m0 + r;
+            if (gm < M && k0 + c + 3 < K)
+                *((threadgroup half4*)(sA + r * 32 + c)) = half4(*((device const float4*)(X + (size_t)gm * K + k0 + c)));
+            else
+                for (int u = 0; u < 4; ++u) sA[r * 32 + c + u] = (gm < M && k0 + c + u < K) ? half(X[(size_t)gm * K + k0 + c + u]) : half(0.0h);
+        }
+        for (uint idx = tid * 4; idx < 64 * 32; idx += 256 * 4) {
+            const int r = int(idx >> 5), c = int(idx & 31u), gn = n0 + r;
+            if (gn < N && k0 + c + 3 < K)
+                *((threadgroup half4*)(sB + r * 32 + c)) = half4(*((device const float4*)(W + (size_t)gn * K + k0 + c)));
+            else
+                for (int u = 0; u < 4; ++u) sB[r * 32 + c + u] = (gn < N && k0 + c + u < K) ? half(W[(size_t)gn * K + k0 + c + u]) : half(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < 4; ++kk) {
+            simdgroup_half8x8 a0, a1, b0, b1;
+            simdgroup_load(a0, sA + (sgm * 16 + 0) * 32 + kk * 8, 32);
+            simdgroup_load(a1, sA + (sgm * 16 + 8) * 32 + kk * 8, 32);
+            simdgroup_load(b0, sB + (sgn * 16 + 0) * 32 + kk * 8, 32, ulong2(0, 0), true);
+            simdgroup_load(b1, sB + (sgn * 16 + 8) * 32 + kk * 8, 32, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
+            simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint qid = lane >> 2;
+    const uint fm = (qid & 4u) + ((lane >> 1) & 3u);
+    const uint fn = (qid & 2u) * 2u + (lane & 1u) * 2u;
+    for (int i = 0; i < 2; ++i) {
+        const int gm = m0 + sgm * 16 + i * 8 + int(fm);
+        if (gm < M) {
+            for (int j = 0; j < 2; ++j) {
+                const int gn = n0 + sgn * 16 + j * 8 + int(fn);
+                if (gn < N) Y[(size_t)gm * N + gn] = acc[i][j].thread_elements()[0];
+                if (gn + 1 < N) Y[(size_t)gm * N + gn + 1] = acc[i][j].thread_elements()[1];
+            }
+        }
+    }
+}
+
+// --- F32 Linear (exact FP32 for M<=8 and router! 4 rows/TG = 128 threads -> 32-48 TGs saturating all 40 M5 Max cores!)
 kernel void ink_linear_f32(
     device const float* W [[buffer(0)]],
     device const float* X [[buffer(1)]],
@@ -394,20 +818,25 @@ kernel void ink_linear_f32(
     uint tg   [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]]) {
     const uint sg = tid >> 5, lane = tid & 31;
-    const int row = int(tg) * 8 + int(sg);
+    const int row = int(tg) * 4 + int(sg);
     if (row >= N) return;
     device const float* wp = W + (size_t)row * K;
     const int K4 = K >> 2;
+    if (M == 1) {
+        float acc = 0.0f;
+        device const float4* w4 = (device const float4*)wp;
+        device const float4* x4 = (device const float4*)X;
+        for (int k = int(lane); k < K4; k += 32) acc += dot(w4[k], x4[k]);
+        const float v = simd_sum(acc);
+        if (lane == 0) Y[row] = v;
+        return;
+    }
     for (int m0 = 0; m0 < M; m0 += 4) {
         const int mm = min(4, M - m0);
         float a[4] = {0, 0, 0, 0};
         for (int k = int(lane); k < K4; k += 32) {
             const float4 wv = ((device const float4*)wp)[k];
             for (int i = 0; i < mm; ++i) a[i] += dot(wv, ((device const float4*)(X + (size_t)(m0 + i) * K))[k]);
-        }
-        for (int k = K4 * 4 + int(lane); k < K; k += 32) {
-            const float wv = wp[k];
-            for (int i = 0; i < mm; ++i) a[i] += wv * X[(size_t)(m0 + i) * K + k];
         }
         for (int i = 0; i < mm; ++i) {
             const float v = simd_sum(a[i]);
@@ -503,6 +932,61 @@ kernel void ink_linear_sk_mv(
 #define INK_LINSK(F) template [[host_name("ink_linear_sk_mv_" #F)]] kernel void ink_linear_sk_mv<F>(device const uchar*, device const float*, device float*, constant int&, constant int&, constant int&, uint, uint);
 INK_LINSK(2) INK_LINSK(3) INK_LINSK(4) INK_LINSK(5) INK_LINSK(6) INK_LINSK(8)
 
+// --- S6_K simdgroup_matrix 8x64 GEMM for M=2..8 (single DRAM pass on SQ-15/SQ-10 DSpark M=8 verify unembed!)
+kernel void ink_linear_sk6_mm8(
+    device const uchar* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* Y       [[buffer(2)]],
+    constant int& N       [[buffer(3)]],
+    constant int& K       [[buffer(4)]],
+    constant int& M       [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sA[8 * 32];
+    threadgroup half sB[64 * 32];
+    const int n0 = int(tg) * 64;
+    if (n0 >= N) return;
+    constexpr int SB = 198;
+    const size_t rowb = (size_t)(K >> 8) * SB;
+    const int br = int(tid >> 2), bc = int((tid & 3u) * 8u);
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        const int ar = int(tid >> 5), ac = int(tid & 31u);
+        sA[tid] = (ar < M && k0 + ac < K) ? half(X[(size_t)ar * K + k0 + ac]) : half(0.0h);
+        const int gn = n0 + br;
+        if (gn < N) {
+            const int col = k0 + bc;
+            const int sbi = col >> 8, j = col & 255, g = j >> 6;
+            device const uchar* blk = W + (size_t)gn * rowb + (size_t)sbi * SB;
+            const float eff = float(as_type<half>(ld16(blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
+            float4 w0, w1;
+            sk_w8<6>(blk + 6, j, w0, w1);
+            *((threadgroup half4*)(sB + br * 32 + bc + 0)) = half4(w0 * eff);
+            *((threadgroup half4*)(sB + br * 32 + bc + 4)) = half4(w1 * eff);
+        } else {
+            *((threadgroup half4*)(sB + br * 32 + bc + 0)) = half4(0.0h);
+            *((threadgroup half4*)(sB + br * 32 + bc + 4)) = half4(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < 4; ++kk) {
+            simdgroup_half8x8 a0, b0;
+            simdgroup_load(a0, sA + kk * 8, 32);
+            simdgroup_load(b0, sB + (int(sg) * 8) * 32 + kk * 8, 32, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc, a0, b0, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint qid = lane >> 2;
+    const int gm = int((qid & 4u) + ((lane >> 1) & 3u));
+    const int gn = n0 + int(sg) * 8 + int((qid & 2u) * 2u + (lane & 1u) * 2u);
+    if (gm < M) {
+        if (gn < N) Y[(size_t)gm * N + gn] = acc.thread_elements()[0];
+        if (gn + 1 < N) Y[(size_t)gm * N + gn + 1] = acc.thread_elements()[1];
+    }
+}
+
 // ============================================================================
 // 4. Inkling-2-Mini MoE Pipeline (Register-Only Decoders + 8-Token Micro-Batching!)
 // ============================================================================
@@ -523,31 +1007,41 @@ kernel void ink_moe_plan(
     device int* ucnt           [[buffer(4)]],
     device int* pair_list      [[buffer(5)]],
     device uint* meta          [[buffer(6)]],
+    device uint2* tiles        [[buffer(7)]],
     uint e    [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]]) {
     threadgroup int sg_u[4];
     threadgroup int sg_p[4];
+    threadgroup int sg_t[4];
     int c = 0;
     for (int i = 0; i < P; ++i) if (topk_idx[i] == int(e)) ++c;
     const int has = c > 0 ? 1 : 0;
+    const int nt = (c + 31) >> 5;
     const int ex_u = simd_prefix_exclusive_sum(has);
     const int ex_p = simd_prefix_exclusive_sum(c);
-    if (lane == 31) { sg_u[sg] = ex_u + has; sg_p[sg] = ex_p + c; }
+    const int ex_t = simd_prefix_exclusive_sum(nt);
+    if (lane == 31) { sg_u[sg] = ex_u + has; sg_p[sg] = ex_p + c; sg_t[sg] = ex_t + nt; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    int base_u = 0, base_p = 0;
-    for (uint w = 0; w < sg; ++w) { base_u += sg_u[w]; base_p += sg_p[w]; }
-    const int pos_u = base_u + ex_u, pos_p = base_p + ex_p;
+    int base_u = 0, base_p = 0, base_t = 0;
+    for (uint w = 0; w < sg; ++w) { base_u += sg_u[w]; base_p += sg_p[w]; base_t += sg_t[w]; }
+    const int pos_u = base_u + ex_u, pos_p = base_p + ex_p, pos_t = base_t + ex_t;
     if (has) {
         uexp[pos_u] = int(e); uoff[pos_u] = pos_p; ucnt[pos_u] = c;
         int k = 0;
         for (int i = 0; i < P; ++i) if (topk_idx[i] == int(e)) pair_list[pos_p + k++] = i;
+        for (int ti = 0; ti < nt; ++ti) {
+            const int rem = min(32, c - ti * 32);
+            tiles[pos_t + ti] = uint2((e << 16) | uint(rem), uint(pos_p + ti * 32));
+        }
     }
     if (e == 127) {
         const uint n_uniq = uint(base_u + ex_u + has);
+        const uint n_tiles = uint(base_t + ex_t + nt);
         meta[0] = n_uniq; meta[1] = uint(P);
         meta[2] = 144u; meta[3] = n_uniq; meta[4] = 1u;
         meta[5] = 144u; meta[6] = n_uniq; meta[7] = 1u;
+        meta[8] = 36u;  meta[9] = n_tiles; meta[10] = 1u;  // Flattened parallel (expert, m_tile) BM=32 BN=64 BK=64!
     }
 }
 
@@ -844,7 +1338,7 @@ kernel void ink_moe_reduce8(
     moe_out[(size_t)m * 2304 + d] = s;
 }
 
-// ---- Low-Register Specialized SF4 & MX8 MoE Shaders (high occupancy on Apple Silicon for SQ-20!) ----
+// ---- Low-Register Specialized SF4 & MX8 MoE Shaders (n==1 fast path + single-pass n<=8 verify!) ----
 kernel void ink_moe_gu_sf4(
     device const uchar* sec4        [[buffer(0)]],
     device const InkExpertDev* ex   [[buffer(1)]],
@@ -864,11 +1358,19 @@ kernel void ink_moe_gu_sf4(
     if (r >= 1152) return;
     const int e = uexp[y], off = uoff[y], n = ucnt[y];
     device const uchar* body = sec4 + ex[e].body_off;
-    for (int t0 = 0; t0 < n; t0 += 4) {
-        const int mm = min(4, n - t0);
-        int pid[4], tk[4];
+    if (n == 1) {
+        const int pid0 = pair_list[off], tk0 = pid0 >> 3;
+        float ag0 = 0.0f, au0 = 0.0f;
+        sf4_w13_chunk(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
+        const float g = simd_sum(ag0), u = simd_sum(au0);
+        if (lane == 0) h_act[(size_t)pid0 * 1152 + r] = situ_act(g, u);
+        return;
+    }
+    for (int t0 = 0; t0 < n; t0 += 8) {
+        const int mm = min(8, n - t0);
+        int pid[8], tk[8];
         for (int i = 0; i < mm; ++i) { pid[i] = pair_list[off + t0 + i]; tk[i] = pid[i] >> 3; }
-        float ag[4] = {0,0,0,0}, au[4] = {0,0,0,0};
+        float ag[8] = {0,0,0,0,0,0,0,0}, au[8] = {0,0,0,0,0,0,0,0};
         sf4_w13_chunk(body, r, x_in, tk, mm, int(lane), ag, au);
         for (int i = 0; i < mm; ++i) {
             const float g = simd_sum(ag[i]), u = simd_sum(au[i]);
@@ -898,11 +1400,23 @@ kernel void ink_moe_dn_sf4(
     const int e = uexp[yy], off = uoff[yy], n = ucnt[yy];
     const InkExpertDev ed = ex[e];
     device const uchar* body = sec4 + ed.body_off;
-    for (int t0 = 0; t0 < n; t0 += 4) {
-        const int mm = min(4, n - t0);
-        int pid[4];
+    if (n == 1) {
+        const int pid0 = pair_list[off];
+        float a0 = 0.0f, a1 = 0.0f;
+        sf4_w2_pair(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane), &a0, &a1);
+        const float v0 = simd_sum(a0), v1 = simd_sum(a1);
+        if (lane == 0) {
+            const float rw = topk_w[pid0];
+            y_pairs[(size_t)pid0 * 2304 + 2 * rp]     = v0 * rw;
+            y_pairs[(size_t)pid0 * 2304 + 2 * rp + 1] = v1 * rw;
+        }
+        return;
+    }
+    for (int t0 = 0; t0 < n; t0 += 8) {
+        const int mm = min(8, n - t0);
+        int pid[8];
         for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
-        float a0[4] = {0,0,0,0}, a1[4] = {0,0,0,0};
+        float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
         sf4_w2_pair(body, ed.dn_off, rp, h_act, pid, mm, int(lane), a0, a1);
         for (int i = 0; i < mm; ++i) {
             const float v0 = simd_sum(a0[i]), v1 = simd_sum(a1[i]);
@@ -934,11 +1448,19 @@ kernel void ink_moe_gu_mx8(
     if (r >= 1152) return;
     const int e = uexp[y], off = uoff[y], n = ucnt[y];
     device const uchar* body = sec4 + ex[e].body_off;
-    for (int t0 = 0; t0 < n; t0 += 4) {
-        const int mm = min(4, n - t0);
-        int pid[4], tk[4];
+    if (n == 1) {
+        const int pid0 = pair_list[off], tk0 = pid0 >> 3;
+        float ag0 = 0.0f, au0 = 0.0f;
+        mx8_w13_chunk(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
+        const float g = simd_sum(ag0), u = simd_sum(au0);
+        if (lane == 0) h_act[(size_t)pid0 * 1152 + r] = situ_act(g, u);
+        return;
+    }
+    for (int t0 = 0; t0 < n; t0 += 8) {
+        const int mm = min(8, n - t0);
+        int pid[8], tk[8];
         for (int i = 0; i < mm; ++i) { pid[i] = pair_list[off + t0 + i]; tk[i] = pid[i] >> 3; }
-        float ag[4] = {0,0,0,0}, au[4] = {0,0,0,0};
+        float ag[8] = {0,0,0,0,0,0,0,0}, au[8] = {0,0,0,0,0,0,0,0};
         mx8_w13_chunk(body, r, x_in, tk, mm, int(lane), ag, au);
         for (int i = 0; i < mm; ++i) {
             const float g = simd_sum(ag[i]), u = simd_sum(au[i]);
@@ -968,11 +1490,23 @@ kernel void ink_moe_dn_mx8(
     const int e = uexp[yy], off = uoff[yy], n = ucnt[yy];
     const InkExpertDev ed = ex[e];
     device const uchar* body = sec4 + ed.body_off;
-    for (int t0 = 0; t0 < n; t0 += 4) {
-        const int mm = min(4, n - t0);
-        int pid[4];
+    if (n == 1) {
+        const int pid0 = pair_list[off];
+        float a0 = 0.0f, a1 = 0.0f;
+        mx8_w2_pair(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane), &a0, &a1);
+        const float v0 = simd_sum(a0), v1 = simd_sum(a1);
+        if (lane == 0) {
+            const float rw = topk_w[pid0];
+            y_pairs[(size_t)pid0 * 2304 + 2 * rp]     = v0 * rw;
+            y_pairs[(size_t)pid0 * 2304 + 2 * rp + 1] = v1 * rw;
+        }
+        return;
+    }
+    for (int t0 = 0; t0 < n; t0 += 8) {
+        const int mm = min(8, n - t0);
+        int pid[8];
         for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
-        float a0[4] = {0,0,0,0}, a1[4] = {0,0,0,0};
+        float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
         mx8_w2_pair(body, ed.dn_off, rp, h_act, pid, mm, int(lane), a0, a1);
         for (int i = 0; i < mm; ++i) {
             const float v0 = simd_sum(a0[i]), v1 = simd_sum(a1[i]);
@@ -982,5 +1516,667 @@ kernel void ink_moe_dn_mx8(
                 y_pairs[(size_t)pid[i] * 2304 + 2 * rp + 1] = v1 * rw;
             }
         }
+    }
+}
+
+// ============================================================================
+// 5. Grouped-Expert simdgroup_matrix 8x8 MoE GEMM (BM=16, BN=64, BK=64)
+//    Indirect grid: (36, n_uniq, 1) -> 36 * 64 = 2304 rows, 256 threads (8 SGs)
+//    - BK=64: 1 full 16-elem SF4 block (uint2 + 1 scale) per thread -> 2x cache-line BW, 2x fewer barriers!
+//    - BM=16: zero wasted M-rows for P=256 (avg n=16), half the accumulators (2 vs 4) -> 2x occupancy!
+//    - Epilogue fuses SITU(el[0]=gate, el[1]=up) directly in registers!
+// ============================================================================
+
+static inline void decode_sb_sf4_16(device const uchar* p_base, device const uchar* s_base, float outer,
+                                    int row_bytes, int s_row_bytes, int gn, int k0, int b_idx, threadgroup half* dst) {
+    const int blk = (k0 >> 4) + b_idx;
+    const float sc = e4m3_to_f32(s_base[(size_t)gn * s_row_bytes + blk]) * outer;
+    const uint2 w8 = *((device const uint2*)(p_base + (size_t)gn * row_bytes + blk * 8));
+    *((threadgroup half4*)(dst + 0))  = half4(kE2M1[w8.x & 15u] * sc, kE2M1[(w8.x >> 4) & 15u] * sc,
+                                              kE2M1[(w8.x >> 8) & 15u] * sc, kE2M1[(w8.x >> 12) & 15u] * sc);
+    *((threadgroup half4*)(dst + 4))  = half4(kE2M1[(w8.x >> 16) & 15u] * sc, kE2M1[(w8.x >> 20) & 15u] * sc,
+                                              kE2M1[(w8.x >> 24) & 15u] * sc, kE2M1[w8.x >> 28] * sc);
+    *((threadgroup half4*)(dst + 8))  = half4(kE2M1[w8.y & 15u] * sc, kE2M1[(w8.y >> 4) & 15u] * sc,
+                                              kE2M1[(w8.y >> 8) & 15u] * sc, kE2M1[(w8.y >> 12) & 15u] * sc);
+    *((threadgroup half4*)(dst + 12)) = half4(kE2M1[(w8.y >> 16) & 15u] * sc, kE2M1[(w8.y >> 20) & 15u] * sc,
+                                              kE2M1[(w8.y >> 24) & 15u] * sc, kE2M1[w8.y >> 28] * sc);
+}
+
+static inline void decode_sb_mx8_16(device const uchar* w_base, device const uchar* s_base,
+                                    int row_bytes, int s_row_bytes, int gn, int k0, int b_idx, threadgroup half* dst) {
+    const int col = k0 + b_idx * 16;
+    const float sc = ue8m0_to_f32(s_base[(size_t)gn * s_row_bytes + (col >> 5)]);
+    const uint4 ww = *((device const uint4*)(w_base + (size_t)gn * row_bytes + col));
+    *((threadgroup half4*)(dst + 0))  = half4(e4m3_to_f32(ww.x & 255u) * sc, e4m3_to_f32((ww.x >> 8) & 255u) * sc,
+                                              e4m3_to_f32((ww.x >> 16) & 255u) * sc, e4m3_to_f32(ww.x >> 24) * sc);
+    *((threadgroup half4*)(dst + 4))  = half4(e4m3_to_f32(ww.y & 255u) * sc, e4m3_to_f32((ww.y >> 8) & 255u) * sc,
+                                              e4m3_to_f32((ww.y >> 16) & 255u) * sc, e4m3_to_f32(ww.y >> 24) * sc);
+    *((threadgroup half4*)(dst + 8))  = half4(e4m3_to_f32(ww.z & 255u) * sc, e4m3_to_f32((ww.z >> 8) & 255u) * sc,
+                                              e4m3_to_f32((ww.z >> 16) & 255u) * sc, e4m3_to_f32(ww.z >> 24) * sc);
+    *((threadgroup half4*)(dst + 12)) = half4(e4m3_to_f32(ww.w & 255u) * sc, e4m3_to_f32((ww.w >> 8) & 255u) * sc,
+                                              e4m3_to_f32((ww.w >> 16) & 255u) * sc, e4m3_to_f32(ww.w >> 24) * sc);
+}
+
+static inline void decode_sb_sk_16(device const uchar* row_ptr, int code, int col, threadgroup half* dst) {
+    const int SB = sk_sb_bytes(code);
+    const int sbi = col >> 8, j = col & 255, g = j >> 6;
+    device const uchar* blk = row_ptr + (size_t)sbi * SB;
+    const float eff = float(as_type<half>(ld16(blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
+    float4 w0 = 0.0f, w1 = 0.0f, w2 = 0.0f, w3 = 0.0f;
+    if (code == 3)      { sk_w8<3>(blk + 6, j, w0, w1); sk_w8<3>(blk + 6, j + 8, w2, w3); }
+    else if (code == 4) { sk_w8<4>(blk + 6, j, w0, w1); sk_w8<4>(blk + 6, j + 8, w2, w3); }
+    else if (code == 2) { sk_w8<2>(blk + 6, j, w0, w1); sk_w8<2>(blk + 6, j + 8, w2, w3); }
+    else if (code == 5) { sk_w8<5>(blk + 6, j, w0, w1); sk_w8<5>(blk + 6, j + 8, w2, w3); }
+    else if (code == 6) { sk_w8<6>(blk + 6, j, w0, w1); sk_w8<6>(blk + 6, j + 8, w2, w3); }
+    else if (code == 8) { sk_w8<8>(blk + 6, j, w0, w1); sk_w8<8>(blk + 6, j + 8, w2, w3); }
+    *((threadgroup half4*)(dst + 0))  = half4(w0 * eff);
+    *((threadgroup half4*)(dst + 4))  = half4(w1 * eff);
+    *((threadgroup half4*)(dst + 8))  = half4(w2 * eff);
+    *((threadgroup half4*)(dst + 12)) = half4(w3 * eff);
+}
+
+// Flattened Parallel (expert, m_tile) simdgroup_matrix w13 + fused SITU (SF4 specialized, BM=32 BN=64 BK=64, 12 KB SLM!)
+kernel void ink_moe_gu_mm_sf4(
+    device const uchar* sec4        [[buffer(0)]],
+    device const InkExpertDev* ex   [[buffer(1)]],
+    device const float* x_in        [[buffer(2)]],
+    device const uint2* tiles       [[buffer(3)]],
+    device const int* uoff_unused   [[buffer(4)]],
+    device const int* ucnt_unused   [[buffer(5)]],
+    device const int* pair_list     [[buffer(6)]],
+    device const uint* meta         [[buffer(7)]],
+    device float* h_act             [[buffer(8)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sA[32 * 64];
+    threadgroup half sB[64 * 64];
+    threadgroup int sh_pid[32];
+    threadgroup int sh_tk[32];
+    const int y = int(tgp.y);
+    if (y >= int(meta[9])) return;
+    const uint2 td = tiles[y];
+    const int e = int(td.x >> 16), mm = int(td.x & 0xFFFFu), off = int(td.y);
+    const int n0 = int(tgp.x) * 64;
+    device const uchar* body = sec4 + ex[e].body_off;
+    device const float* hdr = (device const float*)body;
+    const float outer = hdr[0] / hdr[1];
+    device const uchar* p_base = body + 16;
+    device const uchar* s_base = p_base + 2654208;
+    const int sgm = int(sg >> 2), sgn = int(sg & 3u);
+    const int br = int(tid >> 2), bi = int(tid & 3u);
+    const int ar = int(tid >> 3), ac = int((tid & 7u) * 8u);
+    const uint qid = lane >> 2;
+    const uint fm = (qid & 4u) + ((lane >> 1) & 3u);
+    const uint fn = (qid & 2u) * 2u + (lane & 1u) * 2u;
+
+    if (tid < 32) {
+        const int p = (int(tid) < mm) ? pair_list[off + int(tid)] : 0;
+        sh_pid[tid] = p; sh_tk[tid] = p >> 3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < 2304; k0 += 64) {
+        if (ar < mm) {
+            device const float4* xp = (device const float4*)(x_in + (size_t)sh_tk[ar] * 2304 + k0 + ac);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(xp[0]);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(xp[1]);
+        } else if (ar < 16 || mm > 16) {
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(0.0h);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(0.0h);
+        }
+        decode_sb_sf4_16(p_base, s_base, outer, 1152, 144, n0 + br, k0, bi, sB + br * 64 + bi * 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (mm > 16) {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, a1, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 16 + 0) * 64 + kk * 8, 64);
+                simdgroup_load(a1, sA + (sgm * 16 + 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+                simdgroup_multiply_accumulate(acc10, a1, b0, acc10);
+                simdgroup_multiply_accumulate(acc11, a1, b1, acc11);
+            }
+        } else {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int gn0 = n0 + sgn * 16 + int(fn);
+    const int lm0 = (mm > 16 ? (sgm * 16) : (sgm * 8)) + int(fm);
+    const int lm1 = sgm * 16 + 8 + int(fm);
+    if (lm0 < mm) {
+        const int pid_m = sh_pid[lm0];
+        h_act[(size_t)pid_m * 1152 + (gn0 >> 1)]       = situ_act(acc00.thread_elements()[0], acc00.thread_elements()[1]);
+        h_act[(size_t)pid_m * 1152 + ((gn0 + 8) >> 1)] = situ_act(acc01.thread_elements()[0], acc01.thread_elements()[1]);
+    }
+    if (mm > 16 && lm1 < mm) {
+        const int pid_m = sh_pid[lm1];
+        h_act[(size_t)pid_m * 1152 + (gn0 >> 1)]       = situ_act(acc10.thread_elements()[0], acc10.thread_elements()[1]);
+        h_act[(size_t)pid_m * 1152 + ((gn0 + 8) >> 1)] = situ_act(acc11.thread_elements()[0], acc11.thread_elements()[1]);
+    }
+}
+
+kernel void ink_moe_dn_mm_sf4(
+    device const uchar* sec4        [[buffer(0)]],
+    device const InkExpertDev* ex   [[buffer(1)]],
+    device const float* topk_w      [[buffer(2)]],
+    device const uint2* tiles       [[buffer(3)]],
+    device const int* uoff_unused   [[buffer(4)]],
+    device const int* ucnt_unused   [[buffer(5)]],
+    device const int* pair_list     [[buffer(6)]],
+    device const uint* meta         [[buffer(7)]],
+    device const float* h_act       [[buffer(8)]],
+    device float* y_pairs           [[buffer(9)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sA[32 * 64];
+    threadgroup half sB[64 * 64];
+    threadgroup int sh_pid[32];
+    threadgroup float sh_rw[32];
+    const int yy = int(tgp.y);
+    if (yy >= int(meta[9])) return;
+    const uint2 td = tiles[yy];
+    const int e = int(td.x >> 16), mm = int(td.x & 0xFFFFu), off = int(td.y);
+    const int n0 = int(tgp.x) * 64;
+    const InkExpertDev ed = ex[e];
+    device const uchar* body = sec4 + ed.body_off;
+    device const float* hdr = (device const float*)body;
+    const float outer = hdr[2] / hdr[3];
+    device const uchar* p_base = body + ed.dn_off;
+    device const uchar* s_base = p_base + 1327104;
+    const int sgm = int(sg >> 2), sgn = int(sg & 3u);
+    const int br = int(tid >> 2), bi = int(tid & 3u);
+    const int ar = int(tid >> 3), ac = int((tid & 7u) * 8u);
+    const uint qid = lane >> 2;
+    const uint fm = (qid & 4u) + ((lane >> 1) & 3u);
+    const uint fn = (qid & 2u) * 2u + (lane & 1u) * 2u;
+
+    if (tid < 32) {
+        const int p = (int(tid) < mm) ? pair_list[off + int(tid)] : 0;
+        sh_pid[tid] = p; sh_rw[tid] = (int(tid) < mm) ? topk_w[p] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < 1152; k0 += 64) {
+        if (ar < mm) {
+            device const float4* xp = (device const float4*)(h_act + (size_t)sh_pid[ar] * 1152 + k0 + ac);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(xp[0]);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(xp[1]);
+        } else if (ar < 16 || mm > 16) {
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(0.0h);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(0.0h);
+        }
+        decode_sb_sf4_16(p_base, s_base, outer, 576, 72, n0 + br, k0, bi, sB + br * 64 + bi * 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (mm > 16) {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, a1, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 16 + 0) * 64 + kk * 8, 64);
+                simdgroup_load(a1, sA + (sgm * 16 + 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+                simdgroup_multiply_accumulate(acc10, a1, b0, acc10);
+                simdgroup_multiply_accumulate(acc11, a1, b1, acc11);
+            }
+        } else {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int gn0 = n0 + sgn * 16 + int(fn);
+    const int lm0 = (mm > 16 ? (sgm * 16) : (sgm * 8)) + int(fm);
+    const int lm1 = sgm * 16 + 8 + int(fm);
+    if (lm0 < mm) {
+        const int pid_m = sh_pid[lm0]; const float rw = sh_rw[lm0];
+        y_pairs[(size_t)pid_m * 2304 + gn0]     = acc00.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 1] = acc00.thread_elements()[1] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 8] = acc01.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 9] = acc01.thread_elements()[1] * rw;
+    }
+    if (mm > 16 && lm1 < mm) {
+        const int pid_m = sh_pid[lm1]; const float rw = sh_rw[lm1];
+        y_pairs[(size_t)pid_m * 2304 + gn0]     = acc10.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 1] = acc10.thread_elements()[1] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 8] = acc11.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 9] = acc11.thread_elements()[1] * rw;
+    }
+}
+
+// Flattened Parallel (expert, m_tile) simdgroup_matrix w13 + fused SITU (MX8 specialized, BM=32 BN=64 BK=64!)
+kernel void ink_moe_gu_mm_mx8(
+    device const uchar* sec4        [[buffer(0)]],
+    device const InkExpertDev* ex   [[buffer(1)]],
+    device const float* x_in        [[buffer(2)]],
+    device const uint2* tiles       [[buffer(3)]],
+    device const int* uoff_unused   [[buffer(4)]],
+    device const int* ucnt_unused   [[buffer(5)]],
+    device const int* pair_list     [[buffer(6)]],
+    device const uint* meta         [[buffer(7)]],
+    device float* h_act             [[buffer(8)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sA[32 * 64];
+    threadgroup half sB[64 * 64];
+    threadgroup int sh_pid[32];
+    threadgroup int sh_tk[32];
+    const int y = int(tgp.y);
+    if (y >= int(meta[9])) return;
+    const uint2 td = tiles[y];
+    const int e = int(td.x >> 16), mm = int(td.x & 0xFFFFu), off = int(td.y);
+    const int n0 = int(tgp.x) * 64;
+    device const uchar* body = sec4 + ex[e].body_off;
+    device const uchar* s_base = body + 5308416;
+    const int sgm = int(sg >> 2), sgn = int(sg & 3u);
+    const int br = int(tid >> 2), bi = int(tid & 3u);
+    const int ar = int(tid >> 3), ac = int((tid & 7u) * 8u);
+    const uint qid = lane >> 2;
+    const uint fm = (qid & 4u) + ((lane >> 1) & 3u);
+    const uint fn = (qid & 2u) * 2u + (lane & 1u) * 2u;
+
+    if (tid < 32) {
+        const int p = (int(tid) < mm) ? pair_list[off + int(tid)] : 0;
+        sh_pid[tid] = p; sh_tk[tid] = p >> 3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < 2304; k0 += 64) {
+        if (ar < mm) {
+            device const float4* xp = (device const float4*)(x_in + (size_t)sh_tk[ar] * 2304 + k0 + ac);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(xp[0]);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(xp[1]);
+        } else if (ar < 16 || mm > 16) {
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(0.0h);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(0.0h);
+        }
+        decode_sb_mx8_16(body, s_base, 2304, 72, n0 + br, k0, bi, sB + br * 64 + bi * 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (mm > 16) {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, a1, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 16 + 0) * 64 + kk * 8, 64);
+                simdgroup_load(a1, sA + (sgm * 16 + 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+                simdgroup_multiply_accumulate(acc10, a1, b0, acc10);
+                simdgroup_multiply_accumulate(acc11, a1, b1, acc11);
+            }
+        } else {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int gn0 = n0 + sgn * 16 + int(fn);
+    const int lm0 = (mm > 16 ? (sgm * 16) : (sgm * 8)) + int(fm);
+    const int lm1 = sgm * 16 + 8 + int(fm);
+    if (lm0 < mm) {
+        const int pid_m = sh_pid[lm0];
+        h_act[(size_t)pid_m * 1152 + (gn0 >> 1)]       = situ_act(acc00.thread_elements()[0], acc00.thread_elements()[1]);
+        h_act[(size_t)pid_m * 1152 + ((gn0 + 8) >> 1)] = situ_act(acc01.thread_elements()[0], acc01.thread_elements()[1]);
+    }
+    if (mm > 16 && lm1 < mm) {
+        const int pid_m = sh_pid[lm1];
+        h_act[(size_t)pid_m * 1152 + (gn0 >> 1)]       = situ_act(acc10.thread_elements()[0], acc10.thread_elements()[1]);
+        h_act[(size_t)pid_m * 1152 + ((gn0 + 8) >> 1)] = situ_act(acc11.thread_elements()[0], acc11.thread_elements()[1]);
+    }
+}
+
+kernel void ink_moe_dn_mm_mx8(
+    device const uchar* sec4        [[buffer(0)]],
+    device const InkExpertDev* ex   [[buffer(1)]],
+    device const float* topk_w      [[buffer(2)]],
+    device const uint2* tiles       [[buffer(3)]],
+    device const int* uoff_unused   [[buffer(4)]],
+    device const int* ucnt_unused   [[buffer(5)]],
+    device const int* pair_list     [[buffer(6)]],
+    device const uint* meta         [[buffer(7)]],
+    device const float* h_act       [[buffer(8)]],
+    device float* y_pairs           [[buffer(9)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sA[32 * 64];
+    threadgroup half sB[64 * 64];
+    threadgroup int sh_pid[32];
+    threadgroup float sh_rw[32];
+    const int yy = int(tgp.y);
+    if (yy >= int(meta[9])) return;
+    const uint2 td = tiles[yy];
+    const int e = int(td.x >> 16), mm = int(td.x & 0xFFFFu), off = int(td.y);
+    const int n0 = int(tgp.x) * 64;
+    const InkExpertDev ed = ex[e];
+    device const uchar* w_base = sec4 + ed.body_off + ed.dn_off;
+    device const uchar* s_base = w_base + 2654208;
+    const int sgm = int(sg >> 2), sgn = int(sg & 3u);
+    const int br = int(tid >> 2), bi = int(tid & 3u);
+    const int ar = int(tid >> 3), ac = int((tid & 7u) * 8u);
+    const uint qid = lane >> 2;
+    const uint fm = (qid & 4u) + ((lane >> 1) & 3u);
+    const uint fn = (qid & 2u) * 2u + (lane & 1u) * 2u;
+
+    if (tid < 32) {
+        const int p = (int(tid) < mm) ? pair_list[off + int(tid)] : 0;
+        sh_pid[tid] = p; sh_rw[tid] = (int(tid) < mm) ? topk_w[p] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < 1152; k0 += 64) {
+        if (ar < mm) {
+            device const float4* xp = (device const float4*)(h_act + (size_t)sh_pid[ar] * 1152 + k0 + ac);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(xp[0]);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(xp[1]);
+        } else if (ar < 16 || mm > 16) {
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(0.0h);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(0.0h);
+        }
+        decode_sb_mx8_16(w_base, s_base, 1152, 36, n0 + br, k0, bi, sB + br * 64 + bi * 16);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (mm > 16) {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, a1, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 16 + 0) * 64 + kk * 8, 64);
+                simdgroup_load(a1, sA + (sgm * 16 + 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+                simdgroup_multiply_accumulate(acc10, a1, b0, acc10);
+                simdgroup_multiply_accumulate(acc11, a1, b1, acc11);
+            }
+        } else {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int gn0 = n0 + sgn * 16 + int(fn);
+    const int lm0 = (mm > 16 ? (sgm * 16) : (sgm * 8)) + int(fm);
+    const int lm1 = sgm * 16 + 8 + int(fm);
+    if (lm0 < mm) {
+        const int pid_m = sh_pid[lm0]; const float rw = sh_rw[lm0];
+        y_pairs[(size_t)pid_m * 2304 + gn0]     = acc00.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 1] = acc00.thread_elements()[1] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 8] = acc01.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 9] = acc01.thread_elements()[1] * rw;
+    }
+    if (mm > 16 && lm1 < mm) {
+        const int pid_m = sh_pid[lm1]; const float rw = sh_rw[lm1];
+        y_pairs[(size_t)pid_m * 2304 + gn0]     = acc10.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 1] = acc10.thread_elements()[1] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 8] = acc11.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 9] = acc11.thread_elements()[1] * rw;
+    }
+}
+
+// Flattened Parallel (expert, m_tile) simdgroup_matrix w13 + fused SITU (General: SF4 + MX8 + S2_K..S8_K, BM=32 BN=64 BK=64!)
+kernel void ink_moe_gu_mm_gen(
+    device const uchar* sec4        [[buffer(0)]],
+    device const InkExpertDev* ex   [[buffer(1)]],
+    device const float* x_in        [[buffer(2)]],
+    device const uint2* tiles       [[buffer(3)]],
+    device const int* uoff_unused   [[buffer(4)]],
+    device const int* ucnt_unused   [[buffer(5)]],
+    device const int* pair_list     [[buffer(6)]],
+    device const uint* meta         [[buffer(7)]],
+    device float* h_act             [[buffer(8)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sA[32 * 64];
+    threadgroup half sB[64 * 64];
+    threadgroup int sh_pid[32];
+    threadgroup int sh_tk[32];
+    const int y = int(tgp.y);
+    if (y >= int(meta[9])) return;
+    const uint2 td = tiles[y];
+    const int e = int(td.x >> 16), mm = int(td.x & 0xFFFFu), off = int(td.y);
+    const int n0 = int(tgp.x) * 64;
+    const InkExpertDev ed = ex[e];
+    device const uchar* body = sec4 + ed.body_off;
+    const int gcode = int(ed.gu_code);
+    const bool is_sk_dn = (ed.dn_code != 15 && ed.dn_code != 16);
+    const float sf4_outer = (gcode == 15) ? (((device const float*)body)[0] / ((device const float*)body)[1]) : 0.0f;
+    const size_t sk_rowb = (gcode != 15 && gcode != 16) ? (9ul * size_t(sk_sb_bytes(gcode))) : 0ul;
+    const int sgm = int(sg >> 2), sgn = int(sg & 3u);
+    const int br = int(tid >> 2), bi = int(tid & 3u);
+    const int ar = int(tid >> 3), ac = int((tid & 7u) * 8u);
+    const uint qid = lane >> 2;
+    const uint fm = (qid & 4u) + ((lane >> 1) & 3u);
+    const uint fn = (qid & 2u) * 2u + (lane & 1u) * 2u;
+
+    if (tid < 32) {
+        const int p = (int(tid) < mm) ? pair_list[off + int(tid)] : 0;
+        sh_pid[tid] = p; sh_tk[tid] = p >> 3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < 2304; k0 += 64) {
+        if (ar < mm) {
+            device const float4* xp = (device const float4*)(x_in + (size_t)sh_tk[ar] * 2304 + k0 + ac);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(xp[0]);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(xp[1]);
+        } else if (ar < 16 || mm > 16) {
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(0.0h);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(0.0h);
+        }
+        if (gcode == 15) {
+            decode_sb_sf4_16(body + 16, body + 16 + 2654208, sf4_outer, 1152, 144, n0 + br, k0, bi, sB + br * 64 + bi * 16);
+        } else if (gcode == 16) {
+            decode_sb_mx8_16(body, body + 5308416, 2304, 72, n0 + br, k0, bi, sB + br * 64 + bi * 16);
+        } else {
+            device const uchar* rp = body + 2304 + (size_t)(n0 + br) * sk_rowb;
+            decode_sb_sk_16(rp, gcode, k0 + bi * 16, sB + br * 64 + bi * 16);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (mm > 16) {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, a1, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 16 + 0) * 64 + kk * 8, 64);
+                simdgroup_load(a1, sA + (sgm * 16 + 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+                simdgroup_multiply_accumulate(acc10, a1, b0, acc10);
+                simdgroup_multiply_accumulate(acc11, a1, b1, acc11);
+            }
+        } else {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int r0 = (n0 + sgn * 16 + int(fn)) >> 1;
+    const int r1 = r0 + 4;
+    const float isq0 = is_sk_dn ? (1.0f / float(as_type<half>(ld16(body + 2 * r0)))) : 1.0f;
+    const float isq1 = is_sk_dn ? (1.0f / float(as_type<half>(ld16(body + 2 * r1)))) : 1.0f;
+    const int lm0 = (mm > 16 ? (sgm * 16) : (sgm * 8)) + int(fm);
+    const int lm1 = sgm * 16 + 8 + int(fm);
+    if (lm0 < mm) {
+        const int pid_m = sh_pid[lm0];
+        h_act[(size_t)pid_m * 1152 + r0] = situ_act(acc00.thread_elements()[0], acc00.thread_elements()[1]) * isq0;
+        h_act[(size_t)pid_m * 1152 + r1] = situ_act(acc01.thread_elements()[0], acc01.thread_elements()[1]) * isq1;
+    }
+    if (mm > 16 && lm1 < mm) {
+        const int pid_m = sh_pid[lm1];
+        h_act[(size_t)pid_m * 1152 + r0] = situ_act(acc10.thread_elements()[0], acc10.thread_elements()[1]) * isq0;
+        h_act[(size_t)pid_m * 1152 + r1] = situ_act(acc11.thread_elements()[0], acc11.thread_elements()[1]) * isq1;
+    }
+}
+
+// Flattened Parallel (expert, m_tile) simdgroup_matrix w2 (General: SF4 + MX8 + Paired-2-Row S2_K..S8_K, BM=32 BN=64 BK=64!)
+kernel void ink_moe_dn_mm_gen(
+    device const uchar* sec4        [[buffer(0)]],
+    device const InkExpertDev* ex   [[buffer(1)]],
+    device const float* topk_w      [[buffer(2)]],
+    device const uint2* tiles       [[buffer(3)]],
+    device const int* uoff_unused   [[buffer(4)]],
+    device const int* ucnt_unused   [[buffer(5)]],
+    device const int* pair_list     [[buffer(6)]],
+    device const uint* meta         [[buffer(7)]],
+    device const float* h_act       [[buffer(8)]],
+    device float* y_pairs           [[buffer(9)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sA[32 * 64];
+    threadgroup half sB[64 * 64];
+    threadgroup int sh_pid[32];
+    threadgroup float sh_rw[32];
+    const int yy = int(tgp.y);
+    if (yy >= int(meta[9])) return;
+    const uint2 td = tiles[yy];
+    const int e = int(td.x >> 16), mm = int(td.x & 0xFFFFu), off = int(td.y);
+    const int n0 = int(tgp.x) * 64;
+    const InkExpertDev ed = ex[e];
+    device const uchar* body = sec4 + ed.body_off;
+    const int dcode = int(ed.dn_code);
+    const float sf4_outer = (dcode == 15) ? (((device const float*)body)[2] / ((device const float*)body)[3]) : 0.0f;
+    const size_t sk_pairb = (dcode != 15 && dcode != 16) ? (9ul * size_t(sk_sb_bytes(dcode))) : 0ul;
+    const int sgm = int(sg >> 2), sgn = int(sg & 3u);
+    const int br = int(tid >> 2), bi = int(tid & 3u);
+    const int ar = int(tid >> 3), ac = int((tid & 7u) * 8u);
+    const uint qid = lane >> 2;
+    const uint fm = (qid & 4u) + ((lane >> 1) & 3u);
+    const uint fn = (qid & 2u) * 2u + (lane & 1u) * 2u;
+
+    if (tid < 32) {
+        const int p = (int(tid) < mm) ? pair_list[off + int(tid)] : 0;
+        sh_pid[tid] = p; sh_rw[tid] = (int(tid) < mm) ? topk_w[p] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < 1152; k0 += 64) {
+        if (ar < mm) {
+            device const float4* xp = (device const float4*)(h_act + (size_t)sh_pid[ar] * 1152 + k0 + ac);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(xp[0]);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(xp[1]);
+        } else if (ar < 16 || mm > 16) {
+            *((threadgroup half4*)(sA + ar * 64 + ac + 0)) = half4(0.0h);
+            *((threadgroup half4*)(sA + ar * 64 + ac + 4)) = half4(0.0h);
+        }
+        const int gn = n0 + br;
+        if (dcode == 15) {
+            decode_sb_sf4_16(body + ed.dn_off, body + ed.dn_off + 1327104, sf4_outer, 576, 72, gn, k0, bi, sB + br * 64 + bi * 16);
+        } else if (dcode == 16) {
+            decode_sb_mx8_16(body + ed.dn_off, body + ed.dn_off + 2654208, 1152, 36, gn, k0, bi, sB + br * 64 + bi * 16);
+        } else {
+            const int rp = gn >> 1;
+            const int col_p = ((gn & 1) ? 1152 : 0) + k0 + bi * 16;
+            device const uchar* pr = body + ed.dn_off + (size_t)rp * sk_pairb;
+            decode_sb_sk_16(pr, dcode, col_p, sB + br * 64 + bi * 16);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (mm > 16) {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, a1, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 16 + 0) * 64 + kk * 8, 64);
+                simdgroup_load(a1, sA + (sgm * 16 + 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+                simdgroup_multiply_accumulate(acc10, a1, b0, acc10);
+                simdgroup_multiply_accumulate(acc11, a1, b1, acc11);
+            }
+        } else {
+            for (int kk = 0; kk < 8; ++kk) {
+                simdgroup_half8x8 a0, b0, b1;
+                simdgroup_load(a0, sA + (sgm * 8) * 64 + kk * 8, 64);
+                simdgroup_load(b0, sB + (sgn * 16 + 0) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_load(b1, sB + (sgn * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc00, a0, b0, acc00);
+                simdgroup_multiply_accumulate(acc01, a0, b1, acc01);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int gn0 = n0 + sgn * 16 + int(fn);
+    const int lm0 = (mm > 16 ? (sgm * 16) : (sgm * 8)) + int(fm);
+    const int lm1 = sgm * 16 + 8 + int(fm);
+    if (lm0 < mm) {
+        const int pid_m = sh_pid[lm0]; const float rw = sh_rw[lm0];
+        y_pairs[(size_t)pid_m * 2304 + gn0]     = acc00.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 1] = acc00.thread_elements()[1] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 8] = acc01.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 9] = acc01.thread_elements()[1] * rw;
+    }
+    if (mm > 16 && lm1 < mm) {
+        const int pid_m = sh_pid[lm1]; const float rw = sh_rw[lm1];
+        y_pairs[(size_t)pid_m * 2304 + gn0]     = acc10.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 1] = acc10.thread_elements()[1] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 8] = acc11.thread_elements()[0] * rw;
+        y_pairs[(size_t)pid_m * 2304 + gn0 + 9] = acc11.thread_elements()[1] * rw;
     }
 }

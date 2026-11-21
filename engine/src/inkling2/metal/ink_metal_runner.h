@@ -85,19 +85,22 @@ struct InkMetalRunner {
     int lib_codecs = -1, lib_ops = -1, lib_dspark = -1, lib_vis = -1;
 
     // Pipelines
-    mtl::Pipeline p_lin_bf16_mv, p_lin_bf16_mm;
-    mtl::Pipeline p_lin_q8_mv, p_lin_q8_mm;
-    mtl::Pipeline p_lin_f32;
-    mtl::Pipeline p_lin_sk[9];
+    mtl::Pipeline p_lin_bf16_mv1, p_lin_bf16_mv, p_lin_bf16_mm8, p_lin_bf16_mm;
+    mtl::Pipeline p_lin_q8_mv1, p_lin_q8_mv, p_lin_q8_mm8, p_lin_q8_mm;
+    mtl::Pipeline p_lin_f32, p_lin_f32_mm;
+    mtl::Pipeline p_lin_sk[9], p_lin_sk6_mm8;
+    mtl::Pipeline p_unemb_argmax_q8, p_unemb_argmax_bf16, p_unemb_argmax_sk6, p_argmax_part;
     mtl::Pipeline p_moe_plan, p_moe_gu, p_moe_dn, p_moe_red8;
     mtl::Pipeline p_moe_gu_sf4, p_moe_dn_sf4, p_moe_gu_mx8, p_moe_dn_mx8;
+    mtl::Pipeline p_moe_gu_mm_sf4, p_moe_dn_mm_sf4, p_moe_gu_mm_mx8, p_moe_dn_mm_mx8, p_moe_gu_mm_gen, p_moe_dn_mm_gen;
     int layer_homog_gu[24]{};
     int layer_homog_dn[24]{};
 
     mtl::Pipeline p_emb_bf16, p_emb_q8;
-    mtl::Pipeline p_attn_res_mix, p_ctrl_cat, p_ctrl_apply, p_rms_norm, p_add;
-    mtl::Pipeline p_sconv4_multi, p_sconv4_pf, p_sconv4_pf_commit, p_qr_clip_tau, p_kv_store_f16, p_relpos_gqa;
-    mtl::Pipeline p_router_topk8, p_softcap, p_argmax_rows;
+    mtl::Pipeline p_attn_res_mix, p_attn_res_mix_norm, p_ctrl_cat, p_ctrl_apply, p_ctrl_gf_64, p_ctrl_fuse_norm, p_rms_norm, p_add;
+    mtl::Pipeline p_sconv4_multi, p_sconv4_attn_res, p_moe_red8_sconv_add, p_sconv4_pf, p_sconv4_pf_commit;
+    mtl::Pipeline p_qr_clip_tau, p_kv_store_f16, p_relpos_gqa;
+    mtl::Pipeline p_router_topk8, p_router_topk8_plan_m1, p_softcap, p_argmax_rows;
 
     mtl::Pipeline p_dsp_mix, p_dsp_ctx_kv, p_dsp_init_bf16, p_dsp_init_q8;
     mtl::Pipeline p_dsp_qk_rope, p_dsp_attn, p_dsp_swiglu;
@@ -147,7 +150,7 @@ struct InkMetalRunner {
     mtl::Buffer b_q, b_k_raw, b_v_raw, b_k, b_v, b_r, b_kd_taps, b_vd_taps;
     mtl::Buffer b_sinks, b_gate_attn, b_attn_out, b_wo_raw, b_wo;
     mtl::Buffer b_mlp_in, b_r_logits, b_topk_idx, b_topk_w;
-    mtl::Buffer b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_meta;
+    mtl::Buffer b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_meta, b_moe_tiles;
     mtl::Buffer b_moe_h, b_moe_yp, b_moe_raw, b_moe_out;
     mtl::Buffer b_h_out, b_h_norm, b_logits, b_argmax;
     mtl::Buffer b_taps4;                   // [4, max_batch, 2304] for DSpark taps [5, 23, 41, 48]
@@ -174,22 +177,38 @@ struct InkMetalRunner {
         if (!compile_shaders(kernel_dir, err)) return false;
 
         // Create pipelines
-        p_lin_bf16_mv = cx->pipeline(lib_codecs, "ink_linear_bf16_mv");
-        p_lin_bf16_mm = cx->pipeline(lib_codecs, "ink_linear_bf16_mm");
-        p_lin_q8_mv   = cx->pipeline(lib_codecs, "ink_linear_q8row_mv");
-        p_lin_q8_mm   = cx->pipeline(lib_codecs, "ink_linear_q8row_mm");
-        p_lin_f32     = cx->pipeline(lib_codecs, "ink_linear_f32");
+        p_lin_bf16_mv1 = cx->pipeline(lib_codecs, "ink_linear_bf16_mv1");
+        p_lin_bf16_mv  = cx->pipeline(lib_codecs, "ink_linear_bf16_mv");
+        p_lin_bf16_mm8 = cx->pipeline(lib_codecs, "ink_linear_bf16_mm8");
+        p_lin_bf16_mm  = cx->pipeline(lib_codecs, "ink_linear_bf16_mm");
+        p_lin_q8_mv1   = cx->pipeline(lib_codecs, "ink_linear_q8row_mv1");
+        p_lin_q8_mv    = cx->pipeline(lib_codecs, "ink_linear_q8row_mv");
+        p_lin_q8_mm8   = cx->pipeline(lib_codecs, "ink_linear_q8row_mm8");
+        p_lin_q8_mm    = cx->pipeline(lib_codecs, "ink_linear_q8row_mm");
+        p_lin_f32      = cx->pipeline(lib_codecs, "ink_linear_f32");
+        p_lin_f32_mm   = cx->pipeline(lib_codecs, "ink_linear_f32_mm");
+        p_unemb_argmax_q8   = cx->pipeline(lib_codecs, "ink_unembed_argmax_q8row");
+        p_unemb_argmax_bf16 = cx->pipeline(lib_codecs, "ink_unembed_argmax_bf16");
+        p_unemb_argmax_sk6  = cx->pipeline(lib_codecs, "ink_unembed_argmax_sk6");
+        p_argmax_part       = cx->pipeline(lib_codecs, "ink_argmax_part_reduce");
         for (int f : {2, 3, 4, 5, 6, 8}) {
             p_lin_sk[f] = cx->pipeline(lib_codecs, "ink_linear_sk_mv_" + std::to_string(f));
         }
-        p_moe_plan   = cx->pipeline(lib_codecs, "ink_moe_plan");
-        p_moe_gu     = cx->pipeline(lib_codecs, "ink_moe_gu_situ");
-        p_moe_dn     = cx->pipeline(lib_codecs, "ink_moe_dn");
-        p_moe_gu_sf4 = cx->pipeline(lib_codecs, "ink_moe_gu_sf4");
-        p_moe_dn_sf4 = cx->pipeline(lib_codecs, "ink_moe_dn_sf4");
-        p_moe_gu_mx8 = cx->pipeline(lib_codecs, "ink_moe_gu_mx8");
-        p_moe_dn_mx8 = cx->pipeline(lib_codecs, "ink_moe_dn_mx8");
-        p_moe_red8   = cx->pipeline(lib_codecs, "ink_moe_reduce8");
+        p_lin_sk6_mm8   = cx->pipeline(lib_codecs, "ink_linear_sk6_mm8");
+        p_moe_plan      = cx->pipeline(lib_codecs, "ink_moe_plan");
+        p_moe_gu        = cx->pipeline(lib_codecs, "ink_moe_gu_situ");
+        p_moe_dn        = cx->pipeline(lib_codecs, "ink_moe_dn");
+        p_moe_gu_sf4    = cx->pipeline(lib_codecs, "ink_moe_gu_sf4");
+        p_moe_dn_sf4    = cx->pipeline(lib_codecs, "ink_moe_dn_sf4");
+        p_moe_gu_mx8    = cx->pipeline(lib_codecs, "ink_moe_gu_mx8");
+        p_moe_dn_mx8    = cx->pipeline(lib_codecs, "ink_moe_dn_mx8");
+        p_moe_gu_mm_sf4 = cx->pipeline(lib_codecs, "ink_moe_gu_mm_sf4");
+        p_moe_dn_mm_sf4 = cx->pipeline(lib_codecs, "ink_moe_dn_mm_sf4");
+        p_moe_gu_mm_mx8 = cx->pipeline(lib_codecs, "ink_moe_gu_mm_mx8");
+        p_moe_dn_mm_mx8 = cx->pipeline(lib_codecs, "ink_moe_dn_mm_mx8");
+        p_moe_gu_mm_gen = cx->pipeline(lib_codecs, "ink_moe_gu_mm_gen");
+        p_moe_dn_mm_gen = cx->pipeline(lib_codecs, "ink_moe_dn_mm_gen");
+        p_moe_red8      = cx->pipeline(lib_codecs, "ink_moe_reduce8");
 
         // Detect homogeneous SF4/MX8 layers for low-register specialized Metal pipelines!
         const auto* ed_host = mod->expert_dev_buf.as<InkExpertDev>();
@@ -208,21 +227,27 @@ struct InkMetalRunner {
 
         p_emb_bf16     = cx->pipeline(lib_ops, "ink_embed_bf16");
         p_emb_q8       = cx->pipeline(lib_ops, "ink_embed_q8row");
-        p_attn_res_mix = cx->pipeline(lib_ops, "ink_attn_res_mix");
-        p_ctrl_cat     = cx->pipeline(lib_ops, "ink_ctrl_cat_rms");
-        p_ctrl_apply   = cx->pipeline(lib_ops, "ink_ctrl_apply_norm");
-        p_rms_norm     = cx->pipeline(lib_ops, "ink_rms_norm");
-        p_add          = cx->pipeline(lib_ops, "ink_add");
-        p_copy_f32     = cx->pipeline(lib_ops, "ink_copy_f32");
-        p_sconv4_multi = cx->pipeline(lib_ops, "ink_sconv4_multi");
-        p_sconv4_pf    = cx->pipeline(lib_ops, "ink_sconv4_prefill_single");
-        p_sconv4_pf_commit = cx->pipeline(lib_ops, "ink_sconv4_prefill_commit");
-        p_qr_clip_tau  = cx->pipeline(lib_ops, "ink_qr_clip_tau");
-        p_kv_store_f16 = cx->pipeline(lib_ops, "ink_kv_norm_store_f16");
-        p_relpos_gqa   = cx->pipeline(lib_ops, "ink_relpos_sink_gqa");
-        p_router_topk8 = cx->pipeline(lib_ops, "ink_router_topk8");
-        p_softcap      = cx->pipeline(lib_ops, "ink_softcap_f32");
-        p_argmax_rows  = cx->pipeline(lib_ops, "ink_argmax_rows");
+        p_attn_res_mix        = cx->pipeline(lib_ops, "ink_attn_res_mix");
+        p_attn_res_mix_norm   = cx->pipeline(lib_ops, "ink_attn_res_mix_norm");
+        p_ctrl_cat            = cx->pipeline(lib_ops, "ink_ctrl_cat_rms");
+        p_ctrl_apply          = cx->pipeline(lib_ops, "ink_ctrl_apply_norm");
+        p_ctrl_gf_64          = cx->pipeline(lib_ops, "ink_ctrl_gf_64");
+        p_ctrl_fuse_norm      = cx->pipeline(lib_ops, "ink_ctrl_fuse_norm");
+        p_rms_norm            = cx->pipeline(lib_ops, "ink_rms_norm");
+        p_add                 = cx->pipeline(lib_ops, "ink_add");
+        p_copy_f32            = cx->pipeline(lib_ops, "ink_copy_f32");
+        p_sconv4_multi        = cx->pipeline(lib_ops, "ink_sconv4_multi");
+        p_sconv4_attn_res     = cx->pipeline(lib_ops, "ink_sconv4_attn_res");
+        p_moe_red8_sconv_add  = cx->pipeline(lib_ops, "ink_moe_red8_sconv_add");
+        p_sconv4_pf           = cx->pipeline(lib_ops, "ink_sconv4_prefill_single");
+        p_sconv4_pf_commit    = cx->pipeline(lib_ops, "ink_sconv4_prefill_commit");
+        p_qr_clip_tau         = cx->pipeline(lib_ops, "ink_qr_clip_tau");
+        p_kv_store_f16        = cx->pipeline(lib_ops, "ink_kv_norm_store_f16");
+        p_relpos_gqa          = cx->pipeline(lib_ops, "ink_relpos_sink_gqa");
+        p_router_topk8        = cx->pipeline(lib_ops, "ink_router_topk8");
+        p_router_topk8_plan_m1 = cx->pipeline(lib_ops, "ink_router_topk8_plan_m1");
+        p_softcap             = cx->pipeline(lib_ops, "ink_softcap_f32");
+        p_argmax_rows         = cx->pipeline(lib_ops, "ink_argmax_rows");
 
         p_dsp_mix         = cx->pipeline(lib_dspark, "dspark_mix_taps");
         p_dsp_ctx_kv      = cx->pipeline(lib_dspark, "dspark_ctx_kv_store");
@@ -296,8 +321,8 @@ struct InkMetalRunner {
         b_bank_out  = cx->alloc(MB * D * 4);
         b_msgs      = cx->alloc(4 * MB * D * 4);
         b_in3       = cx->alloc(3 * MB * D * 4);
-        b_cat       = cx->alloc(MB * 2 * D * 4);
-        b_ctrl_gate = cx->alloc(MB * c.gate_rank * 4);
+        b_cat       = cx->alloc(3 * MB * 2 * D * 4);
+        b_ctrl_gate = cx->alloc(3 * MB * c.gate_rank * 4);
 
         b_q         = cx->alloc(MB * (c.n_head * c.head_dim) * 4);
         b_k_raw     = cx->alloc(MB * (c.n_kv * c.head_dim) * 4);
@@ -322,6 +347,7 @@ struct InkMetalRunner {
         b_moe_ucnt  = cx->alloc(c.n_experts * 4);
         b_moe_pairs = cx->alloc(MB * c.top_k * 4);
         b_moe_meta  = cx->alloc(16 * 4);
+        b_moe_tiles = cx->alloc((MB * c.top_k / 32 + 256) * 8);
         b_moe_h     = cx->alloc(MB * c.top_k * c.inter * 4);
         b_moe_yp    = cx->alloc(MB * c.top_k * D * 4);
         b_moe_raw   = cx->alloc(MB * D * 4);
@@ -332,6 +358,8 @@ struct InkMetalRunner {
         // Logits buffer: up to min(max_batch, 64) rows simultaneously (prefill uses last-token-only mode!)
         b_logits    = cx->alloc((size_t)std::min(max_batch, 64) * c.vocab_padded * 4);
         b_argmax    = cx->alloc(MB * 4);
+        bd_part_val = cx->alloc(16384 * 4);
+        bd_part_idx = cx->alloc(16384 * 4);
         b_taps4     = cx->alloc(4 * MB * D * 4);
 
         if (use_dspark) {
@@ -362,8 +390,6 @@ struct InkMetalRunner {
             bd_latent      = cx->alloc(256 * 4);
             bd_corr        = cx->alloc(D * 4);
             bd_tok_chain   = cx->alloc(8 * 4);
-            bd_part_val    = cx->alloc(256 * 4);
-            bd_part_idx    = cx->alloc(256 * 4);
         }
 
         if (!vision_path.empty()) {
@@ -443,16 +469,25 @@ struct InkMetalRunner {
         }
     }
 
-    // Helper: push linear dispatch (auto-dispatches BF16/Q8_ROW/F32/S_K and GEMV vs simdgroup_matrix GEMM!)
+    // Helper: push linear dispatch (auto-dispatches BF16/Q8_ROW/F32/S_K across mv1, mm8, and mm32x64!)
     void push_linear(std::vector<mtl::Dispatch>& ds, const InkTensorInfo& ti, const mtl::Arg& w_arg,
-                     const mtl::Arg& x_arg, const mtl::Arg& y_arg, int N, int K, int M, bool barrier = true) {
+                     const mtl::Arg& x_arg, const mtl::Arg& y_arg, int N, int K, int M,
+                     bool barrier = true, bool exact_f32 = false) {
         mtl::Dispatch d;
         d.barrier = barrier;
         if (ti.fmt == FMT_BF16) {
-            if (M > 8) {
+            if (M == 1) {
+                d.p = &p_lin_bf16_mv1;
+                d.grid[0] = (uint32_t)((N + 31) / 32);
+                d.tg[0] = 256;
+            } else if (M >= 6 && M <= 8) {
+                d.p = &p_lin_bf16_mm8;
+                d.grid[0] = (uint32_t)((N + 63) / 64);
+                d.tg[0] = 256;
+            } else if (M > 8) {
                 d.p = &p_lin_bf16_mm;
                 d.grid[0] = (uint32_t)((N + 63) / 64);
-                d.grid[1] = (uint32_t)((M + 31) / 32);
+                d.grid[1] = (uint32_t)((M + 63) / 64);
                 d.tg[0] = 256;
             } else {
                 d.p = &p_lin_bf16_mv;
@@ -460,7 +495,15 @@ struct InkMetalRunner {
                 d.tg[0] = 256;
             }
         } else if (ti.fmt == FMT_Q8ROW) {
-            if (M > 8) {
+            if (M == 1 && (K & 15) == 0) {
+                d.p = &p_lin_q8_mv1;
+                d.grid[0] = (uint32_t)((N + 31) / 32);
+                d.tg[0] = 256;
+            } else if (M >= 6 && M <= 8) {
+                d.p = &p_lin_q8_mm8;
+                d.grid[0] = (uint32_t)((N + 63) / 64);
+                d.tg[0] = 256;
+            } else if (M > 8) {
                 d.p = &p_lin_q8_mm;
                 d.grid[0] = (uint32_t)((N + 63) / 64);
                 d.grid[1] = (uint32_t)((M + 31) / 32);
@@ -471,13 +514,26 @@ struct InkMetalRunner {
                 d.tg[0] = 256;
             }
         } else if (ti.fmt == FMT_F32) {
-            d.p = &p_lin_f32;
-            d.grid[0] = (uint32_t)((N + 7) / 8);
-            d.tg[0] = 256;
+            if (M > 8 && !exact_f32) {
+                d.p = &p_lin_f32_mm;
+                d.grid[0] = (uint32_t)((N + 63) / 64);
+                d.grid[1] = (uint32_t)((M + 31) / 32);
+                d.tg[0] = 256;
+            } else {
+                d.p = &p_lin_f32;
+                d.grid[0] = (uint32_t)((N + 3) / 4);
+                d.tg[0] = 128;
+            }
         } else if (ti.fmt >= FMT_S2 && ti.fmt <= FMT_S8) {
-            d.p = &p_lin_sk[ti.fmt];
-            d.grid[0] = (uint32_t)((N + 15) / 16);
-            d.tg[0] = 256;
+            if (ti.fmt == FMT_S6 && M >= 2 && M <= 8) {
+                d.p = &p_lin_sk6_mm8;
+                d.grid[0] = (uint32_t)((N + 63) / 64);
+                d.tg[0] = 256;
+            } else {
+                d.p = &p_lin_sk[ti.fmt];
+                d.grid[0] = (uint32_t)((N + 15) / 16);
+                d.tg[0] = 256;
+            }
         } else {
             fprintf(stderr, "[ink_metal] unsupported linear fmt %d for %s\n", ti.fmt, ti.name.c_str());
             exit(2);
@@ -487,11 +543,12 @@ struct InkMetalRunner {
     }
 
     void push_trunk_linear(std::vector<mtl::Dispatch>& ds, const std::string& name,
-                           const mtl::Arg& x_arg, const mtl::Arg& y_arg, int M, int N_override = -1, bool barrier = true) {
+                           const mtl::Arg& x_arg, const mtl::Arg& y_arg, int M, int N_override = -1,
+                           bool barrier = true, bool exact_f32 = false) {
         const auto& ti = mod->man.get(name);
         const int N = N_override > 0 ? N_override : (int)ti.rows();
         const int K = (int)ti.cols();
-        push_linear(ds, ti, mod->tw(name), x_arg, y_arg, N, K, M, barrier);
+        push_linear(ds, ti, mod->tw(name), x_arg, y_arg, N, K, M, barrier, exact_f32);
     }
 
     void push_dspark_linear(std::vector<mtl::Dispatch>& ds, const std::string& name,
@@ -599,70 +656,113 @@ struct InkMetalRunner {
             const bool is_swa = (c.is_swa[ip] != 0);
             const int save_ring = (step.record_verify_ring && n_active_slots == 1 && M <= 8) ? 1 : 0;
 
-            // Attention-Residual mix before attention (ip > 0) — b_cur is untouched until residual update!
-            if (ip > 0) {
-                const int nq = is_swa ? 1 : 3;
-                mtl::Dispatch d;
-                d.p = &p_attn_res_mix;
-                d.grid[0] = (uint32_t)M;
-                d.tg[0] = 256;
-                int boff = 0;
-                d.args = {mtl::Arg::B(b_blocks), mtl::Arg::B(b_cur),
-                          mod->tw("model.llm.attn_res.attn_queries." + std::to_string(ip - 1)),
-                          mtl::Arg::B(b_in3),
-                          mtl::Arg::V(n_blocks), mtl::Arg::V(block_stride), mtl::Arg::V(M_stride),
-                          mtl::Arg::V(nq), mtl::Arg::V(boff)};
-                ds.push_back(std::move(d));
-                if (is_swa && has_msgs) {
-                    // Copy mixed into slots 1 and 2 so k/v controllers can diverge independently
-                    push_copy(mtl::Arg::B(b_in3), mtl::Arg::B(b_in3, (size_t)M_stride * 4), M_stride);
-                    push_copy(mtl::Arg::B(b_in3), mtl::Arg::B(b_in3, (size_t)2 * M_stride * 4), M_stride);
+            // Attention-Residual mix + optional 3-way concurrent loop controllers + input RMSNorm
+            // Fused attn_res_mix_norm eliminates ~90 barriers/token when !has_msgs!
+            if (!has_msgs) {
+                if (ip == 0) {
+                    mtl::Dispatch d;
+                    d.p = &p_rms_norm; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
+                    d.args = {mtl::Arg::B(b_cur), mod->tw(p + ".attn_norm.weight"), mtl::Arg::B(b_in3), mtl::Arg::V(D)};
+                    ds.push_back(std::move(d));
+                } else {
+                    const int nq = is_swa ? 1 : 3;
+                    mtl::Dispatch d;
+                    d.p = &p_attn_res_mix_norm; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
+                    mtl::Arg nw0 = is_swa ? mod->tw(p + ".attn_norm.weight") : mod->tw(p + ".q_input_norm.weight");
+                    mtl::Arg nw1 = is_swa ? nw0 : mod->tw(p + ".k_input_norm.weight");
+                    mtl::Arg nw2 = is_swa ? nw0 : mod->tw(p + ".v_input_norm.weight");
+                    d.args = {mtl::Arg::B(b_blocks), mtl::Arg::B(b_cur),
+                              mod->tw("model.llm.attn_res.attn_queries." + std::to_string(ip - 1)),
+                              nw0, nw1, nw2, mtl::Arg::B(b_in3),
+                              mtl::Arg::V(n_blocks), mtl::Arg::V(block_stride), mtl::Arg::V(M_stride), mtl::Arg::V(nq)};
+                    ds.push_back(std::move(d));
                 }
             } else {
-                push_copy(mtl::Arg::B(b_cur), mtl::Arg::B(b_in3), M_stride);
-            }
-
-            // Cross-pass loop controllers (attn, k, v) on passes 1 & 2 + input RMSNorm
-            if (has_msgs) {
+                const int nq = is_swa ? 1 : 3;
+                {
+                    // Runs CONCURRENTLY with the cross-pass b_msgs attn_res_mix (disjoint inputs & outputs -> -24 barriers!)
+                    mtl::Dispatch d;
+                    d.barrier = false;
+                    d.p = &p_attn_res_mix; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
+                    int boff = 0;
+                    d.args = {mtl::Arg::B(b_blocks), mtl::Arg::B(b_cur),
+                              mod->tw("model.llm.attn_res.attn_queries." + std::to_string(ip - 1)),
+                              mtl::Arg::B(b_in3),
+                              mtl::Arg::V(n_blocks), mtl::Arg::V(block_stride), mtl::Arg::V(M_stride),
+                              mtl::Arg::V(nq), mtl::Arg::V(boff)};
+                    ds.push_back(std::move(d));
+                }
+                // Run all 3 (attn, k, v) controllers CONCURRENTLY in 3 barriers instead of 9 (saves 144+ barriers/tok)!
                 const char* cnames[3] = {"attn", "k", "v"};
                 const char* nnames[3] = {"q_input_norm.weight", "k_input_norm.weight", "v_input_norm.weight"};
                 for (int j = 0; j < 3; ++j) {
-                    const size_t ioff = (size_t)j * M_stride * 4;
+                    const size_t src_off = is_swa ? 0 : ((size_t)j * M_stride * 4);
                     const size_t moff = (size_t)j * M_stride * 4;
-                    {
-                        mtl::Dispatch d;
-                        d.p = &p_ctrl_cat; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
-                        d.args = {mtl::Arg::B(b_in3, ioff), mtl::Arg::B(b_msgs, moff), mtl::Arg::B(b_cat)};
-                        ds.push_back(std::move(d));
-                    }
+                    const size_t coff = (size_t)j * (size_t)M * 2 * D * 4;
+                    mtl::Dispatch d;
+                    d.barrier = (j == 0);
+                    d.p = &p_ctrl_cat; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
+                    d.args = {mtl::Arg::B(b_in3, src_off), mtl::Arg::B(b_msgs, moff), mtl::Arg::B(b_cat, coff)};
+                    ds.push_back(std::move(d));
+                }
+                for (int j = 0; j < 3; ++j) {
+                    const size_t coff = (size_t)j * (size_t)M * 2 * D * 4;
+                    const size_t goff = (size_t)j * (size_t)M * c.gate_rank * 4;
                     push_trunk_linear(ds, p + ".controllers." + cnames[j] + ".down_weight",
-                                      mtl::Arg::B(b_cat), mtl::Arg::B(b_ctrl_gate), M);
-                    {
-                        mtl::Dispatch d;
-                        d.p = &p_ctrl_apply; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
-                        int do_norm = 1;
+                                      mtl::Arg::B(b_cat, coff), mtl::Arg::B(b_ctrl_gate, goff), M, -1, (j == 0));
+                }
+                if (M > 8) {
+                    // Run ALL 3 (attn, k, v) gain & forget GEMMs CONCURRENTLY into b_cat[0..5], then 3-way concurrent fuse_norm (-96 barriers)!
+                    for (int j = 0; j < 3; ++j) {
+                        const size_t goff = (size_t)j * (size_t)M * c.gate_rank * 4;
+                        const size_t sg_off = (size_t)(2 * j + 0) * M_stride * 4;
+                        const size_t sf_off = (size_t)(2 * j + 1) * M_stride * 4;
+                        push_trunk_linear(ds, p + ".controllers." + cnames[j] + ".gain_weight",
+                                          mtl::Arg::B(b_ctrl_gate, goff), mtl::Arg::B(b_cat, sg_off), M, -1, (j == 0));
+                        push_trunk_linear(ds, p + ".controllers." + cnames[j] + ".forget_weight",
+                                          mtl::Arg::B(b_ctrl_gate, goff), mtl::Arg::B(b_cat, sf_off), M, -1, false);
+                    }
+                    const int order[3] = {1, 2, 0};
+                    for (int oi = 0; oi < 3; ++oi) {
+                        const int j = is_swa ? order[oi] : oi;
+                        const size_t src_off = is_swa ? 0 : ((size_t)j * M_stride * 4);
+                        const size_t dst_off = (size_t)j * M_stride * 4;
+                        const size_t moff = (size_t)j * M_stride * 4;
+                        const size_t sg_off = (size_t)(2 * j + 0) * M_stride * 4;
+                        const size_t sf_off = (size_t)(2 * j + 1) * M_stride * 4;
                         std::string nkey = is_swa ? (p + ".attn_norm.weight") : (p + "." + nnames[j]);
-                        d.args = {mtl::Arg::B(b_in3, ioff), mtl::Arg::B(b_msgs, moff), mtl::Arg::B(b_ctrl_gate),
+                        mtl::Dispatch df;
+                        df.barrier = (oi == 0) || (is_swa && oi == 2);
+                        df.p = &p_ctrl_fuse_norm; df.grid[0] = (uint32_t)M; df.tg[0] = 256;
+                        df.args = {mtl::Arg::B(b_in3, src_off), mtl::Arg::B(b_msgs, moff),
+                                   mtl::Arg::B(b_cat, sg_off), mtl::Arg::B(b_cat, sf_off),
+                                   mod->tw(nkey), mtl::Arg::B(b_in3, dst_off)};
+                        ds.push_back(std::move(df));
+                    }
+                } else {
+                    // 40-core parallel ink_ctrl_gf_64 (144 TGs each!) writing to scratch b_cat[0..2] -> ALL 3 run 100% CONCURRENTLY even for is_swa (-12 barriers!)
+                    for (int j = 0; j < 3; ++j) {
+                        const size_t src_off = is_swa ? 0 : ((size_t)j * M_stride * 4);
+                        const size_t dst_off = (size_t)j * M_stride * 4;
+                        const size_t moff = (size_t)j * M_stride * 4;
+                        const size_t goff = (size_t)j * (size_t)M * c.gate_rank * 4;
+                        mtl::Dispatch d;
+                        d.barrier = (j == 0);
+                        d.p = &p_ctrl_gf_64; d.grid[0] = 144; d.grid[1] = (uint32_t)M; d.tg[0] = 256;
+                        d.args = {mtl::Arg::B(b_in3, src_off), mtl::Arg::B(b_msgs, moff), mtl::Arg::B(b_ctrl_gate, goff),
                                   mod->tw(p + ".controllers." + cnames[j] + ".gain_weight"),
                                   mod->tw(p + ".controllers." + cnames[j] + ".forget_weight"),
-                                  mod->tw(nkey), mtl::Arg::B(b_in3, ioff), mtl::Arg::V(do_norm)};
+                                  mtl::Arg::B(b_cat, dst_off)};
                         ds.push_back(std::move(d));
                     }
-                }
-            } else {
-                if (is_swa) {
-                    mtl::Dispatch d;
-                    d.p = &p_rms_norm; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
-                    d.args = {mtl::Arg::B(b_in3), mod->tw(p + ".attn_norm.weight"), mtl::Arg::B(b_in3), mtl::Arg::V(D)};
-                    ds.push_back(std::move(d));
-                } else {
-                    const char* nnames[3] = {"q_input_norm.weight", "k_input_norm.weight", "v_input_norm.weight"};
                     for (int j = 0; j < 3; ++j) {
-                        const size_t ioff = (size_t)j * M_stride * 4;
-                        mtl::Dispatch d;
-                        d.p = &p_rms_norm; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
-                        d.args = {mtl::Arg::B(b_in3, ioff), mod->tw(p + "." + nnames[j]), mtl::Arg::B(b_in3, ioff), mtl::Arg::V(D)};
-                        ds.push_back(std::move(d));
+                        const size_t dst_off = (size_t)j * M_stride * 4;
+                        std::string nkey = is_swa ? (p + ".attn_norm.weight") : (p + "." + nnames[j]);
+                        mtl::Dispatch dn;
+                        dn.barrier = (j == 0);
+                        dn.p = &p_rms_norm; dn.grid[0] = (uint32_t)M; dn.tg[0] = 256;
+                        dn.args = {mtl::Arg::B(b_cat, dst_off), mod->tw(nkey), mtl::Arg::B(b_in3, dst_off), mtl::Arg::V(D)};
+                        ds.push_back(std::move(dn));
                     }
                 }
             }
@@ -720,18 +820,15 @@ struct InkMetalRunner {
                 }
             };
 
-            // 4-tap causal ShortConv on K & V (run concurrently!)
+            // 4-tap causal ShortConv on K & V + Q/R L2 clip & tau (ALL 3 run CONCURRENTLY -> saves 48 barriers!)
             const size_t sc_lbase = (size_t)ip * InkMetalModel::kSconvLayerFloats;
             {
-                int C_kv = 1024, has_dyn = is_swa ? 0 : 1;
+                int C_kv = 1024, has_dyn = is_swa ? 0 : 1, swa_i = is_swa ? 1 : 0;
                 push_sconv(b_k_raw, sc_lbase + InkMetalModel::kSconvKOff, b_kd_taps, sc_hist_k[visit], sc_ring_k[visit], b_k, C_kv, has_dyn, true);
                 push_sconv(b_v_raw, sc_lbase + InkMetalModel::kSconvVOff, b_vd_taps, sc_hist_v[visit], sc_ring_v[visit], b_v, C_kv, has_dyn, (n_active_slots == 1 && M >= 16 && !save_ring));
-            }
 
-            // L2 clip Q/R + tau(pos), and L2 clip K + V RMSNorm + KV Cache store (disjoint -> concurrent!)
-            {
-                int swa_i = is_swa ? 1 : 0;
                 mtl::Dispatch dqr;
+                dqr.barrier = false;
                 dqr.p = &p_qr_clip_tau;
                 dqr.grid[0] = (uint32_t)M; dqr.grid[1] = (uint32_t)c.n_head; dqr.tg[0] = 128;
                 dqr.args = {mtl::Arg::B(b_q), mod->tw(p + ".attn.q_l2_clip.scale"),
@@ -740,7 +837,7 @@ struct InkMetalRunner {
                 ds.push_back(std::move(dqr));
 
                 mtl::Dispatch dkv;
-                dkv.barrier = false;
+                dkv.barrier = true;
                 dkv.p = &p_kv_store_f16;
                 dkv.grid[0] = (uint32_t)M; dkv.grid[1] = (uint32_t)c.n_kv; dkv.tg[0] = 128;
                 dkv.args = {mtl::Arg::B(b_k), mtl::Arg::B(b_v),
@@ -772,37 +869,61 @@ struct InkMetalRunner {
                 ds.push_back(std::move(da));
             }
 
-            // Output projection wo_ud + 4-tap attn_sconv
+            // Output projection wo_ud + FUSED 4-tap attn_sconv + residual/block update (kills 56+ barriers/tok!)
             push_trunk_linear(ds, p + ".attn.wo_ud.weight", mtl::Arg::B(b_attn_out), mtl::Arg::B(b_wo_raw), M);
-            push_sconv(b_wo_raw, sc_lbase + InkMetalModel::kSconvAttnOff, b_kd_taps, sc_hist_attn[visit], sc_ring_attn[visit], b_wo, D, 0, true);
-
-            // Attention-Residual block boundary rule!
-            if (ip % c.block_size == 0) {
-                push_copy(mtl::Arg::B(b_cur), mtl::Arg::B(b_blocks, (size_t)n_blocks * block_stride * 4), M_stride);
-                ++n_blocks;
-                push_copy(mtl::Arg::B(b_wo), mtl::Arg::B(b_cur), M_stride);
+            const bool is_blk = (ip % c.block_size == 0);
+            if (n_active_slots == 1 && M >= 16 && !save_ring) {
+                push_sconv(b_wo_raw, sc_lbase + InkMetalModel::kSconvAttnOff, b_kd_taps, sc_hist_attn[visit], sc_ring_attn[visit], b_wo, D, 0, true);
+                if (is_blk) {
+                    push_copy(mtl::Arg::B(b_cur), mtl::Arg::B(b_blocks, (size_t)n_blocks * block_stride * 4), M_stride);
+                    ++n_blocks;
+                    push_copy(mtl::Arg::B(b_wo), mtl::Arg::B(b_cur), M_stride);
+                } else {
+                    mtl::Dispatch d;
+                    d.p = &p_add; d.grid[0] = (uint32_t)((M_stride + 255) / 256); d.tg[0] = 256;
+                    d.args = {mtl::Arg::B(b_cur), mtl::Arg::B(b_wo), mtl::Arg::B(b_cur), mtl::Arg::V(M_stride)};
+                    ds.push_back(std::move(d));
+                }
             } else {
+                int sb_i = is_blk ? 1 : 0;
                 mtl::Dispatch d;
-                d.p = &p_add;
-                d.grid[0] = (uint32_t)((M_stride + 255) / 256); d.tg[0] = 256;
-                d.args = {mtl::Arg::B(b_cur), mtl::Arg::B(b_wo), mtl::Arg::B(b_cur), mtl::Arg::V(M_stride)};
+                d.p = &p_sconv4_attn_res;
+                d.grid[0] = (uint32_t)n_active_slots; d.grid[1] = (uint32_t)((D + 255) / 256); d.tg[0] = 256;
+                d.args = {mtl::Arg::B(b_wo_raw), mtl::Arg::B(mod->static_sconv_buf, (sc_lbase + InkMetalModel::kSconvAttnOff) * 4),
+                          mtl::Arg::B(sc_hist_attn[visit]),
+                          mtl::Arg::B(b_active_slots), mtl::Arg::B(b_slot_tok_off), mtl::Arg::B(b_slot_tok_cnt), mtl::Arg::B(b_slot_tok_idx),
+                          mtl::Arg::B(b_cur),
+                          mtl::Arg::B(b_blocks, (size_t)(is_blk ? n_blocks : 0) * block_stride * 4),
+                          mtl::Arg::B(sc_ring_attn[visit]),
+                          mtl::Arg::V(sb_i), mtl::Arg::V(save_ring)};
                 ds.push_back(std::move(d));
+                if (is_blk) ++n_blocks;
             }
 
             // ---- MoE Sublayer ----
-            {
+            if (!has_msgs) {
+                // Fused attn_res_mix + mlp_norm (kills 24 barriers/tok!)
                 mtl::Dispatch d;
-                d.p = &p_attn_res_mix;
-                d.grid[0] = (uint32_t)M; d.tg[0] = 256;
-                int nq = 1, boff = 0;
+                d.p = &p_attn_res_mix_norm; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
+                int nq = 1;
+                mtl::Arg mnw = mod->tw(p + ".mlp_norm.weight");
                 d.args = {mtl::Arg::B(b_blocks), mtl::Arg::B(b_cur),
                           mod->tw("model.llm.attn_res.mlp_queries." + std::to_string(ip)),
-                          mtl::Arg::B(b_mlp_in),
-                          mtl::Arg::V(n_blocks), mtl::Arg::V(block_stride), mtl::Arg::V(M_stride),
-                          mtl::Arg::V(nq), mtl::Arg::V(boff)};
+                          mnw, mnw, mnw, mtl::Arg::B(b_mlp_in),
+                          mtl::Arg::V(n_blocks), mtl::Arg::V(block_stride), mtl::Arg::V(M_stride), mtl::Arg::V(nq)};
                 ds.push_back(std::move(d));
-            }
-            if (has_msgs) {
+            } else {
+                {
+                    mtl::Dispatch d;
+                    d.p = &p_attn_res_mix; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
+                    int nq = 1, boff = 0;
+                    d.args = {mtl::Arg::B(b_blocks), mtl::Arg::B(b_cur),
+                              mod->tw("model.llm.attn_res.mlp_queries." + std::to_string(ip)),
+                              mtl::Arg::B(b_mlp_in),
+                              mtl::Arg::V(n_blocks), mtl::Arg::V(block_stride), mtl::Arg::V(M_stride),
+                              mtl::Arg::V(nq), mtl::Arg::V(boff)};
+                    ds.push_back(std::move(d));
+                }
                 {
                     mtl::Dispatch d;
                     d.p = &p_ctrl_cat; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
@@ -810,77 +931,124 @@ struct InkMetalRunner {
                     ds.push_back(std::move(d));
                 }
                 push_trunk_linear(ds, p + ".controllers.mlp.down_weight", mtl::Arg::B(b_cat), mtl::Arg::B(b_ctrl_gate), M);
-                {
+                if (M > 8) {
+                    push_trunk_linear(ds, p + ".controllers.mlp.gain_weight",
+                                      mtl::Arg::B(b_ctrl_gate), mtl::Arg::B(b_wo_raw), M, -1, true);
+                    push_trunk_linear(ds, p + ".controllers.mlp.forget_weight",
+                                      mtl::Arg::B(b_ctrl_gate), mtl::Arg::B(b_wo), M, -1, false);
+                    mtl::Dispatch df;
+                    df.p = &p_ctrl_fuse_norm; df.grid[0] = (uint32_t)M; df.tg[0] = 256;
+                    df.args = {mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_msgs, (size_t)3 * M_stride * 4),
+                               mtl::Arg::B(b_wo_raw), mtl::Arg::B(b_wo),
+                               mod->tw(p + ".mlp_norm.weight"), mtl::Arg::B(b_mlp_in)};
+                    ds.push_back(std::move(df));
+                } else {
                     mtl::Dispatch d;
-                    d.p = &p_ctrl_apply; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
-                    int do_norm = 1;
+                    d.p = &p_ctrl_gf_64; d.grid[0] = 144; d.grid[1] = (uint32_t)M; d.tg[0] = 256;
                     d.args = {mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_msgs, (size_t)3 * M_stride * 4), mtl::Arg::B(b_ctrl_gate),
                               mod->tw(p + ".controllers.mlp.gain_weight"),
                               mod->tw(p + ".controllers.mlp.forget_weight"),
-                              mod->tw(p + ".mlp_norm.weight"), mtl::Arg::B(b_mlp_in), mtl::Arg::V(do_norm)};
+                              mtl::Arg::B(b_mlp_in)};
                     ds.push_back(std::move(d));
+                    mtl::Dispatch dn;
+                    dn.p = &p_rms_norm; dn.grid[0] = (uint32_t)M; dn.tg[0] = 256;
+                    dn.args = {mtl::Arg::B(b_mlp_in), mod->tw(p + ".mlp_norm.weight"), mtl::Arg::B(b_mlp_in), mtl::Arg::V(D)};
+                    ds.push_back(std::move(dn));
                 }
-            } else {
-                mtl::Dispatch d;
-                d.p = &p_rms_norm; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
-                d.args = {mtl::Arg::B(b_mlp_in), mod->tw(p + ".mlp_norm.weight"), mtl::Arg::B(b_mlp_in), mtl::Arg::V(D)};
-                ds.push_back(std::move(d));
             }
 
-            // Router + Top-8 + GPU-side moe_plan + Indirect moe_gu_situ + Indirect moe_dn + reduce8
-            push_trunk_linear(ds, p + ".mlp.gate.weight", mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_r_logits), M);
-            {
+            // Router (exact FP32!) + Top-8 (+ fused M==1 moe_plan -> kills 48 barriers!) + MoE
+            push_trunk_linear(ds, p + ".mlp.gate.weight", mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_r_logits), M, -1, true, true);
+            if (M == 1) {
                 mtl::Dispatch d;
-                d.p = &p_router_topk8; d.grid[0] = (uint32_t)M; d.tg[0] = 128;
+                d.p = &p_router_topk8_plan_m1; d.grid[0] = 1; d.tg[0] = 128;
                 d.args = {mtl::Arg::B(b_r_logits), mod->tw(p + ".mlp.gate.bias"),
-                          mtl::Arg::B(b_topk_idx), mtl::Arg::B(b_topk_w), mtl::Arg::V(c.route_scale)};
-                ds.push_back(std::move(d));
-            }
-            {
-                int P = M * c.top_k;
-                mtl::Dispatch d;
-                d.p = &p_moe_plan; d.grid[0] = 1; d.tg[0] = 128;
-                d.args = {mtl::Arg::B(b_topk_idx), mtl::Arg::V(P),
+                          mtl::Arg::B(b_topk_idx), mtl::Arg::B(b_topk_w),
                           mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
-                          mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta)};
+                          mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::V(c.route_scale)};
                 ds.push_back(std::move(d));
+            } else {
+                {
+                    mtl::Dispatch d;
+                    d.p = &p_router_topk8; d.grid[0] = (uint32_t)M; d.tg[0] = 128;
+                    d.args = {mtl::Arg::B(b_r_logits), mod->tw(p + ".mlp.gate.bias"),
+                              mtl::Arg::B(b_topk_idx), mtl::Arg::B(b_topk_w), mtl::Arg::V(c.route_scale)};
+                    ds.push_back(std::move(d));
+                }
+                {
+                    int P = M * c.top_k;
+                    mtl::Dispatch d;
+                    d.p = &p_moe_plan; d.grid[0] = 1; d.tg[0] = 128;
+                    d.args = {mtl::Arg::B(b_topk_idx), mtl::Arg::V(P),
+                              mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
+                              mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_tiles)};
+                    ds.push_back(std::move(d));
+                }
             }
             const size_t ex_off = (size_t)ip * c.n_experts * sizeof(InkExpertDev);
+            // Flattened parallel (expert, m_tile) BM=32 BN=64 BK=64 simdgroup_matrix MoE for M >= 48 (zero tail straggler!)
+            const bool use_moe_mm = (M >= 48);
             {
                 mtl::Dispatch d;
-                d.p = (layer_homog_gu[ip] == 15) ? &p_moe_gu_sf4
-                    : (layer_homog_gu[ip] == 16) ? &p_moe_gu_mx8 : &p_moe_gu;
+                if (use_moe_mm) {
+                    d.p = (layer_homog_gu[ip] == 15) ? &p_moe_gu_mm_sf4
+                        : (layer_homog_gu[ip] == 16) ? &p_moe_gu_mm_mx8 : &p_moe_gu_mm_gen;
+                    d.ind_off = 8 * sizeof(uint32_t);
+                } else {
+                    d.p = (layer_homog_gu[ip] == 15) ? &p_moe_gu_sf4
+                        : (layer_homog_gu[ip] == 16) ? &p_moe_gu_mx8 : &p_moe_gu;
+                    d.ind_off = 2 * sizeof(uint32_t);
+                }
                 d.tg[0] = 256;
-                d.indirect = &b_moe_meta; d.ind_off = 2 * sizeof(uint32_t);
+                d.indirect = &b_moe_meta;
                 d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_mlp_in),
-                          mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
+                          use_moe_mm ? mtl::Arg::B(b_moe_tiles) : mtl::Arg::B(b_moe_uexp),
+                          mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
                           mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h)};
                 ds.push_back(std::move(d));
             }
             {
                 mtl::Dispatch d;
-                d.p = (layer_homog_dn[ip] == 15) ? &p_moe_dn_sf4
-                    : (layer_homog_dn[ip] == 16) ? &p_moe_dn_mx8 : &p_moe_dn;
+                if (use_moe_mm) {
+                    d.p = (layer_homog_dn[ip] == 15) ? &p_moe_dn_mm_sf4
+                        : (layer_homog_dn[ip] == 16) ? &p_moe_dn_mm_mx8 : &p_moe_dn_mm_gen;
+                    d.ind_off = 8 * sizeof(uint32_t);
+                } else {
+                    d.p = (layer_homog_dn[ip] == 15) ? &p_moe_dn_sf4
+                        : (layer_homog_dn[ip] == 16) ? &p_moe_dn_mx8 : &p_moe_dn;
+                    d.ind_off = 5 * sizeof(uint32_t);
+                }
                 d.tg[0] = 256;
-                d.indirect = &b_moe_meta; d.ind_off = 5 * sizeof(uint32_t);
+                d.indirect = &b_moe_meta;
                 d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_topk_w),
-                          mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
+                          use_moe_mm ? mtl::Arg::B(b_moe_tiles) : mtl::Arg::B(b_moe_uexp),
+                          mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
                           mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h), mtl::Arg::B(b_moe_yp)};
                 ds.push_back(std::move(d));
             }
-            {
+            // Fused MoE reduce8 + mlp_sconv + residual add (kills 96 dispatches & 96 barriers/tok!)
+            if (n_active_slots == 1 && M >= 16 && !save_ring) {
+                {
+                    mtl::Dispatch d;
+                    d.p = &p_moe_red8; d.grid[0] = (uint32_t)M; d.grid[1] = 9; d.tg[0] = 256;
+                    d.args = {mtl::Arg::B(b_moe_yp), mtl::Arg::B(b_moe_raw)};
+                    ds.push_back(std::move(d));
+                }
+                push_sconv(b_moe_raw, sc_lbase + InkMetalModel::kSconvMlpOff, b_kd_taps, sc_hist_mlp[visit], sc_ring_mlp[visit], b_moe_out, D, 0, true);
+                {
+                    mtl::Dispatch d;
+                    d.p = &p_add; d.grid[0] = (uint32_t)((M_stride + 255) / 256); d.tg[0] = 256;
+                    d.args = {mtl::Arg::B(b_cur), mtl::Arg::B(b_moe_out), mtl::Arg::B(b_cur), mtl::Arg::V(M_stride)};
+                    ds.push_back(std::move(d));
+                }
+            } else {
                 mtl::Dispatch d;
-                d.p = &p_moe_red8; d.grid[0] = (uint32_t)M; d.grid[1] = 9; d.tg[0] = 256;
-                d.args = {mtl::Arg::B(b_moe_yp), mtl::Arg::B(b_moe_raw)};
-                ds.push_back(std::move(d));
-            }
-            // mlp_sconv + residual add
-            push_sconv(b_moe_raw, sc_lbase + InkMetalModel::kSconvMlpOff, b_kd_taps, sc_hist_mlp[visit], sc_ring_mlp[visit], b_moe_out, D, 0, true);
-            {
-                mtl::Dispatch d;
-                d.p = &p_add;
-                d.grid[0] = (uint32_t)((M_stride + 255) / 256); d.tg[0] = 256;
-                d.args = {mtl::Arg::B(b_cur), mtl::Arg::B(b_moe_out), mtl::Arg::B(b_cur), mtl::Arg::V(M_stride)};
+                d.p = &p_moe_red8_sconv_add;
+                d.grid[0] = (uint32_t)n_active_slots; d.grid[1] = 9; d.tg[0] = 256;
+                d.args = {mtl::Arg::B(b_moe_yp), mtl::Arg::B(mod->static_sconv_buf, (sc_lbase + InkMetalModel::kSconvMlpOff) * 4),
+                          mtl::Arg::B(sc_hist_mlp[visit]),
+                          mtl::Arg::B(b_active_slots), mtl::Arg::B(b_slot_tok_off), mtl::Arg::B(b_slot_tok_cnt), mtl::Arg::B(b_slot_tok_idx),
+                          mtl::Arg::B(b_cur), mtl::Arg::B(sc_ring_mlp[visit]), mtl::Arg::V(save_ring)};
                 ds.push_back(std::move(d));
             }
         };
@@ -929,85 +1097,113 @@ struct InkMetalRunner {
             run_visit(ip, visit++, 0, false);
         }
 
-        // 5. Final Output Attention-Residual mix + model.llm.norm
+        // 5. Fused Final Output Attention-Residual mix + model.llm.norm
         {
             mtl::Dispatch d;
-            d.p = &p_attn_res_mix; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
-            int nq = 1, boff = 0;
+            d.p = &p_attn_res_mix_norm; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
+            int nq = 1;
+            mtl::Arg fnw = mod->tw("model.llm.norm.weight");
             d.args = {mtl::Arg::B(b_blocks), mtl::Arg::B(b_cur),
-                      mod->tw("model.llm.attn_res.output_query"), mtl::Arg::B(b_h_out),
-                      mtl::Arg::V(n_blocks), mtl::Arg::V(block_stride), mtl::Arg::V(M_stride),
-                      mtl::Arg::V(nq), mtl::Arg::V(boff)};
-            ds.push_back(std::move(d));
-        }
-        {
-            mtl::Dispatch d;
-            d.p = &p_rms_norm; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
-            d.args = {mtl::Arg::B(b_h_out), mod->tw("model.llm.norm.weight"), mtl::Arg::B(b_h_norm), mtl::Arg::V(D)};
+                      mod->tw("model.llm.attn_res.output_query"), fnw, fnw, fnw, mtl::Arg::B(b_h_norm),
+                      mtl::Arg::V(n_blocks), mtl::Arg::V(block_stride), mtl::Arg::V(M_stride), mtl::Arg::V(nq)};
             ds.push_back(std::move(d));
         }
 
         // 6. Optional DSpark tap[3] (visit 48 = h_norm) -> populate DSpark context KV & f_rnn on GPU!
         if (step.capture_taps && use_dspark) {
             push_copy(mtl::Arg::B(b_h_norm), mtl::Arg::B(b_taps4, (size_t)3 * M_stride * 4), M_stride);
+            // Compute all 3 layer mixes into b_in3[0..2] + f_rnn into dsp_frnn_tmp CONCURRENTLY (1 barrier instead of 4!)
             for (int dl = 0; dl < 3; ++dl) {
                 std::string dp = "dspark.layers." + std::to_string(dl);
-                {
-                    mtl::Dispatch d;
-                    d.p = &p_dsp_mix; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
-                    d.args = {mtl::Arg::B(b_taps4), mod->dw("dspark.fuse_weight"), mod->dw(dp + ".dflare_norm.weight"),
-                              mtl::Arg::B(b_mlp_in), mtl::Arg::V(dl), mtl::Arg::V(M)};
-                    ds.push_back(std::move(d));
-                }
-                push_dspark_linear(ds, dp + ".self_attn.k_proj_ctx.weight", mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_k_raw), M, true);
-                push_dspark_linear(ds, dp + ".self_attn.v_proj_ctx.weight", mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_v_raw), M, false);
-                {
-                    mtl::Dispatch d;
-                    d.p = &p_dsp_ctx_kv; d.grid[0] = (uint32_t)M; d.grid[1] = 8; d.tg[0] = 128;
-                    d.args = {mtl::Arg::B(b_k_raw), mtl::Arg::B(b_v_raw), mod->dw(dp + ".self_attn.k_norm_ctx.weight"),
-                              mtl::Arg::B(dsp_ctx_k[dl]), mtl::Arg::B(dsp_ctx_v[dl]),
-                              mtl::Arg::B(b_slot_ids), mtl::Arg::B(b_pos),
-                              mtl::Arg::V(max_ctx), mtl::Arg::V(c.dspark_rope_theta)};
-                    ds.push_back(std::move(d));
-                }
+                mtl::Dispatch d;
+                d.barrier = (dl == 0);
+                d.p = &p_dsp_mix; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
+                d.args = {mtl::Arg::B(b_taps4), mod->dw("dspark.fuse_weight"), mod->dw(dp + ".dflare_norm.weight"),
+                          mtl::Arg::B(b_in3, (size_t)dl * M_stride * 4), mtl::Arg::V(dl), mtl::Arg::V(M)};
+                ds.push_back(std::move(d));
             }
-            // f_rnn_all = mix_taps(taps4, row=3, markov_head.dflare_norm)
             {
                 int row3 = 3;
                 mtl::Dispatch d;
+                d.barrier = false;
                 d.p = &p_dsp_mix; d.grid[0] = (uint32_t)M; d.tg[0] = 256;
                 d.args = {mtl::Arg::B(b_taps4), mod->dw("dspark.fuse_weight"),
                           mod->dw("dspark.markov_head.dflare_norm.weight"),
                           mtl::Arg::B(dsp_frnn_tmp), mtl::Arg::V(row3), mtl::Arg::V(M)};
                 ds.push_back(std::move(d));
             }
+            for (int dl = 0; dl < 3; ++dl) {
+                std::string dp = "dspark.layers." + std::to_string(dl);
+                mtl::Arg mx = mtl::Arg::B(b_in3, (size_t)dl * M_stride * 4);
+                push_dspark_linear(ds, dp + ".self_attn.k_proj_ctx.weight", mx, mtl::Arg::B(b_k_raw), M, true);
+                push_dspark_linear(ds, dp + ".self_attn.v_proj_ctx.weight", mx, mtl::Arg::B(b_v_raw), M, false);
+                mtl::Dispatch d;
+                d.p = &p_dsp_ctx_kv; d.grid[0] = (uint32_t)M; d.grid[1] = 8; d.tg[0] = 128;
+                d.args = {mtl::Arg::B(b_k_raw), mtl::Arg::B(b_v_raw), mod->dw(dp + ".self_attn.k_norm_ctx.weight"),
+                          mtl::Arg::B(dsp_ctx_k[dl]), mtl::Arg::B(dsp_ctx_v[dl]),
+                          mtl::Arg::B(b_slot_ids), mtl::Arg::B(b_pos),
+                          mtl::Arg::V(max_ctx), mtl::Arg::V(c.dspark_rope_theta)};
+                ds.push_back(std::move(d));
+            }
         }
 
-        // 7. Unembed + softcap(30.0) + argmax
+        // 7. Unembed + softcap(30.0) + argmax (fused unembed+argmax when logits_out == nullptr & n_lg == 1!)
         int n_lg = 0;
         if (step.compute_logits) {
+            const auto& uti = mod->man.get("model.llm.unembed.weight");
             if (step.logits_last_only_idx >= 0) {
                 n_lg = 1;
-                push_trunk_linear(ds, "model.llm.unembed.weight",
-                                  mtl::Arg::B(b_h_norm, (size_t)step.logits_last_only_idx * D * 4),
-                                  mtl::Arg::B(b_logits), 1, c.vocab_unpadded);
+                const mtl::Arg h_arg = mtl::Arg::B(b_h_norm, (size_t)step.logits_last_only_idx * D * 4);
+                if (!logits_out && argmax_out && (uti.fmt == FMT_Q8ROW || uti.fmt == FMT_BF16 || uti.fmt == FMT_S6)) {
+                    const int V = c.vocab_unpadded;
+                    const int rpt = (uti.fmt == FMT_S6) ? 16 : 32;
+                    const int nparts = (V + rpt - 1) / rpt;
+                    mtl::Dispatch du;
+                    du.p = (uti.fmt == FMT_Q8ROW) ? &p_unemb_argmax_q8
+                         : (uti.fmt == FMT_BF16)  ? &p_unemb_argmax_bf16 : &p_unemb_argmax_sk6;
+                    du.grid[0] = (uint32_t)nparts; du.tg[0] = 256;
+                    du.args = {mod->tw("model.llm.unembed.weight"), h_arg,
+                               mtl::Arg::B(bd_part_val), mtl::Arg::B(bd_part_idx),
+                               mtl::Arg::V(V), mtl::Arg::V(D)};
+                    ds.push_back(std::move(du));
+                    mtl::Dispatch dr;
+                    dr.p = &p_argmax_part; dr.grid[0] = 1; dr.tg[0] = 256;
+                    dr.args = {mtl::Arg::B(bd_part_val), mtl::Arg::B(bd_part_idx),
+                               mtl::Arg::B(b_argmax), mtl::Arg::V(nparts)};
+                    ds.push_back(std::move(dr));
+                } else {
+                    push_trunk_linear(ds, "model.llm.unembed.weight", h_arg, mtl::Arg::B(b_logits), 1, c.vocab_unpadded);
+                    if (logits_out) {
+                        int tot = c.vocab_unpadded;
+                        mtl::Dispatch d;
+                        d.p = &p_softcap; d.grid[0] = (uint32_t)((tot + 255) / 256); d.tg[0] = 256;
+                        d.args = {mtl::Arg::B(b_logits), mtl::Arg::V(tot), mtl::Arg::V(c.logit_softcap)};
+                        ds.push_back(std::move(d));
+                    }
+                    if (argmax_out) {
+                        mtl::Dispatch d;
+                        d.p = &p_argmax_rows; d.grid[0] = 1; d.tg[0] = 256;
+                        d.args = {mtl::Arg::B(b_logits), mtl::Arg::B(b_argmax), mtl::Arg::V(c.vocab_unpadded)};
+                        ds.push_back(std::move(d));
+                    }
+                }
             } else {
                 n_lg = std::min(M, 64);
                 push_trunk_linear(ds, "model.llm.unembed.weight", mtl::Arg::B(b_h_norm), mtl::Arg::B(b_logits),
                                   n_lg, c.vocab_unpadded);
-            }
-            {
-                int tot = n_lg * c.vocab_unpadded;
-                mtl::Dispatch d;
-                d.p = &p_softcap; d.grid[0] = (uint32_t)((tot + 255) / 256); d.tg[0] = 256;
-                d.args = {mtl::Arg::B(b_logits), mtl::Arg::V(tot), mtl::Arg::V(c.logit_softcap)};
-                ds.push_back(std::move(d));
-            }
-            if (argmax_out) {
-                mtl::Dispatch d;
-                d.p = &p_argmax_rows; d.grid[0] = (uint32_t)n_lg; d.tg[0] = 256;
-                d.args = {mtl::Arg::B(b_logits), mtl::Arg::B(b_argmax), mtl::Arg::V(c.vocab_unpadded)};
-                ds.push_back(std::move(d));
+                if (logits_out) {
+                    int tot = n_lg * c.vocab_unpadded;
+                    mtl::Dispatch d;
+                    d.p = &p_softcap; d.grid[0] = (uint32_t)((tot + 255) / 256); d.tg[0] = 256;
+                    d.args = {mtl::Arg::B(b_logits), mtl::Arg::V(tot), mtl::Arg::V(c.logit_softcap)};
+                    ds.push_back(std::move(d));
+                }
+                if (argmax_out) {
+                    mtl::Dispatch d;
+                    d.p = &p_argmax_rows; d.grid[0] = (uint32_t)n_lg; d.tg[0] = 256;
+                    d.args = {mtl::Arg::B(b_logits), mtl::Arg::B(b_argmax), mtl::Arg::V(c.vocab_unpadded)};
+                    ds.push_back(std::move(d));
+                }
             }
         }
 
@@ -1183,10 +1379,28 @@ struct InkMetalRunner {
                 d.args = {mtl::Arg::B(bd_cur, (size_t)s * D * 4), mtl::Arg::B(bd_corr), mtl::Arg::B(bd_comb), mtl::Arg::V(D)};
                 ds.push_back(std::move(d));
             }
-            push_trunk_linear(ds, "model.llm.unembed.weight", mtl::Arg::B(bd_comb), mtl::Arg::B(bd_logits),
-                              1, c.vocab_unpadded);
-            {
-                // Argmax directly on un-softcapped logits (30*tanh(z/30) is strictly monotonic!)
+            // Fused Unembed + Argmax directly on un-softcapped logits (ZERO 800 KB bd_logits DRAM write/read!)
+            const auto& uti = mod->man.get("model.llm.unembed.weight");
+            if (uti.fmt == FMT_Q8ROW || uti.fmt == FMT_BF16 || uti.fmt == FMT_S6) {
+                const int V = c.vocab_unpadded;
+                const int rpt = (uti.fmt == FMT_S6) ? 16 : 32;
+                const int nparts = (V + rpt - 1) / rpt;
+                mtl::Dispatch du;
+                du.p = (uti.fmt == FMT_Q8ROW) ? &p_unemb_argmax_q8
+                     : (uti.fmt == FMT_BF16)  ? &p_unemb_argmax_bf16 : &p_unemb_argmax_sk6;
+                du.grid[0] = (uint32_t)nparts; du.tg[0] = 256;
+                du.args = {mod->tw("model.llm.unembed.weight"), mtl::Arg::B(bd_comb),
+                           mtl::Arg::B(bd_part_val), mtl::Arg::B(bd_part_idx),
+                           mtl::Arg::V(V), mtl::Arg::V(D)};
+                ds.push_back(std::move(du));
+                mtl::Dispatch dr;
+                dr.p = &p_argmax_part; dr.grid[0] = 1; dr.tg[0] = 256;
+                dr.args = {mtl::Arg::B(bd_part_val), mtl::Arg::B(bd_part_idx),
+                           mtl::Arg::B(bd_tok_chain, (size_t)s * 4), mtl::Arg::V(nparts)};
+                ds.push_back(std::move(dr));
+            } else {
+                push_trunk_linear(ds, "model.llm.unembed.weight", mtl::Arg::B(bd_comb), mtl::Arg::B(bd_logits),
+                                  1, c.vocab_unpadded);
                 mtl::Dispatch da; da.p = &p_argmax_rows; da.grid[0] = 1; da.tg[0] = 256;
                 da.args = {mtl::Arg::B(bd_logits), mtl::Arg::B(bd_tok_chain, (size_t)s * 4), mtl::Arg::V(c.vocab_unpadded)};
                 ds.push_back(std::move(da));

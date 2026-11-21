@@ -209,7 +209,7 @@ struct InkMetalVision {
             if (M > 8) {
                 d.p = &p_mm_bf16;
                 d.grid[0] = (uint32_t)((N + 63) / 64);
-                d.grid[1] = (uint32_t)((M + 31) / 32);
+                d.grid[1] = (uint32_t)((M + 63) / 64);
                 d.tg[0] = 256;
             } else {
                 d.p = &p_mv_bf16;
