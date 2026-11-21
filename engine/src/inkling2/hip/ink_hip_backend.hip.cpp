@@ -1,0 +1,2259 @@
+// engine/src/inkling2/hip/ink_hip_backend.hip.cpp
+// Complete Multi-Gen AMD ROCm/HIP Backend for strata-inkling (Inkling-2-Mini 24->48 Looped MoE + DSpark + Vision).
+// Supports:
+//   - RDNA4 (gfx1200/1201): Wave32 half8 + 2x-rate iu8 WMMA
+//   - RDNA3 / RDNA3.5 (gfx1100/1101/1102, gfx1103 Radeon 780M iGPU, gfx1150 Strix Point 890M, gfx1151 Strix Halo)
+//   - RDNA2 (gfx1030/1031/1032): zero-WMMA Wave32 sdot4 + fdot2 tiled GEMM & SIMT Flash-SWA/GQA
+//   - Zero-OOM iGPU UMA coherent GTT fallback (512 MB - 4 GB BIOS carveout -> full 32/60/128 GB UMA!)
+//   - Windows WDDM TDR & Linux amdgpu MES <= 1.0s dispatch/chunk safety guard
+//   - B = 1..64 multi-request continuous batching, paged 64-tok SWA-1024 & Global KV (FP16 & FP8_E4M3)
+//   - Persistent on-GPU DSpark Block-8 Recurrent Markov drafter & GPU 23-layer BF16 Vision ViT
+// MIT License - Copyright (c) 2026 Niko1221 and the Strata contributors.
+
+#define INKLING_NO_STBI_IMPL
+#include "ink_backend.h"
+#include "ink_vision.h"
+#include "ink_hip_ops.hip.h"
+#include "strata/hip_uma_guard.hpp"
+#include "strata/inkling2/inkling2_loop.hpp"
+#include "strata/quant/sk_codecs.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace ink2 {
+namespace {
+
+using namespace strata::inkling2;
+using namespace strata::inkling2::hip;
+using namespace strata::hip_uma;
+using namespace strata::quant::sk;
+
+struct DeviceMemoryInfo {
+    char device_name[256]{};
+    char arch_name[128]{};
+    AmdGen gen = AmdGen::Unknown;
+    int cu_count = 0;
+    bool is_uma = false;
+    uint64_t carveout_free_bytes = 0;
+    uint64_t carveout_total_bytes = 0;
+    uint64_t effective_free_bytes = 0;
+    uint64_t effective_total_bytes = 0;
+    uint64_t reserve_bytes = 0;
+};
+
+static DeviceMemoryInfo query_device_memory(int gpu_index) noexcept {
+    DeviceMemoryInfo info{};
+    hipDeviceProp_t dp{};
+    if (hipGetDeviceProperties(&dp, gpu_index) == hipSuccess) {
+        std::snprintf(info.device_name, sizeof(info.device_name), "%s", dp.name);
+        std::snprintf(info.arch_name, sizeof(info.arch_name), "%s", dp.gcnArchName);
+        info.gen = classify_amd_gen(dp.gcnArchName);
+        info.cu_count = dp.multiProcessorCount;
+        info.is_uma = (dp.integrated != 0) || is_known_amd_igpu_arch(dp.gcnArchName);
+    }
+    size_t fr = 0, tot = 0;
+    if (hipMemGetInfo(&fr, &tot) == hipSuccess) {
+        info.carveout_free_bytes = fr;
+        info.carveout_total_bytes = tot;
+    }
+    effective_uma_memory(info.is_uma, info.carveout_free_bytes, info.carveout_total_bytes,
+                         info.effective_free_bytes, info.effective_total_bytes);
+    info.reserve_bytes = info.is_uma ? (1024ULL << 20) : (512ULL << 20);
+    return info;
+}
+
+static inline void hip_ign(hipError_t) noexcept {}
+
+__global__ void __launch_bounds__(256) k_bf16_to_f32_vec(const uint16_t* src, float* dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = strata::inkling2::hip::bf16_to_f32(src[i]);
+}
+
+__global__ void __launch_bounds__(256) k_f32_to_bf16_vec(const float* src, uint16_t* dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = strata::inkling2::hip::f32_to_bf16(src[i]);
+}
+
+// Batched DSpark context scatter: copies [B, cols] FP32 -> per-slot BF16 ring at pos[b] in 1 kernel launch!
+__global__ void __launch_bounds__(256) k_dspark_ctx_scatter(
+    const float* __restrict__ src,         // [B, cols]
+    uint16_t* const* __restrict__ dst_tbl, // [max_slots] per-slot base pointers
+    const int32_t* __restrict__ slot_ids,  // [B]
+    const int32_t* __restrict__ pos,       // [B]
+    int B, int cols) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b = blockIdx.y;
+    if (c >= cols || b >= B) return;
+    uint16_t* dst = dst_tbl[slot_ids[b]] + static_cast<size_t>(pos[b]) * cols;
+    dst[c] = strata::inkling2::hip::f32_to_bf16(src[static_cast<size_t>(b) * cols + c]);
+}
+
+// Reconstruct exact 3-lag BF16 ShortConv history at `keep_steps` (0..8) from pre-verify snapshot [3, C]
+// + recorded verify inputs [n_rec, C] so partial DSpark acceptance is 100% bit-exact!
+__global__ void __launch_bounds__(256) k_sconv_rollback_exact(
+    const uint16_t* __restrict__ snap3,  // [3, C] (h0, h1, h2 at snap_seq_len)
+    const uint16_t* __restrict__ rec,    // [8, C] (verify inputs x[0..n_rec-1])
+    uint16_t* __restrict__ dst3,         // [3, C] (slot's active ShortConv history)
+    int keep_steps, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    // Timeline of inputs ending at snap_seq_len + keep_steps - 1:
+    // index -3..-1 -> snap3[0..2], index 0..keep_steps-1 -> rec[0..keep_steps-1]
+    for (int lag = 0; lag < 3; ++lag) {
+        const int t = keep_steps - 3 + lag;
+        uint16_t val = (t < 0) ? snap3[(t + 3) * C + c] : rec[t * C + c];
+        dst3[lag * C + c] = val;
+    }
+}
+
+// Decode any Section 1 tensor format into FP32 on host (exact match to ink_cpu_backend.cpp)
+static std::vector<float> decode_sec1_f32(const uint8_t* sec1, const TInfo& ti) {
+    const size_t n = static_cast<size_t>(ti.numel());
+    std::vector<float> out(n, 0.0f);
+    const uint8_t* src = sec1 + ti.off;
+    if (ti.fmt == F_F32) {
+        std::memcpy(out.data(), src, n * sizeof(float));
+    } else if (ti.fmt == F_BF16) {
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+        for (size_t i = 0; i < n; ++i) out[i] = ink2::bf16_to_f32(p[i]);
+    } else if (ti.fmt == F_F16) {
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+        for (size_t i = 0; i < n; ++i) out[i] = ink2::fp16_to_f32(p[i]);
+    } else if (ti.fmt == F_Q8ROW) {
+        const size_t rows = static_cast<size_t>(ti.rows());
+        const size_t cols = static_cast<size_t>(ti.cols());
+        const float* scales = reinterpret_cast<const float*>(src);
+        const int8_t* qs = reinterpret_cast<const int8_t*>(src + rows * sizeof(float));
+        for (size_t r = 0; r < rows; ++r) {
+            const float sc = scales[r];
+            for (size_t c = 0; c < cols; ++c) out[r * cols + c] = static_cast<float>(qs[r * cols + c]) * sc;
+        }
+    } else {
+        dequant_sk_row(src, static_cast<SkCode>(ti.fmt), out.data(), n);
+    }
+    return out;
+}
+
+static std::vector<uint16_t> f32_vec_to_bf16(const std::vector<float>& v) {
+    std::vector<uint16_t> out(v.size());
+    for (size_t i = 0; i < v.size(); ++i) out[i] = ink2::f32_to_bf16(v[i]);
+    return out;
+}
+
+static bool hip_ok(hipError_t e, const char* ctx, std::string& err) {
+    if (e == hipSuccess) return true;
+    err = std::string("[ink-hip] ") + ctx + ": " + hipGetErrorString(e);
+    return false;
+}
+
+// Growable on-demand GPU Paged KV Pool for ONE visit (SWA or Global) across all max_slots!
+struct VisitKvPool {
+    bool is_swa = true;
+    bool is_fp8 = false;
+    bool is_uma = false;
+    int max_slots = 1;
+    int max_pages_per_slot = 16;
+    int kv_dim = 1024;
+    int cap_pages = 0;
+    int used_pages = 0;
+    uint64_t pool_gen = 0;
+
+    std::vector<int32_t> free_pages;
+    std::vector<int32_t> h_pt;  // [max_slots * max_pages_per_slot], -1 = unallocated
+    bool pt_dirty = true;
+
+    GpuBuffer d_pt;
+    GpuBuffer k_pool;
+    GpuBuffer v_pool;
+    GpuBuffer k_scales;
+    GpuBuffer v_scales;
+
+    void release() {
+        free_gpu_buffer(d_pt);
+        free_gpu_buffer(k_pool);
+        free_gpu_buffer(v_pool);
+        free_gpu_buffer(k_scales);
+        free_gpu_buffer(v_scales);
+        free_pages.clear();
+        h_pt.clear();
+        cap_pages = used_pages = 0;
+    }
+
+    bool init(bool swa, bool fp8, bool uma, int n_slots, int max_pages, int kvd, std::string& err) {
+        release();
+        is_swa = swa;
+        is_fp8 = fp8;
+        is_uma = uma;
+        max_slots = n_slots;
+        max_pages_per_slot = std::max(1, max_pages);
+        kv_dim = kvd;
+        h_pt.assign(static_cast<size_t>(max_slots) * max_pages_per_slot, -1);
+        pt_dirty = true;
+        return hip_ok(alloc_gpu_buffer(d_pt, h_pt.size() * sizeof(int32_t), is_uma), "kv d_pt alloc", err);
+    }
+
+    void free_slot_pages(int slot) {
+        if (slot < 0 || slot >= max_slots) return;
+        int32_t* row = h_pt.data() + static_cast<size_t>(slot) * max_pages_per_slot;
+        for (int p = 0; p < max_pages_per_slot; ++p) {
+            if (row[p] >= 0) {
+                free_pages.push_back(row[p]);
+                row[p] = -1;
+                pt_dirty = true;
+            }
+        }
+    }
+
+    bool grow_pool(int min_pages, hipStream_t st, std::string& err) {
+        int new_cap = std::max(min_pages, std::max(16, cap_pages * 2));
+        const size_t elem_b = is_fp8 ? 1u : 2u;
+        const size_t page_b = static_cast<size_t>(kKvPageTokens) * kv_dim * elem_b;
+
+        GpuBuffer nk, nv, nks, nvs;
+        if (!hip_ok(alloc_gpu_buffer(nk, static_cast<size_t>(new_cap) * page_b, is_uma), "kv grow k", err)) return false;
+        if (!hip_ok(alloc_gpu_buffer(nv, static_cast<size_t>(new_cap) * page_b, is_uma), "kv grow v", err)) {
+            free_gpu_buffer(nk);
+            return false;
+        }
+        if (is_fp8) {
+            const size_t sc_b = static_cast<size_t>(new_cap) * kKvPageTokens * sizeof(float);
+            if (!hip_ok(alloc_gpu_buffer(nks, sc_b, is_uma), "kv grow ks", err) ||
+                !hip_ok(alloc_gpu_buffer(nvs, sc_b, is_uma), "kv grow vs", err)) {
+                free_gpu_buffer(nk); free_gpu_buffer(nv); free_gpu_buffer(nks); free_gpu_buffer(nvs);
+                return false;
+            }
+        }
+        if (cap_pages > 0) {
+            const size_t old_b = static_cast<size_t>(cap_pages) * page_b;
+            if (!hip_ok(hipMemcpyAsync(nk.dev_ptr, k_pool.dev_ptr, old_b, hipMemcpyDeviceToDevice, st), "kv copy k", err)) return false;
+            if (!hip_ok(hipMemcpyAsync(nv.dev_ptr, v_pool.dev_ptr, old_b, hipMemcpyDeviceToDevice, st), "kv copy v", err)) return false;
+            if (is_fp8) {
+                const size_t old_sc = static_cast<size_t>(cap_pages) * kKvPageTokens * sizeof(float);
+                if (!hip_ok(hipMemcpyAsync(nks.dev_ptr, k_scales.dev_ptr, old_sc, hipMemcpyDeviceToDevice, st), "kv copy ks", err)) return false;
+                if (!hip_ok(hipMemcpyAsync(nvs.dev_ptr, v_scales.dev_ptr, old_sc, hipMemcpyDeviceToDevice, st), "kv copy vs", err)) return false;
+            }
+            if (!hip_ok(hipStreamSynchronize(st), "kv grow sync", err)) return false;
+        }
+        free_gpu_buffer(k_pool); free_gpu_buffer(v_pool);
+        free_gpu_buffer(k_scales); free_gpu_buffer(v_scales);
+        k_pool = nk; v_pool = nv; k_scales = nks; v_scales = nvs;
+        cap_pages = new_cap;
+        ++pool_gen;
+        return true;
+    }
+
+    bool ensure_page(int slot, int logical_page, hipStream_t st, std::string& err) {
+        if (logical_page < 0 || logical_page >= max_pages_per_slot) {
+            err = "KV logical page out of range (" + std::to_string(logical_page) + " >= " + std::to_string(max_pages_per_slot) + ")";
+            return false;
+        }
+        int32_t& entry = h_pt[static_cast<size_t>(slot) * max_pages_per_slot + logical_page];
+        if (entry >= 0) return true;
+        int phys = -1;
+        if (!free_pages.empty()) {
+            phys = free_pages.back();
+            free_pages.pop_back();
+        } else {
+            if (used_pages >= cap_pages) {
+                if (!grow_pool(used_pages + 1, st, err)) return false;
+            }
+            phys = used_pages++;
+        }
+        entry = phys;
+        pt_dirty = true;
+        return true;
+    }
+
+    bool sync_pt(hipStream_t st, std::string& err) {
+        if (!pt_dirty) return true;
+        pt_dirty = false;
+        return hip_ok(hipMemcpyAsync(d_pt.dev_ptr, h_pt.data(), h_pt.size() * sizeof(int32_t),
+                                     hipMemcpyHostToDevice, st),
+                      "kv sync d_pt", err);
+    }
+
+    size_t allocated_bytes() const noexcept {
+        return d_pt.bytes + k_pool.bytes + v_pool.bytes + k_scales.bytes + v_scales.bytes;
+    }
+};
+
+struct GpuSlotMeta {
+    bool allocated = false;
+    int max_ctx = 0;
+    int seq_len = 0;
+    int snap_seq_len = 0;
+    bool has_snap = false;
+    // Per-slot ShortConv snapshot buffer on GPU (3.83 MiB) + 8-step verify input ring (5.1 MiB) for exact partial rollback
+    GpuBuffer sconv_snap_k;
+    GpuBuffer sconv_snap_v;
+    GpuBuffer sconv_snap_attn;
+    GpuBuffer sconv_snap_mlp;
+    GpuBuffer sconv_rec_k;
+    GpuBuffer sconv_rec_v;
+    GpuBuffer sconv_rec_attn;
+    GpuBuffer sconv_rec_mlp;
+    int sconv_rec_n = 0;
+    // Per-slot DSpark context KV (3 layers BF16) + f_rnn (BF16), grown on demand
+    GpuBuffer dspark_k[3];
+    GpuBuffer dspark_v[3];
+    GpuBuffer dspark_frnn;
+    int dspark_cap = 0;
+    int dspark_len = 0;
+
+    void release() {
+        free_gpu_buffer(sconv_snap_k);
+        free_gpu_buffer(sconv_snap_v);
+        free_gpu_buffer(sconv_snap_attn);
+        free_gpu_buffer(sconv_snap_mlp);
+        free_gpu_buffer(sconv_rec_k);
+        free_gpu_buffer(sconv_rec_v);
+        free_gpu_buffer(sconv_rec_attn);
+        free_gpu_buffer(sconv_rec_mlp);
+        sconv_rec_n = 0;
+        for (int i = 0; i < 3; ++i) {
+            free_gpu_buffer(dspark_k[i]);
+            free_gpu_buffer(dspark_v[i]);
+        }
+        free_gpu_buffer(dspark_frnn);
+        dspark_cap = dspark_len = 0;
+        allocated = false;
+        has_snap = false;
+        seq_len = snap_seq_len = 0;
+    }
+};
+
+struct GpuPackedTensor {
+    TInfo info;
+    GpuBuffer buf;
+};
+
+struct GpuVisionState {
+    bool loaded = false;
+    VisionShardInfo info;
+    std::unordered_map<std::string, GpuBuffer> w_bf16;
+    std::unordered_map<std::string, GpuBuffer> w_f32;
+    std::vector<float> h_cls;
+    std::vector<float> h_cls_pos;
+    std::vector<float> h_pos_emb;
+
+    void release() {
+        for (auto& kv : w_bf16) free_gpu_buffer(kv.second);
+        for (auto& kv : w_f32) free_gpu_buffer(kv.second);
+        w_bf16.clear();
+        w_f32.clear();
+        loaded = false;
+    }
+};
+
+class HipBackend final : public InkBackend {
+public:
+    ~HipBackend() override { cleanup(); }
+
+    const char* backend_name() const noexcept override { return "hip"; }
+
+    std::string device_info() const override {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "%s (%s, %d CUs, UMA=%d, eff=%.2f GiB, chunk<=%d)",
+                      mem_info_.device_name, mem_info_.arch_name, mem_info_.cu_count,
+                      mem_info_.is_uma ? 1 : 0,
+                      static_cast<double>(mem_info_.effective_total_bytes) / 1073741824.0,
+                      guard_.max_prefill_chunk);
+        return std::string(buf);
+    }
+
+    BackendStats stats() const override {
+        BackendStats st;
+        st.vram_experts_loaded = vram_experts_loaded_;
+        st.ram_experts_loaded = ram_experts_loaded_;
+        st.total_experts = model_ ? model_->rd.expert_directory().size() : 0;
+        st.vram_used_bytes = vram_used_bytes();
+        st.vram_total_bytes = mem_info_.effective_total_bytes;
+        st.max_slots = max_slots_;
+        for (const auto& s : slots_) if (s.allocated) ++st.active_slots;
+        st.kv_dtype = default_kv_dtype_;
+        return st;
+    }
+
+    bool init(const InkModelFile& model, const BackendOpts& opts, std::string& err) override {
+        cleanup();
+        model_ = &model;
+        opts_ = opts;
+        c_ = model.m.c;
+        dspark_cfg_ = model.m.dspark;
+
+        if (!hip_ok(hipSetDevice(opts.gpu_index), "hipSetDevice", err)) return false;
+        if (!hip_ok(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "hipStreamCreate", err)) return false;
+
+        mem_info_ = query_device_memory(opts.gpu_index);
+        guard_ = compute_dispatch_guard(mem_info_.arch_name, mem_info_.cu_count, mem_info_.is_uma,
+#if defined(_WIN32)
+                                        true
+#else
+                                        false
+#endif
+        );
+
+        // Auto-select FP8_E4M3 KV when high concurrency (>= 16) on <= 32 GiB GPU
+        default_kv_dtype_ = opts.kv_dtype;
+        if (opts.kv_dtype_auto && opts.parallel >= 16 && mem_info_.effective_total_bytes <= 36ULL * 1073741824ULL) {
+            default_kv_dtype_ = KvDtype::FP8_E4M3;
+        }
+        max_slots_ = std::max(1, std::min(kMaxParallelSlots, opts.parallel));
+        max_ctx_ = std::max(256, opts.max_ctx);
+
+        // 1. Load Section 1 trunk + DSpark arena from .strata file
+        std::vector<uint8_t> sec1;
+        if (!model.rd.read_section(1, sec1, err)) return false;
+
+        const std::string embed_k = "model.llm.embed.weight";
+        const std::string unemb_k = "model.llm.unembed.weight";
+
+        for (const auto& kv : model.m.trunk) {
+            const std::string& name = kv.first;
+            const TInfo& ti = kv.second;
+            if (name == embed_k || name == unemb_k) {
+                GpuPackedTensor pt;
+                pt.info = ti;
+                if (!upload_raw(pt.buf, sec1.data() + ti.off, ti.bytes, err)) return false;
+                packed_trunk_[name] = pt;
+            } else if (is_large_2d_matmul(name, ti)) {
+                auto f32 = decode_sec1_f32(sec1.data(), ti);
+                auto bf16 = f32_vec_to_bf16(f32);
+                GpuBuffer b;
+                if (!upload_raw(b, bf16.data(), bf16.size() * sizeof(uint16_t), err)) return false;
+                trunk_bf16_[name] = b;
+            } else {
+                auto f32 = decode_sec1_f32(sec1.data(), ti);
+                // Keep small host copy for cross-pass queries and static ShortConv preprocessing
+                if (name == "model.llm.middle_cycle_cross_pass_queries" ||
+                    name == "model.llm.middle_cycle_cross_pass_kv_queries" ||
+                    name.find("sconv") != std::string::npos) {
+                    host_tmp_[name] = f32;
+                }
+                GpuBuffer b;
+                if (!upload_raw(b, f32.data(), f32.size() * sizeof(float), err)) return false;
+                trunk_f32_[name] = b;
+            }
+        }
+
+        // Precompute stacked cross-pass msg_queries [4, D] per core layer -> upload to GPU
+        {
+            const auto& q_cp = host_tmp_.at("model.llm.middle_cycle_cross_pass_queries");
+            const auto& kv_cp = host_tmp_.at("model.llm.middle_cycle_cross_pass_kv_queries");
+            const int core_len = c_.core_end - c_.core_start;
+            d_msg_queries_.resize(c_.n_phys);
+            for (int i = 0; i < core_len; ++i) {
+                std::vector<float> mq(4u * c_.hidden);
+                std::memcpy(mq.data() + 0 * c_.hidden, q_cp.data()  + (2 * i + 0) * c_.hidden, c_.hidden * sizeof(float));
+                std::memcpy(mq.data() + 1 * c_.hidden, kv_cp.data() + (2 * i + 0) * c_.hidden, c_.hidden * sizeof(float));
+                std::memcpy(mq.data() + 2 * c_.hidden, kv_cp.data() + (2 * i + 1) * c_.hidden, c_.hidden * sizeof(float));
+                std::memcpy(mq.data() + 3 * c_.hidden, q_cp.data()  + (2 * i + 1) * c_.hidden, c_.hidden * sizeof(float));
+                if (!upload_raw(d_msg_queries_[c_.core_start + i], mq.data(), mq.size() * sizeof(float), err)) return false;
+            }
+        }
+
+        // Pre-normalize static ShortConv weights to [C, 4] (lag 3..0) -> upload to GPU
+        for (int il = 0; il < c_.n_phys; ++il) {
+            const std::string p = "model.llm.layers." + std::to_string(il);
+            auto upload_sc = [&](const std::string& key, const std::vector<float>& vec) -> bool {
+                GpuBuffer b;
+                if (!upload_raw(b, vec.data(), vec.size() * sizeof(float), err)) return false;
+                static_sconv_[key] = b;
+                return true;
+            };
+            if (!upload_sc(p + ".attn_sconv", host_tmp_.at(p + ".attn_sconv.weight"))) return false;
+            if (!upload_sc(p + ".mlp_sconv",  host_tmp_.at(p + ".mlp_sconv.weight"))) return false;
+            if (c_.is_swa[il]) {
+                if (!upload_sc(p + ".k_sconv", host_tmp_.at(p + ".attn.k_sconv.weight"))) return false;
+                if (!upload_sc(p + ".v_sconv", host_tmp_.at(p + ".attn.v_sconv.weight"))) return false;
+            } else {
+                const int kv_dim = c_.n_kv * c_.head_dim;
+                const auto& kw = host_tmp_.at(p + ".attn.k_sconv.static_w");
+                const auto& vw = host_tmp_.at(p + ".attn.v_sconv.static_w");
+                std::vector<float> kt(kv_dim * 4), vt(kv_dim * 4);
+                for (int c = 0; c < kv_dim; ++c) {
+                    for (int lag = 0; lag < 4; ++lag) {
+                        kt[c * 4 + (3 - lag)] = kw[lag * kv_dim + c];
+                        vt[c * 4 + (3 - lag)] = vw[lag * kv_dim + c];
+                    }
+                }
+                if (!upload_sc(p + ".k_sconv", kt)) return false;
+                if (!upload_sc(p + ".v_sconv", vt)) return false;
+            }
+        }
+        host_tmp_.clear();
+
+        // 2. Load embedded DSpark tensors to GPU if present & enabled
+        has_dspark_ = opts.enable_dspark && dspark_cfg_.present;
+        if (has_dspark_) {
+            for (const auto& kv : model.m.dspark_tensors) {
+                std::string k = kv.first;
+                if (k.rfind("dspark.", 0) == 0) k = k.substr(7);
+                auto f32 = decode_sec1_f32(sec1.data(), kv.second);
+                if (k == "fuse_weight" || k.find("fuse") != std::string::npos) {
+                    h_dspark_fuse_ = f32;
+                }
+                if (kv.second.shape.size() == 2 && k.find("layers.") == 0) {
+                    auto bf16 = f32_vec_to_bf16(f32);
+                    GpuBuffer b;
+                    if (!upload_raw(b, bf16.data(), bf16.size() * sizeof(uint16_t), err)) return false;
+                    dspark_bf16_[k] = b;
+                } else {
+                    GpuBuffer b;
+                    if (!upload_raw(b, f32.data(), f32.size() * sizeof(float), err)) return false;
+                    dspark_f32_[k] = b;
+                }
+            }
+            if (!hip_ok(alloc_gpu_buffer(d_dspark_state_, static_cast<size_t>(dspark_cfg_.markov_rank) * 4, mem_info_.is_uma), "dspark state", err) ||
+                !hip_ok(alloc_gpu_buffer(d_dspark_corr_, static_cast<size_t>(dspark_cfg_.hidden) * 4, mem_info_.is_uma), "dspark corr", err) ||
+                !hip_ok(alloc_gpu_buffer(d_dspark_toks_, 16 * sizeof(int32_t), mem_info_.is_uma), "dspark toks", err) ||
+                !hip_ok(alloc_gpu_buffer(d_dspark_blk_v_, 1024 * sizeof(float), mem_info_.is_uma), "dspark blkv", err) ||
+                !hip_ok(alloc_gpu_buffer(d_dspark_blk_i_, 1024 * sizeof(int32_t), mem_info_.is_uma), "dspark blki", err)) {
+                return false;
+            }
+        }
+
+        // 3. Load Section 4 experts in 3x loop-weighted vram_load_order priority!
+        // Uses strata::hip_uma::alloc_gpu_buffer so 780M (gfx1103) & 890M (gfx1150) with small 512M-4G BIOS carveout
+        // seamlessly allocate coherent GTT UMA memory and fit SQ-10 (9.75 GiB) & SQ-15 (13.36 GiB) 100% on GPU!
+        const auto& dir = model.rd.expert_directory();
+        const size_t n_dir = dir.size();
+        expert_gpu_offset_.assign(n_dir, static_cast<size_t>(-1));
+        expert_ram_bodies_.resize(n_dir);
+        expert_sf4_outer_.assign(n_dir, {1.0f, 1.0f});
+
+        size_t vram_budget = 0;
+        if (opts.vram_experts_gb >= 0.0) {
+            vram_budget = static_cast<size_t>(opts.vram_experts_gb * 1073741824.0);
+        } else {
+            const size_t trunk_now = vram_used_bytes();
+            // Reserve headroom for KV + activations + OS/desktop (always keep at least OS reserve + 768 MiB)
+            const size_t kv_est = std::min<size_t>(
+                estimate_slot_bytes(std::min(max_ctx_, 4096), default_kv_dtype_, has_dspark_).total_bytes() * static_cast<size_t>(max_slots_),
+                mem_info_.effective_total_bytes / 4);
+            const size_t overhead = mem_info_.reserve_bytes + trunk_now + kv_est + (768ULL << 20);
+            if (mem_info_.effective_total_bytes > overhead) {
+                vram_budget = mem_info_.effective_total_bytes - overhead;
+            }
+        }
+
+        // Plan contiguous GPU arena for all experts fitting in vram_budget
+        size_t arena_bytes = 0;
+        std::vector<uint16_t> gpu_plan;
+        std::vector<uint16_t> ram_plan;
+        const size_t ram_cap = (opts.ram_experts_gb > 0.0)
+            ? static_cast<size_t>(opts.ram_experts_gb * 1073741824.0)
+            : static_cast<size_t>(-1);
+        size_t ram_bytes = 0;
+        size_t max_exp_bytes = 0;
+
+        for (uint16_t idx : model.vram_load_order) {
+            if (idx >= n_dir) continue;
+            const size_t sz = dir[idx].body_bytes;
+            const size_t aligned = (sz + 63u) & ~size_t(63u);
+            max_exp_bytes = std::max(max_exp_bytes, aligned);
+            if (arena_bytes + aligned <= vram_budget) {
+                expert_gpu_offset_[idx] = arena_bytes;
+                arena_bytes += aligned;
+                gpu_plan.push_back(idx);
+            } else if (ram_bytes + sz <= ram_cap) {
+                ram_bytes += sz;
+                ram_plan.push_back(idx);
+            }
+        }
+
+        if (arena_bytes > 0) {
+            if (!hip_ok(alloc_gpu_buffer(expert_gpu_arena_, arena_bytes, mem_info_.is_uma), "expert GPU arena alloc", err)) {
+                return false;
+            }
+            std::vector<uint8_t> tmp;
+            for (uint16_t idx : gpu_plan) {
+                if (!model.rd.read_expert_body(idx, tmp, err)) return false;
+                if ((dir[idx].gu_code_id == CODE_SF4 || dir[idx].dn_code_id == CODE_SF4) && tmp.size() >= 16) {
+                    float hdr[4];
+                    std::memcpy(hdr, tmp.data(), 16);
+                    expert_sf4_outer_[idx] = {hdr[0] / hdr[1], hdr[2] / hdr[3]};
+                }
+                if (!hip_ok(hipMemcpy(expert_gpu_arena_.dev_ptr + expert_gpu_offset_[idx], tmp.data(),
+                                      tmp.size(), hipMemcpyHostToDevice),
+                            "expert H2D", err)) {
+                    return false;
+                }
+            }
+            vram_experts_loaded_ = gpu_plan.size();
+        }
+        for (uint16_t idx : ram_plan) {
+            if (!model.rd.read_expert_body(idx, expert_ram_bodies_[idx], err)) return false;
+            if ((dir[idx].gu_code_id == CODE_SF4 || dir[idx].dn_code_id == CODE_SF4) && expert_ram_bodies_[idx].size() >= 16) {
+                float hdr[4];
+                std::memcpy(hdr, expert_ram_bodies_[idx].data(), 16);
+                expert_sf4_outer_[idx] = {hdr[0] / hdr[1], hdr[2] / hdr[3]};
+            }
+        }
+        ram_experts_loaded_ = ram_plan.size();
+
+        if (max_exp_bytes > 0 && vram_experts_loaded_ < n_dir) {
+            if (!hip_ok(alloc_gpu_buffer(d_exp_stage_, max_exp_bytes, mem_info_.is_uma), "expert stage alloc", err)) {
+                return false;
+            }
+        }
+
+        // Build per-layer GPU expert descriptor tables [128] for zero-sync GPU MoE!
+        d_layer_exps_.resize(c_.n_phys);
+        layer_all_gpu_.assign(c_.n_phys, true);
+        for (int il = 0; il < c_.n_phys; ++il) {
+            std::vector<GpuExpertDesc> tbl(c_.n_experts);
+            for (int e = 0; e < c_.n_experts; ++e) {
+                const int dir_idx = model.dir_index_of[il * c_.n_experts + e];
+                GpuExpertDesc d{};
+                if (dir_idx >= 0 && expert_gpu_offset_[dir_idx] != static_cast<size_t>(-1)) {
+                    d.body = expert_gpu_arena_.dev_ptr + expert_gpu_offset_[dir_idx];
+                    d.dn_offset = dir[dir_idx].dn_offset;
+                    d.gu_code = dir[dir_idx].gu_code_id;
+                    d.dn_code = dir[dir_idx].dn_code_id;
+                } else {
+                    layer_all_gpu_[il] = false;
+                }
+                tbl[e] = d;
+            }
+            if (!upload_raw(d_layer_exps_[il], tbl.data(), tbl.size() * sizeof(GpuExpertDesc), err)) return false;
+        }
+
+        // 4. Initialize GPU Paged KV pools & 48-Visit ShortConv BF16 pools
+        const int kv_dim = c_.n_kv * c_.head_dim;
+        const int max_swa_pages = (c_.swa_win + kKvPageTokens - 1) / kKvPageTokens;
+        const int max_glob_pages = (max_ctx_ + kKvPageTokens - 1) / kKvPageTokens;
+        const bool is_fp8 = (default_kv_dtype_ == KvDtype::FP8_E4M3);
+
+        swa_pools_.resize(c_.n_swa_visits);
+        for (int i = 0; i < c_.n_swa_visits; ++i) {
+            if (!swa_pools_[i].init(true, is_fp8, mem_info_.is_uma, max_slots_, max_swa_pages, kv_dim, err)) return false;
+        }
+        glob_pools_.resize(c_.n_global_visits);
+        for (int i = 0; i < c_.n_global_visits; ++i) {
+            if (!glob_pools_[i].init(false, is_fp8, mem_info_.is_uma, max_slots_, max_glob_pages, kv_dim, err)) return false;
+        }
+
+        d_sconv_k_.resize(c_.n_visits);
+        d_sconv_v_.resize(c_.n_visits);
+        d_sconv_attn_.resize(c_.n_visits);
+        d_sconv_mlp_.resize(c_.n_visits);
+        for (int v = 0; v < c_.n_visits; ++v) {
+            const size_t kvb = static_cast<size_t>(max_slots_) * 3 * kv_dim * sizeof(uint16_t);
+            const size_t hb  = static_cast<size_t>(max_slots_) * 3 * c_.hidden * sizeof(uint16_t);
+            if (!hip_ok(alloc_gpu_buffer(d_sconv_k_[v], kvb, mem_info_.is_uma), "sconv k", err) ||
+                !hip_ok(alloc_gpu_buffer(d_sconv_v_[v], kvb, mem_info_.is_uma), "sconv v", err) ||
+                !hip_ok(alloc_gpu_buffer(d_sconv_attn_[v], hb, mem_info_.is_uma), "sconv attn", err) ||
+                !hip_ok(alloc_gpu_buffer(d_sconv_mlp_[v], hb, mem_info_.is_uma), "sconv mlp", err)) {
+                return false;
+            }
+            HIP_ZERO(d_sconv_k_[v]); HIP_ZERO(d_sconv_v_[v]);
+            HIP_ZERO(d_sconv_attn_[v]); HIP_ZERO(d_sconv_mlp_[v]);
+        }
+
+        slots_.resize(max_slots_);
+        return true;
+    }
+
+    bool alloc_slot(int slot, int max_ctx, KvDtype /*kv_dtype*/, std::string& err) override {
+        if (slot < 0 || slot >= max_slots_) {
+            err = "hip: slot index out of range";
+            return false;
+        }
+        auto& sl = slots_[slot];
+        sl.release();
+        sl.allocated = true;
+        sl.max_ctx = max_ctx;
+        sl.seq_len = 0;
+        clear_slot_sconv(slot);
+        return true;
+    }
+
+    void free_slot(int slot) override {
+        if (slot < 0 || slot >= max_slots_) return;
+        for (auto& p : swa_pools_) p.free_slot_pages(slot);
+        for (auto& p : glob_pools_) p.free_slot_pages(slot);
+        slots_[slot].release();
+    }
+
+    void reset_slot(int slot) override {
+        if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return;
+        slots_[slot].seq_len = 0;
+        slots_[slot].dspark_len = 0;
+        slots_[slot].has_snap = false;
+        clear_slot_sconv(slot);
+    }
+
+    void snapshot_slot(int slot) override {
+        if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return;
+        auto& sl = slots_[slot];
+        const int kv_dim = c_.n_kv * c_.head_dim;
+        const size_t kv_one = 3u * kv_dim * sizeof(uint16_t);
+        const size_t h_one  = 3u * c_.hidden * sizeof(uint16_t);
+        if (!sl.sconv_snap_k.dev_ptr) {
+            hip_ign(alloc_gpu_buffer(sl.sconv_snap_k, static_cast<size_t>(c_.n_visits) * kv_one, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(sl.sconv_snap_v, static_cast<size_t>(c_.n_visits) * kv_one, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(sl.sconv_snap_attn, static_cast<size_t>(c_.n_visits) * h_one, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(sl.sconv_snap_mlp, static_cast<size_t>(c_.n_visits) * h_one, mem_info_.is_uma));
+            const size_t kv_rec = 8u * kv_dim * sizeof(uint16_t);
+            const size_t h_rec  = 8u * c_.hidden * sizeof(uint16_t);
+            hip_ign(alloc_gpu_buffer(sl.sconv_rec_k, static_cast<size_t>(c_.n_visits) * kv_rec, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(sl.sconv_rec_v, static_cast<size_t>(c_.n_visits) * kv_rec, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(sl.sconv_rec_attn, static_cast<size_t>(c_.n_visits) * h_rec, mem_info_.is_uma));
+            hip_ign(alloc_gpu_buffer(sl.sconv_rec_mlp, static_cast<size_t>(c_.n_visits) * h_rec, mem_info_.is_uma));
+        }
+        for (int v = 0; v < c_.n_visits; ++v) {
+            hip_ign(hipMemcpyAsync(sl.sconv_snap_k.dev_ptr + v * kv_one, d_sconv_k_[v].dev_ptr + slot * kv_one, kv_one, hipMemcpyDeviceToDevice, stream_));
+            hip_ign(hipMemcpyAsync(sl.sconv_snap_v.dev_ptr + v * kv_one, d_sconv_v_[v].dev_ptr + slot * kv_one, kv_one, hipMemcpyDeviceToDevice, stream_));
+            hip_ign(hipMemcpyAsync(sl.sconv_snap_attn.dev_ptr + v * h_one, d_sconv_attn_[v].dev_ptr + slot * h_one, h_one, hipMemcpyDeviceToDevice, stream_));
+            hip_ign(hipMemcpyAsync(sl.sconv_snap_mlp.dev_ptr + v * h_one, d_sconv_mlp_[v].dev_ptr + slot * h_one, h_one, hipMemcpyDeviceToDevice, stream_));
+        }
+        sl.snap_seq_len = sl.seq_len;
+        sl.sconv_rec_n = 0;
+        sl.has_snap = true;
+    }
+
+    void rollback_slot(int slot, int keep_len) override {
+        if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return;
+        auto& sl = slots_[slot];
+        sl.seq_len = keep_len;
+        sl.dspark_len = std::min(sl.dspark_len, keep_len);
+        if (sl.has_snap) {
+            const int keep_steps = keep_len - sl.snap_seq_len;
+            const int kv_dim = c_.n_kv * c_.head_dim;
+            const size_t kv_one = 3u * kv_dim * sizeof(uint16_t);
+            const size_t h_one  = 3u * c_.hidden * sizeof(uint16_t);
+            const size_t kv_rec = 8u * kv_dim * sizeof(uint16_t);
+            const size_t h_rec  = 8u * c_.hidden * sizeof(uint16_t);
+            if (keep_steps == 0) {
+                for (int v = 0; v < c_.n_visits; ++v) {
+                    hip_ign(hipMemcpyAsync(d_sconv_k_[v].dev_ptr + slot * kv_one, sl.sconv_snap_k.dev_ptr + v * kv_one, kv_one, hipMemcpyDeviceToDevice, stream_));
+                    hip_ign(hipMemcpyAsync(d_sconv_v_[v].dev_ptr + slot * kv_one, sl.sconv_snap_v.dev_ptr + v * kv_one, kv_one, hipMemcpyDeviceToDevice, stream_));
+                    hip_ign(hipMemcpyAsync(d_sconv_attn_[v].dev_ptr + slot * h_one, sl.sconv_snap_attn.dev_ptr + v * h_one, h_one, hipMemcpyDeviceToDevice, stream_));
+                    hip_ign(hipMemcpyAsync(d_sconv_mlp_[v].dev_ptr + slot * h_one, sl.sconv_snap_mlp.dev_ptr + v * h_one, h_one, hipMemcpyDeviceToDevice, stream_));
+                }
+            } else if (keep_steps > 0 && keep_steps <= sl.sconv_rec_n) {
+                for (int v = 0; v < c_.n_visits; ++v) {
+                    k_sconv_rollback_exact<<<(kv_dim + 255) / 256, 256, 0, stream_>>>(
+                        reinterpret_cast<const uint16_t*>(sl.sconv_snap_k.dev_ptr + v * kv_one),
+                        reinterpret_cast<const uint16_t*>(sl.sconv_rec_k.dev_ptr + v * kv_rec),
+                        reinterpret_cast<uint16_t*>(d_sconv_k_[v].dev_ptr + slot * kv_one), keep_steps, kv_dim);
+                    k_sconv_rollback_exact<<<(kv_dim + 255) / 256, 256, 0, stream_>>>(
+                        reinterpret_cast<const uint16_t*>(sl.sconv_snap_v.dev_ptr + v * kv_one),
+                        reinterpret_cast<const uint16_t*>(sl.sconv_rec_v.dev_ptr + v * kv_rec),
+                        reinterpret_cast<uint16_t*>(d_sconv_v_[v].dev_ptr + slot * kv_one), keep_steps, kv_dim);
+                    k_sconv_rollback_exact<<<(c_.hidden + 255) / 256, 256, 0, stream_>>>(
+                        reinterpret_cast<const uint16_t*>(sl.sconv_snap_attn.dev_ptr + v * h_one),
+                        reinterpret_cast<const uint16_t*>(sl.sconv_rec_attn.dev_ptr + v * h_rec),
+                        reinterpret_cast<uint16_t*>(d_sconv_attn_[v].dev_ptr + slot * h_one), keep_steps, c_.hidden);
+                    k_sconv_rollback_exact<<<(c_.hidden + 255) / 256, 256, 0, stream_>>>(
+                        reinterpret_cast<const uint16_t*>(sl.sconv_snap_mlp.dev_ptr + v * h_one),
+                        reinterpret_cast<const uint16_t*>(sl.sconv_rec_mlp.dev_ptr + v * h_rec),
+                        reinterpret_cast<uint16_t*>(d_sconv_mlp_[v].dev_ptr + slot * h_one), keep_steps, c_.hidden);
+                }
+            }
+            sl.has_snap = false;
+            sl.sconv_rec_n = 0;
+        }
+    }
+
+    bool forward_batch(const StepBatch& batch, float* logits_out, TapCapture* taps_out, std::string& err) override {
+        const int B_tot = batch.n_tokens;
+        if (B_tot <= 0) return true;
+
+        // Enforce <= 1.0s TDR / MES chunk cap automatically on iGPUs & Windows WDDM!
+        const int chunk_cap = std::max(1, guard_.max_prefill_chunk);
+        if (B_tot > chunk_cap) {
+            const int V = c_.vocab_unpadded;
+            const int D = c_.hidden;
+            if (taps_out) {
+                for (int k = 0; k < 4; ++k) taps_out->taps[k].resize(static_cast<size_t>(B_tot) * D);
+            }
+            size_t logit_cursor = 0;
+            for (int off = 0; off < B_tot; off += chunk_cap) {
+                const int sub_n = std::min(chunk_cap, B_tot - off);
+                StepBatch sub;
+                sub.n_tokens = sub_n;
+                sub.slot_ids.assign(batch.slot_ids.begin() + off, batch.slot_ids.begin() + off + sub_n);
+                sub.pos.assign(batch.pos.begin() + off, batch.pos.begin() + off + sub_n);
+                sub.token_ids.assign(batch.token_ids.begin() + off, batch.token_ids.begin() + off + sub_n);
+                sub.img_embed_idx.assign(batch.img_embed_idx.begin() + off, batch.img_embed_idx.begin() + off + sub_n);
+                sub.want_logits.assign(batch.want_logits.begin() + off, batch.want_logits.begin() + off + sub_n);
+                sub.img_embeds = batch.img_embeds;
+                sub.capture_taps = batch.capture_taps;
+                const int sub_want = sub.count_logits();
+                float* sub_logits = (logits_out && sub_want > 0) ? (logits_out + logit_cursor * V) : nullptr;
+                TapCapture sub_taps;
+                if (!forward_batch_chunk(sub, sub_logits, taps_out ? &sub_taps : nullptr, err)) return false;
+                if (taps_out) {
+                    for (int k = 0; k < 4; ++k) {
+                        std::memcpy(taps_out->taps[k].data() + static_cast<size_t>(off) * D,
+                                    sub_taps.taps[k].data(), static_cast<size_t>(sub_n) * D * sizeof(float));
+                    }
+                }
+                logit_cursor += static_cast<size_t>(sub_want);
+            }
+            return true;
+        }
+        return forward_batch_chunk(batch, logits_out, taps_out, err);
+    }
+
+    int dspark_draft(int slot, int32_t anchor_tok, int anchor_pos, int max_draft, int32_t* out_ids, std::string& err) override {
+        if (!has_dspark_ || max_draft <= 0) return 0;
+        if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) {
+            err = "hip dspark: invalid slot";
+            return 0;
+        }
+        auto& sl = slots_[slot];
+        if (anchor_pos < 1 || sl.dspark_len < anchor_pos) return 0;
+
+        const int B = dspark_cfg_.block_size;  // 8
+        const int n_draft = std::min(max_draft, B - 1);
+        const int D = dspark_cfg_.hidden;
+        const int H = dspark_cfg_.n_head;
+        const int KV = dspark_cfg_.n_kv;
+        const int hd = dspark_cfg_.head_dim;
+        const int kv_dim = KV * hd;
+        const int q_dim = H * hd;
+        const int inter = dspark_cfg_.inter;
+        const int rank = dspark_cfg_.markov_rank;
+
+        if (!ensure_dspark_scratch(B, D, q_dim, kv_dim, inter, err)) return 0;
+
+        // 1. Build draft block [B, D]: row 0 = embed_norm(embed(anchor_tok)), rows 1..B-1 = mask_embed
+        int32_t h_anchor = anchor_tok;
+        if (!hip_ok(hipMemcpyAsync(d_dspark_toks_.dev_ptr, &h_anchor, sizeof(int32_t), hipMemcpyHostToDevice, stream_), "dspark anchor", err)) return 0;
+        const auto& emb_pk = packed_trunk_.at("model.llm.embed.weight");
+        k_embed_lookup<<<1, 256, 0, stream_>>>(
+            emb_pk.buf.dev_ptr, emb_pk.info.fmt, static_cast<int>(emb_pk.info.rows()),
+            f32_ptr("model.llm.embed_norm.weight"),
+            reinterpret_cast<const int32_t*>(d_dspark_toks_.dev_ptr), nullptr, nullptr,
+            reinterpret_cast<float*>(ds_cur_.dev_ptr), 1, D, c_.rms_eps);
+        const float* mask_e = reinterpret_cast<const float*>(dspark_f32_.at("mask_embed").dev_ptr);
+        for (int i = 1; i < B; ++i) {
+            (void)hipMemcpyAsync(reinterpret_cast<float*>(ds_cur_.dev_ptr) + static_cast<size_t>(i) * D,
+                           mask_e, D * sizeof(float), hipMemcpyDeviceToDevice, stream_);
+        }
+
+        // 2. Run 3 non-causal block-8 attention + SwiGLU layers on GPU!
+        float* cur = reinterpret_cast<float*>(ds_cur_.dev_ptr);
+        float* res = reinterpret_cast<float*>(ds_res_.dev_ptr);
+        float* h   = reinterpret_cast<float*>(ds_h_.dev_ptr);
+        float* q   = reinterpret_cast<float*>(ds_q_.dev_ptr);
+        float* kd  = reinterpret_cast<float*>(ds_k_.dev_ptr);
+        float* vd  = reinterpret_cast<float*>(ds_v_.dev_ptr);
+        float* ao  = reinterpret_cast<float*>(ds_ao_.dev_ptr);
+        float* mg  = reinterpret_cast<float*>(ds_mg_.dev_ptr);
+        float* mu  = reinterpret_cast<float*>(ds_mu_.dev_ptr);
+
+        for (int il = 0; il < dspark_cfg_.n_layers; ++il) {
+            const std::string p = "layers." + std::to_string(il);
+            (void)hipMemcpyAsync(res, cur, static_cast<size_t>(B) * D * sizeof(float), hipMemcpyDeviceToDevice, stream_);
+            k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32(p + ".input_layernorm.weight"), h, B, D, dspark_cfg_.rms_eps);
+
+            launch_bf16_linear(ds_bf16(p + ".self_attn.q_proj.weight"), h, nullptr, q,  B, q_dim,  D, mem_info_.gen, stream_);
+            launch_bf16_linear(ds_bf16(p + ".self_attn.k_proj.weight"), h, nullptr, kd, B, kv_dim, D, mem_info_.gen, stream_);
+            launch_bf16_linear(ds_bf16(p + ".self_attn.v_proj.weight"), h, nullptr, vd, B, kv_dim, D, mem_info_.gen, stream_);
+
+            k_rms_norm_rows<<<B * H, 256, 0, stream_>>>(q, ds_f32(p + ".self_attn.q_norm.weight"), q, B * H, hd, dspark_cfg_.rms_eps);
+            k_rms_norm_rows<<<B * KV, 256, 0, stream_>>>(kd, ds_f32(p + ".self_attn.k_norm.weight"), kd, B * KV, hd, dspark_cfg_.rms_eps);
+            k_half_rope<<<dim3(H, B), hd / 2, 0, stream_>>>(q, nullptr, anchor_pos, B, H, hd, dspark_cfg_.rope_theta);
+            k_half_rope<<<dim3(KV, B), hd / 2, 0, stream_>>>(kd, nullptr, anchor_pos, B, KV, hd, dspark_cfg_.rope_theta);
+
+            const int c0 = dspark_cfg_.is_swa[il] ? std::max(0, anchor_pos - dspark_cfg_.swa_win + 1) : 0;
+            const int c_len = anchor_pos - c0;
+            k_dspark_block_attn<<<dim3(H, B), 128, 0, stream_>>>(
+                q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
+                reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
+                kd, vd, ao, B, H, KV, c0, c_len);
+
+            launch_bf16_linear(ds_bf16(p + ".self_attn.o_proj.weight"), ao, nullptr, h, B, D, q_dim, mem_info_.gen, stream_);
+            k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, h, cur, B * D);
+
+            (void)hipMemcpyAsync(res, cur, static_cast<size_t>(B) * D * sizeof(float), hipMemcpyDeviceToDevice, stream_);
+            k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32(p + ".post_attention_layernorm.weight"), h, B, D, dspark_cfg_.rms_eps);
+            launch_bf16_linear(ds_bf16(p + ".mlp.gate_proj.weight"), h, nullptr, mg, B, inter, D, mem_info_.gen, stream_);
+            launch_bf16_linear(ds_bf16(p + ".mlp.up_proj.weight"),   h, nullptr, mu, B, inter, D, mem_info_.gen, stream_);
+            k_swiglu_f32<<<(B * inter + 255) / 256, 256, 0, stream_>>>(mg, mu, mg, B * inter);
+            launch_bf16_linear(ds_bf16(p + ".mlp.down_proj.weight"), mg, nullptr, h, B, D, inter, mem_info_.gen, stream_);
+            k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, h, cur, B * D);
+        }
+
+        // 3. Final norm + 7-step Persistent On-GPU Recurrent Markov Head (ZERO host sync between steps!)
+        k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32("norm.weight"), cur, B, D, dspark_cfg_.rms_eps);
+        // Convert slot's f_rnn BF16 vector at (anchor_pos - 1) to FP32 in ds_res_ (reusing first D floats)
+        k_bf16_to_f32_vec<<<(D + 255) / 256, 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(sl.dspark_frnn.dev_ptr) + static_cast<size_t>(anchor_pos - 1) * D,
+            res, D);
+
+        (void)hipMemsetAsync(d_dspark_state_.dev_ptr, 0, static_cast<size_t>(rank) * sizeof(float), stream_);
+        const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
+        const int V = c_.vocab_unpadded;
+        const int arg_blks = std::min(512, (V + 7) / 8);
+
+        int32_t* d_toks = reinterpret_cast<int32_t*>(d_dspark_toks_.dev_ptr);
+        for (int step = 1; step <= n_draft; ++step) {
+            k5_dspark_markov_rnn_update<<<1, 256, 0, stream_>>>(
+                d_toks + (step - 1),
+                reinterpret_cast<float*>(d_dspark_state_.dev_ptr),
+                cur + static_cast<size_t>(step) * D,
+                res,
+                ds_f32("markov_head.markov_w1.weight"),
+                ds_f32("markov_head.rnn_proj.weight"),
+                ds_f32("markov_head.rnn_proj.bias"),
+                ds_f32("markov_head.hidden_out.weight"),
+                ds_f32("markov_head.hidden_out.bias"),
+                reinterpret_cast<float*>(d_dspark_corr_.dev_ptr),
+                D, rank);
+            k5_dspark_packed_argmax_stage1<<<arg_blks, 256, 0, stream_>>>(
+                unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
+                cur + static_cast<size_t>(step) * D,
+                reinterpret_cast<const float*>(d_dspark_corr_.dev_ptr),
+                reinterpret_cast<float*>(d_dspark_blk_v_.dev_ptr),
+                reinterpret_cast<int32_t*>(d_dspark_blk_i_.dev_ptr),
+                D, V);
+            k5_dspark_argmax_stage2<<<1, 256, 0, stream_>>>(
+                reinterpret_cast<const float*>(d_dspark_blk_v_.dev_ptr),
+                reinterpret_cast<const int32_t*>(d_dspark_blk_i_.dev_ptr),
+                arg_blks, d_toks + step);
+        }
+
+        // Single tiny 28-byte D2H copy for all drafted tokens!
+        if (!hip_ok(hipMemcpyAsync(out_ids, d_toks + 1, static_cast<size_t>(n_draft) * sizeof(int32_t),
+                                   hipMemcpyDeviceToHost, stream_), "dspark D2H", err)) return 0;
+        if (!hip_ok(hipStreamSynchronize(stream_), "dspark sync", err)) return 0;
+        return n_draft;
+    }
+
+    bool encode_image(const ImageRec& img, std::vector<float>& out_embeds, std::string& err) override {
+        if (opts_.vision_path.empty()) return false;
+        if (!vision_.loaded) {
+            if (!load_vision_gpu(opts_.vision_path, err)) return false;
+        }
+        const VitCfg& vc = vision_.info.c;
+        const int merge = vc.merge;
+        const int patch = vc.patch;
+        const int cell = patch * merge;
+        const int n_tok = img.num_lm_tokens();
+        const int ph = img.grid_h * merge;
+        const int pw = img.grid_w * merge;
+        const int n_patches = ph * pw;
+        const int S = n_patches + 1;
+        const int D = vc.hidden;
+        const int H = vc.heads;
+        const int hd = vc.head_dim;
+        const int patch_in = 3 * patch * patch;
+
+        // 1. Patchify + 2D pos coords on host (< 1 ms)
+        std::vector<float> patch_buf(static_cast<size_t>(n_patches) * patch_in);
+        std::vector<int> pos_h(S, 0), pos_w(S, 0);
+        int pi = 0;
+        for (int gr = 0; gr < img.grid_h; ++gr) {
+            for (int gc = 0; gc < img.grid_w; ++gc) {
+                const size_t tok = static_cast<size_t>(gr) * img.grid_w + gc;
+                const float* cell_px = img.pixel_values.data() + tok * cell * cell * 3;
+                for (int mr = 0; mr < merge; ++mr) {
+                    for (int mc = 0; mc < merge; ++mc) {
+                        float* dst = patch_buf.data() + static_cast<size_t>(pi) * patch_in;
+                        int idx = 0;
+                        for (int py = 0; py < patch; ++py) {
+                            const int ly = mr * patch + py;
+                            for (int px = 0; px < patch; ++px) {
+                                const int lx = mc * patch + px;
+                                const float* rgb = cell_px + (static_cast<size_t>(ly) * cell + lx) * 3;
+                                dst[idx++] = rgb[0]; dst[idx++] = rgb[1]; dst[idx++] = rgb[2];
+                            }
+                        }
+                        pos_h[pi + 1] = gr * merge + mr + 1;
+                        pos_w[pi + 1] = gc * merge + mc + 1;
+                        ++pi;
+                    }
+                }
+            }
+        }
+
+        // Precompute bilinearly interpolated pos_embed [S, D] + axial 2D RoPE cos/sin [S, hd] on host
+        std::vector<float> h_pos_add(static_cast<size_t>(S) * D, 0.0f);
+        for (int d = 0; d < D; ++d) h_pos_add[d] = vision_.h_cls[d] + vision_.h_cls_pos[d];
+        const int G = vc.posemb_grid;
+        for (int p = 0; p < n_patches; ++p) {
+            const float y = (static_cast<float>(pos_h[p + 1] - 1) + 0.5f) * (static_cast<float>(G) / ph) - 0.5f;
+            const float x = (static_cast<float>(pos_w[p + 1] - 1) + 0.5f) * (static_cast<float>(G) / pw) - 0.5f;
+            const int y0 = std::max(0, std::min(G - 1, static_cast<int>(std::floor(y))));
+            const int y1 = std::min(G - 1, y0 + 1);
+            const int x0 = std::max(0, std::min(G - 1, static_cast<int>(std::floor(x))));
+            const int x1 = std::min(G - 1, x0 + 1);
+            const float wy = std::max(0.0f, std::min(1.0f, y - y0));
+            const float wx = std::max(0.0f, std::min(1.0f, x - x0));
+            const float w00 = (1.0f - wy) * (1.0f - wx), w01 = (1.0f - wy) * wx;
+            const float w10 = wy * (1.0f - wx), w11 = wy * wx;
+            const float* p00 = vision_.h_pos_emb.data() + (static_cast<size_t>(y0) * G + x0) * D;
+            const float* p01 = vision_.h_pos_emb.data() + (static_cast<size_t>(y0) * G + x1) * D;
+            const float* p10 = vision_.h_pos_emb.data() + (static_cast<size_t>(y1) * G + x0) * D;
+            const float* p11 = vision_.h_pos_emb.data() + (static_cast<size_t>(y1) * G + x1) * D;
+            float* dst = h_pos_add.data() + static_cast<size_t>(p + 1) * D;
+            for (int d = 0; d < D; ++d) dst[d] = w00 * p00[d] + w01 * p01[d] + w10 * p10[d] + w11 * p11[d];
+        }
+
+        const int sp_dim = hd / 2;
+        const int n_freq = sp_dim / 2;
+        std::vector<float> inv_freq(n_freq);
+        for (int i = 0; i < n_freq; ++i) inv_freq[i] = 1.0f / std::pow(vc.rope_theta, static_cast<float>(2 * i) / sp_dim);
+        std::vector<float> h_rc(static_cast<size_t>(S) * hd), h_rs(static_cast<size_t>(S) * hd);
+        for (int t = 0; t < S; ++t) {
+            for (int i = 0; i < n_freq; ++i) {
+                const float aw = static_cast<float>(pos_w[t]) * inv_freq[i];
+                const float ah = static_cast<float>(pos_h[t]) * inv_freq[i];
+                h_rc[t * hd + 2 * i] = h_rc[t * hd + 2 * i + 1] = std::cos(aw);
+                h_rs[t * hd + 2 * i] = h_rs[t * hd + 2 * i + 1] = std::sin(aw);
+                h_rc[t * hd + sp_dim + 2 * i] = h_rc[t * hd + sp_dim + 2 * i + 1] = std::cos(ah);
+                h_rs[t * hd + sp_dim + 2 * i] = h_rs[t * hd + sp_dim + 2 * i + 1] = std::sin(ah);
+            }
+        }
+
+        // 2. Allocate temporary GPU buffers for this image & execute 23 ViT layers on GPU!
+        GpuBuffer d_patch, d_cur, d_pos, d_norm, d_q, d_k, d_v, d_ao, d_proj, d_mlp, d_rc, d_rs, d_mid, d_out;
+        auto cleanup_img = [&]() {
+            free_gpu_buffer(d_patch); free_gpu_buffer(d_cur); free_gpu_buffer(d_pos);
+            free_gpu_buffer(d_norm); free_gpu_buffer(d_q); free_gpu_buffer(d_k); free_gpu_buffer(d_v);
+            free_gpu_buffer(d_ao); free_gpu_buffer(d_proj); free_gpu_buffer(d_mlp);
+            free_gpu_buffer(d_rc); free_gpu_buffer(d_rs); free_gpu_buffer(d_mid); free_gpu_buffer(d_out);
+        };
+        if (!upload_raw(d_patch, patch_buf.data(), patch_buf.size() * 4, err) ||
+            !upload_raw(d_pos, h_pos_add.data(), h_pos_add.size() * 4, err) ||
+            !upload_raw(d_rc, h_rc.data(), h_rc.size() * 4, err) ||
+            !upload_raw(d_rs, h_rs.data(), h_rs.size() * 4, err) ||
+            !hip_ok(alloc_gpu_buffer(d_cur, static_cast<size_t>(S) * D * 4, mem_info_.is_uma), "vit cur", err) ||
+            !hip_ok(alloc_gpu_buffer(d_norm, static_cast<size_t>(S) * D * 4, mem_info_.is_uma), "vit norm", err) ||
+            !hip_ok(alloc_gpu_buffer(d_q, static_cast<size_t>(S) * D * 4, mem_info_.is_uma), "vit q", err) ||
+            !hip_ok(alloc_gpu_buffer(d_k, static_cast<size_t>(S) * D * 4, mem_info_.is_uma), "vit k", err) ||
+            !hip_ok(alloc_gpu_buffer(d_v, static_cast<size_t>(S) * D * 4, mem_info_.is_uma), "vit v", err) ||
+            !hip_ok(alloc_gpu_buffer(d_ao, static_cast<size_t>(S) * D * 4, mem_info_.is_uma), "vit ao", err) ||
+            !hip_ok(alloc_gpu_buffer(d_proj, static_cast<size_t>(S) * D * 4, mem_info_.is_uma), "vit proj", err) ||
+            !hip_ok(alloc_gpu_buffer(d_mlp, static_cast<size_t>(S) * vc.inter * 4, mem_info_.is_uma), "vit mlp", err) ||
+            !hip_ok(alloc_gpu_buffer(d_mid, static_cast<size_t>(n_tok) * vc.proj_hidden * 4, mem_info_.is_uma), "vit mid", err) ||
+            !hip_ok(alloc_gpu_buffer(d_out, static_cast<size_t>(n_tok) * vc.out_hidden * 4, mem_info_.is_uma), "vit out", err)) {
+            cleanup_img();
+            return false;
+        }
+
+        float* cur = reinterpret_cast<float*>(d_cur.dev_ptr);
+        (void)hipMemsetAsync(cur, 0, static_cast<size_t>(D) * 4, stream_);
+        launch_bf16_linear(vit_bf16("model.visual.backbone.embeddings.patch_embedding.weight"),
+                           reinterpret_cast<const float*>(d_patch.dev_ptr), nullptr, cur + D,
+                           n_patches, D, patch_in, mem_info_.gen, stream_);
+        k_vec_add<<<(S * D + 255) / 256, 256, 0, stream_>>>(cur, reinterpret_cast<const float*>(d_pos.dev_ptr), cur, S * D);
+        k_vit_layernorm_f32<<<S, 256, 0, stream_>>>(cur, vit_f32("model.visual.backbone.ln_pre.weight"),
+                                                    vit_f32("model.visual.backbone.ln_pre.bias"), cur, S, D, vc.ln_eps);
+
+        for (int il = 0; il < vc.layers; ++il) {
+            const std::string p = "model.visual.backbone.layers." + std::to_string(il);
+            k_vit_layernorm_f32<<<S, 256, 0, stream_>>>(cur, vit_f32(p + ".ln_1.weight"), vit_f32(p + ".ln_1.bias"),
+                                                        reinterpret_cast<float*>(d_norm.dev_ptr), S, D, vc.ln_eps);
+            launch_bf16_linear(vit_bf16(p + ".self_attn.q_proj.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
+                               vit_f32(p + ".self_attn.q_proj.bias"), reinterpret_cast<float*>(d_q.dev_ptr), S, D, D, mem_info_.gen, stream_);
+            launch_bf16_linear(vit_bf16(p + ".self_attn.k_proj.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
+                               vit_f32(p + ".self_attn.k_proj.bias"), reinterpret_cast<float*>(d_k.dev_ptr), S, D, D, mem_info_.gen, stream_);
+            launch_bf16_linear(vit_bf16(p + ".self_attn.v_proj.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
+                               vit_f32(p + ".self_attn.v_proj.bias"), reinterpret_cast<float*>(d_v.dev_ptr), S, D, D, mem_info_.gen, stream_);
+            k_vit_rope_2d<<<dim3(H, S), hd / 2, 0, stream_>>>(
+                reinterpret_cast<float*>(d_q.dev_ptr), reinterpret_cast<float*>(d_k.dev_ptr),
+                reinterpret_cast<const float*>(d_rc.dev_ptr), reinterpret_cast<const float*>(d_rs.dev_ptr), S, H, hd);
+            k_vit_full_attn<<<dim3(H, S), 64, 0, stream_>>>(
+                reinterpret_cast<const float*>(d_q.dev_ptr), reinterpret_cast<const float*>(d_k.dev_ptr),
+                reinterpret_cast<const float*>(d_v.dev_ptr), reinterpret_cast<float*>(d_ao.dev_ptr), S, H, hd);
+            launch_bf16_linear(vit_bf16(p + ".self_attn.out_proj.weight"), reinterpret_cast<const float*>(d_ao.dev_ptr),
+                               vit_f32(p + ".self_attn.out_proj.bias"), reinterpret_cast<float*>(d_proj.dev_ptr), S, D, D, mem_info_.gen, stream_);
+            k_vit_layerscale_res<<<(S * D + 255) / 256, 256, 0, stream_>>>(cur, reinterpret_cast<const float*>(d_proj.dev_ptr),
+                                                                           vit_f32(p + ".ls_1.gamma"), S, D);
+
+            k_vit_layernorm_f32<<<S, 256, 0, stream_>>>(cur, vit_f32(p + ".ln_2.weight"), vit_f32(p + ".ln_2.bias"),
+                                                        reinterpret_cast<float*>(d_norm.dev_ptr), S, D, vc.ln_eps);
+            launch_bf16_linear(vit_bf16(p + ".mlp.c_fc.weight"), reinterpret_cast<const float*>(d_norm.dev_ptr),
+                               vit_f32(p + ".mlp.c_fc.bias"), reinterpret_cast<float*>(d_mlp.dev_ptr), S, vc.inter, D, mem_info_.gen, stream_);
+            k_vit_gelu_exact<<<(S * vc.inter + 255) / 256, 256, 0, stream_>>>(reinterpret_cast<float*>(d_mlp.dev_ptr), S * vc.inter);
+            launch_bf16_linear(vit_bf16(p + ".mlp.c_proj.weight"), reinterpret_cast<const float*>(d_mlp.dev_ptr),
+                               vit_f32(p + ".mlp.c_proj.bias"), reinterpret_cast<float*>(d_proj.dev_ptr), S, D, vc.inter, mem_info_.gen, stream_);
+            k_vit_layerscale_res<<<(S * D + 255) / 256, 256, 0, stream_>>>(cur, reinterpret_cast<const float*>(d_proj.dev_ptr),
+                                                                           vit_f32(p + ".ls_2.gamma"), S, D);
+            if (guard_.visit_flush_stride > 0 && ((il + 1) % guard_.visit_flush_stride == 0)) {
+                (void)hipStreamSynchronize(stream_);
+            }
+        }
+
+        // 2x2 merge projector (drop CLS at index 0)
+        const int merged_dim = merge * merge * D;
+        launch_bf16_linear(vit_bf16("model.visual.proj_in.weight"), cur + D, nullptr,
+                           reinterpret_cast<float*>(d_mid.dev_ptr), n_tok, vc.proj_hidden, merged_dim, mem_info_.gen, stream_);
+        k_vit_gelu_exact<<<(n_tok * vc.proj_hidden + 255) / 256, 256, 0, stream_>>>(reinterpret_cast<float*>(d_mid.dev_ptr), n_tok * vc.proj_hidden);
+        launch_bf16_linear(vit_bf16("model.visual.proj_out.weight"), reinterpret_cast<const float*>(d_mid.dev_ptr), nullptr,
+                           reinterpret_cast<float*>(d_out.dev_ptr), n_tok, vc.out_hidden, vc.proj_hidden, mem_info_.gen, stream_);
+
+        out_embeds.resize(static_cast<size_t>(n_tok) * vc.out_hidden);
+        const bool ok = hip_ok(hipMemcpyAsync(out_embeds.data(), d_out.dev_ptr, out_embeds.size() * 4, hipMemcpyDeviceToHost, stream_), "vit D2H", err)
+                     && hip_ok(hipStreamSynchronize(stream_), "vit sync", err);
+        cleanup_img();
+        return ok;
+    }
+
+    bool selfcheck(std::string& err) override {
+        // Verify SF4 GPU GEMV & WMMA parity against exact CPU dequant on active GPU!
+        const int M = 8, N = 64, K = 2304;
+        std::vector<uint8_t> h_p(static_cast<size_t>(N) * (K / 2));
+        std::vector<uint8_t> h_s(static_cast<size_t>(N) * (K / 16));
+        std::vector<half_t> h_x(static_cast<size_t>(M) * K);
+        for (size_t i = 0; i < h_p.size(); ++i) h_p[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFFu);
+        for (size_t i = 0; i < h_s.size(); ++i) h_s[i] = static_cast<uint8_t>(0x38u + (i % 16));
+        for (size_t i = 0; i < h_x.size(); ++i) h_x[i] = static_cast<half_t>(std::sin(static_cast<float>(i) * 0.013f));
+
+        GpuBuffer dp, ds, dx, dy;
+        auto rel = [&]() { free_gpu_buffer(dp); free_gpu_buffer(ds); free_gpu_buffer(dx); free_gpu_buffer(dy); };
+        if (!upload_raw(dp, h_p.data(), h_p.size(), err) ||
+            !upload_raw(ds, h_s.data(), h_s.size(), err) ||
+            !upload_raw(dx, h_x.data(), h_x.size() * sizeof(half_t), err) ||
+            !hip_ok(alloc_gpu_buffer(dy, static_cast<size_t>(M) * N * 4, mem_info_.is_uma), "sc dy", err)) {
+            rel();
+            return false;
+        }
+        launch_sf4_linear(dp.dev_ptr, ds.dev_ptr, 0.25f, reinterpret_cast<const half_t*>(dx.dev_ptr),
+                          reinterpret_cast<float*>(dy.dev_ptr), M, N, K, mem_info_.gen, stream_, false);
+        std::vector<float> got(static_cast<size_t>(M) * N);
+        if (!hip_ok(hipMemcpyAsync(got.data(), dy.dev_ptr, got.size() * 4, hipMemcpyDeviceToHost, stream_), "sc D2H", err) ||
+            !hip_ok(hipStreamSynchronize(stream_), "sc sync", err)) {
+            rel();
+            return false;
+        }
+        rel();
+
+        std::vector<float> w_dec(K);
+        double num = 0.0, den = 0.0;
+        for (int n = 0; n < N; ++n) {
+            dequant_sf4_row(h_p.data() + static_cast<size_t>(n) * (K / 2), h_s.data() + static_cast<size_t>(n) * (K / 16), 0.25f, w_dec.data(), K);
+            for (int m = 0; m < M; ++m) {
+                double acc = 0.0;
+                for (int k = 0; k < K; ++k) acc += static_cast<double>(w_dec[k]) * static_cast<double>(static_cast<float>(h_x[static_cast<size_t>(m) * K + k]));
+                const double d = acc - static_cast<double>(got[static_cast<size_t>(m) * N + n]);
+                num += d * d;
+                den += acc * acc;
+            }
+        }
+        const double rel_l2 = std::sqrt(num / (den + 1e-30));
+        if (rel_l2 > 1e-2) {
+            err = "hip SF4 selfcheck failed: rel_l2=" + std::to_string(rel_l2);
+            return false;
+        }
+        if (model_) {
+            std::vector<uint8_t> s5;
+            if (!model_->rd.read_section(5, s5, err)) return false;
+            if (s5.empty()) { err = "Section 5 sq.selfcheck is empty"; return false; }
+        }
+        return true;
+    }
+
+private:
+    static bool is_large_2d_matmul(const std::string& name, const TInfo& ti) {
+        if (ti.shape.size() != 2) return false;
+        if (name.find("attn_res") != std::string::npos ||
+            name.find("cross_pass") != std::string::npos ||
+            name.find("sconv") != std::string::npos ||
+            name.find("rel_logits_proj") != std::string::npos ||
+            name.find("mlp.gate") != std::string::npos ||
+            name.find("attn_sink_proj") != std::string::npos) {
+            return false;
+        }
+        return ti.numel() >= 32768;
+    }
+
+    void HIP_ZERO(GpuBuffer& b) {
+        if (b.dev_ptr && b.bytes > 0) (void)hipMemset(b.dev_ptr, 0, b.bytes);
+    }
+
+    bool upload_raw(GpuBuffer& dst, const void* src, size_t bytes, std::string& err) {
+        if (!hip_ok(alloc_gpu_buffer(dst, bytes, mem_info_.is_uma), "alloc_gpu_buffer", err)) return false;
+        if (bytes > 0 && !hip_ok(hipMemcpy(dst.dev_ptr, src, bytes, hipMemcpyHostToDevice), "hipMemcpy H2D", err)) return false;
+        return true;
+    }
+
+    const float* f32_ptr(const std::string& k) const {
+        return reinterpret_cast<const float*>(trunk_f32_.at(k).dev_ptr);
+    }
+    const uint16_t* bf16_ptr(const std::string& k) const {
+        return reinterpret_cast<const uint16_t*>(trunk_bf16_.at(k).dev_ptr);
+    }
+    const float* ds_f32(const std::string& k) const {
+        return reinterpret_cast<const float*>(dspark_f32_.at(k).dev_ptr);
+    }
+    const uint16_t* ds_bf16(const std::string& k) const {
+        return reinterpret_cast<const uint16_t*>(dspark_bf16_.at(k).dev_ptr);
+    }
+    const float* vit_f32(const std::string& k) const {
+        auto it = vision_.w_f32.find(k);
+        return it == vision_.w_f32.end() ? nullptr : reinterpret_cast<const float*>(it->second.dev_ptr);
+    }
+    const uint16_t* vit_bf16(const std::string& k) const {
+        return reinterpret_cast<const uint16_t*>(vision_.w_bf16.at(k).dev_ptr);
+    }
+
+    void launch_trunk_linear(const std::string& key, const float* X, float* Y, int M, int N, int K) {
+        auto it_bf = trunk_bf16_.find(key);
+        if (it_bf != trunk_bf16_.end()) {
+            launch_bf16_linear(reinterpret_cast<const uint16_t*>(it_bf->second.dev_ptr), X, nullptr, Y, M, N, K, mem_info_.gen, stream_);
+        } else {
+            launch_f32_linear(reinterpret_cast<const float*>(trunk_f32_.at(key).dev_ptr), X, nullptr, Y, M, N, K, stream_, mem_info_.gen);
+        }
+    }
+
+    void clear_slot_sconv(int slot) {
+        const int kv_dim = c_.n_kv * c_.head_dim;
+        const size_t kv_one = 3u * kv_dim * sizeof(uint16_t);
+        const size_t h_one  = 3u * c_.hidden * sizeof(uint16_t);
+        for (int v = 0; v < c_.n_visits; ++v) {
+            (void)hipMemsetAsync(d_sconv_k_[v].dev_ptr + slot * kv_one, 0, kv_one, stream_);
+            (void)hipMemsetAsync(d_sconv_v_[v].dev_ptr + slot * kv_one, 0, kv_one, stream_);
+            (void)hipMemsetAsync(d_sconv_attn_[v].dev_ptr + slot * h_one, 0, h_one, stream_);
+            (void)hipMemsetAsync(d_sconv_mlp_[v].dev_ptr + slot * h_one, 0, h_one, stream_);
+        }
+    }
+
+    size_t vram_used_bytes() const noexcept {
+        size_t tot = expert_gpu_arena_.bytes + d_exp_stage_.bytes;
+        for (const auto& kv : trunk_bf16_) tot += kv.second.bytes;
+        for (const auto& kv : trunk_f32_) tot += kv.second.bytes;
+        for (const auto& kv : packed_trunk_) tot += kv.second.buf.bytes;
+        for (const auto& kv : static_sconv_) tot += kv.second.bytes;
+        for (const auto& b : d_msg_queries_) tot += b.bytes;
+        for (const auto& kv : dspark_bf16_) tot += kv.second.bytes;
+        for (const auto& kv : dspark_f32_) tot += kv.second.bytes;
+        for (const auto& p : swa_pools_) tot += p.allocated_bytes();
+        for (const auto& p : glob_pools_) tot += p.allocated_bytes();
+        for (const auto& b : d_sconv_k_) tot += b.bytes;
+        for (const auto& b : d_sconv_v_) tot += b.bytes;
+        for (const auto& b : d_sconv_attn_) tot += b.bytes;
+        for (const auto& b : d_sconv_mlp_) tot += b.bytes;
+        return tot;
+    }
+
+    bool ensure_batch_scratch(int B, std::string& err) {
+        if (B <= scratch_B_) return true;
+        const int D = c_.hidden;
+        const int q_dim = c_.n_head * c_.head_dim;
+        const int kv_dim = c_.n_kv * c_.head_dim;
+        const int inter = c_.inter;
+        const int n_exp = c_.n_experts;
+        auto re = [&](GpuBuffer& b, size_t bytes) -> bool {
+            free_gpu_buffer(b);
+            return hip_ok(alloc_gpu_buffer(b, bytes, mem_info_.is_uma), "scratch alloc", err);
+        };
+        if (!re(sc_slot_ids_, B * 4) || !re(sc_pos_, B * 4) || !re(sc_tok_ids_, B * 4) || !re(sc_img_idx_, B * 4) ||
+            !re(sc_want_idx_, B * 4) || !re(sc_grp_slot_, B * 4) || !re(sc_grp_off_, (B + 1) * 4) || !re(sc_grp_tok_, B * 4) ||
+            !re(sc_cur_, static_cast<size_t>(B) * D * 4) || !re(sc_res_, static_cast<size_t>(B) * D * 4) ||
+            !re(sc_in0_, static_cast<size_t>(B) * D * 4) || !re(sc_in1_, static_cast<size_t>(B) * D * 4) ||
+            !re(sc_in2_, static_cast<size_t>(B) * D * 4) || !re(sc_mx3_, static_cast<size_t>(B) * 3 * D * 4) ||
+            !re(sc_msgs_, static_cast<size_t>(B) * 4 * D * 4) || !re(sc_ctrl_tmp_, static_cast<size_t>(B) * D * 4) ||
+            !re(sc_ctrl_in_, static_cast<size_t>(B) * 2 * D * 4) || !re(sc_ctrl_gain_, static_cast<size_t>(B) * D * 4) ||
+            !re(sc_ctrl_forget_, static_cast<size_t>(B) * D * 4) ||
+            !re(sc_q_, static_cast<size_t>(B) * q_dim * 4) || !re(sc_k_raw_, static_cast<size_t>(B) * kv_dim * 4) ||
+            !re(sc_v_raw_, static_cast<size_t>(B) * kv_dim * 4) || !re(sc_k_conv_, static_cast<size_t>(B) * kv_dim * 4) ||
+            !re(sc_v_conv_, static_cast<size_t>(B) * kv_dim * 4) || !re(sc_r_raw_, static_cast<size_t>(B) * c_.n_head * c_.d_rel * 4) ||
+            !re(sc_rel_bias_, static_cast<size_t>(B) * c_.n_head * c_.rel_extent * 4) ||
+            !re(sc_sinks_, static_cast<size_t>(B) * c_.n_head * 4) || !re(sc_gate_a_, static_cast<size_t>(B) * q_dim * 4) ||
+            !re(sc_k_dyn_, static_cast<size_t>(B) * c_.n_kv * 4 * 4) || !re(sc_v_dyn_, static_cast<size_t>(B) * c_.n_kv * 4 * 4) ||
+            !re(sc_attn_out_, static_cast<size_t>(B) * q_dim * 4) || !re(sc_o_proj_, static_cast<size_t>(B) * D * 4) ||
+            !re(sc_a_sconv_, static_cast<size_t>(B) * D * 4) || !re(sc_mlp_in_, static_cast<size_t>(B) * D * 4) ||
+            !re(sc_mlp_f16_, static_cast<size_t>(B) * D * sizeof(half_t)) ||
+            !re(sc_r_logits_, static_cast<size_t>(B) * n_exp * 4) ||
+            !re(sc_topk_ids_, static_cast<size_t>(B) * c_.top_k * 4) || !re(sc_topk_w_, static_cast<size_t>(B) * c_.top_k * 4) ||
+            !re(sc_moe_act_, static_cast<size_t>(B) * c_.top_k * inter * sizeof(half_t)) ||
+            !re(sc_moe_gu_, static_cast<size_t>(B) * 2 * inter * 4) ||
+            !re(sc_moe_ye_, static_cast<size_t>(B) * D * 4) ||
+            !re(sc_exp_off_, 129 * 4) ||
+            !re(sc_bucket_tok_, static_cast<size_t>(B) * c_.top_k * 4) ||
+            !re(sc_slotk_bidx_, static_cast<size_t>(B) * c_.top_k * 4) ||
+            !re(sc_bucket_y_, static_cast<size_t>(B) * c_.top_k * D * 4) ||
+            !re(sc_moe_out_, static_cast<size_t>(B) * D * 4) || !re(sc_m_sconv_, static_cast<size_t>(B) * D * 4) ||
+            !re(sc_exp_tok_idx_, static_cast<size_t>(B) * 4) || !re(sc_exp_tok_w_, static_cast<size_t>(B) * 4) ||
+            !re(sc_h_norm_, static_cast<size_t>(B) * D * 4) ||
+            !re(sc_blk_ptrs_, 16 * sizeof(float*)) ||
+            !re(sc_prelude_, static_cast<size_t>(B) * D * 4) || !re(sc_bank_out_, static_cast<size_t>(B) * D * 4)) {
+            return false;
+        }
+        // Depth block pool (max 8 AttnRes blocks across 24 physical layers + 4 bank slots)
+        sc_blocks_.resize(8);
+        for (int i = 0; i < 8; ++i) if (!re(sc_blocks_[i], static_cast<size_t>(B) * D * 4)) return false;
+        sc_bank_.resize(4);
+        for (int i = 0; i < 4; ++i) if (!re(sc_bank_[i], static_cast<size_t>(B) * D * 4)) return false;
+        for (int k = 0; k < 4; ++k) if (!re(sc_taps_[k], static_cast<size_t>(B) * D * 4)) return false;
+        scratch_B_ = B;
+        return true;
+    }
+
+    bool ensure_dspark_scratch(int B, int D, int q_dim, int kv_dim, int inter, std::string& err) {
+        if (ds_cur_.dev_ptr) return true;
+        auto al = [&](GpuBuffer& b, size_t bytes) -> bool {
+            return hip_ok(alloc_gpu_buffer(b, bytes, mem_info_.is_uma), "dspark scratch", err);
+        };
+        return al(ds_cur_, B * D * 4) && al(ds_res_, B * D * 4) && al(ds_h_, B * D * 4) &&
+               al(ds_q_, B * q_dim * 4) && al(ds_k_, B * kv_dim * 4) && al(ds_v_, B * kv_dim * 4) &&
+               al(ds_ao_, B * q_dim * 4) && al(ds_mg_, B * inter * 4) && al(ds_mu_, B * inter * 4);
+    }
+
+    bool ensure_dspark_slot_cap(GpuSlotMeta& sl, int need_len, std::string& err) {
+        if (need_len <= sl.dspark_cap) return true;
+        const int new_cap = std::max(need_len, std::max(256, sl.dspark_cap * 2));
+        const int kv_dim = dspark_cfg_.n_kv * dspark_cfg_.head_dim;
+        const int D = dspark_cfg_.hidden;
+        for (int il = 0; il < dspark_cfg_.n_layers; ++il) {
+            GpuBuffer nk, nv;
+            if (!hip_ok(alloc_gpu_buffer(nk, static_cast<size_t>(new_cap) * kv_dim * 2, mem_info_.is_uma), "ds k grow", err) ||
+                !hip_ok(alloc_gpu_buffer(nv, static_cast<size_t>(new_cap) * kv_dim * 2, mem_info_.is_uma), "ds v grow", err)) {
+                free_gpu_buffer(nk); free_gpu_buffer(nv);
+                return false;
+            }
+            if (sl.dspark_cap > 0) {
+                const size_t old_b = static_cast<size_t>(sl.dspark_cap) * kv_dim * 2;
+                (void)hipMemcpyAsync(nk.dev_ptr, sl.dspark_k[il].dev_ptr, old_b, hipMemcpyDeviceToDevice, stream_);
+                (void)hipMemcpyAsync(nv.dev_ptr, sl.dspark_v[il].dev_ptr, old_b, hipMemcpyDeviceToDevice, stream_);
+            }
+            (void)hipStreamSynchronize(stream_);
+            free_gpu_buffer(sl.dspark_k[il]); free_gpu_buffer(sl.dspark_v[il]);
+            sl.dspark_k[il] = nk; sl.dspark_v[il] = nv;
+        }
+        GpuBuffer nf;
+        if (!hip_ok(alloc_gpu_buffer(nf, static_cast<size_t>(new_cap) * D * 2, mem_info_.is_uma), "ds frnn grow", err)) return false;
+        if (sl.dspark_cap > 0) {
+            (void)hipMemcpyAsync(nf.dev_ptr, sl.dspark_frnn.dev_ptr, static_cast<size_t>(sl.dspark_cap) * D * 2, hipMemcpyDeviceToDevice, stream_);
+            (void)hipStreamSynchronize(stream_);
+        }
+        free_gpu_buffer(sl.dspark_frnn);
+        sl.dspark_frnn = nf;
+        sl.dspark_cap = new_cap;
+        return true;
+    }
+
+    bool load_vision_gpu(const std::string& path, std::string& err) {
+        vision_.release();
+        if (!vision_probe(path, vision_.info, err)) return false;
+        strata::artifact::StrataFileReader rd;
+        if (!rd.open(path, err)) return false;
+        std::vector<uint8_t> s1;
+        if (!rd.read_section(1, s1, err)) return false;
+
+        for (const auto& kv : vision_.info.T) {
+            const auto& vt = kv.second;
+            size_t n = 1;
+            for (int64_t d : vt.shape) n *= static_cast<size_t>(d);
+            std::vector<float> f32(n);
+            const uint8_t* src = s1.data() + vt.off;
+            if (vt.fmt == F_BF16) {
+                const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+                for (size_t i = 0; i < n; ++i) f32[i] = ink2::bf16_to_f32(p[i]);
+            } else if (vt.fmt == F_F16) {
+                const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+                for (size_t i = 0; i < n; ++i) f32[i] = ink2::fp16_to_f32(p[i]);
+            } else {
+                std::memcpy(f32.data(), src, n * 4);
+            }
+
+            if (kv.first == "model.visual.backbone.embeddings.class_embedding") vision_.h_cls = f32;
+            else if (kv.first == "model.visual.backbone.embeddings.cls_position_embedding") vision_.h_cls_pos = f32;
+            else if (kv.first == "model.visual.backbone.embeddings.position_embedding") vision_.h_pos_emb = f32;
+            else if (kv.first == "model.visual.backbone.embeddings.patch_embedding.weight" ||
+                     (vt.shape.size() >= 2 && vt.shape[0] >= 64 && (n / static_cast<size_t>(vt.shape[0])) >= 64)) {
+                auto bf = f32_vec_to_bf16(f32);
+                GpuBuffer b;
+                if (!upload_raw(b, bf.data(), bf.size() * 2, err)) return false;
+                vision_.w_bf16[kv.first] = b;
+            } else {
+                GpuBuffer b;
+                if (!upload_raw(b, f32.data(), f32.size() * 4, err)) return false;
+                vision_.w_f32[kv.first] = b;
+            }
+        }
+        vision_.loaded = true;
+        return true;
+    }
+
+    bool forward_batch_chunk(const StepBatch& batch, float* logits_out, TapCapture* taps_out, std::string& err) {
+        const int B = batch.n_tokens;
+        const int D = c_.hidden;
+        const int q_dim = c_.n_head * c_.head_dim;
+        const int kv_dim = c_.n_kv * c_.head_dim;
+        const bool is_fp8 = (default_kv_dtype_ == KvDtype::FP8_E4M3);
+
+        for (int b = 0; b < B; ++b) {
+            const int s = batch.slot_ids[b];
+            if (s < 0 || s >= max_slots_ || !slots_[s].allocated) {
+                err = "hip: unallocated slot " + std::to_string(s);
+                return false;
+            }
+        }
+        if (!ensure_batch_scratch(B, err)) return false;
+
+        // Detect whether all B tokens belong to distinct slots (fast parallel ShortConv) or grouped sequential per slot
+        bool all_distinct_slots = true;
+        std::vector<int> slot_seen(max_slots_, 0);
+        for (int b = 0; b < B; ++b) {
+            if (++slot_seen[batch.slot_ids[b]] > 1) all_distinct_slots = false;
+        }
+        int n_groups = 0;
+        std::vector<int32_t> h_grp_slot, h_grp_off, h_grp_tok;
+        if (!all_distinct_slots) {
+            std::vector<std::vector<int32_t>> by_slot(max_slots_);
+            for (int b = 0; b < B; ++b) by_slot[batch.slot_ids[b]].push_back(b);
+            h_grp_off.push_back(0);
+            for (int s = 0; s < max_slots_; ++s) {
+                if (by_slot[s].empty()) continue;
+                h_grp_slot.push_back(s);
+                for (int32_t idx : by_slot[s]) h_grp_tok.push_back(idx);
+                h_grp_off.push_back(static_cast<int32_t>(h_grp_tok.size()));
+            }
+            n_groups = static_cast<int>(h_grp_slot.size());
+            (void)hipMemcpyAsync(sc_grp_slot_.dev_ptr, h_grp_slot.data(), h_grp_slot.size() * 4, hipMemcpyHostToDevice, stream_);
+            (void)hipMemcpyAsync(sc_grp_off_.dev_ptr, h_grp_off.data(), h_grp_off.size() * 4, hipMemcpyHostToDevice, stream_);
+            (void)hipMemcpyAsync(sc_grp_tok_.dev_ptr, h_grp_tok.data(), h_grp_tok.size() * 4, hipMemcpyHostToDevice, stream_);
+        }
+
+        // Pre-ensure KV pages exist for all tokens in batch across all 40 SWA & 8 Global pools
+        for (int b = 0; b < B; ++b) {
+            const int s = batch.slot_ids[b];
+            const int p = batch.pos[b];
+            const int swa_lp = (p % c_.swa_win) >> 6;
+            const int glb_lp = p >> 6;
+            for (int i = 0; i < c_.n_swa_visits; ++i) {
+                if (!swa_pools_[i].ensure_page(s, swa_lp, stream_, err)) return false;
+            }
+            for (int i = 0; i < c_.n_global_visits; ++i) {
+                if (!glob_pools_[i].ensure_page(s, glb_lp, stream_, err)) return false;
+            }
+        }
+        for (auto& p : swa_pools_) if (!p.sync_pt(stream_, err)) return false;
+        for (auto& p : glob_pools_) if (!p.sync_pt(stream_, err)) return false;
+
+        // Upload tiny batch descriptors
+        (void)hipMemcpyAsync(sc_slot_ids_.dev_ptr, batch.slot_ids.data(), B * 4, hipMemcpyHostToDevice, stream_);
+        (void)hipMemcpyAsync(sc_pos_.dev_ptr, batch.pos.data(), B * 4, hipMemcpyHostToDevice, stream_);
+        (void)hipMemcpyAsync(sc_tok_ids_.dev_ptr, batch.token_ids.data(), B * 4, hipMemcpyHostToDevice, stream_);
+        (void)hipMemcpyAsync(sc_img_idx_.dev_ptr, batch.img_embed_idx.data(), B * 4, hipMemcpyHostToDevice, stream_);
+
+        // Upload image embeddings if present in this batch
+        int max_img_row = -1;
+        for (int b = 0; b < B; ++b) max_img_row = std::max(max_img_row, batch.img_embed_idx[b]);
+        GpuBuffer d_img_emb;
+        if (max_img_row >= 0 && batch.img_embeds != nullptr) {
+            if (!upload_raw(d_img_emb, batch.img_embeds, static_cast<size_t>(max_img_row + 1) * D * 4, err)) return false;
+        }
+
+        // Detect single-slot speculative verify batch (recording <= 8 ShortConv inputs for exact partial rollback!)
+        int rec_slot = -1;
+        if (B >= 2 && B <= 8) {
+            const int s0 = batch.slot_ids[0];
+            bool same_slot = slots_[s0].has_snap && batch.pos[0] == slots_[s0].snap_seq_len;
+            for (int b = 1; b < B && same_slot; ++b) {
+                if (batch.slot_ids[b] != s0 || batch.pos[b] != batch.pos[0] + b) same_slot = false;
+            }
+            if (same_slot) {
+                rec_slot = s0;
+                slots_[s0].sconv_rec_n = B;
+            }
+        }
+
+        auto run_sconv = [&](const float* in_ptr, const std::string& sw_key, const float* dyn_ptr,
+                             GpuBuffer& hist_pool, float* out_ptr, int C, int n_heads,
+                             GpuBuffer* rec_pool = nullptr, int rec_visit = 0) {
+            if (rec_slot >= 0 && rec_pool && rec_pool->dev_ptr) {
+                const size_t one_visit = 8u * static_cast<size_t>(C) * sizeof(uint16_t);
+                k_f32_to_bf16_vec<<<(B * C + 255) / 256, 256, 0, stream_>>>(
+                    in_ptr, reinterpret_cast<uint16_t*>(rec_pool->dev_ptr + rec_visit * one_visit), B * C);
+            }
+            const float* sw = reinterpret_cast<const float*>(static_sconv_.at(sw_key).dev_ptr);
+            uint16_t* hp = reinterpret_cast<uint16_t*>(hist_pool.dev_ptr);
+            if (all_distinct_slots) {
+                k2_shortconv4_batched<<<dim3((C + 255) / 256, B), 256, 0, stream_>>>(
+                    in_ptr, sw, dyn_ptr, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), hp, out_ptr, B, C, n_heads);
+            } else {
+                k2_shortconv4_grouped_seq<<<dim3((C + 255) / 256, n_groups), 256, 0, stream_>>>(
+                    in_ptr, sw, dyn_ptr, reinterpret_cast<const int32_t*>(sc_grp_slot_.dev_ptr),
+                    reinterpret_cast<const int32_t*>(sc_grp_off_.dev_ptr), reinterpret_cast<const int32_t*>(sc_grp_tok_.dev_ptr),
+                    hp, out_ptr, n_groups, C, n_heads);
+            }
+        };
+
+        auto run_attnres = [&](const std::vector<const float*>& ptrs, const float* cur_p, const float* q_p,
+                               int nq, float* out_p) {
+            BlockPtrs12 bp{};
+            const int nb = static_cast<int>(ptrs.size());
+            for (int i = 0; i < nb && i < 12; ++i) bp.p[i] = ptrs[i];
+            k1_attn_res_mix<<<dim3(nq, B), 256, 0, stream_>>>(bp, nb, cur_p, q_p, out_p, B, nq, D);
+        };
+
+        // Check eligibility for HIP Graph Capture (all distinct slots, all GPU-resident layers, no images/host-taps, want all logits)
+        bool all_gpu_layers = true;
+        for (bool ok_l : layer_all_gpu_) if (!ok_l) { all_gpu_layers = false; break; }
+        bool all_want_logits = (logits_out != nullptr);
+        for (int b = 0; b < B && all_want_logits; ++b) if (!batch.want_logits[b]) all_want_logits = false;
+        const bool need_taps = (taps_out != nullptr) || (has_dspark_ && batch.capture_taps);
+
+        uint64_t kv_gen_sum = 0;
+        for (const auto& p : swa_pools_) kv_gen_sum += p.pool_gen;
+        for (const auto& p : glob_pools_) kv_gen_sum += p.pool_gen;
+
+        const bool use_graph = all_distinct_slots && all_gpu_layers && all_want_logits &&
+                               max_img_row < 0 && taps_out == nullptr && rec_slot < 0 &&
+                               (B <= 64);
+
+        if (use_graph) {
+            const int V = c_.vocab_unpadded;
+            const size_t lbytes = static_cast<size_t>(B) * V * sizeof(float);
+            if (sc_logits_.bytes < lbytes) {
+                invalidate_graph();
+                free_gpu_buffer(sc_logits_);
+                if (!hip_ok(alloc_gpu_buffer(sc_logits_, lbytes, mem_info_.is_uma), "logits buf", err)) return false;
+            }
+            std::vector<int32_t> want_seq(B);
+            for (int b = 0; b < B; ++b) want_seq[b] = b;
+            (void)hipMemcpyAsync(sc_want_idx_.dev_ptr, want_seq.data(), B * 4, hipMemcpyHostToDevice, stream_);
+
+            if (graph_exec_ != nullptr && graph_B_ == B && graph_need_taps_ == need_taps &&
+                graph_kv_gen_ == kv_gen_sum && graph_scratch_B_ == scratch_B_) {
+                if (!hip_ok(hipGraphLaunch(graph_exec_, stream_), "hipGraphLaunch", err)) return false;
+                for (int b = 0; b < B; ++b) {
+                    auto& sl = slots_[batch.slot_ids[b]];
+                    sl.seq_len = std::max(sl.seq_len, batch.pos[b] + 1);
+                }
+                if (has_dspark_ && batch.capture_taps && h_dspark_fuse_.size() >= 16) {
+                    if (!update_dspark_ctx_gpu(batch, err)) return false;
+                }
+                if (!hip_ok(hipMemcpyAsync(logits_out, sc_logits_.dev_ptr, lbytes, hipMemcpyDeviceToHost, stream_),
+                            "logits D2H", err)) return false;
+                return hip_ok(hipStreamSynchronize(stream_), "graph sync", err);
+            }
+            invalidate_graph();
+            if (!hip_ok(hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal), "hipStreamBeginCapture", err)) {
+                return false;
+            }
+        }
+
+        // 1. Embeddings
+        float* cur = reinterpret_cast<float*>(sc_cur_.dev_ptr);
+        const auto& emb_pk = packed_trunk_.at("model.llm.embed.weight");
+        k_embed_lookup<<<B, 256, 0, stream_>>>(
+            emb_pk.buf.dev_ptr, emb_pk.info.fmt, static_cast<int>(emb_pk.info.rows()),
+            f32_ptr("model.llm.embed_norm.weight"),
+            reinterpret_cast<const int32_t*>(sc_tok_ids_.dev_ptr),
+            reinterpret_cast<const int32_t*>(sc_img_idx_.dev_ptr),
+            reinterpret_cast<const float*>(d_img_emb.dev_ptr),
+            cur, B, D, c_.rms_eps);
+
+        auto maybe_tap = [&](int visit_id, const float* vec) {
+            if (!need_taps) return;
+            for (int k = 0; k < 4 && k < static_cast<int>(dspark_cfg_.target_visits.size()); ++k) {
+                if (dspark_cfg_.target_visits[k] == visit_id) {
+                    (void)hipMemcpyAsync(sc_taps_[k].dev_ptr, vec, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                }
+            }
+        };
+
+        // Depth block tracking (pointers into sc_blocks_[] / sc_bank_[])
+        int n_blocks = 0;
+        int n_prelude_blocks = 0;
+        int n_bank = 0;
+        std::vector<const float*> blk_ptrs;
+        std::vector<const float*> bank_ptrs;
+
+        float* res   = reinterpret_cast<float*>(sc_res_.dev_ptr);
+        float* in0   = reinterpret_cast<float*>(sc_in0_.dev_ptr);
+        float* in1   = reinterpret_cast<float*>(sc_in1_.dev_ptr);
+        float* in2   = reinterpret_cast<float*>(sc_in2_.dev_ptr);
+        float* mx3   = reinterpret_cast<float*>(sc_mx3_.dev_ptr);
+        float* msgs  = reinterpret_cast<float*>(sc_msgs_.dev_ptr);
+        float* q     = reinterpret_cast<float*>(sc_q_.dev_ptr);
+        float* k_raw = reinterpret_cast<float*>(sc_k_raw_.dev_ptr);
+        float* v_raw = reinterpret_cast<float*>(sc_v_raw_.dev_ptr);
+        float* k_cv  = reinterpret_cast<float*>(sc_k_conv_.dev_ptr);
+        float* v_cv  = reinterpret_cast<float*>(sc_v_conv_.dev_ptr);
+        float* r_raw = reinterpret_cast<float*>(sc_r_raw_.dev_ptr);
+        float* rbias = reinterpret_cast<float*>(sc_rel_bias_.dev_ptr);
+        float* sinks = reinterpret_cast<float*>(sc_sinks_.dev_ptr);
+        float* gatea = reinterpret_cast<float*>(sc_gate_a_.dev_ptr);
+        float* k_dyn = reinterpret_cast<float*>(sc_k_dyn_.dev_ptr);
+        float* v_dyn = reinterpret_cast<float*>(sc_v_dyn_.dev_ptr);
+        float* aout  = reinterpret_cast<float*>(sc_attn_out_.dev_ptr);
+        float* oproj = reinterpret_cast<float*>(sc_o_proj_.dev_ptr);
+        float* asc   = reinterpret_cast<float*>(sc_a_sconv_.dev_ptr);
+        float* mlpin = reinterpret_cast<float*>(sc_mlp_in_.dev_ptr);
+        half_t* mlpf16 = reinterpret_cast<half_t*>(sc_mlp_f16_.dev_ptr);
+        float* rlog  = reinterpret_cast<float*>(sc_r_logits_.dev_ptr);
+        int32_t* tk_i = reinterpret_cast<int32_t*>(sc_topk_ids_.dev_ptr);
+        float*   tk_w = reinterpret_cast<float*>(sc_topk_w_.dev_ptr);
+        float* moeout = reinterpret_cast<float*>(sc_moe_out_.dev_ptr);
+        float* msc   = reinterpret_cast<float*>(sc_m_sconv_.dev_ptr);
+
+        int visit = 0;
+        auto run_visit = [&](int ip, bool has_msgs) -> bool {
+            maybe_tap(visit, cur);
+            const std::string p = "model.llm.layers." + std::to_string(ip);
+            const bool is_swa = c_.is_swa[ip] != 0;
+            const int kv_slot = c_.visit_kv_slot[visit];
+            (void)hipMemcpyAsync(res, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+
+            // k1: AttnRes + optional loop controllers + input RMSNorm (zero unnecessary D2D copies!)
+            float* q_in = in0;
+            float* k_in = in1;
+            float* v_in = in2;
+            if (ip > 0) {
+                const float* q_res = f32_ptr("model.llm.attn_res.attn_queries." + std::to_string(ip - 1));
+                if (is_swa) {
+                    run_attnres(blk_ptrs, cur, q_res, 1, in0);
+                    if (has_msgs) {
+                        (void)hipMemcpyAsync(in1, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                        (void)hipMemcpyAsync(in2, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                    }
+                } else {
+                    run_attnres(blk_ptrs, cur, q_res, 3, mx3);
+                    k_split_attnres3<<<(B * D + 255) / 256, 256, 0, stream_>>>(mx3, in0, in1, in2, B, D);
+                }
+            } else {
+                q_in = in0;
+                (void)hipMemcpyAsync(in0, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                if (!is_swa || has_msgs) {
+                    (void)hipMemcpyAsync(in1, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                    (void)hipMemcpyAsync(in2, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                }
+            }
+
+            float* ctrl_inv_c = reinterpret_cast<float*>(sc_ctrl_tmp_.dev_ptr);
+            float* ctrl_inv_m = ctrl_inv_c + B;
+            float* ctrl_gate  = ctrl_inv_m + B;
+
+            auto run_loop_ctrl = [&](float* target_in, int msg_ch, const std::string& cp) {
+                k1_loop_ctrl_rms<<<B, 256, 0, stream_>>>(target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, B, D);
+                const bool is_bf = trunk_bf16_.count(cp + ".down_weight") > 0;
+                if (B >= 16) {
+                    float* cin = reinterpret_cast<float*>(sc_ctrl_in_.dev_ptr);
+                    float* cg  = reinterpret_cast<float*>(sc_ctrl_gain_.dev_ptr);
+                    float* cf  = reinterpret_cast<float*>(sc_ctrl_forget_.dev_ptr);
+                    k1_loop_ctrl_pack_in<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                        target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, cin, B, D);
+                    if (is_bf) {
+                        launch_bf16_linear(bf16_ptr(cp + ".down_weight"),   cin,       nullptr, ctrl_gate, B, c_.gate_rank, 2 * D, mem_info_.gen, stream_);
+                        launch_bf16_linear(bf16_ptr(cp + ".gain_weight"),   ctrl_gate, nullptr, cg,        B, D, c_.gate_rank,    mem_info_.gen, stream_);
+                        launch_bf16_linear(bf16_ptr(cp + ".forget_weight"), ctrl_gate, nullptr, cf,        B, D, c_.gate_rank,    mem_info_.gen, stream_);
+                    } else {
+                        launch_f32_linear(f32_ptr(cp + ".down_weight"),   cin,       nullptr, ctrl_gate, B, c_.gate_rank, 2 * D, stream_, mem_info_.gen);
+                        launch_f32_linear(f32_ptr(cp + ".gain_weight"),   ctrl_gate, nullptr, cg,        B, D, c_.gate_rank,    stream_, mem_info_.gen);
+                        launch_f32_linear(f32_ptr(cp + ".forget_weight"), ctrl_gate, nullptr, cf,        B, D, c_.gate_rank,    stream_, mem_info_.gen);
+                    }
+                    k1_loop_ctrl_apply_out<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                        target_in, msgs, 4, msg_ch, cg, cf, target_in, B, D);
+                } else if (is_bf) {
+                    k1_loop_ctrl_down<true><<<dim3((c_.gate_rank + 7) / 8, B), 256, 0, stream_>>>(
+                        target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, bf16_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
+                    k1_loop_ctrl_up<true><<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                        target_in, msgs, 4, msg_ch, ctrl_gate, bf16_ptr(cp + ".gain_weight"), bf16_ptr(cp + ".forget_weight"), target_in, B, D, c_.gate_rank);
+                } else {
+                    k1_loop_ctrl_down<false><<<dim3((c_.gate_rank + 7) / 8, B), 256, 0, stream_>>>(
+                        target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, f32_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
+                    k1_loop_ctrl_up<false><<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                        target_in, msgs, 4, msg_ch, ctrl_gate, f32_ptr(cp + ".gain_weight"), f32_ptr(cp + ".forget_weight"), target_in, B, D, c_.gate_rank);
+                }
+            };
+
+            if (has_msgs) {
+                const char* cnames[3] = {"attn", "k", "v"};
+                float* ins[3] = {in0, in1, in2};
+                for (int j = 0; j < 3; ++j) {
+                    run_loop_ctrl(ins[j], j, p + ".controllers." + cnames[j]);
+                }
+            }
+
+            if (is_swa) {
+                const float* an = f32_ptr(p + ".attn_norm.weight");
+                k_rms_norm_rows<<<B, 256, 0, stream_>>>(in0, an, in0, B, D, c_.rms_eps);
+                if (has_msgs) {
+                    k_rms_norm_rows<<<B, 256, 0, stream_>>>(in1, an, in1, B, D, c_.rms_eps);
+                    k_rms_norm_rows<<<B, 256, 0, stream_>>>(in2, an, in2, B, D, c_.rms_eps);
+                } else {
+                    k_in = in0;
+                    v_in = in0;
+                }
+            } else {
+                k_rms_norm_rows<<<B, 256, 0, stream_>>>(in0, f32_ptr(p + ".q_input_norm.weight"), in0, B, D, c_.rms_eps);
+                k_rms_norm_rows<<<B, 256, 0, stream_>>>(in1, f32_ptr(p + ".k_input_norm.weight"), in1, B, D, c_.rms_eps);
+                k_rms_norm_rows<<<B, 256, 0, stream_>>>(in2, f32_ptr(p + ".v_input_norm.weight"), in2, B, D, c_.rms_eps);
+            }
+
+            // Batched Q/K/V/R/Sink/Gate projections
+            launch_trunk_linear(p + ".attn.wq_du.weight", q_in, q,     B, q_dim, D);
+            launch_trunk_linear(p + ".attn.wk_dv.weight", k_in, k_raw, B, kv_dim, D);
+            launch_trunk_linear(p + ".attn.wv_dv.weight", v_in, v_raw, B, kv_dim, D);
+            launch_trunk_linear(p + ".attn.wr_du.weight", q_in, r_raw, B, c_.n_head * c_.d_rel, D);
+            launch_trunk_linear(p + ".attn.attn_sink_proj.weight", q_in, sinks, B, c_.n_head, D);
+            launch_trunk_linear(p + ".attn.gate_attn.weight", q_in, gatea, B, q_dim, D);
+            if (!is_swa) {
+                launch_trunk_linear(p + ".attn.k_sconv.weight_proj", k_in, k_dyn, B, c_.n_kv * 4, D);
+                launch_trunk_linear(p + ".attn.v_sconv.weight_proj", v_in, v_dyn, B, c_.n_kv * 4, D);
+            }
+
+            // k2: ShortConv K & V + L2 clip + V RMSNorm + global tau
+            GpuSlotMeta* rsl = (rec_slot >= 0) ? &slots_[rec_slot] : nullptr;
+            run_sconv(k_raw, p + ".k_sconv", is_swa ? nullptr : k_dyn, d_sconv_k_[visit], k_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_k : nullptr, visit);
+            run_sconv(v_raw, p + ".v_sconv", is_swa ? nullptr : v_dyn, d_sconv_v_[visit], v_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_v : nullptr, visit);
+
+            const int32_t* pos_dev = reinterpret_cast<const int32_t*>(sc_pos_.dev_ptr);
+            const std::string q_sc_k = p + ".attn.q_l2_clip.scale";
+            const std::string r_sc_k = p + ".attn.rel_l2_clip.scale";
+            const int q_sc_stride = (trunk_f32_.at(q_sc_k).bytes >= static_cast<size_t>(c_.n_head) * c_.head_dim * 4) ? c_.head_dim : 0;
+            const int r_sc_stride = (trunk_f32_.at(r_sc_k).bytes >= static_cast<size_t>(c_.n_head) * c_.d_rel * 4) ? c_.d_rel : 0;
+            k2_head_l2_clip<<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                q, f32_ptr(q_sc_k), q_sc_stride, is_swa ? nullptr : pos_dev, c_.qk_l2_clip, B, c_.n_head, c_.head_dim);
+            k2_head_l2_clip<<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                r_raw, f32_ptr(r_sc_k), r_sc_stride, is_swa ? nullptr : pos_dev, c_.rel_l2_clip, B, c_.n_head, c_.d_rel);
+            k2_head_l2_clip<<<dim3(c_.n_kv, B), 128, 0, stream_>>>(
+                k_cv, nullptr, 0, nullptr, c_.qk_l2_clip, B, c_.n_kv, c_.head_dim);
+            k_rms_norm_rows<<<B * c_.n_kv, 256, 0, stream_>>>(v_cv, nullptr, v_cv, B * c_.n_kv, c_.head_dim, c_.rms_eps);
+
+            // k3: Paged KV store + RelPos projection + Flash-SWA / Flash-GQA
+            VisitKvPool& kvp = is_swa ? swa_pools_[kv_slot] : glob_pools_[kv_slot];
+            const int swa_w = is_swa ? c_.swa_win : 0;
+            if (is_fp8) {
+                k3_kv_paged_store<true><<<B, 256, 0, stream_>>>(
+                    k_cv, v_cv, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                    reinterpret_cast<float*>(kvp.k_scales.dev_ptr), reinterpret_cast<float*>(kvp.v_scales.dev_ptr),
+                    B, c_.n_kv, c_.head_dim, swa_w);
+            } else {
+                k3_kv_paged_store<false><<<B, 256, 0, stream_>>>(
+                    k_cv, v_cv, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
+                    B, c_.n_kv, c_.head_dim, swa_w);
+            }
+
+            k_relpos_bias_proj<<<dim3(c_.n_head, B), 256, 0, stream_>>>(
+                r_raw, f32_ptr(p + ".attn.rel_logits_proj.proj"), pos_dev, rbias, B, c_.n_head, c_.d_rel, c_.rel_extent);
+
+            if (is_fp8) {
+                k3_flash_swa_gqa<true><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                    q, gatea, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                    reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                    aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+            } else {
+                k3_flash_swa_gqa<false><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                    q, gatea, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
+                    aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+            }
+
+            // O-proj + post-attention ShortConv + AttnRes block boundary rule
+            launch_trunk_linear(p + ".attn.wo_ud.weight", aout, oproj, B, D, q_dim);
+            run_sconv(oproj, p + ".attn_sconv", nullptr, d_sconv_attn_[visit], asc, D, 0, rsl ? &rsl->sconv_rec_attn : nullptr, visit);
+
+            if (ip % c_.block_size == 0) {
+                (void)hipMemcpyAsync(sc_blocks_[n_blocks].dev_ptr, res, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                blk_ptrs.push_back(reinterpret_cast<const float*>(sc_blocks_[n_blocks].dev_ptr));
+                ++n_blocks;
+                (void)hipMemcpyAsync(cur, asc, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+            } else {
+                k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, asc, cur, B * D);
+            }
+
+            // MoE sublayer: AttnRes mlp_queries + optional mlp controller + mlp_norm
+            (void)hipMemcpyAsync(res, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+            run_attnres(blk_ptrs, cur, f32_ptr("model.llm.attn_res.mlp_queries." + std::to_string(ip)), 1, mlpin);
+            if (has_msgs) {
+                run_loop_ctrl(mlpin, 3, p + ".controllers.mlp");
+            }
+            k_rms_norm_rows<<<B, 256, 0, stream_>>>(mlpin, f32_ptr(p + ".mlp_norm.weight"), mlpin, B, D, c_.rms_eps);
+
+            // k4: Top-8/128 Sigmoid Router (exact route_scale=8.0 & tie-break)
+            launch_f32_linear(f32_ptr(p + ".mlp.gate.weight"), mlpin, nullptr, rlog, B, c_.n_experts, D, stream_, mem_info_.gen);
+            k4_moe_router_topk<<<B, 128, 0, stream_>>>(rlog, f32_ptr(p + ".mlp.gate.bias"), tk_i, tk_w, B, c_.top_k, c_.route_scale);
+
+            // MoE Expert Execution:
+            // Fast Path A1 (B == 1, all GPU-resident): 2-launch ZERO-SYNC fused GPU MoE!
+            // Fast Path A2 (B >= 2, all GPU-resident): 4-launch ZERO-SYNC Fused GPU Grouped-MoE (collapses 128 host loops -> 4 GPU launches!)
+            if (layer_all_gpu_[ip] && B == 1) {
+                k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
+                const GpuExpertDesc* d_exps = reinterpret_cast<const GpuExpertDesc*>(d_layer_exps_[ip].dev_ptr);
+                k_moe_direct_w13_situ<<<dim3((c_.inter + 3) / 4, B * c_.top_k), 256, 0, stream_>>>(
+                    d_exps, tk_i, mlpf16, reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr),
+                    B, c_.top_k, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                k_moe_direct_w2_reduce<<<dim3((D + 7) / 8, B), 256, 0, stream_>>>(
+                    d_exps, tk_i, tk_w, reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr),
+                    moeout, B, c_.top_k, D, c_.inter);
+            } else if (layer_all_gpu_[ip]) {
+                k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
+                const GpuExpertDesc* d_exps = reinterpret_cast<const GpuExpertDesc*>(d_layer_exps_[ip].dev_ptr);
+                int32_t* d_off = reinterpret_cast<int32_t*>(sc_exp_off_.dev_ptr);
+                int32_t* d_btk = reinterpret_cast<int32_t*>(sc_bucket_tok_.dev_ptr);
+                int32_t* d_s2b = reinterpret_cast<int32_t*>(sc_slotk_bidx_.dev_ptr);
+                half_t*  d_act = reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr);
+                float*   d_by  = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
+                k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
+                if (B >= 32 && mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
+                    k_moe_grouped_w13_situ_wmma<<<dim3((2 * c_.inter + 63) / 64, c_.n_experts), 128, 0, stream_>>>(
+                        d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                    k_moe_grouped_w2_wmma<<<dim3((D + 63) / 64, c_.n_experts), 128, 0, stream_>>>(
+                        d_exps, d_off, d_act, d_by, D, c_.inter);
+                } else {
+                    k_moe_grouped_w13_situ<<<dim3((c_.inter + 3) / 4, c_.n_experts), 256, 0, stream_>>>(
+                        d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                    k_moe_grouped_w2<<<dim3((D + 7) / 8, c_.n_experts), 256, 0, stream_>>>(
+                        d_exps, d_off, d_act, d_by, D, c_.inter);
+                }
+                k_moe_reduce_buckets<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                    d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
+            } else {
+                // Fast Path B / Hybrid: Coalesced batched WMMA/GEMV MoE across B=1..64/512 (reads each active expert ONCE!)
+                std::vector<int32_t> h_ids(static_cast<size_t>(B) * c_.top_k);
+                std::vector<float>   h_ws(static_cast<size_t>(B) * c_.top_k);
+                if (!hip_ok(hipMemcpyAsync(h_ids.data(), tk_i, h_ids.size() * 4, hipMemcpyDeviceToHost, stream_), "moe ids D2H", err) ||
+                    !hip_ok(hipMemcpyAsync(h_ws.data(),  tk_w, h_ws.size() * 4, hipMemcpyDeviceToHost, stream_), "moe ws D2H", err) ||
+                    !hip_ok(hipStreamSynchronize(stream_), "moe route sync", err)) {
+                    return false;
+                }
+                std::vector<std::vector<int32_t>> exp_toks(c_.n_experts);
+                std::vector<std::vector<float>>   exp_ws(c_.n_experts);
+                for (int b = 0; b < B; ++b) {
+                    for (int k = 0; k < c_.top_k; ++k) {
+                        const int eid = h_ids[b * c_.top_k + k];
+                        exp_toks[eid].push_back(b);
+                        exp_ws[eid].push_back(h_ws[b * c_.top_k + k]);
+                    }
+                }
+
+                (void)hipMemsetAsync(moeout, 0, static_cast<size_t>(B) * D * 4, stream_);
+                const auto& dir = model_->rd.expert_directory();
+                for (int eid = 0; eid < c_.n_experts; ++eid) {
+                    if (exp_toks[eid].empty()) continue;
+                    const int dir_idx = model_->dir_index_of[ip * c_.n_experts + eid];
+                    if (dir_idx < 0) continue;
+                    const auto& ent = dir[dir_idx];
+                    const int m = static_cast<int>(exp_toks[eid].size());
+
+                    const uint8_t* body_dev = nullptr;
+                    if (expert_gpu_offset_[dir_idx] != static_cast<size_t>(-1)) {
+                        body_dev = expert_gpu_arena_.dev_ptr + expert_gpu_offset_[dir_idx];
+                    } else {
+                        const uint8_t* src_host = nullptr;
+                        std::vector<uint8_t> disk_buf;
+                        if (!expert_ram_bodies_[dir_idx].empty()) {
+                            src_host = expert_ram_bodies_[dir_idx].data();
+                        } else {
+                            if (!model_->rd.read_expert_body(dir_idx, disk_buf, err)) return false;
+                            src_host = disk_buf.data();
+                        }
+                        if (!hip_ok(hipMemcpyAsync(d_exp_stage_.dev_ptr, src_host, ent.body_bytes, hipMemcpyHostToDevice, stream_),
+                                    "exp stage H2D", err)) return false;
+                        body_dev = d_exp_stage_.dev_ptr;
+                    }
+
+                    (void)hipMemcpyAsync(sc_exp_tok_idx_.dev_ptr, exp_toks[eid].data(), m * 4, hipMemcpyHostToDevice, stream_);
+                    (void)hipMemcpyAsync(sc_exp_tok_w_.dev_ptr,   exp_ws[eid].data(),   m * 4, hipMemcpyHostToDevice, stream_);
+                    k_gather_rows_f16<<<(m * D + 255) / 256, 256, 0, stream_>>>(
+                        mlpin, reinterpret_cast<const int32_t*>(sc_exp_tok_idx_.dev_ptr), mlpf16, m, D);
+
+                    float* gu_buf = reinterpret_cast<float*>(sc_moe_gu_.dev_ptr);
+                    half_t* act_buf = reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr);
+                    float* ye_buf = reinterpret_cast<float*>(sc_moe_ye_.dev_ptr);
+
+                    // w13 [2*inter, D] (uses cached SF4 outer scales -> ZERO host syncs per expert!)
+                    float sf4_w13_outer = expert_sf4_outer_[dir_idx].first;
+                    float sf4_w2_outer  = expert_sf4_outer_[dir_idx].second;
+                    if (expert_gpu_offset_[dir_idx] == static_cast<size_t>(-1) && expert_ram_bodies_[dir_idx].empty() &&
+                        (ent.gu_code_id == CODE_SF4 || ent.dn_code_id == CODE_SF4)) {
+                        float hdr[4];
+                        hip_ign(hipMemcpyAsync(hdr, body_dev, 16, hipMemcpyDeviceToHost, stream_));
+                        hip_ign(hipStreamSynchronize(stream_));
+                        sf4_w13_outer = hdr[0] / hdr[1];
+                        sf4_w2_outer  = hdr[2] / hdr[3];
+                    }
+                    if (ent.gu_code_id == CODE_SF4) {
+                        const uint8_t* w13_p = body_dev + 16;
+                        const uint8_t* w13_s = w13_p + static_cast<size_t>(2 * c_.inter) * (D / 2);
+                        launch_sf4_linear(w13_p, w13_s, sf4_w13_outer, mlpf16, gu_buf, m, 2 * c_.inter, D, mem_info_.gen, stream_, false);
+                    } else if (ent.gu_code_id == CODE_MX8) {
+                        const uint8_t* w13_w = body_dev;
+                        const uint8_t* w13_s = w13_w + static_cast<size_t>(2 * c_.inter) * D;
+                        launch_mx8_linear(w13_w, w13_s, mlpf16, gu_buf, m, 2 * c_.inter, D, mem_info_.gen, stream_);
+                    } else {
+                        const uint8_t* gu_ptr = body_dev + static_cast<size_t>(c_.inter) * 2;
+                        launch_sk_linear(gu_ptr, ent.gu_code_id, mlpf16, gu_buf, m, 2 * c_.inter, D, mem_info_.gen, stream_);
+                    }
+
+                    // Fused SITU
+                    k_situ_interleaved<<<(m * c_.inter + 255) / 256, 256, 0, stream_>>>(
+                        gu_buf, act_buf, m, c_.inter, c_.situ_beta, c_.situ_lb);
+
+                    // w2 [D, inter]
+                    if (ent.dn_code_id == CODE_SF4) {
+                        const uint8_t* w2_p = body_dev + ent.dn_offset;
+                        const uint8_t* w2_s = w2_p + static_cast<size_t>(D) * (c_.inter / 2);
+                        launch_sf4_linear(w2_p, w2_s, sf4_w2_outer, act_buf, ye_buf, m, D, c_.inter, mem_info_.gen, stream_, false);
+                    } else if (ent.dn_code_id == CODE_MX8) {
+                        const uint8_t* w2_w = body_dev + ent.dn_offset;
+                        const uint8_t* w2_s = w2_w + static_cast<size_t>(D) * c_.inter;
+                        launch_mx8_linear(w2_w, w2_s, act_buf, ye_buf, m, D, c_.inter, mem_info_.gen, stream_);
+                    } else {
+                        launch_sk_paired2_linear(body_dev + ent.dn_offset, ent.dn_code_id,
+                                                 reinterpret_cast<const half_t*>(body_dev),
+                                                 act_buf, ye_buf, m, D, c_.inter, stream_);
+                    }
+
+                    k_scatter_add_expert<<<(D + 255) / 256, 256, 0, stream_>>>(
+                        ye_buf, reinterpret_cast<const int32_t*>(sc_exp_tok_idx_.dev_ptr),
+                        reinterpret_cast<const float*>(sc_exp_tok_w_.dev_ptr), moeout, m, D);
+                }
+            }
+
+            // Post-MLP ShortConv + residual add
+            run_sconv(moeout, p + ".mlp_sconv", nullptr, d_sconv_mlp_[visit], msc, D, 0, rsl ? &rsl->sconv_rec_mlp : nullptr, visit);
+            k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, msc, cur, B * D);
+            ++visit;
+
+            // Periodic TDR/MES flush on heavy prefill batches (skipped during HIP Graph capture!)
+            if (!use_graph && B >= 32 && guard_.visit_flush_stride > 0 && (visit % guard_.visit_flush_stride == 0)) {
+                if (!hip_ok(hipStreamSynchronize(stream_), "tdr visit flush", err)) return false;
+            }
+            return true;
+        };
+
+        // 2. Execute all 48 virtual visits: Prelude (0..5) + Core (6..17 x 3 passes) + Coda (18..23)
+        for (int ip = 0; ip < c_.core_start; ++ip) {
+            if (!run_visit(ip, false)) return false;
+        }
+        (void)hipMemcpyAsync(sc_prelude_.dev_ptr, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+        n_prelude_blocks = n_blocks;
+
+        for (int p_idx = 0; p_idx < c_.num_passes; ++p_idx) {
+            if (p_idx > 0) {
+                bank_ptrs.clear();
+                n_bank = 0;
+                for (int k = n_prelude_blocks + 1; k < n_blocks; ++k) {
+                    (void)hipMemcpyAsync(sc_bank_[n_bank].dev_ptr, sc_blocks_[k].dev_ptr, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                    bank_ptrs.push_back(reinterpret_cast<const float*>(sc_bank_[n_bank].dev_ptr));
+                    ++n_bank;
+                }
+                (void)hipMemcpyAsync(sc_bank_out_.dev_ptr, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                (void)hipMemcpyAsync(cur, sc_prelude_.dev_ptr, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                n_blocks = n_prelude_blocks;
+                blk_ptrs.resize(n_prelude_blocks);
+            }
+            for (int ip = c_.core_start; ip < c_.core_end; ++ip) {
+                if (p_idx > 0) {
+                    run_attnres(bank_ptrs, reinterpret_cast<const float*>(sc_bank_out_.dev_ptr),
+                                reinterpret_cast<const float*>(d_msg_queries_[ip].dev_ptr), 4, msgs);
+                }
+                if (!run_visit(ip, p_idx > 0)) return false;
+            }
+        }
+        for (int ip = c_.core_end; ip < c_.n_phys; ++ip) {
+            if (!run_visit(ip, false)) return false;
+        }
+
+        // 3. Final output depth mix + output_norm
+        float* h_norm = reinterpret_cast<float*>(sc_h_norm_.dev_ptr);
+        run_attnres(blk_ptrs, cur, f32_ptr("model.llm.attn_res.output_query"), 1, h_norm);
+        k_rms_norm_rows<<<B, 256, 0, stream_>>>(h_norm, f32_ptr("model.llm.norm.weight"), h_norm, B, D, c_.rms_eps);
+        maybe_tap(c_.n_visits, h_norm);
+
+        if (use_graph) {
+            const int V = c_.vocab_unpadded;
+            const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
+            k_unembed_softcap<<<dim3((V + 7) / 8, B), 256, 0, stream_>>>(
+                unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
+                h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
+                reinterpret_cast<float*>(sc_logits_.dev_ptr), B, V, D, c_.logit_softcap);
+
+            hipGraph_t g = nullptr;
+            if (!hip_ok(hipStreamEndCapture(stream_, &g), "hipStreamEndCapture", err)) return false;
+            hipError_t ie = hipGraphInstantiate(&graph_exec_, g, nullptr, nullptr, 0);
+            (void)hipGraphDestroy(g);
+            if (!hip_ok(ie, "hipGraphInstantiate", err)) return false;
+            graph_B_ = B;
+            graph_need_taps_ = need_taps;
+            graph_kv_gen_ = kv_gen_sum;
+            graph_scratch_B_ = scratch_B_;
+
+            if (!hip_ok(hipGraphLaunch(graph_exec_, stream_), "hipGraphLaunch(first)", err)) return false;
+            for (int b = 0; b < B; ++b) {
+                auto& sl = slots_[batch.slot_ids[b]];
+                sl.seq_len = std::max(sl.seq_len, batch.pos[b] + 1);
+            }
+            if (has_dspark_ && batch.capture_taps && h_dspark_fuse_.size() >= 16) {
+                if (!update_dspark_ctx_gpu(batch, err)) return false;
+            }
+            const size_t lbytes = static_cast<size_t>(B) * V * sizeof(float);
+            if (!hip_ok(hipMemcpyAsync(logits_out, sc_logits_.dev_ptr, lbytes, hipMemcpyDeviceToHost, stream_),
+                        "logits D2H", err)) return false;
+            return hip_ok(hipStreamSynchronize(stream_), "graph sync", err);
+        }
+
+        // Update slot seq_len + on-GPU DSpark context KV/f_rnn
+        for (int b = 0; b < B; ++b) {
+            auto& sl = slots_[batch.slot_ids[b]];
+            sl.seq_len = std::max(sl.seq_len, batch.pos[b] + 1);
+        }
+        if (has_dspark_ && batch.capture_taps && h_dspark_fuse_.size() >= 16) {
+            if (!update_dspark_ctx_gpu(batch, err)) return false;
+        }
+        if (taps_out) {
+            for (int k = 0; k < 4; ++k) {
+                taps_out->taps[k].resize(static_cast<size_t>(B) * D);
+                (void)hipMemcpyAsync(taps_out->taps[k].data(), sc_taps_[k].dev_ptr, static_cast<size_t>(B) * D * 4,
+                               hipMemcpyDeviceToHost, stream_);
+            }
+        }
+
+        // 4. Unembed + softcap(30.0) ONLY for tokens with want_logits[b] == 1
+        if (logits_out != nullptr) {
+            std::vector<int32_t> want_idx;
+            for (int b = 0; b < B; ++b) if (batch.want_logits[b]) want_idx.push_back(b);
+            const int n_want = static_cast<int>(want_idx.size());
+            if (n_want > 0) {
+                const int V = c_.vocab_unpadded;
+                const size_t lbytes = static_cast<size_t>(n_want) * V * sizeof(float);
+                if (sc_logits_.bytes < lbytes) {
+                    free_gpu_buffer(sc_logits_);
+                    if (!hip_ok(alloc_gpu_buffer(sc_logits_, lbytes, mem_info_.is_uma), "logits buf", err)) return false;
+                }
+                (void)hipMemcpyAsync(sc_want_idx_.dev_ptr, want_idx.data(), n_want * 4, hipMemcpyHostToDevice, stream_);
+                const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
+                k_unembed_softcap<<<dim3((V + 7) / 8, n_want), 256, 0, stream_>>>(
+                    unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
+                    h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
+                    reinterpret_cast<float*>(sc_logits_.dev_ptr), n_want, V, D, c_.logit_softcap);
+                if (!hip_ok(hipMemcpyAsync(logits_out, sc_logits_.dev_ptr, lbytes, hipMemcpyDeviceToHost, stream_),
+                            "logits D2H", err)) return false;
+            }
+        }
+
+        const bool ok = hip_ok(hipStreamSynchronize(stream_), "forward_batch sync", err);
+        free_gpu_buffer(d_img_emb);
+        return ok;
+    }
+
+    bool update_dspark_ctx_gpu(const StepBatch& batch, std::string& err) {
+        const int B = batch.n_tokens;
+        const int D = dspark_cfg_.hidden;
+        const int KV = dspark_cfg_.n_kv;
+        const int hd = dspark_cfg_.head_dim;
+        const int kv_dim = KV * hd;
+
+        bool ptrs_changed = false;
+        for (int b = 0; b < B; ++b) {
+            auto& sl = slots_[batch.slot_ids[b]];
+            const int old_cap = sl.dspark_cap;
+            if (!ensure_dspark_slot_cap(sl, batch.pos[b] + 1, err)) return false;
+            if (sl.dspark_cap != old_cap) ptrs_changed = true;
+        }
+        if (!d_ds_k_ptrs_[0].dev_ptr || ptrs_changed) {
+            std::vector<uint16_t*> pt(max_slots_, nullptr);
+            for (int il = 0; il < dspark_cfg_.n_layers; ++il) {
+                for (int s = 0; s < max_slots_; ++s) pt[s] = reinterpret_cast<uint16_t*>(slots_[s].dspark_k[il].dev_ptr);
+                if (!d_ds_k_ptrs_[il].dev_ptr && !hip_ok(alloc_gpu_buffer(d_ds_k_ptrs_[il], max_slots_ * sizeof(uint16_t*), mem_info_.is_uma), "ds k ptrs", err)) return false;
+                (void)hipMemcpyAsync(d_ds_k_ptrs_[il].dev_ptr, pt.data(), max_slots_ * sizeof(uint16_t*), hipMemcpyHostToDevice, stream_);
+                for (int s = 0; s < max_slots_; ++s) pt[s] = reinterpret_cast<uint16_t*>(slots_[s].dspark_v[il].dev_ptr);
+                if (!d_ds_v_ptrs_[il].dev_ptr && !hip_ok(alloc_gpu_buffer(d_ds_v_ptrs_[il], max_slots_ * sizeof(uint16_t*), mem_info_.is_uma), "ds v ptrs", err)) return false;
+                (void)hipMemcpyAsync(d_ds_v_ptrs_[il].dev_ptr, pt.data(), max_slots_ * sizeof(uint16_t*), hipMemcpyHostToDevice, stream_);
+            }
+            for (int s = 0; s < max_slots_; ++s) pt[s] = reinterpret_cast<uint16_t*>(slots_[s].dspark_frnn.dev_ptr);
+            if (!d_ds_frnn_ptrs_.dev_ptr && !hip_ok(alloc_gpu_buffer(d_ds_frnn_ptrs_, max_slots_ * sizeof(uint16_t*), mem_info_.is_uma), "ds frnn ptrs", err)) return false;
+            (void)hipMemcpyAsync(d_ds_frnn_ptrs_.dev_ptr, pt.data(), max_slots_ * sizeof(uint16_t*), hipMemcpyHostToDevice, stream_);
+        }
+
+        auto softmax4 = [&](int row, float w[4]) {
+            float mx = -1e30f, sm = 0.0f;
+            for (int i = 0; i < 4; ++i) mx = std::max(mx, h_dspark_fuse_[row * 4 + i]);
+            for (int i = 0; i < 4; ++i) { w[i] = std::exp(h_dspark_fuse_[row * 4 + i] - mx); sm += w[i]; }
+            for (int i = 0; i < 4; ++i) w[i] /= sm;
+        };
+
+        const float* t0 = reinterpret_cast<const float*>(sc_taps_[0].dev_ptr);
+        const float* t1 = reinterpret_cast<const float*>(sc_taps_[1].dev_ptr);
+        const float* t2 = reinterpret_cast<const float*>(sc_taps_[2].dev_ptr);
+        const float* t3 = reinterpret_cast<const float*>(sc_taps_[3].dev_ptr);
+        float* ctx = reinterpret_cast<float*>(sc_in0_.dev_ptr);
+        float* kc  = reinterpret_cast<float*>(sc_k_conv_.dev_ptr);
+        float* vc  = reinterpret_cast<float*>(sc_v_conv_.dev_ptr);
+        const int32_t* sids_d = reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr);
+        const int32_t* pos_d  = reinterpret_cast<const int32_t*>(sc_pos_.dev_ptr);
+
+        for (int il = 0; il < dspark_cfg_.n_layers; ++il) {
+            const std::string p = "layers." + std::to_string(il);
+            float w[4];
+            softmax4(il, w);
+            k_dspark_fuse_mix<<<B, 256, 0, stream_>>>(t0, t1, t2, t3, w[0], w[1], w[2], w[3],
+                                                      ds_f32(p + ".dflare_norm.weight"), ctx, B, D, dspark_cfg_.rms_eps);
+            launch_bf16_linear(ds_bf16(p + ".self_attn.k_proj_ctx.weight"), ctx, nullptr, kc, B, kv_dim, D, mem_info_.gen, stream_);
+            launch_bf16_linear(ds_bf16(p + ".self_attn.v_proj_ctx.weight"), ctx, nullptr, vc, B, kv_dim, D, mem_info_.gen, stream_);
+            k_rms_norm_rows<<<B * KV, 256, 0, stream_>>>(kc, ds_f32(p + ".self_attn.k_norm_ctx.weight"), kc, B * KV, hd, dspark_cfg_.rms_eps);
+            k_half_rope<<<dim3(KV, B), hd / 2, 0, stream_>>>(kc, pos_d, 0, B, KV, hd, dspark_cfg_.rope_theta);
+            k_dspark_ctx_scatter<<<dim3((kv_dim + 255) / 256, B), 256, 0, stream_>>>(
+                kc, reinterpret_cast<uint16_t* const*>(d_ds_k_ptrs_[il].dev_ptr), sids_d, pos_d, B, kv_dim);
+            k_dspark_ctx_scatter<<<dim3((kv_dim + 255) / 256, B), 256, 0, stream_>>>(
+                vc, reinterpret_cast<uint16_t* const*>(d_ds_v_ptrs_[il].dev_ptr), sids_d, pos_d, B, kv_dim);
+        }
+        float w_rnn[4];
+        softmax4(dspark_cfg_.n_layers, w_rnn);
+        k_dspark_fuse_mix<<<B, 256, 0, stream_>>>(t0, t1, t2, t3, w_rnn[0], w_rnn[1], w_rnn[2], w_rnn[3],
+                                                  ds_f32("markov_head.dflare_norm.weight"), ctx, B, D, dspark_cfg_.rms_eps);
+        k_dspark_ctx_scatter<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+            ctx, reinterpret_cast<uint16_t* const*>(d_ds_frnn_ptrs_.dev_ptr), sids_d, pos_d, B, D);
+        for (int b = 0; b < B; ++b) {
+            auto& sl = slots_[batch.slot_ids[b]];
+            sl.dspark_len = std::max(sl.dspark_len, batch.pos[b] + 1);
+        }
+        return true;
+    }
+
+    void invalidate_graph() {
+        if (graph_exec_) {
+            (void)hipGraphExecDestroy(graph_exec_);
+            graph_exec_ = nullptr;
+        }
+        graph_B_ = 0;
+        graph_kv_gen_ = 0;
+        graph_scratch_B_ = 0;
+    }
+
+    void cleanup() {
+        invalidate_graph();
+        if (stream_) {
+            (void)hipStreamSynchronize(stream_);
+            (void)hipStreamDestroy(stream_);
+            stream_ = nullptr;
+        }
+        for (auto& sl : slots_) sl.release();
+        slots_.clear();
+        for (auto& p : swa_pools_) p.release();
+        for (auto& p : glob_pools_) p.release();
+        swa_pools_.clear(); glob_pools_.clear();
+        for (auto& b : d_sconv_k_) free_gpu_buffer(b);
+        for (auto& b : d_sconv_v_) free_gpu_buffer(b);
+        for (auto& b : d_sconv_attn_) free_gpu_buffer(b);
+        for (auto& b : d_sconv_mlp_) free_gpu_buffer(b);
+        d_sconv_k_.clear(); d_sconv_v_.clear(); d_sconv_attn_.clear(); d_sconv_mlp_.clear();
+        for (auto& kv : trunk_bf16_) free_gpu_buffer(kv.second);
+        for (auto& kv : trunk_f32_) free_gpu_buffer(kv.second);
+        for (auto& kv : packed_trunk_) free_gpu_buffer(kv.second.buf);
+        for (auto& kv : static_sconv_) free_gpu_buffer(kv.second);
+        for (auto& b : d_msg_queries_) free_gpu_buffer(b);
+        for (auto& kv : dspark_bf16_) free_gpu_buffer(kv.second);
+        for (auto& kv : dspark_f32_) free_gpu_buffer(kv.second);
+        for (auto& b : d_layer_exps_) free_gpu_buffer(b);
+        trunk_bf16_.clear(); trunk_f32_.clear(); packed_trunk_.clear();
+        static_sconv_.clear(); d_msg_queries_.clear(); dspark_bf16_.clear(); dspark_f32_.clear(); d_layer_exps_.clear();
+        free_gpu_buffer(expert_gpu_arena_); free_gpu_buffer(d_exp_stage_);
+        free_gpu_buffer(d_dspark_state_); free_gpu_buffer(d_dspark_corr_); free_gpu_buffer(d_dspark_toks_);
+        free_gpu_buffer(d_dspark_blk_v_); free_gpu_buffer(d_dspark_blk_i_);
+        free_gpu_buffer(ds_cur_); free_gpu_buffer(ds_res_); free_gpu_buffer(ds_h_);
+        free_gpu_buffer(ds_q_); free_gpu_buffer(ds_k_); free_gpu_buffer(ds_v_);
+        free_gpu_buffer(ds_ao_); free_gpu_buffer(ds_mg_); free_gpu_buffer(ds_mu_);
+        for (int i = 0; i < 3; ++i) { free_gpu_buffer(d_ds_k_ptrs_[i]); free_gpu_buffer(d_ds_v_ptrs_[i]); }
+        free_gpu_buffer(d_ds_frnn_ptrs_);
+        free_gpu_buffer(sc_slot_ids_); free_gpu_buffer(sc_pos_); free_gpu_buffer(sc_tok_ids_); free_gpu_buffer(sc_img_idx_);
+        free_gpu_buffer(sc_want_idx_); free_gpu_buffer(sc_grp_slot_); free_gpu_buffer(sc_grp_off_); free_gpu_buffer(sc_grp_tok_);
+        free_gpu_buffer(sc_cur_); free_gpu_buffer(sc_res_); free_gpu_buffer(sc_in0_); free_gpu_buffer(sc_in1_);
+        free_gpu_buffer(sc_in2_); free_gpu_buffer(sc_mx3_); free_gpu_buffer(sc_msgs_); free_gpu_buffer(sc_ctrl_tmp_);
+        free_gpu_buffer(sc_ctrl_in_); free_gpu_buffer(sc_ctrl_gain_); free_gpu_buffer(sc_ctrl_forget_);
+        free_gpu_buffer(sc_q_); free_gpu_buffer(sc_k_raw_); free_gpu_buffer(sc_v_raw_); free_gpu_buffer(sc_k_conv_);
+        free_gpu_buffer(sc_v_conv_); free_gpu_buffer(sc_r_raw_); free_gpu_buffer(sc_rel_bias_);
+        free_gpu_buffer(sc_sinks_); free_gpu_buffer(sc_gate_a_); free_gpu_buffer(sc_k_dyn_); free_gpu_buffer(sc_v_dyn_);
+        free_gpu_buffer(sc_attn_out_); free_gpu_buffer(sc_o_proj_); free_gpu_buffer(sc_a_sconv_);
+        free_gpu_buffer(sc_mlp_in_); free_gpu_buffer(sc_mlp_f16_); free_gpu_buffer(sc_r_logits_);
+        free_gpu_buffer(sc_topk_ids_); free_gpu_buffer(sc_topk_w_); free_gpu_buffer(sc_moe_act_);
+        free_gpu_buffer(sc_moe_gu_); free_gpu_buffer(sc_moe_ye_); free_gpu_buffer(sc_moe_out_); free_gpu_buffer(sc_m_sconv_);
+        free_gpu_buffer(sc_exp_off_); free_gpu_buffer(sc_bucket_tok_); free_gpu_buffer(sc_slotk_bidx_); free_gpu_buffer(sc_bucket_y_);
+        free_gpu_buffer(sc_exp_tok_idx_); free_gpu_buffer(sc_exp_tok_w_); free_gpu_buffer(sc_h_norm_);
+        free_gpu_buffer(sc_blk_ptrs_); free_gpu_buffer(sc_prelude_); free_gpu_buffer(sc_bank_out_); free_gpu_buffer(sc_logits_);
+        for (auto& b : sc_blocks_) free_gpu_buffer(b);
+        for (auto& b : sc_bank_) free_gpu_buffer(b);
+        for (int k = 0; k < 4; ++k) free_gpu_buffer(sc_taps_[k]);
+        sc_blocks_.clear(); sc_bank_.clear();
+        scratch_B_ = 0;
+        vision_.release();
+    }
+
+    const InkModelFile* model_ = nullptr;
+    BackendOpts opts_;
+    InkCfg c_;
+    DsparkCfg dspark_cfg_;
+    DeviceMemoryInfo mem_info_;
+    DispatchGuard guard_;
+    hipStream_t stream_ = nullptr;
+    KvDtype default_kv_dtype_ = KvDtype::FP16;
+    bool has_dspark_ = false;
+    int max_slots_ = 1;
+    int max_ctx_ = 32768;
+
+    std::unordered_map<std::string, GpuBuffer> trunk_bf16_;
+    std::unordered_map<std::string, GpuBuffer> trunk_f32_;
+    std::unordered_map<std::string, GpuPackedTensor> packed_trunk_;
+    std::unordered_map<std::string, GpuBuffer> static_sconv_;
+    std::unordered_map<std::string, std::vector<float>> host_tmp_;
+    std::vector<GpuBuffer> d_msg_queries_;
+
+    std::unordered_map<std::string, GpuBuffer> dspark_bf16_;
+    std::unordered_map<std::string, GpuBuffer> dspark_f32_;
+    std::vector<float> h_dspark_fuse_;
+    GpuBuffer d_dspark_state_, d_dspark_corr_, d_dspark_toks_, d_dspark_blk_v_, d_dspark_blk_i_;
+    GpuBuffer ds_cur_, ds_res_, ds_h_, ds_q_, ds_k_, ds_v_, ds_ao_, ds_mg_, ds_mu_;
+    GpuBuffer d_ds_k_ptrs_[3], d_ds_v_ptrs_[3], d_ds_frnn_ptrs_;
+
+    GpuBuffer expert_gpu_arena_;
+    GpuBuffer d_exp_stage_;
+    std::vector<size_t> expert_gpu_offset_;
+    std::vector<std::vector<uint8_t>> expert_ram_bodies_;
+    std::vector<std::pair<float, float>> expert_sf4_outer_;
+    std::vector<GpuBuffer> d_layer_exps_;
+    std::vector<bool> layer_all_gpu_;
+    size_t vram_experts_loaded_ = 0;
+    size_t ram_experts_loaded_ = 0;
+
+    std::vector<VisitKvPool> swa_pools_;
+    std::vector<VisitKvPool> glob_pools_;
+    std::vector<GpuBuffer> d_sconv_k_, d_sconv_v_, d_sconv_attn_, d_sconv_mlp_;
+    std::vector<GpuSlotMeta> slots_;
+    GpuVisionState vision_;
+
+    int scratch_B_ = 0;
+    GpuBuffer sc_slot_ids_, sc_pos_, sc_tok_ids_, sc_img_idx_, sc_want_idx_;
+    GpuBuffer sc_grp_slot_, sc_grp_off_, sc_grp_tok_;
+    GpuBuffer sc_cur_, sc_res_, sc_in0_, sc_in1_, sc_in2_, sc_mx3_, sc_msgs_, sc_ctrl_tmp_, sc_ctrl_in_, sc_ctrl_gain_, sc_ctrl_forget_;
+    GpuBuffer sc_q_, sc_k_raw_, sc_v_raw_, sc_k_conv_, sc_v_conv_, sc_r_raw_, sc_rel_bias_;
+    GpuBuffer sc_sinks_, sc_gate_a_, sc_k_dyn_, sc_v_dyn_, sc_attn_out_, sc_o_proj_, sc_a_sconv_;
+    GpuBuffer sc_mlp_in_, sc_mlp_f16_, sc_r_logits_, sc_topk_ids_, sc_topk_w_;
+    GpuBuffer sc_moe_act_, sc_moe_gu_, sc_moe_ye_, sc_moe_out_, sc_m_sconv_;
+    GpuBuffer sc_exp_off_, sc_bucket_tok_, sc_slotk_bidx_, sc_bucket_y_;
+    GpuBuffer sc_exp_tok_idx_, sc_exp_tok_w_, sc_h_norm_, sc_blk_ptrs_, sc_prelude_, sc_bank_out_, sc_logits_;
+    std::vector<GpuBuffer> sc_blocks_;
+    std::vector<GpuBuffer> sc_bank_;
+    GpuBuffer sc_taps_[4];
+
+    hipGraphExec_t graph_exec_ = nullptr;
+    int graph_B_ = 0;
+    bool graph_need_taps_ = false;
+    uint64_t graph_kv_gen_ = 0;
+    int graph_scratch_B_ = 0;
+};
+
+}  // namespace
+
+std::unique_ptr<InkBackend> make_hip_backend() {
+    return std::make_unique<HipBackend>();
+}
+
+}  // namespace ink2

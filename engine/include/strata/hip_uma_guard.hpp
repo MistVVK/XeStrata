@@ -202,16 +202,23 @@ inline DispatchGuard compute_dispatch_guard(const char* gcn_arch, int cu_count, 
         g.max_prefill_chunk = windows_wddm ? 512 : 1024;
         g.visit_flush_stride = windows_wddm ? 8 : 16;
     } else if (integrated || is_known_amd_igpu_arch(gcn_arch)) {
-        if (cus <= 12) {
-            // Radeon 780M (gfx1103, 12 CUs): strict <= 1.0s guard prevents both WDDM TDR and Linux MES resets!
+        if (arch_is_exact(gcn_arch, "gfx1151")) {
+            // Strix Halo 8050S/8060S (gfx1151: 32-40 CUs = 16-20 WGPs reported by HIP!)
+            g.max_prefill_chunk = windows_wddm ? 2048 : 4096;
+            g.visit_flush_stride = windows_wddm ? 16 : 24;
+        } else if (arch_is_exact(gcn_arch, "gfx1150")) {
+            // Strix Point 880M/890M (gfx1150: 12-16 CUs = 6-8 WGPs)
+            g.max_prefill_chunk = 512;
+            g.visit_flush_stride = 12;
+        } else if (arch_is_exact(gcn_arch, "gfx1103") || cus <= 12) {
+            // Radeon 780M (gfx1103: 12 CUs = 6 WGPs): strict <= 1.0s guard prevents WDDM TDR & Linux MES resets!
             g.max_prefill_chunk = windows_wddm ? 256 : 512;
             g.visit_flush_stride = 8;
         } else if (cus <= 20) {
-            // Strix Point 880M/890M (gfx1150, 12-16 CUs)
+            // Other mid-size APU
             g.max_prefill_chunk = 512;
             g.visit_flush_stride = 12;
         } else {
-            // Strix Halo 8050S/8060S (gfx1151, 32-40 CUs)
             g.max_prefill_chunk = windows_wddm ? 2048 : 4096;
             g.visit_flush_stride = windows_wddm ? 16 : 24;
         }

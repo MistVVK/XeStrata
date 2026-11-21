@@ -43,8 +43,15 @@ int main() {
     assert(g890_win.max_persistent_blocks <= 24);
 
     const auto ghalo_win = compute_dispatch_guard("gfx1151", 40, true, true);
-    assert(ghalo_win.max_prefill_chunk <= 2048);
-    assert(ghalo_win.visit_flush_stride <= 16);
+    assert(ghalo_win.max_prefill_chunk == 2048);
+    assert(ghalo_win.visit_flush_stride == 16);
+    // RDNA3.5 HIP reports multiProcessorCount in WGPs (20 WGPs = 40 CUs on Strix Halo, 6 WGPs = 12 CUs on 780M)
+    const auto ghalo_wgp = compute_dispatch_guard("gfx1151", 20, true, true);
+    assert(ghalo_wgp.max_prefill_chunk == 2048);
+    assert(ghalo_wgp.visit_flush_stride == 16);
+    const auto g780_wgp = compute_dispatch_guard("gfx1103", 6, true, true);
+    assert(g780_wgp.max_prefill_chunk == 256);
+    assert(g780_wgp.visit_flush_stride == 8);
 
     const auto grdna2 = compute_dispatch_guard("gfx1031", 40, false, false);
     assert(grdna2.max_prefill_chunk <= 1024);
