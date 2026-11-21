@@ -2579,7 +2579,8 @@ static void plain_usage(const std::string& arch) {
                  "                       the model's DFlash2 pack (--draft-model; GLM-5.3-Flash, Qwen3.6-35B-A3B);\n"
                  "                       auto: --serve measures the MTP, DFlash2 and none at its start and keeps the\n"
                  "                       fastest; without --serve the MTP\n"
-                 "  --draft-model FILE   the model's DFlash2 pack\n"
+                 "  --draft dspark       Inkling-2-Mini's DSpark (CPU, greedy, command line only)\n"
+                 "  --draft-model FILE   the model's DFlash2 pack or DSpark GGUF\n"
                  "  --suffix-draft N     --serve: drafts from an earlier repeat of the context's last N+ tokens, a window\n"
                  "                       of them where they go past the MTP's (also without an MTP layer; default 0 = off)\n"
                  "  --lookup-chain K     --serve: after the MTP's drafts, up to K lookup drafts that continue them\n"
@@ -3052,6 +3053,16 @@ int plain_main(int argc, char** argv) {
         opt.vram_elastic = false;
         opt.batch_slots = 0;
     }
+    const bool dspark = opt.draft == "dspark";
+    if (dspark) {
+        if (arch != "inkling2_loop" || !opt.cpu || serve || sp.temperature != 0.0f || !follow.empty()) {
+            std::fprintf(stderr, "xestrata: --draft dspark needs inkling2_loop, --device cpu and greedy CLI decoding "
+                                 "without --spec-follow\n");
+            return 2;
+        }
+        if (opt.draft_model.empty())
+            opt.draft_model = (std::filesystem::path(gguf).parent_path() / "dspark-Inkling-2-Mini-Q8_0.gguf").string();
+    }
     auto at_eos = [&](int32_t t) { return stop_eos && std::find(eos.begin(), eos.end(), t) != eos.end(); };
 
     strata::core::PlainModel model;
@@ -3298,6 +3309,20 @@ int plain_main(int argc, char** argv) {
     }
     const std::vector<int32_t> stop = stop_eos ? eos : std::vector<int32_t>();
     while ((int64_t) produced.size() < n_new && !at_eos(produced.back())) {
+        if (dspark && n_new - (int64_t) produced.size() > 1) {
+            std::vector<int32_t> guesses;
+            const int count = (int) std::min<int64_t>(7, n_new - (int64_t) produced.size() - 1);
+            if (!model.propose_dspark(produced.back(), pos, count, guesses, err)) return start_failed(err);
+            // The target's CPU reference verifies one row at a time. Only the already emitted token enters it.
+            // A mismatch emits the target's choice and ends the window without writing rejected KV or conv state.
+            for (size_t j = 0; j <= guesses.size(); ++j) {
+                const int32_t pending = produced.back();
+                if (!model.forward(&pending, 1, pos++, out.data(), lg, err)) return start_failed(err);
+                if (!emit(0)) return 1;
+                if (at_eos(produced.back()) || j == guesses.size() || produced.back() != guesses[j]) break;
+            }
+            continue;
+        }
         if (spec) {
             int n_emit = 0;
             const size_t at = produced.size();   // the continuation's tokens after the pending one

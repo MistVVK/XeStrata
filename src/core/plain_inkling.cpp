@@ -3,6 +3,8 @@
 // src/core/plain_inkling.cpp - Inkling-2-Mini's CPU reference forward (see plain_inkling.hpp).
 #include "strata/core/plain_inkling.hpp"
 
+#include "plain_dspark.hpp"
+
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 
@@ -113,6 +115,24 @@ struct PlainInkling::Impl {
 
     int64_t n_cells = 0;
     std::vector<float> last_logits_;
+    std::unique_ptr<PlainDspark> dspark;
+    std::vector<float> draft_features;
+
+    bool embedding(int32_t tok, float* x) const {
+        return emb_row && kc::native_row_to_float(emb_type, emb_data + (size_t) tok * emb_row, x, N);
+    }
+
+    bool project_head(const float* x, float* logits, int64_t rows) const {
+        if (!head_row) return false;
+        std::vector<float> w((size_t) N);
+        for (int64_t i = 0; i < rows; ++i) {
+            if (!kc::native_row_to_float(head_type, head_data + (size_t) i * head_row, w.data(), N)) return false;
+            double sum = 0;
+            for (int64_t d = 0; d < N; ++d) sum += (double) w[(size_t) d] * x[d];
+            logits[i] = (float) sum;
+        }
+        return true;
+    }
 
     const std::vector<float>& matrix(const std::string& name, std::string& err) {
         auto it = dense.find(name);
@@ -260,7 +280,8 @@ bool PlainInkling::Impl::load(const GgufModel& model, const ModelSpec& spec, std
     emb_t = t;
     emb_data = m->shard(at).tensor_data(*t);
     emb_type = (int) t->type;
-    emb_row = (size_t) t->shape[1];
+    const auto emb_vocab = t->shape[1];
+    emb_row = kc::native_row_bytes(emb_type, N);
     t = m->find("output.weight", &at);
     if (t == nullptr || t->shape.size() != 2 || (int64_t) t->shape[0] != N || !m->in_bounds(*t, at)) {
         err = "inkling2: output.weight is missing or of the wrong shape";
@@ -269,8 +290,8 @@ bool PlainInkling::Impl::load(const GgufModel& model, const ModelSpec& spec, std
     head_t = t;
     head_data = m->shard(at).tensor_data(*t);
     head_type = (int) t->type;
-    head_row = (size_t) t->shape[1];
-    if (emb_row != (size_t) s.vocab_padded || head_row != (size_t) s.vocab_padded) {
+    head_row = kc::native_row_bytes(head_type, N);
+    if (!emb_row || !head_row || emb_vocab != (size_t) s.vocab_padded || t->shape[1] != (size_t) s.vocab_padded) {
         err = "inkling2: the embedding or head does not match the padded vocabulary";
         return false;
     }
@@ -399,7 +420,8 @@ void PlainInkling::Impl::reset_state() {
 }
 
 void PlainInkling::reset() {
-    if (p_) p_->reset_state();
+    p_->reset_state();
+    if (p_->dspark) p_->dspark->reset();
 }
 
 bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::string& err) {
@@ -419,8 +441,7 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
     std::vector<std::vector<float>> blocks;
 
     // embedding: the raw token's row is not normalized (an encoded image's row would be)
-    const size_t rb = kc::native_row_bytes(emb_type, N);
-    if (rb == 0 || !kc::native_row_to_float(emb_type, emb_data + (size_t) tok * rb, x.data(), N)) {
+    if (!embedding(tok, x.data())) {
         err = "inkling2: cannot dequantize the token embedding";
         return false;
     }
@@ -517,9 +538,17 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
             o[i] = cur[i] - std::tanh(o[i]) * cur[i] + std::tanh(g[i]) * message[i];
     };
 
+    // The draft taps the layer inputs in visit order, not the slots used for recurrent state.
+    int visit = 0;
+    const auto tap = [&](int id, const float* row) {
+        if (!dspark) return;
+        for (size_t j = 0; j < PlainDspark::taps.size(); ++j)
+            if (PlainDspark::taps[j] == id) std::copy_n(row, N, draft_features.data() + j * N);
+    };
     auto layer = [&](int64_t ip, int64_t slot_id, float* cur_in, std::vector<std::vector<float>>& bl,
                      const float* messages, const Loop* loop, bool messages_present) {
         if (!err.empty()) return;
+        tap(visit++, cur_in);
         Layer& L = layers[(size_t) ip];
         Slot& sl = slots[(size_t) slot_id];
         std::vector<float> inpSA(cur_in, cur_in + N);
@@ -717,26 +746,16 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
     // ---- the head ----
     mix(blocks, cur.data(), out_query.data(), tmp.data());
     rms_norm(tmp.data(), out_norm.data(), hn.data(), N, eps);
-    std::vector<float> logits((size_t) s.vocab_padded), hrow((size_t) N);
-    const size_t hrb = kc::native_row_bytes(head_type, N);
-    if (hrb == 0) {
-        err = "inkling2: the head has no host dequantizer";
+    tap(visit, hn.data());  // the terminal tap is the normalized head input
+    last_logits_.resize((size_t) s.vocab_unpadded);
+    if (!project_head(hn.data(), last_logits_.data(), s.vocab_unpadded)) {
+        err = "inkling2: cannot dequantize a head row";
         return false;
     }
-    // the head's dot products, in F32 as mainline's ggml_prec_set_acc(F32).  A row is dequantized into its own
-    // scratch: `logits` holds one value per vocabulary row, not one row's N values.
     const float cap = (float) s.final_logit_softcap;
-    for (int64_t i = 0; i < s.vocab_padded; ++i) {
-        if (!kc::native_row_to_float(head_type, head_data + (size_t) i * hrb, hrow.data(), N)) {
-            err = "inkling2: cannot dequantize a head row";
-            return false;
-        }
-        double ss = 0;
-        for (int64_t d = 0; d < N; ++d) ss += (double) hrow[(size_t) d] * hn[d];
-        const float z = (float) ss;
-        logits[(size_t) i] = cap > 0 ? cap * std::tanh(z / cap) : z;
-    }
-    last_logits_ = std::move(logits);
+    if (cap > 0)
+        for (float& z : last_logits_) z = cap * std::tanh(z / cap);
+    if (dspark) dspark->commit(draft_features.data());
     return true;
 }
 
@@ -762,6 +781,31 @@ bool PlainInkling::run(const int32_t* tokens, int64_t n, int64_t pos, float* log
     if (logits != nullptr)
         std::memcpy(logits, p_->last_logits_.data(), (size_t) p_->s.vocab_unpadded * sizeof(float));
     return true;
+}
+
+bool PlainInkling::load_dspark(const std::string& path, std::string& err) {
+    const auto& s = p_->s;
+    if (s.n_layer != 24 || s.loop_start != 6 || s.loop_end != 18 || s.loop_count != 3 ||
+        s.n_embd != 2304 || s.vocab_unpadded != 200058 || s.vocab_padded != 201024) {
+        err = "DSpark: incompatible target geometry";
+        return false;
+    }
+    auto draft = std::make_unique<PlainDspark>();
+    if (!draft->load(path, *p_->m, err)) return false;
+    p_->draft_features.resize(PlainDspark::taps.size() * (size_t) s.n_embd);
+    p_->dspark = std::move(draft);
+    return true;
+}
+
+bool PlainInkling::propose_dspark(int32_t anchor, int64_t pos, int count, std::vector<int32_t>& tokens,
+                                 std::string& err) const {
+    const auto embedding = [&](int32_t id, float* row) {
+        if (!p_->embedding(id, row)) return false;
+        rms_norm(row, p_->tok_norm.data(), row, p_->N, p_->eps);
+        return true;
+    };
+    const auto head = [&](const float* in, float* out) { return p_->project_head(in, out, p_->s.vocab_unpadded); };
+    return p_->dspark && p_->dspark->propose(anchor, pos, count, embedding, head, tokens, err);
 }
 
 int64_t PlainInkling::vocab() const { return p_->s.vocab_unpadded; }

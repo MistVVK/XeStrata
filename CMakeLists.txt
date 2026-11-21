@@ -603,6 +603,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/vmm.cpp src/core/draft_head.cpp
                                    src/core/grammar.cpp src/core/script_guard.cpp src/core/plain_cpu.cpp
                                    src/core/plain_inkling.cpp
+                                   src/core/plain_dspark.cpp
                                    src/core/auto_pick.cpp)
   target_include_directories(strata_engine PUBLIC include)
   # the dense Qwen3.5 forward on the CPU (--device cpu): AVX2 throughout, run only after PlainModel's cpu_avx2_ok()

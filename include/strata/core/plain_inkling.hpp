@@ -31,6 +31,9 @@ public:
     bool run(const int32_t* tokens, int64_t n, int64_t pos, float* logits, std::string& err);
     void reset();
 
+    bool load_dspark(const std::string& path, std::string& err);
+    bool propose_dspark(int32_t anchor, int64_t pos, int count, std::vector<int32_t>& tokens, std::string& err) const;
+
     int64_t vocab() const;
     std::string describe() const;
 

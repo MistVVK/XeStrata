@@ -3237,7 +3237,11 @@ bool PlainModel::cpu_load(std::string& err) {
     opt_.spec = 0;   // no MTP layer read: no drafts
     if (spec_.arch == ModelArch::Inkling2Loop) {
         inkling_ = std::make_unique<PlainInkling>();
-        if (!inkling_->load(*model_, spec_, err)) { inkling_.reset(); return false; }
+        if (!inkling_->load(*model_, spec_, err) ||
+            (opt_.draft == "dspark" && !inkling_->load_dspark(opt_.draft_model, err))) {
+            inkling_.reset();
+            return false;
+        }
         n_vocab_ = inkling_->vocab();
         std::fprintf(stderr, "xestrata plain: %s\n", inkling_->describe().c_str());
         return true;
@@ -3250,6 +3254,11 @@ bool PlainModel::cpu_load(std::string& err) {
     n_vocab_ = cpu_->vocab();
     std::fprintf(stderr, "xestrata plain: the forward on the CPU: %s\n", cpu_->describe().c_str());
     return true;
+}
+
+bool PlainModel::propose_dspark(int32_t anchor, int64_t pos, int count, std::vector<int32_t>& tokens,
+                                std::string& err) const {
+    return inkling_ && inkling_->propose_dspark(anchor, pos, count, tokens, err);
 }
 
 // The CPU's run and its picks: the last `rows` tokens' logits, each row's draw from its position as pick() takes it
