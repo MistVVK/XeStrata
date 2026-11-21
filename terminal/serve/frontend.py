@@ -52,6 +52,7 @@ class ChatTemplate:
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
+        self._is_hy4 = "<tool_calls{}>" in self.source or "<\uff5creasoning_mode" in self.source
         self.template = env.from_string(self.source)
         self.caps = self._detect_caps()
 
@@ -63,6 +64,9 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+        if self._is_hy4 and kwargs:
+            from serve import hy4_dialect
+            kwargs = hy4_dialect.template_kwargs(kwargs)
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
@@ -150,26 +154,32 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
 
 
 _EFFORT_QWEN = dict(EFFORT)
+_FAMILY: str | None = None
 
 
 def use_family(family: str | None) -> None:
     """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER): the Qwen table, or Hy4-Flash's
     (its template knows no_think, high and max: serve/hy4_dialect.py)."""
+    global _FAMILY
+    _FAMILY = family
     EFFORT.clear()
     if family == "hy4":
         from serve import hy4_dialect
-        EFFORT.update({**{k: None for k in ("none", "off", "minimal", "disabled", "false")}, "low": "high", "medium": "high", "high": "high",
-                       "xhigh": "max", "max": "max", "maximum": "max"})
+        EFFORT.update(hy4_dialect.EFFORT)
         return
     EFFORT.update(_EFFORT_QWEN)
 
 
 def effort_kwargs(value) -> dict:
-    """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
+    """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400 on Qwen; Hy4-Flash clamps external client efforts into {no_think, high, max}."""
     if value is None or value == "":
         return {}
     if value is False:
         return {"enable_thinking": False}
+    if _FAMILY == "hy4":
+        from serve import hy4_dialect
+        mode = hy4_dialect.normalize_effort(value)
+        return {"enable_thinking": False} if mode == "no_think" else {"reasoning_effort": mode}
     key = str(value).strip().lower()
     if key not in EFFORT:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
@@ -178,12 +188,13 @@ def effort_kwargs(value) -> dict:
 
 
 def budget_effort(tokens) -> dict:
-    """Anthropic's thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high."""
+    """Anthropic's thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high (clamped through EFFORT for Hy4-Flash)."""
     try:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else EFFORT["high"]}
+    level = EFFORT.get("low", "low") if n < 2048 else EFFORT.get("medium", "medium") if n < 8192 else EFFORT["high"]
+    return {"reasoning_effort": level}
 
 
 def _has_image(content) -> bool:
@@ -664,7 +675,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     for k, v in ctk.items():
         if k == "enable_thinking" and not v:
             kwargs = {"enable_thinking": False}
-        elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
+        elif k in ("reasoning_effort", "thinking_mode") and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 

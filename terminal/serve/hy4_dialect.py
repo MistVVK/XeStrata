@@ -160,17 +160,40 @@ def translate(text: str) -> str:
 
 
 # ---- reasoning effort (serve/frontend.py use_family): the template takes no_think | high | max ----
-EFFORT = {"none": None, "low": "high", "medium": "high", "high": "high", "xhigh": "max", "max": "max"}
+EFFORT = {
+    "none": None, "off": None, "no_think": None, "disabled": None, "false": None,
+    "minimal": "high", "min": "high", "low": "high", "medium": "high", "med": "high", "high": "high", "auto": "high", "default": "high",
+    "xhigh": "max", "max": "max", "maximum": "max",
+}
+
+
+def normalize_effort(value) -> str:
+    """Clamp any client reasoning_effort / thinking_mode into Hy4-Flash's three valid template modes: no_think | high | max."""
+    if value is False:
+        return "no_think"
+    if value is True or value is None or value == "":
+        return "high"
+    key = str(value).strip().lower()
+    if key in EFFORT:
+        mapped = EFFORT[key]
+        return "no_think" if mapped is None else mapped
+    return "high"
 
 
 def template_kwargs(kwargs: dict) -> dict:
     """The kwargs the Hy4 template reads, from the ones the frontends build (they say `enable_thinking: false` or `reasoning_effort: <level>`): thinking off is
-    reasoning_effort=no_think; the `enable_thinking` key stays (serve reads it to start the parser in the right state)."""
+    reasoning_effort=no_think; any external client effort (minimal, low, medium, xhigh, ...) is clamped into {no_think, high, max} before chat_template.jinja runs."""
     out = dict(kwargs)
+    if "thinking_mode" in out:
+        tm = out.pop("thinking_mode")
+        if out.get("reasoning_effort") in (None, ""):
+            out["reasoning_effort"] = tm
     if out.get("enable_thinking") is False:
         out["reasoning_effort"] = "no_think"
-    elif out.get("reasoning_effort") not in (None, "no_think", "high", "max"):
-        out["reasoning_effort"] = EFFORT.get(str(out["reasoning_effort"]).lower(), "high")
+    elif out.get("reasoning_effort") not in (None, ""):
+        out["reasoning_effort"] = normalize_effort(out["reasoning_effort"])
+    else:
+        out.pop("reasoning_effort", None)
     if out.get("reasoning_effort") == "no_think":
         out["enable_thinking"] = False
     return out

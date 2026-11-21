@@ -149,9 +149,63 @@ def _signals(a, want: dict) -> dict:
         return {"args": [], "vram_mib": None}
 
 
+HY4_DRAFTING_LINE = "Tencent Hy4-Flash has its DFly2 drafter built into the model file; no separate drafter download is needed."
+
+
+def _is_hy4_drafting(a) -> bool:
+    from serve import hy4_kind
+    fam = str(getattr(a, "family", "") or "").strip().lower()
+    if fam == "hy4-flash":
+        return True
+    model = str(getattr(a, "model", "") or "").strip()
+    if model:
+        low = model.lower()
+        if low.startswith("hy4-flash") or low in ("sq-32", "sq-64", "sq-96", "sq-128"):
+            return True
+        try:
+            from strata_cli.launch.catalog import Catalog
+            if Catalog().resolve(model, a.family)[0] == "hy4-flash":
+                return True
+        except Exception:                                    # noqa: BLE001
+            pass
+    if a.config:
+        try:
+            cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig"))
+            if hy4_kind.is_hy4(cfg):
+                return True
+        except (OSError, ValueError):
+            pass
+    if not a.config and not model and not fam:
+        try:
+            from strata_cli.launch.catalog import Catalog
+            cfgs = [c for c in Catalog().installed_configs() if c.get("path")]
+            if cfgs and all(str(c.get("model_name") or "").lower().startswith("hy4-flash") for c in cfgs):
+                return True
+        except Exception:                                    # noqa: BLE001
+            pass
+    return False
+
+
 def run(a) -> int:
     from strata_control import drafting_fetch      # here, not at the top: it pulls in the network code, which a started engine's command line must not load
     machine = a.output in ("json", "jsonl")
+    if _is_hy4_drafting(a):
+        if a.drafting_command == "plan":
+            if machine:
+                print(json.dumps({"schema_version": 1, "ok": True, "needed": False, "tuned_needed": False, "mtp_here": False,
+                                  "mtp_needed": False, "mtp_gb": 0.0, "serves": False, "ready": True, "gb": 0.0,
+                                  "drafter": "dfly2", "choice": "off" if getattr(a, "mode", None) == "off" else "auto",
+                                  "split": False, "note": "", "line": HY4_DRAFTING_LINE, "text": HY4_DRAFTING_LINE,
+                                  "support": "none", "support_line": HY4_DRAFTING_LINE}, ensure_ascii=False))
+            else:
+                print(HY4_DRAFTING_LINE)
+            return 0
+        if machine:
+            print(json.dumps({"schema_version": 1, "ok": True, "event": "result", "pack": None, "skipped": True,
+                              "message": HY4_DRAFTING_LINE}, ensure_ascii=False))
+        else:
+            print(HY4_DRAFTING_LINE)
+        return 0
     if len(_installed_dflash2_configs(a)) > 1:               # which model's drafter? the generic fetch would take the stock one for a set that has a tuned one
         if machine:
             print(json.dumps({"schema_version": 1, "ok": False, "error": {"code": "which_model", "message": SEVERAL_MODELS}}, ensure_ascii=False))

@@ -264,15 +264,17 @@ def desc_matches(desc: dict, s: S.LaunchSettings) -> bool:
     (The graphics cards are not part of it: they go into each launch's own config, see apply_cards.)"""
     if s.context and desc.get("context") != s.context:
         return False
-    want_kv = s.kv or ("int8" if (s.context or 32768) > 8192 else "fp16")
-    if desc.get("kv") not in (None, want_kv) and (s.context or 32768) > 8192:
-        return False
+    if s.family != "hy4-flash":
+        want_kv = s.kv or ("int8" if (s.context or 32768) > 8192 else "fp16")
+        if desc.get("kv") not in (None, want_kv) and (s.context or 32768) > 8192:
+            return False
     images = desc.get("images") or "off"
     if s.vision is None:
         return True                                          # no preference yet: the run settles it before it compares
-    if (s.vision == "off") != (images == "off"):
+    want_off = s.vision in ("off", "no")
+    if want_off != (images == "off"):
         return False
-    if s.vision in ("gpu", "cpu") and images != s.vision:
+    if s.family != "hy4-flash" and s.vision in ("gpu", "cpu") and images != s.vision:
         return False
     return True
 
@@ -1184,7 +1186,8 @@ class Runner:
         s = self.s
         if s.vision is None:
             row = next((r for r in self.catalog.rows() if (r.family, r.model) == (s.family, s.model)), None)
-            s.vision = self.catalog.picture_default(bool(row.images) if row is not None else False)
+            images = bool(row.images) if row is not None else False
+            s.vision = ("on" if images else "off") if self.is_hy4() else self.catalog.picture_default(images)
         return s.vision
 
     def vision_word(self) -> str:
@@ -1192,14 +1195,16 @@ class Runner:
         and the GPU encoder from 24 GB (any make of card), and downloads the pinned picture-reader file (mmproj) with the model."""
         s = self.s
         self.resolved_vision()
-        if s.vision == "off":
+        if s.vision in ("off", "no"):
             return "no"
+        if self.is_hy4():
+            return "yes"
         return "yes" if s.vision == "on" else s.vision
 
     def check_pictures(self, path: Path) -> None:
         """Pictures were asked for: say so in plain words when the installed settings still have them off."""
         s = self.s
-        if s.vision == "off":
+        if s.vision in ("off", "no"):
             return
         try:
             desc = self.catalog.strata.describe_config(path)
@@ -1683,7 +1688,7 @@ class Runner:
     def intel_chosen(self) -> bool:
         """The engine for this launch is the Intel Arc one (chosen with --backend intel, saved, or the only make here), and the model is one
         the built-in downloader sets up for NVIDIA and AMD only: Strata prepares the model files itself instead (adopt_prepared_files)."""
-        if sys.platform == "darwin" or WINDOWS:
+        if self.is_hy4() or sys.platform == "darwin" or WINDOWS:
             return False
         try:
             from strata_control import engine_component
@@ -2761,9 +2766,16 @@ class Runner:
         gb = round(sum(p["gb"] for p in parts), 1)
         engine, here = True, []
         try:
-            report = engine_component.status(Path(self.components_dir) if self.components_dir else None)
-            engine = bool(report.get("usable"))
-            here = [str(i.get("version")) for i in report.get("installed") or [] if i.get("version")]
+            shape = self.model_shape()
+            if shape:
+                from strata_control import shape_engine
+                found = shape_engine.find(shape, Path(self.components_dir) if self.components_dir else None, full=False, title=self.model_title())
+                engine = bool(found.usable)
+                here = [found.version] if found.installed and found.version else []
+            else:
+                report = engine_component.status(Path(self.components_dir) if self.components_dir else None)
+                engine = bool(report.get("usable"))
+                here = [str(i.get("version")) for i in report.get("installed") or [] if i.get("version")]
         except Exception:                                    # noqa: BLE001 - the plan must not fail on this
             pass
         if gb < 0.05:
@@ -2786,7 +2798,8 @@ class Runner:
                          "Copy or link your pack there to use it as it is" +
                          (f"; only {gap['free_gb']:.0f} GB are free on that drive, so choose a bigger drive with --data-dir" if gap.get("free_gb") is not None and gap["free_gb"] < gap["gb"] else "") + ".")
             if any(p["kind"] == "mmproj" for p in parts):
-                text += " To skip the picture reader (the model then answers text only), add --vision off; or put its mmproj file next to your model files."
+                reader_file = "Hy4-Flash-Vision.strata" if self.is_hy4() else "its mmproj file"
+                text += f" To skip the picture reader (the model then answers text only), add --vision off; or put {reader_file} next to your model files."
             if any(p["kind"] == "mtp" for p in parts):
                 text += " To skip the draft layer (a little slower, less memory), add --mtp off."
             if any(p["kind"] == "dflash2" for p in parts):
@@ -2995,6 +3008,8 @@ class Runner:
     def drafting_plan_line(self) -> str:
         """The drafting line of --plan: what drafts, or why not what was asked for. Nothing is changed or downloaded."""
         from strata_control import drafting
+        if self.is_hy4():
+            return "Drafting: off" if str(self.s.drafting or "").strip().lower() == "off" else "Drafting: DFly2 (built into the model)"
         if self.feed_without_draft_layer():                  # the model list says this model has no draft layer: setup fetches none and the engine starts without a drafter
             return drafting.summary_line(drafting.Decision("off", "off"))
         try:

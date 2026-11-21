@@ -796,7 +796,7 @@ class Strata:
         def val(k):
             return a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None
         tag = path.stem[len("strata-"):]
-        missing = [p for p in [cfg.get("exe"), *[x for x in a if isinstance(x, str) and x.endswith(".gguf")]]
+        missing = [p for p in [cfg.get("exe"), *[x for x in a if isinstance(x, str) and x.lower().endswith((".gguf", ".strata"))]]
                    if not p or not (self.engine_here(p, cfg) if str(p).startswith("component:") else Path(p).exists())]
         gaps = shard_gaps([x for x in a if isinstance(x, str) and x.endswith(".gguf")])   # a model in parts is whole only with every part
         missing += gaps
@@ -807,7 +807,7 @@ class Strata:
         return {"model": tag, "config": path.name, "model_name": cfg.get("model_name"),
                 "context": int(val("--max-context")) if str(val("--max-context") or "").isdigit() else None,
                 "kv": val("--kv"), "images": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict)
-                else "off",
+                else ("on" if val("--vision") else "off"),
                 "port": cfg.get("port", DEFAULT_PORT), "host": cfg.get("host", "127.0.0.1"),
                 "gpu": cfg.get("gpu"), "gpu_roles": cfg.get("gpu_roles"), "api_key_set": bool(cfg.get("api_key")),
                 "low_ram": "--resident-experts" in a or "--mmap-experts" in a,

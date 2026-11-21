@@ -260,9 +260,33 @@ def _hw_hash(identity: dict[str, Any]) -> str:
     return tune_machine.stable_hash((identity.get("hardware") or {}).get("hard"))
 
 
+HY4_NO_TUNING = "Tencent Hy4-Flash needs no tuning: its speed and memory placement are set automatically by strata-hy4."
+
+
+def _is_hy4_target_name(target: str) -> bool:
+    from serve import hy4_kind
+    t = (target or "").strip().lower()
+    if t.startswith("hy4-flash") or "/hy4-flash" in t or t in ("sq-32", "sq-64", "sq-96", "sq-128"):
+        return True
+    if "/" in t:
+        fam, _, size = t.partition("/")
+        if fam.strip() == "hy4-flash" or size.strip() in ("sq-32", "sq-64", "sq-96", "sq-128"):
+            return True
+    try:
+        p = Path(target).expanduser()
+        if p.is_file():
+            raw = json.loads(p.read_text(encoding="utf-8-sig"))
+            if isinstance(raw, dict) and hy4_kind.is_hy4(raw):
+                return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
 # --------------------------------------------------------------------------- tune auto
 
 def auto(a: argparse.Namespace) -> int:
+    from serve import hy4_kind
     from strata_control import autotune, engine_component, presets, tune_knobs, tuning
     from strata_control.tune_session import WorkerSession
 
@@ -271,7 +295,11 @@ def auto(a: argparse.Namespace) -> int:
         goal, reserve = _parse_goal(a.goal)
         cfg_path, cfg = _load_target(a.target)
     except Exception as e:  # noqa: BLE001
+        if _is_hy4_target_name(getattr(a, "target", "")):
+            return _fail(HY4_NO_TUNING, 2, machine)
         return _fail(str(e), getattr(e, "exit_code", 2), machine)
+    if hy4_kind.is_hy4(cfg) or _is_hy4_target_name(getattr(a, "target", "")):
+        return _fail(HY4_NO_TUNING, 2, machine)
     if not 0 <= a.leave_ram <= 50:
         return _fail("--leave-ram is a percentage from 0 to 50", 2, machine)
     if a.leave_ram and goal == "speed":

@@ -453,7 +453,10 @@ class Catalog:
         return [int(c) for c in self.tables()[2]]
 
     def contexts_for(self, family: str | None, model: str | None = None) -> list[int]:
-        """The context sizes to offer for this model: the shared list."""
+        """The context sizes to offer for this model: Hy4-Flash's own list (8K..128K), else the shared list."""
+        if family == "hy4-flash":
+            from strata_control import hy4_family
+            return list(hy4_family.CONTEXTS)
         return self.contexts()
 
     def recommendation(self, hw: dict | None = None) -> dict:
@@ -509,8 +512,14 @@ class Catalog:
             got = 0.0
             if base is not None:
                 try:
-                    got = sum(f.stat().st_size for f in self.model_folder(base, r.family, r.model).glob("*.gguf")
-                              if not f.name.lower().startswith("mmproj")) / 1e9
+                    folder = self.model_folder(base, r.family, r.model)
+                    if r.family == "hy4-flash":
+                        from strata_control import hy4_family
+                        got = sum(f.stat().st_size for f in folder.glob("*.strata")
+                                  if f.name in hy4_family.FILES) / 1e9
+                    else:
+                        got = sum(f.stat().st_size for f in folder.glob("*.gguf")
+                                  if not f.name.lower().startswith("mmproj")) / 1e9
                 except OSError:
                     got = 0.0
             need = max(r.download_gb - got, 0.0) + DISK_ROOM_GB
@@ -604,8 +613,11 @@ class Catalog:
             pass
         return {"folder": own, "rule": "fallback", "tried": tried}
 
-    def kv_gb(self, tokens: int, kv: str = "int8") -> float:
-        """The conversation memory for this many tokens, in GB (setup.py's UD_FIT_KV_BYTES: 13 attention layers)."""
+    def kv_gb(self, tokens: int, kv: str = "int8", family: str | None = None) -> float:
+        """The conversation memory for this many tokens, in GB (setup.py's UD_FIT_KV_BYTES: 13 attention layers; Hy4-Flash: hy4_fit)."""
+        if family == "hy4-flash":
+            from strata_control import hy4_fit
+            return tokens * hy4_fit.KV_GB_PER_TOKEN
         mod = self.strata.setup_module()
         table = getattr(mod, "UD_FIT_KV_BYTES", None) or {"fp16": 2112, "int8": 1056, "q4_0": 576, "k8v4": 816}
         return tokens * 13 * table.get(kv, 1056) / 1e9
@@ -634,9 +646,11 @@ class Catalog:
             return {"nvidia": "cuda", "amd": "hip", "intel": "sycl"}.get(v)
         return None
 
-    def reader_state(self) -> str:
-        """"present" when the installed engine carries the picture reader (strata-vision), "missing" when an engine is installed without it,
+    def reader_state(self, family: str | None = None) -> str:
+        """"present" when the installed engine carries the picture reader (strata-vision; built into strata-hy4 for Hy4-Flash), "missing" when an engine is installed without it,
         "unknown" before any engine is installed (the first launch fetches one that has it)."""
+        if family == "hy4-flash":
+            return "present"
         try:
             from strata_control import engine_component as ec
             rep = ec.status()
@@ -649,10 +663,12 @@ class Catalog:
         found = VR.find(Path(str(exe)).parent, os.name == "nt")
         return "present" if (found["cpu"] or found["gpu"]) else "missing"
 
-    def picture_default(self, images: bool) -> str:
+    def picture_default(self, images: bool, family: str | None = None) -> str:
         """The picture setting nobody chose: off for a model that cannot read pictures or an engine without the reader; else on, with the
         reader the one rule of strata_control/vision_reader.py gives: the CPU reader under 24 GB of graphics memory, the GPU reader from 24 GB,
         on every make of card (owner decision 2026-10-18); on a Mac the Metal reader (unified memory). Without a usable graphics card there is nothing to read on: the CPU reader."""
+        if family == "hy4-flash":
+            return "on" if images else "off"
         from strata_control import vision_reader as VR
         if not images or self.reader_state() == "missing" or self.pictures_not_on_card():
             return "off"
@@ -662,11 +678,11 @@ class Catalog:
         vram = comp.main_vram_gb
         return VR.default_mode(vram, "intel" if comp.engine_vendor == "intel" else "") if vram > 0 else "cpu"      # no usable card: nothing to read on, the CPU reader
 
-    def pictures_not_on_card(self) -> bool:
+    def pictures_not_on_card(self, family: str | None = None) -> bool:
         """T14: an Intel Arc card on Linux whose engine does not carry the picture reader (the engine route that builds the model's pack from the files itself
         fetches none) starts the engine text-only, so offering "Yes" would say "Pictures on" and then answer "I don't see a picture" (USERTEST-LIN, A750).
-        An engine that carries the reader (reader_state "present", the B-series decision of 2026-10-22) keeps pictures on."""
-        if not sys.platform.startswith("linux"):
+        An engine that carries the reader (reader_state "present", the B-series decision of 2026-10-22; or strata-hy4's native SYCL vision) keeps pictures on."""
+        if family == "hy4-flash" or not sys.platform.startswith("linux"):
             return False
         try:
             return self.engine_backend() == "sycl" and self.reader_state() != "present"

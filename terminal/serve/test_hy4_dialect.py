@@ -160,6 +160,68 @@ class Effort(unittest.TestCase):
         out = tpl.render([{"role": "user", "content": "x"}], **D.template_kwargs({"enable_thinking": False}))
         self.assertTrue(out.endswith("assistant<\uff5chy_middle:opensource\uff5c><think:opensource></think:opensource>"))
 
+    def test_external_clients_cannot_crash_hy4_template_with_unsupported_efforts(self):
+        tpl = ChatTemplate(TEMPLATE)
+        frontend.use_family("hy4")
+        # OpenAI / Responses / Olares / OpenCode / Codex / omp / pi levels:
+        for raw in ("minimal", "min", "low", "medium", "med", "high", "auto", "default", "custom_unknown"):
+            msgs, tools, kw = frontend.openai_to_messages(
+                {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": raw}
+            )
+            rendered = tpl.render(msgs, tools=tools, **kw)
+            self.assertIn("<\uff5creasoning_mode:opensource\uff5c>reasoning_effort:high<\uff5chy_end:opensource\uff5c>", rendered, raw)
+            self.assertTrue(rendered.endswith("<think:opensource>"), raw)
+        for raw in ("xhigh", "max", "maximum"):
+            msgs, tools, kw = frontend.openai_to_messages(
+                {"messages": [{"role": "user", "content": "hi"}], "reasoning": {"effort": raw}}
+            )
+            rendered = tpl.render(msgs, tools=tools, **kw)
+            self.assertIn("<\uff5creasoning_mode:opensource\uff5c>reasoning_effort:max<\uff5chy_end:opensource\uff5c>", rendered, raw)
+            self.assertTrue(rendered.endswith("<think:opensource>"), raw)
+        for raw in ("none", "off", "no_think", "disabled", "false", False):
+            msgs, tools, kw = frontend.openai_to_messages(
+                {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": raw}
+            )
+            rendered = tpl.render(msgs, tools=tools, **kw)
+            self.assertTrue(rendered.endswith("<think:opensource></think:opensource>"), raw)
+        # chat_template_kwargs (vLLM / llama.cpp / Olares Router style):
+        for ctk, expected in (
+            ({"reasoning_effort": "low"}, "reasoning_effort:high<\uff5chy_end:opensource\uff5c>"),
+            ({"reasoning_effort": "medium"}, "reasoning_effort:high<\uff5chy_end:opensource\uff5c>"),
+            ({"thinking_mode": "low"}, "reasoning_effort:high<\uff5chy_end:opensource\uff5c>"),
+            ({"thinking_mode": "xhigh"}, "reasoning_effort:max<\uff5chy_end:opensource\uff5c>"),
+            ({"thinking_mode": "no_think"}, "<think:opensource></think:opensource>"),
+        ):
+            msgs, tools, kw = frontend.openai_to_messages(
+                {"messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": ctk}
+            )
+            rendered = tpl.render(msgs, tools=tools, **kw)
+            self.assertIn(expected, rendered, ctk)
+        # Anthropic Messages (Claude Code): effort + budget_tokens (<2K, <8K, >=8K) + disabled
+        for budget in (512, 1024, 4096, 16384):
+            msgs, tools, kw = frontend.anthropic_to_messages(
+                {"messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": budget}}
+            )
+            rendered = tpl.render(msgs, tools=tools, **kw)
+            self.assertIn("reasoning_effort:high<\uff5chy_end:opensource\uff5c>", rendered, budget)
+        for eff, mode in (("low", "high"), ("medium", "high"), ("minimal", "high"), ("high", "high"), ("max", "max")):
+            msgs, tools, kw = frontend.anthropic_to_messages(
+                {"messages": [{"role": "user", "content": "hi"}], "output_config": {"effort": eff}}
+            )
+            rendered = tpl.render(msgs, tools=tools, **kw)
+            self.assertIn(f"reasoning_effort:{mode}<\uff5chy_end:opensource\uff5c>", rendered, eff)
+        # Direct ChatTemplate.render defensive clamp (e.g. resolve_prefix or custom caller passing raw Qwen level):
+        for raw_kw, mode in (
+            ({"reasoning_effort": "low"}, "reasoning_effort:high<\uff5chy_end:opensource\uff5c>"),
+            ({"reasoning_effort": "medium"}, "reasoning_effort:high<\uff5chy_end:opensource\uff5c>"),
+            ({"reasoning_effort": "minimal"}, "reasoning_effort:high<\uff5chy_end:opensource\uff5c>"),
+            ({"reasoning_effort": "xhigh"}, "reasoning_effort:max<\uff5chy_end:opensource\uff5c>"),
+            ({"thinking_mode": "low"}, "reasoning_effort:high<\uff5chy_end:opensource\uff5c>"),
+            ({"reasoning_effort": "no_think"}, "<think:opensource></think:opensource>"),
+        ):
+            rendered = tpl.render([{"role": "user", "content": "hi"}], **raw_kw)
+            self.assertIn(mode, rendered, raw_kw)
+
 
 class Kind(unittest.TestCase):
     def test_is_hy4(self):
@@ -207,6 +269,22 @@ class Kind(unittest.TestCase):
     def test_the_probe_says_none_for_a_program_that_cannot_answer(self):
         self.assertIsNone(hy4_kind.probe("does-not-exist", ["--native", "m.strata"]))
         self.assertIsNone(hy4_kind.probe(None, ["--native", "m.strata"]))
+
+    def test_write_images_isolates_overlapping_requests_on_stop_or_retry(self):
+        """Regression for real-human Stop + follow-up in a multi-turn image chat:
+        Request A's cleanup must NEVER unlink Request B's temp file for the same image."""
+        import tempfile
+        png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        with tempfile.TemporaryDirectory() as td:
+            req_a = hy4_kind.write_images([png, png], lambda s: s, lambda b: b, folder=td)
+            req_b = hy4_kind.write_images([png], lambda s: s, lambda b: b, folder=td)
+            self.assertEqual(len(set(req_a + req_b)), 3)
+            # Simulate Request A finishing cancel/drop_embeddings AFTER Request B ran prepare():
+            for p in req_a:
+                Path(p).unlink(missing_ok=True)
+            self.assertTrue(Path(req_b[0]).is_file(), "Request B's image file must survive Request A's cleanup")
+            self.assertEqual(Path(req_b[0]).read_bytes(), png)
+            Path(req_b[0]).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

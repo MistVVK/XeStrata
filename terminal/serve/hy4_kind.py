@@ -131,20 +131,23 @@ def decode_path(text: str) -> str:
 
 def write_images(sources, load, normalize, cancel=None, folder=None) -> list[str]:
     """The picture files of one request, in prompt order, for the engine to read: each source (a data: URL, an http(s) URL, a local path) is read by `load`, made one of the
-    formats the engine decodes (JPEG, PNG, BMP, GIF: `normalize`, which turns an EXIF-rotated JPEG upright and converts WebP and the rest to PNG) and written under a name made of
-    its hash.  Returns the paths.  A source that cannot be read is a ValueError (a 400 that says so)."""
+    formats the engine decodes (JPEG, PNG, BMP, GIF: `normalize`, which turns an EXIF-rotated JPEG upright and converts WebP and the rest to PNG) and written under a unique
+    per-request name (`<hash>-<nonce>-<idx>.<ext>`) so a cancelled request's `drop_embeddings()` never unlinks a follow-up request's copy of the same picture in multi-turn chat.
+    Returns the paths.  A source that cannot be read is a ValueError (a 400 that says so)."""
     import hashlib
+    import secrets
     import tempfile
     base = Path(folder) if folder else Path(tempfile.gettempdir()) / "strata-hy4-images"
     base.mkdir(parents=True, exist_ok=True)
+    nonce = secrets.token_hex(6)
     out: list[str] = []
     try:
-        for src in sources:
+        for idx, src in enumerate(sources):
             if cancel is not None and cancel.is_set():
                 raise ValueError("the request was cancelled")
             data = normalize(src if isinstance(src, bytes) else load(src))
             ext = ".png" if data[:8] == b"\x89PNG\r\n\x1a\n" else ".jpg" if data[:3] == b"\xff\xd8\xff" else ".bmp" if data[:2] == b"BM" else ".gif" if data[:3] == b"GIF" else ".img"
-            p = base / (hashlib.sha256(data).hexdigest()[:32] + ext)
+            p = base / f"{hashlib.sha256(data).hexdigest()[:24]}-{nonce}-{idx}{ext}"
             p.write_bytes(data)
             out.append(str(p))
     except Exception:

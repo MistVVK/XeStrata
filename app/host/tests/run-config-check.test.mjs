@@ -50,6 +50,17 @@ test('every key setup itself writes into a run config is a known key, so a fresh
   for (const key of [...keys, 'user_args']) assert.ok(KNOWN_KEYS.has(key), `${key} is written by setup/the app but the settings check calls it unknown`);
   const text = JSON.stringify({ exe: 'e', args: ['--native', 'm'], args_written: ['--native', 'm'], user_args: ['--pool-workers', '8'], port: 8080 });
   assert.deepEqual(checkRunConfig(text), { ok: true, issues: [] });
+  const hy4Text = JSON.stringify({
+    exe: 'component:strata-hy4',
+    shape_title: 'Tencent Hy4-Flash',
+    arch: 'hy4flash',
+    model_name: 'hy4-flash-sq-64',
+    drafting: 'dfly2',
+    args: ['--native', '/m/Hy4-Flash-SQ-64.strata', '--engram', '/m/Hy4-Flash-Engram-Q8.strata', '--max-context', '131072'],
+    args_written: ['--native', '/m/Hy4-Flash-SQ-64.strata', '--engram', '/m/Hy4-Flash-Engram-Q8.strata', '--max-context', '131072'],
+    port: 8080,
+  });
+  assert.deepEqual(checkRunConfig(hy4Text), { ok: true, issues: [] });
 });
 
 test('broken JSON is reported with its line, in plain words', () => {

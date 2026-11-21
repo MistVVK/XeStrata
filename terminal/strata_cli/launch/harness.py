@@ -97,6 +97,19 @@ def _j(obj) -> str:
 
 # ------------------------------------------------------------------------------------------------ the eight
 
+def _is_hy4(t: Target) -> bool:
+    return (t.model or "").strip().lower().startswith("hy4-flash")
+
+
+def _display_name(t: Target) -> str:
+    m = (t.model or "").lower()
+    if m.startswith("hy4-flash"):
+        return "Tencent Hy4-Flash (Strata, local)"
+    if m.startswith("qwen3.6") or m.startswith("qwen36"):
+        return "Qwen3.6-35B-A3B (Strata, local)"
+    return "Qwen3.8-Flash-Next (Strata, local)"
+
+
 def opencode_file(t: Target) -> str:
     return _j({"$schema": "https://opencode.ai/config.json", "model": f"strata/{t.model}", "small_model": f"strata/{t.model}",
                "autoupdate": False,
@@ -104,7 +117,7 @@ def opencode_file(t: Target) -> str:
                "share": "disabled",
                "provider": {"strata": {"npm": "@ai-sdk/openai-compatible", "name": "Strata (local)",
                                        "options": {"baseURL": t.base, "apiKey": t.key},
-                                       "models": {t.model: {"name": "Qwen3.8-Flash-Next (local)", "tool_call": True, "reasoning": True,
+                                       "models": {t.model: {"name": _display_name(t), "tool_call": True, "reasoning": True,
                                                             "limit": {"context": t.context, "input": t.input_limit, "output": t.output_cap}}}}}})
 
 
@@ -128,25 +141,19 @@ def claude_file(t: Target) -> str:
     return _j({"env": claude_env(t)})
 
 
-def _display_name(t: Target) -> str:
-    m = (t.model or "").lower()
-    if m.startswith("hy4-flash"):
-        return "Tencent Hy4-Flash (Strata, local)"
-    if m.startswith("qwen3.6") or m.startswith("qwen36"):
-        return "Qwen3.6-35B-A3B (Strata, local)"
-    return "Qwen3.8-Flash-Next (Strata, local)"
-
-
 def omp_models(t: Target) -> str:
+    efforts = "[high, max]" if _is_hy4(t) else "[minimal, low, medium, high]"
+    default_level = "high" if _is_hy4(t) else "medium"
     return ("providers:\n  strata:\n    baseUrl: " + t.base + "\n    api: openai-completions\n    auth: none\n    compat:\n"
             "      supportsDeveloperRole: false\n    models:\n      - id: " + t.model + "\n        name: " + _display_name(t) + "\n"
             "        reasoning: true\n        input: [text]\n        contextWindow: " + str(t.context) + "\n        maxTokens: " + str(t.output_cap) +
-            "\n        thinking:\n          mode: effort\n          efforts: [minimal, low, medium, high]\n          defaultLevel: medium\n"
+            f"\n        thinking:\n          mode: effort\n          efforts: {efforts}\n          defaultLevel: {default_level}\n"
             "        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}\n")
 
 
 def omp_config(t: Target) -> str:
-    return ("modelRoles:\n  default: strata/" + t.model + "\ndefaultThinkingLevel: medium\ncompaction:\n  enabled: true\n  thresholdTokens: "
+    level = "high" if _is_hy4(t) else "medium"
+    return ("modelRoles:\n  default: strata/" + t.model + f"\ndefaultThinkingLevel: {level}\ncompaction:\n  enabled: true\n  thresholdTokens: "
             + str(compact_at(t)) + "\n  keepRecentTokens: 4000\n  methodOrder:\n    - soft\n  idleEnabled: false\nsetupVersion: 2\n")
 
 
@@ -159,7 +166,8 @@ def pi_models(t: Target) -> str:
 
 
 def pi_settings(t: Target) -> str:
-    return _j({"defaultProvider": "strata", "defaultModel": t.model, "defaultThinkingLevel": "medium",
+    level = "high" if _is_hy4(t) else "medium"
+    return _j({"defaultProvider": "strata", "defaultModel": t.model, "defaultThinkingLevel": level,
                "compaction": {"enabled": True, "reserveTokens": max(1024, t.context - compact_at(t)), "keepRecentTokens": 4000}})
 
 

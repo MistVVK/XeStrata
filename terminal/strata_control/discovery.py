@@ -354,9 +354,10 @@ def footprint(cfg: dict, config: Path | None = None) -> Footprint:
         if v and v.lower().endswith(".gguf") and Path(v) not in fp.weights and flag != "--ple-gguf":
             fp.weights.append(Path(v))
     if not fp.weights and str(cfg.get("arch") or "").lower() == "hy4flash":
-        v = _flag_value(args, "--native")
-        if v and v.lower().endswith(".strata"):
-            fp.weights.append(Path(v))
+        for flag in ("--native", "--engram"):
+            v = _flag_value(args, flag)
+            if v and v.lower().endswith(".strata") and Path(v) not in fp.weights:
+                fp.weights.append(Path(v))
     if not fp.weights:
         fp.weights = [Path(a) for a in args if a.lower().endswith(".gguf")][:1]
     pack = _flag_value(args, "--pack")

@@ -127,6 +127,9 @@ def mtp_choice(mtp: str | None, drafting: str | None = None) -> str | None:
 
 
 def mmproj_name(catalog, family: str | None) -> str:
+    if family == "hy4-flash":
+        from strata_control import hy4_family
+        return hy4_family.VISION_FILE
     try:
         _m, families, _c, _s = catalog.tables()
         name = (families.get(family or "") or {}).get("mmproj")
@@ -149,10 +152,17 @@ def assess(catalog, family: str | None, model: str | None, *, vision: str = "off
     mtp = mtp_choice(mtp, drafting)
     row = next((r for r in (rows if rows is not None else catalog.rows()) if r.family == family and r.model == model), None) if (family and model) else None
     st.total_gb = float(row.download_gb) if row else 0.0
-    wants_pictures = vision != "off" and (row is None or row.images)
+    wants_pictures = vision not in ("off", "no") and (row is None or row.images)
     data = Path(data_dir) if data_dir else None
     if model_path:
         st.own_files = True
+        if family == "hy4-flash":
+            from strata_control import hy4_family
+            p = Path(model_path)
+            own_dir = p if p.is_dir() else p.parent
+            if wants_pictures and not reader_present(catalog, family, [data, *data_places(catalog, data)], own=own_dir):
+                st.parts.append(Part("mmproj", "the picture reader", round(hy4_family.FILES[hy4_family.VISION_FILE][0] / 1e9, 2)))
+            return st
         first = _first_gguf(Path(model_path))
         beside = discovery.prepared_beside(first, data_places(catalog, data)) if first else {}     # the model folder's own layout, then --data-dir and the remembered folder (where setup writes the draft layer)
         st.folder = beside.get("data_dir")
@@ -180,22 +190,68 @@ def assess(catalog, family: str | None, model: str | None, *, vision: str = "off
             st.installed = False
             st.parts.append(Part("weights", "the model", max(st.total_gb, 0.0)))
             return st
+        v_gb = MMPROJ_GB
+        if family == "hy4-flash":
+            from strata_control import hy4_family
+            v_gb = round(hy4_family.FILES[hy4_family.VISION_FILE][0] / 1e9, 2)
         for m in fp.missing():
             if m.kind == "mtp" and mtp != "off":
                 st.parts.append(Part("mtp", "the draft layer", MTP_FETCH_GB))
             elif m.kind == "mmproj" and wants_pictures:
-                st.parts.append(Part("mmproj", "the picture reader", MMPROJ_GB))
+                st.parts.append(Part("mmproj", "the picture reader", v_gb))
         images = (desc or {}).get("images") if desc is not None else ("cpu" if fp.mmproj else "off")
         if wants_pictures and (images in (None, "off")) and not any(p.kind == "mmproj" for p in st.parts):
-            base = st.folder / "models" if st.folder else data
-            have = (base / mmproj_name(catalog, family)) if base else None
-            if have is None or not have.exists():
-                st.parts.append(Part("mmproj", "the picture reader", MMPROJ_GB))
+            if family == "hy4-flash":
+                own_dir = fp.weights[0].parent if fp.weights else None
+                if not reader_present(catalog, family, [st.folder, *data_places(catalog, data)], own=own_dir):
+                    st.parts.append(Part("mmproj", "the picture reader", v_gb))
+            else:
+                base = st.folder / "models" if st.folder else data
+                have = (base / mmproj_name(catalog, family)) if base else None
+                if have is None or not have.exists():
+                    st.parts.append(Part("mmproj", "the picture reader", MMPROJ_GB))
         return st
     # not installed: whatever of the weights is in the model's folder counts
     if family and model:
         base = data or Path(catalog.data_dir())
         folder = catalog.model_folder(base, family, model)
+        if family == "hy4-flash":
+            from strata_control import hy4_family
+            weight_names = hy4_family.files_of(model, False)
+            got_weights = 0
+            missing_weights = 0
+            for n in weight_names:
+                expected = hy4_family.FILES[n][0]
+                p = folder / n
+                part = folder / (n + ".part")
+                try:
+                    if p.is_file() and p.stat().st_size == expected and not part.exists():
+                        got_weights += expected
+                    elif part.is_file():
+                        got_weights += min(part.stat().st_size, expected)
+                        missing_weights += max(0, expected - part.stat().st_size)
+                    else:
+                        missing_weights += expected
+                except OSError:
+                    missing_weights += expected
+            v_size = hy4_family.FILES[hy4_family.VISION_FILE][0]
+            v_have = False
+            if wants_pictures:
+                vp = folder / hy4_family.VISION_FILE
+                vpart = folder / (hy4_family.VISION_FILE + ".part")
+                try:
+                    if vp.is_file() and vp.stat().st_size == v_size and not vpart.exists():
+                        v_have = True
+                        got_weights += v_size
+                except OSError:
+                    pass
+            st.on_disk_gb = got_weights / 1e9
+            if missing_weights > 0:
+                rem = missing_weights + (0 if (not wants_pictures or v_have) else v_size)
+                st.parts.append(Part("weights", "the model", rem / 1e9))
+            elif wants_pictures and not v_have:
+                st.parts.append(Part("mmproj", "the picture reader", round(v_size / 1e9, 2)))
+            return st
         got = 0
         try:
             got = sum(f.stat().st_size for f in folder.glob("*.gguf") if not f.name.lower().startswith("mmproj"))
@@ -250,6 +306,19 @@ def reader_present(catalog, family: str | None, data_folders, own: Path | None =
     mmproj*.gguf: the family's pinned file name in a data folder's models/ (the one in use, or a folder setup reuses), or with the person's own
     files in their folder (by name), or in the folder above it or that folder's models/ (by name, at the pinned size). Or, when there is no pinned
     file, a verified Unsloth mmproj-F16.gguf (setup.accepted_alt_reader: the same function the start uses)."""
+    if family == "hy4-flash":
+        from strata_control import hy4_family
+        size = hy4_family.FILES[hy4_family.VISION_FILE][0]
+        places = [Path(b) / sub / "hy4-flash" / hy4_family.VISION_FILE for b in data_folders if b for sub in ("models", "Models")]
+        if own is not None:
+            places.insert(0, Path(own) / hy4_family.VISION_FILE)
+        for f in places:
+            try:
+                if f.is_file() and f.stat().st_size == size and not f.with_name(f.name + ".part").exists():
+                    return True
+            except OSError:
+                pass
+        return False
     name = mmproj_name(catalog, family)
     for base in data_folders:
         if not base:

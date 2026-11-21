@@ -146,6 +146,8 @@ class Ctx:
         cached = getattr(self, "_term", None)
         if key is not None and cached is not None and cached[0] == key:
             return cached[1]
+        if self.settings.family == "hy4-flash":
+            return ""
         try:
             from strata_cli.launch.runner import Runner as PlanRunner
             resolved = PlanRunner(self.settings, catalog=self.catalog).resolved_drafting(self.settings.family)
@@ -205,7 +207,7 @@ class Ctx:
         """The role of every card this launch will use (named here, else the installed model's own, else the recommendation) with the cards, or None
         on a computer with fewer than two usable cards. The Cards step shows the same; the Save and Advanced screens did not (T8)."""
         c = self.computer
-        if len(c.usable_gpus) < 2:
+        if len(c.usable_gpus) < 2 or self.settings.family == "hy4-flash":
             return None
         try:
             from strata_control import gpu_roles
@@ -257,7 +259,8 @@ class Ctx:
     def warnings(self) -> list[str]:
         s = self.settings
         out = [n.line() for n in S.check_access(s)]
-        out += [n.line() for n in S.check_parallel(s, vram_gb=self.computer.main_vram_gb or None)]
+        if s.family != "hy4-flash":
+            out += [n.line() for n in S.check_parallel(s, vram_gb=self.computer.main_vram_gb or None)]
         out += [n.line() for n in S.check_context(s)]
         r = next((x for x in self.rows if (x.family, x.model) == (s.family, s.model)), None)
         if r is not None and r.verdict == "disk":
