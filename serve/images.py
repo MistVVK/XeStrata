@@ -151,6 +151,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, cast
+from urllib.parse import urlsplit
 
 from serve import file_lock, option_values
 from serve import downgrades
@@ -1576,8 +1577,12 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
 
 
 def check_mask(data: bytes, size: tuple[int, int]) -> bytes:
-    """An edit's mask, checked as OpenAI checks it (a PNG with an alpha channel, the first image's size) -> RGBA PNG
-    bytes the engine reads (every model takes one: the configs' "mask": false of before are not read)."""
+    """An edit's mask -> RGBA PNG bytes the engine reads (every model takes one: the configs' "mask": false of before
+    are not read).  OpenAI's form, checked as OpenAI checks it: a PNG with an alpha channel of the first image's size,
+    its transparent pixels where it changes.  This server's own form, which the step before gives in a chain: a grey
+    PNG, white where it changes (the chat tools' mask link, mask_to_bw's; segmentations' mask_format png,
+    image_regions.mask_png's) - turned with mask_from_bw as the chat's tools turn it, and fitted to the picture's size,
+    which a segmentation's mask is not (the records' X3, X4)."""
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         raise ImageRequestError("mask: a PNG with an alpha channel")
     import io
@@ -1588,8 +1593,7 @@ def check_mask(data: bytes, size: tuple[int, int]) -> bytes:
     except Exception as e:
         raise ImageRequestError(f"mask: the PNG could not be read ({e})") from None
     if "A" not in im.getbands() and "transparency" not in im.info:
-        raise ImageRequestError("mask: a PNG with an alpha channel (its transparent pixels are where the image "
-                                "changes)")
+        return fit_mask_at(mask_from_bw(data), size)
     if im.size != size:
         raise ImageRequestError(f"mask: {im.size[0]}x{im.size[1]}, not the image's {size[0]}x{size[1]}")
     out = io.BytesIO()
@@ -4314,6 +4318,27 @@ FILE_REF = re.compile(r"/v1/images/files/([0-9a-f]{32}\.(?:png|jpeg|webp|jxl))")
 # an image tool's picture: a kept image's link (a tool's result, or the conversation's), else the conversation's last
 IMAGE_ARG = {"type": "string", "description": "attached:N (the user's Nth picture), or a link a tool returned; "
                                               "left out: the last image. Do not invent URLs."}
+
+
+def kept_link(source: str, host: str = "") -> str | None:
+    """The stored file name an image link names, when it names one of this server's own kept images: the form a chat
+    tool's result gives (`/v1/images/files/<name>`, relative) or the form an endpoint's `url` gives
+    (`<scheme>://<Host>/v1/images/files/<name>`).  A chain's next request takes the link the previous one returned:
+    the name is the access, as GET /v1/images/files/ reads it, so the reader serves the bytes from its own store
+    instead of fetching its own address (the #28 guard refuses that, and XESTRATA_IMAGE_URL_PRIVATE is a setting of the
+    machine, not something a contract may rely on).  Anything else is None: another host's or another port's link is an
+    outside URL and stays the #28 reader's, and so is one with a query or a fragment."""
+    if not isinstance(source, str) or not (source.startswith("/") or source.startswith(("http://", "https://"))):
+        return None
+    parts = urlsplit(source)
+    if parts.query or parts.fragment:
+        return None
+    if parts.netloc and (not host or parts.netloc.lower() != host.lower()):
+        return None
+    m = re.fullmatch(FILE_REF.pattern, parts.path)
+    return m.group(1) if m else None
+
+
 # how the masked edit enlarges the part it cuts out before it is drawn (crop_upscale), and SeedVR2's version for it
 CROP_UPSCALE = ("auto", "lanczos", "realesrgan", "seedvr2")
 CROP_ARGS: dict[str, Any] = {"crop_upscale": {"type": "string", "enum": list(CROP_UPSCALE)},
@@ -4543,19 +4568,27 @@ def mask_from_bw(data: bytes) -> bytes:
     return buf.getvalue()
 
 
+def fit_mask_at(mask: bytes, size: tuple[int, int]) -> bytes:
+    """A mask at the given size, nearest pixels so its parts stay whole: the mask as it is when it is already that
+    size."""
+    import io
+    from PIL import Image
+    im = Image.open(io.BytesIO(mask))
+    if im.size == size:
+        return mask
+    out = io.BytesIO()
+    im.convert("RGBA").resize(size, Image.NEAREST).save(out, format="PNG")
+    return out.getvalue()
+
+
 def fit_mask(mask: bytes, image: bytes) -> bytes:
     """A mask the web page painted at the size it showed the image, at the image's own size (nearest pixels)."""
     import io
     from PIL import Image
     try:
-        m, im = Image.open(io.BytesIO(mask)), Image.open(io.BytesIO(image))
+        return fit_mask_at(mask, Image.open(io.BytesIO(image)).size)
     except Exception as e:
         raise ImageRequestError(f"mask: the PNG could not be read ({e})") from None
-    if m.size == im.size:
-        return mask
-    out = io.BytesIO()
-    m.convert("RGBA").resize(im.size, Image.NEAREST).save(out, format="PNG")
-    return out.getvalue()
 
 
 def user_marks(want: dict, load, file) -> dict:
