@@ -25,6 +25,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/flash_attn.hpp"
 #include "strata/kernels/glm5.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_mmq.hpp"
@@ -1444,11 +1445,17 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         for (int64_t t = 0; t < T; t += per) {
                             const int64_t nq = std::min<int64_t>(per, T - t);
                             int32_t* steps = P.steps + t * k::kStepCount;
-                            k::qsa_block_scores(ib.pooled, ib.dead, P.qsa_query + t * 512, steps, nq, blocks, qs,
-                                                P.qsa_scores, cs);
+                            // the tiled FP32 scorer (the RX 9060 XT, a 32K prompt: 3% faster)
+                            if (!k::qsa_block_scores_tc(ib.pooled, ib.dead, P.qsa_query + t * 512, steps, nq, blocks,
+                                                        qs, P.qsa_scores, cs, 0))
+                                k::qsa_block_scores(ib.pooled, ib.dead, P.qsa_query + t * 512, steps, nq, blocks, qs,
+                                                    P.qsa_scores, cs);
                             k::qsa_block_topk_with_current(P.qsa_scores, steps, nq, blocks, 2052, qs, P.qsa_ids, cs);
-                            k::qsa_decode_attn_batch(P.qcur + t * NH * HD, pools, P.qsa_ids, steps, 2052, qs,
-                                                     attn_scratch_, P.attn + t * NH * HD, nq, cs);
+                            if (!k::flash_attn_select(P.qcur + t * NH * HD, pools, P.qsa_ids, steps, 2052, qs,
+                                                      P.attn + t * NH * HD, nq, cs, attn_scratch_,
+                                                      (size_t) opt_.max_t * (size_t) attn_scratch_floats_ * 4))
+                                k::qsa_decode_attn_batch(P.qcur + t * NH * HD, pools, P.qsa_ids, steps, 2052, qs,
+                                                         attn_scratch_, P.attn + t * NH * HD, nq, cs);
                         }
                     } else {
                         const int64_t cap = std::min<int64_t>(opt_.max_cells, pa + T);

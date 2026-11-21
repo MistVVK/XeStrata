@@ -1396,8 +1396,13 @@ inline void mad(sycl::sub_group sg, D& d, A& a, B& b, D& c) { mx::joint_matrix_m
 template<typename M, typename P>
 inline void store(sycl::sub_group sg, M& m, P p, size_t ld) { mx::joint_matrix_store(sg, m, p, ld, mx::layout::row_major); }
 }  // namespace jmx
-template<int KF, int VF>   // K's KvFmt (kF16, kI8), V's (kF16, kI8, kQ4)
+// GH query heads a KV head for each of QG queries a work-group: its 16 rows are query r / GH's head r % GH.  QG > 1 (a
+// GQA of 4, SenseNova-Loop's) walks the union of the QG queries' selections (union_lists: the cells ascending, a bit
+// a query), each row masked to its own query's cells: neighbouring queries share most of their cells, which the work
+// group then reads once for all of them
+template<int KF, int VF, int GH = G, int QG = 1>   // K's KvFmt (kF16, kI8), V's (kF16, kI8, kQ4)
 struct PromptAttnMma {
+    static_assert(GH * QG <= R, "the rows are one tile");
     static_assert(KF != kQ4, "Q4_0 K takes the FP32 kernel");
     using Pa = PromptAttn<kF16, kF16, pm::CH>;   // the helpers that do not depend on the pools
     static constexpr int VPG = VF == kQ4 ? 2 : 1;      // V scale groups a sub-group's 64 dims
@@ -1413,8 +1418,11 @@ struct PromptAttnMma {
     int64_t cap, n_kv, page_size;
     float scale_log2;
     float* attn;
+    const uint8_t* masks;   // QG > 1: ids [group, cap] the union, masks [group, cap] its bits, steps [group] its length
+    int64_t n_q;
     sycl::local_accessor<half, 1> kvq;      // kh [CH][KR], vh [CH][KR]; at the start qh [R][QS], ql [R][QS]
     sycl::local_accessor<long long, 1> rows;
+    sycl::local_accessor<int, 1> cmask;     // QG > 1: the chunk's cells' bits
     sycl::local_accessor<float, 1> ks, vs;  // [CH][NG], [CH][VS]: INT8 K's scales, V's
     sycl::local_accessor<float, 1> part;    // [NG][R][CH]: q.k per 64-dim group; part[0] then holds p
     sycl::local_accessor<half, 1> pp;       // [2 VS][R][CH]: p' hi (2v) / lo (2v + 1) per V scale group
@@ -1445,27 +1453,31 @@ struct PromptAttnMma {
         using pm::T16;
         const auto grp = it.get_group();
         const auto sg = it.get_sub_group();
-        const int64_t qi = (int64_t) it.get_group(0), kvh = (int64_t) it.get_group(1);
+        const int64_t gq = (int64_t) it.get_group(0), kvh = (int64_t) it.get_group(1);
+        const int64_t qi = gq * QG;
         const int t = (int) it.get_local_id(1), g = (int) sg.get_group_linear_id();
         const int lane = (int) sg.get_local_linear_id();
-        const int64_t n_head = n_kv * G;
-        const float* qp = qv + qi * n_head * HD + kvh * G * HD;
-        float* out = attn + qi * n_head * HD + kvh * G * HD;
-        const int32_t* sel = ids + qi * cap;
-        const int n = steps[qi * kStepCount + kStepWidth];
+        const int64_t n_head = n_kv * GH;
+        const int nr = GH * (int) sycl::min((int64_t) QG, n_q - qi);   // the rows of queries there are
+        // row r's query and head: qp + row(r) (and out + row(r)) is its first value
+        const auto row = [&](int r) { return (int64_t) (r / GH) * n_head * HD + (int64_t) (r % GH) * HD; };
+        const float* qp = qv + qi * n_head * HD + kvh * GH * HD;
+        float* out = attn + qi * n_head * HD + kvh * GH * HD;
+        const int32_t* sel = ids + gq * cap;
+        const int n = QG == 1 ? steps[qi * kStepCount + kStepWidth] : steps[gq];
         const size_t KH = 0, VH = (size_t) CH * KR, QH = 0, QL = (size_t) R * QS;
         const size_t SG0 = (size_t) g * R * T16;   // this sub-group's output staging, a tile at a time
 
-        // q as in PromptAttn: 12 heads + 4 zero rows, times 2^(14 - e), FP16 hi + lo
+        // q as in PromptAttn: the rows, zero rows to 16, times 2^(14 - e), FP16 hi + lo
         float qm = 0.0f;
-        for (int i = t; i < G * HD; i += pm::WG) qm = sycl::fmax(qm, sycl::fabs(qp[i]));
+        for (int i = t; i < nr * HD; i += pm::WG) qm = sycl::fmax(qm, sycl::fabs(qp[row(i / HD) + i % HD]));
         qm = sycl::reduce_over_group(grp, qm, sycl::maximum<float>());
         const int qe = qm > 0.0f ? (int) ((sycl::bit_cast<uint32_t>(qm) >> 23) & 0xFF) - 126 : 0;
         const float qup = sycl::ldexp(1.0f, 14 - qe), qdown = sycl::ldexp(scale_log2, qe - 14);
         for (int i = t; i < R * HD; i += pm::WG) {
             const int r = i / HD, d = i % HD;
             half hi, lo;
-            Pa::split(r < G ? qp[r * HD + d] * qup : 0.0f, hi, lo);
+            Pa::split(r < nr ? qp[row(r) + d] * qup : 0.0f, hi, lo);
             kvq[QH + (size_t) r * QS + d] = hi;
             kvq[QL + (size_t) r * QS + d] = lo;
         }
@@ -1494,6 +1506,7 @@ struct PromptAttnMma {
                     if (page >= 0) r = (page * n_kv + kvh) * page_size + cell % page_size;
                 }
                 rows[t] = r;
+                if constexpr (QG > 1) cmask[t] = t < nh ? (int) masks[gq * cap + c0 + t] : 0;
             }
             sycl::group_barrier(grp);   // rows ready; the previous chunk (and q's staging) is done with kvq, part, pp
             // K and V as FP16: int8 codes are exact in FP16.  8 codes or halves a work-item in one access each way:
@@ -1567,7 +1580,9 @@ struct PromptAttnMma {
                              pt(3) * ks[c * NG + 3];
                     else
                         sc = ((pt(0) + pt(1)) + pt(2)) + pt(3);
-                    x[j] = c < nh && rows[c] >= 0 ? sc * qdown : NEG_INF;
+                    bool in = c < nh && rows[c] >= 0;
+                    if constexpr (QG > 1) in = in && ((cmask[c] >> (r / GH)) & 1);
+                    x[j] = in ? sc * qdown : NEG_INF;
                     mxv = sycl::fmax(mxv, x[j]);
                 }
                 for (int o = 1; o < 8; o <<= 1) mxv = sycl::fmax(mxv, sycl::permute_group_by_xor(sg, mxv, o));
@@ -1640,9 +1655,9 @@ struct PromptAttnMma {
         }
         for (int i = 0; i < OPL; ++i) {
             const int e = lane + pm::SG * (i % TPL), r = e / T16, col = (i / TPL) * T16 + e % T16;
-            if (r < G) {
+            if (r < nr) {
                 const float l = lsum[r];
-                out[r * HD + g * 64 + col] = l > 0.0f ? o[i] / l : 0.0f;
+                out[row(r) + g * 64 + col] = l > 0.0f ? o[i] / l : 0.0f;
             }
         }
 #endif
@@ -1658,15 +1673,18 @@ constexpr size_t mma_local_bytes() {
            (size_t) 3 * R * 4;
 }
 
-template<int KF, int VF>
+// QG > 1: ids, masks and steps are union_lists' (cap its ucap), n_q the queries (their groups the grid)
+template<int KF, int VF, int GH = G, int QG = 1>
 sycl::event launch_mma(sycl::queue& q, const float* qv, QsaAttnPools p, const int32_t* ids, const int32_t* steps,
-                       int64_t cap, int64_t n_kv, int64_t page_size, float* attn, int64_t n_q) {
+                       int64_t cap, int64_t n_kv, int64_t page_size, float* attn, int64_t n_q,
+                       const uint8_t* masks = nullptr) {
     const float scale_log2 = 1.4426950408889634f / std::sqrt((float) HD);
     return q.submit([&](sycl::handler& h) {
-        using K = PromptAttnMma<KF, VF>;
-        K k{qv, p, ids, steps, cap, n_kv, page_size, scale_log2, attn,
+        using K = PromptAttnMma<KF, VF, GH, QG>;
+        K k{qv, p, ids, steps, cap, n_kv, page_size, scale_log2, attn, masks, n_q,
             sycl::local_accessor<half, 1>(sycl::range<1>(K::KV_HALVES), h),
             sycl::local_accessor<long long, 1>(sycl::range<1>(pm::CH), h),
+            sycl::local_accessor<int, 1>(sycl::range<1>(QG > 1 ? pm::CH : 1), h),
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) pm::CH * NG), h),
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) pm::CH * K::VS), h),
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) NG * R * pm::CH), h),
@@ -1675,7 +1693,87 @@ sycl::event launch_mma(sycl::queue& q, const float* qv, QsaAttnPools p, const in
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h)};
-        h.parallel_for(sycl::nd_range<2>({(size_t) n_q, (size_t) (n_kv * pm::WG)}, {1, pm::WG}), k);
+        h.parallel_for(sycl::nd_range<2>({(size_t) ((n_q + QG - 1) / QG), (size_t) (n_kv * pm::WG)}, {1, pm::WG}), k);
+    });
+}
+
+// The union of each QG neighbouring queries' selections (ids [n_q, cap], ascending, steps' widths): for group gq the
+// cells ascending in uids [gq, ucap], bit j of umasks [gq, ucap] set where query gq * QG + j selected the cell, the
+// count in ucount [gq].  A work-group a group: a cell is its first list's (no earlier list has it), and its place in
+// the union is the sum over the lists of their own cells below it (a scan of each list's own flags)
+template<int QG>
+sycl::event union_lists(sycl::queue& q, const int32_t* ids, const int32_t* steps, int64_t cap, int64_t n_q,
+                        int32_t* uids, uint8_t* umasks, int32_t* ucount, int64_t ucap) {
+    constexpr int WG = 256;
+    const int64_t groups = (n_q + QG - 1) / QG, cl = cap + 1;
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int, 1> sc(sycl::range<1>((size_t) (QG * cl)), h);   // own flags, then their scans
+        h.parallel_for(sycl::nd_range<1>((size_t) groups * WG, WG), [=](sycl::nd_item<1> it) {
+            const auto grp = it.get_group();
+            const int64_t gq = (int64_t) it.get_group(0);
+            const int t = (int) it.get_local_id(0);
+            const int32_t* l[QG];
+            int n[QG];
+            for (int j = 0; j < QG; ++j) {
+                const int64_t qi = gq * QG + j;
+                l[j] = ids + qi * cap;
+                n[j] = qi < n_q ? steps[qi * kStepCount + kStepWidth] : 0;
+            }
+            const auto lower = [&](int k, int32_t v) {   // the first place in list k at or above v
+                int lo = 0, hi = n[k];
+                while (lo < hi) {
+                    const int mid = (lo + hi) / 2;
+                    if (l[k][mid] < v) lo = mid + 1; else hi = mid;
+                }
+                return lo;
+            };
+            for (int j = 0; j < QG; ++j)
+                for (int i = t; i < n[j]; i += WG) {
+                    const int32_t v = l[j][i];
+                    bool own = true;
+                    for (int k = 0; k < j; ++k) {
+                        const int p = lower(k, v);
+                        own = own && !(p < n[k] && l[k][p] == v);
+                    }
+                    sc[j * cl + i] = own;
+                }
+            sycl::group_barrier(grp);
+            for (int j = 0; j < QG; ++j) {   // exclusive scan of list j's flags into sc [j, 0 .. n[j]]
+                const int per = (n[j] + WG - 1) / WG, i0 = sycl::min(t * per, n[j]), i1 = sycl::min(i0 + per, n[j]);
+                int sum = 0;
+                for (int i = i0; i < i1; ++i) sum += sc[j * cl + i];
+                int run = sycl::exclusive_scan_over_group(grp, sum, sycl::plus<int>());
+                sycl::group_barrier(grp);
+                for (int i = i0; i < i1; ++i) {
+                    const int f = sc[j * cl + i];
+                    sc[j * cl + i] = run;
+                    run += f;
+                }
+                if (t == WG - 1) sc[j * cl + n[j]] = run;
+                sycl::group_barrier(grp);
+            }
+            int32_t* u = uids + gq * ucap;
+            uint8_t* m = umasks + gq * ucap;
+            for (int j = 0; j < QG; ++j)
+                for (int i = t; i < n[j]; i += WG) {
+                    if (sc[j * cl + i + 1] == sc[j * cl + i]) continue;   // not its own: an earlier list's
+                    const int32_t v = l[j][i];
+                    int at = 0;
+                    uint8_t bits = 0;
+                    for (int k = 0; k < QG; ++k) {
+                        const int p = k == j ? i : lower(k, v);
+                        at += sc[k * cl + p];
+                        if (p < n[k] && l[k][p] == v) bits |= (uint8_t) (1u << k);
+                    }
+                    u[at] = v;
+                    m[at] = bits;
+                }
+            if (t == 0) {
+                int c = 0;
+                for (int k = 0; k < QG; ++k) c += sc[k * cl + n[k]];
+                ucount[gq] = c;
+            }
+        });
     });
 }
 
@@ -1978,6 +2076,35 @@ constexpr int CHUNK = 16;
 static_assert(CHUNK == 16, "the p split gives each lane of a 16-wide sub-group one cell");
 
 
+// 4 query heads a KV head (SenseNova-Loop's QSA, 16 / 4 / 256), FP16 pools, on the portable kernel only: 4 queries a
+// work-group over the union of their selections (union_lists into `scratch`).  False, nothing launched, elsewhere.
+bool batch_gqa4(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+                const QsaShapes& s, float* attn, int64_t n_q, void* scratch, size_t scratch_bytes, void* stream) {
+    constexpr int GH = 4, QG = 4;
+    if (n_q <= 0) return true;
+    auto& queue = core::Runtime::get().stream(stream);
+    const int64_t groups = (n_q + QG - 1) / QG, ucap = QG * cap;
+    const size_t need = (size_t) groups * (size_t) ucap * 5 + (size_t) groups * 4;
+    if (s.head_dim != HD || s.n_head != (int64_t) GH * s.n_head_kv || cap <= 0 || !ids || !steps ||
+        !pools.page_table || !pools.k_pool || !pools.v_pool || pools.k_q || pools.k_q4 || !scratch ||
+        scratch_bytes < need || xmx_available(XmxType::f16))
+        return false;
+    const size_t slm = queue.get_device().get_info<sycl::info::device::local_mem_size>();
+    static core::PerDevice<bool> per_device;
+    const bool mma = per_device.get(queue.get_device(), [&queue, slm] {
+        return xe::mma_shape_is(queue, 16, 16, 16, 32) && slm >= mma_local_bytes() + pm::CH * 4;
+    });
+    if (!mma) return false;
+    auto* uids = static_cast<int32_t*>(scratch);
+    auto* ucount = uids + groups * ucap;
+    auto* umasks = reinterpret_cast<uint8_t*>(ucount + groups);
+    union_lists<QG>(queue, ids, steps, cap, n_q, uids, umasks, ucount, ucap);
+    const sycl::event e = launch_mma<kF16, kF16, GH, QG>(queue, q, pools, uids, ucount, ucap, s.n_head_kv,
+                                                           s.page_size, attn, n_q, umasks);
+    if (!stream) core::Runtime::get().wait(e, "flash_attn_select");
+    return true;
+}
+
 bool batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return true;
@@ -2117,8 +2244,11 @@ bool flash_attn_tuned(const FlashAttnArgs& a, void* stream) {
 }
 
 bool flash_attn_select(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-                       const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
+                       const QsaShapes& s, float* attn, int64_t n_q, void* stream, void* scratch,
+                       size_t scratch_bytes) {
     if (n_q <= 0) return true;
+    if (s.n_head == 4 * s.n_head_kv)
+        return sel::batch_gqa4(q, pools, ids, steps, cap, s, attn, n_q, scratch, scratch_bytes, stream);
     FlashAttnArgs a;
     a.q32 = q;
     a.q_ld = a.out_ld = s.n_head * s.head_dim;
