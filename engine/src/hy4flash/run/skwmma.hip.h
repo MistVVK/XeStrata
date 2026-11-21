@@ -597,16 +597,16 @@ __device__ __forceinline__ void gemm_mainloop_bk(const uint8_t* wr, int nsb, con
     uint2 alo[MTW][PD], ahi[MTW][PD];
 #pragma unroll
     for (int m = 0; m < MTW; ++m) {
-        rlo[m] = (const half_t*)shfl_ptr(xrow[m], g);
-        rhi[m] = (const half_t*)shfl_ptr(xrow[m], g + 8);
+        rlo[m] = (const half_t*)shfl_ptr(xrow[m], g) + c4;
+        rhi[m] = (const half_t*)shfl_ptr(xrow[m], g + 8) + c4;
     }
     if (active) {
 #pragma unroll
         for (int i = 0; i < PD; ++i)
 #pragma unroll
             for (int m = 0; m < MTW; ++m) {
-                alo[m][i] = *(const uint2*)(rlo[m] + i * 16 + c4);
-                ahi[m][i] = *(const uint2*)(rhi[m] + i * 16 + c4);
+                alo[m][i] = *(const uint2*)(rlo[m] + i * 16);
+                ahi[m][i] = *(const uint2*)(rhi[m] + i * 16);
             }
     }
     for (int st = 0; st < nstages; ++st) {
@@ -626,11 +626,13 @@ __device__ __forceinline__ void gemm_mainloop_bk(const uint8_t* wr, int nsb, con
                 uint2 a_lo[MTW], a_hi[MTW];
 #pragma unroll
                 for (int m = 0; m < MTW; ++m) {
-                    a_lo[m] = alo[m][gi & (PD - 1)];
-                    a_hi[m] = ahi[m][gi & (PD - 1)];
+                    a_lo[m] = alo[m][kk & (PD - 1)];
+                    a_hi[m] = ahi[m][kk & (PD - 1)];
+                    // Constant per-kk offset from stage-advanced rlo/rhi avoids signed-32->64 (st*BK)<<1
+                    // induction arithmetic that CUDA 13.0 ptxas mis-schedules on sm_120 in k_moe_gu_gemm<4,1>.
                     if (gi + PD < total) {
-                        alo[m][gi & (PD - 1)] = *(const uint2*)(rlo[m] + (gi + PD) * 16 + c4);
-                        ahi[m][gi & (PD - 1)] = *(const uint2*)(rhi[m] + (gi + PD) * 16 + c4);
+                        alo[m][kk & (PD - 1)] = *(const uint2*)(rlo[m] + (kk + PD) * 16);
+                        ahi[m][kk & (PD - 1)] = *(const uint2*)(rhi[m] + (kk + PD) * 16);
                     }
                 }
 #pragma unroll
@@ -641,6 +643,11 @@ __device__ __forceinline__ void gemm_mainloop_bk(const uint8_t* wr, int nsb, con
 #pragma unroll
                         for (int m = 0; m < MTW; ++m) mma_16816(&acc[m][j].v[s * 4], a_lo[m].x, a_hi[m].x, a_lo[m].y, a_hi[m].y, b.x, b.y);
                     }
+            }
+#pragma unroll
+            for (int m = 0; m < MTW; ++m) {
+                rlo[m] += BK;
+                rhi[m] += BK;
             }
         }
         __syncthreads();

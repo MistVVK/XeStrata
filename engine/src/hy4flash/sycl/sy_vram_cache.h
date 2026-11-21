@@ -37,7 +37,15 @@ constexpr int8_t kS125[32][4] = {
 };
 
 inline int vc_sb_bytes(int code) {
-    return code == 0 ? 48 : code == 2 ? 70 : code == 3 ? 102 : code == 4 ? 134 : code == 5 ? 166 : code == 6 ? 198 : 262;
+    return code == 0 ? 48 : code == 1 ? 58 : code == 2 ? 70 : code == 3 ? 102 : code == 4 ? 134 : code == 5 ? 166 : code == 6 ? 198 : 262;
+}
+
+inline int vc_s15_trit(uint32_t b, int d) {
+    if (b >= 243u) return 0;
+    const uint32_t m = d == 0 ? 65536u : d == 1 ? 21846u : d == 2 ? 7282u : d == 3 ? 2428u : 810u;
+    const uint32_t x = (b * m) >> 16;
+    const uint32_t x3 = (x * 21846u) >> 16;
+    return (int)(x - 3u * x3) - 1;
 }
 
 // Dot product of 1 S_K row (K = 1536 = 6 superblocks) with fp32/fp16 or Q8_1_G64-quantized activation vector using 1 SG32 sub-group.
@@ -112,6 +120,13 @@ inline float sg_dot_row(const sycl::nd_item<1>& it, int code, const uint8_t* rp,
             sq = (float)kS125[i0][0] * xv[0] + (float)kS125[i0][1] * xv[1] + (float)kS125[i0][2] * xv[2] + (float)kS125[i0][3] * xv[3] +
                  (float)kS125[i1][0] * xv[4] + (float)kS125[i1][1] * xv[5] + (float)kS125[i1][2] * xv[6] + (float)kS125[i1][3] * xv[7];
             acc += effx * fine * sq;
+        } else if (code == 1) {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int idx = base_i + k;
+                sq += (float)vc_s15_trit(pl[idx / 5], idx % 5) * xv[k];
+            }
+            acc += effx * sq;
         } else if (code == 5) {
             const uint8_t* p = pl + (base_i >> 1);
             const uint32_t hi = pl[128 + (base_i >> 3)];
@@ -124,6 +139,20 @@ inline float sg_dot_row(const sycl::nd_item<1>& it, int code, const uint8_t* rp,
                 sx += xv[2 * k] + xv[2 * k + 1];
             }
             acc += effx * (sq - 15.5f * sx);
+        } else if (code == 6) {
+            const uint8_t* p = pl + (base_i >> 1);
+            const uint32_t h0 = pl[128 + (base_i >> 2)];
+            const uint32_t h1 = pl[128 + (base_i >> 2) + 1];
+            const uint32_t h16 = h0 | (h1 << 8);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint8_t by = p[k];
+                const uint32_t q0 = (by & 15u) | (((h16 >> (4 * k)) & 3u) << 4);
+                const uint32_t q1 = (by >> 4) | (((h16 >> (4 * k + 2)) & 3u) << 4);
+                sq += (float)q0 * xv[2 * k] + (float)q1 * xv[2 * k + 1];
+                sx += xv[2 * k] + xv[2 * k + 1];
+            }
+            acc += effx * (sq - 31.5f * sx);
         } else {
 #pragma unroll
             for (int k = 0; k < 8; ++k) sq += (float)(int8_t)pl[base_i + k] * xv[k];

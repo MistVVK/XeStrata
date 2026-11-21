@@ -410,6 +410,7 @@ __global__ void k_router_topk(const float* __restrict__ logits, const float* __r
             float b2 = rv[0]; int i2 = ri[0];
             for (int q = 1; q < (int)(blockDim.x >> 5); ++q)
                 if (rv[q] > b2 || (rv[q] == b2 && ri[q] < i2)) { b2 = rv[q]; i2 = ri[q]; }
+            if ((unsigned)i2 >= (unsigned)E) i2 = 0;
             chosen[k] = i2;
             ss[i2] = -3.0e38f;
         }
@@ -530,6 +531,7 @@ __global__ void __launch_bounds__(32) k_router_topk_w32(const float* __restrict_
             const int oi = __shfl_xor(bi, o);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
+        if ((unsigned)bi >= 512u) bi = 0;
         const int win_lane = bi & 31, win_j = bi >> 5;
         float wp = 0.f;
         if (lane == win_lane) {
