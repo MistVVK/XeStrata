@@ -24,6 +24,7 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/dense_i8_tc.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -3561,6 +3562,14 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
+    // Clean-room MIT INT8 Tensor Core path (sm_80+: RTX 3090 & RTX 5090):
+    // Beats scalar __dp4a native_mmvq by 1.3x-2.1x at T=6..8 and 3.1x-9.8x at T=9..16 with ~2e-7 exact parity.
+    if (n_out >= 1024 && ncols <= 16 && dense_i8_tc_type_ok(ggml_type) && dense_i8_tc_decode_enabled()) {
+        const int tc_min_t = (ggml_type == 8) ? 9 : (ggml_type == 14 ? 5 : 6);
+        if (ncols >= tc_min_t && dense_i8_tc_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream)) {
+            return;
+        }
+    }
     // more columns than one launch takes: ceil(ncols / MAX_NCOLS) passes over the same weights.  Every column of a
     // multi-column pass is bitwise the single-column result (bench/micro/native_mmvq_multi.cpp), so the split changes no
     // arithmetic.  Column j starts at activation block j * (n_in / Q8K) and writes y + j * n_out.  (Never reached by a
@@ -3963,6 +3972,11 @@ bool il_arch_ok() {
 
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
     if (ncols < 1 || ncols > 8 || !g_multi_exact || !il_arch_ok()) return false;
+    // Yield to clean-room INT8 Tensor Core GEMM where it beats interleaved scalar __dp4a.
+    if (n_out >= 1024 && dense_i8_tc_type_ok(ggml_type) && dense_i8_tc_decode_enabled()) {
+        const int tc_min_t = (ggml_type == 8) ? 9 : (ggml_type == 14 ? 5 : 6);
+        if (ncols >= tc_min_t) return false;
+    }
     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
            (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 11);
 }

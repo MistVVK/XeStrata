@@ -606,6 +606,8 @@ private:
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
     bool device_hits_ = false;            ///< STRATA_VERIFY_DEVICE_HITS: partial-VRAM hit groups planned on the device
     bool no_pcie_share_ = false;          ///< set_no_pcie_share: --pcie-frac 0 without dynamic PCIe staging
+    bool head_bitplane_used_ = false;     ///< captured graph ran vhead_bitplane_argmax directly into m_out_ (head_logits_ lazy)
+    void ensure_head_logits(int T);       ///< materialize full head_logits_ from head_mixed_ on demand when head_bitplane_used_
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device

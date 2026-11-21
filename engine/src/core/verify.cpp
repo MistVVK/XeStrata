@@ -53,6 +53,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/vhead_bitplane.hpp"
 #include "strata/core/dispatch_stats.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
@@ -2776,10 +2777,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // kFusedGrMaxT columns a launch: a longer window (--lookup-max-t) runs them in chunks of that many columns (one
     // chunk - the same launches as before - for every window up to kFusedGrMaxT tokens)
     stamp(g.n_layers, 0, 0);
+    head_bitplane_used_ = false;
     {
         const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
+        static const bool logits_dump = std::getenv("STRATA_LOGITS_DUMP") != nullptr;
+        const bool use_bitplane = head_ != nullptr && head_->loaded() && head_->bitplane() != nullptr &&
+                                  T <= 16 && !nan_guard_on() && !logits_dump;
       for (int h0 = 0; h0 < T; h0 += kFusedGrMaxT) {
         const int HT = std::min(T - h0, kFusedGrMaxT);   // this chunk's columns: h0 .. h0 + HT
         // S25 (STRATA_HC_Q8=1): the final mixer from the GGUF's Q8_0 projections too, through the same multi read
@@ -2857,12 +2862,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
                 if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
-                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
+                if (use_bitplane && strata::kernels::vhead_bitplane_argmax(head_->bitplane(), xq_, HT, m_out_ + h0, cs)) {
+                    head_bitplane_used_ = true;
+                } else if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
                     if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, hl, (int) N,
                                                     (int) n_vocab_, (int) HT, cs);
-                } else
-                native_mmvq(head_->type(), head_->weights(), xq_, hl, (int) N, (int) n_vocab_, HT, cs);
+                } else {
+                    native_mmvq(head_->type(), head_->weights(), xq_, hl, (int) N, (int) n_vocab_, HT, cs);
+                }
             } catch (const std::exception& e) {
                 err = std::string("verify head: ") + e.what();
                 return false;
@@ -2872,16 +2880,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
-        if (argmax_rows_wanted()) {   // sm_80 to sm_89 (sm_7x opt-in): the pick over many blocks a row (bitwise the one-block kernel's)
-            argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
-        } else {
-            SamplerParams sp;
-            sp.greedy = true;
-            sp.temperature = 0.0f;
-            sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+        if (!head_bitplane_used_) {
+            if (argmax_rows_wanted()) {   // sm_80 to sm_89 (sm_7x opt-in): the pick over many blocks a row (bitwise the one-block kernel's)
+                argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
+            } else {
+                SamplerParams sp;
+                sp.greedy = true;
+                sp.temperature = 0.0f;
+                sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+            }
+            // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
+            if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
         }
-        // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
-        if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
     stamp(g.n_layers, 1, 0);
     if (tap_on_ && !batch_rec_ && tap_file_ != nullptr && !tap_split_) copy_from_mapped(m_tap_, tap_dev_, (int64_t) T * (int64_t) tap_layers_.size() * N, cs);
@@ -3907,6 +3917,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
+        ensure_head_logits(T);
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
@@ -4103,6 +4114,20 @@ void Verifier::publish_plan(void* ctx) {
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
+void Verifier::ensure_head_logits(int T) {
+    if (!head_bitplane_used_ || head_ == nullptr || !head_->loaded() || head_mixed_ == nullptr || head_logits_ == nullptr)
+        return;
+    const int64_t N = g_->n_embd;
+    for (int h0 = 0; h0 < T; h0 += strata::kernels::kFusedGrMaxT) {
+        const int HT = std::min(T - h0, strata::kernels::kFusedGrMaxT);
+        strata::kernels::native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs_);
+        strata::kernels::native_mmvq(head_->type(), head_->weights(), xq_,
+                                     head_logits_ + (size_t) h0 * (size_t) n_vocab_,
+                                     (int) N, (int) n_vocab_, HT, cs_);
+    }
+    head_bitplane_used_ = false;
+}
+
 bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
                                std::string& err) {
     if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
@@ -4123,6 +4148,10 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     if (head_logits_ == nullptr || n_vocab_ <= 0 || T <= 0 || targets == nullptr || out == nullptr) {
         err = "window_logprobs: no head logits for this window";
         return false;
+    }
+    if (head_bitplane_used_) {
+        ensure_head_logits(T);
+        (void) cudaStreamSynchronize(cs_);
     }
     // run() synchronized cs_ before returning, so the head of this window is complete
     std::vector<float> h((size_t) T * (size_t) n_vocab_);

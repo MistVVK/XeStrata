@@ -5,6 +5,10 @@
 #include <string>
 #include <vector>
 
+namespace strata::kernels {
+struct BitplaneHeadHandle;
+}
+
 namespace strata::core {
 
 /// Opt-in native output projection. Uploads unchanged GGUF blocks once at startup and owns its
@@ -36,11 +40,14 @@ public:
     int device() const { return device_; }
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
+    /// Exact 2-stage bit-plane LM head handle (Q8_0 / Q6_K on sm_80+; nullptr if unavailable or disabled).
+    strata::kernels::BitplaneHeadHandle* bitplane() const { return bitplane_; }
 
 private:
     void* weights_ = nullptr;
     void* host_ = nullptr;   // the pinned host buffer weights_ aliases when the head did not fit in VRAM
     void* scratch_ = nullptr;
+    strata::kernels::BitplaneHeadHandle* bitplane_ = nullptr;
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
