@@ -404,10 +404,10 @@ template<int RT, int RO>
 static void launch_gemm_rows(sycl::queue& q, const float* x, int64_t ldx, const float* w, float* y, int64_t ldy,
                              int64_t n_in, int64_t n_out, int64_t n_tok) {
     constexpr int TS = 16;
-    const size_t gt = (size_t) ((n_tok + TS * RT - 1) / (TS * RT)) * TS;
-    const size_t go = (size_t) ((n_out + TS * RO - 1) / (TS * RO)) * TS;
+    const size_t gt = (size_t) ((n_tok + (int64_t) TS * RT - 1) / ((int64_t) TS * RT)) * TS;
+    const size_t go = (size_t) ((n_out + (int64_t) TS * RO - 1) / ((int64_t) TS * RO)) * TS;
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 2> xs(sycl::range<2>(TS * RT, TS + 1), h), ws(sycl::range<2>(TS * RO, TS + 1), h);
+        sycl::local_accessor<float, 2> xs(sycl::range<2>((size_t) TS * RT, TS + 1), h), ws(sycl::range<2>((size_t) TS * RO, TS + 1), h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>(gt, go), sycl::range<2>(TS, TS)), [=](sycl::nd_item<2> it) {
             const int li = (int) it.get_local_id(0), lj = (int) it.get_local_id(1);
             const int64_t t0 = (int64_t) it.get_group(0) * TS * RT, o0 = (int64_t) it.get_group(1) * TS * RO;
@@ -415,11 +415,11 @@ static void launch_gemm_rows(sycl::queue& q, const float* x, int64_t ldx, const 
             for (int64_t k0 = 0; k0 < n_in; k0 += TS) {
                 const int64_t k = k0 + lj;
                 for (int r = 0; r < RT; ++r) {
-                    const int64_t t = t0 + li + TS * r;
+                    const int64_t t = t0 + li + (int64_t) TS * r;
                     xs[li + TS * r][lj] = t < n_tok && k < n_in ? x[t * ldx + k] : 0.0f;
                 }
                 for (int r = 0; r < RO; ++r) {
-                    const int64_t o = o0 + li + TS * r;
+                    const int64_t o = o0 + li + (int64_t) TS * r;
                     ws[li + TS * r][lj] = o < n_out && k < n_in ? w[o * n_in + k] : 0.0f;
                 }
                 sycl::group_barrier(it.get_group());
@@ -434,7 +434,7 @@ static void launch_gemm_rows(sycl::queue& q, const float* x, int64_t ldx, const 
             }
             for (int a = 0; a < RT; ++a)
                 for (int c = 0; c < RO; ++c) {
-                    const int64_t t = t0 + li + TS * a, o = o0 + lj + TS * c;
+                    const int64_t t = t0 + li + (int64_t) TS * a, o = o0 + lj + (int64_t) TS * c;
                     if (t < n_tok && o < n_out) y[t * ldy + o] = acc[a][c];
                 }
         });

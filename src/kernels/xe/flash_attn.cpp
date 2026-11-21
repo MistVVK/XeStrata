@@ -2092,7 +2092,7 @@ bool batch_gqa4(const float* q, const QsaAttnPools& pools, const int32_t* ids, c
     const size_t slm = queue.get_device().get_info<sycl::info::device::local_mem_size>();
     static core::PerDevice<bool> per_device;
     const bool mma = per_device.get(queue.get_device(), [&queue, slm] {
-        return xe::mma_shape_is(queue, 16, 16, 16, 32) && slm >= mma_local_bytes() + pm::CH * 4;
+        return xe::mma_shape_is(queue, 16, 16, 16, 32) && slm >= mma_local_bytes() + (size_t) pm::CH * 4;
     });
     if (!mma) return false;
     auto* uids = static_cast<int32_t*>(scratch);
