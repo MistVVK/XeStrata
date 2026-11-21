@@ -3166,7 +3166,7 @@ void bih3_r1q2_prompt(const Bih3R1q2Layer& layer, const uint8_t* blob, int gate_
     });
     Bih3R1q2Layer one = layer;
     one.n_expert = 1; one.k_pairs = k; one.route_ids = route;
-    bih3_r1q2_grouped(one, ptr, start, groups, dst, token_rows, 1, rows <= kBih3DirectRows ? rows : cap, x_q8_1,
+    bih3_r1q2_grouped(one, ptr, start, groups, dst, token_rows, 1, rows, x_q8_1,
                       scratch, out, stream);
 }
 
