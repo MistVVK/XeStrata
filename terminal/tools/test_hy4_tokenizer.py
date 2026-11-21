@@ -195,7 +195,9 @@ class RealTemplate(unittest.TestCase):
 
     def test_a_bad_effort_is_a_template_error(self):
         with self.assertRaises(Exception):
-            self.tpl.render([{"role": "user", "content": "x"}], reasoning_effort="medium")
+            self.tpl.template.render(messages=[{"role": "user", "content": "x"}], reasoning_effort="medium")
+        out = self.tpl.render([{"role": "user", "content": "x"}], reasoning_effort="medium")
+        self.assertIn("reasoning_effort:high", out)
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ class Default(unittest.TestCase):
 
     def test_the_server_decides_it_after_the_picture_reader_is_known(self):
         src = (ROOT / "serve" / "server.py").read_text(encoding="utf-8")
-        at = src.index('hub.settings["image_results"] = resolve_image_results(hub.settings, svc.vision is not None)')
+        at = src.index('hub.settings["image_results"] = resolve_image_results(hub.settings, svc.has_vision())')
         self.assertLess(at, src.index('if hub.settings["image_results"]:\n            hub.media_dir'))
         self.assertLess(src.index("svc = Service(engine, tok"), at)
 
