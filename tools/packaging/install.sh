@@ -87,6 +87,9 @@ main() {
           AMD:7550) printf '%s\n' "AMD Radeon RX 9070 series" ;;
           AMD:7551) printf '%s\n' "AMD Radeon AI PRO R9700" ;;
           AMD:7590) printf '%s\n' "AMD Radeon RX 9060 XT" ;;
+          AMD:1586) printf '%s\n' "AMD Radeon 8060S (Strix Halo)" ;;
+          AMD:150e) printf '%s\n' "AMD Radeon 890M / 880M (Strix Point)" ;;
+          AMD:15bf|AMD:15c8|AMD:1900|AMD:1901) printf '%s\n' "AMD Radeon 780M" ;;
           *) printf '%s\n' "$maker graphics card (PCI device $id)" ;;
         esac ;;
       *"["*"]"*)     # the product name in brackets ("Navi 48 [Radeon RX 9070/9070 XT]", "DG2 [Arc A750]") is the name a person knows

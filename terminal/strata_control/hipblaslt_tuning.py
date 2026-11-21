@@ -33,7 +33,7 @@ SWITCH = "STRATA_HIPBLASLT_TABLE"            # on | auto | off
 AUTO_USES_TABLE = False
 #: The owner's decision (2026-10-19): "auto" uses the table on these architectures only. gfx1151 (Strix Halo): a community A/B measured
 #: 251 -> 529 prompt tok/s (2.11x) with the table; on gfx1201 the gain was ~1% and decode lost ~2% (notes-021-hip.md), so it stays opt-in there.
-AUTO_ARCHS = ("gfx1151",)
+AUTO_ARCHS = ("gfx1151", "gfx1150", "gfx1103")
 ENGINE_VAR = "STRATA_HIPBLASLT_TUNING"       # what the engine reads: the path of one table
 TABLE_DIR = "tuning"                         # inside an engine package
 HEADER = "STRATA_HIPBLASLT_TUNING_V1"

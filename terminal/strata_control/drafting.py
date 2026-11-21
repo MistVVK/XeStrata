@@ -54,6 +54,8 @@ DRAFTER_GB = {name: int(mib / 10 + 0.5) / 100 for name, mib in DRAFTER_MIB.items
 #: GPU architecture (what nvidia-smi's compute capability and the kernel driver report) -> card class
 ARCH_CLASS = (
     (re.compile(r"^gfx1151$"), "strix_halo"),
+    (re.compile(r"^gfx1150$"), "strix_point"),
+    (re.compile(r"^gfx1103$"), "radeon_780m"),
     (re.compile(r"^gfx120[01]$"), "rdna4"),
     (re.compile(r"^sm_12\d$"), "blackwell"),
     (re.compile(r"^sm_86$"), "ampere"),

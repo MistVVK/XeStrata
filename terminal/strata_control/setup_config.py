@@ -363,7 +363,7 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
             args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
         ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert cache takes "
            "that much less)")
-    elif hip and WIN and gpu.get("uma") and gfx_arch_is(gpu.get("arch"), "gfx1151") and not multi and "--vram-reserve-mib" not in args:
+    elif hip and WIN and gpu.get("uma") and any(gfx_arch_is(gpu.get("arch"), a) for a in ("gfx1151", "gfx1150", "gfx1103")) and not multi and "--vram-reserve-mib" not in args:
         # G16 (Q4-P8, 2026-11-08): a Windows Strix Halo config with no reserve at all (pictures off, or a model with no picture reader) never started
         # UD-Q4_K_XL: with no --vram-reserve-mib the engine puts its Windows floor of 2560 MiB on any card of 15 GiB or more (made for a 20 GB discrete
         # card that paged, #1376), and on this shared pool that room is taken straight back by the RAM budget's page-locked complement, so the prompt
@@ -454,6 +454,8 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
             # them and turning the opt-in off takes them out again.
             cfg.setdefault("env", {}).update(GFX1103_SWITCHES)
         if GFX1150_OPT_IN and gfx_arch_is(gpu["arch"], "gfx1150"):
+            if not WIN:
+                cfg.setdefault("env", {})["STRATA_NO_ARENA_THP"] = "1"
             # the exact gfx1151 speed switches measured on this chip (GFX1150_SWITCHES): the engine has no arch defaults
             # for gfx1150, so setup writes them into the config.  They are setup's own (SETUP_ENV), so a re-run refreshes
             # them and turning the opt-in off takes them out again.

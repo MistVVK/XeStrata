@@ -18,7 +18,7 @@
 #   --release-tag TAG    the release, for example v0.2.7; the image version is the tag without the leading v
 #   --source DIR|URL     use this folder or URL (with strata-feed.json, its .sig and the archives) instead of the GitHub release
 #   --version V          image version (default: the tag without v)
-#   --flavors LIST       comma separated (default: all that the release has: cuda13 cuda12 rocm-gfx120x rocm-gfx110x rocm-gfx1151 sycl)
+#   --flavors LIST       comma separated (default: all that the release has: cuda13 cuda12 rocm-gfx120x rocm-gfx110x rocm-gfx1151 rocm-igpu sycl)
 #   --image NAME         image repository (default ghcr.io/niko1221/strata)
 #   --work DIR           where packages are unpacked (default a temporary folder, removed at the end)
 #   --push               push the images (default: build only)
@@ -62,7 +62,7 @@ trap cleanup EXIT
 
 built=""
 # one flavor at a time: the package is deleted after its image is built, so the disk never holds more than one
-flavor_list=${flavors:-cuda13,cuda12,rocm-gfx120x,rocm-gfx110x,rocm-gfx1151,sycl}
+flavor_list=${flavors:-cuda13,cuda12,rocm-gfx120x,rocm-gfx110x,rocm-gfx1151,rocm-igpu,sycl}
 for flavor in $(echo "$flavor_list" | tr ',' ' '); do
   echo "=== $flavor"
   src_arg="--release-tag $tag"; [ -n "$source" ] && src_arg="--source $source"

@@ -700,8 +700,11 @@ WIN_AMD_DEVICE_ARCH = {0x744C: "gfx1100", 0x7448: "gfx1100", 0x745E: "gfx1100", 
                        0x7590: "gfx1200", 0x7550: "gfx1201", 0x7551: "gfx1201",
                        0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030", 0x73A1: "gfx1030", 0x73DF: "gfx1031",
                        0x73FF: "gfx1032", 0x73EF: "gfx1032", 0x73E3: "gfx1032"}
-WIN_AMD_UMA_IDS = {0x1586: "gfx1151"}                                   # Strix Halo: unified memory, supported
-WIN_AMD_IGPU_IDS = {0x150E, 0x1114, 0x1902, 0x15BF, 0x15C8, 0x164F, 0x1900, 0x1901, 0x1681, 0x1638, 0x1636, 0x15D8, 0x15E7}
+WIN_AMD_UMA_IDS = {0x1586: "gfx1151",                                   # Strix Halo (8060S/8050S/8040S): unified memory, supported
+                   0x150E: "gfx1150",                                   # Strix Point (890M/880M): unified memory, supported
+                   0x15BF: "gfx1103", 0x15C8: "gfx1103", 0x164F: "gfx1103",  # Phoenix (780M/760M/740M): unified memory, supported
+                   0x1900: "gfx1103", 0x1901: "gfx1103"}                # Hawk Point (780M/760M): unified memory, supported
+WIN_AMD_IGPU_IDS = {0x1114, 0x1902, 0x164E, 0x1681, 0x1638, 0x1636, 0x15D8, 0x15E7}
 _WIN_DISPLAY_CLASS = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
 
 
@@ -842,23 +845,33 @@ def _windows_display_adapters_registry() -> list[dict]:
 
 
 def windows_amd_cards(adapters: list[dict] | None = None) -> list[dict]:
-    """The AMD graphics cards (not an integrated Radeon) among the Windows display adapters, each with the architecture Strata
-    runs it as ("" when the id is not in the table but the adapter has 3 GB or more of its own memory, so it is no APU)."""
-    cards = []
+    """The AMD graphics devices Strata supports among the Windows display adapters. Discrete Radeon cards always take
+    precedence over integrated UMA APUs when both are present; when only a supported UMA APU (Strix Halo gfx1151,
+    Strix Point 890M/880M gfx1150, or Radeon 780M/760M/740M gfx1103) is present, it is returned."""
+    discrete = []
+    uma = []
     for adapter in (windows_display_adapters() if adapters is None else adapters):
         if adapter.get("vendor") != "1002":
             continue
         device = adapter.get("device")
-        arch = WIN_AMD_DEVICE_ARCH.get(device) or WIN_AMD_UMA_IDS.get(device) or ""
-        if not arch and device not in WIN_AMD_IGPU_IDS:
+        d_arch = WIN_AMD_DEVICE_ARCH.get(device) or ""
+        u_arch = WIN_AMD_UMA_IDS.get(device) or ""
+        if d_arch:
+            discrete.append({"arch": d_arch, "name": adapter.get("name", ""), "device": device})
+            continue
+        if u_arch:
+            uma.append({"arch": u_arch, "name": adapter.get("name", ""), "device": device})
+            continue
+        if device not in WIN_AMD_IGPU_IDS:
             guess = gfx_from_name(adapter.get("name", ""))              # a card whose id is not in the table: its name says
-            if guess in ("gfx1103", "gfx1150", "gfx1152"):               # (those are integrated Radeons)
+            if guess in ("gfx1151", "gfx1150", "gfx1103"):
+                uma.append({"arch": guess, "name": adapter.get("name", ""), "device": device})
                 continue
-            arch = guess
-        if not arch and (device in WIN_AMD_IGPU_IDS or float(adapter.get("vram_gb") or 0) < 3.0):
-            continue                                                    # an integrated Radeon (512 MB of carve-out)
-        cards.append({"arch": arch, "name": adapter.get("name", ""), "device": device})
-    return cards
+            if guess == "gfx1152":                                      # Krackan Point: still unvalidated
+                continue
+            if guess or float(adapter.get("vram_gb") or 0) >= 3.0:
+                discrete.append({"arch": guess, "name": adapter.get("name", ""), "device": device})
+    return discrete if discrete else uma
 
 
 def _windows_vendor_backend(adapters: list[dict] | None = None) -> str | None:
@@ -938,7 +951,10 @@ def hip_archs_from_pci(drm_root: str = "/sys/class/drm", lspci: bool = True) -> 
                             ids.append(int(found.group(1), 16))
             except (OSError, subprocess.SubprocessError):
                 pass
-    return sorted({WIN_AMD_DEVICE_ARCH.get(i) or WIN_AMD_UMA_IDS.get(i) or "" for i in ids} - {""})
+    discrete = sorted({WIN_AMD_DEVICE_ARCH[i] for i in ids if i in WIN_AMD_DEVICE_ARCH})
+    if discrete:
+        return discrete
+    return sorted({WIN_AMD_UMA_IDS[i] for i in ids if i in WIN_AMD_UMA_IDS})
 
 
 _SMI_CACHE: dict = {}
@@ -1065,7 +1081,7 @@ def driver_notice(have: str | None, need: str) -> str:
 
 #: The AMD card families a person knows by the box they bought, for the one plain line when a build is for another family.
 HIP_FAMILIES = (("RX 9000", ("gfx1200", "gfx1201")), ("RX 7000", ("gfx1100", "gfx1101", "gfx1102")), ("RX 6000", ("gfx1030", "gfx1031", "gfx1032")),
-                ("Ryzen AI Max", ("gfx1151",)))
+                ("Ryzen AI Max", ("gfx1151",)), ("Ryzen AI 300", ("gfx1150",)), ("Radeon 780M", ("gfx1103",)))
 
 
 def hip_family(arch: str) -> str:

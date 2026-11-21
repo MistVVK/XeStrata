@@ -105,8 +105,9 @@ class ExactArch(unittest.TestCase):
         self.assertIn("gfx1151", setup.AMD_ARCHS)
         self.assertIn("gfx1151", setup.ROCM_INDEXES)
         self.assertTrue(setup.ROCM_INDEXES["gfx1151"].endswith("/gfx1151/"))
-        for a in ("gfx1150", "gfx1152", "gfx1103"):                                  # never supported by accident
-            self.assertNotIn(a, setup.AMD_ARCHS)
+        for a in ("gfx1150", "gfx1103"):                                             # first-class supported UMA APUs
+            self.assertIn(a, setup.AMD_ARCHS)
+        self.assertNotIn("gfx1152", setup.AMD_ARCHS)                                 # Krackan: never supported by accident
         self.assertIn("docs/STRIX_HALO.md", setup.AMD_CARDS)
 
 # gfx1151 arch defaults that setup does not copy to gfx1103 / gfx1150: HCD_EXACT copies the gfx1151 hipBLASLt table's
@@ -261,9 +262,9 @@ class OtherChips(LinuxBase):
     def test_strix_point(self):
         g = self.one(110500, 0x150E, 512 << 20, 60 * GIB)
         self.assertEqual(g["arch"], "gfx1150")
-        self.assertFalse(setup.is_strix_halo(g) or g.get("uma"))
-        self.assertIn("gfx1150", setup.amd_problem(g))
-        self.assertIn("not Strix Halo", setup.amd_problem(g))
+        self.assertFalse(setup.is_strix_halo(g))
+        self.assertTrue(g.get("uma"))
+        self.assertIsNone(setup.amd_problem(g))
         self.assertIn("890M", g["name"])
 
     def test_krackan(self):
@@ -276,8 +277,9 @@ class OtherChips(LinuxBase):
     def test_phoenix_hawk_point(self):
         g = self.one(110003, 0x15BF, 512 << 20, 30 * GIB)
         self.assertEqual(g["arch"], "gfx1103")
-        self.assertFalse(g.get("uma"))
-        self.assertIn("gfx1103", setup.amd_problem(g))
+        self.assertFalse(setup.is_strix_halo(g))
+        self.assertTrue(g.get("uma"))
+        self.assertIsNone(setup.amd_problem(g))
         self.assertIn("780M", g["name"])
 
     def test_discrete_cards(self):
@@ -315,8 +317,9 @@ class DualGpu(LinuxBase):
         fake_gpu(self.root, 2, 110501, 80, 129, 0x1586, 2 * GIB, 112 * GIB)
         g = setup.amd_gpus(str(self.root))
         self.assertEqual([x["arch"] for x in g], ["gfx1150", "gfx1151"])
-        self.assertEqual([bool(setup.amd_problem(x)) for x in g], [True, False])
-        self.assertEqual([bool(x.get("uma")) for x in g], [False, True])
+        self.assertEqual([bool(setup.amd_problem(x)) for x in g], [False, False])
+        self.assertEqual([bool(x.get("uma")) for x in g], [True, True])
+        self.assertEqual([setup.is_strix_halo(x) for x in g], [False, True])
         usable = [x for x in g if setup.amd_problem(x) is None]
         self.assertEqual(min(usable, key=setup.amd_rank)["index"], 1)
 
@@ -366,14 +369,14 @@ class WindowsDetection(unittest.TestCase):
         self.assertEqual(min(g, key=setup.amd_rank)["arch"], "gfx1100")
 
     def test_other_integrated_radeons(self):
-        for did, name, arch in ((0x150E, "AMD Radeon(TM) 890M Graphics", "gfx1150"),
-                                (0x1114, "AMD Radeon(TM) 860M Graphics", "gfx1152"),
-                                (0x15BF, "AMD Radeon(TM) 780M Graphics", "gfx1103")):
+        for did, name, arch, supported in ((0x150E, "AMD Radeon(TM) 890M Graphics", "gfx1150", True),
+                                           (0x1114, "AMD Radeon(TM) 860M Graphics", "gfx1152", False),
+                                           (0x15BF, "AMD Radeon(TM) 780M Graphics", "gfx1103", True)):
             ad = [{"name": name, "pnp": rf"PCI\VEN_1002&DEV_{did:04X}&REV_C1\4&2", "ram": 512 << 20}]
             g = setup.amd_gpus_windows(ad, [])[0]
             self.assertEqual(g["arch"], arch)
-            self.assertFalse(g.get("uma"))
-            self.assertIsNotNone(setup.amd_problem(g))
+            self.assertEqual(bool(g.get("uma")), supported)
+            self.assertEqual(setup.amd_problem(g) is None, supported)
 
     def test_hip_listing_of_strix_halo(self):
         """Once the HIP engine is installed the cards are numbered as HIP lists them; the carve-out still comes from the
@@ -543,8 +546,12 @@ class IgpuTextIsArchExact(unittest.TestCase):
         self.assertNotIn("gfx1103", text)
 
     def test_other_chips_get_nothing(self):
-        for a in ("gfx1150", "gfx1152", "gfx1100", "gfx1201"):
+        for a in ("gfx1152", "gfx1100", "gfx1201"):
             self.assertEqual(setup.igpu_notes(self.gpu(a, "x"), 64.0), [])
+        strix_pt = chr(10).join(setup.igpu_notes(self.gpu("gfx1150", "AMD Radeon 890M Graphics"), 64.0))
+        self.assertIn("gfx1150", strix_pt)
+        self.assertIn("890M", strix_pt)
+        self.assertNotIn("gfx1151", strix_pt)
 
     def test_no_strix_halo_model_recommendation_for_gfx1103(self):
         g = self.gpu("gfx1103", "AMD Radeon 780M Graphics")
