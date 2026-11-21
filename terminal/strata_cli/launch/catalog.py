@@ -762,3 +762,28 @@ class Catalog:
 
     def disk_free(self, path: str | os.PathLike) -> float | None:
         return self.strata.disk_free(Path(path))
+
+    def inkling_source_info(self, path_or_repo: str | os.PathLike) -> dict[str, Any]:
+        """Inspect a local .strata/.gguf/HF safetensors path or community Inkling-2-Mini HF repo.
+
+        Official Strata .strata builds (SQ-20 / SQ-15 / SQ-10 + Vision) remain the default recommendation;
+        this helper exposes local-file and community HF import metadata for TUI/GUI/CLI callers.
+        """
+        s = self.strata.setup_module()
+        raw = str(path_or_repo).strip()
+        sources = dict(getattr(s, "INKLING_COMMUNITY_SOURCES", {}) or {}) if s is not None else {}
+        if raw in sources:
+            return {"kind": "hf_repo", "recommended_default": False, **sources[raw]}
+        for info in sources.values():
+            if info.get("repo") == raw:
+                return {"kind": "hf_repo", "recommended_default": False, **info}
+        fmt = "unknown"
+        if s is not None and hasattr(s, "detect_inkling_source_format"):
+            fmt = s.detect_inkling_source_format(raw)
+        return {
+            "kind": "local",
+            "path": raw,
+            "format": fmt,
+            "recommended_default": fmt == "strata",
+            "community_sources": sources,
+        }

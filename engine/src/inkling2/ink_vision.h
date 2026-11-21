@@ -14,6 +14,7 @@
 
 #include "ink_batch.h"
 #include "ink_json.h"
+#include "ink_safetensors_loader.h"
 #include "strata/artifact/strata_reader.hpp"
 
 #ifdef INKLING_DEFINE_STBI
@@ -53,6 +54,7 @@ struct VitTensor {
     std::vector<int64_t> shape;
     uint64_t off = 0;
     uint64_t bytes = 0;
+    std::string shard_path;  // populated for HF safetensors vision sources
 };
 
 struct VisionShardInfo {
@@ -61,6 +63,7 @@ struct VisionShardInfo {
     uint64_t sec1_off = 0;
     uint64_t sec1_len = 0;
     std::string path;
+    bool is_safetensors = false;
 
     const VitTensor* find(const std::string& n) const {
         auto it = T.find(n);
@@ -94,8 +97,116 @@ inline std::string pct_decode(const std::string& s) {
     return o;
 }
 
-// Probe Inkling-2-Mini-Vision.strata without loading weights into RAM/VRAM
+// Probe Inkling-2-Mini-Vision.strata OR HF safetensors (model.visual.*) without loading weights into RAM/VRAM
 inline bool vision_probe(const std::string& path, VisionShardInfo& vi, std::string& err) {
+    vi = VisionShardInfo{};
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const bool is_st = fs::is_directory(path, ec) ||
+            (path.size() >= 12 && path.substr(path.size() - 12) == ".safetensors") ||
+            (path.size() >= 29 && path.substr(path.size() - 29) == "model.safetensors.index.json");
+        if (is_st) {
+            std::string base_dir = path;
+            std::vector<std::string> shards;
+            if (fs::is_directory(path, ec)) {
+                fs::path idx_p = fs::path(path) / "model.safetensors.index.json";
+                if (fs::is_regular_file(idx_p, ec)) {
+                    std::string txt;
+                    if (detail::read_file_text(idx_p.string(), txt)) {
+                        try {
+                            JVal j = json_parse(txt);
+                            if (const JVal* wm = j.get("weight_map")) {
+                                std::unordered_map<std::string, bool> seen;
+                                for (const auto& kv : wm->o) {
+                                    if (kv.first.rfind("model.visual.", 0) == 0 && kv.second.t == JVal::STR) {
+                                        std::string sp = (fs::path(path) / kv.second.s).string();
+                                        if (!seen[sp]) { seen[sp] = true; shards.push_back(sp); }
+                                    }
+                                }
+                            }
+                        } catch (...) {}
+                    }
+                }
+                if (shards.empty()) {
+                    for (const auto& ent : fs::directory_iterator(path, ec)) {
+                        if (!ent.is_regular_file(ec)) continue;
+                        auto fn = ent.path().filename().string();
+                        if (fn.size() > 12 && fn.substr(fn.size() - 12) == ".safetensors" && fn != "mtp.safetensors") {
+                            shards.push_back(ent.path().string());
+                        }
+                    }
+                }
+                std::sort(shards.begin(), shards.end());
+            } else {
+                fs::path fp(path);
+                base_dir = fp.parent_path().empty() ? "." : fp.parent_path().string();
+                if (fp.filename().string() == "model.safetensors.index.json") {
+                    return vision_probe(base_dir, vi, err);
+                }
+                shards.push_back(path);
+            }
+            std::string cfg_txt;
+            if (detail::read_file_text((fs::path(base_dir) / "config.json").string(), cfg_txt)) {
+                try {
+                    JVal j = json_parse(cfg_txt);
+                    if (const JVal* vc = j.get("vision_config")) {
+                        VitCfg& c = vi.c;
+                        if (const JVal* v = vc->get("hidden_size")) c.hidden = static_cast<int>(v->i());
+                        if (const JVal* v = vc->get("num_hidden_layers")) c.layers = static_cast<int>(v->i());
+                        if (const JVal* v = vc->get("num_attention_heads")) c.heads = static_cast<int>(v->i());
+                        if (const JVal* v = vc->get("native_patch_size")) c.patch = static_cast<int>(v->i());
+                        if (const JVal* v = vc->get("patch_size")) c.patch = static_cast<int>(v->i());
+                        if (const JVal* v = vc->get("adapter_merge_size")) c.merge = static_cast<int>(v->i());
+                        if (const JVal* v = vc->get("spatial_merge_size")) c.merge = static_cast<int>(v->i());
+                        if (const JVal* v = vc->get("posemb_grid_size")) c.posemb_grid = static_cast<int>(v->i());
+                        if (const JVal* v = vc->get("projection_hidden_dim")) c.proj_hidden = static_cast<int>(v->i());
+                        if (const JVal* v = vc->get("text_hidden_size")) c.out_hidden = static_cast<int>(v->i());
+                        if (const JVal* v = vc->get("layer_norm_eps")) c.ln_eps = static_cast<float>(v->f());
+                        if (const JVal* v = vc->get("mlp_ratio")) c.inter = static_cast<int>(c.hidden * v->f());
+                        c.head_dim = c.hidden / c.heads;
+                    }
+                } catch (...) {}
+            }
+            for (const auto& sp : shards) {
+                strata::image::StFile st;
+                std::string se = strata::image::st_read_header(sp, st);
+                if (!se.empty()) {
+                    err = "safetensors vision header: " + se;
+                    return false;
+                }
+                for (const auto& kv : st.tensors) {
+                    if (kv.first.rfind("model.visual.", 0) != 0) continue;
+                    VitTensor vt;
+                    vt.fmt = (kv.second.dtype == "F32") ? F_F32 : (kv.second.dtype == "F16" ? F_F16 : F_BF16);
+                    vt.shape = kv.second.shape;
+                    vt.off = st.data_start + kv.second.begin;
+                    vt.bytes = kv.second.end - kv.second.begin;
+                    vt.shard_path = sp;
+                    vi.T[kv.first] = std::move(vt);
+                }
+            }
+            vi.path = path;
+            vi.is_safetensors = true;
+            const char* req[] = {
+                "model.visual.backbone.embeddings.patch_embedding.weight",
+                "model.visual.backbone.embeddings.position_embedding",
+                "model.visual.backbone.embeddings.class_embedding",
+                "model.visual.backbone.embeddings.cls_position_embedding",
+                "model.visual.backbone.ln_pre.weight",
+                "model.visual.proj_in.weight",
+                "model.visual.proj_out.weight",
+            };
+            for (const char* k : req) {
+                if (!vi.T.count(k)) {
+                    err = std::string("safetensors vision missing tensor ") + k;
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
     strata::artifact::StrataFileReader rd;
     if (!rd.open(path, err)) return false;
     if (rd.header().profile != strata::artifact::StrataProfile::VisionShard) {
@@ -319,6 +430,29 @@ public:
     bool load(const std::string& path, std::string& err) {
         if (loaded && info.path == path) return true;
         if (!vision_probe(path, info, err)) return false;
+        weights_.clear();
+        if (info.is_safetensors) {
+            for (const auto& kv : info.T) {
+                const auto& vt = kv.second;
+                size_t n = 1;
+                for (int64_t d : vt.shape) n *= static_cast<size_t>(d);
+                std::vector<uint8_t> raw(vt.bytes);
+                if (!detail::read_slice_from_file(vt.shard_path, vt.off, raw.data(), static_cast<size_t>(vt.bytes), err)) return false;
+                std::vector<float> w(n);
+                if (vt.fmt == F_BF16) {
+                    const uint16_t* p = reinterpret_cast<const uint16_t*>(raw.data());
+                    for (size_t i = 0; i < n; ++i) w[i] = bf16_to_f32(p[i]);
+                } else if (vt.fmt == F_F16) {
+                    const uint16_t* p = reinterpret_cast<const uint16_t*>(raw.data());
+                    for (size_t i = 0; i < n; ++i) w[i] = fp16_to_f32(p[i]);
+                } else {
+                    std::memcpy(w.data(), raw.data(), n * sizeof(float));
+                }
+                weights_[kv.first] = std::move(w);
+            }
+            loaded = true;
+            return true;
+        }
         strata::artifact::StrataFileReader rd;
         if (!rd.open(path, err)) return false;
         std::vector<uint8_t> s1;

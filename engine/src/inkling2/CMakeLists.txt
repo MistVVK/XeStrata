@@ -31,10 +31,12 @@ if(NOT TARGET strata_zstd_dec)
   target_compile_definitions(strata_zstd_dec PRIVATE ZSTD_DISABLE_ASM=1)
 endif()
 
-# Core Inkling-2-Mini + .strata v1.1 static library
+# Core Inkling-2-Mini + .strata v1.1 + Official HF safetensors + Community GGUF static library
 add_library(strata_inkling_core STATIC
   ${_ink_engine_root}/src/artifact/strata_reader.cpp
   ${_ink_engine_root}/src/quant/sk_codecs.cpp
+  ${_ink_engine_root}/src/quant/dequant.cpp
+  ${_ink_engine_root}/src/quant/types.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/inkling2_loop.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/ink_cpu_backend.cpp
 )
@@ -75,6 +77,26 @@ if(COMMAND strata_utf8_manifest)
 endif()
 
 # Optional GPU backend plug-ins (automatically wired when backend lane lands its subfolder!)
+if(STRATA_ENABLE_CUDA)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  add_library(strata_inkling_ep_cuda STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/hybrid_doorbell.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/ep_dual_gpu.cu
+  )
+  target_include_directories(strata_inkling_ep_cuda PUBLIC
+    ${_ink_engine_root}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_link_libraries(strata_inkling_ep_cuda PUBLIC strata_inkling_core CUDA::cudart CUDA::cublas)
+  target_compile_definitions(strata_inkling_ep_cuda PUBLIC INKLING_ENABLE_EP_CUDA=1)
+  set_target_properties(strata_inkling_ep_cuda PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_SEPARABLE_COMPILATION OFF
+  )
+  target_link_libraries(strata-inkling PRIVATE strata_inkling_ep_cuda)
+  target_compile_definitions(strata-inkling PRIVATE INKLING_ENABLE_EP_CUDA=1)
+endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cuda/CMakeLists.txt" AND STRATA_ENABLE_CUDA)
   add_subdirectory(cuda)
 endif()

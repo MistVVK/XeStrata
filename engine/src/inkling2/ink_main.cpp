@@ -46,34 +46,38 @@ static int cmd_export_tokenizer(const std::string& file, const std::string& dir)
     };
     if (!write_str("chat_template.jinja", mf.m.chat_template)) return 1;
     if (!write_str("tokenizer.hf.json", mf.m.tokenizer_json)) return 1;
-    printf("chat_template: %zu bytes, tokenizer_json: %zu bytes\n",
-           mf.m.chat_template.size(), mf.m.tokenizer_json.size());
+    printf("format=%s chat_template: %zu bytes, tokenizer_json: %zu bytes\n",
+           source_kind_name(mf.kind), mf.m.chat_template.size(), mf.m.tokenizer_json.size());
     return 0;
 }
 
-static int cmd_info(const std::string& file, const std::string& vision) {
-    strata::artifact::StrataFileReader rd;
+static int cmd_info(const std::string& file, const std::string& vision, const std::string& dspark_path) {
     std::string err;
-    if (!rd.open(file, err)) {
+    // Check VisionShard (.strata) first
+    if (!SafetensorsAdapter::is_safetensors_path(file) && !GgufAdapter::is_gguf_path(file)) {
+        strata::artifact::StrataFileReader rd;
+        if (!rd.open(file, err)) {
+            fprintf(stderr, "open: %s\n", err.c_str());
+            return 1;
+        }
+        if (rd.header().profile == strata::artifact::StrataProfile::VisionShard) {
+            rd.close();
+            VisionShardInfo vi;
+            if (!vision_probe(file, vi, err)) {
+                fprintf(stderr, "vision shard: %s\n", err.c_str());
+                return 1;
+            }
+            printf("arch=inkling2_vision layers=%d hidden=%d out_hidden=%d patch=%d merge=%d tensors=%zu image_pad=%d\n",
+                   vi.c.layers, vi.c.hidden, vi.c.out_hidden, vi.c.patch, vi.c.merge, vi.T.size(), vi.c.image_token);
+            return 0;
+        }
+    }
+    InkModelFile mf;
+    if (!mf.open(file, err, /*keep_tokenizer=*/false, dspark_path)) {
         fprintf(stderr, "open: %s\n", err.c_str());
         return 1;
     }
-    if (rd.header().profile == strata::artifact::StrataProfile::VisionShard) {
-        rd.close();
-        VisionShardInfo vi;
-        if (!vision_probe(file, vi, err)) {
-            fprintf(stderr, "vision shard: %s\n", err.c_str());
-            return 1;
-        }
-        printf("arch=inkling2_vision layers=%d hidden=%d out_hidden=%d patch=%d merge=%d tensors=%zu image_pad=%d\n",
-               vi.c.layers, vi.c.hidden, vi.c.out_hidden, vi.c.patch, vi.c.merge, vi.T.size(), vi.c.image_token);
-        return 0;
-    }
-    InkManifest m;
-    if (!parse_manifest(rd.manifest_json(), m, err, false)) {
-        fprintf(stderr, "manifest: %s\n", err.c_str());
-        return 1;
-    }
+    const InkManifest& m = mf.m;
     int images = 1;
     if (!vision.empty()) {
         VisionShardInfo vi;
@@ -81,7 +85,8 @@ static int cmd_info(const std::string& file, const std::string& vision) {
         images = vision_probe(vision, vi, verr) ? 1 : 0;
         if (!images) fprintf(stderr, "vision shard: %s\n", verr.c_str());
     }
-    printf("arch=inkling2_loop build=%s layers=%d visits=%d hidden=%d vocab=%d experts=%d eos=%d drafter=%s images=%d image_pad=%d parallel=%d\n",
+    printf("arch=inkling2_loop format=%s build=%s layers=%d visits=%d hidden=%d vocab=%d experts=%d eos=%d drafter=%s images=%d image_pad=%d parallel=%d\n",
+           source_kind_name(mf.kind),
            m.build.empty() ? "unknown" : m.build.c_str(),
            m.c.n_phys, m.c.n_visits, m.c.hidden, m.c.vocab_unpadded, m.c.n_experts, m.c.eos_token_id,
            m.dspark.present ? "dspark" : "none", images, m.c.image_token_id, kMaxParallelSlots);
@@ -89,11 +94,11 @@ static int cmd_info(const std::string& file, const std::string& vision) {
 }
 
 static int cmd_selfcheck(const std::string& model_path, bool force_cpu, bool verify_hash, const BackendOpts& bopts) {
-    auto backend = make_default_backend(force_cpu);
+    auto backend = make_default_backend(force_cpu, &bopts);
     std::string err;
     InkModelFile mf;
     if (!model_path.empty()) {
-        if (!mf.open(model_path, err)) {
+        if (!mf.open(model_path, err, false, bopts.dspark_path)) {
             fprintf(stderr, "[selfcheck] FAIL open: %s\n", err.c_str());
             return 1;
         }
@@ -120,13 +125,13 @@ static int cmd_selfcheck(const std::string& model_path, bool force_cpu, bool ver
 static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, int prompt_len, int gen_len, bool force_cpu, bool use_dspark) {
     InkModelFile mf;
     std::string err;
-    if (!mf.open(model_path, err)) {
+    if (!mf.open(model_path, err, false, bopts.dspark_path)) {
         fprintf(stderr, "open: %s\n", err.c_str());
         return 1;
     }
-    auto backend = make_default_backend(force_cpu);
     BackendOpts bo = bopts;
     bo.enable_dspark = use_dspark;
+    auto backend = make_default_backend(force_cpu, &bo);
     if (!backend->init(mf, bo, err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
         return 1;
@@ -188,8 +193,8 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
     double dec_s = now_s() - t_dec0;
     double ppts = (P * prompt_len) / std::max(pf_s, 1e-9);
     double tps_agg = total_gen / std::max(dec_s, 1e-9);
-    printf("[bench] backend=%s parallel=%d kv=%s prompt=%d gen=%d | prefill=%.1f ppts (%.2fs) | decode=%.1f tps agg (%.1f tps/slot, %.2fs)\n",
-           backend->backend_name(), P, bo.kv_dtype == KvDtype::FP8_E4M3 ? "fp8" : "fp16",
+    printf("[bench] backend=%s format=%s parallel=%d gpus=%d kv=%s prompt=%d gen=%d | prefill=%.1f ppts (%.2fs) | decode=%.1f tps agg (%.1f tps/slot, %.2fs)\n",
+           backend->backend_name(), source_kind_name(mf.kind), P, bo.gpus, kv_dtype_name(bo.kv_dtype),
            prompt_len, gen_len, ppts, pf_s, tps_agg, tps_agg / P, dec_s);
     return 0;
 }
@@ -217,8 +222,8 @@ static int cmd_kld_eval(const std::string& model_path, const std::string& ref_pa
 
     InkModelFile mf;
     std::string err;
-    if (!mf.open(model_path, err)) { fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
-    auto backend = make_default_backend(force_cpu);
+    if (!mf.open(model_path, err, false, bopts.dspark_path)) { fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
+    auto backend = make_default_backend(force_cpu, &bopts);
     if (!backend->init(mf, bopts, err) || !backend->alloc_slot(0, bopts.max_ctx, bopts.kv_dtype, err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
         return 1;
@@ -265,12 +270,49 @@ static int cmd_kld_eval(const std::string& model_path, const std::string& ref_pa
     return 0;
 }
 
+// Dump teacher-forced FP32 reference logits for --kld-eval parity checks across formats & backends
+static int cmd_dump_ref(const std::string& model_path, const std::string& out_path,
+                        const std::string& prompt_ids_str, const BackendOpts& bopts, bool force_cpu) {
+    InkModelFile mf;
+    std::string err;
+    if (!mf.open(model_path, err, false, bopts.dspark_path)) { fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
+    auto backend = make_default_backend(force_cpu, &bopts);
+    if (!backend->init(mf, bopts, err) || !backend->alloc_slot(0, bopts.max_ctx, bopts.kv_dtype, err)) {
+        fprintf(stderr, "init: %s\n", err.c_str());
+        return 1;
+    }
+    std::vector<int32_t> ids;
+    if (!prompt_ids_str.empty()) {
+        if (!parse_id_list(prompt_ids_str, ids, err)) { fprintf(stderr, "%s\n", err.c_str()); return 2; }
+    } else {
+        ids = {1, 2, 3, 4, 5, 6, 7, 8};
+    }
+    const int32_t n_tok = static_cast<int32_t>(ids.size());
+    const int32_t V = mf.m.c.vocab_unpadded;
+    std::vector<float> logits(static_cast<size_t>(n_tok) * V);
+    StepBatch batch;
+    for (int i = 0; i < n_tok; ++i) batch.push(0, i, ids[i], true);
+    if (!backend->forward_batch(batch, logits.data(), nullptr, err)) {
+        fprintf(stderr, "forward: %s\n", err.c_str());
+        return 1;
+    }
+    FILE* f = std::fopen(out_path.c_str(), "wb");
+    if (!f) { fprintf(stderr, "dump-ref: cannot write %s\n", out_path.c_str()); return 1; }
+    std::fwrite(&n_tok, 4, 1, f);
+    std::fwrite(&V, 4, 1, f);
+    std::fwrite(ids.data(), 4, n_tok, f);
+    std::fwrite(logits.data(), 4, logits.size(), f);
+    std::fclose(f);
+    printf("[dump-ref] wrote %s (n_tok=%d, V=%d, backend=%s)\n", out_path.c_str(), n_tok, V, backend->backend_name());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     ServeConfig cfg;
     cfg.version = INKLING_VERSION;
     bool mode_serve = false, mode_bench = false, mode_selfcheck = false, mode_info = false, mode_export = false;
     bool verify_hash = false;
-    std::string info_file, export_file, export_dir, kld_ref, prompt_ids_str;
+    std::string info_file, export_file, export_dir, kld_ref, dump_ref, prompt_ids_str;
     int bench_prompt = 64, bench_gen = 32;
     float cli_temp = 0.0f;
 
@@ -297,6 +339,8 @@ int main(int argc, char** argv) {
             verify_hash = true;
         } else if (a == "--kld-eval") {
             kld_ref = next();
+        } else if (a == "--dump-ref") {
+            dump_ref = next();
         } else if (a == "--native" || a == "--model") {
             cfg.model_path = next();
         } else if (a == "--vision") {
@@ -308,20 +352,32 @@ int main(int argc, char** argv) {
             cfg.bopts.parallel = std::max(1, std::min(kMaxParallelSlots, std::atoi(next().c_str())));
         } else if (a == "--chunk") {
             cfg.bopts.chunk = std::max(1, std::atoi(next().c_str()));
-        } else if (a == "--kv-dtype") {
+        } else if (a == "--kv-dtype" || a == "--kv") {
             std::string kv = next();
             if (kv == "fp8" || kv == "fp8_e4m3") { cfg.bopts.kv_dtype = KvDtype::FP8_E4M3; cfg.bopts.kv_dtype_auto = false; }
-            else if (kv == "fp16") { cfg.bopts.kv_dtype = KvDtype::FP16; cfg.bopts.kv_dtype_auto = false; }
+            else if (kv == "fp16" || kv == "f16") { cfg.bopts.kv_dtype = KvDtype::FP16; cfg.bopts.kv_dtype_auto = false; }
+            else if (kv == "k8v8" || kv == "i8" || kv == "q8") { cfg.bopts.kv_dtype = KvDtype::K8V8; cfg.bopts.kv_dtype_auto = false; }
+            else if (kv == "k8v4") { cfg.bopts.kv_dtype = KvDtype::K8V4; cfg.bopts.kv_dtype_auto = false; }
             else { cfg.bopts.kv_dtype_auto = true; }
         } else if (a == "--draft") {
             cfg.draft_mode = next();
             cfg.bopts.enable_dspark = (cfg.draft_mode != "off");
+        } else if (a == "--dspark") {
+            cfg.bopts.dspark_path = next();
         } else if (a == "--vram-experts-gb") {
             cfg.bopts.vram_experts_gb = std::atof(next().c_str());
         } else if (a == "--ram-experts-gb") {
             cfg.bopts.ram_experts_gb = std::atof(next().c_str());
+        } else if (a == "--vram-reserve-mib") {
+            cfg.bopts.vram_reserve_mib = std::atoi(next().c_str());
+        } else if (a == "--cpu-threads") {
+            cfg.bopts.cpu_threads = std::atoi(next().c_str());
         } else if (a == "--gpu") {
             cfg.bopts.gpu_index = std::atoi(next().c_str());
+        } else if (a == "--gpus") {
+            cfg.bopts.gpus = std::max(1, std::atoi(next().c_str()));
+        } else if (a == "--ep-split") {
+            cfg.bopts.ep_split = std::atof(next().c_str());
         } else if (a == "--threads") {
             cfg.bopts.threads = std::atoi(next().c_str());
         } else if (a == "--cpu") {
@@ -337,14 +393,14 @@ int main(int argc, char** argv) {
         } else if (a == "--no-anti-loop") {
             cfg.anti_loop = false;
         } else if (a == "--help" || a == "-h") {
-            printf("strata-inkling %s - Native Inkling-2-Mini (.strata v1.1) Shape Engine\n"
+            printf("strata-inkling %s - Unified Inkling-2-Mini (.strata v1.1 / HF safetensors / .gguf) Shape Engine\n"
                    "  --version\n"
-                   "  --info FILE.strata [--vision VISION.strata]\n"
-                   "  --export-tokenizer FILE.strata OUT_DIR\n"
-                   "  --selfcheck [--native FILE.strata] [--verify-hash] [--cpu]\n"
-                   "  --bench --native FILE.strata [--parallel 1|4|8|32|64] [--kv-dtype auto|fp16|fp8] [--prompt-len N] [--gen N]\n"
-                   "  --kld-eval REF.bin --native FILE.strata\n"
-                   "  --serve --native FILE.strata [--vision VISION.strata] [--max-context N] [--parallel 1..64] [--draft auto|dspark|off]\n",
+                   "  --info PATH [--vision VISION] [--dspark PATH]\n"
+                   "  --export-tokenizer PATH OUT_DIR\n"
+                   "  --selfcheck [--native PATH] [--verify-hash] [--cpu] [--gpus 1|2] [--kv fp16|fp8|k8v8|k8v4]\n"
+                   "  --bench --native PATH [--parallel 1..64] [--gpus 1|2] [--ep-split F] [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4] [--prompt-len N] [--gen N]\n"
+                   "  --kld-eval REF.bin --native PATH\n"
+                   "  --serve --native PATH [--vision VISION] [--dspark PATH] [--max-context N] [--parallel 1..64] [--gpus 1|2] [--draft auto|dspark|off]\n",
                    INKLING_VERSION);
             return 0;
         } else {
@@ -353,31 +409,38 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Auto-select FP8_E4M3 KV when parallel >= 16 unless user explicitly forced FP16
+    // Read optional IK2_EP_SPLIT env override (#6506)
+    if (const char* ep_env = std::getenv("IK2_EP_SPLIT"); ep_env && *ep_env) {
+        double v = std::atof(ep_env);
+        if (v > 0.0 && v < 1.0) cfg.bopts.ep_split = v;
+    }
+
+    // Auto-select FP8_E4M3 KV when parallel >= 16 unless user explicitly forced a format
     if (cfg.bopts.kv_dtype_auto && cfg.bopts.parallel >= 16) {
         cfg.bopts.kv_dtype = KvDtype::FP8_E4M3;
     }
 
-    if (mode_info) return cmd_info(info_file, cfg.vision_path);
+    if (mode_info) return cmd_info(info_file, cfg.vision_path, cfg.bopts.dspark_path);
     if (mode_export) return cmd_export_tokenizer(export_file, export_dir);
     if (mode_selfcheck) return cmd_selfcheck(cfg.model_path, cfg.force_cpu, verify_hash, cfg.bopts);
     if (!kld_ref.empty()) return cmd_kld_eval(cfg.model_path, kld_ref, cfg.bopts, cfg.force_cpu);
+    if (!dump_ref.empty()) return cmd_dump_ref(cfg.model_path, dump_ref, prompt_ids_str, cfg.bopts, cfg.force_cpu);
     if (mode_bench) return cmd_bench(cfg.model_path, cfg.bopts, bench_prompt, bench_gen, cfg.force_cpu, cfg.bopts.enable_dspark);
 
     if (cfg.model_path.empty()) {
-        fprintf(stderr, "error: --native <model.strata> is required\n");
+        fprintf(stderr, "error: --native <model.strata|hf_dir|model.gguf> is required\n");
         return 2;
     }
 
     InkModelFile mf;
     std::string err;
-    if (!mf.open(cfg.model_path, err)) {
+    if (!mf.open(cfg.model_path, err, false, cfg.bopts.dspark_path)) {
         if (mode_serve) proto("ERR open: %s", err.c_str());
         else fprintf(stderr, "open: %s\n", err.c_str());
         return 1;
     }
 
-    auto backend = make_default_backend(cfg.force_cpu);
+    auto backend = make_default_backend(cfg.force_cpu, &cfg.bopts);
     if (!backend->init(mf, cfg.bopts, err)) {
         if (mode_serve) proto("ERR init: %s", err.c_str());
         else fprintf(stderr, "init: %s\n", err.c_str());
