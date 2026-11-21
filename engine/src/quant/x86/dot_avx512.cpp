@@ -26,6 +26,7 @@ namespace {
 const DotKernel kTable[] = {
     ENTRY(Q4_0, Q8_0, q4_0_q8_0), ENTRY(Q4_1, Q8_1, q4_1_q8_1), ENTRY(Q5_0, Q8_0, q5_0_q8_0), ENTRY(Q5_1, Q8_1, q5_1_q8_1),
     ENTRY(Q8_0, Q8_0, q8_0_q8_0), ENTRY(IQ4_NL, Q8_0, iq4_nl_q8_0), ENTRY(MXFP4, Q8_0, mxfp4_q8_0),
+    ENTRY(NVFP4, Q8_0, nvfp4_q8_0),
 };
 #undef ENTRY
 }  // namespace

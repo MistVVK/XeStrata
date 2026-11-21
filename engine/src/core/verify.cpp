@@ -2784,7 +2784,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
         static const bool logits_dump = std::getenv("STRATA_LOGITS_DUMP") != nullptr;
         const bool use_bitplane = head_ != nullptr && head_->loaded() && head_->bitplane() != nullptr &&
-                                  T <= 16 && !nan_guard_on() && !logits_dump;
+                                  T <= 16 && (head_->type() == 8 || T >= 4) && !logits_dump;
       for (int h0 = 0; h0 < T; h0 += kFusedGrMaxT) {
         const int HT = std::min(T - h0, kFusedGrMaxT);   // this chunk's columns: h0 .. h0 + HT
         // S25 (STRATA_HC_Q8=1): the final mixer from the GGUF's Q8_0 projections too, through the same multi read
@@ -2862,7 +2862,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
                 if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
-                if (use_bitplane && strata::kernels::vhead_bitplane_argmax(head_->bitplane(), xq_, HT, m_out_ + h0, cs)) {
+                uint32_t* const nf_dst = nan_guard_on() && m_nf_ != nullptr
+                                             ? m_nf_ + (size_t) h0 * strata::kernels::kNonfiniteBlocks
+                                             : nullptr;
+                if (use_bitplane && strata::kernels::vhead_bitplane_argmax(head_->bitplane(), xq_, HT, m_out_ + h0, cs,
+                                                                           nf_dst, strata::kernels::kNonfiniteBlocks)) {
                     head_bitplane_used_ = true;
                 } else if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
                     if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);

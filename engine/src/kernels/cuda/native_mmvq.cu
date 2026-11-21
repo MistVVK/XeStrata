@@ -1589,6 +1589,22 @@ template<typename F>
 void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                   void* stream) {
     const auto s = static_cast<cudaStream_t>(stream);
+    // Avoid instantiating NCOLS=9..16 (which spill registers in b6_mmvq_rows_kernel / native_mmvq_multi_kernel).
+    // Supported dense formats (Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS) already run single-pass ncols=9..16 in dense_i8_tc_mmvq;
+    // any remaining fallback splits ncols > 8 into <= 8-column chunks (2..8 here, or single-column if rem == 1).
+    if (ncols > 8) {
+        const std::size_t x_col_bytes = std::size_t(n_in / 32) * sizeof(Q81Block);
+        const auto* xb = static_cast<const uint8_t*>(x_q8_1);
+        int c0 = 0;
+        while (c0 < ncols) {
+            int rem = ncols - c0;
+            int chunk = rem > 8 ? (rem == 9 ? 5 : 8) : rem;
+            launch_multi<F>(weights, xb + std::size_t(c0) * x_col_bytes, y + std::size_t(c0) * std::size_t(n_out),
+                            n_in, n_out, chunk, stream);
+            c0 += chunk;
+        }
+        return;
+    }
     switch (ncols) {
         case 2: launch_multi_n<F, 2>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 3: launch_multi_n<F, 3>(weights, x_q8_1, y, n_in, n_out, s); break;
@@ -1597,18 +1613,6 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
         case 6: launch_multi_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 7: launch_multi_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 8: launch_multi_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
-#if STRATA_VERIFY_MAX_T > 8
-        case 9: launch_multi_n<F, 9>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 10: launch_multi_n<F, 10>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 11: launch_multi_n<F, 11>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 12: launch_multi_n<F, 12>(weights, x_q8_1, y, n_in, n_out, s); break;
-#if STRATA_VERIFY_MAX_T > 12
-        case 13: launch_multi_n<F, 13>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 14: launch_multi_n<F, 14>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 15: launch_multi_n<F, 15>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 16: launch_multi_n<F, 16>(weights, x_q8_1, y, n_in, n_out, s); break;
-#endif
-#endif
         default: throw std::invalid_argument("native MMVQ multi-column launch requires 2 <= ncols <= MAX_NCOLS");
     }
 }
@@ -3563,10 +3567,10 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
     // Clean-room MIT INT8 Tensor Core path (sm_80+: RTX 3090 & RTX 5090):
-    // Beats scalar __dp4a native_mmvq by 1.3x-2.1x at T=6..8 and 3.1x-9.8x at T=9..16 with ~2e-7 exact parity.
-    if (n_out >= 1024 && ncols <= 16 && dense_i8_tc_type_ok(ggml_type) && dense_i8_tc_decode_enabled()) {
-        const int tc_min_t = (ggml_type == 8) ? 9 : (ggml_type == 14 ? 5 : 6);
-        if (ncols >= tc_min_t && dense_i8_tc_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream)) {
+    // Interleaved native_mmvq_il handles ncols=1..8 at peak SM occupancy; for ncols=9..16 (wide verify windows where
+    // native_mmvq_il is absent and native_mmvq would split into 2 passes), dense_i8_tc_mmvq wins 2.0x-2.7x in 1 pass.
+    if (n_out >= 1024 && ncols >= 9 && ncols <= 16 && dense_i8_tc_type_ok(ggml_type) && dense_i8_tc_decode_enabled()) {
+        if (dense_i8_tc_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream)) {
             return;
         }
     }
@@ -3972,11 +3976,6 @@ bool il_arch_ok() {
 
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
     if (ncols < 1 || ncols > 8 || !g_multi_exact || !il_arch_ok()) return false;
-    // Yield to clean-room INT8 Tensor Core GEMM where it beats interleaved scalar __dp4a.
-    if (n_out >= 1024 && dense_i8_tc_type_ok(ggml_type) && dense_i8_tc_decode_enabled()) {
-        const int tc_min_t = (ggml_type == 8) ? 9 : (ggml_type == 14 ? 5 : 6);
-        if (ncols >= tc_min_t) return false;
-    }
     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
            (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 11);
 }

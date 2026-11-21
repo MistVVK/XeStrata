@@ -626,11 +626,21 @@ __global__ void __launch_bounds__(128) vhead_stage2_tiles_kernel(
     }
 }
 
-__global__ void vhead_extract_tokens_kernel(const unsigned long long* __restrict__ d_best, int T,
-                                            int32_t* __restrict__ out_tokens) {
+__global__ void vhead_extract_tokens_kernel(const unsigned long long* __restrict__ d_best,
+                                            const float* __restrict__ d_x_norm, int T,
+                                            int32_t* __restrict__ out_tokens,
+                                            uint32_t* __restrict__ out_nonfinite, int nf_stride) {
     const int t = (int) threadIdx.x;
     if (t < T) {
-        out_tokens[t] = (int32_t) (0xFFFFFFFFu - (uint32_t) (d_best[t] & 0xFFFFFFFFull));
+        const unsigned long long packed = d_best[t];
+        out_tokens[t] = (int32_t) (0xFFFFFFFFu - (uint32_t) (packed & 0xFFFFFFFFull));
+        if (out_nonfinite != nullptr && nf_stride > 0) {
+            const float best_v = ordered_to_float((int32_t) ((uint32_t) (packed >> 32) ^ 0x80000000u));
+            const uint32_t bad = (packed != 0ull && isfinite(d_x_norm[t]) && isfinite(best_v)) ? 0u : 1u;
+            uint32_t* dst = out_nonfinite + (size_t) t * (size_t) nf_stride;
+            dst[0] = bad;
+            for (int b = 1; b < nf_stride; ++b) dst[b] = 0u;
+        }
     }
 }
 
@@ -657,13 +667,13 @@ bool vhead_bitplane_supported() {
 }
 
 bool vhead_bitplane_enabled() {
-    static const int env = [] {
+    // Opt-in via STRATA_VHEAD_BITPLANE=1: keeps ~400 MiB VRAM available for the expert cache on partial-VRAM cards
+    // and avoids Stage-2 tile-survival spikes on outlier-heavy LLM activations (especially Q6_K).
+    static const bool env = [] {
         const char* v = std::getenv("STRATA_VHEAD_BITPLANE");
-        if (v == nullptr || v[0] == '\0') return -1;
-        return std::atoi(v) != 0 ? 1 : 0;
+        return v != nullptr && std::atoi(v) != 0;
     }();
-    if (env == 0) return false;
-    return vhead_bitplane_supported();
+    return env && vhead_bitplane_supported();
 }
 
 BitplaneHeadHandle* vhead_bitplane_create(int ggml_type, const void* d_weights, int n_in, int n_out) {
@@ -743,7 +753,8 @@ size_t vhead_bitplane_bytes(const BitplaneHeadHandle* h) {
     return h ? h->total_bytes : 0;
 }
 
-bool vhead_bitplane_argmax(BitplaneHeadHandle* h, const void* x_q8_1, int T, int32_t* out_tokens, void* stream) {
+bool vhead_bitplane_argmax(BitplaneHeadHandle* h, const void* x_q8_1, int T, int32_t* out_tokens, void* stream,
+                           uint32_t* out_nonfinite, int nonfinite_stride) {
     if (h == nullptr || x_q8_1 == nullptr || out_tokens == nullptr || T < 1 || T > BitplaneHeadHandle::kMaxT)
         return false;
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
@@ -787,7 +798,7 @@ bool vhead_bitplane_argmax(BitplaneHeadHandle* h, const void* x_q8_1, int T, int
             reinterpret_cast<const uint8_t*>(h->raw_w), xq, h->n_in, h->n_out, h->n_tiles,
             h->d_max_lo, h->d_tile_hi, h->d_best);
     }
-    vhead_extract_tokens_kernel<<<1, 32, 0, s>>>(h->d_best, T, out_tokens);
+    vhead_extract_tokens_kernel<<<1, 32, 0, s>>>(h->d_best, h->d_x_norm, T, out_tokens, out_nonfinite, nonfinite_stride);
     return cudaGetLastError() == cudaSuccess;
 }
 

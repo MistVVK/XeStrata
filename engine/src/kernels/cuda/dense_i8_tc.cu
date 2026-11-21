@@ -387,20 +387,23 @@ __device__ __forceinline__ size_t row_bytes_of(int ggml_type, int n_in) {
     }
 }
 
-// ---- Decode / Verify Kernel: 4 warps = 64 output rows x (NTILES*8) tokens per CTA, K-chunked 256 ----
-template <int GTYPE, int NTILES>
-__global__ void __launch_bounds__(128) dense_i8_tc_decode_kernel(
+// ---- Decode / Verify Kernel: WARPS warps = (WARPS*16) output rows x (NTILES*8) tokens per CTA, K-chunked 256 ----
+// WARPS=1 (16 rows/CTA) keeps 110-170 SMs saturated for moderate n_out (<=4096, e.g. out-proj 2560 -> 160 CTAs);
+// WARPS=4 (64 rows/CTA) amortizes smem activation loads for wide n_out (>4096).
+template <int GTYPE, int NTILES, int WARPS = 4>
+__global__ void __launch_bounds__(WARPS * 32) dense_i8_tc_decode_kernel(
     const uint8_t* __restrict__ weights, const Q81Block* __restrict__ xq, float* __restrict__ y,
     int n_in, int n_out, int T) {
 #if STRATA_DENSE_I8_SM80
     constexpr int MAX_T = NTILES * 8;
+    constexpr int NTHREADS = WARPS * 32;
     const int tid = (int) threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
     const int g = lane >> 2;
     const int tig = lane & 3;
 
-    const int r_base = (int) blockIdx.x * 64 + warp * 16;
+    const int r_base = (int) blockIdx.x * (WARPS * 16) + warp * 16;
     const int r0 = r_base + g;
     const int r1 = r_base + 8 + g;
     const bool v0 = r0 < n_out;
@@ -424,7 +427,7 @@ __global__ void __launch_bounds__(128) dense_i8_tc_decode_kernel(
     for (int k_blk0 = 0; k_blk0 < nb32; k_blk0 += 8) {
         const int nb_here = min(8, nb32 - k_blk0);
         // Load MAX_T * nb_here blocks (up to 128 Q81Blocks) cooperatively into ~5 KB smem!
-        for (int idx = tid; idx < MAX_T * 8; idx += 128) {
+        for (int idx = tid; idx < MAX_T * 8; idx += NTHREADS) {
             const int t = idx >> 3;
             const int b = idx & 7;
             if (t < T && b < nb_here) {
@@ -656,16 +659,23 @@ bool dense_i8_tc_mmvq(int ggml_type, const void* weights, const void* x_q8_1, fl
     if ((n_in % align_k) != 0) return false;
 
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
-    const unsigned grid = (unsigned) ((n_out + 63) / 64);
+    const bool narrow_n = (n_out <= 4096);
+    const unsigned grid = narrow_n ? (unsigned) ((n_out + 15) / 16) : (unsigned) ((n_out + 63) / 64);
     const auto* w = reinterpret_cast<const uint8_t*>(weights);
     const auto* xq = reinterpret_cast<const Q81Block*>(x_q8_1);
 
     auto launch = [&](auto type_tag) {
         constexpr int GT = decltype(type_tag)::value;
-        if (T <= 8) {
-            dense_i8_tc_decode_kernel<GT, 1><<<grid, 128, 0, s>>>(w, xq, y, n_in, n_out, T);
+        if (narrow_n) {
+            if (T <= 8) {
+                dense_i8_tc_decode_kernel<GT, 1, 1><<<grid, 32, 0, s>>>(w, xq, y, n_in, n_out, T);
+            } else {
+                dense_i8_tc_decode_kernel<GT, 2, 1><<<grid, 32, 0, s>>>(w, xq, y, n_in, n_out, T);
+            }
+        } else if (T <= 8) {
+            dense_i8_tc_decode_kernel<GT, 1, 4><<<grid, 128, 0, s>>>(w, xq, y, n_in, n_out, T);
         } else {
-            dense_i8_tc_decode_kernel<GT, 2><<<grid, 128, 0, s>>>(w, xq, y, n_in, n_out, T);
+            dense_i8_tc_decode_kernel<GT, 2, 4><<<grid, 128, 0, s>>>(w, xq, y, n_in, n_out, T);
         }
     };
 

@@ -41,7 +41,10 @@ size_t vhead_bitplane_bytes(const BitplaneHeadHandle* h);
 /// Exact greedy argmax over all `n_out` vocabulary rows for `T` tokens (`1 <= T <= 16`).
 /// `x_q8_1` holds `T` contiguous rows of `n_in / 32` `block_q8_1` structs (matching `native_quantize_q8_1`).
 /// Writes exact argmax token ids to `out_tokens[0..T-1]` (lowest index wins exact ties, matching `argmax_rows`).
+/// When `out_nonfinite != nullptr` (`nonfinite_stride > 0`), populates `out_nonfinite[t * nonfinite_stride + 0..stride-1]`
+/// with non-zero if token `t` produced a non-finite norm or winning logit (0 otherwise), matching `logits_nonfinite_rows`.
 /// Returns true if launched cleanly; false if fallback to full `native_mmvq` + `argmax_rows` is needed.
-bool vhead_bitplane_argmax(BitplaneHeadHandle* h, const void* x_q8_1, int T, int32_t* out_tokens, void* stream);
+bool vhead_bitplane_argmax(BitplaneHeadHandle* h, const void* x_q8_1, int T, int32_t* out_tokens, void* stream,
+                           uint32_t* out_nonfinite = nullptr, int nonfinite_stride = 0);
 
 }  // namespace strata::kernels

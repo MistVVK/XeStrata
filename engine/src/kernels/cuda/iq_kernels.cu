@@ -5,6 +5,7 @@
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/nvfp4_decode_sm120.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/sm75_series.hpp"
@@ -6080,6 +6081,8 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
 // [r0, r0 + 32): gate rows r0.. and up rows r0.. (64 weight rows, the same per-(row, entry) sums as mode 7), so
 // one 32-lane warp per entry holds exactly one q8_1 block of h and runs quantize_q8_1_kernel's own code on it -
 // bitwise the separate kernels' hq, two launches fewer per call.
+// Hoists Split<TG>::load outside the per-entry loop (j = 0..NTC-1) so multi-token verify hits decode weights ONCE
+// instead of NTC times, and supports Q4_K (12), Q5_K (13), and NVFP4 (40) with exact tail scales in addition to IQ*.
 template<int TG>
 __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
@@ -6087,17 +6090,23 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
                                                               const int32_t* __restrict__ ent_tok,
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                               block_q8_1* __restrict__ hq) {
-    using GT = typename GridOf<TG>::T;
     using F = Fmt<TG>;
-    __shared__ GT sgrid[GridOf<TG>::N];
+    constexpr bool kHasGrid = (TG == 16 || TG == 18 || TG == 21 || TG == 22);
+    constexpr int kGridN = kHasGrid ? (TG == 22 ? 1024 : TG == 21 ? 512 : 256) : 1;
+    using GT = typename std::conditional<(TG == 16 || TG == 22), uint64_t, uint32_t>::type;
+    __shared__ GT sgrid[kGridN];
     __shared__ float res[LDS_NT][64];
     extern __shared__ int sx_raw[];
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const GT* gsrc = GridOf<TG>::src();
-    for (int i = tid; i < GridOf<TG>::N; i += 256) sgrid[i] = gsrc[i];
+    if constexpr (kHasGrid) {
+        const GT* gsrc = GridOf<TG>::src();
+        for (int i = tid; i < GridOf<TG>::N; i += 256) sgrid[i] = gsrc[i];
+    }
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const float s_gate = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
+    const float s_up   = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
     const int nb = (int) (L.n_embd / F::qk), xb = (int) (L.n_embd / 32), hb = (int) (L.n_ff / 32);
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
     const int r0 = blockIdx.x * 32;
@@ -6124,13 +6133,26 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
                 for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
                 for (int k = lane; k < nb * F::ipb; k += 32) {
                     const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                    if constexpr (kSplit<TG>) {
+                        // Stage grid only for types whose Split<TG>::load<true> matches GridOf<TG> layout (IQ2_XXS, IQ2_S).
+                        constexpr bool kStageSplit = (TG == 16 || TG == 22);
+                        const auto rw0 = Split<TG>::template load<kStageSplit>(w0, kbx, iqs, (const uint32_t*) sgrid);
+                        const auto rw1 = Split<TG>::template load<kStageSplit>(w1, kbx, iqs, (const uint32_t*) sgrid);
 #pragma unroll
-                    for (int j = 0; j < NTC; ++j) {
-                        const block_q8_1* xk = sx + (size_t) j * xb + kbx * (F::qk / 32);
-                        const float a = DotG<TG, 1>::f(w0, xk, kbx, iqs, sgrid);
-                        const float b = DotG<TG, 1>::f(w1, xk, kbx, iqs, sgrid);
-                        s0[j] += a;
-                        s1[j] += b;
+                        for (int j = 0; j < NTC; ++j) {
+                            const block_q8_1* xk = sx + (size_t) j * xb + kbx * (F::qk / 32);
+                            s0[j] += Split<TG>::apply(rw0, xk, iqs);
+                            s1[j] += Split<TG>::apply(rw1, xk, iqs);
+                        }
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < NTC; ++j) {
+                            const block_q8_1* xk = sx + (size_t) j * xb + kbx * (F::qk / 32);
+                            const float a = DotG<TG, 1>::f(w0, xk, kbx, iqs, sgrid);
+                            const float b = DotG<TG, 1>::f(w1, xk, kbx, iqs, sgrid);
+                            s0[j] += a;
+                            s1[j] += b;
+                        }
                     }
                 }
 #pragma unroll
@@ -6148,7 +6170,7 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
         }
         __syncthreads();
         if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
-            const float gg = res[warp][lane], uu = res[warp][32 + lane];
+            const float gg = res[warp][lane] * s_gate, uu = res[warp][32 + lane] * s_up;
             const float xi = (gg / (1.0f + __expf(-gg))) * uu;
             float amax = fabsf(xi), sum = xi;
 #pragma unroll
@@ -6514,6 +6536,17 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (cap_groups <= 0 || cap_entries <= 0) return;
     strata::dispatch::kernel(strata::dispatch::kExpert, 0, L.gu_type, (int) L.n_embd, (int) L.n_ff, L.d_type);   // BW-MEASURE: one grouped expert call
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
+    // Blackwell sm_120a/sm_121a hardware NVFP4 grouped decode/verify (cvt.rn.f16x2.e2m1x2, fused GU+SwiGLU+Q8_1 -> down).
+    if (!g_grouped_v1 && L.gu_type == 40 && L.d_type == 40 && !L.gu_nib && g_exp_phase == 0 &&
+        nvfp4_decode_sm120_available()) {
+        const size_t f0 = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float);
+        const size_t fa0 = (f0 + 255) & ~(size_t) 255;
+        void* hq_ptr = (uint8_t*) scratch + 3 * fa0;
+        if (nvfp4_decode_sm120_grouped(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                                       cap_groups, cap_entries, x_q8_1, hq_ptr, out, stream)) {
+            return;
+        }
+    }
     // (OWN-I8: this fallback no longer hands its calls to native_expert_i8: that kernel reads its own activation image, native_expert_i8_quantize's, and this call's rows are q8_1
     //  blocks.  The prompt path's MMQ groups, where the kernel was measured, quantize the image themselves.)
     cudaStream_t s = (cudaStream_t) stream;
@@ -6616,16 +6649,21 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu = !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
+    const bool fused_gu = !nib_layout(L) && em0 == 8 &&
+                          ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
+                           L.gu_type == 23 || L.gu_type == 12 || L.gu_type == 13 || L.gu_type == 40) &&
                           L.n_ff % 32 == 0;
     if (fused_gu && g_exp_phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
+            case 12: native_gu_fused_kernel<12><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 13: native_gu_fused_kernel<13><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 16: native_gu_fused_kernel<16><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 18: native_gu_fused_kernel<18><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 21: native_gu_fused_kernel<21><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 23: native_gu_fused_kernel<23><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 40: native_gu_fused_kernel<40><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             default: native_gu_fused_kernel<22><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
         }
         check("native_expert_grouped/gu fused");

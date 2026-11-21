@@ -5364,6 +5364,14 @@ int main(int argc, char** argv) {
             o.pcie_frac = base;
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
+        const char* dh_env = std::getenv("STRATA_VERIFY_DEVICE_HITS");
+        if (dh_env != nullptr && std::atoi(dh_env) != 0 && !pf_old && native_pack && o.layer_split.empty() &&
+            o.batch <= 0 && o.peer_device < 0) {
+            o.pcie_frac = 0.0;
+            o.pcie_frac_auto = false;
+            std::fprintf(stderr, "strata generate: STRATA_VERIFY_DEVICE_HITS=1 -> pcie_frac 0.00 "
+                                 "(on-device VRAM hit planning; pass --pcie-frac or STRATA_VERIFY_DEVICE_HITS=0 to override)\n");
+        }
     }
     // STRATA_PCIE_BALANCE=1 (opt-in): each verify layer's PCIe count from measured costs (Verifier::set_pcie_balance)
     // instead of the probe's fixed share above - the CPU's speed sets the right share as much as the link's.  IQ2_XS,
@@ -8281,6 +8289,9 @@ int main(int argc, char** argv) {
                                      "toolkit>, with its libcudart.so present) (#542)\n",
                              CUDART_VERSION / 1000, CUDART_VERSION % 1000 / 10, rt / 1000, rt % 1000 / 10);
         }
+        // Pre-warm cuBLAS BF16 & FP16 modules on a background thread while the expert arena loads
+        // (eliminates ~210-490 ms of cold layer-0 cuBLAS load latency on the first prompt; STRATA_PREFILL_WARM=0 skips).
+        if (named) g_warm_thr = std::thread([dev] { strata::prefill::warm_gemm_libraries(dev); });
 #endif
 #endif
         const std::string e = strata::core::device_code_error();

@@ -53,7 +53,17 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_GU_SWIGLU", "1"},           // -0.8, -1.4
             {"STRATA_QSA_ROWS", "1"},            // -0.5, -1.2
             {"STRATA_B6_MMVQ_ROWS", "1"},        // A4000 0, 3060 -1.7
+            // 0.2.19 sm_86 (RTX 3090 24 GB / A4000 16 GB): bit-exact pipeline/PLE/quant fusions + Q8_0 HC (with sm_80+
+            // hybrid INT8 TC gr_up_q8_tc saving ~600 MiB VRAM) + fused K-quant prompt kernels.
+            {"STRATA_DEQUANT_SIDE", "1"},
+            {"STRATA_QFUSE", "1"},
+            {"STRATA_LFUSE", "1"},
+            {"STRATA_PLE_COMPACT", "1"},
+            {"STRATA_PLE_COPY_STREAM", "1"},
+            {"STRATA_PF_FUSED_KQ", "1"},
+            {"STRATA_HC_Q8", "1"},
         };
+        if (main_vram_bytes > kAdaptFetchMaxVramBytes) t.push_back({"STRATA_VERIFY_DEVICE_HITS", "1"});
     } else if (mj == 12 && mn == 0) {
         // RTX 50 / PRO Blackwell (compute capability 12.0; a gfx12 HIP card reports 12.0 too, but this table is applied by the CUDA build only).  STRATA_SM120_PERF=0 and STRATA_DEFAULTS=026 leave it out.
         if (off("STRATA_SM120_PERF") || defaults026) return t;
@@ -70,12 +80,25 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_Q80_ROWS1", "1"},
             // the grouped native experts' mode-8 layout (the GB10 / P100 / P40 default; exact against the CUDA layout on UD-Q4_K_XL)
             {"STRATA_EXP_MODE", "8"},
+            // 0.2.19 sm_120 (RTX 5090 / RTX PRO 5000 Blackwell): exact overlap/PLE/quant fusions + Q8_0 HC (hybrid
+            // gr_down_q8_fast + INT8 TC gr_up_q8_tc, -0.58 ms/round & ~600 MiB VRAM saved) + fused K-quant prompt kernels
+            // + wide CPU prefill share backed by pinned cpu_x_stream & parallel native_quant_act.
+            {"STRATA_SIDE_MIXER", "2"},
+            {"STRATA_DEQUANT_SIDE", "1"},
+            {"STRATA_QFUSE", "1"},
+            {"STRATA_LFUSE", "1"},
+            {"STRATA_PLE_COMPACT", "1"},
+            {"STRATA_PLE_COPY_STREAM", "1"},
+            {"STRATA_PF_FUSED_KQ", "1"},
+            {"STRATA_HC_Q8", "1"},
+            {"STRATA_PREFILL_CPU_SHARE_NT", "32"},
         };
         // 0.2.17 (owner yes 11-19), a card of 16 GiB or less: the PCIe share also fills the expert cache (not bit-exact: CPU and GPU round differently; the tier is not deterministic).
         // BW-9 (2x RTX 5060 Ti 16 GB, UD-Q4_K_XL, DFlash2 spec 6, tail skip OFF, product flags, 3 paired rounds; phaseA-tests/bw/RESULTS-BW-F.md): decode +4 to +43% by kind (medians 1.087 to 1.325, 3 of 3 rounds up),
         // expert cache hit rate 54.4 -> 62.0%, forced-token KL against the FP16 prompt path 0.948 [0.830, 1.063] of the default's (PASS), prompts level except json 169 at +3 to +5%.  Applies to a one-card run only
         // (the engine turns it off, with a line, for a layer split, helper cards, --batch and the other cases of the DETAILS.md row).  STRATA_ADAPT_FETCH=0 is the way back.
         if (adapt_fetch_default_card(major, minor, main_vram_bytes)) t.push_back({"STRATA_ADAPT_FETCH", "2"});
+        else if (main_vram_bytes > kAdaptFetchMaxVramBytes) t.push_back({"STRATA_VERIFY_DEVICE_HITS", "1"});
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;
         t = {

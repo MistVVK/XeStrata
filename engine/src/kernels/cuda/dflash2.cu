@@ -5,6 +5,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/per_device_flag.hpp"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -272,6 +273,249 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
         *reinterpret_cast<float2*>(o + 4) = make_float2(O[i][4], O[i][5]);
         *reinterpret_cast<float2*>(o + 6) = make_float2(O[i][6], O[i][7]);
     }
+}
+
+// Clean-room MIT sm_80+ BF16 Tensor Core DFlash2 attention (Ampere RTX 3090 + Blackwell RTX 5090).
+// Uses PTX mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 for both S = Q * K^T (all 128 threads active)
+// and O = O * corr + P * V, keeping exact FP32 online softmax and full FP32 dynamic range via BF16 operands.
+#if !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+#define STRATA_DF2_TC_SM80 1
+#else
+#define STRATA_DF2_TC_SM80 0
+#endif
+
+#if STRATA_DF2_TC_SM80
+__device__ __forceinline__ void df2_mma_bf16_m16n8k16(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                      uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+#endif
+
+constexpr int AS16 = 136;   // 128 bf16 + 8 pad (16-byte aligned, bank-conflict-free)
+constexpr int VS16 = 36;    // 32 bf16 + 4 pad (8-byte aligned)
+__global__ void __launch_bounds__(128) attn_part_tc_kernel(
+    const float* __restrict__ q, const float* __restrict__ kring, const float* __restrict__ vring,
+    const float* __restrict__ kblk, const float* __restrict__ vblk,
+    const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
+    const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
+#if STRATA_DF2_TC_SM80
+    __shared__ __align__(16) uint16_t Qs[32 * AS16];        // 8,704 B
+    __shared__ __align__(16) union {
+        uint16_t K[32 * AS16];                              // 8,704 B: [t][d]
+        uint16_t VT[HD * VS16];                             // 9,216 B: [d][t]
+    } kv_s;
+    __shared__ __align__(16) uint16_t Ps16[32 * VS16];      // 2,304 B: [qi][t]
+    __shared__ float Sc[32 * 33];                           // 4,224 B
+    __shared__ float m_s[32], l_s[32], corr_s[32];
+    __shared__ unsigned char kvalid[32];
+
+    const int kvh = blockIdx.x, chunk = blockIdx.y, tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int wq = warp >> 1;      // 0..1: 16 queries each
+    const int wk = warp & 1;       // 0..1: 16 keys (S) or 64 dims (PV)
+    const int g = lane >> 2;       // 0..7
+    const int tig = lane & 3;      // 0..3
+
+    const int s = *anchor_pos;
+    const int lo = s - (window - 1) > 0 ? s - (window - 1) : 0;
+    const int nctx = s - lo;
+    const int nkeys = nctx + kDf2Rows;
+    const int k_begin = chunk * kDf2Chunk;
+    const int64_t ep = tag != nullptr ? ((int64_t) *epoch_ptr << 32) : 0;
+    float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * 32) * 130;
+    if (k_begin >= nkeys) {
+        for (int i = tid; i < 32 * 130; i += 128) pbase[i] = (i % 130 == 0) ? -INFINITY : 0.0f;
+        return;
+    }
+
+    auto f2bf16x2 = [](float a, float b) -> uint32_t {
+        const __nv_bfloat162 h = __floats2bfloat162_rn(a, b);
+        uint32_t u;
+        memcpy(&u, &h, 4);
+        return u;
+    };
+
+    const float scale = rsqrtf((float) HD);
+    for (int i = tid; i < 32 * (HD / 4); i += 128) {
+        const int a = i / (HD / 4), d4 = i % (HD / 4);
+        const int row = a >> 2, gq = a & 3;
+        const float4 v = *reinterpret_cast<const float4*>(q + ((size_t) row * 32 + kvh * kDf2Gqa + gq) * HD + d4 * 4);
+        const uint32_t p0 = f2bf16x2(v.x * scale, v.y * scale);
+        const uint32_t p1 = f2bf16x2(v.z * scale, v.w * scale);
+        *reinterpret_cast<uint2*>(&Qs[a * AS16 + d4 * 4]) = make_uint2(p0, p1);
+    }
+    if (tid < 32) { m_s[tid] = -INFINITY; l_s[tid] = 0.0f; }
+
+    float O[8][4];
+#pragma unroll
+    for (int nd = 0; nd < 8; ++nd) { O[nd][0] = 0.0f; O[nd][1] = 0.0f; O[nd][2] = 0.0f; O[nd][3] = 0.0f; }
+
+    const int k_end = min(k_begin + kDf2Chunk, nkeys);
+    auto fetch = [&](int k0, float4 (&reg)[8], const float* ring, const float* blk) {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4), k = k0 + t;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (k < nctx) v = *reinterpret_cast<const float4*>(ring + ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
+            else if (k < nkeys) v = *reinterpret_cast<const float4*>(blk + ((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d4 * 4);
+            reg[u] = v;
+        }
+    };
+    auto put_k = [&](const float4 (&reg)[8]) {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
+            const uint32_t p0 = f2bf16x2(reg[u].x, reg[u].y);
+            const uint32_t p1 = f2bf16x2(reg[u].z, reg[u].w);
+            *reinterpret_cast<uint2*>(&kv_s.K[t * AS16 + d4 * 4]) = make_uint2(p0, p1);
+        }
+    };
+    auto put_vt = [&](const float4 (&reg)[8]) {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
+            const int d0 = d4 * 4;
+            const __nv_bfloat16 b0 = __float2bfloat16_rn(reg[u].x);
+            const __nv_bfloat16 b1 = __float2bfloat16_rn(reg[u].y);
+            const __nv_bfloat16 b2 = __float2bfloat16_rn(reg[u].z);
+            const __nv_bfloat16 b3 = __float2bfloat16_rn(reg[u].w);
+            uint16_t u0, u1, u2, u3;
+            memcpy(&u0, &b0, 2); memcpy(&u1, &b1, 2); memcpy(&u2, &b2, 2); memcpy(&u3, &b3, 2);
+            kv_s.VT[(d0 + 0) * VS16 + t] = u0;
+            kv_s.VT[(d0 + 1) * VS16 + t] = u1;
+            kv_s.VT[(d0 + 2) * VS16 + t] = u2;
+            kv_s.VT[(d0 + 3) * VS16 + t] = u3;
+        }
+    };
+
+    float4 kreg[8], vreg[8];
+    fetch(k_begin, kreg, kring, kblk);
+
+    for (int k0 = k_begin; k0 < k_end; k0 += 32) {
+        __syncthreads();
+        put_k(kreg);
+        if (tid < 32) {
+            const int k = k0 + tid;
+            kvalid[tid] = (tag == nullptr || k >= nctx || k >= nkeys) ? 1 : (tag[(lo + k) % ring_slots] == (ep | (int64_t) (lo + k)) ? 1 : 0);
+        }
+        fetch(k0, vreg, vring, vblk);
+        __syncthreads();
+
+        // Stage 1: S = Q * K^T (32 x 32 over HD=128) via BF16 Tensor Cores (all 4 warps active!).
+        float sc0[4] = {0.f, 0.f, 0.f, 0.f};
+        float sc1[4] = {0.f, 0.f, 0.f, 0.f};
+        const int q0 = wq * 16;
+        const int kb0 = wk * 16;
+        if (!(variant & 1)) {
+#pragma unroll
+            for (int d = 0; d < HD; d += 16) {
+                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(&Qs[(q0 + g) * AS16 + d + 2 * tig]);
+                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(&Qs[(q0 + g + 8) * AS16 + d + 2 * tig]);
+                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(&Qs[(q0 + g) * AS16 + d + 8 + 2 * tig]);
+                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(&Qs[(q0 + g + 8) * AS16 + d + 8 + 2 * tig]);
+                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&kv_s.K[(kb0 + g) * AS16 + d + 2 * tig]);
+                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&kv_s.K[(kb0 + g) * AS16 + d + 8 + 2 * tig]);
+                df2_mma_bf16_m16n8k16(sc0, a0, a1, a2, a3, b0, b1);
+                const uint32_t b2 = *reinterpret_cast<const uint32_t*>(&kv_s.K[(kb0 + 8 + g) * AS16 + d + 2 * tig]);
+                const uint32_t b3 = *reinterpret_cast<const uint32_t*>(&kv_s.K[(kb0 + 8 + g) * AS16 + d + 8 + 2 * tig]);
+                df2_mma_bf16_m16n8k16(sc1, a0, a1, a2, a3, b2, b3);
+            }
+        }
+        auto store_sc = [&](int qi, int t, float val) {
+            const int k = k0 + t, row = qi >> 2;
+            bool ok = k < nkeys;
+            if (ok && k < nctx) ok = (lo + k) > (s + row - window) && kvalid[t];
+            Sc[qi * 33 + t] = ok ? val : -INFINITY;
+        };
+        store_sc(q0 + g,     kb0 + 2 * tig,     sc0[0]);
+        store_sc(q0 + g,     kb0 + 2 * tig + 1, sc0[1]);
+        store_sc(q0 + g + 8, kb0 + 2 * tig,     sc0[2]);
+        store_sc(q0 + g + 8, kb0 + 2 * tig + 1, sc0[3]);
+        store_sc(q0 + g,     kb0 + 8 + 2 * tig,     sc1[0]);
+        store_sc(q0 + g,     kb0 + 8 + 2 * tig + 1, sc1[1]);
+        store_sc(q0 + g + 8, kb0 + 8 + 2 * tig,     sc1[2]);
+        store_sc(q0 + g + 8, kb0 + 8 + 2 * tig + 1, sc1[3]);
+        __syncthreads();
+
+        // Stage 2: Exact FP32 online softmax -> write Ps16[qi][t] as BF16.
+        {
+            const int qi = tid >> 2, sub = tid & 3;
+            float v[8], tmax = -INFINITY;
+#pragma unroll
+            for (int u = 0; u < 8; ++u) { v[u] = Sc[qi * 33 + sub * 8 + u]; tmax = fmaxf(tmax, v[u]); }
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 2));
+            const float m_old = m_s[qi];
+            const float mn = fmaxf(m_old, tmax);
+            const float corr = (m_old == -INFINITY) ? 0.0f : __expf(m_old - mn);
+            float psum = 0.0f;
+            float pf[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const float p = v[u] == -INFINITY ? 0.0f : __expf(v[u] - mn);
+                pf[u] = p;
+                psum += p;
+            }
+            uint32_t* pdst = reinterpret_cast<uint32_t*>(&Ps16[qi * VS16 + sub * 8]);
+            pdst[0] = f2bf16x2(pf[0], pf[1]);
+            pdst[1] = f2bf16x2(pf[2], pf[3]);
+            pdst[2] = f2bf16x2(pf[4], pf[5]);
+            pdst[3] = f2bf16x2(pf[6], pf[7]);
+            psum += __shfl_xor_sync(0xffffffffu, psum, 1);
+            psum += __shfl_xor_sync(0xffffffffu, psum, 2);
+            if (sub == 0) { l_s[qi] = l_s[qi] * corr + psum; m_s[qi] = mn; corr_s[qi] = corr; }
+        }
+        __syncthreads();
+
+        // Stage 3: Transpose-store V into kv_s.VT, prefetch next K, run O = O*corr + P * V via BF16 TC!
+        put_vt(vreg);
+        if (k0 + 32 < k_end) fetch(k0 + 32, kreg, kring, kblk);
+        __syncthreads();
+
+        const float cr0 = corr_s[q0 + g];
+        const float cr1 = corr_s[q0 + g + 8];
+#pragma unroll
+        for (int nd = 0; nd < 8; ++nd) {
+            O[nd][0] *= cr0; O[nd][1] *= cr0;
+            O[nd][2] *= cr1; O[nd][3] *= cr1;
+        }
+        if (!(variant & 2)) {
+            const int d_base = wk * 64;
+#pragma unroll
+            for (int t = 0; t < 32; t += 16) {
+                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(&Ps16[(q0 + g) * VS16 + t + 2 * tig]);
+                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(&Ps16[(q0 + g + 8) * VS16 + t + 2 * tig]);
+                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(&Ps16[(q0 + g) * VS16 + t + 8 + 2 * tig]);
+                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(&Ps16[(q0 + g + 8) * VS16 + t + 8 + 2 * tig]);
+#pragma unroll
+                for (int nd = 0; nd < 8; ++nd) {
+                    const int d_row = d_base + nd * 8 + g;
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&kv_s.VT[d_row * VS16 + t + 2 * tig]);
+                    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&kv_s.VT[d_row * VS16 + t + 8 + 2 * tig]);
+                    df2_mma_bf16_m16n8k16(O[nd], a0, a1, a2, a3, b0, b1);
+                }
+            }
+        }
+    }
+
+    __syncthreads();
+    if (tid < 32) { pbase[tid * 130] = m_s[tid]; pbase[tid * 130 + 1] = l_s[tid]; }
+    const int q0 = wq * 16;
+    const int d_base = wk * 64;
+#pragma unroll
+    for (int nd = 0; nd < 8; ++nd) {
+        const int d_off = 2 + d_base + nd * 8 + 2 * tig;
+        *reinterpret_cast<float2*>(pbase + (size_t) (q0 + g) * 130 + d_off) = make_float2(O[nd][0], O[nd][1]);
+        *reinterpret_cast<float2*>(pbase + (size_t) (q0 + g + 8) * 130 + d_off) = make_float2(O[nd][2], O[nd][3]);
+    }
+#else
+    (void) q; (void) kring; (void) vring; (void) kblk; (void) vblk; (void) anchor_pos;
+    (void) ring_slots; (void) window; (void) part; (void) variant; (void) tag; (void) epoch_ptr;
+#endif
 }
 
 __device__ __forceinline__ void quant_block(float v, int blk, int col, int K, int8_t* __restrict__ xq, float* __restrict__ xd);
@@ -958,8 +1202,26 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
 
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
                    int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
-    attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
-    check("attn_part");
+#if !defined(__HIPCC__)
+    static const bool tc_ok = [] {
+        if (const char* e = std::getenv("STRATA_DF2_ATTN_TC"); e && e[0] == '0') return false;
+        int dev = 0, major = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        return major >= 8;
+    }();
+    if (tc_ok) {
+        attn_part_tc_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+        check("attn_part_tc");
+    } else
+#endif
+    {
+        attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+        check("attn_part");
+    }
     attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
     check("attn_merge");
 }
