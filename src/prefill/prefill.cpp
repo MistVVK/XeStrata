@@ -1559,6 +1559,30 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
     for (int32_t e = 0; e < E; ++e) if (!routes[(size_t) e].empty()) order.push_back(e);
     const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, ELL, I, f.up_type);
     const int32_t* labels = m.lat_labels_.data() + (size_t) l * E;
+    // The experts neither the cache nor page-locked RAM holds go through the stager's pinned ring, as on the standard
+    // path: a copy straight from pageable memory (the model file's mapping, a RAM copy the PC could not lock) hands the
+    // GPU's runtime the caller's pages, and where the OS takes those back the GPU's queues are suspended.  On a PC
+    // whose RAM is smaller than the experts the chunk stopped there for good (RX 9060 XT, 15 GiB of RAM, Edge0-120B,
+    // 2026-11-21: one expert's copy did not return in 16 minutes; through the ring the same reads finish).
+    std::vector<int> job_of(order.size(), -1);
+    {
+        std::vector<Stager::Job> js;
+        for (size_t j = 0; j < order.size(); ++j) {
+            const int32_t e = order[j];
+            if (m.host_res && m.cache && m.host_res[(size_t) l * E + e] >= 0) continue;
+            const bool tr = m.src->transient(l, e);   // copied by the source (never pinned)
+            if (!tr && m.src->pinned(l, e)) continue;
+            const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
+            if (!tr && !b) { err = "prefill: expert source has no blob"; return false; }
+            job_of[j] = (int) js.size();
+            js.push_back({b, blob_bytes, tr ? m.src : nullptr, (int32_t) l, e});
+        }
+        m.stager->start(std::move(js));
+    }
+    struct StagerDone {
+        Stager* st;
+        ~StagerDone() { st->finish(); }
+    } stager_done{m.stager.get()};
     int bi = 0;
     for (size_t b0 = 0; b0 < order.size(); b0 += kLatBatch, ++bi) {
         const size_t b1 = std::min(order.size(), b0 + kLatBatch);
@@ -1584,13 +1608,13 @@ bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::stri
             if (slot >= 0) {
                 p = (unsigned long long) m.cache->device_slot(slot);
             } else {
-                const uint8_t* b = m.src->blob(l, e);
-                if (b == nullptr) {
-                    err = "prefill: the latent arm needs the experts in RAM (the file tier is not wired yet)";
-                    return false;
-                }
+                // page-locked RAM is read in place; the others from the stager's pinned buffer (it waits if behind)
+                const uint8_t* b = job_of[j] < 0 ? m.src->blob(l, e) : m.stager->wait(job_of[j]);
+                if (b == nullptr) { err = "prefill: expert source has no blob"; return false; }
+                if (m.stager->failed.exchange(false)) { err = "prefill: the expert source could not copy a blob"; return false; }
                 strata::gpu::stream_wait_event(m.copy, m.used[0]);   // the last batch's kernel has read the buffers
                 strata::gpu::copy_async(m.lat_blobs_ + (j - b0) * blob_bytes, b, blob_bytes, m.copy);
+                if (job_of[j] >= 0) m.stager->issued_one(job_of[j], m.copy);
                 p = (unsigned long long) (m.lat_blobs_ + (j - b0) * blob_bytes);
                 dma = true;
             }
