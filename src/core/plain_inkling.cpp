@@ -67,6 +67,7 @@ inline float situ(float gate, float up, float beta, float lb) {
 }  // namespace
 
 struct PlainInkling::Impl {
+    int cpu_threads = 0;
     const GgufModel* m = nullptr;
     ModelSpec s;
     int64_t N = 0, NH = 0, NKV = 0, HD = 0, NE = 0, NK = 0, FF = 0, NCONV = 0, NSLOT = 0;
@@ -1046,7 +1047,7 @@ bool PlainInkling::Impl::window(const int32_t* tokens, int count, int64_t pos0, 
     return true;
 }
 
-PlainInkling::PlainInkling() : p_(std::make_unique<Impl>()) {}
+PlainInkling::PlainInkling(int cpu_threads) : p_(std::make_unique<Impl>()) { p_->cpu_threads = cpu_threads; }
 PlainInkling::~PlainInkling() = default;
 
 bool PlainInkling::load(const GgufModel& m, const ModelSpec& s, std::string& err) {
@@ -1059,11 +1060,10 @@ bool PlainInkling::run(const int32_t* tokens, int64_t n, int64_t pos, int rows, 
         err = "inkling2: no tokens to run";
         return false;
     }
-    // The reference walks one token at a time.  Prompt and decode use the same path, so a token's answer is the same
-    // whether it was alone in a window or at the end of a prompt.  Thread count stays modest: SYNC5-TILE is building
-    // on this machine while this reference is used.
+    // Keep the existing default until other machines and GPU verification have been measured.  On the i7-14700 CPU
+    // reference, 7 threads took 9.13-9.15 s for 3 decode tokens versus 9.72-9.75 s with the default 3 threads.
     const unsigned hw = std::thread::hardware_concurrency();
-    const int threads = std::max(1, (int) hw / 8);
+    const int threads = p_->cpu_threads > 0 ? p_->cpu_threads : std::max(1, (int) hw / 8);
     try {
         for (int64_t t = 0; t < n;) {
             const bool save = logits && t >= n - rows;

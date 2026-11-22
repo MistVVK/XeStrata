@@ -3449,7 +3449,7 @@ bool PlainModel::cpu_load(std::string& err) {
     }
     opt_.spec = 0;   // no MTP layer read: no drafts
     if (spec_.arch == ModelArch::Inkling2Loop) {
-        inkling_ = std::make_unique<PlainInkling>();
+        inkling_ = std::make_unique<PlainInkling>(opt_.cpu_threads);
         if (!inkling_->load(*model_, spec_, err) ||
             (opt_.draft == "dspark" && !inkling_->load_dspark(opt_.draft_model, err))) {
             inkling_.reset();
