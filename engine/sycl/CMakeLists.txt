@@ -394,6 +394,22 @@ if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU
     add_test(NAME native_arithmetic_parity_nvfp4_ggml COMMAND ${CMAKE_COMMAND} -E env
              STRATA_NO_NVFP4_512=1 STRATA_NO_NVFP4_256=1 $<TARGET_FILE:native_arithmetic_parity>)
   endif()
+  foreach(probe IN ITEMS bmg_gdn_tiles_parity bmg_gdn_residual_parity)
+    add_executable(${probe} src/prefill/${probe}.cpp)
+    target_link_libraries(${probe} PRIVATE strata_prefill)
+    add_test(NAME ${probe} COMMAND ${probe})
+    set_tests_properties(${probe} PROPERTIES SKIP_RETURN_CODE 77)
+  endforeach()
+  add_test(NAME bmg_gdn_auto_dispatch COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_GDN_CONV_SERIAL --unset=STRATA_GDN_CONVL2
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --auto)
+  add_test(NAME bmg_gdn_serial_override COMMAND ${CMAKE_COMMAND} -E env STRATA_GDN_CONV_SERIAL=1 STRATA_GDN_CONVL2=1
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --serial)
+  add_test(NAME bmg_gdn_fused_override COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_GDN_CONV_SERIAL STRATA_GDN_CONVL2=1
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --fused)
+  add_test(NAME bmg_gdn_separate_override COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_GDN_CONV_SERIAL STRATA_GDN_CONVL2=0
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --separate)
+  set_tests_properties(bmg_gdn_auto_dispatch bmg_gdn_serial_override bmg_gdn_fused_override bmg_gdn_separate_override
+    PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(gemm_stride_parity src/prefill/gemm_stride_parity.cpp)
   target_link_libraries(gemm_stride_parity PRIVATE strata_prefill)
   add_test(NAME gemm_stride_parity COMMAND gemm_stride_parity)

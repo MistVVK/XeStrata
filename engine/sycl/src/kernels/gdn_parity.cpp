@@ -182,15 +182,17 @@ int prefill_case(int T, int seed, int repeats) {
     for (size_t i = 0; i < ref16.size(); ++i) half_bad += ref16[i] != got16[i];
     std::printf("prefill T=%d seed=%d heads=%d: state=%zu y=%zu fp16=%zu mismatches; max_abs=%.9g max_rel=%.9g; baseline=%.3f ms xe=%.3f ms\n",
                 T, seed, HV, state_bad, y_bad, half_bad, max_abs, max_rel, base_ms, xe_ms);
-    // T=7 additionally checks the production entry point (variant 6 on Alchemist or under STRATA_GDN_XE=1,
-    // else variant 0) and T=0's no-op contract.
+    // Exercise production prefill at both sides of the 128-token Battlemage threshold. The seven-token case also checks T=0.
     int extra_bad = 0;
-    if (T == 7) {
+    if (T == 7 || T == 127 || T == 128) {
         run(-1, gotst, goty, got16);
         // Both variants must match anyway; compare production to baseline.
         extra_bad += std::memcmp(refst.data(), gotst.data(), refst.size() * sizeof(float)) != 0;
         extra_bad += std::memcmp(refy.data(), goty.data(), refy.size() * sizeof(float)) != 0;
         extra_bad += ref16 != got16;
+        if (T != 7) std::printf("prefill production T=%d: %s\n", T, extra_bad ? "FAIL" : "OK");
+    }
+    if (T == 7) {
         q.memcpy(dst, st.data(), st.size() * sizeof(float)).wait_and_throw();
         strata::prefill::gdn_recurrence_variant(6, dst, dh, dg, db, dz, dgm,
                                                1e-6f, dy, dy16, 0, &q);
@@ -233,7 +235,7 @@ int main(int argc, char** argv) {
     for (auto n : device.get_info<sycl::info::device::sub_group_sizes>()) std::printf(" %zu", n);
     std::printf("\n");
     int prefill_bad = 0;
-    for (int t : prefill_tokens ? std::vector<int>{prefill_tokens} : std::vector<int>{1, 7, 256, 1000})
+    for (int t : prefill_tokens ? std::vector<int>{prefill_tokens} : std::vector<int>{1, 7, 127, 128, 129, 256, 1000})
         for (int seed : {2025, 2026}) prefill_bad += prefill_case(t, seed, prefill_repeat);
     std::printf("prefill gdn: %d failures\n", prefill_bad);
     if (prefill_only) {

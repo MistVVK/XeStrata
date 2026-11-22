@@ -50,6 +50,8 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "bmg_gdn_tiles.hpp"
+#include "bmg_gdn_residual.hpp"
 #include <oneapi/mkl.hpp>   // SYCL port: the QSA block scores as GEMM tiles
 namespace strata::kernels {   // SYCL port, kept out of the shared headers: qsa_select.dp.cpp, qsa_decode_attn.dp.cpp
 void qsa_block_scores_reduce(const float* S, int64_t ld, int64_t b0, int64_t nb, const float* dead, const float* q_idx,
@@ -5045,8 +5047,18 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                           T, m.cs, m.xn16_lo, ldx);
                     normed = true;
                 } else if (wnn) {
-                    gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
-                                     m.xn16_lo, ldx);
+                    const int64_t row_stride = ldx > 0 ? ldx : D;
+                    if (half == 0 && !core::is_qsa_layer(g, l) && !m.f16_io &&
+                        use_bmg_gdn_tiles(*m.cs, T) && N == 2560 && HC == 4 && row_stride % 2 == 0 &&
+                        ((reinterpret_cast<uintptr_t>(m.R) | reinterpret_cast<uintptr_t>(m.bo) |
+                          reinterpret_cast<uintptr_t>(wnn->data)) & 7u) == 0 &&
+                        ((reinterpret_cast<uintptr_t>(m.xn16) | reinterpret_cast<uintptr_t>(m.xn16_lo)) & 3u) == 0) {
+                        bmg_gdn_residual::write_norm(*m.cs, m.R, m.bo, m.inj, HC, (const float*) wnn->data,
+                                                     EPS, m.grs, m.xn16, m.xn16_lo, int(T), int(row_stride));
+                    } else {
+                        gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
+                                         m.xn16_lo, ldx);
+                    }
                     normed = true;
                 } else {
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);

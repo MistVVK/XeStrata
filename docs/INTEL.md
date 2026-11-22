@@ -338,6 +338,8 @@ and text requests after the pictures all answered, with no GPU fault in the kern
 **Layout.** `engine/sycl/src` and `engine/sycl/include` mirror the tree and hold only the files the port changes; `engine/sycl/CMakeLists.txt` takes every
 other source from the original location. `sycl/include/dpct/` is the vendored SYCLomatic helper library.
 
+**Battlemage GDN prefill.** On Level Zero Battlemage, the 128-wide GDN recurrence with 16 key heads and 48 value heads pairs successive inputs from 128 tokens. From 512 rows, eligible GDN layers also share projection weights across four tokens, fuse convolution with Q/K normalization, and combine residual writeback with RMSNorm. The projection requires 48 outputs, 2,560 input columns, output stride 96 and a multiple of four rows. The residual uses aligned FP32 buffers and the supported four-stream BF16 layout. Other shapes retain their ordinary paths. Explicit `STRATA_GDN_CONV_SERIAL` and `STRATA_GDN_CONVL2` settings take precedence for convolution. The recurrence override below controls the recurrence only.
+
 **How it is made, so it can be redone.**
 
 1. `engine/sycl/tools/Dockerfile` is the dev image: the llama.cpp SYCL image plus SYCLomatic (`dpct` 2025.3), ninja, and the CUDA 12.8
@@ -394,6 +396,7 @@ All are environment variables for the engine. Put them in the config's `"env"` b
 | `STRATA_UMA_HEADROOM_GIB` | 6 | On such a GPU, the GiB of RAM the engine leaves free when it sizes its cache |
 | `STRATA_PF_XMX` | 2 on Alchemist | Grouped XMX expert launch; `0` off, `1` dequantize first |
 | `STRATA_GDN_XE` | On for Alchemist | Sub-group GDN recurrence |
+| `STRATA_SYCL_GDN_PREFILL_REG_QK` | Automatic on Level Zero Battlemage for the 128-wide, 16-key/48-value-head recurrence at 128 or more tokens | Load two consecutive inputs into subgroup registers and update the FP32 state in token order. Unset enables automatic selection. A value beginning with `1` requests the register kernel on supported inputs. Other explicit values, including `0`, an empty string, `on` and `true`, select the original column kernel. |
 | `STRATA_COPY_ENGINE` | On for Battlemage | Expert copies on the copy engine |
 | `STRATA_INTEL_GEN` | From the device | `battlemage`, `alchemist` or `unknown`: the generation whose kernels and defaults the GPU gets. An Xe3 GPU (Panther Lake: the Arc B390) is classed with Battlemage; `unknown` gives it the generic kernels. |
 | `STRATA_PREFILL_MMQ` | `auto` on Battlemage | Fused int8 prompt experts |
