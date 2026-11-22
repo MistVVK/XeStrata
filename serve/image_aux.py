@@ -48,6 +48,8 @@ SEEDVR2_WORK_MIB = 4096   # what a 7B run takes besides its weights at a couple 
 CONVERT_TIMEOUT_S = 600
 CHUNK = 1 << 20
 CONVERTERS = {"yolo": "yolo_pt.py", "esrgan": "esrgan.py", "state": "state_pt.py"}   # AUX "convert" -> its tool
+# Qwen-Image's ControlNet takes no color, normal or segmentation map: image_controls.mode_of uses the same list
+CONTROLNET_REFUSED_KINDS = ("color", "normal", "segmentation")
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}   # name -> its download's state, while one runs or after it failed
@@ -167,8 +169,9 @@ def setup_names(vram_mib: int, ram_mib: int, root: Path, families=(), versions: 
     - a region in words: Florence-2 large and base, and SAM 3 and CLIP's tokenizer once its license was agreed to in
       `root`.
     - the background's removal: BiRefNet general and lite (the smaller one it falls back to); `versions`: the others.
-    - the control, where a model of `families` takes one: every control image's networks (CNET_KINDS), and the
-      model's own (Qwen-Image's ControlNet Union, MOSS-Image's adapter and control LoRAs).
+    - the control, where a model of `families` takes one: the networks of the kinds it takes (CNET_KINDS), and the
+      model's own (Qwen-Image's ControlNet Union, MOSS-Image's adapter and control LoRAs).  Qwen-Image's ControlNet
+      refuses normal and segmentation maps, so those two networks are fetched only for a family that takes them.
     serve/images.py seedvr2_file takes the 7B's 8-bit file when it is here and fits, so the server uses these; it would
     fetch the 3B's FP16 file instead only with 10 GiB of VRAM beside less than 2 GiB of RAM."""
     q = _qimage()
@@ -183,8 +186,13 @@ def setup_names(vram_mib: int, ram_mib: int, root: Path, families=(), versions: 
     if versions:
         out += [f"birefnet-{v}" for v in q.BIREFNET_VERSIONS if v not in ("general", "lite")]
     caps = [q.family_capabilities(f) for f in families]
-    if any(c.get("control") or c.get("control_reference") or c.get("control_loras") for c in caps):
-        out += [w for ws in q.CNET_KINDS.values() for w in ws]
+    kinds = set()
+    for c in caps:
+        if not (c.get("control") or c.get("control_reference") or c.get("control_loras")):
+            continue
+        refused = CONTROLNET_REFUSED_KINDS if c.get("control") == "controlnet" else ()
+        kinds.update(k for k in q.CNET_KINDS if k not in refused)
+    out += [w for k in q.CNET_KINDS if k in kinds for w in q.CNET_KINDS[k]]
     if any(c.get("control") == "controlnet" for c in caps):
         out.append("cnet-union")
     if any(c.get("control") == "moss" for c in caps):
