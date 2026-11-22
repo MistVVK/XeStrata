@@ -6940,6 +6940,25 @@ def model_shards(fam: dict, model: str) -> int:
     return fam.get("forms", {}).get(model, MODELS.get(model, {})).get("shards", fam.get("shards", 2))
 
 
+def files_gb(family: str, model: str) -> float:
+    """A size's model files on disk (GB), as setup's lists show it: the sizes pinned for that family's files (SC117's
+    Swift 1.5 IQ3_S 83.5, not MODELS' 83.6 of ISTA-DASLab's), a Sync pack's files with the files all packs share, a
+    model of PLAIN_FAMILIES' file; a model of the user's own files as setup read them.  The picture reader and the MTP
+    draft layer are not counted."""
+    fam = FAMILIES[family]
+    if fam.get("plain"):
+        return fam["models"][model]["size"] / 1e9
+    if fam.get("custom"):
+        return MODELS[model]["download_gb"]
+    if family == "sync":
+        return sum(n for files in (sync_models.PACK_FILES[model], sync_models.SHARED_FILES)
+                   for n, _ in files.values()) / 1e9
+    pins = [published_pin(model_file(fam, model, i), fam, model) for i in range(1, model_shards(fam, model) + 1)]
+    if None in pins:
+        raise KeyError(f"{family} {model}: a model file without a pinned size")
+    return sum(p[0] for p in pins if p) / 1e9
+
+
 def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
     """UD-Q4_K_XL, UD-IQ4_XS: the GiB of experts the engine keeps in RAM (--resident-budget-gib): the RAM (GB,
     ram_gb()) less 24 for the OS, the engine and the file cache the other experts are read through, less a KV cache
@@ -9123,7 +9142,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                 f"   <- needs ~{need:.0f} GB of VRAM at {c // 1024}K, the GPU has {gpu_gb:.0f} GB"
         else:
             fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
-        say(f"  {i}) {m:15s} {d['about']}" + ("" if d.get("custom") else f"; download {gb:.0f} GB") + fit)
+        say(f"  {i}) {m:15s} {d['about']}" + ("" if d.get("custom") else f"; download {gb:.1f} GB") + fit)
     # the best quality this PC runs (recommend_size; on the CPU the family's own choice: every size runs as int8)
     cards = [gpu_info(i) for i in sel] if len(sel) > 1 else [gpu]
     rec = str(names.index(recommend_size(family, room_of(ram, cards), names)) + 1)
@@ -9981,7 +10000,8 @@ def describe() -> dict:
                 fits = (("yes" if size_fits(f, m, room) else "no") if f == "sync" else
                         "budget" if d.get("budget") else "yes" if ram >= d["ram_gb"] else "low-ram" if low else
                         "no")
-                models.append({"id": m, "about": d["about"], "download_gb": d["download_gb"], "ram_gb": d["ram_gb"],
+                models.append({"id": m, "about": d["about"], "download_gb": round(files_gb(f, m), 1),
+                               "ram_gb": d["ram_gb"],
                                "fits": fits, "experimental": bool(d.get("experimental")),
                                "recommended": m == by_quant[size_quantizer(f, m)], "quantizer": size_quantizer(f, m),
                                "context": min(by_vram, ram_ctx(m, ram, low)),
@@ -10880,13 +10900,13 @@ def main() -> int:
         if m == have_size:
             fit += "   (installed)"
         if d.get("budget"):
-            say(f"  {i}) {m} {d['about']}; download {d['download_gb']:.0f} GB, keeps ~"
+            say(f"  {i}) {m} {d['about']}; download {files_gb(family, m):.1f} GB, keeps ~"
                 f"{resident_budget_gib(m, ram)} GB of its {d['arena_gb']:.0f} GB of experts in RAM{fit}")
             continue
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, vram) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, vram):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, vram) else "the rest from the SSD)"))
-        say(f"  {i}) {m:8s} {d['about']}" + ("" if d.get("custom") else f"; download {d['download_gb']:.0f} GB") +
+        say(f"  {i}) {m:8s} {d['about']}" + ("" if d.get("custom") else f"; download {files_gb(family, m):.1f} GB") +
             f", uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index(recommend_size(family, room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]]), names)) + 1)
     if family == halo_fam and STRIX_HALO_MODEL in names:

@@ -153,6 +153,20 @@ class FirstModel(unittest.TestCase):
         self.assertEqual(setup.recommend_family(self.fams, room(128, None)), "qwen35-2b")
 
 
+class FilesSize(unittest.TestCase):
+    def test_the_pinned_files(self):
+        sizes = {("sc117-swift", "IQ3_S"): 83.5, ("sc117-swift", "IQ3_XXS"): 75.8, ("sync", "Sync-XS"): 57.6,
+                 ("sync", "Sync-S"): 61.7, ("sync", "Sync-M"): 68.1, ("qwen35-2b", "UD-Q5_K_XL"): 1.5}
+        for (family, model), gb in sizes.items():
+            with self.subTest(family=family, model=model):
+                self.assertEqual(round(setup.files_gb(family, model), 1), gb)
+
+    def test_every_listed_size_has_its_files_size(self):
+        for f in (f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")):
+            for m in setup.family_sizes(f):
+                self.assertGreater(setup.files_gb(f, m), 0.5, f"{f} {m}")
+
+
 class Levels(unittest.TestCase):
     def test_every_family_has_its_place(self):
         self.assertEqual(set(setup.TIERS), {f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")})
