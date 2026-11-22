@@ -81,18 +81,28 @@ int main(int argc, char** argv) {
                 prop.name, prop.major, prop.minor, prop.multiProcessorCount,
                 (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0), (int)sm120::available());
 
-    InkCudaModel model;
-    std::string err;
-    if (!model.load(model_path, gpu_id, use_screen, err)) {
-        std::fprintf(stderr, "Load failed: %s\n", err.c_str());
-        return 1;
-    }
-
-    // Auto-select FP8 KV for high concurrency (32/64 slots) on <= 32 GB VRAM cards
+    // Auto-select FP8 KV for high concurrency (16/32/64 slots) on < 40 GB VRAM cards BEFORE pinning experts!
     InkKvDtype kvd = kv_fp8 ? InkKvDtype::FP8 : InkKvDtype::FP16;
-    if (!kv_fp8 && parallel >= 32 && prop.totalGlobalMem < (40ull << 30)) {
+    if (!kv_fp8 && parallel >= 16 && prop.totalGlobalMem < (40ull << 30)) {
         kvd = InkKvDtype::FP8;
         std::printf("Auto-enabling FP8 KV cache for parallel=%d on %.1f GiB VRAM\n", parallel, (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+    }
+    size_t extra_reserve = 0;
+    if (parallel >= 8) {
+        const size_t swa_r = (parallel >= 16) ? (size_t)(kInkSwaWin + 32) : (size_t)(kInkSwaWin + std::max(chunk, 64));
+        const size_t bpe = (kvd == InkKvDtype::FP8) ? 2ull : 4ull;
+        const size_t sc_per_pos = (kvd == InkKvDtype::FP8) ? (size_t)(2 * kInkKVHeads * 4) : 0ull;
+        extra_reserve = (size_t)40 * parallel * swa_r * ((size_t)kInkKVDim * bpe + sc_per_pos)
+                      + (size_t)kInkVisits * parallel * 3 * kInkSconvCh * 4
+                      + (size_t)8 * parallel * 256 * ((size_t)kInkKVDim * bpe + sc_per_pos)
+                      + (1536ull << 20);
+    }
+
+    InkCudaModel model;
+    std::string err;
+    if (!model.load(model_path, gpu_id, use_screen, err, extra_reserve)) {
+        std::fprintf(stderr, "Load failed: %s\n", err.c_str());
+        return 1;
     }
 
     InkCudaRunner runner(model);
@@ -100,7 +110,7 @@ int main(int argc, char** argv) {
     runner.init(parallel, max_ctx, chunk, kvd);
 
     InkDSpark dspark(runner);
-    if (use_dspark && model.man.has_dspark) dspark.init(max_ctx, 512);
+    if (use_dspark && model.man.has_dspark) dspark.init(runner.max_ctx, 512);
 
     // Build prompt token IDs (realistic default prompt if --tokens not passed)
     std::vector<int32_t> prompt;

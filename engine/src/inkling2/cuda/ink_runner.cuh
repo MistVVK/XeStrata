@@ -508,18 +508,24 @@ struct InkCudaRunner {
                 swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
             }
             const size_t bpe = (kv_dtype == InkKvDtype::FP8) ? 2 : 4;  // K+V bytes per element
-            const size_t swa_kv_bytes = (size_t)40 * max_slots * swa_ring * kInkKVDim * bpe;
+            const size_t sc_per_pos = (kv_dtype == InkKvDtype::FP8) ? (size_t)(2 * kInkKVHeads * 4) : 0;
+            const size_t swa_kv_bytes = (size_t)40 * max_slots * swa_ring * ((size_t)kInkKVDim * bpe + sc_per_pos);
             const size_t sconv_bytes  = (size_t)kInkVisits * max_slots * 3 * kInkSconvCh * 4;
-            const size_t ws_reserve   = (1400ull << 20);  // activation workspaces + DSpark + cuBLAS headroom
+            const size_t ws_reserve   = (max_slots >= 8) ? (1400ull << 20) : (480ull << 20);  // activation workspaces + DSpark + cuBLAS headroom
             if (vfree > swa_kv_bytes + sconv_bytes + ws_reserve) {
                 const size_t avail_glob = vfree - swa_kv_bytes - sconv_bytes - ws_reserve;
-                const size_t per_pos_glob = (size_t)8 * max_slots * kInkKVDim * bpe;
+                const size_t per_pos_glob = (size_t)8 * max_slots * ((size_t)kInkKVDim * bpe + sc_per_pos);
                 const int fit_ctx = (int)std::min<size_t>((size_t)max_ctx, (avail_glob / std::max<size_t>(1, per_pos_glob)) & ~(size_t)63);
-                if (fit_ctx < max_ctx && fit_ctx >= 256) {
+                if (fit_ctx < max_ctx) {
+                    const int clamped = std::max(256, fit_ctx);
                     std::fprintf(stderr, "[InkCUDA] Auto-sizing max_ctx %d -> %d for parallel=%d (%.2f GiB free VRAM)\n",
-                                 max_ctx, fit_ctx, max_slots, (double)vfree / (1024.0 * 1024.0 * 1024.0));
-                    max_ctx = fit_ctx;
+                                 max_ctx, clamped, max_slots, (double)vfree / (1024.0 * 1024.0 * 1024.0));
+                    max_ctx = clamped;
                 }
+            } else if (max_ctx > 256) {
+                std::fprintf(stderr, "[InkCUDA] Tight VRAM (%.2f GiB free) for parallel=%d: clamping max_ctx %d -> 256\n",
+                             (double)vfree / (1024.0 * 1024.0 * 1024.0), max_slots, max_ctx);
+                max_ctx = 256;
             }
         }
 

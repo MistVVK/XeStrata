@@ -125,12 +125,15 @@ public:
         const size_t swa_r = (max_slots_ >= 16) ? (size_t)(strata::ink::kInkSwaWin + 32)
                                                 : (size_t)(strata::ink::kInkSwaWin + std::max(eff_chunk, 64));
         const size_t bpe = (kv_dtype_ == KvDtype::FP8_E4M3) ? 2ull : 4ull;
-        const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * strata::ink::kInkKVDim * bpe
+        const size_t sc_per_pos = (kv_dtype_ == KvDtype::FP8_E4M3) ? (size_t)(2 * strata::ink::kInkKVHeads * 4) : 0ull;
+        const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos)
                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
-                                  + (size_t)8 * max_slots_ * 256 * strata::ink::kInkKVDim * bpe;
-        const size_t min_reserve_bytes = min_kv_bytes + ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20)
-                                                       : (prop.totalGlobalMem <= (13ull << 30)) ? (260ull << 20)
-                                                                                                : (320ull << 20));
+                                  + (size_t)8 * max_slots_ * 256 * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos);
+        const size_t ws_pad = (max_slots_ >= 8) ? (1536ull << 20)
+                            : ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20)
+                             : (prop.totalGlobalMem <= (13ull << 30)) ? (260ull << 20)
+                                                                      : (320ull << 20));
+        const size_t min_reserve_bytes = min_kv_bytes + ws_pad;
 
         // Load .strata v1.1 trunk + experts (100% VRAM or 3x loop-weighted vram_load_order!)
         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
