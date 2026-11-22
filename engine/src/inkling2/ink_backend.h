@@ -79,6 +79,21 @@ public:
         return 0;
     }
 
+    // Optional fused on-device greedy speculative step (W=4 Adaptive Beam Tree + zero-logits-D2H verify + commit).
+    // Returns n_emit in 1..min(8, max_emit) on success, 0 to fall back to dspark_draft + forward_batch, or -1 on error.
+    virtual int dspark_spec_step_greedy(
+        int slot,
+        int32_t anchor_tok,
+        int anchor_pos,
+        int max_emit,
+        int32_t* out_emitted,
+        int* out_drafted,
+        std::string& err) {
+        (void)slot; (void)anchor_tok; (void)anchor_pos; (void)max_emit;
+        (void)out_emitted; (void)out_drafted; (void)err;
+        return 0;
+    }
+
     // Optional GPU Vision ViT encoder: returns true if encoded on device, false to fall back to CPU ViT.
     virtual bool encode_image(const ImageRec& img, std::vector<float>& out_embeds, std::string& err) {
         (void)img; (void)out_embeds; (void)err;

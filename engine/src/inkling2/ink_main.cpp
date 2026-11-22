@@ -169,20 +169,51 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
 
     double t_dec0 = now_s();
     int total_gen = 0;
-    for (int step = 0; step < gen_len; ++step) {
-        batch.clear();
-        batch.capture_taps = use_dspark;
-        for (int s = 0; s < P; ++s) batch.push(s, prompt_len + step, next_tok[s], true);
-        if (!backend->forward_batch(batch, logits.data(), nullptr, err)) {
-            fprintf(stderr, "bench decode err: %s\n", err.c_str());
-            return 1;
-        }
-        for (int s = 0; s < P; ++s) {
-            const float* lg = logits.data() + static_cast<size_t>(s) * V;
+    if (use_dspark && P == 1) {
+        int cur_pos = prompt_len;
+        while (total_gen < gen_len) {
+            const int rem = gen_len - total_gen;
+            if (rem >= 2 && cur_pos + 12 < bo.max_ctx) {
+                int32_t emitted[16]{};
+                int drafted = 0;
+                const int n_emit = backend->dspark_spec_step_greedy(
+                    0, next_tok[0], cur_pos, rem, emitted, &drafted, err);
+                if (n_emit < 0) { fprintf(stderr, "bench spec err: %s\n", err.c_str()); return 1; }
+                if (n_emit > 0) {
+                    next_tok[0] = emitted[n_emit - 1];
+                    cur_pos += n_emit;
+                    total_gen += n_emit;
+                    continue;
+                }
+            }
+            batch.clear();
+            batch.capture_taps = true;
+            batch.push(0, cur_pos++, next_tok[0], true);
+            if (!backend->forward_batch(batch, logits.data(), nullptr, err)) {
+                fprintf(stderr, "bench decode err: %s\n", err.c_str());
+                return 1;
+            }
             int32_t best = 0;
-            for (int i = 1; i < V; ++i) if (lg[i] > lg[best]) best = i;
-            next_tok[s] = best;
+            for (int i = 1; i < V; ++i) if (logits[i] > logits[best]) best = i;
+            next_tok[0] = best;
             ++total_gen;
+        }
+    } else {
+        for (int step = 0; step < gen_len; ++step) {
+            batch.clear();
+            batch.capture_taps = use_dspark;
+            for (int s = 0; s < P; ++s) batch.push(s, prompt_len + step, next_tok[s], true);
+            if (!backend->forward_batch(batch, logits.data(), nullptr, err)) {
+                fprintf(stderr, "bench decode err: %s\n", err.c_str());
+                return 1;
+            }
+            for (int s = 0; s < P; ++s) {
+                const float* lg = logits.data() + static_cast<size_t>(s) * V;
+                int32_t best = 0;
+                for (int i = 1; i < V; ++i) if (lg[i] > lg[best]) best = i;
+                next_tok[s] = best;
+                ++total_gen;
+            }
         }
     }
     double dec_s = now_s() - t_dec0;

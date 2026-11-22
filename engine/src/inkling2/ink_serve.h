@@ -628,11 +628,57 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             continue;
         }
 
-        // 2. Fast-path: Single-stream or low-concurrency DSpark Block-8 speculative step (when decoding)
+        // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree / Block-8 speculative step (when decoding)
         if (use_dspark && n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
             reqs[sole_slot].s.greedy() && reqs[sole_slot].generated + 2 <= reqs[sole_slot].max_new &&
             reqs[sole_slot].cur_pos + 8 < cfg.bopts.max_ctx) {
             auto& rq = reqs[sole_slot];
+            // 2a. Zero-D2H fused greedy Beam Tree speculative step (when no penalties and headroom >= 12)
+            if (!rq.s.penalties() && rq.cur_pos + 12 < cfg.bopts.max_ctx) {
+                int32_t emitted[16]{};
+                int drafted = 0;
+                std::string serr;
+                const int max_emit = rq.max_new - rq.generated;
+                const int n_emit = backend.dspark_spec_step_greedy(
+                    rq.slot, rq.next_tok, rq.cur_pos, max_emit, emitted, &drafted, serr);
+                if (n_emit < 0) {
+                    proto("ERR fatal GPU error: %s", serr.c_str());
+                    return 1;
+                }
+                if (n_emit > 0) {
+                    rq.drafts_offered += drafted;
+                    int kept = 0;
+                    bool done = false;
+                    const char* fin = nullptr;
+                    for (int i = 0; i < n_emit; ++i) {
+                        const int32_t tok = emitted[i];
+                        rq.hist.push_back(tok);
+                        rq.gen_ids.push_back(tok);
+                        rq.cached_prefix.push_back(i == 0 ? rq.next_tok : emitted[i - 1]);
+                        ++rq.generated;
+                        ++kept;
+                        if (i + 1 < n_emit) ++rq.drafts_accepted;
+                        if (rq.is_solo) proto("T %d", tok);
+                        else if (rq.is_ext_gen) proto("T %s %d", rq.req_id.c_str(), tok);
+                        else proto("BT %d %d", rq.slot, tok);
+
+                        if (is_stop_tok(tok)) { fin = "stop"; done = true; break; }
+                        if (rq.generated >= rq.max_new) { fin = "length"; done = true; break; }
+                        if (cfg.anti_loop && detect_repetition_loop(rq.gen_ids)) { fin = "stop"; done = true; break; }
+                    }
+                    if (!done) {
+                        rq.next_tok = emitted[n_emit - 1];
+                        rq.cur_pos += n_emit;
+                    } else {
+                        if (kept < n_emit) {
+                            backend.rollback_slot(rq.slot, rq.cur_pos + kept);
+                        }
+                        rq.cur_pos += kept;
+                        if (fin) finish_req(rq, fin);
+                    }
+                    continue;
+                }
+            }
             int32_t draft_ids[8]{};
             std::string derr;
             const int max_d = std::min(7, rq.max_new - rq.generated - 1);
