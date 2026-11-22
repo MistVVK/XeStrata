@@ -35,6 +35,7 @@ _HEADER_TAGS = (CONTENT_THINK, CONTENT_TEXT, CONTENT_TOOL_JSON, CONTENT_TOOL_TEX
 _IDLE_TAGS = (MSG_MODEL, CONTENT_THINK, CONTENT_TEXT, CONTENT_TOOL_JSON, CONTENT_TOOL_TEXT, CONTENT_XML, END_MSG, END_SAMPLING, ENDOFTEXT)
 _BODY_TAGS = (END_MSG, END_SAMPLING, ENDOFTEXT, MSG_MODEL)
 _MAX_TAG = max(len(t) for t in _HEADER_TAGS)
+_MAX_HEADER_CHARS = 128
 
 
 def _safe_json_call(name: str, arguments) -> str:
@@ -43,7 +44,7 @@ def _safe_json_call(name: str, arguments) -> str:
     return f"<tool_call>\n{payload}\n</tool_call>"
 
 
-def _parse_tool_body(header_name: str, body: str, kind: str) -> str:
+def _parse_tool_body(header_name: str, body: str, kind: str, *, truncated: bool = False) -> str:
     raw = body.strip()
     fallback_name = header_name.strip()
     if kind == "tool_json":
@@ -74,6 +75,8 @@ def _parse_tool_body(header_name: str, body: str, kind: str) -> str:
                 args = {"value": args}
             if name:
                 return _safe_json_call(name, args)
+        if truncated and raw and not raw.startswith("{"):
+            return raw
         if fallback_name:
             return _safe_json_call(fallback_name, {"raw": raw} if raw else {})
         return raw
@@ -118,7 +121,7 @@ class InklingDialect:
         self._in_think = False
 
     def _tags_for(self):
-        if self.state == "idle":
+        if self.state in ("idle", "think"):
             return _IDLE_TAGS
         if self.state == "header":
             return _HEADER_TAGS
@@ -192,6 +195,12 @@ class InklingDialect:
             out.append(("content", chunk))
         elif self.state == "header":
             self.header_acc += chunk
+            # A real Inkling tool-name header is short and single-line; if newlines or >128 chars arrive without a
+            # `<|content_*|>` tag, the model omitted `<|content_text|>` and is writing plain text (#6620).
+            if "\n" in self.header_acc or len(self.header_acc) > _MAX_HEADER_CHARS:
+                out.append(("content", self.header_acc))
+                self.header_acc = ""
+                self.state = "text"
         elif self.state in ("tool_json", "tool_text"):
             self.tool_acc += chunk
 
@@ -205,6 +214,8 @@ class InklingDialect:
             self.tool_acc = ""
             self.header_acc = ""
         elif self.state == "header":
+            if self.header_acc:
+                out.append(("content", self.header_acc))
             self.header_acc = ""
 
     def _handle_tag_typed(self, tag: str, out: list[tuple[str, str]]) -> None:
@@ -239,8 +250,10 @@ class InklingDialect:
             return
 
     def _finish_typed(self, out: list[tuple[str, str]]) -> None:
-        if self.state in ("tool_json", "tool_text") and (self.tool_acc.strip() or self.header_acc.strip()):
-            rendered = _parse_tool_body(self.header_acc, self.tool_acc, self.state)
+        if self.state == "header" and self.header_acc:
+            out.append(("content", self.header_acc))
+        elif self.state in ("tool_json", "tool_text") and (self.tool_acc.strip() or self.header_acc.strip()):
+            rendered = _parse_tool_body(self.header_acc, self.tool_acc, self.state, truncated=True)
             if rendered:
                 if "<tool_call>" in rendered:
                     self.calls += 1
@@ -317,3 +330,26 @@ def prepare_messages(messages: list[dict]) -> list[dict]:
             new_calls.append({**tc, "function": fn})
         out.append({**m, "tool_calls": new_calls} if changed else m)
     return out
+
+
+def finish_prompt(prompt: str, *, has_tools: bool = False, forced: bool = False) -> str:
+    """Append an explicit non-thinking turn opener to a rendered Inkling-2-Mini prompt (#6612, #6620, #6627).
+
+    Inkling-2-Mini's `chat_template.jinja` ends at `<|end_message|>` with no assistant opener, so even with
+    `Thinking effort level: 0` the model still generates `<|message_model|><|content_thinking|>...<|end_message|>`
+    (burning `max_tokens`, causing empty replies, and breaking multi-turn prefix reuse).
+    - Without tools: append `<|message_model|><|content_text|>` so generation starts directly in visible text
+      and matches the next turn's rendered assistant prefix verbatim.
+    - With tools: append an empty thinking turn `<|message_model|><|content_thinking|><|end_message|>` so the
+      model immediately selects either `<|message_model|><|content_text|>` or a tool invocation without wasting
+      tokens or looping inside hidden thinking.
+    Idempotent if the prompt already carries an opener or when a forced tool-call opener will be appended.
+    """
+    if not prompt or forced:
+        return prompt
+    empty_think = f"{MSG_MODEL}{CONTENT_THINK}{END_MSG}"
+    if prompt.endswith((CONTENT_TEXT, CONTENT_TOOL_JSON, CONTENT_TOOL_TEXT, empty_think)):
+        return prompt
+    if prompt.endswith(MSG_MODEL):
+        return prompt + (f"{CONTENT_THINK}{END_MSG}" if has_tools else CONTENT_TEXT)
+    return prompt + (empty_think if has_tools else f"{MSG_MODEL}{CONTENT_TEXT}")

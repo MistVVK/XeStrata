@@ -34,6 +34,8 @@ class SyclInkBackend final : public InkBackend {
 public:
     const char* backend_name() const noexcept override { return mod_.ep2_active ? "sycl-ep2" : "sycl"; }
 
+    bool dspark_ready() const override { return runner_.use_dspark; }
+
     std::string device_info() const override {
         const auto& d = ink_sycl::dev_caps();
         std::string info = d.name + " (" + d.platform + ", " +

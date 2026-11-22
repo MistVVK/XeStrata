@@ -1846,13 +1846,16 @@ def take_note() -> str:
 
 
 def engine_info(args: list[Any], log_text: str = "", note: str = "") -> dict[str, str]:
-    """The facts of one engine start for /metrics and the apps: ``drafting`` (mtp | dflash2 | off) and ``drafting_note`` (plain words, or ""): the one drafter this
-    start loads (``--draft dflash2`` without ``--mtp``, ``--mtp`` without ``--draft``), and why it is not the one asked for. The engine's own log wins over the choice."""
+    """The facts of one engine start for /metrics and the apps: ``drafting`` (mtp | dflash2 | dspark | off) and ``drafting_note`` (plain words, or ""): the one drafter this
+    start loads (``--draft dflash2`` without ``--mtp``, ``--draft dspark``, ``--mtp`` without ``--draft``), and why it is not the one asked for. The engine's own log wins over the choice."""
     items = [str(a) for a in args]
     asked_dflash2 = any(items[i] == "--draft" and i + 1 < len(items) and items[i + 1] == "dflash2" for i in range(len(items)))
+    asked_dspark = any(items[i] == "--draft" and i + 1 < len(items) and items[i + 1] == "dspark" for i in range(len(items)))
     fell_back = fallback_note(log_text) if asked_dflash2 else ""
     drafter = "mtp" if "--mtp" in items else "off"
     if asked_dflash2 and not fell_back:
         drafter = "dflash2"
+    elif asked_dspark and "Skipping DSpark drafter" not in str(log_text or ""):
+        drafter = "dspark"
     text = fell_back or (line(drafter, note) if note else "")
     return {"drafting": drafter, "drafting_note": text}

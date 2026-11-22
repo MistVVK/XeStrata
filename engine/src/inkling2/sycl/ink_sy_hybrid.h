@@ -75,7 +75,7 @@ inline void k_moe_gu_situ_single_sg16(
         if (r >= 1152) return;
 
         const uint8_t* body = ed.body_ptr;
-        const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8);
+        const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8 && ed.dn_code != FMT_GGUF_RAW);
         const float inv_sq = is_sk_dn ? (1.0f / h2f_bits(ld16(body + 2 * r))) : 1.0f;
 
         for (int t0 = 0; t0 < n; t0 += 4) {
@@ -127,6 +127,25 @@ inline void k_moe_gu_situ_single_sg16(
                         float dg = 0.0f, du = 0.0f;
                         for (int j = 0; j < 32; ++j) { dg += e4m3_to_f32(bg[j]) * xp[j]; du += e4m3_to_f32(bu[j]) * xp[j]; }
                         ag[i] += dg * scg; au[i] += du * scu;
+                    }
+                }
+            } else if (ed.gu_code == FMT_GGUF_RAW) {
+                const InkSyGgufExpertHeader* hdr = reinterpret_cast<const InkSyGgufExpertHeader*>(body);
+                const uint32_t gt = hdr->gu_type;
+                const size_t rb = sy_gguf_row_bytes(gt, 2304);
+                const bool ilv = (hdr->flags & 1u) != 0;
+                const uint8_t* rg = body + 32 + (size_t)(ilv ? (2 * r) : r) * rb;
+                const uint8_t* ru = body + 32 + (size_t)(ilv ? (2 * r + 1) : (1152 + r)) * rb;
+                for (int unit = lane; unit < 288; unit += 16) {
+                    const int col = unit << 3;
+                    float wg[8], wu[8];
+                    sy_gguf_decode_8(gt, rg, col, hdr->gate_scale, wg);
+                    sy_gguf_decode_8(gt, ru, col, hdr->up_scale, wu);
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = x_in + (size_t)tk[i] * 2304 + col;
+                        float dg = 0.0f, du = 0.0f;
+                        for (int t = 0; t < 8; ++t) { dg += wg[t] * xp[t]; du += wu[t] * xp[t]; }
+                        ag[i] += dg; au[i] += du;
                     }
                 }
             } else {
@@ -229,6 +248,24 @@ inline sycl::event k_moe_dn_single_sg16(
                         a0[i] += d0 * sc0; a1[i] += d1 * sc1;
                     }
                 }
+            } else if (ed.dn_code == FMT_GGUF_RAW) {
+                const InkSyGgufExpertHeader* hdr = reinterpret_cast<const InkSyGgufExpertHeader*>(body);
+                const uint32_t dt = hdr->dn_type;
+                const size_t rb = sy_gguf_row_bytes(dt, 1152);
+                const uint8_t* r0 = body + ed.dn_off + (size_t)(2 * rp) * rb;
+                const uint8_t* r1 = body + ed.dn_off + (size_t)(2 * rp + 1) * rb;
+                for (int unit = lane; unit < 144; unit += 16) {
+                    const int col = unit << 3;
+                    float w0[8], w1[8];
+                    sy_gguf_decode_8(dt, r0, col, hdr->dn_scale, w0);
+                    sy_gguf_decode_8(dt, r1, col, hdr->dn_scale, w1);
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = h_act + (size_t)pid[i] * 1152 + col;
+                        float d0 = 0.0f, d1 = 0.0f;
+                        for (int t = 0; t < 8; ++t) { d0 += w0[t] * xp[t]; d1 += w1[t] * xp[t]; }
+                        a0[i] += d0; a1[i] += d1;
+                    }
+                }
             } else {
                 const int F = ed.dn_code;
                 const int SB = sk_sb_bytes(F);
@@ -273,10 +310,10 @@ struct InkSyHybridEngine {
     struct CpuGroup {
         int gid = 0;
         int out_base = 0;   // index into bell->cpu_pair_ids / bell->y_cpu
-        int count = 0;      // number of tokens using this cold expert
-        int tok_ids[kSyHybridMaxBatch]{};
-        int pair_ids[kSyHybridMaxBatch]{};
-        float weights[kSyHybridMaxBatch]{};
+        int count = 0;      // number of (tok, k) pairs using this cold expert (up to kSyHybridMaxPairs)
+        int tok_ids[kSyHybridMaxPairs]{};
+        int pair_ids[kSyHybridMaxPairs]{};
+        float weights[kSyHybridMaxPairs]{};
     };
 
     struct PendingProm {
@@ -613,7 +650,7 @@ struct InkSyHybridEngine {
             int exp_to_vg[128], exp_to_cg[128];
             std::memset(exp_to_vg, -1, sizeof(exp_to_vg));
             std::memset(exp_to_cg, -1, sizeof(exp_to_cg));
-            int v_pair_tmp[128][8];
+            int v_pair_tmp[128][16];
 
             for (int pid = 0; pid < P; ++pid) {
                 const int e = bell->topk_idx[pid]; if (e < 0 || e >= E) continue;
@@ -630,7 +667,7 @@ struct InkSyHybridEngine {
                         h_uexp[vg] = e;
                         h_ucnt[vg] = 0;
                     }
-                    v_pair_tmp[vg][h_ucnt[vg]++] = pid;
+                    if (h_ucnt[vg] < 16) v_pair_tmp[vg][h_ucnt[vg]++] = pid;
                 } else {
                     ++stat_cpu_hits;
                     int cg = exp_to_cg[e];
@@ -641,10 +678,12 @@ struct InkSyHybridEngine {
                         cur_groups[cg].count = 0;
                     }
                     auto& grp = cur_groups[cg];
-                    const int idx = grp.count++;
-                    grp.tok_ids[idx] = pid >> 3;
-                    grp.pair_ids[idx] = pid;
-                    grp.weights[idx] = bell->topk_w[pid];
+                    if (grp.count < kSyHybridMaxPairs) {
+                        const int idx = grp.count++;
+                        grp.tok_ids[idx] = pid >> 3;
+                        grp.pair_ids[idx] = pid;
+                        grp.weights[idx] = bell->topk_w[pid];
+                    }
                 }
             }
 

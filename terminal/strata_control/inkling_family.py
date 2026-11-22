@@ -70,7 +70,7 @@ TOKENIZER_FILES = {
 }
 BUILD_ABOUT = {
     "SQ-20": "bit-exact lossless native SF4+MX8 LLM + DSpark drafter: 100% GPU on 24 GiB cards and 32+ GiB unified memory",
-    "SQ-15": "flagship quality (beats UD-Q4_K_XL): 100% GPU on 16 GiB cards / 24 GiB Macs, or fast 3x loop-pinned hybrid on 12 GiB cards",
+    "SQ-15": "flagship quality (beats UD-Q4_K_XL): 100% GPU on 20+ GiB cards / 24 GiB Macs, or fast 3x loop-pinned hybrid on 12–16 GiB cards",
     "SQ-10": "compact high-speed build: 100% GPU on 12 GiB cards, 16 GiB Macs, 4–8 GiB hybrid cards, and Radeon 780M / Strix Point 890M iGPUs",
     "UD-Q8_K_XL": "Unsloth Dynamic ~8-bit GGUF + DSpark drafter: near-lossless GGUF for 24+ GiB GPUs or 32+ GiB RAM",
     "UD-Q4_K_XL": "Unsloth Dynamic ~4.5-bit GGUF + DSpark drafter: high-quality GGUF for 16–24 GiB GPUs or hybrid RAM",

@@ -11,6 +11,7 @@
 #include "strata/core/router_lookahead_v2.hpp"
 #include "strata/inkling2/inkling2_loop.hpp"
 #include "strata/platform/cgroup_mem.hpp"
+#include "strata/quant/isa.hpp"
 #include "strata/quant/sk_codecs.hpp"
 
 #include <algorithm>
@@ -114,18 +115,29 @@ struct CpuSlot {
     std::vector<std::vector<uint16_t>> dspark_v;
     std::vector<uint16_t> dspark_frnn;            // [pos * hidden] BF16
     int dspark_len = 0;
+
+    // Prompt-end conversation checkpoint (#6627)
+    bool ckpt_valid = false;
+    int ckpt_seq_len = 0;
+    SlotShortConvState ckpt_sconv;
+    std::vector<std::vector<uint8_t>> ckpt_swa_k_pages;
+    std::vector<std::vector<uint8_t>> ckpt_swa_v_pages;
+    std::vector<std::vector<float>>   ckpt_swa_k_scales;
+    std::vector<std::vector<float>>   ckpt_swa_v_scales;
+    int ckpt_dspark_len = 0;
 };
 
 class CpuBackend final : public InkBackend {
 public:
     const char* backend_name() const noexcept override { return "cpu"; }
+    bool dspark_ready() const override { return has_dspark_; }
 
     std::string device_info() const override {
         int nth = 1;
 #ifdef _OPENMP
         nth = omp_get_max_threads();
 #endif
-        return std::string("CPU (") + active_sk_isa() + ", " + std::to_string(nth) + " threads)";
+        return std::string("CPU (") + strata::quant::isa_name(strata::quant::best_isa()) + ", " + std::to_string(nth) + " threads)";
     }
 
     BackendStats stats() const override {
@@ -327,6 +339,37 @@ public:
         slots_[slot].recording_snaps = false;
         slots_[slot].snap_seq_len = -1;
         slots_[slot].dspark_len = 0;
+        slots_[slot].ckpt_valid = false;
+    }
+
+    bool save_prompt_checkpoint(int slot, int seq_len) override {
+        if (slot < 0 || slot >= static_cast<int>(slots_.size()) || !slots_[slot].allocated || seq_len <= 0) return false;
+        auto& sl = slots_[slot];
+        sl.ckpt_seq_len = seq_len;
+        sl.ckpt_sconv = sl.sconv;
+        sl.ckpt_swa_k_pages = sl.kv.swa_k_pages;
+        sl.ckpt_swa_v_pages = sl.kv.swa_v_pages;
+        sl.ckpt_swa_k_scales = sl.kv.swa_k_scales;
+        sl.ckpt_swa_v_scales = sl.kv.swa_v_scales;
+        sl.ckpt_dspark_len = sl.dspark_len;
+        sl.ckpt_valid = true;
+        return true;
+    }
+
+    bool restore_prompt_checkpoint(int slot, int seq_len) override {
+        if (slot < 0 || slot >= static_cast<int>(slots_.size()) || !slots_[slot].allocated) return false;
+        auto& sl = slots_[slot];
+        if (!sl.ckpt_valid || sl.ckpt_seq_len != seq_len) return false;
+        sl.sconv = sl.ckpt_sconv;
+        sl.kv.swa_k_pages = sl.ckpt_swa_k_pages;
+        sl.kv.swa_v_pages = sl.ckpt_swa_v_pages;
+        sl.kv.swa_k_scales = sl.ckpt_swa_k_scales;
+        sl.kv.swa_v_scales = sl.ckpt_swa_v_scales;
+        sl.kv.seq_len = seq_len;
+        sl.dspark_len = std::min(sl.ckpt_dspark_len, seq_len);
+        sl.recording_snaps = false;
+        sl.snap_seq_len = -1;
+        return true;
     }
 
     void snapshot_slot(int slot) override {

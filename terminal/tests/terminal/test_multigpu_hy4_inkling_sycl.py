@@ -69,7 +69,7 @@ class InklingKindMultiGpuTests(unittest.TestCase):
                     cfg = {"arch": "inkling2_loop", "backend": backend, "args": list(self.BASE), **extra}
                     args = inkling_kind.engine_args(cfg, "x", announce=False)
                     self.assertIn("--gpus", args, (backend, extra))
-                    self.assertEqual(args[args.index("--gpus") + 1], "2", (backend, extra))
+                    self.assertEqual(args[args.index("--gpus") + 1], "1,0", (backend, extra))
 
             single = {"arch": "inkling2_loop", "backend": "hip", "gpu": 0, "args": list(self.BASE)}
             self.assertNotIn("--gpus", inkling_kind.engine_args(single, "x", announce=False))

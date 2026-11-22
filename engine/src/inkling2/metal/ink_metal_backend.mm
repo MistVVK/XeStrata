@@ -69,6 +69,8 @@ public:
 
     int effective_max_ctx() const override { return runner_.max_ctx; }
 
+    bool dspark_ready() const override { return runner_.use_dspark; }
+
     std::string device_info() const override {
         return cx_.device_name() + " (workSet=" +
                std::to_string((int)(cx_.recommended_working_set() / (1024ull * 1024ull * 1024ull))) + " GiB)";

@@ -2389,10 +2389,12 @@ __global__ void __launch_bounds__(128) k4_moe_router_topk(
     __shared__ int32_t s_chosen[8];
 
     const float lg = logits[static_cast<size_t>(m) * 128 + e];
-    // Inkling-2-Mini exact sigmoid router!
-    const float p = 1.0f / (1.0f + __expf(-lg));
+    // Inkling-2-Mini exact sigmoid router! (NaN-safe so top-K always picks K_top distinct experts!)
+    float p = 1.0f / (1.0f + __expf(-lg));
+    if (!(p == p)) p = 0.0f;
     s_prob[e] = p;
     float my_sc = p + (bias ? bias[e] : 0.0f);
+    if (!(my_sc == my_sc)) my_sc = -1e29f;
     __syncthreads();
 
     // 4-Wave parallel deterministic Top-K argmax (strictly greater, smallest eid wins ties -> 8x faster than 1-thread!)
@@ -2462,9 +2464,11 @@ __global__ void __launch_bounds__(128) k4_moe_router_topk_f16(
     __shared__ int32_t s_chosen[8];
 
     const float lg = logits[static_cast<size_t>(m) * 128 + e];
-    const float p = 1.0f / (1.0f + __expf(-lg));
+    float p = 1.0f / (1.0f + __expf(-lg));
+    if (!(p == p)) p = 0.0f;
     s_prob[e] = p;
     float my_sc = p + (bias ? bias[e] : 0.0f);
+    if (!(my_sc == my_sc)) my_sc = -1e29f;
     __syncthreads();
 
     for (int k = 0; k < K_top; ++k) {

@@ -217,6 +217,22 @@ inline void k_dequant_moe_gu_f16_sg16(InkSyExpertDev ed, half* w_f16) {
                     *reinterpret_cast<sycl::vec<half, 8>*>(o + c * 8) = v;
                 }
             }
+        } else if (ed.gu_code == FMT_GGUF_RAW) {
+            const InkSyGgufExpertHeader* hdr = reinterpret_cast<const InkSyGgufExpertHeader*>(body);
+            const uint32_t gt = hdr->gu_type;
+            const size_t rb = sy_gguf_row_bytes(gt, 2304);
+            const int src_row = (hdr->flags & 1u) ? row : (((row & 1) ? 1152 : 0) + (row >> 1));
+            const float ext_sc = (row & 1) ? hdr->up_scale : hdr->gate_scale;
+            const uint8_t* wr = body + 32 + (size_t)src_row * rb;
+            for (int unit = lane; unit < 288; unit += 16) {
+                const int col = unit << 3;
+                float wf[8];
+                sy_gguf_decode_8(gt, wr, col, ext_sc, wf);
+                sycl::vec<half, 8> v;
+#pragma unroll
+                for (int t = 0; t < 8; ++t) v[t] = (half)wf[t];
+                *reinterpret_cast<sycl::vec<half, 8>*>(dst + col) = v;
+            }
         } else {
             const int F = ed.gu_code;
             const int SB = sk_sb_bytes(F);
@@ -314,6 +330,23 @@ inline void k_dequant_moe_dn_f16_sg16(InkSyExpertDev ed, half* w_f16) {
                     *reinterpret_cast<sycl::vec<half, 8>*>(d1 + b * 32 + c * 8) = v;
                 }
             }
+        } else if (ed.dn_code == FMT_GGUF_RAW) {
+            const InkSyGgufExpertHeader* hdr = reinterpret_cast<const InkSyGgufExpertHeader*>(body);
+            const uint32_t dt = hdr->dn_type;
+            const size_t rb = sy_gguf_row_bytes(dt, 1152);
+            const uint8_t* r0 = body + ed.dn_off + (size_t)(2 * rp) * rb;
+            const uint8_t* r1 = body + ed.dn_off + (size_t)(2 * rp + 1) * rb;
+            for (int unit = lane; unit < 144; unit += 16) {
+                const int col = unit << 3;
+                float wf0[8], wf1[8];
+                sy_gguf_decode_8(dt, r0, col, hdr->dn_scale, wf0);
+                sy_gguf_decode_8(dt, r1, col, hdr->dn_scale, wf1);
+                sycl::vec<half, 8> u, v;
+#pragma unroll
+                for (int t = 0; t < 8; ++t) { u[t] = (half)wf0[t]; v[t] = (half)wf1[t]; }
+                *reinterpret_cast<sycl::vec<half, 8>*>(d0 + col) = u;
+                *reinterpret_cast<sycl::vec<half, 8>*>(d1 + col) = v;
+            }
         } else {
             const int F = ed.dn_code;
             const int SB = sk_sb_bytes(F);
@@ -361,7 +394,7 @@ inline void k_moe_situ_invsq_f16_sg16(InkSyExpertDev ed, const float* y_gu, int 
     Q().parallel_for(NR(n, 256), [=](sycl::nd_item<1> it) INK_REQD_SG16 {
         const int i = (int)it.get_group(0), tid = (int)it.get_local_id(0);
         const uint8_t* body = ed.body_ptr;
-        const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8);
+        const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8 && ed.dn_code != FMT_GGUF_RAW);
         const float* src = y_gu + (size_t)i * 2304;
         half* dst = h_f16 + (size_t)i * 1152;
         for (int r = tid; r < 1152; r += 256) {
