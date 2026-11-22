@@ -178,6 +178,10 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : round_exec_c_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_c_) if (e) cudaGraphExecDestroy(e);
+    for (auto& kv : bm_graphs_) if (kv.second) cudaGraphExecDestroy(kv.second);
+    bm_graphs_.clear();
+    bm_used_.clear();
+    if (bm_arena_) cudaFree(bm_arena_);
     if (cparams_) cudaFree(cparams_);
     if (cring_) cudaFree(cring_);
     if (dinv_) cudaFree(dinv_);
@@ -207,7 +211,8 @@ MtpDrafter::~MtpDrafter() {
     if (owns_draft_head_ && dvocab_) cudaFree(dvocab_);
     if (ev_chain_) cudaEventDestroy(ev_chain_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_floor_};
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_floor_,
+                     h_bm_tok_, h_bm_step_, h_bm_pos_, h_bm_out_, h_bm_prob_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
 }
 
@@ -2113,6 +2118,638 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
         }
     std::vector<int32_t> toks((size_t) T, token);
     return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts, result);
+}
+
+// ---- STRATA_BATCH_MTP_FUSED=1: multi-slot batched MTP drafting (opt-in, default off)
+
+bool MtpDrafter::can_draft_slots(const BatchSlotDraft* items, int n_items) const {
+#if defined(STRATA_GPU_METAL)
+    (void) items; (void) n_items;
+    return false;
+#else
+    if (items == nullptr || n_items < 2 || g_ == nullptr || head_ == nullptr || wt_ == nullptr) return false;
+    if (experts_lent_ || chain_live_ || max_t_ < 2 || cell_floor_enabled() || mtp_catchup_all() || top2_env()) return false;
+    if (rr_res_ != nullptr) return false;
+    for (int i = 0; i < n_items; ++i) {
+        const BatchSlotDraft& it = items[i];
+        const MtpDrafter* sl = it.slot;
+        if (sl == nullptr || it.R_rows == nullptr || it.tokens == nullptr || it.out_drafts == nullptr) return false;
+        if (it.keep < 1 || it.keep > 2 || it.pos0 < 0) return false;
+        for (int j = 0; j < i; ++j)
+            if (items[j].slot == sl) return false;
+        if (sl->device_ != device_ || sl->window_ != window_ || sl->cap_ != cap_ || sl->g_ != g_) return false;
+        if (sl->max_t_ < 2 || std::min(sl->max_t_ - 1, sl->max_drafts_) != 1) return false;
+        if (sl->coupled_active_ || sl->cell_floor_enabled() || sl->chain_live_ || sl->experts_lent_) return false;
+        if (sl->rr_res_ != nullptr) return false;
+        if (sl->hnorm_stream_ != hnorm_stream_ || sl->q4_ != q4_ || sl->q4_head_ != q4_head_) return false;
+        if (sl->head_ != head_ || sl->dhead_ != dhead_ || sl->dhead_type_ != dhead_type_ ||
+            sl->dvocab_ != dvocab_ || sl->n_dvocab_ != n_dvocab_) return false;
+        if (sl->st_.kv_hybrid || st_.kv_hybrid) return false;
+        if (sl->st_.kv_rot != st_.kv_rot || sl->st_.kv_q4 != st_.kv_q4 || sl->st_.kv_int8 != st_.kv_int8) return false;
+        const int a = it.keep - 1;
+        if (sl->st_.max_cells - (it.pos0 + a) < 1) return false;
+    }
+    return true;
+#endif
+}
+
+bool MtpDrafter::ensure_batch_mtp_buffers(std::string& err) {
+    if (bm_ready_) return true;
+    const int cap_m = std::min(std::min(max_t_, strata::kernels::kFusedGrMaxT),
+                               std::min(strata::kernels::kQsaAttnMaxSlots, 8));
+    if (cap_m < 2) { err = "mtp batch: max_t < 2"; return false; }
+    const ModelGeometry& g = *g_;
+    const uint64_t M = (uint64_t) cap_m, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc;
+    const uint64_t NH = (uint64_t) g.n_head, FF = (uint64_t) g.n_ff;
+    const uint64_t attn_bytes = M * (uint64_t) attn_scratch_floats_ * sizeof(float);
+    static const int attn_slots_env = [] {
+        const char* v = std::getenv("STRATA_BATCH_MTP_ATTN_SLOTS");
+        return v == nullptr || v[0] == '\0' ? -1 : (std::atoi(v) != 0 ? 1 : 0);
+    }();
+    const bool want_attn_slots = attn_slots_env > 0 || (attn_slots_env < 0 && attn_bytes <= 32ull * 1024ull * 1024ull);
+
+    auto cleanup = [&]() {
+        if (bm_arena_) { cudaFree(bm_arena_); bm_arena_ = nullptr; }
+        void* hs[] = {h_bm_tok_, h_bm_step_, h_bm_pos_, h_bm_out_, h_bm_prob_};
+        for (void* h : hs) if (h) cudaFreeHost(h);
+        h_bm_tok_ = m_bm_tok_ = nullptr;
+        h_bm_step_ = m_bm_step_ = nullptr;
+        h_bm_pos_ = m_bm_pos_ = nullptr;
+        h_bm_out_ = m_bm_out_ = nullptr;
+        h_bm_prob_ = m_bm_prob_ = nullptr;
+        bm_Rin_cu_ = bm_Rin_acc_ = nullptr;
+        bm_tok_ = bm_step_ = bm_pos_ = nullptr;
+        bm_sh_gate_ = bm_sh_up_ = bm_sh_g_ = nullptr;
+        bm_x_bf16_ = nullptr;
+        bm_dummy_inj_ = nullptr;
+        bm_attn_scratch_ = nullptr;
+    };
+
+    const bool ok_map = mapped((size_t) (2 * M * 4 + 64), (void**) &h_bm_tok_, (void**) &m_bm_tok_) &&
+                        mapped((size_t) (2 * M * 4 * 4 + 64), (void**) &h_bm_step_, (void**) &m_bm_step_) &&
+                        mapped((size_t) (2 * M * NH * 4 + 64), (void**) &h_bm_pos_, (void**) &m_bm_pos_) &&
+                        mapped((size_t) (M * 4 + 64), (void**) &h_bm_out_, (void**) &m_bm_out_) &&
+                        mapped((size_t) (M * 4 + 64), (void**) &h_bm_prob_, (void**) &m_bm_prob_);
+    if (!ok_map) {
+        cleanup();
+        err = "mtp batch: mapped staging failed";
+        return false;
+    }
+
+    auto carve = [&](Bump& b) {
+        bm_tok_ = b.take<int32_t>(2 * M);
+        bm_step_ = b.take<int32_t>(2 * M * 4);
+        bm_pos_ = b.take<int32_t>(2 * M * NH);
+        bm_Rin_cu_ = b.take<float>(M * HC * N);
+        bm_Rin_acc_ = b.take<float>(M * HC * N);
+        bm_sh_gate_ = b.take<float>(M * FF);
+        bm_sh_up_ = b.take<float>(M * FF);
+        bm_sh_g_ = b.take<float>(M);
+        bm_x_bf16_ = b.take<uint16_t>(M * N);
+        bm_dummy_inj_ = b.take<float>(M * HC);
+        bm_attn_scratch_ = want_attn_slots ? b.take<float>(M * (uint64_t) attn_scratch_floats_) : nullptr;
+    };
+    Bump count;
+    carve(count);
+    if (cudaMalloc(&bm_arena_, count.used) != cudaSuccess) {
+        (void) cudaGetLastError();
+        cleanup();
+        err = "mtp batch: staging buffers do not fit";
+        return false;
+    }
+    cudaMemset(bm_arena_, 0, count.used);
+    Bump real;
+    real.base = (uint8_t*) bm_arena_;
+    carve(real);
+    vram_ += count.used;
+    bm_max_t_ = cap_m;
+    bm_ready_ = true;
+    std::fprintf(stderr, "strata mtp: STRATA_BATCH_MTP_FUSED=1 active (chunk_cap=%d, staging %.2f MiB, attn_slots=%s)\n",
+                 bm_max_t_, (double) count.used / 1048576.0, bm_attn_scratch_ != nullptr ? "on" : "per-row");
+    return true;
+}
+
+bool MtpDrafter::record_front_slots(int T, const int32_t* tok_d, const int32_t* step_d, const int32_t* pos_d,
+                                    const float* Rin_d, QsaState* const* states, cudaStream_t cs, std::string& err) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const int64_t N = g.n_embd, HC = g.hc, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
+    const QsaShapes s = shapes_of(g);
+    int wt_fc_embedding, wt_fc_hidden, wt_k_proj, wt_v_proj;
+    const void* wp_fc_embedding = wq("fc_embedding.weight", wt_fc_embedding);
+    const void* wp_fc_hidden = wq("fc_hidden.weight", wt_fc_hidden);
+    const void* wp_k_proj = wq("self_attn.k_proj.weight", wt_k_proj);
+    const void* wp_v_proj = wq("self_attn.v_proj.weight", wt_v_proj);
+    try {
+        const WeightRef* we = wt_->find("token_embd.weight");
+        if (!we) { err = "mtp batch: token_embd.weight is missing"; return false; }
+        if (const NativeEmbed* ne = native_embed()) {
+            ne->gather_dev(tok_d, T, emb_, cs);
+        } else {
+            const auto* codes = (const uint8_t*) we->data;
+            const auto* scales = (const float*) (codes + we->codes_bytes);
+            const auto* offsets = we->has_offset ? (const float*) (codes + we->codes_bytes + we->scales_bytes) : nullptr;
+            embedding_gather_dev(codes, scales, offsets, tok_d, T, we->ne0, we->code_bits, we->code_bias, we->group_elems,
+                                 (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), emb_, cs);
+        }
+        native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
+        native_quantize_q8_1(en_, xq_, (int) N, T, cs);
+        native_mmvq(wt_fc_embedding, wp_fc_embedding, xq_, e2_, (int) N, (int) N, T, cs);
+        if (hnorm_stream_)
+            native_qsa_rms_norm_grouped(Rin_d, f32("pre_fc_norm_hidden.weight"), hn_, (int) N, (int) HC, (int) (T * HC), EPS, cs);
+        else
+            native_qsa_rms_norm_weighted(Rin_d, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
+        for (int c0 = 0; c0 < T * HC; c0 += 8) {
+            const int nc = (int) std::min<int64_t>(8, T * HC - c0);
+            native_quantize_q8_1(hn_ + (size_t) c0 * N, xq_, (int) N, nc, cs);
+            native_mmvq(wt_fc_hidden, wp_fc_hidden, xq_, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
+        }
+        add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
+        const bool qfuse_hc = mtp_qfuse_hc_on();
+        bool q8_attn = false;
+        {
+            FusedGrArgs fa[kFusedGrMaxT];
+            for (int t = 0; t < T; ++t) {
+                fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;
+                fa[t].w_norm = f32("attn_hyper_connection.hc_norm.weight");
+                fa[t].w_down = bf16("attn_hyper_connection.input_mix_weight_down.weight");
+                fa[t].w_up = bf16("attn_hyper_connection.input_mix_weight_up.weight");
+                fa[t].w_inject = bf16("attn_hyper_connection.block_inject_weight.weight");
+                fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
+                fa[t].inject_out = inj_ + t * HC; fa[t].mixed = mixed_ + t * N;
+                if (qfuse_hc) fa[t].q8_mixed = xq_ + (size_t) t * (N / 32) * 36;
+            }
+            q8_attn = fused_gr_read_multi(fa, T, xn_, cs);
+        }
+        if (!q8_attn) native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
+        native_mmvq(wt_k_proj, wp_k_proj, xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
+        native_mmvq(wt_v_proj, wp_v_proj, xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
+        const bool fuse_nr = native_rope_enabled() && native_norm_rope_usable((int) HD, (int) s.n_rot);
+        if (T == 1 && fuse_nr) {
+            native_qsa_rms_norm_rope(kcur_, (int) HD, f32("self_attn.k_norm.weight"), kcur_, (int) NKV, (int) HD,
+                                     (int) s.n_rot, EPS, rope_scaling(), pos_d, cs);
+        } else {
+            native_qsa_rms_norm_weighted(kcur_, f32("self_attn.k_norm.weight"), kcur_, (int) HD, (int) (T * NKV), EPS, cs);
+            for (int t = 0; t < T; ++t) {
+                float* kc = kcur_ + (size_t) t * NKV * HD;
+                if (native_rope_enabled())
+                    native_rope_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, rope_scaling(), pos_d + t * NH, cs);
+                else
+                    rope_neox_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, states[t]->cos_tab, states[t]->sin_tab,
+                                    pos_d + t * NH, cs);
+            }
+        }
+        if (st_.kv_rot) {
+            fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
+            fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
+        }
+        // Each row appends into its own slot's QsaState
+        for (int t = 0; t < T; ++t) {
+            QsaState& st = *states[t];
+            if (st.kv_q4)
+                kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_d + t * 4, kcur_ + (size_t) t * NKV * HD,
+                                  vcur_ + (size_t) t * NKV * HD, s, cs, &st.host);
+            else if (st.kv_int8)
+                kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_d + t * 4,
+                                  kcur_ + (size_t) t * NKV * HD, vcur_ + (size_t) t * NKV * HD, s, cs, &st.host);
+            else
+                kv_append_step(st.k_pool, st.v_pool, st.page_table, step_d + t * 4, kcur_ + (size_t) t * NKV * HD,
+                               vcur_ + (size_t) t * NKV * HD, s, cs, &st.host);
+        }
+    } catch (const std::exception& e) {
+        err = std::string("mtp batch front: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+bool MtpDrafter::record_rest_slots(int T, int32_t* step_d, const int32_t* pos_d, QsaState* const* states,
+                                   cudaStream_t cs, std::string& err) {
+    using namespace strata::kernels;
+    if (!decode_ready(err)) return false;
+    const ModelGeometry& g = *g_;
+    const SessionState& ss = *ss_;
+    const int64_t N = g.n_embd, HC = g.hc, K = ss.k, NH = g.n_head, HD = g.head_dim;
+    const QsaShapes s = shapes_of(g);
+    const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+    int wt_q_proj, wt_o_proj;
+    const void* wp_q_proj = wq("self_attn.q_proj.weight", wt_q_proj);
+    const void* wp_o_proj = wq("self_attn.o_proj.weight", wt_o_proj);
+    const bool fuse_nr = native_rope_enabled() && native_norm_rope_usable((int) HD, (int) s.n_rot);
+    try {
+        // ---- batched Q projection + Q norm + RoPE (xq_ already holds mixed_[0..T-1] from Pass 2 record_front_slots)
+        native_mmvq(wt_q_proj, wp_q_proj, xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
+        if (fuse_nr) {
+            native_qsa_rms_norm_rope(qfull_, (int) (2 * HD), f32("self_attn.q_norm.weight"), qcur_, (int) (T * NH),
+                                     (int) HD, (int) s.n_rot, EPS, rope_scaling(), pos_d, cs);
+        } else {
+            if (cudaMemcpy2DAsync(qcur_, (size_t) HD * 4, qfull_, (size_t) HD * 2 * 4, (size_t) HD * 4,
+                                  (size_t) (T * NH), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                err = "mtp batch: q split failed";
+                return false;
+            }
+            native_qsa_rms_norm_weighted(qcur_, f32("self_attn.q_norm.weight"), qcur_, (int) HD, (int) (T * NH), EPS, cs);
+            if (native_rope_enabled()) {
+                native_rope_apply(qcur_, qcur_, (int) (T * NH), (int) HD, (int) s.n_rot, rope_scaling(), pos_d, cs);
+            } else {
+                for (int t = 0; t < T; ++t)
+                    rope_neox_apply(qcur_ + (size_t) t * NH * HD, qcur_ + (size_t) t * NH * HD, (int) NH, (int) HD,
+                                    (int) s.n_rot, states[t]->cos_tab, states[t]->sin_tab, pos_d + t * NH, cs);
+            }
+        }
+        if (st_.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
+
+        // ---- per-slot dense attention (dual-track: fused qsa_decode_attn_slots when available, else sequential per-row on attn_scratch_)
+        if (window_ > 0) window_ids(step_d, T, (int) window_, ident_, cap_, cs);
+        QsaAttnSlotPools sp{};
+        for (int t = 0; t < T; ++t) sp.p[t] = qsa_attn_pools(*states[t]);
+        static const bool split_attn = [] {
+            const char* v = std::getenv("STRATA_QSA_SPLIT_ATTN");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        const bool fused_attn = !split_attn && bm_attn_scratch_ != nullptr &&
+                                qsa_decode_attn_slots(qcur_, sp, ident_, step_d, cap_, s, bm_attn_scratch_, attn_, T, cs);
+        if (!fused_attn) {
+            for (int t = 0; t < T; ++t) {
+                if (!(split_attn && qsa_decode_attn_split(qcur_ + (size_t) t * NH * HD, sp.p[t],
+                                                          ident_ + (size_t) t * (size_t) cap_, step_d + t * 4, cap_, s,
+                                                          attn_scratch_, (uint64_t) attn_scratch_floats_,
+                                                          attn_ + (size_t) t * NH * HD, 1, cs)))
+                    qsa_decode_attn_batch(qcur_ + (size_t) t * NH * HD, sp.p[t], ident_ + (size_t) t * (size_t) cap_,
+                                          step_d + t * 4, cap_, s, attn_scratch_, attn_ + (size_t) t * NH * HD, 1, cs);
+            }
+        }
+        if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
+        native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
+        native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
+        native_mmvq(wt_o_proj, wp_o_proj, xq_, bo_, (int) (NH * HD), (int) N, T, cs);
+
+        // ---- MLP hyper-connection (attention residual write folded in)
+        const bool qfuse_hc = mtp_qfuse_hc_on();
+        bool q8_mlp = false;
+        {
+            FusedGrArgs fa[kFusedGrMaxT];
+            for (int t = 0; t < T; ++t) {
+                fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = true;
+                fa[t].bo_prev = bo_ + t * N; fa[t].inj_prev = inj_ + t * HC;
+                fa[t].w_norm = f32("mlp_hyper_connection.hc_norm.weight");
+                fa[t].w_down = bf16("mlp_hyper_connection.input_mix_weight_down.weight");
+                fa[t].w_up = bf16("mlp_hyper_connection.input_mix_weight_up.weight");
+                fa[t].w_inject = bf16("mlp_hyper_connection.block_inject_weight.weight");
+                fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
+                fa[t].inject_out = inj2_ + t * HC; fa[t].mixed = mixed_ + t * N;
+                if (qfuse_hc) fa[t].q8_mixed = xq_ + (size_t) t * (N / 32) * 36;
+            }
+            q8_mlp = fused_gr_read_multi(fa, T, xn_, cs);
+        }
+
+        // ---- MoE: batched shared expert on side_ + batched router + grouped 512 resident experts across all T*K entries
+        NativeSharedWeights nsw;
+        nsw.gate_data = wq("mlp.shared_expert.gate_proj.weight", nsw.gate_type);
+        nsw.up_data = wq("mlp.shared_expert.up_proj.weight", nsw.up_type);
+        nsw.down_data = wq("mlp.shared_expert.down_proj.weight", nsw.down_type);
+        nsw.q8_1 = xq_;
+        const bool need_bf16_x = !shared_expert_native_bf16_enabled();
+        static const bool fuse_head_gr = [] {
+            const char* v = std::getenv("STRATA_FUSE_HEAD_GR");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        const bool head_mix_multi_on = mtp_head_mix_multi_on();
+        static const bool branch_on = [] {
+#if defined(STRATA_USE_HIP)
+            return false;
+#else
+            const char* v = std::getenv("STRATA_MTP_SHARED_BRANCH");
+            return v == nullptr || std::atoi(v) != 0;
+#endif
+        }();
+        const bool use_branch = branch_on && side_ != nullptr && sh_fork_ != nullptr && sh_join_ != nullptr;
+        cudaStream_t sh_cs = cs;
+        if (use_branch) {
+            if (cudaEventRecord(sh_fork_, cs) != cudaSuccess || cudaStreamWaitEvent(side_, sh_fork_, 0) != cudaSuccess) {
+                err = "mtp batch: shared expert fork failed";
+                return false;
+            }
+            sh_cs = side_;
+        }
+        auto shared_rows = [&]() {
+            if (need_bf16_x) f32_to_bf16_bulk(mixed_, bm_x_bf16_, (int64_t) T * N, sh_cs);
+            shared_expert_multi(T, mixed_, bm_x_bf16_, nsw, bf16("mlp.shared_expert_gate.weight"),
+                                bm_sh_gate_, bm_sh_up_, bm_sh_g_, shared_, N, g.n_ff, sh_cs,
+                                q8_mlp ? (const void*) xq_ : nullptr, 0);
+        };
+        if (use_branch) {
+            shared_rows();
+            if (cudaEventRecord(sh_join_, side_) != cudaSuccess) {
+                err = "mtp batch: shared expert join record failed";
+                return false;
+            }
+        }
+        if (T > 1 && native_router_enabled() && g.n_expert == 512 && K == 10) {
+            bf16_gemv_fp32_mmvf_multi(mixed_, N, bf16("mlp.gate.weight"), logits_, g.n_expert, (int) N, (int) g.n_expert, T, cs);
+            native_router_top10_multi(logits_, ids_, w_, T, cs);
+        } else {
+            for (int t = 0; t < T; ++t) {
+                bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
+                if (native_router_enabled() && g.n_expert == 512 && K == 10)
+                    native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
+                else
+                    router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
+            }
+        }
+        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
+                           grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
+        quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
+        moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
+                       hit_xs_, hit_scratch_, parts_, cs);
+        if (use_branch) {
+            if (cudaStreamWaitEvent(cs, sh_join_, 0) != cudaSuccess) {
+                err = "mtp batch: shared expert join wait failed";
+                return false;
+            }
+        } else {
+            shared_rows();
+        }
+        static const bool no_multi_gr = [] {
+            const char* v = std::getenv("STRATA_NO_MULTI_GR");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (T > 1 && native_moe_combine_enabled()) {
+            native_moe_combine_multi(parts_, w_, shared_, y_, N, K, T, cs);
+        } else {
+            for (int t = 0; t < T; ++t) {
+                if (native_moe_combine_enabled())
+                    native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
+                else
+                    moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
+            }
+        }
+        if (!fuse_head_gr) {
+            if (no_multi_gr) {
+                for (int t = 0; t < T; ++t)
+                    gr_write(R_ + (size_t) t * HC * N, y_ + t * N, inj2_ + t * HC, gs, R_ + (size_t) t * HC * N, cs);
+            } else {
+                gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);
+            }
+        }
+
+        // ---- final mixer + batched draft head (1x lm_head weight read for all T slots)
+        bool q8_head = false;
+        if (fuse_head_gr) {
+            FusedGrArgs fa[kFusedGrMaxT];
+            for (int t = 0; t < T; ++t) {
+                fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = true;
+                fa[t].bo_prev = y_ + t * N; fa[t].inj_prev = inj2_ + t * HC;
+                fa[t].w_norm = f32("hyper_connection_mixer.hc_norm.weight");
+                fa[t].w_down = bf16("hyper_connection_mixer.input_mix_weight_down.weight");
+                fa[t].w_up = bf16("hyper_connection_mixer.input_mix_weight_up.weight");
+                fa[t].w_inject = nullptr;
+                fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
+                fa[t].inject_out = bm_dummy_inj_ + t * HC; fa[t].mixed = sample_ + t * N;
+                if (qfuse_hc) fa[t].q8_mixed = xq_ + (size_t) t * (N / 32) * 36;
+            }
+            q8_head = fused_gr_read_multi(fa, T, xn_, cs);
+        } else if (head_mix_multi_on) {
+            FusedGrArgs fa[kFusedGrMaxT];
+            for (int t = 0; t < T; ++t) {
+                fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;
+                fa[t].w_norm = f32("hyper_connection_mixer.hc_norm.weight");
+                fa[t].w_down = bf16("hyper_connection_mixer.input_mix_weight_down.weight");
+                fa[t].w_up = bf16("hyper_connection_mixer.input_mix_weight_up.weight");
+                fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = sample_ + t * N;
+                if (qfuse_hc) fa[t].q8_mixed = xq_ + (size_t) t * (N / 32) * 36;
+            }
+            q8_head = fused_gr_read_multi(fa, T, xn_, cs);
+        } else {
+            for (int t = 0; t < T; ++t)
+                gr_read(R_ + (size_t) t * HC * N, f32("hyper_connection_mixer.hc_norm.weight"),
+                        bf16("hyper_connection_mixer.input_mix_weight_down.weight"),
+                        bf16("hyper_connection_mixer.input_mix_weight_up.weight"), nullptr, EPS, gs, own_gr_,
+                        sample_ + t * N, bm_dummy_inj_ + t * HC, cs);
+        }
+        if (!q8_head) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
+        const bool sub = dhead_ != nullptr;
+        const int64_t nv = sub ? n_dvocab_ : n_vocab_;
+        native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
+                    (int) nv, T, cs);
+        if (argmax_rows_wanted()) {
+            argmax_rows(head_logits_, T, (int) nv, arg_scratch_, out_ids_, cs);
+        } else {
+            SamplerParams sp_g;
+            sp_g.greedy = true;
+            sp_g.temperature = 0.0f;
+            sample_tokens(head_logits_, T, (int) nv, nullptr, 0, sp_g, out_ids_, cs);
+        }
+        if (multi_block_head_ops()) row_top_prob_split(head_logits_, T, (int) nv, out_ids_, probs_, top_scratch_, cs);
+        else row_top_prob(head_logits_, T, (int) nv, out_ids_, probs_, cs);
+        if (sub) map_ids(out_ids_, dvocab_, T, cs);
+        const MappedCopy out_c[2] = {{m_bm_out_, out_ids_, T}, {m_bm_prob_, probs_, T}};
+        copy_from_mapped_multi(out_c, 2, cs);
+    } catch (const std::exception& e) {
+        err = std::string("mtp batch rest: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+bool MtpDrafter::capture_batch_slots(const std::vector<uintptr_t>& key, int n_cu, QsaState* const* states_cu, int n_acc,
+                                     QsaState* const* states_acc, cudaGraphExec_t& out_exec, std::string& err) {
+    auto it = bm_graphs_.find(key);
+    if (it != bm_graphs_.end()) {
+        bm_used_[key] = ++bm_tick_;
+        out_exec = it->second;
+        return true;
+    }
+    constexpr size_t kBmGraphLimit = 64;
+    if (bm_graphs_.size() >= kBmGraphLimit) {
+        auto victim = bm_used_.begin();
+        for (auto u = bm_used_.begin(); u != bm_used_.end(); ++u)
+            if (u->second < victim->second) victim = u;
+        if (cs_) (void) cudaStreamSynchronize(cs_);
+        auto gi = bm_graphs_.find(victim->first);
+        if (gi != bm_graphs_.end()) {
+            if (gi->second) cudaGraphExecDestroy(gi->second);
+            bm_graphs_.erase(gi);
+        }
+        bm_used_.erase(victim);
+    }
+    using namespace strata::kernels;
+    const int64_t NH = g_->n_head;
+    const int M = bm_max_t_;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "mtp batch: begin capture";
+        return false;
+    }
+    if (n_cu > 0) {
+        const MappedCopy in[6] = {
+            {bm_tok_, m_bm_tok_, n_cu},
+            {bm_step_, m_bm_step_, (int64_t) n_cu * 4},
+            {bm_pos_, m_bm_pos_, (int64_t) n_cu * NH},
+            {bm_tok_ + M, m_bm_tok_ + M, n_acc},
+            {bm_step_ + M * 4, m_bm_step_ + M * 4, (int64_t) n_acc * 4},
+            {bm_pos_ + M * NH, m_bm_pos_ + M * NH, (int64_t) n_acc * NH},
+        };
+        copy_from_mapped_multi(in, 6, cs_);
+    } else {
+        const MappedCopy in[3] = {
+            {bm_tok_ + M, m_bm_tok_ + M, n_acc},
+            {bm_step_ + M * 4, m_bm_step_ + M * 4, (int64_t) n_acc * 4},
+            {bm_pos_ + M * NH, m_bm_pos_ + M * NH, (int64_t) n_acc * NH},
+        };
+        copy_from_mapped_multi(in, 3, cs_);
+    }
+    bool ok = true;
+    if (n_cu > 0)
+        ok = record_front_slots(n_cu, bm_tok_, bm_step_, bm_pos_, bm_Rin_cu_, states_cu, cs_, err);
+    if (ok)
+        ok = record_front_slots(n_acc, bm_tok_ + M, bm_step_ + M * 4, bm_pos_ + M * NH, bm_Rin_acc_, states_acc, cs_, err);
+    if (ok)
+        ok = record_rest_slots(n_acc, bm_step_ + M * 4, bm_pos_ + M * NH, states_acc, cs_, err);
+    cudaGraphExec_t exec = nullptr;
+    if (!finish_capture(cs_, ok, exec, "batch slots", err)) return false;
+    bm_graphs_[key] = exec;
+    bm_used_[key] = ++bm_tick_;
+    out_exec = exec;
+    return true;
+}
+
+bool MtpDrafter::draft_slots(const BatchSlotDraft* items, int n_items, std::string& err) {
+#if defined(STRATA_GPU_METAL)
+    (void) items; (void) n_items;
+    err = "mtp batch: unsupported on Metal";
+    return false;
+#else
+    if (!decode_ready(err)) return false;
+    if (!can_draft_slots(items, n_items)) {
+        err = "mtp batch: preconditions not met";
+        return false;
+    }
+    const OnDevice on_device(device_);
+    if (!ensure_batch_mtp_buffers(err)) return false;
+
+    // Canonicalize order by slot pointer so round-robin slot rotation reuses the exact same captured graphs (<= 16 for 4 slots).
+    std::vector<int> order((size_t) n_items);
+    for (int i = 0; i < n_items; ++i) order[(size_t) i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return items[a].slot < items[b].slot; });
+
+    const int64_t NH = g_->n_head;
+    const int64_t HCN = g_->hc * g_->n_embd;
+    const int M = bm_max_t_;
+    auto put_step = [&](int row, int64_t cell) {
+        h_bm_step_[row * 4 + 0] = (int32_t) cell;
+        h_bm_step_[row * 4 + 1] = (int32_t) (cell + 1);
+        h_bm_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        h_bm_step_[row * 4 + 3] = (int32_t) (cell + 1);
+        for (int64_t h = 0; h < NH; ++h) h_bm_pos_[row * NH + h] = (int32_t) cell;
+    };
+
+    for (int base = 0; base < n_items; base += M) {
+        const int chunk = std::min(M, n_items - base);
+        QsaState* states_cu[8] = {};
+        QsaState* states_acc[8] = {};
+        int cu_items[8] = {};
+        int n_cu = 0;
+        for (int i = 0; i < chunk; ++i) {
+            const int idx = order[(size_t) (base + i)];
+            const BatchSlotDraft& it = items[idx];
+            states_acc[i] = &it.slot->kv_state_rw();
+            if (it.keep == 2) {
+                cu_items[n_cu] = idx;
+                states_cu[n_cu] = states_acc[i];
+                ++n_cu;
+            }
+        }
+        std::vector<uintptr_t> key;
+        key.reserve((size_t) (2 + n_cu + chunk));
+        key.push_back((uintptr_t) n_cu);
+        key.push_back((uintptr_t) chunk);
+        for (int c = 0; c < n_cu; ++c) key.push_back((uintptr_t) states_cu[c]);
+        for (int i = 0; i < chunk; ++i) key.push_back((uintptr_t) states_acc[i]);
+
+        cudaGraphExec_t exec = nullptr;
+        if (!capture_batch_slots(key, n_cu, states_cu, chunk, states_acc, exec, err)) return false;
+
+        const Clock::time_point t0 = Clock::now();
+        for (int c = 0; c < n_cu; ++c) {
+            const BatchSlotDraft& it = items[cu_items[c]];
+            h_bm_tok_[c] = it.tokens[0];
+            put_step(c, it.pos0);
+        }
+        for (int i = 0; i < chunk; ++i) {
+            const BatchSlotDraft& it = items[order[(size_t) (base + i)]];
+            const int a = it.keep - 1;
+            h_bm_tok_[M + i] = it.tokens[a];
+            put_step(M + i, it.pos0 + a);
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+
+        for (int c = 0; c < n_cu; ++c) {
+            const BatchSlotDraft& it = items[cu_items[c]];
+            if (cudaMemcpyAsync(bm_Rin_cu_ + (size_t) c * HCN, it.R_rows, (size_t) HCN * sizeof(float),
+                                cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+                err = std::string("mtp batch: staging catch-up R failed: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        }
+        for (int i = 0; i < chunk; ++i) {
+            const BatchSlotDraft& it = items[order[(size_t) (base + i)]];
+            const int a = it.keep - 1;
+            if (cudaMemcpyAsync(bm_Rin_acc_ + (size_t) i * HCN, it.R_rows + (size_t) a * HCN, (size_t) HCN * sizeof(float),
+                                cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+                err = std::string("mtp batch: staging accepted R failed: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        }
+        if (cudaGraphLaunch(exec, cs_) != cudaSuccess) {
+            err = std::string("mtp batch: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        (void) cudaStreamQuery(cs_);
+
+        // Overlap per-slot NVMe PLE prefetch with the batched MTP graph on the GPU
+        int32_t ple_prev[8][2] = {};
+        SessionState* ple_ss_arr[8] = {};
+        auto prefetch_slot_ple = [&](int i, int32_t tok) {
+            SessionState* pss = ple_ss_arr[i];
+            if (pss == nullptr || tok < 0) return;
+            uint32_t rows16[strata::kernels::PLE_N_HEADS];
+            strata::kernels::ngram_rows(&tok, ple_prev[i], 1, pss->ple.consts, rows16);
+            ple_prev[i][0] = ple_prev[i][1];
+            ple_prev[i][1] = tok;
+            pss->ple.table->prefetch_rows(rows16);
+        };
+        for (int i = 0; i < chunk; ++i) {
+            const BatchSlotDraft& it = items[order[(size_t) (base + i)]];
+            SessionState* pss = it.slot->ple_session();
+            if (pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr) {
+                ple_ss_arr[i] = pss;
+                ple_prev[i][0] = pss->ple_prev[0];
+                ple_prev[i][1] = pss->ple_prev[1];
+                prefetch_slot_ple(i, it.tokens[it.keep - 1]);
+            }
+        }
+
+        progress_at("mtp batch draft: waiting for the GPU");
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = std::string("mtp batch: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        strata_load_fence();
+        const double chunk_ms = ms_since(t0);
+        for (int i = 0; i < chunk; ++i) {
+            const BatchSlotDraft& it = items[order[(size_t) (base + i)]];
+            const int32_t d0 = ((volatile int32_t*) h_bm_out_)[i];
+            const float p0 = ((volatile float*) h_bm_prob_)[i];
+            it.out_drafts[0] = d0;
+            for (int j = 1; j < it.slot->max_t_ - 1; ++j) it.out_drafts[j] = 0;
+            if (it.out_prob != nullptr) *it.out_prob = p0;
+            prefetch_slot_ple(i, d0);
+            it.slot->ms_draft += chunk_ms / (double) chunk;
+            ++it.slot->rounds;
+        }
+    }
+    return true;
+#endif
 }
 
 }  // namespace strata::core

@@ -1078,6 +1078,7 @@ struct Options {
     int prompt_cache = 6;
     int64_t conversation_cache_mib = -1; // host RAM for independent conversations; -1: not given, --serve sizes it from the free RAM (#3493), 0: off
     int conversation_cache_slots = 4;
+    int conversation_cache_swap_block_mib = strata::core::conversation_cache_swap_default_block_mib;
     int64_t conversation_cache_min_free_mib = 2560;
     /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
@@ -1102,6 +1103,11 @@ struct Options {
     /// data folder --pack sits in (`<data>/packs/<tag>`); none: off.  --conversation-spill-mib N caps it (0 = off; unset = min(32
     /// GiB, a quarter of the free disk), never into --session-min-free-mib).  Tester flags; the tier is on by default.
     std::string conversation_spill_dir;
+    /// --conversation-spill-persist: the tier's folder is `<root>/fp-<model fingerprint>` and its entries survive a restart (a reboot): at
+    /// start those of the current model and settings are adopted and indexed, the folders of other fingerprints are removed.  No time
+    /// limit: an entry goes when the size cap needs room (least recently used first) or when a longer spill of the same conversation
+    /// replaces it.  Off by default (a per-process folder, removed at the end).
+    bool conversation_spill_persist = false;
     int64_t conversation_spill_mib = -1;
     bool session_save_reclaim = false;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
@@ -1277,6 +1283,7 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: sized from the free RAM, up to 8192; 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --conversation-cache-swap-block-mib N  --serve: host K/V exchange block, 0..256 MiB (default 0: off)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
@@ -3998,6 +4005,17 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+        else if (a == "--conversation-cache-swap-block-mib") {
+            const std::string value = next(a.c_str());
+            if (value == "-h" || (value.size() >= 2 && value[0] == '-' && value[1] == '-')) {
+                std::fprintf(stderr, "%s needs a value\n", a.c_str());
+                return 2;
+            }
+            if (!strata::core::parse_conversation_cache_swap_block_mib(value, o.conversation_cache_swap_block_mib)) {
+                std::fprintf(stderr, "%s needs a decimal integer in [0, 256]\n", a.c_str());
+                return 2;
+            }
+        }
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-cache-park-gain" || a == "--conversation-spill-mib" ||
@@ -4023,6 +4041,7 @@ int main(int argc, char** argv) {
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
+        else if (a == "--conversation-spill-persist") o.conversation_spill_persist = true;
         else if (a == "--conversation-spill-dir") o.conversation_spill_dir = next("--conversation-spill-dir");
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
@@ -13473,7 +13492,7 @@ int main(int argc, char** argv) {
                 in.embedding = o.embd_gguf;
                 in.ple = o.ple_gguf;
                 in.pack = o.pack;
-                in.mtp = o.mtp.empty() ? std::string() : o.mtp + "/dense.bin";
+                in.mtp = o.mtp;
                 if (srcp != nullptr) in.experts = srcp->model_inputs();
                 std::vector<strata::core::SessionModelFile> files = strata::core::session_model_inputs(in);
                 // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
@@ -13483,10 +13502,11 @@ int main(int argc, char** argv) {
                         files.push_back({std::string("pack ") + n, o.pack + "/" + n, true});
                     if (srcp == nullptr) files.push_back({"pack experts.bin", o.pack + "/experts.bin", true});
                 }
-                if (!o.mtp.empty()) {
-                    for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
-                    files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
-                }
+                // resolved like the Metal loader (window.cpp): STRATA_METAL_MTP_GGUF overrides the GGUF beside an rt dir
+                const char* mtp_gguf_env = std::getenv("STRATA_METAL_MTP_GGUF");
+                for (auto& m : strata::core::session_mtp_pack_files(o.mtp, o.mtp_draft_vocab,
+                                                                    mtp_gguf_env ? mtp_gguf_env : ""))
+                    files.push_back(std::move(m));
                 uint64_t fp = 0;
                 // each file is one blocking read of at most 2 MiB (head and tail): announced before it starts
                 if (next_file) next_file();
@@ -13564,12 +13584,26 @@ int main(int argc, char** argv) {
                 if (!ec && cap < (uint64_t(64) << 20)) { why = "the disk is full"; cap = 0; }
             }
             size_t cleaned = 0;
-            if (cap > 0 && !spill.open(root, cap, why, &cleaned)) cap = 0;
+            size_t adopted = 0;
+            std::optional<strata::core::SessionFileIdentity> persist_id;
+            if (cap > 0 && o.conversation_spill_persist) {   // the stable folder is named by the model's fingerprint: known before the first spill
+                try {
+                    std::string e;
+                    strata::core::SessionFileIdentity id;
+                    if (session_identity(id, e, {})) { persist_id = id; spill_id = id; }
+                    else std::fprintf(stderr, "strata serve: conversation cache: --conversation-spill-persist: the model cannot be fingerprinted (%s); "
+                                              "a folder of this process is used\n", e.c_str());
+                } catch (...) {}
+            }
+            if (cap > 0 && !spill.open(root, cap, why, &cleaned, persist_id ? &*persist_id : nullptr, &adopted)) cap = 0;
             if (cap > 0) {
-                std::fprintf(stderr, "strata serve: conversation cache: SSD tier in %s, up to %llu MiB%s\n", spill.dir().string().c_str(),
+                std::fprintf(stderr, "strata serve: conversation cache: SSD tier in %s, up to %llu MiB%s%s\n", spill.dir().string().c_str(),
                              (unsigned long long) (cap >> 20),
                              cleaned ? (", " + std::to_string(cleaned) + " folder" + (cleaned == 1 ? "" : "s") +
-                                        " of ended engines removed").c_str() : "");
+                                        (persist_id ? " of other models or ended engines removed" : " of ended engines removed")).c_str() : "",
+                             spill.persistent() ? (", kept across restarts: " + std::to_string(adopted) + " conversation" +
+                                                   (adopted == 1 ? "" : "s") + " adopted from the last run, " +
+                                                   std::to_string(spill.bytes() >> 20) + " MiB").c_str() : "");
             } else {
                 std::fprintf(stderr, "strata serve: conversation cache: no SSD tier: %s\n", why.c_str());
             }
@@ -16600,6 +16634,20 @@ int main(int argc, char** argv) {
                 }
             }
             std::vector<int> df2_launched;   // batch DFlash2: slots whose draft graph is queued
+            // STRATA_BATCH_MTP_FUSED=1 (opt-in, default off): batch all active slots' MTP drafting into one
+            // multi-slot forward pass on solo `mtp` (1x MTP + draft-head weight read instead of A separate passes).
+            static const bool batch_mtp_fused = [] {
+                const char* v = std::getenv("STRATA_BATCH_MTP_FUSED");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
+            const bool try_fused_mtp = batch_mtp_fused && batch_mtp && !batch_df2 && stages.empty();
+            struct PendingSlotMtp {
+                int b = -1;
+                int first = 0;
+                int keep = 1;
+            };
+            std::vector<PendingSlotMtp> pending_mtp;
+            if (try_fused_mtp) pending_mtp.reserve((size_t) A);
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
@@ -16672,21 +16720,25 @@ int main(int argc, char** argv) {
                 }
 #endif
                 if (batch_mtp && !batch_df2 && sl.active) {
-                    // The slot's two residual rows (the final residuals of the last stage: ver.final_R_all() follows the
-                    // chain, so with a layer split they are on the last stage's GPU, where the drafters are).  The copy is
-                    // queued on the drafter's own stream after the window's host sync, so the draft graph reads it.
-                    const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
-                    const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
-                    if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
-                                        ver.final_R_all() + (size_t) first[t] * stride,
-                                        2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
-                                        slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
-                        !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
-                                                    sl.draft.data(), err)) {
-                        std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
-                        return false;
+                    if (try_fused_mtp) {
+                        pending_mtp.push_back({b, first[t], keep[b]});
+                    } else {
+                        // The slot's two residual rows (the final residuals of the last stage: ver.final_R_all() follows the
+                        // chain, so with a layer split they are on the last stage's GPU, where the drafters are).  The copy is
+                        // queued on the drafter's own stream after the window's host sync, so the draft graph reads it.
+                        const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
+                        const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+                        if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
+                                            ver.final_R_all() + (size_t) first[t] * stride,
+                                            2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
+                                            slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
+                            !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
+                                                        sl.draft.data(), err)) {
+                            std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                            return false;
+                        }
+                        sl.draft_ready = true;
                     }
-                    sl.draft_ready = true;
                 }
             }
 #if defined(STRATA_HAVE_DFLASH2)
@@ -16702,7 +16754,50 @@ int main(int argc, char** argv) {
                 sl.draft_ready = true;
             }
 #endif
-            std::fflush(stdout);
+            if (try_fused_mtp) {
+                // Flush BT/BDONE tokens immediately so clients receive them before MTP drafting finishes.
+                std::fflush(stdout);
+                if (!pending_mtp.empty()) {
+                    const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+                    std::vector<strata::core::MtpDrafter::BatchSlotDraft> items(pending_mtp.size());
+                    for (size_t i = 0; i < pending_mtp.size(); ++i) {
+                        const PendingSlotMtp& pm = pending_mtp[i];
+                        BSlot& sl = bs[(size_t) pm.b];
+                        items[i].slot = slot_mtp[(size_t) pm.b].get();
+                        items[i].R_rows = ver.final_R_all() + (size_t) pm.first * stride;
+                        items[i].tokens = outb + pm.first;
+                        items[i].pos0 = pos[pm.first];
+                        items[i].keep = pm.keep;
+                        items[i].out_drafts = sl.draft.data();
+                        items[i].out_prob = nullptr;
+                    }
+                    if (items.size() >= 2 && mtp.can_draft_slots(items.data(), (int) items.size())) {
+                        if (!mtp.draft_slots(items.data(), (int) items.size(), err)) {
+                            std::printf("ERR batch MTP fused: %s\n", err.c_str());
+                            return false;
+                        }
+                        for (const PendingSlotMtp& pm : pending_mtp)
+                            bs[(size_t) pm.b].draft_ready = true;
+                    } else {
+                        for (const PendingSlotMtp& pm : pending_mtp) {
+                            BSlot& sl = bs[(size_t) pm.b];
+                            const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) pm.b]->device());
+                            if (cudaMemcpyAsync(slot_mtp_rows[(size_t) pm.b].get(),
+                                                ver.final_R_all() + (size_t) pm.first * stride,
+                                                2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
+                                                slot_mtp[(size_t) pm.b]->stream()) != cudaSuccess ||
+                                !slot_mtp[(size_t) pm.b]->draft(2, outb + pm.first, pos[pm.first], pm.keep - 1,
+                                                                sl.draft.data(), err)) {
+                                std::printf("ERR batch MTP slot %d: %s\n", pm.b, err.c_str());
+                                return false;
+                            }
+                            sl.draft_ready = true;
+                        }
+                    }
+                }
+            } else {
+                std::fflush(stdout);
+            }
             bt_emit += msd(w2, Clock::now());
             if (adapt_run.th.joinable()) {
                 const Clock::time_point wa = Clock::now();
@@ -18988,6 +19083,87 @@ int main(int argc, char** argv) {
                     return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                 };
             }
+            bool swapped_parked = false;
+            Clock::time_point swap_t0;
+            // A retained K/V matching the live prefix stays for park_current;
+            // unrelated retained K/V does not block an ordinary RAM-tier exchange.
+            const size_t swap_block_bytes = strata::core::conversation_cache_swap_block_bytes(o.conversation_cache_swap_block_mib);
+            if (swap_block_bytes != 0 && incoming && !from_ssd && taken.live &&
+                taken.tokens == (int64_t) incoming->live.ids.size() &&
+                !borrow && !keep_branch && !reply_replaced && park_worth && live_ok && !live.empty() &&
+                conversations.wants((int64_t) live.size()) && !conversations.has_reuse_for(live) &&
+                stages.empty() && o.batch == 0 && !kvg.on) {
+                swap_t0 = Clock::now();
+                struct SwapStage {
+                    SwapStage() { strata::core::progress_at("request: parking the previous conversation"); }
+                    ~SwapStage() { strata::core::progress_at("request"); strata::core::progress_beat(); }
+                } swap_stage;
+                try {
+                    const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
+                    strata::core::ConversationSwapPlan plan;
+                    if (strata::core::conversation_snapshot_swap_prepare(plan, *incoming, view, ss, g,
+                            use_mtp ? &mtp.kv_state() : nullptr, swap_block_bytes, err)) {
+                        // As in park_source, quiesce device work before reclaiming either pool.
+                        const cudaError_t swap_sync = cudaDeviceSynchronize();
+                        if (swap_sync != cudaSuccess) {
+                            std::printf("ERR synchronizing before conversation exchange: %s\n", cudaGetErrorString(swap_sync));
+                            return 1;
+                        }
+                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        auto admit = [&](uint64_t additional) {
+                            const auto mem = strata::core::sample_host_memory();
+                            return strata::core::conversation_memory_admit(
+                                mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
+                        };
+                        // Match the upstream RAM gate's pool-then-heap reclaim, without evicting entries.
+                        auto admit_without_eviction = [&](uint64_t additional) {
+                            bool fits = admit(additional);
+                            if (!fits && pools_budget.idle_bytes() > 0) {
+                                pools_budget.shrink((size_t) -1);
+                                fits = admit(additional);
+                            }
+                            return fits || (strata::core::release_free_heap() && admit(additional));
+                        };
+                        const bool fits = conversations.can_fit(plan.image_bytes, plan.held_bytes) &&
+                                          admit_without_eviction(plan.additional_bytes);
+                        if (fits) {
+                            auto ready = [&](size_t image_bytes, size_t held_bytes) {
+                                return conversations.can_fit(image_bytes, held_bytes) &&
+                                       admit_without_eviction(plan.final_additional_bytes);
+                            };
+                            strata::core::SavedConversation outgoing;
+                            const auto result = strata::core::conversation_snapshot_swap(
+                                plan, *incoming, outgoing, view, ss, g, swap_block_bytes, ready, err);
+                            if (result == strata::core::ConversationSwap::transfer_failed) {
+                                std::printf("ERR exchanging parked conversation: %s\n",
+                                            err.empty() ? "state transfer failed" : err.c_str());
+                                return 1;
+                            }
+                            if (result == strata::core::ConversationSwap::swapped) {
+                                swapped_parked = true;
+                                const size_t snapshot_bytes = outgoing.bytes();
+                                bool stored = false;
+                                try {
+                                    if (conversations.can_fit(snapshot_bytes, incoming->bytes()))
+                                        stored = conversations.put_exchanged(std::move(outgoing), incoming->bytes());
+                                } catch (const std::bad_alloc&) {
+                                    std::fprintf(stderr, "strata serve: conversation cache: allocation failed while publishing exchanged image\n");
+                                }
+                                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens by host K/V exchange; "
+                                                     "parked=%zu bytes=%zu snapshot_bytes=%zu\n",
+                                             stored ? "parked" : "skipped", live.size(), conversations.size(),
+                                             conversations.bytes(), snapshot_bytes);
+                            }
+                        }
+                    }
+                } catch (const std::bad_alloc&) {
+                    if (swapped_parked) {
+                        std::printf("ERR exchanging parked conversation: allocation failed after exchange\n");
+                        return 1;
+                    }
+                }
+                if (!swapped_parked) err.clear();
+            }
             if (borrow && !keep_branch && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
@@ -19011,7 +19187,7 @@ int main(int argc, char** argv) {
                     }
                 }
             } else if ((!from_live || incoming || slot_source >= 0) && !keep_branch && !reply_replaced && park_worth &&
-                       !park_current(incoming ? incoming->bytes() : 0)) {
+                       !swapped_parked && !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -19141,8 +19317,8 @@ int main(int argc, char** argv) {
                              conversations.size(), conversations.bytes(), conversations.borrowed());
             }
             if (incoming) {
-                const auto t0 = Clock::now();
-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
+                const auto t0 = swapped_parked ? swap_t0 : Clock::now();
+                if (!swapped_parked && strata::core::conversation_snapshot_restore(*incoming, ss, g,
                         use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
                     strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
@@ -19188,7 +19364,7 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 resume = taken.tokens;   // (parked.tokens unless the image came from the SSD tier)
                 from_live = taken.live;
-                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                if (!swapped_parked && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live);

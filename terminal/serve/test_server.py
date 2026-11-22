@@ -6777,7 +6777,7 @@ class VisionArgs(unittest.TestCase):
             seen.append(args)
             return Proc()
 
-        with mock.patch.object(server.subprocess, "Popen", popen):
+        with mock.patch.object(server.subprocess, "Popen", popen), mock.patch.object(server.lifeline, "_watch"):
             server.Vision({"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf", **cfg})
         return seen[0]
 

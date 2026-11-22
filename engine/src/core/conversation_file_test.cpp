@@ -469,6 +469,56 @@ int main() {
         check(session_model_fingerprint(session_model_inputs(swapped), c, error) && c != b,
               "inputs: the role each expert file plays enters the fingerprint");
     }
+    // spill fp: an --mtp directory holding only draft_vocab.bin (an rt dir) resolves to the sibling GGUF the Metal
+    // loader opens, not to dense.bin it never has; a pack dir keeps its own files; a cleared drafter lists nothing
+    {
+        const fs::path mroot = dir / "mtp", mdir = mroot / "rt", gg = mroot / "mtp-q2_0.gguf";   // the live layout: <data>/mtp/rt + sibling GGUF
+        fs::create_directories(mdir);
+        spit(mdir / "draft_vocab.bin", std::vector<char>(512, 'v'));
+        spit(gg, std::vector<char>(4096, 'q'));
+        const auto rt_list = session_mtp_pack_files(mdir.string());
+        bool has_gguf = false, has_vocab = false, has_dense = false;
+        for (const auto& e : rt_list) {
+            if (e.path == gg.string()) has_gguf = true;
+            if (e.role == "mtp draft_vocab.bin") has_vocab = true;
+            if (e.path.find("dense.bin") != std::string::npos) has_dense = true;
+        }
+        check(has_gguf && has_vocab && !has_dense, "spill fp: an rt dir resolves to the sibling GGUF, no dense.bin");
+        uint64_t fa = 0, fb = 0, fc = 0;
+        check(session_model_fingerprint(rt_list, fa, error), "spill fp: the rt dir fingerprints");
+        check(session_model_fingerprint(session_mtp_pack_files(mdir.string()), fb, error) && fa == fb,
+              "spill fp: the fingerprint is stable");
+        auto d = slurp(gg); d[0] = 'X'; spit(gg, d);
+        check(session_model_fingerprint(rt_list, fc, error) && fc != fa, "spill fp: the sibling GGUF enters the fingerprint");
+        // a pack folder keeps what its loader opens; an empty one and a cleared drafter list nothing
+        const fs::path pdir = dir / "mtp-pack";
+        fs::create_directories(pdir);
+        spit(pdir / "dense.txt", std::vector<char>(64, 't'));
+        spit(pdir / "dense.bin", std::vector<char>(1024, 'd'));
+        const auto pl = session_mtp_pack_files(pdir.string());
+        check(pl.size() == 2 && pl[0].role == "mtp dense.txt" && pl[1].role == "mtp dense.bin",
+              "spill fp: a pack dir lists its own files, no sibling GGUF");
+        check(session_model_fingerprint(pl, fa, error), "spill fp: the pack dir fingerprints");
+        const fs::path edir = dir / "mtp-empty";
+        fs::create_directories(edir);
+        check(session_mtp_pack_files(edir.string()).empty(), "spill fp: a folder with nothing opens nothing");
+        check(session_mtp_pack_files("").empty(), "spill fp: a cleared drafter lists no entry");
+        // an --mtp GGUF file is the drafter itself; --mtp-draft-vocab names the subset explicitly
+        const auto gl = session_mtp_pack_files(gg.string());
+        check(gl.size() == 2 && gl[0].role == "mtp gguf" && gl[0].path == gg.string() &&
+              gl[1].role == "mtp draft_vocab.bin" && gl[1].path == (mdir / "draft_vocab.bin").string(),
+              "spill fp: --mtp FILE is the GGUF, with the rt vocab beside it");
+        const fs::path vf = dir / "vocab-given.bin";
+        spit(vf, std::vector<char>(256, 'w'));
+        const auto vl = session_mtp_pack_files(mdir.string(), vf.string());
+        check(vl.size() == 2 && vl[0].role == "mtp draft_vocab" && vl[0].path == vf.string() &&
+              vl[1].role == "mtp gguf" && vl[1].path == gg.string(),
+              "spill fp: --mtp-draft-vocab replaces the dir's vocab");
+        // STRATA_METAL_MTP_GGUF (passed through by generate.cpp) overrides the sibling path, as window.cpp does
+        const auto el = session_mtp_pack_files(mdir.string(), "", gg.string());
+        check(el.size() == 2 && el[0].role == "mtp gguf" && el[0].path == gg.string() &&
+              el[1].role == "mtp draft_vocab.bin", "spill fp: the env override names the GGUF");
+    }
     // R2: runtime limits bound every array before it is allocated, and the file size follows from them
     {
         auto exact = [&] {

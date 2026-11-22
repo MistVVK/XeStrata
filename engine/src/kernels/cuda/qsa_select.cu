@@ -1075,11 +1075,11 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slots_kernel(Sc
 // same level (float add commutes), the dot expression is the same text in the same file, the relu-and-add runs over the
 // heads in the same order: the same score bits.  The tail block and the +1e9 are as in the multi kernel.
 template <int NQ>
-__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(const float* __restrict__ pooled,
-                                                                             const float* __restrict__ dead,
-                                                                             const float* __restrict__ q_idx,
-                                                                             const int32_t* __restrict__ steps, int nq,
-                                                                             int64_t max_blocks, float* __restrict__ out) {
+__device__ __forceinline__ void block_scores_rows_body(const float* __restrict__ pooled,
+                                                       const float* __restrict__ dead,
+                                                       const float* __restrict__ q_idx,
+                                                       const int32_t* __restrict__ steps, int nq,
+                                                       int64_t max_blocks, float* __restrict__ out) {
     __shared__ int64_t s_nkv[NQ], s_nbid[NQ];
     if (threadIdx.x < nq) {
         s_nkv[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNKv];
@@ -1138,6 +1138,63 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(con
             }
         }
     }
+}
+
+template <int NQ>
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(const float* __restrict__ pooled,
+                                                                             const float* __restrict__ dead,
+                                                                             const float* __restrict__ q_idx,
+                                                                             const int32_t* __restrict__ steps, int nq,
+                                                                             int64_t max_blocks, float* __restrict__ out) {
+    block_scores_rows_body<NQ>(pooled, dead, q_idx, steps, nq, max_blocks, out);
+}
+
+// Slot-grouped block scores: blockIdx.y selects one slot group g, reading that slot's pooled/dead
+// keys once across all ntok[g] contiguous draft rows with the exact QSAROWS reduce-scatter arithmetic (bitwise).
+template <int MAX_NQ>
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slot_groups_rows_kernel(
+    QsaScoreGroups groups, const float* __restrict__ q_idx, const int32_t* __restrict__ steps, int64_t max_blocks,
+    float* __restrict__ out) {
+    const unsigned g = blockIdx.y;
+    const float* pooled = groups.pooled[0];
+    const float* dead = groups.dead[0];
+    int first = groups.first[0];
+    int ntok = groups.ntok[0];
+#pragma unroll
+    for (unsigned i = 1; i < (unsigned) kScoreMaxGroups; ++i) {
+        if (g == i) {
+            pooled = groups.pooled[i];
+            dead = groups.dead[i];
+            first = groups.first[i];
+            ntok = groups.ntok[i];
+        }
+    }
+    block_scores_rows_body<MAX_NQ>(pooled, dead, q_idx + (size_t) first * IDX_HEADS * IDX_DIM,
+                                   steps + (size_t) first * kStepCount, ntok, max_blocks,
+                                   out + (size_t) first * max_blocks);
+}
+
+// Slot-grouped fallback for groups with 5..MQ rows or STRATA_QSA_ROWS=0: same bitwise block_scores_multi_body.
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slot_groups_multi_kernel(
+    QsaScoreGroups groups, const float* __restrict__ q_idx, const int32_t* __restrict__ steps, int64_t max_blocks,
+    float* __restrict__ out, bool early_exit) {
+    const unsigned g = blockIdx.y;
+    const float* pooled = groups.pooled[0];
+    const float* dead = groups.dead[0];
+    int first = groups.first[0];
+    int ntok = groups.ntok[0];
+#pragma unroll
+    for (unsigned i = 1; i < (unsigned) kScoreMaxGroups; ++i) {
+        if (g == i) {
+            pooled = groups.pooled[i];
+            dead = groups.dead[i];
+            first = groups.first[i];
+            ntok = groups.ntok[i];
+        }
+    }
+    block_scores_multi_body(pooled, dead, q_idx + (size_t) first * IDX_HEADS * IDX_DIM,
+                            steps + (size_t) first * kStepCount, ntok, max_blocks, out + (size_t) first * max_blocks,
+                            early_exit, QsaScoreRows{});
 }
 
 #if defined(__HIPCC__)
@@ -1955,6 +2012,43 @@ bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead
         keys, q_idx, steps, max_blocks, scores, scores_early_exit());
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_slots: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    return true;
+}
+
+bool qsa_block_scores_slot_groups(const QsaScoreGroups& groups, const float* q_idx, const int32_t* steps,
+                                  int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (groups.ng <= 0) return true;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) {
+        std::fprintf(stderr, "qsa_block_scores_slot_groups: unsupported indexer geometry\n");
+        std::exit(1);
+    }
+    if (groups.ng > kScoreMaxGroups || !scores_multi_on()) return false;
+    int max_ntok = 0;
+    for (int g = 0; g < groups.ng; ++g) {
+        if (groups.ntok[g] < 1 || groups.ntok[g] > MQ || !groups.pooled[g] || !groups.dead[g]) return false;
+        if (groups.ntok[g] > max_ntok) max_ntok = groups.ntok[g];
+    }
+    static const bool rows_env = [] {
+        const char* v = std::getenv("STRATA_QSA_ROWS");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    const dim3 grid(256u, (unsigned) groups.ng);
+    const cudaStream_t st = (cudaStream_t) stream;
+    if (rows_env && max_ntok <= 4) {
+        if (max_ntok == 1)
+            block_scores_slot_groups_rows_kernel<1><<<grid, SCORE_WARPS * 32, 0, st>>>(groups, q_idx, steps, max_blocks, scores);
+        else if (max_ntok == 2)
+            block_scores_slot_groups_rows_kernel<2><<<grid, SCORE_WARPS * 32, 0, st>>>(groups, q_idx, steps, max_blocks, scores);
+        else if (max_ntok == 3)
+            block_scores_slot_groups_rows_kernel<3><<<grid, SCORE_WARPS * 32, 0, st>>>(groups, q_idx, steps, max_blocks, scores);
+        else
+            block_scores_slot_groups_rows_kernel<4><<<grid, SCORE_WARPS * 32, 0, st>>>(groups, q_idx, steps, max_blocks, scores);
+    } else {
+        block_scores_slot_groups_multi_kernel<<<grid, SCORE_WARPS * 32, 0, st>>>(groups, q_idx, steps, max_blocks,
+                                                                                 scores, scores_early_exit());
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_slot_groups: %s\n", cudaGetErrorString(e)); std::exit(1); }
     return true;
 }
 

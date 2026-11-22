@@ -934,9 +934,66 @@ std::vector<SessionModelFile> session_model_inputs(const SessionInputs& in) {
     for (size_t i = 0; i < in.native_head.size(); ++i) f.push_back({"native head " + std::to_string(i), in.native_head[i]});
     if (!in.embedding.empty()) f.push_back({"embedding", in.embedding});
     if (!in.ple.empty()) f.push_back({"ple", in.ple});
-    if (!in.mtp.empty()) f.push_back({"mtp", in.mtp});
+    // the drafter's files come from session_mtp_pack_files below, resolved like the loaders resolve them;
+    // nothing is listed here (a directory without dense.bin is an rt directory, not a missing pack file)
     if (!in.pack.empty()) f.push_back({"pack native_experts.txt", in.pack + "/native_experts.txt", true});
     for (const auto& [role, path] : in.experts) f.push_back({role, path});
+    return f;
+}
+
+std::vector<SessionModelFile> session_mtp_pack_files(const std::string& mtp, const std::string& draft_vocab,
+                                                     const std::string& mtp_gguf) {
+    std::vector<SessionModelFile> f;
+    if (mtp.empty()) return f;   // no drafter loaded (--draft-fallback none clears --mtp): nothing to hash
+    std::error_code ec;
+    if (!draft_vocab.empty()) f.push_back({"mtp draft_vocab", draft_vocab});   // --mtp-draft-vocab FILE, always the given file
+    if (std::filesystem::is_regular_file(mtp, ec)) {   // --mtp names the drafter's GGUF itself: that is the whole drafter.
+        f.insert(f.begin(), {"mtp gguf", mtp});
+        // its draft-head subset sits in the rt folder beside it (window.cpp reads <gguf dir>/rt/draft_vocab.bin)
+        if (draft_vocab.empty()) {
+            const std::string beside = mtp.substr(0, mtp.find_last_of("/\\") + 1) + "rt/draft_vocab.bin";
+            if (std::filesystem::is_regular_file(beside, ec)) f.push_back({"mtp draft_vocab.bin", beside});
+        }
+        return f;
+    }
+    // a directory.  The CUDA/HIP loader (mtp.cpp) reads dense.txt + dense.bin + experts.bin from it; when those are
+    // absent it is an rt directory (tools/mtp_rt.py, draft_vocab.bin only) and the Metal engine (window.cpp) opens the
+    // GGUF beside it instead - STRATA_METAL_MTP_GGUF, else <parent>/mtp-q2_0.gguf.  Hash what is opened, nothing else.
+    const bool pack_dir = std::filesystem::is_regular_file(mtp + "/dense.bin", ec) ||
+                          std::filesystem::is_regular_file(mtp + "/experts.bin", ec);
+    if (pack_dir) {
+        f.push_back({"mtp dense.txt", mtp + "/dense.txt"});
+        if (std::filesystem::is_regular_file(mtp + "/dense.bin", ec)) f.push_back({"mtp dense.bin", mtp + "/dense.bin"});
+        if (std::filesystem::is_regular_file(mtp + "/experts.bin", ec)) f.push_back({"mtp experts.bin", mtp + "/experts.bin"});
+        // the pack folder's own subset, when it has one
+        if (draft_vocab.empty() && std::filesystem::is_regular_file(mtp + "/draft_vocab.bin", ec))
+            f.push_back({"mtp draft_vocab.bin", mtp + "/draft_vocab.bin"});
+        return f;
+    }
+    if (mtp_gguf.empty() && !std::filesystem::is_regular_file(mtp + "/draft_vocab.bin", ec))
+        return f;   // neither a pack folder nor an rt folder: nothing is opened, and a name that resolves to no
+                    // drafter must not kill the fingerprint either
+    std::string gguf = mtp_gguf;
+    if (gguf.empty()) {   // the same path window.cpp resolves: strip trailing slashes, cut at the last '/'
+        std::string d = mtp;
+        while (!d.empty() && d.back() == '/') d.pop_back();
+        const size_t s = d.rfind('/');
+#if defined(_WIN32)
+        const size_t w = d.rfind('\\');
+        gguf = (w == std::string::npos ? std::string(".") : d.substr(0, w)) + "\\mtp-q2_0.gguf";
+        if (s != std::string::npos && (w == std::string::npos || s > w))
+            gguf = d.substr(0, s) + "/mtp-q2_0.gguf";
+#else
+        gguf = (s == std::string::npos ? std::string(".") : d.substr(0, s)) + "/mtp-q2_0.gguf";
+#endif
+    }
+    f.push_back({"mtp gguf", gguf});
+    // an rt directory: window.cpp reads the draft head's subset from <gguf dir>/rt/draft_vocab.bin beside the
+    // GGUF it opened (its own default when that is absent hashes as nothing); a --mtp-draft-vocab FILE above wins.
+    if (draft_vocab.empty()) {
+        const std::string beside = gguf.substr(0, gguf.find_last_of("/\\") + 1) + "rt/draft_vocab.bin";
+        if (std::filesystem::is_regular_file(beside, ec)) f.push_back({"mtp draft_vocab.bin", beside});
+    }
     return f;
 }
 

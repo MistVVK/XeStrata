@@ -45,6 +45,7 @@
 
 #include "strata/core/vmm.hpp"
 #include <cstdlib>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -240,12 +241,19 @@ struct QsaState {
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
     strata::kernels::KvHostPools host;
+    // The device aliases in `host` are not necessarily CPU addresses.  These
+    // bounds identify the allocation from which those aliases were carved.
+    uint8_t* host_cpu_base = nullptr;
+    uint8_t* host_device_base = nullptr;
+    size_t host_allocation_bytes = 0;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
     float* idx_tail = nullptr;       ///< (idx_block - 1, idx_dim): the raw tail of the block being filled
     float* idx_dead = nullptr;       ///< (idx_dim,): the spare slot's key, CONSTANT for the sequence
     float* idx_pooled = nullptr;     ///< (max_cells/idx_block + 2, idx_dim)
+    float* idx_pooled_allocation = nullptr;
+    size_t idx_pooled_allocation_bytes = 0;
     int32_t* idx_block_pos = nullptr;
 
     float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64

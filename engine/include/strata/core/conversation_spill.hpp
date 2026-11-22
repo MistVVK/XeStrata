@@ -16,7 +16,9 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_file.hpp"
 
+#include <algorithm>
 #include <condition_variable>
+#include <cstring>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -88,6 +90,18 @@ inline bool is_namespace_name(const std::string& n) {
         if (!((n[i] >= '0' && n[i] <= '9') || (n[i] >= 'a' && n[i] <= 'f'))) return false;
     return true;
 }
+/// `fp-<16 hex>`: the stable folder of one model fingerprint (--conversation-spill-persist)
+inline std::string persist_name(uint64_t fingerprint) {
+    char b[32];
+    std::snprintf(b, sizeof b, "fp-%016llx", (unsigned long long) fingerprint);
+    return b;
+}
+inline bool is_persist_name(const std::string& n) {
+    if (n.size() != 19 || n.compare(0, 3, "fp-") != 0) return false;
+    for (size_t i = 3; i < n.size(); ++i)
+        if (!((n[i] >= '0' && n[i] <= '9') || (n[i] >= 'a' && n[i] <= 'f'))) return false;
+    return true;
+}
 #if defined(_WIN32)
 using LockHandle = HANDLE;
 inline LockHandle no_lock() { return INVALID_HANDLE_VALUE; }
@@ -155,7 +169,11 @@ public:
     SpillNamespace& operator=(const SpillNamespace&) = delete;
     ~SpillNamespace() { close(); }
 
-    bool open(const std::filesystem::path& root, std::string& error, size_t* cleaned = nullptr) {
+    /// `persist_fp`: the model fingerprint whose stable folder `<root>/fp-<hex>` is taken instead of a per-process one (it and its
+    /// files outlive the process).  The folders of other fingerprints nobody holds are removed; when the stable folder is held by a
+    /// live engine, this one falls back to its own per-process folder (persistent() false).
+    bool open(const std::filesystem::path& root, std::string& error, size_t* cleaned = nullptr,
+              const uint64_t* persist_fp = nullptr) {
         close();
         std::error_code ec;
         std::filesystem::create_directories(root, ec);
@@ -163,8 +181,23 @@ public:
             error = "spill folder " + root.string() + " cannot be used" + (ec ? ": " + ec.message() : std::string());
             return false;
         }
-        const size_t n = clean_dead(root);
+        const std::string keep = persist_fp ? spill_detail::persist_name(*persist_fp) : std::string();
+        const size_t n = clean_dead(root, persist_fp != nullptr, keep);
         if (cleaned) *cleaned = n;
+        if (persist_fp) {
+            const std::filesystem::path pdir = root / keep;
+            std::error_code e3;
+            if (!std::filesystem::is_symlink(pdir, e3) && (std::filesystem::is_directory(pdir, e3) || std::filesystem::create_directory(pdir, e3))) {
+                const spill_detail::LockHandle h = spill_detail::try_lock(pdir / ".lock");
+                if (h != spill_detail::no_lock()) {
+                    lock_ = h;
+                    root_ = root;
+                    dir_ = pdir;
+                    persistent_ = true;
+                    return true;
+                }
+            }
+        }
         std::random_device rd;
         char name[64];
         std::snprintf(name, sizeof name, "%lu-%08x%08x", spill_detail::own_pid(), (unsigned) rd(), (unsigned) rd());
@@ -187,10 +220,14 @@ public:
         if (dir_.empty()) return;
         spill_detail::unlock(lock_);
         lock_ = spill_detail::no_lock();
-        std::error_code ec;
-        std::filesystem::remove_all(dir_, ec);
+        if (!persistent_) {
+            std::error_code ec;
+            std::filesystem::remove_all(dir_, ec);
+        }
+        persistent_ = false;
         dir_.clear();
     }
+    bool persistent() const { return persistent_; }
     bool is_open() const { return !dir_.empty(); }
     const std::filesystem::path& dir() const { return dir_; }
     /// the file of parked conversation `serial` (a session file; written to a temporary name first by session_file_write)
@@ -200,13 +237,15 @@ public:
 
     /// Removes the folders under `root` that are named like a namespace, are real folders (not links) and whose lock can be
     /// taken - no process holds them.  Returns how many went.  Everything else under `root` is left alone.
-    static size_t clean_dead(const std::filesystem::path& root) {
+    /// With `persist`, the unheld `fp-<hex>` folders other than `keep` go too (another model's spilled conversations).
+    static size_t clean_dead(const std::filesystem::path& root, bool persist = false, const std::string& keep = {}) {
         size_t n = 0;
         std::error_code ec;
         for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
             const std::filesystem::path p = it->path();
             std::error_code e2;
-            if (it->is_symlink(e2) || !it->is_directory(e2) || !spill_detail::is_namespace_name(p.filename().string())) continue;
+            if (it->is_symlink(e2) || !it->is_directory(e2) || !(spill_detail::is_namespace_name(p.filename().string()) ||
+                (persist && spill_detail::is_persist_name(p.filename().string()) && p.filename().string() != keep))) continue;
             const spill_detail::LockHandle h = spill_detail::try_lock(p / ".lock");
             if (h == spill_detail::no_lock()) continue;   // a live engine holds it (or it cannot be checked): kept
             spill_detail::unlock(h);
@@ -219,6 +258,7 @@ public:
 private:
     std::filesystem::path root_, dir_;
     spill_detail::LockHandle lock_ = spill_detail::no_lock();
+    bool persistent_ = false;
 };
 
 /// The SSD tier's entries: parked conversations written as session files into this process's namespace, oldest first.
@@ -236,16 +276,31 @@ public:
         std::filesystem::path file;
         uint64_t bytes = 0;
         bool cvec = false;
+        uint64_t used = 0;                               // last use (written, matched-and-read): the least recently used goes first
         ConversationCheckpoint live;                     // ids and images only
         std::vector<ConversationCheckpoint> checkpoints;   // ids and images only
     };
 
-    bool open(const std::filesystem::path& root, uint64_t cap, std::string& error, size_t* cleaned = nullptr) {
+    /// `persist`: the tier lives in the stable folder of persist->model and keeps its entries across restarts: those of the files
+    /// whose identity is `*persist` (model and config) are adopted (`*adopted` counts them, oldest use first), any other file of
+    /// that folder is deleted.  The folders of other fingerprints go.  Reads leave the entries in place; a per-process folder
+    /// (persist null, or the stable one held by another engine) behaves as before.
+    bool open(const std::filesystem::path& root, uint64_t cap, std::string& error, size_t* cleaned = nullptr,
+              const SessionFileIdentity* persist = nullptr, size_t* adopted = nullptr) {
         std::lock_guard<std::mutex> lk(mu_);
         entries_.clear();
         budget_ = SpillBudget{cap, 0, 0};
-        return ns_.open(root, error, cleaned);
+        tick_ = 0;
+        next_serial_ = 1;
+        if (adopted) *adopted = 0;
+        const bool ok = ns_.open(root, error, cleaned, persist ? &persist->model : nullptr);
+        if (ok && ns_.persistent()) {
+            const size_t n = adopt_locked(*persist);
+            if (adopted) *adopted = n;
+        }
+        return ok;
     }
+    bool persistent() const { std::lock_guard<std::mutex> lk(mu_); return ns_.persistent(); }
     bool enabled() const { std::lock_guard<std::mutex> lk(mu_); return enabled_locked(); }
     size_t size() const { std::lock_guard<std::mutex> lk(mu_); return entries_.size(); }
     uint64_t bytes() const { std::lock_guard<std::mutex> lk(mu_); return budget_.used; }
@@ -272,7 +327,10 @@ public:
             if (need > budget_.cap) { error = "larger than the whole SSD tier"; return false; }
             while (!budget_.reserve(need)) {
                 if (entries_.empty()) { error = "no room in the SSD tier"; return false; }
-                drop_locked(0);
+                size_t victim = SIZE_MAX;   // an entry this one extends goes first (it would go anyway), then the least recently used
+                for (size_t i = 0; i < entries_.size() && victim == SIZE_MAX; ++i)
+                    if (superseded_by(entries_[i], image)) victim = i;
+                drop_locked(victim != SIZE_MAX ? victim : lru_locked());
             }
             serial = next_serial_++;
             f = ns_.file_for(serial);
@@ -291,9 +349,20 @@ public:
         }
         std::lock_guard<std::mutex> lk(mu_);
         budget_.finish(need, ok ? written : 0);
+        if (ok && ns_.persistent() && !meta_write(f, e, id)) {
+            std::error_code ec;
+            std::filesystem::remove(f, ec);
+            budget_.drop(written);
+            error = "the entry's index file could not be written";
+            return false;
+        }
         if (!ok) return false;
+        e.used = ++tick_;
+        // the same conversation grown: an entry whose tokens are a prefix of this one's is served by this one in full
+        for (size_t i = entries_.size(); i-- > 0;)
+            if (superseded_by(entries_[i], image)) drop_locked(i);
         entries_.push_back(std::move(e));
-        while (budget_.over() && entries_.size() > 1) drop_locked(0);   // (a file larger than its estimate)
+        while (budget_.over() && entries_.size() > 1) drop_locked(lru_locked());   // (a file larger than its estimate)
         if (serial_out) *serial_out = serial;
         return true;
     }
@@ -327,14 +396,25 @@ public:
             const size_t i = index_locked(serial);
             if (i == SIZE_MAX) { error = "no such SSD entry"; return false; }
             f = entries_[i].file;
-            budget_.drop(entries_[i].bytes);
-            entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+            if (ns_.persistent()) {   // kept: a restart finds it again; the next spill that extends it replaces it
+                entries_[i].used = ++tick_;
+                std::error_code ec;
+                std::filesystem::last_write_time(meta_path(f), std::filesystem::file_time_type::clock::now(), ec);
+            } else {
+                budget_.drop(entries_[i].bytes);
+                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+            }
         }
+        const bool keep = persistent_now();
         SavedConversation image;
         size_t read = 0;
         const bool ok = session_file_read(f.string(), id, image, read, error, limits);
-        std::error_code ec;
-        std::filesystem::remove(f, ec);
+        if (!keep) {
+            std::error_code ec;
+            std::filesystem::remove(f, ec);
+        } else if (!ok) {
+            drop_serial(serial);   // (a file that does not read back is not tried again)
+        }
         if (ok) out = std::move(image);
         return ok;
     }
@@ -366,7 +446,8 @@ public:
     }
     void close() {
         std::lock_guard<std::mutex> lk(mu_);
-        while (!entries_.empty()) drop_locked(entries_.size() - 1);
+        if (!ns_.persistent()) while (!entries_.empty()) drop_locked(entries_.size() - 1);   // (a stable folder keeps its entries)
+        entries_.clear();
         ns_.close();
     }
 
@@ -377,8 +458,144 @@ private:
             if (entries_[i].serial == serial) return i;
         return SIZE_MAX;
     }
+    bool persistent_now() const { std::lock_guard<std::mutex> lk(mu_); return ns_.persistent(); }
+    static std::filesystem::path meta_path(std::filesystem::path f) { return f.replace_extension(".meta"); }
+    size_t lru_locked() const {
+        size_t b = 0;
+        for (size_t i = 1; i < entries_.size(); ++i)
+            if (entries_[i].used < entries_[b].used) b = i;
+        return b;
+    }
+    /// `e` is a prefix (equal or shorter) of `image`'s live tokens, same steering and pictures: `image` serves every resume `e` could
+    static bool superseded_by(const Entry& e, const SavedConversation& image) {
+        const size_t n = e.live.ids.size();
+        if (n == 0 || e.cvec != image.cvec || n > image.live.ids.size() ||
+            !std::equal(e.live.ids.begin(), e.live.ids.end(), image.live.ids.begin())) return false;
+        for (const auto& k : e.live.imgs) {   // its pictures are the first ones of the image's
+            bool found = false;
+            for (const auto& m : image.live.imgs) if (m == k) { found = true; break; }
+            if (!found) return false;
+        }
+        size_t within = 0;
+        for (const auto& m : image.live.imgs) if (m.start < (int64_t) n) ++within;
+        return within == e.live.imgs.size();
+    }
+    // The index file beside a persistent entry (`conv-N.meta`): what matching needs, so a restart adopts the entry without reading
+    // its session file.  Written after the session file is complete, by a temporary name and a rename.
+    template <class T> static void put_pod(std::string& b, const T& v) { b.append((const char*) &v, sizeof v); }
+    static void put_ckpt(std::string& b, const ConversationCheckpoint& c) {
+        put_pod(b, (uint64_t) c.ids.size());
+        b.append((const char*) c.ids.data(), c.ids.size() * sizeof(int32_t));
+        put_pod(b, (uint64_t) c.imgs.size());
+        for (const auto& k : c.imgs) { put_pod(b, k.start); put_pod(b, k.hash); }
+    }
+    static bool meta_write(const std::filesystem::path& f, const Entry& e, const SessionFileIdentity& id) {
+        std::string b = "SPM1";
+        put_pod(b, id.model); put_pod(b, id.config);
+        put_pod(b, (uint8_t) e.cvec); put_pod(b, e.bytes);
+        put_ckpt(b, e.live);
+        put_pod(b, (uint64_t) e.checkpoints.size());
+        for (const auto& c : e.checkpoints) put_ckpt(b, c);
+        const std::filesystem::path m = meta_path(f);
+        std::filesystem::path t = m;
+        t += ".tmp";
+        {
+            std::FILE* fp = std::fopen(t.string().c_str(), "wb");
+            if (!fp) return false;
+            const bool ok = std::fwrite(b.data(), 1, b.size(), fp) == b.size();
+            if (std::fclose(fp) != 0 || !ok) { std::error_code ec; std::filesystem::remove(t, ec); return false; }
+        }
+        std::error_code ec;
+        std::filesystem::rename(t, m, ec);
+        if (ec) { std::filesystem::remove(t, ec); return false; }
+        return true;
+    }
+    struct Rd {
+        const std::string& b; size_t at = 0; bool bad = false;
+        template <class T> T pod() { T v{}; if (bad || at + sizeof v > b.size()) { bad = true; return v; } std::memcpy(&v, b.data() + at, sizeof v); at += sizeof v; return v; }
+    };
+    static bool get_ckpt(Rd& r, ConversationCheckpoint& c, uint64_t file_bytes) {
+        const uint64_t n = r.pod<uint64_t>();
+        if (r.bad || n > file_bytes || r.at + n * sizeof(int32_t) > r.b.size()) return false;
+        c.ids.resize((size_t) n);
+        std::memcpy(c.ids.data(), r.b.data() + r.at, (size_t) n * sizeof(int32_t));
+        r.at += (size_t) n * sizeof(int32_t);
+        const uint64_t m = r.pod<uint64_t>();
+        if (r.bad || m > r.b.size()) return false;
+        for (uint64_t i = 0; i < m; ++i) { ConversationImageKey k; k.start = r.pod<int64_t>(); k.hash = r.pod<uint64_t>(); c.imgs.push_back(k); }
+        return !r.bad;
+    }
+    /// Lists the entries a previous run left in the stable folder (mu_ held): a session file whose index file reads back, whose size
+    /// is the one written and whose identity is `id` is adopted, oldest use (the index file's time) first; everything else in the
+    /// folder - another identity, a half-written or orphaned file - is deleted.
+    size_t adopt_locked(const SessionFileIdentity& id) {
+        namespace fs = std::filesystem;
+        struct Found { Entry e; fs::file_time_type t; };
+        std::vector<Found> found;
+        std::error_code ec;
+        std::vector<fs::path> all;
+        for (fs::directory_iterator it(ns_.dir(), ec), end; !ec && it != end; it.increment(ec)) all.push_back(it->path());
+        auto serial_of = [](const fs::path& p, uint64_t& out) {
+            const std::string n = p.stem().string();   // conv-<serial>
+            if (n.size() < 6 || n.compare(0, 5, "conv-") != 0) return false;
+            out = 0;
+            for (size_t i = 5; i < n.size(); ++i) { if (n[i] < '0' || n[i] > '9') return false; out = out * 10 + (uint64_t)(n[i] - '0'); }
+            return true;
+        };
+        std::vector<uint64_t> seen;
+        for (const auto& p : all) {
+            if (p.extension() != ".meta") continue;
+            uint64_t serial = 0;
+            std::error_code e2;
+            const fs::path sess = fs::path(p).replace_extension(".session");
+            bool good = serial_of(p, serial) && fs::is_regular_file(sess, e2) && fs::is_regular_file(p, e2);
+            Found f;
+            if (good) {
+                std::string b;
+                if (std::FILE* fp = std::fopen(p.string().c_str(), "rb")) {
+                    char buf[65536];
+                    size_t n;
+                    while ((n = std::fread(buf, 1, sizeof buf, fp)) > 0) { b.append(buf, n); if (b.size() > (size_t(1) << 28)) break; }
+                    std::fclose(fp);
+                } else good = false;
+                Rd r{b};
+                good = good && b.compare(0, 4, "SPM1") == 0;
+                if (good) {
+                    r.at = 4;
+                    const uint64_t model = r.pod<uint64_t>(), config = r.pod<uint64_t>();
+                    f.e.cvec = r.pod<uint8_t>() != 0;
+                    f.e.bytes = r.pod<uint64_t>();
+                    good = !r.bad && model == id.model && config == id.config && fs::file_size(sess, e2) == f.e.bytes && !e2 &&
+                           get_ckpt(r, f.e.live, f.e.bytes);
+                    const uint64_t nc = good ? r.pod<uint64_t>() : 0;
+                    for (uint64_t i = 0; good && i < nc; ++i) { ConversationCheckpoint c; good = get_ckpt(r, c, f.e.bytes); if (good) f.e.checkpoints.push_back(std::move(c)); }
+                    good = good && !r.bad;
+                }
+                if (good) { f.e.serial = serial; f.e.file = sess; f.t = fs::last_write_time(p, e2); good = !e2; }
+            }
+            if (good) { seen.push_back(serial); found.push_back(std::move(f)); }
+            else { fs::remove(p, e2); fs::remove(sess, e2); }
+        }
+        for (const auto& p : all) {   // whatever is not an adopted entry's file (a .session without index, a leftover temporary)
+            if (p.filename() == ".lock") continue;
+            uint64_t serial = 0;
+            const bool listed = (p.extension() == ".meta" || p.extension() == ".session") && serial_of(p, serial) &&
+                                std::find(seen.begin(), seen.end(), serial) != seen.end();
+            if (!listed) { std::error_code e2; fs::remove_all(p, e2); }
+        }
+        std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.t != b.t ? a.t < b.t : a.e.serial < b.e.serial; });
+        for (auto& f : found) {
+            f.e.used = ++tick_;
+            if (f.e.serial >= next_serial_) next_serial_ = f.e.serial + 1;
+            budget_.used += f.e.bytes;
+            entries_.push_back(std::move(f.e));
+        }
+        while (budget_.over() && entries_.size() > 1) drop_locked(lru_locked());   // (the cap is now smaller than what was kept)
+        return entries_.size();
+    }
     void drop_locked(size_t i) {
         std::error_code ec;
+        std::filesystem::remove(meta_path(entries_.at(i).file), ec);
         std::filesystem::remove(entries_.at(i).file, ec);
         budget_.drop(entries_[i].bytes);
         entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
@@ -393,7 +610,7 @@ private:
     SpillNamespace ns_;
     SpillBudget budget_;
     std::vector<Entry> entries_;
-    uint64_t next_serial_ = 1;
+    uint64_t next_serial_ = 1, tick_ = 0;
 };
 
 /// The best prefix a parked image gives `prompt`, by the RAM cache's rule (its live state or a checkpoint, same pictures, same

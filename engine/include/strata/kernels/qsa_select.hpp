@@ -45,6 +45,22 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
                             const int32_t* steps, int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores,
                             void* stream);
+
+/// Slot-grouped block scores: contiguous queries of the same slot share one read of that slot's
+/// `pooled`/`dead` keys across all `ntok[g]` rows in a single launch (`grid = (256, ng)`), bitwise identical to
+/// per-query `qsa_block_scores`. Sized well under Ampere sm_86's 4 KB pass-by-value kernel parameter limit.
+inline constexpr int kScoreMaxGroups = 8;
+struct QsaScoreGroups {
+    const float* pooled[kScoreMaxGroups] = {};
+    const float* dead[kScoreMaxGroups] = {};
+    int first[kScoreMaxGroups] = {};
+    int ntok[kScoreMaxGroups] = {};
+    int ng = 0;
+};
+static_assert(sizeof(QsaScoreGroups) <= 2048, "sm_86 4KB kernel param limit");
+
+bool qsa_block_scores_slot_groups(const QsaScoreGroups& groups, const float* q_idx, const int32_t* steps,
+                                  int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
 /// QSAROWS (docs/QSAROWS.md): block_scores_multi_kernel's scores for a call of up to 4 queries, bit for bit, with the
 /// queries in registers and the four heads reduce-scattered (six shuffles instead of twenty a block and query).
 /// qsa_block_scores takes it with STRATA_QSA_ROWS=1; false (nothing launched) above 4 queries or on another geometry.

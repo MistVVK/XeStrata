@@ -1,6 +1,7 @@
 // Host-only validation fixtures. CUDA is linked but must never be initialized:
 // invalid restores must return before the first CUDA call or destination write.
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/conversation_memory.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
 #include <cstdint>
@@ -281,9 +282,199 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
 #endif
 }
+
+#if defined(CONVERSATION_TEST_TRANSFERS) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+void swap_transfer_failure() {
+    ModelGeometry g;
+    g.n_layers=4; g.n_expert=256; g.ssm_state_size=2; g.ssm_v_heads=2; g.ssm_conv_channels=8;
+    g.n_head_kv=1; g.head_dim=64; g.idx_key_dim=8;
+    std::string error;
+    ConversationStateSizes z;
+    check(conversation_state_sizes(g,z,error),"swap mock state sizes");
+    Pools pool(g,1);
+    auto& st=pool.st;
+    st.kv_mode=1; st.n_slots=4;
+    std::vector<uint8_t> mapped(pool.data[0].size()+pool.data[1].size()+pool.data[2].size()+pool.data[3].size(),0x55);
+    // This deliberately unmapped device alias is never safe to dereference on
+    // the CPU. Only the recorded CPU base may be used for the exchange.
+    const uintptr_t alias=static_cast<uintptr_t>(0x100000000ull);
+    st.host_cpu_base=mapped.data(); st.host_device_base=reinterpret_cast<uint8_t*>(alias); st.host_allocation_bytes=mapped.size();
+    size_t at=0;
+    st.host.k_q=reinterpret_cast<int8_t*>(alias+at); at+=pool.data[0].size();
+    st.host.v_q=reinterpret_cast<int8_t*>(alias+at); at+=pool.data[1].size();
+    st.host.k_scale=reinterpret_cast<uint16_t*>(alias+at); at+=pool.data[2].size();
+    st.host.v_scale=reinterpret_cast<uint16_t*>(alias+at);
+    st.idx_pooled_allocation=st.idx_pooled; st.idx_pooled_allocation_bytes=pool.data[4].size();
+    std::vector<int32_t> page(24), block(4), stamp(4), ref(4), miss_block(4), miss_slot(4), ctl(32);
+    st.page_table=page.data(); st.map.page_table=page.data(); st.map.n_blocks=24; st.map.n_slots=4;
+    st.map.slot_block=block.data(); st.map.slot_stamp=stamp.data(); st.map.slot_ref=ref.data();
+    st.map.miss_block=miss_block.data(); st.map.miss_slot=miss_slot.data(); st.map.ctl=ctl.data();
+    std::vector<uint8_t> gdn(z.gdn,0xa5), ple(z.ple,0xa5);
+    SessionState ss;
+    ss.max_cells=96; ss.layer_hi=g.n_layers; ss.gdn_alloc=g.n_gdn_layers(); ss.qsa_alloc=1;
+    ss.qsa_states=&st; ss.gdn_state=reinterpret_cast<float*>(gdn.data()); ss.ple_hist=reinterpret_cast<float*>(ple.data());
+    SavedConversation incoming;
+    incoming.geometry={g.n_embd,g.n_layers,g.qsa_interval,g.ssm_state_size,g.ssm_k_heads,g.ssm_v_heads,
+                       g.ssm_d_conv,g.ssm_conv_channels,g.ssm_value_dim,g.n_head,g.n_head_kv,g.head_dim,
+                       g.idx_q_heads,g.idx_key_dim,g.hc,g.hc_lr,g.n_expert,g.n_ff};
+    incoming.layer_hi=g.n_layers; incoming.live.ids={21,22,23,24,25,26,27,28,29};
+    incoming.live.gdn.resize(z.gdn,13); incoming.live.ple.resize(z.ple,13);
+    incoming.live.tails.resize(z.tail,13); incoming.live.dead.resize(z.dead,13); incoming.live.block_pos.resize(z.block_pos,13);
+    incoming.kv.push_back(pool.image(g,true));
+    const auto original=incoming;
+    const std::vector<int32_t> active_ids{1,2,3,4,5,6,7,8,9};
+    const std::vector<ConversationImageKey> images;
+    const std::vector<ConversationCheckpoint> checkpoints;
+    const ConversationView active{active_ids,images,checkpoints,true};
+    ConversationSwapPlan plan;
+    constexpr size_t scratch=7;
+    copy_calls=sync_calls=fail_copy=fail_sync=0;
+    check(st.host_cpu_base!=st.host_device_base,"mock CPU mapping and device alias differ");
+    const size_t disabled=conversation_cache_swap_block_bytes(conversation_cache_swap_default_block_mib);
+    check(disabled==0 && !conversation_snapshot_swap_prepare(plan,incoming,active,ss,g,nullptr,disabled,error) &&
+          copy_calls==0 && sync_calls==0 && incoming.kv[0].k==original.kv[0].k && mapped[0]==0x55,
+          "default zero leaves both sessions untouched for the old path");
+    {
+        // K needs a new segment as well as spare capacity; V grows entirely
+        // within spare capacity that may never have been resident.
+        SavedConversation longer_incoming = incoming;
+        std::array<ConversationBuffer*,4> parts{&longer_incoming.kv[0].k, &longer_incoming.kv[0].v,
+                                                &longer_incoming.kv[0].k_scale, &longer_incoming.kv[0].v_scale};
+        for (size_t i = 0; i < 2; ++i) {
+            const size_t n = parts[i]->size();
+            ConversationBuffer with_spare;
+            with_spare.resize_for_overwrite(n + (i == 0 ? 100 : 1024));
+            check(with_spare.visit(0,n,[](uint8_t* p, size_t count, size_t) {
+                std::memset(p,13,count); return true;
+            }), "initialize only B's used bytes, not its spare");
+            with_spare.resize_for_overwrite(n);
+            *parts[i] = std::move(with_spare);
+        }
+        const SavedConversation before_b = longer_incoming;
+        const auto before_mapped = mapped, before_gdn = gdn, before_ple = ple;
+        const auto before_pool = pool.data;
+        const auto before_page = page, before_block = block, before_stamp = stamp, before_ref = ref;
+        const auto before_miss_block = miss_block, before_miss_slot = miss_slot, before_ctl = ctl;
+        const std::array<int32_t,2> before_prev{ss.ple_prev[0], ss.ple_prev[1]};
+        std::array<size_t,4> old_bytes{}, old_spare{};
+        for (size_t i = 0; i < parts.size(); ++i) {
+            old_bytes[i] = parts[i]->bytes();
+            size_t capacity = 0;
+            check(parts[i]->visit_allocations([&](const uint8_t*, size_t n, size_t) { capacity += n; return true; }),
+                  "measure parked capacity before growth");
+            old_spare[i] = capacity - parts[i]->size();
+        }
+        const std::vector<int32_t> longer_ids{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17};
+        const ConversationView longer_active{longer_ids,images,checkpoints,true};
+        ConversationSwapPlan longer_plan;
+        check(conversation_snapshot_swap_prepare(longer_plan,longer_incoming,longer_active,ss,g,nullptr,scratch,error),
+              "prepare longer A for the final RAM recheck");
+        constexpr uint64_t floor = 1024;
+        const uint64_t initial_available = floor + longer_plan.additional_bytes + (1u << 20);
+        check(conversation_memory_admit(initial_available,longer_plan.additional_bytes,floor),
+              "initial admission succeeds with headroom");
+        ConversationCache cache(1u << 22,2);
+        SavedConversation unrelated;
+        unrelated.live.ids = {99}; unrelated.live.gdn.resize(64,3);
+        check(cache.put(std::move(unrelated)),"park an unrelated cache entry");
+        check(cache.can_fit(longer_plan.image_bytes,longer_plan.held_bytes),"initial cache budget also fits");
+        const size_t cache_bytes = cache.bytes();
+        bool rechecked = false;
+        auto recheck = [&](size_t image_bytes, size_t held_bytes) {
+            rechecked = true;
+            size_t shared = longer_incoming.kv.capacity() * sizeof(ConversationKv);
+            size_t growth = 0;
+            for (size_t i = 0; i < parts.size(); ++i) {
+                shared += parts[i]->bytes();
+                check(parts[i]->bytes() >= old_bytes[i],"reserved K/V capacity does not shrink");
+                growth += parts[i]->bytes() - old_bytes[i];
+                if (longer_plan.layers[0].active_bytes[i] > longer_plan.layers[0].incoming_bytes[i])
+                    growth += old_spare[i];
+            }
+            check(parts[0]->bytes() > old_bytes[0] && parts[1]->bytes() == old_bytes[1] &&
+                  old_spare[0] >= 100 && old_spare[1] >= 1024,
+                  "recheck covers both new segments and previously reserved spare");
+            check(shared <= image_bytes && shared + held_bytes == longer_incoming.bytes() &&
+                  cache.can_fit(image_bytes,held_bytes),
+                  "cache budget counts the shared B storage exactly once");
+            const auto& pooled = longer_plan.layers[0].pooled;
+            const size_t expected = scratch + growth + pooled.bytes() - pooled.size();
+            check(longer_plan.final_additional_bytes == expected && growth > 0,
+                  "final RAM charge includes scratch, growth and unused index capacity");
+            const uint64_t available = floor + expected - 1;
+            check(available < initial_available && conversation_memory_admit(available,0,floor),
+                  "headroom shrank but an admit-zero recheck would incorrectly succeed");
+            return conversation_memory_admit(available,longer_plan.final_additional_bytes,floor);
+        };
+        SavedConversation unpublished;
+        check(conversation_snapshot_swap(longer_plan,longer_incoming,unpublished,longer_active,ss,g,scratch,recheck,error) ==
+                  ConversationSwap::unavailable && rechecked,
+              "reduced headroom falls back before the first exchange write");
+        const auto& after = longer_incoming.kv[0];
+        const auto& before = before_b.kv[0];
+        check(after.k == before.k && after.v == before.v && after.k_scale == before.k_scale &&
+              after.v_scale == before.v_scale && after.pooled == before.pooled &&
+              after.format == before.format && after.cells == before.cells && after.heads == before.heads &&
+              after.head_dim == before.head_dim && after.page_size == before.page_size &&
+              after.pooled_rows == before.pooled_rows && after.idx_dim == before.idx_dim && after.dev_tag == before.dev_tag &&
+              longer_incoming.geometry == before_b.geometry && longer_incoming.cvec == before_b.cvec &&
+              longer_incoming.layer_lo == before_b.layer_lo && longer_incoming.layer_hi == before_b.layer_hi &&
+              longer_incoming.checkpoints.empty() && longer_incoming.stage_images.empty() &&
+              longer_incoming.live.ids == before_b.live.ids && longer_incoming.live.imgs == before_b.live.imgs &&
+              longer_incoming.live.gdn == before_b.live.gdn && longer_incoming.live.ple == before_b.live.ple &&
+              longer_incoming.live.tails == before_b.live.tails && longer_incoming.live.dead == before_b.live.dead &&
+              longer_incoming.live.block_pos == before_b.live.block_pos,
+              "RAM refusal leaves all parked B bytes and state unchanged");
+        check(mapped == before_mapped && pool.data == before_pool && gdn == before_gdn && ple == before_ple &&
+              page == before_page && block == before_block && stamp == before_stamp && ref == before_ref &&
+              miss_block == before_miss_block && miss_slot == before_miss_slot && ctl == before_ctl &&
+              ss.ple_prev[0] == before_prev[0] && ss.ple_prev[1] == before_prev[1],
+              "RAM refusal leaves active A bytes, state and device indices unchanged");
+        check(unpublished.kv.empty() && unpublished.live.ids.empty() && cache.bytes() == cache_bytes &&
+              cache.size() == 1 && cache.evictions() == 0 && cache.can_fit(0,longer_incoming.bytes()),
+              "rollback publishes nothing, keeps other entries, and accounts for B's actual retained capacity");
+        SavedConversation other;
+        other.live.ids = {99}; other.live.gdn.resize(64,3);
+        ConversationCache exact(other.bytes() + longer_incoming.bytes() + 1,2);
+        check(exact.put(std::move(other)) && exact.can_fit(1,longer_incoming.bytes()) &&
+              !exact.can_fit(2,longer_incoming.bytes()),
+              "fallback budget charges B's post-rollback capacity exactly once");
+    }
+    auto* cpu_base=st.host_cpu_base;
+    st.host_cpu_base=nullptr;
+    check(!conversation_snapshot_swap_prepare(plan,incoming,active,ss,g,nullptr,scratch,error),
+          "unverifiable CPU mapping uses the old path");
+    st.host_cpu_base=cpu_base;
+    incoming.kv[0].dev_tag=1;
+    check(!conversation_snapshot_swap_prepare(plan,incoming,active,ss,g,nullptr,scratch,error),
+          "device-tagged image uses the old path");
+    incoming.kv[0].dev_tag=0;
+    incoming.stage_images.emplace_back();
+    check(!conversation_snapshot_swap_prepare(plan,incoming,active,ss,g,nullptr,scratch,error),
+          "split image uses the old path");
+    incoming.stage_images.clear();
+    check(conversation_snapshot_swap_prepare(plan,incoming,active,ss,g,nullptr,scratch,error),"prepare distinct-alias exchange");
+    SavedConversation outgoing;
+    check(conversation_snapshot_swap(plan,incoming,outgoing,active,ss,g,scratch,[](size_t,size_t){return false;},error)==
+              ConversationSwap::unavailable,
+          "pre-write admission failure permits the old path");
+    check(incoming.kv[0].k==original.kv[0].k && mapped[0]==0x55,"pre-write failure preserves both K/V images");
+    check(conversation_snapshot_swap_prepare(plan,incoming,active,ss,g,nullptr,scratch,error),"prepare injected transfer failure");
+    auto fail_next=[&](size_t,size_t) { fail_copy=copy_calls+1; return true; };
+    check(conversation_snapshot_swap(plan,incoming,outgoing,active,ss,g,scratch,fail_next,error)==ConversationSwap::transfer_failed,
+          "device-index copy failure after first exchanged byte is fatal");
+    uint8_t parked=0;
+    check(incoming.kv[0].k.read(&parked,0,1) && mapped[0]==13 && parked==0x55,
+          "exchange used the real CPU mapping before the injected post-write failure");
+    fail_copy=0;
+}
+#endif
 }
 
 int main() {
+#if defined(CONVERSATION_TEST_TRANSFERS) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    swap_transfer_failure();
+#endif
     for (int format : {0,1,2}) for (int experts : {256,512})
         for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);

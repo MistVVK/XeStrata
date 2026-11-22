@@ -38,6 +38,7 @@ struct QsaAttnPoolsRows {
     QsaAttnPools p[kAttnRowsMax];
     int n = 0;
 };
+static_assert(sizeof(QsaAttnPoolsRows) <= 2048, "sm_86 4KB kernel param limit");
 
 /// Scratch floats for `cap` selected cells: partial accumulators, maxima and sums.
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);
@@ -57,6 +58,7 @@ constexpr int kQsaAttnMaxSlots = 8;
 struct QsaAttnSlotPools {
     QsaAttnPools p[kQsaAttnMaxSlots];
 };
+static_assert(sizeof(QsaAttnSlotPools) <= 2048, "sm_86 4KB kernel param limit");
 
 /// qsa_decode_attn_batch for `n_q` queries that each attend over their OWN pools (`pools.p[i]`, one KV cache per batch
 /// slot): one launch instead of one call per query, every block computing exactly what the per-query call computes.

@@ -151,6 +151,53 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 /// thread has one for the card or a finished thread left one in the pool. A restore writes into buffers that exist
 /// already; a new stream is the one thing it can allocate (see program/conv_cache.hpp restore_fits).
 bool conversation_copy_stream_ready(int device);
+// Prepared only for an exclusive, host-authoritative whole-session take.
+// The incoming image remains untouched until all ranges and allocations pass.
+struct ConversationKvSwapLayer {
+    const QsaState* state = nullptr;
+    ConversationKv* image = nullptr;
+    std::array<uint8_t*, 4> active{};
+    std::array<size_t, 5> active_bytes{}, incoming_bytes{};
+    int format = 0;
+    int64_t cells = 0, pooled_rows = 0, page_size = 0;
+    ConversationBuffer pooled;
+};
+struct ConversationSwapPlan {
+    std::vector<ConversationKvSwapLayer> layers;
+    size_t image_bytes = 0, held_bytes = 0, additional_bytes = 0;
+    // Conservative bytes not necessarily reflected in the final RAM sample.
+    size_t final_additional_bytes = 0;
+};
+// The two estimates count shared incoming segments only once, including their
+// actual capacity and the temporary directory needed for any growth.
+bool conversation_snapshot_swap_prepare(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                        const ConversationView& active, const SessionState& session,
+                                        const ModelGeometry& g, const QsaState* draft, size_t block_bytes,
+                                        std::string& error);
+enum class ConversationSwap { unavailable, swapped, transfer_failed };
+// The ready callback checks plan.final_additional_bytes against the latest RAM
+// sample, as well as the image and held sizes against the cache budget.
+// unavailable leaves the incoming image readable and permits the original
+// park/restore path. transfer_failed must end the request/process, never retry.
+ConversationSwap conversation_snapshot_swap(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                            SavedConversation& outgoing, const ConversationView& active,
+                                            SessionState& session, const ModelGeometry& g, size_t block_bytes,
+                                            const std::function<bool(size_t, size_t)>& ready, std::string& error);
+
+// Internal K/V half of the whole-session operation; the state half owns the
+// allocation, synchronization, rollback and running-state restore.
+bool conversation_kv_swap_prepare(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                  const SessionState& session, const ModelGeometry& g,
+                                  const QsaState* draft, int64_t active_tokens, std::string& error);
+bool conversation_kv_swap_reserve(ConversationSwapPlan& plan, uint8_t* scratch, size_t block_bytes,
+                                  bool& transfer_failed, std::string& error);
+void conversation_kv_swap_rollback(ConversationSwapPlan& plan);
+bool conversation_kv_swap_exchange(ConversationSwapPlan& plan, const ModelGeometry& g,
+                                   int64_t incoming_tokens, uint8_t* scratch, size_t block_bytes,
+                                   bool& written, std::string& error);
+void conversation_kv_swap_publish(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                 SavedConversation& outgoing, const ModelGeometry& g);
+
 enum class ConversationRestore { restored, invalid, transfer_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.

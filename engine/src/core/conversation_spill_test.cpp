@@ -53,6 +53,77 @@ int main() {
     // the folders: two live engines on one root keep each other's folder; a dead one's goes; nothing else is touched
     std::error_code ec;
     const fs::path root = fs::temp_directory_path() / ("strata-spill-test-" + std::to_string(std::random_device{}()));
+    {   // --conversation-spill-persist: a stable folder per model fingerprint; entries survive a restart, LRU at the cap, a grown conversation replaces its prefix
+        auto img = [](std::vector<int32_t> ids, uint8_t fill) {
+            SavedConversation s;
+            s.live.ids = ids;
+            s.live.gdn.assign(1 << 20, fill);
+            s.cvec = true;
+            return s;
+        };
+        const fs::path proot = fs::temp_directory_path() / ("strata-spill-persist-" + std::to_string(std::random_device{}()));
+        fs::remove_all(proot, ec);
+        const SessionFileIdentity A{0xa1, 5}, B{0xb2, 5}, A2{0xa1, 6};
+        const uint64_t cap = uint64_t(5) << 20;   // three entries (about 1 MiB each, 2 MiB reserved per write)
+        std::string e;
+        size_t cleaned = 0, adopted = 99;
+        {   // run 0: another model leaves an entry
+            ConversationSpill s;
+            check(s.open(proot, cap, e, &cleaned, &B, &adopted) && s.persistent() && adopted == 0, "persist: a first run on a new root");
+            check(s.put(img({90, 91}, 1), B, e) && s.size() == 1, "persist: model B's entry");
+        }
+        check(fs::exists(proot / spill_detail::persist_name(B.model)), "persist: the stable folder outlives the run");
+        {   // run 1: model A
+            ConversationSpill s;
+            check(s.open(proot, cap, e, &cleaned, &A, &adopted) && s.persistent() && adopted == 0 && cleaned == 1, "persist: model A's start removes B's folder");
+            check(!fs::exists(proot / spill_detail::persist_name(B.model)) && s.dir().filename() == spill_detail::persist_name(A.model), "persist: B's folder gone, A's is fp-<hex>");
+            check(s.put(img({1, 2, 3, 4}, 7), A, e) && s.put(img({10, 11}, 8), A, e) && s.put(img({20, 21}, 9), A, e) && s.size() == 3, "persist: three entries written");
+            ConversationSpill other;   // a second live engine of the same model: falls back to its own per-process folder
+            check(other.open(proot, cap, e, nullptr, &A, &adopted) && !other.persistent() && adopted == 0 && other.dir() != s.dir(), "persist: a second engine of the model gets its own folder");
+            other.close();
+        }
+        {   // run 2: a restart, same fingerprint
+            ConversationSpill s;
+            check(s.open(proot, cap, e, &cleaned, &A, &adopted) && adopted == 3 && s.size() == 3 && s.bytes() > 0, "restart: the three entries are adopted");
+            auto m = s.best(std::vector<int32_t>{1, 2, 3, 4, 9}, {}, true);
+            check(m.tokens == 4 && m.live, "restart: found by token prefix");
+            SavedConversation back;
+            check(s.take_serial(m.serial, A, {}, back, e) && back.live.ids == std::vector<int32_t>({1, 2, 3, 4}) &&
+                  back.live.gdn == std::vector<uint8_t>(1 << 20, 7), "restart: read back byte for byte");
+            check(s.size() == 3 && s.find(m.serial), "a read leaves the entry in place");
+            // least recently USED goes at the cap: {10,11} was written after {1,2,3,4} but the read made {1,2,3,4} the freshest
+            check(s.put(img({30, 31}, 4), A, e) && s.size() == 3, "LRU: a fourth at the cap");
+            check(s.best(std::vector<int32_t>{10, 11, 0}, {}, true).tokens == 0, "LRU: the least recently used ({10,11}) went");
+            check(s.best(std::vector<int32_t>{1, 2, 3, 4, 0}, {}, true).tokens == 4 && s.best(std::vector<int32_t>{20, 21, 0}, {}, true).tokens == 2 &&
+                  s.best(std::vector<int32_t>{30, 31, 0}, {}, true).tokens == 2, "LRU: the read one and the others stay");
+            // supersede: the same conversation grown replaces its prefix; an entry that is no prefix is never removed for it
+            const auto old = s.best(std::vector<int32_t>{1, 2, 3, 4, 0}, {}, true);
+            const fs::path oldf = s.find(old.serial)->file;
+            check(s.put(img({1, 2, 3, 4, 5, 6}, 6), A, e) && s.size() == 3 && !fs::exists(oldf) && !s.find(old.serial), "supersede: P+Q replaces P");
+            check(s.best(std::vector<int32_t>{20, 21, 0}, {}, true).tokens == 2 && s.best(std::vector<int32_t>{30, 31, 0}, {}, true).tokens == 2,
+                  "supersede: entries that are no prefix stay");
+            check(s.best(std::vector<int32_t>{1, 2, 3, 4, 5, 6, 0}, {}, true).tokens == 6, "supersede: the grown one serves the resume");
+        }
+        {   // the same model, other settings: the files are not this run's
+            ConversationSpill s;
+            check(s.open(proot, cap, e, nullptr, &A2, &adopted) && adopted == 0 && s.size() == 0, "restart: another config fingerprint adopts nothing");
+        }
+        {   // restart: another model fingerprint
+            ConversationSpill s;
+            check(s.open(proot, cap, e, &cleaned, &B, &adopted) && adopted == 0 && s.size() == 0 && cleaned == 1, "restart: another model fingerprint deletes the entries");
+            check(!fs::exists(proot / spill_detail::persist_name(A.model)), "restart: the old folder is gone");
+        }
+        {   // a damaged index file: that entry is dropped, the others are adopted
+            ConversationSpill s;
+            check(s.open(proot, cap, e, nullptr, &A, &adopted) && s.put(img({1, 2}, 1), A, e) && s.put(img({3, 4}, 1), A, e), "damage: two entries");
+            const fs::path f0 = s.entry(0).file;
+            s.close();
+            fs::resize_file(fs::path(f0).replace_extension(".meta"), 9, ec);
+            ConversationSpill t;
+            check(t.open(proot, cap, e, nullptr, &A, &adopted) && adopted == 1 && !fs::exists(f0), "damage: a cut index file drops its entry");
+        }
+        fs::remove_all(proot, ec);
+    }
     fs::remove_all(root, ec);
     {
         SpillNamespace a, b2;

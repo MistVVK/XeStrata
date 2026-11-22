@@ -108,6 +108,16 @@ struct SessionInputs {
 };
 // The fingerprint's list: every role with its file, none merged (a path in two roles is two entries).
 std::vector<SessionModelFile> session_model_inputs(const SessionInputs& inputs);
+// The drafter's files, exactly as their loaders resolved them (mtp.cpp, metal window.cpp) - never a pack layout the
+// folder does not have.  `mtp` names a GGUF file: that GGUF.  It names a directory holding dense.bin or experts.bin:
+// those with dense.txt.  A directory without either is an rt directory (tools/mtp_rt.py): the Metal engine reads the
+// draft layer from the GGUF beside it - `mtp_gguf` if set (STRATA_METAL_MTP_GGUF), else <parent of mtp>/mtp-q2_0.gguf,
+// the same path window.cpp opens.  A pack folder without any weights contributes no entry: nothing is opened for it,
+// and a missing required file must not kill the fingerprint.  `draft_vocab` (--mtp-draft-vocab) when given; else
+// <mtp>/draft_vocab.bin only when it exists (the draft head's token subset).  `mtp` empty (a cleared drafter, e.g.
+// --draft dflash2 --draft-fallback none): no entry at all.
+std::vector<SessionModelFile> session_mtp_pack_files(const std::string& mtp, const std::string& draft_vocab = {},
+                                                     const std::string& mtp_gguf = {});
 
 // Why a session file operation failed, for the caller's answer (the server maps it to an HTTP status):
 //   invalid   refused: not a session file, corrupt, another model or configuration, over this engine's limits, a

@@ -789,8 +789,10 @@ system prompt with a billing header that changes on every request; the server pi
 | `"strata_prefix": {"messages": 1}` (per request, opt-in) | One long document, many questions. Marks where the document ends: `{"messages": 1}`, `{"message": 0, "chars": 210000}` or `{"tokens": 12345}`. The checkpoint at the boundary is pinned, so 20 questions cost one read of the document. One pinned prefix at a time per engine; needs `--prompt-cache 3` or more; a malformed field is a 400. See [RESEARCH_RUNS.md](RESEARCH_RUNS.md). |
 | `--conversation-cache-mib N`, `--conversation-cache-slots N` | Park conversations in a bounded host-RAM cache so alternating requests (controller and worker histories, sub-agents) reuse their prompts. Without `--conversation-cache-mib` the budget is 40% of the RAM left above `--conversation-cache-min-free-mib` once the model is loaded, at most 8192 MiB in steps of 256, off when under 1024; the engine log says which. `0` turns it off. It preserves histories; it does not run requests at once. With more clients taking turns than slots, the oldest parked conversation leaves and that client reads its whole prompt again when it returns ([measured with eight agents](#history--older-measurements)). |
 | `--conversation-cache-min-tokens N` | Park only conversations of at least N tokens, so short side requests do not evict a long conversation. Default `0` (park all). |
+| `--conversation-cache-swap-block-mib N` (opt-in) | Exchange compatible host K/V in blocks when switching between parked conversations, reusing the incoming buffers for the outgoing conversation. Set `N` to any whole number from 1 to 256 MiB (for example `17`); default `0` disables it and keeps the original switch and K/V retention. An existing retained K/V prefix that matches the current conversation uses the ordinary park and restore path instead of exchange. |
 | `--conversation-cache-park-gain N` (opt-in) | Park a conversation again only after it advanced N tokens past the copy it would replace. |
 | `--conversation-cache-rewind-keep N` (opt-in) | When a request continues this conversation and at most N of the engine's newest tokens lie past the point where it resumes (for example, the reasoning that a client strips and does not send back), the conversation is not parked. The follow-up then reads only its new tokens instead of first copying the conversation's whole K/V cache. Those N tokens are read again only if that earlier branch is used again. A request that shares only a small part of the conversation (for example only the system prompt) is parked as before. Default `0` parks as before. |
+| `--conversation-spill-persist` (opt-in) | Keep the SSD tier of the conversation cache across engine restarts and reboots. The tier then lives in `<data>/conversation-spill/fp-<model fingerprint>/`; at start the entries written by the same model and settings are adopted and found by token prefix like spills of the current run (a resumed session reads its tokens back from the SSD instead of prefilling them), and the folders of other models are removed. A second engine of the same model uses its own per-process folder. Entries have no time limit: one goes only when the size cap needs room (least recently used, read or written, first) or when a longer spill of the same conversation replaces it. Reading an entry leaves it on disk. Default off: a per-process folder removed when the engine ends. |
 | `--conversation-cache-min-free-mib N` | RAM floor, default 2560. Parking and session files are skipped when less than the snapshot plus the floor is available. |
 | `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB`) | Total RAM this engine's container may use, for when a container cannot see its own limit. Config `args`: `"--memory-limit-mib", "102400"`. `0` = none. |
 
@@ -835,6 +837,13 @@ allocation failures fall back to ordinary prompt processing. With `--layer-split
 stage. Parked snapshots are not kept across restarts; session files are. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables K/V
 retention for diagnostics. The Monitor tab's **Conversation cache** card shows parked, restored and evicted counts and the
 prompt tokens the cache gave back; `/metrics` has the same under `"conversation_cache"`.
+
+The opt-in block exchange is for the Qwen3.8-Flash-Next CUDA engine: a single, non-batched session with host-backed
+streaming K/V and a whole conversation returned from the RAM cache. A draft layer, if used, also needs a verified
+host-backed K/V pool. Borrowed prefixes, session file restores, SSD returns, layer splits, elastic or device-only K/V,
+unverified mappings, asynchronous snapshots and diagnostic captures use the original path. The exchange also falls back
+if the image and working block cannot fit without an eviction. The block is temporary; it is not a limit on the engine's
+total host RAM.
 
 ### Session files (disk)
 

@@ -776,6 +776,126 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 
 bool conversation_copy_stream_ready(int device) { return conversation_detail::copy_stream_ready(device); }
 
+bool conversation_snapshot_swap_prepare(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                        const ConversationView& active, const SessionState& ss,
+                                        const ModelGeometry& g, const QsaState* draft, size_t block_bytes,
+                                        std::string& error) {
+    error.clear();
+    plan = {};
+    // The background park join reports a failed copy only in the log.  Do not
+    // destructively exchange an image that could have been filled that way.
+    if (!block_bytes || incoming.pending || incoming.live_pending || !incoming.stage_images.empty() ||
+        std::getenv("STRATA_PARK_ASYNC") || std::getenv("STRATA_CKPT_ASYNC") ||
+        std::getenv("STRATA_SNAPSHOT_VERIFY") || std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") ||
+        std::getenv("STRATA_CKPT_REREAD") || incoming.live.dev_tag) return false;
+    for (const auto& c : incoming.checkpoints) if (c.dev_tag) return false;
+    for (const auto& c : active.checkpoints) if (c.dev_tag) return false;
+    size_t image_bytes = 0;
+    if (!conversation_snapshot_validate(incoming, ss, g, draft, error) ||
+        !conversation_snapshot_bytes(active, ss, g, draft, image_bytes, error) ||
+        !conversation_kv_swap_prepare(plan, incoming, ss, g, draft, (int64_t) active.ids.size(), error)) return false;
+
+    size_t shared = 0, directory = 0;
+    if (!product(shared, {incoming.kv.capacity(), sizeof(ConversationKv)}) ||
+        !product(directory, {incoming.kv.capacity() - incoming.kv.size(), sizeof(ConversationKv)}) ||
+        !add(image_bytes, directory)) return fail(error, "swap directory byte count overflow");
+    for (size_t j = 0; j < plan.layers.size(); ++j) {
+        auto& layer = plan.layers[j];
+        const size_t fresh = conversation_kv_bytes(*layer.state, g, (int64_t) active.ids.size(), j < owned_qsa(ss));
+        if (!fresh || fresh > image_bytes) return fail(error, "invalid swap K/V estimate");
+        image_bytes -= fresh;
+        const std::array<ConversationBuffer*, 4> buffers = {
+            &layer.image->k, &layer.image->v, &layer.image->k_scale, &layer.image->v_scale};
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            const size_t peak = buffers[i]->allocation_peak(std::max(layer.active_bytes[i], layer.incoming_bytes[i]));
+            if (peak == SIZE_MAX || !add(image_bytes, peak) || !add(shared, buffers[i]->bytes()))
+                return fail(error, "swap K/V byte count overflow");
+        }
+        const size_t pooled = layer.pooled.allocation_peak(layer.active_bytes[4]);
+        if (pooled == SIZE_MAX || !add(image_bytes, pooled)) return fail(error, "swap index byte count overflow");
+    }
+    const size_t incoming_bytes = incoming.bytes();
+    if (shared > incoming_bytes || shared > image_bytes) return fail(error, "invalid shared swap capacity");
+    plan.image_bytes = image_bytes;
+    plan.held_bytes = incoming_bytes - shared; // B's state and device-index image, not its shared K/V
+    plan.additional_bytes = image_bytes - shared;
+    size_t plan_bytes = 0;
+    if (!product(plan_bytes, {plan.layers.capacity(), sizeof(ConversationKvSwapLayer)}) ||
+        !add(plan.additional_bytes, plan_bytes) || !add(plan.additional_bytes, block_bytes))
+        return fail(error, "swap working byte count overflow");
+    return true;
+}
+
+ConversationSwap conversation_snapshot_swap(ConversationSwapPlan& plan, SavedConversation& incoming,
+                                            SavedConversation& outgoing, const ConversationView& active,
+                                            SessionState& ss, const ModelGeometry& g, size_t block_bytes,
+                                            const std::function<bool(size_t, size_t)>& ready, std::string& error) {
+    bool written = false;
+    try {
+        conversation_checkpoint_join(nullptr);
+        conversation_park_join();
+        if (!sync(error)) return ConversationSwap::transfer_failed;
+        SavedConversation captured;
+        captured.geometry = geometry_key(g);
+        captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
+        captured.cvec = active.cvec;
+        captured.live.ids = conversation_detail::copy_beating(active.ids);
+        captured.live.imgs = conversation_detail::copy_beating(active.images);
+        captured.checkpoints = conversation_detail::copy_checkpoints_beating(active.checkpoints);
+        bool staged = false;
+        if (!checkpoint_save(captured.live, ss, g, error, staged) || staged) {
+            if (staged) conversation_checkpoint_join(captured.live.gdn.data());
+            return ConversationSwap::transfer_failed;
+        }
+        std::unique_ptr<uint8_t[]> scratch(new uint8_t[block_bytes]);
+        bool transfer_failed = false;
+        if (!conversation_kv_swap_reserve(plan, scratch.get(), block_bytes, transfer_failed, error)) {
+            conversation_kv_swap_rollback(plan);
+            return transfer_failed ? ConversationSwap::transfer_failed : ConversationSwap::unavailable;
+        }
+        size_t shared = 0, actual = captured.bytes();
+        if (!product(shared, {incoming.kv.capacity(), sizeof(ConversationKv)})) {
+            conversation_kv_swap_rollback(plan);
+            return ConversationSwap::unavailable;
+        }
+        for (const auto& layer : plan.layers) {
+            for (const ConversationBuffer* b : {&layer.image->k, &layer.image->v,
+                                                 &layer.image->k_scale, &layer.image->v_scale})
+                if (!add(shared, b->bytes())) {
+                    conversation_kv_swap_rollback(plan);
+                    return ConversationSwap::unavailable;
+                }
+            if (!add(actual, layer.pooled.bytes())) {
+                conversation_kv_swap_rollback(plan);
+                return ConversationSwap::unavailable;
+            }
+        }
+        // Captured state and the used pooled indices have already been copied;
+        // reserve counted scratch, growth and unused pooled capacity separately.
+        const size_t held = incoming.bytes();
+        if (shared > held || !add(actual, shared) || !ready || !ready(actual, held - shared)) {
+            conversation_kv_swap_rollback(plan);
+            return ConversationSwap::unavailable;
+        }
+        if (!sync(error)) {
+            conversation_kv_swap_rollback(plan);
+            return ConversationSwap::transfer_failed;
+        }
+        if (!conversation_kv_swap_exchange(plan, g, (int64_t) incoming.live.ids.size(),
+                                           scratch.get(), block_bytes, written, error)) {
+            if (!written) conversation_kv_swap_rollback(plan);
+            return written ? ConversationSwap::transfer_failed : ConversationSwap::unavailable;
+        }
+        if (!conversation_checkpoint_restore(incoming.live, ss, g, error)) return ConversationSwap::transfer_failed;
+        conversation_kv_swap_publish(plan, incoming, captured, g);
+        outgoing = std::move(captured);
+        return ConversationSwap::swapped;
+    } catch (const std::bad_alloc&) {
+        if (!written) conversation_kv_swap_rollback(plan);
+        return written ? ConversationSwap::transfer_failed : ConversationSwap::unavailable;
+    }
+}
+
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
     conversation_checkpoint_join(image.live.gdn.data());

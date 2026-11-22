@@ -8,12 +8,29 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <string>
 #include <cstdlib>
 #include <limits>
+#include <new>
 #include <utility>
 #include <vector>
+
+// The cumulative bytes requested on the exchange thread upper-bound its
+// transient live allocations, even when a temporary buffer is freed in-call.
+static thread_local bool count_exchange_allocations = false;
+static thread_local size_t exchange_allocated_bytes = 0;
+void* operator new(std::size_t n) {
+    if (count_exchange_allocations) exchange_allocated_bytes += n;
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t n) { return ::operator new(n); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { ::operator delete(p); }
+void operator delete[](void* p, std::size_t) noexcept { ::operator delete(p); }
 
 using namespace strata::core;
 using namespace strata::kernels;
@@ -62,7 +79,7 @@ struct Fixture {
             cuda_check(cudaMalloc(&raw, n)); device.push_back(raw); p = static_cast<T*>(raw);
         }
     }
-    Fixture(int fmt, int mode) {
+    Fixture(int fmt, int mode, bool single_host = false) {
         auto& st = state;
         st.kv_mode = mode; st.kv_int8 = fmt==kKvInt8; st.kv_q4 = fmt==kKvQ4; st.kv_hybrid = fmt==3;
         st.n_pages = 24; st.n_slots = mode ? 4 : st.n_pages;
@@ -71,19 +88,41 @@ struct Fixture {
         const size_t rows = st.max_cells*g.n_head_kv, slot_rows = st.n_slots*4*g.n_head_kv;
         sizes = {rows*per, rows*per, fmt==kKvInt8 ? rows*(g.head_dim/64)*2:0,
                  fmt==kKvInt8 ? rows*(g.head_dim/64)*2:0, (size_t)st.idx_pooled_rows*g.idx_key_dim*4};
-        if (fmt==3) {
+        if (fmt==3)
             sizes = {rows*per, rows*kv_q4_bytes_per_head((int)g.head_dim), rows*(g.head_dim/64)*2, 0,
                      (size_t)st.idx_pooled_rows*g.idx_key_dim*4};
+        std::array<void*,4> mapped{};
+        if (mode && single_host) {
+            size_t total=0;
+            for (size_t i=0;i<4;++i) total+=sizes[i];
+            void* cpu=nullptr; void* alias=nullptr;
+            cuda_check(cudaHostAlloc(&cpu,total,cudaHostAllocMapped));
+            host.push_back(cpu);
+            cuda_check(cudaHostGetDevicePointer(&alias,cpu,0));
+            st.host_cpu_base=static_cast<uint8_t*>(cpu);
+            st.host_device_base=static_cast<uint8_t*>(alias);
+            st.host_allocation_bytes=total;
+            size_t at=0;
+            for (size_t i=0;i<4;++i) {
+                if (sizes[i]) mapped[i]=static_cast<uint8_t*>(alias)+at;
+                at+=sizes[i];
+            }
+        }
+        if (fmt==3) {
             alloc(st.k_q,sizes[0]); alloc(st.v_q4,sizes[1]); alloc(st.k_scale,sizes[2]);
             sources[0]=st.k_q; sources[1]=st.v_q4; sources[2]=st.k_scale;
         } else if (fmt==kKvQ4) {
             alloc(st.k_q4,slot_rows*per); alloc(st.v_q4,slot_rows*per);
-            if (mode) {alloc(st.host.k_q4,sizes[0],true); alloc(st.host.v_q4,sizes[1],true);}
+            if (mode && single_host) {st.host.k_q4=static_cast<uint8_t*>(mapped[0]); st.host.v_q4=static_cast<uint8_t*>(mapped[1]);}
+            else if (mode) {alloc(st.host.k_q4,sizes[0],true); alloc(st.host.v_q4,sizes[1],true);}
             sources[0]=mode?st.host.k_q4:st.k_q4; sources[1]=mode?st.host.v_q4:st.v_q4;
         } else if (fmt==kKvInt8) {
             alloc(st.k_q,slot_rows*per); alloc(st.v_q,slot_rows*per);
             alloc(st.k_scale,slot_rows*(g.head_dim/64)*2); alloc(st.v_scale,slot_rows*(g.head_dim/64)*2);
-            if (mode) {
+            if (mode && single_host) {
+                st.host.k_q=static_cast<int8_t*>(mapped[0]); st.host.v_q=static_cast<int8_t*>(mapped[1]);
+                st.host.k_scale=static_cast<uint16_t*>(mapped[2]); st.host.v_scale=static_cast<uint16_t*>(mapped[3]);
+            } else if (mode) {
                 alloc(st.host.k_q,sizes[0],true); alloc(st.host.v_q,sizes[1],true);
                 alloc(st.host.k_scale,sizes[2],true); alloc(st.host.v_scale,sizes[3],true);
             }
@@ -91,10 +130,12 @@ struct Fixture {
             sources[2]=mode?st.host.k_scale:st.k_scale; sources[3]=mode?st.host.v_scale:st.v_scale;
         } else {
             alloc(st.k_pool,slot_rows*per); alloc(st.v_pool,slot_rows*per);
-            if (mode) {alloc(st.host.k_pool,sizes[0],true); alloc(st.host.v_pool,sizes[1],true);}
+            if (mode && single_host) {st.host.k_pool=static_cast<uint16_t*>(mapped[0]); st.host.v_pool=static_cast<uint16_t*>(mapped[1]);}
+            else if (mode) {alloc(st.host.k_pool,sizes[0],true); alloc(st.host.v_pool,sizes[1],true);}
             sources[0]=mode?st.host.k_pool:st.k_pool; sources[1]=mode?st.host.v_pool:st.v_pool;
         }
         alloc(st.idx_pooled,sizes[4]); sources[4]=st.idx_pooled;
+        st.idx_pooled_allocation=st.idx_pooled; st.idx_pooled_allocation_bytes=sizes[4];
         alloc(st.page_table,st.n_pages*4);
         if (mode==1) {
             auto& m=st.map;
@@ -124,6 +165,195 @@ struct Fixture {
 };
 bool equal(const ConversationKv& a,const ConversationKv& b) {
     return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
+}
+
+void full_swap(int fmt, size_t a_tokens, size_t b_tokens) {
+    Fixture main(fmt,1,true), draft(fmt,2,true);
+    auto& g=main.g;
+    g.n_layers=4; g.n_expert=256;
+    g.ssm_state_size=2; g.ssm_v_heads=2; g.ssm_conv_channels=8;
+    SessionState ss;
+    ss.max_cells=96; ss.qsa_states=&main.state; ss.layer_hi=g.n_layers;
+    ss.gdn_alloc=g.n_gdn_layers(); ss.qsa_alloc=g.n_qsa_layers();
+    std::string err;
+    ConversationStateSizes sizes;
+    check(conversation_state_sizes(g,sizes,err),"exchange state sizes");
+    main.alloc(ss.gdn_state,sizes.gdn); main.alloc(ss.ple_hist,sizes.ple);
+    main.alloc(main.state.idx_tail,sizes.tail); main.alloc(main.state.idx_dead,sizes.dead);
+    main.alloc(main.state.idx_block_pos,sizes.block_pos);
+    auto ids_for=[](size_t n,int32_t base) {
+        std::vector<int32_t> ids(n);
+        for (size_t i=0;i<n;++i) ids[i]=base+(int32_t)i;
+        return ids;
+    };
+    const auto ids_a=ids_for(a_tokens,100), ids_b=ids_for(b_tokens,1000);
+    const std::vector<ConversationImageKey> imgs_a{{2,123}}, imgs_b{{2,456}};
+    auto fill=[&](uint8_t salt, size_t tokens) {
+        main.fill(salt); draft.fill(salt);
+        for (const auto& [p,n] : std::vector<std::pair<void*,size_t>>{
+                 {ss.gdn_state,sizes.gdn},{ss.ple_hist,sizes.ple},{main.state.idx_tail,sizes.tail},
+                 {main.state.idx_dead,sizes.dead},{main.state.idx_block_pos,sizes.block_pos}})
+            cuda_check(cudaMemset(p,salt,n));
+        cuda_check(cudaMemcpy(main.state.idx_pooled+(tokens/4)*g.idx_key_dim,main.state.idx_dead,
+                              sizes.dead,cudaMemcpyDeviceToDevice));
+        cuda_check(cudaDeviceSynchronize());
+    };
+    auto capture=[&](uint8_t salt, const std::vector<int32_t>& ids,
+                     const std::vector<ConversationImageKey>& imgs, bool cvec, SavedConversation& image) {
+        fill(salt,ids.size());
+        ConversationCheckpoint cp;
+        cp.ids.assign(ids.begin(),ids.begin()+3); cp.imgs=imgs; cp.used=salt; cp.pinned=true;
+        cp.plan.chunk=5; cp.plan.from=1; cp.plan.to=3; cp.plan.lend=7;
+        cp.plan.pipe=0.5; cp.plan.single=true; cp.plan.chunked=true;
+        check(ckpt_save(cp,ss,g,err),"exchange fixture checkpoint");
+        const std::vector<ConversationCheckpoint> checkpoints{cp};
+        const ConversationView view{ids,imgs,checkpoints,cvec};
+        check(snap_save(image,view,ss,g,draft.state,err),"exchange fixture snapshot");
+    };
+    auto same=[&](const SavedConversation& x,const SavedConversation& y) {
+        if (x.geometry!=y.geometry || x.cvec!=y.cvec || x.live.ids!=y.live.ids || x.live.imgs!=y.live.imgs ||
+            x.live.gdn!=y.live.gdn || x.live.ple!=y.live.ple || x.live.tails!=y.live.tails ||
+            x.live.dead!=y.live.dead || x.live.block_pos!=y.live.block_pos || x.kv.size()!=y.kv.size() ||
+            x.checkpoints.size()!=y.checkpoints.size()) return false;
+        for (size_t i=0;i<x.kv.size();++i) if (!equal(x.kv[i],y.kv[i])) return false;
+        for (size_t i=0;i<x.checkpoints.size();++i) {
+            const auto& a=x.checkpoints[i]; const auto& b=y.checkpoints[i];
+            if (a.ids!=b.ids || a.imgs!=b.imgs || a.gdn!=b.gdn || a.ple!=b.ple || a.tails!=b.tails ||
+                a.dead!=b.dead || a.block_pos!=b.block_pos || a.used!=b.used || a.pinned!=b.pinned ||
+                a.plan.chunk!=b.plan.chunk || a.plan.from!=b.plan.from || a.plan.to!=b.plan.to ||
+                a.plan.lend!=b.plan.lend || a.plan.pipe!=b.plan.pipe || a.plan.single!=b.plan.single ||
+                a.plan.chunked!=b.plan.chunked) return false;
+        }
+        return true;
+    };
+    SavedConversation incoming, expected_a, expected_b;
+    capture(177,ids_b,imgs_b,false,incoming);
+    expected_b=incoming;
+    capture(13,ids_a,imgs_a,true,expected_a);
+    ConversationCheckpoint later=expected_a.checkpoints.front();
+    later.ids.assign(ids_a.begin(),ids_a.begin()+5);
+    later.pinned=false;
+    expected_a.checkpoints.push_back(std::move(later));
+    const ConversationView view_a{ids_a,imgs_a,expected_a.checkpoints,true};
+    const ConversationView view_b{ids_b,imgs_b,expected_b.checkpoints,false};
+    constexpr size_t block=37;
+    ConversationSwapPlan plan;
+    if (fmt==kKvF16 && a_tokens==65 && b_tokens==65) {
+        // The default uses the original capture/restore/retain path, with no exchange.
+        const size_t disabled=conversation_cache_swap_block_bytes(conversation_cache_swap_default_block_mib);
+        check(disabled==0 && !conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,disabled,err),
+              "default zero does not prepare an exchange");
+        SavedConversation old_out, old_readback;
+        check(snap_save(old_out,view_a,ss,g,draft.state,err) && same(old_out,expected_a),
+              "default path captures the outgoing session and all checkpoints");
+        ConversationCache old_cache(old_out.bytes()+incoming.bytes()+4096,2);
+        check(old_cache.put(std::move(old_out)) &&
+              conversation_snapshot_restore(incoming,ss,g,draft.state,err)==ConversationRestore::restored,
+              "default path parks A and restores B");
+        old_cache.retain(std::move(incoming.kv),int64_t(ids_b.size()),{},ids_b);
+        check(old_cache.retained_bytes()>0 && snap_save(old_readback,view_b,ss,g,draft.state,err) &&
+              same(old_readback,expected_b), "default path retains B's K/V after restoring it");
+        check(conversation_snapshot_restore(expected_a,ss,g,draft.state,err)==ConversationRestore::restored,
+              "return to A before testing the opt-in path");
+        incoming=expected_b;
+    }
+    auto* alias_base=main.state.host_device_base;
+    main.state.host_device_base=alias_base+1;
+    check(!conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,block,err),
+          "refuse a host alias outside the recorded mapping");
+    main.state.host_device_base=alias_base;
+    const size_t index_bytes=main.state.idx_pooled_allocation_bytes;
+    main.state.idx_pooled_allocation_bytes=0;
+    check(!conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,block,err),
+          "refuse an index outside its recorded device allocation");
+    main.state.idx_pooled_allocation_bytes=index_bytes;
+    check(conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,block,err),"prepare whole-session exchange");
+    check(plan.held_bytes<incoming.bytes(),"shared B K/V is not charged a second time");
+    const auto incoming_before=incoming;
+    SavedConversation outgoing, readback;
+    auto reject=[](size_t,size_t) { return false; };
+    check(conversation_snapshot_swap(plan,incoming,outgoing,view_a,ss,g,block,reject,err)==ConversationSwap::unavailable,
+          "refused admission falls back before exchange");
+    check(same(incoming,incoming_before),"pre-write refusal preserves B despite reserved growth");
+    check(snap_save(readback,view_a,ss,g,draft.state,err) && same(readback,expected_a),
+          "pre-write refusal leaves A active");
+    std::array<const uint8_t*,2> parked_address{};
+    std::array<size_t,2> parked_capacity{};
+    for (size_t i=0;i<2;++i) {
+        incoming.kv[i].k.visit(0,1,[&](const uint8_t* p,size_t,size_t) { parked_address[i]=p; return true; });
+        parked_capacity[i]=incoming.kv[i].k.bytes();
+    }
+    const auto* active_main=main.state.host_cpu_base;
+    const auto* active_draft=draft.state.host_cpu_base;
+    const auto* main_alias=main.state.host_device_base;
+    const auto* draft_alias=draft.state.host_device_base;
+    const auto* main_table=main.state.page_table;
+    const auto* draft_table=draft.state.page_table;
+    check(conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,block,err),"prepare after refusal");
+    const std::function<bool(size_t,size_t)> accept=[](size_t,size_t) { return true; };
+    const bool measure_allocations = fmt==kKvF16 && a_tokens==65 && b_tokens==65;
+    exchange_allocated_bytes = 0;
+    count_exchange_allocations = measure_allocations;
+    const auto swap_result = conversation_snapshot_swap(plan,incoming,outgoing,view_a,ss,g,block,accept,err);
+    count_exchange_allocations = false;
+    check(swap_result==ConversationSwap::swapped,"exchange A and B");
+    if (measure_allocations) {
+        size_t full_kv = 0;
+        for (const auto& kv : expected_a.kv)
+            full_kv += kv.k.size() + kv.v.size() + kv.k_scale.size() + kv.v_scale.size();
+        check(full_kv > 0 && exchange_allocated_bytes > 0 && exchange_allocated_bytes <= plan.additional_bytes &&
+              plan.additional_bytes - exchange_allocated_bytes < full_kv,
+              "transient allocation upper bound leaves no room for a third full K/V image");
+    }
+    check(main.state.host_cpu_base==active_main && draft.state.host_cpu_base==active_draft &&
+          main.state.host_device_base==main_alias && draft.state.host_device_base==draft_alias &&
+          main.state.page_table==main_table && draft.state.page_table==draft_table,
+          "exchange keeps CPU mappings, device aliases and page tables fixed");
+    check(incoming.kv.empty(),"B no longer owns its old K/V segments");
+    for (size_t i=0;i<2;++i) {
+        outgoing.kv[i].k.visit(0,1,[&](const uint8_t* p,size_t,size_t) {
+            check(p==parked_address[i],"outgoing image owns B's original segment"); return true;
+        });
+        if (a_tokens<=b_tokens) check(outgoing.kv[i].k.bytes()==parked_capacity[i],
+                                       "no extra full K/V allocation when B has enough capacity");
+    }
+    check(same(outgoing,expected_a),"outgoing image retains A K/V and every checkpoint");
+    check(outgoing.checkpoints.size()==2 && outgoing.checkpoints[0].pinned && outgoing.live.ids.size()==a_tokens,
+          "all upstream checkpoints and the complete live session are retained");
+    check(snap_save(readback,view_b,ss,g,draft.state,err) && same(readback,expected_b),
+          "incoming B K/V and running state are active");
+    check(ss.ple_prev[0]==ids_b[ids_b.size()-2] && ss.ple_prev[1]==ids_b.back(),"B PLE window restored");
+    ConversationCache cache(outgoing.bytes()+incoming.bytes()+4096,2);
+    SavedConversation other;
+    other.live.ids={9999}; other.live.gdn.resize(64,1); other.cvec=false;
+    check(cache.put(std::move(other)) && cache.can_fit(outgoing.bytes(),incoming.bytes()) &&
+          cache.put_exchanged(std::move(outgoing),incoming.bytes()),"publish A without evicting the unrelated entry");
+    check(cache.evictions()==0 && cache.size()==2 && cache.retained_bytes()==0,
+          "successful publication has no retained B K/V");
+    outgoing=cache.take(1);
+    check(conversation_snapshot_restore(outgoing,ss,g,draft.state,err)==ConversationRestore::restored,
+          "restore exchanged A");
+    check(snap_save(readback,view_a,ss,g,draft.state,err) && same(readback,expected_a),"A/B/A round trip exact");
+
+    if (fmt==kKvF16 && a_tokens==65 && b_tokens==65) {
+        int mib=conversation_cache_swap_default_block_mib;
+        check(parse_conversation_cache_swap_block_mib("1",mib),"parse a positive opt-in block");
+        const size_t enabled=conversation_cache_swap_block_bytes(mib);
+        incoming=expected_b;
+        check(enabled==(size_t(1)<<20) &&
+              conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,enabled,err) &&
+              conversation_snapshot_swap(plan,incoming,outgoing,view_a,ss,g,enabled,accept,err)==ConversationSwap::swapped &&
+              same(outgoing,expected_a), "positive option enables the whole-session exchange");
+        check(snap_save(readback,view_b,ss,g,draft.state,err) && same(readback,expected_b),
+              "positive option restores B through exchange");
+        check(conversation_snapshot_restore(outgoing,ss,g,draft.state,err)==ConversationRestore::restored,
+              "return to A before the post-write fault test");
+    }
+    incoming=expected_b;
+    check(conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,block,err),"prepare post-write fault");
+    auto fail_restore=[&](size_t,size_t) { incoming.live.dead.pop_back(); return true; };
+    check(conversation_snapshot_swap(plan,incoming,outgoing,view_a,ss,g,block,fail_restore,err)==ConversationSwap::transfer_failed,
+          "failure restoring B after exchange is fatal, not a fallback");
 }
 
 void full_session(int fmt, int mode, int experts) {
@@ -451,6 +681,14 @@ int main() {
             }
         }
     }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    if (!std::getenv("STRATA_PARK_ASYNC") && !std::getenv("STRATA_CKPT_ASYNC") &&
+        !std::getenv("STRATA_SNAPSHOT_VERIFY") && !std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") &&
+        !std::getenv("STRATA_CKPT_REREAD"))
+        for (int fmt : {kKvF16,kKvInt8,kKvQ4})
+            for (const auto& lengths : std::array<std::array<size_t,2>,3>{{{65,65},{81,37},{37,81}}})
+                full_swap(fmt,lengths[0],lengths[1]);
+#endif
     for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
         full_session(fmt,mode,experts);
     for (int experts : {256,512}) full_session(3,0,experts);

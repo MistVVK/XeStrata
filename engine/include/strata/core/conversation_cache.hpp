@@ -6,11 +6,15 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <string_view>
+#include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -255,6 +259,22 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
+inline constexpr int conversation_cache_swap_default_block_mib = 0;
+inline bool parse_conversation_cache_swap_block_mib(std::string_view text, int& mib) {
+    if (text.empty()) return false;
+    for (const char c : text) if (c < '0' || c > '9') return false;
+    int64_t value = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || value < 0 || value > 256) return false;
+    mib = (int) value;
+    return true;
+}
+
+// The parser bounds this value; zero leaves the original switch/retain path alone.
+inline constexpr size_t conversation_cache_swap_block_bytes(int mib) {
+    return (size_t) mib << 20;
+}
+
 class ConversationCache {
 public:
     struct Match {
@@ -327,6 +347,12 @@ public:
     }
     size_t retained_bytes() const { return reuse_.bytes(); }
     int64_t retained_tokens() const { return reuse_.kv.empty() ? 0 : reuse_.unchanged_tokens; }
+    // take_reuse_for can use a positive prefix exactly when the first tokens match.
+    template<class Token>
+    bool has_reuse_for(const std::vector<Token>& live) const {
+        return retained_tokens() > 0 && !reuse_.ids.empty() && !live.empty() &&
+               (int64_t) reuse_.ids.front() == (int64_t) live.front();
+    }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
                entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
@@ -575,6 +601,32 @@ public:
         if (!make_room(n, held)) return false;
         entries_.push_back(std::move(image));
         serials_.push_back(next_serial_++);
+        bytes_ += n;
+        return true;
+    }
+
+    // Exchange publication must finish every fallible step before removing old entries.
+    bool put_exchanged(SavedConversation&& image, size_t held = 0) {
+        const size_t n = image.bytes();
+        if (!can_fit(n, held)) return false;
+        static_assert(std::is_nothrow_move_constructible_v<SavedConversation> &&
+                      std::is_nothrow_move_assignable_v<SavedConversation>);
+        serials_.push_back(next_serial_);
+        try { entries_.push_back(std::move(image)); }
+        catch (...) { serials_.pop_back(); throw; }
+        // Keep the payload outside the deque: erasing an old entry can move its
+        // remaining elements. An entry without checkpoints cannot supersede itself.
+        SavedConversation staged = std::move(entries_.back());
+        entries_.back().checkpoints.clear();
+        try { trim_pool(held + n); }
+        catch (...) {
+            entries_.pop_back(); serials_.pop_back();
+            image = std::move(staged);
+            throw;
+        }
+        drop_superseded(staged.live.ids, staged.live.imgs, staged.checkpoints, staged.cvec);
+        entries_.back() = std::move(staged);
+        ++next_serial_;
         bytes_ += n;
         return true;
     }
