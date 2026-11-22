@@ -186,7 +186,7 @@ def setup_names(vram_mib: int, ram_mib: int, root: Path, families=(), versions: 
     if versions:
         out += [f"birefnet-{v}" for v in q.BIREFNET_VERSIONS if v not in ("general", "lite")]
     caps = [q.family_capabilities(f) for f in families]
-    kinds = set()
+    kinds: set[str] = set()
     for c in caps:
         if not (c.get("control") or c.get("control_reference") or c.get("control_loras")):
             continue
