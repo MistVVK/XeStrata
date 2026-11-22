@@ -37,7 +37,10 @@ public:
     const float* gpu_taps() const;
     void reset();
     bool enable_gpu(std::string& err);
-    bool configure_experts(const std::string& profile, int64_t context, std::string& err);
+    /// `reserve_mib`, `vram_free_mib`, `expert_slots`: --vram-reserve-mib, --vram-free-mib and --expert-cache as
+    /// PlainModel's tier takes them (each < 0: not given), for the resident experts' tier.
+    bool configure_experts(const std::string& profile, int64_t context, int64_t reserve_mib, int64_t vram_free_mib,
+                           int64_t expert_slots, std::string& err);
     bool save_profile(const std::string& path, std::string& err) const;
 
     bool load_dspark(const std::string& path, std::string& err);

@@ -5,6 +5,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -43,8 +44,12 @@ class InklingProducts {
     Buffer<float> aq_, ak_, av_, ar_, at_, asink_, ascores_, ao_, taps_;
     std::vector<uint16_t> input_host_, input_lo_;
     std::vector<int32_t> bounds_host_;
-    static constexpr int kWindowRows = 8;
-    std::unordered_map<const uint8_t*, Buffer<uint8_t>> hot_;
+    // The resident experts' VRAM is the storage of every engine's tier (ExpertCache): a slot an expert, its gate/up
+    // from the slot's start and its down from the next 256-byte boundary, so each blob starts where a slot of the
+    // cache does.  The cache's table says which experts are resident; `hot_` is the lookup grouped_rows takes, from a
+    // blob's bytes in the file to its address in the slot.
+    ExpertCache tier_;
+    std::unordered_map<const uint8_t*, const uint8_t*> hot_;
     uint64_t cold_hint_ = 0, gpu_hits_ = 0, gpu_lookups_ = 0;
 
     struct ResidentKv {
@@ -59,6 +64,8 @@ class InklingProducts {
     int64_t head_width_ = 0, head_rows_ = 0, head_tile_ = 0;
 
 public:
+    static constexpr int kWindowRows = 8;
+
     InklingProducts(int64_t groups, int64_t width, int64_t ff, size_t raw_bytes, int64_t heads, int64_t kv, int64_t dim, int64_t rel, int64_t extent)
         : raw_(alloc<uint8_t>(raw_bytes)), weights_(alloc<uint16_t>((size_t) (groups * 2 * ff * width))),
           weights_lo_(alloc<uint16_t>((size_t) (groups * 2 * ff * width))),
@@ -137,10 +144,30 @@ public:
         return true;
     }
 
-    void reserve_hot(const uint8_t* src, size_t bytes) {
-        auto dev = alloc<uint8_t>(bytes);
-        transfer(dev.get(), src, bytes);
-        hot_.emplace(src, std::move(dev));
+    // Where an expert's down starts in its slot, and the slot's bytes (whole 256s, as ExpertCache lays its slots).
+    static size_t down_at(size_t gate_up_bytes) { return (gate_up_bytes + 255) / 256 * 256; }
+    static size_t slot_bytes(size_t gate_up_bytes, size_t down_bytes) {
+        return (down_at(gate_up_bytes) + down_bytes + 255) / 256 * 256;
+    }
+    // The tier: one slot for each resident expert, of the sizes given, in the order reserve_hot is then called.
+    // In pieces where it passes the device's largest allocation; tier_slots() says how many the device gave.
+    void open_tier(const std::vector<int64_t>& sizes, int64_t layers, int64_t experts) {
+        std::string err;
+        tier_.set_max_piece(max_alloc_bytes());
+        if (!tier_.open_sized(sizes, layers, experts, err)) throw std::runtime_error("inkling2: expert tier: " + err);
+    }
+    int64_t tier_slots() const { return tier_.slots(); }
+    int64_t resident() const { return tier_.resident(); }
+    void reserve_hot(int64_t layer, int64_t expert, const uint8_t* gate_up, size_t gate_up_bytes, const uint8_t* down,
+                     size_t down_bytes) {
+        const int32_t slot = tier_.admit(layer, expert);
+        if (slot < 0 || tier_.slot_capacity(slot) < down_at(gate_up_bytes) + down_bytes)
+            throw std::runtime_error("inkling2: the expert tier has no slot for a planned expert");
+        uint8_t* at = tier_.device_slot(slot);
+        transfer(at, gate_up, gate_up_bytes);
+        transfer(at + down_at(gate_up_bytes), down, down_bytes);
+        hot_.emplace(gate_up, at);
+        hot_.emplace(down, at + down_at(gate_up_bytes));
     }
     void set_cold_hint(uint64_t bytes) { cold_hint_ = bytes; }
     uint64_t gpu_hits() const { return gpu_hits_; }
@@ -176,7 +203,7 @@ public:
             const uint8_t* weight;
             if (hit != hot_.end()) {
                 ++gpu_hits_;
-                weight = hit->second.get();
+                weight = hit->second;
             } else {
                 auto* raw = raw_.get() + (size_t) g * bytes_per_expert;
                 upload(raw, src, bytes_per_expert);

@@ -522,7 +522,10 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         opt_.spec = 0;
         inkling_ = std::make_unique<PlainInkling>();
         if (!inkling_->load(*model_, spec_, err) || !inkling_->enable_gpu(err) ||
-            (opt_.draft == "dspark" && !inkling_->load_dspark(opt_.draft_model, err)) || !inkling_->configure_experts(opt_.profile, opt_.max_cells, err)) return false;
+            (opt_.draft == "dspark" && !inkling_->load_dspark(opt_.draft_model, err)) ||
+            !inkling_->configure_experts(opt_.profile, opt_.max_cells, opt_.reserve_mib, opt_.vram_free_mib,
+                                         opt_.expert_slots, err))
+            return false;
         n_vocab_ = inkling_->vocab();
         return true;
     }
