@@ -2,7 +2,7 @@
 // CRITICAL BATTLEMAGE B70 RULE: ZERO reqd_sub_group_size(8)! Every kernel strictly uses INK_REQD_SG16!
 // Accelerates:
 //   1. Dense Trunk & 23-Layer Vision ViT (BF16, Q8_ROW, S2_K..S8_K) for M >= 16 (prefill, Vision, c=16..64)
-//   2. MoE Experts (SF4, MX8, S2_K..S8_K + paired 2-row w2) for n >= 8 (prefill, DSpark verify, c=8..64)
+//   2. MoE Experts (SF4, MX8, S2_K..S8_K + paired 2-row w2) for n >= 12 (prefill, c=16..64) with 128-bit vectorized stores
 //   3. Zero-overhead toggle via INK_SYCL_NO_XMX=1; builds cleanly with or without oneMKL!
 // 100% MIT clean-room implementation.
 #pragma once
@@ -131,7 +131,7 @@ inline void k_q8row_to_f16_rows_sg16(const uint8_t* W, int n0, int nc, int K, in
     });
 }
 
-// 1 SG16 (16 lanes) per 256-weight superblock: each lane unpacks 16 consecutive weights (2 x sk_q8_sy)
+// 1 SG16 (16 lanes) per 256-weight superblock: each lane unpacks 16 consecutive weights -> 2x 128-bit half8 stores!
 template <int F>
 inline void k_sk_to_f16_rows_sg16(const uint8_t* W, int n0, int nc, int K, half* dst) {
     constexpr int SB = sk_sb_bytes(F);
@@ -153,26 +153,28 @@ inline void k_sk_to_f16_rows_sg16(const uint8_t* W, int n0, int nc, int K, half*
         int q0[8], q1[8];
         sk_q8_sy<F>(blk + 6, j0, q0);
         sk_q8_sy<F>(blk + 6, j0 + 8, q1);
+        sycl::vec<half, 8> v0, v1;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            v0[t] = (half)((float)q0[t] * eff + bias);
+            v1[t] = (half)((float)q1[t] * eff + bias);
+        }
         half* out = dst + (size_t)r * K + (size_t)sbi * 256 + j0;
-#pragma unroll
-        for (int t = 0; t < 8; ++t) out[t] = (half)((float)q0[t] * eff + bias);
-#pragma unroll
-        for (int t = 0; t < 8; ++t) out[8 + t] = (half)((float)q1[t] * eff + bias);
+        *reinterpret_cast<sycl::vec<half, 8>*>(out)     = v0;
+        *reinterpret_cast<sycl::vec<half, 8>*>(out + 8) = v1;
     });
 }
 
 // ============================================================================
-// 2. Fast SG16 Dequant-to-FP16 Kernels for MoE Experts (w13 & w2)
+// 2. Fast Vectorized SG16 Dequant-to-FP16 Kernels for MoE Experts (By-Value!)
 // ============================================================================
 
-// Dequant expert w13 [2304, 2304] -> half (row 2r = gate, 2r+1 = up)
-inline void k_dequant_moe_gu_f16_sg16(const InkSyExpertDev* ex_ptr, half* w_f16) {
-    // 16 SG16 per WG, 144 WGs = 2304 SGs -> 1 SG16 per output row (0..2303)
+// Dequant expert w13 [2304, 2304] -> half (row 2r = gate, 2r+1 = up), 128-bit coalesced vector stores!
+inline void k_dequant_moe_gu_f16_sg16(InkSyExpertDev ed, half* w_f16) {
     Q().parallel_for(NR(144, 256), [=](sycl::nd_item<1> it) INK_REQD_SG16 {
         const int sg = (int)it.get_local_id(0) >> 4;
         const int lane = (int)it.get_local_id(0) & 15;
         const int row = (int)it.get_group(0) * 16 + sg;
-        const InkSyExpertDev ed = *ex_ptr;
         const uint8_t* body = ed.body_ptr;
         half* dst = w_f16 + (size_t)row * 2304;
 
@@ -186,12 +188,17 @@ inline void k_dequant_moe_gu_f16_sg16(const InkSyExpertDev* ex_ptr, half* w_f16)
             for (int b = lane; b < 144; b += 16) {
                 const float sc = e4m3_to_f32(sr[b]) * outer;
                 const uint8_t* bp = pr + b * 8;
-                half* o = dst + b * 16;
+                sycl::vec<half, 8> v0, v1;
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    o[2 * j]     = (half)(e2m1_lut(bp[j] & 15u) * sc);
-                    o[2 * j + 1] = (half)(e2m1_lut(bp[j] >> 4)  * sc);
+                for (int j = 0; j < 4; ++j) {
+                    v0[2 * j]     = (half)(e2m1_lut(bp[j] & 15u) * sc);
+                    v0[2 * j + 1] = (half)(e2m1_lut(bp[j] >> 4)  * sc);
+                    v1[2 * j]     = (half)(e2m1_lut(bp[4 + j] & 15u) * sc);
+                    v1[2 * j + 1] = (half)(e2m1_lut(bp[4 + j] >> 4)  * sc);
                 }
+                half* o = dst + b * 16;
+                *reinterpret_cast<sycl::vec<half, 8>*>(o)     = v0;
+                *reinterpret_cast<sycl::vec<half, 8>*>(o + 8) = v1;
             }
         } else if (ed.gu_code == FMT_MX8) {
             const uint8_t* wb = body;
@@ -203,7 +210,12 @@ inline void k_dequant_moe_gu_f16_sg16(const InkSyExpertDev* ex_ptr, half* w_f16)
                 const uint8_t* bp = wr + b * 32;
                 half* o = dst + b * 32;
 #pragma unroll
-                for (int j = 0; j < 32; ++j) o[j] = (half)(e4m3_to_f32(bp[j]) * sc);
+                for (int c = 0; c < 4; ++c) {
+                    sycl::vec<half, 8> v;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) v[j] = (half)(e4m3_to_f32(bp[c * 8 + j]) * sc);
+                    *reinterpret_cast<sycl::vec<half, 8>*>(o + c * 8) = v;
+                }
             }
         } else {
             const int F = ed.gu_code;
@@ -223,24 +235,26 @@ inline void k_dequant_moe_gu_f16_sg16(const InkSyExpertDev* ex_ptr, half* w_f16)
                 else if (F == FMT_S5) { sk_q8_sy<FMT_S5>(blk + 6, j0, q0); sk_q8_sy<FMT_S5>(blk + 6, j0 + 8, q1); }
                 else if (F == FMT_S6) { sk_q8_sy<FMT_S6>(blk + 6, j0, q0); sk_q8_sy<FMT_S6>(blk + 6, j0 + 8, q1); }
                 else { sk_q8_sy<FMT_S8>(blk + 6, j0, q0); sk_q8_sy<FMT_S8>(blk + 6, j0 + 8, q1); }
+                sycl::vec<half, 8> v0, v1;
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    v0[t] = (half)((float)q0[t] * eff + bias);
+                    v1[t] = (half)((float)q1[t] * eff + bias);
+                }
                 half* o = dst + sbi * 256 + j0;
-#pragma unroll
-                for (int t = 0; t < 8; ++t) o[t] = (half)((float)q0[t] * eff + bias);
-#pragma unroll
-                for (int t = 0; t < 8; ++t) o[8 + t] = (half)((float)q1[t] * eff + bias);
+                *reinterpret_cast<sycl::vec<half, 8>*>(o)     = v0;
+                *reinterpret_cast<sycl::vec<half, 8>*>(o + 8) = v1;
             }
         }
     });
 }
 
-// Dequant expert w2 [2304, 1152] -> half (handles SF4, MX8, and paired 2-row S_K SB_0..SB_8!)
-inline void k_dequant_moe_dn_f16_sg16(const InkSyExpertDev* ex_ptr, half* w_f16) {
-    // 1152 row-pairs -> 72 WGs x 16 SG16/WG = 1152 SGs (1 SG16 per row-pair: rows 2*rp and 2*rp+1)
+// Dequant expert w2 [2304, 1152] -> half (handles SF4, MX8, and paired 2-row S_K SB_0..SB_8!), 128-bit stores!
+inline void k_dequant_moe_dn_f16_sg16(InkSyExpertDev ed, half* w_f16) {
     Q().parallel_for(NR(72, 256), [=](sycl::nd_item<1> it) INK_REQD_SG16 {
         const int sg = (int)it.get_local_id(0) >> 4;
         const int lane = (int)it.get_local_id(0) & 15;
         const int rp = (int)it.get_group(0) * 16 + sg;
-        const InkSyExpertDev ed = *ex_ptr;
         const uint8_t* body = ed.body_ptr;
         half* d0 = w_f16 + (size_t)(2 * rp) * 1152;
         half* d1 = w_f16 + (size_t)(2 * rp + 1) * 1152;
@@ -259,13 +273,22 @@ inline void k_dequant_moe_dn_f16_sg16(const InkSyExpertDev* ex_ptr, half* w_f16)
                 const float sc1 = e4m3_to_f32(s1[b]) * outer;
                 const uint8_t* b0 = p0 + b * 8;
                 const uint8_t* b1 = p1 + b * 8;
+                sycl::vec<half, 8> u0, u1, w0, w1;
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    d0[b * 16 + 2 * j]     = (half)(e2m1_lut(b0[j] & 15u) * sc0);
-                    d0[b * 16 + 2 * j + 1] = (half)(e2m1_lut(b0[j] >> 4)  * sc0);
-                    d1[b * 16 + 2 * j]     = (half)(e2m1_lut(b1[j] & 15u) * sc1);
-                    d1[b * 16 + 2 * j + 1] = (half)(e2m1_lut(b1[j] >> 4)  * sc1);
+                for (int j = 0; j < 4; ++j) {
+                    u0[2 * j]     = (half)(e2m1_lut(b0[j] & 15u) * sc0);
+                    u0[2 * j + 1] = (half)(e2m1_lut(b0[j] >> 4)  * sc0);
+                    u1[2 * j]     = (half)(e2m1_lut(b0[4 + j] & 15u) * sc0);
+                    u1[2 * j + 1] = (half)(e2m1_lut(b0[4 + j] >> 4)  * sc0);
+                    w0[2 * j]     = (half)(e2m1_lut(b1[j] & 15u) * sc1);
+                    w0[2 * j + 1] = (half)(e2m1_lut(b1[j] >> 4)  * sc1);
+                    w1[2 * j]     = (half)(e2m1_lut(b1[4 + j] & 15u) * sc1);
+                    w1[2 * j + 1] = (half)(e2m1_lut(b1[4 + j] >> 4)  * sc1);
                 }
+                *reinterpret_cast<sycl::vec<half, 8>*>(d0 + b * 16)     = u0;
+                *reinterpret_cast<sycl::vec<half, 8>*>(d0 + b * 16 + 8) = u1;
+                *reinterpret_cast<sycl::vec<half, 8>*>(d1 + b * 16)     = w0;
+                *reinterpret_cast<sycl::vec<half, 8>*>(d1 + b * 16 + 8) = w1;
             }
         } else if (ed.dn_code == FMT_MX8) {
             const uint8_t* wb = body + ed.dn_off;
@@ -280,9 +303,15 @@ inline void k_dequant_moe_dn_f16_sg16(const InkSyExpertDev* ex_ptr, half* w_f16)
                 const uint8_t* b0 = w0 + b * 32;
                 const uint8_t* b1 = w1 + b * 32;
 #pragma unroll
-                for (int j = 0; j < 32; ++j) {
-                    d0[b * 32 + j] = (half)(e4m3_to_f32(b0[j]) * sc0);
-                    d1[b * 32 + j] = (half)(e4m3_to_f32(b1[j]) * sc1);
+                for (int c = 0; c < 4; ++c) {
+                    sycl::vec<half, 8> u, v;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        u[j] = (half)(e4m3_to_f32(b0[c * 8 + j]) * sc0);
+                        v[j] = (half)(e4m3_to_f32(b1[c * 8 + j]) * sc1);
+                    }
+                    *reinterpret_cast<sycl::vec<half, 8>*>(d0 + b * 32 + c * 8) = u;
+                    *reinterpret_cast<sycl::vec<half, 8>*>(d1 + b * 32 + c * 8) = v;
                 }
             }
         } else {
@@ -303,13 +332,16 @@ inline void k_dequant_moe_dn_f16_sg16(const InkSyExpertDev* ex_ptr, half* w_f16)
                 else if (F == FMT_S5) { sk_q8_sy<FMT_S5>(blk + 6, j0, q0); sk_q8_sy<FMT_S5>(blk + 6, j0 + 8, q1); }
                 else if (F == FMT_S6) { sk_q8_sy<FMT_S6>(blk + 6, j0, q0); sk_q8_sy<FMT_S6>(blk + 6, j0 + 8, q1); }
                 else { sk_q8_sy<FMT_S8>(blk + 6, j0, q0); sk_q8_sy<FMT_S8>(blk + 6, j0 + 8, q1); }
-                // flat0..flat0+15 never straddles 1152 because 1152 % 16 == 0!
+                sycl::vec<half, 8> v0, v1;
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    v0[t] = (half)((float)q0[t] * eff + bias);
+                    v1[t] = (half)((float)q1[t] * eff + bias);
+                }
                 const int flat0 = sbi * 256 + j0;
                 half* o = (flat0 < 1152) ? (d0 + flat0) : (d1 + (flat0 - 1152));
-#pragma unroll
-                for (int t = 0; t < 8; ++t) o[t] = (half)((float)q0[t] * eff + bias);
-#pragma unroll
-                for (int t = 0; t < 8; ++t) o[8 + t] = (half)((float)q1[t] * eff + bias);
+                *reinterpret_cast<sycl::vec<half, 8>*>(o)     = v0;
+                *reinterpret_cast<sycl::vec<half, 8>*>(o + 8) = v1;
             }
         }
     });
@@ -325,10 +357,9 @@ inline void k_moe_gather_f16_sg16(const float* x_in, const int* pair_list, int o
     });
 }
 
-inline void k_moe_situ_invsq_f16_sg16(const InkSyExpertDev* ex_ptr, const float* y_gu, int n, half* h_f16) {
+inline void k_moe_situ_invsq_f16_sg16(InkSyExpertDev ed, const float* y_gu, int n, half* h_f16) {
     Q().parallel_for(NR(n, 256), [=](sycl::nd_item<1> it) INK_REQD_SG16 {
         const int i = (int)it.get_group(0), tid = (int)it.get_local_id(0);
-        const InkSyExpertDev ed = *ex_ptr;
         const uint8_t* body = ed.body_ptr;
         const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8);
         const float* src = y_gu + (size_t)i * 2304;
@@ -423,9 +454,9 @@ inline bool ink_xmx_linear_sk(const uint8_t* W, int N, int K, const float* X, fl
     return true;
 }
 
-// Evaluate ONE MoE expert on Intel XMX (oneMKL FP16 DPAS) for n >= xmx_moe_min_n()!
+// Evaluate ONE MoE expert on Intel XMX (oneMKL FP16 DPAS) by-value (zero host-to-device metadata copy!)
 inline bool ink_xmx_moe_single(
-    const InkSyExpertDev* ex_ptr, const float* x_in, const float* topk_w,
+    InkSyExpertDev ed, const float* x_in, const float* topk_w,
     const int* pair_list, int off, int n, float* y_pairs, sycl::event* out_ev = nullptr) {
     if (!xmx_enabled() || n < xmx_moe_min_n()) return false;
     auto& sc = xmx_scratch();
@@ -434,15 +465,15 @@ inline bool ink_xmx_moe_single(
     sc.ensure_moe(n);
 
     k_moe_gather_f16_sg16(x_in, pair_list, off, n, sc.x_f16);
-    k_dequant_moe_gu_f16_sg16(ex_ptr, sc.w_f16);
+    k_dequant_moe_gu_f16_sg16(ed, sc.w_f16);
     oneapi::mkl::blas::row_major::gemm(
         Q(), oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
         (std::int64_t)n, (std::int64_t)2304, (std::int64_t)2304,
         1.0f, sc.x_f16, (std::int64_t)2304,
         sc.w_f16, (std::int64_t)2304,
         0.0f, sc.y_gu, (std::int64_t)2304);
-    k_moe_situ_invsq_f16_sg16(ex_ptr, sc.y_gu, n, sc.h_f16);
-    k_dequant_moe_dn_f16_sg16(ex_ptr, sc.w_f16);
+    k_moe_situ_invsq_f16_sg16(ed, sc.y_gu, n, sc.h_f16);
+    k_dequant_moe_dn_f16_sg16(ed, sc.w_f16);
     oneapi::mkl::blas::row_major::gemm(
         Q(), oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
         (std::int64_t)n, (std::int64_t)2304, (std::int64_t)1152,
@@ -457,7 +488,7 @@ inline bool ink_xmx_moe_single(
 inline bool ink_xmx_linear_bf16(const uint16_t*, int, int, const float*, float*, int) { return false; }
 inline bool ink_xmx_linear_q8row(const uint8_t*, int, int, const float*, float*, int, int) { return false; }
 template <int F> inline bool ink_xmx_linear_sk(const uint8_t*, int, int, const float*, float*, int) { return false; }
-inline bool ink_xmx_moe_single(const InkSyExpertDev*, const float*, const float*, const int*, int, int, float*, sycl::event* = nullptr) { return false; }
+inline bool ink_xmx_moe_single(InkSyExpertDev, const float*, const float*, const int*, int, int, float*, sycl::event* = nullptr) { return false; }
 #endif
 
 }  // namespace ink_sycl

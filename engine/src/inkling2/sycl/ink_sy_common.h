@@ -146,6 +146,7 @@ inline T* halloc(size_t n) {
 
 inline void dfree(void* p) { if (p) sycl::free(p, Q()); }
 inline void h2d(void* d, const void* h, size_t b) { if (b) Q().memcpy(d, h, b); }
+inline void h2d_sync(void* d, const void* h, size_t b) { if (b) Q().memcpy(d, h, b).wait(); }
 inline void d2h(void* h, const void* d, size_t b) { if (b) Q().memcpy(h, d, b); }
 inline void d2d(void* dst, const void* src, size_t b) { if (b) Q().memcpy(dst, src, b); }
 inline void dzero(void* d, size_t b) { if (b) Q().memset(d, 0, b); }
@@ -502,7 +503,7 @@ struct InkSyclModel {
         dfree(rel_proj_pad_dev);
     }
 
-    bool load(const std::string& p, double vram_experts_gb_override, std::string& err) {
+    bool load(const std::string& p, double vram_experts_gb_override, std::string& err, size_t extra_reserve_bytes = 0) {
         double t0 = now_s();
         path = p;
         FILE* fp = std::fopen(p.c_str(), "rb");

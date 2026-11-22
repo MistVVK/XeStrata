@@ -402,10 +402,10 @@ struct InkSyRunner {
         h2d(b_tok_ids, tok_ids, (size_t)M * 4);
         h2d(b_slot_ids, slot_ids, (size_t)M * 4);
         h2d(b_pos, positions, (size_t)M * 4);
-        h2d(b_active_slots, h_as.data(), (size_t)n_active_slots * 4);
-        h2d(b_slot_tok_off, h_off.data(), (size_t)n_active_slots * 4);
-        h2d(b_slot_tok_cnt, h_cnt.data(), (size_t)n_active_slots * 4);
-        h2d(b_slot_tok_idx, h_idx.data(), (size_t)M * 4);
+        h2d_sync(b_active_slots, h_as.data(), (size_t)n_active_slots * 4);
+        h2d_sync(b_slot_tok_off, h_off.data(), (size_t)n_active_slots * 4);
+        h2d_sync(b_slot_tok_cnt, h_cnt.data(), (size_t)n_active_slots * 4);
+        h2d_sync(b_slot_tok_idx, h_idx.data(), (size_t)M * 4);
         if (is_img_host && img_emb_host) {
             h2d(b_is_img, is_img_host, (size_t)M);
             h2d(b_img_emb, img_emb_host, (size_t)M * D * 4);
@@ -592,17 +592,17 @@ struct InkSyRunner {
                     if (cnt >= xmx_min) xmx_items.push_back({e, off, cnt});
                     else { sm_uexp.push_back(e); sm_uoff.push_back(off); sm_ucnt.push_back(cnt); }
                 }
-                h2d(b_moe_pairs, all_pairs.data(), all_pairs.size() * sizeof(int));
+                h2d_sync(b_moe_pairs, all_pairs.data(), all_pairs.size() * sizeof(int));
                 const InkSyExpertDev* ex_layer = mod->expert_dev + (size_t)ip * c.n_experts;
                 for (const auto& it : xmx_items) {
-                    ink_xmx_moe_single(ex_layer + it.e, b_mlp_in, b_topk_w, b_moe_pairs, it.off, it.cnt, b_moe_yp);
+                    ink_xmx_moe_single(mod->h_ed[(size_t)ip * c.n_experts + it.e], b_mlp_in, b_topk_w, b_moe_pairs, it.off, it.cnt, b_moe_yp);
                 }
                 if (!sm_uexp.empty()) {
                     const int n_su = (int)sm_uexp.size();
-                    h2d(b_moe_uexp, sm_uexp.data(), (size_t)n_su * sizeof(int));
-                    h2d(b_moe_uoff, sm_uoff.data(), (size_t)n_su * sizeof(int));
-                    h2d(b_moe_ucnt, sm_ucnt.data(), (size_t)n_su * sizeof(int));
-                    h2d(b_moe_n_uniq, &n_su, sizeof(int));
+                    h2d_sync(b_moe_uexp, sm_uexp.data(), (size_t)n_su * sizeof(int));
+                    h2d_sync(b_moe_uoff, sm_uoff.data(), (size_t)n_su * sizeof(int));
+                    h2d_sync(b_moe_ucnt, sm_ucnt.data(), (size_t)n_su * sizeof(int));
+                    h2d_sync(b_moe_n_uniq, &n_su, sizeof(int));
                     k_moe_gu_situ_sg16(ex_layer, b_mlp_in, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, n_su, b_moe_h);
                     k_moe_dn_sg16(ex_layer, b_topk_w, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, n_su, b_moe_h, b_moe_yp);
                 }
@@ -738,7 +738,7 @@ struct InkSyRunner {
         const int V_un = c.vocab_unpadded;
 
         dzero(bd_state, 256 * 4);
-        h2d(bd_tok_chain, &anchor_tok, 4);
+        h2d_sync(bd_tok_chain, &anchor_tok, 4);
 
         k_dspark_init_block_sg16(man.get("model.llm.embed.weight"), tf32("model.llm.embed_norm.weight"),
                                  df32("dspark.mask_embed"), bd_cur, anchor_tok, c.vocab_padded);

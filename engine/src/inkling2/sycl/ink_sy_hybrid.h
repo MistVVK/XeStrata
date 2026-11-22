@@ -66,7 +66,7 @@ inline void k_moe_scatter_cpu_sg16(const float* y_cpu, const int* cpu_pair_ids, 
 
 // Single-expert staged SG16 MoE kernels for double-buffered VRAM prefill streaming (reads 1 staged expert in VRAM!)
 inline void k_moe_gu_situ_single_sg16(
-    const InkSyExpertDev* ed_single, const float* x_in,
+    InkSyExpertDev ed, const float* x_in,
     const int* pair_list, int off, int n, float* h_act) {
     if (n <= 0) return;
     Q().parallel_for(NR(72, 256), [=](sycl::nd_item<1> it) INK_REQD_SG16 {
@@ -74,7 +74,6 @@ inline void k_moe_gu_situ_single_sg16(
         const int r = (int)it.get_group(0) * 16 + sg;
         if (r >= 1152) return;
 
-        const InkSyExpertDev ed = ed_single[0];
         const uint8_t* body = ed.body_ptr;
         const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8);
         const float inv_sq = is_sk_dn ? (1.0f / h2f_bits(ld16(body + 2 * r))) : 1.0f;
@@ -169,7 +168,7 @@ inline void k_moe_gu_situ_single_sg16(
 }
 
 inline sycl::event k_moe_dn_single_sg16(
-    const InkSyExpertDev* ed_single, const float* topk_w,
+    InkSyExpertDev ed, const float* topk_w,
     const int* pair_list, int off, int n, const float* h_act, float* y_pairs) {
     if (n <= 0) return sycl::event{};
     return Q().parallel_for(NR(72, 256), [=](sycl::nd_item<1> it) INK_REQD_SG16 {
@@ -177,7 +176,6 @@ inline sycl::event k_moe_dn_single_sg16(
         const int rp = (int)it.get_group(0) * 16 + sg;
         if (rp >= 1152) return;
 
-        const InkSyExpertDev ed = ed_single[0];
         const uint8_t* body = ed.body_ptr;
 
         for (int t0 = 0; t0 < n; t0 += 4) {
@@ -528,13 +526,13 @@ struct InkSyHybridEngine {
                     slot_of_gid[old_gid] = -1;
                     mod->h_ed[old_gid].body_ptr = mod->host_body_ptrs[old_gid];
                     mod->h_ed[old_gid].in_vram = 0;
-                    h2d(mod->expert_dev + old_gid, &mod->h_ed[old_gid], sizeof(InkSyExpertDev));
+                    h2d_sync(mod->expert_dev + old_gid, &mod->h_ed[old_gid], sizeof(InkSyExpertDev));
                 }
                 gid_of_slot[slot] = gid;
                 slot_of_gid[gid] = slot;
                 mod->h_ed[gid].body_ptr = cache_ring_dev + (size_t)slot * slot_stride;
                 mod->h_ed[gid].in_vram = 1;
-                h2d(mod->expert_dev + gid, &mod->h_ed[gid], sizeof(InkSyExpertDev));
+                h2d_sync(mod->expert_dev + gid, &mod->h_ed[gid], sizeof(InkSyExpertDev));
                 ++stat_promotions;
             } else {
                 if (w != i) pending_proms[w] = std::move(pr);
@@ -546,6 +544,8 @@ struct InkSyHybridEngine {
 
     // Schedule async promotion of a hot cold expert on Q_copy() (3x-loop Pass 0 gets immediate boost!)
     void maybe_schedule_promote(int gid, bool is_loop_pass0) {
+        static const bool is_opencl = (dev_caps().platform.find("OpenCL") != std::string::npos);
+        if (is_opencl) return;
         if (!active || n_cache_slots <= 0 || mod->h_ed[gid].in_vram != 0) return;
         if (slot_of_gid[gid] >= 0) return;
         for (const auto& pr : pending_proms) if (pr.gid == gid) return;
@@ -565,6 +565,15 @@ struct InkSyHybridEngine {
         const size_t nbytes = mod->expert_body_bytes[gid];
         if (!src || nbytes == 0 || nbytes > slot_stride) return;
 
+        const int old_gid = gid_of_slot[victim];
+        if (old_gid >= 0 && old_gid != gid) {
+            wait();
+            slot_of_gid[old_gid] = -1;
+            gid_of_slot[victim] = -1;
+            mod->h_ed[old_gid].body_ptr = mod->host_body_ptrs[old_gid];
+            mod->h_ed[old_gid].in_vram = 0;
+            h2d_sync(mod->expert_dev + old_gid, &mod->h_ed[old_gid], sizeof(InkSyExpertDev));
+        }
         slot_inflight[victim] = 1;
         sycl::event ev = Q_copy().memcpy(cache_ring_dev + (size_t)victim * slot_stride, src, nbytes);
         pending_proms.push_back(PendingProm{gid, victim, std::move(ev)});
@@ -665,11 +674,11 @@ struct InkSyHybridEngine {
 
             // 4. Launch GPU VRAM-resident experts simultaneously on Q()!
             if (n_vram_u > 0) {
-                h2d(b_moe_uexp, h_uexp, (size_t)n_vram_u * sizeof(int));
-                h2d(b_moe_uoff, h_uoff, (size_t)n_vram_u * sizeof(int));
-                h2d(b_moe_ucnt, h_ucnt, (size_t)n_vram_u * sizeof(int));
-                h2d(b_moe_pairs, h_pairs, (size_t)vram_p * sizeof(int));
-                h2d(b_moe_n_uniq, &n_vram_u, sizeof(int));
+                h2d_sync(b_moe_uexp, h_uexp, (size_t)n_vram_u * sizeof(int));
+                h2d_sync(b_moe_uoff, h_uoff, (size_t)n_vram_u * sizeof(int));
+                h2d_sync(b_moe_ucnt, h_ucnt, (size_t)n_vram_u * sizeof(int));
+                h2d_sync(b_moe_pairs, h_pairs, (size_t)vram_p * sizeof(int));
+                h2d_sync(b_moe_n_uniq, &n_vram_u, sizeof(int));
                 const InkSyExpertDev* ex_layer = mod->expert_dev + (size_t)ip * E;
                 k_moe_gu_situ_sg16(ex_layer, b_mlp_in, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, n_vram_u, b_moe_h);
                 k_moe_dn_sg16(ex_layer, b_topk_w, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, n_vram_u, b_moe_h, b_moe_yp);
@@ -719,14 +728,14 @@ struct InkSyHybridEngine {
 
         // 1. Run all VRAM-resident experts (XMX for n >= min_n, fused SG16 for small n)
         if (!v_uexp.empty()) {
-            h2d(b_moe_pairs, v_pairs.data(), v_pairs.size() * sizeof(int));
+            h2d_sync(b_moe_pairs, v_pairs.data(), v_pairs.size() * sizeof(int));
             const InkSyExpertDev* ex_layer = mod->expert_dev + (size_t)ip * E;
             const bool do_xmx = xmx_enabled();
             const int xmx_min = xmx_moe_min_n();
             std::vector<int> sm_uexp, sm_uoff, sm_ucnt;
             for (size_t vi = 0; vi < v_uexp.size(); ++vi) {
                 if (do_xmx && v_ucnt[vi] >= xmx_min) {
-                    ink_xmx_moe_single(ex_layer + v_uexp[vi], b_mlp_in, b_topk_w, b_moe_pairs, v_uoff[vi], v_ucnt[vi], b_moe_yp);
+                    ink_xmx_moe_single(mod->h_ed[(size_t)base_gid + v_uexp[vi]], b_mlp_in, b_topk_w, b_moe_pairs, v_uoff[vi], v_ucnt[vi], b_moe_yp);
                 } else {
                     sm_uexp.push_back(v_uexp[vi]);
                     sm_uoff.push_back(v_uoff[vi]);
@@ -735,53 +744,66 @@ struct InkSyHybridEngine {
             }
             if (!sm_uexp.empty()) {
                 const int n_su = (int)sm_uexp.size();
-                h2d(b_moe_uexp, sm_uexp.data(), (size_t)n_su * sizeof(int));
-                h2d(b_moe_uoff, sm_uoff.data(), (size_t)n_su * sizeof(int));
-                h2d(b_moe_ucnt, sm_ucnt.data(), (size_t)n_su * sizeof(int));
-                h2d(b_moe_n_uniq, &n_su, sizeof(int));
+                h2d_sync(b_moe_uexp, sm_uexp.data(), (size_t)n_su * sizeof(int));
+                h2d_sync(b_moe_uoff, sm_uoff.data(), (size_t)n_su * sizeof(int));
+                h2d_sync(b_moe_ucnt, sm_ucnt.data(), (size_t)n_su * sizeof(int));
+                h2d_sync(b_moe_n_uniq, &n_su, sizeof(int));
                 k_moe_gu_situ_sg16(ex_layer, b_mlp_in, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, n_su, b_moe_h);
                 k_moe_dn_sg16(ex_layer, b_topk_w, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, n_su, b_moe_h, b_moe_yp);
             }
         }
 
-        // 2. Stream cold experts through ping-pong VRAM staging[0..1] overlapping Q_copy() H2D with Q() compute!
+        // 2. Stream cold experts through ping-pong VRAM staging[0..1] (async Q_copy on L0; deadlock-free in-order Q on OpenCL!)
         if (!cold.empty()) {
-            h2d(b_moe_pairs, c_pairs.data(), c_pairs.size() * sizeof(int));
-            sycl::event dma_ev[2];
-            sycl::event comp_ev[2];
-            bool comp_valid[2] = {false, false};
-
-            // Kick off first cold expert DMA on Q_copy()
-            dma_ev[0] = Q_copy().memcpy(stage_vram[0], mod->host_body_ptrs[cold[0].gid], mod->expert_body_bytes[cold[0].gid]);
-
-            for (size_t ci = 0; ci < cold.size(); ++ci) {
-                const int cur = (int)(ci & 1);
-                const int nxt = cur ^ 1;
-
-                // Overlap DMA of next cold expert into ping-pong buffer `nxt`!
-                if (ci + 1 < cold.size()) {
-                    if (comp_valid[nxt]) comp_ev[nxt].wait();
-                    const int ngid = cold[ci + 1].gid;
-                    dma_ev[nxt] = Q_copy().memcpy(stage_vram[nxt], mod->host_body_ptrs[ngid], mod->expert_body_bytes[ngid]);
+            static const bool is_opencl = (dev_caps().platform.find("OpenCL") != std::string::npos);
+            h2d_sync(b_moe_pairs, c_pairs.data(), c_pairs.size() * sizeof(int));
+            if (is_opencl) {
+                for (size_t ci = 0; ci < cold.size(); ++ci) {
+                    const int cur = (int)(ci & 1);
+                    const int gid = cold[ci].gid;
+                    Q().memcpy(stage_vram[cur], mod->host_body_ptrs[gid], mod->expert_body_bytes[gid]);
+                    InkSyExpertDev sed = mod->h_ed[gid];
+                    sed.body_ptr = stage_vram[cur];
+                    sed.in_vram = 1;
+                    if (!ink_xmx_moe_single(sed, b_mlp_in, b_topk_w, b_moe_pairs, cold[ci].off, cold[ci].cnt, b_moe_yp)) {
+                        k_moe_gu_situ_single_sg16(sed, b_mlp_in, b_moe_pairs, cold[ci].off, cold[ci].cnt, b_moe_h);
+                        k_moe_dn_single_sg16(sed, b_topk_w, b_moe_pairs, cold[ci].off, cold[ci].cnt, b_moe_h, b_moe_yp);
+                    }
                 }
+            } else {
+                sycl::event dma_ev[2];
+                sycl::event comp_ev[2];
+                bool comp_valid[2] = {false, false};
 
-                // Wait for `cur` DMA to complete, then compute from fast VRAM `stage_vram[cur]`!
-                dma_ev[cur].wait();
-                InkSyExpertDev sed = mod->h_ed[cold[ci].gid];
-                sed.body_ptr = stage_vram[cur];
-                sed.in_vram = 1;
-                h2d(stage_ed_dev[cur], &sed, sizeof(InkSyExpertDev));
-                if (!ink_xmx_moe_single(stage_ed_dev[cur], b_mlp_in, b_topk_w, b_moe_pairs, cold[ci].off, cold[ci].cnt, b_moe_yp, &comp_ev[cur])) {
-                    k_moe_gu_situ_single_sg16(stage_ed_dev[cur], b_mlp_in, b_moe_pairs, cold[ci].off, cold[ci].cnt, b_moe_h);
-                    comp_ev[cur] = k_moe_dn_single_sg16(stage_ed_dev[cur], b_topk_w, b_moe_pairs, cold[ci].off, cold[ci].cnt, b_moe_h, b_moe_yp);
+                dma_ev[0] = Q_copy().memcpy(stage_vram[0], mod->host_body_ptrs[cold[0].gid], mod->expert_body_bytes[cold[0].gid]);
+
+                for (size_t ci = 0; ci < cold.size(); ++ci) {
+                    const int cur = (int)(ci & 1);
+                    const int nxt = cur ^ 1;
+
+                    if (ci + 1 < cold.size()) {
+                        if (comp_valid[nxt]) comp_ev[nxt].wait();
+                        const int ngid = cold[ci + 1].gid;
+                        dma_ev[nxt] = Q_copy().memcpy(stage_vram[nxt], mod->host_body_ptrs[ngid], mod->expert_body_bytes[ngid]);
+                    }
+
+                    dma_ev[cur].wait();
+                    InkSyExpertDev sed = mod->h_ed[cold[ci].gid];
+                    sed.body_ptr = stage_vram[cur];
+                    sed.in_vram = 1;
+                    if (!ink_xmx_moe_single(sed, b_mlp_in, b_topk_w, b_moe_pairs, cold[ci].off, cold[ci].cnt, b_moe_yp, &comp_ev[cur])) {
+                        k_moe_gu_situ_single_sg16(sed, b_mlp_in, b_moe_pairs, cold[ci].off, cold[ci].cnt, b_moe_h);
+                        comp_ev[cur] = k_moe_dn_single_sg16(sed, b_topk_w, b_moe_pairs, cold[ci].off, cold[ci].cnt, b_moe_h, b_moe_yp);
+                    }
+                    comp_valid[cur] = true;
                 }
-                comp_valid[cur] = true;
-
-                // Promote hot cold experts into elastic VRAM cache ring (3x-loop Pass 0 OR high-frequency decode!)
-                maybe_schedule_promote(cold[ci].gid, is_loop_pass0);
+                if (comp_valid[0]) comp_ev[0].wait();
+                if (comp_valid[1]) comp_ev[1].wait();
+                // Promote only for small batches (verify/batched decode M<=8), never during bulk prefill!
+                if (M <= 8) {
+                    for (const auto& cc : cold) maybe_schedule_promote(cc.gid, is_loop_pass0);
+                }
             }
-            if (comp_valid[0]) comp_ev[0].wait();
-            if (comp_valid[1]) comp_ev[1].wait();
         }
 
         k_moe_reduce8_sg16(b_moe_yp, b_moe_raw, M);

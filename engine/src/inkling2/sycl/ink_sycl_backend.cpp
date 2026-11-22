@@ -47,8 +47,12 @@ public:
         // Compute exact runner + KV + DSpark + Vision + XMX/Hybrid reserve so 8-16 GB Arc cards NEVER OOM!
         size_t kv_est = 0;
         const auto& mc = model.m.c;
+        const int core_len = mc.core_end - mc.core_start;
         for (int v = 0; v < mc.n_visits; ++v) {
-            const int ip = mc.phys_for_visit(v);
+            const int ip = (v < mc.core_start) ? v
+                         : (v < mc.core_start + core_len * mc.num_passes)
+                             ? (mc.core_start + (v - mc.core_start) % core_len)
+                             : (mc.core_end + (v - mc.core_start - core_len * mc.num_passes));
             const size_t stride = (size_t)(mc.is_swa[ip] ? mc.swa_win : ctx);
             kv_est += 2ull * (size_t)par * stride * (size_t)mc.n_kv * (size_t)mc.head_dim * 2ull;
         }
