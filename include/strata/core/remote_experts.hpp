@@ -111,6 +111,7 @@ private:
     uint8_t* d_q8_ = nullptr;
     float* d_scales_ = nullptr;
     void* d_scratch_ = nullptr;
+    uint8_t* d_types_ = nullptr;   ///< a mixed pack: each expert's (gate/up K, down K), layer by layer
     void* d_meta_ = nullptr;  ///< one upload of the grouped indices, instead of five small copies
     int32_t* d_start_ = nullptr;
     int32_t* d_dst_ = nullptr;

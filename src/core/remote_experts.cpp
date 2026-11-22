@@ -40,6 +40,7 @@ struct RemoteMeta {
     int32_t start[CAP + 1];
     int32_t dst[CAP];
     int32_t tok[CAP];
+    int32_t ids[CAP];   ///< a mixed pack: the expert of each compact row (the R1Q2 product reads its type by it)
     int32_t count;
 };
 
@@ -133,8 +134,8 @@ void RemoteExperts::close() {
         if (read_stream_) gpu::stream_sync(read_stream_);
         cache_.close();
         for (const void* p : {(const void*) d_x_, (const void*) d_out_, (const void*) d_q8_, (const void*) d_scales_,
-                              (const void*) d_scratch_, (const void*) d_meta_, (const void*) h_x_,
-                              (const void*) h_out_, (const void*) h_meta_})
+                              (const void*) d_scratch_, (const void*) d_meta_, (const void*) d_types_,
+                              (const void*) h_x_, (const void*) h_out_, (const void*) h_meta_})
             gpu::free(p);
         if (stream_) gpu::stream_destroy(stream_);
         if (read_stream_) gpu::stream_destroy(read_stream_);
@@ -149,6 +150,7 @@ void RemoteExperts::close() {
     d_q8_ = nullptr;
     d_scales_ = nullptr;
     d_scratch_ = nullptr;
+    d_types_ = nullptr;
     d_start_ = d_dst_ = d_tok_ = d_count_ = nullptr;
     d_ptr_ = nullptr;
     zero_copy_ = false;
@@ -186,7 +188,8 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
             if (pair.first < 0 || pair.first >= layers || pair.second < 0 || pair.second >= experts) continue;
             const size_t index = (size_t) pair.first * (size_t) experts + (size_t) pair.second;
             if (primary.slot_of(pair.first, pair.second) < 0 && !claimed[index] && !picked[index]) {
-                const uint64_t blob = lay.native ? (lay.blob_bytes(pair.first) + 255) / 256 * 256 : lay.max_blob;
+                const uint64_t blob =
+                    lay.native ? (lay.blob_bytes(pair.first, pair.second) + 255) / 256 * 256 : lay.max_blob;
                 if (fit && needed + blob + (512ull << 20) > free_bytes) break;
                 selected.push_back(pair);
                 needed += blob;
@@ -204,7 +207,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         std::vector<int64_t> sizes;
         if (lay.native) {
             sizes.reserve(selected.size());
-            for (const auto& pair : selected) sizes.push_back((int64_t) lay.blob_bytes(pair.first));
+            for (const auto& pair : selected) sizes.push_back((int64_t) lay.blob_bytes(pair.first, pair.second));
         }
         const bool cache_ok = lay.native ? cache_.open_sized(sizes, layers, experts, err)
                                          : cache_.open((int64_t) selected.size(), layers, experts,
@@ -213,14 +216,15 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         for (const auto& pair : selected) {
             const int32_t slot = cache_.admit(pair.first, pair.second);
             const uint8_t* blob = source.blob(pair.first, pair.second);
-            if (slot < 0 || !blob || !cache_.fill_slot_blocking(slot, blob, err, (int64_t) lay.blob_bytes(pair.first))) {
+            if (slot < 0 || !blob ||
+                !cache_.fill_slot_blocking(slot, blob, err, (int64_t) lay.blob_bytes(pair.first, pair.second))) {
                 err = "GPU" + std::to_string(device) + " experts: " + (err.empty() ? "cache fill failed" : err);
                 close(); return false;
             }
         }
         const auto& first = selected.front();
         if (!cache_.verify_slot(cache_.slot_of(first.first, first.second), source.blob(first.first, first.second),
-                                err, (int64_t) lay.blob_bytes(first.first))) {
+                                err, (int64_t) lay.blob_bytes(first.first, first.second))) {
             err = "GPU" + std::to_string(device) + " experts: " + err;
             close(); return false;
         }
@@ -236,9 +240,28 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                 ff_ = std::max<int64_t>(ff_, f.n_ff);
             }
         }
-        const size_t scratch = std::max<size_t>(
+        size_t scratch = std::max<size_t>(
             (size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, h_, ff_),
             strata::kernels::native_expert_scratch_bytes(CAP, ff_));
+        // a mixed pack (R1Q2, a type and a size each expert): the grouped R1Q2 product's scratch, and each expert's
+        // (gate/up K, down K) on this device, as the verify window's (moe_window.cpp)
+        std::vector<uint8_t> types;
+        if (lay.mixed()) {
+            scratch = std::max(scratch, strata::kernels::bih3_r1q2_grouped_scratch_bytes(CAP, h_, ff_));
+            types.resize((size_t) layers * (size_t) experts * 2);
+            for (int64_t l = 0; l < layers; ++l)
+                for (int64_t e = 0; e < experts; ++e) {
+                    const auto& f = lay.format(l, e);
+                    if (!f.r1q2 || f.n_embd != h_ || f.n_ff != ff_ || f.gu_type < 182 || f.gu_type > 194 ||
+                        f.d_type < 182 || f.d_type > 194) {
+                        err = "GPU" + std::to_string(device) + " experts: invalid mixed R1Q2 geometry or expert type";
+                        close(); return false;
+                    }
+                    const size_t i = lay.expert_index(l, e) * 2;
+                    types[i] = (uint8_t) (f.gu_type - 180);
+                    types[i + 1] = (uint8_t) (f.d_type - 180);
+                }
+        }
         const size_t rows = (size_t) CAP * h_ * sizeof(float);
         stream_ = gpu::stream_create();
         read_stream_ = gpu::stream_create_copy();
@@ -253,6 +276,8 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                          : !gpu::alloc_device(&d_scales_, (size_t) CAP * (h_ / 32) * sizeof(float)) ? "activation scales"
                          : !gpu::alloc_device(&d_scratch_, scratch)             ? "scratch"
                          : !gpu::alloc_device(&d_meta_, sizeof(RemoteMeta))     ? "group metadata"
+                         : !types.empty() && (!gpu::alloc_device(&d_types_, types.size()) ||
+                                              !gpu::copy(d_types_, types.data(), types.size())) ? "expert types"
                                                                                 : nullptr;
         if (step != nullptr) { err = failed(device, step); close(); return false; }
         // Zero copy: the helper's kernels read their input from, and write their compact rows into, its own host USM
@@ -341,6 +366,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     std::memcpy(meta->start, start_.data(), start_.size() * sizeof(start_[0]));
     std::memcpy(meta->dst, dst_.data(), dst_.size() * sizeof(dst_[0]));
     std::memcpy(meta->tok, tok_.data(), tok_.size() * sizeof(tok_[0]));
+    for (size_t j = 0; j < original_row_.size(); ++j) meta->ids[j] = ids[original_row_[j]];
     meta->count = (int32_t) group_id_.size();
     groups_ = (int32_t) group_id_.size();
     const uint64_t compact_bytes = (uint64_t) dst_.size() * h_ * sizeof(float);
@@ -363,13 +389,32 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
                 xin = d_x_;
             }
             strata::kernels::quantize_q8_1_rows(xin, n_tok, h_, d_q8_, s);
-            auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff, fmt.up_type);
-            if (fmt.had_d) {   // APR: and the down weights the rotated h
-                L.had_block = fmt.had_block;
-                L.d_signs = strata::kernels::hadamard_device_signs(fmt.d_signs, (int) fmt.n_ff);
-            }
-            strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
+            // APR: and the down weights the rotated h
+            const float* d_signs = fmt.had_d ? strata::kernels::hadamard_device_signs(fmt.d_signs, (int) fmt.n_ff)
+                                             : nullptr;
+            if (lay.mixed()) {   // R1Q2, a type each expert: the verify window's grouped product (moe_window.cpp),
+                                 // on the path this GPU's report gives it
+                strata::kernels::Bih3R1q2Layer B;
+                B.n_embd = (int) fmt.n_embd;
+                B.n_ff = (int) fmt.n_ff;
+                B.n_expert = (int) lay.n_expert;
+                B.k_pairs = d_types_ + (size_t) layer * (size_t) lay.n_expert * 2;
+                B.route_ids = static_cast<const RemoteMeta*>(d_meta_)->ids;
+                B.had_block = fmt.had_d ? fmt.had_block : 0;
+                B.d_signs = d_signs;
+                std::memcpy(B.p2, fmt.p2, sizeof B.p2);
+                strata::kernels::bih3_r1q2_grouped(B, d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
                                                    (int64_t) dst_.size(), d_q8_, d_scratch_, out, s);
+            } else {
+                auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff,
+                                                               fmt.up_type);
+                if (fmt.had_d) {
+                    L.had_block = fmt.had_block;
+                    L.d_signs = d_signs;
+                }
+                strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
+                                                       (int64_t) dst_.size(), d_q8_, d_scratch_, out, s);
+            }
         } else {
             strata::kernels::quantize_q8_0_scaled(xin, d_q8_, d_scales_, n_tok * H, s);
             strata::kernels::moe_grouped_s2_window(d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
@@ -443,7 +488,8 @@ bool RemoteExperts::copy_cached_blobs(const int32_t* layers, const int32_t* expe
             if (dst[i] == nullptr) continue;
             const int32_t slot = cache_.slot_of(layers[i], experts[i]);
             if (slot < 0) continue;
-            if (!gpu::copy_async(dst[i], cache_.device_slot(slot), (size_t) lay.blob_bytes(layers[i]), read_stream_)) {
+            if (!gpu::copy_async(dst[i], cache_.device_slot(slot), (size_t) lay.blob_bytes(layers[i], experts[i]),
+                                 read_stream_)) {
                 err = failed(device_, "cache read");
                 // nothing may still be writing a caller's buffer when this returns: if the drain fails, forget
                 // every hit and let the caller refill all of them from its fallback
@@ -476,7 +522,7 @@ bool RemotePrefillSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst)
             const bool ok = h->copy_cached_blobs(&l, &e, &d, 1, &got, err);
             if (got) {
                 helper_blobs_.fetch_add(1, std::memory_order_relaxed);
-                helper_bytes_.fetch_add(strata::kernels::cpu::expert_layout().blob_bytes(layer),
+                helper_bytes_.fetch_add(strata::kernels::cpu::expert_layout().blob_bytes(layer, expert),
                                         std::memory_order_relaxed);
                 return true;
             }
