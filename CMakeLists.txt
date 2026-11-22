@@ -1564,6 +1564,11 @@ if(STRATA_ENABLE_XE)
     # as in the CUDA build)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels)
+    # Four-query selected attention: exact union and FP64 output (portable matrix devices only).
+    add_executable(qsa_gqa4_attn_parity src/kernels/qsa_gqa4_attn_parity.cpp)
+    target_link_libraries(qsa_gqa4_attn_parity PRIVATE strata_kernels)
+    add_test(NAME qsa_gqa4_attn_parity COMMAND qsa_gqa4_attn_parity)
+    set_tests_properties(qsa_gqa4_attn_parity PROPERTIES SKIP_RETURN_CODE 77)
     # the decode attention over every cell (Ornith-1.5's, Qwen3.5-9B's and llm-jp-4.1's full attention) against FP64
     # (synthetic)
     add_executable(qsa_dense_attn_parity src/kernels/qsa_dense_attn_parity.cpp)
