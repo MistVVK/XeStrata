@@ -85,9 +85,13 @@ void ck(cudaError_t e, const char* what) {
 #endif
 
 __device__ __forceinline__ uint32_t ld32_unaligned(const uint8_t* p) {
-    const uint16_t lo = __ldg((const uint16_t*) p);
-    const uint16_t hi = __ldg((const uint16_t*) (p + 2));
-    return (uint32_t) lo | ((uint32_t) hi << 16);
+    if (((uintptr_t) p & 1u) == 0u) {
+        const uint16_t lo = __ldg((const uint16_t*) p);
+        const uint16_t hi = __ldg((const uint16_t*) (p + 2));
+        return (uint32_t) lo | ((uint32_t) hi << 16);
+    }
+    return (uint32_t) __ldg(p) | ((uint32_t) __ldg(p + 1) << 8) |
+           ((uint32_t) __ldg(p + 2) << 16) | ((uint32_t) __ldg(p + 3) << 24);
 }
 
 __device__ __forceinline__ uint32_t ld32_fast(const uint8_t* p, bool aligned4) {
@@ -144,33 +148,39 @@ __device__ __forceinline__ uint8_t pack_e2m1x2(float v_lo, float v_hi) {
 
 __global__ void quant_act_fp4_kernel(const float* __restrict__ x, int64_t nblk, uint8_t* __restrict__ xa) {
 #if defined(STRATA_FP4_TC_DEV)
-    const int64_t w = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    if (w >= nblk) return;
     const int lane = threadIdx.x & 31;
     const int sub = lane >> 3;
     const int j = lane & 7;
+    const int64_t warps_per_blk = (int64_t) (blockDim.x >> 5);
+    const int64_t stride = (int64_t) gridDim.x * warps_per_blk;
+    for (int64_t w = (int64_t) blockIdx.x * warps_per_blk + (threadIdx.x >> 5); w < nblk; w += stride) {
+        const float* xb = x + w * K_STEP;
+        const float r0 = xb[16 * sub + j];
+        const float r1 = xb[16 * sub + 8 + j];
+        const float v0 = isfinite(r0) ? r0 : 0.0f;
+        const float v1 = isfinite(r1) ? r1 : 0.0f;
 
-    const float* xb = x + w * K_STEP;
-    const float v0 = xb[16 * sub + j];
-    const float v1 = xb[16 * sub + 8 + j];
-
-    float am_sub = fmaxf(fabsf(v0), fabsf(v1));
+        float am_sub = fmaxf(fabsf(v0), fabsf(v1));
 #pragma unroll
-    for (int o = 1; o < 8; o <<= 1) am_sub = fmaxf(am_sub, __shfl_xor_sync(0xffffffffu, am_sub, o));
+        for (int o = 1; o < 8; o <<= 1) am_sub = fmaxf(am_sub, __shfl_xor_sync(0xffffffffu, am_sub, o));
 
-    float am_64 = fmaxf(am_sub, __shfl_xor_sync(0xffffffffu, am_sub, 8));
-    am_64 = fmaxf(am_64, __shfl_xor_sync(0xffffffffu, am_64, 16));
+        float am_64 = fmaxf(am_sub, __shfl_xor_sync(0xffffffffu, am_sub, 8));
+        am_64 = fmaxf(am_64, __shfl_xor_sync(0xffffffffu, am_64, 16));
 
-    const float g_blk = am_64 * (1.0f / (6.0f * 448.0f));
-    float s_sub = 0.0f;
-    const uint8_t d_code = encode_ue4m3(g_blk > 0.0f ? (am_sub / (g_blk * 6.0f)) : 0.0f, s_sub);
-    const float denom = g_blk * s_sub;
-    const float inv = denom > 0.0f ? (1.0f / denom) : 0.0f;
+        const float g_blk = (am_64 > 0.0f && isfinite(am_64)) ? (am_64 * (1.0f / (6.0f * 448.0f))) : 0.0f;
+        float s_sub = 0.0f;
+        const float ratio = (g_blk > 0.0f && isfinite(g_blk)) ? (am_sub / (g_blk * 6.0f)) : 0.0f;
+        const uint8_t d_code = encode_ue4m3(isfinite(ratio) ? ratio : 0.0f, s_sub);
+        const float denom = g_blk * s_sub;
+        const float inv = (denom > 0.0f && isfinite(denom)) ? (1.0f / denom) : 0.0f;
+        const float q0 = v0 * inv;
+        const float q1 = v1 * inv;
 
-    uint8_t* out = xa + w * AB;
-    out[lane] = pack_e2m1x2(v0 * inv, v1 * inv);
-    if (j == 0) out[32 + sub] = d_code;
-    if (lane == 0) *(float*) (out + 36) = g_blk;
+        uint8_t* out = xa + w * AB;
+        out[lane] = pack_e2m1x2(isfinite(q0) ? q0 : 0.0f, isfinite(q1) ? q1 : 0.0f);
+        if (j == 0) out[32 + sub] = d_code;
+        if (lane == 0) *(float*) (out + 36) = g_blk;
+    }
 #else
     (void) x; (void) nblk; (void) xa;
 #endif
@@ -229,7 +239,8 @@ __global__ void __launch_bounds__(NT, 1) fp4_tc_kernel(Batch b, NativeGeom geo, 
         if (nrows <= 0) continue;
 
         const uint8_t* blob = b.blob[e - b.e0];
-        const bool aligned4 = (((uintptr_t) blob & 3u) == 0u);
+        const bool aligned4 = (((uintptr_t) blob & 3u) == 0u) && ((geo.gu_row & 3u) == 0u) &&
+                              ((geo.d_row & 3u) == 0u) && ((geo.up_off & 3u) == 0u) && ((geo.down_off & 3u) == 0u);
         const int rbase = fb * WR;
 
         const uint8_t* tail = blob + geo.down_off + geo.d_row * (size_t) D_ROWS_N;
@@ -397,7 +408,8 @@ __global__ void __launch_bounds__(NT, 1) fp4_tc_kernel(Batch b, NativeGeom geo, 
                         for (int i = 0; i < 4; ++i) {
                             const float gt = acc[i][n][c] * s_gate;
                             const float up = acc[i][n][2 + c] * s_up;
-                            h_val[n][c][i] = (gt / (1.0f + __expf(-gt))) * up;
+                            const float hv = (gt / (1.0f + __expf(-gt))) * up;
+                            h_val[n][c][i] = isfinite(hv) ? hv : 0.0f;
                         }
                         float a0 = fmaxf(fabsf(h_val[n][c][0]), fabsf(h_val[n][c][1]));
                         float a1 = fmaxf(fabsf(h_val[n][c][2]), fabsf(h_val[n][c][3]));
@@ -425,16 +437,24 @@ __global__ void __launch_bounds__(NT, 1) fp4_tc_kernel(Batch b, NativeGeom geo, 
                         const int r = nb0 + 8 * n + 2 * tig + c;
                         if (r < nrows) {
                             const float am_64 = fmaxf(s_am32[2 * wf_pair + 0][r], s_am32[2 * wf_pair + 1][r]);
-                            const float g_blk = am_64 * (1.0f / (6.0f * 448.0f));
+                            const float g_blk = (am_64 > 0.0f && isfinite(am_64)) ? (am_64 * (1.0f / (6.0f * 448.0f))) : 0.0f;
                             float s0 = 0.0f, s1 = 0.0f;
-                            const uint8_t d0 = encode_ue4m3(g_blk > 0.0f ? (am_sub0[n][c] / (g_blk * 6.0f)) : 0.0f, s0);
-                            const uint8_t d1 = encode_ue4m3(g_blk > 0.0f ? (am_sub1[n][c] / (g_blk * 6.0f)) : 0.0f, s1);
-                            const float inv0 = (g_blk * s0) > 0.0f ? (1.0f / (g_blk * s0)) : 0.0f;
-                            const float inv1 = (g_blk * s1) > 0.0f ? (1.0f / (g_blk * s1)) : 0.0f;
+                            const float r0 = (g_blk > 0.0f && isfinite(g_blk)) ? (am_sub0[n][c] / (g_blk * 6.0f)) : 0.0f;
+                            const float r1 = (g_blk > 0.0f && isfinite(g_blk)) ? (am_sub1[n][c] / (g_blk * 6.0f)) : 0.0f;
+                            const uint8_t d0 = encode_ue4m3(isfinite(r0) ? r0 : 0.0f, s0);
+                            const uint8_t d1 = encode_ue4m3(isfinite(r1) ? r1 : 0.0f, s1);
+                            const float den0 = g_blk * s0;
+                            const float den1 = g_blk * s1;
+                            const float inv0 = (den0 > 0.0f && isfinite(den0)) ? (1.0f / den0) : 0.0f;
+                            const float inv1 = (den1 > 0.0f && isfinite(den1)) ? (1.0f / den1) : 0.0f;
+                            const float q00 = h_val[n][c][0] * inv0;
+                            const float q01 = h_val[n][c][1] * inv0;
+                            const float q10 = h_val[n][c][2] * inv1;
+                            const float q11 = h_val[n][c][3] * inv1;
 
                             uint8_t* dst_slot = out + (size_t) (row0 + r) * H_ROW_BYTES + (size_t) (2 * fb + wf_pair) * AB;
-                            dst_slot[16 * wf_half + 0 + g] = pack_e2m1x2(h_val[n][c][0] * inv0, h_val[n][c][1] * inv0);
-                            dst_slot[16 * wf_half + 8 + g] = pack_e2m1x2(h_val[n][c][2] * inv1, h_val[n][c][3] * inv1);
+                            dst_slot[16 * wf_half + 0 + g] = pack_e2m1x2(isfinite(q00) ? q00 : 0.0f, isfinite(q01) ? q01 : 0.0f);
+                            dst_slot[16 * wf_half + 8 + g] = pack_e2m1x2(isfinite(q10) ? q10 : 0.0f, isfinite(q11) ? q11 : 0.0f);
                             if (g == 0) {
                                 dst_slot[32 + 2 * wf_half + 0] = d0;
                                 dst_slot[32 + 2 * wf_half + 1] = d1;

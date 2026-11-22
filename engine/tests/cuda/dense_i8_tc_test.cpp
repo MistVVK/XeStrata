@@ -7,6 +7,7 @@
 // against dequant_f16 + FP16 cuBLAS across Q8_0 (8), Q4_K (12), Q5_K (13), Q6_K (14), IQ4_XS (23).
 #include "strata/kernels/dense_i8_tc.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/prefill/gemm.hpp"
 
@@ -32,7 +33,7 @@ void ck(cudaError_t e, const char* w) {
 }
 
 void fill_weights(int ggml_type, int n_in, int n_out, std::vector<uint8_t>& buf, std::mt19937& rng) {
-    buf.resize(strata::kernels::native_mmvq_weight_bytes(ggml_type, n_in, n_out));
+    buf.resize(strata::kernels::iq_row_bytes(ggml_type, n_in) * (size_t) n_out);
     if (ggml_type == 8) {
         const int nb = n_in / 32;
         for (int r = 0; r < n_out; ++r) {
@@ -41,6 +42,27 @@ void fill_weights(int ggml_type, int n_in, int n_out, std::vector<uint8_t>& buf,
                 const uint16_t d = __half_as_ushort(__float2half_rn(0.005f + 0.01f * ((float) (rng() & 255) / 255.0f)));
                 p[0] = (uint8_t) (d & 0xffu); p[1] = (uint8_t) (d >> 8);
                 for (int j = 0; j < 32; ++j) p[2 + j] = (uint8_t) (int8_t) ((int) (rng() % 255) - 127);
+            }
+        }
+    } else if (ggml_type == 10) {
+        const int nsb = n_in / 256;
+        for (int r = 0; r < n_out; ++r) {
+            for (int sb = 0; sb < nsb; ++sb) {
+                uint8_t* p = buf.data() + ((size_t) r * nsb + sb) * 84u;
+                for (int j = 0; j < 80; ++j) p[j] = (uint8_t) (rng() & 0xffu);
+                const half2 dm = __floats2half2_rn(0.005f + 0.006f * ((float) (rng() & 255) / 255.0f),
+                                                   0.003f + 0.005f * ((float) (rng() & 255) / 255.0f));
+                std::memcpy(p + 80, &dm, 4);
+            }
+        }
+    } else if (ggml_type == 11) {
+        const int nsb = n_in / 256;
+        for (int r = 0; r < n_out; ++r) {
+            for (int sb = 0; sb < nsb; ++sb) {
+                uint8_t* p = buf.data() + ((size_t) r * nsb + sb) * 110u;
+                for (int j = 0; j < 108; ++j) p[j] = (uint8_t) (rng() & 0xffu);
+                const uint16_t d = __half_as_ushort(__float2half_rn(0.003f + 0.005f * ((float) (rng() & 255) / 255.0f)));
+                p[108] = (uint8_t) (d & 0xffu); p[109] = (uint8_t) (d >> 8);
             }
         }
     } else if (ggml_type == 12) {
@@ -76,6 +98,36 @@ void fill_weights(int ggml_type, int n_in, int n_out, std::vector<uint8_t>& buf,
                 p[208] = (uint8_t) (d & 0xffu); p[209] = (uint8_t) (d >> 8);
             }
         }
+    } else if (ggml_type == 18) {
+        const int nsb = n_in / 256;
+        for (int r = 0; r < n_out; ++r) {
+            for (int sb = 0; sb < nsb; ++sb) {
+                uint8_t* p = buf.data() + ((size_t) r * nsb + sb) * 98u;
+                const uint16_t d = __half_as_ushort(__float2half_rn(0.002f + 0.003f * ((float) (rng() & 255) / 255.0f)));
+                p[0] = (uint8_t) (d & 0xffu); p[1] = (uint8_t) (d >> 8);
+                for (int j = 2; j < 98; ++j) p[j] = (uint8_t) (rng() & 0xffu);
+            }
+        }
+    } else if (ggml_type == 20) {
+        const int nb = n_in / 32;
+        for (int r = 0; r < n_out; ++r) {
+            for (int b = 0; b < nb; ++b) {
+                uint8_t* p = buf.data() + ((size_t) r * nb + b) * 18u;
+                const uint16_t d = __half_as_ushort(__float2half_rn(0.003f + 0.004f * ((float) (rng() & 255) / 255.0f)));
+                p[0] = (uint8_t) (d & 0xffu); p[1] = (uint8_t) (d >> 8);
+                for (int j = 2; j < 18; ++j) p[j] = (uint8_t) (rng() & 0xffu);
+            }
+        }
+    } else if (ggml_type == 21) {
+        const int nsb = n_in / 256;
+        for (int r = 0; r < n_out; ++r) {
+            for (int sb = 0; sb < nsb; ++sb) {
+                uint8_t* p = buf.data() + ((size_t) r * nsb + sb) * 110u;
+                const uint16_t d = __half_as_ushort(__float2half_rn(0.002f + 0.003f * ((float) (rng() & 255) / 255.0f)));
+                p[0] = (uint8_t) (d & 0xffu); p[1] = (uint8_t) (d >> 8);
+                for (int j = 2; j < 110; ++j) p[j] = (uint8_t) (rng() & 0xffu);
+            }
+        }
     } else if (ggml_type == 23) {
         const int nsb = n_in / 256;
         for (int r = 0; r < n_out; ++r) {
@@ -86,6 +138,14 @@ void fill_weights(int ggml_type, int n_in, int n_out, std::vector<uint8_t>& buf,
                 for (int j = 2; j < 136; ++j) p[j] = (uint8_t) (rng() & 0xffu);
             }
         }
+    }
+}
+
+void run_ref_mmvq(int ggml_type, const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    if (ggml_type == 10 || ggml_type == 20) {
+        strata::kernels::iq_mmvq(ggml_type, w, xq, y, n_in, n_out, ncols, s);
+    } else {
+        strata::kernels::native_mmvq(ggml_type, w, xq, y, n_in, n_out, ncols, s);
     }
 }
 
@@ -117,7 +177,7 @@ void test_decode_type(int ggml_type, const char* name, int n_in, int n_out, bool
         }
         for (int t0 = 0; t0 < T; t0 += 4) {
             const int nt = std::min(4, T - t0);
-            strata::kernels::native_mmvq(
+            run_ref_mmvq(
                 ggml_type, d_w,
                 reinterpret_cast<const uint8_t*>(d_xq) + (size_t) t0 * strata::kernels::native_q8_1_bytes(n_in, 1),
                 d_ref + (size_t) t0 * n_out, n_in, n_out, nt, s);
@@ -138,8 +198,10 @@ void test_decode_type(int ggml_type, const char* name, int n_in, int n_out, bool
             den += (double) h_ref[i] * (double) h_ref[i];
         }
         const double rel_rms = den > 0.0 ? std::sqrt(num / den) : 0.0;
-        if (!std::isfinite(rel_rms) || rel_rms > 1e-4) {
-            std::fprintf(stderr, "FAIL decode %s %dx%d T=%d: rel_rms=%.6e\n", name, n_out, n_in, T, rel_rms);
+        // IQ3_XXS / IQ3_S decode dot uses integer division truncation ((ls*sum + sum/2)/2) while TC uses exact float scale -> ~2e-3 diff.
+        const double tol = (ggml_type == 18 || ggml_type == 21) ? 5e-3 : 1e-4;
+        if (!std::isfinite(rel_rms) || rel_rms > tol) {
+            std::fprintf(stderr, "FAIL decode %s %dx%d T=%d: rel_rms=%.6e (tol %.1e)\n", name, n_out, n_in, T, rel_rms, tol);
             std::exit(1);
         }
 
@@ -149,13 +211,13 @@ void test_decode_type(int ggml_type, const char* name, int n_in, int n_out, bool
             constexpr int NITER = 30;
             for (int i = 0; i < 5; ++i)
                 for (int t0 = 0; t0 < T; t0 += 4)
-                    strata::kernels::native_mmvq(ggml_type, d_w,
+                    run_ref_mmvq(ggml_type, d_w,
                         reinterpret_cast<const uint8_t*>(d_xq) + (size_t) t0 * strata::kernels::native_q8_1_bytes(n_in, 1),
                         d_ref + (size_t) t0 * n_out, n_in, n_out, std::min(4, T - t0), s);
             ck(cudaEventRecord(e0, s), "r0");
             for (int i = 0; i < NITER; ++i)
                 for (int t0 = 0; t0 < T; t0 += 4)
-                    strata::kernels::native_mmvq(ggml_type, d_w,
+                    run_ref_mmvq(ggml_type, d_w,
                         reinterpret_cast<const uint8_t*>(d_xq) + (size_t) t0 * strata::kernels::native_q8_1_bytes(n_in, 1),
                         d_ref + (size_t) t0 * n_out, n_in, n_out, std::min(4, T - t0), s);
             ck(cudaEventRecord(e1, s), "r1"); ck(cudaEventSynchronize(e1), "s1");
@@ -205,7 +267,15 @@ void test_prefill_type(int ggml_type, const char* name, int K, int N, int T, boo
         std::fprintf(stderr, "Gemm::init failed: %s\n", err.c_str());
         std::exit(1);
     }
-    gemm.native(d_x, ggml_type, d_w, d_ref, T, N, K, N, 0.0f);
+    auto run_ref_prefill = [&]() {
+        if (ggml_type == 10 || ggml_type == 11) {
+            strata::kernels::iq_dequant_f16(ggml_type, d_w, (int64_t) N * K, gemm.scratch(), s);
+            gemm.f16(d_x, gemm.scratch(), d_ref, T, N, K, N, 0.0f);
+        } else {
+            gemm.native(d_x, ggml_type, d_w, d_ref, T, N, K, N, 0.0f);
+        }
+    };
+    run_ref_prefill();
     if (!strata::kernels::dense_i8_tc_prefill(d_x, ggml_type, d_w, d_got, T, N, K, N, 0.0f, d_scratch, sc_bytes, s)) {
         std::fprintf(stderr, "dense_i8_tc_prefill returned false for %s\n", name);
         std::exit(1);
@@ -232,9 +302,9 @@ void test_prefill_type(int ggml_type, const char* name, int K, int N, int T, boo
         cudaEvent_t e0, e1;
         ck(cudaEventCreate(&e0), "e0"); ck(cudaEventCreate(&e1), "e1");
         constexpr int NITER = 15;
-        for (int i = 0; i < 3; ++i) gemm.native(d_x, ggml_type, d_w, d_ref, T, N, K, N, 0.0f);
+        for (int i = 0; i < 3; ++i) run_ref_prefill();
         ck(cudaEventRecord(e0, s), "r0");
-        for (int i = 0; i < NITER; ++i) gemm.native(d_x, ggml_type, d_w, d_ref, T, N, K, N, 0.0f);
+        for (int i = 0; i < NITER; ++i) run_ref_prefill();
         ck(cudaEventRecord(e1, s), "r1"); ck(cudaEventSynchronize(e1), "s1");
         float ms_ref = 0.0f; ck(cudaEventElapsedTime(&ms_ref, e0, e1), "el"); ms_ref /= NITER;
 
@@ -270,7 +340,8 @@ int main(int argc, char** argv) {
     ck(cudaStreamCreate(&s), "stream");
 
     const std::pair<int, const char*> types[] = {
-        {8, "Q8_0"}, {12, "Q4_K"}, {13, "Q5_K"}, {14, "Q6_K"}, {23, "IQ4_XS"}
+        {8, "Q8_0"}, {10, "Q2_K"}, {11, "Q3_K"}, {12, "Q4_K"}, {13, "Q5_K"},
+        {14, "Q6_K"}, {18, "IQ3_XXS"}, {20, "IQ4_NL"}, {21, "IQ3_S"}, {23, "IQ4_XS"}
     };
     for (auto [ty, nm] : types) {
         test_decode_type(ty, nm, 2560, 8192, bench, s);
