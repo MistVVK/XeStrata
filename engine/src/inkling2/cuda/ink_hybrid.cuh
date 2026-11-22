@@ -28,6 +28,16 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cstdlib>
+#include <sys/mman.h>
+#endif
+
 #if defined(__AVX2__) && !defined(__CUDA_ARCH__)
 #include <immintrin.h>
 #define INK_HOST_AVX2 1
@@ -37,6 +47,59 @@
 #endif
 
 namespace strata::ink {
+
+inline uint64_t ink_ram_available_bytes() noexcept {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t)ms.ullAvailPhys : 0ull;
+#else
+    uint64_t avail = 0, mfree = 0, mbuf = 0, mcache = 0;
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        unsigned long long kb = 0;
+        while (std::fgets(line, sizeof(line), f)) {
+            if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) avail = kb * 1024ull;
+            else if (std::sscanf(line, "MemFree: %llu kB", &kb) == 1) mfree = kb * 1024ull;
+            else if (std::sscanf(line, "Buffers: %llu kB", &kb) == 1) mbuf = kb * 1024ull;
+            else if (std::sscanf(line, "Cached: %llu kB", &kb) == 1) mcache = kb * 1024ull;
+        }
+        std::fclose(f);
+    }
+    if (avail == 0) avail = mfree + mbuf + mcache;
+    if (FILE* fm = std::fopen("/sys/fs/cgroup/memory.max", "r")) {
+        char buf[64] = {};
+        if (std::fgets(buf, sizeof(buf), fm) && buf[0] >= '0' && buf[0] <= '9') {
+            const uint64_t lim = std::strtoull(buf, nullptr, 10);
+            uint64_t cur = 0, inact = 0;
+            if (FILE* fc = std::fopen("/sys/fs/cgroup/memory.current", "r")) {
+                (void)std::fscanf(fc, "%llu", (unsigned long long*)&cur);
+                std::fclose(fc);
+            }
+            if (FILE* fs = std::fopen("/sys/fs/cgroup/memory.stat", "r")) {
+                char line[256];
+                unsigned long long v = 0;
+                while (std::fgets(line, sizeof(line), fs))
+                    if (std::sscanf(line, "inactive_file %llu", &v) == 1) { inact = v; break; }
+                std::fclose(fs);
+            }
+            const uint64_t used = cur > inact ? (cur - inact) : 0;
+            const uint64_t cg_av = lim > used ? (lim - used) : 0;
+            if (lim > 0 && (avail == 0 || cg_av < avail)) avail = cg_av;
+        }
+        std::fclose(fm);
+    }
+    return avail;
+#endif
+}
+
+inline int ink_logical_cpus() noexcept {
+#ifdef _WIN32
+    const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (n > 0) return (int)n;
+#endif
+    return std::max(1, (int)std::thread::hardware_concurrency());
+}
 
 // ============================================================================
 // 1. Fast Host-Side Expert Evaluator (SF4, MX8, S1.5..S8_K) — Bit-Exact to GPU!
@@ -670,16 +733,78 @@ struct InkHybridEngine {
     int n_layers = kInkPhysLayers;
     int n_experts = kInkExperts;
 
-    // Pinned host expert table (all 3072 experts; body != nullptr for host-resident experts)
+    // Pinned or pageable host expert table (all 3072 experts; body != nullptr for host-resident experts)
+    // On Windows WDDM / tight RAM hosts (#6520), falls back cleanly to pageable VirtualAlloc/mmap + pinned bounce ring!
     std::vector<InkHostExpertMeta> host_meta;  // [24 * 128]
-    uint8_t* h_sec4_pinned = nullptr;
-    size_t   h_sec4_bytes  = 0;
+    uint8_t* h_sec4_pinned   = nullptr;
+    uint8_t* h_sec4_pageable = nullptr;
+    size_t   h_sec4_bytes    = 0;
+    bool     sec4_is_pinned  = false;
+    uint8_t* h_pf_bounce[2]  = {};
+    uint8_t* h_promo_stg     = nullptr;
 
     // Mapped doorbell + device state
     InkMappedDoorbell* h_bell = nullptr;
     InkMappedDoorbell* d_bell = nullptr;
     uint32_t* d_seq = nullptr;
     uint32_t* d_cur_seq = nullptr;
+
+    // Simultaneous PCIe + CPU miss-sharing buffers for M=2..16 DSpark Block-8 verify
+    float* h_v_x    = nullptr;   // pinned [16 * kInkHidden]
+    float* h_v_y    = nullptr;   // pinned [16 * kInkTopK * kInkHidden]
+    int32_t* h_v_p  = nullptr;   // pinned [16 * kInkTopK] pair indices written by CPU
+    float* d_v_y    = nullptr;   // device mirror for fast scatter
+    int32_t* d_v_p  = nullptr;   // device pair indices
+    double dec_pcie_share = -1.0; // -1 = auto, 0 = 100% CPU, 1 = 100% PCIe DMA (STRATA_INK_DEC_PCIE_SHARE)
+    bool l3_pf_enabled = true;    // STRATA_L3_PF: idle-worker next-layer L3 prefetch
+    std::atomic<uint32_t> pf_gen{0};
+    int pf_layer = -1, pf_n = 0;
+    int32_t pf_eids[32] = {};
+    int32_t prev_cpu_eids[24][32] = {};
+    int prev_cpu_n[24] = {};
+
+    // Allocate host expert arena safely (pinned if small & within 45% MemAvailable, else pageable + pinned bounce ring!)
+    uint8_t* alloc_host_arena(size_t bytes) {
+        h_sec4_bytes = bytes;
+        const uint64_t avail = ink_ram_available_bytes();
+#ifdef _WIN32
+        const bool try_pin = (bytes <= (8ull << 30)) && (avail == 0 || (double)bytes < 0.35 * (double)avail);
+#else
+        const bool try_pin = (avail == 0 || (double)bytes < 0.45 * (double)avail);
+#endif
+        if (try_pin) {
+            if (cudaHostAlloc(&h_sec4_pinned, bytes, cudaHostAllocDefault) == cudaSuccess) {
+                sec4_is_pinned = true;
+                return h_sec4_pinned;
+            }
+            (void)cudaGetLastError();
+            h_sec4_pinned = nullptr;
+        }
+        sec4_is_pinned = false;
+#ifdef _WIN32
+        h_sec4_pageable = (uint8_t*)VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p != MAP_FAILED) {
+#ifdef MADV_HUGEPAGE
+            madvise(p, bytes, MADV_HUGEPAGE);
+#endif
+            h_sec4_pageable = (uint8_t*)p;
+        }
+#endif
+        std::fprintf(stderr, "[InkHybrid] host expert arena %.2f GB allocated as pageable RAM + pinned bounce ring (avail=%.1f GB)\n",
+                     (double)bytes / 1e9, (double)avail / 1e9);
+        return h_sec4_pageable;
+    }
+
+    void kick_l3_prefetch(int layer, const int32_t* eids, int n) noexcept {
+        if (!l3_pf_enabled || !active || !eids || n <= 0 || layer < 0 || layer >= n_layers) return;
+        const int take = std::min(n, 32);
+        pf_layer = layer;
+        pf_n = take;
+        for (int i = 0; i < take; ++i) pf_eids[i] = eids[i];
+        pf_gen.fetch_add(1, std::memory_order_release);
+    }
 
     // Dynamic Decayed-Frequency Promotion Ring in VRAM (optional when host experts exist!)
     uint8_t*  d_promo_pool = nullptr;
@@ -716,8 +841,10 @@ struct InkHybridEngine {
 
     void start_workers(int num_threads = 0) {
         if (active) return;
-        const int hw = std::max(1, (int)std::thread::hardware_concurrency());
+        const int hw = ink_logical_cpus();
         n_threads = (num_threads > 0) ? num_threads : std::min(16, std::max(2, hw / 2));
+        if (const char* e = std::getenv("STRATA_L3_PF")) l3_pf_enabled = (e[0] != '0');
+        if (const char* e = std::getenv("STRATA_INK_DEC_PCIE_SHARE")) dec_pcie_share = std::max(0.0, std::min(1.0, std::atof(e)));
         INK_CK(cudaHostAlloc(&h_bell, sizeof(InkMappedDoorbell), cudaHostAllocMapped));
         std::memset(h_bell, 0, sizeof(InkMappedDoorbell));
         INK_CK(cudaHostGetDevicePointer(&d_bell, h_bell, 0));
@@ -725,6 +852,11 @@ struct InkHybridEngine {
         d_cur_seq = dalloc<uint32_t>(1);
         INK_CK(cudaMemset(d_seq, 0, 4));
         INK_CK(cudaMemset(d_cur_seq, 0, 4));
+        h_v_x = halloc_pinned<float>(16 * kInkHidden);
+        h_v_y = halloc_pinned<float>(16 * kInkTopK * kInkHidden);
+        h_v_p = halloc_pinned<int32_t>(16 * kInkTopK);
+        d_v_y = dalloc<float>(16 * kInkTopK * kInkHidden);
+        d_v_p = dalloc<int32_t>(16 * kInkTopK);
 
         d_use_cnt   = dalloc<float>(n_layers * n_experts);
         d_want_keys = dalloc<int32_t>(64);
@@ -744,11 +876,35 @@ struct InkHybridEngine {
         stop_flag.store(false, std::memory_order_relaxed);
         for (int t = 1; t < n_threads; ++t) {
             workers.emplace_back([this, t]() {
-                uint32_t seen = 0;
+                uint32_t seen = 0, pf_seen = 0;
                 auto last_t = std::chrono::steady_clock::now();
                 while (!stop_flag.load(std::memory_order_relaxed)) {
                     uint32_t g = work_gen.load(std::memory_order_acquire);
                     if (g == seen) {
+                        if (l3_pf_enabled) {
+                            const uint32_t pg = pf_gen.load(std::memory_order_acquire);
+                            if (pg != pf_seen) {
+                                pf_seen = pg;
+                                const int pl = pf_layer, pn = pf_n;
+                                for (int i = t - 1; i < pn; i += std::max(1, n_threads - 1)) {
+                                    if (work_gen.load(std::memory_order_acquire) != seen || stop_flag.load(std::memory_order_relaxed)) break;
+                                    const int key = pl * n_experts + pf_eids[i];
+                                    if (key >= 0 && key < (int)host_meta.size() && host_meta[key].body) {
+                                        const char* ptr = reinterpret_cast<const char*>(host_meta[key].body);
+                                        const size_t len = host_meta[key].body_bytes;
+                                        for (size_t o = 0; o < len; o += 64) {
+                                            if ((o & 16383u) == 0 && work_gen.load(std::memory_order_acquire) != seen) break;
+#if defined(INK_HOST_AVX2)
+                                            _mm_prefetch(ptr + o, _MM_HINT_T1);
+#elif defined(__GNUC__) || defined(__clang__)
+                                            __builtin_prefetch(ptr + o, 0, 2);
+#endif
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                         auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - last_t).count();
                         if (dt > 15) std::this_thread::sleep_for(std::chrono::microseconds(100));
                         else std::this_thread::yield();
@@ -815,6 +971,14 @@ struct InkHybridEngine {
             pf_stage_bytes = std::max(pf_stage_bytes, align_b);
             INK_CK(cudaMalloc(&d_pf_stage[0], pf_stage_bytes));
             INK_CK(cudaMalloc(&d_pf_stage[1], pf_stage_bytes));
+            if (!sec4_is_pinned) {
+                for (int b = 0; b < 2; ++b) {
+                    if (cudaHostAlloc(&h_pf_bounce[b], pf_stage_bytes, cudaHostAllocDefault) != cudaSuccess) {
+                        (void)cudaGetLastError();
+                        h_pf_bounce[b] = nullptr;
+                    }
+                }
+            }
             vram_avail -= 2 * pf_stage_bytes;
         }
         // Remaining spare VRAM (> 256 MiB headroom) becomes dynamic decayed-frequency promotion ring!
@@ -823,6 +987,12 @@ struct InkHybridEngine {
             n_promo_slots = (int)(ring_bytes / align_b);
             if (n_promo_slots >= 4) {
                 INK_CK(cudaMalloc(&d_promo_pool, (size_t)n_promo_slots * align_b));
+                if (!sec4_is_pinned) {
+                    if (cudaHostAlloc(&h_promo_stg, align_b, cudaHostAllocDefault) != cudaSuccess) {
+                        (void)cudaGetLastError();
+                        h_promo_stg = nullptr;
+                    }
+                }
                 promo_owner.assign(n_promo_slots, -1);
                 key_to_slot.assign(n_layers * n_experts, -1);
             } else {
@@ -877,7 +1047,13 @@ struct InkHybridEngine {
             }
             const auto& nm = host_meta[key];
             uint8_t* dst_slot = d_promo_pool + (size_t)victim * promo_slot_bytes;
-            INK_CK(cudaMemcpyAsync(dst_slot, nm.body, nm.body_bytes, cudaMemcpyHostToDevice, promo_st));
+            if (!sec4_is_pinned && h_promo_stg) {
+                INK_CK(cudaStreamSynchronize(promo_st));
+                std::memcpy(h_promo_stg, nm.body, nm.body_bytes);
+                INK_CK(cudaMemcpyAsync(dst_slot, h_promo_stg, nm.body_bytes, cudaMemcpyHostToDevice, promo_st));
+            } else {
+                INK_CK(cudaMemcpyAsync(dst_slot, nm.body, nm.body_bytes, cudaMemcpyHostToDevice, promo_st));
+            }
             InkExpertDev pro{};
             pro.body_off = (uint64_t)((intptr_t)dst_slot - (intptr_t)d_sec4);
             pro.dn_off   = nm.dn_off;
@@ -906,11 +1082,27 @@ struct InkHybridEngine {
         fr(d_seq); fr(d_cur_seq); fr(d_use_cnt); fr(d_want_keys); fr(d_n_want);
         fr(d_promo_pool); fr(d_pf_stage[0]); fr(d_pf_stage[1]);
         fr(d_pf_exp_tmp[0]); fr(d_pf_exp_tmp[1]);
+        fr(d_v_y); fr(d_v_p);
         for (int b = 0; b < 2; ++b) {
             if (h_pf_exp_pin[b]) { cudaFreeHost(h_pf_exp_pin[b]); h_pf_exp_pin[b] = nullptr; }
+            if (h_pf_bounce[b])  { cudaFreeHost(h_pf_bounce[b]);  h_pf_bounce[b]  = nullptr; }
         }
+        if (h_promo_stg) { cudaFreeHost(h_promo_stg); h_promo_stg = nullptr; }
+        if (h_v_x) { cudaFreeHost(h_v_x); h_v_x = nullptr; }
+        if (h_v_y) { cudaFreeHost(h_v_y); h_v_y = nullptr; }
+        if (h_v_p) { cudaFreeHost(h_v_p); h_v_p = nullptr; }
         if (h_bell) { cudaFreeHost(h_bell); h_bell = nullptr; d_bell = nullptr; }
         if (h_sec4_pinned) { cudaFreeHost(h_sec4_pinned); h_sec4_pinned = nullptr; h_sec4_bytes = 0; }
+        if (h_sec4_pageable) {
+#ifdef _WIN32
+            VirtualFree(h_sec4_pageable, 0, MEM_RELEASE);
+#else
+            munmap(h_sec4_pageable, h_sec4_bytes);
+#endif
+            h_sec4_pageable = nullptr;
+            h_sec4_bytes = 0;
+        }
+        sec4_is_pinned = false;
         if (promo_st) { cudaStreamDestroy(promo_st); promo_st = nullptr; }
         if (pf_dma_st) { cudaStreamDestroy(pf_dma_st); pf_dma_st = nullptr; }
         for (int b = 0; b < 2; ++b) {
@@ -920,8 +1112,26 @@ struct InkHybridEngine {
     }
 };
 
+__global__ void __launch_bounds__(256) k_ink_scatter_cpu_pairs(
+    const float* __restrict__ src_y,       // [n_pairs, kInkHidden]
+    const int32_t* __restrict__ pair_idx,  // [n_pairs]
+    const float* __restrict__ topk_w,      // [M * 8]
+    float* __restrict__ y_pair,            // [M * 8, kInkHidden]
+    int n_pairs) {
+    const int j = blockIdx.x;
+    if (j >= n_pairs) return;
+    const int pid = pair_idx[j];
+    const float rw = topk_w[pid];
+    const float4* s4 = reinterpret_cast<const float4*>(src_y + (size_t)j * kInkHidden);
+    float4* d4 = reinterpret_cast<float4*>(y_pair + (size_t)pid * kInkHidden);
+    for (int i = threadIdx.x; i < (kInkHidden / 4); i += 256) {
+        const float4 v = s4[i];
+        d4[i] = make_float4(v.x * rw, v.y * rw, v.z * rw, v.w * rw);
+    }
+}
+
 // ============================================================================
-// 3. Hybrid MoE Launcher: Doorbell Parallel CPU+GPU (M=1) + Ping-Pong DMA Streaming (M>=2)!
+// 3. Hybrid MoE Launcher: Doorbell Parallel CPU+GPU (M=1) + Simultaneous PCIe+CPU Miss-Sharing (M=2..16) + Ping-Pong DMA Streaming (M>16)!
 // ============================================================================
 inline void launch_ink_moe_hybrid(
     cudaStream_t st,
@@ -965,22 +1175,49 @@ inline void launch_ink_moe_hybrid(
         launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, 1, ws, force_exact_dec, false);
         k_ink_doorbell_wait_collect<<<kInkTopK, 256, 0, st>>>(hyb.d_bell, hyb.d_cur_seq, ws.topk_w, ws.y_pair);
     } else {
-        // Double-Buffered Ping-Pong Async DMA Streaming overlapped with Blackwell sm_120a / INT8 Tensor Cores!
-        // Step A: Collect which host experts in layer `ip` are needed (all host experts for M>16; exact hit set for M<=16!)
+        // Step A: Collect which host experts in layer `ip` are needed (all host experts for M>16; exact hit set + multiplicity for M<=16!)
         std::vector<int> host_list;
         host_list.reserve(kInkExperts);
+        int32_t h_idx[16 * kInkTopK] = {};
+        int ecnt[kInkExperts] = {};
+        std::vector<int> cpu_eids;
+        std::vector<std::pair<int, int>> cpu_pairs;  // (pair_id, expert_id)
         if (M <= 16) {
-            int32_t h_idx[16 * kInkTopK];
             INK_CK(cudaMemcpyAsync(h_idx, ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
+            if (hyb.h_v_x) INK_CK(cudaMemcpyAsync(hyb.h_v_x, x_f32, (size_t)M * kInkHidden * 4, cudaMemcpyDeviceToHost, st));
             INK_CK(cudaStreamSynchronize(st));
-            uint8_t seen[kInkExperts] = {};
             for (int i = 0; i < M * kInkTopK; ++i) {
                 const int e = h_idx[i];
                 const int key = ip * kInkExperts + e;
-                if (!seen[e] && hyb.host_meta[key].body != nullptr &&
+                if (e >= 0 && e < kInkExperts && hyb.host_meta[key].body != nullptr &&
                     (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0)) {
-                    seen[e] = 1;
-                    host_list.push_back(e);
+                    if (ecnt[e] == 0) host_list.push_back(e);
+                    ++ecnt[e];
+                }
+            }
+            // Simultaneous PCIe H2D GPU Miss-Sharing + CPU Pool (L / (L + k R)) for DSpark Block-8 verify (M = 2..16)!
+            // Highest-multiplicity experts go to GPU Tensor Cores over PCIe DMA; remaining cnt==1 experts run concurrently on CPU!
+            const double share = (hyb.dec_pcie_share >= 0.0) ? hyb.dec_pcie_share : (hyb.sec4_is_pinned ? 0.60 : 0.50);
+            if (hyb.active && hyb.h_v_x && hyb.h_v_y && host_list.size() >= 2 && share < 0.999) {
+                std::sort(host_list.begin(), host_list.end(), [&](int a, int b) { return ecnt[a] > ecnt[b]; });
+                int w_tot = 0;
+                for (int e : host_list) w_tot += ecnt[e];
+                const double w_goal = share * (double)w_tot;
+                int w_acc = 0;
+                size_t split = 0;
+                while (split < host_list.size() && (double)w_acc < w_goal) {
+                    w_acc += ecnt[host_list[split]];
+                    ++split;
+                }
+                uint8_t is_cpu[kInkExperts] = {};
+                for (size_t i = split; i < host_list.size(); ++i) {
+                    is_cpu[host_list[i]] = 1;
+                    cpu_eids.push_back(host_list[i]);
+                }
+                host_list.resize(split);
+                for (int p = 0; p < M * kInkTopK; ++p) {
+                    const int e = h_idx[p];
+                    if (e >= 0 && e < kInkExperts && is_cpu[e]) cpu_pairs.push_back({p, e});
                 }
             }
         } else {
@@ -993,8 +1230,8 @@ inline void launch_ink_moe_hybrid(
             }
         }
 
-        // Partition host_list into ping-pong VRAM chunks fitting inside pf_stage_bytes!
-        struct PfChunk { std::vector<int> eids; std::vector<size_t> offs; };
+        // Partition GPU-assigned host_list into ping-pong VRAM chunks fitting inside pf_stage_bytes!
+        struct PfChunk { std::vector<int> eids; std::vector<size_t> offs; size_t total_bytes = 0; };
         std::vector<PfChunk> chunks;
         if (!host_list.empty() && hyb.d_pf_stage[0] && hyb.pf_stage_bytes > 0) {
             PfChunk cur;
@@ -1002,6 +1239,7 @@ inline void launch_ink_moe_hybrid(
             for (int e : host_list) {
                 const size_t b = (hyb.host_meta[ip * kInkExperts + e].body_bytes + 255ull) & ~255ull;
                 if (used + b > hyb.pf_stage_bytes && !cur.eids.empty()) {
+                    cur.total_bytes = used;
                     chunks.push_back(std::move(cur));
                     cur = {};
                     used = 0;
@@ -1010,10 +1248,13 @@ inline void launch_ink_moe_hybrid(
                 cur.offs.push_back(used);
                 used += b;
             }
-            if (!cur.eids.empty()) chunks.push_back(std::move(cur));
+            if (!cur.eids.empty()) {
+                cur.total_bytes = used;
+                chunks.push_back(std::move(cur));
+            }
         }
 
-        // Kick off Chunk `ci` DMA into ping-pong buffer `buf` (waits on prior pf_ev_done[buf] so h_pf_exp_pin[buf] & d_pf_stage[buf] NEVER race!)
+        // Kick off Chunk `ci` DMA into ping-pong buffer `buf` (uses bounce ring cleanly when host arena is pageable!)
         auto issue_dma = [&](size_t ci, int buf) {
             if (hyb.pf_buf_busy[buf]) {
                 INK_CK(cudaEventSynchronize(hyb.pf_ev_done[buf]));
@@ -1022,6 +1263,7 @@ inline void launch_ink_moe_hybrid(
             const auto& ch = chunks[ci];
             InkExpertDev* h_exp = hyb.h_pf_exp_pin[buf];
             for (int e = 0; e < kInkExperts; ++e) { h_exp[e] = {}; h_exp[e].tier = 2; }
+            const bool use_bounce = (!hyb.sec4_is_pinned && hyb.h_pf_bounce[buf] != nullptr);
             for (size_t i = 0; i < ch.eids.size(); ++i) {
                 const int e = ch.eids[i];
                 const auto& hm = hyb.host_meta[ip * kInkExperts + e];
@@ -1030,7 +1272,14 @@ inline void launch_ink_moe_hybrid(
                 h_exp[e].gu_code  = hm.gu_code;
                 h_exp[e].dn_code  = hm.dn_code;
                 h_exp[e].tier     = 0;
-                INK_CK(cudaMemcpyAsync(hyb.d_pf_stage[buf] + ch.offs[i], hm.body, hm.body_bytes, cudaMemcpyHostToDevice, hyb.pf_dma_st));
+                if (use_bounce) {
+                    std::memcpy(hyb.h_pf_bounce[buf] + ch.offs[i], hm.body, hm.body_bytes);
+                } else {
+                    INK_CK(cudaMemcpyAsync(hyb.d_pf_stage[buf] + ch.offs[i], hm.body, hm.body_bytes, cudaMemcpyHostToDevice, hyb.pf_dma_st));
+                }
+            }
+            if (use_bounce && ch.total_bytes > 0) {
+                INK_CK(cudaMemcpyAsync(hyb.d_pf_stage[buf], hyb.h_pf_bounce[buf], ch.total_bytes, cudaMemcpyHostToDevice, hyb.pf_dma_st));
             }
             INK_CK(cudaMemcpyAsync(hyb.d_pf_exp_tmp[buf], h_exp, (size_t)kInkExperts * sizeof(InkExpertDev), cudaMemcpyHostToDevice, hyb.pf_dma_st));
             INK_CK(cudaEventRecord(hyb.pf_ev_dma[buf], hyb.pf_dma_st));
@@ -1050,6 +1299,53 @@ inline void launch_ink_moe_hybrid(
             launch_ink_moe_dispatch_only(st, hyb.d_pf_stage[buf], hyb.d_pf_exp_tmp[buf], info, x_f32, M, ws, force_exact_dec, true);
             INK_CK(cudaEventRecord(hyb.pf_ev_done[buf], st));
             hyb.pf_buf_busy[buf] = true;
+        }
+
+        // Concurrently evaluate CPU-assigned pairs for M=2..16 while GPU executes VRAM + PCIe-streamed chunks!
+        if (!cpu_pairs.empty()) {
+            const int np = (int)cpu_pairs.size();
+            const int nt = std::min(std::max(1, hyb.n_threads), np);
+            if (nt > 1) {
+                std::vector<std::thread> tmp_th;
+                tmp_th.reserve((size_t)nt - 1);
+                for (int t = 1; t < nt; ++t) {
+                    tmp_th.emplace_back([&, t]() {
+                        for (int j = t; j < np; j += nt) {
+                            const int pid = cpu_pairs[j].first;
+                            const int e   = cpu_pairs[j].second;
+                            const int m   = pid / kInkTopK;
+                            hyb.h_v_p[j]  = pid;
+                            host_eval::eval_expert_f32_h(hyb.host_meta[ip * kInkExperts + e], hyb.h_v_x + (size_t)m * kInkHidden, hyb.h_v_y + (size_t)j * kInkHidden);
+                        }
+                    });
+                }
+                for (int j = 0; j < np; j += nt) {
+                    const int pid = cpu_pairs[j].first;
+                    const int e   = cpu_pairs[j].second;
+                    const int m   = pid / kInkTopK;
+                    hyb.h_v_p[j]  = pid;
+                    host_eval::eval_expert_f32_h(hyb.host_meta[ip * kInkExperts + e], hyb.h_v_x + (size_t)m * kInkHidden, hyb.h_v_y + (size_t)j * kInkHidden);
+                }
+                for (auto& th : tmp_th) th.join();
+            } else {
+                for (int j = 0; j < np; ++j) {
+                    const int pid = cpu_pairs[j].first;
+                    const int e   = cpu_pairs[j].second;
+                    const int m   = pid / kInkTopK;
+                    hyb.h_v_p[j]  = pid;
+                    host_eval::eval_expert_f32_h(hyb.host_meta[ip * kInkExperts + e], hyb.h_v_x + (size_t)m * kInkHidden, hyb.h_v_y + (size_t)j * kInkHidden);
+                }
+            }
+            INK_CK(cudaMemcpyAsync(hyb.d_v_y, hyb.h_v_y, (size_t)np * kInkHidden * 4, cudaMemcpyHostToDevice, st));
+            INK_CK(cudaMemcpyAsync(hyb.d_v_p, hyb.h_v_p, (size_t)np * 4, cudaMemcpyHostToDevice, st));
+            k_ink_scatter_cpu_pairs<<<np, 256, 0, st>>>(hyb.d_v_y, hyb.d_v_p, ws.topk_w, ws.y_pair, np);
+            // Record CPU misses for layer ip and kick L3 prefetch for next layer (STRATA_L3_PF)
+            const int cn = std::min((int)cpu_eids.size(), 32);
+            hyb.prev_cpu_n[ip] = cn;
+            for (int i = 0; i < cn; ++i) hyb.prev_cpu_eids[ip][i] = cpu_eids[i];
+            if (ip + 1 < kInkPhysLayers && hyb.prev_cpu_n[ip + 1] > 0) {
+                hyb.kick_l3_prefetch(ip + 1, hyb.prev_cpu_eids[ip + 1], hyb.prev_cpu_n[ip + 1]);
+            }
         }
     }
 

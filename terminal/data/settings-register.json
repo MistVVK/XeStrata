@@ -3820,13 +3820,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2056,
+     "line": 1788,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/hy4_graph.hip.h",
-     "line": 1333,
+     "line": 1418,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3859,7 +3859,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2773,
+     "line": 2611,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3901,7 +3901,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2776,
+     "line": 2614,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -3945,7 +3945,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2775,
+     "line": 2613,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3978,7 +3978,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2002,
+     "line": 1734,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4011,13 +4011,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2023,
+     "line": 1755,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2042,
+     "line": 1774,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4050,7 +4050,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2197,
+     "line": 1991,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4083,13 +4083,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2071,
+     "line": 1836,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2208,
+     "line": 2003,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4122,7 +4122,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2195,
+     "line": 1989,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4155,7 +4155,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2206,
+     "line": 2000,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -9139,13 +9139,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1461,
+     "line": 1168,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1494,
+     "line": 1201,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -14726,7 +14726,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_graph.hip.h",
-     "line": 1341,
+     "line": 1426,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -15462,6 +15462,34 @@
    "status": "research",
    "owner": "program",
    "note": "[reviewed] Fault-injection test switch. [src comment]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_INK_DEC_PCIE_SHARE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/inkling2/cuda/ink_hybrid.cuh",
+     "line": 847,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "default",
+   "owner": "inkling2",
+   "note": "Fraction of missed MoE experts streamed to GPU over PCIe concurrently with CPU workers during inkling2 decode/verify (-1=auto, 0=off, 0..1=fixed share).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -18327,6 +18355,40 @@
    "status": "research",
    "owner": "core",
    "note": "keep only the first N MiB of a layer in the L2 prefetch (STRATA_L2_PF); a cap at 72 MiB measured the same as none (RESULTS-BW-C.md)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_L3_PF",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
+     "line": 2001,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "engine/src/inkling2/cuda/ink_hybrid.cuh",
+     "line": 846,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "default",
+   "owner": "hy4flash",
+   "note": "Cross-layer CPU L3 prefetch of predicted next-layer missed experts during GPU attention window (1=on by default, 0=off).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -25072,6 +25134,34 @@
    "status": "research",
    "owner": "kernels/cpu",
    "note": "[auto] not documented for users; code default not readable from the call",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_NUMA_ARENA",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
+     "line": 1692,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "on",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "default",
+   "owner": "hy4flash",
+   "note": "Pin CPU expert arena loader threads per NUMA/physical core topology for first-touch memory placement (1=on by default, 0=off).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -48046,7 +48136,7 @@
    "reads": [
     {
      "file": "engine/src/kernels/cuda/vhead_bitplane.cu",
-     "line": 673,
+     "line": 674,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
