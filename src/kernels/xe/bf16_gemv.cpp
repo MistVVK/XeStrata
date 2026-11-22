@@ -447,9 +447,12 @@ void f32_gemm_rows(const float* x, int64_t ldx, const float* w, float* y, int64_
     if (x == nullptr || w == nullptr || y == nullptr)
         throw std::invalid_argument("f32_gemm_rows: null pointer");
     auto& q = queue_for(stream);
-    // the 4 x 4 tiles where both sides fill them (RX 9060 XT, 16K tokens of 4096: 512 outputs 650 -> 217 ms, 128
-    // outputs 161 -> 85); 8 and 32 outputs ran slower with 4 x 4 or 4 x 1 tiles (335 -> 825 or 405 ms)
-    if (n_out >= 64 && n_tok >= 64) launch_gemm_rows<4, 4>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok);
+    // Conservative shared regions: K=512 and 4096 on B70, RTX 4070 and RX 9060 XT.  At K=4096, 192 tokens x 512
+    // outputs took 654/556/565 -> 428/302/413 us; 4096 x 128 took 2696/2428/2724 -> 783/703/2291 us (1x1 -> 4x4).
+    // The 64-output case stays 1x1: at 2048 tokens the RX took 730 -> 2468 us, though B70 and RTX prefer 4x4 there.
+    const bool wide = (n_out >= 384 && n_tok >= 192) || (n_out >= 192 && n_tok >= 2048) ||
+                      (n_out >= 128 && n_tok >= 4096);
+    if (wide) launch_gemm_rows<4, 4>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok);
     else launch_gemm_rows<1, 1>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok);
     if (!stream) core::Runtime::get().finish(q);
 }
