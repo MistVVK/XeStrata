@@ -1,5 +1,8 @@
-// src/quant/arm/act_neon.cpp - the Neon contract's activation quantizers: ggml's NEON Q8_0 / Q8_1 (round half to even, vcvtnq), and Q8_K, which is ggml's scalar
-// `_ref` on Arm too (its Arm file calls it a placeholder).  Compiled with the flags of cmake/backends/quant.cmake.
+// Copyright (c) 2026 Niko1221 and the Strata contributors
+// SPDX-License-Identifier: MIT
+//
+// src/quant/arm/act_neon.cpp - the Neon contract's activation quantizers: NEON Q8_0 / Q8_1 (round half to even, vcvtnq),
+// and SIMD NEON Q8_K (bit-exact to quantize_q8_K_ref on both GCC and Clang ARM64 builds).
 #include "tier_common.hpp"
 
 #include "../registry.hpp"
@@ -17,6 +20,7 @@ namespace {
 const ActKernel kTable[] = {
     {neon::quantize_q8_0, Type::Q8_0, Arith::Neon, Isa::Neon, "neon_q8_0"},
     {neon::quantize_q8_1, Type::Q8_1, Arith::Neon, Isa::Neon, "neon_q8_1"},
+    {neon::quantize_q8_K, Type::Q8_K, Arith::Neon, Isa::Neon, "neon_q8_K"},
     {quantize_q8_K_ref, Type::Q8_K, Arith::Neon, Isa::Scalar, "neon_q8_K_ref"},
 };
 }  // namespace

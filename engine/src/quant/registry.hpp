@@ -25,10 +25,12 @@ ActTable generic_act_table() noexcept;   // act_ref.cpp
 #ifdef STRATA_QUANT_X86_TIERS
 DotTable avx_dot_table() noexcept;       // x86/dot_avx.cpp      (Arith::Avx, Isa::Avx1)
 DotTable avx2_dot_table() noexcept;      // x86/dot_avx2.cpp     (Arith::Avx2, Isa::Avx2)
+DotX4Table avx2_dot_x4_table() noexcept; // x86/dot_avx2.cpp     (4-row shared-activation AVX2 kernels)
 ActTable avx_act_table() noexcept;       // x86/act_avx.cpp
 ActTable avx2_act_table() noexcept;      // x86/act_avx2.cpp
+ActTable avx512_act_table() noexcept;    // x86/act_avx512.cpp   (Arith::Avx2 bits in 512-bit lanes, Isa::Avx512)
 DotTable avx512_dot_table() noexcept;    // x86/dot_avx512.cpp   (Arith::Avx2 bits in 512-bit lanes, Isa::Avx512)
-DotX4Table avx512_dot_x4_table() noexcept; // x86/dot_avx512.cpp (4-row shared-activation VPDPBUSD kernels)
+DotX4Table avx512_dot_x4_table() noexcept; // x86/dot_avx512.cpp (4-row shared-activation VPDPBUSD/VPDPWSSD kernels)
 #endif
 
 #ifdef STRATA_QUANT_ARM_TIERS
