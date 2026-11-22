@@ -99,6 +99,10 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false,
     // 1.43 [1.42, 1.45] / 1.47 [1.46, 1.47] against 1.52 [1.50, 1.54] / 1.51 [1.50, 1.52] / 1.56 [1.55, 1.57]; Q5_K / Q8_0 0.94 [0.94, 0.95] / 1.20 [1.20, 1.21] / 1.35 [1.35, 1.35] against 1.46 [1.45, 1.48] / 1.44 [1.44, 1.46] /
     // 1.49 [1.48, 1.49]; the ranges do not overlap, and the output bits hash is equal at every tile.  The Q5_1-down pair (43 layers) keeps the 64-row tile there: 1.64 / 1.71 / 1.67 against 1.50 / 1.52 / 1.58.
     if (kq == 2 && c.s120 && c.sms >= 100 && c.sms < 150 && avg >= kKqMinAvg) return {2, Why::kS120Kq};
+    // #6489: staged launches on sm_86-class (8.0 / 8.6 / 8.9) cards with 80+ SMs (e.g. RTX 4090 D 114 SMs, RTX 4090
+    // 128 SMs) above the 56-112 band (16K+ cold prefill on IQ3_S): falling through to the 64-row unstaged tile both
+    // halves weight reuse and turns off cp.async weight staging (-21% on RTX 4090 D). Keep 128-row staged above 112.
+    if (staged && c.s86 && c.sms >= 80 && avg > 112.0) return {2, Why::kStaged};
     return {avg > 56.0 && avg <= 112.0 ? 2 : 4, Why::kBand};
 }
 

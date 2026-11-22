@@ -88,8 +88,15 @@ int main() {
                 CHECK(pick(c, n, E, false).ww == pick(c, n, E).ww && pick(c, n, E, false).why == pick(c, n, E).why);
                 CHECK(pick(c, n, E).why != Why::kStaged);
             }
-            // outside the class a staged launch keeps the rule: 80+ SMs, sm_121, a card with neither flag (sm_89 / sm_80: not measured), an unknown SM count
-            for (const Card& c : {s86at80, a6000s, s120at80, rtx5080, pro5000, pro6000, rtx5090, gb10, Card{true, true, 48, true}, s89, unknown}) {
+            // #6489: sm_86-class 80+ SMs keep the 128-row staged tile above 112 rows/expert (preventing -21% 16K
+            // IQ3_S fallback to unstaged 64-row tile on RTX 4090 D / 4090 / A6000) and match unstaged at or below 112.
+            for (const Card& c : {s86at80, a6000s, Card{false, false, 114, true}, Card{false, false, 128, true}}) {
+                const double avg = (double) n / E;
+                if (avg > 112.0) CHECK(pick(c, n, E, true).ww == 2 && pick(c, n, E, true).why == Why::kStaged);
+                else CHECK(pick(c, n, E, true).ww == pick(c, n, E, false).ww && pick(c, n, E, true).why == pick(c, n, E, false).why);
+            }
+            // outside the class a staged launch keeps the rule: sm_120 80+ SMs, sm_121, a card with neither flag, an unknown SM count
+            for (const Card& c : {s120at80, rtx5080, pro5000, pro6000, rtx5090, gb10, Card{true, true, 48, true}, s89, unknown}) {
                 CHECK(pick(c, n, E, true).ww == pick(c, n, E, false).ww && pick(c, n, E, true).why == pick(c, n, E, false).why);
             }
         }
@@ -533,9 +540,9 @@ int main() {
             CHECK(pick(c, 1024 * 8, 256, true, w).ww == 4 && pick(c, 1792 * 8, 256, true, w).ww == 4);                       // 32 and 56 rows an expert: the band's bottom, 64 as before
             CHECK(pick(c, 2048 * 8, 256, true, w).ww == 2 && pick(c, 2048 * 8, 256, true, w).why == Why::kBand);              // 64: the band, 128 as before
             for (int T : {4096, 8192, 20000}) CHECK(pick(c, (int64_t) T * 8, 256, true, w).ww == 2 && pick(c, (int64_t) T * 8, 256, true, w).why == Why::kS86Wide);   // 128 / 256 / 625: 128 rows now
-            for (int T : {4096, 8192, 20000}) CHECK(pick(c, (int64_t) T * 8, 256, true, false).ww == 4);                       // not the class: the old pick, 64 rows
+            for (int T : {4096, 8192, 20000}) CHECK(pick(c, (int64_t) T * 8, 256, false, false).ww == 4 && pick(c, (int64_t) T * 8, 256, true, false).ww == 2 && pick(c, (int64_t) T * 8, 256, true, false).why == Why::kStaged);
             CHECK(pick(c, 4096 * 8, 256, true, w).ww == 2 && pick(c, 3584 * 8, 256, true, w).ww == 2 && pick(c, 3584 * 8, 256, true, false).ww == 2);   // 112 rows an expert (3,584 tokens): band, 128 either way
-            CHECK(pick(c, 3585 * 8, 256, true, w).ww == 2 && pick(c, 3585 * 8, 256, true, false).ww == 4);                    // 112.03: the line
+            CHECK(pick(c, 3585 * 8, 256, true, w).ww == 2 && pick(c, 3585 * 8, 256, false, false).ww == 4 && pick(c, 3585 * 8, 256, true, false).ww == 2);                    // 112.03: wide / staged keep 128, unstaged non-wide takes 64
         }
         // under 80 SMs the staged rule already takes 128 (A4000), sm_120 never looks at wide
         for (int T : {1024, 2048, 4096, 8192, 20000}) {

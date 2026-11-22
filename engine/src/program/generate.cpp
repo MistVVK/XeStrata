@@ -15906,14 +15906,21 @@ int main(int argc, char** argv) {
                                   std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                     wlist += wb;
                 }
-                strata::core::session_zero(ss, g, nullptr, main_cs);
-                cudaStreamSynchronize(main_stream);
-                drive.d.layers = 0;
-                drive.d.experts = 0;
-                drive.d.failed = false;
                 std::fprintf(stderr, "strata serve: window warm-up: ms per width %s, total %.0f ms%s%s\n", wlist.c_str(),
                              std::chrono::duration<double, std::milli>(Clock::now() - w0).count(), wok ? "" : "; a window failed: ",
                              wok ? "" : werr.c_str());
+                std::fflush(stderr);
+                if (!wok) {
+                    // #6487: log the failing warm-up window error before resetting the session; calling session_zero()
+                    // over a sticky CUDA error tripped kv_stream: reset and masked the real failure.
+                    exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : werr);
+                } else {
+                    strata::core::session_zero(ss, g, nullptr, main_cs);
+                    cudaStreamSynchronize(main_stream);
+                }
+                drive.d.layers = 0;
+                drive.d.experts = 0;
+                drive.d.failed = false;
             }
         }
         g_gpu_pause_idle.idle(gpu_pause_now());   // AMD on Linux: the gap before the first request starts here (the start-up's own pauses are not a "between")
