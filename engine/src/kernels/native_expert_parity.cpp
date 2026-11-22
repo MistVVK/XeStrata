@@ -75,6 +75,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
     }
     for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
+    const std::vector<float> G_raw(G), U_raw(U), D_raw(D);
     if (f.tail_off) {   // the blob's scales, as the engine applies them (gate and up as read, down on its output)
         float tail[4];
         std::memcpy(tail, blob.data() + f.tail_off, sizeof tail);
@@ -468,8 +469,8 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             size_t differ = 0, h_differ = 0, h_shown = 0;
             long h_maxulp = 0;
             const struct { const uint8_t* src; int type; const std::vector<float>* want; } mats[3] = {
-                {(const uint8_t*) dblob, f.gu_type, &G}, {(const uint8_t*) dblob + f.up_off, f.gu_type, &U},
-                {(const uint8_t*) dblob + f.down_off, f.d_type, &D}};
+                {(const uint8_t*) dblob, f.gu_type, &G_raw}, {(const uint8_t*) dblob + f.up_off, f.gu_type, &U_raw},
+                {(const uint8_t*) dblob + f.down_off, f.d_type, &D_raw}};
             for (const auto& m : mats) {
                 strata::kernels::iq_dequant_f32(m.type, m.src, FF * H, dq, s);
                 strata::kernels::iq_dequant_f16(m.type, m.src, FF * H, dh, s);
@@ -492,7 +493,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             cudaMemcpy(got_dq.data(), dq, got_dq.size() * 4, cudaMemcpyDeviceToHost);
             size_t emb_differ = 0;
             for (int64_t r = 0; r < FF; ++r)
-                emb_differ += std::memcmp(got_dq.data() + r * H, G.data() + (FF - 1 - r) * H, (size_t) H * 4) != 0;
+                emb_differ += std::memcmp(got_dq.data() + r * H, G_raw.data() + (FF - 1 - r) * H, (size_t) H * 4) != 0;
             cudaFree(dq); cudaFree(dh); cudaFree(dtk);
             std::printf("          GPU dequant vs ggml to_float: rel %.2e, %zu of %lld values differ in any bit; fp16 of "
                         "it: %zu differ (max %ld ulp); embedding rows: %zu of %lld differ\n", dq_err, differ, (long long) (3 * FF * H),
