@@ -5,8 +5,11 @@
 #include "conversation_trace.hpp"
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +17,8 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 namespace strata::core {
 namespace {
@@ -265,6 +270,126 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
 }
+
+// STRATA_PARK_HOST_MEMCPY=1 (opt-in, default OFF): for kv_mode != 0 (streamed/draft-ring K/V whose parts 0..3 live
+// in pinned host memory st.host.*), use resize_for_overwrite() and multi-threaded host std::memcpy instead of
+// zero-filling resize() plus per-segment synchronous CUDA/WDDM copy calls.
+bool park_host_memcpy_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PARK_HOST_MEMCPY");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
+int park_copy_threads() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_PARK_COPY_THREADS");
+        const int parsed = v != nullptr ? std::atoi(v) : 8;
+        return std::max(1, std::min(16, parsed > 0 ? parsed : 8));
+    }();
+    return n;
+}
+
+struct HostCopySpan {
+    uint8_t* dst;
+    const uint8_t* src;
+    size_t n;
+};
+
+// Persistent worker pool for parallel host-to-host K/V copies (leaked intentionally on process exit so Windows CRT
+// teardown never deadlocks on parked threads; 0% CPU while idle).
+class HostCopyPool {
+public:
+    explicit HostCopyPool(int total_threads) : n_workers_(std::max(0, total_threads - 1)) {
+        workers_.reserve((size_t) n_workers_);
+        for (int i = 0; i < n_workers_; ++i) {
+            workers_.emplace_back([this] {
+                conversation_detail::background_thread_placement();
+                uint64_t seen = 0;
+                for (;;) {
+                    const std::vector<HostCopySpan>* tasks = nullptr;
+                    {
+                        std::unique_lock<std::mutex> lk(mu_);
+                        cv_start_.wait(lk, [&] { return gen_ != seen; });
+                        seen = gen_;
+                        tasks = cur_tasks_;
+                    }
+                    if (tasks != nullptr) drain(*tasks);
+                    if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        cv_done_.notify_one();
+                    }
+                }
+            });
+        }
+    }
+
+    void run(const std::vector<HostCopySpan>& tasks) {
+        if (tasks.empty()) return;
+        if (n_workers_ <= 0 || tasks.size() <= 1) {
+            for (const auto& t : tasks) {
+                std::memcpy(t.dst, t.src, t.n);
+                core::progress_beat();
+            }
+            return;
+        }
+        std::lock_guard<std::mutex> run_lk(run_mu_);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            cur_tasks_ = &tasks;
+            next_idx_.store(0, std::memory_order_relaxed);
+            remaining_.store(n_workers_, std::memory_order_release);
+            ++gen_;
+        }
+        cv_start_.notify_all();
+        drain(tasks);
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_done_.wait(lk, [&] { return remaining_.load(std::memory_order_acquire) == 0; });
+        cur_tasks_ = nullptr;
+    }
+
+private:
+    void drain(const std::vector<HostCopySpan>& tasks) {
+        const size_t total = tasks.size();
+        for (;;) {
+            const size_t idx = next_idx_.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= total) return;
+            const HostCopySpan& t = tasks[idx];
+            std::memcpy(t.dst, t.src, t.n);
+            core::progress_beat();
+        }
+    }
+
+    int n_workers_ = 0;
+    std::mutex run_mu_;
+    std::mutex mu_;
+    std::condition_variable cv_start_;
+    std::condition_variable cv_done_;
+    uint64_t gen_ = 0;
+    const std::vector<HostCopySpan>* cur_tasks_ = nullptr;
+    std::atomic<size_t> next_idx_{0};
+    std::atomic<int> remaining_{0};
+    std::vector<std::thread> workers_;
+};
+
+void parallel_host_memcpy(const std::vector<HostCopySpan>& spans) {
+    if (spans.empty()) return;
+    static HostCopyPool* pool = new HostCopyPool(park_copy_threads());
+    constexpr size_t kChunk = (size_t) 4 << 20;   // 4 MiB sub-spans for even thread load balancing
+    std::vector<HostCopySpan> chunks;
+    chunks.reserve(spans.size() * 2);
+    for (const auto& s : spans) {
+        if (s.n == 0) continue;
+        size_t off = 0;
+        while (off < s.n) {
+            const size_t piece = std::min(kChunk, s.n - off);
+            chunks.push_back({s.dst + off, s.src + off, piece});
+            off += piece;
+        }
+    }
+    pool->run(chunks);
+}
 } // namespace
 
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
@@ -313,12 +438,31 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     // STRATA_PARK_VRAM_MIB: this layer's parts go into the park's slot under a fresh tag (0: no slot this park)
     image.dev_tag = park_async().slot != nullptr ? vram_kv().next_tag++ : 0;
+    const bool fast_host = park_host_memcpy_on() && st.kv_mode != 0;
+    std::vector<HostCopySpan> host_spans;
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
+        if (fast_host && i < 4) {
+            if (sizes[i] > keep && src[i] == nullptr) { error = "conversation snapshot: missing state buffer"; return false; }
+            const bool trace = park_trace_on();
+            const auto t1 = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const long rf0 = trace ? conversation_trace::thread_minflt() : 0;
+            dst[i]->resize_for_overwrite(sizes[i]);
+            if (trace) {
+                kv_save_trace().resize += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+                kv_save_trace().resize_faults += conversation_trace::thread_minflt() - rf0;
+            }
+            if (sizes[i] > keep && !dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+                    host_spans.push_back({p, static_cast<const uint8_t*>(src[i]) + at, n});
+                    return true;
+                })) return false;
+            if (reused_bytes) *reused_bytes += keep;
+            continue;
+        }
         {   // STRATA_PARK_VRAM_MIB: with a slot, the whole part goes device to device into it (a restore of this image
             // reads it from there) and the host buffer gets only the bytes past the kept prefix, read from the slot on
             // the background thread; a part the slot cannot take is copied synchronously - never through the stage,
@@ -380,6 +524,13 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         }
         if (!copied) return false;
         if (reused_bytes) *reused_bytes += keep;
+    }
+    if (!host_spans.empty()) {
+        const bool trace = park_trace_on();
+        const auto tc0 = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        parallel_host_memcpy(host_spans);
+        if (trace)
+            kv_save_trace().copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc0).count();
     }
     return true;
 }
@@ -526,6 +677,21 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
             if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
         return refresh_residency(st, g, upto, error);
     }
+    if (park_host_memcpy_on() && st.kv_mode != 0) {
+        std::vector<HostCopySpan> host_spans;
+        for (size_t i = 0; i < 4; ++i) {
+            if (src[i]->size() > 0 && !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+            if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                    host_spans.push_back({static_cast<uint8_t*>(dst[i]) + at, p, n});
+                    return true;
+                })) return false;
+        }
+        parallel_host_memcpy(host_spans);
+        if (!src[4]->visit(0, src[4]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(static_cast<uint8_t*>(dst[4]) + at, p, n, error);
+            })) return false;
+        return refresh_residency(st, g, upto, error);
+    }
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
@@ -555,6 +721,21 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     if (slot != nullptr) {
         for (size_t i = 0; i < src.size(); ++i)
             if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
+        return refresh_residency(st, g, upto, error);
+    }
+    if (park_host_memcpy_on() && st.kv_mode != 0) {
+        std::vector<HostCopySpan> host_spans;
+        for (size_t i = 0; i < 4; ++i) {
+            if (sizes[i] > 0 && !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+            if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
+                    host_spans.push_back({static_cast<uint8_t*>(dst[i]) + at, p, n});
+                    return true;
+                })) return false;
+        }
+        parallel_host_memcpy(host_spans);
+        if (!src[4]->visit(0, sizes[4], [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(static_cast<uint8_t*>(dst[4]) + at, p, n, error);
+            })) return false;
         return refresh_residency(st, g, upto, error);
     }
     for (size_t i = 0; i < src.size(); ++i)

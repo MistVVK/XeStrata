@@ -681,15 +681,15 @@ builds make that identity easy to mistake, see below - so calibrate it on the ca
 
 ```sh
 cmake --build build-hip --target tune_rocblas
-LD_LIBRARY_PATH=/opt/rocm/lib ./build-hip/tune_rocblas --tuning-out table.txt   # 14 shapes x 8 token buckets, about 5 min
+LD_LIBRARY_PATH=/opt/rocm/lib ./build-hip/tune_rocblas --tuning-out table.txt   # 14 shapes x 12 token buckets, about 15 min
 ```
 
-The tool times rocBLAS's default kernel and every solution the library lists for each shape at T = 256 ... 8192 (`--case
+The tool times rocBLAS's default kernel and every solution the library lists for each shape at T = 256 ... 16384 (`--case
 T,N,K,ldy` adds a shape, `--tokens` changes the buckets), checks the fastest against the default's output, and writes one row
 per shape and bucket: the winning solution where it beats the default by `--min-gain` (1.05), `default` otherwise. The header
 names the architecture and version (`STRATA_ROCBLAS_TUNING_V1 gfx1030 5.6.0.8d1ae90e`). Save it as
 `tools/hip/<arch>-rocblas-<version>.txt` (trailing dots dropped) for setup, or point `STRATA_ROCBLAS_TUNING` at the file.
-`STRATA_ROCBLAS_VERBOSE=1` prints the solution picked per shape and a `tuned_launches=... fallbacks=...` summary at exit. A
+`STRATA_ROCBLAS_VERBOSE=1` prints the solution picked per shape (or `default kernel; no row for T=... N=... K=... ldy=...`) and a `tuned_launches=... fallbacks=...` summary at exit; a read at the prompt lengths you use lists every (T, N, K, ldy) the engine calls, which is the way to check that a table covers them (a row matches N, K and ldy exactly; T goes to the nearest bucket). A
 solution rocBLAS refuses at run time falls back to the default kernel for that call, and after three refusals for good.
 `hip_prefill_rocblas_gemm` (with `STRATA_ROCBLAS_TUNING` set) is the smoke test.
 

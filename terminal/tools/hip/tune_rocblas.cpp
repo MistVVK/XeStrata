@@ -14,7 +14,7 @@
 //   cmake --build build-hip --target tune_rocblas
 //   ./build-hip/tune_rocblas --tuning-out tools/hip/<arch>-rocblas-<version>.txt
 //
-// Defaults: the engine's 14 FP16 dense shapes at T = 256 ... 8192 (--tokens); --case T,N,K,ldy adds one shape.
+// Defaults: the engine's 14 FP16 dense shapes at T = 256 ... 16384 (--tokens); --case T,N,K,ldy adds one shape.
 #define ROCBLAS_BETA_FEATURES_API
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -50,7 +50,7 @@ struct Buffer {
 struct Shape { int t, n, k, ldy; };
 struct Options {
     std::vector<Shape> shapes;
-    std::vector<int> tokens{256, 512, 768, 1024, 1536, 2048, 4096, 8192};
+    std::vector<int> tokens{256, 512, 768, 1024, 1536, 2048, 4096, 8192, 10240, 12288, 14336, 16384};
     std::string tuning_out;
     double min_gain = 1.05;
     bool explicit_shapes = false;
@@ -82,7 +82,7 @@ int positive(const std::string& s, const char* label) {
 }
 void usage(const char* p) {
     std::printf("Usage: %s [--case T,N,K,ldy]... [--tokens T1,T2,...] [--min-gain 1.05] [--tuning-out PATH]\n", p);
-    std::printf("Defaults: the engine's 14 FP16 dense shapes (ldy = N) at T = 256,512,768,1024,1536,2048,4096,8192.\n");
+    std::printf("Defaults: the engine's 14 FP16 dense shapes (N K ldy as the engine calls them) at T = 256 ... 16384.\n");
 }
 Options options(int argc, char** argv) {
     Options o;
@@ -108,11 +108,15 @@ Options options(int argc, char** argv) {
     }
     if (!o.explicit_shapes) {
         // Qwen3.8-Flash-Next's dense FP16 products, prompt_f16() on (the hc read, GDN and QSA projections, the router
-        // and the shared expert), ldy = N for every one of them.  N K as the engine calls Gemm (ROCBLAS_LAYER=2).
-        const int nk[][2] = {{10240, 2560}, {12288, 2560}, {6144, 2560}, {2560, 6144}, {2560, 640}, {2560, 2560},
-                             {640, 2560}, {512, 2560}, {128, 2560}, {48, 2560}, {320, 10240}, {10240, 320},
-                             {4, 10240}, {1, 2560}};
-        for (const auto& p : nk) for (int t : o.tokens) o.shapes.push_back({t, p[0], p[1], p[0]});
+        // and the shared expert).  N K ldy as the engine calls Gemm (STRATA_ROCBLAS_VERBOSE=1 lists every (T,N,K,ldy) it
+        // meets): ldy = N except ssm_alpha / ssm_beta, which bf16_proj writes interleaved into one buffer (ldy = 2 * 48 =
+        // 96) - a table row for 48 2560 48 never matches them.  The buckets go to 16384, the chunk `--prefill 16384`
+        // reads (on gfx1030 rocBLAS's own pick for the GDN gate, N=6144 K=2560, is 1.8x off its best at T=16384 only).
+        const int nkl[][3] = {{10240, 2560, 10240}, {12288, 2560, 12288}, {6144, 2560, 6144}, {2560, 6144, 2560},
+                              {2560, 640, 2560}, {2560, 2560, 2560}, {640, 2560, 640}, {512, 2560, 512},
+                              {128, 2560, 128}, {48, 2560, 96}, {320, 10240, 320}, {10240, 320, 10240},
+                              {4, 10240, 4}, {1, 2560, 1}};
+        for (const auto& p : nkl) for (int t : o.tokens) o.shapes.push_back({t, p[0], p[1], p[2]});
     }
     return o;
 }

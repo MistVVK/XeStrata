@@ -4927,7 +4927,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             });
             cudaStreamWaitEvent(m.cs, m.copied[r % (size_t) m.ring], 0);
         };
+        size_t given_upto = 0;   // STRATA_I8_DEFER: the last count handed back to the stager
         auto give_back = [&](size_t upto) {
+            given_upto = upto;
             if (threaded_issue) a_consumed.store(upto, std::memory_order_release);
             else issue_until(upto + (size_t) m.ring);
         };
@@ -7523,14 +7525,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // pick only gives its slot back
                             size_t k = seq_start[(size_t) l];
                             const size_t kend = seq_start[(size_t) l + 1];
+                            // STRATA_I8_DEFER=1 (opt-in, the int8 expert groups only): a streamed entry the routing did not pick no longer
+                            // launches the open int8 group early.  Without it, every such entry while an int8 group holds ring slots runs the
+                            // experts gathered so far as a launch of their own (MMQ's flush only gathers, its GEMM still waits for the full
+                            // group; the int8 flush IS the launch), so a group of 16 experts is cut into fragments of one or a few experts and
+                            // tens of rows - the int8 kernels' least efficient shape.  With it, the entry's own slot gets its event at once and
+                            // the hand-back to the stager waits until the group has launched (the flush records the group's slot events; the
+                            // walk's `gg_nslots == 0 -> give_back(consumed)` then hands back everything up to here), so no slot of the open group
+                            // can be refilled before it is read.  The stager is held back by those entries meanwhile: when the entries not yet
+                            // handed back plus a full group would come near the ring, the early launch is kept.
+                            static const bool i8_defer = [] { const char* v = std::getenv("STRATA_I8_DEFER"); return v != nullptr && v[0] == '1'; }();
                             auto release_to = [&](int32_t e_stop) {
                                 while (k < kend && seq[k].e < e_stop) {
-                                    if (gg_nslots > 0) flush(0);   // the open group's slots get their event first
+                                    const bool defer = i8_defer && i8_l && gg_nslots > 0 &&
+                                                       (k + 1 - given_upto) + (size_t) strata::prefill::i8grp::kGroupMax + 2 < (size_t) m.ring;
+                                    if (gg_nslots > 0 && !defer) flush(0);   // the open group's slots get their event first
                                     const int sl = (int) (k % (size_t) m.ring);
                                     cudaEventRecord(m.used[sl], m.cs);
                                     m.used_of[sl] = sl;
                                     consumed = ++k;
-                                    give_back(consumed);
+                                    if (!defer) give_back(consumed);
                                 }
                             };
                             for (size_t j = 0; j < order.size(); ++j) {

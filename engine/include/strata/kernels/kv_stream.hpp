@@ -111,6 +111,7 @@ void kv_unstage_to_host(const QsaAttnPools& stage, const KvHostPools& host, int 
 struct KvStreamCounters {
     uint64_t misses = 0, lookups = 0, calls = 0;
     bool overflow = false;
+    uint32_t overflow_count = 0;
 };
 /// Synchronous read of the counters (debug and the end-of-request summary).
 KvStreamCounters kv_stream_counters(const KvStreamMap& m);

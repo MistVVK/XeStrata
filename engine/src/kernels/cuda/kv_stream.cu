@@ -156,7 +156,7 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
         m.ctl[0] = epoch;
         m.ctl[1] = hand;
         m.ctl[2] = placed;
-        if (placed < need) m.ctl[3] = 1;
+        if (placed < need) m.ctl[3] += 1;
         unsigned long long* c = reinterpret_cast<unsigned long long*>(m.ctl + 4);
         c[0] += (unsigned long long) placed;
         c[1] += (unsigned long long) s_lookups;
@@ -280,6 +280,7 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     r.lookups = u[1];
     r.calls = u[2];
     r.overflow = c[3] != 0;
+    r.overflow_count = (uint32_t) c[3];
     return r;
 }
 

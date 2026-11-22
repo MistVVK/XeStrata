@@ -14853,6 +14853,34 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_I8_DEFER",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/prefill/prefill.cpp",
+     "line": 7393,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "opt-in",
+   "owner": "prefill",
+   "note": "[reviewed] =1: a streamed prompt entry no token routes to no longer launches the open int8 expert group early (groups were cut into fragments of one or a few experts); the hand-back to the stager waits for the group's launch. Bit-identical output.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_I8_FEWROWS",
    "backends": [
     "cuda-hip"

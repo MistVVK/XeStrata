@@ -209,7 +209,7 @@ bool run(int fmt) {
     std::printf("  %s: %d batches, %llu block lookups, %llu misses (%.1f%% hit), overflow %d, %d failures\n",
                 name, batches, (unsigned long long) c.lookups, (unsigned long long) c.misses,
                 c.lookups ? 100.0 * (double) (c.lookups - c.misses) / (double) c.lookups : 0.0, (int) c.overflow, bad);
-    if (c.overflow || c.calls != (uint64_t) batches || c.misses == 0 || c.misses >= c.lookups) ++bad;
+    if (c.overflow || c.overflow_count != 0 || c.calls != (uint64_t) batches || c.misses == 0 || c.misses >= c.lookups) ++bad;
 
     // 4. a ring over the same host copy: blocks [b1 - R, b1) restored, read through `b % R`
     {

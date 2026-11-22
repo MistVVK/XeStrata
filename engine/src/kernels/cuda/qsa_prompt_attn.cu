@@ -172,7 +172,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
         if (c >= min(CH, n - c0)) return -1;
         const int cell = ids[c0 + c];
         const long long page = (long long) p.page_table[cell / page_size];
-        return (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        return page >= 0 ? (page * n_kv_heads + kvh) * page_size + (cell % page_size) : -1;
     };
     auto fetch = [&](int c0) {
         if constexpr (PREFETCH) {
@@ -209,7 +209,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
             if (t < nh) {
                 const int cell = ids[c0 + t];
                 const long long page = (long long) p.page_table[cell / page_size];
-                r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
             }
             S.row[t] = r;
         }
@@ -601,7 +601,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_i8_kernel(const float* __
     auto row_of = [&](int cell) -> long long {
         if (cell < 0) return -1;
         const long long page = (long long) __ldg(p.page_table + cell / page_size);
-        return (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        return page >= 0 ? (page * n_kv_heads + kvh) * page_size + (cell % page_size) : -1;
     };
 #if !STRATA_PA_SM80
     // Turing (no cp.async): the warp's next pieces wait in registers and are stored into their stage after this
@@ -864,7 +864,7 @@ __global__ void __launch_bounds__(THREADS) decode_attn_i8_split_kernel(const flo
     auto row_of = [&](int cell) -> long long {
         if (cell < 0) return -1;
         const long long page = (long long) __ldg(p.page_table + cell / page_size);
-        return (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        return page >= 0 ? (page * n_kv_heads + kvh) * page_size + (cell % page_size) : -1;
     };
     auto issue = [&](long long r, int st, float& ksr, float& vsr) {
 #pragma unroll
@@ -1216,7 +1216,7 @@ __global__ void __launch_bounds__(THREADS, 3) prompt_attn_i8v3_kernel(const floa
     auto row_of = [&](int cell) -> long long {
         if (cell < 0) return -1;
         const long long page = (long long) __ldg(p.page_table + cell / page_size);
-        return (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        return page >= 0 ? (page * n_kv_heads + kvh) * page_size + (cell % page_size) : -1;
     };
     // this warp's 64-dim slice of K (kv = 0) or V (1) of the chunk whose rows the lanes hold, and the cells' scales
     auto issue = [&](long long r, int kv) {
@@ -1572,7 +1572,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
         if (t < min(CH, n)) {
             const int cell = ids[t];
             const long long page = (long long) p.page_table[cell / page_size];
-            r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
         }
         S.row[0][t] = r;
     }
@@ -1819,7 +1819,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
             if (idx < n) {
                 const int cell = ids[idx];
                 const long long page = (long long) p.page_table[cell / page_size];
-                r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
             }
             S.row[rbuf ^ 1][t] = r;
         }

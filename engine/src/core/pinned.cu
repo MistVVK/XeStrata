@@ -37,6 +37,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <chrono>   // the STRATA_NUMA_ARENA=1 slice placement's timing (Windows only)
+#include "strata/kernels/cpu/expert_layout.hpp"   // its per-role slice geometry
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -142,12 +144,19 @@ uint64_t free_huge_bytes() {
 }
 #endif
 
+#if defined(_WIN32)
+// defined below (the Windows STRATA_NUMA_ARENA=1 slice placement): whether the placement can run on this host and
+// pack - reserve() checks it before giving up large pages, so a host or pack it cannot serve keeps them.
+bool numa_arena_usable(uint64_t bytes);
+#endif
+
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
 // A non-empty shared_file instead maps one file whose first 4 KiB identify the pack and whose remaining bytes
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
 // hugepage-aligned file size and arena offset rather than the 4 KiB header layout used here.
 void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::string& shared_file,
-              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes,
+              bool numa_placeable) {
     mapping_base = nullptr;
     mapping_bytes = 0;
 
@@ -271,7 +280,12 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
     // fails with ERROR_PRIVILEGE_NOT_HELD.  That is the EXPECTED outcome on a desktop, not an error.
     SIZE_T large = GetLargePageMinimum();
     // A/B switch: STRATA_NO_LARGEPAGES=1 skips the large-page attempt, same run, same boot.
-    if (large > 0 && std::getenv("STRATA_NO_LARGEPAGES") == nullptr) {
+    // STRATA_NUMA_ARENA=1 skips it too - but only when the slice placement can actually run (the switch set, a
+    // native layout it can place, two NUMA nodes): a 2 MB large page cannot split a role across sockets (a
+    // [gate | up | down] role is ~512-614 KiB), so per-slice placement needs 4 KB pages - the same reason the
+    // Linux twin asks for MADV_NOHUGEPAGE.  A host or pack the placement cannot serve keeps its large pages.
+    const bool numa_arena = numa_placeable && numa_arena_usable(bytes);
+    if (large > 0 && std::getenv("STRATA_NO_LARGEPAGES") == nullptr && !numa_arena) {
         // MEM_LARGE_PAGES requires the allocation size to be an exact multiple of the large page size -
         // anything else is ERROR_INVALID_PARAMETER (87), which reads like a privilege problem but is not.
         // Round up: the slack is under 2 MB and the tail stays unused.
@@ -288,6 +302,8 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         note = "large pages refused for " + std::to_string((unsigned long long) lbytes) + " B (GetLargePageMinimum=" +
                std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
                std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
+    } else if (numa_arena) {
+        note = "large pages skipped (STRATA_NUMA_ARENA=1); using 4 KB pages";
     } else if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
         note = "large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages";
     } else {
@@ -732,6 +748,158 @@ void release_alias_claims(std::vector<void*>& claims) {
     claims.clear();
 }
 
+#if defined(_WIN32)
+
+// node -> GROUP_AFFINITY for nodes 0 and 1 (the only shape the slice placement serves; a host with more
+// nodes gets its note saying only 0 and 1 were placed).  GetLogicalProcessorInformationEx(RelationNumaNode) is the documented
+// form; this SDK's NUMA_NODE_RELATIONSHIP names the affinity GroupMask (a GroupCount + GroupMask/GroupMasks union)
+// and every layout of the struct keeps it at the same offset, so GroupMask reads across SDK generations.  The older
+// GetNumaNodeProcessorMaskEx is not used: on Win10 19044 it writes a bare GROUP_AFFINITY per node (observed), which
+// reads back as garbage through the documented struct.  A node spanning several processor groups reports its first
+// group only; the touchers still run on that node's cores, which is what first-touch needs.
+struct NumaWinTopology {
+    GROUP_AFFINITY ga[2];
+    bool two_nodes = false;
+    int nodes_seen = 0;   // RelationNumaNode entries of this host (0 and 1 are the ones placed)
+};
+NumaWinTopology numa_win_topology() {
+    NumaWinTopology topo;
+    DWORD need = 0;
+    std::vector<char> buf;
+    bool ok = false;
+    for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+        ok = GetLogicalProcessorInformationEx(RelationNumaNode,
+                                              reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+                                                  buf.empty() ? nullptr : buf.data()), &need) != 0;
+        if (!ok) {
+            if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || need == 0) return topo;
+            buf.resize(need);
+        }
+    }
+    if (!ok || buf.empty()) return topo;
+    bool filled[2] = {false, false};
+    for (DWORD at = 0; at < need; ) {
+        auto* it = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + at);
+        if (it->Size == 0 || at + it->Size > need) break;
+        if (it->Relationship == RelationNumaNode) {
+            ++topo.nodes_seen;
+            const DWORD n = it->NumaNode.NodeNumber;   // file by NodeNumber: the entry order is not defined
+            if (n < 2 && it->NumaNode.GroupMask.Mask != 0) {
+                topo.ga[n] = it->NumaNode.GroupMask;
+                filled[n] = true;
+            }
+        }
+        at += it->Size;
+    }
+    topo.two_nodes = filled[0] && filled[1];
+    return topo;
+}
+
+// STRATA_NUMA_ARENA=1 (the env the Linux slice placement of #6529 uses; the code paths are OS-disjoint): whether
+// the placement can run here - the switch set, a native layout it knows how to place, and two NUMA nodes.  Every
+// cost the switch carries (the large-page skip in reserve(), the 4 KB touch below) checks this, so a host or a
+// pack the placement cannot serve keeps its default path, large pages included.
+bool numa_arena_usable(uint64_t bytes) {
+    const char* env = std::getenv("STRATA_NUMA_ARENA");
+    if (env == nullptr || env[0] != '1' || bytes == 0) return false;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    return lay.native && lay.n_layers > 0 && lay.n_expert > 0 && lay.fmt.size() == (size_t) lay.n_layers &&
+           lay.total <= bytes && numa_win_topology().two_nodes;
+}
+
+// STRATA_NUMA_ARENA=1, the Windows twin of the Linux slice placement (#6529, from the Windows evidence in
+// Niko1221/Strata#6023 and mw00/project-maya#56): place Slice 0 and Slice 1 of every expert's [gate | up | down]
+// roles on NUMA nodes 0 and 1 BEFORE cudaHostRegister pins the pages.  Windows has no madvise/mempolicy; the
+// mechanism is the documented first-touch preference (a demand-zero page prefers the node of the CPU that faults
+// it, falling back to another node when that one runs out), reached through processor groups: SetThreadAffinityMask
+// cannot address a second group (36+36 logical CPUs make two on the measurement host), and the #56-era "first-touch
+// does not follow the touching thread" measurement was its pin masks collapsing into group 0 through exactly that
+// plus a wrong struct marshal.  Measured on 2x E5-2696 v3, Win10 19044 (#6023, 2026-11-22): placement follows the
+// touching thread at run granularity >= 128 KB (128 KB / 256 KB / 512 KB alternating blocks and contiguous halves
+// all land ~50/50 on a QueryWorkingSetEx scan, preserved through cudaHostRegister Portable|Mapped), below that the
+// first 2 MB follow it and the rest collapses onto one node.  The per-role halves this function touches are
+// ~256-307 KB, inside the working zone; 8 workers a node saturate the fault path (a 56.2 GiB arena places in 15 s).
+// Commit shape does not matter (one-shot commit, per-page VirtualAllocExNuma: identical distributions), so
+// reserve()'s allocation stays exactly as it is.
+//
+// Called from the first constructor and the Deferred one, whose arenas use the packed expert layout
+// expert_layout().blob_offset.  The ByNeed constructor is NOT called: pin-by-need pads every blob to a 4 KiB
+// stride (ArenaExpertSource's PadMap, so any set of blobs can register exactly) and moves the destination
+// offsets - placing the packed layout there would misplace every blob after the first one.
+void place_arena_numa_slices_win(void* base, uint64_t bytes, std::string& note) {
+    const char* env = std::getenv("STRATA_NUMA_ARENA");
+    if (env == nullptr || env[0] != '1' || base == nullptr || bytes == 0) return;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.n_layers <= 0 || lay.n_expert <= 0 || lay.fmt.size() != (size_t) lay.n_layers ||
+        lay.total > bytes) {
+        note += "; STRATA_NUMA_ARENA=1: the pack layout is not one this placement can serve (native expert blobs "
+                "required), the switch was ignored";
+        return;
+    }
+    const NumaWinTopology topo = numa_win_topology();
+    if (!topo.two_nodes) {
+        note += "; STRATA_NUMA_ARENA=1: one NUMA node (or the topology query failed), slice placement not needed";
+        return;
+    }
+    const char* extra_nodes = topo.nodes_seen > 2 ? "; more nodes seen, 0 and 1 placed" : "";
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr int kWorkersPerNode = 8;
+    constexpr uint64_t kPage = 4096;
+    std::atomic<int> pin_failures = 0;   // touchers that could not be pinned to their node's group
+    std::vector<std::thread> th;
+    th.reserve(2 * kWorkersPerNode);
+    bool spawned_all = true;
+    for (int k = 0; k < 2 && spawned_all; ++k) {
+        for (int w = 0; w < kWorkersPerNode && spawned_all; ++w) {
+            try {
+                th.emplace_back([base, &lay, k, w, &topo, &pin_failures]() {
+                    if (!SetThreadGroupAffinity(GetCurrentThread(), &topo.ga[(size_t) k], nullptr))
+                        ++pin_failures;
+                    // the same page math as the Linux twin: within each role, the page-aligned first half is
+                    // slice 0 (node 0) and the second half is slice 1 (node 1); a role's halves are ~256-307 KB
+                    for (int64_t l = w; l < lay.n_layers; l += kWorkersPerNode) {
+                        const auto& fm = lay.fmt[(size_t) l];
+                        const uint64_t blob = lay.blob_bytes(l);
+                        const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
+                        for (int64_t e = 0; e < lay.n_expert; ++e) {
+                            uint64_t start = lay.blob_offset(l, e);
+                            for (int r = 0; r < 3; ++r) {
+                                const uint64_t mid = start + per[r] / 2, end = start + per[r];
+                                const uint64_t lo = k == 0 ? (start & ~(kPage - 1)) : ((mid + kPage - 1) & ~(kPage - 1));
+                                const uint64_t hi = k == 0 ? ((mid + kPage - 1) & ~(kPage - 1)) : (end & ~(kPage - 1));
+                                for (uint64_t at = lo; at < hi; at += kPage)
+                                    ((volatile uint8_t*) base)[at] = 0;
+                                start = end;
+                            }
+                        }
+                    }
+                });
+            } catch (const std::exception&) {   // a worker could not start: join what exists and say the placement is partial
+                spawned_all = false;
+            }
+        }
+    }
+    for (auto& t : th) t.join();
+    // Touch the trailing spare blob so the entire arena is faulted before cudaHostRegister (a few pages, touched
+    // from the calling thread: far below the placement's own measurement noise)
+    for (uint64_t at = lay.total & ~(kPage - 1); at < bytes; at += kPage)
+        ((volatile uint8_t*) base)[at] = 0;
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    char msg[288];
+    const int failures = pin_failures.load(std::memory_order_relaxed);
+    if (!spawned_all || failures != 0)
+        std::snprintf(msg, sizeof msg,
+                      "; STRATA_NUMA_ARENA=1: WARNING: slice placement partial (%d toucher(s) off-node%s); "
+                      "the pages the missing workers own stay unpinned", failures,
+                      spawned_all ? "" : "; a worker could not start");
+    else
+        std::snprintf(msg, sizeof msg,
+                      "; NUMA slice-placed (STRATA_NUMA_ARENA=1: slice 0 -> node 0, slice 1 -> node 1 in %.2f s%s)", secs,
+                      extra_nodes);
+    note += msg;
+}
+#endif
+
 // pin_register for the arena's ranges.  Windows HIP: a range whose GPU alias covers memory in use is unregistered again and
 // reported as refused, so the caller's "the driver refused it" path applies to it (#3431).
 #if defined(__linux__)
@@ -786,7 +954,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
                          uint64_t shared_pack_hash) : capacity(bytes) {
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes,
+                      /*numa_placeable=*/true);
     if (!shared_file.empty() && base != nullptr && mapping_base != nullptr)
         shared_state = reinterpret_cast<std::atomic<uint64_t>*>(static_cast<char*>(mapping_base) +
                                                                 offsetof(SharedArenaHeader, reserved));
@@ -795,6 +964,13 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         mapping_bytes = bytes;
     }
 
+#if defined(_WIN32)
+    // STRATA_NUMA_ARENA=1 places the slices first: the twin touches every page from node-pinned threads, so the
+    // pages are resident when they register - the cost the comment below warns about, measured at ~90 ms per
+    // 512 MB in the M1 prototype; a partial tier pays it once at start and buys per-slice node locality for it.
+    if (base && shared_state == nullptr && backing == PageBacking::NormalPages)
+        place_arena_numa_slices_win(base, bytes, note);
+#endif
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
     if (base && arena_no_register()) {
@@ -923,7 +1099,8 @@ PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uin
                          uint64_t shared_pack_hash) : capacity(bytes) {
     by_need = true;
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes,
+                      /*numa_placeable=*/false);
     if (!shared_file.empty() && base != nullptr && mapping_base != nullptr)
         shared_state = reinterpret_cast<std::atomic<uint64_t>*>(static_cast<char*>(mapping_base) +
                                                                 offsetof(SharedArenaHeader, reserved));
@@ -932,6 +1109,7 @@ PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uin
         mapping_bytes = bytes;
     }
     if (base == nullptr) return;
+    // (No slice placement here: the ByNeed arena may be padded per blob - see place_arena_numa_slices_win.)
     // Register BEFORE any page is touched (see the first constructor).  Same caps as there: the engine's
     // `max_pinned_bytes`, else STRATA_ARENA_PIN_GIB=N (> 0); "auto" (-2) is the sliced pin's and does not apply.
     const int env_gib = arena_pin_cap_gib();
@@ -1016,11 +1194,18 @@ PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uin
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, Deferred)
     : capacity(bytes), bounds_(bounds) {
     if (bytes == 0 || bounds.size() < 2) return;
-    base = reserve(bytes, backing, note, std::string{}, 0, mapping_base, mapping_bytes);
+    base = reserve(bytes, backing, note, std::string{}, 0, mapping_base, mapping_bytes,
+                   /*numa_placeable=*/true);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
     }
+#if defined(_WIN32)
+    // Slice placement before the per-layer registration pipeline faults anything (see the first constructor).
+    // No shared_state check: this constructor takes no shared file, the arena is always process-private.
+    if (base && backing == PageBacking::NormalPages)
+        place_arena_numa_slices_win(base, bytes, note);
+#endif
     slice_bytes = 1;   // sliced: one registration per layer
 }
 

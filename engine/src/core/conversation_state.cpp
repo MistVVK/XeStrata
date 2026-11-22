@@ -620,10 +620,19 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     if (!live_saved) return false;
     const auto p3 = now();
     const int64_t upto = (int64_t) view.ids.size();
-    // STRATA_PARK_ASYNC: the K/V bytes these saves copy (the stage they need; an over-estimate by the kept prefix)
+    // STRATA_PARK_ASYNC / STRATA_PARK_VRAM_MIB: size the VRAM stage by device-resident bytes only.
+    // Under streamed KV (kv_mode != 0), parts 0..3 live in st.host.* and are never staged in VRAM;
+    // only part 4 (idx_pooled, or 0 for the draft layer) is device-resident, avoiding ~9x VRAM over-reservation.
     size_t kv_need = 0;
-    for (size_t j = 0; j < layers; ++j) kv_need += conversation_kv_bytes(owned(ss, j), g, upto, true);
-    if (draft) kv_need += conversation_kv_bytes(*draft, g, upto, false);
+    auto stage_bytes = [&](const QsaState& q, bool idx) -> size_t {
+        if (q.kv_mode == 0) return conversation_kv_bytes(q, g, upto, idx);
+        std::array<uint64_t, 5> parts{};
+        std::string ignore;
+        if (conversation_kv_part_sizes(q, g, upto, idx, parts, ignore)) return (size_t) parts[4];
+        return conversation_kv_bytes(q, g, upto, idx);
+    };
+    for (size_t j = 0; j < layers; ++j) kv_need += stage_bytes(owned(ss, j), true);
+    if (draft) kv_need += stage_bytes(*draft, false);
     const bool staged = conversation_park_async_begin(kv_need);
     const auto p4 = now();
     struct Abandon { bool on; ~Abandon() { if (on) conversation_park_async_abandon(); } } abandon{staged};
