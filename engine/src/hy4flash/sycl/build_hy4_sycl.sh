@@ -54,8 +54,9 @@ g++ -O3 -march=native -std=c++17 -fPIC $INC -c "$REPO_ROOT/engine/src/quant/sk_c
 g++ -O3 -std=c++17 -fPIC $INC -c "$REPO_ROOT/engine/src/ngram/hy4_engram_reader.cpp" -o "$OBJ_DIR/hy4_engram_reader.o"
 g++ -O3 -std=c++17 -fPIC $INC -c "$REPO_ROOT/engine/src/hy4flash/run/hy4_engram.cpp" -o "$OBJ_DIR/hy4_engram.o"
 g++ -O3 -std=c++17 -fPIC -pthread $INC -c "$REPO_ROOT/engine/src/hy4flash/run/hy4_cpu_experts.cpp" -o "$OBJ_DIR/hy4_cpu_experts.o"
+g++ -O3 -std=c++17 -fPIC -pthread $INC -c "$REPO_ROOT/engine/src/hy4flash/run/hy4_cpu_k512.cpp" -o "$OBJ_DIR/hy4_cpu_k512.o"
 
-HOST_OBJS="$OBJ_DIR/strata_reader.o $OBJ_DIR/sk_codecs.o $OBJ_DIR/hy4_engram_reader.o $OBJ_DIR/hy4_engram.o $OBJ_DIR/hy4_cpu_experts.o"
+HOST_OBJS="$OBJ_DIR/strata_reader.o $OBJ_DIR/sk_codecs.o $OBJ_DIR/hy4_engram_reader.o $OBJ_DIR/hy4_engram.o $OBJ_DIR/hy4_cpu_experts.o $OBJ_DIR/hy4_cpu_k512.o"
 LIBS="${ZSTD_LIBS:--L/usr/lib/x86_64-linux-gnu -l:libzstd.so.1} -lpthread -lm"
 
 echo "== Building strata-hy4-sycl ($ARCH_MODE, onemkl=$([ -n "$MKL_FLAGS" ] && echo 1 || echo 0)) =="
