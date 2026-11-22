@@ -10814,7 +10814,7 @@ def main() -> int:
         # a model of PLAIN_FAMILIES this PC runs needs none of that RAM: the one asked for, else one of FIRST_CHOICE
         # (Qwen3.5-2B the last, its weights in VRAM); then the stop waits for a Flash-Next family chosen in step 2
         plain_ok = any(runs_here(f, room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]]))
-                       for f in ([a.family] if a.family else [f for f, _ in FIRST_CHOICE]) if f in PLAIN_FAMILIES)
+                       for f in ([a.family] if a.family else [f for f, *_ in FIRST_CHOICE]) if f in PLAIN_FAMILIES)
         if ram < need - 4 and not a.check and not low_ok and not plain_ok:
             setup_ram_stop(a.family, ram, need)
         if a.ram_reserve_gib:
