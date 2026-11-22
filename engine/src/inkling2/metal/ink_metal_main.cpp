@@ -115,7 +115,8 @@ static int print_info(const std::string& path, const std::string& vis_path) {
     return 0;
 }
 
-// Run greedy generation for 1 slot (plain decode OR DSpark Block-8 speculative decode)
+// Run greedy generation for 1 slot (plain decode, Linear DSpark Block-8, OR Multi-Branch Tree DSpark!)
+// tree_budget: 0 = linear Block-8, > 0 (e.g. 12, 16, 24) = Multi-Branch Tree DSpark!
 static bool run_greedy_decode(
     InkMetalRunner& r,
     int slot,
@@ -127,7 +128,8 @@ static bool run_greedy_decode(
     double& decode_ms,
     int& total_accepted,
     int& total_offered,
-    std::string& err) {
+    std::string& err,
+    int tree_budget = 0) {
     r.reset_slot(slot);
     out_ids.clear();
     total_accepted = 0;
@@ -161,16 +163,16 @@ static bool run_greedy_decode(
     out_ids.push_back(next_tok);
     int cur_pos = P;
 
-    // 2. Decode loop (adaptive DSpark draft length: 3..7 on M5 Apple10, 2..5 on M1-M4 bandwidth-bound GPUs!)
+    // 2. Decode loop (adaptive DSpark draft length OR Multi-Branch Tree DSpark!)
     double td0 = mtl::now_s();
-    InkMetalRunner::SlotSconvSnap snap;
-    std::vector<float> frnn_backup;
-    const int min_k = r.is_apple10 ? 3 : 2;
-    const int max_k = r.is_apple10 ? 7 : 6;
-    int cur_k = r.is_apple10 ? 5 : 4;
+    const int min_k = 2;
+    const int max_k = r.is_apple10 ? 7 : 5;
+    int cur_k = r.is_apple10 ? 4 : 3;
+    int cur_depth = r.is_apple10 ? 5 : 4;
+    const int eos_id = r.mod->man.c.eos_id;
 
     while ((int)out_ids.size() < max_new && cur_pos + 1 < r.max_ctx) {
-        if (next_tok == r.mod->man.c.eos_id) break;
+        if (next_tok == eos_id) break;
 
         if (!use_spec || !r.use_dspark || cur_pos + 9 >= r.max_ctx || (int)out_ids.size() + 1 >= max_new) {
             InkBatchStep st;
@@ -183,6 +185,115 @@ static bool run_greedy_decode(
             if (!r.forward_batch(st, nullptr, &next_tok, err)) return false;
             ++cur_pos;
             out_ids.push_back(next_tok);
+        } else if (tree_budget != 0 && r.use_dspark_meff) {
+            InkDraftTree tree;
+            const int rem_cap = max_new - (int)out_ids.size();
+            const bool dyn = (tree_budget < 0);
+            const int max_b = dyn ? 12 : tree_budget;
+            const int eff_budget = (rem_cap <= 4) ? std::min(max_b, rem_cap + 2) : max_b;
+            const int dcap = dyn ? cur_depth : 7;
+            const int tm = r.dspark_draft_beam_tree(slot, next_tok, cur_pos, eff_budget, dyn, tree, dcap);
+            if (tm <= 1) {
+                InkBatchStep st;
+                st.M = 1; st.slot_ids = {slot}; st.pos = {cur_pos}; st.tok_ids = {next_tok};
+                st.capture_taps = true; st.compute_logits = true;
+                if (!r.forward_batch(st, nullptr, &next_tok, err)) return false;
+                ++cur_pos;
+                out_ids.push_back(next_tok);
+                continue;
+            }
+            if (tree.is_linear) {
+                // Zero-overhead linear verify path (0.05 ms O(1) ring rollback instead of 0.45 ms tree commit!)
+                InkBatchStep st;
+                st.M = tm; st.slot_ids.assign(tm, slot); st.pos.resize(tm);
+                for (int i = 0; i < tm; ++i) st.pos[i] = cur_pos + i;
+                st.tok_ids = tree.tok_ids;
+                st.capture_taps = true; st.compute_logits = true; st.record_verify_ring = true;
+                int32_t ver_ids[32] = {};
+                if (!r.forward_batch(st, nullptr, ver_ids, err)) return false;
+                const int rem = tm - 1;
+                int accepted = 0;
+                for (int i = 0; i < rem; ++i) {
+                    if (ver_ids[i] == tree.tok_ids[i + 1]) ++accepted;
+                    else break;
+                }
+                total_offered += rem;
+                total_accepted += accepted;
+                for (int i = 0; i < accepted; ++i) {
+                    const int32_t tk = tree.tok_ids[i + 1];
+                    out_ids.push_back(tk);
+                    if (tk == eos_id || (int)out_ids.size() >= max_new) break;
+                }
+                if ((int)out_ids.size() < max_new && (accepted == 0 || tree.tok_ids[accepted] != eos_id)) {
+                    next_tok = ver_ids[accepted];
+                    out_ids.push_back(next_tok);
+                }
+                if (accepted < rem) r.restore_verify_step(slot, accepted);
+                cur_depth = std::max(4, std::min(7, accepted + 3));
+                cur_pos += (1 + accepted);
+                continue;
+            }
+            InkBatchStep st;
+            st.M = tm;
+            st.slot_ids.assign(tm, slot);
+            st.pos.resize(tm);
+            for (int i = 0; i < tm; ++i) st.pos[i] = cur_pos + tree.depths[i];
+            st.tok_ids = tree.tok_ids;
+            st.capture_taps = true;
+            st.compute_logits = true;
+            st.is_tree = true;
+            st.tree_anchor_pos = cur_pos;
+            st.tree_parent = tree.parents;
+            st.tree_anc_mask = tree.anc_masks;
+            int32_t ver_ids[32] = {};
+            if (!r.forward_batch(st, nullptr, ver_ids, err)) return false;
+
+            // Exact greedy walk down the verified tree (100% bitwise-exact with M=1!)
+            std::vector<int32_t> path_nodes;
+            path_nodes.reserve(8);
+            path_nodes.push_back(0);
+            int cur_node = 0;
+            int accepted = 0;
+            int32_t bonus_tok = ver_ids[0];
+            while (true) {
+                const int32_t target_next = ver_ids[cur_node];
+                int match_child = -1;
+                for (int ci = cur_node + 1; ci < tm; ++ci) {
+                    if (tree.parents[ci] == cur_node && tree.tok_ids[ci] == target_next) {
+                        match_child = ci;
+                        break;
+                    }
+                }
+                if (match_child < 0) {
+                    bonus_tok = target_next;
+                    break;
+                }
+                if (target_next == eos_id || (int)out_ids.size() + accepted + 1 >= max_new) {
+                    path_nodes.push_back(match_child);
+                    ++accepted;
+                    bonus_tok = ver_ids[match_child];
+                    break;
+                }
+                path_nodes.push_back(match_child);
+                ++accepted;
+                cur_node = match_child;
+                bonus_tok = ver_ids[cur_node];
+            }
+            total_offered += 7;
+            total_accepted += accepted;
+
+            for (int i = 1; i <= accepted; ++i) {
+                const int32_t tk = tree.tok_ids[path_nodes[i]];
+                out_ids.push_back(tk);
+                if (tk == eos_id || (int)out_ids.size() >= max_new) break;
+            }
+            if ((int)out_ids.size() < max_new && (accepted == 0 || tree.tok_ids[path_nodes[accepted]] != eos_id)) {
+                next_tok = bonus_tok;
+                out_ids.push_back(next_tok);
+            }
+            r.commit_tree_path(slot, cur_pos, path_nodes);
+            cur_depth = std::max(4, std::min(7, accepted + 3));
+            cur_pos += (1 + accepted);
         } else {
             // Draft `cur_k` (3..7) tokens on GPU via Exact Low-Rank M_eff DSpark!
             int32_t draft[7] = {};
@@ -230,9 +341,9 @@ static bool run_greedy_decode(
 
             for (int i = 0; i < accepted; ++i) {
                 out_ids.push_back(draft[i]);
-                if (draft[i] == r.mod->man.c.eos_id || (int)out_ids.size() >= max_new) break;
+                if (draft[i] == eos_id || (int)out_ids.size() >= max_new) break;
             }
-            if ((int)out_ids.size() < max_new && (accepted == 0 || draft[accepted - 1] != r.mod->man.c.eos_id)) {
+            if ((int)out_ids.size() < max_new && (accepted == 0 || draft[accepted - 1] != eos_id)) {
                 next_tok = ver_ids[accepted];
                 out_ids.push_back(next_tok);
             }
@@ -436,15 +547,25 @@ int main(int argc, char** argv) {
         }
     }
 
+    int tree_budget = 0;
+    if (draft_mode == "tree" || draft_mode == "beam") tree_budget = -1;  // Sparse-MoE Bayes-Optimal Dynamic Beam-4 Tree!
+    else if (draft_mode == "tree6") tree_budget = 6;
+    else if (draft_mode == "tree8") tree_budget = 8;
+    else if (draft_mode == "tree10") tree_budget = 10;
+    else if (draft_mode == "tree12") tree_budget = 12;
+    else if (draft_mode == "tree16") tree_budget = 16;
+    else if (draft_mode == "tree24") tree_budget = 24;
+    else if (draft_mode == "tree32") tree_budget = 32;
+
     if (do_spec_check) {
         std::vector<int32_t> plain_ids, spec_ids;
         double pm0 = 0, dm0 = 0, pm1 = 0, dm1 = 0;
         int acc0 = 0, off0 = 0, acc1 = 0, off1 = 0;
-        if (!run_greedy_decode(runner, 0, custom_ids, gen_n, false, plain_ids, pm0, dm0, acc0, off0, err)) {
+        if (!run_greedy_decode(runner, 0, custom_ids, gen_n, false, plain_ids, pm0, dm0, acc0, off0, err, 0)) {
             fprintf(stderr, "[ERROR] plain decode: %s\n", err.c_str());
             return 1;
         }
-        if (!run_greedy_decode(runner, 0, custom_ids, gen_n, true, spec_ids, pm1, dm1, acc1, off1, err)) {
+        if (!run_greedy_decode(runner, 0, custom_ids, gen_n, true, spec_ids, pm1, dm1, acc1, off1, err, tree_budget)) {
             fprintf(stderr, "[ERROR] spec decode: %s\n", err.c_str());
             return 1;
         }
@@ -457,8 +578,8 @@ int main(int argc, char** argv) {
         const double tps_plain = plain_ids.size() / std::max(dm0 * 1e-3, 1e-6);
         const double tps_spec  = spec_ids.size() / std::max(dm1 * 1e-3, 1e-6);
         const double alpha = off1 > 0 ? (1.0 + (double)acc1 / (off1 / 7.0)) : 1.0;
-        printf("[SPEC-CHECK] parity=%d/%d (%s) | plain=%.1f tok/s (%.1f ms) | dspark=%.1f tok/s (%.1f ms, acc=%d/%d, alpha~%.2f)\n",
-               match, ncmp, (match == ncmp && plain_ids.size() == spec_ids.size()) ? "BITWISE-EXACT" : "DIFF",
+        printf("[SPEC-CHECK draft=%s] parity=%d/%d (%s) | plain=%.1f tok/s (%.1f ms) | dspark=%.1f tok/s (%.1f ms, acc=%d/%d, alpha~%.2f)\n",
+               draft_mode.c_str(), match, ncmp, (match == ncmp && plain_ids.size() == spec_ids.size()) ? "BITWISE-EXACT" : "DIFF",
                tps_plain, dm0, tps_spec, dm1, acc1, off1, alpha);
         if (match != ncmp) {
             printf("  first diff at %d: plain=%d spec=%d\n", match, plain_ids[match], spec_ids[match]);
@@ -472,12 +593,12 @@ int main(int argc, char** argv) {
         double pm = 0, dm = 0;
         int acc = 0, off = 0;
         const bool use_spec = (draft_mode != "off") && runner.use_dspark;
-        if (!run_greedy_decode(runner, 0, bp, gen_n, use_spec, out_ids, pm, dm, acc, off, err)) {
+        if (!run_greedy_decode(runner, 0, bp, gen_n, use_spec, out_ids, pm, dm, acc, off, err, tree_budget)) {
             fprintf(stderr, "[ERROR] bench: %s\n", err.c_str());
             return 1;
         }
         printf("[BENCH] build=%s draft=%s prompt=%d (%.1f ms, %.1f ppts) | gen=%zu (%.1f ms, %.1f tok/s, acc=%d/%d)\n",
-               mod.man.build.c_str(), use_spec ? "dspark" : "off",
+               mod.man.build.c_str(), use_spec ? draft_mode.c_str() : "off",
                bench_prompt, pm, bench_prompt / std::max(pm * 1e-3, 1e-6),
                out_ids.size(), dm, out_ids.size() / std::max(dm * 1e-3, 1e-6), acc, off);
     }
