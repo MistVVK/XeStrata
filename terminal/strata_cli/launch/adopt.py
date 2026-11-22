@@ -102,7 +102,9 @@ def plan(*, family: str, model: str, model_dir: Path, data_dir: Path, src: Path,
     mtp = Path(data_dir) / "mtp" / "rt"
     args = ["--pack", str(pack), "--native", str(shards[0])]
     if family != "unsloth" and not feed and (len(shards) > 1 or family == "gyro"):            # Gyro's one file holds the n-gram table too
-        args += ["--ple-gguf", str(shards[-1])]      # (Unsloth's 3-6 shards: the engine finds the n-gram table by its tensor name, as setup.py writes the config; it is shard 2, 3 or the last one by set)
+        # Swift's n-gram table is in shard 1 (with layers 0-12), as setup.py finds it by tensor name; the last shard made the
+        # engine stop with "per_layer_token_embd.weight is not in ...". The other two-file sets keep it in shard 2.
+        args += ["--ple-gguf", str(shards[0] if family == "swift" else shards[-1])]      # (Unsloth's 3-6 shards: the engine finds the n-gram table by its tensor name, as setup.py writes the config; it is shard 2, 3 or the last one by set)
     if backend == "metal":
         # a Mac: the Metal defaults metal/setup_mac.py writes for a model that streams from the SSD (one token per step, no draft layer, the GGUF mapped in place)
         args += ["--expert-profile", str(profile), "--expert-cache", "64", "--prefill", "auto", "--spec", "2", "--suffix-draft", "0",

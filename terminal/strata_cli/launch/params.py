@@ -192,7 +192,7 @@ def build_rows(engine_help: str | None, base_args: list[Any], tuned_args: list[A
         else:
             t = t if t is not None else ""
         shown = lambda v: "on" if v == "" and not is_env and name in (base if v is d else tuned) else v     # noqa: E731
-        y = extra.get(name, "")
+        y = ("on" if extra[name] == "" else extra[name]) if name in extra else ""
         # #5136: the engine reads environment settings that its --help does not list, so a name with no row here is not a typing
         # mistake, and its default is not known (the run config's value is shown when it has one).  Only a flag is checked.
         if p:

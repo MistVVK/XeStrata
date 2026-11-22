@@ -622,9 +622,17 @@ def _recheck(a: argparse.Namespace, machine: bool) -> int:
     stale = presets.staleness(preset, ident)
     if stale["state"] == "hard":
         return _fail("this PC changed too much for a re-check (" + "; ".join(stale["reasons"]) + "): tune again with strata tune auto", 5, machine)
-    engine_changed = int((preset.get("identity", {}).get("engine") or {}).get("tuning_epoch") or 0) != \
-        int((ident.get("engine") or {}).get("tuning_epoch") or 0)
-    opts = autotune.Options(use=(preset.get("choices") or {}).get("use", "chat"))
+    saved_choices = preset.get("choices") or {}
+    choices = presets.choices_from_config(cfg)
+    # The CLI can pick a benchmark goal that is not written into the model config.
+    choices["goal"] = saved_choices.get("goal", choices["goal"])
+    slot = presets.slot_key(choices, (ident.get("model") or {}).get("sha256_shard1"))
+    if preset.get("slot") != slot:
+        return _fail("these choices differ from the saved tuning: tune again or use the original choices", 5, machine)
+    old_identity = preset.get("identity") or {}
+    compare_baseline = (presets.engine_changed(old_identity.get("engine") or {}, ident.get("engine") or {})
+                        or old_identity.get("memory_policy") != ident.get("memory_policy"))
+    opts = autotune.Options(use=saved_choices.get("use", "chat"))
     ctx = autotune.context_from_config(cfg, engine_backend=(ident.get("engine") or {}).get("backend"), opts=opts,
                                        engine_flags=tuning.engine_flag_inventory(
                                            Path(exe), wanted=tuning.dimension_flags() | tune_knobs.arm_flags()))
@@ -641,7 +649,7 @@ def _recheck(a: argparse.Namespace, machine: bool) -> int:
         _write_status(a.status_file, state)
         say(p["message"])
 
-    out = autotune.recheck(session, [str(x) for x in cfg.get("args") or []], preset, ctx=ctx, engine_changed=engine_changed,
+    out = autotune.recheck(session, [str(x) for x in cfg.get("args") or []], preset, ctx=ctx, engine_changed=compare_baseline,
                            progress=progress)
     out["identity"] = ident
     updated = presets.record_recheck(preset["id"], out)

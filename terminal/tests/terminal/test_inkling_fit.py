@@ -98,9 +98,11 @@ class TestInklingFitAndHardwareSelection(unittest.TestCase):
         self.assertEqual(shape_engine.exe_name("inkling2", target="linux-aarch64"), "strata-inkling")
         self.assertEqual(shape_engine.exe_name("inkling2", target="macos-arm64"), "strata-inkling")
         self.assertEqual(shape_engine.exe_name("inkling2", target="windows-x86_64"), "strata-inkling.exe")
+        import json
         from strata_cli.launch import harness
         t = harness.Target("http://127.0.0.1:8080", "strata-local", "inkling-2-mini-sq-20", 32768)
-        self.assertIn('"reasoning": false', harness.opencode_file(t))
+        oc_ink = json.loads(harness.opencode_file(t))
+        self.assertFalse(oc_ink["providers"]["strata"]["models"]["inkling-2-mini-sq-20"]["capabilities"]["reasoning"]["supported"])
         self.assertIn("reasoning: false", harness.omp_models(t))
         self.assertIn("defaultThinkingLevel: off", harness.omp_config(t))
         self.assertIn('"defaultThinkingLevel": "off"', harness.pi_settings(t))

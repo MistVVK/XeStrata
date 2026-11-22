@@ -1386,6 +1386,34 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(runtime._child_present({"pid": 4242, "started": 7}, written=1000.0) is True, "a recorded creation time decides by itself")
             self.assertTrue(runtime._child_present(child), "no marker time: unchanged")
 
+    def test_a_creation_time_from_before_the_last_boot_names_a_gone_process(self):
+        # 2026-11-20: a launch was left running across a restart. Its marker recorded the server's PID and creation time;
+        # after the restart the number belonged to a process the user could not open, pid_alive() took the refusal as
+        # "present", and every launch and stop said "lost host child is still present" until the marker was moved by hand.
+        boot = 134_396_000_000_000_000
+        slack = runtime.winproc._BOOT_SLACK
+        self.assertTrue(runtime.winproc.created_before_boot(boot - 3_600 * 10_000_000, boot), "an hour before the boot")
+        self.assertFalse(runtime.winproc.created_before_boot(boot + 10_000_000, boot), "after the boot: could be live")
+        self.assertFalse(runtime.winproc.created_before_boot(boot - slack + 1, boot), "inside the clock slack: keep refusing")
+        for started, booted in ((None, boot), (boot - 2 * slack, None), (0, boot), (-1, boot), (True, boot), (1.5, boot)):
+            with self.subTest(started=started, boot=booted):
+                self.assertFalse(runtime.winproc.created_before_boot(started, booted), "unknown: never guess")
+
+    @unittest.skipUnless(WINDOWS, "pid_alive() reads Windows process handles")
+    def test_a_refused_pid_recorded_before_the_last_boot_is_not_alive(self):
+        boot = runtime.winproc.boot_time()
+        self.assertIsNotNone(boot)
+        self.assertLess(boot, runtime.winproc.process_started(os.getpid()), "this process started after the boot")
+        k32 = mock.Mock()
+        k32.OpenProcess.return_value = 0                                 # refused, as for a protected process
+        with mock.patch.object(runtime.winproc, "process_started", return_value=None), \
+                mock.patch.object(runtime.winproc, "boot_time", return_value=boot), \
+                mock.patch.object(runtime.winproc, "_k32", k32), \
+                mock.patch.object(runtime.winproc.ctypes, "get_last_error", return_value=runtime.winproc._ERROR_ACCESS_DENIED):
+            self.assertFalse(runtime.winproc.pid_alive(4242, boot - 3_600 * 10_000_000), "recorded before the boot: gone")
+            self.assertTrue(runtime.winproc.pid_alive(4242, boot + 10_000_000), "recorded after the boot: keep refusing")
+            self.assertTrue(runtime.winproc.pid_alive(4242, None), "no creation time: keep refusing")
+
     def test_a_marker_left_by_a_killed_app_is_cleaned_up_when_its_number_belongs_to_a_later_program(self):
         victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
         try:

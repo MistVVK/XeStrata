@@ -1759,6 +1759,18 @@ class Runner:
         tag = cat.tag_of(s.family, s.model)
         data_dir = Path(s.data_dir) if s.data_dir else cat.data_dir()
         model_dir = Path(s.model_path) if s.model_path else data_dir / "models" / (fam.get("tag", "") + s.model)
+        if not s.model_path and not model_dir.is_dir():
+            # A previous --model-path launch saved the files' own folder in the installed config; reuse it when re-launched without --model-path.
+            installed = cat.installed_config(tag)
+            if installed is not None:
+                try:
+                    prev_args = [str(a) for a in read_config(installed).get("args") or []]
+                    if "--native" in prev_args and prev_args.index("--native") + 1 < len(prev_args):
+                        prev_dir = Path(prev_args[prev_args.index("--native") + 1]).parent
+                        if prev_dir.is_dir():
+                            model_dir = prev_dir
+                except Exception:                            # noqa: BLE001
+                    pass
         if model_dir.is_file():
             model_dir = model_dir.parent
         try:
