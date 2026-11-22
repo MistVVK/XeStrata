@@ -475,8 +475,8 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         }
 
         rq.prompt_len = static_cast<int>(rq.prompt_ids.size());
-        if (rq.prompt_len <= 0 || rq.prompt_len >= cfg.bopts.max_ctx) {
-            err = "prompt length out of range (1.." + std::to_string(cfg.bopts.max_ctx - 1) + ")";
+        if (rq.prompt_len <= 0 || rq.prompt_len >= eff_max_ctx) {
+            err = "prompt length out of range (1.." + std::to_string(eff_max_ctx - 1) + ")";
             rq.active = false;
             return false;
         }
@@ -508,7 +508,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         if (line == "QUIT") { quit_requested = true; return false; }
         if (line == "HELLO") {
             proto("HELLO ok engine=strata-inkling-%s arch=inkling2_loop backend=%s max_ctx=%d parallel=%d",
-                  cfg.version.c_str(), backend.backend_name(), cfg.bopts.max_ctx, P);
+                  cfg.version.c_str(), backend.backend_name(), eff_max_ctx, P);
             return true;
         }
         if (line == "STATS") {

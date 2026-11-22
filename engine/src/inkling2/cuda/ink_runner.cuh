@@ -775,8 +775,9 @@ struct InkCudaModel {
         const std::string& layer_split_spec = "",
         int cpu_threads = 0) {
         // Fast zero-overhead path for single-GPU .strata v1.1!
+        const bool is_strata_fmt = (mf.m.format.rfind("strata", 0) == 0);
         const bool single_gpu_req = (gpu1 < 0) && (all_gpus.size() <= 1) && layer_split_spec.empty();
-        if (mf.m.format == "strata" && single_gpu_req) {
+        if (is_strata_fmt && single_gpu_req) {
             return load(mf.path, gpu0, build_screen, err, extra_reserve_bytes, vram_experts_gb, ram_experts_gb, ssd_experts, cpu_threads);
         }
 
@@ -1290,7 +1291,7 @@ struct InkCudaModel {
         uint8_t* h_arena_base = nullptr;
         if (uh > 0) {
             const size_t ram_cap = safe_host_ram_cap(ram_experts_gb, ssd_experts);
-            if (ram_cap < uh && mf.m.format != "strata") {
+            if (ram_cap < uh && !is_strata_fmt) {
                 std::fprintf(stderr, "[InkCUDA] Note: GGUF/HF host spill %.2f GiB exceeds soft RAM cap %.2f GiB (allocating pageable host arena)\n",
                              (double)uh / 1073741824.0, (double)ram_cap / 1073741824.0);
             }
