@@ -6969,20 +6969,27 @@ def kv_streaming_need_gb(model, ctx, kv) -> float:
     for the engine (Linux mimic): streaming gave 756 -> 1,267 expert slots and a 32K prompt in 12-17 s instead of
     21-34 s, with the RAM the engine used unchanged (RAM budget 31 -> 29 GiB); on the owner's RTX 5070 (R5070's
     run) 924 -> 1,585 slots, a 32K prompt 130 -> 79 s, the RAM copy 30.8 -> 28.9 GiB, no paging.  Rule (1) alone
-    asked 64.8 GB of a PC that reads 63.1 and left the KV in VRAM."""
+    asked 64.8 GB of a PC that reads 63.1 and left the KV in VRAM.
+    #6354: Unsloth budget-mode quants subtract KV RAM from --resident-budget-gib, so streaming works cleanly from
+    16 GB RAM up (keeping 12 GB OS headroom + KV RAM)."""
     kv_gb = kv_streaming_ram_gb(ctx, kv)
     m = MODELS[model]
+    if m.get("budget"):
+        return max(16.0, LOW_RAM_HEADROOM_GB + kv_gb + 4.0)
     return min(m["ram_gb"] + kv_gb + 1, m["arena_gb"] + LOW_RAM_HEADROOM_GB + kv_gb)
 
 
-def kv_streaming_wanted(model, ctx, kv, ram, choice="auto") -> bool:
-    """Will setup stream this model's KV cache on this PC: from 64K up, when the RAM holds the cache beside the
-    model's experts (`kv_streaming_need_gb`); `--kv-streaming on|off` overrides the RAM test (the owner's rule), and
-    WSL never streams.  Step 7 writes `--kv-resident` on exactly this answer, and the launcher's preset diff asks it
-    too: a config's `--kv-resident` and a preset's "auto" are the same setting when this says yes."""
+def kv_streaming_wanted(model, ctx, kv, ram, choice="auto", vram_gb: float = 0.0) -> bool:
+    """Will setup stream this model's KV cache on this PC: from 64K up (and from 32K up on <= 16 GB discrete GPUs
+    for Unsloth budget-mode quants per #6354), when the RAM holds the cache beside the model's experts
+    (`kv_streaming_need_gb`); `--kv-streaming on|off` overrides the RAM test (the owner's rule), and WSL never streams.
+    Step 7 writes `--kv-resident` on exactly this answer, and the launcher's preset diff asks it too: a config's
+    `--kv-resident` and a preset's "auto" are the same setting when this says yes."""
     if is_wsl() or choice == "off":
         return False
-    return ctx >= 65536 and (ram >= kv_streaming_need_gb(model, ctx, kv) or choice == "on")
+    m = MODELS.get(model, {})
+    min_ctx = 32768 if (m.get("budget") and 0 < float(vram_gb or 0.0) <= 16.5) else 65536
+    return ctx >= min_ctx and (ram >= kv_streaming_need_gb(model, ctx, kv) or choice == "on")
 
 
 def low_ram_one_gpu_why(model, ram, choice, sel=None) -> list[str]:
@@ -8700,9 +8707,11 @@ def unsloth_vram_slack_mib(vram_gb: float, ctx: int, kv: str, reserve_mib: int, 
 
 def unsloth_small_card_plan(vram_gb: float, ctx: int, kv: str, reserve_mib: int | None, ctx_fixed=False, kv_fixed=False,
                             runtime_mib: int = 0):
-    """(ctx, kv, mtp, slack_mib) of the least harmful start that the estimate says fits, or None when none does.
+    """(ctx, kv, mtp, slack_mib) of the least harmful start that fits on small discrete cards (4-9 GB).
     Order of harm: the KV in 4 bits, then a smaller context (down to 4608), then no draft layer on the GPU (decode
-    up to 2x slower, but 0.8 GB for the cache); a value the user chose (--context, --kv) is not changed."""
+    up to 2x slower, but 0.8 GB for the cache); a value the user chose (--context, --kv) is not changed.
+    For 4 GB and 6 GB GPUs (vram_gb >= 3.5), falls back cleanly to 0-slot / dense-streaming mode (slack_mib = 0.0,
+    mtp = False, int8/q4_0 KV) so the engine streams routed experts from RAM+SSD instead of refusing or OOMing."""
     reserve = UD_FIT_ENGINE_RESERVE_MIB if reserve_mib is None else reserve_mib
     ctxs = [ctx] if ctx_fixed else [ctx] + [c for c in UD_FIT_CTX_STEPS if c < ctx]
     kvs = [kv] if kv_fixed or kv == "q4_0" else [kv, "q4_0"]
@@ -8712,20 +8721,27 @@ def unsloth_small_card_plan(vram_gb: float, ctx: int, kv: str, reserve_mib: int 
                 slack = unsloth_vram_slack_mib(vram_gb, c, k, reserve, mtp, runtime_mib)
                 if slack >= UD_FIT_MIN_SLACK_MIB:
                     return c, k, mtp, slack
+    if float(vram_gb or 0.0) >= 3.5:
+        c0 = ctx if ctx_fixed else min(ctx, 8192 if vram_gb >= 5.5 else 4608)
+        k0 = kv if kv_fixed else ("int8" if vram_gb >= 5.5 else "q4_0")
+        return c0, k0, False, 0.0
     return None
 
 
 def unsloth_small_card_lines(model: str, vram_gb: float, plan, start_ok: bool) -> list[str]:
-    """The words for a ~8 GB card: that UD-* is very slow here and what to pick instead (always), and when the start
-    would have stopped, that and what setup changed instead.  Recommend, never force."""
+    """The words for a <= 8 GB card: explains 0-slot / dense-streaming on 4-6 GB cards or small cache on 8 GB cards
+    and what smaller quants run faster. Recommend, never force."""
+    if float(vram_gb or 0.0) < 7.0:
+        return [f"{model} on a {vram_gb:.0f} GB card uses 0-slot / dense-streaming mode: dense weights and KV stay in "
+                "VRAM while routed experts stream from RAM + SSD (no OOM, never refused). UD-IQ3_XXS or UD-IQ1_M "
+                "need far less RAM/SSD bandwidth on this tier."]
     lines = [f"{model} on a {vram_gb:.0f} GB card is very slow: the dense side and the draft layer fill the card, the expert "
              "cache gets a few slots, and nearly every expert comes from RAM or the SSD (3-5 tok/s measured on an 8 GB "
              "Arc A750). IQ3_XXS or IQ3_S of the Qwen3.8-Flash-Next family fit such a card far better; run setup again "
              "and pick one of them."]
     if not start_ok and plan is None:
         lines.append("By setup's estimate even a 4608 context with a 4-bit KV cache and no draft layer leaves no room "
-                     "for the expert cache on this card: the start will probably stop with \"no VRAM is left for the "
-                     "expert cache\".")
+                     "for the expert cache on this card: the start will use 0-slot dense-streaming mode.")
     return lines
 
 
@@ -11905,8 +11921,12 @@ def main() -> int:
         ok(f"rope scaling: {scaling}, factor {rope_scale:g} ({origin})")
     ok(f"context: {ctx} tokens")
     # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21).
-    # Track 6A: on <= 12.5 GB GPUs, default to int8 KV even at <= 8192 context (saves ~112 MiB VRAM for ExpertCache/DFlash2).
-    _low_vram_kv = 0 < float((gpu or {}).get("vram_gb") or 0.0) <= 12.5
+    # Track 6A + #6354: default to int8 KV on <= 12.5 GB GPUs (all models), on <= 16.5 GB GPUs (all Unsloth quants at
+    # any context: avoids 21-23% 16K/32K prompt slowdown and preserves 400+ VRAM expert slots), and on <= 24.5 GB GPUs
+    # at >= 64K context.
+    _vram_kv = float((gpu or {}).get("vram_gb") or 0.0)
+    _is_unsloth_kv = bool(MODELS.get(model, {}).get("budget"))
+    _low_vram_kv = (0 < _vram_kv <= 12.5) or (_is_unsloth_kv and ((0 < _vram_kv <= 16.5) or (0 < _vram_kv <= 24.5 and ctx >= 65536)))
     kv = (a.kv or "int8") if (ctx > 8192 or _low_vram_kv) else (a.kv or "fp16")
     if ctx > 8192 and not a.kv and not a.yes:
         say()

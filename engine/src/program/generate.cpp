@@ -1048,6 +1048,7 @@ struct Options {
     int64_t adapt_warm_rounds = 0;
     int adapt_iv(int64_t rounds) const { return adapt_warm_every > 0 && rounds < adapt_warm_rounds ? adapt_warm_every : adapt_every; }   ///< the interval in force at verify round `rounds`
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
+    bool adapt_decay_given = false;   ///< --adapt-decay was on the command line (#4870 coverage default does not override it)
     /// an expert is swapped into the VRAM tier only when its decayed routing count beats the one it replaces by more than
     /// this (--adapt-min-gain; both the blocking and the asynchronous tier)
     float adapt_min_gain = 1.5f;
@@ -4050,7 +4051,7 @@ int main(int argc, char** argv) {
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
-        else if (a == "--adapt-decay") o.adapt_decay = strata::program::adapt_decay_checked(std::atof(next("--adapt-decay")));   // #1284: outside 0..1 -> 0.7, said
+        else if (a == "--adapt-decay") { o.adapt_decay = strata::program::adapt_decay_checked(std::atof(next("--adapt-decay"))); o.adapt_decay_given = true; }   // #1284: outside 0..1 -> 0.7, said
         else if (a == "--adapt-min-gain") o.adapt_min_gain = (float) std::atof(next("--adapt-min-gain"));
         else if (a == "--adapt-async") { o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0; o.adapt_async_given = o.adapt_async; }
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
@@ -9127,7 +9128,18 @@ int main(int argc, char** argv) {
         if (use_df2 && native_head.loaded()) mtp_bind += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0);   // DFlash2's own draft head and logits (serve: and the prompt staging), bound after this
 #endif
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
-        const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
+        const int64_t max_blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
+        // Heterogeneous Unsloth packs (UD-Q4_K_XL, UD-IQ4_XS, UD-IQ3_XXS, etc.) mix ~5 MiB Q8_0 outlier layers with
+        // smaller K/IQ layers (1.3-3.1 MiB). Sizing auto slots from max_blob under-counts capacity by 40-150% and can
+        // push 6-12 GB cards below min_slots. Use the mean 256B-aligned layer blob when the pack is heterogeneous.
+        int64_t blob = max_blob;
+        if (native_pack && !profile.empty() && !o.expert_cache_per_layer && g.n_layers > 0) {
+            uint64_t sum_b = 0;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                sum_b += (((uint64_t) nib::slot_bytes(l) + 255ull) / 256ull) * 256ull;
+            const int64_t avg_blob = (int64_t) (sum_b / (uint64_t) g.n_layers);
+            if (avg_blob > 0 && avg_blob < max_blob) blob = avg_blob;
+        }
         // #496: the least a working cache needs (the verify window cannot start without one, #174): a cache too small to lend the prompt path a
         // 256-token chunk's buffers (plus the 128 slots a loan leaves; one slot without --prefill) makes it allocate its own on top
         int64_t min_slots = (o.prefill_chunk > 0 && pf_borrow)
@@ -9395,7 +9407,7 @@ int main(int argc, char** argv) {
         const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first +
                                  (auto_cache && post_cache_extra_b > 0 ? (size_t) post_cache_extra_b : 0);
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
-        const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
+        const uint64_t cap = auto_cache ? (uint64_t) free_room : std::min<uint64_t>(budget, (uint64_t) free_room);
         for (const auto& pr : profile) {
             const uint64_t b = (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) nib::slot_bytes(pr.first), slot_guard);
             if (used + b > cap) break;
@@ -12049,20 +12061,50 @@ int main(int argc, char** argv) {
                                     ? "A larger automatic RAM copy (the lend region comes after the ranked experts), or a smaller --prefill,"
                                     : "A larger --resident-budget-gib (the lend region comes after the ranked experts), or a smaller --prefill,")
                              : "A smaller --prefill, or auto,");
+        // Issue #4870: coverage-based adaptive tier defaults (15%..65% VRAM coverage -> 2 / 192 / 0.92 when not given).
+        // Apply before reserve_exchanges so resident RAM exchange buffers match the faster mid-coverage swap rate.
+        {
+            const int64_t total_pairs = g.n_layers * g.n_expert;
+            int64_t live_slots = xcache.slots();
+            for (const auto& stp : stages) live_slots += stp->cache.slots();
+            const double cov = total_pairs > 0 ? (double) live_slots / (double) total_pairs : 0.0;
+            if (o.adapt_every > 0 && o.adapt_swaps > 0 && live_slots > 0 && live_slots < total_pairs &&
+                cov >= 0.15 && cov <= 0.65) {
+                const int prev_ev = o.adapt_every, prev_sw = o.adapt_swaps;
+                const float prev_dc = o.adapt_decay;
+                if (!o.adapt_every_given) o.adapt_every = 2;
+                if (!o.adapt_swaps_given) o.adapt_swaps = 192;
+                if (!o.adapt_decay_given) o.adapt_decay = 0.92f;
+                if (o.adapt_every != prev_ev || o.adapt_swaps != prev_sw || o.adapt_decay != prev_dc)
+                    std::fprintf(stderr, "strata generate: #4870 mid-coverage expert cache (%lld of %lld slots, %.1f%%): "
+                                         "adaptive defaults every %d -> %d, swaps %d -> %d, decay %.2f -> %.2f\n",
+                                 (long long) live_slots, (long long) total_pairs, 100.0 * cov,
+                                 prev_ev, o.adapt_every, prev_sw, o.adapt_swaps, prev_dc, o.adapt_decay);
+            }
+        }
         if (resident_ok) {
             // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
             // page-locked (an asynchronous copy instead of the driver's staged, synchronous one)
-            if (o.adapt_async && !src.reserve_exchanges(2 * std::min<int64_t>(o.adapt_swaps, 96), err,
-                                                        std::min<int64_t>(o.adapt_swaps, 96)))
-                adapt_async_off(err.c_str());
+            const int64_t ex_want = std::min<int64_t>(o.adapt_swaps, 192);
+            if (o.adapt_async && !src.reserve_exchanges(2 * ex_want, err, ex_want)) {
+                if (ex_want > 96 && src.reserve_exchanges(2 * 96, err, 96)) {
+                    if (!o.adapt_swaps_given) o.adapt_swaps = 96;
+                } else {
+                    adapt_async_off(err.c_str());
+                }
+            }
             // pageable buffers would make every copy of a round synchronous (the driver stages them): that is the
             // blocking tier's cost, so the asynchronous tier is not worth running - said, and the blocking tier stays
             if (o.adapt_async && !src.exchange_pinned())
                 adapt_async_off("the exchange buffers could not be page-locked");
             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
-                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
-                std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
-                return 1;
+                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 192), err)) {
+                if (o.adapt_swaps > 96 && src.reserve_exchanges(96, err)) {
+                    if (!o.adapt_swaps_given) o.adapt_swaps = 96;
+                } else {
+                    std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
+                    return 1;
+                }
             }
             {
                 cudaDeviceProp ucp{};
@@ -14804,20 +14846,36 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON: a missed expert that every token of a verify window routes at rank %d or "
                                  "lower is skipped (answers differ slightly); it is off when STRATA_ROUTE_TAIL_SKIP is not set or is 0\n",
                          strata::core::tail_skip_rank(), strata::core::tail_skip_rank());
-        // Track 6A + #6509 (v0.2.20): tiny-cache (< 25% resident) anti-thrash dampening + Zipf-head profile pinning
-        // Applies to both single-GPU and multi-GPU layer splits (e.g. 2x 12 GB #6509 at ~16.6% total residency).
+        // Issue #4870 + Track 6A + #6509 (v0.2.20): coverage-based adaptive defaults.
+        // - Mid-coverage (15%..65% of total layer-experts): faster 2 / 192 / 0.92 curve (+8% hit rate, +10% decode tok/s)
+        //   when not explicitly overridden on the CLI.
+        // - Tiny-cache (< 15% resident): anti-thrash dampening via low_vram_adapt_swaps + Zipf-head profile pinning.
         const int64_t total_expert_pairs = g.n_layers * g.n_expert;
         int64_t live_gpu_slots = xcache.slots();
         for (const auto& stp : stages) live_gpu_slots += stp->cache.slots();
         {
-            const int damp = strata::core::low_vram_adapt_swaps(o.adapt_swaps, o.adapt_swaps_given, live_gpu_slots, total_expert_pairs);
-            if (damp != o.adapt_swaps) {
-                std::fprintf(stderr, "strata serve: tiny expert cache (%lld of %lld slots, %.1f%%): dampening adaptive swaps %d -> %d "
-                                     "to avoid PCIe thrashing (--adapt-swaps N overrides)\n",
-                             (long long) live_gpu_slots, (long long) total_expert_pairs,
-                             total_expert_pairs > 0 ? 100.0 * (double) live_gpu_slots / (double) total_expert_pairs : 0.0,
-                             o.adapt_swaps, damp);
-                o.adapt_swaps = damp;
+            const double cov = total_expert_pairs > 0 ? (double) live_gpu_slots / (double) total_expert_pairs : 0.0;
+            if (!all_experts_resident && live_gpu_slots > 0 && o.adapt_every > 0 && o.adapt_swaps > 0 &&
+                cov >= 0.15 && cov <= 0.65) {
+                const int prev_ev = o.adapt_every, prev_sw = o.adapt_swaps;
+                const float prev_dc = o.adapt_decay;
+                if (!o.adapt_every_given) o.adapt_every = 2;
+                if (!o.adapt_swaps_given) o.adapt_swaps = 192;
+                if (!o.adapt_decay_given) o.adapt_decay = 0.92f;
+                if (o.adapt_every != prev_ev || o.adapt_swaps != prev_sw || o.adapt_decay != prev_dc)
+                    std::fprintf(stderr, "strata serve: #4870 mid-coverage expert cache (%lld of %lld slots, %.1f%%): "
+                                         "adaptive defaults every %d -> %d, swaps %d -> %d, decay %.2f -> %.2f\n",
+                                 (long long) live_gpu_slots, (long long) total_expert_pairs, 100.0 * cov,
+                                 prev_ev, o.adapt_every, prev_sw, o.adapt_swaps, prev_dc, o.adapt_decay);
+            } else if (cov < 0.15) {
+                const int damp = strata::core::low_vram_adapt_swaps(o.adapt_swaps, o.adapt_swaps_given, live_gpu_slots, total_expert_pairs);
+                if (damp != o.adapt_swaps) {
+                    std::fprintf(stderr, "strata serve: tiny expert cache (%lld of %lld slots, %.1f%%): dampening adaptive swaps %d -> %d "
+                                         "to avoid PCIe thrashing (--adapt-swaps N overrides)\n",
+                                 (long long) live_gpu_slots, (long long) total_expert_pairs, 100.0 * cov,
+                                 o.adapt_swaps, damp);
+                    o.adapt_swaps = damp;
+                }
             }
         }
         std::vector<uint8_t> pinned_pair;
@@ -15430,7 +15488,7 @@ int main(int argc, char** argv) {
         // exchange buffers, no RAM moves (see a_arena below)
         const bool a_arena = srcp == &arena_src;
         // as the blocking tier's exchange buffers; the arena has none, so its rounds are as large as the blocking tier's
-        const int64_t a_cap = a_arena ? o.adapt_swaps : std::min<int64_t>(o.adapt_swaps, 96);
+        const int64_t a_cap = a_arena ? o.adapt_swaps : std::min<int64_t>(o.adapt_swaps, 192);
         const auto a_env = [](const char* name, int def) {
             const char* v = std::getenv(name);
             return v != nullptr && *v != 0 ? std::atoi(v) : def;
@@ -24388,6 +24446,19 @@ int main(int argc, char** argv) {
         const int64_t files0 = src.file_reads(), ram0 = src.ram_reads();
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
+        {
+            // Issue #4870: coverage-based adaptive defaults in non-serve decode path as well.
+            const int64_t total_pairs = g.n_layers * g.n_expert;
+            int64_t live_slots = xcache.slots();
+            for (const auto& stp : stages) live_slots += stp->cache.slots();
+            const double cov = total_pairs > 0 ? (double) live_slots / (double) total_pairs : 0.0;
+            if (o.adapt_every > 0 && o.adapt_swaps > 0 && live_slots > 0 && live_slots < total_pairs &&
+                cov >= 0.15 && cov <= 0.65) {
+                if (!o.adapt_every_given) o.adapt_every = 2;
+                if (!o.adapt_swaps_given) o.adapt_swaps = 192;
+                if (!o.adapt_decay_given) o.adapt_decay = 0.92f;
+            }
+        }
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         const char* fetch_off = d_res == nullptr ? "no residency table" : xcache.slots() <= 0 ? "0-slot expert cache" : o.spec_split ? "--spec-split"
                               : multi_gpu ? "a layer split" : drive.d.peer != nullptr ? "a peer tier"

@@ -21,7 +21,7 @@ macro(strata_quant_layer)
     # the x86 tiers: ggml's own x86 code ported, each file compiled with its flavour's instruction-set flags so the #if __AVX2__ / __AVX__ branches
     # select what ggml-cpu selects for that flavour (the release builds are AVX2; STRATA_ISA_FLOOR=avx is the AVX-only one)
     target_sources(strata_quant PRIVATE ${_sq}/src/quant/x86/dot_avx2.cpp ${_sq}/src/quant/x86/act_avx2.cpp ${_sq}/src/quant/x86/dot_avx.cpp
-                                       ${_sq}/src/quant/x86/act_avx.cpp ${_sq}/src/quant/x86/dot_avx512.cpp)
+                                       ${_sq}/src/quant/x86/act_avx.cpp ${_sq}/src/quant/x86/dot_avx512.cpp ${_sq}/src/quant/x86/act_avx512.cpp)
     target_compile_definitions(strata_quant PRIVATE STRATA_QUANT_X86_TIERS=1)
     if(MSVC)
       # MSVC contracts neither ggml-cpu's C nor these files' intrinsics (measured: 0 differences from its own ggml in all three flavours); the Windows bits
@@ -30,9 +30,9 @@ macro(strata_quant_layer)
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx2.cpp ${_sq}/src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx.cpp ${_sq}/src/quant/x86/act_avx.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
       if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/clang:-mavx512vnni")
+        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp ${_sq}/src/quant/x86/act_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/clang:-mavx512vnni")
       else()
-        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp ${_sq}/src/quant/x86/act_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
       endif()
     else()
       # What is pinned, and against what: the reference is ggml-cpu as GCC 13.3 builds it (C, gnu11, where GCC contracts a multiply and an add into an
@@ -49,7 +49,7 @@ macro(strata_quant_layer)
       # AVX2, FMA and F16C explicitly off: a -march=native build host must not leak wider code into the AVX-only tier
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx.cpp ${_sq}/src/quant/x86/act_avx.cpp PROPERTIES COMPILE_OPTIONS "-mavx;-mno-avx2;-mno-fma;-mno-f16c;-ffp-contract=fast")
       # the 512-bit kernels of the Avx2 contract: F/DQ/BW/VL + VNNI (what Isa::Avx512 means), called only behind caps()
-      set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS
+      set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp ${_sq}/src/quant/x86/act_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                   "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx2;-mfma;-mf16c;-ffp-contract=fast")
     endif()
   endif()

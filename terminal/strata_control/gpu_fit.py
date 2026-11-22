@@ -354,3 +354,310 @@ def ssd_streaming_plan(memory_gb: float, ram_gb: float | None, vram_gb: float | 
         "bounce_ring_gb": 0.0,
         "flags": ["--cpu", "--ssd-experts", "--ram-experts-gb", f"{lru_gb:g}"],
     }
+
+
+# ---- Qwen3.8 / Unsloth all-tier planner (discrete 4..32 GB + DGX Spark + Mac Metal + Strix Halo) -------------------------
+# Covers every Unsloth Dynamic quant (UD-Q4_K_XL, Q8_0, UD-IQ4_XS, UD-IQ3_XXS, UD-Q6_K_XL, UD-Q5_K_XL, UD-Q3_K_XL,
+# UD-Q2_K_XL, UD-IQ2_XXS, UD-IQ2_XS, UD-Q2_0, UD-IQ1_M, UD-IQ1_S) with heterogeneous expert sizing, #6354 auto int8 KV +
+# elastic --kv-resident, #4870 coverage-based adaptive defaults (2/192/0.92 at 15%-65% coverage), and clean 4 GB / 6 GB
+# discrete unlock (0-slot / dense-streaming / RAM+SSD cold tiers, never refusing or OOMing).
+UNSLOTH_TOTAL_EXPERT_PAIRS = 48 * 512     # 24,576 (layer, expert) pairs in Qwen3.8-Flash-Next
+UNSLOTH_MAX_EXPERT_MIB = 5.05             # worst-case Q8_0 outlier expert blob (used by uniform max_blob sizing)
+UNSLOTH_KV_BYTES_PER_TOK = {"fp16": 2112, "int8": 1056, "k8v4": 816, "q4_0": 576}   # 13 attention layers (12 QSA + draft)
+UNSLOTH_ADAPT_MIN_COV = 0.15              # #4870 lower coverage bound for fast adaptive tier
+UNSLOTH_ADAPT_MAX_COV = 0.65              # #4870 upper coverage bound for fast adaptive tier
+
+UNSLOTH_QUANTS: dict[str, dict[str, Any]] = {
+    "UD-IQ1_S":      {"arena_gb":  32.5, "download_gb":  65.8, "dense_gb": 3.2, "avg_expert_mib": 1.26, "max_expert_mib": 5.05},
+    "UD-IQ1_M":      {"arena_gb":  34.8, "download_gb":  68.0, "dense_gb": 3.2, "avg_expert_mib": 1.35, "max_expert_mib": 5.05},
+    "UD-Q2_0":       {"arena_gb":  37.4, "download_gb":  70.5, "dense_gb": 3.2, "avg_expert_mib": 1.45, "max_expert_mib": 5.05},
+    "UD-IQ2_XXS":    {"arena_gb":  39.8, "download_gb":  73.2, "dense_gb": 3.2, "avg_expert_mib": 1.54, "max_expert_mib": 5.05},
+    "UD-IQ2_XS":     {"arena_gb":  42.3, "download_gb":  75.8, "dense_gb": 3.2, "avg_expert_mib": 1.64, "max_expert_mib": 5.05},
+    "UD-Q2_K_XL":    {"arena_gb":  46.0, "download_gb":  79.6, "dense_gb": 3.3, "avg_expert_mib": 1.78, "max_expert_mib": 5.05},
+    "UD-IQ3_XXS":    {"arena_gb":  50.3, "download_gb":  83.6, "dense_gb": 3.3, "avg_expert_mib": 1.95, "max_expert_mib": 5.05},
+    "UD-Q3_K_XL":    {"arena_gb":  56.2, "download_gb":  89.5, "dense_gb": 3.4, "avg_expert_mib": 2.18, "max_expert_mib": 5.05},
+    "UD-IQ4_XS":     {"arena_gb":  59.5, "download_gb":  93.7, "dense_gb": 3.4, "avg_expert_mib": 2.31, "max_expert_mib": 5.05},
+    "UD-IQ4_XS-v31": {"arena_gb":  60.4, "download_gb":  93.7, "dense_gb": 3.4, "avg_expert_mib": 2.34, "max_expert_mib": 5.05},
+    "UD-Q4_K_XL":    {"arena_gb":  77.0, "download_gb": 111.3, "dense_gb": 3.5, "avg_expert_mib": 2.99, "max_expert_mib": 5.05},
+    "UD-Q5_K_XL":    {"arena_gb":  98.4, "download_gb": 158.3, "dense_gb": 3.6, "avg_expert_mib": 3.82, "max_expert_mib": 5.05},
+    "UD-Q6_K_XL":    {"arena_gb": 109.2, "download_gb": 169.2, "dense_gb": 3.6, "avg_expert_mib": 4.24, "max_expert_mib": 5.05},
+    "Q8_0":          {"arena_gb": 128.3, "download_gb": 188.2, "dense_gb": 3.8, "avg_expert_mib": 4.98, "max_expert_mib": 5.05},
+}
+
+
+def is_dgx_spark_card(card: dict | None) -> bool:
+    """NVIDIA DGX Spark / GB10 (cc 12.1, 128 GB unified memory)."""
+    if not isinstance(card, dict):
+        return False
+    text = " ".join(str(card.get(k) or "") for k in ("name", "arch", "cc")).lower()
+    return "gb10" in text or "dgx spark" in text or "spark" in text or "12.1" in text or "sm_121" in text
+
+
+def is_mac_metal_card(card: dict | None, backend: str = "") -> bool:
+    """Apple Silicon unified memory GPU (Metal backend)."""
+    if str(backend or "").lower() == "metal":
+        return True
+    if not isinstance(card, dict):
+        return False
+    text = " ".join(str(card.get(k) or "") for k in ("name", "vendor")).lower()
+    return "apple" in text or "metal" in text
+
+
+def unsloth_kv_default(vram_gb: float, ctx: int, uma: bool = False, explicit_kv: str | None = None) -> str:
+    """#6354: default KV cache precision for Unsloth quants.
+
+    - Discrete <= 16.5 GB: always int8 (prevents 21-23% 16K/32K prompt slowdown and saves 400+ expert slots on 12 GB).
+    - Discrete <= 24.5 GB at >= 64K context: int8.
+    - Any tier at > 8K context or UMA (DGX Spark, Mac Metal, Strix Halo): int8.
+    - Explicit user choice (--kv) is always respected.
+    """
+    if explicit_kv:
+        return str(explicit_kv)
+    vram = float(vram_gb or 0.0)
+    if uma:
+        return "int8"
+    if 0.0 < vram <= 16.5:
+        return "int8"
+    if 0.0 < vram <= 24.5 and int(ctx) >= 65536:
+        return "int8"
+    return "int8" if int(ctx) > 8192 else "fp16"
+
+
+def unsloth_kv_resident_default(vram_gb: float, ram_gb: float, ctx: int, kv: str = "int8", uma: bool = False,
+                                explicit_kv_resident: int | None = None) -> int | None:
+    """#6354: elastic --kv-resident token window for Unsloth quants on discrete GPUs.
+
+    Streams older KV pages to pinned host RAM so VRAM stays free for the expert cache:
+      - <= 4.5 GB: 4096 when ctx > 4096
+      - <= 6.5 GB: 8192 when ctx > 8192
+      - <= 12.5 GB: 16384 when ctx > 16384
+      - <= 16.5 GB: 16384 at 32K, 32768 at >= 64K
+      - <= 24.5 GB: 32768 at >= 64K
+      - > 24.5 GB: 32768 at >= 128K
+    Disabled on UMA (shared memory gains nothing from copying RAM->RAM) and on < 16 GB RAM hosts.
+    """
+    if explicit_kv_resident is not None:
+        return int(explicit_kv_resident) if int(explicit_kv_resident) > 0 else None
+    vram = float(vram_gb or 0.0)
+    ram = float(ram_gb or 0.0)
+    c = int(ctx)
+    if uma or vram <= 0.0 or ram < 16.0:
+        return None
+    if vram <= 4.5:
+        return 4096 if c > 4096 else None
+    if vram <= 6.5:
+        return 8192 if c > 8192 else None
+    if vram <= 12.5:
+        return 16384 if c > 16384 else None
+    if vram <= 16.5:
+        if c >= 65536:
+            return 32768
+        if c > 16384:
+            return 16384
+        return None
+    if vram <= 24.5:
+        return 32768 if c >= 65536 else None
+    return 32768 if c >= 131072 else None
+
+
+def adaptive_cache_defaults(live_slots: int, total_pairs: int = UNSLOTH_TOTAL_EXPERT_PAIRS,
+                            adapt_every: int | None = None, adapt_swaps: int | None = None,
+                            adapt_decay: float | None = None) -> dict[str, Any]:
+    """Issue #4870 coverage-based adaptive expert cache defaults (mirrors engine/src/program/generate.cpp).
+
+    When the VRAM expert cache holds between 15% and 65% of total layer-experts (every 6-32 GB discrete tier running
+    UD-Q4_K_XL, Q8_0, UD-IQ4_XS, UD-IQ3_XXS, or NVFP4), default to the faster 2 / 192 / 0.92 curve (+8% cache hit
+    rate, +10% decode tok/s). Explicit user overrides are never overwritten.
+    """
+    slots = max(0, int(live_slots))
+    total = max(1, int(total_pairs))
+    cov = min(1.0, float(slots) / float(total))
+    if slots <= 0 or slots >= total:
+        def_every, def_swaps, def_decay, mode = 0, 0, 0.7, ("all_resident" if slots >= total else "zero_slot")
+    elif UNSLOTH_ADAPT_MIN_COV <= cov <= UNSLOTH_ADAPT_MAX_COV:
+        def_every, def_swaps, def_decay, mode = 2, 192, 0.92, "mid_coverage_fast"
+    elif cov < UNSLOTH_ADAPT_MIN_COV:
+        def_every, def_swaps, def_decay, mode = 4, (16 if cov < 0.125 else 32), 0.7, "low_vram_dampened"
+    else:
+        def_every, def_swaps, def_decay, mode = 4, 96, 0.7, "high_coverage_standard"
+    return {
+        "adapt_every": def_every if adapt_every is None else int(adapt_every),
+        "adapt_swaps": def_swaps if adapt_swaps is None else int(adapt_swaps),
+        "adapt_decay": def_decay if adapt_decay is None else float(adapt_decay),
+        "coverage": round(cov, 4),
+        "mode": mode,
+    }
+
+
+def _discrete_tier_name(vram_gb: float) -> str:
+    for bound, label in ((4.5, "4gb"), (6.5, "6gb"), (8.5, "8gb"), (10.5, "10gb"),
+                         (12.5, "12gb"), (16.5, "16gb"), (24.5, "24gb"), (32.5, "32gb")):
+        if vram_gb <= bound:
+            return f"discrete_{label}"
+    return f"discrete_{int(round(vram_gb))}gb"
+
+
+def unsloth_tier_plan(model: str, vram_gb: float, ram_gb: float, ctx: int = 32768, backend: str = "cuda",
+                      uma: bool = False, gpu_name: str = "", arch: str = "",
+                      kv_override: str | None = None, kv_resident_override: int | None = None) -> dict[str, Any]:
+    """Comprehensive Qwen3.8 / Unsloth tier planner across every GPU/RAM tier.
+
+    Handles:
+      - Discrete GPUs: 4, 6, 8, 10, 12, 16, 24, 32 GB (NVIDIA CUDA, AMD HIP RDNA2/3/4, Intel Arc SYCL)
+      - Unified Memory: NVIDIA DGX Spark (128 GB), Apple Mac Metal (16/24/32/48/64/128 GB), AMD Strix Halo (64/128 GB)
+    Never refuses to install or OOMs on 4 GB / 6 GB GPUs (uses 0-slot / dense-streaming + RAM/SSD cold tiers).
+    """
+    spec = UNSLOTH_QUANTS.get(model)
+    if spec is None:
+        raise ValueError(f"Unknown Unsloth quant: {model!r}")
+    vram = float(vram_gb or 0.0)
+    ram = float(ram_gb or 0.0)
+    c = int(ctx)
+    be = str(backend or "cuda").lower()
+    card = {"name": gpu_name, "arch": arch, "vendor": vendor_of_backend(be), "uma": uma, "vram_gb": vram}
+    arena_gb = float(spec["arena_gb"])
+    avg_mib = float(spec["avg_expert_mib"])
+    max_mib = float(spec["max_expert_mib"])
+    dense_gb = float(spec["dense_gb"])
+    notes: list[str] = []
+    flags: list[str] = []
+
+    # ---- Unified memory tiers: DGX Spark, Mac Metal, Strix Halo ----
+    if is_dgx_spark_card(card):
+        kv = unsloth_kv_default(vram or ram, c, uma=True, explicit_kv=kv_override)
+        pool_gb = max(vram, ram, 128.0)
+        fits_all = (arena_gb + dense_gb + 12.0) <= pool_gb
+        slots = UNSLOTH_TOTAL_EXPERT_PAIRS if fits_all else int(max(0.0, (pool_gb - dense_gb - 16.0) * 1024.0 / avg_mib))
+        slots = min(slots, UNSLOTH_TOTAL_EXPERT_PAIRS)
+        adapt = adaptive_cache_defaults(slots)
+        flags = ["--mmap-experts", "--prefill", "auto:32768", "--mtp-q4", "all", "--mtp-hnorm", "stream", "--kv", kv]
+        if not fits_all:
+            budget = max(16, int(pool_gb - 20.0))
+            flags += ["--resident-budget-gib", str(budget)]
+        else:
+            budget = 0
+        return {
+            "tier": "dgx_spark", "model": model, "backend": "cuda", "uma": True, "runnable": True,
+            "kv": kv, "kv_resident": None, "mtp": True,
+            "expert_cache_mode": "spark_mmap_resident" if fits_all else "spark_mmap_budget",
+            "estimated_slots": slots, "uniform_max_blob_slots": min(UNSLOTH_TOTAL_EXPERT_PAIRS, int(slots * avg_mib / max_mib)),
+            "coverage": adapt["coverage"], "adaptive": adapt,
+            "ram_tier": "uma_unified" if fits_all else "uma_budget", "resident_budget_gib": budget,
+            "flags": flags, "notes": notes,
+        }
+
+    if is_mac_metal_card(card, be):
+        unified = max(ram, vram)
+        kv = unsloth_kv_default(unified, c, uma=True, explicit_kv=kv_override)
+        leave = 8.0 if unified >= 48.0 else 4.0
+        usable_gb = min(unified * 0.75, max(4.0, unified - leave))
+        kv_gb = c * 13 * UNSLOTH_KV_BYTES_PER_TOK.get(kv, 1056) / 1e9
+        resident = (arena_gb + dense_gb + kv_gb + 2.0) <= usable_gb
+        mtp = resident or unified >= 96.0
+        mode = "metal_resident" if resident else "metal_stream"
+        slots = UNSLOTH_TOTAL_EXPERT_PAIRS if resident else min(1500, int(max(0.0, (usable_gb - dense_gb - kv_gb) * 1024.0 / avg_mib)))
+        adapt = adaptive_cache_defaults(slots)
+        flags = ["--kv", kv]
+        if not resident:
+            flags.append("--mmap-experts")
+            notes.append("STRATA_METAL_STREAM=1 (streams cold experts from SSD through unified memory)")
+        if not mtp:
+            flags += ["--mtp", "off"]
+        return {
+            "tier": f"mac_metal_{int(round(unified))}gb", "model": model, "backend": "metal", "uma": True, "runnable": True,
+            "kv": kv, "kv_resident": None, "mtp": mtp,
+            "expert_cache_mode": mode, "estimated_slots": slots,
+            "uniform_max_blob_slots": min(UNSLOTH_TOTAL_EXPERT_PAIRS, int(slots * avg_mib / max_mib)),
+            "coverage": adapt["coverage"], "adaptive": adapt,
+            "ram_tier": "uma_unified" if resident else "metal_ssd_stream", "resident_budget_gib": 0,
+            "flags": flags, "notes": notes,
+        }
+
+    if uma and is_strix_halo_card(card):
+        total_ram = max(ram, vram)
+        kv = unsloth_kv_default(total_ram, c, uma=True, explicit_kv=kv_override)
+        pool_gb = total_ram * 0.78   # GTT + carve-out unified pool on Strix Halo (64 GB -> ~50 GB, 128 GB -> ~100 GB)
+        fits_pool = (6.0 + arena_gb + 4.0) <= pool_gb
+        slots = UNSLOTH_TOTAL_EXPERT_PAIRS if fits_pool else min(
+            UNSLOTH_TOTAL_EXPERT_PAIRS, int(max(256.0, (pool_gb * 0.45 - dense_gb) * 1024.0 / avg_mib)))
+        adapt = adaptive_cache_defaults(slots)
+        flags = ["--kv", kv, "--prefill", "auto:16384"]
+        budget = 0
+        if not fits_pool:
+            # Avoid 2x pin OOM on 64 GB Strix Halo or Q8_0 on 128 GB Strix Halo
+            budget = max(12, int(total_ram * 0.40))
+            flags += ["--expert-cache", str(slots), "--resident-budget-gib", str(budget)]
+        if model.lower() == STRIX_Q4_MODEL.lower():
+            notes.append(STRIX_Q4_NOTE)
+        return {
+            "tier": f"strix_halo_{int(round(total_ram))}gb", "model": model, "backend": "hip", "uma": True, "runnable": True,
+            "kv": kv, "kv_resident": None, "mtp": True,
+            "expert_cache_mode": "full_uma" if fits_pool else "uma_bounded_cache",
+            "estimated_slots": slots, "uniform_max_blob_slots": min(UNSLOTH_TOTAL_EXPERT_PAIRS, int(slots * avg_mib / max_mib)),
+            "coverage": adapt["coverage"], "adaptive": adapt,
+            "ram_tier": "uma_unified" if fits_pool else "uma_budget_ssd", "resident_budget_gib": budget,
+            "flags": flags, "notes": notes,
+        }
+
+    # ---- Discrete GPUs: 4, 6, 8, 10, 12, 16, 24, 32+ GB (CUDA / HIP / Intel Arc SYCL) ----
+    kv = unsloth_kv_default(vram, c, uma=False, explicit_kv=kv_override)
+    kv_res = unsloth_kv_resident_default(vram, ram, c, kv=kv, uma=False, explicit_kv_resident=kv_resident_override)
+    vram_kv_tokens = min(c, kv_res) if kv_res is not None else c
+    kv_vram_mib = vram_kv_tokens * 13 * UNSLOTH_KV_BYTES_PER_TOK.get(kv, 1056) / (1024.0 * 1024.0)
+    # 4 GB and 6 GB GPUs: drop GPU draft layer (saves ~800 MiB) and use tight reserve so dense trunk + KV always fit
+    mtp = vram > 6.5
+    mtp_mib = 802.0 if mtp else 0.0
+    runtime_mib = 0.0 if be == "sycl" else (256.0 if vram <= 6.5 else 384.0)
+    reserve_mib = 200.0 if vram <= 4.5 else (300.0 if vram <= 8.5 else 512.0)
+    # Dense trunk in VRAM (on 4 GB cards, output head moves to pinned host memory if needed, leaving ~2.8 GiB in VRAM)
+    dense_vram_mib = (dense_gb * 1024.0 - 420.0) if vram <= 4.5 else (dense_gb * 1024.0)
+    slack_mib = vram * 1024.0 - dense_vram_mib - mtp_mib - kv_vram_mib - runtime_mib - reserve_mib
+
+    # 4 GB & 6 GB unlock: 0-slot / dense-streaming when VRAM slack < 160 MiB (never refuse, never OOM!)
+    if vram <= 4.5 or slack_mib < 160.0:
+        est_slots = 0
+        uni_slots = 0
+        cache_mode = "zero_slot" if vram <= 4.5 else "dense_streaming"
+        notes.append("0-slot / dense-streaming mode: dense trunk + KV on GPU, routed experts stream from RAM/SSD (never refuses)")
+    else:
+        est_slots = min(UNSLOTH_TOTAL_EXPERT_PAIRS, int(slack_mib / avg_mib))
+        uni_slots = min(UNSLOTH_TOTAL_EXPERT_PAIRS, int(slack_mib / max_mib))
+        cache_mode = "heterogeneous_cache"
+
+    adapt = adaptive_cache_defaults(est_slots)
+    flags = ["--kv", kv]
+    if kv_res is not None:
+        flags += ["--kv-resident", str(kv_res)]
+    if not mtp:
+        flags += ["--mtp", "off"]
+    if est_slots == 0:
+        flags += ["--expert-cache", "0", "--no-prefill-borrow"]
+    elif adapt["mode"] == "mid_coverage_fast":
+        flags += ["--adapt-every", str(adapt["adapt_every"]), "--adapt-swaps", str(adapt["adapt_swaps"]),
+                  "--adapt-decay", f"{adapt['adapt_decay']:g}"]
+
+    # Cold tier (RAM + SSD): never overcommit host RAM
+    kv_ram_gb = (c * 13 * UNSLOTH_KV_BYTES_PER_TOK.get(kv, 1056) / 1e9) if kv_res is not None else 0.0
+    vram_experts_gb = est_slots * avg_mib / 1024.0
+    cold_experts_gb = max(0.0, arena_gb - vram_experts_gb)
+    ram_avail_gb = max(0.0, ram - 12.0 - kv_ram_gb)
+    if cold_experts_gb <= ram_avail_gb:
+        ram_tier = "all_ram"
+        budget_gib = 0
+    elif ram_avail_gb >= 8.0:
+        ram_tier = "resident_budget"
+        budget_gib = int(ram_avail_gb)
+        flags += ["--resident-budget-gib", str(budget_gib)]
+    else:
+        ram_tier = "ssd_streaming"
+        budget_gib = 0
+        flags += ["--ssd-experts", "--ram-experts-gb", "0"]
+
+    return {
+        "tier": _discrete_tier_name(vram), "model": model, "backend": be, "uma": False, "runnable": True,
+        "kv": kv, "kv_resident": kv_res, "mtp": mtp,
+        "expert_cache_mode": cache_mode, "estimated_slots": est_slots, "uniform_max_blob_slots": uni_slots,
+        "coverage": adapt["coverage"], "adaptive": adapt,
+        "ram_tier": ram_tier, "resident_budget_gib": budget_gib,
+        "flags": flags, "notes": notes,
+    }
