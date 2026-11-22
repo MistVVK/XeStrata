@@ -80,6 +80,26 @@ class Refresh(unittest.TestCase):
             self.assertEqual((rt / "draft_vocab.bin").read_bytes(), (data / setup.DRAFT_VOCABS["latin"]).read_bytes())
             self.assertEqual(said.call_args[0][0], "draft layer: the token subset with the Latin-script languages")
 
+    def test_arabic_is_copied_and_holds_en_in_order(self):
+        from array import array
+        from unittest import mock
+        data = ROOT / "data"
+        if not (data / setup.DRAFT_VOCABS["arabic"]).exists():
+            self.skipTest("data/draft_vocab_arabic.bin is not in this checkout")
+        en = list(array("i", (data / setup.DRAFT_VOCABS["en"]).read_bytes()))
+        ar = list(array("i", (data / setup.DRAFT_VOCABS["arabic"]).read_bytes()))
+        self.assertEqual(ar[:len(en)], en)
+        self.assertEqual(len(set(ar)), len(ar))
+        self.assertEqual(ar[len(en):], sorted(ar[len(en):]))
+        self.assertGreater(len(ar) - len(en), 8000)
+        with tempfile.TemporaryDirectory() as d:
+            rt = Path(d)
+            (rt / "draft_vocab.bin").write_bytes((data / setup.DRAFT_VOCABS["cjk"]).read_bytes())
+            with mock.patch.object(setup, "ok") as said:
+                setup.refresh_draft_vocab(rt, "arabic")
+            self.assertEqual((rt / "draft_vocab.bin").read_bytes(), (data / setup.DRAFT_VOCABS["arabic"]).read_bytes())
+            self.assertEqual(said.call_args[0][0], "draft layer: the token subset with the Arabic script")
+
     def test_fr_holds_the_en_subset_in_its_order(self):
         # built with tools/draft_vocab.py --base data/draft_vocab_en.bin --corpus ...: the base first, unchanged
         from array import array
@@ -145,7 +165,7 @@ class SmallCardNote(unittest.TestCase):
         self.assertTrue(note)
         self.assertIn("--draft-vocab en", " ".join(note))
         self.assertIn("the draft head does not fit", " ".join(note))
-        for vram, chosen in ((16.0, None), (24.0, None), (12.0, "en"), (12.0, "cyrillic"), (12.0, "fr"), (12.0, "cjk"),
+        for vram, chosen in ((16.0, None), (24.0, None), (12.0, "en"), (12.0, "cyrillic"), (12.0, "fr"), (12.0, "arabic"), (12.0, "cjk"),
                              (0.0, None)):
             self.assertEqual(setup.draft_vocab_note(vram, chosen), [], (vram, chosen))
 
@@ -157,7 +177,7 @@ class SmallCardNote(unittest.TestCase):
             if not p.exists():
                 self.skipTest(f"data/{name} is not in this checkout")
             sizes[choice] = p.stat().st_size // 4
-        for choice in ("en", "cyrillic", "fr", "latin"):
+        for choice in ("en", "cyrillic", "fr", "latin", "arabic"):
             want = setup.DRAFT_VOCAB_MIB["cjk"] * sizes[choice] / sizes["cjk"]
             self.assertAlmostEqual(setup.DRAFT_VOCAB_MIB[choice], want, delta=3)
 

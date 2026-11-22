@@ -883,6 +883,7 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
                  (long long) n_tokens, mib(n_tokens), free_s.c_str());
     struct Subset { const char* name; int64_t tokens; const char* what; };
     static const Subset smaller[] = {{"cyrillic", 58963, "English, code and the Cyrillic script"},
+                                     {"arabic", 49318, "English, code and the Arabic script"},
                                      {"en", 40525, "English and code"}};
     std::string opts;
     for (const Subset& s : smaller)

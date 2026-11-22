@@ -8,7 +8,7 @@ Chinese drafted almost nothing (#137).  This adds whole scripts to a subset:
     python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab.bin --add cjk \
         --out data/draft_vocab.bin
 
---add takes han, kana, hangul, cjk_punct, cjk (those four) or cyrillic.  The base ids keep their order; the added ones follow in
+--add takes han, kana, hangul, cjk_punct, cjk (those four), cyrillic or arabic.  The base ids keep their order; the added ones follow in
 id order.  --stats prints what a subset holds.
 
 A language written in a script the base already holds (French, Spanish, German... in Latin letters) needs specific
@@ -44,6 +44,8 @@ SCRIPTS = {
     "cjk_punct": [(0x3000, 0x303F), (0xFF00, 0xFF65), (0xFFA0, 0xFFEF)],
     # Ukrainian, Russian, Bulgarian, Serbian...: the shipped subset held 142 of the vocabulary's 18,580 Cyrillic tokens
     "cyrillic": [(0x0400, 0x04FF), (0x0500, 0x052F), (0x1C80, 0x1C8F), (0x2DE0, 0x2DFF), (0xA640, 0xA69F)],
+    # Arabic, Persian/Farsi, Urdu, Pashto, Kurdish, Sindhi, Uyghur (#6578: the default subset held 33 of 8,826 Arabic tokens)
+    "arabic": [(0x0600, 0x06FF), (0x0750, 0x077F), (0x08A0, 0x08FF), (0xFB50, 0xFDFF), (0xFE70, 0xFEFF)],
 }
 GROUPS = {"cjk": ["han", "kana", "hangul", "cjk_punct"]}
 
@@ -97,7 +99,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gguf", required=True, help="the model's (first) GGUF file: its vocabulary")
     ap.add_argument("--base", help="the subset to extend (int32 ids)")
-    ap.add_argument("--add", default="", help="comma list: han, kana, hangul, cjk_punct, cjk, cyrillic")
+    ap.add_argument("--add", default="", help="comma list: han, kana, hangul, cjk_punct, cjk, cyrillic, arabic")
     ap.add_argument("--corpus", nargs="+", default=[], help="UTF-8 text files in the language to add (#597)")
     ap.add_argument("--coverage", type=float, default=0.99,
                     help="with --corpus: the share of its token occurrences the added tokens cover (default 0.99)")
