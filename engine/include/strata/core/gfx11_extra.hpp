@@ -70,7 +70,6 @@ inline std::vector<std::pair<std::string, std::string>> gfx11_discrete_exact_env
         {"STRATA_SMALL_UNR", "3"},
         {"STRATA_GR_Q32_G", "2"},
         {"STRATA_GR_Q8_PFS", "1"},
-        {"STRATA_VERIFY_DEVICE_HITS", "1"},
     };
     if (windows) {
         // Helper thread launches the verify window while the main thread serves CPU doorbells (prevents WDDM first-window launch stalls),

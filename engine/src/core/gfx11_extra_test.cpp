@@ -53,8 +53,8 @@ int main() {
         const auto ex_lin = gfx11_discrete_exact_env(g, false, false);
         const auto ex_win = gfx11_discrete_exact_env(g, false, true);
         const auto wm     = gfx11_discrete_wmma_env(g, false);
-        CHECK(ex_lin.size() == 25);
-        CHECK(ex_win.size() == 27);
+        CHECK(ex_lin.size() == 24);
+        CHECK(ex_win.size() == 26);
         CHECK(wm.size() == 13);
         CHECK(has_kv(ex_lin, "STRATA_GDN_HEAD", "1"));
         CHECK(has_kv(ex_lin, "STRATA_GDN_PP", "2"));
@@ -74,7 +74,7 @@ int main() {
         CHECK(has_kv(wm, "STRATA_PF_P1A_L2", "1"));
         CHECK(has_kv(wm, "STRATA_DFLASH_WMMA", "1"));
         CHECK(has_kv(wm, "STRATA_HIP_FAST_DEC", "1"));
-        CHECK(has_kv(ex_lin, "STRATA_VERIFY_DEVICE_HITS", "1"));
+        CHECK(!has_kv(ex_lin, "STRATA_VERIFY_DEVICE_HITS", "1"));
         CHECK(gfx11_prefill_share_default(g, false));
     }
 
