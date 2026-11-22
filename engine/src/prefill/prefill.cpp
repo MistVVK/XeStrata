@@ -77,6 +77,7 @@
 #include "strata/kernels/i8_expert_rule.hpp"
 #include "strata/prefill/i8_group.hpp"
 #include "strata/prefill/moe_fp4_tc.hpp"
+#include "strata/prefill/moe_fp8_mxf_tc.hpp"
 #include "strata/prefill/routed_stream.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/expert_nibble.hpp"
@@ -5716,11 +5717,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         constexpr int kTypeNvfp4 = (int) strata::quant::Type::NVFP4;
                         const bool fp4_nat = fused_nat && !had_gu && !had_d && mmq_gt == kTypeNvfp4 &&
                                              mmq_dt == kTypeNvfp4 && fp4_tc::wanted();
+                        const bool fp8_nat = !fp4_nat && fused_nat && !had_gu && !had_d &&
+                                             fp8_mxf_tc::wanted(mmq_gt, mmq_dt);
                         if (fp4_nat) {
                             if (static bool said_fp4 = false; !said_fp4) {
                                 said_fp4 = true;
                                 std::fprintf(stderr, "strata: prompt NVFP4 experts on the Blackwell mxf4nvf4 tensor-core "
                                                      "kernels (STRATA_PREFILL_NVFP4=w4a4)\n");
+                            }
+                        } else if (fp8_nat) {
+                            if (static bool said_fp8 = false; !said_fp8) {
+                                said_fp8 = true;
+                                std::fprintf(stderr, "strata: prompt experts on the Blackwell mxf8f6f4 tensor-core "
+                                                     "kernels (STRATA_PF_MXFP8_MOE=0 disables)\n");
                             }
                         } else if (static bool said = false; !said) {
                             said = true;
@@ -5728,8 +5737,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                  "#136)\n");
                         }
                         pt.mark(kPfGather, cs);
-                        // the layer's input to NVFP4 (Blackwell w4a4) or int8 once per token; the rows of each expert from the router's ids
+                        // the layer's input to NVFP4 (Blackwell w4a4), MXFP8 (Blackwell mxf8f6f4), or int8 once per token
                         if (fp4_nat) fp4_tc::quantize_act(m.mixed, T, N, m.Xq, m.cs);
+                        else if (fp8_nat) fp8_mxf_tc::quantize_act(m.mixed, T, N, m.Xq, m.cs);
                         else if (fused_nat && had_gu) {   // (a folded trellis gate/up: its input rotated, as the MMQ path's xsrc = m.Xr)
                             strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);
                             fused::quantize_act_native(m.Xr, T, N, m.Xq, m.cs);
@@ -5738,7 +5748,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // (a folded trellis down: H rotated inside experts_native; off again after the layer's launches)
                         if (fused_nat && had_d) fused::set_down_rotation(true, had_sh);
                         // STRATA_PF_P1A=1 (gfx1151): the layer input's FP16 rows for the P1A kernels (p1a_input keeps nullptr otherwise)
-                        if (fused_nat && !fp4_nat) fused::p1a_input(had_gu ? nullptr : m.mixed_h, m.H_bytes);
+                        if (fused_nat && !fp4_nat && !fp8_nat) fused::p1a_input(had_gu ? nullptr : m.mixed_h, m.H_bytes);
                         bool p1a_layer = false;
                         fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
                         // launches over the experts in id order, each at most kMaxBatch experts (STRATA_PF_BATCH: below)
@@ -5756,7 +5766,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int n = v ? std::atoi(v) : 0;
                             return n > 0 ? std::min(n, fused::kBatchRoom) : fused::kMaxBatch;
                         }();
-                        const bool wide = fused_nat && !fp4_nat && pf_batch > fused::kMaxBatch && fused::native_wide();
+                        const bool wide = fused_nat && !fp4_nat && !fp8_nat && pf_batch > fused::kMaxBatch && fused::native_wide();
                         const int per_launch = wide ? pf_batch : std::min(pf_batch, fused::kMaxBatch);
                         for (int32_t e = 0; e < m.g->n_expert;) {
                             fused::Batch b;
@@ -5789,6 +5799,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const auto& f = lay.fmt[(size_t) l];
                                 const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
                                 fp4_tc::experts(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                            } else if (fp8_nat) {
+                                const auto& f = lay.fmt[(size_t) l];
+                                const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+                                fp8_mxf_tc::experts(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             } else if (fused_nat) {
                                 fused::want_dm_f16(pf_dm16() && rows_cpu == 0 && !peer_now && ((reinterpret_cast<uintptr_t>(m.shared) | reinterpret_cast<uintptr_t>(m.bo)) & 15) == 0);
                                 const auto& f = lay.fmt[(size_t) l];

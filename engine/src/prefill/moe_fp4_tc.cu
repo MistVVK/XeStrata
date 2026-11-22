@@ -43,9 +43,9 @@ constexpr int T_NVFP4 = (int) strata::quant::Type::NVFP4;
 constexpr int AB = 80;
 constexpr int K_STEP = 64;
 constexpr int BS_NVFP4 = 36;
-constexpr int NT = 256;          // 8 warps: wf in 0..1 (64 weight rows each), wn in 0..3 (16 routed rows each -> 64 rows/pass)
-constexpr int TR = 64;           // fused::group tile rows (single pass: zero double weight reads at T=2048!)
-constexpr int WR = 128;          // GU: 64 gate + 64 up = 64 SwiGLU features (1 full NVFP4 block per fb!); Down: 128 cols
+constexpr int NT = 512;          // 16 warps: wf in 0..3 (64 weight rows each -> 256 rows), wn in 0..3 (16 routed rows each -> 64 rows/pass)
+constexpr int TR = 64;           // fused::group tile rows (single pass: zero double weight reads!)
+constexpr int WR = 256;          // GU: 128 gate + 128 up = 128 SwiGLU features (2 NVFP4 blocks/fb); Down: 256 cols -> 2x fewer tiles & activation reads!
 constexpr int W_STRIDE = 48;     // 32B qs + 16B pad (conflict-free ldmatrix)
 constexpr int A_STRIDE = 48;
 
@@ -111,7 +111,7 @@ __device__ __forceinline__ void cp16_async(void* dst_smem, const void* src_glob)
 
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
 __device__ __forceinline__ void cp_wait0() { asm volatile("cp.async.wait_group 0;\n"); }
-__device__ __forceinline__ void cp_wait1() { asm volatile("cp.async.wait_group 1;\n"); }
+__device__ __forceinline__ void pf_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];\n" :: "l"(p)); }
 
 __device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void* src_smem) {
     const uint32_t a = smem_u32(src_smem);
@@ -181,13 +181,11 @@ __global__ void quant_act_fp4_kernel(const float* __restrict__ x, int64_t nblk, 
 #endif
 }
 
-// Persistent Blackwell mxf4nvf4 MoE kernel (v3):
-//   - 256 threads (8 warps): wf = warp >> 2 (0..1: 64 weight rows each), wn = warp & 3 (0..3: 16 routed rows each).
-//   - Single pass over all TR=64 routed rows per tile (never re-reads weights on 33..64-row experts!).
-//   - 100% coalesced weight loads (8 consecutive lanes load 32 contiguous bytes of each 36B NVFP4 block)
-//     software-pipelined in registers overlapped with mxf4nvf4 MMA + cp.async activations (1 __syncthreads()/K-step).
+// Persistent Blackwell mxf4nvf4 MoE kernel (v4):
+//   - 512 threads (16 warps): wf = warp >> 2 (0..3: 64 weight rows each = 256 rows), wn = warp & 3 (0..3: 16 routed rows each = 64 rows).
+//   - Halves CTA tile count (5 GU tiles, 10 Down tiles) and halves global activation traffic vs WR=128 (~35 KB static smem, 0 spills).
 template <bool GU>
-__global__ void __launch_bounds__(NT, 2) fp4_tc_kernel(Batch b, NativeGeom geo, Tables tb, const uint8_t* __restrict__ act,
+__global__ void __launch_bounds__(NT, 1) fp4_tc_kernel(Batch b, NativeGeom geo, Tables tb, const uint8_t* __restrict__ act,
                                                        const int32_t* __restrict__ src, uint8_t* __restrict__ out,
                                                        float* __restrict__ dm) {
 #if defined(STRATA_FP4_TC_DEV)
@@ -198,18 +196,18 @@ __global__ void __launch_bounds__(NT, 2) fp4_tc_kernel(Batch b, NativeGeom geo, 
     constexpr int NFB = ROWS_N / WR;
     constexpr size_t ACT_ROW_BYTES = GU ? X_ROW_BYTES : H_ROW_BYTES;
 
-    __shared__ alignas(16) uint8_t s_wqs[2][WR * W_STRIDE]; // 2 * 6,144 = 12,288 B
-    __shared__ alignas(16) uint8_t s_aqs[2][TR * A_STRIDE]; // 2 * 3,072 =  6,144 B
-    __shared__ uint32_t s_wsc[2][WR];                       // 2 *   512 =  1,024 B
-    __shared__ uint32_t s_asc[2][TR];                       // 2 *   256 =    512 B
-    __shared__ float s_agb[2][TR];                          // 2 *   256 =    512 B
-    __shared__ int32_t s_row[TR];                           //                256 B
-    __shared__ float s_am32[2][TR];                         //                512 B (total ~21.2 KB)
+    __shared__ alignas(16) uint8_t s_wqs[2][WR * W_STRIDE]; // 2 * 12,288 = 24,576 B
+    __shared__ alignas(16) uint8_t s_aqs[2][TR * A_STRIDE]; // 2 *  3,072 =  6,144 B
+    __shared__ uint32_t s_wsc[2][WR];                       // 2 *  1,024 =  2,048 B
+    __shared__ uint32_t s_asc[2][TR];                       // 2 *    256 =    512 B
+    __shared__ float s_agb[2][TR];                          // 2 *    256 =    512 B
+    __shared__ int32_t s_row[TR];                           //                 256 B
+    __shared__ float s_am32[4][TR];                         //               1,024 B (total 35,072 B)
 
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int wf = warp >> 2;          // 0..1: 64 weight rows per wf
+    const int wf = warp >> 2;          // 0..3: 64 weight rows per wf (256 weight rows/CTA)
     const int wn = warp & 3;           // 0..3: 16 routed rows per wn
     const int nb0 = 16 * wn;
     const int g = lane >> 2;
@@ -218,7 +216,7 @@ __global__ void __launch_bounds__(NT, 2) fp4_tc_kernel(Batch b, NativeGeom geo, 
     const int l8 = lane & 7;
     const int tidx_a = g + (tig & 1) * 8;
 
-    const int rl = tid >> 3;           // 0..31: row offset within 32-row group
+    const int rl = tid >> 3;           // 0..63: row offset within 64-row quarter
     const int lc = tid & 7;            // 0..7: 8 consecutive lanes load 32 contiguous bytes of qs!
 
     const int a_off = (64 * wf + 8 * (lm & 1) + l8) * W_STRIDE + 16 * (lm >> 1);
@@ -248,7 +246,7 @@ __global__ void __launch_bounds__(NT, 2) fp4_tc_kernel(Batch b, NativeGeom geo, 
             s_down = __uint_as_float(ld32_fast(tail + 8, aligned4));
         }
 
-        // Precompute the 4 row pointers owned by lane-group `rl` (rows rl, rl+32, rl+64, rl+96).
+        // Precompute the 4 row pointers owned by lane-group `rl` (rows rl, rl+64, rl+128, rl+192).
         auto row_ptr = [&](int row) -> const uint8_t* {
             if constexpr (GU) {
                 return blob + ((row & 8) ? geo.up_off : 0) +
@@ -258,9 +256,16 @@ __global__ void __launch_bounds__(NT, 2) fp4_tc_kernel(Batch b, NativeGeom geo, 
             }
         };
         const uint8_t* const wr0 = row_ptr(rl);
-        const uint8_t* const wr1 = row_ptr(rl + 32);
-        const uint8_t* const wr2 = row_ptr(rl + 64);
-        const uint8_t* const wr3 = row_ptr(rl + 96);
+        const uint8_t* const wr1 = row_ptr(rl + 64);
+        const uint8_t* const wr2 = row_ptr(rl + 128);
+        const uint8_t* const wr3 = row_ptr(rl + 192);
+        if (lc == 0) {
+            pf_l2(wr0); pf_l2(wr1); pf_l2(wr2); pf_l2(wr3);
+            if (NS > 3) {
+                pf_l2(wr0 + 3 * BS_NVFP4); pf_l2(wr1 + 3 * BS_NVFP4);
+                pf_l2(wr2 + 3 * BS_NVFP4); pf_l2(wr3 + 3 * BS_NVFP4);
+            }
+        }
 
         __syncthreads();
         if (tid < TR) {
@@ -312,10 +317,10 @@ __global__ void __launch_bounds__(NT, 2) fp4_tc_kernel(Batch b, NativeGeom geo, 
 
         auto store_w_smem = [&](int buf, uint32_t q0, uint32_t q1, uint32_t q2, uint32_t q3, uint32_t wsc) {
             *(uint32_t*) (s_wqs[buf] + (rl + 0) * W_STRIDE + lc * 4) = q0;
-            *(uint32_t*) (s_wqs[buf] + (rl + 32) * W_STRIDE + lc * 4) = q1;
-            *(uint32_t*) (s_wqs[buf] + (rl + 64) * W_STRIDE + lc * 4) = q2;
-            *(uint32_t*) (s_wqs[buf] + (rl + 96) * W_STRIDE + lc * 4) = q3;
-            if (lc < 4) s_wsc[buf][lc * 32 + rl] = wsc;
+            *(uint32_t*) (s_wqs[buf] + (rl + 64) * W_STRIDE + lc * 4) = q1;
+            *(uint32_t*) (s_wqs[buf] + (rl + 128) * W_STRIDE + lc * 4) = q2;
+            *(uint32_t*) (s_wqs[buf] + (rl + 192) * W_STRIDE + lc * 4) = q3;
+            if (lc < 4) s_wsc[buf][lc * 64 + rl] = wsc;
         };
 
         // Stage 0 prologue.
@@ -338,6 +343,10 @@ __global__ void __launch_bounds__(NT, 2) fp4_tc_kernel(Batch b, NativeGeom geo, 
             if (st + 1 < NS) {
                 issue_act(st + 1, nxt);
                 load_w_regs(st + 1, wq0, wq1, wq2, wq3, wsc);
+                if (lc == 0 && ((st & 3) == 0) && st + 4 < NS) {
+                    const size_t pf = (size_t) (st + 4) * BS_NVFP4;
+                    pf_l2(wr0 + pf); pf_l2(wr1 + pf); pf_l2(wr2 + pf); pf_l2(wr3 + pf);
+                }
             }
 
             if (on0) {
@@ -411,6 +420,8 @@ __global__ void __launch_bounds__(NT, 2) fp4_tc_kernel(Batch b, NativeGeom geo, 
             }
             __syncthreads();
             if (on0) {
+                const int wf_pair = wf >> 1;
+                const int wf_half = wf & 1;
 #pragma unroll
                 for (int n = 0; n < 2; ++n) {
                     if (n == 1 && !on1) break;
@@ -418,7 +429,7 @@ __global__ void __launch_bounds__(NT, 2) fp4_tc_kernel(Batch b, NativeGeom geo, 
                     for (int c = 0; c < 2; ++c) {
                         const int r = nb0 + 8 * n + 2 * tig + c;
                         if (r < nrows) {
-                            const float am_64 = fmaxf(s_am32[0][r], s_am32[1][r]);
+                            const float am_64 = fmaxf(s_am32[2 * wf_pair + 0][r], s_am32[2 * wf_pair + 1][r]);
                             const float g_blk = am_64 * (1.0f / (6.0f * 448.0f));
                             float s0 = 0.0f, s1 = 0.0f;
                             const uint8_t d0 = encode_ue4m3(g_blk > 0.0f ? (am_sub0[n][c] / (g_blk * 6.0f)) : 0.0f, s0);
@@ -426,13 +437,13 @@ __global__ void __launch_bounds__(NT, 2) fp4_tc_kernel(Batch b, NativeGeom geo, 
                             const float inv0 = (g_blk * s0) > 0.0f ? (1.0f / (g_blk * s0)) : 0.0f;
                             const float inv1 = (g_blk * s1) > 0.0f ? (1.0f / (g_blk * s1)) : 0.0f;
 
-                            uint8_t* dst_slot = out + (size_t) (row0 + r) * H_ROW_BYTES + (size_t) fb * AB;
-                            dst_slot[16 * wf + 0 + g] = pack_e2m1x2(h_val[n][c][0] * inv0, h_val[n][c][1] * inv0);
-                            dst_slot[16 * wf + 8 + g] = pack_e2m1x2(h_val[n][c][2] * inv1, h_val[n][c][3] * inv1);
+                            uint8_t* dst_slot = out + (size_t) (row0 + r) * H_ROW_BYTES + (size_t) (2 * fb + wf_pair) * AB;
+                            dst_slot[16 * wf_half + 0 + g] = pack_e2m1x2(h_val[n][c][0] * inv0, h_val[n][c][1] * inv0);
+                            dst_slot[16 * wf_half + 8 + g] = pack_e2m1x2(h_val[n][c][2] * inv1, h_val[n][c][3] * inv1);
                             if (g == 0) {
-                                dst_slot[32 + 2 * wf + 0] = d0;
-                                dst_slot[32 + 2 * wf + 1] = d1;
-                                if (wf == 0) *(float*) (dst_slot + 36) = g_blk;
+                                dst_slot[32 + 2 * wf_half + 0] = d0;
+                                dst_slot[32 + 2 * wf_half + 1] = d1;
+                                if (wf_half == 0) *(float*) (dst_slot + 36) = g_blk;
                             }
                         }
                     }

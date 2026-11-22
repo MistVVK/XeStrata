@@ -386,7 +386,8 @@ void nvfp4_decode_sm120_set_override(int mode) noexcept { g_override = mode; }
 bool nvfp4_decode_sm120_available() noexcept {
     static const bool env_on = [] {
         const char* v = std::getenv("STRATA_NVFP4_DEC_SM120");
-        return v != nullptr && v[0] == '1';
+        if (v == nullptr || v[0] == '\0') return false;   // opt-in: iq_kernels.cu row_dot_20_sub8 + native_down_lds_kernel (use_sub8) is 3-6x faster at DFlash2 E/G=1..4
+        return v[0] != '0';
     }();
     const bool on = (g_override >= 0) ? (g_override != 0) : env_on;
     return on && device_ok();

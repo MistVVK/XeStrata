@@ -192,6 +192,7 @@ int main(int argc, char** argv) {
     bool bench = false;
     for (int i = 1; i < argc; ++i)
         if (std::strcmp(argv[i], "--bench") == 0) bench = true;
+    strata::kernels::nvfp4_decode_sm120_set_override(1);
     if (!strata::kernels::nvfp4_decode_sm120_available()) {
         std::printf("nvfp4_decode_sm120_test: skipping (requires Blackwell sm_120a/sm_121a)\n");
         return 77;

@@ -10,11 +10,13 @@
 //      error and paired GPU latency.
 // Exits with code 77 (skipped) when no CUDA GPU is present or when fp4_tc::available() is false (non-sm_120/sm_121 or
 // built without 120a/121a).
+#include "strata/prefill/dense_fp4_tc.hpp"
 #include "strata/prefill/moe_fp4_tc.hpp"
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/quant/types.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -386,6 +388,132 @@ void run_bench_case(int T, int E, cudaStream_t s) {
     ck(cudaEventDestroy(ev0), "d0"); ck(cudaEventDestroy(ev1), "d1");
 }
 
+void run_dense_fp4_parity_case(int T, int N_out, int K_in, float beta, cudaStream_t s) {
+    namespace dense_fp4 = strata::prefill::dense_fp4_tc;
+    if (!dense_fp4::available()) {
+        std::fprintf(stderr, "prefill_fp4_tc_test: dense_fp4_tc::available() is false on fp4_tc-capable device\n");
+        std::exit(1);
+    }
+    const int ldy = N_out + 17;   // non-aligned stride to verify bounds and ldy handling
+    const size_t w_row_bytes = (size_t) (K_in / 64) * BS;
+    std::mt19937 rng(4400u + (unsigned) T * 31u + (unsigned) N_out * 7u);
+    std::uniform_real_distribution<float> xdist(-1.5f, 1.5f);
+
+    std::vector<uint8_t> h_w((size_t) N_out * w_row_bytes);
+    for (int r = 0; r < N_out; ++r) {
+        for (int b = 0; b < K_in / 64; ++b) {
+            uint8_t* blk = h_w.data() + (size_t) r * w_row_bytes + (size_t) b * BS;
+            for (int sub = 0; sub < 4; ++sub) blk[sub] = (uint8_t) (0x24 + (rng() % 28));
+            for (int q = 0; q < 32; ++q) blk[4 + q] = (uint8_t) (rng() & 0xffu);
+        }
+    }
+
+    std::vector<uint16_t> h_x16((size_t) T * K_in);
+    std::vector<float> h_xf((size_t) T * K_in);
+    for (size_t i = 0; i < h_x16.size(); ++i) {
+        const __half hv = __float2half(xdist(rng));
+        uint16_t bits = 0;
+        std::memcpy(&bits, &hv, 2);
+        h_x16[i] = bits;
+        h_xf[i] = __half2float(hv);
+    }
+
+    const float kSentinel = 12345.25f;
+    std::vector<float> h_y_init((size_t) T * ldy, kSentinel);
+    for (int t = 0; t < T; ++t) {
+        for (int n = 0; n < N_out; ++n) h_y_init[(size_t) t * ldy + n] = xdist(rng) * 3.0f;
+    }
+
+    DevBuf d_w(h_w.size());
+    DevBuf d_x(h_x16.size() * sizeof(uint16_t));
+    DevBuf d_y(h_y_init.size() * sizeof(float));
+    ck(cudaMemcpyAsync(d_w.p, h_w.data(), h_w.size(), cudaMemcpyHostToDevice, s), "dense H2D w");
+    ck(cudaMemcpyAsync(d_x.p, h_x16.data(), h_x16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice, s), "dense H2D x");
+    ck(cudaMemcpyAsync(d_y.p, h_y_init.data(), h_y_init.size() * sizeof(float), cudaMemcpyHostToDevice, s), "dense H2D y");
+
+    const bool ok = dense_fp4::gemm_f16_nvfp4(d_x.as<uint16_t>(), d_w.p, d_y.as<float>(), T, N_out, K_in, ldy, beta, s);
+    if (!ok) {
+        std::fprintf(stderr, "prefill_fp4_tc_test: dense_fp4_tc::gemm_f16_nvfp4 returned false for T=%d N=%d K=%d\n",
+                     T, N_out, K_in);
+        std::exit(1);
+    }
+    ck(cudaStreamSynchronize(s), "dense sync");
+
+    std::vector<float> h_y(h_y_init.size());
+    ck(cudaMemcpy(h_y.data(), d_y.p, h_y.size() * sizeof(float), cudaMemcpyDeviceToHost), "dense D2H y");
+
+    for (int t = 0; t < T; ++t) {
+        for (int n = N_out; n < ldy; ++n) {
+            if (h_y[(size_t) t * ldy + n] != kSentinel) {
+                std::fprintf(stderr, "prefill_fp4_tc_test: dense OOB write at t=%d n=%d (got %g)\n",
+                             t, n, h_y[(size_t) t * ldy + n]);
+                std::exit(1);
+            }
+        }
+    }
+
+    std::vector<float> w_row((size_t) K_in);
+    std::vector<float> x_q4((size_t) K_in);
+    double q4_num = 0.0, q4_den = 0.0, raw_num = 0.0, raw_den = 0.0;
+    const int n_step = N_out <= 320 ? 1 : (N_out / 128);
+    const int t_step = T <= 65 ? 1 : (T / 32);
+    for (int t = 0; t < T; t += t_step) {
+        const float* xr = h_xf.data() + (size_t) t * K_in;
+        quantize_act_nvfp4_host(xr, K_in, x_q4.data());
+        for (int n = 0; n < N_out; n += n_step) {
+            dequant_nvfp4_row(h_w.data() + (size_t) n * w_row_bytes, K_in, w_row.data());
+            double acc4 = 0.0, acc_raw = 0.0;
+            for (int k = 0; k < K_in; ++k) {
+                acc4 += (double) w_row[(size_t) k] * (double) x_q4[(size_t) k];
+                acc_raw += (double) w_row[(size_t) k] * (double) xr[k];
+            }
+            const double base = (beta == 0.0f) ? 0.0 : (double) beta * (double) h_y_init[(size_t) t * ldy + n];
+            const double ref4 = base + acc4;
+            const double ref_raw = base + acc_raw;
+            const double got = (double) h_y[(size_t) t * ldy + n];
+            q4_num += (got - ref4) * (got - ref4);
+            q4_den += ref4 * ref4;
+            raw_num += (got - ref_raw) * (got - ref_raw);
+            raw_den += ref_raw * ref_raw;
+        }
+    }
+    const double rel4 = q4_den > 0.0 ? std::sqrt(q4_num / q4_den) : 0.0;
+    const double rel_raw = raw_den > 0.0 ? std::sqrt(raw_num / raw_den) : 0.0;
+    std::printf("  DENSE T=%4d N=%4d K=%4d beta=%.1f: vs W4A4-FP64 rel RMS = %.6f | vs unquant-FP64 = %.4f\n",
+                T, N_out, K_in, beta, rel4, rel_raw);
+    if (!std::isfinite(rel4) || rel4 > 1e-3) {
+        std::fprintf(stderr, "prefill_fp4_tc_test: dense rel4 %.6f exceeded tolerance (1e-3)\n", rel4);
+        std::exit(1);
+    }
+    if (!std::isfinite(rel_raw) || rel_raw > 0.22) {
+        std::fprintf(stderr, "prefill_fp4_tc_test: dense rel_raw %.4f exceeded bound (0.22)\n", rel_raw);
+        std::exit(1);
+    }
+}
+
+void run_dense_fp4_bench_case(int T, int N_out, int K_in, cudaStream_t s) {
+    namespace dense_fp4 = strata::prefill::dense_fp4_tc;
+    const size_t w_bytes = (size_t) N_out * (size_t) (K_in / 64) * BS;
+    DevBuf d_w(w_bytes);
+    DevBuf d_x((size_t) T * K_in * sizeof(uint16_t));
+    DevBuf d_y((size_t) T * N_out * sizeof(float));
+    ck(cudaMemsetAsync(d_w.p, 0x38, w_bytes, s), "bench memset w");
+    ck(cudaMemsetAsync(d_x.p, 0x3c, (size_t) T * K_in * sizeof(uint16_t), s), "bench memset x");
+    ck(cudaMemsetAsync(d_y.p, 0, (size_t) T * N_out * sizeof(float), s), "bench memset y");
+
+    cudaEvent_t ev0, ev1;
+    ck(cudaEventCreate(&ev0), "ev0"); ck(cudaEventCreate(&ev1), "ev1");
+    for (int i = 0; i < 3; ++i) dense_fp4::gemm_f16_nvfp4(d_x.as<uint16_t>(), d_w.p, d_y.as<float>(), T, N_out, K_in, N_out, 0.0f, s);
+    ck(cudaEventRecord(ev0, s), "ev0");
+    for (int i = 0; i < 20; ++i) dense_fp4::gemm_f16_nvfp4(d_x.as<uint16_t>(), d_w.p, d_y.as<float>(), T, N_out, K_in, N_out, 0.0f, s);
+    ck(cudaEventRecord(ev1, s), "ev1");
+    ck(cudaEventSynchronize(ev1), "sync");
+    float ms = 0.0f; ck(cudaEventElapsedTime(&ms, ev0, ev1), "el"); ms /= 20.0f;
+    const double tflops = (2.0 * (double) T * (double) N_out * (double) K_in) / ((double) ms * 1e9);
+    std::printf("  DENSE BENCH T=%4d N=%4d K=%4d: %.3f ms (%.1f TFLOPS)\n", T, N_out, K_in, ms, tflops);
+    ck(cudaEventDestroy(ev0), "d0"); ck(cudaEventDestroy(ev1), "d1");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -404,10 +532,17 @@ int main(int argc, char** argv) {
     run_parity_case(17, 16, 2, s);
     run_parity_case(65, 32, 0, s);
     run_parity_case(517, 64, 2, s);
+    run_dense_fp4_parity_case(33, 192, 256, 0.0f, s);
+    run_dense_fp4_parity_case(65, 320, 512, 1.0f, s);
+    run_dense_fp4_parity_case(130, 2560, 2560, 0.0f, s);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
         run_bench_case(512, 512, s);
         run_bench_case(2048, 512, s);
         run_bench_case(8192, 512, s);
+        run_dense_fp4_bench_case(512, 2560, 2560, s);
+        run_dense_fp4_bench_case(2048, 2560, 2560, s);
+        run_dense_fp4_bench_case(2048, 6144, 2560, s);
+        run_dense_fp4_bench_case(8192, 6144, 2560, s);
     }
     ck(cudaStreamDestroy(s), "cudaStreamDestroy");
     std::printf("prefill_fp4_tc_test: ok\n");
