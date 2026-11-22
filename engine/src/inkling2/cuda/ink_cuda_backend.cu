@@ -71,16 +71,16 @@ class InkCudaBackend final : public InkBackend {
 public:
     ~InkCudaBackend() override { cleanup(); }
 
-    const char* backend_name() const noexcept override { return "cuda"; }
+    const char* backend_name() const noexcept override { return model_.ep2_active ? "cuda-ep2" : "cuda"; }
 
     std::string device_info() const override { return dev_info_; }
 
     BackendStats stats() const override {
         BackendStats st{};
         if (initialized_) {
-            st.vram_experts_loaded = model_.n_vram_experts;
+            st.vram_experts_loaded = model_.n_vram_experts + model_.n_peer_experts;
             st.ram_experts_loaded  = model_.n_host_experts;
-            st.total_experts       = model_.n_vram_experts + model_.n_host_experts;
+            st.total_experts       = model_.n_vram_experts + model_.n_peer_experts + model_.n_host_experts;
             size_t vf = 0, vt = 0;
             if (cudaMemGetInfo(&vf, &vt) == cudaSuccess) {
                 st.vram_total_bytes = vt;
@@ -97,8 +97,23 @@ public:
 
     bool init(const InkModelFile& mf, const BackendOpts& opts, std::string& err) override {
         cleanup();
-        gpu_id_ = opts.gpu_index;
-        cudaError_t ce = cudaSetDevice(gpu_id_);
+        int n_dev = 0;
+        cudaError_t ce = cudaGetDeviceCount(&n_dev);
+        if (ce != cudaSuccess || n_dev <= 0) {
+            err = std::string("cudaGetDeviceCount failed: ") + cudaGetErrorString(ce);
+            return false;
+        }
+        // Resolve primary + optional peer GPU ordinal from opts.gpu_ids / opts.gpu_index / opts.gpus
+        gpu_id_ = (opts.gpu_index >= 0 && opts.gpu_index < n_dev) ? opts.gpu_index : 0;
+        int peer_gpu_id = -1;
+        if (opts.gpu_ids.size() >= 2) {
+            if (opts.gpu_ids[0] >= 0 && opts.gpu_ids[0] < n_dev) gpu_id_ = opts.gpu_ids[0];
+            if (opts.gpu_ids[1] >= 0 && opts.gpu_ids[1] < n_dev && opts.gpu_ids[1] != gpu_id_) peer_gpu_id = opts.gpu_ids[1];
+        } else if (opts.gpus >= 2 && n_dev >= 2) {
+            peer_gpu_id = (gpu_id_ == 0) ? 1 : 0;
+        }
+
+        ce = cudaSetDevice(gpu_id_);
         if (ce != cudaSuccess) {
             err = std::string("cudaSetDevice failed: ") + cudaGetErrorString(ce);
             return false;
@@ -110,10 +125,19 @@ public:
             return false;
         }
         char buf[512];
-        std::snprintf(buf, sizeof(buf), "%.200s (sm_%d%d, %d SMs, %.1f GiB VRAM, sm120_tc=%d)",
-                      prop.name, prop.major, prop.minor, prop.multiProcessorCount,
-                      (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0),
-                      (int)strata::ink::sm120::available());
+        if (peer_gpu_id >= 0) {
+            cudaDeviceProp prop1{};
+            cudaGetDeviceProperties(&prop1, peer_gpu_id);
+            std::snprintf(buf, sizeof(buf), "GPU%d:%.120s + GPU%d:%.120s (sm_%d%d, %.1f+%.1f GiB VRAM, ep2=1)",
+                          gpu_id_, prop.name, peer_gpu_id, prop1.name, prop.major, prop.minor,
+                          (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0),
+                          (double)prop1.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+        } else {
+            std::snprintf(buf, sizeof(buf), "%.200s (sm_%d%d, %d SMs, %.1f GiB VRAM, sm120_tc=%d)",
+                          prop.name, prop.major, prop.minor, prop.multiProcessorCount,
+                          (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0),
+                          (int)strata::ink::sm120::available());
+        }
         dev_info_ = buf;
 
         // Compute exact minimum KV + ShortConv + workspace headroom for parallel slots before pinning experts!
@@ -134,12 +158,18 @@ public:
                             : ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20)
                              : (prop.totalGlobalMem <= (13ull << 30)) ? (260ull << 20)
                                                                       : (320ull << 20));
-        const size_t min_reserve_bytes = min_kv_bytes + ws_pad;
+        size_t min_reserve_bytes = min_kv_bytes + ws_pad;
+        if (opts.vram_reserve_mib >= 0) {
+            min_reserve_bytes = std::max(min_reserve_bytes, (size_t)opts.vram_reserve_mib << 20);
+        }
 
-        // Load .strata v1.1 trunk + experts (100% VRAM, hybrid RAM, or first-class GPU+SSD Only!)
+        // Load .strata v1.1 / .gguf (Unsloth + ggml-org) / HF safetensors trunk + experts (Single-GPU, Dual-GPU EP, or GPU+SSD Only!)
         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
-        if (!model_.load(mf.path, gpu_id_, build_screen, err, min_reserve_bytes,
-                         opts.vram_experts_gb, opts.ram_experts_gb, opts.ssd_experts)) return false;
+        if (!model_.load_from_model_file(mf, gpu_id_, peer_gpu_id, (float)opts.ep_split, build_screen, err,
+                                         min_reserve_bytes, gguf_detail::gguf_dequant_row_f32, gguf_detail::gguf_row_bytes,
+                                         opts.vram_experts_gb, opts.ram_experts_gb, opts.ssd_experts)) {
+            return false;
+        }
 
         auto cuda_kvd = (kv_dtype_ == KvDtype::FP8_E4M3) ? strata::ink::InkKvDtype::FP8
                                                           : strata::ink::InkKvDtype::FP16;
@@ -147,7 +177,7 @@ public:
         runner_ = std::make_unique<strata::ink::InkCudaRunner>(model_);
         const bool vf_graph_ok = strata::core::allow_1024_thread_cuda_graphs(
             prop.major, prop.minor, strata::core::volta_forever_active());
-        runner_->use_cuda_graph = vf_graph_ok;
+        runner_->use_cuda_graph = vf_graph_ok && !model_.ep2_active;
         if (!vf_graph_ok) {
             std::fprintf(stderr, "[inkling-cuda] sm_70 under volta-forever: disabling 1024-thread CUDA Graph capture by default\n");
         }

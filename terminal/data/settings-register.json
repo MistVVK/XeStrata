@@ -4544,6 +4544,62 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_CUDA_PEER_P2P",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/inkling2/cuda/ink_runner.cuh",
+          "line": 596,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "int",
+      "default_state": null,
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "status": "opt-in",
+      "owner": "inkling2/cuda",
+      "note": "force direct cudaMemcpyPeerAsync transport on dual-GPU Inkling CUDA EP2 regardless of latency probe",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_CUDA_PEER_PINNED",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/inkling2/cuda/ink_runner.cuh",
+          "line": 594,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "int",
+      "default_state": null,
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "status": "opt-in",
+      "owner": "inkling2/cuda",
+      "note": "force portable pinned-host bounce buffer transport instead of direct P2P on dual-GPU Inkling CUDA EP2",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_CVEC_FUSE",
       "backends": [
         "cuda-hip",

@@ -15,10 +15,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -59,21 +62,172 @@ struct InkTreeSpec {
 // (Exact 2-stage screened argmax kernels live in ink_kernels.cuh)
 
 // ============================================================================
-// InkCudaModel: GPU-resident .strata v1.1 Trunk + Experts + Pre-processed Tensors
+// Host GGUF_RAW -> canonical SF4 (E2M1 + E4M3 block-16) converter
+// Used for exotic 1-2 bit GGUF quants (IQ1_S, IQ2_XXS, IQ3_XXS, Q2_0, etc.) or host-spilled GGUF experts!
+// ============================================================================
+inline uint8_t host_f32_to_e4m3_pos(float v) noexcept {
+    if (v <= 0.0f) return 0u;
+    if (v >= 448.0f) return 0x7Eu;
+    // Exact round-to-nearest positive FP8 E4M3 (exp bias=7, 3 mantissa bits, subnormals exp=0 -> m * 2^-9)
+    if (v < (1.0f / 64.0f)) {
+        int m = (int)std::lround(v * 512.0f);
+        if (m < 0) m = 0;
+        if (m > 7) m = 7;
+        return (uint8_t)m;
+    }
+    int exp = 0;
+    float frac = std::frexp(v, &exp);  // v = frac * 2^exp, frac in [0.5, 1.0)
+    int e_unb = exp - 1;               // v = (frac * 2) * 2^e_unb, mant in [1.0, 2.0)
+    int e_bits = e_unb + 7;
+    if (e_bits <= 0) {
+        int m = (int)std::lround(v * 512.0f);
+        return (uint8_t)std::max(0, std::min(7, m));
+    }
+    int m = (int)std::lround((frac * 2.0f - 1.0f) * 8.0f);
+    if (m >= 8) { m = 0; ++e_bits; }
+    if (e_bits >= 15) return (e_bits == 15 && m <= 6) ? (uint8_t)((15 << 3) | m) : 0x7Eu;
+    return (uint8_t)((e_bits << 3) | (m & 7));
+}
+
+inline float host_e4m3_pos_to_f32(uint8_t b) noexcept {
+    b &= 0x7Fu;
+    int e = (b >> 3) & 0xF;
+    int m = b & 7;
+    if (e == 0) return (float)m * (1.0f / 512.0f);
+    return std::ldexp(1.0f + (float)m * 0.125f, e - 7);
+}
+
+inline uint8_t host_f32_to_e2m1_nib(float v) noexcept {
+    uint8_t sign = (v < 0.0f) ? 8u : 0u;
+    float a = std::fabs(v);
+    // Midpoints between {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
+    uint8_t mag = 0u;
+    if      (a < 0.25f) mag = 0u;
+    else if (a < 0.75f) mag = 1u;
+    else if (a < 1.25f) mag = 2u;
+    else if (a < 1.75f) mag = 3u;
+    else if (a < 2.50f) mag = 4u;
+    else if (a < 3.50f) mag = 5u;
+    else if (a < 5.00f) mag = 6u;
+    else                mag = 7u;
+    return (uint8_t)(sign | mag);
+}
+
+inline void host_quant_row_sf4(const float* row, int K, float outer_scale, uint8_t* dst_p, uint8_t* dst_s) noexcept {
+    const float inv_outer = (outer_scale > 0.0f) ? (1.0f / outer_scale) : 0.0f;
+    const int nblk = K / 16;
+    for (int b = 0; b < nblk; ++b) {
+        const float* x = row + b * 16;
+        float am = 0.0f;
+        for (int i = 0; i < 16; ++i) am = std::max(am, std::fabs(x[i]));
+        uint8_t sb = host_f32_to_e4m3_pos((am / 6.0f) * inv_outer);
+        dst_s[b] = sb;
+        const float sc = host_e4m3_pos_to_f32(sb) * outer_scale;
+        const float inv = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
+        uint8_t* p = dst_p + b * 8;
+        for (int i = 0; i < 8; ++i) {
+            uint8_t lo = host_f32_to_e2m1_nib(x[2 * i + 0] * inv);
+            uint8_t hi = host_f32_to_e2m1_nib(x[2 * i + 1] * inv);
+            p[i] = (uint8_t)((lo & 0xFu) | ((hi & 0xFu) << 4));
+        }
+    }
+}
+
+template <typename DequantFn, typename RowBytesFn>
+inline bool repack_gguf_raw_body_to_sf4(
+    const uint8_t* raw_body, uint32_t raw_dn_off,
+    int D, int F,
+    DequantFn&& dequant_row, RowBytesFn&& row_bytes,
+    std::vector<uint8_t>& out_sf4, uint32_t& out_dn_off, std::string& err) {
+    InkGgufExpertHeader hdr{};
+    std::memcpy(&hdr, raw_body, sizeof(hdr));
+    const size_t rb_gu = row_bytes(hdr.gu_type, D);
+    const size_t rb_dn = row_bytes(hdr.dn_type, F);
+    if (rb_gu == 0 || rb_dn == 0) {
+        err = "SF4 repack: unsupported GGUF quant type (" + std::to_string(hdr.gu_type) + "/" + std::to_string(hdr.dn_type) + ")";
+        return false;
+    }
+
+    // Dequant gate [F, D], up [F, D], down [D, F] once into FP32
+    std::vector<float> g_buf((size_t)F * D), u_buf((size_t)F * D), d_buf((size_t)D * F);
+    const uint8_t* gu_src = raw_body + sizeof(hdr);
+    const uint8_t* dn_src = raw_body + raw_dn_off;
+    float max_gu = 0.0f, max_dn = 0.0f;
+    for (int f = 0; f < F; ++f) {
+        float* gr = g_buf.data() + (size_t)f * D;
+        float* ur = u_buf.data() + (size_t)f * D;
+        if (!dequant_row(hdr.gu_type, gu_src + (size_t)f * rb_gu, gr, D) ||
+            !dequant_row(hdr.gu_type, gu_src + (size_t)(F + f) * rb_gu, ur, D)) {
+            err = "SF4 repack: gate/up dequant failed";
+            return false;
+        }
+        for (int c = 0; c < D; ++c) {
+            gr[c] *= hdr.gate_scale;
+            ur[c] *= hdr.up_scale;
+            max_gu = std::max(max_gu, std::max(std::fabs(gr[c]), std::fabs(ur[c])));
+        }
+    }
+    for (int r = 0; r < D; ++r) {
+        float* dr = d_buf.data() + (size_t)r * F;
+        if (!dequant_row(hdr.dn_type, dn_src + (size_t)r * rb_dn, dr, F)) {
+            err = "SF4 repack: down dequant failed";
+            return false;
+        }
+        for (int c = 0; c < F; ++c) {
+            dr[c] *= hdr.dn_scale;
+            max_dn = std::max(max_dn, std::fabs(dr[c]));
+        }
+    }
+
+    const float outer_gu = std::max(max_gu / (6.0f * 240.0f), 1e-6f);
+    const float outer_dn = std::max(max_dn / (6.0f * 240.0f), 1e-6f);
+    const size_t w13_p_bytes = (size_t)(2 * F) * (D / 2);
+    const size_t w13_s_bytes = (size_t)(2 * F) * (D / 16);
+    const size_t w2_p_bytes  = (size_t)D * (F / 2);
+    const size_t w2_s_bytes  = (size_t)D * (F / 16);
+    out_dn_off = (uint32_t)(16u + w13_p_bytes + w13_s_bytes);
+    out_sf4.assign(out_dn_off + w2_p_bytes + w2_s_bytes, 0);
+
+    float sf4_hdr[4] = {outer_gu, 1.0f, outer_dn, 1.0f};
+    std::memcpy(out_sf4.data(), sf4_hdr, 16);
+    uint8_t* w13_p = out_sf4.data() + 16;
+    uint8_t* w13_s = w13_p + w13_p_bytes;
+    for (int f = 0; f < F; ++f) {
+        host_quant_row_sf4(g_buf.data() + (size_t)f * D, D, outer_gu,
+                           w13_p + (size_t)(2 * f + 0) * (D / 2), w13_s + (size_t)(2 * f + 0) * (D / 16));
+        host_quant_row_sf4(u_buf.data() + (size_t)f * D, D, outer_gu,
+                           w13_p + (size_t)(2 * f + 1) * (D / 2), w13_s + (size_t)(2 * f + 1) * (D / 16));
+    }
+    uint8_t* w2_p = out_sf4.data() + out_dn_off;
+    uint8_t* w2_s = w2_p + w2_p_bytes;
+    for (int r = 0; r < D; ++r) {
+        host_quant_row_sf4(d_buf.data() + (size_t)r * F, F, outer_dn,
+                           w2_p + (size_t)r * (F / 2), w2_s + (size_t)r * (F / 16));
+    }
+    return true;
+}
+
+// ============================================================================
+// InkCudaModel: GPU-resident .strata v1.1 / .gguf / HF Trunk + Experts (Single-GPU & Dual-GPU EP!)
 // ============================================================================
 struct InkCudaModel {
     InkManifest man;
     strata::artifact::StrataFileReader rd;
     std::string path;
     int primary_gpu = 0;
+    int peer_gpu = -1;
+    bool ep2_active = false;
+    bool ep2_p2p = false;
+    float ep_split = 0.5f;
     int sm_cc = 0;  // major * 10 + minor (e.g. 60, 61, 70, 75, 86, 89, 120, 121)
     bool trunk_attn_fp16 = false;  // true on sm_70/75: .attn.* BF16 weights converted in-place to FP16 at load!
 
     uint8_t* d_trunk = nullptr;
     uint8_t* d_sec4  = nullptr;
+    uint8_t* d_sec4_peer = nullptr;
     uint8_t* h_sec4_pinned = nullptr;  // optional pinned overflow for 8/12/16 GB GPUs
-    size_t trunk_bytes = 0, sec4_bytes = 0;
-    size_t n_vram_experts = 0, n_host_experts = 0;
+    size_t trunk_bytes = 0, sec4_bytes = 0, sec4_peer_bytes = 0;
+    size_t n_vram_experts = 0, n_peer_experts = 0, n_host_experts = 0;
 
     // Preprocessed per-layer F32 buffers (tiny: < 40 MB total)
     float* d_msg_queries[12] = {};      // [4, 2304] F32 for physical layers 6..17
@@ -82,10 +236,13 @@ struct InkCudaModel {
     float* d_sconv_attn[24] = {};       // [2304, 4] F32
     float* d_sconv_mlp[24] = {};        // [2304, 4] F32
 
-    // Per-physical-layer expert directory on GPU + Strata Hyper-Inference Hybrid Engine (for 8/12/16 GB GPUs!)
+    // Per-physical-layer expert directory on GPU 0 + optional GPU 1 (Dual-GPU EP) + Hybrid Engine
     InkExpertDev* d_experts[24] = {};
+    InkExpertDev* d_experts_peer[24] = {};
     InkLayerMoeInfo moe_info[24]{};
+    InkLayerMoeInfo moe_info_peer[24]{};
     bool layer_has_host[24] = {};
+    bool layer_has_peer[24] = {};
     InkHybridEngine hybrid;
 
     // Exact 2-stage unembed screening index (for BF16 unembed in SQ-20)
@@ -429,7 +586,621 @@ struct InkCudaModel {
         return true;
     }
 
+    // Hardware P2P roundtrip + latency probe between g0 and g1.
+    // On PCIe root-complex systems without NVLink/PCIe-switch, cudaDeviceCanAccessPeer can report true
+    // while peer DMA stalls for tens of milliseconds; benchmark P2P vs portable pinned-host bounce and
+    // auto-select whichever is genuinely faster (honoring STRATA_CUDA_PEER_PINNED=1 / STRATA_CUDA_PEER_P2P=1).
+    static bool probe_p2p(int g0, int g1) {
+        if (const char* env = std::getenv("STRATA_CUDA_PEER_PINNED"); env && std::atoi(env) != 0) return false;
+        const bool force_p2p = []() {
+            const char* env = std::getenv("STRATA_CUDA_PEER_P2P");
+            return env && std::atoi(env) != 0;
+        }();
+        int can01 = 0, can10 = 0;
+        if (cudaDeviceCanAccessPeer(&can01, g0, g1) != cudaSuccess ||
+            cudaDeviceCanAccessPeer(&can10, g1, g0) != cudaSuccess || !can01 || !can10) {
+            return false;
+        }
+        cudaSetDevice(g0);
+        cudaError_t e0 = cudaDeviceEnablePeerAccess(g1, 0);
+        if (e0 != cudaSuccess && e0 != cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); return false; }
+        cudaSetDevice(g1);
+        cudaError_t e1 = cudaDeviceEnablePeerAccess(g0, 0);
+        if (e1 != cudaSuccess && e1 != cudaErrorPeerAccessAlreadyEnabled) {
+            cudaSetDevice(g0); cudaDeviceDisablePeerAccess(g1); cudaGetLastError();
+            return false;
+        }
+        cudaGetLastError();
+
+        // 9,216-byte (1x kInkHidden float) roundtrip verification + latency comparison
+        constexpr size_t kN = kInkHidden;
+        constexpr size_t kB = kN * sizeof(float);
+        std::vector<uint32_t> h_tx(kN), h_rx01(kN, 0), h_rx10(kN, 0);
+        for (size_t i = 0; i < kN; ++i) h_tx[i] = (uint32_t)(0x12345678u ^ (i * 2654435761u));
+        uint32_t *d0 = nullptr, *d1 = nullptr, *hp = nullptr;
+        cudaStream_t s0 = nullptr, s1 = nullptr;
+        cudaSetDevice(g0);
+        cudaMalloc(&d0, kB);
+        cudaHostAlloc(&hp, kB, cudaHostAllocPortable);
+        cudaStreamCreateWithFlags(&s0, cudaStreamNonBlocking);
+        cudaMemcpy(d0, h_tx.data(), kB, cudaMemcpyHostToDevice);
+        cudaSetDevice(g1);
+        cudaMalloc(&d1, kB);
+        cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking);
+        cudaMemset(d1, 0, kB);
+
+        bool ok = (cudaMemcpyPeer(d1, g1, d0, g0, kB) == cudaSuccess) &&
+                  (cudaMemcpy(h_rx01.data(), d1, kB, cudaMemcpyDeviceToHost) == cudaSuccess);
+        cudaSetDevice(g0);
+        ok = ok && (cudaMemcpyPeer(d0, g0, d1, g1, kB) == cudaSuccess) &&
+             (cudaMemcpy(h_rx10.data(), d0, kB, cudaMemcpyDeviceToHost) == cudaSuccess);
+        ok = ok && (std::memcmp(h_tx.data(), h_rx01.data(), kB) == 0) &&
+             (std::memcmp(h_tx.data(), h_rx10.data(), kB) == 0);
+
+        double t_p2p_us = 1e9, t_pin_us = 1e9;
+        if (ok && !force_p2p) {
+            // Warmup + up to 8 timed roundtrips via P2P (early-exit if a single roundtrip stalls > 5 ms!)
+            cudaSetDevice(g1);
+            const double tw0 = now_s();
+            cudaMemcpyPeerAsync(d1, g1, d0, g0, kB, s1);
+            cudaMemcpyPeerAsync(d0, g0, d1, g1, kB, s1);
+            cudaStreamSynchronize(s1);
+            const double t_warm_us = (now_s() - tw0) * 1e6;
+            if (t_warm_us > 5000.0) {
+                t_p2p_us = t_warm_us;
+            } else {
+                const double tp0 = now_s();
+                for (int it = 0; it < 8; ++it) {
+                    cudaMemcpyPeerAsync(d1, g1, d0, g0, kB, s1);
+                    cudaMemcpyPeerAsync(d0, g0, d1, g1, kB, s1);
+                    cudaStreamSynchronize(s1);
+                }
+                t_p2p_us = (now_s() - tp0) * 1e6 / 8.0;
+            }
+
+            // Warmup + 8 timed roundtrips via portable pinned-host bounce
+            cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+            cudaSetDevice(g0); cudaEventCreateWithFlags(&ev0, cudaEventDisableTiming);
+            cudaSetDevice(g1); cudaEventCreateWithFlags(&ev1, cudaEventDisableTiming);
+            auto do_pin = [&]() {
+                cudaSetDevice(g0);
+                cudaMemcpyAsync(hp, d0, kB, cudaMemcpyDeviceToHost, s0);
+                cudaEventRecord(ev0, s0);
+                cudaSetDevice(g1);
+                cudaStreamWaitEvent(s1, ev0, 0);
+                cudaMemcpyAsync(d1, hp, kB, cudaMemcpyHostToDevice, s1);
+                cudaMemcpyAsync(hp, d1, kB, cudaMemcpyDeviceToHost, s1);
+                cudaEventRecord(ev1, s1);
+                cudaSetDevice(g0);
+                cudaStreamWaitEvent(s0, ev1, 0);
+                cudaMemcpyAsync(d0, hp, kB, cudaMemcpyHostToDevice, s0);
+                cudaStreamSynchronize(s0);
+            };
+            do_pin();
+            const double th0 = now_s();
+            for (int it = 0; it < 8; ++it) do_pin();
+            t_pin_us = (now_s() - th0) * 1e6 / 8.0;
+            cudaSetDevice(g0); cudaEventDestroy(ev0);
+            cudaSetDevice(g1); cudaEventDestroy(ev1);
+        }
+
+        cudaSetDevice(g0); cudaStreamDestroy(s0); cudaFree(d0); cudaFreeHost(hp);
+        cudaSetDevice(g1); cudaStreamDestroy(s1); cudaFree(d1);
+        cudaSetDevice(g0);
+        const bool use_p2p = ok && (force_p2p || (t_p2p_us < t_pin_us * 0.90 && t_p2p_us < 500.0));
+        if (!use_p2p) {
+            cudaSetDevice(g0); cudaDeviceDisablePeerAccess(g1); cudaGetLastError();
+            cudaSetDevice(g1); cudaDeviceDisablePeerAccess(g0); cudaGetLastError();
+            cudaSetDevice(g0);
+        }
+        if (ok && !force_p2p) {
+            std::fprintf(stderr, "[InkCUDA] EP2 GPU%d<->GPU%d transport: %s (p2p=%.1f us vs pinned=%.1f us)\n",
+                         g0, g1, use_p2p ? "direct-p2p" : "pinned-host", t_p2p_us, t_pin_us);
+        }
+        return use_p2p;
+    }
+
+    // Unified fast GPU loader for .strata v1.1, .gguf (Unsloth + ggml-org), HF safetensors, AND Dual-GPU EP (`cuda-ep2`)!
+    template <typename ModelFileT, typename DequantFn, typename RowBytesFn>
+    bool load_from_model_file(
+        const ModelFileT& mf,
+        int gpu0,
+        int gpu1,
+        float ep_split_in,
+        bool build_screen,
+        std::string& err,
+        size_t extra_reserve_bytes,
+        DequantFn&& dequant_row,
+        RowBytesFn&& row_bytes,
+        double vram_experts_gb = -1.0,
+        double ram_experts_gb = -1.0,
+        bool ssd_experts = false) {
+        // Fast zero-overhead path for single-GPU .strata v1.1!
+        if (mf.m.format == "strata" && gpu1 < 0) {
+            return load(mf.path, gpu0, build_screen, err, extra_reserve_bytes, vram_experts_gb, ram_experts_gb, ssd_experts);
+        }
+
+        path = mf.path;
+        primary_gpu = gpu0;
+        peer_gpu = (gpu1 >= 0 && gpu1 != gpu0) ? gpu1 : -1;
+        ep2_active = (peer_gpu >= 0);
+        ep_split = std::max(0.1f, std::min(0.9f, ep_split_in));
+        INK_CK(cudaSetDevice(primary_gpu));
+        {
+            cudaDeviceProp prop{};
+            INK_CK(cudaGetDeviceProperties(&prop, primary_gpu));
+            sm_cc = prop.major * 10 + prop.minor;
+        }
+        if (ep2_active) {
+            ep2_p2p = probe_p2p(primary_gpu, peer_gpu);
+            INK_CK(cudaSetDevice(primary_gpu));
+        }
+
+        // 1. Populate InkManifest directly from unified InkModelFile
+        man = InkManifest{};
+        man.build = mf.m.build;
+        man.c.n_phys         = mf.m.c.n_phys;
+        man.c.n_visits       = mf.m.c.n_visits;
+        man.c.hidden         = mf.m.c.hidden;
+        man.c.inter          = mf.m.c.inter;
+        man.c.vocab_padded   = mf.m.c.vocab_padded;
+        man.c.vocab_unpadded = mf.m.c.vocab_unpadded;
+        man.c.n_head         = mf.m.c.n_head;
+        man.c.n_kv           = mf.m.c.n_kv;
+        man.c.head_dim       = mf.m.c.head_dim;
+        man.c.d_rel          = mf.m.c.d_rel;
+        man.c.rel_extent     = mf.m.c.rel_extent;
+        man.c.swa_win        = mf.m.c.swa_win;
+        man.c.block_size     = mf.m.c.block_size;
+        man.c.n_experts      = mf.m.c.n_experts;
+        man.c.top_k          = mf.m.c.top_k;
+        man.c.core_start     = mf.m.c.core_start;
+        man.c.core_end       = mf.m.c.core_end;
+        man.c.num_passes     = mf.m.c.num_passes;
+        man.c.gate_rank      = mf.m.c.gate_rank;
+        man.c.eos_id         = mf.m.c.eos_token_id;
+        man.c.rms_eps        = mf.m.c.rms_eps;
+        man.c.qk_clip        = mf.m.c.qk_l2_clip;
+        man.c.rel_clip       = mf.m.c.rel_l2_clip;
+        man.c.log_alpha      = mf.m.c.log_scale_alpha;
+        man.c.log_floor      = mf.m.c.log_scale_floor;
+        man.c.route_scale    = mf.m.c.route_scale;
+        man.c.situ_beta      = mf.m.c.situ_beta;
+        man.c.situ_lb        = mf.m.c.situ_lb;
+        man.c.logit_softcap  = mf.m.c.logit_softcap;
+        man.c.is_swa.assign(mf.m.c.is_swa.begin(), mf.m.c.is_swa.end());
+        man.has_dspark       = mf.m.dspark.present;
+        for (const auto& kv : mf.m.trunk) {
+            TensorInfo ti;
+            ti.name = kv.second.name;
+            ti.fmt = kv.second.fmt;
+            ti.shape = kv.second.shape;
+            ti.off = kv.second.off;
+            ti.bytes = kv.second.bytes;
+            man.trunk[kv.first] = std::move(ti);
+        }
+        for (const auto& kv : mf.m.dspark_tensors) {
+            TensorInfo ti;
+            ti.name = kv.second.name;
+            ti.fmt = kv.second.fmt;
+            ti.shape = kv.second.shape;
+            ti.off = kv.second.off;
+            ti.bytes = kv.second.bytes;
+            man.dspark[kv.first] = std::move(ti);
+        }
+
+        // 2. Upload Section 1 trunk + DSpark to GPU 0
+        double t0 = now_s();
+        {
+            std::vector<uint8_t> sec1;
+            if (!mf.read_section1(sec1, err)) return false;
+            trunk_bytes = sec1.size();
+            INK_CK(cudaMalloc(&d_trunk, std::max<size_t>(256, trunk_bytes)));
+            if (trunk_bytes > 0) INK_CK(cudaMemcpy(d_trunk, sec1.data(), trunk_bytes, cudaMemcpyHostToDevice));
+        }
+        double t_trunk = now_s() - t0;
+
+        trunk_attn_fp16 = (sm_cc >= 70 && sm_cc < 80);
+        if (trunk_attn_fp16) {
+            for (const auto& kv : man.trunk) {
+                if (kv.second.fmt == FMT_BF16 && kv.first.find(".attn.") != std::string::npos) {
+                    const size_t nw = (size_t)kv.second.rows() * kv.second.cols();
+                    __nv_bfloat16* ptr = reinterpret_cast<__nv_bfloat16*>(d_trunk + kv.second.off);
+                    k_ink_bf16_to_fp16<<<(nw + 255) / 256, 256>>>(ptr, reinterpret_cast<__half*>(ptr), nw);
+                }
+            }
+            INK_CK(cudaDeviceSynchronize());
+        }
+
+        // 3. Prepare all 3072 experts (native SF4/MX8/S_K/GGUF_RAW, auto-repacking exotic GGUF quants -> SF4 in parallel!)
+        double t1 = now_s();
+        const auto& dir = mf.expert_directory();
+        const int n_total = (int)dir.size();
+        const int D = man.c.hidden, F = man.c.inter;
+        const size_t sf4_dn_off_const = 16u + (size_t)(2 * F) * (D / 2) + (size_t)(2 * F) * (D / 16);
+        const size_t sf4_body_const   = sf4_dn_off_const + (size_t)D * (F / 2) + (size_t)D * (F / 16);
+
+        // Determine per-expert target tier: 0=GPU0, 1=GPU1 (ep2), 2=Host hybrid
+        size_t vf0 = 0, vt0 = 0, vf1 = 0, vt1 = 0;
+        INK_CK(ink_cuda_mem_info(&vf0, &vt0, primary_gpu));
+        const size_t base_res0 = (vt0 >= (20ull << 30)) ? (1600ull << 20)
+                               : (vt0 <= (13ull << 30)) ? (780ull << 20) : (1280ull << 20);
+        const size_t res0 = std::max(base_res0, extra_reserve_bytes);
+        const size_t bud0 = (vf0 > res0) ? (vf0 - res0) : 0;
+        size_t bud1 = 0;
+        if (ep2_active) {
+            INK_CK(cudaSetDevice(peer_gpu));
+            INK_CK(ink_cuda_mem_info(&vf1, &vt1, peer_gpu));
+            const size_t res1 = (768ull << 20);  // peer MoE scratch + cuBLAS/driver headroom
+            bud1 = (vf1 > res1) ? (vf1 - res1) : 0;
+            INK_CK(cudaSetDevice(primary_gpu));
+        }
+
+        // Estimate expert bytes & check which GGUF_RAW experts need SF4 repack (exotic 1-2 bit quants)
+        std::vector<uint8_t> need_sf4_repack(n_total, 0);
+        std::vector<size_t> eff_bytes(n_total, 0);
+        for (int di = 0; di < n_total; ++di) {
+            const auto& e = dir[di];
+            if (e.gu_code_id == FMT_GGUF_RAW) {
+                // Peek first 32B header of layer's first expert to check gu_type/dn_type
+                std::vector<uint8_t> tmp;
+                if (di % man.c.n_experts == 0) {
+                    if (!mf.read_expert_body(di, tmp, err)) return false;
+                    InkGgufExpertHeader gh{};
+                    std::memcpy(&gh, tmp.data(), sizeof(gh));
+                    const bool gpu_ok = ink_gguf_has_gpu_kernel(gh.gu_type) && ink_gguf_has_gpu_kernel(gh.dn_type);
+                    for (int ee = 0; ee < man.c.n_experts && (di + ee) < n_total; ++ee) {
+                        need_sf4_repack[di + ee] = gpu_ok ? 0 : 1;
+                    }
+                }
+            }
+            eff_bytes[di] = need_sf4_repack[di] ? sf4_body_const : (size_t)e.body_bytes;
+        }
+
+        // Build 3x loop-weighted load order
+        const auto& vorder = mf.vram_load_order;
+        std::vector<uint16_t> order;
+        if ((int)vorder.size() == n_total) order = vorder;
+        else { order.resize(n_total); for (int i = 0; i < n_total; ++i) order[i] = (uint16_t)i; }
+
+        // Assign each expert to GPU0 (0), GPU1 (1), or Host hybrid (2)
+        // For ep2: balance each layer's 128 experts across GPU0 and GPU1 using ep_split (GPU1 target share).
+        // When default 50/50 split is requested and GPU0 holds trunk+KV while GPU1 has more free VRAM,
+        // automatically shift share slightly toward GPU1 (up to 62%) so GPU0 keeps ample KV/DSpark/Vision headroom!
+        float eff_split = ep_split;
+        if (ep2_active && std::fabs(ep_split_in - 0.5f) < 1e-3f && vf1 > vf0 + (512ull << 20)) {
+            const double ratio = (double)vf1 / std::max(1.0, (double)vf0 + (double)vf1);
+            eff_split = (float)std::max(0.50, std::min(0.625, ratio));
+        }
+        std::vector<uint8_t> target_tier(n_total, 2);
+        size_t u0 = 0, u1 = 0, uh = 0, max_exp_b = 0;
+        const int n_peer_per_layer = ep2_active ? std::max(1, std::min(man.c.n_experts - 1, (int)std::lround(man.c.n_experts * eff_split))) : 0;
+        auto want_peer = [&](int exp_id) -> bool {
+            if (!ep2_active) return false;
+            if (n_peer_per_layer == man.c.n_experts / 2) return (exp_id & 1) == 1;
+            return ((exp_id * n_peer_per_layer) % man.c.n_experts) < n_peer_per_layer;
+        };
+
+        // First pass: check if full GPU0+GPU1 fits with zero host spill!
+        size_t need0_ideal = 0, need1_ideal = 0;
+        for (int di = 0; di < n_total; ++di) {
+            if (want_peer(dir[di].expert_id)) need1_ideal += eff_bytes[di];
+            else                              need0_ideal += eff_bytes[di];
+        }
+        const size_t user_vram_cap = (vram_experts_gb >= 0.0)
+            ? static_cast<size_t>(vram_experts_gb * 1073741824.0)
+            : static_cast<size_t>(-1);
+        const bool all_fit_gpu = !ssd_experts && (need0_ideal <= std::min(bud0, user_vram_cap) && need1_ideal <= std::min(bud1, user_vram_cap));
+        const size_t hyb_post_res = std::max(res0, (size_t)(1664ull << 20));
+        const size_t hyb_bud0 = (vf0 > hyb_post_res + (256ull << 20)) ? (vf0 - hyb_post_res - (256ull << 20)) : 0;
+        const size_t cap0 = std::min(all_fit_gpu ? bud0 : hyb_bud0, user_vram_cap);
+        if (user_vram_cap < bud1) bud1 = user_vram_cap;
+
+        n_vram_experts = 0; n_peer_experts = 0; n_host_experts = 0;
+        for (uint16_t di : order) {
+            const size_t eb = eff_bytes[di];
+            const bool pref_p = want_peer(dir[di].expert_id);
+            if (pref_p && u1 + eb <= bud1) {
+                target_tier[di] = 1; u1 += eb; ++n_peer_experts;
+            } else if (!pref_p && u0 + eb <= cap0) {
+                target_tier[di] = 0; u0 += eb; ++n_vram_experts;
+            } else if (ep2_active && u1 + eb <= bud1) {
+                target_tier[di] = 1; u1 += eb; ++n_peer_experts;
+            } else if (u0 + eb <= cap0) {
+                target_tier[di] = 0; u0 += eb; ++n_vram_experts;
+            } else {
+                // Host hybrid spillover: InkHybridEngine natively runs SF4/MX8/S_K, so repack GGUF_RAW host experts to SF4!
+                if (dir[di].gu_code_id == FMT_GGUF_RAW) {
+                    need_sf4_repack[di] = 1;
+                    eff_bytes[di] = sf4_body_const;
+                }
+                const size_t hb = (eff_bytes[di] + 63ull) & ~63ull;
+                target_tier[di] = 2; uh += hb; ++n_host_experts;
+                max_exp_b = std::max(max_exp_b, eff_bytes[di]);
+            }
+        }
+        // In ep2 + host-hybrid overflow (giant model > GPU0+GPU1 VRAM), keep each layer strictly either
+        // EP2 (GPU0+GPU1) or Hybrid (GPU0+Host) so visit_layer never mixes tier==1 and tier==2 in one layer!
+        if (ep2_active && n_host_experts > 0) {
+            const int E = man.c.n_experts;
+            for (int il = 0; il < man.c.n_phys; ++il) {
+                bool has1 = false, has2 = false;
+                for (int r = 0; r < E; ++r) {
+                    const uint8_t t = target_tier[il * E + r];
+                    if (t == 1) has1 = true;
+                    else if (t == 2) has2 = true;
+                }
+                if (has1 && has2) {
+                    for (int r = 0; r < E; ++r) {
+                        const int di = il * E + r;
+                        if (target_tier[di] == 1) {
+                            u1 -= eff_bytes[di]; --n_peer_experts;
+                            if (dir[di].gu_code_id == FMT_GGUF_RAW) {
+                                need_sf4_repack[di] = 1;
+                                eff_bytes[di] = sf4_body_const;
+                            }
+                            const size_t hb = (eff_bytes[di] + 63ull) & ~63ull;
+                            target_tier[di] = 2; uh += hb; ++n_host_experts;
+                            max_exp_b = std::max(max_exp_b, eff_bytes[di]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Allocate GPU0, GPU1, and optional Host hybrid arenas
+        INK_CK(cudaSetDevice(primary_gpu));
+        sec4_bytes = u0;
+        INK_CK(cudaMalloc(&d_sec4, std::max<size_t>(256, sec4_bytes)));
+        if (ep2_active && u1 > 0) {
+            INK_CK(cudaSetDevice(peer_gpu));
+            sec4_peer_bytes = u1;
+            INK_CK(cudaMalloc(&d_sec4_peer, std::max<size_t>(256, sec4_peer_bytes)));
+            INK_CK(cudaSetDevice(primary_gpu));
+        }
+        uint8_t* h_arena_base = nullptr;
+        if (uh > 0) {
+            h_arena_base = hybrid.alloc_host_arena(uh);
+            if (!h_arena_base) { err = "cannot allocate host expert arena"; return false; }
+            hybrid.host_meta.assign((size_t)man.c.n_phys * man.c.n_experts, {});
+            hybrid.orig_host_off.assign((size_t)man.c.n_phys * man.c.n_experts, 0);
+        }
+
+        // Precompute exact destination offsets so we can upload/repack in parallel chunks!
+        std::vector<size_t> dst_off(n_total, 0);
+        {
+            size_t c0 = 0, c1 = 0, ch = 0;
+            for (int di = 0; di < n_total; ++di) {
+                if (target_tier[di] == 0)      { dst_off[di] = c0; c0 += eff_bytes[di]; }
+                else if (target_tier[di] == 1) { dst_off[di] = c1; c1 += eff_bytes[di]; }
+                else                           { dst_off[di] = ch; ch += (eff_bytes[di] + 63ull) & ~63ull; }
+            }
+        }
+
+        std::vector<InkExpertDev> h_exp0(n_total), h_exp1(n_total);
+        for (int il = 0; il < 24; ++il) {
+            moe_info[il] = {}; moe_info_peer[il] = {};
+            layer_has_host[il] = false; layer_has_peer[il] = false;
+        }
+
+        // Process layer-by-layer: sequential file read, then multi-threaded CPU repack for any exotic GGUF->SF4 experts!
+        for (int il = 0; il < man.c.n_phys; ++il) {
+            const int E = man.c.n_experts;
+            std::vector<std::vector<uint8_t>> layer_bodies(E);
+            std::vector<uint32_t> layer_dn_off(E, 0);
+            std::vector<uint8_t> layer_gu_code(E, 0), layer_dn_code(E, 0);
+            bool any_repack = false;
+            for (int r = 0; r < E; ++r) {
+                const int di = il * E + r;
+                if (need_sf4_repack[di]) any_repack = true;
+            }
+            if (any_repack) {
+                std::vector<std::vector<uint8_t>> raw_bodies(E);
+                for (int r = 0; r < E; ++r) {
+                    const int di = il * E + r;
+                    if (!mf.read_expert_body(di, raw_bodies[r], err)) return false;
+                }
+                std::atomic<int> next_r{0};
+                std::atomic<bool> par_ok{true};
+                std::mutex err_mu;
+                std::string par_err;
+                const unsigned n_thr = std::max(1u, std::min<unsigned>(16u, std::thread::hardware_concurrency()));
+                std::vector<std::thread> workers;
+                workers.reserve(n_thr);
+                for (unsigned t = 0; t < n_thr; ++t) {
+                    workers.emplace_back([&]() {
+                        while (true) {
+                            const int r = next_r.fetch_add(1);
+                            if (r >= E || !par_ok.load(std::memory_order_relaxed)) break;
+                            const int di = il * E + r;
+                            const auto& e = dir[di];
+                            if (need_sf4_repack[di]) {
+                                uint32_t new_dn = 0;
+                                std::string lerr;
+                                if (!repack_gguf_raw_body_to_sf4(raw_bodies[r].data(), e.dn_offset, D, F, dequant_row, row_bytes, layer_bodies[r], new_dn, lerr)) {
+                                    std::lock_guard<std::mutex> lk(err_mu);
+                                    par_ok.store(false);
+                                    if (par_err.empty()) par_err = lerr;
+                                    break;
+                                }
+                                raw_bodies[r].clear();
+                                raw_bodies[r].shrink_to_fit();
+                                layer_dn_off[r] = new_dn;
+                                layer_gu_code[r] = FMT_SF4;
+                                layer_dn_code[r] = FMT_SF4;
+                            } else {
+                                layer_bodies[r] = std::move(raw_bodies[r]);
+                                layer_dn_off[r] = e.dn_offset;
+                                layer_gu_code[r] = e.gu_code_id;
+                                layer_dn_code[r] = e.dn_code_id;
+                            }
+                        }
+                    });
+                }
+                for (auto& w : workers) w.join();
+                if (!par_ok.load()) { err = par_err; return false; }
+            } else {
+                for (int r = 0; r < E; ++r) {
+                    const int di = il * E + r;
+                    const auto& e = dir[di];
+                    if (!mf.read_expert_body(di, layer_bodies[r], err)) return false;
+                    layer_dn_off[r] = e.dn_offset;
+                    layer_gu_code[r] = e.gu_code_id;
+                    layer_dn_code[r] = e.dn_code_id;
+                }
+            }
+
+            // Upload layer's experts to GPU0 / GPU1 / Host hybrid
+            auto mark_info = [](InkLayerMoeInfo& mi, uint8_t code) {
+                if (code == FMT_SF4)           mi.has_sf4  = true;
+                else if (code == FMT_MX8)      mi.has_mx8  = true;
+                else if (code == FMT_GGUF_RAW) mi.has_gguf = true;
+                else                           mi.has_sk   = true;
+            };
+            for (int r = 0; r < E; ++r) {
+                const int di = il * E + r;
+                const auto& e = dir[di];
+                const int key = il * E + e.expert_id;
+                const auto& body = layer_bodies[r];
+                InkExpertDev d0{}, d1{};
+                d0.dn_off = d1.dn_off = layer_dn_off[r];
+                d0.gu_code = d1.gu_code = layer_gu_code[r];
+                d0.dn_code = d1.dn_code = layer_dn_code[r];
+                if (target_tier[di] == 0) {
+                    INK_CK(cudaSetDevice(primary_gpu));
+                    INK_CK(cudaMemcpy(d_sec4 + dst_off[di], body.data(), body.size(), cudaMemcpyHostToDevice));
+                    d0.body_off = dst_off[di]; d0.tier = 0;
+                    d1.body_off = 0;           d1.tier = 3;  // skipped on GPU 1
+                    mark_info(moe_info[il], layer_gu_code[r]);
+                } else if (target_tier[di] == 1) {
+                    INK_CK(cudaSetDevice(peer_gpu));
+                    INK_CK(cudaMemcpy(d_sec4_peer + dst_off[di], body.data(), body.size(), cudaMemcpyHostToDevice));
+                    d0.body_off = 0;           d0.tier = 3;  // skipped on GPU 0
+                    d1.body_off = dst_off[di]; d1.tier = 0;
+                    layer_has_peer[il] = true;
+                    mark_info(moe_info_peer[il], layer_gu_code[r]);
+                } else {
+                    uint8_t* hdst = h_arena_base + dst_off[di];
+                    std::memcpy(hdst, body.data(), body.size());
+                    hybrid.host_meta[key].body       = hdst;
+                    hybrid.host_meta[key].body_bytes = (uint32_t)body.size();
+                    hybrid.host_meta[key].dn_off     = layer_dn_off[r];
+                    hybrid.host_meta[key].gu_code    = layer_gu_code[r];
+                    hybrid.host_meta[key].dn_code    = layer_dn_code[r];
+                    hybrid.orig_host_off[key]        = dst_off[di];
+                    d0.body_off = dst_off[di]; d0.tier = 2;
+                    d1.body_off = 0;           d1.tier = 3;
+                    layer_has_host[il] = true;
+                    mark_info(moe_info[il], layer_gu_code[r]);
+                }
+                h_exp0[key] = d0;
+                h_exp1[key] = d1;
+            }
+        }
+        INK_CK(cudaSetDevice(primary_gpu));
+        if (n_host_experts > 0) {
+            hybrid.start_workers();
+            size_t vf_now = 0, vt_now = 0;
+            INK_CK(ink_cuda_mem_info(&vf_now, &vt_now, primary_gpu));
+            const size_t avail = (vf_now > hyb_post_res) ? (vf_now - hyb_post_res) : 0;
+            hybrid.alloc_staging(max_exp_b, avail);
+        }
+        double t_exp = now_s() - t1;
+
+        for (int il = 0; il < man.c.n_phys; ++il) {
+            INK_CK(cudaSetDevice(primary_gpu));
+            d_experts[il] = dalloc<InkExpertDev>(man.c.n_experts);
+            INK_CK(cudaMemcpy(d_experts[il], h_exp0.data() + (size_t)il * man.c.n_experts,
+                              (size_t)man.c.n_experts * sizeof(InkExpertDev), cudaMemcpyHostToDevice));
+            if (ep2_active) {
+                INK_CK(cudaSetDevice(peer_gpu));
+                d_experts_peer[il] = dalloc<InkExpertDev>(man.c.n_experts);
+                INK_CK(cudaMemcpy(d_experts_peer[il], h_exp1.data() + (size_t)il * man.c.n_experts,
+                                  (size_t)man.c.n_experts * sizeof(InkExpertDev), cudaMemcpyHostToDevice));
+            }
+        }
+        INK_CK(cudaSetDevice(primary_gpu));
+
+        // 4. Preprocess msg_queries[6..17] and static_sconv[0..23]
+        {
+            const auto& ti_q  = man.get("model.llm.middle_cycle_cross_pass_queries");
+            const auto& ti_kv = man.get("model.llm.middle_cycle_cross_pass_kv_queries");
+            std::vector<float> h_q(24 * kInkHidden), h_kv(24 * kInkHidden);
+            INK_CK(cudaMemcpy(h_q.data(), d_trunk + ti_q.off, h_q.size() * 4, cudaMemcpyDeviceToHost));
+            INK_CK(cudaMemcpy(h_kv.data(), d_trunk + ti_kv.off, h_kv.size() * 4, cudaMemcpyDeviceToHost));
+            for (int i = 0; i < 12; ++i) {
+                std::vector<float> mq(4 * kInkHidden);
+                std::memcpy(mq.data() + 0 * kInkHidden, h_q.data()  + (2 * i)     * kInkHidden, kInkHidden * 4);
+                std::memcpy(mq.data() + 1 * kInkHidden, h_kv.data() + (2 * i)     * kInkHidden, kInkHidden * 4);
+                std::memcpy(mq.data() + 2 * kInkHidden, h_kv.data() + (2 * i + 1) * kInkHidden, kInkHidden * 4);
+                std::memcpy(mq.data() + 3 * kInkHidden, h_q.data()  + (2 * i + 1) * kInkHidden, kInkHidden * 4);
+                d_msg_queries[i] = dalloc<float>(4 * kInkHidden);
+                INK_CK(cudaMemcpy(d_msg_queries[i], mq.data(), mq.size() * 4, cudaMemcpyHostToDevice));
+            }
+        }
+        for (int il = 0; il < man.c.n_phys; ++il) {
+            const std::string p = "model.llm.layers." + std::to_string(il);
+            d_sconv_attn[il] = (float*)(d_trunk + man.get(p + ".attn_sconv.weight").off);
+            d_sconv_mlp[il]  = (float*)(d_trunk + man.get(p + ".mlp_sconv.weight").off);
+            if (man.c.is_swa[il]) {
+                d_sconv_k[il] = (float*)(d_trunk + man.get(p + ".attn.k_sconv.weight").off);
+                d_sconv_v[il] = (float*)(d_trunk + man.get(p + ".attn.v_sconv.weight").off);
+            } else {
+                auto flip_t = [&](const std::string& tname) -> float* {
+                    std::vector<float> src(4 * kInkKVDim), dst(kInkKVDim * 4);
+                    INK_CK(cudaMemcpy(src.data(), d_trunk + man.get(tname).off, src.size() * 4, cudaMemcpyDeviceToHost));
+                    for (int c = 0; c < kInkKVDim; ++c)
+                        for (int l = 0; l < 4; ++l) dst[c * 4 + l] = src[(3 - l) * kInkKVDim + c];
+                    float* dptr = dalloc<float>(dst.size());
+                    INK_CK(cudaMemcpy(dptr, dst.data(), dst.size() * 4, cudaMemcpyHostToDevice));
+                    return dptr;
+                };
+                d_sconv_k[il] = flip_t(p + ".attn.k_sconv.static_w");
+                d_sconv_v[il] = flip_t(p + ".attn.v_sconv.static_w");
+            }
+        }
+
+        // 5. Optional unembed screening index
+        const auto& ui = man.get("model.llm.unembed.weight");
+        if (build_screen && (ui.fmt == FMT_BF16 || ui.fmt == FMT_S6_K)) {
+            INK_CK(ink_cuda_mem_info(&vf0, &vt0, primary_gpu));
+            if (vf0 > (2048ull << 20)) {
+                unembed_screen.V = man.c.vocab_unpadded;
+                unembed_screen.q8  = dalloc<int8_t>((size_t)unembed_screen.V * kInkHidden);
+                unembed_screen.sc  = dalloc<float>(unembed_screen.V);
+                unembed_screen.eps = dalloc<float>(unembed_screen.V);
+                if (ui.fmt == FMT_BF16) {
+                    k_ink_build_unembed_screen_bf16<<<(unembed_screen.V + 7) / 8, 256>>>(
+                        reinterpret_cast<const uint16_t*>(d_trunk + ui.off),
+                        unembed_screen.q8, unembed_screen.sc, unembed_screen.eps, unembed_screen.V);
+                } else {
+                    k_ink_build_unembed_screen_s6k<<<(unembed_screen.V + 7) / 8, 256>>>(
+                        d_trunk + ui.off,
+                        unembed_screen.q8, unembed_screen.sc, unembed_screen.eps, unembed_screen.V);
+                }
+                INK_CK(cudaDeviceSynchronize());
+                unembed_screen.ready = true;
+            }
+        }
+
+        std::fprintf(stderr, "[InkCUDA] Loaded %s (%s, fmt=%s): trunk=%.2f GB (%.2fs), experts=%zu GPU%d + %zu GPU%d / %zu host (%.2fs, ep2=%d, p2p=%d, hyb=%d), sm120_tc=%d\n",
+                     path.c_str(), man.build.c_str(), mf.m.format.c_str(), (double)trunk_bytes / 1e9, t_trunk,
+                     n_vram_experts, primary_gpu, n_peer_experts, peer_gpu, n_host_experts, t_exp,
+                     (int)ep2_active, (int)ep2_p2p, (int)hybrid.active, (int)sm120::available());
+        return true;
+    }
+
     void free_all() {
+        if (ep2_active && peer_gpu >= 0) {
+            cudaSetDevice(peer_gpu);
+            for (int il = 0; il < 24; ++il) {
+                if (d_experts_peer[il]) { cudaFree(d_experts_peer[il]); d_experts_peer[il] = nullptr; }
+            }
+            if (d_sec4_peer) { cudaFree(d_sec4_peer); d_sec4_peer = nullptr; }
+            cudaSetDevice(primary_gpu);
+        }
+        ep2_active = false; ep2_p2p = false; peer_gpu = -1;
+        n_peer_experts = 0; sec4_peer_bytes = 0;
         hybrid.free_all();
         unembed_screen.free_all();
         for (int i = 0; i < 12; ++i) if (d_msg_queries[i]) { cudaFree(d_msg_queries[i]); d_msg_queries[i] = nullptr; }
@@ -523,6 +1294,14 @@ struct InkCudaRunner {
 
     InkMoeWorkspace moe_ws;
 
+    // Dual-GPU Expert Parallelism (cuda-ep2) peer workspace & async sync (dynamically sized to max_batch -> zero B=64 cap!)
+    cudaStream_t peer_st = nullptr;
+    cudaEvent_t ev_moe_ready = nullptr, ev_peer_done = nullptr;
+    InkMoeWorkspace peer_ws;
+    float *d_peer_x = nullptr, *d_peer_y = nullptr, *d_peer_y_rx = nullptr;
+    float *h_ep_x = nullptr, *h_ep_w = nullptr, *h_ep_y = nullptr;
+    int32_t *h_ep_idx = nullptr;
+
     // 48-Visit CUDA Graph cache (keyed by M, is_tree, capture_taps)
     struct GraphKey {
         int M;
@@ -595,7 +1374,8 @@ struct InkCudaRunner {
             const size_t sc_per_pos = (kv_dtype == InkKvDtype::FP8) ? (size_t)(2 * kInkKVHeads * 4) : 0;
             const size_t swa_kv_bytes = (size_t)40 * max_slots * swa_ring * ((size_t)kInkKVDim * bpe + sc_per_pos);
             const size_t sconv_bytes  = (size_t)kInkVisits * max_slots * 3 * kInkSconvCh * 4;
-            const size_t ws_reserve   = (max_slots >= 8) ? (1400ull << 20) : (480ull << 20);  // activation workspaces + DSpark + cuBLAS headroom
+            const size_t ws_reserve   = ((max_slots >= 8) ? (1536ull << 20) : (1024ull << 20))
+                                      + (m.man.has_dspark ? (384ull << 20) : 0ull);  // activation workspaces + moe_ws + DSpark + cuBLAS headroom
             if (vfree > swa_kv_bytes + sconv_bytes + ws_reserve) {
                 const size_t avail_glob = vfree - swa_kv_bytes - sconv_bytes - ws_reserve;
                 const size_t per_pos_glob = (size_t)8 * max_slots * ((size_t)kInkKVDim * bpe + sc_per_pos);
@@ -732,6 +1512,25 @@ struct InkCudaRunner {
         h_meta_pin  = halloc_pinned<int32_t>(64ull * meta_ring_stride);
 
         moe_ws.alloc(max_batch);
+        if (m.ep2_active && m.peer_gpu >= 0) {
+            use_cuda_graph = false;
+            INK_CK(cudaSetDevice(m.primary_gpu));
+            INK_CK(cudaEventCreateWithFlags(&ev_moe_ready, cudaEventDisableTiming));
+            d_peer_y_rx = dalloc<float>(MB * kInkHidden);
+            INK_CK(cudaSetDevice(m.peer_gpu));
+            INK_CK(cudaStreamCreateWithFlags(&peer_st, cudaStreamNonBlocking));
+            INK_CK(cudaEventCreateWithFlags(&ev_peer_done, cudaEventDisableTiming));
+            peer_ws.alloc(max_batch);
+            d_peer_x = dalloc<float>(MB * kInkHidden);
+            d_peer_y = dalloc<float>(MB * kInkHidden);
+            INK_CK(cudaSetDevice(m.primary_gpu));
+            if (!m.ep2_p2p) {
+                INK_CK(cudaHostAlloc(&h_ep_x,   MB * kInkHidden * sizeof(float),   cudaHostAllocPortable));
+                INK_CK(cudaHostAlloc(&h_ep_idx, MB * kInkTopK   * sizeof(int32_t), cudaHostAllocPortable));
+                INK_CK(cudaHostAlloc(&h_ep_w,   MB * kInkTopK   * sizeof(float),   cudaHostAllocPortable));
+                INK_CK(cudaHostAlloc(&h_ep_y,   MB * kInkHidden * sizeof(float),   cudaHostAllocPortable));
+            }
+        }
         // Pre-allocate Tensor Core prefill attention workspace outside timed prefill loop when VRAM allows (~140 MB)!
         if (m.sm_cc >= 60 && max_slots <= 4 && max_batch >= 128) {
             size_t vf = 0, vt = 0;
@@ -1397,7 +2196,63 @@ struct InkCudaRunner {
         }
         prof_mark_end(0); prof_mark_start();
 
-        if (m.layer_has_host[ip] && m.hybrid.active) {
+        if (m.ep2_active && m.layer_has_peer[ip]) {
+            // Full On-GPU Dual-GPU Expert Parallelism (GPU 0 & GPU 1 run MoE concurrently; zero CPU-trunk!)
+            launch_ink_moe_router(
+                st, cublas,
+                (const float*)m.trunk_ptr(p + ".mlp.gate.weight"),
+                (const float*)m.trunk_ptr(p + ".mlp.gate.bias"),
+                d_moe_in, M, moe_ws, m.man.c.route_scale, (mode == 2));
+            const size_t x_bytes   = (size_t)M * kInkHidden * sizeof(float);
+            const size_t idx_bytes = (size_t)M * kInkTopK * sizeof(int32_t);
+            const size_t w_bytes   = (size_t)M * kInkTopK * sizeof(float);
+            if (m.ep2_p2p) {
+                INK_CK(cudaEventRecord(ev_moe_ready, st));
+                INK_CK(cudaSetDevice(m.peer_gpu));
+                INK_CK(cudaStreamWaitEvent(peer_st, ev_moe_ready, 0));
+                INK_CK(cudaMemcpyPeerAsync(d_peer_x, m.peer_gpu, d_moe_in, m.primary_gpu, x_bytes, peer_st));
+                INK_CK(cudaMemcpyPeerAsync(peer_ws.topk_idx, m.peer_gpu, moe_ws.topk_idx, m.primary_gpu, idx_bytes, peer_st));
+                INK_CK(cudaMemcpyPeerAsync(peer_ws.topk_w, m.peer_gpu, moe_ws.topk_w, m.primary_gpu, w_bytes, peer_st));
+                launch_ink_moe_dispatch_only(peer_st, m.d_sec4_peer, m.d_experts_peer[ip], m.moe_info_peer[ip],
+                                             d_peer_x, M, peer_ws, (mode == 2), false);
+                k_ink_moe_reduce8_tier0<<<dim3((kInkHidden + 255) / 256, M), 256, 0, peer_st>>>(
+                    m.d_experts_peer[ip], peer_ws.topk_idx, peer_ws.y_pair, d_peer_y, M);
+                INK_CK(cudaMemcpyPeerAsync(d_peer_y_rx, m.primary_gpu, d_peer_y, m.peer_gpu, x_bytes, peer_st));
+                INK_CK(cudaEventRecord(ev_peer_done, peer_st));
+                INK_CK(cudaSetDevice(m.primary_gpu));
+            } else {
+                INK_CK(cudaMemcpyAsync(h_ep_x, d_moe_in, x_bytes, cudaMemcpyDeviceToHost, st));
+                INK_CK(cudaMemcpyAsync(h_ep_idx, moe_ws.topk_idx, idx_bytes, cudaMemcpyDeviceToHost, st));
+                INK_CK(cudaMemcpyAsync(h_ep_w, moe_ws.topk_w, w_bytes, cudaMemcpyDeviceToHost, st));
+                INK_CK(cudaEventRecord(ev_moe_ready, st));
+                INK_CK(cudaSetDevice(m.peer_gpu));
+                INK_CK(cudaStreamWaitEvent(peer_st, ev_moe_ready, 0));
+                INK_CK(cudaMemcpyAsync(d_peer_x, h_ep_x, x_bytes, cudaMemcpyHostToDevice, peer_st));
+                INK_CK(cudaMemcpyAsync(peer_ws.topk_idx, h_ep_idx, idx_bytes, cudaMemcpyHostToDevice, peer_st));
+                INK_CK(cudaMemcpyAsync(peer_ws.topk_w, h_ep_w, w_bytes, cudaMemcpyHostToDevice, peer_st));
+                launch_ink_moe_dispatch_only(peer_st, m.d_sec4_peer, m.d_experts_peer[ip], m.moe_info_peer[ip],
+                                             d_peer_x, M, peer_ws, (mode == 2), false);
+                k_ink_moe_reduce8_tier0<<<dim3((kInkHidden + 255) / 256, M), 256, 0, peer_st>>>(
+                    m.d_experts_peer[ip], peer_ws.topk_idx, peer_ws.y_pair, d_peer_y, M);
+                INK_CK(cudaMemcpyAsync(h_ep_y, d_peer_y, x_bytes, cudaMemcpyDeviceToHost, peer_st));
+                INK_CK(cudaEventRecord(ev_peer_done, peer_st));
+                INK_CK(cudaSetDevice(m.primary_gpu));
+            }
+            // Concurrently run GPU 0's local tier=0 experts on `st`!
+            launch_ink_moe_dispatch_only(st, m.d_sec4, m.d_experts[ip], m.moe_info[ip],
+                                         d_moe_in, M, moe_ws, (mode == 2), false);
+            k_ink_moe_reduce8_tier0<<<dim3((kInkHidden + 255) / 256, M), 256, 0, st>>>(
+                m.d_experts[ip], moe_ws.topk_idx, moe_ws.y_pair, d_moe_raw, M);
+            // Join GPU 1 partial sum on GPU 0 and finish post-MLP ShortConv!
+            INK_CK(cudaStreamWaitEvent(st, ev_peer_done, 0));
+            if (!m.ep2_p2p) {
+                INK_CK(cudaMemcpyAsync(d_peer_y_rx, h_ep_y, x_bytes, cudaMemcpyHostToDevice, st));
+            }
+            const size_t n_add = (size_t)M * kInkHidden;
+            k_ink_add_f32<<<(n_add + 255) / 256, 256, 0, st>>>(d_moe_raw, d_peer_y_rx, n_add);
+            prof_mark_end(5); prof_mark_start();
+            run_sconv_uniform(d_moe_raw, m.d_sconv_mlp[ip], nullptr, d_cur, kInkHidden, 2 * kInkKVDim + kInkHidden, 0, true);
+        } else if (m.layer_has_host[ip] && m.hybrid.active) {
             launch_ink_moe_hybrid(
                 st, cublas, m.d_sec4, m.d_experts[ip], m.moe_info[ip], ip, m.hybrid,
                 (const float*)m.trunk_ptr(p + ".mlp.gate.weight"),
@@ -1689,6 +2544,21 @@ struct InkCudaRunner {
     void free_all() {
         for (auto& e : graph_cache) if (e.exec) cudaGraphExecDestroy(e.exec);
         graph_cache.clear();
+        if (m.ep2_active && m.peer_gpu >= 0) {
+            cudaSetDevice(m.peer_gpu);
+            peer_ws.free_all();
+            if (d_peer_x) { cudaFree(d_peer_x); d_peer_x = nullptr; }
+            if (d_peer_y) { cudaFree(d_peer_y); d_peer_y = nullptr; }
+            if (ev_peer_done) { cudaEventDestroy(ev_peer_done); ev_peer_done = nullptr; }
+            if (peer_st) { cudaStreamDestroy(peer_st); peer_st = nullptr; }
+            cudaSetDevice(m.primary_gpu);
+        }
+        if (d_peer_y_rx) { cudaFree(d_peer_y_rx); d_peer_y_rx = nullptr; }
+        if (ev_moe_ready) { cudaEventDestroy(ev_moe_ready); ev_moe_ready = nullptr; }
+        if (h_ep_x)   { cudaFreeHost(h_ep_x); h_ep_x = nullptr; }
+        if (h_ep_idx) { cudaFreeHost(h_ep_idx); h_ep_idx = nullptr; }
+        if (h_ep_w)   { cudaFreeHost(h_ep_w); h_ep_w = nullptr; }
+        if (h_ep_y)   { cudaFreeHost(h_ep_y); h_ep_y = nullptr; }
         moe_ws.free_all();
         for (int v = 0; v < kInkVisits; ++v) {
             if (kv_desc[v].k_f16) cudaFree(kv_desc[v].k_f16);

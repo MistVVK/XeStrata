@@ -3,6 +3,12 @@
 #pragma once
 
 #include "strata/quant/sk_codecs.hpp"
+// MERGED (2026-11-22): Ryu's (kuraneko1, MIT) two-axis SM x VRAM automatic
+// profile selection, merged into the official CUDA Inkling-2 implementation.
+// Credit: kuraneko1 (_ryu15_), https://github.com/kuraneko1/Strata (MIT). The table is pure C++ and
+// GPU-free, follows measured-only/recommend-never-force, and never overrides
+// explicit user CLI flags or env vars.
+#include "strata/inkling2/profile_rules.hpp"
 
 #include <cstddef>
 #include <cstdint>

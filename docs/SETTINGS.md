@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (300)
+## Switches you can turn on (302)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -47,6 +47,8 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_COLD_TRACE` | on / off | NVIDIA and AMD | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_COPY_ENGINE` | on / off | Intel Arc | [INTEL.md](INTEL.md) |
 | `STRATA_COPY_HIP_PRIO` | number | NVIDIA and AMD | - |
+| `STRATA_CUDA_PEER_P2P` | number | NVIDIA and AMD | - |
+| `STRATA_CUDA_PEER_PINNED` | number | NVIDIA and AMD | - |
 | `STRATA_DBG_GDN` | on / off | NVIDIA and AMD | [BATCHING.md](BATCHING.md) |
 | `STRATA_DENSE_F32` | number | NVIDIA | [COMMUNITY_BENCHMARKS.md](COMMUNITY_BENCHMARKS.md), [OLDER_GPUS.md](OLDER_GPUS.md), [README.md](bench-results/2026-10-12-p40-sm61-kernels/README.md) |
 | `STRATA_DENSE_MMQ` | on / off | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [DETAILS.md](DETAILS.md), [prefill-ab.md](bench-results/2026-10-05-community-gfx1151/prefill-ab.md) |
