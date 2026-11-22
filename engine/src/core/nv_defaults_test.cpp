@@ -129,8 +129,12 @@ int main() {
         CHECK(find(t, "STRATA_PF_FUSED_KQ") && *find(t, "STRATA_PF_FUSED_KQ") == "1");
         CHECK(!find(t, "STRATA_HC_Q8"));
         CHECK(!find(t, "STRATA_VERIFY_DEVICE_HITS"));
+        const auto t12 = nv_default_env(8, 9, false, 12ull << 30);
+        CHECK(t12.size() == 20 && find(t12, "STRATA_ADAPT_FETCH") && *find(t12, "STRATA_ADAPT_FETCH") == "2");
+        CHECK(!find(t12, "STRATA_VERIFY_DEVICE_HITS"));
         const auto t24 = nv_default_env(8, 9, false, 24ull << 30);
         CHECK(t24.size() == 20 && find(t24, "STRATA_VERIFY_DEVICE_HITS") && *find(t24, "STRATA_VERIFY_DEVICE_HITS") == "1");
+        CHECK(!find(t24, "STRATA_ADAPT_FETCH"));
         CHECK(nv_default_env(8, 9, true).empty());
         put("STRATA_SM89_PERF", "0");
         CHECK(nv_default_env(8, 9, false).empty());
@@ -171,10 +175,13 @@ int main() {
         CHECK(find(a, "STRATA_ADAPT_LAG") && *find(a, "STRATA_ADAPT_LAG") == "2");
         CHECK(find(p, "STRATA_ADAPT_NOWAIT") && *find(p, "STRATA_ADAPT_NOWAIT") == "1");
         CHECK(find(p, "STRATA_ADAPT_LAG") && *find(p, "STRATA_ADAPT_LAG") == "2");
-        // sm_86 > 16 GiB (RTX 3090 24 GB / A6000) gets VERIFY_DEVICE_HITS=1; <= 16 GiB (A4000 / 3060) does not
+        // sm_86 <= 13 GiB (RTX 3060/3070/3080) gets ADAPT_FETCH=2 (not under 026); 16 GiB (A4000) gets neither; > 16 GiB (3090/A6000) gets VERIFY_DEVICE_HITS=1
+        const auto a12 = nv_default_env(8, 6, false, 12ull << 30);
         const auto a16 = nv_default_env(8, 6, false, 16ull << 30);
         const auto a24 = nv_default_env(8, 6, false, 24ull << 30);
-        CHECK(!find(a16, "STRATA_VERIFY_DEVICE_HITS"));
+        CHECK(find(a12, "STRATA_ADAPT_FETCH") && *find(a12, "STRATA_ADAPT_FETCH") == "2");
+        CHECK(!find(nv_default_env(8, 6, true, 12ull << 30), "STRATA_ADAPT_FETCH"));
+        CHECK(!find(a16, "STRATA_VERIFY_DEVICE_HITS") && !find(a16, "STRATA_ADAPT_FETCH"));
         CHECK(find(a24, "STRATA_VERIFY_DEVICE_HITS") && *find(a24, "STRATA_VERIFY_DEVICE_HITS") == "1");
     }
     // round 0212: STRATA_MMQ_KQ=1 is a default for compute capability 8.0+ (owner yes 11-03), with its own off switches
