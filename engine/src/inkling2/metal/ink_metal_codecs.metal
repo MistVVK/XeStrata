@@ -304,7 +304,7 @@ kernel void ink_linear_bf16_mm8(
     }
 }
 
-// --- BF16 GEMV for M=1..8 (fallback)
+// --- BF16 GEMV for M=1..8 (single DRAM weight pass, ZERO barriers, exact FP32 activations!)
 kernel void ink_linear_bf16_mv(
     device const ushort* W [[buffer(0)]],
     device const float* X  [[buffer(1)]],
@@ -335,6 +335,28 @@ kernel void ink_linear_bf16_mv(
         if (has1) {
             const float v1 = simd_sum(a1);
             if (lane == 0) Y[row0 + 1] = v1;
+        }
+        return;
+    }
+
+    if (M <= 8) {
+        float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
+        for (int k = int(lane); k < K4; k += 32) {
+            const float4 w0 = bf16x4_to_f32(w0p[k]);
+            const float4 w1 = has1 ? bf16x4_to_f32(w1p[k]) : float4(0.f);
+            for (int i = 0; i < M; ++i) {
+                const float4 xv = ((device const float4*)(X + (size_t)i * K))[k];
+                a0[i] += dot(w0, xv);
+                if (has1) a1[i] += dot(w1, xv);
+            }
+        }
+        for (int i = 0; i < M; ++i) {
+            const float v0 = simd_sum(a0[i]);
+            if (lane == 0) Y[(size_t)i * N + row0] = v0;
+            if (has1) {
+                const float v1 = simd_sum(a1[i]);
+                if (lane == 0) Y[(size_t)i * N + row0 + 1] = v1;
+            }
         }
         return;
     }
@@ -705,7 +727,229 @@ kernel void ink_argmax_part_reduce(
     if (tid == 0) out_id[0] = sh_i[0];
 }
 
-// --- Q8_ROW GEMV for M=1..8 (fallback)
+// --- Multi-row Fused Unembed + Per-TG Argmax for M = 2..16 (ZERO logits DRAM write/read!)
+// grid (nparts, 1, 1), 256 threads -> writes part_v[m * nparts + tg], part_i[m * nparts + tg]
+kernel void ink_unembed_argmax_m_bf16(
+    device const ushort* W [[buffer(0)]],
+    device const float* X  [[buffer(1)]],
+    device float* part_v   [[buffer(2)]],
+    device int* part_i     [[buffer(3)]],
+    constant int& N        [[buffer(4)]],
+    constant int& K        [[buffer(5)]],
+    constant int& M        [[buffer(6)]],
+    constant int& nparts   [[buffer(7)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[8 * 8];
+    threadgroup int sh_i[8 * 8];
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int row0 = int(tg) * 16 + int(sg) * 2;
+    const bool h0 = row0 < N, h1 = (row0 + 1) < N;
+    const int K4 = K >> 2;
+    device const ushort4* w0p = (device const ushort4*)(W + (size_t)(h0 ? row0 : 0) * K);
+    device const ushort4* w1p = (device const ushort4*)(W + (size_t)(h1 ? (row0 + 1) : 0) * K);
+
+    for (int m0 = 0; m0 < M; m0 += 8) {
+        const int mm = min(8, M - m0);
+        float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
+        if (h0) {
+            for (int k = int(lane); k < K4; k += 32) {
+                const float4 w0 = bf16x4_to_f32(w0p[k]);
+                const float4 w1 = h1 ? bf16x4_to_f32(w1p[k]) : float4(0.0f);
+                for (int i = 0; i < mm; ++i) {
+                    const float4 xv = ((device const float4*)(X + (size_t)(m0 + i) * K))[k];
+                    a0[i] += dot(w0, xv);
+                    if (h1) a1[i] += dot(w1, xv);
+                }
+            }
+        }
+        for (int i = 0; i < mm; ++i) {
+            float bv = h0 ? simd_sum(a0[i]) : -1e30f;
+            int bi = row0;
+            if (h1) {
+                const float v1 = simd_sum(a1[i]);
+                if (v1 > bv) { bv = v1; bi = row0 + 1; }
+            }
+            if (lane == 0) { sh_v[i * 8 + sg] = bv; sh_i[i * 8 + sg] = bi; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < uint(mm)) {
+            const int i = int(tid);
+            float tv = sh_v[i * 8 + 0]; int ti = sh_i[i * 8 + 0];
+            for (int s = 1; s < 8; ++s) {
+                const float sv = sh_v[i * 8 + s]; const int si = sh_i[i * 8 + s];
+                if (sv > tv || (sv == tv && si < ti)) { tv = sv; ti = si; }
+            }
+            part_v[(size_t)(m0 + i) * nparts + tg] = tv;
+            part_i[(size_t)(m0 + i) * nparts + tg] = ti;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void ink_unembed_argmax_m_q8row(
+    device const uchar* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* part_v  [[buffer(2)]],
+    device int* part_i    [[buffer(3)]],
+    constant int& N       [[buffer(4)]],
+    constant int& K       [[buffer(5)]],
+    constant int& M       [[buffer(6)]],
+    constant int& nparts  [[buffer(7)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[8 * 8];
+    threadgroup int sh_i[8 * 8];
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int row0 = int(tg) * 16 + int(sg) * 2;
+    const bool h0 = row0 < N, h1 = (row0 + 1) < N;
+    device const float* scales = (device const float*)W;
+    const float sc0 = h0 ? scales[row0] : 0.0f;
+    const float sc1 = h1 ? scales[row0 + 1] : 0.0f;
+    device const uchar* qbase = W + (size_t)N * 4;
+    device const char4* q0p = (device const char4*)(qbase + (size_t)(h0 ? row0 : 0) * K);
+    device const char4* q1p = (device const char4*)(qbase + (size_t)(h1 ? (row0 + 1) : 0) * K);
+    const int K4 = K >> 2;
+
+    for (int m0 = 0; m0 < M; m0 += 8) {
+        const int mm = min(8, M - m0);
+        float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
+        if (h0) {
+            for (int k = int(lane); k < K4; k += 32) {
+                const float4 w0 = float4(q0p[k]);
+                const float4 w1 = h1 ? float4(q1p[k]) : float4(0.0f);
+                for (int i = 0; i < mm; ++i) {
+                    const float4 xv = ((device const float4*)(X + (size_t)(m0 + i) * K))[k];
+                    a0[i] += dot(w0, xv);
+                    if (h1) a1[i] += dot(w1, xv);
+                }
+            }
+        }
+        for (int i = 0; i < mm; ++i) {
+            float bv = h0 ? (simd_sum(a0[i]) * sc0) : -1e30f;
+            int bi = row0;
+            if (h1) {
+                const float v1 = simd_sum(a1[i]) * sc1;
+                if (v1 > bv) { bv = v1; bi = row0 + 1; }
+            }
+            if (lane == 0) { sh_v[i * 8 + sg] = bv; sh_i[i * 8 + sg] = bi; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < uint(mm)) {
+            const int i = int(tid);
+            float tv = sh_v[i * 8 + 0]; int ti = sh_i[i * 8 + 0];
+            for (int s = 1; s < 8; ++s) {
+                const float sv = sh_v[i * 8 + s]; const int si = sh_i[i * 8 + s];
+                if (sv > tv || (sv == tv && si < ti)) { tv = sv; ti = si; }
+            }
+            part_v[(size_t)(m0 + i) * nparts + tg] = tv;
+            part_i[(size_t)(m0 + i) * nparts + tg] = ti;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void ink_unembed_argmax_m_sk6(
+    device const uchar* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* part_v  [[buffer(2)]],
+    device int* part_i    [[buffer(3)]],
+    constant int& N       [[buffer(4)]],
+    constant int& K       [[buffer(5)]],
+    constant int& M       [[buffer(6)]],
+    constant int& nparts  [[buffer(7)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[8 * 8];
+    threadgroup int sh_i[8 * 8];
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int row0 = int(tg) * 16 + int(sg) * 2;
+    const bool h0 = row0 < N, h1 = (row0 + 1) < N;
+    constexpr int SB = 198;
+    const int nsb = K >> 8;
+    const size_t rowb = (size_t)nsb * SB;
+    device const uchar* r0 = W + (size_t)(h0 ? row0 : 0) * rowb;
+    device const uchar* r1 = h1 ? (r0 + rowb) : r0;
+
+    for (int m0 = 0; m0 < M; m0 += 8) {
+        const int mm = min(8, M - m0);
+        float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
+        if (h0) {
+            for (int unit = int(lane); unit < nsb * 32; unit += 32) {
+                const int sbi = unit >> 5, u = unit & 31, g = u >> 3, j = (g << 6) + ((u & 7) << 3);
+                device const uchar* b0 = r0 + (size_t)sbi * SB;
+                const float e0 = float(as_type<half>(ld16(b0))) * (float(b0[2 + g]) * (1.0f / 255.0f));
+                float4 w00, w01;
+                sk_w8<6>(b0 + 6, j, w00, w01);
+                float e1 = 0.0f; float4 w10 = 0.0f, w11 = 0.0f;
+                if (h1) {
+                    device const uchar* b1 = r1 + (size_t)sbi * SB;
+                    e1 = float(as_type<half>(ld16(b1))) * (float(b1[2 + g]) * (1.0f / 255.0f));
+                    sk_w8<6>(b1 + 6, j, w10, w11);
+                }
+                for (int i = 0; i < mm; ++i) {
+                    device const float4* xp = (device const float4*)(X + (size_t)(m0 + i) * K + sbi * 256 + j);
+                    const float4 x0 = xp[0], x1 = xp[1];
+                    a0[i] = fma(e0, dot(w00, x0) + dot(w01, x1), a0[i]);
+                    if (h1) a1[i] = fma(e1, dot(w10, x0) + dot(w11, x1), a1[i]);
+                }
+            }
+        }
+        for (int i = 0; i < mm; ++i) {
+            float bv = h0 ? simd_sum(a0[i]) : -1e30f;
+            int bi = row0;
+            if (h1) {
+                const float v1 = simd_sum(a1[i]);
+                if (v1 > bv) { bv = v1; bi = row0 + 1; }
+            }
+            if (lane == 0) { sh_v[i * 8 + sg] = bv; sh_i[i * 8 + sg] = bi; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < uint(mm)) {
+            const int i = int(tid);
+            float tv = sh_v[i * 8 + 0]; int ti = sh_i[i * 8 + 0];
+            for (int s = 1; s < 8; ++s) {
+                const float sv = sh_v[i * 8 + s]; const int si = sh_i[i * 8 + s];
+                if (sv > tv || (sv == tv && si < ti)) { tv = sv; ti = si; }
+            }
+            part_v[(size_t)(m0 + i) * nparts + tg] = tv;
+            part_i[(size_t)(m0 + i) * nparts + tg] = ti;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// Multi-row partial argmax reduction: grid (M, 1, 1), 256 threads
+kernel void ink_argmax_part_reduce_m(
+    device const float* part_v [[buffer(0)]],
+    device const int* part_i   [[buffer(1)]],
+    device int* out_ids        [[buffer(2)]],
+    constant int& n_parts      [[buffer(3)]],
+    uint m   [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[256];
+    threadgroup int sh_i[256];
+    device const float* pv = part_v + (size_t)m * n_parts;
+    device const int*   pi = part_i + (size_t)m * n_parts;
+    float bv = -1e30f; int bi = 0;
+    for (int i = int(tid); i < n_parts; i += 256) {
+        const float v = pv[i]; const int idx = pi[i];
+        if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
+    }
+    sh_v[tid] = bv; sh_i[tid] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sh_v[tid + s] > sh_v[tid] || (sh_v[tid + s] == sh_v[tid] && sh_i[tid + s] < sh_i[tid])) {
+                sh_v[tid] = sh_v[tid + s]; sh_i[tid] = sh_i[tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) out_ids[m] = sh_i[0];
+}
+
+// --- Q8_ROW GEMV for M=1..8 (single DRAM weight pass, ZERO barriers, exact FP32 activations!)
 kernel void ink_linear_q8row_mv(
     device const uchar* W [[buffer(0)]],
     device const float* X [[buffer(1)]],
@@ -739,6 +983,28 @@ kernel void ink_linear_q8row_mv(
         if (has1) {
             const float v1 = simd_sum(a1) * sc1;
             if (lane == 0) Y[row0 + 1] = v1;
+        }
+        return;
+    }
+
+    if (M <= 8) {
+        float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
+        for (int k = int(lane); k < K4; k += 32) {
+            const float4 w0 = float4(q0p[k]);
+            const float4 w1 = has1 ? float4(q1p[k]) : float4(0.f);
+            for (int i = 0; i < M; ++i) {
+                const float4 xv = ((device const float4*)(X + (size_t)i * K))[k];
+                a0[i] += dot(w0, xv);
+                if (has1) a1[i] += dot(w1, xv);
+            }
+        }
+        for (int i = 0; i < M; ++i) {
+            const float v0 = simd_sum(a0[i]) * sc0;
+            if (lane == 0) Y[(size_t)i * N + row0] = v0;
+            if (has1) {
+                const float v1 = simd_sum(a1[i]) * sc1;
+                if (lane == 0) Y[(size_t)i * N + row0 + 1] = v1;
+            }
         }
         return;
     }
@@ -1673,11 +1939,11 @@ kernel void ink_moe_gu_sf4(
         if (lane16 == 0) h_act[(size_t)pid0 * 1152 + r] = situ_act(g, u) * inv_sq;
         return;
     }
-    for (int t0 = 0; t0 < n; t0 += 8) {
-        const int mm = min(8, n - t0);
-        int pid[8], tk[8];
+    for (int t0 = 0; t0 < n; t0 += 4) {
+        const int mm = min(4, n - t0);
+        int pid[4], tk[4];
         for (int i = 0; i < mm; ++i) { pid[i] = pair_list[off + t0 + i]; tk[i] = pid[i] >> 3; }
-        float ag[8] = {0,0,0,0,0,0,0,0}, au[8] = {0,0,0,0,0,0,0,0};
+        float ag[4] = {0,0,0,0}, au[4] = {0,0,0,0};
         sf4_w13_chunk_s<16>(body, r, x_in, tk, mm, int(lane16), ag, au);
         for (int i = 0; i < mm; ++i) {
             const float g = moe_sum16(ag[i]), u = moe_sum16(au[i]);
@@ -1722,11 +1988,11 @@ kernel void ink_moe_dn_sf4(
         }
         return;
     }
-    for (int t0 = 0; t0 < n; t0 += 8) {
-        const int mm = min(8, n - t0);
-        int pid[8];
+    for (int t0 = 0; t0 < n; t0 += 4) {
+        const int mm = min(4, n - t0);
+        int pid[4];
         for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
-        float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
+        float a0[4] = {0,0,0,0}, a1[4] = {0,0,0,0};
         sf4_w2_pair_s<8>(body, ed.dn_off, rp, h_act, pid, mm, int(lane8), a0, a1);
         for (int i = 0; i < mm; ++i) {
             const float v0 = moe_sum8(a0[i]), v1 = moe_sum8(a1[i]);
@@ -1870,11 +2136,11 @@ kernel void ink_moe_gu_sk_t(
         if (lane == 0) h_act[(size_t)pid0 * 1152 + r] = situ_act(g, u) * inv_sq;
         return;
     }
-    for (int t0 = 0; t0 < n; t0 += 8) {
-        const int mm = min(8, n - t0);
-        int pid[8], tk[8];
+    for (int t0 = 0; t0 < n; t0 += 4) {
+        const int mm = min(4, n - t0);
+        int pid[4], tk[4];
         for (int i = 0; i < mm; ++i) { pid[i] = pair_list[off + t0 + i]; tk[i] = pid[i] >> 3; }
-        float ag[8] = {0,0,0,0,0,0,0,0}, au[8] = {0,0,0,0,0,0,0,0};
+        float ag[4] = {0,0,0,0}, au[4] = {0,0,0,0};
         sk_w13_chunk<F>(body, r, x_in, tk, mm, int(lane), ag, au);
         for (int i = 0; i < mm; ++i) {
             const float g = simd_sum(ag[i]), u = simd_sum(au[i]);
@@ -1919,11 +2185,11 @@ kernel void ink_moe_dn_sk_t(
         }
         return;
     }
-    for (int t0 = 0; t0 < n; t0 += 8) {
-        const int mm = min(8, n - t0);
-        int pid[8];
+    for (int t0 = 0; t0 < n; t0 += 4) {
+        const int mm = min(4, n - t0);
+        int pid[4];
         for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
-        float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
+        float a0[4] = {0,0,0,0}, a1[4] = {0,0,0,0};
         sk_w2_paired2<F>(body, ed.dn_off, rp, h_act, pid, mm, int(lane), a0, a1);
         for (int i = 0; i < mm; ++i) {
             const float v0 = simd_sum(a0[i]), v1 = simd_sum(a1[i]);
@@ -1980,11 +2246,11 @@ kernel void ink_moe_gu_sk23(
         if (lane == 0) h_act[(size_t)pid0 * 1152 + r] = situ_act(g, u) * inv_sq;
         return;
     }
-    for (int t0 = 0; t0 < n; t0 += 8) {
-        const int mm = min(8, n - t0);
-        int pid[8], tk[8];
+    for (int t0 = 0; t0 < n; t0 += 4) {
+        const int mm = min(4, n - t0);
+        int pid[4], tk[4];
         for (int i = 0; i < mm; ++i) { pid[i] = pair_list[off + t0 + i]; tk[i] = pid[i] >> 3; }
-        float ag[8] = {0,0,0,0,0,0,0,0}, au[8] = {0,0,0,0,0,0,0,0};
+        float ag[4] = {0,0,0,0}, au[4] = {0,0,0,0};
         if (ed.gu_code == 3)      sk_w13_chunk<3>(body, r, x_in, tk, mm, int(lane), ag, au);
         else if (ed.gu_code == 2) sk_w13_chunk<2>(body, r, x_in, tk, mm, int(lane), ag, au);
         else                      sf4_w13_chunk_s<32>(body, r, x_in, tk, mm, int(lane), ag, au);
@@ -2101,12 +2367,12 @@ kernel void ink_moe_dn_sk23(
             }
             return;
         }
-        for (int t0 = 0; t0 < n; t0 += 8) {
-            const int mm = min(8, n - t0);
-            int pid[8];
+        for (int t0 = 0; t0 < n; t0 += 2) {
+            const int mm = min(2, n - t0);
+            int pid[2];
             for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
-            float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
-            float b0[8] = {0,0,0,0,0,0,0,0}, b1[8] = {0,0,0,0,0,0,0,0};
+            float a0[2] = {0,0}, a1[2] = {0,0};
+            float b0[2] = {0,0}, b1[2] = {0,0};
             if (ed.dn_code == 2) sk_w2_2pair_coalesced<2>(body, ed.dn_off, rp0, h_act, pid, mm, int(lane), a0, a1, b0, b1);
             else                 sk_w2_2pair_coalesced<3>(body, ed.dn_off, rp0, h_act, pid, mm, int(lane), a0, a1, b0, b1);
             for (int i = 0; i < mm; ++i) {
@@ -2121,11 +2387,11 @@ kernel void ink_moe_dn_sk23(
     } else {
         const uint hid = tid >> 4, lane16 = tid & 15u;
         const int rp = int(tgp.x) * 16 + int(hid);
-        for (int t0 = 0; t0 < n; t0 += 8) {
-            const int mm = min(8, n - t0);
-            int pid[8];
+        for (int t0 = 0; t0 < n; t0 += 4) {
+            const int mm = min(4, n - t0);
+            int pid[4];
             for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
-            float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
+            float a0[4] = {0,0,0,0}, a1[4] = {0,0,0,0};
             sf4_w2_pair_s<16>(body, ed.dn_off, rp, h_act, pid, mm, int(lane16), a0, a1);
             for (int i = 0; i < mm; ++i) {
                 const float v0 = moe_sum16(a0[i]), v1 = moe_sum16(a1[i]);
