@@ -3055,6 +3055,25 @@ bool Verifier::commit(int n_keep, std::string& err) {
 
 namespace {
 double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
+// Issue #78: a lost device leaves a commit's event Pending for ever.  The old spin had neither an end nor a read of
+// Failed, so host threads stayed in R until the server's silence timer.  Use the same 20 s bound as the window waits
+// (wait_ring, service, done) and report the driver's error when the query fails.
+bool wait_commit_event(const char* what, const strata::gpu::Event* ev, std::string& err) {
+    const Clock::time_point since = Clock::now();
+    strata::gpu::Status st;
+    while ((st = strata::gpu::event_status(ev)) == strata::gpu::Status::Pending) {
+        _mm_pause();
+        if (ms_since(since) > 20000.0) {
+            err = std::string("verify: timed out waiting for ") + what;
+            return false;
+        }
+    }
+    if (st == strata::gpu::Status::Failed) {
+        err = std::string("verify: ") + what + ": " + strata::gpu::last_error();
+        return false;
+    }
+    return true;
+}
 }  // namespace
 
 void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
@@ -3151,12 +3170,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     // window is launched, never in pl_commit_async behind it (on the B70 that wait did not return while the window
     // waited for this thread)
     if (commit_live_) {
-        strata::gpu::Status st;
-        while ((st = strata::gpu::event_status(ev_commit_)) == strata::gpu::Status::Pending) _mm_pause();
-        if (st == strata::gpu::Status::Failed) {
-            err = std::string("verify: the previous commit: ") + strata::gpu::last_error();
-            return false;
-        }
+        if (!wait_commit_event("the previous commit", ev_commit_, err)) return false;
         commit_live_ = false;
     }
     win_.reset();
@@ -3283,12 +3297,7 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();
     if (commit_live_) {   // a replay (pl_launch waited for the one before): its graph reads the words below
-        strata::gpu::Status st;
-        while ((st = strata::gpu::event_status(ev_commit_)) == strata::gpu::Status::Pending) _mm_pause();
-        if (st == strata::gpu::Status::Failed) {
-            err = std::string("verify: the commit before: ") + strata::gpu::last_error();
-            return false;
-        }
+        if (!wait_commit_event("the commit before", ev_commit_, err)) return false;
     }
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
