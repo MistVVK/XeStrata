@@ -102,7 +102,7 @@ SHARED_FILES = {
 
 
 def sha256(path, size):
-    """Hash large files without the Linux page cache; a short unaligned tail is read normally."""
+    """Hash large files without the Linux page cache, falling back to a normal read."""
     import hashlib
     import mmap
     import os
@@ -114,7 +114,10 @@ def sha256(path, size):
     chunk = 4 << 20
     aligned = size - size % 4096
     digest = hashlib.sha256()
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    except OSError:
+        return _sha256_buffered(path, size)
     try:
         with mmap.mmap(-1, chunk) as buf:
             offset = 0
@@ -129,13 +132,31 @@ def sha256(path, size):
                 finally:
                     view.release()
                 offset += n
+        if aligned != size:
+            with open(path, "rb") as f:
+                f.seek(aligned)
+                tail = f.read(size - aligned)
+            if len(tail) != size - aligned:
+                raise OSError(f"short tail at {aligned}")
+            digest.update(tail)
+    except OSError:
+        return _sha256_buffered(path, size)
     finally:
         os.close(fd)
-    if aligned != size:
-        with open(path, "rb") as f:
-            f.seek(aligned)
-            tail = f.read(size - aligned)
-        if len(tail) != size - aligned:
-            raise OSError(f"short tail at {aligned}")
-        digest.update(tail)
+    return digest.hexdigest()
+
+
+def _sha256_buffered(path, size):
+    """Hash the pinned prefix through the page cache when direct I/O is refused."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    left = size
+    with open(path, "rb") as f:
+        while left:
+            data = f.read(min(1 << 20, left))
+            if not data:
+                raise OSError(f"short read at {size - left} of {size}")
+            digest.update(data)
+            left -= len(data)
     return digest.hexdigest()
