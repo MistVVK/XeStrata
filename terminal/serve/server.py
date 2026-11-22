@@ -291,6 +291,7 @@ from serve.server_parts.http_api import (  # noqa: F401  (moved unchanged, file 
     origins_of,
     parse_config_text,
     read_config,
+    request_asks_sampling,
     sampling_defaults_from_config,
     split_joined_args,
     tool_call_recovery_setting,
@@ -4041,6 +4042,31 @@ class Service:
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
+    @property
+    def has_mtp(self) -> bool:
+        """True when the underlying engine has MTP (Multi-Token Prediction) drafting enabled."""
+        if getattr(self, "_has_mtp", None) is not None:
+            return bool(self._has_mtp)
+        spawn = getattr(self.engine, "spawn", None)
+        if spawn and len(spawn) > 1 and isinstance(spawn[1], (list, tuple)):
+            args = spawn[1]
+            if "--mtp" in args:
+                idx = args.index("--mtp")
+                if idx + 1 < len(args):
+                    val = str(args[idx + 1]).lower()
+                    if val not in ("off", "0", "false"):
+                        return True
+                else:
+                    return True
+        info = getattr(self.engine, "info", None)
+        if isinstance(info, dict) and info.get("has_mtp"):
+            return True
+        return False
+
+    @has_mtp.setter
+    def has_mtp(self, val: bool | None) -> None:
+        self._has_mtp = val
+
     def admission_limit(self) -> int | None:
         if self.max_queue is None:
             return None
@@ -5364,8 +5390,13 @@ class Service:
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
-        card = model_card_sampling(self.model_arch, thinking,
-                                   greedy=asks_greedy(sampling, self.shared, self.sampling_defaults))
+        # #3354: when MTP drafting is active (has_mtp) and the request does not explicitly ask for sampling,
+        # omitted sampling parameters remain greedy so MTP drafts are not silently disabled by model card defaults.
+        mtp_greedy = self.has_mtp and not request_asks_sampling(sampling, self.shared, self.sampling_defaults)
+        card = {} if mtp_greedy else model_card_sampling(
+            self.model_arch, thinking,
+            greedy=asks_greedy(sampling, self.shared, self.sampling_defaults),
+        )
         defaults = {**card, **self.sampling_defaults, **self.shared}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
@@ -7361,7 +7392,9 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            defaults = {**model_card_sampling(svc.model_arch, True, greedy=asks_greedy(svc.shared, svc.sampling_defaults)),
+            card_defaults = {} if (svc.has_mtp and not request_asks_sampling(svc.shared, svc.sampling_defaults)) else \
+                model_card_sampling(svc.model_arch, True, greedy=asks_greedy(svc.shared, svc.sampling_defaults))
+            defaults = {**card_defaults,
                         **svc.sampling_defaults, **svc.shared}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
             params = {names.get(k, k): v for k, v in defaults.items()

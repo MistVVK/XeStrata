@@ -16,7 +16,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine, asks_greedy, model_card_sampling, serve  # noqa: E402
+from serve.server import (  # noqa: E402
+    ByteTokenizer,
+    MockEngine,
+    Service,
+    StrataEngine,
+    asks_greedy,
+    model_card_sampling,
+    request_asks_sampling,
+    serve,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -49,6 +58,7 @@ class ModelCardSampling(unittest.TestCase):
 
     def tearDown(self):
         self.svc.model_arch = None
+        self.svc.has_mtp = False
 
     def keys(self, **body):
         body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, **body}
@@ -128,6 +138,39 @@ class ModelCardSampling(unittest.TestCase):
     def test_no_family_no_defaults(self):
         self.svc.model_arch = None
         self.assertEqual(self.keys(), "")
+
+    def test_mtp_defaults_to_greedy_when_no_sampling_specified(self):
+        # Issue #3354: when MTP drafting is enabled and the request specifies no sampling parameters,
+        # the request stays greedy so MTP drafts are not silently blocked by model-card defaults.
+        self.svc.model_arch = "qwen35moe"
+        self.svc.has_mtp = True
+        k = self.keys()
+        self.assertNotIn("temperature", k)
+        self.assertNotIn("penalty_present", k)
+        self.assertEqual(k, "")
+
+    def test_mtp_explicit_sampling_respected(self):
+        self.svc.model_arch = "qwen35moe"
+        self.svc.has_mtp = True
+        k = self.keys(temperature=0.8, top_p=0.9)
+        self.assertIn("temperature=0.8", k)
+        self.assertIn("top_p=0.9", k)
+
+    def test_mtp_explicit_zero_stays_greedy(self):
+        self.svc.model_arch = "qwen35moe"
+        self.svc.has_mtp = True
+        k = self.keys(temperature=0)
+        self.assertNotIn("temperature", k)
+        self.assertNotIn("penalty_present", k)
+
+    def test_request_asks_sampling(self):
+        self.assertFalse(request_asks_sampling())
+        self.assertFalse(request_asks_sampling({}))
+        self.assertFalse(request_asks_sampling({"max_tokens": 100}))
+        self.assertTrue(request_asks_sampling({"temperature": 0}))
+        self.assertTrue(request_asks_sampling({"temperature": 0.7}))
+        self.assertTrue(request_asks_sampling({"presence_penalty": 1.5}))
+        self.assertTrue(request_asks_sampling({}, {"top_k": 20}))
 
 
 if __name__ == "__main__":
