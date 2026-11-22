@@ -474,6 +474,22 @@ def reachable(url: str, timeout: float = 5.0) -> bool:
         return False
 
 
+def repo_closed(repo: str, timeout: float = 5.0) -> bool:
+    """Whether Hugging Face answers 401 for `repo` without a login: a private or removed repository, which setup cannot
+    download (it takes no Hugging Face token).  Any other answer, or none (offline, a mirror without the API), is no
+    verdict: the download says what is wrong.  A gated repository's page answers 200: only its files are closed."""
+    try:
+        req = urllib.request.Request(f"{hf_endpoint()}/api/models/{repo}", method="HEAD",
+                                     headers={"User-Agent": "xestrata-setup"})
+        urllib.request.urlopen(req, timeout=timeout).close()
+    except urllib.error.HTTPError as e:
+        e.close()
+        return e.code == 401
+    except OSError:
+        pass
+    return False
+
+
 def model_source() -> str:
     """"modelscope" or "huggingface".  ModelScope only when --source modelscope / XESTRATA_SOURCE=modelscope asks for
     it; everything else (auto, a HF_ENDPOINT mirror chosen on purpose, #495) is Hugging Face.  Setup does not switch
@@ -4666,6 +4682,10 @@ def download_file(url, dst: Path, what=None):
         except download_core.NetFailure as e:   # 12 s then 30 s: about 44 s for a silent host, not 320
             net_fail(e, what or dst.name)
         except urllib.error.HTTPError as e:
+            if e.code == 401:                              # a private or removed repository: no try opens it
+                fail(f"{what or dst.name}: {url.split('/')[2]} answers 401 for {hf_repo(url) or url}: the repository "
+                     "is private or gone, and setup downloads without a login", "choose another model, or update "
+                     "XeStrata")
             if e.code == 404 and hf_unpinned(url) != url:  # the pinned revision is gone from the repository
                 if not allow_unpinned():
                     fail(f"the pinned version of {what or dst.name} is no longer on Hugging Face",
@@ -7054,6 +7074,25 @@ def first_choice(fams: list, room: Room) -> tuple:
         if size:
             return f, size
     return last
+
+
+def first_offered(fams: list, room: Room) -> tuple:
+    """first_choice among the families setup can download (the user's decision of 2026-11-22): one whose model
+    repository Hugging Face answers 401 (repo_closed) is passed over with a line that says so, and the next of
+    FIRST_CHOICE is offered.  When none is left (the last step closed too) setup stops, naming each."""
+    fams, passed = list(fams), []
+    while True:
+        f, size = first_choice(fams, room)
+        shut = [r for role, r in family_repos(f, size or recommend_size(f, room)) if role == "model" and repo_closed(r)]
+        if not shut:
+            return f, size
+        passed.append(f"{FAMILIES[f]['title']} ({', '.join(shut)})")
+        warn(f"{FAMILIES[f]['title']} is passed over: Hugging Face answers 401 for {', '.join(shut)} (the repository "
+             "is private or gone; setup downloads without a login)")
+        if f == LAST_CHOICE or f not in [c for c, *_ in FIRST_CHOICE]:
+            fail("none of the models setup offers a first install can be downloaded: Hugging Face answers 401 for "
+                 + "; ".join(passed), "choose another model with --family (--help lists them), or update XeStrata")
+        fams.remove(f)
 
 
 def recommend_family(fams: list, room: Room) -> str:
@@ -10093,7 +10132,7 @@ def describe() -> dict:
     vram = gpu_expert_vram(gpu) if gpu else 0.0
     by_vram = vram_ctx([gpu]) if gpu else 32768
     room = room_of(ram, [gpu] if gpu else [])
-    first_fam, first_size = first_choice([f for f in FAMILIES if f != CUSTOM], room)
+    first_fam, first_size = first_offered([f for f in FAMILIES if f != CUSTOM], room)
     families = []
     for f, fam in FAMILIES.items():
         if fam.get("edge0"):
@@ -10999,7 +11038,7 @@ def main() -> int:
     else:
         # the first this PC runs of FIRST_CHOICE (without a GPU: the 2B, the better answers), asked by its levels
         room = room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]])
-        first = first_choice(fams, room)
+        first = first_offered(fams, room)
         family, a.quantizer = ask_tiers(fams, halo_fam or first[0], room, halo_fam, a.yes)
     if not on_cpu and family not in PLAIN_FAMILIES and ram < minimum_setup_ram(family) - 4 and not low_ok:
         setup_ram_stop(family, ram, minimum_setup_ram(family))     # step 1's stop, for the Flash-Next family chosen
