@@ -338,9 +338,11 @@ __device__ __forceinline__ float ue8m0_to_f32(uint8_t e) {
     return __uint_as_float((uint32_t)e << 23);
 }
 
-// Exact SITU(beta=4.0, lb=25.0) double-softcapped MoE activation
+// Exact SITU(beta=4.0, lb=25.0) double-softcapped MoE activation (non-finite guard prevents NaN propagation!)
 __device__ __forceinline__ float situ_f32(float g, float u) {
-    const float sig = 1.0f / (1.0f + __expf(-g));
+    if (!isfinite(g) || !isfinite(u)) return 0.0f;
+    const float gc = fminf(fmaxf(g, -80.0f), 80.0f);
+    const float sig = 1.0f / (1.0f + __expf(-gc));
     const float ga = kInkSituBeta * tanhf(g * (1.0f / kInkSituBeta)) * sig;
     const float ua = kInkSituLb * tanhf(u * (1.0f / kInkSituLb));
     return ga * ua;

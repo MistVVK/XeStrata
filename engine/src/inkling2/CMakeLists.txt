@@ -111,8 +111,10 @@ if(STRATA_ENABLE_CUDA)
     CUDA_STANDARD_REQUIRED ON
     CUDA_ARCHITECTURES "${STRATA_INK_CUDA_ARCHS}"
     CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_RUNTIME_LIBRARY Shared
     POSITION_INDEPENDENT_CODE ON
   )
+  set_target_properties(strata-inkling PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
   target_link_libraries(strata-inkling PRIVATE strata_inkling_ep_cuda)
   target_compile_definitions(strata-inkling PRIVATE INKLING_ENABLE_EP_CUDA=1)
 endif()

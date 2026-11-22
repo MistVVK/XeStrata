@@ -497,7 +497,7 @@ int main(int argc, char** argv) {
     if (!image_path.empty()) {
         std::vector<float> emb;
         int ntok = 0;
-        if (!runner.vis.encode_image_file(cx, image_path, emb, ntok, err)) {
+        if (!runner.ensure_vision(err) || !runner.vis.encode_image_file(cx, image_path, emb, ntok, err)) {
             fprintf(stderr, "[ERROR] vision: %s\n", err.c_str());
             return 1;
         }

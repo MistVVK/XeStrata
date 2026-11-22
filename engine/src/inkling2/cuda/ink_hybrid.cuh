@@ -329,11 +329,56 @@ inline void quant_q8_1_h(const float* x, InkQ8_1_G64* out, int cols) noexcept {
     }
 }
 
+inline const int8_t (*s15_trit_lut_h() noexcept)[5] {
+    static int8_t lut[256][5];
+    static bool init = false;
+    if (!init) {
+        for (int b = 0; b < 256; ++b) {
+            int v = b;
+            for (int k = 0; k < 5; ++k) {
+                lut[b][k] = (int8_t)((v % 3) - 1);
+                v /= 3;
+            }
+        }
+        init = true;
+    }
+    return lut;
+}
+
+inline void s15_unpack64_h(const uint8_t* pl, int g, int8_t out[64]) noexcept {
+    const auto* lut = s15_trit_lut_h();
+    const int base = g * 64;
+    int i = 0;
+    int byte_idx = base / 5;
+    int rem = base % 5;
+    if (rem != 0) {
+        const int8_t* t = lut[pl[byte_idx++]];
+        for (int k = rem; k < 5 && i < 64; ++k) out[i++] = t[k];
+    }
+    while (i + 5 <= 64) {
+        const int8_t* t = lut[pl[byte_idx++]];
+        out[i + 0] = t[0]; out[i + 1] = t[1]; out[i + 2] = t[2]; out[i + 3] = t[3]; out[i + 4] = t[4];
+        i += 5;
+    }
+    if (i < 64) {
+        const int8_t* t = lut[pl[byte_idx]];
+        for (int k = 0; i < 64; ++k) out[i++] = t[k];
+    }
+}
+
 inline float dot_sk_sub64_h(const uint8_t* pl, int fmt, int g, const InkQ8_1_G64& xb, float eff) noexcept {
     const int8_t* qs = xb.qs;
     int32_t isum = 0;
 #if defined(INK_HOST_AVX2)
-    if (fmt == FMT_S4_K) {
+    if (fmt == FMT_S1_5) {
+        alignas(32) int8_t tr[64];
+        s15_unpack64_h(pl, g, tr);
+        const __m256i bias = _mm256_set1_epi8(1);
+        const __m256i u0 = _mm256_add_epi8(_mm256_load_si256(reinterpret_cast<const __m256i*>(tr)), bias);
+        const __m256i u1 = _mm256_add_epi8(_mm256_load_si256(reinterpret_cast<const __m256i*>(tr + 32)), bias);
+        isum = avx2_dot_u8_i8_64(u0, u1, qs);
+        return eff * (xb.d * (float)isum - xb.s);
+    } else if (fmt == FMT_S4_K) {
         const uint8_t* p = pl + g * 32;
         const __m128i m0f = _mm_set1_epi8(0x0F);
         const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
@@ -506,14 +551,13 @@ inline float dot_sk_sub64_h(const uint8_t* pl, int fmt, int g, const InkQ8_1_G64
         for (int i = 0; i < 64; ++i) isum += (int32_t)p[i] * qs[i];
         return eff * xb.d * (float)isum;
     } else if (fmt == FMT_S1_5) {
-        for (int i = 0; i < 64; ++i) {
-            const int idx = g * 64 + i;
-            int b = pl[idx / 5];
-            int k = idx % 5;
-            for (int r = 0; r < k; ++r) b /= 3;
-            int tr = (b % 3) - 1;
-            isum += tr * qs[i];
-        }
+        alignas(16) int8_t tr[64];
+        s15_unpack64_h(pl, g, tr);
+#if defined(INK_HOST_NEON)
+        isum = neon_dot_s8_64(tr);
+#else
+        for (int i = 0; i < 64; ++i) isum += (int32_t)tr[i] * (int32_t)qs[i];
+#endif
         return eff * xb.d * (float)isum;
     }
     return 0.0f;
@@ -622,6 +666,153 @@ inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float
             }
             y_out[2 * pr]     = y0;
             y_out[2 * pr + 1] = y1;
+        }
+    }
+}
+
+// Expert-grouped multi-token CPU evaluator (M=2..16 verify): reads each weight block ONCE across all `cnt` routed tokens!
+inline void eval_expert_batch_f32_h(
+    const InkHostExpertMeta& em,
+    const float* const* xs,
+    float* const* ys,
+    int cnt,
+    const uint8_t* body_override = nullptr,
+    void (*wait_down)(void*) = nullptr, void* wait_ctx = nullptr) noexcept {
+    if (cnt <= 0) return;
+    if (cnt == 1) {
+        eval_expert_f32_h(em, xs[0], ys[0], body_override, wait_down, wait_ctx);
+        return;
+    }
+    constexpr int D = kInkHidden;
+    constexpr int I = kInkInter;
+    const uint8_t* body = body_override ? body_override : em.body;
+    if (!body) {
+        for (int t = 0; t < cnt; ++t) std::memset(ys[t], 0, (size_t)D * sizeof(float));
+        return;
+    }
+    constexpr int MAX_T = 16;
+    const int T = std::min(cnt, MAX_T);
+    float act[MAX_T][I];
+
+    // 1. Gate + Up + SITU(4.0, 25.0) — reuse each weight row across all T tokens in L1!
+    if (em.gu_code == FMT_SF4) {
+        float hdr[4];
+        std::memcpy(hdr, body, 16);
+        const float w_outer = hdr[0] / hdr[1];
+        const uint8_t* bp = body + 16;
+        const uint8_t* bs = bp + (size_t)(2 * I) * (D / 2);
+        for (int j = 0; j < I; ++j) {
+            const uint8_t* pg = bp + (size_t)(2 * j) * (D / 2);
+            const uint8_t* sg = bs + (size_t)(2 * j) * (D / 16);
+            const uint8_t* pu = bp + (size_t)(2 * j + 1) * (D / 2);
+            const uint8_t* su = bs + (size_t)(2 * j + 1) * (D / 16);
+            for (int t = 0; t < T; ++t) {
+                const float g = dot_sf4_row_h(pg, sg, w_outer, xs[t], D);
+                const float u = dot_sf4_row_h(pu, su, w_outer, xs[t], D);
+                const float sig = 1.0f / (1.0f + std::exp(-g));
+                act[t][j] = (kInkSituBeta * std::tanh(g / kInkSituBeta) * sig) * (kInkSituLb * std::tanh(u / kInkSituLb));
+            }
+        }
+    } else if (em.gu_code == FMT_MX8) {
+        const uint8_t* bp = body;
+        const uint8_t* bs = bp + (size_t)(2 * I) * D;
+        for (int j = 0; j < I; ++j) {
+            const uint8_t* pg = bp + (size_t)(2 * j) * D;
+            const uint8_t* sg = bs + (size_t)(2 * j) * (D / 32);
+            const uint8_t* pu = bp + (size_t)(2 * j + 1) * D;
+            const uint8_t* su = bs + (size_t)(2 * j + 1) * (D / 32);
+            for (int t = 0; t < T; ++t) {
+                const float g = dot_mx8_row_h(pg, sg, xs[t], D);
+                const float u = dot_mx8_row_h(pu, su, xs[t], D);
+                const float sig = 1.0f / (1.0f + std::exp(-g));
+                act[t][j] = (kInkSituBeta * std::tanh(g / kInkSituBeta) * sig) * (kInkSituLb * std::tanh(u / kInkSituLb));
+            }
+        }
+    } else {
+        InkQ8_1_G64 xq[MAX_T][D / 64];
+        for (int t = 0; t < T; ++t) quant_q8_1_h(xs[t], xq[t], D);
+        const int sb = ink_sb_bytes(em.gu_code);
+        const size_t row_b = 9ull * sb;
+        const uint8_t* gu_base = body + I * 2;
+        for (int j = 0; j < I; ++j) {
+            const uint8_t* gr = gu_base + (size_t)(2 * j) * row_b;
+            const uint8_t* ur = gr + row_b;
+            float g[MAX_T] = {}, u[MAX_T] = {};
+            for (int s = 0; s < 9; ++s) {
+                const uint8_t* bg = gr + s * sb;
+                const uint8_t* bu = ur + s * sb;
+                uint16_t dg, du;
+                std::memcpy(&dg, bg, 2); std::memcpy(&du, bu, 2);
+                const float Dg = f16_to_f32_h(dg), Du = f16_to_f32_h(du);
+                for (int sg = 0; sg < 4; ++sg) {
+                    const float effg = Dg * ((float)bg[2 + sg] * (1.0f / 255.0f));
+                    const float effu = Du * ((float)bu[2 + sg] * (1.0f / 255.0f));
+                    const int idx = s * 4 + sg;
+                    for (int t = 0; t < T; ++t) {
+                        g[t] += dot_sk_sub64_h(bg + 6, em.gu_code, sg, xq[t][idx], effg);
+                        u[t] += dot_sk_sub64_h(bu + 6, em.gu_code, sg, xq[t][idx], effu);
+                    }
+                }
+            }
+            uint16_t sq_bits;
+            std::memcpy(&sq_bits, body + j * 2, 2);
+            const float inv_sq = 1.0f / f16_to_f32_h(sq_bits);
+            for (int t = 0; t < T; ++t) {
+                const float sig = 1.0f / (1.0f + std::exp(-g[t]));
+                act[t][j] = (kInkSituBeta * std::tanh(g[t] / kInkSituBeta) * sig) * (kInkSituLb * std::tanh(u[t] / kInkSituLb)) * inv_sq;
+            }
+        }
+    }
+
+    // 2. Down projection [D, I]
+    if (wait_down) wait_down(wait_ctx);
+    if (em.dn_code == FMT_SF4) {
+        float hdr[4];
+        std::memcpy(hdr, body, 16);
+        const float w_outer = hdr[2] / hdr[3];
+        const uint8_t* bp = body + em.dn_off;
+        const uint8_t* bs = bp + (size_t)D * (I / 2);
+        for (int r = 0; r < D; ++r) {
+            const uint8_t* pr = bp + (size_t)r * (I / 2);
+            const uint8_t* sr = bs + (size_t)r * (I / 16);
+            for (int t = 0; t < T; ++t) ys[t][r] = dot_sf4_row_h(pr, sr, w_outer, act[t], I);
+        }
+    } else if (em.dn_code == FMT_MX8) {
+        const uint8_t* bp = body + em.dn_off;
+        const uint8_t* bs = bp + (size_t)D * I;
+        for (int r = 0; r < D; ++r) {
+            const uint8_t* pr = bp + (size_t)r * I;
+            const uint8_t* sr = bs + (size_t)r * (I / 32);
+            for (int t = 0; t < T; ++t) ys[t][r] = dot_mx8_row_h(pr, sr, act[t], I);
+        }
+    } else {
+        InkQ8_1_G64 hq[MAX_T][I / 64];
+        for (int t = 0; t < T; ++t) quant_q8_1_h(act[t], hq[t], I);
+        const int sb = ink_sb_bytes(em.dn_code);
+        const size_t pair_b = 9ull * sb;
+        const uint8_t* dn_base = body + em.dn_off;
+        for (int pr = 0; pr < D / 2; ++pr) {
+            const uint8_t* blk0 = dn_base + (size_t)pr * pair_b;
+            float y0[MAX_T] = {}, y1[MAX_T] = {};
+            for (int s = 0; s < 9; ++s) {
+                const uint8_t* blk = blk0 + s * sb;
+                uint16_t d16;
+                std::memcpy(&d16, blk, 2);
+                const float Dsc = f16_to_f32_h(d16);
+                for (int sg = 0; sg < 4; ++sg) {
+                    const int sub_g = s * 4 + sg;
+                    const float eff = Dsc * ((float)blk[2 + sg] * (1.0f / 255.0f));
+                    if (sub_g < 18) {
+                        for (int t = 0; t < T; ++t) y0[t] += dot_sk_sub64_h(blk + 6, em.dn_code, sg, hq[t][sub_g], eff);
+                    } else {
+                        for (int t = 0; t < T; ++t) y1[t] += dot_sk_sub64_h(blk + 6, em.dn_code, sg, hq[t][sub_g - 18], eff);
+                    }
+                }
+            }
+            for (int t = 0; t < T; ++t) {
+                ys[t][2 * pr]     = y0[t];
+                ys[t][2 * pr + 1] = y1[t];
+            }
         }
     }
 }
@@ -764,9 +955,11 @@ struct InkHybridEngine {
     float* h_v_x    = nullptr;   // pinned [16 * kInkHidden]
     float* h_v_y    = nullptr;   // pinned [16 * kInkTopK * kInkHidden]
     int32_t* h_v_p  = nullptr;   // pinned [16 * kInkTopK] pair indices written by CPU
+    int32_t* h_v_idx = nullptr;  // pinned [16 * kInkTopK] topk_idx D2H staging (<= 512 B)
     float* d_v_y    = nullptr;   // device mirror for fast scatter
     int32_t* d_v_p  = nullptr;   // device pair indices
     double dec_pcie_share = -1.0; // -1 = auto, 0 = 100% CPU, 1 = 100% PCIe DMA (STRATA_INK_DEC_PCIE_SHARE)
+    uint32_t promo_step = 0;      // cadence counter so step_promote does NOT sync every single token!
     bool l3_pf_enabled = true;    // STRATA_L3_PF: idle-worker next-layer L3 prefetch
     std::atomic<uint32_t> pf_gen{0};
     int pf_layer = -1, pf_n = 0;
@@ -839,18 +1032,89 @@ struct InkHybridEngine {
     InkExpertDev* h_pf_exp_pin[2] = {};
     bool pf_buf_busy[2] = {false, false};
 
-    // Spin-wait worker threads
+    // Spin-wait worker threads (shared by M=1 doorbell AND M=2..16 expert-grouped verify — ZERO std::thread spawns!)
+    struct CpuVerifyGroup {
+        int eid = 0;
+        int count = 0;
+        int pids[16] = {};
+        int out_slots[16] = {};
+    };
     std::atomic<bool> stop_flag{false};
     std::atomic<uint32_t> work_gen{0};
     std::atomic<int> work_done{0};
-    int cur_layer = 0, cur_nj = 0;
+    std::atomic<int> verify_next{0};
+    int work_mode = 0;  // 0 = M=1 doorbell jobs, 1 = M=2..16 expert-grouped verify jobs
+    int cur_layer = 0, cur_nj = 0, cur_ng = 0;
     int cur_slot_k[kInkTopK] = {}, cur_eid[kInkTopK] = {};
     int cur_cold_slot[kInkTopK] = {-1,-1,-1,-1,-1,-1,-1,-1};
     const uint8_t* cur_cold_ptr[kInkTopK] = {};
     float cur_x[kInkHidden] = {};
+    CpuVerifyGroup verify_groups[kInkExperts];
     std::vector<std::thread> workers;
     std::thread master_thr;
     int n_threads = 0;
+
+    void eval_verify_group(int gi) noexcept {
+        const auto& grp = verify_groups[gi];
+        const int key = cur_layer * n_experts + grp.eid;
+        const auto& hm = host_meta[key];
+        const float* xs[16];
+        float* ys[16];
+        for (int k = 0; k < grp.count; ++k) {
+            const int pid = grp.pids[k];
+            const int m   = pid / kInkTopK;
+            const int os  = grp.out_slots[k];
+            h_v_p[os] = pid;
+            xs[k] = h_v_x + (size_t)m * kInkHidden;
+            ys[k] = h_v_y + (size_t)os * kInkHidden;
+        }
+        if (hm.body != nullptr) {
+            host_eval::eval_expert_batch_f32_h(hm, xs, ys, grp.count);
+        } else if (hm.cold_ssd && cold_store) {
+            int cslot = -1;
+            const uint64_t g_now = step_gen.load(std::memory_order_relaxed);
+            const uint8_t* cptr = cold_store->demand_begin(key, cur_layer, g_now, cslot);
+            if (cptr && cslot >= 0) {
+                struct DwCtx { ink2::InkColdStore* cs; int slot; };
+                DwCtx ctx{cold_store.get(), cslot};
+                auto dw_cb = +[](void* p) {
+                    auto* c = static_cast<DwCtx*>(p);
+                    c->cs->wait_down(c->slot);
+                };
+                if (cold_store->wait_gate_up(cslot)) {
+                    host_eval::eval_expert_batch_f32_h(hm, xs, ys, grp.count, cptr, dw_cb, &ctx);
+                } else {
+                    for (int k = 0; k < grp.count; ++k) std::memset(ys[k], 0, (size_t)kInkHidden * sizeof(float));
+                }
+                cold_store->unpin_slot(cslot);
+            } else {
+                for (int k = 0; k < grp.count; ++k) std::memset(ys[k], 0, (size_t)kInkHidden * sizeof(float));
+            }
+        } else {
+            for (int k = 0; k < grp.count; ++k) std::memset(ys[k], 0, (size_t)kInkHidden * sizeof(float));
+        }
+    }
+
+    void run_verify_groups(int layer, int ng) noexcept {
+        if (ng <= 0) return;
+        cur_layer = layer;
+        cur_ng = ng;
+        work_mode = 1;
+        verify_next.store(0, std::memory_order_relaxed);
+        work_done.store(0, std::memory_order_relaxed);
+        if (n_threads > 1 && ng > 1) {
+            work_gen.fetch_add(1, std::memory_order_release);
+        }
+        while (true) {
+            const int gi = verify_next.fetch_add(1, std::memory_order_relaxed);
+            if (gi >= ng) break;
+            eval_verify_group(gi);
+        }
+        if (n_threads > 1 && ng > 1) {
+            while (work_done.load(std::memory_order_acquire) < n_threads - 1) std::this_thread::yield();
+        }
+        work_mode = 0;
+    }
 
     void eval_doorbell_job(int j) noexcept {
         const int key = cur_layer * n_experts + cur_eid[j];
@@ -888,11 +1152,12 @@ struct InkHybridEngine {
         d_cur_seq = dalloc<uint32_t>(1);
         INK_CK(cudaMemset(d_seq, 0, 4));
         INK_CK(cudaMemset(d_cur_seq, 0, 4));
-        h_v_x = halloc_pinned<float>(16 * kInkHidden);
-        h_v_y = halloc_pinned<float>(16 * kInkTopK * kInkHidden);
-        h_v_p = halloc_pinned<int32_t>(16 * kInkTopK);
-        d_v_y = dalloc<float>(16 * kInkTopK * kInkHidden);
-        d_v_p = dalloc<int32_t>(16 * kInkTopK);
+        h_v_x   = halloc_pinned<float>(16 * kInkHidden);
+        h_v_y   = halloc_pinned<float>(16 * kInkTopK * kInkHidden);
+        h_v_p   = halloc_pinned<int32_t>(16 * kInkTopK);
+        h_v_idx = halloc_pinned<int32_t>(16 * kInkTopK);
+        d_v_y   = dalloc<float>(16 * kInkTopK * kInkHidden);
+        d_v_p   = dalloc<int32_t>(16 * kInkTopK);
 
         d_use_cnt   = dalloc<float>(n_layers * n_experts);
         d_want_keys = dalloc<int32_t>(64);
@@ -947,8 +1212,16 @@ struct InkHybridEngine {
                         continue;
                     }
                     seen = g;
-                    for (int j = t; j < cur_nj; j += n_threads) {
-                        eval_doorbell_job(j);
+                    if (work_mode == 1) {
+                        while (true) {
+                            const int gi = verify_next.fetch_add(1, std::memory_order_relaxed);
+                            if (gi >= cur_ng) break;
+                            eval_verify_group(gi);
+                        }
+                    } else {
+                        for (int j = t; j < cur_nj; j += n_threads) {
+                            eval_doorbell_job(j);
+                        }
                     }
                     work_done.fetch_add(1, std::memory_order_release);
                     last_t = std::chrono::steady_clock::now();
@@ -1050,14 +1323,19 @@ struct InkHybridEngine {
         }
     }
 
-    // Token-end decayed-frequency promotion: promote up to 4 hottest cold experts into VRAM ring asynchronously!
+    // Periodic decayed-frequency promotion: avoids per-token cudaStreamSynchronize stalls!
+    // Fast warmup during first 32 steps (every 4 tokens, up to 16 swaps), then steady-state every 16 tokens (up to 4 swaps).
     void step_promote(uint8_t* d_sec4, InkExpertDev* const d_experts[24], cudaStream_t main_st) {
         if (!active || n_promo_slots <= 0) return;
+        const uint32_t stp = ++promo_step;
+        const bool in_warmup = (stp <= 32u);
+        const uint32_t period = in_warmup ? 4u : 16u;
+        if ((stp % period) != 0u) return;
         int32_t nw = 0;
         INK_CK(cudaMemcpyAsync(&nw, d_n_want, 4, cudaMemcpyDeviceToHost, main_st));
         INK_CK(cudaStreamSynchronize(main_st));
         if (nw <= 0) {
-            k_ink_decay_use_cnt<<<(n_layers * n_experts + 255) / 256, 256, 0, main_st>>>(d_use_cnt, n_layers * n_experts, 0.97f);
+            k_ink_decay_use_cnt<<<(n_layers * n_experts + 255) / 256, 256, 0, main_st>>>(d_use_cnt, n_layers * n_experts, 0.94f);
             return;
         }
         int32_t wants[64];
@@ -1069,10 +1347,11 @@ struct InkHybridEngine {
         INK_CK(cudaMemcpy(h_cnt.data(), d_use_cnt, h_cnt.size() * 4, cudaMemcpyDeviceToHost));
         std::sort(wants, wants + n_take, [&](int a, int b) { return h_cnt[a] > h_cnt[b]; });
 
+        const int max_swaps = in_warmup ? 16 : 4;
         int promoted = 0;
         std::vector<int> pinned_cold_slots;
         const uint64_t g_now = step_gen.fetch_add(1, std::memory_order_relaxed);
-        for (int i = 0; i < n_take && promoted < 4; ++i) {
+        for (int i = 0; i < n_take && promoted < max_swaps; ++i) {
             const int key = wants[i];
             if (key < 0 || key >= n_layers * n_experts) continue;
             const auto& nm = host_meta[key];
@@ -1159,6 +1438,7 @@ struct InkHybridEngine {
         if (h_v_x) { cudaFreeHost(h_v_x); h_v_x = nullptr; }
         if (h_v_y) { cudaFreeHost(h_v_y); h_v_y = nullptr; }
         if (h_v_p) { cudaFreeHost(h_v_p); h_v_p = nullptr; }
+        if (h_v_idx) { cudaFreeHost(h_v_idx); h_v_idx = nullptr; }
         if (h_copyback_buf) { cudaFreeHost(h_copyback_buf); h_copyback_buf = nullptr; h_copyback_bytes = 0; }
         cold_store.reset();
         if (h_bell) { cudaFreeHost(h_bell); h_bell = nullptr; d_bell = nullptr; }
@@ -1255,10 +1535,12 @@ inline void launch_ink_moe_hybrid(
                    (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0);
         };
         if (M <= 16 && !hyb.ssd_only) {
-            int32_t h_idx[16 * kInkTopK] = {};
+            int32_t* h_idx = hyb.h_v_idx;
+            int32_t h_idx_fallback[16 * kInkTopK] = {};
+            if (!h_idx) h_idx = h_idx_fallback;
             int ecnt[kInkExperts] = {};
+            // Copy ONLY tiny topk_idx (<= 512 B) first so 0-miss visits and tiny-spill PCIe-only visits NEVER stall on x_f32 D2H!
             INK_CK(cudaMemcpyAsync(h_idx, ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
-            if (hyb.h_v_x) INK_CK(cudaMemcpyAsync(hyb.h_v_x, x_f32, (size_t)M * kInkHidden * 4, cudaMemcpyDeviceToHost, st));
             INK_CK(cudaStreamSynchronize(st));
             for (int i = 0; i < M * kInkTopK; ++i) {
                 const int e = h_idx[i];
@@ -1269,8 +1551,12 @@ inline void launch_ink_moe_hybrid(
                     ++ecnt[e];
                 }
             }
-            // Simultaneous PCIe H2D GPU Miss-Sharing + CPU Pool (L / (L + k R)) for DSpark Block-8 verify (M = 2..16)!
-            const double share = (hyb.dec_pcie_share >= 0.0) ? hyb.dec_pcie_share : (hyb.sec4_is_pinned ? 0.60 : 0.50);
+            // Zero-cliff small-spill fast path: when <= 6 cold experts miss (~2-6 MB) and PCIe staging is ready,
+            // stream ALL of them asynchronously over PCIe H2D to GPU Tensor Cores (< 0.15 ms, zero x_f32 D2H, zero CPU wait!)
+            const bool stream_all_pcie = (hyb.dec_pcie_share < 0.0) && (host_list.size() <= 6) &&
+                                         (hyb.d_pf_stage[0] != nullptr) && (hyb.pf_stage_bytes > 0);
+            const double share = (hyb.dec_pcie_share >= 0.0) ? hyb.dec_pcie_share
+                               : (stream_all_pcie ? 1.0 : (hyb.sec4_is_pinned ? 0.65 : 0.55));
             if (hyb.active && hyb.h_v_x && hyb.h_v_y && host_list.size() >= 2 && share < 0.999) {
                 std::sort(host_list.begin(), host_list.end(), [&](int a, int b) { return ecnt[a] > ecnt[b]; });
                 int w_tot = 0;
@@ -1291,6 +1577,11 @@ inline void launch_ink_moe_hybrid(
                 for (int p = 0; p < M * kInkTopK; ++p) {
                     const int e = h_idx[p];
                     if (e >= 0 && e < kInkExperts && is_cpu[e]) cpu_pairs.push_back({p, e});
+                }
+                // Copy x_f32 D2H ONLY when CPU pool actually has cold misses to evaluate!
+                if (!cpu_pairs.empty()) {
+                    INK_CK(cudaMemcpyAsync(hyb.h_v_x, x_f32, (size_t)M * kInkHidden * 4, cudaMemcpyDeviceToHost, st));
+                    INK_CK(cudaStreamSynchronize(st));
                 }
             }
         } else if (M <= 16 || hyb.ssd_only) {
@@ -1429,41 +1720,31 @@ inline void launch_ink_moe_hybrid(
             hyb.pf_buf_busy[buf] = true;
         }
 
-        // Concurrently evaluate CPU-assigned pairs for M=2..16 while GPU executes VRAM + PCIe-streamed chunks!
+        // Concurrently evaluate CPU-assigned pairs for M=2..16 on the PERSISTENT worker pool (ZERO std::thread spawns!)
+        // Deduplicates unique cold experts across M verify tokens -> ONE single weight read per expert!
         if (!cpu_pairs.empty()) {
             const int np = (int)cpu_pairs.size();
-            const int nt = std::min(std::max(1, hyb.n_threads), np);
-            if (nt > 1) {
-                std::vector<std::thread> tmp_th;
-                tmp_th.reserve((size_t)nt - 1);
-                for (int t = 1; t < nt; ++t) {
-                    tmp_th.emplace_back([&, t]() {
-                        for (int j = t; j < np; j += nt) {
-                            const int pid = cpu_pairs[j].first;
-                            const int e   = cpu_pairs[j].second;
-                            const int m   = pid / kInkTopK;
-                            hyb.h_v_p[j]  = pid;
-                            host_eval::eval_expert_f32_h(hyb.host_meta[ip * kInkExperts + e], hyb.h_v_x + (size_t)m * kInkHidden, hyb.h_v_y + (size_t)j * kInkHidden);
-                        }
-                    });
+            int eid_to_grp[kInkExperts];
+            std::memset(eid_to_grp, -1, sizeof(eid_to_grp));
+            int ng = 0;
+            for (int j = 0; j < np; ++j) {
+                const int pid = cpu_pairs[j].first;
+                const int e   = cpu_pairs[j].second;
+                int gi = eid_to_grp[e];
+                if (gi < 0) {
+                    gi = ng++;
+                    eid_to_grp[e] = gi;
+                    hyb.verify_groups[gi].eid = e;
+                    hyb.verify_groups[gi].count = 0;
                 }
-                for (int j = 0; j < np; j += nt) {
-                    const int pid = cpu_pairs[j].first;
-                    const int e   = cpu_pairs[j].second;
-                    const int m   = pid / kInkTopK;
-                    hyb.h_v_p[j]  = pid;
-                    host_eval::eval_expert_f32_h(hyb.host_meta[ip * kInkExperts + e], hyb.h_v_x + (size_t)m * kInkHidden, hyb.h_v_y + (size_t)j * kInkHidden);
-                }
-                for (auto& th : tmp_th) th.join();
-            } else {
-                for (int j = 0; j < np; ++j) {
-                    const int pid = cpu_pairs[j].first;
-                    const int e   = cpu_pairs[j].second;
-                    const int m   = pid / kInkTopK;
-                    hyb.h_v_p[j]  = pid;
-                    host_eval::eval_expert_f32_h(hyb.host_meta[ip * kInkExperts + e], hyb.h_v_x + (size_t)m * kInkHidden, hyb.h_v_y + (size_t)j * kInkHidden);
+                auto& grp = hyb.verify_groups[gi];
+                if (grp.count < 16) {
+                    const int k = grp.count++;
+                    grp.pids[k] = pid;
+                    grp.out_slots[k] = j;
                 }
             }
+            hyb.run_verify_groups(ip, ng);
             INK_CK(cudaMemcpyAsync(hyb.d_v_y, hyb.h_v_y, (size_t)np * kInkHidden * 4, cudaMemcpyHostToDevice, st));
             INK_CK(cudaMemcpyAsync(hyb.d_v_p, hyb.h_v_p, (size_t)np * 4, cudaMemcpyHostToDevice, st));
             k_ink_scatter_cpu_pairs<<<np, 256, 0, st>>>(hyb.d_v_y, hyb.d_v_p, ws.topk_w, ws.y_pair, np);

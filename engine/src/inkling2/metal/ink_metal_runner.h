@@ -185,11 +185,12 @@ struct InkMetalRunner {
     mtl::Buffer bd_beam_st_in, bd_beam_st_out, bd_beam_lat, bd_beam_joint, bd_beam_rproj;
     mtl::Buffer bd_beam_toks, bd_beam_logp, bd_beam_pidx, bd_beam_pool;
 
-    // DSpark context KV caches (3 layers) + committed f_rnn [max_slots, max_ctx, 2304] (wait: only last committed f_rnn per slot is needed for decode!
-    // Store [max_slots, max_ctx] for ctx_kv, and [max_slots, 2304] for latest f_rnn + backup for rollback!)
+    // DSpark context KV caches (3 layers: layers 0 & 2 are compact SWA-1025 rings, layer 1 is global!)
     mtl::Buffer dsp_ctx_k[3], dsp_ctx_v[3];
+    int dsp_kv_stride[3] = {1025, 8192, 1025};
     mtl::Buffer dsp_frnn_slot;   // [max_slots, 2304] latest committed f_rnn (for pos = apos - 1)
     mtl::Buffer dsp_frnn_tmp;    // [max_batch, 2304]
+    std::string pending_vision_path;  // Lazy on-demand Vision loading (saves ~900 MiB wired RAM on 16/32 GB Macs!)
 
     // Workspace buffers for forward_batch (sized to max_batch)
     mtl::Buffer b_slot_ids, b_pos, b_tok_ids, b_is_img, b_img_emb;
@@ -379,8 +380,37 @@ struct InkMetalRunner {
         p_dsp_meff_beam4_top2_q8 = cx->pipeline(lib_dspark, "dspark_meff_beam4_top2_q8");
         p_dsp_beam4_select       = cx->pipeline(lib_dspark, "dspark_beam4_select");
 
-        // Allocate KV caches & ShortConv state pools
+        // Allocate KV caches & ShortConv state pools (WorkingSet-aware auto-ctx sizing for 16/24/32 GB Mac M1/M2/M3/M4!)
         const auto& c = mod->man.c;
+        {
+            const uint64_t ws_lim = cx->recommended_working_set();
+            const uint64_t cur_alloc = cx->allocated();
+            if (ws_lim > (4ull << 30)) {
+                const uint64_t os_headroom = (ws_lim <= (14ull << 30)) ? (1024ull << 20) : (1536ull << 20);
+                // SWA KV (40 visits) + ShortConv + workspaces + compact DSpark SWA layers (0 & 2)
+                const size_t swa_kv_b = 40ul * (size_t)max_slots * (size_t)c.swa_win * c.n_kv * c.head_dim * 4ul;
+                const size_t sc_b = (size_t)c.n_visits * (size_t)max_slots * 3ul * (2ul * c.n_kv * c.head_dim + 2ul * c.hidden) * 4ul;
+                const size_t ws_b = 512ull << 20;
+                const uint64_t fixed_need = cur_alloc + swa_kv_b + sc_b + ws_b + os_headroom;
+                const size_t per_pos_glob = (8ul + (use_dspark ? 1ul : 0ul)) * (size_t)max_slots * c.n_kv * c.head_dim * 4ul;
+                if (ws_lim > fixed_need && per_pos_glob > 0) {
+                    const int fit_ctx = (int)std::min<uint64_t>((uint64_t)max_ctx, ((ws_lim - fixed_need) / per_pos_glob) & ~63ull);
+                    if (fit_ctx < max_ctx) {
+                        const int clamped = std::max(1024, fit_ctx);
+                        fprintf(stderr, "[ink_metal] WorkingSet-aware auto-ctx: %d -> %d (alloc=%.2f GiB / workSet=%.2f GiB)\n",
+                                max_ctx, clamped, cur_alloc / 1073741824.0, ws_lim / 1073741824.0);
+                        max_ctx = clamped;
+                    }
+                } else if (ws_lim <= fixed_need) {
+                    if (max_batch > 256) max_batch = 256;
+                    if (max_ctx > 4096) {
+                        fprintf(stderr, "[ink_metal] Tight Unified WorkingSet (alloc=%.2f GiB / workSet=%.2f GiB): clamping ctx %d -> 4096\n",
+                                cur_alloc / 1073741824.0, ws_lim / 1073741824.0, max_ctx);
+                        max_ctx = 4096;
+                    }
+                }
+            }
+        }
         kv_k.resize(c.n_visits);
         kv_v.resize(c.n_visits);
         visit_kv_stride.resize(c.n_visits);
@@ -489,9 +519,10 @@ struct InkMetalRunner {
         b_taps4     = cx->alloc(4 * MB * D * 4);
 
         if (use_dspark) {
-            const size_t dkv = (size_t)max_slots * max_ctx * c.n_kv * c.head_dim * sizeof(uint16_t);
             const size_t dtkv = 32ul * c.n_kv * c.head_dim * sizeof(uint16_t);
             for (int l = 0; l < 3; ++l) {
+                dsp_kv_stride[l] = c.dspark_is_swa[l] ? std::min(max_ctx, c.dspark_swa_win) : max_ctx;
+                const size_t dkv = (size_t)max_slots * (size_t)dsp_kv_stride[l] * c.n_kv * c.head_dim * sizeof(uint16_t);
                 dsp_ctx_k[l] = cx->alloc(dkv);
                 dsp_ctx_v[l] = cx->alloc(dkv);
                 dsp_tree_k[l] = cx->alloc(dtkv);
@@ -583,11 +614,8 @@ struct InkMetalRunner {
             }
         }
 
-        if (!vision_path.empty()) {
-            if (!vis.load(*cx, lib_codecs, lib_vis, vision_path, &InkMetalModel::read_section0_json, err)) {
-                return false;
-            }
-        }
+        // Lazy on-demand Vision loading (saves ~900 MiB wired workingSet on 16/32 GB Macs during text-only chat!)
+        pending_vision_path = vision_path;
 
         // Optional Metal 4 Neural Accelerator (mpp::tensor_ops::matmul2d) pipelines & FP16 cache!
         if (lib_mpp >= 0) {
@@ -728,12 +756,22 @@ struct InkMetalRunner {
         }
 
         fprintf(stderr,
-                "[ink_metal] runner ready: slots=%d ctx=%d batch=%d dspark=%d vision=%d mpp=%d(trunk=%d,hot=%d) | KV=%.1f MiB SC=%.1f MiB TotalAlloc=%.2f GiB\n",
-                max_slots, max_ctx, max_batch, (int)use_dspark, (int)vis.loaded,
+                "[ink_metal] runner ready: slots=%d ctx=%d batch=%d dspark=%d vision=%s mpp=%d(trunk=%d,hot=%d) | KV=%.1f MiB SC=%.1f MiB TotalAlloc=%.2f GiB\n",
+                max_slots, max_ctx, max_batch, (int)use_dspark,
+                vis.loaded ? "loaded" : (pending_vision_path.empty() ? "off" : "lazy"),
                 (int)use_mpp, (int)use_mpp_trunk_f16, mpp_decomp_cap,
                 kv_bytes_tot / (1024.0 * 1024.0), sc_bytes_tot / (1024.0 * 1024.0),
                 cx->allocated() / (1024.0 * 1024.0 * 1024.0));
         return true;
+    }
+
+    bool ensure_vision(std::string& err) {
+        if (vis.loaded) return true;
+        if (pending_vision_path.empty()) {
+            err = "metal vision path not configured";
+            return false;
+        }
+        return vis.load(*cx, lib_codecs, lib_vis, pending_vision_path, &InkMetalModel::read_section0_json, err);
     }
 
     // Reset ShortConv state for a slot (called before starting a fresh sequence in slot `s`)
@@ -1933,7 +1971,7 @@ struct InkMetalRunner {
                     d.args = {mtl::Arg::B(b_k_raw), mtl::Arg::B(b_v_raw), mod->dw(dp + ".self_attn.k_norm_ctx.weight"),
                               mtl::Arg::B(dsp_ctx_k[dl]), mtl::Arg::B(dsp_ctx_v[dl]),
                               mtl::Arg::B(b_slot_ids), mtl::Arg::B(b_pos),
-                              mtl::Arg::V(max_ctx), mtl::Arg::V(c.dspark_rope_theta)};
+                              mtl::Arg::V(dsp_kv_stride[dl]), mtl::Arg::V(c.dspark_rope_theta)};
                     ds.push_back(std::move(d));
                 }
             }
@@ -2150,7 +2188,7 @@ struct InkMetalRunner {
                 da.args = {mtl::Arg::B(bd_q), mtl::Arg::B(bd_k), mtl::Arg::B(bd_v),
                            mtl::Arg::B(dsp_ctx_k[il]), mtl::Arg::B(dsp_ctx_v[il]), mtl::Arg::B(bd_ao),
                            mtl::Arg::V(slot), mtl::Arg::V(anchor_pos), mtl::Arg::V(is_swa),
-                           mtl::Arg::V(c.dspark_swa_win), mtl::Arg::V(max_ctx)};
+                           mtl::Arg::V(c.dspark_swa_win), mtl::Arg::V(dsp_kv_stride[il])};
                 ds.push_back(std::move(da));
             }
             if (use_mpp && use_dspark_f16) {
@@ -2334,7 +2372,7 @@ struct InkMetalRunner {
                 d.args = {mtl::Arg::B(dsp_tree_k[dl]), mtl::Arg::B(dsp_tree_v[dl]),
                           mtl::Arg::B(dsp_ctx_k[dl]), mtl::Arg::B(dsp_ctx_v[dl]),
                           mtl::Arg::B(b_tree_path), mtl::Arg::V(slot), mtl::Arg::V(anchor_pos),
-                          mtl::Arg::V(max_ctx)};
+                          mtl::Arg::V(dsp_kv_stride[dl])};
                 ds.push_back(std::move(d));
             }
         }
@@ -2427,7 +2465,7 @@ struct InkMetalRunner {
                 da.args = {mtl::Arg::B(bd_q), mtl::Arg::B(bd_k), mtl::Arg::B(bd_v),
                            mtl::Arg::B(dsp_ctx_k[il]), mtl::Arg::B(dsp_ctx_v[il]), mtl::Arg::B(bd_ao),
                            mtl::Arg::V(slot), mtl::Arg::V(anchor_pos), mtl::Arg::V(is_swa),
-                           mtl::Arg::V(c.dspark_swa_win), mtl::Arg::V(max_ctx)};
+                           mtl::Arg::V(c.dspark_swa_win), mtl::Arg::V(dsp_kv_stride[il])};
                 ds.push_back(std::move(da));
             }
             if (use_mpp && use_dspark_f16) {
@@ -2798,7 +2836,7 @@ struct InkMetalRunner {
                 da.args = {mtl::Arg::B(bd_q), mtl::Arg::B(bd_k), mtl::Arg::B(bd_v),
                            mtl::Arg::B(dsp_ctx_k[il]), mtl::Arg::B(dsp_ctx_v[il]), mtl::Arg::B(bd_ao),
                            mtl::Arg::V(slot), mtl::Arg::V(anchor_pos), mtl::Arg::V(is_swa),
-                           mtl::Arg::V(c.dspark_swa_win), mtl::Arg::V(max_ctx)};
+                           mtl::Arg::V(c.dspark_swa_win), mtl::Arg::V(dsp_kv_stride[il])};
                 ds.push_back(std::move(da));
             }
             if (use_mpp && use_dspark_f16) {

@@ -685,10 +685,32 @@ struct GgufAdapter {
         }
 
         // 3. Optional external DSpark drafter (either mtp.safetensors or dspark-*.gguf!)
-        if (!explicit_dspark.empty()) {
-            if (explicit_dspark.size() >= 12 && explicit_dspark.substr(explicit_dspark.size() - 12) == ".safetensors") {
-                dspark_st.path = explicit_dspark;
-                std::string e = strata::image::st_read_header(explicit_dspark, dspark_st.st);
+        //    Auto-discover companion dspark-*.gguf / mtp.safetensors in the model directory when not explicitly provided.
+        std::string dspark_file = explicit_dspark;
+        if (dspark_file.empty()) {
+            const size_t sep = path.find_last_of("/\\");
+            const std::string dir_path = (sep != std::string::npos) ? path.substr(0, sep) : ".";
+            try {
+                if (std::filesystem::exists(dir_path) && std::filesystem::is_directory(dir_path)) {
+                    for (const auto& entry : std::filesystem::directory_iterator(dir_path)) {
+                        if (!entry.is_regular_file()) continue;
+                        const std::string fname = entry.path().filename().string();
+                        std::string fl = fname;
+                        for (char& ch : fl) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        if (fl == "mtp.safetensors" ||
+                            (fl.find("dspark") != std::string::npos && fl.size() >= 5 && fl.substr(fl.size() - 5) == ".gguf")) {
+                            dspark_file = entry.path().string();
+                            break;
+                        }
+                    }
+                }
+            } catch (...) {
+            }
+        }
+        if (!dspark_file.empty()) {
+            if (dspark_file.size() >= 12 && dspark_file.substr(dspark_file.size() - 12) == ".safetensors") {
+                dspark_st.path = dspark_file;
+                std::string e = strata::image::st_read_header(dspark_file, dspark_st.st);
                 if (!e.empty()) { err = "dspark safetensors: " + e; return false; }
                 has_dspark_st = true;
                 for (const auto& kv : dspark_st.st.tensors) {
@@ -708,9 +730,9 @@ struct GgufAdapter {
                     m.dspark_tensors[kv.first] = std::move(ti);
                 }
                 m.dspark.present = !m.dspark_tensors.empty();
-            } else if (gguf_detail::has_gguf_magic(explicit_dspark)) {
+            } else if (gguf_detail::has_gguf_magic(dspark_file)) {
                 try {
-                    dspark_gguf = std::make_unique<strata::GgufModel>(strata::GgufModel::open(explicit_dspark));
+                    dspark_gguf = std::make_unique<strata::GgufModel>(strata::GgufModel::open(dspark_file));
                 } catch (const std::exception& e) {
                     err = std::string("dspark GGUF open: ") + e.what();
                     return false;

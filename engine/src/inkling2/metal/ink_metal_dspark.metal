@@ -93,8 +93,9 @@ kernel void dspark_ctx_kv_store(
     kn[tid] = kv * inv * k_nw[tid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // NeoX half-split RoPE: (d, d + 64) for d in 0..63
-    const size_t dst_off = (((size_t)slot * kv_stride + pos) * DSP_NKV + kh) * DSP_HD;
+    // NeoX half-split RoPE: (d, d + 64) for d in 0..63 (ring modulo supports compact SWA-1025 layers 0 & 2!)
+    const int kpos = pos % kv_stride;
+    const size_t dst_off = (((size_t)slot * kv_stride + kpos) * DSP_NKV + kh) * DSP_HD;
     if (tid < 64) {
         const float freq = 1.0f / pow(theta, float(2 * tid) / float(DSP_HD));
         const float ang = float(pos) * freq;
@@ -225,7 +226,7 @@ kernel void dspark_block_attn(
     for (int idx = int(sg); idx < total_k; idx += 4) {
         float4 kv, vv;
         if (idx < n_ctx) {
-            const int pos = c0 + idx;
+            const int pos = (c0 + idx) % kv_stride;
             const size_t off = ((slot_base + pos) * DSP_NKV + kh) * DSP_HD;
             kv = float4(((device const half4*)(ctx_k + off))[lane]);
             vv = float4(((device const half4*)(ctx_v + off))[lane]);
@@ -907,8 +908,9 @@ kernel void dspark_ctx_kv_tree_commit(
     uint tid  [[thread_index_in_threadgroup]]) {
     const int i = int(tgp.x), kh = int(tgp.y);
     const int node = path_ids[i];
+    const int kpos = (anchor_pos + i) % kv_stride;
     const size_t src_off = ((size_t)node * DSP_NKV + kh) * DSP_HD + tid;
-    const size_t dst_off = (((size_t)slot * kv_stride + (anchor_pos + i)) * DSP_NKV + kh) * DSP_HD + tid;
+    const size_t dst_off = (((size_t)slot * kv_stride + kpos) * DSP_NKV + kh) * DSP_HD + tid;
     ctx_k[dst_off] = tree_k[src_off];
     ctx_v[dst_off] = tree_v[src_off];
 }

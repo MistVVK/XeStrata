@@ -130,10 +130,14 @@ __global__ void __launch_bounds__(256) k_ink_attn_res_mix(
     __shared__ float sh[32];
     __shared__ float s_wred[8][5][8];  // [s][0=ss, 1..4=dots[0..3]][warp 0..7] -> ONE barrier for ALL S x n_q!
     __shared__ float s_prob[4][8];
+    __shared__ float s_sc_local[4][8];
+    __shared__ float s_inv_buf[8];
 
     // Fused Pass 1+2 with ONE single __syncthreads() across all S states and n_q queries!
     const float inv_sqrt_d = rsqrtf((float)D);
-    for (int s = 0; s < S; ++s) {
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        if (s >= S) break;
         const float4* sp4 = reinterpret_cast<const float4*>(states.p[s] + (size_t)m * D);
         float ss = 0.0f;
         float dots[4] = {};
@@ -161,31 +165,29 @@ __global__ void __launch_bounds__(256) k_ink_attn_res_mix(
     }
     __syncthreads();
     if (tid == 0) {
-        float sc_local[4][8];
-        float s_inv[8];
         for (int s = 0; s < S; ++s) {
             float ss = 0.0f;
 #pragma unroll
             for (int w = 0; w < 8; ++w) ss += s_wred[s][0][w];
             const float inv = rsqrtf(ss / (float)D + kInkRmsEps);
-            s_inv[s] = inv;
+            s_inv_buf[s] = inv;
             for (int q = 0; q < n_q; ++q) {
                 float dsum = 0.0f;
 #pragma unroll
                 for (int w = 0; w < 8; ++w) dsum += s_wred[s][1 + q][w];
-                sc_local[q][s] = dsum * inv * inv_sqrt_d;
+                s_sc_local[q][s] = dsum * inv * inv_sqrt_d;
             }
         }
         for (int q = 0; q < n_q; ++q) {
             float mx = -1e30f;
-            for (int s = 0; s < S; ++s) mx = fmaxf(mx, sc_local[q][s]);
+            for (int s = 0; s < S; ++s) mx = fmaxf(mx, s_sc_local[q][s]);
             float sum = 0.0f;
             for (int s = 0; s < S; ++s) {
-                sc_local[q][s] = expf(sc_local[q][s] - mx);
-                sum += sc_local[q][s];
+                s_sc_local[q][s] = expf(s_sc_local[q][s] - mx);
+                sum += s_sc_local[q][s];
             }
             const float inv_s = 1.0f / sum;
-            for (int s = 0; s < S; ++s) s_prob[q][s] = sc_local[q][s] * inv_s * s_inv[s];
+            for (int s = 0; s < S; ++s) s_prob[q][s] = s_sc_local[q][s] * inv_s * s_inv_buf[s];
         }
     }
     __syncthreads();
@@ -552,12 +554,16 @@ __global__ void __launch_bounds__(256) k_ink_attn_res_3x_cat_rms(
     const float inv_sqrt_d = rsqrtf((float)D);
     __shared__ float s_wred[8][2][8];  // [state][0=ss, 1=dot][warp]
     __shared__ float s_prob[8];
+    __shared__ float s_sc[8];
+    __shared__ float s_sinv[8];
     __shared__ float sh[32];
 
     auto compute_mix_probs = [&](const DepthStatePtrs& ds, const float* qptr) {
         const int S = ds.count;
         const float4* q4 = reinterpret_cast<const float4*>(qptr);
-        for (int s = 0; s < S; ++s) {
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            if (s >= S) break;
             const float4* sp4 = reinterpret_cast<const float4*>(ds.p[s] + (size_t)m * D);
             float ss = 0.0f, dot = 0.0f;
             for (int i = tid; i < D4; i += 256) {
@@ -572,20 +578,19 @@ __global__ void __launch_bounds__(256) k_ink_attn_res_3x_cat_rms(
         }
         __syncthreads();
         if (tid == 0) {
-            float sc[8], sinv[8];
             float mx = -1e30f;
             for (int s = 0; s < S; ++s) {
                 float ss = 0.0f, ds_v = 0.0f;
 #pragma unroll
                 for (int w = 0; w < 8; ++w) { ss += s_wred[s][0][w]; ds_v += s_wred[s][1][w]; }
-                sinv[s] = rsqrtf(ss / (float)D + kInkRmsEps);
-                sc[s] = ds_v * sinv[s] * inv_sqrt_d;
-                mx = fmaxf(mx, sc[s]);
+                s_sinv[s] = rsqrtf(ss / (float)D + kInkRmsEps);
+                s_sc[s] = ds_v * s_sinv[s] * inv_sqrt_d;
+                mx = fmaxf(mx, s_sc[s]);
             }
             float sum = 0.0f;
-            for (int s = 0; s < S; ++s) { sc[s] = expf(sc[s] - mx); sum += sc[s]; }
+            for (int s = 0; s < S; ++s) { s_sc[s] = expf(s_sc[s] - mx); sum += s_sc[s]; }
             const float inv_s = 1.0f / sum;
-            for (int s = 0; s < S; ++s) s_prob[s] = sc[s] * inv_s * sinv[s];
+            for (int s = 0; s < S; ++s) s_prob[s] = s_sc[s] * inv_s * s_sinv[s];
         }
         __syncthreads();
     };
@@ -664,11 +669,15 @@ __global__ void __launch_bounds__(256) k_ink_mlp_res_cat_rms(
     const float inv_sqrt_d = rsqrtf((float)D);
     __shared__ float s_wred[8][2][8];
     __shared__ float s_prob[8];
+    __shared__ float s_sc[8];
+    __shared__ float s_sinv[8];
     __shared__ float sh[32];
 
     const int S = stp.count;
     const float4* q4 = reinterpret_cast<const float4*>(q_mlp);
-    for (int s = 0; s < S; ++s) {
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        if (s >= S) break;
         const float4* sp4 = reinterpret_cast<const float4*>(stp.p[s] + (size_t)m * D);
         float ss = 0.0f, dot = 0.0f;
         for (int i = tid; i < D4; i += 256) {
@@ -682,20 +691,19 @@ __global__ void __launch_bounds__(256) k_ink_mlp_res_cat_rms(
     }
     __syncthreads();
     if (tid == 0) {
-        float sc[8], sinv[8];
         float mx = -1e30f;
         for (int s = 0; s < S; ++s) {
             float ss = 0.0f, ds_v = 0.0f;
 #pragma unroll
             for (int w = 0; w < 8; ++w) { ss += s_wred[s][0][w]; ds_v += s_wred[s][1][w]; }
-            sinv[s] = rsqrtf(ss / (float)D + kInkRmsEps);
-            sc[s] = ds_v * sinv[s] * inv_sqrt_d;
-            mx = fmaxf(mx, sc[s]);
+            s_sinv[s] = rsqrtf(ss / (float)D + kInkRmsEps);
+            s_sc[s] = ds_v * s_sinv[s] * inv_sqrt_d;
+            mx = fmaxf(mx, s_sc[s]);
         }
         float sum = 0.0f;
-        for (int s = 0; s < S; ++s) { sc[s] = expf(sc[s] - mx); sum += sc[s]; }
+        for (int s = 0; s < S; ++s) { s_sc[s] = expf(s_sc[s] - mx); sum += s_sc[s]; }
         const float inv_s = 1.0f / sum;
-        for (int s = 0; s < S; ++s) s_prob[s] = sc[s] * inv_s * sinv[s];
+        for (int s = 0; s < S; ++s) s_prob[s] = s_sc[s] * inv_s * s_sinv[s];
     }
     __syncthreads();
 
@@ -1331,6 +1339,23 @@ struct InkMultiProj {
     int            count;
 };
 
+// Constant-index resolver for InkMultiProj: keeps the 128-byte parameter struct in CONSTANT[0] (eliminates STACK:128 spill!)
+__device__ __forceinline__ bool ink_resolve_multi_proj(
+    const InkMultiProj& mp, int grow,
+    const uint8_t*& Wp, float*& Yp, int& Np, int& lrow) {
+    Wp = nullptr; Yp = nullptr; Np = 0; lrow = 0;
+#pragma unroll
+    for (int p = 0; p < 5; ++p) {
+        if (Wp == nullptr && p < mp.count && grow < mp.cumN[p + 1]) {
+            Wp = mp.W[p];
+            Yp = mp.Y[p];
+            Np = mp.N[p];
+            lrow = grow - mp.cumN[p];
+        }
+    }
+    return Wp != nullptr;
+}
+
 // 256B-Coalesced 16-Lane Multi-Projection BF16 GEMV (8 output rows/CTA, 16 lanes x 16B uint4 = 256B!)
 // 2x wave occupancy on wo_ud (288 CTAs > 170 SMs!) + zero tiling at M=1 -> saturates 1,500+ GB/s GDDR7!
 template <int MAX_M, bool IS_FP16 = false>
@@ -1343,18 +1368,11 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_bf16(
     const int lg   = tid & 15;       // 0..15 lanes per row (16 x 16B = 256B coalesced!)
     const int grow = blockIdx.x * 8 + sub;
 
-    int pid = -1, lrow = 0;
-    if (grow < mp.cumN[mp.count]) {
-#pragma unroll
-        for (int p = 0; p < 5; ++p) {
-            if (p < mp.count && grow < mp.cumN[p + 1]) {
-                pid = p;
-                lrow = grow - mp.cumN[p];
-                break;
-            }
-        }
-    }
-    const uint4* wr = (pid >= 0) ? reinterpret_cast<const uint4*>(reinterpret_cast<const uint16_t*>(mp.W[pid]) + (size_t)lrow * K) : nullptr;
+    const uint8_t* Wp = nullptr;
+    float* Yp = nullptr;
+    int Np = 0, lrow = 0;
+    const bool valid = ink_resolve_multi_proj(mp, grow, Wp, Yp, Np, lrow);
+    const uint4* wr = valid ? reinterpret_cast<const uint4*>(reinterpret_cast<const uint16_t*>(Wp) + (size_t)lrow * K) : nullptr;
     float acc[MAX_M] = {};
 
     constexpr int KT = (MAX_M == 1) ? 2304 : ((MAX_M <= 8) ? 576 : 256);
@@ -1368,7 +1386,7 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_bf16(
             for (int i = tid; i < kl4; i += 128) dx[i] = sx[i];
         }
         __syncthreads();
-        if (pid >= 0) {
+        if (valid) {
             const int kl8 = kl >> 3;
             const uint4* wrt = wr + (k0 >> 3);
             for (int k8 = lg; k8 < kl8; k8 += 16) {
@@ -1400,9 +1418,7 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_bf16(
         }
         if (k0 + KT < K) __syncthreads();
     }
-    if (pid < 0) return;
-    float* Yp = mp.Y[pid];
-    const int Np = mp.N[pid];
+    if (!valid) return;
 #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
         if (m < M) {
@@ -1441,17 +1457,13 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row_m1(
     const int sub  = tid >> 4;       // 0..7 output rows per CTA
     const int lg   = tid & 15;       // 0..15 lanes per row (16 x 16B = 256B!)
     const int grow = blockIdx.x * 8 + sub;
-    int pid = -1, lrow = 0;
-    if (grow < mp.cumN[mp.count]) {
-#pragma unroll
-        for (int p = 0; p < 5; ++p) {
-            if (p < mp.count && grow < mp.cumN[p + 1]) { pid = p; lrow = grow - mp.cumN[p]; break; }
-        }
-    }
-    if (pid < 0) return;
-    const float sc = reinterpret_cast<const float*>(mp.W[pid])[lrow];
+    const uint8_t* Wp = nullptr;
+    float* Yp = nullptr;
+    int Np = 0, lrow = 0;
+    if (!ink_resolve_multi_proj(mp, grow, Wp, Yp, Np, lrow)) return;
+    const float sc = reinterpret_cast<const float*>(Wp)[lrow];
     const uint4* w16 = reinterpret_cast<const uint4*>(
-        reinterpret_cast<const int8_t*>(mp.W[pid] + (size_t)mp.N[pid] * 4) + (size_t)lrow * K);
+        reinterpret_cast<const int8_t*>(Wp + (size_t)Np * 4) + (size_t)lrow * K);
     const int n16 = K >> 4;
     float acc = 0.0f;
     for (int k16 = lg; k16 < n16; k16 += 16) {
@@ -1465,7 +1477,7 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row_m1(
     }
 #pragma unroll
     for (int o = 8; o >= 1; o >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, o);
-    if (lg == 0) mp.Y[pid][lrow] = acc * sc;
+    if (lg == 0) Yp[lrow] = acc * sc;
 }
 
 // 256B-Coalesced 16-Lane Pre-Quantized Q8_ROW Multi-Projection GEMV (8 rows/CTA, pure dp4a_i8, ZERO per-CTA quantization!)
@@ -1479,20 +1491,13 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row_preq(
     const int lg   = tid & 15;       // 0..15 lanes per row (16 x 16B = 256B!)
     const int grow = blockIdx.x * 8 + sub;
 
-    int pid = -1, lrow = 0;
-    if (grow < mp.cumN[mp.count]) {
-#pragma unroll
-        for (int p = 0; p < 5; ++p) {
-            if (p < mp.count && grow < mp.cumN[p + 1]) {
-                pid = p;
-                lrow = grow - mp.cumN[p];
-                break;
-            }
-        }
-    }
-    const float sc = (pid >= 0) ? reinterpret_cast<const float*>(mp.W[pid])[lrow] : 0.0f;
-    const uint4* w16 = (pid >= 0) ? reinterpret_cast<const uint4*>(
-        reinterpret_cast<const int8_t*>(mp.W[pid] + (size_t)mp.N[pid] * 4) + (size_t)lrow * K) : nullptr;
+    const uint8_t* Wp = nullptr;
+    float* Yp = nullptr;
+    int Np = 0, lrow = 0;
+    const bool valid = ink_resolve_multi_proj(mp, grow, Wp, Yp, Np, lrow);
+    const float sc = valid ? reinterpret_cast<const float*>(Wp)[lrow] : 0.0f;
+    const uint4* w16 = valid ? reinterpret_cast<const uint4*>(
+        reinterpret_cast<const int8_t*>(Wp + (size_t)Np * 4) + (size_t)lrow * K) : nullptr;
     float acc[MAX_M] = {};
 
     constexpr int GT = (MAX_M <= 8) ? 36 : 16;
@@ -1507,7 +1512,7 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row_preq(
             for (int i = tid; i < n4; i += 128) dx[i] = sx[i];
         }
         __syncthreads();
-        if (pid >= 0) {
+        if (valid) {
             const int n16 = ng * 4;
             const uint4* wt = w16 + g0 * 4;
             for (int k16 = lg; k16 < n16; k16 += 16) {
@@ -1529,9 +1534,7 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row_preq(
         }
         if (g0 + GT < ng_tot) __syncthreads();
     }
-    if (pid < 0) return;
-    float* Yp = mp.Y[pid];
-    const int Np = mp.N[pid];
+    if (!valid) return;
 #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
         if (m < M) {
@@ -1553,20 +1556,13 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row(
     const int lane = tid & 31;
     const int grow = blockIdx.x * 4 + warp;
 
-    int pid = -1, lrow = 0;
-    if (grow < mp.cumN[mp.count]) {
-#pragma unroll
-        for (int p = 0; p < 5; ++p) {
-            if (p < mp.count && grow < mp.cumN[p + 1]) {
-                pid = p;
-                lrow = grow - mp.cumN[p];
-                break;
-            }
-        }
-    }
-    const float sc = (pid >= 0) ? reinterpret_cast<const float*>(mp.W[pid])[lrow] : 0.0f;
-    const uint4* w16 = (pid >= 0) ? reinterpret_cast<const uint4*>(
-        reinterpret_cast<const int8_t*>(mp.W[pid] + (size_t)mp.N[pid] * 4) + (size_t)lrow * K) : nullptr;
+    const uint8_t* Wp = nullptr;
+    float* Yp = nullptr;
+    int Np = 0, lrow = 0;
+    const bool valid = ink_resolve_multi_proj(mp, grow, Wp, Yp, Np, lrow);
+    const float sc = valid ? reinterpret_cast<const float*>(Wp)[lrow] : 0.0f;
+    const uint4* w16 = valid ? reinterpret_cast<const uint4*>(
+        reinterpret_cast<const int8_t*>(Wp + (size_t)Np * 4) + (size_t)lrow * K) : nullptr;
     float acc[MAX_M] = {};
 
     // High-speed Q8_1 dp4a_i8 tiled GEMV: quantize X[m, k0..k0+KT-1] in 64-elem groups ONCE into shared memory (4x faster ALU!)
@@ -1596,7 +1592,7 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row(
             if (lane == 0) s_xs[m][g] = d;
         }
         __syncthreads();
-        if (pid >= 0) {
+        if (valid) {
             // 8 groups of 64 = 32 uint4s (each lane handles 1 uint4 = 16 weights -> group = k16 >> 2!)
             const int kl16 = kl >> 4;
             const uint4* wt = w16 + (k0 >> 4);
@@ -1619,9 +1615,7 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row(
         }
         if (k0 + KT < K) __syncthreads();
     }
-    if (pid < 0) return;
-    float* Yp = mp.Y[pid];
-    const int Np = mp.N[pid];
+    if (!valid) return;
 #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
         if (m < M) {

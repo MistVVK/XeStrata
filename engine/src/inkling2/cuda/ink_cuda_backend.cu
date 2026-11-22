@@ -71,7 +71,11 @@ class InkCudaBackend final : public InkBackend {
 public:
     ~InkCudaBackend() override { cleanup(); }
 
-    const char* backend_name() const noexcept override { return model_.ep2_active ? "cuda-ep2" : "cuda"; }
+    const char* backend_name() const noexcept override {
+        return model_.ls_active ? "cuda-ls" : (model_.ep2_active ? "cuda-ep2" : "cuda");
+    }
+
+    int effective_max_ctx() const override { return initialized_ ? eff_max_ctx_ : 0; }
 
     std::string device_info() const override { return dev_info_; }
 
@@ -103,15 +107,26 @@ public:
             err = std::string("cudaGetDeviceCount failed: ") + cudaGetErrorString(ce);
             return false;
         }
-        // Resolve primary + optional peer GPU ordinal from opts.gpu_ids / opts.gpu_index / opts.gpus
+        // Resolve primary + optional multi-GPU list (up to 4 GPUs!) from opts.gpu_ids / opts.gpu_index / opts.gpus
         gpu_id_ = (opts.gpu_index >= 0 && opts.gpu_index < n_dev) ? opts.gpu_index : 0;
-        int peer_gpu_id = -1;
-        if (opts.gpu_ids.size() >= 2) {
-            if (opts.gpu_ids[0] >= 0 && opts.gpu_ids[0] < n_dev) gpu_id_ = opts.gpu_ids[0];
-            if (opts.gpu_ids[1] >= 0 && opts.gpu_ids[1] < n_dev && opts.gpu_ids[1] != gpu_id_) peer_gpu_id = opts.gpu_ids[1];
+        std::vector<int> all_gpus;
+        if (!opts.gpu_ids.empty()) {
+            for (int g : opts.gpu_ids) {
+                if (g >= 0 && g < n_dev && std::find(all_gpus.begin(), all_gpus.end(), g) == all_gpus.end() && all_gpus.size() < 4) {
+                    all_gpus.push_back(g);
+                }
+            }
+            if (!all_gpus.empty()) gpu_id_ = all_gpus[0];
         } else if (opts.gpus >= 2 && n_dev >= 2) {
-            peer_gpu_id = (gpu_id_ == 0) ? 1 : 0;
+            const int want = std::min(std::min(opts.gpus, n_dev), 4);
+            all_gpus.push_back(gpu_id_);
+            for (int g = 0; g < n_dev && (int)all_gpus.size() < want; ++g) {
+                if (g != gpu_id_) all_gpus.push_back(g);
+            }
+        } else {
+            all_gpus.push_back(gpu_id_);
         }
+        const int peer_gpu_id = (all_gpus.size() >= 2) ? all_gpus[1] : -1;
 
         ce = cudaSetDevice(gpu_id_);
         if (ce != cudaSuccess) {
@@ -124,73 +139,113 @@ public:
             err = std::string("cudaGetDeviceProperties failed: ") + cudaGetErrorString(ce);
             return false;
         }
-        char buf[512];
-        if (peer_gpu_id >= 0) {
-            cudaDeviceProp prop1{};
-            cudaGetDeviceProperties(&prop1, peer_gpu_id);
-            std::snprintf(buf, sizeof(buf), "GPU%d:%.120s + GPU%d:%.120s (sm_%d%d, %.1f+%.1f GiB VRAM, ep2=1)",
-                          gpu_id_, prop.name, peer_gpu_id, prop1.name, prop.major, prop.minor,
-                          (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0),
-                          (double)prop1.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
-        } else {
-            std::snprintf(buf, sizeof(buf), "%.200s (sm_%d%d, %d SMs, %.1f GiB VRAM, sm120_tc=%d)",
-                          prop.name, prop.major, prop.minor, prop.multiProcessorCount,
-                          (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0),
-                          (int)strata::ink::sm120::available());
-        }
-        dev_info_ = buf;
+        const int sm_cc = prop.major * 10 + prop.minor;
 
-        // Compute exact minimum KV + ShortConv + workspace headroom for parallel slots before pinning experts!
+        // Compute exact minimum KV + ShortConv + workspace headroom BEFORE pinning experts!
+        // Keep lossless FP16 KV as default when Host KV Offload handles capacity (#552)!
         max_slots_ = std::max(1, std::min(kMaxParallelSlots, opts.parallel));
+        const int kv_offload_mode = (opts.kv_offload == "on") ? 1 : ((opts.kv_offload == "off") ? -1 : 0);
         kv_dtype_ = opts.kv_dtype;
-        if (opts.kv_dtype_auto && (max_slots_ >= 16 || prop.totalGlobalMem <= (13ull << 30)) && prop.totalGlobalMem < (40ull << 30)) {
-            kv_dtype_ = KvDtype::FP8_E4M3;
+        if (opts.kv_dtype_auto) {
+            if (max_slots_ >= 16) {
+                kv_dtype_ = KvDtype::FP8_E4M3;
+            } else if (kv_offload_mode < 0) {
+                if (prop.totalGlobalMem <= (13ull << 30)) {
+                    kv_dtype_ = KvDtype::FP8_E4M3;
+                } else if (sm_cc >= 89 && opts.max_ctx > 16384 && prop.totalGlobalMem < (40ull << 30)) {
+                    kv_dtype_ = KvDtype::FP8_E4M3;
+                }
+            }
         }
+        auto map_kvd = [](KvDtype d) -> strata::ink::InkKvDtype {
+            if (d == KvDtype::FP8_E4M3) return strata::ink::InkKvDtype::FP8;
+            if (d == KvDtype::K8V8)     return strata::ink::InkKvDtype::K8V8;
+            if (d == KvDtype::K8V4)     return strata::ink::InkKvDtype::K8V4;
+            return strata::ink::InkKvDtype::FP16;
+        };
+        const auto cuda_kvd = map_kvd(kv_dtype_);
+
         const int eff_chunk = std::max(64, opts.chunk);
         const size_t swa_r = (max_slots_ >= 16) ? (size_t)(strata::ink::kInkSwaWin + 32)
                                                 : (size_t)(strata::ink::kInkSwaWin + std::max(eff_chunk, 64));
-        const size_t bpe = (kv_dtype_ == KvDtype::FP8_E4M3) ? 2ull : 4ull;
-        const size_t sc_per_pos = (kv_dtype_ == KvDtype::FP8_E4M3) ? (size_t)(2 * strata::ink::kInkKVHeads * 4) : 0ull;
-        const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos)
+        const size_t per_visit_pos = strata::ink::InkCudaRunner::kv_bytes_per_visit_pos(cuda_kvd);
+        const int init_glob = (kv_offload_mode == 1)
+            ? 0
+            : ((kv_offload_mode == 0 && prop.totalGlobalMem <= (13ull << 30))
+                ? std::min(std::max(256, opts.max_ctx), 2048)
+                : std::max(256, std::min(std::max(256, opts.max_ctx), (max_slots_ == 1) ? 8192 : 4096)));
+        const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * per_visit_pos
                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
-                                  + (size_t)8 * max_slots_ * 256 * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos);
-        const size_t ws_pad = (max_slots_ >= 8) ? (1536ull << 20)
-                            : ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20)
-                             : (prop.totalGlobalMem <= (13ull << 30)) ? (260ull << 20)
-                                                                      : (320ull << 20));
+                                  + (size_t)8 * max_slots_ * init_glob * per_visit_pos;
+        // Include O(1) prefill ws (~114 MiB) + compact DSpark (~160 MiB) + activation ws (WDDM floor added inside loader!)
+        const size_t ws_pad = (max_slots_ >= 8) ? (1280ull << 20)
+                            : ((prop.totalGlobalMem >= (20ull << 30)) ? (960ull << 20)
+                             : (prop.totalGlobalMem <= (13ull << 30)) ? (512ull << 20)
+                                                                      : (640ull << 20));
         size_t min_reserve_bytes = min_kv_bytes + ws_pad;
         if (opts.vram_reserve_mib >= 0) {
             min_reserve_bytes = std::max(min_reserve_bytes, (size_t)opts.vram_reserve_mib << 20);
         }
 
-        // Load .strata v1.1 / .gguf (Unsloth + ggml-org) / HF safetensors trunk + experts (Single-GPU, Dual-GPU EP, or GPU+SSD Only!)
+        // Load .strata v1.1 / .gguf (Unsloth + ggml-org) / HF safetensors trunk + experts (Single-GPU, EP2, Layer-Split, or 4-tier GPU+RAM+SSD!)
         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
         if (!model_.load_from_model_file(mf, gpu_id_, peer_gpu_id, (float)opts.ep_split, build_screen, err,
                                          min_reserve_bytes, gguf_detail::gguf_dequant_row_f32, gguf_detail::gguf_row_bytes,
-                                         opts.vram_experts_gb, opts.ram_experts_gb, opts.ssd_experts)) {
+                                         opts.vram_experts_gb, opts.ram_experts_gb, opts.ssd_experts,
+                                         all_gpus, opts.layer_split, opts.threads)) {
             return false;
         }
 
-        auto cuda_kvd = (kv_dtype_ == KvDtype::FP8_E4M3) ? strata::ink::InkKvDtype::FP8
-                                                          : strata::ink::InkKvDtype::FP16;
+        {
+            char buf[512];
+            if (model_.ls_active) {
+                std::string s = "LayerSplit[";
+                for (int i = 0; i < model_.n_stages; ++i) {
+                    cudaDeviceProp sp{};
+                    cudaGetDeviceProperties(&sp, model_.stage_gpu[i]);
+                    if (i > 0) s += " + ";
+                    char part[128];
+                    std::snprintf(part, sizeof(part), "GPU%d:%.48s(%.0fG,L%d-%d)",
+                                  model_.stage_gpu[i], sp.name, (double)sp.totalGlobalMem / 1073741824.0,
+                                  model_.stage_l0[i], model_.stage_l1[i] - 1);
+                    s += part;
+                }
+                s += "]";
+                dev_info_ = s;
+            } else if (peer_gpu_id >= 0 && model_.ep2_active) {
+                cudaDeviceProp prop1{};
+                cudaGetDeviceProperties(&prop1, peer_gpu_id);
+                std::snprintf(buf, sizeof(buf), "GPU%d:%.120s + GPU%d:%.120s (sm_%d%d, %.1f+%.1f GiB VRAM, ep2=1)",
+                              gpu_id_, prop.name, peer_gpu_id, prop1.name, prop.major, prop.minor,
+                              (double)prop.totalGlobalMem / 1073741824.0, (double)prop1.totalGlobalMem / 1073741824.0);
+                dev_info_ = buf;
+            } else {
+                std::snprintf(buf, sizeof(buf), "%.200s (sm_%d%d, %d SMs, %.1f GiB VRAM, sm120_tc=%d)",
+                              prop.name, prop.major, prop.minor, prop.multiProcessorCount,
+                              (double)prop.totalGlobalMem / 1073741824.0, (int)strata::ink::sm120::available());
+                dev_info_ = buf;
+            }
+        }
 
         runner_ = std::make_unique<strata::ink::InkCudaRunner>(model_);
         const bool vf_graph_ok = strata::core::allow_1024_thread_cuda_graphs(
             prop.major, prop.minor, strata::core::volta_forever_active());
-        runner_->use_cuda_graph = vf_graph_ok && !model_.ep2_active;
+        runner_->use_cuda_graph = vf_graph_ok && !model_.ep2_active && !model_.ls_active;
         if (!vf_graph_ok) {
             std::fprintf(stderr, "[inkling-cuda] sm_70 under volta-forever: disabling 1024-thread CUDA Graph capture by default\n");
         }
-        runner_->init(max_slots_, std::max(256, opts.max_ctx), std::max(64, opts.chunk), cuda_kvd);
+        runner_->init(max_slots_, std::max(256, opts.max_ctx), std::max(64, opts.chunk), cuda_kvd, kv_offload_mode);
         eff_max_ctx_ = runner_->max_ctx;
 
-        if (opts.enable_dspark && model_.man.has_dspark) {
+        if (opts.enable_dspark && model_.man.has_dspark && !model_.ls_active) {
             dspark_ = std::make_unique<strata::ink::InkDSpark>(*runner_);
             dspark_->init(eff_max_ctx_, 512);
         }
 
-        // Allocate snapshot buffer (3.83 MB) + selected hidden gather buffers + pinned D2H logits staging
-        d_sconv_snap_ = strata::ink::dalloc<float>((size_t)strata::ink::kInkVisits * 3 * strata::ink::kInkSconvCh);
+        // Allocate snapshot buffer (3.83 MB) + selected hidden gather buffers
+        if (!model_.ls_active) {
+            d_sconv_snap_ = strata::ink::dalloc<float>((size_t)strata::ink::kInkVisits * 3 * strata::ink::kInkSconvCh);
+        }
         d_h_sel_      = strata::ink::dalloc<float>((size_t)runner_->max_batch * strata::ink::kInkHidden);
         d_sel_idx_    = strata::ink::dalloc<int32_t>(runner_->max_batch);
         slot_alloc_.assign(max_slots_, false);
@@ -227,7 +282,7 @@ public:
     }
 
     void snapshot_slot(int slot) override {
-        if (!initialized_ || slot < 0 || slot >= max_slots_) return;
+        if (!initialized_ || slot < 0 || slot >= max_slots_ || model_.ls_active || !d_sconv_snap_) return;
         strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
             runner_->d_sconv_pool_arr, d_sconv_snap_, slot, runner_->max_slots, true);
         snap_active_[slot] = true;
@@ -236,7 +291,7 @@ public:
     }
 
     void rollback_slot(int slot, int keep_len) override {
-        if (!initialized_ || slot < 0 || slot >= max_slots_) return;
+        if (!initialized_ || slot < 0 || slot >= max_slots_ || model_.ls_active || !d_sconv_snap_) return;
         if (snap_active_[slot]) {
             const int n_keep = std::max(0, std::min(snap_M_[slot], keep_len - snap_p0_[slot]));
             strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
@@ -276,6 +331,24 @@ public:
         }
         const int N = batch.n_tokens;
         if (N <= 0) return true;
+        // Defensive KV position bounds check + elastic global KV growth (fixes #6590B CUDA error 700 & CA1JEeAx!)
+        int max_pos_req = 0;
+        for (int i = 0; i < N; ++i) {
+            if (batch.pos[i] < 0 || batch.pos[i] >= eff_max_ctx_) {
+                err = "CUDA KV position " + std::to_string(batch.pos[i]) + " out of bounds [0, " + std::to_string(eff_max_ctx_) + ")";
+                return false;
+            }
+            if (batch.pos[i] > max_pos_req) max_pos_req = batch.pos[i];
+        }
+        if (!runner_->ensure_global_kv_cap(max_pos_req + 1)) {
+            err = "VRAM exhausted growing elastic global KV cache to " + std::to_string(max_pos_req + 1) + " tokens";
+            return false;
+        }
+        if (batch.capture_taps && dspark_ && dspark_->ready) {
+            if (!dspark_->ensure_ctx_cap(max_pos_req + 1)) {
+                dspark_->ready = false;
+            }
+        }
         tree_snap_ready_ = false;
         const int V = model_.man.c.vocab_unpadded;
 
@@ -485,8 +558,9 @@ public:
         int max_draft,
         int32_t* out_draft_ids,
         std::string& /*err*/) override {
-        if (!initialized_ || !dspark_ || !dspark_->ready || slot != 0 || dspark_slot_ != 0) return 0;
-        if (anchor_pos <= 0 || anchor_pos + 8 >= dspark_->max_ctx) return 0;
+        if (!initialized_ || model_.ls_active || !dspark_ || !dspark_->ready || slot != 0 || dspark_slot_ != 0) return 0;
+        if (anchor_pos <= 0 || anchor_pos + 8 >= eff_max_ctx_ || anchor_pos + 8 >= dspark_->max_ctx) return 0;
+        if (!runner_->ensure_global_kv_cap(anchor_pos + 8) || !dspark_->ensure_ctx_cap(anchor_pos + 8)) return 0;
         int32_t ids7[8] = {};
         float conf7[8] = {};
         dspark_->draft_block8(anchor_tok, anchor_pos, ids7, conf7);
@@ -519,8 +593,9 @@ public:
         int32_t* out_emitted,
         int* out_drafted,
         std::string& /*err*/) override {
-        if (!initialized_ || !dspark_ || !dspark_->ready || slot != 0 || dspark_slot_ != 0) return 0;
-        if (anchor_pos <= 0 || anchor_pos + 12 >= dspark_->max_ctx || max_emit < 1 || !out_emitted) return 0;
+        if (!initialized_ || model_.ls_active || !dspark_ || !dspark_->ready || slot != 0 || dspark_slot_ != 0) return 0;
+        if (anchor_pos <= 0 || anchor_pos + 12 >= eff_max_ctx_ || anchor_pos + 12 >= dspark_->max_ctx || max_emit < 1 || !out_emitted) return 0;
+        if (!runner_->ensure_global_kv_cap(anchor_pos + 12) || !dspark_->ensure_ctx_cap(anchor_pos + 12)) return 0;
 
         // 1. Snapshot slot-0 ShortConv pre-verify state (2.5 us) for exact mid-tree EOS rollback if needed!
         strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
