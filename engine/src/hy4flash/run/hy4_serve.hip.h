@@ -36,6 +36,7 @@
 
 #include "hy4_graph.hip.h"
 #include "hy4_spec.hip.h"
+#include "hy4_convcache.h"
 
 namespace hy4 {
 
@@ -46,6 +47,9 @@ struct ServeOpts {
     int index_topk = 2048;
     bool no_index = false, no_engram = false;
     bool session_reuse = false;
+    std::string cc_dir;      // --conversation-cache-dir: SSD conversation cache (hy4_convcache.h); empty = off
+    double cc_gib = 40.0;    // --conversation-cache-gib
+    int cc_min = 1024;       // --conversation-cache-min-tokens
     int tail_skip = 0;  // opt-in only (0 = OFF by default)
     std::string draft = "auto";  // auto = dfly2 when the file carries the drafter; off; dfly2 (error without it)
     std::string dfly_override;   // optional flat DFLYOVR1 or DFOV0001 binary overriding model.dfly_layers.* in VRAM
@@ -312,8 +316,12 @@ inline int hy4_serve_main(const ServeOpts& o) {
         if (vision_probe(o.vision, vprobe, verr)) images_ok = true;
         else fprintf(stderr, "[vision] disabled: %s\n", verr.c_str());
     }
-    proto("INFO engine=hy4-serve-0 arch=hy4flash backend=hip model=%s layers=%d vocab=%d chunk=%d session_reuse=%d drafter=%s images=%d", base.c_str(), r.c.n_layers, V, r.Tc,
-          o.session_reuse ? 1 : 0, use_spec ? "dfly2" : "none", images_ok ? 1 : 0);
+    ConvCache cc;
+    if (!o.cc_dir.empty() && !cc.init(r, o.cc_dir, o.cc_gib, o.cc_min, o.model)) fprintf(stderr, "[convcache] off: cannot use %s\n", o.cc_dir.c_str());
+    const bool reuse = o.session_reuse || cc.on;
+    bool dirty = false;
+    proto("INFO engine=hy4-serve-0 arch=hy4flash backend=hip model=%s layers=%d vocab=%d chunk=%d session_reuse=%d drafter=%s images=%d conversation_cache=%d", base.c_str(), r.c.n_layers, V, r.Tc,
+          reuse ? 1 : 0, use_spec ? "dfly2" : "none", images_ok ? 1 : 0, cc.on ? cc.parked() : -1);
     proto("READY %d stop", max_ctx);
 
     LineInput in;
@@ -394,9 +402,47 @@ inline int hy4_serve_main(const ServeOpts& o) {
             if (vf < ((size_t)4 << 30)) venc.unload();
             r.vis = &vctx;
         }
-        // KV reuse: only a pure extension of what is resident
+        // KV reuse: pure extension, resident rewind (live or prompt-end ring copy), or parked SSD sequence
         int start = 0;
-        if (!has_images && o.session_reuse && fwd > 0 && fwd < T0 && (int)tok.size() >= fwd && std::equal(tok.begin(), tok.begin() + fwd, q.ids.begin())) start = fwd;
+        bool from_ck = false;
+        if (!has_images && reuse && fwd > 0 && (int)tok.size() >= fwd) {
+            const int n = ConvCache::common(tok.data(), fwd, q.ids);
+            if (n == fwd && fwd < T0) start = fwd;
+            else if (cc.on && n > 0) {
+                const int s_live = cc.start_for(n, fwd, T0);
+                const int s_ck = (cc.ck_pos > 0 && cc.ck_pos <= fwd) ? cc.start_for(n, cc.ck_pos, T0) : -1;
+                if (s_live > 0 && s_live >= s_ck) start = s_live;
+                else if (s_ck > 0) {
+                    start = s_ck;
+                    from_ck = true;
+                }
+            }
+        }
+        ConvCache::Pick pk;
+        if (cc.on && !has_images) {
+            pk = cc.best(q.ids);
+            if (pk.ent < 0 || pk.start <= start + 256) pk = ConvCache::Pick();
+        }
+        const bool same_conv = start > 0 && (cc.ck_pos > 0 ? start >= cc.ck_pos - 64 : fwd - start <= 512);
+        if (cc.on && dirty && fwd >= cc.min_tokens && (pk.ent >= 0 || !same_conv)) {
+            cc.park(r, tok, fwd);
+            dirty = false;
+        }
+        if (pk.ent >= 0) {
+            std::string cerr;
+            if (cc.restore(r, pk, cerr)) {
+                start = pk.start;
+                from_ck = false;
+                dirty = false;
+            } else {
+                fprintf(stderr, "[convcache] %s: reading the prompt instead\n", cerr.c_str());
+                start = 0;
+                from_ck = false;
+            }
+        } else if (from_ck) {
+            cc.restore_checkpoint(r);
+        }
+        if (start == 0 || pk.ent >= 0) cc.ck_pos = -1;
         tok.assign(q.ids.begin(), q.ids.end());
         fwd = 0;
         if (start > 0) proto("RESUME %d", start);
@@ -414,6 +460,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
             done += T;
             if (done < T0) r.prefetch_engram(tok.data(), done, std::min(r.Tc, T0 - done));
             const bool last = done == T0;
+            if (done > start) dirty = true;
             if (last) {
                 r.head(T, T - 1);
                 if (use_spec) df.snap_h(0);
@@ -423,6 +470,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
             const double ms = (now_s() - t0) * 1000.0;
             proto("PP %d %d %.0f %.1f", done, T0, ms, (done - start) / std::max(1e-9, ms / 1000.0));
             fwd = done;
+            if (last && !has_images) cc.checkpoint(r, T0);
             if (!last && in.stop.load()) {
                 cancelled = true;
                 break;
@@ -503,11 +551,12 @@ inline int hy4_serve_main(const ServeOpts& o) {
             return 1;
         }
         if (nonfinite) finish = "nonfinite";
-        if (!o.session_reuse || has_images) fwd = 0;
+        if (!reuse || has_images) fwd = 0;
         r.vis = nullptr;
         const double decode_ms = (now_s() - t1) * 1000.0;
         proto("DONE %d %d %.1f %.1f %s 0 0 %d", made, T0, prompt_ms, decode_ms, finish, start);
     }
+    if (cc.on && dirty && fwd >= cc.min_tokens) cc.park(r, tok, fwd);
     HCK(hipDeviceSynchronize());
     return 0;
 }
