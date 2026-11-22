@@ -109,7 +109,7 @@ if(TARGET strata_kernels AND TARGET strata_core)
   add_library(strata_split_df2 STATIC ${CMAKE_SOURCE_DIR}/src/core/dflash2.cpp ${_sp}/src/df2_bridge.cpp)
   target_compile_definitions(strata_split_df2 PRIVATE STRATA_DF2_NO_BIND=1)
   target_include_directories(strata_split_df2 PRIVATE ${_sp}/src)
-  target_link_libraries(strata_split_df2 PUBLIC strata_kernels strata_core ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_split_df2 PUBLIC strata_kernels strata_core $<TARGET_NAME_IF_EXISTS:strata_kernels_cpu> ${_strata_gpu_runtime_target})
   set(_sp_df2 ON)
 endif()
 

@@ -17,6 +17,11 @@
 #include <cstdio>
 #include <cstdlib>
 
+#if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906)
+#include "strata/kernels/hip_unsloth_wmma.hpp"
+#include "strata/kernels/hip_unsloth_dp4a.hpp"
+#endif
+
 namespace strata::kernels {
 
 bool rdna_q6k_enabled();
@@ -29,8 +34,6 @@ bool rdna_kq_mmvq2(int type, const void* w, const void* xq, float* y, int n_in, 
 bool rdna_q80_wmma_mmvq(const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream);
 
 #if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906)
-#include "strata/kernels/hip_unsloth_wmma.hpp"
-#include "strata/kernels/hip_unsloth_dp4a.hpp"
 namespace {
 
 struct Q81 {
