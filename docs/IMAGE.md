@@ -321,6 +321,8 @@ A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image w
   HunyuanImage 3.0 cuts a reference to the bucket whose shape is nearest and reads it with its VAE (4,096 tokens at 1024x1024) and with SigLIP2 (at most 1,024 patches): about 5,000 tokens a reference, which lengthen each step.
   MOSS-Image reads each reference with its VAE at about 1024x1024 pixels in its aspect ratio and puts it through the DiT once, first; at every step the image being made looks at it (chinoll's Moss-Image-Edit form: the text encoder does not see the images). A reference takes about 2 GB of VRAM.
 - **A mask:** `mask`, a PNG with an alpha channel the size of the first image, redraws only its transparent part and keeps the rest as the first image's pixels. Every model takes one.
+  A multipart form sends it as the `mask` file, JSON as `"mask": {"image_url": ...}` (a data: URL, an http(s) URL or this server's link).
+  A PNG without an alpha channel (greyscale; a colored one is read by its lightness) is taken too: white is what is redrawn, black what is kept, and a grey is read as a mask that much transparent. The mask links the chat's tools return, and a `mask` of "Words to masks" below with `mask_format` `png` (in JSON, sent with `data:image/png;base64,` before it), are of this form, so one step's result is the next step's mask as it is. One of another size than the first image is fitted to it by nearest pixels (a PNG with an alpha channel of another size is refused).
   With no `size`, `auto` or the first image's own size, the part around the paint is cut out, enlarged to the about 1024x1024 pixels the model draws well, drawn again, and shrunk and put back into the image. A small part such as a face is drawn in detail, and the image comes back at the first image's size.
    - The edge put back is soft, so the paint's close surroundings (some tens of pixels) change a little as well. Every pixel past them is exactly the first image's.
    - The part cut out is the paint with an eighth of its size around it on every side; with two reference images or more ("put image 2's face on her"), 0.3 of it, to show more around it.
@@ -408,6 +410,10 @@ Makes and returns the map a `control` would give the model (the web page's "Prev
 - `usage`: counted in the image engine's tokens (the prompt's tokens, and one token for each 16x16 pixels of the reference images and the image made). For HunyuanImage 3.0: the prompt's ids, one for each 16x16 pixels of the image made, and a reference image's VAE tokens and 1,024 SigLIP2 slots.
 - `xestrata-engine`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), what the prompt's writing out made (`enhance`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`); when adapters were applied, their count (`lora_n`), their VRAM (`lora_mib`), the names a prompt's tag left out (`lora_unknown`) and the keys of an applied file that name no adapter tensor (`lora_ignored`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`). When the mask's part was cut out and drawn, the size drawn (`made_size`), the part cut out (`crop`: `box` the x, y, width and height on the first image, `whole` whether the whole image was drawn again; `empty` for a mask with nothing painted) and the seconds of the cut and the putting back (`plan`'s `crop_s`). When it was drawn in two passes, the second's part, size and strength (`refine`).
 - The image model is listed in `/v1/models` too.
+- A link this server returned goes into the next request's input images as it is: a `url` (with `response_format` `url`: `<scheme>://<Host>/v1/images/files/<name>`) and a chat tool's relative link (`/v1/images/files/<name>`) alike. They are taken by the edits' `image`, `images` and `mask`, the JSON `image` of the upscale, words to masks, removing the background and the control map, a `control`'s `image`, and `/v1/responses`' `image_generation` `input_image_mask`.
+   - The server reads the picture of its own link from the store that kept it, without fetching its own address. Its own link is a relative one, or an absolute one whose host and port are the request's `Host` header's (http or https alike).
+   - A link with a query or a fragment, or one of another host or port, is fetched from outside as any other URL is.
+   - The server keeps only the newest images, so an old link's picture may be gone: that is a 400.
 
 ### From the chat
 
@@ -435,6 +441,19 @@ Makes and returns the map a `control` would give the model (the web page's "Prev
 - `/v1/responses` does the same with OpenAI's built-in `image_generation` tool, and returns the image in an `image_generation_call` item (`result`, the image in base64, with `size`, `quality`, `background`, `output_format` and `revised_prompt`).
   The tool's `size`, `quality`, `output_format`, `output_compression` and `background` are used for the images it makes (`size` `auto`: the size the model asks for).
   Where the model's LoRA listing is not empty, `generate_image` and `edit_image` take a `lora` argument (names, strengths and block weights), and the chat's model reads the `lora` skill and chooses the LoRAs of the character or style asked for ([LoRA](#lora-adapters)).
+
+### Skills for an external caller (`GET /v1/skills`)
+
+An agent or a client outside XeStrata reads the bundled skills (`serve/skills/`) in the wording of REST requests. The API key is `/v1/models`' own.
+
+- `GET /v1/skills`: the list of the bundled skills, `{"object": "list", "data": [...]}`, each with `name`, `description`, `kind` (`always`, `style`, `model` or `tool`) and `chars` (the characters of the file's body). The skills the web page's user added are not in it; the skills switched off in the chat are.
+- `GET /v1/skills/<name>`: the skill's `SKILL.md` turned into the form for outside use, as `text/markdown`.
+   - The front matter (`name`, `description`, `metadata`) and the rules of judgment are kept as they are.
+   - The chat's own wording becomes REST's: the attachments' `attached:N` the links passed; the plan's chart's `plan` and `step`, `group`, `use_text_gpu`, a tool given as one line, the Video tab and the chat's training panel each what REST has for it.
+   - A placeholder naming a model family (`<this setup's qwen-image-2.1 model>`) becomes the id of that family's first model in this setup; where the setup has none of that family, the text says so and gives this setup's image model ids.
+   - At its end comes a `## External REST API` section: this setup's image model ids and default, how input images and result links are handled, that requests with no dependency may be sent in parallel, how to wait on a 503 with `weights_downloading`, and how to wait on a video job.
+   - The base URL is made from the request's `Host` header (and `X-Forwarded-Proto`).
+   - A name that is not there is a 404 (`code` `skill_not_found`).
 
 ## Video
 
