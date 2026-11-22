@@ -68,6 +68,10 @@ public:
     //      STRATA_CPUEXP_COLD_IO = direct (default) | buffered (page cache kept, for warm-cache runs) | fadvise (buffered + DONTNEED).
     bool set_cold_experts(const std::vector<std::vector<bool>>& cold, std::string& err);
     bool cold_expert(int layer, int expert) const;
+    /// Enqueue speculative 512 KiB chunked NVMe prefetches for predicted cold experts of a future layer (L+1, L+2).
+    void prefetch_cold(int layer, const int32_t* experts, int n);
+    /// Drop stale unstarted/in-flight cold prefetches for layers older than `current_layer`.
+    void drop_stale_cold(int current_layer);
     // RAM the process may use: min(MemTotal, cgroup memory.max / memory.limit_in_bytes) on Linux, total physical memory on Windows.
     static uint64_t ram_budget_bytes();
     // Currently available host RAM (Linux MemAvailable capped by cgroup free + reclaimable file cache; Windows ullAvailPhys).

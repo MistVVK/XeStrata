@@ -5,8 +5,12 @@
 // MIT License - Copyright (c) 2026 Strata contributors
 #define INKLING_DEFINE_STBI 1
 #include "ink_backend.h"
+#include "ink_cold_store.hpp"
 #include "ink_vision.h"
+#include "strata/core/moe_wave_plan.hpp"
+#include "strata/core/router_lookahead_v2.hpp"
 #include "strata/inkling2/inkling2_loop.hpp"
+#include "strata/platform/cgroup_mem.hpp"
 #include "strata/quant/sk_codecs.hpp"
 
 #include <algorithm>
@@ -212,18 +216,77 @@ public:
             }
         }
 
-        // 3. Load Section 4 experts into RAM in 3x loop-weighted vram_load_order priority (respecting --ram-experts-gb)
+        // 3. Load Section 4 experts into RAM in 3x loop-weighted vram_load_order priority (respecting --ram-experts-gb, --ssd-experts, and cgroup ceiling)
         const auto& dir = model.expert_directory();
-        expert_bodies_.resize(dir.size());
-        const size_t ram_cap_bytes = (opts.ram_experts_gb > 0.0)
-            ? static_cast<size_t>(opts.ram_experts_gb * 1073741824.0)
+        expert_bodies_.assign(dir.size(), {});
+        size_t ram_cap_bytes = (opts.ram_experts_gb >= 0.0)
+            ? static_cast<size_t>(strata::platform::cgroup_mem::gib_to_bytes(opts.ram_experts_gb))
             : static_cast<size_t>(-1);
+        const auto cg = strata::platform::cgroup_mem::probe_cgroup_room(strata::platform::cgroup_mem::kUnlimited);
+        if (cg.limited && cg.available_bytes != strata::platform::cgroup_mem::kUnlimited && cg.available_bytes > 0) {
+            const uint64_t reserve = std::min<uint64_t>(cg.available_bytes / 8, 2ULL << 30);
+            const size_t cg_cap = static_cast<size_t>(
+                cg.available_bytes > reserve ? cg.available_bytes - reserve : 0);
+            if (ram_cap_bytes > cg_cap) ram_cap_bytes = cg_cap;
+        }
+        // In explicit --ssd-experts or --ram-experts-gb 0 mode, reserve a bounded LRU ColdStore ring (up to 1 GiB)
+        // instead of preloading all experts into RAM; when ram_experts_gb > 0 and < total model, split cleanly.
+        size_t total_exp_bytes = 0, max_exp_bytes = 0;
+        for (const auto& e : dir) {
+            total_exp_bytes += e.body_bytes;
+            max_exp_bytes = std::max<size_t>(max_exp_bytes, e.body_bytes);
+        }
+        const bool need_cold_ssd = opts.ssd_experts || (ram_cap_bytes < total_exp_bytes);
+        size_t preload_cap = ram_cap_bytes;
+        size_t cold_ring_bytes = 0;
+        if (need_cold_ssd) {
+            if (opts.ssd_experts && opts.ram_experts_gb <= 0.0) {
+                preload_cap = 0;
+                cold_ring_bytes = 512ULL << 20;  // bounded 512 MiB O_DIRECT/NO_BUFFERING LRU ring
+            } else if (ram_cap_bytes == 0) {
+                preload_cap = 0;
+                cold_ring_bytes = 256ULL << 20;  // minimum bounded LRU ring when --ram-experts-gb 0
+            } else {
+                cold_ring_bytes = std::min<size_t>(512ULL << 20, std::max<size_t>(128ULL << 20, ram_cap_bytes / 4));
+                preload_cap = (ram_cap_bytes > cold_ring_bytes) ? (ram_cap_bytes - cold_ring_bytes) : 0;
+            }
+        }
         size_t loaded_bytes = 0;
+        size_t n_loaded = 0;
         for (uint16_t idx : model.vram_load_order) {
             if (idx >= dir.size()) continue;
-            if (loaded_bytes + dir[idx].body_bytes > ram_cap_bytes) continue;
+            if (loaded_bytes + dir[idx].body_bytes > preload_cap) continue;
             if (!model.read_expert_body(idx, expert_bodies_[idx], err)) return false;
             loaded_bytes += dir[idx].body_bytes;
+            ++n_loaded;
+        }
+        if (n_loaded < dir.size() && max_exp_bytes > 0) {
+            std::vector<InkColdExpertDesc> cdescs(dir.size());
+            const uint64_t sec4_off = model.rd.header().sections[4].file_offset;
+            for (size_t i = 0; i < dir.size(); ++i) {
+                cdescs[i].file_off   = sec4_off + dir[i].body_offset;
+                cdescs[i].body_bytes = dir[i].body_bytes;
+                cdescs[i].dn_off     = dir[i].dn_offset;
+                cdescs[i].gu_code    = dir[i].gu_code_id;
+                cdescs[i].dn_code    = dir[i].dn_code_id;
+            }
+            const size_t ring_b = std::max<size_t>(cold_ring_bytes, 128ULL << 20);
+            if (!cold_store_.open(model.path, std::move(cdescs), max_exp_bytes, ring_b, 4, err)) {
+                std::fprintf(stderr, "[inkling-cpu] cold store open failed (%s); falling back to direct reads\n", err.c_str());
+                err.clear();
+            } else {
+                std::vector<int> idle_order;
+                idle_order.reserve(dir.size());
+                for (uint16_t idx : model.vram_load_order) {
+                    if (idx < dir.size() && expert_bodies_[idx].empty()) idle_order.push_back(static_cast<int>(idx));
+                }
+                cold_store_.start_idle_preloader(std::move(idle_order), 500);
+                std::fprintf(stderr, "[inkling-cpu] CPU+SSD streaming active: %zu/%zu RAM-pinned (%.2f GiB), "
+                                     "%d-slot LRU ColdStore (%.0f MiB, direct=%d, proj_ready[3]+pe128+lookahead)\n",
+                             n_loaded, dir.size(), (double)loaded_bytes / 1073741824.0,
+                             cold_store_.num_slots(), (double)cold_store_.pool_bytes() / 1048576.0,
+                             (int)cold_store_.is_direct());
+            }
         }
 
         // 4. Initialize slot pool (1..64)
@@ -309,6 +372,9 @@ public:
         }
 
         // 1. Embeddings (image tokens bypass embed_norm!)
+        ++step_gen_;
+        if (cold_store_.is_open()) cold_store_.notify_active();
+        struct IdleGuard { InkColdStore& cs; ~IdleGuard() { if (cs.is_open()) cs.notify_idle(); } } idle_guard{cold_store_};
         std::vector<float> cur(static_cast<size_t>(B) * D);
         const float* emb_nw = trunk_f32_.at("model.llm.embed_norm.weight").data();
         const auto& emb_pk = packed_trunk_.at("model.llm.embed.weight");
@@ -662,9 +728,69 @@ public:
                 }
             }
 
-            // Collect active experts and execute batched GEMM per expert!
+            // Collect active experts, apply pe128 Order-A wave ordering on prefill, issue 2-priority NVMe demand reads
+            // up front, and overlap gate+up+SITU compute with down NVMe reads via proj_ready[3]!
             std::vector<int> active_exps;
             for (int e = 0; e < c_.n_experts; ++e) if (!exp_tokens[e].empty()) active_exps.push_back(e);
+
+            if (cold_store_.is_open()) {
+                cold_store_.drop_stale(visit, step_gen_);
+                if (B > 1 && active_exps.size() > 1) {
+                    std::vector<int32_t> tok_ids(static_cast<size_t>(B) * c_.top_k, -1);
+                    std::vector<int> fill_k(B, 0);
+                    for (int e : active_exps) {
+                        for (const auto& tw : exp_tokens[e]) {
+                            int b = tw.first;
+                            if (fill_k[b] < c_.top_k) tok_ids[static_cast<size_t>(b) * c_.top_k + fill_k[b]++] = e;
+                        }
+                    }
+                    const auto w_pe = strata::core::compute_pe128_scores(tok_ids.data(), B, c_.top_k, c_.n_experts);
+                    std::vector<uint8_t> is_res(c_.n_experts, 0);
+                    for (int e : active_exps) {
+                        const int di = model_->dir_index_of[ip * c_.n_experts + e];
+                        if (di >= 0 && !expert_bodies_[di].empty()) is_res[e] = 1;
+                    }
+                    std::vector<int32_t> act32(active_exps.begin(), active_exps.end());
+                    const auto wplan = strata::core::plan_moe_waves(act32, is_res, w_pe, std::max(16, cold_store_.num_slots()));
+                    active_exps.clear();
+                    for (int32_t e : wplan.wave0_residents) active_exps.push_back(e);
+                    for (const auto& wv : wplan.cold_waves) {
+                        for (int32_t e : wv) active_exps.push_back(e);
+                    }
+                }
+            }
+
+            // 2-visit Router Lookahead (v+1, v+2): enqueue late-binding 512 KiB chunked prefetches for future visits!
+            if (cold_store_.is_open() && B == 1) {
+                auto next_phys_layer = [&](int v_idx) -> int {
+                    if (v_idx < c_.core_start) return v_idx;
+                    const int core_len = c_.core_end - c_.core_start;
+                    const int rel = v_idx - c_.core_start;
+                    if (rel < core_len * c_.num_passes) return c_.core_start + (rel % core_len);
+                    const int post = rel - core_len * c_.num_passes;
+                    const int pl = c_.core_end + post;
+                    return (pl < c_.n_phys) ? pl : -1;
+                };
+                for (int ahead = 1; ahead <= 2; ++ahead) {
+                    const int nv = visit + ahead;
+                    const int nlp = next_phys_layer(nv);
+                    if (nlp < 0) break;
+                    const std::string np = "model.llm.layers." + std::to_string(nlp);
+                    auto it_gw = trunk_f32_.find(np + ".mlp.gate.weight");
+                    auto it_gb = trunk_f32_.find(np + ".mlp.gate.bias");
+                    if (it_gw != trunk_f32_.end() && it_gb != trunk_f32_.end()) {
+                        auto pred = strata::core::predict_router_topk_f32(
+                            nv, ahead, cur.data(), it_gw->second.data(), it_gb->second.data(),
+                            D, c_.n_experts, c_.top_k, true);
+                        for (int64_t pe : pred.experts) {
+                            const int di = model_->dir_index_of[nlp * c_.n_experts + static_cast<int>(pe)];
+                            if (di >= 0 && expert_bodies_[di].empty()) {
+                                cold_store_.prefetch_hint(di, nv, step_gen_);
+                            }
+                        }
+                    }
+                }
+            }
 
             std::vector<float> moe_out(static_cast<size_t>(B) * D, 0.0f);
             std::vector<std::vector<float>> exp_y(active_exps.size());
@@ -672,45 +798,91 @@ public:
             std::string io_err;
             bool io_ok = true;
 
-            #pragma omp parallel for schedule(dynamic)
-            for (int ai = 0; ai < static_cast<int>(active_exps.size()); ++ai) {
-                const int eid = active_exps[ai];
-                const int dir_idx = model_->dir_index_of[ip * c_.n_experts + eid];
-                if (dir_idx < 0) continue;
-                const auto& ent = dir[dir_idx];
-                const auto& tok_list = exp_tokens[eid];
-                const size_t m = tok_list.size();
-                std::vector<float> xe(m * D);
-                for (size_t t = 0; t < m; ++t) {
-                    std::memcpy(xe.data() + t * D, mlp_in.data() + static_cast<size_t>(tok_list[t].first) * D, D * sizeof(float));
-                }
-                const uint8_t* body_ptr = nullptr;
-                std::vector<uint8_t> disk_buf;
-                if (!expert_bodies_[dir_idx].empty()) {
-                    body_ptr = expert_bodies_[dir_idx].data();
-                } else {
-                    #pragma omp critical
-                    {
-                        std::string e2;
-                        if (!model_->read_expert_body(dir_idx, disk_buf, e2)) {
-                            io_ok = false;
-                            io_err = e2;
+            // Pre-issue all demand NVMe reads for cold experts in this visit (bounded by cold_store slot count)
+            const size_t n_act = active_exps.size();
+            const size_t wave_cap = cold_store_.is_open()
+                ? static_cast<size_t>(std::max(1, cold_store_.num_slots() - 4))
+                : n_act;
+            for (size_t w0 = 0; w0 < n_act; w0 += wave_cap) {
+                const size_t w1 = std::min(n_act, w0 + wave_cap);
+                std::vector<const uint8_t*> wave_ptrs(w1 - w0, nullptr);
+                std::vector<int> wave_slots(w1 - w0, -1);
+                if (cold_store_.is_open()) {
+                    for (size_t wi = w0; wi < w1; ++wi) {
+                        const int dir_idx = model_->dir_index_of[ip * c_.n_experts + active_exps[wi]];
+                        if (dir_idx >= 0 && expert_bodies_[dir_idx].empty()) {
+                            wave_ptrs[wi - w0] = cold_store_.demand_begin(dir_idx, visit, step_gen_, wave_slots[wi - w0]);
                         }
                     }
-                    if (!disk_buf.empty()) body_ptr = disk_buf.data();
                 }
-                if (body_ptr) {
-                    exp_y[ai].resize(m * D);
-                    eval_inkling2_expert_batch(body_ptr,
-                                               static_cast<SkCode>(ent.gu_code_id),
-                                               static_cast<SkCode>(ent.dn_code_id),
-                                               ent.dn_offset, xe.data(), m, D, c_.inter, exp_y[ai].data());
+
+                #pragma omp parallel for schedule(dynamic)
+                for (int wi = static_cast<int>(w0); wi < static_cast<int>(w1); ++wi) {
+                    const int eid = active_exps[wi];
+                    const int dir_idx = model_->dir_index_of[ip * c_.n_experts + eid];
+                    if (dir_idx < 0) continue;
+                    const auto& ent = dir[dir_idx];
+                    const auto& tok_list = exp_tokens[eid];
+                    const size_t m = tok_list.size();
+                    std::vector<float> xe(m * D);
+                    for (size_t t = 0; t < m; ++t) {
+                        std::memcpy(xe.data() + t * D, mlp_in.data() + static_cast<size_t>(tok_list[t].first) * D, D * sizeof(float));
+                    }
+                    const uint8_t* body_ptr = nullptr;
+                    std::vector<uint8_t> disk_buf;
+                    const int cslot = wave_slots[static_cast<size_t>(wi) - w0];
+                    struct DownWaitCtx { InkColdStore* cs; int slot; bool ok; };
+                    DownWaitCtx dw_ctx{&cold_store_, cslot, true};
+                    auto dw_cb = +[](void* p) {
+                        auto* c = static_cast<DownWaitCtx*>(p);
+                        if (c->cs && c->slot >= 0) c->ok = c->cs->wait_down(c->slot);
+                    };
+
+                    if (!expert_bodies_[dir_idx].empty()) {
+                        body_ptr = expert_bodies_[dir_idx].data();
+                    } else if (cslot >= 0 && wave_ptrs[static_cast<size_t>(wi) - w0] != nullptr) {
+                        if (cold_store_.wait_gate_up(cslot)) {
+                            body_ptr = wave_ptrs[static_cast<size_t>(wi) - w0];
+                        } else {
+                            #pragma omp critical
+                            { io_ok = false; io_err = "cold NVMe gate+up read failed"; }
+                        }
+                    } else {
+                        #pragma omp critical
+                        {
+                            std::string e2;
+                            if (!model_->read_expert_body(dir_idx, disk_buf, e2)) {
+                                io_ok = false;
+                                io_err = e2;
+                            }
+                        }
+                        if (!disk_buf.empty()) body_ptr = disk_buf.data();
+                    }
+                    if (body_ptr) {
+                        exp_y[wi].resize(m * D);
+                        eval_inkling2_expert_batch(body_ptr,
+                                                   static_cast<SkCode>(ent.gu_code_id),
+                                                   static_cast<SkCode>(ent.dn_code_id),
+                                                   ent.dn_offset, xe.data(), m, D, c_.inter, exp_y[wi].data(),
+                                                   cslot >= 0 ? dw_cb : nullptr, &dw_ctx);
+                        if (cslot >= 0 && !dw_ctx.ok) {
+                            #pragma omp critical
+                            { io_ok = false; io_err = "cold NVMe down read failed"; }
+                        }
+                    }
+                    if (cslot >= 0) cold_store_.unpin_slot(cslot);
                 }
             }
             if (!io_ok) { err = io_err; return false; }
 
-            // Deterministic scatter-add of active expert outputs
-            for (size_t ai = 0; ai < active_exps.size(); ++ai) {
+            // Deterministic scatter-add of active expert outputs in ascending expert_id order
+            // (so pe128 Order-A NVMe I/O ordering stays bitwise identical to full-RAM summation!)
+            std::vector<size_t> scatter_ord(active_exps.size());
+            for (size_t ai = 0; ai < active_exps.size(); ++ai) scatter_ord[ai] = ai;
+            std::sort(scatter_ord.begin(), scatter_ord.end(), [&](size_t a, size_t b) {
+                return active_exps[a] < active_exps[b];
+            });
+            for (size_t ai : scatter_ord) {
                 const auto& tok_list = exp_tokens[active_exps[ai]];
                 const auto& ye = exp_y[ai];
                 if (ye.empty()) continue;
@@ -1109,6 +1281,8 @@ private:
     std::vector<std::vector<float>> msg_queries_;
     std::unordered_map<std::string, std::vector<float>> dspark_f32_;
     std::vector<std::vector<uint8_t>> expert_bodies_;
+    InkColdStore cold_store_;
+    uint64_t step_gen_ = 0;
     std::vector<CpuSlot> slots_;
 
     static void decode_packed_row(const PackedTensor& pk, int row, float* dst) noexcept {

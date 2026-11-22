@@ -13,6 +13,7 @@
 #define INKLING_NO_STBI_IMPL
 #include "ink_backend.h"
 #include "ink_gguf_transcode.h"
+#include "../ink_cold_store.hpp"
 #include "ink_vision.h"
 #include "ink_hip_ops.hip.h"
 #include "ink_hip_tree.hip.h"
@@ -20,7 +21,11 @@
 #include "ink_hip_hybrid.hpp"
 #include "strata/hip_uma_guard.hpp"
 #include "strata/inkling2/inkling2_loop.hpp"
+#include "strata/platform/cgroup_mem.hpp"
 #include "strata/quant/sk_codecs.hpp"
+#if defined(__linux__)
+#include "strata/platform/numa_balancing.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -463,6 +468,11 @@ public:
 
     bool init(const InkModelFile& model, const BackendOpts& opts, std::string& err) override {
         cleanup();
+#if defined(__linux__)
+        if (const std::string nb = strata::platform::numa_balancing::keep_scanner_off(); !nb.empty()) {
+            std::fprintf(stderr, "%s\n", nb.c_str());
+        }
+#endif
         model_ = &model;
         opts_ = opts;
         c_ = model.m.c;
@@ -472,6 +482,21 @@ public:
         if (!hip_ok(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "hipStreamCreate", err)) return false;
 
         mem_info_ = query_device_memory(opts.gpu_index);
+#if defined(__linux__)
+        if (mem_info_.is_uma) {
+            if (std::FILE* osf = std::fopen("/proc/sys/kernel/osrelease", "r")) {
+                char osrel[256] = {0};
+                if (std::fgets(osrel, sizeof(osrel), osf) &&
+                    (std::strstr(osrel, "microsoft") || std::strstr(osrel, "Microsoft") || std::strstr(osrel, "WSL"))) {
+                    std::fprintf(stderr,
+                                 "[ink-hip] WARNING: WSL2 on integrated Ryzen APU (%s) hits ROCm 10.2 #10097 aperture faults; "
+                                 "use native Windows HIP or bounded bounce buffers\n",
+                                 mem_info_.arch_name);
+                }
+                std::fclose(osf);
+            }
+        }
+#endif
         guard_ = compute_dispatch_guard(mem_info_.arch_name, mem_info_.cu_count, mem_info_.is_uma,
 #if defined(_WIN32)
                                         true
@@ -767,9 +792,20 @@ public:
         size_t arena_bytes = 0;
         std::vector<uint16_t> gpu_plan;
         std::vector<uint16_t> ram_plan;
-        const size_t ram_cap = (opts.ram_experts_gb > 0.0)
-            ? static_cast<size_t>(opts.ram_experts_gb * 1073741824.0)
-            : static_cast<size_t>(-1);
+        size_t ram_cap = (opts.ssd_experts || opts.ram_experts_gb == 0.0)
+            ? 0u
+            : ((opts.ram_experts_gb > 0.0)
+                ? static_cast<size_t>(strata::platform::cgroup_mem::gib_to_bytes(opts.ram_experts_gb))
+                : static_cast<size_t>(-1));
+        {
+            const auto cg = strata::platform::cgroup_mem::probe_cgroup_room(strata::platform::cgroup_mem::kUnlimited);
+            if (cg.limited && cg.available_bytes != strata::platform::cgroup_mem::kUnlimited && cg.available_bytes > 0) {
+                const uint64_t reserve = std::min<uint64_t>(cg.available_bytes / 8, 2ULL << 30);
+                const size_t cg_cap = static_cast<size_t>(
+                    cg.available_bytes > reserve ? cg.available_bytes - reserve : 0);
+                if (ram_cap > cg_cap) ram_cap = cg_cap;
+            }
+        }
         size_t ram_bytes = 0;
 
         for (uint16_t idx : model.vram_load_order) {
@@ -864,6 +900,27 @@ public:
             }
         }
         ram_experts_loaded_ = ram_plan.size();
+        if (vram_experts_loaded_ + ram_experts_loaded_ < n_dir && max_exp_bytes > 0) {
+            std::vector<InkColdExpertDesc> cdescs(n_dir);
+            const uint64_t sec4_off = model.rd.header().sections[4].file_offset;
+            for (size_t i = 0; i < n_dir; ++i) {
+                cdescs[i].file_off   = sec4_off + dir[i].body_offset;
+                cdescs[i].body_bytes = dir[i].body_bytes;
+                cdescs[i].dn_off     = dir[i].dn_offset;
+                cdescs[i].gu_code    = dir[i].gu_code_id;
+                cdescs[i].dn_code    = dir[i].dn_code_id;
+            }
+            const size_t ring_b = 512ULL << 20;
+            std::string cerr;
+            if (cold_store_.open(model.path, std::move(cdescs), max_exp_bytes, ring_b, 4, cerr)) {
+                std::fprintf(stderr, "[inkling-hip] GPU+SSD streaming active: %zu VRAM, %zu RAM, %zu SSD-only "
+                                     "(%d-slot ColdStore = %.0f MiB, direct=%d)\n",
+                             vram_experts_loaded_, ram_experts_loaded_,
+                             n_dir - vram_experts_loaded_ - ram_experts_loaded_,
+                             cold_store_.num_slots(), (double)cold_store_.pool_bytes() / 1048576.0,
+                             (int)cold_store_.is_direct());
+            }
+        }
 
         if (max_exp_bytes > 0 && vram_experts_loaded_ < n_dir) {
             if (!hip_ok(alloc_gpu_buffer(d_exp_stage_, max_exp_bytes, mem_info_.is_uma), "expert stage alloc", err)) {
@@ -3386,6 +3443,13 @@ private:
                                 if (!expert_ram_bodies_[dir_idx].empty()) {
                                     host_body = expert_ram_bodies_[dir_idx].data();
                                     hybrid_.prefetch_async(dir_idx, host_body, dir[dir_idx].body_bytes, false);
+                                } else if (cold_store_.is_open()) {
+                                    int cslot = -1;
+                                    const uint8_t* cp = cold_store_.demand_wait(dir_idx, ip, cold_gen_, cslot);
+                                    if (!cp) { err = "hip cold_store mx8 read failed"; return false; }
+                                    disk_fallback_bufs.emplace_back(cp, cp + dir[dir_idx].body_bytes);
+                                    cold_store_.unpin_slot(cslot);
+                                    host_body = disk_fallback_bufs.back().data();
                                 } else {
                                     disk_fallback_bufs.emplace_back();
                                     uint32_t tmp_dn = 0; uint8_t tmp_gu = 0, tmp_dnc = 0;
@@ -3413,6 +3477,13 @@ private:
                             if (!expert_ram_bodies_[dir_idx].empty()) {
                                 host_body = expert_ram_bodies_[dir_idx].data();
                                 hybrid_.prefetch_async(dir_idx, host_body, dir[dir_idx].body_bytes, is_core_repeat_candidate);
+                            } else if (cold_store_.is_open()) {
+                                int cslot = -1;
+                                const uint8_t* cp = cold_store_.demand_wait(dir_idx, ip, cold_gen_, cslot);
+                                if (!cp) { err = "hip cold_store cpu read failed"; return false; }
+                                disk_fallback_bufs.emplace_back(cp, cp + dir[dir_idx].body_bytes);
+                                cold_store_.unpin_slot(cslot);
+                                host_body = disk_fallback_bufs.back().data();
                             } else {
                                 disk_fallback_bufs.emplace_back();
                                 uint32_t tmp_dn = 0; uint8_t tmp_gu = 0, tmp_dnc = 0;
@@ -3534,6 +3605,13 @@ private:
                         const uint8_t* hp = nullptr;
                         if (!expert_ram_bodies_[dir_idx].empty()) {
                             hp = expert_ram_bodies_[dir_idx].data();
+                        } else if (cold_store_.is_open()) {
+                            int cslot = -1;
+                            const uint8_t* cp = cold_store_.demand_wait(dir_idx, ip, cold_gen_, cslot);
+                            if (!cp) { err = "hip cold_store prefill read failed"; return false; }
+                            disk_bufs.emplace_back(cp, cp + dir[dir_idx].body_bytes);
+                            cold_store_.unpin_slot(cslot);
+                            hp = disk_bufs.back().data();
                         } else {
                             disk_bufs.emplace_back();
                             uint32_t tmp_dn = 0; uint8_t tmp_gu = 0, tmp_dnc = 0;
@@ -4605,6 +4683,8 @@ private:
     std::vector<size_t> expert_gpu_offset_;
     std::vector<strata::artifact::StrataExpertEntry> adj_dir_;
     std::vector<std::vector<uint8_t>> expert_ram_bodies_;
+    InkColdStore cold_store_;
+    uint64_t cold_gen_ = 1;
     std::vector<std::pair<float, float>> expert_sf4_outer_;
     std::vector<GpuBuffer> d_layer_exps_;
     std::vector<std::vector<GpuExpertDesc>> h_layer_exps_;

@@ -815,9 +815,29 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
+size_t ExpertCache::slot_capacity(int32_t slot) const {
+    if (slot < 0 || slot >= slots_) return 0;
+    return (size_t) slot_room(slot);
+}
+
+bool ExpertCache::scrub_loan_boundary(int32_t first_lent_slot, std::string& err, void* stream) {
+    if (first_lent_slot < 0 || first_lent_slot >= slots_) return true;
+    uint8_t* dst = device_slot(first_lent_slot);
+    const size_t cap = slot_capacity(first_lent_slot);
+    if (dst == nullptr || cap == 0) return true;
+    const size_t pad = std::min<size_t>(512, cap);
+    const cudaError_t e = cudaMemsetAsync(dst, 0, pad, (cudaStream_t) stream);
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::scrub_loan_boundary: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
     if (sealed_) sealed_write("fill_slot", slot);
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const size_t cap = slot_capacity(slot);
+    const size_t n = (size_t) (bytes > 0 && (size_t) bytes <= cap ? bytes : (int64_t) cap);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
@@ -828,8 +848,11 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
-                                          (cudaStream_t) stream);
+    cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
+                                    (cudaStream_t) stream);
+    if (e == cudaSuccess && n < cap) {
+        e = cudaMemsetAsync(dst + n, 0, std::min<size_t>(512, cap - n), (cudaStream_t) stream);
+    }
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
         return false;
@@ -840,7 +863,8 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
     if (sealed_) sealed_write("fill_slot_blocking", slot);
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const size_t cap = slot_capacity(slot);
+    const size_t n = (size_t) (bytes > 0 && (size_t) bytes <= cap ? bytes : (int64_t) cap);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
@@ -858,10 +882,13 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         return false;
     }
     std::memcpy(blocking_staging_, host_blob, n);
-    const cudaError_t e = cudaMemcpy(dst, blocking_staging_, n, cudaMemcpyHostToDevice);
+    cudaError_t e = cudaMemcpy(dst, blocking_staging_, n, cudaMemcpyHostToDevice);
 #else
-    const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
+    cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
 #endif
+    if (e == cudaSuccess && n < cap) {
+        e = cudaMemset(dst + n, 0, std::min<size_t>(512, cap - n));
+    }
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
         return false;
@@ -872,14 +899,18 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
     if (sealed_) sealed_write("fill_slot_queued", slot);
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const size_t cap = slot_capacity(slot);
+    const size_t n = (size_t) (bytes > 0 && (size_t) bytes <= cap ? bytes : (int64_t) cap);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {
         err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
                              : "ExpertCache::fill_slot_queued: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
+    cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
+    if (e == cudaSuccess && n < cap) {
+        e = cudaMemsetAsync(dst + n, 0, std::min<size_t>(512, cap - n), (cudaStream_t) 0);
+    }
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
         return false;
@@ -891,18 +922,30 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
 bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err) {
     if (sealed_) sealed_write("fill_slot_queued_parts", slot);
     uint8_t* dst = device_slot(slot);
+    const size_t cap = slot_capacity(slot);
     if (dst == nullptr || parts == nullptr || n <= 0) {
         err = "ExpertCache::fill_slot_queued_parts: slot outside the arena or no pieces";
         return false;
     }
-    uint64_t total = 0;
-    for (int i = 0; i < n; ++i) total += parts[i].n;
-    if (total > (uint64_t) blob_) {
+    uint64_t total = 0, max_end = 0;
+    for (int i = 0; i < n; ++i) {
+        total += parts[i].n;
+        max_end = std::max<uint64_t>(max_end, parts[i].at + parts[i].n);
+    }
+    if (total > (uint64_t) cap || max_end > (uint64_t) cap) {
         err = "ExpertCache::fill_slot_queued_parts: the pieces are larger than a slot";
         return false;
     }
     for (int i = 0; i < n; ++i) {
         const cudaError_t e = cudaMemcpyAsync(dst + parts[i].at, parts[i].p, (size_t) parts[i].n, cudaMemcpyHostToDevice,
+                                              (cudaStream_t) 0);
+        if (e != cudaSuccess) {
+            err = std::string("ExpertCache::fill_slot_queued_parts: ") + cudaGetErrorString(e);
+            return false;
+        }
+    }
+    if (max_end < (uint64_t) cap) {
+        const cudaError_t e = cudaMemsetAsync(dst + max_end, 0, std::min<size_t>(512, cap - (size_t) max_end),
                                               (cudaStream_t) 0);
         if (e != cudaSuccess) {
             err = std::string("ExpertCache::fill_slot_queued_parts: ") + cudaGetErrorString(e);

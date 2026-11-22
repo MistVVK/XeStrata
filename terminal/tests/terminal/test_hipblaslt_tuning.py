@@ -88,6 +88,17 @@ class Decision(TempDir):
         self.assertIn("100500", d.message)
         self.assertIn("plain hipBLAS", d.message)
 
+    def test_v2_kernel_name_table_is_reused_across_rocm_10_2_plus(self):
+        pkg = fake_package(self.root, version=100600, tables=())
+        v2_file = fake_table(pkg / "tuning", "gfx1201", 100500, header=f"{ht.HEADER_V2} gfx1201 100500")
+        v2_file.write_text("# V2 kernel-name table\nSTRATA_HIPBLASLT_TUNING_V2 gfx1201 100500\n"
+                           "bf16 128 2560 128 4096 73754 Cijk_Ailk_Bljk_BBS_BH_MT128x128x32\n", encoding="utf-8")
+        d = ht.resolve(pkg, ["gfx1201"], environ=ON)
+        self.assertEqual(d.path, pkg / "tuning" / "gfx1201-hipblaslt-100500.txt")
+        # V1 remains strictly bound to its exact version even on >= 100500
+        pkg_v1 = fake_package(self.root / "v1only", version=100600, tables=(("gfx1201", 100500),))
+        self.assertIsNone(ht.resolve(pkg_v1, ["gfx1201"], environ=ON).path)
+
     def test_a_card_without_a_table_in_the_package_gets_plain_hipblas_and_one_line(self):
         pkg = fake_package(self.root)
         d = ht.resolve(pkg, ["gfx1200"], environ=ON)

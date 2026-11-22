@@ -30,6 +30,7 @@
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/fused_tile_rule.hpp"
 #include "strata/prefill/own_only_switches.hpp"
+#include "strata/core/volta_forever.hpp"
 #include "strata/prefill/moe_fused_q36.hpp"
 #include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -3614,9 +3615,21 @@ struct Engine {
             cudaGraph_t graph = nullptr;
             CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
             body();
-            CK(cudaStreamEndCapture(st, &graph));
-            CK(cudaGraphInstantiate(&gx, graph, 0));
-            CK(cudaGraphDestroy(graph));
+            const cudaError_t ec = cudaStreamEndCapture(st, &graph);
+            const cudaError_t ei = (ec == cudaSuccess && graph != nullptr) ? cudaGraphInstantiate(&gx, graph, 0) : ec;
+            if (graph != nullptr) (void) cudaGraphDestroy(graph);
+            if (ei != cudaSuccess) {
+                if (strata::core::volta_forever_active()) {
+                    (void) cudaGetLastError();
+                    std::fprintf(stderr, "strata-q36: CUDA Graph instantiate returned %s under volta-forever "
+                                         "(sm_70 512-thread graph limit); running stream launches\n",
+                                 cudaGetErrorString(ei));
+                    use_graph = false;
+                    body();
+                    return;
+                }
+                CK(ei);
+            }
         }
         CK(cudaGraphLaunch(gx, st));
     }
@@ -5405,14 +5418,15 @@ int strata::qwen35::run(int argc, char** argv) {
         }
     }
     if (model.empty()) { std::fprintf(stderr, "strata-q36: --model is required\n"); return 2; }
+    if (strata::core::apply_default_cuda_module_loading()) {
+        std::fprintf(stderr, "strata-q36: volta-forever detected: setting CUDA_MODULE_LOADING=LAZY\n");
+    }
 #if !defined(_WIN32)
-    setenv("CUDA_MODULE_LOADING", "EAGER", 0);   // every kernel loaded with the context, not in the first prompt
     setenv("STRATA_Q8_PACKED", "1", 0);   // the packed Q8_0 decode copy unless STRATA_Q8_PACKED is set otherwise
     setenv("STRATA_MMQ_KQ", "1", 0);      // the K-quant MMQ prompt kernels (every expert of this family is a K-quant)
 #else
     if (std::getenv("STRATA_MMQ_KQ") == nullptr) _putenv_s("STRATA_MMQ_KQ", "1");
     if (std::getenv("STRATA_Q8_PACKED") == nullptr) _putenv_s("STRATA_Q8_PACKED", "1");   // as on Linux (it was missing here)
-    if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #endif
     // Strata's fused prompt kernels for this family's formats (moe_fused_iq_q36.cu): the K-quant, Q6_K and Q8_0 gate/up
     // instances are opt-in for Flash-Next's packs; this engine sets them up by default (=0 keeps a format on MMQ), and in a build without MMQ the Turing set-up too

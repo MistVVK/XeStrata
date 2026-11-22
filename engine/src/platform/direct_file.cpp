@@ -82,6 +82,7 @@ struct DirectFile::Impl {
     HANDLE file = INVALID_HANDLE_VALUE;
     HANDLE port = nullptr;
     uint64_t size = 0;
+    uint32_t sector_align = 4096;
     std::mutex mu;                      // everything below
     std::deque<Req*> free_reqs;
     std::vector<Req*> all_reqs;
@@ -176,6 +177,13 @@ bool DirectFile::open(const std::string& path, std::string& err) {
         return false;
     }
     impl_->size = (uint64_t) sz.QuadPart;
+    FILE_STORAGE_INFO fsi{};
+    if (GetFileInformationByHandleEx(impl_->file, FileStorageInfo, &fsi, sizeof(fsi))) {
+        impl_->sector_align = round_up_sector_alignment(fsi.LogicalBytesPerSector,
+                                                        fsi.PhysicalBytesPerSectorForAtomicity);
+    } else {
+        impl_->sector_align = alignment();
+    }
     impl_->port = CreateIoCompletionPort(impl_->file, nullptr, 0, 1);
     if (impl_->port == nullptr) {
         err = "DirectFile: CreateIoCompletionPort failed (error " + std::to_string(GetLastError()) + ")";
@@ -196,16 +204,19 @@ void DirectFile::close() {
     impl_->port = nullptr;
     impl_->file = INVALID_HANDLE_VALUE;
     impl_->size = 0;
+    impl_->sector_align = alignment();
     impl_->immediate.clear();
     impl_->queue.clear();
 }
 
 bool DirectFile::is_open() const { return impl_->file != INVALID_HANDLE_VALUE; }
 uint64_t DirectFile::size() const { return impl_->size; }
+uint32_t DirectFile::sector_alignment() const { return impl_->sector_align; }
 
 bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {
     if (!is_open()) { err = "DirectFile: not open"; return false; }
-    if (offset % alignment() || length % alignment() || ((uintptr_t) buffer) % alignment() || length == 0) {
+    const uint32_t align = impl_->sector_align;
+    if (offset % align || length % align || ((uintptr_t) buffer) % align || length == 0) {
         err = "DirectFile: unaligned request";
         return false;
     }
@@ -267,6 +278,7 @@ void DirectFile::wake() {
 struct DirectFile::Impl {
     int fd = -1;
     uint64_t size = 0;
+    uint32_t sector_align = 4096;
     std::mutex mu;
     std::condition_variable cv_work, cv_done;
     std::deque<Pending> queue;
@@ -332,9 +344,11 @@ void DirectFile::close() {
 
 bool DirectFile::is_open() const { return impl_->fd >= 0; }
 uint64_t DirectFile::size() const { return impl_->size; }
+uint32_t DirectFile::sector_alignment() const { return impl_->sector_align; }
 
 bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {
-    if (offset % alignment() || length % alignment() || ((uintptr_t) buffer) % alignment() || length == 0) {
+    const uint32_t align = impl_->sector_align;
+    if (offset % align || length % align || ((uintptr_t) buffer) % align || length == 0) {
         err = "DirectFile: unaligned request";
         return false;
     }

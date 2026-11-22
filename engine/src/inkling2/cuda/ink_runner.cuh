@@ -98,7 +98,9 @@ struct InkCudaModel {
         return man.get(name);
     }
 
-    bool load(const std::string& strata_path, int gpu_id, bool build_screen, std::string& err, size_t extra_reserve_bytes = 0) {
+    bool load(const std::string& strata_path, int gpu_id, bool build_screen, std::string& err,
+              size_t extra_reserve_bytes = 0, double vram_experts_gb = -1.0,
+              double ram_experts_gb = -1.0, bool ssd_experts = false) {
         path = strata_path;
         primary_gpu = gpu_id;
         INK_CK(cudaSetDevice(primary_gpu));
@@ -178,8 +180,11 @@ struct InkCudaModel {
                                   : (vtot <= (13ull << 30)) ? (780ull << 20)
                                                             : (1280ull << 20);
         const size_t reserve = std::max(base_reserve, extra_reserve_bytes);
+        const size_t user_vram_cap = (vram_experts_gb >= 0.0)
+            ? static_cast<size_t>(vram_experts_gb * 1073741824.0)
+            : static_cast<size_t>(-1);
         for (int il = 0; il < 24; ++il) layer_has_host[il] = false;
-        if (vfree > sec4_bytes + reserve) {
+        if (!ssd_experts && vfree > sec4_bytes + reserve && sec4_bytes <= user_vram_cap) {
             // 100% VRAM resident! Single sequential streaming DMA!
             INK_CK(cudaMalloc(&d_sec4, sec4_bytes));
             const size_t CH = 64ull << 20;
@@ -210,28 +215,77 @@ struct InkCudaModel {
             // Reserve full headroom (1.66 GiB for runner+DSpark+cuBLAS+Graph + 256 MiB for ping-pong DMA + promo ring)!
             const size_t hyb_post_res = std::max(reserve, (size_t)(1664ull << 20));
             const size_t hyb_reserve = hyb_post_res + (256ull << 20);
-            const size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
-            size_t vram_used = 0, host_used = 0, max_exp_bytes = 0;
+            size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
+            if (user_vram_cap < vram_budget) vram_budget = user_vram_cap;
+            const size_t ram_cap = (ram_experts_gb >= 0.0)
+                ? static_cast<size_t>(ram_experts_gb * 1073741824.0)
+                : static_cast<size_t>(-1);
+            size_t vram_used = 0, host_used = 0, max_exp_bytes = 0, n_ssd_experts = 0;
             std::vector<uint8_t> in_vram(n_total, 0);
+            std::vector<uint8_t> in_ram(n_total, 0);
+            const bool force_ssd_only = ssd_experts || (ram_experts_gb == 0.0);
             for (uint16_t di : order) {
                 const auto& e = dir[di];
                 max_exp_bytes = std::max<size_t>(max_exp_bytes, e.body_bytes);
+                const size_t al = (size_t)((e.body_bytes + 63ull) & ~63ull);
                 if (vram_used + e.body_bytes <= vram_budget) {
                     in_vram[di] = 1;
                     vram_used += e.body_bytes;
                     ++n_vram_experts;
+                } else if (!force_ssd_only && host_used + al <= ram_cap) {
+                    in_ram[di] = 1;
+                    host_used += al;
+                    ++n_host_experts;
                 } else {
-                    host_used += (size_t)((e.body_bytes + 63ull) & ~63ull);
+                    ++n_ssd_experts;
                     ++n_host_experts;
                 }
             }
             INK_CK(cudaMalloc(&d_sec4, std::max<size_t>(256, vram_used)));
             uint8_t* h_arena_base = nullptr;
-            if (host_used > 0) {
-                h_arena_base = hybrid.alloc_host_arena(host_used);
-                if (!h_arena_base) { err = "cannot allocate host expert arena"; return false; }
+            if (n_host_experts > 0) {
+                if (host_used > 0) {
+                    h_arena_base = hybrid.alloc_host_arena(host_used);
+                    if (!h_arena_base) { err = "cannot allocate host expert arena"; return false; }
+                }
                 hybrid.host_meta.assign((size_t)man.c.n_phys * man.c.n_experts, {});
                 hybrid.orig_host_off.assign((size_t)man.c.n_phys * man.c.n_experts, 0);
+            }
+            if (n_ssd_experts > 0) {
+                hybrid.ssd_only = true;
+                std::vector<ink2::InkColdExpertDesc> cdescs((size_t)man.c.n_phys * man.c.n_experts);
+                for (int di = 0; di < n_total; ++di) {
+                    const auto& e = dir[di];
+                    const int il = di / man.c.n_experts;
+                    const int key = il * man.c.n_experts + e.expert_id;
+                    cdescs[key].file_off   = hdr.sections[4].file_offset + e.body_offset;
+                    cdescs[key].body_bytes = e.body_bytes;
+                    cdescs[key].dn_off     = e.dn_offset;
+                    cdescs[key].gu_code    = e.gu_code_id;
+                    cdescs[key].dn_code    = e.dn_code_id;
+                }
+                // Bounded 1 GiB (or user ram_cap up to 2 GiB) page-locked DMA bounce/prefetch ring (0 OS swap)!
+                const size_t ring_bytes = (ram_experts_gb > 0.0)
+                    ? std::min<size_t>(2ull << 30, std::max<size_t>(256ull << 20, ram_cap))
+                    : (512ull << 20);
+                hybrid.cold_store = std::make_unique<ink2::InkColdStore>();
+                auto pin_alloc = [](size_t b) -> uint8_t* {
+                    uint8_t* p = nullptr;
+                    if (cudaHostAlloc(&p, b, cudaHostAllocDefault) == cudaSuccess) return p;
+                    return nullptr;
+                };
+                auto pin_free = [](uint8_t* p) { if (p) cudaFreeHost(p); };
+                if (!hybrid.cold_store->open(strata_path, std::move(cdescs), max_exp_bytes, ring_bytes, 4, err, pin_alloc, pin_free)) {
+                    return false;
+                }
+                INK_CK(cudaHostAlloc(&hybrid.h_copyback_buf, (max_exp_bytes + 255ull) & ~255ull, cudaHostAllocDefault));
+                hybrid.h_copyback_bytes = (max_exp_bytes + 255ull) & ~255ull;
+                std::fprintf(stderr, "[inkling-cuda] GPU+SSD streaming active: %zu VRAM (%.2f GiB), %zu RAM, %zu SSD-only "
+                                     "(%d-slot pinned DMA ring = %.0f MiB, direct=%d)\n",
+                             n_vram_experts, (double)vram_used / 1073741824.0,
+                             n_host_experts - n_ssd_experts, n_ssd_experts,
+                             hybrid.cold_store->num_slots(), (double)hybrid.cold_store->pool_bytes() / 1048576.0,
+                             (int)hybrid.cold_store->is_direct());
             }
 
             size_t v_cur = 0, h_cur = 0;
@@ -240,15 +294,17 @@ struct InkCudaModel {
                 const auto& e = dir[di];
                 const int il = di / man.c.n_experts;
                 const int key = il * man.c.n_experts + e.expert_id;
-                tmp_body.resize(e.body_bytes);
-                if (!rd.read_at(hdr.sections[4].file_offset + e.body_offset, tmp_body.data(), e.body_bytes, err)) return false;
                 auto& dev = h_exp[key];
                 if (in_vram[di]) {
+                    tmp_body.resize(e.body_bytes);
+                    if (!rd.read_at(hdr.sections[4].file_offset + e.body_offset, tmp_body.data(), e.body_bytes, err)) return false;
                     INK_CK(cudaMemcpy(d_sec4 + v_cur, tmp_body.data(), e.body_bytes, cudaMemcpyHostToDevice));
                     dev.body_off = v_cur;
                     dev.tier = 0;
                     v_cur += e.body_bytes;
-                } else {
+                } else if (in_ram[di]) {
+                    tmp_body.resize(e.body_bytes);
+                    if (!rd.read_at(hdr.sections[4].file_offset + e.body_offset, tmp_body.data(), e.body_bytes, err)) return false;
                     uint8_t* hdst = h_arena_base + h_cur;
                     std::memcpy(hdst, tmp_body.data(), e.body_bytes);
                     hybrid.host_meta[key].body       = hdst;
@@ -256,11 +312,24 @@ struct InkCudaModel {
                     hybrid.host_meta[key].dn_off     = e.dn_offset;
                     hybrid.host_meta[key].gu_code    = e.gu_code_id;
                     hybrid.host_meta[key].dn_code    = e.dn_code_id;
+                    hybrid.host_meta[key].cold_ssd   = false;
                     hybrid.orig_host_off[key]        = h_cur;
                     dev.body_off = h_cur;
                     dev.tier = 2;  // CPU Doorbell (M=1) + Ping-Pong DMA Streaming (M>=2)!
                     layer_has_host[il] = true;
                     h_cur += (size_t)((e.body_bytes + 63ull) & ~63ull);
+                } else {
+                    // Cold SSD expert: ZERO host RAM allocated at startup! Streamed via pinned InkColdStore DMA ring!
+                    hybrid.host_meta[key].body       = nullptr;
+                    hybrid.host_meta[key].body_bytes = e.body_bytes;
+                    hybrid.host_meta[key].dn_off     = e.dn_offset;
+                    hybrid.host_meta[key].gu_code    = e.gu_code_id;
+                    hybrid.host_meta[key].dn_code    = e.dn_code_id;
+                    hybrid.host_meta[key].cold_ssd   = true;
+                    hybrid.orig_host_off[key]        = 0;
+                    dev.body_off = 0;
+                    dev.tier = 2;
+                    layer_has_host[il] = true;
                 }
             }
             if (n_host_experts > 0) {
@@ -269,6 +338,16 @@ struct InkCudaModel {
                 INK_CK(ink_cuda_mem_info(&vf_now, &vt_now));
                 const size_t avail = (vf_now > hyb_post_res) ? (vf_now - hyb_post_res) : 0;
                 hybrid.alloc_staging(max_exp_bytes, avail);
+                if (hybrid.cold_store) {
+                    std::vector<int> idle_keys;
+                    for (uint16_t di : order) {
+                        if (!in_vram[di] && !in_ram[di]) {
+                            const int il = di / man.c.n_experts;
+                            idle_keys.push_back(il * man.c.n_experts + dir[di].expert_id);
+                        }
+                    }
+                    hybrid.cold_store->start_idle_preloader(std::move(idle_keys), 500);
+                }
             }
         }
         double t_exp = now_s() - t1;

@@ -10,6 +10,7 @@
 #include "ink_dspark.cuh"
 #include "ink_runner.cuh"
 #include "ink_spec.cuh"
+#include "strata/core/volta_forever.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -135,15 +136,21 @@ public:
                                                                       : (320ull << 20));
         const size_t min_reserve_bytes = min_kv_bytes + ws_pad;
 
-        // Load .strata v1.1 trunk + experts (100% VRAM or 3x loop-weighted vram_load_order!)
+        // Load .strata v1.1 trunk + experts (100% VRAM, hybrid RAM, or first-class GPU+SSD Only!)
         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
-        if (!model_.load(mf.path, gpu_id_, build_screen, err, min_reserve_bytes)) return false;
+        if (!model_.load(mf.path, gpu_id_, build_screen, err, min_reserve_bytes,
+                         opts.vram_experts_gb, opts.ram_experts_gb, opts.ssd_experts)) return false;
 
         auto cuda_kvd = (kv_dtype_ == KvDtype::FP8_E4M3) ? strata::ink::InkKvDtype::FP8
                                                           : strata::ink::InkKvDtype::FP16;
 
         runner_ = std::make_unique<strata::ink::InkCudaRunner>(model_);
-        runner_->use_cuda_graph = true;
+        const bool vf_graph_ok = strata::core::allow_1024_thread_cuda_graphs(
+            prop.major, prop.minor, strata::core::volta_forever_active());
+        runner_->use_cuda_graph = vf_graph_ok;
+        if (!vf_graph_ok) {
+            std::fprintf(stderr, "[inkling-cuda] sm_70 under volta-forever: disabling 1024-thread CUDA Graph capture by default\n");
+        }
         runner_->init(max_slots_, std::max(256, opts.max_ctx), std::max(64, opts.chunk), cuda_kvd);
         eff_max_ctx_ = runner_->max_ctx;
 

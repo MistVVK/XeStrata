@@ -422,6 +422,15 @@ public:
             if (t.name == name) return &t;
         return nullptr;
     }
+    /// Companion `<stem>.input_scale` lookup for calibrated NVFP4 tensors (strata/quant/nvfp4_recipe.hpp).
+    const TensorInfo* find_input_scale_for(const std::string& weight_name) const {
+        static constexpr const char* kSuf = ".weight";
+        const size_t n = weight_name.size();
+        const std::string scale_name = (n > 7 && weight_name.compare(n - 7, 7, kSuf) == 0)
+                                           ? (weight_name.substr(0, n - 7) + ".input_scale")
+                                           : (weight_name + ".input_scale");
+        return find(scale_name);
+    }
     uint64_t count_type(const char* tn) const {
         uint64_t n = 0;
         for (const auto& t : tensors_)
@@ -595,6 +604,14 @@ public:
         if (it == index_.end()) return nullptr;
         if (shard) *shard = it->second.first;
         return it->second.second;
+    }
+    /// Companion `<stem>.input_scale` lookup across split GGUF shards for calibrated NVFP4 tensors.
+    const TensorInfo* find_input_scale_for(const std::string& weight_name, size_t* shard = nullptr) const {
+        const size_t n = weight_name.size();
+        const std::string scale_name = (n > 7 && weight_name.compare(n - 7, 7, ".weight") == 0)
+                                           ? (weight_name.substr(0, n - 7) + ".input_scale")
+                                           : (weight_name + ".input_scale");
+        return find(scale_name, shard);
     }
     /// Whether `t` (a tensor of shard `s`) has a known byte count that lies inside its file.
     bool in_bounds(const TensorInfo& t, size_t s) const {

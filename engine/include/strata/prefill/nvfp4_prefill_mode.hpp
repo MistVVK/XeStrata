@@ -25,12 +25,19 @@ enum class Nvfp4PrefillPath {
 };
 
 inline Nvfp4PrefillPath resolve_nvfp4_prefill_path(const char* env, bool fp4_tc_available, bool mmq_built,
-                                                   bool* degraded_to_w4a8 = nullptr) {
+                                                   bool* degraded_to_w4a8 = nullptr,
+                                                   bool has_input_scale = true) {
     if (degraded_to_w4a8 != nullptr) *degraded_to_w4a8 = false;
     if (env == nullptr || env[0] == '\0' || std::strcmp(env, "w4a8") == 0) {
         return Nvfp4PrefillPath::FusedW4A8;
     }
     if (std::strcmp(env, "w4a4") == 0) {
+        // Lossless NVFP4 guard (strata/quant/nvfp4_recipe.hpp): never run W4A4 E2M1 activation quantization on
+        // W4A16_NVFP4 checkpoints lacking calibrated <stem>.input_scale tensors (prevents ~6x KL spike).
+        if (!has_input_scale) {
+            if (degraded_to_w4a8 != nullptr) *degraded_to_w4a8 = true;
+            return Nvfp4PrefillPath::FusedW4A8;
+        }
         if (fp4_tc_available) return Nvfp4PrefillPath::FusedW4A4;
         if (mmq_built) return Nvfp4PrefillPath::LegacyMmqOrF16;
         if (degraded_to_w4a8 != nullptr) *degraded_to_w4a8 = true;
@@ -40,8 +47,9 @@ inline Nvfp4PrefillPath resolve_nvfp4_prefill_path(const char* env, bool fp4_tc_
 }
 
 inline bool nvfp4_fused_covers(const char* env, bool fp4_tc_available, bool mmq_built,
-                               bool* degraded_to_w4a8 = nullptr) {
-    const Nvfp4PrefillPath p = resolve_nvfp4_prefill_path(env, fp4_tc_available, mmq_built, degraded_to_w4a8);
+                               bool* degraded_to_w4a8 = nullptr,
+                               bool has_input_scale = true) {
+    const Nvfp4PrefillPath p = resolve_nvfp4_prefill_path(env, fp4_tc_available, mmq_built, degraded_to_w4a8, has_input_scale);
     return p == Nvfp4PrefillPath::FusedW4A8 || p == Nvfp4PrefillPath::FusedW4A4;
 }
 

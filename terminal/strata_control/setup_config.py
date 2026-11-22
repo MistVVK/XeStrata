@@ -230,14 +230,17 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
     work_budget, work_asked = None, None               # the app's "Leave 20% for my work" number (the old rule), written beside the budget (setup.work_budget_key)
     if low_ram and ready:
         # NVFP4 (68 GB of experts) on a PC whose RAM does not hold them: the RAM-budget mode, as Unsloth's files - the
-        # most-used experts outside VRAM pinned within RAM less 17 GB (24 on a unified-memory GPU), the rest read from experts.bin.  Mapped
-        # (--mmap-experts) on a 64 GB Windows PC, the experts it read stayed in the engine's working set: free RAM
-        # fell to 0.6 GB on the RTX 5070 PC (2026-10-13), where the budget mode kept 22 GB free
+        # most-used experts outside VRAM pinned within RAM less 17 GB (24 on a unified-memory GPU), the rest read from experts.bin.
+        # When host RAM is very small (rb <= 0), switch cleanly to GPU+SSD Only (--ssd-experts: bounded 1-2 GiB DMA ring, 0 swap).
         rb = resident_budget_gib(model, ram, uma=gpu_uma)
-        args += ["--resident-budget-gib", str(rb)]
-        work_budget = resident_budget_gib(model, ram, uma=gpu_uma, work=True)
-        ok(f"low-RAM mode: {rb} GiB of {model}'s experts kept in RAM (the most used), the rest read from the pack's "
-           "experts.bin on the SSD as needed")
+        if rb <= 0:
+            args += ["--ssd-experts"]
+            ok(f"GPU+SSD streaming mode: {model}'s cold experts stream directly from SSD through a bounded pinned DMA ring (0 swap)")
+        else:
+            args += ["--resident-budget-gib", str(rb)]
+            work_budget = resident_budget_gib(model, ram, uma=gpu_uma, work=True)
+            ok(f"low-RAM mode: {rb} GiB of {model}'s experts kept in RAM (the most used), the rest read from the pack's "
+               "experts.bin on the SSD as needed")
     elif low_ram:   # the experts from the pack's experts.bin: the ones the GPU does not hold copied into RAM, or mapped
         args += ["--resident-experts" if resident else "--mmap-experts"]
     elif is_gb10(gpu):

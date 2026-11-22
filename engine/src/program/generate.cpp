@@ -27,6 +27,7 @@
 #include "strata/core/kfd_settle.hpp"
 #include "strata/core/kfd_quiet.hpp"
 #include "strata/core/kpack_path.hpp"
+#include "strata/core/volta_forever.hpp"
 #include "strata/core/device_error_exit.hpp"
 #if defined(STRATA_USE_HIP) && defined(__linux__)
 #include "strata/kernels/fused_gr.hpp"   // fused_gr_check, called early on an integrated gfx11 (kfd_quiet.hpp, LOAD)
@@ -71,6 +72,8 @@
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/prefill/moe_fp4_tc.hpp"
+#include "strata/quant/nvfp4_recipe.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -883,6 +886,9 @@ struct Options {
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
     /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
+    /// First-class `GPU + SSD` Only / `CPU + SSD` Only mode (`--ssd-experts` or `--ram-experts-gb 0` / `--resident-budget-gib 0`):
+    /// allocates 0 multi-GB host expert arena (bounded pinned DMA bounce/prefetch ring only, O_DIRECT / FILE_FLAG_NO_BUFFERING, 0 swap).
+    bool ssd_experts = false;
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -3753,21 +3759,12 @@ int main(int argc, char** argv) {
         if (!kp.empty() && std::getenv("STRATA_TRACE") != nullptr) std::fprintf(stderr, "strata trace: ROCM_KPACK_PATH=%s\n", kp.c_str());
     }
 #endif
-    // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
-    // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
-    // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
-    // Exception: nbald/volta-forever under CUDA 13 runs out of cublas heap under EAGER loading (#guides/strata.md §5).
-    if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
-#if defined(_WIN32)
-        _putenv_s("CUDA_MODULE_LOADING", "EAGER");
-#else
-        if (strata::volta_forever_active()) {
-            std::fprintf(stderr, "strata generate: volta-forever %s detected: keeping CUDA_MODULE_LOADING=LAZY\n",
-                         strata::volta_forever_version());
-        } else {
-            setenv("CUDA_MODULE_LOADING", "EAGER", 0);
-        }
-#endif
+    // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM — EXCEPT when
+    // running on sm_70 (V100 / Titan V) through the volta-forever libcuda shim, where EAGER forces multi-minute JIT
+    // translation of unused sm_80+/sm_90+/sm_120 kernels (volta_forever.hpp switches the default to LAZY).
+    if (strata::core::apply_default_cuda_module_loading()) {
+        std::fprintf(stderr, "strata: volta-forever detected (%s): setting CUDA_MODULE_LOADING=LAZY\n",
+                     strata::core::volta_forever_version_str() ? strata::core::volta_forever_version_str() : "env");
     }
     if (launch_blocking())
         std::fprintf(stderr, "warning: CUDA_LAUNCH_BLOCKING=1: the verify windows cannot run with blocking launches, so "
@@ -4214,15 +4211,28 @@ int main(int argc, char** argv) {
             o.ram_keep = strata::core::ram_keep_from_gib(gib);
             ram_keep_by_flag = true;
         }
-        else if (a == "--resident-budget-gib") {
-            const double gib = std::atof(next("--resident-budget-gib"));
-            if (!(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-budget-gib needs N > 0\n"); return 2; }
-            o.resident_budget = (uint64_t) (gib * 1073741824.0);
-            o.mmap_experts = o.resident_cpu_experts = true;
-            o.resident_pin = strata::core::resident_pin_from_env(std::getenv("STRATA_RESIDENT_PIN"));
-            o.resident_headroom = 4ull << 30;
-            if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
-                o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
+        else if (a == "--ssd-experts") {
+            o.ssd_experts = true;
+            o.mmap_experts = true;
+            o.resident_cpu_experts = o.resident_pin = o.resident_soft = false;
+            o.resident_budget = 0;
+        }
+        else if (a == "--resident-budget-gib" || a == "--ram-experts-gb") {
+            const double gib = std::atof(next(a.c_str()));
+            if (!(gib >= 0.0)) { std::fprintf(stderr, "strata generate: %s needs N >= 0\n", a.c_str()); return 2; }
+            if (gib == 0.0) {
+                o.ssd_experts = true;
+                o.mmap_experts = true;
+                o.resident_cpu_experts = o.resident_pin = o.resident_soft = false;
+                o.resident_budget = 0;
+            } else {
+                o.resident_budget = (uint64_t) (gib * 1073741824.0);
+                o.mmap_experts = o.resident_cpu_experts = true;
+                o.resident_pin = strata::core::resident_pin_from_env(std::getenv("STRATA_RESIDENT_PIN"));
+                o.resident_headroom = 4ull << 30;
+                if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
+                    o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
+            }
         }
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
@@ -5059,10 +5069,27 @@ int main(int argc, char** argv) {
             }
             // --ple-gguf defaults to the shard that holds the PLE table, found by name: shard 2 of the ISTA files
             // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's
-            if (o.ple_gguf.empty() && !o.no_ple) {
+            {
                 const strata::GgufModel model(o.native_shards);
-                size_t at = 0;
-                if (model.find("per_layer_token_embd.weight", &at) != nullptr) o.ple_gguf = o.native_shards[at];
+                if (o.ple_gguf.empty() && !o.no_ple) {
+                    size_t at = 0;
+                    if (model.find("per_layer_token_embd.weight", &at) != nullptr) o.ple_gguf = o.native_shards[at];
+                }
+                // Guard Blackwell W4A4 against uncalibrated NVFP4 weights lacking `<stem>.input_scale`.
+                bool any_nvfp4_exp = false;
+                bool missing_input_scale = false;
+                for (size_t si = 0; si < model.size(); ++si) {
+                    for (const auto& t : model.shard(si).tensors()) {
+                        if (t.type == static_cast<uint32_t>(strata::quant::Type::NVFP4) &&
+                            strata::quant::nvfp4_layer_eligible(t.name)) {
+                            any_nvfp4_exp = true;
+                            if (model.find_input_scale_for(t.name) == nullptr) missing_input_scale = true;
+                        }
+                    }
+                }
+                if (any_nvfp4_exp) {
+                    strata::prefill::fp4_tc::set_model_has_input_scale(!missing_input_scale);
+                }
             }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), e.what());
@@ -8493,11 +8520,22 @@ int main(int argc, char** argv) {
         // #773: without a RAM budget there is no RAM copy and the file cache IS the expert tier (measured on a
         // 32 GB, 2 x 16 GB rig: forcing unbuffered reads there re-read 163-629 GB from the drive and halved the
         // speed), so STRATA_UNBUFFERED_LOAD=1 is not honoured in that mode
-        if (o.resident_budget > 0) {
+        if (o.resident_budget > 0 || o.ssd_experts) {
             std::string why;
-            const bool ub = src.set_unbuffered(o.resident_budget, why);
+            const bool ub = src.set_unbuffered(o.ssd_experts ? 0 : o.resident_budget, why, o.ssd_experts);
             std::fprintf(stderr, "strata generate: the file tier reads %s (%s)\n",
                          ub ? "unbuffered" : "through the file cache", why.c_str());
+#if defined(_WIN32)
+            // Unmap GGUF / experts.bin immediately so GPU xcache fill and 47+ GiB pin_cache_complement stream at full
+            // unmapped NVMe queue depth (10.4 GB/s vs 3.4 GB/s when NTFS serializes unbuffered reads on mapped files).
+            // If recheck_unbuffered later switches back to OS file cache, map_view() remaps the shards automatically.
+            if (ub && std::getenv("STRATA_KEEP_MAPPING") == nullptr) {
+                std::string dwhy;
+                const bool dropped = src.drop_mapping_verified(dwhy);
+                std::fprintf(stderr, "strata generate: the mapped view of the experts %s before startup load (%s)\n",
+                             dropped ? "is closed" : "stays open", dwhy.c_str());
+            }
+#endif
         } else if (const char* env = std::getenv("STRATA_UNBUFFERED_LOAD"); env != nullptr && env[0] != '\0' &&
                    env[0] != '0') {
             std::fprintf(stderr, "strata generate: the file tier reads through the file cache (STRATA_UNBUFFERED_LOAD=%s "
@@ -10050,7 +10088,7 @@ int main(int argc, char** argv) {
             if (la_stats) lookahead.enable_stats(g.n_layers);
             if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
                 lookahead.set_depth(std::atoi(dv));
-            else if (srcp == &src && src.io_prefetch())
+            else if (srcp == &src && (src.io_prefetch() || o.ssd_experts))
                 lookahead.set_depth(2);
             la_started = true;
             if (srcp == &src && gpu_holds_all && !la_asked && !fs_ahead && !la_stats) {   // started, but not attached while nothing is read
@@ -11862,7 +11900,7 @@ int main(int argc, char** argv) {
     if (o.adapt_async && !src.complement_ready() && srcp != &arena_src) adapt_async_off("the resident RAM mode is not running");
     // pp-opt: with the file tier unbuffered, the mapped view of experts.bin is only a fallback from here on - and while
     // it exists NTFS serves the unbuffered reads one at a time (drop_mapping).  STRATA_KEEP_MAPPING=1 keeps it (A/B).
-    if (srcp == &src && src.unbuffered() && std::getenv("STRATA_KEEP_MAPPING") == nullptr) {
+    if (srcp == &src && src.unbuffered() && !src.is_unmapped() && std::getenv("STRATA_KEEP_MAPPING") == nullptr) {
         std::string why;
         const bool dropped = src.drop_mapping(why);
         std::fprintf(stderr, "strata generate: the mapped view of the experts %s (%s)\n",
@@ -19969,6 +20007,7 @@ int main(int argc, char** argv) {
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
+                if (p.cache != nullptr && p.first_now >= 0 && !p.cache->scrub_loan_boundary(p.first_now, e)) return false;
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                     strata::core::BlobPart parts[3];
                     const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
@@ -20000,7 +20039,14 @@ int main(int argc, char** argv) {
                 return true;
             };
             auto refill_one = [&](PfPart& p, std::string& e) -> bool {
-                if (p.lent.empty()) return true;
+                if (p.lent.empty()) {
+                    if (p.lent_chunk > 0 && p.cache != nullptr && p.first_now >= 0) {
+                        const strata::core::OnDevice on(p.dev);
+                        if (!p.cache->scrub_loan_boundary(p.first_now, e) || !p.cache->sync_queued(e)) return false;
+                        p.lent_chunk = 0;
+                    }
+                    return true;
+                }
                 return refill_issue(p, e) && refill_wait(p, e);
             };
             // #340: with several stages every stage's copies go out first (each card on its own link), then each is
@@ -23626,6 +23672,21 @@ int main(int argc, char** argv) {
             return 1;
         }
         // refill the lent slots from the arena and give them back to the decode tier
+        if (borrow != nullptr && o.expert_cache > 0 && xcache.slots() > 0) {
+            const uint8_t* bptr = static_cast<const uint8_t*>(borrow);
+            const uint8_t* base0 = xcache.device_slot(0);
+            int32_t boundary_slot = -1;
+            if (base0 != nullptr && bptr >= base0) {
+                const uint64_t boff = (uint64_t) (bptr - base0);
+                for (int32_t s = 0; s < xcache.slots(); ++s) {
+                    if (xcache.slot_offset(s) == boff) { boundary_slot = s; break; }
+                }
+            }
+            if (boundary_slot >= 0 && !xcache.scrub_loan_boundary(boundary_slot, err)) {
+                std::fprintf(stderr, "strata generate: scrubbing the lent boundary failed: %s\n", err.c_str());
+                return 1;
+            }
+        }
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)

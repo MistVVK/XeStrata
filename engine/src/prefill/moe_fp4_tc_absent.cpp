@@ -12,6 +12,8 @@ namespace strata::prefill::fp4_tc {
 bool built() { return false; }
 bool available() { return false; }
 bool wanted() { return false; }
+void set_model_has_input_scale(bool) {}
+bool model_has_input_scale() { return true; }
 
 void quantize_act(const float*, int64_t, int64_t, void*, void*) {
     std::fprintf(stderr, "strata: fp4_tc::quantize_act called in a build without sm_120a/sm_121a kernels\n");

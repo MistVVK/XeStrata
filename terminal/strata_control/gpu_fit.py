@@ -28,6 +28,8 @@ SPLIT_MIN_VRAM_GB = 8.0        # setup.py SPLIT_MIN_VRAM_GB: a card sharing a mo
 SPLIT_PROMPT_VRAM_GB = 12.0    # setup.py SPLIT_PROMPT_VRAM_GB (#448): a smaller second card caps the prompt chunk
 MIN_CARD_GB = 4.0              # under this a card cannot hold the dense weights: ignored (an iGPU, a display card)
 FITS_SPARE_RAM_GB = 4.0        # RAM left beyond the experts below which "fits" becomes "tight"
+SSD_BOUNCE_RING_GB = 1.5       # bounded 1-2 GiB pinned DMA bounce/prefetch ring in RAM for GPU+SSD Only (0 OS swap)
+SSD_MIN_RAM_LRU_GB = 1.0       # minimum bounded RAM LRU cache for CPU+SSD Only streaming
 SPLIT_PROMPT_GAIN = "about 20% faster"   # setup.py's own words for prompts read on two cards (docs/MULTI_GPU.md)
 
 
@@ -292,3 +294,63 @@ def recommended_cards(memory_gb: float, ram_gb: float | None, cards: list[dict],
     """The card numbers of the recommended option (empty: no usable card)."""
     res = options(memory_gb, ram_gb, cards, vendor)
     return next((o["cards"] for o in res["options"] if o["recommended"]), [])
+
+
+def ssd_streaming_plan(memory_gb: float, ram_gb: float | None, vram_gb: float | None = 0.0) -> dict[str, Any]:
+    """First-class `GPU + SSD` Only and `CPU + SSD` Only placement & CLI flag planner.
+
+    Never blocks or overcommits RAM when `memory_gb` (e.g., 64-250 GB MoE) exceeds available RAM:
+      - `gpu_ssd_only`: discrete GPU >= 4 GiB with small host RAM (`ram_room < 4 GiB` and spill > 0) ->
+        uses a bounded 1.0-2.0 GiB pinned DMA bounce/prefetch ring in RAM (0 OS swap) + O_DIRECT/NO_BUFFERING
+        NVMe -> GPU streaming (`--ssd-experts`, `--ram-experts-gb 0`).
+      - `cpu_ssd_only`: no usable GPU (`vram < 4 GiB`) and `ram_room < experts` -> bounded RAM LRU cache
+        + O_DIRECT/NO_BUFFERING + `proj_ready[3]` (`--cpu`, `--ssd-experts`, `--ram-experts-gb <budget>`).
+      - `gpu_ram_ssd`: 3-tier hybrid (GPU + bounded RAM LRU + NVMe streaming).
+      - `in_memory`: fits cleanly in VRAM + RAM without SSD streaming.
+    """
+    vram = float(vram_gb or 0.0)
+    ram = float(ram_gb or 0.0)
+    f = fit(memory_gb, ram if ram > 0 else None, vram)
+    if not f["known"]:
+        return {
+            "mode": "unknown", "runnable": True, "label": "memory unknown",
+            "vram_use_gb": 0.0, "ram_use_gb": 0.0, "ssd_gb": 0.0, "bounce_ring_gb": 0.0,
+            "flags": [],
+        }
+    if f["spill_gb"] <= 0.05:
+        return {
+            "mode": "in_memory", "runnable": True,
+            "label": "GPU + RAM" if vram >= MIN_CARD_GB else "CPU + RAM",
+            "vram_use_gb": f["vram_use_gb"], "ram_use_gb": f["ram_use_gb"],
+            "ssd_gb": 0.0, "bounce_ring_gb": 0.0, "flags": [],
+        }
+    ram_room = max(0.0, ram - SYSTEM_ROOM_GB)
+    if vram >= MIN_CARD_GB:
+        if ram_room < 4.0:
+            bounce = _round1(min(2.0, max(1.0, ram * 0.2)))
+            return {
+                "mode": "gpu_ssd_only", "runnable": True,
+                "label": f"GPU + SSD (low RAM, ~{bounce:g} GB DMA ring)",
+                "vram_use_gb": f["vram_use_gb"], "ram_use_gb": bounce,
+                "ssd_gb": _round1(max(0.0, memory_gb - f["vram_use_gb"])),
+                "bounce_ring_gb": bounce,
+                "flags": ["--ssd-experts", "--ram-experts-gb", "0"],
+            }
+        rb = int(max(1, ram_room))
+        return {
+            "mode": "gpu_ram_ssd", "runnable": True,
+            "label": f"GPU + {rb} GB RAM + SSD",
+            "vram_use_gb": f["vram_use_gb"], "ram_use_gb": float(rb),
+            "ssd_gb": f["spill_gb"], "bounce_ring_gb": SSD_BOUNCE_RING_GB,
+            "flags": ["--resident-budget-gib", str(rb)],
+        }
+    # No usable GPU: first-class CPU + SSD Only mode!
+    lru_gb = _round1(max(SSD_MIN_RAM_LRU_GB, min(ram_room, max(SSD_MIN_RAM_LRU_GB, ram * 0.5))))
+    return {
+        "mode": "cpu_ssd_only", "runnable": True,
+        "label": f"CPU + SSD (no GPU, {lru_gb:g} GB RAM LRU)",
+        "vram_use_gb": 0.0, "ram_use_gb": lru_gb,
+        "ssd_gb": _round1(max(0.0, memory_gb - lru_gb)),
+        "bounce_ring_gb": 0.0,
+        "flags": ["--cpu", "--ssd-experts", "--ram-experts-gb", f"{lru_gb:g}"],
+    }

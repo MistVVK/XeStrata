@@ -11,7 +11,13 @@
 namespace strata::artifact {
 namespace {
 constexpr uint8_t kStrataMagic[8] = {'S', 'T', 'R', 'A', 'T', 'A', 0x00, 0x01};
-bool seek_abs(std::FILE* fp, uint64_t off) noexcept { return fseeko(fp, static_cast<off_t>(off), SEEK_SET) == 0; }
+bool seek_abs(std::FILE* fp, uint64_t off) noexcept {
+#if defined(_WIN32)
+    return _fseeki64(fp, static_cast<__int64>(off), SEEK_SET) == 0;
+#else
+    return fseeko(fp, static_cast<off_t>(off), SEEK_SET) == 0;
+#endif
+}
 }  // namespace
 
 void StrataFileReader::close() {

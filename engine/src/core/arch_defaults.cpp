@@ -152,7 +152,8 @@ bool igpu_uma_arena_default(const char* gcn_arch, bool integrated, bool windows,
 bool igpu_arena_no_thp_default(const char* gcn_arch, bool integrated, bool windows) {
     if (!integrated || windows) return false;
     return strata::kernels::gfx_arch_is(gcn_arch, "gfx1103") || strata::kernels::gfx_arch_is(gcn_arch, "gfx1150") ||
-           strata::kernels::gfx_arch_is(gcn_arch, "gfx1151");
+           strata::kernels::gfx_arch_is(gcn_arch, "gfx1151") || strata::kernels::gfx_arch_is(gcn_arch, "gfx1152") ||
+           strata::kernels::gfx_arch_is(gcn_arch, "gfx1153");
 }
 
 bool igpu_kfd_settle_default(const char* gcn_arch, bool integrated, bool windows) {
@@ -164,7 +165,8 @@ bool igpu_cache_drop_default(const char* gcn_arch, bool integrated, bool windows
 }
 
 bool igpu_fused_prompt_default(const char* gcn_arch, bool integrated, bool windows) {
-    return igpu_arena_no_thp_default(gcn_arch, integrated, windows);   // the same device class
+    if (!integrated || windows) return false;
+    return igpu_prompt_defaults_arch(gcn_arch);
 }
 
 std::vector<std::pair<std::string, std::string>> igpu_default_env(const char* gcn_arch, bool integrated) {
@@ -449,6 +451,19 @@ std::vector<std::string> apply_arch_defaults(const char* gcn_arch, bool integrat
         std::fprintf(stderr, "strata: gfx1151 (Strix Halo): the verify window's graph is launched from a helper thread (the main thread serves the doorbells meanwhile; STRATA_GFX1151_DEFAULTS=0 or STRATA_VERIFY_ASYNC_LAUNCH=0 turns it off)\n");
         set.insert(set.end(), lau.begin(), lau.end());
     }
+#if defined(__linux__)
+    if (integrated) {
+        if (std::FILE* osf = std::fopen("/proc/sys/kernel/osrelease", "r")) {
+            char osrel[256] = {0};
+            if (std::fgets(osrel, sizeof(osrel), osf) && wsl2_ryzen_apu_unsupported(gcn_arch, integrated, osrel)) {
+                std::fprintf(stderr, "strata: WARNING: WSL2 on an integrated Ryzen APU (%s) is unsupported in ROCm 10.2 (#10097) "
+                                     "and may stall or reset KFD/dxgkrnl; run the native Windows HIP build instead\n",
+                             gcn_arch);
+            }
+            std::fclose(osf);
+        }
+    }
+#endif
     return set;
 }
 

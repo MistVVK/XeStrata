@@ -91,8 +91,11 @@ EOJ
 # the libraries the engine and the GPU reader load (the CPU reader needs only the system's), collected from the build outputs
 DATA=(--data "$LIBW/lib/rocblas/library=rocblas/library" --data "$LIBW/lib/hipblaslt/library=hipblaslt/library" --data-arch "$DATAARCH")
 BINS=("$OUT/b/strata" "$OUT/bh/bin/strata-vision-hip")
+LLVMTARGET="$CORE/lib/llvm/lib/$(uname -m)-unknown-linux-gnu"
+LLVMSEARCH=(--search "$CORE/lib/llvm/lib")
+[ -d "$LLVMTARGET" ] && LLVMSEARCH+=(--search "$LLVMTARGET")   # ROCm 10.2+ LLVM 24 per-target runtime directory
 for b in "${BINS[@]}"; do
-  python3 tools/packaging/collect_libs.py --binary "$b" --search "$LIBW/lib" --search "$HP/lib" --search "$CORE/lib" --search "$CORE/lib/llvm/lib" ${SYSDEPS:+--search "$HP/lib/rocm_sysdeps/lib"} \
+  python3 tools/packaging/collect_libs.py --binary "$b" --search "$LIBW/lib" --search "$HP/lib" --search "$CORE/lib" "${LLVMSEARCH[@]}" ${SYSDEPS:+--search "$HP/lib/rocm_sysdeps/lib"} \
     --also 'libamd_comgr.so*' --also 'libhiprtc*.so*' --out "$STAGE" \
     "${DATA[@]}" >> "$OUT/collect.log" 2>&1
   chk $? "collected for $(basename "$b")"

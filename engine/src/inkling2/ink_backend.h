@@ -25,7 +25,8 @@ struct BackendOpts {
     int cpu_threads = 0;         // > 0 activates CUDA-Graph mapped-memory doorbell NUMA CPU expert pool (#6520)
     int threads = 0;             // 0 = auto
     double vram_experts_gb = -1.0; // <0 = auto (3x loop-weighted vram_load_order!)
-    double ram_experts_gb = -1.0;  // <0 = auto
+    double ram_experts_gb = -1.0;  // <0 = auto, 0 = GPU+SSD only (bounded 1-2 GiB DMA ring, 0 host arena)
+    bool ssd_experts = false;      // first-class GPU+SSD / CPU+SSD direct NVMe streaming mode
     KvDtype kv_dtype = KvDtype::FP16;
     bool kv_dtype_auto = true;   // auto selects FP8_E4M3 when parallel >= 16 on <= 32 GiB GPU
     bool enable_dspark = true;

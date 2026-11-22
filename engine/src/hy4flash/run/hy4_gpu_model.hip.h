@@ -16,6 +16,7 @@
 #include "hy4_io.h"
 #include "hy4_manifest.h"
 #include "strata/artifact/strata_reader.hpp"
+#include "strata/platform/cgroup_mem.hpp"
 #if !HY4_CUDA
 #include "strata/hip_uma_guard.hpp"
 #endif
@@ -439,21 +440,23 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
 }
 
 inline double host_mem_gb();
-// RAM this process may use: min(MemTotal, the container's cgroup limit), in GiB (matching host_mem_gb())
-inline double ram_limit_gb() {
-    double gb = host_mem_gb();
+// RAM this process may use: min(MemTotal, the tightest cgroup v1/v2 available ceiling crediting reclaimable file cache), in GiB
+inline double ram_limit_gb(bool* out_cgroup_limited = nullptr) {
+    const double host_gb = host_mem_gb();
 #ifndef _WIN32
-    const char* files[2] = {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
-    for (const char* fn : files) {
-        FILE* f = fopen(fn, "r");
-        if (!f) continue;
-        double v = 0;
-        char buf[64] = {0};
-        if (fgets(buf, sizeof buf, f) && sscanf(buf, "%lf", &v) == 1 && v > 1e9 && v < 1e15) gb = std::min(gb, v / 1073741824.0);
-        fclose(f);
+    const uint64_t host_bytes = strata::platform::cgroup_mem::gib_to_bytes(host_gb);
+    const auto cg = strata::platform::cgroup_mem::probe_cgroup_room(host_bytes);
+    if (out_cgroup_limited) *out_cgroup_limited = cg.limited;
+    if (cg.limited && cg.available_bytes != strata::platform::cgroup_mem::kUnlimited) {
+        return std::min(host_gb, static_cast<double>(cg.available_bytes) / 1073741824.0);
     }
+    if (cg.limit_bytes != strata::platform::cgroup_mem::kUnlimited) {
+        return std::min(host_gb, static_cast<double>(cg.limit_bytes) / 1073741824.0);
+    }
+#else
+    if (out_cgroup_limited) *out_cgroup_limited = false;
 #endif
-    return gb;
+    return host_gb;
 }
 
 inline double host_mem_gb() {
@@ -557,11 +560,12 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     std::vector<uint64_t> vcap(ng, 0), vb_gpu(ng, 0), nv_gpu(ng, 0);
     // Adaptive VRAM expert cache (single-GPU cpu_mode): when host RAM fits all experts (e.g. 64 GB+ Hero cards), use 100% dynamic slots;
     // when multi-GPU (--gpus 0,1...), distribute static experts across all GPUs (e.g. 2x V100 32 GB = 64 GB HBM2).
-    const double host_gb = host_mem_gb(), lim_gb = ram_limit_gb(), avail_gb = ram_avail_gb();
-    const bool cgroup_limited = (lim_gb < host_gb - 1.0);
+    bool cgroup_limited = false;
+    const double lim_gb = ram_limit_gb(&cgroup_limited), avail_gb = ram_avail_gb();
     double ram_budget_gb = 0.0;
     if (cpu_mode) {
-        if (getenv("HY4_RAM_BUDGET_GB")) ram_budget_gb = std::max(0.0, atof(getenv("HY4_RAM_BUDGET_GB")));
+        if (const char* rb = getenv("HY4_RAM_BUDGET_GB") ? getenv("HY4_RAM_BUDGET_GB") : getenv("STRATA_HY4_RAM_GB"))
+            ram_budget_gb = std::max(0.0, atof(rb));
         else {
             const double need = getenv("HY4_HOST_NEED_GB") ? atof(getenv("HY4_HOST_NEED_GB")) : 0.0;
             const double engram_gb = getenv("HY4_ENGRAM_CACHE_MIB") ? std::max(0.0, atof(getenv("HY4_ENGRAM_CACHE_MIB")) / 1024.0) : 0.85;
@@ -571,7 +575,7 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
             ram_budget_gb = std::max(0.0, (avail_gb > 0.5) ? std::min(by_total, by_avail) : by_total);
         }
     }
-    const uint64_t ram_budget_bytes = ram_budget_gb > 0 ? (uint64_t)(ram_budget_gb * 1e9) : 0;
+    const uint64_t ram_budget_bytes = strata::platform::cgroup_mem::gib_to_bytes(ram_budget_gb);
     uint64_t all_al_bytes = 0;
     size_t max_body_sz = 0;
     for (size_t i = 0; i < N; ++i) {
@@ -921,7 +925,8 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
         if (gpu_is_uma() && fr > trunk_al) fr -= trunk_al;
         double reserve_gb = getenv("HY4_RESERVE_GB") ? atof(getenv("HY4_RESERVE_GB")) : 6.0;
         double budget = (double)fr - reserve_gb * 1073741824.0;
-        if (getenv("HY4_EXPERT_VRAM_GB")) budget = atof(getenv("HY4_EXPERT_VRAM_GB")) * 1073741824.0;
+        if (const char* vb = getenv("HY4_EXPERT_VRAM_GB") ? getenv("HY4_EXPERT_VRAM_GB") : getenv("STRATA_HY4_VRAM_GB"))
+            budget = atof(vb) * 1073741824.0;
         const uint64_t sec4_al = (g.sec4_bytes + 4095) & ~4095ull;
         bool loaded_full = false;
         if (g.peer_devs.empty() && budget >= (double)sec4_al) {

@@ -364,11 +364,13 @@ private:
     std::condition_variable cv_;
     bool quit_ = false, pending_ = false, busy_ = false;
     int64_t layer_ = -1, n_tok_ = 0;
-    std::vector<int32_t> res_;   ///< the residency rows of the layers predicted, copied at submit (admissions write the table)
+    std::vector<int32_t> res_;       ///< pending residency rows (overwritten by submit() without dropping!)
+    std::vector<int32_t> work_res_;  ///< worker's active copy while busy_ == true
     bool has_res_ = false;
     uint64_t sub_gen_ = 0;
-    ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
-    std::vector<float> x_;
+    ForesightSwap* fs_ = nullptr;    ///< (under mu_)
+    std::vector<float> x_;           ///< pending activation buffer (overwritten by submit() without dropping!)
+    std::vector<float> work_x_;      ///< worker's active copy while busy_ == true
     std::atomic<int64_t> predicted_{0}, skipped_{0};
     std::atomic<uint64_t> busy_us_{0};
     // STRATA_LOOKAHEAD_STATS
@@ -913,7 +915,7 @@ public:
     /// experts_unbuffered.  The mapped reads' page faults are one small request each, and the pages they bring in
     /// take the RAM the budget was sized for.  `why` says what decided.
     /// #577: `ram_bytes` counts up to every expert, and only the experts outside it are what the cache must keep.
-    bool set_unbuffered(uint64_t ram_bytes, std::string& why);
+    bool set_unbuffered(uint64_t ram_bytes, std::string& why, bool force = false);
     /// #577: the same decision once the RAM copy is built (pin_cache_complement), from the RAM it really holds and the
     /// expert bytes outside it; switches either way (startup only, nothing reading).  Returns whether unbuffered.
     bool recheck_unbuffered(std::string& why);
@@ -927,6 +929,10 @@ public:
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
     /// read_direct (mapped_blob answers nullptr).  Returns whether the view was closed; `why` says why not.
     bool drop_mapping(std::string& why);
+    /// Verifies unbuffered read_direct on blob (0, 0) against the mapping first, then calls drop_mapping so Windows
+    /// NTFS unbuffered reads run at full unmapped NVMe queue depth (10.4 GB/s vs 3.4 GB/s) during GPU cache + RAM load.
+    bool drop_mapping_verified(std::string& why);
+    bool is_unmapped() const { return unmapped_; }
     /// A GPU that shares the system RAM (cudaDevAttrIntegrated: the DGX Spark's GB10) and holds every expert in its cache
     /// reads nothing from the files again, and the pages the start read from them are a second copy of the cache's bytes.
     /// CUDA counts only the RAM the kernel has free (MemFree, not the page cache it could reclaim), so with those pages
@@ -1137,6 +1143,7 @@ private:
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> pdirect_;              ///< open_prompt_direct: O_DIRECT fds for copy_blobs only
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
+    uint64_t direct_sector_ = 4096;           ///< Windows FileStorageInfo hardware sector alignment (>= 4096)
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }

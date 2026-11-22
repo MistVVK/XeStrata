@@ -20,12 +20,12 @@ tests/terminal/test_hy4_squant_fit.py, plus what the 0.2.18 defaults add (owner,
                                                                     beyond the author's 20K, the same range (to be checked against the CUDA lane's RTX 5070 numbers at 128K)
 
 The placement is planned at the chosen context on every card, 8 GB ones included (owner, 2026-11-19: 128K is the default everywhere and people change it themselves, never a
-lower context chosen for them).  At the author's 20K the author's rule above holds.  Beyond it the engine's own memory plan decides (HY4-CUDA's plan_memory, mirrored by `engine_plan`, with
-the growable KV of 2026-11-20): the card keeps the working buffers and the KV state it holds free of experts; a card that cannot hold the KV rows at this context (8 GiB at 128K) keeps only the
-first positions of rows + IndexPool (about 46K here, 33K measured on a real 8 GB card) and moves the whole state to pinned host memory once a prompt passes them, so the card has almost no room
-for experts (0.3 GB) and RAM holds 5.7 GB of state plus HOST_PIN_HEADROOM_GB (about 58 GB of a 64 GiB PC are usable): SQ-64 does not fit 8 GiB + 64 GiB (about 3.4 GB from the SSD) and is
-still recommended there, still at 128K, with the "may run slower" words and its SSD-read figure.  A 12 GiB card keeps the rows in the card and pins only the kv_b copies (1.4 GB): 0.6 GB of
-experts in the card, SQ-64 + 64 GiB resident (12 GiB + 32 GiB reads 33 GB).  A 16 GiB card and larger hold all the state and reserve the prefill scratch.
+lower context chosen for them).  At the author's 20K the author's rule above holds.  Beyond it the engine's own memory plan decides (HY4-CUDA's plan_memory in
+hy4_gpu_model.hip.h, mirrored by `engine_plan`, with Vt-free MLA of 71576cda5 and the 0.03 GB single-layer wkv scratch of 6e38f588a): discrete cards under 48 GiB map
+embed_tokens (0.38 GB) in host RAM, and keep the working buffers and the KV state free of experts; an 8 GiB card that cannot hold all 128K KV rows + IndexPool (2.72 GB) keeps
+the first ~94K positions in video memory and moves the state to pinned host memory once a prompt passes them (3.02 GB in host RAM plus HOST_PIN_HEADROOM_GB), so SQ-64 reads
+about 1.44 GB from the SSD on 8 GiB + 64 GiB ("near resident").  A 12 GiB card and larger hold all 128K Vt-free KV rows + IndexPool in video memory (2.50 GB of experts in
+VRAM on 12 GiB, SQ-64 + 64 GiB resident; 12 GiB + 32 GiB reads 26.5 GB) and reserve the prefill streaming scratch.
 
 Unified memory (Strata Halo, Apple silicon, DGX Spark) has one pool: the trunk, the KV and every expert body live in it and nothing is copied or read from the SSD while the
 footprint fits `pool - UMA_RESERVE_GB - kv_extra - vision`.
@@ -49,13 +49,15 @@ DEFAULT_CONTEXT = 131072         # owner, 2026-11-19: 128K by default
 CONTEXTS = [8192, 32768, 65536, 131072]
 KV_GB_PER_TOKEN = 34.7e-6        # KV + context workspace (IndexPool, workspace and Engram buffers grow with it too), per token: HY4-STRIX, Strix Halo SQ-64: (66.3 - 62.2) GiB x 1.0737 / (131072 - 4096); HY4-METAL (M5 Max): +5.0 GB from 4K to 128K, KV alone 1.9 GB of it
 DRAFTER_GB = 0.44                # the 5-layer DFly2 drafter, in Section 1 already (inside every build's dense_gb): kept here to say so, not added twice
-#: HY4-CUDA's engine decides where the sparse-layer KV rows, the IndexPool state and the absorbed kv_b copies live (plan_memory in hy4_gpu_model.hip.h, 2026-11-20): `engine_plan` below
-#: is that rule.  Pinned host memory is what the engine puts out of the card: about 5.7 GB at 128K on an 8 GiB card (rows 3.42 + IndexPool 0.91 + kv_b 1.06 + 0.3), 1.4 GB (kv_b only) on 12 GiB.
-HOST_KV_GB_PER_TOKEN = 5.7 / 131072      # kept for callers that want the 8 GiB-card figure per token (host_kv_gb says it for a card)
-HOST_PIN_HEADROOM_GB = 3.8               # the pinned staging beside the cache itself (about 58 GB of a 64 GiB PC are usable with 5.7 GB of host KV)
-ENGINE_KV_ROW_B = 12.0 * 2176.0          # per position: the 12 sparse layers' KV rows + Vt (bytes)
+#: HY4-CUDA's engine decides where the Vt-free sparse-layer KV rows and IndexPool state live (plan_memory in hy4_gpu_model.hip.h, 71576cda5 / 6e38f588a): `engine_plan` below
+#: is that rule.  Pinned host memory is what the engine puts out of the card when full-context KV exceeds VRAM: ~3.02 GB at 128K on an 8 GiB card (rows 1.81 + IndexPool 0.91 + 0.30), 0 GB on >= 12 GiB.
+HOST_KV_GB_PER_TOKEN = 3.018 / 131072    # kept for callers that want the 8 GiB-card figure per token (host_kv_gb says it for a card)
+HOST_PIN_HEADROOM_GB = 3.8               # the pinned staging beside the cache itself
+ENGINE_KV_ROW_B = 12.0 * 1152.0          # per position: the 12 sparse layers' Vt-free MLA KV rows (bytes; 71576cda5 eliminated the 1024 B/slot Vt cache)
 ENGINE_IDX_B = 12.0 * 512.0 + 12.0 * 64.0  # per position: IndexPool iv/ig + the pooled keys (bytes; the pooled keys are max_ctx/4 x 256 B, i.e. 64 B a position)
-ENGINE_KVB_GB = 1.06                     # the absorbed kv_b copies
+ENGINE_WKV_GB = 0.03                     # single-layer reusable FP16 wk/wv prefill scratch (28 MiB; replaced the 1.06 GB absorbed kv_b copies in 6e38f588a)
+ENGINE_CUBLAS_GB = 0.08                  # 64 MiB reusable side-stream FP16 dequant + cuBLAS scratch
+ENGINE_HOST_EMBED_GB = 0.38              # discrete cards (< 48 GiB) map embed_tokens in host RAM (hy4_gpu_model.hip.h:340)
 ENGINE_MARGIN_GB = 0.3
 ENGINE_DENSE_EXTRA_GB = 0.12             # the engine's trunk (Section 1 of the file, 5.92 GB for SQ-64) is a little more than the author's dense_gb (5.80)
 FAMILY = "hy4-flash"
@@ -87,47 +89,61 @@ def non_expert_gb(ctx: int | None = None) -> float:
     return VRAM_NON_EXPERT_GB + kv_extra_gb(ctx)
 
 
+def _est_work_gb(c: int) -> float:
+    """HY4-CUDA's aliased work_arena + activations + 30 SWA rings (est_work_gb in hy4_gpu_model.hip.h:359-363)."""
+    arena = max(2.0 * c * 16384.0 * 4.0, float(c) * 16.0 * 1536.0 * 6.0) / 1e9
+    return arena + c * 0.195e6 / 1e9 + 0.22 + 30.0 * (512.0 + c) * 1152.0 / 1e9
+
+
 def engine_plan(vram_gib: float, ctx: int | None = None, dense_gb: float = 5.80) -> dict:
-    """HY4-CUDA's memory plan for a context on a card (plan_memory in engine/src/hy4flash/run/hy4_gpu_model.hip.h, 2026-11-20), mirrored: where the KV state lives and what the
-    card keeps free for it.  Returns {chunk, work_gb, mask, dev_pos, reserve_gb, host_need_gb}:
-      mask bit 2: the absorbed kv_b copies (1.06 GB) are in pinned host memory;  bit 1: the KV rows + IndexPool are;
-      dev_pos: on a card that cannot hold the rows at this context the first dev_pos positions of rows + IndexPool stay in video memory (a short chat runs at card speed) and everything moves
-               to pinned host memory once the context passes it (growable KV; mask bit 1 is then clear but the host need counts the rows and the IndexPool);
-      reserve_gb: video memory the engine keeps free of experts (buffers, the KV state it holds, the prefill scratch when everything fits);
-      host_need_gb: pinned host memory the state takes once it has moved (0 when the whole state is in the card)."""
+    """HY4-CUDA's memory plan for a context on a card (plan_memory in engine/src/hy4flash/run/hy4_gpu_model.hip.h:328-423, v0.2.18), mirrored: where the KV state lives and
+    what the card keeps free for it at full `ctx` steady state.  Returns {chunk, work_gb, mask, dev_pos, host_embed, trunk_gb, reserve_gb, host_need_gb}:
+      mask bit 1: the KV rows + IndexPool live in pinned host memory from token 0;
+      dev_pos: on a card that cannot hold all `ctx` rows in VRAM (e.g. 8 GiB at 128K), the first dev_pos positions of rows + IndexPool stay in VRAM (~94K on SQ-64) and move
+               to pinned host memory once the context passes it (growable KV; mask bit 1 is then clear, and host_need_gb counts the spilled rows + IndexPool);
+      host_embed: discrete cards under 48 GiB map embed_tokens (0.38 GB) in host RAM, reducing trunk VRAM by 0.38 GB;
+      reserve_gb: video memory the engine keeps free of experts at full `ctx` (working buffers, held KV state, wkv/cuBLAS scratch, and prefill streaming scratch);
+      host_need_gb: pinned host memory the spilled KV state takes once moved (0 when the whole state stays in the card, i.e. >= 12 GiB at 128K)."""
     n = DEFAULT_CONTEXT if ctx is None else int(ctx)
     tot = float(vram_gib) * GIB_TO_GB
+    host_embed = tot < (48.0 * GIB_TO_GB)
     trunk = dense_gb + ENGINE_DENSE_EXTRA_GB
+    if host_embed and trunk > 0.5:
+        trunk -= ENGINE_HOST_EMBED_GB
+    per_pos = ENGINE_KV_ROW_B + ENGINE_IDX_B  # 20,736 B per token across 12 sparse layers
+    init_slots = 16384 if (host_embed and n > 16384) else n
+    kv_init_gb = ((init_slots + 8 + 15) // 16 * 16) * per_pos / 1e9
+    chunk = (8192 if n >= 8192 else 4096) if tot >= 15.0 else (2048 if tot >= 11.0 else 1024)
+    work_cap = 0.22 if tot >= 15.0 else 0.16
+    while chunk > 256 and _est_work_gb(chunk) > work_cap * tot:
+        chunk //= 2
+    while chunk > 256 and trunk + _est_work_gb(chunk) + kv_init_gb + ENGINE_WKV_GB + ENGINE_CUBLAS_GB + 0.55 > tot:
+        chunk //= 2
     slots = (n + 8 + 15) // 16 * 16
     rows = slots * ENGINE_KV_ROW_B / 1e9
     pivg = (12.0 * n * 512.0 + 12.0 * (n // 4 + 8) * 256.0) / 1e9
-    chunk = 2048
-    while chunk > 256 and chunk * 1.4e6 > 0.12 * tot * 1e9:
-        chunk //= 2
-    while chunk > 256 and trunk + chunk * 1.5e6 / 1e9 + 0.4 + pivg + rows + ENGINE_MARGIN_GB > tot:
-        chunk //= 2
-    work = chunk * 1.5e6 / 1e9 + 0.4 + 30.0 * (512.0 + chunk) * 2176.0 / 1e9
-    mask = 0
-    if trunk + work + pivg + rows + ENGINE_KVB_GB + ENGINE_MARGIN_GB > tot:
-        mask |= 2
-    if trunk + work + pivg + rows + ENGINE_MARGIN_GB > tot:
-        mask |= 1
-    per_pos = ENGINE_KV_ROW_B + ENGINE_IDX_B
+    work = _est_work_gb(chunk)
+    mask = 1 if (trunk + work + pivg + rows + ENGINE_WKV_GB + ENGINE_CUBLAS_GB + 0.35 > tot) else 0
     dev_pos = 0
     if mask & 1:
-        avail = tot - trunk - work - ENGINE_MARGIN_GB
+        avail = tot - trunk - work - ENGINE_WKV_GB - ENGINE_CUBLAS_GB - 0.35
         dp = int(avail * 1e9 / per_pos) // 1024 * 1024 if avail > 0 else 0
         if 4096 <= dp < n:
             mask &= ~1
             dev_pos = dp
-    host_need = (rows + (pivg if dev_pos else 0.0) if ((mask & 1) or dev_pos) else 0.0) + (ENGINE_KVB_GB if mask & 2 else 0.0) + ENGINE_MARGIN_GB
-    reserve = work + (dev_pos * per_pos / 1e9 if dev_pos else pivg + (0.0 if mask & 1 else rows)) + (0.0 if mask & 2 else ENGINE_KVB_GB) + (1.45 if tot >= 10.0 and mask == 0 else 0.0)
-    return {"chunk": chunk, "work_gb": round(work, 3), "mask": mask, "dev_pos": dev_pos, "reserve_gb": round(reserve, 3), "host_need_gb": round(host_need, 3) if (mask or dev_pos) else 0.0}
+    host_need = (rows + (pivg if dev_pos else 0.0) if ((mask & 1) or dev_pos) else 0.0) + ENGINE_MARGIN_GB
+    kv_res = 0.0 if (mask & 1) else ((dev_pos * per_pos / 1e9) if dev_pos else (rows + pivg))
+    pf_res = 0.82 if (21.5 <= tot < 64.0 and mask == 0 and not dev_pos) else (0.56 if (10.0 <= tot < 64.0 and mask == 0 and not dev_pos) else 0.0)
+    margin_res = 0.35 if dev_pos else 0.45
+    reserve = work + kv_res + ENGINE_WKV_GB + ENGINE_CUBLAS_GB + pf_res + margin_res
+    return {"chunk": chunk, "work_gb": round(work, 3), "mask": mask, "dev_pos": dev_pos, "host_embed": host_embed,
+            "trunk_gb": round(trunk, 2), "reserve_gb": round(reserve, 3),
+            "host_need_gb": round(host_need, 3) if (mask or dev_pos) else 0.0}
 
 
 def host_kv_gb(ctx: int | None = None, vram_gib: float = 8.0) -> float:
-    """Pinned host memory the engine's KV state takes at `ctx` tokens on a card of `vram_gib` (GB): 5.7 GB at 128K on an 8 GiB card (rows + IndexPool + kv_b copies, once a prompt
-    passes the positions the card keeps), about 1.4 GB (the kv_b copies) on 12 GiB, nothing on a card that holds it all."""
+    """Pinned host memory the engine's KV state takes at `ctx` tokens on a card of `vram_gib` (GB): ~3.02 GB at 128K on an 8 GiB card (Vt-free rows + IndexPool once a prompt
+    passes the ~94K positions the card keeps), 0 GB on >= 12 GiB cards that hold all 128K positions in VRAM."""
     return engine_plan(vram_gib, ctx)["host_need_gb"]
 
 
@@ -139,18 +155,20 @@ def kv_in_host(vram_gib: float | None, ctx: int | None = None) -> bool:
 
 def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None, vision: bool = False) -> dict:
     """Where the expert bodies of `build` go on a PC with a card of `vram_gib` and `ram_gib` of main memory (GiB): GB in video memory, in RAM, on the SSD.  At the author's 20K
-    (and below) the author's rule holds.  Beyond it the engine's own plan decides (`engine_plan`): the card keeps the buffers and the KV state it holds free of experts (on a small card
-    only the first positions: growable KV), and what the state takes in pinned host memory, plus the pinned headroom, comes out of RAM."""
+    (and below) the author's rule holds.  Beyond it the engine's own plan decides (`engine_plan`): the card keeps the buffers and the KV state it holds free of experts (on an 8 GiB card
+    the first ~94K positions: growable KV), mapped embed_tokens (0.38 GB on < 48 GiB cards) and any spilled host KV + pinned headroom come out of RAM."""
     info = BUILDS[build]
     n = DEFAULT_CONTEXT if ctx is None else int(ctx)
     if n > AUTHOR_CONTEXT and vram_gib > 0:
         plan = engine_plan(vram_gib, n, info["dense_gb"])
-        gpu_room = max(0.0, vram_gib * GIB_TO_GB - info["dense_gb"] - ENGINE_DENSE_EXTRA_GB - plan["reserve_gb"])
+        gpu_room = max(0.0, vram_gib * GIB_TO_GB - plan["trunk_gb"] - plan["reserve_gb"])
         host = plan["host_need_gb"]
+        host_embed_ram = ENGINE_HOST_EMBED_GB if plan["host_embed"] else 0.0
     else:
         gpu_room = max(0.0, vram_gib * GIB_TO_GB - info["dense_gb"] - non_expert_gb(ctx))
         host = 0.0
-    ram_room = max(0.0, ram_gib * GIB_TO_GB - OS_RESERVE_GB - HOT_ENGRAM_GB - (VISION_GB if vision else 0.0) - ((host + HOST_PIN_HEADROOM_GB) if host > 0 else 0.0))
+        host_embed_ram = 0.0
+    ram_room = max(0.0, ram_gib * GIB_TO_GB - OS_RESERVE_GB - HOT_ENGRAM_GB - host_embed_ram - (VISION_GB if vision else 0.0) - ((host + HOST_PIN_HEADROOM_GB) if host > 0 else 0.0))
     in_vram = min(info["bodies_gb"], gpu_room)
     in_ram = min(info["bodies_gb"] - in_vram, ram_room)
     on_ssd = max(0.0, info["bodies_gb"] - in_vram - in_ram)
@@ -219,3 +237,30 @@ def build_of_model_name(model_name: str | None) -> str | None:
         return None
     size = low[len(FAMILY_NAME) + 1:].upper()
     return size if size in BUILDS else None
+
+
+def ssd_mode_flags(build: str, vram_gib: float | None, ram_gib: float, unified: bool = False,
+                   ctx: int | None = None, vision: bool = False) -> dict:
+    """First-class GPU+SSD Only / CPU+SSD Only runner flags for Hy4-Flash (never blocks or overcommits RAM)."""
+    placed = place(build, vram_gib, ram_gib, unified, ctx, vision)
+    v = float(vram_gib or 0.0)
+    r = float(ram_gib or 0.0)
+    ssd = placed["ssd_gb"]
+    if ssd <= 0.05:
+        return {"tier": "in_memory", "runnable": True, "placement": placed, "flags": []}
+    if not unified and v >= 6.0 and (placed["ram_gb"] < 8.0 and ssd > placed["ram_gb"]):
+        return {
+            "tier": "gpu_ssd_only", "runnable": True, "placement": placed,
+            "bounce_ring_gb": round(min(2.0, max(1.0, r * 0.15)), 1),
+            "flags": ["--ssd-experts", "--ram-experts-gb", "0"],
+        }
+    if not unified and v < 6.0:
+        lru_gb = round(max(1.0, min(placed["ram_gb"], max(1.0, r * 0.5))), 1)
+        return {
+            "tier": "cpu_ssd_only", "runnable": True, "placement": placed,
+            "flags": ["--ssd-experts", "--ram-experts-gb", f"{lru_gb:g}"],
+        }
+    return {
+        "tier": "hybrid_ssd", "runnable": True, "placement": placed,
+        "flags": ["--ram-experts-gb", f"{max(0.0, placed['ram_gb']):g}"],
+    }

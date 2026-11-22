@@ -12,7 +12,7 @@ endif()
 # same wave32 / 64 KiB LDS / sudot4 family as gfx1100, on a unified-memory APU; experimental.
 set(_strata_hip_validated gfx1100 gfx1103 gfx1151 gfx1201)
 set(_strata_hip_community gfx1101 gfx1150 gfx1200)
-set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1030 gfx1031 gfx1032 gfx1034 gfx1152)   # gfx1103: Radeon 780M iGPU; gfx1150: Strix Point 890M/880M; gfx1151: Strix Halo; gfx1152: Krackan, Radeon 860M / 840M (#1625), builds with the portable kernels, no card report yet
+set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1030 gfx1031 gfx1032 gfx1034 gfx1152 gfx1153 gfx1170 gfx1171 gfx1172 gfx1250)   # gfx1103: Radeon 780M iGPU; gfx1150: Strix Point 890M/880M; gfx1151: Strix Halo; gfx1152: Krackan, Radeon 860M / 840M (#1625); ROCm 10.2 adds gfx1153 (Ryzen AI 400), gfx1170/1171/1172 (RDNA3.5+/Medusa), and gfx1250 (wave32/matrix preview)
 # CMake hands HIP a ';' list, but a -DCMAKE_HIP_ARCHITECTURES typed by hand (or ROCm's own Windows tooling) may use
 # spaces, which foreach(IN LISTS) would otherwise treat as one element.
 string(REPLACE " " ";" _strata_hip_norm "${CMAKE_HIP_ARCHITECTURES}")

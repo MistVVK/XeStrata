@@ -179,3 +179,55 @@ export function runCards<T extends RunCard>(gpus: T[] | null | undefined, engine
   const hasReal = mine.some(g => !sharesMemory(g) && g.vram_gb >= 4);
   return mine.filter(g => !(hasReal && sharesMemory(g)));
 }
+
+export type SsdStreamingMode = 'in_memory' | 'gpu_ssd_only' | 'cpu_ssd_only' | 'hybrid_ssd' | 'unknown';
+export interface SsdStreamingPlan {
+  mode: SsdStreamingMode;
+  runnable: boolean;
+  label: string;
+  bounceRingGb: number;
+  ramBudgetGb: number;
+  ssdGb: number;
+}
+
+/**
+ * First-class `GPU + SSD` Only and `CPU + SSD` Only classification matching `strata_control/gpu_fit.py` `ssd_streaming_plan`.
+ * Ensures the Desktop GUI never blocks or overcommits RAM on low-RAM GPU hosts or no-GPU hosts streaming big MoEs from NVMe.
+ */
+export function ssdStreamingMode(fit: Fit, hw: FitHardware | null | undefined): SsdStreamingPlan {
+  if (!fit.known) {
+    return { mode: 'unknown', runnable: true, label: 'memory unknown', bounceRingGb: 0, ramBudgetGb: 0, ssdGb: 0 };
+  }
+  const ram = Number(hw?.ram_gb) || 0;
+  const vram = Number(hw?.vram_gb) || 0;
+  if (fit.spillGb <= 0.05) {
+    return {
+      mode: 'in_memory', runnable: true,
+      label: vram >= 4 ? 'GPU + RAM' : 'CPU + RAM',
+      bounceRingGb: 0, ramBudgetGb: fit.ramUseGb, ssdGb: 0,
+    };
+  }
+  const ramRoom = Math.max(0, ram - SYSTEM_ROOM_GB);
+  if (vram >= 4) {
+    if (ramRoom < 4) {
+      const bounce = round1(Math.min(2.0, Math.max(1.0, ram * 0.2)));
+      return {
+        mode: 'gpu_ssd_only', runnable: true,
+        label: `GPU + SSD (low RAM, ~${bounce} GB DMA ring)`,
+        bounceRingGb: bounce, ramBudgetGb: 0, ssdGb: round1(Math.max(0, fit.memoryGb - fit.vramUseGb)),
+      };
+    }
+    const rb = Math.max(1, Math.floor(ramRoom));
+    return {
+      mode: 'hybrid_ssd', runnable: true,
+      label: `GPU + ${rb} GB RAM + SSD`,
+      bounceRingGb: 1.5, ramBudgetGb: rb, ssdGb: fit.spillGb,
+    };
+  }
+  const lruGb = round1(Math.max(1.0, Math.min(ramRoom, Math.max(1.0, ram * 0.5))));
+  return {
+    mode: 'cpu_ssd_only', runnable: true,
+    label: `CPU + SSD (no GPU, ${lruGb} GB RAM LRU)`,
+    bounceRingGb: 0, ramBudgetGb: lruGb, ssdGb: round1(Math.max(0, fit.memoryGb - lruGb)),
+  };
+}

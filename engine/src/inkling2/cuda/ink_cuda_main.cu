@@ -10,6 +10,7 @@
 #include "ink_dspark.cuh"
 #include "ink_runner.cuh"
 #include "ink_spec.cuh"
+#include "strata/core/volta_forever.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +36,9 @@ static std::vector<int32_t> parse_ids_arg(const std::string& s) {
 }
 
 int main(int argc, char** argv) {
+    if (strata::core::apply_default_cuda_module_loading()) {
+        std::fprintf(stderr, "[inkling-cuda] volta-forever detected: setting CUDA_MODULE_LOADING=LAZY\n");
+    }
     std::string model_path;
     std::string tokens_arg;
     int gen_n = 128;

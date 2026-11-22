@@ -16,6 +16,9 @@ int main() {
     int fd = mkstemp(name);
     if (fd < 0) return 1;
     close(fd);
+    static_assert(strata::platform::round_up_sector_alignment(512, 4096) == 4096);
+    static_assert(strata::platform::round_up_sector_alignment(8192, 4096) == 8192);
+    static_assert(strata::platform::round_up_sector_alignment(4096, 12288) == 16384);
     void* memory = DirectFile::alloc_aligned(4096 * 18);
     try {
         check(memory != nullptr, "buffer allocation");
@@ -24,6 +27,8 @@ int main() {
         std::string error;
         setenv("STRATA_IO_THREADS", "4", 1);   // the pool's size (out-of-range values are clamped to 1..64)
         check(f.open(name, error), error.c_str());
+        check(f.sector_alignment() >= DirectFile::alignment() && (f.sector_alignment() & (f.sector_alignment() - 1)) == 0,
+              "sector_alignment must be power-of-two >= 4096");
         check(!f.submit(1, memory, 4096, 0, error), "unaligned request accepted");
         for (unsigned i = 0; i < 17; ++i)
             check(f.submit(i * 4096, static_cast<char*>(memory) + i * 4096, 4096, i, error), error.c_str());
