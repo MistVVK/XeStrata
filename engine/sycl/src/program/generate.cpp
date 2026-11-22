@@ -732,6 +732,10 @@ struct Options {
     /// best reads it back.  Only on pressure: a park that fits in RAM never touches the disk, and a layer split is not
     /// written (a stage image is).  The file format, its identity and its read limits are the session SAVE's.
     std::string conversation_spill_dir;   // empty: <data>/conversation-spill when --pack is under <data>/packs
+    /// --conversation-spill-persist: the tier's folder is `<root>/fp-<model fingerprint>` and its entries survive a restart: at
+    /// start those of the current model and settings are adopted and indexed, the folders of other fingerprints are removed.
+    /// Off by default (a per-process folder, removed at the end).
+    bool conversation_spill_persist = false;
     int64_t conversation_spill_mib = -1;  // -1: the disk's free space decides; 0: no SSD tier
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
@@ -883,6 +887,8 @@ void usage() {
                  "  --conversation-spill-dir PATH  --serve (opt-in): also keep parked conversations on disk (a local SSD):\n"
                  "                       what RAM evicts or its floor refuses is written there, and a request whose prompt\n"
                  "                       it serves best reads it back.  Default: <data>/conversation-spill\n"
+                 "  --conversation-spill-persist  --serve (opt-in): keep the SSD tier across engine restarts in\n"
+                 "                       <root>/fp-<model fingerprint>, adopting matching entries at start\n"
                  "  --conversation-spill-mib N  --serve: the SSD tier's budget (default: from the disk's free space;\n"
                  "                       0 = no SSD tier)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
@@ -1551,6 +1557,12 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
                     err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
                     return false;
                 }
+                const uint64_t bytes = (uint64_t) N * sizeof(float);
+                const uint64_t payload = f.file_size() >= f.data_start() ? f.file_size() - f.data_start() : 0;
+                if (t.offset > payload || bytes > payload - t.offset) {
+                    err = path + ": " + t.name + " is truncated";
+                    return false;
+                }
                 const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
                 for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
                 have[(size_t) l] = true;
@@ -1795,6 +1807,14 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
         for (unsigned int d = 0; d < dpct::device_count(); ++d) dpct::get_device(d).queues_wait_and_throw();
     } catch (...) {
     }
+    std::fflush(stderr);
+    std::_Exit(code);
+}
+
+// #6445: after UR_RESULT_ERROR_DEVICE_LOST, the Level Zero context is poisoned for this process; unwinding
+// GPU destructors or calling queues_wait_and_throw() throws sycl::exception from a destructor -> std::terminate.
+[[noreturn]] static void device_lost_exit(int code = 1) {
+    std::fflush(stdout);
     std::fflush(stderr);
     std::_Exit(code);
 }
@@ -2058,6 +2078,7 @@ int main(int argc, char **argv) try {
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
+        else if (a == "--conversation-spill-persist") o.conversation_spill_persist = true;
         else if (a == "--conversation-spill-dir") o.conversation_spill_dir = next("--conversation-spill-dir");
         else if (a == "--conversation-spill-mib") {
             const long long n = std::atoll(next("--conversation-spill-mib"));
@@ -8120,7 +8141,7 @@ int main(int argc, char **argv) try {
                 in.embedding = o.embd_gguf;
                 in.ple = o.ple_gguf;
                 in.pack = o.pack;
-                in.mtp = o.mtp.empty() ? std::string() : o.mtp + "/dense.bin";
+                in.mtp = o.mtp;
                 if (srcp != nullptr) in.experts = srcp->model_inputs();
                 std::vector<strata::core::SessionModelFile> files = strata::core::session_model_inputs(in);
                 // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
@@ -8130,10 +8151,11 @@ int main(int argc, char **argv) try {
                         files.push_back({std::string("pack ") + n, o.pack + "/" + n, true});
                     if (srcp == nullptr) files.push_back({"pack experts.bin", o.pack + "/experts.bin", true});
                 }
-                if (!o.mtp.empty()) {
-                    for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
-                    files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
-                }
+                // resolved like the Metal loader (window.cpp): STRATA_METAL_MTP_GGUF overrides the GGUF beside an rt dir
+                const char* mtp_gguf_env = std::getenv("STRATA_METAL_MTP_GGUF");
+                for (auto& m : strata::core::session_mtp_pack_files(o.mtp, o.mtp_draft_vocab,
+                                                                    mtp_gguf_env ? mtp_gguf_env : ""))
+                    files.push_back(std::move(m));
                 uint64_t fp = 0;
                 // each file is one blocking read of at most 2 MiB (head and tail): announced before it starts
                 if (next_file) next_file();
@@ -8215,12 +8237,26 @@ int main(int argc, char **argv) try {
                 if (!ec && cap < (uint64_t(64) << 20)) { why = "the disk is full"; cap = 0; }
             }
             size_t cleaned = 0;
-            if (cap > 0 && !spill.open(root, cap, why, &cleaned)) cap = 0;
+            size_t adopted = 0;
+            std::optional<strata::core::SessionFileIdentity> persist_id;
+            if (cap > 0 && o.conversation_spill_persist) {   // the stable folder is named by the model's fingerprint: known before the first spill
+                try {
+                    std::string e;
+                    strata::core::SessionFileIdentity id;
+                    if (session_identity(id, e, {})) { persist_id = id; spill_id = id; }
+                    else std::fprintf(stderr, "strata serve: conversation cache: --conversation-spill-persist: the model cannot be fingerprinted (%s); "
+                                              "a folder of this process is used\n", e.c_str());
+                } catch (...) {}
+            }
+            if (cap > 0 && !spill.open(root, cap, why, &cleaned, persist_id ? &*persist_id : nullptr, &adopted)) cap = 0;
             if (cap > 0) {
-                std::fprintf(stderr, "strata serve: conversation cache: SSD tier in %s, up to %llu MiB%s\n",
+                std::fprintf(stderr, "strata serve: conversation cache: SSD tier in %s, up to %llu MiB%s%s\n",
                              spill.dir().string().c_str(), (unsigned long long) (cap >> 20),
                              cleaned ? (", " + std::to_string(cleaned) + " folder" + (cleaned == 1 ? "" : "s") +
-                                        " of ended engines removed").c_str() : "");
+                                        (persist_id ? " of other models or ended engines removed" : " of ended engines removed")).c_str() : "",
+                             spill.persistent() ? (", kept across restarts: " + std::to_string(adopted) + " conversation" +
+                                                   (adopted == 1 ? "" : "s") + " adopted from the last run, " +
+                                                   std::to_string(spill.bytes() >> 20) + " MiB").c_str() : "");
             } else {
                 std::fprintf(stderr, "strata serve: conversation cache: no SSD tier: %s\n", why.c_str());
             }
@@ -10565,6 +10601,11 @@ int main(int argc, char **argv) try {
             const int64_t n = (int64_t) ids.size();
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+            if (o.max_context < 8 || n < 0 || max_new < 0 || n > o.max_context - 8 || max_new > o.max_context - 8 - n) {
+                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
+                            (long long) max_new, (long long) o.max_context);
+                continue;
+            }
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
@@ -10674,11 +10715,6 @@ int main(int argc, char **argv) try {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
-                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
-                            (long long) max_new, (long long) o.max_context);
-                continue;
-            }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
@@ -11597,18 +11633,10 @@ int main(int argc, char **argv) try {
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
-                        // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
-                        // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
-                        /*
-                        DPCT1010: SYCL uses exceptions to report errors and
-                        does not use the error codes. The cudaPeekAtLastError
-                        function call was replaced with 0. You need to rewrite
-                        this code.
-                        */
-                        if (0 != 0) {
-                            std::fflush(stdout);
-                            std::fflush(stderr);
-                            std::_Exit(1);
+                        // #224 / #6445: a poisoned GPU context (e.g. Level Zero UR_RESULT_ERROR_DEVICE_LOST)
+                        // cannot safely unwind GPU destructors (which throw into std::terminate or hang): leave at once.
+                        if (strata::device_is_lost() || strata::is_device_lost(err)) {
+                            device_lost_exit(1);
                         }
                         return 1;
                     }
@@ -12716,7 +12744,9 @@ int main(int argc, char **argv) try {
                 strata::workload_trace::Scope verify_trace("decode.verify", nullptr, T);
                 const Clock::time_point tw0 = Clock::now();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
-                    std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                    const char* msg = drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str();
+                    std::printf("ERR %s\n", msg);
+                    if (strata::device_is_lost() || strata::is_device_lost(err)) device_lost_exit(1);
                     return 1;
                 }
                 int32_t fol_tgt[16];
@@ -12752,6 +12782,7 @@ int main(int argc, char **argv) try {
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
+                    if (strata::device_is_lost() || strata::is_device_lost(err)) device_lost_exit(1);
                     return 1;
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
@@ -14054,6 +14085,7 @@ int main(int argc, char **argv) try {
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                if (strata::device_is_lost() || strata::is_device_lost(err)) device_lost_exit(1);
                 return 1;
             }
             if (drive.d.failed) {
@@ -14490,6 +14522,11 @@ catch (sycl::exception const &exc) {
     std::cerr << "strata: this card does not have the memory for this start: the GPU ran out of memory while the engine was loading (" << what << "). Lower the number of "
                  "requests at once (--batch / parallel), use --kv q4_0 (a smaller K/V), turn off the draft layer, or close other programs that use the GPU" << std::endl;
     std::exit(1);
+  }
+  if (strata::is_device_lost(what)) {
+    strata::mark_device_lost();
+    std::cerr << "strata: GPU device lost (" << what << "). " << strata::device_lost_hint() << std::endl;
+    device_lost_exit(1);
   }
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;

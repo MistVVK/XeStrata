@@ -7,6 +7,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include <cstdlib>
+#include "strata/core/device_lost.hpp"
 
 namespace strata {
 inline sycl::queue* q_of(const void* stream) {

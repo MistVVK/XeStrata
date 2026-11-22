@@ -623,6 +623,9 @@ if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU
   add_executable(uma_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/uma_test.cpp)   # #6448: an integrated GPU's room from /proc/meminfo (CPU, no device)
   target_include_directories(uma_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME uma_test COMMAND uma_test)
+  add_executable(device_lost_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/device_lost_test.cpp)   # #6445: DEVICE_LOST detection & diagnostics (CPU, no device)
+  target_include_directories(device_lost_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME device_lost_test COMMAND device_lost_test)
   add_executable(verify_refusal_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/verify_refusal_test.cpp)   # a refused start (no VRAM expert tier) ends cleanly: the verifiers leave the default queue alone
   target_link_libraries(verify_refusal_test PRIVATE strata_engine strata_prefill strata_spec)
   add_test(NAME verify_refusal_test COMMAND verify_refusal_test)   # needs one SYCL GPU

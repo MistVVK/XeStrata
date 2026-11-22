@@ -149,6 +149,13 @@ with Coder IQ1_M 1,024 MiB fits all 12,288 experts with 2 GB of VRAM free.
 - **Bounded spins.** A device spin that never sees its flag makes the `xe` driver time out the queue and reset the GT, and the
   card can stay wedged until a reboot. Every spin is capped. The cap is the build option `STRATA_SYCL_SPIN_MAX` (2,000,000
   reads, a few seconds, unless the build is an AOT build for a `bmg` card, which keeps 20,000).
+- **Root GPU monitoring and `preempt_timeout_us` (`xe`, #6445).** On Linux with the `xe` driver, querying the card as root
+  (for example `sudo xpu-smi` from a fan/temperature logger or dashboard) submits a render job that forces running compute
+  kernels to yield within `preempt_timeout_us` (default `640000`, 640 ms). If a long prefill or verify kernel cannot yield
+  in time, GuC resets the compute engine (`Engine reset: engine_class=ccs`) and Level Zero returns
+  `UR_RESULT_ERROR_DEVICE_LOST`. Run `xpu-smi` unprivileged (or stop root GPU polling while Strata is running), and
+  optionally raise the compute preemption timeout before starting the engine:
+  `echo 10000000 > /sys/class/drm/cardN/device/tile0/gt0/engines/ccs/preempt_timeout_us`.
 - **JIT builds** add `-ze-opt-greater-than-4GB-buffer-required` so kernels keep 64-bit addresses past 4 GiB into an allocation.
   oneMKL's own precompiled kernels do not get it; the GEMM stages an operand past 4 GiB (`STRATA_SYCL_GEMM_STAGE=1` forces
   that on Battlemage).
