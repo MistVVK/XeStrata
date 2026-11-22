@@ -828,13 +828,13 @@ INKLING_FAMILIES = {
         "title": inkling_family.TITLE, "by": inkling_family.BY, "tag": inkling_family.TAG, "name": inkling_family.FAMILY, "arch": inkling_family.ARCH, "inkling": True, "vision": inkling_family.DEFAULT_VISION,
         "about": "a fast 26.4B-A3.4B (5.4B looped-active) multimodal reasoning & agentic MoE with embedded DSpark drafter and 1..64 concurrent slots",
         "license": "Thinking Machines Inkling-2-Mini: https://huggingface.co/thinkingmachines/Inkling-2-Mini",
-        "models": {b: {"about": inkling_family.BUILD_ABOUT[b], "ram_gb": int(-(-inkling_fit.BUILDS[b]["footprint_gb"] // 1))} for b in inkling_fit.ORDER[::-1]},
+        "models": {b: {"about": inkling_family.BUILD_ABOUT[b], "ram_gb": int(-(-inkling_fit.BUILDS[b]["footprint_gb"] // 1)), "format": inkling_fit.BUILDS[b].get("format", "strata")} for b in inkling_fit.ORDER},
     }
 }
 
 # Inkling-2-Mini custom/community local-file & Hugging Face import sources (official HF safetensors + Unsloth GGUFs).
 # Native `.strata` v1.1 (SQ-20, SQ-15, SQ-10 + Vision) remains the flagship recommended default; `strata-inkling` also
-# loads official `thinkingmachines/Inkling-2-Mini` safetensors (zero requantization) and community `.gguf` files directly.
+# downloads and loads Unsloth GGUFs (`unsloth/Inkling-2-Mini-GGUF`) and official safetensors directly.
 INKLING_COMMUNITY_SOURCES = {
     "safetensors": {
         "title": "Inkling-2-Mini (Official HF safetensors)",
@@ -855,22 +855,16 @@ INKLING_COMMUNITY_SOURCES = {
         "exe": "component:strata-inkling",
         "recommended_default": False,
         "models": {
-            "UD-Q4_K_XL": {"file": "Inkling-2-Mini-UD-Q4_K_XL.gguf", "ram_gb": 24,
-                           "about": "NVFP4 (L0..19) + Q8_0 (L20..23) Unsloth Dynamic GGUF"},
-            "UD-IQ4_XS": {"file": "Inkling-2-Mini-UD-IQ4_XS.gguf", "ram_gb": 20,
-                          "about": "IQ4_XS Unsloth Dynamic GGUF"},
-            "UD-IQ3_XXS": {"file": "Inkling-2-Mini-UD-IQ3_XXS.gguf", "ram_gb": 16,
-                           "about": "Compact IQ3_XXS Unsloth Dynamic GGUF"},
-            "UD-Q8_K_XL": {"file": "Inkling-2-Mini-UD-Q8_K_XL.gguf", "ram_gb": 32,
-                           "about": "High-precision Q8_K_XL Unsloth Dynamic GGUF"},
+            b: {
+                "file": inkling_fit.BUILDS[b]["file"],
+                "ram_gb": int(-(-inkling_fit.BUILDS[b]["footprint_gb"] // 1)),
+                "about": inkling_family.BUILD_ABOUT[b],
+            }
+            for b in inkling_fit.GGUF_ORDER
         },
-        "sha256": {
-            "Inkling-2-Mini-UD-Q4_K_XL.gguf": (
-                17629759456, "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15"
-            ),
-        },
-        "dspark": "dspark-Inkling-2-Mini-Q8_0.gguf",
-        "mmproj": "mmproj-BF16.gguf",
+        "sha256": dict(inkling_family.UNSLOTH_GGUF_FILES),
+        "dspark": inkling_family.DSPARK_GGUF_FILE,
+        "mmproj": inkling_family.MMPROJ_BF16_FILE,
     },
 }
 
@@ -10286,7 +10280,7 @@ def inkling_fetch(a, name: str, folder: Path, own: bool) -> Path:
         return dst
     if own:
         fail(f"{dst} is missing", f"put {name} in {folder}, or drop --gguf-dir to download it")
-    srcs = inkling_family.sources()
+    srcs = inkling_family.sources_for(name)
     if not srcs:
         fail(f"no download source for {name} is configured", f"put the file in {folder} (or set STRATA_INKLING_SOURCE) and run this again")
     last = None
@@ -10344,7 +10338,7 @@ def inkling_tokenizer_dir(a, model: Path, folder: Path, out: Path, engine: Path 
         env[var] = os.pathsep.join([eng_dir, env[var]]) if env.get(var) else eng_dir
         try:
             run([str(engine), "--export-tokenizer", str(model), str(raw)], env=env)
-        except SystemExit:
+        except (SystemExit, OSError):
             pass
         src_tok = (raw / "tokenizer.hf.json") if (raw / "tokenizer.hf.json").is_file() else tok_json
         src_tpl = (raw / "chat_template.jinja") if (raw / "chat_template.jinja").is_file() else tmpl_file
@@ -10359,12 +10353,12 @@ def inkling_tokenizer_dir(a, model: Path, folder: Path, out: Path, engine: Path 
         if not tok_json.is_file():
             try:
                 tok_json = inkling_fetch(a, inkling_family.TOKENIZER_FILE, fetch_dir, own=False)
-            except SystemExit:
+            except (SystemExit, OSError):
                 pass
         if not tmpl_file.is_file():
             try:
                 tmpl_file = inkling_fetch(a, inkling_family.CHAT_TEMPLATE_FILE, fetch_dir, own=False)
-            except SystemExit:
+            except (SystemExit, OSError):
                 pass
         if tok_json.is_file() and tmpl_file.is_file():
             inkling_tokenizer.convert_files(tok_json, tmpl_file, out)
@@ -10415,7 +10409,7 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     folder = inkling_folder(a)
     own = bool(getattr(a, "gguf_dir", None))
     local_src = inkling_local_source(a, model) if own else None
-    is_gguf = bool(local_src and local_src[2])
+    is_gguf = bool(local_src and local_src[2]) or (not local_src and inkling_family.is_gguf_build(model))
     if local_src:
         folder = local_src[1]
     data, _ = data_folder_for(a)
@@ -10437,7 +10431,7 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
                 ok(f"drafter: DSpark ({dspark_path.name})")
     else:
         ok("images: " + ("on (Inkling-2-Mini-Vision.strata, 0.64 GB lossless BF16)" if vision else "off"))
-        files = inkling_family.files_of(model, vision)
+        files = inkling_family.files_of(model, vision, dspark=True)
         left = 0.0
         for n in files:
             p = folder / n
@@ -10466,10 +10460,13 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         ok(f"model file: {model_file}")
     else:
         step(5, f"downloading {fam['title']} {model}")
-        files = inkling_family.files_of(model, vision)
+        files = inkling_family.files_of(model, vision, dspark=True)
         paths = {n: inkling_fetch(a, n, folder, own) for n in files}
         model_file = paths[files[0]]
         vision_path = paths.get(inkling_family.VISION_FILE) if vision else None
+        dspark_path = paths.get(inkling_family.DSPARK_GGUF_FILE) if is_gguf else None
+        if dspark_path is not None:
+            ok(f"drafter: DSpark ({dspark_path.name})")
         ok(f"model file: {model_file}")
 
     step(6, "preparing the model for Strata")
@@ -10481,6 +10478,8 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         ok(f"tokenizer: {tokdir}")
 
     step(7, "writing the start script")
+    drafting_mode = "off" if (is_gguf and dspark_path is None) else inkling_family.DEFAULT_DRAFTER
+    placed = inkling_fit.place(model, vram_gib, ram_gib, unified, ctx, bool(vision and vision_path is not None), dspark=(drafting_mode != "off"))
     args = ["--native", str(model_file), "--max-context", str(ctx)]
     if vision and vision_path is not None:
         args += ["--vision", str(vision_path)]
@@ -10490,7 +10489,6 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         args += ["--gpus", "2"]
     if not unified and len(dual_gpus) < 2:
         args += ["--vram-experts-gb", f"{placed['vram_gb']:.2f}", "--ram-experts-gb", f"{placed['ram_gb']:.2f}"]
-    drafting_mode = "off" if (is_gguf and dspark_path is None) else inkling_family.DEFAULT_DRAFTER
     cfg = {
         "exe": engine_exe(eng),
         "args": args,

@@ -335,7 +335,7 @@ def _qwen36_candidate(shards: list[Path], issues: list[str], notes: list[str]) -
 
 
 def _inkling_build_for_bytes(total_bytes: int, name: str = "") -> str:
-    """Map a local Inkling-2-Mini .strata or .gguf file size/name to the closest catalog build (SQ-20 / SQ-15 / SQ-10)."""
+    """Map a local Inkling-2-Mini .strata or .gguf file size/name to the closest catalog build."""
     low = str(name or "").lower()
     if "sq-20" in low or "sq_20" in low:
         return "SQ-20"
@@ -343,6 +343,10 @@ def _inkling_build_for_bytes(total_bytes: int, name: str = "") -> str:
         return "SQ-15"
     if "sq-10" in low or "sq_10" in low:
         return "SQ-10"
+    from strata_control import inkling_fit
+    for b in inkling_fit.GGUF_ORDER:
+        if b.lower() in low:
+            return b
     if total_bytes >= 17_000_000_000:
         return "SQ-20"
     if total_bytes >= 12_000_000_000:

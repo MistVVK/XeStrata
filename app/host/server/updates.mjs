@@ -83,11 +83,13 @@ export async function checkComponentUpdates({ control, appUpdater = null, appVer
   let appNotes = app.notes ?? '';
   let appCheckFailed = null;   // the shell's own (Tauri) check threw: before this, the Settings check hid it and showed only Control's text
   let appCannot = null;   // browser mode: the app window's updater is not running, so the app itself cannot be updated from here
+  let installPathWarning = null;
   if (appUpdater) {
     try {
       const verdict = await appUpdater.check();
       appNew = verdict.available ? verdict.version : null;
       appNotes = verdict.notes ?? appNotes;
+      installPathWarning = formatInstallPathWarning(verdict);
     } catch (error) {
       if (error?.code === 'app-update-unavailable' && appUpdater.unavailable) appCannot = appUpdater.unavailable;
       else appCheckFailed = String(error?.message ?? error ?? 'The app update check failed.');   // the app's own check did not work: say so, raw text behind Details
@@ -100,7 +102,25 @@ export async function checkComponentUpdates({ control, appUpdater = null, appVer
   else if (appCheckFailed) Object.assign(strata, { status: 'error', message: appCheckLine });
   else Object.assign(strata, { status: 'current', message: 'Strata is up to date.' });
   if (appCheckFailed) strata.details = appCheckFailed;
+  if (installPathWarning) strata.installPathWarning = installPathWarning;
   return { checkedAt, feed: report.feed, strata, engine: engineView, serving: report.serving ?? [] };
+}
+
+/**
+ * Plain-English warning for #6573 when the running Windows executable lives in a different folder than the Windows
+ * installer registry entry (manual relocation) and/or when custom launcher profile env vars are active.
+ */
+export function formatInstallPathWarning(verdict) {
+  if (!verdict || typeof verdict !== 'object') return null;
+  const parts = [];
+  if (verdict.installPathMismatch && verdict.installDir && verdict.registeredInstallDir) {
+    parts.push(`Strata is running from ${verdict.installDir}, while Windows has ${verdict.registeredInstallDir} registered. Updating will install into ${verdict.installDir} and update the Windows registration.`);
+  }
+  const customEnv = Array.isArray(verdict.customProfileEnv) ? verdict.customProfileEnv.filter(Boolean) : [];
+  if (customEnv.length) {
+    parts.push(`This session uses custom profile paths (${customEnv.join(', ')}). Reopen Strata through that launcher after updating to keep the same profile.`);
+  }
+  return parts.length ? parts.join(' ') : null;
 }
 
 /**

@@ -14,12 +14,14 @@ export function versionName(v: CatalogVersion): string {
     case 'unsloth': return `Unsloth ${v.model}`;
     case 'nvfp4': return tr(nvfp4Version(v.model)?.name ?? v.model);
     case 'coder': return `Coder ${v.model}`;
+    case 'inkling-2-mini': return /^UD-/i.test(v.model) ? `Unsloth ${v.model}` : v.model;
     default: return v.model;
   }
 }
 
 /** Who made a version (Details only): the family name of the quantization, a proper name in every language. */
 const MAKERS: Record<string, string> = { qwen: 'GSQ-RCO', coder: 'GSQ-RCO', swift: 'Swift', unsloth: 'Unsloth', gyro: 'Gyro', nvfp4: 'NVFP4' };
+const makerOf = (v: CatalogVersion): string | undefined => (v.sourceFamily === 'inkling-2-mini' ? (/^UD-/i.test(v.model) ? 'Unsloth GGUF' : 'Strata') : MAKERS[v.sourceFamily]);
 
 const gb = (n: number) => `${Number.isInteger(n) ? n : n.toFixed(1)} GB`;
 const whole = (n: number) => `${Math.round(n)} GB`;
@@ -57,9 +59,16 @@ export function VersionPicker({ versions, selectedId, hardware, onSelect, onOwnG
   useEffect(() => setDetails(detailsOpen), [detailsOpen]);
   const selected = versions.find(v => v.id === selectedId);
   // Where the recommended ones are shown outside the menu, the menu holds only the others.
+  // For Inkling-2-Mini, keep the primary native .strata builds (SQ-20/SQ-15/SQ-10, hardware-recommended first) at the top,
+  // with the direct-download Unsloth GGUF quants cleanly selectable under More versions.
   const rows = recommendedVersions(versions, pick);
+  const inklingNative = versions.some(v => v.sourceFamily === 'inkling-2-mini' && !/^UD-/i.test(v.model))
+    ? versions
+        .filter(v => v.sourceFamily === 'inkling-2-mini' && !/^UD-/i.test(v.model))
+        .sort((a, b) => Number(!!b.inkling?.recommended) - Number(!!a.inkling?.recommended))
+    : [];
   const apart = new Set(showRecommended ? [] : rows.map(x => x.v.id));
-  const recommendedIds = rows.map(x => x.v.id);
+  const recommendedIds = rows.length ? rows.map(x => x.v.id) : inklingNative.map(v => v.id);
   const { top, more } = versionGroups(versions, apart, downloaded, recommendedIds);
   const shown = selected && !apart.has(selected.id) ? selected : undefined;
   // The folded part opens by itself when it holds the chosen version or when there is nothing above it.
@@ -74,7 +83,7 @@ export function VersionPicker({ versions, selectedId, hardware, onSelect, onOwnG
   const row = (v: CatalogVersion) => {
     const on = v.id === selectedId, have = !!downloaded?.has(v.id);
     const state = versionFit(v, hardware, cache);
-    const technical = [MAKERS[v.sourceFamily], need(v, true)].filter(Boolean).join(' · ');
+    const technical = [makerOf(v), need(v, true)].filter(Boolean).join(' · ');
     const note = versionNote(v.model);
     return <button key={v.id} role="menuitemradio" aria-checked={on} className={cx('version-row', on && 'is-on')} onClick={() => { onSelect(v.id); setOpen(false); }}>
       <span className="version-row__check">{tr(on ? <Icon name="check" size={14}/> : null)}</span>

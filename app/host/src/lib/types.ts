@@ -10,6 +10,8 @@ export interface SoftwareUpdate {
   message: string;
   /** The technical reason behind `message`, shown only behind the Details disclosure. */
   details?: string;
+  /** Windows desktop update path / custom-launcher profile warning surfaced before updating (#6573). */
+  installPathWarning?: string;
 }
 export interface UpdateCheckResult { checkedAt: string; strata: SoftwareUpdate; engine: SoftwareUpdate }
 

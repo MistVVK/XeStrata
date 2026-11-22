@@ -15,6 +15,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -23,6 +24,178 @@ use tauri_plugin_updater::UpdaterExt;
 
 /// Where an endpoint other than the one in `tauri.conf.json` may come from: a local test feed. Only loopback or https.
 const ENDPOINT_ENV: &str = "STRATA_UPDATE_APP_ENDPOINT";
+
+/// Environment variables that point Strata Desktop at a custom profile/storage layout (e.g. a user launcher script).
+const CUSTOM_PROFILE_ENVS: [&str; 6] = [
+    "STRATA_DESKTOP_DATA_DIR",
+    "STRATA_HOME",
+    "STRATA_MODELS_DIR",
+    "STRATA_WORKSPACE",
+    "STRATA_INSTALL_DIR",
+    "STRATA_DATA_DIR",
+];
+
+/// Strip Windows verbatim prefix (`\\?\`) and surrounding quotes from a path string.
+fn strip_win_prefix(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('"');
+    if let Some(rest) = trimmed.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Normalize a Windows directory path for case-insensitive equality comparison (Issue #6573).
+pub(crate) fn normalize_install_dir(raw: &str) -> String {
+    let clean = strip_win_prefix(raw).replace('/', "\\");
+    let trimmed = clean.trim_end_matches('\\');
+    if trimmed.len() == 2 && trimmed.ends_with(':') {
+        format!("{}\\", trimmed.to_ascii_lowercase())
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+/// True when `running` and `registered` are both known and point to different folders.
+pub(crate) fn install_path_mismatch(running: Option<&Path>, registered: Option<&Path>) -> bool {
+    match (running, registered) {
+        (Some(a), Some(b)) => {
+            let na = normalize_install_dir(&a.to_string_lossy());
+            let nb = normalize_install_dir(&b.to_string_lossy());
+            !na.is_empty() && !nb.is_empty() && na != nb
+        }
+        _ => false,
+    }
+}
+
+/// Return active custom profile override environment variable names (non-empty) on this process.
+pub(crate) fn custom_profile_env_vars() -> Vec<String> {
+    CUSTOM_PROFILE_ENVS
+        .iter()
+        .filter(|k| std::env::var_os(k).map(|v| !v.is_empty()).unwrap_or(false))
+        .map(|k| (*k).to_string())
+        .collect()
+}
+
+/// Validate that a directory is a safe, real target for NSIS `/D=<dir>` (absolute, no quotes/newlines, not inside temp or `%LOCALAPPDATA%\Strata`).
+pub(crate) fn safe_installer_target_dir(dir: &Path, temp_dir: Option<&Path>, local_app_data: Option<&Path>) -> Option<String> {
+    let clean = strip_win_prefix(&dir.to_string_lossy());
+    let clean = clean.trim_end_matches(['\\', '/']).to_string();
+    if clean.is_empty() || clean.contains('"') || clean.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let looks_abs = clean.starts_with(r"\\")
+        || (clean.len() >= 3 && clean.as_bytes()[0].is_ascii_alphabetic() && clean.as_bytes()[1] == b':' && (clean.as_bytes()[2] == b'\\' || clean.as_bytes()[2] == b'/'))
+        || dir.is_absolute();
+    if !looks_abs {
+        return None;
+    }
+    let norm = normalize_install_dir(&clean);
+    if let Some(tmp) = temp_dir {
+        let tn = normalize_install_dir(&tmp.to_string_lossy());
+        if !tn.is_empty() && (norm == tn || norm.starts_with(&format!("{tn}\\"))) {
+            return None;
+        }
+    }
+    if let Some(lad) = local_app_data {
+        let data_dir = normalize_install_dir(&lad.join("Strata").to_string_lossy());
+        if !data_dir.is_empty() && norm == data_dir {
+            return None;
+        }
+    }
+    Some(clean)
+}
+
+/// Build the NSIS updater arguments: `/P /R /UPDATE`, plus an optional unquoted `/D=<dir>` (must be the final NSIS argument).
+pub(crate) fn installer_cli_args(target_dir: Option<&Path>, temp_dir: Option<&Path>, local_app_data: Option<&Path>) -> (Vec<&'static str>, Option<String>) {
+    let base = vec!["/P", "/R", "/UPDATE"];
+    let d_arg = target_dir
+        .and_then(|d| safe_installer_target_dir(d, temp_dir, local_app_data))
+        .map(|clean| format!("/D={clean}"));
+    (base, d_arg)
+}
+
+/// Directory containing the currently running desktop executable.
+fn running_install_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let parent = exe.parent()?;
+    Some(PathBuf::from(strip_win_prefix(&parent.to_string_lossy())))
+}
+
+/// Windows: read the registered install folder from HKCU (`Software\Strata\Strata` or `Uninstall\Strata\InstallLocation`).
+#[cfg(windows)]
+fn registered_install_dir() -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    const HKEY_CURRENT_USER: isize = 0x8000_0001_u32 as isize;
+    const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+    const RRF_RT_REG_EXPAND_SZ: u32 = 0x0000_0004;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            hkey: isize,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            pdw_type: *mut u32,
+            pv_data: *mut u16,
+            pcb_data: *mut u32,
+        ) -> i32;
+    }
+
+    fn read_hkcu_str(subkey: &str, value_name: Option<&str>) -> Option<String> {
+        let wide = |s: &str| std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let sk = wide(subkey);
+        let vn = value_name.map(wide);
+        let vn_ptr = vn.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+        let mut bytes: u32 = 0;
+        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+        let rc = unsafe { RegGetValueW(HKEY_CURRENT_USER, sk.as_ptr(), vn_ptr, flags, std::ptr::null_mut(), std::ptr::null_mut(), &mut bytes) };
+        if rc != 0 || bytes < 2 {
+            return None;
+        }
+        let mut buf = vec![0u16; (bytes as usize + 1) / 2];
+        let rc2 = unsafe { RegGetValueW(HKEY_CURRENT_USER, sk.as_ptr(), vn_ptr, flags, std::ptr::null_mut(), buf.as_mut_ptr(), &mut bytes) };
+        if rc2 != 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let s = OsString::from_wide(&buf[..len]).to_string_lossy().trim().trim_matches('"').to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    read_hkcu_str(r"Software\Strata\Strata", None)
+        .or_else(|| read_hkcu_str(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Strata", Some("InstallLocation")))
+        .map(|s| PathBuf::from(strip_win_prefix(&s)))
+}
+
+#[cfg(not(windows))]
+fn registered_install_dir() -> Option<PathBuf> {
+    None
+}
+
+fn install_location_fields() -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    let running = running_install_dir();
+    let registered = registered_install_dir();
+    let mismatch = install_path_mismatch(running.as_deref(), registered.as_deref());
+    if let Some(ref r) = running {
+        map.insert("installDir".into(), serde_json::json!(r.to_string_lossy()));
+    }
+    if let Some(ref reg) = registered {
+        map.insert("registeredInstallDir".into(), serde_json::json!(reg.to_string_lossy()));
+    }
+    map.insert("installPathMismatch".into(), serde_json::json!(mismatch));
+    let custom_env = custom_profile_env_vars();
+    if !custom_env.is_empty() {
+        map.insert("customProfileEnv".into(), serde_json::json!(custom_env));
+    }
+    map
+}
 
 #[derive(Clone, Default)]
 struct Progress {
@@ -69,12 +242,16 @@ fn updater_for(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String>
 
 async fn check(app: &AppHandle) -> Result<serde_json::Value, String> {
     let updater = updater_for(app)?;
-    match updater.check().await.map_err(|e| e.to_string())? {
-        Some(update) => Ok(serde_json::json!({
+    let mut out = match updater.check().await.map_err(|e| e.to_string())? {
+        Some(update) => serde_json::json!({
             "available": true, "version": update.version, "current": update.current_version, "notes": update.body,
-        })),
-        None => Ok(serde_json::json!({ "available": false, "current": app.package_info().version.to_string() })),
+        }),
+        None => serde_json::json!({ "available": false, "current": app.package_info().version.to_string() }),
+    };
+    if let Some(obj) = out.as_object_mut() {
+        obj.extend(install_location_fields());
     }
+    Ok(out)
 }
 
 async fn install(app: AppHandle, progress: Arc<Mutex<Progress>>) {
@@ -133,18 +310,28 @@ async fn install(app: AppHandle, progress: Arc<Mutex<Progress>>) {
 }
 
 /// Windows: write the verified installer to a temp folder and start it detached and outside the app's Job Object.
+/// Passes `/D=<running_install_dir>` as the final unquoted NSIS argument (#6573) so a manually relocated installation
+/// updates in place and refreshes Windows's registered install path instead of updating a stale old folder.
 #[cfg(windows)]
 fn launch_installer(version: &str, bytes: &[u8]) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
-    let dir = std::env::temp_dir().join(format!("strata-app-update-{version}"));
+    let temp = std::env::temp_dir();
+    let dir = temp.join(format!("strata-app-update-{version}"));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let installer = dir.join("installer.exe");
     std::fs::write(&installer, bytes).map_err(|e| e.to_string())?;
-    std::process::Command::new(&installer)
-        .args(["/P", "/R", "/UPDATE"])
-        .creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS)
+    let running = running_install_dir();
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let (base_args, d_arg) = installer_cli_args(running.as_deref(), Some(&temp), local_app_data.as_deref());
+    let mut cmd = std::process::Command::new(&installer);
+    cmd.args(&base_args);
+    if let Some(d) = d_arg {
+        // NSIS requires `/D=...` to be the final unquoted argument even when the path contains spaces.
+        cmd.raw_arg(d);
+    }
+    cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS)
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("could not start the installer outside the app: {e}"))
@@ -311,5 +498,41 @@ mod tests {
         }
         std::env::remove_var(ENDPOINT_ENV);
         assert!(endpoint_override().is_none());
+    }
+
+    #[test]
+    fn install_path_mismatch_normalizes_case_slashes_and_verbatim_prefix() {
+        assert!(!install_path_mismatch(
+            Some(Path::new(r"\\?\C:\Strata\App\")),
+            Some(Path::new(r#""c:/strata/app""#))
+        ));
+        assert!(install_path_mismatch(
+            Some(Path::new(r"C:\Strata\App")),
+            Some(Path::new(r"D:\Strata"))
+        ));
+        assert!(!install_path_mismatch(Some(Path::new(r"C:\Strata\App")), None));
+        assert!(!install_path_mismatch(None, Some(Path::new(r"D:\Strata"))));
+    }
+
+    #[test]
+    fn installer_cli_args_appends_unquoted_d_flag_for_safe_relocated_paths() {
+        let temp = Path::new(r"C:\Users\alice\AppData\Local\Temp");
+        let lad = Path::new(r"C:\Users\alice\AppData\Local");
+        let (base, d_arg) = installer_cli_args(Some(Path::new(r"C:\Strata\My App\")), Some(temp), Some(lad));
+        assert_eq!(base, vec!["/P", "/R", "/UPDATE"]);
+        assert_eq!(d_arg.as_deref(), Some(r"/D=C:\Strata\My App"));
+
+        // Temp folder, %LOCALAPPDATA%\Strata (user data), and paths with quotes are rejected.
+        assert_eq!(installer_cli_args(Some(Path::new(r"C:\Users\alice\AppData\Local\Temp\test")), Some(temp), Some(lad)).1, None);
+        assert_eq!(installer_cli_args(Some(Path::new(r"C:\Users\alice\AppData\Local\Strata")), Some(temp), Some(lad)).1, None);
+        assert_eq!(installer_cli_args(Some(Path::new(r#"C:\Bad"Dir"#)), Some(temp), Some(lad)).1, None);
+    }
+
+    #[test]
+    fn custom_profile_env_vars_detects_active_launcher_overrides() {
+        std::env::set_var("STRATA_DESKTOP_DATA_DIR", r"C:\Strata\Data");
+        let vars = custom_profile_env_vars();
+        assert!(vars.iter().any(|v| v == "STRATA_DESKTOP_DATA_DIR"), "{vars:?}");
+        std::env::remove_var("STRATA_DESKTOP_DATA_DIR");
     }
 }
