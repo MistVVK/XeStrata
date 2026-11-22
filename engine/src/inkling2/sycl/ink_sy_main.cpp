@@ -99,6 +99,7 @@ static bool run_greedy_decode(InkSyRunner& R, const std::vector<int>& prompt, in
 }
 
 int main(int argc, char** argv) {
+    ensure_l0_v1_default();
     std::string model_path, vision_path, image_path, prompt_csv = "1,2,3,4,5,6,7,8";
     int n_gen = 32, max_ctx = 4096, parallel = 1;
     double vram_gb = -1.0;

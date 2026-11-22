@@ -23,6 +23,9 @@
 #include "hy4_json.h"
 #include "mtl_rt.h"
 #include "strata/artifact/strata_reader.hpp"
+#ifdef INK_METAL_WITH_MODEL_FILE
+#include "../ink_gguf_transcode.h"
+#endif
 
 namespace ink_metal {
 
@@ -456,6 +459,182 @@ struct InkMetalModel {
                 max_buf / (1024.0 * 1024.0 * 1024.0));
         return true;
     }
+
+#ifdef INK_METAL_WITH_MODEL_FILE
+    // Unified Apple Silicon Metal loader for Community/Unsloth .gguf and Official HF .safetensors via InkModelFile.
+    // Streams & transcodes GGUF_RAW experts into anonymous page-aligned Unified Memory (zero temp files on disk!).
+    bool load_from_model_file(mtl::Context& cx, const ink2::InkModelFile& mf, std::string& err) {
+        double t0 = mtl::now_s();
+        path = mf.path;
+        fd = -1;
+        format_minor = 1;
+
+        // 1. Copy InkManifest & config from InkModelFile
+        man = InkManifest{};
+        man.build = mf.m.build;
+        man.chat_template = mf.m.chat_template;
+        man.tokenizer_json = mf.m.tokenizer_json;
+        const auto& sc = mf.m.c;
+        InkCfg& c = man.c;
+        c.n_phys = sc.n_phys;
+        c.n_visits = sc.n_visits;
+        c.hidden = sc.hidden;
+        c.inter = sc.inter;
+        c.vocab_padded = sc.vocab_padded;
+        c.vocab_unpadded = sc.vocab_unpadded;
+        c.n_head = sc.n_head;
+        c.n_kv = sc.n_kv;
+        c.head_dim = sc.head_dim;
+        c.d_rel = sc.d_rel;
+        c.rel_extent = sc.rel_extent;
+        c.swa_win = sc.swa_win;
+        c.block_size = sc.block_size;
+        c.n_experts = sc.n_experts;
+        c.top_k = sc.top_k;
+        c.core_start = sc.core_start;
+        c.core_end = sc.core_end;
+        c.num_passes = sc.num_passes;
+        c.gate_rank = sc.gate_rank;
+        c.sconv_k = sc.sconv_k;
+        c.eos_id = sc.eos_token_id;
+        c.image_pad_id = sc.image_token_id;
+        c.rms_eps = sc.rms_eps;
+        c.qk_l2_clip = sc.qk_l2_clip;
+        c.rel_l2_clip = sc.rel_l2_clip;
+        c.log_scale_alpha = sc.log_scale_alpha;
+        c.log_scale_floor = sc.log_scale_floor;
+        c.logit_softcap = sc.logit_softcap;
+        c.situ_beta = sc.situ_beta;
+        c.situ_lb = sc.situ_lb;
+        c.route_scale = sc.route_scale;
+        c.is_swa.assign(c.n_phys, 0);
+        for (int i = 0; i < c.n_phys && i < (int)sc.is_swa.size(); ++i) c.is_swa[i] = sc.is_swa[i] ? 1 : 0;
+
+        c.has_dspark = mf.m.dspark.present && !mf.m.dspark_tensors.empty();
+        c.dspark_layers = mf.m.dspark.n_layers;
+        c.dspark_inter = mf.m.dspark.inter;
+        c.dspark_block_size = mf.m.dspark.block_size;
+        c.dspark_markov_rank = mf.m.dspark.markov_rank;
+        c.dspark_rope_theta = mf.m.dspark.rope_theta;
+        c.dspark_swa_win = mf.m.dspark.swa_win;
+        for (int i = 0; i < 4 && i < (int)mf.m.dspark.target_visits.size(); ++i) c.dspark_taps[i] = mf.m.dspark.target_visits[i];
+        for (int i = 0; i < 3 && i < (int)mf.m.dspark.is_swa.size(); ++i) c.dspark_is_swa[i] = mf.m.dspark.is_swa[i] ? 1 : 0;
+
+        for (const auto& kv : mf.m.trunk) {
+            InkTensorInfo ti;
+            ti.name = kv.second.name.empty() ? kv.first : kv.second.name;
+            ti.fmt = kv.second.fmt;
+            ti.shape = kv.second.shape;
+            ti.off = kv.second.off;
+            ti.bytes = kv.second.bytes;
+            man.T[kv.first] = std::move(ti);
+        }
+        for (const auto& kv : mf.m.dspark_tensors) {
+            InkTensorInfo ti;
+            ti.name = kv.second.name.empty() ? kv.first : kv.second.name;
+            ti.fmt = kv.second.fmt;
+            ti.shape = kv.second.shape;
+            ti.off = kv.second.off;
+            ti.bytes = kv.second.bytes;
+            man.D[kv.first] = std::move(ti);
+        }
+
+        // 2. Read Section 1 (Trunk + DSpark) and plan transcoded expert layout
+        std::vector<uint8_t> sec1;
+        if (!mf.read_section1(sec1, err)) return false;
+
+        const size_t n_total = (size_t)man.c.n_phys * (size_t)man.c.n_experts;
+        std::vector<strata::artifact::StrataExpertEntry> adj_dir;
+        ink2::transcode::plan_transcoded_expert_directory(mf, adj_dir);
+
+        experts.assign(n_total, InkExpertDev{0, 0, 0, 0, 0});
+        std::vector<size_t> dir_idx_by_gid(n_total, (size_t)-1);
+        std::vector<size_t> plan_body_bytes(n_total, 0);
+        uint64_t cur_exp_off = 0;
+        for (size_t i = 0; i < std::min(adj_dir.size(), n_total); ++i) {
+            const size_t layer = i / (size_t)man.c.n_experts;
+            const size_t gid = layer * (size_t)man.c.n_experts + adj_dir[i].expert_id;
+            if (gid >= n_total) continue;
+            dir_idx_by_gid[gid] = i;
+            plan_body_bytes[gid] = adj_dir[i].body_bytes;
+            experts[gid] = InkExpertDev{
+                cur_exp_off,
+                adj_dir[i].dn_offset,
+                adj_dir[i].gu_code_id,
+                adj_dir[i].dn_code_id,
+                0,
+            };
+            cur_exp_off += ((uint64_t)adj_dir[i].body_bytes + 63ull) & ~63ull;
+        }
+        vram_load_order = mf.vram_load_order;
+
+        // 3. Allocate single page-aligned anonymous Unified Memory arena (zero temp files on disk!)
+        const size_t pg = 16384;
+        sec1_off = 0;
+        sec1_bytes = sec1.size();
+        sec4_off = ((sec1_bytes + pg - 1) / pg) * pg;
+        sec4_bytes = cur_exp_off;
+        fsize = sec4_off + sec4_bytes;
+        map_len = ((fsize + pg - 1) / pg) * pg;
+
+        void* m = mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (m == MAP_FAILED) {
+            err = "mmap(MAP_ANON) failed for unified GGUF/safetensors arena (" +
+                  std::to_string(map_len / (1024ull * 1024ull)) + " MiB)";
+            return false;
+        }
+        base = static_cast<uint8_t*>(m);
+        if (!sec1.empty()) {
+            std::memcpy(base + sec1_off, sec1.data(), sec1.size());
+        }
+        sec1.clear();
+        sec1.shrink_to_fit();
+
+        // 4. Stream & transcode all experts in parallel directly into base + sec4_off
+        const int n_threads = ink2::transcode::default_transcode_threads();
+        bool ok = ink2::transcode::parallel_run(n_total, n_threads, [&](size_t gid, std::string& lerr) -> bool {
+            const size_t di = dir_idx_by_gid[gid];
+            if (di == (size_t)-1) return true;
+            std::vector<uint8_t> body;
+            uint32_t dn_off = 0;
+            uint8_t gu_code = 0, dn_code = 0;
+            if (!ink2::transcode::read_or_transcode_expert(mf, di, body, dn_off, gu_code, dn_code, lerr)) {
+                return false;
+            }
+            if (body.size() > plan_body_bytes[gid]) {
+                lerr = "transcoded expert exceeded planned arena slot";
+                return false;
+            }
+            std::memcpy(base + sec4_off + experts[gid].body_off, body.data(), body.size());
+            experts[gid].dn_off = dn_off;
+            experts[gid].gu_code = gu_code;
+            experts[gid].dn_code = dn_code;
+            return true;
+        }, err);
+        if (!ok) return false;
+
+        // 5. Wrap zero-copy in Metal buffer(s) + upload descriptors & pre-oriented tables
+        const size_t max_buf = cx.max_buffer_length();
+        if (map_len <= max_buf) {
+            wbuf = cx.wrap(base, map_len);
+        } else {
+            wbuf = cx.wrap(base, map_len, 1ull << 30);
+        }
+
+        expert_dev_buf = cx.alloc(experts.size() * sizeof(InkExpertDev));
+        std::memcpy(expert_dev_buf.ptr, experts.data(), experts.size() * sizeof(InkExpertDev));
+        prepare_preoriented_tables(cx);
+
+        t_load = mtl::now_s() - t0;
+        fprintf(stderr,
+                "[ink_metal] loaded %s (src=%s, build=%s, %.2f GiB arena, trunk=%zu, dspark=%zu, experts=%zu) in %.2fs (workSet=%.1f GiB, maxBuf=%.1f GiB)\n",
+                path.c_str(), ink2::source_kind_name(mf.kind), man.build.c_str(),
+                map_len / (1024.0 * 1024.0 * 1024.0), man.T.size(), man.D.size(), experts.size(), t_load,
+                cx.recommended_working_set() / (1024.0 * 1024.0 * 1024.0),
+                max_buf / (1024.0 * 1024.0 * 1024.0));
+        return true;
+    }
+#endif
 
     // Pre-stack cross-pass message queries, pre-orient ShortConv static weights [C, 4] lag3..lag0,
     // and zero-pad rel_logits_proj [16, 1024] -> [16, 1025] (col 1024 = 0.0f) once at load time!

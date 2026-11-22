@@ -28,6 +28,9 @@
 
 #include "../ink_json.h"
 #include "strata/artifact/strata_reader.hpp"
+#ifdef INK_SYCL_WITH_MODEL_FILE
+#include "../ink_gguf_transcode.h"
+#endif
 
 #define INK_REQD_SG16 [[sycl::reqd_sub_group_size(16)]]
 
@@ -56,8 +59,17 @@ inline bool seek_abs(FILE* fp, uint64_t off) {
 #endif
 }
 
+// Work around oneAPI 2026.1.1 Level Zero V2 + oneMKL GEMM SIGSEGV (exit 139) on Battlemage (Arc Pro B70 / bmg_g31).
+// Preserves any explicit user override of UR_LOADER_USE_LEVEL_ZERO_V2.
+inline void ensure_l0_v1_default() {
+    if (!std::getenv("UR_LOADER_USE_LEVEL_ZERO_V2")) {
+        sy_setenv("UR_LOADER_USE_LEVEL_ZERO_V2", "0", 0);
+    }
+}
+
 inline sycl::queue& Q() {
     static sycl::queue q = [] {
+        ensure_l0_v1_default();
         if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
             const char* be = std::getenv("INK_SYCL_BACKEND");
             sy_setenv("ONEAPI_DEVICE_SELECTOR", (be && std::string(be) == "opencl") ? "opencl:gpu" : "level_zero:gpu", 1);
@@ -709,6 +721,302 @@ struct InkSyclModel {
                 vram_exp_slabs.size(), n_host_experts);
         return true;
     }
+
+#ifdef INK_SYCL_WITH_MODEL_FILE
+    // Unified loader for Community/Unsloth .gguf and Official HF .safetensors via InkModelFile.
+    // Streams & transcodes GGUF_RAW experts to S4_K/S6_K/S8_K across CPU threads with zero temp files!
+    bool load_from_model_file(const ink2::InkModelFile& mf, double vram_experts_gb_override,
+                              std::string& err, size_t extra_reserve_bytes = 0) {
+        double t0 = now_s();
+        path = mf.path;
+        format_minor = 1;
+
+        // 1. Copy InkManifest & config from InkModelFile
+        man = InkManifest{};
+        man.build = mf.m.build;
+        man.chat_template = mf.m.chat_template;
+        const auto& sc = mf.m.c;
+        InkCfg& c = man.c;
+        c.n_phys = sc.n_phys;
+        c.n_visits = sc.n_visits;
+        c.hidden = sc.hidden;
+        c.inter = sc.inter;
+        c.vocab_padded = sc.vocab_padded;
+        c.vocab_unpadded = sc.vocab_unpadded;
+        c.n_head = sc.n_head;
+        c.n_kv = sc.n_kv;
+        c.head_dim = sc.head_dim;
+        c.d_rel = sc.d_rel;
+        c.rel_extent = sc.rel_extent;
+        c.swa_win = sc.swa_win;
+        c.block_size = sc.block_size;
+        c.n_experts = sc.n_experts;
+        c.top_k = sc.top_k;
+        c.core_start = sc.core_start;
+        c.core_end = sc.core_end;
+        c.num_passes = sc.num_passes;
+        c.gate_rank = sc.gate_rank;
+        c.eos_id = sc.eos_token_id;
+        c.image_pad_id = sc.image_token_id;
+        c.rms_eps = sc.rms_eps;
+        c.qk_l2_clip = sc.qk_l2_clip;
+        c.rel_l2_clip = sc.rel_l2_clip;
+        c.log_scale_alpha = sc.log_scale_alpha;
+        c.log_scale_floor = sc.log_scale_floor;
+        c.logit_softcap = sc.logit_softcap;
+        c.route_scale = sc.route_scale;
+        c.is_swa.assign(c.n_phys, 0);
+        for (int i = 0; i < c.n_phys && i < (int)sc.is_swa.size(); ++i) c.is_swa[i] = sc.is_swa[i] ? 1 : 0;
+
+        c.has_dspark = mf.m.dspark.present && !mf.m.dspark_tensors.empty();
+        c.dspark_layers = mf.m.dspark.n_layers;
+        c.dspark_inter = mf.m.dspark.inter;
+        c.dspark_block_size = mf.m.dspark.block_size;
+        c.dspark_markov_rank = mf.m.dspark.markov_rank;
+        c.dspark_rope_theta = mf.m.dspark.rope_theta;
+        c.dspark_swa_win = mf.m.dspark.swa_win;
+        for (int i = 0; i < 4 && i < (int)mf.m.dspark.target_visits.size(); ++i) c.dspark_taps[i] = mf.m.dspark.target_visits[i];
+        for (int i = 0; i < 3 && i < (int)mf.m.dspark.is_swa.size(); ++i) c.dspark_is_swa[i] = mf.m.dspark.is_swa[i] ? 1 : 0;
+
+        for (const auto& kv : mf.m.trunk) {
+            InkTensorInfo ti;
+            ti.name = kv.second.name.empty() ? kv.first : kv.second.name;
+            ti.fmt = kv.second.fmt;
+            ti.shape = kv.second.shape;
+            ti.off = kv.second.off;
+            ti.bytes = kv.second.bytes;
+            man.T[kv.first] = std::move(ti);
+        }
+        for (const auto& kv : mf.m.dspark_tensors) {
+            InkTensorInfo ti;
+            ti.name = kv.second.name.empty() ? kv.first : kv.second.name;
+            ti.fmt = kv.second.fmt;
+            ti.shape = kv.second.shape;
+            ti.off = kv.second.off;
+            ti.bytes = kv.second.bytes;
+            man.D[kv.first] = std::move(ti);
+        }
+
+        // 2. Upload Section 1 (Trunk + DSpark) into <= 3.2 GiB device slabs
+        std::vector<uint8_t> sec1;
+        if (!mf.read_section1(sec1, err)) return false;
+
+        const size_t kMaxSlab = std::min<size_t>(dev_caps().max_alloc ? (dev_caps().max_alloc * 7 / 8) : (3200ull << 20), 3200ull << 20);
+        auto upload_tensor_map = [&](std::unordered_map<std::string, InkTensorInfo>& mp,
+                                     std::unordered_map<std::string, std::vector<uint8_t>>& host_copies) -> bool {
+            std::vector<InkTensorInfo*> ordered;
+            ordered.reserve(mp.size());
+            for (auto& kv : mp) ordered.push_back(&kv.second);
+            std::sort(ordered.begin(), ordered.end(), [](const InkTensorInfo* a, const InkTensorInfo* b) { return a->off < b->off; });
+
+            size_t idx = 0;
+            while (idx < ordered.size()) {
+                size_t slab_sz = 0, start = idx;
+                while (idx < ordered.size()) {
+                    size_t tb = ((ordered[idx]->bytes + 63) / 64) * 64;
+                    if (slab_sz > 0 && slab_sz + tb > kMaxSlab) break;
+                    slab_sz += tb;
+                    ++idx;
+                }
+                uint8_t* dev_slab = dalloc<uint8_t>(slab_sz);
+                trunk_slabs.push_back(dev_slab);
+                size_t cur_off = 0;
+                for (size_t j = start; j < idx; ++j) {
+                    InkTensorInfo* ti = ordered[j];
+                    if (ti->off + ti->bytes > sec1.size()) {
+                        err = "section1 tensor out of bounds: " + ti->name;
+                        return false;
+                    }
+                    const uint8_t* src = sec1.data() + ti->off;
+                    h2d(dev_slab + cur_off, src, ti->bytes);
+                    ti->dev_ptr = dev_slab + cur_off;
+                    if (ti->name.find("sconv") != std::string::npos ||
+                        ti->name.find("middle_cycle_cross_pass") != std::string::npos ||
+                        ti->name.find("rel_logits_proj") != std::string::npos) {
+                        host_copies[ti->name].assign(src, src + ti->bytes);
+                    }
+                    cur_off += ((ti->bytes + 63) / 64) * 64;
+                }
+                wait();
+            }
+            return true;
+        };
+
+        std::unordered_map<std::string, std::vector<uint8_t>> host_tmp;
+        if (!upload_tensor_map(man.T, host_tmp) || !upload_tensor_map(man.D, host_tmp)) return false;
+        sec1.clear();
+        sec1.shrink_to_fit();
+        prepare_preoriented_tables(host_tmp);
+
+        // 3. Plan transcoded expert directory & 3x loop-weighted VRAM vs Host-USM placement
+        const size_t n_total = (size_t)man.c.n_phys * (size_t)man.c.n_experts;
+        std::vector<strata::artifact::StrataExpertEntry> adj_dir;
+        ink2::transcode::plan_transcoded_expert_directory(mf, adj_dir);
+
+        std::vector<strata::artifact::StrataExpertEntry> ents_by_gid(n_total);
+        std::vector<size_t> dir_idx_by_gid(n_total, (size_t)-1);
+        for (size_t i = 0; i < std::min(adj_dir.size(), n_total); ++i) {
+            const size_t layer = i / (size_t)man.c.n_experts;
+            const size_t gid = layer * (size_t)man.c.n_experts + adj_dir[i].expert_id;
+            if (gid < n_total) {
+                ents_by_gid[gid] = adj_dir[i];
+                dir_idx_by_gid[gid] = i;
+            }
+        }
+
+        std::vector<uint16_t> order;
+        if (mf.vram_load_order.size() == n_total) {
+            order.reserve(n_total);
+            for (uint16_t di : mf.vram_load_order) {
+                if (di < adj_dir.size()) {
+                    const size_t layer = (size_t)di / (size_t)man.c.n_experts;
+                    const size_t gid = layer * (size_t)man.c.n_experts + adj_dir[di].expert_id;
+                    if (gid < n_total) order.push_back((uint16_t)gid);
+                }
+            }
+        }
+        if (order.size() != n_total) {
+            order.clear();
+            for (int l = man.c.core_start; l < man.c.core_end; ++l)
+                for (int e = 0; e < man.c.n_experts; ++e) order.push_back((uint16_t)(l * man.c.n_experts + e));
+            for (int l = 0; l < man.c.core_start; ++l)
+                for (int e = 0; e < man.c.n_experts; ++e) order.push_back((uint16_t)(l * man.c.n_experts + e));
+            for (int l = man.c.core_end; l < man.c.n_phys; ++l)
+                for (int e = 0; e < man.c.n_experts; ++e) order.push_back((uint16_t)(l * man.c.n_experts + e));
+        }
+
+        const size_t gpu_mem = dev_caps().global_mem;
+        const size_t base_reserve = gpu_mem >= (24ull << 30) ? (2560ull << 20)
+                                  : gpu_mem >= (11ull << 30) ? (1536ull << 20)
+                                                             : (1024ull << 20);
+        const size_t reserve = (extra_reserve_bytes > 0) ? (extra_reserve_bytes + (768ull << 20)) : base_reserve;
+        const size_t used = dev_bytes_allocated();
+        size_t vram_budget = (gpu_mem > used + reserve) ? (gpu_mem - used - reserve) : 0;
+        if (vram_experts_gb_override >= 0.0) {
+            vram_budget = (size_t)(vram_experts_gb_override * (1024.0 * 1024.0 * 1024.0));
+        }
+
+        std::vector<size_t> vram_gids, host_gids;
+        size_t vram_acc = 0;
+        for (uint16_t gid : order) {
+            if (gid >= n_total || dir_idx_by_gid[gid] == (size_t)-1) continue;
+            const size_t eb = ents_by_gid[gid].body_bytes;
+            if (vram_acc + eb <= vram_budget) {
+                vram_gids.push_back(gid);
+                vram_acc += eb;
+            } else {
+                host_gids.push_back(gid);
+            }
+        }
+        n_vram_experts = (int)vram_gids.size();
+        n_host_experts = (int)host_gids.size();
+        vram_expert_bytes = vram_acc;
+
+        h_ed.assign(n_total, InkSyExpertDev{});
+        host_body_ptrs.assign(n_total, nullptr);
+        expert_body_bytes.assign(n_total, 0);
+        max_expert_bytes = 0;
+
+        const int n_threads = ink2::transcode::default_transcode_threads();
+        const size_t kBatch = 16;  // <= ~64-128 MiB transient host scratch
+
+        auto populate_experts = [&](const std::vector<size_t>& gids, bool to_device) -> bool {
+            size_t i = 0;
+            while (i < gids.size()) {
+                size_t slab_sz = 0, start = i;
+                while (i < gids.size()) {
+                    size_t eb = ((ents_by_gid[gids[i]].body_bytes + 4095) / 4096) * 4096;
+                    if (slab_sz > 0 && slab_sz + eb > kMaxSlab) break;
+                    slab_sz += eb;
+                    ++i;
+                }
+                uint8_t* slab = to_device ? dalloc<uint8_t>(slab_sz) : halloc<uint8_t>(slab_sz);
+                if (to_device) vram_exp_slabs.push_back(slab); else host_exp_slabs.push_back(slab);
+
+                // Precompute aligned offsets inside slab
+                const size_t n_in_slab = i - start;
+                std::vector<size_t> slab_offs(n_in_slab, 0);
+                size_t cur = 0;
+                for (size_t k = 0; k < n_in_slab; ++k) {
+                    slab_offs[k] = cur;
+                    cur += ((ents_by_gid[gids[start + k]].body_bytes + 4095) / 4096) * 4096;
+                }
+
+                if (!to_device) {
+                    // Transcode straight into host-pinned USM slab in parallel!
+                    std::vector<uint32_t> dn_offs(n_in_slab, 0);
+                    std::vector<uint8_t> gu_codes(n_in_slab, 0), dn_codes(n_in_slab, 0);
+                    std::vector<uint32_t> body_lens(n_in_slab, 0);
+                    bool ok = ink2::transcode::parallel_run(n_in_slab, n_threads, [&](size_t k, std::string& lerr) -> bool {
+                        const size_t gid = gids[start + k];
+                        std::vector<uint8_t> tmp;
+                        if (!ink2::transcode::read_or_transcode_expert(
+                                mf, dir_idx_by_gid[gid], tmp, dn_offs[k], gu_codes[k], dn_codes[k], lerr)) {
+                            return false;
+                        }
+                        if (tmp.size() > ents_by_gid[gid].body_bytes) {
+                            lerr = "transcoded expert exceeded planned slab size";
+                            return false;
+                        }
+                        std::memcpy(slab + slab_offs[k], tmp.data(), tmp.size());
+                        body_lens[k] = (uint32_t)tmp.size();
+                        return true;
+                    }, err);
+                    if (!ok) return false;
+                    for (size_t k = 0; k < n_in_slab; ++k) {
+                        const size_t gid = gids[start + k];
+                        host_body_ptrs[gid] = slab + slab_offs[k];
+                        expert_body_bytes[gid] = body_lens[k];
+                        max_expert_bytes = std::max<size_t>(max_expert_bytes, body_lens[k]);
+                        h_ed[gid] = InkSyExpertDev{slab + slab_offs[k], dn_offs[k], gu_codes[k], dn_codes[k], 0, 0};
+                    }
+                } else {
+                    // Transcode in bounded batches of kBatch experts in parallel, then stream H2D
+                    for (size_t b0 = 0; b0 < n_in_slab; b0 += kBatch) {
+                        const size_t bn = std::min(kBatch, n_in_slab - b0);
+                        std::vector<std::vector<uint8_t>> bufs(bn);
+                        std::vector<uint32_t> dn_offs(bn, 0);
+                        std::vector<uint8_t> gu_codes(bn, 0), dn_codes(bn, 0);
+                        bool ok = ink2::transcode::parallel_run(bn, n_threads, [&](size_t j, std::string& lerr) -> bool {
+                            const size_t gid = gids[start + b0 + j];
+                            return ink2::transcode::read_or_transcode_expert(
+                                mf, dir_idx_by_gid[gid], bufs[j], dn_offs[j], gu_codes[j], dn_codes[j], lerr);
+                        }, err);
+                        if (!ok) return false;
+                        for (size_t j = 0; j < bn; ++j) {
+                            const size_t gid = gids[start + b0 + j];
+                            if (bufs[j].size() > ents_by_gid[gid].body_bytes) {
+                                err = "transcoded expert exceeded planned VRAM slab size";
+                                return false;
+                            }
+                            h2d(slab + slab_offs[b0 + j], bufs[j].data(), bufs[j].size());
+                            expert_body_bytes[gid] = (uint32_t)bufs[j].size();
+                            max_expert_bytes = std::max<size_t>(max_expert_bytes, bufs[j].size());
+                            h_ed[gid] = InkSyExpertDev{slab + slab_offs[b0 + j], dn_offs[j], gu_codes[j], dn_codes[j], 1, 0};
+                        }
+                        wait();
+                    }
+                }
+            }
+            return true;
+        };
+
+        if (!populate_experts(vram_gids, true) || !populate_experts(host_gids, false)) return false;
+
+        expert_dev = dalloc<InkSyExpertDev>(n_total);
+        h2d(expert_dev, h_ed.data(), n_total * sizeof(InkSyExpertDev));
+        wait();
+
+        t_load = now_s() - t0;
+        fprintf(stderr,
+                "[ink_sycl] loaded %s (src=%s, build=%s, dev=%s %.1f GiB) in %.2fs | VRAM experts=%d/%zu (%.2f GiB, %zu slabs), Host-USM=%d\n",
+                path.c_str(), ink2::source_kind_name(mf.kind), man.build.c_str(), dev_caps().name.c_str(),
+                gpu_mem / (1024.0 * 1024.0 * 1024.0), t_load,
+                n_vram_experts, n_total, vram_expert_bytes / (1024.0 * 1024.0 * 1024.0),
+                vram_exp_slabs.size(), n_host_experts);
+        return true;
+    }
+#endif
 
     void prepare_preoriented_tables(const std::unordered_map<std::string, std::vector<uint8_t>>& ht) {
         const int D = man.c.hidden;
