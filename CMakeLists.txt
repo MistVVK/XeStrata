@@ -689,6 +689,12 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(vram_room_test PRIVATE strata_engine)
     add_test(NAME vram_room_test COMMAND vram_room_test)
     set_tests_properties(vram_room_test PROPERTIES TIMEOUT 60)
+    # the VRAM tier's plan every engine shares (expert_tier.hpp): the room, the layers' slots, the slots that fit the
+    # memory read again, against the rule as PlainModel had it written out (CPU only)
+    add_executable(expert_tier_plan_test tests/core/expert_tier_plan_test.cpp)
+    target_link_libraries(expert_tier_plan_test PRIVATE strata_engine)
+    add_test(NAME expert_tier_plan_test COMMAND expert_tier_plan_test)
+    set_tests_properties(expert_tier_plan_test PROPERTIES TIMEOUT 60)
     # the kernel releases whose drm/pagemap the SVM workaround catches: Ubuntu's 7.0.0 ABI 40 and later, nothing
     # else (CPU only)
     add_executable(svm_kernel_test tests/core/svm_kernel_test.cpp)

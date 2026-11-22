@@ -97,11 +97,6 @@ namespace {
 
 namespace k = strata::kernels;
 
-// The plain engine's floor for the room no plan counts (core::vram_room): under STRATA_VRAM_LIMIT_MIB=4096 on
-// the RX 9060 XT the peak stayed below the card with 128 MiB kept free - llm-jp Q4_K_M, Ornith Q4_K_M and
-// GSQ-RCO 3bit, 2026-10-12 - where the 768 MiB of before left 700 MiB of the card unused.
-constexpr uint64_t kTierRoomLeast = 192ull << 20;
-
 constexpr int kQ6K = 14;
 constexpr int kQ80 = 8;
 constexpr int kBF16 = 30;   // a BF16 file's projections: bf16_gemv_fp32_mmvf_multi on the FP32 rows
@@ -2231,18 +2226,14 @@ bool PlainModel::open_experts(std::string& err) {
             prompt_carve(opt_.prompt_chunk, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
         }
     }
-    const uint64_t window_b = (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * (uint64_t) s.n_embd * 4 * 3 +
-                              16 * lay.max_blob + (64ull << 20);
-    // what is allocated after the tier (the products' libraries, the graphs) and the driver's margin: the room of
-    // the device's memory (core::vram_room; its floor kTierRoomLeast above, its 768 MiB ceiling past 24 GiB)
-    const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20
-                                                   : core::vram_room(total_b_, /*parts*/ 1, kTierRoomLeast);
-    const uint64_t room = free_b > window_b + reserve ? free_b - window_b - reserve : 0;
+    const uint64_t window_b = tier_window_bytes(opt_.max_t, s.n_expert_used, s.n_embd, lay.max_blob);
     uint64_t per_layer_b = 0;
     for (int64_t l : moe_local_) per_layer_b += lay.bytes[(size_t) l];
-    int64_t q = per_layer_b > 0 ? (int64_t) (room / per_layer_b) : 0;
-    q = std::min<int64_t>(q, E);
-    if (opt_.expert_slots >= 0) q = std::min<int64_t>(q, opt_.expert_slots / std::max<int64_t>(L, 1));
+    // the room, the reserve and the slots a layer takes by the tiers' one rule (plan_tier_room, expert_tier.hpp)
+    const TierRoom fits = plan_tier_room(free_b, total_b_, window_b, opt_.reserve_mib, opt_.expert_slots, per_layer_b,
+                                         L, E);
+    const uint64_t reserve = fits.reserve, room = fits.room;
+    const int64_t q = fits.q;
     if (q < 1 && LS > 0) {
         err = "plain model: no VRAM is left for the expert tier (" + std::to_string(free_b >> 20) +
               " MiB free); reduce --max-context, --batch or --vram-reserve-mib, or close other GPU programs";
@@ -2256,7 +2247,8 @@ bool PlainModel::open_experts(std::string& err) {
     // profile's pairs in its order over all the layers while the tier's bytes last; without one, the layers alike
     // (a profile of the trunk's layers serves a load with the MTP layer as well, and one with the MTP layer a load
     // without it: its pairs dropped)
-    std::vector<int64_t> quota((size_t) L, 0);
+    std::vector<char> local((size_t) L, 0);
+    for (int64_t l : moe_local_) local[(size_t) l] = 1;
     if (!opt_.profile.empty()) {
         int64_t ranked_slots = 0;
         std::string err2;
@@ -2267,17 +2259,15 @@ bool PlainModel::open_experts(std::string& err) {
                          prior_.end());
             err.clear();
         }
-        std::vector<char> local((size_t) L, 0);
-        for (int64_t l : moe_local_) local[(size_t) l] = 1;
-        // Ornith-1.5 (qwen35moe) the layers alike: the order over all the layers lost hits there (RTX 4070, Q6_K,
-        // 256 tokens: 72.8-73.1% -> 70.8%, 91.1 / 90.8 -> 87.5 / 87.6 tok/s, 2026-10-26)
-        const bool alike = s.arch == ModelArch::Qwen35Moe;
-        quota = plan_profile_fill(prior_, L, E, per_layer_b * (uint64_t) q, [&](int64_t l) { return lay.bytes[(size_t) l]; },
-                                  [&](int64_t l) { return local[(size_t) l] != 0; }, alike)
-                    .quota;
-    } else {
-        for (int64_t l : moe_local_) quota[(size_t) l] = q;
     }
+    // Ornith-1.5 (qwen35moe) the layers alike: the order over all the layers lost hits there (RTX 4070, Q6_K,
+    // 256 tokens: 72.8-73.1% -> 70.8%, 91.1 / 90.8 -> 87.5 / 87.6 tok/s, 2026-10-26)
+    const bool alike = s.arch == ModelArch::Qwen35Moe;
+    const std::vector<int64_t> quota =
+        plan_tier_fill(opt_.profile.empty() ? nullptr : &prior_, L, E, fits,
+                       [&](int64_t l) { return lay.bytes[(size_t) l]; },
+                       [&](int64_t l) { return local[(size_t) l] != 0; }, alike)
+            .quota;
     std::vector<int64_t> slot_bytes;
     free_.assign((size_t) L, {});
     slot_layer_.clear();
@@ -2298,11 +2288,8 @@ bool PlainModel::open_experts(std::string& err) {
         if (strata::gpu::mem_info(&f, &t)) {
             const uint64_t now = counted_free(f, f, opt_.vram_free_mib);
             const uint64_t limit = now > window_b + reserve ? now - window_b - reserve : 0;
-            uint64_t need = 0;
-            for (const int64_t b : slot_bytes) need += ((uint64_t) b + 255) / 256 * 256;
             const size_t before = slot_bytes.size();
-            while (!slot_bytes.empty() && need > limit) {
-                need -= ((uint64_t) slot_bytes.back() + 255) / 256 * 256;
+            for (const size_t keep = tier_slots_within(slot_bytes, limit); slot_bytes.size() > keep;) {
                 free_[(size_t) slot_layer_.back()].pop_back();   // (before the reverse: its last is this slot)
                 slot_layer_.pop_back();
                 slot_bytes.pop_back();

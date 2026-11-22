@@ -9,6 +9,7 @@
 #pragma once
 
 #include "strata/core/auto_pick.hpp"
+#include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
@@ -139,6 +140,41 @@ inline void ram_adapt_round(const float* usage, const int32_t* res, int64_t laye
     }
 }
 
+/// The plain engine's floor for the room no plan counts (core::vram_room): under STRATA_VRAM_LIMIT_MIB=4096 on
+/// the RX 9060 XT the peak stayed below the card with 128 MiB kept free - llm-jp Q4_K_M, Ornith Q4_K_M and
+/// GSQ-RCO 3bit, 2026-10-12 - where the 768 MiB of before left 700 MiB of the card unused.
+inline constexpr uint64_t kTierRoomLeast = 192ull << 20;
+
+/// What a verify window takes beside a VRAM tier, counted apart from it: its rows (`max_t` tokens of `k` routed
+/// experts, three FP32 rows of `n_embd` each), sixteen experts in staging and 64 MiB.
+inline uint64_t tier_window_bytes(int64_t max_t, int64_t k, int64_t n_embd, uint64_t max_blob) {
+    return (uint64_t) max_t * (uint64_t) k * (uint64_t) n_embd * 4 * 3 + 16 * max_blob + (64ull << 20);
+}
+
+/// A VRAM tier's room, for every engine that fills one from the free memory (PlainModel's rule; Inkling-2-Mini's
+/// tier takes it too).  Of `free_b` (counted_free's) on a device of `total_b`: less `window_b` and less the reserve -
+/// what is allocated after the tier (the products' libraries, the graphs) and the driver's margin, --vram-reserve-mib
+/// (`reserve_mib` >= 0) or the room of the device's memory (core::vram_room, its floor kTierRoomLeast, its 768 MiB
+/// ceiling past 24 GiB).  `per_layer_b`: one expert of every layer the tier holds; `max_slots`: --expert-cache N over
+/// the `layers` (< 0: what fits).
+struct TierRoom {
+    uint64_t reserve = 0;   ///< what stays free beside the tier and the window
+    uint64_t room = 0;      ///< the tier's bytes at most
+    int64_t q = 0;          ///< the experts a layer takes when the layers take alike (`n_expert` at most)
+    uint64_t bytes = 0;     ///< per_layer_b * q: the budget plan_profile_fill shares out
+};
+inline TierRoom plan_tier_room(uint64_t free_b, uint64_t total_b, uint64_t window_b, int64_t reserve_mib,
+                               int64_t max_slots, uint64_t per_layer_b, int64_t layers, int64_t n_expert) {
+    TierRoom t;
+    t.reserve = reserve_mib >= 0 ? (uint64_t) reserve_mib << 20 : vram_room(total_b, /*parts*/ 1, kTierRoomLeast);
+    t.room = free_b > window_b + t.reserve ? free_b - window_b - t.reserve : 0;
+    t.q = per_layer_b > 0 ? (int64_t) (t.room / per_layer_b) : 0;
+    t.q = std::min<int64_t>(t.q, n_expert);
+    if (max_slots >= 0) t.q = std::min<int64_t>(t.q, max_slots / std::max<int64_t>(layers, 1));
+    t.bytes = per_layer_b * (uint64_t) t.q;
+    return t;
+}
+
 /// How many slots of a tier of `budget` bytes each layer takes, from its profile (`prior`, (layer, expert) pairs in
 /// rank order): Qwen3.8-Flash-Next's fill (generate.cpp), the pairs in their order over all the layers while the bytes
 /// last (`bytes(l)` a layer's expert, `local(l)` the layers this tier holds), then the rest of the bytes the layers in
@@ -174,6 +210,36 @@ ProfileFill<Pairs> plan_profile_fill(const Pairs& prior, int64_t layers, int64_t
             f.fill.push_back(p);
         }
     return f;
+}
+
+/// The slots each layer of a tier of `room` takes, and the experts that take them at the start.  With a profile
+/// (`prior` not null): plan_profile_fill's, over room.bytes.  Without one: room.q in each layer the tier holds, and
+/// each of those layers' first experts, the layers in turn.
+template <class Pairs, class Bytes, class Local>
+ProfileFill<Pairs> plan_tier_fill(const Pairs* prior, int64_t layers, int64_t n_expert, const TierRoom& room,
+                                  Bytes bytes, Local local, bool alike) {
+    if (prior != nullptr) return plan_profile_fill(*prior, layers, n_expert, room.bytes, bytes, local, alike);
+    ProfileFill<Pairs> f;
+    f.quota.assign((size_t) layers, 0);
+    for (int64_t l = 0; l < layers; ++l)
+        if (local(l)) f.quota[(size_t) l] = room.q;
+    for (int64_t e = 0; e < room.q; ++e)
+        for (int64_t l = 0; l < layers; ++l)
+            if (local(l)) f.fill.emplace_back((int32_t) l, (int32_t) e);
+    return f;
+}
+
+/// How many of a tier's slots, in the order ExpertCache::open_sized lays them (each from a 256-byte boundary), fit
+/// `limit` bytes: the free memory is read again just before the tier is opened, and what was allocated since the plan
+/// comes off the last slots.
+inline size_t tier_slots_within(const std::vector<int64_t>& slot_bytes, uint64_t limit) {
+    uint64_t need = 0;
+    size_t n = 0;
+    for (; n < slot_bytes.size(); ++n) {
+        need += ((uint64_t) slot_bytes[n] + 255) / 256 * 256;
+        if (need > limit) break;
+    }
+    return n;
 }
 
 /// #463 without the stall (upstream d69424c9, #764): a verify window takes the adaptive tier's previous swaps only once
