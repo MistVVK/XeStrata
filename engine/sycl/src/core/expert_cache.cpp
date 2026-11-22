@@ -6,6 +6,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/uma.hpp"
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
@@ -63,11 +64,88 @@ static unsigned long long own_drm_local_bytes() {
 #endif
 }
 
+// #6448: is the current device an integrated GPU (one pool of memory with the system)?  dpct's integrated flag (#3729),
+// per device: a box can mix an integrated GPU with a discrete one, and the answer is the CURRENT device's.  STRATA_UMA=1
+// / =0 overrides it for every device.  Linux only, as the MemAvailable rule (#409) was: /proc/meminfo is what it reads.
+bool device_unified_memory() {
+#if defined(__linux__) && !defined(STRATA_HIP_GFX906)   // (the gfx906 compat layer has no cudaDevAttrIntegrated; that GPU is discrete)
+    static const int forced = uma_override(std::getenv("STRATA_UMA"));   // -1: from the device, 0: a card, 1: integrated
+    if (forced >= 0) return forced == 1;
+    static std::atomic<int> uma_cache[64];   // 0 unknown, 1 integrated (unified memory), 2 discrete
+    int dev = 0, v = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) == 0 && dev >= 0 && dev < 64) {
+        int c = uma_cache[dev].load(std::memory_order_acquire);
+        if (c == 0) {
+            c = DPCT_CHECK_ERROR(v = dpct::get_device(dev).get_integrated()) == 0 && v ? 1 : 2;
+            uma_cache[dev].store(c, std::memory_order_release);
+        }
+        return c == 1;
+    }
+#endif
+    return false;
+}
+
+// STRATA_UMA_HEADROOM_GIB: a whole number of GiB, 0..1024; anything else keeps the default 6 (said once)
+uint64_t uma_headroom_bytes() {
+    static const long gib = [] {
+        const char* h = std::getenv("STRATA_UMA_HEADROOM_GIB");
+        if (h == nullptr) return 6L;
+        char* end = nullptr;
+        const long v = std::strtol(h, &end, 10);
+        if (end != h && *end == '\0' && v >= 0 && v <= 1024) return v;
+        std::fprintf(stderr, "strata: STRATA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6\n", h);
+        return 6L;
+    }();
+    return (uint64_t) gib << 30;
+}
+
+// The RAM an integrated GPU's next allocations can come from.  `available` is MemAvailable; `pooled` is what the GPU
+// driver keeps of the pages an earlier engine freed (GPUReclaim in /proc/meminfo, the TTM page pool of #2412): the
+// driver hands those to the next GPU allocation before it asks the kernel for new ones, and MemAvailable does not count
+// them, so a second start after an unload would otherwise plan with tens of GiB less than the first.  A kernel without
+// the line, or one that reports 0 there (7.0 in #2412), adds nothing.  False when /proc/meminfo cannot be read.
+bool uma_memory(uint64_t& available, uint64_t& pooled) {
+    available = 0;
+    pooled = 0;
+    std::FILE* m = std::fopen("/proc/meminfo", "r");
+    if (m == nullptr) return false;
+    char line[256];
+    bool got = false;
+    while (std::fgets(line, sizeof line, m))
+        if (uma_meminfo_line(line, available, pooled)) got = true;
+    std::fclose(m);
+    return got;
+}
+
+// #6448: what the model may take on an integrated GPU: the RAM the system can give (uma_memory) less the headroom kept
+// for everything else, and never more than the driver lets one context address (`total_b`, 0 = no cap).  The driver's
+// own "free" is not used: on an Arc B390 it follows MemFree, so a warm file cache counts as taken (10.7 to 22.9 GiB at
+// six starts of the same model).
+size_t uma_free_bytes(size_t total_b) {
+    uint64_t avail = 0, pooled = 0;
+    if (!uma_memory(avail, pooled)) return 0;
+    const uint64_t head = uma_headroom_bytes();
+    const uint64_t room = uma_room(avail, pooled, head, total_b);
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true)) {
+        char held[96] = "";
+        if (pooled > 0)
+            std::snprintf(held, sizeof held, " + %.2f GiB the GPU driver holds from an earlier load", (double) pooled / 1073741824.0);
+        std::fprintf(stderr, "strata: integrated GPU, one pool of memory with the system: %.2f GiB of RAM available%s, "
+                             "%.0f GiB kept free for the system (STRATA_UMA_HEADROOM_GIB) -> %.2f GiB for the model\n",
+                     (double) avail / 1073741824.0, held, (double) head / 1073741824.0, (double) room / 1073741824.0);
+    }
+    return (size_t) room;
+}
+
 // See the header.  NVIDIA's DGX Spark Porting Guide (section 5.5, "Memory reporting on UMA systems") recommends the same:
 // not to rely on cudaMemGetInfo alone but to count the memory the OS can reclaim.  Swap is not counted here (unlike
 // NVIDIA's reference snippet): an expert cache that pushes the system into swap would be far slower than a smaller one.
+// On an integrated GPU (#6448) the figure is uma_free_bytes(), capped at the device's global memory.
 size_t device_free_bytes() try {
     size_t free_b = 0, total_b = 0;
+    if (device_unified_memory())
+        return uma_free_bytes((size_t) dpct::get_current_device().get_device_info().get_global_mem_size());
     /*
     DPCT1106: 'cudaMemGetInfo' was migrated with the Intel extensions for
     device information which may not be supported by all compilers or runtimes.
@@ -98,49 +176,6 @@ size_t device_free_bytes() try {
             std::fprintf(stderr, "strata: the driver reports the whole card as free although this process holds %.2f GiB of it (Arc A750/i915 does this); sizing from the DRM fdinfo instead\n", (double) own / 1073741824.0);
         free_b = (size_t) (total_b - own);
     }
-#if defined(__linux__) && !defined(STRATA_HIP_GFX906)   // (the gfx906 compat layer has no cudaDevAttrIntegrated; that GPU is discrete)
-    // per device: a box can mix an integrated GPU (an APU) with a discrete one, and the answer is the CURRENT device's
-    static std::atomic<int> uma_cache[64];   // 0 unknown, 1 integrated (unified memory), 2 discrete
-    bool unified_memory = false;
-    {
-        int dev = 0, v = 0;
-        if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) == 0 &&
-            dev >= 0 && dev < 64) {
-            int c = uma_cache[dev].load(std::memory_order_acquire);
-            if (c == 0) {
-                c = DPCT_CHECK_ERROR(
-                        v = dpct::get_device(dev).get_integrated()) == 0 &&
-                            v
-                        ? 1
-                        : 2;
-                uma_cache[dev].store(c, std::memory_order_release);
-            }
-            unified_memory = c == 1;
-        }
-    }
-    if (unified_memory) {
-        if (FILE* m = std::fopen("/proc/meminfo", "r")) {
-            char line[256];
-            unsigned long long kb = 0;
-            while (std::fgets(line, sizeof line, m))
-                if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
-            std::fclose(m);
-            // STRATA_UMA_HEADROOM_GIB: a whole number of GiB, 0..1024; anything else keeps the default 6 (said once)
-            static const long gib = [] {
-                const char* h = std::getenv("STRATA_UMA_HEADROOM_GIB");
-                if (h == nullptr) return 6L;
-                char* end = nullptr;
-                const long v = std::strtol(h, &end, 10);
-                if (end != h && *end == '\0' && v >= 0 && v <= 1024) return v;
-                std::fprintf(stderr, "strata: STRATA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6\n", h);
-                return 6L;
-            }();
-            const unsigned long long head = (unsigned long long) gib << 30;
-            const unsigned long long avail = kb << 10;
-            if (avail > head && avail - head > free_b) free_b = (size_t) (avail - head);
-        }
-    }
-#endif
     return free_b;
 }
 catch (sycl::exception const &exc) {

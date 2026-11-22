@@ -4,7 +4,8 @@ Before, serve/telemetry.py knew NVML, amdgpu and Metal only; the Intel reader li
 route through sycl/serve/server_intel.py installed it, so the container, the packaged Terminal and the app showed no GPU readings on an
 Arc. The fake trees: an xe Arc Pro B70 beside a UHD iGPU (card0, no hwmon), and an i915 Arc A750 (no tile0, hwmon "i915").
 #5988 (from PR #5994): the engine's load from its DRM clients' fdinfo (xe cycles, i915 nanoseconds) and VRAM / PCIe traffic from Level
-Zero sysman (a fake library object here), without root or the sampler."""
+Zero sysman (a fake library object here), without root or the sampler.
+#6448: an Arc Pro B390 built into the processor (xe, no hwmon) with a fake /proc/meminfo: its memory is the RAM."""
 import json
 import os
 import sys
@@ -22,6 +23,9 @@ class NoZes:
     """sysman with nothing to say (no Level Zero, or the card not found)."""
     def read(self):
         return None, None
+
+    def integrated(self):
+        return None
 
     def pci_stats(self):
         return None
@@ -145,6 +149,9 @@ class FakeZes:
 
     def read(self):
         return 2 * 2**30, 32 * 2**30
+
+    def integrated(self):
+        return False
 
     def pci_stats(self):
         self.t += 1_000_000
@@ -285,6 +292,119 @@ class RootlessLoadAndVram(unittest.TestCase):
         z = telemetry._Zes("0000:03:00.0", lib=mock.Mock(zesInit=mock.Mock(return_value=0x78000001)))
         self.assertEqual(z.read(), (None, None))
         self.assertIsNone(z.pci_stats())
+
+
+def b390_tree(root):
+    """An Arc Pro B390 (Panther Lake), built into the processor: xe (tile0), no hwmon, no PCIe link of its own."""
+    igpu = pci(root, "0000:00:02.0", "0x8086", "0xb086", width=0)
+    (igpu / "tile0").mkdir()
+    link_card(root, 0, igpu)
+
+
+def meminfo(root, total_gib, available_gib, reclaim_gib=None):
+    lines = [f"MemTotal:       {total_gib << 20} kB", f"MemFree:        {1 << 20} kB", f"MemAvailable:   {available_gib << 20} kB",
+             f"Cached:         {12 << 20} kB"]
+    if reclaim_gib is not None:
+        lines.append(f"GPUReclaim:     {reclaim_gib << 20} kB")
+    write(root / "proc" / "meminfo", "\n".join(lines) + "\n")
+
+
+class IgpuZes(FakeZes):
+    """sysman on an integrated GPU: the INTEGRATED flag, and MemAvailable as the size with MemFree as free (19 of 20 GiB "used"),
+    both moving with every program on the computer."""
+    def integrated(self):
+        return True
+
+    def read(self):
+        return 19 * 2**30, 20 * 2**30
+
+
+#: the engine's client on the fake B390 holds 30 GiB in gtt and 2 GiB in system (drm-total-* is not what it holds)
+IGPU_CLIENT = ("drm-driver:\txe\ndrm-pdev:\t0000:00:02.0\ndrm-client-id:\t4\ndrm-cycles-ccs:\t0\ndrm-total-cycles-ccs:\t1000\n"
+               "drm-total-gtt:\t31457280 KiB\ndrm-resident-gtt:\t31457280 KiB\ndrm-resident-system:\t2097152 KiB\n")
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") and hasattr(os, "symlink"), "sysfs trees with symlinks: Linux")
+class IntegratedIntelGpu(unittest.TestCase):
+    """#6448: an Intel GPU built into the processor (Level Zero's INTEGRATED flag) has no memory of its own. Its size is the RAM
+    (MemTotal), its use what the GPU clients hold of the RAM (xe's gtt and system regions), and its free memory what the system
+    can still give it (MemAvailable + GPUReclaim), never sysman's figures. A card, and a GPU sysman cannot answer for, read as before."""
+
+    def reader(self, root, zes):
+        return telemetry._Intel(0, sysfs=str(root), stat=str(root / "none.json"), proc=str(root / "proc"), zes=zes)
+
+    def free(self, reader):
+        with mock.patch.object(telemetry, "gpu_reader", lambda index=0, amd=False: reader):
+            return telemetry.free_vram_mib(0)
+
+    def test_the_size_is_the_ram_and_the_use_the_clients_gtt_and_system_memory(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            b390_tree(root)
+            meminfo(root, 62, 20, reclaim_gib=8)
+            fdinfo(root, 111, 5, IGPU_CLIENT)
+            r = self.reader(root, IgpuZes())
+            self.assertTrue(r.ok(), "xe (tile0) without a hwmon")
+            self.assertTrue(r.integrated)
+            self.assertEqual(r.name(), "Intel Arc Pro B390")
+            out = r.read()
+            self.assertEqual(out["mem_total"], 62 * 2**30, "MemTotal, not sysman's size (MemAvailable)")
+            self.assertEqual(out["mem_used"], 32 * 2**30, "gtt + system of the client, not sysman's size less MemFree")
+            self.assertEqual(self.free(r), 28 << 10, "MemAvailable + GPUReclaim, not the size less the use")
+
+    def test_no_gpureclaim_line_no_client_and_no_meminfo(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            b390_tree(root)
+            meminfo(root, 62, 20)                                     # a kernel that does not report GPUReclaim (#2412)
+            r = self.reader(root, IgpuZes())
+            out = r.read()
+            self.assertEqual((out["mem_used"], out["mem_total"]), (None, 62 * 2**30), "no client: no use, never a 0")
+            self.assertEqual(self.free(r), 20 << 10, "MemAvailable alone")
+            (root / "proc" / "meminfo").unlink()
+            self.assertIsNone(self.free(r), "unknown, so nothing is refused for it")
+
+    def test_a_card_and_a_gpu_sysman_cannot_answer_for_read_as_before(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "card"
+            b70_tree(root)
+            meminfo(root, 62, 20, reclaim_gib=8)
+            fdinfo(root, 111, 5, IGPU_CLIENT.replace("0000:00:02.0", "0000:03:00.0"))
+            card = self.reader(root, FakeZes())
+            self.assertFalse(card.integrated)
+            out = card.read()
+            self.assertEqual((out["mem_used"], out["mem_total"]), (2 * 2**30, 32 * 2**30), "sysman's, as before")
+            self.assertIsNone(card._fd_mem, "a card's gtt and system memory is not its VRAM")
+            self.assertEqual(self.free(card), 30 << 10, "the size less the use, as before")
+            root = Path(d) / "igpu"
+            b390_tree(root)
+            meminfo(root, 62, 20, reclaim_gib=8)
+            fdinfo(root, 111, 5, IGPU_CLIENT)
+            unknown = self.reader(root, NoZes())
+            self.assertFalse(unknown.integrated, "sysman cannot say: read as a card")
+            self.assertIsNone(unknown.read()["mem_total"])
+            self.assertIsNone(self.free(unknown))
+
+    def test_the_servers_free_memory_checks_read_the_same(self):
+        """min_free_vram_mib's load gate and the GPU picture reader's room (Service.free_vram_mib), and the note when the reader found no
+        room (card_free_mib), read free_vram_mib: before, each took the size less the use, 62 - 32 = 30 GiB on this fake B390."""
+        from serve.frontend import ChatTemplate
+        from serve.server import ByteTokenizer, MockEngine, Service, card_free_mib
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate(Path(__file__).resolve().parent / "chat_template.jinja"))
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "igpu"
+            b390_tree(root)
+            meminfo(root, 62, 20, reclaim_gib=8)
+            fdinfo(root, 111, 5, IGPU_CLIENT)
+            igpu = self.reader(root, IgpuZes())
+            with mock.patch.object(telemetry, "gpu_reader", lambda index=0, amd=False: igpu):
+                self.assertEqual((svc.free_vram_mib(), card_free_mib(0)), (28 << 10, 28 << 10), "MemAvailable + GPUReclaim")
+            root = Path(d) / "card"
+            b70_tree(root)
+            card = self.reader(root, FakeZes())
+            with mock.patch.object(telemetry, "gpu_reader", lambda index=0, amd=False: card):
+                self.assertEqual((svc.free_vram_mib(), card_free_mib(0)), (30 << 10, 30 << 10), "a card: the size less the use, as before")
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "the Intel fallback is Linux only")

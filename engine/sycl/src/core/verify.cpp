@@ -1961,20 +1961,46 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
 
 // SYCL port: a failed queue wait reported as what it was.  DPCT_CHECK_ERROR keeps only "error" from the SYCL
 // exception and drops the device, which made a pipelined-window failure on a layer split impossible to place:
-// the same text came from either card and from any of the four verifiers.  These two helpers say which.
-static dpct::err0 queue_wait_diag(sycl::queue *cs, int dev, const char *what) {
+// the same text came from either card and from any of the four verifiers.  These helpers say which, and
+// diagnose Level Zero UR_RESULT_ERROR_DEVICE_LOST (#6445) cleanly instead of unwinding into std::terminate.
+static dpct::err0 queue_wait_diag(sycl::queue *cs, int dev, const char *what, std::string *detail = nullptr) {
     if (cs == nullptr) return dpct::default_error;
     try {
         cs->wait();
         return dpct::success;
     } catch (std::exception const &e) {
+        const std::string msg = e.what();
+        const bool lost = strata::is_device_lost(msg);
+        if (lost) strata::mark_device_lost();
         std::string qdev = "<unknown>";
         try { qdev = cs->get_device().get_info<sycl::info::device::name>(); } catch (...) {}
         std::fprintf(stderr, "strata verify: %s: the queue wait failed on verifier device %d (queue device: %s): %s\n",
-                     what, dev, qdev.c_str(), e.what());
+                     what, dev, qdev.c_str(), msg.c_str());
+        if (lost)
+            std::fprintf(stderr, "strata verify: GPU device lost during %s. %s\n", what, strata::device_lost_hint());
         std::fflush(stderr);
+        if (detail != nullptr) {
+            *detail = std::string(what) + ": " + msg;
+            if (lost) *detail += std::string(" -- ") + strata::device_lost_hint();
+        }
         return dpct::default_error;
     }
+}
+
+static void record_verify_sycl_exception(const char *what, int dev, const sycl::exception &exc,
+                                         std::atomic<bool> &released, std::string &err) {
+    const std::string msg = exc.what();
+    const bool lost = strata::is_device_lost(msg);
+    if (lost) {
+        strata::mark_device_lost();
+        released.store(true);
+    }
+    std::fprintf(stderr, "strata verify: %s failed on verifier device %d: %s\n", what, dev, msg.c_str());
+    if (lost)
+        std::fprintf(stderr, "strata verify: GPU device lost during %s. %s\n", what, strata::device_lost_hint());
+    std::fflush(stderr);
+    err = std::string("verify: ") + what + ": " + msg;
+    if (lost) err += std::string(" -- ") + strata::device_lost_hint();
 }
 
 std::string Verifier::profile_report() {
@@ -2725,7 +2751,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
     // spin kernel outlives the process.  The wait itself stays a blocking sync (a polling wait cost decode upstream).
     trace_ev("SYNC", -1, -1, 0);
-    const dpct::err0 se = queue_wait_diag(cs_, device_, "window sync");
+    std::string wait_err;
+    const dpct::err0 se = queue_wait_diag(cs_, device_, "window sync", &wait_err);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     const Clock::time_point t_done = Clock::now();
     if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {
@@ -2747,7 +2774,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     DPCT1000: Error handling if-stmt was detected but could not be rewritten.
     */
     if (se != 0) {
-        err = std::string("verify: ") + dpct::get_error_string_dummy(se);
+        if (strata::device_is_lost()) released_.store(true);
+        err = std::string("verify: ") + (!wait_err.empty() ? wait_err : std::string(dpct::get_error_string_dummy(se)));
         return false;
     }
     if (wait_failed(pos0, T, G, false, err)) return false;   // #5160: a wait ran out: the window's tokens are not used
@@ -2878,9 +2906,14 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
-        copy_->wait(); // no host function of this window may raise flag B in
-                       // the next one
-        copy_used_ = false;
+        std::string copy_err;
+        const dpct::err0 ce = queue_wait_diag(copy_, device_, "window copy sync", &copy_err);
+        copy_used_ = false; // no host function of this window may raise flag B in the next one
+        if (ce != 0) {
+            if (strata::device_is_lost()) released_.store(true);
+            err = std::string("verify: ") + (!copy_err.empty() ? copy_err : std::string(dpct::get_error_string_dummy(ce)));
+            return false;
+        }
     }
     strata::kprof::window_end("decode");   // STRATA_KPROF=1 (with STRATA_VERIFY_EAGER=1): this window's per-kernel times
     if (prof_on_ && G == 1) {   // the window's GPU stage stamps
@@ -2915,9 +2948,10 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (DPCT_CHECK_ERROR(cs_->wait()) !=
-            0) { // m_out_ is the mapped h_out_: synced, it is readable
-            err = "verify: the head sampling failed";
+        std::string samp_err;
+        if (queue_wait_diag(cs_, device_, "head sampling sync", &samp_err) != 0) { // m_out_ is the mapped h_out_: synced, it is readable
+            if (strata::device_is_lost()) released_.store(true);
+            err = !samp_err.empty() ? ("verify: " + samp_err) : std::string("verify: the head sampling failed");
             return false;
         }
     }
@@ -2964,9 +2998,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     return true;
 }
 catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    record_verify_sycl_exception("window run", device_, exc, released_, err);
+    return false;
 }
 
 void Verifier::set_plan_slot(int grp) {
@@ -3219,40 +3252,21 @@ bool Verifier::commit(int n_keep, std::string &err) try {
     return next_ == nullptr || next_->commit(n_keep, err);
 }
 catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    record_verify_sycl_exception("commit", device_, exc, released_, err);
+    return false;
 }
 
 bool Verifier::wait_commit(std::string &err) try {
     if (commit_pending_) {
         const OnDevice on_device(device_);
         commit_pending_ = false;
-        const dpct::err0 se = DPCT_CHECK_ERROR(commit_done_->wait_and_throw());
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use error
-        codes. Please replace the "get_error_string_dummy(...)" with a real
-        error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (se != 0) {
-          err = std::string("verify: commit: ") +
-                dpct::get_error_string_dummy(se);
-          return false;
-        }
+        commit_done_->wait_and_throw();
     }
     return next_ == nullptr || next_->wait_commit(err);
 }
 catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    record_verify_sycl_exception("wait_commit", device_, exc, released_, err);
+    return false;
 }
 
 // SYCL port: capture every window graph now (one per window size) instead of on first use, so the first request
@@ -3797,9 +3811,8 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
     return true;
 }
 catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    record_verify_sycl_exception("batch window run", device_, exc, released_, err);
+    return false;
 }
 
 bool Verifier::commit_slots(std::string& err) {
@@ -4277,9 +4290,8 @@ bool Verifier::pl_launch(int T, const int32_t *tokens, int64_t pos0,
     return true;
 }
 catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    record_verify_sycl_exception("pipelined launch", device_, exc, released_, err);
+    return false;
 }
 
 int Verifier::service(PoolMultiFn pool, void *user, std::string &err) try {
@@ -4385,9 +4397,8 @@ int Verifier::service(PoolMultiFn pool, void *user, std::string &err) try {
     return 1;
 }
 catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    record_verify_sycl_exception("pipelined service", device_, exc, released_, err);
+    return -1;
 }
 
 bool Verifier::done(std::string &err) try {
@@ -4439,9 +4450,8 @@ bool Verifier::done(std::string &err) try {
     return true;
 }
 catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    record_verify_sycl_exception("pipelined done", device_, exc, released_, err);
+    return false;
 }
 
 bool Verifier::pl_finish(int32_t *out, std::string &err) try {
@@ -4463,8 +4473,10 @@ bool Verifier::pl_finish(int32_t *out, std::string &err) try {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) last_pos0_;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (DPCT_CHECK_ERROR(cs_->wait()) != 0) {
-            err = "verify: the head sampling failed";
+        std::string samp_err;
+        if (queue_wait_diag(cs_, device_, "pipelined head sampling sync", &samp_err) != 0) {
+            if (strata::device_is_lost()) released_.store(true);
+            err = !samp_err.empty() ? ("verify: " + samp_err) : std::string("verify: the head sampling failed");
             return false;
         }
     }
@@ -4474,9 +4486,8 @@ bool Verifier::pl_finish(int32_t *out, std::string &err) try {
     return true;
 }
 catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    record_verify_sycl_exception("pipelined finish", device_, exc, released_, err);
+    return false;
 }
 
 bool Verifier::pl_commit_async(int n_keep, std::string &err) try {
@@ -4570,9 +4581,8 @@ bool Verifier::pl_commit_async(int n_keep, std::string &err) try {
     return true;
 }
 catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    record_verify_sycl_exception("pipelined commit", device_, exc, released_, err);
+    return false;
 }
 
 void Verifier::absorb_stats(Verifier& o) {

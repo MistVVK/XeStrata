@@ -193,6 +193,21 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
     return true;
 }
 
+/// #2518: the checkpoints a slot carries for `live` - every one whose tokens are a strict prefix of it, in the
+/// order given.  The retained checkpoints are a chain (each a prefix of the next), and a request that branches
+/// inside the conversation resumes from the point it shares, which is usually NOT the longest checkpoint: the
+/// deepest one diverges before it.  Keeping only the longest left the slot with nothing such a request could
+/// start from.  An image prompt is not matched again by tokens alone, so it carries none.
+inline std::vector<ConversationCheckpoint> conversation_checkpoints_prefixing(
+        const std::vector<ConversationCheckpoint>& checks, const std::vector<int32_t>& live, bool image) {
+    std::vector<ConversationCheckpoint> out;
+    if (image) return out;
+    for (const ConversationCheckpoint& c : checks)
+        if (c.ids.size() < live.size() && std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+            out.push_back(c);
+    return out;
+}
+
 struct SavedConversation {
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};

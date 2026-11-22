@@ -223,6 +223,10 @@ public:
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    /// SYCL: run eligible neighboring chunks together within this request's checkpoint bounds.
+    bool run_expert_window(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
+                           int64_t next_checkpoint, int64_t checkpoint_interval, int64_t prompt_end,
+                           int64_t short_read, bool save_tail);
 
     const PrefillStats& stats() const { return stats_; }
 

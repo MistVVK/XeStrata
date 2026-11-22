@@ -335,6 +335,43 @@ if(STRATA_SYCL_TLA_ATTN)
 endif()
 
 
+# The expert kernels use the same local sycl-tla tree as prompt attention.
+# Building them does not select the opt-in routed expert path at run time.
+set(STRATA_SYCL_TLA_EXPERT_GU "AUTO" CACHE STRING "Build Battlemage TLA expert kernels (AUTO, ON or OFF)")
+set_property(CACHE STRATA_SYCL_TLA_EXPERT_GU PROPERTY STRINGS AUTO ON OFF)
+set(_expert_tla_mode "${STRATA_SYCL_TLA_EXPERT_GU}")
+if(NOT _expert_tla_mode MATCHES "^(AUTO|ON|OFF)$")
+  message(FATAL_ERROR "STRATA_SYCL_TLA_EXPERT_GU must be AUTO, ON or OFF")
+endif()
+set(_expert_tla_dir "${STRATA_SYCL_TLA_DIR}")
+if(NOT _expert_tla_dir)
+  set(_expert_tla_dir "${STRATA_ROOT}/third_party/sycl-tla")
+endif()
+set(_expert_tla_enabled OFF)
+if(NOT _expert_tla_mode STREQUAL "OFF" AND STRATA_ZE_LOADER AND (NOT STRATA_SYCL_AOT OR STRATA_SYCL_AOT MATCHES "^bmg-g(21|31)(,bmg-g(21|31))*$"))
+  set(_expert_tla_enabled ON)
+  foreach(_header IN ITEMS cute/layout.hpp cute/numeric/numeric_types.hpp cute/util/type_traits.hpp
+                           cute/arch/mma_xe_legacy.hpp cute/arch/copy_xe_legacy_builtin.hpp)
+    if(NOT EXISTS "${_expert_tla_dir}/include/${_header}")
+      set(_expert_tla_enabled OFF)
+      break()
+    endif()
+  endforeach()
+endif()
+if(_expert_tla_mode STREQUAL "ON" AND NOT _expert_tla_enabled)
+  message(FATAL_ERROR "STRATA_SYCL_TLA_EXPERT_GU=ON requires local sycl-tla headers, Level Zero and a portable or Battlemage target")
+endif()
+if(_expert_tla_enabled)
+  set(_expert_gu ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/bmg_gate_up.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/bmg_direct_experts.cpp)
+  target_sources(strata_prefill PRIVATE ${_expert_gu} src/prefill/bmg_expert_window.cpp)
+  set_property(SOURCE ${_expert_gu} APPEND PROPERTY COMPILE_OPTIONS "-isystem" "${_expert_tla_dir}/include")
+  set_property(SOURCE ${_expert_gu} APPEND PROPERTY COMPILE_DEFINITIONS
+    CUTLASS_ENABLE_SYCL SYCL_INTEL_TARGET CUTLASS_ENABLE_HEADERS_ONLY CUTLASS_SYCL_BUILTIN_ENABLE)
+  target_compile_definitions(strata_prefill PRIVATE STRATA_HAS_TLA_EXPERT_GU=1)
+endif()
+message(STATUS "Strata SYCL: Battlemage TLA routed experts: ${_expert_tla_enabled}")
+
 strata_resolve(_main src/program/generate.cpp)
 add_executable(strata ${_main})
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
@@ -342,6 +379,23 @@ target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
 if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU_QUANT: it decides whether ggml is configured)
   enable_testing()
+  add_executable(bmg_expert_window_plan_test src/prefill/bmg_expert_window_plan_test.cpp)
+  add_test(NAME bmg_expert_window_plan_test COMMAND bmg_expert_window_plan_test)
+  add_test(NAME bmg_expert_defaults_test COMMAND ${CMAKE_COMMAND} -E env
+    --unset=STRATA_SYCL_BMG_ROUTED_EXPERTS --unset=STRATA_SYCL_BMG_EXPERT_WINDOW
+    $<TARGET_FILE:bmg_expert_window_plan_test> experts auto)
+  add_test(NAME bmg_expert_window_off_test COMMAND ${CMAKE_COMMAND} -E env
+    --unset=STRATA_SYCL_BMG_ROUTED_EXPERTS STRATA_SYCL_BMG_EXPERT_WINDOW=0
+    $<TARGET_FILE:bmg_expert_window_plan_test> experts off)
+  add_test(NAME bmg_expert_override_test COMMAND ${CMAKE_COMMAND} -E env
+    STRATA_SYCL_BMG_ROUTED_EXPERTS=0 STRATA_SYCL_BMG_EXPERT_WINDOW=1
+    $<TARGET_FILE:bmg_expert_window_plan_test> off on)
+  add_executable(bmg_expert_rows_parity src/prefill/bmg_expert_rows_parity.cpp)
+  target_link_libraries(bmg_expert_rows_parity PRIVATE strata_includes)
+  add_test(NAME bmg_expert_rows_parity COMMAND ${CMAKE_COMMAND} -E env
+    --unset=STRATA_SYCL_BMG_ROUTED_EXPERTS $<TARGET_FILE:bmg_expert_rows_parity>)
+  set_tests_properties(bmg_expert_rows_parity PROPERTIES SKIP_RETURN_CODE 77)
+
   # Host-only proposal contracts of the gated MTP proposal; no SYCL runtime or GPU library needed.
   add_executable(gated_proposal_test ${STRATA_ROOT}/src/core/gated_proposal_test.cpp)
   target_include_directories(gated_proposal_test PRIVATE ${STRATA_ROOT}/include)
@@ -364,6 +418,13 @@ if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU
   add_executable(runtime_files_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/runtime_files_test.cpp)   # #5914: the loaded runtime files (host only)
   target_include_directories(runtime_files_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME runtime_files_test COMMAND runtime_files_test)
+  # Host-only: the conversation cache's SSD tier - its folder per engine process and its budget (conversation_spill.hpp).
+  # No GPU, no model; the same source the CUDA/HIP engine builds under STRATA_BUILD_CONVERSATION_TESTS.
+  add_executable(conversation_spill_test ${STRATA_ROOT}/src/core/conversation_spill_test.cpp ${STRATA_ROOT}/src/core/conversation_file.cpp)
+  target_include_directories(conversation_spill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${STRATA_ROOT}/include)
+  target_compile_features(conversation_spill_test PRIVATE cxx_std_17)
+  target_link_libraries(conversation_spill_test PRIVATE Threads::Threads)
+  add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
   add_executable(spec_admission_test ${STRATA_ROOT}/src/core/spec_admission_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
   target_include_directories(spec_admission_test PRIVATE ${STRATA_ROOT}/include)
   add_test(NAME spec_admission_default COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_SPEC_PROB_GATE $<TARGET_FILE:spec_admission_test>)
@@ -387,9 +448,39 @@ if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU
     add_test(NAME native_arithmetic_parity_nvfp4_ggml COMMAND ${CMAKE_COMMAND} -E env
              STRATA_NO_NVFP4_512=1 STRATA_NO_NVFP4_256=1 $<TARGET_FILE:native_arithmetic_parity>)
   endif()
+  foreach(probe IN ITEMS bmg_gdn_tiles_parity bmg_gdn_residual_parity)
+    add_executable(${probe} src/prefill/${probe}.cpp)
+    target_link_libraries(${probe} PRIVATE strata_prefill)
+    add_test(NAME ${probe} COMMAND ${probe})
+    set_tests_properties(${probe} PROPERTIES SKIP_RETURN_CODE 77)
+  endforeach()
+  add_test(NAME bmg_gdn_auto_dispatch COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_GDN_CONV_SERIAL --unset=STRATA_GDN_CONVL2
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --auto)
+  add_test(NAME bmg_gdn_serial_override COMMAND ${CMAKE_COMMAND} -E env STRATA_GDN_CONV_SERIAL=1 STRATA_GDN_CONVL2=1
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --serial)
+  add_test(NAME bmg_gdn_fused_override COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_GDN_CONV_SERIAL STRATA_GDN_CONVL2=1
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --fused)
+  add_test(NAME bmg_gdn_separate_override COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_GDN_CONV_SERIAL STRATA_GDN_CONVL2=0
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --separate)
+  set_tests_properties(bmg_gdn_auto_dispatch bmg_gdn_serial_override bmg_gdn_fused_override bmg_gdn_separate_override
+    PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(gemm_stride_parity src/prefill/gemm_stride_parity.cpp)
   target_link_libraries(gemm_stride_parity PRIVATE strata_prefill)
   add_test(NAME gemm_stride_parity COMMAND gemm_stride_parity)
+  if(_expert_tla_enabled)
+    add_executable(bmg_expert_window_mkl_parity src/prefill/bmg_expert_window_mkl_parity.cpp)
+    target_link_libraries(bmg_expert_window_mkl_parity PRIVATE strata_prefill)
+    add_test(NAME bmg_expert_window_mkl_parity COMMAND bmg_expert_window_mkl_parity)
+    set_tests_properties(bmg_expert_window_mkl_parity PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(bmg_direct_experts_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/bmg_direct_experts_parity.cpp)
+    target_link_libraries(bmg_direct_experts_parity PRIVATE strata_prefill)
+    add_test(NAME bmg_direct_experts_parity COMMAND bmg_direct_experts_parity)
+    set_tests_properties(bmg_direct_experts_parity PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(bmg_gate_up_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/bmg_gate_up_parity.cpp)
+    target_link_libraries(bmg_gate_up_parity PRIVATE strata_prefill)
+    add_test(NAME bmg_gate_up_parity COMMAND bmg_gate_up_parity)
+    set_tests_properties(bmg_gate_up_parity PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   foreach(p IN ITEMS dequant_s2 s2_gemv shared_expert gr gdn s2_gemv_q8 sampler rope quantize_act router_top10
                      s_gemv elementwise bf16_gemv s_gemv_q8k qsa kv_q8 kv_stream kv_q4 cvec)
     strata_resolve(_src src/kernels/${p}_parity.cpp)
@@ -503,6 +594,13 @@ if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU
   target_link_libraries(kv_hybrid_parity PRIVATE strata_kernels)
   add_executable(dequant_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/dequant_bench.cpp)   # prompt-path expert dequant timing + output hash
   target_link_libraries(dequant_bench PRIVATE strata_kernels)
+  add_executable(iq2xxs_fused_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/iq2xxs_fused_parity.cpp)
+  target_link_libraries(iq2xxs_fused_parity PRIVATE strata_kernels)
+  add_test(NAME iq2xxs_fused_parity COMMAND ${CMAKE_COMMAND} -E env
+    --unset=STRATA_SYCL_BMG_ROUTED_EXPERTS $<TARGET_FILE:iq2xxs_fused_parity>)
+  add_test(NAME bmg_native_dequant_parity COMMAND ${CMAKE_COMMAND} -E env
+    --unset=STRATA_SYCL_BMG_ROUTED_EXPERTS $<TARGET_FILE:iq2xxs_fused_parity> --native)
+  set_tests_properties(bmg_native_dequant_parity PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(mmvq_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_bench.cpp)   # dense mmvq timing
   target_link_libraries(mmvq_bench PRIVATE strata_kernels)
   add_executable(dflash2_ring_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/dflash2_ring_test.cpp)   # DF2-SYCL: the ring log: rebuilt K/V rows are the original ones
@@ -522,6 +620,12 @@ if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU
   add_executable(verify_env_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/verify_env_test.cpp)   # #6250: NO_HOST=1 alone gets the device plan (CPU, no device)
   target_include_directories(verify_env_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME verify_env_test COMMAND verify_env_test)
+  add_executable(uma_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/uma_test.cpp)   # #6448: an integrated GPU's room from /proc/meminfo (CPU, no device)
+  target_include_directories(uma_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME uma_test COMMAND uma_test)
+  add_executable(device_lost_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/device_lost_test.cpp)   # #6445: DEVICE_LOST detection & diagnostics (CPU, no device)
+  target_include_directories(device_lost_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME device_lost_test COMMAND device_lost_test)
   add_executable(verify_refusal_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/verify_refusal_test.cpp)   # a refused start (no VRAM expert tier) ends cleanly: the verifiers leave the default queue alone
   target_link_libraries(verify_refusal_test PRIVATE strata_engine strata_prefill strata_spec)
   add_test(NAME verify_refusal_test COMMAND verify_refusal_test)   # needs one SYCL GPU

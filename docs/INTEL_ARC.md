@@ -174,9 +174,35 @@ Things that matter on an Arc (details in [INTEL.md](INTEL.md)):
 Two cards on `xe` (2x Arc Pro B70, IQ3_S, 0.1.44): `--layer-split auto` picked a split at about 11 tok/s where
 `--layer-split 30` ran about 54. The auto choice now prefers the split with the most VRAM headroom (above).
 
-**Not tested by anyone:** Windows (no native build path), Arc on WSL2 with the current engine, integrated Arc GPUs (the B390 /
-Panther Lake in #515; shared-memory planning does not exist), and pictures on a Battlemage card with a GPU reader. Pictures work
-on the A750 (on by default, read on the CPU). See [INTEL.md](INTEL.md#pictures-on-an-arc).
+**Not tested by anyone:** Windows (no native build path), Arc on WSL2 with the current engine, integrated Intel GPUs other than
+the Arc B390 (see [Integrated Arc GPUs](#integrated-arc-gpus-the-b390-panther-lake)), and pictures on a Battlemage card with a GPU
+reader. Pictures work on the A750 (on by default, read on the CPU). See [INTEL.md](INTEL.md#pictures-on-an-arc).
+
+## Integrated Arc GPUs: the B390 (Panther Lake)
+
+A GPU built into the processor, such as Panther Lake's Arc B390, has no memory of its own: what the engine calls VRAM is the PC's
+RAM. On Linux the engine plans such a GPU as one pool of memory with the system (#6448). Discrete cards are not affected.
+
+- **The cache is sized from the RAM.** The room is `MemAvailable`, plus the pages the GPU driver keeps pooled from an earlier
+  load (`GPUReclaim` in `/proc/meminfo`; a kernel that reports 0 there, as 7.0 did in #2412, adds nothing), less a headroom left
+  for the rest of the system (`STRATA_UMA_HEADROOM_GIB`, 6 GiB unless set). The start prints these figures in one line. Level
+  Zero's own free figure is not used on such a GPU.
+- **No second copy in the same RAM.** With `--expert-cache auto` there is no pinned mirror: the experts the cache cannot hold
+  are read from the file by the host (or, with `STRATA_VERIFY_NO_HOST`, refused, below). The prompt loan's mirror is off
+  (`STRATA_LEND_MIRROR=N` turns it on, with `STRATA_MIRROR_MIB` for its room when the cache is automatic). With a cache size
+  you give, the mirror gets the rest of the pool less `--vram-reserve-mib`. KV streaming is not turned on by itself.
+- **A model that does not fit is refused at once.** With `--stream-experts` and `STRATA_VERIFY_NO_HOST`, an automatic cache that
+  cannot hold every expert ends the start as soon as it is sized, with how many experts and GiB are short, instead of after
+  the fill.
+- `STRATA_UMA=0` plans the GPU as a card, as before; `STRATA_UMA=1` plans any GPU as one that shares the RAM.
+
+`./setup.sh --backend sycl` still stops at built-in graphics, so such a GPU runs from a run config written by hand.
+
+> **Measured on:** Arc Pro B390 (Panther Lake, 8086:b086, xe), Core Ultra X9 388H, 62 GiB LPDDR5X shared, Linux 7.2, compute
+> runtime 26.35, Swift 1.5 IQ3_XXS with `--expert-cache auto --stream-experts` at a 128K context. At each of three starts all
+> 24,576 experts were in one 39.97 GiB cache with no mirror, and at least 6.2 GiB of RAM stayed available. Decode: 26.3 tok/s on
+> a code prompt and 20.4 on the answer to a 6K prompt (19.1 and 13.3 before this planning, with a cache of 8,400-13,400 slots
+> and a 19-25 GiB mirror). A 6K prompt is read at about 335 tok/s, against about 394 before.
 
 ## Windows
 

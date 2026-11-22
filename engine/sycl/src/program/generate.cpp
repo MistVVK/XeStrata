@@ -39,9 +39,11 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/short_cache.hpp"
+#include "strata/core/uma.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/conversation_spill.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gguf_expert_source.hpp"
@@ -75,6 +77,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "../bmg_window_session.hpp"
 #include "strata/program/adapt_decay.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -138,6 +141,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <system_error>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -722,6 +726,17 @@ struct Options {
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    /// --serve (opt-in): the conversation cache's SSD tier (conversation_spill.hpp).  A parked conversation the RAM
+    /// tier evicts (its byte budget, its slot count, the RAM gate) or a captured one the RAM floor refuses is written
+    /// as a session file in this process's folder instead of being dropped, and a later request whose prompt it serves
+    /// best reads it back.  Only on pressure: a park that fits in RAM never touches the disk, and a layer split is not
+    /// written (a stage image is).  The file format, its identity and its read limits are the session SAVE's.
+    std::string conversation_spill_dir;   // empty: <data>/conversation-spill when --pack is under <data>/packs
+    /// --conversation-spill-persist: the tier's folder is `<root>/fp-<model fingerprint>` and its entries survive a restart: at
+    /// start those of the current model and settings are adopted and indexed, the folders of other fingerprints are removed.
+    /// Off by default (a per-process folder, removed at the end).
+    bool conversation_spill_persist = false;
+    int64_t conversation_spill_mib = -1;  // -1: the disk's free space decides; 0: no SSD tier
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
@@ -869,6 +884,13 @@ void usage() {
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
                  "                       session file (default 2560)\n"
+                 "  --conversation-spill-dir PATH  --serve (opt-in): also keep parked conversations on disk (a local SSD):\n"
+                 "                       what RAM evicts or its floor refuses is written there, and a request whose prompt\n"
+                 "                       it serves best reads it back.  Default: <data>/conversation-spill\n"
+                 "  --conversation-spill-persist  --serve (opt-in): keep the SSD tier across engine restarts in\n"
+                 "                       <root>/fp-<model fingerprint>, adopting matching entries at start\n"
+                 "  --conversation-spill-mib N  --serve: the SSD tier's budget (default: from the disk's free space;\n"
+                 "                       0 = no SSD tier)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
@@ -1535,6 +1557,12 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
                     err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
                     return false;
                 }
+                const uint64_t bytes = (uint64_t) N * sizeof(float);
+                const uint64_t payload = f.file_size() >= f.data_start() ? f.file_size() - f.data_start() : 0;
+                if (t.offset > payload || bytes > payload - t.offset) {
+                    err = path + ": " + t.name + " is truncated";
+                    return false;
+                }
                 const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
                 for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
                 have[(size_t) l] = true;
@@ -1779,6 +1807,14 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
         for (unsigned int d = 0; d < dpct::device_count(); ++d) dpct::get_device(d).queues_wait_and_throw();
     } catch (...) {
     }
+    std::fflush(stderr);
+    std::_Exit(code);
+}
+
+// #6445: after UR_RESULT_ERROR_DEVICE_LOST, the Level Zero context is poisoned for this process; unwinding
+// GPU destructors or calling queues_wait_and_throw() throws sycl::exception from a destructor -> std::terminate.
+[[noreturn]] static void device_lost_exit(int code = 1) {
+    std::fflush(stdout);
     std::fflush(stderr);
     std::_Exit(code);
 }
@@ -2042,6 +2078,16 @@ int main(int argc, char **argv) try {
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
+        else if (a == "--conversation-spill-persist") o.conversation_spill_persist = true;
+        else if (a == "--conversation-spill-dir") o.conversation_spill_dir = next("--conversation-spill-dir");
+        else if (a == "--conversation-spill-mib") {
+            const long long n = std::atoll(next("--conversation-spill-mib"));
+            if (n < 0) {
+                std::fprintf(stderr, "--conversation-spill-mib needs a nonnegative integer\n");
+                return 2;
+            }
+            o.conversation_spill_mib = n;
+        }
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
@@ -4189,7 +4235,10 @@ int main(int argc, char **argv) try {
     // slower): with no --kv-resident given, the K/V streams from RAM, the resident window as large as the card leaves room for.
     // Needed: every session (the main one and each request slot), what loads after them (the draft layer, the native head, the verify buffers), the reserve,
     // the prompt path's smallest own buffers (chunk 256) and a cache of 128 slots.
-    if (o.kv_resident <= 0 && o.max_context > 20480 && !multi_gpu && !o.kv_grow && o.expert_cache != 0) {
+    // #6448: not on an integrated GPU.  KV streaming keeps the whole K/V in pinned RAM and a window of it in VRAM; with one
+    // pool for both that is the K/V twice, so a context that does not fit there does not fit streamed either.
+    if (o.kv_resident <= 0 && o.max_context > 20480 && !multi_gpu && !o.kv_grow && o.expert_cache != 0 &&
+        !strata::core::device_unified_memory()) {
         const int64_t kLateLoadMib = (!o.mtp.empty() || o.draft == "dflash2") ? 1500 : 700;   // Arc A750: MTP 835 + head 417 + verify 70 + the rest; DFlash2 alone is about the same
         const int64_t blob_b = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         const int64_t n_sess = 1 + std::max(o.batch, 0);
@@ -4260,6 +4309,7 @@ int main(int argc, char **argv) try {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
+        strata::prefill::configure_bmg_window(ss, *strata::q_of(main_cs), !multi_gpu && stages.empty() && o.batch <= 0);
         if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
             std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                                  "%.2f GiB of pinned RAM\n",
@@ -5140,6 +5190,29 @@ int main(int argc, char **argv) try {
     if (o.expert_cache > 0) {
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
+        // #6448: on an integrated GPU the auto cache took all the room the shared pool has and nothing mirrors the rest
+        // (below), so a cache with fewer slots than the model has experts ends in the refusal after the fill.  It is
+        // refused here instead, with the same words: the fill would first read every slot's expert from the disk (tens of
+        // GiB) only to find the same shortfall.  A mirror size given in STRATA_MIRROR_MIB (other than 0) is left to the
+        // mirror and to the check after it.
+        const bool no_host_env = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+        const char* mirror_mib = std::getenv("STRATA_MIRROR_MIB");
+        const bool mirror_given = mirror_mib != nullptr && std::atoll(mirror_mib) != 0;
+        if (strata::core::device_unified_memory() && auto_cache && !multi_gpu && o.stream_experts && srcp == &gguf_src && no_host_env
+            && !mirror_given && xcache.slots() < g.n_layers * g.n_expert) {
+            uint64_t av = 0, pooled = 0, all_b = 0;
+            strata::core::uma_memory(av, pooled);
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                all_b += (uint64_t) g.n_expert * (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+            const uint64_t have_b = (uint64_t) xcache.bytes(), short_b = all_b > have_b ? all_b - have_b : 0;
+            std::fprintf(stderr, "strata generate: REFUSED: this model does not fit in the memory the integrated GPU shares with the system: "
+                                 "%lld of its experts (about %.1f GiB) have no room. %.1f GiB of RAM is available now and %.0f GiB of it is "
+                                 "kept free for the system (STRATA_UMA_HEADROOM_GIB). Close programs that hold RAM, lower --max-context, or "
+                                 "take a smaller size of the model\n",
+                         (long long) (g.n_layers * g.n_expert - xcache.slots()), (double) short_b / 1073741824.0,
+                         (double) (av + pooled) / 1073741824.0, (double) strata::core::uma_headroom_bytes() / 1073741824.0);
+            refuse_exit(2);
+        }
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -5367,7 +5440,11 @@ int main(int argc, char **argv) try {
         // STRATA_LEND_MIRROR=0 turns it off; =N: the last N slots (default 10% of the cache with a loan, at most 1,200).
         if (!o.no_prefill_borrow && o.prefill_chunk > 0 && !multi_gpu) {
             const char* lm = std::getenv("STRATA_LEND_MIRROR");
-            const int64_t want_tail = lm ? std::atoll(lm) : std::min<int64_t>(xcache.slots() / 10, 1200);
+            // #6448: off by default on an integrated GPU, where the mirror is the same RAM as the cache: a second copy of
+            // up to 1,200 cached experts (about 2 GiB).  On an Arc Pro B390, 6K prompts ran at 367 tok/s without it and
+            // 359 with it (medians of 3).  With an auto cache there it also needs STRATA_MIRROR_MIB (the mirror's room).
+            const int64_t want_tail = lm ? std::atoll(lm)
+                                         : (strata::core::device_unified_memory() ? 0 : std::min<int64_t>(xcache.slots() / 10, 1200));
             if (want_tail > 0) {
                 const int64_t first_tail = xcache.slots() - std::min<int64_t>(want_tail, xcache.slots());
                 for (int64_t l = 0; l < mirror_end; ++l)
@@ -5384,7 +5461,16 @@ int main(int argc, char **argv) try {
             std::fclose(f);
         }
         const char* mv = std::getenv("STRATA_MIRROR_MIB");
-        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        // #6448: on an integrated GPU the mirror comes out of the pool the cache was sized from.  An auto cache took what
+        // the pool allows, so what it left is the reserve of the allocations still to come, not room for a mirror: the
+        // experts it could not hold are read from the file by the host, or, with STRATA_VERIFY_NO_HOST, refused below
+        // with the numbers.  A cache size that was given leaves the pool's rest, less the reserve, to the mirror.
+        const bool uma_pool = strata::core::device_unified_memory();
+        if (uma_pool && !mv) {
+            const uint64_t room = (uint64_t) strata::core::uma_free_bytes(0), keep = (uint64_t) o.vram_reserve_mib << 20;
+            cap = auto_cache ? 0 : (room > keep ? room - keep : 0);
+        }
         if (!miss.empty() && cap > 0) {
             const auto tm = Clock::now();
             const int64_t got = gguf_src.mirror(miss, cap, 8, err);
@@ -5410,6 +5496,23 @@ int main(int argc, char **argv) try {
         unmirrored_misses = (int64_t) n_true_miss - (int64_t) (gguf_src.mirrored_bytes() ? std::count_if(miss.begin(), miss.begin() + (ptrdiff_t) n_true_miss,
             [&](const std::pair<int64_t, int64_t>& pr) { return gguf_src.pinned(pr.first, pr.second); }) : 0);
         const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+        if (unmirrored_misses > 0 && no_host && uma_pool) {
+            // #6448: the same refusal in the terms of one pool of memory, with what is short
+            uint64_t av = 0, pooled = 0;
+            strata::core::uma_memory(av, pooled);
+            uint64_t short_b = 0;   // the bytes of the experts that have no room (their sizes differ by layer)
+            for (size_t k = 0; k < n_true_miss; ++k)
+                if (!gguf_src.pinned(miss[k].first, miss[k].second))
+                    short_b += (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(miss[k].first);
+            const double short_gib = (double) short_b / 1073741824.0;
+            std::fprintf(stderr, "strata generate: REFUSED: this model does not fit in the memory the integrated GPU shares with the system: "
+                                 "%lld of its experts (about %.1f GiB) have no room. %.1f GiB of RAM is available now and %.0f GiB of it is "
+                                 "kept free for the system (STRATA_UMA_HEADROOM_GIB). Close programs that hold RAM, lower --max-context, or "
+                                 "take a smaller size of the model\n",
+                         (long long) unmirrored_misses, short_gib, (double) (av + pooled) / 1073741824.0,
+                         (double) strata::core::uma_headroom_bytes() / 1073741824.0);
+            refuse_exit(2);
+        }
         if (unmirrored_misses > 0 && no_host) {
             std::fprintf(stderr, "strata generate: REFUSED: %lld experts are neither in VRAM nor mirrored; with STRATA_VERIFY_NO_HOST "
                                  "the device plan cannot run them and generation would lack a safe host fallback - raise "
@@ -8038,7 +8141,7 @@ int main(int argc, char **argv) try {
                 in.embedding = o.embd_gguf;
                 in.ple = o.ple_gguf;
                 in.pack = o.pack;
-                in.mtp = o.mtp.empty() ? std::string() : o.mtp + "/dense.bin";
+                in.mtp = o.mtp;
                 if (srcp != nullptr) in.experts = srcp->model_inputs();
                 std::vector<strata::core::SessionModelFile> files = strata::core::session_model_inputs(in);
                 // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
@@ -8048,10 +8151,11 @@ int main(int argc, char **argv) try {
                         files.push_back({std::string("pack ") + n, o.pack + "/" + n, true});
                     if (srcp == nullptr) files.push_back({"pack experts.bin", o.pack + "/experts.bin", true});
                 }
-                if (!o.mtp.empty()) {
-                    for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
-                    files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
-                }
+                // resolved like the Metal loader (window.cpp): STRATA_METAL_MTP_GGUF overrides the GGUF beside an rt dir
+                const char* mtp_gguf_env = std::getenv("STRATA_METAL_MTP_GGUF");
+                for (auto& m : strata::core::session_mtp_pack_files(o.mtp, o.mtp_draft_vocab,
+                                                                    mtp_gguf_env ? mtp_gguf_env : ""))
+                    files.push_back(std::move(m));
                 uint64_t fp = 0;
                 // each file is one blocking read of at most 2 MiB (head and tail): announced before it starts
                 if (next_file) next_file();
@@ -8095,6 +8199,132 @@ int main(int argc, char **argv) try {
             id.config = *config_fp;
             return true;
         };
+        // The conversation cache's SSD tier (conversation_spill.hpp; 0.2.17's P2 of the cache admission design), in this
+        // engine.  A parked conversation the RAM tier evicts (its byte budget, its slot count, the RAM gate) or a captured
+        // one the RAM floor refuses is written as a session file in this process's folder instead of being dropped, and a
+        // later request whose prompt it serves best reads it back.  Only on pressure: a park that fits in RAM never
+        // touches the disk.  One stage only (a layer split's stage images are not written).  The file format, its identity
+        // and its read limits are the session SAVE's.
+        //
+        // Unlike the CUDA engine's, this write runs on the serve thread: this engine has no BackgroundWriter, so the
+        // request that evicts a conversation waits for the file.  SpillCost is what keeps that from being a loss - only a
+        // conversation whose prefill costs more than the disk round trip is written, so a cheap re-read never pays for it.
+        strata::core::ConversationSpill spill;
+        std::optional<strata::core::SessionFileIdentity> spill_id;
+        strata::core::SpillCost spill_cost;
+        if (conversations.enabled() && stages.empty() && o.conversation_spill_mib != 0) {
+            std::filesystem::path root;
+            if (!o.conversation_spill_dir.empty()) {
+                root = o.conversation_spill_dir;
+            } else if (!o.pack.empty()) {
+                std::filesystem::path p = std::filesystem::path(o.pack).lexically_normal();
+                if (p.filename().empty()) p = p.parent_path();   // (a trailing separator)
+                if (p.parent_path().filename() == "packs") root = p.parent_path().parent_path() / "conversation-spill";
+            }
+            std::string why;
+            uint64_t cap = 0;
+            if (root.empty()) {
+                why = "no data folder (--pack is not under <data>/packs; --conversation-spill-dir sets one)";
+            } else {
+                std::error_code ec;
+                std::filesystem::create_directories(root, ec);
+                const std::filesystem::space_info sp = std::filesystem::space(root, ec);
+                const uint64_t floor = (uint64_t) std::max<int64_t>(o.session_min_free_mib, 0) << 20;
+                if (ec) why = "its disk cannot be read (" + ec.message() + ")";
+                else if (o.conversation_spill_mib > 0) cap = std::min<uint64_t>((uint64_t) o.conversation_spill_mib << 20,
+                                                                               sp.available > floor ? sp.available - floor : 0);
+                else cap = strata::core::spill_default_budget(sp.available, floor);
+                if (!ec && cap < (uint64_t(64) << 20)) { why = "the disk is full"; cap = 0; }
+            }
+            size_t cleaned = 0;
+            size_t adopted = 0;
+            std::optional<strata::core::SessionFileIdentity> persist_id;
+            if (cap > 0 && o.conversation_spill_persist) {   // the stable folder is named by the model's fingerprint: known before the first spill
+                try {
+                    std::string e;
+                    strata::core::SessionFileIdentity id;
+                    if (session_identity(id, e, {})) { persist_id = id; spill_id = id; }
+                    else std::fprintf(stderr, "strata serve: conversation cache: --conversation-spill-persist: the model cannot be fingerprinted (%s); "
+                                              "a folder of this process is used\n", e.c_str());
+                } catch (...) {}
+            }
+            if (cap > 0 && !spill.open(root, cap, why, &cleaned, persist_id ? &*persist_id : nullptr, &adopted)) cap = 0;
+            if (cap > 0) {
+                std::fprintf(stderr, "strata serve: conversation cache: SSD tier in %s, up to %llu MiB%s%s\n",
+                             spill.dir().string().c_str(), (unsigned long long) (cap >> 20),
+                             cleaned ? (", " + std::to_string(cleaned) + " folder" + (cleaned == 1 ? "" : "s") +
+                                        (persist_id ? " of other models or ended engines removed" : " of ended engines removed")).c_str() : "",
+                             spill.persistent() ? (", kept across restarts: " + std::to_string(adopted) + " conversation" +
+                                                   (adopted == 1 ? "" : "s") + " adopted from the last run, " +
+                                                   std::to_string(spill.bytes() >> 20) + " MiB").c_str() : "");
+            } else {
+                std::fprintf(stderr, "strata serve: conversation cache: no SSD tier: %s\n", why.c_str());
+            }
+        }
+        std::mutex spill_cost_mu;
+        // On this thread: whether `img` goes to the SSD tier at all - the tier is on, one stage, and the cost rule says the
+        // disk round trip is cheaper than reading the conversation again.
+        auto spill_ready = [&](const strata::core::SavedConversation& img, const char* why) -> bool {
+            if (!spill.enabled() || !img.stage_images.empty()) return false;
+            const int64_t tokens = (int64_t) img.live.ids.size();
+            const uint64_t bytes = (uint64_t) img.bytes();
+            std::lock_guard<std::mutex> lk(spill_cost_mu);
+            if (!spill_cost.worth(tokens, bytes)) {
+                std::fprintf(stderr, "strata serve: conversation cache: not spilling %lld tokens (%s): reading them again "
+                                     "(about %.0f ms here) costs less than the SSD round trip of %llu MiB (about %.0f ms)\n",
+                             (long long) tokens, why, spill_cost.reread_ms(tokens), (unsigned long long) (bytes >> 20),
+                             spill_cost.round_trip_ms(bytes));
+                return false;
+            }
+            return true;
+        };
+        // Writes one conversation to the SSD tier; its serial, 0 when it could not be written.  Never throws.
+        auto spill_write = [&](const strata::core::SavedConversation& img, const char* why) -> uint64_t {
+            try {
+                if (!spill_id) {
+                    std::string e;
+                    strata::core::SessionFileIdentity id;
+                    if (!session_identity(id, e, {})) {
+                        std::fprintf(stderr, "strata serve: conversation cache: no SSD tier from now on: the model cannot "
+                                             "be fingerprinted (%s)\n", e.c_str());
+                        spill.close();
+                        return 0;
+                    }
+                    spill_id = id;
+                }
+                std::string e;
+                uint64_t serial = 0;
+                const auto t0 = Clock::now();
+                const bool ok = spill.put(img, *spill_id, e, &serial);
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                if (ok) {
+                    if (const auto en = spill.find(serial)) {
+                        std::lock_guard<std::mutex> lk(spill_cost_mu);
+                        spill_cost.saw_write(en->bytes, ms);
+                    }
+                    std::fprintf(stderr, "strata serve: conversation cache: spilled %zu tokens to the SSD tier (%s) in %.1f ms; "
+                                         "on SSD %zu, %llu MiB\n", img.live.ids.size(), why, ms, spill.size(),
+                             (unsigned long long) (spill.bytes() >> 20));
+                } else {
+                    std::fprintf(stderr, "strata serve: conversation cache: could not spill %zu tokens to the SSD tier (%s): %s\n",
+                                 img.live.ids.size(), why, e.c_str());
+                }
+                return ok ? serial : 0;
+            } catch (...) {
+                std::fprintf(stderr, "strata serve: conversation cache: could not spill to the SSD tier (%s): out of memory\n", why);
+                return 0;
+            }
+        };
+        // writes it now, on this thread (the RAM floor after a capture needs the memory back at once)
+        auto spill_put = [&](const strata::core::SavedConversation& img, const char* why) -> bool {
+            return spill_ready(img, why) && spill_write(img, why) != 0;
+        };
+        if (spill.enabled()) {
+            conversations.set_evict_sink([&](strata::core::SavedConversation&& v) {
+                if (spill_ready(v, "evicted from RAM")) spill_write(v, "evicted from RAM");
+            });
+        }
+
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
         struct ParkSource {
@@ -8226,6 +8456,8 @@ int main(int argc, char **argv) try {
                     image.stage_images.push_back(std::move(part));
                 }
                 if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(), 0, floor)) {
+                    // the SSD tier: the captured image is written out and freed instead of thrown away
+                    if (spill_put(image, "the RAM floor after the capture")) return true;
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
                     return true;
                 }
@@ -10369,6 +10601,11 @@ int main(int argc, char **argv) try {
             const int64_t n = (int64_t) ids.size();
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+            if (o.max_context < 8 || n < 0 || max_new < 0 || n > o.max_context - 8 || max_new > o.max_context - 8 - n) {
+                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
+                            (long long) max_new, (long long) o.max_context);
+                continue;
+            }
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
@@ -10478,11 +10715,6 @@ int main(int argc, char **argv) try {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
-                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
-                            (long long) max_new, (long long) o.max_context);
-                continue;
-            }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
@@ -10569,9 +10801,61 @@ int main(int argc, char **argv) try {
                             slot_ck = &c;
                         }
                 }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+            // The SSD tier: a conversation the RAM tier no longer holds, when it gives this prompt more than anything else
+            // here does.  Read with the same limits a session file gets, so an entry this build cannot restore is refused
+            // rather than loaded short.
+            if (!incoming && spill.enabled() && spill.size() > 0 && stages.empty() && spill_id) {
+                const auto sp = spill.best(ids, req_imgs, want_cvec);
+                const auto sp_entry = sp.tokens > 0 ? spill.find(sp.serial) : std::nullopt;
+                if (sp_entry && sp.tokens > std::max(resume, slot_tokens)) {
+                    const int64_t sp_tokens = (int64_t) sp_entry->live.ids.size();
+                    const uint64_t sp_bytes = sp_entry->bytes;
+                    strata::core::SavedConversation image;
+                    std::string why;
+                    bool from_ssd = false;
+                    const auto t0 = Clock::now();
+                    try {
+                        strata::core::SessionReadLimits limits;
+                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        limits.admit = [floor, &o](uint64_t need, std::string& w) {
+                            const auto avail = strata::core::available_host_bytes();
+                            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            w = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                                std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
+                                (avail ? std::to_string(*avail >> 20) + " MiB available)" : "RAM telemetry unavailable)");
+                            return false;
+                        };
+                        if (strata::core::conversation_session_read_limits(limits, ss, g,
+                                use_mtp ? &mtp.kv_state() : nullptr,
+                                (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), why) &&
+                            spill.take_serial(sp.serial, *spill_id, limits, image, why))
+                            from_ssd = true;
+                        else
+                            spill.drop_serial(sp.serial);   // (limits that cannot be formed: it cannot be read here either)
+                    } catch (const std::bad_alloc&) {
+                        why = "not enough RAM to read it";
+                        spill.drop_serial(sp.serial);
+                    }
+                    if (from_ssd) {
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                        {
+                            std::lock_guard<std::mutex> lk(spill_cost_mu);
+                            spill_cost.saw_read(sp_bytes, ms);
+                        }
+                        std::fprintf(stderr, "strata serve: conversation cache: read %lld tokens back from the SSD tier in %.1f ms "
+                                             "(this prompt starts with %lld of them); on SSD %zu, %llu MiB\n", (long long) sp_tokens,
+                                     ms, (long long) sp.tokens, spill.size(), (unsigned long long) (spill.bytes() >> 20));
+                        incoming.emplace(std::move(image));
+                        parked = strata::core::ConversationCache::Match{SIZE_MAX, sp.tokens, false, 0};
+                    } else {
+                        std::fprintf(stderr, "strata serve: conversation cache: could not read %lld tokens back from the SSD tier "
+                                             "(%s); the prompt is read again\n", (long long) sp_tokens, why.c_str());
+                    }
+                }
+            }
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
@@ -11161,7 +11445,12 @@ int main(int argc, char **argv) try {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) {
                     b60_layouts.packed(false);
-                    const bool ok=sp.run(ids.data()+a0,b0-a0,a0,e);
+                    const bool window = ss.bmg_window_device && !piped;
+                    const bool ok = window
+                        ? sp.run_expert_window(ids.data() + a0, b0 - a0, a0, e, pp_next_check, o.prompt_cache_every,
+                                               pp_total, o.short_read,
+                                               o.prompt_cache_tail && o.prompt_cache > 0 && o.prompt_cache_every > 0 && !pp_tail_saved)
+                        : sp.run(ids.data() + a0, b0 - a0, a0, e);
                     b60_layouts.packed(true);
                     return ok;
                 }
@@ -11313,8 +11602,12 @@ int main(int argc, char **argv) try {
                 return e != nullptr && std::atoi(e) != 0;
             }();
             // Only add a snapshot; the existing token and image checks still decide reuse.
+            // #2518: the branch point sits at the turn before the one this prompt ends with, which is
+            // max_tail tokens further back - a long reply hides it past the default 1024, so the engine
+            // never made the checkpoint a branching follow-up needs. 16384 covers a full reply.
             const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
-                ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
+                ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token,
+                                                               8192, 16384) : -1;
             int64_t at = read_from;
             for (const int64_t to : {reread_to, root_at, message_at, turn_at, n - 1}) {
                 if (to <= at) continue;
@@ -11340,18 +11633,10 @@ int main(int argc, char **argv) try {
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
-                        // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
-                        // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
-                        /*
-                        DPCT1010: SYCL uses exceptions to report errors and
-                        does not use the error codes. The cudaPeekAtLastError
-                        function call was replaced with 0. You need to rewrite
-                        this code.
-                        */
-                        if (0 != 0) {
-                            std::fflush(stdout);
-                            std::fflush(stderr);
-                            std::_Exit(1);
+                        // #224 / #6445: a poisoned GPU context (e.g. Level Zero UR_RESULT_ERROR_DEVICE_LOST)
+                        // cannot safely unwind GPU destructors (which throw into std::terminate or hang): leave at once.
+                        if (strata::device_is_lost() || strata::is_device_lost(err)) {
+                            device_lost_exit(1);
                         }
                         return 1;
                     }
@@ -12459,7 +12744,9 @@ int main(int argc, char **argv) try {
                 strata::workload_trace::Scope verify_trace("decode.verify", nullptr, T);
                 const Clock::time_point tw0 = Clock::now();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
-                    std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                    const char* msg = drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str();
+                    std::printf("ERR %s\n", msg);
+                    if (strata::device_is_lost() || strata::is_device_lost(err)) device_lost_exit(1);
                     return 1;
                 }
                 int32_t fol_tgt[16];
@@ -12495,6 +12782,7 @@ int main(int argc, char **argv) try {
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
+                    if (strata::device_is_lost() || strata::is_device_lost(err)) device_lost_exit(1);
                     return 1;
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
@@ -12853,12 +13141,12 @@ int main(int argc, char **argv) try {
                     }
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
-                    const ConvCheckpoint* best = nullptr;
-                    for (const ConvCheckpoint& c : checks)
-                        if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
-                            std::equal(c.ids.begin(), c.ids.end(), live.begin()))
-                            best = &c;
-                    if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                    // #2518: keep EVERY checkpoint that prefixes the conversation, not just the longest: the
+                    // message boundary between a shared context and the question is what a later request
+                    // branching inside this conversation resumes from. The longest (the turn) alone diverges
+                    // before that boundary and is useless to such a request, which then overwrites another
+                    // chat's slot instead. (The slot -> main copy at copy_from_slot already carries all of them.)
+                    sl.checks = strata::core::conversation_checkpoints_prefixing(checks, live, sl.img);
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
@@ -13797,6 +14085,7 @@ int main(int argc, char **argv) try {
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                if (strata::device_is_lost() || strata::is_device_lost(err)) device_lost_exit(1);
                 return 1;
             }
             if (drive.d.failed) {
@@ -14233,6 +14522,11 @@ catch (sycl::exception const &exc) {
     std::cerr << "strata: this card does not have the memory for this start: the GPU ran out of memory while the engine was loading (" << what << "). Lower the number of "
                  "requests at once (--batch / parallel), use --kv q4_0 (a smaller K/V), turn off the draft layer, or close other programs that use the GPU" << std::endl;
     std::exit(1);
+  }
+  if (strata::is_device_lost(what)) {
+    strata::mark_device_lost();
+    std::cerr << "strata: GPU device lost (" << what << "). " << strata::device_lost_hint() << std::endl;
+    device_lost_exit(1);
   }
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;

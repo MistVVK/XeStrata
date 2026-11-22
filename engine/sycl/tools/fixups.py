@@ -26,6 +26,18 @@ def all_sources():
 edit("include/dpct/util.hpp", lambda s: s.replace("experimental::get_tangle_group(", "experimental::entangle(")
      .replace("experimental::get_fixed_size_group<", "experimental::chunked_partition<"))
 
+# 1b. dpct never fills `_integrated` (no CUDA attribute maps to it), so every iGPU reported 0 and device_free_bytes()
+#     (src/core/expert_cache.cpp) sized the expert cache from the tiny card memory instead of MemAvailable.
+def integrated(s):
+    if "set_integrated(dev.has(" in s:
+        return s
+    return s.replace(
+        "  prop.set_host_unified_memory(dev.has(sycl::aspect::usm_host_allocations));\n",
+        "  prop.set_host_unified_memory(dev.has(sycl::aspect::usm_host_allocations));\n"
+        "  // dpct leaves _integrated unset, so iGPUs report 0 and the expert cache is not sized from MemAvailable.\n"
+        "  prop.set_integrated(dev.has(sycl::aspect::ext_oneapi_is_integrated_gpu));\n", 1)
+edit("include/dpct/device.hpp", integrated)
+
 for rel in all_sources():
     rel = str(rel)
     # 2. `(dpct::queue_ptr)stream->memcpy(...)`: the cast binds to the member call result, not the pointer.

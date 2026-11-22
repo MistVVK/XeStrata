@@ -1064,7 +1064,10 @@ class _Metal:
 #: the cards setup names by PCI id (sycl/setup_intel.py INTEL_ARC; the same table as sycl/serve/xe_telemetry.py)
 ARC_NAMES = {"e223": "Arc Pro B70", "e221": "Arc Pro B60", "e211": "Arc Pro B60", "e20b": "Arc B580", "e20c": "Arc B570",
              "e212": "Arc B50", "56a0": "Arc A770", "56a1": "Arc A750", "56a2": "Arc A580", "56a5": "Arc A380",
-             "56a6": "Arc A310", "5690": "Arc A770M"}
+             "56a6": "Arc A310", "5690": "Arc A770M",
+             # #6448: Panther Lake's GPU, built into the processor (not in setup's table); the ids as hwdata's pci.ids names them
+             "b080": "Arc B390", "b082": "Arc B390", "b084": "Arc Pro B390", "b086": "Arc Pro B390",
+             "b081": "Arc B370", "b083": "Arc B370", "b085": "Arc Pro B370", "b087": "Arc Pro B370"}
 
 
 class _ZesPciAddress(ctypes.Structure):
@@ -1220,9 +1223,34 @@ class _Intel:
         self._fd_mem = None                     # bytes the DRM clients this user can see hold on the card (fdinfo), last read
         self.driver = ("xe" if os.path.isdir(f"{self.dev}/tile0") else "i915") if self.dev else None
         self._pci = None                        # (rx bytes, tx bytes, ts us) of the last read
+        # #6448: a GPU built into the processor (Level Zero's INTEGRATED flag) has no memory of its own: it shares the RAM.
+        # A card, or sysman that cannot say (None), reads as before.
+        self.integrated = bool(self.zes.integrated()) if self.zes is not None else False
 
     def ok(self):
         return self.dev is not None and sys.platform.startswith("linux")
+
+    def _meminfo(self):
+        """MemTotal, MemAvailable and GPUReclaim (the freed pages the GPU driver keeps pooled for its next allocation; a kernel
+        that does not report them has no such line or 0, #2412) in bytes, from <proc>/meminfo; a missing one is 0."""
+        out = {"MemTotal": 0, "MemAvailable": 0, "GPUReclaim": 0}
+        try:
+            with open(f"{self._proc}/meminfo", encoding="ascii", errors="replace") as fh:
+                for line in fh:
+                    k, _, v = line.partition(":")
+                    if k in out:
+                        parts = v.split()
+                        if parts and parts[0].isdigit():
+                            out[k] = int(parts[0]) * 1024
+        except OSError:
+            pass
+        return out
+
+    def shared_free(self):
+        """#6448: what an integrated GPU can still take, in bytes: the RAM the system can still give (MemAvailable) plus the
+        pages the GPU driver holds pooled (GPUReclaim). None when MemAvailable cannot be read."""
+        m = self._meminfo()
+        return (m["MemAvailable"] + m["GPUReclaim"]) if m["MemAvailable"] else None
 
     @staticmethod
     def _rd(p):
@@ -1309,8 +1337,10 @@ class _Intel:
             drivers[key] = drv
             if total:
                 now[key] = (busy, total)
-            for k, v in kv.items():   # the client's memory on this card (i915: drm-resident-local0, xe: drm-resident-vram0), "N KiB"
-                if re.fullmatch(r"drm-resident-(local|vram)\d+", k):
+            # the client's memory on this card (i915: drm-resident-local0, xe: drm-resident-vram0), "N KiB"; an integrated GPU has
+            # no vram region, its clients' memory is in gtt and system (one region per buffer at a time, so the two add up)
+            for k, v in kv.items():
+                if re.fullmatch(r"drm-resident-(local|vram)\d+", k) or (self.integrated and k in ("drm-resident-gtt", "drm-resident-system")):
                     parts = v.split()
                     if parts and parts[0].isdigit():
                         unit = {"KiB": 2**10, "MiB": 2**20, "GiB": 2**30}.get(parts[1] if len(parts) > 1 else "", 1)
@@ -1347,6 +1377,11 @@ class _Intel:
                 # sysman on i915 (Arc A-series) reports the card's size but no use: free == size, so "used 0" while an engine holds
                 # gigabytes (measured on an A750, p1006 11-16). The engine's own DRM clients' resident memory is the reading there.
                 used = self._fd_mem
+            if self.integrated:
+                # #6448: sysman answers MemAvailable as the size and MemFree as free here, both moving with every program on
+                # the computer. The size is the RAM; the use is what the GPU clients this user can see hold of it (fdinfo), which
+                # on a laptop includes the desktop's own.
+                used, total = self._fd_mem, (self._meminfo()["MemTotal"] or total)
             out["mem_used"], out["mem_total"] = used, total
         if self.hwmon:
             if out["temp"] is None:
@@ -1516,10 +1551,14 @@ def windows_amd_cards(adapters=None) -> list:
 
 
 def free_vram_mib(index=0, amd=False):
-    """Free VRAM of a card in MiB, or None when it cannot be read."""
+    """Free VRAM of a card in MiB, or None when it cannot be read.  An integrated Intel GPU (#6448) has no VRAM of its own: its
+    free memory is what the system can still give it (_Intel.shared_free), not the size less what the engine's own clients hold."""
     g = gpu_reader(index, amd)
     if not g.ok():
         return None
+    if isinstance(g, _Intel) and g.integrated:
+        free = g.shared_free()
+        return int(free >> 20) if free is not None else None
     r = g.read()
     if r.get("mem_total") is None or r.get("mem_used") is None:
         return None

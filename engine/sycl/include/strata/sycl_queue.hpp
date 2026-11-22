@@ -7,6 +7,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include <cstdlib>
+#include "strata/core/device_lost.hpp"
 
 namespace strata {
 inline sycl::queue* q_of(const void* stream) {
@@ -121,8 +122,38 @@ namespace strata {
 // intel_gpu_driver() has no sysfs to read): the architecture enum when the runtime knows it, else the marketing name
 // ("Intel(R) Arc(TM) Pro B70", "... A750 ..."). Battlemage = Arc B-series / Pro B-series (B570 B580 B50 B60 B65 B70).
 enum class IntelGpuGen { Unknown, Alchemist, Battlemage };
+// Is this GPU an Xe3 (Panther Lake, built into the processor)?  It has the Battlemage cards' matrix (DPAS) units,
+// 16- and 32-lane sub-groups and 256-register threads.  By the architecture id: compute runtime 26.35 names an Arc Pro
+// B390 "Intel(R) Graphics [0xb086]", which the name rule below does not take for Battlemage, and reports it as
+// intel_gpu_ptl_h.  Other Xe3 parts (Wildcat Lake) and the Xe2 GPUs built into Lunar Lake are not matched.
+inline bool intel_gpu_xe3(const sycl::device& d) {
+    if (!d.is_gpu()) return false;
+    try {
+        namespace exp = sycl::ext::oneapi::experimental;
+        const auto a = d.get_info<exp::info::device::architecture>();
+        return a == exp::architecture::intel_gpu_ptl_h || a == exp::architecture::intel_gpu_ptl_u;
+    } catch (...) {
+    }
+    return false;
+}
+// What STRATA_INTEL_GEN asks for (battlemage | alchemist | unknown), or -1 when it is unset: a way to measure a GPU on
+// another generation's kernels, and to take one back off them.
+inline int intel_gpu_gen_override() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_INTEL_GEN");
+        if (e == nullptr || e[0] == '\0') return -1;
+        const std::string s(e);
+        if (s == "battlemage") return (int) IntelGpuGen::Battlemage;
+        if (s == "alchemist") return (int) IntelGpuGen::Alchemist;
+        if (s == "unknown") return (int) IntelGpuGen::Unknown;
+        std::fprintf(stderr, "strata: STRATA_INTEL_GEN=%s is not battlemage, alchemist or unknown; ignored\n", e);
+        return -1;
+    }();
+    return v;
+}
 inline IntelGpuGen intel_gpu_gen(const sycl::device& d) {
     if (!d.is_gpu()) return IntelGpuGen::Unknown;
+    if (const int o = intel_gpu_gen_override(); o >= 0) return (IntelGpuGen) o;
     try {
         {
             namespace exp = sycl::ext::oneapi::experimental;
@@ -135,6 +166,9 @@ inline IntelGpuGen intel_gpu_gen(const sycl::device& d) {
         }
     } catch (...) {
     }
+    // #6448: an Xe3 GPU runs the Battlemage kernels and gets their defaults.  STRATA_INTEL_GEN=unknown takes it back
+    // off them.
+    if (intel_gpu_xe3(d)) return IntelGpuGen::Battlemage;
     std::string n;
     try { n = d.get_info<sycl::info::device::name>(); } catch (...) { return IntelGpuGen::Unknown; }
     if (n.find("Intel") == std::string::npos) return IntelGpuGen::Unknown;

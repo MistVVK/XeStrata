@@ -1,3 +1,4 @@
+#include "../../bmg_prefill_options.hpp"
 #include "b60_weight_cache.hpp"
 #include "b60_layout_state.hpp"
 #include <sycl/ext/intel/esimd.hpp>
@@ -6678,6 +6679,44 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
 // 0.1.43: gate/up and down of one expert in one launch.  Work-group g of the first 2 * n_ff * per_row is the gu kernel's
 // (row-superblock g / 2, parity g % 2); the rest are the flat kernel's superblocks of the down matrix.
 namespace {
+// Each subgroup expands one 256-value block. Keeping gate, up and down in
+// one submission also keeps the original dequantized-weight ring lifetime.
+template<int GateType, unsigned Subgroups>
+void bmg_dequant_native_q2(sycl::queue* queue, const void* gate, const void* up, const void* down,
+                           uint16_t* dst_gu, uint16_t* dst_d) {
+    constexpr unsigned blocks_per_row = 2560 / QK_K;
+    constexpr unsigned blocks_per_matrix = 640 * blocks_per_row;
+    strata::kprof::kp(queue, __FILE__, __func__, __LINE__)->submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>{3 * blocks_per_matrix * 32, Subgroups * 32},
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                const auto sg = item.get_sub_group();
+                const unsigned block = item.get_group(0) * Subgroups + sg.get_group_linear_id();
+                const unsigned lane = sg.get_local_linear_id();
+                if (block >= 2 * blocks_per_matrix) {
+                    const unsigned j = block - 2 * blocks_per_matrix;
+                    dq_q2_0(down, j, reinterpret_cast<sycl::half*>(dst_d) + j * QK_K, lane);
+                    return;
+                }
+                const bool is_up = block >= blocks_per_matrix;
+                const unsigned i = is_up ? block - blocks_per_matrix : block;
+                const unsigned row = i / blocks_per_row;
+                const unsigned out = (2 * row + unsigned(is_up)) * blocks_per_row + i % blocks_per_row;
+                auto* dest = reinterpret_cast<sycl::half*>(dst_gu) + out * QK_K;
+                const auto* weights = is_up ? up : gate;
+                if constexpr (GateType == 16) {
+                    // Map the quartet metadata decoder's thread number to contiguous output runs.
+                    const unsigned tid = (lane % 4) * 8 + lane / 4;
+                    dq_iq2_xxs_metadata(weights, i, dest, tid, sg);
+                } else if constexpr (GateType == 22) {
+                    dq_iq2_s(iq_signed_grid::block_at<block_iq2_s>(weights, i), 0, dest, lane);
+                } else {
+                    static_assert(GateType == 29);
+                    dq_iq1_m(iq_signed_grid::block_at<block_iq1_m>(weights, i), 0, dest, lane);
+                }
+            });
+    });
+}
+
 __dpct_inline__ void dequant_expert_kernel(int gt, int dt, const void *__restrict__ gate, const void *__restrict__ up,
                                            const void *__restrict__ down, int64_t per_row, int64_t gu_wgs,
                                            sycl::half *__restrict__ ygu, sycl::half *__restrict__ yd) {
@@ -6701,6 +6740,22 @@ void iq_dequant_expert_f16(int gt, int dt, const void* gate, const void* up, con
     if (n_embd % 256 != 0 || (n_ff * n_embd) % 256 != 0 || !is_iq(gt) || !is_iq(dt)) {
         std::fprintf(stderr, "iq_dequant_expert_f16: types %d/%d, %lld x %lld\n", gt, dt, (long long) n_ff, (long long) n_embd);
         std::exit(1);
+    }
+    if (dt == 42 && n_ff == 640 && n_embd == 2560) {
+        const bool selected = strata::bmg::experts_enabled() && (gt == 16 || gt == 22 || gt == 29);
+        auto* queue = strata::q_of(stream);
+        if (selected && queue->get_backend() == sycl::backend::ext_oneapi_level_zero) {
+            const auto device = queue->get_device();
+            if (strata::intel_gpu_gen(device) == strata::IntelGpuGen::Battlemage) {
+                switch (gt) {
+                    case 16: bmg_dequant_native_q2<16, 8>(queue, gate, up, down, dst_gu, dst_d); break;
+                    case 22: bmg_dequant_native_q2<22, 4>(queue, gate, up, down, dst_gu, dst_d); break;
+                    case 29: bmg_dequant_native_q2<29, 4>(queue, gate, up, down, dst_gu, dst_d); break;
+                }
+                check("bmg_dequant_native_q2");
+                return;
+            }
+        }
     }
     const int64_t per_row = n_embd / 256, gu_wgs = 2 * n_ff * per_row, d_wgs = n_ff * n_embd / 256;
     {
