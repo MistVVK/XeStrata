@@ -16,6 +16,9 @@
 #include "hy4_io.h"
 #include "hy4_manifest.h"
 #include "strata/artifact/strata_reader.hpp"
+#if !HY4_CUDA
+#include "strata/hip_uma_guard.hpp"
+#endif
 #if defined(__aarch64__) && defined(__linux__)
 #include <sys/auxv.h>
 #endif
@@ -46,7 +49,16 @@ inline bool gpu_is_uma() {
 
 inline void gpu_mem_avail(size_t& fr, size_t& tot) {
     HCK(hipMemGetInfo(&fr, &tot));
-#if !defined(_WIN32)
+#if !HY4_CUDA
+    if (gpu_is_uma()) {
+        // First-class UMA / iGPU memory pool query on BOTH Windows (780M gfx1103, 890M gfx1150, Strix Halo gfx1151)
+        // and Linux: accounts for coherent GTT / system RAM so a 512 MB - 4 GB BIOS carveout never falsely OOMs!
+        uint64_t ufr = fr, utot = tot;
+        strata::hip_uma::effective_uma_memory(true, fr, tot, ufr, utot);
+        fr = (size_t)ufr;
+        tot = (size_t)utot;
+    }
+#elif !defined(_WIN32)
     if (gpu_is_uma()) {
         size_t avail = 0;
         if (FILE* f = fopen("/proc/meminfo", "r")) {
@@ -733,6 +745,17 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
     const uint64_t trunk_al = (g.trunk_bytes + 4095) & ~4095ull;
     size_t fr0 = 0, tot0 = 0;
     gpu_mem_avail(fr0, tot0);
+#if !HY4_CUDA
+    // On UMA / iGPU (780M gfx1103, 890M gfx1150, Strix Halo gfx1151) with a small BIOS carveout (512 MB - 4 GB),
+    // automatically allocate trunk & experts via hipHostMallocCoherent | hipHostMallocMapped when carveout VRAM is too small.
+    auto hip_uma_alloc_or_malloc = [](uint8_t** d_out, uint8_t** h_out, uint64_t sz_al, bool force_uma) -> bool {
+        strata::hip_uma::GpuBuffer b;
+        if (strata::hip_uma::alloc_gpu_buffer(b, (size_t)sz_al, gpu_is_uma(), force_uma) != hipSuccess) return false;
+        *d_out = b.dev_ptr;
+        if (h_out) *h_out = b.host_ptr;
+        return true;
+    };
+#endif
     const bool want_host_embed = !uma_mapped && !getenv("HY4_EMBED_VRAM") && (tot0 < (48ull << 30)) && g.man.T.count("model.embed_tokens.weight");
     bool loaded_host_embed = false;
     if (want_host_embed) {
@@ -767,6 +790,23 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
         }
     }
     if (!loaded_host_embed) {
+#if !HY4_CUDA
+        if (gpu_is_uma()) {
+            uint8_t* hp = nullptr;
+            if (!hip_uma_alloc_or_malloc(&g.d_trunk, &hp, trunk_al, uma_mapped)) {
+                fprintf(stderr, "trunk UMA alloc failed (%.2f GB)\n", trunk_al / 1e9);
+                return false;
+            }
+            if (hp) {
+                read_file_parallel(path, h.sections[1].file_offset, g.trunk_bytes, hp, &g.t_load_trunk, "trunk(uma-coherent)");
+            } else {
+                stream_to_device(path, h.sections[1].file_offset, g.trunk_bytes, g.d_trunk, &g.t_load_trunk, "trunk");
+            }
+        } else {
+            HCK(hipMalloc((void**)&g.d_trunk, trunk_al));
+            stream_to_device(path, h.sections[1].file_offset, g.trunk_bytes, g.d_trunk, &g.t_load_trunk, "trunk");
+        }
+#else
         if (uma_mapped) {
             void* hp = nullptr;
             HCK(hipHostMalloc(&hp, trunk_al, hipHostMallocMapped));
@@ -776,6 +816,7 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
             HCK(hipMalloc((void**)&g.d_trunk, trunk_al));
             stream_to_device(path, h.sections[1].file_offset, g.trunk_bytes, g.d_trunk, &g.t_load_trunk, "trunk");
         }
+#endif
     }
     if (!g.rd.read_section(2, g.seed, err)) {
         fprintf(stderr, "sec2: %s\n", err.c_str());
@@ -800,6 +841,31 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
         const uint64_t sec4_al = (g.sec4_bytes + 4095) & ~4095ull;
         bool loaded_full = false;
         if (g.peer_devs.empty() && budget >= (double)sec4_al) {
+#if !HY4_CUDA
+            if (gpu_is_uma()) {
+                uint8_t* hp = nullptr;
+                if (hip_uma_alloc_or_malloc(&g.d_sec4, &hp, sec4_al, uma_mapped)) {
+                    if (hp) {
+                        read_file_parallel(path, h.sections[4].file_offset, g.sec4_bytes, hp, &g.t_load_experts, "experts(uma-coherent)");
+                        g.h_arena = hp;
+                    } else {
+                        stream_to_device(path, h.sections[4].file_offset, g.sec4_bytes, g.d_sec4, &g.t_load_experts, "experts");
+                    }
+                    loaded_full = true;
+                }
+            } else {
+                if (hipMalloc((void**)&g.d_sec4, sec4_al) == hipSuccess) {
+                    stream_to_device(path, h.sections[4].file_offset, g.sec4_bytes, g.d_sec4, &g.t_load_experts, "experts");
+                    loaded_full = true;
+                } else {
+                    (void)hipGetLastError();
+                    fprintf(stderr, "[load] full expert hipMalloc (%.2f GB) failed; falling back to tiered loading\n", sec4_al / 1e9);
+                    size_t fr2 = 0, tot2 = 0;
+                    HCK(hipMemGetInfo(&fr2, &tot2));
+                    budget = (double)fr2 - reserve_gb * 1073741824.0;
+                }
+            }
+#else
             if (uma_mapped) {
                 void* hp = nullptr;
                 if (hipHostMalloc(&hp, sec4_al, hipHostMallocMapped) == hipSuccess) {
@@ -822,6 +888,7 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
                     budget = (double)fr2 - reserve_gb * 1073741824.0;
                 }
             }
+#endif
         }
         if (!loaded_full) {
             // host-resident experts: pinned + read by the GPU (needs the RAM) or computed by the CPU. HY4_CPU_EXPERTS=1/0 forces, default: CPU when they would use > 45% of the RAM or the CPU has AVX-512 VBMI+VNNI

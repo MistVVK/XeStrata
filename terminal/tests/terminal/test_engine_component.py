@@ -280,7 +280,11 @@ class WindowsAmd(unittest.TestCase):
     TESTER_A = [{"vendor": "1002", "device": 0x7550, "name": "AMD Radeon RX 9070 XT", "vram_gb": 16.0}]
     RYZEN_IGPU_AND_CARD = [{"vendor": "1002", "device": 0x164E, "name": "AMD Radeon(TM) Graphics", "vram_gb": 0.5},
                            {"vendor": "1002", "device": 0x744C, "name": "AMD Radeon RX 7900 XTX", "vram_gb": 24.0}]
-    IGPU_ONLY = [{"vendor": "1002", "device": 0x15BF, "name": "AMD Radeon 780M Graphics", "vram_gb": 0.5}]
+    IGPU_ONLY = [{"vendor": "1002", "device": 0x164E, "name": "AMD Radeon(TM) Graphics", "vram_gb": 0.5}]
+    RADEON_780M_ONLY = [{"vendor": "1002", "device": 0x15BF, "name": "AMD Radeon 780M Graphics", "vram_gb": 0.5}]
+    STRIX_POINT_ONLY = [{"vendor": "1002", "device": 0x150E, "name": "AMD Radeon 890M Graphics", "vram_gb": 0.5}]
+    RADEON_780M_AND_CARD = [{"vendor": "1002", "device": 0x15BF, "name": "AMD Radeon 780M Graphics", "vram_gb": 0.5},
+                            {"vendor": "1002", "device": 0x744C, "name": "AMD Radeon RX 7900 XTX", "vram_gb": 24.0}]
 
     def test_a_removed_nvidia_card_left_in_the_registry_does_not_win(self):      # #3892
         old = {"vendor": "10de", "device": 0x2684, "name": "NVIDIA GeForce RTX 4090", "vram_gb": 24.0}
@@ -308,6 +312,13 @@ class WindowsAmd(unittest.TestCase):
         self.assertIsNone(ec._windows_vendor_backend(self.IGPU_ONLY))
         self.assertIsNone(ec._windows_vendor_backend([]))
 
+    def test_first_class_uma_igpus_780m_and_strix_point_are_hip_and_discrete_still_wins(self):
+        self.assertEqual(ec._windows_vendor_backend(self.RADEON_780M_ONLY), "hip")
+        self.assertEqual([c["arch"] for c in ec.windows_amd_cards(self.RADEON_780M_ONLY)], ["gfx1103"])
+        self.assertEqual(ec._windows_vendor_backend(self.STRIX_POINT_ONLY), "hip")
+        self.assertEqual([c["arch"] for c in ec.windows_amd_cards(self.STRIX_POINT_ONLY)], ["gfx1150"])
+        self.assertEqual([c["arch"] for c in ec.windows_amd_cards(self.RADEON_780M_AND_CARD)], ["gfx1100"])
+
     def test_an_unknown_id_with_its_own_memory_is_a_card_without_an_arch(self):
         cards = ec.windows_amd_cards([{"vendor": "1002", "device": 0x9999, "name": "AMD Radeon RX Future", "vram_gb": 20.0}])
         self.assertEqual(cards, [{"arch": "", "name": "AMD Radeon RX Future", "device": 0x9999}])
@@ -331,7 +342,7 @@ class WindowsAmd(unittest.TestCase):
         import setup as strata_setup
         self.assertEqual({k: v for k, v in strata_setup._WIN_AMD_DID.items() if k not in strata_setup.AMD_IGPU_PCI},
                          ec.WIN_AMD_DEVICE_ARCH)
-        self.assertEqual({k: v for k, v in strata_setup.AMD_IGPU_PCI.items() if v == strata_setup.STRIX_HALO_ARCH}, ec.WIN_AMD_UMA_IDS)
+        self.assertEqual({k: v for k, v in strata_setup.AMD_IGPU_PCI.items() if v in ("gfx1151", "gfx1150", "gfx1103")}, ec.WIN_AMD_UMA_IDS)
         for device in strata_setup.AMD_IGPU_PCI:
             if device not in ec.WIN_AMD_UMA_IDS:
                 self.assertIn(device, ec.WIN_AMD_IGPU_IDS)

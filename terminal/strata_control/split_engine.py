@@ -40,7 +40,7 @@ import re
 TESTED = {"nvidia": {"sm_86": (2,), "sm_120": (2,)}, "amd": {"gfx1201": (2, 3, 4)}}
 # the engine package's kernels (one binary per card count with a code object for each AMD architecture): any other card is refused. AMD beyond gfx1201 is EXPERIMENTAL: only an explicit
 # `--split-engine on` starts it there (never auto), and the engine runs its kernel self-test on the card before it loads the model (src/split/src/hip/selftest_policy.hpp)
-BUILT_ARCHS = {"nvidia": ("sm_86", "sm_120"), "amd": ("gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1200", "gfx1201")}
+BUILT_ARCHS = {"nvidia": ("sm_86", "sm_120"), "amd": ("gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1200", "gfx1201")}
 TESTED_CARD_COUNTS = (2,)          # run with the host exchange: 2 cards (boston, 2x RTX A6000; srv118, 2x RTX PRO 6000)
 TESTED_ARCHS = (86, 120)           # compute capability: sm_86 (the 61-task suite, pictures, hashes) and sm_120 (decode, prompts, parallel, hashes,
                                    # pictures; no suite there)

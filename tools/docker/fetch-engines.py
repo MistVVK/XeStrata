@@ -36,6 +36,7 @@ FLAVORS = {
     "rocm-gfx120x": ("hip", "rx9070", "hip"),       # RX 9000, Radeon AI PRO R9700 (gfx1200 / gfx1201)
     "rocm-gfx110x": ("hip", "rx7900", "hip"),       # RX 7000 (gfx1100 / gfx1101 / gfx1102)
     "rocm-gfx1151": ("hip", "halo", "hip"),         # Strix Halo (gfx1151)
+    "rocm-igpu": ("hip", "igpu", "hip"),            # Radeon 780M (gfx1103) & Strix Point 890M/880M (gfx1150)
     "sycl": ("sycl", None, "sycl"),                 # Intel Arc; only when the release has a Linux SYCL package
 }
 PLATFORM = "linux-x86_64"

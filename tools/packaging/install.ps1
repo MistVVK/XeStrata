@@ -106,7 +106,7 @@ if ($arch -ne 'AMD64') { Die "this computer ($arch) is a Windows on ARM PC. Stra
 $platform = 'windows-x86_64'
 $gpu = ''
 # a discrete card is named before a built-in one (a Ryzen's "AMD Radeon(TM) Graphics" is listed first on many PCs); this line is only for the person to read
-try { $cards = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic|Remote' }); $gpu = ($cards | Sort-Object @{ Expression = { if ($_.Name -match 'NVIDIA|GeForce|RTX|GTX|Quadro|Radeon (RX|PRO|AI)|Arc|Instinct') { 0 } else { 1 } } } | Select-Object -First 1 -ExpandProperty Name) } catch { }
+try { $cards = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic|Remote' }); $gpu = ($cards | Sort-Object @{ Expression = { if ($_.Name -match 'NVIDIA|GeForce|RTX|GTX|Quadro|Radeon (RX|PRO|AI)|Arc|Instinct') { 0 } elseif ($_.Name -match '8060S|8050S|8040S|890M|880M|780M') { 1 } else { 2 } } } | Select-Object -First 1 -ExpandProperty Name) } catch { }
 Write-Host 'Strata Terminal installer'
 Write-Host "  This computer: Windows $arch ($platform)$(if ($gpu) { ", graphics: $gpu" })"
 Write-Host "  Release folder: $feed"

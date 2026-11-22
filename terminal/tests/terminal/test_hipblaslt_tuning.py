@@ -145,7 +145,7 @@ class Decision(TempDir):
     def test_the_default_is_the_owners_decision(self):
         """A table changes the bits of the prompt's dense GEMMs (notes-021-hip.md); the owner chose: on by default for Strix Halo only."""
         self.assertFalse(ht.AUTO_USES_TABLE)
-        self.assertEqual(ht.AUTO_ARCHS, ("gfx1151",))
+        self.assertEqual(ht.AUTO_ARCHS, ("gfx1151", "gfx1150", "gfx1103"))
 
     def test_auto_uses_the_table_on_strix_halo_only(self):
         for arch, used in (("gfx1151", True), ("gfx1201", False), ("gfx1100", False)):
