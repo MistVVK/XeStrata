@@ -261,7 +261,7 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
     if (n == 0) return true;
     threads = std::max(1, threads);
     qd = std::max(1, qd);
-    const bool few_pages = n <= 256;  // a decode-step fetch (~50 pages): spread over persistent helper threads (each issues its share and waits), no thread creation per call
+    const bool few_pages = n <= 512;  // a decode/verify fetch (~50..400 pages): spread over persistent helper threads (no thread creation per call)
     if (few_pages) { qd = std::min(qd, 8); threads = std::min(threads, 8); }
     std::atomic<size_t> next{0};
     std::atomic<bool> bad{false};
@@ -376,7 +376,7 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
     int fd = (int)((intptr_t)h_ - 1);
     const bool dontneed = fadv_dontneed_;
     int nt = (int)std::min<size_t>((size_t)std::max(1, threads) * (size_t)std::max(1, qd), n);
-    if (n <= 256) nt = std::min(nt, 16);  // decode-sized fetches: persistent helper threads
+    if (n <= 512) nt = std::min(nt, 16);  // decode/verify-sized fetches: persistent helper threads (avoid spawning 128 pthreads per Tree-8 verify!)
     std::atomic<size_t> next{0};
     std::atomic<bool> bad{false};
     std::mutex emu;
@@ -396,7 +396,7 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
 #endif
         }
     };
-    if (n <= 256) {
+    if (n <= 512) {
         helper_pool().run(nt, std::function<void()>(worker));
     } else {
         std::vector<std::thread> th;

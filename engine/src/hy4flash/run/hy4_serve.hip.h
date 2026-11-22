@@ -153,7 +153,10 @@ inline bool parse_gen(const std::string& line, GenReq& r, std::string& err) {
         double d = atof(val.c_str());
         if (key == "temperature") r.s.temperature = (float)d;
         else if (key == "top_p") r.s.top_p = (float)d;
-        else if (key == "top_k") r.s.top_k = std::max(1, std::min(64, (int)d));
+        else if (key == "top_k") {
+            const int tk = (int)d;
+            r.s.top_k = (tk <= 0 || tk > 64) ? 64 : tk;
+        }
         else if (key == "min_p") r.s.min_p = (float)d;
         else if (key == "penalty_repeat") r.s.rep = (float)d;
         else if (key == "penalty_freq") r.s.freq = (float)d;
