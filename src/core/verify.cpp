@@ -1935,6 +1935,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     VDBG("staged; launching\n");
     const bool le = strata::gpu::graph_launch(res ? exec_res_[T] : win_.segmented() ? segs_[T][0] : exec_[T], cs_);
     if (!le) { err = std::string("verify: launch: ") + strata::gpu::last_error(); return false; }
+    if (!res && !win_.mark_done(cs_, err)) return false;   // wait_ring reads DEVICE_LOST from this event (#78)
     (void) strata::gpu::stream_idle(cs_);
     VDBG("launched\n");
     if (ple_late) {   // while the GPU runs layer 0 up to its experts; layer 1 waits for layer 0's flag
@@ -2384,6 +2385,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         err = std::string("verify: batch launch: ") + strata::gpu::last_error();
         return false;
     }
+    if (!win_.mark_done(cs_, err)) return false;
     (void) strata::gpu::stream_idle(cs_);
     for (int64_t k = 0; k < le_ - lb_; ++k) {
         const int64_t l = lb_ + k;
