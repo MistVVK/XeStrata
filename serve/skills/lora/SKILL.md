@@ -1,6 +1,6 @@
 ---
 name: lora
-description: Choosing LoRAs for generate_image and edit_image - which, how strong, and their block weights.
+description: Choosing LoRAs for generate_image, edit_image and control - which, how strong, and their block weights.
 metadata:
   kind: tool
   tool: lora
