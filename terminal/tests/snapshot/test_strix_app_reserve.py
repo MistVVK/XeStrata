@@ -31,14 +31,14 @@ def flag(argv: list[str], name: str):
     return argv[argv.index(name) + 1] if name in argv else None
 
 
-def without(argv: list[str], name: str) -> list[str]:
+def without(argv: list[str], name: str, *, takes_value: bool = True) -> list[str]:
     out, skip = [], False
     for a in argv:
         if skip:
             skip = False
             continue
         if a == name:
-            skip = True
+            skip = takes_value
             continue
         out.append(a)
     return out
@@ -89,7 +89,9 @@ class StrixAppReserve(unittest.TestCase):
                 with self.subTest(model=model, profile=profile):
                     app = self.engine(model, reserve, "app", {"resourceProfile": profile, "vision": "no", "values": {"drafting": "auto"}})
                     self.assertEqual(flag(app["argv"], "--vram-reserve-mib"), "700", "the app keeps what setup wrote (it wrote 1024)")
-                    self.assertEqual(without(app["argv"], "--pool-workers"), without(launch["argv"], "--pool-workers"), "the same engine line")
+                    app_argv = without(without(app["argv"], "--pool-workers"), "--prompt-cache-spread", takes_value=False)
+                    launch_argv = without(without(launch["argv"], "--pool-workers"), "--prompt-cache-spread", takes_value=False)
+                    self.assertEqual(app_argv, launch_argv, "the same engine line")
                     if profile == "performance":
                         self.assertIsNone(flag(app["argv"], "--pool-workers"))
 

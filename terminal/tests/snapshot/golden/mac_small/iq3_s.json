@@ -149,7 +149,8 @@
      "--max-context",
      "32768",
      "--kv",
-     "int8"
+     "int8",
+     "--prompt-cache-spread"
     ],
     "cwd": "<REPO>",
     "tokenizer": "<ROOT>/data/packs/iq3_s/tokenizer",
@@ -192,7 +193,8 @@
      "--max-context",
      "32768",
      "--kv",
-     "int8"
+     "int8",
+     "--prompt-cache-spread"
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",
@@ -253,7 +255,8 @@
      "--max-context",
      "32768",
      "--kv",
-     "int8"
+     "int8",
+     "--prompt-cache-spread"
     ],
     "cwd": "<REPO>",
     "tokenizer": "<ROOT>/data/packs/iq3_s/tokenizer",
@@ -297,7 +300,8 @@
      "--max-context",
      "32768",
      "--kv",
-     "int8"
+     "int8",
+     "--prompt-cache-spread"
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",

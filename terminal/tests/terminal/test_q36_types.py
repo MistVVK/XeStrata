@@ -99,7 +99,7 @@ class CatalogSets(unittest.TestCase):
     def test_a_type_the_engine_cannot_run_is_refused(self):
         types = table(FIXTURES[-1])
         down = next(n for n in types if n.endswith("ffn_down_exps.weight"))
-        self.assertTrue(q36_types.problems({**types, down: 11}))             # Q3_K is no down type of the expert kernels
+        self.assertTrue(q36_types.problems({**types, down: 1}))              # F16 is no down type of the expert kernels
         norm = next(n for n in types if n.endswith("attn_norm.weight"))
         self.assertTrue(q36_types.problems({**types, norm: 2}))             # a norm the f32 loader cannot widen (Q4_0)
         gate = next(n for n in types if n.endswith("ffn_gate_exps.weight"))
@@ -137,7 +137,7 @@ class Importer(unittest.TestCase):
     def test_an_unsupported_quant_is_refused_with_the_existing_words(self):
         types = self.small_table()
         down = next(n for n in types if n.endswith("ffn_down_exps.weight"))
-        plan = models.plan_import(str(self.put("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", {**types, down: 11})))
+        plan = models.plan_import(str(self.put("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", {**types, down: 1})))
         self.assertIsNone(plan["candidate_selection"])
         self.assertIn("unsupported_or_missing_architecture", plan["issues"])
         self.assertIn(models.UNSUPPORTED_MODEL_TYPE, plan["messages"])

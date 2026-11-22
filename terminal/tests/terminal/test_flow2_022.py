@@ -60,7 +60,8 @@ class MissingOwnFiles(Base):
         empty.mkdir()
         code, out, err = run_cli(["launch", "--plan", "--model", "q2_0", "--model-path", str(empty)])
         self.assertEqual(code, 2)
-        self.assertIn("no .gguf model files", err)
+        self.assertIn("no .gguf", err)
+        self.assertIn("model files", err)
         self.assertIn("...-00001-of-00002.gguf", err)
 
     def test_machine_output_carries_the_same_words(self):

@@ -146,7 +146,7 @@ class EntryPointsSetItForEveryChild(unittest.TestCase):
 # listed here (and, when it starts a Strata program - the engine, the picture reader, sd-cli, setup, a worker - it builds its environment with
 # quiet_crash_env or inherits the one an entry point set).
 STRATA_PROGRAMS = {
-    "serve/server.py": 5,              # the engine, the picture reader (env from child_env / vision_env), the strata-device probe, before_load commands
+    "serve/server.py": 6,              # the engine, the picture reader (env from child_env / vision_env), the strata-device probe, before_load commands, --export-tokenizer (quiet_crash_env)
     "serve/server_parts/engines.py": 2,   # (moved out of serve/server.py unchanged, file split)
     "serve/images.py": 1,              # sd-cli (image_env)
     "serve/lifeline.py": 4,            # the wrapper every child goes through (ps, a watcher); no program of ours of its own
@@ -158,6 +158,7 @@ STRATA_PROGRAMS = {
     "strata_control/tuning.py": 2,     # engine --help and the bare-flag probe of an undocumented flag (#4652), both engine_env
     "strata_control/shape_engine.py": 2,  # engine --version / --geometry (inherit)
     "serve/hy4_kind.py": 1,            # `strata-hy4 --info <model>` before a Hy4-Flash start (what the engine can do: drafter, images); env through quiet_crash_env
+    "serve/inkling_kind.py": 1,        # `strata-inkling --info <model>` before an Inkling-2-Mini start (drafter, images); env through quiet_crash_env
     "strata_control/native_helpers.py": 1,  # an opted-in native helper (strata-<name>, no ggml; inherits)
     "strata_control/local_engine.py": 1,  # the added build's --version check (#5114, quiet_crash_env)
     "strata_control/updater.py": 4,       # --version probes and the AMD test start's strata-device probe (inherit)

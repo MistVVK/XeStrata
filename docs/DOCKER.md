@@ -22,6 +22,7 @@ Docker on a **Mac** has no access to the Mac's graphics chip (no Metal): use the
 | AMD **RX 9000** series and Radeon AI PRO R9700 (RDNA 4, gfx1200 / gfx1201) | `0.2.7-rocm-gfx120x` | the `amdgpu` kernel driver (Linux 6.8+) |
 | AMD **RX 7000** series (RDNA 3, gfx1100 / gfx1101 / gfx1102) | `0.2.7-rocm-gfx110x` | the `amdgpu` kernel driver |
 | AMD **Ryzen AI Max** ("Strix Halo", Radeon 8060S, gfx1151) | `0.2.7-rocm-gfx1151` | the `amdgpu` kernel driver |
+| AMD **Ryzen AI 300 / 7040 / 8040** (Radeon 890M / 880M / 780M, gfx1150 / gfx1103) | `0.2.7-rocm-igpu` | the `amdgpu` kernel driver |
 | Intel **Arc** A-series and B-series (including Arc Pro B70) | `0.2.7-sycl` (if no image exists for a release, [build it](#build-it-yourself)) | the `i915` or `xe` kernel driver; **prepared model files** (see [Intel](#intel-arc)) |
 
 **Measured on:** the 0.2.16 images (engine 0.1.62), pulled with Podman. Size on disk: `cuda13` 1.32 GB, `cuda12` 1.65 GB,

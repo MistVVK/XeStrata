@@ -19,8 +19,8 @@ from __future__ import annotations
 import re
 
 # GGML type numbers (tools/gguf_reader.py GGML_TYPES)
-EXPERT_GATE_UP = frozenset({16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 14, 6, 2, 3, 8, 40, 144, 145, 147, 148, 149})   # STRATA_GU_FMTS (Q6K build)
-EXPERT_DOWN = frozenset({20, 23, 42, 7, 6, 2, 3, 8, 12, 13, 14, 40, 144, 146, 147, 148, 149})                      # STRATA_D_FMTS (Q6K build)
+EXPERT_GATE_UP = frozenset({16, 17, 18, 20, 21, 22, 23, 29, 42, 10, 11, 12, 13, 14, 6, 2, 3, 8, 40, 144, 145, 147, 148, 149})   # STRATA_GU_FMTS (Q6K build)
+EXPERT_DOWN = frozenset({18, 20, 21, 23, 42, 7, 6, 10, 11, 12, 2, 3, 8, 13, 14, 40, 144, 146, 147, 148, 149})                  # STRATA_D_FMTS (Q6K build)
 MATRIX = frozenset({2, 6, 7, 8, 11, 12, 13, 14, 20, 23, 42, 16, 17, 18, 21, 22, 29})                             # native_mmvq_supported
 VECTOR = frozenset({0, 1, 30, 8, 11, 12, 13, 14, 23})                                                                              # upload_f32: F32 F16 BF16 Q8_0, Q3_K-Q6_K, IQ4_XS
 

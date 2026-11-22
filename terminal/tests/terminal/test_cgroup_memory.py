@@ -148,7 +148,7 @@ class Callers(unittest.TestCase):
             self.assertEqual(split_engine.ram_gib(), (POD_LIMIT / GIB, 13.0))
         with mock.patch.object(C, "ram_bytes", lambda: (HOST_KB * 1024, HOST_AVAIL_KB * 1024)):
             self.assertEqual(split_engine.ram_gib(), (HOST_KB / (1 << 20), HOST_AVAIL_KB / (1 << 20)))
-        with mock.patch.object(C, "ram_bytes", lambda: (None, None)):
+        with mock.patch.object(os, "name", "posix"), mock.patch.object(C, "ram_bytes", lambda: (None, None)):
             self.assertEqual(split_engine.ram_gib(), (0.0, 0.0))
 
     @unittest.skipIf(os.name == "nt", "the Linux branch of tune_machine.memory")

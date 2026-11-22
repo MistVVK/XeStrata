@@ -299,18 +299,27 @@ def probe_cards(indexes: list[int] | None = None) -> list[Card]:
 
 
 def _probe_amd_cards_windows(indexes: list[int] | None = None) -> list[Card]:
-    """AMD GPUs on Windows via setup.amd_gpus_win() (strata-device.exe --list-devices when installed, else display adapters)."""
+    """AMD discrete GPUs on Windows via strata_control.engine_component display adapters (no installer import)."""
     try:
-        import setup as _setup
-        found = _setup.amd_gpus_win()
+        from strata_control import engine_component as EC
+        adapters = EC.windows_display_adapters()
     except Exception:                                        # noqa: BLE001 - optional probe
         return []
     cards: list[Card] = []
-    for g in found:
-        if g.get("uma") or g.get("cannot_run"):
+    for adapter in adapters:
+        if adapter.get("vendor") != "1002":
             continue
-        mem = int(round(float(g.get("vram_gb") or 0.0) * 1024))
-        cards.append(Card(int(g.get("index", len(cards))), str(g.get("name") or "AMD GPU"), mem, 0, "amd", str(g.get("arch") or "?")))
+        dev = adapter.get("device")
+        if dev in EC.WIN_AMD_UMA_IDS or dev in EC.WIN_AMD_IGPU_IDS:
+            continue
+        arch = EC.WIN_AMD_DEVICE_ARCH.get(dev) or EC.gfx_from_name(adapter.get("name", ""))
+        if arch in ("gfx1151", "gfx1150", "gfx1103", "gfx1152"):
+            continue
+        vram_gb = float(adapter.get("vram_gb") or 0.0)
+        if not arch and vram_gb < 3.0:
+            continue
+        mem = int(round(vram_gb * 1024))
+        cards.append(Card(len(cards), str(adapter.get("name") or "AMD GPU"), mem, 0, "amd", arch or "?"))
     return _named_or_visible(cards, indexes)
 
 

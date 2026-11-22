@@ -259,7 +259,8 @@
      "--kv",
      "int8",
      "--kv-resident",
-     "32768"
+     "32768",
+     "--prompt-cache-spread"
     ],
     "cwd": "<REPO>",
     "tokenizer": "<ROOT>/data/packs/iq3_s/tokenizer",
@@ -303,7 +304,8 @@
      "--kv",
      "int8",
      "--kv-resident",
-     "32768"
+     "32768",
+     "--prompt-cache-spread"
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",
@@ -367,7 +369,8 @@
      "--kv",
      "int8",
      "--kv-resident",
-     "32768"
+     "32768",
+     "--prompt-cache-spread"
     ],
     "cwd": "<REPO>",
     "tokenizer": "<ROOT>/data/packs/iq3_s/tokenizer",
@@ -412,7 +415,8 @@
      "--kv",
      "int8",
      "--kv-resident",
-     "32768"
+     "32768",
+     "--prompt-cache-spread"
     ],
     "env_set": {
      "GGML_NO_BACKTRACE": "1",

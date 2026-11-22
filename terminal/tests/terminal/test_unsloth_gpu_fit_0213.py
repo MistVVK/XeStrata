@@ -56,7 +56,8 @@ class TheTerminalMenu(unittest.TestCase):
             want = FITS if r.fit_gb <= 63.0 else SLOWER
             self.assertEqual((r.verdict, r.words), (want, "fits" if want == FITS else "may run slower"), (family, model, r.fit_gb))
         if ("hy4-flash", "SQ-64") in rows:
-            self.assertEqual(rows[("hy4-flash", "SQ-64")].words, "may run slower")
+            self.assertEqual(rows[("hy4-flash", "SQ-64")].words, "fits")            # elastic 16K KV keeps SQ-64 near-resident (<= 5 GB cold tail on SSD)
+            self.assertEqual(rows[("hy4-flash", "SQ-96")].words, "may run slower")
         for m in ("UD-IQ1_M", "UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL"):         # the Unsloth sets that were "too big", 39 to 61 GB
             self.assertEqual(rows[("unsloth", m)].words, "fits", m)
         for m in ("UD-IQ4_XS", "UD-IQ4_XS-v31", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"):

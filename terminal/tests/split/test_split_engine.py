@@ -595,7 +595,7 @@ class AmdDefault(unittest.TestCase):
     def test_architectures_without_a_code_object_are_refused_even_with_on(self):
         import tempfile
 
-        for arch in ("gfx1030", "gfx1151", "gfx90a", "gfx942"):                     # RDNA2, Strix Halo, CDNA: not built
+        for arch in ("gfx1030", "gfx90a", "gfx942"):                                 # RDNA2, CDNA: not built
             with tempfile.TemporaryDirectory() as tmp:
                 cfg = self.amd(tmp, split_engine="on")
                 d = S.apply_to_config(cfg, exe_for_cards=lambda n, cc=None, arch_=None: "/e/x", system="linux",

@@ -8579,7 +8579,7 @@ def _ensure_shape_tokenizer(cfg: dict, tpath: Path) -> bool:
             if exe is not None and exe.is_file():
                 raw = tpath.with_name(tpath.name + "-export")
                 raw.mkdir(parents=True, exist_ok=True)
-                env = dict(os.environ)
+                env = quiet_crash_env(dict(os.environ))
                 var = "PATH" if os.name == "nt" else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
                 dirs = [str(exe.resolve().parent)] + [str(d) for d in (resolved.get("lib_dirs") or []) if Path(d).is_dir()]
                 env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))

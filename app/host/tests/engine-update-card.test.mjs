@@ -29,5 +29,6 @@ test('the card is on the Models screen once and nowhere else', () => {
 
 test('an updated engine is reported as an engine, not as "Strata is updated"', () => {
   const host = src('server/native-control.mjs');
-  assert.match(host, /x\.component==='engine'\?'The engine is updated and ready\.'/);
+  assert.match(host, /isEngine=c=>c==='engine'\|\|\(typeof c==='string'&&c\.startsWith\('strata-'\)&&c!=='strata-control'\)/);
+  assert.match(host, /isEngine\(x\.component\)\?'The engine is updated and ready\.'/);
 });

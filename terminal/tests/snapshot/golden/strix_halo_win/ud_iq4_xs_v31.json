@@ -305,7 +305,8 @@
      "--kv",
      "int8",
      "--resident-budget-gib",
-     "48"
+     "48",
+     "--prompt-cache-spread"
     ],
     "cwd": "<REPO>",
     "tokenizer": "<ROOT>/data/packs/ud_iq4_xs_v31/tokenizer",
@@ -343,6 +344,7 @@
      "int8",
      "--resident-budget-gib",
      "48",
+     "--prompt-cache-spread",
      "--draft",
      "dflash2",
      "--draft-model",
@@ -431,7 +433,8 @@
      "--kv",
      "int8",
      "--resident-budget-gib",
-     "48"
+     "48",
+     "--prompt-cache-spread"
     ],
     "cwd": "<REPO>",
     "tokenizer": "<ROOT>/data/packs/ud_iq4_xs_v31/tokenizer",
@@ -470,6 +473,7 @@
      "int8",
      "--resident-budget-gib",
      "48",
+     "--prompt-cache-spread",
      "--draft",
      "dflash2",
      "--draft-model",

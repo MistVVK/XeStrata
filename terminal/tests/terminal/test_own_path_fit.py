@@ -26,8 +26,9 @@ class PerToken(unittest.TestCase):
 
     def test_the_figure_follows_the_engines_allocations(self):
         src = ENGINE.read_text(encoding="utf-8")
-        # the session's fp32 K and V per attention layer and for the MTP block (4 calls at n_head_kv x ctx x head_dim floats)
-        self.assertEqual(len(re.findall(r"ss\.[kv]c\.push_back\(dalloc\(\(size_t\) g\.n_head_kv \* ctx \* g\.head_dim\)\)", src)), 4)
+        # the session's K and V per attention layer and for the MTP block (4 calls at kvn = n_head_kv x ctx x head_dim elements)
+        self.assertIn("const size_t kvn = (size_t) g.n_head_kv * ctx * g.head_dim;", src)
+        self.assertEqual(len(re.findall(r"ss\.[kv]c\.push_back\(kv_alloc\(kvn, \(size_t\) g\.head_dim\)\)", src)), 4)
         # one fp16 copy of K and V at the full context
         self.assertEqual(len(re.findall(r"[kv]16 = dalloc_t<__half>\(\(size_t\) g\.n_head_kv \* ctx \* g\.head_dim\)", src)), 2)
 
