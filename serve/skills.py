@@ -414,7 +414,7 @@ def _contract(ctx: dict, base: str) -> str:
         "- Input images: send the bytes as multipart `image` (`image[]` for several) or as JSON `image` / `images` "
         "with a `data:` or `http(s)` URL. A relative link `/v1/images/files/<name>` is resolved against " + base
         + "; fetch it and send the bytes, or pass a link you already have as a URL. There is no general "
-        "`POST /v1/images/files` upload (unverified): get a link from a `response_format=url` response of "
+        "`POST /v1/images/files` upload (that POST answers 404): get a link from a `response_format=url` response of "
         "`/v1/images/edits`, `/v1/images/upscale`, `/v1/images/segmentations`, `/v1/images/remove-background`, "
         "`/v1/images/controls` or `/v1/videos/files`.",
         "- Result links: a response's `url` is absolute; a chat tool's `/v1/images/files/...` is relative. Copy "
@@ -467,10 +467,16 @@ def externalize(text: str, ctx: dict, base: str) -> str:
         (_VIDEO_SEG, "A job, as upscale_video's: poll `GET /v1/videos/<id>` and use `GET .../content` with "
                      "`?variant=overlay|mask|object_<id>`; do not re-POST. Pick an object by pointing, or fix one "
                      "missed, with the segmentation job's `prompts`."),
-        (_PANEL, "The chat's training panel has no confirmed REST equivalent (unverified)."),
-        (_PANEL_HELP, "The chat's panel steps (unverified over REST):"),
-        (_PANEL_WAIT, "Do not re-POST the same training request; its external status contract is unverified."),
-        (_PANEL_PICK, "A saved version is selected over REST (the registration path is unverified)"),
+        (_PANEL, "The chat's training panel runs on the server's LoRA training API: `POST /v1/lora/jobs` and the "
+                 "actions under `/v1/lora/jobs/<id>`."),
+        (_PANEL_HELP, "The panel's steps, each a REST request (`POST /v1/lora/jobs`: a multipart form with `images` "
+                      "and the fields `name`, `kind`, `trigger`, `model`; `POST .../caption` writes the captions and "
+                      "`PUT .../captions` edits them; `POST .../start` takes `steps` (n) and `save_every` (k)):"),
+        (_PANEL_WAIT, "Do not wait for it and do not re-POST: a second `POST /v1/lora/jobs` makes a second job, and "
+                      "`.../start` refuses a job that is queued or running. Read its `status` and `progress` with "
+                      "`GET /v1/lora/jobs/<id>`."),
+        (_PANEL_PICK, "Pick one and register it with `POST /v1/lora/jobs/<id>/register` (JSON `step` and `name`; "
+                      "without `step` it takes the last version)"),
         (_SETUP, f"this setup ({base})"),
     )
     for pattern, replacement in rules:
