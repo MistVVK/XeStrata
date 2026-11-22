@@ -34,21 +34,44 @@ We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where 
 
 | Provider | Choices |
 | --- | --- |
-| **ISTA-DASLab · recommended** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) for coding. |
-| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
+| **ISTA-DASLab · recommended** | [Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF). [Coder: IQ1\_M](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) ([guide](docs/MODELS.md#coder)) for coding. |
+| **Unsloth** | [UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) |
 | **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Lower memory use but slower. |
-| **Other options** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
+| **Other options** | [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) ([guide](docs/MODELS.md#swift-15)), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
 
-[Compare sizes, memory needs and compatibility](docs/MODELS.md).
+[Compare sizes, memory needs and compatibility](docs/MODELS.md#qwen38-flash-next).
 
 </details>
 
 <details>
 <summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
 
-**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
+**Unsloth:** [UD-Q4\_K\_XL, UD-Q6\_K\_XL, Q8\_0](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF). These are the currently documented packs for this model.
 
 [Model guide and compatibility](docs/QWEN36.md).
+
+</details>
+
+<details>
+<summary><b>Tencent Hy4-Flash</b></summary>
+
+| Provider | Choices |
+| --- | --- |
+| **Strata native (`.strata`)** | [SQ-64, SQ-96, SQ-128](https://huggingface.co/strata-engine/Hy4-Flash-Strata) (with Engram shard on SSD, DFly2 drafter, and vision; base model: [tencent/Hy4-flash](https://huggingface.co/tencent/Hy4-flash)). |
+
+[Compare sizes, memory needs and compatibility](docs/MODELS.md#tencent-hy4-flash).
+
+</details>
+
+<details>
+<summary><b>Inkling-2-Mini</b></summary>
+
+| Provider | Choices |
+| --- | --- |
+| **Strata native (`.strata`)** | [SQ-10, SQ-15, SQ-20](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata) (with built-in DSpark drafter and vision; base model: [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)). |
+| **Unsloth GGUF** | [UD-IQ1\_S through UD-Q8\_K\_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (with companion DSpark drafter and vision). |
+
+[Compare sizes, memory needs and compatibility](docs/MODELS.md#inkling-2-mini).
 
 </details>
 

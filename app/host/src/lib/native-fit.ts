@@ -175,9 +175,15 @@ export function cardRoomGb(cards: readonly Pick<RunCard, 'vram_gb' | 'uma' | 'de
  */
 export function runCards<T extends RunCard>(gpus: T[] | null | undefined, engineVendor?: string | null): T[] {
   const sharesMemory = (g: RunCard) => !!(g.integrated || g.uma || g.unified_gb);
+  const isBigUmaCard = (g: RunCard) => {
+    if (!sharesMemory(g)) return false;
+    const mem = Math.max(Number(g.vram_gb) || 0, Number(g.unified_gb) || 0);
+    if (mem >= 48) return true;
+    return /gfx1151|strix\s*halo|\b80[456]0s\b/i.test(`${g.name ?? ''} ${g.arch ?? ''}`) && (mem === 0 || mem >= 32);
+  };
   const mine = (gpus ?? []).filter(g => g.usable !== false && (!engineVendor || !g.vendor || g.vendor === engineVendor));
   const hasReal = mine.some(g => !sharesMemory(g) && g.vram_gb >= 3.5);
-  return mine.filter(g => !(hasReal && sharesMemory(g)));
+  return mine.filter(g => !(hasReal && sharesMemory(g) && !isBigUmaCard(g)));
 }
 
 export type SsdStreamingMode = 'in_memory' | 'gpu_ssd_only' | 'cpu_ssd_only' | 'hybrid_ssd' | 'unknown';

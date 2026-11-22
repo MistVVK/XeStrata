@@ -15,14 +15,21 @@ test('the first-run screen takes its card from firstRunCard', () => {
 });
 
 const built = await build({ entryPoints: [fileURLToPath(new URL('../src/lib/first-run-card.ts', import.meta.url))], bundle: true, write: false, platform: 'node', format: 'esm' });
-const { firstRunCard, builtIntoProcessor } = await import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].text).toString('base64')}`);
+const { firstRunCard, builtIntoProcessor, isBigUma } = await import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].text).toString('base64')}`);
 
-test('setup\'s order: a discrete card before the processor\'s graphics, then the most memory, then the lower number', () => {
+test('setup\'s order: discrete cards beat small iGPUs (#6015), while Big UMA (8060S / gfx1151) competes on memory (#6619)', () => {
   const igpu = { name: 'AMD Radeon(TM) Graphics', vramGb: 2 }, rx = { name: 'AMD Radeon RX 9070', vramGb: 16 };
   assert.equal(firstRunCard([igpu, rx]), rx, 'the reporter\'s PC (#6015)');
   assert.equal(firstRunCard([rx, igpu]), rx);
-  const halo = { name: 'AMD Radeon(TM) 8060S Graphics', vramGb: 64 }, w = { name: 'AMD Radeon PRO W7600', vramGb: 8 };
-  assert.equal(firstRunCard([halo, w]), w, 'an APU with more (shared) memory than the discrete card still comes after it');
+  const smallApu = { name: 'AMD Radeon 780M Graphics', vramGb: 8 }, w = { name: 'AMD Radeon PRO W7600', vramGb: 8 };
+  assert.equal(firstRunCard([smallApu, w]), w, 'a small APU still comes after a discrete card');
+  const halo = { name: 'AMD Radeon(TM) 8060S Graphics', vramGb: 128, arch: 'gfx1151', uma: true };
+  const r9700 = { name: 'AMD Radeon AI PRO R9700', vramGb: 32, arch: 'gfx1201' };
+  assert.equal(isBigUma(halo), true);
+  assert.equal(isBigUma(igpu), false);
+  assert.equal(firstRunCard([halo, r9700]), halo, '#6619: 128 GB Strix Halo 8060S is not demoted behind 32 GB R9700');
+  assert.equal(firstRunCard([r9700, halo]), halo, '#6619: order-independent Big UMA win');
+  assert.equal(firstRunCard([{ ...r9700, usable: false }, halo]), halo, '#6619: unusable discrete card is skipped');
   assert.equal(firstRunCard([halo]), halo, 'an APU alone is the card');
   assert.equal(firstRunCard([{ name: 'Intel(R) UHD Graphics 770', vramGb: 1 }, { name: 'Intel(R) Arc(TM) A750 Graphics', vramGb: 8 }]).name, 'Intel(R) Arc(TM) A750 Graphics');
   assert.equal(firstRunCard([{ name: 'NVIDIA GeForce RTX 3060', vramGb: 12 }, { name: 'NVIDIA GeForce RTX 4090', vramGb: 24 }]).name, 'NVIDIA GeForce RTX 4090');

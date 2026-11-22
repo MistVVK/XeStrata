@@ -483,9 +483,10 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         return arena + c * 0.195e6 / GB + 0.22 + 30.0 * (512.0 + c) * kv_row_b / GB;
     };
     if (chunk <= 0) {
+        // #6614: on 16 GB discrete cards (tot < 20 GB), default chunk = 2048 saves ~0.8 GB VRAM (~300 hot experts) vs 4096 while keeping fast prefill.
         int c = (multi_gpu && max_ctx >= 98304 && tot < 40.0) ? 2048
               : (tot >= 44.0 ? ((max_ctx >= 8192) ? 8192 : 4096)
-              : (tot >= 15.0 ? 4096 : (tot >= 11.5 ? 2048 : (tot >= 7.0 ? 1024 : 512))));
+              : (tot >= 20.0 ? 4096 : (tot >= 11.5 ? 2048 : (tot >= 7.0 ? 1024 : 512))));
         if (multi_gpu && min_card_gb < 14.0 && c > 4096) c = 4096;
         if (multi_gpu && min_card_gb < 10.0 && c > 2048) c = 2048;
         const double work_cap = (tot >= 15.0) ? 0.22 : (tot >= 7.0 ? 0.16 : 0.14);
@@ -842,9 +843,10 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
             const uint64_t overflow = all_al_bytes - ram_budget_bytes;
             const double static_share = std::min(0.75, (double)overflow / (double)vram_budget);
             dyn_frac = std::max(0.25, 1.0 - static_share);
-        } else if (cpu_mode && N > 0 && vram_budget >= (12ull << 30)) {
-            // Mixed-precision SQ packs (e.g. SQ-64: S6/S8 hot experts 3.7 MB vs avg 2.67 MB) waste ~25-39% VRAM when 100% uniform-slot vcache is used.
-            // Pack the hottest ranks tightly in static VRAM (0% padding) and keep 35% of VRAM as adaptive vcache slabs sized to the largest remaining tier-2 expert!
+        } else if (cpu_mode && N > 0 && vram_budget >= (3ull << 30)) {
+            // #6614: Mixed-precision SQ packs (e.g. SQ-64: S6/S8 hot experts 3.7 MB vs avg 2.67 MB) waste ~25-39% VRAM when 100% uniform-slot vcache is used.
+            // Lowering the threshold from 12 GiB to 3 GiB enables tight static VRAM (65%, 0% padding) + compact adaptive vcache slabs (35%, sized to tier-2 max)
+            // on 16 GB discrete cards like RX 9070 XT (~6-8 GiB expert VRAM), adding ~25% more VRAM-resident experts and eliminating cold-start misses on rank 0..N.
             const double avg_body_sz = (double)all_al_bytes / (double)N;
             if ((double)max_body_sz > 1.20 * avg_body_sz) dyn_frac = 0.35;
         }

@@ -37,6 +37,7 @@ if sys.platform == "win32":
 import argparse
 import datetime
 import getpass
+import hashlib
 import json
 import os
 import platform
@@ -234,6 +235,31 @@ def pctl(values, p):
     return serve_load.pct(values, p)
 
 
+def doc_root() -> Path:
+    """Folder that holds README.md and docs/: ROOT in an installed Terminal or pre-0.2.16 tree, or ROOT.parent in the
+    0.2.16+ repository layout where tools/ lives under terminal/ (#6628)."""
+    if (ROOT / "README.md").is_file() or (ROOT / "docs").is_dir():
+        return ROOT
+    if (ROOT.parent / "README.md").is_file() or (ROOT.parent / "docs").is_dir():
+        return ROOT.parent
+    return ROOT
+
+
+def agent_corpus_info(files: list[tuple[str, str]]) -> dict:
+    """Record which corpus the Quick Agent suite actually sent so --compare never silently equates repo docs with
+    generated filler (#6628)."""
+    rel_names = [rel for rel, _ in files]
+    n_gen = sum(1 for r in rel_names if r.startswith("generated/"))
+    if n_gen == len(rel_names):
+        kind = "generated"
+    elif n_gen == 0:
+        kind = "repo_docs"
+    else:
+        kind = "mixed"
+    digest_hex = hashlib.sha256("\0".join(f"{r}\n{body}" for r, body in files).encode("utf-8")).hexdigest()[:12]
+    return {"corpus": kind, "corpus_files": rel_names, "corpus_sha256": digest_hex}
+
+
 # ---------------------------------------------------------------------------------------------------- the suite
 class Suite:
     def __init__(self, base, key, ctx, runs, think, log=print, want_clients=0, want_long=False, quick=False):
@@ -316,11 +342,12 @@ class Suite:
                                       "reused_tokens": stat(r["reused_tokens"] or 0 for r in good)}
 
     def agent_files(self) -> list[tuple[str, str]]:
-        """Five pieces of text a coding agent would read: this folder's own documents when they exist (nothing personal),
+        """Five pieces of text a coding agent would read: the repo's own documents when they exist (nothing personal),
         else generated filler of the same size."""
+        base = doc_root()
         names = []
         for rel in ("README.md", "docs/HOW_IT_WORKS.md", "docs/DETAILS.md", "docs/INSTALL.md", "docs/MODELS.md", "docs/COMMUNITY_BENCHMARKS.md"):
-            p = ROOT / rel
+            p = base / rel
             if p.is_file():
                 words = p.read_text(encoding="utf-8", errors="replace").split()
                 if len(words) >= AGENT_WORDS // 2:
@@ -331,8 +358,8 @@ class Suite:
             i += 1
         return names[:AGENT_TURNS]
 
-    def agent_session(self, run: int) -> list[dict]:
-        files = self.agent_files()
+    def agent_session(self, run: int, files: list[tuple[str, str]] | None = None) -> list[dict]:
+        files = self.agent_files() if files is None else files
         msgs = [{"role": "system", "content": f"{SYSTEM}\n(session {self.tag(run, 'a')})"},
                 {"role": "user", "content": "I will show you files from a project one at a time. After each file, answer in "
                                             "one or two sentences what it is for. Do not call tools."}]
@@ -356,10 +383,12 @@ class Suite:
             self.out["skipped"]["agent"] = f"context {self.ctx} is below ~10K"
             self.log(f"agent: skipped: context {self.ctx} is below ~10K")
             return
-        self.log(f"agent: a session of {AGENT_TURNS + 1} turns with four tools, x {self.runs} runs")
+        files = self.agent_files()
+        corpus = agent_corpus_info(files)
+        self.log(f"agent: a session of {AGENT_TURNS + 1} turns with four tools, x {self.runs} runs (corpus: {corpus['corpus']})")
         sessions = []
         for run in range(self.runs):
-            turns = self.agent_session(run)
+            turns = self.agent_session(run, files=files)
             sessions.append(turns)
             for d in turns:
                 if d["ok"]:
@@ -375,7 +404,7 @@ class Suite:
             reread.append(sum(max(0, (p["prompt_tokens"] or 0) + (p["generated_tokens"] or 0) - (d["reused_tokens"] or 0))
                               for p, d in zip(s, s[1:])))
             fresh.append(sum(d["read_tokens"] or 0 for d in s[1:]) - reread[-1])
-        self.out["agent"] = {"sessions": sessions, "hit_pct": stat(hit), "reread_tokens": stat(reread), "new_tokens": stat(fresh),
+        self.out["agent"] = {**corpus, "sessions": sessions, "hit_pct": stat(hit), "reread_tokens": stat(reread), "new_tokens": stat(fresh),
                              "turn_ttft_s": stat(d["ttft_s"] for s in follow for d in s),
                              "last_turn_prompt_tokens": stat(s[-1]["prompt_tokens"] for s in follow if s),
                              "turn_decode_tps": stat(d["decode_tps"] for s in follow for d in s),
@@ -951,9 +980,15 @@ def render_readme(res: dict) -> str:
     L += ["", "Ranges are the lowest and highest of the runs; `Runs` counts requests that returned a token."]
     ag = out["agent"]
     if ag and ag.get("sessions"):
+        corpus_line = ""
+        if ag.get("corpus"):
+            cfiles = ", ".join(ag.get("corpus_files") or [])
+            chash = f" ({ag['corpus_sha256']})" if ag.get("corpus_sha256") else ""
+            corpus_line = f"Corpus: `{ag['corpus']}`{chash}" + (f" [{cfiles}]." if cfiles else ".")
         L += ["", "### Agent session (conversation cache)", "",
               f"Cache hit over the follow-up turns: {fmt(ag.get('hit_pct'), 1, ' %')}; earlier-turn tokens read again per session: "
-              f"{fmt(ag.get('reread_tokens'), 0)} (earlier turns that the cache did not hold; the {fmt(ag.get('new_tokens'), 0)} new tokens of the files are read once); first turn (nothing cached) first token: {fmt(ag.get('first_turn_ttft_s'), 2, ' s')}.", "",
+              f"{fmt(ag.get('reread_tokens'), 0)} (earlier turns that the cache did not hold; the {fmt(ag.get('new_tokens'), 0)} new tokens of the files are read once); first turn (nothing cached) first token: {fmt(ag.get('first_turn_ttft_s'), 2, ' s')}."
+              + (f" {corpus_line}" if corpus_line else ""), "",
               "| Turn (run 1) | Prompt tokens | Reused | Read | Prompt tok/s | First token (s) | Decode tok/s |", "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
         for d in ag["sessions"][0]:
             if d["ok"]:
@@ -988,6 +1023,14 @@ def compare_table(old: dict, new: dict) -> str:
     ho, hn = old["machine"], new["machine"]
     notes = [f"  {n}: {ho.get(f)} -> {hn.get(f)}" for n, f in (("GPU", "gpu"), ("engine", "engine_version"), ("model", "model"), ("quant", "quant"),
                                                               ("context", "context")) if ho.get(f) != hn.get(f)]
+    ao, an = (old.get("results") or {}).get("agent") or {}, (new.get("results") or {}).get("agent") or {}
+    if ao and an:
+        co, cn = ao.get("corpus"), an.get("corpus")
+        so, sn = ao.get("corpus_sha256"), an.get("corpus_sha256")
+        if (co or cn) and (co != cn or (so and sn and so != sn)):
+            o_desc = f"{co or 'unrecorded'}" + (f" ({so})" if so else "")
+            n_desc = f"{cn or 'unrecorded'}" + (f" ({sn})" if sn else "")
+            notes.append(f"  agent corpus: {o_desc} -> {n_desc} (agent rows are not directly comparable)")
     return "\n".join(rows + (["", "differences:"] + notes if notes else []))
 
 

@@ -125,7 +125,9 @@ export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine
     // Main / Helper / Off per card (src/lib/gpu-roles.ts, strata_control/gpu_roles.py): the recommendation until the person changes a role; a loaded model shows what it was started with.
     // With Run multiple models, a card another loaded model already uses starts Off for this one (while a free card exists).
     const busy = (i: number) => expert && multiple && usedBy([i]).length > 0, freeCards = roleCards.filter(c => !busy(c.index));
-    const recommended = freeCards.length && freeCards.length < roleCards.length ? { ...recommendRoles(freeCards, engineVendor), roles: { ...Object.fromEntries(roleCards.map(c => [c.index, 'off'])), ...recommendRoles(freeCards, engineVendor).roles } as Roles } : recommendRoles(roleCards, engineVendor);
+    const selectedMemoryGb = selectedSize ? memoryNeeded(selectedSize) || null : null;
+    const recOpts = { modelMemoryGb: selectedMemoryGb };
+    const recommended = freeCards.length && freeCards.length < roleCards.length ? { ...recommendRoles(freeCards, engineVendor, recOpts), roles: { ...Object.fromEntries(roleCards.map(c => [c.index, 'off'])), ...recommendRoles(freeCards, engineVendor, recOpts).roles } as Roles } : recommendRoles(roleCards, engineVendor, recOpts);
     const loadedRoles = loadedSelected && roleCards.length > 1 ? fromLegacy(loadedSelected.gpus, roleCards, 'as_given') : null;
     // #6117: the cards the model was last started with (its run config's gpu_roles) are what a Load keeps while the page asks for the recommendation, so the box shows
     // them: it said "Recommended" and the Load ran on one card. Back to recommended, and a pick equal to the recommendation, are then sent as a choice that replaces them.

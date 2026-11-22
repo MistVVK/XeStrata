@@ -21,6 +21,7 @@ export interface RoleCard {
   usable?: boolean;
   problem?: string | null;
   vendor?: string;
+  arch?: string;
   uma?: boolean;
   integrated?: boolean;
   unified_gb?: number;
@@ -41,6 +42,14 @@ const speed = (c: RoleCard) => (typeof c.speed === 'number' && c.speed > 0 ? c.s
 const shares = (c: RoleCard) => !!(c.integrated || c.uma || c.unified_gb || c.vendor === 'apple');
 const canRun = (c: RoleCard) => c.usable !== false;
 const rnd = (n: number) => Math.round(n);
+
+/** High-memory unified-memory APU (e.g. Strix Halo 8060S / gfx1151 with 64-128 GB UMA): eligible as Main beside a discrete card (#6619). */
+export function isBigUma(c: RoleCard): boolean {
+  if (!shares(c)) return false;
+  const m = Math.max(mem(c), Number(c.unified_gb) || 0);
+  if (m >= 48) return true;
+  return /gfx1151|strix\s*halo|\b80[456]0s\b/i.test(`${c.name ?? ''} ${c.arch ?? ''}`) && m >= 32;
+}
 
 export function shortName(c: RoleCard): string {
   let n = String(c.name || `GPU ${c.index + 1}`);
@@ -69,9 +78,9 @@ function eligible(cs: RoleCard[]): RoleCard[] {
 }
 
 export type MainWhy = 'only' | 'faster' | 'same' | 'memory' | 'none';
+export interface RecommendOpts { modelMemoryGb?: number | null }
 
-export function pickMain(cs: RoleCard[]): { main: RoleCard | null; why: MainWhy } {
-  const pool = eligible(cs);
+function pickMainFromPool(pool: RoleCard[]): { main: RoleCard | null; why: MainWhy } {
   if (!pool.length) return { main: null, why: 'none' };
   if (pool.length === 1) return { main: pool[0], why: 'only' };
   const top = Math.max(...pool.map(speed));
@@ -86,14 +95,37 @@ export function pickMain(cs: RoleCard[]): { main: RoleCard | null; why: MainWhy 
   return { main, why };
 }
 
-export type OffWhy = 'cannot_run' | 'igpu' | 'small' | 'helper';
+export function pickMain(cs: RoleCard[], opts?: RecommendOpts): { main: RoleCard | null; why: MainWhy } {
+  const discretes = cs.filter(c => canRun(c) && !shares(c) && mem(c) >= MIN_CARD_GB);
+  const bigUmas = cs.filter(c => canRun(c) && isBigUma(c));
+  if (discretes.length && bigUmas.length) {
+    const discPick = pickMainFromPool(discretes);
+    const umaMemOf = (c: RoleCard) => Math.max(mem(c), Number(c.unified_gb) || 0);
+    const bestUma = [...bigUmas].sort((a, b) => rnd(umaMemOf(b)) - rnd(umaMemOf(a)) || a.index - b.index)[0];
+    const discMain = discPick.main!;
+    const umaMem = umaMemOf(bestUma);
+    const discMem = mem(discMain);
+    const modelMem = typeof opts?.modelMemoryGb === 'number' && opts.modelMemoryGb > 0 ? opts.modelMemoryGb : null;
+    if (modelMem !== null) {
+      if (modelMem <= discMem) return { main: discMain, why: discretes.length > 1 ? discPick.why : 'faster' };
+      if (umaMem > discMem) return { main: bestUma, why: 'memory' };
+      return discPick;
+    }
+    if (umaMem > discMem) return { main: bestUma, why: 'memory' };
+    return discPick;
+  }
+  return pickMainFromPool(eligible(cs));
+}
+
+export type OffWhy = 'cannot_run' | 'igpu' | 'small' | 'helper' | 'separate';
 export interface Recommendation { roles: Roles; main: number | null; why: MainWhy; reasons: Record<number, MainWhy | OffWhy> }
 
-/** The best card is Main; every other card starts as Helper, EXCEPT a card with 8 GB or less when a bigger card is there (or it has under 4 GB), built-in graphics beside a real card, and a card the engine cannot run: those start Off. */
-export function recommend(cards: RoleCard[] | null | undefined, vendor?: string | null): Recommendation {
+/** The best card is Main; every other card starts as Helper, EXCEPT a card with 8 GB or less when a bigger card is there (or it has under 4 GB), built-in graphics beside a real card, a discrete card beside a Big UMA Main (#6619), and a card the engine cannot run: those start Off. */
+export function recommend(cards: RoleCard[] | null | undefined, vendor?: string | null, opts?: RecommendOpts): Recommendation {
   const cs = rows(cards, vendor);
-  const { main, why } = pickMain(cs);
+  const { main, why } = pickMain(cs, opts);
   const roles: Roles = {}, reasons: Recommendation['reasons'] = {};
+  const mainIsBigUma = !!(main && isBigUma(main));
   // An 8 GB card is a poor Helper beside a bigger card, but a perfectly good one when 8 GB is all there is: two GTX 1080s are a working
   // 16 GB pool (#3655). A card with 8 GB or less starts Off only when a bigger usable card is there, or when it is too small to help.
   const hasBigger = cs.some(c => canRun(c) && !shares(c) && rnd(mem(c)) > OFF_AT_OR_BELOW_GB);
@@ -101,7 +133,8 @@ export function recommend(cards: RoleCard[] | null | undefined, vendor?: string 
     const i = c.index;
     if (main && c === main) { roles[i] = 'main'; reasons[i] = why; }
     else if (!canRun(c)) { roles[i] = 'off'; reasons[i] = 'cannot_run'; }
-    else if (shares(c) && main) { roles[i] = 'off'; reasons[i] = 'igpu'; }
+    else if (shares(c) && main) { roles[i] = 'off'; reasons[i] = isBigUma(c) ? 'separate' : 'igpu'; }
+    else if (mainIsBigUma) { roles[i] = 'off'; reasons[i] = 'separate'; }
     else if (rnd(mem(c)) <= OFF_AT_OR_BELOW_GB && (hasBigger || mem(c) < MIN_CARD_GB)) { roles[i] = 'off'; reasons[i] = 'small'; }
     else { roles[i] = 'helper'; reasons[i] = 'helper'; }
   }
@@ -223,7 +256,7 @@ export function warnings(roles: Roles, cards: RoleCard[], opts: { spillGb?: numb
     const c = cs.get(i), role = roles[i];
     if (!c || role === 'off') continue;
     if (!canRun(c)) out.push({ code: 'cannot_run', card: i, text: `${shortName(c)} cannot run Strata.`, fix: { card: i, role: 'off' } });
-    else if (role === 'main' && shares(c) && cards.some(x => !shares(x) && canRun(x))) {
+    else if (role === 'main' && shares(c) && !isBigUma(c) && cards.some(x => !shares(x) && canRun(x))) {
       const real = cards.filter(x => !shares(x) && canRun(x)).sort((a, b) => speed(b) - speed(a) || mem(b) - mem(a) || a.index - b.index)[0];
       out.push({ code: 'igpu_main', card: i, text: `${shortName(c)} is built-in graphics; it is slow as Main.`, fix: { card: real.index, role: 'main' } });
     }
@@ -252,8 +285,8 @@ export function noteText(code: string | null, cards: RoleCard[]): string {
 }
 
 /** The one plain line above the cards. */
-export function sentence(cards: RoleCard[] | null | undefined, vendor?: string | null): string {
-  const cs = rows(cards, vendor), rec = recommend(cards, vendor);
+export function sentence(cards: RoleCard[] | null | undefined, vendor?: string | null, opts?: RecommendOpts): string {
+  const cs = rows(cards, vendor), rec = recommend(cards, vendor, opts);
   if (rec.main === null) return 'No graphics card that Strata can use was found.';
   const byi = new Map(cs.map(c => [c.index, c]));
   const m = byi.get(rec.main)!;
@@ -271,7 +304,7 @@ export function sentence(cards: RoleCard[] | null | undefined, vendor?: string |
   }
   for (const i of byNumber(rec.roles)) if (rec.roles[i] === 'off') {
     const code = rec.reasons[i], c = byi.get(i)!;
-    s += ` ${shortName(c)} starts Off: ${code === 'cannot_run' ? 'Strata cannot run it.' : code === 'igpu' ? 'built-in graphics.' : `${OFF_AT_OR_BELOW_GB} GB or less.`}`;
+    s += ` ${shortName(c)} starts Off: ${code === 'cannot_run' ? 'Strata cannot run it.' : code === 'igpu' ? 'built-in graphics.' : code === 'separate' ? 'not paired with unified memory.' : `${OFF_AT_OR_BELOW_GB} GB or less.`}`;
   }
   return s;
 }

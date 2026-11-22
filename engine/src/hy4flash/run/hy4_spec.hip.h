@@ -75,8 +75,18 @@ public:
         for (int b = 0; b < 6; ++b) { cn[b] = 2.0; cy[b] = 2.0 * MID[b]; }
         HCK(hipHostMalloc((void**)&h_arg, 64, hipHostMallocDefault));
         if (cfg.exact) {
+#if !HY4_CUDA && HY4_MMA
+            // #6614: On RDNA4 (gfx1200/gfx1201), forcing GEMV up to M=16 kicks DFly2 M=5..8 verify windows off Wave32 WMMA onto scalar GEMV!
+            // Keep M=5..8 on Wave32 WMMA unless --spec-check or HY4_SPEC_FORCE_GEMV=1 explicitly requests GEMV invariance.
+            const bool force_gemv = cfg.check || (getenv("HY4_SPEC_FORCE_GEMV") && atoi(getenv("HY4_SPEC_FORCE_GEMV")) != 0);
+            if (!skd::is_gfx12_device() || force_gemv) {
+                skd::moe_dec_max_m() = 16;
+                skd::lin_gemv_max_m() = 16;
+            }
+#else
             skd::moe_dec_max_m() = 16;
             skd::lin_gemv_max_m() = 16;
+#endif
         }
         if (cfg.K > DFLY_KMAX) cfg.K = DFLY_KMAX;
         if (cfg.K < 1) cfg.K = 1;
@@ -106,9 +116,10 @@ public:
                                        : ((tp > 0 ? tp : 30.0) * dm_scale(m));
         if (tv[m] <= 0) return est;
         const long age = S.spec_iters - tv_step[m];
-        if (age > 12 && tv[m] > est * 1.15) {
+        const long stale_age = r.hyb ? 6 : 12;
+        if (age > stale_age && tv[m] > est * 1.15) {
             // Smoothly decay stale cold measurement toward fresh estimate so choose_m re-probes m
-            const double w = std::min(0.85, (double)(age - 12) / 24.0);
+            const double w = std::min(0.85, (double)(age - stale_age) / (r.hyb ? 12.0 : 24.0));
             return tv[m] * (1.0 - w) + est * w;
         }
         return tv[m];
@@ -203,10 +214,13 @@ public:
 
     void note_iter(double ms, int ntok, bool is_spec) {
         if (!cfg.adaptive || cfg.cut >= 0 || !is_spec) return;
+        // #6614: on hybrid GPU+CPU setups, ignore early cold-vcache warmup steps so one spike never locks DFly2 into plain mode for 256+ tokens.
+        if (r.hyb && S.spec_iters < 4) return;
         win.push_back({ms, ntok});
         while (win.size() > 8) win.pop_front();
         const int n = (int)win.size();
-        if (n < 3 || tp <= 0) return;
+        const int min_n = r.hyb ? 4 : 3;
+        if (n < min_n || tp <= 0) return;
         double sm = 0, st = 0;
         for (auto& w : win) { sm += w.ms; st += w.tok; }
         const double ratio = sm / st;  // ms per token
@@ -215,7 +229,7 @@ public:
             ++S.backoffs;
             plain_left = P;
             S.P_final = P;
-            P = std::min(P * 2, 256);
+            P = std::min(P * 2, r.hyb ? 64 : 256);
             win.clear();
             probing = false;
         } else if (n >= 8 && ratio < 0.9 * tp) {

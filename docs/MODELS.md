@@ -1,11 +1,13 @@
 ﻿# Which model? Sizes, versions and what fits
 
 This page helps you choose a model and check that your computer can run it. It covers
-Qwen3.8-Flash-Next (and its variants) and Qwen3.6-35B-A3B. For installing, see [INSTALL.md](INSTALL.md).
+Qwen3.8-Flash-Next (and its variants), Qwen3.6-35B-A3B, Tencent Hy4-Flash, and Inkling-2-Mini. For installing, see [INSTALL.md](INSTALL.md).
 
 > **On this page:** [Quick start](#quick-start) · [Pick by memory](#pick-by-memory) ·
 > [Qwen3.8-Flash-Next](#qwen38-flash-next) ·
-> [Qwen3.6-35B-A3B](#qwen36-35b-a3b) · [Adding or switching models](#adding-or-switching-models) ·
+> [Qwen3.6-35B-A3B](#qwen36-35b-a3b) ·
+> [Tencent Hy4-Flash](#tencent-hy4-flash) ·
+> [Inkling-2-Mini](#inkling-2-mini) · [Adding or switching models](#adding-or-switching-models) ·
 > [History](#history--older-measurements)
 
 ## Quick start
@@ -45,7 +47,8 @@ They are estimates; a given context may still not fit.
 - **Less memory, coding only:** [Coder](#coder) runs around 32 GB of RAM with a suitable GPU.
 - **Less memory, general use:** compare Unsloth, then [Gyro](#gyro-s-and-gyro-m-agentionai), which uses the least memory and is slower.
 - **More memory:** [Unsloth's 4 to 8 bit files](#unsloths-files-ud-iq4_xs-to-q8_0) need 72 to 136 GB for all experts in RAM.
-- **A smaller model:** [Qwen3.6-35B-A3B](#qwen36-35b-a3b), 32 to 52 GB of RAM.
+- **A smaller model:** [Qwen3.6-35B-A3B](#qwen36-35b-a3b) (32 to 52 GB of RAM) or [Inkling-2-Mini](#inkling-2-mini) (8 to 24 GB GPU / 16 to 32 GB RAM).
+- **Large native MoE:** [Tencent Hy4-Flash](#tencent-hy4-flash) (64 to 128 GB of RAM or unified memory, plus Engram shard on SSD).
 
 If RAM is short, setup can read experts from the SSD instead ([below](#will-it-fit)). That works and is much slower.
 
@@ -53,7 +56,7 @@ If RAM is short, setup can read experts from the SSD instead ([below](#will-it-f
 
 ## Qwen3.8-Flash-Next
 
-Four ISTA-DASLab sizes are the original model; the versions below are variants or other providers' packs of it.
+Four [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) sizes are the original model; the versions below are variants or other providers' packs of it.
 Every version in setup's menu reads pictures. [Picture rules](#pictures).
 
 ### Will it fit?
@@ -130,7 +133,7 @@ strata launch --family swift --model IQ2_XS
 
 ### Unsloth's files: UD-IQ4_XS to Q8_0
 
-`--family unsloth` is Unsloth's 4 to 8 bit quantizations of the same model. They keep the experts at more bits than
+`--family unsloth` is [Unsloth's 4 to 8 bit quantizations](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) of the same model. They keep the experts at more bits than
 the sizes above, so they need more RAM. Setup keeps every expert in RAM when they fit with 16 GB to spare. With less RAM
 it keeps as many as fit and reads the rest from the SSD (much slower), and for the bigger files it asks first.
 
@@ -154,7 +157,7 @@ strata launch --family unsloth --model UD-Q5_K_XL
 
 ### Gyro-S and Gyro-M (agentionai)
 
-`--family gyro` is agentionai's Gyro quantization: trellis-coded experts in a rotated basis. They are the smallest
+`--family gyro` is [agentionai's Gyro quantization](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF): trellis-coded experts in a rotated basis. They are the smallest
 options and never setup's default. The download includes the 28 GB n-gram table. The memory figure is VRAM and RAM together.
 
 | Size | Download | Memory (VRAM + RAM) | In plain words |
@@ -235,6 +238,50 @@ Pictures, parallel requests, full measurements and limits: [QWEN36.md](QWEN36.md
 
 ```sh
 strata launch --family qwen36 --model UD-Q4_K_XL
+```
+
+## Tencent Hy4-Flash
+
+[Tencent Hy4-Flash](https://huggingface.co/tencent/Hy4-flash) runs on its dedicated Strata shape engine (`strata-hy4`) using
+[Strata's native `.strata` quantizations](https://huggingface.co/strata-engine/Hy4-Flash-Strata). It includes the built-in DFly2
+drafter, reads pictures (`Hy4-Flash-Vision.strata`, 0.93 GB), and streams its 67.6 GB Engram lookup shard (`Hy4-Flash-Engram-Q8.strata`)
+directly from the SSD.
+
+| Build | Model file | Engram shard (SSD) | Planning memory | In plain words |
+| --- | ---: | ---: | ---: | --- |
+| **SQ-64** | 62.0 GB | 67.6 GB | 64 GB RAM + 8+ GB GPU | flagship size; also supports 4-tier SSD cold-expert streaming on smaller RAM |
+| **SQ-96** | 89.6 GB | 67.6 GB | 96 GB RAM or 128 GB unified | higher precision, closer to the full model |
+| **SQ-128** | 113.7 GB | 67.6 GB | 128 GB RAM or 128 GB unified | highest precision native build |
+
+```sh
+strata launch --family hy4-flash --model SQ-64
+```
+
+## Inkling-2-Mini
+
+[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) from Thinking Machines runs on its dedicated Strata shape
+engine (`strata-inkling`). Both [Strata's native `.strata` v1.1 builds](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata)
+and [Unsloth's Dynamic GGUFs](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) are supported, with built-in DSpark speculative
+drafting and picture reading (`Inkling-2-Mini-Vision.strata`, 0.64 GB).
+
+**Strata native `.strata` builds**
+
+| Build | File size | Typical hardware | In plain words |
+| --- | ---: | --- | --- |
+| **SQ-10** | 10.5 GB | 12 GB GPU, 16 GB Mac, or 4–8 GB hybrid | compact high-speed build |
+| **SQ-15** | 14.3 GB | 16 GB GPU, 24 GB Mac, or 12 GB hybrid | flagship quality |
+| **SQ-20** | 19.3 GB | 24 GB GPU or 32+ GB unified | near-lossless native SF4+MX8 build |
+
+**Unsloth Dynamic GGUF builds** ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), plus 0.40 GB companion DSpark drafter)
+
+| Range | File sizes | Typical hardware |
+| --- | ---: | --- |
+| **UD-IQ1\_S / UD-IQ1\_M / UD-IQ2\_XXS / UD-Q2\_K\_XL** | 7.8 – 9.1 GB | 4–12 GB GPUs and 16 GB RAM |
+| **UD-IQ3\_XXS / UD-Q3\_K\_XL / UD-IQ4\_XS / UD-Q4\_K\_M / UD-Q4\_K\_XL** | 11.7 – 17.6 GB | 8–24 GB GPUs or hybrid RAM |
+| **UD-Q8\_K\_XL** | 22.9 GB | 24+ GB GPUs or 32+ GB RAM |
+
+```sh
+strata launch --family inkling-2-mini --model SQ-15
 ```
 
 ## Adding or switching models
