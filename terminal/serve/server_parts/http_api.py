@@ -618,6 +618,20 @@ MODEL_CARD_SAMPLING = {
 
 # The card's penalties: a greedy request must not get them (see model_card_sampling)
 CARD_PENALTIES = ("presence_penalty", "frequency_penalty", "repetition_penalty")
+SAMPLING_PARAM_KEYS = (
+    "temperature", "top_p", "top_k", "min_p",
+    "presence_penalty", "frequency_penalty", "repetition_penalty",
+)
+
+
+def request_asks_sampling(*layers) -> bool:
+    """True when any layer explicitly specifies any sampling or penalty parameter."""
+    for layer in layers:
+        if isinstance(layer, dict):
+            for k in SAMPLING_PARAM_KEYS:
+                if layer.get(k) is not None:
+                    return True
+    return False
 
 
 def model_card_sampling(arch, thinking, greedy=False) -> dict:

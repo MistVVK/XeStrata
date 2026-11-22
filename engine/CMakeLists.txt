@@ -412,6 +412,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(q36_expert_info_test tests/program/q36_expert_info_test.cpp)
   target_include_directories(q36_expert_info_test PRIVATE include)
   add_test(NAME q36_expert_info_test COMMAND q36_expert_info_test)
+  # #6522 / #6425: qwen35moe per-layer head_count_kv array, feed_forward_length=0, and hybrid staging headroom (no GPU)
+  add_executable(q36_metadata_test src/qwen35/q36_metadata_test.cpp)
+  target_link_libraries(q36_metadata_test PRIVATE strata_artifact)
+  add_test(NAME q36_metadata_test COMMAND q36_metadata_test)
 
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
