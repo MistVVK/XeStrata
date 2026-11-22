@@ -6,7 +6,9 @@
 # differ from HEAD (changed or new, not deleted).  Run from the repository root.  Exits 1 when any lint reports.
 # The tools come from apt, except ruff, lychee and stylelint, which are in .lint/ (see AGENTS.md, Lints).
 # XESTRATA_LINT_BUILD names the build folder whose compile_commands.json clang-tidy reads (default build/free;
-# configure it with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON).
+# configure it with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON).  src/kernels/xe/sdpa_cudnn.cpp is only compiled in a
+# contrib build that finds cudnn.h: tools/lint/cudnn-headers.sh puts the headers under $HOME and prints the
+# STRATA_CUDNN_ROOT to configure that build with, so the source is checked here instead of being skipped.
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 C=tools/lint
