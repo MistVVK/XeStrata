@@ -485,7 +485,7 @@ struct WmmaKernel {
             const bool live = r < row_hi && tq < a.rows;
             for (int k = 0; k < DT; ++k)
                 for (int e = 0; e < w::KN; ++e) {
-                    const int64_t off = tq * a.q_ld + h * D + k * 16 + hi * w::KOFF + e;
+                    const int64_t off = tq * a.q_ld + h * D + (int64_t) (k * 16) + (int64_t) (hi * w::KOFF) + e;
                     const float v = !live ? 0.0f : q32 ? a.q32[off] * a.scale
                                                        : (float) sycl::bit_cast<sycl::half>(a.q[off]);
                     const _Float16 vh = (_Float16) v;
@@ -515,7 +515,7 @@ struct WmmaKernel {
                 const int64_t c = c0 + j;
                 h8 k8(0), v8(0);
                 if (c < keys) kv8(c, kvh, dd, k8, v8);
-                *reinterpret_cast<h8*>(K + j * KS + dd) = k8;
+                *reinterpret_cast<h8*>(K + (ptrdiff_t) (j * KS) + dd) = k8;
                 for (int e = 0; e < 8; ++e) Vt[(dd + e) * VS + j] = v8[e];
             }
             // every wave on, also one without rows (all masked): the sub-group barrier below waits for the whole
@@ -527,7 +527,7 @@ struct WmmaKernel {
                 acc.v = w::fv8{0, 0, 0, 0, 0, 0, 0, 0};
                 for (int k = 0; k < DT; ++k) {
                     w::Bc<sycl::half> b;
-                    b.v = frag_at(K + (ct * 16 + lo) * KS + k * 16 + hi * w::KOFF);
+                    b.v = frag_at(K + (ptrdiff_t) ((ct * 16 + lo) * KS) + (ptrdiff_t) (k * 16) + (ptrdiff_t) (hi * w::KOFF));
                     w::A<sycl::half> qa, qb;
                     qa.v = qh[k];
                     w::mad(sg, acc, qa, b, acc);
@@ -542,7 +542,7 @@ struct WmmaKernel {
             for (int e = 0; e < 8; ++e) {   // row row_of(hi, e): its 16 lanes hold its BK columns
                 float mx = m[e];
                 for (int ct = 0; ct < CT; ++ct) {
-                    const int64_t c = c0 + ct * 16 + lo;
+                    const int64_t c = c0 + (int64_t) (ct * 16) + lo;
                     sc[ct][e] = c < lim[e] && c >= from[e] ? sc[ct][e] * sscale : NEG;
                     mx = sycl::fmax(mx, sc[ct][e]);
                 }
@@ -565,8 +565,8 @@ struct WmmaKernel {
                     w::A<sycl::half> pa;
                     w::Bc<sycl::half> b;
                     w::C acc;
-                    pa.v = frag_at(P + lo * PS + k0 + hi * w::KOFF);
-                    b.v = frag_at(Vt + (k * 16 + lo) * VS + k0 + hi * w::KOFF);
+                    pa.v = frag_at(P + (ptrdiff_t) (lo * PS) + k0 + (ptrdiff_t) (hi * w::KOFF));
+                    b.v = frag_at(Vt + (ptrdiff_t) ((k * 16 + lo) * VS) + k0 + (ptrdiff_t) (hi * w::KOFF));
                     acc.v = o[k];
                     w::mad(sg, acc, pa, b, acc);
                     o[k] = acc.v;
@@ -585,7 +585,7 @@ struct WmmaKernel {
                 const int64_t r = my0 + w::row_of(hi, e), tq = r / G;
                 if (r >= row_hi || tq < a.first || tq >= a.row_end) continue;
                 const float x = o[k][e] / l[e];
-                const int64_t to = (tq - a.first) * a.out_ld + (kvh * G + r % G) * D + k * 16 + lo;
+                const int64_t to = (tq - a.first) * a.out_ld + (kvh * G + r % G) * D + (int64_t) (k * 16) + lo;
                 if constexpr (F32) static_cast<float*>(a.out)[to] = x;
                 else static_cast<sycl::half*>(a.out)[to] = sycl::half(x);
             }

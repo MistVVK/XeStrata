@@ -2413,19 +2413,19 @@ struct IqWmmaKernel {
                     const float d = xs[(row0 + row) * (K / 32) + (k0 + cc) / 32];
                     for (int j = 0; j < 8; ++j) h[j] = sycl::half(d * (float) q[j]);
                 }
-                *reinterpret_cast<sycl::vec<sycl::half, 8>*>(al + rr * LD + cc) = h;
+                *reinterpret_cast<sycl::vec<sycl::half, 8>*>(al + (ptrdiff_t) (rr * LD) + cc) = h;
             }
             const int piece = (int) (k0 % 256);
             for (int t = lid; t < WN * (KC / 8); t += WG) {   // neighbouring work-items: the same 8 values of neighbouring rows
                 const int rr = t % WN, tt = t / WN;
-                dq_one<TYPE>(w + (size_t) (wn0 + rr) * row_bytes, k0 / 256, ToNK{bl + rr * LD, piece}, piece / 8 + tt);
+                dq_one<TYPE>(w + (size_t) (wn0 + rr) * row_bytes, k0 / 256, ToNK{bl + (ptrdiff_t) (rr * LD), piece}, piece / 8 + tt);
             }
             sycl::group_barrier(it.get_group());
             for (int kk = 0; kk < KC; kk += T16) {
                 xe::wmma::A<sycl::half> a[SGM];
                 xe::wmma::Bc<sycl::half> b[SGN];
-                for (int i = 0; i < SGM; ++i) xe::wmma::load(sg, a[i], al + (ms + i * T16) * LD + kk, LD);
-                for (int j = 0; j < SGN; ++j) xe::wmma::load(sg, b[j], bl + (ns + j * T16) * LD + kk, LD);
+                for (int i = 0; i < SGM; ++i) xe::wmma::load(sg, a[i], al + (ptrdiff_t) ((ms + i * T16) * LD) + kk, LD);
+                for (int j = 0; j < SGN; ++j) xe::wmma::load(sg, b[j], bl + (ptrdiff_t) ((ns + j * T16) * LD) + kk, LD);
                 for (int i = 0; i < SGM; ++i)
                     for (int j = 0; j < SGN; ++j) xe::wmma::mad(sg, c[i][j], a[i], b[j], c[i][j]);
             }
