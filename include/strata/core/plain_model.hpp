@@ -369,7 +369,9 @@ public:
     /// The bytes save_state would take for `tokens` tokens
     size_t state_bytes(int64_t tokens) const;
     const float* inkling_tap_dev() const;
-    bool propose_dspark(int32_t anchor, int64_t pos, int count, std::vector<int32_t>& tokens, std::string& err) const;
+    // Check a DSpark block against the target. Only matched rows enter the target state.
+    bool dspark_step(int32_t anchor, int64_t pos, int count, const std::vector<int32_t>& eos,
+                     int32_t* out, float* logits, int& emitted, int& accepted, std::string& err);
 
     /// Tokens [0, T) at positions pos .. pos + T - 1 (T <= max_t): out[t] is the greedy token after token t, and with
     /// `logits` the T rows of n_vocab logits.  Positions must follow the previous window's.

@@ -24,6 +24,8 @@ public:
     PlainDspark();
     ~PlainDspark();
     bool load(const std::string& path, const GgufModel& target, std::string& err);
+    bool enable_gpu(std::string& err);
+    bool place_attention(int64_t context, std::string& err);
     void reset();
     void commit(const float* features);
     bool propose(int32_t anchor, int64_t pos, int count, const Embedding& embedding, const Head& head,

@@ -42,6 +42,16 @@ void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     sync_if_needed(stream, event);
 }
 
+void f32_split_f16(const float* x, uint16_t* hi, uint16_t* lo, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+        const uint16_t h = f16_gpu::f16_from_f32(x[i]);
+        hi[i] = h;
+        lo[i] = f16_gpu::f16_from_f32((x[i] - (float) sycl::bit_cast<sycl::half>(h)) * 1024.0f);
+    });
+    sync_if_needed(stream, event);
+}
+
 void add_inplace(float* dst, const float* src, int64_t n, void* stream, float a) {
     if (n <= 0) return;
     // a src is exact for a = 1, so the residual's plain sum keeps its bits

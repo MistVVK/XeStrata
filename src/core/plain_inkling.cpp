@@ -5,6 +5,9 @@
 
 #include "plain_dspark.hpp"
 #include "plain_inkling_gpu.hpp"
+#include "strata/platform/env.hpp"
+#include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_tier.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -41,18 +44,17 @@ void rms_norm_no_gamma(const float* x, float* y, int64_t n, float eps) {
     for (int64_t i = 0; i < n; ++i) y[i] = x[i] * scale;
 }
 
-/// `cur` is [channels][n]; the row's L2 norm is capped at `threshold` after `scale` (llama.cpp's graph::clip).
-void l2_clip(const float* scale, float threshold, float* cur, int64_t channels, int64_t n) {
-    // a GGUF [channels][n] tensor is stored with `channels` fastest: scale[head*channels + channel]
-    for (int64_t c = 0; c < channels; ++c)
-        for (int64_t t = 0; t < n; ++t)
-            if (scale != nullptr) cur[c * n + t] *= scale[t * channels + c];
-    for (int64_t t = 0; t < n; ++t) {
+/// Cap the L2 norm of each contiguous head after applying its learned scale.
+void l2_clip(const float* scale, float threshold, float* cur, int64_t width, int64_t heads) {
+    for (int64_t h = 0; h < heads; ++h) {
+        float* row = cur + h * width;
         double ss = 0;
-        for (int64_t c = 0; c < channels; ++c) ss += (double) cur[c * n + t] * cur[c * n + t];
-        const float norm = std::sqrt((float) ss) + 1e-6f;
-        const float factor = std::min(1.0f, threshold / norm);
-        for (int64_t c = 0; c < channels; ++c) cur[c * n + t] *= factor;
+        for (int64_t d = 0; d < width; ++d) {
+            if (scale) row[d] *= scale[h * width + d];
+            ss += (double) row[d] * row[d];
+        }
+        const float factor = std::min(1.0f, threshold / (std::sqrt((float) ss) + 1e-6f));
+        for (int64_t d = 0; d < width; ++d) row[d] *= factor;
     }
 }
 
@@ -120,12 +122,14 @@ struct PlainInkling::Impl {
     std::unique_ptr<InklingProducts> products;
     std::vector<float> draft_features;
     bool taps_valid = false;
+    std::vector<double> heat;
 
     bool embedding(int32_t tok, float* x) const {
         return emb_row && kc::native_row_to_float(emb_type, emb_data + (size_t) tok * emb_row, x, N);
     }
 
     bool project_head(const float* x, float* logits, int64_t rows) const {
+        if (products && products->has_head()) return products->project_head(x, logits, rows);
         if (!head_row) return false;
         std::vector<float> w((size_t) N);
         for (int64_t i = 0; i < rows; ++i) {
@@ -238,6 +242,48 @@ struct PlainInkling::Impl {
         for (auto& t : ts) t.join();
     }
 
+    // matvec over several inputs in one pass of the weights; every output keeps matvec's accumulation order
+    template <int R>
+    static void dot_rows(const float* w, const float* xt, float* const* y, int64_t n_in, int64_t r0, int64_t r1) {
+        for (int64_t o = r0; o < r1; ++o) {
+            const float* row = w + (size_t) o * n_in;
+            double ss[R] = {};
+            for (int64_t i = 0; i < n_in; ++i) {
+                const double wi = row[i];
+                const float* xi = xt + (size_t) i * R;
+                for (int r = 0; r < R; ++r) ss[r] += wi * xi[r];
+            }
+            for (int r = 0; r < R; ++r) y[r][o] = (float) ss[r];
+        }
+    }
+
+    void matvec_rows(const std::vector<float>& w, const std::vector<const float*>& x, const std::vector<float*>& y,
+                     int64_t n_in, int64_t n_out, int threads) {
+        using Dot = void (*)(const float*, const float*, float* const*, int64_t, int64_t, int64_t);
+        static constexpr Dot dots[] = {nullptr, nullptr, dot_rows<2>, dot_rows<3>, dot_rows<4>,
+                                       dot_rows<5>, dot_rows<6>, dot_rows<7>, dot_rows<8>};
+        std::vector<float> xt;
+        for (size_t at = 0; at < x.size();) {
+            const int R = (int) std::min<size_t>(8, x.size() - at);
+            if (R == 1) { matvec(w, x[at], y[at], n_in, n_out, threads); ++at; continue; }
+            xt.resize((size_t) n_in * R);
+            for (int64_t i = 0; i < n_in; ++i)
+                for (int r = 0; r < R; ++r) xt[(size_t) i * R + r] = x[at + (size_t) r][i];
+            float* const* yr = y.data() + at;
+            const auto span = [&](int64_t r0, int64_t r1) { dots[R](w.data(), xt.data(), yr, n_in, r0, r1); };
+            if (threads <= 1 || n_out < 128) {
+                span(0, n_out);
+            } else {
+                std::vector<std::thread> ts;
+                const int64_t chunk = (n_out + threads - 1) / threads;
+                for (int64_t r = 0; r < n_out; r += chunk)
+                    ts.emplace_back([&, r, chunk] { span(r, std::min(n_out, r + chunk)); });
+                for (auto& t : ts) t.join();
+            }
+            at += (size_t) R;
+        }
+    }
+
     void mat(const std::string& name, const float* x, float* y, int64_t n_in, int64_t n_out, int threads,
              std::string& err) {
         const auto& w = matrix(name, err);
@@ -245,9 +291,18 @@ struct PlainInkling::Impl {
         matvec(w, x, y, n_in, n_out, threads);
     }
 
+    struct RoutedInput {
+        const float* input;
+        const int64_t* ids;
+        const float* weights;
+        float* output;
+    };
+    void grouped_moe(const Layer& layer, const std::vector<RoutedInput>& rows);
+
     void reset_state();
     bool load(const GgufModel& model, const ModelSpec& spec, std::string& err);
-    bool token(int32_t tok, int64_t pos, int threads, std::string& err);
+    bool window(const int32_t* tokens, int count, int64_t pos0, int threads, float* logits, std::string& err,
+                const std::function<int()>& keep = {});
 };
 
 bool PlainInkling::Impl::load(const GgufModel& model, const ModelSpec& spec, std::string& err) {
@@ -406,6 +461,7 @@ bool PlainInkling::Impl::load(const GgufModel& model, const ModelSpec& spec, std
         }
     }
 
+    heat.assign((size_t) (s.n_layer * NE), 0);
     slots.resize((size_t) NSLOT);
     reset_state();
     return true;
@@ -413,7 +469,9 @@ bool PlainInkling::Impl::load(const GgufModel& model, const ModelSpec& spec, std
 
 void PlainInkling::Impl::reset_state() {
     const int64_t channels = 2 * NKV * HD + 2 * N;
-    for (auto& sl : slots) {
+    for (size_t i = 0; i < slots.size(); ++i) {
+        auto& sl = slots[i];
+        if (products) products->invalidate_kv(i);
         sl.k.assign((size_t) s.relative_extent * NKV * HD, 0.0f);
         sl.v.assign((size_t) s.relative_extent * NKV * HD, 0.0f);
         sl.pos.assign((size_t) s.relative_extent, -1);
@@ -428,43 +486,128 @@ void PlainInkling::reset() {
     if (p_->dspark) p_->dspark->reset();
 }
 
-bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::string& err) {
-    if (tok < 0 || tok >= (int32_t) s.vocab_padded) {
-        err = "inkling2: token out of range";
-        return false;
+void PlainInkling::Impl::grouped_moe(const Layer& layer, const std::vector<RoutedInput>& rows) {
+    std::vector<InklingProducts::RoutedRow> pairs;
+    for (int32_t t = 0; t < (int32_t) rows.size(); ++t)
+        for (int32_t j = 0; j < NK; ++j)
+            pairs.push_back({rows[(size_t) t].ids[j], t, j});
+    InklingProducts::group_routes(pairs);
+    std::vector<float> contributions(pairs.size() * (size_t) N);
+    for (size_t first = 0; first < pairs.size();) {
+        std::vector<int64_t> ids;
+        std::vector<int32_t> counts;
+        size_t end = first;
+        while (end < pairs.size() && ids.size() < (size_t) NK) {
+            const int64_t id = pairs[end].expert;
+            const size_t start = end;
+            while (end < pairs.size() && pairs[end].expert == id) ++end;
+            ids.push_back(id);
+            counts.push_back((int32_t) (end - start));
+        }
+        const size_t n = end - first;
+        std::vector<float> input(n * (size_t) N), gu(n * (size_t) (2 * FF)), hidden(n * (size_t) FF);
+        std::vector<float> down(n * (size_t) N);
+        for (size_t i = 0; i < n; ++i)
+            std::copy_n(rows[(size_t) pairs[first + i].row].input, N, input.data() + i * (size_t) N);
+        const int groups = (int) ids.size();
+        products->grouped_rows(layer.gu.type, layer.gu.data, (size_t) layer.gu.rows * layer.gu.row_bytes,
+                               ids.data(), groups, input.data(), N, 2 * FF, gu.data(), counts.data());
+        for (size_t i = 0; i < n; ++i) {
+            const int64_t id = pairs[first + i].expert;
+            const float scale = layer.gu.scale ? layer.gu.scale[id] : 1.0f;
+            const float* g = gu.data() + i * (size_t) (2 * FF);
+            for (int64_t j = 0; j < FF; ++j)
+                hidden[i * (size_t) FF + j] = situ(g[j] * scale, g[FF + j] * scale, (float) s.situ_beta,
+                                                    (float) s.situ_linear_beta);
+        }
+        products->grouped_rows(layer.down.type, layer.down.data, (size_t) layer.down.rows * layer.down.row_bytes,
+                               ids.data(), groups, hidden.data(), FF, N, down.data(), counts.data());
+        for (size_t i = 0; i < n; ++i) {
+            const auto& pair = pairs[first + i];
+            const size_t dst = ((size_t) pair.row * (size_t) NK + (size_t) pair.rank) * (size_t) N;
+            const float scale = layer.down.scale ? layer.down.scale[pair.expert] : 1.0f;
+            for (int64_t j = 0; j < N; ++j) contributions[dst + j] = down[i * (size_t) N + j] * scale;
+        }
+        first = end;
+    }
+    // Keep the sum in top-k order, independent of the expert packing order.
+    for (size_t t = 0; t < rows.size(); ++t) {
+        std::fill_n(rows[t].output, N, 0.0f);
+        for (int64_t k = 0; k < NK; ++k)
+            for (int64_t j = 0; j < N; ++j)
+                rows[t].output[j] += rows[t].weights[k] * contributions[(t * (size_t) NK + k) * (size_t) N + j];
+    }
+}
+
+bool PlainInkling::Impl::window(const int32_t* tokens, int count, int64_t pos0, int threads,
+                                float* logits, std::string& err, const std::function<int()>& keep) {
+    for (int t = 0; t < count; ++t) {
+        if (tokens[t] < 0 || tokens[t] >= s.vocab_padded) {
+            err = "inkling2: token out of range";
+            return false;
+        }
     }
     const int64_t nrel = s.relative_length;
     const int64_t extent = s.relative_extent;
     const int64_t channels = 2 * NKV * HD + 2 * N;
     const float inv_sqrt_hd = 1.0f / std::sqrt((float) HD);
     const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
-    std::vector<float> x(N), hn(N), q(NH * HD), k(NKV * HD), v(NKV * HD), r(NH * nrel), att(NH * HD);
-    std::vector<float> in0(N), in1(N), in2(N), normed(N), mixed(N), tmp(N), out(N);
-    std::vector<float> hv(FF), gate_tmp(NH * HD), rowbuf((size_t) std::max(N, FF)), msg[4];
-    for (auto& m : msg) m.resize(N);
-    std::vector<std::vector<float>> blocks;
-
-    // embedding: the raw token's row is not normalized (an encoded image's row would be)
-    if (!embedding(tok, x.data())) {
-        err = "inkling2: cannot dequantize the token embedding";
-        return false;
+    std::vector<float> x(N), hn(N), mixed(N), tmp(N), out(N);
+    std::vector<float> hv(FF), rowbuf((size_t) std::max(N, FF));
+    struct Backup {
+        int64_t cells = 0;
+        std::vector<int32_t> positions;
+        std::vector<float> k, v, conv;
+    };
+    const size_t kv_width = (size_t) (NKV * HD);
+    const size_t conv_width = (size_t) ((NCONV - 1) * channels);
+    std::vector<Backup> backups(keep ? slots.size() : 0);
+    const auto restore = [&](int kept) {
+        if (!keep) return;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            auto& slot = slots[i];
+            const auto& old = backups[i];
+            if (old.positions.empty()) continue;
+            slot.cells = std::min(old.cells + kept, extent);
+            std::copy_n(old.conv.data() + (size_t) kept * conv_width, conv_width, slot.conv.data());
+            for (int t = kept; t < count; ++t) {
+                const size_t cell = (size_t) ((pos0 + t) % extent);
+                slot.pos[cell] = old.positions[(size_t) t];
+                std::copy_n(old.k.data() + (size_t) t * kv_width, kv_width, slot.k.data() + cell * kv_width);
+                std::copy_n(old.v.data() + (size_t) t * kv_width, kv_width, slot.v.data() + cell * kv_width);
+            }
+            if (products && kept < count)
+                products->refresh_kv(i, slot.k.data(), slot.v.data(), slot.pos.data(), (pos0 + kept) % extent,
+                                     count - kept, extent, kv_width);
+        }
+    };
+    struct Rollback {
+        const decltype(restore)& fn;
+        bool armed;
+        ~Rollback() { if (armed) fn(0); }
+    } rollback{restore, (bool) keep};
+    struct Row {
+        std::vector<float> cur, prelude, bank_out, features, expert_in, expert_out, weights;
+        std::vector<int64_t> ids;
+        std::vector<std::vector<float>> blocks, prelude_blocks, bank;
+    };
+    std::vector<Row> rows((size_t) count);
+    for (int t = 0; t < count; ++t) {
+        auto& row = rows[(size_t) t];
+        if (!embedding(tokens[t], x.data())) {
+            err = "inkling2: cannot dequantize the token embedding";
+            return false;
+        }
+        row.cur.resize((size_t) N);
+        rms_norm(x.data(), tok_norm.data(), row.cur.data(), N, eps);
+        row.features.resize(draft_features.size());
+        row.expert_out.resize((size_t) N);
     }
-    rms_norm(x.data(), tok_norm.data(), hn.data(), N, eps);
-
-    // tau of llama.cpp's build_inputs: 1 + alpha*log(max(1, (pos+1)/floor))
-    const double ratio = std::max(1.0, (double) (pos + 1) / (double) s.log_scale_floor);
-    const float tau = (float) (1.0 + s.log_scale_alpha * std::log(ratio));
 
     // ---- the helpers of one layer ----
     auto dense_of = [&](const std::string& name) -> const float* {
         auto it = dense.find(name);
         return it == dense.end() ? nullptr : it->second.data();
-    };
-    auto multiply = [&](const std::string& name, const float* in, float* o, int64_t n_in, int64_t n_out) {
-        std::string e;
-        const auto& w = matrix(name, e);
-        if (!e.empty()) { err = e; return; }
-        matvec(w, in, o, n_in, n_out, threads);
     };
 
     // causal short convolution with a residual; `dynamic` adds per-head input-dependent taps (full-attention K/V)
@@ -480,7 +623,7 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
             for (int64_t lag = 0; lag < NCONV; ++lag) {
                 const float* src = lag == NCONV - 1 ? cur
                     : sl.conv.data() + (size_t) (NCONV - 2 - lag) * channels + (size_t) offset;
-                acc += (double) wt[(size_t) lag * n_ch + c] * src[c];
+                acc += (double) wt[(size_t) c * NCONV + lag] * src[c];
             }
             o[c] = (cur[c] + (float) acc) * scale;
         }
@@ -490,7 +633,7 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
                 for (int64_t lag = 0; lag < NCONV; ++lag) {
                     const float* src = lag == NCONV - 1 ? cur
                         : sl.conv.data() + (size_t) (NCONV - 2 - lag) * channels + (size_t) offset;
-                    const float tap = dyn[(size_t) lag * n_heads + hd];
+                    const float tap = dyn[(size_t) hd * NCONV + (NCONV - 1 - lag)];
                     for (int64_t d = 0; d < per_head; ++d) {
                         const int64_t c = hd * per_head + d;
                         o[c] += src[c] * tap * scale;
@@ -544,248 +687,355 @@ bool PlainInkling::Impl::token(int32_t tok, int64_t pos, int threads, std::strin
 
     // The draft taps the layer inputs in visit order, not the slots used for recurrent state.
     int visit = 0;
-    const auto tap = [&](int id, const float* row) {
-        if (!dspark && !products) return;
+    const auto tap = [&](Row& row, int id, const float* values) {
+        if (row.features.empty()) return;
         for (size_t j = 0; j < PlainDspark::taps.size(); ++j)
-            if (PlainDspark::taps[j] == id) std::copy_n(row, N, draft_features.data() + j * N);
+            if (PlainDspark::taps[j] == id) std::copy_n(values, N, row.features.data() + j * N);
     };
-    auto layer = [&](int64_t ip, int64_t slot_id, float* cur_in, std::vector<std::vector<float>>& bl,
-                     const float* messages, const Loop* loop, bool messages_present) {
+    // A layer's projections take every row of the window in one pass over the weights; each row keeps its own
+    // accumulation order, so a row's numbers do not depend on how many rows share the window.  The short
+    // convolutions, the KV append and the attention still go one row at a time, in row order.
+    auto multiply_rows = [&](const std::string& name, const std::vector<const float*>& in, const std::vector<float*>& o,
+                             int64_t n_in, int64_t n_out) {
+        std::string e;
+        const auto& w = matrix(name, e);
+        if (!e.empty()) { err = e; return; }
+        matvec_rows(w, in, o, n_in, n_out, threads);
+    };
+    struct Prep {
+        std::vector<float> inpSA, mx, in0, in1, in2, q, k, v, r, kdyn, vdyn, sink, gate, att, o, normed, route;
+        const float* inputs[3] = {nullptr, nullptr, nullptr};
+    };
+    std::vector<Prep> preps((size_t) count);
+    auto prepare = [&](int64_t ip, int64_t slot_id, const std::vector<std::vector<float>>& messages, const Loop* loop,
+                       Backup* old) {
         if (!err.empty()) return;
-        tap(visit++, cur_in);
+        const bool messages_present = loop != nullptr;
         Layer& L = layers[(size_t) ip];
         Slot& sl = slots[(size_t) slot_id];
-        std::vector<float> inpSA(cur_in, cur_in + N);
-        const float* inputs[3] = {cur_in, cur_in, cur_in};
-        std::vector<float> mx;
-        if (dense_of(L.resq) != nullptr) {
-            // one learned query on a sliding-window layer, three on a full-attention layer (one per Q/K/V input)
-            mx.resize(3 * N);
-            const float* rq = dense_of(L.resq);
-            mix(bl, cur_in, rq, mx.data());
-            if (L.swa) {
-                inputs[0] = inputs[1] = inputs[2] = mx.data();
-            } else {
-                mix(bl, cur_in, rq + N, mx.data() + N);
-                mix(bl, cur_in, rq + 2 * N, mx.data() + 2 * N);
-                in0.assign(mx.begin(), mx.begin() + N);
-                in1.assign(mx.begin() + N, mx.begin() + 2 * N);
-                in2.assign(mx.begin() + 2 * N, mx.begin() + 3 * N);
-                inputs[0] = in0.data(); inputs[1] = in1.data(); inputs[2] = in2.data();
+        const auto& relbias = matrix(L.relbias, err);
+        if (!err.empty()) return;
+        std::vector<const float*> in_rows[3];
+        for (int t = 0; t < count && err.empty(); ++t) {
+            auto& row = rows[(size_t) t];
+            auto& P = preps[(size_t) t];
+            const float* msg = messages_present ? messages[(size_t) t].data() : nullptr;
+            float* cur_in = row.cur.data();
+            auto& bl = row.blocks;
+            tap(row, visit, cur_in);
+            P.inpSA.assign(cur_in, cur_in + N);
+            P.inputs[0] = P.inputs[1] = P.inputs[2] = cur_in;
+            if (dense_of(L.resq) != nullptr) {
+                // one learned query on a sliding-window layer, three on a full-attention layer (one per Q/K/V input)
+                P.mx.resize(3 * N);
+                const float* rq = dense_of(L.resq);
+                mix(bl, cur_in, rq, P.mx.data());
+                if (L.swa) {
+                    P.inputs[0] = P.inputs[1] = P.inputs[2] = P.mx.data();
+                } else {
+                    mix(bl, cur_in, rq + N, P.mx.data() + N);
+                    mix(bl, cur_in, rq + 2 * N, P.mx.data() + 2 * N);
+                    P.in0.assign(P.mx.begin(), P.mx.begin() + N);
+                    P.in1.assign(P.mx.begin() + N, P.mx.begin() + 2 * N);
+                    P.in2.assign(P.mx.begin() + 2 * N, P.mx.begin() + 3 * N);
+                    P.inputs[0] = P.in0.data(); P.inputs[1] = P.in1.data(); P.inputs[2] = P.in2.data();
+                }
             }
-        }
-        if (messages_present && loop != nullptr) {
-            for (int j = 0; j < 3; ++j) {
-                std::vector<float> ctr(N);
-                control(inputs[j], messages + (size_t) j * N, *loop, j, ctr.data());
-                if (j == 0) in0 = std::move(ctr); else if (j == 1) in1 = std::move(ctr); else in2 = std::move(ctr);
-                inputs[j] = j == 0 ? in0.data() : (j == 1 ? in1.data() : in2.data());
-            }
-        }
-        if (L.swa) {
             if (messages_present) {
                 for (int j = 0; j < 3; ++j) {
-                    std::vector<float> nz(N);
-                    rms_norm(inputs[j], dense_of(L.attn_norm), nz.data(), N, eps);
-                    if (j == 0) in0 = std::move(nz); else if (j == 1) in1 = std::move(nz); else in2 = std::move(nz);
-                    inputs[j] = j == 0 ? in0.data() : (j == 1 ? in1.data() : in2.data());
+                    std::vector<float> ctr(N);
+                    control(P.inputs[j], msg + (size_t) j * N, *loop, j, ctr.data());
+                    if (j == 0) P.in0 = std::move(ctr); else if (j == 1) P.in1 = std::move(ctr); else P.in2 = std::move(ctr);
+                    P.inputs[j] = j == 0 ? P.in0.data() : (j == 1 ? P.in1.data() : P.in2.data());
+                }
+            }
+            if (L.swa) {
+                if (messages_present) {
+                    for (int j = 0; j < 3; ++j) {
+                        std::vector<float> nz(N);
+                        rms_norm(P.inputs[j], dense_of(L.attn_norm), nz.data(), N, eps);
+                        if (j == 0) P.in0 = std::move(nz); else if (j == 1) P.in1 = std::move(nz); else P.in2 = std::move(nz);
+                        P.inputs[j] = j == 0 ? P.in0.data() : (j == 1 ? P.in1.data() : P.in2.data());
+                    }
+                } else {
+                    P.in0.resize(N);
+                    rms_norm(P.inputs[0], dense_of(L.attn_norm), P.in0.data(), N, eps);
+                    P.inputs[0] = P.inputs[1] = P.inputs[2] = P.in0.data();
                 }
             } else {
-                rms_norm(inputs[0], dense_of(L.attn_norm), in0.data(), N, eps);
-                inputs[0] = inputs[1] = inputs[2] = in0.data();
+                std::vector<float> n0(N), n1(N), n2(N);
+                rms_norm(P.inputs[0], dense_of(L.qin), n0.data(), N, eps);
+                rms_norm(P.inputs[1], dense_of(L.kin), n1.data(), N, eps);
+                rms_norm(P.inputs[2], dense_of(L.vin), n2.data(), N, eps);
+                P.in0 = std::move(n0); P.in1 = std::move(n1); P.in2 = std::move(n2);
+                P.inputs[0] = P.in0.data(); P.inputs[1] = P.in1.data(); P.inputs[2] = P.in2.data();
             }
-        } else {
-            rms_norm(inputs[0], dense_of(L.qin), in0.data(), N, eps);
-            rms_norm(inputs[1], dense_of(L.kin), in1.data(), N, eps);
-            rms_norm(inputs[2], dense_of(L.vin), in2.data(), N, eps);
-            inputs[0] = in0.data(); inputs[1] = in1.data(); inputs[2] = in2.data();
+            for (int j = 0; j < 3; ++j) in_rows[j].push_back(P.inputs[j]);
+            P.q.resize(NH * HD); P.k.resize(NKV * HD); P.v.resize(NKV * HD); P.r.resize(NH * nrel);
+            P.sink.resize(NH); P.gate.resize(NH * HD); P.att.resize(NH * HD); P.o.resize(N);
+            P.normed.resize(N); P.route.resize(NE);
+            if (!L.swa) { P.kdyn.resize(NCONV * NKV); P.vdyn.resize(NCONV * NKV); }
         }
         if (!err.empty()) return;
-
-        multiply(L.q, inputs[0], q.data(), N, NH * HD);
-        multiply(L.k, inputs[1], k.data(), N, NKV * HD);
-        multiply(L.v, inputs[2], v.data(), N, NKV * HD);
-        multiply(L.rel, inputs[0], r.data(), N, NH * nrel);
-        std::vector<float> kdyn((size_t) NCONV * NKV), vdyn((size_t) NCONV * NKV);
+        const auto outs = [&](std::vector<float> Prep::*field) {
+            std::vector<float*> o;
+            for (auto& P : preps) o.push_back((P.*field).data());
+            return o;
+        };
+        multiply_rows(L.q, in_rows[0], outs(&Prep::q), N, NH * HD);
+        multiply_rows(L.k, in_rows[1], outs(&Prep::k), N, NKV * HD);
+        multiply_rows(L.v, in_rows[2], outs(&Prep::v), N, NKV * HD);
+        multiply_rows(L.rel, in_rows[0], outs(&Prep::r), N, NH * nrel);
         if (!L.swa) {
-            multiply(L.kproj, inputs[1], kdyn.data(), N, NCONV * NKV);
-            multiply(L.vproj, inputs[2], vdyn.data(), N, NCONV * NKV);
+            multiply_rows(L.kproj, in_rows[1], outs(&Prep::kdyn), N, NCONV * NKV);
+            multiply_rows(L.vproj, in_rows[2], outs(&Prep::vdyn), N, NCONV * NKV);
         }
-        convolve(k.data(), NKV * HD, L.kconv, L.swa ? nullptr : kdyn.data(), sl, 0, tmp.data());
-        k.assign(tmp.begin(), tmp.begin() + NKV * HD);
-        convolve(v.data(), NKV * HD, L.vconv, L.swa ? nullptr : vdyn.data(), sl, NKV * HD, tmp.data());
-        v.assign(tmp.begin(), tmp.begin() + NKV * HD);
-        l2_clip(dense_of(L.qclip), (float) s.qk_clip, q.data(), HD, NH);
-        l2_clip(nullptr, (float) s.qk_clip, k.data(), HD, NKV);
-        for (int64_t h = 0; h < NKV; ++h) rms_norm_no_gamma(v.data() + h * HD, v.data() + h * HD, HD, eps);
-        l2_clip(dense_of(L.relclip), (float) s.relative_clip, r.data(), nrel, NH);
-        if (!L.swa) {
-            for (auto& z : q) z *= tau;
-            for (auto& z : r) z *= tau;
-        }
+        multiply_rows(L.sink, in_rows[0], outs(&Prep::sink), N, NH);
+        multiply_rows(L.gate, in_rows[0], outs(&Prep::gate), N, NH * HD);
         if (!err.empty()) return;
 
-        // append this token's K and V to the slot's cache
-        const int64_t cell = sl.cells < extent ? sl.cells++ : extent - 1;
-        sl.pos[(size_t) cell] = pos;
-        for (int64_t h = 0; h < NKV; ++h) {
-            std::memcpy(sl.k.data() + ((size_t) cell * NKV + h) * HD, k.data() + h * HD, HD * sizeof(float));
-            std::memcpy(sl.v.data() + ((size_t) cell * NKV + h) * HD, v.data() + h * HD, HD * sizeof(float));
-        }
+        for (int t = 0; t < count && err.empty(); ++t) {
+            auto& P = preps[(size_t) t];
+            const int64_t pos = pos0 + t;
+            const auto ratio = std::max(1.0, (double) (pos + 1) / (double) s.log_scale_floor);
+            const float tau = (float) (1.0 + s.log_scale_alpha * std::log(ratio));
+            auto& q = P.q;
+            auto& k = P.k;
+            auto& v = P.v;
+            auto& r = P.r;
+            float* att = P.att.data();
+            convolve(k.data(), NKV * HD, L.kconv, L.swa ? nullptr : P.kdyn.data(), sl, 0, tmp.data());
+            k.assign(tmp.begin(), tmp.begin() + NKV * HD);
+            convolve(v.data(), NKV * HD, L.vconv, L.swa ? nullptr : P.vdyn.data(), sl, NKV * HD, tmp.data());
+            v.assign(tmp.begin(), tmp.begin() + NKV * HD);
+            l2_clip(dense_of(L.qclip), (float) s.qk_clip, q.data(), HD, NH);
+            l2_clip(nullptr, (float) s.qk_clip, k.data(), HD, NKV);
+            for (int64_t h = 0; h < NKV; ++h) rms_norm_no_gamma(v.data() + h * HD, v.data() + h * HD, HD, eps);
+            l2_clip(dense_of(L.relclip), (float) s.relative_clip, r.data(), nrel, NH);
+            if (!L.swa) {
+                for (auto& z : q) z *= tau;
+                for (auto& z : r) z *= tau;
+            }
+            if (!err.empty()) return;
 
-        const auto& relbias = matrix(L.relbias, err);
-        std::vector<float> sink(NH);
-        multiply(L.sink, inputs[0], sink.data(), N, NH);
-        if (!err.empty()) return;
-        if (products) {
-            products->attention(q.data(), sl.k.data(), sl.v.data(), r.data(), relbias.data(), sink.data(), sl.pos.data(),
-                                pos, cell, NH, NKV, HD, nrel, extent, L.swa ? s.swa_window : 0, att.data());
-        } else {
-            for (int64_t h = 0; h < NH; ++h) {
-                const int64_t hkv = h / (NH / NKV);
-                std::vector<float> scores((size_t) cell + 1), p((size_t) cell + 1);
-                for (int64_t c = 0; c < cell; ++c) {
-                    const int64_t dist = pos - sl.pos[(size_t) c];
-                    if (dist < 0 || dist >= extent || (L.swa && dist >= s.swa_window)) { scores[(size_t) c] = -1e30f; continue; }
-                    double ss = 0;
+            // append this token's K and V to the slot's cache
+            const int64_t cell = pos % extent;
+            const int64_t cells = sl.cells = std::min(sl.cells + 1, extent);
+            sl.pos[(size_t) cell] = pos;
+            for (int64_t h = 0; h < NKV; ++h) {
+                std::memcpy(sl.k.data() + ((size_t) cell * NKV + h) * HD, k.data() + h * HD, HD * sizeof(float));
+                std::memcpy(sl.v.data() + ((size_t) cell * NKV + h) * HD, v.data() + h * HD, HD * sizeof(float));
+            }
+            const float* sink = P.sink.data();
+            if (products) {
+                products->attention(q.data(), sl.k.data(), sl.v.data(), r.data(), relbias.data(), sink, sl.pos.data(),
+                                    pos, cells, NH, NKV, HD, nrel, extent, L.swa ? s.swa_window : 0, att, (size_t) slot_id);
+            } else {
+                for (int64_t h = 0; h < NH; ++h) {
+                    const int64_t hkv = h / (NH / NKV);
+                    std::vector<float> scores((size_t) cells + 1);
+                    for (int64_t c = 0; c < cells; ++c) {
+                        const int64_t dist = pos - sl.pos[(size_t) c];
+                        if (dist < 0 || dist >= extent || (L.swa && dist >= s.swa_window)) { scores[(size_t) c] = -1e30f; continue; }
+                        double ss = 0;
+                        for (int64_t d = 0; d < HD; ++d)
+                            ss += (double) q[h * HD + d] * sl.k.data()[((size_t) c * NKV + hkv) * HD + d];
+                        double bias = -(double) sink[h];
+                        for (int64_t d = 0; d < nrel; ++d)
+                            bias += (double) r[h * nrel + d] * relbias[(size_t) dist * nrel + d];
+                        scores[(size_t) c] = (float) (ss * inv_sqrt_hd + bias);
+                    }
+                    scores[(size_t) cells] = 0.0f;   // the zero sink
+                    const float mx = *std::max_element(scores.begin(), scores.end());
+                    double sum = 0;
+                    for (auto& z : scores) { z = std::exp(z - mx); sum += z; }
                     for (int64_t d = 0; d < HD; ++d)
-                        ss += (double) q[h * HD + d] * sl.k.data()[((size_t) c * NKV + hkv) * HD + d];
-                    double bias = -(double) sink[h];
-                    for (int64_t d = 0; d < nrel; ++d)
-                        bias += (double) r[h * nrel + d] * relbias[(size_t) dist * nrel + d];
-                    scores[(size_t) c] = (float) (ss * inv_sqrt_hd + bias);
+                        att[h * HD + d] = 0.0f;
+                    for (int64_t c = 0; c < cells; ++c) {
+                        const float pw = scores[(size_t) c] / sum;
+                        const float* vc = sl.v.data() + ((size_t) c * NKV + hkv) * HD;
+                        for (int64_t d = 0; d < HD; ++d) att[h * HD + d] += pw * vc[d];
+                    }
                 }
-                scores[(size_t) cell] = 0.0f;   // the zero sink
-                const float mx = *std::max_element(scores.begin(), scores.end());
-                double sum = 0;
-                for (auto& z : scores) { z = std::exp(z - mx); sum += z; }
-                double acc = 0;
-                for (int64_t c = 0; c < cell; ++c) acc += (double) (scores[(size_t) c] / sum);
-                for (int64_t d = 0; d < HD; ++d)
-                    att[h * HD + d] = 0.0f;
-                for (int64_t c = 0; c < cell; ++c) {
-                    if (scores[(size_t) c] < 0) continue;
-                    const float pw = scores[(size_t) c] / sum;
-                    const float* vc = sl.v.data() + ((size_t) c * NKV + hkv) * HD;
-                    for (int64_t d = 0; d < HD; ++d) att[h * HD + d] += pw * vc[d];
-                }
-                (void) acc;
             }
-        }
-
-        multiply(L.gate, inputs[0], gate_tmp.data(), N, NH * HD);
-        for (int64_t i = 0; i < NH * HD; ++i) att[i] *= sigmoid(gate_tmp[i]);
-        multiply(L.o, att.data(), tmp.data(), NH * HD, N);
-        convolve(tmp.data(), N, L.postconv, nullptr, sl, 2 * NKV * HD, out.data());
-        if (!err.empty()) return;
-
-        if (ip % s.attn_res_block == 0) bl.push_back(inpSA);
-        else for (int64_t i = 0; i < N; ++i) cur_in[i] += out[i];
-
-        const float* ffn_inp = cur_in;
-        std::vector<float> ffn_cur(N);
-        mix(bl, cur_in, dense_of(L.ffnq), ffn_cur.data());
-        if (messages_present && loop != nullptr) {
-            std::vector<float> ctr(N);
-            control(ffn_cur.data(), messages + 3 * N, *loop, 3, ctr.data());
-            ffn_cur = std::move(ctr);
+            for (int64_t i = 0; i < NH * HD; ++i) att[i] *= sigmoid(P.gate[(size_t) i]);
+            // the K/V channels after this row; the later channels are copied after their own phases
+            if (old) std::copy(sl.conv.begin(), sl.conv.end(), old->conv.data() + ((size_t) t + 1) * conv_width);
         }
         if (!err.empty()) return;
-        rms_norm(ffn_cur.data(), dense_of(L.ffnnorm), normed.data(), N, eps);
+        std::vector<const float*> att_rows;
+        for (auto& P : preps) att_rows.push_back(P.att.data());
+        multiply_rows(L.o, att_rows, outs(&Prep::o), NH * HD, N);
+        if (!err.empty()) return;
 
+        std::vector<const float*> normed_rows;
+        for (int t = 0; t < count && err.empty(); ++t) {
+            auto& row = rows[(size_t) t];
+            auto& P = preps[(size_t) t];
+            const float* msg = messages_present ? messages[(size_t) t].data() : nullptr;
+            convolve(P.o.data(), N, L.postconv, nullptr, sl, 2 * NKV * HD, out.data());
+            if (!err.empty()) return;
+            if (old)
+                for (int64_t lag = 0; lag < NCONV - 1; ++lag) {
+                    const size_t offset = (size_t) (lag * channels + 2 * NKV * HD);
+                    std::copy_n(sl.conv.data() + offset, N, old->conv.data() + ((size_t) t + 1) * conv_width + offset);
+                }
+            float* cur_in = row.cur.data();
+            auto& bl = row.blocks;
+            if (ip % s.attn_res_block == 0) bl.push_back(P.inpSA);
+            for (int64_t i = 0; i < N; ++i) cur_in[i] = ip % s.attn_res_block == 0 ? out[i] : cur_in[i] + out[i];
+
+            std::vector<float> ffn_cur(N);
+            mix(bl, cur_in, dense_of(L.ffnq), ffn_cur.data());
+            if (messages_present) {
+                std::vector<float> ctr(N);
+                control(ffn_cur.data(), msg + 3 * N, *loop, 3, ctr.data());
+                ffn_cur = std::move(ctr);
+            }
+            if (!err.empty()) return;
+            rms_norm(ffn_cur.data(), dense_of(L.ffnnorm), P.normed.data(), N, eps);
+            normed_rows.push_back(P.normed.data());
+        }
+        if (!err.empty()) return;
         // sigmoid router, top-8, the selected probabilities normalized and scaled by route_scale
-        multiply(L.router, normed.data(), tmp.data(), N, NE);
-        std::vector<float> prob((size_t) NE);
-        for (int64_t e = 0; e < NE; ++e) prob[(size_t) e] = sigmoid(tmp[e] + (L.exp_b != nullptr ? L.exp_b[e] : 0.0f));
-        std::vector<int64_t> ids(NE);
-        std::iota(ids.begin(), ids.end(), 0);
-        std::partial_sort(ids.begin(), ids.begin() + NK, ids.end(),
-                          [&](int64_t a, int64_t b) { return prob[(size_t) a] > prob[(size_t) b]; });
-        std::vector<float> w((size_t) NK);
-        double wsum = 0;
-        for (int64_t j = 0; j < NK; ++j) { w[(size_t) j] = prob[(size_t) ids[(size_t) j]]; wsum += w[(size_t) j]; }
-        for (auto& z : w) z = (float) (z / (wsum + 1e-20) * s.expert_weights_scale);
+        multiply_rows(L.router, normed_rows, outs(&Prep::route), N, NE);
+        if (!err.empty()) return;
 
-        std::fill(out.begin(), out.end(), 0.0f);
-        if (products) {
-            std::vector<float> gu((size_t) (NK * 2 * FF)), hidden((size_t) (NK * FF)), down((size_t) (NK * N));
-            products->grouped(L.gu.type, L.gu.data, (size_t) L.gu.rows * L.gu.row_bytes, ids.data(), (int) NK,
-                              normed.data(), true, N, 2 * FF, gu.data());
-            for (int64_t j = 0; j < NK; ++j) {
-                const float scale = L.gu.scale ? L.gu.scale[ids[(size_t) j]] : 1.0f;
-                for (int64_t i = 0; i < FF; ++i)
-                    hidden[(size_t) (j * FF + i)] = situ(gu[(size_t) (j * 2 * FF + i)] * scale,
-                        gu[(size_t) (j * 2 * FF + FF + i)] * scale, (float) s.situ_beta, (float) s.situ_linear_beta);
-            }
-            products->grouped(L.down.type, L.down.data, (size_t) L.down.rows * L.down.row_bytes, ids.data(),
-                              (int) NK, hidden.data(), false, FF, N, down.data());
-            for (int64_t j = 0; j < NK; ++j) {
-                const float scale = L.down.scale ? L.down.scale[ids[(size_t) j]] : 1.0f;
-                for (int64_t i = 0; i < N; ++i)
-                    out[(size_t) i] += w[(size_t) j] * (down[(size_t) (j * N + i)] * scale);
-            }
-        } else {
-            for (int64_t j = 0; j < NK; ++j) {
-                const int64_t eid = ids[(size_t) j];
-                // the fused gate/up matrix has 2*FF rows: row i is the gate, row FF+i the up
-                for (int64_t i = 0; i < FF; ++i) {
-                    const float g = expert_row_dot(L.gu, (int) eid, i, normed.data(), rowbuf);
-                    const float u = expert_row_dot(L.gu, (int) eid, FF + i, normed.data(), rowbuf);
-                    hv[(size_t) i] = situ(g, u, (float) s.situ_beta, (float) s.situ_linear_beta);
+        for (int t = 0; t < count; ++t) {
+            auto& row = rows[(size_t) t];
+            auto& P = preps[(size_t) t];
+            std::vector<float> prob((size_t) NE);
+            for (int64_t e = 0; e < NE; ++e) prob[(size_t) e] = sigmoid(P.route[(size_t) e]);
+            std::vector<int64_t> ids(NE);
+            std::iota(ids.begin(), ids.end(), 0);
+            std::partial_sort(ids.begin(), ids.begin() + NK, ids.end(),
+                              [&](int64_t a, int64_t b) {
+                                  const float x = prob[(size_t) a] + L.exp_b[a], y = prob[(size_t) b] + L.exp_b[b];
+                                  return x == y ? a < b : x > y;
+                              });
+            for (int64_t j = 0; j < NK; ++j) ++heat[(size_t) (ip * NE + ids[(size_t) j])];
+            std::vector<float> w((size_t) NK);
+            double wsum = 0;
+            for (int64_t j = 0; j < NK; ++j) { w[(size_t) j] = prob[(size_t) ids[(size_t) j]]; wsum += w[(size_t) j]; }
+            for (auto& z : w) z = (float) (z / (wsum + 1e-20) * s.expert_weights_scale);
+
+            if (products) {
+                row.expert_in = P.normed;
+                row.ids = std::move(ids);
+                row.weights = std::move(w);
+            } else {
+                std::fill(row.expert_out.begin(), row.expert_out.end(), 0.0f);
+                for (int64_t j = 0; j < NK; ++j) {
+                    const int64_t eid = ids[(size_t) j];
+                    for (int64_t i = 0; i < FF; ++i) {
+                        const float g = expert_row_dot(L.gu, (int) eid, i, P.normed.data(), rowbuf);
+                        const float u = expert_row_dot(L.gu, (int) eid, FF + i, P.normed.data(), rowbuf);
+                        hv[(size_t) i] = situ(g, u, (float) s.situ_beta, (float) s.situ_linear_beta);
+                    }
+                    for (int64_t i = 0; i < N; ++i)
+                        row.expert_out[(size_t) i] += w[(size_t) j] * expert_row_dot(L.down, (int) eid, i, hv.data(), rowbuf);
                 }
-                for (int64_t i = 0; i < N; ++i)
-                    out[i] += w[(size_t) j] * expert_row_dot(L.down, (int) eid, i, hv.data(), rowbuf);
             }
         }
-        convolve(out.data(), N, L.ffnconv, nullptr, sl, 2 * NKV * HD + N, tmp.data());
-        for (int64_t i = 0; i < N; ++i) cur_in[i] = ffn_inp[i] + tmp[i];
+    };
+    const auto layer = [&](int64_t ip, int64_t slot_id, const Loop* loop) {
+        auto& slot = slots[(size_t) slot_id];
+        Backup* old = keep ? &backups[(size_t) slot_id] : nullptr;
+        if (old) {
+            old->cells = slot.cells;
+            old->k.resize((size_t) count * kv_width);
+            old->v.resize((size_t) count * kv_width);
+            old->conv.resize(((size_t) count + 1) * conv_width);
+            old->positions.resize((size_t) count);
+            std::copy(slot.conv.begin(), slot.conv.end(), old->conv.begin());
+            for (int t = 0; t < count; ++t) {
+                const size_t cell = (size_t) ((pos0 + t) % extent);
+                old->positions[(size_t) t] = slot.pos[cell];
+                std::copy_n(slot.k.data() + cell * kv_width, kv_width, old->k.data() + (size_t) t * kv_width);
+                std::copy_n(slot.v.data() + cell * kv_width, kv_width, old->v.data() + (size_t) t * kv_width);
+            }
+        }
+        std::vector<std::vector<float>> messages(loop ? (size_t) count : 0);
+        for (int t = 0; t < (int) messages.size(); ++t) {
+            auto& row = rows[(size_t) t];
+            auto& message = messages[(size_t) t];
+            message.resize((size_t) (4 * N));
+            const float* mq = dense_of(loop->query);
+            for (int c = 0; c < 4; ++c)
+                mix(row.bank, row.bank_out.data(), mq + c * N, message.data() + c * N);
+        }
+        prepare(ip, slot_id, messages, loop, old);
+        if (!err.empty()) return;
+        const auto& L = layers[(size_t) ip];
+        if (products) {
+            std::vector<RoutedInput> routed;
+            routed.reserve(rows.size());
+            for (auto& row : rows)
+                routed.push_back({row.expert_in.data(), row.ids.data(), row.weights.data(), row.expert_out.data()});
+            grouped_moe(L, routed);
+        }
+        for (int t = 0; t < count; ++t) {
+            auto& row = rows[(size_t) t];
+            convolve(row.expert_out.data(), N, L.ffnconv, nullptr, slot, 2 * NKV * HD + N, tmp.data());
+            for (int64_t i = 0; i < N; ++i) row.cur[(size_t) i] += tmp[(size_t) i];
+            if (old) {
+                // Only the FFN channels changed in this phase. Keep the attention channels from prepare().
+                for (int64_t lag = 0; lag < NCONV - 1; ++lag) {
+                    const size_t offset = (size_t) (lag * channels + 2 * NKV * HD + N);
+                    std::copy_n(slot.conv.data() + offset, N, old->conv.data() + ((size_t) t + 1) * conv_width + offset);
+                }
+            }
+        }
+        ++visit;
     };
 
-    // ---- the graph: prelude, 3 passes over the core, tail ----
-    std::vector<float> cur(N);
-    std::memcpy(cur.data(), hn.data(), N * sizeof(float));
-    for (int64_t l = 0; l < s.loop_start; ++l) layer(l, l, cur.data(), blocks, nullptr, nullptr, false);
-    const auto prelude_blocks = blocks;
-    const std::vector<float> prelude = cur;
-    std::vector<std::vector<float>> bank;
-    std::vector<float> bank_out;
+    for (int64_t l = 0; l < s.loop_start && err.empty(); ++l) layer(l, l, nullptr);
+    for (auto& row : rows) { row.prelude = row.cur; row.prelude_blocks = row.blocks; }
     for (int64_t pass = 0; pass < s.loop_count && err.empty(); ++pass) {
         if (pass > 0) {
-            // the previous pass's blocks after its first core block, and its output
-            bank.assign(blocks.begin() + (size_t) prelude_blocks.size() + 1, blocks.end());
-            bank_out = cur;
-            cur = prelude;
-            blocks = prelude_blocks;
+            for (auto& row : rows) {
+                row.bank.assign(row.blocks.begin() + (ptrdiff_t) row.prelude_blocks.size() + 1, row.blocks.end());
+                row.bank_out = row.cur;
+                row.cur = row.prelude;
+                row.blocks = row.prelude_blocks;
+            }
         }
         for (int64_t ip = s.loop_start; ip < s.loop_end && err.empty(); ++ip) {
-            const int64_t il = pass == 0 ? ip : s.n_layer + (pass - 1) * (s.loop_end - s.loop_start) + (ip - s.loop_start);
-            if (pass == 0) { layer(ip, ip, cur.data(), blocks, nullptr, nullptr, false); continue; }
-            const Loop& C = loops[(size_t) (ip - s.loop_start)];
-            std::vector<float> message(4 * N);
-            const float* mq = dense_of(C.query);
-            for (int c = 0; c < 4; ++c)
-                mix(bank, bank_out.data(), mq + (size_t) c * N, message.data() + (size_t) c * N);
-            layer(ip, il, cur.data(), blocks, message.data(), &C, true);
+            const int64_t slot = pass == 0 ? ip : s.n_layer + (pass - 1) * (s.loop_end - s.loop_start) + ip - s.loop_start;
+            layer(ip, slot, pass == 0 ? nullptr : &loops[(size_t) (ip - s.loop_start)]);
         }
     }
-    for (int64_t l = s.loop_end; l < s.n_layer && err.empty(); ++l) layer(l, l, cur.data(), blocks, nullptr, nullptr, false);
+    for (int64_t l = s.loop_end; l < s.n_layer && err.empty(); ++l) layer(l, l, nullptr);
     if (!err.empty()) return false;
 
-    // ---- the head ----
-    mix(blocks, cur.data(), out_query.data(), tmp.data());
-    rms_norm(tmp.data(), out_norm.data(), hn.data(), N, eps);
-    tap(visit, hn.data());  // the terminal tap is the normalized head input
     last_logits_.resize((size_t) s.vocab_unpadded);
-    if (!project_head(hn.data(), last_logits_.data(), s.vocab_unpadded)) {
-        err = "inkling2: cannot dequantize a head row";
-        return false;
-    }
     const float cap = (float) s.final_logit_softcap;
-    if (cap > 0)
-        for (float& z : last_logits_) z = cap * std::tanh(z / cap);
-    if (products) products->capture(draft_features.data(), draft_features.size());
-    taps_valid = true;
-    if (dspark) dspark->commit(draft_features.data());
+    for (int t = 0; t < count; ++t) {
+        auto& row = rows[(size_t) t];
+        mix(row.blocks, row.cur.data(), out_query.data(), tmp.data());
+        rms_norm(tmp.data(), out_norm.data(), hn.data(), N, eps);
+        tap(row, visit, hn.data());
+        if (!project_head(hn.data(), last_logits_.data(), s.vocab_unpadded)) {
+            err = "inkling2: cannot dequantize a head row";
+            return false;
+        }
+        if (cap > 0)
+            for (float& z : last_logits_) z = cap * std::tanh(z / cap);
+        if (logits) std::copy(last_logits_.begin(), last_logits_.end(), logits + t * s.vocab_unpadded);
+    }
+    const int kept = keep ? keep() : count;
+    if (kept < 1 || kept > count) { err = "inkling2: invalid verifier commit length"; return false; }
+    restore(kept);
+    rollback.armed = false;
+    for (int t = 0; t < kept; ++t) {
+        auto& row = rows[(size_t) t];
+        if (products) products->capture(row.features.data(), row.features.size());
+        taps_valid = true;
+        if (dspark) {
+            if (products) products->read_taps(row.features.data(), row.features.size());
+            dspark->commit(row.features.data());
+        }
+    }
     return true;
 }
 
@@ -808,14 +1058,30 @@ bool PlainInkling::run(const int32_t* tokens, int64_t n, int64_t pos, int rows, 
     const unsigned hw = std::thread::hardware_concurrency();
     const int threads = std::max(1, (int) hw / 8);
     try {
-        for (int64_t t = 0; t < n; ++t) {
-            if (!p_->token(tokens[t], pos + t, threads, err)) return false;
-            if (logits != nullptr && t >= n - rows)
-                std::copy_n(p_->last_logits_.data(), p_->s.vocab_unpadded,
-                            logits + (t - (n - rows)) * p_->s.vocab_unpadded);
+        for (int64_t t = 0; t < n;) {
+            const bool save = logits && t >= n - rows;
+            const int64_t available = save || !logits ? n - t : n - rows - t;
+            const int count = (int) std::min<int64_t>(p_->products ? PlainDspark::block : 1, available);
+            float* out = save ? logits + (t - (n - rows)) * p_->s.vocab_unpadded : nullptr;
+            if (!p_->window(tokens + t, count, pos + t, threads, out, err)) return false;
+            t += count;
         }
     } catch (const std::exception& e) { p_->taps_valid = false; err = e.what(); return false; }
     return true;
+}
+
+bool PlainInkling::verify(const int32_t* tokens, int count, int64_t pos, float* logits,
+                         const std::function<int()>& keep, std::string& err) {
+    if (!p_->products || !p_->dspark || count < 2 || count > PlainDspark::block ||
+        count > p_->s.relative_extent || pos < 0 || !tokens || !logits || !keep) {
+        err = "inkling2: invalid GPU verifier window";
+        return false;
+    }
+    p_->taps_valid = false;
+    const int threads = std::max(1, (int) std::thread::hardware_concurrency() / 8);
+    try {
+        return p_->window(tokens, count, pos, threads, logits, err, keep);
+    } catch (const std::exception& e) { p_->taps_valid = false; err = e.what(); return false; }
 }
 
 const float* PlainInkling::gpu_taps() const {
@@ -838,8 +1104,83 @@ bool PlainInkling::enable_gpu(std::string& err) {
         p_->products = std::make_unique<InklingProducts>(p_->NK, p_->N, p_->FF, raw * (size_t) p_->NK,
                                                         p_->NH, p_->NKV, p_->HD, p_->s.relative_length,
                                                         p_->s.relative_extent);
+        const char* setting = strata::env_get("INKLING_PLACEMENT");
+        const std::string placement = setting ? setting : "host";
+
     } catch (const std::exception& e) { err = e.what(); return false; }
     return true;
+}
+
+bool PlainInkling::configure_experts(const std::string& profile, int64_t context, std::string& err) {
+    const char* mode = strata::env_get("INKLING_PLACEMENT");
+    const std::string_view placement = mode ? mode : "host";
+    if (placement == "host") return true;
+    const char* toggle = strata::env_get("INKLING_RESIDUAL");
+    const bool residual = !(toggle && std::string_view(toggle) == "0");
+    try {
+        if (placement == "auto" && p_->dspark && !p_->dspark->enable_gpu(err)) {
+            if (!err.empty()) return false;
+            std::fprintf(stderr, "xestrata: DSpark matrices do not fit or need FP64; keeping the host drafter\n");
+        }
+        if (!p_->products->load_head(p_->head_type, p_->head_data, p_->head_row, p_->N, p_->s.vocab_padded))
+            std::fprintf(stderr, "xestrata: Inkling head does not fit the VRAM budget; keeping the host head\n");
+    } catch (const std::exception& e) { err = e.what(); return false; }
+    if (placement != "auto") return true;
+    if (residual && p_->dspark && !p_->dspark->place_attention(context, err)) return false;
+    using Pair = std::pair<int32_t, int32_t>;
+    std::vector<Pair> prior;
+    int64_t slots = 0;
+    const auto& s = p_->s;
+    if (!profile.empty() && !read_expert_profile(profile, s.n_layer, p_->NE, prior, slots, err)) return false;
+    size_t free = 0, total = 0;
+    if (!gpu::mem_info(&free, &total)) { err = "inkling2: cannot query expert placement budget"; return false; }
+    try {
+        if (residual) p_->products->configure_kv(p_->slots.size(), (size_t) s.relative_extent, (size_t) (p_->NKV * p_->HD),
+                                   free - std::min<uint64_t>(free, vram_room(total)));
+    } catch (const std::exception& e) { err = e.what(); return false; }
+    if (!gpu::mem_info(&free, &total)) { err = "inkling2: cannot query VRAM after KV placement"; return false; }
+    const uint64_t vr = free - std::min<uint64_t>(free, vram_room(total));
+    const auto host = sample_host_memory();
+    const uint64_t hr = detail::ram_headroom(host ? host->limit / 32 : 0);
+    const uint64_t dram = host ? host->available - std::min(host->available, hr) : 0;
+    const auto bytes = [&](int64_t layer) {
+        const auto& l = p_->layers[(size_t) layer];
+        return (size_t) l.gu.rows * l.gu.row_bytes + (size_t) l.down.rows * l.down.row_bytes;
+    };
+    const uint64_t max_alloc = max_alloc_bytes();
+    const auto local = [&](int64_t l) { return bytes(l) <= max_alloc; };
+    const auto plan = plan_profile_fill(prior, s.n_layer, p_->NE, vr, bytes, local, false);
+    uint64_t hot_bytes = 0;
+    try {
+        for (const auto& [layer, expert] : plan.fill) {
+            const auto& l = p_->layers[(size_t) layer];
+            for (const auto* e : {&l.gu, &l.down}) {
+                const size_t len = (size_t) e->rows * e->row_bytes;
+                p_->products->reserve_hot(e->data + (size_t) expert * len, len);
+                hot_bytes += len;
+            }
+        }
+    } catch (const std::exception& e) { err = e.what(); return false; }
+    uint64_t all = 0, batch = 0;
+    for (int64_t l = 0; l < s.n_layer; ++l) { all += bytes(l) * (uint64_t) p_->NE; batch = std::max(batch, bytes(l)); }
+    const uint64_t hint = std::min(dram, batch * (uint64_t) p_->NK);
+    p_->products->set_cold_hint(hint);
+    std::fprintf(stderr, "xestrata: Inkling expert tier: %zu experts, %llu bytes hot of %llu bytes; "
+                         "VRAM pool %llu, DRAM pool %llu, prefetch up to %llu bytes per tile\n", plan.fill.size(),
+                 (unsigned long long) hot_bytes, (unsigned long long) all, (unsigned long long) vr,
+                 (unsigned long long) dram, (unsigned long long) hint);
+    return true;
+}
+
+bool PlainInkling::save_profile(const std::string& path, std::string& err) const {
+    auto order = rank_learned_profile(p_->s.n_layer, p_->NE, std::vector<uint8_t>(p_->heat.size(), 0), p_->heat, {});
+    order.erase(std::remove_if(order.begin(), order.end(), [&](const auto& pair) {
+        return p_->heat[(size_t) (pair.first * p_->NE + pair.second)] == 0;
+    }), order.end());
+    if (p_->products)
+        std::fprintf(stderr, "xestrata: Inkling expert lookups: %llu/%llu resident\n",
+                     (unsigned long long) p_->products->gpu_hits(), (unsigned long long) p_->products->gpu_lookups());
+    return write_expert_profile(path, p_->s.n_layer, p_->NE, order, err);
 }
 
 bool PlainInkling::load_dspark(const std::string& path, std::string& err) {

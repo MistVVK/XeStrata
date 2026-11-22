@@ -414,4 +414,65 @@ void gemm_rows(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_
     finish(stream, e, "gemm_rows");
 }
 
+bool gemm_f32_ordered(const float* x, const float* w, float* y, int64_t rows, int64_t n, int64_t k, void* stream) {
+    auto& q = core::Runtime::get().stream(stream);
+    if (!q.get_device().has(sycl::aspect::fp64)) return false;
+    const auto event = q.parallel_for(sycl::range<2>((size_t) rows, (size_t) n), [=](sycl::id<2> id) {
+        const int64_t t = (int64_t) id[0], row = (int64_t) id[1];
+        double sum = 0;
+        for (int64_t d = 0; d < k; ++d) sum += (double) w[row * k + d] * x[t * k + d];
+        y[t * n + row] = (float) sum;
+    });
+    finish(stream, event, "gemm_f32_ordered");
+    return true;
+}
+
+bool gemv_f32_ordered(const float* x, const float* w, float* y, int64_t n, int64_t k, void* stream) {
+    return gemm_f32_ordered(x, w, y, 1, n, k, stream);
+}
+
+bool rows_norm_ordered(const float* x, const float* w, float* y, int64_t rows, int64_t n, float eps, void* stream) {
+    auto& q = core::Runtime::get().stream(stream);
+    if (!q.get_device().has(sycl::aspect::fp64)) return false;
+    const auto event = q.parallel_for(sycl::range<1>((size_t) rows), [=](sycl::id<1> id) {
+        const float* in = x + (int64_t) id[0] * n;
+        float* out = y + (int64_t) id[0] * n;
+        double ss = 0;
+        for (int64_t i = 0; i < n; ++i) ss += (double) in[i] * in[i];
+        const float scale = 1.0f / sycl::sqrt((float) (ss / (double) n) + eps);
+        for (int64_t i = 0; i < n; ++i) out[i] = in[i] * (scale * w[i]);
+    });
+    finish(stream, event, "rows_norm_ordered");
+    return true;
+}
+
+void rope_rows_table(float* x, const float* cs, int64_t rows, int64_t heads, int64_t dim, void* stream) {
+    auto& q = core::Runtime::get().stream(stream);
+    const int64_t half = dim / 2;
+    const auto event = q.parallel_for(sycl::range<1>((size_t) (rows * heads * half)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0] % half, h = (int64_t) id[0] / half % heads, t = (int64_t) id[0] / half / heads;
+        float* r = x + (t * heads + h) * dim;
+        const float c = cs[(t * half + i) * 2], s = cs[(t * half + i) * 2 + 1];
+        const float a = r[i], b = r[i + half];
+        r[i] = a * c - b * s;
+        r[i + half] = a * s + b * c;
+    });
+    finish(stream, event, "rope_rows_table");
+}
+
+void add_rows_f32(float* x, const float* y, int64_t n, void* stream) {
+    auto& q = core::Runtime::get().stream(stream);
+    const auto event = q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) { x[id[0]] += y[id[0]]; });
+    finish(stream, event, "add_rows_f32");
+}
+
+void swiglu_rows_f32(float* up, const float* gate, int64_t n, void* stream) {
+    auto& q = core::Runtime::get().stream(stream);
+    const auto event = q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const float g = gate[id[0]];
+        up[id[0]] *= g * (1.0f / (1.0f + sycl::exp(-g)));
+    });
+    finish(stream, event, "swiglu_rows_f32");
+}
+
 }  // namespace strata::kernels

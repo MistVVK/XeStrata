@@ -11,6 +11,7 @@
 #include "strata/artifact/model_spec.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -29,10 +30,15 @@ public:
     bool load(const GgufModel& m, const ModelSpec& s, std::string& err);
     /// `tokens[n]` at `pos`, the last `rows` logits into `logits` [rows][n_vocab_unpadded].
     bool run(const int32_t* tokens, int64_t n, int64_t pos, int rows, float* logits, std::string& err);
+    // Evaluate a candidate window, then commit only the rows selected by `keep`.
+    bool verify(const int32_t* tokens, int count, int64_t pos, float* logits,
+                const std::function<int()>& keep, std::string& err);
     /// Last token's ordered DSpark tap row, in device memory until the next run or reset.
     const float* gpu_taps() const;
     void reset();
     bool enable_gpu(std::string& err);
+    bool configure_experts(const std::string& profile, int64_t context, std::string& err);
+    bool save_profile(const std::string& path, std::string& err) const;
 
     bool load_dspark(const std::string& path, std::string& err);
     bool propose_dspark(int32_t anchor, int64_t pos, int count, std::vector<int32_t>& tokens, std::string& err) const;

@@ -3,6 +3,15 @@
 #include "plain_dspark.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/device.hpp"
+#include "strata/core/gpu.hpp"
+#include "strata/core/runtime.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/xmx_gemm.hpp"
+#include "strata/kernels/prompt_attn.hpp"
+#include <cstdio>
+#include <string_view>
+#include "strata/platform/env.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #include <algorithm>
@@ -55,21 +64,89 @@ void rope(float* x, int64_t pos) {
     }
 }
 
+struct DraftDevice {
+    struct Free { void operator()(void* p) const { if (p) gpu::free(p); } };
+    template<class T> using Buffer = std::unique_ptr<T, Free>;
+    template<class T> static Buffer<T> alloc(size_t n) {
+        Buffer<T> p(static_cast<T*>(gpu::alloc_device(n * sizeof(T))));
+        if (!p) throw std::runtime_error("DSpark: resident buffer allocation failed");
+        return p;
+    }
+    struct Queue {
+        gpu::Stream s = gpu::stream_create();
+        ~Queue() { if (s) gpu::stream_destroy(s); }
+    } queue;
+    Buffer<float> input, output;
+    bool batch = false;
+    struct Cache { Buffer<float> k, v; size_t capacity = 0; };
+    std::array<Cache, layers> history;
+    Buffer<float> q, noise_k, noise_v, scores, attention;
+    // The layers on the device (propose): the rows, their norms, the projections, the FFN and the RoPE table
+    bool layered = false;
+    Buffer<float> x, normed, proj, up, gate, cs;
+    std::array<std::array<Buffer<float>, 4>, layers> norms;   // attn, q, k, ffn
+    void copy(void* dst, const void* from, size_t n) const {
+        if (!gpu::copy_async(dst, from, n, queue.s)) throw std::runtime_error("DSpark: resident copy failed");
+    }
+    void wait() const {
+        if (!gpu::stream_sync(queue.s)) throw std::runtime_error("DSpark: resident stream failed");
+    }
+};
+
 struct Weight {
     const uint8_t* data = nullptr;
     int type = 0, in = 0, out = 0;
     size_t stride = 0;
+    DraftDevice* device = nullptr;
+    DraftDevice::Buffer<float> resident;
+
+    void upload(DraftDevice& dev, uint8_t* raw) {
+        resident = DraftDevice::alloc<float>((size_t) in * (size_t) out);
+        dev.copy(raw, data, stride * (size_t) out);
+        kernels::iq_dequant_f32(type, raw, (int64_t) in * out, resident.get(), dev.queue.s);
+        dev.wait();
+        device = &dev;
+    }
 
     void row(int index, float* dst) const {
+        if (resident) {
+            device->copy(dst, resident.get() + (size_t) index * in, (size_t) in * sizeof(float));
+            device->wait();
+            return;
+        }
         if (!kc::native_row_to_float(type, data + (size_t) index * stride, dst, in))
             throw std::runtime_error("DSpark: host tensor decoding failed");
     }
     void mul(const float* x, float* y) const {
+        if (resident) {
+            device->copy(device->input.get(), x, (size_t) in * sizeof(float));
+            if (!kernels::gemv_f32_ordered(device->input.get(), resident.get(), device->output.get(), out, in,
+                                            device->queue.s)) throw std::runtime_error("DSpark: ordered GPU GEMV unavailable");
+            device->copy(y, device->output.get(), (size_t) out * sizeof(float));
+            device->wait();
+            return;
+        }
         Vec w((size_t) in);
         for (int i = 0; i < out; ++i) {
             row(i, w.data());
             y[i] = dot(w.data(), x, in);
         }
+    }
+    void mul_block(const float* x, float* y) const {
+        if (!resident || !device->batch) {
+            for (size_t t = 0; t < PlainDspark::block; ++t) mul(x + t * in, y + t * out);
+            return;
+        }
+        const auto rows = PlainDspark::block;
+        device->copy(device->input.get(), x, (size_t) rows * in * sizeof(float));
+        if (!kernels::gemm_f32_ordered(device->input.get(), resident.get(), device->output.get(), rows, out, in,
+                                        device->queue.s)) throw std::runtime_error("DSpark: ordered GPU product unavailable");
+        device->copy(y, device->output.get(), (size_t) rows * out * sizeof(float));
+        device->wait();
+    }
+    void mul_dev(const float* x, float* y, int rows) const {
+        if (!kernels::gemm_f32_ordered(x, resident.get(), y, rows, out, in, device->queue.s))
+            throw std::runtime_error("DSpark: ordered GPU product unavailable");
     }
     Vec vec() const {
         Vec x((size_t) in);
@@ -87,7 +164,7 @@ Weight read_weight(const GgufModel& model, const std::string& name, int in, int 
         throw std::runtime_error("DSpark: missing or incompatible tensor " + name);
     const auto stride = kc::native_row_bytes((int) t->type, in);
     if (!stride) throw std::runtime_error("DSpark: invalid row size for " + name);
-    return {model.shard(shard).tensor_data(*t), (int) t->type, in, std::max(1, out), stride};
+    return {model.shard(shard).tensor_data(*t), (int) t->type, in, std::max(1, out), stride, nullptr, {}};
 }
 
 void check_metadata(const GgufFile& g) {
@@ -142,6 +219,7 @@ struct Layer {
 struct PlainDspark::Impl {
     explicit Impl(const std::string& path) : model(GgufModel::open(path)) {}
     GgufModel model;
+    std::unique_ptr<DraftDevice> device;
     std::array<Layer, layers> layer;
     std::array<std::array<float, taps.size()>, layers + 1> fuse{};
     Vec mask, last_norm, context_norm, joint_bias, correction_bias;
@@ -211,6 +289,112 @@ bool PlainDspark::load(const std::string& path, const GgufModel& target, std::st
     }
 }
 
+bool PlainDspark::enable_gpu(std::string& err) {
+    try {
+        size_t free = 0, total = 0;
+        if (!gpu::mem_info(&free, &total)) throw std::runtime_error("DSpark: cannot query VRAM budget");
+        const uint64_t budget = free - std::min<uint64_t>(free, vram_room(total));
+        const uint64_t largest = max_alloc_bytes();
+        std::vector<Weight*> matrices{&p_->markov, &p_->joint, &p_->correction};
+        for (auto& l : p_->layer)
+            matrices.insert(matrices.end(), {&l.q, &l.k, &l.v, &l.o, &l.ctx_k, &l.ctx_v, &l.up, &l.gate, &l.down});
+        size_t bytes = 0, raw_bytes = 0, x = 0, y = 0;
+        for (const auto* w : matrices) {
+            const size_t resident = (size_t) w->in * (size_t) w->out * sizeof(float);
+            if (resident > largest || !kernels::embed_type_supported(w->type) || w->in % 256 != 0) return false;
+            bytes += resident;
+            raw_bytes = std::max(raw_bytes, w->stride * (size_t) w->out);
+            x = std::max(x, (size_t) w->in);
+            if (w != &p_->markov) y = std::max(y, (size_t) w->out);
+        }
+        const char* batch_setting = strata::env_get("INKLING_HOSTSTATE");
+        const bool batch = !(batch_setting && std::string_view(batch_setting) == "0") &&
+                           bytes + raw_bytes + block * (x + y) * sizeof(float) <= budget &&
+                           block * std::max(x, y) * sizeof(float) <= largest;
+        if (bytes + raw_bytes + (x + y) * sizeof(float) > budget || raw_bytes > largest ||
+            !Runtime::get().device().has(sycl::aspect::fp64)) return false;
+        auto dev = std::make_unique<DraftDevice>();
+        if (!dev->queue.s) throw std::runtime_error("DSpark: cannot create resident stream");
+        auto raw = DraftDevice::alloc<uint8_t>(raw_bytes);
+        dev->batch = batch;
+        dev->input = DraftDevice::alloc<float>(x * (batch ? block : 1));
+        dev->output = DraftDevice::alloc<float>(y * (batch ? block : 1));
+        std::fprintf(stderr, "xestrata: DSpark ordered product staging: %zu bytes, %d rows\n",
+                     (x + y) * (batch ? block : 1) * sizeof(float), batch ? block : 1);
+        for (auto* w : matrices) w->upload(*dev, raw.get());
+        p_->device = std::move(dev);
+        std::fprintf(stderr, "xestrata: DSpark resident: %zu matrices, %zu bytes, staging %zu bytes, budget %llu bytes\n",
+                     matrices.size(), bytes, raw_bytes, (unsigned long long) budget);
+        return true;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
+
+bool PlainDspark::place_attention(int64_t context, std::string& err) {
+    auto* dev = p_->device.get();
+    if (!dev || context < 1) return true;
+    try {
+        size_t free = 0, total = 0;
+        if (!gpu::mem_info(&free, &total)) throw std::runtime_error("DSpark: cannot query attention budget");
+        const uint64_t budget = free - std::min<uint64_t>(free, vram_room(total));
+        const uint64_t limit = max_alloc_bytes();
+        constexpr size_t q_elements = block * heads * hd, noise_elements = block * kv_width;
+        constexpr size_t layer_elements = 3 * block * width + 2 * block * ff + block * hd +
+                                          layers * (2 * width + 2 * hd);
+        const bool layered = dev->batch;
+        const uint64_t fixed = (2 * (q_elements + noise_elements) + (layered ? layer_elements : 0)) * sizeof(float);
+        if (budget <= fixed || limit < q_elements * sizeof(float)) return true;
+        const auto capacity = [&](int64_t n, int layer) {
+            return (uint64_t) (sliding[layer] ? std::min<int64_t>(n, window) : n);
+        };
+        const auto pool_bytes = [&](int64_t n) {
+            uint64_t bytes = 0;
+            for (int i = 0; i < layers; ++i) bytes += 2 * capacity(n, i) * kv_width * sizeof(float);
+            return bytes;
+        };
+        const auto score_bytes = [&](int64_t n) { return (uint64_t) (n + block) * block * heads * sizeof(float); };
+        int64_t n = std::min<uint64_t>((uint64_t) context, limit / (kv_width * sizeof(float)));
+        while (n > 0 && (score_bytes(n) > limit || pool_bytes(n) + score_bytes(n) > budget - fixed)) n /= 2;
+        if (n == 0) return true;
+        dev->q = DraftDevice::alloc<float>(q_elements);
+        dev->attention = DraftDevice::alloc<float>(q_elements);
+        dev->noise_k = DraftDevice::alloc<float>(noise_elements);
+        dev->noise_v = DraftDevice::alloc<float>(noise_elements);
+        dev->scores = DraftDevice::alloc<float>(score_bytes(n) / sizeof(float));
+        for (int i = 0; i < layers; ++i) {
+            auto& cache = dev->history[i];
+            cache.capacity = (size_t) capacity(n, i);
+            cache.k = DraftDevice::alloc<float>(cache.capacity * kv_width);
+            cache.v = DraftDevice::alloc<float>(cache.capacity * kv_width);
+        }
+        if (layered) {
+            dev->x = DraftDevice::alloc<float>(block * width);
+            dev->normed = DraftDevice::alloc<float>(block * width);
+            dev->proj = DraftDevice::alloc<float>(block * width);
+            dev->up = DraftDevice::alloc<float>(block * ff);
+            dev->gate = DraftDevice::alloc<float>(block * ff);
+            dev->cs = DraftDevice::alloc<float>(block * hd);
+            for (int i = 0; i < layers; ++i) {
+                const auto& l = p_->layer[i];
+                const Vec* w[] = {&l.attn_norm, &l.q_norm, &l.k_norm, &l.ffn_norm};
+                for (int j = 0; j < 4; ++j) {
+                    dev->norms[i][j] = DraftDevice::alloc<float>(w[j]->size());
+                    dev->copy(dev->norms[i][j].get(), w[j]->data(), w[j]->size() * sizeof(float));
+                }
+            }
+            dev->wait();
+            dev->layered = true;
+        }
+        std::fprintf(stderr, "xestrata: DSpark attention: %lld/%lld context rows, %llu bytes KV, "
+                             "%llu bytes scratch, %llu bytes budget, layers on %s\n", (long long) n, (long long) context,
+                     (unsigned long long) pool_bytes(n), (unsigned long long) (fixed + score_bytes(n)),
+                     (unsigned long long) budget, dev->layered ? "the device" : "the host");
+        return true;
+    } catch (const std::exception& e) { err = e.what(); return false; }
+}
+
 void PlainDspark::reset() {
     for (auto& l : p_->layer) l.history.clear();
     p_->committed = 0;
@@ -226,6 +410,13 @@ void PlainDspark::commit(const float* features) {
         for (int h = 0; h < kv_heads; ++h) {
             norm(kv.k.data() + (size_t) h * hd, l.ctx_k_norm.data(), hd);
             rope(kv.k.data() + (size_t) h * hd, p_->committed);
+        }
+        if (auto* dev = p_->device.get(); dev && dev->history[i].capacity) {
+            auto& cache = dev->history[i];
+            const size_t cell = (size_t) p_->committed % cache.capacity;
+            dev->copy(cache.k.get() + cell * kv_width, kv.k.data(), kv_width * sizeof(float));
+            dev->copy(cache.v.get() + cell * kv_width, kv.v.data(), kv_width * sizeof(float));
+            dev->wait();
         }
         if (sliding[i] && l.history.size() >= window) l.history.pop_front();
     }
@@ -248,15 +439,77 @@ bool PlainDspark::propose(int32_t anchor, int64_t pos, int count, const Embeddin
         return false;
     }
     for (int t = 1; t < block; ++t) std::copy(p_->mask.begin(), p_->mask.end(), x[(size_t) t].begin());
-    for (const auto& l : p_->layer) {
+    // The layers stay on the device when every context fits its ring: one upload of the rows and one read back.
+    // Each step keeps the host's order and rounding except SwiGLU's exp. Else the host loop below.
+    auto* gdev = p_->device.get();
+    bool on_device = gdev && gdev->layered;
+    for (int i = 0; i < layers && on_device; ++i)
+        on_device = gdev->history[i].capacity > 0 && p_->layer[i].history.size() <= gdev->history[i].capacity;
+    if (on_device) {
+        std::array<float, (size_t) block * hd> cs;
+        for (int t = 0; t < block; ++t)
+            for (int i = 0; i < hd / 2; ++i) {
+                const float theta = (float) (pos + t) * std::pow(rope_base, -2.0f * (float) i / hd);
+                cs[(size_t) (t * hd / 2 + i) * 2] = std::cos(theta);
+                cs[(size_t) (t * hd / 2 + i) * 2 + 1] = std::sin(theta);
+            }
+        Vec rows((size_t) block * width);
+        for (size_t t = 0; t < block; ++t) std::copy(x[t].begin(), x[t].end(), rows.data() + t * width);
+        gdev->copy(gdev->x.get(), rows.data(), rows.size() * sizeof(float));
+        gdev->copy(gdev->cs.get(), cs.data(), sizeof(cs));
+        const auto norm_rows = [&](const float* in, const DraftDevice::Buffer<float>& w, float* out, int64_t n, int64_t dim) {
+            if (!kernels::rows_norm_ordered(in, w.get(), out, n, dim, eps, gdev->queue.s))
+                throw std::runtime_error("DSpark: ordered GPU norm unavailable");
+        };
+        for (int layer = 0; layer < layers; ++layer) {
+            const auto& l = p_->layer[layer];
+            const auto& w = gdev->norms[layer];
+            const auto& cache = gdev->history[layer];
+            const int64_t n_past = (int64_t) l.history.size();
+            norm_rows(gdev->x.get(), w[0], gdev->normed.get(), block, width);
+            l.q.mul_dev(gdev->normed.get(), gdev->q.get(), block);
+            l.k.mul_dev(gdev->normed.get(), gdev->noise_k.get(), block);
+            l.v.mul_dev(gdev->normed.get(), gdev->noise_v.get(), block);
+            norm_rows(gdev->q.get(), w[1], gdev->q.get(), block * heads, hd);
+            kernels::rope_rows_table(gdev->q.get(), gdev->cs.get(), block, heads, hd, gdev->queue.s);
+            norm_rows(gdev->noise_k.get(), w[2], gdev->noise_k.get(), block * kv_heads, hd);
+            kernels::rope_rows_table(gdev->noise_k.get(), gdev->cs.get(), block, kv_heads, hd, gdev->queue.s);
+            if (!kernels::ordered_block_attn(gdev->q.get(), cache.k.get(), cache.v.get(), gdev->noise_k.get(),
+                                             gdev->noise_v.get(), pos - n_past, n_past, (int64_t) cache.capacity, block,
+                                             heads, kv_heads, hd, gdev->scores.get(), gdev->attention.get(), gdev->queue.s))
+                throw std::runtime_error("DSpark: GPU attention unavailable");
+            l.o.mul_dev(gdev->attention.get(), gdev->proj.get(), block);
+            kernels::add_rows_f32(gdev->x.get(), gdev->proj.get(), block * width, gdev->queue.s);
+            norm_rows(gdev->x.get(), w[3], gdev->normed.get(), block, width);
+            l.up.mul_dev(gdev->normed.get(), gdev->up.get(), block);
+            l.gate.mul_dev(gdev->normed.get(), gdev->gate.get(), block);
+            kernels::swiglu_rows_f32(gdev->up.get(), gdev->gate.get(), block * ff, gdev->queue.s);
+            l.down.mul_dev(gdev->up.get(), gdev->proj.get(), block);
+            kernels::add_rows_f32(gdev->x.get(), gdev->proj.get(), block * width, gdev->queue.s);
+        }
+        gdev->copy(rows.data(), gdev->x.get(), rows.size() * sizeof(float));
+        gdev->wait();
+        for (size_t t = 0; t < block; ++t) std::copy_n(rows.data() + t * width, width, x[t].begin());
+    }
+    for (int layer = 0; layer < layers && !on_device; ++layer) {
+        const auto& l = p_->layer[layer];
         std::vector<Kv> kv(block);
         std::vector<std::array<float, (size_t) hd * heads>> q(block);
+        Vec normed((size_t) block * width), qb((size_t) block * heads * hd);
+        Vec kb((size_t) block * kv_width), vb((size_t) block * kv_width);
+        for (size_t t = 0; t < block; ++t) {
+            float* n = normed.data() + t * width;
+            std::copy(x[t].begin(), x[t].end(), n);
+            norm(n, l.attn_norm.data(), width);
+        }
+        l.q.mul_block(normed.data(), qb.data());
+        l.k.mul_block(normed.data(), kb.data());
+        l.v.mul_block(normed.data(), vb.data());
         for (int t = 0; t < block; ++t) {
-            Row n = x[(size_t) t];
-            norm(n.data(), l.attn_norm.data(), width);
-            l.q.mul(n.data(), q[(size_t) t].data());
-            l.k.mul(n.data(), kv[(size_t) t].k.data());
-            l.v.mul(n.data(), kv[(size_t) t].v.data());
+            const size_t at = (size_t) t;
+            std::copy_n(qb.data() + at * heads * hd, heads * hd, q[at].data());
+            std::copy_n(kb.data() + at * kv_width, kv_width, kv[at].k.data());
+            std::copy_n(vb.data() + at * kv_width, kv_width, kv[at].v.data());
             for (int h = 0; h < heads; ++h) {
                 norm(q[(size_t) t].data() + (size_t) h * hd, l.q_norm.data(), hd);
                 rope(q[(size_t) t].data() + (size_t) h * hd, pos + t);
@@ -267,12 +520,35 @@ bool PlainDspark::propose(int32_t anchor, int64_t pos, int count, const Embeddin
             }
         }
         const size_t n_past = l.history.size();
-        Vec scores(n_past + block), up(ff), gate(ff);
+        Vec scores(n_past + block), up((size_t) block * ff), gate((size_t) block * ff);
         const float scale = 1.0f / std::sqrt((float) hd);
         const auto cell = [&](size_t j) -> const Kv& { return j < n_past ? l.history[j] : kv[j - n_past]; };
+        using AttnRow = std::array<float, (size_t) hd * heads>;
+        std::vector<AttnRow> gpu_att;
+        if (auto* dev = p_->device.get(); dev && dev->history[layer].capacity > 0 &&
+            n_past <= dev->history[layer].capacity) {
+            const auto& cache = dev->history[layer];
+            std::array<float, block * kv_width> nk, nv;
+            for (size_t t = 0; t < block; ++t) {
+                std::copy(kv[t].k.begin(), kv[t].k.end(), nk.data() + t * kv_width);
+                std::copy(kv[t].v.begin(), kv[t].v.end(), nv.data() + t * kv_width);
+            }
+            dev->copy(dev->q.get(), q.data(), block * sizeof(AttnRow));
+            dev->copy(dev->noise_k.get(), nk.data(), sizeof(nk));
+            dev->copy(dev->noise_v.get(), nv.data(), sizeof(nv));
+            if (!kernels::ordered_block_attn(dev->q.get(), cache.k.get(), cache.v.get(), dev->noise_k.get(),
+                                             dev->noise_v.get(), pos - (int64_t) n_past, (int64_t) n_past,
+                                             (int64_t) cache.capacity, block, heads, kv_heads, hd, dev->scores.get(),
+                                             dev->attention.get(), dev->queue.s)) throw std::runtime_error("DSpark: GPU attention unavailable");
+            gpu_att.resize(block);
+            dev->copy(gpu_att.data(), dev->attention.get(), block * sizeof(AttnRow));
+            dev->wait();
+        }
+        Vec all_att((size_t) block * heads * hd), projected((size_t) block * width);
         for (int t = 0; t < block; ++t) {
-            std::array<float, (size_t) hd * heads> att{};
-            for (int h = 0; h < heads; ++h) {
+            AttnRow att{};
+            if (!gpu_att.empty()) att = gpu_att[(size_t) t];
+            else for (int h = 0; h < heads; ++h) {
                 const int hkv = h / (heads / kv_heads);
                 for (size_t j = 0; j < scores.size(); ++j)
                     scores[j] = scale * dot(q[(size_t) t].data() + (size_t) h * hd, cell(j).k.data() + (size_t) hkv * hd, hd);
@@ -280,16 +556,20 @@ bool PlainDspark::propose(int32_t anchor, int64_t pos, int count, const Embeddin
                 for (size_t j = 0; j < scores.size(); ++j)
                     for (int d = 0; d < hd; ++d) att[h * hd + d] += scores[j] * cell(j).v[hkv * hd + d];
             }
-            Row o, n;
-            l.o.mul(att.data(), o.data());
-            for (int i = 0; i < width; ++i) { x[(size_t) t][i] += o[i]; n[i] = x[(size_t) t][i]; }
-            norm(n.data(), l.ffn_norm.data(), width);
-            l.up.mul(n.data(), up.data());
-            l.gate.mul(n.data(), gate.data());
-            for (int i = 0; i < ff; ++i) up[i] *= gate[i] * sigmoid(gate[i]);
-            l.down.mul(up.data(), o.data());
-            for (int i = 0; i < width; ++i) x[(size_t) t][i] += o[i];
+            std::copy(att.begin(), att.end(), all_att.data() + (size_t) t * heads * hd);
         }
+        l.o.mul_block(all_att.data(), projected.data());
+        for (size_t t = 0; t < block; ++t) {
+            float* n = normed.data() + t * width;
+            for (int i = 0; i < width; ++i) { x[t][i] += projected[t * width + i]; n[i] = x[t][i]; }
+            norm(n, l.ffn_norm.data(), width);
+        }
+        l.up.mul_block(normed.data(), up.data());
+        l.gate.mul_block(normed.data(), gate.data());
+        for (size_t i = 0; i < up.size(); ++i) up[i] *= gate[i] * sigmoid(gate[i]);
+        l.down.mul_block(up.data(), projected.data());
+        for (size_t t = 0; t < block; ++t)
+            for (int i = 0; i < width; ++i) x[t][i] += projected[t * width + i];
     }
     std::array<float, (size_t) 2 * (rank + width)> input{};
     std::copy(p_->context.begin(), p_->context.end(), input.begin() + 2L * rank + width);

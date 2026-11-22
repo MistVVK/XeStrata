@@ -2579,7 +2579,7 @@ static void plain_usage(const std::string& arch) {
                  "                       the model's DFlash2 pack (--draft-model; GLM-5.3-Flash, Qwen3.6-35B-A3B);\n"
                  "                       auto: --serve measures the MTP, DFlash2 and none at its start and keeps the\n"
                  "                       fastest; without --serve the MTP\n"
-                 "  --draft dspark       Inkling-2-Mini's DSpark (CPU, greedy, command line only)\n"
+                 "  --draft dspark       Inkling-2-Mini's DSpark (greedy, command line only)\n"
                  "  --draft-model FILE   the model's DFlash2 pack or DSpark GGUF\n"
                  "  --suffix-draft N     --serve: drafts from an earlier repeat of the context's last N+ tokens, a window\n"
                  "                       of them where they go past the MTP's (also without an MTP layer; default 0 = off)\n"
@@ -3055,8 +3055,8 @@ int plain_main(int argc, char** argv) {
     }
     const bool dspark = opt.draft == "dspark";
     if (dspark) {
-        if (arch != "inkling2_loop" || !opt.cpu || serve || sp.temperature != 0.0f || !follow.empty()) {
-            std::fprintf(stderr, "xestrata: --draft dspark needs inkling2_loop, --device cpu and greedy CLI decoding "
+        if (arch != "inkling2_loop" || opt.max_t < 2 || serve || sp.temperature != 0.0f || !follow.empty()) {
+            std::fprintf(stderr, "xestrata: --draft dspark needs inkling2_loop, --max-t >= 2 and greedy CLI decoding "
                                  "without --spec-follow\n");
             return 2;
         }
@@ -3308,19 +3308,19 @@ int plain_main(int argc, char** argv) {
         return 1;
     }
     const std::vector<int32_t> stop = stop_eos ? eos : std::vector<int32_t>();
+    int64_t draft_blocks = 0, proposed_total = 0, accepted_total = 0;
     while ((int64_t) produced.size() < n_new && !at_eos(produced.back())) {
         if (dspark && n_new - (int64_t) produced.size() > 1) {
-            std::vector<int32_t> guesses;
-            const int count = (int) std::min<int64_t>(7, n_new - (int64_t) produced.size() - 1);
-            if (!model.propose_dspark(produced.back(), pos, count, guesses, err)) return start_failed(err);
-            // The target's CPU reference verifies one row at a time. Only the already emitted token enters it.
-            // A mismatch emits the target's choice and ends the window without writing rejected KV or conv state.
-            for (size_t j = 0; j <= guesses.size(); ++j) {
-                const int32_t pending = produced.back();
-                if (!model.forward(&pending, 1, pos++, out.data(), lg, err)) return start_failed(err);
-                if (!emit(0)) return 1;
-                if (at_eos(produced.back()) || j == guesses.size() || produced.back() != guesses[j]) break;
-            }
+            const int count = (int) std::min<int64_t>({7, T - 1, n_new - (int64_t) produced.size() - 1});
+            int n_emit = 0, n_accept = 0;
+            if (!model.dspark_step(produced.back(), pos, count, stop, out.data(), lg, n_emit, n_accept, err))
+                return start_failed(err);
+            ++draft_blocks;
+            proposed_total += count;
+            accepted_total += n_accept;
+            for (int row = 0; row < n_emit; ++row)
+                if (!emit(row)) return 1;
+            pos += n_emit;
             continue;
         }
         if (spec) {
@@ -3369,6 +3369,10 @@ int plain_main(int argc, char** argv) {
         std::fprintf(stderr, "xestrata (%s): %lld experts moved into the RAM copy in the places of unused ones, %lld of "
                              "them out of a stage buffer (XESTRATA_RAM_ADAPT)\n", arch.c_str(),
                      (long long) model.ram_adapts(), (long long) model.ram_staged());
+    if (draft_blocks > 0)
+        std::fprintf(stderr, "xestrata (%s): DSpark %lld blocks, %lld proposals, %lld accepted (%.1f%%)\n",
+                     arch.c_str(), (long long) draft_blocks, (long long) proposed_total, (long long) accepted_total,
+                     100.0 * (double) accepted_total / (double) proposed_total);
     if (model.spec_windows() > 0)
         std::fprintf(stderr, "xestrata (%s): %lld windows checked %lld drafts, accepted %lld (%.1f%%), %.2f tokens a window; "
                              "a window %.2f ms, its drafts %.2f ms\n",

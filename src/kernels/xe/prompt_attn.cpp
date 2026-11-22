@@ -625,4 +625,40 @@ void relative_prompt_attn(const float* q, const float* k, const float* v, const 
     });
 }
 
+bool ordered_block_attn(const float* q, const float* k, const float* v, const float* noise_k, const float* noise_v,
+                        int64_t first, int64_t past, int64_t capacity, int rows, int heads, int kv_heads, int dim,
+                        float* scores, float* out, void* stream) {
+    auto& queue = core::Runtime::get().stream(stream);
+    if (!queue.get_device().has(sycl::aspect::fp64)) return false;
+    const int64_t cells = past + rows;
+    const float scale = 1.0f / std::sqrt((float) dim);
+    queue.parallel_for(sycl::range<2>((size_t) rows * heads, (size_t) cells), [=](sycl::id<2> id) {
+        const int64_t h = (int64_t) id[0], c = (int64_t) id[1], g = (h % heads) / (heads / kv_heads);
+        const float* cell = c < past ? k + ((first + c) % capacity) * kv_heads * dim
+                                      : noise_k + (c - past) * kv_heads * dim;
+        double sum = 0;
+        for (int d = 0; d < dim; ++d) sum += (double) q[h * dim + d] * cell[g * dim + d];
+        scores[h * cells + c] = scale * (float) sum;
+    });
+    queue.parallel_for(sycl::range<1>((size_t) rows * heads), [=](sycl::id<1> id) {
+        auto* row = scores + (int64_t) id[0] * cells;
+        float peak = row[0];
+        for (int64_t c = 1; c < cells; ++c) peak = sycl::fmax(peak, row[c]);
+        double sum = 0;
+        for (int64_t c = 0; c < cells; ++c) { row[c] = sycl::exp(row[c] - peak); sum += row[c]; }
+        for (int64_t c = 0; c < cells; ++c) row[c] /= (float) sum;
+    });
+    queue.parallel_for(sycl::range<2>((size_t) rows * heads, (size_t) dim), [=](sycl::id<2> id) {
+        const int64_t h = (int64_t) id[0], d = (int64_t) id[1], g = (h % heads) / (heads / kv_heads);
+        float sum = 0;
+        for (int64_t c = 0; c < cells; ++c) {
+            const float* cell = c < past ? v + ((first + c) % capacity) * kv_heads * dim
+                                          : noise_v + (c - past) * kv_heads * dim;
+            sum += scores[h * cells + c] * cell[g * dim + d];
+        }
+        out[h * dim + d] = sum;
+    });
+    return true;
+}
+
 }  // namespace strata::kernels

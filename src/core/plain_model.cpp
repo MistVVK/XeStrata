@@ -492,7 +492,8 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         opt_.prompt_chunk = 0;
         opt_.spec = 0;
         inkling_ = std::make_unique<PlainInkling>();
-        if (!inkling_->load(*model_, spec_, err) || !inkling_->enable_gpu(err)) return false;
+        if (!inkling_->load(*model_, spec_, err) || !inkling_->enable_gpu(err) ||
+            (opt_.draft == "dspark" && !inkling_->load_dspark(opt_.draft_model, err)) || !inkling_->configure_experts(opt_.profile, opt_.max_cells, err)) return false;
         n_vocab_ = inkling_->vocab();
         return true;
     }
@@ -3272,9 +3273,57 @@ const float* PlainModel::inkling_tap_dev() const {
     return inkling_ ? inkling_->gpu_taps() : nullptr;
 }
 
-bool PlainModel::propose_dspark(int32_t anchor, int64_t pos, int count, std::vector<int32_t>& tokens,
-                                std::string& err) const {
-    return inkling_ && inkling_->propose_dspark(anchor, pos, count, tokens, err);
+bool PlainModel::dspark_step(int32_t anchor, int64_t pos, int count, const std::vector<int32_t>& eos,
+                             int32_t* out, float* logits, int& emitted, int& accepted, std::string& err) {
+    emitted = accepted = 0;
+    if (!inkling_ || count < 1 || count >= opt_.max_t || count > 7) {
+        err = "DSpark: invalid verifier window";
+        return false;
+    }
+    std::vector<int32_t> proposals;
+    if (!inkling_->propose_dspark(anchor, pos, count, proposals, err)) return false;
+    if (!opt_.cpu) {
+        std::vector<int32_t> candidates{anchor};
+        candidates.insert(candidates.end(), proposals.begin(), proposals.end());
+        const int rows = (int) candidates.size();
+        cpu_logits_.resize((size_t) rows * (size_t) n_vocab_);
+        const auto keep = [&]() {
+            k::SamplerParams sp = sampler_;
+            sp.counter = (uint64_t) pos;
+            sp.logit_bias = cpu_bias_.empty() ? nullptr : cpu_bias_.data();
+            sp.allowed = cpu_allowed_.empty() ? nullptr : cpu_allowed_.data();
+            const bool hist = cpu_hist_len_ > 0 && sp.penalty_last_n > 0;
+            std::vector<int> picks((size_t) rows);
+            k::sample_tokens_host(cpu_logits_.data(), rows, (int) n_vocab_, hist ? cpu_hist_.data() : nullptr,
+                                  hist ? cpu_hist_len_ : 0, sp, picks.data());
+            for (int i = 0; i < rows; ++i) {
+                const int32_t next = picks[(size_t) i];
+                out[emitted++] = next;
+                const bool match = i < count && next == proposals[(size_t) i];
+                if (match) ++accepted;
+                if (!match || std::find(eos.begin(), eos.end(), next) != eos.end()) break;
+            }
+            return emitted;
+        };
+        if (!inkling_->verify(candidates.data(), rows, pos, cpu_logits_.data(), keep, err)) return false;
+        if (logits) std::copy_n(cpu_logits_.data(), (size_t) emitted * (size_t) n_vocab_, logits);
+        progress_beat();
+        progress_tick();
+        return true;
+    }
+    // Inkling shares stateful convolutions and KV with the correctness reference. Verify in order and
+    // stop on mismatch instead of mutating the target with rows whose state would need rolling back.
+    int32_t pending = anchor;
+    for (int i = 0; i <= count; ++i) {
+        float* row = logits ? logits + (size_t) i * n_vocab_ : nullptr;
+        if (!forward(&pending, 1, pos + i, out + i, row, err)) return false;
+        ++emitted;
+        pending = out[i];
+        const bool match = i < count && pending == proposals[(size_t) i];
+        if (match) ++accepted;
+        if (!match || std::find(eos.begin(), eos.end(), pending) != eos.end()) break;
+    }
+    return true;
 }
 
 // The CPU's run and its picks: the last `rows` tokens' logits, each row's draw from its position as pick() takes it
@@ -5718,6 +5767,7 @@ bool PlainModel::fill_slot(int64_t layer, int32_t expert, std::string& err) {
 }
 
 bool PlainModel::save_profile(const std::string& path, std::string& err) const {
+    if (inkling_) return inkling_->save_profile(path, err);
     if (dense_) { err = "plain model: a dense model has no experts to profile"; return false; }
     const int64_t L = n_moe_, E = spec_.n_expert;
     std::vector<uint8_t> resident((size_t) (L * E), 0);
