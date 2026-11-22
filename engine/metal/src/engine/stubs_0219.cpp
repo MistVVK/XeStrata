@@ -10,9 +10,13 @@
 #include <string>
 
 #include "strata/kernels/dflash2.hpp"
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/megakernel.hpp"
+#include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/vhead_bitplane.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/moe_fp4_tc.hpp"
 
 namespace strata::metal_engine { void missing(const char* name); }
 
@@ -36,8 +40,26 @@ void df2_iota_pos(int32_t*, int32_t, int, void*) {
     strata::metal_engine::missing("strata::kernels::df2_iota_pos");
 }
 
+void gather_rows(const uint8_t*, int64_t, const int32_t*, int64_t, uint8_t*, void*) {
+    strata::metal_engine::missing("strata::kernels::gather_rows");
+}
+
+void kv_stream_resolve_groups(const KvResolveGroups&, const int32_t*, const int32_t*, int64_t,
+                              const QsaShapes&, void*) {
+    strata::metal_engine::missing("strata::kernels::kv_stream_resolve_groups");
+}
+
+bool qsa_block_scores_slot_groups(const QsaScoreGroups&, const float*, const int32_t*, int64_t,
+                                  const QsaShapes&, float*, void*) {
+    return false;
+}
+
 }  // namespace strata::kernels
 
 namespace strata::prefill {
 bool Gemm::init(void*, int64_t, std::string&) { return false; }
+namespace fp4_tc {
+void set_model_has_input_scale(bool) {}
+bool model_has_input_scale() { return true; }
+}  // namespace fp4_tc
 }  // namespace strata::prefill

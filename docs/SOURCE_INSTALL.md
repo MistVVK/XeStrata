@@ -1,7 +1,7 @@
 # Install and build from a source checkout
 
 Use this guide to work on Strata's code or maintain a source-based installation. It is for developers.
-To just use Strata (version 0.2.19), install the [desktop app or the Terminal](INSTALL.md). Installed apps do not use `START-HERE.bat`.
+To just use Strata (version 0.2.20), install the [desktop app or the Terminal](INSTALL.md). Installed apps do not use `START-HERE.bat`.
 
 The repository includes `START-HERE.bat`, `UPDATE.bat` and `setup.sh`. (`SETUP.bat` and `update.sh` went away with the 0.2.16 folder
 layout: `START-HERE.bat --setup` and `./setup.sh --setup` do what `SETUP.bat` did, `START-HERE.bat --update` and `./setup.sh --update` what `update.sh` did.)

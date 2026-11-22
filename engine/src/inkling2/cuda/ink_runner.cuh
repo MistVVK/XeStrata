@@ -1195,7 +1195,7 @@ struct InkCudaModel {
             for (int s = 0; s < n_stages; ++s) {
                 size_t sf = 0, st = 0;
                 INK_CK(ink_cuda_mem_info(&sf, &st, stage_gpu[s]));
-                const size_t sres = (s == 0) ? res0 : std::max((size_t)(896ull << 20), wddm_safety_floor(st) + (512ull << 20));
+                const size_t sres = (s == 0) ? res0 : std::max<size_t>((size_t)(896ull << 20), wddm_safety_floor(st) + (size_t)(512ull << 20));
                 stage_bud[s] = (sf > sres) ? (sf - sres) : 0;
                 if (user_vram_cap < stage_bud[s]) stage_bud[s] = user_vram_cap;
             }

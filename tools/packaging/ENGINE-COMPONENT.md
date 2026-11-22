@@ -40,7 +40,7 @@ A package folder is immutable: a new build is a new folder.
 Example (shortened):
 
 ```json
-{"schema_version": 2, "id": "strata-engine", "name": "strata-engine", "version": "0.1.65",
+{"schema_version": 2, "id": "strata-engine", "name": "strata-engine", "version": "0.1.66",
  "platform": "linux-x86_64", "backend": "cuda", "archs": ["sm_86"], "min_driver": {"nvidia": "580.65"},
  "build_id": "be885026f96a-cuda13.0", "entrypoint": "strata",
  "files": [{"path": "strata", "sha256": "<64 hex>", "bytes": 191000000}], "signature": null}
@@ -83,7 +83,7 @@ UTF-8). It contains every file hash, so one signature covers the whole package. 
 
 ## Building a package
 
-    python packaging/package_engine.py --src <build folder> --backend cuda --version 0.1.65 \
+    python packaging/package_engine.py --src <build folder> --backend cuda --version 0.1.66 \
         --out <components>/engine --arch sm_86 --arch compute_89 --min-driver nvidia=580.65 \
         [--build-id <id>] [--variant cuda13] [--platform linux-x86_64] [--include 'rocm/**' --include strata-vision.exe | --tree]
     python packaging/package_engine.py --verify <package folder>       # full hash check

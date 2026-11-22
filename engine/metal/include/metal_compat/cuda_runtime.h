@@ -133,6 +133,15 @@ inline cudaError_t cudaDeviceGetAttribute(int* v, cudaDeviceAttr a, int d) {
 inline cudaError_t cudaDeviceCanAccessPeer(int* v, int d, int p) { return strata::gpu::device_can_access_peer(v, d, p); }
 inline cudaError_t cudaDeviceEnablePeerAccess(int p, unsigned f) { return strata::gpu::device_enable_peer_access(p, f); }
 inline cudaError_t cudaDeviceDisablePeerAccess(int) { return cudaSuccess; }   // a Mac has one GPU: nothing to disable
+enum cudaDeviceP2PAttr {
+    cudaDevP2PAttrPerformanceRank = 1,
+    cudaDevP2PAttrAccessSupported = 2,
+    cudaDevP2PAttrNativeAtomicSupported = 3,
+};
+inline cudaError_t cudaDeviceGetP2PAttribute(int* v, cudaDeviceP2PAttr, int, int) {
+    if (v) *v = 0;
+    return strata::gpu::compat_detail::bad();
+}
 
 // ---- memory and copies
 template <class T> inline cudaError_t cudaMalloc(T** p, size_t n) { return strata::gpu::malloc_device(p, n); }

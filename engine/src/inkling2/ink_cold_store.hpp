@@ -107,7 +107,11 @@ public:
             }
         }
 #else
+#if defined(O_DIRECT)
         fd_ = ::open(strata_path.c_str(), O_RDONLY | O_DIRECT);
+#else
+        fd_ = -1;
+#endif
         if (fd_ >= 0) {
             direct_ = true;
             sector_align_ = 4096;
@@ -118,6 +122,10 @@ public:
                 err = "InkColdStore: cannot open " + strata_path;
                 return false;
             }
+#if defined(__APPLE__) && defined(F_NOCACHE)
+            (void)::fcntl(fd_, F_NOCACHE, 1);
+            sector_align_ = 4096;
+#endif
         }
 #endif
         // Each slot stores one expert aligned up to `sector_align_` plus one trailing sector for unaligned file offsets!

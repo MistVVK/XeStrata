@@ -24,7 +24,7 @@
 #endif
 
 #ifndef INK_VERSION
-#define INK_VERSION "0.1.65"
+#define INK_VERSION "0.1.66"
 #endif
 
 namespace ink_metal {

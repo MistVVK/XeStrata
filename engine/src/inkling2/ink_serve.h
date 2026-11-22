@@ -435,7 +435,7 @@ struct ServeConfig {
     std::string draft_mode = "auto";  // auto | dspark | off
     bool force_cpu = false;
     bool anti_loop = true;
-    std::string version = "0.1.65";
+    std::string version = "0.1.66";
 };
 
 inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& backend) {

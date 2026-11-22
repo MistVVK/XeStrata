@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto need = [&]() -> std::string { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(); };
-        if (a == "--version") { printf("strata-inkling 0.1.65\n"); return 0; }
+        if (a == "--version") { printf("strata-inkling 0.1.66\n"); return 0; }
         else if (a == "--model" || a == "-m" || a == "--native") model_path = need();
         else if (a == "--vision") vision_path = need();
         else if (a == "--image") image_path = need();
@@ -172,7 +172,7 @@ int main(int argc, char** argv) {
     std::string err;
     if (show_info) {
         if (!mod.probe_only(model_path, err)) { fprintf(stderr, "[ERROR] %s\n", err.c_str()); return 1; }
-        printf("strata-inkling 0.1.65\n");
+        printf("strata-inkling 0.1.66\n");
         printf("arch=inkling2_loop layers=%d visits=%d hidden=%d vocab=%d experts=%d eos=%d drafter=%s images=%d image_pad=%d parallel=64 backend=sycl build=%s\n",
                mod.man.c.n_phys, mod.man.c.n_visits, mod.man.c.hidden, mod.man.c.vocab_unpadded,
                mod.man.c.n_experts, mod.man.c.eos_id, mod.man.c.has_dspark ? "dspark" : "none",

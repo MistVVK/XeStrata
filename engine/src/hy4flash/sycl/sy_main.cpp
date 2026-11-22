@@ -12,7 +12,7 @@
 using namespace hy4s;
 
 #ifndef HY4_VERSION
-#define HY4_VERSION "0.2.18-dev-sycl"
+#define HY4_VERSION "0.1.66"
 #endif
 
 // `strata-hy4 --export-tokenizer FILE.strata DIR`: Section 0's tokenizer_json and chat_template to DIR/tokenizer.hf.json and DIR/chat_template.jinja

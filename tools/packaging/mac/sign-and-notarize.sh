@@ -49,7 +49,8 @@ NOTARY_PROFILE="${NOTARY_PROFILE:-strata-notary}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENT_NODE_SRC="$HERE/entitlements-node.plist"
 
-INPUT=""; TERMINAL=""; ENGINE=""; OUT=""; DRY=0; KEEP=0; SIGN_NESTED=0; UPDATER_ARCHIVE=0
+INPUT=""; TERMINAL=""; OUT=""; DRY=0; KEEP=0; SIGN_NESTED=0; UPDATER_ARCHIVE=0
+declare -a ENGINES=()
 WORK=""
 LOG=""
 declare -a RESULTS=()
@@ -65,7 +66,7 @@ usage() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --terminal)    [ $# -ge 2 ] || usage; TERMINAL="$2"; shift 2 ;;
-    --engine)      [ $# -ge 2 ] || usage; ENGINE="$2"; shift 2 ;;
+    --engine)      [ $# -ge 2 ] || usage; ENGINES+=("$2"); shift 2 ;;
     --out)         [ $# -ge 2 ] || usage; OUT="$2"; shift 2 ;;
     --dry-run)     DRY=1; shift ;;
     --keep-work)   KEEP=1; shift ;;
@@ -76,7 +77,7 @@ while [ $# -gt 0 ]; do
     *)             if [ -z "$INPUT" ]; then INPUT="$1"; shift; else echo "unexpected argument: $1" >&2; usage; fi ;;
   esac
 done
-[ -n "$INPUT" ] || [ -n "$TERMINAL" ] || [ -n "$ENGINE" ] || usage
+[ -n "$INPUT" ] || [ -n "$TERMINAL" ] || [ "${#ENGINES[@]}" -gt 0 ] || usage
 if [ "$UPDATER_ARCHIVE" -eq 1 ] && [ -z "$INPUT" ]; then echo "--updater-archive needs the app (a .dmg or .app) as the input" >&2; usage; fi
 
 # ----------------------------------------------------------------------------------------------------------------- output helpers
@@ -110,7 +111,7 @@ summary() {
   else
     say "RESULT: FAILED. Read the FAIL line above. Full log: ${LOG:-none}"
   fi
-  if [ -n "$TERMINAL" ] || [ -n "$ENGINE" ]; then
+  if [ -n "$TERMINAL" ] || [ "${#ENGINES[@]}" -gt 0 ]; then
     say ""
     say "Note on the Terminal zip and the engine folder: Apple cannot staple a ticket to bare command-line programs in a zip, so the zip carries no ticket. Notarisation is"
     say "still recorded at Apple by the programs' hashes, and macOS checks that online the first time a quarantined (browser-downloaded) copy is opened."
@@ -182,11 +183,15 @@ fi
 
 [ -z "$INPUT" ] || [ -e "$INPUT" ] || { echo "not found: $INPUT" >&2; exit 2; }
 [ -z "$TERMINAL" ] || [ -f "$TERMINAL" ] || { echo "not found: $TERMINAL" >&2; exit 2; }
-[ -z "$ENGINE" ] || [ -f "$ENGINE" ] || { echo "not found: $ENGINE" >&2; exit 2; }
-case "$ENGINE" in ""|*.tar.gz|*.tgz) ;; *) echo "--engine takes the engine folder as a .tar.gz: $ENGINE" >&2; exit 2 ;; esac
+if [ "${#ENGINES[@]}" -gt 0 ]; then
+  for eng in "${ENGINES[@]}"; do
+    [ -f "$eng" ] || { echo "not found: $eng" >&2; exit 2; }
+    case "$eng" in *.tar.gz|*.tgz) ;; *) echo "--engine takes the engine folder as a .tar.gz: $eng" >&2; exit 2 ;; esac
+  done
+fi
 
 if [ -z "$OUT" ]; then
-  first="${INPUT:-${TERMINAL:-$ENGINE}}"
+  first="${INPUT:-${TERMINAL:-${ENGINES[0]:-}}}"
   OUT="$(cd "$(dirname "$first")" && pwd)/signed"
 fi
 mkdir -p "$OUT" || { echo "cannot create $OUT" >&2; exit 2; }
@@ -204,7 +209,7 @@ say "  output   : $OUT"
 say ""
 
 need_kb=0
-for f in "$INPUT" "$TERMINAL" "$ENGINE"; do
+for f in "$INPUT" "$TERMINAL" ${ENGINES[@]+"${ENGINES[@]}"}; do
   [ -n "$f" ] || continue
   kb="$(du -sk "$f" | awk '{print $1}')"; need_kb=$((need_kb + kb * 5))
 done
@@ -722,7 +727,7 @@ process_terminal() {
 # engine-component.json) as a .tar.gz of ONE folder. The Qwen engine gets its Developer ID signature as a nested program of the signed
 # app; this does the same for a package outside the app. Same identity and options as every nested program above; no entitlements.
 process_engine() {
-  local src=$ENGINE edir="$WORK/engine" name stem top tops final notarize_zip bin f bad=0 n rc
+  local src=$1 eidx=$2 edir="$WORK/engine-$2" name stem top tops final notarize_zip bin f bad=0 n rc
   name="$(basename "$src")"
   mkdir -p "$edir"
   tar -xzf "$src" -C "$edir" || fail "unpack the engine folder" "tar failed"
@@ -751,8 +756,8 @@ process_engine() {
   # the signed program starts under the hardened runtime (a signing mistake kills it at once, exit 137); no model is loaded
   bin="$(grep -o '"entrypoint"[^,]*' "$top/engine-component.json" 2>/dev/null | sed 's/.*: *"\(.*\)"/\1/' | head -n 1)"
   if [ -n "$bin" ] && [ -x "$top/$bin" ]; then
-    run_timeout 30 "$top/$bin" --help >"$WORK/engine-help.txt" 2>&1; rc=$?
-    cat "$WORK/engine-help.txt" >>"$LOG"
+    run_timeout 30 "$top/$bin" --help >"$WORK/engine-${eidx}-help.txt" 2>&1; rc=$?
+    cat "$WORK/engine-${eidx}-help.txt" >>"$LOG"
     if [ "$rc" -ge 128 ]; then fail "smoke: engine package starts" "$bin was killed (exit $rc) under the hardened runtime"
     else rec OK "smoke: engine package starts" "$bin, no model loaded"; fi
   else
@@ -772,7 +777,7 @@ process_engine() {
   rec OK "pack the engine folder" "$(basename "$final")"
 
   if [ "$DRY" -eq 0 ]; then
-    notarize "$notarize_zip" "engine"
+    notarize "$notarize_zip" "engine-${eidx}"
     rec INFO "staple the engine folder" "not possible for bare programs; Apple holds the ticket online"
   else
     rec INFO "notarise the engine folder" "skipped in a dry run"
@@ -783,5 +788,11 @@ process_engine() {
 # ----------------------------------------------------------------------------------------------------------------- run
 if [ -n "$INPUT" ]; then process_app; fi
 if [ -n "$TERMINAL" ]; then process_terminal; fi
-if [ -n "$ENGINE" ]; then process_engine; fi
+if [ "${#ENGINES[@]}" -gt 0 ]; then
+  eidx=0
+  for eng in "${ENGINES[@]}"; do
+    eidx=$((eidx + 1))
+    process_engine "$eng" "$eidx"
+  done
+fi
 finish 0

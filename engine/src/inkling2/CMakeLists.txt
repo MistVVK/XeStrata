@@ -2,7 +2,7 @@
 # MIT License - Copyright (c) 2026 Strata contributors
 cmake_minimum_required(VERSION 3.24)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-  project(strata_inkling VERSION 0.1.65 LANGUAGES C CXX)
+  project(strata_inkling VERSION 0.1.66 LANGUAGES C CXX)
   set(CMAKE_CXX_STANDARD 20)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
   set(CMAKE_CXX_EXTENSIONS OFF)
@@ -59,20 +59,21 @@ if(NOT TARGET strata_quant)
       ${_sq}/src/quant/x86/dot_avx.cpp
       ${_sq}/src/quant/x86/act_avx.cpp
       ${_sq}/src/quant/x86/dot_avx512.cpp
+      ${_sq}/src/quant/x86/act_avx512.cpp
     )
     target_compile_definitions(strata_quant PRIVATE STRATA_QUANT_X86_TIERS=1)
     if(MSVC)
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx2.cpp ${_sq}/src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx.cpp ${_sq}/src/quant/x86/act_avx.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
       if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/clang:-mavx512vnni")
+        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp ${_sq}/src/quant/x86/act_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/clang:-mavx512vnni")
       else()
-        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp ${_sq}/src/quant/x86/act_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
       endif()
     else()
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx2.cpp ${_sq}/src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=fast")
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx.cpp ${_sq}/src/quant/x86/act_avx.cpp PROPERTIES COMPILE_OPTIONS "-mavx;-mno-avx2;-mno-fma;-mno-f16c;-ffp-contract=fast")
-      set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx2;-mfma;-mf16c;-ffp-contract=fast")
+      set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp ${_sq}/src/quant/x86/act_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx2;-mfma;-mf16c;-ffp-contract=fast")
     endif()
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     target_sources(strata_quant PRIVATE ${_sq}/src/quant/arm/dot_neon.cpp ${_sq}/src/quant/arm/act_neon.cpp)

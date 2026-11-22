@@ -25,7 +25,7 @@
 using namespace ink2;
 
 #ifndef INKLING_VERSION
-#define INKLING_VERSION "0.1.65"
+#define INKLING_VERSION "0.1.66"
 #endif
 
 static int cmd_export_tokenizer(const std::string& file, const std::string& dir) {

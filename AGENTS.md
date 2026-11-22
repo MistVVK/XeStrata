@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Version 0.2.19, engine 0.1.65. The public model families are
+Version 0.2.20, engine 0.1.66. The public model families are
 Qwen3.8-Flash-Next and Qwen3.6-35B-A3B. Read **[docs/AI_REFERENCE.md](docs/AI_REFERENCE.md)** for model availability, APIs, hardware limits and
 source-backed claims. Articles and videos should use **[docs/MEDIA_KIT.md](docs/MEDIA_KIT.md)**.
 
@@ -13,7 +13,7 @@ Strata has three parts:
 
 - **The app** (`app/desktop`, the Tauri shell; `app/host`, the Node host and the web UI). It is for people who do
   not want a terminal. One installer per system ([latest release](https://github.com/Niko1221/Strata/releases/latest)):
-  `Strata-0.2.19-windows-x64-setup.exe`, `Strata-0.2.19-linux-x86_64.AppImage`, `Strata-0.2.19-macos-arm64.dmg`.
+  `Strata-0.2.20-windows-x64-setup.exe`, `Strata-0.2.20-linux-x86_64.AppImage`, `Strata-0.2.20-macos-arm64.dmg`.
   The Windows and Linux installers carry no engine: the app downloads the engine for the graphics card on first
   start, or installs a file the user already has. The Mac dmg keeps its small Metal engine inside.
 - **The Terminal** (`strata.py`, `strata_cli/`, `strata_control/`): the `strata` command. It sets up a model, serves

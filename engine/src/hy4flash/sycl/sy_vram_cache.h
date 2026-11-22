@@ -200,6 +200,127 @@ struct VramExpertGroup {
     int32_t pair_idx[VC_GRP_MAX_T];  // output pair slot [0..npairs-1]
 };
 
+// Peer-GPU (`sy_peer.h`) SG32 row dot product & pair descriptor (supported on both Alchemist & Battlemage).
+template <class ActT, bool Q8_ACT>
+inline float sg_dot_row(const sycl::nd_item<1>& it, int code, const uint8_t* rp, const ActT* x) {
+    auto sg = it.get_sub_group();
+    const int lane = (int)it.get_local_id(0) & 31;
+    const int sby = vc_sb_bytes(code);
+    const int g = lane >> 3;
+    const int j0 = (lane & 7) << 3;
+    const int base_i = (g << 6) + j0;
+    float acc = 0.0f;
+#pragma unroll
+    for (int sbi = 0; sbi < 6; ++sbi) {
+        const uint8_t* blk = rp + (size_t)sbi * sby;
+        const float D = h2f_bits(ld16(blk));
+        const float eff = D * ((float)blk[2 + g] / 255.0f);
+        const uint8_t* pl = blk + 6;
+        const ActT* xp = x + sbi * 256 + base_i;
+        float xv[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) xv[k] = (float)xp[k];
+        float scale_x = 1.0f;
+        if constexpr (Q8_ACT) {
+            float amax = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) amax = sycl::fmax(amax, sycl::fabs(xv[k]));
+            amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 1));
+            amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 2));
+            amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 4));
+            scale_x = amax * (1.0f / 127.0f);
+            const float inv = amax > 0.0f ? (127.0f / amax) : 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) xv[k] = (float)sycl::clamp((int)sycl::rint(xv[k] * inv), -127, 127);
+        }
+        const float effx = eff * scale_x;
+        float sq = 0.0f, sx = 0.0f;
+        if (code == 2) {
+            const uint8_t b0 = pl[base_i >> 2], b1 = pl[(base_i >> 2) + 1];
+            sq = (float)(b0 & 3u) * xv[0] + (float)((b0 >> 2) & 3u) * xv[1] + (float)((b0 >> 4) & 3u) * xv[2] + (float)(b0 >> 6) * xv[3] +
+                 (float)(b1 & 3u) * xv[4] + (float)((b1 >> 2) & 3u) * xv[5] + (float)((b1 >> 4) & 3u) * xv[6] + (float)(b1 >> 6) * xv[7];
+            sx = xv[0] + xv[1] + xv[2] + xv[3] + xv[4] + xv[5] + xv[6] + xv[7];
+            acc += effx * (sq - 1.5f * sx);
+        } else if (code == 3) {
+            const uint8_t b0 = pl[base_i >> 2], b1 = pl[(base_i >> 2) + 1];
+            const uint32_t hi = pl[64 + (base_i >> 3)];
+            sq = (float)((b0 & 3u) | ((hi & 1u) << 2)) * xv[0] + (float)(((b0 >> 2) & 3u) | (((hi >> 1) & 1u) << 2)) * xv[1] +
+                 (float)(((b0 >> 4) & 3u) | (((hi >> 2) & 1u) << 2)) * xv[2] + (float)((b0 >> 6) | (((hi >> 3) & 1u) << 2)) * xv[3] +
+                 (float)((b1 & 3u) | (((hi >> 4) & 1u) << 2)) * xv[4] + (float)(((b1 >> 2) & 3u) | (((hi >> 5) & 1u) << 2)) * xv[5] +
+                 (float)(((b1 >> 4) & 3u) | (((hi >> 6) & 1u) << 2)) * xv[6] + (float)((b1 >> 6) | (((hi >> 7) & 1u) << 2)) * xv[7];
+            sx = xv[0] + xv[1] + xv[2] + xv[3] + xv[4] + xv[5] + xv[6] + xv[7];
+            acc += effx * (sq - 3.5f * sx);
+        } else if (code == 4) {
+            const uint8_t* p = pl + (base_i >> 1);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint8_t by = p[k];
+                sq += (float)(by & 15u) * xv[2 * k] + (float)(by >> 4) * xv[2 * k + 1];
+                sx += xv[2 * k] + xv[2 * k + 1];
+            }
+            acc += effx * (sq - 7.5f * sx);
+        } else if (code == 0) {
+            const float fine = 0.5f + (float)((pl[40 + (g >> 1)] >> ((g & 1) * 4)) & 15u) / 15.0f;
+            const int grp = base_i >> 5;
+            const uint8_t* p = pl + grp * 5;
+            const uint64_t bits = (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32);
+            const int j_sub = (base_i & 31) >> 2;
+            const uint32_t i0 = (uint32_t)((bits >> (5 * j_sub)) & 0x1Fu);
+            const uint32_t i1 = (uint32_t)((bits >> (5 * (j_sub + 1))) & 0x1Fu);
+            sq = (float)kS125[i0][0] * xv[0] + (float)kS125[i0][1] * xv[1] + (float)kS125[i0][2] * xv[2] + (float)kS125[i0][3] * xv[3] +
+                 (float)kS125[i1][0] * xv[4] + (float)kS125[i1][1] * xv[5] + (float)kS125[i1][2] * xv[6] + (float)kS125[i1][3] * xv[7];
+            acc += effx * fine * sq;
+        } else if (code == 1) {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int idx = base_i + k;
+                sq += (float)vc_s15_trit(pl[idx / 5], idx % 5) * xv[k];
+            }
+            acc += effx * sq;
+        } else if (code == 5) {
+            const uint8_t* p = pl + (base_i >> 1);
+            const uint32_t hi = pl[128 + (base_i >> 3)];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint8_t by = p[k];
+                const uint32_t q0 = (by & 15u) | (((hi >> (2 * k)) & 1u) << 4);
+                const uint32_t q1 = (by >> 4) | (((hi >> (2 * k + 1)) & 1u) << 4);
+                sq += (float)q0 * xv[2 * k] + (float)q1 * xv[2 * k + 1];
+                sx += xv[2 * k] + xv[2 * k + 1];
+            }
+            acc += effx * (sq - 15.5f * sx);
+        } else if (code == 6) {
+            const uint8_t* p = pl + (base_i >> 1);
+            const uint32_t h0 = pl[128 + (base_i >> 2)];
+            const uint32_t h1 = pl[128 + (base_i >> 2) + 1];
+            const uint32_t h16 = h0 | (h1 << 8);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint8_t by = p[k];
+                const uint32_t q0 = (by & 15u) | (((h16 >> (4 * k)) & 3u) << 4);
+                const uint32_t q1 = (by >> 4) | (((h16 >> (4 * k + 2)) & 3u) << 4);
+                sq += (float)q0 * xv[2 * k] + (float)q1 * xv[2 * k + 1];
+                sx += xv[2 * k] + xv[2 * k + 1];
+            }
+            acc += effx * (sq - 31.5f * sx);
+        } else {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) sq += (float)(int8_t)pl[base_i + k] * xv[k];
+            acc += effx * sq;
+        }
+    }
+    return sg_sum(it, acc);
+}
+
+struct VramPair {
+    const uint8_t* body;
+    uint32_t dn_off;
+    int32_t tok;
+    int32_t gu;
+    int32_t dn;
+    float weight;
+};
+
 // GEMM1 (fused gate + up + SwiGLU/sq) with pre-quantized Q8_1_G64 activations cached in SLM (<= 12 KiB/WG) + native SG16.
 // 96 WGs/expert x 256 threads (16 SG16 rows/WG) -> 1,536 rows. Each weight row loaded ONCE across all ntok <= NT tokens!
 template <int NT>

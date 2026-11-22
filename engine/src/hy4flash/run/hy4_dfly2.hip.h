@@ -449,14 +449,14 @@ struct DFly2 {
         hipGraphExec_t exec = nullptr;
     };
     std::vector<DgEntry> dg_cache;
-    cudaGraphExec_t dg_eval[DFLY_KMAX + 1] = {};
+    hipGraphExec_t dg_eval[DFLY_KMAX + 1] = {};
     int dg_eval_rv = -1;
     uint64_t dg_eval_kv_gen = ~0ull;
     void dg_clear() {
         for (auto& e : dg_cache) if (e.exec) (void)hipGraphExecDestroy(e.exec);
         dg_cache.clear();
         for (int j = 0; j <= DFLY_KMAX; ++j)
-            if (dg_eval[j]) { (void)cudaGraphExecDestroy(dg_eval[j]); dg_eval[j] = nullptr; }
+            if (dg_eval[j]) { (void)hipGraphExecDestroy(dg_eval[j]); dg_eval[j] = nullptr; }
         dg_eval_rv = -1;
     }
     ~DFly2() { dg_clear(); }

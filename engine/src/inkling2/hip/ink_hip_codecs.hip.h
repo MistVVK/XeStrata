@@ -131,6 +131,11 @@ __device__ __forceinline__ float hip_gguf_q3k_scale(const uint8_t* sc, int is) {
     return static_cast<float>(s - 32);
 }
 
+__device__ __forceinline__ float ld_fp16_as_f32(const uint8_t* p) {
+    const uint16_t bits = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+    return static_cast<float>(__builtin_bit_cast(half_t, bits));
+}
+
 // Decode 8 consecutive weights starting at 8-aligned `col` from a single GGUF row into uint4 (8 x FP16 for fdot2/WMMA)
 __device__ __forceinline__ uint4 hip_gguf_decode_8_f16(uint32_t t, const uint8_t* __restrict__ row, int col, float ext_scale) {
     float w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -427,11 +432,6 @@ __device__ __forceinline__ int sk_i8_bias(int code) {
         case CODE_S6_K: return 63;
         default:        return 0;
     }
-}
-
-__device__ __forceinline__ float ld_fp16_as_f32(const uint8_t* p) {
-    const uint16_t bits = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
-    return static_cast<float>(__builtin_bit_cast(half_t, bits));
 }
 
 __device__ __forceinline__ int s15_trit(uint32_t byte_val, int pos) {

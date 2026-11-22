@@ -10,3 +10,6 @@
 #ifndef MADV_HUGEPAGE
 #define MADV_HUGEPAGE (-1)
 #endif
+#ifndef MADV_NOHUGEPAGE
+#define MADV_NOHUGEPAGE (-1)
+#endif
