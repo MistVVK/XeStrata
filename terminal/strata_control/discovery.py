@@ -353,7 +353,7 @@ def footprint(cfg: dict, config: Path | None = None) -> Footprint:
         v = _flag_value(args, flag)
         if v and v.lower().endswith(".gguf") and Path(v) not in fp.weights and flag != "--ple-gguf":
             fp.weights.append(Path(v))
-    if not fp.weights and str(cfg.get("arch") or "").lower() == "hy4flash":
+    if not fp.weights and str(cfg.get("arch") or "").lower() in ("hy4flash", "inkling2_loop"):
         for flag in ("--native", "--engram"):
             v = _flag_value(args, flag)
             if v and v.lower().endswith(".strata") and Path(v) not in fp.weights:

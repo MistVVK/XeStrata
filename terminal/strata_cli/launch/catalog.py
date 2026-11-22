@@ -30,7 +30,7 @@ def _merge_families(cat: Any, families: dict) -> dict:
             all_fams.update(strata.own_families())
             s = strata.setup_module()
             if s is not None:
-                for tbl in ("OWN_PATH_FAMILIES", "HY4_FAMILIES"):
+                for tbl in ("OWN_PATH_FAMILIES", "HY4_FAMILIES", "INKLING_FAMILIES"):
                     for f, d in (getattr(s, tbl, None) or {}).items():
                         all_fams.setdefault(f, d)
     except Exception:                                  # noqa: BLE001
@@ -457,6 +457,9 @@ class Catalog:
         if family == "hy4-flash":
             from strata_control import hy4_family
             return list(hy4_family.CONTEXTS)
+        if family == "inkling-2-mini":
+            from strata_control import inkling_family
+            return list(inkling_family.CONTEXTS)
         return self.contexts()
 
     def recommendation(self, hw: dict | None = None) -> dict:
@@ -517,6 +520,10 @@ class Catalog:
                         from strata_control import hy4_family
                         got = sum(f.stat().st_size for f in folder.glob("*.strata")
                                   if f.name in hy4_family.FILES) / 1e9
+                    elif r.family == "inkling-2-mini":
+                        from strata_control import inkling_family
+                        got = sum(f.stat().st_size for f in folder.glob("*.strata")
+                                  if f.name in inkling_family.FILES) / 1e9
                     else:
                         got = sum(f.stat().st_size for f in folder.glob("*.gguf")
                                   if not f.name.lower().startswith("mmproj")) / 1e9
@@ -588,9 +595,9 @@ class Catalog:
         _m, families, _c, _s = self.tables()
         all_families = _merge_families(self, families)
         models = Path(base) / "models"
-        if all_families.get(family, {}).get("hy4"):
-            hy4_dir = models / family
-            return {"folder": hy4_dir, "rule": "exact" if hy4_dir.is_dir() else "fallback", "tried": [{"path": hy4_dir, "rule": "exact", "exists": hy4_dir.is_dir()}]}
+        if all_families.get(family, {}).get("hy4") or all_families.get(family, {}).get("inkling"):
+            fam_dir = models / family
+            return {"folder": fam_dir, "rule": "exact" if fam_dir.is_dir() else "fallback", "tried": [{"path": fam_dir, "rule": "exact", "exists": fam_dir.is_dir()}]}
         own = models / (all_families[family].get("tag", "") + model)
         lower = models / self.tag_of(family, model)
         tried = []
@@ -618,6 +625,9 @@ class Catalog:
         if family == "hy4-flash":
             from strata_control import hy4_fit
             return tokens * hy4_fit.KV_GB_PER_TOKEN
+        if family == "inkling-2-mini":
+            from strata_control import inkling_fit
+            return inkling_fit.kv_cache_gb(tokens)
         mod = self.strata.setup_module()
         table = getattr(mod, "UD_FIT_KV_BYTES", None) or {"fp16": 2112, "int8": 1056, "q4_0": 576, "k8v4": 816}
         return tokens * 13 * table.get(kv, 1056) / 1e9
@@ -627,10 +637,13 @@ class Catalog:
         the one rule of the app, the Terminal and setup). A Mac keeps its unified-memory rule."""
         from strata_control import default_context
         hw = hw or self.hardware()
-        if hw.get("mac") and hw.get("ram_gb") and family != "hy4-flash":
+        if hw.get("mac") and hw.get("ram_gb") and family not in ("hy4-flash", "inkling-2-mini"):
             mac = self.strata.mac()                           # a Mac: the context by unified memory (strata_control/mac_fit.py)
             if mac is not None:
                 return int(mac.recommend_context(float(hw["ram_gb"])))
+        if family == "inkling-2-mini":
+            from strata_control import inkling_family
+            return inkling_family.DEFAULT_CONTEXT
         return default_context.pick(self.contexts_for(family, model))
 
     # ---- pictures
@@ -649,7 +662,7 @@ class Catalog:
     def reader_state(self, family: str | None = None) -> str:
         """"present" when the installed engine carries the picture reader (strata-vision; built into strata-hy4 for Hy4-Flash), "missing" when an engine is installed without it,
         "unknown" before any engine is installed (the first launch fetches one that has it)."""
-        if family == "hy4-flash":
+        if family in ("hy4-flash", "inkling-2-mini"):
             return "present"
         try:
             from strata_control import engine_component as ec
@@ -667,7 +680,7 @@ class Catalog:
         """The picture setting nobody chose: off for a model that cannot read pictures or an engine without the reader; else on, with the
         reader the one rule of strata_control/vision_reader.py gives: the CPU reader under 24 GB of graphics memory, the GPU reader from 24 GB,
         on every make of card (owner decision 2026-10-18); on a Mac the Metal reader (unified memory). Without a usable graphics card there is nothing to read on: the CPU reader."""
-        if family == "hy4-flash":
+        if family in ("hy4-flash", "inkling-2-mini"):
             return "on" if images else "off"
         from strata_control import vision_reader as VR
         if not images or self.reader_state() == "missing" or self.pictures_not_on_card():
@@ -682,7 +695,7 @@ class Catalog:
         """T14: an Intel Arc card on Linux whose engine does not carry the picture reader (the engine route that builds the model's pack from the files itself
         fetches none) starts the engine text-only, so offering "Yes" would say "Pictures on" and then answer "I don't see a picture" (USERTEST-LIN, A750).
         An engine that carries the reader (reader_state "present", the B-series decision of 2026-10-22; or strata-hy4's native SYCL vision) keeps pictures on."""
-        if family == "hy4-flash" or not sys.platform.startswith("linux"):
+        if family in ("hy4-flash", "inkling-2-mini") or not sys.platform.startswith("linux"):
             return False
         try:
             return self.engine_backend() == "sycl" and self.reader_state() != "present"

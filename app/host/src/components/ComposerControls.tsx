@@ -24,6 +24,7 @@ const modes: {
 ];
 const efforts = ['Off', 'Low', 'Medium', 'High', 'Max'];
 const hy4Efforts = ['Off', 'High', 'Max'];
+const inklingEfforts = ['Off', 'Minimal', 'Low', 'Medium', 'High', 'Max'];
 /** The most tokens a reply may spend thinking (the server's reasoning_budget_tokens); 0 = no limit. */
 const THINKING_BUDGETS: [number, string][] = [[0, 'No limit'], [2048, '2K'], [8192, '8K'], [32768, '32K']];
 const textTypes = /\.(txt|md|markdown|csv|tsx?|jsx?|py|json|css|rs|go|sh|html?|ya?ml|toml|xml|log)$/i;
@@ -76,9 +77,10 @@ export function ComposerControls({ session, onPreview, onAttach, onError, onSlas
     const apiOnlyDefault = !!apiModel && apiModel.thinks !== true;
     const pictures = pictureStatus(native, remoteModel, providers);
     const isHy4Active = !remoteModel && !!nativeModel && /^hy4-flash/i.test(nativeModel.model);
-    const activeEfforts = isHy4Active ? hy4Efforts : efforts;
+    const isInklingActive = !remoteModel && !!nativeModel && /^inkling-2-mini/i.test(nativeModel.model);
+    const activeEfforts = isHy4Active ? hy4Efforts : isInklingActive ? inklingEfforts : efforts;
     const mode = modes.find(m => m.value === session?.preferences?.mode) ?? modes[0];
-    const effort = activeEfforts.includes(session?.preferences?.thinking ?? '') ? session!.preferences!.thinking! : (isHy4Active ? 'High' : 'Medium');
+    const effort = activeEfforts.includes(session?.preferences?.thinking ?? '') ? session!.preferences!.thinking! : ((isHy4Active || isInklingActive) ? 'High' : 'Medium');
     const budget = session?.preferences?.thinkingBudget ?? 0;
     const shortcut = MOD === '⌘' ? '⌘⇧A' : 'Ctrl+Shift+A';
     async function openFile(selected: File | undefined) {

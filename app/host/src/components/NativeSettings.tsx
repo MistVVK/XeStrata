@@ -9,9 +9,11 @@ import { Btn, ErrorNotice, Select } from './ui';
 import { draftingChoices } from '../lib/drafting';
 import { NativeMcpEditor } from './NativeMcpEditor';
 import { choiceOptions, choiceValue, isNumberChoice, withChoice } from '../lib/speed-choice';
-import { HY4_FAMILY } from '../lib/native-catalog';
+import { HY4_FAMILY, INKLING_FAMILY } from '../lib/native-catalog';
 /** Native engine fields that apply only to the Qwen Flash-Next engine (strata-hy4 ignores them). */
 const HY4_HIDDEN_FIELDS = new Set(['mtp', 'batchMtp', 'layer_split', 'gpu_order', 'split_skip_if_fits', 'vram_elastic', 'vram_reserve_mib', 'vision_tokens', 'vision_min_tokens', 'parallel', 'effort_position', 'anthropic_thinking']);
+/** Native engine fields that Inkling-2-Mini (strata-inkling) ignores — note `parallel` (1..64) IS shown! */
+const INKLING_HIDDEN_FIELDS = new Set(['mtp', 'batchMtp', 'layer_split', 'gpu_order', 'split_skip_if_fits', 'vram_elastic', 'vram_reserve_mib', 'vision_tokens', 'vision_min_tokens', 'effort_position', 'anthropic_thinking']);
 /** One of the speed features: what it is called, what it does, whether it is on by default, and the engine environment it writes outside its default (server/native-settings.mjs). */
 interface SpeedSwitch {
     id: string;
@@ -128,9 +130,10 @@ export function NativeSettings({ model }: {
     </details>;
     const family = (native?.catalog?.families ?? []).find(f => f.sizes.some(s => s.id === model))?.family ?? null;
     const isHy4 = family === HY4_FAMILY || /^hy4-flash/i.test(model);
-    const draftingOpts = isHy4 ? ['dfly2', 'off'] : draftingChoices(family, native?.capabilities?.dflash2);
+    const isInkling = family === INKLING_FAMILY || /^inkling-2-mini/i.test(model);
+    const draftingOpts = isHy4 ? ['dfly2', 'off'] : isInkling ? ['dspark', 'off'] : draftingChoices(family, native?.capabilities?.dflash2);
     const draftingOffered = !!draftingOpts;
-    const rows = (native?.fields ?? []).filter(f => (f.id !== 'drafting' || draftingOffered) && (!isHy4 || !HY4_HIDDEN_FIELDS.has(f.id)) && `${tr(f.label)} ${f.id} ${tr(f.group)}`.toLowerCase().includes(query.toLowerCase())).map(f => f.id === 'drafting' && draftingOpts ? { ...f, choices: draftingOpts } : f);
+    const rows = (native?.fields ?? []).filter(f => (f.id !== 'drafting' || draftingOffered) && (!isHy4 || !HY4_HIDDEN_FIELDS.has(f.id)) && (!isInkling || !INKLING_HIDDEN_FIELDS.has(f.id)) && `${tr(f.label)} ${f.id} ${tr(f.group)}`.toLowerCase().includes(query.toLowerCase())).map(f => f.id === 'drafting' && draftingOpts ? { ...f, choices: draftingOpts } : f);
     const switchRows = switches.filter(sw => `${tr(sw.label)} ${sw.id} ${tr(switchGroup(sw))}`.toLowerCase().includes(query.toLowerCase()));
     // A choice switch (owner, 0.2.16: STRATA_ROUTE_TAIL_SKIP): the default writes no entry, every other choice writes its value (src/lib/speed-choice.ts). 0.2.17: the default is Off, On is 7.
     const choiceRow = (sw: SpeedSwitch) => { const known = choiceValue(sw, values.env), numbered = isNumberChoice(sw, known);

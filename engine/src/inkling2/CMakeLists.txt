@@ -80,6 +80,19 @@ endif()
 if(STRATA_ENABLE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+  if(NOT DEFINED STRATA_INK_CUDA_ARCHS OR "${STRATA_INK_CUDA_ARCHS}" STREQUAL "")
+    if(DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
+      set(STRATA_INK_CUDA_ARCHS "${CMAKE_CUDA_ARCHITECTURES}")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|ARM64|arm64)$")
+      set(STRATA_INK_CUDA_ARCHS "121")
+    elseif(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+      set(STRATA_INK_CUDA_ARCHS "75;80;86;89;120")
+    elseif(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+      set(STRATA_INK_CUDA_ARCHS "60;61;70;75;80;86;89;120")
+    else()
+      set(STRATA_INK_CUDA_ARCHS "60;61;70;75;80;86;89")
+    endif()
+  endif()
   add_library(strata_inkling_ep_cuda STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/hybrid_doorbell.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/ep_dual_gpu.cu
@@ -90,9 +103,15 @@ if(STRATA_ENABLE_CUDA)
   )
   target_link_libraries(strata_inkling_ep_cuda PUBLIC strata_inkling_core CUDA::cudart CUDA::cublas)
   target_compile_definitions(strata_inkling_ep_cuda PUBLIC INKLING_ENABLE_EP_CUDA=1)
+  if(WIN32)
+    target_compile_definitions(strata_inkling_ep_cuda PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+  endif()
   set_target_properties(strata_inkling_ep_cuda PROPERTIES
     CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${STRATA_INK_CUDA_ARCHS}"
     CUDA_SEPARABLE_COMPILATION OFF
+    POSITION_INDEPENDENT_CODE ON
   )
   target_link_libraries(strata-inkling PRIVATE strata_inkling_ep_cuda)
   target_compile_definitions(strata-inkling PRIVATE INKLING_ENABLE_EP_CUDA=1)

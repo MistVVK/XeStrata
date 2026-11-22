@@ -101,10 +101,16 @@ def _is_hy4(t: Target) -> bool:
     return (t.model or "").strip().lower().startswith("hy4-flash")
 
 
+def _is_inkling(t: Target) -> bool:
+    return (t.model or "").strip().lower().startswith("inkling-2-mini")
+
+
 def _display_name(t: Target) -> str:
     m = (t.model or "").lower()
     if m.startswith("hy4-flash"):
         return "Tencent Hy4-Flash (Strata, local)"
+    if m.startswith("inkling-2-mini"):
+        return "Inkling-2-Mini (Strata, local)"
     if m.startswith("qwen3.6") or m.startswith("qwen36"):
         return "Qwen3.6-35B-A3B (Strata, local)"
     return "Qwen3.8-Flash-Next (Strata, local)"
@@ -142,8 +148,8 @@ def claude_file(t: Target) -> str:
 
 
 def omp_models(t: Target) -> str:
-    efforts = "[high, max]" if _is_hy4(t) else "[minimal, low, medium, high]"
-    default_level = "high" if _is_hy4(t) else "medium"
+    efforts = "[high, max]" if _is_hy4(t) else "[none, minimal, low, medium, high, max]" if _is_inkling(t) else "[minimal, low, medium, high]"
+    default_level = "high" if (_is_hy4(t) or _is_inkling(t)) else "medium"
     return ("providers:\n  strata:\n    baseUrl: " + t.base + "\n    api: openai-completions\n    auth: none\n    compat:\n"
             "      supportsDeveloperRole: false\n    models:\n      - id: " + t.model + "\n        name: " + _display_name(t) + "\n"
             "        reasoning: true\n        input: [text]\n        contextWindow: " + str(t.context) + "\n        maxTokens: " + str(t.output_cap) +
@@ -152,7 +158,7 @@ def omp_models(t: Target) -> str:
 
 
 def omp_config(t: Target) -> str:
-    level = "high" if _is_hy4(t) else "medium"
+    level = "high" if (_is_hy4(t) or _is_inkling(t)) else "medium"
     return ("modelRoles:\n  default: strata/" + t.model + f"\ndefaultThinkingLevel: {level}\ncompaction:\n  enabled: true\n  thresholdTokens: "
             + str(compact_at(t)) + "\n  keepRecentTokens: 4000\n  methodOrder:\n    - soft\n  idleEnabled: false\nsetupVersion: 2\n")
 
@@ -166,7 +172,7 @@ def pi_models(t: Target) -> str:
 
 
 def pi_settings(t: Target) -> str:
-    level = "high" if _is_hy4(t) else "medium"
+    level = "high" if (_is_hy4(t) or _is_inkling(t)) else "medium"
     return _j({"defaultProvider": "strata", "defaultModel": t.model, "defaultThinkingLevel": level,
                "compaction": {"enabled": True, "reserveTokens": max(1024, t.context - compact_at(t)), "keepRecentTokens": 4000}})
 

@@ -376,12 +376,12 @@ test('the Models page sends a plain Load, not the installer, when the only gap i
   const { build } = await import('esbuild');
   const built = await build({ stdin: { contents: "export * from './src/lib/native-catalog';", resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'node', loader: { '.json': 'json' } });
   const { fetchesPictures, PICTURE_FETCH_FAMILIES } = await import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].text).toString('base64')}`);
-  for (const family of ['qwen', 'coder', 'unsloth', 'gyro', 'swift', 'hy4-flash']) assert.equal(fetchesPictures({ sourceFamily: family }, true), true, family);
+  for (const family of ['qwen', 'coder', 'unsloth', 'gyro', 'swift', 'hy4-flash', 'inkling-2-mini']) assert.equal(fetchesPictures({ sourceFamily: family }, true), true, family);
   for (const family of ['nvfp4', 'qwen36', undefined]) assert.equal(fetchesPictures({ sourceFamily: family }, true), false, `${family} keeps the installer`);
   assert.equal(fetchesPictures({ sourceFamily: 'qwen' }, false), false, 'a source checkout has no Control to fetch them');
   assert.equal(fetchesPictures({ sourceFamily: 'qwen' }, undefined), false);
   assert.equal(fetchesPictures(undefined, true), false);
-  assert.deepEqual(PICTURE_FETCH_FAMILIES.slice().sort(), ['coder', 'gyro', 'hy4-flash', 'qwen', 'swift', 'unsloth']);
+  assert.deepEqual(PICTURE_FETCH_FAMILIES.slice().sort(), ['coder', 'gyro', 'hy4-flash', 'inkling-2-mini', 'qwen', 'swift', 'unsloth']);
   const screen = read('../src/components/NativeModels.tsx');
   assert.match(screen, /const picturesByLoad = fetchesPictures\(selectedSize, native\?\.packaged\)/);
   assert.match(screen, /\(!selectedSize\?\.images \|\| vision === 'no' \|\| picturesByLoad \|\| installed\.images && installed\.images !== 'off'\)/, 'the shortcut to a plain Load no longer needs the pictures to be prepared');

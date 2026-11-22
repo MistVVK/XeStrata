@@ -1066,9 +1066,9 @@ def pick_hip_devices(devices: list[dict]) -> tuple[list[int] | None, str | None]
 
 
 def parallel_slots(cfg: dict) -> int:
-    """How many batch slots the config asks for (0 = none): the args' own --batch/--slots, else "parallel"."""
+    """How many batch slots the config asks for (0 = none): the args' own --batch/--slots/--parallel, else "parallel"."""
     args = list(cfg.get("args") or [])
-    for k in ("--batch", "--slots"):
+    for k in ("--batch", "--slots", "--parallel"):
         if k in args:
             try:
                 return int(args[args.index(k) + 1])

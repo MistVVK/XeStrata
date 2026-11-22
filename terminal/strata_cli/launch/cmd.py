@@ -64,9 +64,9 @@ def _parallel(value: str) -> int:
     try:
         p = int(value)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"'{value}' is not a number of requests. Use 1 to 8, or leave it out to fit your card.") from None
-    if not 1 <= p <= 8:
-        raise argparse.ArgumentTypeError(f"{p} requests at once is outside what the engine can do. Use 1 to 8.")
+        raise argparse.ArgumentTypeError(f"'{value}' is not a number of requests. Use 1 to 64, or leave it out to fit your card.") from None
+    if not 1 <= p <= 64:
+        raise argparse.ArgumentTypeError(f"{p} requests at once is outside what the engine can do. Use 1 to 64.")
     return p
 
 

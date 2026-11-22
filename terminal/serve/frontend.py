@@ -39,9 +39,8 @@ class _GenerationExtension(jinja2.ext.Extension):
     tags = {"generation"}
 
     def parse(self, parser):
-        lineno = next(parser.stream).lineno
-        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
-        return body
+        next(parser.stream)
+        return parser.parse_statements(("name:endgeneration",), drop_needle=True)
 
 
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
@@ -59,20 +58,13 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
-        env = ImmutableSandboxedEnvironment(
-            trim_blocks=True,
-            lstrip_blocks=True,
-            extensions=["jinja2.ext.loopcontrols", _GenerationExtension],
-        )
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
+                                            extensions=["jinja2.ext.loopcontrols", _GenerationExtension])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self._is_hy4 = "<tool_calls{}>" in self.source or "<\uff5creasoning_mode" in self.source
-        self._is_inkling = (
-            "<|content_invoke_tool_json|>" in self.source
-            or "<|content_thinking|>" in self.source
-            or "Thinking effort level:" in self.source
-        )
+        self._is_inkling2 = "<|content_invoke_tool_json|>" in self.source or "tool_declare<|content_xml|>" in self.source
         self.template = env.from_string(self.source)
         self.caps = self._detect_caps()
 
@@ -87,9 +79,11 @@ class ChatTemplate:
         if self._is_hy4 and kwargs:
             from serve import hy4_dialect
             kwargs = hy4_dialect.template_kwargs(kwargs)
-        elif self._is_inkling:
+        elif self._is_inkling2:
             from serve import inkling_dialect
-            kwargs = inkling_dialect.template_kwargs(kwargs)
+            messages = inkling_dialect.prepare_messages(messages)
+            if kwargs:
+                kwargs = inkling_dialect.template_kwargs(kwargs)
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
@@ -132,19 +126,19 @@ class ChatTemplate:
 
         history = [user, {"role": "assistant", "content": "strata_caps_answer",
                           "reasoning_content": "strata_caps_reasoning"}, user]
-        if self._is_inkling:
-            def ink_calls(count):
+        if "<|content_invoke_tool_json|>" in self.source or "tool_declare<|content_xml|>" in self.source:
+            def inkling_calls(count):
                 calls = [{"name": f"strata_caps_call_{i}", "arguments": {"arg": f"strata_caps_arg_{i}"}} for i in range(count)]
                 messages = [user, {"role": "assistant", "content": "", "tool_calls": [{"function": call} for call in calls]}]
-                messages += [{"role": "tool", "content": f"strata_caps_result_{i}"} for i in range(count)] + [user]
+                messages += [{"role": "tool", "name": f"strata_caps_call_{i}", "content": f"strata_caps_result_{i}"} for i in range(count)] + [user]
                 prompt = render(messages, tools)
-                return all(f"<|content_invoke_tool_json|>" in prompt and f"strata_caps_call_{i}" in prompt
+                return all(f"<|message_model|>strata_caps_call_{i}<|content_invoke_tool_json|>" in prompt
                            and f"strata_caps_result_{i}" in prompt for i in range(count))
             return {"supports_tools": all(s in tool_prompt for s in ("strata_caps_call_0", "strata_caps_description", "tool_declare<|content_xml|>")),
-                    "supports_tool_calls": ink_calls(1),
+                    "supports_tool_calls": inkling_calls(1),
                     "supports_system_role": "strata_caps_system" in render([{"role": "system", "content": "strata_caps_system"}, user]),
-                    "supports_parallel_tool_calls": ink_calls(2),
-                    "supports_preserve_reasoning": "strata_caps_reasoning" in render(history, tools)}
+                    "supports_parallel_tool_calls": inkling_calls(2),
+                    "supports_preserve_reasoning": "<|content_thinking|>strata_caps_reasoning" in render(history, tools)}
         if "<tool_calls{}>" in self.source:      # Hy4-Flash (serve/hy4_dialect.py): its own spelling of the same capabilities
             def hy4_calls(count):
                 calls = [{"name": f"strata_caps_call_{i}", "arguments": {"arg": f"strata_caps_arg_{i}"}} for i in range(count)]
@@ -202,7 +196,7 @@ def use_family(family: str | None) -> None:
         from serve import hy4_dialect
         EFFORT.update(hy4_dialect.EFFORT)
         return
-    if family == "inkling":
+    if family == "inkling2":
         from serve import inkling_dialect
         EFFORT.update(inkling_dialect.EFFORT)
         return
@@ -214,15 +208,14 @@ def effort_kwargs(value) -> dict:
     if value is None or value == "":
         return {}
     if value is False:
-        return {"enable_thinking": False}
+        return {"reasoning_effort": "none"} if _FAMILY == "inkling2" else {"enable_thinking": False}
     if _FAMILY == "hy4":
         from serve import hy4_dialect
         mode = hy4_dialect.normalize_effort(value)
         return {"enable_thinking": False} if mode == "no_think" else {"reasoning_effort": mode}
-    if _FAMILY == "inkling":
+    if _FAMILY == "inkling2":
         from serve import inkling_dialect
-        mode = inkling_dialect.normalize_effort(value)
-        return {"enable_thinking": False, "reasoning_effort": "none"} if mode == "none" else {"reasoning_effort": mode}
+        return {"reasoning_effort": inkling_dialect.normalize_effort(value)}
     key = str(value).strip().lower()
     if key not in EFFORT:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
@@ -354,7 +347,8 @@ def literal_tags(controls) -> dict[str, str]:
     written inside a message - a file an agent reads, a pasted chat template - opened or ended a turn there.  Longest
     first, as the tokenizer matches them: a literal inside a longer one is not marked before it."""
     tags = {**LITERAL_TAGS, **{c: chr(CONTROL_MARK0 + k) for k, c in enumerate(c for c in controls
-                                                                                if c not in LITERAL_TAGS)}}
+                                                                                if c not in LITERAL_TAGS)
+                               if CONTROL_MARK0 + k < 0x10FFFE}}
     return dict(sorted(tags.items(), key=lambda t: -len(t[0])))
 
 
@@ -3045,34 +3039,44 @@ class Hy4OutputParser(OutputParser):
         return out + super().finish(reason)
 
 
-class InklingOutputParser(OutputParser):
-    """The parser for Inkling-2-Mini's typed segments (<|content_thinking|>, <|content_text|>, <|content_invoke_tool_json|>, <|content_xml|>)."""
+class InklingOutputParser(JsonOutputParser):
+    """The parser for Inkling-2-Mini: translates `<|content_thinking|>`, `<|content_text|>`, `<|content_invoke_tool_json|>`,
+    `<|content_invoke_tool_text|>`, and `<|content_xml|>` channels via serve/inkling_dialect.py.
+    Starts in content mode (`thinking=False`) because Inkling-2-Mini opens and closes thinking explicitly with `<|content_thinking|>`,
+    so `reasoning_effort=none`, interleaved thinking, and direct tool calls all parse cleanly."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  recover: bool = False, declared_only: bool = False, deferred: bool = False):
-        super().__init__(thinking=thinking, tools=tools, stream_tools=stream_tools, recover=recover,
+        super().__init__(thinking=False, tools=tools, stream_tools=stream_tools, recover=True,
                          declared_only=declared_only, deferred=deferred)
         from serve import inkling_dialect
-        self._dialect = inkling_dialect.InklingDialect(thinking=(self.state == "reasoning"))
+        self._dialect = inkling_dialect.InklingDialect()
 
-    @property
-    def clean(self) -> bool:
-        return super().clean and not self._dialect.buf
+    def _dispatch(self, chunks: list[tuple[str, str]]) -> list[Event]:
+        out: list[Event] = []
+        for kind, chunk in chunks:
+            if kind == "reasoning":
+                out.append(Event("reasoning", chunk))
+            elif chunk:
+                out.extend(super().feed(chunk))
+        return out
 
     def feed(self, delta: str) -> list[Event]:
-        return super().feed(self._dialect.feed(delta))
+        return self._dispatch(self._dialect.feed_channels(delta))
 
     def finish(self, reason: str | None = None) -> list[Event]:
-        tail = self._dialect.feed("", final=True)
-        out = super().feed(tail) if tail else []
+        out = self._dispatch(self._dialect.feed_channels("", final=True))
         return out + super().finish(reason)
 
 
 def parser_for_template(source: str | None):
     """The OutputParser class for a chat template's text, by the tool-call form the template documents (serve/toolformat.py):
-    the JSON form gets JsonOutputParser; Inkling-2-Mini gets InklingOutputParser; Hy4 gets Hy4OutputParser; the rest keep OutputParser."""
-    if source and ("<|content_invoke_tool_json|>" in source or "<|content_thinking|>" in source or "Thinking effort level:" in source):
-        return InklingOutputParser
+    the JSON form gets JsonOutputParser; the XML form every Strata model ships with, templates without tools, and forms nothing
+    here reads keep OutputParser (the same class as before this existed)."""
     from serve import toolformat
     kind = toolformat.tool_format(source or "")
-    return Hy4OutputParser if kind == "hy4" else JsonOutputParser if kind == "json" else OutputParser
+    if kind == "hy4":
+        return Hy4OutputParser
+    if kind == "inkling2":
+        return InklingOutputParser
+    return JsonOutputParser if kind == "json" else OutputParser

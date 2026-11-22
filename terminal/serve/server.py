@@ -761,7 +761,7 @@ class StrataEngine:
         # the all-cards split engine (sFNX, strata-split-N[-arch]): its GEN parser accepts fewer keys than Strata's engine (tests/split/test_split_gen_keys.py pins them)
         self.split_engine = os.path.basename(str(exe)).startswith("strata-split")
         self.hy4_engine = hy4_kind.is_hy4_exe(exe)     # the Hy4-Flash engine (serve/hy4_kind.py): one request at a time, no logprobs, no logit bias
-        self.inkling_engine = inkling_kind.is_inkling_exe(exe)  # the Inkling-2-Mini engine (serve/inkling_kind.py): 1..64 continuous batching, DSpark, Vision
+        self.inkling_engine = inkling_kind.is_inkling_exe(exe)   # Inkling-2-Mini (serve/inkling_kind.py): 1..64 continuous batching, DSpark, in-process Vision
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -1258,12 +1258,12 @@ class StrataEngine:
     def pen_from_key(self, orig_len: int, prompt_len: int) -> str:
         """` pen_from=N` for a leg that continues a request (prompt + what it generated): where the reply began, Strata's penalty window start. The all-cards split engine
         (sFNX) and Hy4-Flash (`strata-hy4`) refuse the key (GEN: unknown/unsupported key pen_from): it is not sent."""
-        if getattr(self, "split_engine", False) or getattr(self, "hy4_engine", False) or prompt_len <= orig_len:
+        if getattr(self, "split_engine", False) or getattr(self, "hy4_engine", False) or getattr(self, "inkling_engine", False) or prompt_len <= orig_len:
             return ""
         return f" pen_from={orig_len - 1}"
 
     @staticmethod
-    def sampling_keys(sampling: dict, *, hy4: bool = False) -> str:
+    def sampling_keys(sampling: dict, *, hy4: bool = False, inkling: bool = False) -> str:
         keys = ""
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
@@ -1300,11 +1300,12 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
-        if hy4:
-            # Hy4-Flash (serve/hy4_kind.py): its GEN parser strictly rejects Flash-Next-only keys
-            # (cvec, ckpt, pin, hold, pipe, aux_cpus, img_keys, logprobs, allowed, bias).
+        if hy4 or inkling:
+            # Hy4-Flash & Inkling-2-Mini: strip Flash-Next-only keys; pass image=<path> keys cleanly
             for p in sampling.get("strata_hy4_images") or []:
                 keys += " image=" + hy4_kind.encode_path(p)
+            for p in sampling.get("strata_inkling_images") or []:
+                keys += " image=" + inkling_kind.encode_path(p)
             return keys
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
@@ -1923,8 +1924,9 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         hold = (sampling or {}).get(HOLD_KEY)           # the thinking budget's hold (P2b): the reasoning tokens left when this pass starts, and </think>'s id
-        _skw = {"hy4": True} if (getattr(self, "hy4_engine", False) or getattr(self, "inkling_engine", False)) else {}
-        keys0 = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY}, **_skw)   # (the hold's key goes on per leg: leg_keys below)
+        keys0 = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY},
+                                   hy4=getattr(self, "hy4_engine", False),
+                                   inkling=getattr(self, "inkling_engine", False))   # (the hold's key goes on per leg: leg_keys below)
         # logprobs: only an admission's token can have an LP line here (the slot's "BT" lines carry none), so the
         # server refuses these requests unless max_tokens is 1.  The lines go to the request itself, through its
         # cancel Event: several requests read control lines at once, and the engine's lp_lines is one attribute.
@@ -2474,9 +2476,8 @@ class StrataEngine:
         self.lp_lines = LPLines(cancel)
         carry = NO_LINE                  # a line read for a token's LP line, held until it is used
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        _skw = {"hy4": True} if (getattr(self, "hy4_engine", False) or getattr(self, "inkling_engine", False)) else {}
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {}, **_skw)} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {}, **_skw)}"
+        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {}, hy4=getattr(self, 'hy4_engine', False), inkling=getattr(self, 'inkling_engine', False))} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{self.sampling_keys(sampling or {}, hy4=getattr(self, 'hy4_engine', False), inkling=getattr(self, 'inkling_engine', False))}"
         if prefill_only:                                 # split serving (serve/split.py): read the prompt, make no token
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
@@ -3467,7 +3468,7 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     and without leaving a note for the next engine start (the retry arguments of mtp_retry_args)."""
     if hy4_kind.is_hy4(cfg):                     # the Hy4-Flash engine takes none of the Flash-Next flags below (serve/hy4_kind.py)
         return hy4_kind.engine_args(cfg, exe, announce=announce)
-    if inkling_kind.is_inkling(cfg):             # the Inkling-2-Mini engine (serve/inkling_kind.py): --parallel 1..64, --draft dspark|off, --vision
+    if inkling_kind.is_inkling(cfg):             # the Inkling-2-Mini engine takes its own flags (serve/inkling_kind.py)
         return inkling_kind.engine_args(cfg, exe, announce=announce)
     args = list(cfg["args"])
     # "user_args" (strata_control/user_args.py): the options the person set by hand, over the generated ones at every start,
@@ -4004,12 +4005,13 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = end_token_ids(tokenizer)
         self.hy4 = getattr(engine, "hy4_engine", False) is True      # the Hy4-Flash engine: its end tokens, its tagged texts that stay text in a message
-        self.inkling = getattr(engine, "inkling_engine", False) is True  # the Inkling-2-Mini engine (serve/inkling_kind.py)
+        self.inkling = getattr(engine, "inkling_engine", False) is True   # the Inkling-2-Mini engine: its end tokens & channel tags
         if self.hy4:
             self.stop_ids |= hy4_kind.end_ids(tokenizer)
             self.literals = literal_tags(list(getattr(tokenizer, "control_tokens", ())) + hy4_kind.literal_tags(tokenizer))
         elif self.inkling:
             self.stop_ids |= inkling_kind.end_ids(tokenizer)
+            self.literals = literal_tags(list(getattr(tokenizer, "control_tokens", ())) + inkling_kind.literal_tags(tokenizer))
         self.family = None                            # the model family: set_family() below (None: the Qwen form)
         self.parser_cls = parser_for_template(getattr(template, "source", None))   # reads the model's output (reasoning, content, tool calls): by the template's tool-call form
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
@@ -4234,7 +4236,7 @@ class Service:
 
     def has_vision(self) -> bool:
         """Whether this server can read images: either a separate vision encoder (Flash-Next)
-        or an in-process Hy4-Flash engine that reported `images=1`."""
+        or an in-process Hy4-Flash / Inkling-2-Mini engine that reported `images=1`."""
         if self.vision is not None:
             return True
         return bool((self.hy4 or self.inkling) and (getattr(self.engine, "info", None) or {}).get("images") == 1)
@@ -4969,8 +4971,8 @@ class Service:
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         if self.hy4:                                   # Hy4's template reads reasoning_effort no_think | high | max (serve/hy4_dialect.py)
             return self.template.render(messages, tools=tools, **hy4_dialect.template_kwargs(kwargs))
-        if self.inkling:                               # Inkling-2-Mini template reads reasoning_effort none..max (serve/inkling_dialect.py)
-            return self.template.render(messages, tools=tools, **inkling_dialect.template_kwargs(kwargs))
+        if self.inkling:                               # Inkling-2-Mini reads reasoning_effort none|minimal|low|medium|high|max (serve/inkling_dialect.py)
+            return self.template.render(inkling_dialect.prepare_messages(messages), tools=tools, **inkling_dialect.template_kwargs(kwargs))
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -5089,15 +5091,20 @@ class Service:
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
-        self.embeddings.hy4 = self._drop_hy4_images(getattr(self.embeddings, "hy4", None))      # an earlier pass of this request left its files: gone first
-        if images and (self.hy4 or self.inkling):                     # Hy4-Flash & Inkling-2-Mini: in-process Vision shard (INFO images=1)
+        self.embeddings.hy4 = self._drop_hy4_images(getattr(self.embeddings, "hy4", None))
+        self.embeddings.inkling = self._drop_hy4_images(getattr(self.embeddings, "inkling", None))      # an earlier pass of this request left its files: gone first
+        if images and (self.hy4 or self.inkling):                     # Hy4-Flash / Inkling-2-Mini: in-process engine reads pictures directly (INFO images=1)
+            kind_mod = inkling_kind if self.inkling else hy4_kind
             if (getattr(self.engine, "info", None) or {}).get("images") != 1:
-                raise ValueError(inkling_kind.NO_IMAGES_REPLY if self.inkling else hy4_kind.NO_IMAGES_REPLY)
+                raise ValueError(kind_mod.NO_IMAGES_REPLY)
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
                 raise ValueError("offline mode cannot download an image URL; send a data: image instead")
-            writer = inkling_kind.write_images if self.inkling else hy4_kind.write_images
-            self.embeddings.hy4 = writer(
+            written = kind_mod.write_images(
                 images, lambda s: fetched[s] if s in fetched else Vision.load(s), Vision.normalize, cancel)
+            if self.inkling:
+                self.embeddings.inkling = written
+            else:
+                self.embeddings.hy4 = written
             images = []
         if images:
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
@@ -5286,6 +5293,7 @@ class Service:
         if path is not None:
             Path(path).unlink(missing_ok=True)
         self.embeddings.hy4 = self._drop_hy4_images(getattr(self.embeddings, "hy4", None))
+        self.embeddings.inkling = self._drop_hy4_images(getattr(self.embeddings, "inkling", None))
 
     @staticmethod
     def _drop_hy4_images(paths):
@@ -5438,6 +5446,9 @@ class Service:
         hy4_images = getattr(self.embeddings, "hy4", None)                 # Hy4-Flash: the picture files of this request (kept until drop_embeddings)
         if hy4_images:
             sampling = {**(sampling or {}), "strata_hy4_images": list(hy4_images)}
+        inkling_images = getattr(self.embeddings, "inkling", None)         # Inkling-2-Mini: the picture files of this request
+        if inkling_images:
+            sampling = {**(sampling or {}), "strata_inkling_images": list(inkling_images)}
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
         # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
@@ -8364,7 +8375,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     if _ds:                                             # DeepSeek: this Strata no longer runs it; stop before the engine starts (retired.py)
         print(retired.server_line(_ds), flush=True)
         return 2
-    if a.config and a.engine == "strata" and not hy4_kind.is_hy4(cfg) and not inkling_kind.is_inkling(cfg):     # (Hy4-Flash & Inkling-2-Mini have no Flash-Next tuning knobs)
+    if a.config and a.engine == "strata" and not hy4_kind.is_hy4(cfg) and not inkling_kind.is_inkling(cfg):     # (custom shape engines have no Flash-Next tuning knobs)
         cfg = apply_saved_tuning(cfg)
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
     launch_attestation = None
@@ -8585,7 +8596,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family("hy4" if svc.hy4 else "inkling" if svc.inkling else None)
+        svc.set_family("hy4" if svc.hy4 else "inkling2" if svc.inkling else None)
         if svc.hy4:
             svc._force_text = hy4_dialect.force_text
         elif svc.inkling:
@@ -8593,7 +8604,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])
-            for flag in ("--batch", "--slots"):
+            for flag in ("--batch", "--slots", "--parallel"):
                 if flag in args and args.index(flag) + 1 < len(args):
                     try:
                         requested = int(args[args.index(flag) + 1])

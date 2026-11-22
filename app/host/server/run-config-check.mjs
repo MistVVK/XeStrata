@@ -12,6 +12,7 @@
  */
 import { NATIVE_FIELDS } from './native-settings.mjs';
 import { isHy4 } from './hy4.mjs';
+import { isInkling } from './inkling.mjs';
 
 /** Every top-level key a run config may carry: what setup writes, what serve/server.py reads, the app's own fields. */
 export const KNOWN_KEYS = new Set([
@@ -28,7 +29,9 @@ export const KNOWN_KEYS = new Set([
 
 const BOOLS = new Set(['open_browser', 'prevent_sleep', 'elastic', 'env_to_user', 'gpus_asked', 'batch_telemetry', 'tool_call_recovery', 'reasoning_loop_recovery']);
 const NUMBERS = { port: [1, 65535], max_queue: [0, 1e6], queue_timeout: [0, 1e6], threads: [1, 4096], elastic_idle_s: [0, 1e7], min_free_vram_mib: [0, 1e7] };
-const REASONING = ['none', 'low', 'medium', 'high'];
+const REASONING = ['low', 'medium', 'high', 'none', 'off'];
+const INKLING_REASONING = ['none', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
+const HY4_REASONING = ['none', 'off', 'high', 'max'];
 const SAMPLING = { temperature: [0, 10], top_p: [0, 1], top_k: [1, 64], min_p: [0, 1], presence_penalty: [-10, 10], repetition_penalty: [0, 10], repeat_penalty: [0, 10], frequency_penalty: [-10, 10], penalty_last_n: [0, 1048576], repeat_last_n: [0, 1048576], seed: [0, 4294967295] };
 const WHOLE = new Set(['top_k', 'penalty_last_n', 'repeat_last_n', 'seed']);
 
@@ -108,9 +111,10 @@ export function checkRunConfig(text, { known = KNOWN_KEYS } = {}) {
     } else if (fields.has(key)) {
       const f = fields.get(key);
       if (value === '') continue;
-      if (f.type === 'number' && (typeof value !== 'number' || !Number.isInteger(value) || value < f.min || value > f.max)) add('error', 'whole-range', key, { key, min: f.min, max: f.max, value: show(value) }, `"${key}" must be a whole number from ${f.min} to ${f.max}, not ${show(value)}.`);
+      const maxVal = (key === 'parallel' && isInkling(config)) ? 64 : f.max;
+      if (f.type === 'number' && (typeof value !== 'number' || !Number.isInteger(value) || value < f.min || value > maxVal)) add('error', 'whole-range', key, { key, min: f.min, max: maxVal, value: show(value) }, `"${key}" must be a whole number from ${f.min} to ${maxVal}, not ${show(value)}.`);
       else if (f.type === 'boolean' && typeof value !== 'boolean') add('error', 'bool', key, { key, value: show(value) }, `"${key}" must be true or false, not ${show(value)}.`);
-      else if (f.type === 'enum' && !(key === 'drafting' && value === 'dfly2' && isHy4(config)) && !f.choices.includes(value)) add('error', 'choice', key, { key, choices: f.choices.join(', '), value: show(value) }, `"${key}" must be one of ${f.choices.join(', ')}, not ${show(value)}.`);
+      else if (f.type === 'enum' && !(key === 'drafting' && ((value === 'dfly2' && isHy4(config)) || (value === 'dspark' && isInkling(config)))) && !f.choices.includes(value)) add('error', 'choice', key, { key, choices: f.choices.join(', '), value: show(value) }, `"${key}" must be one of ${f.choices.join(', ')}, not ${show(value)}.`);
       else if (f.type === 'string' && (typeof value !== 'string' || value.length > 256)) add('error', 'text', key, { key }, `"${key}" must be text of at most 256 characters.`);
       else if (f.type === 'array') {
         const list = typeof value === 'string' ? value.split(',').map(v => v.trim()).filter(Boolean) : value;
@@ -126,7 +130,8 @@ export function checkRunConfig(text, { known = KNOWN_KEYS } = {}) {
       const [lo, hi] = NUMBERS[key];
       if (typeof value !== 'number' || !Number.isFinite(value) || value < lo || value > hi) add('error', 'number-range', key, { key, min: lo, max: hi, value: show(value) }, `"${key}" must be a number from ${lo} to ${hi}, not ${show(value)}.`);
     } else if (key === 'reasoning_effort') {
-      if (!REASONING.includes(value)) add('error', 'choice', key, { key, choices: REASONING.join(', '), value: show(value) }, `"reasoning_effort" must be one of ${REASONING.join(', ')}, not ${show(value)}.`);
+      const allowed = isInkling(config) ? INKLING_REASONING : isHy4(config) ? HY4_REASONING : REASONING;
+      if (!allowed.includes(value)) add('error', 'choice', key, { key, choices: allowed.join(', '), value: show(value) }, `"reasoning_effort" must be one of ${allowed.join(', ')}, not ${show(value)}.`);
     } else if (key === 'gpu') {
       const ok = Number.isInteger(value) && value >= 0 || Array.isArray(value) && value.length > 0 && value.every(n => Number.isInteger(n) && n >= 0);
       if (!ok) add('error', 'gpu', key, {}, '"gpu" must be a graphics card number such as 0, or a list such as [0, 1].');

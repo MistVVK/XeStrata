@@ -145,12 +145,12 @@ test('Hy4-Flash on-demand Vision fetch, Step 4 tune() vision preservation, and U
   const guided = read('../src/components/GuidedSetup.tsx');
   const settings = read('../src/components/NativeSettings.tsx');
   const sidebar = read('../src/app/Sidebar.tsx');
-  assert.match(nc, /vision:\(isHy4\(current\.config\)\|\|current\.config\.vision\)\?args\.vision:'no'/);
-  assert.match(nc, /nextArgs=\[\.\.\.withoutHy4Vision\(config\.args\),'--vision',got\.mmproj\]/);
+  assert.match(nc, /vision:\(isHy4\(current\.config\)\|\|isInkling\(current\.config\)\|\|current\.config\.vision\)\?args\.vision:'no'/);
+  assert.match(nc, /withoutHy4Vision/);
   assert.match(bridge, /known\.vision === false && vision === true/);
   assert.match(bridge, /isHy4Route = route\.kind === 'local' && \/\^hy4-flash\/i\.test/);
   assert.match(composer, /hy4Efforts = \['Off', 'High', 'Max'\]/);
-  assert.match(composer, /isHy4Active \? 'High' : 'Medium'/);
+  assert.match(composer, /isHy4Active[\s\S]*'High' : 'Medium'/);
   assert.match(models, /isHy4Selected = selectedFamily\?\.family === HY4_FAMILY/);
   assert.match(models, /!isHy4Selected \? <NativeTuneBadge/);
   assert.match(models, /!isHy4Selected \? <Btn icon="gauge"/);

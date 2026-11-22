@@ -119,10 +119,12 @@ def reference(shape: str) -> str:
     return ec.REFERENCE_PREFIX + component_id(shape)
 
 
-#: The engine of Tencent Hy4-Flash is a "shape" in this module's sense (its own component next to the Strata engine, fetched through the signed feed, named by the run
-#: config's exe "component:strata-hy4") but not a compile of the Strata engine: its program is strata-hy4 and it has no geometry, so it says what it is with `--info`.
+#: The engines of Tencent Hy4-Flash and Thinking Machines Inkling-2-Mini are "shapes" in this module's sense (each is its own component next to the Strata engine, fetched
+#: through the signed feed, named by the run config's exe "component:strata-hy4" / "component:strata-inkling") but not a compile of the Qwen Strata engine: each has its own
+#: program (`strata-hy4`, `strata-inkling`) and no Qwen geometry, so it identifies itself with `--version` / `--info`.
 HY4_SHAPE = "hy4"
 INKLING_SHAPE = "inkling2"
+CUSTOM_SHAPES = frozenset({HY4_SHAPE, INKLING_SHAPE})
 
 
 def exe_name(shape: str | None = None) -> str:
@@ -234,7 +236,7 @@ def _test_start(exe: Path, timeout: float = 120.0, shape: str | None = None) -> 
         if not first.startswith("strata-hy4"):
             return False, NO_SHAPE_ANSWER
     elif shape == INKLING_SHAPE:
-        # Inkling-2-Mini's standalone engine: `strata-inkling --version` names itself ("strata-inkling <version>")
+        # Inkling-2-Mini's engine has no Qwen geometry: `strata-inkling --version` names it ("strata-inkling <version>")
         if not first.startswith("strata-inkling"):
             return False, NO_SHAPE_ANSWER
     elif shape:

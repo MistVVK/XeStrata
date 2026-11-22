@@ -93,7 +93,7 @@ O200K_PATTERN = (
     r"|\s+(?!\S)"
     r"|\s+"
 )
-O200K_PRES = ("gpt-4o", "inkling", "inkling2", "o200k")
+O200K_PRES = ("o200k", "o200k_base", "gpt-4o", "inkling", "inkling2")
 
 
 # The `qwen2` pre-tokenizer (Qwen2 / Qwen3-Next; llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2,
@@ -138,7 +138,7 @@ class UnknownPreTokenizer(ValueError):
 
 
 def pre_tokenizer_kind(pre) -> str | None:
-    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "qwen2", "deepseek3", "inkling2", or
+    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "qwen2", "deepseek3", "o200k", or
     None for a type this file does not know.  An empty or missing value is the qwen35 default, as it always was."""
     p = "qwen35" if pre is None or pre == "" else str(pre)
     if p == "qwen35":
@@ -148,7 +148,7 @@ def pre_tokenizer_kind(pre) -> str | None:
     if p.startswith("deepseek"):
         return "deepseek3"
     if p in O200K_PRES:
-        return "inkling2"
+        return "o200k"
     return None
 
 
@@ -183,6 +183,9 @@ class Tokenizer:
         if pre_tokenizer_kind(pre) == "deepseek3":
             seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
             self._split = lambda text: _sequence_findall(seq, text)
+        elif pre_tokenizer_kind(pre) == "o200k":
+            self._re = regex.compile(O200K_PATTERN)
+            self._split = self._re.findall
         elif pre_tokenizer_kind(pre) == "qwen2":
             self._re = regex.compile(QWEN2_PATTERN)
             self._split = self._re.findall
@@ -576,7 +579,7 @@ def extract(gguf_path, out_dir) -> dict:
     out = pathlib.Path(out_dir) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
     tk = Tokenizer.from_gguf(gguf_path)
-    is_o200k = pre_tokenizer_kind(tk.pre) == "inkling2"
+    is_o200k = pre_tokenizer_kind(tk.pre) == "o200k"
     cfg = {
         "model": "gpt2",
         "pre": tk.pre,
@@ -610,7 +613,7 @@ def extract_hf(model_dir, out_dir, pre: str = "gpt-4o", special_ids: dict[str, i
     out.mkdir(parents=True, exist_ok=True)
     src = pathlib.Path(model_dir)
     tk = Tokenizer.from_hf(src / "tokenizer.json", pre, special_ids or {})
-    is_o200k = pre_tokenizer_kind(pre) == "inkling2"
+    is_o200k = pre_tokenizer_kind(pre) == "o200k"
     cfg = {
         "model": "gpt2",
         "pre": tk.pre,

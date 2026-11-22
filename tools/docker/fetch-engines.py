@@ -156,19 +156,25 @@ def main() -> int:
                 print(f"{flavor}\t{FLAVORS[flavor][2]}\tSKIP")
             continue
         hy4_pkg = pick_shape(feed, "hy4", flavor, pkg)
+        ink_pkg = pick_shape(feed, "inkling2", flavor, pkg)
         log(f"{flavor}: {pkg.label} ({pkg.url})")
         if hy4_pkg is not None:
             log(f"{flavor} [hy4]: {hy4_pkg.label} ({hy4_pkg.url})")
+        if ink_pkg is not None:
+            log(f"{flavor} [inkling2]: {ink_pkg.label} ({ink_pkg.url})")
         if a.list:
             print(f"{flavor}\t{FLAVORS[flavor][2]}\t{pkg.url}\t{pkg.size}\t{pkg.sha256}")
             continue
         a.out.mkdir(parents=True, exist_ok=True)
         folder = fetch_one(feed, pkg, a.out, trusted)
-        if hy4_pkg is not None:
-            hy4_folder = fetch_one(feed, hy4_pkg, a.out, trusted, subdir="shapes/hy4")
-            print(f"{flavor}\t{FLAVORS[flavor][2]}\t{folder}\t{hy4_folder}", flush=True)
-        else:
-            print(f"{flavor}\t{FLAVORS[flavor][2]}\t{folder}", flush=True)
+        hy4_folder = fetch_one(feed, hy4_pkg, a.out, trusted, subdir="shapes/hy4") if hy4_pkg is not None else ""
+        ink_folder = fetch_one(feed, ink_pkg, a.out, trusted, subdir="shapes/inkling2") if ink_pkg is not None else ""
+        cols = [flavor, FLAVORS[flavor][2], str(folder)]
+        if hy4_folder or ink_folder:
+            cols.append(str(hy4_folder))
+        if ink_folder:
+            cols.append(str(ink_folder))
+        print("\t".join(cols), flush=True)
     if a.out and (a.out / ".partial").is_dir():
         shutil.rmtree(a.out / ".partial", ignore_errors=True)
     return status

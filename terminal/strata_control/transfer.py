@@ -217,10 +217,51 @@ def resolve_ref(base: str, ref: str, environ=None) -> str:
     return str(target)
 
 
+def _hf_host(hostname: str, environ=None) -> bool:
+    """True when `hostname` is Hugging Face (huggingface.co / hf.co) or the configured HF_ENDPOINT host."""
+    h = (hostname or "").strip().lower()
+    if not h:
+        return False
+    if h == "huggingface.co" or h.endswith(".huggingface.co") or h == "hf.co" or h.endswith(".hf.co"):
+        return True
+    env = os.environ if environ is None else environ
+    ep = (env.get("HF_ENDPOINT") or "").strip()
+    if ep:
+        try:
+            ep_host = (urllib.parse.urlparse(ep).hostname or "").lower()
+            if ep_host and h == ep_host:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def hf_auth_headers(url: str, environ=None) -> dict[str, str]:
+    """Optional Bearer auth header for Hugging Face downloads when HF_TOKEN / HUGGING_FACE_HUB_TOKEN is set.
+    Returns {} for public zero-auth downloads or any non-HF host (never leaks tokens to third-party hosts)."""
+    env = os.environ if environ is None else environ
+    tok = (env.get("HF_TOKEN") or env.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
+    if not tok:
+        return {}
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return {}
+    if not _hf_host(parsed.hostname or "", env):
+        return {}
+    return {"Authorization": f"Bearer {tok}"}
+
+
 class _PolicyRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         check_url_policy(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        out = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if out is not None:
+            old_host = (urllib.parse.urlparse(req.full_url).hostname or "").lower()
+            new_host = (urllib.parse.urlparse(newurl).hostname or "").lower()
+            if old_host != new_host:
+                out.remove_header("Authorization")
+                out.unredirected_hdrs.pop("Authorization", None)
+        return out
 
 
 _opener = netpolicy.build_opener(_PolicyRedirects)      # the network rule: the connection phase is bounded, a stalled read ends after 60 s
@@ -264,7 +305,7 @@ def read_small(location: str, *, limit: int = SMALL_LIMIT, timeout: float = 30, 
     try:
         if kind in ("http", "https"):
             check_url_policy(location)
-            request = urllib.request.Request(location, headers={"User-Agent": _USER_AGENT, "Cache-Control": "no-cache"})
+            request = urllib.request.Request(location, headers={"User-Agent": _USER_AGENT, "Cache-Control": "no-cache", **hf_auth_headers(location)})
             try:                                         # the network rule: 12 s, then one retry with the full timeout; clear failures at once
                 def attempt(req, timeout):
                     _SERVER_DATE.clear()                 # only the answer of the try that worked counts
@@ -368,7 +409,7 @@ def _transfer(location, partial: Path, have: int, size: int, progress, cancel, t
     try:
         if kind in ("http", "https"):
             check_url_policy(location)
-            headers = {"User-Agent": _USER_AGENT}
+            headers = {"User-Agent": _USER_AGENT, **hf_auth_headers(location)}
             if have:
                 headers["Range"] = f"bytes={have}-"
             request = urllib.request.Request(location, headers=headers)

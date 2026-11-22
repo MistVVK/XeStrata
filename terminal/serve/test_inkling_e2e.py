@@ -343,9 +343,9 @@ class TestInklingServing(unittest.TestCase):
         self.assertEqual(shape_engine.component_id("inkling2"), "strata-inkling")
 
     def test_o200k_tokenizer_and_ignore_merges(self):
-        self.assertEqual(strata_tokenizer.pre_tokenizer_kind("inkling2"), "inkling2")
-        self.assertEqual(strata_tokenizer.pre_tokenizer_kind("o200k"), "inkling2")
-        self.assertEqual(strata_tokenizer.pre_tokenizer_kind("gpt-4o"), "inkling2")
+        self.assertEqual(strata_tokenizer.pre_tokenizer_kind("inkling2"), "o200k")
+        self.assertEqual(strata_tokenizer.pre_tokenizer_kind("o200k"), "o200k")
+        self.assertEqual(strata_tokenizer.pre_tokenizer_kind("gpt-4o"), "o200k")
         # Build minimal o200k tokenizer where "hello" is in vocab directly (ignore_merges!)
         b2u = strata_tokenizer.BYTE_TO_UNICODE
         base_vocab = [b2u[b] for b in range(256)] + ["hello", "<|content_thinking|>", "<|content_model_end_sampling|>"]
