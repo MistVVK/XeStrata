@@ -24,6 +24,9 @@
 
 #include <cstdlib>
 #include "strata/kernels/gfx_arch.hpp"
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+#include "strata/kernels/hip_unsloth_wmma.hpp"
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -57,7 +60,13 @@ static bool strata_wmma_gfx11_device() {
 }
 
 // The same answer for host code that decides whether to pad an activation's row stride (prefill.cpp, STRATA_PF_PAD).
-bool strata_pf_padded_gemm_available() { return strata_wmma_gfx11_device(); }
+bool strata_pf_padded_gemm_available() {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    return strata_wmma_gfx11_device() || strata::kernels::hip_unsloth::hip_wmma_device_available();
+#else
+    return strata_wmma_gfx11_device();
+#endif
+}
 
 template <typename ElemT>
 struct WmmaTraits;
@@ -295,12 +304,22 @@ static inline bool strata_wmma_gemm_dispatch(const uint16_t* X, const uint16_t* 
 bool strata_wmma_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y,
                           int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
                           void* stream) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    if (!strata_wmma_gfx11_device()) {
+        return strata::kernels::hip_unsloth::hip_unsloth_wmma_gemm_f16(X, K, W, K, Y, T, N, K, ldy, beta, stream);
+    }
+#endif
     return strata_wmma_gemm_dispatch<_Float16>(X, W, Y, T, N, K, ldy, beta, stream);
 }
 
 bool strata_wmma_gemm_bf16(const uint16_t* X, const uint16_t* W, float* Y,
                            int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
                            void* stream) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    if (!strata_wmma_gfx11_device()) {
+        return strata::kernels::hip_unsloth::hip_unsloth_wmma_gemm_bf16(X, K, W, K, Y, T, N, K, ldy, beta, stream);
+    }
+#endif
     return strata_wmma_gemm_dispatch<__bf16>(X, W, Y, T, N, K, ldy, beta, stream);
 }
 
@@ -688,7 +707,13 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
     if (ldy <= 0) ldy = N;
     if (ldx < K || ldw < K || ldx % 8 != 0 || ldw % 8 != 0 || ldx > (1LL << 30) || ldw > (1LL << 30)) return false;
     if (ldy < N || T > (1LL << 30) || N > (1LL << 30) || K > (1LL << 30)) return false;
-    if (!strata_wmma_gfx11_device()) return false;
+    if (!strata_wmma_gfx11_device()) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+        return strata::kernels::hip_unsloth::hip_unsloth_wmma_gemm_f16(X, ldx, W, ldw, Y, T, N, K, ldy, beta, stream);
+#else
+        return false;
+#endif
+    }
     hipStream_t s = static_cast<hipStream_t>(stream);
     const int acc = beta == 1.0f ? 1 : 0;
     const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
@@ -711,16 +736,33 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
 }
 
 #else
-// Non-HIP / Non-GFX11 compilation fallback
-bool strata_pf_gemm_f16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, float, void*) {
+// Non-GFX11 compilation fallback (forwards to RDNA4 gfx12 Wave32 WMMA when built with HIP)
+bool strata_pf_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                        float beta, void* stream) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    return strata::kernels::hip_unsloth::hip_unsloth_wmma_gemm_f16(X, K, W, K, Y, T, N, K, ldy, beta, stream);
+#else
+    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) beta; (void) stream;
     return false;
+#endif
 }
-bool strata_pf_gemm_f16_ld(const uint16_t*, int64_t, const uint16_t*, int64_t, float*, int64_t, int64_t, int64_t,
-                           int64_t, float, void*) {
+bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
+                           int64_t N, int64_t K, int64_t ldy, float beta, void* stream) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    return strata::kernels::hip_unsloth::hip_unsloth_wmma_gemm_f16(X, ldx, W, ldw, Y, T, N, K, ldy, beta, stream);
+#else
+    (void) X; (void) ldx; (void) W; (void) ldw; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) beta; (void) stream;
     return false;
+#endif
 }
-// No padded product in this build (no gfx11 target): prefill.cpp does not pad an activation's row stride.
-bool strata_pf_padded_gemm_available() { return false; }
+// Padded activation row stride is supported whenever gfx11 or gfx12 Wave32 WMMA is available.
+bool strata_pf_padded_gemm_available() {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    return strata::kernels::hip_unsloth::hip_wmma_device_available();
+#else
+    return false;
+#endif
+}
 bool strata_pf_hcdown_bf16(const uint16_t*, int64_t, const uint16_t*, const uint16_t*, int64_t, int64_t, float*, float*,
                            int64_t, int64_t, void*) {
     return false;
@@ -728,15 +770,25 @@ bool strata_pf_hcdown_bf16(const uint16_t*, int64_t, const uint16_t*, const uint
 bool strata_pf_hcdown_exact_bf16(const uint16_t*, int64_t, const uint16_t*, float*, int64_t, int64_t, int64_t, void*) {
     return false;
 }
-bool strata_wmma_gemm_f16(const uint16_t*, const uint16_t*, float*,
-                          int64_t, int64_t, int64_t, int64_t, float,
-                          void*) {
+bool strata_wmma_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y,
+                          int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
+                          void* stream) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    return strata::kernels::hip_unsloth::hip_unsloth_wmma_gemm_f16(X, K, W, K, Y, T, N, K, ldy, beta, stream);
+#else
+    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) beta; (void) stream;
     return false;
+#endif
 }
 
-bool strata_wmma_gemm_bf16(const uint16_t*, const uint16_t*, float*,
-                           int64_t, int64_t, int64_t, int64_t, float,
-                           void*) {
+bool strata_wmma_gemm_bf16(const uint16_t* X, const uint16_t* W, float* Y,
+                           int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
+                           void* stream) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    return strata::kernels::hip_unsloth::hip_unsloth_wmma_gemm_bf16(X, K, W, K, Y, T, N, K, ldy, beta, stream);
+#else
+    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) beta; (void) stream;
     return false;
+#endif
 }
 #endif

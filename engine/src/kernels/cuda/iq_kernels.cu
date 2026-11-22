@@ -15,6 +15,9 @@
 #include "strata/kernels/i8_expert_rule.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+#include "strata/kernels/hip_unsloth_wmma.hpp"
+#endif
 #include "s26_tsum.cuh"
 
 #include <cuda_fp16.h>
@@ -60,7 +63,7 @@ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
-#if defined(STRATA_HIP_GFX906)
+#if defined(__HIPCC__) || defined(STRATA_HIP_GFX906)
     // AMD: llama.cpp's HIP lookup (vecdotq.cuh) - v_perm_b32 takes 3-bit byte indices, so the low and high halves
     // of the table are looked up and the index MSB picks between them: 4 perms per 8 values.
     const uint32_t* v32 = reinterpret_cast<const uint32_t*>(table);
@@ -6751,25 +6754,7 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
 // STRATA_GFX1151_EXP8=0 (or STRATA_GFX11_EXP8=0 / STRATA_GFX11_DEFAULTS=0 on discrete gfx11) keeps the old layout.
 bool gfx1151_exp8(int dev) {
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
-    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
-    if (dev < 0 || dev >= 64) return false;
-    if (!per_dev[dev]) {
-        const char* v = std::getenv("STRATA_GFX1151_EXP8");
-        const char* v11 = std::getenv("STRATA_GFX11_EXP8");
-        const char* off11 = std::getenv("STRATA_GFX11_DEFAULTS");
-        cudaDeviceProp p;
-        bool yes = false;
-        if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
-            if (strata::kernels::gfx_arch_is_gfx1151(p.gcnArchName)) {
-                yes = !(v != nullptr && v[0] == '0') && !(v11 != nullptr && v11[0] == '0');
-            } else if (strata::kernels::gfx_arch_is_discrete_rdna3(p.gcnArchName)) {
-                yes = !(v != nullptr && v[0] == '0') && !(v11 != nullptr && v11[0] == '0') && !(off11 != nullptr && off11[0] == '0');
-            }
-        }
-        per_dev[dev] = yes ? 2 : 1;
-        (void) cudaGetLastError();
-    }
-    return per_dev[dev] == 2;
+    return strata::kernels::hip_unsloth::hip_exp8_auto_enabled(dev);
 #else
     (void) dev;
     return false;

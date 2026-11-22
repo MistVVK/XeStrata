@@ -29,6 +29,8 @@ bool rdna_kq_mmvq2(int type, const void* w, const void* xq, float* y, int n_in, 
 bool rdna_q80_wmma_mmvq(const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream);
 
 #if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906)
+#include "strata/kernels/hip_unsloth_wmma.hpp"
+#include "strata/kernels/hip_unsloth_dp4a.hpp"
 namespace {
 
 struct Q81 {
@@ -412,6 +414,13 @@ bool rdna_kq_mmvq2(int type, const void* w, const void* xq, float* y, int n_in, 
             case 21:
                 kq_launch_slice<21>(wb, xc, yc, n_in, n_out, nc, s, w2, y2c, n_out2);
                 break;
+            case 8:
+            case 18:
+                if (w2 != nullptr) return false;
+                if (!strata::kernels::hip_unsloth::hip_unsloth_dp4a_mmvq(type, wb, xc, yc, n_in, n_out, nc, 1.0f, s)) {
+                    return false;
+                }
+                break;
             default:
                 return false;
         }
@@ -453,13 +462,16 @@ bool rdna_q6k_mmvq2(const void* w, const void* xq, float* y, int n_in, int n_out
 }
 
 bool rdna_q80_wmma_mmvq(const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream) {
-    if (!rdna_q6k_enabled() || !arch_is_gfx11_wmma()) return false;
+    if (!rdna_q6k_enabled()) return false;
     static const bool wmma_dec_off = [] {
         const char* v = std::getenv("STRATA_RDNA_Q80_WMMA");
         return v != nullptr && v[0] == '0';
     }();
     if (wmma_dec_off) return false;
     if (ncols < 8 || ncols > 16 || (n_in % 32) != 0 || n_out < 64) return false;
+    if (!arch_is_gfx11_wmma()) {
+        return strata::kernels::hip_unsloth::hip_unsloth_wmma_q80_mmvq(w, xq, y, n_in, n_out, ncols, stream);
+    }
     const unsigned blocks = (unsigned) ((n_out + 63) / 64);
     rdna_q80_wmma_t8_kernel<<<blocks, 128, 0, (cudaStream_t) stream>>>(
         static_cast<const Q80*>(w), static_cast<const Q81*>(xq), y, n_in, n_out, ncols);

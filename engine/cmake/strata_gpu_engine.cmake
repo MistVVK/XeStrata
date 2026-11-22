@@ -105,7 +105,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   if(STRATA_ENABLE_HIP)
-    target_sources(strata_kernels PRIVATE src/kernels/cuda/nvfp4_decode_sm120_absent.cpp)
+    target_sources(strata_kernels PRIVATE
+      src/kernels/cuda/nvfp4_decode_sm120_absent.cpp
+      src/kernels/hip/hip_unsloth_wmma.cu
+      src/kernels/hip/hip_unsloth_dp4a.cu)
   endif()
   if(STRATA_ISA_FLOOR STREQUAL "avx")
     if(MSVC)

@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (330)
+## Switches you can turn on (331)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -70,7 +70,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_EXPERT_NIBBLE_RECHECK` | on / off | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md) |
 | `STRATA_EXPERT_NIBBLE_SKIP` | on / off | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md) |
 | `STRATA_EXPERT_V2K` | on / off | NVIDIA and AMD, Intel Arc | [QUANTS.md](QUANTS.md), [QWEN36.md](QWEN36.md) |
-| `STRATA_EXP_MODE` | on / off | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [OLDER_GPUS.md](OLDER_GPUS.md), [README.md](bench-results/2026-10-07-v100-decode-kernels/README.md) |
+| `STRATA_EXP_MODE` | number | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [OLDER_GPUS.md](OLDER_GPUS.md), [README.md](bench-results/2026-10-07-v100-decode-kernels/README.md) |
 | `STRATA_F16_RANGE` | on / off | NVIDIA and AMD | [AMD_HIP.md](AMD_HIP.md), [README.md](bench-results/2026-10-04-rdna2-fp16-prompt/README.md), [README.md](bench-results/2026-10-09-community-2x-rx-6900xt-0.1.41/README.md) |
 | `STRATA_FETCH_THREADS` | number | NVIDIA and AMD, Intel Arc | [UNSLOTH_Q4.md](UNSLOTH_Q4.md) |
 | `STRATA_FILE_CACHE_OLD_RULE` | on / off | NVIDIA and AMD | [AMD_HIP.md](AMD_HIP.md) |
@@ -80,6 +80,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_GDN_CHUNK` | number | NVIDIA and AMD | [GDN_CONTRACT.md](GDN_CONTRACT.md), [NVIDIA_V100.md](NVIDIA_V100.md), [RESULTS.md](bench-results/2026-10-02-gdn-chunk/RESULTS.md) |
 | `STRATA_GDN_PIPELINE` | number | NVIDIA and AMD, Intel Arc | [GDN_CONTRACT.md](GDN_CONTRACT.md) |
 | `STRATA_GDN_REC_HEADS` | on / off | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
+| `STRATA_GFX1030_EXP8` | text | AMD | - |
 | `STRATA_GFX11_CHUNK` | on / off | AMD | - |
 | `STRATA_GFX12_CHUNK` | text | AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_GFX12_RING` | on / off | AMD | [DETAILS.md](DETAILS.md) |
@@ -347,7 +348,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WATCHDOG_S` | number | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 
-## Switches that go back to earlier behaviour (104)
+## Switches that go back to earlier behaviour (106)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -369,12 +370,14 @@ version made it the default.
 | `STRATA_GFX1151_CHUNK` | text | AMD | v0.2.16 | [release-notes-0.2.3.md](release-notes-0.2.3.md), [STRIX_HALO.md](STRIX_HALO.md), [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) |
 | `STRATA_GFX1151_DEFAULTS` | on / off | NVIDIA and AMD | v0.2.16 | [STRIX_HALO.md](STRIX_HALO.md), [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) |
 | `STRATA_GFX11_DEFAULTS` | on / off | NVIDIA and AMD | v0.2.19 | - |
-| `STRATA_GFX11_EXP8` | text | NVIDIA and AMD | v0.2.19 | - |
+| `STRATA_GFX11_EXP8` | text | AMD | v0.2.19 | - |
 | `STRATA_GFX11_WMMA_DEFAULTS` | on / off | NVIDIA and AMD | v0.2.19 | - |
 | `STRATA_GFX12_DEFAULTS` | on / off | NVIDIA and AMD | v0.2.16 | [DETAILS.md](DETAILS.md) |
+| `STRATA_GFX12_EXP8` | text | AMD | - | - |
 | `STRATA_GR_V3` | number | NVIDIA and AMD, Intel Arc | v0.2.16 | [DETAILS.md](DETAILS.md), [README.md](bench-results/2026-10-03-community-rx7900xtx-rocm102-nightly/README.md), [README.md](bench-results/2026-10-04-community-rx7900xtx-hipblaslt-100500/README.md) |
 | `STRATA_HC_Q8_ALL_STAGES` | on / off | NVIDIA and AMD | v0.2.16 | - |
 | `STRATA_HIPBLASLT` | number | AMD | v0.2.19 | - |
+| `STRATA_HIP_EXP8` | text | AMD | - | - |
 | `STRATA_HIP_MAPPED_COHERENT` | on / off | NVIDIA and AMD | v0.2.19 | - |
 | `STRATA_HIP_QUEUE_PRIME` | on / off | NVIDIA and AMD | v0.2.16 | [AMD_HIP.md](AMD_HIP.md), [release-notes-0.2.1.md](release-notes-0.2.1.md), [release-notes-0.2.2.md](release-notes-0.2.2.md) |
 | `STRATA_I8_SM70` | text | NVIDIA and AMD | v0.2.16 | - |
