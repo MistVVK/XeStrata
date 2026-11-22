@@ -30,6 +30,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -100,6 +101,34 @@ def _read(path: Path, builtin: bool) -> Skill:
                  {str(k): str(v) for k, v in meta.items()} if isinstance(meta, dict) else {})
 
 
+def _read_external(path: Path) -> Skill:
+    """A built-in skill read for GET /v1/skills.  Nine of the files on disk have ': ' in an unquoted description,
+    which YAML reads as a mapping and the chat's _read() skips.  Quote those two values here instead of changing a
+    file or the chat's reader: the external endpoint serves every built-in, and nothing else changes."""
+    text = path.read_text(encoding="utf-8")
+    m = re.match(r"\A﻿?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", text, flags=re.S)
+    if not m:
+        raise SkillError(f"{path}: it starts with a front matter")
+    lines = []
+    for line in m.group(1).splitlines():
+        f = re.match(r"^(\s*)(name|description):\s+(.*?)\s*$", line)
+        lines.append(f"{f.group(1)}{f.group(2)}: {json.dumps(f.group(3))}"
+                     if f and not f.group(3).startswith(("'", '"')) else line)
+    try:
+        front = yaml.safe_load("\n".join(lines))
+    except yaml.YAMLError as e:
+        raise SkillError(f"{path}: the front matter is not YAML ({str(e).splitlines()[0]})") from None
+    if not isinstance(front, dict):
+        raise SkillError(f"{path}: the front matter is not a mapping")
+    body = re.sub(r"\A\s*<!--.*?-->\s*", "", text[m.end():], flags=re.S).strip()
+    name, desc = check(front, body)
+    if name != path.parent.name:
+        raise SkillError(f"{path}: its name {name!r} is not its folder's")
+    meta = front.get("metadata")
+    return Skill(name, desc, body, True,
+                 {str(k): str(v) for k, v in meta.items()} if isinstance(meta, dict) else {})
+
+
 def default_dir() -> Path:
     """The user's skills when the config names no "skills_dir": the data folder setup uses (the settings' data_dir,
     else its default) - setup writes "skills_dir" into each model's config, so this is for an older config."""
@@ -155,6 +184,25 @@ class Skills:
             names = {s.name for s in own}
             user = [s for s, _, _ in self._scan(self.user_dir, False) if s is not None and s.name not in names]
         return own + user
+
+    def external_all(self) -> list[Skill]:
+        """Every built-in skill on disk, for the external endpoint only.  Unlike all(), this includes one whose
+        front matter's unquoted description has ': ' in it; the chat's list and _cache are left alone."""
+        if not self.builtin_dir.is_dir():
+            return []
+        out = []
+        for d in sorted(self.builtin_dir.iterdir()):
+            f = d / "SKILL.md"
+            if not d.is_dir() or d.name.startswith(".") or not f.is_file():
+                continue
+            try:
+                out.append(_read_external(f))
+            except (OSError, UnicodeError, SkillError):
+                continue
+        return out
+
+    def external_get(self, name: str) -> Skill | None:
+        return next((s for s in self.external_all() if s.name == name), None)
 
     def broken(self) -> list[dict]:
         """The user's SKILL.md files that do not read, and why (the web page's list shows them)."""
@@ -286,6 +334,148 @@ class Skills:
 def wrap_user(s: Skill) -> str:
     """A user's skill as load_skill returns it: marked as the user's, not XeStrata's."""
     return (f"<skill name=\"{s.name}\" source=\"added by this server's user, not XeStrata\">\n{s.body}\n</skill>")
+
+
+# ---------------------------------------------------------------------------------- skills for an external caller
+# GET /v1/skills serves the built-in skills through one conversion that lives here, in the shared skills module: no
+# skill name or model name is special-cased.  The file on disk stays the chat's.  Every rule below is a pattern on the
+# text, applied once, in a fixed order; the setup's model ids and the request's base URL are data passed in by serve.
+
+_PLACEHOLDER = re.compile(r"<this setup's [^<>]*?model>", re.I)
+# A1: a chat's attachment notation, and the sentence that describes it.
+_ATTACHED = re.compile(r"\battached:(\d+)\b")
+_ATTACHED_SAY = re.compile(r"The user's pictures are `attached:1`, `attached:2`, \.\.\. in attachment order")
+# A2: the chat's implicit extra pictures, the chat's saved mask link.
+_EXTRA_PICS = re.compile(r"Without them the user's other attached pictures go in, except the control image\.")
+_MASK_LINK = re.compile(r"the marked picture and the mask's link")
+# A4: the chat's plan / step / group / use_text_gpu / stub call arguments and same-reply calls.
+_PLAN_SAY = re.compile(r"two image or video steps or more get a chart of them as the first call's `plan` "
+                       r"\(combine-tools has more\)")
+_PLAN_IDS = re.compile(r"each call gives its box's id as `step`, and the page colors the box as it runs")
+_GROUP = re.compile(r"The calls of one reply run at once\. Calls whose results are joined later share a `group`: "
+                    r"one failing stops the rest of it\. `use_text_gpu` true lends them the chat model's GPU: only "
+                    r"when the user wants it fast, or two heavy steps of different image models stand side by side\.")
+_STUB = re.compile(r"A tool given as one line: call it with the arguments its line names; its first call "
+                   r"answers with the rest\.")
+_REPLY = re.compile(r"The calls of one reply run at once: put together the steps that need no other step's result\.")
+_TWO_REPLIES = re.compile(r"\bin two replies\b")
+_CHAIN = re.compile(r"Each step takes the link the step before it returned as its `image`\.")
+# A5/A6: a download message, the Video tab and the chat's training panel.
+_DOWNLOAD = re.compile(r"A result that says it is downloading: tell the user, and call it again later, in a new "
+                       r"message\.")
+_VIDEO_UP = re.compile(r"tell the user it runs, that they follow it in the Video tab and where the video will be; "
+                       r"do not call again to check\.")
+_VIDEO_SEG = re.compile(r"A job, as upscale_video's: tell the user, do not call again to check\. To pick one object "
+                        r"by pointing, or fix one missed: the Video tab's Find objects\.")
+_PANEL = re.compile(r"The training panel opens in the chat; the user does the work there\.")
+_PANEL_HELP = re.compile(r"Tell the user what the panel does, briefly:")
+_PANEL_WAIT = re.compile(r"Do not wait for it and do not call train_lora again for the same request\.")
+_PANEL_PICK = re.compile(r"The user picks one and registers it as a LoRA")
+_SETUP = re.compile(r"\bthis setup\b(?!\s*\()")
+
+
+def external_models(images: Any) -> dict:
+    """The setup's image model ids in config order, grouped by family: the facts A3 resolves a placeholder with."""
+    gens = list(images.gens.values()) if images is not None else []
+    families: dict[str, list[str]] = {}
+    for g in gens:
+        family = str(getattr(g, "family", None) or g.cfg.get("family") or "qwen-image")
+        families.setdefault(family, []).append(g.model)
+    return {"ids": [g.model for g in gens], "default": gens[0].model if gens else "", "families": families}
+
+
+def _family_ids(ctx: dict, asked: str) -> list[str]:
+    """The ids of the family a placeholder names: `qwen-image-2.1` is the `qwen-image` family.  No id is guessed."""
+    keys = []
+    for f in ctx["families"]:
+        if f and (asked == f or asked.startswith(f + "-") or f.startswith(asked + "-")):
+            keys.append(f)
+    return ctx["families"][max(keys, key=len)] if keys else []
+
+
+def _contract(ctx: dict, base: str) -> str:
+    """The one contract block every external skill carries: the setup's real ids and the A1-A6 REST wording."""
+    ids = ctx["ids"]
+    qwen = _family_ids(ctx, "qwen-image-2.1")
+    if ids:
+        models = "Image models in this setup: " + ", ".join(f"`{i}`" for i in ids)
+        models += f"; default `{ctx['default']}`." if ctx["default"] else "."
+    else:
+        models = "This setup has no image models."
+    if qwen:
+        models += " Qwen-Image-2.1 ids here: " + ", ".join(
+            f"`{i}`" + (" (default of this family)" if n == 0 else "") for n, i in enumerate(qwen)) + "."
+    else:
+        models += " This setup has no Qwen-Image-2.1 model; do not guess a name."
+    return "\n\n".join([
+        "## External REST API",
+        f"These skills are served from {base} by GET /v1/skills. Use this REST contract, not the chat's call rules.",
+        models,
+        "- Input images: send the bytes as multipart `image` (`image[]` for several) or as JSON `image` / `images` "
+        "with a `data:` or `http(s)` URL. A relative link `/v1/images/files/<name>` is resolved against " + base
+        + "; fetch it and send the bytes, or pass a link you already have as a URL. There is no general "
+        "`POST /v1/images/files` upload (unverified): get a link from a `response_format=url` response of "
+        "`/v1/images/edits`, `/v1/images/upscale`, `/v1/images/segmentations`, `/v1/images/remove-background`, "
+        "`/v1/images/controls` or `/v1/videos/files`.",
+        "- Result links: a response's `url` is absolute; a chat tool's `/v1/images/files/...` is relative. Copy "
+        "links exactly, never invent one. Only the newest files are kept, so an old link can 404. Masks and control "
+        "maps are saved in the same place. `POST /v1/images/segmentations` returns a mask inline (`data[].mask`: "
+        "base64 PNG with `mask_format=png`, COCO RLE with `mask_format=rle`), not a link.",
+        "- Requests with no dependency may be sent in parallel. When one depends on another, use the first "
+        "response's link (as fetched bytes) for the next request; the server has no `group` and no failure cascade. "
+        "A tool's definition is `GET /v1/skills/<name>`; keep at most two retries on a bad result and change the "
+        "prompt or region, not only `strength`. The chat's two-stage stub call is chat only.",
+        "- A 503 with `code: weights_downloading` is not success: wait `Retry-After` seconds (default 30) and "
+        "resend the same request. A video job returns an id: poll `GET /v1/videos/<id>` for `status` / `progress`, "
+        "then `GET /v1/videos/<id>/content` (or `?variant=overlay|mask|object_<id>`); do not re-POST the job.",
+    ])
+
+
+def externalize(text: str, ctx: dict, base: str) -> str:
+    """One SKILL.md -> its external form: the front matter kept, each A1-A6 rule applied once, A7 left alone."""
+    m = re.match(r"\A(\ufeff?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z))(.*)\Z", text, flags=re.S)
+    head, body = (m.group(1), m.group(2)) if m else ("", text)
+
+    def placeholder(match: re.Match) -> str:
+        asked = match.group(0)[1:-1].rsplit(" model", 1)[0].replace("this setup's", "").strip().lower()
+        ids = _family_ids(ctx, asked)
+        if not ids:
+            return "no such model in this setup" + ("; image models: " + ", ".join(ctx["ids"]) if ctx["ids"] else "")
+        return ids[0]   # the family's id in config order, so the example stays a valid JSON string
+
+    body = _PLACEHOLDER.sub(placeholder, body)
+    rules = (
+        (_ATTACHED_SAY, "Input pictures are the links you pass, in order"),
+        (_ATTACHED, r"<input image \1 link>"),
+        (_EXTRA_PICS, "Every input picture is explicit: pass the extras in `image[]` / `images`."),
+        (_MASK_LINK, "the marked picture and the mask (a link in the chat, `data[].mask` inline in a REST "
+                     "`/v1/images/segmentations` response)"),
+        (_PLAN_SAY, "a chart of them drawn for the plan"),
+        (_PLAN_IDS, "the ids are for your own tracking"),
+        (_GROUP, "Requests with no dependency may be sent in parallel; when one depends on another, use the first "
+                 "response's link (as bytes) for the next request. There is no server-side `group` or failure "
+                 "cascade, and `use_text_gpu` is not an API argument."),
+        (_STUB, "A tool's definition is `GET /v1/skills/<name>` and its arguments are the REST contract."),
+        (_REPLY, "Requests with no dependency may be sent in parallel."),
+        (_TWO_REPLIES, "in two consecutive requests"),
+        (_CHAIN, "Each step takes the link the step before it returned as its `image` (fetch a relative link and "
+                 "send the bytes)."),
+        (_DOWNLOAD, "A 503 with `code: weights_downloading` is not success: wait `Retry-After` seconds (default 30) "
+                    "and resend the same request."),
+        (_VIDEO_UP, "POST returns a job id; poll `GET /v1/videos/<id>` for `status` / `progress`, then "
+                    "`GET /v1/videos/<id>/content` for the file. Do not re-POST the job."),
+        (_VIDEO_SEG, "A job, as upscale_video's: poll `GET /v1/videos/<id>` and use `GET .../content` with "
+                     "`?variant=overlay|mask|object_<id>`; do not re-POST. Pick an object by pointing, or fix one "
+                     "missed, with the segmentation job's `prompts`."),
+        (_PANEL, "The chat's training panel has no confirmed REST equivalent (unverified)."),
+        (_PANEL_HELP, "The chat's panel steps (unverified over REST):"),
+        (_PANEL_WAIT, "Do not re-POST the same training request; its external status contract is unverified."),
+        (_PANEL_PICK, "A saved version is selected over REST (the registration path is unverified)"),
+        (_SETUP, f"this setup ({base})"),
+    )
+    for pattern, replacement in rules:
+        body = pattern.sub(replacement, body)
+    return head + body.rstrip() + "\n\n" + _contract(ctx, base) + "\n"
 
 
 class SkillTools:

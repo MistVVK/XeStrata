@@ -8704,6 +8704,9 @@ def make_handler(svc: Service):
                                                    "code": "model_not_found"}})
                     else:
                         self._json(200, found)
+            elif path == "/v1/skills" or path.startswith("/v1/skills/"):
+                if self._authorized():
+                    self._v1_skills_get(path)
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -10118,6 +10121,35 @@ def make_handler(svc: Service):
                                                       f"config's trusted_origins)"}})
                 return False
             return True
+
+        def _v1_skills_get(self, path):
+            """GET /v1/skills: the built-in skills' index for an external caller; GET /v1/skills/<name>: one skill's
+            SKILL.md converted for outside use (skills_api.externalize), in markdown.  The web page's /skills, which
+            serves the raw text and the user's skills, is untouched.  The key and the base URL follow /v1/models."""
+            if path == "/v1/skills":
+                data = [{"name": s.name, "description": s.description, "kind": s.kind, "chars": len(s.body)}
+                        for s in svc.skills.external_all()]
+                self._json(200, {"object": "list", "data": data})
+                return
+            name = unquote(path[len("/v1/skills/"):])
+            s = svc.skills.external_get(name)
+            if s is None or not s.builtin:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "skill_not_found",
+                                           "message": f"no skill named {name!r}"}})
+                return
+            addr = cast(Any, self.server.server_address)
+            host = self.headers.get("Host") or f"{addr[0]}:{addr[1]}"
+            scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
+            ctx = skills_api.external_models(svc.images)
+            text = skills_api.externalize((svc.skills.builtin_dir / name / "SKILL.md").read_text(encoding="utf-8"),
+                                          ctx, f"{scheme}://{host}")
+            body = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            self._cors()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _skills_get(self, path):
             """GET /skills: every skill (XeStrata's and the user's), whether each is on, and the user's that do not
