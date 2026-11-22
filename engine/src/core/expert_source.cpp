@@ -3982,6 +3982,30 @@ bool FileExpertSource::pin_cache_complement(
         }
 #endif
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
+        // #6583: on a multi-GPU layer split under a RAM budget, reserve room for the stages' prompt-path lend
+        // regions BEFORE filling the coldest tail of the complement.  Borrowed slots hold GPU-resident hot experts
+        // that are evicted and re-read on every prompt chunk; letting the coldest complement experts crowd them out
+        // turns every chunk into hundreds of uncached SSD blob reads.
+        uint64_t stage_lend_reserve = 0;
+        if (!stage_lend_regions_.empty()) {
+            std::vector<uint8_t> seen(offsets.size(), 0);
+            for (const auto& region : stage_lend_regions_) {
+                for (const auto& pair : region) {
+                    if (pair.first < 0 || pair.first >= n_layers_ || pair.second < 0 || pair.second >= n_expert_) continue;
+                    const size_t idx = (size_t) pair.first * (size_t) n_expert_ + (size_t) pair.second;
+                    if (offsets[idx] != kNoComplement || seen[idx]) continue;
+                    seen[idx] = 1;
+                    const uint64_t b = layer_blob_bytes_[(size_t) pair.first];
+                    if (b > budget_bytes - stage_lend_reserve) {
+                        stage_lend_reserve = budget_bytes;
+                        break;
+                    }
+                    stage_lend_reserve += b;
+                }
+                if (stage_lend_reserve >= budget_bytes) break;
+            }
+        }
+        const uint64_t comp_cap = budget_bytes - stage_lend_reserve;
         uint64_t at = 0;
         int64_t held = 0;
         if (rank != nullptr)
@@ -3990,12 +4014,12 @@ bool FileExpertSource::pin_cache_complement(
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
                 const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
-                if (b > budget_bytes - at) continue;
+                if (b > comp_cap - at) continue;
                 ranked[i] = at;
                 at += b;
                 ++held;
             }
-        if (what_fits && held == 0) {   // #467: nothing to keep - the caller's plain mmap fallback, not an empty copy
+        if (what_fits && held == 0 && stage_lend_reserve == 0) {   // #467: nothing to keep - the caller's plain mmap fallback, not an empty copy
             err = "FileExpertSource: available memory cannot hold any expert of the complement";
             return false;
         }

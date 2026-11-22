@@ -11687,7 +11687,41 @@ int main(int argc, char** argv) {
         std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lends;
         decide_split_ring();   // the ring the prompt path really uses, BEFORE bytes_needed sizes the regions below
         if (pf_borrow && d_res != nullptr && o.prefill_chunk > 0 && multi_gpu && !stages.empty()) {
-            const int64_t bound = o.prefill_auto ? auto_ceiling : o.prefill_chunk;
+            int64_t bound = o.prefill_auto ? auto_ceiling : o.prefill_chunk;
+            if (o.prefill_auto && bound > 256) {
+                // #6583: size the split lend regions for the largest chunk the auto scan can actually pick
+                // (every stage within g_lend_keep and kAutoLendPct), rather than over-reserving for an unreachable
+                // auto_ceiling (e.g. 32768 when the cards fit 8192).
+                auto split_auto_fits = [&](int64_t c) -> bool {
+                    if (c > 8192 && (c > o.prefill_auto_max || c > o.max_context)) return false;
+                    if (o.prefill_auto_cap > 0 && c > o.prefill_auto_cap) return false;
+                    for (size_t i = 0; i <= stages.size(); ++i) {
+                        const strata::core::ExpertCache& xc = i == 0 ? xcache : stages[i - 1]->cache;
+                        const strata::core::SessionState& ses = i == 0 ? ss : stages[i - 1]->ss;
+                        const int64_t dev = i == 0 ? -1 : stages[i - 1]->dev;
+                        const int64_t lb = i == 0 ? 0 : stages[i - 1]->lb;
+                        const int64_t le = i == 0 ? split_at[0] : stages[i - 1]->le;
+                        if (xc.slots() <= 0 || le <= lb) continue;
+                        uint64_t need = 0;
+                        {
+                            const strata::core::OnDevice on((int) dev);
+                            need = strata::prefill::Prefill::bytes_needed(g, ses, c, srcp != nullptr);
+                        }
+                        const int64_t k = strata::program::split_lend_slots(
+                            xc.slots(), xc.bytes(), xc.slot_offsets(),
+                            (uint64_t) strata::kernels::cpu::expert_layout().max_blob, need);
+                        if (k <= 0 || k + g_lend_keep > xc.slots() || k * 100 > kAutoLendPct * xc.slots()) return false;
+                    }
+                    return true;
+                };
+                int64_t lo = 1, hi = bound / 256, best = 0;
+                while (lo <= hi) {
+                    const int64_t mid = lo + (hi - lo) / 2;
+                    if (split_auto_fits(mid * 256)) { best = mid * 256; lo = mid + 1; }
+                    else hi = mid - 1;
+                }
+                if (best >= 256) bound = best;
+            }
             static const bool own_ok = [] {
                 const char* v = std::getenv("STRATA_SPLIT_OWN_BUFFERS");
                 return v == nullptr || v[0] != '0';
