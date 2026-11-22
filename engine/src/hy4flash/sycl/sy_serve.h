@@ -47,18 +47,6 @@ struct ServeOpts {
     SpecCfg spec;
 };
 
-struct SampleOpts {
-    float temperature = 0.f;  // 0 = greedy
-    float top_p = 1.f;
-    int top_k = 64;
-    float min_p = 0.f;
-    float rep = 1.f, freq = 0.f, pres = 0.f;
-    int last_n = 64;
-    uint64_t seed = 0;
-    bool greedy() const { return temperature <= 0.f; }
-    bool penalties() const { return rep != 1.f || freq != 0.f || pres != 0.f; }
-};
-
 #ifndef _MSC_VER
 inline void proto(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 #endif
@@ -417,9 +405,19 @@ inline int hy4s_serve_main(const ServeOpts& o) {
                 fprintf(stderr, "[vision] %zu picture(s), %d image rows, encoded in %.2f s\n", recs.size(), vctx.n_rows, vctx.t_encode);
                 r.vis = &vctx;
             }
-            // KV reuse: only a pure extension of what is resident
+            // KV reuse: pure extension OR LCP prefix rollback (4-token IndexPool-aligned, within SWA ring safety bound)
             int start = 0;
-            if (!has_images && o.session_reuse && fwd > 0 && fwd < T0 && (int)tok.size() >= fwd && std::equal(tok.begin(), tok.begin() + fwd, q.ids.begin())) start = fwd;
+            if (!has_images && o.session_reuse && fwd > 0 && (int)tok.size() >= fwd) {
+                int lcp = 0;
+                const int lim = std::min(fwd, T0);
+                while (lcp < lim && tok[lcp] == q.ids[lcp]) ++lcp;
+                if (lcp == fwd && fwd < T0) {
+                    start = fwd;  // exact pure extension: zero wasted tokens
+                } else if (lcp >= 4) {
+                    const int s = std::min(lcp, T0 - 1) & ~3;  // align to 4-token IndexPool group so ivg rebuilds cleanly
+                    if (s > 0 && std::max(0, s - r.c.window + 1) >= std::max(0, fwd - r.ring)) start = s;
+                }
+            }
             tok.assign(q.ids.begin(), q.ids.end());
             fwd = 0;
             if (start > 0) proto("RESUME %d", start);
@@ -467,11 +465,11 @@ inline int hy4s_serve_main(const ServeOpts& o) {
             const int limit = std::min(q.max_new, std::max(0, room));
             bool nonfinite = false;
             const bool greedy_fast = q.s.greedy() && !q.s.penalties();
-            const bool spec_path = use_spec && greedy_fast && limit > 0 && !has_images;  // the drafter does not apply the 3D picture positions
+            const bool spec_path = use_spec && limit > 0 && !has_images;  // lossless for both greedy AND probabilistic (temperature/penalties)!
             long acc0 = spec ? spec->S.accepted : 0, off0 = spec ? spec->S.drafted : 0;
             if (spec_path) {
                 std::string fin, e2;
-                fwd = spec->run(tok, limit, max_ctx, EOS, EOT, [&](int t) { proto("T %d", t); return !in.stop.load(); }, fin, e2, made);
+                fwd = spec->run(tok, limit, max_ctx, EOS, EOT, [&](int t) { proto("T %d", t); return !in.stop.load(); }, fin, e2, made, &q.s, &rng);
                 if (fin == "error") {
                     proto("ERR spec: %s", e2.c_str());
                     return 1;

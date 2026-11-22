@@ -313,9 +313,14 @@ struct DFly2 {
             if (r.split_max > 0) {
                 const int S = std::min(r.split_max, 8);
                 Dispatch dd;
-                dd.p = &r.P("mla_attend_part");
+                if (r.mpp_flash_ok && r.mpp_dec_attn) {
+                    dd.p = &r.P("mla_flash_mpp_part");
+                    dd.grid[0] = 2; dd.grid[1] = S; dd.grid[2] = B; dd.tg[0] = 128;
+                } else {
+                    dd.p = &r.P("mla_attend_part");
+                    dd.grid[0] = 32; dd.grid[1] = S; dd.grid[2] = B; dd.tg[0] = 256;
+                }
                 dd.args = {Bf(qa_h), Bf(r.kcache[L]), wf(pa + ".learnable_sink_param"), Bf(r.attn_ws), Arg::V<MlaArgs>(ma), Bf(dlist), Bf(dnk), I(S)};
-                dd.grid[0] = 32; dd.grid[1] = S; dd.grid[2] = B; dd.tg[0] = 256;
                 r.ds.push_back(std::move(dd));
                 r.add("mla_attend_merge", 32, B, 256, {Bf(r.attn_ws), Bf(ctx_h), Arg::V<MlaArgs>(ma), I(S)});
             } else {

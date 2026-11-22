@@ -148,6 +148,27 @@ class Effort(unittest.TestCase):
         frontend.use_family(None)
         self.assertEqual(frontend.effort_kwargs("high"), {"reasoning_effort": "xhigh"})       # the Qwen table is back
 
+    def test_config_reasoning_effort_max_is_hy4_only(self):
+        from serve.server import clean_shared_defaults
+        hy4_cfg = {"arch": hy4_kind.ARCH}
+        self.assertTrue(hy4_kind.is_hy4(hy4_cfg))
+        self.assertEqual(clean_shared_defaults({"reasoning_effort": "max"}, hy4=hy4_kind.is_hy4(hy4_cfg)), {"reasoning_effort": "max"})
+        self.assertEqual(clean_shared_defaults({"reasoning_effort": "none"}, hy4=True), {"reasoning_effort": "none"})
+        with self.assertRaises(ValueError):                                   # other families: today's validation
+            clean_shared_defaults({"reasoning_effort": "max"}, hy4=hy4_kind.is_hy4({"arch": "qwen"}))
+        with self.assertRaises(ValueError):
+            clean_shared_defaults({"reasoning_effort": "max"})
+        with self.assertRaises(ValueError):
+            clean_shared_defaults({"reasoning_effort": "bogus"}, hy4=True)
+        # the configured level reaches the template the way a request's own does (OpenAI body; Anthropic output_config)
+        frontend.use_family("hy4")
+        tpl = ChatTemplate(TEMPLATE)
+        msgs, tools, kw = frontend.openai_to_messages({"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "max"})
+        self.assertIn("reasoning_effort:max", tpl.render(msgs, tools=tools, **D.template_kwargs(kw)))
+        msgs, tools, kw = frontend.anthropic_to_messages({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 9,
+                                                          "output_config": {"effort": "max"}})
+        self.assertIn("reasoning_effort:max", tpl.render(msgs, tools=tools, **D.template_kwargs(kw)))
+
     def test_template_kwargs(self):
         self.assertEqual(D.template_kwargs({"enable_thinking": False}), {"enable_thinking": False, "reasoning_effort": "no_think"})
         self.assertEqual(D.template_kwargs({"reasoning_effort": "max"}), {"reasoning_effort": "max"})
@@ -232,20 +253,24 @@ class Kind(unittest.TestCase):
         self.assertFalse(hy4_kind.is_hy4(None))
 
     BASE = ["--native", "m.strata", "--engram", "e.strata", "--max-context", "131072"]
+    SR = ["--session-reuse", "1"]               # on by default (the engine's longest-common-prefix reuse)
 
     def test_args_are_the_configs_own_when_the_engine_has_neither(self):
         cfg = {"arch": "hy4flash", "args": self.BASE}
         with mock.patch.object(hy4_kind, "probe", return_value=None):
-            self.assertEqual(hy4_kind.engine_args(cfg, "x", announce=False), self.BASE)             # drafter asked (the default), the engine cannot say it has one
+            self.assertEqual(hy4_kind.engine_args(cfg, "x", announce=False), self.BASE + self.SR)   # drafter asked (the default), the engine cannot say it has one
         with mock.patch.object(hy4_kind, "probe", return_value={"arch": "hy4flash", "drafter": "none", "images": "0"}):
-            self.assertEqual(hy4_kind.engine_args({**cfg, "args": self.BASE + ["--vision", "v.strata"]}, "x", announce=False), self.BASE)   # no image reader: --vision <file> left out
+            self.assertEqual(hy4_kind.engine_args({**cfg, "args": self.BASE + ["--vision", "v.strata"]}, "x", announce=False), self.BASE + self.SR)   # no image reader: --vision <file> left out
 
     def test_the_drafter_and_the_pictures_are_on_by_default_where_the_engine_has_them(self):
         cfg = {"arch": "hy4flash", "args": self.BASE + ["--vision", "v.strata"]}
         have = {"arch": "hy4flash", "drafter": "dfly2", "images": "1"}
         with mock.patch.object(hy4_kind, "probe", return_value=have):
-            self.assertEqual(hy4_kind.engine_args(cfg, "x", announce=False), self.BASE + ["--vision", "v.strata", "--draft", "dfly2"])
-            self.assertEqual(hy4_kind.engine_args({**cfg, "drafting": "off"}, "x", announce=False), self.BASE + ["--vision", "v.strata"])
+            self.assertEqual(hy4_kind.engine_args(cfg, "x", announce=False), self.BASE + ["--vision", "v.strata"] + self.SR + ["--draft", "dfly2"])
+            self.assertEqual(hy4_kind.engine_args({**cfg, "drafting": "off"}, "x", announce=False), self.BASE + ["--vision", "v.strata"] + self.SR)
+            off = hy4_kind.engine_args({**cfg, "args": cfg["args"] + ["--session-reuse", "0"]}, "x", announce=False)       # an explicit 0 stays
+            self.assertEqual(off.count("--session-reuse"), 1)
+            self.assertEqual(off[off.index("--session-reuse") + 1], "0")
             for word in ("auto", "mtp", "dflash2", "dfly2"):                                          # Qwen's words mean "the default" here
                 self.assertIn("--draft", hy4_kind.engine_args({**cfg, "drafting": word}, "x", announce=False), word)
             kept = {**cfg, "args": cfg["args"] + ["--draft", "dfly2"]}

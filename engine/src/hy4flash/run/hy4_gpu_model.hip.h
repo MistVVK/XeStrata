@@ -782,6 +782,11 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
             const uint64_t overflow = all_al_bytes - ram_budget_bytes;
             const double static_share = std::min(0.75, (double)overflow / (double)vram_budget);
             dyn_frac = std::max(0.25, 1.0 - static_share);
+        } else if (cpu_mode && N > 0 && vram_budget >= (12ull << 30)) {
+            // Mixed-precision SQ packs (e.g. SQ-64: S6/S8 hot experts 3.7 MB vs avg 2.67 MB) waste ~25-39% VRAM when 100% uniform-slot vcache is used.
+            // Pack the hottest ranks tightly in static VRAM (0% padding) and keep 35% of VRAM as adaptive vcache slabs sized to the largest remaining tier-2 expert!
+            const double avg_body_sz = (double)all_al_bytes / (double)N;
+            if ((double)max_body_sz > 1.20 * avg_body_sz) dyn_frac = 0.35;
         }
     }
     size_t static_budget = vram_budget;
@@ -898,11 +903,15 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         if (!any_placed) break;
     }
     uint64_t vb = vb_gpu[0];
-    // Reclaim any leftover static_budget slack into additional dynamic slots
-    if (ng == 1 && cpu_mode && dyn_frac > 0.01 && max_body_sz > 0 && vram_budget > vb + dyn_bytes + max_body_sz) {
-        int extra = (int)((vram_budget - vb - dyn_bytes) / max_body_sz);
-        dyn_slots += extra;
-        dyn_bytes = (size_t)dyn_slots * max_body_sz;
+    // Size adaptive vcache slots to the largest remaining non-VRAM (tier != 0) expert so static S6/S8 hot experts do not bloat dynamic slot stride!
+    size_t vcache_slot_sz = max_body_sz;
+    if (ng == 1 && cpu_mode && dyn_frac > 0.01 && vram_budget > vb) {
+        size_t t2_max = 0;
+        for (size_t i = 0; i < N; ++i)
+            if (tier[i] != 0) t2_max = std::max<size_t>(t2_max, (size_t)al(dir[i].body_bytes));
+        if (t2_max > 0 && t2_max < vcache_slot_sz) vcache_slot_sz = t2_max;
+        dyn_slots = vcache_slot_sz > 0 ? (int)((vram_budget - vb) / vcache_slot_sz) : 0;
+        dyn_bytes = (size_t)dyn_slots * vcache_slot_sz;
     }
     uint64_t n_v = nv_gpu[0], n_h = 0, n_cold = 0, cold_bytes = 0;
     for (size_t i = 0; i < N; ++i) {
@@ -936,18 +945,18 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     HCK(hipSetDevice(g.primary_gpu));
     HCK(hipMalloc((void**)&g.d_sec4, vb ? vb : 4096));
     g.vcache_slabs.clear();
-    g.vcache_slot_bytes = max_body_sz;
-    g.vcache_slots_per_slab = max_body_sz > 0 ? std::max(1, (int)((384ull << 20) / max_body_sz)) : 1;
+    g.vcache_slot_bytes = vcache_slot_sz;
+    g.vcache_slots_per_slab = vcache_slot_sz > 0 ? std::max(1, (int)((384ull << 20) / vcache_slot_sz)) : 1;
     int actual_dyn = 0;
     while (actual_dyn < dyn_slots) {
         const int take = std::min(g.vcache_slots_per_slab, dyn_slots - actual_dyn);
         uint8_t* slab = nullptr;
-        if (hipMalloc((void**)&slab, (size_t)take * max_body_sz) != hipSuccess) { (void)hipGetLastError(); break; }
+        if (hipMalloc((void**)&slab, (size_t)take * vcache_slot_sz) != hipSuccess) { (void)hipGetLastError(); break; }
         g.vcache_slabs.push_back(slab);
         actual_dyn += take;
     }
     dyn_slots = actual_dyn;
-    dyn_bytes = (size_t)dyn_slots * max_body_sz;
+    dyn_bytes = (size_t)dyn_slots * vcache_slot_sz;
     g.vcache_nslots = dyn_slots;
     const uint64_t total_vram_arena = vb + dyn_bytes;
     g.peers.clear();

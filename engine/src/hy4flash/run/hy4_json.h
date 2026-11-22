@@ -10,6 +10,8 @@
 
 namespace hy4 {
 
+struct JMember;  // avoids std::pair<std::string, JVal> incomplete-type instantiation on Clang + libstdc++ 16
+
 struct JVal {
     enum T { Null, Bool, Num, Str, Arr, Obj } t = Null;
     bool b = false;
@@ -18,23 +20,34 @@ struct JVal {
     bool is_int = false;
     std::string s;
     std::vector<JVal> a;
-    std::vector<std::pair<std::string, JVal>> o;
+    std::vector<JMember> o;
 
-    const JVal* get(const std::string& k) const {
-        for (auto& kv : o) if (kv.first == k) return &kv.second;
-        return nullptr;
-    }
-    const JVal& at(const std::string& k) const {
-        const JVal* v = get(k);
-        if (!v) throw std::runtime_error("json: missing key " + k);
-        return *v;
-    }
-    const JVal& operator[](size_t i) const { return a.at(i); }
-    size_t size() const { return t == Arr ? a.size() : o.size(); }
+    const JVal* get(const std::string& k) const;
+    const JVal& at(const std::string& k) const;
+    const JVal& operator[](size_t i) const;
+    size_t size() const;
     double f() const { return num; }
     int64_t i() const { return is_int ? i64 : (int64_t)num; }
     const std::string& str() const { return s; }
 };
+
+struct JMember {
+    std::string first;
+    JVal second;
+    JMember(std::string k, JVal v) : first(std::move(k)), second(std::move(v)) {}
+};
+
+inline const JVal* JVal::get(const std::string& k) const {
+    for (auto& kv : o) if (kv.first == k) return &kv.second;
+    return nullptr;
+}
+inline const JVal& JVal::at(const std::string& k) const {
+    const JVal* v = get(k);
+    if (!v) throw std::runtime_error("json: missing key " + k);
+    return *v;
+}
+inline const JVal& JVal::operator[](size_t i) const { return a.at(i); }
+inline size_t JVal::size() const { return t == Arr ? a.size() : o.size(); }
 
 class JsonParser {
 public:

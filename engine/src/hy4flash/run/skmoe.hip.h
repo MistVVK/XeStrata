@@ -742,8 +742,8 @@ __device__ __forceinline__ void gu_sg_64_128(const uint8_t* body, int bx, int ty
     }
     fv8 acc[MTW][2];
     acc_zero(acc);
-    const int brow[2] = {wn * 16, 32 + wn * 16};
-    gemm_mainloop_g<FMT, MTW, 2>(wr, 6, xrow, ws, acc, brow, true);
+    if constexpr (MTW == 1) gemm_mainloop_bk128_64_1x2<FMT>(wr, 6, xrow[0], ws, acc, wn * 16, 32 + wn * 16);
+    else gemm_mainloop_bk128_64_2x2<FMT>(wr, 6, xrow[0], xrow[1], ws, acc, wn * 16, 32 + wn * 16);
     const __half* sqx = (const __half*)body;
 #pragma unroll
     for (int i = 0; i < MTW; ++i)
@@ -781,6 +781,10 @@ __device__ __forceinline__ void dn_sg_body(const uint8_t* dnw, int bx, int ty, i
 #pragma unroll
     for (int j = 0; j < NTW; ++j) brow[j] = (wn * NTW + j) * 16;
     if constexpr (BN == 128) gemm_mainloop_128<FMT, MTW, NTW>(wr, 6, xrow, ws, acc, brow);
+    else if constexpr (MTW == 1 && NTW == 1) gemm_mainloop_bk128_64_1x1<FMT>(wr, 6, xrow[0], ws, acc, brow[0]);
+    else if constexpr (MTW == 2 && NTW == 1) gemm_mainloop_bk128_64_2x1<FMT>(wr, 6, xrow[0], xrow[1], ws, acc, brow[0]);
+    else if constexpr (MTW == 1 && NTW == 2) gemm_mainloop_bk128_64_1x2<FMT>(wr, 6, xrow[0], ws, acc, brow[0], brow[1]);
+    else if constexpr (MTW == 2 && NTW == 2) gemm_mainloop_bk128_64_2x2<FMT>(wr, 6, xrow[0], xrow[1], ws, acc, brow[0], brow[1]);
     else gemm_mainloop_g<FMT, MTW, NTW>(wr, 6, xrow, ws, acc, brow, true);
 #pragma unroll
     for (int i = 0; i < MTW; ++i)
@@ -805,7 +809,7 @@ __global__ void __launch_bounds__(256) k_moe_gu_sg(const uint8_t* __restrict__ s
     const int e = wl_e[blockIdx.y];
     const int ty = wl_ty ? wl_ty[blockIdx.y] : 0;
     const int n = cnt[e];
-    __shared__ __attribute__((aligned(16))) half_t ws[BM <= 32 ? (128 * BK128_LD) : (GEMM_BN * GEMM_LDW)];
+    __shared__ __attribute__((aligned(16))) half_t ws[BM <= 32 ? (128 * BK128_LD) : (GEMM_BN * BK128_LD)];
     const ExpertDev ed = ex[e];
     const uint8_t* body = sec4 + ed.body_off;
 #define HY4_GU_SG_CASE(F)                                                                                    \
@@ -838,7 +842,8 @@ __global__ void __launch_bounds__(256) k_moe_dn_sg(const uint8_t* __restrict__ s
     const int e = wl_e[blockIdx.y];
     const int ty = wl_ty ? wl_ty[blockIdx.y] : 0;
     const int n = cnt[e];
-    __shared__ __attribute__((aligned(16))) half_t ws[BN == 128 ? (128 * BK128_LD) : (GEMM_BN * GEMM_LDW)];
+    constexpr bool USE_BK128_64 = (BN != 128) && ((MTW == 1 || MTW == 2) && (NTW == 1 || NTW == 2));
+    __shared__ __attribute__((aligned(16))) half_t ws[BN == 128 ? (128 * BK128_LD) : (USE_BK128_64 ? (GEMM_BN * BK128_LD) : (GEMM_BN * GEMM_LDW))];
     const ExpertDev ed = ex[e];
     const uint8_t* dnw = sec4 + ed.body_off + ed.dn_off;
     switch (ed.dn_code) {

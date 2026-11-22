@@ -597,15 +597,19 @@ static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* o
 
 template <int FMT, bool HI>
 static void rows_fmt(const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out) {
-    for (int g0 = 0; g0 < m; g0 += 4) {
-        const int mg = std::min(4, m - g0);
+    for (int g0 = 0; g0 < m; g0 += 8) {
+        const int mg = std::min(8, m - g0);
         const ActRow* const* x = X + g0;
         float* o = out + (size_t)g0 * nrows;
         switch (mg) {
             case 1: rows_m<FMT, 1, HI>(W, nrows, x, o); break;
             case 2: rows_m<FMT, 2, HI>(W, nrows, x, o); break;
             case 3: rows_m<FMT, 3, HI>(W, nrows, x, o); break;
-            default: rows_m<FMT, 4, HI>(W, nrows, x, o); break;
+            case 4: rows_m<FMT, 4, HI>(W, nrows, x, o); break;
+            case 5: rows_m<FMT, 5, HI>(W, nrows, x, o); break;
+            case 6: rows_m<FMT, 6, HI>(W, nrows, x, o); break;
+            case 7: rows_m<FMT, 7, HI>(W, nrows, x, o); break;
+            default: rows_m<FMT, 8, HI>(W, nrows, x, o); break;
         }
     }
 }
@@ -1074,15 +1078,19 @@ static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* o
 
 template <int FMT, bool HI>
 static void rows_fmt(const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out) {
-    for (int g0 = 0; g0 < m; g0 += 4) {
-        const int mg = std::min(4, m - g0);
+    for (int g0 = 0; g0 < m; g0 += 8) {
+        const int mg = std::min(8, m - g0);
         const ActRow* const* x = X + g0;
         float* o = out + (size_t)g0 * nrows;
         switch (mg) {
             case 1: rows_m<FMT, 1, HI>(W, nrows, x, o); break;
             case 2: rows_m<FMT, 2, HI>(W, nrows, x, o); break;
             case 3: rows_m<FMT, 3, HI>(W, nrows, x, o); break;
-            default: rows_m<FMT, 4, HI>(W, nrows, x, o); break;
+            case 4: rows_m<FMT, 4, HI>(W, nrows, x, o); break;
+            case 5: rows_m<FMT, 5, HI>(W, nrows, x, o); break;
+            case 6: rows_m<FMT, 6, HI>(W, nrows, x, o); break;
+            case 7: rows_m<FMT, 7, HI>(W, nrows, x, o); break;
+            default: rows_m<FMT, 8, HI>(W, nrows, x, o); break;
         }
     }
 }
@@ -2824,6 +2832,8 @@ int CpuExperts::default_threads() {
     const int phys_cap = std::max(1, host_cpus / 2);
     const double cg = cgroup_cpu_limit();
     if (cg > 0.0 && cg < (double)host_cpus) return std::max(1, std::min(phys_cap, (int)std::floor(cg) - 2));
+    if (phys_cap >= 28) return phys_cap - 6;  // leave headroom on 28+ core Threadripper/EPYC for GPU submission & DMA threads
+    if (phys_cap >= 20) return phys_cap - 2;
     return phys_cap;
 }
 

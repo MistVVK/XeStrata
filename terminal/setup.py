@@ -10092,7 +10092,7 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
         ok(f"tokenizer: {tokdir}")
 
     step(7, "writing the start script")
-    args = ["--native", str(paths[files[0]]), "--engram", str(engram), "--max-context", str(ctx)]
+    args = ["--native", str(paths[files[0]]), "--engram", str(engram), "--max-context", str(ctx), "--session-reuse", "1"]   # the engine reuses a conversation's longest common prefix
     if vision:                                         # the Vision shard: the engine reads pictures with it once it supports them (serve leaves the option out until the engine says images=1)
         args += ["--vision", str(paths[hy4_family.VISION_FILE])]
     if not unified:                                    # a card: the rank-cut plan (hy4_fit) as the engine's caps; one pool: the engine puts everything in it

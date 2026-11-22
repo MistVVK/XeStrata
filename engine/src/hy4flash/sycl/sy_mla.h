@@ -34,6 +34,7 @@ struct MlaAttnArgs {
     const int32_t* nkeys = nullptr;
     int kmax = 0;
     float scale = 0.0625f;
+    TreePos tree{};  // tree.n > 0: Tree-8 speculative verify (logical pos p0+depth[t], ancestor slot p0+anc[t][d])
 };
 
 size_t mla_cache_bytes(int slots);
@@ -41,19 +42,22 @@ void mla_choose_splits(const MlaAttnArgs& a, int& TK, int& S, int& tps);
 size_t mla_workspace_bytes(const MlaAttnArgs& a);
 
 // Standard host-parameterized entry points (compatible with sy_mla_test and non-graphed paths)
-void mla_write_kv(const float* kv_a, const float* norm_w, half* cache, int cache_slots, int M, int p0, int ring, float theta, float eps);
+void mla_write_kv(const float* kv_a, const float* norm_w, half* cache, int cache_slots, int M, int p0, int ring, float theta, float eps, TreePos tp = {});
 void mla_prep_q(const float* q_b, const half* wk_b, half* qa, int M, int NH, int p0, float theta);
 void mla_attend(const half* qa, const half* cache, const float* sinks, half* ctx, const MlaAttnArgs& a, void* ws, size_t ws_bytes);
 void mla_vup(const half* ctx, const half* wv_b, const float* gate, half* o, int M, int NH);
 
-// Device-resident StepParams entry points for SYCL command_graph replay (reads p0 or a from d_step on device)
+// Tree-8 KV compaction: copies physical slot (p0 + src.depth[k]) [% ring] -> (p0 + k) [% ring] for k = 0..src.n-1.
+void mla_compact_kv(half* cache, int cache_slots, int p0, int ring, TreePos src);
+
+// Device-resident StepParams entry points for SYCL command_graph replay (reads p0 or a, and optional tree, from d_step on device)
 void mla_write_kv_dev(const float* kv_a, const float* norm_w, half* cache, int cache_slots, int M, const StepParams* d_step, bool use_dfly_a, int ring, float theta, float eps);
 void mla_prep_q_dev(const float* q_b, const half* wk_b, half* qa, int M, int NH, const StepParams* d_step, bool use_dfly_a, float theta);
 void mla_attend_dev(const half* qa, const half* cache, const float* sinks, half* ctx, const MlaAttnArgs& a, const StepParams* d_step, bool use_dfly_a, int TK, int S, int tps, void* ws, size_t ws_bytes);
 
 // Quantized S_K kv_b_proj decode/verify kernels (bit-identical to split_kvb -> fp16 -> prep_q/vup, 3x less bandwidth, 0 persistent fp16 wk_b/wv_b VRAM)
-// W_kvb: raw S_K [NH*448][512]; if d_step != nullptr, reads p0 (or a when use_dfly_a) from d_step instead of host p0.
-void mla_prep_q_sk(int fmt, const void* W_kvb, const float* q_b, half* qa, int M, int NH, int p0, const StepParams* d_step, bool use_dfly_a, float theta);
+// W_kvb: raw S_K [NH*448][512]; if d_step != nullptr, reads p0 (or a when use_dfly_a) and optional tree from d_step instead of host p0.
+void mla_prep_q_sk(int fmt, const void* W_kvb, const float* q_b, half* qa, int M, int NH, int p0, const StepParams* d_step, bool use_dfly_a, float theta, TreePos tp = {});
 void mla_vup_sk(int fmt, const void* W_kvb, const half* ctx, const float* gate, half* o, int M, int NH);
 
 extern int g_mla_target_blocks;

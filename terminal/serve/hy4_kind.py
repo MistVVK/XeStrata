@@ -130,6 +130,8 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     if n_gpus >= 2 and "--gpus" not in args:
         local_order = [str(n_gpus - 1)] + [str(i) for i in range(n_gpus - 1)]
         args += ["--gpus", ",".join(local_order)]
+    if "--session-reuse" not in args:            # the engine keeps the longest common prefix of a conversation: on unless the config says 0
+        args += ["--session-reuse", "1"]
     wants_images = "--vision" in args
     need_draft = "--draft" not in args and wants_drafter(cfg)
     info = probe(exe, args, cfg) if (exe and (wants_images or need_draft)) else None

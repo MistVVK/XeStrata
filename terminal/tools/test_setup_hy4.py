@@ -590,6 +590,7 @@ class MacHy4Flash(unittest.TestCase):
             self.assertEqual(written["drafting"], "dfly2")
             self.assertIn("--max-context", written["args"])
             self.assertEqual(written["args"][written["args"].index("--max-context") + 1], "131072")
+            self.assertEqual(written["args"][written["args"].index("--session-reuse") + 1], "1")
             self.assertIn("--vision", written["args"])
             self.assertNotIn("--vram-experts-gb", written["args"])
             self.assertNotIn("--ram-experts-gb", written["args"])

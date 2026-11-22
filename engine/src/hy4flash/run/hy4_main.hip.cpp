@@ -354,6 +354,9 @@ int main(int argc, char** argv) {
 #ifdef STRATA_HY4_DISTRIBUTED
     bool mpi_experts = false;
 #endif
+    std::string cc_dir;
+    double cc_gib = 40.0;
+    int cc_min = 1024;
     int gpu = -1;
     std::string gpus_csv = getenv("HY4_GPUS") ? getenv("HY4_GPUS") : "";
     std::string draft = "auto";  // auto: dfly2 under --serve (when the file carries the drafter), off for the CLI runs (gates / benches); "off" and "dfly2" force
@@ -437,6 +440,9 @@ int main(int argc, char** argv) {
         else if (a == "--spec-exact") scfg.exact = atoi(nxt().c_str()) != 0;
         else if (a == "--parity-m") parity_list = nxt();
         else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
+        else if (a == "--conversation-cache-dir") cc_dir = nxt();
+        else if (a == "--conversation-cache-gib") cc_gib = atof(nxt().c_str());
+        else if (a == "--conversation-cache-min-tokens") cc_min = atoi(nxt().c_str());
         else if (a == "--vision") vision_path = nxt();           // HY4-VISION: the Vision shard; loaded on the first request that carries a picture
         else if (a == "--image") image_files.push_back(nxt());  // HY4-VISION (offline runs): a picture file per image-pad token of --tokens, in order (the engine expands each pad)
         else if (a == "--image-max-pixels") image_max_pixels = atoll(nxt().c_str());
@@ -550,6 +556,9 @@ int main(int argc, char** argv) {
         so.no_index = no_index;
         so.no_engram = no_engram;
         so.session_reuse = session_reuse;
+        so.cc_dir = cc_dir;
+        so.cc_gib = cc_gib;
+        so.cc_min = cc_min;
         so.tail_skip = tail_skip_arg;
         so.draft = draft;
         so.dfly_override = dfly_override;

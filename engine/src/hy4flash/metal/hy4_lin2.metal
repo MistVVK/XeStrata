@@ -9,7 +9,6 @@ kernel void linear_skr(device const uchar* W [[buffer(0)]], device const half* X
     const int row0 = (int(tg) * 8 + int(sg)) * R;
     if (row0 >= N) return;
     constexpr int SB = sk_sb_bytes(F);
-    constexpr float H = sk_half(F);
     const int nsb = K >> 8;
     const size_t rowb = (size_t) nsb * SB;
     float acc[R][MT];
@@ -21,10 +20,8 @@ kernel void linear_skr(device const uchar* W [[buffer(0)]], device const half* X
         if (R == 1) {
             device const uchar* blk = W + (size_t) row0 * rowb + (size_t) sbi * SB;
             const float eff = float(as_type<half>(*((device const ushort*) blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
-            int q[8];
-            sk_q8<F>(blk + 6, j, q);
-            const float4 w0 = float4(float(q[0]), float(q[1]), float(q[2]), float(q[3])) - H;
-            const float4 w1 = float4(float(q[4]), float(q[5]), float(q[6]), float(q[7])) - H;
+            float4 w0, w1;
+            sk_w8_f4<F>(blk + 6, j, w0, w1);
             for (int m = 0; m < MT; ++m) {
                 device const half4* xp = (device const half4*) (X + (size_t) m * K + sbi * 256 + j);
                 acc[0][m] = fma(eff, dot(w0, float4(xp[0])) + dot(w1, float4(xp[1])), acc[0][m]);
@@ -40,10 +37,8 @@ kernel void linear_skr(device const uchar* W [[buffer(0)]], device const half* X
                 if (row0 + r < N) {
                     device const uchar* blk = W + (size_t) (row0 + r) * rowb + (size_t) sbi * SB;
                     const float eff = float(as_type<half>(*((device const ushort*) blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
-                    int q[8];
-                    sk_q8<F>(blk + 6, j, q);
-                    const float4 w0 = float4(float(q[0]), float(q[1]), float(q[2]), float(q[3])) - H;
-                    const float4 w1 = float4(float(q[4]), float(q[5]), float(q[6]), float(q[7])) - H;
+                    float4 w0, w1;
+                    sk_w8_f4<F>(blk + 6, j, w0, w1);
                     for (int m = 0; m < MT; ++m) {
                         acc[r][m] = fma(eff, dot(w0, xa[m]) + dot(w1, xb[m]), acc[r][m]);
                     }
@@ -70,7 +65,6 @@ kernel void linear_sm(device const uchar* W [[buffer(0)]], device const half* X 
     const int n0 = int(tg) * 32;
     if (n0 >= N) return;
     constexpr int SB = sk_sb_bytes(F);
-    constexpr float H = sk_half(F);
     const int nsb = K >> 8;
 
     simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
@@ -95,13 +89,11 @@ kernel void linear_sm(device const uchar* W [[buffer(0)]], device const half* X 
             const float eff = float(as_type<half>(*((device const ushort*) blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
             for (int u = 0; u < 2; ++u) {
                 const int col = wk + u * 8;
-                int q[8];
-                sk_q8<F>(blk + 6, g * 64 + col, q);
-                const half4 h0 = half4((float4(float(q[0]), float(q[1]), float(q[2]), float(q[3])) - H) * eff);
-                const half4 h1 = half4((float4(float(q[4]), float(q[5]), float(q[6]), float(q[7])) - H) * eff);
+                float4 w0, w1;
+                sk_w8_f4<F>(blk + 6, g * 64 + col, w0, w1);
                 threadgroup half4* dst = (threadgroup half4*) (sB + wr * 64 + col);
-                dst[0] = h0;
-                dst[1] = h1;
+                dst[0] = half4(w0 * eff);
+                dst[1] = half4(w1 * eff);
             }
         } else {
             threadgroup uint4* dst = (threadgroup uint4*) (sB + wr * 64 + wk);
@@ -132,12 +124,10 @@ kernel void linear_sm(device const uchar* W [[buffer(0)]], device const half* X 
 
 #define LIN2(F, MT, R) template [[host_name("linear_skr_" #F "_" #MT "_" #R)]] kernel void linear_skr<F, MT, R>(device const uchar*, device const half*, device float*, constant int&, constant int&, constant int&, uint, uint);
 #define LIN2_ALL(F, R) LIN2(F, 1, R) LIN2(F, 2, R) LIN2(F, 3, R) LIN2(F, 4, R) LIN2(F, 5, R) LIN2(F, 6, R) LIN2(F, 7, R) LIN2(F, 8, R)
-LIN2_ALL(4, 1) LIN2_ALL(4, 4)
-LIN2_ALL(5, 1) LIN2_ALL(5, 4)
-LIN2_ALL(6, 1) LIN2_ALL(6, 4)
-LIN2_ALL(8, 1) LIN2_ALL(8, 4)
-LIN2(4, 1, 2) LIN2(5, 1, 2) LIN2(6, 1, 2) LIN2(8, 1, 2)
-LIN2(4, 2, 2) LIN2(5, 2, 2) LIN2(6, 2, 2) LIN2(8, 2, 2)
+LIN2_ALL(4, 1) LIN2_ALL(4, 2) LIN2_ALL(4, 4)
+LIN2_ALL(5, 1) LIN2_ALL(5, 2) LIN2_ALL(5, 4)
+LIN2_ALL(6, 1) LIN2_ALL(6, 2) LIN2_ALL(6, 4)
+LIN2_ALL(8, 1) LIN2_ALL(8, 2) LIN2_ALL(8, 4)
 
 #define LINSM(F) template [[host_name("linear_sm_" #F)]] kernel void linear_sm<F>(device const uchar*, device const half*, device float*, constant int&, constant int&, constant int&, uint, uint, uint, uint);
 LINSM(4) LINSM(5) LINSM(6) LINSM(8)

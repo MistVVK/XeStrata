@@ -91,6 +91,150 @@ static inline void sk_w8(device const uchar* blk, int g, int j, thread float* w)
     for (int t = 0; t < 8; ++t) w[t] = (float(q[t]) - sk_half(F)) * eff;
 }
 
+// Constant-cache LUTs for S2_K..S6_K centered weight decode (exact to the bit vs float(q) - sk_half(F); 10x fewer ALU ops).
+constant half4 kHyS2Lut[256] = {
+    half4(-1.5h,-1.5h,-1.5h,-1.5h), half4(-0.5h,-1.5h,-1.5h,-1.5h), half4(0.5h,-1.5h,-1.5h,-1.5h), half4(1.5h,-1.5h,-1.5h,-1.5h),
+    half4(-1.5h,-0.5h,-1.5h,-1.5h), half4(-0.5h,-0.5h,-1.5h,-1.5h), half4(0.5h,-0.5h,-1.5h,-1.5h), half4(1.5h,-0.5h,-1.5h,-1.5h),
+    half4(-1.5h,0.5h,-1.5h,-1.5h),  half4(-0.5h,0.5h,-1.5h,-1.5h),  half4(0.5h,0.5h,-1.5h,-1.5h),  half4(1.5h,0.5h,-1.5h,-1.5h),
+    half4(-1.5h,1.5h,-1.5h,-1.5h),  half4(-0.5h,1.5h,-1.5h,-1.5h),  half4(0.5h,1.5h,-1.5h,-1.5h),  half4(1.5h,1.5h,-1.5h,-1.5h),
+    half4(-1.5h,-1.5h,-0.5h,-1.5h), half4(-0.5h,-1.5h,-0.5h,-1.5h), half4(0.5h,-1.5h,-0.5h,-1.5h), half4(1.5h,-1.5h,-0.5h,-1.5h),
+    half4(-1.5h,-0.5h,-0.5h,-1.5h), half4(-0.5h,-0.5h,-0.5h,-1.5h), half4(0.5h,-0.5h,-0.5h,-1.5h), half4(1.5h,-0.5h,-0.5h,-1.5h),
+    half4(-1.5h,0.5h,-0.5h,-1.5h),  half4(-0.5h,0.5h,-0.5h,-1.5h),  half4(0.5h,0.5h,-0.5h,-1.5h),  half4(1.5h,0.5h,-0.5h,-1.5h),
+    half4(-1.5h,1.5h,-0.5h,-1.5h),  half4(-0.5h,1.5h,-0.5h,-1.5h),  half4(0.5h,1.5h,-0.5h,-1.5h),  half4(1.5h,1.5h,-0.5h,-1.5h),
+    half4(-1.5h,-1.5h,0.5h,-1.5h),  half4(-0.5h,-1.5h,0.5h,-1.5h),  half4(0.5h,-1.5h,0.5h,-1.5h),  half4(1.5h,-1.5h,0.5h,-1.5h),
+    half4(-1.5h,-0.5h,0.5h,-1.5h),  half4(-0.5h,-0.5h,0.5h,-1.5h),  half4(0.5h,-0.5h,0.5h,-1.5h),  half4(1.5h,-0.5h,0.5h,-1.5h),
+    half4(-1.5h,0.5h,0.5h,-1.5h),   half4(-0.5h,0.5h,0.5h,-1.5h),   half4(0.5h,0.5h,0.5h,-1.5h),   half4(1.5h,0.5h,0.5h,-1.5h),
+    half4(-1.5h,1.5h,0.5h,-1.5h),   half4(-0.5h,1.5h,0.5h,-1.5h),   half4(0.5h,1.5h,0.5h,-1.5h),   half4(1.5h,1.5h,0.5h,-1.5h),
+    half4(-1.5h,-1.5h,1.5h,-1.5h),  half4(-0.5h,-1.5h,1.5h,-1.5h),  half4(0.5h,-1.5h,1.5h,-1.5h),  half4(1.5h,-1.5h,1.5h,-1.5h),
+    half4(-1.5h,-0.5h,1.5h,-1.5h),  half4(-0.5h,-0.5h,1.5h,-1.5h),  half4(0.5h,-0.5h,1.5h,-1.5h),  half4(1.5h,-0.5h,1.5h,-1.5h),
+    half4(-1.5h,0.5h,1.5h,-1.5h),   half4(-0.5h,0.5h,1.5h,-1.5h),   half4(0.5h,0.5h,1.5h,-1.5h),   half4(1.5h,0.5h,1.5h,-1.5h),
+    half4(-1.5h,1.5h,1.5h,-1.5h),   half4(-0.5h,1.5h,1.5h,-1.5h),   half4(0.5h,1.5h,1.5h,-1.5h),   half4(1.5h,1.5h,1.5h,-1.5h),
+    half4(-1.5h,-1.5h,-1.5h,-0.5h), half4(-0.5h,-1.5h,-1.5h,-0.5h), half4(0.5h,-1.5h,-1.5h,-0.5h), half4(1.5h,-1.5h,-1.5h,-0.5h),
+    half4(-1.5h,-0.5h,-1.5h,-0.5h), half4(-0.5h,-0.5h,-1.5h,-0.5h), half4(0.5h,-0.5h,-1.5h,-0.5h), half4(1.5h,-0.5h,-1.5h,-0.5h),
+    half4(-1.5h,0.5h,-1.5h,-0.5h),  half4(-0.5h,0.5h,-1.5h,-0.5h),  half4(0.5h,0.5h,-1.5h,-0.5h),  half4(1.5h,0.5h,-1.5h,-0.5h),
+    half4(-1.5h,1.5h,-1.5h,-0.5h),  half4(-0.5h,1.5h,-1.5h,-0.5h),  half4(0.5h,1.5h,-1.5h,-0.5h),  half4(1.5h,1.5h,-1.5h,-0.5h),
+    half4(-1.5h,-1.5h,-0.5h,-0.5h), half4(-0.5h,-1.5h,-0.5h,-0.5h), half4(0.5h,-1.5h,-0.5h,-0.5h), half4(1.5h,-1.5h,-0.5h,-0.5h),
+    half4(-1.5h,-0.5h,-0.5h,-0.5h), half4(-0.5h,-0.5h,-0.5h,-0.5h), half4(0.5h,-0.5h,-0.5h,-0.5h), half4(1.5h,-0.5h,-0.5h,-0.5h),
+    half4(-1.5h,0.5h,-0.5h,-0.5h),  half4(-0.5h,0.5h,-0.5h,-0.5h),  half4(0.5h,0.5h,-0.5h,-0.5h),  half4(1.5h,0.5h,-0.5h,-0.5h),
+    half4(-1.5h,1.5h,-0.5h,-0.5h),  half4(-0.5h,1.5h,-0.5h,-0.5h),  half4(0.5h,1.5h,-0.5h,-0.5h),  half4(1.5h,1.5h,-0.5h,-0.5h),
+    half4(-1.5h,-1.5h,0.5h,-0.5h),  half4(-0.5h,-1.5h,0.5h,-0.5h),  half4(0.5h,-1.5h,0.5h,-0.5h),  half4(1.5h,-1.5h,0.5h,-0.5h),
+    half4(-1.5h,-0.5h,0.5h,-0.5h),  half4(-0.5h,-0.5h,0.5h,-0.5h),  half4(0.5h,-0.5h,0.5h,-0.5h),  half4(1.5h,-0.5h,0.5h,-0.5h),
+    half4(-1.5h,0.5h,0.5h,-0.5h),   half4(-0.5h,0.5h,0.5h,-0.5h),   half4(0.5h,0.5h,0.5h,-0.5h),   half4(1.5h,0.5h,0.5h,-0.5h),
+    half4(-1.5h,1.5h,0.5h,-0.5h),   half4(-0.5h,1.5h,0.5h,-0.5h),   half4(0.5h,1.5h,0.5h,-0.5h),   half4(1.5h,1.5h,0.5h,-0.5h),
+    half4(-1.5h,-1.5h,1.5h,-0.5h),  half4(-0.5h,-1.5h,1.5h,-0.5h),  half4(0.5h,-1.5h,1.5h,-0.5h),  half4(1.5h,-1.5h,1.5h,-0.5h),
+    half4(-1.5h,-0.5h,1.5h,-0.5h),  half4(-0.5h,-0.5h,1.5h,-0.5h),  half4(0.5h,-0.5h,1.5h,-0.5h),  half4(1.5h,-0.5h,1.5h,-0.5h),
+    half4(-1.5h,0.5h,1.5h,-0.5h),   half4(-0.5h,0.5h,1.5h,-0.5h),   half4(0.5h,0.5h,1.5h,-0.5h),   half4(1.5h,0.5h,1.5h,-0.5h),
+    half4(-1.5h,1.5h,1.5h,-0.5h),   half4(-0.5h,1.5h,1.5h,-0.5h),   half4(0.5h,1.5h,1.5h,-0.5h),   half4(1.5h,1.5h,1.5h,-0.5h),
+    half4(-1.5h,-1.5h,-1.5h,0.5h),  half4(-0.5h,-1.5h,-1.5h,0.5h),  half4(0.5h,-1.5h,-1.5h,0.5h),  half4(1.5h,-1.5h,-1.5h,0.5h),
+    half4(-1.5h,-0.5h,-1.5h,0.5h),  half4(-0.5h,-0.5h,-1.5h,0.5h),  half4(0.5h,-0.5h,-1.5h,0.5h),  half4(1.5h,-0.5h,-1.5h,0.5h),
+    half4(-1.5h,0.5h,-1.5h,0.5h),   half4(-0.5h,0.5h,-1.5h,0.5h),   half4(0.5h,0.5h,-1.5h,0.5h),   half4(1.5h,0.5h,-1.5h,0.5h),
+    half4(-1.5h,1.5h,-1.5h,0.5h),   half4(-0.5h,1.5h,-1.5h,0.5h),   half4(0.5h,1.5h,-1.5h,0.5h),   half4(1.5h,1.5h,-1.5h,0.5h),
+    half4(-1.5h,-1.5h,-0.5h,0.5h),  half4(-0.5h,-1.5h,-0.5h,0.5h),  half4(0.5h,-1.5h,-0.5h,0.5h),  half4(1.5h,-1.5h,-0.5h,0.5h),
+    half4(-1.5h,-0.5h,-0.5h,0.5h),  half4(-0.5h,-0.5h,-0.5h,0.5h),  half4(0.5h,-0.5h,-0.5h,0.5h),  half4(1.5h,-0.5h,-0.5h,0.5h),
+    half4(-1.5h,0.5h,-0.5h,0.5h),   half4(-0.5h,0.5h,-0.5h,0.5h),   half4(0.5h,0.5h,-0.5h,0.5h),   half4(1.5h,0.5h,-0.5h,0.5h),
+    half4(-1.5h,1.5h,-0.5h,0.5h),   half4(-0.5h,1.5h,-0.5h,0.5h),   half4(0.5h,1.5h,-0.5h,0.5h),   half4(1.5h,1.5h,-0.5h,0.5h),
+    half4(-1.5h,-1.5h,0.5h,0.5h),   half4(-0.5h,-1.5h,0.5h,0.5h),   half4(0.5h,-1.5h,0.5h,0.5h),   half4(1.5h,-1.5h,0.5h,0.5h),
+    half4(-1.5h,-0.5h,0.5h,0.5h),   half4(-0.5h,-0.5h,0.5h,0.5h),   half4(0.5h,-0.5h,0.5h,0.5h),   half4(1.5h,-0.5h,0.5h,0.5h),
+    half4(-1.5h,0.5h,0.5h,0.5h),    half4(-0.5h,0.5h,0.5h,0.5h),    half4(0.5h,0.5h,0.5h,0.5h),    half4(1.5h,0.5h,0.5h,0.5h),
+    half4(-1.5h,1.5h,0.5h,0.5h),    half4(-0.5h,1.5h,0.5h,0.5h),    half4(0.5h,1.5h,0.5h,0.5h),    half4(1.5h,1.5h,0.5h,0.5h),
+    half4(-1.5h,-1.5h,1.5h,0.5h),   half4(-0.5h,-1.5h,1.5h,0.5h),   half4(0.5h,-1.5h,1.5h,0.5h),   half4(1.5h,-1.5h,1.5h,0.5h),
+    half4(-1.5h,-0.5h,1.5h,0.5h),   half4(-0.5h,-0.5h,1.5h,0.5h),   half4(0.5h,-0.5h,1.5h,0.5h),   half4(1.5h,-0.5h,1.5h,0.5h),
+    half4(-1.5h,0.5h,1.5h,0.5h),    half4(-0.5h,0.5h,1.5h,0.5h),    half4(0.5h,0.5h,1.5h,0.5h),    half4(1.5h,0.5h,1.5h,0.5h),
+    half4(-1.5h,1.5h,1.5h,0.5h),    half4(-0.5h,1.5h,1.5h,0.5h),    half4(0.5h,1.5h,1.5h,0.5h),    half4(1.5h,1.5h,1.5h,0.5h),
+    half4(-1.5h,-1.5h,-1.5h,1.5h),  half4(-0.5h,-1.5h,-1.5h,1.5h),  half4(0.5h,-1.5h,-1.5h,1.5h),  half4(1.5h,-1.5h,-1.5h,1.5h),
+    half4(-1.5h,-0.5h,-1.5h,1.5h),  half4(-0.5h,-0.5h,-1.5h,1.5h),  half4(0.5h,-0.5h,-1.5h,1.5h),  half4(1.5h,-0.5h,-1.5h,1.5h),
+    half4(-1.5h,0.5h,-1.5h,1.5h),   half4(-0.5h,0.5h,-1.5h,1.5h),   half4(0.5h,0.5h,-1.5h,1.5h),   half4(1.5h,0.5h,-1.5h,1.5h),
+    half4(-1.5h,1.5h,-1.5h,1.5h),   half4(-0.5h,1.5h,-1.5h,1.5h),   half4(0.5h,1.5h,-1.5h,1.5h),   half4(1.5h,1.5h,-1.5h,1.5h),
+    half4(-1.5h,-1.5h,-0.5h,1.5h),  half4(-0.5h,-1.5h,-0.5h,1.5h),  half4(0.5h,-1.5h,-0.5h,1.5h),  half4(1.5h,-1.5h,-0.5h,1.5h),
+    half4(-1.5h,-0.5h,-0.5h,1.5h),  half4(-0.5h,-0.5h,-0.5h,1.5h),  half4(0.5h,-0.5h,-0.5h,1.5h),  half4(1.5h,-0.5h,-0.5h,1.5h),
+    half4(-1.5h,0.5h,-0.5h,1.5h),   half4(-0.5h,0.5h,-0.5h,1.5h),   half4(0.5h,0.5h,-0.5h,1.5h),   half4(1.5h,0.5h,-0.5h,1.5h),
+    half4(-1.5h,1.5h,-0.5h,1.5h),   half4(-0.5h,1.5h,-0.5h,1.5h),   half4(0.5h,1.5h,-0.5h,1.5h),   half4(1.5h,1.5h,-0.5h,1.5h),
+    half4(-1.5h,-1.5h,0.5h,1.5h),   half4(-0.5h,-1.5h,0.5h,1.5h),   half4(0.5h,-1.5h,0.5h,1.5h),   half4(1.5h,-1.5h,0.5h,1.5h),
+    half4(-1.5h,-0.5h,0.5h,1.5h),   half4(-0.5h,-0.5h,0.5h,1.5h),   half4(0.5h,-0.5h,0.5h,1.5h),   half4(1.5h,-0.5h,0.5h,1.5h),
+    half4(-1.5h,0.5h,0.5h,1.5h),    half4(-0.5h,0.5h,0.5h,1.5h),    half4(0.5h,0.5h,0.5h,1.5h),    half4(1.5h,0.5h,0.5h,1.5h),
+    half4(-1.5h,1.5h,0.5h,1.5h),    half4(-0.5h,1.5h,0.5h,1.5h),    half4(0.5h,1.5h,0.5h,1.5h),    half4(1.5h,1.5h,0.5h,1.5h),
+    half4(-1.5h,-1.5h,1.5h,1.5h),   half4(-0.5h,-1.5h,1.5h,1.5h),   half4(0.5h,-1.5h,1.5h,1.5h),   half4(1.5h,-1.5h,1.5h,1.5h),
+    half4(-1.5h,-0.5h,1.5h,1.5h),   half4(-0.5h,-0.5h,1.5h,1.5h),   half4(0.5h,-0.5h,1.5h,1.5h),   half4(1.5h,-0.5h,1.5h,1.5h),
+    half4(-1.5h,0.5h,1.5h,1.5h),    half4(-0.5h,0.5h,1.5h,1.5h),    half4(0.5h,0.5h,1.5h,1.5h),    half4(1.5h,0.5h,1.5h,1.5h),
+    half4(-1.5h,1.5h,1.5h,1.5h),    half4(-0.5h,1.5h,1.5h,1.5h),    half4(0.5h,1.5h,1.5h,1.5h),    half4(1.5h,1.5h,1.5h,1.5h),
+};
+constant half4 kHyS3Hi[16] = {
+    half4(-2.0h,-2.0h,-2.0h,-2.0h), half4(2.0h,-2.0h,-2.0h,-2.0h), half4(-2.0h,2.0h,-2.0h,-2.0h), half4(2.0h,2.0h,-2.0h,-2.0h),
+    half4(-2.0h,-2.0h,2.0h,-2.0h),  half4(2.0h,-2.0h,2.0h,-2.0h),  half4(-2.0h,2.0h,2.0h,-2.0h),  half4(2.0h,2.0h,2.0h,-2.0h),
+    half4(-2.0h,-2.0h,-2.0h,2.0h),  half4(2.0h,-2.0h,-2.0h,2.0h),  half4(-2.0h,2.0h,-2.0h,2.0h),  half4(2.0h,2.0h,-2.0h,2.0h),
+    half4(-2.0h,-2.0h,2.0h,2.0h),   half4(2.0h,-2.0h,2.0h,2.0h),   half4(-2.0h,2.0h,2.0h,2.0h),   half4(2.0h,2.0h,2.0h,2.0h),
+};
+constant half2 kHyS4Lut[256] = {
+    half2(-7.5h,-7.5h), half2(-6.5h,-7.5h), half2(-5.5h,-7.5h), half2(-4.5h,-7.5h), half2(-3.5h,-7.5h), half2(-2.5h,-7.5h), half2(-1.5h,-7.5h), half2(-0.5h,-7.5h),
+    half2(0.5h,-7.5h),  half2(1.5h,-7.5h),  half2(2.5h,-7.5h),  half2(3.5h,-7.5h),  half2(4.5h,-7.5h),  half2(5.5h,-7.5h),  half2(6.5h,-7.5h),  half2(7.5h,-7.5h),
+    half2(-7.5h,-6.5h), half2(-6.5h,-6.5h), half2(-5.5h,-6.5h), half2(-4.5h,-6.5h), half2(-3.5h,-6.5h), half2(-2.5h,-6.5h), half2(-1.5h,-6.5h), half2(-0.5h,-6.5h),
+    half2(0.5h,-6.5h),  half2(1.5h,-6.5h),  half2(2.5h,-6.5h),  half2(3.5h,-6.5h),  half2(4.5h,-6.5h),  half2(5.5h,-6.5h),  half2(6.5h,-6.5h),  half2(7.5h,-6.5h),
+    half2(-7.5h,-5.5h), half2(-6.5h,-5.5h), half2(-5.5h,-5.5h), half2(-4.5h,-5.5h), half2(-3.5h,-5.5h), half2(-2.5h,-5.5h), half2(-1.5h,-5.5h), half2(-0.5h,-5.5h),
+    half2(0.5h,-5.5h),  half2(1.5h,-5.5h),  half2(2.5h,-5.5h),  half2(3.5h,-5.5h),  half2(4.5h,-5.5h),  half2(5.5h,-5.5h),  half2(6.5h,-5.5h),  half2(7.5h,-5.5h),
+    half2(-7.5h,-4.5h), half2(-6.5h,-4.5h), half2(-5.5h,-4.5h), half2(-4.5h,-4.5h), half2(-3.5h,-4.5h), half2(-2.5h,-4.5h), half2(-1.5h,-4.5h), half2(-0.5h,-4.5h),
+    half2(0.5h,-4.5h),  half2(1.5h,-4.5h),  half2(2.5h,-4.5h),  half2(3.5h,-4.5h),  half2(4.5h,-4.5h),  half2(5.5h,-4.5h),  half2(6.5h,-4.5h),  half2(7.5h,-4.5h),
+    half2(-7.5h,-3.5h), half2(-6.5h,-3.5h), half2(-5.5h,-3.5h), half2(-4.5h,-3.5h), half2(-3.5h,-3.5h), half2(-2.5h,-3.5h), half2(-1.5h,-3.5h), half2(-0.5h,-3.5h),
+    half2(0.5h,-3.5h),  half2(1.5h,-3.5h),  half2(2.5h,-3.5h),  half2(3.5h,-3.5h),  half2(4.5h,-3.5h),  half2(5.5h,-3.5h),  half2(6.5h,-3.5h),  half2(7.5h,-3.5h),
+    half2(-7.5h,-2.5h), half2(-6.5h,-2.5h), half2(-5.5h,-2.5h), half2(-4.5h,-2.5h), half2(-3.5h,-2.5h), half2(-2.5h,-2.5h), half2(-1.5h,-2.5h), half2(-0.5h,-2.5h),
+    half2(0.5h,-2.5h),  half2(1.5h,-2.5h),  half2(2.5h,-2.5h),  half2(3.5h,-2.5h),  half2(4.5h,-2.5h),  half2(5.5h,-2.5h),  half2(6.5h,-2.5h),  half2(7.5h,-2.5h),
+    half2(-7.5h,-1.5h), half2(-6.5h,-1.5h), half2(-5.5h,-1.5h), half2(-4.5h,-1.5h), half2(-3.5h,-1.5h), half2(-2.5h,-1.5h), half2(-1.5h,-1.5h), half2(-0.5h,-1.5h),
+    half2(0.5h,-1.5h),  half2(1.5h,-1.5h),  half2(2.5h,-1.5h),  half2(3.5h,-1.5h),  half2(4.5h,-1.5h),  half2(5.5h,-1.5h),  half2(6.5h,-1.5h),  half2(7.5h,-1.5h),
+    half2(-7.5h,-0.5h), half2(-6.5h,-0.5h), half2(-5.5h,-0.5h), half2(-4.5h,-0.5h), half2(-3.5h,-0.5h), half2(-2.5h,-0.5h), half2(-1.5h,-0.5h), half2(-0.5h,-0.5h),
+    half2(0.5h,-0.5h),  half2(1.5h,-0.5h),  half2(2.5h,-0.5h),  half2(3.5h,-0.5h),  half2(4.5h,-0.5h),  half2(5.5h,-0.5h),  half2(6.5h,-0.5h),  half2(7.5h,-0.5h),
+    half2(-7.5h,0.5h),  half2(-6.5h,0.5h),  half2(-5.5h,0.5h),  half2(-4.5h,0.5h),  half2(-3.5h,0.5h),  half2(-2.5h,0.5h),  half2(-1.5h,0.5h),  half2(-0.5h,0.5h),
+    half2(0.5h,0.5h),   half2(1.5h,0.5h),   half2(2.5h,0.5h),   half2(3.5h,0.5h),   half2(4.5h,0.5h),   half2(5.5h,0.5h),   half2(6.5h,0.5h),   half2(7.5h,0.5h),
+    half2(-7.5h,1.5h),  half2(-6.5h,1.5h),  half2(-5.5h,1.5h),  half2(-4.5h,1.5h),  half2(-3.5h,1.5h),  half2(-2.5h,1.5h),  half2(-1.5h,1.5h),  half2(-0.5h,1.5h),
+    half2(0.5h,1.5h),   half2(1.5h,1.5h),   half2(2.5h,1.5h),   half2(3.5h,1.5h),   half2(4.5h,1.5h),   half2(5.5h,1.5h),   half2(6.5h,1.5h),   half2(7.5h,1.5h),
+    half2(-7.5h,2.5h),  half2(-6.5h,2.5h),  half2(-5.5h,2.5h),  half2(-4.5h,2.5h),  half2(-3.5h,2.5h),  half2(-2.5h,2.5h),  half2(-1.5h,2.5h),  half2(-0.5h,2.5h),
+    half2(0.5h,2.5h),   half2(1.5h,2.5h),   half2(2.5h,2.5h),   half2(3.5h,2.5h),   half2(4.5h,2.5h),   half2(5.5h,2.5h),   half2(6.5h,2.5h),   half2(7.5h,2.5h),
+    half2(-7.5h,3.5h),  half2(-6.5h,3.5h),  half2(-5.5h,3.5h),  half2(-4.5h,3.5h),  half2(-3.5h,3.5h),  half2(-2.5h,3.5h),  half2(-1.5h,3.5h),  half2(-0.5h,3.5h),
+    half2(0.5h,3.5h),   half2(1.5h,3.5h),   half2(2.5h,3.5h),   half2(3.5h,3.5h),   half2(4.5h,3.5h),   half2(5.5h,3.5h),   half2(6.5h,3.5h),   half2(7.5h,3.5h),
+    half2(-7.5h,4.5h),  half2(-6.5h,4.5h),  half2(-5.5h,4.5h),  half2(-4.5h,4.5h),  half2(-3.5h,4.5h),  half2(-2.5h,4.5h),  half2(-1.5h,4.5h),  half2(-0.5h,4.5h),
+    half2(0.5h,4.5h),   half2(1.5h,4.5h),   half2(2.5h,4.5h),   half2(3.5h,4.5h),   half2(4.5h,4.5h),   half2(5.5h,4.5h),   half2(6.5h,4.5h),   half2(7.5h,4.5h),
+    half2(-7.5h,5.5h),  half2(-6.5h,5.5h),  half2(-5.5h,5.5h),  half2(-4.5h,5.5h),  half2(-3.5h,5.5h),  half2(-2.5h,5.5h),  half2(-1.5h,5.5h),  half2(-0.5h,5.5h),
+    half2(0.5h,5.5h),   half2(1.5h,5.5h),   half2(2.5h,5.5h),   half2(3.5h,5.5h),   half2(4.5h,5.5h),   half2(5.5h,5.5h),   half2(6.5h,5.5h),   half2(7.5h,5.5h),
+    half2(-7.5h,6.5h),  half2(-6.5h,6.5h),  half2(-5.5h,6.5h),  half2(-4.5h,6.5h),  half2(-3.5h,6.5h),  half2(-2.5h,6.5h),  half2(-1.5h,6.5h),  half2(-0.5h,6.5h),
+    half2(0.5h,6.5h),   half2(1.5h,6.5h),   half2(2.5h,6.5h),   half2(3.5h,6.5h),   half2(4.5h,6.5h),   half2(5.5h,6.5h),   half2(6.5h,6.5h),   half2(7.5h,6.5h),
+    half2(-7.5h,7.5h),  half2(-6.5h,7.5h),  half2(-5.5h,7.5h),  half2(-4.5h,7.5h),  half2(-3.5h,7.5h),  half2(-2.5h,7.5h),  half2(-1.5h,7.5h),  half2(-0.5h,7.5h),
+    half2(0.5h,7.5h),   half2(1.5h,7.5h),   half2(2.5h,7.5h),   half2(3.5h,7.5h),   half2(4.5h,7.5h),   half2(5.5h,7.5h),   half2(6.5h,7.5h),   half2(7.5h,7.5h),
+};
+constant half4 kHyS5Hi[16] = {
+    half4(-8.0h,-8.0h,-8.0h,-8.0h), half4(8.0h,-8.0h,-8.0h,-8.0h), half4(-8.0h,8.0h,-8.0h,-8.0h), half4(8.0h,8.0h,-8.0h,-8.0h),
+    half4(-8.0h,-8.0h,8.0h,-8.0h),  half4(8.0h,-8.0h,8.0h,-8.0h),  half4(-8.0h,8.0h,8.0h,-8.0h),  half4(8.0h,8.0h,8.0h,-8.0h),
+    half4(-8.0h,-8.0h,-8.0h,8.0h),  half4(8.0h,-8.0h,-8.0h,8.0h),  half4(-8.0h,8.0h,-8.0h,8.0h),  half4(8.0h,8.0h,-8.0h,8.0h),
+    half4(-8.0h,-8.0h,8.0h,8.0h),   half4(8.0h,-8.0h,8.0h,8.0h),   half4(-8.0h,8.0h,8.0h,8.0h),   half4(8.0h,8.0h,8.0h,8.0h),
+};
+
+// Fast aligned-ushort centered weight decode (exact to the bit vs float(q) - sk_half(F)):
+//   - S2_K / S3_K: constant-cache LUT (4 weights/lookup -> -16% on MoE experts)
+//   - S4_K / S5_K / S6_K: pure-ALU aligned-ushort sk_q8 (avoids constant-cache lookup pressure on 4-lookup formats)
+//   - S8_K: aligned-ushort char2 unpack (-7% on S8 linear projections)
+template <int F>
+static inline void sk_w8_f4(device const uchar* pl, int j, thread float4& w0, thread float4& w1) {
+    if (F == 2) {
+        const uint v = uint(*((device const ushort*) (pl + (j >> 2))));
+        w0 = float4(kHyS2Lut[v & 255u]);
+        w1 = float4(kHyS2Lut[v >> 8]);
+    } else if (F == 3) {
+        const uint v = uint(*((device const ushort*) (pl + (j >> 2))));
+        const uint h = uint(pl[64 + (j >> 3)]);
+        w0 = float4(kHyS2Lut[v & 255u] + kHyS3Hi[h & 15u]);
+        w1 = float4(kHyS2Lut[v >> 8] + kHyS3Hi[h >> 4]);
+    } else if (F == 8) {
+        device const ushort* p = (device const ushort*) (pl + j);
+        const char2 c0 = as_type<char2>(p[0]), c1 = as_type<char2>(p[1]);
+        const char2 c2 = as_type<char2>(p[2]), c3 = as_type<char2>(p[3]);
+        w0 = float4(float(c0.x), float(c0.y), float(c1.x), float(c1.y));
+        w1 = float4(float(c2.x), float(c2.y), float(c3.x), float(c3.y));
+    } else {
+        constexpr float H = sk_half(F);
+        int q[8];
+        sk_q8<F>(pl, j, q);
+        w0 = float4(float(q[0]), float(q[1]), float(q[2]), float(q[3])) - H;
+        w1 = float4(float(q[4]), float(q[5]), float(q[6]), float(q[7])) - H;
+    }
+}
+
 // ================================================================ elementwise / norms / iHC =====================================================================
 
 // embedding: S8_K row -> 4 identical hc streams. W: S8_K [V][3072]
@@ -157,6 +301,73 @@ kernel void hc_mix(device const float* x [[buffer(0)]], device const float* fn [
         for (int j = 0; j < 8; ++j) {
             float a = 0;
             for (uint i = 0; i < nthr / 32; ++i) a += sh[j][i];
+            m[j] = a * inv;
+        }
+        if (nout == 8) {
+            for (int h = 0; h < NHC; ++h) {
+                pre[(size_t) tok * NHC + h] = sigmoidf_(m[h] * scale[0] + base[h]) + hc_eps;
+                post[(size_t) tok * NHC + h] = hc_mag * sigmoidf_(m[NHC + h] * scale[1] + base[NHC + h]) + hc_eps;
+            }
+        } else {
+            for (int h = 0; h < NHC; ++h) pre[(size_t) tok * NHC + h] = sigmoidf_(m[h] * scale[0] + base[h]) + hc_eps;
+        }
+    }
+}
+
+// Prefill multi-token hc_mix: 4 tokens per threadgroup of 256 threads, reading fn[nout][12288] ONCE for all 4 tokens (4x less fn L2 traffic!)
+// Uses exact lane-strided k += 256 summation order matching hc_mix bit-for-bit (zero router drift / KL = 0!).
+kernel void hc_mix_blk(device const float* x [[buffer(0)]], device const float* fn [[buffer(1)]], device const float* scale [[buffer(2)]], device const float* base [[buffer(3)]],
+                       device float* pre [[buffer(4)]], device float* post [[buffer(5)]], constant int& nout [[buffer(6)]], constant int& T [[buffer(7)]],
+                       constant float& eps [[buffer(8)]], constant float& hc_eps [[buffer(9)]], constant float& hc_mag [[buffer(10)]],
+                       uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh[4][9][8];
+    const int t0 = int(tg) * 4;
+    const int nt = min(4, T - t0);
+    if (nt <= 0) return;
+    const int K = NHC * HID;
+    float ss[4] = {0.f, 0.f, 0.f, 0.f};
+    float acc[4][8];
+    for (int t = 0; t < 4; ++t)
+        for (int j = 0; j < 8; ++j) acc[t][j] = 0.f;
+    for (uint k = tid; k < (uint) K; k += 256u) {
+        float vx[4];
+        for (int t = 0; t < 4; ++t) {
+            if (t < nt) {
+                const float v = x[(size_t) (t0 + t) * K + k];
+                vx[t] = v;
+                ss[t] += v * v;
+            }
+        }
+        for (int j = 0; j < 8; ++j) {
+            if (j < nout) {
+                const float vf = fn[(size_t) j * K + k];
+                for (int t = 0; t < 4; ++t)
+                    if (t < nt) acc[t][j] += vx[t] * vf;
+            }
+        }
+    }
+    const uint sg = tid >> 5, lane = tid & 31u;
+    for (int t = 0; t < 4; ++t) {
+        if (t < nt) {
+            const float s = simd_sum(ss[t]);
+            if (lane == 0) sh[t][8][sg] = s;
+            for (int j = 0; j < 8; ++j) {
+                const float a = simd_sum(acc[t][j]);
+                if (lane == 0) sh[t][j][sg] = a;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((int) tid < nt) {
+        const int t = int(tid);
+        const int tok = t0 + t;
+        float tot = 0.f;
+        for (int i = 0; i < 8; ++i) tot += sh[t][8][i];
+        const float inv = rsqrt(tot / float(K) + eps);
+        float m[8];
+        for (int j = 0; j < 8; ++j) {
+            float a = 0.f;
+            for (int i = 0; i < 8; ++i) a += sh[t][j][i];
             m[j] = a * inv;
         }
         if (nout == 8) {
@@ -1110,9 +1321,6 @@ static inline uint f2key(float f) {
 kernel void idx_select(device const float* score [[buffer(0)]], constant int& ldS [[buffer(1)]], constant int& p0 [[buffer(2)]], constant int& n_top [[buffer(3)]], constant int& kmax [[buffer(4)]],
                        device int* keys [[buffer(5)]], device int* nkeys [[buffer(6)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     threadgroup int red[8];
-    threadgroup atomic_int cnt_sel;
-    threadgroup uint thr_s;
-    threadgroup int n_gt_s;
     int pos = p0 + t;
     int grp = pos >> 2;
     device int* kl = keys + (size_t) t * kmax;
@@ -1122,68 +1330,93 @@ kernel void idx_select(device const float* score [[buffer(0)]], constant int& ld
         return;
     }
     device const float* sc = score + (size_t) t * ldS;
-    uint lo = 0, hi = 0xFFFFFFFFu;
-    for (int it = 0; it < 33 && lo < hi; ++it) {
-        uint mid = (uint) (lo + (((ulong) hi - lo + 1) >> 1));
-        int c = 0;
-        for (int g = tid; g < grp; g += 256) c += (f2key(sc[g]) >= mid) ? 1 : 0;
-        c = simd_sum(c);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if ((tid & 31) == 0) red[tid >> 5] = c;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        int tot = 0;
-        for (int w = 0; w < 8; ++w) tot += red[w];
-        if (tot >= n_top) lo = mid; else hi = mid - 1;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup atomic_uint hist[256];
+    threadgroup uint s_byte;
+    threadgroup int s_above;
+    uint kc[8];
+    const bool cached = (grp <= 2048);
+    if (cached) {
+        for (int r = 0; r < 8; ++r) {
+            const int g = int(tid) + r * 256;
+            kc[r] = g < grp ? f2key(sc[g]) : 0u;
+        }
     }
-    if (tid == 0) { thr_s = lo; atomic_store_explicit(&cnt_sel, 0, memory_order_relaxed); }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint thr = thr_s;
-    int c = 0;
-    for (int g = tid; g < grp; g += 256) c += (f2key(sc[g]) > thr) ? 1 : 0;
-    c = simd_sum(c);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if ((tid & 31) == 0) red[tid >> 5] = c;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        int tot = 0;
-        for (int w = 0; w < 8; ++w) tot += red[w];
-        n_gt_s = tot;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    int n_eq_need = n_top - n_gt_s;
-    {   // the groups above the threshold in increasing g order (deterministic list order): thread tid owns a contiguous run of groups
-        const int per = (grp + 255) / 256;
-        const int g0 = int(tid) * per, g1 = min(grp, g0 + per);
-        int cnt = 0;
-        for (int g = g0; g < g1; ++g) cnt += (f2key(sc[g]) > thr) ? 1 : 0;
-        const int ex = simd_prefix_exclusive_sum(cnt);
-        if ((tid & 31) == 31) red[tid >> 5] = ex + cnt;
+    uint prefix = 0u;
+    int rem = n_top;
+    const uint sg = tid >> 5, lane = tid & 31u;
+    for (int pass = 0; pass < 4; ++pass) {
+        const uint shift = uint((3 - pass) * 8);
+        const uint mask = pass == 0 ? 0u : (~0u << (shift + 8u));
+        atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        int base = 0;
-        for (uint w = 0; w < (tid >> 5); ++w) base += red[w];
-        int sidx = base + ex;
-        for (int g = g0; g < g1; ++g)
-            if (f2key(sc[g]) > thr) {
-                for (int j = 0; j < 4; ++j) kl[4 * sidx + j] = 4 * g + j;
-                ++sidx;
+        if (cached) {
+            for (int r = 0; r < 8; ++r) {
+                const int g = int(tid) + r * 256;
+                if (g < grp) {
+                    const uint k = kc[r];
+                    if (pass == 0 || (k & mask) == prefix)
+                        atomic_fetch_add_explicit(&hist[(k >> shift) & 255u], 1u, memory_order_relaxed);
+                }
             }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        int s = n_gt_s, need = n_eq_need;
-        for (int g = 0; g < grp && need > 0; ++g) {
-            if (f2key(sc[g]) == thr) {
-                for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
-                ++s;
-                --need;
+        } else {
+            for (int g = int(tid); g < grp; g += 256) {
+                const uint k = f2key(sc[g]);
+                if (pass == 0 || (k & mask) == prefix)
+                    atomic_fetch_add_explicit(&hist[(k >> shift) & 255u], 1u, memory_order_relaxed);
             }
         }
-        atomic_store_explicit(&cnt_sel, s, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint c0 = atomic_load_explicit(&hist[255u - tid], memory_order_relaxed);
+        const uint sg_inc = simd_prefix_inclusive_sum(c0);
+        if (lane == 31u) red[sg] = int(sg_inc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint base = 0u;
+        for (uint w = 0; w < sg; ++w) base += uint(red[w]);
+        const uint cum = base + sg_inc;
+        const uint prev = cum - c0;
+        if (prev < uint(rem) && cum >= uint(rem)) {
+            s_byte = 255u - tid;
+            s_above = int(prev);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix |= (s_byte << shift);
+        rem -= s_above;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    int npool = atomic_load_explicit(&cnt_sel, memory_order_relaxed);
-    int nown = pos - 4 * grp + 1;
-    for (int i = tid; i < nown; i += 256) kl[4 * npool + i] = 4 * grp + i;
-    if (tid == 0) nkeys[t] = 4 * npool + nown;
+    // Exact counts from 4-pass radix descent: n_gt = elements strictly > thr, n_eq_need = ties == thr needed.
+    const uint thr = prefix;
+    const int n_eq_need = rem;
+    const int n_gt = n_top - n_eq_need;
+    threadgroup int red_eq[8];
+    {   // Emit > thr at [0..n_gt-1] and first n_eq_need ties == thr at [n_gt..n_top-1] in deterministic increasing g order (100% parallel!)
+        const int per = (grp + 255) / 256;
+        const int g0 = int(tid) * per, g1 = min(grp, g0 + per);
+        int cnt_gt = 0, cnt_eq = 0;
+        for (int g = g0; g < g1; ++g) {
+            const uint k = f2key(sc[g]);
+            cnt_gt += (k > thr) ? 1 : 0;
+            cnt_eq += (k == thr) ? 1 : 0;
+        }
+        const int ex_gt = simd_prefix_exclusive_sum(cnt_gt);
+        const int ex_eq = simd_prefix_exclusive_sum(cnt_eq);
+        if (lane == 31u) { red[sg] = ex_gt + cnt_gt; red_eq[sg] = ex_eq + cnt_eq; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int base_gt = 0, base_eq = 0;
+        for (uint w = 0; w < sg; ++w) { base_gt += red[w]; base_eq += red_eq[w]; }
+        int sidx_gt = base_gt + ex_gt;
+        int sidx_eq = base_eq + ex_eq;
+        for (int g = g0; g < g1; ++g) {
+            const uint k = f2key(sc[g]);
+            if (k > thr) {
+                *((device int4*) (kl + 4 * sidx_gt)) = int4(4 * g, 4 * g + 1, 4 * g + 2, 4 * g + 3);
+                ++sidx_gt;
+            } else if (k == thr && sidx_eq < n_eq_need) {
+                const int d = n_gt + sidx_eq;
+                *((device int4*) (kl + 4 * d)) = int4(4 * g, 4 * g + 1, 4 * g + 2, 4 * g + 3);
+                ++sidx_eq;
+            }
+        }
+    }
+    const int nown = pos - 4 * grp + 1;
+    for (int i = int(tid); i < nown; i += 256) kl[4 * n_top + i] = 4 * grp + i;
+    if (tid == 0) nkeys[t] = 4 * n_top + nown;
 }

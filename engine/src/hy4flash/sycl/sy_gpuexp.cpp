@@ -48,7 +48,16 @@ struct Item {  // one (expert, 64-token tile) of a group
     int32_t pad0;
 };
 
-inline int code_sb_bytes(int code) { return code == 0 ? 48 : code == 2 ? 70 : code == 3 ? 102 : 134; }
+inline int code_sb_bytes(int code) {
+    return code == 0 ? 48 : code == 1 ? 58 : code == 2 ? 70 : code == 3 ? 102 : code == 4 ? 134 : code == 5 ? 166 : code == 6 ? 198 : 262;
+}
+inline int s15_trit(uint32_t b, int d) {
+    if (b >= 243u) return 0;
+    const uint32_t m = d == 0 ? 65536u : d == 1 ? 21846u : d == 2 ? 7282u : d == 3 ? 2428u : 810u;
+    const uint32_t x = (b * m) >> 16;
+    const uint32_t x3 = (x * 21846u) >> 16;
+    return (int)(x - 3u * x3) - 1;
+}
 inline void put2(half* p, float a, float b) { *reinterpret_cast<sycl::vec<half, 2>*>(p) = sycl::vec<half, 2>((half)a, (half)b); }
 inline uint32_t ld_u32(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -56,6 +65,7 @@ inline uint32_t ld_u32(const uint8_t* p) {
 
 // Cooperatively dequantize 32 weights (half_idx = 0 -> k=0..31, half_idx = 1 -> k=32..63) of 64-weight subgroup `g`
 // of super-block `blk` of row `n` (0..63) into VNNI-2 packed SLM `sb_ptr` [32][128] (only 8 KiB!).
+// Supports ALL 8 S_K expert codes (0=S1.25, 1=S1.58, 2=S2, 3=S3, 4=S4, 5=S5, 6=S6, 7=S8) -> enables GPU XMX prefill on SQ-32/64/96/128!
 template <int CODE>
 inline void dq_half_group(const uint8_t* blk, float eff, int g, int half_idx, half* sb_ptr, int n) {
     const uint8_t* pl = blk + 6;
@@ -71,6 +81,13 @@ inline void dq_half_group(const uint8_t* blk, float eff, int g, int half_idx, ha
             const uint32_t idx = (uint32_t)((bits >> (5 * j)) & 0x1Fu);
             put2(dst + (2 * j) * 128, (float)kS125[idx][0] * e, (float)kS125[idx][1] * e);
             put2(dst + (2 * j + 1) * 128, (float)kS125[idx][2] * e, (float)kS125[idx][3] * e);
+        }
+    } else if constexpr (CODE == 1) {
+        const int base_i = g * 64 + half_idx * 32;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int i0 = base_i + 2 * j, i1 = i0 + 1;
+            put2(dst + j * 128, (float)s15_trit(pl[i0 / 5], i0 % 5) * eff, (float)s15_trit(pl[i1 / 5], i1 % 5) * eff);
         }
     } else if constexpr (CODE == 2) {
         const float bias = -1.5f * eff;
@@ -104,7 +121,7 @@ inline void dq_half_group(const uint8_t* blk, float eff, int g, int half_idx, ha
             put2(dst + (2 * b) * 128, (float)q0 * eff + bias, (float)q1 * eff + bias);
             put2(dst + (2 * b + 1) * 128, (float)q2 * eff + bias, (float)q3 * eff + bias);
         }
-    } else {
+    } else if constexpr (CODE == 4) {
         const float bias = -7.5f * eff;
         const uint8_t* p = pl + g * 32 + half_idx * 16;
 #pragma unroll
@@ -116,7 +133,61 @@ inline void dq_half_group(const uint8_t* blk, float eff, int g, int half_idx, ha
                 put2(dst + (w * 4 + j) * 128, (float)(by & 15u) * eff + bias, (float)(by >> 4) * eff + bias);
             }
         }
+    } else if constexpr (CODE == 5) {
+        const float bias = -15.5f * eff;
+        const uint8_t* p = pl + g * 32 + half_idx * 16;
+        const uint32_t hb = ld_u32(pl + 128 + g * 8 + half_idx * 4);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t wd = ld_u32(p + w * 4);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int i = w * 4 + j;
+                const uint32_t by = (wd >> (8 * j)) & 0xFFu;
+                const uint32_t q0 = (by & 15u) | (((hb >> (2 * i)) & 1u) << 4);
+                const uint32_t q1 = (by >> 4) | (((hb >> (2 * i + 1)) & 1u) << 4);
+                put2(dst + i * 128, (float)q0 * eff + bias, (float)q1 * eff + bias);
+            }
+        }
+    } else if constexpr (CODE == 6) {
+        const float bias = -31.5f * eff;
+        const uint8_t* p = pl + g * 32 + half_idx * 16;
+        const uint8_t* ph = pl + 128 + g * 16 + half_idx * 8;
+        const uint32_t h0 = ld_u32(ph), h1 = ld_u32(ph + 4);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t wd = ld_u32(p + w * 4);
+            const uint32_t hw = (w < 2 ? h0 : h1) >> (16 * (w & 1));
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t by = (wd >> (8 * j)) & 0xFFu;
+                const uint32_t h4 = (hw >> (4 * j)) & 0xFu;
+                const uint32_t q0 = (by & 15u) | ((h4 & 3u) << 4);
+                const uint32_t q1 = (by >> 4) | (((h4 >> 2) & 3u) << 4);
+                put2(dst + (w * 4 + j) * 128, (float)q0 * eff + bias, (float)q1 * eff + bias);
+            }
+        }
+    } else {
+        // CODE == 7: S8
+        const uint8_t* p = pl + g * 64 + half_idx * 32;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            const uint32_t wd = ld_u32(p + w * 4);
+            put2(dst + (2 * w) * 128, (float)(int8_t)(wd & 0xFFu) * eff, (float)(int8_t)((wd >> 8) & 0xFFu) * eff);
+            put2(dst + (2 * w + 1) * 128, (float)(int8_t)((wd >> 16) & 0xFFu) * eff, (float)(int8_t)(wd >> 24) * eff);
+        }
     }
+}
+
+inline void dq_half_group_any(int code, const uint8_t* blk, float eff, int g, int half_idx, half* sb_ptr, int n) {
+    if (code == 4) dq_half_group<4>(blk, eff, g, half_idx, sb_ptr, n);
+    else if (code == 3) dq_half_group<3>(blk, eff, g, half_idx, sb_ptr, n);
+    else if (code == 2) dq_half_group<2>(blk, eff, g, half_idx, sb_ptr, n);
+    else if (code == 5) dq_half_group<5>(blk, eff, g, half_idx, sb_ptr, n);
+    else if (code == 6) dq_half_group<6>(blk, eff, g, half_idx, sb_ptr, n);
+    else if (code == 0) dq_half_group<0>(blk, eff, g, half_idx, sb_ptr, n);
+    else if (code == 1) dq_half_group<1>(blk, eff, g, half_idx, sb_ptr, n);
+    else dq_half_group<7>(blk, eff, g, half_idx, sb_ptr, n);
 }
 
 // MODE 0: GEMM1 + SwiGLU epilogue -> hb (half [P][1536]); MODE 1: GEMM2 -> ye (float [P][1536])
@@ -194,10 +265,7 @@ sycl::event launch_gemm_xmx(sycl::queue& q, const sycl::event* dep, const Item* 
                     D * ((float)blk[4] * (1.0f / 255.0f)), D * ((float)blk[5] * (1.0f / 255.0f))};
 #pragma unroll
                 for (int g = 0; g < 4; ++g) {
-                    if (code == 0) dq_half_group<0>(blk, effs[g], g, half_idx, sb_ptr, row_local);
-                    else if (code == 2) dq_half_group<2>(blk, effs[g], g, half_idx, sb_ptr, row_local);
-                    else if (code == 3) dq_half_group<3>(blk, effs[g], g, half_idx, sb_ptr, row_local);
-                    else dq_half_group<4>(blk, effs[g], g, half_idx, sb_ptr, row_local);
+                    dq_half_group_any(code, blk, effs[g], g, half_idx, sb_ptr, row_local);
                     sycl::group_barrier(it.get_group());
 
                     if (active) {
@@ -222,6 +290,118 @@ sycl::event launch_gemm_xmx(sycl::queue& q, const sycl::event* dep, const Item* 
             if (active) {
                 for (int j = 0; j < n_tiles; ++j)
                     xm::joint_matrix_store(sg, mc[j], sc_mp + (size_t)(sg_m * 8) * 64 + (sg_n + j * n_step) * 8, (size_t)64, xm::layout::row_major);
+            }
+            sycl::group_barrier(it.get_group());
+
+            if constexpr (MODE == 0) {
+                for (int idx = tid; idx < ntok * 32; idx += 128) {
+                    const int t = idx >> 5, i = idx & 31;
+                    const float g = sc[t * 64 + i], u = sc[t * 64 + 32 + i];
+                    const float sq = h2f_bits(ld16(body + 2 * (32 * wt + i)));
+                    const float s = sycl::fmin(g / (1.0f + sycl::exp(-g)), 10.0f);
+                    const float uc = sycl::fmax(-10.0f, sycl::fmin(u, 10.0f));
+                    ((half*)out)[(size_t)(item.pbase + t) * K + 32 * wt + i] = (half)((s * uc) / sq);
+                }
+            } else {
+                for (int idx = tid; idx < ntok * 64; idx += 128) {
+                    const int t = idx >> 6, i = idx & 63;
+                    ((float*)out)[(size_t)(item.pbase + t) * K + 64 * wt + i] = sc[t * 64 + i];
+                }
+            }
+        });
+    });
+}
+#endif
+
+// Xe2 Battlemage SG=16 XMX prefill routed experts (8x16x16 fp16 -> fp32, 128 threads = 8 SG16, adaptive M x N tiling!)
+#ifdef HY4S_ENABLE_SG16_XMX
+template <int MODE>
+sycl::event launch_gemm_xmx_sg16(sycl::queue& q, const sycl::event* dep, const Item* items, int nitems, const half* X, void* out) {
+    constexpr int NT = MODE == 0 ? 48 : 24;
+    return q.submit([&](sycl::handler& h) {
+        if (dep) h.depends_on(*dep);
+        sycl::local_accessor<half, 1> sB(64 * 64, h);    // 8 KiB VNNI-2 B tile (BK=64)
+        sycl::local_accessor<float, 1> sC(64 * 64, h);   // 16 KiB epilogue tile
+        h.parallel_for(sycl::nd_range<1>((size_t)nitems * NT * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int gid = (int)it.get_group(0);
+            const Item item = items[gid / NT];
+            const int wt = gid % NT;
+            const int tid = (int)it.get_local_id(0);
+            auto sg = it.get_sub_group();
+            const int sgi = tid >> 4;          // 0..7 (8 SG16 subgroups)
+            const int row_local = tid >> 1;    // 0..63
+            const int half_idx = tid & 1;      // 0 or 1
+            const uint8_t* body = item.body_ptr;
+            const int code = MODE == 0 ? item.gu : item.dn;
+            const uint8_t* W = MODE == 0 ? body + 3072 : body + item.dn_off;
+            const int row = MODE == 0 ? (row_local < 32 ? 32 * wt + row_local : K + 32 * wt + (row_local - 32)) : 64 * wt + row_local;
+            const int sby = code_sb_bytes(code);
+            const uint8_t* rp = W + (size_t)row * 6 * sby;
+            const int ntok = (int)item.ntok;
+
+            // Adaptive (M, N) SG16 assignment:
+            //   ntok <= 16 -> 2 M-tiles x 4 N-tiles (1 8x16 tile/SG16)
+            //   ntok <= 32 -> 4 M-tiles x 2 N-tiles (2 8x16 tiles/SG16)
+            //   ntok >  32 -> 8 M-tiles x 1 N-tile  (4 8x16 tiles/SG16)
+            int sg_m, sg_n, n_tiles;
+            if (ntok <= 16) {
+                sg_m = sgi >> 2;      // 0..1
+                sg_n = sgi & 3;       // 0..3
+                n_tiles = 1;
+            } else if (ntok <= 32) {
+                sg_m = sgi >> 1;      // 0..3
+                sg_n = (sgi & 1) * 2; // 0, 2
+                n_tiles = 2;
+            } else {
+                sg_m = sgi;           // 0..7
+                sg_n = 0;
+                n_tiles = 4;
+            }
+            const int m0 = (int)item.pbase + sg_m * 8;
+            const bool active = sg_m * 8 < ntok;
+
+            xm::joint_matrix<sycl::sub_group, half, xm::use::a, 8, 16, xm::layout::row_major> ma;
+            xm::joint_matrix<sycl::sub_group, half, xm::use::b, 16, 16, xm::layout::ext_intel_packed> mb;
+            xm::joint_matrix<sycl::sub_group, float, xm::use::accumulator, 8, 16> mc[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) xm::joint_matrix_fill(sg, mc[j], 0.0f);
+
+            half* sb_ptr = &sB[0];
+            auto sB_mp = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(sb_ptr);
+
+            for (int sbi = 0; sbi < 6; ++sbi) {
+                const uint8_t* blk = rp + (size_t)sbi * sby;
+                const float D = h2f_bits(ld16(blk));
+                const float effs[4] = {
+                    D * ((float)blk[2] * (1.0f / 255.0f)), D * ((float)blk[3] * (1.0f / 255.0f)),
+                    D * ((float)blk[4] * (1.0f / 255.0f)), D * ((float)blk[5] * (1.0f / 255.0f))};
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    dq_half_group_any(code, blk, effs[g], g, half_idx, sb_ptr, row_local);
+                    sycl::group_barrier(it.get_group());
+
+                    if (active) {
+                        const half* xrow = X + (size_t)m0 * K + (size_t)sbi * 256 + g * 64;
+#pragma unroll
+                        for (int s = 0; s < 4; ++s) {
+                            auto xp = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                                const_cast<half*>(xrow + s * 16));
+                            xm::joint_matrix_load(sg, ma, xp, (size_t)K);
+                            for (int j = 0; j < n_tiles; ++j) {
+                                xm::joint_matrix_load(sg, mb, sB_mp + (size_t)(s * 8) * 128 + (size_t)(sg_n + j) * 32, (size_t)128);
+                                xm::joint_matrix_mad(sg, mc[j], ma, mb, mc[j]);
+                            }
+                        }
+                    }
+                    sycl::group_barrier(it.get_group());
+                }
+            }
+
+            float* sc = &sC[0];
+            auto sc_mp = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(sc);
+            if (active) {
+                for (int j = 0; j < n_tiles; ++j)
+                    xm::joint_matrix_store(sg, mc[j], sc_mp + (size_t)(sg_m * 8) * 64 + (sg_n + j) * 16, (size_t)64, xm::layout::row_major);
             }
             sycl::group_barrier(it.get_group());
 
@@ -280,10 +460,7 @@ sycl::event launch_gemm_simt(sycl::queue& q, const sycl::event* dep, const Item*
                     D * ((float)blk[2] * (1.0f / 255.0f)), D * ((float)blk[3] * (1.0f / 255.0f)),
                     D * ((float)blk[4] * (1.0f / 255.0f)), D * ((float)blk[5] * (1.0f / 255.0f))};
                 for (int g = 0; g < 4; ++g) {
-                    if (code == 0) dq_half_group<0>(blk, effs[g], g, half_idx, sb_ptr, row_local);
-                    else if (code == 2) dq_half_group<2>(blk, effs[g], g, half_idx, sb_ptr, row_local);
-                    else if (code == 3) dq_half_group<3>(blk, effs[g], g, half_idx, sb_ptr, row_local);
-                    else dq_half_group<4>(blk, effs[g], g, half_idx, sb_ptr, row_local);
+                    dq_half_group_any(code, blk, effs[g], g, half_idx, sb_ptr, row_local);
                     sycl::group_barrier(it.get_group());
                     const int k0 = sbi * 256 + g * 64;
                     for (int kp = 0; kp < 32; ++kp) {
@@ -333,6 +510,9 @@ template <int MODE>
 sycl::event launch_gemm(sycl::queue& q, const sycl::event* dep, const Item* items, int nitems, const half* X, void* out) {
 #ifndef HY4S_DISABLE_SG8
     if (dev_caps().has_xmx_sg8) return launch_gemm_xmx<MODE>(q, dep, items, nitems, X, out);
+#endif
+#ifdef HY4S_ENABLE_SG16_XMX
+    if (dev_caps().has_xmx_sg16) return launch_gemm_xmx_sg16<MODE>(q, dep, items, nitems, X, out);
 #endif
     return launch_gemm_simt<MODE>(q, dep, items, nitems, X, out);
 }
@@ -501,9 +681,9 @@ bool GpuExperts::init(const CpuExperts& cx, size_t stage_bytes, int max_tokens, 
             int gu, dn;
             uint32_t dno, bytes;
             if (!cx.expert_info(L, e, &body, &gu, &dn, &dno, &bytes)) continue;
-            auto okc = [](int c) { return c == 0 || c == 2 || c == 3 || c == 4; };
+            auto okc = [](int c) { return c >= 0 && c <= 7; };
             if (!okc(gu) || !okc(dn)) {
-                err = "expert code not supported by GPU path (S1.25/S2/S3/S4 only)";
+                err = "expert code not supported by GPU path (expected 0..7)";
                 return false;
             }
             if (bytes > I.slot_bytes) {
@@ -530,9 +710,9 @@ bool GpuExperts::init_unified(const std::string& strata_path, const hy4::CpuExpe
     for (size_t i = 0; i < dir.size(); ++i) {
         const int L = (int)(i / 512);
         const auto& d = dir[i];
-        auto okc = [](int c) { return c == 0 || c == 2 || c == 3 || c == 4; };
+        auto okc = [](int c) { return c >= 0 && c <= 7; };
         if (!okc(d.gu_code_id) || !okc(d.dn_code_id)) {
-            err = "expert code not supported by GPU path (S1.25/S2/S3/S4 only)";
+            err = "expert code not supported by GPU path (expected 0..7)";
             return false;
         }
         if (d.body_bytes > I.slot_bytes) {

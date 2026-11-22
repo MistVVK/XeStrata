@@ -41,8 +41,18 @@ static int export_tokenizer(const std::string& file, const std::string& dir) {
     return 0;
 }
 
-// `strata-hy4 --info FILE.strata`: one line of key=value facts, no GPU needed. drafter= and images= are what THIS engine can do with this file (images=1: the SYCL engine reads pictures when it is started with --vision).
+// `strata-hy4 --info [FILE.strata]`: one line of key=value facts, no GPU needed.
 static int print_info(const std::string& file) {
+    if (file.empty()) {
+        printf("arch=hy4flash engine=hy4-serve-sycl-0 backend=sycl drafter=dfly2 spec_tree=1 spec_prob=1 lcp_resume=1 images=1 version=%s\n", HY4_VERSION);
+        return 0;
+    }
+    std::string verr;
+    hy4::VisionShardInfo vinfo;
+    if (hy4::vision_probe(file, vinfo, verr)) {
+        printf("arch=hy4flash_vision backend=sycl images=1 tensors=%zu\n", vinfo.T.size());
+        return 0;
+    }
     strata::artifact::StrataFileReader rd;
     std::string err;
     if (!rd.open(file, err)) {
@@ -67,7 +77,8 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 }
 
 int main(int argc, char** argv) {
-    // Work around oneAPI 2026.1.1 Level Zero V2 + oneMKL GEMM SIGSEGV (exit 139) on Battlemage (Arc Pro B70 / bmg_g31).
+    // Work around oneMKL + Level Zero V2 adapter segfault (exit 139) on Battlemage Xe2 (Arc Pro B70 bmg_g31):
+    // default UR_LOADER_USE_LEVEL_ZERO_V2=0 when unset in user env BEFORE any SYCL device/queue init.
     if (!std::getenv("UR_LOADER_USE_LEVEL_ZERO_V2")) {
         hy4s_setenv("UR_LOADER_USE_LEVEL_ZERO_V2", "0", 0);
     }
@@ -107,7 +118,10 @@ int main(int argc, char** argv) {
             printf("strata-hy4 %s\n", HY4_VERSION);
             return 0;
         }
-        if (a == "--info") return print_info(nxt());
+        if (a == "--info") {
+            const std::string f = (i + 1 < argc && argv[i + 1][0] != '-') ? std::string(argv[++i]) : std::string();
+            return print_info(f);
+        }
         if (a == "--export-tokenizer") {
             const std::string f = nxt();
             return export_tokenizer(f, nxt());
@@ -170,6 +184,9 @@ int main(int argc, char** argv) {
         else if (a == "--spec-check") scfg.check = true;
         else if (a == "--spec-plain-only") scfg.plain_only = true;
         else if (a == "--spec-rv") scfg.rv = atoi(nxt().c_str());
+        else if (a == "--spec-tree") scfg.tree = true;
+        else if (a == "--no-spec-tree") scfg.tree = false;
+        else if (a == "--spec-early-cut") scfg.early_cut = (float)atof(nxt().c_str());
         else {
             fprintf(stderr, "unknown arg %s\n", a.c_str());
             if (serve) {
@@ -237,9 +254,9 @@ int main(int argc, char** argv) {
     }
     try {
         const auto& caps = dev_caps();
-        fprintf(stderr, "[gpu] %s, %.2f GiB (runtime: %s, sg8=%d sg16=%d xmx8=%d graph=%d onemkl=%d)\n",
+        fprintf(stderr, "[gpu] %s, %.2f GiB (runtime: %s, sg8=%d sg16=%d xmx8=%d xmx16=%d graph=%d onemkl=%d)\n",
                 caps.name.c_str(), caps.global_mem / 1073741824.0, caps.platform.c_str(),
-                (int)caps.has_sg8, (int)caps.has_sg16, (int)caps.has_xmx_sg8, (int)caps.has_graph, (int)onemkl_enabled());
+                (int)caps.has_sg8, (int)caps.has_sg16, (int)caps.has_xmx_sg8, (int)caps.has_xmx_sg16, (int)caps.has_graph, (int)onemkl_enabled());
         SyModel g;
         std::string err;
         if (!g.load(model, err)) {
@@ -378,9 +395,11 @@ int main(int argc, char** argv) {
                     (unsigned long long)r.graph_replays, (unsigned long long)r.graph_captures);
             if (vcache.active()) {
                 const uint64_t ht = vcache.hits(), ms = vcache.misses();
-                fprintf(stderr, "[vram-cache] hits %llu / %llu (%.1f%%), promotions %llu\n",
+                const uint64_t uq = vcache.unique_expert_launches(), tp_l = vcache.total_pair_launches();
+                fprintf(stderr, "[vram-cache] hits %llu / %llu (%.1f%%), promotions %llu, dedup %llu/%llu (%.2fx)\n",
                         (unsigned long long)ht, (unsigned long long)(ht + ms),
-                        (ht + ms) ? 100.0 * (double)ht / (double)(ht + ms) : 0.0, (unsigned long long)vcache.promotions());
+                        (ht + ms) ? 100.0 * (double)ht / (double)(ht + ms) : 0.0, (unsigned long long)vcache.promotions(),
+                        (unsigned long long)uq, (unsigned long long)tp_l, uq ? (double)tp_l / (double)uq : 1.0);
             }
             fprintf(stderr, "[io] decode: SSD read %.2f GB in %.2f s = %.3f GB/s (cpu pool %.1f GB/s)\n",
                     io_read_gb() - io1, td, (io_read_gb() - io1) / std::max(td, 1e-9), ucx.stats().gbps());
@@ -566,9 +585,11 @@ int main(int argc, char** argv) {
                     (unsigned long long)r.graph_replays, (unsigned long long)r.graph_captures);
             if (vcache.active()) {
                 const uint64_t ht = vcache.hits(), ms = vcache.misses();
-                fprintf(stderr, "[vram-cache] hits %llu / %llu (%.1f%%), promotions %llu\n",
+                const uint64_t uq = vcache.unique_expert_launches(), tp_l = vcache.total_pair_launches();
+                fprintf(stderr, "[vram-cache] hits %llu / %llu (%.1f%%), promotions %llu, dedup %llu/%llu (%.2fx)\n",
                         (unsigned long long)ht, (unsigned long long)(ht + ms),
-                        (ht + ms) ? 100.0 * (double)ht / (double)(ht + ms) : 0.0, (unsigned long long)vcache.promotions());
+                        (ht + ms) ? 100.0 * (double)ht / (double)(ht + ms) : 0.0, (unsigned long long)vcache.promotions(),
+                        (unsigned long long)uq, (unsigned long long)tp_l, uq ? (double)tp_l / (double)uq : 1.0);
             }
             fprintf(stderr, "[io] decode: SSD read %.2f GB in %.2f s = %.3f GB/s (cpu pool %.1f GB/s)\n",
                     io_read_gb() - io1, td, (io_read_gb() - io1) / std::max(td, 1e-9), ucx.stats().gbps());
