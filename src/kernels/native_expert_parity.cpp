@@ -818,8 +818,8 @@ static int check_bih3_grouped(void* stream) {
         strata::parity::copy_out(gout.data(), go, gout.size());
         std::vector<float> g_got, g_want;
         for (int r : {0, 2}) {
-            g_got.insert(g_got.end(), gout.begin() + (size_t) r * H, gout.begin() + (size_t) (r + 1) * H);
-            g_want.insert(g_want.end(), want.begin() + (size_t) dst[r] * H, want.begin() + (size_t) (dst[r] + 1) * H);
+            g_got.insert(g_got.end(), gout.begin() + (std::ptrdiff_t) ((size_t) r * H), gout.begin() + (std::ptrdiff_t) ((size_t) (r + 1) * H));
+            g_want.insert(g_want.end(), want.begin() + (std::ptrdiff_t) ((size_t) dst[r] * H), want.begin() + (std::ptrdiff_t) ((size_t) (dst[r] + 1) * H));
         }
         groups_error = rel(g_got, g_want);
         for (int i = 0; i < H; ++i) if (gout[(size_t) H + i] != 7.f) groups_error = 1;   // the group with no blob
@@ -910,12 +910,12 @@ static int check_bih3_grouped(void* stream) {
         auto* want_dn = dev.alloc<float>((size_t) TR * H);
         auto* got_gu = dev.alloc<float>((size_t) TR * 2 * FF);
         auto* got_dn = dev.alloc<float>((size_t) TR * H);
-        strata::kernels::xmx_gemm_grouped(dxg, dgu, (int64_t) 2 * FF * H, want_gu, tb, 2, 3, 2 * FF, H, stream);
+        strata::kernels::xmx_gemm_grouped(dxg, dgu, (int64_t) 2 * FF * H, want_gu, tb, 2, 3, (int64_t) 2 * FF, H, stream);
         strata::kernels::xmx_gemm_grouped(dxd, ddn, (int64_t) H * FF, want_dn, tb, 2, 3, H, FF, stream);
         const void* blobs_dev[] = {reinterpret_cast<const void*>(ptr[0]), reinterpret_cast<const void*>(ptr[1])};
         const int32_t kp[] = {(f[0].gu_type - 180) | (f[0].d_type - 180) << 8,
                               (f[1].gu_type - 180) | (f[1].d_type - 180) << 8};
-        strata::kernels::bih3_r1q2_gemm_grouped_f16(L, false, dxg, blobs_dev, kp, got_gu, 2 * FF, tb, 2, 3, stream);
+        strata::kernels::bih3_r1q2_gemm_grouped_f16(L, false, dxg, blobs_dev, kp, got_gu, (int64_t) 2 * FF, tb, 2, 3, stream);
         strata::kernels::bih3_r1q2_gemm_grouped_f16(L, true, dxd, blobs_dev, kp, got_dn, H, tb, 2, 3, stream);
         std::vector<float> a((size_t) TR * 2 * FF), b(a.size()), c((size_t) TR * H), d(c.size());
         strata::parity::copy_out(a.data(), got_gu, a.size());
