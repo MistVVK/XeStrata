@@ -166,7 +166,7 @@ PREREQUISITES = {
              "zstd": "zstd", "opencl": "opencl-headers", "cuda": "cuda", "how": "sudo pacman -S --needed "},
 }
 # where CMake's find_library looks, per distribution
-LIB_DIRS = ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib", "/usr/local/lib")
+LIB_DIRS = ("/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib", "/usr/local/lib")
 
 
 def static_zstd() -> bool:
