@@ -1848,7 +1848,12 @@ private:
                     bell->n_jobs = node_cnt[nd];
                     std::memcpy(bell->x, host_jobs[0].xe.data(), static_cast<size_t>(D) * sizeof(float));
                     bell_seq[nd] = seq;
+#if defined(_MSC_VER)
+                    std::atomic_thread_fence(std::memory_order_release);
+                    bell->ring = seq;
+#else
                     __atomic_store_n(&bell->ring, seq, __ATOMIC_RELEASE);
+#endif
                 }
             }
         }
@@ -1878,7 +1883,14 @@ private:
             for (int nd = 0; nd < db_.n_nodes; ++nd) {
                 if (bell_seq[nd] == 0) continue;
                 hybrid::InkDoorbell* bell = db_.h_bells[nd];
-                while (__atomic_load_n(&bell->ack[nd], __ATOMIC_ACQUIRE) != bell_seq[nd]) {
+                for (;;) {
+#if defined(_MSC_VER)
+                    const uint32_t cur_ack = bell->ack[nd];
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    if (cur_ack == bell_seq[nd]) break;
+#else
+                    if (__atomic_load_n(&bell->ack[nd], __ATOMIC_ACQUIRE) == bell_seq[nd]) break;
+#endif
                     std::this_thread::yield();
                 }
             }
