@@ -2494,11 +2494,15 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             // kernels, so forcing them there killed the engine ("prefill copy_i32: unspecified launch failure" on a
             // Tesla P100); such a card ignores the switch and keeps the kernel it runs without it.
             const char* w = std::getenv("STRATA_QSA_WARP");
-            const int real_cc = 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);
+            const int real_cc = strata::cc_of(major, minor);
             cc[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "attn")) && real_cc >= 75 ? 75 : real_cc;
         }
         if (cc[dev] < 70) return false;
+#if defined(STRATA_EXPERIMENTAL_SM60)
         volta = cc[dev] < 75;     // sm_70: the m8n8k4 kernel (STRATA_PA_VOLTA); STRATA_QSA_WARP=1 still forces the old one
+#else
+        volta = false;            // CUDA 13 builds without STRATA_EXPERIMENTAL_SM60 keep Tensor Core prompt attention
+#endif
         turing = cc[dev] < 80;
         t75 = cc[dev] == 75;      // a Turing card, or one run as such (STRATA_EMULATE_CC=75, STRATA_QSA_WARP=1)
     }

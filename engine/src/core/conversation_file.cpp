@@ -951,7 +951,7 @@ std::vector<SessionModelFile> session_mtp_pack_files(const std::string& mtp, con
         f.insert(f.begin(), {"mtp gguf", mtp});
         // its draft-head subset sits in the rt folder beside it (window.cpp reads <gguf dir>/rt/draft_vocab.bin)
         if (draft_vocab.empty()) {
-            const std::string beside = mtp.substr(0, mtp.find_last_of("/\\") + 1) + "rt/draft_vocab.bin";
+            const std::string beside = (std::filesystem::path(mtp).parent_path() / "rt" / "draft_vocab.bin").string();
             if (std::filesystem::is_regular_file(beside, ec)) f.push_back({"mtp draft_vocab.bin", beside});
         }
         return f;
@@ -991,7 +991,7 @@ std::vector<SessionModelFile> session_mtp_pack_files(const std::string& mtp, con
     // an rt directory: window.cpp reads the draft head's subset from <gguf dir>/rt/draft_vocab.bin beside the
     // GGUF it opened (its own default when that is absent hashes as nothing); a --mtp-draft-vocab FILE above wins.
     if (draft_vocab.empty()) {
-        const std::string beside = gguf.substr(0, gguf.find_last_of("/\\") + 1) + "rt/draft_vocab.bin";
+        const std::string beside = (std::filesystem::path(gguf).parent_path() / "rt" / "draft_vocab.bin").string();
         if (std::filesystem::is_regular_file(beside, ec)) f.push_back({"mtp draft_vocab.bin", beside});
     }
     return f;

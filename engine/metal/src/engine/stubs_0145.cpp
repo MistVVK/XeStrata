@@ -152,6 +152,9 @@ namespace strata::kernels { void native_q8_0_sm60_release(void const* p0) { } }
 // the MTP drafter's STRATA_MTP_Q8_SM60 packing (mtp.cpp): nothing packed on Metal
 namespace strata::kernels { bool native_q8_0_sm60_pack_quiet(void const* p0, int p1, int p2, char const* p3) { return false; } }
 namespace strata::kernels { bool native_q8_0_sm60_pack_in_place(void* p0, int p1, int p2, char const* p3) { return false; } }
+namespace strata::kernels { bool native_q8_0_inplace_enabled() { return false; } }
+namespace strata::kernels { bool native_q8_0_inplace_eligible(int, int) { return false; } }
+namespace strata::kernels { bool native_q8_0_packed_lookup(const void*, const int8_t*&, const void*&) { return false; } }
 // STRATA_SELECT_LONG (verify.cpp's long-context decode select): CUDA only; never reached on Metal (no scratch asked for)
 namespace strata::kernels { long long qsa_topk_multi_scratch_ints(long long p0) { return 0; } }
 namespace strata::kernels { void qsa_block_topk_long(float const* p0, int const* p1, long long p2, long long p3, long long p4, strata::kernels::QsaShapes const& p5, int* p6, void* p7, long long p8, int* p9) { strata::metal_engine::missing("strata::kernels::qsa_block_topk_long"); } }
@@ -163,3 +166,6 @@ namespace strata::kernels { void ple_iq4nl_dequant(const uint8_t* p0, int64_t p1
 // STRATA_DEQUANT_SIDE (opt-in, CUDA only): off on Metal; the prompt path takes no second scratch and set_dequant_side(nullptr) keeps the serial form.
 namespace strata::prefill { bool gemm_dequant_side() { return false; } }
 auto strata::prefill::Gemm::set_dequant_side(uint16_t* p0, std::string& p1) -> bool { if (p0 == nullptr) return true; strata::metal_engine::missing("strata::prefill::Gemm::set_dequant_side"); return false; }
+namespace strata::kernels { void argmax_rows_val_idx(const float* p0, int p1, int p2, int p3, void* p4, float* p5, int32_t* p6, void* p7) { strata::metal_engine::missing("strata::kernels::argmax_rows_val_idx"); } }
+namespace strata::kernels { void argmax_merge_halves(const float* p0, const int32_t* p1, const float* p2, const int32_t* p3, int p4, int32_t* p5, void* p6) { strata::metal_engine::missing("strata::kernels::argmax_merge_halves"); } }
+namespace strata::kernels { void or_u32_rows(uint32_t* p0, const uint32_t* p1, int p2, void* p3) { strata::metal_engine::missing("strata::kernels::or_u32_rows"); } }

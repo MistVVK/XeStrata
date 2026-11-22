@@ -662,6 +662,8 @@ private:
     SessionState* ss_ = nullptr;
     VerifyHits hits_;
     const NativeHead* head_ = nullptr;
+    mutable bool split_logits_materialized_ = false;
+    void ensure_full_logits(int T, bool sync) const;
     int max_t_ = 0;
     float* ple_key_ = nullptr;   ///< STRATA_PLE_BATCH: the window rows' PLE key / value projections
     float* ple_val_ = nullptr;

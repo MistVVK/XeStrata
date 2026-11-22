@@ -323,6 +323,7 @@ BACKEND_CONF = {"sycl": 0.6, "metal": 0.5}
 # conf 0.55. 11-08 sweep (phaseA-tests/df2r2/RESULTS-CONF.md), IQ3_S, 36 requests, 300 greedy tokens, 5 interleaved pairs against conf 0.35 / window 6: +2.4%, 5 of 5 pairs faster, output identical
 # (conf 0.55 alone +1.1%). Only where every expert is resident (the first CONF_STEPS step), the case that was measured; the other sets on that card were not measured and keep 0.35.
 BIG_CARD_BYTES = 48_000_000_000     # "48 GB" the way cards are sold (a 48 GB card reports about 47.5 GiB); the engine's kDflash2BigCardBytes is the same number
+BLACKWELL_W8_BYTES = 15_000_000_000 # 15 GB line: RTX 5080 (16 GB), RTX 5090 (32 GB), RTX PRO 5000 (72 GB); engine's kDflash2BlackwellW8Bytes
 
 
 @dataclass(frozen=True)
@@ -1016,6 +1017,13 @@ def engine_flags(pack: str | Path, vocab: str | Path | None = None, form: str | 
     return ("--draft", "dflash2", "--draft-model", str(pack), "--draft-fallback", "none", *where, "--spec", str(SPEC_WINDOW), "--draft-conf", f"{DRAFT_CONF:g}")
 
 
+def blackwell_w8(backend: str | None, archs: Any = None, vram_mib: float | None = None, slots: int | float | None = None) -> bool:
+    """Desktop Blackwell cc 12.0 (sm_120) with at least 15 GB VRAM and normal expert cache: engine cap is 8 (dflash2_blackwell_w8)."""
+    if str(backend or "").strip().lower() != "cuda" or first_arch(archs) != "sm_120" or not vram_mib or slots is None:
+        return False
+    return vram_mib * 1048576 >= BLACKWELL_W8_BYTES and slots >= 3000
+
+
 def big_blackwell(backend: str | None, archs: Any = None, vram_mib: float | None = None, slots: int | float | None = None) -> bool:
     """Is this start on the large-VRAM Blackwell class (the window of 8, and the sets' big_blackwell_conf): CUDA, the first card's architecture sm_120 (cc 12.0; the Spark is sm_121), the one card's memory ``vram_mib``
     at least BIG_CARD_BYTES (None = several cards or unknown: no), and ``slots`` in the all-resident step (None counts as unknown: no)? Mirrors the engine's dflash2_big_blackwell."""
@@ -1031,11 +1039,11 @@ def big_blackwell_conf_for(backend: str | None, model_name: str | None, archs: A
 
 
 def window_for(backend: str | None, archs: Any = None, vram_mib: float | None = None, slots: int | float | None = None) -> int:
-    """The ``--spec`` of a DFlash2 start: WIDE_WINDOW (8) on Strix Halo (HIP gfx1151, engine cap 8) and on the large-VRAM Blackwell class (big_blackwell), SPEC_WINDOW (6) everywhere else, so no other
-    card's effective window changes (the engine caps 6 on the Spark and the smaller Blackwell cards, and does not cap the rest)."""
+    """The ``--spec`` of a DFlash2 start: WIDE_WINDOW (8) on Strix Halo (HIP gfx1151, engine cap 8) and on desktop Blackwell cc 12.0 with >= 15 GB (blackwell_w8),
+    SPEC_WINDOW (6) everywhere else, so no other card's effective window changes."""
     if str(backend or "").strip().lower() == "hip" and first_arch(archs) == "gfx1151":
         return WIDE_WINDOW
-    return WIDE_WINDOW if big_blackwell(backend, archs, vram_mib, slots) else SPEC_WINDOW
+    return WIDE_WINDOW if blackwell_w8(backend, archs, vram_mib, slots) else SPEC_WINDOW
 
 
 def conf_for(backend: str | None, slots: int | float | None) -> float:

@@ -108,6 +108,12 @@ bool native_q8_0_packed_eligible(int n_in, int n_out);
 void native_q8_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_out);
 void native_q8_0_packed_register(const void* gguf_weights, const void* packed, int n_in, int n_out);
 void native_q8_0_packed_unregister(const void* gguf_weights);
+/// STRATA_Q8_INPLACE=1 (opt-in): packs eligible dense Q8_0 matrices in-place (+0 MiB extra VRAM) as split qs/d
+/// planes read by both decode MMVQ (q8sm60::kernel with opt-in SMEM on Volta+) and prefill dequant_f16/f16_ld.
+bool native_q8_0_inplace_enabled();
+bool native_q8_0_inplace_eligible(int n_in, int n_out);
+bool native_q8_0_packed_lookup(const void* gguf_weights, const int8_t** qs, const void** d_half,
+                               int* n_in, int* n_out);
 /// STRATA_Q8_SM60=1 (opt-in, Pascal GP100): every Q8_0 dense matrix is packed as above whatever its shape, and the
 /// Q8_0 decode GEMVs run a kernel written for compute capability 6.0 (q8_sm60.cuh; not bitwise the exact kernels).
 /// native_q8_0_sm60_pack packs a device matrix here (the head) and owns the copy until native_q8_0_sm60_release;

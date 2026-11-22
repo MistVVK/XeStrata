@@ -4,6 +4,7 @@
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/arch_defaults.hpp"   // arena_skip_thp_request
 #include "strata/core/page_cache_drop.hpp"   // drop_range (the drop behind the arena read, Linux)
+#include "strata/kernels/cpu/expert_layout.hpp"   // per-role slice geometry for STRATA_NUMA_ARENA=1
 #if defined(STRATA_USE_HIP) && defined(__linux__)   // kfd_quiet NOREG scope: Linux HIP only, every other build keeps its old text
 #include "strata/core/kfd_quiet.hpp"   // NOREG: the arena's mode and its lock (the Radeon 780M class, Linux HIP)
 #endif
@@ -12,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cerrno>
 #include <cstdlib>
@@ -37,13 +39,13 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#include <chrono>   // the STRATA_NUMA_ARENA=1 slice placement's timing (Windows only)
-#include "strata/kernels/cpu/expert_layout.hpp"   // its per-role slice geometry
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #ifdef __linux__
+#include <sched.h>
+#include <sys/syscall.h>
 #include <sys/vfs.h>
 #endif
 #include <unistd.h>
@@ -455,8 +457,11 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
 
     // STRATA_NO_LARGEPAGES=1 is the same-run A/B switch the Windows branch documents; honor it
     // here too, so the large-page path can be compared without changing the pool or rebooting.
-    if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
-        note = "large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages";
+    // STRATA_NUMA_ARENA=1 also uses 4 KB pages (MADV_NOHUGEPAGE) so per-role NUMA slices can be placed on separate sockets.
+    const bool numa_arena = numa_placeable && [] { const char* v = std::getenv("STRATA_NUMA_ARENA"); return v != nullptr && v[0] == '1'; }();
+    if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr || numa_arena) {
+        note = numa_arena ? "large pages skipped (STRATA_NUMA_ARENA=1); using 4 KB pages"
+                          : "large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages";
     } else {
         void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
@@ -492,6 +497,10 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
     const uintptr_t end = aligned + bytes, raw_end = start + padded;
     if (raw_end > end) munmap((void*) end, raw_end - end);
     void* p = (void*) aligned;
+    if (numa_arena) {
+        (void) madvise(p, bytes, MADV_NOHUGEPAGE);
+        return p;
+    }
     // #771: with THP "always" the kernel already backs this mapping with huge pages where it can; the extra
     // MADV_HUGEPAGE only adds direct reclaim and compaction on every fault (defrag=madvise), which on a fragmented
     // machine stretched a 25 s start to 432 s.  So it is not asked for there.  STRATA_NO_ARENA_THP=1 skips it
@@ -898,6 +907,74 @@ void place_arena_numa_slices_win(void* base, uint64_t bytes, std::string& note) 
                       extra_nodes);
     note += msg;
 }
+#elif defined(__linux__)
+// STRATA_NUMA_ARENA=1: place Slice 0 and Slice 1 of every expert's [gate | up | down] roles on NUMA nodes 0 and 1
+// before cudaHostRegister locks the pages in place. Toucher threads override any inherited MPOL_INTERLEAVE policy
+// (such as numactl --interleave=all) with MPOL_DEFAULT on their pinned CPU core so first-touch allocates on the
+// local node of that slice.
+void place_arena_numa_slices(void* base, uint64_t bytes, std::string& note) {
+    const char* env = std::getenv("STRATA_NUMA_ARENA");
+    if (env == nullptr || env[0] != '1' || base == nullptr || bytes == 0) return;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.n_layers <= 0 || lay.n_expert <= 0 || lay.fmt.size() != (size_t) lay.n_layers ||
+        lay.total > bytes)
+        return;
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) return;
+    std::vector<int> node_cpus[2];
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &allowed)) continue;
+        char p0[96], p1[96];
+        std::snprintf(p0, sizeof p0, "/sys/devices/system/cpu/cpu%d/node0", c);
+        std::snprintf(p1, sizeof p1, "/sys/devices/system/cpu/cpu%d/node1", c);
+        if (access(p0, F_OK) == 0) node_cpus[0].push_back(c);
+        else if (access(p1, F_OK) == 0) node_cpus[1].push_back(c);
+    }
+    if (node_cpus[0].empty() || node_cpus[1].empty()) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr int kWorkersPerNode = 8;
+    constexpr uint64_t kPage = 4096;
+    std::vector<std::thread> th;
+    th.reserve(2 * kWorkersPerNode);
+    for (int k = 0; k < 2; ++k) {
+        for (int w = 0; w < kWorkersPerNode; ++w) {
+            const int cpu = node_cpus[k][(size_t) w % node_cpus[k].size()];
+            th.emplace_back([base, &lay, k, w, cpu]() {
+                cpu_set_t set;
+                CPU_ZERO(&set);
+                CPU_SET(cpu, &set);
+                (void) sched_setaffinity(0, sizeof set, &set);
+                // MPOL_DEFAULT (0): override any process-wide MPOL_INTERLEAVE so first-touch allocates on `cpu`'s node
+                (void) syscall(SYS_set_mempolicy, 0, nullptr, 0ul);
+                for (int64_t l = w; l < lay.n_layers; l += kWorkersPerNode) {
+                    const auto& fm = lay.fmt[(size_t) l];
+                    const uint64_t blob = lay.blob_bytes(l);
+                    const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
+                    for (int64_t e = 0; e < lay.n_expert; ++e) {
+                        uint64_t start = lay.blob_offset(l, e);
+                        for (int r = 0; r < 3; ++r) {
+                            const uint64_t mid = start + per[r] / 2, end = start + per[r];
+                            const uint64_t lo = k == 0 ? (start & ~(kPage - 1)) : ((mid + kPage - 1) & ~(kPage - 1));
+                            const uint64_t hi = k == 0 ? ((mid + kPage - 1) & ~(kPage - 1)) : (end & ~(kPage - 1));
+                            for (uint64_t at = lo; at < hi; at += kPage)
+                                ((volatile uint8_t*) base)[at] = 0;
+                            start = end;
+                        }
+                    }
+                }
+            });
+        }
+    }
+    for (auto& t : th) t.join();
+    // Touch the trailing spare blob so the entire arena is faulted before cudaHostRegister
+    for (uint64_t at = lay.total & ~(kPage - 1); at < bytes; at += kPage)
+        ((volatile uint8_t*) base)[at] = 0;
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    char msg[160];
+    std::snprintf(msg, sizeof msg, "; NUMA slice-placed (STRATA_NUMA_ARENA=1: slice 0 -> node 0, slice 1 -> node 1 in %.2f s)", secs);
+    note += msg;
+}
 #endif
 
 // pin_register for the arena's ranges.  Windows HIP: a range whose GPU alias covers memory in use is unregistered again and
@@ -970,6 +1047,9 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
     // 512 MB in the M1 prototype; a partial tier pays it once at start and buys per-slice node locality for it.
     if (base && shared_state == nullptr && backing == PageBacking::NormalPages)
         place_arena_numa_slices_win(base, bytes, note);
+#elif defined(__linux__)
+    if (base && shared_state == nullptr && backing == PageBacking::NormalPages)
+        place_arena_numa_slices(base, bytes, note);
 #endif
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
@@ -1205,6 +1285,9 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, De
     // No shared_state check: this constructor takes no shared file, the arena is always process-private.
     if (base && backing == PageBacking::NormalPages)
         place_arena_numa_slices_win(base, bytes, note);
+#elif defined(__linux__)
+    if (base && backing == PageBacking::NormalPages)
+        place_arena_numa_slices(base, bytes, note);
 #endif
     slice_bytes = 1;   // sliced: one registration per layer
 }

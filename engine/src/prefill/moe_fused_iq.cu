@@ -1793,6 +1793,13 @@ __device__ __forceinline__ void nw_barrier() {
     __builtin_amdgcn_s_waitcnt(0x7 | (0x3f << 10));   // gfx11 simm16: expcnt [2:0], lgkmcnt [9:4], vmcnt [15:10]: lgkmcnt(0) only
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#elif STRATA_NAT_W12
+    // #6515: gfx12 runs in WGP mode too; write the explicit LDS wait (s_wait_dscnt 0x0) with local workgroup fences
+    // so stage weight stores are ordered before the barrier without global_inv scope:SCOPE_SE.
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    asm volatile("s_wait_dscnt 0x0" ::: "memory");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 #else
     __syncthreads();
 #endif

@@ -29,7 +29,7 @@ def new_cap(uma, major, minor, vram_bytes):      # the same file after (mirrored
     if uma:
         return 8
     if major == 12:
-        return 8 if (minor == 0 and vram_bytes >= 48_000_000_000) else 6
+        return 8 if (minor == 0 and vram_bytes >= 15_000_000_000) else 6
     return 0
 
 
@@ -84,9 +84,14 @@ class CardWindow(unittest.TestCase):
                 self.assertEqual(self.flags(name, "cuda", ["sm_120"], mib, tuned=True), ("8", "0.35"), (name, mib))
                 self.assertEqual(self.flags(name, "cuda", ["sm_120"], mib), ("8", "0.35"), (name, mib))
 
-    def test_blackwell_cc_12_0_under_48_gb_keeps_today(self):
-        for mib in (32768, 24576, 16384, 12288, 45776, None):           # RTX 5090 32 GB .. 5070 12 GB, just under the line, memory unknown (several cards)
-            self.assertEqual(self.flags(IQ3S, "cuda", ["sm_120"], mib, tuned=True), ("6", f"{drafting.conf_for('cuda', drafting.slots_of([], mib)):g}"), mib)     # the slot rule, as before
+    def test_blackwell_cc_12_0_desktop_15_gb_or_more(self):
+        """Window 8 on RTX 5080 (16 GB), RTX 5090 (32 GB), and cards >= 15 GB."""
+        for mib in (32768, 24576, 16384, 45776):           # RTX 5090 32 GB .. RTX 5080 16 GB
+            self.assertEqual(self.flags(IQ3S, "cuda", ["sm_120"], mib, tuned=True)[0], "8", mib)
+
+    def test_blackwell_cc_12_0_under_15_gb_keeps_window_6(self):
+        for mib in (12288, None):                           # RTX 5070 12 GB, memory unknown (several cards)
+            self.assertEqual(self.flags(IQ3S, "cuda", ["sm_120"], mib, tuned=True), ("6", f"{drafting.conf_for('cuda', drafting.slots_of([], mib)):g}"), mib)
         self.assertEqual(self.flags(IQ3S, "cuda", ["sm_120"], 32768)[1], "0.35")
 
     def test_the_spark_is_unchanged(self):
@@ -123,7 +128,7 @@ class CardWindow(unittest.TestCase):
             spec = int(self.flags(IQ3S if backend != "hip" else Q4, backend, archs, mib)[0])
             old = effective(6, old_cap(uma, major))
             new = effective(spec, new_cap(uma, major, minor, vram))
-            big = backend == "cuda" and major == 12 and minor == 0 and vram >= 48_000_000_000
+            big = backend == "cuda" and major == 12 and minor == 0 and vram >= 15_000_000_000
             want = 8 if (uma or big) else old
             self.assertEqual(new, want, (backend, archs, mib, "old", old))
 

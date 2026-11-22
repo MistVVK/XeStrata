@@ -18,6 +18,8 @@
 // rounding only; the int8 dots are exact).
 #pragma once
 
+#include "strata/core/emulate.hpp"
+
 namespace q8sm60 {
 
 constexpr int THREADS = 256;
@@ -26,6 +28,26 @@ constexpr int MAX_COLS = 8;                        // columns of one launch (a w
 
 inline std::size_t smem_bytes(int ncols, int n_in) {
     return std::size_t(ncols) * std::size_t(n_in) + std::size_t(ncols) * std::size_t(n_in / 32) * sizeof(float);
+}
+
+inline std::size_t device_max_smem() {
+    static std::size_t cache[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
+        return MAX_SMEM;
+    }
+    if (cache[dev] == 0) {
+        int optin = 0;
+        if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) == cudaSuccess &&
+            optin > int(MAX_SMEM)) {
+            cache[dev] = std::size_t(optin);
+        } else {
+            cudaGetLastError();
+            cache[dev] = MAX_SMEM;
+        }
+    }
+    return cache[dev];
 }
 
 template<int NCOLS, int TPR>
@@ -83,54 +105,114 @@ __global__ void kernel(const int8_t* __restrict__ qs, const half* __restrict__ d
     }
 }
 
-// One workgroup per SM would leave too few rows in flight on a 48-SM die; four per SM is what the shapes of
-// Qwen3.8-Flash-Next measured best (STRATA_Q8_SM60_BPS overrides it).
+// One workgroup per SM would leave too few rows in flight on a 48-SM die; four per SM is what Pascal measured best,
+// and six per SM measured best on Volta's 80 SMs (STRATA_Q8_SM60_BPS overrides it).
 inline int blocks_per_sm() {
-    static const int v = [] {
+    static const int env = [] {
         const char* e = std::getenv("STRATA_Q8_SM60_BPS");
-        const int n = e ? std::atoi(e) : 0;
-        return n > 0 ? n : 4;
+        return e ? std::atoi(e) : 0;
     }();
-    return v;
+    if (env > 0) return env;
+#if !defined(__HIPCC__)
+    static int cache[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
+        return 4;
+    }
+    if (cache[dev] == 0) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess) {
+            cache[dev] = ::strata::cc_of(major, minor) == 70 ? 6 : 4;
+        } else {
+            cudaGetLastError();
+            return 4;
+        }
+    }
+    return cache[dev];
+#else
+    return 4;
+#endif
 }
 
 inline int sm_count() {
-    int dev = 0, n = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+    static int cache[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
         return 48;
-    return n > 0 ? n : 48;
+    }
+    if (cache[dev] == 0) {
+        int n = 0;
+        if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && n > 0) {
+            cache[dev] = n;
+        } else {
+            cudaGetLastError();
+            cache[dev] = 48;
+        }
+    }
+    return cache[dev];
 }
 
 template<int NCOLS, int TPR>
-void launch_one(const int8_t* qs, const half* d, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+inline bool configure_smem(std::size_t smem) {
+    static std::size_t configured[64] = {};
+    static bool carveout_done[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
+        return smem <= MAX_SMEM;
+    }
+    if (!carveout_done[dev]) {
+#if !defined(__HIPCC__)
+        (void) cudaFuncSetAttribute(kernel<NCOLS, TPR>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        cudaGetLastError();
+#endif
+        carveout_done[dev] = true;
+    }
+    if (smem > MAX_SMEM && smem > configured[dev]) {
+        if (cudaFuncSetAttribute(kernel<NCOLS, TPR>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        configured[dev] = smem;
+    }
+    return true;
+}
+
+template<int NCOLS, int TPR>
+bool launch_one(const int8_t* qs, const half* d, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    const std::size_t smem = smem_bytes(NCOLS, n_in);
+    if (!configure_smem<NCOLS, TPR>(smem)) return false;
     constexpr int RPB = THREADS / TPR;
     const int groups = (n_out + RPB - 1) / RPB;
     const int grid = (std::min)(groups, sm_count() * blocks_per_sm());
-    kernel<NCOLS, TPR><<<unsigned(grid), THREADS, smem_bytes(NCOLS, n_in), s>>>(qs, d, x, y, n_in, n_out);
+    kernel<NCOLS, TPR><<<unsigned(grid), THREADS, smem, s>>>(qs, d, x, y, n_in, n_out);
+    return true;
 }
 
 template<int NCOLS>
-void launch_cols(const int8_t* qs, const half* d, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
-    if (n_in >= 2048) launch_one<NCOLS, 32>(qs, d, x, y, n_in, n_out, s);
-    else if (n_in >= 1024) launch_one<NCOLS, 16>(qs, d, x, y, n_in, n_out, s);
-    else launch_one<NCOLS, 8>(qs, d, x, y, n_in, n_out, s);
+bool launch_cols(const int8_t* qs, const half* d, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    if (n_in >= 2048) return launch_one<NCOLS, 32>(qs, d, x, y, n_in, n_out, s);
+    else if (n_in >= 1024) return launch_one<NCOLS, 16>(qs, d, x, y, n_in, n_out, s);
+    else return launch_one<NCOLS, 8>(qs, d, x, y, n_in, n_out, s);
 }
 
 // false: a shape this kernel does not take (the caller runs its usual kernel)
 inline bool launch(const int8_t* qs, const half* d, const Q81Block* x, float* y, int n_in, int n_out, int ncols,
                    cudaStream_t s) {
-    if (n_in % 32 != 0 || n_in < 128 || ncols < 1 || ncols > MAX_COLS || smem_bytes(ncols, n_in) > MAX_SMEM) return false;
+    if (n_in % 32 != 0 || n_in < 128 || ncols < 1 || ncols > MAX_COLS || smem_bytes(ncols, n_in) > device_max_smem()) return false;
     switch (ncols) {
-        case 1: launch_cols<1>(qs, d, x, y, n_in, n_out, s); break;
-        case 2: launch_cols<2>(qs, d, x, y, n_in, n_out, s); break;
-        case 3: launch_cols<3>(qs, d, x, y, n_in, n_out, s); break;
-        case 4: launch_cols<4>(qs, d, x, y, n_in, n_out, s); break;
-        case 5: launch_cols<5>(qs, d, x, y, n_in, n_out, s); break;
-        case 6: launch_cols<6>(qs, d, x, y, n_in, n_out, s); break;
-        case 7: launch_cols<7>(qs, d, x, y, n_in, n_out, s); break;
-        default: launch_cols<8>(qs, d, x, y, n_in, n_out, s); break;
+        case 1: return launch_cols<1>(qs, d, x, y, n_in, n_out, s);
+        case 2: return launch_cols<2>(qs, d, x, y, n_in, n_out, s);
+        case 3: return launch_cols<3>(qs, d, x, y, n_in, n_out, s);
+        case 4: return launch_cols<4>(qs, d, x, y, n_in, n_out, s);
+        case 5: return launch_cols<5>(qs, d, x, y, n_in, n_out, s);
+        case 6: return launch_cols<6>(qs, d, x, y, n_in, n_out, s);
+        case 7: return launch_cols<7>(qs, d, x, y, n_in, n_out, s);
+        default: return launch_cols<8>(qs, d, x, y, n_in, n_out, s);
     }
-    return true;
 }
 
 // GGUF Q8_0 blocks (34 bytes, 2-byte aligned) -> the packed planes, on the device (the head's 0.6 GiB stays off the host)

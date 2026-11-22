@@ -15,10 +15,10 @@ int main() {
     CHECK(dflash2_auto_cap(false, 12, 0, 72 * GiB) == 8);      // Blackwell cc 12.0, RTX PRO 5000 72 GB
     CHECK(dflash2_auto_cap(false, 12, 0, 96 * GiB) == 8);      // Blackwell cc 12.0, 96 GB
     CHECK(dflash2_auto_cap(false, 12, 0, 48000000000ull) == 8);// exactly 48 GB
-    CHECK(dflash2_auto_cap(false, 12, 0, 48000000000ull - 1) == 6);
     CHECK(dflash2_auto_cap(false, 12, 0, 51033931776ull) == 8);// a 48 GB card reports about 47.5 GiB
-    CHECK(dflash2_auto_cap(false, 12, 0, 32 * GiB) == 6);      // RTX 5090: cc 12.0 under 48 GB keeps 6
-    CHECK(dflash2_auto_cap(false, 12, 0, 12 * GiB) == 6);      // RTX 5070
+    CHECK(dflash2_auto_cap(false, 12, 0, 32 * GiB) == 8);      // RTX 5090 32 GB
+    CHECK(dflash2_auto_cap(false, 12, 0, 16 * GiB) == 8);      // RTX 5080 16 GB
+    CHECK(dflash2_auto_cap(false, 12, 0, 12 * GiB) == 6);      // RTX 5070 12 GB (< 15 GB keeps 6)
     CHECK(dflash2_auto_cap(false, 12, 0, 0) == 6);             // memory unknown keeps 6
     CHECK(dflash2_auto_cap(false, 12, 1, 128 * GiB) == 6);     // DGX Spark (cc 12.1): unchanged whatever the memory it reports
     CHECK(dflash2_auto_cap(false, 12, 1, 24 * GiB) == 6);

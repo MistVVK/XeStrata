@@ -2,6 +2,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/core/arch_defaults.hpp"   // prompt_f16_resolve (inline)
+#include "strata/core/emulate.hpp"
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
 #include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -871,7 +872,7 @@ int current_cc() {
             cudaGetLastError();
             return 0;
         }
-        v = 10 * major + minor;
+        v = strata::cc_of(major, minor);
         cc[dev].store(v, std::memory_order_relaxed);
     }
     return v;

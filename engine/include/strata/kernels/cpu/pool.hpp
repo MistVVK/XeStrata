@@ -36,6 +36,7 @@
 #include <memory>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -250,6 +251,24 @@ public:
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
     static constexpr int kMaxSplitMulti = 96;
+    /// STRATA_L3_PF / STRATA_POOL_STATIC (opt-in): the native row phases (modes 5/6) give worker j the rows
+    /// [per*j/n, per*(j+1)/n) of every expert of the phase and the host none, so the rows a worker computes are the
+    /// rows `prefetch_next` had that same worker read.  They take the two-phase batch, not STRATA_POOL_DEP's one batch.
+    /// Not with the NUMA split.
+    void set_static_slices(bool on) { static_slices_ = on && numa_n_ == 0 && n_ > 1; }
+    bool static_slices() const { return static_slices_; }
+    /// The next layer's prefetch: its router (n_expert x n_embd BF16), the expert layout, how many experts the window's
+    /// tokens route to (k) and how many non-resident ones to read (top), and the RAM blob of an expert (null: skip it).
+    struct L3Prefetch {
+        const uint16_t* router = nullptr;
+        int n_embd = 0, n_expert = 0, nt = 0, k = 0, top = 0;
+        NativeFmt fmt;
+        std::function<const uint8_t*(int)> blob;
+    };
+    /// Publishes the prefetch and returns at once: every worker computes its share of the router's logits on `x`
+    /// (nt x n_embd, copied), all of them pick the same `top` experts not in VRAM (`res_row[e] >= 0`) by their votes
+    /// over the tokens' top k, and each reads its static slices of those blobs.  The next batch of any kind stops it.
+    void prefetch_next(const L3Prefetch& q, const float* x, const int32_t* res_row);
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
@@ -292,7 +311,19 @@ private:
     int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
-    void run_phase(int mode, int n_tasks);
+    /// per_worker: one task per worker, task j on worker j (the static slices), none on the host
+    void run_phase(int mode, int n_tasks, bool per_worker = false);
+    void prefetch_task(int j);
+    void native_rows(int e, int r0, int r1);
+    bool static_slices_ = false;
+    bool per_worker_ = false;      // this batch's tasks are per worker (written before the publish, read after it)
+    bool pf_inflight_ = false;     // a prefetch batch was published and has not been waited for (host only)
+    std::atomic<bool> pf_abort_{false};
+    std::atomic<int> pf_arrive_{0};
+    L3Prefetch pfq_;
+    std::vector<float> pf_x_, pf_logits_;
+    std::vector<int32_t> pf_res_;
+    std::atomic<uint64_t> pf_sink_{0};   // keeps the prefetch reads
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.

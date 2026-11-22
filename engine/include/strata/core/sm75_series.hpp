@@ -31,7 +31,7 @@ inline bool sm75_series() {
 }
 
 /// the device (raw cudaDevAttrComputeCapabilityMajor / Minor) is a Turing card, or emulates one (STRATA_EMULATE_CC=75)
-inline bool is_sm75(int major, int minor) { return cc_major_of(major) == 7 && cc_minor_of(minor) == 5; }
+inline bool is_sm75(int major, int minor) { return cc_of(major, minor) == 75; }
 
 /// the default of a bitwise Turing kernel switch: on for a Turing card when STRATA_SM75_PERF=1
 inline bool sm75_default(int major, int minor) { return is_sm75(major, minor) && sm75_series(); }

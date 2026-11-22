@@ -29,6 +29,7 @@
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/core/emulate.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/dispatch_stats.hpp"
@@ -1545,7 +1546,9 @@ bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
     if constexpr (!B6X<F>::ok) {
         return false;
     } else {
-        if (b6_rows_mode() <= 0 || !g_multi_exact || s26_tsum_on() || n_in / F::DIV < 1) return false;
+        // b6_rows_mode() > 0 takes precedence over s26_tsum_on() on B6 formats so STRATA_TSUM=1 stays active on
+        // HC Q8 (fused_gr.cu), BF16, and non-B6 MMVQ formats.
+        if (b6_rows_mode() <= 0 || !g_multi_exact || n_in / F::DIV < 1) return false;
         const int rows = b6_rows_mode() == 1 ? 2 : b6_rows_mode();
         const dim3 threads(WARP, WARPS);
         if (rows == 2)
@@ -2516,6 +2519,27 @@ bool q8_sm60_on() {
     return on;
 #endif
 }
+bool q8_inplace_on() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_Q8_INPLACE");
+        const bool yes = v && v[0] == '1' && v[1] == '\0';
+        if (yes) std::fprintf(stderr, "strata q8 inplace: eligible dense Q8_0 matrices packed in-place (+0 MiB VRAM)\n");
+        return yes;
+    }();
+    return on;
+#endif
+}
+int q8_inplace_min_out() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_Q8_INPLACE_MIN_OUT");
+        const int n = e ? std::atoi(e) : 0;
+        return n >= 1 ? n : 640;
+    }();
+    return v;
+}
 #if !defined(__HIPCC__)
 #include "q8_sm60.cuh"
 #endif
@@ -2627,7 +2651,7 @@ bool q8_packed_shape(int n_in, int n_out) {   // the shapes native_q8_0_packed_k
 bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     auto& registry = q8_packed_registry();
 #if !defined(__HIPCC__)
-    if (q8_sm60_on() && !registry.empty()) {
+    if ((q8_sm60_on() || q8_inplace_on()) && !registry.empty()) {
         const auto found = registry.find(weights);
         if (found != registry.end() && found->second.n_in == n_in && found->second.n_out == n_out) {
             validate_pointer(x_q8_1);
@@ -2645,6 +2669,11 @@ bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
             if (all) {
                 launch_check();
                 return true;
+            }
+            if (static_cast<const void*>(found->second.qs) == weights) {
+                std::fprintf(stderr, "strata q8 inplace: q8sm60 declined in-place tensor (%d x %d, ncols=%d)\n",
+                             n_out, n_in, ncols);
+                std::abort();
             }
             // a shape the Pascal kernel declines: the exact packed kernel only where it was measured, else the GGUF layout
             if (!q8_packed_shape(n_in, n_out)) return false;
@@ -2845,7 +2874,39 @@ bool native_q8_0_packed_enabled() {
 
 bool native_q8_0_packed_eligible(int n_in, int n_out) {
     if (q8_sm60_on()) return n_in >= 128 && n_in % 32 == 0 && n_out > 0;   // the Pascal kernel takes any of them
+    if (q8_inplace_on() && native_q8_0_inplace_eligible(n_in, n_out)) return true;
     return q8_packed_shape(n_in, n_out);
+}
+
+bool native_q8_0_inplace_enabled() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    return q8_inplace_on();
+#endif
+}
+
+bool native_q8_0_inplace_eligible(int n_in, int n_out) {
+#if defined(__HIPCC__)
+    (void) n_in; (void) n_out;
+    return false;
+#else
+    return n_in >= 128 && n_in % 32 == 0 && n_out >= q8_inplace_min_out() &&
+           q8sm60::smem_bytes(q8sm60::MAX_COLS, n_in) <= q8sm60::device_max_smem();
+#endif
+}
+
+bool native_q8_0_packed_lookup(const void* gguf_weights, const int8_t** qs, const void** d_half,
+                               int* n_in, int* n_out) {
+    auto& reg = q8_packed_registry();
+    if (reg.empty() || !gguf_weights) return false;
+    const auto it = reg.find(gguf_weights);
+    if (it == reg.end()) return false;
+    if (qs) *qs = it->second.qs;
+    if (d_half) *d_half = it->second.d;
+    if (n_in) *n_in = it->second.n_in;
+    if (n_out) *n_out = it->second.n_out;
+    return true;
 }
 
 namespace {
@@ -3528,6 +3589,18 @@ void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (!q8_packed_registry().empty() && q8_packed_registry().count(weights)) {
+        validate_shape(n_in, ncols, 32);
+        if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+        validate_pointer(weights);
+        validate_pointer(x);
+        validate_pointer(scratch_q8_1);
+        validate_pointer(y);
+        validate_stream(stream);
+        native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
+        native_q8_0_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
+        return;
+    }
     small_f32<Q80Block, 8>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
@@ -3687,14 +3760,14 @@ constexpr IlRows kIlRowsShared[] = {   // sm_86 + sm_120, and the fallback for e
 // `mmvq_il_parity --bench --emit-table` on the card (docs/MMVQ_IL_TABLE.md), paste the printed block as a
 // `constexpr IlRows kIlRows_<cc>[]` and add {<cc>, kIlRows_<cc>, sizeof(kIlRows_<cc>) / sizeof(IlRows)} below.  Each choice
 // is bitwise the same output, so a table is only speed.  Without a rebuild: STRATA_MMVQ_IL_ROWS (see il_env_rows).
-// Volta (sm_70): read off mmvq_il_parity --bench on a V100-SXM2-32GB (two runs, mean), the same rule - per cell the
-// rows count whose every measured shape takes at least 3% off native_mmvq's time (e.g. the Q5_K head at 3 columns
-// 1094 -> 821 us, Q6_K 12288 rows 68.9 -> 47.9 us), else 0; unmeasured classes take a neighbour's value (PR 1401)
+// Volta (sm_70): read off mmvq_il_parity --bench on a V100-SXM2-32GB (two runs, mean) and re-verified on a
+// V100-SXM2-16GB (200W/1020MHz, two runs agree; Q3_K added), the same 3% rule. Bitwise equal to native_mmvq.
 constexpr IlRows kIlRows_70[] = {
     {23, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 4, 2, 2, 2}}},   // IQ4_XS
-    {12, {{0, 2, 2, 4, 4}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q4_K
-    {13, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 1, 2, 2, 2}}},   // Q5_K
-    {14, {{0, 1, 1, 1, 1}, {0, 2, 2, 2, 2}, {0, 2, 2, 4, 2}}},   // Q6_K
+    {12, {{0, 2, 4, 4, 4}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q4_K
+    {13, {{0, 2, 2, 4, 2}, {0, 2, 2, 2, 2}, {0, 1, 1, 2, 2}}},   // Q5_K
+    {14, {{0, 1, 1, 1, 2}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q6_K
+    {11, {{0, 1, 2, 2, 2}, {0, 1, 2, 2, 2}, {0, 1, 1, 2, 2}}},   // Q3_K
 };
 // Pascal (sm_60), read off mmvq_il_parity --bench --emit-table on a Tesla P100-PCIE-16GB (three runs, identical
 // tables), the same 3% rule.  Pascal has no dp4a (strata_dp4a: four vmad), so the kernels are compute-bound and more rows a
@@ -3772,6 +3845,14 @@ constexpr IlPf kIlPf_80[] = {
 constexpr IlPf58 kIlPf58_80[] = {   // (rows 4 runs as 2 at 5+ columns, so the emitted 0x34 cells are written 0x32)
     {14, {{0x31, 0x42, 0x32, 0x32, 0x32}, {0x31, 0x31, 0x32, 0x32, 0x32}, {0x31, 0x31, 0x02, 0x32, 0x02}, {0x31, 0x31, 0x31, 0x31, 0x31}}},   // Q6_K
 };
+// Volta (sm_70): V100-SXM2-16GB (200W/1020MHz), mmvq_il_parity --bench --emit-table --pf 0,3,4; cells take pf3/pf4 where
+// it beats both native_mmvq and pf0, else pf0 (0x02). Opt-in via STRATA_MMVQ_IL_PF=1 (+ STRATA_SM70_TABLE=1).
+constexpr IlPf kIlPf_70[] = {
+    {14, {{0x31, 0x32, 0x32, 0x32, 0x32}, {0x31, 0x31, 0x02, 0x02, 0x02}, {0x31, 0x32, 0x41, 0x41, 0x41}}},   // Q6_K
+};
+constexpr IlPf58 kIlPf58_70[] = {
+    {14, {{0x31, 0x32, 0x02, 0x02, 0x02}, {0x31, 0x32, 0x02, 0x02, 0x02}, {0x00, 0x02, 0x02, 0x02, 0x02}, {0x31, 0x31, 0x31, 0x02, 0x02}}},   // Q6_K
+};
 // Turing (sm_75): read off mmvq_il_parity --bench --emit-table on an RTX 2080 Ti 22 GB (SM 1650 MHz), the same 3% rule.
 // The plain multi-column kernels are bound by dp4a throughput on Turing from 2 columns on (IQ4_XS 2560x10240 at 4
 // columns 81.1 -> 37.4 us, the Q5_K head 1671 -> 1045 us); bitwise equal to native_mmvq.  No one-column table here:
@@ -3802,8 +3883,16 @@ constexpr IlRows58 kIlRows58_80[] = {   // CMP 170HX, as kIlRows_80
     {14, {{0, 0, 4, 2, 4}, {0, 0, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 0, 4, 2, 4}}},   // Q6_K
     {11, {{0, 0, 4, 2, 4}, {0, 0, 4, 1, 4}, {0, 0, 1, 1, 1}, {1, 1, 1, 1, 1}}},   // Q3_K
 };
+constexpr IlRows58 kIlRows58_70[] = {   // V100-SXM2-16GB (200W/1020MHz, two runs agree; rows 4 runs as 2 at 5+ cols)
+    {23, {{0, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {1, 2, 2, 2, 2}}},   // IQ4_XS
+    {12, {{0, 1, 2, 2, 2}, {0, 2, 2, 2, 2}, {1, 2, 2, 2, 2}, {1, 2, 2, 2, 2}}},   // Q4_K
+    {13, {{0, 1, 2, 2, 2}, {0, 2, 2, 2, 2}, {1, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q5_K
+    {14, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q6_K
+    {11, {{0, 1, 2, 1, 1}, {1, 2, 2, 2, 2}, {1, 2, 2, 2, 2}, {1, 2, 1, 1, 1}}},   // Q3_K
+};
 struct Il58Arch { int cc; const IlRows58* t; size_t n; };
 constexpr Il58Arch kIl58Arch[] = {
+    {70, kIlRows58_70, sizeof(kIlRows58_70) / sizeof(IlRows58)},
     {80, kIlRows58_80, sizeof(kIlRows58_80) / sizeof(IlRows58)},
     {120, kIlRows58_120, sizeof(kIlRows58_120) / sizeof(IlRows58)},
     {1201, kIlRows58_120, sizeof(kIlRows58_120) / sizeof(IlRows58)},   // a 12.0 card with 80+ SMs (il_cc)
@@ -3829,8 +3918,15 @@ constexpr Il1Rows kIl1Rows_80[] = {   // CMP 170HX, as kIlRows_80
     {13, {0, 0, 0, 4, 1}},   // Q5_K
     {11, {0, 0, 2, 2, 2}},   // Q3_K
 };
+constexpr Il1Rows kIl1Rows_70[] = {   // V100-SXM2-16GB (200W/1020MHz, two runs agree)
+    {23, {1, 0, 4, 1, 1}},   // IQ4_XS
+    {12, {0, 0, 4, 2, 2}},   // Q4_K
+    {13, {0, 0, 4, 4, 4}},   // Q5_K
+    {11, {0, 2, 2, 2, 2}},   // Q3_K
+};
 struct Il1Arch { int cc; const Il1Rows* t; size_t n; };
 constexpr Il1Arch kIl1Arch[] = {
+    {70, kIl1Rows_70, sizeof(kIl1Rows_70) / sizeof(Il1Rows)},
     {80, kIl1Rows_80, sizeof(kIl1Rows_80) / sizeof(Il1Rows)},
     {61, kIl1Rows_61, sizeof(kIl1Rows_61) / sizeof(Il1Rows)},
     {86, kIl1Rows_86, sizeof(kIl1Rows_86) / sizeof(Il1Rows)},
@@ -3953,14 +4049,19 @@ int il_cc() {
 }
 int il_rows(int type, int ncols, int n_out) { return native_mmvq_il_rows_for(il_cc(), type, ncols, n_out); }
 int il_pf_table(int type, int ncols, int n_out) {
-    if (il_cc() != 80 || ncols < 2 || ncols > 8) return 0;   // only the CMP 170HX measured one
+    const int cc = il_cc();
+    if ((cc != 80 && cc != 70) || ncols < 2 || ncols > 8) return 0;   // CMP 170HX (sm_80) and V100 (sm_70)
     const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
     if (ncols <= 4) {
-        for (const IlPf& t : kIlPf_80)
-            if (t.type == type) return t.v[ncols - 2][cls];
+        const IlPf* tbl = cc == 70 ? kIlPf_70 : kIlPf_80;
+        const size_t n = cc == 70 ? sizeof(kIlPf_70) / sizeof(IlPf) : sizeof(kIlPf_80) / sizeof(IlPf);
+        for (size_t i = 0; i < n; ++i)
+            if (tbl[i].type == type) return tbl[i].v[ncols - 2][cls];
     } else {
-        for (const IlPf58& t : kIlPf58_80)
-            if (t.type == type) return t.v[ncols - 5][cls];
+        const IlPf58* tbl = cc == 70 ? kIlPf58_70 : kIlPf58_80;
+        const size_t n = cc == 70 ? sizeof(kIlPf58_70) / sizeof(IlPf58) : sizeof(kIlPf58_80) / sizeof(IlPf58);
+        for (size_t i = 0; i < n; ++i)
+            if (tbl[i].type == type) return tbl[i].v[ncols - 5][cls];
     }
     return 0;
 }

@@ -2152,6 +2152,15 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_halve_kernel(co
 // #1825: the prompt path's thread-per-head scorer (bitwise the warp kernel's scores).  Default: Turing with
 // STRATA_SM75_PERF=1 (the P100 gain measured here is +1..3% at 30-60K tokens, under the 3% bar for a new default);
 // STRATA_SCORES_THREAD=1 turns it on, =0 off, on any CUDA card
+static bool sm70_default_on(int major, int minor) {
+    static const bool perf_on = [] {
+        const char* e = std::getenv("STRATA_SM70_PERF");
+        const char* d = std::getenv("STRATA_DEFAULTS");
+        return (e == nullptr || e[0] != '0') && !(d != nullptr && std::strcmp(d, "026") == 0);
+    }();
+    return strata::cc_of(major, minor) == 70 && perf_on;
+}
+
 bool scores_thread_on() {
     static const int env = [] { const char* v = std::getenv("STRATA_SCORES_THREAD"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     if (env >= 0) return env != 0;
@@ -2162,7 +2171,7 @@ bool scores_thread_on() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
+        ok[dev] = (strata::sm75_default(major, minor) || sm70_default_on(major, minor)) ? 1 : 2;   // Turing / Volta
     }
     return ok[dev] == 1;
 }
@@ -2177,7 +2186,7 @@ bool scores_halve_on() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
+        ok[dev] = (strata::sm75_default(major, minor) || sm70_default_on(major, minor)) ? 1 : 2;   // Turing / Volta
     }
     return ok[dev] == 1;
 }
@@ -2460,7 +2469,7 @@ static bool topk_active_turing_device() {
     if (dev != cached_device) {
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
-        turing = prop.major == 7 && prop.minor == 5;
+        turing = (prop.major == 7 && prop.minor == 5) || sm70_default_on(prop.major, prop.minor);
         cached_device = dev;
     }
     return turing;
@@ -2998,7 +3007,7 @@ bool topk_sample_on() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;
+        ok[dev] = (strata::sm75_default(major, minor) || sm70_default_on(major, minor)) ? 1 : 2;
     }
     return ok[dev] == 1;
 }
@@ -3110,9 +3119,10 @@ static bool scores_dx_device(int& sms) {
     static thread_local int cached_device = -1, cached_sms = 0;
     static thread_local bool pascal = false;
     if (dev != cached_device) {
-        int major = 0;
+        int major = 0, minor = 0;
         pascal = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                 strata::cc_major_of(major) == 6;
+                 cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+                 (strata::cc_major_of(major) == 6 || sm70_default_on(major, minor));
         if (cudaDeviceGetAttribute(&cached_sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) cached_sms = 0;
         cudaGetLastError();
         cached_device = dev;
@@ -3175,9 +3185,10 @@ static int topk_multi_mode() {
     static thread_local int cached_device = -1;
     static thread_local int mode = 0;
     if (dev != cached_device) {
-        int major = 0;
+        int major = 0, minor = 0;
         mode = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                       strata::cc_major_of(major) == 6 ? 2 : 0;
+               cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+               (strata::cc_major_of(major) == 6 || sm70_default_on(major, minor)) ? 2 : 0;
         cudaGetLastError();
         cached_device = dev;
     }

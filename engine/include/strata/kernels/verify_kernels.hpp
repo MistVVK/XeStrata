@@ -220,6 +220,14 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
 /// so).  Graph-capturable.
 uint64_t argmax_rows_scratch_bytes(int n_rows);
 void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream);
+/// Same reduction as argmax_rows, adding `idx_offset` to each winning index and optionally writing each row's winning logit to `out_val`.
+void argmax_rows_val_idx(const float* logits, int n_rows, int n, int idx_offset, void* scratch, float* out_val,
+                         int32_t* out_idx, void* stream);
+/// Merge two half-vocabulary argmax results while preserving lower-index tie breaking (`b > a`).
+void argmax_merge_halves(const float* v0, const int32_t* i0, const float* v1, const int32_t* i1, int n_rows,
+                         int32_t* out, void* stream);
+/// Bitwise OR `src[0..n)` into `dst[0..n)`.
+void or_u32_rows(uint32_t* dst, const uint32_t* src, int n, void* stream);
 /// row_top_prob over 8 blocks a row, each computing 4 of its 32 warps' sums, the row's last block adding the 32 in
 /// order: bitwise row_top_prob.  `scratch`: row_top_prob_scratch_bytes(n_rows), zero before the first launch.
 uint64_t row_top_prob_scratch_bytes(int n_rows);

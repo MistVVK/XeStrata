@@ -19,9 +19,8 @@ bool off(const char* name) {
 }  // namespace
 
 bool adapt_fetch_default_card(int major, int minor, uint64_t vram_bytes) {
-    const int mj = strata::cc_major_of(major);
-    (void) minor;
-    return mj == 12 && vram_bytes > 0 && vram_bytes <= kAdaptFetchMaxVramBytes;
+    const int cc = strata::cc_of(major, minor);
+    return (cc / 10) == 12 && vram_bytes > 0 && vram_bytes <= kAdaptFetchMaxVramBytes;
 }
 
 std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor) {
@@ -34,7 +33,8 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
 
 std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor, bool defaults026, uint64_t main_vram_bytes) {
     std::vector<std::pair<std::string, std::string>> t;
-    const int mj = strata::cc_major_of(major), mn = strata::cc_minor_of(minor);
+    const int cc = strata::cc_of(major, minor);
+    const int mj = cc / 10, mn = cc % 10;
     if (mj == 8 && mn == 6) {
         if (off("STRATA_SM86_PERF")) return t;
         t = {
@@ -65,9 +65,16 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
         if (main_vram_bytes > kAdaptFetchMaxVramBytes) t.push_back({"STRATA_VERIFY_DEVICE_HITS", "1"});
     } else if (mj == 8 && mn == 9) {
         // RTX 40 / Ada Lovelace (compute capability 8.9: RTX 4090 / 4080 / 4070 / RTX 6000 Ada).
+        // #6462 measured the sm_86 bit-exact set (+6%, KL 0.00000) and CPU share 32/6144 (-26% 3K follow-up TTFT) on RTX 4090.
         // STRATA_SM89_PERF=0 and STRATA_DEFAULTS=026 leave it out.
         if (off("STRATA_SM89_PERF") || defaults026) return t;
         t = {
+            {"STRATA_ADAPT_LAG", "2"},
+            {"STRATA_ATTN_DAILY", "1"},
+            {"STRATA_GR_UP75", "1"},
+            {"STRATA_GU_SWIGLU", "1"},
+            {"STRATA_QSA_ROWS", "1"},
+            {"STRATA_B6_MMVQ_ROWS", "1"},
             {"STRATA_HC_UPMIX", "1"},
             {"STRATA_L2_PF", "1"},
             {"STRATA_Q80_ROWS1", "1"},
@@ -80,6 +87,7 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_PLE_COPY_STREAM", "1"},
             {"STRATA_PF_FUSED_KQ", "1"},
             {"STRATA_PREFILL_CPU_SHARE_NT", "32"},
+            {"STRATA_PREFILL_CPU_SHARE_MAX", "6144"},
         };
         if (main_vram_bytes > kAdaptFetchMaxVramBytes) t.push_back({"STRATA_VERIFY_DEVICE_HITS", "1"});
     } else if (mj == 12 && mn == 0) {
@@ -90,10 +98,8 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             // 31,817 tokens) against the baseline of the released engine; STRATA_HC_UPMIX_CHECK on an 8K prompt: mixed rel RMS 0, max |diff| 0 (the fused kernel is the default pair's bits).
             // STRATA_HC_UPMIX=0 is the way back.  (phaseA-tests/bw/RESULTS-BW-A.md)
             {"STRATA_HC_UPMIX", "1"},
-            // BW-G (RTX 5090, UD-Q4_K_XL, DFlash2 spec 6, tail skip OFF, paired rounds; phaseA-tests/bw/RESULTS-BW-C.md, RESULTS-BW-G.md): three more bit-exact decode switches, each alone and the three
-            // together BASE-05 27 of 27 identical to the released engine's baseline, the three together decode +2.0% (20 of 25 paired rounds up), window -2.9%.  Each has =0 as the way back.
-            // the next layer's dense weights prefetched into L2 while the window waits for the CPU experts (doorbell graph only; the all-resident graph never runs it)
-            {"STRATA_L2_PF", "1"},
+            // #6431: STRATA_L2_PF=1 stays opt-in on sm_120 (regressed NVFP4 batch decode on 2x RTX 5090, IQ3_S on 4x RTX 5080,
+            // and 1x RTX 5090 IQ3_S by 8-12% when enabled by default).
             // the one-row-per-block Q8_0 dense kernel (each row keeps its own partial sums: the two-row kernel's bits)
             {"STRATA_Q80_ROWS1", "1"},
             // the grouped native experts' mode-8 layout (the GB10 / P100 / P40 default; exact against the CUDA layout on UD-Q4_K_XL)
@@ -116,6 +122,34 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
         // (the engine turns it off, with a line, for a layer split, helper cards, --batch and the other cases of the DETAILS.md row).  STRATA_ADAPT_FETCH=0 is the way back.
         if (adapt_fetch_default_card(major, minor, main_vram_bytes)) t.push_back({"STRATA_ADAPT_FETCH", "2"});
         else if (main_vram_bytes > kAdaptFetchMaxVramBytes) t.push_back({"STRATA_VERIFY_DEVICE_HITS", "1"});
+    } else if (mj == 7 && mn == 0) {
+        // Volta (Tesla V100 / Titan V / Quadro GV100, sm_70): 21 validated bit-exact switches measured on locked-clock
+        // dual V100-SXM2-16GB (200 W / 1020 MHz and 300 W / 1530 MHz SM / 877 MHz MEM; identical sha and needle checks).
+        // STRATA_SM70_PERF=0 and STRATA_DEFAULTS=026 leave the table out.
+        if (off("STRATA_SM70_PERF") || defaults026) return t;
+        t = {
+            {"STRATA_ADAPT_OVERLAP", "1"},
+            {"STRATA_SM70_TABLE", "1"},
+            {"STRATA_B6_MMVQ_ROWS", "1"},
+            {"STRATA_TSUM", "1"},
+            {"STRATA_SMALL_UNR", "3"},
+            {"STRATA_GR_NORM_FAST", "1"},
+            {"STRATA_SIDE_MIXER", "2"},
+            {"STRATA_ARGMAX_ROWS_SM70", "1"},
+            {"STRATA_LFUSE", "1"},
+            {"STRATA_GDN_SPLIT", "1"},
+            {"STRATA_SH_STREAM", "1"},
+            {"STRATA_Q80_ROWS1", "1"},
+            {"STRATA_NO_MMVQ_ROWS2", "1"},
+            {"STRATA_CPU_IQ_ALL_EXACT1", "1"},
+            {"STRATA_GR_Q8_DOWN_MODE", "2"},
+            {"STRATA_GR_Q8_UP_COLS", "16"},
+            {"STRATA_GR_Q8_UP_MODE", "2"},
+            {"STRATA_SCORES_HALVE", "1"},
+            {"STRATA_SCORES_THREAD", "1"},
+            {"STRATA_TOPK_SAMPLE", "1"},
+            {"STRATA_SELECT_LONG", "1"},
+        };
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;
         t = {
@@ -175,7 +209,8 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
 }
 
 std::vector<std::string> apply_nv_defaults(int major, int minor, uint64_t main_vram_bytes) {
-    const int mj = strata::cc_major_of(major), mn = strata::cc_minor_of(minor);
+    const int cc = strata::cc_of(major, minor);
+    const int mj = cc / 10, mn = cc % 10;
     std::vector<std::string> set;
     bool fetch_set = false;
     for (const auto& kv : nv_default_env(major, minor, strata::qwen_defaults_026(), main_vram_bytes)) {
@@ -193,14 +228,15 @@ std::vector<std::string> apply_nv_defaults(int major, int minor, uint64_t main_v
         const bool sm86 = mj == 8 && mn == 6;
         const bool sm89 = mj == 8 && mn == 9;
         const bool sm121 = mj == 12 && mn == 1;
-        // sm_86 / sm_89 / sm_60: bit-exact switches.  sm_121: the fused prompt path and the FP4-activation NVFP4 prompt round differently from the
+        // sm_86 / sm_89 / sm_70 / sm_60: bit-exact switches.  sm_121: the fused prompt path and the FP4-activation NVFP4 prompt round differently from the
         // paths they replace (24 of 24 greedy answers were identical on the Spark; no KL run), so the line does not say "exact".
         const bool sm120 = mj == 12 && mn == 0;
+        const bool sm70 = mj == 7 && mn == 0;
         // ADAPT_FETCH (a card of 16 GiB or less) is not bit-exact either: the line then says so and names its own way back
         std::fprintf(stderr, "strata: %s: %zu %sspeed switches on by default (%s=0 turns them off%s; a switch you set is kept%s): ",
-                     sm86 ? "sm_86 (Ampere)" : sm89 ? "sm_89 (Ada)" : sm121 ? "sm_121 (GB10)" : sm120 ? "sm_120 (Blackwell)" : "sm_60 (Pascal)", set.size(), sm121 || fetch_set ? "" : "exact ",
-                     sm86 ? "STRATA_SM86_PERF" : sm89 ? "STRATA_SM89_PERF" : sm121 ? "STRATA_SM121_PERF" : sm120 ? "STRATA_SM120_PERF" : "STRATA_SM60_PERF",
-                     sm89 || sm121 || sm120 ? ", as does STRATA_DEFAULTS=026" : "",
+                     sm86 ? "sm_86 (Ampere)" : sm89 ? "sm_89 (Ada)" : sm121 ? "sm_121 (GB10)" : sm120 ? "sm_120 (Blackwell)" : sm70 ? "sm_70 (Volta)" : "sm_60 (Pascal)", set.size(), sm121 || fetch_set ? "" : "exact ",
+                     sm86 ? "STRATA_SM86_PERF" : sm89 ? "STRATA_SM89_PERF" : sm121 ? "STRATA_SM121_PERF" : sm120 ? "STRATA_SM120_PERF" : sm70 ? "STRATA_SM70_PERF" : "STRATA_SM60_PERF",
+                     sm89 || sm121 || sm120 || sm70 ? ", as does STRATA_DEFAULTS=026" : "",
                      fetch_set ? "; ADAPT_FETCH is on because this card has 16 GiB of memory or less, it does not give bit-for-bit the same text, STRATA_ADAPT_FETCH=0 turns it off" : "");
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");
@@ -215,7 +251,7 @@ std::vector<std::pair<std::string, std::string>> nv_kq_default_env(int min_major
 std::vector<std::pair<std::string, std::string>> nv_kq_default_env(int min_major, int min_minor, bool defaults026) {
     std::vector<std::pair<std::string, std::string>> t;
     if (defaults026) return t;
-    if (strata::cc_major_of(min_major) < 8) return t;   // Volta / Turing / Pascal: not measured, keep the FP16 prompt path
+    if (strata::cc_of(min_major, min_minor) / 10 < 8) return t;   // Volta / Turing / Pascal: not measured, keep the FP16 prompt path
     const char* sw = std::getenv("STRATA_NV_KQ_DEFAULT");
     if (sw != nullptr && sw[0] == '0') return t;
     if (!kNvKqDefaultOn && !(sw != nullptr && sw[0] == '1')) return t;
@@ -277,7 +313,8 @@ std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor, bool 
 }
 
 void apply_spec_adapt_default(int major, int minor) {
-    const int mj = strata::cc_major_of(major), mn = strata::cc_minor_of(minor);
+    const int cc = strata::cc_of(major, minor);
+    const int mj = cc / 10, mn = cc % 10;
     // sm_86 only: the P100 (sm_60) gained 4-16% on JSON/code/chat/tool calls but lost 3% on the 4K agent transcript (5/5 pairs), so there it stays opt-in
     // Owner round 9 (2026-10-22): on the z440 A4000s the 5-pair A/B against 0.2.2 was 0.995 (code 0.996, json 1.019, tool 0.973,
     // agent 0.991) and the 3060 was length-confounded, so the earlier +9..17% did not reproduce: opt-in (STRATA_SPEC_ADAPT_SM86=1)

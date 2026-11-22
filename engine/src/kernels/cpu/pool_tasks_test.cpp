@@ -116,6 +116,47 @@ int main(int argc, char** argv) {
                     ++checks;
                 }
             }
+        // STRATA_L3_PF's static row slices, alone and with a prefetch still reading when the batch is published
+        // (the batch stops it), give the reference bits
+        {
+            const int ne = 64;
+            std::vector<uint16_t> router((size_t) ne * cpu::H);
+            for (size_t i = 0; i < router.size(); ++i) router[i] = (uint16_t) (0x3c00u + (uint16_t) ((i * 2654435761u) >> 24));
+            std::vector<int32_t> res(ne, -1);
+            for (int e = 0; e < ne; e += 3) res[(size_t) e] = 0;
+            std::vector<float> px(2 * (size_t) cpu::H);
+            for (size_t i = 0; i < px.size(); ++i) px[i] = std::cos((float) i * 0.017f);
+            for (bool host : {false, true}) for (int workers : {2, 3, 5}) for (bool pf : {false, true}) {
+                if (pf && !cpu::cpu_avx2_ok()) continue;
+                cpu::ExpertPool pool(workers, false, host);
+                pool.set_static_slices(true);
+                if (!pool.static_slices()) return 1;
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    std::fill(out.begin(), out.end(), 0.0f);
+                    for (const auto& job : jobs) for (int t = 0; t < job.nt; ++t)
+                        std::fill(job.out[t], job.out[t] + cpu::H, std::numeric_limits<float>::quiet_NaN());
+                    if (pf) {
+                        cpu::ExpertPool::L3Prefetch q;
+                        q.router = router.data();
+                        q.n_embd = cpu::H;
+                        q.n_expert = ne;
+                        q.nt = 2;
+                        q.k = 10;
+                        q.top = 4;
+                        q.fmt = f;
+                        q.blob = [&](int) { return (const uint8_t*) blob.data(); };
+                        pool.prefetch_next(q, px.data(), res.data());
+                    }
+                    pool.run_split_multi_native(f, jobs.data(), n);
+                    if (std::memcmp(ref.data(), out.data(), out.size() * sizeof(float)) != 0) {
+                        std::fprintf(stderr, "static-slice mismatch n=%d workers=%d host=%d prefetch=%d repeat=%d\n",
+                                     n, workers, host, pf, repeat);
+                        return 1;
+                    }
+                    ++checks;
+                }
+            }
+        }
         // STRATA_NUMA_SPLIT=test: two slices without a real second node (thread j -> slice j % 2), every worker
         // sleeping between batches (spin 0) so the late-wake path of issue #29 runs constantly
         put_env("STRATA_NUMA_SPLIT", "test");

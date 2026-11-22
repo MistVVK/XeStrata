@@ -895,8 +895,8 @@ struct ArgRow {
 };
 
 // grid (blocks, rows): block b scans [b * per_block, +per_block) of its row
-__global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int per_block, ArgRow* __restrict__ rows,
-                                   int32_t* out) {
+__global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int per_block, int idx_offset,
+                                   ArgRow* __restrict__ rows, float* __restrict__ out_val, int32_t* out) {
     const int row = (int) blockIdx.y, b = (int) blockIdx.x, nb = (int) gridDim.x;
     unsigned* counter = &rows[row].counter;
     float* pv = rows[row].v;
@@ -928,9 +928,21 @@ __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int 
     }
     arg_block(bv, bi, n);
     if (threadIdx.x == 0) {
-        out[row] = bi < n ? bi : 0;   // no value above -inf: 0, as the one-block kernel
+        if (out_val != nullptr) out_val[row] = bv;
+        out[row] = bi < n ? (bi + idx_offset) : idx_offset;   // no value above -inf: first index in slice
         *counter = 0;
     }
+}
+
+__global__ void argmax_merge_halves_kernel(const float* __restrict__ v0, const int32_t* __restrict__ i0,
+                                           const float* __restrict__ v1, const int32_t* __restrict__ i1,
+                                           int n_rows, int32_t* __restrict__ out) {
+    const int r = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (r >= n_rows) return;
+    const float a = v0[r], b = v1[r];
+    const float ninf = __int_as_float(0xff800000);
+    if (!(a > ninf) && !(b > ninf)) { out[r] = 0; return; }
+    out[r] = (b > a) ? i1[r] : i0[r];
 }
 
 // a row's top-probability scratch: its counter, then its 32 warps' sums
@@ -975,8 +987,27 @@ void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t*
     const int nb = std::min(kArgMaxBlocks, std::max(1, (n + 4095) / 4096));
     const int per_block = (n + nb - 1) / nb;
     argmax_rows_kernel<<<dim3((unsigned) nb, (unsigned) n_rows), kArgThreads, 0, (cudaStream_t) stream>>>(
-        logits, n, per_block, (ArgRow*) scratch, out);
+        logits, n, per_block, 0, (ArgRow*) scratch, nullptr, out);
     check("argmax_rows");
+}
+
+void argmax_rows_val_idx(const float* logits, int n_rows, int n, int idx_offset, void* scratch, float* out_val,
+                         int32_t* out_idx, void* stream) {
+    if (n_rows <= 0 || n <= 0) return;
+    const int nb = std::min(kArgMaxBlocks, std::max(1, (n + 4095) / 4096));
+    const int per_block = (n + nb - 1) / nb;
+    argmax_rows_kernel<<<dim3((unsigned) nb, (unsigned) n_rows), kArgThreads, 0, (cudaStream_t) stream>>>(
+        logits, n, per_block, idx_offset, (ArgRow*) scratch, out_val, out_idx);
+    check("argmax_rows_val_idx");
+}
+
+void argmax_merge_halves(const float* v0, const int32_t* i0, const float* v1, const int32_t* i1, int n_rows,
+                         int32_t* out, void* stream) {
+    if (n_rows <= 0) return;
+    const int blocks = (n_rows + 255) / 256;
+    argmax_merge_halves_kernel<<<dim3((unsigned) blocks), 256, 0, (cudaStream_t) stream>>>(
+        v0, i0, v1, i1, n_rows, out);
+    check("argmax_merge_halves");
 }
 
 uint64_t row_top_prob_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(TopRow); }
@@ -992,6 +1023,14 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
 uint64_t argmax_rows_scratch_bytes(int) { return 0; }
 void argmax_rows(const float*, int, int, void*, int32_t*, void*) {
     std::fprintf(stderr, "argmax_rows: not built for this backend\n");
+    std::exit(1);
+}
+void argmax_rows_val_idx(const float*, int, int, int, void*, float*, int32_t*, void*) {
+    std::fprintf(stderr, "argmax_rows_val_idx: not built for this backend\n");
+    std::exit(1);
+}
+void argmax_merge_halves(const float*, const int32_t*, const float*, const int32_t*, int, int32_t*, void*) {
+    std::fprintf(stderr, "argmax_merge_halves: not built for this backend\n");
     std::exit(1);
 }
 uint64_t row_top_prob_scratch_bytes(int) { return 0; }
@@ -1022,6 +1061,20 @@ void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* fla
     logits_nonfinite_kernel<<<dim3((unsigned) kNonfiniteBlocks, (unsigned) n_rows), 256, 0, (cudaStream_t) stream>>>(
         logits, n, per_block, flags);
     check("logits_nonfinite_rows");
+}
+
+namespace {
+__global__ void or_u32_rows_kernel(uint32_t* __restrict__ dst, const uint32_t* __restrict__ src, int n) {
+    const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) dst[i] |= src[i];
+}
+}  // namespace
+
+void or_u32_rows(uint32_t* dst, const uint32_t* src, int n, void* stream) {
+    if (n <= 0) return;
+    const int blocks = (n + 255) / 256;
+    or_u32_rows_kernel<<<dim3((unsigned) blocks), 256, 0, (cudaStream_t) stream>>>(dst, src, n);
+    check("or_u32_rows");
 }
 
 bool multi_block_head_ops() {

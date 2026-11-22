@@ -438,6 +438,20 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         vram_ += bytes;
         hw = dhead_;
         head_rows = (int64_t) vocab.size();
+    } else if (!vocab.empty() && head->is_split()) {
+        const size_t bytes = (size_t) ((int64_t) vocab.size() * row_bytes);
+        if (cudaMalloc((void**) &dhead_, bytes) != cudaSuccess) {
+            err = "dflash2: the draft vocabulary's head rows do not fit";
+            return false;
+        }
+        if (!head->gather_rows(vocab.data(), (int64_t) vocab.size(), device_, dhead_, err)) {
+            cudaFree(dhead_);
+            dhead_ = nullptr;
+            return false;
+        }
+        vram_ += bytes;
+        hw = dhead_;
+        head_rows = (int64_t) vocab.size();
     } else if (!vocab.empty()) {
         int32_t* dv = nullptr;
         if (cudaMalloc((void**) &dv, vocab.size() * 4) != cudaSuccess || cudaMalloc((void**) &dhead_, (size_t) ((int64_t) vocab.size() * row_bytes)) != cudaSuccess) {

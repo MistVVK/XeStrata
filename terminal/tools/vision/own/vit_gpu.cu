@@ -78,6 +78,7 @@ struct DevW {            // a weight matrix [rows = out][cols = in] on the devic
     void* p = nullptr;
     Kind kind = K_BF16;
     int rows = 0, cols = 0;
+    bool is_q8 = false;  // #6470: stored as raw Q8_0 blocks (34 bytes per 32 weights), dequantized into d_q8_f16 before GEMM
 };
 
 struct DevLayer {
@@ -418,6 +419,20 @@ __global__ void k_add_bias(float* __restrict__ y, const float* __restrict__ bias
     for (int i = threadIdx.x; i < n; i += blockDim.x) y[base + i] += bias[i];
 }
 
+// #6470: Q8_0 block (34 bytes: IEEE fp16 scale d + 32 int8_t qs) -> 32 F16 values.
+__global__ void k_dequant_q8_0_f16(const uint8_t* __restrict__ src, uint16_t* __restrict__ dst, size_t n_blocks) {
+    const size_t total = n_blocks * 32;
+    for (size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t) gridDim.x * blockDim.x) {
+        const size_t b = idx >> 5;
+        const int j = (int) (idx & 31);
+        const uint8_t* p = src + b * 34;
+        const uint16_t h = (uint16_t) ((uint16_t) p[0] | ((uint16_t) p[1] << 8));
+        const float d = __half2float(__ushort_as_half(h));
+        const int8_t q = (int8_t) p[2 + j];
+        dst[idx] = f_to_f16bits(d * (float) q);
+    }
+}
+
 // ---- host side ----
 uint16_t host_f32_to_bf16(float f) {
     uint32_t u;
@@ -448,6 +463,9 @@ struct VitGpuImpl {
     float *patch_w = nullptr, *patch_b = nullptr, *pos = nullptr, *post_w = nullptr, *post_b = nullptr, *mm0_b = nullptr, *mm2_b = nullptr;
     DevW mm0, mm2;
     std::vector<DevLayer> layers;
+    bool q8_expand = false;           // STRATA_VIT_Q8_EXPAND=1: opt out of compact Q8_0 weight storage (#6470)
+    uint16_t* d_q8_f16 = nullptr;     // shared F16 dequant scratch for compact Q8_0 weight matrices (#6470)
+    size_t q8_scratch_elems = 0;
 
     int cap_patches = 0;
     // Work buffers, sized for cap_patches patches N (D = width).  The GPU memory is what a reader costs next to the engine, so the matrix products run in
@@ -720,7 +738,19 @@ struct VitGpuImpl {
             raw.resize(n * 2);
             if (!gg.read_raw(*t, raw.data(), err)) return false;
             w.kind = t->type == GT_F16 ? K_F16 : K_BF16;
-        } else {                                                 // F32 -> BF16, Q8_0 -> F16
+        } else if (t->type == GT_Q8_0 && !q8_expand && (n % 32 == 0) && t->nbytes == (n / 32) * 34) {
+            // #6470: keep Q8_0 matrices compact in VRAM (~1.06 B/elem instead of 2 B/elem F16) and dequantize into d_q8_f16 before GEMM.
+            raw.resize((size_t) t->nbytes);
+            if (!gg.read_raw(*t, raw.data(), err)) return false;
+            w.kind = K_F16;
+            w.is_q8 = true;
+            uint8_t* dev = nullptr;
+            if (!alloc(dev, raw.size(), err, true)) return false;
+            w.p = dev;
+            if (cudaMemcpy(w.p, raw.data(), raw.size(), cudaMemcpyHostToDevice) != cudaSuccess) { err = "GPU copy failed"; return false; }
+            if (n > q8_scratch_elems) q8_scratch_elems = n;
+            return true;
+        } else {                                                 // F32 -> BF16, Q8_0 (when expanded) -> F16
             std::vector<float> f(n);
             if (!gg.read_f32(*t, f.data(), err)) return false;
             raw.resize(n * 2);
@@ -747,14 +777,22 @@ struct VitGpuImpl {
     // y[M][N] (float32) = A[M][K] (kind of w) * w^T
     bool gemm(const DevW& w, const void* A, int M, void* y, cudaDataType_t kind_a, std::string& err) {
         const float alpha = 1.0f, beta = 0.0f;
+        const void* wp = w.p;
+        if (w.is_q8) {
+            const size_t n = (size_t) w.rows * (size_t) w.cols;
+            k_dequant_q8_0_f16<<<blocks_for(n), 256>>>((const uint8_t*) w.p, d_q8_f16, n / 32);
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) { err = std::string("the Q8_0 weight dequantization failed: ") + cudaGetErrorString(e); return false; }
+            wp = d_q8_f16;
+        }
         bool done = false;
 #if defined(STRATA_VIT_HIPBLASLT)
         if (lt_weights && kind_a != CUDA_R_32F)
-            done = lt_mm(true, false, w.rows, M, w.cols, w.p, kind_a, w.cols, 0, A, kind_a, w.cols, 0, y, CUDA_R_32F, w.rows, 0, 1, lt_sol);
+            done = lt_mm(true, false, w.rows, M, w.cols, wp, kind_a, w.cols, 0, A, kind_a, w.cols, 0, y, CUDA_R_32F, w.rows, 0, 1, lt_sol);
 #endif
 #if defined(STRATA_VIT_HIP)
         if (!done && hpa16 && kind_a != CUDA_R_32F && (size_t) M * w.rows <= y16_elems) {
-            const cublasStatus_t s = cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, M, w.cols, &alpha, w.p, kind_a, w.cols, A, kind_a, w.cols, &beta, d_y16,
+            const cublasStatus_t s = cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, M, w.cols, &alpha, wp, kind_a, w.cols, A, kind_a, w.cols, &beta, d_y16,
                                                   kind_a, w.rows, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
             if (s != CUBLAS_STATUS_SUCCESS) { err = "the BLAS matrix product failed (status " + std::to_string((int) s) + ")"; return false; }
             const size_t cnt = (size_t) M * w.rows;
@@ -763,7 +801,7 @@ struct VitGpuImpl {
         }
 #endif
         if (!done) {
-            const cublasStatus_t s = cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, M, w.cols, &alpha, w.p, kind_a, w.cols, A, kind_a, w.cols, &beta, y,
+            const cublasStatus_t s = cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, M, w.cols, &alpha, wp, kind_a, w.cols, A, kind_a, w.cols, &beta, y,
                                                   CUDA_R_32F, w.rows, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
             if (s != CUBLAS_STATUS_SUCCESS) { err = "the BLAS matrix product failed (status " + std::to_string((int) s) + ")"; return false; }
         }
@@ -912,6 +950,7 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     }
 #endif
     m.bf16_mode = vit_gpu_bf16_mode(std::getenv("STRATA_VIT_BF16_AS_F16"), m.bf16_mode);
+    if (const char* e = std::getenv("STRATA_VIT_Q8_EXPAND")) m.q8_expand = std::atoi(e) != 0;
     m.trace = std::getenv("STRATA_TRACE") != nullptr;
     {
         const cudaError_t se = set_device_retrying(device);
@@ -970,6 +1009,7 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
             !m.upload_matrix(L.down, gg, p + "ffn_down.weight", err) || !m.upload_f32(L.down_b, gg, p + "ffn_down.bias", err))
             return false;
     }
+    if (m.q8_scratch_elems > 0 && !m.alloc(m.d_q8_f16, m.q8_scratch_elems, err, true)) return false;
     m.n_weight_allocs = m.allocs.size();
     if (m.trace && !m.f16_notes.empty()) {
         for (const VitGpuImpl::F16Note& f : m.f16_notes)

@@ -6483,7 +6483,7 @@ I8Volta i8_volta() {
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
         cudaDeviceGetAttribute(&sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
         if (cudaDeviceGetAttribute(&res, cudaDevAttrReservedSharedMemoryPerBlock, dev) != cudaSuccess) { cudaGetLastError(); res = 0; }
-        per[dev] = {strata::cc_major_of(major) == 7 && strata::cc_minor_of(minor) == 0 && sm > 0, (size_t) sm, (size_t) res};
+        per[dev] = {strata::cc_of(major, minor) == 70 && sm > 0, (size_t) sm, (size_t) res};
     }
     return per[dev];
 #endif
