@@ -15,6 +15,9 @@
 #include "s26_tsum.cuh"
 
 #include <cuda_fp16.h>
+#if !defined(__HIPCC__)
+#include <cuda_bf16.h>
+#endif
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -255,13 +258,14 @@ struct GrMulti {
 // d = amax / 127, roundf(x / d), ds = (d, sum) - the bytes the separate launch writes.
 struct GrQ81 { half2 ds; int8_t qs[32]; };
 static_assert(2 * 16 == 32, "two up blocks per q8_1 group");
-__device__ __forceinline__ void gr_q8_tail(const GrMulti& m, int d0) {
+template <int BLOCKS_PER_Q8 = 2>
+__device__ __forceinline__ void gr_q8_tail_n(const GrMulti& m, int d0) {
     __shared__ int last;
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
         unsigned* c = m.a[0].q8_cnt + d0 / 32;
-        last = atomicAdd(c, 1u) == 1u;
+        last = atomicAdd(c, 1u) == (unsigned) (BLOCKS_PER_Q8 - 1);
         if (last) atomicExch(c, 0u);
     }
     __syncthreads();
@@ -282,6 +286,7 @@ __device__ __forceinline__ void gr_q8_tail(const GrMulti& m, int d0) {
     y->qs[lane] = q;
     if (lane == 0) y->ds = q8_1_ds(d, sum);   // #606: clamped scale/sum - an unclamped pair NaN-poisons the dot path
 }
+__device__ __forceinline__ void gr_q8_tail(const GrMulti& m, int d0) { gr_q8_tail_n<2>(m, d0); }
 // Step 1 of `gr_down_kernel`, one block per token, same threads and reduction order: rs[t] and xn[t] to global.
 __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
     __shared__ float part[WARPS][HC];
@@ -2621,26 +2626,48 @@ __device__ __forceinline__ void gr_mma_s8_m16n8k32(int32_t (&d)[4], uint32_t a0,
         : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
+
+__device__ __forceinline__ void gr_mma_bf16_m16n8k16(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                     uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t gr_f32x2_to_bf16x2(float f0, float f1) {
+    uint32_t out;
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(out) : "f"(f0), "f"(f1));
+    return out;
+}
+
+__device__ __forceinline__ uint32_t gr_i8x2_to_bf16x2(int8_t v0, int8_t v1) {
+    return gr_f32x2_to_bf16x2((float) v0, (float) v1);
+}
 #endif
 
+// Clean-room MIT sm_80+ BF16 Tensor Core Q8_0 hyper-connection read (STRATA_HC_Q8_BF16TC, default ON on sm_80+ CUDA
+// when STRATA_HC_Q8=1; =0 disables). Every int8 weight in [-128..127] is bit-exact in BF16 (8-bit significand), and
+// BF16 activations preserve full FP32 exponent range (zero outlier clipping on R*w_norm and 320-dim SiLU(lo)).
+// Coalesced warp-wide weight loads into smem + mma.m16n8k16.f32.bf16.bf16.f32 across all T<=8 tokens simultaneously.
 template <int T>
-__global__ void __launch_bounds__(THREADS) gr_down_q8_tc_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
+__global__ void __launch_bounds__(THREADS) gr_down_q8_bf16tc_kernel(GrMulti m, float* __restrict__ part,
+                                                                    float* __restrict__ ssg) {
 #if STRATA_GR_Q8_TC_SM80
     constexpr int NB = Q8_KC / 32;            // 20 Q8_0 blocks for Flash-Next (640 cols)
-    constexpr int ROW_BYTES = NB * Q8B;       // 680 bytes per row chunk (multiple of 4!)
+    constexpr int ROW_BYTES = NB * Q8B;       // 680 bytes per row chunk (multiple of 4)
     constexpr int ROW_U32 = ROW_BYTES / 4;    // 170 uint32s per row chunk
     constexpr int TC_RG = LR / 32;            // 10 row groups of 32 rows (+1 inject group)
-    __shared__ alignas(16) int8_t xs_q[8][Q8_KC];        //  5,120 B
-    __shared__ float xs_d[8][NB];                        //    640 B
-    __shared__ float red_b[8][NB];                       //    640 B (deterministic, zero-spill ssp per block)
-    __shared__ alignas(16) uint32_t s_w[16][ROW_U32];    // 10,880 B (16 rows x 680 B, 100% coalesced load!)
-    __shared__ float p_acc[WARPS][8][16];                //  4,096 B (total ~21 KB -> 4+ CTAs/SM!)
+    __shared__ alignas(16) uint16_t xs_bf[8][Q8_KC];     // 10,240 B (BF16 activations, full FP32 exponent range)
+    __shared__ float red_b[8][NB];                       //    640 B (deterministic ssp per block)
+    __shared__ alignas(16) uint32_t s_w[16][ROW_U32];    // 10,880 B (16 rows x 680 B, 100% coalesced load)
+    __shared__ float p_acc[WARPS][8][16];                //  4,096 B (total ~26 KB -> 3-4 CTAs/SM!)
 
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int rg = blockIdx.x, kc = blockIdx.y, c = kc / Q8_CPS;
     const bool inj = (rg == TC_RG);
 
-    // All 8 warps (256 threads) cooperatively load R (+ pending write) * w_norm, accumulate ssp, and quantize into xs_q/xs_d.
     for (int kb = warp; kb < T * NB; kb += WARPS) {
         const int k = kb / NB;
         const int b = kb - k * NB;
@@ -2654,15 +2681,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_q8_tc_kernel(GrMulti m, float
         const float ss_blk = warp_sum(r * r);
         if (rg == 0 && lane == 0) red_b[k][b] = ss_blk;
         const float xv = r * a.w_norm[col];
-        float amax = fabsf(xv);
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-        const float dx = amax * (1.0f / 127.0f);
-        const float inv = dx > 0.0f ? (1.0f / dx) : 0.0f;
-        int qv = dx > 0.0f ? __float2int_rn(xv * inv) : 0;
-        qv = max(-127, min(127, qv));
-        xs_q[k][b * 32 + lane] = (int8_t) qv;
-        if (lane == 0) xs_d[k][b] = dx;
+        xs_bf[k][b * 32 + lane] = __bfloat16_as_ushort(__float2bfloat16_rn(xv));
     }
     __syncthreads();
     if (rg == 0 && t < T) {
@@ -2685,16 +2704,22 @@ __global__ void __launch_bounds__(THREADS) gr_down_q8_tc_kernel(GrMulti m, float
             for (int b = 0; b < NB; ++b) {
                 const float wv = __uint_as_float((uint32_t) wr[b * 32 + lane] << 16);
 #pragma unroll
-                for (int k = 0; k < T; ++k) acc[k] = fmaf(wv * xs_d[k][b], (float) xs_q[k][b * 32 + lane], acc[k]);
+                for (int k = 0; k < T; ++k) {
+                    const float xv = __uint_as_float((uint32_t) xs_bf[k][b * 32 + lane] << 16);
+                    acc[k] = fmaf(wv, xv, acc[k]);
+                }
             }
         } else {
             const uint8_t* wr = m.a[0].q8_inject + (size_t) r * (D / 32) * Q8B + (size_t) kc * ROW_BYTES;
             for (int b = 0; b < NB; ++b) {
                 const uint8_t* blk = wr + b * Q8B;
                 const float dw = q8_half(q8_ld16(blk));
-                const int wq = (int) (int8_t) blk[2 + lane];
+                const float wv = dw * (float) (int8_t) blk[2 + lane];
 #pragma unroll
-                for (int k = 0; k < T; ++k) acc[k] = fmaf(dw * xs_d[k][b], (float) (wq * (int) xs_q[k][b * 32 + lane]), acc[k]);
+                for (int k = 0; k < T; ++k) {
+                    const float xv = __uint_as_float((uint32_t) xs_bf[k][b * 32 + lane] << 16);
+                    acc[k] = fmaf(wv, xv, acc[k]);
+                }
             }
         }
 #pragma unroll
@@ -2705,23 +2730,18 @@ __global__ void __launch_bounds__(THREADS) gr_down_q8_tc_kernel(GrMulti m, float
         return;
     }
 
-    // 32 output rows in 2 passes of 16 rows: each pass loads 16 rows x 680 B COALESCED (1 warp per row, 100% 128B hits)
-    // into s_w[16][170], then all 8 warps split the NB=20 Q8_0 blocks across 8 warps (2-3 MMAs per warp!).
     const int g = lane >> 2;
     const int tig = lane & 3;
     const int t0 = 2 * tig;
     const int t1 = t0 + 1;
     const size_t row_stride = (size_t) (D / 32) * Q8B;
     const uint8_t* base_w = m.a[0].q8_down + (size_t) kc * ROW_BYTES;
-
-    // Static balanced split of NB blocks across WARPS=8 warps:
     const int b_start = (warp * NB) / WARPS;
     const int b_end = ((warp + 1) * NB) / WARPS;
 
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
         const int r_base = rg * 32 + half * 16;
-        // 8 warps load 16 rows (2 rows per warp), all 32 lanes contiguous along each 680-byte row!
 #pragma unroll
         for (int rr = 0; rr < 2; ++rr) {
             const int lr = warp * 2 + rr;
@@ -2742,24 +2762,24 @@ __global__ void __launch_bounds__(THREADS) gr_down_q8_tc_kernel(GrMulti m, float
             const uint8_t* blk1 = w1 + b * Q8B;
             const float dw0 = q8_half(q8_ld16(blk0));
             const float dw1 = q8_half(q8_ld16(blk1));
-            const uint32_t a0 = q8_ld16(blk0 + 2 + tig * 4) | (q8_ld16(blk0 + 4 + tig * 4) << 16);
-            const uint32_t a2 = q8_ld16(blk0 + 18 + tig * 4) | (q8_ld16(blk0 + 20 + tig * 4) << 16);
-            const uint32_t a1 = q8_ld16(blk1 + 2 + tig * 4) | (q8_ld16(blk1 + 4 + tig * 4) << 16);
-            const uint32_t a3 = q8_ld16(blk1 + 18 + tig * 4) | (q8_ld16(blk1 + 20 + tig * 4) << 16);
-            const uint32_t b0 = (g < T) ? *reinterpret_cast<const uint32_t*>(&xs_q[g][b * 32 + tig * 4]) : 0u;
-            const uint32_t b1 = (g < T) ? *reinterpret_cast<const uint32_t*>(&xs_q[g][b * 32 + 16 + tig * 4]) : 0u;
-            int32_t d[4] = {0, 0, 0, 0};
-            gr_mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
-            if (t0 < T) {
-                const float dx0 = xs_d[t0][b];
-                acc[0] = fmaf(dw0 * dx0, (float) d[0], acc[0]);
-                acc[2] = fmaf(dw1 * dx0, (float) d[2], acc[2]);
+            const int8_t* q0 = reinterpret_cast<const int8_t*>(blk0 + 2);
+            const int8_t* q1 = reinterpret_cast<const int8_t*>(blk1 + 2);
+            float db[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int kh = 0; kh < 2; ++kh) {
+                const int k0 = kh * 16 + 2 * tig;
+                const uint32_t a0 = gr_i8x2_to_bf16x2(q0[k0], q0[k0 + 1]);
+                const uint32_t a1 = gr_i8x2_to_bf16x2(q1[k0], q1[k0 + 1]);
+                const uint32_t a2 = gr_i8x2_to_bf16x2(q0[k0 + 8], q0[k0 + 9]);
+                const uint32_t a3 = gr_i8x2_to_bf16x2(q1[k0 + 8], q1[k0 + 9]);
+                const uint32_t b0 = (g < T) ? *reinterpret_cast<const uint32_t*>(&xs_bf[g][b * 32 + k0]) : 0u;
+                const uint32_t b1 = (g < T) ? *reinterpret_cast<const uint32_t*>(&xs_bf[g][b * 32 + k0 + 8]) : 0u;
+                gr_mma_bf16_m16n8k16(db, a0, a1, a2, a3, b0, b1);
             }
-            if (t1 < T) {
-                const float dx1 = xs_d[t1][b];
-                acc[1] = fmaf(dw0 * dx1, (float) d[1], acc[1]);
-                acc[3] = fmaf(dw1 * dx1, (float) d[3], acc[3]);
-            }
+            acc[0] = fmaf(dw0, db[0], acc[0]);
+            acc[1] = fmaf(dw0, db[1], acc[1]);
+            acc[2] = fmaf(dw1, db[2], acc[2]);
+            acc[3] = fmaf(dw1, db[3], acc[3]);
         }
         if (t0 < T) { p_acc[warp][t0][g] = acc[0]; p_acc[warp][t0][8 + g] = acc[2]; }
         if (t1 < T) { p_acc[warp][t1][g] = acc[1]; p_acc[warp][t1][8 + g] = acc[3]; }
@@ -2781,23 +2801,25 @@ __global__ void __launch_bounds__(THREADS) gr_down_q8_tc_kernel(GrMulti m, float
 }
 
 template <int T>
-__global__ void __launch_bounds__(THREADS) gr_up_q8_tc_kernel(GrMulti m, const float* __restrict__ part,
-                                                              const float* __restrict__ ssg) {
+__global__ void __launch_bounds__(THREADS) gr_up_q8_bf16tc_kernel(GrMulti m, const float* __restrict__ part,
+                                                                  const float* __restrict__ ssg) {
 #if STRATA_GR_Q8_TC_SM80
     constexpr int NB_UP = LR / 32;            // 10 Q8_0 blocks for LR=320
-    constexpr int NB_HALF = NB_UP / 2;        // 5 Q8_0 blocks per warp (8 warps = 4 streams x 2 K-halves)
-    constexpr int STREAM_BYTES = UPM_COLS * NB_UP * Q8B; // 16 * 340 = 5,440 contiguous bytes per stream!
+    constexpr int NB_HALF = NB_UP / 2;        // 5 Q8_0 blocks per warp
+    constexpr int STREAM_BYTES = UPM_COLS * NB_UP * Q8B; // 16 * 340 = 5,440 contiguous bytes per stream
     constexpr int STREAM_U32 = STREAM_BYTES / 4;         // 1,360 uint32s per stream
-    __shared__ alignas(16) float lo[T][LR];
-    __shared__ alignas(16) int8_t lo_q[8][LR];
-    __shared__ float lo_d[8][NB_UP];
+    __shared__ alignas(16) uint16_t lo_bf[8][LR];        //  5,120 B (BF16 SiLU(lo), exact FP32 exponent range!)
+    __shared__ uint16_t s_i8_bf16[256];                  //    512 B (bit-exact int8 -> bf16 LUT, zero I2F/CVT in loop!)
     __shared__ float rsS[T][HC];
     __shared__ float g_out[T][HC][UPM_COLS];
     __shared__ float p1[HC][8][UPM_COLS];
-    __shared__ alignas(16) uint32_t s_w[HC][STREAM_U32]; // 21,760 B (4 streams x 5,440 B, 100% coalesced load!)
+    __shared__ alignas(16) uint32_t s_w[HC][STREAM_U32]; // 21,760 B (4 streams x 5,440 B coalesced)
 
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int d0 = blockIdx.x * UPM_COLS;
+
+    // Every thread initializes 1 entry of the exact int8 -> bf16 lookup table (256 threads = 256 entries, 1 cycle!).
+    s_i8_bf16[t] = __bfloat16_as_ushort(__float2bfloat16_rn((float) (int8_t) t));
 
     if (t < T * HC) {
         const int k = t / HC, c = t - k * HC;
@@ -2822,30 +2844,13 @@ __global__ void __launch_bounds__(THREADS) gr_up_q8_tc_kernel(GrMulti m, const f
         }
         if (r < LR) {
             const float x = sum / (float) HC;
-            lo[k][r] = x / (1.0f + __expf(-x));
+            const float s = x / (1.0f + __expf(-x));
+            lo_bf[k][r] = __bfloat16_as_ushort(__float2bfloat16_rn(s));
         } else {
             m.a[k].inject_out[r - LR] = sum;
         }
     }
-    __syncthreads();
 
-    // Quantize lo[T][LR] -> lo_q[T][LR] + lo_d[T][NB_UP] across all 8 warps (~0.2 us).
-    for (int kb = warp; kb < T * NB_UP; kb += WARPS) {
-        const int k = kb / NB_UP;
-        const int b = kb - k * NB_UP;
-        const float xv = lo[k][b * 32 + lane];
-        float amax = fabsf(xv);
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-        const float dx = amax * (1.0f / 127.0f);
-        const float inv = dx > 0.0f ? (1.0f / dx) : 0.0f;
-        int qv = dx > 0.0f ? __float2int_rn(xv * inv) : 0;
-        qv = max(-127, min(127, qv));
-        lo_q[k][b * 32 + lane] = (int8_t) qv;
-        if (lane == 0) lo_d[k][b] = dx;
-    }
-
-    // Cooperatively load all 4 streams x 5,440 contiguous bytes COALESCED into s_w (64 threads per stream = 22 loads!).
     const int c = warp & 3;
     const int kh = warp >> 2;
     {
@@ -2878,24 +2883,28 @@ __global__ void __launch_bounds__(THREADS) gr_up_q8_tc_kernel(GrMulti m, const f
         const uint8_t* blk1 = w1 + b * Q8B;
         const float dw0 = q8_half(q8_ld16(blk0));
         const float dw1 = q8_half(q8_ld16(blk1));
-        const uint32_t a0 = q8_ld16(blk0 + 2 + tig * 4) | (q8_ld16(blk0 + 4 + tig * 4) << 16);
-        const uint32_t a2 = q8_ld16(blk0 + 18 + tig * 4) | (q8_ld16(blk0 + 20 + tig * 4) << 16);
-        const uint32_t a1 = q8_ld16(blk1 + 2 + tig * 4) | (q8_ld16(blk1 + 4 + tig * 4) << 16);
-        const uint32_t a3 = q8_ld16(blk1 + 18 + tig * 4) | (q8_ld16(blk1 + 20 + tig * 4) << 16);
-        const uint32_t b0 = (g < T) ? *reinterpret_cast<const uint32_t*>(&lo_q[g][b * 32 + tig * 4]) : 0u;
-        const uint32_t b1 = (g < T) ? *reinterpret_cast<const uint32_t*>(&lo_q[g][b * 32 + 16 + tig * 4]) : 0u;
-        int32_t d[4] = {0, 0, 0, 0};
-        gr_mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
-        if (t0 < T) {
-            const float dx0 = lo_d[t0][b];
-            acc[0] = fmaf(dw0 * dx0, (float) d[0], acc[0]);
-            acc[2] = fmaf(dw1 * dx0, (float) d[2], acc[2]);
+        const int8_t* q0 = reinterpret_cast<const int8_t*>(blk0 + 2);
+        const int8_t* q1 = reinterpret_cast<const int8_t*>(blk1 + 2);
+        float db[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int k2 = 0; k2 < 2; ++k2) {
+            const int k0 = k2 * 16 + 2 * tig;
+            const uint32_t a0 = (uint32_t) s_i8_bf16[(uint8_t) q0[k0]] |
+                                ((uint32_t) s_i8_bf16[(uint8_t) q0[k0 + 1]] << 16);
+            const uint32_t a1 = (uint32_t) s_i8_bf16[(uint8_t) q1[k0]] |
+                                ((uint32_t) s_i8_bf16[(uint8_t) q1[k0 + 1]] << 16);
+            const uint32_t a2 = (uint32_t) s_i8_bf16[(uint8_t) q0[k0 + 8]] |
+                                ((uint32_t) s_i8_bf16[(uint8_t) q0[k0 + 9]] << 16);
+            const uint32_t a3 = (uint32_t) s_i8_bf16[(uint8_t) q1[k0 + 8]] |
+                                ((uint32_t) s_i8_bf16[(uint8_t) q1[k0 + 9]] << 16);
+            const uint32_t b0 = (g < T) ? *reinterpret_cast<const uint32_t*>(&lo_bf[g][b * 32 + k0]) : 0u;
+            const uint32_t b1 = (g < T) ? *reinterpret_cast<const uint32_t*>(&lo_bf[g][b * 32 + k0 + 8]) : 0u;
+            gr_mma_bf16_m16n8k16(db, a0, a1, a2, a3, b0, b1);
         }
-        if (t1 < T) {
-            const float dx1 = lo_d[t1][b];
-            acc[1] = fmaf(dw0 * dx1, (float) d[1], acc[1]);
-            acc[3] = fmaf(dw1 * dx1, (float) d[3], acc[3]);
-        }
+        acc[0] = fmaf(dw0, db[0], acc[0]);
+        acc[1] = fmaf(dw0, db[1], acc[1]);
+        acc[2] = fmaf(dw1, db[2], acc[2]);
+        acc[3] = fmaf(dw1, db[3], acc[3]);
     }
 
     if (kh == 1) {
@@ -2943,16 +2952,321 @@ __global__ void __launch_bounds__(THREADS) gr_up_q8_tc_kernel(GrMulti m, const f
 #endif
 }
 
+template <int T>
+__global__ void __launch_bounds__(THREADS) gr_down_q8_tc_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
+#if STRATA_GR_Q8_TC_SM80
+    constexpr int NB = Q8_KC / 32;            // 20 Q8_0 blocks for Flash-Next (640 cols)
+    constexpr int ROW_BYTES = NB * Q8B;       // 680 bytes per row chunk (multiple of 8!)
+    constexpr int ROW_U2 = ROW_BYTES / 8;     // 85 uint2s per row chunk
+    constexpr int TC_RG = LR / 16;            // 20 row groups of 16 rows (+1 inject group -> 336 CTAs!)
+    __shared__ alignas(16) int8_t xs_q[8][Q8_KC];        //  5,120 B
+    __shared__ float xs_d[8][NB];                        //    640 B
+    __shared__ float red_b[8][NB];                       //    640 B (deterministic, zero-spill ssp per block)
+    __shared__ alignas(16) uint2 s_w[16][ROW_U2];        // 10,880 B (16 rows x 680 B, 100% aligned uint2 load!)
+    __shared__ float p_acc[WARPS][8][16];                //  4,096 B (total ~21.4 KB -> 4+ CTAs/SM!)
+
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int rg = blockIdx.x, kc = blockIdx.y, c = kc / Q8_CPS;
+    const bool inj = (rg == TC_RG);
+
+    // All 8 warps (256 threads) cooperatively load R (+ pending write) * w_norm, accumulate ssp, and quantize into xs_q/xs_d.
+    for (int kb = warp; kb < T * NB; kb += WARPS) {
+        const int k = kb / NB;
+        const int b = kb - k * NB;
+        const FusedGrArgs& a = m.a[k];
+        const int col = kc * Q8_KC + b * 32 + lane;
+        float r = a.R[col];
+        if (a.apply) {
+            const float gw = 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC);
+            r = fmaf(a.bo_prev[col - c * N], gw, r);
+        }
+        const float ss_blk = warp_sum(r * r);
+        if (rg == 0 && lane == 0) red_b[k][b] = ss_blk;
+        const float xv = r * a.w_norm[col];
+        float amax = fabsf(xv);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float dx = amax * (1.0f / 127.0f);
+        const float inv = dx > 0.0f ? (1.0f / dx) : 0.0f;
+        int qv = dx > 0.0f ? __float2int_rn(xv * inv) : 0;
+        qv = max(-127, min(127, qv));
+        xs_q[k][b * 32 + lane] = (int8_t) qv;
+        if (lane == 0) xs_d[k][b] = dx;
+    }
+
+    const size_t row_stride = (size_t) (D / 32) * Q8B;
+    const uint8_t* base_w = m.a[0].q8_down + (size_t) kc * ROW_BYTES;
+    const int r_base = rg * 16;
+
+    // Overlap 16-row coalesced uint2 weight loads with activation staging before the single sync!
+    if (!inj) {
+#pragma unroll
+        for (int rr = 0; rr < 2; ++rr) {
+            const int lr = warp * 2 + rr;
+            const uint2* src2 = reinterpret_cast<const uint2*>(base_w + (size_t) (r_base + lr) * row_stride);
+            for (int u = lane; u < ROW_U2; u += 32) s_w[lr][u] = __ldg(src2 + u);
+        }
+    }
+    __syncthreads();
+
+    if (rg == 0 && t < T) {
+        float s = 0.0f;
+#pragma unroll
+        for (int b = 0; b < NB; ++b) s += red_b[t][b];
+        ssg[t * Q8_NKC + kc] = s;
+    }
+
+    if (inj) {
+        const bool have_inj = (m.a[0].q8_inject != nullptr || m.a[0].w_inject != nullptr);
+        if (!have_inj || warp >= HC) return;
+        const bool inj_bf16 = (m.a[0].q8_inject == nullptr);
+        const int r = warp;
+        float acc[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[k] = 0.0f;
+        if (inj_bf16) {
+            const uint16_t* wr = m.a[0].w_inject + (size_t) r * D + (size_t) kc * Q8_KC;
+            for (int b = 0; b < NB; ++b) {
+                const float wv = __uint_as_float((uint32_t) wr[b * 32 + lane] << 16);
+#pragma unroll
+                for (int k = 0; k < T; ++k) acc[k] = fmaf(wv * xs_d[k][b], (float) xs_q[k][b * 32 + lane], acc[k]);
+            }
+        } else {
+            const uint8_t* wr = m.a[0].q8_inject + (size_t) r * (D / 32) * Q8B + (size_t) kc * ROW_BYTES;
+            for (int b = 0; b < NB; ++b) {
+                const uint8_t* blk = wr + b * Q8B;
+                const float dw = q8_half(q8_ld16(blk));
+                const int wq = (int) (int8_t) blk[2 + lane];
+#pragma unroll
+                for (int k = 0; k < T; ++k) acc[k] = fmaf(dw * xs_d[k][b], (float) (wq * (int) xs_q[k][b * 32 + lane]), acc[k]);
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const float v = warp_sum(acc[k]);
+            if (lane == 0) part[((size_t) k * Q8_NKC + kc) * PR + LR + r] = v;
+        }
+        return;
+    }
+
+    // All 8 warps split the NB=20 Q8_0 blocks across 8 warps (2-3 MMAs per warp, single 16-row pass!).
+    const int g = lane >> 2;
+    const int tig = lane & 3;
+    const int t0 = 2 * tig;
+    const int t1 = t0 + 1;
+    const int b_start = (warp * NB) / WARPS;
+    const int b_end = ((warp + 1) * NB) / WARPS;
+
+    const uint8_t* w0 = reinterpret_cast<const uint8_t*>(s_w[g]);
+    const uint8_t* w1 = reinterpret_cast<const uint8_t*>(s_w[8 + g]);
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int b = b_start; b < b_end; ++b) {
+        const uint8_t* blk0 = w0 + b * Q8B;
+        const uint8_t* blk1 = w1 + b * Q8B;
+        const float dw0 = q8_half(q8_ld16(blk0));
+        const float dw1 = q8_half(q8_ld16(blk1));
+        const uint32_t a0 = q8_ld16(blk0 + 2 + tig * 4) | (q8_ld16(blk0 + 4 + tig * 4) << 16);
+        const uint32_t a2 = q8_ld16(blk0 + 18 + tig * 4) | (q8_ld16(blk0 + 20 + tig * 4) << 16);
+        const uint32_t a1 = q8_ld16(blk1 + 2 + tig * 4) | (q8_ld16(blk1 + 4 + tig * 4) << 16);
+        const uint32_t a3 = q8_ld16(blk1 + 18 + tig * 4) | (q8_ld16(blk1 + 20 + tig * 4) << 16);
+        const uint32_t b0 = (g < T) ? *reinterpret_cast<const uint32_t*>(&xs_q[g][b * 32 + tig * 4]) : 0u;
+        const uint32_t b1 = (g < T) ? *reinterpret_cast<const uint32_t*>(&xs_q[g][b * 32 + 16 + tig * 4]) : 0u;
+        int32_t d[4] = {0, 0, 0, 0};
+        gr_mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
+        if (t0 < T) {
+            const float dx0 = xs_d[t0][b];
+            acc[0] = fmaf(dw0 * dx0, (float) d[0], acc[0]);
+            acc[2] = fmaf(dw1 * dx0, (float) d[2], acc[2]);
+        }
+        if (t1 < T) {
+            const float dx1 = xs_d[t1][b];
+            acc[1] = fmaf(dw0 * dx1, (float) d[1], acc[1]);
+            acc[3] = fmaf(dw1 * dx1, (float) d[3], acc[3]);
+        }
+    }
+    if (t0 < T) { p_acc[warp][t0][g] = acc[0]; p_acc[warp][t0][8 + g] = acc[2]; }
+    if (t1 < T) { p_acc[warp][t1][g] = acc[1]; p_acc[warp][t1][8 + g] = acc[3]; }
+    __syncthreads();
+
+    if (t < T * 16) {
+        const int tk = t >> 4;
+        const int lr = t & 15;
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) sum += p_acc[w][tk][lr];
+        part[((size_t) tk * Q8_NKC + kc) * PR + r_base + lr] = sum;
+    }
+#else
+    (void) m; (void) part; (void) ssg;
+#endif
+}
+
+constexpr int UP8_COLS = 8;
+constexpr int UP8_BLOCKS = N / UP8_COLS;   // 320 CTAs (full wave saturation on 110-SM Blackwell & 82-SM 3090!)
+
+template <int T>
+__global__ void __launch_bounds__(THREADS) gr_up_q8_tc_kernel(GrMulti m, const float* __restrict__ part,
+                                                              const float* __restrict__ ssg) {
+#if STRATA_GR_Q8_TC_SM80
+    constexpr int NB_UP = LR / 32;                          // 10 Q8_0 blocks for LR=320
+    constexpr int STREAM_BYTES = UP8_COLS * NB_UP * Q8B;    // 8 * 340 = 2,720 contiguous bytes per stream (% 16 == 0!)
+    constexpr int STREAM_U4 = STREAM_BYTES / 16;            // 170 uint4s per stream (3 loads/thread!)
+    __shared__ alignas(16) int8_t lo_q[8][LR];              //  2,560 B (direct warp-quantized SiLU(lo), zero float lo!)
+    __shared__ float lo_d[8][NB_UP];                        //    320 B
+    __shared__ float rsS[T][HC];                            //    128 B
+    __shared__ float g_out[T][HC][UP8_COLS];                //  1,024 B
+    __shared__ float p_acc[4][HC][8][UP8_COLS];             //  4,096 B
+    __shared__ alignas(16) uint4 s_w[HC][STREAM_U4];        // 10,880 B (total ~19 KB -> 5+ CTAs/SM!)
+
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int d0 = blockIdx.x * UP8_COLS;
+
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
+        const float r = rsqrtf(ss / (float) N + m.a[k].eps);
+        rsS[k][c] = r;
+        if (blockIdx.x == 0) m.a[k].rs[c] = r;
+    }
+
+    // Overlap 100% 16-byte aligned uint4 weight loads (all 4 streams) with rsS computation before first sync!
+    {
+        const int lc = warp & 3;
+        const int lhalf = warp >> 2;
+        const uint4* src4 = reinterpret_cast<const uint4*>(m.a[0].q8_up + (size_t) (lc * N + d0) * NB_UP * Q8B);
+        for (int u = lhalf * 32 + lane; u < STREAM_U4; u += 64) s_w[lc][u] = __ldg(src4 + u);
+    }
+    __syncthreads();
+
+    // Direct register reduction of part -> SiLU(sum / HC) -> warp-level per-32 Q8 quantization into lo_q/lo_d!
+    for (int kb = warp; kb < T * NB_UP; kb += WARPS) {
+        const int k = kb / NB_UP;
+        const int b = kb - k * NB_UP;
+        const int r = b * 32 + lane;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+#pragma unroll
+            for (int j = 0; j < Q8_CPS; ++j) p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + r];
+            sum = fmaf(rsS[k][c], p, sum);
+        }
+        const float x = sum / (float) HC;
+        const float xv = x / (1.0f + __expf(-x));
+        float amax = fabsf(xv);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float dx = amax * (1.0f / 127.0f);
+        const float inv = dx > 0.0f ? (1.0f / dx) : 0.0f;
+        int qv = dx > 0.0f ? __float2int_rn(xv * inv) : 0;
+        qv = max(-127, min(127, qv));
+        lo_q[k][r] = (int8_t) qv;
+        if (lane == 0) lo_d[k][b] = dx;
+    }
+    if (blockIdx.x == 0 && (m.a[0].w_inject != nullptr || m.a[0].q8_inject != nullptr) && t < T * HC) {
+        const int k = t / HC, ir = t - k * HC;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+#pragma unroll
+            for (int j = 0; j < Q8_CPS; ++j) p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + LR + ir];
+            sum = fmaf(rsS[k][c], p, sum);
+        }
+        m.a[k].inject_out[ir] = sum;
+    }
+    __syncthreads();
+
+    // 8 warps = 2 stream-pairs (c0=2*pair, c1=2*pair+1 -> 16 rows per mma!) x 4 K-splits (2-3 MMAs per warp!).
+    const int pair = warp & 1;
+    const int kh = warp >> 1;
+    const int c0 = pair * 2;
+    const int c1 = c0 + 1;
+    const int g = lane >> 2;
+    const int tig = lane & 3;
+    const int t0 = 2 * tig;
+    const int t1 = t0 + 1;
+
+    const uint8_t* w0 = reinterpret_cast<const uint8_t*>(s_w[c0]) + (size_t) g * NB_UP * Q8B;
+    const uint8_t* w1 = reinterpret_cast<const uint8_t*>(s_w[c1]) + (size_t) g * NB_UP * Q8B;
+    const int b_start = (kh * NB_UP) / 4;
+    const int b_end = ((kh + 1) * NB_UP) / 4;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int b = b_start; b < b_end; ++b) {
+        const uint8_t* blk0 = w0 + b * Q8B;
+        const uint8_t* blk1 = w1 + b * Q8B;
+        const float dw0 = q8_half(q8_ld16(blk0));
+        const float dw1 = q8_half(q8_ld16(blk1));
+        const uint32_t a0 = q8_ld16(blk0 + 2 + tig * 4) | (q8_ld16(blk0 + 4 + tig * 4) << 16);
+        const uint32_t a2 = q8_ld16(blk0 + 18 + tig * 4) | (q8_ld16(blk0 + 20 + tig * 4) << 16);
+        const uint32_t a1 = q8_ld16(blk1 + 2 + tig * 4) | (q8_ld16(blk1 + 4 + tig * 4) << 16);
+        const uint32_t a3 = q8_ld16(blk1 + 18 + tig * 4) | (q8_ld16(blk1 + 20 + tig * 4) << 16);
+        const uint32_t b0 = (g < T) ? *reinterpret_cast<const uint32_t*>(&lo_q[g][b * 32 + tig * 4]) : 0u;
+        const uint32_t b1 = (g < T) ? *reinterpret_cast<const uint32_t*>(&lo_q[g][b * 32 + 16 + tig * 4]) : 0u;
+        int32_t d[4] = {0, 0, 0, 0};
+        gr_mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
+        if (t0 < T) {
+            const float dx0 = lo_d[t0][b];
+            acc[0] = fmaf(dw0 * dx0, (float) d[0], acc[0]);
+            acc[2] = fmaf(dw1 * dx0, (float) d[2], acc[2]);
+        }
+        if (t1 < T) {
+            const float dx1 = lo_d[t1][b];
+            acc[1] = fmaf(dw0 * dx1, (float) d[1], acc[1]);
+            acc[3] = fmaf(dw1 * dx1, (float) d[3], acc[3]);
+        }
+    }
+
+    if (t0 < T) { p_acc[kh][c0][t0][g] = acc[0]; p_acc[kh][c1][t0][g] = acc[2]; }
+    if (t1 < T) { p_acc[kh][c0][t1][g] = acc[1]; p_acc[kh][c1][t1][g] = acc[3]; }
+    __syncthreads();
+
+    // T * HC * UP8_COLS <= 8 * 4 * 8 = 256 -> every thread owns at most 1 (token, stream, col) element!
+    if (t < T * HC * UP8_COLS) {
+        const int tk = t >> 5;
+        const int sc = (t >> 3) & 3;
+        const int dd = t & 7;
+        const int r_idx = sc * N + d0 + dd;
+        const float dot = (p_acc[0][sc][tk][dd] + p_acc[1][sc][tk][dd]) +
+                          (p_acc[2][sc][tk][dd] + p_acc[3][sc][tk][dd]);
+        const FusedGrArgs& a = m.a[tk];
+        float rv = a.R[r_idx];
+        if (a.apply) {
+            const float gw = 2.0f * sigmoidf_(a.inj_prev[sc] / (float) HC);
+            rv = fmaf(a.bo_prev[d0 + dd], gw, rv);
+            a.R_out[r_idx] = rv;
+        }
+        g_out[tk][sc][dd] = (rv * a.w_norm[r_idx] * rsS[tk][sc]) * sigmoidf_(dot);
+    }
+    __syncthreads();
+
+    if (t < T * UP8_COLS) {
+        const int k = t >> 3;
+        const int col = t & 7;
+        float sum = 0.0f;
+#pragma unroll
+        for (int sc = 0; sc < HC; ++sc) sum += g_out[k][sc][col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail_n<4>(m, d0);   // S26 STRATA_QFUSE (4 blocks per 32-col group)
+#else
+    (void) m; (void) part; (void) ssg;
+#endif
+}
+
 static int hc_q8_tc_mode() {
 #if defined(__HIPCC__)
     return 0;
 #else
     static const int env = [] {
         const char* v = std::getenv("STRATA_HC_Q8_TC");
-        if (v == nullptr || v[0] == '\0') return 0;
+        if (v == nullptr || v[0] == '\0') return -1;
         return std::atoi(v);
     }();
-    if (env <= 0) return 0;
+    if (env == 0) return 0;
     static int ok[64] = {};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return 0; }
@@ -2962,7 +3276,8 @@ static int hc_q8_tc_mode() {
         if (!good) (void) cudaGetLastError();
         ok[dev] = good ? 1 : -1;
     }
-    return ok[dev] > 0 ? env : 0;
+    if (ok[dev] <= 0) return 0;
+    return env > 0 ? env : 1;   // default 1 (exact gr_down_q8_fast + 320-CTA uint4 INT8 TC gr_up_q8_tc) on sm_80+ CUDA (STRATA_HC_Q8_TC=0 disables)
 #endif
 }
 
@@ -2983,19 +3298,50 @@ static bool hc_q8_sm80_fast() {
 #endif
 }
 
+static int hc_q8_bf16tc_mode() {
+#if defined(__HIPCC__)
+    return 0;
+#else
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_HC_Q8_BF16TC");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::atoi(v);
+    }();
+    if (env == 0) return 0;
+    if (!hc_q8_sm80_fast()) return 0;
+    return env > 0 ? env : 1;   // fallback when STRATA_HC_Q8_TC=0
+#endif
+}
+
 template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cudaStream_t st, unsigned long long* stamp_buf,
                                   int stamp_i0) {
-    // Opt-in INT8 TC path (STRATA_HC_Q8_TC=1 for TC up, =2 for TC down+up; quantizes 320-dim SiLU(lo) to int8).
+    // High-wave coalesced INT8 TC path (default on sm_80+ CUDA; STRATA_HC_Q8_TC=0 disables, =1 uses fast down + TC up,
+    // =2 uses TC down (336 CTAs, uint2 coalesced) + TC up (320 CTAs, uint4 coalesced)).
     const int tc_mode = hc_q8_tc_mode();
     if (tc_mode >= 1 && (LR % 32 == 0) && ((Q8_KC / 32) % 2 == 0) && ((LR / 32) % 2 == 0)) {
         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
         if (tc_mode >= 2) {
-            gr_down_q8_tc_kernel<T><<<dim3(LR / 32 + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+            gr_down_q8_tc_kernel<T><<<dim3(LR / 16 + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
         } else {
             gr_down_q8_fast_kernel<T, 4, true><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
         }
         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
-        gr_up_q8_tc_kernel<T><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
+        gr_up_q8_tc_kernel<T><<<UP8_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
+        return;
+    }
+    // Default on sm_80+ CUDA: exact-FP32 gr_down_q8_fast<T, 4, true> (fastest at T=1..8) + BF16 Tensor Core
+    // gr_up_q8_bf16tc_kernel (full FP32 exponent range on SiLU(lo), bit-exact int8->bf16 LUT, coalesced weights;
+    // STRATA_HC_Q8_BF16TC=0 falls back to scalar gr_up_q8_fast, =2 also uses BF16 TC for down).
+    const int bf_mode = hc_q8_bf16tc_mode();
+    if (bf_mode >= 1 && (LR % 32 == 0) && ((Q8_KC / 32) % 2 == 0) && ((LR / 32) % 2 == 0)) {
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
+        if (bf_mode >= 2) {
+            gr_down_q8_bf16tc_kernel<T><<<dim3(LR / 32 + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+        } else {
+            gr_down_q8_fast_kernel<T, 4, true><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+        }
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+        gr_up_q8_bf16tc_kernel<T><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
         return;
     }
     // On CUDA sm_80+, default to the exact-FP32-activation gr_down_q8_fast_kernel<T, 4, true> + gr_up_q8_fast_kernel

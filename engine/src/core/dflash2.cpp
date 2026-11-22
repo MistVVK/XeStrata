@@ -64,6 +64,66 @@ Dflash2Drafter::~Dflash2Drafter() {
     for (cudaEvent_t e : ev_ctx_) if (e) cudaEventDestroy(e);
     if (ev_a_) cudaEventDestroy(ev_a_);
     if (ev_b_) cudaEventDestroy(ev_b_);
+    free_ctx_batch();
+}
+
+struct Dflash2Drafter::CtxBatch {
+    static constexpr int kB = 64;
+    int32_t* pos = nullptr;
+    float* rt = nullptr;
+    uint8_t* xqc = nullptr;
+    float* xdc = nullptr;
+    float* fcy = nullptr;
+    float* kc = nullptr;
+    float* vc = nullptr;
+    int8_t* h_logq[2] = {};
+    float* h_logd[2] = {};
+    cudaEvent_t ev[2] = {};
+};
+
+void Dflash2Drafter::free_ctx_batch() {
+    if (!ctx_batch_) return;
+    auto* cb = ctx_batch_;
+    ctx_batch_ = nullptr;
+    auto fr = [](void* p) { if (p) cudaFree(p); };
+    fr(cb->pos); fr(cb->rt); fr(cb->xqc); fr(cb->xdc); fr(cb->fcy); fr(cb->kc); fr(cb->vc);
+    for (int i = 0; i < 2; ++i) {
+        if (cb->h_logq[i]) cudaFreeHost(cb->h_logq[i]);
+        if (cb->h_logd[i]) cudaFreeHost(cb->h_logd[i]);
+        if (cb->ev[i]) cudaEventDestroy(cb->ev[i]);
+    }
+    delete cb;
+}
+
+bool Dflash2Drafter::ensure_ctx_batch(std::string& err) {
+    if (ctx_batch_) return true;
+    auto* cb = new CtxBatch();
+    constexpr int B = CtxBatch::kB;
+    auto dev = [&](auto** p, size_t n) {
+        using T = std::remove_pointer_t<std::remove_reference_t<decltype(*p)>>;
+        return cudaMalloc((void**) p, n * sizeof(T)) == cudaSuccess;
+    };
+    const size_t tap_n = std::max<size_t>(taps_.size(), 1) * (size_t) N_;
+    bool ok = dev(&cb->pos, B) && dev(&cb->rt, (size_t) B * 128) &&
+              dev(&cb->xqc, (size_t) B * tap_n + 4096) && dev(&cb->xdc, (size_t) B * (tap_n / 32) + 64) &&
+              dev(&cb->fcy, (size_t) B * N_) && dev(&cb->kc, (size_t) B * NKV_ * HD_) &&
+              dev(&cb->vc, (size_t) B * NKV_ * HD_);
+    for (int i = 0; ok && i < 2; ++i) {
+        ok = cudaEventCreateWithFlags(&cb->ev[i], cudaEventDisableTiming) == cudaSuccess;
+        if (ok && log_on_) {
+            ok = cudaHostAlloc((void**) &cb->h_logq[i], (size_t) B * N_, cudaHostAllocDefault) == cudaSuccess &&
+                 cudaHostAlloc((void**) &cb->h_logd[i], (size_t) B * (N_ / 32) * sizeof(float), cudaHostAllocDefault) == cudaSuccess;
+        }
+    }
+    if (!ok) {
+        (void) cudaGetLastError();
+        ctx_batch_ = cb;
+        free_ctx_batch();
+        (void) err;
+        return false;
+    }
+    ctx_batch_ = cb;
+    return true;
 }
 
 // STRATA_DF2_PROFILE=1 (measurement only): the round runs without its graph and an event follows every stage; the per-stage averages print at exit
@@ -971,6 +1031,87 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
     if (!context_wait(err)) return false;
     const OnDevice on_device(device_);
     const int tap_n = (int) taps_.size() * N_;
+    static const bool batch_on = [] {
+        const char* e = std::getenv("STRATA_DF2_CTX_BATCH");
+        return !(e && e[0] == '0');
+    }();
+    if (batch_on && n > kRows && prof_ == nullptr && ensure_ctx_batch(err)) {
+        auto* cb = ctx_batch_;
+        constexpr int B = CtxBatch::kB;
+        h_meta_[18] = epoch_;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
+
+        bool slot_pend[2] = {false, false};
+        int64_t slot_p0[2] = {-1, -1};
+        int slot_cnt[2] = {0, 0};
+        auto flush_slot = [&](int s) -> bool {
+            if (!slot_pend[s]) return true;
+            slot_pend[s] = false;
+            if (cudaEventSynchronize(cb->ev[s]) != cudaSuccess) {
+                err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            if (log_on_) {
+                for (int i = 0; i < slot_cnt[s]; ++i) {
+                    const int64_t pos = slot_p0[s] + i;
+                    LogChunk& ch = cur_.writable((size_t) (pos / kLogChunk));
+                    const size_t r = (size_t) (pos % kLogChunk);
+                    std::memcpy(&ch.q[r * 2560], cb->h_logq[s] + (size_t) i * 2560, 2560);
+                    std::memcpy(&ch.d[r * 80], cb->h_logd[s] + (size_t) i * 80, 80 * sizeof(float));
+                    ch.ok[r] = 1;
+                }
+            }
+            return true;
+        };
+
+        try {
+            int b_idx = 0;
+            for (int64_t r0 = 0; r0 < n; r0 += B, ++b_idx) {
+                const int m = (int) std::min<int64_t>(B, n - r0);
+                const bool need_kv = (r0 + m) > (n - kRing);
+                if (!log_on_ && !need_kv) continue;
+                const int s = b_idx & 1;
+                if (log_on_ && !flush_slot(s)) return false;
+
+                kernels::df2_iota_pos(cb->pos, (int32_t) (pos0 + r0), m, cs_);
+                kernels::df2_quant_rows(taps + (size_t) r0 * (size_t) tap_n, tap_n, m, cb->xqc, cb->xdc, cs_);
+                gemm({"fc.weight"}, {cb->fcy}, m, cs_, cb->xqc, cb->xdc);
+                kernels::df2_rms_quant(cb->fcy, f32("hidden_norm.weight"), nullptr, m, N_, eps_, cb->xqc, cb->xdc, cs_);
+                if (log_on_) {
+                    cudaMemcpyAsync(cb->h_logq[s], cb->xqc, (size_t) m * N_, cudaMemcpyDeviceToHost, cs_);
+                    cudaMemcpyAsync(cb->h_logd[s], cb->xdc, (size_t) m * (N_ / 32) * sizeof(float), cudaMemcpyDeviceToHost, cs_);
+                    cudaEventRecord(cb->ev[s], cs_);
+                    slot_pend[s] = true;
+                    slot_p0[s] = pos0 + r0;
+                    slot_cnt[s] = m;
+                }
+                if (need_kv) {
+                    kernels::df2_rope_table_inv(cb->pos, m, rope_inv_, cb->rt, cs_);
+                    for (int l = 0; l < L_; ++l) {
+                        const std::string p = "layers." + std::to_string(l) + ".";
+                        const std::string kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
+                        gemm({kp.c_str(), vp.c_str()}, {cb->kc, cb->vc}, m, cs_, cb->xqc, cb->xdc);
+                        kernels::df2_kv_ring(cb->kc, cb->vc, f32(p + "self_attn.k_norm.weight"), cb->pos, cb->rt,
+                                             kring_[l], vring_[l], kRing, m, NKV_, eps_, cs_, tag_, d_meta_ + 18);
+                    }
+                    for (int i = 0; i < m; ++i)
+                        slot_pos_[(size_t) ((pos0 + r0 + i) % kRing)] = ((int64_t) epoch_ << 32) | (pos0 + r0 + i);
+                }
+            }
+        } catch (const std::exception& e) {
+            err = e.what();
+            return false;
+        }
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        if (log_on_ && (!flush_slot(0) || !flush_slot(1))) return false;
+        have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
+        ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n);
+        return true;
+    }
     for (int64_t r0 = 0; r0 < n; r0 += kRows) {
         const int m = (int) std::min<int64_t>(kRows, n - r0);
         for (int i = 0; i < m; ++i) h_meta_[i] = (int32_t) (pos0 + r0 + i);

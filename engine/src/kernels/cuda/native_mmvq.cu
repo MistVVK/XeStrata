@@ -3564,13 +3564,23 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     return row_bytes * std::size_t(n_out);
 }
 
+static int dense_i8_tc_min_t() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_DENSE_I8_TC_MIN_T");
+        return (e != nullptr && e[0] != '\0') ? std::max(1, std::atoi(e)) : 9;
+    }();
+    return v;
+}
+
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
-    // Clean-room MIT INT8 Tensor Core path (sm_80+: RTX 3090 & RTX 5090):
-    // Interleaved native_mmvq_il handles ncols=1..8 at peak SM occupancy; for ncols=9..16 (wide verify windows where
-    // native_mmvq_il is absent and native_mmvq would split into 2 passes), dense_i8_tc_mmvq wins 2.0x-2.7x in 1 pass.
-    if (n_out >= 1024 && ncols >= 9 && ncols <= 16 && dense_i8_tc_type_ok(ggml_type) && dense_i8_tc_decode_enabled()) {
+    // Clean-room MIT coalesced INT8 Tensor Core path (sm_80+: RTX 3090 & RTX 5090):
+    // Evaluates T >= min_t (default 3; STRATA_DENSE_I8_TC=0 disables; STRATA_DENSE_I8_TC_MIN_T overrides)
+    // up to T=16 in a single coalesced smem-staged weight pass using mma.m16n8k32/k16.
+    if (n_out >= 1024 && ncols >= dense_i8_tc_min_t() && ncols <= 16 &&
+        dense_i8_tc_type_ok(ggml_type) && dense_i8_tc_decode_enabled()) {
         if (dense_i8_tc_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream)) {
+            strata::dispatch::kernel(strata::dispatch::kDense, 30, ggml_type, n_in, n_out, ncols);
             return;
         }
     }
@@ -3976,6 +3986,12 @@ bool il_arch_ok() {
 
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
     if (ncols < 1 || ncols > 8 || !g_multi_exact || !il_arch_ok()) return false;
+    // When coalesced INT8 Tensor Core dense GEMM covers this shape (T >= min_t, n_out >= 1024), decline native_mmvq_il
+    // so callers skip the redundant q8_1_interleave launch and dispatch straight into dense_i8_tc_mmvq via native_mmvq.
+    if (g_tune_rows == 0 && n_out >= 1024 && ncols >= dense_i8_tc_min_t() &&
+        dense_i8_tc_type_ok(ggml_type) && dense_i8_tc_decode_enabled()) {
+        return false;
+    }
     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
            (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 11);
 }

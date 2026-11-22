@@ -23147,6 +23147,26 @@ int main(int argc, char** argv) {
             k = 0;   // Metal: no loan of expert-cache slots (the prompt buffers are the Metal window's own); the refill after it copied into given-back allocations
 #endif
             if (k > 0) {   // the lent slots are refilled after the prompt
+                // Skip borrowing & refilling expert cache slots when the GPU already has ample free VRAM for the
+                // prompt path's own buffers (e.g., 48-72 GB Blackwell/Ampere cards where all experts fit with GBs to
+                // spare). Avoids evicting resident experts and paying ~80-150 ms of PCIe refill after prefill.
+                static const bool no_free_skip = [] {
+                    const char* e = std::getenv("STRATA_PREFILL_ALWAYS_BORROW");
+                    return e != nullptr && e[0] == '1';
+                }();
+                if (!no_free_skip && !o.kv_grow) {
+                    const uint64_t own_need =
+                        strata::prefill::Prefill::bytes_needed_owned(g, ss, chunk, srcp != nullptr);
+                    size_t fb = 0, tb = 0;
+                    if (cudaMemGetInfo(&fb, &tb) == cudaSuccess &&
+                        fb > own_need + (4ull << 30)) {
+                        k = 0;
+                    } else {
+                        (void) cudaGetLastError();
+                    }
+                }
+            }
+            if (k > 0) {   // the lent slots are refilled after the prompt
                 const int32_t first = (int32_t) (xcache.slots() - k);
                 // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
                 kvg_started = true;

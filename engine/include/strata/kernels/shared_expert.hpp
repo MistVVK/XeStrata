@@ -39,6 +39,7 @@ struct NativeSharedWeights {
     const void* down_data = nullptr;
     void* q8_1 = nullptr;
     const void* x_q8_1 = nullptr;   // optional pre-quantized Q8_1 input for gate/up in shared_expert_multi
+    void* q8_1_il = nullptr;        // optional interleaved Q8_1 scratch for native_mmvq_il (bit-exact!)
 };
 
 /// Bytes of caller-owned scratch `shared_expert` needs.  **THE KERNEL USED TO `cudaMalloc` FOUR BUFFERS ON

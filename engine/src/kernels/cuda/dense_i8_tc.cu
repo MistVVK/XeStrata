@@ -387,10 +387,620 @@ __device__ __forceinline__ size_t row_bytes_of(int ggml_type, int n_in) {
     }
 }
 
-// ---- Decode / Verify Kernel: WARPS warps = (WARPS*16) output rows x (NTILES*8) tokens per CTA, K-chunked 256 ----
-// WARPS=1 (16 rows/CTA) keeps 110-170 SMs saturated for moderate n_out (<=4096, e.g. out-proj 2560 -> 160 CTAs);
-// WARPS=4 (64 rows/CTA) amortizes smem activation loads for wide n_out (>4096).
-template <int GTYPE, int NTILES, int WARPS = 4>
+// Byte count of one K<=256 chunk for a single weight row, padded up to a multiple of 4 bytes.
+template <int GTYPE>
+__device__ __host__ constexpr int chunk_u32_of() {
+    if constexpr (GTYPE == kTypeQ8_0) return 68;     // 8 * 34 = 272 B
+    else if constexpr (GTYPE == kTypeQ4_K) return 36; // 144 B
+    else if constexpr (GTYPE == kTypeQ5_K) return 44; // 176 B
+    else if constexpr (GTYPE == kTypeQ6_K) return 53; // 210 B -> 212 B
+    else return 34;                                   // IQ4_XS: 136 B
+}
+
+// 100%-coalesced warp-wide weight stager: all 32 lanes read contiguous words along each of 16 rows in turn.
+template <int GTYPE>
+__device__ __forceinline__ void stage_dense_rows16(
+    const uint8_t* __restrict__ weights, int r_base, int n_out, size_t rbytes,
+    int k_blk0, int nb_here, int lane, uint32_t (&s_w)[16][chunk_u32_of<GTYPE>()]) {
+    constexpr int MAX_U32 = chunk_u32_of<GTYPE>();
+    const size_t blk_off = (GTYPE == kTypeQ8_0)
+                               ? (size_t) k_blk0 * 34u
+                               : (size_t) (k_blk0 >> 3) * (GTYPE == kTypeQ4_K ? 144u :
+                                                           GTYPE == kTypeQ5_K ? 176u :
+                                                           GTYPE == kTypeQ6_K ? 210u : 136u);
+    const int n_bytes = (GTYPE == kTypeQ8_0)
+                            ? nb_here * 34
+                            : (GTYPE == kTypeQ4_K ? 144 :
+                               GTYPE == kTypeQ5_K ? 176 :
+                               GTYPE == kTypeQ6_K ? 210 : 136);
+    const int full_u32 = n_bytes >> 2;
+    const bool has_tail2 = (n_bytes & 2) != 0;
+
+#pragma unroll
+    for (int rr = 0; rr < 16; ++rr) {
+        if (r_base + rr < n_out) {
+            const uint8_t* p = weights + (size_t) (r_base + rr) * rbytes + blk_off;
+            if constexpr (GTYPE == kTypeQ4_K || GTYPE == kTypeQ5_K) {
+                const uint32_t* p32 = reinterpret_cast<const uint32_t*>(p);
+                for (int u = lane; u < full_u32; u += 32) s_w[rr][u] = __ldg(p32 + u);
+            } else {
+                for (int u = lane; u < full_u32; u += 32) {
+                    const uint16_t* p16 = reinterpret_cast<const uint16_t*>(p + u * 4);
+                    s_w[rr][u] = (uint32_t) __ldg(p16) | ((uint32_t) __ldg(p16 + 1) << 16);
+                }
+                if (has_tail2 && lane == 0) {
+                    s_w[rr][full_u32] = (uint32_t) __ldg(reinterpret_cast<const uint16_t*>(p + full_u32 * 4));
+                }
+            }
+        } else {
+            for (int u = lane; u < MAX_U32; u += 32) s_w[rr][u] = 0u;
+        }
+    }
+    __syncwarp();
+}
+
+// Fast shared-memory byte/half/u32 readers for staged rows in s_w (already 4-byte aligned at row start!).
+__device__ __forceinline__ uint32_t smem_ld32_b2(const uint8_t* p) {
+    const uint16_t* p16 = reinterpret_cast<const uint16_t*>(p);
+    return (uint32_t) p16[0] | ((uint32_t) p16[1] << 16);
+}
+
+__device__ __forceinline__ float smem_ld_fp16_b2(const uint8_t* p) {
+    return __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(p)));
+}
+
+template <int GTYPE, int NTILES>
+__device__ __forceinline__ void eval_kchunk_tc_smem(
+    const uint32_t (&s_w)[16][chunk_u32_of<GTYPE>()],
+    bool v0, bool v1, int nb_here,
+    const int8_t* __restrict__ s_xq, const float* __restrict__ s_dx, const float* __restrict__ s_xs,
+    int g, int tig, float (&acc)[NTILES][4]) {
+#if STRATA_DENSE_I8_SM80
+    const uint8_t* blk0 = reinterpret_cast<const uint8_t*>(s_w[g]);
+    const uint8_t* blk1 = reinterpret_cast<const uint8_t*>(s_w[8 + g]);
+
+    if constexpr (GTYPE == kTypeQ8_0) {
+        for (int b = 0; b < nb_here; ++b) {
+            const uint8_t* p0 = blk0 + b * 34;
+            const uint8_t* p1 = blk1 + b * 34;
+            const float dw0 = v0 ? smem_ld_fp16_b2(p0) : 0.0f;
+            const float dw1 = v1 ? smem_ld_fp16_b2(p1) : 0.0f;
+            const uint32_t a0 = v0 ? smem_ld32_b2(p0 + 2 + tig * 4) : 0u;
+            const uint32_t a2 = v0 ? smem_ld32_b2(p0 + 18 + tig * 4) : 0u;
+            const uint32_t a1 = v1 ? smem_ld32_b2(p1 + 2 + tig * 4) : 0u;
+            const uint32_t a3 = v1 ? smem_ld32_b2(p1 + 18 + tig * 4) : 0u;
+
+#pragma unroll
+            for (int nt = 0; nt < NTILES; ++nt) {
+                const int tg = nt * 8 + g;
+                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + tig * 4);
+                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + 16 + tig * 4);
+                int32_t d[4] = {0, 0, 0, 0};
+                mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
+
+                const int t0 = nt * 8 + 2 * tig;
+                const int t1 = t0 + 1;
+                const float dx0 = s_dx[t0 * 8 + b];
+                const float dx1 = s_dx[t1 * 8 + b];
+                acc[nt][0] = fmaf(dw0 * dx0, (float) d[0], acc[nt][0]);
+                acc[nt][1] = fmaf(dw0 * dx1, (float) d[1], acc[nt][1]);
+                acc[nt][2] = fmaf(dw1 * dx0, (float) d[2], acc[nt][2]);
+                acc[nt][3] = fmaf(dw1 * dx1, (float) d[3], acc[nt][3]);
+            }
+        }
+    } else if constexpr (GTYPE == kTypeQ4_K) {
+        const half2 dm0 = v0 ? *reinterpret_cast<const half2*>(blk0) : __floats2half2_rn(0.0f, 0.0f);
+        const half2 dm1 = v1 ? *reinterpret_cast<const half2*>(blk1) : __floats2half2_rn(0.0f, 0.0f);
+        const float d0_all = __low2float(dm0), m0_all = __high2float(dm0);
+        const float d1_all = __low2float(dm1), m1_all = __high2float(dm1);
+        const uint8_t* sc0_p = blk0 + 4;
+        const uint8_t* sc1_p = blk1 + 4;
+        const uint8_t* qs0_p = blk0 + 16;
+        const uint8_t* qs1_p = blk1 + 16;
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t raw0_lo = v0 ? *reinterpret_cast<const uint32_t*>(qs0_p + 32 * j + tig * 4) : 0u;
+            const uint32_t raw0_hi = v0 ? *reinterpret_cast<const uint32_t*>(qs0_p + 32 * j + 16 + tig * 4) : 0u;
+            const uint32_t raw1_lo = v1 ? *reinterpret_cast<const uint32_t*>(qs1_p + 32 * j + tig * 4) : 0u;
+            const uint32_t raw1_hi = v1 ? *reinterpret_cast<const uint32_t*>(qs1_p + 32 * j + 16 + tig * 4) : 0u;
+
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                const int b = 2 * j + hi;
+                float s0 = 0.0f, mn0 = 0.0f, s1 = 0.0f, mn1 = 0.0f;
+                if (v0) decode_k4_scale_min(sc0_p, b, s0, mn0);
+                if (v1) decode_k4_scale_min(sc1_p, b, s1, mn1);
+                const float ds0 = d0_all * s0, ms0 = m0_all * mn0;
+                const float ds1 = d1_all * s1, ms1 = m1_all * mn1;
+
+                const uint32_t a0 = (hi == 0) ? (raw0_lo & 0x0F0F0F0Fu) : ((raw0_lo >> 4) & 0x0F0F0F0Fu);
+                const uint32_t a2 = (hi == 0) ? (raw0_hi & 0x0F0F0F0Fu) : ((raw0_hi >> 4) & 0x0F0F0F0Fu);
+                const uint32_t a1 = (hi == 0) ? (raw1_lo & 0x0F0F0F0Fu) : ((raw1_lo >> 4) & 0x0F0F0F0Fu);
+                const uint32_t a3 = (hi == 0) ? (raw1_hi & 0x0F0F0F0Fu) : ((raw1_hi >> 4) & 0x0F0F0F0Fu);
+
+#pragma unroll
+                for (int nt = 0; nt < NTILES; ++nt) {
+                    const int tg = nt * 8 + g;
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + tig * 4);
+                    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + 16 + tig * 4);
+                    int32_t d[4] = {0, 0, 0, 0};
+                    mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
+
+                    const int t0 = nt * 8 + 2 * tig;
+                    const int t1 = t0 + 1;
+                    acc[nt][0] = fmaf(ds0 * s_dx[t0 * 8 + b], (float) d[0], fmaf(-ms0, s_xs[t0 * 8 + b], acc[nt][0]));
+                    acc[nt][1] = fmaf(ds0 * s_dx[t1 * 8 + b], (float) d[1], fmaf(-ms0, s_xs[t1 * 8 + b], acc[nt][1]));
+                    acc[nt][2] = fmaf(ds1 * s_dx[t0 * 8 + b], (float) d[2], fmaf(-ms1, s_xs[t0 * 8 + b], acc[nt][2]));
+                    acc[nt][3] = fmaf(ds1 * s_dx[t1 * 8 + b], (float) d[3], fmaf(-ms1, s_xs[t1 * 8 + b], acc[nt][3]));
+                }
+            }
+        }
+    } else if constexpr (GTYPE == kTypeQ5_K) {
+        const half2 dm0 = v0 ? *reinterpret_cast<const half2*>(blk0) : __floats2half2_rn(0.0f, 0.0f);
+        const half2 dm1 = v1 ? *reinterpret_cast<const half2*>(blk1) : __floats2half2_rn(0.0f, 0.0f);
+        const float d0_all = __low2float(dm0), m0_all = __high2float(dm0);
+        const float d1_all = __low2float(dm1), m1_all = __high2float(dm1);
+        const uint8_t* sc0_p = blk0 + 4;
+        const uint8_t* sc1_p = blk1 + 4;
+        const uint32_t qh0_lo = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 16 + tig * 4) : 0u;
+        const uint32_t qh0_hi = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 32 + tig * 4) : 0u;
+        const uint32_t qh1_lo = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 16 + tig * 4) : 0u;
+        const uint32_t qh1_hi = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 32 + tig * 4) : 0u;
+        const uint8_t* qs0_p = blk0 + 48;
+        const uint8_t* qs1_p = blk1 + 48;
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t raw0_lo = v0 ? *reinterpret_cast<const uint32_t*>(qs0_p + 32 * j + tig * 4) : 0u;
+            const uint32_t raw0_hi = v0 ? *reinterpret_cast<const uint32_t*>(qs0_p + 32 * j + 16 + tig * 4) : 0u;
+            const uint32_t raw1_lo = v1 ? *reinterpret_cast<const uint32_t*>(qs1_p + 32 * j + tig * 4) : 0u;
+            const uint32_t raw1_hi = v1 ? *reinterpret_cast<const uint32_t*>(qs1_p + 32 * j + 16 + tig * 4) : 0u;
+
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                const int b = 2 * j + hi;
+                float s0 = 0.0f, mn0 = 0.0f, s1 = 0.0f, mn1 = 0.0f;
+                if (v0) decode_k4_scale_min(sc0_p, b, s0, mn0);
+                if (v1) decode_k4_scale_min(sc1_p, b, s1, mn1);
+                const float ds0 = d0_all * s0, ms0 = m0_all * mn0;
+                const float ds1 = d1_all * s1, ms1 = m1_all * mn1;
+
+                const uint32_t q4_0l = (hi == 0) ? (raw0_lo & 0x0F0F0F0Fu) : ((raw0_lo >> 4) & 0x0F0F0F0Fu);
+                const uint32_t q4_0h = (hi == 0) ? (raw0_hi & 0x0F0F0F0Fu) : ((raw0_hi >> 4) & 0x0F0F0F0Fu);
+                const uint32_t q4_1l = (hi == 0) ? (raw1_lo & 0x0F0F0F0Fu) : ((raw1_lo >> 4) & 0x0F0F0F0Fu);
+                const uint32_t q4_1h = (hi == 0) ? (raw1_hi & 0x0F0F0F0Fu) : ((raw1_hi >> 4) & 0x0F0F0F0Fu);
+
+                const uint32_t a0 = q4_0l | (((qh0_lo >> b) & 0x01010101u) << 4);
+                const uint32_t a2 = q4_0h | (((qh0_hi >> b) & 0x01010101u) << 4);
+                const uint32_t a1 = q4_1l | (((qh1_lo >> b) & 0x01010101u) << 4);
+                const uint32_t a3 = q4_1h | (((qh1_hi >> b) & 0x01010101u) << 4);
+
+#pragma unroll
+                for (int nt = 0; nt < NTILES; ++nt) {
+                    const int tg = nt * 8 + g;
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + tig * 4);
+                    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + 16 + tig * 4);
+                    int32_t d[4] = {0, 0, 0, 0};
+                    mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
+
+                    const int t0 = nt * 8 + 2 * tig;
+                    const int t1 = t0 + 1;
+                    acc[nt][0] = fmaf(ds0 * s_dx[t0 * 8 + b], (float) d[0], fmaf(-ms0, s_xs[t0 * 8 + b], acc[nt][0]));
+                    acc[nt][1] = fmaf(ds0 * s_dx[t1 * 8 + b], (float) d[1], fmaf(-ms0, s_xs[t1 * 8 + b], acc[nt][1]));
+                    acc[nt][2] = fmaf(ds1 * s_dx[t0 * 8 + b], (float) d[2], fmaf(-ms1, s_xs[t0 * 8 + b], acc[nt][2]));
+                    acc[nt][3] = fmaf(ds1 * s_dx[t1 * 8 + b], (float) d[3], fmaf(-ms1, s_xs[t1 * 8 + b], acc[nt][3]));
+                }
+            }
+        }
+    } else if constexpr (GTYPE == kTypeQ6_K) {
+        const float d0_all = v0 ? smem_ld_fp16_b2(blk0 + 208) : 0.0f;
+        const float d1_all = v1 ? smem_ld_fp16_b2(blk1 + 208) : 0.0f;
+        const int8_t* sc0_p = reinterpret_cast<const int8_t*>(blk0 + 192);
+        const int8_t* sc1_p = reinterpret_cast<const int8_t*>(blk1 + 192);
+
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+#pragma unroll
+            for (int half16 = 0; half16 < 2; ++half16) {
+                const int l0 = half16 * 16;
+                const uint32_t qh0 = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 128 + 32 * n + l0 + tig * 4) : 0u;
+                const uint32_t qh1 = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 128 + 32 * n + l0 + tig * 4) : 0u;
+                const uint32_t ql0_a = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 64 * n + l0 + tig * 4) : 0u;
+                const uint32_t ql0_b = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 64 * n + 32 + l0 + tig * 4) : 0u;
+                const uint32_t ql1_a = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 64 * n + l0 + tig * 4) : 0u;
+                const uint32_t ql1_b = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 64 * n + 32 + l0 + tig * 4) : 0u;
+
+#pragma unroll
+                for (int qid = 0; qid < 4; ++qid) {
+                    const int sub = 8 * n + 2 * qid + half16;
+                    const int b32 = sub >> 1;
+                    const float dw0 = v0 ? (d0_all * (float) sc0_p[sub]) : 0.0f;
+                    const float dw1 = v1 ? (d1_all * (float) sc1_p[sub]) : 0.0f;
+
+                    const uint32_t src0 = (qid & 1) ? ql0_b : ql0_a;
+                    const uint32_t src1 = (qid & 1) ? ql1_b : ql1_a;
+                    const uint32_t lo0 = (qid < 2) ? (src0 & 0x0F0F0F0Fu) : ((src0 >> 4) & 0x0F0F0F0Fu);
+                    const uint32_t lo1 = (qid < 2) ? (src1 & 0x0F0F0F0Fu) : ((src1 >> 4) & 0x0F0F0F0Fu);
+                    const uint32_t a0 = __vsub4(lo0 | (((qh0 >> (2 * qid)) & 0x03030303u) << 4), 0x20202020u);
+                    const uint32_t a1 = __vsub4(lo1 | (((qh1 >> (2 * qid)) & 0x03030303u) << 4), 0x20202020u);
+
+#pragma unroll
+                    for (int nt = 0; nt < NTILES; ++nt) {
+                        const int tg = nt * 8 + g;
+                        const uint32_t b0 = *reinterpret_cast<const uint32_t*>(
+                            s_xq + (tg * 8 + b32) * 32 + half16 * 16 + tig * 4);
+                        int32_t d[4] = {0, 0, 0, 0};
+                        mma_s8_m16n8k16(d, a0, a1, b0);
+
+                        const int t0 = nt * 8 + 2 * tig;
+                        const int t1 = t0 + 1;
+                        acc[nt][0] = fmaf(dw0 * s_dx[t0 * 8 + b32], (float) d[0], acc[nt][0]);
+                        acc[nt][1] = fmaf(dw0 * s_dx[t1 * 8 + b32], (float) d[1], acc[nt][1]);
+                        acc[nt][2] = fmaf(dw1 * s_dx[t0 * 8 + b32], (float) d[2], acc[nt][2]);
+                        acc[nt][3] = fmaf(dw1 * s_dx[t1 * 8 + b32], (float) d[3], acc[nt][3]);
+                    }
+                }
+            }
+        }
+    } else if constexpr (GTYPE == kTypeIQ4_XS) {
+        const float d0_all = v0 ? smem_ld_fp16_b2(blk0) : 0.0f;
+        const float d1_all = v1 ? smem_ld_fp16_b2(blk1) : 0.0f;
+        const uint16_t sh0 = v0 ? *reinterpret_cast<const uint16_t*>(blk0 + 2) : 0u;
+        const uint16_t sh1 = v1 ? *reinterpret_cast<const uint16_t*>(blk1 + 2) : 0u;
+        const uint32_t sl0 = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 4) : 0u;
+        const uint32_t sl1 = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 4) : 0u;
+
+#pragma unroll
+        for (int b = 0; b < 8; ++b) {
+            const int ls0 = (int) (((sl0 >> (4 * b)) & 0x0Fu) | (((sh0 >> (2 * b)) & 3u) << 4)) - 32;
+            const int ls1 = (int) (((sl1 >> (4 * b)) & 0x0Fu) | (((sh1 >> (2 * b)) & 3u) << 4)) - 32;
+            const float dw0 = v0 ? (d0_all * (float) ls0) : 0.0f;
+            const float dw1 = v1 ? (d1_all * (float) ls1) : 0.0f;
+
+            const uint32_t raw0 = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 8 + b * 16 + tig * 4) : 0u;
+            const uint32_t raw1 = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 8 + b * 16 + tig * 4) : 0u;
+            const uint2 w0_lh = iq4nl_lut8(raw0);
+            const uint2 w1_lh = iq4nl_lut8(raw1);
+
+#pragma unroll
+            for (int nt = 0; nt < NTILES; ++nt) {
+                const int tg = nt * 8 + g;
+                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + tig * 4);
+                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + 16 + tig * 4);
+                int32_t d[4] = {0, 0, 0, 0};
+                mma_s8_m16n8k32(d, w0_lh.x, w1_lh.x, w0_lh.y, w1_lh.y, b0, b1);
+
+                const int t0 = nt * 8 + 2 * tig;
+                const int t1 = t0 + 1;
+                acc[nt][0] = fmaf(dw0 * s_dx[t0 * 8 + b], (float) d[0], acc[nt][0]);
+                acc[nt][1] = fmaf(dw0 * s_dx[t1 * 8 + b], (float) d[1], acc[nt][1]);
+                acc[nt][2] = fmaf(dw1 * s_dx[t0 * 8 + b], (float) d[2], acc[nt][2]);
+                acc[nt][3] = fmaf(dw1 * s_dx[t1 * 8 + b], (float) d[3], acc[nt][3]);
+            }
+        }
+    }
+#else
+    (void) s_w; (void) v0; (void) v1; (void) nb_here;
+    (void) s_xq; (void) s_dx; (void) s_xs; (void) g; (void) tig; (void) acc;
+#endif
+}
+
+// ---- High-Occupancy 8-Warp K-Split Decode / Verify Kernel: 16 output rows x (NTILES*8) tokens per 256-thread CTA ----
+// All 8 warps cooperate on ONE 16-row tile per K=256 superblock:
+//   - Load phase: each warp loads ONLY 2 rows coalesced into shared s_w[16][U32] (~3.4 KB total for the whole CTA!),
+//     while cooperatively loading T*8 activation blocks into s_xq (~2.0 KB). Total smem ~6-9 KB -> 6+ CTAs/SM = 48 warps/SM!
+//   - Compute phase: warp w (0..7) owns sub-block b = w (32 elements of the 256-elem superblock), executing just ONE
+//     mma.m16n8k32.s8 (or two m16n8k16 for Q6_K) per 8-token tile!
+//   - Epilogue: single warp-reduction across the 8 warps at the very end of the K loop!
+template <int GTYPE, int NTILES>
+__global__ void __launch_bounds__(256) dense_i8_tc_decode_ksplit_kernel(
+    const uint8_t* __restrict__ weights, const Q81Block* __restrict__ xq, float* __restrict__ y,
+    int n_in, int n_out, int T) {
+#if STRATA_DENSE_I8_SM80
+    constexpr int MAX_T = NTILES * 8;
+    constexpr int MAX_U32 = chunk_u32_of<GTYPE>();
+    const int tid = (int) threadIdx.x;
+    const int warp = tid >> 5;   // 0..7 -> sub-block b = warp within each K=256 chunk!
+    const int lane = tid & 31;
+    const int g = lane >> 2;     // 0..7
+    const int tig = lane & 3;    // 0..3
+
+    const int r_base = (int) blockIdx.x * 16;
+    const int r0 = r_base + g;
+    const int r1 = r_base + 8 + g;
+    const bool v0 = r0 < n_out;
+    const bool v1 = r1 < n_out;
+
+    const int nb32 = n_in >> 5;
+    const size_t rbytes = row_bytes_of(GTYPE, n_in);
+    constexpr size_t kChunkBytes = (GTYPE == kTypeQ8_0) ? 272u :
+                                   (GTYPE == kTypeQ4_K) ? 144u :
+                                   (GTYPE == kTypeQ5_K) ? 176u :
+                                   (GTYPE == kTypeQ6_K) ? 210u : 136u;
+
+    __shared__ alignas(16) int8_t s_xq[MAX_T * 256];
+    __shared__ float s_dx[MAX_T * 8];
+    __shared__ float s_xs[MAX_T * 8];
+    __shared__ alignas(16) uint32_t s_w[16][MAX_U32];
+
+    float acc[NTILES][4];
+#pragma unroll
+    for (int nt = 0; nt < NTILES; ++nt) {
+        acc[nt][0] = 0.0f; acc[nt][1] = 0.0f; acc[nt][2] = 0.0f; acc[nt][3] = 0.0f;
+    }
+
+    const uint8_t* blk0 = reinterpret_cast<const uint8_t*>(s_w[g]);
+    const uint8_t* blk1 = reinterpret_cast<const uint8_t*>(s_w[8 + g]);
+
+    for (int k_blk0 = 0; k_blk0 < nb32; k_blk0 += 8) {
+        const int nb_here = min(8, nb32 - k_blk0);
+        const int n_bytes = (GTYPE == kTypeQ8_0) ? (nb_here * 34) : (int) kChunkBytes;
+        const int full_u32 = n_bytes >> 2;
+        const bool has_tail2 = (n_bytes & 2) != 0;
+        const size_t blk_off = (GTYPE == kTypeQ8_0) ? ((size_t) k_blk0 * 34u)
+                                                    : ((size_t) (k_blk0 >> 3) * kChunkBytes);
+
+        // 256 threads load <= 128 activation blocks (at most 1 block per 2 threads -> 1 cycle!).
+        if (tid < MAX_T * 8) {
+            const int t = tid >> 3;
+            const int b = tid & 7;
+            if (t < T && b < nb_here) {
+                const Q81Block& blk = xq[(size_t) t * nb32 + k_blk0 + b];
+                const float dx = __low2float(blk.ds);
+                s_dx[tid] = dx;
+                const uint32_t* src32 = reinterpret_cast<const uint32_t*>(blk.qs);
+                const uint32_t x0 = src32[0], x1 = src32[1], x2 = src32[2], x3 = src32[3];
+                const uint32_t x4 = src32[4], x5 = src32[5], x6 = src32[6], x7 = src32[7];
+                if constexpr (GTYPE == kTypeQ4_K || GTYPE == kTypeQ5_K) {
+                    int qsum = __dp4a(0x01010101, (int) x0, 0);
+                    qsum = __dp4a(0x01010101, (int) x1, qsum);
+                    qsum = __dp4a(0x01010101, (int) x2, qsum);
+                    qsum = __dp4a(0x01010101, (int) x3, qsum);
+                    qsum = __dp4a(0x01010101, (int) x4, qsum);
+                    qsum = __dp4a(0x01010101, (int) x5, qsum);
+                    qsum = __dp4a(0x01010101, (int) x6, qsum);
+                    qsum = __dp4a(0x01010101, (int) x7, qsum);
+                    s_xs[tid] = dx * (float) qsum;
+                }
+                uint4* dst4 = reinterpret_cast<uint4*>(s_xq + tid * 32);
+                dst4[0] = make_uint4(x0, x1, x2, x3);
+                dst4[1] = make_uint4(x4, x5, x6, x7);
+            } else {
+                s_dx[tid] = 0.0f;
+                if constexpr (GTYPE == kTypeQ4_K || GTYPE == kTypeQ5_K) s_xs[tid] = 0.0f;
+                uint4* dst4 = reinterpret_cast<uint4*>(s_xq + tid * 32);
+                dst4[0] = make_uint4(0u, 0u, 0u, 0u);
+                dst4[1] = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+
+        // 8 warps cooperatively load 16 weight rows (ONLY 2 rows per warp, 100% coalesced 128B transactions!).
+#pragma unroll
+        for (int rr = 0; rr < 2; ++rr) {
+            const int lr = warp * 2 + rr;
+            if (r_base + lr < n_out) {
+                const uint8_t* p = weights + (size_t) (r_base + lr) * rbytes + blk_off;
+                if constexpr (GTYPE == kTypeQ4_K || GTYPE == kTypeQ5_K) {
+                    const uint32_t* p32 = reinterpret_cast<const uint32_t*>(p);
+                    for (int u = lane; u < full_u32; u += 32) s_w[lr][u] = __ldg(p32 + u);
+                } else {
+                    const bool al4 = (((uintptr_t) p & 3u) == 0u);
+                    for (int u = lane; u < full_u32; u += 32) {
+                        if (al4) {
+                            s_w[lr][u] = __ldg(reinterpret_cast<const uint32_t*>(p) + u);
+                        } else {
+                            const uint16_t* p16 = reinterpret_cast<const uint16_t*>(p + u * 4);
+                            s_w[lr][u] = (uint32_t) __ldg(p16) | ((uint32_t) __ldg(p16 + 1) << 16);
+                        }
+                    }
+                    if (has_tail2 && lane == 0) {
+                        s_w[lr][full_u32] = (uint32_t) __ldg(reinterpret_cast<const uint16_t*>(p + full_u32 * 4));
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // Each warp w (0..7) evaluates ONLY sub-block b = warp (32 elements)!
+        const int b = warp;
+        if (b < nb_here) {
+            if constexpr (GTYPE == kTypeQ8_0) {
+                const uint8_t* p0 = blk0 + b * 34;
+                const uint8_t* p1 = blk1 + b * 34;
+                const float dw0 = v0 ? smem_ld_fp16_b2(p0) : 0.0f;
+                const float dw1 = v1 ? smem_ld_fp16_b2(p1) : 0.0f;
+                const uint32_t a0 = v0 ? smem_ld32_b2(p0 + 2 + tig * 4) : 0u;
+                const uint32_t a2 = v0 ? smem_ld32_b2(p0 + 18 + tig * 4) : 0u;
+                const uint32_t a1 = v1 ? smem_ld32_b2(p1 + 2 + tig * 4) : 0u;
+                const uint32_t a3 = v1 ? smem_ld32_b2(p1 + 18 + tig * 4) : 0u;
+#pragma unroll
+                for (int nt = 0; nt < NTILES; ++nt) {
+                    const int tg = nt * 8 + g;
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + tig * 4);
+                    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + 16 + tig * 4);
+                    int32_t d[4] = {0, 0, 0, 0};
+                    mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
+                    const int t0 = nt * 8 + 2 * tig;
+                    const int t1 = t0 + 1;
+                    acc[nt][0] = fmaf(dw0 * s_dx[t0 * 8 + b], (float) d[0], acc[nt][0]);
+                    acc[nt][1] = fmaf(dw0 * s_dx[t1 * 8 + b], (float) d[1], acc[nt][1]);
+                    acc[nt][2] = fmaf(dw1 * s_dx[t0 * 8 + b], (float) d[2], acc[nt][2]);
+                    acc[nt][3] = fmaf(dw1 * s_dx[t1 * 8 + b], (float) d[3], acc[nt][3]);
+                }
+            } else if constexpr (GTYPE == kTypeQ4_K) {
+                const half2 dm0 = v0 ? *reinterpret_cast<const half2*>(blk0) : __floats2half2_rn(0.0f, 0.0f);
+                const half2 dm1 = v1 ? *reinterpret_cast<const half2*>(blk1) : __floats2half2_rn(0.0f, 0.0f);
+                float s0 = 0.0f, mn0 = 0.0f, s1 = 0.0f, mn1 = 0.0f;
+                if (v0) decode_k4_scale_min(blk0 + 4, b, s0, mn0);
+                if (v1) decode_k4_scale_min(blk1 + 4, b, s1, mn1);
+                const float ds0 = __low2float(dm0) * s0, ms0 = __high2float(dm0) * mn0;
+                const float ds1 = __low2float(dm1) * s1, ms1 = __high2float(dm1) * mn1;
+                const int j = b >> 1, hi = b & 1;
+                const uint32_t raw0_lo = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 16 + 32 * j + tig * 4) : 0u;
+                const uint32_t raw0_hi = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 16 + 32 * j + 16 + tig * 4) : 0u;
+                const uint32_t raw1_lo = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 16 + 32 * j + tig * 4) : 0u;
+                const uint32_t raw1_hi = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 16 + 32 * j + 16 + tig * 4) : 0u;
+                const uint32_t a0 = hi ? ((raw0_lo >> 4) & 0x0F0F0F0Fu) : (raw0_lo & 0x0F0F0F0Fu);
+                const uint32_t a2 = hi ? ((raw0_hi >> 4) & 0x0F0F0F0Fu) : (raw0_hi & 0x0F0F0F0Fu);
+                const uint32_t a1 = hi ? ((raw1_lo >> 4) & 0x0F0F0F0Fu) : (raw1_lo & 0x0F0F0F0Fu);
+                const uint32_t a3 = hi ? ((raw1_hi >> 4) & 0x0F0F0F0Fu) : (raw1_hi & 0x0F0F0F0Fu);
+#pragma unroll
+                for (int nt = 0; nt < NTILES; ++nt) {
+                    const int tg = nt * 8 + g;
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + tig * 4);
+                    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + 16 + tig * 4);
+                    int32_t d[4] = {0, 0, 0, 0};
+                    mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
+                    const int t0 = nt * 8 + 2 * tig;
+                    const int t1 = t0 + 1;
+                    acc[nt][0] = fmaf(ds0 * s_dx[t0 * 8 + b], (float) d[0], fmaf(-ms0, s_xs[t0 * 8 + b], acc[nt][0]));
+                    acc[nt][1] = fmaf(ds0 * s_dx[t1 * 8 + b], (float) d[1], fmaf(-ms0, s_xs[t1 * 8 + b], acc[nt][1]));
+                    acc[nt][2] = fmaf(ds1 * s_dx[t0 * 8 + b], (float) d[2], fmaf(-ms1, s_xs[t0 * 8 + b], acc[nt][2]));
+                    acc[nt][3] = fmaf(ds1 * s_dx[t1 * 8 + b], (float) d[3], fmaf(-ms1, s_xs[t1 * 8 + b], acc[nt][3]));
+                }
+            } else if constexpr (GTYPE == kTypeQ5_K) {
+                const half2 dm0 = v0 ? *reinterpret_cast<const half2*>(blk0) : __floats2half2_rn(0.0f, 0.0f);
+                const half2 dm1 = v1 ? *reinterpret_cast<const half2*>(blk1) : __floats2half2_rn(0.0f, 0.0f);
+                float s0 = 0.0f, mn0 = 0.0f, s1 = 0.0f, mn1 = 0.0f;
+                if (v0) decode_k4_scale_min(blk0 + 4, b, s0, mn0);
+                if (v1) decode_k4_scale_min(blk1 + 4, b, s1, mn1);
+                const float ds0 = __low2float(dm0) * s0, ms0 = __high2float(dm0) * mn0;
+                const float ds1 = __low2float(dm1) * s1, ms1 = __high2float(dm1) * mn1;
+                const int j = b >> 1, hi = b & 1;
+                const uint32_t qh0_lo = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 16 + tig * 4) : 0u;
+                const uint32_t qh0_hi = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 32 + tig * 4) : 0u;
+                const uint32_t qh1_lo = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 16 + tig * 4) : 0u;
+                const uint32_t qh1_hi = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 32 + tig * 4) : 0u;
+                const uint32_t raw0_lo = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 48 + 32 * j + tig * 4) : 0u;
+                const uint32_t raw0_hi = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 48 + 32 * j + 16 + tig * 4) : 0u;
+                const uint32_t raw1_lo = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 48 + 32 * j + tig * 4) : 0u;
+                const uint32_t raw1_hi = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 48 + 32 * j + 16 + tig * 4) : 0u;
+                const uint32_t q4_0l = hi ? ((raw0_lo >> 4) & 0x0F0F0F0Fu) : (raw0_lo & 0x0F0F0F0Fu);
+                const uint32_t q4_0h = hi ? ((raw0_hi >> 4) & 0x0F0F0F0Fu) : (raw0_hi & 0x0F0F0F0Fu);
+                const uint32_t q4_1l = hi ? ((raw1_lo >> 4) & 0x0F0F0F0Fu) : (raw1_lo & 0x0F0F0F0Fu);
+                const uint32_t q4_1h = hi ? ((raw1_hi >> 4) & 0x0F0F0F0Fu) : (raw1_hi & 0x0F0F0F0Fu);
+                const uint32_t a0 = q4_0l | (((qh0_lo >> b) & 0x01010101u) << 4);
+                const uint32_t a2 = q4_0h | (((qh0_hi >> b) & 0x01010101u) << 4);
+                const uint32_t a1 = q4_1l | (((qh1_lo >> b) & 0x01010101u) << 4);
+                const uint32_t a3 = q4_1h | (((qh1_hi >> b) & 0x01010101u) << 4);
+#pragma unroll
+                for (int nt = 0; nt < NTILES; ++nt) {
+                    const int tg = nt * 8 + g;
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + tig * 4);
+                    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + 16 + tig * 4);
+                    int32_t d[4] = {0, 0, 0, 0};
+                    mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
+                    const int t0 = nt * 8 + 2 * tig;
+                    const int t1 = t0 + 1;
+                    acc[nt][0] = fmaf(ds0 * s_dx[t0 * 8 + b], (float) d[0], fmaf(-ms0, s_xs[t0 * 8 + b], acc[nt][0]));
+                    acc[nt][1] = fmaf(ds0 * s_dx[t1 * 8 + b], (float) d[1], fmaf(-ms0, s_xs[t1 * 8 + b], acc[nt][1]));
+                    acc[nt][2] = fmaf(ds1 * s_dx[t0 * 8 + b], (float) d[2], fmaf(-ms1, s_xs[t0 * 8 + b], acc[nt][2]));
+                    acc[nt][3] = fmaf(ds1 * s_dx[t1 * 8 + b], (float) d[3], fmaf(-ms1, s_xs[t1 * 8 + b], acc[nt][3]));
+                }
+            } else if constexpr (GTYPE == kTypeQ6_K) {
+                const float d0_all = v0 ? smem_ld_fp16_b2(blk0 + 208) : 0.0f;
+                const float d1_all = v1 ? smem_ld_fp16_b2(blk1 + 208) : 0.0f;
+                const int8_t* sc0_p = reinterpret_cast<const int8_t*>(blk0 + 192);
+                const int8_t* sc1_p = reinterpret_cast<const int8_t*>(blk1 + 192);
+                const int n = b >> 2;
+                const int qid = b & 3;
+                const int ql_off = 64 * n + ((qid & 1) ? 32 : 0);
+#pragma unroll
+                for (int half16 = 0; half16 < 2; ++half16) {
+                    const int l0 = half16 * 16;
+                    const int sub = 2 * b + half16;
+                    const float dw0 = v0 ? (d0_all * (float) sc0_p[sub]) : 0.0f;
+                    const float dw1 = v1 ? (d1_all * (float) sc1_p[sub]) : 0.0f;
+                    const uint32_t qh0 = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 128 + 32 * n + l0 + tig * 4) : 0u;
+                    const uint32_t qh1 = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 128 + 32 * n + l0 + tig * 4) : 0u;
+                    const uint32_t src0 = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + ql_off + l0 + tig * 4) : 0u;
+                    const uint32_t src1 = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + ql_off + l0 + tig * 4) : 0u;
+                    const uint32_t lo0 = (qid < 2) ? (src0 & 0x0F0F0F0Fu) : ((src0 >> 4) & 0x0F0F0F0Fu);
+                    const uint32_t lo1 = (qid < 2) ? (src1 & 0x0F0F0F0Fu) : ((src1 >> 4) & 0x0F0F0F0Fu);
+                    const uint32_t a0 = __vsub4(lo0 | (((qh0 >> (2 * qid)) & 0x03030303u) << 4), 0x20202020u);
+                    const uint32_t a1 = __vsub4(lo1 | (((qh1 >> (2 * qid)) & 0x03030303u) << 4), 0x20202020u);
+#pragma unroll
+                    for (int nt = 0; nt < NTILES; ++nt) {
+                        const int tg = nt * 8 + g;
+                        const uint32_t b0 = *reinterpret_cast<const uint32_t*>(
+                            s_xq + (tg * 8 + b) * 32 + l0 + tig * 4);
+                        int32_t d[4] = {0, 0, 0, 0};
+                        mma_s8_m16n8k16(d, a0, a1, b0);
+                        const int t0 = nt * 8 + 2 * tig;
+                        const int t1 = t0 + 1;
+                        acc[nt][0] = fmaf(dw0 * s_dx[t0 * 8 + b], (float) d[0], acc[nt][0]);
+                        acc[nt][1] = fmaf(dw0 * s_dx[t1 * 8 + b], (float) d[1], acc[nt][1]);
+                        acc[nt][2] = fmaf(dw1 * s_dx[t0 * 8 + b], (float) d[2], acc[nt][2]);
+                        acc[nt][3] = fmaf(dw1 * s_dx[t1 * 8 + b], (float) d[3], acc[nt][3]);
+                    }
+                }
+            } else if constexpr (GTYPE == kTypeIQ4_XS) {
+                const float d0_all = v0 ? smem_ld_fp16_b2(blk0) : 0.0f;
+                const float d1_all = v1 ? smem_ld_fp16_b2(blk1) : 0.0f;
+                const uint16_t sh0 = v0 ? *reinterpret_cast<const uint16_t*>(blk0 + 2) : 0u;
+                const uint16_t sh1 = v1 ? *reinterpret_cast<const uint16_t*>(blk1 + 2) : 0u;
+                const uint32_t sl0 = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 4) : 0u;
+                const uint32_t sl1 = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 4) : 0u;
+                const int ls0 = (int) (((sl0 >> (4 * b)) & 0x0Fu) | (((sh0 >> (2 * b)) & 3u) << 4)) - 32;
+                const int ls1 = (int) (((sl1 >> (4 * b)) & 0x0Fu) | (((sh1 >> (2 * b)) & 3u) << 4)) - 32;
+                const float dw0 = v0 ? (d0_all * (float) ls0) : 0.0f;
+                const float dw1 = v1 ? (d1_all * (float) ls1) : 0.0f;
+                const uint32_t raw0 = v0 ? *reinterpret_cast<const uint32_t*>(blk0 + 8 + b * 16 + tig * 4) : 0u;
+                const uint32_t raw1 = v1 ? *reinterpret_cast<const uint32_t*>(blk1 + 8 + b * 16 + tig * 4) : 0u;
+                const uint2 w0_lh = iq4nl_lut8(raw0);
+                const uint2 w1_lh = iq4nl_lut8(raw1);
+#pragma unroll
+                for (int nt = 0; nt < NTILES; ++nt) {
+                    const int tg = nt * 8 + g;
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + tig * 4);
+                    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(s_xq + (tg * 8 + b) * 32 + 16 + tig * 4);
+                    int32_t d[4] = {0, 0, 0, 0};
+                    mma_s8_m16n8k32(d, w0_lh.x, w1_lh.x, w0_lh.y, w1_lh.y, b0, b1);
+                    const int t0 = nt * 8 + 2 * tig;
+                    const int t1 = t0 + 1;
+                    acc[nt][0] = fmaf(dw0 * s_dx[t0 * 8 + b], (float) d[0], acc[nt][0]);
+                    acc[nt][1] = fmaf(dw0 * s_dx[t1 * 8 + b], (float) d[1], acc[nt][1]);
+                    acc[nt][2] = fmaf(dw1 * s_dx[t0 * 8 + b], (float) d[2], acc[nt][2]);
+                    acc[nt][3] = fmaf(dw1 * s_dx[t1 * 8 + b], (float) d[3], acc[nt][3]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Reduce the 8 warps' partial sums using s_w as scratch (8 * MAX_T * 16 floats <= 8 * 16 * 16 * 4 = 8 KB;
+    // use a dedicated small 4 KB / 8 KB smem buffer).
+    __shared__ float s_red[8][MAX_T][16];
+#pragma unroll
+    for (int nt = 0; nt < NTILES; ++nt) {
+        const int t0 = nt * 8 + 2 * tig;
+        const int t1 = t0 + 1;
+        s_red[warp][t0][g] = acc[nt][0];
+        s_red[warp][t1][g] = acc[nt][1];
+        s_red[warp][t0][8 + g] = acc[nt][2];
+        s_red[warp][t1][8 + g] = acc[nt][3];
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < T * 16; idx += 256) {
+        const int tk = idx >> 4;
+        const int lr = idx & 15;
+        const int row = r_base + lr;
+        if (row < n_out) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) sum += s_red[w][tk][lr];
+            y[(size_t) tk * n_out + row] = sum;
+        }
+    }
+#else
+    (void) weights; (void) xq; (void) y; (void) n_in; (void) n_out; (void) T;
+#endif
+}
+
+// ---- Decode / Verify Kernel (legacy multi-warp, unused when ksplit runs) ----
+template <int GTYPE, int NTILES, int WARPS = 2>
 __global__ void __launch_bounds__(WARPS * 32) dense_i8_tc_decode_kernel(
     const uint8_t* __restrict__ weights, const Q81Block* __restrict__ xq, float* __restrict__ y,
     int n_in, int n_out, int T) {
@@ -411,12 +1021,11 @@ __global__ void __launch_bounds__(WARPS * 32) dense_i8_tc_decode_kernel(
 
     const int nb32 = n_in >> 5;
     const size_t rbytes = row_bytes_of(GTYPE, n_in);
-    const uint8_t* w0 = weights + (size_t) (v0 ? r0 : 0) * rbytes;
-    const uint8_t* w1 = weights + (size_t) (v1 ? r1 : 0) * rbytes;
 
     __shared__ alignas(16) int8_t s_xq[MAX_T * 256];
     __shared__ float s_dx[MAX_T * 8];
     __shared__ float s_xs[MAX_T * 8];
+    __shared__ alignas(16) uint32_t s_w[WARPS][16][chunk_u32_of<GTYPE>()];
 
     float acc[NTILES][4];
 #pragma unroll
@@ -426,7 +1035,6 @@ __global__ void __launch_bounds__(WARPS * 32) dense_i8_tc_decode_kernel(
 
     for (int k_blk0 = 0; k_blk0 < nb32; k_blk0 += 8) {
         const int nb_here = min(8, nb32 - k_blk0);
-        // Load MAX_T * nb_here blocks (up to 128 Q81Blocks) cooperatively into ~5 KB smem!
         for (int idx = tid; idx < MAX_T * 8; idx += NTHREADS) {
             const int t = idx >> 3;
             const int b = idx & 7;
@@ -435,32 +1043,35 @@ __global__ void __launch_bounds__(WARPS * 32) dense_i8_tc_decode_kernel(
                 const float dx = __low2float(blk.ds);
                 s_dx[idx] = dx;
                 const uint32_t* src32 = reinterpret_cast<const uint32_t*>(blk.qs);
-                const uint32_t w0 = src32[0], w1 = src32[1], w2 = src32[2], w3 = src32[3];
-                const uint32_t w4 = src32[4], w5 = src32[5], w6 = src32[6], w7 = src32[7];
-                int qsum = __dp4a(0x01010101, (int) w0, 0);
-                qsum = __dp4a(0x01010101, (int) w1, qsum);
-                qsum = __dp4a(0x01010101, (int) w2, qsum);
-                qsum = __dp4a(0x01010101, (int) w3, qsum);
-                qsum = __dp4a(0x01010101, (int) w4, qsum);
-                qsum = __dp4a(0x01010101, (int) w5, qsum);
-                qsum = __dp4a(0x01010101, (int) w6, qsum);
-                qsum = __dp4a(0x01010101, (int) w7, qsum);
-                s_xs[idx] = dx * (float) qsum;
+                const uint32_t x0 = src32[0], x1 = src32[1], x2 = src32[2], x3 = src32[3];
+                const uint32_t x4 = src32[4], x5 = src32[5], x6 = src32[6], x7 = src32[7];
+                if constexpr (GTYPE == kTypeQ4_K || GTYPE == kTypeQ5_K) {
+                    int qsum = __dp4a(0x01010101, (int) x0, 0);
+                    qsum = __dp4a(0x01010101, (int) x1, qsum);
+                    qsum = __dp4a(0x01010101, (int) x2, qsum);
+                    qsum = __dp4a(0x01010101, (int) x3, qsum);
+                    qsum = __dp4a(0x01010101, (int) x4, qsum);
+                    qsum = __dp4a(0x01010101, (int) x5, qsum);
+                    qsum = __dp4a(0x01010101, (int) x6, qsum);
+                    qsum = __dp4a(0x01010101, (int) x7, qsum);
+                    s_xs[idx] = dx * (float) qsum;
+                }
                 uint4* dst4 = reinterpret_cast<uint4*>(s_xq + idx * 32);
-                dst4[0] = make_uint4(w0, w1, w2, w3);
-                dst4[1] = make_uint4(w4, w5, w6, w7);
+                dst4[0] = make_uint4(x0, x1, x2, x3);
+                dst4[1] = make_uint4(x4, x5, x6, x7);
             } else {
                 s_dx[idx] = 0.0f;
-                s_xs[idx] = 0.0f;
+                if constexpr (GTYPE == kTypeQ4_K || GTYPE == kTypeQ5_K) s_xs[idx] = 0.0f;
                 uint4* dst4 = reinterpret_cast<uint4*>(s_xq + idx * 32);
                 dst4[0] = make_uint4(0u, 0u, 0u, 0u);
                 dst4[1] = make_uint4(0u, 0u, 0u, 0u);
             }
         }
+        stage_dense_rows16<GTYPE>(weights, r_base, n_out, rbytes, k_blk0, nb_here, lane, s_w[warp]);
         __syncthreads();
 
-        if (v0 || v1) {
-            eval_kchunk_tc<GTYPE, NTILES>(w0, w1, v0, v1, nb_here, k_blk0, s_xq, s_dx, s_xs, g, tig, acc);
+        if (r_base < n_out) {
+            eval_kchunk_tc_smem<GTYPE, NTILES>(s_w[warp], v0, v1, nb_here, s_xq, s_dx, s_xs, g, tig, acc);
         }
         __syncthreads();
     }
@@ -659,23 +1270,16 @@ bool dense_i8_tc_mmvq(int ggml_type, const void* weights, const void* x_q8_1, fl
     if ((n_in % align_k) != 0) return false;
 
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
-    const bool narrow_n = (n_out <= 4096);
-    const unsigned grid = narrow_n ? (unsigned) ((n_out + 15) / 16) : (unsigned) ((n_out + 63) / 64);
+    const unsigned grid = (unsigned) ((n_out + 15) / 16);
     const auto* w = reinterpret_cast<const uint8_t*>(weights);
     const auto* xq = reinterpret_cast<const Q81Block*>(x_q8_1);
 
     auto launch = [&](auto type_tag) {
         constexpr int GT = decltype(type_tag)::value;
-        if (narrow_n) {
-            if (T <= 8) {
-                dense_i8_tc_decode_kernel<GT, 1, 1><<<grid, 32, 0, s>>>(w, xq, y, n_in, n_out, T);
-            } else {
-                dense_i8_tc_decode_kernel<GT, 2, 1><<<grid, 32, 0, s>>>(w, xq, y, n_in, n_out, T);
-            }
-        } else if (T <= 8) {
-            dense_i8_tc_decode_kernel<GT, 1, 4><<<grid, 128, 0, s>>>(w, xq, y, n_in, n_out, T);
+        if (T <= 8) {
+            dense_i8_tc_decode_ksplit_kernel<GT, 1><<<grid, 256, 0, s>>>(w, xq, y, n_in, n_out, T);
         } else {
-            dense_i8_tc_decode_kernel<GT, 2, 4><<<grid, 128, 0, s>>>(w, xq, y, n_in, n_out, T);
+            dense_i8_tc_decode_ksplit_kernel<GT, 2><<<grid, 256, 0, s>>>(w, xq, y, n_in, n_out, T);
         }
     };
 

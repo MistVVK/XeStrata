@@ -38,16 +38,25 @@ int main() {
     unset("STRATA_SM86_PERF");
     unset("STRATA_SM60_PERF");
     unset("STRATA_EMULATE_CC");
-    // GB10 (12.1): the five measured own-stack switches, and no stale MMQ STRATA_PREFILL_NVFP4=w4a4 default
+    // GB10 (12.1): the five measured own-stack switches + 0.2.19 pipeline/PLE/quant/HC_Q8 + native sm_121a mxf4nvf4
     {
         const auto t = nv_default_env(12, 1, false);
-        CHECK(t.size() == 5);
+        CHECK(t.size() == 12);
         CHECK(find(t, "STRATA_PF_FUSED") && *find(t, "STRATA_PF_FUSED") == "1");
         CHECK(find(t, "STRATA_PF_FUSED_KQ") && *find(t, "STRATA_PF_FUSED_KQ") == "1");
-        CHECK(!find(t, "STRATA_PREFILL_NVFP4"));
+        CHECK(find(t, "STRATA_PREFILL_NVFP4") && *find(t, "STRATA_PREFILL_NVFP4") == "w4a4");
         CHECK(find(t, "STRATA_HC_UPMIX") && *find(t, "STRATA_HC_UPMIX") == "1");
         CHECK(find(t, "STRATA_SIDE_MIXER") && *find(t, "STRATA_SIDE_MIXER") == "2");
         CHECK(find(t, "STRATA_SPEC_COST") && *find(t, "STRATA_SPEC_COST") == "1");
+        CHECK(find(t, "STRATA_DEQUANT_SIDE") && *find(t, "STRATA_DEQUANT_SIDE") == "1");
+        CHECK(find(t, "STRATA_QFUSE") && *find(t, "STRATA_QFUSE") == "1");
+        CHECK(find(t, "STRATA_LFUSE") && *find(t, "STRATA_LFUSE") == "1");
+        CHECK(find(t, "STRATA_PLE_COMPACT") && *find(t, "STRATA_PLE_COMPACT") == "1");
+        CHECK(find(t, "STRATA_PLE_COPY_STREAM") && *find(t, "STRATA_PLE_COPY_STREAM") == "1");
+        CHECK(find(t, "STRATA_HC_Q8") && *find(t, "STRATA_HC_Q8") == "1");
+        const auto t128 = nv_default_env(12, 1, false, 128ull << 30);
+        CHECK(find(t128, "STRATA_VERIFY_DEVICE_HITS") && *find(t128, "STRATA_VERIFY_DEVICE_HITS") == "1");
+        CHECK(!find(t128, "STRATA_ADAPT_FETCH"));
     }
     // STRATA_DEFAULTS=026 (the 0.2.7 master switch; the sm_121 table is newer than 0.2.6) empties it
     CHECK(nv_default_env(12, 1, true).empty());
@@ -55,7 +64,7 @@ int main() {
     put("STRATA_SM121_PERF", "0");
     CHECK(nv_default_env(12, 1, false).empty());
     put("STRATA_SM121_PERF", "1");
-    CHECK(nv_default_env(12, 1, false).size() == 5);
+    CHECK(nv_default_env(12, 1, false).size() == 12);
     unset("STRATA_SM121_PERF");
     // STRATA_PREFILL_NVFP4 resolution in builds without MMQ: w4a4 routes to fp4_tc where available and degrades to w4a8 (never FP16 cuBLAS) elsewhere
     {
@@ -74,11 +83,11 @@ int main() {
         CHECK(nvfp4_fused_covers("w4a4", false, false));
         CHECK(!nvfp4_fused_covers("fp16", true, false));
     }
-    // sm_120 (RTX 50 / PRO Blackwell): BW-13/BW-G + 0.2.19 exact overlap/PLE/quant fusions, Q8_0 HC, fused K-quant prefill, wide CPU share; STRATA_DEFAULTS=026 and STRATA_SM120_PERF=0 leave it out
+    // sm_120 (RTX 50 / PRO Blackwell): BW-13/BW-G + 0.2.19 exact overlap/PLE/quant fusions, Q8_0 HC, fused K-quant prefill, wide CPU share, native mxf4nvf4; STRATA_DEFAULTS=026 and STRATA_SM120_PERF=0 leave it out
     {
         unset("STRATA_SM120_PERF");
         const auto t = nv_default_env(12, 0, false);
-        CHECK(t.size() == 13 && find(t, "STRATA_HC_UPMIX") && *find(t, "STRATA_HC_UPMIX") == "1");
+        CHECK(t.size() == 14 && find(t, "STRATA_HC_UPMIX") && *find(t, "STRATA_HC_UPMIX") == "1");
         CHECK(find(t, "STRATA_L2_PF") && *find(t, "STRATA_L2_PF") == "1");                // BW-G
         CHECK(find(t, "STRATA_Q80_ROWS1") && *find(t, "STRATA_Q80_ROWS1") == "1");
         CHECK(find(t, "STRATA_EXP_MODE") && *find(t, "STRATA_EXP_MODE") == "8");
@@ -91,6 +100,7 @@ int main() {
         CHECK(find(t, "STRATA_PF_FUSED_KQ") && *find(t, "STRATA_PF_FUSED_KQ") == "1");
         CHECK(find(t, "STRATA_HC_Q8") && *find(t, "STRATA_HC_Q8") == "1");
         CHECK(find(t, "STRATA_PREFILL_CPU_SHARE_NT") && *find(t, "STRATA_PREFILL_CPU_SHARE_NT") == "32");
+        CHECK(find(t, "STRATA_PREFILL_NVFP4") && *find(t, "STRATA_PREFILL_NVFP4") == "w4a4");
         CHECK(!find(t, "STRATA_VERIFY_DEVICE_HITS") && !find(t, "STRATA_ADAPT_FETCH"));
         // <= 16 GiB gets ADAPT_FETCH=2; > 16 GiB (RTX 5090 32 GB / RTX PRO 5000) gets VERIFY_DEVICE_HITS=1
         const auto t16 = nv_default_env(12, 0, false, 16ull << 30);
@@ -103,12 +113,27 @@ int main() {
         put("STRATA_SM120_PERF", "0");
         CHECK(nv_default_env(12, 0, false).empty());
         put("STRATA_SM120_PERF", "1");
-        CHECK(nv_default_env(12, 0, false).size() == 13);
+        CHECK(nv_default_env(12, 0, false).size() == 14);
         unset("STRATA_SM120_PERF");
+    }
+    // sm_89 (RTX 40 / Ada Lovelace): 13 switches + VERIFY_DEVICE_HITS for > 16 GiB (RTX 4090 24 GB)
+    {
+        unset("STRATA_SM89_PERF");
+        const auto t = nv_default_env(8, 9, false);
+        CHECK(t.size() == 13 && find(t, "STRATA_HC_UPMIX") && *find(t, "STRATA_HC_UPMIX") == "1");
+        CHECK(find(t, "STRATA_L2_PF") && *find(t, "STRATA_L2_PF") == "1");
+        CHECK(find(t, "STRATA_PF_FUSED_KQ") && *find(t, "STRATA_PF_FUSED_KQ") == "1");
+        CHECK(find(t, "STRATA_HC_Q8") && *find(t, "STRATA_HC_Q8") == "1");
+        CHECK(!find(t, "STRATA_VERIFY_DEVICE_HITS"));
+        const auto t24 = nv_default_env(8, 9, false, 24ull << 30);
+        CHECK(t24.size() == 14 && find(t24, "STRATA_VERIFY_DEVICE_HITS") && *find(t24, "STRATA_VERIFY_DEVICE_HITS") == "1");
+        CHECK(nv_default_env(8, 9, true).empty());
+        put("STRATA_SM89_PERF", "0");
+        CHECK(nv_default_env(8, 9, false).empty());
+        unset("STRATA_SM89_PERF");
     }
     // sm_100 and the older cards get nothing from this file; the sm_86 / sm_60 tables are unchanged by the flag
     CHECK(nv_default_env(10, 0, false).empty());
-    CHECK(nv_default_env(8, 9, false).empty());
     CHECK(nv_default_env(7, 5, false).empty());
     {
         const auto a = nv_default_env(8, 6, false), b = nv_default_env(8, 6, true);
@@ -190,7 +215,7 @@ int main() {
         unset("STRATA_PF_FUSED_SM86");
     }
     // the other tables are unchanged by it
-    CHECK(nv_default_env(12, 0, false).size() == 13);   // sm_120 0.2.19 default stack
+    CHECK(nv_default_env(12, 0, false).size() == 14);   // sm_120 0.2.19 default stack
     // round 0212: the NVIDIA prompt-chunk ceiling of a bare `--prefill auto` (nv_chunk.hpp)
     CHECK(nv_chunk_ceiling(nullptr, false) == 32768);
     CHECK(nv_chunk_ceiling("1", false) == 32768);

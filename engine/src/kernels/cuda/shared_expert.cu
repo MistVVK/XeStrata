@@ -226,9 +226,19 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
         x_q8_1 = nw.q8_1;
     }
-    // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls)
-    if (!(pair && nw.gate_type == nw.up_type &&
-          native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok, stream))) {
+    // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls).
+    // When interleaved MMVQ covers gate/up (e.g. IQ4_XS / Q4_K / Q5_K / Q6_K) and q8_1_il scratch is provided,
+    // use bit-exact native_mmvq_il instead of plain native_mmvq for much higher memory bandwidth.
+    const bool use_gu_il = (nw.q8_1_il != nullptr) && (n_tok >= 2) &&
+                           (native_mmvq_il_supported(nw.gate_type, n_tok, (int) n_ff) ||
+                            native_mmvq_il_supported(nw.up_type, n_tok, (int) n_ff));
+    if (use_gu_il) {
+        native_q8_1_interleave(x_q8_1, nw.q8_1_il, (int) n_embd, n_tok, stream);
+        native_mmvq_il(nw.gate_type, nw.gate_data, x_q8_1, nw.q8_1_il, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+        native_mmvq_il(nw.up_type, nw.up_data, x_q8_1, nw.q8_1_il, up, (int) n_embd, (int) n_ff, n_tok, stream);
+    } else if (!(pair && nw.gate_type == nw.up_type &&
+                 native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff,
+                                  n_tok, stream))) {
         native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
         native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
     }
@@ -239,7 +249,12 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_swiglu_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate, up, gate, n);
         native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     }
-    native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    if (nw.q8_1_il != nullptr && n_tok >= 2 && native_mmvq_il_supported(nw.down_type, n_tok, (int) n_embd)) {
+        native_q8_1_interleave(nw.q8_1, nw.q8_1_il, (int) n_ff, n_tok, stream);
+        native_mmvq_il(nw.down_type, nw.down_data, nw.q8_1, nw.q8_1_il, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    } else {
+        native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    }
     if (gate_deferred) {   // the caller computed g (raw) with the router and scales `out` in the combine
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi: ") + cudaGetErrorString(e));

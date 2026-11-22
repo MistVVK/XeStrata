@@ -5563,9 +5563,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    // the GPU's copy_rows_from_mapped zeroes the rows it computed itself (dec_batch); STRATA_VERIFY_DEVICE_PLAN's
-    // copy_or_zero_from_mapped copies every row, so there the host still zeroes them
-    static const bool device_plan = [] { const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); return v != nullptr && std::atoi(v) != 0; }();
+    // the GPU's copy_rows_from_mapped zeroes the rows it computed itself (dec_batch); STRATA_VERIFY_DEVICE_PLAN /
+    // STRATA_VERIFY_DEVICE_HITS's copy_or_zero_from_mapped copies every row, so there the host still zeroes them
+    static const bool device_plan = [] {
+        const char* p = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
+        const char* h = std::getenv("STRATA_VERIFY_DEVICE_HITS");
+        return (p != nullptr && std::atoi(p) != 0) || (h != nullptr && std::atoi(h) != 0);
+    }();
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
     bool any_cpu = false;
     for (int64_t i = 0; i < n; ++i)
@@ -7130,8 +7134,10 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
     const char* v = std::getenv("STRATA_FS_SLOTS");
     const int slots = v ? std::atoi(v) : 0;
     if (slots <= 0) return nullptr;
-    if (const char* dp = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); dp && std::atoi(dp) != 0) {
-        std::fprintf(stderr, "strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN (the device would plan "
+    const char* dp = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
+    const char* dh = std::getenv("STRATA_VERIFY_DEVICE_HITS");
+    if ((dp && std::atoi(dp) != 0) || (dh && std::atoi(dh) != 0)) {
+        std::fprintf(stderr, "strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN/HITS (the device would plan "
                              "resident layers without the host)\n");
         return nullptr;
     }
