@@ -197,20 +197,17 @@ std::vector<std::pair<std::string, std::string>> igpu_default_env(const char* gc
             {"STRATA_PF_FUSED", "1"},
             {"STRATA_SELECT_WMMA", "1"},   // 0.2.9: the block scorer on matrix cores; not bitwise (about 10 of 2,051 selected cells flip at the cutoff
                                            // for queries past ~5K tokens), x1.008 at 8K, x1.037 at 32K, x1.077 at 64K (STRIX-Q-RESULTS.md)
-            // 0.2.9 (owner, 10-30: a consistent Strix Halo speed gain goes on by default): the prompt experts of every covered
-            // format on the F16 matrix-core kernels (the Q8_0 down layers of the Unsloth files included).  Windows gfx1151,
-            // interleaved x3, same 16 greedy ids: IQ3_S 4K 1,187 -> 1,296 and 8K 1,285 -> 1,399 tok/s (x1.09), UD-IQ4_XS 4K 1,119 ->
-            // 1,221 and 8K 1,180 -> 1,270; decode unchanged.  The rounding differs from the int8 kernels (KL is information only).
-            {"STRATA_PF_F16", "1"},
-            // Round 0215 (STRIX-FIT): the down rows of the F16 expert kernels go to the combine as FP16 (half the bytes written and read).  Windows gfx1151,
-            // interleaved 8K pairs, same engine: IQ3_S x1.022 (4 of 4 pairs), UD-IQ4_XS x1.026 (3 of 3), UD-Q4_K_XL x1.012 (3 of 4); the first-token KL
-            // is 1e-4 at 8K and 0.02-0.04 on agent transcripts (information).  STRATA_PF_DM16=0 turns it off.
+            // 0.2.19 (RDNA3 Wave-2): upgrade gfx1151 Windows prompt experts to native_h11p_kernel (STRATA_PF_F16=2, 128-tok FP16 WMMA),
+            // cover Q5_K/Q8_0 layers with STRATA_PF_P1A_L2=1, and enable Wave32 WMMA DFlash2 (2.78x) + rdna_gr/rdna_mmvq (HIP_FAST_DEC=1).
+            // Live Strix Halo IQ3_S: +7.5% decode (62.68 -> 67.41 tps), +2.9% pp4k, +1.7% pp8k, +7.6% short pp, KL 4.2e-11..7.6e-7, top1 EXACT.
+            {"STRATA_PF_F16", "2"},
+            // Round 0215 (STRIX-FIT): the down rows of the F16 expert kernels go to the combine as FP16 (half the bytes written and read).
             {"STRATA_PF_DM16", "1"},
-            // The Q4_K gate/up + Q5_1 down layers (43 of 48 in UD-Q4_K_XL) on the F16 WMMA kernels of src/prefill/moe_p1a.cu; other layers
-            // and packs keep the kernels above.  Windows gfx1151, UD-Q4_K_XL, 5 interleaved pairs: prompt x1.046 (4K), x1.043 (8K),
-            // x1.043 (32K), decode unchanged (job strix-20261114-1347-9a28).  KL to the FP16 truth, 24 prompts a size: on 0.0112 / 0.0116
-            // against off 0.0179 / 0.0118 at 4K / 8K (job strix-20261114-1347-238b).  STRATA_PF_P1A=0 turns it off.
+            // The Q4_K / Q5_K gate/up + Q5_1 / Q8_0 down layers (48 of 48 in UD-Q4_K_XL) on the F16 WMMA kernels of src/prefill/moe_p1a.cu.
             {"STRATA_PF_P1A", "1"},
+            {"STRATA_PF_P1A_L2", "1"},
+            {"STRATA_DFLASH_WMMA", "1"},
+            {"STRATA_HIP_FAST_DEC", "1"},
         };
     }
     return t;

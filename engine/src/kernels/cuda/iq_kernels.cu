@@ -5763,9 +5763,11 @@ __global__ void __launch_bounds__(256) native_down_amd_kernel(const unsigned lon
 template<int TY> struct GridOf;
 template<> struct GridOf<22> { using T = uint64_t; static constexpr int N = 1024; __device__ static const T* src() { return iq2s_grid; } };
 template<> struct GridOf<16> { using T = uint64_t; static constexpr int N = 256; __device__ static const T* src() { return iq2xxs_grid; } };
+template<> struct GridOf<17> { using T = uint64_t; static constexpr int N = 512; __device__ static const T* src() { return iq2xs_grid; } };
 template<> struct GridOf<18> { using T = uint32_t; static constexpr int N = 256; __device__ static const T* src() { return iq3xxs_grid; } };
 template<> struct GridOf<21> { using T = uint32_t; static constexpr int N = 512; __device__ static const T* src() { return iq3s_grid; } };
 template<> struct GridOf<23> { using T = uint32_t; static constexpr int N = 1; __device__ static const T* src() { return iq3s_grid; } };   // IQ4_XS: no grid
+template<> struct GridOf<40> { using T = uint32_t; static constexpr int N = 1; __device__ static const T* src() { return iq3s_grid; } };   // NVFP4: no grid
 
 // SG = 1 (mode 6): the signs without byte-SIMD ops, which gfx906 lacks (strata_vcmpne4 / strata_vsub4 unpack to
 // ~12 word ops each).  m = the sign nibble as 0x00/0xff bytes; (g ^ m) is g or -g-1 per byte, so
@@ -5909,8 +5911,44 @@ template<int SG> struct DotG<16, SG> { __device__ static __forceinline__ float f
     return d * sumi;
 } };
 
+// IQ2_XS: vec_dot_iq2_xs_q8_1 with the 512-entry iq2xs_grid in LDS (4 KB) - bitwise equal to mode 0
+template<int SG> struct DotG<17, SG> { __device__ static __forceinline__ float f(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs,
+                                                      const uint64_t* grid) {
+    const block_iq2_xs* bq2 = (const block_iq2_xs*) vbq + kbx;
+    const int2 q2_packed = make_int2(get_int_b2(bq2->qs, iqs + 0), get_int_b2(bq2->qs, iqs + 1));
+    const uint16_t* q2 = (const uint16_t*) &q2_packed;
+    const int ls0 = bq2->scales[iqs / 2] & 0x0F;
+    const int ls1 = bq2->scales[iqs / 2] >> 4;
+    int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint2 grid_pos = *(const uint2*) (grid + (q2[l0 / 2] & 0x1FF));
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+        int& acc = l0 < 4 ? sumi0 : sumi1;
+        if constexpr (SG == 1) {
+            const uint32_t v = (q2[l0 / 2] >> 9) & 0x7F, sg = v | ((__popc(v) & 1) << 7);
+            const int m0 = nib_mask(sg), m1 = nib_mask(sg >> 4);
+            acc = ggml_cuda_dp4a((int) grid_pos.x ^ m0, u0, acc);
+            acc = ggml_cuda_dp4a((int) grid_pos.y ^ m1, u1, acc);
+            acc -= ggml_cuda_dp4a(m1, u1, ggml_cuda_dp4a(m0, u0, 0));
+        } else {
+            const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
+            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+            acc = ggml_cuda_dp4a((int) __vsub4(grid_pos.x ^ signs0, signs0), u0, acc);
+            acc = ggml_cuda_dp4a((int) __vsub4(grid_pos.y ^ signs1, signs1), u1, acc);
+        }
+    }
+    const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
+    return d * sumi;
+} };
+
 template<int SG> struct DotG<23, SG> { __device__ static __forceinline__ float f(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs,
                                                       const uint32_t*) { return vec_dot_iq4_xs_q8_1(vbq, bq8_1, kbx, iqs); } };
+template<int SG> struct DotG<40, SG> { __device__ static __forceinline__ float f(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs,
+                                                      const uint32_t*) { return vec_dot_nvfp4_q8_1(vbq, bq8_1, kbx, iqs); } };
 
 constexpr int LDS_RB = 64;    // gate/up rows per block (4 R2 passes of 16)
 constexpr int LDS_NT = 4;     // entries whose activations sit in LDS at once
@@ -6059,7 +6097,8 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
                 }
 #pragma unroll
                 for (int j = 0; j < NTC; ++j) {
-                    const float a = warp_sum(s0[j]), b = warp_sum(s1[j]);
+                    const float sd = (TD == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
+                    const float a = warp_sum(s0[j]) * sd, b = warp_sum(s1[j]) * sd;
                     if (lane == 0) {
                         out[(size_t) ent_dst[c0 + j] * L.n_embd + r0] = a;
                         if (two) out[(size_t) ent_dst[c0 + j] * L.n_embd + r1] = b;
@@ -6148,7 +6187,9 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
         }
         __syncthreads();
         if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
-            const float gg = res[warp][lane], uu = res[warp][32 + lane];
+            const float sg = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
+            const float su = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
+            const float gg = res[warp][lane] * sg, uu = res[warp][32 + lane] * su;
             const float xi = (gg / (1.0f + __expf(-gg))) * uu;
             float amax = fabsf(xi), sum = xi;
 #pragma unroll
@@ -6165,18 +6206,29 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
     }
 }
 
-// dflash2-kern: Strix Halo (gfx1151) takes mode 8 (gate/up + SwiGLU + q8_1 in one launch, the group's activations in LDS) for the
-// IQ packs' gate/up: native_expert_bench on the IQ3_S pack's real rows, 45 groups of one entry (a 8-token verify window's call),
-// gate/up -25% (IQ2_S), -8% (IQ3_XXS), -6% (IQ3_S), bitwise equal to mode 0.  STRATA_GFX1151_EXP8=0 keeps the old layout.
+// dflash2-kern: Strix Halo (gfx1151) & discrete RDNA3 (gfx1100..gfx1102) take mode 8 (gate/up + SwiGLU + q8_1 in one launch,
+// the group's activations + codebook grid in LDS) for the IQ/NVFP4 packs' gate/up:
+//   - gfx1151 IQ3_S: gate/up -25% (IQ2_S), -8% (IQ3_XXS), -6% (IQ3_S), bitwise equal to mode 0.
+//   - gfx1100 RX 7900 XT IQ2_XS: gen128 94.4 -> 96.9 tps (+2.6% decode, 128/128 bit-identical).
+// STRATA_GFX1151_EXP8=0 (or STRATA_GFX11_EXP8=0 / STRATA_GFX11_DEFAULTS=0 on discrete gfx11) keeps the old layout.
 bool gfx1151_exp8(int dev) {
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     static int per_dev[64];   // 0 unknown, 1 no, 2 yes
     if (dev < 0 || dev >= 64) return false;
     if (!per_dev[dev]) {
         const char* v = std::getenv("STRATA_GFX1151_EXP8");
+        const char* v11 = std::getenv("STRATA_GFX11_EXP8");
+        const char* off11 = std::getenv("STRATA_GFX11_DEFAULTS");
         cudaDeviceProp p;
-        per_dev[dev] = !(v != nullptr && v[0] == '0') && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-                               strata::kernels::gfx_arch_is_gfx1151(p.gcnArchName) ? 2 : 1;
+        bool yes = false;
+        if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
+            if (strata::kernels::gfx_arch_is_gfx1151(p.gcnArchName)) {
+                yes = !(v != nullptr && v[0] == '0') && !(v11 != nullptr && v11[0] == '0');
+            } else if (strata::kernels::gfx_arch_is_discrete_rdna3(p.gcnArchName)) {
+                yes = !(v != nullptr && v[0] == '0') && !(v11 != nullptr && v11[0] == '0') && !(off11 != nullptr && off11[0] == '0');
+            }
+        }
+        per_dev[dev] = yes ? 2 : 1;
         (void) cudaGetLastError();
     }
     return per_dev[dev] == 2;
@@ -6616,16 +6668,18 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu = !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
+    const bool fused_gu = !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23 || L.gu_type == 40) &&
                           L.n_ff % 32 == 0;
     if (fused_gu && g_exp_phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
             case 16: native_gu_fused_kernel<16><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 17: native_gu_fused_kernel<17><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 18: native_gu_fused_kernel<18><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 21: native_gu_fused_kernel<21><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 23: native_gu_fused_kernel<23><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 40: native_gu_fused_kernel<40><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             default: native_gu_fused_kernel<22><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
         }
         check("native_expert_grouped/gu fused");
@@ -6746,11 +6800,12 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     int dev_d = 0;
     cudaGetDevice(&dev_d);
     // gfx1151: the LDS down kernel is slower than the CUDA layout for IQ4_NL (86 vs 63 us, 24 groups) and faster for Q2_0 (-18%)
-    const bool lds_down_ok = L.d_type == 42 || (L.d_type == 20 && !gfx1151_exp8(dev_d));
+    const bool lds_down_ok = L.d_type == 42 || L.d_type == 40 || (L.d_type == 20 && !gfx1151_exp8(dev_d));
     if ((em0d == 7 || em0d == 8) && lds_down_ok) {
         const dim3 gl((unsigned) ((L.n_embd + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
         if (L.d_type == 20) native_down_lds_kernel<20><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else if (L.d_type == 40) native_down_lds_kernel<40><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         else native_down_lds_kernel<42><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         check("native_expert_grouped/down");
         return;

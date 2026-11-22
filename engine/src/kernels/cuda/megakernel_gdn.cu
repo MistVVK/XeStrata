@@ -40,14 +40,36 @@ struct Q80Block {
 static_assert(sizeof(Q81Block) == 36 && sizeof(Q80Block) == 34);
 
 __device__ __forceinline__ float warp_sum(float x) {
+#if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906)
+#define MK_DPP(val, c) __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(val), c, 0xf, 0xf, false))
+    x += MK_DPP(x, 0x161);
+    x += MK_DPP(x, 0x162);
+    x += MK_DPP(x, 0x164);
+    x += MK_DPP(x, 0x168);
+    x += __int_as_float(__builtin_amdgcn_permlanex16(0, __float_as_int(x), 0x76543210, 0xfedcba98, false, false));
+#undef MK_DPP
+    return x;
+#else
 #pragma unroll
     for (int offset = WARP / 2; offset > 0; offset >>= 1) x += __shfl_xor_sync(0xffffffffu, x, offset, WARP);
     return x;
+#endif
 }
 __device__ __forceinline__ float warp_max(float x) {
+#if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906)
+#define MK_DPP(val, c) __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(val), c, 0xf, 0xf, false))
+    x = fmaxf(x, MK_DPP(x, 0x161));
+    x = fmaxf(x, MK_DPP(x, 0x162));
+    x = fmaxf(x, MK_DPP(x, 0x164));
+    x = fmaxf(x, MK_DPP(x, 0x168));
+    x = fmaxf(x, __int_as_float(__builtin_amdgcn_permlanex16(0, __float_as_int(x), 0x76543210, 0xfedcba98, false, false)));
+#undef MK_DPP
+    return x;
+#else
 #pragma unroll
     for (int offset = WARP / 2; offset > 0; offset >>= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, offset, WARP));
     return x;
+#endif
 }
 __device__ __forceinline__ int load_int_b2(const void* ptr, int i32) {
     const auto* x = static_cast<const uint16_t*>(ptr);

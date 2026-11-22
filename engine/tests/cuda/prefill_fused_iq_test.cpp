@@ -369,11 +369,15 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
 
 // the fused path: quantize, group on the device, then launches over expert ranges `cuts` (e.g. {0, 20, 64})
 struct FusedBufs {
-    Dev xa, ha, dm, scratch, slot, src, ids;
+    Dev xa, ha, dm, scratch, slot, src, ids, x16;
+    size_t ha_bytes = 0;
     FusedBufs(int T, int64_t rows, int E)
-        : xa(fused::act_bytes(T, N)), ha(fused::act_bytes(rows, FF)), dm((size_t) rows * N * 4),
+        : xa(fused::act_bytes(T, N)),
+          ha(std::max<size_t>(fused::act_bytes(rows, FF), (size_t) rows * FF * 2)),
+          dm((size_t) rows * N * 4),
           scratch(fused::group_bytes(rows, E)), slot((size_t) rows * 4), src((size_t) rows * 4),
-          ids((size_t) rows * 4) {}
+          ids((size_t) rows * 4), x16((size_t) T * N * 2),
+          ha_bytes(std::max<size_t>(fused::act_bytes(rows, FF), (size_t) rows * FF * 2)) {}
 };
 void run_fused(const Pair& p, const Geo& geo, FusedBufs& b, const float* x_dev, int T, int E,
                const std::vector<int>& cuts, const std::vector<const uint8_t*>& blob, cudaStream_t s) {
@@ -382,7 +386,23 @@ void run_fused(const Pair& p, const Geo& geo, FusedBufs& b, const float* x_dev, 
     fused::quantize_act_native(x_dev, T, N, b.xa.p, s);
     fused::group(b.ids.as<int32_t>(), rows, K, E, b.scratch.p, b.slot.as<int32_t>(), b.src.as<int32_t>(), s);
     fused::set_down_rotation(g_rot_on, g_rot_signs_dev);   // (--folded trellis pairs; off for every other pair)
-    struct Off { ~Off() { fused::set_down_rotation(false, nullptr); } } off_at_end;
+    const bool use_h11p = !g_rot_on && fused::h11p_takes_pair((int) p.gu, (int) p.d);
+    if (use_h11p) {
+        std::vector<float> xf((size_t) T * N);
+        std::vector<uint16_t> xh((size_t) T * N);
+        ck(cudaMemcpyAsync(xf.data(), x_dev, xf.size() * 4, cudaMemcpyDeviceToHost, s), "x_h11p_d2h");
+        ck(cudaStreamSynchronize(s), "x_h11p_sync");
+        for (size_t i = 0; i < xf.size(); ++i) xh[i] = ggml_fp32_to_fp16(xf[i]);
+        ck(cudaMemcpyAsync(b.x16.p, xh.data(), xh.size() * 2, cudaMemcpyHostToDevice, s), "x_h11p_h2d");
+        fused::p1a_input(b.x16.p, b.ha_bytes);
+    }
+    struct Off {
+        bool h11p;
+        ~Off() {
+            if (h11p) fused::p1a_input(nullptr, 0);
+            fused::set_down_rotation(false, nullptr);
+        }
+    } off_at_end{use_h11p};
     for (size_t c = 0; c + 1 < cuts.size(); ++c) {
         for (int e0 = cuts[c]; e0 < cuts[c + 1]; e0 += fused::kMaxBatch) {
             fused::Batch bt;
@@ -591,12 +611,19 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
     const Err ef = compare(y_f, frow, ref, pair, (size_t) rows);
     const Err efm = mq ? compare(y_f, frow, y_mmq, mrow, (size_t) rows) : Err{};
     const Err e2 = compare(y_f, frow, ref2, pair, (size_t) rows);
-    std::printf("  fused vs the int8-rounded model (same activation / H rounding, double sums): rel RMS %.3e  worst %.3e\n",
-                e2.rms, e2.worst);
-    // STRATA_PF_F16=1: H's int8 rounding meets values a few F16 ulps from the int8 model's (f16_on); the FP32 reference
-    // checks below stay as they are
-    if (e2.rms > (f16_on() ? 5e-3 : 2e-3) || e2.worst > 3e-2)
-        throw std::runtime_error(std::string(p.name) + ": the fused path differs from its own arithmetic's model");
+    const bool h11p_pair = !g_rot_on && fused::h11p_takes_pair((int) p.gu, (int) p.d);
+    if (h11p_pair) {
+        std::printf("  native_h11p (FP16 WMMA) vs FP64 reference: rel RMS %.3e  worst row max rel %.3e\n", ef.rms, ef.worst);
+        if (ef.rms > 5e-3 || ef.worst > 5e-2)
+            throw std::runtime_error(std::string(p.name) + ": native_h11p FP16 WMMA error vs FP64 reference is too large");
+    } else {
+        std::printf("  fused vs the int8-rounded model (same activation / H rounding, double sums): rel RMS %.3e  worst %.3e\n",
+                    e2.rms, e2.worst);
+        // STRATA_PF_F16=1: H's int8 rounding meets values a few F16 ulps from the int8 model's (f16_on); the FP32 reference
+        // checks below stay as they are
+        if (e2.rms > (f16_on() ? 5e-3 : 2e-3) || e2.worst > 3e-2)
+            throw std::runtime_error(std::string(p.name) + ": the fused path differs from its own arithmetic's model");
+    }
     if (mq) std::printf("  MMQ   vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", em.rms, em.worst);
     std::printf("  fused vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", ef.rms, ef.worst);
     if (mq) std::printf("  fused vs MMQ           : rel RMS %.3e  worst row max rel %.3e\n", efm.rms, efm.worst);
@@ -886,7 +913,11 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
         const Err em = mq ? compare(ym, id, ref, id, pick.size()) : Err{}, ef = compare(yf, id, ref, id, pick.size());
         std::printf("  sample of %zu pairs vs FP32 reference: MMQ rel RMS %.3e worst %.3e, fused rel RMS %.3e worst "
                     "%.3e\n", pick.size(), em.rms, em.worst, ef.rms, ef.worst);
-        if (own_model) {   // a build without MMQ: the rule of kOwnRel on the sample
+        const bool h11p_pair = !g_rot_on && fused::h11p_takes_pair((int) p.gu, (int) p.d);
+        if (h11p_pair) {
+            if (ef.rms > 5e-3 || ef.worst > 5e-2)
+                throw std::runtime_error(std::string(p.name) + ": native_h11p FP16 WMMA sample error vs FP64 reference is too large (timing)");
+        } else if (own_model) {   // a build without MMQ: the rule of kOwnRel on the sample
             const Err e2 = compare(yf, id, ref2, id, pick.size()), ev = compare(ref2, id, ref, id, pick.size());
             std::printf("  sample of %zu pairs, fused vs the int8-rounded model: rel RMS %.3e worst %.3e; the model vs FP32: rel RMS %.3e worst %.3e\n",
                         pick.size(), e2.rms, e2.worst, ev.rms, ev.worst);
