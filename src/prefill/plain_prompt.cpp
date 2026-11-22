@@ -25,11 +25,15 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/flash_attn.hpp"
+#include "strata/kernels/glm5.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -1108,6 +1112,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     const int64_t E = s.n_expert, K = s.n_expert_used;
     const int64_t FS = dense_ ? s.n_ff : s.n_ff_shexp, qw = (has_gate_ ? 2 : 1) * NH * HD;
     const float eps = (float) s.rms_eps;
+    const bool loop = s.arch == ModelArch::SenseNovaLoop;
     const k::QsaShapes qs = attn_shapes();
     strata::gpu::Stream cs = cs_;
     prefill::Gemm& gm = prompt_gemm().gemm;
@@ -1180,11 +1185,11 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             bool wait() { return !set || strata::gpu::event_sync(e); }
         } staged;
         if (!first())   // the rows handed on, into this stage's own pinned memory (and its rows out from there)
-            std::memcpy(hand_host_, hand_in, (size_t) ((c_last - c_begin) * N) * 4);
+            std::memcpy(hand_host_, hand_in, (size_t) ((c_last - c_begin) * hand_w_) * 4);
         for (int64_t c0 = c_begin; c0 < c_last; c0 += P.T) {
             enc_row0_ = c0;   // the chunk's first row (block_hook_)
             const int64_t T = std::min<int64_t>(P.T, c_last - c0), p0 = pos + c0;
-            float* hand = hand_host_ != nullptr ? hand_host_ + (c0 - c_begin) * N : nullptr;
+            float* hand = hand_host_ != nullptr ? hand_host_ + (c0 - c_begin) * hand_w_ : nullptr;
             // the staging buffers are pinned host memory the last chunk's copies read: written again only once those
             // copies ran (a dense model's chunk has nothing else that waits on the host, and its next inputs went
             // over the last chunk's before the GPU read them: PLaMo 3 Translate and Qwen3.5 through the FP16 and the
@@ -1206,13 +1211,15 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 for (int64_t hd = 0; hd < NH; ++hd) P.h_pos[t * NH + hd] = (int32_t) (p0 + t);
                 for (int64_t hd = 0; hd < NKV; ++hd) P.h_pos[T * NH + t * NKV + hd] = (int32_t) (p0 + t);
             }
-            if (!strata::gpu::copy_async(P.x, first() ? P.emb : hand, (size_t) (T * N) * 4, cs) ||
+            if (!strata::gpu::copy_async(loop && !first() ? P.g_hs : P.x, first() ? P.emb : hand,
+                                         (size_t) (T * (loop && !first() ? 2 * N : N)) * 4, cs) ||
                 !strata::gpu::copy_async(P.steps, P.h_steps, (size_t) (T * k::kStepCount) * 4, cs) ||
                 !strata::gpu::copy_async(P.pos_q, P.h_pos, (size_t) (T * NH) * 4, cs) ||
                 !strata::gpu::copy_async(P.pos_k, P.h_pos + T * NH, (size_t) (T * NKV) * 4, cs)) {
                 err = std::string("plain prompt: staging: ") + strata::gpu::last_error();
                 return false;
             }
+            if (loop && !first() && !s.mhc_active_before(lb_)) k::glm5_hc_mean(P.g_hs, P.x, N, T, cs, 2);
             P.h_dense_bounds[0] = 0;
             P.h_dense_bounds[1] = (int32_t) T;
             if (!strata::gpu::copy_async(P.dense_bounds, P.h_dense_bounds, 2 * sizeof(int32_t), cs)) {
@@ -1236,7 +1243,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             // their FP16 sums are taken (not widened into FP32 first: a pass over every sum, the RTX 4070's Qwen3.5-9B
             // prompt 75 ms of 1.0 s at 4K, 2026-11-07); y16 in the FP32 buffer's room
             // (not with plamo3's norms after the mixer and the FFN: their inputs are the products' FP32 rows)
-            const bool half_rows = dense_half_sums_ && !hooked && !plamo_ && T >= dense_native_rows_ &&
+            const bool half_rows = dense_half_sums_ && !hooked && !plamo_ && !loop && T >= dense_native_rows_ &&
                                    gm.half_ok(cs);
             auto proj_h = [&](const W& w, void* y) {
                 gm.native_half(P.x16, w.type, w.data, static_cast<uint16_t*>(y), T, w.n_out, w.n_in);
@@ -1306,7 +1313,17 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     if (hooked && !is_mtp) hook_->after(l - lb_, which, x, T, y, ldy > 0 ? ldy : w.n_out);
                 };
                 const int64_t pa = is_mtp ? p0 + 1 : p0;   // the rows' first position
-                k::native_qsa_rms_norm_weighted(P.x, b.attn_norm, P.hn, (int) N, (int) T, eps, cs);
+                const bool mhc = b.hc_attn_fn.data != nullptr;
+                auto route = [&](const W& fn, const float* bias) {
+                    k::f32_gemm_rows(P.g_hs, 2 * N, static_cast<const float*>(fn.data), P.g_mixes, 8, 2 * N, 8, T, cs);
+                    k::glm5_hc_pre(P.g_hs, P.g_mixes, nullptr, bias, 1e-6f, 0, (int) s.mhc_iterations,
+                                   P.g_y, P.g_post, P.g_comb, N, T, cs, 2, (float) s.mhc_pre_scale);
+                };
+                if (mhc) {
+                    if (s.physical_layer(l) == s.mhc_start) k::glm5_hc_init(P.x, P.g_hs, N, T, cs, 2);
+                    route(b.hc_attn_fn, b.hc_attn_bias);
+                }
+                k::native_qsa_rms_norm_weighted(mhc ? P.g_y : P.x, b.attn_norm, P.hn, (int) N, (int) T, eps, cs);
                 f16(P.hn, T, N);
                 if (b.recurrent) {
                     auto part = [&](int stage) {   // the profile's GDN parts, summed into stage 0 as well
@@ -1403,15 +1420,55 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     // the prompt attention (prompt_attn: K and V read once a block of queries), else the decode's
                     // kernel: every query reads the cells up to its own; the grid as wide as the chunk's last context (not
                     // the cache's capacity: no graph holds it), as many queries a launch as the scratch takes
-                    const int64_t cap = std::min<int64_t>(opt_.max_cells, pa + T);
-                    const int64_t per_q = (int64_t) k::qsa_decode_attn_scratch_floats(cap, qs);
-                    const int64_t nq_max = std::max<int64_t>(1, std::min<int64_t>((int64_t) opt_.max_t * attn_scratch_floats_ / per_q, 4096));
-                    const bool batched =
-                        prompt_attn_on && k::prompt_attn(P.qcur, pools, pa, T, qs, P.attn, cs, window_of(b));
-                    for (int64_t t = 0; !batched && t < T; t += nq_max) {
-                        const int nq = (int) std::min<int64_t>(nq_max, T - t);
-                        k::qsa_dense_attn_batch(P.qcur + t * NH * HD, pools, P.steps + t * k::kStepCount, cap, qs,
-                                                attn_scratch_, P.attn + t * NH * HD, nq, cs, window_of(b));
+                    // a chunk whose last row is within the indexer's budget selects every cell: its keys for the later
+                    // chunks, the attention as the dense one's
+                    const bool qsa = sparse_qsa_ && (size_t) a < qsa_weights_.size() && qsa_weights_[(size_t) a].q.data;
+                    if (qsa && pa + T <= qs.idx_top_k) {
+                        const QsaWeights& w = qsa_weights_[(size_t) a];
+                        k::f32_gemm_rows(P.hn, N, static_cast<const float*>(w.k.data), P.qsa_raw, 128, N, 128, T, cs);
+                        k::native_qsa_indexer_append_batch(P.qsa_raw, T, pa, 0, w.k_norm, eps, qsa_index_[(size_t) a], qs,
+                                                           opt_.max_cells, rope_of(b), cs, w.block_norm, true);
+                    }
+                    if (qsa && pa + T > qs.idx_top_k) {
+                        const QsaWeights& w = qsa_weights_[(size_t) a];
+                        const auto& ib = qsa_index_[(size_t) a];
+                        k::f32_gemm_rows(P.hn, N, static_cast<const float*>(w.q.data), P.qsa_query, 512, N, 512, T, cs);
+                        k::f32_gemm_rows(P.hn, N, static_cast<const float*>(w.k.data), P.qsa_raw, 128, N, 128, T, cs);
+                        for (int64_t t = 0; t < T; t += 65535 / 4)
+                            k::native_qsa_rms_norm_rope(P.qsa_query + t * 512, 128, w.q_norm,
+                                                        P.qsa_query + t * 512, (int) (std::min<int64_t>(65535 / 4, T - t) * 4),
+                                                        128, 64, eps, rope_of(b), P.pos_k + t * 4, cs, true);
+                        k::native_qsa_indexer_append_batch(P.qsa_raw, T, pa, 0, w.k_norm, eps, ib, qs,
+                                                           opt_.max_cells, rope_of(b), cs, w.block_norm, true);
+                        const int64_t blocks = opt_.max_cells / 4 + 1;
+                        const int64_t scratch = (int64_t) k::qsa_decode_attn_scratch_floats(2052, qs);
+                        const int64_t per = std::max<int64_t>(1, std::min<int64_t>(64, opt_.max_t * attn_scratch_floats_ / scratch));
+                        for (int64_t t = 0; t < T; t += per) {
+                            const int64_t nq = std::min<int64_t>(per, T - t);
+                            int32_t* steps = P.steps + t * k::kStepCount;
+                            // the tiled FP32 scorer (the RX 9060 XT, a 32K prompt: 3% faster)
+                            if (!k::qsa_block_scores_tc(ib.pooled, ib.dead, P.qsa_query + t * 512, steps, nq, blocks,
+                                                        qs, P.qsa_scores, cs, 0))
+                                k::qsa_block_scores(ib.pooled, ib.dead, P.qsa_query + t * 512, steps, nq, blocks, qs,
+                                                    P.qsa_scores, cs);
+                            k::qsa_block_topk_with_current(P.qsa_scores, steps, nq, blocks, 2052, qs, P.qsa_ids, cs);
+                            if (!k::flash_attn_select(P.qcur + t * NH * HD, pools, P.qsa_ids, steps, 2052, qs,
+                                                      P.attn + t * NH * HD, nq, cs, attn_scratch_,
+                                                      (size_t) opt_.max_t * (size_t) attn_scratch_floats_ * 4))
+                                k::qsa_decode_attn_batch(P.qcur + t * NH * HD, pools, P.qsa_ids, steps, 2052, qs,
+                                                         attn_scratch_, P.attn + t * NH * HD, nq, cs);
+                        }
+                    } else {
+                        const int64_t cap = std::min<int64_t>(opt_.max_cells, pa + T);
+                        const int64_t per_q = (int64_t) k::qsa_decode_attn_scratch_floats(cap, qs);
+                        const int64_t nq_max = std::max<int64_t>(1, std::min<int64_t>((int64_t) opt_.max_t * attn_scratch_floats_ / per_q, 4096));
+                        const bool batched =
+                            prompt_attn_on && k::prompt_attn(P.qcur, pools, pa, T, qs, P.attn, cs, window_of(b));
+                        for (int64_t t = 0; !batched && t < T; t += nq_max) {
+                            const int nq = (int) std::min<int64_t>(nq_max, T - t);
+                            k::qsa_dense_attn_batch(P.qcur + t * NH * HD, pools, P.steps + t * k::kStepCount, cap, qs,
+                                                    attn_scratch_, P.attn + t * NH * HD, nq, cs, window_of(b));
+                        }
                     }
                     if (opt_.kv_tcq != 0) k::fwht256_signed(P.attn, T * NH, true, cs);
                     else if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(P.attn, T * NH, cs);
@@ -1429,7 +1486,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         hook(ProductHook::kO, b.o, P.x16, P.mix);
                     }
                 }
-                if (half_rows) {
+                if (mhc) {
+                    k::glm5_hc_post(P.mix, P.g_hs, P.g_post, P.g_comb, P.g_hs, N, T, cs, 2);
+                    route(b.hc_ffn_fn, b.hc_ffn_bias);
+                } else if (half_rows) {
                     prefill::add_h(P.x, reinterpret_cast<const uint16_t*>(P.mix), T * N, cs);
                 } else if (b.attn_post != nullptr) {   // plamo3: the mixer's output normed before the add
                     k::native_qsa_rms_norm_weighted(P.mix, b.attn_post, P.hn, (int) N, (int) T, eps, cs);
@@ -1440,7 +1500,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 mark(b.recurrent ? 0 : 4, t_mark);
 
                 if (dense_) {   // qwen35's FFN: gate and up from the normed rows, the SwiGLU, down; int8 where it can
-                    k::native_qsa_rms_norm_weighted(P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);
+                    k::native_qsa_rms_norm_weighted(mhc ? P.g_y : P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);
                     f16(P.hn, T, N);
                     if (half_rows) {   // gate, up, the SwiGLU and down's sums for the residual all in FP16
                         proj_h(b.sh_gate, P.sh_gate);
@@ -1471,14 +1531,19 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         proj(b.sh_down, P.moe_out, T, 0, dense_half_sums_);
                         hook(ProductHook::kDown, b.sh_down, P.x16, P.moe_out);
                     }
-                    if (b.ffn_post != nullptr) {   // plamo3: the FFN's output normed before the add
+                    if (mhc) {
+                        k::glm5_hc_post(P.moe_out, P.g_hs, P.g_post, P.g_comb, P.g_hs, N, T, cs, 2);
+                        if (s.physical_layer(l) == s.mhc_end - 1) k::glm5_hc_mean(P.g_hs, P.x, N, T, cs, 2);
+                    } else if (b.ffn_post != nullptr) {   // plamo3: the FFN's output normed before the add
                         k::native_qsa_rms_norm_weighted(P.moe_out, b.ffn_post, P.hn, (int) N, (int) T, eps, cs);
                         k::add_inplace(P.x, P.hn, T * N, cs);
                     } else {
                         k::add_inplace(P.x, P.moe_out, T * N, cs);
                     }
-                    steer(b, T, P.x, cs);
-                    if (!is_mtp) tap_rows(l, P.x, 1, T, p0, false, cs);
+                    if (!mhc || s.physical_layer(l) == s.mhc_end - 1) {
+                        steer(b, T, P.x, cs);
+                        if (!is_mtp) tap_rows(l, P.x, 1, T, p0, false, cs);
+                    }
                     mark(3, t_mark);
                     if (!is_mtp) unbind_block(l);
                     continue;
@@ -1536,7 +1601,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     last_logits();
                 }
             } else if (!last()) {   // the rows to the next stage
-                if (!strata::gpu::copy_async(hand, P.x, (size_t) (T * N) * 4, cs)) {
+                if (loop && !s.mhc_active_before(le_)) k::glm5_hc_init(P.x, P.g_hs, N, T, cs, 2);
+                if (!strata::gpu::copy_async(hand, loop ? P.g_hs : P.x, (size_t) (T * hand_w_) * 4, cs)) {
                     err = std::string("plain prompt: the rows to the next GPU: ") + strata::gpu::last_error();
                     return false;
                 }

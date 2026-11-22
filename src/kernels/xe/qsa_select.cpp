@@ -629,4 +629,37 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     finish(stream, launch_topk_wide(queue_for(stream), scores, steps, nq, max_blocks, cap, ids), "qsa_block_topk");
 }
 
+void qsa_block_topk_with_current(const float* scores, int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                                 const QsaShapes& s, int32_t* ids, void* stream) {
+    if (nq <= 0) return;
+    if (!stream || s.idx_block != R || s.idx_top_k <= 0 || s.idx_top_k > INT32_MAX - R ||
+        s.idx_top_k % R || cap < s.idx_top_k + R || !steps || !ids)
+        throw core::DeviceError("qsa_block_topk_with_current: unsupported geometry or cap");
+    auto& q = queue_for(stream);
+    const int budget = (int) s.idx_top_k;
+    // Rank whole blocks only. The tail is unioned afterwards, so even an arbitrarily large block score cannot
+    // displace a tail cell. kStepPos keeps n_kv - 1 while the top-k reads the temporary complete-cell count.
+    q.parallel_for(sycl::range<1>((size_t) nq), [=](sycl::id<1> id) {
+        int32_t* st = steps + id[0] * kStepCount;
+        const int n = st[kStepNKv];
+        const int complete = n - n % R;
+        st[kStepNKv] = complete;
+        st[kStepWidth] = complete < budget ? complete : budget;
+    });
+    qsa_block_topk(scores, steps, nq, max_blocks, cap, s, ids, stream);
+    q.parallel_for(sycl::range<1>((size_t) nq), [=](sycl::id<1> id) {
+        int32_t* st = steps + id[0] * kStepCount;
+        const int n = st[kStepPos] + 1, complete = n - n % R;
+        int width = st[kStepWidth];
+        int32_t* out = ids + id[0] * cap;
+        if (n != complete) {
+            for (int cell = complete; cell < n; ++cell) out[width++] = cell;
+        } else if (n > width && out[width - 1] != n - 1) {
+            for (int cell = n - R; cell < n; ++cell) out[width++] = cell;
+        }
+        st[kStepNKv] = n;
+        st[kStepWidth] = width;
+    });
+}
+
 }  // namespace strata::kernels

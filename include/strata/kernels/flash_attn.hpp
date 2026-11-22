@@ -151,7 +151,14 @@ bool flash_attn_i8_prefixed(const uint16_t* q16, const uint16_t* k16, const uint
 /// flash_attn over a selection, with `qsa_decode_attn_batch`'s arguments minus the scratch.  Returns false (nothing
 /// launched) when the device has no kernel for the pools (above) or the geometry is not 24 heads / 2 KV heads / 256:
 /// the caller then uses the decode kernel.
+///
+/// 16 heads / 4 KV heads / 256 (SenseNova-Loop's QSA) take a form of their own: 4 heads a KV head leave 12 of the
+/// tile's 16 rows empty, so a work-group takes 4 neighbouring queries, walks the union of their selections once and
+/// masks each row to its own query's cells (FP16 pools, the portable kernel: RDNA3's and RDNA4's WMMA, NVIDIA's tensor
+/// cores; not Intel's XMX).  It needs `scratch_bytes` of `scratch` for the unions: 5 * 4 * cap bytes and 4 more a 4
+/// queries.  The same cells and weights as the decode kernel, in another summation order.
 bool flash_attn_select(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-                       const QsaShapes& s, float* attn, int64_t n_q, void* stream);
+                       const QsaShapes& s, float* attn, int64_t n_q, void* stream, void* scratch = nullptr,
+                       size_t scratch_bytes = 0);
 
 }  // namespace strata::kernels

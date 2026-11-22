@@ -57,6 +57,12 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream);
+/// Select complete blocks up to the token budget, plus all causal cells in the query's current block.
+/// The latter includes a just-completed block even when it was not in the ranked set. Updates each step's width;
+/// ids need a capacity of at least idx_top_k + idx_block cells per query.
+void qsa_block_topk_with_current(const float* scores, int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                                 const QsaShapes& s, int32_t* ids, void* stream);
+
 /// The original kernel (keys read from memory on every radix pass), for tests: the same ids.
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                         const QsaShapes& s, int32_t* ids, void* stream);

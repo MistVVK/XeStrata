@@ -24,23 +24,27 @@ namespace strata::kernels {
 ///      post [T][4] = 2 sigmoid(mix[4..8) scale[1] + base[4..8));
 ///      comb [T][16], comb[dst + 4 src]: mix[8..24) scale[2] + base[8..24), softmax over dst, + hc_eps, then the
 ///      columns (sum over src) normalised, then `iters` - 1 rounds of rows (sum over dst) and columns, each sum + hc_eps.
+/// With streams = 2 (SenseNova-Loop), mixes [T][8] are pre[2], post[2], row-major comb[2][2]; base [8] is
+/// added after RMS normalization, scale and hc_eps are unused, and pre is sigmoid times pre_scale. The comb is
+/// normalized in log space, rows then columns for each iteration, and exponentiated at the end.
 void glm5_hc_pre(const float* x, const float* mixes, const float* scale, const float* base, float rms_eps, float hc_eps,
-                 int iters, float* y, float* post, float* comb, int64_t n_embd, int64_t n_tokens, void* stream);
+                 int iters, float* y, float* post, float* comb, int64_t n_embd, int64_t n_tokens, void* stream,
+                 int streams = 4, float pre_scale = 1.0f);
 
 /// The streams before the first block: every stream the token's embedding, hs[t][s] = x[t] (llama.cpp's hc_init).
-void glm5_hc_init(const float* x, float* hs, int64_t n_embd, int64_t n_tokens, void* stream);
+void glm5_hc_init(const float* x, float* hs, int64_t n_embd, int64_t n_tokens, void* stream, int streams = 4);
 
 /// dst[b][a][d] = src[a][b][d] for A x B blocks of D floats: [token][head][dim] to [head][token][dim] and back, so a
 /// head's rows of every token lie together for its own matrix (the MLA's wk_b and wv_b).
 void glm5_transpose_abd(const float* src, float* dst, int64_t a, int64_t b, int64_t d, void* stream);
 
 /// The mHC streams' write after a block (llama.cpp's build_hc_post): out[t][d] = f[t] post[t][d] + sum_s
-/// residual[t][s] comb[t][d + 4 s].  `out` may be `residual` (each element's four streams are read before written).
+/// residual[t][s] comb[t][d + 4 s]. For 2 streams, comb is row-major [dst][src]. `out` may be `residual`.
 void glm5_hc_post(const float* f, const float* residual, const float* post, const float* comb, float* out,
-                  int64_t n_embd, int64_t n_tokens, void* stream);
+                  int64_t n_embd, int64_t n_tokens, void* stream, int streams = 4);
 
 /// The streams' mean before the output norm: y[t] = (x[t][0] + x[t][1] + x[t][2] + x[t][3]) / 4.
-void glm5_hc_mean(const float* x, float* y, int64_t n_embd, int64_t n_tokens, void* stream);
+void glm5_hc_mean(const float* x, float* y, int64_t n_embd, int64_t n_tokens, void* stream, int streams = 4);
 
 /// The sigmoid router (llama.cpp's build_moe_ffn with gating SIGMOID and exp_probs_b): p = sigmoid(logits); the k
 /// experts with the largest p + bias (ties to the lower index), weights p of those, divided by their sum (clamped

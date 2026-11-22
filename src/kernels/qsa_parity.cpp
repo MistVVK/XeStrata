@@ -50,8 +50,10 @@
 //     1e-3 for FP16 paths.  That difference is the FP16 CACHE's cost, not the kernel's, and it is kept
 //     separate so a kernel bug cannot hide inside it.
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 
@@ -72,6 +74,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -378,11 +381,16 @@ constexpr int kOracleN = (int) (sizeof(kOracle) / sizeof(kOracle[0])) / 2;
 int main(int argc, char** argv) try {
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // a crash must not swallow what was printed already
     bool selftest = false, dense = false, bench = false;
+    std::string fixture, long_fixture, full_fixture, project_fixture;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
         else if (a == "--qsa-dense") dense = true;
         else if (a == "--bench") bench = true;
+        else if (a == "--fixture" && i + 1 < argc) fixture = argv[++i];
+        else if (a == "--long-fixture" && i + 1 < argc) long_fixture = argv[++i];
+        else if (a == "--full-fixture" && i + 1 < argc) full_fixture = argv[++i];
+        else if (a == "--project-fixture" && i + 1 < argc) project_fixture = argv[++i];
         else {
             std::fprintf(stderr, "usage: qsa_parity [--selftest] [--qsa-dense] [--bench]\n"
                                  "  --qsa-dense  attend to EVERY cell instead of the indexer's selection\n"
@@ -408,6 +416,319 @@ int main(int argc, char** argv) try {
                 (long long) NH, (long long) NKV, (long long) HD, (long long) IDXN, (long long) IDXD,
                 (long long) R, (long long) TOPK, (long long) S.page_size, dense ? "DENSE" : "sparse");
     require("the fixture's r is the artifact's IDX_BLOCK", R == REF_R, "r = " + std::to_string(R));
+
+    if (!fixture.empty()) {
+        std::ifstream input(fixture, std::ios::binary);
+        auto read = [&](size_t n) {
+            std::vector<float> v(n);
+            if (!input.read(reinterpret_cast<char*>(v.data()), (std::streamsize) (n * sizeof(float))))
+                throw std::runtime_error("truncated indexer fixture");
+            return v;
+        };
+        const auto raw = read(size_t(8) * 128), kn = read(128), bn = read(128), want_k = read(size_t(2) * 128);
+        const auto raw_q = read(size_t(8) * 4 * 128), qn = read(128), want_q = read(size_t(8) * 4 * 128);
+        const auto score_keys = read(size_t(576) * 128), score_q = read(size_t(4) * 128), want_scores = read(576), want_ids = read(512);
+        Dev<float> dr, dk, db, dq, dqn, out_q(size_t(8) * 4 * 128), tail(size_t(3) * 128), dead(128), pooled(size_t(3) * 128);
+        Dev<int32_t> bpos(1), qpos;
+        dr.put(raw); dk.put(kn); db.put(bn); dq.put(raw_q); dqn.put(qn);
+        std::vector<int32_t> positions(size_t(8) * 4);
+        for (int t = 0; t < 8; ++t) for (int h = 0; h < 4; ++h) positions[t * 4 + h] = t;
+        qpos.put(positions);
+        strata::gpu::Stream cs = strata::gpu::stream_create();
+        check(cs != nullptr, "fixture stream");
+        strata::kernels::RopeScaling sc;
+        sc.type = strata::kernels::RopeScalingType::YaRN;
+        sc.factor = 2; sc.ext_factor = 1; sc.orig_ctx = 262144;
+        const strata::kernels::QsaIndexerBuffers bufs{tail.p, dead.p, pooled.p, bpos.p};
+        strata::kernels::native_qsa_indexer_append_batch(dr.p, 8, 0, 0, dk.p, EPS, bufs, S, 8, sc, cs, db.p, true);
+        strata::kernels::native_qsa_rms_norm_rope(dq.p, 128, dqn.p, out_q.p, 32, 128, 64, EPS, sc, qpos.p, cs, true);
+        check(strata::gpu::stream_sync(cs), "fixture sync");
+        const auto got_k = pooled.get(size_t(2) * 128), got_q = out_q.get(size_t(8) * 4 * 128);
+        double kmax = 0, qmax = 0;
+        for (size_t i = 0; i < got_k.size(); ++i) kmax = std::max(kmax, std::fabs(double(got_k[i]) - want_k[i]));
+        for (size_t i = 0; i < got_q.size(); ++i) qmax = std::max(qmax, std::fabs(double(got_q[i]) - want_q[i]));
+        report("fixture key max absolute error", kmax, "max");
+        report("fixture query max absolute error", qmax, "max");
+        require("fixture key", kmax < 5e-4);
+        require("fixture query", qmax < 5e-4);
+        Dev<float> sk, sq, scores(577), dz;
+        Dev<int32_t> steps, ids(2052);
+        sk.put(score_keys); sq.put(score_q); dz.put(std::vector<float>(128, 0));
+        std::vector<int32_t> step(strata::kernels::kStepCount);
+        strata::kernels::qsa_step_fill(step.data(), 2304, S);
+        steps.put(step);
+        strata::kernels::qsa_block_scores(sk.p, dz.p, sq.p, steps.p, 1, 577, S, scores.p, cs);
+        strata::kernels::qsa_block_topk(scores.p, steps.p, 1, 577, 2051, S, ids.p, cs);
+        check(strata::gpu::stream_sync(cs), "fixture scores sync");
+        const auto got_scores = scores.get(576);
+        const auto got_ids = ids.get(2051);
+        double smax = 0;
+        for (size_t i = 0; i < got_scores.size(); ++i)
+            smax = std::max(smax, std::fabs(double(got_scores[i]) - want_scores[i]));
+        std::vector<bool> selected(2305, false), expected(2305, false);
+        for (const auto id : got_ids) if (id >= 0 && id < 2305) selected[(size_t) id] = true;
+        for (const float id : want_ids) for (int c = 0; c < 4; ++c) expected[(size_t) int(id) * 4 + c] = true;
+        expected[2304] = true;
+        int extra = 0, missing = 0;
+        for (int i = 0; i < 2305; ++i) { extra += selected[(size_t) i] && !expected[(size_t) i];
+            missing += expected[(size_t) i] && !selected[(size_t) i]; }
+        report("fixture score max absolute error", smax, "max");
+        std::printf("  fixture selected cells: extra %d, missing %d\n", extra, missing);
+        require("fixture scores", smax < 5e-4);
+        strata::kernels::qsa_block_topk_with_current(scores.p, steps.p, 1, 577, 2052, S, ids.p, cs);
+        check(strata::gpu::stream_sync(cs), "fixture corrected selection sync");
+        const auto new_step = steps.get(strata::kernels::kStepCount);
+        const auto new_ids = ids.get((size_t) new_step[strata::kernels::kStepWidth]);
+        std::fill(selected.begin(), selected.end(), false);
+        for (const auto id : new_ids) if (id >= 0 && id < 2305) selected[(size_t) id] = true;
+        extra = 0; missing = 0;
+        for (int i = 0; i < 2305; ++i) { extra += selected[(size_t) i] && !expected[(size_t) i];
+            missing += expected[(size_t) i] && !selected[(size_t) i]; }
+        std::printf("  fixture selection with current: extra %d, missing %d\n", extra, missing);
+        require("fixture selected cells", extra == 0 && missing == 0);
+        strata::gpu::stream_destroy(cs);
+    }
+
+    if (!long_fixture.empty()) {
+        std::ifstream input(long_fixture, std::ios::binary);
+        auto read = [&](size_t n) {
+            std::vector<float> v(n);
+            if (!input.read(reinterpret_cast<char*>(v.data()), (std::streamsize) (n * sizeof(float))))
+                throw std::runtime_error("truncated long indexer fixture");
+            return v;
+        };
+        const auto raw = read(size_t(2305) * 128), kn = read(128), bn = read(128);
+        const auto raw_q = read(512), qn = read(128), want_k = read(size_t(576) * 128), want_q = read(512);
+        const auto want_scores = read(576), want_ids = read(512);
+        Dev<float> dr, dk, db, dq, dqn, out_q(512), tail(384), dead(128), pooled(size_t(577) * 128), scores(577);
+        Dev<int32_t> bpos(1), qpos, steps, ids(2052);
+        dr.put(raw); dk.put(kn); db.put(bn); dq.put(raw_q); dqn.put(qn);
+        qpos.put(std::vector<int32_t>(4, 2304));
+        std::vector<int32_t> hs(strata::kernels::kStepCount);
+        strata::kernels::qsa_step_fill(hs.data(), 2304, S); steps.put(hs);
+        strata::gpu::Stream cs = strata::gpu::stream_create();
+        check(cs != nullptr, "long fixture stream");
+        strata::kernels::RopeScaling sc;
+        sc.type = strata::kernels::RopeScalingType::YaRN;
+        sc.factor = 2; sc.ext_factor = 1; sc.orig_ctx = 262144;
+        const strata::kernels::QsaIndexerBuffers bufs{tail.p, dead.p, pooled.p, bpos.p};
+        strata::kernels::native_qsa_indexer_append_batch(dr.p, 2305, 0, 0, dk.p, EPS, bufs, S, 2305, sc, cs, db.p, true);
+        strata::kernels::native_qsa_rms_norm_rope(dq.p, 128, dqn.p, out_q.p, 4, 128, 64, EPS, sc, qpos.p, cs, true);
+        strata::kernels::qsa_block_scores(pooled.p, dead.p, out_q.p, steps.p, 1, 577, S, scores.p, cs);
+        strata::kernels::qsa_block_topk_with_current(scores.p, steps.p, 1, 577, 2052, S, ids.p, cs);
+        check(strata::gpu::stream_sync(cs), "long fixture sync");
+        const auto got_k = pooled.get(size_t(576) * 128), got_q = out_q.get(512), got_scores = scores.get(576);
+        const auto finished = steps.get(strata::kernels::kStepCount);
+        const auto got_ids = ids.get((size_t) finished[strata::kernels::kStepWidth]);
+        double km = 0, qm = 0, sm = 0;
+        for (size_t i = 0; i < got_k.size(); ++i) km = std::max(km, std::fabs(double(got_k[i]) - want_k[i]));
+        for (size_t i = 0; i < got_q.size(); ++i) qm = std::max(qm, std::fabs(double(got_q[i]) - want_q[i]));
+        for (size_t i = 0; i < got_scores.size(); ++i)
+            sm = std::max(sm, std::fabs(double(got_scores[i]) - want_scores[i]));
+        std::vector<bool> selected(2305, false), expected(2305, false);
+        for (const auto id : got_ids) if (id >= 0 && id < 2305) selected[(size_t) id] = true;
+        for (const auto id : want_ids) for (int c = 0; c < 4; ++c) expected[(size_t) int(id) * 4 + c] = true;
+        expected[2304] = true;
+        int extra = 0, missing = 0;
+        for (int i = 0; i < 2305; ++i) { extra += selected[(size_t) i] && !expected[(size_t) i];
+            missing += expected[(size_t) i] && !selected[(size_t) i]; }
+        report("long fixture key max absolute error", km, "max");
+        report("long fixture query max absolute error", qm, "max");
+        report("long fixture score max absolute error", sm, "max");
+        std::printf("  long fixture selected cells: extra %d, missing %d\n", extra, missing);
+        require("long fixture selected cells", extra == 0 && missing == 0);
+        strata::gpu::stream_destroy(cs);
+    }
+
+    if (!full_fixture.empty()) {
+        std::ifstream input(full_fixture, std::ios::binary);
+        auto read = [&](size_t n) {
+            std::vector<float> v(n);
+            if (!input.read(reinterpret_cast<char*>(v.data()), (std::streamsize) (n * sizeof(float))))
+                throw std::runtime_error("truncated full indexer fixture");
+            return v;
+        };
+        constexpr int Q = 64, N = 16384, B = 4096, CAP = 2052;
+        const auto raw = read(size_t(N) * 128), kn = read(128), bn = read(128);
+        const auto raw_q = read(size_t(Q) * 512), qn = read(128), want_k = read(size_t(B) * 128), want_q = read(size_t(Q) * 512);
+        const auto want_scores = read(size_t(Q) * B), want_ids = read(size_t(Q) * 512);
+        Dev<float> dr, dk, db, dq, dqn, out_q(size_t(Q) * 512), tail(384), dead(128), pooled((size_t(B) + 1) * 128);
+        Dev<float> scores(size_t(Q) * (B + 1));
+        Dev<int32_t> bpos(1), qpos, steps, ids(size_t(Q) * CAP);
+        dr.put(raw); dk.put(kn); db.put(bn); dq.put(raw_q); dqn.put(qn);
+        std::vector<int32_t> hp(size_t(Q) * 4), hs(size_t(Q) * strata::kernels::kStepCount);
+        for (int t = 0; t < Q; ++t) {
+            for (int h = 0; h < 4; ++h) hp[t * 4 + h] = t * 256;
+            strata::kernels::qsa_step_fill(hs.data() + size_t(t) * strata::kernels::kStepCount, int64_t(t) * 256, S);
+        }
+        qpos.put(hp); steps.put(hs);
+        strata::gpu::Stream cs = strata::gpu::stream_create();
+        check(cs != nullptr, "full fixture stream");
+        strata::kernels::RopeScaling sc;
+        sc.type = strata::kernels::RopeScalingType::YaRN;
+        sc.factor = 2; sc.ext_factor = 1; sc.orig_ctx = 262144;
+        const strata::kernels::QsaIndexerBuffers bufs{tail.p, dead.p, pooled.p, bpos.p};
+        strata::kernels::native_qsa_indexer_append_batch(dr.p, N, 0, 0, dk.p, EPS, bufs, S, N, sc, cs, db.p, true);
+        strata::kernels::native_qsa_rms_norm_rope(dq.p, 128, dqn.p, out_q.p, Q * 4, 128, 64, EPS, sc, qpos.p, cs, true);
+        strata::kernels::qsa_block_scores(pooled.p, dead.p, out_q.p, steps.p, Q, B + 1, S, scores.p, cs);
+        strata::kernels::qsa_block_topk_with_current(scores.p, steps.p, Q, B + 1, CAP, S, ids.p, cs);
+        check(strata::gpu::stream_sync(cs), "full fixture sync");
+        const auto got_k = pooled.get(size_t(B) * 128), got_q = out_q.get(size_t(Q) * 512), got_scores = scores.get(size_t(Q) * (B + 1));
+        const auto finished = steps.get(size_t(Q) * strata::kernels::kStepCount), got_ids = ids.get(size_t(Q) * CAP);
+        double km = 0, qm = 0, sm = 0, score_sq = 0, score_ref_sq = 0;
+        for (size_t i = 0; i < got_k.size(); ++i) km = std::max(km, std::fabs(double(got_k[i]) - want_k[i]));
+        for (size_t i = 0; i < got_q.size(); ++i) qm = std::max(qm, std::fabs(double(got_q[i]) - want_q[i]));
+        int mismatches = 0, extra_total = 0, missing_total = 0;
+        for (int t = 0; t < Q; ++t) {
+            const int n = t * 256 + 1, nb = n / 4;
+            for (int b = 0; b < nb; ++b) {
+                const double want = want_scores[t * B + b], delta = got_scores[t * (B + 1) + b] - want;
+                sm = std::max(sm, std::fabs(delta)); score_sq += delta * delta; score_ref_sq += want * want;
+            }
+            std::vector<bool> selected((size_t) n, false), expected((size_t) n, false);
+            const int width = finished[t * strata::kernels::kStepCount + strata::kernels::kStepWidth];
+            for (int i = 0; i < width; ++i) { const int id = got_ids[t * CAP + i]; if (id >= 0 && id < n) selected[(size_t) id] = true; }
+            for (int i = 0; i < 512; ++i) {
+                const int b = (int) want_ids[t * 512 + i];
+                if (b >= 0 && b < nb) for (int c = 0; c < 4; ++c) expected[(size_t) b * 4 + c] = true;
+            }
+            for (int i = (n - 1) / 4 * 4; i < n; ++i) expected[(size_t) i] = true;
+            int extra = 0, missing = 0;
+            for (int i = 0; i < n; ++i) { extra += selected[(size_t) i] && !expected[(size_t) i];
+                missing += expected[(size_t) i] && !selected[(size_t) i]; }
+            if (extra || missing) { ++mismatches; extra_total += extra; missing_total += missing;
+                std::printf("    position %d: extra %d missing %d\n", t * 256, extra, missing); }
+        }
+        report("full fixture key max absolute error", km, "max");
+        report("full fixture query max absolute error", qm, "max");
+        report("full fixture score max absolute error", sm, "max");
+        report("full fixture score relative RMS", std::sqrt(score_sq / score_ref_sq), "ratio");
+        std::printf("  full fixture selected cells: %d/%d rows differ, extra %d missing %d\n",
+                    mismatches, Q, extra_total, missing_total);
+        require("full fixture selected cells", mismatches == 0);
+        Dev<float> ref_k, ref_q; ref_k.put(want_k); ref_q.put(want_q);
+        const struct { const char* name; const float* keys; const float* query; } cases[] = {
+            {"engine K + fixture Q", pooled.p, ref_q.p}, {"fixture K + engine Q", ref_k.p, out_q.p},
+            {"fixture K + fixture Q", ref_k.p, ref_q.p}};
+        for (const auto& c : cases) {
+            steps.put(hs);
+            strata::kernels::qsa_block_scores(c.keys, dead.p, c.query, steps.p, Q, B + 1, S, scores.p, cs);
+            strata::kernels::qsa_block_topk_with_current(scores.p, steps.p, Q, B + 1, CAP, S, ids.p, cs);
+            check(strata::gpu::stream_sync(cs), "full fixture isolation sync");
+            const auto scv = scores.get(size_t(Q) * (B + 1));
+            const auto sv = steps.get(size_t(Q) * strata::kernels::kStepCount), iv = ids.get(size_t(Q) * CAP);
+            int rows_bad = 0, ex = 0, miss = 0;
+            double mx = 0, dsq = 0, wsq = 0;
+            for (int t = 0; t < Q; ++t) {
+                const int n = t * 256 + 1, nb = n / 4;
+                std::vector<bool> found((size_t) n, false), expected((size_t) n, false);
+                for (int b = 0; b < nb; ++b) {
+                    const double w = want_scores[t * B + b], d = scv[t * (B + 1) + b] - w;
+                    mx = std::max(mx, std::fabs(d)); dsq += d * d; wsq += w * w;
+                }
+                const int width = sv[t * strata::kernels::kStepCount + strata::kernels::kStepWidth];
+                for (int i = 0; i < width; ++i) { const int id = iv[t * CAP + i]; if (id >= 0 && id < n) found[(size_t) id] = true; }
+                for (int i = 0; i < 512; ++i) {
+                    const int b = (int) want_ids[t * 512 + i];
+                    if (b >= 0 && b < nb) for (int j = 0; j < 4; ++j) expected[(size_t) b * 4 + j] = true;
+                }
+                for (int i = (n - 1) / 4 * 4; i < n; ++i) expected[(size_t) i] = true;
+                int e = 0, m = 0;
+                for (int i = 0; i < n; ++i) { e += found[(size_t) i] && !expected[(size_t) i];
+                    m += expected[(size_t) i] && !found[(size_t) i]; }
+                rows_bad += e || m; ex += e; miss += m;
+            }
+            std::printf("  %-24s score max %.3e relative RMS %.3e, rows %d/%d extra %d missing %d\n",
+                        c.name, mx, std::sqrt(dsq / wsq), rows_bad, Q, ex, miss);
+        }
+        strata::gpu::stream_destroy(cs);
+    }
+
+    if (!project_fixture.empty()) {
+        std::ifstream input(project_fixture, std::ios::binary);
+        auto read = [&](size_t n) {
+            std::vector<float> v(n);
+            if (!input.read(reinterpret_cast<char*>(v.data()), (std::streamsize) (n * sizeof(float))))
+                throw std::runtime_error("truncated projection fixture");
+            return v;
+        };
+        const auto hidden = read(size_t(8) * 4096), qw = read(size_t(512) * 4096), kw = read(size_t(128) * 4096);
+        const auto ref_rawk = read(size_t(8) * 128), kn = read(128), bn = read(128), ref_key = read(size_t(2) * 128);
+        const auto ref_rawq = read(size_t(8) * 512), qn = read(128), ref_query = read(size_t(8) * 512);
+        Dev<float> dh, dwq, dwk, dkn, dbn, dqn, rawq(size_t(8) * 512), rawk(size_t(8) * 128), gemvq(size_t(8) * 512), gemvk(size_t(8) * 128);
+        Dev<float> query(size_t(8) * 512), tail(384), dead(128), pooled(size_t(3) * 128);
+        Dev<int32_t> bpos(1), qpos;
+        dh.put(hidden); dwq.put(qw); dwk.put(kw); dkn.put(kn); dbn.put(bn); dqn.put(qn);
+        std::vector<int32_t> hp(32);
+        for (int t = 0; t < 8; ++t) for (int h = 0; h < 4; ++h) hp[t * 4 + h] = t;
+        qpos.put(hp);
+        strata::gpu::Stream cs = strata::gpu::stream_create();
+        check(cs != nullptr, "projection fixture stream");
+        strata::kernels::f32_gemm_rows(dh.p, 4096, dwq.p, rawq.p, 512, 4096, 512, 8, cs);
+        strata::kernels::f32_gemm_rows(dh.p, 4096, dwk.p, rawk.p, 128, 4096, 128, 8, cs);
+        strata::kernels::f32_gemv_fp32_mmvf_multi(dh.p, 4096, dwq.p, gemvq.p, 512, 4096, 512, 8, cs);
+        strata::kernels::f32_gemv_fp32_mmvf_multi(dh.p, 4096, dwk.p, gemvk.p, 128, 4096, 128, 8, cs);
+        strata::kernels::RopeScaling sc;
+        sc.type = strata::kernels::RopeScalingType::YaRN;
+        sc.factor = 2; sc.ext_factor = 1; sc.orig_ctx = 262144;
+        const strata::kernels::QsaIndexerBuffers bufs{tail.p, dead.p, pooled.p, bpos.p};
+        strata::kernels::native_qsa_indexer_append_batch(rawk.p, 8, 0, 0, dkn.p, EPS, bufs, S, 8, sc, cs, dbn.p, true);
+        strata::kernels::native_qsa_rms_norm_rope(rawq.p, 128, dqn.p, query.p, 32, 128, 64, EPS, sc, qpos.p, cs, true);
+        check(strata::gpu::stream_sync(cs), "projection fixture sync");
+        auto maxdiff = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double m = 0; for (size_t i = 0; i < a.size(); ++i) m = std::max(m, std::fabs(double(a[i]) - b[i]));
+            return m;
+        };
+        const double gq = maxdiff(rawq.get(size_t(8) * 512), ref_rawq), gk = maxdiff(rawk.get(size_t(8) * 128), ref_rawk);
+        const double vq = maxdiff(gemvq.get(size_t(8) * 512), ref_rawq), vk = maxdiff(gemvk.get(size_t(8) * 128), ref_rawk);
+        const double qm = maxdiff(query.get(size_t(8) * 512), ref_query), km = maxdiff(pooled.get(size_t(2) * 128), ref_key);
+        std::printf("  projection fixture: GEMM q %.3e k %.3e; GEMV q %.3e k %.3e; query %.3e key %.3e\n",
+                    gq, gk, vq, vk, qm, km);
+        require("fixture from hidden states through GPU indexer", std::max({gq, gk, vq, vk, qm, km}) < 5e-4);
+        strata::gpu::stream_destroy(cs);
+    }
+
+    // The sparse mask selects 512 complete blocks and always unions the current causal block.
+    // Test both outcomes when the current block has just closed, as well as an incomplete tail.
+    {
+        constexpr int Q = 5, BLOCKS = 600, CAP = 2052;
+        const int positions[Q] = {2046, 2047, 2051, 2051, 2304};
+        std::vector<int32_t> hs(size_t(Q) * strata::kernels::kStepCount);
+        std::vector<float> scores(size_t(Q) * BLOCKS, 0);
+        for (int q = 0; q < Q; ++q) {
+            strata::kernels::qsa_step_fill(hs.data() + size_t(q) * strata::kernels::kStepCount, positions[q], S);
+            const int nb = (positions[q] + 1) / 4;
+            for (int b = 0; b < nb; ++b)
+                scores[q * BLOCKS + b] = q == 4 ? 2e9f + float((nb - b) * 256) : float(q == 3 ? b : nb - b);
+            if ((positions[q] + 1) % 4) scores[q * BLOCKS + nb] = 1e9f;
+        }
+        Dev<float> ds; ds.put(scores);
+        Dev<int32_t> steps, ids(size_t(Q) * CAP); steps.put(hs);
+        strata::gpu::Stream cs = strata::gpu::stream_create();
+        check(cs != nullptr, "selection stream");
+        strata::kernels::qsa_block_topk_with_current(ds.p, steps.p, Q, BLOCKS, CAP, S, ids.p, cs);
+        check(strata::gpu::stream_sync(cs), "selection sync");
+        const auto actual = ids.get(size_t(Q) * CAP), finished = steps.get(size_t(Q) * strata::kernels::kStepCount);
+        bool all = true;
+        for (int q = 0; q < Q; ++q) {
+            const int n = positions[q] + 1, nb = n / 4;
+            std::vector<bool> expected((size_t) n, false), found((size_t) n, false);
+            for (int i = 0; i < std::min(nb, 512); ++i) {
+                const int b = q == 3 ? nb - 1 - i : i;
+                for (int c = 0; c < 4; ++c) expected[(size_t) b * 4 + c] = true;
+            }
+            for (int i = (n - 1) / 4 * 4; i < n; ++i) expected[(size_t) i] = true;
+            const int width = finished[q * strata::kernels::kStepCount + strata::kernels::kStepWidth];
+            for (int i = 0; i < width; ++i) {
+                const int cell = actual[(size_t) q * CAP + i];
+                if (cell < 0 || cell >= n || found[(size_t) cell]) all = false;
+                else found[(size_t) cell] = true;
+            }
+            if (expected != found) all = false;
+        }
+        require("block topk plus current, open and completed", all);
+        strata::gpu::stream_destroy(cs);
+    }
 
     // ================= 0. the fp16 converter, against numpy =================
     {

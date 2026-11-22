@@ -723,12 +723,29 @@ private:
         /// the fused [q | k | v] and [gate | up] matrices q, k, v, sh_gate and sh_up are row ranges of, and whether the
         /// layer is a sliding-window one
         const float *attn_post = nullptr, *ffn_post = nullptr;
-        W qkv_all, gu_all;
+        W qkv_all, gu_all, beta_alpha_all;
+        W hc_attn_fn, hc_ffn_fn;
+        const float *hc_attn_bias = nullptr, *hc_ffn_bias = nullptr;
         bool swa = false;
         const float* router = nullptr;                        // F32 [n_embd, n_expert]
         const float* sh_gate_inp = nullptr;                   // F32 [n_embd]
         W sh_gate, sh_up, sh_down;                            // the shared expert, or qwen35's dense FFN
     };
+    // QSA indexers are per visit, even when the loop reuses the attention block's ordinary weights.
+    struct QsaWeights {
+        W q, k;
+        const float *q_norm = nullptr, *k_norm = nullptr, *block_norm = nullptr;
+    };
+    bool sparse_qsa_ = false;
+    /// This window's rows all within the indexer's budget, where the selection is every cell: the QSA layers append
+    /// their indexer keys and attend densely, without the query, the scores and the top-k (stage_forward; sexec_)
+    bool qsa_short_ = false;
+    std::vector<QsaWeights> qsa_weights_;
+    std::vector<strata::kernels::QsaIndexerBuffers> qsa_index_;
+    std::vector<std::vector<float*>> qsa_tail_snap_;
+    float *qsa_raw_ = nullptr, *qsa_query_ = nullptr, *qsa_scores_ = nullptr;
+    int32_t* qsa_ids_ = nullptr;
+
     /// stream_blocks: each block's matrices in the mapped file (W::data set as the block is bound), and their source
     struct Streamed {
         W* w = nullptr;
@@ -896,6 +913,8 @@ private:
         float *qfull = nullptr, *qcur = nullptr, *kraw = nullptr, *kcur = nullptr, *vcur = nullptr, *attn = nullptr,
               *attn32 = nullptr;
         int32_t *steps = nullptr, *pos_q = nullptr, *pos_k = nullptr;
+        float *qsa_raw = nullptr, *qsa_query = nullptr, *qsa_scores = nullptr;
+        int32_t* qsa_ids = nullptr;
         float *rlog = nullptr, *w = nullptr, *shared = nullptr, *sh_g = nullptr, *sh_gate = nullptr, *sh_up = nullptr;
         int32_t* ids = nullptr;
         uint16_t* xs16 = nullptr;          ///< the routed rows grouped by expert, FP16 [T * k, n_embd]
@@ -1357,6 +1376,8 @@ private:
     std::vector<PendingSwap> pending_;
     std::vector<strata::gpu::Graph*> exec_;                      ///< per T: the whole window
     std::vector<std::vector<strata::gpu::Graph*>> segs_;         ///< per T: the segments (MoeWindow::segmented)
+    std::vector<strata::gpu::Graph*> sexec_;                     ///< per T: the whole window, qsa_short_'s form
+    std::vector<std::vector<strata::gpu::Graph*>> ssegs_;        ///< per T: its segments
     std::vector<strata::gpu::Graph*> mexec_;                     ///< per T: the MTP layer
     std::vector<strata::gpu::Graph*> rexec_, mrexec_;            ///< per T: the two with every routed expert in VRAM
     bool res_rec_ = false;                                       ///< recording rexec_ / mrexec_

@@ -2648,7 +2648,7 @@ static void plain_usage(const std::string& arch) {
                  "  --ram-reserve-mib N  leave N MiB of RAM free for other programs (setup's --ram-reserve-gib): the\n"
                  "                       experts' RAM copy keeps at least it beside it, and it is the least\n"
                  "                       --conversation-cache-min-free-mib (also XESTRATA_RAM_RESERVE_MIB; 0 = none)\n"
-                 "  --vision             --serve takes pictures too (GENI; qwen35 and qwen35moe, the rows from xestrata-vision)\n"
+                 "  --vision             --serve takes pictures too (GENI; qwen35, qwen35moe and sensenova_loop, the rows from xestrata-vision)\n"
                  "  --gpu PCI            the GPU (its PCI address)\n"
                  "  --device cpu|gpu     where the forward runs (default gpu; the dense Qwen3.5 models, qwen35, run on\n"
                  "                       the CPU as well, and take it when no GPU is there)\n"
@@ -2675,6 +2675,8 @@ int plain_main(int argc, char** argv) {
     linkless_gpu_adapter();
 
     strata::core::PlainOptions opt;
+    // The official Q4_K_M MTP accepted 52.8% of 123 drafts on the B70; keep it available with --spec.
+    if (arch == "sensenova_loop") opt.spec = 0;
     opt.coupled_draft = strata::core::coupled_draft_env();   // STRATA_SPEC_COUPLED=1, as Qwen3.8-Flash-Next's
     // XESTRATA_BATCH_MTP: auto (the default) keeps the option (on by default where the slots allow it); 0 and 1 turn
     // it off and on, as --no-batch-mtp / --batch-mtp do.
@@ -3012,8 +3014,8 @@ int plain_main(int argc, char** argv) {
 
     if (sp.greedy) sp.temperature = 0.0f;
     if (stop_eos && eos.empty()) eos = eos_tokens(gguf);
-    if (opt.vision && arch != "qwen35" && arch != "qwen35moe") {   // the M-RoPE table: the Qwen3.5 rotation's
-        std::fprintf(stderr, "xestrata (%s): --vision is off: pictures are read for qwen35 and qwen35moe\n", arch.c_str());
+    if (opt.vision && arch != "qwen35" && arch != "qwen35moe" && arch != "sensenova_loop") {   // the M-RoPE table: the Qwen3.5 rotation's
+        std::fprintf(stderr, "xestrata (%s): --vision is off: pictures are read for qwen35, qwen35moe and sensenova_loop\n", arch.c_str());
         opt.vision = false;
     }
     // the CPU: asked for, or a dense model (Qwen3.5, PLaMo 3) on a PC whose SYCL runtime lists no GPU it can use
@@ -3200,8 +3202,8 @@ int plain_main(int argc, char** argv) {
         }
     }
     if (!cvecs.files.empty()) {   // before the first window records the blocks
-        if (model.spec().arch == ModelArch::Glm5Next) {
-            std::fprintf(stderr, "xestrata (%s): --control-vector is not available for GLM-5.3-Flash yet\n", arch.c_str());
+        if (model.spec().arch == ModelArch::Glm5Next || model.spec().arch == ModelArch::SenseNovaLoop) {
+            std::fprintf(stderr, "xestrata (%s): --control-vector is not available for this model yet\n", arch.c_str());
             return 2;
         }
         if (!load_control_vectors(cvecs, model.spec().n_layer, model.spec().n_embd, arch, err) ||
