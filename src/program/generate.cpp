@@ -3508,6 +3508,9 @@ int main(int argc, char** argv) {
             drafter_bytes += (int64_t) head_bytes;
         }
         auto weights_of = [&](int64_t lo, int64_t hi) -> uint64_t {
+            // (hi < 0: every layer, session_bytes' convention - one GPU alone is asked for as (0, -1), and its room
+            // was counted without any layer's weights: Sync-M's cache at 21,900 experts where it takes 19,070)
+            if (hi < 0) hi = L;
             uint64_t b = canon_all + nat_shared;
             for (int64_t l = 0; l < L; ++l)
                 if (l < lo || l >= hi) b -= std::min(b, canon_layer[(size_t) l]);
@@ -3693,9 +3696,9 @@ int main(int argc, char** argv) {
             const double one = predict({}, hm, held);
             alone_ms = startable ? one : 1e30;
             alone_holds_all = startable && held == (int64_t) prof.size();
-            std::fprintf(stderr, "xestrata generate: layer split auto: CUDA0 alone would take %.1f ms per window (~%.1f%% "
-                                 "of the routed mass cached%s)\n", one, 100.0 * hm,
-                         alone_holds_all ? ", every profiled pair" : "");
+            std::fprintf(stderr, "xestrata generate: layer split auto: CUDA0 alone would take %.1f ms per window (its "
+                                 "cache holds %lld of %zu profiled pairs, ~%.1f%% of the routed mass%s)\n", one,
+                         (long long) held, prof.size(), 100.0 * hm, alone_holds_all ? ": every pair" : "");
         }
         std::vector<int64_t> best, at((size_t) ns - 1);
         double best_ms = 1e30, best_mass = 0;

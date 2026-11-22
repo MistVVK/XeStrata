@@ -1019,9 +1019,10 @@ bool PlainModel::split_auto_role(std::string& err) {
     const double split_ms = split_r.startable ? split_r.ms : 1e30;
     const double alone_ms = alone_r.startable ? alone_r.ms : 1e30;
     const bool alone_holds_all = alone_r.startable && alone_r.held == (int64_t) prof.size();
-    std::fprintf(stderr, "xestrata plain: --layer-split auto: %s alone would take %.1f ms per window (~%.1f%% of the "
-                         "routed mass cached%s)\n", strata::gpu::device_name(split_devs_[0]).c_str(), alone_r.ms,
-                 100.0 * alone_r.held_mass, alone_holds_all ? ", every profiled pair" : "");
+    std::fprintf(stderr, "xestrata plain: --layer-split auto: %s alone would take %.1f ms per window (its cache holds "
+                         "%lld of %zu profiled pairs, ~%.1f%% of the routed mass%s)\n",
+                 strata::gpu::device_name(split_devs_[0]).c_str(), alone_r.ms, (long long) alone_r.held, prof.size(),
+                 100.0 * alone_r.held_mass, alone_holds_all ? ": every pair" : "");
     // the second GPU as a helper expert cache
     const char* role_env = strata::env_get("SPLIT_ROLE");
     const std::string role = role_env != nullptr ? role_env : "";
