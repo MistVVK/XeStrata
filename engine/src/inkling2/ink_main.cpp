@@ -225,7 +225,7 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
     double ppts = (P * prompt_len) / std::max(pf_s, 1e-9);
     double tps_agg = total_gen / std::max(dec_s, 1e-9);
     printf("[bench] backend=%s format=%s parallel=%d gpus=%d kv=%s prompt=%d gen=%d | prefill=%.1f ppts (%.2fs) | decode=%.1f tps agg (%.1f tps/slot, %.2fs)\n",
-           backend->backend_name(), source_kind_name(mf.kind), P, bo.gpus, kv_dtype_name(bo.kv_dtype),
+           backend->backend_name(), source_kind_name(mf.kind), P, bo.gpus, kv_dtype_name(backend->stats().kv_dtype),
            prompt_len, gen_len, ppts, pf_s, tps_agg, tps_agg / P, dec_s);
     return 0;
 }

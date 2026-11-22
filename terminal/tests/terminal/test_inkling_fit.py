@@ -79,6 +79,16 @@ class TestInklingFitAndHardwareSelection(unittest.TestCase):
         self.assertTrue(rec_strix["unified"])
         self.assertTrue(rec_strix["fits"])
 
+        # 8 GiB & 12 GiB discrete GPUs auto-enable FP8 KV to maximize 3x-looped core expert residency
+        p8 = inkling_fit.compute("SQ-10", 8, 32, 32768)
+        self.assertEqual(p8["kv_dtype"], "fp8")
+        self.assertGreater(p8["vram_gb"], 5.0)
+        p12 = inkling_fit.compute("SQ-15", 12, 32, 32768)
+        self.assertEqual(p12["kv_dtype"], "fp8")
+        self.assertGreater(p12["vram_gb"], 9.0)
+        p16 = inkling_fit.compute("SQ-15", 16, 32, 32768)
+        self.assertEqual(p16["kv_dtype"], "fp16")
+
     def test_kv_cache_scales_for_parallel_1_to_64(self):
         k1 = inkling_fit.kv_cache_gb(32768, parallel=1)
         k8 = inkling_fit.kv_cache_gb(32768, parallel=8)

@@ -98,7 +98,8 @@ struct InkCudaModel {
         return man.get(name);
     }
 
-    bool load(const std::string& strata_path, int gpu_id, bool build_screen, std::string& err, size_t extra_reserve_bytes = 0) {
+    bool load(const std::string& strata_path, int gpu_id, bool build_screen, std::string& err,
+              size_t extra_reserve_bytes = 0, double max_vram_experts_gb = -1.0) {
         path = strata_path;
         primary_gpu = gpu_id;
         INK_CK(cudaSetDevice(primary_gpu));
@@ -175,11 +176,16 @@ struct InkCudaModel {
         // Tight on-demand VRAM reserve: lets SQ-10 fit 100% in 12 GB RTX 5070 (even under Win11 WDDM!) and SQ-15 in 16 GB RTX 5070 Ti,
         // while keeping full headroom for FP8 KV + workspaces + DSpark + CUDA Graph (spilling cleanly to Hybrid on 11 GB GPUs)!
         const size_t base_reserve = (vtot >= (20ull << 30)) ? (1600ull << 20)
+#ifdef _WIN32
                                   : (vtot <= (13ull << 30)) ? (780ull << 20)
+#else
+                                  : (vtot <= (13ull << 30)) ? (1024ull << 20)
+#endif
                                                             : (1280ull << 20);
         const size_t reserve = std::max(base_reserve, extra_reserve_bytes);
+        const bool user_cap_experts = (max_vram_experts_gb >= 0.0) && ((size_t)(max_vram_experts_gb * 1e9) < sec4_bytes);
         for (int il = 0; il < 24; ++il) layer_has_host[il] = false;
-        if (vfree > sec4_bytes + reserve) {
+        if (!user_cap_experts && vfree > sec4_bytes + reserve) {
             // 100% VRAM resident! Single sequential streaming DMA!
             INK_CK(cudaMalloc(&d_sec4, sec4_bytes));
             const size_t CH = 64ull << 20;
@@ -204,13 +210,29 @@ struct InkCudaModel {
             if ((int)vorder.size() == n_total) {
                 order = vorder;
             } else {
-                order.resize(n_total);
-                for (int i = 0; i < n_total; ++i) order[i] = (uint16_t)i;
+                // Guarantee 3x looped core layers (core_start..core_end-1) are ALWAYS prioritized before 1x prelude/coda!
+                order.reserve(n_total);
+                for (int il = man.c.core_start; il < man.c.core_end; ++il)
+                    for (int r = 0; r < man.c.n_experts; ++r) order.push_back((uint16_t)(il * man.c.n_experts + r));
+                for (int il = 0; il < man.c.core_start; ++il)
+                    for (int r = 0; r < man.c.n_experts; ++r) order.push_back((uint16_t)(il * man.c.n_experts + r));
+                for (int il = man.c.core_end; il < man.c.n_phys; ++il)
+                    for (int r = 0; r < man.c.n_experts; ++r) order.push_back((uint16_t)(il * man.c.n_experts + r));
             }
-            // Reserve full headroom (1.66 GiB for runner+DSpark+cuBLAS+Graph + 256 MiB for ping-pong DMA + promo ring)!
-            const size_t hyb_post_res = std::max(reserve, (size_t)(1664ull << 20));
-            const size_t hyb_reserve = hyb_post_res + (256ull << 20);
-            const size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
+            // Tight VRAM reserve tailored to 8 GB / 10-12 GB / 16+ GB cards so ALL 12 looped 3x core layers fit in VRAM on 8 GB SQ-10 & 12 GB SQ-15
+            // while leaving enough headroom (~1.08 GiB) for FP8 KV + activations + DSpark + cuBLAS with ZERO OOMs!
+            const size_t hyb_post_floor = (vtot <= (10ull << 30)) ? (1080ull << 20)
+                                        : (vtot <= (14ull << 30)) ? (1120ull << 20)
+                                                                  : (1664ull << 20);
+            // 256 MiB staging+promo budget = 2x64 MiB ping-pong DMA (1-chunk SQ-15!) + ~120 MiB FREE 1.4us D2D dynamic hot-expert ring (~30-45 slots)!
+            const size_t stage_res      = (vtot <= (14ull << 30)) ? (256ull << 20)
+                                                                  : (256ull << 20);
+            const size_t hyb_post_res = std::max(reserve, hyb_post_floor);
+            const size_t hyb_reserve = hyb_post_res + stage_res;
+            size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
+            if (max_vram_experts_gb >= 0.0) {
+                vram_budget = std::min(vram_budget, (size_t)(max_vram_experts_gb * 1e9));
+            }
             size_t vram_used = 0, host_used = 0, max_exp_bytes = 0;
             std::vector<uint8_t> in_vram(n_total, 0);
             for (uint16_t di : order) {
@@ -268,7 +290,7 @@ struct InkCudaModel {
                 size_t vf_now = 0, vt_now = 0;
                 INK_CK(ink_cuda_mem_info(&vf_now, &vt_now));
                 const size_t avail = (vf_now > hyb_post_res) ? (vf_now - hyb_post_res) : 0;
-                hybrid.alloc_staging(max_exp_bytes, avail);
+                hybrid.alloc_staging(max_exp_bytes, avail, vt_now);
             }
         }
         double t_exp = now_s() - t1;
@@ -507,16 +529,22 @@ struct InkCudaRunner {
             INK_CK(ink_cuda_mem_info(&vfree, &vtot));
             tree_cap = (max_slots <= 4 && vfree > (700ull << 20)) ? kInkMaxTree : 16;
             max_batch = std::max(max_batch, tree_cap);
-            // On tight 12 GB GPUs (especially Win11 WDDM), cap max_batch to 512 so workspaces never trigger host paging!
-            if (vfree < (2200ull << 20) && max_batch > 512) {
-                max_batch = 512;
+            // On tight 8-12 GB GPUs (especially Win11 WDDM), cap max_batch so workspaces & SWA rings leave maximum VRAM for 3x-looped experts & KV without WDDM spill!
+            const int batch_cap = (vtot <= (10ull << 30) || vfree < (1800ull << 20)) ? 256 : 512;
+            if ((vtot <= (10ull << 30) || vfree < (2200ull << 20)) && max_batch > batch_cap) {
+                max_batch = batch_cap;
                 swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
             }
             const size_t bpe = (kv_dtype == InkKvDtype::FP8) ? 2 : 4;  // K+V bytes per element
             const size_t sc_per_pos = (kv_dtype == InkKvDtype::FP8) ? (size_t)(2 * kInkKVHeads * 4) : 0;
             const size_t swa_kv_bytes = (size_t)40 * max_slots * swa_ring * ((size_t)kInkKVDim * bpe + sc_per_pos);
             const size_t sconv_bytes  = (size_t)kInkVisits * max_slots * 3 * kInkSconvCh * 4;
-            const size_t ws_reserve   = (max_slots >= 8) ? (1400ull << 20) : (480ull << 20);  // activation workspaces + DSpark + cuBLAS headroom
+            const size_t ws_reserve   = (max_slots >= 8) ? (1400ull << 20)
+#ifdef _WIN32
+                                      : (vtot <= (13ull << 30)) ? ((max_slots == 1) ? (580ull << 20) : (340ull << 20)) : (480ull << 20);  // preserve WDDM + DSpark headroom so 12 GB Win11 never spills to shared RAM
+#else
+                                      : (vtot <= (13ull << 30)) ? ((max_slots == 1) ? (780ull << 20) : (260ull << 20)) : (480ull << 20);  // activation workspaces + DSpark + cuBLAS headroom (0 OOM on 8-12 GB!)
+#endif
             if (vfree > swa_kv_bytes + sconv_bytes + ws_reserve) {
                 const size_t avail_glob = vfree - swa_kv_bytes - sconv_bytes - ws_reserve;
                 const size_t per_pos_glob = (size_t)8 * max_slots * ((size_t)kInkKVDim * bpe + sc_per_pos);
@@ -1319,8 +1347,9 @@ struct InkCudaRunner {
         prof_mark_end(0); prof_mark_start();
 
         if (m.layer_has_host[ip] && m.hybrid.active) {
+            const int next_ip = (visit + 1 < kInkVisits) ? ink_visit_phys(visit + 1) : -1;
             launch_ink_moe_hybrid(
-                st, cublas, m.d_sec4, m.d_experts[ip], m.moe_info[ip], ip, m.hybrid,
+                st, cublas, m.d_sec4, m.d_experts, m.moe_info[ip], ip, next_ip, m.hybrid,
                 (const float*)m.trunk_ptr(p + ".mlp.gate.weight"),
                 (const float*)m.trunk_ptr(p + ".mlp.gate.bias"),
                 d_moe_in, d_moe_raw, M, moe_ws, m.man.c.route_scale, (mode == 2));
@@ -1513,6 +1542,7 @@ struct InkCudaRunner {
             return;
         }
         emit_48_visits(M, 2, slot0, p0, want_taps);
+        if (m.hybrid.active && m.n_host_experts > 0) m.hybrid.decay_verify_counts();
     }
 
     // Batched multi-slot 1-token-per-slot step (B = 1..64 concurrent requests, captured in CUDA Graph when 100% VRAM!)

@@ -89,9 +89,17 @@ def kv_cache_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False)
     return round(slots * (active_ctx * per_tok + fixed), 3)
 
 
-def non_expert_gb(ctx: int | None = None, parallel: int = 1, vision: bool = False) -> float:
+def auto_fp8_kv(vram_gib: float | None, ctx: int | None = None, parallel: int = 1) -> bool:
+    """True when the engine auto-enables FP8/k8v8 KV cache to preserve VRAM for 3x-looped routed experts (<= 12.5 GiB discrete GPUs or >= 16 parallel slots)."""
+    if int(parallel or 1) >= 16:
+        return True
+    v = float(vram_gib or 0.0)
+    return 0.0 < v <= 12.5
+
+
+def non_expert_gb(ctx: int | None = None, parallel: int = 1, vision: bool = False, fp8_kv: bool = False) -> float:
     """Video memory kept free of expert bodies: driver/runtime buffers + KV/SWA/ShortConv state (+ optional Vision shard)."""
-    return round(VRAM_DRIVER_GB + kv_cache_gb(ctx, parallel) + (VISION_GB if vision else 0.0), 3)
+    return round(VRAM_DRIVER_GB + kv_cache_gb(ctx, parallel, fp8_kv=fp8_kv) + (VISION_GB if vision else 0.0), 3)
 
 
 def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None, vision: bool = False, parallel: int = 1) -> dict:
@@ -99,7 +107,8 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
     info = BUILDS[build]
     vram_gb = float(vram_gib or 0.0) * GIB_TO_GB
     ram_gb = float(ram_gib or 0.0) * GIB_TO_GB
-    gpu_room = max(0.0, vram_gb - info["dense_gb"] - non_expert_gb(ctx, parallel, vision=False))
+    fp8_kv = auto_fp8_kv(vram_gib, ctx, parallel)
+    gpu_room = max(0.0, vram_gb - info["dense_gb"] - non_expert_gb(ctx, parallel, vision=False, fp8_kv=fp8_kv))
     ram_room = max(0.0, ram_gb - OS_RESERVE_GB - (VISION_GB if vision else 0.0))
     in_vram = min(info["bodies_gb"], gpu_room)
     in_ram = min(info["bodies_gb"] - in_vram, ram_room)
@@ -110,6 +119,7 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
         "ram_gb": round(in_ram, 2),
         "ssd_gb": round(on_ssd, 2),
         "full_vram": on_ssd <= 0.05 and in_ram <= 0.05 and vram_total <= vram_gb,
+        "kv_dtype": "fp8" if fp8_kv else "fp16",
     }
 
 

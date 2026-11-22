@@ -351,10 +351,18 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     // Discrete cards (< 48 GB) keep embed_tokens (0.38 GB) in pinned mapped host memory
     const bool host_embed = !getenv("HY4_EMBED_VRAM") && (total < (48ull << 30));
     if (host_embed && trunk > 0.5) trunk -= 0.38;
-    // Sparse KV (no Vt: 1152 B/slot) + IndexPool (576 B/slot) = 1728 B/slot * 12 layers = 20,736 B/token.
+    // Compressed Q8 MLA KV cache (656 B/slot vs 1152 B/slot FP16, lossless FP16 RoPE):
+    // Available via --kv q8 / HY4_KV_Q8=1 (saves 780 MiB at 128K); default remains lossless FP16 because
+    // 16K incremental KV growth (0.34 GB init) already leaves 4.6 GB vcache on 12 GB cards & preserves full DFly2 acceptance.
+    bool kv_q8 = false;
+    if (getenv("HY4_KV_Q8")) {
+        kv_q8 = atoi(getenv("HY4_KV_Q8")) != 0;
+    }
+    const double kv_row_b = kv_q8 ? 656.0 : 1152.0;
+    // Sparse KV (656 B/slot Q8 or 1152 B/slot FP16) + IndexPool (576 B/slot) across 12 sparse layers.
     // On single discrete cards (< 48 GB) with max_ctx > 16384, allocate sparse KV + IndexPool in 16,384-token VRAM increments
     // (reclaiming adaptive vcache slabs as KV grows). On multi-GPU static EP (no vcache slabs), reserve full max_ctx KV upfront so 128K stays in VRAM.
-    const double per_pos = 12.0 * 1152.0 + 12.0 * 512.0 + 12.0 * 64.0;  // 20,736 B per token across 12 sparse layers
+    const double per_pos = 12.0 * kv_row_b + 12.0 * 512.0 + 12.0 * 64.0;
     int init_slots = max_ctx;
     if (!multi_gpu && !getenv("HY4_KV_NO_GROW") && total < (48ull << 30) && max_ctx > 16384) {
         init_slots = 16384;
@@ -369,17 +377,17 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     const double wkv = 0.03;  // single-layer reusable FP16 wk/wv prefill scratch (28 MiB)
     const double cublas_gb = HY4_CUDA ? 0.08 : 0.0;  // 64 MiB reusable side-stream FP16 dequant + cuBLAS scratch
     auto est_work_gb = [&](int c) {
-        // Aliased work_arena (max(2*c*16384*4, moe_ws_bytes(c))) + qa_h/H1/x/z/etc (~0.195 MB/tok) + SWA rings (30*(512+c)*1152 B) + misc 0.22 GB
+        // Aliased work_arena (max(2*c*16384*4, moe_ws_bytes(c))) + qa_h/H1/x/z/etc (~0.195 MB/tok) + SWA rings (30*(512+c)*kv_row_b) + misc 0.22 GB
         const double arena = std::max(2.0 * c * 16384.0 * 4.0, (double)c * 16.0 * 1536.0 * 6.0) / GB;
-        return arena + c * 0.195e6 / GB + 0.22 + 30.0 * (512.0 + c) * 1152.0 / GB;
+        return arena + c * 0.195e6 / GB + 0.22 + 30.0 * (512.0 + c) * kv_row_b / GB;
     };
     if (chunk <= 0) {
         // 16..32 GB cards default to Tc = 4096 (maximizes AdaptiveExpertCache by +1.6 GB / +450-600 VRAM slots over Tc = 8192);
+        // 12 GB cards default to Tc = 2048; <= 11 GB (8 GB & 10 GB cards) default to Tc = 1024 (saves +370 MiB -> +100 vcache slots!);
         // 48 GB+ cards default to Tc = 8192 when ctx >= 8192 (halves PCIe passes at 128K).
-        // Multi-GPU 32 GB static EP at >=96K context uses Tc = 2048 so 100% of SQ-64 experts + full 128K KV fit in HBM2 (e.g. 2x V100 32 GB).
         int c = (multi_gpu && max_ctx >= 98304 && tot < 40.0) ? 2048
               : (tot >= 44.0 ? ((max_ctx >= 8192) ? 8192 : 4096)
-              : (tot >= 15.0 ? 4096 : (tot >= 11.0 ? 2048 : 1024)));
+              : (tot >= 15.0 ? 4096 : (tot >= 11.5 ? 2048 : 1024)));
         const double work_cap = (tot >= 15.0) ? 0.22 : 0.16;
         while (c > 256 && est_work_gb(c) > work_cap * tot) c >>= 1;
         while (c > 256 && trunk + est_work_gb(c) + kv_init_gb + wkv + cublas_gb + 0.55 > tot) c >>= 1;
@@ -393,7 +401,7 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         chunk = c;
     }
     const double slots = (double)((max_ctx + 8 + 15) / 16 * 16);
-    const double rows = 12.0 * slots * 1152.0 / GB;                                                         // full max_ctx sparse-layer KV rows (no Vt)
+    const double rows = 12.0 * slots * kv_row_b / GB;                                                       // full max_ctx sparse-layer KV rows
     const double pivg = 12.0 * (double)max_ctx * 512.0 / GB + 12.0 * (double)(max_ctx / 4 + 8) * 256.0 / GB;  // full max_ctx IndexPool iv/ig + pooled keys
     const double work_gb = est_work_gb(chunk);
     // Check if full max_ctx KV fits in VRAM; if not and card is very small (8 GB), set dev_pos for VRAM-to-host spill
@@ -420,20 +428,29 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         char b[32];
         const double host_kv = ((mask & 1) || dev_pos) ? (rows + (dev_pos ? pivg : 0.0)) : 0.0;
         const double host_emb = host_embed ? 0.40 : 0.0;
-        const double host_bounce = (tot < 48.0) ? ((tot >= 20.0) ? 0.82 : 0.55) : 0.0;  // 2 x 384 MiB (>= 20 GiB) or 2 x 256 MiB pinned prefill bounce ring
+        const double host_bounce = (tot < 48.0) ? ((tot >= 20.0) ? 0.82 : ((tot >= 10.0) ? 0.28 : 0.22)) : 0.0;
         snprintf(b, sizeof b, "%.2f", host_kv + host_emb + host_bounce + 0.3);
         hy4_setenv("HY4_HOST_NEED_GB", b, 1);
     }
     if (!getenv("HY4_RESERVE_GB")) {
         const double kv_res = (mask & 1) ? 0.0 : (init_slots < max_ctx ? kv_init_gb : (dev_pos ? dev_pos * per_pos / GB : (rows + pivg)));
-        const double pf_res = (tot >= 21.5 && tot < 64.0 && mask == 0) ? 0.82 : ((tot >= 10.0 && tot < 64.0 && mask == 0) ? 0.56 : 0.0);  // 2 x 384 MiB (>= 21.5 GiB) or 2 x 256 MiB device scratch for prefill streaming
-        const double reserve = work_gb + kv_res + wkv + cublas_gb + pf_res + 0.45;
+        // Compact double-buffered d_scratch[0..1]: 2x96 MiB on 8 GB, 2x160 MiB on 10-12 GB, 2x256 MiB on 16 GB, 2x384 MiB on 24-32 GB!
+        const double pf_res = (mask != 0 || tot >= 64.0) ? 0.0
+                            : (tot >= 21.5 ? 0.82 : (tot >= 14.5 ? 0.56 : (tot >= 10.0 ? 0.34 : 0.22)));
+#ifdef _WIN32
+        // Keep >= 0.85-1.0 GiB physical VRAM headroom on Windows WDDM so driver 595+/621+ never silently pages VRAM to system RAM!
+        const double margin = (tot < 10.0) ? 0.65 : ((tot < 14.5) ? 0.90 : 0.95);
+#else
+        const double margin = (tot < 14.5) ? 0.32 : 0.45;
+#endif
+        // Convert decimal GB -> GiB to match load_gpu_model's reserve_gb * 1073741824.0 without 7.4% silent waste!
+        const double reserve_gib = (work_gb + kv_res + wkv + cublas_gb + pf_res + margin) / 1.073741824;
         char b[32];
-        snprintf(b, sizeof b, "%.2f", reserve);
+        snprintf(b, sizeof b, "%.2f", reserve_gib);
         hy4_setenv("HY4_RESERVE_GB", b, 1);
     }
-    fprintf(stderr, "[plan] ctx %d (init %d) chunk %d: buffers ~%.2f GB, KV+idx %.2f GB (128K full %.2f GB), kv_b scratch %.2f GB, trunk %.2f GB%s on a %.1f GB card -> host mask %d; reserve %s GB\n",
-            max_ctx, init_slots, chunk, work_gb, kv_init_gb, rows + pivg, wkv, trunk, host_embed ? " (embed in RAM)" : "", tot, atoi(getenv("HY4_KV_HOST")), getenv("HY4_RESERVE_GB"));
+    fprintf(stderr, "[plan] ctx %d (init %d, kv=%s) chunk %d: buffers ~%.2f GB, KV+idx %.2f GB (128K full %.2f GB), kv_b scratch %.2f GB, trunk %.2f GB%s on a %.1f GB card -> host mask %d; reserve %s GiB\n",
+            max_ctx, init_slots, kv_q8 ? "q8" : "fp16", chunk, work_gb, kv_init_gb, rows + pivg, wkv, trunk, host_embed ? " (embed in RAM)" : "", tot, atoi(getenv("HY4_KV_HOST")), getenv("HY4_RESERVE_GB"));
     if (dev_pos) fprintf(stderr, "[plan] growable KV: up to %ld positions stay in VRAM, moves to pinned host memory if context exceeds that\n", dev_pos);
     return chunk;
 }
@@ -680,7 +697,13 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     HCK(hipMalloc((void**)&g.d_sec4, vb ? vb : 4096));
     g.vcache_slabs.clear();
     g.vcache_slot_bytes = max_body_sz;
-    g.vcache_slots_per_slab = max_body_sz > 0 ? std::max(1, (int)((384ull << 20) / max_body_sz)) : 1;
+    {
+        size_t vf_s = 0, vt_s = 0;
+        HCK(hipMemGetInfo(&vf_s, &vt_s));
+        // Finer 64 MiB slabs on <= 13.5 GiB cards so KV growth / Vision reclaims only 64 MiB at a time and zero VRAM is lost to slab rounding!
+        const size_t slab_bytes = (vt_s <= (size_t)(13.5 * 1073741824.0)) ? (64ull << 20) : (384ull << 20);
+        g.vcache_slots_per_slab = max_body_sz > 0 ? std::max(1, (int)(slab_bytes / max_body_sz)) : 1;
+    }
     int actual_dyn = 0;
     while (actual_dyn < dyn_slots) {
         const int take = std::min(g.vcache_slots_per_slab, dyn_slots - actual_dyn);

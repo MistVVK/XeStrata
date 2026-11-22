@@ -836,13 +836,15 @@ __global__ void k_fix_q(const float* __restrict__ q_b, __half* __restrict__ qa, 
 }
 
 // MLA key: cache[slot][512 + 2i ..] = rope(kv_a[t][512 + 2i ..], mrope position of token p0 + t); slot = (p0 + t) % ring, or p0 + t without a ring
-__global__ void k_fix_k(const float* __restrict__ kv_a, __half* __restrict__ cache, int p0, int ring, float theta, RopeDev rd) {
+__global__ void k_fix_k(const float* __restrict__ kv_a, __half* __restrict__ cache, int p0, int ring, float theta, RopeDev rd, bool kv_q8 = false) {
     const int t = blockIdx.x, i = threadIdx.x;  // 32 threads
     const int pos = p0 + t;
     const int slot = ring > 0 ? pos % ring : pos;
     float o0, o1;
     rope_pair_v(kv_a[(size_t)t * 576 + 512 + 2 * i], kv_a[(size_t)t * 576 + 512 + 2 * i + 1], rope_pos(rd, pos, mrope_axis(i)), i, theta, o0, o1);
-    *reinterpret_cast<__half2*>(cache + (size_t)slot * 576 + 512 + 2 * i) = __floats2half2_rn(o0, o1);
+    __half* dst = kv_q8 ? (cache + (size_t)slot * 328 + 264 + 2 * i)  // 328 halves = 656 B Q8 row, k_pe starts at byte 528 (half 264)
+                        : (cache + (size_t)slot * 576 + 512 + 2 * i);
+    *reinterpret_cast<__half2*>(dst) = __floats2half2_rn(o0, o1);
 }
 
 // indexer query: out[t][h][d] = iq[t][h][d], dims 64..127 roped at the mrope position of token p0 + t (instead of idx::k_idx_q_rope)
@@ -957,8 +959,8 @@ struct VisionCtx {
     void fix_q(hipStream_t st, const float* q_b, __half* qa, int M, int NH, int p0, float theta) {
         hipLaunchKernelGGL(vit::k_fix_q, dim3(M * NH), dim3(32), 0, st, q_b, qa, NH, p0, theta, rd());
     }
-    void fix_k(hipStream_t st, const float* kv_a, __half* cache, int M, int p0, int ring, float theta) {
-        hipLaunchKernelGGL(vit::k_fix_k, dim3(M), dim3(32), 0, st, kv_a, cache, p0, ring, theta, rd());
+    void fix_k(hipStream_t st, const float* kv_a, __half* cache, int M, int p0, int ring, float theta, bool kv_q8 = false) {
+        hipLaunchKernelGGL(vit::k_fix_k, dim3(M), dim3(32), 0, st, kv_a, cache, p0, ring, theta, rd(), kv_q8);
     }
     void iq_rope(hipStream_t st, const float* iq, __half* out, int T, int p0, float theta) {
         hipLaunchKernelGGL(vit::k_fix_iq, dim3(T, 16), dim3(128), 0, st, iq, out, p0, theta, rd());

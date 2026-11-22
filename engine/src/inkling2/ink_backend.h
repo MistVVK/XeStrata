@@ -132,10 +132,9 @@ inline std::unique_ptr<InkBackend> make_default_backend(bool force_cpu = false, 
     if (!force_cpu) {
 #ifdef INKLING_ENABLE_EP_CUDA
         // Prefer modular Dual-GPU EP / Graph-Doorbell Hybrid CUDA backend when --gpus >= 2, --cpu-threads > 0,
-        // --vram-reserve-mib >= 0, or when K8V8/K8V4 KV is selected (or when primary CUDA backend isn't built).
+        // or --vram-reserve-mib >= 0 (primary InkCudaBackend natively supports FP8/K8V8/K8V4 KV on single GPUs!).
         const bool need_ep_or_hybrid = opts && (
-            opts->gpus >= 2 || opts->cpu_threads > 0 || opts->vram_reserve_mib >= 0 ||
-            opts->kv_dtype == KvDtype::K8V8 || opts->kv_dtype == KvDtype::K8V4);
+            opts->gpus >= 2 || opts->cpu_threads > 0 || opts->vram_reserve_mib >= 0);
         if (need_ep_or_hybrid) return make_ep_cuda_backend();
 #endif
 #ifdef INKLING_ENABLE_CUDA
