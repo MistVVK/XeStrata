@@ -7071,8 +7071,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 fz_b.e1 = (int) (j + 1);
                                 pt.mark(kPfGemmGU, cs);
                                 fused::want_dm_f16(false);
+                                // Expose FP16 layer inputs (m.mixed_h) to native_h11p_kernel (STRATA_PF_F16=2) on staged partial-cache discrete gfx11
+                                fused::p1a_input(had_gu ? nullptr : m.mixed_h, m.H_bytes);
                                 // the layer's tables (group_bounds, before the walk) and rows: the batch's experts are local indices of them
                                 fused::experts_native(fz_b, fz_geom, (int) order.size(), T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                                fused::p1a_input(nullptr, 0);
                                 if (gg_nslots > 0) {   // the batch's staged blobs are read: one event releases their slots
                                     const int rel = gg_slots[gg_nslots - 1];
                                     cudaEventRecord(m.used[rel], m.cs);
@@ -8765,7 +8768,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 fb.e1 = ngx;
                 for (int i = 0; i < ngx; ++i) fb.blob[i] = fz_blob[i];
                 fused::want_dm_f16(false);
+                fused::p1a_input(lb.mixed_h, m.H_bytes);
                 fused::experts_native(fb, fz_geom, ngx, gp.nr, m.GU, lb.xa, d_row_tok + gp.r0, m.H, m.Dm, cs);
+                fused::p1a_input(nullptr, 0);
                 for (int i = 0; i < fz_nrel; ++i) {   // the group's staged blobs are read: their slots are free
                     cudaEventRecord(m.used[fz_rel[i]], cs);
                     m.used_of[fz_rel[i]] = fz_rel[i];

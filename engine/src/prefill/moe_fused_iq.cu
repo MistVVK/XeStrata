@@ -2280,10 +2280,14 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
 #pragma unroll
         for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
     }
+    if constexpr (WT == T_NVFP4) {
+#pragma unroll
+        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_fp4[k] << (8 * (k & 3));
+    }
     nw_barrier();
     const int ur = tid >> 1, uj = tid & 1;
     const int nwork = spp[ne] * NFB;
-    constexpr bool GU256 = GU && WT != T_Q2_0 && WT != T_Q8_0;
+    constexpr bool GU256 = GU && WT != T_Q2_0 && WT != T_Q8_0 && WT != T_NVFP4;
     for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
         const int p = w / NFB, fb = w % NFB;
         int lo = 0, hi2 = ne - 1;
@@ -2295,6 +2299,12 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
         const int2 tl = tb.tiles[t];
         const int e = tl.x, row0 = tl.y, nrows = min(TP, tb.off[e + 1] - row0);
         const uint8_t* blob = b.blob[e - b.e0];
+        float t_gate = 1.0f, t_up = 1.0f, t_down = 1.0f;
+        if constexpr (WT == T_NVFP4) {
+            const uint8_t* tlp = blob + geo.down_off + geo.d_row * (size_t) D_ROWS_N;
+            if constexpr (GU) { t_gate = __uint_as_float(ld32(tlp)); t_up = __uint_as_float(ld32(tlp + 4)); }
+            else t_down = __uint_as_float(ld32(tlp + 8));
+        }
         const int rbase = fb * NW_ROWS;
         const uint8_t* wrow = GU ? blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
@@ -2416,9 +2426,10 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
                         float hv[8];
 #pragma unroll
                         for (int i = 0; i < 8; ++i) {
-                            const float up = __int_as_float(__builtin_amdgcn_permlanex16(
+                            float up = __int_as_float(__builtin_amdgcn_permlanex16(
                                 __float_as_int(acc[mt][nt][i]), __float_as_int(acc[mt][nt][i]), 0x76543210u, 0xfedcba98u, false, false));
-                            const float gt = acc[mt][nt][i];
+                            float gt = acc[mt][nt][i];
+                            if constexpr (WT == T_NVFP4) { gt *= t_gate; up *= t_up; }
                             hv[i] = gt / (1.0f + __expf(-gt)) * up;
                         }
                         const int r = 64 * wn + 16 * nt + l16;
@@ -2444,12 +2455,19 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
                             if constexpr (D16) {
                                 _Float16* d16p = reinterpret_cast<_Float16*>(dm) + (size_t) (row0 + r) * kMoeEmbd + rbase + 32 * wm + 16 * mt + hi;
 #pragma unroll
-                                for (int i = 0; i < 8; ++i)
-                                    d16p[2 * i] = (_Float16) fminf(fmaxf(acc[mt][nt][i], -65504.0f), 65504.0f);
+                                for (int i = 0; i < 8; ++i) {
+                                    float v = acc[mt][nt][i];
+                                    if constexpr (WT == T_NVFP4) v *= t_down;
+                                    d16p[2 * i] = (_Float16) fminf(fmaxf(v, -65504.0f), 65504.0f);
+                                }
                             } else {
                                 float* d = dm + (size_t) (row0 + r) * kMoeEmbd + rbase + 32 * wm + 16 * mt + hi;
 #pragma unroll
-                                for (int i = 0; i < 8; ++i) d[2 * i] = acc[mt][nt][i];
+                                for (int i = 0; i < 8; ++i) {
+                                    float v = acc[mt][nt][i];
+                                    if constexpr (WT == T_NVFP4) v *= t_down;
+                                    d[2 * i] = v;
+                                }
                             }
                         }
                     }
@@ -3029,6 +3047,7 @@ bool gu_covered(int t) {
            || ((t == T_TQK6 || t == T_TQ2_T) && tq_hip_device(dev_info()))   // STRATA_PF_FUSED_TQ=1 on gfx12; gfx1151 by fused_tq_hip.hpp
            || (t == T_Q8_0 && dev_info().w12 && q8gu_hip_requested())   // STRATA_PF_FUSED_Q8GU=1 on gfx12
            || (t == T_Q6_K && dev_info().w12 && q6k_hip_requested())    // STRATA_PF_FUSED_Q6K=1 on gfx12
+           || (t == T_NVFP4 && dev_info().g11_wmma && !dev_info().w12 && h11p_wanted())   // gfx11 WMMA (STRATA_PF_F16=2): native_h11p_kernel<T_NVFP4>
 #endif
         ;
 }
@@ -3161,6 +3180,7 @@ bool d_covered_on(int t, const DevInfo& d) {
     if (t == T_Q8_0 && !d.w12 && (f16::requested() || q8d_f16_default(d))) return true;
     if (t == T_Q8_0 && d.w12 && (q8d_hip_requested() || q8gu_hip_requested() || q6k_hip_requested())) return true;   // (behind an i-quant gate/up with Q8D, a Q8_0 one with Q8GU, a Q6_K one with Q6K: native_supported)
     if (t == T_TQK7 || t == T_TQ2_T) return tq_hip_device(d);   // STRATA_PF_FUSED_TQ=1 on gfx12, gfx1151 by fused_tq_hip.hpp (behind a trellis gate/up only: native_supported)
+    if (t == T_NVFP4) return d.g11_wmma && !d.w12 && h11p_wanted();   // gfx11 WMMA (STRATA_PF_F16=2): behind an NVFP4 gate/up only (native_supported)
 #else
     if (t == T_Q5_0) return d.q50;   // STRATA_PF_FUSED_Q50=1 and its kernels set up (dev_info)
     if (t == T_Q5_1) return d.kq;    // STRATA_PF_FUSED_KQ=1 (behind a K-quant gate/up only: native_supported)
@@ -3488,6 +3508,12 @@ bool native_supported(int gu_type, int d_type) {
         const DevInfo& d = dev_info();
         return d_type == T_Q8_0 && d.ok && d.w12 && q6k_hip_requested();
     }
+    // NVFP4 / NVFP4 pair on gfx11 WMMA (STRATA_PF_F16=2): native_h11p_kernel<T_NVFP4> (applies per-expert s_gate/s_up/s_down tail in FP32 epilogue).
+    if (gu_type == T_NVFP4 || d_type == T_NVFP4) {
+        static const bool mode_ok = [] { const char* v = std::getenv("STRATA_PREFILL_NVFP4"); return v == nullptr || v[0] == '\0' || std::strcmp(v, "w4a8") == 0; }();
+        const DevInfo& d = dev_info();
+        return gu_type == T_NVFP4 && d_type == T_NVFP4 && mode_ok && d.ok && d.g11_wmma && !d.w12 && h11p_wanted();
+    }
 #endif
     // default: only these three; the Q2_0 one (148-amd) is on Linux only: on Windows it is opt-in (STRATA_PF_FUSED=1) until tested there.
     // AMD-Q (owner decision 10-31): the IQ2_S and IQ4_XS gate/up layers too (the IQ3_S pack's 21 layers that kept MMQ), Linux only like the Q2_0 entry.
@@ -3572,6 +3598,7 @@ bool h11p_wanted() {
 bool h11p_takes_pair(int gu_type, int d_type) {
 #if defined(__HIPCC__)
     if (!h11p_wanted()) return false;
+    if (gu_type == T_NVFP4 && d_type == T_NVFP4) return true;
     const bool gu_ok = gu_type == T_IQ2_XXS || gu_type == T_IQ2_XS || gu_type == T_IQ2_S ||
                        gu_type == T_IQ3_XXS || gu_type == T_IQ3_S || gu_type == T_IQ4_XS ||
                        gu_type == T_Q2_0 || gu_type == T_Q4_K || gu_type == T_Q5_K;
@@ -3662,6 +3689,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
                 case T_Q2_0: STRATA_NH_GU(T_Q2_0); break;
                 case T_Q4_K: STRATA_NH_GU(T_Q4_K); break;
                 case T_Q5_K: STRATA_NH_GU(T_Q5_K); break;
+                case T_NVFP4: STRATA_NH_GU(T_NVFP4); break;
                 default: STRATA_NH_GU(T_IQ4_XS); break;
             }
 #undef STRATA_NH_GU
@@ -3673,6 +3701,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             else if (g.d_type == T_Q5_0) STRATA_NH_D(T_Q5_0);
             else if (g.d_type == T_Q5_1) STRATA_NH_D(T_Q5_1);
             else if (g.d_type == T_Q8_0) STRATA_NH_D(T_Q8_0);
+            else if (g.d_type == T_NVFP4) STRATA_NH_D(T_NVFP4);
             else STRATA_NH_D(T_IQ4_NL);
 #undef STRATA_NH_D
             ck(cudaGetLastError(), "experts_native (h11p)");
