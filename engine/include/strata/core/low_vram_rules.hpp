@@ -23,13 +23,63 @@
 
 namespace strata::core {
 
+constexpr uint64_t kLowVram4GiB  = (5ull << 30) + (512ull << 20);   // 5.5 GiB ceiling (covers 4 GB cards)
 constexpr uint64_t kLowVram8GiB  = (8ull << 30) + (512ull << 20);   // 8.5 GiB (covers 8 GB cards: 7.9-8.0 GiB)
+constexpr uint64_t kLowVram10GiB = (9ull << 30) + (512ull << 20);   // 9.5 GiB floor (covers 10/12 GB cards: 9.8-12.0 GiB)
 constexpr uint64_t kLowVram12GiB = (12ull << 30) + (512ull << 20);  // 12.5 GiB (covers 10/12 GB cards: 9.8-12.0 GiB)
 constexpr uint64_t kLowVram13GiB = 13ull << 30;                     // 13.0 GiB ceiling for low-VRAM fastpaths
+constexpr uint64_t kWddm16GiB    = 15ull << 30;                     // 15.0 GiB floor (16 GB cards report ~15.9 GiB)
 
 constexpr int kDefaultReserveMib = 700;
 constexpr int kLowVram8ReserveMib = 480;
 constexpr int kLowVram12ReserveMib = 550;
+
+// #6128 / #5915: Windows WDDM driver 595+ / 621.01 silently pages GPU memory to host DDR4/DDR5 over PCIe
+// whenever free physical VRAM falls below the WDDM headroom floor after all late allocations (cuBLAS,
+// MMQ/prompt workspace, MTP/DFlash2, CUDA graph capture). Keep a hard post-load free-VRAM safety floor
+// on Windows WDDM discrete GPUs (non-TCC, non-integrated).
+constexpr int kWddmFloor16GPlusMib = 1280;
+constexpr int kWddmFloor10To12GMib = 960;
+constexpr int kWddmFloor6To8GMib   = 640;
+constexpr int kWddmFloor4GMib      = 448;
+constexpr int64_t kWddmLateAllocMib = 384;
+
+/// True on Windows WDDM discrete GPUs (excludes Linux, integrated APUs/UMA, and Windows TCC compute-only GPUs).
+inline bool is_wddm_discrete(bool windows, bool integrated, bool tcc_driver) noexcept {
+    return windows && !integrated && !tcc_driver;
+}
+
+/// Hard free-VRAM safety floor (MiB) on Windows WDDM discrete GPUs after all late allocations.
+inline int wddm_vram_safety_floor_mib(uint64_t total_vram_bytes) noexcept {
+    if (total_vram_bytes == 0) return 0;
+    if (total_vram_bytes >= kWddm16GiB) return kWddmFloor16GPlusMib;
+    if (total_vram_bytes >= kLowVram10GiB) return kWddmFloor10To12GMib;
+    if (total_vram_bytes >= kLowVram4GiB) return kWddmFloor6To8GMib;
+    return kWddmFloor4GMib;
+}
+
+/// Effective VRAM reserve (MiB) on Windows WDDM discrete GPUs for `--expert-cache auto`.
+/// Raises the default reserve (and legacy setup.py `--vision --vram-reserve-mib 700` configs per #6128)
+/// to at least `wddm_vram_safety_floor_mib(total_vram_bytes)`, unless `STRATA_WDDM_VRAM_FLOOR=0`.
+/// Never lowers a larger reserve (e.g. Windows HIP's 2560 MiB floor or user `--vram-reserve-mib 1500`).
+inline int wddm_effective_reserve_mib(bool wddm_discrete, bool reserve_given, bool vision,
+                                      int cur_reserve_mib, uint64_t total_vram_bytes,
+                                      const char* floor_env = nullptr) noexcept {
+    if (!wddm_discrete || total_vram_bytes == 0) return cur_reserve_mib;
+    if (floor_env != nullptr && floor_env[0] == '0') return cur_reserve_mib;
+    const int floor_mib = wddm_vram_safety_floor_mib(total_vram_bytes);
+    if (cur_reserve_mib >= floor_mib) return cur_reserve_mib;
+    if (!reserve_given || (vision && cur_reserve_mib == kDefaultReserveMib)) return floor_mib;
+    return cur_reserve_mib;
+}
+
+/// Unpriced late-allocation allowance (MiB) reserved before ExpertCache on auto-sized GPUs.
+/// On Windows WDDM discrete GPUs this covers cuBLAS/hipBLAS handles, DEQUANT_SIDE scratch, 12-token verify
+/// buffers, and 7 captured CUDA graphs so the post-load free VRAM stays strictly above the WDDM floor.
+inline int64_t wddm_late_alloc_mib(bool wddm_discrete, bool defaults026, int64_t base_late_mib = 256) noexcept {
+    if (defaults026) return 0;
+    return wddm_discrete ? kWddmLateAllocMib : base_late_mib;
+}
 
 /// Automatic non-vision VRAM reserve (MiB) for discrete <= 12.5 GiB GPUs.
 /// Never overrides an explicit --vram-reserve-mib (vision passes 2100 explicitly) or non-default reserves.

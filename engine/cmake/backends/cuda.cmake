@@ -5,11 +5,12 @@
 
 # CUDA: runtime library, architectures (enable_language), the architecture checks, the gpu target variables
 macro(strata_cuda_toolchain)
-  # #585: CMake links CUDA code with the STATIC runtime by default, and the targets below also link CUDA::cudart (the
-  # DLL's import library).  MSVC with a CUDA 12.x toolkit - the experimental Pascal/Volta build - then fails with
-  # LNK1169 (every cudart symbol defined twice); GNU ld lets it pass.  That build links the shared runtime alone.  The
-  # ready-made engine (CUDA 13, no STRATA_EXPERIMENTAL_SM60) is unchanged; -DCMAKE_CUDA_RUNTIME_LIBRARY overrides.
-  if(MSVC AND STRATA_EXPERIMENTAL_SM60 AND NOT DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
+  # #585: CMake links CUDA code with the STATIC runtime (cudart_static.lib) by default, while the targets below
+  # (strata, strata-inkling, strata-hy4, tests) also link CUDA::cudart (cudart.lib, the DLL import library).
+  # On MSVC this produces LNK2005 / LNK1169 duplicate cudart symbols across both CUDA 12.x and CUDA 13.x builds
+  # (especially when strata.exe builds alongside strata_inkling_cuda); GNU ld lets it pass. Link the shared CUDA
+  # runtime consistently on MSVC unless the caller overrides -DCMAKE_CUDA_RUNTIME_LIBRARY.
+  if(MSVC AND NOT DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
     set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
   endif()
   # #4023: the default below has to be set BEFORE enable_language(CUDA): since CMake 3.18 that call fills an unset

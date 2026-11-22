@@ -13212,6 +13212,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_GR_V70",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/kernels/cuda/fused_gr.cu",
+     "line": 1738,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/NVIDIA_V100.md:75"
+   ],
+   "first_commit": "HEAD",
+   "first_date": "2026-11-22",
+   "since": null,
+   "last_commit": "HEAD",
+   "last_date": "2026-11-22",
+   "status": "opt-in",
+   "owner": "kernels/cuda",
+   "note": "Volta (sm_70) only: the token-split hyper-connection read (a warp per row and token); fused_gr_check compares it bit for bit with the default read at 1-8 tokens and keeps the default read on a card where it differs.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_GU_LANES",
    "backends": [
     "sycl"
@@ -14563,6 +14598,39 @@
    "status": "",
    "owner": "",
    "note": "",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_HIP_DYNAMIC_QUEUES",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/program/generate.cpp",
+     "line": 3821,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": "off",
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "HEAD",
+   "first_date": "2026-11-22",
+   "since": null,
+   "last_commit": "HEAD",
+   "last_date": "2026-11-22",
+   "status": "opt-in",
+   "owner": "program",
+   "note": "AMD HIP: by default the engine sets DEBUG_HIP_DYNAMIC_QUEUES=0 before HIP init to avoid RDNA4 dynamic-queue copy/compute serialization (#5162/#6127) and queue stalls (#5649/#5718). Set =1 to keep runtime default.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -38335,6 +38403,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_Q8_V70",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/kernels/cuda/native_mmvq.cu",
+     "line": 1628,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/NVIDIA_V100.md:78"
+   ],
+   "first_commit": "HEAD",
+   "first_date": "2026-11-22",
+   "since": null,
+   "last_commit": "HEAD",
+   "last_date": "2026-11-22",
+   "status": "opt-in",
+   "owner": "kernels/cuda",
+   "note": "Volta (sm_70) only: the dense Q8_0 GEMV of 2-4 columns with its block loop unrolled (n_in a multiple of 1024), bitwise the default kernel; not taken with STRATA_TSUM=1.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_QFUSE",
    "backends": [
     "cuda-hip",
@@ -49961,6 +50064,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_VERIFY_TIMEOUT_S",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/verify.cpp",
+     "line": 4007,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "HEAD",
+   "first_date": "2026-11-22",
+   "since": null,
+   "last_commit": "HEAD",
+   "last_date": "2026-11-22",
+   "status": "opt-in",
+   "owner": "core",
+   "note": "Per-layer verify-window wait timeout in seconds (default 20 s on CUDA, 30 s on HIP; #5718) before one-shot flag re-publish and 5 s grace.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_VERIFY_TRACE",
    "backends": [
     "cuda-hip",
@@ -50354,6 +50490,39 @@
    "status": "rollback",
    "owner": "core",
    "note": "Windows: the WDDM shared-segment cut of the resident complement (two or more CUDA devices) keeps this many MiB (default 2048) (RESULTS-0217-FIXWIN.md, #3725)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_WDDM_VRAM_FLOOR",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/program/generate.cpp",
+     "line": 9026,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": "on",
+   "code_default": "1",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "HEAD",
+   "first_date": "2026-11-22",
+   "since": null,
+   "last_commit": "HEAD",
+   "last_date": "2026-11-22",
+   "status": "default",
+   "owner": "program",
+   "note": "Windows WDDM discrete GPUs: enforces tiered free-VRAM safety floor (1280/960/640/448 MiB) after all late allocations so driver 595+/621.01 never pages VRAM to host RAM (#6128/#5915). Set =0 to disable.",
    "retire_after": "",
    "retired_in": ""
   },

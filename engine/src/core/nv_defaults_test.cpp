@@ -118,22 +118,24 @@ int main() {
         CHECK(nv_default_env(12, 0, false).size() == 12);
         unset("STRATA_SM120_PERF");
     }
-    // sm_89 (RTX 40 / Ada Lovelace): 19 switches (#6462 bit-exact + 0.2.19) + VERIFY_DEVICE_HITS for > 16 GiB (RTX 4090 24 GB)
+    // sm_89 (RTX 40 / Ada Lovelace): 17 switches (#6462 bit-exact + 0.2.19; L2_PF opt-in per #6431, QFUSE opt-in per #6583) + VERIFY_DEVICE_HITS for > 16 GiB (RTX 4090 24 GB)
     {
         unset("STRATA_SM89_PERF");
         const auto t = nv_default_env(8, 9, false);
-        CHECK(t.size() == 19 && find(t, "STRATA_HC_UPMIX") && *find(t, "STRATA_HC_UPMIX") == "1");
+        CHECK(t.size() == 17 && find(t, "STRATA_HC_UPMIX") && *find(t, "STRATA_HC_UPMIX") == "1");
         CHECK(find(t, "STRATA_ADAPT_LAG") && *find(t, "STRATA_ADAPT_LAG") == "2");
         CHECK(find(t, "STRATA_ATTN_DAILY") && *find(t, "STRATA_ATTN_DAILY") == "1");
         CHECK(find(t, "STRATA_PREFILL_CPU_SHARE_MAX") && *find(t, "STRATA_PREFILL_CPU_SHARE_MAX") == "6144");
         CHECK(find(t, "STRATA_PF_FUSED_KQ") && *find(t, "STRATA_PF_FUSED_KQ") == "1");
+        CHECK(!find(t, "STRATA_L2_PF"));    // #6431: opt-in on sm_89
+        CHECK(!find(t, "STRATA_QFUSE"));    // #6583: opt-in alongside GR_UP75 on sm_89
         CHECK(!find(t, "STRATA_HC_Q8"));
         CHECK(!find(t, "STRATA_VERIFY_DEVICE_HITS"));
         const auto t12 = nv_default_env(8, 9, false, 12ull << 30);
-        CHECK(t12.size() == 20 && find(t12, "STRATA_ADAPT_FETCH") && *find(t12, "STRATA_ADAPT_FETCH") == "2");
+        CHECK(t12.size() == 18 && find(t12, "STRATA_ADAPT_FETCH") && *find(t12, "STRATA_ADAPT_FETCH") == "2");
         CHECK(!find(t12, "STRATA_VERIFY_DEVICE_HITS"));
         const auto t24 = nv_default_env(8, 9, false, 24ull << 30);
-        CHECK(t24.size() == 20 && find(t24, "STRATA_VERIFY_DEVICE_HITS") && *find(t24, "STRATA_VERIFY_DEVICE_HITS") == "1");
+        CHECK(t24.size() == 18 && find(t24, "STRATA_VERIFY_DEVICE_HITS") && *find(t24, "STRATA_VERIFY_DEVICE_HITS") == "1");
         CHECK(!find(t24, "STRATA_ADAPT_FETCH"));
         CHECK(nv_default_env(8, 9, true).empty());
         put("STRATA_SM89_PERF", "0");
@@ -263,6 +265,15 @@ int main() {
     CHECK(!nv_chunk_card_ok(5, 2) && !nv_chunk_card_ok(0, 0));
     CHECK(nv_chunk_card_ok(8, 0) && nv_chunk_card_ok(8, 6) && nv_chunk_card_ok(9, 0) && nv_chunk_card_ok(12, 0));
     CHECK(nv_chunk_step_down(32768) == 16384 && nv_chunk_step_down(16384) == 8192 && nv_chunk_step_down(8192) == 8192);
+    // #5199: <= 16.5 GiB cards keep bare --prefill auto at 8192 unless STRATA_NV_CHUNK is set explicitly; > 16.5 GiB keeps 32768
+    CHECK(nv_chunk_ceiling_for_vram(nullptr, false, 8ull << 30) == 0);
+    CHECK(nv_chunk_ceiling_for_vram(nullptr, false, 12ull << 30) == 0);
+    CHECK(nv_chunk_ceiling_for_vram(nullptr, false, 16ull << 30) == 0);
+    CHECK(nv_chunk_ceiling_for_vram("16", false, 16ull << 30) == 16384);
+    CHECK(nv_chunk_ceiling_for_vram("1", false, 16ull << 30) == 32768);
+    CHECK(nv_chunk_ceiling_for_vram(nullptr, false, 24ull << 30) == 32768);
+    CHECK(nv_chunk_ceiling_for_vram(nullptr, false, 0) == 32768);
+    CHECK(nv_chunk_ceiling_for_vram(nullptr, true, 24ull << 30) == 0);
     // the one-argument form reads STRATA_DEFAULTS
     put("STRATA_DEFAULTS", "026");
     CHECK(nv_default_env(12, 1).empty());

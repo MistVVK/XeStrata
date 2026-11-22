@@ -1612,7 +1612,170 @@ static int gr_r2() {
     static const int v = [] { const char* e = std::getenv("STRATA_GR_R2"); return e != nullptr ? std::atoi(e) : 2; }();
     return v == 1 || v == 2 || v == 4 ? v : 0;
 }
-void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+
+#if !defined(__HIPCC__)
+// ---- STRATA_GR_V70=1 (opt-in, Volta sm_70 only): the token-split read.  On a V100 the default read keeps one warp
+// per row for all of a window's tokens: 41 blocks of 8 rows for the down projection (half of the 80 SMs idle) and
+// the activations staged by a plain copy (sm_70 has no cp.async), so each extra token adds ~4-5 us of latency-bound
+// work.  Here a warp owns one (row, token) pair instead - the down read is 324 blocks of T warps (one row, warp k =
+// token k), the up read N/2 blocks of 2 columns x HC streams x T tokens with 8 threads a (row, token).  Every value is
+// computed with exactly the default kernels' operations in their order: the down lane L sums the chunks L + 32 q in
+// ascending q (acc += the chunk's 8-FMA dot) and the xor butterfly, as gr_down_staged / gr_down_multi do; the up's
+// group of 8 does gr_up_fast_kernel's old lanes j, j+8, j+16, j+24 and the tail chunk 32 + j with the same xor8 tree;
+// the epilogues are theirs.  Only who computes what changes: more warps in flight, the T warps of a row reading its
+// weights through L1.  The norm is the variant's own (plain / split / split-fast).  Not taken with Q8 weights
+// (STRATA_HC_REQ8 / HC_Q8) or the q8_1 tail (STRATA_QFUSE).  fused_gr_check compares it bit for bit with the default
+// read at 1-8 tokens on the card and turns it off there if any output differs.  Compiled for the shape it was
+// written for (LR 320: the tail chunk 32 + j, HC 4) and for sm_70 device code only; any other build or card keeps the
+// default read.
+constexpr int V70_UC = 2;   // up: columns a block
+constexpr bool kV70Shape = LR == 320 && HC == 4 && (D / 8) % 32 == 0 && N % V70_UC == 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 700
+#define STRATA_GR_V70_DEVICE 0   // device code for another architecture: empty kernels the host never launches
+#else
+#define STRATA_GR_V70_DEVICE 1
+#endif
+__device__ __forceinline__ float v70_xor8(float v) {
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+template <int T>
+__global__ void __launch_bounds__(32 * T) gr_down_ts_kernel(GrMulti m) {
+    static_assert(T >= 1 && T <= kFusedGrMaxT, "one warp a token");
+#if STRATA_GR_V70_DEVICE
+    if constexpr (kV70Shape) {
+        constexpr int NQ = D / 8 / 32;                               // chunks of 8 a lane: 40 in Flash-Next
+        constexpr int BQ = NQ % 20 == 0 ? 20 : (NQ % 16 == 0 ? 16 : (NQ % 8 == 0 ? 8 : 1));
+        const int lane = threadIdx.x & 31, k = threadIdx.x >> 5, row = blockIdx.x;
+        const bool inj = row >= LR;                                  // launched only when w_inject is set
+        const uint16_t* wrow = inj ? m.a[0].w_inject + (size_t) (row - LR) * D : m.a[0].w_down + (size_t) row * D;
+        const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+        const float4* x4 = reinterpret_cast<const float4*>(m.xn + (size_t) k * D);
+        float acc = 0.0f;
+#pragma unroll
+        for (int q0 = 0; q0 < NQ; q0 += BQ) {
+            uint4 w[BQ];
+#pragma unroll
+            for (int b = 0; b < BQ; ++b) w[b] = __ldg(w4 + lane + 32 * (q0 + b));
+#pragma unroll
+            for (int b = 0; b < BQ; ++b) {
+                const int j = lane + 32 * (q0 + b);
+                acc += dot8v(w[b], __ldg(x4 + 2 * j), __ldg(x4 + 2 * j + 1));
+            }
+        }
+        const float s = warp_sum(acc);
+        if (lane != 0) return;
+        if (inj) {
+            m.a[k].inject_out[row - LR] = s;
+        } else {
+            const float x = s / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+#endif
+}
+template <int T>
+__global__ void __launch_bounds__(32 * V70_UC * T) gr_up_ts_kernel(GrMulti m) {
+    static_assert(T >= 1 && T <= kFusedGrMaxT, "8 threads a (row, token)");
+    static_assert(HC == 4, "32 UC T threads = HC x UC x T groups of 8");
+#if STRATA_GR_V70_DEVICE
+    if constexpr (kV70Shape) {   // LR 320: chunks 0..31 in 4 steps of 8, the tail chunk 32 + j (as gr_up_fast_kernel)
+        constexpr int UC = V70_UC, NT = 32 * UC * T;
+        __shared__ __align__(16) float lo[T][LR];
+        __shared__ float g[T][HC][UC];
+        const int t = threadIdx.x, j = t & 7, grp = t >> 3;
+        const int k = grp % T, r = grp / T, c = r / UC, dd = r - c * UC, d0 = blockIdx.x * UC, i = c * N + d0 + dd;
+        const FusedGrArgs& a = m.a[k];
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+        uint4 w[5];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) w[q] = __ldg(w4 + j + 8 * q);
+        w[4] = __ldg(w4 + 32 + j);
+        const bool apply = a.apply;
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        if (j == 0) {
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            rsc = a.rs[c];
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        for (int x = t; x < T * LR; x += NT) lo[x / LR][x % LR] = m.a[x / LR].lo[x % LR];
+        __syncthreads();
+        const float* l = lo[k];
+        const float p0 = dot8(w[0], l + j * 8) + dot8(w[4], l + (32 + j) * 8);   // old lane j and its tail chunk
+        const float p1 = dot8(w[1], l + (j + 8) * 8);
+        const float p2 = dot8(w[2], l + (j + 16) * 8);
+        const float p3 = dot8(w[3], l + (j + 24) * 8);
+        const float mine = v70_xor8((p0 + p2) + (p1 + p3));
+        if (j == 0) {
+            float x0 = rv;
+            if (apply) {
+                x0 = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), x0);
+                a.R_out[i] = x0;
+            }
+            const float x = x0 * wn * rsc;
+            g[k][c][dd] = x * sigmoidf_(mine);
+        }
+        __syncthreads();
+        for (int x = t; x < T * UC; x += NT) {
+            const int kk = x / UC, col = x - kk * UC;
+            float s = 0.0f;
+#pragma unroll
+            for (int cc = 0; cc < HC; ++cc) s += g[kk][cc][col];
+            m.a[kk].mixed[d0 + col] = s / (float) HC;
+        }
+    }
+#endif
+}
+// per device: fused_gr_check's verdict on the token-split read (0 = not checked, 1 = differs: off, 2 = bitwise)
+std::atomic<int> g_v70_ok[64];
+// STRATA_GR_V70=1 asked for, the build has the kernels and the current card is Volta (fused_gr_check's question)
+bool gr_v70_wanted() {
+    if constexpr (!kV70Shape) {
+        return false;
+    } else {
+        static const bool env = [] { const char* v = std::getenv("STRATA_GR_V70"); return v != nullptr && std::atoi(v) != 0; }();
+        return env && cur_dev_volta();
+    }
+}
+bool gr_v70_on() {
+    if (!gr_v70_wanted()) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    return g_v70_ok[dev].load(std::memory_order_relaxed) != 1;   // unchecked (a bench) or checked bitwise
+}
+template <int T>
+void launch_v70_t(const GrMulti& m, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+    const unsigned rows = (unsigned) (LR + (m.a[0].w_inject != nullptr ? HC : 0));
+    gr_down_ts_kernel<T><<<rows, 32 * T, 0, st>>>(m);
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+    gr_up_ts_kernel<T><<<N / V70_UC, 32 * V70_UC * T, 0, st>>>(m);
+}
+// false (nothing launched) for a token count the kernels are not instantiated for
+bool launch_v70(const GrMulti& m, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+    static_assert(kFusedGrMaxT == 8, "launch_v70 instantiates T = 1..8");
+    if constexpr (!kV70Shape) {
+        (void) m; (void) st; (void) stamp_buf; (void) stamp_i0;
+        return false;
+    } else {
+        switch (m.T) {
+            case 1: launch_v70_t<1>(m, st, stamp_buf, stamp_i0); return true;
+            case 2: launch_v70_t<2>(m, st, stamp_buf, stamp_i0); return true;
+            case 3: launch_v70_t<3>(m, st, stamp_buf, stamp_i0); return true;
+            case 4: launch_v70_t<4>(m, st, stamp_buf, stamp_i0); return true;
+            case 5: launch_v70_t<5>(m, st, stamp_buf, stamp_i0); return true;
+            case 6: launch_v70_t<6>(m, st, stamp_buf, stamp_i0); return true;
+            case 7: launch_v70_t<7>(m, st, stamp_buf, stamp_i0); return true;
+            case 8: launch_v70_t<8>(m, st, stamp_buf, stamp_i0); return true;
+            default: return false;
+        }
+    }
+}
+#endif
+// v70 = false: never the STRATA_GR_V70 read (fused_gr_selftest's default-read sets)
+void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0,
+                  bool v70 = true) {
     const int n_tok = m.T;
     const bool q8w = m.a[0].s_down != nullptr;   // STRATA_HC_REQ8: w_down / w_up hold int8 codes
 #if STRATA_GR_FAST_BUILD
@@ -1631,6 +1794,16 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     } else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
 #endif
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
+#if !defined(__HIPCC__)
+    // STRATA_GR_V70=1 (Volta, opt-in): the token-split down and up reads above, bitwise the plain / split / staged kernels
+    if (v70 && !q8w && m.a[0].q8_mixed == nullptr && gr_v70_on() && launch_v70(m, st, stamp_buf, stamp_i0)) {
+        // BW-MEASURE: var 30 = the token-split read (as the stream-split read counts 20 + split), n_in = N, n_out = LR
+        strata::dispatch::kernel(strata::dispatch::kHc, 30, 0, N, LR, n_tok);
+        return;
+    }
+#else
+    (void) v70;
+#endif
     // STRATA_HC_Q8: the staged down kernel reads bf16 only, so Q8 weights take split's down kernel (the plain one)
     const bool staged = variant >= kHcStaged && m.a[0].s_down == nullptr;
     int tv = N;
@@ -4386,10 +4559,19 @@ namespace {
 /// The plain read, split, staged and (for one token) the single-token read on random bf16 weights and random inputs,
 /// 1..8 tokens, with and without the pending write; every output of split and staged compared with the plain read's
 /// bit for bit (and the plain read's with the single-token read's).  `why[v]` gets the first difference of variant
-/// v; false if the check itself could not run.
-bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
+/// v; false if the check itself could not run.  With `v70` (CUDA, STRATA_GR_V70=1 on a Volta card) the token-split
+/// read also runs under each of the three variants and is compared bit for bit with that variant's default read at
+/// every token count: *v70 = 2 when all agree, 1 when one differs or the check failed (`v70_why`), 0 when not run.
+bool fused_gr_selftest(bool ok_variant[4], std::string why[4], int* v70 = nullptr, std::string* v70_why = nullptr) {
     constexpr int TM = kFusedGrMaxT;
-    constexpr int NV = 4;                             // sets: 0 = plain, 1 = split, 2 = staged, 3 = single-token
+    constexpr int NV = 7;   // sets: 0 = plain, 1 = split, 2 = staged, 3 = single-token, 4..6 = STRATA_GR_V70 under 0..2
+#if !defined(__HIPCC__)
+    const bool chk70 = v70 != nullptr && gr_v70_wanted();
+#else
+    const bool chk70 = false;
+#endif
+    const int nv = chk70 ? NV : 4;                    // the V70 sets only when that read is checked
+    if (v70 != nullptr) *v70 = 0;
     std::mt19937 rng(20260930u);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     std::vector<uint16_t> h_down((size_t) LR * D), h_up((size_t) D * LR), h_inj((size_t) HC * D);
@@ -4405,11 +4587,15 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
 
     const size_t n_set = (size_t) TM * (D + D + LR + HC + HC + N);   // R_out, xn, lo, rs, inject, mixed (floats)
     const size_t bytes = h_down.size() * 2 + h_up.size() * 2 + h_inj.size() * 2 +
-                         (h_norm.size() + h_R.size() + h_bo.size() + h_ip.size() + NV * n_set) * 4 + 32 * 256;
+                         (h_norm.size() + h_R.size() + h_bo.size() + h_ip.size() + nv * n_set) * 4 + 32 * 256;
     uint8_t* base = nullptr;
     if (cudaMalloc((void**) &base, bytes) != cudaSuccess) {
         cudaGetLastError();
         why[0] = "no room for the check (" + std::to_string(bytes >> 20) + " MiB)";
+        if (chk70) {
+            *v70 = 1;
+            if (v70_why != nullptr) *v70_why = "the check could not run (" + why[0] + ")";
+        }
         return false;
     }
     size_t off = 0;
@@ -4421,8 +4607,9 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
     float* d_R = (float*) take(h_R.size() * 4);
     float* d_bo = (float*) take(h_bo.size() * 4);
     float* d_ip = (float*) take(h_ip.size() * 4);
-    struct Set { float *R_out, *xn, *lo, *rs, *inj, *mixed; } set[NV];
-    for (Set& x : set) {
+    struct Set { float *R_out, *xn, *lo, *rs, *inj, *mixed; } set[NV] = {};
+    for (int v = 0; v < nv; ++v) {
+        Set& x = set[v];
         x.R_out = (float*) take((size_t) TM * D * 4); x.xn = (float*) take((size_t) TM * D * 4);
         x.lo = (float*) take((size_t) TM * LR * 4); x.rs = (float*) take((size_t) TM * HC * 4);
         x.inj = (float*) take((size_t) TM * HC * 4); x.mixed = (float*) take((size_t) TM * N * 4);
@@ -4472,10 +4659,12 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
     };
     ok_variant[2] = ok_variant[3] = ok;
     bool single_ok = ok;
+    bool ok70 = ok;
+    std::string w70;
     for (int apply = 0; apply < 2 && ok; ++apply) {
         for (int T = 1; T <= TM && ok; ++T) {
             FusedGrArgs a[NV][TM];
-            for (int v = 0; v < NV; ++v) {
+            for (int v = 0; v < nv; ++v) {
                 const size_t span = (size_t) ((uint8_t*) (set[v].mixed + (size_t) TM * N) - (uint8_t*) set[v].R_out);
                 ok = ok && cudaMemsetAsync(set[v].R_out, 0xFF, span, st) == cudaSuccess;   // the whole set
                 for (int k = 0; k < T; ++k) {
@@ -4492,7 +4681,14 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
                 for (int k = 0; k < T; ++k) m.a[k] = a[v][k];
                 m.xn = set[v].xn;
                 m.T = T;
-                launch_multi(m, v + 1, st, nullptr, 0);
+                launch_multi(m, v + 1, st, nullptr, 0, false);   // the default read, never the STRATA_GR_V70 one
+            }
+            for (int v = 4; v < nv; ++v) {                      // STRATA_GR_V70 under plain / split / staged
+                GrMulti m;
+                for (int k = 0; k < T; ++k) m.a[k] = a[v][k];
+                m.xn = set[v].xn;
+                m.T = T;
+                launch_multi(m, v - 3, st, nullptr, 0, true);
             }
             if (T == 1) fused_gr_read(a[3][0], st);
             if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess) {
@@ -4503,7 +4699,17 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
             if (ok_variant[2] && !all_same(set[0], set[1], T, apply, why[2])) ok_variant[2] = false;
             if (ok && ok_variant[3] && !all_same(set[0], set[2], T, apply, why[3])) ok_variant[3] = false;
             if (ok && T == 1 && single_ok && !all_same(set[3], set[0], T, apply, why[1])) single_ok = false;
+            for (int v = 4; v < nv && ok && ok70; ++v)
+                if (!all_same(set[v - 4], set[v], T, apply, w70)) {
+                    static const char* const vname[3] = {"plain", "split", "staged"};
+                    w70 = std::string("under the ") + vname[v - 4] + " read: " + w70;
+                    ok70 = false;
+                }
         }
+    }
+    if (chk70) {
+        *v70 = ok && ok70 ? 2 : 1;
+        if (v70_why != nullptr) *v70_why = ok ? w70 : "the check could not run (" + why[0] + ")";
     }
     if (!single_ok && ok) {                            // the plain read itself disagrees with the single-token read
         why[2] = why[3] = "the plain read differs from the single-token read: " + why[1];
@@ -4546,15 +4752,41 @@ void fused_gr_check() {
 #endif
     if (dev < 0 || dev >= 64 || g_variant[dev].load() > 0) return;
     const int want = env_variant();
+    int v70 = 0;
+    std::string why70;
+#if !defined(__HIPCC__)
+    // STRATA_GR_V70=1: used on this card only once it matched the default read bit for bit at 1-8 tokens
+    auto v70_verdict = [&] {
+        if (v70 == 0) return;
+        g_v70_ok[dev].store(v70);
+        if (v70 == 2)
+            std::fprintf(stderr, "strata hc: CUDA%d: STRATA_GR_V70=1: the token-split down and up reads (a warp per row "
+                                 "and token); checked bit for bit against the default read at 1-%d tokens\n",
+                         dev, kFusedGrMaxT);
+        else
+            std::fprintf(stderr, "strata hc: CUDA%d: STRATA_GR_V70=1 is off here: the token-split read differs from the "
+                                 "default read: %s\n", dev, why70.c_str());
+    };
+#else
+    auto v70_verdict = [] {};
+#endif
     if (want == kHcPlain) {
         g_variant[dev].store(kHcPlain);
         std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as the plain one (STRATA_HC_SPLIT=0)\n",
                      dev);
+#if !defined(__HIPCC__)
+        if (gr_v70_wanted()) {   // the variants are not checked here, the token-split read still is
+            bool okv[4];
+            std::string why[4];
+            (void) fused_gr_selftest(okv, why, &v70, &why70);
+            v70_verdict();
+        }
+#endif
         return;
     }
     bool okv[4];
     std::string why[4];
-    const bool ran = fused_gr_selftest(okv, why);
+    const bool ran = fused_gr_selftest(okv, why, &v70, &why70);
     int use = kHcPlain;
     if (want >= kHcStaged && okv[kHcStaged]) use = kHcStaged;
     else if (okv[kHcSplit]) use = kHcSplit;
@@ -4573,6 +4805,7 @@ void fused_gr_check() {
     std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
                                    "for the earlier ones)" : "");
+    v70_verdict();
 }
 
 
