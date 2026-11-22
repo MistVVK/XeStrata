@@ -361,6 +361,9 @@ template <> struct XD<T_Q3_K> {
         xd16(h + 32 * u + 16, xs + 16, xsum[1], 2);
     }
 };
+template <> struct XD<T_Q2_K> {
+    static inline void load(device const float* h, int u, thread float* xs, thread float* xsum) { XD<T_Q3_K>::load(h, u, xs, xsum); }
+};
 
 template <int F, int LPR, int NR, int NE>
 static inline void dn_body_k(device const uchar* d0, device const float* h, device float* ye, device const int* plan, int c,
@@ -448,19 +451,21 @@ GU_SET(T_IQ2_S)
 GU_SET(T_IQ3_S)
 GU_SET(T_IQ4_XS)   // the IQ3_S pack's gate/up in one layer
 GU_SET(T_IQ1_M)    // IQ1_M's expert gate/up in the GSQ packs (ported from the 0.1.45 line)
-GU_SET(T_Q4_K) GU_SET(T_Q5_K) GU_SET(T_Q6_K) GU_SET(T_Q8_0)   // the UD-Q4/5/6_K_XL packs
+GU_SET(T_Q2_K) GU_SET(T_Q3_K) GU_SET(T_Q4_K) GU_SET(T_Q5_K) GU_SET(T_Q6_K) GU_SET(T_Q8_0) GU_SET(T_NVFP4)   // the Unsloth UD-Q2/3/4/5/6_K_XL, Q8_0, and NVFP4 packs
 DN_SET(T_Q5_1) DN_SET(T_Q8_0)
 DN_SET(T_Q5_0)   // the UD-IQ2_XS / Q2_K_XL / Q3_K_XL / IQ4_XS packs' down experts (generic Dec: d * (code - 16))
 DN_SET(T_Q2_0)
 DN_SET(T_Q2_0R)
 DN_SET(T_IQ4_NL)
+DN_SET(T_NVFP4)
+DN_SET(T_IQ3_XXS)
 // UD files at expert widths divisible by 256: IQ4_XS / IQ3_S downs read raw h like the gate/up's raw-kind formats (the generic
 // X / Dec); the K-quants take moe_down_k (XD above).  Same host names, moe_down_<type>_<L>_<R>_<S>.
 #ifdef STRATA_KQ_DOWN   // the host defines it when a layer's down is one of these types (window.cpp kq_down_prelude): today's sets compile exactly what they did
 DN_SET(T_IQ4_XS) DN_SET(T_IQ3_S)
 #define DNK(F, L, R, S) template [[host_name("moe_down_" #F "_" #L "_" #R "_" #S)]] kernel decltype(moe_down_k<F, L, R, S>) moe_down_k<F, L, R, S>;
 #define DNK_SET(F) DNK(F, 8, 1, 4) DNK(F, 8, 2, 4) DNK(F, 8, 4, 4) DNK(F, 8, 1, 8) DNK(F, 8, 2, 8) DNK(F, 4, 1, 4) DNK(F, 4, 2, 4)                    DNK(F, 4, 4, 4) DNK(F, 16, 1, 4) DNK(F, 16, 2, 4) DNK(F, 32, 1, 4) DNK(F, 2, 2, 4)
-DNK_SET(T_Q4_K) DNK_SET(T_Q5_K) DNK_SET(T_Q6_K) DNK_SET(T_Q3_K)
+DNK_SET(T_Q2_K) DNK_SET(T_Q3_K) DNK_SET(T_Q4_K) DNK_SET(T_Q5_K) DNK_SET(T_Q6_K)
 #endif   // STRATA_KQ_DOWN
 // Gyro (agentionai's trellis experts): TQK6 / TQ2_T gate/up, TQK7 / TQ2_T down (the CUDA engine's STRATA_GU_FMTS / D_FMTS)
 GU_SET(T_TQK6) GU_SET(T_TQ2T)

@@ -96,7 +96,8 @@ kernel void gemv(device const uchar* W [[buffer(0)]], device const float* xp [[b
                   GV(F, 32, 1, 8, 8) GV(F, 16, 1, 8, 4) GV(F, 32, 1, 8, 2) GV(F, 8, 1, 8, 1)                   GV(F, 1, 1, 4, 1) GV(F, 1, 2, 4, 1) GV(F, 2, 1, 4, 1) GV(F, 2, 2, 4, 1) GV(F, 1, 1, 2, 1) GV(F, 4, 4, 4, 1)
 #ifndef GEMV_TYPES
 #define GEMV_TYPES GV_SET(T_F32) GV_SET(T_BF16) GV_SET(T_Q8_0) GV_SET(T_Q4_0) GV_SET(T_Q5_0) GV_SET(T_IQ4_NL) GV_SET(T_IQ4_XS) \
-                   GV_SET(T_Q2_0) GV_SET(T_IQ3_S) GV_SET(T_Q3_K) GV_SET(T_Q4_K) GV_SET(T_Q5_K) GV_SET(T_Q6_K)
+                   GV_SET(T_Q2_0) GV_SET(T_IQ3_XXS) GV_SET(T_IQ3_S) GV_SET(T_Q2_K) GV_SET(T_Q3_K) GV_SET(T_Q4_K) GV_SET(T_Q5_K) \
+                   GV_SET(T_Q6_K) GV_SET(T_NVFP4)
 #endif
 GEMV_TYPES
 
@@ -154,8 +155,10 @@ kernel void gemv_pair(device const uchar* Wg [[buffer(0)]], device const float* 
 
 #define GP_(F1, F2) template [[host_name("gemv_pair_" #F1 "_" #F2)]] kernel decltype(gemv_pair<F1, F2, 32, 4>) gemv_pair<F1, F2, 32, 4>;
 #define GP(F1, F2) GP_(F1, F2)
-#define GP_ROW(F1) GP(F1, T_IQ3_S) GP(F1, T_IQ4_XS) GP(F1, T_Q2_0) GP(F1, T_Q3_K) GP(F1, T_Q4_K) GP(F1, T_Q5_K) GP(F1, T_Q6_K)
-GP_ROW(T_IQ3_S) GP_ROW(T_IQ4_XS) GP_ROW(T_Q2_0) GP_ROW(T_Q3_K) GP_ROW(T_Q4_K) GP_ROW(T_Q5_K) GP_ROW(T_Q6_K)
+#define GP_ROW(F1) GP(F1, T_IQ3_XXS) GP(F1, T_IQ3_S) GP(F1, T_IQ4_XS) GP(F1, T_Q2_0) GP(F1, T_Q2_K) GP(F1, T_Q3_K) \
+                   GP(F1, T_Q4_K) GP(F1, T_Q5_K) GP(F1, T_Q6_K) GP(F1, T_Q8_0) GP(F1, T_NVFP4)
+GP_ROW(T_IQ3_XXS) GP_ROW(T_IQ3_S) GP_ROW(T_IQ4_XS) GP_ROW(T_Q2_0) GP_ROW(T_Q2_K) GP_ROW(T_Q3_K)
+GP_ROW(T_Q4_K) GP_ROW(T_Q5_K) GP_ROW(T_Q6_K) GP_ROW(T_Q8_0) GP_ROW(T_NVFP4)
 // Q2_0 with raw activations (the shared expert's down reading the pair's raw h)
 GV_SET(T_Q2_0R)
 
@@ -219,7 +222,8 @@ kernel void gemv16(device const uchar* W [[buffer(0)]], device const half* xp [[
 #define GV16_SET(F) GV16(F, 32, 1, 4, 1) GV16(F, 32, 2, 4, 1) GV16(F, 16, 1, 4, 1) GV16(F, 16, 2, 4, 1) GV16(F, 8, 1, 4, 1) \
                     GV16(F, 8, 2, 4, 1) GV16(F, 4, 2, 4, 1) GV16(F, 4, 1, 4, 1) GV16(F, 32, 1, 8, 2) GV16(F, 16, 1, 8, 4) \
                     GV16(F, 2, 1, 4, 1) GV16(F, 2, 2, 4, 1) GV16(F, 1, 1, 4, 1)
-GV16_SET(T_Q3_K) GV16_SET(T_Q4_K) GV16_SET(T_Q5_K) GV16_SET(T_Q6_K) GV16_SET(T_IQ4_XS) GV16_SET(T_Q2_0)
+GV16_SET(T_Q2_K) GV16_SET(T_Q3_K) GV16_SET(T_Q4_K) GV16_SET(T_Q5_K) GV16_SET(T_Q6_K) GV16_SET(T_Q8_0)
+GV16_SET(T_IQ4_XS) GV16_SET(T_IQ3_XXS) GV16_SET(T_IQ3_S) GV16_SET(T_Q2_0) GV16_SET(T_NVFP4)
 #endif   // STRATA_METAL_F16
 
 // gemv_cat: two matrices of the same format and n_in over the same x in one dispatch - rows [0, n_split) are W's
@@ -324,4 +328,4 @@ kernel void gemv_x(device const uchar* W [[buffer(0)]], device const float* xp [
 #define GVX_SET(F) GVX(F, 32, 1, 4) GVX(F, 32, 2, 4) GVX(F, 16, 1, 4) GVX(F, 16, 2, 4) GVX(F, 8, 1, 4) GVX(F, 8, 2, 4) \
                    GVX(F, 4, 2, 4) GVX(F, 16, 2, 8) GVX(F, 8, 2, 8) GVX(F, 16, 4, 4) GVX(F, 32, 2, 8) GVX(F, 2, 2, 4)
 GVX_SET(T_BF16) GVX_SET(T_Q8_0) GVX_SET(T_Q4_0) GVX_SET(T_Q5_0) GVX_SET(T_IQ4_NL) GVX_SET(T_IQ4_XS) GVX_SET(T_Q2_0)
-GVX_SET(T_IQ3_S) GVX_SET(T_Q3_K) GVX_SET(T_Q4_K) GVX_SET(T_Q5_K) GVX_SET(T_Q6_K)
+GVX_SET(T_IQ3_XXS) GVX_SET(T_IQ3_S) GVX_SET(T_Q2_K) GVX_SET(T_Q3_K) GVX_SET(T_Q4_K) GVX_SET(T_Q5_K) GVX_SET(T_Q6_K) GVX_SET(T_NVFP4)

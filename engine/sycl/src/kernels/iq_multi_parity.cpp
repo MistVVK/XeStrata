@@ -22,6 +22,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -63,10 +64,17 @@ const char* name_of(int t) {
         case 23: return "IQ4_XS";
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
+        case 12: return "Q4_K";
+        case 13: return "Q5_K";
+        case 14: return "Q6_K";
+        case 7: return "Q5_1";
+        case 6: return "Q5_0";
+        case 8: return "Q8_0";
+        case 40: return "NVFP4";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 ? 32 : t == 42 ? 64 : 256; }
+int block_values(int t) { return (t == 20 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8) ? 32 : (t == 42 || t == 40) ? 64 : 256; }
 
 // `rows` rows of `n` values of format t: random bytes, then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -75,14 +83,22 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     std::uniform_int_distribution<int> byte(0, 255), ex(2, 8), man(0, 1023), sgn(0, 3);
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {
-        if (t == 29) {
+        if (t == 40) {
+            for (int k = 0; k < 4; ++k) w[o + k] = (uint8_t) (0x18 + (byte(rng) & 0x1F));
+        } else if (t == 29) {
             // IQ1_M: the fp16 scale is the top nibbles of the four scale words (bytes 48..55); nibble 3 carries the
             // sign and the exponent's top bits: 0x1 / 0x2 (or 0x9 / 0xA) keeps it in 2^-11 .. 2^-3
             const uint8_t nib = (uint8_t) ((sgn(rng) == 0 ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
             w[o + 55] = (uint8_t) ((w[o + 55] & 0x0F) | (nib << 4));
         } else {
-            const uint16_t h = (uint16_t) ((sgn(rng) == 0 ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));   // 2^-13 .. 2^-6
-            std::memcpy(&w[o], &h, 2);
+            const int e = (t == 12 || t == 13) ? 1 + ex(rng) % 4 : ex(rng);
+            const uint16_t h = (uint16_t) ((sgn(rng) == 0 ? 0x8000 : 0) | (e << 10) | man(rng));   // 2^-13 .. 2^-6
+            std::memcpy(&w[o + (t == 14 ? 208 : 0)], &h, 2);
+            if (t == 12 || t == 13 || t == 7 || t == 3) {
+                const int em = (t == 7 || t == 3) ? ex(rng) : 1 + ex(rng) % 4;
+                const uint16_t m = (uint16_t) ((sgn(rng) == 0 ? 0x8000 : 0) | (em << 10) | man(rng));
+                std::memcpy(&w[o + 2], &m, 2);
+            }
         }
     }
     return w;
@@ -270,6 +286,7 @@ struct Grouped {
     float* dout = nullptr;
     size_t out_floats = 0;
     std::vector<int32_t> h_start, h_tok, h_dst;   // the host copies, for reference()
+    std::vector<std::array<float, 4>> h_tails;    // per-group NVFP4 tail scales
 
     Grouped(int gu, int dt, int64_t H, int64_t FF, const std::vector<int>& counts, int tokens, std::mt19937& rng) {
         L = k::native_expert_layout(gu, dt, H, FF);
@@ -290,10 +307,17 @@ struct Grouped {
         h_dst = dst;
         std::vector<unsigned long long> ptr;
         for (int g = 0; g < n_groups; ++g) {
-            // one blob per group: gate rows | up rows (format gu, H values) | down rows (format dt, FF values)
+            // one blob per group: gate rows | up rows (format gu, H values) | down rows (format dt, FF values) [| NVFP4 tail]
             auto b = random_rows(gu, 2 * FF, H, rng);
             const auto d = random_rows(dt, H, FF, rng);
             b.insert(b.end(), d.begin(), d.end());
+            std::array<float, 4> tail{1.0f, 1.0f, 1.0f, 0.0f};
+            if (L.tail_off != 0) {
+                tail = {0.75f + 0.1f * (g % 3), 1.25f - 0.15f * (g % 2), 0.5f + 0.2f * (g % 4), 0.0f};
+                const auto* tp = reinterpret_cast<const uint8_t*>(tail.data());
+                b.insert(b.end(), tp, tp + 16);
+            }
+            h_tails.push_back(tail);
             if (b.size() != L.bytes) { std::fprintf(stderr, "blob size %zu != %zu\n", b.size(), L.bytes); std::exit(2); }
             uint8_t* db = dalloc<uint8_t>(b.size());
             /*
@@ -402,15 +426,29 @@ struct Grouped {
                                 .memcpy(ptr.data(), dptr, ptr.size() * 8).wait()), "ptr");
         for (int gi = 0; gi < n_groups; ++gi) {
             const uint8_t* blob = (const uint8_t*) ptr[gi];
+            const auto& tail = h_tails[(size_t) gi];
             for (int e = h_start[gi]; e < h_start[gi + 1]; ++e) {
                 const uint8_t* xq = dxq + (size_t) h_tok[e] * (H / 32) * 36;
                 k::iq_mmvq(L.gu_type, blob, xq, g, (int) H, (int) FF, 1, s);
                 k::iq_mmvq(L.gu_type, blob + L.up_off, xq, u, (int) H, (int) FF, 1, s);
+                if (L.tail_off != 0) {
+                    ck(DPCT_CHECK_ERROR(s->wait()), "ref sync gu");
+                    std::vector<float> hg((size_t) FF), hu((size_t) FF);
+                    dpct::get_in_order_queue().memcpy(hg.data(), g, (size_t) FF * 4).wait();
+                    dpct::get_in_order_queue().memcpy(hu.data(), u, (size_t) FF * 4).wait();
+                    for (int64_t i = 0; i < FF; ++i) { hg[(size_t) i] *= tail[0]; hu[(size_t) i] *= tail[1]; }
+                    dpct::get_in_order_queue().memcpy(g, hg.data(), (size_t) FF * 4).wait();
+                    dpct::get_in_order_queue().memcpy(u, hu.data(), (size_t) FF * 4).wait();
+                }
                 k::native_swiglu_quantize_q8_1(g, u, hq, (int) FF, 1, s);
                 k::iq_mmvq(L.d_type, blob + L.down_off, hq, y, (int) FF, (int) H, 1, s);
                 ck(DPCT_CHECK_ERROR(s->wait()), "ref sync");
+                float* dst_row = out.data() + (size_t) h_dst[e] * H;
                 ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                        .memcpy(out.data() + (size_t) h_dst[e] * H, y, (size_t) H * 4).wait()), "ref out");
+                                        .memcpy(dst_row, y, (size_t) H * 4).wait()), "ref out");
+                if (L.tail_off != 0) {
+                    for (int64_t i = 0; i < H; ++i) dst_row[i] *= tail[2];
+                }
             }
         }
         sycl::free(g, dpct::get_in_order_queue()); sycl::free(u, dpct::get_in_order_queue());
@@ -666,13 +704,27 @@ int main(int argc, char** argv) {
     ck(DPCT_CHECK_ERROR(s = dpct::get_current_device().create_queue(true)),
        "stream");
     std::mt19937 rng(18);
-    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42}) {
+    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 12, 13,
+#ifdef STRATA_Q6K_EXPERTS
+                  14,
+#endif
+                  8, 7, 6, 40}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42}) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
+    }
+    // Unsloth K-quants + Q8_0 + NVFP4 (with non-unit tail scales)
+    for (const auto& pr : std::vector<std::pair<int, int>>{
+             {12, 8}, {12, 7}, {13, 8},
+#ifdef STRATA_Q6K_EXPERTS
+             {14, 8},
+#endif
+             {8, 8}, {40, 40}, {40, 8}, {12, 40}}) {
+        check_grouped(pr.first, pr.second, 2560, 640, s, rng);
+        check_grouped(pr.first, pr.second, 1024, 512, s, rng);
     }
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);

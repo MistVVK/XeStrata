@@ -37,18 +37,39 @@ int main(int argc, char** argv) {
     for (auto& c : cnt) { c = std::max(1, (int) gd(rng)); tot += c; }
     int fails = 0;
     struct Case { int ty; bool gu; };
-    // the formats of the native packs' experts that the prompt path's fused XMX takes (prefill.cpp xmx2_fmt)
-    for (Case cs : {Case{18, true}, Case{21, true}, Case{22, true}, Case{23, true}, Case{20, false}, Case{42, false}}) {
+    // the formats of the native packs' experts that the prompt path's fused XMX takes (prefill.cpp xmx2_fmt) + NVFP4
+    for (Case cs : {Case{18, true}, Case{21, true}, Case{22, true}, Case{23, true},
+                    Case{12, true}, Case{13, true},
+#ifdef STRATA_Q6K_EXPERTS
+                    Case{14, true},
+#endif
+                    Case{8, true}, Case{40, true},
+                    Case{20, false}, Case{42, false}, Case{8, false}, Case{6, false}, Case{7, false}, Case{40, false}}) {
         const int64_t K = cs.gu ? 2560 : 640, N = cs.gu ? 1280 : 2560, n_ff = 640;
-        const int blk_elems = cs.ty == 20 ? 32 : cs.ty == 42 ? 64 : 256;
+        const int blk_elems = (cs.ty == 20 || cs.ty == 8 || cs.ty == 7 || cs.ty == 6 || cs.ty == 2 || cs.ty == 3) ? 32 :
+                              (cs.ty == 42 || cs.ty == 40) ? 64 : 256;
         const size_t blk_bytes = strata::kernels::iq_row_bytes(cs.ty, blk_elems);
         const size_t mat_bytes = strata::kernels::iq_row_bytes(cs.ty, K) * (cs.gu ? n_ff : N);
         if (blk_bytes == 0 || mat_bytes == 0) { std::printf("type %d: not supported\n", cs.ty); continue; }
         auto blob = [&]() {
             std::vector<uint8_t> b(mat_bytes);
             for (auto& x : b) x = (uint8_t) rng();
-            if (cs.ty != 29)   // d = 0.0625 at each block's start (IQ1_M keeps its scale in the scales field)
+            if (cs.ty == 40) {
+                // NVFP4: UE4M3 scales in bytes [0..3], avoid 0x7F (NaN) and keep scales modest (0x20..0x38)
+                for (size_t o = 0; o + 4 <= b.size(); o += blk_bytes)
+                    for (int k = 0; k < 4; ++k) b[o + k] = (uint8_t) (0x20 + (b[o + k] & 0x1F));
+            } else if (cs.ty == 14) {
+                // Q6_K: fp16 d is last (bytes 208..209)
+                for (size_t o = 0; o + 210 <= b.size(); o += blk_bytes) { b[o + 208] = 0x00; b[o + 209] = 0x20; }
+            } else if (cs.ty == 12 || cs.ty == 13 || cs.ty == 7 || cs.ty == 3) {
+                // Q4_K / Q5_K / Q5_1 / Q4_1: dm = (d, dmin) at bytes [0..3]
+                for (size_t o = 0; o + 4 <= b.size(); o += blk_bytes) {
+                    b[o + 0] = 0x00; b[o + 1] = 0x20;
+                    b[o + 2] = 0x00; b[o + 3] = 0x20;
+                }
+            } else if (cs.ty != 29) {   // d = 0.0625 at each block's start (IQ1_M keeps its scale in the scales field)
                 for (size_t o = 0; o + 1 < b.size(); o += blk_bytes) { b[o] = 0x00; b[o + 1] = 0x2C; }
+            }
             return b;
         };
         std::vector<uint8_t*> dg(n), du(n);

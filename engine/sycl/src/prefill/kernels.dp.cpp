@@ -1919,7 +1919,8 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ Dm,
                                         const float *__restrict__ w,
                                         const float *__restrict__ shared,
                                         const float *__restrict__ sg,
-                                        float *__restrict__ bo, int64_t T) {
+                                        float *__restrict__ bo, int64_t T,
+                                        const float *__restrict__ row_sd) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i =
         (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
@@ -1928,9 +1929,11 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ Dm,
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
-    for (int k = 0; k < KU; ++k)
-        s = sycl::fma((float)(w[t * KU + k]),
-                      (float)(Dm[(int64_t)slot[t * KU + k] * N + d]), s);
+    for (int k = 0; k < KU; ++k) {
+        const int64_t r = slot[t * KU + k];
+        const float v = row_sd ? Dm[r * N + d] * row_sd[r] : Dm[r * N + d];
+        s = sycl::fma((float)(w[t * KU + k]), v, s);
+    }
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
 
@@ -1945,7 +1948,8 @@ adjust the code, or use smaller sub-group size to avoid high register pressure.
 __dpct_inline__ void moe_combine4_kernel(
     const float *__restrict__ Dm, const int32_t *__restrict__ slot,
     const float *__restrict__ w, const sycl::float4 *__restrict__ shared,
-    const float *__restrict__ sg, sycl::float4 *__restrict__ bo, int64_t T) {
+    const float *__restrict__ sg, sycl::float4 *__restrict__ bo, int64_t T,
+    const float *__restrict__ row_sd) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i =
         (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
@@ -1958,15 +1962,19 @@ __dpct_inline__ void moe_combine4_kernel(
 #pragma unroll
     for (int k = 0; k < KU; ++k) {
         ww[k] = w[t * KU + k];
-        v[k] = *reinterpret_cast<const sycl::float4 *>(
-            Dm + (int64_t)slot[t * KU + k] * N + d);
+        const int64_t r = slot[t * KU + k];
+        v[k] = *reinterpret_cast<const sycl::float4 *>(Dm + r * N + d);
+        if (row_sd) {
+            const float sd = row_sd[r];
+            v[k] = sycl::float4(v[k].x() * sd, v[k].y() * sd, v[k].z() * sd, v[k].w() * sd);
+        }
     }
 #pragma unroll
     for (int k = 0; k < KU; ++k) {
         s.x() = sycl::fma(ww[k], v[k].x(), s.x());
-            s.y() = sycl::fma(ww[k], v[k].y(), s.y());
+        s.y() = sycl::fma(ww[k], v[k].y(), s.y());
         s.z() = sycl::fma(ww[k], v[k].z(), s.z());
-            s.w() = sycl::fma(ww[k], v[k].w(), s.w());
+        s.w() = sycl::fma(ww[k], v[k].w(), s.w());
     }
     const float g = sigm(sg[t]);
     const sycl::float4 sh = shared[i];
@@ -3164,7 +3172,7 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream, const float* row_sd) {
-    if (row_sd != nullptr) { std::fprintf(stderr, "moe_combine: per-row scales (NVFP4) are CUDA only\n"); std::exit(1); }
+    if (T <= 0) return;
 #ifndef STRATA_W_NO_COMB
     if (((reinterpret_cast<uintptr_t>(Dm) | reinterpret_cast<uintptr_t>(shared) | reinterpret_cast<uintptr_t>(bo)) & 15) == 0) {
         {
@@ -3182,7 +3190,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
                         moe_combine4_kernel(
                             Dm, slot, w,
                             reinterpret_cast<const sycl::float4 *>(shared), sg,
-                            reinterpret_cast<sycl::float4 *>(bo), T);
+                            reinterpret_cast<sycl::float4 *>(bo), T, row_sd);
                     });
         }
         check("moe_combine");
@@ -3199,7 +3207,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    moe_combine_kernel(Dm, slot, w, shared, sg, bo, T);
+                    moe_combine_kernel(Dm, slot, w, shared, sg, bo, T, row_sd);
                 });
     }
     check("moe_combine");

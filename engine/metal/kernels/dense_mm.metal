@@ -61,8 +61,8 @@ kernel void gemm_f16(device half* A [[buffer(0)]], device half* B [[buffer(1)]],
 
 #define DQ(F) template [[host_name("dq_f16_" #F)]] kernel decltype(dq_f16<F>) dq_f16<F>;
 #define DQ_(F) DQ(F)
-DQ_(T_F32) DQ_(T_BF16) DQ_(T_Q8_0) DQ_(T_Q4_0) DQ_(T_Q5_0) DQ_(T_IQ4_NL) DQ_(T_IQ4_XS) DQ_(T_Q2_0) DQ_(T_IQ3_S) DQ_(T_Q3_K)
-DQ_(T_Q4_K) DQ_(T_Q5_K) DQ_(T_Q6_K)
+DQ_(T_F32) DQ_(T_BF16) DQ_(T_Q8_0) DQ_(T_Q4_0) DQ_(T_Q5_0) DQ_(T_IQ4_NL) DQ_(T_IQ4_XS) DQ_(T_Q2_0) DQ_(T_IQ3_XXS) DQ_(T_IQ3_S)
+DQ_(T_Q2_K) DQ_(T_Q3_K) DQ_(T_Q4_K) DQ_(T_Q5_K) DQ_(T_Q6_K) DQ_(T_NVFP4)
 template [[host_name("gemm_f16_64_64_4")]] kernel decltype(gemm_f16<64, 64, 4>) gemm_f16<64, 64, 4>;
 template [[host_name("gemm_f16_128_64_4")]] kernel decltype(gemm_f16<128, 64, 4>) gemm_f16<128, 64, 4>;
 template [[host_name("gemm_f16_64_128_4")]] kernel decltype(gemm_f16<64, 128, 4>) gemm_f16<64, 128, 4>;

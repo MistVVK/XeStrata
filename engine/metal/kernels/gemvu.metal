@@ -64,5 +64,6 @@ kernel void gemv_u(device const uchar* W [[buffer(0)]], device const float* xp [
 #define GVU(F, L, R, S, K, U) GVU_(F, L, R, S, K, U)
 #define GVU_SET(F, U) GVU(F, 16, 1, 4, 1, U) GVU(F, 32, 1, 8, 2, U) GVU(F, 8, 1, 4, 1, U) GVU(F, 32, 1, 4, 1, U)
 #define GVU_ALL(U) GVU_SET(T_F32, U) GVU_SET(T_BF16, U) GVU_SET(T_Q8_0, U) GVU_SET(T_Q4_0, U) GVU_SET(T_Q5_0, U) GVU_SET(T_IQ4_NL, U) GVU_SET(T_IQ4_XS, U) \
-                  GVU_SET(T_Q2_0, U) GVU_SET(T_IQ3_S, U) GVU_SET(T_Q3_K, U) GVU_SET(T_Q4_K, U) GVU_SET(T_Q5_K, U) GVU_SET(T_Q6_K, U)
+                  GVU_SET(T_Q2_0, U) GVU_SET(T_IQ3_XXS, U) GVU_SET(T_IQ3_S, U) GVU_SET(T_Q2_K, U) GVU_SET(T_Q3_K, U) GVU_SET(T_Q4_K, U) GVU_SET(T_Q5_K, U) \
+                  GVU_SET(T_Q6_K, U) GVU_SET(T_NVFP4, U)
 GVU_ALL(2)

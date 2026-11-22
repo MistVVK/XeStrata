@@ -116,7 +116,7 @@ std::string kq_down_prelude(const gguf::File& f) {
     for (int l = 0; l < 128; ++l) {
         const gguf::Tensor* t = f.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
         if (!t) continue;
-        if (t->type == ref::Q3_K || t->type == ref::Q4_K || t->type == ref::Q5_K || t->type == ref::Q6_K || t->type == ref::IQ3_S ||
+        if (t->type == ref::Q2_K || t->type == ref::Q3_K || t->type == ref::Q4_K || t->type == ref::Q5_K || t->type == ref::Q6_K || t->type == ref::IQ3_S ||
             t->type == ref::IQ4_XS)
             return "#define STRATA_KQ_DOWN 1\n";
     }
@@ -178,9 +178,9 @@ bool f16_auto_for(const std::string& path, bool streaming) {
 // the half plane a format reads: 0 raw, 1 x * 4^-(i % 4), 2 x * 2^-8 at odd i; -1 no fp16 decode
 int x16_kind(int ty) {
     switch (ty) {
-        case ref::IQ4_XS: return 0;
+        case ref::IQ4_XS: case ref::Q8_0: case ref::IQ3_XXS: case ref::IQ3_S: case ref::NVFP4: return 0;
         case ref::Q2_0: return 1;
-        case ref::Q3_K: case ref::Q4_K: case ref::Q5_K: case ref::Q6_K: return 2;
+        case ref::Q2_K: case ref::Q3_K: case ref::Q4_K: case ref::Q5_K: case ref::Q6_K: return 2;
         default: return -1;
     }
 }
@@ -198,7 +198,7 @@ int xkind(int t) {
     switch (t) {
         case ref::Q2_0: return 1;
         case ref::Q4_K: case ref::Q5_K: return 2;
-        case ref::Q6_K: case ref::Q3_K: return 3;
+        case ref::Q6_K: case ref::Q3_K: case ref::Q2_K: return 3;
         default: return 0;
     }
 }
@@ -932,9 +932,9 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         std::vector<std::string> names;
         for (const auto& kv : f_.tensors) {
             const gguf::Tensor& x = kv.second;
-            // BF16 (when the Q8_0 read is on) and, whatever the setting, the Gyro file's Q6_K / IQ4_NL ones: the decode window's
-            // hyper-connection kernels read BF16 or Q8_0 only
-            const bool conv = (x.type == ref::BF16 && hc_q8_) || x.type == ref::Q6_K || x.type == ref::IQ4_NL;
+            // BF16 (when the Q8_0 read is on) and any quantized non-Q8_0/non-F32 HC tensor (Gyro / Unsloth packs):
+            // the decode window's hyper-connection kernels read BF16 or Q8_0 (with optional F32 inject rows)
+            const bool conv = (x.type == ref::BF16 && hc_q8_) || (x.type != ref::BF16 && x.type != ref::Q8_0 && x.type != ref::F32);
             if (!conv || x.name.find("hc_") == std::string::npos || x.name.find("_norm") != std::string::npos) continue;
             uint64_t ne = 1;
             for (uint64_t d : x.shape) ne *= d;
@@ -1098,10 +1098,11 @@ void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, boo
     const auto [bi, oi] = src(tin);
     const auto [bu, ou] = src(tup);
     const bool q8 = is_q8(tdn) && is_q8(tup);
-    const bool injf = q8 && !final_ && !q8off_.count(tin.name) && tin.type == ref::F32;
+    const bool injf = !final_ && !q8off_.count(tin.name) && tin.type == ref::F32;
     mtl::Dispatch d2;
     static const bool hcld = std::getenv("STRATA_METAL_HCLD") && std::string(std::getenv("STRATA_METAL_HCLD")) == "1";   // OFF (measured -10.9%, 4 of 4 rounds, M5 Max UD-Q4_K_XL): the HC kernels' units loaded two or three at a time, bitwise the same; registers and occupancy, as the earlier gemvu / moeu unrolls
-    const char* dn = injf ? (hcld ? "gr_downp_q8f_8_8" : "gr_down_q8f_8_8") : q8 ? (hcld ? "gr_downp_q8_8_8" : "gr_down_q8_8_8") : "gr_down_8_8";
+    const char* dn = q8 ? (injf ? (hcld ? "gr_downp_q8f_8_8" : "gr_down_q8f_8_8") : (hcld ? "gr_downp_q8_8_8" : "gr_down_q8_8_8"))
+                        : (injf ? (hcld ? "gr_downp_bf16f_8_8" : "gr_down_bf16f_8_8") : "gr_down_8_8");
     d2.p = P(lib_, dn, mtl::Constants().i(1, ntok), std::string(dn) + "#" + std::to_string(ntok));
     d2.args = {mtl::Arg::B(*bd, od), mtl::Arg::B(*bi, oi), mtl::Arg::B(xn_), mtl::Arg::B(lo_),
                mtl::Arg::B(inj_[1 - cur_inj_]), mtl::Arg::V(a)};

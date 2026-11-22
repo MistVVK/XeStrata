@@ -157,6 +157,25 @@ template <> struct DW<T_Q3_K> {
         p1 = p0 + 16;
     }
 };
+// Q2_K: d * (sc & 0xF) * ((q >> 2j) & 3) - dmin * (sc >> 4), contiguous 32
+template <> struct DW<T_Q2_K> {
+    static inline void run(device const uchar* row, int u, int k0, thread float* w, thread int& p0, thread int& p1,
+                           threadgroup const uint*) {
+        device const uchar* b = row + (u >> 3) * 84;
+        const int n = (u >> 2) & 1, j = u & 3;
+        device const uchar* q = b + 16 + 32 * n;
+        const uchar s1 = b[8 * n + 2 * j], s2 = b[8 * n + 2 * j + 1];
+        const float d = rdh(b + 80), dm = rdh(b + 82);
+        const float d1 = d * float(s1 & 0xF), m1 = dm * float(s1 >> 4);
+        const float d2 = d * float(s2 & 0xF), m2 = dm * float(s2 >> 4);
+        for (int l = 0; l < 16; ++l) {
+            w[l] = d1 * float((q[l] >> (2 * j)) & 3) - m1;
+            w[16 + l] = d2 * float((q[l + 16] >> (2 * j)) & 3) - m2;
+        }
+        p0 = 32 * u - k0;
+        p1 = p0 + 16;
+    }
+};
 
 struct MmaArgs {
     uint n_in;
@@ -213,4 +232,4 @@ kernel void gemv_mma(device const uchar* W [[buffer(0)]], device const float* x 
 #define MM(F, S) template [[host_name("gemv_mma_" #F "_" #S)]] kernel decltype(gemv_mma<F, S>) gemv_mma<F, S>;
 #define MM_SET(F) MM(F, 1) MM(F, 2) MM(F, 4)
 MM_SET(T_BF16) MM_SET(T_Q8_0) MM_SET(T_Q4_0) MM_SET(T_Q5_0) MM_SET(T_IQ4_NL) MM_SET(T_IQ4_XS) MM_SET(T_Q2_0)
-MM_SET(T_IQ3_S) MM_SET(T_Q3_K) MM_SET(T_Q4_K) MM_SET(T_Q5_K) MM_SET(T_Q6_K)
+MM_SET(T_IQ3_XXS) MM_SET(T_IQ3_S) MM_SET(T_Q2_K) MM_SET(T_Q3_K) MM_SET(T_Q4_K) MM_SET(T_Q5_K) MM_SET(T_Q6_K) MM_SET(T_NVFP4)

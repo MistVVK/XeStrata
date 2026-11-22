@@ -15,7 +15,7 @@ int xkind(int t) {
     switch (t) {
         case ref::Q2_0: return 1;
         case ref::Q4_K: case ref::Q5_K: return 2;
-        case ref::Q6_K: case ref::Q3_K: return 3;
+        case ref::Q6_K: case ref::Q3_K: case ref::Q2_K: return 3;
         default: return 0;
     }
 }
@@ -41,7 +41,8 @@ int main() {
     const size_t plane = (size_t)4 * NIN * MAXT;
     const std::vector<std::pair<int, int>> pairs = {{ref::Q2_0, ref::Q3_K}, {ref::Q3_K, ref::Q2_0}, {ref::IQ4_XS, ref::IQ3_S},
                                                     {ref::Q4_K, ref::Q6_K}, {ref::Q5_K, ref::Q4_K}, {ref::Q6_K, ref::IQ3_S},
-                                                    {ref::Q2_0, ref::Q2_0}, {ref::IQ3_S, ref::Q4_K}};
+                                                    {ref::Q2_0, ref::Q2_0}, {ref::IQ3_S, ref::Q4_K}, {ref::IQ3_XXS, ref::IQ3_XXS},
+                                                    {ref::Q2_K, ref::Q4_K}, {ref::Q8_0, ref::Q8_0}, {ref::NVFP4, ref::NVFP4}};
     int fails = 0;
     for (auto [fg, fu] : pairs) {
         const size_t rg = ref::row_bytes(fg, NIN), ru = ref::row_bytes(fu, NIN);

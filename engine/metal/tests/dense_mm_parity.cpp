@@ -20,7 +20,7 @@ double median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v
 float h16(float v) { return ref::f16_to_f32(ref::f32_to_f16(v)); }
 int unit_of(int t) {
     switch (t) {
-        case ref::Q2_0: case ref::IQ3_S: case ref::BF16: case ref::F32: return 16;
+        case ref::Q2_0: case ref::NVFP4: case ref::IQ3_XXS: case ref::IQ3_S: case ref::BF16: case ref::F32: return 16;
         default: return 32;
     }
 }
@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
         }
     };
     const std::vector<int> types = {ref::F32, ref::BF16, ref::Q8_0, ref::Q4_0, ref::Q5_0, ref::IQ4_NL, ref::IQ4_XS, ref::Q2_0,
-                                    ref::IQ3_S, ref::Q3_K, ref::Q4_K, ref::Q5_K, ref::Q6_K};
+                                    ref::IQ3_XXS, ref::IQ3_S, ref::Q2_K, ref::Q3_K, ref::Q4_K, ref::Q5_K, ref::Q6_K, ref::NVFP4};
     if (!bench) {
         int fails = 0;
         for (int ty : types)

@@ -150,6 +150,8 @@ kernel void moe_down_u(device const uchar* W [[buffer(0)]], device const float* 
 #define DNU(F, L, R, S, U) DNU_(F, L, R, S, U)
 // the tiles the Q2_0 and IQ3_S packs use (window.cpp / token_chain.cpp pick 32,1,4 for gate/up; down 8,1,4 for Q2_0 and 4,2,4 otherwise)
 #define GUU_ALL(U) GUU(T_Q2_0, 32, 1, 4, U) GUU(T_IQ3_XXS, 32, 1, 4, U) GUU(T_IQ2_S, 32, 1, 4, U) GUU(T_IQ3_S, 32, 1, 4, U) \
-                   GUU(T_IQ4_XS, 32, 1, 4, U)
-#define DNU_ALL(U) DNU(T_Q2_0, 8, 1, 4, U) DNU(T_Q2_0R, 8, 1, 4, U) DNU(T_IQ4_NL, 4, 2, 4, U) DNU(T_Q8_0, 4, 2, 4, U) DNU(T_Q5_1, 4, 2, 4, U) DNU(T_Q5_0, 4, 2, 4, U)
+                   GUU(T_IQ4_XS, 32, 1, 4, U) GUU(T_Q2_K, 32, 1, 4, U) GUU(T_Q3_K, 32, 1, 4, U) GUU(T_Q4_K, 32, 1, 4, U) \
+                   GUU(T_Q5_K, 32, 1, 4, U) GUU(T_Q6_K, 32, 1, 4, U) GUU(T_Q8_0, 32, 1, 4, U) GUU(T_NVFP4, 32, 1, 4, U)
+#define DNU_ALL(U) DNU(T_Q2_0, 8, 1, 4, U) DNU(T_Q2_0R, 8, 1, 4, U) DNU(T_IQ4_NL, 4, 2, 4, U) DNU(T_Q8_0, 4, 2, 4, U) \
+                   DNU(T_Q5_1, 4, 2, 4, U) DNU(T_Q5_0, 4, 2, 4, U) DNU(T_IQ3_XXS, 8, 1, 4, U) DNU(T_NVFP4, 8, 1, 4, U)
 GUU_ALL(2) DNU_ALL(2)

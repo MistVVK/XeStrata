@@ -69,11 +69,13 @@ const char* name_of(int t) {
         case 13: return "Q5_K";
         case 14: return "Q6_K";
         case 7: return "Q5_1";
+        case 6: return "Q5_0";
         case 8: return "Q8_0";
+        case 40: return "NVFP4";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 ? 32 : (t == 42 || t == 40) ? 64 : 256; }
 
 // `rows` rows of `n` values of format t: random bytes, then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -82,7 +84,10 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     std::uniform_int_distribution<int> byte(0, 255), ex(2, 8), man(0, 1023), sgn(0, 1);
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {
-        if (t == 29) {
+        if (t == 40) {
+            // NVFP4: 4 UE4M3 scales at bytes [0..3], keep modest finite non-NaN values (0x18..0x37)
+            for (int k = 0; k < 4; ++k) w[o + k] = (uint8_t) (0x18 + (byte(rng) & 0x1F));
+        } else if (t == 29) {
             // IQ1_M: the fp16 scale is the top nibbles of its four scale words (bytes 48..55), the sign and the
             // exponent's top bits in the last: 0x1 / 0x2 there (0x9 / 0xA negative) keeps it in 2^-11 .. 2^-3
             const uint8_t nib = (uint8_t) ((sgn(rng) ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
@@ -92,8 +97,8 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
             const int e = (t == 12 || t == 13) ? 1 + ex(rng) % 4 : ex(rng);
             const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (e << 10) | man(rng));
             std::memcpy(&w[o + (t == 14 ? 208 : 0)], &h, 2);   // Q6_K keeps its fp16 scale last (ql, qh, scales, d)
-            if (t == 12 || t == 13 || t == 7) {   // Q4_K / Q5_K: dmin, Q5_1: m - the second fp16, as small
-                const int em = (t == 7) ? ex(rng) : 1 + ex(rng) % 4;
+            if (t == 12 || t == 13 || t == 7 || t == 3) {   // Q4_K / Q5_K: dmin, Q5_1 / Q4_1: m - the second fp16, as small
+                const int em = (t == 7 || t == 3) ? ex(rng) : 1 + ex(rng) % 4;
                 const uint16_t m = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (em << 10) | man(rng));
                 std::memcpy(&w[o + 2], &m, 2);
             }
@@ -127,10 +132,15 @@ struct Setup {
         slot = (L.bytes + 255) & ~(size_t) 255;
         blobs = dalloc<uint8_t>(slot * (size_t) n_blobs);
         for (int b = 0; b < n_blobs; ++b) {
-            // gate rows | up rows (format gu, H values each) | down rows (format dt, FF values each)
+            // gate rows | up rows (format gu, H values each) | down rows (format dt, FF values each) [+ NVFP4 tail]
             auto blob = random_rows(gu, 2 * FF, H, rng);
             const auto down = random_rows(dt, H, FF, rng);
             blob.insert(blob.end(), down.begin(), down.end());
+            if (L.tail_off) {
+                const float tail[4] = {gu == 40 ? 0.75f : 1.0f, gu == 40 ? 1.25f : 1.0f, dt == 40 ? 0.5f : 1.0f, 0.0f};
+                const auto* tb = reinterpret_cast<const uint8_t*>(tail);
+                blob.insert(blob.end(), tb, tb + 16);
+            }
             hb.push_back(blob);
             if (blob.size() != L.bytes) { std::fprintf(stderr, "blob %zu != %zu bytes\n", blob.size(), L.bytes); std::exit(2); }
             /*
@@ -391,6 +401,27 @@ void dq_block(int t, const uint8_t* b, float* y) {
             }
             break;
         }
+        case 40: {   // NVFP4: d[4] (UE4M3 scales), qs[32] (64 nibbles)
+            static constexpr float kfp4[16] = {
+                0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+            };
+            auto ue4m3 = [](uint8_t x) -> float {
+                if (x == 0 || x == 0x7F || x == 0xFF) return 0.0f;
+                const int exp = (x >> 3) & 0xF, man = x & 0x7;
+                if (exp == 0) return std::ldexp((float) man, -9);
+                return std::ldexp(1.0f + (float) man / 8.0f, exp - 7);
+            };
+            for (int sb = 0; sb < 4; ++sb) {
+                const float d = ue4m3(b[sb]);
+                const uint8_t* q = b + 4 + sb * 8;
+                for (int j = 0; j < 8; ++j) {
+                    y[sb * 16 + j] = d * kfp4[q[j] & 0xF];
+                    y[sb * 16 + 8 + j] = d * kfp4[q[j] >> 4];
+                }
+            }
+            break;
+        }
         default: std::fprintf(stderr, "dq_block: type %d\n", t); std::exit(2);
     }
 }
@@ -408,6 +439,12 @@ std::vector<float> reference(const Setup& S) {
     std::vector<float> x(H);
     for (size_t g = 0; g + 1 < S.h_start.size(); ++g) {
         const auto& blob = S.hb[S.h_blob[g]];
+        float sg = 1.0f, su = 1.0f, sd = 1.0f;
+        if (S.L.tail_off != 0) {
+            std::memcpy(&sg, blob.data() + S.L.tail_off + 0, 4);
+            std::memcpy(&su, blob.data() + S.L.tail_off + 4, 4);
+            std::memcpy(&sd, blob.data() + S.L.tail_off + 8, 4);
+        }
         const auto G = dq_rows(S.L.gu_type, blob.data(), FF, H);
         const auto U = dq_rows(S.L.gu_type, blob.data() + S.L.up_off, FF, H);
         const auto D = dq_rows(S.L.d_type, blob.data() + S.L.down_off, H, FF);
@@ -418,12 +455,13 @@ std::vector<float> reference(const Setup& S) {
             for (int64_t r = 0; r < FF; ++r) {
                 double gs = 0, us = 0;
                 for (int64_t i = 0; i < H; ++i) { gs += (double) G[r * H + i] * x[i]; us += (double) U[r * H + i] * x[i]; }
+                gs *= sg; us *= su;
                 h[r] = (float) (gs / (1.0 + std::exp(-gs)) * us);
             }
             for (int64_t r = 0; r < H; ++r) {
                 double s = 0;
                 for (int64_t i = 0; i < FF; ++i) s += (double) D[r * FF + i] * h[i];
-                ref[(size_t) S.h_dst[e] * H + r] = (float) s;
+                ref[(size_t) S.h_dst[e] * H + r] = (float) (s * sd);
             }
         }
     }
@@ -623,7 +661,7 @@ void kq_bench(dpct::queue_ptr s, std::mt19937& rng, int nl, bool host) {
 #ifdef STRATA_Q6K_EXPERTS
                             {14, 8},
 #endif
-                            {8, 8}};
+                            {8, 8}, {40, 40}, {40, 8}, {12, 40}};
     std::vector<int> w1(10, 1), w2(12, 1), w4(16, 1);
     w2.insert(w2.end(), 4, 2);                                  // 16 groups, 20 entries
     w4.insert(w4.end(), 12, 2);                                 // 28 groups, 40 entries
@@ -733,10 +771,64 @@ int main(int argc, char** argv) {
         dpct::get_current_device().destroy_queue(s);
         return g_fail ? 1 : 0;
     }
+    // Verify EXP_MODE=8 (fused gate+up+SwiGLU+q8_1) against EXP_MODE=0, including NVFP4 tails and had_block>0 bypass.
+    auto check_mode8 = [&](int gu, int dt, int64_t H, int64_t FF) {
+        Setup S(gu, dt, H, FF, 4, 8, 12, rng, s);
+        int bad = 0;
+        double max_rel = 0.0;
+        size_t bit_diffs = 0;
+        for (int ng : {1, 2, 5, 8}) {
+            S.plan(ng, 0, rng);
+            k::native_expert_set_mode(0, 0);
+            const auto r0 = S.result(false, 0, 0x7F, s);
+            k::native_expert_set_mode(8, 0);
+            const auto r8 = S.result(false, 0, 0x7F, s);
+            k::native_expert_set_mode(0, 0);
+            double emax = 0, amax = 0;
+            for (size_t i = 0; i < r0.size(); ++i) {
+                uint32_t u0, u8;
+                std::memcpy(&u0, &r0[i], 4);
+                std::memcpy(&u8, &r8[i], 4);
+                if (std::isnan(r0[i]) && std::isnan(r8[i])) continue;
+                if (u0 != u8) ++bit_diffs;
+                if (!std::isfinite(r8[i])) { ++bad; break; }
+                emax = std::max(emax, (double) std::fabs(r0[i] - r8[i]));
+                amax = std::max(amax, (double) std::fabs(r0[i]));
+            }
+            const double rel = amax > 0 ? emax / amax : 0.0;
+            max_rel = std::max(max_rel, rel);
+            if (!(rel < 1e-5)) ++bad;
+        }
+        // Hadamard bypass check: with had_block > 0, mode 8 must take the unfused Hadamard path and match mode 0 bitwise
+        {
+            std::vector<float> signs((size_t) FF, 1.0f);
+            for (int64_t i = 0; i < FF; ++i) signs[(size_t) i] = (i & 1) ? -1.0f : 1.0f;
+            float* d_signs = dalloc<float>((size_t) FF);
+            dpct::get_in_order_queue().memcpy(d_signs, signs.data(), (size_t) FF * 4).wait();
+            S.L.had_block = 32;
+            S.L.d_signs = d_signs;
+            S.plan(3, 0, rng);
+            k::native_expert_set_mode(0, 0);
+            const auto r0 = S.result(false, 0, 0x7F, s);
+            k::native_expert_set_mode(8, 0);
+            const auto r8 = S.result(false, 0, 0x7F, s);
+            k::native_expert_set_mode(0, 0);
+            S.L.had_block = 0;
+            S.L.d_signs = nullptr;
+            sycl::free(d_signs, dpct::get_in_order_queue());
+            if (std::memcmp(r0.data(), r8.data(), r0.size() * 4) != 0) ++bad;
+        }
+        std::printf("mode8 %-6s/%-6s %5lld x %4lld: %s (bit_diffs %zu, max_rel %.2e)\n",
+                    name_of(gu), name_of(dt), (long long) H, (long long) FF, bad ? "FAIL" : "OK", bit_diffs, max_rel);
+        g_fail += bad;
+    };
     if (argc > 1 && std::string(argv[1]) == "--kq") {   // the K-quant split and the CPU reference only
-        const int pairs[][2] = {{12, 7}, {12, 8}, {13, 8}, {14, 8}, {8, 8}, {13, 7}};
+        const int pairs[][2] = {{12, 7}, {12, 8}, {13, 8}, {14, 8}, {8, 8}, {13, 7}, {40, 40}, {40, 8}, {12, 40}};
         for (const auto& pr : pairs) check_kq(pr[0], pr[1], 2560, 640, s, rng);   // the model's shapes
         for (const auto& pr : pairs) check_kq(pr[0], pr[1], 512, 256, s, rng);
+        for (const auto& pr : pairs) check_mode8(pr[0], pr[1], 2560, 640);
+        check_mode8(23, 20, 2560, 640);
+        check_mode8(18, 42, 2560, 640);
         std::printf("native_grouped_parity --kq: %d failures\n", g_fail);
         dpct::get_current_device().destroy_queue(s);
         return g_fail ? 1 : 0;
@@ -745,8 +837,14 @@ int main(int argc, char** argv) {
 #ifdef STRATA_Q6K_EXPERTS
                    14,
 #endif
-                   8})        // STRATA_GU_FMTS
-        for (int dt : {20, 23, 42, 7, 8, 6, 13}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS (6 = Q5_0: UD-IQ4_XS / Q3_K_XL); IQ4_XS: n_ff % 256
+                   8, 40})        // STRATA_GU_FMTS
+        for (int dt : {20, 23, 42, 7, 8, 6, 13, 40}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS (6 = Q5_0: UD-IQ4_XS / Q3_K_XL); IQ4_XS: n_ff % 256
+    for (const auto& pr : std::vector<std::pair<int, int>>{{40, 40}, {40, 8}, {12, 40}, {12, 8}, {13, 8},
+#ifdef STRATA_Q6K_EXPERTS
+                                                           {14, 8},
+#endif
+                                                           {8, 8}, {23, 20}, {18, 42}})
+        check_mode8(pr.first, pr.second, 2560, 640);
     kq_down();                                                          // Q4-KQ: Q5_K / Q6_K downs at widths 512 and 1024
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     // round 0214: every expert type pair of the new Unsloth Qwen3.8-Flash-Next sets at the model's 2560 x 640
