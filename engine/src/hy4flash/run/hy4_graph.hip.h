@@ -17,6 +17,7 @@
 #include "hy4_cpu_experts.h"
 #include "hy4_engram.h"
 #include "hy4_gpu_model.hip.h"
+#include "strata/core/volta_forever.hpp"
 #include "hy4_indexer.hip.h"
 #include "hy4_kernels.hip.h"
 #include "hy4_vision.hip.h"  // HY4-VISION hook: image rows + 3D rope (all hooks below are no-ops while Runner::vis is null)
@@ -1448,7 +1449,16 @@ public:
         tune_init();
 #if HY4_CUDA
         skd::cublas_pf().ensure(st);
-        cuda_graph_on = getenv("HY4_CUDA_GRAPH") ? atoi(getenv("HY4_CUDA_GRAPH")) != 0 : true;
+        {
+            hipDeviceProp_t dp_cg{};
+            (void)hipGetDeviceProperties(&dp_cg, m.primary_gpu);
+            const bool vf_block = !strata::core::allow_1024_thread_cuda_graphs(
+                dp_cg.major, dp_cg.minor, strata::core::volta_forever_active());
+            cuda_graph_on = getenv("HY4_CUDA_GRAPH") ? atoi(getenv("HY4_CUDA_GRAPH")) != 0 : !vf_block;
+            if (vf_block && !cuda_graph_on) {
+                fprintf(stderr, "[runner] sm_70 under volta-forever: disabling 1024-thread CUDA Graph capture by default (HY4_CUDA_GRAPH=1 overrides)\n");
+            }
+        }
         HCK(hipHostMalloc((void**)&h_step, sizeof(DevStepArgs), hipHostMallocDefault));
         d_step = dalloc<DevStepArgs>(1);
         HCK(hipHostMalloc((void**)&h_ids, 64, hipHostMallocDefault));

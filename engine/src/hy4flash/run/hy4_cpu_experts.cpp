@@ -13,6 +13,8 @@
 #include <thread>
 
 #include "hy4_io.h"
+#include "strata/platform/cgroup_mem.hpp"
+#include "strata/platform/direct_file.hpp"
 #include "strata/quant/sk_codecs.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -1597,6 +1599,7 @@ struct ColdStore {
 #endif
     int io_mode = 0;  // 0 = direct (O_DIRECT / FILE_FLAG_NO_BUFFERING), 1 = buffered (page cache kept: "warm cache" runs), 2 = buffered + POSIX_FADV_DONTNEED
     size_t slot_bytes = 0;
+    size_t sector_align = 4096;
     int nslots = 0;
     uint8_t* mem = nullptr;
     std::vector<Slot> slots;
@@ -1631,6 +1634,17 @@ struct ColdStore {
             h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, fl, nullptr);
         }
         if (h == INVALID_HANDLE_VALUE) { e = "cannot open " + path + " for cold reads"; return false; }
+        {
+            FILE_STORAGE_INFO fsi{};
+            if (GetFileInformationByHandleEx(h, FileStorageInfo, &fsi, sizeof(fsi))) {
+                const size_t phys = fsi.PhysicalBytesPerSectorForPerformance ? (size_t)fsi.PhysicalBytesPerSectorForPerformance
+                                                                             : (size_t)fsi.LogicalBytesPerSector;
+                sector_align = strata::platform::round_up_sector_alignment(phys);
+            }
+            if (sector_align > 4096) {
+                slot_bytes = (slot_bytes + sector_align - 1u) & ~(sector_align - 1u);
+            }
+        }
         mem = (uint8_t*)VirtualAlloc(nullptr, slot_bytes * (size_t)nslots, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (!mem) { CloseHandle(h); h = INVALID_HANDLE_VALUE; e = "cannot allocate the cold-expert cache"; return false; }
 #else
@@ -2817,15 +2831,12 @@ uint64_t CpuExperts::ram_budget_bytes() {
             if (std::sscanf(line, "MemTotal: %llu kB", &kb) == 1) { total = kb * 1024ull; break; }
         std::fclose(f);
     }
-    for (const char* p : {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"}) {
-        if (std::FILE* f = std::fopen(p, "r")) {
-            char buf[64] = {0};
-            if (std::fgets(buf, sizeof(buf), f) && buf[0] >= '0' && buf[0] <= '9') {
-                const unsigned long long v = std::strtoull(buf, nullptr, 10);
-                if (v > 0 && (total == 0 || v < total)) total = v;
-            }
-            std::fclose(f);
-        }
+    const auto cg = strata::platform::cgroup_mem::probe_cgroup_room(total);
+    if (cg.limited && cg.available_bytes != strata::platform::cgroup_mem::kUnlimited) {
+        return (total == 0) ? cg.available_bytes : std::min(total, cg.available_bytes);
+    }
+    if (cg.limit_bytes != strata::platform::cgroup_mem::kUnlimited) {
+        return (total == 0) ? cg.limit_bytes : std::min(total, cg.limit_bytes);
     }
     return total;
 #endif

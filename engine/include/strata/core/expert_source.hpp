@@ -927,6 +927,10 @@ public:
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
     /// read_direct (mapped_blob answers nullptr).  Returns whether the view was closed; `why` says why not.
     bool drop_mapping(std::string& why);
+    /// Verifies unbuffered read_direct on blob (0, 0) against the mapping first, then calls drop_mapping so Windows
+    /// NTFS unbuffered reads run at full unmapped NVMe queue depth (10.4 GB/s vs 3.4 GB/s) during GPU cache + RAM load.
+    bool drop_mapping_verified(std::string& why);
+    bool is_unmapped() const { return unmapped_; }
     /// A GPU that shares the system RAM (cudaDevAttrIntegrated: the DGX Spark's GB10) and holds every expert in its cache
     /// reads nothing from the files again, and the pages the start read from them are a second copy of the cache's bytes.
     /// CUDA counts only the RAM the kernel has free (MemFree, not the page cache it could reclaim), so with those pages
@@ -1137,6 +1141,7 @@ private:
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> pdirect_;              ///< open_prompt_direct: O_DIRECT fds for copy_blobs only
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
+    uint64_t direct_sector_ = 4096;           ///< Windows FileStorageInfo hardware sector alignment (>= 4096)
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }

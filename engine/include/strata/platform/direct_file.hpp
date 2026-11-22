@@ -20,6 +20,17 @@ struct Completion {
     bool ok = false;
 };
 
+/// Pure helper: computes a power-of-two unbuffered I/O alignment >= 4096 from Windows FileStorageInfo / Linux STATX_DIOALIGN.
+constexpr uint32_t round_up_sector_alignment(uint32_t logical_sector, uint32_t atomic_sector = 0) noexcept {
+    uint32_t need = 4096u;
+    if (logical_sector > need) need = logical_sector;
+    if (atomic_sector > need) need = atomic_sector;
+    if (need > (1u << 20)) need = (1u << 20);
+    uint32_t p2 = 4096u;
+    while (p2 < need && p2 < (1u << 20)) p2 <<= 1;
+    return p2;
+}
+
 class DirectFile {
 public:
     DirectFile();
@@ -32,6 +43,8 @@ public:
     bool is_open() const;
     uint64_t size() const;
     static constexpr uint32_t alignment() { return 4096; }
+    /// Dynamic hardware sector alignment of the open file (>= 4096; handles 8K/16K Dev Drive / ReFS / RAID volumes).
+    uint32_t sector_alignment() const;
 
     /// Queue one read. Returns false (and sets `err`) if the request could not be queued; a queued request
     /// always produces exactly one completion.

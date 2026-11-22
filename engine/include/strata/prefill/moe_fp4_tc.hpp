@@ -27,8 +27,13 @@ bool built();
 /// True when built() and the current CUDA device is compute capability 12.0 or 12.1 with runnable mxf4nvf4 kernels.
 bool available();
 
-/// True when available() and STRATA_PREFILL_NVFP4=w4a4 was requested.
+/// True when available() and STRATA_PREFILL_NVFP4=w4a4 was requested (and the loaded model provides `<stem>.input_scale` when required).
 bool wanted();
+
+/// Record whether the loaded NVFP4 model carries companion `<stem>.input_scale` tensors.
+/// When false, `wanted()` safely degrades to W4A8 instead of dispatching uncalibrated W4A4.
+void set_model_has_input_scale(bool has_scale);
+bool model_has_input_scale();
 
 /// Quantize x [rows][cols] FP32 (cols a multiple of 64) into `xa` (fused::act_bytes(rows, cols): 80 bytes per 64 values).
 void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* stream);

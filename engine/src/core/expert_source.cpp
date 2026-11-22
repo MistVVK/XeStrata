@@ -2765,6 +2765,7 @@ uint64_t FileExpertSource::expert_bytes() const {
 
 bool FileExpertSource::open_direct(std::string& why) {
 #if defined(_WIN32)
+    direct_sector_ = 4096;
     for (const std::string& path : paths_) {
         const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
         std::vector<wchar_t> w((size_t) (wide > 0 ? wide : 1), L'\0');
@@ -2777,6 +2778,14 @@ bool FileExpertSource::open_direct(std::string& why) {
             for (void* d : direct_) CloseHandle((HANDLE) d);
             direct_.clear();
             return false;
+        }
+        FILE_STORAGE_INFO fsi{};
+        if (GetFileInformationByHandleEx(h, FileStorageInfo, &fsi, sizeof(fsi))) {
+            uint64_t need = std::max<uint64_t>({4096ull, fsi.LogicalBytesPerSector, fsi.PhysicalBytesPerSectorForAtomicity});
+            if (need > (1ull << 20)) need = (1ull << 20);
+            uint64_t p2 = 4096ull;
+            while (p2 < need) p2 <<= 1;
+            direct_sector_ = std::max(direct_sector_, p2);
         }
         direct_.push_back(h);
     }
@@ -2872,6 +2881,16 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
     why = head + w;
     if (ub == !direct_.empty()) return ub;
     if (ub) return open_direct(why);
+#if defined(_WIN32)
+    // If drop_mapping_verified closed the view early so startup fills ran at unmapped NVMe speed, remap before closing direct_.
+    if (unmapped_) {
+        std::string remap_why;
+        if (!map_view(remap_why)) {
+            why += " (stays unbuffered: " + remap_why + ")";
+            return true;
+        }
+    }
+#endif
     // through the file cache after all: the mapped reads take over (staged() stays true for the GGUF in place)
     for (void* d : direct_) close_direct(d);
     direct_.clear();
@@ -2973,32 +2992,82 @@ uint64_t FileExpertSource::drop_cached_pages(const std::function<bool(int64_t, i
 #endif
 }
 
+bool FileExpertSource::drop_mapping_verified(std::string& why) {
+#if defined(_WIN32)
+    if (direct_.empty()) { why = "the reads are not unbuffered"; return false; }
+    if (unmapped_) { why = "already closed"; return true; }
+    if (layer_blob_bytes_.empty() || n_layers_ <= 0 || n_expert_ <= 0) return drop_mapping(why);
+    std::vector<uint8_t> ref((size_t) layer_blob_bytes_[0]);
+    if (!role_ptr_.empty()) {
+        uint64_t at = 0;
+        for (int r = 0; r < 3; ++r) {
+            const size_t i = (size_t) r;
+            const uint64_t per = role_bytes_[i];
+            std::memcpy(ref.data() + at, role_ptr_[i], (size_t) per);
+            at += per;
+        }
+    } else {
+        const uint8_t* m = mapped_blob(0, 0);
+        if (m == nullptr) { why = "the first blob is not mapped"; return false; }
+        std::memcpy(ref.data(), m, ref.size());
+    }
+    std::vector<uint8_t> probe(ref.size());
+    const Fill f{0, 0, 0, probe.data()};
+    if (!read_direct(&f, 1) || std::memcmp(probe.data(), ref.data(), ref.size()) != 0) {
+        why = "unbuffered probe of blob (0, 0) failed or differed; keeping mapped fallback";
+        return false;
+    }
+    return drop_mapping(why);
+#else
+    return drop_mapping(why);
+#endif
+}
+
 bool FileExpertSource::begin_startup_unbuffered(std::string& why) {
 #if defined(_WIN32)
     if (const char* v = std::getenv("STRATA_STARTUP_UNBUFFERED"); v != nullptr && v[0] != '\0' && std::atoi(v) == 0) {
         why = "STRATA_STARTUP_UNBUFFERED=0";
         return false;
     }
-    if (base_ == nullptr || unmapped_ || startup_ub_ || !role_ptr_.empty() || !maps_.empty() || paths_.size() != 1 ||
-        layer_blob_bytes_.empty()) {
-        why = "experts.bin only";
+    if (base_ == nullptr || unmapped_ || startup_ub_ || paths_.empty() || layer_blob_bytes_.empty()) {
+        why = "not open or already unmapped";
         return false;
     }
     if (!direct_.empty()) { why = "the file tier reads unbuffered already"; return false; }
     const auto t0 = std::chrono::steady_clock::now();
-    const uint8_t* m = mapped_blob(0, 0);   // the first blob as the mapping reads it, for the check below
-    if (m == nullptr) { why = "the first blob is not mapped"; return false; }
-    const std::vector<uint8_t> ref(m, m + (size_t) layer_blob_bytes_[0]);
+    std::vector<uint8_t> ref((size_t) layer_blob_bytes_[0]);
+    if (!role_ptr_.empty()) {
+        uint64_t at = 0;
+        for (int r = 0; r < 3; ++r) {
+            const size_t i = (size_t) r;
+            const uint64_t per = role_bytes_[i];
+            std::memcpy(ref.data() + at, role_ptr_[i], (size_t) per);
+            at += per;
+        }
+    } else {
+        const uint8_t* m = mapped_blob(0, 0);   // the first blob as the mapping reads it, for the check below
+        if (m == nullptr) { why = "the first blob is not mapped"; return false; }
+        std::memcpy(ref.data(), m, ref.size());
+    }
     // NTFS runs the unbuffered reads of a file one at a time while it is mapped or open buffered (drop_mapping), so
-    // the view, the section and the handle all go.  The first unbuffered open with no buffered handle left purges the
-    // file's cached pages: 1.2-2.5 s after a mapped start had left IQ2_XS's 33 GiB experts.bin on the standby list,
-    // 3 ms after an unbuffered start.  A buffered handle held open instead keeps the cache and serializes the reads
-    UnmapViewOfFile((LPCVOID) base_);
+    // the view(s), the section(s) and the handle(s) all go (both experts.bin and GGUF shards in place).
+    if (!maps_.empty()) {
+        for (Map& m : maps_) {
+            if (!m.closed && m.base != nullptr) UnmapViewOfFile((LPCVOID) m.base);
+            m.closed = true;   // m.base stays for offset arithmetic until map_view remaps
+            if (m.mapping != nullptr) CloseHandle((HANDLE) m.mapping);
+            m.mapping = nullptr;
+            if (m.file != nullptr) CloseHandle((HANDLE) m.file);
+            m.file = nullptr;
+        }
+    } else {
+        UnmapViewOfFile((LPCVOID) base_);
+        if (mapping_ != nullptr) CloseHandle((HANDLE) mapping_);
+        mapping_ = nullptr;
+        if (file_ != nullptr) CloseHandle((HANDLE) file_);
+        file_ = nullptr;
+    }
     unmapped_ = true;
-    if (mapping_ != nullptr) CloseHandle((HANDLE) mapping_);
-    mapping_ = nullptr;
-    if (file_ != nullptr) CloseHandle((HANDLE) file_);
-    file_ = nullptr;
     std::string fail;
     if (open_direct(fail)) {
         // the first blob both ways: a drive that does not read it unbuffered keeps the mapped copy
@@ -3057,6 +3126,45 @@ bool FileExpertSource::end_startup_unbuffered(std::string& why) {
 
 bool FileExpertSource::map_view(std::string& why) {
 #if defined(_WIN32)
+    if (!maps_.empty()) {
+        for (size_t fi = 0; fi < maps_.size(); ++fi) {
+            Map& gm = maps_[fi];
+            if (!gm.closed) continue;
+            const std::string& path = paths_[fi];
+            const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+            std::vector<wchar_t> wpath((size_t) (wide > 0 ? wide : 1), L'\0');
+            if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wide);
+            HANDLE f = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+            LARGE_INTEGER sz{};
+            const bool same = f != INVALID_HANDLE_VALUE && GetFileSizeEx(f, &sz) && (uint64_t) sz.QuadPart == gm.bytes;
+            HANDLE m = same ? CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
+            void* view = m != nullptr ? MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0) : nullptr;
+            if (view == nullptr) {
+                why = f != INVALID_HANDLE_VALUE && !same
+                          ? (path + " changed size since it was opened")
+                          : (path + " could not be mapped again (error " +
+                             std::to_string((unsigned long long) GetLastError()) + ")");
+                if (m != nullptr) CloseHandle(m);
+                if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+                return false;
+            }
+            const uint8_t* new_base = (const uint8_t*) view;
+            for (size_t i = 0; i < role_file_.size(); ++i) {
+                if ((size_t) role_file_[i] == fi) {
+                    const uint64_t off = (uint64_t) (role_ptr_[i] - gm.base);
+                    role_ptr_[i] = new_base + off;
+                }
+            }
+            gm.base = new_base;
+            gm.file = f;
+            gm.mapping = m;
+            gm.closed = false;
+        }
+        base_ = maps_.front().base;
+        unmapped_ = false;
+        return true;
+    }
     // open's mapping of experts.bin, again
     const std::string& path = paths_.front();
     const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
@@ -3093,7 +3201,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
     // queue depth 48 make 10.4 GB/s on a file nobody maps and 3.4 GB/s on a mapped one, 8 MiB reads 8.6 GB/s.  So
     // windows less than kGap apart (the same role of nearby experts) are merged into requests of up to kMerge bytes.
-    constexpr uint64_t kSector = 4096, kGap = 1ull << 20, kMerge = 32ull << 20;
+    constexpr uint64_t kGap = 1ull << 20, kMerge = 32ull << 20;
+    const uint64_t kSector = direct_sector_ >= 4096 ? direct_sector_ : 4096ull;
     struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; };
     struct Req { HANDLE h; uint64_t a0, size, pos; };
     // this thread's aligned buffer and events, kept for its next batch

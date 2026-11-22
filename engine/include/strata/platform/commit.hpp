@@ -19,21 +19,73 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <psapi.h>
 
+#include <algorithm>
 #include <cwchar>
 #include <string>
 #include <vector>
+#else
+#include <algorithm>
 #endif
 
 namespace strata::platform {
 
+/// Pure helper (tested on every OS): bounds available commit when this process runs inside a Windows Job Object
+/// (`JOB_OBJECT_LIMIT_PROCESS_MEMORY` or `JOB_OBJECT_LIMIT_JOB_MEMORY`).  Windows charges discrete GPU VRAM allocations
+/// against process/job commit, so `discrete_vram_reserve` (when known) is subtracted from the remaining Job room.
+constexpr uint64_t job_commit_room_from_limits(uint64_t proc_limit, uint64_t proc_committed,
+                                               uint64_t job_limit, uint64_t job_committed,
+                                               uint64_t discrete_vram_reserve = 0) noexcept {
+    uint64_t cap = UINT64_MAX;
+    if (proc_limit > 0) {
+        const uint64_t r = proc_limit > proc_committed ? (proc_limit - proc_committed) : 0;
+        if (r < cap) cap = r;
+    }
+    if (job_limit > 0) {
+        const uint64_t used = job_committed > proc_committed ? job_committed : proc_committed;
+        const uint64_t r = job_limit > used ? (job_limit - used) : 0;
+        if (r < cap) cap = r;
+    }
+    if (cap != UINT64_MAX) {
+        cap = cap > discrete_vram_reserve ? (cap - discrete_vram_reserve) : 0;
+    }
+    return cap;
+}
+
+/// Queries the current Windows Job Object commit ceiling, or UINT64_MAX when unconstrained / off Windows.
+inline uint64_t job_commit_room_bytes(uint64_t discrete_vram_reserve = 0) noexcept {
+#if defined(_WIN32)
+    BOOL in_job = FALSE;
+    if (!IsProcessInJob(GetCurrentProcess(), nullptr, &in_job) || !in_job) return UINT64_MAX;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION ji{};
+    if (!QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &ji, sizeof(ji), nullptr)) {
+        return UINT64_MAX;
+    }
+    const DWORD flags = ji.BasicLimitInformation.LimitFlags;
+    const uint64_t proc_lim = (flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) ? (uint64_t) ji.ProcessMemoryLimit : 0;
+    const uint64_t job_lim = (flags & JOB_OBJECT_LIMIT_JOB_MEMORY) ? (uint64_t) ji.JobMemoryLimit : 0;
+    if (proc_lim == 0 && job_lim == 0) return UINT64_MAX;
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    const uint64_t proc_used = K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                                       reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))
+                                   ? (uint64_t) pmc.PrivateUsage
+                                   : 0;
+    return job_commit_room_from_limits(proc_lim, proc_used, job_lim, proc_used, discrete_vram_reserve);
+#else
+    (void) discrete_vram_reserve;
+    return UINT64_MAX;
+#endif
+}
+
 /// #5742: the commit an allocation can still get on Windows, from what is left now (ullAvailPageFile) and what the page
-/// files may still grow by (commit_growth below).  Windows grows a page file on demand up to its maximum, so a page file
-/// set to 8 GB initial and 32 GB maximum is not an 8 GB one: counting only what was left clamped --resident-budget-gib
-/// 24 to 17.42 GiB and turned the automatic conversation cache off on a 40 GB machine, where a page file set to start
-/// larger (the same maximum) did neither.  Saturates instead of wrapping.
+/// files may still grow by (commit_growth below), bounded by any enclosing Windows Job Object memory limit.
+/// Saturates instead of wrapping.
 inline uint64_t commit_available(uint64_t avail_now, uint64_t growth) {
-    return growth > UINT64_MAX - avail_now ? UINT64_MAX : avail_now + growth;
+    const uint64_t sys_avail = growth > UINT64_MAX - avail_now ? UINT64_MAX : avail_now + growth;
+    const uint64_t job_avail = job_commit_room_bytes();
+    return sys_avail < job_avail ? sys_avail : job_avail;
 }
 
 /// The bytes Windows' page files may still grow by: a page file Windows manages (PagingFiles "?:\pagefile.sys", or a

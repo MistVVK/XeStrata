@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include "strata/platform/cgroup_mem.hpp"
 
 #define INK_CK(call)                                                                                                  \
     do {                                                                                                              \
@@ -92,6 +93,10 @@ inline cudaError_t ink_cuda_mem_info(size_t* vfree, size_t* vtot, int dev = -1) 
                 unsigned long long kb = 0;
                 if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
                     size_t avail = (size_t)kb * 1024ull;
+                    const auto cg = strata::platform::cgroup_mem::probe_cgroup_room((uint64_t)*vtot);
+                    if (cg.limited && cg.available_bytes != strata::platform::cgroup_mem::kUnlimited) {
+                        avail = std::min<size_t>(avail, (size_t)cg.available_bytes);
+                    }
                     if (avail > *vfree) *vfree = std::min(avail, *vtot);
                     break;
                 }

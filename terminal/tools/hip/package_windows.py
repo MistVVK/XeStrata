@@ -146,10 +146,19 @@ def main() -> int:
                 shutil.copytree(f, lib / f.name)
             else:
                 shutil.copy2(f, lib / f.name)
-    for arch in archs:
-        src = rbin / "hipblaslt" / "library" / arch
-        if src.is_dir():                                  # hipBLASLt has no RDNA2 (gfx1030) kernels
-            shutil.copytree(src, stage / "rocm" / "bin" / "hipblaslt" / "library" / arch)
+    lt_src = rbin / "hipblaslt" / "library"
+    if lt_src.is_dir():
+        lt_dst = stage / "rocm" / "bin" / "hipblaslt" / "library"
+        for f in lt_src.iterdir():
+            if f.is_dir():
+                if f.name in archs:                       # hipBLASLt has no RDNA2 (gfx1030) kernels
+                    shutil.copytree(f, lt_dst / f.name)
+            else:
+                # ROCm 10.2+ hipBLASLt 1.5.0 places TensileLite master manifests / hipblasltExtOpLibrary.dat at library/ root
+                m = re.search(r"gfx[0-9a-f]+", f.name)
+                if m is None or m.group() in archs:
+                    lt_dst.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(f, lt_dst / f.name)
     kp = stage / "rocm" / ".kpack"
     kp.mkdir()
     kpack_src = a.rocm / ".kpack"

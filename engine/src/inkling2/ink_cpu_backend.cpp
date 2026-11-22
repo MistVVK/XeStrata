@@ -7,6 +7,7 @@
 #include "ink_backend.h"
 #include "ink_vision.h"
 #include "strata/inkling2/inkling2_loop.hpp"
+#include "strata/platform/cgroup_mem.hpp"
 #include "strata/quant/sk_codecs.hpp"
 
 #include <algorithm>
@@ -212,12 +213,19 @@ public:
             }
         }
 
-        // 3. Load Section 4 experts into RAM in 3x loop-weighted vram_load_order priority (respecting --ram-experts-gb)
+        // 3. Load Section 4 experts into RAM in 3x loop-weighted vram_load_order priority (respecting --ram-experts-gb and cgroup ceiling)
         const auto& dir = model.expert_directory();
         expert_bodies_.resize(dir.size());
-        const size_t ram_cap_bytes = (opts.ram_experts_gb > 0.0)
-            ? static_cast<size_t>(opts.ram_experts_gb * 1073741824.0)
+        size_t ram_cap_bytes = (opts.ram_experts_gb > 0.0)
+            ? static_cast<size_t>(strata::platform::cgroup_mem::gib_to_bytes(opts.ram_experts_gb))
             : static_cast<size_t>(-1);
+        const auto cg = strata::platform::cgroup_mem::probe_cgroup_room();
+        if (cg.has_limit && cg.effective_available_bytes > 0) {
+            const uint64_t reserve = std::min<uint64_t>(cg.effective_available_bytes / 8, 2ULL << 30);
+            const size_t cg_cap = static_cast<size_t>(
+                cg.effective_available_bytes > reserve ? cg.effective_available_bytes - reserve : 0);
+            if (ram_cap_bytes > cg_cap) ram_cap_bytes = cg_cap;
+        }
         size_t loaded_bytes = 0;
         for (uint16_t idx : model.vram_load_order) {
             if (idx >= dir.size()) continue;

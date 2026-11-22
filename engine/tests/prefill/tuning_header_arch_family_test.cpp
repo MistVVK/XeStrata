@@ -89,6 +89,10 @@ int main() {
         // The pair a five-character prefix match would wrongly group: both are "gfx10", neither is a sibling.
         {"gfx1010", 100202, "gfx1030", 100202, false, "RDNA1 table on RDNA2: a shared prefix is not a family"},
         {"gfx1030", 100202, "gfx1010", 100202, false, "RDNA2 table on RDNA1, symmetric direction"},
+        // RDNA3.5 siblings (gfx1150 / gfx1151 / gfx1152 / gfx1153) share the family rule, distinct from RDNA3 (gfx1100..1102).
+        {"gfx1151", 100500, "gfx1150", 100500, true, "RDNA3.5 sibling: Strix Halo table on Strix Point"},
+        {"gfx1151", 100500, "gfx1153", 100500, true, "RDNA3.5 sibling: Strix Halo table on Ryzen AI 400 (gfx1153)"},
+        {"gfx1100", 100500, "gfx1151", 100500, false, "RDNA3 discrete table rejected on RDNA3.5 APU"},
     };
     int failures = 0;
     for (const auto& c : cases) {
@@ -100,6 +104,30 @@ int main() {
         std::printf("%s %s/%d vs %s/%d rows=%zu  %s\n", good ? "ok  " : "FAIL", c.file_arch, c.file_version,
                     c.runtime_arch, c.runtime_version, rows, c.why);
         if (!ok) std::printf("      err: %s\n", err.c_str());
+    }
+    // V2 kernel-name tuning format (ROCm 10.2.0 hipBLASLt >= 100500): portable across >= 100500, rejected on < 100500.
+    {
+        const fs::path v2_path = dir.path / "v2-gfx1201-100500.txt";
+        {
+            std::ofstream out(v2_path);
+            out << "STRATA_HIPBLASLT_TUNING_V2 gfx1201 100500\n"
+                << "bf16 128 2560 128 4096 73754 Cijk_Ailk_Bljk_BBS_BH_MT128x128x32\n";
+        }
+        TuningTable t_ok, t_old;
+        std::string err;
+        if (!t_ok.load(v2_path.string(), "gfx1200", 100600, err) || t_ok.format_version() != 2 ||
+            t_ok.rows().size() != 1 || t_ok.rows()[0].kernel_name != "Cijk_Ailk_Bljk_BBS_BH_MT128x128x32") {
+            ++failures;
+            std::printf("FAIL V2 cross-version >= 100500 rejected: %s\n", err.c_str());
+        } else {
+            std::printf("ok   V2 gfx1201/100500 loaded on gfx1200/100600 with kernel_name\n");
+        }
+        if (t_old.load(v2_path.string(), "gfx1201", 100401, err)) {
+            ++failures;
+            std::printf("FAIL V2 table erroneously accepted on pre-10.2 hipBLASLt 100401\n");
+        } else {
+            std::printf("ok   V2 gfx1201/100500 rejected on pre-10.2 hipBLASLt 100401 (%s)\n", err.c_str());
+        }
     }
     const int total = int(sizeof(cases) / sizeof(cases[0]));
     std::printf("tuning_header_arch_family_test: %d cases, %d failures\n", total, failures);

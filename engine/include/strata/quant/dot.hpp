@@ -15,8 +15,21 @@ namespace strata::quant {
 /// activation type's: 32 for the 32-element formats, 256 for Q8_K).  The activation format is `TypeInfo::act` of the weight type.
 using DotFn = void (*)(int n, float* s, const void* w, const void* a);
 
+/// 4-row shared-activation dot: computes out[r] = dot(w_base + r * row_bytes, a) for r in 0..3 with bit-exact Arith::Avx2 sums,
+/// amortizing activation loads and bias sums 4x via AVX-512 VNNI VPDPBUSD.
+using DotX4Fn = void (*)(int n, float out[4], const void* w_base, size_t row_bytes, const void* a);
+
 struct DotKernel {
     DotFn fn = nullptr;
+    Type weight = Type::F32;
+    Type act = Type::Q8_0;
+    Arith arith = Arith::Generic;
+    Isa isa = Isa::Scalar;
+    const char* name = "";
+};
+
+struct DotX4Kernel {
+    DotX4Fn fn = nullptr;
     Type weight = Type::F32;
     Type act = Type::Q8_0;
     Arith arith = Arith::Generic;
@@ -27,6 +40,10 @@ struct DotKernel {
 /// The best kernel of contract `a` for weight type `w` that runs on a CPU of level `max_isa` (the second form: this CPU), or nullptr.
 const DotKernel* dot_kernel(Type w, Arith a, Isa max_isa) noexcept;
 const DotKernel* dot_kernel(Type w, Arith a) noexcept;
+
+/// Best 4-row shared-activation kernel of contract `a` for weight type `w`, or nullptr if unavailable on this CPU.
+const DotX4Kernel* dot_x4_kernel(Type w, Arith a, Isa max_isa) noexcept;
+const DotX4Kernel* dot_x4_kernel(Type w, Arith a) noexcept;
 
 /// Every kernel the layer has for (w, a), best first, whether or not this CPU can run it (tests, benches, the oracle tool).
 int dot_kernels(Type w, Arith a, const DotKernel** out, int cap) noexcept;

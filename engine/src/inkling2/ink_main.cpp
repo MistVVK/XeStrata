@@ -17,6 +17,10 @@
 #include "ink_manifest.h"
 #include "ink_serve.h"
 #include "ink_vision.h"
+#include "strata/core/volta_forever.hpp"
+#if defined(__linux__) && defined(INKLING_ENABLE_HIP)
+#include "strata/platform/numa_balancing.hpp"
+#endif
 
 using namespace ink2;
 
@@ -339,6 +343,16 @@ static int cmd_dump_ref(const std::string& model_path, const std::string& out_pa
 }
 
 int main(int argc, char** argv) {
+#if defined(__linux__) && defined(INKLING_ENABLE_HIP)
+    if (const std::string nb = strata::platform::numa_balancing::keep_scanner_off(); !nb.empty()) {
+        std::fprintf(stderr, "%s\n", nb.c_str());
+    }
+#endif
+#if defined(INKLING_ENABLE_CUDA) || defined(INKLING_ENABLE_EP_CUDA)
+    if (strata::core::apply_default_cuda_module_loading()) {
+        std::fprintf(stderr, "[inkling] volta-forever detected: setting CUDA_MODULE_LOADING=LAZY\n");
+    }
+#endif
     ServeConfig cfg;
     cfg.version = INKLING_VERSION;
     bool mode_serve = false, mode_bench = false, mode_selfcheck = false, mode_info = false, mode_export = false;

@@ -524,13 +524,32 @@ const DevState& dev_state() {
 
 }  // namespace
 
+namespace {
+bool g_model_has_input_scale = true;
+}
+
 bool built() { return true; }
 
 bool available() { return dev_state().ok; }
 
+void set_model_has_input_scale(bool has_scale) { g_model_has_input_scale = has_scale; }
+
+bool model_has_input_scale() { return g_model_has_input_scale; }
+
 bool wanted() {
     if (!available()) return false;
-    static const Nvfp4PrefillPath p = resolve_nvfp4_prefill_path(std::getenv("STRATA_PREFILL_NVFP4"), true, false);
+    bool degraded = false;
+    const Nvfp4PrefillPath p =
+        resolve_nvfp4_prefill_path(std::getenv("STRATA_PREFILL_NVFP4"), true, false, &degraded, g_model_has_input_scale);
+    if (degraded && !g_model_has_input_scale) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                         "strata: STRATA_PREFILL_NVFP4=w4a4 requested, but model lacks <stem>.input_scale; "
+                         "degrading to lossless W4A8 prefill.\n");
+        }
+    }
     return p == Nvfp4PrefillPath::FusedW4A4;
 }
 

@@ -46,6 +46,7 @@
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 #include "hipblaslt_tuning.hpp"
+#include <filesystem>
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -300,7 +301,8 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
 
     auto state = std::make_unique<HipLtState>();
     state->workspace = workspace;
-    state->workspace_bytes = workspace_bytes;
+    // ROCm 10.2.0 Known Issue: hipBLASLt 1.5.0 workspace sizes > UINT32_MAX trigger 32-bit internal overflow / UB.
+    state->workspace_bytes = std::min<size_t>(workspace_bytes, static_cast<size_t>(UINT32_MAX));
     if (hipblasLtCreate(&state->handle) != HIPBLAS_STATUS_SUCCESS) {
         std::fprintf(stderr, "prefill gemm: hipBLASLt handle creation failed; using hipBLASEx\n");
         return nullptr;
@@ -332,8 +334,31 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
         if (dir.empty()) return nullptr;
         path_own = dir + arch + "-hipblaslt-" + std::to_string(version) + ".txt";
         std::FILE* f = std::fopen(path_own.c_str(), "rb");
-        if (f == nullptr) return nullptr;       // no table for this card and hipBLASLt version beside the engine: plain hipBLAS as before
-        std::fclose(f);
+        if (f != nullptr) {
+            std::fclose(f);
+        } else {
+            // ROCm 10.2+ (hipBLASLt >= 100500): allow a V2 kernel-name table calibrated on >= 100500 when no exact version file exists.
+            path_own.clear();
+            int best_v = -1;
+            const std::string prefix = arch + "-hipblaslt-";
+            std::error_code ec;
+            if (version >= 100500) {
+                for (const auto& ent : std::filesystem::directory_iterator(dir, ec)) {
+                    if (!ent.is_regular_file(ec)) continue;
+                    const std::string nm = ent.path().filename().string();
+                    if (nm.rfind(prefix, 0) != 0 || nm.size() <= prefix.size() + 4 || nm.substr(nm.size() - 4) != ".txt") continue;
+                    const int fv = std::atoi(nm.c_str() + prefix.size());
+                    if (fv < 100500 || fv <= best_v) continue;
+                    strata::prefill::hipblaslt::TuningTable probe;
+                    std::string perr;
+                    if (probe.load(ent.path().string(), arch, version, perr) && probe.format_version() == 2) {
+                        best_v = fv;
+                        path_own = ent.path().string();
+                    }
+                }
+            }
+            if (path_own.empty()) return nullptr;
+        }
         path = path_own.c_str();
     }
     std::string error;
@@ -374,7 +399,7 @@ HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipbl
 
     std::vector<int> solution_ids{row->solution_id};
     std::vector<hipblasLtMatmulHeuristicResult_t> candidates;
-    if (hipblaslt_ext::getAlgosFromIndex(state.handle, solution_ids, candidates) != HIPBLAS_STATUS_SUCCESS ||
+        if (hipblaslt_ext::getAlgosFromIndex(state.handle, solution_ids, candidates) != HIPBLAS_STATUS_SUCCESS ||
         candidates.empty() || candidates.front().state != HIPBLAS_STATUS_SUCCESS ||
         hipblaslt_ext::getIndexFromAlgo(candidates.front().algo) != row->solution_id) {
         if (verbose) {
@@ -384,9 +409,22 @@ HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipbl
         return state.cache.emplace(key, resolved).first->second;
     }
 
+    auto algo = candidates.front().algo;
+#if defined(HIPBLASLT_VERSION_MAJOR) && (HIPBLASLT_VERSION_MAJOR * 100000 + HIPBLASLT_VERSION_MINOR * 100 + HIPBLASLT_VERSION_PATCH >= 100500)
+    if (!row->kernel_name.empty()) {
+        const std::string actual_name = hipblaslt_ext::getAlgoName(algo);
+        if (!actual_name.empty() && actual_name != row->kernel_name) {
+            if (verbose) {
+                std::fprintf(stderr, "prefill gemm: Lt fallback; solution %d kernel '%s' != V2 expected '%s'\n",
+                             row->solution_id, actual_name.c_str(), row->kernel_name.c_str());
+            }
+            return state.cache.emplace(key, resolved).first->second;
+        }
+    }
+#endif
+
     const float alpha = 1.0f;
     size_t required_workspace = 0;
-    auto algo = candidates.front().algo;
     if (hipblaslt_ext::matmulIsAlgoSupported(state.handle, desc.op, &alpha, desc.a, desc.b, &beta, desc.c, desc.c,
                                              algo, required_workspace) != HIPBLAS_STATUS_SUCCESS) {
         if (verbose) {

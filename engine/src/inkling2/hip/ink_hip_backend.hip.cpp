@@ -19,7 +19,11 @@
 #include "ink_hip_hybrid.hpp"
 #include "strata/hip_uma_guard.hpp"
 #include "strata/inkling2/inkling2_loop.hpp"
+#include "strata/platform/cgroup_mem.hpp"
 #include "strata/quant/sk_codecs.hpp"
+#if defined(__linux__)
+#include "strata/platform/numa_balancing.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -462,6 +466,11 @@ public:
 
     bool init(const InkModelFile& model, const BackendOpts& opts, std::string& err) override {
         cleanup();
+#if defined(__linux__)
+        if (const std::string nb = strata::platform::numa_balancing::keep_scanner_off(); !nb.empty()) {
+            std::fprintf(stderr, "%s\n", nb.c_str());
+        }
+#endif
         model_ = &model;
         opts_ = opts;
         c_ = model.m.c;
@@ -471,6 +480,21 @@ public:
         if (!hip_ok(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "hipStreamCreate", err)) return false;
 
         mem_info_ = query_device_memory(opts.gpu_index);
+#if defined(__linux__)
+        if (mem_info_.is_uma) {
+            if (std::FILE* osf = std::fopen("/proc/sys/kernel/osrelease", "r")) {
+                char osrel[256] = {0};
+                if (std::fgets(osrel, sizeof(osrel), osf) &&
+                    (std::strstr(osrel, "microsoft") || std::strstr(osrel, "Microsoft") || std::strstr(osrel, "WSL"))) {
+                    std::fprintf(stderr,
+                                 "[ink-hip] WARNING: WSL2 on integrated Ryzen APU (%s) hits ROCm 10.2 #10097 aperture faults; "
+                                 "use native Windows HIP or bounded bounce buffers\n",
+                                 mem_info_.arch_name);
+                }
+                std::fclose(osf);
+            }
+        }
+#endif
         guard_ = compute_dispatch_guard(mem_info_.arch_name, mem_info_.cu_count, mem_info_.is_uma,
 #if defined(_WIN32)
                                         true
@@ -764,9 +788,18 @@ public:
         size_t arena_bytes = 0;
         std::vector<uint16_t> gpu_plan;
         std::vector<uint16_t> ram_plan;
-        const size_t ram_cap = (opts.ram_experts_gb > 0.0)
-            ? static_cast<size_t>(opts.ram_experts_gb * 1073741824.0)
+        size_t ram_cap = (opts.ram_experts_gb > 0.0)
+            ? static_cast<size_t>(strata::platform::cgroup_mem::gib_to_bytes(opts.ram_experts_gb))
             : static_cast<size_t>(-1);
+        {
+            const auto cg = strata::platform::cgroup_mem::probe_cgroup_room();
+            if (cg.has_limit && cg.effective_available_bytes > 0) {
+                const uint64_t reserve = std::min<uint64_t>(cg.effective_available_bytes / 8, 2ULL << 30);
+                const size_t cg_cap = static_cast<size_t>(
+                    cg.effective_available_bytes > reserve ? cg.effective_available_bytes - reserve : 0);
+                if (ram_cap > cg_cap) ram_cap = cg_cap;
+            }
+        }
         size_t ram_bytes = 0;
 
         for (uint16_t idx : model.vram_load_order) {

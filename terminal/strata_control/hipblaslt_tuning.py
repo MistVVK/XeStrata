@@ -37,6 +37,8 @@ AUTO_ARCHS = ("gfx1151", "gfx1150", "gfx1103")
 ENGINE_VAR = "STRATA_HIPBLASLT_TUNING"       # what the engine reads: the path of one table
 TABLE_DIR = "tuning"                         # inside an engine package
 HEADER = "STRATA_HIPBLASLT_TUNING_V1"
+HEADER_V2 = "STRATA_HIPBLASLT_TUNING_V2"
+MIN_V2_VERSION = 100500                      # ROCm 10.2.0 (hipBLASLt 1.5.0): getAlgoName() kernel names are stable across >= 100500
 OFF_WORDS = ("off", "0", "no", "false", "none", "disable", "disabled")
 ON_WORDS = ("on", "1", "yes", "true", "force", "enable", "enabled")
 _NAME = re.compile(r"^(gfx[0-9a-f]+)-hipblaslt-(\d+)\.txt$")
@@ -61,14 +63,23 @@ def version_from_header(rocm_root) -> int | None:
     return version_number(*parts)
 
 
-def header_ok(path: Path, arch: str, version: int) -> bool:
-    """The file's own second line must name the same architecture and version as its file name (the engine checks it again)."""
+def header_format_version(path: Path, arch: str, version: int) -> int | None:
+    """1 for a valid V1 header, 2 for a valid V2 header matching (arch, version), else None."""
     try:
         with open(path, encoding="utf-8") as f:
             head = [f.readline().strip(), f.readline().strip()]
     except OSError:
-        return False
-    return f"{HEADER} {arch} {version}" in head
+        return None
+    if f"{HEADER_V2} {arch} {version}" in head:
+        return 2
+    if f"{HEADER} {arch} {version}" in head:
+        return 1
+    return None
+
+
+def header_ok(path: Path, arch: str, version: int) -> bool:
+    """The file's own second line must name the same architecture and version as its file name (V1 or V2; the engine checks it again)."""
+    return header_format_version(path, arch, version) is not None
 
 
 def tables_in(folder) -> dict[tuple[str, int], Path]:
@@ -204,9 +215,16 @@ def resolve(folder, archs_present, *, environ=None, cfg: dict | None = None) -> 
     tables = tables_in(tuning)
     for arch in dict.fromkeys(archs):
         path = tables.get((arch, version))
+        file_ver = version
+        if path is None and version >= MIN_V2_VERSION:
+            v2_cands = sorted(((v, p) for (a, v), p in tables.items()
+                               if a == arch and v >= MIN_V2_VERSION and header_format_version(p, arch, v) == 2),
+                              key=lambda item: item[0], reverse=True)
+            if v2_cands:
+                file_ver, path = v2_cands[0]
         if path is None:
             continue
-        if not header_ok(path, arch, version):
+        if not header_ok(path, arch, file_ver):
             return Decision(None, f"hipBLASLt tuning table: {path.name} is not used, its header does not match its name; plain hipBLAS", "warn")
         if mode(environ, cfg) == "auto" and not (AUTO_USES_TABLE or arch in AUTO_ARCHS):
             return Decision(None, f"hipBLASLt tuning table: {path.name} is in this package and not used by default (faster prompts, but answers can differ "

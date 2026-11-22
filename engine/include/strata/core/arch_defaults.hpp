@@ -97,6 +97,18 @@ inline bool arena_skip_thp_request(const char* no_arena_thp, bool thp_always, bo
     return thp_always || igpu_rule;
 }
 
+/// ROCm 10.2.0 Known Issue (#10097): WSL2 is unsupported on integrated Ryzen APUs (gfx1103 / gfx1150..gfx1153) because
+/// dxgkrnl/WSL2 lacks KFD GTT userptr/aperture semantics; callers warn at startup to run the native Windows HIP build.
+inline bool wsl2_ryzen_apu_unsupported(const char* gcn_arch, bool integrated, const char* osrelease) {
+    if (!integrated || gcn_arch == nullptr || osrelease == nullptr) return false;
+    const bool is_wsl = std::strstr(osrelease, "microsoft") != nullptr || std::strstr(osrelease, "Microsoft") != nullptr ||
+                        std::strstr(osrelease, "WSL") != nullptr;
+    if (!is_wsl) return false;
+    return strata::kernels::gfx_arch_is(gcn_arch, "gfx1103") || strata::kernels::gfx_arch_is(gcn_arch, "gfx1150") ||
+           strata::kernels::gfx_arch_is(gcn_arch, "gfx1151") || strata::kernels::gfx_arch_is(gcn_arch, "gfx1152") ||
+           strata::kernels::gfx_arch_is(gcn_arch, "gfx1153");
+}
+
 /// The matrix-core prompt set an integrated GPU takes when `igpu_prompt_set_enabled()`: STRATA_HIP_WMMA, STRATA_PF_GEMM, STRATA_PA_FAST,
 /// STRATA_SELECT_WMMA, STRATA_HC_UPMIX, all "1".  Empty unless `integrated` (hipDeviceProp_t::integrated: the device
 /// shares the host's memory) AND the architecture is one of `igpu_prompt_defaults_arch`: a discrete card of the same

@@ -115,6 +115,8 @@ public:
                 ws_bytes_ = 0;
             }
         }
+        // ROCm 10.2.0 hipBLASLt 1.5.0: clamp workspace size to UINT32_MAX to avoid 32-bit internal offset overflow.
+        if (ws_bytes_ > static_cast<size_t>(UINT32_MAX)) ws_bytes_ = static_cast<size_t>(UINT32_MAX);
         const uint64_t max_ws = static_cast<uint64_t>(ws_bytes_);
         (void)fn_pref_set_(pref_, kPrefMaxWs, &max_ws, sizeof(max_ws));
         ready_ = true;

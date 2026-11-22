@@ -10,6 +10,10 @@ struct DotTable {
     const DotKernel* v;
     int n;
 };
+struct DotX4Table {
+    const DotX4Kernel* v;
+    int n;
+};
 struct ActTable {
     const ActKernel* v;
     int n;
@@ -24,6 +28,7 @@ DotTable avx2_dot_table() noexcept;      // x86/dot_avx2.cpp     (Arith::Avx2, I
 ActTable avx_act_table() noexcept;       // x86/act_avx.cpp
 ActTable avx2_act_table() noexcept;      // x86/act_avx2.cpp
 DotTable avx512_dot_table() noexcept;    // x86/dot_avx512.cpp   (Arith::Avx2 bits in 512-bit lanes, Isa::Avx512)
+DotX4Table avx512_dot_x4_table() noexcept; // x86/dot_avx512.cpp (4-row shared-activation VPDPBUSD kernels)
 #endif
 
 #ifdef STRATA_QUANT_ARM_TIERS

@@ -4,7 +4,7 @@
 # MIT License - Copyright (c) 2026 Niko1221 and the Strata contributors.
 
 if(NOT DEFINED STRATA_HIP_ARCHS OR "${STRATA_HIP_ARCHS}" STREQUAL "")
-  set(STRATA_HIP_ARCHS "gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1030;gfx1031;gfx1032")
+  set(STRATA_HIP_ARCHS "gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1170;gfx1171;gfx1172;gfx1250;gfx1030;gfx1031;gfx1032")
 endif()
 
 # Locate hipcc / AMD clang++ if not already configured by top-level hip_backend.cmake

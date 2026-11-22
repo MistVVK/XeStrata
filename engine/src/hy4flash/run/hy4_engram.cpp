@@ -14,6 +14,7 @@
 
 #include "hy4_json.h"
 #include "strata/artifact/strata_reader.hpp"
+#include "strata/platform/cgroup_mem.hpp"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -318,28 +319,7 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
 }
 #else
 static bool engram_in_cgroup_mem_limit() {
-    uint64_t host_bytes = 0;
-    if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
-        char line[256];
-        unsigned long long kb = 0;
-        while (std::fgets(line, sizeof(line), f))
-            if (std::sscanf(line, "MemTotal: %llu kB", &kb) == 1) { host_bytes = kb * 1024ull; break; }
-        std::fclose(f);
-    }
-    for (const char* fn : {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"}) {
-        if (std::FILE* f = std::fopen(fn, "r")) {
-            char buf[64] = {0};
-            if (std::fgets(buf, sizeof(buf), f) && buf[0] >= '0' && buf[0] <= '9') {
-                const unsigned long long v = std::strtoull(buf, nullptr, 10);
-                if (v > (1ull << 30) && v < (1ull << 50) && (host_bytes == 0 || v + (1ull << 30) < host_bytes)) {
-                    std::fclose(f);
-                    return true;
-                }
-            }
-            std::fclose(f);
-        }
-    }
-    return false;
+    return strata::platform::cgroup_mem::in_cgroup_memory_limit();
 }
 bool PageFile::open_impl(const std::string& path, std::string& err, bool direct) {
     close();

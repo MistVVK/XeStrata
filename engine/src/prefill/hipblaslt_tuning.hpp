@@ -19,6 +19,7 @@ struct TuningRow {
     int ldy = 0;
     int t_bucket = 0;
     int solution_id = -1;
+    std::string kernel_name;   ///< V2 (ROCm 10.2+ hipBLASLt >= 100500): stable getAlgoName() kernel identifier
 };
 
 class TuningTable {
@@ -31,6 +32,7 @@ public:
         }
 
         bool saw_header = false;
+        int format_v = 1;
         std::string line;
         size_t line_number = 0;
         while (std::getline(input, line)) {
@@ -44,41 +46,52 @@ public:
                 std::string arch;
                 int version = 0;
                 std::string extra;
-                if (!(row >> magic >> arch >> version) || (row >> extra) || magic != "STRATA_HIPBLASLT_TUNING_V1") {
+                if (!(row >> magic >> arch >> version) || (row >> extra) ||
+                    (magic != "STRATA_HIPBLASLT_TUNING_V1" && magic != "STRATA_HIPBLASLT_TUNING_V2")) {
                     err = "invalid tuning header at line " + std::to_string(line_number);
                     return false;
                 }
-                // A table's solution IDs are scoped to its hipBLASLt version and its architecture FAMILY:
-                // gfx1200/gfx1201 (RDNA4) share them, as gfx1100/gfx1101/gfx1102 (RDNA3) do.  A card can report
-                // its sibling - an R9700 (gfx1201) under HSA_OVERRIDE_GFX_VERSION=12.0.0 reports gfx1200 - and
-                // must still load its own calibration.  A solution ID that does not exist on the running card
-                // fails the per-solution gate in prefill/gemm.cu (getAlgosFromIndex / matmulIsAlgoSupported) and
-                // falls back to hipBLASEx, so the header gate does not need to be exact.
+                format_v = (magic == "STRATA_HIPBLASLT_TUNING_V2") ? 2 : 1;
+                // A table's solution IDs are scoped to its architecture FAMILY:
+                // gfx1200/gfx1201 (RDNA4), gfx1100/gfx1101/gfx1102 (RDNA3), and gfx1150..gfx1153 (RDNA3.5).
+                // V1 numeric solution IDs require an exact hipBLASLt version match; V2 carries getAlgoName()
+                // kernel names, which ROCm 10.2.0 (hipBLASLt 1.5.0 = 100500) guarantees stable across >= 100500.
                 const auto is_rdna4 = [](const std::string& a) { return a == "gfx1200" || a == "gfx1201"; };
                 const auto is_rdna3 = [](const std::string& a) {
                     return a == "gfx1100" || a == "gfx1101" || a == "gfx1102";
                 };
+                const auto is_rdna35 = [](const std::string& a) {
+                    return a == "gfx1150" || a == "gfx1151" || a == "gfx1152" || a == "gfx1153";
+                };
                 if (arch != expected_arch &&
                     !(is_rdna4(arch) && is_rdna4(expected_arch)) &&
-                    !(is_rdna3(arch) && is_rdna3(expected_arch))) {
+                    !(is_rdna3(arch) && is_rdna3(expected_arch)) &&
+                    !(is_rdna35(arch) && is_rdna35(expected_arch))) {
                     err = "tuning architecture mismatch: file=" + arch + " runtime=" + expected_arch;
                     return false;
                 }
-                if (version != expected_version) {
+                const bool v2_cross_ok = (format_v == 2 && version >= 100500 && expected_version >= 100500);
+                if (version != expected_version && !v2_cross_ok) {
                     err = "hipBLASLt version mismatch: file=" + std::to_string(version) +
                           " runtime=" + std::to_string(expected_version);
                     return false;
                 }
                 arch_ = std::move(arch);
                 version_ = version;
+                format_version_ = format_v;
                 saw_header = true;
                 continue;
             }
 
             std::string type_name;
             int n = 0, k = 0, ldy = 0, t_bucket = 0, solution_id = -1;
-            std::string extra;
-            if (!(row >> type_name >> n >> k >> ldy >> t_bucket >> solution_id) || (row >> extra) ||
+            std::string kname, extra;
+            const bool have_cols = (format_v == 2)
+                                       ? (static_cast<bool>(row >> type_name >> n >> k >> ldy >> t_bucket >> solution_id >> kname) &&
+                                          !(row >> extra) && !kname.empty())
+                                       : (static_cast<bool>(row >> type_name >> n >> k >> ldy >> t_bucket >> solution_id) &&
+                                          !(row >> extra));
+            if (!have_cols ||
                 (type_name != "f16" && type_name != "bf16") || n <= 0 || k <= 0 || ldy < n || t_bucket <= 0 ||
                 solution_id < 0) {
                 err = "invalid tuning row at line " + std::to_string(line_number);
@@ -91,6 +104,7 @@ public:
             parsed.ldy = ldy;
             parsed.t_bucket = t_bucket;
             parsed.solution_id = solution_id;
+            parsed.kernel_name = std::move(kname);
             for (const auto& existing : rows_) {
                 if (existing.type == parsed.type && existing.n == parsed.n && existing.k == parsed.k &&
                     existing.ldy == parsed.ldy && existing.t_bucket == parsed.t_bucket) {
@@ -125,10 +139,12 @@ public:
     const std::vector<TuningRow>& rows() const { return rows_; }
     const std::string& arch() const { return arch_; }
     int version() const { return version_; }
+    int format_version() const { return format_version_; }
 
 private:
     std::string arch_;
     int version_ = 0;
+    int format_version_ = 1;
     std::vector<TuningRow> rows_;
 };
 

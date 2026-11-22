@@ -11,6 +11,10 @@
 #include "hy4_graph.hip.h"
 #include "hy4_spec.hip.h"
 #include "hy4_serve.hip.h"
+#include "strata/core/volta_forever.hpp"
+#if defined(__linux__) && !HY4_CUDA
+#include "strata/platform/numa_balancing.hpp"
+#endif
 
 using namespace hy4;
 
@@ -328,6 +332,18 @@ static int run_dump_dfly_batch(Runner& r, const std::string& manifest_path, cons
 }
 
 int main(int argc, char** argv) {
+#if defined(__linux__) && !HY4_CUDA
+    // Must run before any worker thread is created: hipHostRegister on Linux HIP creates KFD userptr mappings that
+    // kernel.numa_balancing=1 otherwise invalidates, stalling AMD GPU queues for 77-236 s (numa_balancing.hpp).
+    if (const std::string nb = strata::platform::numa_balancing::keep_scanner_off(); !nb.empty()) {
+        std::fprintf(stderr, "%s\n", nb.c_str());
+    }
+#endif
+#if HY4_CUDA
+    if (strata::core::apply_default_cuda_module_loading()) {
+        std::fprintf(stderr, "[gpu] volta-forever detected: setting CUDA_MODULE_LOADING=LAZY\n");
+    }
+#endif
     std::string model, engram, tok_path, out_dir = ".", vision_path, dfly_override;
     std::vector<std::string> image_files;
     std::string info_file;

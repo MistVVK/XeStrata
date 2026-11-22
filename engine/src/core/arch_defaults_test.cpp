@@ -426,29 +426,37 @@ int main() {
         put("STRATA_GFX1151_DEFAULTS", "0");   // back to the state this block found (the 026 checks below rely on it)
     }
 #endif
-    // the registered arena asks for no transparent huge pages on an integrated gfx11 GPU under Linux (780M, 880M / 890M, Strix Halo),
+    // the registered arena asks for no transparent huge pages on an integrated gfx11 GPU under Linux (780M, 880M / 890M, Strix Halo, Krackan gfx1152, Gorgon Point gfx1153),
     // detected from the device (integrated + arch), with or without the target-feature suffix; never on Windows, never on a discrete card
-    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1103:sramecc-:xnack-", "gfx1151:sramecc+:xnack-"}) {
+    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153", "gfx1103:sramecc-:xnack-", "gfx1151:sramecc+:xnack-"}) {
         CHECK(igpu_arena_no_thp_default(g, true, false));
         CHECK(!igpu_arena_no_thp_default(g, true, true));     // Windows: unchanged
         CHECK(!igpu_arena_no_thp_default(g, false, false));   // not integrated
     }
-    for (const char* g : {"gfx1152", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1036", "gfx11030", "gfx11031", "", "gfx90a"})
+    for (const char* g : {"gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1036", "gfx11030", "gfx11031", "", "gfx90a"})
         CHECK(!igpu_arena_no_thp_default(g, true, false));
-    // the wait before READY (kfd_settle.hpp) is for the same class: integrated gfx1103 / gfx1150 / gfx1151 under Linux, nothing else
-    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1103:sramecc-:xnack-"}) {
+    // the wait before READY (kfd_settle.hpp) is for the same class: integrated gfx1103 / gfx1150..gfx1153 under Linux, nothing else
+    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153", "gfx1103:sramecc-:xnack-"}) {
         CHECK(igpu_kfd_settle_default(g, true, false));
         CHECK(!igpu_kfd_settle_default(g, true, true));     // Windows
         CHECK(!igpu_kfd_settle_default(g, false, false));   // not integrated
     }
-    for (const char* g : {"gfx1100", "gfx1201", "gfx90a", "gfx1030", "gfx1152", ""}) CHECK(!igpu_kfd_settle_default(g, true, false));
+    for (const char* g : {"gfx1100", "gfx1201", "gfx90a", "gfx1030", ""}) CHECK(!igpu_kfd_settle_default(g, true, false));
     // the file-cache give-back during and after the expert load (page_cache_drop.hpp): the same class
-    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1103:sramecc-:xnack-"}) {
+    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153", "gfx1103:sramecc-:xnack-"}) {
         CHECK(igpu_cache_drop_default(g, true, false));
         CHECK(!igpu_cache_drop_default(g, true, true));     // Windows
         CHECK(!igpu_cache_drop_default(g, false, false));   // not integrated
     }
-    for (const char* g : {"gfx1100", "gfx1201", "gfx90a", "gfx1030", "gfx1152", ""}) CHECK(!igpu_cache_drop_default(g, true, false));
+    for (const char* g : {"gfx1100", "gfx1201", "gfx90a", "gfx1030", ""}) CHECK(!igpu_cache_drop_default(g, true, false));
+    // ROCm 10.2.0 #10097: WSL2 on integrated Ryzen APUs (gfx1103, gfx1150..gfx1153) is flagged so startup tells the user to run native Windows HIP
+    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153", "gfx1151:sramecc+:xnack-"}) {
+        CHECK(strata::core::wsl2_ryzen_apu_unsupported(g, true, "6.6.87.2-microsoft-standard-WSL2"));
+        CHECK(!strata::core::wsl2_ryzen_apu_unsupported(g, true, "6.11.0-21-generic"));       // bare-metal Linux: supported
+        CHECK(!strata::core::wsl2_ryzen_apu_unsupported(g, false, "6.6.87.2-microsoft-WSL2")); // discrete GPU: supported
+    }
+    CHECK(!strata::core::wsl2_ryzen_apu_unsupported("gfx1100", true, "6.6.87.2-microsoft-standard-WSL2"));
+    CHECK(!strata::core::wsl2_ryzen_apu_unsupported("gfx1201", true, "6.6.87.2-microsoft-standard-WSL2"));
     // the fused int8 prompt experts (STRATA_PF_FUSED=1 instead of llama.cpp's MMQ): the same class again, nothing else
     for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1103:sramecc-:xnack-", "gfx1151:sramecc+:xnack-"}) {
         CHECK(igpu_fused_prompt_default(g, true, false));

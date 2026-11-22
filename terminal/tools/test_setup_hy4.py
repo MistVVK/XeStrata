@@ -405,8 +405,8 @@ class Defaults0218(unittest.TestCase):
         self.assertEqual(cfg["drafting"], "dfly2")
         self.assertEqual(cfg["arch"], "hy4flash")
         self.assertEqual(cfg["exe"], "component:strata-hy4")
-        self.assertEqual(args[args.index("--vram-experts-gb") + 1], "0.60")               # 12 GiB: the KV state (5.5 GB at 128K) is pinned host memory, so the card keeps the author's 5.08 GB of experts
-        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "55.44")
+        self.assertEqual(args[args.index("--vram-experts-gb") + 1], "2.50")               # 12 GiB at 128K (v0.2.18 Vt-free MLA + 0.03 GB wkv scratch): full KV stays on card, leaving 2.50 GB for VRAM experts
+        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "53.54")
         self.assertTrue(any(l.startswith("images: on") for l in lines), lines)
 
     def test_vision_no_leaves_the_shard_and_the_option_out(self):
@@ -426,8 +426,8 @@ class Defaults0218(unittest.TestCase):
     def test_the_planned_placement_on_an_8_gib_card_is_written_at_128k(self):
         cfg, _lines, _ = self.install(vram=8.0)                                          # the engine lanes deal with a cache that does not fit the card
         args = cfg["args"]
-        self.assertEqual(args[args.index("--vram-experts-gb") + 1], "0.31")
-        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "52.30")        # 8 GiB + 64 GiB, SQ-64: 3.0 GB of its experts are read from the SSD (the planner recommends SQ-64 there: there is no SQ-32)
+        self.assertEqual(args[args.index("--vram-experts-gb") + 1], "0.01")
+        self.assertEqual(args[args.index("--ram-experts-gb") + 1], "54.59")        # 8 GiB + 64 GiB, SQ-64: ~1.44 GB of its experts are read from the SSD (the planner recommends SQ-64 there: there is no SQ-32)
 
 
 class Catalog(unittest.TestCase):
@@ -454,7 +454,7 @@ class Catalog(unittest.TestCase):
         self.assertTrue(by["SQ-64"]["images"])
         self.assertEqual({k: by[k]["on_this_pc"] for k in by}, {"SQ-64": "fits", "SQ-96": "may run slower", "SQ-128": "may run slower"})
         self.assertEqual([k for k in by if by[k]["hy4"]["recommended"]], ["SQ-64"])
-        self.assertEqual(by["SQ-64"]["hy4"]["placement"], {"vram_gb": 0.6, "ram_gb": 55.44, "ssd_gb": 0.0})            # at 128K the engine keeps the KV state in pinned host memory on a 12 GiB card (HY4-CUDA)
+        self.assertEqual(by["SQ-64"]["hy4"]["placement"], {"vram_gb": 2.5, "ram_gb": 53.54, "ssd_gb": 0.0})             # at 128K on 12 GiB (v0.2.18 Vt-free MLA) full KV + 2.50 GB experts fit VRAM
         self.assertIsNone(by["SQ-64"]["gpu_options"])
 
     def test_unified_memory(self):

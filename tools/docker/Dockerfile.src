@@ -38,6 +38,8 @@ WORKDIR /src
 COPY . .
 ARG CUDA_ARCHITECTURES="75;80;86;89;120"
 ARG BUILD_VISION=1
+ARG BUILD_HY4=0
+ARG BUILD_INKLING=1
 ARG ENGINE_VERSION=
 RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r terminal/requirements.txt -r terminal/requirements-build.txt
 # ggml comes from the vendored engine/third_party/strata-ggml; strata-vision is Strata's own reader (terminal/tools/vision/own): nothing is downloaded
@@ -45,11 +47,15 @@ RUN set -e; \
     real=""; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do real="$real;${a}-real"; done; real=${real#;}; \
     last=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ' | awk '{print $NF}'); \
     sm60=OFF; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do if [ "$a" -lt 75 ]; then sm60=ON; fi; done; \
+    hy4=OFF; [ "$BUILD_HY4" = "1" ] && hy4=ON || true; \
+    ink=OFF; [ "$BUILD_INKLING" = "1" ] && ink=ON || true; \
     /venv/bin/cmake -G Ninja -S engine -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
-        -DSTRATA_EXPERIMENTAL_SM60=$sm60 \
+        -DSTRATA_EXPERIMENTAL_SM60=$sm60 -DSTRATA_BUILD_HY4=$hy4 -DSTRATA_BUILD_INKLING=$ink \
         -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON \
         "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
     . tools/packaging/engine_targets.sh; targets=$(engine_targets /venv/bin/cmake build); \
+    [ "$BUILD_HY4" = "1" ] && targets="$targets strata-hy4" || true; \
+    [ "$BUILD_INKLING" = "1" ] && targets="$targets strata-inkling" || true; \
     /venv/bin/cmake --build build --target $targets -j "$(nproc)"; \
     if [ "$BUILD_VISION" = "1" ]; then \
       /venv/bin/cmake -G Ninja -S terminal/tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release \
@@ -59,6 +65,9 @@ RUN set -e; \
 RUN set -e; \
     mkdir -p /stage /engine; \
     cp build/strata /stage/; \
+    [ -f build/strata-hy4 ] && cp build/strata-hy4 /stage/ || true; \
+    [ -f build/src/inkling2/strata-inkling ] && cp build/src/inkling2/strata-inkling /stage/ || true; \
+    [ -f build/strata-inkling ] && cp build/strata-inkling /stage/ || true; \
     [ -f build/libstrata_kq.so ] && cp build/libstrata_kq.so /stage/ || true; \
     [ -f build-vision/bin/strata-vision ] && cp build-vision/bin/strata-vision /stage/ || true; \
     ver="${ENGINE_VERSION:-$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0-9.]*\).*/\1/p' engine/CMakeLists.txt | head -1)}"; \

@@ -731,6 +731,13 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         return;
     }
     const Tr dot = traits(f.gu_type);
+#if defined(STRATA_OWN_CPU_QUANT)
+    static const bool x4_on = std::getenv("STRATA_NO_DOT_X4") == nullptr;
+    const strata::quant::DotX4Kernel* x4 =
+        (x4_on && (Arithmetic == NativeArithmetic::Default || flavour_avx2()))
+            ? strata::quant::dot_x4_kernel((strata::quant::Type) f.gu_type, strata::quant::Arith::Avx2)
+            : nullptr;
+#endif
     // BW-G: the weights a few rows ahead are requested while this row is computed (row_prefetch.hpp); the same bits
     const int pf_rows = row_pf_bytes() > 0 ? (int) ((size_t) (row_pf_bytes() + (int) f.gu_row - 1) / f.gu_row) : 0;
     const int pf_hint = row_pf_hint();
@@ -739,7 +746,26 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
             row_prefetch_range(blob + (size_t) (r0 + k) * f.gu_row, f.gu_row, pf_hint);
             row_prefetch_range(blob + f.up_off + (size_t) (r0 + k) * f.gu_row, f.gu_row, pf_hint);
         }
-    for (int r = r0; r < r1; ++r) {
+    int r = r0;
+#if defined(STRATA_OWN_CPU_QUANT)
+    if (x4 != nullptr) {
+        for (; r + 4 <= r1; r += 4) {
+            const uint8_t* gr = blob + (size_t) r * f.gu_row;
+            const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+            for (int t = 0; t < nt; ++t) {
+                float g4[4], u4[4];
+                x4->fn(n, g4, gr, f.gu_row, act[t]);
+                x4->fn(n, u4, ur, f.gu_row, act[t]);
+                for (int k = 0; k < 4; ++k) {
+                    const float gs = g4[k] * sg;
+                    const float us = u4[k] * su;
+                    ff[t][r + k] = (gs / (1.f + std::exp(-gs))) * us;
+                }
+            }
+        }
+    }
+#endif
+    for (; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
         if (pf_rows > 0 && r + pf_rows < r1) {
@@ -830,12 +856,32 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
         return;
     }
     const Tr dot = traits(f.d_type);
+#if defined(STRATA_OWN_CPU_QUANT)
+    static const bool x4_on = std::getenv("STRATA_NO_DOT_X4") == nullptr;
+    const strata::quant::DotX4Kernel* x4 =
+        (x4_on && (Arithmetic == NativeArithmetic::Default || flavour_avx2()))
+            ? strata::quant::dot_x4_kernel((strata::quant::Type) f.d_type, strata::quant::Arith::Avx2)
+            : nullptr;
+#endif
     const int pf_rows = row_pf_bytes() > 0 ? (int) ((size_t) (row_pf_bytes() + (int) f.d_row - 1) / f.d_row) : 0;
     const int pf_hint = row_pf_hint();
     if (pf_rows > 0 && row_pf_prologue() != 0)
         for (int k = 0; k < pf_rows && r0 + k < r1; ++k)
             row_prefetch_range(blob + f.down_off + (size_t) (r0 + k) * f.d_row, f.d_row, pf_hint);
-    for (int r = r0; r < r1; ++r) {
+    int r = r0;
+#if defined(STRATA_OWN_CPU_QUANT)
+    if (x4 != nullptr) {
+        for (; r + 4 <= r1; r += 4) {
+            const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
+            for (int t = 0; t < nt; ++t) {
+                float s4[4];
+                x4->fn(n, s4, dr, f.d_row, hq[t]);
+                for (int k = 0; k < 4; ++k) out[t][r + k] = s4[k] * sd;
+            }
+        }
+    }
+#endif
+    for (; r < r1; ++r) {
         const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
         if (pf_rows > 0 && r + pf_rows < r1) row_prefetch_range(dr + (size_t) pf_rows * f.d_row, f.d_row, pf_hint);
         for (int t = 0; t < nt; ++t) {
