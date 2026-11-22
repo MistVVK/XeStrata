@@ -117,8 +117,8 @@ struct PlainOptions {
     bool vram_elastic = false;
     int64_t vram_segment_mib = 512;
     int max_t = 8;                  ///< the largest window
-    /// --device cpu: the dense Qwen3.5 forward on the CPU alone (plain_cpu.hpp), no GPU opened; `cpu_threads` its
-    /// pool's threads (0: physical cores, subject to the CPU quota)
+    /// --device cpu: the dense Qwen3.5 or Inkling-2-Mini forward on the CPU alone, no GPU opened; `cpu_threads` is
+    /// the thread count (0: physical cores, subject to the CPU quota; Inkling-2-Mini: logical CPUs / 8, at least 1)
     bool cpu = false;
     int cpu_threads = 0;
     /// --gpu-layers N (the dense models: qwen35, plamo3): the first N blocks and the head on the GPU, the other blocks

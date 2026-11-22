@@ -24,7 +24,7 @@ namespace strata::core {
 
 class PlainInkling {
 public:
-    PlainInkling();
+    explicit PlainInkling(int cpu_threads = 0);
     ~PlainInkling();
 
     bool load(const GgufModel& m, const ModelSpec& s, std::string& err);
