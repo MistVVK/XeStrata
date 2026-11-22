@@ -44,16 +44,23 @@ test('a tune is started on the config a load would use, unloads nothing it did n
     for (let n = 0; n < 200 && !seen; n++) { await new Promise(r => setTimeout(r, 30)); const j = f.control.state().jobs.find(x => x.id === job.id); if (j.progress) seen = j.progress; }
     assert.ok(seen, 'progress from the status file reaches the job');
     assert.equal(seen.minutesLeft, 9);
+    const cmd = log.find(c => c[0] === 'tune');
+    const original = readFileSync(cmd[2], 'utf8');
+    await f.control.tuneStatus({ model: 'iq2_xs', resourceProfile: 'performance' });
+    const statusPath = log.find(c => c[0] === 'presets' && c[1] === 'status')[2];
+    assert.notEqual(statusPath, cmd[2]);
+    assert.equal(readFileSync(cmd[2], 'utf8'), original);
+    assert.ok(!existsSync(statusPath), 'a completed status call removes its own snapshot');
     const done = await finishJob(f.control, job.id);
     assert.equal(done.state, 'done', done.error);
     assert.equal(done.result.summary, "+12% faster answers, saved as 'IQ2_XS 32K – Full speed'");
-    const cmd = log.find(c => c[0] === 'tune');
     assert.equal(cmd[1], 'auto');
     assert.equal(arg(cmd, '--mode'), 'quick');
     assert.equal(arg(cmd, '--goal'), 'room');                 // "Leave 20% for my work"
     assert.equal(arg(cmd, '--leave-ram'), '20');
     assert.ok(!cmd.includes('--allow-small-differences'));
-    const cfg = JSON.parse(readFileSync(cmd[2], 'utf8'));      // the config the tuner measures is the one a load would start
+    const cfg = JSON.parse(original);
+    assert.ok(!existsSync(cmd[2]), 'a completed tune removes its own snapshot');
     assert.equal(cfg.ui_resource_profile, 'work');
     assert.ok(Array.isArray(cfg.args) && cfg.args.includes('--max-context'));
     assert.equal(cfg.api_key, undefined);
@@ -139,14 +146,20 @@ test('a model that is not prepared cannot be tuned', async () => {
 
 test('Expert mode can read the tuned values and the tuning can be switched off for these choices', async () => {
   const log = [];
-  const f = nativeFixture({ tuneHandler: handler(log, {}) });
+  const fake = handler(log, {});
+  let cfg;
+  const f = nativeFixture({ tuneHandler: (child, args) => {
+    const effective = args.indexOf('effective');
+    if (effective !== -1) cfg = JSON.parse(readFileSync(args[effective + 1], 'utf8'));
+    fake(child, args);
+  } });
   try {
     await f.control.refresh(true);
     const eff = await f.control.tuneEffective({ model: 'iq2_xs', resourceProfile: 'work' });
     assert.equal(eff.applied, true);
     assert.deepEqual(eff.changed, [{ flag: '--kv-resident', was: '32768', now: '65536' }]);
     const cmd = log.find(c => c[1] === 'effective');
-    const cfg = JSON.parse(readFileSync(cmd[2], 'utf8'));
+    assert.ok(!existsSync(cmd[2]));
     assert.equal(cfg.ui_resource_profile, 'work');                 // the choices a load would make, so the right tuning is found
     await f.control.tuneOff({ model: 'iq2_xs', resourceProfile: 'work' });
     assert.deepEqual(log.at(-1).slice(0, 2), ['presets', 'off']);

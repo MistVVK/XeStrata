@@ -3,5 +3,14 @@
  "fixa02": "몇 초 정도 걸립니다.",
  "fixa03": "남은 다운로드",
  "fixa04": "답변을 더 빠르게 해 주는 작은 도우미를 다운로드하는 중입니다. 한 번만 진행됩니다.",
- "fixa05": "아직 확인하고 있습니다. 처음 시작할 때는 최대 1분 정도 걸릴 수 있습니다."
+ "fixa05": "아직 확인하고 있습니다. 처음 시작할 때는 최대 1분 정도 걸릴 수 있습니다.",
+ "contextOptimizerHint": "코딩 도우미가 공간을 확보할 때 작은 로컬 모델이 이전 도우미 메시지와 도구 결과에서 발췌문을 선택합니다. 기본값은 꺼짐입니다. 선택에 실패하면 일반 요약을 사용합니다.",
+ "contextOptimizerConfigure": "로컬 모델 설정",
+ "contextOptimizerEnable": "Context Optimizer 켜기",
+ "contextOptimizerTimeout": "제한 시간(초)",
+ "contextOptimizerUnavailable": "Context Optimizer 설정을 사용할 수 없습니다.",
+ "contextOptimizerTest": "모델 테스트",
+ "contextOptimizerTestSuccess": "모델 테스트를 통과했습니다({0} ms).",
+ "contextOptimizerTestFailure": "로컬 모델이 유효한 선택을 반환하지 않았습니다. 서버, 모델 ID, 제한 시간을 확인하세요.",
+ "contextOptimizerSaved": "저장했습니다. 진행 중인 채팅이 끝난 뒤 다음 도우미 요청부터 적용됩니다."
 }

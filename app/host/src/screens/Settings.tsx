@@ -12,14 +12,19 @@ import { NativeOperations } from '../components/NativeOperations';
 import { FontChoice } from '../components/FontChoice';
 import { ElectricityPrice } from '../components/ElectricityPrice';
 import { ApprovalNotifySetting, DoneSoundSetting, NumberQuotesSetting, PortSetting, TraySetting, useShellState } from '../components/ShellSettings';
+import { ModelPortSetting } from '../components/ModelPortSetting';
+import { PromptCacheSpreadSetting } from '../components/PromptCacheSpreadSetting';
 import { CompactionSetting } from '../components/CompactionSetting';
+import { ContextOptimizerSetting } from '../components/ContextOptimizerSetting';
+import { RamReserveSetting } from '../components/RamReserveSetting';
 import { HelperLimitSetting } from '../components/HelperLimitSetting';
 import { ChatDefaultsSetting } from '../components/ChatDefaultsSetting';
 import { LANGUAGES } from '../lib/i18n';
 import { setLanguage, setWhileBusy } from '../lib/store';
 import { UserRulesSetting } from '../components/UserRules';
 import { CONTENT_FONT_RANGE, setContentFontSize, setDensity, setReplyWidth, setFocus, setMotion, setShortcuts, setTheme, setTransparency, setUiScale, UI_SCALES, useStore, setSettingsSection } from '../lib/store';
-const PANELS = [{ name: 'Appearance', icon: 'sun', sections: ['General', 'Reading & focus'] }, { name: 'Models', icon: 'models', sections: [] }, { name: 'Tools', icon: 'tool', sections: [] }, { name: 'Storage', icon: 'disk', sections: ['Storage'] }, { name: 'Engine', icon: 'engine', sections: [] }, { name: 'About', icon: 'info', sections: ['About', 'Update', 'Privacy'] }] as const;
+const PANELS = [{ name: 'Appearance', icon: 'sun', sections: ['General', 'Reading & focus'] }, { name: 'Models', icon: 'models', sections: [] }, { name: 'Context and memory', icon: 'memory', sections: ['Chat context', 'System RAM'] }, { name: 'Tools', icon: 'tool', sections: [] }, { name: 'Storage', icon: 'disk', sections: ['Storage'] }, { name: 'Engine', icon: 'engine', sections: [] }, { name: 'About', icon: 'info', sections: ['About', 'Update', 'Privacy'] }] as const;
+const panelId = (name: typeof PANELS[number]['name']) => name.replaceAll(' ', '-');
 export function SettingsScreen() {
     const prefs = useStore(s => s);
     const [shell, saveShell] = useShellState();
@@ -33,15 +38,19 @@ export function SettingsScreen() {
         control: ReactNode;
     }[] = [
         { section: 'General', label: 'Language', hint: 'Choose the language used throughout Strata.', control: <Select translateLabels={false} ariaLabel={tr("Language")} value={prefs.language} options={[...LANGUAGES]} onChange={value => setLanguage(value as typeof prefs.language)}/> },
-        { section: 'General', label: 'While an answer is being written', hint: 'What Enter does when you send a message while the assistant is still answering.', aliases: 'interrupt wait queue interject busy send after stop enter', control: <Select value={prefs.whileBusy} ariaLabel={tr("While an answer is being written")} options={[{ value: 'wait', label: 'Wait for the answer' }, { value: 'queue', label: 'Send after the answer' }, { value: 'interject', label: 'Interrupt the answer' }]} onChange={value => setWhileBusy(value as typeof prefs.whileBusy)}/> },
+        { section: 'General', label: 'While an answer is being written', hint: 'What Enter does when you send a message while the assistant is still answering.', aliases: 'interrupt wait queue interject busy send after stop enter', control: <Select value={prefs.whileBusy} ariaLabel={tr("While an answer is being written")} options={[{ value: 'wait', label: 'Wait for the answer' }, { value: 'queue', label: 'Send after the answer' }, { value: 'interject', label: 'Send a live message' }]} onChange={value => setWhileBusy(value as typeof prefs.whileBusy)}/> },
         { section: 'General', label: 'Sound when work finishes', hint: 'Plays a short sound when an answer or task that took a while is finished, or when Strata is in the background.', aliases: 'audio chime done complete notification', control: <DoneSoundSetting /> },
         { section: 'General', label: 'Notify me when Strata needs an answer', hint: 'In Manual mode, shows a desktop notification when the assistant waits for your approval and Strata is in the background.', aliases: 'approval permission alert notification manual', control: <ApprovalNotifySetting /> },
         ...(shell?.tray ? [{ section: 'General', label: 'Minimise to tray', hint: 'Closing the window keeps Strata running in the tray, next to the clock. Choose Quit in the tray menu to stop it. Applies the next time Strata starts.', aliases: 'tray background close notification area', control: <TraySetting shell={shell} save={saveShell} /> }] : []),
         ...(shell?.desktop ? [{ section: 'General', label: 'App port', hint: 'The port Strata’s window and local address use. Leave it empty to let Strata choose (47831 when it is free). Applies the next time Strata starts.', aliases: 'network address 47831 localhost api', control: <PortSetting shell={shell} save={saveShell} /> }] : []),
+        { section: 'General', label: 'Model server port', hint: 'The starting port local model servers use (default 18500). Leave empty for automatic; Strata avoids probing port 8080 so it does not conflict with other local apps such as Spring Boot. Applies the next time a model loads.', aliases: '8080 18500 spring boot port conflict engine model server localhost api', control: <ModelPortSetting /> },
         { section: 'General', label: 'Number quotes', hint: 'When one message quotes several passages, each gets a number and says who wrote it, so the assistant can tell them apart. Start a line with [1] or [2] to answer one of them.', aliases: 'quote quoting numbered reference passages', control: <NumberQuotesSetting /> },
         { section: 'General', label: 'Your rules', hint: 'Rules the assistant follows in every chat, for example "Answer in German" or "Keep answers short". New answers use them right away.', aliases: 'instructions system prompt agents.md custom global always', control: <UserRulesSetting /> },
         { section: 'General', label: 'Electricity price', hint: 'Price of one kilowatt-hour. The Monitor then shows what your graphics card has cost since Strata started. Leave it empty to hide the cost.', aliases: 'cost power energy kwh currency money', control: <ElectricityPrice /> },
-        { section: 'General', label: 'Summarize older messages', hint: 'How full a chat has to get before the assistant condenses its beginning to make room. Later keeps more of the conversation and leaves less room for one answer; the assistant picks the new number up on its next message.', aliases: 'compact compaction context window threshold summarize tokens history memory', control: <CompactionSetting /> },
+        { section: 'Chat context', label: 'Summarize older messages', hint: 'How full a chat has to get before the assistant condenses its beginning to make room. Later keeps more of the conversation and leaves less room for one answer; the assistant picks the new number up on its next message.', aliases: 'compact compaction context window threshold summarize tokens history memory', control: <CompactionSetting /> },
+        { section: 'Chat context', label: 'Spread prompt cache checkpoints', hint: 'Passes --prompt-cache-spread to local models so saved checkpoints thin out back through long conversations instead of clustering at the end. Uses the same RAM and cuts compaction re-read time on hybrid models. Applies the next time a model loads.', aliases: 'prompt cache spread compaction hybrid gyro prefill checkpoints memory', control: <PromptCacheSpreadSetting /> },
+        { section: 'Chat context', label: 'Context Optimizer (experimental)', hint: 'Let a small local model select excerpts from older assistant messages and tool results when the coding assistant makes room. Off by default. Standard summarization takes over if the selection fails.', aliases: 'compaction context window history memory local model', control: <ContextOptimizerSetting /> },
+        { section: 'System RAM', label: 'RAM to keep free (GiB) (experimental)', hint: 'Keep system RAM available when loading local models. Applies to all profiles the next time they load.', aliases: 'ram headroom free memory model weights cache keep reserve', control: <RamReserveSetting /> },
         { section: 'General', label: 'Helper time limit', hint: 'Stops a helper that keeps working longer than this. Off lets helpers run as long as they need.', aliases: 'helper subagent agent time limit timeout stop long running minutes hours', control: <HelperLimitSetting /> },
         { section: 'General', label: 'New chats', hint: 'What every new conversation starts with: how much it may do on its own, how deeply it thinks, and how long one answer may be. A conversation you are already in keeps its own choice.', aliases: 'default mode permission bypass plan manual thinking reasoning effort budget tokens limit', control: <ChatDefaultsSetting /> },
         { section: 'Reading & focus', label: 'Font', hint: 'Choose an installed font for the interface and conversations.', control: <FontChoice /> },
@@ -67,12 +76,12 @@ export function SettingsScreen() {
             const index = PANELS.findIndex(p => p.name === active);
             const next = e.key === 'Home' ? 0 : e.key === 'End' ? PANELS.length - 1 : (index + (['ArrowDown', 'ArrowRight'].includes(e.key) ? 1 : -1) + PANELS.length) % PANELS.length;
             activate(PANELS[next].name);
-            document.getElementById(`settings-tab-${PANELS[next].name}`)?.focus();
+            document.getElementById(`settings-tab-${panelId(PANELS[next].name)}`)?.focus();
         }}>
-      {tr(PANELS.map(panel => <button key={panel.name} role="tab" id={`settings-tab-${panel.name}`} aria-controls={`settings-panel-${panel.name}`} aria-selected={active === panel.name} tabIndex={active === panel.name ? 0 : -1} className="settingsindex__item" onClick={() => activate(panel.name)}><Icon name={panel.icon as IconName} size={17}/>{tr(panel.name)}</button>))}
+      {tr(PANELS.map(panel => <button key={panel.name} role="tab" id={`settings-tab-${panelId(panel.name)}`} aria-controls={`settings-panel-${panelId(panel.name)}`} aria-selected={active === panel.name} tabIndex={active === panel.name ? 0 : -1} className="settingsindex__item" onClick={() => activate(panel.name)}><Icon name={panel.icon as IconName} size={17}/>{tr(panel.name)}</button>))}
     </nav>
     <div className="settings-pane" ref={scrollRef}>
-      {tr(PANELS.map(panel => <div key={panel.name} role="tabpanel" tabIndex={0} id={`settings-panel-${panel.name}`} aria-labelledby={`settings-tab-${panel.name}`} hidden={active !== panel.name}>
+      {tr(PANELS.map(panel => <div key={panel.name} role="tabpanel" tabIndex={0} id={`settings-panel-${panelId(panel.name)}`} aria-labelledby={`settings-tab-${panelId(panel.name)}`} hidden={active !== panel.name}>
         {tr(panel.name === 'Models' ? <SettingsModels /> : panel.name === 'Tools' ? (active === panel.name ? <SettingsTools /> : null) : panel.name === 'Engine' && active === panel.name ? <div className="stack stack--lg settings-body"><section className="settings-section"><h2 className="h3" style={{ marginBottom: 14 }}>{tr("Engine")}</h2><NativeOperations /></section></div> : active === panel.name ? <div className="stack stack--lg settings-body">
           {tr(panel.sections.map(section => <section className="settings-section" key={section}>
             <h2 className="h3" style={{ marginBottom: 14 }}>{tr(section)}</h2>

@@ -111,8 +111,12 @@ export function controlEnvironment(control, { env = process.env, components = co
  * The environment of the installer process (tools/strata_mcp.py): Control's, with acquiring still forbidden for the process
  * itself. Only the install job it starts when the user asks to download a model lifts that for its own children.
  */
-export function installerEnvironment(control, { env = process.env, installDir, components = componentsDirectory({ env }) } = {}) {
-  return { ...controlEnvironment(control, { env, components }), STRATA_CONTROL_INSTALL: '1', ...(installDir ? { STRATA_INSTALL_DIR: installDir } : {}) };
+export function installerEnvironment(control, { env = process.env, installDir, components = componentsDirectory({ env }), modelPort = null, probeDefaultPort = false } = {}) {
+  const portEnv = Number.isInteger(modelPort) && modelPort >= 1024 && modelPort <= 65535
+    ? { STRATA_MODEL_PORT: String(modelPort) }
+    : {};
+  const skipDefault = !probeDefaultPort && modelPort !== 8080 ? { STRATA_NO_DEFAULT_PORT: '1' } : {};
+  return { ...controlEnvironment(control, { env, components }), STRATA_CONTROL_INSTALL: '1', ...(installDir ? { STRATA_INSTALL_DIR: installDir } : {}), ...portEnv, ...skipDefault };
 }
 
 export class ControlError extends Error {

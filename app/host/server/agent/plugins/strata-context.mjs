@@ -12,10 +12,11 @@
  *      the summary replaces it), the pieces are summarised one after the other, each building on the summary before it, and a piece the
  *      server still refuses is halved and tried again.
  *
- * How. It wraps `tokenMeter.measure` and `llm.stream` in place, once each (the same way strata-models wraps the subagent tools). Only a
- * request the Harness marks `purpose: 'compaction'` is touched in `llm.stream`. Nothing in the Harness is rewritten: a Harness update
- * that renames either leaves compaction as it was, and the test that runs the real Harness fails.
+ * The plugin wraps the token meter and compaction stream once. At adapter preparation it also removes foreign reasoning from the
+ * outgoing request, and for local models it sets the request's reply ceiling. The real Harness tests exercise these hooks.
  */
+import { existsSync } from 'node:fs';
+import { optimizeContext, savedContextOptimizer } from '../context-optimizer.mjs';
 import { replyCap } from '../reply-cut.mjs';
 import { densityOf, estimateMessage, estimateTools, isContextOverflow, MAX_DENSITY, pressureNow, promptTokensOf, splitMessages, summaryBudget, usageOfEvent, WINDOW_SLACK, withSummaryLanguage } from '../context-budget.mjs';
 
@@ -32,9 +33,34 @@ const wrapped = new WeakSet();
 /** Densities that made a summary request fail on this server, per session id (the next request starts from a more careful one). */
 const careful = new Map();
 
-export function apply(ctx) {
+/** Give a new model the visible transcript and tool evidence. Native reasoning
+ * remains on disk and is replayed verbatim only to the same provider and model. */
+export function projectForeignReasoning(options) {
+  if (!options?.provider || !options.model || !Array.isArray(options.messages)) return options;
+  let changed = false;
+  const messages = options.messages.flatMap(message => {
+    const source = message.source;
+    if (message.role !== 'assistant' || !source?.provider || !source.model
+        || (source.provider === options.provider && source.model === options.model)) return [message];
+    const content = message.content.filter(block => block.type !== 'reasoning');
+    if (content.length === message.content.length && source.replayState === undefined) return [message];
+    changed = true;
+    const { replayState: _native, ...neutral } = source;
+    return content.length ? [{ ...message, content, source: neutral }] : [];
+  });
+  return changed ? { ...options, messages } : options;
+}
+
+export function apply(ctx, config = {}) {
+  const pauseFile = process.env.STRATA_UPDATE_PAUSE_FILE;
+  const paused = () => pauseFile && existsSync(pauseFile);
+  const pauseReason = 'Agent work is paused for the Strata update.';
+  if (pauseFile) ctx.on('tools/pre-execute', (exec, next) => paused() ? { kind: 'deny', reason: pauseReason } : next());
   const meter = ctx.tokenMeter;
   const llm = ctx.llm;
+  const optimizer = savedContextOptimizer(config.contextOptimizer);
+  let optimizing = false;
+  let lastOptimization = null;
   const log = (level, text) => { try { ctx.logger?.[level]?.(`strata-context: ${text}`); } catch { /* logging never blocks */ } };
 
   // 1. The measured size of the prompt, from the model server's own report for each answer.
@@ -52,6 +78,15 @@ export function apply(ctx) {
       return { ...m, totalTokens: total, nodes: m.nodes.map(n => ({ ...n, tokens: Math.ceil(n.tokens * density) })) };
     };
     ctx.on('session/event', (session, event) => {
+      if (event.type === 'model/selection') {
+        // The previous prompt was rendered for a different model or adapter.
+        samples.delete(session);
+        if (session.id) {
+          bySessionId.delete(String(session.id));
+          careful.delete(String(session.id));
+        }
+        return;
+      }
       if (event.type !== 'assistant/message') return;
       const real = promptTokensOf(usageOfEvent(event));
       if (!(real > 0)) return;
@@ -73,6 +108,7 @@ export function apply(ctx) {
     wrapped.add(llm);
     const original = llm.stream;
     llm.stream = function stream(options) {
+      if (paused()) throw new Error(pauseReason);
       if (options?.purpose !== 'compaction') return original.call(this, options);
       return summaryStream.call(this, options, original);
     };
@@ -90,31 +126,33 @@ export function apply(ctx) {
     const original = llm.prepareCall;
     const raised = new WeakSet();
     const prepare = async function prepareCall(config, signal, configure) {
-      try { raiseReplyCeiling(config?.provider, raised); } catch (e) { log('warn', `could not raise the reply ceiling: ${e.message}`); }
+      if (paused()) throw new Error(pauseReason);
+      try { prepareAdapter(config?.provider, raised); } catch (e) { log('warn', `could not prepare the model adapter: ${e.message}`); }
       return original.call(this, config, signal, configure);
     };
     wrapped.add(prepare);
     llm.prepareCall = prepare;
   }
-  function raiseReplyCeiling(provider, raised) {
-    if (!isLocalRoute(provider)) return;
+  function prepareAdapter(provider, raised) {
     const adapter = llm.adapters?.get?.(provider)?.adapter;
     if (!adapter || raised.has(adapter) || typeof adapter.streamWithSnapshot !== 'function' || typeof adapter.modelOf !== 'function') return;
     raised.add(adapter);
     const stream = adapter.streamWithSnapshot;
     adapter.streamWithSnapshot = function streamWithSnapshot(options, snapshot) {
-      let next = options;
+      if (paused()) throw new Error(pauseReason);
+      let next = projectForeignReasoning(options);
       try {
-        if (isLocalRoute(options?.provider)) {
+        if (isLocalRoute(options?.provider) && options.purpose === undefined) {
           const model = this.modelOf(snapshot, options.provider, options.model);
           const asked = options.maxTokens ?? model.maxTokens ?? 0;
-          // Only the agent's own reply budget is raised: a summary or a title asks for far less and keeps what it asked.
-          if (model.contextWindow > 0 && asked >= Math.floor(model.contextWindow * 0.25)) {
+          // Raise the profile's default agent budget. It is capped at 32K, even on windows larger than 128K.
+          // Auxiliary requests carry a purpose, and callers with a different explicit limit keep it.
+          if (model.contextWindow > 0 && asked === model.maxTokens) {
             const cap = replyCap(model.contextWindow, asked);
-            if (cap > asked) next = { ...options, maxTokens: cap };
+            if (cap > asked) next = { ...next, maxTokens: cap };
           }
         }
-      } catch { next = options; }
+      } catch { /* keep the history projection even if no ceiling is available */ }
       return stream.call(this, next, snapshot);
     };
   }
@@ -133,7 +171,8 @@ export function apply(ctx) {
           const config = session.requestHeader?.()?.config;
           let window = 0;
           if (config) window = (await llm.resolveModelInfo(config.provider, config.model))?.context?.contextWindow ?? 0;
-          return { kind: 'success', text: JSON.stringify({ tokens, window }) };
+          const outcome = lastOptimization?.sessionId === session.id ? lastOptimization.outcome : null;
+          return { kind: 'success', text: JSON.stringify({ tokens, window, ...(outcome ? { optimizer: outcome } : {}) }) };
         } catch (e) { return { kind: 'error', text: `strata-context: ${e.message}` }; }
       },
     });
@@ -153,6 +192,28 @@ export function apply(ctx) {
   const refusedForSize = finish => finish?.kind === 'error' && isContextOverflow(finish.failure ?? finish);
 
   async function* summaryStream(options, original) {
+    if (optimizer.enabled && !optimizing) {
+      const started = performance.now();
+      optimizing = true;
+      let result;
+      try { result = await optimizeContext(optimizer, options); }
+      catch { result = { reason: 'optimizer-failed' }; }
+      finally { optimizing = false; }
+      if (paused()) throw new Error(pauseReason);
+      options.signal?.throwIfAborted();
+      const elapsed = Math.round(performance.now() - started);
+      const outcome = result.text
+        ? { state: 'selected', sourceBytes: result.sourceBytes, outputBytes: result.outputBytes, durationMs: elapsed }
+        : { state: 'fallback', reason: result.reason, durationMs: elapsed };
+      lastOptimization = { sessionId: options.sessionId, outcome };
+      if (result.text) {
+        log('info', `Context Optimizer selected excerpts (${result.sourceBytes} → ${result.outputBytes} bytes, ${elapsed} ms)`);
+        yield { type: 'text-delta', index: 0, text: result.text };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+        return;
+      }
+      log('info', `Context Optimizer used standard compaction (${result.reason}, ${elapsed} ms)`);
+    }
     options = { ...options, messages: withSummaryLanguage(options.messages) };   // #4750: the summary follows the conversation's language
     let window = 0;
     try { window = (await llm.resolveModelInfo(options.provider, options.model, options.signal))?.context?.contextWindow ?? 0; } catch { window = 0; }
@@ -180,10 +241,14 @@ export function apply(ctx) {
     if (tools && estimateTools({ tools }) * density > window / 3) tools = undefined;   // a long tool list only describes tools: the summary does not need it
     const fixed = (system ? estimateMessage(system) : 0) * density + estimateTools({ tools }) * density + estimateMessage(instruction) * density;
     let budget = summaryBudget({ window, summaryTokens: summaryTokens * 2, systemTokens: fixed, instructionTokens: 0 });
+    // Keep completed work across a size retry. Re-split the original messages
+    // after that boundary, so a retry never clips an already clipped copy.
+    let summarised = 0, summary = '';
     for (let attempt = 0; ; attempt++) {
-      const runs = splitMessages(body, Math.max(1024, budget), density);
-      log('info', `summarising ${body.length} messages in ${runs.length} piece(s) for a ${window}-token window (density ${density.toFixed(2)}, about ${Math.round(budget)} tokens a piece)`);
-      let failed = null, summary = '';
+      const remaining = body.slice(summarised);
+      const runs = splitMessages(remaining, Math.max(1024, budget), density);
+      log('info', `summarising ${remaining.length} messages in ${runs.length} piece(s) for a ${window}-token window (density ${density.toFixed(2)}, about ${Math.round(budget)} tokens a piece)`);
+      let failed = null;
       for (let i = 0; i < runs.length && !failed; i++) {
         options.signal?.throwIfAborted?.();
         const carried = summary ? [{ role: 'user', content: [{ type: 'text', text: `<compacted-summary>\n${summary}\n</compacted-summary>` }] }] : [];
@@ -194,6 +259,7 @@ export function apply(ctx) {
         // The last piece's answer is the summary the Harness reads; a piece that ended in another error ends the request the same way.
         if (i === runs.length - 1 || finish?.kind === 'error' || finish?.kind === 'aborted') { for (const chunk of chunks) yield chunk; return; }
         summary = text;
+        summarised += runs[i].length;
       }
       if (!failed || attempt >= 3) throw Object.assign(new Error(failed?.failure?.message ?? 'the summary request does not fit the window'), { code: 'CONTEXT_WINDOW_EXCEEDED' });
       density = Math.min(MAX_DENSITY, density * 1.6);

@@ -1,6 +1,9 @@
 /** Ports the host listens on: a free one for the helpers, and a plain sentence when the main one cannot be taken. */
 import net from 'node:net';
 
+/** True when a value is a valid non-privileged TCP port (1024..65535). */
+export const validModelPort = value => Number.isInteger(value) && value >= 1024 && value <= 65535;
+
 /** Why a listen failed, in words a person can act on (Windows keeps whole ranges for Hyper-V, WSL and Docker). */
 export function listenProblem(error, port, host = '127.0.0.1', platform = process.platform) {
   const code = error?.code;

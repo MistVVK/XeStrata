@@ -183,7 +183,7 @@ test('the shell bridge client exists only inside the desktop app, speaks to loop
 
 // ---------------------------------------------------------------------------------- the Settings buttons in the packaged app
 
-function fixture({ withApp = false, update, appInstall } = {}) {
+function fixture({ withApp = false, update, appInstall, beforeUpdate } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'strata-update-ops-'));
   const install = join(root, 'install'), data = join(root, 'data');
   mkdirSync(install, { recursive: true });
@@ -213,7 +213,7 @@ function fixture({ withApp = false, update, appInstall } = {}) {
     check: async () => ({ available: true, version: '0.2.0' }),
     install: appInstall ?? (async ({ onProgress }) => { calls.push(['app-install']); onProgress({ downloaded: 50, total: 100 }); return { state: 'done' }; }),
   } : null;
-  const native = createNativeControl({ control, appUpdater, directory: data, spawnProcess: (...args) => { if (!args[1]?.some(a => String(a).endsWith('strata_mcp.py'))) spawned.push(args); throw new Error('no process but the installer tool (Control strata_mcp.py, absent in this fixture) may be started by the host in packaged mode'); }, fetcher: async () => Response.json({}), requests: () => [] });
+  const native = createNativeControl({ control, appUpdater, beforeUpdate, directory: data, spawnProcess: (...args) => { if (!args[1]?.some(a => String(a).endsWith('strata_mcp.py'))) spawned.push(args); throw new Error('no process but the installer tool (Control strata_mcp.py, absent in this fixture) may be started by the host in packaged mode'); }, fetcher: async () => Response.json({}), requests: () => [] });
   return { native, calls, spawned, data, control, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 const finish = async (native, id) => { for (let i = 0; i < 400; i++) { const job = native.state().jobs.find(j => j.id === id); if (job.state !== 'running') return job; await new Promise(r => setTimeout(r, 10)); } throw new Error('job did not finish'); };
@@ -268,6 +268,17 @@ test('packaged: no update while a model is loaded; calibration is still refused'
     assert.equal(f.calls.filter(c => c[0] === 'update').length, 0);
     const calibrate = await finish(f.native, f.native.operation('calibrate', { model: 'iq2_xs' }).id);
     assert.match(calibrate.error, /Terminal|calibrates NVIDIA/);
+  } finally { await f.native.close(); f.cleanup(); }
+});
+
+test('an unconfirmed pause blocks both the Control update and the app installer', async () => {
+  const f = fixture({ withApp: true, beforeUpdate: async () => { throw new Error('Helper stop unconfirmed'); } });
+  try {
+    await f.native.refresh(true);
+    const job = await finish(f.native, f.native.operation('update-strata').id);
+    assert.equal(job.state, 'error');
+    assert.match(job.error, /unconfirmed/);
+    assert.deepEqual(f.calls, []);
   } finally { await f.native.close(); f.cleanup(); }
 });
 

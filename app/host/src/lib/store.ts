@@ -119,7 +119,7 @@ export interface AppState {
   shareTelemetry: boolean;
   paletteOpen: boolean;
   shortcutsOpen: boolean;
-  settingsSection: 'Appearance' | 'Models' | 'Tools' | 'Storage' | 'Engine' | 'About';
+  settingsSection: 'Appearance' | 'Models' | 'Context and memory' | 'Tools' | 'Storage' | 'Engine' | 'About';
   hardware: Hardware | null;
   library: ModelLibrary | null;
   imageModels: ImageModelLibrary | null;
@@ -737,11 +737,45 @@ export function setWhileBusy(whileBusy: WhileBusy) {
   savePrefs();
 }
 
-/** A message sent while an answer is being written waits here; the chat sends it when the answer is done (it is also where Interrupt leaves it). */
+/** A message sent while an answer is being written waits here until the answer is done. */
 export function parkMessage(sessionId: string, text: string) {
   const clean = text.trim();
   if (!clean) return;
   set({ parked: { ...state.parked, [sessionId]: [...(state.parked[sessionId] ?? []), clean] } });
+}
+
+/** Put a live follow-up between the current reply and a new continuation. The
+ * Harness keeps one streaming turn, but its transcript must retain the actual
+ * order: text written before the follow-up, the follow-up, then later text. */
+function recordAgentFollowUp(sessionId: string, value: { id?: unknown; text?: unknown; at?: unknown } | null | undefined, replyId: string): string | null {
+  if (typeof value?.id !== 'string' || typeof value.text !== 'string' || typeof value.at !== 'string') return null;
+  const { id, text, at } = value;
+  const message: ChatMessage = { id, role: 'user', content: text, at };
+  const continuationId = uid('m');
+  let recorded = false;
+  patchSession(sessionId, session => {
+    if (session.messages.some(existing => existing.id === message.id)) return session;
+    const quotes = takeQuoteSources(message.content);
+    const next = quotes ? { ...message, quotes } : message;
+    const replyIndex = session.messages.findIndex(existing => existing.id === replyId);
+    if (replyIndex < 0) return { ...session, updatedAt: new Date().toISOString(), messages: [...session.messages, next] };
+    const reply = session.messages[replyIndex];
+    const continuation: ChatMessage = { id: continuationId, role: 'assistant', content: '', at, streaming: true };
+    recorded = true;
+    return { ...session, updatedAt: new Date().toISOString(), messages: [...session.messages.slice(0, replyIndex), { ...reply, streaming: false }, next, continuation, ...session.messages.slice(replyIndex + 1)] };
+  });
+  return recorded ? continuationId : null;
+}
+
+/** Tell the parent in its own live session. A plain chat or a turn that just ended can accept it as a regular follow-up instead. */
+export async function steerMessage(sessionId: string, message: string): Promise<boolean> {
+  try {
+    await api.post('/api/chat/steer', { sessionId, message });
+    return true;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409) return false;
+    throw error;
+  }
 }
 function setAsks(sessionId: string, list: AgentAsk[]) {
   const next = { ...state.agentAsks };
@@ -749,7 +783,7 @@ function setAsks(sessionId: string, list: AgentAsk[]) {
   set({ agentAsks: next });
 }
 /** The agent asked the person something (a frame of the host), or the question ended without an answer. */
-export function addAgentAsk(sessionId: string, frame: { callId?: unknown; questions?: unknown }) {
+export function addAgentAsk(sessionId: string, frame: { callId?: unknown; questions?: unknown; agentName?: unknown }) {
   const ask = readAsk(frame);
   // A /loop runs without anyone there: the question is skipped at once, so the loop never waits for an answer.
   if (ask && loopScheduler.isRunning(sessionId)) { void answerAgentAsk(sessionId, ask.callId, null).catch(() => {}); return; }
@@ -1608,6 +1642,10 @@ function patchSession(id: string, fn: (s: Session) => Session) {
   set({ sessions });
 }
 
+export function dismissAgent(sessionId: string, agentId: string) {
+  patchSession(sessionId, s => ({ ...s, agents: (s.agents ?? []).filter(a => a.id !== agentId), dismissedAgentIds: [...new Set([...(s.dismissedAgentIds ?? []), agentId])].slice(-200) }));
+}
+
 // The demo clock belongs to the session, so hiding the sidebar or navigating
 // away never pauses it. Only start and completion are written to storage.
 const timeSkipTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -1819,9 +1857,9 @@ export function stopStreaming() {
   const turn = id ? liveTurns.get(id) : undefined;
   if (!id || !turn) return;
   const abort = () => { turn.abort.abort(); };
-  void api.post<{ stopped: boolean }>('/api/chat/stop', { sessionId: id }).then(
+  void api.post<{ stopped: boolean; ended?: string }>('/api/chat/stop', { sessionId: id }).then(
     result => {
-      if (!result.stopped) abort();
+      if (!result.stopped && result.ended !== 'unconfirmed') abort();
       // An agent turn that was told to stop but is slow to end must not leave the chat stuck.
       else setTimeout(() => { if (liveTurns.get(id) === turn) abort(); }, 30000);
     },
@@ -2024,8 +2062,8 @@ export function stopChat(id: string) {
   const turn = liveTurns.get(id);
   if (!turn) return;
   const abort = () => { turn.abort.abort(); };
-  void api.post<{ stopped: boolean }>('/api/chat/stop', { sessionId: id }).then(
-    result => { if (!result.stopped) abort(); else setTimeout(() => { if (liveTurns.get(id) === turn) abort(); }, 30000); },
+  void api.post<{ stopped: boolean; ended?: string }>('/api/chat/stop', { sessionId: id }).then(
+    result => { if (!result.stopped && result.ended !== 'unconfirmed') abort(); else setTimeout(() => { if (liveTurns.get(id) === turn) abort(); }, 30000); },
     abort,
   );
 }
@@ -2251,6 +2289,14 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
           });
         } else if (type === 'status') {
           applyStatusFrame(sessionId, frame as Record<string, unknown>);
+          // The banner is only the current state. Keep each meaningful change on
+          // the reply too, so a quiet non-thinking turn is still inspectable.
+          const text = typeof frame.text === 'string' ? frame.text.trim() : '';
+          if (text) patchAssistant(m => {
+            const activity = [...(m.activity ?? [])];
+            if (activity.at(-1)?.text !== text) activity.push({ text, at: Date.now() });
+            return { ...m, activity: activity.slice(-80) };
+          });
           // Manual mode waits for the person: a notification when they have opted in and Strata is in the background (#3477), once per question.
           if (frame.code === 'waiting-approval' && lastApprovalNotice !== `${sessionId}:${String(frame.seq)}`) {
             lastApprovalNotice = `${sessionId}:${String(frame.seq)}`;
@@ -2264,6 +2310,10 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
           // A proposed plan is shown as the plan card in place of this turn's closing text (that text is the plan in prose).
           const planned = frame.plan as { id?: unknown } | null;
           if (frame.event === 'proposed' && planned && typeof planned.id === 'string') { const pid = planned.id; patchAssistant(m => ({ ...m, planId: pid })); }
+        } else if (type === 'agent-follow-up') {
+          const { id, text, at } = (frame.message ?? {}) as { id?: unknown; text?: unknown; at?: unknown };
+          const continuation = recordAgentFollowUp(sessionId, { id, text, at }, assistantId);
+          if (continuation) assistantId = continuation;
         } else if (type === 'queued-message') {
           applyQueueFrame(sessionId, frame.queue);
           const sent = frame.message as { text?: unknown } | undefined;
@@ -2286,7 +2336,7 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
           const code = String(frame.code ?? 'notice');
           if (!noticed.has(code)) { noticed.add(code); pushToast('info', 'Agent', plainFailureText(String(frame.message ?? '')).message); }
         } else if (type === 'agent-question') {
-          addAgentAsk(sessionId, frame as { callId?: unknown; questions?: unknown });
+          addAgentAsk(sessionId, frame);
         } else if (type === 'agent-question-end') {
           removeAgentAsk(sessionId, String(frame.callId ?? ''));
         } else if (type === 'agent-tool-draft') {
@@ -2307,7 +2357,8 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
             return { ...m, tools: existing ? m.tools!.map(t => t.id === tool.id ? next : t) : [...(m.tools ?? []), next] };
           });
         } else if (type === 'agent') {
-          patchSession(sessionId, s => ({ ...s, agents: updateAgent(s.agents ?? [], frame.agent) }));
+          const id = typeof (frame.agent as { id?: unknown } | undefined)?.id === 'string' ? (frame.agent as { id: string }).id : '';
+          patchSession(sessionId, s => id && s.dismissedAgentIds?.includes(id) ? s : ({ ...s, agents: updateAgent(s.agents ?? [], frame.agent) }));
         } else if (type === 'delta') {
           /* applied through queueText above */
         } else if (type === 'deliverable') {

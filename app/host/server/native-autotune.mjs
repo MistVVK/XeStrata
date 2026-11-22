@@ -3,6 +3,7 @@
  * same preset store the Terminal uses, so tuning in one place covers the other. This module only runs those commands, follows the
  * status file the tuner rewrites at every step, and turns the answer into the sentence the app shows. It measures nothing itself.
  */
+import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -131,11 +132,12 @@ export function createAutoTune({ launcher, workDir, spawnProcess = spawn, pollMs
   };
 }
 
-export function writeTuneConfig(directory, model, cfg) {
+export async function withTuneConfig(directory, cfg, useConfig) {
   const dir = join(directory, 'native-tune');
   mkdirSync(dir, { recursive: true });
-  const path = join(dir, `${model}.json`);
+  const path = join(dir, `config-${randomUUID()}.json`);
   const { api_key, port, ...rest } = cfg;            // the key and port belong to a running instance, not to the choices
-  writeFileSync(path, JSON.stringify(rest, null, 2), { mode: 0o600 });
-  return path;
+  writeFileSync(path, JSON.stringify(rest, null, 2), { mode: 0o600, flag: 'wx' });
+  try { return await useConfig(path); }
+  finally { rmSync(path, { force: true }); }
 }

@@ -84,6 +84,10 @@ export function createAppUi({ env = process.env, shutdown = () => {}, open = ope
     get mode() { return mode; },
     /** What the page reads to decide what to show. */
     state: () => ({ mode, reason, canQuit: mode === 'browser', appUpdate: mode === 'browser' || mode === null ? 'unavailable' : 'available' }),
+    async openHelper(sessionId, helperId, name) {
+      const shell = mode === 'window' ? bridge ?? originalBridge : null;
+      return shell?.openHelper ? shell.openHelper(sessionId, helperId, name) : { opened: false };
+    },
     /** The window process hands over its updater bridge (a loopback address and a token). */
     setBridge({ url, token } = {}) {
       if (typeof url !== 'string' || !BRIDGE_URL.test(url) || typeof token !== 'string' || token.length < 16) throw new Error('That is not a bridge address.');

@@ -3,5 +3,14 @@
  "fixa02": "This takes a few seconds.",
  "fixa03": "Left to download",
  "fixa04": "Downloading a small helper that makes answers faster. This happens once.",
- "fixa05": "Still checking. On the first start this can take up to a minute."
+ "fixa05": "Still checking. On the first start this can take up to a minute.",
+ "contextOptimizerHint": "Let a small local model select excerpts from older assistant messages and tool results when the coding assistant makes room. Off by default. Standard summarization takes over if the selection fails.",
+ "contextOptimizerConfigure": "Configure local model",
+ "contextOptimizerEnable": "Enable Context Optimizer",
+ "contextOptimizerTimeout": "Timeout in seconds",
+ "contextOptimizerUnavailable": "Context Optimizer settings are unavailable.",
+ "contextOptimizerTest": "Test model",
+ "contextOptimizerTestSuccess": "Model test passed ({0} ms).",
+ "contextOptimizerTestFailure": "The local model did not return a usable selection. Check the server, model ID and timeout.",
+ "contextOptimizerSaved": "Saved. The next assistant request applies this after active chats finish."
 }

@@ -1,6 +1,6 @@
 /** Strata's output-budget correction for the staged pi-ai copy. */
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 export const HARNESS_BUDGET_PATCH = Object.freeze({
@@ -49,4 +49,28 @@ export function patchStagedHarnessBudget(stagedRoot) {
   const after = Buffer.from(source.replace(oldClamp, newClamp));
   writeFileSync(target, after);
   return { ...HARNESS_BUDGET_PATCH, afterSha256: sha256(after) };
+}
+
+/** Verify the staged bytes before every desktop bundle, including a reused local stage. */
+export function prepareStagedHarnessBudget(stagedRoot) {
+  const bundlePath = join(stagedRoot, 'BUNDLE.json');
+  const target = join(stagedRoot, HARNESS_BUDGET_PATCH.file);
+  if (!existsSync(bundlePath) && !existsSync(target)) return null; // desktop development without a bundled Harness
+  const bundle = JSON.parse(readFileSync(bundlePath, 'utf8'));
+  const patches = bundle.patches ?? [];
+  const recorded = patches.find(patch => patch.id === HARNESS_BUDGET_PATCH.id);
+  if (!recorded) {
+    const patch = patchStagedHarnessBudget(stagedRoot);
+    writeFileSync(bundlePath, JSON.stringify({ ...bundle, patches: [...patches, patch] }, null, 2) + '\n');
+    return patch;
+  }
+  const bytes = readFileSync(target);
+  const source = bytes.toString('utf8');
+  if (Object.entries(HARNESS_BUDGET_PATCH).some(([key, value]) => recorded[key] !== value)
+      || recorded.afterSha256 !== sha256(bytes)
+      || source.split(newClamp).length !== 2
+      || sha256(source.replace(newClamp, oldClamp)) !== HARNESS_BUDGET_PATCH.beforeSha256) {
+    throw new Error('Harness output-budget patch: staged bytes do not match their provenance. Stage the Harness again.');
+  }
+  return recorded;
 }

@@ -3,5 +3,14 @@
  "fixa02": "这需要几秒钟。",
  "fixa03": "待下载",
  "fixa04": "正在下载一个能加快回答速度的小助手。此操作只进行一次。",
- "fixa05": "仍在检查。首次启动时最多可能需要一分钟。"
+ "fixa05": "仍在检查。首次启动时最多可能需要一分钟。",
+ "contextOptimizerHint": "编程助手需要腾出上下文空间时，由小型本地模型从较早的助手消息和工具结果中选择摘录。默认关闭。选择失败时会使用常规摘要。",
+ "contextOptimizerConfigure": "配置本地模型",
+ "contextOptimizerEnable": "启用 Context Optimizer",
+ "contextOptimizerTimeout": "超时秒数",
+ "contextOptimizerUnavailable": "无法读取 Context Optimizer 设置。",
+ "contextOptimizerTest": "测试模型",
+ "contextOptimizerTestSuccess": "模型测试通过（{0} 毫秒）。",
+ "contextOptimizerTestFailure": "本地模型未返回有效选择。请检查服务器、模型 ID 和超时设置。",
+ "contextOptimizerSaved": "已保存。正在运行的聊天结束后，下一次助手请求会应用此设置。"
 }

@@ -50,6 +50,38 @@ mod renderer_choice;
 #[cfg(target_os = "linux")]
 mod supervisor;
 
+/// Opens a separate, ordinary operating-system window for one helper. The page
+/// owns the data; the shell only gives it a movable native surface on the same
+/// trusted loopback origin as the main window.
+fn open_helper_window(app: &tauri::AppHandle, port: u16, session_id: &str, helper_id: &str, name: &str) -> Result<(), String> {
+    let valid_id = |id: &str| !id.is_empty() && id.len() <= 160 &&
+        id.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-.:@".contains(&c));
+    if !valid_id(session_id) || !valid_id(helper_id) {
+        return Err("The helper window identifier is not valid.".to_string());
+    }
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    (session_id, helper_id).hash(&mut hasher);
+    let label = format!("helper-{:016x}", hasher.finish());
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.unminimize(); let _ = window.show(); let _ = window.set_focus();
+        return Ok(());
+    }
+    let title = if name.trim().is_empty() { "Strata helper" } else { name.trim() };
+    let mut url: tauri::Url = format!("http://127.0.0.1:{port}/").parse().map_err(|_| "The helper window address is invalid.")?;
+    url.query_pairs_mut()
+        .append_pair("helperWindow", "1")
+        .append_pair("sessionId", session_id)
+        .append_pair("helperId", helper_id);
+    WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
+        .title(title)
+        .inner_size(680.0, 760.0)
+        .min_inner_size(420.0, 360.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// The kill-on-close Job Object that holds everything this app starts (Windows). Its only handle is this process's,
 /// which the system closes however the process ends; closing the last handle ends every process in the job.
 #[cfg(windows)]
@@ -531,7 +563,7 @@ fn start_host(app: &tauri::AppHandle) -> Result<u16, String> {
     // which the app window ignores. The Linux shell sets the same variable in supervisor.rs.
     cmd.env("STRATA_UI_MODE", "window");
     // The signed app updater (Tauri) is reached by the host through a token-protected loopback bridge.
-    let bridge = updater::start(app, random_token());
+    let bridge = updater::start(app, random_token(), port);
     updater::apply_env(&mut cmd, app, bridge.as_ref());
     *app.state::<ShutdownToken>().0.lock().unwrap() = Some(token);
 
@@ -979,8 +1011,11 @@ fn run_embedded() {
                     }
                 }
             }
-            if let tauri::WindowEvent::Destroyed = event {
+            // Helper windows are independent reading surfaces. Closing one must
+            // never end the app host or the conversation it is showing.
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
                 stop_host(&window.app_handle().clone());
+                window.app_handle().exit(0);
             }
         })
         .build(tauri::generate_context!())
@@ -1300,7 +1335,7 @@ fn run_window_process() -> ! {
         .setup(move |app| {
             // The signed app updater (Tauri) is reached by the host through a token-protected loopback bridge; tell the host where it is.
             let bridge_token = random_token();
-            if let Some(bridge) = updater::start(app.handle(), bridge_token) {
+            if let Some(bridge) = updater::start(app.handle(), bridge_token, port) {
                 let body = serde_json::json!({ "bridge": { "url": bridge.url, "token": bridge.token } }).to_string();
                 if let Err(e) = http_request_body(
                     "POST",
@@ -1314,7 +1349,7 @@ fn run_window_process() -> ! {
             open_window(app, port, &token)
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
                 window.app_handle().exit(0);
             }
         })

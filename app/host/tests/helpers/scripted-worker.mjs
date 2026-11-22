@@ -15,6 +15,7 @@
  *                                   wider access, so the approval gate is exercised
  *   SCRIPT:plain <file> <text>      the same call without the escalation (no approval needed)
  *   SCRIPT:echo <text>              replies with <text>
+ *   SCRIPT:fill <n>                 one long text chunk with n repetitions
  *   SCRIPT:ask                      one ask_user_question call (the agent asking the person something)
  *   SCRIPT:envdump <file>           one shell call that writes the shell's environment to <file>
  *   SCRIPT:retrywrite <file> <text> the `write` tool, like a careful model: when the sandbox denies it and offers
@@ -28,7 +29,7 @@
  *   SCRIPT:call <tool> <json>       one call to any tool with the given JSON arguments
  *   SCRIPT:multi <json>             {"calls":[[tool,args],...],"say":"final text"}: all the calls in one reply, then the text once their results are in
  *   SCRIPT:searchloop               a model that never stops: every reply rewrites a numbered plan and calls web_search again with a new query
- *   SCRIPT:bloat <prompt tokens>    a reply that is only thinking (no answer text), with usage reporting that many prompt tokens (a context at 100%)
+ *   SCRIPT:bloat <prompt tokens> [answer]   report the specified prompt usage and emit an answer or thinking only
  *   SCRIPT:badseq <steps> <file>    tool calls the Strata server could not run, as it marks them (strata_rejected_tool_calls /
  *                                   strata_unread_tool_markup), then a proper call: steps rej:NAME[>HINT], cut, junk, read, say (see below)
  *
@@ -139,6 +140,26 @@ export async function startScriptedWorker({ port = 0, chunkDelayMs = 40, model =
       if (/biggest lever/.test(t) && !answered && last.role !== 'tool') return say(['{"step": 2, "why": "The layout decided in step 1 shapes everything after it."}']);
       if (/IMPROVEMENT PLAN/.test(t) && !answered && last.role !== 'tool') return say(['## Better path\n\n', '1. Improve the first attempt SCRIPT:goalstep\n', '2. Polish and check SCRIPT:goalstep\n']);
     }
+    const guardCase = directive?.[1] === 'mixedguard'
+      ? (directive[2].includes('#1') ? 'repeatread' : 'distinctreads')
+      : directive?.[1];
+    if (['repeatread', 'distinctreads', 'emptyafterread'].includes(guardCase)) {
+      if (!(body.tools ?? []).length) return say(['Scripted title']);
+      const n = toolMessages.length;
+      if (guardCase === 'emptyafterread' && n) return finish('stop', 1);
+      if (n >= 14) return say(['Checked all fixtures.']);
+      return toolCall('read', { file_path: `fixture-${guardCase === 'distinctreads' ? n : 0}.txt` });
+    }
+    if (guardCase === 'repeatthinking') {
+      if (!(body.tools ?? []).length) return say(['Scripted title']);
+      const thought = 'I will look again at the same option and retrace the same checks before deciding what to do. ';
+      for (let i = 0; i < 80 && !closed; i++) {
+        send({ role: 'assistant', reasoning_content: thought });
+        await delay(chunkDelayMs);
+      }
+      if (!closed) return finish('stop', 1800);
+      return;
+    }
     if (directive?.[1] === 'searchloop') {
       const n = requests.filter(r => r.directive === 'searchloop').length;
       send({ role: 'assistant', content: `Plan, version ${n}:
@@ -174,8 +195,14 @@ export async function startScriptedWorker({ port = 0, chunkDelayMs = 40, model =
       }
       if (step === 'cut') { const tail = '<tool_call>\n<function=read>\n<parameter=file_path>\n'; return markup(`Reading it.\n${tail}`, { strata_unread_tool_markup: { reason: 'cut_off', chars: tail.length } }); }
       if (step === 'junk') { const tail = '<tool_call>\n<=true>\n</tool_call>'; return markup(`Reading it.\n${tail}`, { strata_unread_tool_markup: { reason: 'unreadable', chars: tail.length } }); }
+      if (step === 'length') { send({ role: 'assistant', content: 'A partial answer.' }); return finish('length', 100); }
       if (step === 'read') return toolCall('read', { file_path: file });
       return say(['All done after the tool step.']);
+    }
+    if (directive?.[1] === 'thinkcut') {
+      if (!(body.tools ?? []).length) return say(['Scripted title']);
+      send({ role: 'assistant', reasoning_content: 'I should consider the question before answering.' });
+      return finish('length', 100);
     }
     if (directive?.[1] === 'cutwrite' || directive?.[1] === 'cutalways') {
       // A reply the length limit cuts inside a tool call (AGENT-LOST): some words, then `write` arguments that never close, finish "length".
@@ -195,7 +222,9 @@ export async function startScriptedWorker({ port = 0, chunkDelayMs = 40, model =
       return finish('length', 19660);
     }
     if (directive?.[1] === 'bloat') {
-      promptTokens = parseInt((directive[2] ?? '').trim(), 10) || 100;
+      const [, count, answer] = /^(\d+)(?:\s+(.+))?$/.exec((directive[2] ?? '').trim()) ?? [];
+      promptTokens = Number(count) || 100;
+      if (answer) return say([answer]);
       send({ role: 'assistant', content: '', reasoning_content: 'Thinking about it for a long time and never getting to the answer.' });
       return finish('stop', 20);
     }
@@ -230,6 +259,7 @@ export async function startScriptedWorker({ port = 0, chunkDelayMs = 40, model =
     }
     if (name === 'hang') { send({ role: 'assistant', content: '' }); return; }   // headers sent, then silence: a model server that went quiet
     if (name === 'echo') return say([args]);
+    if (name === 'fill') return say(['routine output '.repeat(Math.min(1000, Number.parseInt(args, 10) || 1))]);
     if (name === 'retrywrite' || name === 'retryshell') {
       const [file, ...rest] = args.split(/\s+/);
       const value = rest.join(' ') || 'run';

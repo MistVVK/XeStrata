@@ -19,6 +19,7 @@ import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
+import { saveCheckpoint, workspaceState } from './update-checkpoint.mjs';
 import { GatewayClient } from './gateway-client.mjs';
 import { HarnessProcess, resolveHarness, redact, stopStaleAgent } from './harness-runtime.mjs';
 import { StatusReporter } from './status.mjs';
@@ -30,6 +31,8 @@ import { DeliverableTracker, ActivityGroups, FolderClaims } from './deliverables
 import { SkillsUsed, skillInfoFrom } from './skills-used.mjs';
 import { turnEngineSpeed } from './engine-speed.mjs';
 import { TurnGuard, GoalGuard, guardNote, GUARD_NOTES } from './turn-guard.mjs';
+import { ProgressGuard } from './progress-guard.mjs';
+import { requirementOf, StepEvidence } from './plan-brief.mjs';
 import { cutNotice, cutNudge } from './reply-cut.mjs';
 import { MarkerStore, MAX_TOOL_FIXES, FIXING_STATUS, correctionText, endNote } from './tool-fix.mjs';
 import { watchForWake } from './wake-watch.mjs';
@@ -45,7 +48,7 @@ export function agentProvider(route, { budget = 0, sampling = null, forwardAlway
 }
 
 /** How often one turn asks the agent to carry on after a reply the length limit cut (each time in smaller pieces). */
-export const MAX_CUT_RETRIES = 2;
+export const MAX_RECOVERY_PROMPTS = 2;
 /** Replies the agent started by itself (a background command finished) that ended while no page was attached, kept per chat until a page takes them (#6070 review). */
 export const WOKEN_KEPT = 8;
 import { buildAnswer, parseQuestions } from './user-questions.mjs';
@@ -127,6 +130,17 @@ export function imageParts(images) {
 
 /** A timer that never keeps the process alive by itself. */
 const after = (ms, fn) => { const t = setTimeout(fn, ms); t.unref?.(); return t; };
+function beforeAbort(work, signal) {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return work();
+    }).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
 /** The app's own host folder: never a place an answer's files can be (this file lives in <host>/server/agent). */
 const HOST_DIR = fileURLToPath(new URL('../..', import.meta.url));
 
@@ -143,9 +157,21 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
  * @param {string} [options.nodePath]                   the Node runtime that runs the Harness
  * @param {(line:string)=>void} [options.log]
  */
-export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, onWake = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, helperLimitMs = () => 0, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, liveMs = 90_000, startRuntimeImpl = null, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500, restartWaitMs = 120_000 }) {
+export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, onWake = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, helperLimitMs = () => 0, contextOptimizer = () => null, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, liveMs = 90_000, startRuntimeImpl = null, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500, restartWaitMs = 120_000, controlRpcMs = 15_000, helperStopMs = 10_000 }) {
+  const boundedRpc = (runtime, method, args, signal = null) => {
+    const deadline = AbortSignal.timeout(controlRpcMs);
+    const bounded = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    return beforeAbort(() => runtime.gw.rpc(method, args, { signal: bounded }), bounded);
+  };
   const root = join(dataDir, 'agent');
   const home = join(root, 'home');
+  const checkpointDir = join(root, 'update-checkpoints', randomUUID());
+  const pauseMarker = join(checkpointDir, 'paused');
+  let updatePaused = false;
+  let preparation;
+  function allowWork() {
+    if (updatePaused) throw new AgentUnavailable('Agent work is paused for the Strata update. Restart Strata to resume.', 'update-paused');
+  }
   const sessionsFile = join(root, 'sessions.json');
   mkdirSync(root, { recursive: true });
   /** Which chat's file tools wrote which file, for chats that share a folder (#5008). */
@@ -190,6 +216,16 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   const idleWaiters = new Set();
 
   const chat = id => { let c = chats.get(id); if (!c) { c = { id, turn: null, route: null, routeGeneration: -1 }; chats.set(id, c); } return c; };
+  // A cancel with no confirmation may leave work running on the old session.
+  // Keep its durable history and seed the next request from the visible chat.
+  function retireSession(c, sessionId) {
+    if (sessionMap[c.id]?.sessionId !== sessionId) return;
+    delete sessionMap[c.id];
+    c.route = null;
+    try { persist(); } catch (e) { log(`agent · could not save the retired session mapping: ${e.message}`); }
+  }
+  const interruptChild = (runtime, parentSessionId, childSessionId) =>
+    boundedRpc(runtime, 'subagents/interruptByParent', { childSessionId, parentSessionId, mode: 'continuable' });
   const activeTurns = () => [...chats.values()].filter(c => c.turn).length;
   // A restart of the Harness waits for every chat that works on the running one: a turn, and also a chat that already holds the running Harness
   // (c.holding: from the moment ensureRuntime handed it over until the chat's turn exists) but is not a turn yet, which a restart would close under it.
@@ -198,6 +234,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   /** FIX-APP A5: what the person is told when the restart of the Harness cannot start because another chat is working. A change in Settings -> Tools is not "the list of models". */
   const BUSY_WORDS = {
     tools: 'Another chat is still working, so your new Tools settings are not in use yet. Send your message again when that chat has finished.',
+    optimizer: 'Another chat is still working, so the new Context Optimizer settings are not in use yet. Try again when it finishes.',
     models: 'Another chat is still working and the list of models changed. Try again when it finishes.',
   };
   const waitIdle = (signal, ms, why = 'models') => new Promise((resolve, reject) => {
@@ -212,7 +249,12 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   let shapeTargets = {};
   function buildProfileNow() {
     const toolSettings = tools();
-    const profile = buildProfile({ local: localInstances(), connections: connections(), gate, tools: toolSettings, skillsDir: skillsDir(), proxyBase, searchMock, defaultLocalId: defaultLocalId() });
+    const optimizer = contextOptimizer();
+    const profile = buildProfile({
+      local: localInstances(), connections: connections(), gate, tools: toolSettings, skillsDir: skillsDir(),
+      proxyBase, searchMock, defaultLocalId: defaultLocalId(), workingMemory: env.STRATA_AGENT_WORKING_MEMORY === '1', contextOptimizer: optimizer,
+    });
+    profile.optimizerKey = optimizer?.enabled ? JSON.stringify(optimizer) : null;
     shapeTargets = profile.shapeTargets ?? {};
     // FIX-APP A5: which Settings -> Tools values this profile was made from (compared, never shown or logged), so a restart that waits for other chats can say whether the Tools
     // settings or the model list is why (the tools signature moves with a model change too).
@@ -223,6 +265,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   /** TOOLCALL-B: replies whose tool call could not run, as the forwarding endpoint read them, until a turn takes one (tool-fix.mjs). */
   const toolMarkers = new MarkerStore();
   const forwardAlways = env.STRATA_AGENT_FORWARD !== '0';
+  const planBrief = env.STRATA_AGENT_PLAN_BRIEF === '1';
   const noteToolMarker = marker => toolMarkers.add(marker);
 
   function harnessInfo() { return resolveHarness({ env, componentsDir, bundledDir }); }
@@ -258,16 +301,17 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     writeFileSync(patchFile, profile.patch);
     const workdir = join(root, 'run');
     const hp = new HarnessProcess({
-      harness: h, home, patchFile, cwd: workdir, env: profile.env, nodePath, logFile: join(root, 'harness.log'), pidFile: join(root, 'harness.pid'),
+      harness: h, home, patchFile, cwd: workdir, env: { ...profile.env, STRATA_UPDATE_PAUSE_FILE: pauseMarker }, nodePath, logFile: join(root, 'harness.log'), pidFile: join(root, 'harness.pid'),
       onExit: exit => {
         log(`agent · the Harness process exited (code ${exit.code})`);
         if (rt?.hp === hp) { lastError = 'The agent process stopped.'; rt = null; }
-        for (const c of chats.values()) c.turn?.abortFromRuntime('The agent process stopped before this turn finished.');
+        for (const c of chats.values()) if (c.turn?.runtime.hp === hp) c.turn.abortFromRuntime('The agent process stopped before this turn finished.');
       },
     });
     const info = await hp.start({ timeoutMs: startTimeoutMs });
     const gw = new GatewayClient({ baseUrl: info.baseUrl, token: info.token });
-    await gw.connect();
+    try { await gw.connect({ signal: AbortSignal.timeout(controlRpcMs) }); }
+    catch (e) { gw.close(); await hp.stop(); throw e; }
     const next = { hp, gw, profile, clientId: null, generation: ++generation, events: null };
     next.events = gw.openStream('$events', {}, {
       onItem: value => onHostEvent(next, value),
@@ -289,6 +333,8 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   /** Make sure a runtime exists that knows the route this turn needs. */
   async function ensureRuntime(choice, signal) {
     for (;;) {
+      allowWork();
+      signal?.throwIfAborted();
       if (starting) { await starting.catch(() => {}); continue; }
       const profile = buildProfileNow();
       const route = routeFor(profile, choice);
@@ -301,7 +347,8 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       if (known) return { rt, route };
       starting = (async () => {
         if (rt?.hp.running) {
-          await waitIdle(signal, restartWaitMs, rt.profile.toolsKey !== profile.toolsKey ? 'tools' : 'models');
+          const why = rt.profile.optimizerKey !== profile.optimizerKey ? 'optimizer' : rt.profile.toolsKey !== profile.toolsKey ? 'tools' : 'models';
+          await waitIdle(signal, restartWaitMs, why);
           const old = rt; rt = null;
           old.events?.close(); old.gw.close(); await old.hp.stop();
         }
@@ -327,28 +374,29 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       if (!r.callId) return;
       pending.set(`${value.agentId}:${r.callId}`, { eventId: value.eventId, sessionId: value.agentId, callId: r.callId, tool: r.toolName, reason: r.reason ?? null, at: Date.now(), clientId: runtime.clientId });
     } else if (value.type === 'waterfall' && value.event === 'user-questions/request') {
-      // The agent of a chat that is running in front of the person asks the person: the question goes to the page (the question card above the message box) and the
-      // Harness waits for the answer. Anything else (a helper's question, a chat that is stopping, a request with nothing to show) is declared
-      // unanswerable, which makes the tool return an error the model reads and carries on from, instead of a turn that waits forever.
+      // An interactive chat can answer both its own questions and its helpers' questions.
       const r = value.request ?? {};
-      const chatId = chatOfSession(value.agentId);
+      const chatId = chatOfSession(value.agentId) ?? [...chats.values()].find(c => c.turn?.children.has(value.agentId))?.id;
       const turn = chatId ? chats.get(chatId)?.turn : null;
+      const helper = turn?.children.get(r.strataHelperId ?? value.agentId);
       const items = parseQuestions(r.questions);
       // A goal or a plan step runs without anyone there: a question would stall it, so it is declined at once (the model reads "could not be answered" and goes on).
       if (!turn || turn.finished || turn.stopping || turn.goalRun || turn.plan || !turn.announceQuestion || !items.length) {
         void runtime.gw.answerEvent({ clientId: runtime.clientId, eventId: value.eventId, outcome: 'next' }).catch(() => {});
       } else {
-        const callId = String(r.wait?.callId ?? value.eventId);
-        questions.set(`${value.agentId}:${callId}`, { eventId: value.eventId, sessionId: value.agentId, callId, items, at: Date.now(), clientId: runtime.clientId });
-        turn.announceQuestion({ type: 'agent-question', callId, questions: items });
+        const id = String(r.wait?.callId ?? value.eventId);
+        const callId = helper ? `${helper.id}:${id}` : id;
+        const agentName = helper?.cp.name;
+        questions.set(`${chatId}:${callId}`, { chatId, eventId: value.eventId, sessionId: helper?.id ?? value.agentId, callId, items, agentName, at: Date.now(), clientId: runtime.clientId });
+        turn.announceQuestion({ type: 'agent-question', callId, questions: items, agentName });
       }
     } else if (value.type === 'cancel') {
-      for (const [k, v] of questions) if (v.eventId === value.eventId) { questions.delete(k); chats.get(chatOfSession(v.sessionId))?.turn?.announceQuestion?.({ type: 'agent-question-end', callId: v.callId }); }
+      for (const [k, v] of questions) if (v.eventId === value.eventId) { questions.delete(k); chats.get(v.chatId)?.turn?.announceQuestion?.({ type: 'agent-question-end', callId: v.callId }); }
       for (const [k, v] of pending) if (v.eventId === value.eventId) pending.delete(k);
     }
   }
 
-  async function sessionFor(c, cwd, runtime, { vision, onWait = () => {} } = {}) {
+  async function sessionFor(c, cwd, runtime, { vision, onWait = () => {}, signal } = {}) {
     let known = sessionMap[c.id];
     // The chat's folder changed: the agent's working folder and sandbox are fixed when its session starts, so the chat gets a new session
     // in the new folder (the earlier conversation is carried into its first message, as for any fresh session).
@@ -360,7 +408,8 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       if (typeof vision === 'boolean' && known.vision !== vision) { sessionMap[c.id] = { ...known, vision }; persist(); }
       return { sessionId: known.sessionId, fresh: false };
     }
-    const created = await createSessionWhenReady(() => runtime.gw.rpc('session/create', { request: { cwd } }), { readyMs: sessionReadyMs, retryMs: sessionRetryMs, onWait, cancelled: () => c.cancelStart });
+    const created = await createSessionWhenReady(() => boundedRpc(runtime, 'session/create', { request: { cwd } }, signal), { readyMs: sessionReadyMs, retryMs: sessionRetryMs, onWait, cancelled: () => signal?.aborted });
+    signal?.throwIfAborted();
     if (!created) return null;
     sessionMap[c.id] = { sessionId: created.sessionId, cwd, ...(typeof vision === 'boolean' ? { vision } : {}), createdAt: new Date().toISOString() };
     persist();
@@ -372,15 +421,15 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
    * check that it took. A turn never starts in a mode other than the one asked for: if the switch cannot be
    * confirmed the turn fails closed with a typed error instead of running with unknown permissions.
    */
-  async function applyMode(runtime, sessionId, mode) {
+  async function applyMode(runtime, sessionId, mode, signal) {
     const want = MODE_PRESETS[mode].key;
     const read = async () => {
-      const r = await runtime.gw.rpc('session/projections', { request: { sessionId, keys: ['permissions'] } });
+      const r = await boundedRpc(runtime, 'session/projections', { request: { sessionId, keys: ['permissions'] } }, signal);
       return r?.values?.permissions?.currentValue ?? null;
     };
     try {
       if (await read() !== want) {
-        const done = await runtime.gw.rpc('commands/execute', { agentId: sessionId, line: `/permission ${want}`, submittedAttachments: [] });
+        const done = await boundedRpc(runtime, 'commands/execute', { agentId: sessionId, line: '/permission ' + want, submittedAttachments: [] }, signal);
         if (done?.result?.kind !== 'success') throw new Error(done?.result?.text ?? 'the agent did not recognise the command');
         const now = await read();
         if (now !== want) throw new Error(`the session reports "${now}" instead of "${want}"`);
@@ -398,7 +447,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     // Manual leaves the sandbox open and relies on the Strata gate to ask first. Without the gate it must not start.
     if (mode === 'manual' && !runtime.gateChecked) {
       try {
-        const probe = await runtime.gw.rpc('commands/execute', { agentId: sessionId, line: '/strata-gate', submittedAttachments: [] });
+        const probe = await boundedRpc(runtime, 'commands/execute', { agentId: sessionId, line: '/strata-gate', submittedAttachments: [] }, signal);
         if (probe?.result?.kind !== 'success' || !String(probe.result.text ?? '').includes('strata-gate active')) throw new Error('the approval gate is not loaded');
         runtime.gateChecked = true;
       } catch (e) {
@@ -412,14 +461,25 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
    * `signal` means the client went away: the turn keeps running (that is not Stop).
    */
   async function runTurn(options) {
+    allowWork();
     const c = chat(options.chatId);
     if (c.turn || c.starting) throw new AgentUnavailable('This chat is still working. Stop it or wait for it to finish.', 'turn-active');
     // From here until the Harness has the prompt, Stop has no session to cancel; it cancels the start.
-    c.starting = true; c.cancelStart = false;
+    c.starting = true; c.startAbort = new AbortController(); c.startFinished = deferred();
     // Our own turn follows the session from here: the idle watch for a turn the Harness starts by itself ends, and arms again when this one ends.
     c.wake?.close(); c.wake = null;
     c.wakeOptions = { workspacePath: options.workspacePath, choice: options.choice ?? null, mode: options.mode ?? null, thinking: options.thinking ?? null, thinkingBudget: options.thinkingBudget ?? 0 };
-    try { return await runTurnInner(c, options); } finally { c.starting = false; if (c.holding) { c.holding = false; notifyIdle(); } }
+    try { return await runTurnInner(c, options); }
+    catch (e) {
+      if (!c.startAbort.signal.aborted) throw e;
+      options.onFrame({ type: 'done', finishReason: 'aborted', cancelled: true, usageSource: 'unavailable' });
+      return { cancelled: true };
+    } finally {
+      c.starting = false;
+      c.startAbort = null;
+      if (c.holding) { c.holding = false; notifyIdle(); }
+      c.startFinished.resolve();
+    }
   }
 
   /**
@@ -427,14 +487,20 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
    * a completion notice that carries no request id of ours). It is taken over like any turn, with nothing to send: the page is told (`onWake`) and attaches to it, or reads it when it ends.
    */
   async function startWakeTurn(c, seq) {
-    if (c.turn || c.starting || !c.wakeOptions) return;
-    c.starting = true; c.cancelStart = false;
+    if (updatePaused || c.turn || c.starting || !c.wakeOptions) return;
+    c.starting = true; c.startAbort = new AbortController(); c.startFinished = deferred();
     try { await runTurnInner(c, { ...c.wakeOptions, chatId: c.id, message: '', onFrame: () => {}, requestId: `wake-${randomUUID()}`, adopt: { seq } }); }
     catch (e) { log(`agent · a turn the agent started by itself could not be followed: ${e?.message ?? e}`); }
-    finally { c.starting = false; if (c.holding) { c.holding = false; notifyIdle(); } }
+    finally {
+      c.starting = false;
+      c.startAbort = null;
+      if (c.holding) { c.holding = false; notifyIdle(); }
+      c.startFinished.resolve();
+    }
   }
   function armWake(c, runtime, sessionId, after) {
     c.wake?.close();
+    if (updatePaused) return;
     // `after`: the last event our turn saw, so a turn that began before the watch's first snapshot still wakes the chat (#6070 review)
     c.wake = watchForWake({ gw: runtime.gw, sessionId, after, onWake: seq => { c.wake = null; void startWakeTurn(c, seq); } });
   }
@@ -451,9 +517,12 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     signal?.addEventListener('abort', () => { subscribers.delete(onFrame); }, { once: true });
     // What the assistant itself wrote in this run (not our own step lines): a plan turn reads its plan from it, a step reads its summary.
     const written = { all: '', step: '', reasoning: '' };
+    const progress = new ProgressGuard();
+    let finalAnswer = false;
     // TOOLCALL-B: the texts this turn sent the assistant (a marker whose request carries one is this turn's), the time of its newest own event
     // (a marker from before it is not about the reply that just ended), and the corrections asked for in a row.
-    const fix = { texts: new Set(), since: Date.now(), count: 0, total: 0, waiting: false, ended: false };
+    const fix = { texts: new Set(), since: Date.now(), count: 0, waiting: false, ended: null };
+    let recoveryPrompts = 0;
     // The frame that closed the turn, kept with the turn's text for a page that comes back after it ended (attach).
     let terminal = null;
     // The turn guard (turn-guard.mjs): counts failing searches, searches, plan rewrites and a nearly full context. Set up once the route is known.
@@ -492,12 +561,19 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
 
     emit({ type: 'queued', requestId });
     reporter.set({ phase: 'starting', code: 'starting', text: 'Starting…' });
-    const { rt: runtime, route } = await ensureRuntime(choice, signal);
+    const setupSignal = AbortSignal.any([c.startAbort.signal, AbortSignal.timeout(startTimeoutMs + sessionReadyMs + controlRpcMs)]);
+    const readySignal = signal ? AbortSignal.any([setupSignal, signal]) : setupSignal;
+    const { rt: runtime, route } = await beforeAbort(() => ensureRuntime(choice, readySignal), readySignal);
+    setupSignal.throwIfAborted();
     c.holding = true;   // this chat now works on `runtime`: a restart of the Harness waits for it (busyChats); cleared when its turn exists or the start ends (runTurn)
-    const made = await sessionFor(c, workspacePath, runtime, { vision: route.vision, onWait: () => reporter.set({ phase: 'starting', code: 'assistant-starting', text: 'Starting the assistant…' }) });
+    const made = await beforeAbort(() => sessionFor(c, workspacePath, runtime, {
+      vision: route.vision,
+      signal: setupSignal,
+      onWait: () => reporter.set({ phase: 'starting', code: 'assistant-starting', text: 'Starting the assistant…' }),
+    }), setupSignal);
     const { sessionId, fresh } = made ?? {};
     const cancelled = () => { reporter.clear(); emit({ type: 'done', finishReason: 'aborted', cancelled: true, tokensIn: null, tokensOut: null, usageSource: 'unavailable', durationMs: 0, model: route.name, contextMax: route.contextWindow }); return { cancelled: true }; };
-    if (c.cancelStart || !made) return cancelled();
+    if (!made) return cancelled();
 
     // The model and the chat's thinking level (the Reasoning menu) are sent to the Harness when either changed. A level the route does
     // not have (an API model with its own vocabulary) is dropped and the model's own default stands: never an error for the person.
@@ -512,9 +588,9 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     const provider = agentProvider(route, { budget, sampling, forwardAlways });
     const wanted = `${provider}/${route.modelId}/${level ?? ''}/${route.vision ? 'v' : ''}`;
     if (c.route !== wanted || c.routeGeneration !== runtime.generation || c.vision !== !!route.vision) {
-      const select = effort => runtime.gw.rpc('session/selectModel', { request: { sessionId, provider, model: route.modelId, ...(effort ? { reasoningEffort: effort } : {}) } });
+      const select = effort => boundedRpc(runtime, 'session/selectModel', { request: { sessionId, provider, model: route.modelId, ...(effort ? { reasoningEffort: effort } : {}) } }, setupSignal);
       try {
-        try { await select(level); } catch (e) { if (!level || e.code === 'session/not-found') throw e; await select(null); }
+        try { await select(level); } catch (e) { if (!level || e.code === 'session/not-found' || agentUnreachable(e)) throw e; await select(null); }
       } catch (e) {
         if (e.code === 'session/not-found') { delete sessionMap[c.id]; persist(); }
         throw new AgentUnavailable(`The coding assistant could not use ${route.name}. Pick the model again and retry.`, 'model-unavailable', e.message);
@@ -525,13 +601,14 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     // The chat's permission mode is read once, here, for this whole turn. A change the user makes while the
     // turn runs applies to the next one, so a running turn never sees its permissions move under it.
     const appliedMode = planTask ? 'plan' : modeOf(mode);
-    if (!adopt) await applyMode(runtime, sessionId, appliedMode);
+    if (!adopt) await applyMode(runtime, sessionId, appliedMode, setupSignal);
+    setupSignal.throwIfAborted();
 
     // Does the message fit the model's window? Asked before anything is sent, with the model server's own count (context-fit.mjs). A message
     // that fits once the older messages are a summary is sent after a summary; one that can never fit is not sent, and the person is told
     // plainly and offered the two ways out. Whatever cannot be counted goes through: the Harness recovers from a refusal by itself.
     if (!goal && !adopt && route.kind === 'local') {
-      const fit = await fitCheck({ runtime, route, sessionId, fresh, history, message }).catch(() => null);
+      const fit = await beforeAbort(() => fitCheck({ runtime, route, sessionId, fresh, history, message }).catch(() => null), setupSignal);
       if (fit?.action === 'too-large') {
         reporter.clear();
         const values = [grouped(fit.tokens), grouped(fit.window)];
@@ -541,26 +618,42 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       }
       if (fit?.action === 'summarize') {
         reporter.set({ phase: 'compacting', code: 'compacting', text: FIT_TEXT.summarizing, key: FIT_TEXT.summarizing, values: [] });
-        const done = await compactChat(runtime, sessionId);
+        const done = await beforeAbort(() => compactChat(runtime, sessionId), setupSignal);
         reporter.clear();
         if (done.ok) emit(summarizedNote(done.before, done.after, fit.window));
       }
     }
 
-    const projector = new TurnProjector({ policy: MODE_PRESETS[appliedMode].approval, window: route.contextWindow, catchUp: !!adopt });
+    setupSignal.throwIfAborted();
+    allowWork();
+    const projector = new TurnProjector({ policy: MODE_PRESETS[appliedMode].approval, window: route.contextWindow, catchUp: true });
     // #4981: a goal gets its own guard (failing calls pause it); the per-turn search and rewrite limits would stop a long goal
-    guard = goal ? new GoalGuard() : new TurnGuard({ plan: !!planTask, contextMax: route.kind === 'local' ? route.contextWindow : 0 });   // a saved connection's window is often only assumed: never judged by a guess
+    guard = goal ? new GoalGuard() : new TurnGuard({ plan: !!planTask });
     projector.onStatus = update => { if (!turn?.parentOpen && turn?.children.size && [...turn.children.values()].some(h => !h.done) && update.phase === 'waiting') return; reporter.set(update); };
     const turn = {
-      sessionId, projector, route, requestId, live: !!adopt, lastSeq: adopt ? adopt.seq - 1 : -1,
+      sessionId, projector, route, runtime, requestId, live: !!adopt, lastSeq: adopt ? adopt.seq - 1 : -1,
       ended: deferred(), follow: null, snapshot: deferred(), finished: false, prompted: false, stopBeforePrompt: false,
       abortFromRuntime: reason => finishTurn(reason), finish: failure => finishTurn(failure),
       // Helper agents (subagents) the Harness started for this chat, and the state of the run around them.
       children: new Map(), subagentCalls: new Map(), parentOpen: false, stopping: false, settleTimer: null, mode: appliedMode,
+      pendingSteers: new Map(), steerAdmissions: new Set(), followUps: [],
       plan: null, advancing: false, goalRun: false, lastActivity: Date.now(), heard: Date.now(), engineMark: null, watchdog: null,
       research: researchTopic ? { phase: 'gather', nudged: false, waitingStart: false } : null, wake: !!adopt, fix,
     };
     c.turn = turn; c.holding = false;
+    turn.updateSnapshot = () => ({
+      sessionId, requestId, mode: appliedMode, finished: turn.finished, stopping: turn.stopping,
+      text: written.all, reasoning: written.reasoning,
+      followUps: turn.followUps, helpers: [...turn.children.values()].map(child => child.cp.agent())
+    });
+    function showFollowUp(entry) {
+      if (entry.shown) return;
+      entry.shown = true;
+      entry.message.at = new Date().toISOString();
+      progress.newInstruction();
+      turn.followUps.push(entry.message);
+      emit({ type: 'agent-follow-up', message: entry.message });
+    }
     if (adopt) { log(`agent · ${chatId}: the agent started a turn by itself (a background job finished); following it as ${requestId}`); onWake(chatId, requestId); }
     if (workspacePath) folderClaims.begin(workspacePath, chatId);
     /**
@@ -574,8 +667,13 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       const newcomer = frame => { if (!alive) return; try { onFrame(frame); } catch { alive = false; } };
       newcomer({ type: 'start', model: route.name, contextMax: route.contextWindow, demo: false, remoteModel: route.kind === 'api', agent: true, mode: appliedMode, sessionId, requestId, skills: [], resumed: true, ...(planTask ? { planning: true } : {}) });
       newcomer({ type: 'resync', content: hideDeltas ? '' : written.all, reasoning: written.reasoning });
+      for (const message of turn.followUps) newcomer({ type: 'agent-follow-up', message });
       for (const t of projector.tools.values()) if (t.card) newcomer({ type: 'agent-tool', tool: t.card });
-      for (const q of questions.values()) if (q.sessionId === sessionId) newcomer({ type: 'agent-question', callId: q.callId, questions: q.items });
+      for (const child of turn.children.values()) {
+        newcomer(rowFrame(child));
+        for (const entry of child.cp.tools.values()) if (entry.asked) newcomer({ type: 'agent-tool', tool: entry.card });
+      }
+      for (const q of questions.values()) if (q.chatId === chatId) newcomer({ type: 'agent-question', callId: q.callId, questions: q.items, agentName: q.agentName });
       if (!alive) return;
       subscribers.add(onFrame);
       again?.addEventListener('abort', () => { subscribers.delete(onFrame); }, { once: true });
@@ -593,7 +691,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
         for (const h of turn.children.values()) {
           if (h.done || h.limitHit || h.cp.status !== 'working' || !h.cp.workStartedAt || Date.now() - h.cp.workStartedAt < helperLimit) continue;
           h.limitHit = true; h.cp.limitReached = true;
-          void runtime.gw.rpc('subagents/interruptByParent', { childSessionId: h.id, parentSessionId: sessionId, mode: 'continuable' }).catch(() => {});
+          void turn.stopChild(h).catch(e => log(`agent · helper limit: ${e.message}`));
         }
       }
       const toolRunning = [...projector.tools.values()].some(x => x.card?.state === 'running' || x.card?.state === 'proposed') || pending.size > 0 && pendingFor(chatId).length > 0;
@@ -601,8 +699,9 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       const endStalled = sinceMs => {
         turn.stalledFor = Math.round(sinceMs / 1000);
         turn.stopping = true;
-        void runtime.gw.rpc('session/cancel', { request: { sessionId } }).catch(() => {});
-        for (const h of turn.children.values()) if (!h.done) void runtime.gw.rpc('subagents/interruptByParent', { childSessionId: h.id, parentSessionId: sessionId, mode: 'continuable' }).catch(() => {});
+        void boundedRpc(runtime, 'session/cancel', { request: { sessionId } }).catch(() => {});
+        for (const h of turn.children.values()) if (!h.done) void interruptChild(runtime, sessionId, h.id).catch(() => {});
+        retireSession(c, sessionId);
         const mins = Math.max(1, Math.round(turn.stalledFor / 60));
         turn.finish(`The assistant stopped answering for ${mins > 1 ? mins + ' minutes' : 'a minute'}, so I ended this turn. Anything it already finished is kept. Send your message again to go on.`);
       };
@@ -627,11 +726,19 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     async function finishTurn(failure) {
       if (turn.finished) return;
       turn.finished = true;
-      for (const [k, v] of questions) if (v.sessionId === turn.sessionId) questions.delete(k);
+      turn.snapshot.resolve();
+      for (const [k, v] of questions) if (v.chatId === chatId) questions.delete(k);
+      for (const [k, v] of pending) if (v.sessionId === sessionId) pending.delete(k);
       clearTimeout(turn.settleTimer);
+      clearTimeout(turn.stopDeadline);
       clearInterval(turn.watchdog);
       turn.follow?.close();
-      for (const child of turn.children.values()) child.follow?.close();
+      for (const child of turn.children.values()) {
+        child.follow?.close();
+        clearTimeout(child.flush);
+        clearTimeout(child.stopDeadline);
+        if (!child.done) finishChild(child, { kind: 'interrupted' });
+      }
       if (turn.stopping && !failure) projector.ended = turn.guard ? { kind: 'completed' } : { kind: 'aborted', reason: { kind: 'user' } };
       reporter.clear();
       const extra = [];
@@ -643,7 +750,10 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       // The turn guard: a turn the app stopped, or one that ended with no words, always ends with one plain message (a plan card carries it itself).
       let noteReason = turn.guard ?? null;
       // TOOLCALL-B: the model wrote calls that could not run after two corrections in a row: one plain sentence, nothing else added.
-      if (fix.ended && !noteReason && !failure) { noteReason = 'tool-calls'; extra.push(endNote()); }
+      if (fix.ended && !noteReason && !failure) {
+        noteReason = fix.ended;
+        if (noteReason === 'tool-calls') extra.push(endNote());
+      }
       // A reply the length limit cut ends with a sentence that says so (and what was lost), never with silence (AGENT-LOST).
       const cutEnd = !failure && !turn.stopping && projector.ended?.kind === 'max-tokens';
       if (cutEnd && !noteReason) {
@@ -652,14 +762,20 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
 
 ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
       }
-      if (!noteReason && !cutEnd && guard && !failure && !turn.stopping && !turn.goalRun) {
-        noteReason = guard.silent({ ended: projector.ended, wrote: projector.emittedAny === true, acted: projector.tools.size > 0, contextTokens: projector.contextTokens });
+      const emptyCompletion = projector.ended?.kind === 'error' && projector.ended.error?.code === 'EMPTY_RESPONSE';
+      if (!noteReason && !cutEnd && guard && !failure && !turn.stopping && !turn.goalRun && !emptyCompletion) {
+        noteReason = guard.silent({ ended: projector.ended, wrote: finalAnswer, acted: projector.tools.size > 0 });
       }
       if (noteReason && !extra.some(f => f.type === 'plan' && f.event === 'proposed')) { const note = guardNote(noteReason); if (note) extra.push(note); }
       for (const f of extra) emit(f);
       // The answer speed of a turn on this computer is the engine's own (tokens it produced over its decode time, as the Monitor shows it).
       const engine = !failure && route.kind === 'local' ? await engineSpeedOf(route, projector) : null;
       const frames = failure ? [{ type: 'error', message: plainAgentFailure(failure), details: failure, code: 'AGENT_STOPPED' }] : projector.finish({ model: route.name, contextMax: route.contextWindow, engine });
+      if (!failure && emptyCompletion && !turn.stopping) {
+        const key = GUARD_NOTES[projector.tools.size > 0 ? 'work-only' : 'empty'];
+        Object.assign(frames.at(-1), { message: key, key, details: projector.ended.error.message });
+      }
+      if (noteReason && frames.at(-1)?.type === 'done') frames.at(-1).noteReason = noteReason;
       for (const f of frames.slice(0, -1)) emit(f);
       // Messages typed while the goal ran and not delivered between steps go back to the page now, to be sent as ordinary messages.
       if (turn.goalRun && isAttached()) {
@@ -669,21 +785,31 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
       for (const f of frames.slice(-1)) emit(f);
       c.turn = null;
       // What a page that was away needs to show the end of this turn (attach, below).
-      c.last = { wake: !!adopt, taken: isAttached(), requestId, sessionId, mode: appliedMode, model: route.name, contextMax: route.contextWindow, remoteModel: route.kind === 'api', content: hideDeltas ? '' : written.all.slice(0, 4_000_000), reasoning: written.reasoning, cards: [...projector.tools.values()].filter(t => t.card).map(t => t.card), terminal };
+      c.last = { wake: !!adopt, taken: isAttached(), requestId, sessionId, mode: appliedMode, model: route.name, contextMax: route.contextWindow, remoteModel: route.kind === 'api', content: hideDeltas ? '' : written.all.slice(0, 4_000_000), reasoning: written.reasoning, cards: [...projector.tools.values()].filter(t => t.card).map(t => t.card), agents: [...turn.children.values()].map(child => child.cp.agent()), followUps: turn.followUps, closingNotes: extra.filter(f => f.type === 'delta' && f.own).map(({ own, ...frame }) => frame), terminal };
       // every reply the agent started by itself that no page took is kept, not only the last one: two background commands that finish while the app is closed both reach the chat
       if (c.last.wake && !c.last.taken) c.woken = [...(c.woken ?? []).filter(w => !w.taken), c.last].slice(-WOKEN_KEPT);
       turn.ended.resolve({ reason: projector.ended, failure: failure ?? null });
       notifyIdle();
       if (!failure && !turn.stopping && !goal && !planTask && !researchTopic && rt === runtime) armWake(c, runtime, sessionId, turn.lastSeq);
-      // A turn that filled the context, or that the guard stopped, leaves a long history behind: summarise the older part now so the next message has room.
-      if (noteReason === 'context' || noteReason === 'searches' || noteReason === 'searches-failed' || noteReason === 'rewrites' || /context window|too long|exceeds/i.test(String(projector.ended?.error?.message ?? ''))) void compactSession(runtime, sessionId);
+      // The Harness recovers from actual context refusal, and the next prompt
+      // checks fit before it is sent. Avoid a second, unsolicited summary here.
+      if (noteReason === 'searches' || noteReason === 'searches-failed' || noteReason === 'rewrites') void compactSession(runtime, sessionId);
     }
 
     emit({ type: 'start', model: route.name, contextMax: route.contextWindow, demo: false, remoteModel: route.kind === 'api', agent: true, mode: appliedMode, sessionId, requestId, skills: [], ...(planTask ? { planning: true } : {}) });
 
+    // A resumed child keeps its ID. Its creation is in the parent's history,
+    // and the Harness emits no second catalog event when accepting a message.
+    const knownChildren = new Map();
     turn.follow = runtime.gw.openStream('session/follow', { request: { address: { kind: 'session', sessionId }, assistantStream: true } }, {
       onItem: item => {
         if (item.type === 'snapshot') {
+          for (const record of item.records ?? []) {
+            if (record.type === 'event' && record.event.type === 'subagent/catalog') {
+              const entry = record.event.data;
+              knownChildren.set(entry.childId, entry);
+            }
+          }
           if (turn.lastSeq < 0) turn.lastSeq = item.cursor;
           else for (const r of item.records ?? []) if (r.type === 'event' && r.event.seq > turn.lastSeq) handle({ type: 'event', event: r.event });
           // A turn the Harness started by itself may be mid-reply when this follow opens: the text so far comes from the snapshot, once.
@@ -693,8 +819,19 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
         }
         handle(item);
       },
-      onError: e => finishTurn(`The agent lost the session stream: ${e.message}`),
+      onEnd: () => loseSessionStream('stream closed'),
+      onError: e => loseSessionStream(e.message),
     });
+
+    function loseSessionStream(message) {
+      if (turn.finished) return;
+      if (turn.prompted) {
+        retireSession(c, sessionId);
+        void boundedRpc(runtime, 'session/cancel', { request: { sessionId } }).catch(() => {});
+        for (const child of turn.children.values()) if (!child.done) void interruptChild(runtime, sessionId, child.id).catch(() => {});
+      }
+      void finishTurn(`The agent lost the session stream: ${message}`);
+    }
 
     /** The guard says stop: end the turn the way Stop does, but as a normal end with a plain message (finishTurn). */
     function trip(reason) {
@@ -722,8 +859,21 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
       turn.lastActivity = Date.now();
       turn.heard = turn.lastActivity;
       for (const f of projector.consume(item)) emit(f);
-      if (guard && projector.contextTokens != null) trip(guard.context(projector.contextTokens));
-      if (item.type === 'event') watchParent(item.event);
+      if (item.type === 'event') {
+        const event = item.event;
+        if (event.type === 'assistant/message') {
+          const blocks = event.data?.message?.content ?? [];
+          finalAnswer = !hideDeltas && !blocks.some(block => block.type === 'tool-call')
+            && blocks.some(block => block.type === 'text' && block.text?.trim());
+        } else if (event.type === 'turn/start') finalAnswer = false;
+        turn.plan?.evidence?.observe(event);
+        watchParent(event);
+        const stalled = progress.observe(event);
+        // Waiting for a helper to report is legitimate work. Its own guard is independent.
+        if (stalled && ![...turn.children.values()].some(child => !child.done)) trip(stalled);
+      } else if (item.type === 'assistant-stream' && ![...turn.children.values()].some(child => !child.done)) {
+        trip(progress.observeStream(item.frame));
+      }
     }
 
     // -- helper agents ---------------------------------------------------------------------------------------
@@ -738,53 +888,111 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
       if (working && !turn.parentOpen) reporter.set({ phase: 'helpers', code: 'helpers', text: `Helpers are working (${working})…`, key: 'Helpers are working ({0})…', values: [working], args: { n: working } });
     };
 
+    function finishChild(child, reason) {
+      if (child.done) return;
+      if (reason) for (const frame of child.cp.consume({ type: 'event', event: { type: 'turn/end', data: { reason } } }).frames) emit(frame);
+      child.done = true;
+      child.endedAt = Date.now();
+      child.stopTask = null;
+      clearTimeout(child.stopDeadline);
+      for (const [key, entry] of pending) if (entry.sessionId === child.id) pending.delete(key);
+      for (const [key, entry] of questions) if (entry.sessionId === child.id) {
+        questions.delete(key);
+        emit({ type: 'agent-question-end', callId: entry.callId });
+      }
+      emitRow(child, true);
+      if (!turn.finished) armSettle();
+    }
+
+    function loseChild(child, message) {
+      child.follow?.close();
+      if (turn.finished || child.done) return;
+      child.noticed = true; // The lost stream can no longer confirm a report.
+      if (!child.stopTask) void interruptChild(runtime, sessionId, child.id).catch(() => {});
+      finishChild(child, { kind: 'error', error: { message } });
+    }
+
+    turn.stopChild = child => {
+      if (child.done) return Promise.resolve();
+      if (child.stopTask) return child.stopTask;
+      child.stopDeadline = after(helperStopMs, () => loseChild(child, 'The helper did not confirm that it stopped.'));
+      child.stopTask = interruptChild(runtime, sessionId, child.id).catch(e => {
+        if (child.done) return;
+        clearTimeout(child.stopDeadline);
+        child.stopTask = null;
+        if (child.limitHit) loseChild(child, 'The helper did not confirm that it stopped.');
+        throw e;
+      });
+      return child.stopTask;
+    };
+
     function openChild(d) {
       const id = d.childId;
       if (!id || turn.children.has(id)) return;
       const cp = new ChildProjector({ id, name: d.label || 'Helper' });
-      const child = { id, cp, follow: null, noticed: false, done: false, lastRow: 0, rowPending: false, endedAt: 0 };
+      const child = { id, cp, guard: new ProgressGuard(), follow: null, noticed: false, done: false, lastRow: 0, rowPending: false, endedAt: 0, lastSeq: -1 };
       turn.children.set(id, child);
       emitRow(child, true);
-      const fold = item => {
+      const fold = (item, replay = false) => {
         if (turn.finished) return;
+        if (item.type === 'event' && Number.isInteger(item.event.seq)) {
+          if (item.event.seq <= child.lastSeq) return;
+          child.lastSeq = item.event.seq;
+        }
         turn.lastActivity = turn.heard = Date.now();
         // A helper that finishes before its throttled "working" row went out would show queued -> completed and never "working": send the held row first.
         if (item.type === 'event' && item.event.type === 'turn/end' && child.rowPending) emitRow(child, true);
         const { frames, row } = cp.consume(item);
         for (const f of frames) emit(f);
-        if (item.type === 'event' && item.event.type === 'turn/end') { child.done = true; child.endedAt = Date.now(); emitRow(child, true); armSettle(); return; }
-        if (item.type === 'event' && child.done && cp.status === 'working') { child.done = false; child.limitHit = false; }
+        if (item.type === 'event' && item.event.type === 'turn/end') { child.confirmedEnd = true; finishChild(child); return; }
+        if (child.done && !cp.finished) {
+          child.confirmedEnd = false;
+          child.done = false;
+          child.noticed = false;
+          child.limitHit = false;
+          child.guard = new ProgressGuard();
+          clearTimeout(turn.settleTimer);
+        }
+        if (!replay && !child.done && !child.stopTask && !turn.stopping) {
+          const reason = item.type === 'event' ? child.guard.observe(item.event)
+            : item.type === 'assistant-stream' ? child.guard.observeStream(item.frame) : null;
+          if (reason) {
+            cp.progressStop = GUARD_NOTES[reason];
+            log(`agent · helper guard: ${reason}`);
+            void turn.stopChild(child).catch(e => loseChild(child, e.message));
+          }
+        }
         if (row) emitRow(child);
       };
       child.follow = runtime.gw.openStream('session/follow', {
         request: { address: { kind: 'subagent', parentSessionId: sessionId, childSessionId: id, mode: d.mode ?? 'unknown' }, assistantStream: true },
       }, {
         onItem: item => {
-          if (item.type === 'snapshot') { for (const r of item.records ?? []) if (r.type === 'event') fold({ type: 'event', event: r.event }); return; }
+          if (item.type === 'snapshot') { for (const r of item.records ?? []) if (r.type === 'event') fold({ type: 'event', event: r.event }, true); return; }
           fold(item);
         },
-        onError: e => {
-          log(`agent · helper stream ended: ${e.message}`);
-          if (!child.done) { child.done = true; child.endedAt = Date.now(); cp.status = 'failed'; cp.failure = 'Lost contact with this helper.'; cp.endedAt = Date.now(); emitRow(child, true); armSettle(); }
-        },
+        onEnd: () => loseChild(child, 'Lost contact with this helper.'),
+        onError: e => { log(`agent · helper stream ended: ${e.message}`); loseChild(child, 'Lost contact with this helper.'); },
       });
       // A late reader still gets the final row: flush any row held back by the throttle.
-      child.flush = after(500, function tick() { if (!turn.finished && child.rowPending) emitRow(child, true); if (!turn.finished && !child.done) child.flush = after(500, tick); });
+      child.flush = after(500, function tick() { if (turn.finished) return; if (child.rowPending) emitRow(child, true); child.flush = after(500, tick); });
     }
 
     function watchParent(e) {
       const d = e.data ?? {};
       switch (e.type) {
         case 'turn/start':
+          turn.endObserved = false;
           turn.parentOpen = true;
           if (turn.research) turn.research.waitingStart = false;
           turn.cutWaiting = false;
           fix.waiting = false;
           clearTimeout(turn.settleTimer);
           // After Stop, a helper's report would start a new turn that nobody asked for.
-          if (turn.stopping) void runtime.gw.rpc('session/cancel', { request: { sessionId } }).catch(() => {});
+          if (turn.stopping) void boundedRpc(runtime, 'session/cancel', { request: { sessionId } }).catch(() => {});
           break;
         case 'turn/end':
+          turn.endObserved = true;
           turn.parentOpen = false;
           armSettle();
           break;
@@ -794,21 +1002,48 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
           if (!turn.parentOpen) { turn.parentOpen = true; clearTimeout(turn.settleTimer); }
           break;
         case 'tool/call':
-          if (d.name === 'subagent' || d.name === 'subagent_fork') turn.subagentCalls.set(d.callId, parseArgs(d.arguments));
+          if (d.name === 'subagent' || d.name === 'subagent_fork' || d.name === 'send_message') turn.subagentCalls.set(d.callId, parseArgs(d.arguments));
           break;
         case 'subagent/catalog':
+          knownChildren.set(d.childId, d);
           openChild(d);
           break;
         case 'tool/result': {
           const call = turn.subagentCalls.get(d.message?.toolCallId);
           const text = (d.message?.content ?? []).map(p => p.text ?? '').join(' ');
+          if (call?.agent_id && !d.message?.isError) {
+            const target = knownChildren.get(call.agent_id);
+            if (target?.mode === 'continuable') openChild(target);
+          }
           const started = /started subagent ([0-9a-f-]{36})/i.exec(text);
           const child = started ? turn.children.get(started[1]) : null;
           if (call && child) { child.cp.task = String(call.prompt ?? call.description ?? '').replace(/\s+/g, ' ').trim().slice(0, 140); emitRow(child, true); }
           break;
         }
-        case 'user/message':
+        case 'user/message': {
+          const id = d.source?.rpcId;
+          const followUp = turn.pendingSteers.get(id);
+          if (followUp) {
+            turn.pendingSteers.delete(id);
+            fix.texts.add(followUp.message.text);
+            fix.since = Date.now();
+            if (turn.plan?.evidence) {
+              const evidence = turn.plan.evidence;
+              const changedCheck = evidence.correct(followUp.message.text);
+              const plan = plans.get(chatId);
+              const at = plan && currentStep(plan);
+              if (plan?.id === turn.plan.id && at >= 0) plans.update(chatId, p => {
+                const step = p.steps[at];
+                step.correction = followUp.message.text.slice(0, 600);
+                if (changedCheck) step.verificationDirection = step.correction;
+                step.verification = evidence.requirement;
+              });
+            }
+            showFollowUp(followUp);
+            if (!turn.parentOpen) armSettle();
+          }
           if (d.source?.kind === 'goal' && Number.isInteger(d.source.round)) { turn.goalRound = d.source.round; void announceGoal(); }
+        }
         // falls through
         case 'agent/inbox/spliced': {
           // a notice the Harness put into the conversation (a helper's report): a marker from before it is not about the parent's next reply
@@ -837,7 +1072,7 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
     function settlePlan(failure) {
       if (planTask) {
         if (failure || (turn.stopping && !turn.guard)) return [];
-        const parsed = parsePlan(written.all, planTask);
+        const parsed = parsePlan(written.all, planTask, planBrief);
         if (!parsed) return [];
         const plan = plans.create(chatId, { title: parsed.title, steps: parsed.steps, request: planTask, ...(turn.guard ? { caution: GUARD_NOTES[turn.guard] } : {}) });
         return [publishPlan('proposed', plan)];
@@ -863,9 +1098,13 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
 
     /** The goal the Harness runs for the plan's next waiting step, and the frames that say so. */
     async function startStep(plan, index) {
+      if (updatePaused) return;
       plans.update(chatId, p => { p.state = 'running'; p.goalStarted = true; p.steps[index].state = 'running'; });
       const now = plans.get(chatId);
-      await runtime.gw.rpc('goals/create', { agentId: sessionId, request: { objective: stepObjective(now, index) } });
+      if (planBrief) turn.plan.evidence = new StepEvidence(workspacePath, requirementOf(now.steps[index]));
+      const objective = stepObjective(now, index, planBrief);
+      await boundedRpc(runtime, 'goals/create', { agentId: sessionId, request: { objective } });
+      if (turn.finished || turn.stopping) return;
       written.step = ''; written.stepAt = Date.now();
       emit(stepFrame(now, index));
       emit(publishPlan('step', now));
@@ -875,14 +1114,33 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
 
     /** One goal step finished: say so, hand over queued messages, and begin the next step (or end the plan). */
     async function advancePlan() {
+      if (updatePaused) return false;
       const run = turn.plan;
       const plan = plans.get(chatId);
       if (!run || !plan || plan.id !== run.id) return false;
       const at = currentStep(plan);
       if (at < 0) return false;
+      const evidence = run.evidence;
+      if (evidence?.requirement && !evidence.receipt) {
+        const message = evidence.requirement.invalid
+          ? 'This plan step still needs a valid read verification rule.'
+          : typeof evidence.requirement.line === 'string'
+            ? 'The plan step is paused until the required line is verified with Read.'
+            : 'The plan step is paused until the corrected file is verified with Read.';
+        emit({ type: 'delta', own: true, text: '\n\n' + message + '\n', key: message });
+        for (const frame of settlePlan(null)) emit(frame);
+        return false;
+      }
       const cards = [...projector.tools.values()].filter(x => x.calledAt >= (written.stepAt ?? 0) - 50 && x.card?.state === 'done').map(x => x.card);
-      const summary = stepSummary(cards, written.step.split(/\n\s*\n/).filter(Boolean).at(-1) ?? written.step);
-      plans.update(chatId, p => { p.steps[at].state = 'done'; p.steps[at].summary = summary; });
+      const summary = evidence?.receipt
+        ? 'Verified ' + evidence.receipt.path + (evidence.receipt.line === undefined ? ' with Read.' : ' at line ' + evidence.receipt.line + '.')
+        : stepSummary(cards, written.step.split(/\n\s*\n/).filter(Boolean).at(-1) ?? written.step);
+      plans.update(chatId, p => {
+        const step = p.steps[at];
+        step.state = 'done';
+        step.summary = summary;
+        if (evidence?.receipt) step.evidence = evidence.receipt;
+      });
       let now = plans.get(chatId);
       emit(stepFrame(now, at));
       emit({ type: 'delta', own: true, text: `\n\n${stepLine(at, now.steps.length, now.steps[at].text, 'done')}\n` });
@@ -901,7 +1159,7 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
     /** Hand the person's queued messages to the assistant, one at a time, each answered before the next. */
     async function deliverQueued(afterStep) {
       const list = queues.get(chatId) ?? [];
-      while (list.length && !turn.stopping && !turn.finished) {
+      while (list.length && !updatePaused && !turn.stopping && !turn.finished) {
         const item = list.shift();
         if (!list.length) queues.delete(chatId);
         onQueue(chatId, queueView(chatId));
@@ -922,20 +1180,23 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
      * open (for a few seconds at most); after Stop nobody waits for reports.
      */
     function armSettle() {
+      if (updatePaused && !turn.stopping) return;
       clearTimeout(turn.settleTimer);
       if (turn.finished) return;
       turn.settleTimer = after(turn.stopping ? 1200 : turn.children.size ? 600 : 0, async () => {
-        if (turn.finished || turn.parentOpen || turn.advancing) return;
+        if (turn.finished || turn.parentOpen || turn.advancing || (updatePaused && !turn.stopping)) return;
+        if (turn.steerAdmissions.size || turn.pendingSteers.size) { armSettle(); return; }
         const open = [...turn.children.values()];
         if (open.some(c => !c.done)) return;
         if (!turn.stopping) {
           if (open.some(c => !c.noticed && Date.now() - c.endedAt < 8000)) { armSettle(); return; }
           // An armed goal starts its next round as soon as the agent is idle: the run is not over until the goal stops.
           const current = await goalGet();
-          if (turn.finished || turn.parentOpen) return;
+          if (turn.finished || turn.parentOpen || [...turn.children.values()].some(c => !c.done)) return;
+          if (turn.pendingSteers.size) { armSettle(); return; }
           if (current && current.phase === 'active' && current.activation === 'armed') { turn.settleTimer = after(700, armSettle); return; }
           // TOOLCALL-B: the reply that ended the turn carried a tool call that could not run (an undeclared name, or markup cut off). The model
-          // gets a tool error and goes on, twice in a row at most; the third time the turn ends with one plain sentence. Nothing guessed runs.
+          // can retry within the turn's shared recovery budget. The bridge never runs a guessed tool call.
           if (fix.waiting) { turn.settleTimer = after(300, armSettle); return; }
           if (!turn.goalRun && !turn.stopping && projector.ended?.kind === 'completed') {
             const others = [...chats.values()].map(x => x.turn).filter(t => t && t !== turn && !t.finished && t.fix).map(t => ({ texts: t.fix.texts, since: t.fix.since }));
@@ -944,13 +1205,13 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
             else if (got?.marker) {
               const m = got.marker;
               const what = [...(m.rejected ?? []).map(r => `rejected ${String(r?.name ?? '?').slice(0, 40)}`), ...(m.unread ? [`unread ${m.unread.reason ?? '?'}`] : [])].join(', ');
-              if (fix.count >= MAX_TOOL_FIXES) {
-                fix.ended = true;
-                log(`agent · ${chatId}: tool call could not run (${what}) after ${fix.count} corrections in a row; the turn ends`);
+              if (fix.count >= MAX_TOOL_FIXES || recoveryPrompts >= MAX_RECOVERY_PROMPTS) {
+                fix.ended = fix.count >= MAX_TOOL_FIXES && !projector.tools.size ? 'tool-calls' : 'recovery-limit';
+                log(`agent · ${chatId}: tool call could not run (${what}); recovery limit reached, ending the turn`);
                 finishTurn(null);
                 return;
               } else {
-                fix.count += 1; fix.total += 1;
+                fix.count += 1; recoveryPrompts += 1;
                 const text = correctionText(m);
                 log(`agent · ${chatId}: tool call could not run (${what}); correction ${fix.count} of ${MAX_TOOL_FIXES}`);
                 reporter.set({ phase: 'waiting', code: 'fixing-tool-call', text: FIXING_STATUS, key: FIXING_STATUS, values: [], urgent: true });
@@ -964,9 +1225,12 @@ ${note.text}`, key: note.key, values: note.values, noteReason: 'cut' });
           }
           // A reply the length limit cut (AGENT-LOST): the agent lost what it was writing. Say so in the chat and ask it to carry on in smaller pieces, twice at most.
           if (turn.cutWaiting) { turn.settleTimer = after(300, armSettle); return; }
-          if (projector.ended?.kind === 'max-tokens' && !turn.goalRun && !turn.stopping && (turn.cuts ?? 0) < MAX_CUT_RETRIES) {
+          if (projector.ended?.kind === 'max-tokens' && !turn.goalRun && !turn.stopping && recoveryPrompts < MAX_RECOVERY_PROMPTS) {
             const cut = projector.cut();
-            turn.cuts = (turn.cuts ?? 0) + 1;
+            // A continuation can preserve an incomplete tool draft or visible answer.
+            // A reasoning-only cutoff has neither; resending at the same effort wastes another decode.
+            if (!cut.calls.length && !finalAnswer) { finishTurn(null); return; }
+            recoveryPrompts += 1;
             const note = cutNotice({ ...cut, retrying: true });
             emit({ type: 'delta', own: true, text: `
 
@@ -1007,13 +1271,15 @@ ${note.text}
             if (more && !turn.finished && !turn.stopping) { turn.settleTimer = after(700, armSettle); return; }
           }
 
-          if (turn.goalRun && current) { const line = goalEnding(current); if (line) emit({ type: 'delta', text: line }); }
+          if (turn.goalRun && current && (!turn.plan?.evidence?.requirement || turn.plan.evidence.receipt || current.phase !== 'complete')) {
+            const line = goalEnding(current); if (line) emit({ type: 'delta', text: line });
+          }
           if (turn.goalRun) await announceGoal(true);
         }
         finishTurn(null);
       });
     }
-    const goalGet = () => runtime.gw.rpc('goals/get', { agentId: sessionId }).catch(() => undefined);
+    const goalGet = () => boundedRpc(runtime, 'goals/get', { agentId: sessionId }).catch(() => undefined);
     /** The goal's state to the page: a `goal` frame, the SSE event for the bar, and (while a round runs) the status line. */
     async function announceGoal(final = false) {
       const view = await goalGet();
@@ -1026,14 +1292,37 @@ ${note.text}
     turn.announceGoal = announceGoal;
     turn.announceQueue = frame => emit(frame);
     turn.announceQuestion = frame => emit(frame);
+    turn.steer = async text => {
+      const id = `steer-${randomUUID()}`;
+      const entry = { message: { id, text, at: new Date().toISOString() }, shown: false };
+      turn.pendingSteers.set(id, entry);
+      const admission = boundedRpc(runtime, 'session/prompt', {
+        request: { requestId: id, sessionId, mode: 'steer', content: [{ type: 'text', text }] },
+      });
+      turn.steerAdmissions.add(admission);
+      try {
+        await admission;
+        showFollowUp(entry);
+      } catch (error) {
+        // The session event can confirm delivery even if the HTTP acknowledgement was lost.
+        if (!turn.pendingSteers.delete(id)) return { ok: true, message: entry.message };
+        throw error;
+      } finally {
+        turn.steerAdmissions.delete(admission);
+        if (!turn.parentOpen) armSettle();
+      }
+      return { ok: true, message: entry.message };
+    };
 
     const snapshotTimer = {};
     await Promise.race([turn.snapshot.promise, new Promise((_, rej) => { snapshotTimer.t = after(20_000, () => rej(new Error('the session stream did not open'))); })])
       .catch(e => { finishTurn(e.message); })
       .finally(() => clearTimeout(snapshotTimer.t));
     if (turn.finished) return { error: true };
-    if (turn.stopBeforePrompt || c.cancelStart) { projector.ended = { kind: 'aborted', reason: { kind: 'user' } }; finishTurn(null); return { cancelled: true }; }
+    if (turn.stopBeforePrompt) { projector.ended = { kind: 'aborted', reason: { kind: 'user' } }; finishTurn(null); return { cancelled: true }; }
 
+    if (updatePaused) { await finishTurn(null); return { cancelled: true }; }
+    turn.prompted = true;
     if (goal) {
       // A goal run has no prompt of its own: the Harness's goal driver starts the rounds. Everything from now on is ours.
       turn.live = true; turn.goalRun = true;
@@ -1044,7 +1333,9 @@ ${note.text}
           turn.plan = { id: plan.id, once: !!planRun.once };
           const at = currentStep(plan);
           if (at < 0) throw new AgentUnavailable('Every step of this plan is already done.', 'plan-done');
-          if (goal.action === 'resume' && plan.goalStarted) {
+          const recheck = planBrief && goal.action === 'resume' && (await goalGet())?.phase === 'complete';
+          if (goal.action === 'resume' && plan.goalStarted && !recheck) {
+            if (planBrief) turn.plan.evidence = new StepEvidence(workspacePath, requirementOf(plan.steps[at]));
             plans.update(chatId, p => { p.state = 'running'; p.steps[at].state = 'running'; });
             await startGoal(runtime, sessionId, goal);
             emit(publishPlan('step', plans.get(chatId)));
@@ -1062,26 +1353,29 @@ ${note.text}
       if (fresh && history.length) prompt = withEarlierConversation(history, message);
       fix.texts.add(prompt); fix.since = Date.now();
       try {
-        await runtime.gw.rpc('session/prompt', { request: { requestId, sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }, ...imageParts(images)] } });
+        await Promise.race([
+          boundedRpc(runtime, 'session/prompt', { request: { requestId, sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }, ...imageParts(images)] } }),
+          turn.ended.promise,
+        ]);
       } catch (e) {
-        finishTurn(`The agent did not accept the message: ${e.message}`);
-        return { error: true };
+        if (!turn.live && !turn.finished) {
+          if (agentUnreachable(e)) {
+            retireSession(c, sessionId);
+            void boundedRpc(runtime, 'session/cancel', { request: { sessionId } }).catch(() => {});
+          }
+          await finishTurn(`The agent did not accept the message: ${e.message}`);
+          return { error: true };
+        }
       }
     }
     if (!goal && !adopt) reporter.set({ phase: 'waiting', code: 'reading-prompt', text: 'Reading your message…' });
-    turn.prompted = true; turn.promptedAt = Date.now();
-    if (turn.stopBeforePrompt) {
-      // Stop landed in the instant between 'prompt sent' and 'prompt accepted'. A cancel before the turn
-      // starts arms nothing, so wait for the turn to be ours, then cancel it.
-      for (let i = 0; i < 100 && !turn.live && !turn.finished; i++) await new Promise(r => setTimeout(r, 50));
-      if (!turn.finished) await runtime.gw.rpc('session/cancel', { request: { sessionId } }).catch(() => {});
-    }
+    turn.promptedAt = Date.now();
 
     // Wait for the turn, or for the client to leave. Leaving does not stop the turn.
-    const gone = new Promise(r => signal?.addEventListener('abort', () => r('detached'), { once: true }));
+    const gone = signal?.aborted ? Promise.resolve('detached') : new Promise(r => signal?.addEventListener('abort', () => r('detached'), { once: true }));
     const outcome = await Promise.race([turn.ended.promise, gone]);
     if (outcome === 'detached') return { detached: true, sessionId, ended: turn.ended.promise.then(r => ({ ...r, tokensOut: projector.tokensOut })) };
-    return { sessionId, reason: outcome.reason, tokensIn: projector.tokensIn, tokensOut: projector.tokensOut };
+    return { sessionId, reason: outcome.reason, error: !!outcome.failure, tokensIn: projector.tokensIn, tokensOut: projector.tokensOut };
   }
 
   // -- /goal -----------------------------------------------------------------------------------------------
@@ -1090,20 +1384,20 @@ ${note.text}
   async function startGoal(runtime, sessionId, goal) {
     if (goal.action === 'create') {
       const request = { objective: goal.objective, ...(goal.maxRounds ? { maxGoalRounds: goal.maxRounds } : {}) };
-      await runtime.gw.rpc('goals/create', { agentId: sessionId, request });
+      await boundedRpc(runtime, 'goals/create', { agentId: sessionId, request });
       return;
     }
-    const current = await runtime.gw.rpc('goals/get', { agentId: sessionId });
+    const current = await boundedRpc(runtime, 'goals/get', { agentId: sessionId });
     if (!current) throw new AgentUnavailable('There is no goal to continue. Start one with /goal followed by what you want done.', 'goal-none');
-    await runtime.gw.rpc('goals/resume', { agentId: sessionId, ref: { id: current.id, revision: current.revision } });
+    await boundedRpc(runtime, 'goals/resume', { agentId: sessionId, ref: { id: current.id, revision: current.revision } });
   }
 
-  async function pauseGoal(runtime, sessionId, chatId = null) {
+  async function pauseGoal(runtime, sessionId, chatId = null, signal = null) {
     try {
-      const current = await runtime.gw.rpc('goals/get', { agentId: sessionId });
+      const current = await boundedRpc(runtime, 'goals/get', { agentId: sessionId }, signal);
       if (current && current.phase === 'active') {
-        await runtime.gw.rpc('goals/pause', { agentId: sessionId, ref: { id: current.id, revision: current.revision } });
-        if (chatId) onGoal(chatId, goalObject(await runtime.gw.rpc('goals/get', { agentId: sessionId }).catch(() => undefined)));
+        await boundedRpc(runtime, 'goals/pause', { agentId: sessionId, ref: { id: current.id, revision: current.revision } }, signal);
+        if (chatId) onGoal(chatId, goalObject(await boundedRpc(runtime, 'goals/get', { agentId: sessionId }, signal).catch(() => undefined)));
       }
     } catch { /* no goal service, or nothing to pause */ }
   }
@@ -1111,12 +1405,13 @@ ${note.text}
   /** The goal as the page and the goal bar see it (notes-split-agent3.md), or null. */
   function goalObject(view, chatId = null) {
     if (!view) return null;
-    const phase = ['active', 'paused', 'complete', 'blocked'].includes(view.phase) ? view.phase : 'blocked';
+    let phase = ['active', 'paused', 'complete', 'blocked'].includes(view.phase) ? view.phase : 'blocked';
     // A goal that is running a plan (or the points of a goal) shows the plan's title and which step it is on.
     const plan = chatId ? plans.get(chatId) : null;
     const running = plan && plan.goalStarted && ['running', 'paused'].includes(plan.state) ? plan : null;
     const at = running ? running.steps.findIndex(x => x.state !== 'done' && x.state !== 'skipped') : -1;
     const step = running && at >= 0 ? { index: at + 1, total: running.steps.length, text: running.steps[at].text } : null;
+    if (planBrief && running?.state === 'paused' && at >= 0 && phase === 'complete' && requirementOf(running.steps[at])) phase = 'paused';
     return { objective: step ? running.title : String(view.objective ?? ''), ...(step ? { step } : {}), phase, round: view.roundsStarted ?? 0, maxRounds: view.maxGoalRounds ?? null, ...(phase === 'blocked' ? { blocked: plainBlocker(view.blockedReason) } : {}) };
   }
 
@@ -1129,6 +1424,7 @@ ${note.text}
 
   /** Pause, edit or remove the goal from the goal bar. Instant; resume runs rounds and goes through the chat stream. */
   async function goalControl({ chatId, action, text }) {
+    allowWork();
     const known = sessionMap[chatId]?.sessionId;
     if (!known || !rt?.hp.running) throw new AgentUnavailable('There is no goal in this chat yet.', 'goal-none');
     const current = await rt.gw.rpc('goals/get', { agentId: known }).catch(() => undefined);
@@ -1206,7 +1502,7 @@ ${note.text}
       return runTurn({ ...options, goal: { action: 'resume' }, ...(goalPlan ? { planRun: goalPlan } : {}) });
     }
     // A goal whose own words hold numbered points ("1. ... 2. ... 3. ...") runs point by point, each one reported.
-    const points = parsePoints(text);
+    const points = parsePoints(text, planBrief);
     if (points) {
       const plan = plans.create(chatId, { title: points.title, steps: points.steps, request: text, source: 'goal', state: 'approved' });
       onPlan(chatId, 'approved', planView(plan));
@@ -1250,7 +1546,7 @@ ${note.text}
         ? 'A plan is waiting for you above. Approve it, edit it or reject it, or type /plan followed by something else to make a new one.'
         : 'Type /plan followed by what you want done, for example: /plan build a small pagoda page. I will look around and write a plan; nothing changes until you approve it.');
     }
-    return runTurn({ ...options, message: planPrompt(task), planTask: task, mode: 'plan' });
+    return runTurn({ ...options, message: planPrompt(task, planBrief), planTask: task, mode: 'plan' });
   }
 
   /**
@@ -1283,7 +1579,7 @@ ${note.text}
     const plan = planOf(chatId, planId);
     if (action === 'edit') {
       mustBeOpen(plan);
-      const next = editedSteps(steps, plan.steps);
+      const next = editedSteps(steps, plan.steps, planBrief);
       const t = String(title ?? '').replace(/\s+/g, ' ').trim().slice(0, 80);
       plans.update(chatId, p => { p.steps = next; if (t) p.title = t; p.state = 'proposed'; });
       onPlan(chatId, 'edited', planView(plans.get(chatId)));
@@ -1340,8 +1636,8 @@ ${note.text}
    * carries on.
    */
   async function answerQuestion({ chatId, callId, answers, skip = false }) {
-    const sessionId = sessionMap[chatId]?.sessionId;
-    const key = `${sessionId}:${callId}`;
+    allowWork();
+    const key = `${chatId}:${callId}`;
     const entry = questions.get(key);
     if (!entry || !rt?.hp.running) throw new AgentUnavailable('That question was already answered, or the assistant has gone on.', 'question-gone');
     const outcome = skip ? 'next' : buildAnswer(entry.items, answers);
@@ -1358,7 +1654,36 @@ ${note.text}
    * (or is between steps) a new turn. The Harness refuses a helper that cannot take messages (a one-shot one) and a parent that is not live;
    * either comes back as a plain sentence.
    */
+  /** Follow a continuable helper that received a follow-up while its parent chat is idle (#6516). */
+  function watchIdleHelper(c, runtime, parentSessionId, helperId) {
+    c.idleHelpers ??= new Map();
+    const existing = c.idleHelpers.get(helperId);
+    if (existing && !existing.done) return existing;
+    const prev = c.last?.agents?.find(a => a.id === helperId);
+    const cp = new ChildProjector({ id: helperId, name: prev?.name ?? 'Helper', task: prev?.description ?? '' });
+    if (Array.isArray(prev?.steps)) cp.steps = prev.steps.slice(-20);
+    if (Array.isArray(prev?.replies)) cp.replies = prev.replies.slice(-50);
+    const entry = { id: helperId, parentSessionId, cp, done: false, close: null };
+    c.idleHelpers.set(helperId, entry);
+    const syncLast = () => {
+      const snap = cp.agent();
+      if (c.last) {
+        const list = Array.isArray(c.last.agents) ? c.last.agents : [];
+        const at = list.findIndex(a => a.id === helperId);
+        c.last.agents = at >= 0 ? list.map((a, i) => i === at ? snap : a) : [...list, snap];
+      }
+    };
+    const stream = runtime.gw.follow(helperId, item => {
+      cp.consume(item);
+      syncLast();
+      if (cp.finished) { entry.done = true; stream?.close?.(); }
+    }, () => { entry.done = true; });
+    entry.close = () => { entry.done = true; stream?.close?.(); };
+    return entry;
+  }
+
   async function messageHelper({ chatId, helperId, text, delivery = 'queue' }) {
+    allowWork();
     const clean = String(text ?? '').trim().slice(0, 8000);
     if (!clean) throw new AgentUnavailable('Type a few words for the helper.', 'helper-empty');
     if (!/^[\w.:@-]{1,160}$/.test(String(helperId ?? ''))) throw new AgentUnavailable('That helper is not known.', 'helper-unknown');
@@ -1366,6 +1691,10 @@ ${note.text}
     if (!parent || !rt?.hp.running) throw new AgentUnavailable('The assistant is not running in this chat, so it cannot pass a message on. Send a message in the chat first.', 'helper-idle');
     try {
       const receipt = await rt.gw.rpc('subagents/prompt', { request: { requestId: `helper-${randomUUID()}`, parentSessionId: parent, childSessionId: String(helperId), mode: 'continuable', delivery: delivery === 'steer' ? 'steer' : 'queue', content: [{ type: 'text', text: clean }] } });
+      const c = chat(chatId);
+      const liveChild = c.turn?.children.get(String(helperId));
+      if (liveChild) liveChild.guard.newInstruction();
+      else if (typeof rt.gw.follow === 'function') watchIdleHelper(c, rt, parent, String(helperId));
       return { ok: true, messageId: receipt?.messageId ?? null, delivery: delivery === 'steer' ? 'steer' : 'queue' };
     } catch (e) {
       log(`agent · message for a helper refused: ${String(e?.message ?? e).slice(0, 200)}`);
@@ -1373,10 +1702,41 @@ ${note.text}
     }
   }
 
+  async function stopHelper({ chatId, helperId }) {
+    const c = chats.get(chatId);
+    const id = String(helperId ?? '');
+    const turn = c?.turn;
+    const child = turn?.children.get(id);
+    if (turn && child && !child.done && rt?.hp.running) {
+      await turn.stopChild(child);
+      return { ok: true };
+    }
+    const idle = c?.idleHelpers?.get(id);
+    if (idle && !idle.done && rt?.hp.running) {
+      await interruptChild(rt, idle.parentSessionId, id);
+      idle.close?.();
+      return { ok: true };
+    }
+    throw new AgentUnavailable('This helper has already finished or is no longer running.', 'helper-gone');
+  }
+
   // -- messages typed while a goal runs ----------------------------------------------------------------------
+
+  /** Add input to the parent at its next step while the current chat and helpers keep running. */
+  async function steerMessage({ chatId, text }) {
+    allowWork();
+    const turn = chats.get(chatId)?.turn;
+    if (!turn?.live || turn.finished || turn.stopping || turn.advancing || typeof turn.steer !== 'function') {
+      throw new AgentUnavailable('No running assistant can take this message right now.', 'steer-idle');
+    }
+    const clean = typeof text === 'string' ? text.trim() : '';
+    if (!clean) throw new AgentUnavailable('Enter a message first.', 'steer-empty');
+    return turn.steer(clean);
+  }
 
   /** Queue a message for the running goal. It is delivered between steps, or handed back to the page when the goal ends or pauses. */
   function queueMessage({ chatId, text }) {
+    allowWork();
     const turn = chats.get(chatId)?.turn;
     if (!turn || !turn.goalRun || turn.stopping || turn.finished) throw new AgentUnavailable('No goal is running in this chat, so there is nothing to queue behind. Send the message as usual.', 'queue-idle');
     const clean = String(text ?? '').trim().slice(0, 8000);
@@ -1441,6 +1801,7 @@ ${note.text}
 
   /** Answer one pending approval. `decision` is `approve` or `deny`. */
   async function approve({ chatId, callId, decision }) {
+    allowWork();
     const sessionId = sessionMap[chatId]?.sessionId;
     // A helper agent's question carries the helper's session id in front of its call id. Only a helper that belongs to
     // THIS chat's run can be answered from this chat.
@@ -1575,25 +1936,50 @@ ${note.text}
   async function stop(chatId, { waitMs = 20_000 } = {}) {
     const c = chats.get(chatId);
     const turn = c?.turn;
-    if (!turn && c?.starting) { c.cancelStart = true; return { stopped: true, ended: 'cancelled-before-start', ms: 0 }; }
+    if (!turn && c?.starting) {
+      const finished = c.startFinished.promise;
+      if (c.holding && sessionMap[chatId]?.sessionId) retireSession(c, sessionMap[chatId].sessionId);
+      c.startAbort.abort();
+      await finished;
+      return { stopped: true, ended: 'cancelled-before-start', ms: 0 };
+    }
     if (!turn || !rt) return { stopped: false, reason: 'no active turn' };
     const t0 = Date.now();
-    if (!turn.prompted) {
-      // The Harness has not been given the prompt yet, so there is nothing to cancel there.
-      turn.stopBeforePrompt = true;
-      const early = await Promise.race([turn.ended.promise, new Promise(r => setTimeout(() => r(null), 100))]);
-      if (early) return { stopped: true, ended: early.reason?.kind ?? 'aborted', ms: Date.now() - t0 };
+    if (!turn.stopDeadline && !turn.finished) {
+      turn.stopping = true;
+      if (!turn.prompted) {
+        turn.stopBeforePrompt = true;
+        await turn.finish(null);
+      } else {
+        const runtime = rt;
+        const cancel = () => boundedRpc(runtime, 'session/cancel', { request: { sessionId: turn.sessionId } })
+          .then(() => { turn.cancelConfirmed = true; turn.pendingSteers.clear(); }).catch(() => {});
+        turn.stopDeadline = after(waitMs, () => {
+          retireSession(c, turn.sessionId);
+          void cancel();
+          void turn.finish('The assistant did not confirm that it stopped. Your partial answer is kept. You can send another message.');
+        });
+        const pauseSignal = AbortSignal.timeout(Math.min(waitMs, controlRpcMs, 3000));
+        void (async () => {
+          await beforeAbort(() => pauseGoal(runtime, turn.sessionId, chatId, pauseSignal), pauseSignal).catch(() => {});
+          if (turn.finished) return;
+          // Interrupt helpers before cancelling the parent, so their reports do not wake it again.
+          await Promise.allSettled([...turn.children.values()].filter(h => !h.done).map(h => turn.stopChild(h)));
+          // A simultaneous send must reach the inbox before Stop clears it.
+          await Promise.allSettled(turn.steerAdmissions);
+          if (turn.finished) return;
+          await cancel();
+          if (!turn.finished && !turn.parentOpen && !turn.pendingSteers.size && turn.live && [...turn.children.values()].every(h => h.done)) {
+            clearTimeout(turn.settleTimer);
+            turn.settleTimer = after(300, () => {
+              if (!turn.finished && !turn.parentOpen && [...turn.children.values()].every(h => h.done)) void turn.finish(null);
+            });
+          }
+        })().catch(e => log(`agent · stop: ${e.message}`));
+      }
     }
-    turn.stopping = true;
-    await pauseGoal(rt, turn.sessionId, chatId);
-    // Helpers first: a helper still working would otherwise report back and wake the parent again.
-    await Promise.allSettled([...turn.children.values()].filter(h => !h.done).map(h => rt.gw.rpc('subagents/interruptByParent', { childSessionId: h.id, parentSessionId: turn.sessionId, mode: 'continuable' })));
-    await rt.gw.rpc('session/cancel', { request: { sessionId: turn.sessionId } }).catch(e => { if (turn.parentOpen) throw e; });
-    // Nothing is running in the parent (it was waiting for its helpers): the run ends once they are all down.
-    if (!turn.parentOpen) { clearTimeout(turn.settleTimer); turn.settleTimer = after(300, () => { if (!turn.finished && !turn.parentOpen && [...turn.children.values()].every(h => h.done)) turn.finish(null); }); }
-    let timer; const result = await Promise.race([turn.ended.promise, new Promise(r => { timer = after(waitMs, () => r(null)); })]);
-    clearTimeout(timer);
-    if (!result) return { stopped: false, pending: true, reason: 'the turn is still stopping' };
+    const result = await turn.ended.promise;
+    if (result.failure) return { stopped: false, ended: 'unconfirmed', reason: result.failure, ms: Date.now() - t0 };
     return { stopped: true, ended: result.reason?.kind ?? 'unknown', ms: Date.now() - t0 };
   }
 
@@ -1625,7 +2011,10 @@ ${note.text}
     if (c.woken) c.woken = c.woken.filter(w => !w.taken);
     onFrame({ type: 'start', model: last.model, contextMax: last.contextMax, demo: false, remoteModel: last.remoteModel, agent: true, mode: last.mode, sessionId: last.sessionId, requestId: last.requestId, skills: [], resumed: true });
     onFrame({ type: 'resync', content: last.content, reasoning: last.reasoning });
+    for (const message of last.followUps ?? []) onFrame({ type: 'agent-follow-up', message });
     for (const card of last.cards) onFrame({ type: 'agent-tool', tool: card });
+    for (const agent of last.agents ?? []) onFrame({ type: 'agent', agent });
+    for (const frame of last.closingNotes ?? []) onFrame(frame);
     if (last.terminal) onFrame(last.terminal);
     return { ended: Promise.resolve(), live: false };
   }
@@ -1642,6 +2031,89 @@ ${note.text}
     return Object.keys(sessionMap).map(chatId => ({ chatId, folder: sessionMap[chatId]?.cwd ?? null, pending: pendingFor(chatId) })).filter(c => c.pending.length);
   }
 
+  // A preparation belongs to this host lifetime. Concurrent windows and the installer
+  // share its result, including an unconfirmed stop. A new host starts a new check.
+  function prepareForUpdate() {
+    if (preparation) return preparation.then(report => {
+      if (!existsSync(report.checkpoint)) throw new Error('The saved update checkpoint is missing.');
+      return report;
+    });
+    updatePaused = true;
+    preparation = checkpointAndStop();
+    return preparation;
+  }
+
+  async function checkpointAndStop() {
+    mkdirSync(checkpointDir, { recursive: true, mode: 0o700 });
+    writeFileSync(pauseMarker, '', { mode: 0o600 });
+    const targets = [...chats.values()];
+    const turns = targets.map(c => ({ c, turn: c.turn, starting: c.starting }));
+    const snapshot = () => turns.map(({ c, turn }) => ({
+      chatId: c.id, sessionId: sessionMap[c.id]?.sessionId, cwd: c.wakeOptions?.workspacePath ?? sessionMap[c.id]?.cwd,
+      plan: plans.get(c.id), queue: queueView(c.id), parent: turn?.updateSnapshot() ?? c.last ?? null
+    }));
+    const before = structuredClone(snapshot());
+    const folders = [...new Set(before.map(s => s.cwd).filter(Boolean))];
+    const receipts = [];
+    const gitState = () => Promise.all(folders.map(workspaceState));
+
+    const until = async (check, ms, reason) => {
+      const end = Date.now() + ms;
+      while (!check()) {
+        if (Date.now() >= end) throw new Error(reason);
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    };
+    try {
+      await saveCheckpoint(checkpointDir, 'before', { at: new Date().toISOString(), chats: before, workspaces: await gitState() });
+      // Some children may already have finished during the Git snapshot. Include
+      // their own terminal event in the receipt just as for interrupted children.
+      const acknowledged = new Set();
+      for (;;) {
+        const helpers = turns.flatMap(({ c, turn }) =>
+          [...(turn?.children.values() ?? [])].filter(child => !acknowledged.has(child)).map(child => ({ c, turn, child })));
+        if (!helpers.length) break;
+        const results = await Promise.allSettled(helpers.map(async ({ c, turn, child }) => {
+          const receipt = { chatId: c.id, helperId: child.id, confirmed: false };
+          receipts.push(receipt);
+          if (!child.done) await beforeAbort(() => turn.stopChild(child), AbortSignal.timeout(helperStopMs));
+          await until(() => child.confirmedEnd, helperStopMs, 'Helper did not confirm its stop: ' + child.id);
+          receipt.confirmed = true;
+          acknowledged.add(child);
+        }));
+        const refused = results.filter(result => result.status === 'rejected');
+        if (refused.length) throw new Error(refused.map(result => result.reason.message).join(', '));
+      }
+      const parentStops = await Promise.allSettled(turns.map(async ({ c, turn, starting: wasStarting }) => {
+        if (!turn && !wasStarting) return;
+        const receipt = { chatId: c.id, confirmed: false };
+        receipts.push(receipt);
+        if (c.turn || c.starting) {
+          const result = await beforeAbort(() => stop(c.id), AbortSignal.timeout(25_000));
+          if (!result.stopped) throw new Error(result.reason ?? 'Parent did not confirm its stop: ' + c.id);
+          if (turn?.prompted && !turn.cancelConfirmed && !turn.endObserved) throw new Error('Parent did not acknowledge cancellation: ' + c.id);
+          receipt.ended = result.ended;
+        }
+        receipt.confirmed = true;
+      }));
+      const failedParents = parentStops.filter(result => result.status === 'rejected');
+      if (failedParents.length) throw new Error(failedParents.map(result => result.reason.message).join(', '));
+      if (starting) await beforeAbort(() => starting, AbortSignal.timeout(startTimeoutMs));
+      await until(() => targets.every(c => !c.turn && !c.starting && !c.holding), controlRpcMs, 'An agent session is still busy.');
+      for (const { turn } of turns) {
+        if (turn && [...turn.children.values()].some(child => !acknowledged.has(child) || !child.confirmedEnd)) throw new Error('A helper has no confirmed end event.');
+      }
+      const harness = rt?.hp;
+      await close();
+      if (harness?.running || existsSync(join(root, 'harness.pid'))) throw new Error('The Harness process has no confirmed exit.');
+      const checkpoint = await saveCheckpoint(checkpointDir, 'ready', { at: new Date().toISOString(), chats: snapshot(), workspaces: await gitState(), receipts });
+      return { checkpoint, receipts };
+    } catch (error) {
+      const report = await saveCheckpoint(checkpointDir, 'incomplete', { receipts, error: error.message, chats: snapshot() });
+      throw new Error(error.message + ' · ' + report);
+    }
+  }
+
   async function close() {
     for (const c of chats.values()) { c.wake?.close(); c.wake = null; }
     const r = rt; rt = null;
@@ -1651,7 +2123,15 @@ ${note.text}
   /** Let go of a chat's Harness session mapping (a task starts every run in a session of its own). */
   function forget(chatId) { if (chats.get(chatId)?.turn) return; chats.get(chatId)?.wake?.close(); delete sessionMap[chatId]; chats.delete(chatId); persist(); }
 
-  return { compactCommand, messageHelper, answerQuestion, goalState, goalControl, harnessDir, status, turnOf, runningTurns, wokenTurns, attach, runTurn, goalCommand, planCommand, researchCommand, llmTarget, noteToolMarker, setPlanBriefing, resetSession, reopenPlan, skipStep, planGoal, planControl, planState, queueMessage, cancelQueued, takeQueue, forget, approve, setMode, stop, pendingFor, pendingAll, close, sessionOf: chatId => sessionMap[chatId]?.sessionId ?? null, workingFolder: chatId => sessionMap[chatId]?.cwd ?? null, isRunning: chatId => !!chats.get(chatId)?.turn, _debug: () => ({ rt, sessionMap }) };
+  function helperState(chatId, helperId) {
+    const c = chats.get(chatId);
+    return c?.turn?.children.get(helperId)?.cp.agent()
+      ?? c?.idleHelpers?.get(helperId)?.cp.agent()
+      ?? c?.last?.agents?.find(a => a.id === helperId)
+      ?? null;
+  }
+
+  return { prepareForUpdate, compactCommand, messageHelper, stopHelper, helperState, answerQuestion, goalState, goalControl, harnessDir, status, turnOf, runningTurns, wokenTurns, attach, runTurn, goalCommand, planCommand, researchCommand, llmTarget, noteToolMarker, setPlanBriefing, resetSession, reopenPlan, skipStep, planGoal, planControl, planState, steerMessage, queueMessage, cancelQueued, takeQueue, forget, approve, setMode, stop, pendingFor, pendingAll, close, sessionOf: chatId => sessionMap[chatId]?.sessionId ?? null, workingFolder: chatId => sessionMap[chatId]?.cwd ?? null, isRunning: chatId => !!chats.get(chatId)?.turn, _debug: () => ({ rt, sessionMap }) };
 }
 
 /** A goal that stopped by itself, in words. */

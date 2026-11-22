@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resourceSettings, saferStart, ramKeepGib, engineKnowsRamKeep, engineVersionOfExe, RAM_KEEP_MIN_ENGINE } from '../server/native-resources.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createNativeControl } from '../server/native-control.mjs';
+import { resourceSettings, saferStart, ramKeepGib, engineKnowsRamKeep, engineVersionOfExe, RAM_KEEP_MIN_ENGINE, withRamReserve } from '../server/native-resources.mjs';
 
 const pc64 = { cpu: { cores: 12 }, ram_gb: 63, gpus: [{ index: 0, name: 'NVIDIA GeForce RTX 5070', vram_gb: 11.9 }] };
 const iq3s = { arenaGb: 50.3 };                                   // engine version not known
@@ -9,6 +13,43 @@ const iq3sOld = { arenaGb: 50.3, engineVersion: '0.1.55' };       // the 0.2.9 r
 const config = { gpu: 0, args: ['--native', 'x.gguf', '--max-context', '32768', '--pool-workers', '12'] };
 const flag = (args, name) => args[args.indexOf(name) + 1];
 const old279 = (ram, arena = 50.3) => Math.max(8, Math.min(Math.floor(ram * .8) - 10, Math.floor(arena / 1.073741824)));   // the 0.2.9 rule
+
+test('the shared RAM reserve overrides both resource profiles only in the launch copy', () => {
+  for (const profile of ['work', 'performance']) {
+    const prepared = { ...config, ...resourceSettings(config, pc64, profile, iq3sNew) };
+    const before = structuredClone(prepared);
+    const launch = withRamReserve(prepared, 12);
+    assert.equal(launch.env.STRATA_RAM_KEEP_GIB, '12');
+    assert.deepEqual(launch.args, prepared.args);
+    assert.deepEqual(prepared, before);
+    assert.equal(withRamReserve(prepared, null), prepared);
+  }
+  const manual = { args: ['--ram-keep-gib', '4', '--max-context', '524288'], user_args: ['--ram-keep-gib', '4'],
+    env: { STRATA_RESIDENT_HEADROOM_GIB: '6' } };
+  const launch = withRamReserve(manual, 12);
+  assert.deepEqual(launch.args, ['--max-context', '524288']);
+  assert.deepEqual(launch.user_args, []);
+  assert.equal(launch.env.STRATA_RESIDENT_HEADROOM_GIB, '12');
+  assert.equal(withRamReserve(manual, null).args[1], '4');
+});
+
+test('the shared reserve survives a host restart and can be reset to Automatic', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'strata-ram-reserve-'));
+  let native;
+  try {
+    native = createNativeControl({ directory });
+    assert.deepEqual(native.ramReserve(), { gib: null });
+    for (const invalid of [undefined, '12', 0, -1, 1.5, Infinity]) assert.throws(() => native.saveRamReserve(invalid));
+    assert.deepEqual(native.saveRamReserve(12), { gib: 12 });
+    await native.close();
+    native = createNativeControl({ directory });
+    assert.deepEqual(native.ramReserve(), { gib: 12 });
+    assert.deepEqual(native.saveRamReserve(null), { gib: null });
+  } finally {
+    await native?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test('which engines know the setting: RAM_KEEP_MIN_ENGINE and newer; unknown or unreadable versions are treated as older', () => {
   assert.equal(RAM_KEEP_MIN_ENGINE, '0.1.56');

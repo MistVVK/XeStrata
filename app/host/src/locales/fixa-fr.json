@@ -3,5 +3,14 @@
  "fixa02": "Cela prend quelques secondes.",
  "fixa03": "Reste à télécharger",
  "fixa04": "Téléchargement d’un petit assistant qui accélère les réponses. Cela n’arrive qu’une fois.",
- "fixa05": "Vérification en cours. Au premier démarrage, cela peut prendre jusqu'à une minute."
+ "fixa05": "Vérification en cours. Au premier démarrage, cela peut prendre jusqu'à une minute.",
+ "contextOptimizerHint": "Laissez un petit modèle local sélectionner des extraits de messages précédents de l’assistant et de résultats d’outils quand l’assistant de programmation a besoin de place. Désactivé par défaut. Si la sélection échoue, le résumé habituel prend le relais.",
+ "contextOptimizerConfigure": "Configurer le modèle local",
+ "contextOptimizerEnable": "Activer Context Optimizer",
+ "contextOptimizerTimeout": "Délai en secondes",
+ "contextOptimizerUnavailable": "Les paramètres de Context Optimizer sont indisponibles.",
+ "contextOptimizerTest": "Tester le modèle",
+ "contextOptimizerTestSuccess": "Test du modèle réussi ({0} ms).",
+ "contextOptimizerTestFailure": "Le modèle local n’a pas renvoyé de sélection valide. Vérifiez le serveur, l’identifiant du modèle et le délai.",
+ "contextOptimizerSaved": "Enregistré. La prochaine demande à l’assistant applique ce réglage une fois les conversations en cours terminées."
 }

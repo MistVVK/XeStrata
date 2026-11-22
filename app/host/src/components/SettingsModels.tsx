@@ -3,7 +3,7 @@ import { tr } from '../lib/i18n';
 import { useEffect, useRef, useState } from 'react';
 import { useImeKeys } from '../lib/ime-keys';
 import { removeModelConnection, saveModelConnection, useStore } from '../lib/store';
-import type { ApiModel, ModelConnection, ModelConnectionDraft, ModelProtocol } from '../lib/types';
+import type { ApiModel, ModelConnection, ModelConnectionDraft, ModelProtocol, ModelReasoningFormat } from '../lib/types';
 import { Btn, Dialog, ErrorNotice, Icon, Select } from './ui';
 const protocols: {
     value: ModelProtocol;
@@ -12,6 +12,13 @@ const protocols: {
     { value: 'openai-chat', label: 'OpenAI Chat Completions' },
     { value: 'openai-responses', label: 'OpenAI Responses' },
     { value: 'anthropic', label: 'Anthropic Messages' },
+];
+const reasoningFormats: { value: ModelReasoningFormat; label: string }[] = [
+    { value: 'auto', label: 'Automatic' },
+    { value: 'default', label: 'Provider default' },
+    { value: 'strata', label: 'Strata · chat template' },
+    { value: 'deepseek', label: 'DeepSeek · thinking' },
+    { value: 'effort', label: 'OpenAI · reasoning effort' },
 ];
 export function SettingsModels() {
     const providers = useStore(s => s.providers), streaming = useStore(s => s.streaming);
@@ -100,6 +107,7 @@ export function SettingsModels() {
         <label className="input-field"><span>{tr("Display name")}</span><input className="st-input" value={draft.name} placeholder={tr(draft.kind === 'custom' ? 'My other PC' : 'Provider name')} onChange={e => update({ name: e.target.value })}/></label>
         <label className="input-field"><span>{tr("Base URL")}</span><input className="st-input" type="url" value={draft.baseUrl} placeholder={tr("http://192.168.1.20:1234/v1")} spellCheck={false} onChange={e => update({ baseUrl: e.target.value })}/><small className="muted">{tr(preset?.baseUrlHint ?? 'Include the API prefix, such as /v1, but leave off /models or /chat/completions.')}</small></label>
         <div className="input-field"><span>{tr("API protocol")}</span><Select ariaLabel={tr("API protocol")} value={draft.protocol} options={protocols} onChange={value => update({ protocol: value })}/></div>
+        {draft.protocol === 'openai-chat' ? <div className="input-field"><span>{tr("Reasoning format")}</span><Select ariaLabel={tr("Reasoning format")} value={draft.reasoningFormat ?? 'auto'} options={reasoningFormats} onChange={value => update({ reasoningFormat: value })}/></div> : null}
   </div> : null;
     return <div className="stack stack--lg settings-models">
     <div><h2 className="h3">{tr("Models")}</h2><p className="small muted settings-models__intro">{tr("Connect an API provider or a model server on another computer.")}</p></div>
@@ -115,7 +123,7 @@ export function SettingsModels() {
       </div>
       <p className="small muted">{tr(draft.kind === 'provider' ? 'Choose a provider, enter its API key, then select models to add.' : 'Use the server’s API address. For another PC, enter its network address instead of localhost.')}</p>
       <fieldset disabled={pending} className="provider-fields">
-        {tr(draft.kind === 'provider' ? <div className="input-field"><span>{tr("Provider")}</span><Select ariaLabel={tr("Provider")} value={draft.provider ?? ''} options={providers!.catalog.map(p => ({ value: p.id, label: p.name }))} onChange={value => { const p = providers!.catalog.find(p => p.id === value)!; update({ provider: p.id, name: p.name, baseUrl: p.baseUrl, protocol: p.protocol, apiKey: '', clearKey: true, models: [] }); }}/></div> : null)}
+        {tr(draft.kind === 'provider' ? <div className="input-field"><span>{tr("Provider")}</span><Select ariaLabel={tr("Provider")} value={draft.provider ?? ''} options={providers!.catalog.map(p => ({ value: p.id, label: p.name }))} onChange={value => { const p = providers!.catalog.find(p => p.id === value)!; update({ provider: p.id, name: p.name, baseUrl: p.baseUrl, protocol: p.protocol, reasoningFormat: 'auto', apiKey: '', clearKey: true, models: [] }); }}/></div> : null)}
         {tr(draft.kind === 'custom' ? connectionFields : null)}
         <label className="input-field"><span>{tr("API key ")}{tr(draft.kind === 'custom' ? <span className="muted">{tr("(optional)")}</span> : null)}</span><input className="st-input" type="password" value={draft.apiKey} autoComplete="new-password" placeholder={tr(saved?.apiKeySet && !draft.clearKey ? 'Leave blank to keep the saved key' : 'Enter API key')} spellCheck={false} onChange={e => update({ apiKey: e.target.value, clearKey: false })}/><small className="muted">{tr("Saved on the Strata host, never in browser storage.")}</small></label>
         {tr(draft.kind === 'provider' ? <details className="provider-options" key={draft.provider} open={!preset?.baseUrl}><summary>{tr("Connection settings")}</summary>{tr(connectionFields)}</details> : null)}

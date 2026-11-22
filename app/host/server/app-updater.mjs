@@ -20,14 +20,18 @@ export function createAppUpdater({ env = process.env, fetcher = fetch, sleep = m
   const base = env.STRATA_SHELL_BRIDGE;
   const token = env.STRATA_SHELL_TOKEN;
   if (!base || !token || !/^http:\/\/127\.0\.0\.1:\d+$/.test(base)) return null;
-  async function call(path, method = 'GET', timeoutMs = 120_000) {
+  async function call(path, method = 'GET', timeoutMs = 120_000, fallback = 'The Strata app could not check for updates') {
     const response = await fetcher(`${base}${path}`, { method, headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(timeoutMs) });
     let body = null;
     try { body = await response.json(); } catch { /* no body */ }
-    if (!response.ok) throw new Error(body?.error ?? `The Strata app could not check for updates (${response.status}).`);
+    if (!response.ok) throw new Error(body?.error ?? `${fallback} (${response.status}).`);
     return body;
   }
   return {
+    openHelper: (sessionId, helperId, name) => call(
+      `/shell/helper?${new URLSearchParams({ sessionId, helperId, name })}`, 'POST', 10_000,
+      'The Strata app could not open the helper window',
+    ),
     /** { available, version, current, notes } from the shell's updater (signature-verified metadata). */
     check: () => call('/app-update/check'),
     /**

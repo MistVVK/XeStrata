@@ -15,7 +15,7 @@ const instance = id => ({ id, label: 'S', baseUrl: 'http://127.0.0.1:9', modelId
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 
 /** A bridge over fake runtimes: every start of the "Harness" is recorded, every stop too; a gateway that answers what the start of a turn asks. */
-function rig(t, { instances, hold = null, ...options } = {}) {
+function rig(t, { instances, hold = null, holdPrompt = null, ...options } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'strata-race-'));
   const ws = join(dir, 'ws'); mkdirSync(ws, { recursive: true });
   const current = { list: instances ?? [instance('i1')] };
@@ -31,6 +31,7 @@ function rig(t, { instances, hold = null, ...options } = {}) {
       async rpc(method, args = {}) {
         if (method === 'session/create') { const id = `sess-${number}-${sessions.size + 1}`; sessions.set(id, number); return { sessionId: id }; }
         if (method === 'session/selectModel') { if (hold) await hold(args); return {}; }
+        if (method === 'session/prompt' && holdPrompt) await holdPrompt(args);
         if (method === 'session/projections') return { values: { permissions: { currentValue: permissions.get(args.request?.sessionId) ?? null } } };
         if (method === 'commands/execute') {
           const m = /^\/permission (\S+)/.exec(args.line ?? '');
@@ -133,4 +134,82 @@ test('(d) a stream opened on a closed gateway tells its owner at once, and one c
   await sleep(50);
   assert.deepEqual(second, ['gateway/closed'], 'a stream opened on a closed client tells its owner');
   early.close();
+});
+
+const event = (seq, type, data = {}) => ({ type: 'event', event: { seq, type, time: Date.now(), data } });
+function live(r, chatId, index) {
+  r.push(index, event(1, 'user/message', { source: { rpcId: `req-${chatId}` } }));
+  r.push(index, event(2, 'turn/start'));
+}
+
+test('Stop frees the chat while model selection is still unanswered', async t => {
+  const selecting = deferred();
+  const r = rig(t, { hold: () => { selecting.resolve(); return new Promise(() => {}); } });
+  const x = r.turn('start-stuck');
+  await selecting.promise;
+  assert.equal((await r.bridge.stop('start-stuck')).ended, 'cancelled-before-start');
+  assert.equal((await x.done).cancelled, true);
+  assert.equal(x.frames.at(-1).type, 'done');
+  assert.equal((await r.bridge.stop('start-stuck')).reason, 'no active turn');
+});
+
+test('a prompt with no receipt cannot leave the chat marked busy', async t => {
+  const r = rig(t, { holdPrompt: () => new Promise(() => {}), controlRpcMs: 150 });
+  const x = r.turn('prompt-stuck');
+  assert.ok(await untilEnded(x, 2000));
+  assert.match(x.error()?.message, /did not take this message/);
+  await x.done;
+  assert.equal(r.bridge.sessionOf('prompt-stuck'), null);
+  assert.equal((await r.bridge.stop('prompt-stuck')).reason, 'no active turn');
+});
+
+test('Stop without turn/end closes the stream and retires the affected session', async t => {
+  const r = rig(t);
+  const x = r.turn('cancel-stuck');
+  await sleep(100);
+  live(r, 'cancel-stuck', 0);
+  const result = await r.bridge.stop('cancel-stuck', { waitMs: 100 });
+  assert.equal(result.ended, 'unconfirmed');
+  assert.match(x.error()?.message, /did not confirm/);
+  await x.done;
+  assert.equal(r.bridge.sessionOf('cancel-stuck'), null);
+});
+
+test('helper EOF and an unconfirmed helper Stop both release the waiting parent', async t => {
+  const r = rig(t, { helperStopMs: 150, stallMs: 5000 });
+  for (const end of ['eof', 'stop']) {
+    const parent = r.follows.length, child = parent + 1;
+    const x = r.turn(end);
+    await sleep(100);
+    live(r, end, parent);
+    r.push(parent, event(3, 'subagent/catalog', { childId: end + '-helper', label: 'Helper' }));
+    r.push(parent, event(4, 'turn/end', { reason: { kind: 'completed' } }));
+    await sleep(10);
+    const caughtUp = [];
+    const page = new AbortController();
+    assert.ok(r.bridge.attach({ chatId: end, signal: page.signal, onFrame: frame => caughtUp.push(frame) }));
+    assert.equal(caughtUp.find(f => f.type === 'agent')?.agent.status, 'queued');
+    page.abort();
+    if (end === 'eof') r.follows[child].handlers.onEnd();
+    else await r.bridge.stopHelper({ chatId: end, helperId: end + '-helper' });
+    assert.ok(await untilEnded(x, 2500));
+    await x.done;
+    assert.equal(x.frames.filter(f => f.type === 'agent').at(-1)?.agent.status, 'failed');
+    assert.equal(x.frames.at(-1).type, 'done');
+  }
+});
+
+test('an ordinary turn recovers committed text when every live chunk was lost', async t => {
+  const r = rig(t);
+  const x = r.turn('committed');
+  await sleep(100);
+  r.push(0, event(1, 'assistant/message', { message: { content: [{ type: 'text', text: 'Old' }] } }));
+  r.push(0, event(2, 'user/message', { source: { rpcId: 'req-committed' } }));
+  const answer = event(3, 'assistant/message', { message: { content: [{ type: 'text', text: 'Recovered answer.' }] } });
+  r.push(0, answer);
+  r.push(0, answer);  // A reconnect can replay the same durable event.
+  r.push(0, event(4, 'turn/end', { reason: { kind: 'completed' } }));
+  assert.ok(await untilEnded(x, 2000));
+  await x.done;
+  assert.deepEqual(x.frames.filter(f => f.type === 'delta').map(f => f.text), ['Recovered answer.']);
 });

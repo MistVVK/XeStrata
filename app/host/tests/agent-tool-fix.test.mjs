@@ -13,6 +13,7 @@ import { buildProfile } from '../server/agent/profile.mjs';
 import { startScriptedWorker } from './helpers/scripted-worker.mjs';
 import { createAgentBridge, agentProvider } from '../server/agent/agent-bridge.mjs';
 import { resolveHarness } from '../server/agent/harness-runtime.mjs';
+import { GUARD_NOTES } from '../server/agent/turn-guard.mjs';
 
 const HARNESS = process.env.STRATA_HARNESS_DIR;
 const skip = !HARNESS || !resolveHarness({ env: process.env }).ok ? 'STRATA_HARNESS_DIR is not set to a built Harness' : false;
@@ -206,6 +207,16 @@ const cards = (out, name) => out.filter(f => f.type === 'agent-tool' && f.tool.n
 const keys = out => out.filter(f => f.type === 'delta' && f.key).map(f => f.key);
 const statuses = out => out.filter(f => f.type === 'status').map(f => f.text);
 
+test('the same recovery budget covers malformed tool calls and length cutoffs', { skip }, async t => {
+  const r = await rig(t);
+  const pattern = 'rej:exec,length,rej:exec,read';
+  const out = await r.run('mixed', `SCRIPT:badseq ${pattern} ${r.file}`);
+  assert.equal(ofScript(r.worker, pattern).length, 3);
+  assert.equal(cards(out, 'read').length, 0);
+  assert.equal(keys(out).at(-1), GUARD_NOTES['recovery-limit']);
+  assert.equal(out.at(-1).noteReason, 'recovery-limit');
+});
+
 for (const [label, step, expect] of [
   ['an undeclared name', 'rej:exec', /Tool error: no such tool: exec\. Nothing was run\. The tools you can call are: [^\n]*\bread\b[^\n]*\.(?! Did you mean)/],
   ['an undeclared name with a close declared one', 'rej:psh>read', /Tool error: no such tool: psh\. Nothing was run\. The tools you can call are: [^\n]*\. Did you mean read\?/],
@@ -239,16 +250,16 @@ test('after two corrections in a row the third bad reply ends the turn with the 
   assert.equal(keys(out).at(-1), END_NOTE);
   assert.ok(out.findIndex(f => f.key === END_NOTE) < out.findIndex(f => f.type === 'done'));
   assert.equal(out.filter(f => f.type === 'error').length, 0);
-  assert.ok(r.logs.some(l => /after 2 corrections in a row; the turn ends/.test(l)));
+  assert.ok(r.logs.some(l => /recovery limit reached/.test(l)));
 });
 
-test('a call that runs starts the count again', { skip }, async (t) => {
+test('a successful tool call does not renew the turn recovery budget or get replayed', { skip }, async (t) => {
   const r = await rig(t);
   const out = await r.run('reset', `SCRIPT:badseq rej:a,rej:b,read,rej:c,rej:d,read ${r.file}`);
-  assert.equal(ofScript(r.worker, 'rej:a,rej:b').length, 7);
-  assert.equal(cards(out, 'read').length, 2);
-  assert.ok(!keys(out).includes(END_NOTE));
-  assert.equal(r.logs.filter(l => /correction \d of 2/.test(l)).length, 4);
+  assert.equal(ofScript(r.worker, 'rej:a,rej:b').length, 4);
+  assert.equal(cards(out, 'read').length, 1);
+  assert.equal(keys(out).at(-1), GUARD_NOTES['recovery-limit']);
+  assert.equal(r.logs.filter(l => /correction \d of 2/.test(l)).length, 2);
 });
 
 test('parallel chats: a marker in one chat does not continue the other', { skip }, async (t) => {

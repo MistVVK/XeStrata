@@ -35,8 +35,8 @@ export class GatewayClient {
   }
 
   /** Exchange the launch token for the API cookie. */
-  async connect() {
-    const res = await fetch(`${this.#base}/?token=${encodeURIComponent(this.#token)}`, { redirect: 'manual' });
+  async connect({ signal } = {}) {
+    const res = await fetch(`${this.#base}/?token=${encodeURIComponent(this.#token)}`, { redirect: 'manual', signal });
     const cookie = (res.headers.get('set-cookie') ?? '').split(';')[0];
     if (!cookie.startsWith('dsh-auth-')) throw new GatewayError(`the agent refused the launch token (HTTP ${res.status})`, { code: 'gateway/auth' });
     this.#cookie = cookie;

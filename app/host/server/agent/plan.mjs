@@ -14,6 +14,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { splitReadRule, stepBrief } from './plan-brief.mjs';
 
 export const MAX_STEPS = 12;
 const MAX_TEXT = 140;
@@ -21,23 +22,26 @@ const MAX_DETAIL = 220;
 
 const clean = s => String(s ?? '').replace(/\*\*|__|`/g, '').replace(/\s+/g, ' ').trim();
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1).trimEnd() + '…' : s);
+const withReadRule = (text, rule) => (text && rule ? text + ' ' + rule : text);
 
 /** "Write the file — one file, inline styles" into { text, detail }. */
-function splitStep(raw) {
-  const s = clean(raw).replace(/^(?:step\s*\d+\s*[:.\-]\s*)/i, '');
+function splitStep(raw, readProof = false) {
+  const { body, rule } = splitReadRule(raw, readProof);
+  const s = clean(body).replace(/^(?:step\s*\d+\s*[:.\-]\s*)/i, '');
   const at = s.search(/\s[—–]\s|\s-\s|:\s/);
   const head = at > 8 ? s.slice(0, at) : s;
   const rest = at > 8 ? s.slice(at).replace(/^\s*[—–:\-]\s*/, '') : '';
-  return { text: clip(head.replace(/[.;:]+$/, ''), MAX_TEXT), detail: clip(rest, MAX_DETAIL) };
+  return { text: withReadRule(clip(head.replace(/[.;:]+$/, ''), MAX_TEXT), rule), detail: clip(rest, MAX_DETAIL) };
 }
 
 /** The instruction a plan turn gets in front of the person's request. */
-export function planPrompt(task) {
+export function planPrompt(task, readProof = false) {
   return [
     'Make a plan for the request below. Do not change anything: you may only look (read files, list folders, search).',
     'When you have looked enough, end your reply with the plan as a numbered list: one short line per step, in the order they should be done.',
     'Put a short heading line right before the list, like "## Pagoda page" (two to five words that name the plan).',
     'You may add the reason after a dash. Use 3 to 8 steps. Write nothing after the list.',
+    ...(readProof ? ['For a step with an exact file and line to check, append [verify-read relative/file | exact line]. Use this only where the request or the inspected project gives the exact check.'] : []),
     '',
     `Request: ${task}`,
   ].join('\n');
@@ -47,7 +51,7 @@ export function planPrompt(task) {
  * The plan in a reply: its last run of numbered lines (at least two). Lines that follow a step and are indented or bulleted are that
  * step's detail. Returns null when the reply holds no list, so the page shows the reply as it is and never a made-up plan.
  */
-export function parsePlan(text, request = '') {
+export function parsePlan(text, request = '', readProof = false) {
   const lines = String(text ?? '').replace(/\r/g, '').split('\n');
   const item = /^\s{0,3}(?:step\s+)?(\d{1,2})[.):]\s+(\S.*)$/i;
   const runs = [];
@@ -68,7 +72,7 @@ export function parsePlan(text, request = '') {
   const best = runs.filter(r => r.items.length >= 2).at(-1);
   if (!best) return null;
   const steps = best.items.slice(0, MAX_STEPS).map((it, k) => {
-    const { text: t, detail } = splitStep(it.raw);
+    const { text: t, detail } = splitStep(it.raw, readProof);
     const extra = clip(it.extra.join(' '), MAX_DETAIL);
     return { id: `s${k + 1}`, text: t, detail: detail || extra, state: 'pending', summary: null };
   }).filter(s => s.text);
@@ -82,12 +86,13 @@ export function parsePlan(text, request = '') {
 }
 
 /** Numbered points inside a goal's own words ("1. a 2. b" on lines or in one line); at least two, counting up from 1. */
-export function parsePoints(objective) {
+export function parsePoints(objective, readProof = false) {
   const text = String(objective ?? '').replace(/\r/g, '');
   const found = [];
   const re = /(?:^|\s)(\d{1,2})[.)]\s+/g;
   let m; const marks = [];
-  while ((m = re.exec(text))) marks.push({ n: Number(m[1]), at: m.index, after: m.index + m[0].length });
+  const numbers = readProof ? text.replace(/\[verify-read [^\]\r\n]*\]/giu, rule => ' '.repeat(rule.length)) : text;
+  while ((m = re.exec(numbers))) marks.push({ n: Number(m[1]), at: m.index, after: m.index + m[0].length });
   let want = 1; let start = -1;
   const seq = [];
   for (const k of marks) {
@@ -95,10 +100,13 @@ export function parsePoints(objective) {
     else if (k.n === 1) { seq.length = 0; seq.push(k); want = 2; }
   }
   if (seq.length < 2) return null;
-  seq.forEach((k, i) => found.push(clean(text.slice(k.after, i + 1 < seq.length ? seq[i + 1].at : undefined))));
+  seq.forEach((k, i) => {
+    const raw = text.slice(k.after, i + 1 < seq.length ? seq[i + 1].at : undefined);
+    found.push(readProof ? raw.trim() : clean(raw));
+  });
   const aim = clean(text.slice(0, seq[0].at)).replace(/[:\-–—]+$/, '').trim();
   const steps = found.slice(0, MAX_STEPS).map((t, k) => {
-    const { text: s, detail } = splitStep(t);
+    const { text: s, detail } = splitStep(t, readProof);
     return { id: `s${k + 1}`, text: s, detail, state: 'pending', summary: null };
   }).filter(s => s.text);
   if (steps.length < 2) return null;
@@ -109,15 +117,17 @@ export function parsePoints(objective) {
 export const isViewStep = text => /\b(open|view|launch|preview|look at|check|confirm|verify)\b[^\n]{0,60}\b(browser|in chrome|in edge|in firefox|window|on screen)\b/i.test(String(text ?? ''));
 
 /** The goal the Harness runs for step `index` (0-based): one step, with the aim and the steps around it named. */
-export function stepObjective(plan, index) {
+export function stepObjective(plan, index, brief = false) {
   const n = plan.steps.length; const s = plan.steps[index];
+  const view = isViewStep(s.text) ? 'This step is about seeing the result. To show a local image, SVG, HTML page or PDF, use the present tool (a browser cannot open file:// addresses). Never wait for a program to close. If a person is at this computer and you start a browser, start it so the command returns at once (Windows: Start-Process; macOS: open; Linux: xdg-open) and say only that you started it, not that the page rendered. If there is no screen, check the page without a visible window: use the headless browser tool if you have one, otherwise read the file and its script for mistakes, and say in one plain sentence what you could and could not check. Then finish the step.' : '';
+  if (brief) return [...stepBrief(plan, index), view].filter(Boolean).join('\n');
   const done = plan.steps.slice(0, index).map((x, i) => `${i + 1}. ${x.text}${x.summary ? ' (' + String(x.summary).slice(0, 100) + ')' : ''}`).join('; ');
   return [
     `Overall aim: ${plan.title}.`,
     `You are on step ${index + 1} of ${n}: ${s.text}${s.detail ? ` (${s.detail})` : ''}.`,
     done ? `Already done: ${done}.` : '',
     plan.briefing ? String(plan.briefing) : '',
-    isViewStep(s.text) ? 'This step is about seeing the result. To show a local image, SVG, HTML page or PDF, use the present tool (a browser cannot open file:// addresses). Never wait for a program to close. If a person is at this computer and you start a browser, start it so the command returns at once (Windows: Start-Process; macOS: open; Linux: xdg-open) and say only that you started it, not that the page rendered. If there is no screen, check the page without a visible window: use the headless browser tool if you have one, otherwise read the file and its script for mistakes, and say in one plain sentence what you could and could not check. Then finish the step.' : '',
+    view,
     'Do only this step, check that it worked, and then finish the goal.',
     index + 1 < n ? 'The next steps are handled separately: do not start them.' : '',
   ].filter(Boolean).join(' ');
@@ -161,11 +171,13 @@ export function planAsPrompt(plan) {
 }
 
 /** A step list from the person's edit: texts only, validated and capped. Throws a plain sentence for an unusable list. */
-export function editedSteps(input, previous = []) {
+export function editedSteps(input, previous = [], readProof = false) {
   if (!Array.isArray(input)) throw Object.assign(new Error('A plan needs a list of steps.'), { code: 'plan-steps' });
   const steps = input.map((x, k) => {
-    const text = clip(clean(typeof x === 'string' ? x : x?.text), MAX_TEXT);
-    const detail = clip(clean(typeof x === 'string' ? '' : x?.detail), MAX_DETAIL);
+    const title = splitReadRule(typeof x === 'string' ? x : x?.text, readProof);
+    const details = splitReadRule(typeof x === 'string' ? '' : x?.detail, readProof);
+    const text = withReadRule(clip(clean(title.body), MAX_TEXT), title.rule);
+    const detail = withReadRule(clip(clean(details.body), MAX_DETAIL), details.rule) || details.rule;
     const kept = previous.find(p => p.id === x?.id);
     return text ? { id: kept?.id ?? `s${k + 1}`, text, detail, state: 'pending', summary: null } : null;
   }).filter(Boolean).slice(0, MAX_STEPS);

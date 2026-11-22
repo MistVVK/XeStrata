@@ -3,5 +3,14 @@
  "fixa02": "数秒かかります。",
  "fixa03": "残りのダウンロード",
  "fixa04": "回答を速くする小さなヘルパーをダウンロードしています。これは一度だけ行われます。",
- "fixa05": "確認を続けています。初回の起動では最大1分ほどかかることがあります。"
+ "fixa05": "確認を続けています。初回の起動では最大1分ほどかかることがあります。",
+ "contextOptimizerHint": "コーディングアシスタントがコンテキストの空きを作るときに、小さなローカルモデルが過去の応答とツール結果から抜粋を選びます。初期状態ではオフです。選択に失敗した場合は通常の要約を使います。",
+ "contextOptimizerConfigure": "ローカルモデルを設定",
+ "contextOptimizerEnable": "Context Optimizer を有効にする",
+ "contextOptimizerTimeout": "タイムアウト（秒）",
+ "contextOptimizerUnavailable": "Context Optimizer の設定を取得できません。",
+ "contextOptimizerTest": "モデルをテスト",
+ "contextOptimizerTestSuccess": "モデルのテストに成功しました（{0} ミリ秒）。",
+ "contextOptimizerTestFailure": "ローカルモデルが有効な選択結果を返しませんでした。サーバー、モデル ID、タイムアウトを確認してください。",
+ "contextOptimizerSaved": "保存しました。実行中のチャットが完了した後、次のアシスタントへのリクエストから適用されます。"
 }

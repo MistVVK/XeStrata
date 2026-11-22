@@ -1,6 +1,6 @@
 /** Saved API connections. Secrets never leave the host's private credentials file. */
 import { modelReadsPictures, modelSupportsReasoning } from './vision-probe.mjs';
-import { isOpenRouter, OPENROUTER_EFFORTS } from './agent/profile.mjs';
+import { connectionReasoningEfforts, connectionReasoningFormat, REASONING_FORMATS } from './agent/profile.mjs';
 import { validateChatImages } from './chat-images.mjs';
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -121,6 +121,8 @@ export function createModelProviders({ directory, changed = () => {}, fetchImpl 
     if (kind === 'provider' && !catalog) fail('Choose a model provider.');
     const protocol = body.protocol ?? catalog?.protocol;
     if (!PROTOCOLS.includes(protocol)) fail('Choose a supported API protocol.');
+    const reasoningFormat = protocol === 'openai-chat' ? (body.reasoningFormat ?? existing?.reasoningFormat ?? 'auto') : 'auto';
+    if (!REASONING_FORMATS.includes(reasoningFormat)) fail('Choose a supported reasoning format.');
     const name = text(body.name) || catalog?.name;
     if (!name) fail('Give this connection a display name.');
     const baseUrl = normalizeBaseUrl(body.baseUrl || catalog?.baseUrl);
@@ -136,7 +138,7 @@ export function createModelProviders({ directory, changed = () => {}, fetchImpl 
       return { id, name: text(row.name) || id, contextMax: numeric(row.contextMax), maxOutput: numeric(row.maxOutput), vision: row.vision === true ? true : row.vision === false ? false : null, reasoning: row.reasoning === true ? true : row.reasoning === false ? false : null };
     });
     if (new Set(models.map(m => m.id)).size !== models.length) fail('Each model ID must be unique within this connection.');
-    return { id: existing?.id ?? randomUUID(), kind, provider: catalog?.id ?? null, name, baseUrl, protocol, apiKey, models };
+    return { id: existing?.id ?? randomUUID(), kind, provider: catalog?.id ?? null, name, baseUrl, protocol, apiKey, models, ...(reasoningFormat !== 'auto' ? { reasoningFormat } : {}) };
   }
   function save(body) {
     const connection = draft(body);
@@ -204,9 +206,23 @@ export function createModelProviders({ directory, changed = () => {}, fetchImpl 
         : { model: model.id, messages: [...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []), ...messages], stream: true, ...(['openai', 'deepseek', 'openrouter', 'google', 'moonshotai'].includes(connection.provider) ? { stream_options: { include_usage: true } } : {}) };
     // Match the native composer's effort names. Unknown support and other protocols keep provider defaults.
     const choice = typeof thinking === 'string' ? thinking.toLowerCase() : '';
-    if (protocol === 'openai-chat' && (model.reasoning ?? knownThinks(connection, model.id)) === true && ['off', 'low', 'medium', 'high', 'max'].includes(choice)) {
-      if (isOpenRouter(connection)) payload.reasoning = { effort: OPENROUTER_EFFORTS[choice] };
-      else payload.reasoning_effort = ({ off: 'none', max: 'high' })[choice] ?? choice;
+    const efforts = connectionReasoningEfforts(connection, { reasoning: model.reasoning ?? knownThinks(connection, model.id) });
+    if (efforts && Object.hasOwn(efforts, choice)) {
+      const effort = efforts[choice];
+      switch (connectionReasoningFormat(connection)) {
+        case 'strata':
+          payload.chat_template_kwargs = { enable_thinking: choice !== 'off', ...(effort ? { reasoning_effort: effort } : {}) };
+          break;
+        case 'openrouter':
+          payload.reasoning = { effort };
+          break;
+        case 'deepseek':
+          payload.thinking = { type: choice === 'off' ? 'disabled' : 'enabled' };
+          if (choice !== 'off') payload.reasoning_effort = effort;
+          break;
+        default:
+          payload.reasoning_effort = effort;
+      }
     }
     const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(10 * 60 * 1000)]) : AbortSignal.timeout(10 * 60 * 1000);
     const res = await request(connection, protocol === 'anthropic' ? 'messages' : protocol === 'openai-responses' ? 'responses' : 'chat/completions', { method: 'POST', body: JSON.stringify(payload), signal: requestSignal });

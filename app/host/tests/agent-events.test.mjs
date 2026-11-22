@@ -56,6 +56,8 @@ test('routeFor picks the chat\'s own choice', () => {
   assert.equal(outputBudget(200_000, 64_000), 64_000, 'the connection own maximum is used when known');
   assert.equal(outputBudget(8192, 64_000), 8192 - 2048, 'a known maximum is still bounded by the window');
   assert.equal(outputBudget(200_000, 4096), 4096, 'a small known maximum is respected');
+  assert.equal(outputBudget(200_000, 512), 512, 'a provider maximum below 1K is still respected');
+  assert.equal(outputBudget(512), 384, 'an advertised tiny window still reserves prompt room');
 });
 
 test('the agent environment keeps what a shell needs and drops ambient credentials', () => {

@@ -46,6 +46,6 @@ test('two chats: a message parked in chat 1 goes out once, from chat 1, however 
 
 test('the chat screen asks parkedReady with the active chat and runs again when the active chat changes', () => {
   const chat = src('screens/Chat.tsx');
-  assert.match(chat, /import \{ busyPlan, parkedReady \} from '\.\.\/lib\/while-busy';/);
+  assert.match(chat, /import \{[^}]*\bbusyPlan\b[^}]*\bparkedReady\b[^}]*\} from '\.\.\/lib\/while-busy';/);
   assert.match(chat, /if \(!session \|\| !parkedReady\(session\.id, activeId, streaming, parked\?\.length \?\? 0\)\)\s*return;\s*const next = takeParked\(session\.id\);\s*if \(next !== undefined\)\s*void sendMessage\(next\);\s*\}, \[streaming, parked\?\.length, session\?\.id, activeId\]\);/);
 });
