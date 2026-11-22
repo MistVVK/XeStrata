@@ -16,7 +16,9 @@
 //      truncated file, a role named in the wrong file, a type or a shape the pack does not say, a missing file.
 #include "gguf_fixture.hpp"
 
+#include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -25,6 +27,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -147,6 +150,165 @@ void columns() {
     check(!load(d.path, 2, 512, err), "two names are refused");
     write_text(d.path / "native_experts.txt", manifest(4, "a extra", blob));
     check(!load(d.path, 2, 512, err), "a column after the shard column is refused");
+}
+
+// Sync's v6: the pack is made here so it needs neither model files nor a GPU.
+void sync_v6() {
+    using namespace strata::kernels::cpu;
+    float p2[3][4];
+    for (auto& m : p2) for (float& q : m) q = 1.f;
+    NativeFmt a, b;
+    std::string err;
+    if (!native_r1q2_fmt(182, 183, 256, 128, p2, a, err) ||
+        !native_r1q2_fmt(183, 184, 256, 128, p2, b, err)) {
+        check(false, "Sync v6: create formats: " + err); return;
+    }
+    TempDir d;
+    const std::string header = "# strata native experts v6: (n_expert 2, expert_embd 256, expert_ff 128)\n";
+    const std::string manifest = header + "0 183 184 0 " + std::to_string(b.bytes) + "\n1 183 184 " +
+                                 std::to_string(a.bytes + b.bytes) + " " + std::to_string(b.bytes) + "\n";
+    const std::string kinds = "0 0 182 183\n0 1 183 184\n1 0 183 184\n1 1 182 183\n";
+    write_text(d.path / "native_experts.txt", manifest);
+    write_text(d.path / "experts_k.txt", kinds);
+    write_text(d.path / "r1q2.txt", "0 0 0 0 0 0 0\n1 0 0 0 0 0 0\n");
+    write_text(d.path / "hadamard.txt", "# strata hadamard v1\nblock 128\nlayer 0 1 1 1\nlayer 1 1 1 1\n");
+    bool ok = load(d.path, 2, 2, err);
+    const ExpertLayout& L = expert_layout();
+    check(ok && L.mixed() && L.total == 2 * (a.bytes + b.bytes) &&
+          L.blob_offset(0, 0) == 0 && L.blob_offset(0, 1) == a.bytes &&
+          L.blob_offset(1, 0) == a.bytes + b.bytes && L.blob_offset(1, 1) == a.bytes + 2 * b.bytes &&
+          L.blob_bytes(0, 0) == a.bytes && L.blob_bytes(0, 1) == b.bytes &&
+          L.format(1, 1).gu_type == 182 && L.format(1, 1).had_gu && L.format(1, 1).had_d,
+          "Sync v6: mixed sizes, positions, types and Hadamard" + (ok ? "" : ": " + err));
+    if (ok) {
+        const ExpertLayout original = L;   // NOLINT(performance-unnecessary-copy-initialization): L is replaced below
+        ExpertLayout with_gguf_offsets = L;
+        with_gguf_offsets.gguf_off.assign(6, 0);
+        expert_layout_set(with_gguf_offsets);
+        strata::core::ArenaExpertSource absent;
+        absent.set_gguf((d.path / "common.gguf").string());
+        const bool refused = !absent.open(d.path.string(), 2, 2, 1, err) &&
+                             err.find("cannot open") != std::string::npos &&
+                             err.find("experts.v2.bin") != std::string::npos;
+        expert_layout_set(original);
+        check(refused, "Sync v6: missing experts.v2.bin is not read from the common GGUF");
+        std::vector<uint8_t> packed((size_t) L.total);
+        for (int64_t layer = 0; layer < 2; ++layer) for (int64_t expert = 0; expert < 2; ++expert) {
+            const size_t off = (size_t) L.blob_offset(layer, expert), bytes = (size_t) L.blob_bytes(layer, expert);
+            std::fill(packed.begin() + (ptrdiff_t) off, packed.begin() + (ptrdiff_t) (off + bytes),
+                      (uint8_t) (1 + layer * 2 + expert));
+        }
+        { std::ofstream f(d.path / "experts.v2.bin", std::ios::binary); f.write((const char*) packed.data(), (std::streamsize) packed.size()); }
+        strata::core::FileExpertSource source;
+        ok = source.open(d.path.string(), 2, 2, err);
+        bool equal = ok;
+        for (int64_t layer = 0; ok && layer < 2; ++layer) for (int64_t expert = 0; expert < 2; ++expert) {
+            const size_t off = (size_t) L.blob_offset(layer, expert), bytes = (size_t) L.blob_bytes(layer, expert);
+            std::vector<uint8_t> copy(bytes + 1, 0x91);
+            const uint8_t* ptr = source.blob(layer, expert);
+            equal = equal && ptr && std::memcmp(ptr, packed.data() + off, bytes) == 0 &&
+                    source.copy_blob(layer, expert, copy.data()) && copy.back() == 0x91 &&
+                    std::memcmp(copy.data(), packed.data() + off, bytes) == 0;
+        }
+        check(equal, "Sync v6: mapped experts.v2.bin uses each expert's exact position and length" + (ok ? "" : ": " + err));
+        const std::vector<std::pair<int32_t, int32_t>> rank{{0, 1}, {1, 1}, {0, 0}, {1, 0}};
+        ok = ok && source.pin_complement(0, {}, {}, err, strata::core::FileExpertSource::Pin::off, {}, -1, 0,
+                                         b.bytes + a.bytes, &rank);
+        equal = ok && source.resident_count() == 2 && source.has_resident(0, 1) && source.has_resident(1, 1) &&
+                !source.has_resident(0, 0) && !source.has_resident(1, 0);
+        for (int64_t layer = 0; ok && layer < 2; ++layer) for (int64_t expert = 0; expert < 2; ++expert) {
+            const size_t off = (size_t) L.blob_offset(layer, expert), bytes = (size_t) L.blob_bytes(layer, expert);
+            const uint8_t* ptr = source.blob(layer, expert);
+            equal = equal && ptr && std::memcmp(ptr, packed.data() + off, bytes) == 0;
+        }
+        check(equal, "Sync v6: budgeted mixed RAM copy and mapped fallback" + (ok ? "" : ": " + err));
+        if (ok) {
+            bool swapped = source.replace_resident(0, 0, 1) && source.has_resident(0, 0) &&
+                           !source.has_resident(0, 1) && source.has_resident(1, 1);
+            const uint8_t* small = source.blob(0, 0);
+            swapped = swapped && small && std::memcmp(small, packed.data(), (size_t) a.bytes) == 0;
+            swapped = swapped && source.replace_resident(0, 1, 0) && source.has_resident(0, 1) &&
+                      !source.has_resident(0, 0) && source.has_resident(1, 1);
+            const uint8_t* large = source.blob(0, 1);
+            const uint8_t* other = source.blob(1, 1);
+            swapped = swapped && large && other &&
+                      std::memcmp(large, packed.data() + L.blob_offset(0, 1), (size_t) b.bytes) == 0 &&
+                      std::memcmp(other, packed.data() + L.blob_offset(1, 1), (size_t) a.bytes) == 0;
+            check(swapped, "Sync v6: unequal-sized RAM exchange shrinks and grows without corrupting another expert");
+            const bool full = !source.replace_resident(1, 0, 1) && source.has_resident(1, 1) &&
+                              !source.has_resident(1, 0) && source.has_resident(0, 1) &&
+                              std::memcmp(source.blob(1, 1), packed.data() + L.blob_offset(1, 1), (size_t) a.bytes) == 0;
+            check(full, "Sync v6: a growing RAM exchange without space leaves ownership and bytes intact");
+            bool exchange = source.reserve_exchanges(2, err);
+            uint8_t* tmp = source.exchange_buffer(0, 0);
+            exchange = exchange && tmp != nullptr;
+            if (exchange) {
+                std::memcpy(tmp, packed.data() + L.blob_offset(0, 0), (size_t) a.bytes);
+                exchange = source.stage_exchange(0, 1, 0, 0) && source.commit_exchanges() == 1 &&
+                           source.has_resident(0, 0) && !source.has_resident(0, 1) &&
+                           std::memcmp(source.blob(0, 0), packed.data() + L.blob_offset(0, 0), (size_t) a.bytes) == 0;
+            }
+            if (exchange) {
+                std::memcpy(tmp, packed.data() + L.blob_offset(0, 1), (size_t) b.bytes);
+                exchange = source.stage_exchange(0, 0, 1, 0);
+                if (exchange) { source.commit_copies(); exchange = source.commit_flip() == 1; }
+                exchange = exchange && source.has_resident(0, 1) && !source.has_resident(0, 0) &&
+                           std::memcmp(source.blob(0, 1), packed.data() + L.blob_offset(0, 1), (size_t) b.bytes) == 0 &&
+                           std::memcmp(source.blob(1, 1), packed.data() + L.blob_offset(1, 1), (size_t) a.bytes) == 0;
+            }
+            check(exchange, "Sync v6: staged unequal-sized GPU exchanges shrink and grow, including asynchronous commit");
+        }
+#if !defined(_WIN32)
+        source.close();
+        { std::ofstream f(d.path / "experts.v2.bin", std::ios::binary | std::ios::app);
+          const std::vector<uint8_t> padding((size_t) L.max_blob, 0); f.write((const char*) padding.data(), (std::streamsize) padding.size()); }
+        setenv("XESTRATA_ARENA_MMAP", "1", 1);
+        strata::core::ArenaExpertSource arena;
+        ok = arena.open(d.path.string(), 2, 2, 1, err);
+        unsetenv("XESTRATA_ARENA_MMAP");
+        equal = ok;
+        for (int64_t layer = 0; ok && layer < 2; ++layer) for (int64_t expert = 0; expert < 2; ++expert) {
+            const size_t off = (size_t) L.blob_offset(layer, expert), bytes = (size_t) L.blob_bytes(layer, expert);
+            const uint8_t* ptr = arena.blob(layer, expert);
+            equal = equal && ptr && std::memcmp(ptr, packed.data() + off, bytes) == 0;
+        }
+        check(equal, "Sync v6: mapped arena returns each mixed expert exactly" + (ok ? "" : ": " + err));
+#endif
+    }
+    write_text(d.path / "experts_k.txt", kinds + "0 0 182 183\n");
+    check(!load(d.path, 2, 2, err) && err.find("duplicate") != std::string::npos, "Sync v6: duplicate expert refused");
+    write_text(d.path / "experts_k.txt", "0 0 182 183\n");
+    check(!load(d.path, 2, 2, err) && err.find("missing") != std::string::npos, "Sync v6: missing expert refused");
+    write_text(d.path / "experts_k.txt", kinds);
+    write_text(d.path / "r1q2.txt", "0 0 0 0 0 0 0\n");
+    check(!load(d.path, 2, 2, err), "Sync v6: missing scale table refused");
+}
+
+void dense_nq() {
+    using namespace strata::core;
+    TempDir d;
+    std::string err;
+    const std::string index = "output.weight 12 256 1 0 144\nblk.0.attn_gate.weight 11 256 1 144 110\n";
+    std::vector<uint8_t> bytes(254);
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (uint8_t) i;
+    { std::ofstream f(d.path / "dense_nq.bin", std::ios::binary); f.write((const char*) bytes.data(), (std::streamsize) bytes.size()); }
+    write_text(d.path / "dense_nq.txt", index);
+    bool ok = dense_nq_init(d.path.string(), err);
+    std::vector<uint8_t> row;
+    ok = ok && dense_nq_active() && dense_nq_find("output.weight") &&
+         dense_nq_find("blk.0.attn_gate.weight") && !dense_nq_find("other") &&
+         dense_nq_read("blk.0.attn_gate.weight", 256, 1, row, err) &&
+         row == std::vector<uint8_t>(bytes.begin() + 144, bytes.end());
+    check(ok, "dense_nq: validate index and read the replacement's bytes" + (ok ? "" : ": " + err));
+    check(!dense_nq_read("output.weight", 256, 2, row, err), "dense_nq: wrong dimensions refused");
+    write_text(d.path / "dense_nq.txt", index + "output.weight 12 256 1 0 144\n");
+    check(!dense_nq_init(d.path.string(), err), "dense_nq: duplicate refused");
+    write_text(d.path / "dense_nq.txt", "output.weight 12 256 1 0 144\nblk.0.attn_gate.weight 11 256 1 100 110\n");
+    check(!dense_nq_init(d.path.string(), err), "dense_nq: overlapping spans refused");
+    write_text(d.path / "dense_nq.txt", "output.weight 12 256 1 200 144\n");
+    check(!dense_nq_init(d.path.string(), err), "dense_nq: short binary refused");
+    TempDir empty;
+    check(dense_nq_init(empty.path.string(), err) && !dense_nq_active(), "dense_nq: ordinary pack has no replacement");
 }
 
 // ---- 2b. v6: the latent MoE's A-only pack (Edge0): the header's widths, no hadamard.txt, the column scales
@@ -398,6 +560,31 @@ int main(int argc, char** argv) try {
                     ok ? "every span is its tensor" : "REFUSED: ", ok ? "" : err.c_str());
         return ok ? 0 : 1;
     }
+    if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--sync") {
+        std::string err;
+        if (!load(argv[2], 48, 512, err)) { std::printf("layout refused: %s\n", err.c_str()); return 1; }
+        const ExpertLayout& L = strata::kernels::cpu::expert_layout();
+        if (!strata::core::dense_nq_init(argv[2], err) || !strata::core::dense_nq_find("output.weight")) {
+            std::printf("dense_nq refused: %s\n", err.c_str()); return 1;
+        }
+        const auto file_size = fs::file_size(fs::path(argv[2]) / "experts.v2.bin");
+        std::printf("Sync v%d: %lld layers x %lld experts, computed %llu B, file %llu B\n", L.version,
+                    (long long) L.n_layers, (long long) L.n_expert, (unsigned long long) L.total,
+                    (unsigned long long) file_size);
+        if (argc == 4) {
+            const strata::GgufFile gguf(argv[3]);
+            const std::string arch_err = strata::check_architecture(gguf);
+            size_t expert_tensors = 0;
+            for (const auto& t : gguf.tensors())
+                if (t.name.find("ffn_gate_exps.weight") != std::string::npos ||
+                    t.name.find("ffn_up_exps.weight") != std::string::npos ||
+                    t.name.find("ffn_down_exps.weight") != std::string::npos) ++expert_tensors;
+            std::printf("common GGUF: %zu tensors, %zu routed expert tensors, architecture: %s\n",
+                        gguf.tensors().size(), expert_tensors, arch_err.empty() ? "ok" : arch_err.c_str());
+            if (!arch_err.empty() || expert_tensors != 0) return 1;
+        }
+        return L.mixed() && L.total == file_size ? 0 : 1;
+    }
     std::printf("expert_layout_test\n");
     if (argc < 2) {
         std::printf("usage: expert_layout_test <tests/data/native_experts>\n");
@@ -406,6 +593,8 @@ int main(int argc, char** argv) try {
     real_packs(argv[1]);
     columns();
     latent_v6();
+    sync_v6();
+    dense_nq();
     arena();
     std::printf(g_fail ? "expert_layout_test: %d FAILED\n" : "expert_layout_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;

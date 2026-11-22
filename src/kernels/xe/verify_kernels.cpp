@@ -1153,6 +1153,37 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
     done(stream, fetch_blobs_on(q, src, n, dst, (long long) (blob_bytes / 16), (size_t) groups), "fetch_blobs");
 }
 
+void fetch_r1q2_blobs(const unsigned long long* src, const int32_t* count, uint8_t* dst, int64_t stride, int cap,
+                      const int32_t* starts, const int32_t* entries, const int32_t* route_ids, const uint8_t* k_pairs,
+                      int n_embd, int n_ff, void* stream) {
+    if (cap <= 0) return;
+    if (stride <= 0 || stride % 16 || n_embd <= 0 || n_embd % 128 || n_ff <= 0 || n_ff % 128)
+        fail("fetch_r1q2_blobs: invalid geometry");
+    using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+    auto& q = Q(stream);
+    const int fixed = fetch_groups_fixed();
+    const int groups = fixed > 0 ? fixed : fetch_groups().get(q.get_device(), [&] { return fetch_groups_default(q); });
+    const size_t items = (size_t) groups * 256, per = (size_t) stride / 16;
+    auto event = q.parallel_for(sycl::nd_range<1>(items, 256), [=](sycl::nd_item<1> it) {
+        // the groups this window fetches, not the staging's cap: a layer with no PCIe share (every expert in VRAM)
+        // walked cap x stride / 16 items for nothing, 80 us a layer on the B70 (Sync-S, 2026-11-20)
+        const size_t n = (size_t) sycl::clamp(*count, 0, cap);
+        for (size_t i = it.get_global_linear_id(); i < n * per; i += items) {
+            const size_t g = i / per, off = i % per;
+            // The host-built plan supplies in-range entry, route and expert indices for each fetched group.
+            const int expert = route_ids[entries[starts[g]]];  // NOLINT(clang-analyzer-security.ArrayBound)
+            const size_t gk = k_pairs[(size_t) 2 * expert], dk = k_pairs[(size_t) 2 * expert + 1];
+            const size_t gb = (size_t) n_embd / 128, db = (size_t) n_ff / 128;
+            const size_t codes = 2 * (size_t) n_ff * gb * 4 * gk + (size_t) n_embd * db * 4 * dk;
+            const size_t gu = (size_t) n_ff * 2 + gb * 2 + (size_t) n_ff * ((gb + 3) / 4);
+            const size_t ds = (size_t) n_embd * 2 + db * 2 + (size_t) n_embd * ((db + 3) / 4);
+            const size_t bytes = (((codes + 15) & ~(size_t) 15) + 2 * gu + ds + 255) & ~(size_t) 255;
+            if (off < bytes / 16) reinterpret_cast<u32x4*>(dst)[i] = reinterpret_cast<const u32x4*>(src[g])[off];
+        }
+    });
+    done(stream, event, "fetch_r1q2_blobs");
+}
+
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
     const unsigned long long b = (unsigned long long) base;
     const long long bytes = (long long) blob_bytes;

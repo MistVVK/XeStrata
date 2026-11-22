@@ -13,7 +13,7 @@ enum class XmxType { f16, bf16 };
 
 /// Whether the compute device runs the XMX kernels for inputs of type `t` (joint_matrix 8 x 16 x 16 with FP32
 /// accumulators and 16-wide sub-groups, as it reports them; STRATA_NO_XMX=1 says no).  Without them the products run
-/// through DP4a, and other kernels on the matrix engines (the prompt attention) take their own paths.
+/// through DP4a.  For matrix_report's has_form: a path asks for its form there.
 bool xmx_available(XmxType t);
 
 /// Whether the compute device runs FP16 products on its matrix engines (the XMX kernels, or mma_gemm's joint_matrix).
@@ -56,5 +56,15 @@ void xmx_gemm_grouped(const uint16_t* X, const uint16_t* W, int64_t w_stride, fl
 /// Y = X . W^T, one sub-group an output: the small products xmx_gemm does not take.
 void gemm_rows(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                void* stream, bool accumulate = false);
+
+// Ordered FP64 accumulation of an FP32 matrix and vector, rounded once to FP32.
+bool gemm_f32_ordered(const float* x, const float* w, float* y, int64_t rows, int64_t n, int64_t k, void* stream);
+bool gemv_f32_ordered(const float* x, const float* w, float* y, int64_t n, int64_t k, void* stream);
+// The DSpark draft's layer steps on the device, in the host reference's order: an RMS norm of each row with an
+// ordered FP64 sum (the same rounding as the host), RoPE from a host-computed [rows][dim/2][cos,sin] table,
+// and a residual add. SwiGLU stays on the host: the device's exp is not the host libm's.
+bool rows_norm_ordered(const float* x, const float* w, float* y, int64_t rows, int64_t n, float eps, void* stream);
+void rope_rows_table(float* x, const float* cs, int64_t rows, int64_t heads, int64_t dim, void* stream);
+void add_rows_f32(float* x, const float* y, int64_t n, void* stream);
 
 }  // namespace strata::kernels

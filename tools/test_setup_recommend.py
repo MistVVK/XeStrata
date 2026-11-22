@@ -40,6 +40,24 @@ class SizeByQuality(unittest.TestCase):
         self.assertEqual(setup.recommend_size("gyro", room(48, 8)), "Gyro-M")
         self.assertEqual(setup.recommend_size("atomicchat", room(64, 0)), "AD-5.00bpw")  # the same experts, 8-bit table
 
+    def test_sync_does_not_change_other_families_entry_gate(self):
+        self.assertEqual(setup.minimum_setup_ram("sync"), 24)
+        self.assertEqual(setup.minimum_setup_ram("gyro"), 26)
+        self.assertEqual(setup.minimum_setup_ram(None), 26)
+
+    def test_sync_thresholds_and_recommendation(self):
+        cases = [(23, 16, "Sync-XS"), (24, 16, "Sync-XS"), (31.99, 16, "Sync-XS"),
+                 (32, 11.99, "Sync-XS"), (32, 12, "Sync-S"), (47.99, 11.99, "Sync-XS"),
+                 (48, 0, "Sync-M"), (48, 12, "Sync-M")]
+        for ram, vram, expected in cases:
+            with self.subTest(ram=ram, vram=vram):
+                self.assertEqual(setup.recommend_size("sync", room(ram, vram)), expected)
+        self.assertFalse(setup.size_fits("sync", "Sync-XS", room(23.99, 16)))
+        self.assertTrue(setup.size_fits("sync", "Sync-XS", room(24, 16)))
+        self.assertFalse(setup.size_fits("sync", "Sync-S", room(32, 11.99)))
+        self.assertTrue(setup.size_fits("sync", "Sync-S", room(48, 0)))
+        self.assertEqual(setup.recommend_family(FirstModel.fams, room(64, 16)), "sc117-swift")
+
     def test_a_plain_moe_takes_the_best_that_ram_and_vram_hold_tested_or_not(self):
         self.assertEqual(setup.recommend_size("ornith", room(36, 4)), "Q5_K_M")    # untested, as the user chose
         self.assertEqual(setup.recommend_size("ornith", room(128, 24)), "Q8_0")    # never above Q8_0

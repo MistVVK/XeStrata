@@ -219,11 +219,15 @@ public:
     VmmRange* vmm_range() { return vmm_.get(); }
     /// Byte offset of slot `s` in the arena (s == slots(): the end).
     uint64_t slot_offset(int64_t s) const { return off_.empty() ? (uint64_t) s * (uint64_t) blob_ : off_[(size_t) s]; }
+    /// Usable bytes in one slot, including when its backing allocations are separate pieces.
+    uint64_t slot_capacity(int64_t s) const { return (uint64_t) (slot_end(s + 1) - slot_end(s)); }
 
 private:
     int64_t slot_end(int64_t n) const {
         return !size_off_.empty() ? (int64_t) size_off_[(size_t) n] : off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n];
     }
+    /// Resolve a copy length against the selected slot, not the largest slot in a sized cache.
+    bool slot_copy_size(int32_t slot, int64_t bytes, size_t& n, std::string& err) const;
     bool open_segmented(uint64_t want, std::string& err);
     bool open_pieces(const std::vector<uint64_t>& size_off, std::string& err);
     /// The piece allocations of `open_pieces` with the piece size given (not `piece_max_`).  `best_effort`: the first

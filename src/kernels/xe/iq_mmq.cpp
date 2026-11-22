@@ -34,6 +34,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/platform/env.hpp"
 #include "iq_bits.hpp"
+#include "bih3.hpp"
 #include "cuda_intrinsics.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_iq_mmq
 #include "strata/kernels/device_arch_tag.hpp"
@@ -570,6 +571,35 @@ template<> struct Dec<kNativeQ6KRows> {   // Q6_K split by row (native_mmvq.hpp)
         const float d = (float) *reinterpret_cast<const sycl::half*>(row + bpr * 208 + blk * 2);
         r.s0 = d * (float) sc[2 * (ptrdiff_t) j];
         r.s1 = d * (float) sc[2 * j + 1];
+        return r;
+    }
+};
+
+// The gathered bih3 R1Q2 planes: three signed-byte blocks for each original block of 32. Their scale is FP32,
+// so gathering does not round the row, column or two-bit scales to FP16 a second time.
+template<> struct Dec<kBih3Planes> {
+    static constexpr int QK = 32, BSZ = 36;
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const uint8_t* block = row + (size_t) sb * BSZ;
+        Sub r;
+        for (int j = 0; j < 8; ++j) r.v[j] = (uint32_t) get_int_b4(block, j);
+        r.s0 = r.s1 = *reinterpret_cast<const float*>(block + 32);
+        return r;
+    }
+};
+
+// The gathered bih3 R1Q2 codes (kBih3Code): sub-block sb of the three-plane row is plane sb % 3 of the 32 values
+// sb / 3, decoded from the 128-value block's codes in the tile (the plane's two products of each state only): the
+// codes are 0.5 bytes a weight against kBih3Planes' 3.4.
+template<> struct Dec<kBih3Code> {
+    static constexpr int QK = 384, BSZ = 64;
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const int v = sb / 3, p = sb % 3;
+        const uint8_t* block = row + (size_t) (v / 4) * BSZ;
+        const int k = block[60], step0 = (v % 4) * 8;
+        Sub r;
+        for (int j = 0; j < 8; ++j) r.v[j] = xe::bih3_state_plane(xe::bih3_state_w(block, k, step0 + j), p);
+        r.s0 = r.s1 = *reinterpret_cast<const float*>(block + 56);
         return r;
     }
 };
@@ -2043,7 +2073,9 @@ bool iq_mmq_dp4a_usable(sycl::queue& q) {
 const char* iq_mmq_path(sycl::queue& q) {
     if (iq_mmq_usable(q)) {
         const sycl::device d = q.get_device();
-        return xe::amd_wmma(d) ? "WMMA" : shape_reported(d) ? "joint_matrix" : "XMX";
+        const int intel = intel_shape_of(q);   // by_rows chooses this before the other matrix forms
+        if (intel) return intel == 1 ? "XMX SG16" : "XMX SG8";
+        return xe::amd_wmma(d) ? "WMMA" : "joint_matrix";
     }
     return iq_mmq_dp4a_usable(q) ? "DP4a" : nullptr;
 }
@@ -2052,7 +2084,7 @@ bool iq_mmq_type_sums(int t) { return t == 7 || t == 12 || t == 13; }   // has_m
 
 bool iq_mmq_type_ok(int t) {
     switch (t) {
-        case 2: case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
+        case 2: case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows: case kBih3Planes: case kBih3Code:
         case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 40: case 42:
         case kIqMmqFx + 16: case kIqMmqFx + 17: case kIqMmqFx + 18: case kIqMmqFx + 20: case kIqMmqFx + 21:
         case kIqMmqFx + 22: case kIqMmqFx + 42: return true;
@@ -2077,6 +2109,8 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
         case 14: return (size_t) (cols / Dec<14>::QK) * Dec<14>::BSZ;
         case kNativeQ6KRows: return (size_t) (cols / Dec<kNativeQ6KRows>::QK) * Dec<kNativeQ6KRows>::BSZ;
         case kNativeQ8Rows: return (size_t) (cols / Dec<kNativeQ8Rows>::QK) * Dec<kNativeQ8Rows>::BSZ;
+        case kBih3Planes: return (size_t) (cols / Dec<kBih3Planes>::QK) * Dec<kBih3Planes>::BSZ;
+        case kBih3Code: return (size_t) (cols / Dec<kBih3Code>::QK) * Dec<kBih3Code>::BSZ;
         case 16: case kIqMmqFx + 16: return (size_t) (cols / Dec<16>::QK) * Dec<16>::BSZ;
         case 17: case kIqMmqFx + 17: return (size_t) (cols / Dec<17>::QK) * Dec<17>::BSZ;
         case 18: case kIqMmqFx + 18: return (size_t) (cols / Dec<18>::QK) * Dec<18>::BSZ;
@@ -2163,6 +2197,8 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         STRATA_MMQ_CASE(14);
         STRATA_MMQ_CASE(kNativeQ6KRows);
         STRATA_MMQ_CASE(kNativeQ8Rows);
+        STRATA_MMQ_CASE(kBih3Planes);
+        STRATA_MMQ_CASE(kBih3Code);
         STRATA_MMQ_CASE(16);
         STRATA_MMQ_CASE(17);
         STRATA_MMQ_CASE(18);

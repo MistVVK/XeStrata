@@ -810,6 +810,9 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
+    // The row partition is shared by the batch, although its expert formats and blob lengths may differ.
+    for (int e = 0; e < n; ++e)
+        if (jobs[e].fmt != nullptr && (jobs[e].fmt->n_ff != f.n_ff || jobs[e].fmt->n_embd != f.n_embd)) std::abort();
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
@@ -821,11 +824,13 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
-        const bool q2 = f.d_type == 42 && !canon_layer(f);
-        for (int e = 0; e < nb; ++e)
+        for (int e = 0; e < nb; ++e) {
+            const NativeFmt& ef = mjobs_[e].fmt != nullptr ? *mjobs_[e].fmt : f;
+            const bool q2 = ef.d_type == 42 && !canon_layer(ef);
             for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2) act_quant_any(split_multi_[(size_t) e].ff[t], (int) f.n_ff, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+                if (q2) act_quant_any(split_multi_[(size_t) e].ff[t], (int) ef.n_ff, split_multi_[(size_t) e].a2[t]);
+                else native_quant_h(ef, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        }
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = phase_tasks(mrows_);
@@ -835,7 +840,8 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
         ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
     }
-    multi_bytes += (int64_t) n * (int64_t) f.bytes;
+    for (int e = 0; e < n; ++e)
+        multi_bytes += (int64_t) (jobs[e].fmt != nullptr ? jobs[e].fmt->bytes : f.bytes);
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }

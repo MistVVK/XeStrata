@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/cpu/expert_layout.hpp - plan v0.3 P6: where each routed expert lives in experts.bin.
 //
@@ -38,6 +39,21 @@ struct ExpertLayout {
     /// v6 (the latent MoE, Edge0): the experts' own widths from the header, 0 when it does not name them.
     /// They differ from the shell's hidden width and expert FF: the experts run at the latent width.
     int64_t expert_embd = 0, expert_ff = 0;
+    /// Sync's v6 has a different format and size for each expert, unlike Edge0's v6.
+    std::vector<NativeFmt> expert_fmt;
+    std::vector<uint64_t> expert_off;
+    std::vector<uint64_t> layer_size;
+    bool mixed() const { return !expert_fmt.empty(); }
+    size_t expert_index(int64_t layer, int64_t expert) const { return (size_t) (layer * n_expert + expert); }
+    const NativeFmt& format(int64_t layer, int64_t expert) const {
+        return mixed() ? expert_fmt[expert_index(layer, expert)] : fmt[(size_t) layer];
+    }
+    uint64_t blob_bytes(int64_t layer, int64_t expert) const {
+        return mixed() ? format(layer, expert).bytes : blob_bytes(layer);
+    }
+    uint64_t layer_bytes(int64_t layer) const {
+        return mixed() ? layer_size[(size_t) layer] : blob_bytes(layer) * (uint64_t) n_expert;
+    }
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size
 
@@ -47,7 +63,8 @@ struct ExpertLayout {
         return native ? offset[(size_t) layer] : (uint64_t) layer * (uint64_t) n_expert * (uint64_t) BLOB;
     }
     uint64_t blob_offset(int64_t layer, int64_t expert) const {
-        return layer_offset(layer) + (uint64_t) expert * blob_bytes(layer);
+        return mixed() ? expert_off[expert_index(layer, expert)] :
+                         layer_offset(layer) + (uint64_t) expert * blob_bytes(layer);
     }
 };
 

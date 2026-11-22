@@ -50,7 +50,8 @@ WIDE_PUBLIC = {
     # cpu_avx512_ok)
     "resize_rows_avxvnni", "resize_rows_avx512",
 }
-WIDE_OBJECTS = ("expert.cpp", "iq_avx512.cpp", "iq_avx2.cpp", "q2_avx2.cpp", "kq_avx2.cpp", "tq_avx512.cpp",
+WIDE_OBJECTS = ("expert.cpp", "iq_avx512.cpp", "iq_avx2.cpp", "q2_avx2.cpp", "kq_avx2.cpp", "tq_avx2.cpp",
+                "tq_avx512.cpp",
                 "nvfp4_avx512.cpp",
                 "i8_gemm_vnni.cpp", "i8_gemm_avx512.cpp", "bf16_gemm_avx512.cpp", "vision_cpu_avx512.cpp",
                 "resize_rows_avx2.cpp",

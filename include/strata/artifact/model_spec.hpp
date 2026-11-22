@@ -15,6 +15,8 @@
 //              gate|up, RMSNorms after the attention and the FFN as well as before
 //   glm5-next  GLM-5.3-Flash: KDA + NoPE MLA with a k-pool indexer, mHC, leading dense layers, MTP.  Also spelled
 //              `glm5next` (Project Maya's quants, after unsloth's first GGUFs), with the same keys under that name.
+//   inkling2_loop Inkling-2-Mini (Thinking Machines): hybrid sliding-window / relative-attention layers with short
+//              convolutions, AttnRes every 6 layers, sigmoid-gated MoE and a 3-pass loop over core layers 6-17.
 //
 // `block_count` counts the MTP (NextN) layers too; `n_layer` here is the trunk, block_count minus
 // `nextn_predict_layers`, as llama.cpp's `n_layer()`.  A key a model does not carry reads as 0 (or false), and
@@ -32,7 +34,7 @@
 
 namespace strata {
 
-enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, Qwen35, Plamo3, Qwen3 };
+enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, Qwen35, Plamo3, Qwen3, Inkling2Loop };
 
 /// llama.cpp's `llama_expert_gating_func_type`
 enum class ExpertGating : uint32_t { None = 0, Softmax = 1, Sigmoid = 2 };
@@ -68,6 +70,36 @@ struct ModelSpec {
     bool layer_swa(int64_t l) const { return swa_window > 0 && l >= 0 && l < (int64_t) swa.size() && swa[(size_t) l]; }
     /// A dense model: a SwiGLU FFN in every block and no experts (qwen35, plamo3, qwen3)
     bool dense() const { return arch == ModelArch::Qwen35 || arch == ModelArch::Plamo3 || arch == ModelArch::Qwen3; }
+
+    // inkling2_loop (Inkling-2-Mini).  No RoPE: the relative-position bias carries the positions.  The GGUF's keys
+    // are those mainline llama.cpp writes in src/llama-arch.cpp (PR #32694).  The loop expands the trunk's 24 physical
+    // layers to 48 cache slots; the extra 24 share their weights with core layers 6-17 but keep their own K/V and
+    // convolution state.  `layer_phys` is the slot -> physical layer map of llama_model_inkling2_loop::layer_phys.
+    int64_t loop_start = 0, loop_end = 0, loop_count = 0, loop_gate_rank = 0;
+    bool loop_varying = false;
+    int64_t attn_res_block = 0;                 ///< inkling2_loop.attn_res.block_size
+    int64_t sconv_l_cache = 0;                  ///< inkling2_loop.shortconv.l_cache (kernel size)
+    int64_t relative_length = 0;                ///< d_rel
+    int64_t relative_extent = 0;                ///< the distances the bias table covers
+    double relative_clip = 0;                   ///< L2 cap of the relative vectors
+    double qk_clip = 0;                         ///< L2 cap of Q and K
+    int64_t log_scale_floor = 0;
+    double log_scale_alpha = 0;
+    double situ_beta = 0, situ_linear_beta = 0; ///< beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
+    double final_logit_softcap = 0;
+    int64_t vocab_padded = 0, vocab_unpadded = 0;
+    bool expert_gate_bias = false;              ///< blk.*.exp_probs_b.bias present
+
+    int64_t n_slot() const {
+        if (arch != ModelArch::Inkling2Loop || loop_count <= 0 || loop_end <= loop_start) return n_layer;
+        return n_layer + (loop_count - 1) * (loop_end - loop_start);
+    }
+    int64_t layer_phys(int64_t il) const {
+        if (il < n_layer || loop_end <= loop_start) return il;
+        return loop_start + (il - n_layer) % (loop_end - loop_start);
+    }
+    /// True when cache slot `il` is a copy of a physical core layer (its weights are shared, its state is not).
+    bool loop_slot(int64_t il) const { return arch == ModelArch::Inkling2Loop && il >= n_layer && il < n_slot(); }
 
     // linear attention.  `recurrent` is per layer: true for a gated delta-net / KDA layer.
     std::vector<bool> recurrent;          ///< block_count entries; the MTP layers are false
@@ -158,9 +190,10 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     else if (A == "plamo3") s.arch = ModelArch::Plamo3;
     // Qwen3 and Qwen3-VL's language part (the image models' text encoders): every layer full attention, dense
     else if (A == "qwen3" || A == "qwen3vl") s.arch = ModelArch::Qwen3;
+    else if (A == "inkling2_loop") s.arch = ModelArch::Inkling2Loop;
     else {
         err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen35, qwen3moe, glm5-next, plamo3, "
-              "qwen3, qwen3vl)";
+              "qwen3, qwen3vl, inkling2_loop)";
         return false;
     }
 
@@ -187,6 +220,20 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.norm_eps = spec_num(g, A, "attention.layer_norm_epsilon");
 
     s.n_head = spec_int(g, A, "attention.head_count");
+    if (s.arch == ModelArch::Inkling2Loop && s.n_head == 0) {
+        // inkling2 writes one head count per layer; the engine uses one value and checks the layers below
+        std::vector<double> heads;
+        if (!spec_per_layer(g, A, "attention.head_count", n_all, heads) || heads.empty()) {
+            err = A + ".attention.head_count is neither a number nor one per layer";
+            return false;
+        }
+        s.n_head = (int64_t) heads[0];
+        for (size_t i = 1; i < heads.size(); ++i)
+            if (heads[i] != heads[0]) {
+                err = A + ".attention.head_count differs between layers";
+                return false;
+            }
+    }
     std::vector<double> kv;
     if (spec_get(g, A, "attention.head_count_kv") && !spec_per_layer(g, A, "attention.head_count_kv", n_all, kv)) {
         err = A + ".attention.head_count_kv is neither a number nor one per layer";
@@ -229,6 +276,59 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
                 for (int64_t i = 0; i < n_all; ++i) s.swa[(size_t) i] = n == 0 || i % n < n - 1;
             }
         }
+    } else if (s.arch == ModelArch::Inkling2Loop) {
+        // inkling2.cpp reads the pattern as one flag per layer; the GGUF writes true for a sliding-window layer
+        s.swa_window = spec_int(g, A, "attention.sliding_window");
+        std::vector<double> pat;
+        if (!spec_per_layer(g, A, "attention.sliding_window_pattern", n_all, pat)) {
+            err = A + ".attention.sliding_window_pattern must be one flag per layer";
+            return false;
+        }
+        for (int64_t i = 0; i < n_all; ++i) s.swa[(size_t) i] = pat[(size_t) i] != 0;
+    }
+
+    if (s.arch == ModelArch::Inkling2Loop) {
+        s.loop_start = spec_int(g, A, "loop.start");
+        s.loop_end = spec_int(g, A, "loop.end");
+        s.loop_count = spec_int(g, A, "loop.count");
+        s.loop_gate_rank = spec_int(g, A, "loop.gate_rank");
+        s.loop_varying = spec_int(g, A, "loop.varying") != 0;
+        s.attn_res_block = spec_int(g, A, "attn_res.block_size");
+        s.sconv_l_cache = spec_int(g, A, "shortconv.l_cache");
+        s.relative_length = spec_int(g, A, "attention.relative_length");
+        s.relative_extent = spec_int(g, A, "attention.relative_extent");
+        s.relative_clip = spec_num(g, A, "attention.relative_clip");
+        s.qk_clip = spec_num(g, A, "attention.qk_clip");
+        s.log_scale_floor = spec_int(g, A, "attention.log_scale_floor");
+        s.log_scale_alpha = spec_num(g, A, "attention.log_scale_alpha");
+        s.situ_beta = spec_num(g, A, "activation.situ_beta");
+        s.situ_linear_beta = spec_num(g, A, "activation.situ_linear_beta");
+        s.final_logit_softcap = spec_num(g, A, "final_logit_softcapping");
+        s.vocab_padded = spec_int(g, A, "vocab_size");
+        s.vocab_unpadded = spec_int(g, A, "vocab_size_unpadded");
+        s.expert_gate_bias = spec_get(g, A, "expert_gate_bias") != nullptr ||
+                             spec_get(g, A, "use_gate_bias") != nullptr;
+        // llama_model_inkling2_loop::load_arch_hparams's checks, here before a slot is allocated
+        const int64_t block = s.attn_res_block;
+        if (s.loop_count < (s.loop_varying ? 1 : 2) || s.loop_gate_rank <= 0 || s.loop_start <= 0 ||
+            s.loop_start >= s.loop_end || s.loop_end > s.n_layer || block <= 0 ||
+            s.loop_start % block != 0 || s.loop_end % block != 0 || s.n_nextn != 0) {
+            err = A + ": invalid loop core [" + std::to_string(s.loop_start) + ", " + std::to_string(s.loop_end) +
+                  ") with AttnRes block " + std::to_string(block) + ", " + std::to_string(s.loop_count) +
+                  " passes or gate rank " + std::to_string(s.loop_gate_rank);
+            return false;
+        }
+        if (!s.relative_length || !s.relative_extent || !s.swa_window || !s.log_scale_floor ||
+            s.sconv_l_cache < 2 || s.sconv_l_cache > 64 || s.vocab_unpadded <= 0 ||
+            s.vocab_unpadded > s.vocab_padded || s.qk_clip <= 0 || s.relative_clip <= 0 || s.situ_beta <= 0 ||
+            s.situ_linear_beta <= 0) {
+            err = A + ": invalid relative attention, short convolution, softcap or vocabulary dimensions";
+            return false;
+        }
+        if (s.n_slot() > 512) {   // llama.cpp's LLAMA_MAX_LAYERS; keep the check local to the header
+            err = A + ": " + std::to_string(s.n_slot()) + " cache slots exceed the maximum of 512";
+            return false;
+        }
     }
 
     s.full_attention_interval = spec_int(g, A, "full_attention_interval");
@@ -267,6 +367,7 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     case ModelArch::Qwen3Moe:
     case ModelArch::Plamo3:
     case ModelArch::Qwen3:
+    case ModelArch::Inkling2Loop:
         break;
     }
 
@@ -278,8 +379,9 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.n_dense_lead = spec_int(g, A, "leading_dense_block_count");
     s.n_ff = spec_int(g, A, "feed_forward_length");
     s.gating = (ExpertGating) spec_int(g, A, "expert_gating_func");
-    if (s.gating == ExpertGating::None)   // llama.cpp's defaults: GLM-5.3-Flash sigmoid, the Qwens softmax
-        s.gating = s.arch == ModelArch::Glm5Next ? ExpertGating::Sigmoid : ExpertGating::Softmax;
+    if (s.gating == ExpertGating::None)   // llama.cpp's defaults: GLM-5.3-Flash and inkling2 sigmoid, the Qwens softmax
+        s.gating = (s.arch == ModelArch::Glm5Next || s.arch == ModelArch::Inkling2Loop) ? ExpertGating::Sigmoid
+                                                                                       : ExpertGating::Softmax;
     if (s.gating != ExpertGating::Softmax && s.gating != ExpertGating::Sigmoid) {
         err = A + ".expert_gating_func " + std::to_string((uint32_t) s.gating) + " is not supported";
         return false;

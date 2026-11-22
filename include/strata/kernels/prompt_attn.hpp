@@ -19,6 +19,18 @@
 
 namespace strata::kernels {
 
+/// One GQA query over FP32 cells, with a relative-position dot product and a zero-valued sink.
+/// `cells` includes the appended query row. Scratch holds [heads][cells] scores.
+void relative_prompt_attn(const float* q, const float* k, const float* v, const float* rel,
+                          const float* table, const float* sink, const int32_t* positions,
+                          int64_t pos, int64_t cells, int64_t heads, int64_t kv_heads, int64_t dim,
+                          int64_t relative_dim, int64_t extent, int64_t window, float* scores, float* out, void* stream);
+
+/// Ordered FP32 block GQA over a chronological context ring followed by a separate noise block.
+bool ordered_block_attn(const float* q, const float* k, const float* v, const float* noise_k, const float* noise_v,
+                        int64_t first, int64_t past, int64_t capacity, int rows, int heads, int kv_heads, int dim,
+                        float* scores, float* out, void* stream);
+
 /// attn[t, h, :] = softmax(q[t, h, :] . K[c, h / G, :] / sqrt(head_dim), c <= pos0 + t) . V for the T queries at
 /// positions pos0 .. pos0 + T - 1, whose cells are already in the pools: q and attn [T, n_head, head_dim] FP32, the
 /// pools `[page][kv_head][page_size][head_dim]` FP16 through `page_table`.  False, nothing launched, for a shape it is

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -7,7 +8,10 @@
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/platform/env.hpp"
 
+#include <array>
 #include <atomic>
+#include <cmath>
+#include <limits>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -359,6 +363,7 @@ size_t native_row_bytes(int, int64_t) { return 0; }
 #endif
 
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+    if (n_layers <= 0 || n_expert <= 0) { err = "expert layout: empty geometry"; return false; }
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
@@ -374,6 +379,35 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     return false;
 #else
     L.native = true;
+    std::ifstream kinds(pack_dir + "/experts_k.txt");
+    const bool sync_v6 = (bool) kinds;
+    std::ifstream scales_file(pack_dir + "/r1q2.txt");
+    if (sync_v6 != (bool) scales_file) {
+        err = "experts_k.txt and r1q2.txt must both be present for a mixed R1Q2 pack";
+        return false;
+    }
+    using ScaleTable = std::array<std::array<float, 4>, 3>;
+    std::vector<ScaleTable> tables((size_t) n_layers);
+    std::vector<bool> have_scales((size_t) n_layers, false);
+    std::string scale_line;
+    while (std::getline(scales_file, scale_line)) {
+        if (scale_line.empty() || scale_line[0] == '#') continue;
+        std::istringstream ss(scale_line);
+        long long layer = -1;
+        double values[6];
+        std::string extra;
+        if (!(ss >> layer >> values[0] >> values[1] >> values[2] >> values[3] >> values[4] >> values[5]) ||
+            (ss >> extra) || layer < 0 || layer >= n_layers || have_scales[(size_t) layer]) {
+            err = "r1q2.txt: malformed or duplicate layer: " + scale_line;
+            return false;
+        }
+        for (int m = 0; m < 3; ++m) for (int q = 0; q < 4; ++q) {
+            const float v = (float) std::exp2(values[2 * (size_t) m] + q * values[2 * (size_t) m + 1]);
+            if (!(v > 0.f) || !std::isfinite(v)) { err = "r1q2.txt: invalid scale: " + scale_line; return false; }
+            tables[(size_t) layer][m][q] = v;
+        }
+        have_scales[(size_t) layer] = true;
+    }
     L.fmt.resize((size_t) n_layers);
     L.offset.assign((size_t) n_layers, ~0ull);
     L.bytes.assign((size_t) n_layers, 0);
@@ -437,8 +471,17 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, expert_embd ? expert_embd : H, expert_ff ? expert_ff : FF, f, err))
-            return false;
+        if (sync_v6) {
+            if (L.version != 6 || !have_scales[(size_t) l]) {
+                err = "experts_k.txt requires v6 and one R1Q2 scale table per layer";
+                return false;
+            }
+            float p2[3][4];
+            for (int m = 0; m < 3; ++m) for (int q = 0; q < 4; ++q) p2[m][q] = tables[(size_t) l][m][q];
+            if (!native_r1q2_fmt((int) gt, (int) dt, expert_embd ? expert_embd : H,
+                                 expert_ff ? expert_ff : FF, p2, f, err)) return false;
+        } else if (!native_fmt((int) gt, (int) dt, expert_embd ? expert_embd : H,
+                               expert_ff ? expert_ff : FF, f, err)) return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
@@ -485,13 +528,63 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         L.bytes[(size_t) l] = blob;
         if (blob > L.max_blob) L.max_blob = blob;
     }
+    if (sync_v6) {
+        if (L.version != 6 || L.n_expert <= 0 ||
+            (uint64_t) L.n_expert > std::numeric_limits<size_t>::max() / (uint64_t) n_layers) {
+            err = "experts_k.txt: invalid version or expert count";
+            return false;
+        }
+        const size_t count = (size_t) n_layers * (size_t) L.n_expert;
+        L.expert_fmt.resize(count);
+        L.expert_off.resize(count);
+        L.layer_size.assign((size_t) n_layers, 0);
+        std::vector<bool> seen(count, false);
+        while (std::getline(kinds, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream ss(line);
+            long long l = -1, e = -1, gt = -1, dt = -1;
+            std::string extra;
+            if (!(ss >> l >> e >> gt >> dt) || (ss >> extra) || l < 0 || l >= n_layers ||
+                e < 0 || e >= L.n_expert || gt < 182 || gt > 194 || dt < 182 || dt > 194) {
+                err = "experts_k.txt: malformed line: " + line;
+                return false;
+            }
+            const size_t i = L.expert_index(l, e);
+            if (seen[i]) { err = "experts_k.txt: duplicate expert: " + line; return false; }
+            seen[i] = true;
+            float p2[3][4];
+            for (int m = 0; m < 3; ++m) for (int q = 0; q < 4; ++q) p2[m][q] = tables[(size_t) l][m][q];
+            if (!native_r1q2_fmt((int) gt, (int) dt, L.fmt[(size_t) l].n_embd, L.fmt[(size_t) l].n_ff,
+                                 p2, L.expert_fmt[i], err)) return false;
+        }
+        for (int64_t l = 0; l < n_layers; ++l) {
+            uint64_t next = L.offset[(size_t) l], largest = 0;
+            if (next == ~0ull || !have_scales[(size_t) l]) {
+                err = "experts_k.txt: missing layer " + std::to_string(l);
+                return false;
+            }
+            for (int64_t e = 0; e < L.n_expert; ++e) {
+                const size_t i = L.expert_index(l, e);
+                if (!seen[i]) { err = "experts_k.txt: missing layer/expert " + std::to_string(l) + "/" + std::to_string(e); return false; }
+                const uint64_t size = L.expert_fmt[i].bytes;
+                if (next > std::numeric_limits<uint64_t>::max() - size) { err = "experts_k.txt: offsets overflow"; return false; }
+                L.expert_off[i] = next;
+                next += size;
+                if (size > largest) largest = size;
+            }
+            if (largest != L.bytes[(size_t) l]) { err = "experts_k.txt: largest expert differs from manifest"; return false; }
+            L.layer_size[(size_t) l] = next - L.offset[(size_t) l];
+        }
+    }
     uint64_t at = 0;
     for (int64_t l = 0; l < n_layers; ++l) {
         if (L.offset[(size_t) l] != at) {
             err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
         }
-        at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
+        const uint64_t layer_size = L.layer_bytes(l);
+        if (at > std::numeric_limits<uint64_t>::max() - layer_size) { err = "native_experts.txt: offsets overflow"; return false; }
+        at += layer_size;
     }
     L.total = at;
     L.expert_embd = expert_embd;
@@ -502,7 +595,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     {
         std::ifstream probe(pack_dir + "/hadamard.txt");
         const bool have = (bool) probe;
-        if (L.version == 5 && !have) {
+        if ((L.version == 5 || sync_v6) && !have) {
             err = "native_experts.txt v5 declares Hadamard-folded experts, but " + pack_dir + "/hadamard.txt is missing";
             return false;
         }
@@ -537,6 +630,14 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 err = "hadamard.txt: no sign vector for layer " + std::to_string(l) + "'s expert width";
                 return false;
             }
+        }
+    }
+    if (sync_v6) {
+        for (int64_t l = 0; l < n_layers; ++l) for (int64_t e = 0; e < L.n_expert; ++e) {
+            NativeFmt& f = L.expert_fmt[L.expert_index(l, e)];
+            const NativeFmt& layer = L.fmt[(size_t) l];
+            f.had_block = layer.had_block; f.had_gu = layer.had_gu; f.had_d = layer.had_d;
+            f.gu_signs = layer.gu_signs; f.d_signs = layer.d_signs;
         }
     }
     // v6 (the latent MoE): the Q3_K shared column scales.  The gate/up rows are A*diag(s), so the D stage's

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #pragma once
 
@@ -11,6 +12,18 @@
 namespace strata::core {
 class WeightTable;
 struct WeightRef;
+
+/// A packed dense replacement for a native GGUF matrix. Its bytes stay in dense_nq.bin until read.
+struct DenseNqEntry {
+    int type = -1;
+    int64_t ne0 = 0, ne1 = 0;
+    uint64_t offset = 0, bytes = 0;
+};
+bool dense_nq_init(const std::string& pack_dir, std::string& err);
+bool dense_nq_active();
+const DenseNqEntry* dense_nq_find(const std::string& name);
+bool dense_nq_read(const std::string& name, int64_t ne0, int64_t ne1, std::vector<uint8_t>& data,
+                   std::string& err);
 
 /// STRATA_HC_Q8 with the BF16 copies dropped (NativeDense::drop_hc_bf16): `w`'s BF16 values, its Q8_0 copy
 /// dequantized on `stream` into scratch `slot` (0-1 the prompt path's down and up, 2-3 the single-token read's),

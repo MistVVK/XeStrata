@@ -53,10 +53,6 @@ using xe::attn::pool_format;
 using xe::attn::q4_row8;
 using xe::attn::tcq_row8;
 
-// the shared attention for the pools (below)
-bool flash_pools(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int fmt, int64_t pos0, int64_t T,
-                 const QsaShapes& s, float* attn, int64_t window = 0);
-
 }  // namespace
 
 bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,
@@ -64,39 +60,27 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
     if (T <= 0) return true;
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv != 0 || s.page_size <= 0) return false;
     sycl::queue& queue = core::Runtime::get().stream(stream);
-    static const bool no_mma = [] {   // STRATA_PROMPT_ATTN_MMA=0: the FMA kernel on every GPU
-        const char* v = strata::env_get("PROMPT_ATTN_MMA");
-        return v != nullptr && std::strtol(v, nullptr, 10) == 0;
-    }();
-    // RDNA3 and RDNA4: the shared attention's WMMA form (flash_attn.hpp), which these GPUs' FMA form is far behind;
-    // elsewhere its FMA form (FP32 FMAs, K and V from FP16)
-    QsaAttnPools pools;
-    pools.k_pool = k_pool;
-    pools.v_pool = v_pool;
-    pools.page_table = page_table;
-    if (!no_mma && xe::amd_wmma(queue.get_device())) {
-        if (!flash_pools(queue, q, pools, kFmtF16, pos0, T, s, attn, window)) return false;
-    } else {
-        FlashAttnArgs a;
-        a.q32 = q;
-        a.q_ld = a.out_ld = s.n_head * s.head_dim;
-        a.k = k_pool;
-        a.v = v_pool;
-        a.page_table = page_table;
-        a.page_size = s.page_size;
-        a.n_head = s.n_head;
-        a.n_kv = s.n_head_kv;
-        a.head_dim = s.head_dim;
-        a.rows = a.n_causal = a.row_end = T;
-        a.keys = pos0 + T;
-        a.pos0 = pos0;
-        a.window = window;
-        a.out = attn;
-        a.out_f32 = true;
-        a.scale = 1.0f / std::sqrt((float) s.head_dim);
-        a.fma = true;
-        if (!flash_attn(a, &queue)) return false;
-    }
+    // the shared attention's FMA form (FP32 FMAs, K and V from FP16) on every GPU: its matrix forms, RDNA's WMMA among
+    // them, are the pools overload's other kernel (run_mma), timed against this one (prompt_attn_tune)
+    FlashAttnArgs a;
+    a.q32 = q;
+    a.q_ld = a.out_ld = s.n_head * s.head_dim;
+    a.k = k_pool;
+    a.v = v_pool;
+    a.page_table = page_table;
+    a.page_size = s.page_size;
+    a.n_head = s.n_head;
+    a.n_kv = s.n_head_kv;
+    a.head_dim = s.head_dim;
+    a.rows = a.n_causal = a.row_end = T;
+    a.keys = pos0 + T;
+    a.pos0 = pos0;
+    a.window = window;
+    a.out = attn;
+    a.out_f32 = true;
+    a.scale = 1.0f / std::sqrt((float) s.head_dim);
+    a.fma = true;
+    if (!flash_attn(a, &queue)) return false;
     if (stream == nullptr) queue.wait_and_throw();
     return true;
 }
@@ -104,7 +88,7 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
 namespace {
 
 // The kernel a prompt's attention takes, for a GPU, a shape and a pool format (prompt_attn_tune): the matrix
-// engines' (JmKernel, or WmmaKernel's INT8 form on RDNA3 and RDNA4), the FP16 pools' FMA or WMMA kernel, or none: the
+// engines' (JmKernel, or WmmaKernel's INT8 form on RDNA3 and RDNA4), the FP16 pools' FMA kernel, or none: the
 // caller's decode kernel (qsa_dense_attn_batch).  Their order changes with the GPU, the pools and the context: over a
 // 2,048-query chunk after 28K cells of Qwen3.6-35B-A3B's 16/2 heads of 256 they ran 222, 256 and 216 ms on a B70 with
 // FP16 pools (237, -, 272 with INT8 ones), 217, 166 and 397 ms on an RTX 4070 (222, -, 391); llm-jp-4.1's 40/4 heads
@@ -601,6 +585,80 @@ bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_
     }
     if (fmt != kFmtF16) return false;   // the FP32 and WMMA kernels read FP16 pools: the caller keeps the decode kernel
     return prompt_attn(q, pools.k_pool, pools.v_pool, pools.page_table, pos0, T, s, attn, stream, window);
+}
+
+void relative_prompt_attn(const float* q, const float* k, const float* v, const float* rel,
+                          const float* table, const float* sink, const int32_t* positions,
+                          int64_t pos, int64_t cells, int64_t heads, int64_t kv_heads, int64_t dim,
+                          int64_t relative_dim, int64_t extent, int64_t window, float* scores, float* out, void* stream) {
+    auto& queue = core::Runtime::get().stream(stream);
+    const float scale = 1.0f / std::sqrt((float) dim);
+    if (cells > 0) queue.parallel_for(sycl::range<2>((size_t) heads, (size_t) cells), [=](sycl::id<2> id) {
+        const int64_t h = (int64_t) id[0], c = (int64_t) id[1];
+        const int64_t d = pos - positions[c], kv = h / (heads / kv_heads);
+        float score = -1e30f;
+        if (d >= 0 && d < extent && (window == 0 || d < window)) {
+            float dot = 0, bias = -sink[h];
+            for (int64_t i = 0; i < dim; ++i) dot += q[h * dim + i] * k[(c * kv_heads + kv) * dim + i];
+            for (int64_t i = 0; i < relative_dim; ++i) bias += rel[h * relative_dim + i] * table[d * relative_dim + i];
+            score = dot * scale + bias;
+        }
+        scores[h * cells + c] = score;
+    });
+    queue.parallel_for(sycl::range<1>((size_t) heads), [=](sycl::id<1> id) {
+        const auto h = (int64_t) id[0];
+        float peak = 0;
+        for (int64_t c = 0; c < cells; ++c) peak = sycl::fmax(peak, scores[h * cells + c]);
+        float sum = sycl::exp(-peak);
+        for (int64_t c = 0; c < cells; ++c) {
+            float& x = scores[h * cells + c];
+            x = sycl::exp(x - peak);
+            sum += x;
+        }
+        for (int64_t c = 0; c < cells; ++c) scores[h * cells + c] /= sum;
+    });
+    queue.parallel_for(sycl::range<2>((size_t) heads, (size_t) dim), [=](sycl::id<2> id) {
+        const int64_t h = (int64_t) id[0], d = (int64_t) id[1], kv = h / (heads / kv_heads);
+        float y = 0;
+        for (int64_t c = 0; c < cells; ++c) y += scores[h * cells + c] * v[(c * kv_heads + kv) * dim + d];
+        out[h * dim + d] = y;
+    });
+}
+
+bool ordered_block_attn(const float* q, const float* k, const float* v, const float* noise_k, const float* noise_v,
+                        int64_t first, int64_t past, int64_t capacity, int rows, int heads, int kv_heads, int dim,
+                        float* scores, float* out, void* stream) {
+    auto& queue = core::Runtime::get().stream(stream);
+    if (!queue.get_device().has(sycl::aspect::fp64)) return false;
+    const int64_t cells = past + rows;
+    const float scale = 1.0f / std::sqrt((float) dim);
+    queue.parallel_for(sycl::range<2>((size_t) rows * heads, (size_t) cells), [=](sycl::id<2> id) {
+        const int64_t h = (int64_t) id[0], c = (int64_t) id[1], g = (h % heads) / (heads / kv_heads);
+        const float* cell = c < past ? k + ((first + c) % capacity) * kv_heads * dim
+                                      : noise_k + (c - past) * kv_heads * dim;
+        double sum = 0;
+        for (int d = 0; d < dim; ++d) sum += (double) q[h * dim + d] * cell[g * dim + d];
+        scores[h * cells + c] = scale * (float) sum;
+    });
+    queue.parallel_for(sycl::range<1>((size_t) rows * heads), [=](sycl::id<1> id) {
+        auto* row = scores + (int64_t) id[0] * cells;
+        float peak = row[0];
+        for (int64_t c = 1; c < cells; ++c) peak = sycl::fmax(peak, row[c]);
+        double sum = 0;
+        for (int64_t c = 0; c < cells; ++c) { row[c] = sycl::exp(row[c] - peak); sum += row[c]; }
+        for (int64_t c = 0; c < cells; ++c) row[c] /= (float) sum;
+    });
+    queue.parallel_for(sycl::range<2>((size_t) rows * heads, (size_t) dim), [=](sycl::id<2> id) {
+        const int64_t h = (int64_t) id[0], d = (int64_t) id[1], g = (h % heads) / (heads / kv_heads);
+        float sum = 0;
+        for (int64_t c = 0; c < cells; ++c) {
+            const float* cell = c < past ? v + ((first + c) % capacity) * kv_heads * dim
+                                          : noise_v + (c - past) * kv_heads * dim;
+            sum += scores[h * cells + c] * cell[g * dim + d];
+        }
+        out[h * dim + d] = sum;
+    });
+    return true;
 }
 
 }  // namespace strata::kernels

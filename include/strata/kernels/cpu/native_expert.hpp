@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/cpu/native_expert.hpp - plan v0.3 P6: one routed expert in its GGUF form on the CPU.
 //
@@ -57,6 +58,10 @@ struct NativeFmt {
     /// A*diag(s), so the D stage's rows take 1/s before any consumer reads them (the vector is the reciprocals,
     /// n_embd floats, layer-major in the layout's storage).  nullptr: the pack has no column scales.
     const float* gu_colscale = nullptr;
+    /// R1Q2 stores codes first, then per-matrix row bases, column scales and packed two-bit indices.
+    bool r1q2 = false;
+    size_t sc_off = 0;
+    float p2[3][4] = {};
 };
 
 /// Whether the layer's gate and up rows are of different types (a NativeFmt filled by native_fmt; one built another
@@ -69,6 +74,12 @@ bool native_experts_available() noexcept;
 /// is the up rows' when they differ, which must quantize the activation the same way.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
                 int up_type = -1);
+
+/// Build a bih3 R1Q2 format from types 182..194 and the gate, up and down scale tables.
+bool native_r1q2_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const float (&p2)[3][4],
+                      NativeFmt& f, std::string& err);
+/// Offset of a projection's scales from sc_off, m = 0 (gate), 1 (up), 2 (down).
+size_t native_r1q2_scale_offset(const NativeFmt& f, int m);
 
 /// One row of `n` values of a GGUF tensor of ggml type `type` to floats, by ggml's own dequantizer (F32 copied): the
 /// one host lookup of an embedding row, for every table that stays in host memory (the plain models' and the image

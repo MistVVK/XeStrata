@@ -407,6 +407,19 @@ The RAM is handled as for UD-Q4_K_XL: with less RAM than below, a RAM budget of 
 ./setup.sh --setup --family unsloth --model UD-Q5_K_XL
 ```
 
+### Or: Sync-XS, Sync-S and Sync-M
+
+[Sync-XS](https://huggingface.co/hiru2005/Sync-XS), [Sync-S](https://huggingface.co/hiru2005/Sync-S) and [Sync-M](https://huggingface.co/sync-strata/Sync-M) by hiruhiru2005 are mixed-bit bih3 and R1Q2 packs.
+The three share a [GGUF, MTP and tokenizer](https://huggingface.co/hiru2005/Sync-shared), downloaded once. The picture reader is the original model's.
+Setup recommends XS from 24 GiB RAM, S from 32 GiB RAM with 12 GiB VRAM, and M from 48 GiB RAM. With at least 48 GiB RAM, S has no VRAM condition.
+This does not change the order of the first model setup recommends.
+
+Tail skip is off by default for Sync. On the B70 limited to 12 GiB of VRAM, the mean teacher-forced KL against the unskipped path over 21 prompts of 220 tokens was 0.008904 for XS, 0.010352 for S and 0.011171 for M at rank 7. These are not as small as the earlier 0.0058 reference. At rank 4 they were 0.050165, 0.056059 and 0.060073. The caches held 4739, 3945 and 2768 experts respectively, so the numbers are not a direct comparison between packs. Set `XESTRATA_ROUTE_TAIL_SKIP=7` to try rank 7.
+
+```bash
+./setup.sh --setup --family sync --model Sync-XS
+```
+
 ### Or: Gyro-S, Gyro-M and Gyro-L
 
 **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** is agentionai's quantization of the original model (upstream ba64156fd).

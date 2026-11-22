@@ -182,14 +182,11 @@ int kind_of(sycl::queue& q) {
     static core::PerDevice<int> of;
     return of.get(q.get_device(), [&q] {
         const sycl::device d = q.get_device();
-        if (strata::kernels::xe::amd_wmma(d)) return 1;
-        if (d.get_backend() != sycl::backend::ext_oneapi_cuda) {
+        if (has_form(d, MatrixForm::wmma)) return 1;
+        if (!has_form(d, MatrixForm::mma_s8)) {
             const int jm = jm_kind(d);
             return jm != 0 ? jm : kDotKind;
         }
-        const auto a = static_cast<uint64_t>(d.get_info<syclex::info::device::architecture>());
-        if (a < static_cast<uint64_t>(syclex::architecture::nvidia_gpu_sm_80) || a >= 0x0200000000000000ull)
-            return kDotKind;
         int* f = sycl::malloc_device<int>(1, q);
         if (f == nullptr) return 0;
         int v = 0;

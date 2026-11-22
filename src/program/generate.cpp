@@ -1957,7 +1957,8 @@ void setup_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, const O
 bool pcie_move_if_pays(strata::core::ExpertDispatch& d, bool overlap, const strata::prefill::PrefillStats& ps,
                        const std::vector<int32_t>& host_res, int spec) {
     const strata::core::PcieSplitTimes* t = d.pcie_split;
-    if (t == nullptr || ps.routed.empty() || ps.routed_k <= 0 || d.src->device_alias(t->layer, 0) != nullptr) return false;
+    if ((t == nullptr && d.pcie_num <= 0) || ps.routed.empty() || ps.routed_k <= 0 ||
+        d.src->device_alias(t != nullptr ? t->layer : 0, 0) != nullptr) return false;
     int64_t total = 0, missed = 0;
     for (size_t i = 0; i < ps.routed.size() && i < host_res.size(); ++i) {
         total += ps.routed[i];
@@ -1967,7 +1968,9 @@ bool pcie_move_if_pays(strata::core::ExpertDispatch& d, bool overlap, const stra
     const double rows = strata::spec::DraftPolicy::prior_tokens(spec) * (double) ps.routed_k;   // a layer's routings a window
     const double f = rows * (double) missed / (double) total;
     const int fi = (int) std::lround(f), hi = (int) std::lround(rows - f);
-    const int m = fi > 0 ? strata::core::pcie_split_m(*t, overlap, fi, hi) : 0;
+    int m = fi <= 0 ? 0 : t != nullptr ? strata::core::pcie_split_m(*t, overlap, fi, hi)
+                                     : (fi * d.pcie_num) >> 8;
+    if (t == nullptr && m == 0 && fi >= 2 && strata::core::pcie_min1_on()) m = 1;
     if (m <= 0) {
         std::fprintf(stderr, "xestrata generate: PCIe split: the prompt routes %.2f missed experts a layer a window, which "
                              "the CPU takes: the expert arena stays registered for copies\n", f);
@@ -3121,6 +3124,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--native-head-gguf requires --stream-token\n");
         return 2;
     }
+    if (!strata::core::dense_nq_init(o.pack, err)) {
+        std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
+        return 1;
+    }
+    if (strata::core::dense_nq_active() && (o.native_head_gguf.empty() || o.native_dense_gguf.empty())) {
+        std::fprintf(stderr, "xestrata generate: dense_nq requires native head and dense projections (--native)\n");
+        return 2;
+    }
     // Plan v0.3 P6: where the experts live.  A native pack (tools/iq_pack.py: the IQ2_XS / IQ3_XXS files) keeps
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
@@ -3442,7 +3453,10 @@ int main(int argc, char** argv) {
             try {
                 const strata::GgufModel hm = strata::GgufModel::open(o.native_head_gguf);
                 size_t at = 0;
-                if (const strata::TensorInfo* t = hm.find("output.weight", &at)) head_bytes = strata::tensor_payload_bytes(*t);
+                if (const strata::TensorInfo* t = hm.find("output.weight", &at)) {
+                    const auto* nq = strata::core::dense_nq_find("output.weight");
+                    head_bytes = nq ? nq->bytes : strata::tensor_payload_bytes(*t);
+                }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "xestrata generate: layer split auto: %s (the head left out of the sizes)\n", e.what());
             }
@@ -4298,7 +4312,10 @@ int main(int argc, char** argv) {
                 try {
                     const auto hm = strata::GgufModel::open(o.native_head_gguf);
                     size_t at = 0;
-                    if (const auto* t = hm.find("output.weight", &at)) later += strata::tensor_payload_bytes(*t);
+                    if (const auto* t = hm.find("output.weight", &at)) {
+                        const auto* nq = strata::core::dense_nq_find("output.weight");
+                        later += nq ? nq->bytes : strata::tensor_payload_bytes(*t);
+                    }
                 } catch (const std::exception&) {
                     std::fprintf(stderr, "xestrata generate: cannot estimate the later head allocation\n");
                     std::fprintf(stderr, "xestrata generate: session state allocation failed\n");
@@ -5095,14 +5112,18 @@ int main(int argc, char** argv) {
             bin.mtp_serial = batch_mtp_serial();
             bin.mtp_piped = piped_mtp_asked;
             bin.adapt_async = o.adapt_async == 1;
-            {   // two NVIDIA cards: one serial group only with STRATA_BATCH_GROUPS_NV_SERIAL=1 (upstream f680a80d8 made it
-                // the default; upstream ec8e40590 went back to the pipeline, measured faster with 0.2.7's code on 2x RTX A6000
-                // and 2x RTX A4000 at 2 and 4 streams).  Every GPU of the split on CUDA, as upstream's NVIDIA build.
-                // Unmeasured here (no machine with two NVIDIA cards)
-                const char* nv = strata::env_get("BATCH_GROUPS_NV_SERIAL");
-                bool all_cuda = strata::core::device_info(strata::core::current_device()).backend == "CUDA";
-                for (const auto& st : stages) all_cuda = all_cuda && strata::core::device_info(st->dev).backend == "CUDA";
-                bin.nv_serial_faster = all_cuda && nv != nullptr && nv[0] != '\0' && nv[0] != '0';
+            {   // one serial group only with STRATA_BATCH_GROUPS_NV_SERIAL=1 (upstream f680a80d8 made it two NVIDIA cards'
+                // default; upstream ec8e40590 went back to the pipeline, measured faster with 0.2.7's code on 2x RTX A6000
+                // and 2x RTX A4000 at 2 and 4 streams), on cards that reach each other's memory both ways as those do
+                // (peer access), whatever their maker.  Unmeasured here (no machine with two such cards)
+                const char* v = strata::env_get("BATCH_GROUPS_NV_SERIAL");
+                bool peers = !stages.empty();
+                int prev = strata::core::current_device();
+                for (const auto& st : stages) {
+                    peers = peers && strata::gpu::peer_access(prev, st->dev) && strata::gpu::peer_access(st->dev, prev);
+                    prev = st->dev;
+                }
+                bin.serial_faster = peers && v != nullptr && v[0] != '\0' && v[0] != '0';
             }
             const auto r = strata::program::batch_groups::resolve(bin);
             if (r.from_auto) {
@@ -5248,7 +5269,7 @@ int main(int argc, char** argv) {
     const bool shared_empty = !o.shared_expert_arena.empty() &&
                               !strata::core::PinnedArena::shared_filled(o.shared_expert_arena);
     if (!o.mmap_experts && (o.shared_expert_arena.empty() || shared_empty) &&
-        !(native_pack && !std::ifstream(o.pack + "/experts.bin", std::ios::binary) && o.native_preset.empty())) {
+        !(native_pack && !std::ifstream(o.pack + (strata::kernels::cpu::expert_layout().mixed() ? "/experts.v2.bin" : "/experts.bin"), std::ios::binary) && o.native_preset.empty())) {
         const char* keep = strata::env_get("ARENA_LOW_RAM");
         strata::core::detail::HostMemory hm;
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -5304,7 +5325,7 @@ int main(int argc, char** argv) {
         // most of them but whose RAM cannot hold them all.
         // Without experts.bin a native pack's experts are read from the model's GGUF files in place (--native;
         // upstream 3889344): each blob assembled from its gate, up and down slices when it is needed.
-        if (native_pack && !std::ifstream(o.pack + "/experts.bin", std::ios::binary)) {
+        if (native_pack && !std::ifstream(o.pack + (strata::kernels::cpu::expert_layout().mixed() ? "/experts.v2.bin" : "/experts.bin"), std::ios::binary)) {
             if (o.native_preset.empty()) {
                 std::fprintf(stderr, "xestrata generate: --mmap-experts on the native pack %s without experts.bin needs "
                                      "--native (the experts are read from the GGUF files)\n", o.pack.c_str());
@@ -5954,10 +5975,10 @@ int main(int argc, char** argv) {
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         for (const auto& pr : profile) {
-            const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
+            const uint64_t b = (lay.blob_bytes(pr.first, pr.second) + 255) / 256 * 256;
             if (used + b > cap) break;
             used += b;
-            sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
+            sized_slots.push_back((int64_t) lay.blob_bytes(pr.first, pr.second));
         }
         // upstream #831: the sized-slots loop walks the profile's pairs, so the profile's length is the ceiling; an
         // explicit --expert-cache above it used to be cut with no word.  A warning only (the allocation is the same).
@@ -6129,12 +6150,12 @@ int main(int argc, char** argv) {
             if (slot == strata::core::kNotResident) break;
             const uint8_t* b = blob_to_copy(srcp, profile_order[(size_t) i].first, profile_order[(size_t) i].second, fill_tmp);
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile_order[(size_t) i].first))) {
+                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile_order[(size_t) i].first, profile_order[(size_t) i].second))) {
                 std::fprintf(stderr, "xestrata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
             }
-            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile_order[(size_t) i].first);
+            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile_order[(size_t) i].first, profile_order[(size_t) i].second);
             ++prefilled;
         }
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
@@ -6143,7 +6164,7 @@ int main(int argc, char** argv) {
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
         if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile_order[0].first, profile_order[0].second),
                                 blob_to_copy(srcp, profile_order[0].first, profile_order[0].second, fill_tmp), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile_order[0].first))) {
+                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile_order[0].first, profile_order[0].second))) {
             std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
             return 1;
         }
@@ -6185,10 +6206,10 @@ int main(int argc, char** argv) {
         std::vector<int64_t> sized;
         int64_t used = 0;
         for (const auto& pr : st.profile) {
-            const int64_t b = native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+            const int64_t b = native_pack ? ((int64_t) lay.blob_bytes(pr.first, pr.second) + 255) / 256 * 256 : (int64_t) lay.max_blob;
             if (used + b > room) break;
             used += b;
-            sized.push_back((int64_t) lay.blob_bytes(pr.first));
+            sized.push_back((int64_t) lay.blob_bytes(pr.first, pr.second));
         }
         // its prompt path borrows from this cache, and every stage reads prompts in one chunk size: a cache that holds
         // all its layers' experts in less than the room gets empty slots too, up to what the largest chunk borrows
@@ -6232,7 +6253,7 @@ int main(int argc, char** argv) {
             const int32_t slot = st.cache.admit(pr.first, pr.second);
             if (slot == strata::core::kNotResident) break;
             const uint8_t* b = blob_to_copy(srcp, pr.first, pr.second, fill_tmp);
-            if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first))) {
+            if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first, pr.second))) {
                 std::fprintf(stderr, "xestrata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
                              st.dev, (long long) filled, err.c_str());
                 return 1;
@@ -6242,7 +6263,7 @@ int main(int argc, char** argv) {
         st.held = filled;
         if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
                                                  blob_to_copy(srcp, st.profile[0].first, st.profile[0].second, fill_tmp), err,
-                                                 (int64_t) lay.blob_bytes(st.profile[0].first))) {
+                                                 (int64_t) lay.blob_bytes(st.profile[0].first, st.profile[0].second))) {
             std::fprintf(stderr, "xestrata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
                          filled == 0 ? "nothing filled" : err.c_str());
             return 1;
@@ -7083,9 +7104,9 @@ int main(int argc, char** argv) {
                 if (!cold.empty() && cold.back().first < heat(oi)) {
                     vi = cold.back().second;
                     const int32_t vs = host_res[(size_t) vi];
-                    if (xcache.slot_offset(vs + 1) - xcache.slot_offset(vs) < lay.blob_bytes(layer) ||
+                    if (xcache.slot_capacity(vs) < lay.blob_bytes(layer, oi % g.n_expert) ||
                         !strata::gpu::copy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo),
-                                           (size_t) lay.blob_bytes(layer)))
+                                           (size_t) lay.blob_bytes(layer, oi % g.n_expert)))
                         vi = -1;
                     else {
                         cold.pop_back();
@@ -7184,10 +7205,10 @@ int main(int argc, char** argv) {
             for (; pi < profile.size(); ++pi) {
                 const int32_t l = profile[pi].first, e = profile[pi].second;
                 const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
-                if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
+                if (host_res[i] >= 0 || lay.blob_bytes(l, e) > room) continue;
                 const uint8_t* b = srcp->blob(l, e);
                 if (b == nullptr) continue;
-                strata::gpu::copy_async(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l), nullptr);
+                strata::gpu::copy_async(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l, e), nullptr);
                 filled.emplace_back(i, (int32_t) s);
                 ++pi;
                 break;
@@ -8410,9 +8431,11 @@ int main(int argc, char** argv) {
                 // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
                 if (!o.pack.empty()) {
                     for (const char* n : {"index.txt", "dense.bin"}) files.push_back({std::string("pack ") + n, o.pack + "/" + n});
-                    for (const char* n : {"embd.bin", "extra.bin", "manifest.json"})
+                    for (const char* n : {"embd.bin", "extra.bin", "manifest.json", "native_experts.txt", "experts_k.txt",
+                                          "r1q2.txt", "hadamard.txt", "dense_nq.txt", "dense_nq.bin"})
                         files.push_back({std::string("pack ") + n, o.pack + "/" + n, true});
-                    if (srcp == nullptr) files.push_back({"pack experts.bin", o.pack + "/experts.bin", true});
+                    if (srcp == nullptr) files.push_back({"pack experts", o.pack + (strata::kernels::cpu::expert_layout().mixed() ?
+                                                                            "/experts.v2.bin" : "/experts.bin"), true});
                 }
                 if (!o.mtp.empty()) {
                     for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
@@ -9010,7 +9033,7 @@ int main(int argc, char** argv) {
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
                 const strata::core::OnDevice on(gs ? gs->dev : -1);
                 uint8_t* sdst = gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot);
-                const size_t sn = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                const size_t sn = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer, s.in);
                 ++adapt_swaps_n;
                 if (tb) ++adapt_sync_n;
                 if (slot < 0 || b == nullptr ||
@@ -9164,6 +9187,10 @@ int main(int argc, char** argv) {
                 if ((int64_t) aswaps.size() >= a_cap) break;
                 const int32_t slot = a_res[(size_t) c.layer * g.n_expert + c.out];
                 if (slot < 0) continue;
+                const auto& layout = strata::kernels::cpu::expert_layout();
+                const int home = multi_gpu ? stage_of(c.layer) : 0;
+                const auto* cache = ahomes[(size_t) home].cache;
+                if (layout.blob_bytes(c.layer, c.in) > cache->slot_capacity(slot)) continue;
                 // an exchange (as resident_stage_swaps): `in` from the RAM copy, `out` held by its slot alone takes its
                 // place there; otherwise `out` is in the copy already (the lend region) or `in` is not (a RAM budget)
                 const bool x = !a_arena && src.has_resident(c.layer, c.in) && !src.has_resident(c.layer, c.out);
@@ -9179,7 +9206,7 @@ int main(int argc, char** argv) {
                 for (const ASwap& w : aswaps) {
                     if (w.home != hi || !w.exchange) continue;
                     if (!strata::gpu::copy_async(src.exchange_buffer(w.j, w.layer), h.cache->device_slot(w.slot),
-                                                 (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer), h.stream)) {
+                                                 (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer, w.out), h.stream)) {
                         std::fprintf(stderr, "xestrata serve: adaptive tier: copy back of layer %d slot %d (GPU %d) failed: %s\n",
                                      (int) w.layer, (int) w.slot, h.dev, strata::gpu::last_error());
                         a_err = true;
@@ -9215,7 +9242,7 @@ int main(int argc, char** argv) {
             AHome& h = ahomes[(size_t) w.home];
             const strata::core::OnDevice on(h.dev);
             if (!strata::gpu::copy_async(h.cache->device_slot(w.slot), b,
-                                         (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer), h.stream)) {
+                                         (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer, w.in), h.stream)) {
                 std::fprintf(stderr, "xestrata serve: adaptive tier: copy of layer %d into slot %d (GPU %d) failed: %s\n",
                              (int) w.layer, (int) w.slot, h.dev, strata::gpu::last_error());
                 a_err = true;
@@ -9347,6 +9374,7 @@ int main(int argc, char** argv) {
                         const size_t out = (size_t) w.layer * g.n_expert + w.out;
                         if (host_res[out] != w.slot) continue;   // the table moved since the snapshot: not this one
                         if (w.exchange && !src.stage_exchange(w.layer, w.in, w.out, w.j)) {
+                            if (strata::kernels::cpu::expert_layout().mixed()) continue;   // no fitting RAM span
                             std::fprintf(stderr, "xestrata serve: adaptive tier: stage_exchange refused layer %d in %d out %d\n",
                                          (int) w.layer, (int) w.in, (int) w.out);
                             return false;
@@ -9968,7 +9996,7 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                     const uint8_t* b = blob_to_copy(srcp, layer, pick % g.n_expert, fill_tmp);
                     if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
-                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer, pick % g.n_expert))) {
                         e = "VRAM: refilling the cache failed: " + ferr;
                         return false;
                     }
@@ -12318,7 +12346,7 @@ int main(int argc, char** argv) {
                         // a transient source's blob is copied into fill_tmp, so each fill must be over before the next
                         const bool tb = srcp->transient(i / g.n_expert, i % g.n_expert);
                         const uint8_t* b = blob_to_copy(srcp, i / g.n_expert, i % g.n_expert, fill_tmp);
-                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert, i % g.n_expert);
                         if (b == nullptr || !(tb ? c.fill_slot_blocking(slot, b, e, nb)
                                                  : c.fill_slot_queued(slot, b, e, nb)))
                             return false;
@@ -14464,7 +14492,7 @@ int main(int argc, char** argv) {
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait
                 const bool tb = srcp->transient(i / g.n_expert, i % g.n_expert);   // see the serve loop's refill
                 const uint8_t* b = blob_to_copy(srcp, i / g.n_expert, i % g.n_expert, fill_tmp);
-                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert, i % g.n_expert);
                 if (b == nullptr || !(tb ? xcache.fill_slot_blocking(slot, b, err, nb)
                                          : xcache.fill_slot_queued(slot, b, err, nb))) {
                     std::fprintf(stderr, "xestrata generate: refilling a lent slot failed: %s\n", err.c_str());
@@ -14896,7 +14924,7 @@ int main(int argc, char** argv) {
                 // source's blob - the GGUF read in place - is copied into fill_tmp, so that swap is synchronous)
                 const bool tb = srcp->transient(s.layer, s.in);
                 const uint8_t* b = blob_to_copy(srcp, s.layer, s.in, fill_tmp);
-                const size_t sn = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                const size_t sn = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer, s.in);
                 if (slot < 0 || b == nullptr ||
                     !(tb ? strata::gpu::copy(xcache.device_slot(slot), b, sn)
                          : strata::gpu::copy_async(xcache.device_slot(slot), b, sn, adapt_stream))) {

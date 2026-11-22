@@ -26,6 +26,7 @@
 #include "strata/core/constraint_upload.hpp"
 
 #include "strata/core/plain_cpu.hpp"
+#include "strata/core/plain_inkling.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/device.hpp"
@@ -133,7 +134,7 @@ PlainModel::PlainModel() = default;
 
 PlainModel::~PlainModel() {
     if (hash_file_ != nullptr) std::fclose(hash_file_);
-    if (cpu_ != nullptr) {   // --device cpu: no GPU was opened, nothing of its to give back
+    if (opt_.cpu && (cpu_ != nullptr || inkling_ != nullptr)) {   // --device cpu: no GPU was opened, nothing of its to give back
         if (route_dump_ != nullptr) std::fclose(route_dump_);
         return;
     }
@@ -483,6 +484,19 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         return false;
     }
     if (!read_model_spec(model_->meta(), spec_, err)) return false;
+    if (spec_.arch == ModelArch::Inkling2Loop) {
+        if (serve_ || opt_.vision || opt_.encoder || opt_.batch_slots > 0 || opt_.split_auto || !opt_.split_at.empty()) {
+            err = "inkling2: GPU reference supports single-device text CLI only";
+            return false;
+        }
+        opt_.prompt_chunk = 0;
+        opt_.spec = 0;
+        inkling_ = std::make_unique<PlainInkling>();
+        if (!inkling_->load(*model_, spec_, err) || !inkling_->enable_gpu(err) ||
+            (opt_.draft == "dspark" && !inkling_->load_dspark(opt_.draft_model, err)) || !inkling_->configure_experts(opt_.profile, opt_.max_cells, err)) return false;
+        n_vocab_ = inkling_->vocab();
+        return true;
+    }
     // the layer split: its points (given, or from the GPUs' memory), each rising inside the trunk, a GPU each
     const int64_t nl = spec_.n_layer;
     // the GPUs a split takes, as generate.cpp's: the runtime's first, then the ones --split-device names, else the
@@ -615,6 +629,11 @@ bool PlainModel::load_stage(const PlainOptions& opt, PlainModel* root, int64_t l
 }
 
 bool PlainModel::load_arch(std::string& err) {
+    if (spec_.arch == ModelArch::Inkling2Loop) {
+        err = "plain model: inkling2_loop runs on the CPU reference in this stage (--device cpu); the GPU graph is "
+              "not implemented yet";
+        return false;
+    }
     return spec_.arch == ModelArch::Glm5Next ? load_glm5(err) : load_qwen(err);
 }
 
@@ -3229,6 +3248,17 @@ bool PlainModel::cpu_load(std::string& err) {
         return false;
     }
     opt_.spec = 0;   // no MTP layer read: no drafts
+    if (spec_.arch == ModelArch::Inkling2Loop) {
+        inkling_ = std::make_unique<PlainInkling>();
+        if (!inkling_->load(*model_, spec_, err) ||
+            (opt_.draft == "dspark" && !inkling_->load_dspark(opt_.draft_model, err))) {
+            inkling_.reset();
+            return false;
+        }
+        n_vocab_ = inkling_->vocab();
+        std::fprintf(stderr, "xestrata plain: %s\n", inkling_->describe().c_str());
+        return true;
+    }
     cpu_ = std::make_unique<PlainCpu>();
     if (!cpu_->load(*model_, spec_, opt_, err)) {
         cpu_.reset();
@@ -3239,11 +3269,70 @@ bool PlainModel::cpu_load(std::string& err) {
     return true;
 }
 
+const float* PlainModel::inkling_tap_dev() const {
+    return inkling_ ? inkling_->gpu_taps() : nullptr;
+}
+
+bool PlainModel::dspark_step(int32_t anchor, int64_t pos, int count, const std::vector<int32_t>& eos,
+                             int32_t* out, float* logits, int& emitted, int& accepted, std::string& err) {
+    emitted = accepted = 0;
+    if (!inkling_ || count < 1 || count >= opt_.max_t || count > 7) {
+        err = "DSpark: invalid verifier window";
+        return false;
+    }
+    std::vector<int32_t> proposals;
+    if (!inkling_->propose_dspark(anchor, pos, count, proposals, err)) return false;
+    if (!opt_.cpu) {
+        std::vector<int32_t> candidates{anchor};
+        candidates.insert(candidates.end(), proposals.begin(), proposals.end());
+        const int rows = (int) candidates.size();
+        cpu_logits_.resize((size_t) rows * (size_t) n_vocab_);
+        const auto keep = [&]() {
+            k::SamplerParams sp = sampler_;
+            sp.counter = (uint64_t) pos;
+            sp.logit_bias = cpu_bias_.empty() ? nullptr : cpu_bias_.data();
+            sp.allowed = cpu_allowed_.empty() ? nullptr : cpu_allowed_.data();
+            const bool hist = cpu_hist_len_ > 0 && sp.penalty_last_n > 0;
+            std::vector<int> picks((size_t) rows);
+            k::sample_tokens_host(cpu_logits_.data(), rows, (int) n_vocab_, hist ? cpu_hist_.data() : nullptr,
+                                  hist ? cpu_hist_len_ : 0, sp, picks.data());
+            for (int i = 0; i < rows; ++i) {
+                const int32_t next = picks[(size_t) i];
+                out[emitted++] = next;
+                const bool match = i < count && next == proposals[(size_t) i];
+                if (match) ++accepted;
+                if (!match || std::find(eos.begin(), eos.end(), next) != eos.end()) break;
+            }
+            return emitted;
+        };
+        if (!inkling_->verify(candidates.data(), rows, pos, cpu_logits_.data(), keep, err)) return false;
+        if (logits) std::copy_n(cpu_logits_.data(), (size_t) emitted * (size_t) n_vocab_, logits);
+        progress_beat();
+        progress_tick();
+        return true;
+    }
+    // Inkling shares stateful convolutions and KV with the correctness reference. Verify in order and
+    // stop on mismatch instead of mutating the target with rows whose state would need rolling back.
+    int32_t pending = anchor;
+    for (int i = 0; i <= count; ++i) {
+        float* row = logits ? logits + (size_t) i * n_vocab_ : nullptr;
+        if (!forward(&pending, 1, pos + i, out + i, row, err)) return false;
+        ++emitted;
+        pending = out[i];
+        const bool match = i < count && pending == proposals[(size_t) i];
+        if (match) ++accepted;
+        if (!match || std::find(eos.begin(), eos.end(), pending) != eos.end()) break;
+    }
+    return true;
+}
+
 // The CPU's run and its picks: the last `rows` tokens' logits, each row's draw from its position as pick() takes it
 bool PlainModel::cpu_run(const int32_t* tokens, int64_t n, int64_t pos, int rows, int32_t* out, float* logits,
                          std::string& err) {
     cpu_logits_.resize((size_t) rows * (size_t) n_vocab_);
-    if (!cpu_->run(tokens, n, pos, rows, cpu_logits_.data(), err)) return false;
+    if (inkling_ != nullptr) {
+        if (!inkling_->run(tokens, n, pos, rows, cpu_logits_.data(), err)) return false;
+    } else if (!cpu_->run(tokens, n, pos, rows, cpu_logits_.data(), err)) return false;
     k::SamplerParams sp = sampler_;
     sp.counter = (uint64_t) (pos + n - rows);
     sp.logit_bias = cpu_bias_.empty() ? nullptr : cpu_bias_.data();
@@ -3260,7 +3349,7 @@ bool PlainModel::cpu_run(const int32_t* tokens, int64_t n, int64_t pos, int rows
 }
 
 bool PlainModel::set_logit_bias(const std::vector<float>& bias, std::string& err) {
-    if (cpu_ != nullptr) {
+    if (cpu_ != nullptr || inkling_ != nullptr) {
         if (!bias.empty() && bias.size() != (size_t) n_vocab_) {
             err = "plain model: a logit bias of another vocabulary";
             return false;
@@ -3284,7 +3373,7 @@ bool PlainModel::set_logit_bias(const std::vector<float>& bias, std::string& err
 }
 
 bool PlainModel::set_allowed(const uint32_t* row, std::string& err) {
-    if (cpu_ != nullptr) {   // the same row for each of a window's rows
+    if (cpu_ != nullptr || inkling_ != nullptr) {   // the same row for each of a window's rows
         const size_t words = (size_t) (n_vocab_ + 31) / 32;
         cpu_allowed_.clear();
         if (row != nullptr)
@@ -3311,7 +3400,7 @@ bool PlainModel::set_allowed(const uint32_t* row, std::string& err) {
 }
 
 bool PlainModel::set_allowed_rows(const uint32_t* rows, int T, std::string& err) {
-    if (cpu_ != nullptr) {
+    if (cpu_ != nullptr || inkling_ != nullptr) {
         if (rows != nullptr && (T < 1 || T > opt_.max_t)) { err = "plain model: mask rows out of range"; return false; }
         const size_t words = (size_t) (n_vocab_ + 31) / 32;
         cpu_allowed_.assign(rows, rows == nullptr ? rows : rows + words * (size_t) T);
@@ -3337,7 +3426,7 @@ bool PlainModel::set_allowed_rows(const uint32_t* rows, int T, std::string& err)
 }
 
 bool PlainModel::set_history(const int32_t* tokens, int n, std::string& err) {
-    if (cpu_ != nullptr) {   // the same history for each of a window's rows
+    if (cpu_ != nullptr || inkling_ != nullptr) {   // the same history for each of a window's rows
         cpu_hist_len_ = std::max(0, n);
         cpu_hist_.clear();
         for (int r = 0; r < opt_.max_t && cpu_hist_len_ > 0; ++r) cpu_hist_.insert(cpu_hist_.end(), tokens, tokens + n);
@@ -3492,6 +3581,7 @@ size_t PlainModel::Snapshot::bytes() const {
 
 size_t PlainModel::state_bytes(int64_t tokens) const {
     if (cpu_ != nullptr) return cpu_->state_bytes(tokens, true);
+    if (inkling_ != nullptr) return 0;
     size_t n = 0;
     for (const StatePart& p : state_parts(tokens)) n += p.bytes;
     for (const auto& st : next_) n += st->state_bytes(tokens);
@@ -3761,6 +3851,10 @@ bool PlainModel::restore_parts(const Snapshot& snap, bool recurrent_only, std::s
 }
 
 bool PlainModel::reset(std::string& err) {
+    if (inkling_ != nullptr) {
+        inkling_->reset();
+        return true;
+    }
     if (cpu_ != nullptr) {
         cpu_->reset();
         return true;
@@ -4613,7 +4707,7 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
         err = "plain model: the window is out of range";
         return false;
     }
-    if (cpu_ != nullptr) return cpu_run(tokens, T, pos, T, out, logits, err);
+    if (cpu_ != nullptr || inkling_ != nullptr) return cpu_run(tokens, T, pos, T, out, logits, err);
     const float* hand = nullptr;   // each stage's rows to the next
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
@@ -4634,7 +4728,7 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
 
 bool PlainModel::forward_run(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits,
                              std::string& err, const std::function<void(int64_t)>& progress) {
-    if (cpu_ != nullptr) {   // one run; out and logits the last window's rows, as the windows would leave them
+    if (cpu_ != nullptr || inkling_ != nullptr) {   // one run; out and logits the last window's rows
         if (n < 1) { err = "plain model: no tokens to run"; return false; }
         const int last = (int) ((n - 1) % opt_.max_t) + 1;
         if (!cpu_run(tokens, n, pos, last, out, logits, err)) return false;
@@ -5673,6 +5767,7 @@ bool PlainModel::fill_slot(int64_t layer, int32_t expert, std::string& err) {
 }
 
 bool PlainModel::save_profile(const std::string& path, std::string& err) const {
+    if (inkling_) return inkling_->save_profile(path, err);
     if (dense_) { err = "plain model: a dense model has no experts to profile"; return false; }
     const int64_t L = n_moe_, E = spec_.n_expert;
     std::vector<uint8_t> resident((size_t) (L * E), 0);

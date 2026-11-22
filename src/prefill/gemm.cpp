@@ -1021,7 +1021,7 @@ bool Gemm::f16_groups(const uint16_t* X, const uint16_t* W, int64_t w_stride, fl
     // and 55 TFLOP/s against oneMKL's 45 and 44).  Without them, a product an expert (dozens to hundreds of rows): a
     // 4K prompt's experts took 1.7 s through hipBLASLt on the RX 9060 XT, against 8.5 s in the grouped DP4a kernel.  A
     // failed product leaves the whole call to the grouped kernel, which writes every row again.
-    if (std::strcmp(strata::kernels::gemm_path(XmxType::f16), "DP4a") != 0) return false;
+    if (strata::kernels::has_form(strata::kernels::MatrixForm::f16_grouped)) return false;
     for (int e = 0; e < G; ++e) {
         const int64_t r0 = bounds[e], rows = (int64_t) bounds[e + 1] - r0;
         if (rows > 0 && !blas<sycl::half>(X + r0 * K, W + e * w_stride, Y + r0 * N, rows, N, K, N, false, stream))

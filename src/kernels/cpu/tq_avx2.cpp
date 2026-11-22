@@ -18,6 +18,12 @@
 #include "tq_states.hpp"
 
 #include <immintrin.h>
+#include <cstring>
+#include <cstdlib>
+
+#if !defined(STRATA_AVXVNNI)
+#define STRATA_AVXVNNI 0
+#endif
 
 namespace strata::kernels::cpu::tq_detail {
 namespace {
@@ -125,6 +131,53 @@ void tq_rows_avx2(int ty, const uint8_t* w, size_t row_bytes, int n, const TqAct
         case 148: rows_nt<148>(w, row_bytes, n, a, nt, out, r0, r1); break;
         case 149: rows_nt<149>(w, row_bytes, n, a, nt, out, r0, r1); break;
         default: break;
+    }
+}
+
+
+namespace {
+// `code` has its first two bytes appended, so a wrapped 15-bit window never reads past the block.
+inline uint32_t bih3_state_padded(const uint8_t* code, int k, int step) {
+    if (k == 8) return (((uint32_t) code[(step + 31) & 31] << 8) | code[step]) & 0x7fffu;
+    const int bit = (31 - step) * k, i = bit / 8;
+    const uint32_t window = (uint32_t) code[i] | ((uint32_t) code[i + 1] << 8) | ((uint32_t) code[i + 2] << 16);
+    return (window >> (bit % 8)) & 0x7fffu;
+}
+
+namespace bih3_avx2 {
+#define BIH3_MODE 0
+#define BIH3_FN
+#include "tq_bih3_rows.inl"
+#undef BIH3_FN
+#undef BIH3_MODE
+}
+#if STRATA_AVXVNNI
+namespace bih3_avxvnni {
+#define BIH3_MODE 1
+#define BIH3_FN __attribute__((target("avxvnni")))
+#include "tq_bih3_rows.inl"
+#undef BIH3_FN
+#undef BIH3_MODE
+}
+#endif
+namespace bih3_avx512vnni {
+#define BIH3_MODE 2
+#define BIH3_FN __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+#include "tq_bih3_rows.inl"
+#undef BIH3_FN
+#undef BIH3_MODE
+}
+}  // namespace
+
+void bih3_rows_x86(Bih3Isa isa, int type, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
+                    int nt, float* const* out, int r0, int r1, const TqR1q2Scales& scales) {
+    switch (isa) {
+        case Bih3Isa::avx512vnni: bih3_avx512vnni::rows(type, w, row_bytes, n, a, nt, out, r0, r1, scales); return;
+#if STRATA_AVXVNNI
+        case Bih3Isa::avxvnni: bih3_avxvnni::rows(type, w, row_bytes, n, a, nt, out, r0, r1, scales); return;
+#endif
+        case Bih3Isa::avx2: bih3_avx2::rows(type, w, row_bytes, n, a, nt, out, r0, r1, scales); return;
+        default: std::abort();
     }
 }
 

@@ -42,6 +42,7 @@
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/matrix_report.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -594,14 +595,14 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, bool large
     // from their GGUF blocks in the cache (dequantized in local memory to the same FP16 values: the same bits as
     // dequantizing and multiplying, without writing the dequantized weights), as Qwen3.8-Flash-Next's prompt does
     // (prefill.cpp); more rows than one work-group's would decode the weights again per group.  Gate and up of one type,
-    // the rows of up right after gate's; XMX (or tensor cores) for FP16.  STRATA_PREFILL_FUSED=0: every expert
+    // the rows of up right after gate's; the f16_from_blocks form.  STRATA_PREFILL_FUSED=0: every expert
     // dequantized.
     static const bool fused_on = [] {
         const char* v = strata::env_get("PREFILL_FUSED");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     const bool fuse_res = fused_on && !use_mmq && !k::cpu::native_mixed_gu(f) && f.up_off == (size_t) FF * f.gu_row &&
-                          k::xmx_available(k::XmxType::f16) && k::iq_gemm_grouped_ok(f.gu_type, 2 * FF, N) &&
+                          k::has_form(k::MatrixForm::f16_from_blocks) && k::iq_gemm_grouped_ok(f.gu_type, 2 * FF, N) &&
                           k::iq_gemm_grouped_ok(f.d_type, N, FF);
     auto fusable = [&](int64_t e) {
         return fuse_res && count[(size_t) e] <= k::kIqGemmTileRows && res_[(size_t) (ml * E + e)] >= 0;

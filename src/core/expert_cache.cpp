@@ -685,8 +685,23 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
+bool ExpertCache::slot_copy_size(int32_t slot, int64_t bytes, size_t& n, std::string& err) const {
+    if (slot < 0 || slot >= slots_) {
+        err = "ExpertCache: slot outside the arena";
+        return false;
+    }
+    const int64_t capacity = slot_end((int64_t) slot + 1) - slot_end(slot);
+    if (bytes < 0 || bytes > capacity) {
+        err = "ExpertCache: requested bytes exceed the selected slot";
+        return false;
+    }
+    n = (size_t) (bytes > 0 ? bytes : capacity);
+    return true;
+}
+
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    size_t n = 0;
+    if (!slot_copy_size(slot, bytes, n, err)) return false;
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
@@ -707,7 +722,8 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
 }
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    size_t n = 0;
+    if (!slot_copy_size(slot, bytes, n, err)) return false;
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
@@ -727,7 +743,8 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 }
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    size_t n = 0;
+    if (!slot_copy_size(slot, bytes, n, err)) return false;
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {
         err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
@@ -753,7 +770,11 @@ bool ExpertCache::sync_queued(std::string& err) {
 }
 
 bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
+    size_t nb = 0;
+    if (!slot_copy_size(slot, bytes, nb, err) || host_blob == nullptr) {
+        if (host_blob == nullptr) err = "ExpertCache::verify_slot: the host blob is null";
+        return false;
+    }
     const uint8_t* src = device_slot(slot);
     if (src == nullptr) {
         err = "ExpertCache::verify_slot: slot outside the arena";
@@ -774,7 +795,7 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
         char buf[256];
         std::snprintf(buf, sizeof buf,
                       "ExpertCache::verify_slot: slot %d differs from the arena at byte %llu (of %lld)",
-                      (int) slot, (unsigned long long) first, (long long) blob_);
+                      (int) slot, (unsigned long long) first, (long long) nb);
         err = buf;
         return false;
     }

@@ -2091,6 +2091,16 @@ class SharedPrefix(unittest.TestCase):
 class GpuChoice(unittest.TestCase):
     """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
+    def test_route_tail_default_respects_explicit_environment(self):
+        from serve.server import child_env
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(child_env({"route_tail_skip_default": 0})["XESTRATA_ROUTE_TAIL_SKIP"], "0")
+            self.assertNotIn("XESTRATA_ROUTE_TAIL_SKIP", child_env({}))
+            env = child_env({"route_tail_skip_default": 0, "env": {"XESTRATA_ROUTE_TAIL_SKIP": "7"}})
+            self.assertEqual(env["XESTRATA_ROUTE_TAIL_SKIP"], "7")
+        with mock.patch.dict(os.environ, {"XESTRATA_ROUTE_TAIL_SKIP": "7"}, clear=True):
+            self.assertEqual(child_env({"route_tail_skip_default": 0})["XESTRATA_ROUTE_TAIL_SKIP"], "7")
+
     def test_env(self):
         from serve.server import child_env
         env = child_env({"gpu": 1})

@@ -19,6 +19,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
@@ -26,6 +27,8 @@
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/nvfp4.hpp"
 #include "strata/platform/env.hpp"
 
@@ -586,8 +589,400 @@ static int check_synthetic(const std::string& arg, void* s, bool had = false) {
     return failures ? 1 : 0;
 }
 
+// R1Q2 has scales outside its code stream. Exercise every K and both short and long rows with identical Q8 values
+// and FP16 activation scales on CPU and GPU, including the wrap at the last trellis state.
+static int check_bih3_mmvq(void* stream, bool bench = false) {
+    constexpr int rows = 128, cols = 3;
+    auto& queue = strata::core::Runtime::get().compute();
+    const char* path = strata::kernels::iq_mmq_path(queue);
+    std::printf("bih3 R1Q2 matrix path: %s\n", path ? path : "scalar row fallback");
+    const float p2[4] = {0.25f, 0.5f, 1.f, 2.f};
+    std::mt19937 rng(931);  // NOLINT(cert-msc51-cpp,bugprone-random-generator-seed): reproducible parity input
+    std::uniform_real_distribution<float> dist(-1.f, 1.f);
+    double worst = 0, matrix_worst = 0;
+    int failures = 0;
+    for (int n : {128, 640, 2560}) for (int k = 2; k <= 14; ++k) {
+        const int blocks = n / 128, qb = (blocks + 3) / 4;
+        const size_t row_bytes = (size_t) blocks * 4 * (size_t) k;
+        std::vector<uint8_t> codes((size_t) rows * row_bytes), rowbase((size_t) rows * 2),
+                             colscale((size_t) blocks * 2), q((size_t) rows * qb);
+        for (auto& v : codes) v = (uint8_t) rng();
+        for (auto& v : q) v = (uint8_t) rng();
+        auto half = [](std::vector<uint8_t>& v, size_t i, float value) {
+            const uint16_t h = ggml_fp32_to_fp16(value);
+            v[2 * i] = (uint8_t) h; v[2 * i + 1] = (uint8_t) (h >> 8);
+        };
+        for (int r = 0; r < rows; ++r) half(rowbase, (size_t) r, 0.5f + 0.5f * (float) (r + 1) / rows);
+        for (int b = 0; b < blocks; ++b) half(colscale, (size_t) b, 0.5f + 0.5f * (float) (b + 1) / (float) blocks);
+        std::vector<std::vector<uint8_t>> act(cols, std::vector<uint8_t>((size_t) n / 32 * 34));
+        std::vector<uint8_t> q81((size_t) cols * n / 32 * 36);
+        std::vector<float> xs((size_t) n);
+        const void* ap[cols];
+        for (int t = 0; t < cols; ++t) {
+            for (float& x : xs) x = dist(rng);
+            ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float(xs.data(), act[t].data(), n);
+            ap[t] = act[t].data();
+            for (int b = 0; b < n / 32; ++b) {
+                const uint8_t* src = act[t].data() + (size_t) b * 34;
+                uint8_t* dst = q81.data() + ((size_t) t * (n / 32) + b) * 36;
+                std::memcpy(dst, src, 2); std::memcpy(dst + 4, src + 2, 32);
+            }
+        }
+        cpu::TqR1q2Scales sc{rowbase.data(), colscale.data(), q.data(), (size_t) qb, {p2[0], p2[1], p2[2], p2[3]}};
+        std::vector<float> want((size_t) cols * rows), got(want.size());
+        float* out[cols];
+        for (int t = 0; t < cols; ++t) out[t] = want.data() + (size_t) t * rows;
+        cpu::tq_bih3_r1q2_rows(180 + k, codes.data(), row_bytes, n, ap, cols, out, 0, rows, sc);
+        strata::parity::Device dev;
+        strata::kernels::Bih3R1q2Matrix mat;
+        mat.codes = dev.upload(codes); mat.rowbase = dev.upload(rowbase); mat.colscale = dev.upload(colscale);
+        mat.q = dev.upload(q); mat.row_bytes = row_bytes; mat.k = k; mat.n_in = n; mat.n_out = rows;
+        std::copy(p2, p2 + 4, mat.p2);
+        const auto* dx = dev.upload(q81);
+        auto* dy = dev.alloc<float>(got.size());
+        strata::kernels::bih3_r1q2_mmvq(mat, dx, dy, cols, stream);
+        strata::parity::copy_out(got.data(), dy, got.size());
+        const double error = rel(got, want);
+        worst = std::max(worst, error);
+        if (!std::isfinite(error) || error > 1e-5) {
+            std::printf("bih3 R1Q2 mmvq: K=%d n=%d rel %.9g FAILED\n", k, n, error);
+            ++failures;
+        }
+        if (path) {
+            namespace K = strata::kernels;
+            auto* gathered = dev.alloc<uint8_t>((size_t) rows * (size_t) (3 * n / 32) * 36);
+            auto* expanded = dev.alloc<uint8_t>(K::iq_mmq_act_bytes(cols, (int64_t) 3 * n));
+            const auto* bounds = dev.upload(std::vector<int32_t>{0, cols});
+            const auto* ids = dev.upload(std::vector<int32_t>{0, 1, 2});
+            K::bih3_r1q2_gather_mmq(mat, gathered, stream);
+            K::bih3_r1q2_expand_mmq(dx, expanded, n, cols, stream);
+            K::iq_mmq_grouped(queue, K::kBih3Planes, gathered, (size_t) rows * (3 * n / 32) * 36,
+                              rows, (int64_t) 3 * n, 1, expanded, cols, bounds, cols, ids, dy, rows).wait_and_throw();
+            strata::parity::copy_out(got.data(), dy, got.size());
+            const double e = rel(got, want);
+            matrix_worst = std::max(matrix_worst, e);
+            if (!std::isfinite(e) || e > 1e-5) {
+                std::printf("bih3 R1Q2 matrix: K=%d n=%d rel %.9g FAILED\n", k, n, e);
+                ++failures;
+            }
+            if (bench && k == 8 && n == 2560) {
+                auto matrix = [&] {
+                    K::iq_mmq_grouped(queue, K::kBih3Planes, gathered, (size_t) rows * (3 * n / 32) * 36,
+                                      rows, (int64_t) 3 * n, 1, expanded, cols, bounds, cols, ids, dy, rows);
+                };
+                auto row = [&] { K::bih3_r1q2_mmvq(mat, dx, dy, cols, stream); };
+                auto gather = [&] { K::bih3_r1q2_gather_mmq(mat, gathered, stream); };
+                auto time = [&](const auto& fn) {
+                    for (int i = 0; i < 3; ++i) fn();
+                    queue.wait_and_throw();
+                    const auto start = std::chrono::steady_clock::now();
+                    for (int i = 0; i < 20; ++i) fn();
+                    queue.wait_and_throw();
+                    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / 20;
+                };
+                const double matrix_us = time(matrix), row_us = time(row), gather_us = time(gather);
+                std::printf("bih3 R1Q2 bench: K=8 128x2560 3 columns, %s matrix %.1f us, "
+                            "row %.1f us, gather %.1f us (wall per call, 20 calls)\n",
+                            path, matrix_us, row_us, gather_us);
+            }
+        }
+    }
+    std::printf("bih3 R1Q2 mmvq: 39 cases, max relative error %.9g, %d failures\n", worst, failures);
+    if (path) std::printf("bih3 R1Q2 %s: 39 cases, max relative error %.9g\n", path, matrix_worst);
+    return failures ? 1 : 0;
+}
+
+// Two differently sized experts in the same call, with out-of-order destinations and a repeated expert.
+static int check_bih3_grouped(void* stream) {
+    constexpr int H = 256, FF = 128, NT = 3;
+    const float p2[3][4] = {{0.25f, 0.5f, 1.f, 2.f}, {0.5f, 1.f, 1.5f, 2.f}, {0.25f, 0.5f, 1.f, 2.f}};
+    cpu::NativeFmt f[2];
+    std::string err;
+    if (!cpu::native_r1q2_fmt(182, 183, H, FF, p2, f[0], err) ||
+        !cpu::native_r1q2_fmt(188, 189, H, FF, p2, f[1], err)) {
+        std::printf("bih3 grouped: %s\n", err.c_str()); return 1;
+    }
+    std::mt19937 rng(388);  // NOLINT(cert-msc51-cpp,bugprone-random-generator-seed): reproducible parity input
+    std::uniform_real_distribution<float> dist(-1.f, 1.f);
+    std::vector<std::vector<uint8_t>> blobs(2);
+    for (int e = 0; e < 2; ++e) {
+        auto& blob = blobs[e]; blob.resize(f[e].bytes);
+        for (auto& v : blob) v = (uint8_t) rng();
+        for (int m = 0; m < 3; ++m) {
+            const int r = m == 2 ? H : FF, blocks = (m == 2 ? FF : H) / 128;
+            uint8_t* sc = blob.data() + f[e].sc_off + cpu::native_r1q2_scale_offset(f[e], m);
+            const uint16_t rb = ggml_fp32_to_fp16(0.05f), cs = ggml_fp32_to_fp16(0.25f);
+            for (int i = 0; i < r; ++i) { sc[(size_t) 2 * i] = (uint8_t) rb; sc[(size_t) 2 * i + 1] = (uint8_t) (rb >> 8); }
+            for (int i = 0; i < blocks; ++i) { sc[2 * r + 2 * i] = (uint8_t) cs; sc[2 * r + 2 * i + 1] = (uint8_t) (cs >> 8); }
+        }
+    }
+    std::vector<float> x((size_t) NT * H), want((size_t) NT * H), got(want.size());
+    for (float& v : x) v = dist(rng);
+    const int32_t route[NT] = {1, 0, 1}, dst[NT] = {1, 0, 2}, tok[NT] = {2, 0, 1};
+    std::vector<cpu::NativeAct> act(NT);
+    std::vector<uint8_t> q81((size_t) NT * H / 32 * 36);
+    for (int t = 0; t < NT; ++t) {
+        cpu::native_quant_act(f[0], x.data() + (size_t) t * H, act[t].bytes);
+        for (int b = 0; b < H / 32; ++b) {
+            const uint8_t* src = act[t].bytes + (size_t) b * 34;
+            uint8_t* out = q81.data() + ((size_t) t * (H / 32) + b) * 36;
+            std::memcpy(out, src, 2); std::memcpy(out + 4, src + 2, 32);
+        }
+    }
+    for (int i = 0; i < NT; ++i) {
+        const int expert = route[dst[i]];
+        const void* a[] = {act[tok[i]].bytes};
+        std::vector<float> hidden(FF);
+        float* hp[] = {hidden.data()};
+        cpu::native_gu_rows(f[expert], blobs[expert].data(), a, 1, hp, 0, FF);
+        cpu::NativeAct hq;
+        cpu::native_quant_h(f[expert], hidden.data(), hq.bytes);
+        const void* ha[] = {hq.bytes};
+        float* op[] = {want.data() + (size_t) dst[i] * H};
+        cpu::native_down_rows(f[expert], blobs[expert].data(), ha, 1, op, 0, H);
+    }
+    strata::parity::Device dev;
+    std::vector<unsigned long long> ptr(3);
+    for (int e = 0; e < 2; ++e) ptr[(size_t) e] = (unsigned long long) dev.upload(blobs[(size_t) e]);
+    const auto* dptr = dev.upload(ptr);
+    const auto* dstart = dev.upload(std::vector<int32_t>{0, 1, 3, 3});
+    const auto* groups = dev.upload(std::vector<int32_t>{2});
+    const auto* ddst = dev.upload(std::vector<int32_t>(dst, dst + NT));
+    const auto* dtok = dev.upload(std::vector<int32_t>(tok, tok + NT));
+    const auto* droutes = dev.upload(std::vector<int32_t>(route, route + NT));
+    const auto* dk = dev.upload(std::vector<uint8_t>{2, 3, 8, 9});
+    const auto* dx = dev.upload(q81);
+    auto* dy = dev.alloc<float>(got.size());
+    // The PCIe copy kernel must read only each expert's own bytes, preserving the unused tail and empty slot.
+    const size_t stride = std::max(f[0].bytes, f[1].bytes);
+    std::vector<uint8_t> stage(3 * stride, 0xa5);
+    auto* dstage = dev.upload(stage);
+    strata::kernels::fetch_r1q2_blobs(dptr, groups, dstage, (int64_t) stride, 3, dstart, ddst, droutes, dk,
+                                      H, FF, stream);
+    strata::parity::copy_out(stage.data(), dstage, stage.size());
+    bool fetch_ok = true;
+    for (int e = 0; e < 2; ++e) {
+        const size_t bytes = blobs[(size_t) e].size();
+        fetch_ok = fetch_ok && std::memcmp(stage.data() + (size_t) e * stride, blobs[(size_t) e].data(), bytes) == 0;
+        for (size_t i = bytes; i < stride; ++i) fetch_ok = fetch_ok && stage[(size_t) e * stride + i] == 0xa5;
+    }
+    for (size_t i = 2 * stride; i < stage.size(); ++i) fetch_ok = fetch_ok && stage[i] == 0xa5;
+    if (!fetch_ok) { std::puts("bih3 grouped: mixed fetch corrupted a tail or an empty slot"); return 1; }
+    const size_t scratch_bytes = strata::kernels::bih3_r1q2_grouped_scratch_bytes(NT, H, FF);
+    void* scratch = dev.alloc<uint8_t>(scratch_bytes);
+    strata::kernels::Bih3R1q2Layer L;
+    L.n_embd = H; L.n_ff = FF; L.n_expert = 2; L.k_pairs = dk; L.route_ids = droutes;
+    std::memcpy(L.p2, p2, sizeof p2);
+    strata::kernels::bih3_r1q2_grouped(L, dptr, dstart, groups, ddst, dtok, 3, NT, dx, scratch, dy, stream);
+    strata::parity::copy_out(got.data(), dy, got.size());
+    const double error = rel(got, want);
+    std::printf("bih3 grouped mixed K=2/3,8/9: rel %.9g, scratch %zu bytes\n", error, scratch_bytes);
+    strata::kernels::bih3_r1q2_grouped_scalar(L, dptr, dstart, groups, ddst, dtok, 3, NT, dx, scratch, dy, stream);
+    strata::parity::copy_out(got.data(), dy, got.size());
+    const double scalar_error = rel(got, want);
+    std::printf("bih3 grouped scalar mixed K=2/3,8/9: rel %.9g\n", scalar_error);
+    const size_t prompt_bytes = strata::kernels::bih3_r1q2_prompt_scratch_bytes(NT, H, FF);
+    auto* ps = dev.alloc<uint8_t>(prompt_bytes);
+    auto* po = dev.alloc<float>((size_t) NT * H);
+    strata::kernels::bih3_r1q2_prompt(L, reinterpret_cast<const uint8_t*>(ptr[0]), 2, 3,
+                                      dtok, 1, NT, dx, ps, po, stream);
+    strata::kernels::bih3_r1q2_prompt(L, reinterpret_cast<const uint8_t*>(ptr[1]), 8, 9,
+                                      dtok + 1, 2, NT, dx, ps, po + H, stream);
+    std::vector<float> prompt((size_t) NT * H), prompt_want(prompt.size());
+    strata::parity::copy_out(prompt.data(), po, prompt.size());
+    for (int i = 0; i < NT; ++i)
+        std::copy_n(want.data() + (size_t) dst[i] * H, H, prompt_want.data() + (size_t) i * H);
+    const double prompt_error = rel(prompt, prompt_want);
+    std::printf("bih3 prompt mixed K=2/3,8/9: rel %.9g, scratch %zu bytes\n", prompt_error, prompt_bytes);
+    // A layer's experts in one call: rows sorted by expert (entry 0 expert 0's, entries 1 and 2 expert 1's), a group
+    // with no blob (row 1: left as it was) and a cap of 2 rows, so the groups take two passes.
+    double groups_error = 0;
+    {
+        const unsigned long long blob0 = ptr[0], blob1 = ptr[1];
+        const std::vector<int32_t> meta = {(int32_t) blob0, (int32_t) (blob0 >> 32), 0, 0,
+                                           (int32_t) blob1, (int32_t) (blob1 >> 32)};
+        const std::vector<int32_t> starts = {0, 1, 2, 3};
+        const std::vector<int32_t> kp = {2 | 3 << 8, 8 | 9 << 8, 8 | 9 << 8};
+        const auto* gptr = reinterpret_cast<const unsigned long long*>(dev.upload(meta));
+        const auto* gstart = dev.upload(starts);
+        const auto* gk = dev.upload(kp);
+        const auto* gtok = dev.upload(std::vector<int32_t>(tok, tok + NT));
+        const size_t gbytes = strata::kernels::bih3_r1q2_prompt_scratch_bytes(2, H, FF);
+        auto* gs = dev.alloc<uint8_t>(gbytes);
+        std::vector<float> gout((size_t) NT * H, 7.f);
+        auto* go = dev.upload(gout);
+        strata::kernels::Bih3R1q2Layer one = L;
+        strata::kernels::bih3_r1q2_prompt_groups(one, gptr, gstart, gk, starts.data(), 3, gtok, dx, gs, 2, go, stream);
+        strata::parity::copy_out(gout.data(), go, gout.size());
+        std::vector<float> g_got, g_want;
+        for (int r : {0, 2}) {
+            g_got.insert(g_got.end(), gout.begin() + (size_t) r * H, gout.begin() + (size_t) (r + 1) * H);
+            g_want.insert(g_want.end(), want.begin() + (size_t) dst[r] * H, want.begin() + (size_t) (dst[r] + 1) * H);
+        }
+        groups_error = rel(g_got, g_want);
+        for (int i = 0; i < H; ++i) if (gout[(size_t) H + i] != 7.f) groups_error = 1;   // the group with no blob
+        std::printf("bih3 prompt groups (two passes, a group without a blob): rel %.9g\n", groups_error);
+        // the same rows through the matrix products of the gathered codes (kBih3Code), where the device has them
+        if (strata::kernels::iq_mmq_path(strata::core::Runtime::get().compute()) != nullptr) {
+            const std::vector<int32_t> mptr = {(int32_t) blob0, (int32_t) (blob0 >> 32), (int32_t) blob1,
+                                               (int32_t) (blob1 >> 32)};
+            const auto* m_ptr = reinterpret_cast<const unsigned long long*>(dev.upload(mptr));
+            const auto* m_k = dev.upload(std::vector<int32_t>{2 | 3 << 8, 8 | 9 << 8});
+            const auto* m_bnd = dev.upload(std::vector<int32_t>{0, 1, 3});
+            const auto* m_rows = dev.upload(std::vector<int32_t>{0, 1, 2});
+            auto* ms = dev.alloc<uint8_t>(strata::kernels::bih3_r1q2_grouped_scratch_bytes(NT, H, FF));
+            auto* mw = dev.alloc<uint8_t>(2 * strata::kernels::bih3_r1q2_code_bytes(H, FF));
+            auto* mo = dev.alloc<float>((size_t) NT * H);
+            strata::kernels::bih3_r1q2_prompt_mmq(one, 2, m_ptr, m_k, m_bnd, 2, m_rows, gtok, NT, dx, ms, mw, mo, stream);
+            std::vector<float> m_got((size_t) NT * H);
+            strata::parity::copy_out(m_got.data(), mo, m_got.size());
+            double mmq_error = rel(m_got, prompt_want);
+            std::printf("bih3 prompt matrix pass (kBih3Code): rel %.9g\n", mmq_error);
+            if (!(mmq_error < 1e-2)) groups_error = 1;
+        }
+    }
+    // The FP16 dequantization (bih3_r1q2_dequant_f16) against the CPU's rows: a column of each matrix is its row
+    // products with a one-hot Q8_0 activation (scale 1, one value 1: every other term zero, so the weight exactly)
+    double dq_error = 0;
+    for (int e = 0; e < 2; ++e) {
+        auto* dgu = dev.alloc<uint16_t>((size_t) 2 * FF * H);
+        auto* ddn = dev.alloc<uint16_t>((size_t) H * FF);
+        strata::kernels::bih3_r1q2_dequant_f16(L, reinterpret_cast<const uint8_t*>(ptr[(size_t) e]),
+                                              f[e].gu_type - 180, f[e].d_type - 180, dgu, ddn, stream);
+        std::vector<uint16_t> hgu((size_t) 2 * FF * H), hdn((size_t) H * FF);
+        strata::parity::copy_out(hgu.data(), dgu, hgu.size());
+        strata::parity::copy_out(hdn.data(), ddn, hdn.size());
+        std::vector<float> dq_got, dq_want;
+        for (int m = 0; m < 3; ++m) {
+            const int rows = m == 2 ? H : FF, width = m == 2 ? FF : H;
+            const uint8_t* sp = blobs[(size_t) e].data() + f[e].sc_off + cpu::native_r1q2_scale_offset(f[e], m);
+            const size_t blocks = (size_t) width / 128;
+            cpu::TqR1q2Scales sc{sp, sp + 2 * (size_t) rows, sp + 2 * (size_t) rows + 2 * blocks, (blocks + 3) / 4, {}};
+            for (int q = 0; q < 4; ++q) sc.p2[q] = p2[m][q];
+            const uint8_t* w = blobs[(size_t) e].data() + (m == 0 ? 0 : m == 1 ? f[e].up_off : f[e].down_off);
+            std::vector<uint8_t> onehot((size_t) 8 * (size_t) (width / 32) * 34);
+            std::vector<float> col((size_t) 8 * (size_t) rows);
+            for (int c0 = 0; c0 < width; c0 += 8) {
+                std::fill(onehot.begin(), onehot.end(), 0);
+                const void* a[8];
+                float* o[8];
+                for (int t = 0; t < 8; ++t) {
+                    uint8_t* blk = onehot.data() + (size_t) t * (size_t) (width / 32) * 34 + (size_t) ((c0 + t) / 32) * 34;
+                    blk[0] = 0x00; blk[1] = 0x3c;   // d = 1.0
+                    blk[2 + (c0 + t) % 32] = 1;
+                    a[t] = onehot.data() + (size_t) t * (size_t) (width / 32) * 34;
+                    o[t] = col.data() + (size_t) t * (size_t) rows;
+                }
+                cpu::tq_bih3_r1q2_rows(m == 2 ? f[e].d_type : f[e].gu_type, w, m == 2 ? f[e].d_row : f[e].gu_row,
+                                       width, a, 8, o, 0, rows, sc);
+                for (int t = 0; t < 8; ++t)
+                    for (int r = 0; r < rows; ++r) {
+                        const size_t at = m == 2 ? (size_t) r * FF + (size_t) (c0 + t)
+                                                 : (size_t) (2 * r + m) * H + (size_t) (c0 + t);
+                        dq_want.push_back(col[(size_t) t * rows + r]);
+                        dq_got.push_back(ggml_fp16_to_fp32(m == 2 ? hdn[at] : hgu[at]));
+                    }
+            }
+        }
+        dq_error = std::max(dq_error, rel(dq_got, dq_want));
+    }
+    std::printf("bih3 FP16 dequantization against the CPU rows: rel %.9g\n", dq_error);
+    std::vector<float> signs(FF);
+    for (int i = 0; i < FF; ++i) signs[i] = i % 3 ? 1.f : -1.f;
+    for (auto& fmt : f) { fmt.had_d = true; fmt.had_block = FF; fmt.d_signs = signs.data(); }
+    for (int i = 0; i < NT; ++i) {
+        const int expert = route[dst[i]];
+        const void* a[] = {act[tok[i]].bytes};
+        std::vector<float> hidden(FF);
+        float* hp[] = {hidden.data()};
+        cpu::native_gu_rows(f[expert], blobs[expert].data(), a, 1, hp, 0, FF);
+        cpu::NativeAct hq;
+        cpu::native_quant_h(f[expert], hidden.data(), hq.bytes);
+        const void* ha[] = {hq.bytes};
+        float* op[] = {want.data() + (size_t) dst[i] * H};
+        cpu::native_down_rows(f[expert], blobs[expert].data(), ha, 1, op, 0, H);
+    }
+    L.had_block = FF; L.d_signs = dev.upload(signs);
+    strata::kernels::bih3_r1q2_grouped_scalar(L, dptr, dstart, groups, ddst, dtok, 3, NT, dx, scratch, dy, stream);
+    strata::parity::copy_out(got.data(), dy, got.size());
+    const double had_error = rel(got, want);
+    std::printf("bih3 grouped scalar with Hadamard: rel %.9g\n", had_error);
+    return std::isfinite(error) && error < 1e-2 && std::isfinite(scalar_error) && scalar_error < 1e-2 &&
+           std::isfinite(prompt_error) && prompt_error < 1e-2 && std::isfinite(groups_error) && groups_error < 1e-2 &&
+           std::isfinite(had_error) && had_error < 1e-2 && std::isfinite(dq_error) && dq_error < 1e-3 ? 0 : 1;
+}
+
+// Isolate the product's device time; gathering and activation quantization finish before the warm-up.
+static int benchmark_bih3_event() {
+    namespace K = strata::kernels;
+    auto& runtime = strata::core::Runtime::get().compute();
+    sycl::queue q(runtime.get_context(), runtime.get_device(),
+                  sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
+    const char* path = K::iq_mmq_path(q);
+    if (!path) { std::puts("event bench: no tiled path"); return 1; }
+    std::printf("event bench path: %s (one expert; gathered weights, no gather/quantize)\n", path);
+    strata::parity::Device dev;
+    constexpr int rounds = 100;
+    for (int i = 0; i < 300; ++i) q.single_task([] {});
+    q.wait_and_throw();
+    std::vector<sycl::event> empty;
+    empty.reserve(rounds);
+    for (int i = 0; i < rounds; ++i) empty.push_back(q.single_task([] {}));
+    q.wait_and_throw();
+    std::vector<double> empty_us;
+    for (const auto& ev : empty) {
+        const auto a = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto b = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+        empty_us.push_back((double) (b - a) / 1000.0);
+    }
+    std::sort(empty_us.begin(), empty_us.end());
+    std::printf("event bench empty kernel: median %.2f us min %.2f us (%d events)\n",
+                empty_us[rounds / 2], empty_us[0], rounds);
+    for (const auto [n_out, n_in] : {std::pair{640, 2560}, std::pair{2560, 640}}) {
+        for (int nt : {8, 16, 32, 64}) for (int ty : {K::kBih3Planes, 12}) {
+            const int cols = ty == K::kBih3Planes ? 3 * n_in : n_in;
+            // A 65-row activation pitch keeps split-K off without a runtime-owned scratch queue.
+            const int pitch = 65;
+            const size_t wb = (size_t) n_out * K::iq_mmq_row_bytes(ty, cols);
+            auto* w = dev.alloc<uint8_t>(wb);
+            auto* x = dev.alloc<float>((size_t) pitch * cols);
+            auto* xq = dev.alloc<uint8_t>(K::iq_mmq_act_bytes(pitch, cols));
+            auto* y = dev.alloc<float>((size_t) nt * n_out);
+            const auto* bounds = dev.upload(std::vector<int32_t>{0, nt});
+            std::vector<int32_t> hids((size_t) nt);
+            for (int i = 0; i < nt; ++i) hids[(size_t) i] = i;
+            const auto* ids = dev.upload(hids);
+            q.memset(w, 0, wb); q.memset(x, 0, (size_t) pitch * cols * sizeof(float));
+            K::iq_mmq_quantize(q, x, nullptr, xq, cols, cols, pitch, K::iq_mmq_type_sums(ty));
+            auto product = [&] { return K::iq_mmq_grouped(q, ty, w, wb, n_out, cols, 1, xq, pitch,
+                                                           bounds, nt, ids, y, n_out); };
+            for (int i = 0; i < 300; ++i) product();
+            q.wait_and_throw();
+            std::vector<sycl::event> events;
+            events.reserve(rounds);
+            for (int i = 0; i < rounds; ++i) events.push_back(product());
+            q.wait_and_throw();
+            std::vector<double> us;
+            for (const auto& ev : events) {
+                const auto a = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+                const auto b = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+                us.push_back((double) (b - a) / 1000.0);
+            }
+            std::sort(us.begin(), us.end());
+            std::printf("event bench %s %dx%d tokens=%d %s: median %.2f us min %.2f us (%d events)\n",
+                        n_out == 640 ? "gate/up" : "down", n_out, n_in, nt,
+                        ty == K::kBih3Planes ? "R1Q2 planes" : "Q4_K", us[rounds / 2], us[0], rounds);
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): an uncaught error ends the check with its message
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
+    if (argc == 2 && std::string(argv[1]) == "--bih3-event-bench") return benchmark_bih3_event();
+    if (argc == 2 && std::string(argv[1]) == "--bih3-mmvq") return check_bih3_mmvq(strata::parity::stream());
+    if (argc == 2 && std::string(argv[1]) == "--bih3-grouped") return check_bih3_grouped(strata::parity::stream());
+    if (argc == 2 && std::string(argv[1]) == "--bih3-bench") return check_bih3_mmvq(strata::parity::stream(), true);
     if (argc == 2 && std::string(argv[1]) == "--bf16-embd") return check_bf16_embd(strata::parity::stream());
     if (argc == 3 && std::string(argv[1]) == "--synthetic") return check_synthetic(argv[2], strata::parity::stream());
     if (argc == 3 && std::string(argv[1]) == "--synthetic-hadamard")

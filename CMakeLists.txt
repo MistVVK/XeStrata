@@ -602,6 +602,8 @@ if(STRATA_ENABLE_XE)
                                    src/core/conversation_file.cpp src/core/control_vector.cpp
                                    src/core/vmm.cpp src/core/draft_head.cpp
                                    src/core/grammar.cpp src/core/script_guard.cpp src/core/plain_cpu.cpp
+                                   src/core/plain_inkling.cpp
+                                   src/core/plain_dspark.cpp
                                    src/core/auto_pick.cpp)
   target_include_directories(strata_engine PUBLIC include)
   # the dense Qwen3.5 forward on the CPU (--device cpu): AVX2 throughout, run only after PlainModel's cpu_avx2_ok()
@@ -1851,9 +1853,10 @@ if(STRATA_NATIVE_EXPERTS)
   # structs in unions on purpose (ggml-common.h, ggml-impl.h); clang warns of both there and nowhere else.  ggml's
   # targets alone, on Windows alone, so XeStrata's files keep the warnings
   if(WIN32)
-    foreach(_t ggml-base ggml-cpu ggml)
-      if(TARGET ${_t})
-        target_compile_options(${_t} PRIVATE -Wno-keyword-macro -Wno-gnu-anonymous-struct -Wno-nested-anon-types)
+    foreach(ggml_target ggml-base ggml-cpu ggml)
+      if(TARGET ${ggml_target})
+        target_compile_options(${ggml_target} PRIVATE -Wno-keyword-macro -Wno-gnu-anonymous-struct
+                               -Wno-nested-anon-types)
       endif()
     endforeach()
   endif()
@@ -1874,7 +1877,8 @@ if(STRATA_NATIVE_EXPERTS)
   set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
   set_source_files_properties(src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp
                               PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-  set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
+  set_property(SOURCE src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/tq_avx2.cpp
+               APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
   if(STRATA_BUILD_TESTS)
@@ -1927,6 +1931,11 @@ if(STRATA_NATIVE_EXPERTS)
     set_tests_properties(latent_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     # the BF16 token embedding (--embd-gguf) gathered and dequantized bit for bit: synthetic, so in CTest
     add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
+    # bih3 R1Q2 matrix rows, K=2..14, against the scalar CPU reference
+    add_test(NAME native_expert_parity_bih3_mmvq COMMAND native_expert_parity --bih3-mmvq)
+    set_tests_properties(native_expert_parity_bih3_mmvq PROPERTIES TIMEOUT 120)
+    add_test(NAME native_expert_parity_bih3_grouped COMMAND native_expert_parity --bih3-grouped)
+    set_tests_properties(native_expert_parity_bih3_grouped PROPERTIES TIMEOUT 120)
     # UD-Q4_K_XL's expert pairs (and Q8_0 alone) and OrcaRouter Q4_K_S's q4_K/q5_0 on synthetic ggml-quantized
     # weights at 2560/640 (upstream efeffd8, d652cd6): GPU and CPU experts against the float reference, GPU
     # dequantizers against to_float

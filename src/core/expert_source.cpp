@@ -93,14 +93,14 @@ bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64
 }
 
 bool make_cache_complement_plan(
-    int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+    int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& blob_sizes,
     const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
     std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err) {
     offsets.clear();
     bytes = 0;
     err.clear();
-    if (n_layers <= 0 || n_expert <= 0 || layer_blob_bytes.size() != (size_t) n_layers) {
+    if (n_layers <= 0 || n_expert <= 0) {
         err = "FileExpertSource: invalid geometry for the cache complement plan";
         return false;
     }
@@ -109,6 +109,10 @@ bool make_cache_complement_plan(
         return false;
     }
     const size_t count = (size_t) n_layers * (size_t) n_expert;
+    if (blob_sizes.size() != count) {
+        err = "FileExpertSource: cache complement size table does not match the geometry";
+        return false;
+    }
     std::vector<uint8_t> omitted(count, 0);
     auto mark_pairs = [&](const std::vector<std::pair<int32_t, int32_t>>& pairs, uint8_t bit,
                           const char* label) -> bool {
@@ -132,7 +136,7 @@ bool make_cache_complement_plan(
     };
     if (!mark_pairs(primary_gpu_pairs, 1, "primary GPU") ||
         !mark_pairs(additional_gpu_pairs, 2, "additional GPU")) return false;
-    for (uint64_t blob_bytes : layer_blob_bytes) {
+    for (uint64_t blob_bytes : blob_sizes) {
         if (blob_bytes == 0) {
             err = "FileExpertSource: cache complement layer has zero-sized expert blobs";
             return false;
@@ -141,10 +145,10 @@ bool make_cache_complement_plan(
 
     offsets.assign(count, kNoCacheComplement);
     for (int64_t layer = 0; layer < n_layers; ++layer) {
-        const uint64_t blob_bytes = layer_blob_bytes[(size_t) layer];
         for (int64_t expert = 0; expert < n_expert; ++expert) {
             const size_t index = (size_t) layer * (size_t) n_expert + (size_t) expert;
             if (omitted[index] != 0) continue;
+            const uint64_t blob_bytes = blob_sizes[index];
             if (bytes > std::numeric_limits<uint64_t>::max() - blob_bytes) {
                 offsets.clear();
                 bytes = 0;
@@ -188,12 +192,12 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
     return keep;
 }
 
-int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& blob_sizes,
                                   std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t cap_bytes,
                                   const std::vector<std::vector<std::pair<int32_t, int32_t>>>& regions,
                                   std::string& err) {
     const size_t blobs = (size_t) (n_layers * n_expert);
-    if (n_layers <= 0 || n_expert <= 0 || layer_blob_bytes.size() != (size_t) n_layers || offsets.size() != blobs) {
+    if (n_layers <= 0 || n_expert <= 0 || blob_sizes.size() != blobs || offsets.size() != blobs || bytes > cap_bytes) {
         err = "append_stage_lend_regions: the plan does not match the geometry";
         return -1;
     }
@@ -216,7 +220,7 @@ int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std:
         for (const auto& pair : region) {
             const size_t index = (size_t) pair.first * (size_t) n_expert + (size_t) pair.second;
             if (offsets[index] != kNoCacheComplement) continue;   // already in the copy
-            const uint64_t b = layer_blob_bytes[(size_t) pair.first];
+            const uint64_t b = blob_sizes[index];
             if (b > cap_bytes - bytes) break;                     // this stage's rest keeps the file fallback
             offsets[index] = bytes;
             bytes += b;
@@ -607,7 +611,8 @@ int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
     }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return 0;
-    out[0] = {b, layer_blob_bytes_[(size_t) layer], io_fds_.empty() ? -1 : io_fds_[0], (uint64_t) (b - base_), 0};
+    const uint64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer, expert);
+    out[0] = {b, bytes, io_fds_.empty() ? -1 : io_fds_[0], (uint64_t) (b - base_), 0};
     return 1;
 }
 
@@ -629,6 +634,7 @@ uint64_t FileExpertSource::cached_bytes(int64_t layer, int64_t expert, uint64_t&
 }
 
 uint64_t FileExpertSource::expert_bytes() const {
+    if (strata::kernels::cpu::expert_layout().mixed()) return strata::kernels::cpu::expert_layout().total;
     uint64_t total = 0;
     for (uint64_t b : layer_blob_bytes_) total += b * (uint64_t) n_expert_;
     return total;
@@ -810,8 +816,8 @@ void FileExpertSource::io_worker() {
         const bool ok = copy_from_files(layer, expert, dst);
         io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
         if (ok) {
-            file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
-            io_pf_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+            file_read_bytes_.fetch_add(strata::kernels::cpu::expert_layout().blob_bytes(layer, expert), std::memory_order_relaxed);
+            io_pf_bytes_.fetch_add(strata::kernels::cpu::expert_layout().blob_bytes(layer, expert), std::memory_order_relaxed);
         }
         {
             std::lock_guard<std::mutex> lk(stage_mu_);
@@ -933,7 +939,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
                 err = "FileExpertSource: the native expert layout is invalid at layer " + std::to_string(layer);
                 return false;
             }
-            const uint64_t layer_bytes = bytes * (uint64_t) n_expert;
+            const uint64_t layer_bytes = layout.layer_bytes(layer);
             if (at > want || layer_bytes > want - at) {
                 err = "FileExpertSource: the native expert layout exceeds its declared size at layer " +
                       std::to_string(layer);
@@ -948,8 +954,8 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
             return false;
         }
     }
-    const std::string path = pack_dir + "/experts.bin";
-    if (layout.native && !gguf_.empty() && !std::filesystem::exists(path)) {
+    const std::string path = pack_dir + (layout.mixed() ? "/experts.v2.bin" : "/experts.bin");
+    if (layout.native && !layout.mixed() && !gguf_.empty() && !std::filesystem::exists(path)) {
         // CS-T: no experts.bin - the model's GGUF shards, read in place
         blobs_ = (int64_t) blob_count;
         n_layers_ = n_layers;
@@ -1045,7 +1051,8 @@ bool FileExpertSource::pin_by_device(std::vector<uint64_t>& offsets, std::vector
         for (const size_t i : order)
             if (owner_of(i) == owners[k]) {
                 packed[i] = at;
-                at += layer_blob_bytes_[i / (size_t) n_expert_];
+                at += strata::kernels::cpu::expert_layout().blob_bytes((int64_t) (i / (size_t) n_expert_),
+                                                                        (int64_t) (i % (size_t) n_expert_));
             }
         const OnDevice on(owners[k]);
         void* h = nullptr;
@@ -1192,7 +1199,7 @@ void FileExpertSource::close() {
 bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     const uint8_t* b = blob(layer, expert);
     if (b == nullptr || dst == nullptr) return false;
-    std::memcpy(dst, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer));
+    std::memcpy(dst, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer, expert));
     return true;
 }
 
@@ -1307,7 +1314,7 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return false;
-    std::memcpy(dst, b, (size_t) layer_blob_bytes_[(size_t) layer]);
+    std::memcpy(dst, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer, expert));
     return true;
 }
 
@@ -1330,7 +1337,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         if (!ahead && stage_pf_[v]) {   // a layer asked for what was read ahead
             stage_pf_[v] = 0;
             io_pf_used_.fetch_add(1, std::memory_order_relaxed);
-            io_pf_used_bytes_.fetch_add(layer_blob_bytes_[(size_t) (key / n_expert_)], std::memory_order_relaxed);
+            io_pf_used_bytes_.fetch_add(strata::kernels::cpu::expert_layout().blob_bytes(key / n_expert_, key % n_expert_),
+                                        std::memory_order_relaxed);
         }
         return true;
     }
@@ -1372,15 +1380,15 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
 bool FileExpertSource::fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst) {
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = copy_from_files(layer, expert, dst);
-    publish_stage(v, layer, ok, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+    publish_stage(v, layer, expert, ok, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
     return ok;
 }
 
-void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us) {
+void FileExpertSource::publish_stage(size_t v, int64_t layer, int64_t expert, bool ok, double us) {
     file_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
     if (ok) {
-        file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
-        file_blob_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+        file_read_bytes_.fetch_add(strata::kernels::cpu::expert_layout().blob_bytes(layer, expert), std::memory_order_relaxed);
+        file_blob_bytes_.fetch_add(strata::kernels::cpu::expert_layout().blob_bytes(layer, expert), std::memory_order_relaxed);
     }
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -1433,7 +1441,7 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
             if (pf_mark_ && pf_mark_[index].exchange(0, std::memory_order_relaxed)) {   // read ahead, now asked for
                 io_pf_used_.fetch_add(1, std::memory_order_relaxed);
-                io_pf_used_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+                io_pf_used_bytes_.fetch_add(strata::kernels::cpu::expert_layout().blob_bytes(layer, e), std::memory_order_relaxed);
             }
             if (complement_ready_ && resident_blob(index) != nullptr) continue;
             if (!override_.empty() && override_[index] != nullptr) continue;
@@ -1557,7 +1565,8 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
         if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
-            if (const uint8_t* b = mapped_blob(l, e)) strata::platform::advise_willneed(b, layer_blob_bytes_[(size_t) l]);
+            if (const uint8_t* b = mapped_blob(l, e))
+                strata::platform::advise_willneed(b, strata::kernels::cpu::expert_layout().blob_bytes(l, e));
             continue;
         }
         for (int r = 0; r < 3; ++r) {
@@ -1583,7 +1592,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
                 for (size_t i = at; i < at + k; ++i) {
                     const Fill& f = todo[i];
                     // a failed batch: each blob again on its own (copy_from_files falls back to the mapping)
-                    if (ok) publish_stage(f.v, f.layer, true, us / (double) k);
+                    if (ok) publish_stage(f.v, f.layer, f.e, true, us / (double) k);
                     else (void) fill_stage(f.v, f.layer, f.e, f.dst);
                 }
             }
@@ -1795,7 +1804,7 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     if (base_ == nullptr || dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-    const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
+    const uint64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer, expert);
     if (complement_ready_) {
         const uint8_t* held =
             resident_blob(index);
@@ -1816,6 +1825,12 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {
     if (!role_ptr_.empty()) return nullptr;   // the GGUF in place: no contiguous blob in any file
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+    const auto& layout = strata::kernels::cpu::expert_layout();
+    if (layout.mixed()) {
+        const uint64_t offset = layout.blob_offset(layer, expert), bytes = layout.blob_bytes(layer, expert);
+        if (offset > mapped_bytes_ || bytes > mapped_bytes_ - offset) return nullptr;
+        return base_ + (size_t) offset;
+    }
     const size_t i = (size_t) layer;
     if (i >= layer_offsets_.size() || i >= layer_blob_bytes_.size()) return nullptr;
     const uint64_t blob_bytes = layer_blob_bytes_[i];
@@ -1868,22 +1883,26 @@ bool FileExpertSource::pin_complement(
         err = "FileExpertSource: a slot for each GPU expert";
         return false;
     }
-    const bool sync = strata::gpu::device_sync();
-    if (sync != true) {
+    if ((n_slots > 0 || !primary_gpu_pairs.empty() || !additional_gpu_pairs.empty()) && !strata::gpu::device_sync()) {
         err = std::string("FileExpertSource: GPU expert cache is not ready: ") + strata::gpu::last_error();
-
         return false;
     }
 
+    const auto& layout = strata::kernels::cpu::expert_layout();
+    std::vector<uint64_t> blob_sizes((size_t) blobs_);
+    for (int64_t l = 0; l < n_layers_; ++l)
+        for (int64_t e = 0; e < n_expert_; ++e)
+            blob_sizes[(size_t) l * (size_t) n_expert_ + (size_t) e] = layout.blob_bytes(l, e);
+
     // the bytes each slot's expert takes here (for the lend region below)
     std::vector<uint64_t> slot_bytes((size_t) std::max<int64_t>(n_slots, 0), 0);
-    for (size_t i = 0; i < pair_slot.size(); ++i)
-        if (pair_slot[i] >= 0 && pair_slot[i] < n_slots)
-            slot_bytes[(size_t) pair_slot[i]] = layer_blob_bytes_[(size_t) primary_gpu_pairs[i].first];
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
-    if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
+    if (!detail::make_cache_complement_plan(n_layers_, n_expert_, blob_sizes, primary_gpu_pairs,
                                             additional_gpu_pairs, offsets, bytes, err)) return false;
+    for (size_t i = 0; i < pair_slot.size(); ++i)
+        if (pair_slot[i] >= 0 && pair_slot[i] < n_slots)
+            slot_bytes[(size_t) pair_slot[i]] = layout.blob_bytes(primary_gpu_pairs[i].first, primary_gpu_pairs[i].second);
     const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
     const int64_t lend_asked = lend_from_slot;   // #11: the lent slots whose experts stay on the files are read again
     int64_t budget_lent = 0, budget_lendable = 0;   // the lend region's slots kept by a budget (below), and its size
@@ -1926,7 +1945,7 @@ bool FileExpertSource::pin_complement(
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
                 ++wanted;
-                const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
+                const uint64_t b = layout.blob_bytes(pr.first, pr.second);
                 if (b > budget_bytes - at) continue;
                 ranked[i] = at;
                 at += b;
@@ -1959,7 +1978,7 @@ bool FileExpertSource::pin_complement(
             for (size_t i : order) {
                 const auto& pr = primary_gpu_pairs[i];
                 const size_t idx = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
-                const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
+                const uint64_t b = layout.blob_bytes(pr.first, pr.second);
                 if (b > budget_bytes - at) break;   // a contiguous tail of the region: a short prompt lends only the last few
                 if (ranked[idx] != kNoComplement) continue;
                 ranked[idx] = at;
@@ -2017,7 +2036,7 @@ bool FileExpertSource::pin_complement(
             core.reserve(primary_gpu_pairs.size());
             for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
                 if (pair_slot[i] < keep_from) core.push_back(primary_gpu_pairs[i]);
-            if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
+            if (!detail::make_cache_complement_plan(n_layers_, n_expert_, blob_sizes, core,
                                                     additional_gpu_pairs, offsets, bytes, err)) return false;
         }
     }
@@ -2042,7 +2061,7 @@ bool FileExpertSource::pin_complement(
         uint64_t cap = budget;   // a RAM budget (--resident-budget-gib) caps the whole copy, regions included
         if (budget_bytes > 0 && budget_bytes != kResidentWhatFits && budget_bytes < cap) cap = budget_bytes;
         const uint64_t before = bytes;
-        stage_lent = detail::append_stage_lend_regions(n_layers_, n_expert_, layer_blob_bytes_, offsets, bytes, cap,
+        stage_lent = detail::append_stage_lend_regions(n_layers_, n_expert_, blob_sizes, offsets, bytes, cap,
                                                        stage_lend_regions_, err);
         if (stage_lent < 0) return false;
         stage_lent_bytes = bytes - before;
@@ -2058,12 +2077,12 @@ bool FileExpertSource::pin_complement(
                 if (l >= 0 && e >= 0 && l < n_layers_ && e < n_expert_) on_gpu[(size_t) l * (size_t) n_expert_ + (size_t) e] = 1;
         uint64_t in_place = 0;
         for (size_t i = 0; i < on_gpu.size(); ++i)
-            if (!on_gpu[i] && offsets[i] == kNoComplement) in_place += layer_blob_bytes_[i / (size_t) n_expert_];
+            if (!on_gpu[i] && offsets[i] == kNoComplement) in_place += blob_sizes[i];
         if (lend_asked >= 0)
             for (size_t i = 0; i < primary_gpu_pairs.size(); ++i) {
                 const auto [l, e] = primary_gpu_pairs[i];
                 if (pair_slot[i] >= lend_asked && offsets[(size_t) l * (size_t) n_expert_ + (size_t) e] == kNoComplement)
-                    in_place += layer_blob_bytes_[(size_t) l];
+                    in_place += layout.blob_bytes(l, e);
             }
         if (physical == 0 && !available_memory_bytes(physical)) physical = 0;
         const uint64_t cma = strata::platform::cma_free_bytes();   // not for pinned pages (upstream #3698)
@@ -2131,7 +2150,7 @@ bool FileExpertSource::pin_complement(
                 std::vector<std::pair<uint64_t, uint64_t>> blobs;   // (offset, bytes), in arena order
                 for (size_t i = 0; i < offsets.size(); ++i)
                     if (offsets[i] != kNoComplement)
-                        blobs.emplace_back(offsets[i], layer_blob_bytes_[i / (size_t) n_expert_]);
+                        blobs.emplace_back(offsets[i], blob_sizes[i]);
                 std::sort(blobs.begin(), blobs.end());
                 const char* parts_env = strata::env_get("PIN_PARTS");   // 0: one allocation or none (A/B)
                 const int max_parts = parts_env != nullptr ? (int) std::strtol(parts_env, nullptr, 10) : 32;
@@ -2203,14 +2222,13 @@ bool FileExpertSource::pin_complement(
         for (;;) {
             const int64_t layer = next_layer.fetch_add(1);
             if (layer >= n_layers_ || failed.load()) return;
-            const uint64_t blob_bytes = layer_blob_bytes_[(size_t) layer];
             std::vector<Fill> batch;   // #286, unbuffered: 32 blobs' reads in flight at once, merged where near
             auto flush = [&]() {
                 if (batch.empty()) return true;
                 bool ok = read_direct(batch.data(), batch.size());
                 for (size_t i = 0; !ok && i < batch.size(); ++i)
                     if (!copy_from_files(batch[i].layer, batch[i].e, batch[i].dst)) return false;
-                copied.fetch_add(blob_bytes * (uint64_t) batch.size());
+                for (const Fill& f : batch) copied.fetch_add(layout.blob_bytes(f.layer, f.e));
                 batch.clear();
                 return true;
             };
@@ -2224,6 +2242,7 @@ bool FileExpertSource::pin_complement(
             for (int64_t expert = 0; expert < n_expert_; ++expert) {
                 const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
                 const uint64_t offset = offsets[index];
+                const uint64_t blob_bytes = layout.blob_bytes(layer, expert);
                 if (offset == kNoComplement) continue;
                 if (offset > bytes || blob_bytes > bytes - offset) {
                     fail("FileExpertSource: invalid blob bounds while building the cache complement");
@@ -2252,7 +2271,7 @@ bool FileExpertSource::pin_complement(
             // a copied layer's pages handed back; Windows leaves them to its memory manager, as upstream does
             if (role_ptr_.empty()) {   // experts.bin; the GGUF in place leaves its pages to the OS
             const uint64_t layer_offset = layer_offsets_[(size_t) layer];
-            const uint64_t layer_bytes = blob_bytes * (uint64_t) n_expert_;
+            const uint64_t layer_bytes = layout.layer_bytes(layer);
             const uint64_t layer_end = layer_offset + layer_bytes;
             const uint64_t page = (uint64_t) page_size;
             const uint64_t advice_start = layer_offset - layer_offset % page;
@@ -2404,7 +2423,8 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
                                  "one)\n", rotate_want == 1 ? "on" : "off",
                          (double) extra / 1073741824.0, (double) have / 1073741824.0);
     }
-    const bool requested = rotate_want == 1;
+    // Mixed experts need different-sized destinations; the ownership rotation has only per-layer sizes.
+    const bool requested = rotate_want == 1 && !strata::kernels::cpu::expert_layout().mixed();
     const bool eligible = requested && rotate_total != 0 && rotate_total <= std::numeric_limits<size_t>::max() &&
                           complement_pinned_ && !complement_partial_ &&
                           complement_host_ != nullptr && complement_device_ != nullptr && complement_bytes_ > 0 &&
@@ -2471,8 +2491,13 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     if (override_[i_out] != nullptr) return false;
     for (const Exchange& x : staged_)
         if (x.in == i_in || x.q == q) return false;
+    const uint64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer, out);
+    // Rotation commits through its ownership table; only the copy path uses a complement offset.
+    const uint64_t at = exchange_storage_.active() ? 0 :
+        strata::kernels::cpu::expert_layout().mixed() ? replacement_offset(i_in, bytes) : complement_offsets_[i_in];
+    if (at == kNoComplement) return false;
     override_[i_out] = exchange_buffer(q, layer);
-    staged_.push_back({i_in, i_out, q, layer_blob_bytes_[(size_t) layer]});
+    staged_.push_back({i_in, i_out, q, bytes, at});
     return true;
 }
 
@@ -2490,17 +2515,52 @@ int64_t FileExpertSource::commit_exchanges() {
             override_[x.out] = nullptr;
             continue;
         }
-        const uint64_t at = complement_offsets_[x.in];
+        const uint64_t at = x.at;
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr) {
             std::memcpy(complement_at(at), src, (size_t) x.bytes);
-            if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
+            complement_offsets_[x.in] = kNoComplement;
+            complement_offsets_[x.out] = at;
+            ++n;
         }
         override_[x.out] = nullptr;
     }
     staged_.clear();
     exchanges_ += n;
     return n;
+}
+
+uint64_t FileExpertSource::replacement_offset(size_t outgoing, uint64_t bytes) const {
+    const uint64_t old = complement_offsets_[outgoing];
+    if (old == kNoComplement || bytes == 0) return kNoComplement;
+    uint64_t begin = 0, end = complement_bytes_;
+    if (!complement_chunks_.empty()) {
+        const ComplementChunk* c = chunk_of(complement_chunks_, old);
+        begin = c->start;
+        end = c->end;
+    }
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const int64_t l = (int64_t) (outgoing / (size_t) n_expert_);
+    const int64_t e = (int64_t) (outgoing % (size_t) n_expert_);
+    if (bytes <= lay.blob_bytes(l, e)) return old;
+    std::vector<std::pair<uint64_t, uint64_t>> used;
+    for (size_t i = 0; i < complement_offsets_.size(); ++i) {
+        const uint64_t at = complement_offsets_[i];
+        if (i == outgoing || at == kNoComplement || at < begin || at >= end) continue;
+        const uint64_t len = lay.blob_bytes((int64_t) (i / (size_t) n_expert_), (int64_t) (i % (size_t) n_expert_));
+        if (len > end - at) return kNoComplement;
+        used.emplace_back(at, at + len);
+    }
+    for (const Exchange& x : staged_) {
+        if (x.at >= begin && x.at < end) used.emplace_back(x.at, x.at + x.bytes);
+    }
+    std::sort(used.begin(), used.end());
+    uint64_t cursor = begin;
+    for (const auto& span : used) {
+        if (span.first > cursor && bytes <= span.first - cursor) return cursor;
+        cursor = std::max(cursor, span.second);
+    }
+    return bytes <= end - cursor ? cursor : kNoComplement;
 }
 
 bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) {
@@ -2511,9 +2571,10 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
     const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
     if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
     if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
-    const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
-    if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
-        bytes > complement_bytes_ - at) return false;
+    const uint64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer, in);
+    if (complement_offsets_[i_out] == kNoComplement || complement_offsets_[i_in] != kNoComplement) return false;
+    const uint64_t at = replacement_offset(i_out, bytes);
+    if (at == kNoComplement) return false;
     // read beside the copy first: a failed read leaves `out` where it was
     if (ram_adapt_buf_.size() < (size_t) bytes) ram_adapt_buf_.resize((size_t) bytes);
     const auto t0 = std::chrono::steady_clock::now();
@@ -2522,7 +2583,8 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
                        std::memory_order_relaxed);
     file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     std::memcpy(complement_at(at), ram_adapt_buf_.data(), (size_t) bytes);
-    if (!detail::exchange_cache_complement(complement_offsets_, i_out, i_in)) return false;
+    complement_offsets_[i_out] = kNoComplement;
+    complement_offsets_[i_in] = at;
     ++ram_adapts_;
     return true;
 }
@@ -2535,9 +2597,11 @@ bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_
     const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
     if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
     if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
-    const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
-    if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
-        bytes > complement_bytes_ - at || bytes > stage_blob_) return false;
+    const uint64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer, in);
+    if (complement_offsets_[i_out] == kNoComplement || complement_offsets_[i_in] != kNoComplement ||
+        bytes > stage_blob_) return false;
+    const uint64_t at = replacement_offset(i_out, bytes);
+    if (at == kNoComplement) return false;
     {
         // held across the copy: claim_stage cannot hand the buffer to another blob meanwhile
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -2545,7 +2609,8 @@ bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_
         if (it == stage_of_.end() || stage_busy_[it->second] || stage_key_[it->second] != (int64_t) i_in) return false;
         std::memcpy(complement_at(at), stage_buf_[it->second].get(), (size_t) bytes);
     }
-    if (!detail::exchange_cache_complement(complement_offsets_, i_out, i_in)) return false;
+    complement_offsets_[i_out] = kNoComplement;
+    complement_offsets_[i_in] = at;
     ++ram_adapts_;
     ++ram_staged_;
     return true;
@@ -2555,7 +2620,7 @@ void FileExpertSource::commit_copies() {
     if (exchange_storage_.active()) return;   // STRATA_EXCHANGE_ROTATE: ownership moves in commit_flip, nothing to copy
     for (const Exchange& x : staged_) {
         const uint8_t* src = override_.empty() ? nullptr : override_[x.out];
-        const uint64_t at = complement_offsets_[x.in];
+        const uint64_t at = x.at;
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr)
             std::memcpy(complement_at(at), src, (size_t) x.bytes);
@@ -2575,11 +2640,14 @@ int64_t FileExpertSource::commit_flip() {
             override_[x.out] = nullptr;
             continue;
         }
-        const uint64_t at = complement_offsets_[x.in];
+        const uint64_t at = x.at;
         // the same test as commit_copies: an exchange whose bytes were copied is the one that flips
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
-            complement_host_ != nullptr && detail::exchange_cache_complement(complement_offsets_, x.in, x.out))
+            complement_host_ != nullptr) {
+            complement_offsets_[x.in] = kNoComplement;
+            complement_offsets_[x.out] = at;
             ++n;
+        }
         override_[x.out] = nullptr;
     }
     staged_.clear();
@@ -2624,7 +2692,7 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
         } else {
             result = mapped_blob(layer, expert);
             if (result != nullptr) {
-                file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+                file_read_bytes_.fetch_add(strata::kernels::cpu::expert_layout().blob_bytes(layer, expert), std::memory_order_relaxed);
 #if defined(__linux__)
                 if (io_stats_) {   // what the page cache held when the kernels were handed the mapping
                     uint64_t total = 0;
@@ -2653,7 +2721,7 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement) return false;
     // a partial pin (CS-T): only the registered prefix
     return !complement_partial_ ||
-           complement_offsets_[index] + layer_blob_bytes_[(size_t) layer] <= complement_pin_limit_;
+           complement_offsets_[index] + strata::kernels::cpu::expert_layout().blob_bytes(layer, expert) <= complement_pin_limit_;
 }
 
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {
@@ -2818,11 +2886,13 @@ struct CpuCalJobs {
     std::vector<float> x, out;
     strata::kernels::cpu::NativeAct act;
     const uint8_t* ring[kRing] = {};
+    const strata::kernels::cpu::NativeFmt* formats[kRing] = {};
     int cursor = 0;
     strata::kernels::cpu::ExpertJobMulti jobs[kCall];
     void next(int k) {   // the next k experts of the ring into jobs[0, k)
         for (int j = 0; j < k; ++j) {
             jobs[j].blob = ring[cursor];
+            jobs[j].fmt = formats[cursor];
             cursor = (cursor + 1) % kRing;
         }
     }
@@ -2839,7 +2909,11 @@ bool cpu_cal_jobs(ExpertDispatch& d, int64_t n_layers, int64_t& layer, CpuCalJob
         for (int64_t e = 0; e < d.n_expert && n < CpuCalJobs::kRing; ++e)
             if (d.host_res[(size_t) l * (size_t) d.n_expert + (size_t) e] < 0 && d.src->pinned(l, e)) {
                 const uint8_t* b = d.src->blob(l, e);
-                if (b != nullptr) cj.ring[n++] = b;
+                if (b != nullptr) {
+                    cj.ring[n] = b;
+                    cj.formats[n] = lay.mixed() ? &lay.format(l, e) : nullptr;
+                    ++n;
+                }
             }
         if (n == CpuCalJobs::kRing) layer = l;
     }
@@ -3289,6 +3363,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
+        size_t dma_bytes[64];
         int64_t pcie_i0[64];
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
@@ -3316,6 +3391,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                         if (src != nullptr) {
                             kd = 1;
                             dma_src[fetches] = src;
+                            dma_bytes[fetches] = (size_t) lay.blob_bytes(d.layers, e);
                             pcie_i0[fetches] = i0;
                             ++fetches;
                         }
@@ -3343,7 +3419,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++groups;
         }
         P.start[groups] = entries;
-        const uint64_t bb = lay.blob_bytes(d.layers);
+        const uint64_t bb = lay.mixed() ? lay.max_blob : lay.blob_bytes(d.layers);
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
             P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
@@ -3365,7 +3441,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
-        if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, dma_bytes, (size_t) bb);   // beside the CPU's work
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -3506,7 +3582,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
                 nj.nt = 0;
-                nj.fmt = nullptr;
+                nj.fmt = native && lay.mixed() ? &lay.format(d.layers, e) : nullptr;
                 if (zc) {   // the gate rows are the blob; up and down at their distance in the mapping
                     strata::kernels::cpu::NativeFmt& f = d.zc_fmt[(size_t) jo];
                     f = lay.fmt[(size_t) d.layers];
@@ -3743,6 +3819,10 @@ bool shared_arena_pack_hash(const std::string& pack_dir, const std::string& expe
         if (!hash_small_file(pack / name, h, err)) return false;
     }
 
+    if (lay.mixed())
+        for (const char* name : {"experts_k.txt", "r1q2.txt", "hadamard.txt"})
+            if (!hash_small_file(pack / name, h, err)) return false;
+
     if (std::filesystem::exists(experts_path)) {
         if (!hash_sampled_file(experts_path, h, err)) return false;
     } else if (!gguf.empty()) {
@@ -3879,6 +3959,8 @@ std::vector<std::string> native_layer_problems(bool mixed_gu) {
     const ExpertLayout& lay = expert_layout();
     for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
         const NativeFmt& f = lay.fmt[(size_t) l];
+        // Qwen3.8's window and prompt paths take the mixed R1Q2 format; PlainModel's mixed-gu path does not yet.
+        if (lay.mixed() && !mixed_gu && f.r1q2) continue;
         const std::string at = "MoE layer " + std::to_string(l) + " (block " + std::to_string(lay.block_of(l)) + ")";
         const int up = f.up_type >= 0 ? f.up_type : f.gu_type;
         if (!mixed_gu && native_mixed_gu(f)) {
@@ -4071,8 +4153,11 @@ LoadStats load_expert_units(const std::string& path, const std::string& gguf, bo
                 while (e1 < lay.n_expert && dropped(l, e1)) ++e1;
                 const uint64_t n = (uint64_t) (e1 - e0);
                 if (!from_gguf) {
-                    if (!read_at(path, lay.blob_offset(l, e0), n * blob)) { bad = true; return; }
-                    std::memcpy(dst + (lay.blob_offset(l, e0) - lay.layer_offset(l)), buf.data(), (size_t) (n * blob));
+                    const uint64_t first = lay.blob_offset(l, e0);
+                    const uint64_t end = e1 == lay.n_expert ? lay.layer_offset(l) + lay.layer_bytes(l) : lay.blob_offset(l, e1);
+                    const uint64_t run_bytes = end - first;
+                    if (!read_at(path, first, run_bytes)) { bad = true; return; }
+                    std::memcpy(dst + (first - lay.layer_offset(l)), buf.data(), (size_t) run_bytes);
                 } else {
                     const auto& fm = lay.fmt[(size_t) l];
                     const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
@@ -4085,7 +4170,9 @@ LoadStats load_expert_units(const std::string& path, const std::string& gguf, bo
                                         buf.data() + k * per[r], (size_t) per[r]);
                     }
                 }
-                bytes += n * blob;
+                bytes += from_gguf ? n * blob :
+                    (e1 == lay.n_expert ? lay.layer_offset(l) + lay.layer_bytes(l) : lay.blob_offset(l, e1)) -
+                        lay.blob_offset(l, e0);
                 e0 = e1;
             }
         }
@@ -4181,18 +4268,19 @@ bool arena_host_usm_faster() {
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
                              std::string& err, const std::string& shared_arena_file) {
     close();
-    const std::string path = pack_dir + "/experts.bin";
     // plan v0.3 P6: the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     if (lay.n_layers != n_layers || lay.n_expert != n_expert) {
         err = "ArenaExpertSource: the expert layout was loaded for a different geometry";
         return false;
     }
+    const std::string path = pack_dir + (lay.mixed() ? "/experts.v2.bin" : "/experts.bin");
     const int64_t blob = (int64_t) lay.max_blob;
     const uint64_t want = lay.total;
 
     // plan v0.3 P6: no experts.bin in a native pack -> the experts come straight from the GGUF
-    const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
+    const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.mixed() &&
+                           !lay.gguf_off.empty() && !gguf_.empty();
     // SIZE CHECK BEFORE THE ALLOCATION, not after.  A wrong pack should name the two numbers rather than spend
     // 34 GB and a minute of loading first.
     if (!from_gguf) {
@@ -4350,7 +4438,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     for (int64_t l = 0; l < n_layers; ++l) {
         bounds.push_back(lay.layer_offset(l));
         loff.push_back(lay.layer_offset(l));
-        lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
+        lbytes.push_back(lay.layer_bytes(l));
         for (int64_t e = 0; e < n_expert; ++e) cuts.push_back(lay.blob_offset(l, e));
     }
     bounds.push_back(want);
@@ -4517,7 +4605,7 @@ bool ArenaExpertSource::drop_cold(uint64_t want_bytes, const std::vector<std::pa
     for (int64_t u : order) {
         if (dropped >= want_bytes) break;
         bits[(size_t) (u / 8)] |= (uint8_t) (1u << (u % 8));
-        dropped += lay.blob_bytes(u / lay.n_expert);
+        dropped += lay.blob_bytes(u / lay.n_expert, u % lay.n_expert);
     }
     if (dropped == 0) return true;
     auto* a = (PinnedArena*) arena_;
@@ -4527,7 +4615,7 @@ bool ArenaExpertSource::drop_cold(uint64_t want_bytes, const std::vector<std::pa
     for (int64_t u = 0; u < units; ++u) {
         if (!(bits[(size_t) (u / 8)] >> (u % 8) & 1)) continue;
         const int64_t l = u / lay.n_expert, e = u % lay.n_expert;
-        const uint64_t off = head + lay.blob_offset(l, e), n = lay.blob_bytes(l);
+        const uint64_t off = head + lay.blob_offset(l, e), n = lay.blob_bytes(l, e);
         if (!ranges.empty() && ranges.back().first + ranges.back().second == off) ranges.back().second += n;
         else ranges.emplace_back(off, n);
     }
@@ -4577,8 +4665,9 @@ void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
 #else
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return;
     const auto& lay = strata::kernels::cpu::expert_layout();
+    if (layer >= lay.n_layers) return;
     const uint64_t off = lay.blob_offset(layer, expert) & ~(uint64_t) 4095;
-    const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer);
+    const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer, expert);
     madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_WILLNEED);
 #endif
 }
@@ -4596,8 +4685,9 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
 #else
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
     const auto& lay = strata::kernels::cpu::expert_layout();
+    if (layer >= lay.n_layers) return 0;
     const uint64_t off = (lay.blob_offset(layer, expert) + 4095) & ~(uint64_t) 4095;
-    const uint64_t end = (lay.blob_offset(layer, expert) + lay.blob_bytes(layer)) & ~(uint64_t) 4095;
+    const uint64_t end = (lay.blob_offset(layer, expert) + lay.blob_bytes(layer, expert)) & ~(uint64_t) 4095;
     if (end <= off) return 0;
     if (madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_DONTNEED) != 0) return 0;
     return end - off;
@@ -4607,7 +4697,7 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();
-    return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
+    return layer < lay.n_layers && lay.blob_offset(layer, expert) + lay.blob_bytes(layer, expert) <= pinned_bytes_;
 }
 
 bool ArenaExpertSource::make_kernel_readable(std::string& err) {
@@ -4642,7 +4732,7 @@ const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) co
     if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
     // one registration slice per layer
     if ((size_t) layer >= dev_slice_.size()) return nullptr;
-    return dev_slice_[(size_t) layer] + (uint64_t) expert * lay.blob_bytes(layer);
+    return dev_slice_[(size_t) layer] + lay.blob_offset(layer, expert) - lay.layer_offset(layer);
 }
 
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {

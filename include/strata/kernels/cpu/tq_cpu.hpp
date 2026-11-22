@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/cpu/tq_cpu.hpp - the trellis expert formats (TQ2_T / TQK6 / TQK7 / TQP5 / TQP6 / TQP7, ggml
 // types 144-149 of the agention llama.cpp fork) on the CPU: decode-and-dot against Q8_0 activations (ggml's
@@ -72,6 +73,36 @@ void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n
 void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                 const void* const* act, int nt, float* const* ff, int r0, int r1);
 
+/// R1Q2 scales for one matrix. Half-precision values are stored little-endian in the blob; q packs four
+/// two-bit indices per byte, separately for each row. p2 selects the layer and projection's scale table.
+struct TqR1q2Scales {
+    const uint8_t* rowbase;
+    const uint8_t* colscale;
+    const uint8_t* q;
+    size_t qbytes;
+    float p2[4];
+};
+
+/// The bih3 types 182..194 use K=2..14 and 4*K code bytes per 128 weights, without a block scale.
+/// Bih3 chooses its ISA separately from the original trellis formats, by CPUID feature bits and the token
+/// count (a version is taken only where it measured faster than the one below it; llvm-mca and row
+/// benches, 2026-11-19).  The explicit entry is for parity tests.
+enum class Bih3Isa : int { scalar, avx2, avxvnni, avx512vnni };
+bool bih3_isa_ok(Bih3Isa isa);
+Bih3Isa bih3_isa(int nt);
+const char* bih3_isa_name(Bih3Isa isa);
+void tq_bih3_r1q2_rows_isa(Bih3Isa isa, int type, const uint8_t* w, size_t row_bytes, int n,
+                            const void* const* act, int nt, float* const* out, int r0, int r1,
+                            const TqR1q2Scales& scales);
+void tq_bih3_r1q2_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                        float* const* out, int r0, int r1, const TqR1q2Scales& scales);
+void tq_bih3_r1q2_gu_rows_isa(Bih3Isa isa, int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n,
+                               const void* const* act, int nt, float* const* ff, int r0, int r1,
+                               const TqR1q2Scales& gate, const TqR1q2Scales& up);
+void tq_bih3_r1q2_gu_rows(int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n,
+                           const void* const* act, int nt, float* const* ff, int r0, int r1,
+                           const TqR1q2Scales& gate, const TqR1q2Scales& up);
+
 /// Largest token group per call and widest row the kernels take.
 inline constexpr int kTqMaxTokens = 8;
 inline constexpr int kTqMaxN = 4096;
@@ -83,6 +114,10 @@ struct TqAct {
     alignas(64) float d[kTqMaxN / 32];
 };
 void unpack_act(const void* q8_0, int n, TqAct& a);
+#if defined(__x86_64__) || defined(_M_X64)
+void bih3_rows_x86(Bih3Isa isa, int type, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
+                    int nt, float* const* out, int r0, int r1, const TqR1q2Scales& scales);
+#endif
 // the per-ISA row kernels (dot products only; `out[t][r]` for rows [r0, r1)); `ty` the ggml type
 void tq_rows_scalar(int ty, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1);

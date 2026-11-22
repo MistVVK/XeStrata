@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/native_expert.cpp - plan v0.3 P6: native (GGUF-form) experts on the CPU through ggml-cpu.
 // See the header.  Nothing here is Strata arithmetic: the activation quantizers and the row dot products are
@@ -186,6 +187,62 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     return true;
 }
 
+
+size_t native_r1q2_scale_offset(const NativeFmt& f, int m) {
+    const size_t blocks = (size_t) f.n_embd / kTqBlock;
+    const size_t gu = (size_t) f.n_ff * 2 + blocks * 2 + (size_t) f.n_ff * ((blocks + 3) / 4);
+    if (m < 0 || m > 2) std::abort();
+    return (size_t) m * gu;
+}
+
+bool native_r1q2_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const float (&p2)[3][4],
+                      NativeFmt& f, std::string& err) {
+    if (gu_type < 182 || gu_type > 194 || d_type < 182 || d_type > 194 || n_embd <= 0 || n_ff <= 0 ||
+        n_embd > kTqMaxN || n_ff > kNativeMaxFF || n_embd % kTqBlock || n_ff % kTqBlock) {
+        err = "native experts: invalid bih3 R1Q2 type or dimensions";
+        return false;
+    }
+    for (int m = 0; m < 3; ++m) for (int q = 0; q < 4; ++q) {
+        if (!(p2[m][q] > 0.f) || !std::isfinite(p2[m][q])) {
+            err = "native experts: invalid R1Q2 scale";
+            return false;
+        }
+    }
+    f = NativeFmt{};
+    f.gu_type = f.up_type = gu_type; f.d_type = d_type;
+    f.gu_act = f.d_act = GGML_TYPE_Q8_0;
+    f.n_embd = n_embd; f.n_ff = n_ff;
+    const size_t gb = (size_t) n_embd / kTqBlock, db = (size_t) n_ff / kTqBlock;
+    f.gu_row = f.up_row = gb * 4 * (size_t) (gu_type - 180);
+    f.d_row = db * 4 * (size_t) (d_type - 180);
+    f.up_off = f.gu_row * (size_t) n_ff;
+    f.down_off = 2 * f.up_off;
+    const size_t codes = f.down_off + f.d_row * (size_t) n_embd;
+    f.sc_off = (codes + 15) / 16 * 16;
+    const size_t ds = (size_t) n_embd * 2 + db * 2 + (size_t) n_embd * ((db + 3) / 4);
+    f.bytes = (f.sc_off + native_r1q2_scale_offset(f, 2) + ds + 255) / 256 * 256;
+    f.act_bytes = ggml_row_size(GGML_TYPE_Q8_0, n_embd);
+    f.h_bytes = ggml_row_size(GGML_TYPE_Q8_0, n_ff);
+    if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
+        err = "native experts: R1Q2 activation larger than the pool's buffers";
+        return false;
+    }
+    f.r1q2 = true;
+    std::memcpy(f.p2, p2, sizeof f.p2);
+    return true;
+}
+
+namespace {
+TqR1q2Scales r1q2_scales(const NativeFmt& f, const uint8_t* blob, int m) {
+    const size_t rows = (size_t) (m < 2 ? f.n_ff : f.n_embd);
+    const size_t blocks = (size_t) (m < 2 ? f.n_embd : f.n_ff) / kTqBlock;
+    const uint8_t* p = blob + f.sc_off + native_r1q2_scale_offset(f, m);
+    TqR1q2Scales scales{p, p + 2 * rows, p + 2 * rows + 2 * blocks, (blocks + 3) / 4, {}};
+    for (int q = 0; q < 4; ++q) scales.p2[q] = f.p2[m][q];
+    return scales;
+}
+}  // namespace
+
 namespace {
 // Q8_K (the activations of every i-quant row): ggml-cpu's x86 quantizer is the scalar reference, ~3 us per token
 // and layer on the host before the pool can start; q8k_quant_avx2 writes the same bytes.  cpu_avx2_ok() too:
@@ -297,6 +354,12 @@ void part_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (f.r1q2) {
+        tq_bih3_r1q2_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1,
+                              r1q2_scales(f, blob, 0), r1q2_scales(f, blob, 1));
+        return;
+    }
+
     if (canon_layer(f)) { canon_gu_rows(f, blob, act, nt, ff, r0, r1); return; }
     if (f.gu_type == 42) {   // Q2_0: Strata's GGUF-layout kernels on the ActQ native_quant_act wrote
         thread_local float ub[MAXT][kNativeMaxFF];
@@ -391,6 +454,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    if (f.r1q2) {
+        tq_bih3_r1q2_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1,
+                           r1q2_scales(f, blob, 2));
+        return;
+    }
+
     if (canon_layer(f)) { canon_down_rows(f, blob, hq, nt, out, r0, r1); return; }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.  From one

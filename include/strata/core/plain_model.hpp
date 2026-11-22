@@ -67,6 +67,7 @@ namespace strata::core {
 
 class RemoteExperts;
 class PlainCpu;
+class PlainInkling;
 
 struct PlainOptions {
     std::string gguf;               ///< any shard of the model
@@ -294,7 +295,7 @@ public:
     /// tokens put back from a snapshot (its rings: the window before `end`).
     bool can_rewind(int64_t to, int64_t end = -1) const;
     /// The forward runs on the CPU (--device cpu): no GPU, no drafts, no pictures, no batches.
-    bool on_cpu() const { return cpu_ != nullptr; }
+    bool on_cpu() const { return opt_.cpu; }
     int64_t max_cells() const { return opt_.max_cells; }
     /// The options as loaded (the --kv format auto_gpu_layers chose)
     const PlainOptions& options() const { return opt_; }
@@ -367,6 +368,11 @@ public:
                    const strata::kernels::SamplerParams* sp, int T, int32_t* drafts, std::string& err);
     /// The bytes save_state would take for `tokens` tokens
     size_t state_bytes(int64_t tokens) const;
+    const float* inkling_tap_dev() const;
+    // Check a DSpark block against the target. Only matched rows enter the target state.
+    bool dspark_step(int32_t anchor, int64_t pos, int count, const std::vector<int32_t>& eos,
+                     int32_t* out, float* logits, int& emitted, int& accepted, std::string& err);
+
     /// Tokens [0, T) at positions pos .. pos + T - 1 (T <= max_t): out[t] is the greedy token after token t, and with
     /// `logits` the T rows of n_vocab logits.  Positions must follow the previous window's.
     /// `defer`: the window's rows are not yet known to be kept (a verify window): spec_step counts the ones it keeps
@@ -1089,6 +1095,8 @@ private:
     std::unique_ptr<GgufModel> model_;
     // --device cpu: the forward, and the picks' constraints on the host (set_logit_bias, set_allowed, set_history)
     std::unique_ptr<PlainCpu> cpu_;
+    /// inkling2_loop's CPU reference forward (--device cpu); the GPU path is not implemented in this stage.
+    std::unique_ptr<PlainInkling> inkling_;
     /// --gpu-layers not given, a dense model on one GPU: the blocks its free VRAM holds after the head, their K/V and a
     /// reserve (opt_.gpu_layers set: all of them, N, or 0 for the CPU alone)
     bool auto_gpu_layers(std::string& err);

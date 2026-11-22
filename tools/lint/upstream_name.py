@@ -8,9 +8,9 @@ strata alone is upstream's name, and an upstream sync brings it back.  This lint
 C++, Python and F# files, the shell scripts' code (not their comments), the documents (Markdown) and the web app
 (JavaScript, HTML, the locales), and reports a `strata` that is not part of `xestrata`, outside the uses ALLOWED
 keeps: the namespace and include paths, the file names, the CMake options and targets, the API fields and markers
-shared with upstream, an old STRATA_<name> a script still reads after XESTRATA_<name>, and the credits.  In the documents,
-`Strata` is upstream's name and stays.  A line of code whose comment says upstream (or an earlier name) speaks of
-upstream's engine and is not read; a document marks what it says of the names themselves with
+shared with upstream, an old STRATA_<name> a script still reads after XESTRATA_<name>, and the credits.
+In the documents, `Strata` is upstream's name and stays.  A line of code whose comment says upstream (or an earlier
+name) speaks of upstream's engine and is not read; a document marks what it says of the names themselves with
 <!-- upstream-name: off --> and <!-- upstream-name: on -->.  Without files it checks every tracked file it reads.
 Exits 1 on a finding.
 """
@@ -60,6 +60,7 @@ ALLOWED = [
     # a heading's anchor (the headings of upstream's versions)
     r'#[\w%-]*strata-\d',
     # credits and upstream named
+    r'(?i:sync-strata)',
     r'[Uu]pstream(?:\'s)? Strata', r'upstream の Strata', r'Upstream-Strata', r'Strata en amont', r'Strata \(upstream\)',
     r'Strata(?:-GLM)? (?:[0-9]|#|v[0-9])', r'Strata\'s', r'\boriginal-strata\b',
     r'Niko1221', r'the Strata contributors', r'Strata-GLM', r'github\.com/[\w.-]+/Strata',

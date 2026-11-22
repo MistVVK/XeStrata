@@ -382,6 +382,19 @@ RAM の扱いは UD-Q4_K_XL と同じで、RAM が下の目安より少なけれ
 ./setup.sh --setup --family unsloth --model UD-Q5_K_XL
 ```
 
+### Sync-XS、Sync-S、Sync-M
+
+hiruhiru2005 の [Sync-XS](https://huggingface.co/hiru2005/Sync-XS)、[Sync-S](https://huggingface.co/hiru2005/Sync-S)、[Sync-M](https://huggingface.co/sync-strata/Sync-M) は bih3 と R1Q2 の混合ビットの pack です。
+[共通の GGUF、MTP、tokenizer](https://huggingface.co/hiru2005/Sync-shared) は 3 つで共有し、一度だけ取得します。画像読み手は元のモデルのものです。
+setup は RAM 24 GiB から XS、32 GiB かつ VRAM 12 GiB から S、48 GiB から M を勧めます。RAM が 48 GiB 以上なら S の VRAM 条件はありません。
+既定のモデルの推奨順は変わりません。
+
+Sync の tail skip は既定で off です。B70 の VRAM を 12 GiB に制限し、21 問・各 220 トークンで、飛ばさない経路との teacher-forced KL の平均を測りました。R7 は XS 0.008904、S 0.010352、M 0.011171 で、従来の参照 0.0058 と同程度とは言えません。R4 はそれぞれ 0.050165、0.056059、0.060073 です。キャッシュは XS 4739 枠、S 3945 枠、M 2768 枠なので、pack 間の数字は直接比べません。R7 を試すには `XESTRATA_ROUTE_TAIL_SKIP=7` を設定します。
+
+```bash
+./setup.sh --setup --family sync --model Sync-XS
+```
+
 ### Gyro-S、Gyro-M、Gyro-L
 
 **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** は、agentionai による元のモデルの量子化です（upstream ba64156fd）。
