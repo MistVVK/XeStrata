@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Sync's pinned files are reused, checked, and shared between model sizes."""
+import errno
 import hashlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -91,6 +93,44 @@ class SyncFiles(unittest.TestCase):
             data = b"abcdefg" * ((32 << 20) // 7 + 1)
             p.write_bytes(data)
             self.assertEqual(sync_models.sha256(p, len(data)), hashlib.sha256(data).hexdigest())
+
+    def test_hash_falls_back_when_direct_io_is_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            p = Path(temp) / "file"
+            data = b"abcdefg" * ((32 << 20) // 7 + 1)
+            p.write_bytes(data)
+            expected = hashlib.sha256(data).hexdigest()
+            real_open, real_read = os.open, os.read
+            reads = []
+
+            def direct_open(path, flags, *args):
+                return real_open(path, flags & ~os.O_DIRECT, *args)
+
+            def direct_readv(fd, buffers):
+                view = buffers[0]
+                chunk = real_read(fd, len(view))
+                view[:len(chunk)] = chunk
+                reads.append(len(chunk))
+                return len(chunk)
+
+            with (mock.patch.object(os, "open", direct_open),
+                  mock.patch.object(os, "readv", direct_readv)):
+                self.assertEqual(sync_models.sha256(p, len(data)), expected)
+            self.assertEqual(reads, [4 << 20] * 8)
+
+            def refuse_open(path, flags, *args):
+                if flags & os.O_DIRECT:
+                    raise OSError(errno.EINVAL, "O_DIRECT is refused")
+                return real_open(path, flags, *args)
+
+            with mock.patch.object(os, "open", refuse_open):
+                self.assertEqual(sync_models.sha256(p, len(data)), expected)
+            with (mock.patch.object(os, "open", direct_open),
+                  mock.patch.object(os, "readv", side_effect=OSError(errno.EINVAL, "direct read refused"))):
+                self.assertEqual(sync_models.sha256(p, len(data)), expected)
+            with (mock.patch.object(os, "open", direct_open),
+                  mock.patch.object(os, "readv", return_value=1)):
+                self.assertEqual(sync_models.sha256(p, len(data)), expected)
 
 
 if __name__ == "__main__":
