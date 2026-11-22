@@ -2851,16 +2851,11 @@ IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app a
 
 
 def card_free_mib(index: int | None, amd: bool = False) -> int | None:
-    """Free memory of one card in MiB, from the backend's reader (NVML, the amdgpu files); None when it cannot be read (nothing is refused for that)."""
+    """Free memory of one card in MiB, from the backend's reader (NVML, the amdgpu files; an integrated Intel GPU: what the system can still give
+    it, #6448) through telemetry.free_vram_mib; None when it cannot be read (nothing is refused for that)."""
     try:
-        from serve.telemetry import gpu_reader
-        g = gpu_reader(int(index or 0), amd=amd)
-        if not g.ok():
-            return None
-        r = g.read()
-        if r.get("mem_total") is None or r.get("mem_used") is None:
-            return None
-        return int((r["mem_total"] - r["mem_used"]) >> 20)
+        from serve.telemetry import free_vram_mib
+        return free_vram_mib(int(index or 0), amd=amd)
     except Exception:                                  # noqa: BLE001
         return None
 
@@ -4393,16 +4388,11 @@ class Service:
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from the backend's reader - NVML, the amdgpu sysfs files (#301) or
-        IOKit on macOS (Metal backend); None when it can't be read (then nothing is refused)."""
+        IOKit on macOS (Metal backend); on an integrated Intel GPU what the system can still give it (#6448) - through
+        telemetry.free_vram_mib; None when it can't be read (then nothing is refused)."""
         try:
-            from serve.telemetry import gpu_reader
-            g = gpu_reader(int(getattr(self, "gpu_index", 0) or 0), amd=getattr(self, "backend", None) == "hip")
-            if not g.ok():
-                return None
-            r = g.read()
-            if r.get("mem_total") is None or r.get("mem_used") is None:
-                return None
-            return int((r["mem_total"] - r["mem_used"]) >> 20)
+            from serve.telemetry import free_vram_mib
+            return free_vram_mib(int(getattr(self, "gpu_index", 0) or 0), amd=getattr(self, "backend", None) == "hip")
         except Exception:
             return None
 

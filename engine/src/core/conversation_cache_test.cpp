@@ -1239,5 +1239,39 @@ int main() {
             check(refused > 0 && evicted_any > 0 && pool.shrinks > 0, "the workload refused, evicted and trimmed the pool at least once");
         }
     }
+    {
+        // #2518: a slot carries every checkpoint that prefixes the prompt, not only the longest one.
+        auto chain = [](int32_t n) {
+            ConversationCheckpoint c;
+            c.ids.resize((size_t) n);
+            for (int32_t i = 0; i < n; ++i) c.ids[(size_t) i] = 100 + i;
+            c.gdn.assign(3, (uint8_t) n);        // distinguishable, so a copy is recognisable
+            return c;
+        };
+        std::vector<ConversationCheckpoint> checks{chain(4), chain(8), chain(12)};
+        std::vector<int32_t> live = chain(12).ids;
+        live.push_back(112);                     // the prompt goes on past the deepest checkpoint
+
+        std::vector<ConversationCheckpoint> kept = conversation_checkpoints_prefixing(checks, live, false);
+        check(kept.size() == 3, "#2518: every checkpoint that prefixes the prompt is carried, not only the longest");
+        check(kept[0].ids.size() == 4 && kept[1].ids.size() == 8 && kept[2].ids.size() == 12,
+              "#2518: the carried checkpoints keep the order and the lengths they had");
+        check(kept[2].gdn == checks[2].gdn && kept[2].gdn.data() != checks[2].gdn.data(),
+              "#2518: a carried checkpoint is a copy of the state, not a reference to it");
+
+        std::vector<int32_t> ends_at_eight = chain(8).ids;
+        std::vector<ConversationCheckpoint> shorter = conversation_checkpoints_prefixing(checks, ends_at_eight, false);
+        check(shorter.size() == 1 && shorter[0].ids.size() == 4,
+              "#2518: a checkpoint as long as the prompt is not a prefix of it");
+
+        ConversationCheckpoint diverging = chain(8);
+        diverging.ids[6] = -7;
+        std::vector<ConversationCheckpoint> mixed{chain(4), diverging};
+        check(conversation_checkpoints_prefixing(mixed, live, false).size() == 1,
+              "#2518: a checkpoint that diverges from the prompt is not carried");
+
+        check(conversation_checkpoints_prefixing(checks, live, true).empty(),
+              "#2518: an image prompt carries no checkpoints (its tokens do not match again)");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
