@@ -118,7 +118,6 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "OpenMOSS-Team/MOSS-Image-SFT": "f972bd4b4b9e3852133cc5da954d87bc32cd8fb9",                     # 2026-10-27
     "OpenMOSS-Team/MOSS-Image-Base": "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",                    # 2026-10-27
     "PedroMarinhoDev/Moss-Image-Edit-ComfyUI": "908d6308cf38fed82263f09e9a334070183a18f8",          # 2026-11-04
-    "akhaliq/MOSS-Image-Edit-HQ": "ee1493ba577437e70b88bc4499b85cc7aa4594ca",                       # 2026-11-04
     "unsloth/Qwen3.5-9B-GGUF": "3885219b6810b007914f3a7950a8d1b469d598a5",                          # 2026-10-26
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
     "circlestone-labs/Anima": "f973fc41ec7545364ac9776c2440285f43ff2a30",                          # 2026-11-02
@@ -292,15 +291,6 @@ TERMS: dict[str, dict] = {
             ("gh:Chenkin-x/Moss-Image-Edit",
              "d735569c936ebbfaf274bee5cbff4297c533d133", "LICENSE", 35149,
              "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"),
-            ("hf:OpenMOSS-Team/MOSS-Image-SFT",
-             "f972bd4b4b9e3852133cc5da954d87bc32cd8fb9", "LICENSE", 11358,
-             "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
-        ],
-    },
-    "akhaliq/MOSS-Image-Edit-HQ": {
-        "license": "Apache License",
-        "card": "apache-2.0",
-        "texts": [
             ("hf:OpenMOSS-Team/MOSS-Image-SFT",
              "f972bd4b4b9e3852133cc5da954d87bc32cd8fb9", "LICENSE", 11358,
              "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
