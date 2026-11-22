@@ -328,7 +328,7 @@ public:
     bool mpp_ok = false;       // hy4_mpp.metal / hy4_mppq.metal compiled (Metal 4 matmul2d): prefill GEMMs through an fp16 dequantised scratch
     bool mpp_flash_ok = false; // hy4_mppflash.metal compiled (Metal 4 matmul2d Flash-MLA)
     bool mpp_flash_on = true;  // use mla_flash_mpp when mpp_flash_ok (--no-mpp-flash to force simdgroup_matrix mla_flash)
-    bool mpp_dec_attn = false; // split-K MPP Flash-MLA for decode/verify (--mpp-dec-attn)
+    bool mpp_dec_attn = true;  // split-K MPP Flash-MLA for decode/verify + Tree-8 (3.2x faster at M=6, 6/6 bit-identical; --no-mpp-dec-attn for A/B)
     int mpp_min = 96;          // use it from this many tokens
     Buffer wscr;               // dequantised weight scratch [N][K] half
     bool flash_on = true;      // K-streamed Flash-MLA (mla_flash_mpp / mla_flash) for prefill chunks of >= 16 tokens (--no-flash to disable)
@@ -337,8 +337,9 @@ public:
     int moe_mm_min = 64;       // MoE prefill through the MPP grouped GEMM from this many tokens (needs mpp_ok)
     int moe_tn_arg = 64;       // MPP MoE N tile (64 default, 32 for A/B)
     int moe_tm_arg = 0;        // MPP MoE M tile override (0 = auto)
+    bool moe_bucket = true;    // multi-size (128/64/32/16) bucketed MPP MoE with 2x weight reuse on 128-row tiles (--no-moe-bucket for A/B)
     int mpp_tile_arg = 0;      // MPP dense GEMM tile override: 0=128x64 (default), 64=64x64, 128=128x128
-    Buffer m_srt, m_pos, m_tiles, m_meta, m_xs, m_hs, m_y;
+    Buffer m_srt, m_pos, m_tiles, m_t128, m_t64, m_t32, m_t16, m_meta, m_xs, m_hs, m_y;
     Buffer hc_part;            // partials of the split iHC mix [T<=8][24][9]
     bool hc_split = true;
     Buffer attn_ws;            // split-K attention partials [T<=8][64][S<=16][514] floats
@@ -501,10 +502,9 @@ public:
             else if (sm_verify && M >= 1 && M <= 8 && (t.fmt == 4 || t.fmt == 5 || t.fmt == 6 || t.fmt == 8)) {
                 add("linear_sm_" + f, (N + 31) / 32, 1, 128, a);
             } else if (lin2 && M >= 1 && M <= 8 && (t.fmt == 4 || t.fmt == 5 || t.fmt == 6 || t.fmt == 8)) {
-                // row-blocked GEMV (hy4_lin2.metal): R rows per simdgroup, MT == M tokens
+                // row-blocked GEMV (hy4_lin2.metal): R=1 is optimal for pure-ALU sk_w8_f4 on M5 Max (bitwise M-invariant)
                 int R = 1;
                 if (lin2_r > 0) R = lin2_r == 3 ? 1 : lin2_r;
-                if (R == 2 && M > 2) R = 1;
                 add("linear_skr_" + f + "_" + std::to_string(M) + "_" + std::to_string(R), (N + 8 * R - 1) / (8 * R), 1, 256, a);
             } else add(std::string("linear_sk_") + f + (M == 1 ? "_1" : "_8"), (N + 7) / 8, 1, 256, a);
         }
@@ -557,12 +557,16 @@ public:
             wscr_elems = (size_t) 16384 * 3072;
             if (mpp_ok) wscr = cx.alloc(wscr_elems * 2);
             if (mpp_ok) {
-                const size_t P = (size_t) Tc * 16, tm_alloc = (size_t) std::max(moe_tm(Tc), moe_tm_arg);
+                const size_t P = (size_t) Tc * 16, tm_alloc = (size_t) std::max({64, moe_tm(Tc), moe_tm_arg});
                 const size_t rows_max = P + 512 * tm_alloc;
                 m_srt = cx.alloc(rows_max * 4);
                 m_pos = cx.alloc(P * 4);
                 m_tiles = cx.alloc((P / 16 + 512 + 8) * 8);
-                m_meta = cx.alloc(64);
+                m_t128 = cx.alloc((P / 128 + 512 + 8) * 8);
+                m_t64  = cx.alloc((512 + 8) * 8);
+                m_t32  = cx.alloc((512 + 8) * 8);
+                m_t16  = cx.alloc((512 + 8) * 8);
+                m_meta = cx.alloc(128);
                 m_xs = cx.alloc(rows_max * 1536 * 2);
                 m_hs = cx.alloc(rows_max * 1536 * 2);
                 m_y = cx.alloc(rows_max * 1536 * 4);
@@ -713,11 +717,14 @@ public:
             const double tw0 = now_s();
             const std::string kv0 = L(0) + ".self_attn.kv_b_proj.weight";
             const int f0 = g.ti(kv0).fmt;
-            add("split_kvb_t_" + std::to_string(f0), heads(0) * 448, 1, 128, {g.tw(kv0), B(wk_scr), B(wv_scr)});
+            add("split_kvb_t_" + std::to_string(f0), heads(0) * 448, 1, 64, {g.tw(kv0), B(wk_scr), B(wv_scr)});
             (void) P("router_topk_fast");
             (void) P("idx_score_sg");
+            (void) P("hc_mix_blk");
             if (mpp_flash_ok) {
                 (void) P("mla_flash_mpp");
+                (void) P("mla_flash_mpp_part");
+                (void) P("mla_flash_mpp_part_tree");
                 (void) P("mla_prep_q_mpp");
                 (void) P("mla_vup_mpp");
             }
@@ -725,10 +732,15 @@ public:
                 (void) P("mpp_mm_64_64_4");
                 (void) P("mpp_mm_128_64_4");
                 (void) P("mpp_mm_128_128_4");
+                (void) P("moe_plan_b");
+                (void) P("moe_mm_gu_16_64_2");
+                (void) P("moe_mm_dn_16_64_2");
                 (void) P("moe_mm_gu_32_64_4");
                 (void) P("moe_mm_dn_32_64_4");
                 (void) P("moe_mm_gu_64_64_4");
                 (void) P("moe_mm_dn_64_64_4");
+                (void) P("moe_mm_gu2_64_32_4");
+                (void) P("moe_mm_dn2_64_64_4");
             }
             run_all();
             gpu_total = 0;
@@ -862,7 +874,10 @@ public:
             lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
             int G = (p0 + tree->max_depth() + 1) / 4;
             if (G < 1) G = 1;
-            add("idx_score_tree", (G + 63) / 64, T, 64, {B(iq_h), B(hw_f), B(pooled[il]), B(tmp_pooled), B(score), I(p0), Arg::V<TreeArgs>(ta), I(G), I((int) ldS), Fl(1.0f / sqrtf((float) (128 * 16)))});
+            if (idxsg_on)
+                add("idx_score_sg_tree", (G + 63) / 64, T, 128, {B(iq_h), B(hw_f), B(pooled[il]), B(tmp_pooled), B(score), I(p0), Arg::V<TreeArgs>(ta), I(G), I((int) ldS), Fl(1.0f / sqrtf((float) (128 * 16)))});
+            else
+                add("idx_score_tree", (G + 63) / 64, T, 64, {B(iq_h), B(hw_f), B(pooled[il]), B(tmp_pooled), B(score), I(p0), Arg::V<TreeArgs>(ta), I(G), I((int) ldS), Fl(1.0f / sqrtf((float) (128 * 16)))});
             int n_top = index_topk / c.kpool - 1;
             add("idx_select_tree", T, 1, 256, {B(score), I((int) ldS), I(p0), Arg::V<TreeArgs>(ta), I(n_top), I(index_topk), B(keys), B(nkeys)});
             return;
@@ -958,7 +973,10 @@ public:
                                                   I(want_f ? 1 : 0)});
             return;
         }
-        add("hc_mix", T, 1, 256, {B(x), g.tw(hp + ".hc_fn"), g.tw(hp + ".hc_scale"), g.tw(hp + ".hc_base"), B(pre), B(post), I(8), Fl(c.rms_eps), Fl(c.hc_eps), Fl(c.hc_mag)});
+        if (T >= 16)
+            add("hc_mix_blk", (T + 3) / 4, 1, 256, {B(x), g.tw(hp + ".hc_fn"), g.tw(hp + ".hc_scale"), g.tw(hp + ".hc_base"), B(pre), B(post), I(8), I(T), Fl(c.rms_eps), Fl(c.hc_eps), Fl(c.hc_mag)});
+        else
+            add("hc_mix", T, 1, 256, {B(x), g.tw(hp + ".hc_fn"), g.tw(hp + ".hc_scale"), g.tw(hp + ".hc_base"), B(pre), B(post), I(8), Fl(c.rms_eps), Fl(c.hc_eps), Fl(c.hc_mag)});
         op("hc_mix");
         add("hc_reduce_norm", T, 1, 256, {B(x), B(pre), g.tw(norm_w), B(cur_h), B(cur_f), Fl(c.rms_eps), I(want_f ? 1 : 0)});
     }
@@ -993,7 +1011,7 @@ public:
             add("mla_prep_q_dec_" + std::to_string(kvb_fmt) + "_" + std::to_string(T), NH, 2, 256,
                 {g.tw(kvb_nm), B(F2), B(qa_h), I(T), I(NH), I(p0), Fl((float) theta(il))});
         } else {
-            add("split_kvb_t_" + std::to_string(kvb_fmt), NH * 448, 1, 128, {g.tw(kvb_nm), B(wk_scr), B(wv_scr)});
+            add("split_kvb_t_" + std::to_string(kvb_fmt), NH * 448, 1, 64, {g.tw(kvb_nm), B(wk_scr), B(wv_scr)});
             Dispatch dq;
             if (mpp_flash_ok && mpp_flash_on && T >= 32) {
                 dq.p = &P("mla_prep_q_mpp");
@@ -1032,10 +1050,17 @@ public:
         a.kmax = index_topk;
         a.scale = 0.0625f;
         if (is_tree) {
-            const int S = std::max(1, std::min(split_max > 0 ? split_max : 1, NH == 32 ? 8 : 4));
+            const bool use_mpp_part = mpp_flash_ok && mpp_dec_attn && NH % 16 == 0;
+            const int S = use_mpp_part ? std::max(1, std::min(16, (split_max > 0 ? split_max : 1) * 2))
+                                       : std::max(1, std::min(split_max > 0 ? split_max : 1, NH == 32 ? 8 : 4));
             Dispatch dd;
-            dd.p = &P("mla_attend_part_tree");
-            dd.grid[0] = NH; dd.grid[1] = S; dd.grid[2] = T; dd.tg[0] = 256;
+            if (use_mpp_part) {
+                dd.p = &P("mla_flash_mpp_part_tree");
+                dd.grid[0] = NH / 16; dd.grid[1] = S; dd.grid[2] = T; dd.tg[0] = 128;
+            } else {
+                dd.p = &P("mla_attend_part_tree");
+                dd.grid[0] = NH; dd.grid[1] = S; dd.grid[2] = T; dd.tg[0] = 256;
+            }
             dd.args = {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(attn_ws), Arg::V<MlaArgs>(a), B(keys), B(nkeys), I(S), Arg::V<TreeArgs>(ta)};
             ds.push_back(std::move(dd));
             add("mla_attend_merge", NH, T, 256, {B(attn_ws), B(ctx_h), Arg::V<MlaArgs>(a), I(S)});
@@ -1044,9 +1069,10 @@ public:
         else if (flash_on && T >= 16 && NH % 16 == 0)
             add("mla_flash_sg16", NH / 16, T, 256, {B(qa_h), B(kcache[il]), g.tw(pa + ".learnable_sink_param"), B(ctx_h), Arg::V<MlaArgs>(a), B(keys), B(nkeys)});
         else if (T <= 8 && split_max > 0) {
-            const int S = std::min(split_max, NH == 32 ? 8 : 4);
+            const bool use_mpp_part = mpp_flash_ok && mpp_dec_attn && NH % 16 == 0;
+            const int S = use_mpp_part ? std::min(16, split_max * 2) : std::min(split_max, NH == 32 ? 8 : 4);
             Dispatch dd;
-            if (mpp_flash_ok && mpp_dec_attn && NH % 16 == 0) {
+            if (use_mpp_part) {
                 dd.p = &P("mla_flash_mpp_part");
                 dd.grid[0] = NH / 16; dd.grid[1] = S; dd.grid[2] = T; dd.tg[0] = 128;
             } else {
@@ -1154,17 +1180,49 @@ public:
             ds.back().indirect = &m2_meta; ds.back().ind_off = 8;
             add("moe_reduce_h", T, 1, 256, {B(moe_y), B(z_h)});
         } else if (mpp_ok && T >= moe_mm_min) {
-            const int Pn = T * 16, TM = moe_tm_arg > 0 ? moe_tm_arg : moe_tm(T), TN = moe_tn_arg;
-            const int SG = (TM == 64 || (TM == 32 && TN == 64)) ? 4 : 2;
-            const std::string tag = std::to_string(TM) + "_" + std::to_string(TN) + "_" + std::to_string(SG);
-            add("moe_plan", 1, 1, 512, {B(moe_idx), I(Pn), I(TM), B(m_srt), B(m_pos), B(m_tiles), B(m_meta), I(1536 / TN), I(1536 / TN)});
-            add("moe_gather", 1, 1, 256, {B(z_h), B(m_srt), B(m_xs)});
-            ds.back().indirect = &m_meta; ds.back().ind_off = 32;
-            add("moe_mm_gu_" + tag, 1, 1, SG * 32, {sec4, exl, B(m_xs), B(m_hs), B(m_tiles)});
-            ds.back().indirect = &m_meta; ds.back().ind_off = 8;
-            add("moe_mm_dn_" + tag, 1, 1, SG * 32, {sec4, exl, B(m_hs), B(m_y), B(m_tiles)});
-            ds.back().indirect = &m_meta; ds.back().ind_off = 20;
-            add("moe_combine_h", T, 1, 256, {B(m_y), B(m_pos), B(moe_w), B(z_h)});
+            const int Pn = T * 16;
+            if (moe_bucket && moe_tm_arg == 0 && moe_tn_arg == 64) {
+                add("moe_plan_b", 1, 1, 512, {B(moe_idx), I(Pn), B(m_srt), B(m_pos), B(m_t128), B(m_t64), B(m_t32), B(m_t16), B(m_meta), I(1536 / 32), I(1536 / 64), I(1536 / 64)});
+                add("moe_gather", 1, 1, 256, {B(z_h), B(m_srt), B(m_xs)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 0;
+                // Gate+Up buckets write disjoint rows of m_hs: run concurrently with no inter-bucket barrier!
+                add("moe_mm_gu2_64_32_4", 1, 1, 128, {sec4, exl, B(m_xs), B(m_hs), B(m_t128)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 12;
+                add("moe_mm_gu_64_64_4", 1, 1, 128, {sec4, exl, B(m_xs), B(m_hs), B(m_t64)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 36;
+                ds.back().barrier = false;
+                add("moe_mm_gu_32_64_4", 1, 1, 128, {sec4, exl, B(m_xs), B(m_hs), B(m_t32)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 60;
+                ds.back().barrier = false;
+                add("moe_mm_gu_16_64_2", 1, 1, 64, {sec4, exl, B(m_xs), B(m_hs), B(m_t16)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 84;
+                ds.back().barrier = false;
+                // Down buckets write disjoint rows of m_y: run concurrently with no inter-bucket barrier!
+                add("moe_mm_dn2_64_64_4", 1, 1, 128, {sec4, exl, B(m_hs), B(m_y), B(m_t128)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 24;
+                add("moe_mm_dn_64_64_4", 1, 1, 128, {sec4, exl, B(m_hs), B(m_y), B(m_t64)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 48;
+                ds.back().barrier = false;
+                add("moe_mm_dn_32_64_4", 1, 1, 128, {sec4, exl, B(m_hs), B(m_y), B(m_t32)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 72;
+                ds.back().barrier = false;
+                add("moe_mm_dn_16_64_2", 1, 1, 64, {sec4, exl, B(m_hs), B(m_y), B(m_t16)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 96;
+                ds.back().barrier = false;
+                add("moe_combine_h", T, 1, 256, {B(m_y), B(m_pos), B(moe_w), B(z_h)});
+            } else {
+                const int TM = moe_tm_arg > 0 ? moe_tm_arg : moe_tm(T), TN = moe_tn_arg;
+                const int SG = (TM == 64 || (TM == 32 && TN == 64)) ? 4 : 2;
+                const std::string tag = std::to_string(TM) + "_" + std::to_string(TN) + "_" + std::to_string(SG);
+                add("moe_plan", 1, 1, 512, {B(moe_idx), I(Pn), I(TM), B(m_srt), B(m_pos), B(m_tiles), B(m_meta), I(1536 / TN), I(1536 / TN)});
+                add("moe_gather", 1, 1, 256, {B(z_h), B(m_srt), B(m_xs)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 32;
+                add("moe_mm_gu_" + tag, 1, 1, SG * 32, {sec4, exl, B(m_xs), B(m_hs), B(m_tiles)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 8;
+                add("moe_mm_dn_" + tag, 1, 1, SG * 32, {sec4, exl, B(m_hs), B(m_y), B(m_tiles)});
+                ds.back().indirect = &m_meta; ds.back().ind_off = 20;
+                add("moe_combine_h", T, 1, 256, {B(m_y), B(m_pos), B(moe_w), B(z_h)});
+            }
             op("moe_experts");
         } else {
             if (T <= pair_max) {
@@ -1245,7 +1303,7 @@ public:
                 if (emeta.layers[j] == il) mo = j;
             if (mo >= 0 && engram_ready) {
                 if (!eng_prepped) {
-                    if (T > 8 && !seg_mode && !g.cold_experts && !ds.empty()) {
+                    if (T >= 2 && !seg_mode && !g.cold_experts && !ds.empty()) {
                         void* tk = cx.run_graph_async(ds);
                         ds.clear();
                         const bool ok = engram_prep(tok_all, p0, T, err, tree);
@@ -1429,9 +1487,9 @@ static int export_tokenizer(const std::string& file, const std::string& dir) {
 
 int main(int argc, char** argv) {
     std::string model, engram, tok_path, out_dir = ".", kernels;
-    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_mpp_flash = false, mpp_dec_attn = false, no_qkvb = false, no_idxsg = false, sm_verify = false, force_cold = false, no_hcsplit = false, prof3 = false;
+    bool load_only = false, dump = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false, warm = false, seg = false, no_mpp = false, no_relax = false, no_flash = false, no_mpp_flash = false, mpp_dec_attn = true, no_qkvb = false, no_idxsg = false, sm_verify = false, force_cold = false, no_hcsplit = false, prof3 = false;
     int gen = 0, max_ctx = 0, chunk = 0, index_topk = 2048, pair_max = 4, n_layers_run = 42, mpp_min_arg = 96, moe_mm_min_arg = 64, moe_tn_arg = 64, moe_tm_arg = 0, mpp_tile_arg = 0, split_arg = 8, mm_min_arg = 16, ab_rounds = 0, bench_m = 0, par_m = 0, lin2_r_arg = 0;
-    bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false, no_pipe = false;
+    bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false, no_pipe = false, no_moe_bucket = false;
     int pipe_segs_arg = 8;
     bool serve = false, session_reuse = false;
     int ring_slack_arg = -1, conv_slots_arg = -1, conv_mib_arg = 16384, conv_min_arg = 1024, spill_mib_arg = 32768;
@@ -1475,8 +1533,10 @@ int main(int argc, char** argv) {
         else if (a == "--no-flash") no_flash = true;
         else if (a == "--no-mpp-flash") no_mpp_flash = true;
         else if (a == "--mpp-dec-attn") mpp_dec_attn = true;
+        else if (a == "--no-mpp-dec-attn") mpp_dec_attn = false;
         else if (a == "--moe-tn") moe_tn_arg = atoi(nxt().c_str());
         else if (a == "--moe-tm") moe_tm_arg = atoi(nxt().c_str());
+        else if (a == "--no-moe-bucket") no_moe_bucket = true;
         else if (a == "--mpp-tile") mpp_tile_arg = atoi(nxt().c_str());
         else if (a == "--no-qkvb") no_qkvb = true;
         else if (a == "--no-idxsg") no_idxsg = true;
@@ -1682,6 +1742,7 @@ int main(int argc, char** argv) {
     r.mpp_dec_attn = mpp_dec_attn;
     r.moe_tn_arg = moe_tn_arg;
     r.moe_tm_arg = moe_tm_arg;
+    r.moe_bucket = !no_moe_bucket;
     r.mpp_tile_arg = mpp_tile_arg;
     r.qkvb_on = !no_qkvb;
     r.idxsg_on = !no_idxsg;

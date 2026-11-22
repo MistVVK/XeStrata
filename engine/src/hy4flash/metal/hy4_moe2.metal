@@ -9,10 +9,13 @@
 kernel void moe2_plan(device const int* idx [[buffer(0)]], constant int& P [[buffer(1)]], device int* uexp [[buffer(2)]], device int* ucnt [[buffer(3)]], device int* upair [[buffer(4)]],
                       device uint* meta [[buffer(5)]], uint e [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup int sums[16];
+    threadgroup int s_idx[128];
+    if ((int) e < P) s_idx[e] = idx[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     int mine[8];
     int c = 0;
     for (int i = 0; i < P; ++i)
-        if (idx[i] == (int) e && c < 8) mine[c++] = i;
+        if (s_idx[i] == (int) e && c < 8) mine[c++] = i;
     const int has = c > 0 ? 1 : 0;
     const int ex = simd_prefix_exclusive_sum(has);
     if (lane == 31) sums[sg] = ex + has;
@@ -36,39 +39,50 @@ kernel void moe2_plan(device const int* idx [[buffer(0)]], constant int& P [[buf
 }
 
 template <int F, int NT>
-static inline void m2_gu_rows(device const uchar* rg, device const uchar* ru, device const half* z, thread const int* tk, int lane, thread float* ag, thread float* au) {
+static inline void m2_gu_rows(device const uchar* rg, device const uchar* ru, device const half* z, thread const int* tk, uint tid, int lane, threadgroup half* sx, thread float* ag, thread float* au) {
     constexpr int SB = sk_sb_bytes(F);
-    constexpr float H = sk_half(F);
-    for (int unit = lane; unit < 6 * 32; unit += 32) {
-        const int sbi = unit >> 5, u = unit & 31, g = u >> 3, j = (g << 6) + ((u & 7) << 3);
+    const int g = lane >> 3, j = (g << 6) + ((lane & 7) << 3);
+    for (int sbi = 0; sbi < 6; ++sbi) {
+        if (NT >= 2) {
+            // Cooperatively stage sbi's 256 halves for all NT tokens into threadgroup memory (<= 4 KB) -> 8x fewer device loads!
+            for (int idx = int(tid); idx < NT * 64; idx += 256) {
+                const int t = idx >> 6, c4 = (idx & 63) << 2;
+                *((threadgroup half4*) (sx + t * 256 + c4)) = *((device const half4*) (z + (size_t) tk[t] * 1536 + sbi * 256 + c4));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         device const uchar* bg = rg + (size_t) sbi * SB;
         device const uchar* bu = ru + (size_t) sbi * SB;
         const float effg = float(as_type<half>(*((device const ushort*) bg))) * (float(bg[2 + g]) * (1.0f / 255.0f));
         const float effu = float(as_type<half>(*((device const ushort*) bu))) * (float(bu[2 + g]) * (1.0f / 255.0f));
-        int qg[8], qu[8];
-        sk_q8<F>(bg + 6, j, qg);
-        sk_q8<F>(bu + 6, j, qu);
-        const float4 wg0 = float4(float(qg[0]), float(qg[1]), float(qg[2]), float(qg[3])) - H;
-        const float4 wg1 = float4(float(qg[4]), float(qg[5]), float(qg[6]), float(qg[7])) - H;
-        const float4 wu0 = float4(float(qu[0]), float(qu[1]), float(qu[2]), float(qu[3])) - H;
-        const float4 wu1 = float4(float(qu[4]), float(qu[5]), float(qu[6]), float(qu[7])) - H;
-        for (int t = 0; t < NT; ++t) {
-            device const half4* x4 = (device const half4*) (z + (size_t) tk[t] * 1536 + sbi * 256 + j);
+        float4 wg0, wg1, wu0, wu1;
+        sk_w8_f4<F>(bg + 6, j, wg0, wg1);
+        sk_w8_f4<F>(bu + 6, j, wu0, wu1);
+        if (NT == 1) {
+            device const half4* x4 = (device const half4*) (z + (size_t) tk[0] * 1536 + sbi * 256 + j);
             const float4 xa = float4(x4[0]), xb = float4(x4[1]);
-            ag[t] = fma(effg, dot(wg0, xa) + dot(wg1, xb), ag[t]);
-            au[t] = fma(effu, dot(wu0, xa) + dot(wu1, xb), au[t]);
+            ag[0] = fma(effg, dot(wg0, xa) + dot(wg1, xb), ag[0]);
+            au[0] = fma(effu, dot(wu0, xa) + dot(wu1, xb), au[0]);
+        } else {
+            for (int t = 0; t < NT; ++t) {
+                threadgroup const half4* x4 = (threadgroup const half4*) (sx + t * 256 + j);
+                const float4 xa = float4(x4[0]), xb = float4(x4[1]);
+                ag[t] = fma(effg, dot(wg0, xa) + dot(wg1, xb), ag[t]);
+                au[t] = fma(effu, dot(wu0, xa) + dot(wu1, xb), au[t]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 }
 template <int NT>
-static inline void m2_gu_code(int code, device const uchar* rg, device const uchar* ru, device const half* z, thread const int* tk, int lane, thread float* ag, thread float* au) {
+static inline void m2_gu_code(int code, device const uchar* rg, device const uchar* ru, device const half* z, thread const int* tk, uint tid, int lane, threadgroup half* sx, thread float* ag, thread float* au) {
     switch (code) {
-        case 2: m2_gu_rows<2, NT>(rg, ru, z, tk, lane, ag, au); break;
-        case 3: m2_gu_rows<3, NT>(rg, ru, z, tk, lane, ag, au); break;
-        case 4: m2_gu_rows<4, NT>(rg, ru, z, tk, lane, ag, au); break;
-        case 5: m2_gu_rows<5, NT>(rg, ru, z, tk, lane, ag, au); break;
-        case 6: m2_gu_rows<6, NT>(rg, ru, z, tk, lane, ag, au); break;
-        case 8: m2_gu_rows<8, NT>(rg, ru, z, tk, lane, ag, au); break;
+        case 2: m2_gu_rows<2, NT>(rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        case 3: m2_gu_rows<3, NT>(rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        case 4: m2_gu_rows<4, NT>(rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        case 5: m2_gu_rows<5, NT>(rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        case 6: m2_gu_rows<6, NT>(rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        case 8: m2_gu_rows<8, NT>(rg, ru, z, tk, tid, lane, sx, ag, au); break;
         default: break;
     }
 }
@@ -77,6 +91,7 @@ static inline void m2_gu_code(int code, device const uchar* rg, device const uch
 kernel void moe2_gu(device const uchar* sec4 [[buffer(0)]], device const ExpertDev* ex [[buffer(1)]], device const half* z [[buffer(2)]], device const int* uexp [[buffer(3)]],
                     device const int* ucnt [[buffer(4)]], device const int* upair [[buffer(5)]], device const uint* meta [[buffer(6)]], device half* h2 [[buffer(7)]], uint2 tgp [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup half sx[8 * 256]; // 4096 B
     const int y = int(tgp.y);
     if (y >= int(meta[0])) return;
     const uint sg = tid >> 5, lane = tid & 31;
@@ -97,14 +112,14 @@ kernel void moe2_gu(device const uchar* sec4 [[buffer(0)]], device const ExpertD
     float ag[8], au[8];
     for (int i = 0; i < 8; ++i) { ag[i] = 0.f; au[i] = 0.f; }
     switch (n) {
-        case 1: m2_gu_code<1>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
-        case 2: m2_gu_code<2>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
-        case 3: m2_gu_code<3>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
-        case 4: m2_gu_code<4>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
-        case 5: m2_gu_code<5>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
-        case 6: m2_gu_code<6>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
-        case 7: m2_gu_code<7>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
-        default: m2_gu_code<8>(ed.gu_code, rg, ru, z, tk, lane, ag, au); break;
+        case 1: m2_gu_code<1>(ed.gu_code, rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        case 2: m2_gu_code<2>(ed.gu_code, rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        case 3: m2_gu_code<3>(ed.gu_code, rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        case 4: m2_gu_code<4>(ed.gu_code, rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        case 5: m2_gu_code<5>(ed.gu_code, rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        case 6: m2_gu_code<6>(ed.gu_code, rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        case 7: m2_gu_code<7>(ed.gu_code, rg, ru, z, tk, tid, lane, sx, ag, au); break;
+        default: m2_gu_code<8>(ed.gu_code, rg, ru, z, tk, tid, lane, sx, ag, au); break;
     }
     const float sq = float(sqx[r]);
     for (int i = 0; i < 8; ++i) {
@@ -121,15 +136,12 @@ kernel void moe2_gu(device const uchar* sec4 [[buffer(0)]], device const ExpertD
 template <int F, int NT>
 static inline void m2_dn_rows(device const uchar* rp, device const half* h2, thread const int* pid, int lane, thread float* acc) {
     constexpr int SB = sk_sb_bytes(F);
-    constexpr float H = sk_half(F);
-    for (int unit = lane; unit < 6 * 32; unit += 32) {
-        const int sbi = unit >> 5, u = unit & 31, g = u >> 3, j = (g << 6) + ((u & 7) << 3);
+    const int g = lane >> 3, j = (g << 6) + ((lane & 7) << 3);
+    for (int sbi = 0; sbi < 6; ++sbi) {
         device const uchar* blk = rp + (size_t) sbi * SB;
         const float eff = float(as_type<half>(*((device const ushort*) blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
-        int q[8];
-        sk_q8<F>(blk + 6, j, q);
-        const float4 w0 = float4(float(q[0]), float(q[1]), float(q[2]), float(q[3])) - H;
-        const float4 w1 = float4(float(q[4]), float(q[5]), float(q[6]), float(q[7])) - H;
+        float4 w0, w1;
+        sk_w8_f4<F>(blk + 6, j, w0, w1);
         for (int t = 0; t < NT; ++t) {
             device const half4* x4 = (device const half4*) (h2 + (size_t) pid[t] * 1536 + sbi * 256 + j);
             acc[t] = fma(eff, dot(w0, float4(x4[0])) + dot(w1, float4(x4[1])), acc[t]);

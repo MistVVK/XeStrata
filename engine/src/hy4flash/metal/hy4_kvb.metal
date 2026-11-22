@@ -12,34 +12,32 @@ kernel void mla_prep_q_dec(device const uchar* kvb [[buffer(0)]], device const f
                            constant int& M [[buffer(3)]], constant int& NH [[buffer(4)]], constant int& p0 [[buffer(5)]], constant float& theta [[buffer(6)]],
                            uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     constexpr int SB = sk_sb_bytes(F);
-    constexpr float H = sk_half(F);
     const int h = int(tgp.x), s = int(tgp.y);
     const uint wave = tid >> 5, lane = tid & 31u;
     const int g = int(lane >> 3);
     const int j = int(lane << 3);
     threadgroup float red[8][256];
 
-    float acc[MT][8];
-    for (int m = 0; m < MT; ++m)
-        for (int k = 0; k < 8; ++k) acc[m][k] = 0.0f;
+    float4 acc0[MT], acc1[MT];
+    for (int m = 0; m < MT; ++m) { acc0[m] = float4(0.0f); acc1[m] = float4(0.0f); }
 
     for (int ii = 0; ii < 24; ++ii) {
         const int i = int(wave) * 24 + ii;
         device const uchar* blk = kvb + ((size_t) h * 448 + i) * (2 * SB) + (size_t) s * SB;
         const float D = float(as_type<half>(*((device const ushort*) blk)));
         const float eff = D * (float(blk[2 + g]) * (1.0f / 255.0f));
-        int q[8];
-        sk_q8<F>(blk + 6, j, q);
-        float qh[8];
-        for (int k = 0; k < 8; ++k) qh[k] = float(q[k]) - H;
+        float4 w0, w1;
+        sk_w8_f4<F>(blk + 6, j, w0, w1);
         for (int m = 0; m < MT; ++m) {
             const float qe = q_b[((size_t) m * NH + h) * 256 + i] * eff;
-            for (int k = 0; k < 8; ++k) acc[m][k] = fma(qe, qh[k], acc[m][k]);
+            acc0[m] = fma(float4(qe), w0, acc0[m]);
+            acc1[m] = fma(float4(qe), w1, acc1[m]);
         }
     }
 
     for (int m = 0; m < MT; ++m) {
-        for (int k = 0; k < 8; ++k) red[wave][j + k] = acc[m][k];
+        *((threadgroup float4*) (red[wave] + j)) = acc0[m];
+        *((threadgroup float4*) (red[wave] + j + 4)) = acc1[m];
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float v = red[0][tid] + red[1][tid] + red[2][tid] + red[3][tid] + red[4][tid] + red[5][tid] + red[6][tid] + red[7][tid];
         qa[((size_t) m * NH + h) * MLA_ROW + s * 256 + int(tid)] = half(v);
@@ -64,7 +62,6 @@ kernel void mla_vup_dec(device const uchar* kvb [[buffer(0)]], device const half
                         constant int& M [[buffer(4)]], constant int& NH [[buffer(5)]],
                         uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     constexpr int SB = sk_sb_bytes(F);
-    constexpr float H = sk_half(F);
     const int h = int(tgp.x);
     const uint sg = tid >> 5, lane = tid & 31u;
     const int row_j = int(tgp.y) * 8 + int(sg);
@@ -86,10 +83,8 @@ kernel void mla_vup_dec(device const uchar* kvb [[buffer(0)]], device const half
         device const uchar* blk = rp + (size_t) s * SB;
         const float D = float(as_type<half>(*((device const ushort*) blk)));
         const float eff = D * (float(blk[2 + g]) * (1.0f / 255.0f));
-        int q[8];
-        sk_q8<F>(blk + 6, k0, q);
-        const float4 w0 = float4(float(q[0]), float(q[1]), float(q[2]), float(q[3])) - H;
-        const float4 w1 = float4(float(q[4]), float(q[5]), float(q[6]), float(q[7])) - H;
+        float4 w0, w1;
+        sk_w8_f4<F>(blk + 6, k0, w0, w1);
         for (int m = 0; m < MT; ++m) {
             threadgroup const half4* xp = (threadgroup const half4*) (sc[m] + s * 256 + k0);
             const float d = dot(w0, float4(xp[0])) + dot(w1, float4(xp[1]));
@@ -120,7 +115,7 @@ INST_KVB_F(8)
 // ================================================================ 2. Single-layer scratch dequant + per-head prefill GEMM ================================================
 
 // Dequantizes kv_b_proj [NH*448][512] into wk_t [NH][512][192] (transposed for GEMM A@B^T!) and wv [NH][256][512] half.
-// Grid (NH * 448), 128 threads.
+// Grid (NH * 448), 64 threads (1 thread per 8 weights using constant-cache LUT sk_w8_f4).
 template <int F>
 kernel void split_kvb_t(device const uchar* W [[buffer(0)]], device half* wk_t [[buffer(1)]], device half* wv [[buffer(2)]],
                         uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint nthr [[threads_per_threadgroup]]) {
@@ -128,23 +123,27 @@ kernel void split_kvb_t(device const uchar* W [[buffer(0)]], device half* wk_t [
     const int j = int(r) % 448;
     constexpr int SB = sk_sb_bytes(F);
     device const uchar* rp = W + (size_t) r * 2 * SB;
-    if (j < 192) {
-        device half* dst = wk_t + (size_t) h * 512 * 192 + j;
-        for (uint k = tid; k < 512; k += nthr) {
-            device const uchar* blk = rp + (size_t) (k >> 8) * SB;
-            const float D = h2f_bits(ld16(blk));
-            const int i = int(k & 255u);
-            const float eff = D * (float(blk[2 + (i >> 6)]) * (1.0f / 255.0f));
-            dst[(size_t) k * 192] = half((float(sk_q<F>(blk + 6, i)) - sk_half(F)) * eff);
-        }
-    } else {
-        device half* dst = wv + ((size_t) h * 256 + (j - 192)) * 512;
-        for (uint k = tid; k < 512; k += nthr) {
-            device const uchar* blk = rp + (size_t) (k >> 8) * SB;
-            const float D = h2f_bits(ld16(blk));
-            const int i = int(k & 255u);
-            const float eff = D * (float(blk[2 + (i >> 6)]) * (1.0f / 255.0f));
-            dst[k] = half((float(sk_q<F>(blk + 6, i)) - sk_half(F)) * eff);
+    for (uint u = tid; u < 64u; u += nthr) {
+        const uint sb = u >> 5;
+        const int i = int((u & 31u) << 3);
+        const int g = i >> 6;
+        device const uchar* blk = rp + (size_t) sb * SB;
+        const float eff = float(as_type<half>(*((device const ushort*) blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
+        float4 w0, w1;
+        sk_w8_f4<F>(blk + 6, i, w0, w1);
+        const half4 h0 = half4(w0 * eff);
+        const half4 h1 = half4(w1 * eff);
+        const uint k0 = sb * 256u + uint(i);
+        if (j < 192) {
+            device half* dst = wk_t + (size_t) h * 512 * 192 + j;
+            dst[(size_t) (k0 + 0) * 192] = h0.x; dst[(size_t) (k0 + 1) * 192] = h0.y;
+            dst[(size_t) (k0 + 2) * 192] = h0.z; dst[(size_t) (k0 + 3) * 192] = h0.w;
+            dst[(size_t) (k0 + 4) * 192] = h1.x; dst[(size_t) (k0 + 5) * 192] = h1.y;
+            dst[(size_t) (k0 + 6) * 192] = h1.z; dst[(size_t) (k0 + 7) * 192] = h1.w;
+        } else {
+            device half4* dst = (device half4*) (wv + ((size_t) h * 256 + (j - 192)) * 512 + k0);
+            dst[0] = h0;
+            dst[1] = h1;
         }
     }
 }

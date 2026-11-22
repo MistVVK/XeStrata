@@ -1,50 +1,75 @@
 // hy4_dfly2b.metal - reduced-vocabulary draft chain of DFly2: candidate ids = the top-N of the base logits lm_head(final_norm(H)[j]); the chain scores only those lm_head rows with the corrected
 // hidden state. A draft change can only change acceptance, never the output (the verify pass is the target). Compiled with hy4.metal (f2key is defined there).
 
-// top-N ids of each logits row [n][V]: threshold search on the order-preserving key, then emit every id with key >= thr until N are written. grid n, 1024 threads
+// top-N ids of each logits row [n][V]: 4-pass 8-bit radix threshold search on the order-preserving key (4 passes instead of 33!), then emit every id with key >= thr until N are written. grid n, 1024 threads
 kernel void dfly_topn(device const float* logits [[buffer(0)]], constant int& V [[buffer(1)]], constant int& N [[buffer(2)]], device int* cand [[buffer(3)]], uint row [[threadgroup_position_in_grid]],
                       uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup int red[32];
+    threadgroup atomic_uint hist[256];
+    threadgroup int red[8];
     threadgroup atomic_int cnt;
-    threadgroup uint thr_s;
+    threadgroup uint thr_s, s_byte;
+    threadgroup int s_above;
     device const float* lg = logits + (size_t) row * V;
     device int* out = cand + (size_t) row * N;
-    uint lo = 0, hi = 0xFFFFFFFFu;
-    for (int it = 0; it < 33 && lo < hi; ++it) {
-        const uint mid = (uint) (lo + (((ulong) hi - lo + 1) >> 1));
-        int c = 0;
-        for (int i = tid; i < V; i += 1024) c += (f2key(lg[i]) >= mid) ? 1 : 0;
-        c = simd_sum(c);
+    uint prefix = 0u;
+    int rem = N;
+    for (int pass = 0; pass < 4; ++pass) {
+        const uint shift = uint((3 - pass) * 8);
+        const uint mask = pass == 0 ? 0u : (~0u << (shift + 8u));
+        if (tid < 256u) atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if ((tid & 31) == 0) red[tid >> 5] = c;
+        for (int i = int(tid); i < V; i += 1024) {
+            const uint k = f2key(lg[i]);
+            if (pass == 0 || (k & mask) == prefix)
+                atomic_fetch_add_explicit(&hist[(k >> shift) & 255u], 1u, memory_order_relaxed);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        int tot = 0;
-        for (int w = 0; w < 32; ++w) tot += red[w];
-        if (tot >= N) lo = mid; else hi = mid - 1;
+        uint c0 = 0u, sg_inc = 0u;
+        const uint sg = tid >> 5, lane = tid & 31u;
+        if (tid < 256u) {
+            c0 = atomic_load_explicit(&hist[255u - tid], memory_order_relaxed);
+            sg_inc = simd_prefix_inclusive_sum(c0);
+            if (lane == 31u) red[sg] = int(sg_inc);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 256u) {
+            uint base = 0u;
+            for (uint w = 0; w < sg; ++w) base += uint(red[w]);
+            const uint cum = base + sg_inc;
+            const uint prev = cum - c0;
+            if (prev < uint(rem) && cum >= uint(rem)) {
+                s_byte = 255u - tid;
+                s_above = int(prev);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix |= (s_byte << shift);
+        rem -= s_above;
     }
-    if (tid == 0) { thr_s = lo; atomic_store_explicit(&cnt, 0, memory_order_relaxed); }
+    if (tid == 0) { thr_s = prefix; atomic_store_explicit(&cnt, 0, memory_order_relaxed); }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint thr = thr_s;
-    for (int i = tid; i < V; i += 1024)
+    for (int i = int(tid); i < V; i += 1024)
         if (f2key(lg[i]) >= thr) {
             const int s = atomic_fetch_add_explicit(&cnt, 1, memory_order_relaxed);
             if (s < N) out[s] = i;
         }
 }
 
-// score[k] = lm_head row cand[k] . h   (lm_head S8_K [V][3072], a row = 12 super-blocks of 262 B); one simdgroup (32 threads) per candidate
+// score[k] = lm_head row cand[k] . h   (lm_head S8_K [V][3072], a row = 12 super-blocks of 262 B); one simdgroup (32 threads) per candidate, vectorized 8 weights/lane
 kernel void dfly_cand_score(device const uchar* W [[buffer(0)]], device const int* cand [[buffer(1)]], device const half* h [[buffer(2)]], device float* score [[buffer(3)]], uint k [[threadgroup_position_in_grid]],
                             uint lane [[thread_index_in_threadgroup]]) {
     device const uchar* row = W + (size_t) cand[k] * 12 * 262;
-    float acc = 0;
+    const int g = int(lane >> 3);
+    const int j = int(lane << 3);
+    float acc = 0.0f;
     for (int sb = 0; sb < 12; ++sb) {
         device const uchar* blk = row + sb * 262;
-        const float D = h2f_bits(ld16(blk));
-        for (int i = lane; i < 256; i += 32) {
-            const float eff = D * (float(blk[2 + (i >> 6)]) / 255.0f);
-            acc += float(as_type<char>(blk[6 + i])) * eff * float(h[sb * 256 + i]);
-        }
+        const float eff = float(as_type<half>(*((device const ushort*) blk))) * (float(blk[2 + g]) * (1.0f / 255.0f));
+        float4 w0, w1;
+        sk_w8_f4<8>(blk + 6, j, w0, w1);
+        device const half4* h4 = (device const half4*) (h + sb * 256 + j);
+        acc = fma(eff, dot(w0, float4(h4[0])) + dot(w1, float4(h4[1])), acc);
     }
     acc = simd_sum(acc);
     if (lane == 0) score[k] = acc;
@@ -251,6 +276,83 @@ kernel void idx_q_rope_tree(device const float* iq [[buffer(0)]], device half* o
     out[(size_t) t * 2048 + h * 128 + d] = half(v);
 }
 
+// Tree-aware simdgroup_matrix IndexPool scorer (16x fewer pooled reads than scalar idx_score_tree, bit-identical math to idx_score_sg!).
+// Grid ((G+63)/64, T), 128 threads (4 simdgroups, each owns 16 groups x 16 heads).
+kernel void idx_score_sg_tree(device const half* iq [[buffer(0)]], device const float* hw [[buffer(1)]], device const half* pooled [[buffer(2)]], device const half* tmp_pooled [[buffer(3)]],
+                              device float* score [[buffer(4)]], constant int& p0 [[buffer(5)]], constant TreeArgs& tr [[buffer(6)]], constant int& G [[buffer(7)]],
+                              constant int& ldS [[buffer(8)]], constant float& hscale [[buffer(9)]], uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                              uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    const int t = int(tgp.y);
+    const int g0 = int(tgp.x) * 64;
+    const int g_base = p0 >> 2;
+    const int grp = (p0 + int(tr.depth[t])) >> 2;
+    if (g0 >= grp) {
+        if (int(tid) < 64 && g0 + int(tid) < G) score[(size_t) t * ldS + g0 + int(tid)] = -INFINITY;
+        return;
+    }
+
+    threadgroup half sQ[16 * 128];
+    threadgroup half sK[64 * 64];
+    threadgroup float shw[16];
+
+    for (int p = 0; p < 2; ++p) {
+        const uint idx = uint(p * 128) + tid;
+        *((threadgroup uint4*) (sQ + idx * 8u)) = *((device const uint4*) (iq + (size_t) t * 2048 + idx * 8u));
+    }
+    if (tid < 16) shw[tid] = hw[(size_t) t * 16 + tid] * hscale;
+
+    simdgroup_float8x8 s[2][2];
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) s[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int hk = 0; hk < 2; ++hk) {
+        for (int p = 0; p < 4; ++p) {
+            const uint idx = uint(p * 128) + tid;
+            const uint gr = idx >> 3;
+            const uint gc = (idx & 7u) << 3;
+            const int g = g0 + int(gr);
+            uint4 kv = uint4(0u);
+            if (g < grp) {
+                device const half* pr = (g < g_base) ? (pooled + (size_t) g * 128) : (tmp_pooled + (size_t) (t * 2 + (g - g_base)) * 128);
+                kv = *((device const uint4*) (pr + hk * 64 + int(gc)));
+            }
+            *((threadgroup uint4*) (sK + gr * 64u + gc)) = kv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int kk = 0; kk < 8; ++kk) {
+            simdgroup_half8x8 qf0, qf1, kf0, kf1;
+            simdgroup_load(qf0, sQ + hk * 64 + kk * 8, 128);
+            simdgroup_load(qf1, sQ + 8 * 128 + hk * 64 + kk * 8, 128);
+            simdgroup_load(kf0, sK + (sg * 16) * 64 + kk * 8, 64, ulong2(0, 0), true);
+            simdgroup_load(kf1, sK + (sg * 16 + 8) * 64 + kk * 8, 64, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(s[0][0], qf0, kf0, s[0][0]);
+            simdgroup_multiply_accumulate(s[0][1], qf0, kf1, s[0][1]);
+            simdgroup_multiply_accumulate(s[1][0], qf1, kf0, s[1][0]);
+            simdgroup_multiply_accumulate(s[1][1], qf1, kf1, s[1][1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint qid = lane >> 2;
+    const uint fm = (qid & 4u) + ((lane >> 1) & 3u);
+    const uint fn = (qid & 2u) * 2u + (lane & 1u) * 2u;
+    const float w0 = shw[fm];
+    const float w1 = shw[8u + fm];
+    for (int j = 0; j < 2; ++j) {
+        for (int e = 0; e < 2; ++e) {
+            float val = max(s[0][j].thread_elements()[e], 0.0f) * w0 + max(s[1][j].thread_elements()[e], 0.0f) * w1;
+            val += simd_shuffle_xor(val, ushort(2));
+            val += simd_shuffle_xor(val, ushort(4));
+            val += simd_shuffle_xor(val, ushort(16));
+            if (fm == 0) {
+                const int g = g0 + int(sg) * 16 + j * 8 + int(fn) + e;
+                if (g < G) score[(size_t) t * ldS + g] = g < grp ? val : -INFINITY;
+            }
+        }
+    }
+}
+
 // Tree-aware IndexPool scorer: reads committed pooled[g] for g < p0/4 and tmp_pooled[t*2 + g - g0] for g >= p0/4. grid ((G+63)/64, T), 64 threads
 kernel void idx_score_tree(device const half* iq [[buffer(0)]], device const float* hw [[buffer(1)]], device const half* pooled [[buffer(2)]], device const half* tmp_pooled [[buffer(3)]],
                            device float* score [[buffer(4)]], constant int& p0 [[buffer(5)]], constant TreeArgs& tr [[buffer(6)]], constant int& G [[buffer(7)]],
@@ -284,9 +386,6 @@ kernel void idx_select_tree(device const float* score [[buffer(0)]], constant in
                             constant int& n_top [[buffer(4)]], constant int& kmax [[buffer(5)]], device int* keys [[buffer(6)]], device int* nkeys [[buffer(7)]],
                             uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     threadgroup int red[8];
-    threadgroup atomic_int cnt_sel;
-    threadgroup uint thr_s;
-    threadgroup int n_gt_s;
     const int pos = p0 + int(tr.depth[t]);
     const int grp = pos >> 2;
     device int* kl = keys + (size_t) t * kmax;
@@ -296,70 +395,94 @@ kernel void idx_select_tree(device const float* score [[buffer(0)]], constant in
         return;
     }
     device const float* sc = score + (size_t) t * ldS;
-    uint lo = 0, hi = 0xFFFFFFFFu;
-    for (int it = 0; it < 33 && lo < hi; ++it) {
-        uint mid = (uint) (lo + (((ulong) hi - lo + 1) >> 1));
-        int c = 0;
-        for (int g = int(tid); g < grp; g += 256) c += (f2key(sc[g]) >= mid) ? 1 : 0;
-        c = simd_sum(c);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if ((tid & 31) == 0) red[tid >> 5] = c;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        int tot = 0;
-        for (int w = 0; w < 8; ++w) tot += red[w];
-        if (tot >= n_top) lo = mid; else hi = mid - 1;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup atomic_uint hist[256];
+    threadgroup uint s_byte;
+    threadgroup int s_above;
+    uint kc[8];
+    const bool cached = (grp <= 2048);
+    if (cached) {
+        for (int r = 0; r < 8; ++r) {
+            const int g = int(tid) + r * 256;
+            kc[r] = g < grp ? f2key(sc[g]) : 0u;
+        }
     }
-    if (tid == 0) { thr_s = lo; atomic_store_explicit(&cnt_sel, 0, memory_order_relaxed); }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint thr = thr_s;
-    int c = 0;
-    for (int g = int(tid); g < grp; g += 256) c += (f2key(sc[g]) > thr) ? 1 : 0;
-    c = simd_sum(c);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if ((tid & 31) == 0) red[tid >> 5] = c;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        int tot = 0;
-        for (int w = 0; w < 8; ++w) tot += red[w];
-        n_gt_s = tot;
+    uint prefix = 0u;
+    int rem = n_top;
+    const uint sg = tid >> 5, lane = tid & 31u;
+    for (int pass = 0; pass < 4; ++pass) {
+        const uint shift = uint((3 - pass) * 8);
+        const uint mask = pass == 0 ? 0u : (~0u << (shift + 8u));
+        atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (cached) {
+            for (int r = 0; r < 8; ++r) {
+                const int g = int(tid) + r * 256;
+                if (g < grp) {
+                    const uint k = kc[r];
+                    if (pass == 0 || (k & mask) == prefix)
+                        atomic_fetch_add_explicit(&hist[(k >> shift) & 255u], 1u, memory_order_relaxed);
+                }
+            }
+        } else {
+            for (int g = int(tid); g < grp; g += 256) {
+                const uint k = f2key(sc[g]);
+                if (pass == 0 || (k & mask) == prefix)
+                    atomic_fetch_add_explicit(&hist[(k >> shift) & 255u], 1u, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint c0 = atomic_load_explicit(&hist[255u - tid], memory_order_relaxed);
+        const uint sg_inc = simd_prefix_inclusive_sum(c0);
+        if (lane == 31u) red[sg] = int(sg_inc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint base = 0u;
+        for (uint w = 0; w < sg; ++w) base += uint(red[w]);
+        const uint cum = base + sg_inc;
+        const uint prev = cum - c0;
+        if (prev < uint(rem) && cum >= uint(rem)) {
+            s_byte = 255u - tid;
+            s_above = int(prev);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix |= (s_byte << shift);
+        rem -= s_above;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int n_eq_need = n_top - n_gt_s;
+    const uint thr = prefix;
+    const int n_eq_need = rem;
+    const int n_gt = n_top - n_eq_need;
+    threadgroup int red_eq[8];
     {
         const int per = (grp + 255) / 256;
         const int g0 = int(tid) * per, g1 = min(grp, g0 + per);
-        int cnt = 0;
-        for (int g = g0; g < g1; ++g) cnt += (f2key(sc[g]) > thr) ? 1 : 0;
-        const int ex = simd_prefix_exclusive_sum(cnt);
-        if ((tid & 31) == 31) red[tid >> 5] = ex + cnt;
+        int cnt_gt = 0, cnt_eq = 0;
+        for (int g = g0; g < g1; ++g) {
+            const uint k = f2key(sc[g]);
+            cnt_gt += (k > thr) ? 1 : 0;
+            cnt_eq += (k == thr) ? 1 : 0;
+        }
+        const int ex_gt = simd_prefix_exclusive_sum(cnt_gt);
+        const int ex_eq = simd_prefix_exclusive_sum(cnt_eq);
+        if (lane == 31u) { red[sg] = ex_gt + cnt_gt; red_eq[sg] = ex_eq + cnt_eq; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        int base = 0;
-        for (uint w = 0; w < (tid >> 5); ++w) base += red[w];
-        int sidx = base + ex;
-        for (int g = g0; g < g1; ++g)
-            if (f2key(sc[g]) > thr) {
-                for (int j = 0; j < 4; ++j) kl[4 * sidx + j] = 4 * g + j;
-                ++sidx;
-            }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        int s = n_gt_s, need = n_eq_need;
-        for (int g = 0; g < grp && need > 0; ++g) {
-            if (f2key(sc[g]) == thr) {
-                for (int j = 0; j < 4; ++j) kl[4 * s + j] = 4 * g + j;
-                ++s;
-                --need;
+        int base_gt = 0, base_eq = 0;
+        for (uint w = 0; w < sg; ++w) { base_gt += red[w]; base_eq += red_eq[w]; }
+        int sidx_gt = base_gt + ex_gt;
+        int sidx_eq = base_eq + ex_eq;
+        for (int g = g0; g < g1; ++g) {
+            const uint k = f2key(sc[g]);
+            if (k > thr) {
+                *((device int4*) (kl + 4 * sidx_gt)) = int4(4 * g, 4 * g + 1, 4 * g + 2, 4 * g + 3);
+                ++sidx_gt;
+            } else if (k == thr && sidx_eq < n_eq_need) {
+                const int d = n_gt + sidx_eq;
+                *((device int4*) (kl + 4 * d)) = int4(4 * g, 4 * g + 1, 4 * g + 2, 4 * g + 3);
+                ++sidx_eq;
             }
         }
-        atomic_store_explicit(&cnt_sel, s, memory_order_relaxed);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int npool = atomic_load_explicit(&cnt_sel, memory_order_relaxed);
     const int nown = pos - 4 * grp + 1;
-    for (int i = int(tid); i < nown; i += 256) kl[4 * npool + i] = 4 * grp + i;
-    if (tid == 0) nkeys[t] = 4 * npool + nown;
+    for (int i = int(tid); i < nown; i += 256) kl[4 * n_top + i] = 4 * grp + i;
+    if (tid == 0) nkeys[t] = 4 * n_top + nown;
 }
 
 // Post-verify in-place sequential KV compaction: tr.depth[k] = path[k] >= k. grid 1, 256 threads
