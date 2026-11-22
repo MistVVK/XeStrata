@@ -1743,14 +1743,17 @@ BASE_ABOUT = {"qwen3.8-flash-next": "Qwen's model, the one XeStrata is made for"
 # Signal-2's RAM at its peak (GiB, the engine's resident set): 58.6 to 64.4 in the runs of 2026-11-22 (Arc Pro B70,
 # its n-gram table in RAM: --ple-io ram, 1K and 4K prompts, 512 tokens of decode), the largest kept
 SIGNAL2_PEAK_RAM_GB = 64.4
-# the families a first install is offered, in this order: the first this PC runs (recommend_family), with the size it
-# must hold where one is named and the RAM it takes at its peak where it asks for its RAM's room beside that (the
-# user's decision of 2026-11-22): Swift 1.5's SC117 copy where its IQ3_XXS runs (recommend_size takes its IQ3_S where
-# that runs), else Signal-2 where the RAM holds its peak with LOW_RAM_HEADROOM_GB beside it (74.4 GiB: a 64 GB PC,
-# 62.7 as ram_gb reads it, does not; a 96 GB one does), else Sync (XS, S or M), else SenseNova-Loop-9B (QSA), else
-# Qwen3.5-2B (LAST_CHOICE), which is offered when nothing else runs.  A family that is not in FAMILIES is passed over.
-FIRST_CHOICE = (("sc117-swift", "IQ3_XXS", None), ("signal2", None, SIGNAL2_PEAK_RAM_GB), ("sync", None, None),
-                ("sensenova-loop-qsa", None, None), ("qwen35-2b", None, None))
+# the families a first install is offered, in this order (the user's decision of 2026-11-22): the first this PC runs
+# (first_choice).  Each: (family, the sizes it is offered in, best first, or None: the one recommend_size takes;
+# the RAM it takes at its peak, which the RAM must hold with LOW_RAM_HEADROOM_GB beside it, or None; whether most of
+# the size's experts must be in the GPUs' cache, gpu_holds_most).  Swift 1.5's SC117 copy, IQ3_S where it runs with
+# most of its experts on the GPUs, else IQ3_XXS so (VRAM about 31.2 and 27.5 GB: a 32 GB card); else Signal-2 where
+# the RAM holds its peak (74.4 GiB: a 64 GB PC, 62.7 as ram_gb reads it, does not; a 96 GB one does); else Sync (XS,
+# S or M); else SenseNova-Loop-9B (QSA); else Qwen3.5-2B (LAST_CHOICE), offered when nothing else runs.  A family that
+# is not in FAMILIES is passed over.
+FIRST_CHOICE = (("sc117-swift", ("IQ3_S", "IQ3_XXS"), None, True), ("signal2", None, SIGNAL2_PEAK_RAM_GB, False),
+                ("sync", None, None, False), ("sensenova-loop-qsa", None, None, False),
+                ("qwen35-2b", None, None, False))
 LAST_CHOICE = "qwen35-2b"
 
 
@@ -6924,16 +6927,38 @@ def runs_here(family: str, room: Room) -> bool:
                if fam.get("plain") or not MODELS[m].get("experimental"))
 
 
-def recommend_family(fams: list, room: Room) -> str:
-    """The family a first install is offered: on the CPU Qwen3.5-2B, else the first of FIRST_CHOICE this PC runs (the
-    size it names, or any, and its peak RAM with LOW_RAM_HEADROOM_GB beside it), else Qwen3.5-2B (LAST_CHOICE); the
-    first of `fams` without it"""
-    last = LAST_CHOICE if LAST_CHOICE in fams else fams[0]
+def gpu_holds_most(size: str, room: Room) -> bool:
+    """Most of a Flash-Next size's experts in the GPUs' cache at 32K (low_ram_gpu_gb: the VRAM less ~6 GB for the
+    dense weights, buffers and the draft layer).  Below that "most experts stay on the CPU and it will be slow" (step
+    1's line for a small card), and a 3-bit GSQ-RCO size does more CPU work per expert than a smaller one: IQ3_S needs
+    6 + 50.3 / 2 = 31.2 GB, IQ3_XXS 6 + 42.9 / 2 = 27.5."""
+    return low_ram_gpu_gb(size, room.vram) >= MODELS[size]["arena_gb"] / 2
+
+
+def first_choice(fams: list, room: Room) -> tuple:
+    """(family, size) a first install is offered: on the CPU Qwen3.5-2B, else the first of FIRST_CHOICE this PC runs
+    (the first of its sizes that runs with what it asks of the GPUs, or any size, and its peak RAM with
+    LOW_RAM_HEADROOM_GB beside it), else Qwen3.5-2B (LAST_CHOICE); the first of `fams` without it.  The size is None
+    where the family's own recommendation (recommend_size) decides it."""
+    last = (LAST_CHOICE if LAST_CHOICE in fams else fams[0], None)
     if room.on_cpu:
         return last
-    return next((f for f, size, peak in FIRST_CHOICE if f in fams and
-                 (peak is None or room.ram >= peak + LOW_RAM_HEADROOM_GB) and
-                 (size_fits(f, size, room) if size else runs_here(f, room))), last)
+    for f, sizes, peak, most in FIRST_CHOICE:
+        if f not in fams or (peak is not None and room.ram < peak + LOW_RAM_HEADROOM_GB):
+            continue
+        if sizes is None:
+            if runs_here(f, room):
+                return f, None
+            continue
+        size = next((m for m in sizes if size_fits(f, m, room) and (not most or gpu_holds_most(m, room))), None)
+        if size:
+            return f, size
+    return last
+
+
+def recommend_family(fams: list, room: Room) -> str:
+    """The family a first install is offered (first_choice)"""
+    return first_choice(fams, room)[0]
 
 
 def model_shards(fam: dict, model: str) -> int:
@@ -9968,6 +9993,7 @@ def describe() -> dict:
     vram = gpu_expert_vram(gpu) if gpu else 0.0
     by_vram = vram_ctx([gpu]) if gpu else 32768
     room = room_of(ram, [gpu] if gpu else [])
+    first_fam, first_size = first_choice([f for f in FAMILIES if f != CUSTOM], room)
     families = []
     for f, fam in FAMILIES.items():
         if fam.get("edge0"):
@@ -9979,6 +10005,8 @@ def describe() -> dict:
         by_quant = {q: recommend_size(f, room, [m for m in names if size_quantizer(f, m) == q])
                     for q in dict.fromkeys(size_quantizer(f, m) for m in names)}
         rec = recommend_size(f, room, names)
+        if f == first_fam and first_size:              # the first install's offer: its size, also within its quant
+            rec = by_quant[size_quantizer(f, first_size)] = first_size
         if fam.get("plain"):
             ctx_f = min(by_vram, fam["max_context"])
             for m in names:
@@ -10050,7 +10078,7 @@ def describe() -> dict:
             # the versions' and quantizations' names
             "bases": [{"id": b, "title": t} for b, t in BASES.items()]
             + ([{"id": CUSTOM, "title": FAMILIES[CUSTOM]["title"]}] if CUSTOM in FAMILIES else []),
-            "recommended_family": recommend_family([f for f in FAMILIES if f != CUSTOM], room),
+            "recommended_family": first_fam,
             "variants": VARIANTS, "quantizers": QUANTIZERS,
             "images": images, "image_default": list(QI.SETUP_DEFAULT),
             # SAM 3.1's license (--image-sam3-license), and whether it was agreed to (ask_sam3_license's record)
@@ -10865,12 +10893,14 @@ def main() -> int:
     halo = gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu and ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB
     halo_fam = (next((f for f in fams if f in MODELS.get(STRIX_HALO_MODEL, {}).get("families", ())), None)
                 if halo else None)
+    first: tuple = (None, None)
     if a.family:
         family = a.family
     else:
         # the first this PC runs of FIRST_CHOICE (without a GPU: the 2B, the better answers), asked by its levels
         room = room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]])
-        family, a.quantizer = ask_tiers(fams, halo_fam or recommend_family(fams, room), room, halo_fam, a.yes)
+        first = first_choice(fams, room)
+        family, a.quantizer = ask_tiers(fams, halo_fam or first[0], room, halo_fam, a.yes)
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
     if (lic := family_license(family)):
@@ -10909,6 +10939,8 @@ def main() -> int:
         say(f"  {i}) {m:8s} {d['about']}" + ("" if d.get("custom") else f"; download {files_gb(family, m):.1f} GB") +
             f", uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index(recommend_size(family, room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]]), names)) + 1)
+    if family == first[0] and first[1] in names:     # the first install's offer (first_choice): its size
+        rec = str(names.index(first[1]) + 1)
     if family == halo_fam and STRIX_HALO_MODEL in names:
         rec = str(names.index(STRIX_HALO_MODEL) + 1)
     if have_size is not None:   # setup run again: the installed size, whatever is recommended for a first install

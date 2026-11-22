@@ -57,7 +57,7 @@ class SizeByQuality(unittest.TestCase):
         self.assertTrue(setup.size_fits("sync", "Sync-XS", room(24, 16)))
         self.assertFalse(setup.size_fits("sync", "Sync-S", room(32, 11.99)))
         self.assertTrue(setup.size_fits("sync", "Sync-S", room(48, 0)))
-        self.assertEqual(setup.recommend_family(FirstModel.fams, room(64, 16)), "sc117-swift")
+        self.assertEqual(setup.recommend_family(FirstModel.fams, room(64, 32)), "sc117-swift")
 
     def test_a_plain_moe_takes_the_best_that_ram_and_vram_hold_tested_or_not(self):
         self.assertEqual(setup.recommend_size("ornith", room(36, 4)), "Q5_K_M")    # untested, as the user chose
@@ -109,17 +109,24 @@ class FirstModel(unittest.TestCase):
 
     def first(self, ram: float, vram: float | None, fams=None) -> tuple:
         r = room(ram, vram)
-        f = setup.recommend_family(fams or self.fams + list(OTHER_BRANCHES["FAMILIES"]), r)
-        return f, setup.recommend_size(f, r)
+        f, size = setup.first_choice(fams or self.fams + list(OTHER_BRANCHES["FAMILIES"]), r)
+        return f, size or setup.recommend_size(f, r)
 
     def test_the_first_this_pc_runs_in_the_users_order(self):
-        # the user's order of 2026-11-22: SC117's Swift 1.5, Signal-2 where the RAM is plenty else Sync, SenseNova,
-        # Qwen3.5-2B.  Every PC with the RAM for Signal-2 runs SC117's IQ3_XXS, so the order never reaches Signal-2
-        # (the user is asked whether Signal-2 goes first there: then FIRST_CHOICE and the first case change)
-        cases = [((123.2, 32), ("sc117-swift", "IQ3_S")),        # 128 GB installed: SC117 before Signal-2
-                 ((62.7, 16), ("sc117-swift", "IQ3_S")),         # 64 GB installed
-                 ((52, 0), ("sc117-swift", "IQ3_XXS")),          # IQ3_XXS in the low-RAM mode, IQ3_S not
-                 ((48, 0), ("sync", "Sync-M")),                  # SC117's IQ2_XS only: not SC117
+        # the user's order of 2026-11-22: SC117's Swift 1.5 (IQ3_S, else IQ3_XXS, each where it runs with most of its
+        # experts on the GPUs), Signal-2 where the RAM holds its peak else Sync, SenseNova, Qwen3.5-2B
+        cases = [((123.2, 32), ("sc117-swift", "IQ3_S")),        # 128 GB of RAM, a 32 GB card
+                 ((123.2, 31.89), ("sc117-swift", "IQ3_S")),     # as an Arc Pro B70 reads
+                 ((123.2, 30), ("sc117-swift", "IQ3_XXS")),      # most of IQ3_XXS's experts on it, not of IQ3_S's
+                 ((123.2, 24), ("signal2", "S")),                # a 24 GB card: SC117 mostly on the CPU
+                 ((123.2, 12), ("signal2", "S")),
+                 ((93.0, 16), ("signal2", "S")),                 # 96 GB of RAM
+                 ((74.4, 16), ("signal2", "S")),
+                 ((74.3, 16), ("sync", "Sync-M")),
+                 ((62.7, 32), ("sc117-swift", "IQ3_S")),         # 64 GB of RAM, a 32 GB card
+                 ((62.7, 16), ("sync", "Sync-M")),
+                 ((32, 32), ("sc117-swift", "IQ3_S")),           # in the low-RAM mode
+                 ((52, 0), ("sync", "Sync-M")),
                  ((32, 12), ("sync", "Sync-S")),
                  ((24, 8), ("sync", "Sync-XS")),
                  ((20, 16), ("sensenova-loop-qsa", "Q8_0")),
@@ -131,6 +138,15 @@ class FirstModel(unittest.TestCase):
             for (ram, vram), expected in cases:
                 with self.subTest(ram=ram, vram=vram):
                     self.assertEqual(self.first(ram, vram), expected)
+
+    def test_sc117_needs_most_of_its_experts_on_the_gpus(self):
+        self.assertTrue(setup.gpu_holds_most("IQ3_S", room(128, 31.16)))
+        self.assertFalse(setup.gpu_holds_most("IQ3_S", room(128, 31.14)))
+        self.assertTrue(setup.gpu_holds_most("IQ3_XXS", room(128, 27.46)))
+        self.assertFalse(setup.gpu_holds_most("IQ3_XXS", room(128, 27.44)))
+        # a second card adds its VRAM less 5 (room_of): two 16 GB cards hold 27 GB, not most of IQ3_XXS
+        two = setup.room_of(128, [{"vram_gb": 16.0, "integrated": False}] * 2)
+        self.assertFalse(setup.gpu_holds_most("IQ3_XXS", two))
 
     def test_signal2_where_the_ram_is_plenty_else_sync(self):
         # the step itself, SC117 aside: Signal-2's peak, 64.4 GiB, with LOW_RAM_HEADROOM_GB beside it
@@ -145,6 +161,7 @@ class FirstModel(unittest.TestCase):
     def test_a_family_not_registered_is_passed_over(self):
         # this tree without Signal-2's and SenseNova's entries: SC117, Sync, Qwen3.5-2B
         self.assertEqual(self.first(123.2, 32, self.fams), ("sc117-swift", "IQ3_S"))
+        self.assertEqual(self.first(123.2, 24, self.fams), ("sync", "Sync-M"))
         self.assertEqual(self.first(48, 0, self.fams), ("sync", "Sync-M"))
         self.assertEqual(self.first(20, 16, self.fams), ("qwen35-2b", "Q8_0"))
 
