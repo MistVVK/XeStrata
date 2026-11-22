@@ -82,7 +82,7 @@ def mode_of(cfg: dict, kind: str) -> str | None:
     None."""
     caps = img._qimage().family_capabilities(cfg.get("family"))
     if caps.get("control") == "controlnet":
-        return "controlnet" if kind not in ("color", "normal", "segmentation") else None
+        return "controlnet" if kind not in image_aux.CONTROLNET_REFUSED_KINDS else None
     if caps.get("control") == "moss" and kind in MOSS_KINDS:
         return "moss"
     if kind in caps.get("control_loras", {}) and img.can_edit(cfg):
