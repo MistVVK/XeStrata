@@ -6713,6 +6713,16 @@ def minimum_setup_ram(family: str | None) -> float:
                if family == "sync" or "sync" not in d.get("families", ()))
 
 
+def setup_ram_stop(family: str | None, ram: float, need: float) -> None:
+    """Stop setup: this PC's RAM is short of the smallest Flash-Next size `family` offers (minimum_setup_ram)"""
+    # every model keeps ALL its experts in RAM (23+ GB) unless the GPU holds enough of them for the low-RAM mode
+    hint = ("Sync-XS needs about 24 GiB of RAM; add memory or keep less reserved" if family == "sync" else
+            "XeStrata keeps the model's experts in RAM (23-50 GB) and the GPU holds a copy of the "
+            "most-used ones: it needs 32 GB of RAM or more (48 GB for the full model), or a GPU with "
+            "the VRAM to hold most of them")
+    fail(f"RAM: {ram:.0f} GB - the smallest model needs about {need} GB", hint)
+
+
 def low_ram_fits(model, ram, vram_gb) -> bool:
     """In the low-RAM mode: the experts the GPU does not hold fit the RAM left beside the rest (as file cache)."""
     return ram - 6 + max(0.0, vram_gb - 5 - MTP_VRAM_GB) >= MODELS[model]["arena_gb"]
@@ -10801,21 +10811,21 @@ def main() -> int:
             warn(f"--ram-reserve-gib {a.ram_reserve_gib:g} leaves less RAM than the smallest model runs in "
                  f"({need - 4:.0f} GB): XeStrata takes that much, and about {ram_total - ram:.0f} GB stay free")
             a.ram_reserve_gib = math.floor(ram_total - ram)
-        if ram < need - 4 and not a.check and not low_ok:
-            # every model keeps ALL its experts in RAM (23+ GB) unless the GPU holds enough of them for the low-RAM mode
-            hint = ("Sync-XS needs about 24 GiB of RAM; add memory or keep less reserved" if a.family == "sync" else
-                    "XeStrata keeps the model's experts in RAM (23-50 GB) and the GPU holds a copy of the "
-                    "most-used ones: it needs 32 GB of RAM or more (48 GB for the full model), or a GPU with "
-                    "the VRAM to hold most of them")
-            fail(f"RAM: {ram:.0f} GB - the smallest model needs about {need} GB", hint)
+        # a model of PLAIN_FAMILIES this PC runs needs none of that RAM: the one asked for, else one of FIRST_CHOICE
+        # (Qwen3.5-2B the last, its weights in VRAM); then the stop waits for a Flash-Next family chosen in step 2
+        plain_ok = any(runs_here(f, room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]]))
+                       for f in ([a.family] if a.family else [f for f, _ in FIRST_CHOICE]) if f in PLAIN_FAMILIES)
+        if ram < need - 4 and not a.check and not low_ok and not plain_ok:
+            setup_ram_stop(a.family, ram, need)
         if a.ram_reserve_gib:
             ok(f"RAM: {ram_total:.0f} GB, {a.ram_reserve_gib:g} GiB of it kept free for other programs "
                f"(--ram-reserve-gib): XeStrata plans with {max(ram, 0.0):.0f} GB")
         elif ram >= need - 4:
             ok(f"RAM: {ram:.0f} GB")
         else:
-            ok(f"RAM: {ram:.0f} GB (less than the {need} GB the smallest model needs)" +
-               ("; the GPU's VRAM makes up for it (the low-RAM mode)" if low_ok else ""))
+            ok(f"RAM: {ram:.0f} GB (less than the {need} GB the smallest Qwen3.8-Flash-Next model needs)" +
+               ("; the GPU's VRAM makes up for it (the low-RAM mode)" if low_ok else
+                "; the smaller models run on the GPU" if plain_ok else ""))
     ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     if not avx2:
         fail("this CPU has no AVX2; XeStrata needs at least AVX2")
@@ -10865,7 +10875,7 @@ def main() -> int:
                 verdict = "fits" if ram >= gb + 8 else "fits with the GPU's VRAM" if ram + plain_vram >= gb + 8 \
                     else "slow (the experts that do not fit are read from the SSD)"
                 say(f"  {fam['title']} {m}: ~{gb + 8:.0f} GB of RAM and VRAM: {verdict}")
-        if not any_fits:
+        if not any_fits and not plain_ok:
             # upstream #977: every size says "does not fit", so the verdict says so too (and the exit code, for
             # scripts). It only reports: --model NAME --yes still installs one anyway.
             say(f"\nThis PC cannot run XeStrata yet: no model size fits {ram:.0f} GB of RAM (the smallest needs about "
@@ -10901,6 +10911,8 @@ def main() -> int:
         room = room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]])
         first = first_choice(fams, room)
         family, a.quantizer = ask_tiers(fams, halo_fam or first[0], room, halo_fam, a.yes)
+    if not on_cpu and family not in PLAIN_FAMILIES and ram < minimum_setup_ram(family) - 4 and not low_ok:
+        setup_ram_stop(family, ram, minimum_setup_ram(family))     # step 1's stop, for the Flash-Next family chosen
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
     if (lic := family_license(family)):
