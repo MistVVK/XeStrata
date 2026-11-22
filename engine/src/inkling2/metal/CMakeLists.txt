@@ -1,6 +1,10 @@
 # engine/src/inkling2/metal/CMakeLists.txt - Apple Silicon Metal backend plugin for strata-inkling
 # MIT License - Copyright (c) 2026 Strata contributors
 
+enable_language(OBJCXX)
+set(CMAKE_OBJCXX_STANDARD 20)
+set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+
 set(_ink_eng_root "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
 set(_ink_gen_hdr "${CMAKE_CURRENT_BINARY_DIR}/ink_metal_embedded_shaders.h")
 
@@ -8,27 +12,10 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 add_custom_command(
   OUTPUT "${_ink_gen_hdr}"
-  COMMAND ${Python3_EXECUTABLE} -c "
-import pathlib, sys
-out = [
-  '#pragma once',
-  'namespace ink_metal {',
-]
-pairs = [
-  ('kInkMetalCodecsSrc', 'ink_metal_codecs.metal'),
-  ('kInkMetalOpsSrc', 'ink_metal_ops.metal'),
-  ('kInkMetalDsparkSrc', 'ink_metal_dspark.metal'),
-  ('kInkMetalVisionSrc', 'ink_metal_vision.metal'),
-  ('kInkMetalMppSrc', 'ink_metal_mpp.metal'),
-]
-base = pathlib.Path(sys.argv[1])
-for var, fn in pairs:
-  txt = (base / fn).read_text(encoding='utf-8')
-  out.append(f'static const char {var}[] = R\"INKMSL({txt})INKMSL\";')
-out.append('}')
-pathlib.Path(sys.argv[2]).write_text('\\n'.join(out), encoding='utf-8')
-" "${CMAKE_CURRENT_SOURCE_DIR}" "${_ink_gen_hdr}"
+  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/embed_shaders.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}" "${_ink_gen_hdr}"
   DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/embed_shaders.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/ink_metal_codecs.metal"
     "${CMAKE_CURRENT_SOURCE_DIR}/ink_metal_ops.metal"
     "${CMAKE_CURRENT_SOURCE_DIR}/ink_metal_dspark.metal"
