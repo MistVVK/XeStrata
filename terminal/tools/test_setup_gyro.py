@@ -68,8 +68,10 @@ class GyroCatalog(unittest.TestCase):
         intel = hardware(28.0, 16.0)
         intel["gpus"] = [{**g, "vendor": "intel"} for g in intel["gpus"]]
         self.assertIn("Gyro-M", s.recommend(intel)["why"])       # the SYCL engine has the trellis kernels (0.2.2)
-        self.assertIsNone(s.recommend(hardware(12.0, 8.0))["family"])
-        self.assertIsNone(s.recommend(hardware(16.0, 11.0))["family"])   # 27 GB: below Gyro-S's 27.6 + room
+        # Below Gyro-S's 27.6 GB + room, Gyro is never picked; Inkling-2-Mini covers 8-27 GB PCs and <8 GB RAM returns None.
+        self.assertEqual(s.recommend(hardware(12.0, 8.0))["family"], "inkling-2-mini")
+        self.assertEqual(s.recommend(hardware(16.0, 11.0))["family"], "inkling-2-mini")
+        self.assertIsNone(s.recommend(hardware(4.0, 4.0))["family"])
 
     def test_mcp_table_verdict_counts_vram(self):
         s = M.Strata(ROOT)

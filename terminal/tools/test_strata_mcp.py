@@ -781,6 +781,8 @@ class Helpers(unittest.TestCase):
             r = s.recommend({"ram_gb": ram, "gpus": gpu, "cpu": {"avx2": True}})
             self.assertEqual((r["family"], r["model"], r["context"]), want, ram)
         r = s.recommend({"ram_gb": 16, "gpus": [{**gpu[0], "vram_gb": 8.0}], "cpu": {"avx2": True}})
+        self.assertEqual((r["family"], r["model"]), ("inkling-2-mini", "SQ-10"))
+        r = s.recommend({"ram_gb": 4, "gpus": [{**gpu[0], "vram_gb": 4.0}], "cpu": {"avx2": True}})
         self.assertIsNone(r["model"])
         r = s.recommend({"ram_gb": 64, "gpus": [], "cpu": {"avx2": True}})
         self.assertIsNone(r["model"])

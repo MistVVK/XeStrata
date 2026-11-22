@@ -20,11 +20,15 @@ Multi-request parallelism (`--parallel 1|4|8|32|64`):
 from __future__ import annotations
 
 GIB_TO_GB = 1.073741824
-VRAM_DRIVER_GB = 0.85            # driver / WDDM / runtime buffers
+VRAM_DRIVER_GB = 1.10            # driver / WDDM / desktop compositor + runtime buffers
+VRAM_HYBRID_WORKSPACE_GB = 0.90  # hybrid ping-pong DMA ring + runner scratch + desktop margin (#6587)
+DSPARK_BASE_GB = 0.08            # DSpark activation / head buffers
+DSPARK_KV_BYTES_PER_TOK = 12288  # 3 DSpark layers x 8 kv_heads x 128 head_dim x 2 (K+V) x 2B (FP16)
 OS_RESERVE_GB = 4.50             # system RAM reserve on discrete or UMA hosts
 UMA_RESERVE_GB = 5.00            # unified memory OS + driver reserve
 SSD_NEAR_RESIDENT_GB = 2.0
 VISION_GB = 0.637                # Inkling-2-Mini-Vision.strata (636,526,592 B)
+DSPARK_GGUF_GB = 0.402           # dspark-Inkling-2-Mini-Q8_0.gguf (402,278,560 B)
 DEFAULT_CONTEXT = 32768          # docs/10-GUI-TUI.md default: 32K (up to 1M available)
 CONTEXTS = [8192, 32768, 65536, 131072, 262144]
 MAX_CONTEXT = 1048576
@@ -48,13 +52,33 @@ IGPU_SQ10_ARCHS = frozenset({"gfx1103", "gfx1150"})
 #: High-bandwidth unified-memory GPUs (DGX Spark GB10 sm_121, Strix Halo gfx1151) that scale to SQ-20 on >= 32 GiB UMA.
 BIG_UMA_ARCHS = frozenset({"121", "sm_121", "gfx1151"})
 
-#: name -> exact Section 1 (dense + DSpark) and Section 4 (expert bodies) sizes from the verified .strata v1.1 binaries.
+#: name -> exact Section 1 (dense + DSpark) and Section 4 (expert bodies) sizes from the verified .strata v1.1 binaries,
+#: plus direct-download Unsloth Dynamic GGUF builds from unsloth/Inkling-2-Mini-GGUF.
 BUILDS = {
-    "SQ-20": {"file": "Inkling-2-Mini-SQ-20.strata", "footprint_gb": 19.35, "dense_gb": 3.67, "bodies_gb": 15.68, "file_gb": 19.35},
-    "SQ-15": {"file": "Inkling-2-Mini-SQ-15.strata", "footprint_gb": 14.35, "dense_gb": 2.07, "bodies_gb": 12.28, "file_gb": 14.35},
-    "SQ-10": {"file": "Inkling-2-Mini-SQ-10.strata", "footprint_gb": 10.47, "dense_gb": 1.87, "bodies_gb": 8.60, "file_gb": 10.47},
+    "SQ-20": {"file": "Inkling-2-Mini-SQ-20.strata", "footprint_gb": 19.35, "dense_gb": 3.67, "bodies_gb": 15.68, "file_gb": 19.35, "format": "strata"},
+    "SQ-15": {"file": "Inkling-2-Mini-SQ-15.strata", "footprint_gb": 14.35, "dense_gb": 2.07, "bodies_gb": 12.28, "file_gb": 14.35, "format": "strata"},
+    "SQ-10": {"file": "Inkling-2-Mini-SQ-10.strata", "footprint_gb": 10.47, "dense_gb": 1.87, "bodies_gb": 8.60, "file_gb": 10.47, "format": "strata"},
+    "UD-Q8_K_XL": {"file": "Inkling-2-Mini-UD-Q8_K_XL.gguf", "footprint_gb": 22.87, "dense_gb": 2.87, "bodies_gb": 20.00, "file_gb": 22.87, "format": "gguf"},
+    "UD-Q4_K_XL": {"file": "Inkling-2-Mini-UD-Q4_K_XL.gguf", "footprint_gb": 17.63, "dense_gb": 2.15, "bodies_gb": 15.48, "file_gb": 17.63, "format": "gguf"},
+    "UD-Q4_K_M": {"file": "Inkling-2-Mini-UD-Q4_K_M.gguf", "footprint_gb": 16.61, "dense_gb": 2.10, "bodies_gb": 14.51, "file_gb": 16.61, "format": "gguf"},
+    "UD-IQ4_XS": {"file": "Inkling-2-Mini-UD-IQ4_XS.gguf", "footprint_gb": 15.73, "dense_gb": 2.05, "bodies_gb": 13.68, "file_gb": 15.73, "format": "gguf"},
+    "UD-Q3_K_XL": {"file": "Inkling-2-Mini-UD-Q3_K_XL.gguf", "footprint_gb": 13.63, "dense_gb": 2.00, "bodies_gb": 11.63, "file_gb": 13.63, "format": "gguf"},
+    "UD-IQ3_XXS": {"file": "Inkling-2-Mini-UD-IQ3_XXS.gguf", "footprint_gb": 11.66, "dense_gb": 1.95, "bodies_gb": 9.71, "file_gb": 11.66, "format": "gguf"},
+    "UD-Q2_K_XL": {"file": "Inkling-2-Mini-UD-Q2_K_XL.gguf", "footprint_gb": 9.14, "dense_gb": 1.88, "bodies_gb": 7.26, "file_gb": 9.14, "format": "gguf"},
+    "UD-IQ2_XXS": {"file": "Inkling-2-Mini-UD-IQ2_XXS.gguf", "footprint_gb": 8.49, "dense_gb": 1.85, "bodies_gb": 6.64, "file_gb": 8.49, "format": "gguf"},
+    "UD-IQ1_M": {"file": "Inkling-2-Mini-UD-IQ1_M.gguf", "footprint_gb": 8.02, "dense_gb": 1.82, "bodies_gb": 6.20, "file_gb": 8.02, "format": "gguf"},
+    "UD-IQ1_S": {"file": "Inkling-2-Mini-UD-IQ1_S.gguf", "footprint_gb": 7.76, "dense_gb": 1.80, "bodies_gb": 5.96, "file_gb": 7.76, "format": "gguf"},
 }
-ORDER = ("SQ-20", "SQ-15", "SQ-10")       # best quality first
+STRATA_ORDER = ("SQ-20", "SQ-15", "SQ-10")       # primary recommended native .strata builds, best quality first
+GGUF_ORDER = (
+    "UD-Q8_K_XL", "UD-Q4_K_XL", "UD-Q4_K_M", "UD-IQ4_XS", "UD-Q3_K_XL",
+    "UD-IQ3_XXS", "UD-Q2_K_XL", "UD-IQ2_XXS", "UD-IQ1_M", "UD-IQ1_S",
+)
+ORDER = (*STRATA_ORDER, *GGUF_ORDER)
+
+
+def is_gguf_build(build: str | None) -> bool:
+    return BUILDS.get(str(build or ""), {}).get("format") == "gguf"
 
 
 def build_names() -> list[str]:
@@ -73,6 +97,14 @@ def is_big_uma_arch(arch: str | None, name: str | None = None) -> bool:
     return "gb10" in low or "dgx spark" in low or "strix halo" in low
 
 
+def dspark_gb(ctx: int | None = None, enabled: bool = True) -> float:
+    """DSpark drafter KV + scratch footprint in GB for `ctx` tokens (0 when drafting is disabled)."""
+    if not enabled:
+        return 0.0
+    n = DEFAULT_CONTEXT if ctx is None else max(1024, int(ctx))
+    return round(DSPARK_BASE_GB + n * DSPARK_KV_BYTES_PER_TOK / 1e9, 3)
+
+
 def kv_cache_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False) -> float:
     """KV + SWA-1024 + ShortConv state in GB for `ctx` context tokens across `parallel` concurrent request slots."""
     n = DEFAULT_CONTEXT if ctx is None else max(1024, int(ctx))
@@ -89,44 +121,72 @@ def kv_cache_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False)
     return round(slots * (active_ctx * per_tok + fixed), 3)
 
 
-def non_expert_gb(ctx: int | None = None, parallel: int = 1, vision: bool = False) -> float:
-    """Video memory kept free of expert bodies: driver/runtime buffers + KV/SWA/ShortConv state (+ optional Vision shard)."""
-    return round(VRAM_DRIVER_GB + kv_cache_gb(ctx, parallel) + (VISION_GB if vision else 0.0), 3)
+def non_expert_gb(ctx: int | None = None, parallel: int = 1, vision: bool = False, *,
+                  dspark: bool = True, fp8_kv: bool = False, hybrid: bool = False) -> float:
+    """Video memory kept free of expert bodies: driver/desktop + hybrid workspace + DSpark KV + KV/SWA/ShortConv (+ Vision shard)."""
+    return round(
+        VRAM_DRIVER_GB
+        + (VRAM_HYBRID_WORKSPACE_GB if hybrid else 0.0)
+        + dspark_gb(ctx, enabled=dspark)
+        + kv_cache_gb(ctx, parallel, fp8_kv=fp8_kv)
+        + (VISION_GB if vision else 0.0),
+        3,
+    )
 
 
-def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None, vision: bool = False, parallel: int = 1) -> dict:
-    """Placement of `build` on a discrete-GPU PC (vram_gib + ram_gib): GB of experts in VRAM, in RAM, and on SSD."""
+def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None, vision: bool = False,
+            parallel: int = 1, dspark: bool = True) -> dict:
+    """Placement of `build` on a discrete-GPU PC (vram_gib + ram_gib): GB of experts in VRAM, in RAM, and on SSD.
+
+    Accounts for driver/desktop overhead, KV/SWA cache, DSpark KV, Vision shard, and hybrid runner workspace (#6587),
+    clamping `in_vram >= 0.0` so 4 GB and 6 GB GPUs place trunk in VRAM and stream routed experts from RAM/SSD cleanly.
+    """
     info = BUILDS[build]
-    vram_gb = float(vram_gib or 0.0) * GIB_TO_GB
+    v_gib = float(vram_gib or 0.0)
+    vram_gb = v_gib * GIB_TO_GB
     ram_gb = float(ram_gib or 0.0) * GIB_TO_GB
-    gpu_room = max(0.0, vram_gb - info["dense_gb"] - non_expert_gb(ctx, parallel, vision=False))
-    ram_room = max(0.0, ram_gb - OS_RESERVE_GB - (VISION_GB if vision else 0.0))
-    in_vram = min(info["bodies_gb"], gpu_room)
-    in_ram = min(info["bodies_gb"] - in_vram, ram_room)
-    on_ssd = max(0.0, info["bodies_gb"] - in_vram - in_ram)
-    vram_total = info["dense_gb"] + in_vram
+    fp8_kv = 0.0 < v_gib <= 13.0 or int(parallel or 1) >= 16
+    extra_dspark_weights = DSPARK_GGUF_GB if (dspark and info.get("format") == "gguf") else 0.0
+    dense_total = info["dense_gb"] + extra_dspark_weights
+    # Check 100%-VRAM residency first (no hybrid bounce ring needed when every expert fits on GPU)
+    full_need = dense_total + info["bodies_gb"] + non_expert_gb(ctx, parallel, vision=vision, dspark=dspark, fp8_kv=fp8_kv, hybrid=False)
+    if vram_gb > 0.0 and full_need <= vram_gb:
+        in_vram = info["bodies_gb"]
+        in_ram = 0.0
+        on_ssd = 0.0
+        full_vram = True
+    else:
+        gpu_room = max(0.0, vram_gb - dense_total - non_expert_gb(ctx, parallel, vision=vision, dspark=dspark, fp8_kv=fp8_kv, hybrid=True))
+        ram_room = max(0.0, ram_gb - OS_RESERVE_GB - (VISION_GB if vision else 0.0))
+        in_vram = min(info["bodies_gb"], gpu_room)
+        in_ram = min(info["bodies_gb"] - in_vram, ram_room)
+        on_ssd = max(0.0, info["bodies_gb"] - in_vram - in_ram)
+        full_vram = False
     return {
         "vram_gb": round(in_vram, 2),
         "ram_gb": round(in_ram, 2),
         "ssd_gb": round(on_ssd, 2),
-        "full_vram": on_ssd <= 0.05 and in_ram <= 0.05 and vram_total <= vram_gb,
+        "full_vram": full_vram,
     }
 
 
-def compute_unified(build: str, pool_gib: float, ctx: int | None = None, vision: bool = False, parallel: int = 1) -> dict:
+def compute_unified(build: str, pool_gib: float, ctx: int | None = None, vision: bool = False,
+                    parallel: int = 1, dspark: bool = True) -> dict:
     """Placement on a unified-memory / coherent-UMA host (Apple Silicon, Strix Halo, Strix Point 890M, Radeon 780M, DGX Spark)."""
     info = BUILDS[build]
+    extra_dspark = DSPARK_GGUF_GB if (dspark and info.get("format") == "gguf") else 0.0
+    need_total = info["footprint_gb"] + extra_dspark
     room = max(0.0, float(pool_gib or 0.0) * GIB_TO_GB - UMA_RESERVE_GB - kv_cache_gb(ctx, parallel) - (VISION_GB if vision else 0.0))
-    held = min(info["footprint_gb"], room)
-    on_ssd = max(0.0, info["footprint_gb"] - held)
+    held = min(need_total, room)
+    on_ssd = max(0.0, need_total - held)
     return {"vram_gb": round(held, 2), "ram_gb": 0.0, "ssd_gb": round(on_ssd, 2), "full_vram": on_ssd <= 0.05}
 
 
 def place(build: str, vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None,
-          vision: bool = False, parallel: int = 1) -> dict:
+          vision: bool = False, parallel: int = 1, dspark: bool = True) -> dict:
     if unified:
-        return compute_unified(build, ram_gib, ctx, vision, parallel)
-    return compute(build, vram_gib or 0.0, ram_gib, ctx, vision, parallel)
+        return compute_unified(build, ram_gib, ctx, vision, parallel, dspark)
+    return compute(build, vram_gib or 0.0, ram_gib, ctx, vision, parallel, dspark)
 
 
 def mode(placed: dict | float) -> str:
@@ -200,10 +260,12 @@ def rows(vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int
     out = []
     for b in ORDER:
         placed = place(b, vram_gib, ram_gib, unified, ctx, vision, parallel)
+        dl = BUILDS[b]["file_gb"] + (DSPARK_GGUF_GB if is_gguf_build(b) else 0.0)
         out.append({
             "build": b,
             "file": BUILDS[b]["file"],
-            "download_gb": BUILDS[b]["file_gb"],
+            "format": BUILDS[b].get("format", "strata"),
+            "download_gb": round(dl, 2),
             "footprint_gb": BUILDS[b]["footprint_gb"],
             "placement": placed,
             "mode": mode(placed),
@@ -211,8 +273,9 @@ def rows(vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int
     return out
 
 
-def disk_gb(build: str, vision: bool = False) -> float:
-    return round(BUILDS[build]["file_gb"] + (VISION_GB if vision else 0.0), 2)
+def disk_gb(build: str, vision: bool = False, dspark: bool = True) -> float:
+    extra_dspark = DSPARK_GGUF_GB if (dspark and is_gguf_build(build)) else 0.0
+    return round(BUILDS[build]["file_gb"] + extra_dspark + (VISION_GB if vision else 0.0), 2)
 
 
 def build_of_model_name(model_name: str | None) -> str | None:

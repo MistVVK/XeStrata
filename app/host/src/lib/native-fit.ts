@@ -176,6 +176,6 @@ export function cardRoomGb(cards: readonly Pick<RunCard, 'vram_gb' | 'uma' | 'de
 export function runCards<T extends RunCard>(gpus: T[] | null | undefined, engineVendor?: string | null): T[] {
   const sharesMemory = (g: RunCard) => !!(g.integrated || g.uma || g.unified_gb);
   const mine = (gpus ?? []).filter(g => g.usable !== false && (!engineVendor || !g.vendor || g.vendor === engineVendor));
-  const hasReal = mine.some(g => !sharesMemory(g) && g.vram_gb >= 4);
+  const hasReal = mine.some(g => !sharesMemory(g) && g.vram_gb >= 3.5);
   return mine.filter(g => !(hasReal && sharesMemory(g)));
 }

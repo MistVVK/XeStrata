@@ -31,7 +31,7 @@ export interface RoleCard {
 export const OFF_AT_OR_BELOW_GB = 8;
 const SAME_SPEED = 1.05;
 const MEMORY_GUARD_SPEED = 0.5;
-const MIN_CARD_GB = 4;
+const MIN_CARD_GB = 3.5;
 const SPLIT_CARD_OVERHEAD_GB = 2;
 export const CPU_ONLY_LINE = 'Performance is degraded on CPU only.';
 export const NO_CARD_LINE = 'This engine needs a graphics card to start. Turn one on.';

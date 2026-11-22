@@ -147,7 +147,8 @@ class CatalogRules(unittest.TestCase):
             rows = {r.model: r for r in cat.rows()}
             self.assertEqual(set(rows), {"Q2_0", "IQ3_XXS", "IQ3_S", "Gyro-S", "Gyro-M", "UD-IQ1_M",
                                 "UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL", "UD-IQ4_XS-v31", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL",
-                                "SQ-64", "SQ-96", "SQ-128"})   # Unsloth's sets + Hy4-Flash builds on Mac
+                                "SQ-64", "SQ-96", "SQ-128",
+                                "SQ-20", "SQ-15", "SQ-10", "UD-IQ1_S", "UD-IQ2_XXS", "UD-IQ4_XS", "UD-Q4_K_M", "UD-Q8_K_XL"})   # Unsloth's sets + Hy4-Flash + Inkling-2-Mini builds on Mac
             self.assertEqual([r.model for r in rows.values() if r.recommended], ["Q2_0"])
             self.assertEqual((rows["Q2_0"].verdict, rows["Q2_0"].words), ("slower", "may run slower"))
             self.assertEqual(rows["IQ3_S"].verdict, "slower")

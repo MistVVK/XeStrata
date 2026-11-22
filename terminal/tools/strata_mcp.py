@@ -729,11 +729,12 @@ class Strata:
         d = (getattr(self.setup_module(), "INKLING_FAMILIES", None) or {}).get(family)
         if not d or model not in d["models"]:
             return None
-        from strata_control import inkling_fit
+        from strata_control import inkling_family, inkling_fit
         b = inkling_fit.BUILDS[model]
-        return {"about": d["models"][model]["about"], "download_gb": round(b["file_gb"] + inkling_fit.VISION_GB, 1), "ram_gb": d["models"][model]["ram_gb"],
+        dl_bytes = sum((inkling_family.size_of(n) or 0) for n in inkling_family.files_of(model, vision=True, dspark=True))
+        return {"about": d["models"][model]["about"], "download_gb": round(dl_bytes / 1e9, 1), "ram_gb": d["models"][model]["ram_gb"],
                 "arena_gb": b["bodies_gb"], "vision": True, "engine": None, "families": (family,), "context_fit": None, "inkling": True,
-                "footprint_gb": b["footprint_gb"]}
+                "footprint_gb": b["footprint_gb"], "format": b.get("format", "strata")}
 
     def own_size(self, family, model) -> dict | None:
         """One size of an own-path family as a model-table row for install_plan / model_table (None: not an own-path size).
@@ -1399,6 +1400,7 @@ class Strata:
                     verdict = None if ink is None else ("may run slower" if ink["mode"] == "cross_tier_ssd" else "fits")
                     sizes.append({"model": m, "about": d["about"], "download_gb": d["download_gb"],
                                   **({"inkling": ink} if ink else {}),
+                                  **({"format": d["format"]} if d.get("format") else {}),
                                   "experimental": False, "images": True,
                                   "ram_needed_gb": d["ram_gb"], "experts_gb": d.get("arena_gb"), "mem_total": False,
                                   "memory_gb": d["footprint_gb"], "fit_gb": d["footprint_gb"],
@@ -1468,6 +1470,20 @@ class Strata:
             fam, why = "gyro", (f"{ram:.0f} GB of RAM is below the Coder's 32 GB, but RAM + VRAM = {ram + vram:.0f} GB "
                                 f"holds {model} ({models[model]['ram_gb']} GB of memory in total; the quality is lower "
                                 "than the 2-3-bit sizes, and it needs the whole download on a fast SSD)")
+        elif self.inkling_visible() and ram >= 8:
+            from strata_control import inkling_family, inkling_fit
+            rec_ink = inkling_fit.recommend(vram, ram)
+            b = rec_ink["build"]
+            dl_gb = round(sum((inkling_family.size_of(n) or 0) for n in inkling_family.files_of(b, vision=True, dspark=True)) / 1e9, 1)
+            why = (f"{ram:.0f} GB of RAM + {vram:.0f} GB of VRAM: Inkling-2-Mini {b} ({inkling_fit.BUILDS[b]['footprint_gb']:.1f} GB) "
+                   f"runs cleanly on 4+ GB GPUs with routed experts in RAM")
+            cmd = (("START-HERE.bat --setup" if WIN else "./setup.sh --setup") +
+                   f" --yes --family {inkling_family.FAMILY} --model {b} --context {inkling_family.DEFAULT_CONTEXT}" +
+                   (f" --backend {backend}" if backend in ("hip", "sycl") else ""))
+            return {"family": inkling_family.FAMILY, "model": b, "title": f"{inkling_family.TITLE} {b}",
+                    "context": inkling_family.DEFAULT_CONTEXT, "backend": backend,
+                    "gpu": {k: best.get(k) for k in ("index", "name", "vram_gb")},
+                    "download_gb": dl_gb, "why": why, "notes": notes, "setup_command": cmd}
         else:
             return {"family": None, "model": None, "why": f"{ram:.0f} GB of RAM: Strata needs 32 GB or more "
                                                           "(the smallest model, the Coder, keeps ~23 GB of experts in "
@@ -1536,6 +1552,7 @@ class Strata:
                 sizes.append({"model": m, "about": d["about"], "download_gb": d["download_gb"],
                               **({"hy4": hy4} if hy4 else {}),
                               **({"inkling": ink} if ink else {}),
+                              **({"format": d["format"]} if d.get("format") else {}),
                               "experimental": bool(d.get("experimental")),
                               "images": d.get("vision", fd.get("vision", True)) is not False,
                               # which picture reader "pictures on" gets on this PC (strata_control/vision_reader.py, the one rule: the CPU reader
@@ -1781,11 +1798,12 @@ def expected_files(S, family: str, model: str, models_dir: Path, vision: bool) -
             for name in hy4_family.files_of(model, bool(vision)):
                 out.append({"path": str(folder / name), "bytes": hy4_family.size_of(name), "role": "model"})
             return out
-        if family in (getattr(S, "INKLING_FAMILIES", None) or {}):      # Inkling-2-Mini: the build + optional Vision shard in one folder
+        if family in (getattr(S, "INKLING_FAMILIES", None) or {}):      # Inkling-2-Mini: the build (+ DSpark GGUF for Unsloth GGUFs) + optional Vision shard in one folder
             from strata_control import inkling_family
             folder = Path(models_dir) / inkling_family.FAMILY
-            for name in inkling_family.files_of(model, bool(vision)):
-                out.append({"path": str(folder / name), "bytes": inkling_family.size_of(name), "role": "vision" if name == inkling_family.VISION_FILE else "model"})
+            for name in inkling_family.files_of(model, bool(vision), dspark=True):
+                role = "vision" if name == inkling_family.VISION_FILE else ("dspark" if name == inkling_family.DSPARK_GGUF_FILE else "model")
+                out.append({"path": str(folder / name), "bytes": inkling_family.size_of(name), "role": role})
             return out
         own = (getattr(S, "OWN_PATH_FAMILIES", None) or {}).get(family)
         if own:                                         # Qwen3.6: the GGUF and the picture reader in the model's folder

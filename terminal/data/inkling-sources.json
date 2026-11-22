@@ -1,9 +1,15 @@
 {
- "note": "Hugging Face repository for Thinking Machines Inkling-2-Mini (.strata v1.1). Overridden by STRATA_INKLING_SOURCE or config key inkling_source.",
+ "note": "Hugging Face repositories for Thinking Machines Inkling-2-Mini: flagship native .strata v1.1 builds (strata-engine/Inkling-2-Mini-Strata) and Unsloth Dynamic GGUF builds (unsloth/Inkling-2-Mini-GGUF). Overridden by STRATA_INKLING_SOURCE or config key inkling_source.",
  "sources": [
   {
    "kind": "http",
    "base": "https://huggingface.co/strata-engine/Inkling-2-Mini-Strata/resolve/main"
+  }
+ ],
+ "gguf_sources": [
+  {
+   "kind": "http",
+   "base": "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main"
   }
  ]
 }

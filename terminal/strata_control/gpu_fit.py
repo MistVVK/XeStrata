@@ -26,7 +26,7 @@ DENSE_EXTRA_GB = 1.0           # = native-fit.ts DENSE_EXTRA_GB
 SPLIT_CARD_OVERHEAD_GB = 2.0   # each extra card of a split: its own dense layers and prompt buffers
 SPLIT_MIN_VRAM_GB = 8.0        # setup.py SPLIT_MIN_VRAM_GB: a card sharing a model needs this much
 SPLIT_PROMPT_VRAM_GB = 12.0    # setup.py SPLIT_PROMPT_VRAM_GB (#448): a smaller second card caps the prompt chunk
-MIN_CARD_GB = 4.0              # under this a card cannot hold the dense weights: ignored (an iGPU, a display card)
+MIN_CARD_GB = 3.5              # admits 4 GB GPUs reporting 3.8-3.9 GiB (GTX 1650, RTX 3050 4 GB, T500, Arc A310); still ignores 2 GB display cards
 FITS_SPARE_RAM_GB = 4.0        # RAM left beyond the experts below which "fits" becomes "tight"
 SPLIT_PROMPT_GAIN = "about 20% faster"   # setup.py's own words for prompts read on two cards (docs/MULTI_GPU.md)
 
