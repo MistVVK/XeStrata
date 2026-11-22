@@ -1311,8 +1311,12 @@ if(STRATA_ENABLE_XE)
       if(WIN32 AND EXISTS "${STRATA_CUDA_WINDOWS_LIBS}/include/cuda_runtime_api.h")
         set(_strata_cudnn_cuda_inc ${STRATA_CUDA_WINDOWS_LIBS}/include)
       endif()
+      # cudnn-frontend and cuDNN's headers are third-party: system includes keep clang-tidy's analyzer from
+      # reporting their own fields (cudnn-frontend's uninitialized INode::tag) as findings in this source.
+      target_include_directories(strata_kernels SYSTEM PRIVATE
+                   ${strata_cudnn_fe_SOURCE_DIR}/include ${_strata_cudnn_inc})
       set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY INCLUDE_DIRECTORIES
-                   ${strata_cudnn_fe_SOURCE_DIR}/include ${_strata_cudnn_inc} ${_strata_cudnn_cuda_inc})
+                   ${_strata_cudnn_cuda_inc})
       set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS
                    NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING CUDNN_FRONTEND_SKIP_JSON_LIB)
       set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_OPTIONS -w)   # its headers' warnings
