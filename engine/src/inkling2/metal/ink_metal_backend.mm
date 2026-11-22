@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#define INK_METAL_WITH_MODEL_FILE 1
 #include "ink_metal_runner.h"
 
 #ifdef INK_METAL_EMBEDDED_SHADERS
@@ -86,7 +87,12 @@ public:
 
     bool init(const InkModelFile& model, const BackendOpts& opts, std::string& err) override {
         kv_dtype_ = opts.kv_dtype;
-        if (!mod_.load(cx_, model.path, err)) return false;
+        const char* force_mf = std::getenv("INK_METAL_FORCE_MODEL_FILE");
+        if (model.kind == ModelSourceKind::Strata && !(force_mf && force_mf[0] == '1')) {
+            if (!mod_.load(cx_, model.path, err)) return false;
+        } else {
+            if (!mod_.load_from_model_file(cx_, model, err)) return false;
+        }
         const int par = std::max(1, std::min(64, opts.parallel));
         const int batch_cap = std::max(256, std::max(opts.chunk, par));
         if (!runner_.init(cx_, mod_, par, std::max(256, opts.max_ctx), batch_cap,

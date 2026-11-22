@@ -12,6 +12,7 @@
 
 #define INKLING_NO_STBI_IMPL
 #include "ink_backend.h"
+#include "ink_gguf_transcode.h"
 #include "ink_vision.h"
 #include "ink_hip_ops.hip.h"
 #include "ink_hip_tree.hip.h"
@@ -451,7 +452,7 @@ public:
         BackendStats st;
         st.vram_experts_loaded = vram_experts_loaded_;
         st.ram_experts_loaded = ram_experts_loaded_;
-        st.total_experts = model_ ? model_->rd.expert_directory().size() : 0;
+        st.total_experts = !adj_dir_.empty() ? adj_dir_.size() : (model_ ? model_->expert_directory().size() : 0);
         st.vram_used_bytes = vram_used_bytes();
         st.vram_total_bytes = mem_info_.effective_total_bytes;
         st.max_slots = max_slots_;
@@ -515,9 +516,9 @@ public:
             (void)alloc_gpu_buffer(d_exp_w2_f16_,  w2_b,  mem_info_.is_uma);
         }
 
-        // 1. Load Section 1 trunk + DSpark arena from .strata file
+        // 1. Load Section 1 trunk + DSpark arena (supports .strata v1.1, .gguf, and .safetensors!)
         std::vector<uint8_t> sec1;
-        if (!model.rd.read_section(1, sec1, err)) return false;
+        if (!model.read_section1(sec1, err)) return false;
 
         const std::string embed_k = "model.llm.embed.weight";
         const std::string unemb_k = "model.llm.unembed.weight";
@@ -718,7 +719,9 @@ public:
         // 3. Load Section 4 experts in 3x loop-weighted vram_load_order priority!
         // Uses strata::hip_uma::alloc_gpu_buffer so 780M (gfx1103) & 890M (gfx1150) with small 512M-4G BIOS carveout
         // seamlessly allocate coherent GTT UMA memory and fit SQ-10 (9.75 GiB) & SQ-15 (13.36 GiB) 100% on GPU!
-        const auto& dir = model.rd.expert_directory();
+        // For community .gguf (GGUF_RAW), plan_transcoded_expert_directory() computes exact S4_K/S6_K/S8_K sizes upfront!
+        transcode::plan_transcoded_expert_directory(model, adj_dir_);
+        const auto& dir = adj_dir_;
         const size_t n_dir = dir.size();
         expert_gpu_offset_.assign(n_dir, static_cast<size_t>(-1));
         expert_ram_bodies_.resize(n_dir);
@@ -783,32 +786,81 @@ public:
             }
         }
 
+        const int tc_threads = transcode::default_transcode_threads();
         if (arena_bytes > 0) {
             if (!hip_ok(alloc_gpu_buffer(expert_gpu_arena_, arena_bytes, mem_info_.is_uma), "expert GPU arena alloc", err)) {
                 return false;
             }
-            std::vector<uint8_t> tmp;
-            for (uint16_t idx : gpu_plan) {
-                if (!model.rd.read_expert_body(idx, tmp, err)) return false;
-                if ((dir[idx].gu_code_id == CODE_SF4 || dir[idx].dn_code_id == CODE_SF4) && tmp.size() >= 16) {
-                    float hdr[4];
-                    std::memcpy(hdr, tmp.data(), 16);
-                    expert_sf4_outer_[idx] = {hdr[0] / hdr[1], hdr[2] / hdr[3]};
+            if (model.kind == ModelSourceKind::Strata) {
+                std::vector<uint8_t> tmp;
+                for (uint16_t idx : gpu_plan) {
+                    if (!model.rd.read_expert_body(idx, tmp, err)) return false;
+                    if ((dir[idx].gu_code_id == CODE_SF4 || dir[idx].dn_code_id == CODE_SF4) && tmp.size() >= 16) {
+                        float hdr[4];
+                        std::memcpy(hdr, tmp.data(), 16);
+                        expert_sf4_outer_[idx] = {hdr[0] / hdr[1], hdr[2] / hdr[3]};
+                    }
+                    if (!hip_ok(hipMemcpy(expert_gpu_arena_.dev_ptr + expert_gpu_offset_[idx], tmp.data(),
+                                          tmp.size(), hipMemcpyHostToDevice),
+                                "expert H2D", err)) {
+                        return false;
+                    }
                 }
-                if (!hip_ok(hipMemcpy(expert_gpu_arena_.dev_ptr + expert_gpu_offset_[idx], tmp.data(),
-                                      tmp.size(), hipMemcpyHostToDevice),
-                            "expert H2D", err)) {
-                    return false;
+            } else {
+                // Multi-threaded streaming transcode in bounded 16-expert batches (< 128 MiB scratch, 0 temp files)
+                const size_t kBatch = 16;
+                for (size_t b0 = 0; b0 < gpu_plan.size(); b0 += kBatch) {
+                    const size_t bn = std::min(kBatch, gpu_plan.size() - b0);
+                    std::vector<std::vector<uint8_t>> bufs(bn);
+                    std::vector<uint32_t> dn_offs(bn, 0);
+                    std::vector<uint8_t> gu_c(bn, 0), dn_c(bn, 0);
+                    bool ok = transcode::parallel_run(bn, tc_threads, [&](size_t j, std::string& lerr) -> bool {
+                        return transcode::read_or_transcode_expert(model, gpu_plan[b0 + j], bufs[j], dn_offs[j], gu_c[j], dn_c[j], lerr);
+                    }, err);
+                    if (!ok) return false;
+                    for (size_t j = 0; j < bn; ++j) {
+                        const uint16_t idx = gpu_plan[b0 + j];
+                        if ((gu_c[j] == CODE_SF4 || dn_c[j] == CODE_SF4) && bufs[j].size() >= 16) {
+                            float hdr[4];
+                            std::memcpy(hdr, bufs[j].data(), 16);
+                            expert_sf4_outer_[idx] = {hdr[0] / hdr[1], hdr[2] / hdr[3]};
+                        }
+                        if (!hip_ok(hipMemcpy(expert_gpu_arena_.dev_ptr + expert_gpu_offset_[idx], bufs[j].data(),
+                                              bufs[j].size(), hipMemcpyHostToDevice),
+                                    "expert H2D", err)) {
+                            return false;
+                        }
+                    }
                 }
             }
             vram_experts_loaded_ = gpu_plan.size();
         }
-        for (uint16_t idx : ram_plan) {
-            if (!model.rd.read_expert_body(idx, expert_ram_bodies_[idx], err)) return false;
-            if ((dir[idx].gu_code_id == CODE_SF4 || dir[idx].dn_code_id == CODE_SF4) && expert_ram_bodies_[idx].size() >= 16) {
-                float hdr[4];
-                std::memcpy(hdr, expert_ram_bodies_[idx].data(), 16);
-                expert_sf4_outer_[idx] = {hdr[0] / hdr[1], hdr[2] / hdr[3]};
+        if (!ram_plan.empty()) {
+            if (model.kind == ModelSourceKind::Strata) {
+                for (uint16_t idx : ram_plan) {
+                    if (!model.rd.read_expert_body(idx, expert_ram_bodies_[idx], err)) return false;
+                    if ((dir[idx].gu_code_id == CODE_SF4 || dir[idx].dn_code_id == CODE_SF4) && expert_ram_bodies_[idx].size() >= 16) {
+                        float hdr[4];
+                        std::memcpy(hdr, expert_ram_bodies_[idx].data(), 16);
+                        expert_sf4_outer_[idx] = {hdr[0] / hdr[1], hdr[2] / hdr[3]};
+                    }
+                }
+            } else {
+                bool ok = transcode::parallel_run(ram_plan.size(), tc_threads, [&](size_t k, std::string& lerr) -> bool {
+                    const uint16_t idx = ram_plan[k];
+                    uint32_t dn_off = 0;
+                    uint8_t gu_c = 0, dn_c = 0;
+                    if (!transcode::read_or_transcode_expert(model, idx, expert_ram_bodies_[idx], dn_off, gu_c, dn_c, lerr)) {
+                        return false;
+                    }
+                    if ((gu_c == CODE_SF4 || dn_c == CODE_SF4) && expert_ram_bodies_[idx].size() >= 16) {
+                        float hdr[4];
+                        std::memcpy(hdr, expert_ram_bodies_[idx].data(), 16);
+                        expert_sf4_outer_[idx] = {hdr[0] / hdr[1], hdr[2] / hdr[3]};
+                    }
+                    return true;
+                }, err);
+                if (!ok) return false;
             }
         }
         ram_experts_loaded_ = ram_plan.size();
@@ -2004,7 +2056,7 @@ public:
             err = "hip SF4 selfcheck failed: rel_l2=" + std::to_string(rel_l2);
             return false;
         }
-        if (model_) {
+        if (model_ && model_->kind == ModelSourceKind::Strata) {
             std::vector<uint8_t> s5;
             if (!model_->rd.read_section(5, s5, err)) return false;
             if (s5.empty()) { err = "Section 5 sq.selfcheck is empty"; return false; }
@@ -3135,7 +3187,7 @@ private:
                     !hip_ok(hipStreamSynchronize(stream_), "moe off sync", err)) {
                     return false;
                 }
-                const auto& dir = model_->rd.expert_directory();
+                const auto& dir = adj_dir_;
                 for (int eid = 0; eid < c_.n_experts; ++eid) {
                     const int beg = h_off[eid];
                     const int m_e = h_off[eid + 1] - beg;
@@ -3288,7 +3340,7 @@ private:
                     !hip_ok(hipStreamSynchronize(stream_), "hyb route sync", err)) {
                     return false;
                 }
-                const auto& dir = model_->rd.expert_directory();
+                const auto& dir = adj_dir_;
                 const bool is_core_repeat_candidate = (ip >= c_.core_start && ip < c_.core_end && visit < (c_.core_start + 2 * (c_.core_end - c_.core_start)));
 
                 std::vector<GpuExpertDesc> step_exps = h_layer_exps_[ip];
@@ -3336,7 +3388,8 @@ private:
                                     hybrid_.prefetch_async(dir_idx, host_body, dir[dir_idx].body_bytes, false);
                                 } else {
                                     disk_fallback_bufs.emplace_back();
-                                    if (!model_->rd.read_expert_body(dir_idx, disk_fallback_bufs.back(), err)) return false;
+                                    uint32_t tmp_dn = 0; uint8_t tmp_gu = 0, tmp_dnc = 0;
+                                    if (!transcode::read_or_transcode_expert(*model_, dir_idx, disk_fallback_bufs.back(), tmp_dn, tmp_gu, tmp_dnc, err)) return false;
                                     host_body = disk_fallback_bufs.back().data();
                                 }
                                 mi = static_cast<int>(mx8_stream_jobs.size());
@@ -3362,7 +3415,8 @@ private:
                                 hybrid_.prefetch_async(dir_idx, host_body, dir[dir_idx].body_bytes, is_core_repeat_candidate);
                             } else {
                                 disk_fallback_bufs.emplace_back();
-                                if (!model_->rd.read_expert_body(dir_idx, disk_fallback_bufs.back(), err)) return false;
+                                uint32_t tmp_dn = 0; uint8_t tmp_gu = 0, tmp_dnc = 0;
+                                if (!transcode::read_or_transcode_expert(*model_, dir_idx, disk_fallback_bufs.back(), tmp_dn, tmp_gu, tmp_dnc, err)) return false;
                                 host_body = disk_fallback_bufs.back().data();
                             }
                             ji = static_cast<int>(cpu_jobs.size());
@@ -3453,7 +3507,7 @@ private:
                     return false;
                 }
 
-                const auto& dir = model_->rd.expert_directory();
+                const auto& dir = adj_dir_;
                 struct ActiveExp {
                     int eid, dir_idx, beg, m_e;
                     const uint8_t* dev_ptr;
@@ -3482,7 +3536,8 @@ private:
                             hp = expert_ram_bodies_[dir_idx].data();
                         } else {
                             disk_bufs.emplace_back();
-                            if (!model_->rd.read_expert_body(dir_idx, disk_bufs.back(), err)) return false;
+                            uint32_t tmp_dn = 0; uint8_t tmp_gu = 0, tmp_dnc = 0;
+                            if (!transcode::read_or_transcode_expert(*model_, dir_idx, disk_bufs.back(), tmp_dn, tmp_gu, tmp_dnc, err)) return false;
                             hp = disk_bufs.back().data();
                         }
                         ram_exps.push_back({eid, dir_idx, beg, m_e, nullptr, hp});
@@ -4457,6 +4512,7 @@ private:
         trunk_bf16_.clear(); trunk_f32_.clear(); packed_trunk_.clear();
         static_sconv_.clear(); d_msg_queries_.clear(); dspark_bf16_.clear(); dspark_f32_.clear();
         d_layer_exps_.clear(); h_layer_exps_.clear();
+        adj_dir_.clear();
         free_gpu_buffer(expert_gpu_arena_); free_gpu_buffer(d_exp_stage_);
         free_gpu_buffer(d_exp_w13_f16_); free_gpu_buffer(d_exp_w2_f16_);
         free_gpu_buffer(d_dspark_state_); free_gpu_buffer(d_dspark_state2_); free_gpu_buffer(d_dspark_latent_);
@@ -4547,6 +4603,7 @@ private:
     GpuBuffer d_exp_stage_;
     GpuBuffer d_exp_w13_f16_, d_exp_w2_f16_;
     std::vector<size_t> expert_gpu_offset_;
+    std::vector<strata::artifact::StrataExpertEntry> adj_dir_;
     std::vector<std::vector<uint8_t>> expert_ram_bodies_;
     std::vector<std::pair<float, float>> expert_sf4_outer_;
     std::vector<GpuBuffer> d_layer_exps_;

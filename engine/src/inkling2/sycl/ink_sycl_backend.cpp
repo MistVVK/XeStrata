@@ -12,7 +12,21 @@
 #include <string>
 #include <vector>
 
+#define INK_SYCL_WITH_MODEL_FILE 1
 #include "ink_sy_runner.h"
+
+namespace {
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((constructor(101)))
+#endif
+void ink_sycl_early_l0_v1_init() {
+    ink_sycl::ensure_l0_v1_default();
+}
+struct InkSyclEarlyInitGuard {
+    InkSyclEarlyInitGuard() { ink_sycl::ensure_l0_v1_default(); }
+};
+static InkSyclEarlyInitGuard g_ink_sycl_early_init_guard;
+}  // namespace
 
 namespace ink2 {
 
@@ -63,7 +77,12 @@ public:
         const size_t vis_est = !opts.vision_path.empty() ? (700ull << 20) : 0ull;
         const size_t hyb_xmx_est = (320ull << 20);  // Elastic VRAM cache ring (<=256 MiB) + XMX scratch (~32 MiB) + ping-pong
         const size_t extra_reserve = kv_est + dsp_kv + sc_est + act_est + vis_est + hyb_xmx_est;
-        if (!mod_.load(model.path, opts.vram_experts_gb, err, extra_reserve)) return false;
+        ink_sycl::ensure_l0_v1_default();
+        if (model.kind == ModelSourceKind::Strata) {
+            if (!mod_.load(model.path, opts.vram_experts_gb, err, extra_reserve)) return false;
+        } else {
+            if (!mod_.load_from_model_file(model, opts.vram_experts_gb, err, extra_reserve)) return false;
+        }
         if (!runner_.init(mod_, par, ctx, batch_cap, opts.enable_dspark, err)) {
             return false;
         }

@@ -75,6 +75,7 @@ add_custom_command(
           -Wall -Wextra -Wno-unused-function -Wno-unused-result
           "${_ink_hip_src}" -o "${_ink_hip_obj}"
   DEPENDS "${_ink_hip_src}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../ink_gguf_transcode.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_common.hip.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_codecs.hip.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_ops.hip.h"

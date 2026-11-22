@@ -67,6 +67,10 @@ static void top5_line(const float* lg, int V, int pos, std::string& out) {
 }
 
 int main(int argc, char** argv) {
+    // Work around oneAPI 2026.1.1 Level Zero V2 + oneMKL GEMM SIGSEGV (exit 139) on Battlemage (Arc Pro B70 / bmg_g31).
+    if (!std::getenv("UR_LOADER_USE_LEVEL_ZERO_V2")) {
+        hy4s_setenv("UR_LOADER_USE_LEVEL_ZERO_V2", "0", 0);
+    }
     // Backend: Level Zero with SYCL command_graph replay (~2.15 us/kernel) beats OpenCL eager (~7.35 us/kernel) on both prefill & decode!
     // HY4S_BACKEND=opencl (or an explicit ONEAPI_DEVICE_SELECTOR) overrides.
     const bool user_sel = std::getenv("ONEAPI_DEVICE_SELECTOR") != nullptr;
