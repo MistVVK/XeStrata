@@ -620,7 +620,7 @@ type MainWindow(setup: Setup.Access) as this =
                         | "slow" | "no" -> yield badge failBrush (tr "install.doesNotFitThe" "does not fit the RAM")
                         | _ -> ()
                     ]
-                    muted (trf "install.sizeAbout" "{about}; download {download}, needs ~{ram} of RAM" [ "about", box m.About; "download", box (gb m.DownloadGb); "ram", box (gb m.RamGb) ])
+                    muted (trf "install.sizeAbout" "{about}; download {download}, needs ~{ram} of RAM" [ "about", box m.About; "download", box (gbTenth m.DownloadGb); "ram", box (gb m.RamGb) ])
                 ])
         let contexts = ComboBox(MinWidth = 160.0)
         let license = muted ""

@@ -685,7 +685,7 @@ MODELS: dict[str, dict[str, Any]] = {
                    "file": "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-0000{i}-of-00003.gguf", "vision": True},
 }
 # Sync's pre-built packs use the same engine as Qwen3.8-Flash-Next.  The thresholds are the pack authors'
-# recommendations, in GiB; they decide only the size within this family, not the first model setup recommends.
+# recommendations, in GiB; they decide the size within this family and whether it runs here (FIRST_CHOICE).
 MODELS.update({
     "Sync-XS": {"about": "the smallest Sync pack", "download_gb": 57.7, "ram_gb": 24,
                 "arena_gb": 20.47, "families": ("sync",), "vision": True},
@@ -1697,7 +1697,7 @@ FAMILIES.update(PLAIN_FAMILIES)
 # changed copy) and its quantization (whose files), then the size (the user's decision of 2026-11-09: the families of
 # one level mixed models, copies and quantizers).  A family is one (model, version, quantization), its --family ID
 # kept; Ornith-1.5's sizes are of two quantizations (a size's own "quantizer").  BASES in the order setup lists them:
-# FIRST_CHOICE's models first.
+# Qwen3.8-Flash-Next, the model of FIRST_CHOICE's first families, first.
 BASES = {"qwen3.8-flash-next": "Qwen3.8-Flash-Next",
          "ornith-1.5": "Ornith-1.5-35B-A3B",
          "qwen3.6": "Qwen3.6-35B-A3B", "qwen3.5-9b": "Qwen3.5-9B", "qwen3.5-2b": "Qwen3.5-2B",
@@ -1740,11 +1740,21 @@ TIERS = {  # family: (model, version, quantization), in the order each level lis
 }
 # a model's line in setup's first question where its original family's "about" does not say what the model is
 BASE_ABOUT = {"qwen3.8-flash-next": "Qwen's model, the one XeStrata is made for"}
-# the families a first install is offered, in this order: the first this PC runs (recommend_family), with the size it
-# must hold where one is named (the user's decisions of 2026-11-09 and 2026-11-14: Swift 1.5's SC117 copy where its
-# IQ3_XXS runs, else Gyro-Coder-L where its experts all fit the RAM, else Gyro-Coder, then the smaller models)
-FIRST_CHOICE = (("sc117-swift", "IQ3_XXS"), ("gyro-coder", "Gyro-Coder-L"), ("gyro-coder", "Gyro-Coder"),
-                ("ornith", None), ("qwen36", None), ("qwen35", None), ("qwen35-2b", None))
+# Signal-2's RAM at its peak (GiB, the engine's resident set): 58.6 to 64.4 in the runs of 2026-11-22 (Arc Pro B70,
+# its n-gram table in RAM: --ple-io ram, 1K and 4K prompts, 512 tokens of decode), the largest kept
+SIGNAL2_PEAK_RAM_GB = 64.4
+# the families a first install is offered, in this order (the user's decision of 2026-11-22): the first this PC runs
+# (first_choice).  Each: (family, the sizes it is offered in, best first, or None: the one recommend_size takes;
+# the RAM it takes at its peak, which the RAM must hold with LOW_RAM_HEADROOM_GB beside it, or None; whether most of
+# the size's experts must be in the GPUs' cache, gpu_holds_most).  Swift 1.5's SC117 copy, IQ3_S where it runs with
+# most of its experts on the GPUs, else IQ3_XXS so (VRAM about 31.2 and 27.5 GB: a 32 GB card); else Signal-2 where
+# the RAM holds its peak (74.4 GiB: a 64 GB PC, 62.7 as ram_gb reads it, does not; a 96 GB one does); else Sync (XS,
+# S or M); else SenseNova-Loop-9B (QSA); else Qwen3.5-2B (LAST_CHOICE), offered when nothing else runs.  A family that
+# is not in FAMILIES is passed over.
+FIRST_CHOICE = (("sc117-swift", ("IQ3_S", "IQ3_XXS"), None, True), ("signal2", None, SIGNAL2_PEAK_RAM_GB, False),
+                ("sync", None, None, False), ("sensenova-loop-qsa", None, None, False),
+                ("qwen35-2b", None, None, False))
+LAST_CHOICE = "qwen35-2b"
 
 
 def plain_parts(d: dict) -> list[dict[str, Any]]:
@@ -6917,17 +6927,61 @@ def runs_here(family: str, room: Room) -> bool:
                if fam.get("plain") or not MODELS[m].get("experimental"))
 
 
-def recommend_family(fams: list, room: Room) -> str:
-    """The family a first install is offered: on the CPU Qwen3.5-2B, else the first of FIRST_CHOICE this PC runs (the
-    size it names, or any), else the first of `fams`"""
+def gpu_holds_most(size: str, room: Room) -> bool:
+    """Most of a Flash-Next size's experts in the GPUs' cache at 32K (low_ram_gpu_gb: the VRAM less ~6 GB for the
+    dense weights, buffers and the draft layer).  Below that "most experts stay on the CPU and it will be slow" (step
+    1's line for a small card), and a 3-bit GSQ-RCO size does more CPU work per expert than a smaller one: IQ3_S needs
+    6 + 50.3 / 2 = 31.2 GB, IQ3_XXS 6 + 42.9 / 2 = 27.5."""
+    return low_ram_gpu_gb(size, room.vram) >= MODELS[size]["arena_gb"] / 2
+
+
+def first_choice(fams: list, room: Room) -> tuple:
+    """(family, size) a first install is offered: on the CPU Qwen3.5-2B, else the first of FIRST_CHOICE this PC runs
+    (the first of its sizes that runs with what it asks of the GPUs, or any size, and its peak RAM with
+    LOW_RAM_HEADROOM_GB beside it), else Qwen3.5-2B (LAST_CHOICE); the first of `fams` without it.  The size is None
+    where the family's own recommendation (recommend_size) decides it."""
+    last = (LAST_CHOICE if LAST_CHOICE in fams else fams[0], None)
     if room.on_cpu:
-        return "qwen35-2b" if "qwen35-2b" in fams else fams[0]
-    return next((f for f, size in FIRST_CHOICE if f in fams and
-                 (size_fits(f, size, room) if size else runs_here(f, room))), fams[0])
+        return last
+    for f, sizes, peak, most in FIRST_CHOICE:
+        if f not in fams or (peak is not None and room.ram < peak + LOW_RAM_HEADROOM_GB):
+            continue
+        if sizes is None:
+            if runs_here(f, room):
+                return f, None
+            continue
+        size = next((m for m in sizes if size_fits(f, m, room) and (not most or gpu_holds_most(m, room))), None)
+        if size:
+            return f, size
+    return last
+
+
+def recommend_family(fams: list, room: Room) -> str:
+    """The family a first install is offered (first_choice)"""
+    return first_choice(fams, room)[0]
 
 
 def model_shards(fam: dict, model: str) -> int:
     return fam.get("forms", {}).get(model, MODELS.get(model, {})).get("shards", fam.get("shards", 2))
+
+
+def files_gb(family: str, model: str) -> float:
+    """A size's model files on disk (GB), as setup's lists show it: the sizes pinned for that family's files (SC117's
+    Swift 1.5 IQ3_S 83.5, not MODELS' 83.6 of ISTA-DASLab's), a Sync pack's files with the files all packs share, a
+    model of PLAIN_FAMILIES' file; a model of the user's own files as setup read them.  The picture reader and the MTP
+    draft layer are not counted."""
+    fam = FAMILIES[family]
+    if fam.get("plain"):
+        return fam["models"][model]["size"] / 1e9
+    if fam.get("custom"):
+        return MODELS[model]["download_gb"]
+    if family == "sync":
+        return sum(n for files in (sync_models.PACK_FILES[model], sync_models.SHARED_FILES)
+                   for n, _ in files.values()) / 1e9
+    pins = [published_pin(model_file(fam, model, i), fam, model) for i in range(1, model_shards(fam, model) + 1)]
+    if None in pins:
+        raise KeyError(f"{family} {model}: a model file without a pinned size")
+    return sum(p[0] for p in pins if p) / 1e9
 
 
 def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
@@ -9113,7 +9167,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                 f"   <- needs ~{need:.0f} GB of VRAM at {c // 1024}K, the GPU has {gpu_gb:.0f} GB"
         else:
             fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
-        say(f"  {i}) {m:15s} {d['about']}" + ("" if d.get("custom") else f"; download {gb:.0f} GB") + fit)
+        say(f"  {i}) {m:15s} {d['about']}" + ("" if d.get("custom") else f"; download {gb:.1f} GB") + fit)
     # the best quality this PC runs (recommend_size; on the CPU the family's own choice: every size runs as int8)
     cards = [gpu_info(i) for i in sel] if len(sel) > 1 else [gpu]
     rec = str(names.index(recommend_size(family, room_of(ram, cards), names)) + 1)
@@ -9939,6 +9993,7 @@ def describe() -> dict:
     vram = gpu_expert_vram(gpu) if gpu else 0.0
     by_vram = vram_ctx([gpu]) if gpu else 32768
     room = room_of(ram, [gpu] if gpu else [])
+    first_fam, first_size = first_choice([f for f in FAMILIES if f != CUSTOM], room)
     families = []
     for f, fam in FAMILIES.items():
         if fam.get("edge0"):
@@ -9950,6 +10005,8 @@ def describe() -> dict:
         by_quant = {q: recommend_size(f, room, [m for m in names if size_quantizer(f, m) == q])
                     for q in dict.fromkeys(size_quantizer(f, m) for m in names)}
         rec = recommend_size(f, room, names)
+        if f == first_fam and first_size:              # the first install's offer: its size, also within its quant
+            rec = by_quant[size_quantizer(f, first_size)] = first_size
         if fam.get("plain"):
             ctx_f = min(by_vram, fam["max_context"])
             for m in names:
@@ -9971,7 +10028,8 @@ def describe() -> dict:
                 fits = (("yes" if size_fits(f, m, room) else "no") if f == "sync" else
                         "budget" if d.get("budget") else "yes" if ram >= d["ram_gb"] else "low-ram" if low else
                         "no")
-                models.append({"id": m, "about": d["about"], "download_gb": d["download_gb"], "ram_gb": d["ram_gb"],
+                models.append({"id": m, "about": d["about"], "download_gb": round(files_gb(f, m), 1),
+                               "ram_gb": d["ram_gb"],
                                "fits": fits, "experimental": bool(d.get("experimental")),
                                "recommended": m == by_quant[size_quantizer(f, m)], "quantizer": size_quantizer(f, m),
                                "context": min(by_vram, ram_ctx(m, ram, low)),
@@ -10020,7 +10078,7 @@ def describe() -> dict:
             # the versions' and quantizations' names
             "bases": [{"id": b, "title": t} for b, t in BASES.items()]
             + ([{"id": CUSTOM, "title": FAMILIES[CUSTOM]["title"]}] if CUSTOM in FAMILIES else []),
-            "recommended_family": recommend_family([f for f in FAMILIES if f != CUSTOM], room),
+            "recommended_family": first_fam,
             "variants": VARIANTS, "quantizers": QUANTIZERS,
             "images": images, "image_default": list(QI.SETUP_DEFAULT),
             # SAM 3.1's license (--image-sam3-license), and whether it was agreed to (ask_sam3_license's record)
@@ -10835,12 +10893,14 @@ def main() -> int:
     halo = gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu and ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB
     halo_fam = (next((f for f in fams if f in MODELS.get(STRIX_HALO_MODEL, {}).get("families", ())), None)
                 if halo else None)
+    first: tuple = (None, None)
     if a.family:
         family = a.family
     else:
         # the first this PC runs of FIRST_CHOICE (without a GPU: the 2B, the better answers), asked by its levels
         room = room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]])
-        family, a.quantizer = ask_tiers(fams, halo_fam or recommend_family(fams, room), room, halo_fam, a.yes)
+        first = first_choice(fams, room)
+        family, a.quantizer = ask_tiers(fams, halo_fam or first[0], room, halo_fam, a.yes)
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
     if (lic := family_license(family)):
@@ -10870,15 +10930,17 @@ def main() -> int:
         if m == have_size:
             fit += "   (installed)"
         if d.get("budget"):
-            say(f"  {i}) {m} {d['about']}; download {d['download_gb']:.0f} GB, keeps ~"
+            say(f"  {i}) {m} {d['about']}; download {files_gb(family, m):.1f} GB, keeps ~"
                 f"{resident_budget_gib(m, ram)} GB of its {d['arena_gb']:.0f} GB of experts in RAM{fit}")
             continue
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, vram) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, vram):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, vram) else "the rest from the SSD)"))
-        say(f"  {i}) {m:8s} {d['about']}" + ("" if d.get("custom") else f"; download {d['download_gb']:.0f} GB") +
+        say(f"  {i}) {m:8s} {d['about']}" + ("" if d.get("custom") else f"; download {files_gb(family, m):.1f} GB") +
             f", uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index(recommend_size(family, room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]]), names)) + 1)
+    if family == first[0] and first[1] in names:     # the first install's offer (first_choice): its size
+        rec = str(names.index(first[1]) + 1)
     if family == halo_fam and STRIX_HALO_MODEL in names:
         rec = str(names.index(STRIX_HALO_MODEL) + 1)
     if have_size is not None:   # setup run again: the installed size, whatever is recommended for a first install

@@ -289,6 +289,17 @@ let ``the install page starts at setup's recommendation`` () =
     Assert.True(visible lv.Quantization, "Qwen3.8-Flash-Next has four quantizations")
     Assert.Equal(4, lv.Quantization.ItemCount)
 
+/// A size shows its model files to a tenth of a GB at any size (setup's files_gb: 83.5 and 83.6 GB are two files).
+[<AvaloniaFact>]
+let ``a size shows its files to a tenth of a GB`` () =
+    english ()
+    let d = described.Value
+    let w = open' (FakeSetup(d, none))
+    let lv = installPage w
+    let m = lv.Sizes.SelectedItem :?> Model
+    Assert.True(m.DownloadGb >= 10.0, sprintf "%s: a size of 10 GB or more is needed here" m.Id)
+    Assert.True(shows w (sprintf "download %s GB," (m.DownloadGb.ToString("0.0"))), sprintf "%s: %g GB" m.Id m.DownloadGb)
+
 /// Every family, each of its sizes and each context the install page offers, the fields setup would ask shown.
 [<AvaloniaFact>]
 let ``every family, size and context can be chosen`` () =

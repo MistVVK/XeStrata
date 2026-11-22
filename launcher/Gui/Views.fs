@@ -96,4 +96,7 @@ let field (label: string) (control: Control) =
 let gb (x: float) =
     trf "unit.gb" "{n} GB" [ "n", box (if x >= 10.0 then x.ToString("0") else x.ToString("0.0")) ]
 
+/// A model's files: to a tenth of a GB at any size (setup's files_gb; 83.5 and 75.8 GB, not 84 and 76)
+let gbTenth (x: float) = trf "unit.gb" "{n} GB" [ "n", box (x.ToString("0.0")) ]
+
 let contextLabel (tokens: int) = trf "unit.ktokens" "{n}K tokens" [ "n", box (tokens / 1024) ]
