@@ -59,6 +59,7 @@
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/rope.hpp"
+#include "strata/platform/env.hpp"
 
 #include "parity_device.hpp"
 #include "strata/core/gpu.hpp"
@@ -73,6 +74,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <fstream>
 #include <random>
@@ -151,6 +153,39 @@ void report(const std::string& name, double v, const char* unit) {
 void require(const std::string& name, bool ok, const std::string& detail = "") {
     std::printf("  %-48s %-6s %s\n", name.c_str(), ok ? "ok" : "*** BAD ***", detail.c_str());
     if (!ok) ++g_bad;
+}
+
+// The accepted limit of QSA index selection, from the 14 recorded P2 text fixtures (visit 03, 07, ... 55,
+// 64 sampled positions each = 896).  Five positions select one block too many and one too few, four cells each.
+// The residual was accepted as a known limit on 2026-11-20; the fixture K/Q and the reference CPU rotary give
+// 896/896, and the device's pow differs from the CPU's by 1 ulp, without proving that this is the only cause.
+// The list is written out in full (visit, position, extra cells, missing cells) so that a sixth deviation, a
+// different position, or a different block size fails the test instead of widening the allowance silently.
+struct SelectionDeviation { int position, extra, missing; };
+struct KnownSelectionDeviation { int visit, position, extra, missing; };
+constexpr KnownSelectionDeviation kKnownSelectionDeviations[] = {
+    {15, 15104, 4, 4}, {23, 16128, 4, 4}, {31, 11520, 4, 4}, {31, 15872, 4, 4}, {47, 16128, 4, 4},
+};
+std::vector<SelectionDeviation> expected_deviations(int visit) {
+    std::vector<SelectionDeviation> out;
+    for (const auto& d : kKnownSelectionDeviations)
+        if (d.visit == visit) out.push_back({d.position, d.extra, d.missing});
+    return out;
+}
+std::string describe_deviations(const std::vector<SelectionDeviation>& v) {
+    std::string s;
+    for (const auto& d : v) {
+        if (!s.empty()) s += ", ";
+        s += std::to_string(d.position) + ":+" + std::to_string(d.extra) + "/-" + std::to_string(d.missing);
+    }
+    return s.empty() ? "none" : s;
+}
+bool same_deviations(const std::vector<SelectionDeviation>& got, const std::vector<SelectionDeviation>& want) {
+    if (got.size() != want.size()) return false;
+    for (size_t i = 0; i < got.size(); ++i)
+        if (got[i].position != want[i].position || got[i].extra != want[i].extra || got[i].missing != want[i].missing)
+            return false;
+    return true;
 }
 
 // ================= the reference: ref/qsa.py + ref/model.py, in double =================
@@ -380,13 +415,14 @@ constexpr int kOracleN = (int) (sizeof(kOracle) / sizeof(kOracle[0])) / 2;
 
 int main(int argc, char** argv) try {
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // a crash must not swallow what was printed already
-    bool selftest = false, dense = false, bench = false;
+    bool selftest = false, dense = false, bench = false, fixture896 = false;
     std::string fixture, long_fixture, full_fixture, project_fixture;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
         else if (a == "--qsa-dense") dense = true;
         else if (a == "--bench") bench = true;
+        else if (a == "--qsa-896-fixture") fixture896 = true;
         else if (a == "--fixture" && i + 1 < argc) fixture = argv[++i];
         else if (a == "--long-fixture" && i + 1 < argc) long_fixture = argv[++i];
         else if (a == "--full-fixture" && i + 1 < argc) full_fixture = argv[++i];
@@ -396,7 +432,10 @@ int main(int argc, char** argv) try {
                                  "  --qsa-dense  attend to EVERY cell instead of the indexer's selection\n"
                                  "               (P1.S4's isolation switch; the sparse selection is still run\n"
                                  "                and checked, against the reference's dense/sparse property)\n"
-                                 "  --bench      time the kernels at 32K of context\n");
+                                 "  --bench      time the kernels at 32K of context\n"
+                                 "  --qsa-896-fixture  check the 14 recorded fixtures (896 positions) against the\n"
+                                 "               accepted selection deviations; XESTRATA_QSA_896_FIXTURES names\n"
+                                 "               their directory; skip (77) when it is absent\n");
             return 2;
         }
     }
@@ -540,8 +579,8 @@ int main(int argc, char** argv) try {
         strata::gpu::stream_destroy(cs);
     }
 
-    if (!full_fixture.empty()) {
-        std::ifstream input(full_fixture, std::ios::binary);
+    auto run_full_fixture = [&](const std::string& path, int visit, bool accepted_limit) {
+        std::ifstream input(path, std::ios::binary);
         auto read = [&](size_t n) {
             std::vector<float> v(n);
             if (!input.read(reinterpret_cast<char*>(v.data()), (std::streamsize) (n * sizeof(float))))
@@ -579,6 +618,7 @@ int main(int argc, char** argv) try {
         for (size_t i = 0; i < got_k.size(); ++i) km = std::max(km, std::fabs(double(got_k[i]) - want_k[i]));
         for (size_t i = 0; i < got_q.size(); ++i) qm = std::max(qm, std::fabs(double(got_q[i]) - want_q[i]));
         int mismatches = 0, extra_total = 0, missing_total = 0;
+        std::vector<SelectionDeviation> deviations;
         for (int t = 0; t < Q; ++t) {
             const int n = t * 256 + 1, nb = n / 4;
             for (int b = 0; b < nb; ++b) {
@@ -597,6 +637,7 @@ int main(int argc, char** argv) try {
             for (int i = 0; i < n; ++i) { extra += selected[(size_t) i] && !expected[(size_t) i];
                 missing += expected[(size_t) i] && !selected[(size_t) i]; }
             if (extra || missing) { ++mismatches; extra_total += extra; missing_total += missing;
+                deviations.push_back({t * 256, extra, missing});
                 std::printf("    position %d: extra %d missing %d\n", t * 256, extra, missing); }
         }
         report("full fixture key max absolute error", km, "max");
@@ -605,7 +646,13 @@ int main(int argc, char** argv) try {
         report("full fixture score relative RMS", std::sqrt(score_sq / score_ref_sq), "ratio");
         std::printf("  full fixture selected cells: %d/%d rows differ, extra %d missing %d\n",
                     mismatches, Q, extra_total, missing_total);
-        require("full fixture selected cells", mismatches == 0);
+        if (accepted_limit) {
+            const auto allowed = expected_deviations(visit);
+            require("full fixture accepted selection deviations", same_deviations(deviations, allowed),
+                    "got " + describe_deviations(deviations) + ", allowed " + describe_deviations(allowed));
+        } else {
+            require("full fixture selected cells", mismatches == 0);
+        }
         Dev<float> ref_k, ref_q; ref_k.put(want_k); ref_q.put(want_q);
         const struct { const char* name; const float* keys; const float* query; } cases[] = {
             {"engine K + fixture Q", pooled.p, ref_q.p}, {"fixture K + engine Q", ref_k.p, out_q.p},
@@ -642,6 +689,33 @@ int main(int argc, char** argv) try {
                         c.name, mx, std::sqrt(dsq / wsq), rows_bad, Q, ex, miss);
         }
         strata::gpu::stream_destroy(cs);
+        return mismatches;
+    };
+
+    if (!full_fixture.empty()) run_full_fixture(full_fixture, 0, false);
+
+    if (fixture896) {
+        const char* dir = strata::env_get("QSA_896_FIXTURES");
+        if (dir == nullptr || dir[0] == '\0' || !std::filesystem::is_directory(dir)) {
+            std::printf("qsa 896 fixture: XESTRATA_QSA_896_FIXTURES is unset or not a directory; skip (77)\n");
+            return 77;
+        }
+        int observed = 0;
+        for (int visit = 3; visit <= 55; visit += 4) {
+            char name[32];
+            std::snprintf(name, sizeof name, "visit-%02d.bin", visit);
+            const std::filesystem::path path = std::filesystem::path(dir) / name;
+            if (!std::filesystem::is_regular_file(path)) {
+                require("qsa 896 fixture " + std::string(name), false, "missing");
+                continue;
+            }
+            std::printf("\n-- qsa 896 fixture visit %d (%s)\n", visit, name);
+            observed += run_full_fixture(path.string(), visit, true);
+        }
+        constexpr int kExpectedDeviations = sizeof(kKnownSelectionDeviations) / sizeof(kKnownSelectionDeviations[0]);
+        std::printf("qsa 896 fixtures: %d/896 rows differ, %d deviations, %d allowed\n",
+                    observed, observed, kExpectedDeviations);
+        require("qsa 896 total accepted deviations", observed == kExpectedDeviations);
     }
 
     if (!project_fixture.empty()) {
