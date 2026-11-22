@@ -14,9 +14,21 @@ constexpr int kMaxParallelSlots = 64;
 constexpr int kKvPageTokens = 64;  // 64-token pages for on-demand SWA-1024 & Global KV allocation
 
 enum class KvDtype : uint8_t {
-    FP16 = 0,     // 32 KiB/tok Global (8 visits x 8 kv_heads x 128 dim x 2 x 2B), 160 MiB max SWA-1024
+    FP16     = 0, // 32 KiB/tok Global (8 visits x 8 kv_heads x 128 dim x 2 x 2B), 160 MiB max SWA-1024
     FP8_E4M3 = 1, // 16 KiB/tok Global (64 MiB per 4K slot!), 80 MiB max SWA-1024 -> 64 slots fit in 16-32 GB GPU!
+    K8V8     = 2, // 16.5 KiB/tok Global: symmetric INT8 K & INT8 V with per-64 FP16 scales (#6520 / @merbanan)
+    K8V4     = 3, // 12.75 KiB/tok Global: symmetric INT8 K + 4-bit asymmetric V with per-64 FP16 scale & min (#6520 / @merbanan)
 };
+
+inline const char* kv_dtype_name(KvDtype dt) noexcept {
+    switch (dt) {
+        case KvDtype::FP16:     return "fp16";
+        case KvDtype::FP8_E4M3: return "fp8";
+        case KvDtype::K8V8:     return "k8v8";
+        case KvDtype::K8V4:     return "k8v4";
+        default:                return "fp16";
+    }
+}
 
 // ---- Scalar FP16 / BF16 / FP8 E4M3FN conversion helpers (portable across CPU & GPU host prep) ----
 inline float bf16_to_f32(uint16_t b) noexcept {
@@ -122,12 +134,16 @@ struct SlotMemBudget {
 };
 
 inline SlotMemBudget estimate_slot_bytes(int max_ctx, KvDtype kv_dtype, bool with_dspark) {
-    const size_t elem = (kv_dtype == KvDtype::FP8_E4M3) ? 1u : 2u;
     const size_t kv_dim = 8u * 128u;  // 1024
     const size_t swa_len = static_cast<size_t>(std::min(max_ctx, 1024));
+    // Bytes per token per visit for K + V combined
+    size_t kv_tok_bytes = 2u * kv_dim * 2u;  // FP16: 4096 B
+    if (kv_dtype == KvDtype::FP8_E4M3) kv_tok_bytes = 2u * kv_dim;
+    else if (kv_dtype == KvDtype::K8V8) kv_tok_bytes = 2u * kv_dim + 2u * (kv_dim / 64u) * 2u;
+    else if (kv_dtype == KvDtype::K8V4) kv_tok_bytes = kv_dim + (kv_dim / 2u) + (kv_dim / 64u) * 2u + (kv_dim / 64u) * 4u;
     SlotMemBudget b;
-    b.swa_kv_bytes    = 40u * swa_len * 2u * kv_dim * elem;
-    b.global_kv_bytes = 8u * static_cast<size_t>(max_ctx) * 2u * kv_dim * elem;
+    b.swa_kv_bytes    = 40u * swa_len * kv_tok_bytes;
+    b.global_kv_bytes = 8u * static_cast<size_t>(max_ctx) * kv_tok_bytes;
     b.sconv_bytes     = 48u * 3u * (1024u + 1024u + 2304u + 2304u) * 2u;  // 1,916,928 x 2 = 3,833,856 B (~3.83 MB)
     if (with_dspark) {
         b.dspark_bytes = (2u * std::min<size_t>(max_ctx, 1025u) + static_cast<size_t>(max_ctx)) * 2u * kv_dim * 2u
@@ -137,7 +153,9 @@ inline SlotMemBudget estimate_slot_bytes(int max_ctx, KvDtype kv_dtype, bool wit
 }
 
 // ---- Paged KV Cache for a single slot (on-demand 64-token page allocation -> tiny footprint for active slots!) ----
+// Supports FP16, FP8_E4M3, K8V8 (per-64 INT8 K + INT8 V), and K8V4 (per-64 INT8 K + 4-bit asymmetric V)
 struct SlotKvPages {
+    static constexpr int kGroupSize = 64;
     KvDtype dtype = KvDtype::FP16;
     int kv_dim = 1024;
     int swa_win = 1024;
@@ -145,12 +163,15 @@ struct SlotKvPages {
     int n_glob_visits = 8;
     int seq_len = 0;
 
-    // Each page stores kKvPageTokens * kv_dim elements (uint16_t for FP16, uint8_t for FP8)
-    // SWA pages: [n_swa_visits][max_swa_pages], ring-indexed by (pos % swa_win) / kKvPageTokens
+    // Each page stores kKvPageTokens rows:
+    //   FP16: kv_dim * 2 B for K, kv_dim * 2 B for V
+    //   FP8_E4M3: kv_dim B for K, kv_dim B for V; 1 float scale/token
+    //   K8V8: kv_dim B int8 K, kv_dim B int8 V; (kv_dim/64) float scales/token
+    //   K8V4: kv_dim B int8 K, (kv_dim/2) B packed u4 V; (kv_dim/64) scales for K, 2*(kv_dim/64) (scale, min) for V
     int max_swa_pages = 16;  // 1024 / 64 = 16
     std::vector<std::vector<uint8_t>> swa_k_pages;  // [n_swa_visits * max_swa_pages]
     std::vector<std::vector<uint8_t>> swa_v_pages;
-    std::vector<std::vector<float>>   swa_k_scales; // per-token scale for FP8 [n_swa_visits * max_swa_pages][64]
+    std::vector<std::vector<float>>   swa_k_scales;
     std::vector<std::vector<float>>   swa_v_scales;
 
     // Global pages: [n_glob_visits][num_alloc_pages] grown on demand!
@@ -179,13 +200,31 @@ struct SlotKvPages {
 
     void reset() { seq_len = 0; }
 
-    size_t elem_bytes() const noexcept { return (dtype == KvDtype::FP8_E4M3) ? 1u : 2u; }
+    size_t k_row_bytes() const noexcept {
+        return (dtype == KvDtype::FP16) ? static_cast<size_t>(kv_dim) * 2u : static_cast<size_t>(kv_dim);
+    }
+    size_t v_row_bytes() const noexcept {
+        if (dtype == KvDtype::FP16) return static_cast<size_t>(kv_dim) * 2u;
+        if (dtype == KvDtype::K8V4) return static_cast<size_t>(kv_dim) / 2u;
+        return static_cast<size_t>(kv_dim);
+    }
+    size_t k_scales_per_tok() const noexcept {
+        if (dtype == KvDtype::FP16) return 0u;
+        if (dtype == KvDtype::FP8_E4M3) return 1u;
+        return static_cast<size_t>((kv_dim + kGroupSize - 1) / kGroupSize);
+    }
+    size_t v_scales_per_tok() const noexcept {
+        if (dtype == KvDtype::FP16) return 0u;
+        if (dtype == KvDtype::FP8_E4M3) return 1u;
+        if (dtype == KvDtype::K8V4) return 2u * static_cast<size_t>((kv_dim + kGroupSize - 1) / kGroupSize);
+        return static_cast<size_t>((kv_dim + kGroupSize - 1) / kGroupSize);
+    }
 
-    void write_vec(uint8_t* page, float* scales, int slot_in_page, const float* src) const noexcept {
+    void write_k_vec(uint8_t* page, float* scales, int slot_in_page, const float* src) const noexcept {
         if (dtype == KvDtype::FP16) {
             uint16_t* dst = reinterpret_cast<uint16_t*>(page) + static_cast<size_t>(slot_in_page) * kv_dim;
             for (int i = 0; i < kv_dim; ++i) dst[i] = f32_to_fp16(src[i]);
-        } else {
+        } else if (dtype == KvDtype::FP8_E4M3) {
             float amax = 0.0f;
             for (int i = 0; i < kv_dim; ++i) amax = std::max(amax, std::fabs(src[i]));
             const float sc = (amax > 1e-12f) ? (amax / 448.0f) : 1.0f;
@@ -193,17 +232,96 @@ struct SlotKvPages {
             scales[slot_in_page] = sc;
             uint8_t* dst = page + static_cast<size_t>(slot_in_page) * kv_dim;
             for (int i = 0; i < kv_dim; ++i) dst[i] = f32_to_fp8_e4m3(src[i] * inv);
+        } else {
+            // K8V8 & K8V4 both store K as symmetric per-64 INT8 with FP16-rounded scale
+            const int ng = (kv_dim + kGroupSize - 1) / kGroupSize;
+            float* sc_row = scales + static_cast<size_t>(slot_in_page) * ng;
+            int8_t* dst = reinterpret_cast<int8_t*>(page) + static_cast<size_t>(slot_in_page) * kv_dim;
+            for (int g = 0; g < ng; ++g) {
+                const int i0 = g * kGroupSize;
+                const int i1 = std::min(kv_dim, i0 + kGroupSize);
+                float amax = 0.0f;
+                for (int i = i0; i < i1; ++i) amax = std::max(amax, std::fabs(src[i]));
+                const float sc = fp16_to_f32(f32_to_fp16(amax / 127.0f));
+                sc_row[g] = sc;
+                const float inv = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
+                for (int i = i0; i < i1; ++i) {
+                    int q = static_cast<int>(std::nearbyintf(src[i] * inv));
+                    dst[i] = static_cast<int8_t>(std::clamp(q, -127, 127));
+                }
+            }
         }
     }
 
-    void read_vec(const uint8_t* page, const float* scales, int slot_in_page, float* dst) const noexcept {
+    void write_v_vec(uint8_t* page, float* scales, int slot_in_page, const float* src) const noexcept {
+        if (dtype != KvDtype::K8V4) {
+            write_k_vec(page, scales, slot_in_page, src);
+            return;
+        }
+        // K8V4 V path: per-64 asymmetric 4-bit (0..15) with FP16-rounded (scale, min)
+        const int ng = (kv_dim + kGroupSize - 1) / kGroupSize;
+        float* sc_row = scales + static_cast<size_t>(slot_in_page) * (2u * ng);
+        uint8_t* dst = page + static_cast<size_t>(slot_in_page) * (kv_dim / 2);
+        for (int g = 0; g < ng; ++g) {
+            const int i0 = g * kGroupSize;
+            const int i1 = std::min(kv_dim, i0 + kGroupSize);
+            float vmin = src[i0], vmax = src[i0];
+            for (int i = i0 + 1; i < i1; ++i) {
+                vmin = std::min(vmin, src[i]);
+                vmax = std::max(vmax, src[i]);
+            }
+            const float sc = fp16_to_f32(f32_to_fp16((vmax - vmin) / 15.0f));
+            const float mn = fp16_to_f32(f32_to_fp16(vmin));
+            sc_row[2 * g + 0] = sc;
+            sc_row[2 * g + 1] = mn;
+            const float inv = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
+            for (int i = i0; i < i1; i += 2) {
+                int q0 = std::clamp(static_cast<int>(std::nearbyintf((src[i] - mn) * inv)), 0, 15);
+                int q1 = (i + 1 < i1) ? std::clamp(static_cast<int>(std::nearbyintf((src[i + 1] - mn) * inv)), 0, 15) : 0;
+                dst[i / 2] = static_cast<uint8_t>((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+            }
+        }
+    }
+
+    void read_k_vec(const uint8_t* page, const float* scales, int slot_in_page, float* dst) const noexcept {
         if (dtype == KvDtype::FP16) {
             const uint16_t* src = reinterpret_cast<const uint16_t*>(page) + static_cast<size_t>(slot_in_page) * kv_dim;
             for (int i = 0; i < kv_dim; ++i) dst[i] = fp16_to_f32(src[i]);
-        } else {
+        } else if (dtype == KvDtype::FP8_E4M3) {
             const float sc = scales[slot_in_page];
             const uint8_t* src = page + static_cast<size_t>(slot_in_page) * kv_dim;
             for (int i = 0; i < kv_dim; ++i) dst[i] = fp8_e4m3_to_f32(src[i]) * sc;
+        } else {
+            const int ng = (kv_dim + kGroupSize - 1) / kGroupSize;
+            const float* sc_row = scales + static_cast<size_t>(slot_in_page) * ng;
+            const int8_t* src = reinterpret_cast<const int8_t*>(page) + static_cast<size_t>(slot_in_page) * kv_dim;
+            for (int g = 0; g < ng; ++g) {
+                const int i0 = g * kGroupSize;
+                const int i1 = std::min(kv_dim, i0 + kGroupSize);
+                const float sc = sc_row[g];
+                for (int i = i0; i < i1; ++i) dst[i] = static_cast<float>(src[i]) * sc;
+            }
+        }
+    }
+
+    void read_v_vec(const uint8_t* page, const float* scales, int slot_in_page, float* dst) const noexcept {
+        if (dtype != KvDtype::K8V4) {
+            read_k_vec(page, scales, slot_in_page, dst);
+            return;
+        }
+        const int ng = (kv_dim + kGroupSize - 1) / kGroupSize;
+        const float* sc_row = scales + static_cast<size_t>(slot_in_page) * (2u * ng);
+        const uint8_t* src = page + static_cast<size_t>(slot_in_page) * (kv_dim / 2);
+        for (int g = 0; g < ng; ++g) {
+            const int i0 = g * kGroupSize;
+            const int i1 = std::min(kv_dim, i0 + kGroupSize);
+            const float sc = sc_row[2 * g + 0];
+            const float mn = sc_row[2 * g + 1];
+            for (int i = i0; i < i1; i += 2) {
+                const uint8_t b = src[i / 2];
+                dst[i] = static_cast<float>(b & 0x0Fu) * sc + mn;
+                if (i + 1 < i1) dst[i + 1] = static_cast<float>((b >> 4) & 0x0Fu) * sc + mn;
+            }
         }
     }
 
@@ -211,60 +329,52 @@ struct SlotKvPages {
         const int rpos = pos % swa_win;
         const int p_idx = swa_slot * max_swa_pages + (rpos / kKvPageTokens);
         const int off = rpos % kKvPageTokens;
-        const size_t pbytes = static_cast<size_t>(kKvPageTokens) * kv_dim * elem_bytes();
         if (swa_k_pages[p_idx].empty()) {
-            swa_k_pages[p_idx].resize(pbytes);
-            swa_v_pages[p_idx].resize(pbytes);
-            if (dtype == KvDtype::FP8_E4M3) {
-                swa_k_scales[p_idx].assign(kKvPageTokens, 1.0f);
-                swa_v_scales[p_idx].assign(kKvPageTokens, 1.0f);
-            }
+            swa_k_pages[p_idx].resize(static_cast<size_t>(kKvPageTokens) * k_row_bytes());
+            swa_v_pages[p_idx].resize(static_cast<size_t>(kKvPageTokens) * v_row_bytes());
+            if (k_scales_per_tok() > 0) swa_k_scales[p_idx].assign(static_cast<size_t>(kKvPageTokens) * k_scales_per_tok(), 1.0f);
+            if (v_scales_per_tok() > 0) swa_v_scales[p_idx].assign(static_cast<size_t>(kKvPageTokens) * v_scales_per_tok(), 1.0f);
         }
-        write_vec(swa_k_pages[p_idx].data(), swa_k_scales[p_idx].data(), off, k);
-        write_vec(swa_v_pages[p_idx].data(), swa_v_scales[p_idx].data(), off, v);
+        write_k_vec(swa_k_pages[p_idx].data(), swa_k_scales[p_idx].empty() ? nullptr : swa_k_scales[p_idx].data(), off, k);
+        write_v_vec(swa_v_pages[p_idx].data(), swa_v_scales[p_idx].empty() ? nullptr : swa_v_scales[p_idx].data(), off, v);
     }
 
     void load_swa(int swa_slot, int pos, float* k, float* v) const {
         const int rpos = pos % swa_win;
         const int p_idx = swa_slot * max_swa_pages + (rpos / kKvPageTokens);
         const int off = rpos % kKvPageTokens;
-        read_vec(swa_k_pages[p_idx].data(), swa_k_scales[p_idx].data(), off, k);
-        read_vec(swa_v_pages[p_idx].data(), swa_v_scales[p_idx].data(), off, v);
+        read_k_vec(swa_k_pages[p_idx].data(), swa_k_scales[p_idx].empty() ? nullptr : swa_k_scales[p_idx].data(), off, k);
+        read_v_vec(swa_v_pages[p_idx].data(), swa_v_scales[p_idx].empty() ? nullptr : swa_v_scales[p_idx].data(), off, v);
     }
 
     void store_global(int glob_slot, int pos, const float* k, const float* v) {
         const size_t pg = static_cast<size_t>(pos / kKvPageTokens);
         const int off = pos % kKvPageTokens;
-        const size_t pbytes = static_cast<size_t>(kKvPageTokens) * kv_dim * elem_bytes();
         if (pg >= glob_k_pages[glob_slot].size()) {
             glob_k_pages[glob_slot].resize(pg + 1);
             glob_v_pages[glob_slot].resize(pg + 1);
-            if (dtype == KvDtype::FP8_E4M3) {
-                glob_k_scales[glob_slot].resize(pg + 1);
-                glob_v_scales[glob_slot].resize(pg + 1);
-            }
+            if (k_scales_per_tok() > 0) glob_k_scales[glob_slot].resize(pg + 1);
+            if (v_scales_per_tok() > 0) glob_v_scales[glob_slot].resize(pg + 1);
         }
         if (glob_k_pages[glob_slot][pg].empty()) {
-            glob_k_pages[glob_slot][pg].resize(pbytes);
-            glob_v_pages[glob_slot][pg].resize(pbytes);
-            if (dtype == KvDtype::FP8_E4M3) {
-                glob_k_scales[glob_slot][pg].assign(kKvPageTokens, 1.0f);
-                glob_v_scales[glob_slot][pg].assign(kKvPageTokens, 1.0f);
-            }
+            glob_k_pages[glob_slot][pg].resize(static_cast<size_t>(kKvPageTokens) * k_row_bytes());
+            glob_v_pages[glob_slot][pg].resize(static_cast<size_t>(kKvPageTokens) * v_row_bytes());
+            if (k_scales_per_tok() > 0) glob_k_scales[glob_slot][pg].assign(static_cast<size_t>(kKvPageTokens) * k_scales_per_tok(), 1.0f);
+            if (v_scales_per_tok() > 0) glob_v_scales[glob_slot][pg].assign(static_cast<size_t>(kKvPageTokens) * v_scales_per_tok(), 1.0f);
         }
-        write_vec(glob_k_pages[glob_slot][pg].data(),
-                  dtype == KvDtype::FP8_E4M3 ? glob_k_scales[glob_slot][pg].data() : nullptr, off, k);
-        write_vec(glob_v_pages[glob_slot][pg].data(),
-                  dtype == KvDtype::FP8_E4M3 ? glob_v_scales[glob_slot][pg].data() : nullptr, off, v);
+        write_k_vec(glob_k_pages[glob_slot][pg].data(),
+                    k_scales_per_tok() > 0 ? glob_k_scales[glob_slot][pg].data() : nullptr, off, k);
+        write_v_vec(glob_v_pages[glob_slot][pg].data(),
+                    v_scales_per_tok() > 0 ? glob_v_scales[glob_slot][pg].data() : nullptr, off, v);
     }
 
     void load_global(int glob_slot, int pos, float* k, float* v) const {
         const size_t pg = static_cast<size_t>(pos / kKvPageTokens);
         const int off = pos % kKvPageTokens;
-        read_vec(glob_k_pages[glob_slot][pg].data(),
-                 dtype == KvDtype::FP8_E4M3 ? glob_k_scales[glob_slot][pg].data() : nullptr, off, k);
-        read_vec(glob_v_pages[glob_slot][pg].data(),
-                 dtype == KvDtype::FP8_E4M3 ? glob_v_scales[glob_slot][pg].data() : nullptr, off, v);
+        read_k_vec(glob_k_pages[glob_slot][pg].data(),
+                   k_scales_per_tok() > 0 ? glob_k_scales[glob_slot][pg].data() : nullptr, off, k);
+        read_v_vec(glob_v_pages[glob_slot][pg].data(),
+                   v_scales_per_tok() > 0 ? glob_v_scales[glob_slot][pg].data() : nullptr, off, v);
     }
 };
 

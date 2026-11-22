@@ -824,6 +824,109 @@ HY4_FAMILIES = {
     }
 }
 
+# Inkling-2-Mini custom/community local-file & Hugging Face import sources (official HF safetensors + Unsloth GGUFs).
+# Native `.strata` v1.1 (SQ-20, SQ-15, SQ-10 + Vision) remains the flagship recommended default; `strata-inkling` also
+# loads official `thinkingmachines/Inkling-2-Mini` safetensors (zero requantization) and community `.gguf` files directly.
+INKLING_COMMUNITY_SOURCES = {
+    "safetensors": {
+        "title": "Inkling-2-Mini (Official HF safetensors)",
+        "repo": "thinkingmachines/Inkling-2-Mini",
+        "format": "safetensors",
+        "files": ("model-00001-of-00001.safetensors", "model.safetensors.index.json", "config.json",
+                  "tokenizer.json", "chat_template.jinja"),
+        "dspark": "mtp.safetensors",
+        "arch": "inkling2_loop",
+        "exe": "component:strata-inkling",
+        "recommended_default": False,
+    },
+    "gguf": {
+        "title": "Inkling-2-Mini (Community / Unsloth GGUF)",
+        "repo": "unsloth/Inkling-2-Mini-GGUF",
+        "format": "gguf",
+        "arch": "inkling2_loop",
+        "exe": "component:strata-inkling",
+        "recommended_default": False,
+        "models": {
+            "UD-Q4_K_XL": {"file": "Inkling-2-Mini-UD-Q4_K_XL.gguf", "ram_gb": 24,
+                           "about": "NVFP4 (L0..19) + Q8_0 (L20..23) Unsloth Dynamic GGUF"},
+            "UD-IQ4_XS": {"file": "Inkling-2-Mini-UD-IQ4_XS.gguf", "ram_gb": 20,
+                          "about": "IQ4_XS Unsloth Dynamic GGUF"},
+            "UD-IQ3_XXS": {"file": "Inkling-2-Mini-UD-IQ3_XXS.gguf", "ram_gb": 16,
+                           "about": "Compact IQ3_XXS Unsloth Dynamic GGUF"},
+            "UD-Q8_K_XL": {"file": "Inkling-2-Mini-UD-Q8_K_XL.gguf", "ram_gb": 32,
+                           "about": "High-precision Q8_K_XL Unsloth Dynamic GGUF"},
+        },
+        "sha256": {
+            "Inkling-2-Mini-UD-Q4_K_XL.gguf": (
+                17629759456, "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15"
+            ),
+        },
+        "dspark": "dspark-Inkling-2-Mini-Q8_0.gguf",
+        "mmproj": "mmproj-BF16.gguf",
+    },
+}
+
+
+def detect_inkling_source_format(path: str | os.PathLike) -> str | None:
+    """Detect whether `path` is a `.strata`, official HF `safetensors`, or `.gguf` Inkling-2-Mini source."""
+    p = Path(path)
+    if p.is_dir():
+        if (p / "model.safetensors.index.json").is_file() or (p / "model-00001-of-00001.safetensors").is_file():
+            return "safetensors"
+        if any(f.suffix.lower() == ".safetensors" and f.name != "mtp.safetensors" for f in p.iterdir() if f.is_file()):
+            return "safetensors"
+        return None
+    if not p.is_file():
+        return None
+    low = p.name.lower()
+    if low.endswith(".strata"):
+        return "strata"
+    if low.endswith(".safetensors") or low == "model.safetensors.index.json":
+        return "safetensors"
+    if low.endswith(".gguf"):
+        try:
+            with p.open("rb") as fh:
+                if fh.read(4) == b"GGUF":
+                    return "gguf"
+        except OSError:
+            pass
+    return None
+
+
+def build_inkling_import_args(
+    model_path: str | os.PathLike,
+    *,
+    max_context: int = 32768,
+    parallel: int = 1,
+    gpus: int = 1,
+    ep_split: float | None = None,
+    kv: str | None = None,
+    vram_reserve_mib: int | None = None,
+    cpu_threads: int | None = None,
+    dspark_path: str | os.PathLike | None = None,
+    vision_path: str | os.PathLike | None = None,
+) -> list[str]:
+    """Build unified `strata-inkling` engine args for `.strata` (default), official `safetensors`, or `.gguf`."""
+    args = ["--native", str(model_path), "--max-context", str(max_context)]
+    if parallel > 1:
+        args += ["--parallel", str(parallel)]
+    if gpus > 1:
+        args += ["--gpus", str(gpus)]
+        if ep_split is not None:
+            args += ["--ep-split", f"{ep_split:.3f}"]
+    if kv:
+        args += ["--kv", str(kv)]
+    if vram_reserve_mib is not None and vram_reserve_mib >= 0:
+        args += ["--vram-reserve-mib", str(vram_reserve_mib)]
+    if cpu_threads is not None and cpu_threads > 0:
+        args += ["--cpu-threads", str(cpu_threads)]
+    if dspark_path:
+        args += ["--dspark", str(dspark_path)]
+    if vision_path:
+        args += ["--vision", str(vision_path)]
+    return args
+
+
 # Every model file Strata downloads has a fixed size and SHA-256: (repository, file name) -> (bytes, sha256).  download()
 # checks the file against it as soon as it is whole (a wrong file is deleted and setup stops), and stops before the
 # download when the server's size is not the pinned one.  The files are fetched from the commits in HF_REVISIONS.
@@ -9574,8 +9677,8 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         download(fam["hf"] + gguf.name, gguf)
     verify_sha256(gguf, *fam["sha256"][published], own=bool(a.gguf_dir))
     ok(f"model file: {gguf}")
-    mmproj = folder / fam["mmproj"]
-    if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
+    if vision != "none" and fam.get("mmproj"):         # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
+        mmproj = folder / fam["mmproj"]
         if not a.gguf_dir and not have(mmproj) and not mmproj.with_name(mmproj.name + ".part").exists():
             # another size of this model has it already (the same file, kept beside each size): linked here, not fetched again
             if share_sibling_file(mmproj, Path(a.models_dir), mmproj.name, fam["sha256"][mmproj.name][0]):

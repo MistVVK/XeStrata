@@ -19,12 +19,17 @@ struct BackendOpts {
     int parallel = 1;            // 1..64 concurrent slots
     int chunk = 512;
     int gpu_index = 0;
+    int gpus = 1;                // 1 or 2 (--gpus 2 activates Dual-GPU Expert Parallelism, #6506)
+    double ep_split = 0.5;       // GPU 1 expert share in (0, 1) (--ep-split / IK2_EP_SPLIT)
+    int vram_reserve_mib = -1;   // >= 0 reserves N MiB free VRAM & activates hybrid offload (#6520)
+    int cpu_threads = 0;         // > 0 activates CUDA-Graph mapped-memory doorbell NUMA CPU expert pool (#6520)
     int threads = 0;             // 0 = auto
     double vram_experts_gb = -1.0; // <0 = auto (3x loop-weighted vram_load_order!)
     double ram_experts_gb = -1.0;  // <0 = auto
     KvDtype kv_dtype = KvDtype::FP16;
     bool kv_dtype_auto = true;   // auto selects FP8_E4M3 when parallel >= 16 on <= 32 GiB GPU
     bool enable_dspark = true;
+    std::string dspark_path;     // optional external mtp.safetensors or dspark-*.gguf
     std::string vision_path;
 };
 
@@ -95,6 +100,9 @@ std::unique_ptr<InkBackend> make_cpu_backend();
 #ifdef INKLING_ENABLE_CUDA
 std::unique_ptr<InkBackend> make_cuda_backend();
 #endif
+#ifdef INKLING_ENABLE_EP_CUDA
+std::unique_ptr<InkBackend> make_ep_cuda_backend();
+#endif
 #ifdef INKLING_ENABLE_HIP
 std::unique_ptr<InkBackend> make_hip_backend();
 #endif
@@ -105,10 +113,20 @@ std::unique_ptr<InkBackend> make_metal_backend();
 std::unique_ptr<InkBackend> make_sycl_backend();
 #endif
 
-inline std::unique_ptr<InkBackend> make_default_backend(bool force_cpu = false) {
+inline std::unique_ptr<InkBackend> make_default_backend(bool force_cpu = false, const BackendOpts* opts = nullptr) {
     if (!force_cpu) {
+#ifdef INKLING_ENABLE_EP_CUDA
+        // Prefer modular Dual-GPU EP / Graph-Doorbell Hybrid CUDA backend when --gpus >= 2, --cpu-threads > 0,
+        // --vram-reserve-mib >= 0, or when K8V8/K8V4 KV is selected (or when primary CUDA backend isn't built).
+        const bool need_ep_or_hybrid = opts && (
+            opts->gpus >= 2 || opts->cpu_threads > 0 || opts->vram_reserve_mib >= 0 ||
+            opts->kv_dtype == KvDtype::K8V8 || opts->kv_dtype == KvDtype::K8V4);
+        if (need_ep_or_hybrid) return make_ep_cuda_backend();
+#endif
 #ifdef INKLING_ENABLE_CUDA
         return make_cuda_backend();
+#elif defined(INKLING_ENABLE_EP_CUDA)
+        return make_ep_cuda_backend();
 #elif defined(INKLING_ENABLE_HIP)
         return make_hip_backend();
 #elif defined(INKLING_ENABLE_METAL)

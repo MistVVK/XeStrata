@@ -12,7 +12,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ink_gguf_loader.h"
 #include "ink_json.h"
+#include "ink_safetensors_loader.h"
 #include "strata/artifact/strata_reader.hpp"
 #include "strata/quant/sk_codecs.hpp"
 
@@ -27,12 +29,13 @@ enum WFmt : int {
     F_S5    = 5,
     F_S6    = 6,
     F_S8    = 8,
-    F_SF4   = 15,
-    F_MX8   = 16,
-    F_Q8ROW = 100,
-    F_F32   = 101,
-    F_BF16  = 102,
-    F_F16   = 103,
+    F_SF4      = 15,
+    F_MX8      = 16,
+    F_GGUF_RAW = 20,
+    F_Q8ROW    = 100,
+    F_F32      = 101,
+    F_BF16     = 102,
+    F_F16      = 103,
 };
 
 inline int fmt_from_str(const std::string& s) {
@@ -419,18 +422,57 @@ struct Sha256 {
     }
 };
 
-// Opened .strata v1.1 model handle shared across CPU/CUDA/HIP/Metal/SYCL backends
+enum class ModelSourceKind : uint8_t {
+    Strata      = 0,  // Flagship native .strata v1.1 (default recommended)
+    Safetensors = 1,  // Official HF thinkingmachines/Inkling-2-Mini (+ mtp.safetensors)
+    Gguf        = 2,  // Community / Unsloth .gguf (single or multi-shard + optional dspark)
+};
+
+inline const char* source_kind_name(ModelSourceKind k) noexcept {
+    switch (k) {
+        case ModelSourceKind::Strata:      return "strata";
+        case ModelSourceKind::Safetensors: return "safetensors";
+        case ModelSourceKind::Gguf:        return "gguf";
+        default:                           return "unknown";
+    }
+}
+
+// Unified model handle (.strata v1.1 + Official HF safetensors + Community/Unsloth .gguf)
+// shared transparently across CPU / CUDA / HIP / Metal / SYCL backends.
 struct InkModelFile {
     std::string path;
+    ModelSourceKind kind = ModelSourceKind::Strata;
     strata::artifact::StrataFileReader rd;
+    std::unique_ptr<SafetensorsAdapter> st_adapter;
+    std::unique_ptr<GgufAdapter> gguf_adapter;
     InkManifest m;
-    // Direct lookup: dir_index_of[phys_layer * n_experts + expert_id] -> index in rd.expert_directory()
+    // Direct lookup: dir_index_of[phys_layer * n_experts + expert_id] -> index in expert_directory()
     std::vector<int> dir_index_of;
     // 3x loop-weighted priority order of directory indices (0..3071)
     std::vector<uint16_t> vram_load_order;
 
-    bool open(const std::string& file_path, std::string& err, bool keep_tokenizer = false) {
+    bool open(const std::string& file_path, std::string& err, bool keep_tokenizer = false,
+              const std::string& explicit_dspark = "") {
         path = file_path;
+        st_adapter.reset();
+        gguf_adapter.reset();
+        dir_index_of.clear();
+        vram_load_order.clear();
+
+        if (SafetensorsAdapter::is_safetensors_path(file_path)) {
+            kind = ModelSourceKind::Safetensors;
+            st_adapter = std::make_unique<SafetensorsAdapter>();
+            return st_adapter->open_into<InkManifest, TInfo>(
+                file_path, m, dir_index_of, vram_load_order, err, keep_tokenizer, explicit_dspark);
+        }
+        if (GgufAdapter::is_gguf_path(file_path)) {
+            kind = ModelSourceKind::Gguf;
+            gguf_adapter = std::make_unique<GgufAdapter>();
+            return gguf_adapter->open_into<InkManifest, TInfo>(
+                file_path, m, dir_index_of, vram_load_order, err, keep_tokenizer, explicit_dspark);
+        }
+
+        kind = ModelSourceKind::Strata;
         if (!rd.open(file_path, err)) return false;
         if (!parse_manifest(rd.manifest_json(), m, err, keep_tokenizer)) return false;
         const auto& dir = rd.expert_directory();
@@ -469,7 +511,26 @@ struct InkModelFile {
         return true;
     }
 
+    const std::vector<strata::artifact::StrataExpertEntry>& expert_directory() const {
+        if (kind == ModelSourceKind::Safetensors && st_adapter) return st_adapter->expert_dir;
+        if (kind == ModelSourceKind::Gguf && gguf_adapter) return gguf_adapter->expert_dir;
+        return rd.expert_directory();
+    }
+
+    bool read_section1(std::vector<uint8_t>& out, std::string& err) const {
+        if (kind == ModelSourceKind::Safetensors && st_adapter) return st_adapter->read_section1(out, err);
+        if (kind == ModelSourceKind::Gguf && gguf_adapter) return gguf_adapter->read_section1(out, err);
+        return rd.read_section(1, out, err);
+    }
+
+    bool read_expert_body(size_t dir_index, std::vector<uint8_t>& out, std::string& err) const {
+        if (kind == ModelSourceKind::Safetensors && st_adapter) return st_adapter->read_expert_body(dir_index, m.c.n_experts, out, err);
+        if (kind == ModelSourceKind::Gguf && gguf_adapter) return gguf_adapter->read_expert_body(dir_index, m.c.n_experts, out, err);
+        return rd.read_expert_body(dir_index, out, err);
+    }
+
     bool verify_sections(std::string& err, bool verify_section4 = true) const {
+        if (kind != ModelSourceKind::Strata) return true;  // safetensors/GGUF verified via header/bounds at open
         std::vector<uint8_t> chunk(8 * 1024 * 1024);
         for (int sid = 0; sid < strata::artifact::STRATA_NUM_SECTIONS; ++sid) {
             if (sid == 4 && !verify_section4) continue;

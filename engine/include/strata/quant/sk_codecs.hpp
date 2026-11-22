@@ -21,9 +21,23 @@ enum class SkCode : uint8_t {
     S5_K  = 5,  // 166 B (6 B hdr + 160 B 5-bit symmetric half-integer q in 0..31)
     S6_K  = 6,  // 198 B (6 B hdr + 192 B 6-bit symmetric half-integer q in 0..63)
     S8_K  = 8,  // 262 B (6 B hdr + 256 B 8-bit signed int8 q in [-127..127])
-    SF4   = 15, // Lossless NVFP4: E2M1 nibbles + F8_E4M3/16w block scales + F32 amax/denom (.strata v1.1)
-    MX8   = 16, // Lossless MXFP8: F8_E4M3 weights + UE8M0/32w block scales (.strata v1.1)
+    SF4      = 15, // Lossless NVFP4: E2M1 nibbles + F8_E4M3/16w block scales + F32 amax/denom (.strata v1.1)
+    MX8      = 16, // Lossless MXFP8: F8_E4M3 weights + UE8M0/32w block scales (.strata v1.1)
+    GGUF_RAW = 20, // Lossless native GGUF block expert body (Q8_0/Q4_K/Q5_K/Q6_K/IQ3_S/IQ4_NL/IQ4_XS/MXFP4)
 };
+
+// 32-byte aligned header prepended to SkCode::GGUF_RAW expert bodies
+struct GgufExpertHeader {
+    uint32_t magic;       // 0x47475546u ("GGUF")
+    uint32_t gu_type;     // ggml_type for gate/up weights
+    uint32_t dn_type;     // ggml_type for down weights
+    uint32_t flags;       // bit 0: 1 = interleaved (even=gate, odd=up), 0 = split ([gate rows 0..F-1; up rows F..2F-1])
+    float    gate_scale;  // per-expert scale for gate (1.0f if absent)
+    float    up_scale;    // per-expert scale for up (1.0f if absent)
+    float    dn_scale;    // per-expert scale for down (1.0f if absent)
+    uint32_t reserved;    // padding to 32 bytes
+};
+static_assert(sizeof(GgufExpertHeader) == 32, "GgufExpertHeader must be 32 B");
 
 constexpr size_t superblock_bytes(SkCode code) noexcept {
     switch (code) {

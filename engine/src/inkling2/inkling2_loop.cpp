@@ -1,6 +1,8 @@
 // src/inkling2/inkling2_loop.cpp - Native ModelFamily::Inkling2Loop + DSpark Block-8 Markov ops
 // MIT License - Copyright (c) 2026 Strata contributors
 #include "strata/inkling2/inkling2_loop.hpp"
+#include "strata/artifact/gguf_reader.hpp"
+#include "strata/quant/dequant.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -209,7 +211,55 @@ void eval_inkling2_expert_batch(
     std::vector<float> act(m * inter);
 
     // 1. w13 projection [2*inter, hidden] (interleaved: even rows = gate, odd rows = up)
-    if (gu_code == SkCode::SF4) {
+    if (gu_code == SkCode::GGUF_RAW) {
+        GgufExpertHeader hdr{};
+        std::memcpy(&hdr, body, sizeof(hdr));
+        int be = 0, bb = 0;
+        strata::block_geometry(hdr.gu_type, be, bb);
+        const size_t row_b = (be > 0) ? (hidden / static_cast<size_t>(be)) * static_cast<size_t>(bb) : 0;
+        const uint8_t* w_base = body + sizeof(GgufExpertHeader);
+        std::vector<float> wrow(hidden);
+        auto deq_row = [&](const uint8_t* src) {
+            if (hdr.gu_type == 0) {
+                std::memcpy(wrow.data(), src, hidden * 4);
+            } else if (hdr.gu_type == 1) {
+                const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+                for (size_t c = 0; c < hidden; ++c) wrow[c] = fp16_bits_to_f32(p[c]);
+            } else if (hdr.gu_type == 30) {
+                const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+                for (size_t c = 0; c < hidden; ++c) {
+                    uint32_t u = static_cast<uint32_t>(p[c]) << 16;
+                    std::memcpy(&wrow[c], &u, 4);
+                }
+            } else {
+                strata::quant::dequant_row(static_cast<strata::quant::Type>(hdr.gu_type), src, wrow.data(), static_cast<int64_t>(hidden));
+            }
+        };
+        const bool interleaved = (hdr.flags & 1u) != 0;
+        if (interleaved) {
+            for (size_t r = 0; r < 2 * inter; ++r) {
+                deq_row(w_base + r * row_b);
+                const float sc = ((r & 1u) == 0) ? hdr.gate_scale : hdr.up_scale;
+                for (size_t t = 0; t < m; ++t) {
+                    gu[t * (2 * inter) + r] = dot_f32(wrow.data(), x_in + t * hidden, hidden) * sc;
+                }
+            }
+        } else {
+            // Split layout: rows [0..inter-1] = gate, rows [inter..2*inter-1] = up
+            for (size_t j = 0; j < inter; ++j) {
+                deq_row(w_base + j * row_b);
+                for (size_t t = 0; t < m; ++t) {
+                    gu[t * (2 * inter) + 2 * j + 0] = dot_f32(wrow.data(), x_in + t * hidden, hidden) * hdr.gate_scale;
+                }
+            }
+            for (size_t j = 0; j < inter; ++j) {
+                deq_row(w_base + (inter + j) * row_b);
+                for (size_t t = 0; t < m; ++t) {
+                    gu[t * (2 * inter) + 2 * j + 1] = dot_f32(wrow.data(), x_in + t * hidden, hidden) * hdr.up_scale;
+                }
+            }
+        }
+    } else if (gu_code == SkCode::SF4) {
         float hdr[4];
         std::memcpy(hdr, body, 16);
         const float w13_outer = hdr[0] / hdr[1];
@@ -268,7 +318,35 @@ void eval_inkling2_expert_batch(
     }
 
     // 3. w2 projection [hidden, inter]
-    if (dn_code == SkCode::SF4) {
+    if (dn_code == SkCode::GGUF_RAW) {
+        GgufExpertHeader hdr{};
+        std::memcpy(&hdr, body, sizeof(hdr));
+        int be = 0, bb = 0;
+        strata::block_geometry(hdr.dn_type, be, bb);
+        const size_t row_b = (be > 0) ? (inter / static_cast<size_t>(be)) * static_cast<size_t>(bb) : 0;
+        const uint8_t* w2_base = body + dn_offset;
+        std::vector<float> wrow(inter);
+        for (size_t r = 0; r < hidden; ++r) {
+            const uint8_t* src = w2_base + r * row_b;
+            if (hdr.dn_type == 0) {
+                std::memcpy(wrow.data(), src, inter * 4);
+            } else if (hdr.dn_type == 1) {
+                const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+                for (size_t c = 0; c < inter; ++c) wrow[c] = fp16_bits_to_f32(p[c]);
+            } else if (hdr.dn_type == 30) {
+                const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+                for (size_t c = 0; c < inter; ++c) {
+                    uint32_t u = static_cast<uint32_t>(p[c]) << 16;
+                    std::memcpy(&wrow[c], &u, 4);
+                }
+            } else {
+                strata::quant::dequant_row(static_cast<strata::quant::Type>(hdr.dn_type), src, wrow.data(), static_cast<int64_t>(inter));
+            }
+            for (size_t t = 0; t < m; ++t) {
+                y_out[t * hidden + r] = dot_f32(wrow.data(), act.data() + t * inter, inter) * hdr.dn_scale;
+            }
+        }
+    } else if (dn_code == SkCode::SF4) {
         float hdr[4];
         std::memcpy(hdr, body, 16);
         const float w2_outer = hdr[2] / hdr[3];

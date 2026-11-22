@@ -127,7 +127,7 @@ public:
     BackendStats stats() const override {
         BackendStats st;
         st.ram_experts_loaded = expert_bodies_.size();
-        st.total_experts = model_ ? model_->rd.expert_directory().size() : 0;
+        st.total_experts = model_ ? model_->expert_directory().size() : 0;
         st.max_slots = static_cast<int>(slots_.size());
         for (const auto& s : slots_) if (s.allocated) ++st.active_slots;
         st.kv_dtype = default_kv_dtype_;
@@ -145,9 +145,9 @@ public:
         if (opts.threads > 0) omp_set_num_threads(opts.threads);
 #endif
 
-        // 1. Load Section 1 trunk + DSpark arena
+        // 1. Load Section 1 trunk + DSpark arena (works identically for .strata, official safetensors, and .gguf!)
         std::vector<uint8_t> sec1;
-        if (!model.rd.read_section(1, sec1, err)) return false;
+        if (!model.read_section1(sec1, err)) return false;
 
         // Decode trunk tensors (keep embed/unembed in compact raw/BF16 if huge? On CPU, keep BF16 for embed/unembed & F32 for layers)
         const std::string embed_k = "model.llm.embed.weight";
@@ -213,7 +213,7 @@ public:
         }
 
         // 3. Load Section 4 experts into RAM in 3x loop-weighted vram_load_order priority (respecting --ram-experts-gb)
-        const auto& dir = model.rd.expert_directory();
+        const auto& dir = model.expert_directory();
         expert_bodies_.resize(dir.size());
         const size_t ram_cap_bytes = (opts.ram_experts_gb > 0.0)
             ? static_cast<size_t>(opts.ram_experts_gb * 1073741824.0)
@@ -222,7 +222,7 @@ public:
         for (uint16_t idx : model.vram_load_order) {
             if (idx >= dir.size()) continue;
             if (loaded_bytes + dir[idx].body_bytes > ram_cap_bytes) continue;
-            if (!model.rd.read_expert_body(idx, expert_bodies_[idx], err)) return false;
+            if (!model.read_expert_body(idx, expert_bodies_[idx], err)) return false;
             loaded_bytes += dir[idx].body_bytes;
         }
 
@@ -668,7 +668,7 @@ public:
 
             std::vector<float> moe_out(static_cast<size_t>(B) * D, 0.0f);
             std::vector<std::vector<float>> exp_y(active_exps.size());
-            const auto& dir = model_->rd.expert_directory();
+            const auto& dir = model_->expert_directory();
             std::string io_err;
             bool io_ok = true;
 
@@ -692,7 +692,7 @@ public:
                     #pragma omp critical
                     {
                         std::string e2;
-                        if (!model_->rd.read_expert_body(dir_idx, disk_buf, e2)) {
+                        if (!model_->read_expert_body(dir_idx, disk_buf, e2)) {
                             io_ok = false;
                             io_err = e2;
                         }
@@ -1054,8 +1054,32 @@ public:
                 return false;
             }
         }
-        // 4. Verify Section 5 payload if model is loaded
-        if (model_) {
+        // 4. Verify K8V8 & K8V4 KV round-trip accuracy (#6520 / @merbanan)
+        {
+            std::vector<float> kv_in(1024), kv_k(1024), kv_v(1024);
+            for (int i = 0; i < 1024; ++i) kv_in[i] = std::sin(static_cast<float>(i) * 0.031f) * 2.5f;
+            SlotKvPages p8, p4;
+            p8.init(1, 1, 1024, 64, KvDtype::K8V8);
+            p8.store_swa(0, 0, kv_in.data(), kv_in.data());
+            p8.load_swa(0, 0, kv_k.data(), kv_v.data());
+            for (int i = 0; i < 1024; ++i) {
+                if (std::fabs(kv_k[i] - kv_in[i]) > 0.05f || std::fabs(kv_v[i] - kv_in[i]) > 0.05f) {
+                    err = "K8V8 KV round-trip error";
+                    return false;
+                }
+            }
+            p4.init(1, 1, 1024, 64, KvDtype::K8V4);
+            p4.store_swa(0, 0, kv_in.data(), kv_in.data());
+            p4.load_swa(0, 0, kv_k.data(), kv_v.data());
+            for (int i = 0; i < 1024; ++i) {
+                if (std::fabs(kv_k[i] - kv_in[i]) > 0.05f || std::fabs(kv_v[i] - kv_in[i]) > 0.45f) {
+                    err = "K8V4 KV round-trip error";
+                    return false;
+                }
+            }
+        }
+        // 5. Verify Section 5 payload if .strata model is loaded
+        if (model_ && model_->kind == ModelSourceKind::Strata) {
             std::vector<uint8_t> s5;
             if (!model_->rd.read_section(5, s5, err)) return false;
             if (s5.empty()) {
