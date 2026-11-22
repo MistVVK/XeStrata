@@ -324,6 +324,23 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     const auto suffix = arch.find(':');
     if (suffix != std::string::npos) arch.resize(suffix);
 
+    bool cwsr_safe = true;
+#if defined(__linux__)
+    if (arch == "gfx1103") {
+        auto read_small = [](const char* file) -> std::string {
+            std::ifstream in(file);
+            if (!in) return {};
+            std::ostringstream os;
+            os << in.rdbuf();
+            return os.str();
+        };
+        const int cwsr_val = strata::prefill::hipblaslt::parse_cwsr_enable_value(
+            read_small("/sys/module/amdgpu/parameters/cwsr_enable"));
+        const bool cmd_off = strata::prefill::hipblaslt::cmdline_has_cwsr_disabled(read_small("/proc/cmdline"));
+        cwsr_safe = strata::prefill::hipblaslt::gfx1103_hipblaslt_cwsr_safe(arch, true, cwsr_val, cmd_off);
+    }
+#endif
+
     if (from_package) {
         // Unset or "auto": gfx11 matrix-core parts (RX 7000 discrete RDNA3 + Strix Halo / 780M / 890M gfx1150) take a matching
         // packaged tuning table automatically unless STRATA_GFX11_DEFAULTS=0 (on RX 7900 XTX, 128K prompt +82%: 926 -> 1,687 tok/s);
@@ -331,6 +348,12 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
         const char* off11 = std::getenv("STRATA_GFX11_DEFAULTS");
         const bool g11_auto = !(off11 != nullptr && off11[0] == '0') && strata::kernels::gfx_arch_is_gfx11_wmma(arch.c_str());
         if (!table_forced && arch != "gfx1151" && !g11_auto) return nullptr;
+        if (!table_forced && !cwsr_safe) {
+            std::fprintf(stderr, "prefill gemm: gfx1103 hipBLASLt tuning table skipped because amdgpu.cwsr_enable is not 0 "
+                                 "(#6132/#6574); add amdgpu.cwsr_enable=0 to kernel cmdline or set STRATA_HIPBLASLT_TABLE=on "
+                                 "to force; using hipBLASEx\n");
+            return nullptr;
+        }
         const std::string dir = own_tuning_dir();
         if (dir.empty()) return nullptr;
         path_own = dir + arch + "-hipblaslt-" + std::to_string(version) + ".txt";
@@ -361,6 +384,10 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
             if (path_own.empty()) return nullptr;
         }
         path = path_own.c_str();
+    }
+    if (!cwsr_safe) {
+        std::fprintf(stderr, "prefill gemm: WARNING: loading hipBLASLt tuning table on gfx1103 while amdgpu.cwsr_enable is not 0 "
+                             "(#6132/#6574); if warm-up resets the GPU, add amdgpu.cwsr_enable=0 to kernel cmdline\n");
     }
     std::string error;
     if (!state->table.load(path, arch, version, error)) {
@@ -494,8 +521,10 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
         return true;
     }
 
-    std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d\n", (int) status);
-    if (beta != 0.0f) {
+    std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d for T=%lld N=%lld K=%lld ldy=%lld; "
+                         "dropping shape and falling back to hipBLASEx\n",
+                 (int) status, (long long) t, (long long) n, (long long) k, (long long) ldy);
+    if (beta != 0.0f && !strata::prefill::hipblaslt::hipblaslt_prelaunch_error((int) status)) {
         std::fprintf(stderr, "prefill gemm: refusing a fallback after hipBLASLt failed with nonzero beta\n");
         std::exit(1);
     }

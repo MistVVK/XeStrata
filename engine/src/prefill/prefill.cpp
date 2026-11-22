@@ -3896,6 +3896,14 @@ bool Prefill::arm_cpu_share_split(bool applies, double floor_ms, int pool_worker
 #endif
 }
 
+void Prefill::disarm_default_cpu_share() {
+    if (!g_share_default) return;
+    g_share_default = false;
+    g_share_limit_arch = 0;
+    g_share_nt_arch = 0;
+    if (cpu_share_explicit() == -2.0) g_stream_min_share = 0;
+}
+
 void Prefill::set_share_blocked(bool blocked) { g_share_blocked.store(blocked, std::memory_order_release); }
 
 void Prefill::fix_cpu_share(double share) { g_share_fixed = share >= 0.0 ? std::clamp(share, 0.0, 1.0) : -1.0; }

@@ -90,6 +90,17 @@ int main() {
         in.drafter = false;
         check(reserve_mib(in) == 5800 + 256 + 96, "a stage without the drafter books no DFlash2 term");
     }
+    // larger native MTP pack (e.g. Q4_0 / IQ4_NL: 1675 MiB instead of Q2_0's 1000 MiB)
+    {
+        Inputs in;
+        in.base_reserve_mib = 1800;
+        in.later = true;
+        in.drafter = true;
+        in.drafter_mib = 1675;
+        check(reserve_mib(in) == 1800 + 96 + 1675, "custom drafter_mib applies when drafter is true");
+        in.drafter = false;
+        check(reserve_mib(in) == 1800 + 96, "custom drafter_mib ignored when drafter is false");
+    }
     std::printf("stage_reserve_test: %ld cases, %s\n", cases, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

@@ -22,6 +22,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -45,9 +46,15 @@ public:
     MtpDrafter& operator=(const MtpDrafter&) = delete;
 
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
-    /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
+    /// Call before the VRAM expert tier is sized: this takes ~0.9 GB (Q2_0) or ~1.6 GB (Q4_0 / IQ4_NL).
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768, const MtpDrafter* shared = nullptr);
+    /// Estimated VRAM reserve (MiB) for the layer split search before `load()` runs: returns `base_mib` (1000 MiB)
+    /// for legacy Q2_0 packs and scales up by the extra expert bytes for larger native packs (e.g. ~1675 MiB for Q4_0 / IQ4_NL).
+    static int64_t reserve_mib(const std::string& rt_dir, int64_t base_mib = 1000);
+    bool native_experts() const { return native_experts_; }
+    int expert_gu_type() const { return expert_layout_.gu_type; }
+    int expert_d_type() const { return expert_layout_.d_type; }
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, opt-in, changes the output): the draft layer's router is biased like
@@ -349,6 +356,9 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    bool native_experts_ = false;
+    strata::kernels::NativeExpertLayout expert_layout_{};
+    uint64_t expert_blob_bytes_ = 0;
     // the prompt room: the experts' pinned host snapshot, its size, and whether a prompt has taken their contents
     // (the block itself stays where it is - see experts_lend)
     void* experts_host_ = nullptr;

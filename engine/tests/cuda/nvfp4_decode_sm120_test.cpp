@@ -51,7 +51,7 @@ void run_case(int n_groups, int entries_per_group, bool bench) {
         float* tail = reinterpret_cast<float*>(bp + L.tail_off);
         tail[0] = 0.015f;
         tail[1] = 0.018f;
-        tail[2] = 0.012f;
+        tail[2] = (1 + g % 4) * 0.00005f;
         tail[3] = 0.0f;
     }
 
@@ -111,8 +111,9 @@ void run_case(int n_groups, int entries_per_group, bool bench) {
         native_quantize_q8_1(d_x + (size_t) t0 * kN, (uint8_t*) d_xq + (size_t) t0 * (kN / 32) * 36, kN, nt, st);
     }
 
-    // Reference: existing scalar/dp4a grouped path (override sm120 hardware decode off).
+    // Compare against the mode 0 DP4A result using identical blobs and activations.
     void* hq_ptr = (uint8_t*) d_scratch + 3 * fa;
+    ck(cudaMemsetAsync(d_out_new, 0xff, (size_t) total_entries * kN * sizeof(float), st), "poison tensor core output");
     nvfp4_decode_sm120_set_override(1);
     if (!nvfp4_decode_sm120_grouped(L, d_grp_ptr, d_grp_start, d_n_groups, d_ent_dst, d_ent_tok,
                                     n_groups, total_entries, d_xq, hq_ptr, d_out_new, st)) {
@@ -120,6 +121,8 @@ void run_case(int n_groups, int entries_per_group, bool bench) {
         std::exit(1);
     }
     nvfp4_decode_sm120_set_override(0);
+    native_expert_set_mode(0, 0);
+    ck(cudaMemsetAsync(d_out_ref, 0xff, (size_t) total_entries * kN * sizeof(float), st), "poison reference output");
     native_expert_grouped(L, d_grp_ptr, d_grp_start, d_n_groups, d_ent_dst, d_ent_tok,
                           n_groups, total_entries, d_xq, d_scratch, d_out_ref, st);
     nvfp4_decode_sm120_set_override(1);
@@ -129,17 +132,35 @@ void run_case(int n_groups, int entries_per_group, bool bench) {
     ck(cudaMemcpy(h_ref.data(), d_out_ref, h_ref.size() * sizeof(float), cudaMemcpyDeviceToHost), "d2h ref");
     ck(cudaMemcpy(h_new.data(), d_out_new, h_new.size() * sizeof(float), cudaMemcpyDeviceToHost), "d2h new");
 
-    double num = 0.0, den = 0.0, max_abs = 0.0;
-    for (size_t i = 0; i < h_ref.size(); ++i) {
-        const double d = (double) h_new[i] - (double) h_ref[i];
-        num += d * d;
-        den += (double) h_ref[i] * (double) h_ref[i];
-        max_abs = std::max(max_abs, std::abs(d));
+    auto check = [&](const char* path, double rel_tol) {
+        double num = 0.0, den = 0.0, max_abs = 0.0;
+        for (size_t i = 0; i < h_ref.size(); ++i) {
+            const double d = (double) h_new[i] - (double) h_ref[i];
+            num += d * d;
+            den += (double) h_ref[i] * (double) h_ref[i];
+            max_abs = std::max(max_abs, std::abs(d));
+        }
+        const double rel_rms = den > 0.0 ? std::sqrt(num / den) : 0.0;
+        const bool ok = den > 0.0 && std::isfinite(rel_rms) && rel_rms < rel_tol;
+        std::printf("  NVFP4 %s G=%2d E/G=%2d: rel_rms=%.6f max_abs=%.6f %s\n",
+                    path, n_groups, entries_per_group, rel_rms, max_abs, ok ? "OK" : "FAIL");
+        if (!ok) std::exit(1);
+    };
+    check("sm120 tensor core", 5e-3);
+
+    // Both grouped layouts route the 640-column down projection to the 8-lane kernel.
+    nvfp4_decode_sm120_set_override(0);
+    for (int mode : {8, 7}) {
+        native_expert_set_mode(mode, 0);
+        const int poison = mode == 7 ? 0x7f : 0xff;
+        ck(cudaMemsetAsync(d_out_new, poison, h_new.size() * sizeof(float), st), "poison grouped output");
+        native_expert_grouped(L, d_grp_ptr, d_grp_start, d_n_groups, d_ent_dst, d_ent_tok,
+                              n_groups, total_entries, d_xq, d_scratch, d_out_new, st);
+        ck(cudaStreamSynchronize(st), "grouped sync");
+        ck(cudaMemcpy(h_new.data(), d_out_new, h_new.size() * sizeof(float), cudaMemcpyDeviceToHost), "d2h grouped");
+        check(mode == 7 ? "grouped mode 7" : "grouped mode 8", 1e-5);
     }
-    const double rel_rms = std::sqrt(num / std::max(den, 1e-30));
-    std::printf("  NVFP4 G=%2d E/G=%2d: rel_rms=%.6f max_abs=%.6f %s\n",
-                n_groups, entries_per_group, rel_rms, max_abs, rel_rms < 5e-3 ? "OK" : "FAIL");
-    if (rel_rms >= 5e-3) std::exit(1);
+    native_expert_set_mode(-1, 0);
 
     if (bench) {
         cudaEvent_t a, b;
@@ -197,13 +218,9 @@ int main(int argc, char** argv) {
         std::printf("nvfp4_decode_sm120_test: skipping (requires Blackwell sm_120a/sm_121a)\n");
         return 77;
     }
-    // Note: pass STRATA_NVFP4_DEC_SM120=0 only around ref? No, nvfp4_decode_sm120_available caches env once.
-    // Force native_expert_grouped to run the reference path via native_expert_set_mode(0) + g_grouped_v1?
-    // Actually native_expert_grouped dispatches to nvfp4_decode_sm120_grouped unless STRATA_NVFP4_DEC_SM120=0,
-    // so run this test by setting native_expert_set_grouped_v1(true) before calling native_expert_grouped?
-    // Wait: let's check if native_expert_set_grouped_v1 exists or expose a direct env/flag!
     run_case(10, 1, bench);
     run_case(24, 2, bench);
+    run_case(24, 3, bench);
     run_case(32, 4, bench);
     run_case(32, 8, bench);
     std::printf("nvfp4_decode_sm120_test: ok\n");

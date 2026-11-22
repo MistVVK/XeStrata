@@ -13,7 +13,8 @@ Layout: dense tensors (attention, indexer, hyper-connections, shared expert, rou
     q2_0   64-element blocks, grid {-1, 0, 1, 2} x d. The scale is chosen per block to MINIMIZE squared error over
            that grid (the ggml reference sets d = max|w| and never uses the +2 level). Same format as the main
            model's experts, so Strata's CPU VNNI kernel and GPU hit kernel serve it unchanged. ~0.71 GB.
-    q4_0   ggml reference rounding. ~1.42 GB.       q8_0   ggml reference. ~2.67 GB.
+    q4_0   ggml reference rounding. ~1.42 GB.       iq4_nl non-linear 4-bit codebook. ~1.42 GB.
+    q8_0   ggml reference. ~2.67 GB.
 
 This is round-to-nearest, not GSQ: the plan picks the expert format by MEASURED draft acceptance (P0.3/P6), not
 by this file's reconstruction error, which is reported per tensor only as a sanity check. No model runs here.
@@ -101,6 +102,33 @@ def q4_0(w: np.ndarray) -> np.ndarray:
     return out.reshape(-1)
 
 
+KVALUES_IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], dtype=np.float32)
+KVALUES_IQ4NL_MIDS = 0.5 * (KVALUES_IQ4NL[:-1] + KVALUES_IQ4NL[1:])
+
+
+def iq4_nl(w: np.ndarray) -> np.ndarray:
+    """IQ4_NL (type 20): 32-value blocks, fp16 d + 16 packed nibble bytes mapping into KVALUES_IQ4NL."""
+    x = w.reshape(-1, 32).astype(np.float32)
+    idx = np.abs(x).argmax(axis=1)
+    mx = x[np.arange(x.shape[0]), idx][:, None]
+    d = mx / np.float32(-127.0)
+    for _ in range(2):
+        inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0)
+        q = np.searchsorted(KVALUES_IQ4NL_MIDS, x * inv).astype(np.uint8)
+        qv = KVALUES_IQ4NL[q]
+        denom = (qv * qv).sum(axis=1, keepdims=True)
+        d = np.where(denom > 0, (x * qv).sum(axis=1, keepdims=True) / np.where(denom > 0, denom, 1.0), 0.0).astype(np.float32)
+    d16 = d.astype(np.float16)
+    d = d16.astype(np.float32)
+    inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0)
+    q = np.searchsorted(KVALUES_IQ4NL_MIDS, x * inv).astype(np.uint8)
+    packed = (q[:, :16] | (q[:, 16:] << 4)).astype(np.uint8)
+    out = np.empty((x.shape[0], 18), dtype=np.uint8)
+    out[:, :2] = d16.view(np.uint8).reshape(-1, 2)
+    out[:, 2:] = packed
+    return out.reshape(-1)
+
+
 def q8_0(w: np.ndarray) -> np.ndarray:
     x = w.reshape(-1, 32).astype(np.float32)
     d = np.abs(x).max(axis=1, keepdims=True) / 127.0
@@ -125,6 +153,12 @@ def dequant(kind: str, blob: np.ndarray, n: int) -> np.ndarray:
         qs = b[:, 2:]
         q = np.concatenate([qs & 15, qs >> 4], axis=1).astype(np.float32)
         return ((q - 8.0) * d).reshape(-1)[:n]
+    if kind == "iq4_nl":
+        b = blob.reshape(-1, 18)
+        d = b[:, :2].copy().view(np.float16).astype(np.float32)
+        qs = b[:, 2:]
+        q = np.concatenate([qs & 15, qs >> 4], axis=1)
+        return (KVALUES_IQ4NL[q] * d).reshape(-1)[:n]
     b = blob.reshape(-1, 34)
     d = b[:, :2].copy().view(np.float16).astype(np.float32)
     return (b[:, 2:].view(np.int8).astype(np.float32) * d).reshape(-1)[:n]
@@ -132,6 +166,7 @@ def dequant(kind: str, blob: np.ndarray, n: int) -> np.ndarray:
 
 QUANT = {"q2_0": (q2_0, gguf.GGMLQuantizationType.Q2_0, 64, 18),
          "q4_0": (q4_0, gguf.GGMLQuantizationType.Q4_0, 32, 18),
+         "iq4_nl": (iq4_nl, gguf.GGMLQuantizationType.IQ4_NL, 32, 18),
          "q8_0": (q8_0, gguf.GGMLQuantizationType.Q8_0, 32, 34)}
 
 
@@ -150,7 +185,8 @@ def main() -> int:
     w.add_string("strata.mtp.source_sha256", hashlib.sha256(
         json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
     w.add_string("strata.mtp.expert_format", a.experts)
-    w.add_string("strata.mtp.expert_quantizer", "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
+    qdesc = {"q2_0": "per-block MSE scale search", "iq4_nl": "IQ4_NL least-squares scale search"}.get(a.experts, "ggml reference")
+    w.add_string("strata.mtp.expert_quantizer", qdesc)
     report = []
     for t in sorted(manifest, key=lambda t: t["name"]):
         name, shape = t["name"], t["shape"]

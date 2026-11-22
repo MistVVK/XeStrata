@@ -1227,7 +1227,7 @@ VOCAB_NAME = "draft_vocab.bin"
 
 
 #: The subsets a person can choose in setup (``--draft-vocab``), by name: the files Strata ships in data/ (setup.DRAFT_VOCABS names the same ones).
-VOCAB_FILES = {"cjk": VOCAB_NAME, "en": "draft_vocab_en.bin", "cyrillic": "draft_vocab_cyrillic.bin", "fr": "draft_vocab_fr.bin", "latin": "draft_vocab_latin.bin"}
+VOCAB_FILES = {"cjk": VOCAB_NAME, "en": "draft_vocab_en.bin", "cyrillic": "draft_vocab_cyrillic.bin", "fr": "draft_vocab_fr.bin", "latin": "draft_vocab_latin.bin", "arabic": "draft_vocab_arabic.bin"}
 #: The sha256 of the 27-Han-token subset up to 0.1.26 (setup.OLD_DRAFT_VOCABS): a copy that is any shipped subset may be replaced by the person's later choice, a made-by-hand one never.
 OLD_VOCAB_SHA256 = {"369151522226a5edaa5f12cfd1e2ae7db8f4fbdbd222f3dcf327dced9597fb25"}
 
@@ -1244,17 +1244,18 @@ def shipped_vocab(choice: str | None = None) -> Path:
 # on those four, both within 0.3% of the default on English and code; either file costs 12-16% on Chinese and Japanese. So with no choice saved, the file follows the computer's languages, and
 # anything that could mean Chinese, Japanese or Korean keeps the default (the costs are lopsided: the wrong file on CJK text costs far more than the right one gains elsewhere).
 
-#: Language codes by the script their text is written in (the ones the vocabulary files cover: Cyrillic, and the Latin script beyond English). Anything else (English, Arabic, Hebrew, Hindi, Thai,
+#: Language codes by the script their text is written in (the ones the vocabulary files cover: Cyrillic, Arabic, and the Latin script beyond English). Anything else (English, Hebrew, Hindi, Thai,
 #: Greek...) says nothing.
 _CJK_LANGS = frozenset("zh ja ko yue cmn wuu hak nan gan lzh".split())
 _CYRILLIC_LANGS = frozenset("ru uk be bg mk sr kk ky tg mn tt ba cv ce os sah ab av kv udm".split())
+_ARABIC_LANGS = frozenset("ar fa ur ps sd ckb ug prs".split())
 _LATIN_LANGS = frozenset(("de fr es pt it nl pl cs sk sl hr bs ro hu sv da nb nn no fi et lv lt tr vi id ms ca gl eu af sq is ga cy mt fil tl sw "
                           "lb fo gd br oc rm eo la uz az tk hsb dsb ast an co fy sc se smn nds wa ln zu xh st tn yo ig ha so mg haw mi sm to").split())
 _CJK_SCRIPTS = frozenset("hans hant hani jpan kore hang hira kana bopo".split())
 
 
 def script_of_language(tag: Any) -> str:
-    """The script group a language tag (``ru-RU``, ``sr-Latn-RS``, ``de_DE.UTF-8``, ``sr_RS@latin``, ``zh-Hans``) says: ``cjk``, ``cyrillic``, ``latin`` (a Latin-script language other than English) or ``""`` (English, another
+    """The script group a language tag (``ru-RU``, ``ar-SA``, ``sr-Latn-RS``, ``de_DE.UTF-8``, ``sr_RS@latin``, ``zh-Hans``) says: ``cjk``, ``cyrillic``, ``arabic``, ``latin`` (a Latin-script language other than English) or ``""`` (English, another
     script, ``C`` / ``POSIX``, nothing readable)."""
     text = str(tag or "").strip()
     if not text:
@@ -1274,10 +1275,14 @@ def script_of_language(tag: Any) -> str:
         return "cjk"
     if "cyrl" in scripts or modifier == "cyrillic":
         return "cyrillic"
+    if "arab" in scripts or modifier == "arabic":
+        return "arabic"
     if "latn" in scripts or modifier == "latin":
         return "" if lang == "en" else "latin"
     if lang in _CYRILLIC_LANGS:
         return "cyrillic"
+    if lang in _ARABIC_LANGS:
+        return "arabic"
     if lang in _LATIN_LANGS:
         return "latin"
     return ""

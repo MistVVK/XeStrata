@@ -203,6 +203,41 @@ void test_split_without_regions_keeps_nothing() {
             require(!rig.src.has_resident(l, e), "an expert neither in a cache's complement region entered the copy");
 }
 
+// #6583: under a --resident-budget-gib smaller than (complement + stage lend regions), the copy reserves
+// room for the borrowed stage lend regions before filling the coldest complement tail, so every borrowed
+// slot stays RAM-backed instead of reading from SSD on every prompt chunk.
+void test_split_lend_region_budget_with_complement() {
+    Rig rig("split lend region budget with complement");
+    std::string err;
+
+    // Rebuild stage0 and stage1 holding only 3 of the 4 experts per layer (e = 0,1,2), leaving (0,3) and (1,3)
+    // in the complement: rank puts (0,3) hot and (1,3) cold.
+    strata::core::ExpertCache s0, s1;
+    require(s0.open(3, kLayers, kExperts, rig.blob, err), err);
+    require(s1.open(3, kLayers, kExperts, rig.blob, err), err);
+    for (int64_t e = 0; e < 3; ++e) {
+        const int32_t a0 = s0.admit(0, e);
+        require(a0 >= 0 && s0.fill_slot_blocking(a0, rig.truth[(size_t) e].data(), err), err);
+        const int32_t a1 = s1.admit(1, e);
+        require(a1 >= 0 && s1.fill_slot_blocking(a1, rig.truth[(size_t) kExperts + e].data(), err), err);
+    }
+    std::vector<std::pair<int32_t, int32_t>> s1_pairs{{1, 0}, {1, 1}, {1, 2}};
+    std::vector<std::pair<int32_t, int32_t>> rank{{0, 3}, {1, 3}};
+
+    // Each stage borrows 2 slots (4 blobs total), plus 2 complement blobs = 6 blobs; budget is 5 blobs.
+    rig.src.stage_lend_regions({{{0, 2}, {0, 1}}, {{1, 2}, {1, 1}}});
+    const uint64_t budget = 5 * (uint64_t) rig.blob;
+    require(rig.src.pin_cache_complement(s0, err, false, s1_pairs, -1, 0, budget, &rank), err);
+
+    require(rig.src.resident_bytes() == budget, "copy did not fill the 5-blob budget");
+    require(rig.src.resident_lent_slots() == 4, "all 4 borrowed stage lend slots must be kept in RAM");
+    require(rig.src.has_resident(0, 2) && rig.src.has_resident(0, 1) &&
+            rig.src.has_resident(1, 2) && rig.src.has_resident(1, 1),
+            "borrowed lend slots were crowded out by the cold complement tail");
+    require(rig.src.has_resident(0, 3), "hottest complement expert should fit in the remaining 1 blob");
+    require(!rig.src.has_resident(1, 3), "coldest complement expert should be the one left on file fallback");
+}
+
 }  // namespace
 
 int main() {
@@ -210,6 +245,7 @@ int main() {
         test_split_lend_region_served_from_ram();
         test_split_lend_region_budget();
         test_split_without_regions_keeps_nothing();
+        test_split_lend_region_budget_with_complement();
         std::cout << "split_lend_complement_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

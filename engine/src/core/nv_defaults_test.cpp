@@ -173,6 +173,8 @@ int main() {
         // repeatable output: sm_86 keeps ADAPT_LAG=2 but no longer turns ADAPT_NOWAIT on (option 2); sm_60 keeps both
         CHECK(!find(a, "STRATA_ADAPT_NOWAIT"));
         CHECK(find(a, "STRATA_ADAPT_LAG") && *find(a, "STRATA_ADAPT_LAG") == "2");
+        CHECK(find(a, "STRATA_GR_UP75") && *find(a, "STRATA_GR_UP75") == "1");
+        CHECK(!find(a, "STRATA_QFUSE"));   // #6583: opt-in on sm_86 (conflicts with GR_UP75 + 1-token self_commit)
         CHECK(find(p, "STRATA_ADAPT_NOWAIT") && *find(p, "STRATA_ADAPT_NOWAIT") == "1");
         CHECK(find(p, "STRATA_ADAPT_LAG") && *find(p, "STRATA_ADAPT_LAG") == "2");
         // sm_86 <= 13 GiB (RTX 3060/3070/3080) gets ADAPT_FETCH=2 (not under 026); 16 GiB (A4000) gets neither; > 16 GiB (3090/A6000) gets VERIFY_DEVICE_HITS=1

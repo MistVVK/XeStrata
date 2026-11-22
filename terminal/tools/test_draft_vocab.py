@@ -42,6 +42,13 @@ class Coverage(unittest.TestCase):
             b.write_text("eté", encoding="utf-8")
             self.assertEqual(DV.corpus_counts(Tok(), [a, b]), Counter({ord("é"): 3, ord("t"): 2, ord("e"): 1}))
 
+    def test_scripts_of_detects_arabic_script(self):
+        self.assertIn("arabic", DV.scripts_of(" في"))
+        self.assertIn("arabic", DV.scripts_of("مرحبا"))
+        self.assertIn("arabic", DV.scripts_of("پژوهش"))       # Persian/Urdu letters
+        self.assertNotIn("arabic", DV.scripts_of("hello world"))
+        self.assertNotIn("arabic", DV.scripts_of("привет"))
+
 
 if __name__ == "__main__":
     unittest.main()

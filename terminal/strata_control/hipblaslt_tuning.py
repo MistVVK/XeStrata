@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -193,6 +194,29 @@ def user_choice(environ=None, cfg: dict | None = None) -> str | None:
     return None
 
 
+def amdgpu_cwsr_disabled(*, platform: str | None = None,
+                         sysfs_path: str | Path = "/sys/module/amdgpu/parameters/cwsr_enable",
+                         cmdline_path: str | Path = "/proc/cmdline") -> bool | None:
+    """On Linux, whether amdgpu CWSR is explicitly disabled (`amdgpu.cwsr_enable=0`, needed for gfx1103 hipBLASLt
+    stability per #6132/#6574). Returns True when disabled, False when sysfs reports non-zero (enabled), or None on
+    non-Linux / unreadable sysfs."""
+    if not (platform or sys.platform).startswith("linux"):
+        return None
+    try:
+        cmdline = Path(cmdline_path).read_text(encoding="utf-8", errors="ignore")
+        if "amdgpu.cwsr_enable=0" in cmdline.split():
+            return True
+    except OSError:
+        pass
+    try:
+        raw = Path(sysfs_path).read_text(encoding="utf-8", errors="ignore").strip()
+        if raw:
+            return int(raw) == 0
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def resolve(folder, archs_present, *, environ=None, cfg: dict | None = None) -> Decision:
     """The table for an installed AMD engine package ``folder`` on a PC whose GPUs are ``archs_present`` (in the order the engine sees them).
     Never raises; an empty message means there is nothing worth a line (not an AMD package, or the person chose already)."""
@@ -229,6 +253,10 @@ def resolve(folder, archs_present, *, environ=None, cfg: dict | None = None) -> 
         if mode(environ, cfg) == "auto" and not (AUTO_USES_TABLE or arch in AUTO_ARCHS):
             return Decision(None, f"hipBLASLt tuning table: {path.name} is in this package and not used by default (faster prompts, but answers can differ "
                                   f"in the last digits); {SWITCH}=on uses it")
+        if mode(environ, cfg) == "auto" and arch == "gfx1103" and amdgpu_cwsr_disabled() is False:
+            return Decision(None, f"hipBLASLt tuning table: {path.name} skipped on gfx1103 because amdgpu.cwsr_enable is not 0 "
+                                  f"(#6132/#6574; can trigger KFD/MES warm-up resets); add amdgpu.cwsr_enable=0 to kernel cmdline "
+                                  f"or set {SWITCH}=on to force; plain hipBLAS", "warn")
         return Decision(path, f"hipBLASLt tuning table: {path.name} (faster prompts; {SWITCH}=off turns it off)")
     other = sorted({v for (a, v) in tables if a in archs})
     if other:

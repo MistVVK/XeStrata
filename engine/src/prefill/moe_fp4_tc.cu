@@ -80,11 +80,6 @@ void ck(cudaError_t e, const char* what) {
     }
 }
 
-unsigned blocks_for(int64_t items, int per_block) {
-    const int64_t b = (items + per_block - 1) / per_block;
-    return (unsigned) std::max<int64_t>(1, std::min<int64_t>(b, 65535));
-}
-
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200) && (__CUDA_ARCH__ < 1300)
 #define STRATA_FP4_TC_DEV 1
 #endif
@@ -554,13 +549,23 @@ bool wanted() {
 }
 
 void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {
-    if (rows <= 0) return;
-    if (cols % K_STEP != 0) {
-        std::fprintf(stderr, "fp4_tc::quantize_act: cols=%lld is not a multiple of 64\n", (long long) cols);
+    if (cols < 0 || cols % K_STEP != 0) {
+        std::fprintf(stderr, "fp4_tc::quantize_act: cols=%lld must be a non-negative multiple of %d\n",
+                     (long long) cols, K_STEP);
         std::exit(1);
     }
-    const int64_t nblk = rows * (cols / K_STEP);
-    quant_act_fp4_kernel<<<blocks_for(nblk, 8), 256, 0, (cudaStream_t) stream>>>(x, nblk, (uint8_t*) xa);
+    if (rows <= 0 || cols == 0) return;
+    const int64_t blocks_per_row = cols / K_STEP;
+    static constexpr int64_t kMaxGridX = 0x7fffffffLL;
+    if (rows > (kMaxGridX * 8) / blocks_per_row) {
+        std::fprintf(stderr, "fp4_tc::quantize_act: rows=%lld cols=%lld exceeds CUDA grid.x limit\n",
+                     (long long) rows, (long long) cols);
+        std::exit(1);
+    }
+    const int64_t nblk = rows * blocks_per_row;
+    // Each warp handles one 64-value block. Large prefill chunks need more than 65535 CTAs in grid.x.
+    const unsigned grid = (unsigned) ((nblk + 7) / 8);
+    quant_act_fp4_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(x, nblk, (uint8_t*) xa);
     ck(cudaGetLastError(), "fp4_tc::quantize_act");
 }
 

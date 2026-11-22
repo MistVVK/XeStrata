@@ -5791,6 +5791,11 @@ int main(int argc, char** argv) {
     // free once its fixed costs are paid, so every layer gets the same cache bytes on every card; it then runs as an explicit split with every card trimmed.  The dense set's size is
     // estimated from the pack (the native projections at the ratio the IQ3_S pack has); the check after CUDA0's load decides again from the exact figure.  Never reached by cards with
     // room; STRATA_STAGE_TRIM=0, STRATA_SPLIT_EARLY_OFF=1 or STRATA_SPILL_OFF=1 keeps the old path.
+    // Dynamic drafter VRAM reserve: Q2_0 S2 stays at kDrafterMib (1000 MiB); larger native packs (e.g. Q4_0 / IQ4_NL:
+    // ~1675 MiB) scale up by their extra expert bytes so layer-split sizing keeps accurate VRAM headroom.
+    const int64_t mtp_drafter_mib =
+        !o.mtp.empty() ? strata::core::MtpDrafter::reserve_mib(o.mtp, strata::program::stage_reserve::kDrafterMib)
+                       : strata::program::stage_reserve::kDrafterMib;
     if (multi_gpu && split_auto && !trim_user_asked && !split_devs.empty() && std::getenv("STRATA_SPILL_OFF") == nullptr &&
         !(std::getenv("STRATA_STAGE_TRIM") != nullptr && std::string(std::getenv("STRATA_STAGE_TRIM")) == "0") &&
         std::getenv("STRATA_SPLIT_EARLY_OFF") == nullptr && spill_discrete_gpu()) {
@@ -5805,7 +5810,7 @@ int main(int argc, char** argv) {
             const int nd = (int) devs.size();
             wm.session_mib = (int64_t) (strata::core::session_bytes(g, o.max_context, K, 0, (g.n_layers + nd - 1) / nd) >> 20);
             if (!o.native_head_gguf.empty()) wm.head_mib = 410;   // the Q5_K head of this model family (0.41 GiB); the exact figure is read once the head loads
-            wm.drafter_mib = (!o.mtp.empty() || o.draft == "dflash2") ? strata::program::stage_reserve::kDrafterMib : 0;
+            wm.drafter_mib = (!o.mtp.empty() || o.draft == "dflash2") ? mtp_drafter_mib : 0;
             wm.slot_mib = 3;
             const int64_t later_reserve = (o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib) + strata::program::stage_reserve::kWindowMib;
             wm.reserve_mib = later_reserve;
@@ -6019,7 +6024,7 @@ int main(int argc, char** argv) {
         wm.session_mib = (int64_t) (strata::core::session_bytes(g, o.max_context, K, 0, (g.n_layers + ns_w - 1) / ns_w) >> 20);
         if (const strata::core::WeightRef* wo_w = wt.find("output.weight"); wo_w != nullptr && !o.native_head_gguf.empty())
             wm.head_mib = (int64_t) (((uint64_t) wo_w->ne1 * (uint64_t) (g.n_embd / 256) * 176ull) >> 20);   // Q5_K: 176 bytes per 256 values
-        wm.drafter_mib = (!o.mtp.empty() || o.draft == "dflash2") ? strata::program::stage_reserve::kDrafterMib : 0;
+        wm.drafter_mib = (!o.mtp.empty() || o.draft == "dflash2") ? mtp_drafter_mib : 0;
         wm.slot_mib = std::max<int64_t>(1, (int64_t) ((strata::kernels::cpu::expert_layout().max_blob + (1u << 20) - 1) >> 20));
         wm.reserve_mib = (o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib) + strata::program::stage_reserve::kWindowMib;
         for (size_t i = 0; i < split_devs.size(); ++i) {
@@ -6405,7 +6410,7 @@ int main(int argc, char** argv) {
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
             const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
-            const int64_t held_back = session + (((int64_t) o.vram_reserve_mib + 1000 + 96) << 20);   // + drafter/head, windows
+            const int64_t held_back = session + (((int64_t) o.vram_reserve_mib + mtp_drafter_mib + 96) << 20);   // + drafter/head, windows
             const int64_t room = (int64_t) fb - held_back;
             cudaDeviceProp dp{};
             cudaGetDeviceProperties(&dp, 0);
@@ -6855,6 +6860,7 @@ int main(int argc, char** argv) {
         rin.prompt_buffers_mib = pf;
         rin.later = later;
         rin.drafter = drafter;
+        rin.drafter_mib = mtp_drafter_mib;
         rin.df2_bind_mib = search && drafter && df2_last ? strata::program::stage_reserve::df2_search_mib(o.serve) : 0;
         rin.pipe_window_mib = kPipeWindowMib;
         rin.pipe_snap_mib = kPipeSnapMib;
@@ -11680,6 +11686,52 @@ int main(int argc, char** argv) {
     int64_t region_chunk = 0;   // the chunk the RAM copy's lend region was sized for (the warning below names it)
     int64_t region_today = 0, region_today_k = 0;   // today's chunk and its start-up loan, which the scan keeps when the RAM holds less
 #endif
+    // #6583: arm the serve CPU prefill share BEFORE sizing plan_lend / stage_lend_regions so bytes_needed() sees
+    // the exact stream_all_min() tail that the serve scan will borrow after pin_cache_complement(). Otherwise a
+    // 2-card split (STRATA_SPLIT_CPU_SHARE raising stream_all_min 1024 -> 3072) reserved ~315 fewer RAM-backed
+    // lend slots than the serve scan later borrowed, forcing hundreds of unbuffered SSD reads on every chunk.
+    // The post-complement host-memory gate (share_default_ok) still runs below and disarms the default share if
+    // RAM is too tight.
+    static const bool share_batch_env = [] {
+        const char* v = std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH");
+        return v != nullptr && v[0] == '1';
+    }();
+    const bool serve_share_pool = (o.batch <= 0 || share_batch_env) && !o.no_pool;
+    bool serve_share_has_work = strata::prefill::share_rules::default_share_has_work(
+        (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
+#if defined(STRATA_USE_HIP) || defined(STRATA_USE_SYCL) || defined(__HIPCC__)
+    constexpr bool serve_share_cuda_build = false;
+#else
+    constexpr bool serve_share_cuda_build = true;
+#endif
+    const bool serve_share_layout = strata::prefill::share_rules::default_share_layout(
+        (int) stages.size(), multi_gpu,
+        strata::prefill::share_rules::split_share_env_of(std::getenv("STRATA_SPLIT_CPU_SHARE")),
+        serve_share_cuda_build);
+    if (o.serve) {
+        if (stages.empty() && !multi_gpu && o.batch <= 0)   // STRATA_SWITCH_POINT: before any bytes_needed
+            strata::prefill::Prefill::set_card_expert_share(
+                (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert),
+                xcache.slots() > 0 ? (double) xcache.bytes() / (double) xcache.slots() / 1e6 : 0.0,
+                o.pcie_probe_gbps, pool.workers());
+        if (serve_share_pool && !stages.empty() && o.batch <= 0 && serve_share_has_work) {
+            double floor_ms = 0.0;
+            bool links_ok = o.pcie_probe_gbps > 0.0, all_cc120 = true;
+            auto stage_floor = [&](const strata::core::ExpertCache& xc, int64_t lb, int64_t le, double link, int dev) {
+                if (!(link > 0.0) || xc.slots() <= 0) { links_ok = false; return; }
+                const int64_t miss = std::max<int64_t>(0, (le - lb) * g.n_expert - (int64_t) xc.slots());
+                floor_ms += (double) miss * ((double) xc.bytes() / (double) xc.slots() / 1e6) / link;
+                cudaDeviceProp dp;
+                if (cudaGetDeviceProperties(&dp, dev) != cudaSuccess || dp.major != 12 || dp.minor != 0) all_cc120 = false;
+            };
+            stage_floor(xcache, 0, stages.front()->lb, o.pcie_probe_gbps, 0);
+            for (auto& st : stages) stage_floor(st->cache, st->lb, st->le, st->link_gbps, st->dev);
+            if (links_ok)
+                strata::prefill::Prefill::arm_cpu_share_split(true, floor_ms, pool.workers(), all_cc120);
+        }
+        strata::prefill::Prefill::arm_cpu_share(serve_share_pool,
+                                                serve_share_pool && serve_share_layout && serve_share_has_work);
+    }
     if (o.resident_cpu_experts) {
         int64_t lend_from = -1;
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
@@ -11739,7 +11791,41 @@ int main(int argc, char** argv) {
         std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lends;
         decide_split_ring();   // the ring the prompt path really uses, BEFORE bytes_needed sizes the regions below
         if (pf_borrow && d_res != nullptr && o.prefill_chunk > 0 && multi_gpu && !stages.empty()) {
-            const int64_t bound = o.prefill_auto ? auto_ceiling : o.prefill_chunk;
+            int64_t bound = o.prefill_auto ? auto_ceiling : o.prefill_chunk;
+            if (o.prefill_auto && bound > 256) {
+                // #6583: size the split lend regions for the largest chunk the auto scan can actually pick
+                // (every stage within g_lend_keep and kAutoLendPct), rather than over-reserving for an unreachable
+                // auto_ceiling (e.g. 32768 when the cards fit 8192).
+                auto split_auto_fits = [&](int64_t c) -> bool {
+                    if (c > 8192 && (c > o.prefill_auto_max || c > o.max_context)) return false;
+                    if (o.prefill_auto_cap > 0 && c > o.prefill_auto_cap) return false;
+                    for (size_t i = 0; i <= stages.size(); ++i) {
+                        const strata::core::ExpertCache& xc = i == 0 ? xcache : stages[i - 1]->cache;
+                        const strata::core::SessionState& ses = i == 0 ? ss : stages[i - 1]->ss;
+                        const int64_t dev = i == 0 ? -1 : stages[i - 1]->dev;
+                        const int64_t lb = i == 0 ? 0 : stages[i - 1]->lb;
+                        const int64_t le = i == 0 ? split_at[0] : stages[i - 1]->le;
+                        if (xc.slots() <= 0 || le <= lb) continue;
+                        uint64_t need = 0;
+                        {
+                            const strata::core::OnDevice on((int) dev);
+                            need = strata::prefill::Prefill::bytes_needed(g, ses, c, srcp != nullptr);
+                        }
+                        const int64_t k = strata::program::split_lend_slots(
+                            xc.slots(), xc.bytes(), xc.slot_offsets(),
+                            (uint64_t) strata::kernels::cpu::expert_layout().max_blob, need);
+                        if (k <= 0 || k + g_lend_keep > xc.slots() || k * 100 > kAutoLendPct * xc.slots()) return false;
+                    }
+                    return true;
+                };
+                int64_t lo = 1, hi = bound / 256, best = 0;
+                while (lo <= hi) {
+                    const int64_t mid = lo + (hi - lo) / 2;
+                    if (split_auto_fits(mid * 256)) { best = mid * 256; lo = mid + 1; }
+                    else hi = mid - 1;
+                }
+                if (best >= 256) bound = best;
+            }
             static const bool own_ok = [] {
                 const char* v = std::getenv("STRATA_SPLIT_OWN_BUFFERS");
                 return v == nullptr || v[0] != '0';
@@ -11751,13 +11837,16 @@ int main(int argc, char** argv) {
                 const int64_t lb = i == 0 ? 0 : stages[i - 1]->lb;
                 const int64_t le = i == 0 ? split_at[0] : stages[i - 1]->le;
                 if (xc.slots() <= 0 || le <= lb) continue;
-                const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ses, bound);
-                if (own_ok) {   // the card funds its buffers at any chunk the scan can pick: nothing is lent
-                    const strata::core::OnDevice on(dev);
-                    size_t fb = 0, tb = 0;
-                    if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
-                        if ((uint64_t) fb >= need + (3ull << 29)) continue;
-                    } else (void) cudaGetLastError();
+                uint64_t need = 0;
+                {
+                    const strata::core::OnDevice on((int) dev);
+                    need = strata::prefill::Prefill::bytes_needed(g, ses, bound, srcp != nullptr);
+                    if (own_ok) {   // the card funds its buffers at any chunk the scan can pick: nothing is lent
+                        size_t fb = 0, tb = 0;
+                        if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
+                            if ((uint64_t) fb >= need + (3ull << 29)) continue;
+                        } else (void) cudaGetLastError();
+                    }
                 }
                 // its tail slots, as the scan's `cache_slots_for` counts them
                 int64_t k = strata::program::split_lend_slots(
@@ -12081,47 +12170,21 @@ int main(int argc, char** argv) {
 #endif
         // STRATA_PREFILL_CPU_SHARE_BATCH=1 (opt-in): the prompt path gets the pool beside batch slots too; a read takes the
         // share only while no slot decodes (set_share_blocked before each read), since the slots' windows use the pool
-        static const bool share_batch = [] { const char* v = std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH"); return v != nullptr && v[0] == '1'; }();
-        const bool share_pool = (o.batch <= 0 || share_batch) && !o.no_pool;
+        const bool share_batch = share_batch_env;
+        const bool share_pool = serve_share_pool;
         if (share_batch && o.batch > 0 && !o.no_pool)
             std::fprintf(stderr, "strata serve: STRATA_PREFILL_CPU_SHARE_BATCH=1: the prompt path may use the CPU pool beside the "
                                  "%lld batch slots, for a read with no slot decoding\n", (long long) o.batch);
-        bool share_has_work = strata::prefill::share_rules::default_share_has_work(
-            (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
+        bool share_has_work = serve_share_has_work;
         if (!share_has_work)
             std::fprintf(stderr, "strata serve: every expert is in the GPU cache (%lld of %lld): the CPU prefill share has "
                                  "nothing to take, so it is not armed by default (STRATA_PREFILL_CPU_SHARE=auto forces it)\n",
                          (long long) xcache.slots(), (long long) (g.n_layers * g.n_expert));
-        // BW-F: one card as before, and a layer split of two cards (STRATA_SPLIT_CPU_SHARE=0 takes the split back to streaming every expert over PCIe; share_rules.hpp default_share_layout)
-#if defined(STRATA_USE_HIP) || defined(STRATA_USE_SYCL) || defined(__HIPCC__)
-        constexpr bool share_cuda_build = false;
-#else
-        constexpr bool share_cuda_build = true;
-#endif
-        const bool share_layout = strata::prefill::share_rules::default_share_layout(
-            (int) stages.size(), multi_gpu, strata::prefill::share_rules::split_share_env_of(std::getenv("STRATA_SPLIT_CPU_SHARE")), share_cuda_build);
-        if (share_pool && share_layout && share_has_work && !share_default_ok()) share_has_work = false;   // H11
-        if (stages.empty() && !multi_gpu && o.batch <= 0)   // STRATA_SWITCH_POINT: one card, no batch slots; before any bytes_needed, like the share
-            strata::prefill::Prefill::set_card_expert_share((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert), xcache.slots() > 0 ? (double) xcache.bytes() / (double) xcache.slots() / 1e6 : 0.0, o.pcie_probe_gbps, pool.workers());
-        // BW-H: a layer split takes the share's limit and expert width from the link rule where the stages' stream floors, summed (a chunk passes through every stage in turn), are large;
-        // it arms the share by itself only where BW-F's default (below) does not: a split of three or more cards.  Call before arm_cpu_share (whose tail takes the limit as the stream floor).
-        if (share_pool && !stages.empty() && o.batch <= 0 && share_has_work) {
-            double floor_ms = 0.0;
-            bool links_ok = o.pcie_probe_gbps > 0.0, all_cc120 = true;
-            auto stage_floor = [&](const strata::core::ExpertCache& xc, int64_t lb, int64_t le, double link, int dev) {
-                if (!(link > 0.0) || xc.slots() <= 0) { links_ok = false; return; }
-                const int64_t miss = std::max<int64_t>(0, (le - lb) * g.n_expert - (int64_t) xc.slots());
-                floor_ms += (double) miss * ((double) xc.bytes() / (double) xc.slots() / 1e6) / link;
-                cudaDeviceProp dp;
-                if (cudaGetDeviceProperties(&dp, dev) != cudaSuccess || dp.major != 12 || dp.minor != 0) all_cc120 = false;
-            };
-            stage_floor(xcache, 0, stages.front()->lb, o.pcie_probe_gbps, 0);
-            for (auto& st : stages) stage_floor(st->cache, st->lb, st->le, st->link_gbps, st->dev);
-            if (links_ok && share_default_ok())
-                strata::prefill::Prefill::arm_cpu_share_split(true, floor_ms, pool.workers(), all_cc120);
+        const bool share_layout = serve_share_layout;
+        if (share_pool && (share_layout || (!stages.empty() && o.batch <= 0)) && share_has_work && !share_default_ok()) {
+            share_has_work = false;   // H11: host memory gate refused the default share
+            strata::prefill::Prefill::disarm_default_cpu_share();
         }
-        // BW-F: one card, and a layer split of exactly two CUDA cards, arm the share by default (where the link rule above did not already, with its own limit)
-        strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && share_layout && share_has_work);
         if (share_pool && share_layout && share_has_work && !stages.empty() && multi_gpu && std::getenv("STRATA_PREFILL_CPU_SHARE") == nullptr)
             std::fprintf(stderr, "strata serve: layer split of two cards: the CPU prefill share is armed by default, as on one card (STRATA_SPLIT_CPU_SHARE=0 turns it off)\n");
         void* borrow = nullptr;

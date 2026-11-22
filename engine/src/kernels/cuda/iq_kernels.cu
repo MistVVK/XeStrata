@@ -850,9 +850,9 @@ STRATA_TQP_FMT(149)
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #ifdef STRATA_Q6K_EXPERTS   // opt-in build (-DSTRATA_Q6K_EXPERTS=ON): one more instance per kernel, loaded at start
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(147) X(148) X(149)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(147) X(148) X(149)
 #else
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(147) X(148) X(149)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(147) X(148) X(149)
 #endif
 // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them
 // Q4_K as well: heretic's down experts are Q4_K; without 12 here d_qk(12)=0 and STRATA_DOWN reaches its exit(1)
@@ -2826,6 +2826,58 @@ __global__ void __launch_bounds__(256, STRATA_EXPDEC_MINB) expdec_down_kernel(co
     }
 }
 
+// STRATA_SM86_DOWN_WS: zero-spill (REG:64, STACK:0, 2,880 B smem) IQ4_NL down kernel for sm_86.
+// Eliminates native_down_multi_kernel<20>'s 64-byte stack spill by staging up to ED_NC=4 q8_1 hidden rows
+// (n_ff = 640 -> ED_HB = 20 blocks) in shared memory and running 32 sub-warps of 8 lanes via ed_d20_rows<1, NC>.
+// Bit-exact with native_down_multi_kernel<20> (same dp4a order and reduction tree).
+__global__ void __launch_bounds__(256, 4) sm86_down_iq4nl_clean_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                       const int32_t* __restrict__ grp_start,
+                                                                       const int32_t* __restrict__ n_groups,
+                                                                       const int32_t* __restrict__ ent_dst,
+                                                                       const block_q8_1* __restrict__ hq,
+                                                                       NativeExpertLayout L, float* __restrict__ out) {
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    STRATA_SHARED_ALIGN16(int4, s_u, ED_NC * 2 * ED_HB);
+    __shared__ float s_ds[ED_NC * ED_HB];
+    const int tid = threadIdx.x;
+    const int r = (int) blockIdx.x * 32 + (tid >> 3);
+    const int t = tid & 7;
+    const bool valid_r = r < (int) L.n_embd;
+    const size_t w_off = L.down_off + (size_t) (valid_r ? r : 0) * L.d_row;
+    const int2* s_p = reinterpret_cast<const int2*>(s_u);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const uint8_t* wr = blob + w_off;
+        const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += ED_NC) {
+            const int n = min(ED_NC, e1 - e);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            for (int c = 0; c < n; ++c)
+                ed_stage_entry<ED_HB, false>(s_u, s_ds, c, hq + (size_t) (e + c) * ED_HB, tid);
+            iq_sync_lds();
+            if (valid_r) {
+                const uint8_t* wr1[1] = { wr };
+                auto exec = [&](auto nc) {
+                    constexpr int NC = decltype(nc)::value;
+                    float s[1][NC];
+                    ed_d20_rows<1, NC>(wr1, s_p, s_ds, t, s);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c)
+                        if (t == c) out[(size_t) ent_dst[e + c] * L.n_embd + r] = L.tail_off ? s[0][c] * sd : s[0][c];
+                };
+                switch (n) {
+                    case 1: exec(std::integral_constant<int, 1>{}); break;
+                    case 2: exec(std::integral_constant<int, 2>{}); break;
+                    case 3: exec(std::integral_constant<int, 3>{}); break;
+                    default: exec(std::integral_constant<int, 4>{}); break;
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
 // value i of a q8_1 row set (the warp holds block i / 32, lane = i % 32)
 __device__ __forceinline__ void q8_1_store(const float xi, block_q8_1* __restrict__ y, const long long i) {
@@ -4232,6 +4284,51 @@ bool expdec_down(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cu
     expdec_note(L, false, true, s, gy, cap_groups);
     if (L.d_type == 20) expdec_down_t<20>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else expdec_down_t<42>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    return true;
+}
+
+// STRATA_SM86_DOWN_WS (opt-in, default 0 = off): bit-exact sm_86 down kernels for n_ff=640:
+//   =1 or =6: IQ4_NL (20) -> sm86_down_iq4nl_clean_kernel (rb=32, 0 stack spill); Q2_0 (42) -> expdec_down_kernel<42,2> (rb=64)
+//   =5:       Q2_0-only (expdec_down_kernel<42,2>, rb=64), leaving IQ4_NL on default
+int sm86_down_ws_mode() {
+    static const int mode = [] {
+        const int v = env_int_or("STRATA_SM86_DOWN_WS", 0);
+        return (v == 1 || v == 5 || v == 6) ? v : 0;
+    }();
+    return mode;
+}
+bool sm86_down_ws_ok(const NativeExpertLayout& L) {
+    return (L.d_type == 20 || (L.d_type == 42 && L.n_embd % 2 == 0)) && L.n_ff == 32 * ED_HB && L.n_embd > 0 &&
+           L.had_block == 0 && L.d_row == (size_t) (L.d_type == 20 ? 360 : 180);
+}
+void sm86_down_ws_note(const NativeExpertLayout& L, int mode, cudaStream_t s, int64_t gy, int64_t cap_groups) {
+    static bool seen[64] = {};
+    if (L.d_type < 0 || L.d_type >= 64 || seen[L.d_type]) return;
+    seen[L.d_type] = true;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    (void) cudaStreamIsCapturing(s, &cs);
+    int dev = -1;
+    (void) cudaGetDevice(&dev);
+    const int rb = L.d_type == 20 ? 32 : 64;
+    const char* kname = L.d_type == 20 ? "sm86_down_iq4nl_clean_kernel" : "expdec_down_kernel<42,2>";
+    std::fprintf(stderr, "strata sm86-down-ws: CUDA%d down type %d: %s (mode=%d rb=%d), grid %d x %lld (cap %lld)%s\n",
+                 dev, L.d_type, kname, mode, rb, ((int) L.n_embd + rb - 1) / rb, (long long) gy, (long long) cap_groups,
+                 cs != cudaStreamCaptureStatusNone ? ", captured into a graph" : "");
+}
+bool sm86_down_ws(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cudaStream_t s,
+                  const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                  const int32_t* ent_dst, const block_q8_1* hq, float* out) {
+    const int mode = sm86_down_ws_mode();
+    if (mode == 0 || g_old_kernels || g_no_sub16_gu || !sm86_down_ws_ok(L)) return false;
+    if (mode == 5 && L.d_type != 42) return false;
+    sm86_down_ws_note(L, mode, s, gy, cap_groups);
+    if (L.d_type == 20) {
+        const dim3 grid((unsigned) ((L.n_embd + 31) / 32), (unsigned) gy);
+        sm86_down_iq4nl_clean_kernel<<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    } else {
+        const dim3 grid((unsigned) ((L.n_embd + 63) / 64), (unsigned) gy);
+        expdec_down_kernel<42, 2><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, 64);
+    }
     return true;
 }
 
@@ -6060,11 +6157,13 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
     extern __shared__ int sh_raw[];   // LDS_NT entries x hb blocks of q8_1
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    if (e0 >= e1) return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const float sd = (TD == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
     const int nb = (int) (L.n_ff / F::qk), hb = (int) (L.n_ff / 32);
     const int n_items = nb * F::ipb;
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
     const int nrow = (int) L.n_embd;
     const block_q8_1* sh = (const block_q8_1*) sh_raw;
     constexpr bool kDownSplit = kSplit<TD> || (TD == 7);
@@ -6113,7 +6212,10 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
                         float v = s[j];
 #pragma unroll
                         for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-                        if (slane == 0) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = v;
+                        if (slane == 0) {
+                            if constexpr (TD == 40) v *= sd;
+                            out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = v;
+                        }
                     }
                 };
                 switch (cn) {
@@ -6160,7 +6262,6 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
                 }
 #pragma unroll
                 for (int j = 0; j < NTC; ++j) {
-                    const float sd = (TD == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
                     const float a = warp_sum(s0[j]) * sd, b = warp_sum(s1[j]) * sd;
                     if (lane == 0) {
                         out[(size_t) ent_dst[c0 + j] * L.n_embd + r0] = a;
@@ -6201,6 +6302,8 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
     extern __shared__ int sx_raw[];
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    if (e0 >= e1) return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     if constexpr (kHasGrid) {
         const GT* gsrc = GridOf<TG>::src();
@@ -6217,7 +6320,6 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
     const float s_gate = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
     const float s_up   = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
     const int nb = (int) (L.n_embd / F::qk), xb = (int) (L.n_embd / 32), hb = (int) (L.n_ff / 32);
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
     const int r0 = blockIdx.x * 32;
     const block_q8_1* sx = (const block_q8_1*) sx_raw;
     auto wrow = [&](int i) -> const uint8_t* {   // i < 32: gate row r0 + i, else up row r0 + i - 32
@@ -6936,6 +7038,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         return;
     }
 #endif
+    if (sm86_down_ws(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out)) {
+        check("native_expert_grouped/down sm86_ws");
+        return;
+    }
 #if STRATA_EXP_LAYOUTS
     const int em0d = sm75_down_em(em0, cap_groups);
     int dev_d = 0;
