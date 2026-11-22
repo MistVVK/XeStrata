@@ -39,6 +39,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/short_cache.hpp"
+#include "strata/core/uma.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -4212,7 +4213,10 @@ int main(int argc, char **argv) try {
     // slower): with no --kv-resident given, the K/V streams from RAM, the resident window as large as the card leaves room for.
     // Needed: every session (the main one and each request slot), what loads after them (the draft layer, the native head, the verify buffers), the reserve,
     // the prompt path's smallest own buffers (chunk 256) and a cache of 128 slots.
-    if (o.kv_resident <= 0 && o.max_context > 20480 && !multi_gpu && !o.kv_grow && o.expert_cache != 0) {
+    // #6448: not on an integrated GPU.  KV streaming keeps the whole K/V in pinned RAM and a window of it in VRAM; with one
+    // pool for both that is the K/V twice, so a context that does not fit there does not fit streamed either.
+    if (o.kv_resident <= 0 && o.max_context > 20480 && !multi_gpu && !o.kv_grow && o.expert_cache != 0 &&
+        !strata::core::device_unified_memory()) {
         const int64_t kLateLoadMib = (!o.mtp.empty() || o.draft == "dflash2") ? 1500 : 700;   // Arc A750: MTP 835 + head 417 + verify 70 + the rest; DFlash2 alone is about the same
         const int64_t blob_b = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         const int64_t n_sess = 1 + std::max(o.batch, 0);
@@ -5163,6 +5167,29 @@ int main(int argc, char **argv) try {
     if (o.expert_cache > 0) {
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
+        // #6448: on an integrated GPU the auto cache took all the room the shared pool has and nothing mirrors the rest
+        // (below), so a cache with fewer slots than the model has experts ends in the refusal after the fill.  It is
+        // refused here instead, with the same words: the fill would first read every slot's expert from the disk (tens of
+        // GiB) only to find the same shortfall.  A mirror size given in STRATA_MIRROR_MIB (other than 0) is left to the
+        // mirror and to the check after it.
+        const bool no_host_env = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+        const char* mirror_mib = std::getenv("STRATA_MIRROR_MIB");
+        const bool mirror_given = mirror_mib != nullptr && std::atoll(mirror_mib) != 0;
+        if (strata::core::device_unified_memory() && auto_cache && !multi_gpu && o.stream_experts && srcp == &gguf_src && no_host_env
+            && !mirror_given && xcache.slots() < g.n_layers * g.n_expert) {
+            uint64_t av = 0, pooled = 0, all_b = 0;
+            strata::core::uma_memory(av, pooled);
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                all_b += (uint64_t) g.n_expert * (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+            const uint64_t have_b = (uint64_t) xcache.bytes(), short_b = all_b > have_b ? all_b - have_b : 0;
+            std::fprintf(stderr, "strata generate: REFUSED: this model does not fit in the memory the integrated GPU shares with the system: "
+                                 "%lld of its experts (about %.1f GiB) have no room. %.1f GiB of RAM is available now and %.0f GiB of it is "
+                                 "kept free for the system (STRATA_UMA_HEADROOM_GIB). Close programs that hold RAM, lower --max-context, or "
+                                 "take a smaller size of the model\n",
+                         (long long) (g.n_layers * g.n_expert - xcache.slots()), (double) short_b / 1073741824.0,
+                         (double) (av + pooled) / 1073741824.0, (double) strata::core::uma_headroom_bytes() / 1073741824.0);
+            refuse_exit(2);
+        }
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -5390,7 +5417,11 @@ int main(int argc, char **argv) try {
         // STRATA_LEND_MIRROR=0 turns it off; =N: the last N slots (default 10% of the cache with a loan, at most 1,200).
         if (!o.no_prefill_borrow && o.prefill_chunk > 0 && !multi_gpu) {
             const char* lm = std::getenv("STRATA_LEND_MIRROR");
-            const int64_t want_tail = lm ? std::atoll(lm) : std::min<int64_t>(xcache.slots() / 10, 1200);
+            // #6448: off by default on an integrated GPU, where the mirror is the same RAM as the cache: a second copy of
+            // up to 1,200 cached experts (about 2 GiB).  On an Arc Pro B390, 6K prompts ran at 367 tok/s without it and
+            // 359 with it (medians of 3).  With an auto cache there it also needs STRATA_MIRROR_MIB (the mirror's room).
+            const int64_t want_tail = lm ? std::atoll(lm)
+                                         : (strata::core::device_unified_memory() ? 0 : std::min<int64_t>(xcache.slots() / 10, 1200));
             if (want_tail > 0) {
                 const int64_t first_tail = xcache.slots() - std::min<int64_t>(want_tail, xcache.slots());
                 for (int64_t l = 0; l < mirror_end; ++l)
@@ -5407,7 +5438,16 @@ int main(int argc, char **argv) try {
             std::fclose(f);
         }
         const char* mv = std::getenv("STRATA_MIRROR_MIB");
-        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        // #6448: on an integrated GPU the mirror comes out of the pool the cache was sized from.  An auto cache took what
+        // the pool allows, so what it left is the reserve of the allocations still to come, not room for a mirror: the
+        // experts it could not hold are read from the file by the host, or, with STRATA_VERIFY_NO_HOST, refused below
+        // with the numbers.  A cache size that was given leaves the pool's rest, less the reserve, to the mirror.
+        const bool uma_pool = strata::core::device_unified_memory();
+        if (uma_pool && !mv) {
+            const uint64_t room = (uint64_t) strata::core::uma_free_bytes(0), keep = (uint64_t) o.vram_reserve_mib << 20;
+            cap = auto_cache ? 0 : (room > keep ? room - keep : 0);
+        }
         if (!miss.empty() && cap > 0) {
             const auto tm = Clock::now();
             const int64_t got = gguf_src.mirror(miss, cap, 8, err);
@@ -5433,6 +5473,23 @@ int main(int argc, char **argv) try {
         unmirrored_misses = (int64_t) n_true_miss - (int64_t) (gguf_src.mirrored_bytes() ? std::count_if(miss.begin(), miss.begin() + (ptrdiff_t) n_true_miss,
             [&](const std::pair<int64_t, int64_t>& pr) { return gguf_src.pinned(pr.first, pr.second); }) : 0);
         const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+        if (unmirrored_misses > 0 && no_host && uma_pool) {
+            // #6448: the same refusal in the terms of one pool of memory, with what is short
+            uint64_t av = 0, pooled = 0;
+            strata::core::uma_memory(av, pooled);
+            uint64_t short_b = 0;   // the bytes of the experts that have no room (their sizes differ by layer)
+            for (size_t k = 0; k < n_true_miss; ++k)
+                if (!gguf_src.pinned(miss[k].first, miss[k].second))
+                    short_b += (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(miss[k].first);
+            const double short_gib = (double) short_b / 1073741824.0;
+            std::fprintf(stderr, "strata generate: REFUSED: this model does not fit in the memory the integrated GPU shares with the system: "
+                                 "%lld of its experts (about %.1f GiB) have no room. %.1f GiB of RAM is available now and %.0f GiB of it is "
+                                 "kept free for the system (STRATA_UMA_HEADROOM_GIB). Close programs that hold RAM, lower --max-context, or "
+                                 "take a smaller size of the model\n",
+                         (long long) unmirrored_misses, short_gib, (double) (av + pooled) / 1073741824.0,
+                         (double) strata::core::uma_headroom_bytes() / 1073741824.0);
+            refuse_exit(2);
+        }
         if (unmirrored_misses > 0 && no_host) {
             std::fprintf(stderr, "strata generate: REFUSED: %lld experts are neither in VRAM nor mirrored; with STRATA_VERIFY_NO_HOST "
                                  "the device plan cannot run them and generation would lack a safe host fallback - raise "

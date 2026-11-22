@@ -159,7 +159,10 @@ with Coder IQ1_M 1,024 MiB fits all 12,288 experts with 2 GB of VRAM free.
 - **Monitor tab.** `server_intel.py` plugs the shared Intel reader (`terminal/serve/telemetry.py`) into the Monitor. Temperature, power and
   the PCIe link come from sysfs. Load and VRAM work without root: load is the GPU busy time of the engine's own processes
   (`/proc/<pid>/fdinfo`, readable by the user who started them), the VRAM total comes from Level Zero sysman (`libze_loader.so.1`),
-  and the VRAM in use from sysman on `xe` and from the engine's own fdinfo memory on `i915`. The root sampler
+  and the VRAM in use from sysman on `xe` and from the engine's own fdinfo memory on `i915`. An Intel GPU built into the
+  processor (Level Zero's integrated flag) has no VRAM: its total is the RAM (`MemTotal`) and its use the fdinfo memory in
+  `gtt` and `system` of the GPU clients this user can see (on a laptop, the desktop's too). The server's free-memory checks (`min_free_vram_mib`, the room for a GPU picture reader) count
+  `MemAvailable` plus `GPUReclaim` from `/proc/meminfo` there. The root sampler
   (`engine/sycl/tools/gpustat.py`, `gpustat.service`) is optional: when it runs, its `/run/gpustat.json` is used first, and it also sees
   other users' processes. PCIe traffic needs Intel PMT, which is root-only unless the host grants it; without it the Monitor leaves
   that reading empty. A run config may name a `model_switcher`; the web app's header then gets a Model menu.
@@ -225,8 +228,9 @@ moves about 26 GB; bigger chunks read faster.
 Draft length (200 tokens, `--spec-min-p 0.5`): `--spec 6` against `--spec 4` is +6.5% on code and -1.5% on prose, so the setup
 default (4, 0.5) stays. A `--prefill 8192` chunk is not bit-identical to 4096 (first-token KL 1.1e-2 at 16K, top-1 the same).
 
-**Fused int8 expert path (Battlemage default).** On a Battlemage GPU (B70, B580, B570, detected by device architecture) the
-engine computes the prompt's routed experts with ESIMD kernels that decode the quantized weights in registers into the s8 DPAS B
+**Fused int8 expert path (Battlemage default).** On a Battlemage GPU (B70, B580, B570, detected by device architecture; also
+an Xe3 GPU, see `STRATA_INTEL_GEN`) the engine computes the prompt's routed experts with ESIMD kernels that decode the
+quantized weights in registers into the s8 DPAS B
 operand and multiply them by q8_1 activations. Covered: gate/up IQ3_S, IQ3_XXS, IQ2_S and down IQ4_NL, Q2_0. Other formats keep
 the FP16 path, as does every other GPU. `STRATA_PREFILL_MMQ` unset is `auto`, which times both chains at the first layer of each
 format and takes int8 below the measured crossover (130-250 rows per expert); `=0` turns it off, `=1` forces it. Activations are
@@ -385,14 +389,17 @@ All are environment variables for the engine. Put them in the config's `"env"` b
 | Switch | Default | Effect |
 | --- | --- | --- |
 | `STRATA_VERIFY_NO_HOST` | 1 (`strata-sycl.sh`); 0 on `i915` | See above |
-| `STRATA_MIRROR_MIB` | Free RAM less 4 GiB | Size of the pinned host mirror for experts without a VRAM slot. Set `0` on a layer split where the mirror would not be used. |
+| `STRATA_MIRROR_MIB` | Free RAM less 4 GiB. On an integrated GPU: none with `--expert-cache auto`, the pool's rest less `--vram-reserve-mib` with a cache size you give | Size of the pinned host mirror for experts without a VRAM slot. Set `0` on a layer split where the mirror would not be used. |
+| `STRATA_UMA` | From the device | `1` / `0`: plan the GPU as one that shares the system's RAM (an integrated GPU), or as a card. Linux. See [INTEL_ARC.md](INTEL_ARC.md#integrated-arc-gpus-the-b390-panther-lake) |
+| `STRATA_UMA_HEADROOM_GIB` | 6 | On such a GPU, the GiB of RAM the engine leaves free when it sizes its cache |
 | `STRATA_PF_XMX` | 2 on Alchemist | Grouped XMX expert launch; `0` off, `1` dequantize first |
 | `STRATA_GDN_XE` | On for Alchemist | Sub-group GDN recurrence |
 | `STRATA_COPY_ENGINE` | On for Battlemage | Expert copies on the copy engine |
+| `STRATA_INTEL_GEN` | From the device | `battlemage`, `alchemist` or `unknown`: the generation whose kernels and defaults the GPU gets. An Xe3 GPU (Panther Lake: the Arc B390) is classed with Battlemage; `unknown` gives it the generic kernels. |
 | `STRATA_PREFILL_MMQ` | `auto` on Battlemage | Fused int8 prompt experts |
 | `STRATA_PREFILL_STREAM_ALL` | On when VRAM holds more than 90% of the (layer, expert) pairs | Copy every expert the cache does not hold, layer by layer; `=0` / `=1` force it |
 | `STRATA_PREFILL_FIRST` | 256 if the cache holds every expert, else 0 | Tokens in the short first prompt chunk |
-| `STRATA_LEND_MIRROR` | On | Mirror the experts in the last 10% of cache slots; `=0` off |
+| `STRATA_LEND_MIRROR` | On; off on an integrated GPU, where an automatic cache also needs `STRATA_MIRROR_MIB` for it | Mirror the experts in the last 10% of cache slots; `=0` off, `=N` the last N slots |
 | `STRATA_VERIFY_LEAN` | On | Decode graph without unanswered nodes; `=0` off |
 | `STRATA_FILL_SERIAL=1` | Off | The old serial expert-cache fill (the pipelined fill is the default) |
 | `STRATA_MMVQ_A2=0`, `STRATA_MMVQ_WIDE_32=0` | On | Restore the older matvec kernels |

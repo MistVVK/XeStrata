@@ -319,6 +319,8 @@ static void get_device_info(device_info &out, const sycl::device &dev) {
       dev.get_info<sycl::info::device::max_work_item_sizes<3>>());
 #endif
   prop.set_host_unified_memory(dev.has(sycl::aspect::usm_host_allocations));
+  // dpct leaves _integrated unset, so iGPUs report 0 and the expert cache is not sized from MemAvailable.
+  prop.set_integrated(dev.has(sycl::aspect::ext_oneapi_is_integrated_gpu));
 
   prop.set_max_clock_frequency(
       dev.get_info<sycl::info::device::max_clock_frequency>() * 1000);

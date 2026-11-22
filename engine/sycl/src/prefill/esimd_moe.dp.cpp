@@ -812,8 +812,12 @@ namespace {
 bool bmg_arch(const sycl::device& d) {
     namespace ex = sycl::ext::oneapi::experimental;
     if (!d.is_gpu()) return false;
+    if (strata::intel_gpu_gen_override() >= 0) return strata::intel_gpu_gen(d) == strata::IntelGpuGen::Battlemage;
     const auto a = d.get_info<ex::info::device::architecture>();
-    return a == ex::architecture::intel_gpu_bmg_g21 || a == ex::architecture::intel_gpu_bmg_g31;
+    // #6448: also an Xe3 GPU, which intel_gpu_gen() classes with Battlemage: the same DPAS units; available() still
+    // checks that this device has the s8 8x16x32 combination the kernels need
+    return a == ex::architecture::intel_gpu_bmg_g21 || a == ex::architecture::intel_gpu_bmg_g31 ||
+           strata::intel_gpu_xe3(d);
 }
 }  // namespace
 
