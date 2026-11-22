@@ -32,6 +32,6 @@ test('picture reading stays on for own files when a reader is already on this co
 test('the own-files page asks for its vision value from that rule, not from the folder alone', () => {
   const page = src('components/NativeLocalModel.tsx');
   assert.match(page, /import \{ ownFilesVision \} from '\.\.\/lib\/own-files-vision';/);
-  assert.match(page, /vision: ownFilesVision\(checked\.preview\.projectors, native\?\.visionReader, native\?\.installed\?\.models\)/);
+  assert.match(page, /vision: ownFilesVision\(checked\.preview\.projectors, native\?\.visionReader, native\?\.installed\?\.models(?:, selection\.family)?\)/);
   assert.doesNotMatch(page, /p\.status === 'ok' && p\.pinned\) && native\?\.visionReader \? 'yes' : 'no'/);
 });

@@ -30,6 +30,28 @@ export const mb = megabytes;
 /** After the size when the download also brings the newer Strata Control (owner-approved wording, 11-09). */
 export const WITH_CONTROL = " (with the Strata setup update)";
 
+/** Shape of `/api/control/status` used to decide whether the first-run engine card should appear. */
+export interface ControlStatusEngine {
+    engine?: { usable?: boolean; shapes?: { shape?: string; usable?: boolean }[] } | null;
+    shapeEngines?: { shape?: string; usable?: boolean }[];
+    anyUsableEngine?: boolean;
+    engineSetup?: boolean;
+}
+
+/**
+ * Decide whether the first-run Qwen engine download card should open.
+ * Returns `false` when a shape engine (such as `strata-inkling` or `strata-hy4`) is already installed and usable,
+ * so users who only installed a shape engine are not prompted to download the 490 MB Qwen engine.
+ */
+export function engineNeededFromStatus(s: ControlStatusEngine | null | undefined): boolean | null {
+    if (!s) return false;
+    if (s.engineSetup) return null;
+    if (s.anyUsableEngine === true) return false;
+    if ((s.shapeEngines ?? []).some(x => x?.usable === true)) return false;
+    if ((s.engine?.shapes ?? []).some(x => x?.usable === true)) return false;
+    return !!s.engine && s.engine.usable === false;
+}
+
 /**
  * Whether this PC still needs its engine. Reads only Control's local answer (no network): the engine is missing and the engine that came
  * with the app is not being unpacked. `null` while that is not known yet.
@@ -38,10 +60,9 @@ export function useEngineNeeded(): boolean | null {
     const [needed, setNeeded] = useState<boolean | null>(null);
     useEffect(() => {
         let live = true;
-        const ask = () => api.get<{ engine?: { usable?: boolean } | null; engineSetup?: boolean }>('/api/control/status').then(s => {
+        const ask = () => api.get<ControlStatusEngine>('/api/control/status').then(s => {
             if (!live) return;
-            if (s.engineSetup) return setNeeded(null);
-            setNeeded(!!s.engine && s.engine.usable === false);
+            setNeeded(engineNeededFromStatus(s));
         }, () => { if (live) setNeeded(false); });
         void ask();
         const timer = setInterval(() => void ask(), 3000);

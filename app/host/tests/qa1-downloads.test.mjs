@@ -160,8 +160,8 @@ test('no recognised engine: the app still downloads, warns in the card, and load
   assert.equal((source.match(/ENGINE_NOT_RECOGNISED\+/g) ?? []).length, 2, 'both load paths use it');
   const models = readSource(new URL('../src/components/NativeModels.tsx', import.meta.url), 'utf8');
   const guided = readSource(new URL('../src/components/GuidedSetup.tsx', import.meta.url), 'utf8');
-  assert.match(models, /<EngineWarning native=\{native\}( onSetup=\{\(\) => go\('setup'\)\})?\/>/);   // #5529: the Models page adds a way to the guided setup
-  assert.match(guided, /<EngineWarning native=\{native\}\/>/);
+  assert.match(models, /<EngineWarning native=\{native\}(?: family=\{selectedFamily\?\.family\})?( onSetup=\{\(\) => go\('setup'\)\})?\/>/);   // #5529: the Models page adds a way to the guided setup
+  assert.match(guided, /<EngineWarning native=\{native\}(?: family=\{selectedFamily\?\.family\})?\/>/);
   const warn = readSource(new URL('../src/components/EngineWarning.tsx', import.meta.url), 'utf8');
   assert.match(warn, /The model will download, but it may not run until the right engine is installed \(Settings → About\)\./);
   // the install is not refused for a missing engine (only the engine-minimum refusal for a version that is too old stays)

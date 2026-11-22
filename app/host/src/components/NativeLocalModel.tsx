@@ -63,7 +63,9 @@ export function NativeLocalModel({ onBack }: { onBack: () => void }) {
         setPending(true);
         setError('');
         try {
-            const result = await nativeAction<NativeJob>('operations', { kind: 'install', args: { family: selection.family, model: selection.model, gguf_dir: checked.preview.model_dir ?? checked.path, ...(ownDataFolder ? { data_dir: ownDataFolder } : {}), context: native?.catalog?.recommendation?.context ?? 32768, vision: ownFilesVision(checked.preview.projectors, native?.visionReader, native?.installed?.models), kv: 'int8', loadAfter: true } });
+            const isInkling = selection.family === 'inkling-2-mini';
+            const localTarget = isInkling && /\.(gguf|strata)$/i.test(checked.path) ? checked.path : (checked.preview.model_dir ?? checked.path);
+            const result = await nativeAction<NativeJob>('operations', { kind: 'install', args: { family: selection.family, model: selection.model, gguf_dir: localTarget, ...(ownDataFolder ? { data_dir: ownDataFolder } : {}), context: isInkling ? 32768 : (native?.catalog?.recommendation?.context ?? 32768), vision: ownFilesVision(checked.preview.projectors, native?.visionReader, native?.installed?.models, selection.family), kv: 'int8', loadAfter: true } });
             setJobId(result.id);
         }
         catch (e) { setError(e instanceof Error ? e.message : String(e)); }

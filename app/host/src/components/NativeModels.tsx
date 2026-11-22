@@ -276,7 +276,7 @@ export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine
       {tr(roleCards.length > 1 && (native?.hardware?.gpus ?? []).length > roleCards.length ? <p className="small muted native-cards__note">{tr('Not used: {0} (another make of graphics card than this engine drives).', [(native?.hardware?.gpus ?? []).filter(g => !roleCards.some(r => r.index === g.index && r.vendor === g.vendor)).map(g => g.name).join(', ')])}</p> : null)}
       {tr(selectedSize?.images || noReader ? <><div className="native-image-reading"><label title={noReader ? tr("Needs an engine update") : undefined}><input type="checkbox" checked={!noReader && vision !== 'no'} disabled={noReader || !!active} onChange={e => pickVision(e.target.checked ? 'yes' : 'no')}/><span><strong>{tr("Read pictures")}</strong></span></label>{tr(expert && !isHy4Selected && vision !== 'no' ? <Select ariaLabel={tr("Image encoder device")} value={vision === 'yes' ? 'yes' : vision} options={[{ value: 'yes', label: 'Automatic' }, { value: 'gpu', label: 'GPU' }, { value: 'cpu', label: 'CPU' }]} onChange={pickVision}/> : null)}</div>{tr(vision !== 'no' && !noReader && !active && loadedSelected?.picturesNote ? <p className="small muted native-vision-note" role="status">{tr(loadedSelected.picturesNote)}</p> : null)}</> : null)}
      </> : null)}
-     <EngineWarning native={native} onSetup={() => go('setup')}/>
+     <EngineWarning native={native} family={selectedFamily?.family} onSetup={() => go('setup')}/>
      <EngineUpdateCard native={native} busy={!!active}/>
      <EngineUpdateDialog open={false} onClose={() => {}}/>
      {tr(active ? <NativeProgress job={active} label={jobLabel(active)}/> : null)}

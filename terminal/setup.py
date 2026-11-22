@@ -1267,9 +1267,11 @@ _OWN_DIRS: list = []                                   # --gguf-dir: folders of 
 def own_files_in(folder) -> None:
     """Strata writes nothing beside the person's own model files (lane NET item 5): their finish marks are kept in marks/ (_kept_mark)."""
     try:
-        _OWN_DIRS.append(Path(folder).expanduser().resolve())
+        p = Path(folder).expanduser().resolve()
+        _OWN_DIRS.append(p.parent if p.is_file() else p)
     except OSError:
-        _OWN_DIRS.append(Path(folder).expanduser())
+        p = Path(folder).expanduser()
+        _OWN_DIRS.append(p.parent if p.is_file() else p)
 
 
 def _is_own_file(path: Path) -> bool:
@@ -10037,15 +10039,80 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
 
 def inkling_folder(a) -> Path:
     if getattr(a, "gguf_dir", None):
-        return Path(a.gguf_dir)
+        p = Path(a.gguf_dir)
+        return p.parent if p.is_file() else p
     return Path(getattr(a, "models_dir", None) or (home() / "models")) / inkling_family.FAMILY
+
+
+def inkling_local_source(a, model: str | None = None) -> tuple[Path, Path, bool] | None:
+    """Resolve a user-supplied --gguf-dir (file or folder) for Inkling-2-Mini to (model_file, folder, is_gguf)."""
+    raw_val = getattr(a, "gguf_dir", None)
+    if not raw_val:
+        return None
+    raw = Path(raw_val)
+    shard_re = re.compile(r"^(.+)-(\d{5})-of-(\d{5})\.gguf$", re.I)
+    aux_re = re.compile(r"^(?:mmproj|dspark|imatrix|mtp[-_]).*\.gguf$", re.I)
+    if raw.is_file():
+        low = raw.name.lower()
+        if low.endswith(".gguf"):
+            m = shard_re.match(raw.name)
+            first = raw.with_name(f"{m.group(1)}-00001-of-{m.group(3)}.gguf") if m else raw
+            return (first if first.is_file() else raw), raw.parent, True
+        if low.endswith(".strata"):
+            return raw, raw.parent, False
+        return None
+    if not raw.is_dir():
+        return None
+    if model and model in inkling_fit.BUILDS:
+        pinned = raw / inkling_family.build_file(model)
+        if pinned.is_file():
+            return pinned, raw, False
+    ggufs = sorted(p for p in raw.glob("*.gguf") if p.is_file() and not aux_re.match(p.name))
+    if ggufs:
+        first_shard = next((p for p in ggufs if (m := shard_re.match(p.name)) and m.group(2) == "00001"), None)
+        return (first_shard or ggufs[0]), raw, True
+    stratas = sorted(p for p in raw.glob("*.strata")
+                     if p.is_file() and "vision" not in p.name.lower() and "engram" not in p.name.lower())
+    if len(stratas) == 1:
+        return stratas[0], raw, False
+    return None
+
+
+def inkling_find_local_vision(folder: Path, data: Path, is_gguf: bool) -> Path | None:
+    """Find a local Inkling-2-Mini Vision shard (.strata) or companion mmproj*.gguf beside a local model."""
+    for cand in (folder / inkling_family.VISION_FILE, data / "models" / inkling_family.FAMILY / inkling_family.VISION_FILE):
+        if cand.is_file():
+            return cand
+    if is_gguf:
+        mmprojs = sorted(p for p in folder.glob("mmproj*.gguf") if p.is_file())
+        if mmprojs:
+            for pref in ("bf16", "f16", "q8_0"):
+                hit = next((p for p in mmprojs if pref in p.name.lower()), None)
+                if hit:
+                    return hit
+            return mmprojs[0]
+    return None
+
+
+def inkling_find_local_dspark(folder: Path) -> Path | None:
+    """Find an optional local DSpark drafter file (dspark*.gguf or mtp.safetensors) beside an Inkling GGUF."""
+    for base in (folder, folder / "dspark"):
+        if not base.is_dir():
+            continue
+        ggufs = sorted(p for p in base.glob("dspark*.gguf") if p.is_file())
+        if ggufs:
+            return ggufs[0]
+        mtp = base / "mtp.safetensors"
+        if mtp.is_file():
+            return mtp
+    return None
 
 
 def inkling_offered(a=None) -> bool:
     try:
         if inkling_family.sources():
             return True
-        return bool(a is not None and inkling_family.local_files(inkling_folder(a)))
+        return bool(a is not None and (inkling_local_source(a) or inkling_family.local_files(inkling_folder(a))))
     except Exception:                                  # noqa: BLE001
         return False
 
@@ -10135,38 +10202,33 @@ def inkling_fetch(a, name: str, folder: Path, own: bool) -> Path:
     fail(f"no source lists {name}")
 
 
-def inkling_tokenizer_dir(a, model: Path, folder: Path, out: Path, engine: Path | None, own: bool) -> Path | None:
-    """Build serve's o200k tokenizer directory from Section 0 manifest, --export-tokenizer, or tokenizer.json alongside the weights."""
+def inkling_tokenizer_dir(a, model: Path, folder: Path, out: Path, engine: Path | None, own: bool, *, data: Path | None = None) -> Path | None:
+    """Build serve's o200k tokenizer directory from Section 0 manifest, --export-tokenizer, companion files, or public HF fallback."""
     sys.path.insert(0, str(ROOT / "tools"))
     import inkling_tokenizer
     if (out / "vocab.json").is_file() and (out / "chat_template.jinja").is_file():
         return out
-    tok_json = folder / inkling_family.TOKENIZER_FILE
-    tmpl_file = folder / inkling_family.CHAT_TEMPLATE_FILE
-    # 1. Try reading Section 0 manifest directly (uses embedded chat_template + tokenizer_json or companion tokenizer.json)
-    try:
-        manifest = inkling_tokenizer.read_manifest(model)
-        if manifest.get("tokenizer_json") is None and not tok_json.is_file() and not own:
-            tok_json = inkling_fetch(a, inkling_family.TOKENIZER_FILE, folder, own)
-        inkling_tokenizer.convert_manifest(manifest, out, tokenizer_json_path=tok_json if tok_json.is_file() else None)
-        return out
-    except RuntimeError:
-        pass
+    is_gguf = model.suffix.lower() == ".gguf"
+    data_ink = (data / "models" / inkling_family.FAMILY) if data is not None else folder
+    tok_json = next((d / inkling_family.TOKENIZER_FILE for d in (folder, data_ink) if (d / inkling_family.TOKENIZER_FILE).is_file()),
+                    folder / inkling_family.TOKENIZER_FILE)
+    tmpl_file = next((d / inkling_family.CHAT_TEMPLATE_FILE for d in (folder, data_ink) if (d / inkling_family.CHAT_TEMPLATE_FILE).is_file()),
+                     folder / inkling_family.CHAT_TEMPLATE_FILE)
+    # 1. For .strata files, try reading Section 0 manifest directly (uses embedded chat_template + tokenizer_json or companion tokenizer.json)
+    if not is_gguf:
+        try:
+            manifest = inkling_tokenizer.read_manifest(model)
+            if manifest.get("tokenizer_json") is None and not tok_json.is_file() and not own:
+                tok_json = inkling_fetch(a, inkling_family.TOKENIZER_FILE, folder, own)
+            inkling_tokenizer.convert_manifest(manifest, out, tokenizer_json_path=tok_json if tok_json.is_file() else None)
+            return out
+        except (RuntimeError, ValueError):
+            pass
     # 2. Try companion HF files (tokenizer.json + chat_template.jinja) directly (no zstd needed)
-    if not tok_json.is_file() and not own:
-        try:
-            tok_json = inkling_fetch(a, inkling_family.TOKENIZER_FILE, folder, own)
-        except SystemExit:
-            pass
-    if not tmpl_file.is_file() and not own:
-        try:
-            tmpl_file = inkling_fetch(a, inkling_family.CHAT_TEMPLATE_FILE, folder, own)
-        except SystemExit:
-            pass
     if tok_json.is_file() and tmpl_file.is_file():
         inkling_tokenizer.convert_files(tok_json, tmpl_file, out)
         return out
-    # 3. Fallback to strata-inkling --export-tokenizer
+    # 3. Try strata-inkling --export-tokenizer (works for both .strata v1.1 and Inkling-2-Mini .gguf files)
     if engine is not None and Path(engine).is_file():
         raw = out.with_name(out.name + "-export")
         raw.mkdir(parents=True, exist_ok=True)
@@ -10174,17 +10236,38 @@ def inkling_tokenizer_dir(a, model: Path, folder: Path, out: Path, engine: Path 
         var = "PATH" if WIN else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
         eng_dir = str(Path(engine).resolve().parent)
         env[var] = os.pathsep.join([eng_dir, env[var]]) if env.get(var) else eng_dir
-        run([str(engine), "--export-tokenizer", str(model), str(raw)], env=env)
+        try:
+            run([str(engine), "--export-tokenizer", str(model), str(raw)], env=env)
+        except SystemExit:
+            pass
         src_tok = (raw / "tokenizer.hf.json") if (raw / "tokenizer.hf.json").is_file() else tok_json
         src_tpl = (raw / "chat_template.jinja") if (raw / "chat_template.jinja").is_file() else tmpl_file
         if src_tok.is_file() and src_tpl.is_file():
             inkling_tokenizer.convert_files(src_tok, src_tpl, out)
             return out
+        tok_json, tmpl_file = src_tok, src_tpl
+    # 4. Public HF tokenizer fallback (writes into Strata's own data folder, never into user's read-only GGUF folder)
+    if os.environ.get("STRATA_NO_ACQUIRE") != "1":
+        fetch_dir = data_ink if own else folder
+        fetch_dir.mkdir(parents=True, exist_ok=True)
+        if not tok_json.is_file():
+            try:
+                tok_json = inkling_fetch(a, inkling_family.TOKENIZER_FILE, fetch_dir, own=False)
+            except SystemExit:
+                pass
+        if not tmpl_file.is_file():
+            try:
+                tmpl_file = inkling_fetch(a, inkling_family.CHAT_TEMPLATE_FILE, fetch_dir, own=False)
+            except SystemExit:
+                pass
+        if tok_json.is_file() and tmpl_file.is_file():
+            inkling_tokenizer.convert_files(tok_json, tmpl_file, out)
+            return out
     return None
 
 
 def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted):
-    """Steps 2-7 for Thinking Machines Inkling-2-Mini (.strata v1.1, strata-inkling shape engine)."""
+    """Steps 2-7 for Thinking Machines Inkling-2-Mini (.strata v1.1 or local .gguf, strata-inkling shape engine)."""
     fam = INKLING_FAMILIES[family]
     say()
     say(f"  {fam['title']} - {fam['by']}: {fam['about']}")
@@ -10221,19 +10304,41 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if mode == "cross_tier_ssd":
         warn(f"{model} exceeds this PC's memory: about {placed['ssd_gb']:.1f} GB stream from SSD ({rec['build']} fits better)")
     ok(f"context: {ctx} tokens")
-    ok("images: " + ("on (Inkling-2-Mini-Vision.strata, 0.64 GB lossless BF16)" if vision else "off"))
     folder = inkling_folder(a)
     own = bool(getattr(a, "gguf_dir", None))
-    files = inkling_family.files_of(model, vision)
-    left = 0.0
-    for n in files:
-        p = folder / n
-        if not inkling_have(a, p):
-            part = p.with_name(p.name + ".part")
-            left += (inkling_family.FILES[n][0] - (part.stat().st_size if part.is_file() else 0)) / 1e9
-    if left and free_gb(folder) < left:
-        fail(f"not enough free disk space in {folder}: need ~{left:.1f} GB, {free_gb(folder):.1f} GB free",
-             ("use --data-dir on a bigger drive (strata launch --data-dir)" if CONTROL else "use --models-dir on a bigger drive"))
+    local_src = inkling_local_source(a, model) if own else None
+    is_gguf = bool(local_src and local_src[2])
+    if local_src:
+        folder = local_src[1]
+    data, _ = data_folder_for(a)
+    vision_path: Path | None = None
+    dspark_path: Path | None = None
+    if local_src:
+        if vision:
+            vision_path = inkling_find_local_vision(folder, data, is_gguf)
+            if vision_path is not None:
+                ok(f"images: on ({vision_path.name})")
+            else:
+                vision = False
+                warn("no local Inkling-2-Mini Vision shard or mmproj found beside the model; starting text-only")
+        else:
+            ok("images: off")
+        if is_gguf:
+            dspark_path = inkling_find_local_dspark(folder)
+            if dspark_path is not None:
+                ok(f"drafter: DSpark ({dspark_path.name})")
+    else:
+        ok("images: " + ("on (Inkling-2-Mini-Vision.strata, 0.64 GB lossless BF16)" if vision else "off"))
+        files = inkling_family.files_of(model, vision)
+        left = 0.0
+        for n in files:
+            p = folder / n
+            if not inkling_have(a, p):
+                part = p.with_name(p.name + ".part")
+                left += (inkling_family.FILES[n][0] - (part.stat().st_size if part.is_file() else 0)) / 1e9
+        if left and free_gb(folder) < left:
+            fail(f"not enough free disk space in {folder}: need ~{left:.1f} GB, {free_gb(folder):.1f} GB free",
+                 ("use --data-dir on a bigger drive (strata launch --data-dir)" if CONTROL else "use --models-dir on a bigger drive"))
 
     step(3, "Python packages")
     pip_install(runtime_packages(), "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil, textual (the screens)")
@@ -10247,13 +10352,20 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         engine_program = Path(eng) / inkling_family.EXE
         ok(f"engine: {engine_program}")
 
-    step(5, f"downloading {fam['title']} {model}")
-    paths = {n: inkling_fetch(a, n, folder, own) for n in files}
-    ok(f"model file: {paths[files[0]]}")
+    if local_src:
+        step(5, f"using local {fam['title']} files")
+        model_file = local_src[0]
+        ok(f"model file: {model_file}")
+    else:
+        step(5, f"downloading {fam['title']} {model}")
+        files = inkling_family.files_of(model, vision)
+        paths = {n: inkling_fetch(a, n, folder, own) for n in files}
+        model_file = paths[files[0]]
+        vision_path = paths.get(inkling_family.VISION_FILE) if vision else None
+        ok(f"model file: {model_file}")
 
     step(6, "preparing the model for Strata")
-    data, _ = data_folder_for(a)
-    tokdir = inkling_tokenizer_dir(a, paths[files[0]], folder, data / "packs" / tag.lower() / "tokenizer", engine_program, own)
+    tokdir = inkling_tokenizer_dir(a, model_file, folder, data / "packs" / tag.lower() / "tokenizer", engine_program, own, data=data)
     if tokdir is None:
         warn("the tokenizer could not be extracted yet; run setup again once the engine or tokenizer.json is available")
         tokdir = data / "packs" / tag.lower() / "tokenizer"
@@ -10261,13 +10373,16 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         ok(f"tokenizer: {tokdir}")
 
     step(7, "writing the start script")
-    args = ["--native", str(paths[files[0]]), "--max-context", str(ctx)]
-    if vision:
-        args += ["--vision", str(paths[inkling_family.VISION_FILE])]
+    args = ["--native", str(model_file), "--max-context", str(ctx)]
+    if vision and vision_path is not None:
+        args += ["--vision", str(vision_path)]
+    if dspark_path is not None:
+        args += ["--dspark", str(dspark_path)]
     if len(dual_gpus) >= 2:
         args += ["--gpus", "2"]
     if not unified and len(dual_gpus) < 2:
         args += ["--vram-experts-gb", f"{placed['vram_gb']:.2f}", "--ram-experts-gb", f"{placed['ram_gb']:.2f}"]
+    drafting_mode = "off" if (is_gguf and dspark_path is None) else inkling_family.DEFAULT_DRAFTER
     cfg = {
         "exe": engine_exe(eng),
         "args": args,
@@ -10278,7 +10393,7 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         "log": str(home() / f"strata-{tag.lower()}.log"),
         "lib_dirs": lib_dirs,
         "port": port,
-        "drafting": inkling_family.DEFAULT_DRAFTER,
+        "drafting": drafting_mode,
         "parallel": inkling_family.DEFAULT_PARALLEL,
     }
     if hip:

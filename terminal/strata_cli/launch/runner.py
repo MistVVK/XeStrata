@@ -1267,7 +1267,10 @@ class Runner:
                 args.append("--set-default-data-dir")
         if s.model_path:
             p = Path(s.model_path)
-            args += ["--gguf-dir", str(p if p.is_dir() else p.parent)]
+            if fam == "inkling-2-mini" and p.is_file():
+                args += ["--gguf-dir", str(p)]
+            else:
+                args += ["--gguf-dir", str(p if p.is_dir() else p.parent)]
         if self.feed:                                     # --feed / STRATA_UPDATE_FEED: setup reads the signed feed from there too
             args += ["--feed", str(self.feed)]
         if s.gpu_roles:
@@ -1355,8 +1358,10 @@ class Runner:
             if s.model_path:
                 want = Path(s.model_path).expanduser().resolve()
                 folder = want if want.is_dir() else want.parent
-                ggufs = [Path(a) for a in args if a.lower().endswith(".gguf")]
-                if not ggufs or not all(_inside(g.resolve(), folder) for g in ggufs):
+                model_files = [Path(a) for a in args if a.lower().endswith((".gguf", ".strata"))]
+                if not model_files or not all(_inside(g.resolve(), folder) for g in model_files):
+                    return False
+                if want.is_file() and not any(g.resolve() == want for g in model_files):
                     return False
                 if s.data_dir:
                     packs = [Path(args[i + 1]) for i, a in enumerate(args[:-1]) if a == "--pack"]
