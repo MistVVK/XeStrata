@@ -62,10 +62,9 @@ bool gemm_f32_ordered(const float* x, const float* w, float* y, int64_t rows, in
 bool gemv_f32_ordered(const float* x, const float* w, float* y, int64_t n, int64_t k, void* stream);
 // The DSpark draft's layer steps on the device, in the host reference's order: an RMS norm of each row with an
 // ordered FP64 sum (the same rounding as the host), RoPE from a host-computed [rows][dim/2][cos,sin] table,
-// a residual add, and SwiGLU (its exp is the device's, not the host's libm).
+// and a residual add. SwiGLU stays on the host: the device's exp is not the host libm's.
 bool rows_norm_ordered(const float* x, const float* w, float* y, int64_t rows, int64_t n, float eps, void* stream);
 void rope_rows_table(float* x, const float* cs, int64_t rows, int64_t heads, int64_t dim, void* stream);
 void add_rows_f32(float* x, const float* y, int64_t n, void* stream);
-void swiglu_rows_f32(float* up, const float* gate, int64_t n, void* stream);
 
 }  // namespace strata::kernels

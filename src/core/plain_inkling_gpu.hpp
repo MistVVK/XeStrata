@@ -235,7 +235,7 @@ public:
             resident_kv_.push_back({alloc<float>(extent * width), alloc<float>(extent * width), alloc<int32_t>(extent), false});
         std::fprintf(stderr, "xestrata: Inkling target KV: %zu/%zu resident slots, %llu bytes on GPU, "
                              "%llu bytes host shadow, %llu bytes budget\n", count, slots,
-                     (unsigned long long) (count * slot_bytes), (unsigned long long) (slots * slot_bytes),
+                     (unsigned long long) count * slot_bytes, (unsigned long long) slots * slot_bytes,
                      (unsigned long long) budget);
     }
     void invalidate_kv(size_t slot) noexcept {

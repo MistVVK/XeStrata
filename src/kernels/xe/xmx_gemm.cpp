@@ -466,13 +466,4 @@ void add_rows_f32(float* x, const float* y, int64_t n, void* stream) {
     finish(stream, event, "add_rows_f32");
 }
 
-void swiglu_rows_f32(float* up, const float* gate, int64_t n, void* stream) {
-    auto& q = core::Runtime::get().stream(stream);
-    const auto event = q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const float g = gate[id[0]];
-        up[id[0]] *= g * (1.0f / (1.0f + sycl::exp(-g)));
-    });
-    finish(stream, event, "swiglu_rows_f32");
-}
-
 }  // namespace strata::kernels

@@ -33,14 +33,14 @@ inline float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 void rms_norm(const float* x, const float* w, float* y, int64_t n, float eps) {
     double ss = 0;
     for (int64_t i = 0; i < n; ++i) ss += (double) x[i] * x[i];
-    const float scale = 1.0f / std::sqrt((float) (ss / n) + eps);
+    const float scale = 1.0f / std::sqrt((float) (ss / (double) n) + eps);
     for (int64_t i = 0; i < n; ++i) y[i] = x[i] * scale * w[i];
 }
 
 void rms_norm_no_gamma(const float* x, float* y, int64_t n, float eps) {
     double ss = 0;
     for (int64_t i = 0; i < n; ++i) ss += (double) x[i] * x[i];
-    const float scale = 1.0f / std::sqrt((float) (ss / n) + eps);
+    const float scale = 1.0f / std::sqrt((float) (ss / (double) n) + eps);
     for (int64_t i = 0; i < n; ++i) y[i] = x[i] * scale;
 }
 
@@ -562,7 +562,9 @@ bool PlainInkling::Impl::window(const int32_t* tokens, int count, int64_t pos0, 
     const size_t kv_width = (size_t) (NKV * HD);
     const size_t conv_width = (size_t) ((NCONV - 1) * channels);
     std::vector<Backup> backups(keep ? slots.size() : 0);
-    const auto restore = [&](int kept) {
+    // restore() only touches host memory and cannot throw: on the error path (Rollback) the resident copies are marked
+    // stale; after a verified window the restored cells are copied to them below (refresh).
+    const auto restore = [&](int kept, bool stale) {
         if (!keep) return;
         for (size_t i = 0; i < slots.size(); ++i) {
             auto& slot = slots[i];
@@ -576,15 +578,13 @@ bool PlainInkling::Impl::window(const int32_t* tokens, int count, int64_t pos0, 
                 std::copy_n(old.k.data() + (size_t) t * kv_width, kv_width, slot.k.data() + cell * kv_width);
                 std::copy_n(old.v.data() + (size_t) t * kv_width, kv_width, slot.v.data() + cell * kv_width);
             }
-            if (products && kept < count)
-                products->refresh_kv(i, slot.k.data(), slot.v.data(), slot.pos.data(), (pos0 + kept) % extent,
-                                     count - kept, extent, kv_width);
+            if (products && kept < count && stale) products->invalidate_kv(i);
         }
     };
     struct Rollback {
         const decltype(restore)& fn;
         bool armed;
-        ~Rollback() { if (armed) fn(0); }
+        ~Rollback() { if (armed) fn(0, true); }
     } rollback{restore, (bool) keep};
     struct Row {
         std::vector<float> cur, prelude, bank_out, features, expert_in, expert_out, weights;
@@ -779,6 +779,7 @@ bool PlainInkling::Impl::window(const int32_t* tokens, int count, int64_t pos0, 
         if (!err.empty()) return;
         const auto outs = [&](std::vector<float> Prep::*field) {
             std::vector<float*> o;
+            o.reserve(preps.size());
             for (auto& P : preps) o.push_back((P.*field).data());
             return o;
         };
@@ -821,7 +822,7 @@ bool PlainInkling::Impl::window(const int32_t* tokens, int count, int64_t pos0, 
             // append this token's K and V to the slot's cache
             const int64_t cell = pos % extent;
             const int64_t cells = sl.cells = std::min(sl.cells + 1, extent);
-            sl.pos[(size_t) cell] = pos;
+            sl.pos[(size_t) cell] = (int32_t) pos;
             for (int64_t h = 0; h < NKV; ++h) {
                 std::memcpy(sl.k.data() + ((size_t) cell * NKV + h) * HD, k.data() + h * HD, HD * sizeof(float));
                 std::memcpy(sl.v.data() + ((size_t) cell * NKV + h) * HD, v.data() + h * HD, HD * sizeof(float));
@@ -852,7 +853,7 @@ bool PlainInkling::Impl::window(const int32_t* tokens, int count, int64_t pos0, 
                     for (int64_t d = 0; d < HD; ++d)
                         att[h * HD + d] = 0.0f;
                     for (int64_t c = 0; c < cells; ++c) {
-                        const float pw = scores[(size_t) c] / sum;
+                        const float pw = (float) (scores[(size_t) c] / sum);
                         const float* vc = sl.v.data() + ((size_t) c * NKV + hkv) * HD;
                         for (int64_t d = 0; d < HD; ++d) att[h * HD + d] += pw * vc[d];
                     }
@@ -864,6 +865,7 @@ bool PlainInkling::Impl::window(const int32_t* tokens, int count, int64_t pos0, 
         }
         if (!err.empty()) return;
         std::vector<const float*> att_rows;
+        att_rows.reserve(preps.size());
         for (auto& P : preps) att_rows.push_back(P.att.data());
         multiply_rows(L.o, att_rows, outs(&Prep::o), NH * HD, N);
         if (!err.empty()) return;
@@ -1025,8 +1027,13 @@ bool PlainInkling::Impl::window(const int32_t* tokens, int count, int64_t pos0, 
     }
     const int kept = keep ? keep() : count;
     if (kept < 1 || kept > count) { err = "inkling2: invalid verifier commit length"; return false; }
-    restore(kept);
+    restore(kept, false);
     rollback.armed = false;
+    if (products && kept < count)
+        for (size_t i = 0; i < slots.size(); ++i)
+            if (!backups[i].positions.empty())
+                products->refresh_kv(i, slots[i].k.data(), slots[i].v.data(), slots[i].pos.data(),
+                                     (pos0 + kept) % extent, count - kept, extent, kv_width);
     for (int t = 0; t < kept; ++t) {
         auto& row = rows[(size_t) t];
         if (products) products->capture(row.features.data(), row.features.size());
@@ -1104,9 +1111,6 @@ bool PlainInkling::enable_gpu(std::string& err) {
         p_->products = std::make_unique<InklingProducts>(p_->NK, p_->N, p_->FF, raw * (size_t) p_->NK,
                                                         p_->NH, p_->NKV, p_->HD, p_->s.relative_length,
                                                         p_->s.relative_extent);
-        const char* setting = strata::env_get("INKLING_PLACEMENT");
-        const std::string placement = setting ? setting : "host";
-
     } catch (const std::exception& e) { err = e.what(); return false; }
     return true;
 }

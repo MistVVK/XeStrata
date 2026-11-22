@@ -340,7 +340,7 @@ bool PlainDspark::place_attention(int64_t context, std::string& err) {
         if (!gpu::mem_info(&free, &total)) throw std::runtime_error("DSpark: cannot query attention budget");
         const uint64_t budget = free - std::min<uint64_t>(free, vram_room(total));
         const uint64_t limit = max_alloc_bytes();
-        constexpr size_t q_elements = block * heads * hd, noise_elements = block * kv_width;
+        constexpr size_t q_elements = (size_t) block * heads * hd, noise_elements = (size_t) block * kv_width;
         constexpr size_t layer_elements = 3 * block * width + 2 * block * ff + block * hd +
                                           layers * (2 * width + 2 * hd);
         const bool layered = dev->batch;
@@ -355,7 +355,7 @@ bool PlainDspark::place_attention(int64_t context, std::string& err) {
             return bytes;
         };
         const auto score_bytes = [&](int64_t n) { return (uint64_t) (n + block) * block * heads * sizeof(float); };
-        int64_t n = std::min<uint64_t>((uint64_t) context, limit / (kv_width * sizeof(float)));
+        int64_t n = (int64_t) std::min<uint64_t>((uint64_t) context, limit / (kv_width * sizeof(float)));
         while (n > 0 && (score_bytes(n) > limit || pool_bytes(n) + score_bytes(n) > budget - fixed)) n /= 2;
         if (n == 0) return true;
         dev->q = DraftDevice::alloc<float>(q_elements);
@@ -370,12 +370,12 @@ bool PlainDspark::place_attention(int64_t context, std::string& err) {
             cache.v = DraftDevice::alloc<float>(cache.capacity * kv_width);
         }
         if (layered) {
-            dev->x = DraftDevice::alloc<float>(block * width);
-            dev->normed = DraftDevice::alloc<float>(block * width);
-            dev->proj = DraftDevice::alloc<float>(block * width);
-            dev->up = DraftDevice::alloc<float>(block * ff);
-            dev->gate = DraftDevice::alloc<float>(block * ff);
-            dev->cs = DraftDevice::alloc<float>(block * hd);
+            dev->x = DraftDevice::alloc<float>((size_t) block * width);
+            dev->normed = DraftDevice::alloc<float>((size_t) block * width);
+            dev->proj = DraftDevice::alloc<float>((size_t) block * width);
+            dev->up = DraftDevice::alloc<float>((size_t) block * ff);
+            dev->gate = DraftDevice::alloc<float>((size_t) block * ff);
+            dev->cs = DraftDevice::alloc<float>((size_t) block * hd);
             for (int i = 0; i < layers; ++i) {
                 const auto& l = p_->layer[i];
                 const Vec* w[] = {&l.attn_norm, &l.q_norm, &l.k_norm, &l.ffn_norm};
@@ -389,7 +389,7 @@ bool PlainDspark::place_attention(int64_t context, std::string& err) {
         }
         std::fprintf(stderr, "xestrata: DSpark attention: %lld/%lld context rows, %llu bytes KV, "
                              "%llu bytes scratch, %llu bytes budget, layers on %s\n", (long long) n, (long long) context,
-                     (unsigned long long) pool_bytes(n), (unsigned long long) (fixed + score_bytes(n)),
+                     (unsigned long long) pool_bytes(n), (unsigned long long) fixed + score_bytes(n),
                      (unsigned long long) budget, dev->layered ? "the device" : "the host");
         return true;
     } catch (const std::exception& e) { err = e.what(); return false; }
@@ -440,7 +440,7 @@ bool PlainDspark::propose(int32_t anchor, int64_t pos, int count, const Embeddin
     }
     for (int t = 1; t < block; ++t) std::copy(p_->mask.begin(), p_->mask.end(), x[(size_t) t].begin());
     // The layers stay on the device when every context fits its ring: one upload of the rows and one read back.
-    // Each step keeps the host's order and rounding except SwiGLU's exp. Else the host loop below.
+    // Each step keeps the host's order and rounding (SwiGLU's exp runs on the host). Else the host loop below.
     auto* gdev = p_->device.get();
     bool on_device = gdev && gdev->layered;
     for (int i = 0; i < layers && on_device; ++i)
@@ -457,6 +457,7 @@ bool PlainDspark::propose(int32_t anchor, int64_t pos, int count, const Embeddin
         for (size_t t = 0; t < block; ++t) std::copy(x[t].begin(), x[t].end(), rows.data() + t * width);
         gdev->copy(gdev->x.get(), rows.data(), rows.size() * sizeof(float));
         gdev->copy(gdev->cs.get(), cs.data(), sizeof(cs));
+        Vec up_host((size_t) block * ff), gate_host((size_t) block * ff);
         const auto norm_rows = [&](const float* in, const DraftDevice::Buffer<float>& w, float* out, int64_t n, int64_t dim) {
             if (!kernels::rows_norm_ordered(in, w.get(), out, n, dim, eps, gdev->queue.s))
                 throw std::runtime_error("DSpark: ordered GPU norm unavailable");
@@ -470,22 +471,27 @@ bool PlainDspark::propose(int32_t anchor, int64_t pos, int count, const Embeddin
             l.q.mul_dev(gdev->normed.get(), gdev->q.get(), block);
             l.k.mul_dev(gdev->normed.get(), gdev->noise_k.get(), block);
             l.v.mul_dev(gdev->normed.get(), gdev->noise_v.get(), block);
-            norm_rows(gdev->q.get(), w[1], gdev->q.get(), block * heads, hd);
+            norm_rows(gdev->q.get(), w[1], gdev->q.get(), (int64_t) block * heads, hd);
             kernels::rope_rows_table(gdev->q.get(), gdev->cs.get(), block, heads, hd, gdev->queue.s);
-            norm_rows(gdev->noise_k.get(), w[2], gdev->noise_k.get(), block * kv_heads, hd);
+            norm_rows(gdev->noise_k.get(), w[2], gdev->noise_k.get(), (int64_t) block * kv_heads, hd);
             kernels::rope_rows_table(gdev->noise_k.get(), gdev->cs.get(), block, kv_heads, hd, gdev->queue.s);
             if (!kernels::ordered_block_attn(gdev->q.get(), cache.k.get(), cache.v.get(), gdev->noise_k.get(),
                                              gdev->noise_v.get(), pos - n_past, n_past, (int64_t) cache.capacity, block,
                                              heads, kv_heads, hd, gdev->scores.get(), gdev->attention.get(), gdev->queue.s))
                 throw std::runtime_error("DSpark: GPU attention unavailable");
             l.o.mul_dev(gdev->attention.get(), gdev->proj.get(), block);
-            kernels::add_rows_f32(gdev->x.get(), gdev->proj.get(), block * width, gdev->queue.s);
+            kernels::add_rows_f32(gdev->x.get(), gdev->proj.get(), (int64_t) block * width, gdev->queue.s);
             norm_rows(gdev->x.get(), w[3], gdev->normed.get(), block, width);
             l.up.mul_dev(gdev->normed.get(), gdev->up.get(), block);
             l.gate.mul_dev(gdev->normed.get(), gdev->gate.get(), block);
-            kernels::swiglu_rows_f32(gdev->up.get(), gdev->gate.get(), block * ff, gdev->queue.s);
+            // SwiGLU's exp on the host: the device's exp is not the host libm's, and the rows must match the host path
+            gdev->copy(up_host.data(), gdev->up.get(), up_host.size() * sizeof(float));
+            gdev->copy(gate_host.data(), gdev->gate.get(), gate_host.size() * sizeof(float));
+            gdev->wait();
+            for (size_t i = 0; i < up_host.size(); ++i) up_host[i] *= gate_host[i] * sigmoid(gate_host[i]);
+            gdev->copy(gdev->up.get(), up_host.data(), up_host.size() * sizeof(float));
             l.down.mul_dev(gdev->up.get(), gdev->proj.get(), block);
-            kernels::add_rows_f32(gdev->x.get(), gdev->proj.get(), block * width, gdev->queue.s);
+            kernels::add_rows_f32(gdev->x.get(), gdev->proj.get(), (int64_t) block * width, gdev->queue.s);
         }
         gdev->copy(rows.data(), gdev->x.get(), rows.size() * sizeof(float));
         gdev->wait();
@@ -528,7 +534,7 @@ bool PlainDspark::propose(int32_t anchor, int64_t pos, int count, const Embeddin
         if (auto* dev = p_->device.get(); dev && dev->history[layer].capacity > 0 &&
             n_past <= dev->history[layer].capacity) {
             const auto& cache = dev->history[layer];
-            std::array<float, block * kv_width> nk, nv;
+            std::array<float, (size_t) block * kv_width> nk, nv;
             for (size_t t = 0; t < block; ++t) {
                 std::copy(kv[t].k.begin(), kv[t].k.end(), nk.data() + t * kv_width);
                 std::copy(kv[t].v.begin(), kv[t].v.end(), nv.data() + t * kv_width);
