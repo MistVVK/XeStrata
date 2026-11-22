@@ -367,11 +367,13 @@ __global__ void __launch_bounds__(256) k_dspark_top_cand_s1(
     const float* __restrict__ base_logits,  // [7, V]
     int V,
     int32_t* __restrict__ tmp_ids,          // [7, 128 * 16 = 2048]
-    float* __restrict__ tmp_vals) {         // [7, 2048]
+    float* __restrict__ tmp_vals,           // [7, 2048]
+    int ld = 0) {
     const int s = blockIdx.y;   // 0..6
     const int ch = blockIdx.x;  // 0..127
     const int tid = threadIdx.x;
-    const float* lg = base_logits + (size_t)s * V;
+    const int stride = (ld > 0) ? ld : V;
+    const float* lg = base_logits + (size_t)s * stride;
 
     float b0 = -3e38f, b1 = -3e38f;
     int32_t i0 = 0, i1 = 0;
@@ -750,7 +752,7 @@ struct InkDSpark {
         d_kc_tmp      = dalloc<float>((size_t)r.max_batch * kInkKVDim);
         d_vc_tmp      = dalloc<float>((size_t)r.max_batch * kInkKVDim);
         d_kv_ctx_fused= dalloc<float>((size_t)r.max_batch * 2 * kInkKVDim);
-        d_base_logits = dalloc<float>(8ull * m.man.c.vocab_unpadded);
+        d_base_logits = dalloc<float>(8ull * ((m.man.c.vocab_unpadded + 7) & ~7));
         d_cand_ids    = dalloc<int32_t>(7ull * K_cand);
         d_cand_base   = dalloc<float>(7ull * K_cand);
         d_top_tmp_ids = dalloc<int32_t>(7ull * 2048);
@@ -777,7 +779,7 @@ struct InkDSpark {
         // Pre-pack the 3 tiny DSpark layers into fused BF16 (sm_80+) or FP16 (sm_70/75) QKV, GU, KV_CTX, O, DOWN!
         // Collapses 21+6 cuBLAS calls -> 12+3 Tensor Core calls (< 0.35 ms on 5090 & V100!)
         size_t vfree = 0, vtot = 0;
-        INK_CK(cudaMemGetInfo(&vfree, &vtot));
+        INK_CK(ink_cuda_mem_info(&vfree, &vtot));
         cache_is_fp16 = (m.sm_cc >= 70 && m.sm_cc < 80);
         auto load_to_tc = [&](const std::string& wn, uint16_t* dst_u16) {
             const auto& ti = m.tinfo(wn);
@@ -852,25 +854,29 @@ struct InkDSpark {
             }
             INK_CK(cudaStreamSynchronize(r.st));
         }
-        // On Volta sm_70 (V100 32GB, lacks hardware dp4a), pre-pack FP16 unembed [V, 2304] (~604 MB) when >2 GiB free
-        // so DSpark base-logit screening runs on 125 TFLOPS FP16 Tensor Cores in ~0.67 ms (instead of 4.6 ms)!
+        // On Volta sm_70 (V100 32GB, lacks hardware dp4a), pre-pack FP16 unembed [V_pad, 2304] (~604 MB) when >2 GiB free
+        // Pad V to multiple of 8 so Volta sm_70 cuBLAS engages 125 TFLOPS FP16 Tensor Cores (~0.67 ms vs 4.6 ms)!
         if (m.sm_cc == 70 && m.unembed_screen.ready) {
-            INK_CK(cudaMemGetInfo(&vfree, &vtot));
-            const size_t u_elems = (size_t)m.man.c.vocab_unpadded * kInkHidden;
+            INK_CK(ink_cuda_mem_info(&vfree, &vtot));
+            const int V_pad = (m.man.c.vocab_unpadded + 7) & ~7;
+            const size_t u_elems = (size_t)V_pad * kInkHidden;
             if (vfree > u_elems * 2 + (2048ull << 20)) {
                 d_unembed_fp16 = dalloc<__half>(u_elems);
                 const auto& ui = m.tinfo("model.llm.unembed.weight");
                 const uint8_t* W = m.d_trunk + ui.off;
-                const int V = m.man.c.vocab_unpadded;
+                const int V_rows = std::min(V_pad, (int)ui.rows());
                 if (ui.fmt == FMT_BF16) {
-                    k_ink_bf16_to_fp16<<<(u_elems + 255) / 256, 256, 0, r.st>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(W), d_unembed_fp16, u_elems);
+                    k_ink_bf16_to_fp16<<<((size_t)V_rows * kInkHidden + 255) / 256, 256, 0, r.st>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(W), d_unembed_fp16, (size_t)V_rows * kInkHidden);
                 } else {
-                    // Convert Q8 unembed_screen directly to FP16 (identical to dp4a7 screen, 6x faster via FP16 TC!)
-                    dim3 dg((kInkHidden + 255) / 256, V);
-                    k_ink_sk_to_bf16<FMT_S6_K><<<dg, 256, 0, r.st>>>(W, reinterpret_cast<__nv_bfloat16*>(d_unembed_fp16), V, kInkHidden);
-                    k_ink_bf16_to_fp16<<<(u_elems + 255) / 256, 256, 0, r.st>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(d_unembed_fp16), d_unembed_fp16, u_elems);
+                    dim3 dg((kInkHidden + 255) / 256, V_rows);
+                    __nv_bfloat16* dst_b = reinterpret_cast<__nv_bfloat16*>(d_unembed_fp16);
+                    if (ui.fmt == FMT_S5_K)      k_ink_sk_to_bf16<FMT_S5_K><<<dg, 256, 0, r.st>>>(W, dst_b, V_rows, kInkHidden);
+                    else if (ui.fmt == FMT_S6_K) k_ink_sk_to_bf16<FMT_S6_K><<<dg, 256, 0, r.st>>>(W, dst_b, V_rows, kInkHidden);
+                    else if (ui.fmt == FMT_S8_K) k_ink_sk_to_bf16<FMT_S8_K><<<dg, 256, 0, r.st>>>(W, dst_b, V_rows, kInkHidden);
+                    else                         k_ink_q8row_to_bf16<<<dg, 256, 0, r.st>>>(W, dst_b, V_rows, kInkHidden);
+                    k_ink_bf16_to_fp16<<<((size_t)V_rows * kInkHidden + 255) / 256, 256, 0, r.st>>>(
+                        dst_b, d_unembed_fp16, (size_t)V_rows * kInkHidden);
                 }
                 INK_CK(cudaStreamSynchronize(r.st));
             }
@@ -1012,17 +1018,20 @@ struct InkDSpark {
         k_ink_rms_norm<<<B, 256, 0, r.st>>>(d_cur, (const float*)m.trunk_ptr("dspark.norm.weight"), d_cur, nullptr, B, kInkHidden);
         const int V = m.man.c.vocab_unpadded;
         const float* base_logits_7 = d_base_logits;
+        int base_ld = V;
         if (d_unembed_fp16) {
-            // Volta sm_70 V100: N=8 (multiple of 8!) engages 125 TFLOPS FP16 Tensor Cores (~0.67 ms vs 4.6 ms!)
+            // Volta sm_70 V100: (V_pad, 8, 2304) ALL multiples of 8 -> 125 TFLOPS FP16 Tensor Cores (~0.67 ms vs 4.6 ms!)
+            const int V_pad = (V + 7) & ~7;
             const size_t nx = 8ull * kInkHidden;
             __half* x_fp16 = reinterpret_cast<__half*>(r.d_x_bf16);
             k_ink_f32_to_fp16<<<(nx + 255) / 256, 256, 0, r.st>>>(d_cur, x_fp16, nx);
             const float a = 1.0f, b = 0.0f;
             INK_CUBLAS_CK(cublasGemmEx(
-                r.cublas, CUBLAS_OP_T, CUBLAS_OP_N, V, 8, kInkHidden, &a,
+                r.cublas, CUBLAS_OP_T, CUBLAS_OP_N, V_pad, 8, kInkHidden, &a,
                 d_unembed_fp16, CUDA_R_16F, kInkHidden, x_fp16, CUDA_R_16F, kInkHidden, &b,
-                d_base_logits, CUDA_R_32F, V, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            base_logits_7 = d_base_logits + V;
+                d_base_logits, CUDA_R_32F, V_pad, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            base_logits_7 = d_base_logits + V_pad;
+            base_ld = V_pad;
         } else if (m.unembed_screen.ready) {
             k_dspark_quant_h_q8<<<7, 256, 0, r.st>>>(d_cur + kInkHidden, d_h_q8, d_h_sc);
             if (m.sm_cc == 70 || m.sm_cc == 60) {
@@ -1036,7 +1045,9 @@ struct InkDSpark {
         } else {
             r.linear("model.llm.unembed.weight", d_cur + kInkHidden, d_base_logits, 7, V);
         }
-        k_dspark_top_cand_s1<<<dim3(128, 7), 256, 0, r.st>>>(base_logits_7, V, d_top_tmp_ids, d_top_tmp_vals);
+        // Note: if base_ld > V (V_pad), pass V_pad? No, k_dspark_top_cand_s1 indexes slot*V + i!
+        // Instead use ld=V when V_pad==V, or pass stride! Let's check k_dspark_top_cand_s1: ld=V if V_pad==V else V_pad.
+        k_dspark_top_cand_s1<<<dim3(128, 7), 256, 0, r.st>>>(base_logits_7, V, d_top_tmp_ids, d_top_tmp_vals, base_ld);
         k_dspark_top_cand_s2<<<7, 256, 0, r.st>>>(d_top_tmp_ids, d_top_tmp_vals, K_cand, d_cand_ids, d_cand_base);
 
         // 4. Multi-CTA 7-step on-GPU Markov RNN loop (~0.06 ms total for all 7 steps!)

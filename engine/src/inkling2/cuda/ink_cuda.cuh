@@ -74,6 +74,37 @@ inline int current_sm_arch(int dev = 0) {
     return cached_sm;
 }
 
+// Unified-Memory-safe VRAM query: on Linux integrated GPUs (e.g. DGX Spark GB10 sm_121 128 GB UMA),
+// cudaMemGetInfo subtracts reclaimable OS page cache (like the 19 GB .strata file just read!),
+// so take max(cuda_free, /proc/meminfo MemAvailable) to prevent false hybrid spill!
+inline cudaError_t ink_cuda_mem_info(size_t* vfree, size_t* vtot, int dev = -1) {
+    cudaError_t ce = cudaMemGetInfo(vfree, vtot);
+    if (ce != cudaSuccess) return ce;
+#if defined(__linux__)
+    int cur = dev;
+    if (cur < 0) cudaGetDevice(&cur);
+    cudaDeviceProp p{};
+    if (cudaGetDeviceProperties(&p, cur) == cudaSuccess && (p.integrated != 0 || (p.major == 12 && p.minor == 1))) {
+        FILE* f = std::fopen("/proc/meminfo", "r");
+        if (f) {
+            char line[256];
+            while (std::fgets(line, sizeof(line), f)) {
+                unsigned long long kb = 0;
+                if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                    size_t avail = (size_t)kb * 1024ull;
+                    if (avail > *vfree) *vfree = std::min(avail, *vtot);
+                    break;
+                }
+            }
+            std::fclose(f);
+        }
+    }
+#else
+    (void)dev;
+#endif
+    return cudaSuccess;
+}
+
 // ---- Exact Inkling-2-Mini model constants ----
 constexpr int kInkPhysLayers  = 24;
 constexpr int kInkVisits      = 48;

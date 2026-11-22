@@ -118,7 +118,7 @@ public:
         // Compute exact minimum KV + ShortConv + workspace headroom for parallel slots before pinning experts!
         max_slots_ = std::max(1, std::min(kMaxParallelSlots, opts.parallel));
         kv_dtype_ = opts.kv_dtype;
-        if (opts.kv_dtype_auto && max_slots_ >= 16 && prop.totalGlobalMem < (40ull << 30)) {
+        if (opts.kv_dtype_auto && (max_slots_ >= 16 || prop.totalGlobalMem <= (13ull << 30)) && prop.totalGlobalMem < (40ull << 30)) {
             kv_dtype_ = KvDtype::FP8_E4M3;
         }
         const int eff_chunk = std::max(64, opts.chunk);
@@ -128,7 +128,9 @@ public:
         const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * strata::ink::kInkKVDim * bpe
                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
                                   + (size_t)8 * max_slots_ * 256 * strata::ink::kInkKVDim * bpe;
-        const size_t min_reserve_bytes = min_kv_bytes + ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20) : (320ull << 20));
+        const size_t min_reserve_bytes = min_kv_bytes + ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20)
+                                                       : (prop.totalGlobalMem <= (13ull << 30)) ? (260ull << 20)
+                                                                                                : (320ull << 20));
 
         // Load .strata v1.1 trunk + experts (100% VRAM or 3x loop-weighted vram_load_order!)
         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;

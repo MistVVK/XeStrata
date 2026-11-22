@@ -14,6 +14,9 @@ if [ -f /workspace/cuda13/env.sh ]; then
 elif [ -d "$HOME/cuda/bin" ]; then
     export PATH="$HOME/cuda/bin:$PATH"
     export LD_LIBRARY_PATH="$HOME/cuda/lib64:${LD_LIBRARY_PATH:-}"
+elif [ -d "/usr/local/cuda/bin" ]; then
+    export PATH="/usr/local/cuda/bin:$PATH"
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 fi
 
 NVCC="${NVCC:-nvcc}"
@@ -40,7 +43,11 @@ else
 fi
 
 INC="-I$SCRIPT_DIR -I$REPO_ROOT/engine/include -I$REPO_ROOT/engine/src/hy4flash/run -I$REPO_ROOT/engine/third_party/zstd-dec -I$REPO_ROOT/engine/third_party/zstd-dec/common -I$REPO_ROOT/engine/third_party/zstd-dec/decompress"
-COMMON_FLAGS="-O3 -std=c++20 --expt-relaxed-constexpr -Xcompiler -fPIC"
+HOST_SIMD=""
+if [ "$(uname -m)" = "x86_64" ]; then
+    HOST_SIMD="-Xcompiler -mavx2,-mfma"
+fi
+COMMON_FLAGS="-O3 -std=c++20 --expt-relaxed-constexpr -Xcompiler -fPIC $HOST_SIMD"
 
 echo "== Compiling vendored zstd-dec =="
 ZSTD_OBJS=""

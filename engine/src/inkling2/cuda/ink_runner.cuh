@@ -150,7 +150,7 @@ struct InkCudaModel {
 
         // 2. Check free VRAM -> load Section 4 experts (100% VRAM when fits, else 3x loop-weighted vram_load_order!)
         size_t vfree = 0, vtot = 0;
-        INK_CK(cudaMemGetInfo(&vfree, &vtot));
+        INK_CK(ink_cuda_mem_info(&vfree, &vtot));
         const auto& dir = rd.expert_directory();
         const int n_total = (int)dir.size();  // 24 * 128 = 3072
         std::vector<InkExpertDev> h_exp(n_total);
@@ -172,9 +172,11 @@ struct InkCudaModel {
         }
 
         double t1 = now_s();
-        // Tight on-demand VRAM reserve: lets SQ-10 fit 100% in 12 GB RTX 5070 and SQ-15 fit 100% in 16 GB RTX 5070 Ti,
-        // while keeping full headroom (~1.25 GiB) for KV + workspaces + DSpark + CUDA Graph (spilling cleanly to Hybrid on 11 GB GPUs)!
-        const size_t base_reserve = (vtot >= (20ull << 30)) ? (1600ull << 20) : (1280ull << 20);
+        // Tight on-demand VRAM reserve: lets SQ-10 fit 100% in 12 GB RTX 5070 (even under Win11 WDDM!) and SQ-15 in 16 GB RTX 5070 Ti,
+        // while keeping full headroom for FP8 KV + workspaces + DSpark + CUDA Graph (spilling cleanly to Hybrid on 11 GB GPUs)!
+        const size_t base_reserve = (vtot >= (20ull << 30)) ? (1600ull << 20)
+                                  : (vtot <= (13ull << 30)) ? (780ull << 20)
+                                                            : (1280ull << 20);
         const size_t reserve = std::max(base_reserve, extra_reserve_bytes);
         for (int il = 0; il < 24; ++il) layer_has_host[il] = false;
         if (vfree > sec4_bytes + reserve) {
@@ -263,7 +265,7 @@ struct InkCudaModel {
             if (n_host_experts > 0) {
                 hybrid.start_workers();
                 size_t vf_now = 0, vt_now = 0;
-                INK_CK(cudaMemGetInfo(&vf_now, &vt_now));
+                INK_CK(ink_cuda_mem_info(&vf_now, &vt_now));
                 const size_t avail = (vf_now > hyb_post_res) ? (vf_now - hyb_post_res) : 0;
                 hybrid.alloc_staging(max_exp_bytes, avail);
             }
@@ -320,7 +322,7 @@ struct InkCudaModel {
         // 4. Build exact 2-stage Cauchy-Schwarz screening index for BF16 or S6_K unembed (SQ-20, SQ-15, SQ-10)!
         const auto& ui = man.get("model.llm.unembed.weight");
         if (build_screen && (ui.fmt == FMT_BF16 || ui.fmt == FMT_S6_K)) {
-            INK_CK(cudaMemGetInfo(&vfree, &vtot));
+            INK_CK(ink_cuda_mem_info(&vfree, &vtot));
             if (vfree > (2048ull << 20)) {
                 unembed_screen.V = man.c.vocab_unpadded;
                 unembed_screen.q8  = dalloc<int8_t>((size_t)unembed_screen.V * kInkHidden);
@@ -499,7 +501,12 @@ struct InkCudaRunner {
         // Auto-fit max_ctx to free VRAM so c = 32 / 64 never OOMs on 32 GiB RTX 5090!
         {
             size_t vfree = 0, vtot = 0;
-            INK_CK(cudaMemGetInfo(&vfree, &vtot));
+            INK_CK(ink_cuda_mem_info(&vfree, &vtot));
+            // On tight 12 GB GPUs (especially Win11 WDDM), cap max_batch to 512 so workspaces never trigger host paging!
+            if (vfree < (2200ull << 20) && max_batch > 512) {
+                max_batch = 512;
+                swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
+            }
             const size_t bpe = (kv_dtype == InkKvDtype::FP8) ? 2 : 4;  // K+V bytes per element
             const size_t swa_kv_bytes = (size_t)40 * max_slots * swa_ring * kInkKVDim * bpe;
             const size_t sconv_bytes  = (size_t)kInkVisits * max_slots * 3 * kInkSconvCh * 4;

@@ -2188,6 +2188,227 @@ __global__ void __launch_bounds__(256) k_ink_moe_wmma_f16(
     (void)sec4_base; (void)experts; (void)tb; (void)act_f32; (void)topk_w; (void)out_buf;
 #endif
 }
+// High-Occupancy Zero-Spill BK=64, BN=64, TR=64 WMMA FP16 Tensor Core Prefill Kernel for Volta sm_70 & Turing sm_75!
+// Split IS_SK (SF4/MX8 vs S_K) + scalar fc0/fc1 (0 stack frame, <=64 regs!) + 20.5 KB smem -> 4 CTAs/SM (1024 thr/SM)!
+template <bool GU, int FMT>
+__device__ __forceinline__ void wmma_unpack_sk_64x64_f16(
+    const uint8_t* __restrict__ body, uint64_t dn_off, int fb, int k64, int tid, __half (&s_w)[64][72]) {
+    constexpr int SB = ink_sb_bytes(FMT);
+    constexpr float HALF = ink_sk_half(FMT);
+    constexpr size_t row_b = 9ull * (size_t)SB;
+    const uint8_t* gu_base = body + kInkInter * 2;
+    const int r_loc = tid >> 2;  // 0..63
+    const int lg4   = tid & 3;   // 0..3 -> 2x8 = 16 weights/thread = 64 weights/row!
+    const int phys_row = fb * 64 + r_loc;
+    const uint8_t* blk;
+    int sg;
+    if constexpr (GU) {
+        blk = gu_base + (size_t)phys_row * row_b + (size_t)(k64 >> 2) * SB;
+        sg  = k64 & 3;
+    } else {
+        const int pair_r = phys_row >> 1;
+        const int sub_glob = k64 + (phys_row & 1) * 18;
+        blk = body + dn_off + (size_t)pair_r * row_b + (size_t)(sub_glob >> 2) * SB;
+        sg  = sub_glob & 3;
+    }
+    const float eff = f16_to_f32(ld16_u(blk)) * ((float)blk[2 + sg] * (1.0f / 255.0f));
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        uint32_t w0, w1;
+        sk_unpack8_lane8<FMT>(blk + 6, sg, p * 4 + lg4, w0, w1);
+        __half2* dst2 = reinterpret_cast<__half2*>(&s_w[r_loc][(p * 4 + lg4) * 8]);
+        dst2[0] = __floats2half2_rn(((float)(int8_t)(w0)       - HALF) * eff, ((float)(int8_t)(w0 >> 8)  - HALF) * eff);
+        dst2[1] = __floats2half2_rn(((float)(int8_t)(w0 >> 16) - HALF) * eff, ((float)(int8_t)(w0 >> 24) - HALF) * eff);
+        dst2[2] = __floats2half2_rn(((float)(int8_t)(w1)       - HALF) * eff, ((float)(int8_t)(w1 >> 8)  - HALF) * eff);
+        dst2[3] = __floats2half2_rn(((float)(int8_t)(w1 >> 16) - HALF) * eff, ((float)(int8_t)(w1 >> 24) - HALF) * eff);
+    }
+}
+
+template <bool GU, bool IS_SK>
+__global__ void __launch_bounds__(256, 4) k_ink_moe_wmma_f16_bk64(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    InkMoeTables tb,
+    const float* __restrict__ act_f32,
+    const float* __restrict__ topk_w,
+    float* __restrict__ out_buf) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+    constexpr int TR     = 64;
+    constexpr int BN     = 64;
+    constexpr int BK     = 64;
+    constexpr int K      = GU ? kInkHidden : kInkInter;         // 2304 or 1152
+    constexpr int ROWS_N = GU ? (2 * kInkInter) : kInkHidden;   // 2304
+    constexpr int NFB    = ROWS_N / BN;                         // 36 blocks of 64 rows
+    constexpr int N64    = K / BK;                              // 36 (GU) or 18 (DN)
+
+    __shared__ alignas(16) __half s_a[TR][72];                  // 9,216 B
+    __shared__ alignas(16) union {
+        __half w[BN][72];                                       // 9,216 B
+        float  o[16][BN];                                       // 4,096 B
+    } s_u;                                                      // Total smem = 20.5 KB -> 4 CTAs/SM!
+    __shared__ float   s_e4[256];
+    __shared__ __half2 s_e2m1[256];
+    __shared__ int32_t s_row[TR];
+    __shared__ float   s_rw[TR];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int wm   = warp >> 1;  // 0..3 (each warp owns 16 rows)
+    const int wn   = warp & 1;   // 0..1 (each warp owns 32 cols = 2x16!)
+
+    if constexpr (!IS_SK) {
+        s_e4[tid] = e4m3_to_f32_compute((uint8_t)tid);
+        const float2 e2 = e2m1x2_byte_to_f32x2((uint8_t)tid);
+        s_e2m1[tid] = __floats2half2_rn(e2.x, e2.y);
+        __syncthreads();
+    }
+
+    const int nt = *tb.n_tiles;
+    const int total_jobs = nt * NFB;
+    for (int job = blockIdx.x; job < total_jobs; job += gridDim.x) {
+        const int t_idx = job / NFB;
+        const int fb    = job - t_idx * NFB;
+        const int2 tl   = tb.tiles[t_idx];
+        const int e     = tl.x;
+        const int row0  = tl.y;
+        const int nrows = min(TR, tb.off[e + 1] - row0);
+        if (nrows <= 0) continue;
+
+        const InkExpertDev ex = experts[e];
+        const int fmt = GU ? (int)ex.gu_code : (int)ex.dn_code;
+        if (ex.tier > 1) continue;
+        if constexpr (!IS_SK) { if (fmt != FMT_SF4 && fmt != FMT_MX8) continue; }
+        else                  { if (fmt == FMT_SF4 || fmt == FMT_MX8) continue; }
+
+        if (tid < nrows) {
+            s_row[tid] = GU ? tb.tok_idx[row0 + tid] : (row0 + tid);
+            if constexpr (!GU) s_rw[tid] = topk_w[tb.pairs[row0 + tid]];
+        }
+        __syncthreads();
+
+        const uint8_t* body = sec4_base + ex.body_off;
+        float w_outer = 1.0f;
+        const uint8_t* bp = nullptr;
+        const uint8_t* bs = nullptr;
+        if constexpr (!IS_SK) {
+            if (fmt == FMT_SF4) {
+                const float* hdr = reinterpret_cast<const float*>(body);
+                w_outer = GU ? (hdr[0] / hdr[1]) : (hdr[2] / hdr[3]);
+                bp = GU ? (body + 16) : (body + ex.dn_off);
+                bs = bp + (size_t)ROWS_N * (K / 2);
+            } else {
+                bp = GU ? body : (body + ex.dn_off);
+                bs = bp + (size_t)ROWS_N * K;
+            }
+        }
+
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> fc0, fc1;
+        nvcuda::wmma::fill_fragment(fc0, 0.0f);
+        nvcuda::wmma::fill_fragment(fc1, 0.0f);
+
+        for (int k64 = 0; k64 < N64; ++k64) {
+            // 1. Load activation tile s_a[64][64] (4 float4s/thread, 100% coalesced!)
+#pragma unroll
+            for (int it = 0; it < 4; ++it) {
+                const int idx = it * 256 + tid;
+                const int r = idx >> 4;
+                const int q = idx & 15;
+                __half2* dst2 = reinterpret_cast<__half2*>(&s_a[r][q * 4]);
+                if (r < nrows) {
+                    const float4 xv = *reinterpret_cast<const float4*>(act_f32 + (size_t)s_row[r] * K + k64 * 64 + q * 4);
+                    dst2[0] = __floats2half2_rn(fminf(fmaxf(xv.x, -65504.0f), 65504.0f), fminf(fmaxf(xv.y, -65504.0f), 65504.0f));
+                    dst2[1] = __floats2half2_rn(fminf(fmaxf(xv.z, -65504.0f), 65504.0f), fminf(fmaxf(xv.w, -65504.0f), 65504.0f));
+                } else {
+                    const __half2 z = __float2half2_rn(0.0f);
+                    dst2[0] = z; dst2[1] = z;
+                }
+            }
+            // 2. Coalesced 4-threads/row unpack of 64 x 64 weights into s_u.w[64][72]!
+            if constexpr (!IS_SK) {
+                const int r_loc = tid >> 2;
+                const int b     = tid & 3;
+                const int phys_row = fb * 64 + r_loc;
+                if (fmt == FMT_SF4) {
+                    const int blk = k64 * 4 + b;
+                    const __half2 hsc = __float2half2_rn(s_e4[bs[(size_t)phys_row * (K / 16) + blk]] * w_outer);
+                    const uint2 p8 = *reinterpret_cast<const uint2*>(bp + (size_t)phys_row * (K / 2) + blk * 8);
+                    __half2* dst2 = reinterpret_cast<__half2*>(&s_u.w[r_loc][b * 16]);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        dst2[i]     = __hmul2(s_e2m1[(p8.x >> (8 * i)) & 0xFFu], hsc);
+                        dst2[4 + i] = __hmul2(s_e2m1[(p8.y >> (8 * i)) & 0xFFu], hsc);
+                    }
+                } else {
+                    const float sc = ue8m0_to_f32(bs[(size_t)phys_row * (K / 32) + k64 * 2 + (b >> 1)]);
+                    const uint4 w16 = *reinterpret_cast<const uint4*>(bp + (size_t)phys_row * K + k64 * 64 + b * 16);
+                    const uint32_t wu[4] = {w16.x, w16.y, w16.z, w16.w};
+                    __half2* dst2 = reinterpret_cast<__half2*>(&s_u.w[r_loc][b * 16]);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const uint32_t u = wu[i];
+                        dst2[2 * i + 0] = __floats2half2_rn(s_e4[u & 0xFFu] * sc, s_e4[(u >> 8) & 0xFFu] * sc);
+                        dst2[2 * i + 1] = __floats2half2_rn(s_e4[(u >> 16) & 0xFFu] * sc, s_e4[(u >> 24) & 0xFFu] * sc);
+                    }
+                }
+            } else {
+                if (fmt == FMT_S3_K)      wmma_unpack_sk_64x64_f16<GU, FMT_S3_K>(body, ex.dn_off, fb, k64, tid, s_u.w);
+                else if (fmt == FMT_S2_K) wmma_unpack_sk_64x64_f16<GU, FMT_S2_K>(body, ex.dn_off, fb, k64, tid, s_u.w);
+                else if (fmt == FMT_S4_K) wmma_unpack_sk_64x64_f16<GU, FMT_S4_K>(body, ex.dn_off, fb, k64, tid, s_u.w);
+                else if (fmt == FMT_S5_K) wmma_unpack_sk_64x64_f16<GU, FMT_S5_K>(body, ex.dn_off, fb, k64, tid, s_u.w);
+                else if (fmt == FMT_S6_K) wmma_unpack_sk_64x64_f16<GU, FMT_S6_K>(body, ex.dn_off, fb, k64, tid, s_u.w);
+                else if (fmt == FMT_S8_K) wmma_unpack_sk_64x64_f16<GU, FMT_S8_K>(body, ex.dn_off, fb, k64, tid, s_u.w);
+                else if (fmt == FMT_S1_5) wmma_unpack_sk_64x64_f16<GU, FMT_S1_5>(body, ex.dn_off, fb, k64, tid, s_u.w);
+            }
+            __syncthreads();
+
+            // 3. 4x K-steps of 1x2 WMMA 16x16x16 Tensor Core MMA (scalar fa & fb -> <= 64 regs, ZERO spills!)
+#pragma unroll
+            for (int kk = 0; kk < 64; kk += 16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> fa;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> fb_m;
+                nvcuda::wmma::load_matrix_sync(fa,   &s_a[wm * 16][kk], 72);
+                nvcuda::wmma::load_matrix_sync(fb_m, &s_u.w[wn * 32 +  0][kk], 72);
+                nvcuda::wmma::mma_sync(fc0, fa, fb_m, fc0);
+                nvcuda::wmma::load_matrix_sync(fb_m, &s_u.w[wn * 32 + 16][kk], 72);
+                nvcuda::wmma::mma_sync(fc1, fa, fb_m, fc1);
+            }
+            __syncthreads();
+        }
+
+        // 4. Staged 16x64 epilogue reusing s_u.o[16][64] (0 stack frame, 4 CTAs/SM!)
+        for (int mb = 0; mb < 4; ++mb) {
+            const int r_base = mb * 16;
+            if (r_base >= nrows) break;
+            if (wm == mb) {
+                nvcuda::wmma::store_matrix_sync(&s_u.o[0][wn * 32 +  0], fc0, BN, nvcuda::wmma::mem_row_major);
+                nvcuda::wmma::store_matrix_sync(&s_u.o[0][wn * 32 + 16], fc1, BN, nvcuda::wmma::mem_row_major);
+            }
+            __syncthreads();
+            const int nr = min(16, nrows - r_base);
+            if constexpr (GU) {
+                const int fbase = fb * 32;
+                for (int idx = tid; idx < nr * 32; idx += 256) {
+                    const int r = idx >> 5;
+                    const int f = idx & 31;
+                    float v = situ_f32(s_u.o[r][2 * f], s_u.o[r][2 * f + 1]);
+                    if constexpr (IS_SK) v *= (1.0f / f16_to_f32(ld16_u(body + (fbase + f) * 2)));
+                    out_buf[(size_t)(row0 + r_base + r) * kInkInter + fbase + f] = v;
+                }
+            } else {
+                const int rbase = fb * 64;
+                for (int idx = tid; idx < nr * 64; idx += 256) {
+                    const int r = idx >> 6;
+                    const int c = idx & 63;
+                    out_buf[(size_t)tb.pairs[row0 + r_base + r] * kInkHidden + rbase + c] = s_u.o[r][c] * s_rw[r_base + r];
+                }
+            }
+            __syncthreads();
+        }
+    }
+#else
+    (void)sec4_base; (void)experts; (void)tb; (void)act_f32; (void)topk_w; (void)out_buf;
+#endif
+}
 #endif  // __CUDACC__
 
 // ============================================================================
@@ -2220,16 +2441,31 @@ inline void launch_ink_moe_dispatch_only(
     const int P = M * kInkTopK;
     const int max_act = std::min(P, kInkExperts);
 
-    // 2A. Volta sm_70 (V100) & Turing sm_75 (2080 Ti) High-Occupancy 2x2-Tiled WMMA FP16 Tensor Core path!
+    // 2A. Volta sm_70 (V100) & Turing sm_75 (2080 Ti) Zero-Spill 4-CTA/SM WMMA FP16 Tensor Core path!
     if (use_wmma_tc) {
         const int mt = ink_moe_max_tiles(M, tile_rows);
-        const unsigned grid = (unsigned)std::min(std::max(1, mt * 18), 2048);
         if (tile_rows <= 16) {
+            const unsigned grid = (unsigned)std::min(std::max(1, mt * 18), 2048);
             k_ink_moe_wmma_f16<true, 16><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, x_f32, nullptr, ws.h_f32);
             k_ink_moe_wmma_f16<false, 16><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
         } else {
-            k_ink_moe_wmma_f16<true, 64><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, x_f32, nullptr, ws.h_f32);
-            k_ink_moe_wmma_f16<false, 64><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
+            static bool s_carveout_set = false;
+            if (!s_carveout_set) {
+                cudaFuncSetAttribute(k_ink_moe_wmma_f16_bk64<true,  false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+                cudaFuncSetAttribute(k_ink_moe_wmma_f16_bk64<false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+                cudaFuncSetAttribute(k_ink_moe_wmma_f16_bk64<true,  true>,  cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+                cudaFuncSetAttribute(k_ink_moe_wmma_f16_bk64<false, true>,  cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+                s_carveout_set = true;
+            }
+            const unsigned grid = (unsigned)std::min(std::max(1, mt * 36), 4096);
+            if (info.has_sf4 || info.has_mx8) {
+                k_ink_moe_wmma_f16_bk64<true,  false><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, x_f32, nullptr, ws.h_f32);
+                k_ink_moe_wmma_f16_bk64<false, false><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
+            }
+            if (info.has_sk) {
+                k_ink_moe_wmma_f16_bk64<true,  true><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, x_f32, nullptr, ws.h_f32);
+                k_ink_moe_wmma_f16_bk64<false, true><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
+            }
         }
         return;
     }

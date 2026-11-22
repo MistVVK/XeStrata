@@ -78,6 +78,11 @@ target_compile_options(strata_inkling_cuda PRIVATE
 if(WIN32)
   target_compile_definitions(strata_inkling_cuda PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_definitions(strata_inkling_cuda_sm120 PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/arch:AVX2>)
+  endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+  target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx2,-mfma>)
 endif()
 
 target_link_libraries(strata_inkling_cuda PUBLIC
