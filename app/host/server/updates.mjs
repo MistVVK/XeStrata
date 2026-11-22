@@ -129,7 +129,15 @@ export function formatInstallPathWarning(verdict) {
  * read), installed (an engine is already here), wrong-make (an engine for another make of card is installed).
  */
 export async function engineFirstRun({ control, gpus = [] }) {
-  const cards = gpus.map(g => ({ name: g.name ?? 'Graphics card', vramGb: g.vramGb ?? null }));
+  const cards = gpus.map(g => ({
+    name: g.name ?? 'Graphics card',
+    vramGb: g.vramGb ?? null,
+    ...(g.arch != null ? { arch: g.arch } : {}),
+    ...(g.uma != null ? { uma: g.uma } : {}),
+    ...(g.integrated != null ? { integrated: g.integrated } : {}),
+    ...(g.unified_gb != null ? { unified_gb: g.unified_gb } : {}),
+    ...(g.usable != null ? { usable: g.usable } : {}),
+  }));
   let report;
   try {
     report = await control.updateCheck({});

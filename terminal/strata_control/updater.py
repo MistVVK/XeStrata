@@ -848,49 +848,68 @@ def stage_engine(ctx: Context, feed: feedmod.Feed, pkg: feedmod.EnginePackage, a
         raise
 
 
-def _is_shape_engine_config(source) -> bool:
-    """True when a saved run config targets a shape engine (Hy4-Flash, Inkling-2-Mini, or another `component:strata-<shape>`):
-    updating the general `strata-engine` must never pass Hy4 (`--engram`) or Inkling (`--dspark`) flags to `strata` (#6589)."""
+_SHAPE_ONLY_FLAGS = frozenset({"--engram", "--dspark", "--dfly-override", "--vram-experts-gb", "--ram-experts-gb", "--ssd-experts"})
+
+
+def _config_component_id(source) -> str:
+    """Which engine component (`strata-engine`, `strata-hy4`, `strata-inkling`, ...) a saved run config targets (#6589, #6623)."""
     cfg = source
     if not isinstance(cfg, dict):
         try:
             cfg = json.loads(Path(source).read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, TypeError):
-            return False
+            return ec.COMPONENT_ID
     if not isinstance(cfg, dict):
-        return False
-    arch = str(cfg.get("arch") or "").strip().lower()
-    if arch in ("hy4flash", "inkling2_loop"):
-        return True
+        return ec.COMPONENT_ID
     exe = str(cfg.get("exe") or "").strip()
     if ec.is_reference(exe):
-        comp = exe[len(ec.REFERENCE_PREFIX):]
-        if comp not in ("", ec.COMPONENT_ID):
-            return True
+        comp = exe[len(ec.REFERENCE_PREFIX):].strip()
+        if comp:
+            return comp
     exe_base = exe.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if exe_base.startswith(("strata-hy4", "strata-inkling")):
-        return True
+    if exe_base.startswith("strata-hy4"):
+        return "strata-hy4"
+    if exe_base.startswith("strata-inkling"):
+        return "strata-inkling"
+    arch = str(cfg.get("arch") or "").strip().lower()
+    if arch in ("hy4flash", "hy4"):
+        return "strata-hy4"
+    if arch in ("inkling2", "inkling2_loop"):
+        return "strata-inkling"
     args = cfg.get("args")
     if isinstance(args, list):
-        arg_set = {str(a) for a in args}
-        if "--engram" in arg_set or "--dspark" in arg_set:
-            return True
-    return False
+        arg_list = [str(a) for a in args]
+        arg_set = set(arg_list)
+        if "--dspark" in arg_set:
+            return "strata-inkling"
+        if arg_set & _SHAPE_ONLY_FLAGS:
+            return "strata-hy4"
+        for i, a in enumerate(arg_list):
+            if a == "--native" and i + 1 < len(arg_list) and arg_list[i + 1].lower().endswith(".strata"):
+                return "strata-inkling" if "inkling" in arg_list[i + 1].lower() else "strata-hy4"
+    return ec.COMPONENT_ID
 
 
-def discover_run_config(environ=None) -> Path | None:
+def _is_shape_engine_config(source) -> bool:
+    """True when a saved run config targets a shape engine (Hy4-Flash, Inkling-2-Mini, or another `component:strata-<shape>`):
+    updating the general `strata-engine` must never pass Hy4 (`--engram`) or Inkling (`--dspark`) flags to `strata` (#6589, #6623)."""
+    return _config_component_id(source) != ec.COMPONENT_ID
+
+
+def discover_run_config(environ=None, *, component_id: str = ec.COMPONENT_ID) -> Path | None:
     """A saved model's run config for the test start: the one a saved profile uses if its files are all present, otherwise any
-    installed model whose files are present. DeepSeek models and shape-engine models (Hy4-Flash, Inkling-2-Mini) are left out
-    so updating `strata-engine` never passes `--engram` or `--dspark` to `strata` (#6589).
-    None when no general-engine model can be used (the first run)."""
+    installed model whose files are present and match `component_id`. DeepSeek models and configs belonging to another engine
+    component (e.g. Hy4-Flash `--engram` or Inkling `--dspark` when testing `strata-engine`) are left out (#6589, #6623).
+    None when no matching model can be used (falls back to binary smoke)."""
     from strata_control import models, profiles, retired
     try:
         listed = models.list_installed()
     except Exception:                                   # noqa: BLE001 - discovery is best effort
         return None
+    want = component_id or ec.COMPONENT_ID
     ready = [m for m in listed.get("models", []) if m.get("component_status") == "present" and m.get("source_config")
              and not retired.config_file_reason(m["source_config"])
-             and not _is_shape_engine_config(m["source_config"])]
+             and _config_component_id(m["source_config"]) == want]
     if not ready:
         return None
     try:
@@ -1321,13 +1340,14 @@ def low_memory(cfg: dict) -> tuple[float, float] | None:
 
 
 def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Context) -> dict:
-    """Start the staged engine through the real start path (owner runtime, `component:strata-engine`, a saved model), wait for
+    """Start the staged engine through the real start path (owner runtime, `component:<id>`, a saved model), wait for
     the one-token generation probe, and stop it. Everything runs in an isolated runtime, profile and component folder, so a
-    user's own instances, profiles and engines are not involved. With no model installed the engine is only run with --version."""
-    source = Path(ctx.run_config) if ctx.run_config else discover_run_config(ctx.environ)
-    if source is not None and component.id == ec.COMPONENT_ID and _is_shape_engine_config(source):
-        # #6589: never test the general `strata` engine against a Hy4-Flash (`--engram`) or Inkling (`--dspark`) config
-        source = discover_run_config(ctx.environ)
+    user's own instances, profiles and engines are not involved. With no matching model installed the engine is only run with --version."""
+    target_comp = component.id or ec.COMPONENT_ID
+    source = Path(ctx.run_config) if ctx.run_config else discover_run_config(ctx.environ, component_id=target_comp)
+    if source is not None and _config_component_id(source) != target_comp:
+        # #6589 / #6623: never test an engine against another engine component's run config (e.g. Hy4 `--engram` on `strata`)
+        source = discover_run_config(ctx.environ, component_id=target_comp)
     if source is None:
         if not ctx.allow_no_model_smoke:
             raise TestStartFailed(component.version, "no installed model to test with")
@@ -1344,7 +1364,11 @@ def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Con
         # found no current Control and the test start failed with a ProfileError about the old file
         from strata_control import cfg_paths
         cfg, _moved, _lost = cfg_paths.resolve_config(cfg)
-        cfg["exe"] = ec.REFERENCE_PREFIX + ec.COMPONENT_ID
+        if _config_component_id(cfg) != target_comp:
+            if not ctx.allow_no_model_smoke:
+                raise TestStartFailed(component.version, "no installed model matching this engine component")
+            return binary_smoke(component, ctx=ctx)
+        cfg["exe"] = ec.REFERENCE_PREFIX + target_comp
         cfg["backend"] = component.backend
         cfg.pop("lib_dirs", None)
         if isinstance(cfg.get("args"), list):

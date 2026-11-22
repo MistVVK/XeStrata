@@ -29,7 +29,96 @@ PATH_FLAGS = {
 MONITOR_TEXTUAL_VERSION = "8.2.8"
 
 
-def _location(raw: str, cfg: dict, config_path: Path) -> Path:
+_COMPONENT_PATH_RE = (
+    re.compile(r"^(?P<root>.+?[/\\]components[/\\]shapes[/\\](?P<shape>[^/\\]+)[/\\]engine)[/\\](?P<ver>[^/\\]+)(?:[/\\](?P<rest>.*))?$", re.I),
+    re.compile(r"^(?P<root>.+?[/\\]components[/\\]engine)[/\\](?P<ver>[^/\\]+)(?:[/\\](?P<rest>.*))?$", re.I),
+    re.compile(r"^(?P<root>.+?[/\\]components[/\\]control)[/\\](?P<ver>[^/\\]+)(?:[/\\](?P<rest>.*))?$", re.I),
+)
+
+
+def _active_component_folder(root: Path) -> Path | None:
+    try:
+        data = json.loads((root / "active.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        for key in ("version", "active", "current", "primary"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                cand = root / val.strip()
+                if cand.is_dir():
+                    return cand
+    return None
+
+
+def _newest_component_folders(root: Path, *, prefer_backend: str | None = None) -> list[Path]:
+    if not root.is_dir():
+        return []
+    try:
+        from strata_control import engine_component
+        ver_key = engine_component._version_key
+    except Exception:                                    # noqa: BLE001
+        ver_key = lambda s: (s,)                         # noqa: E731
+    dirs = [p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    backend = (prefer_backend or "").strip().lower()
+    dirs.sort(key=lambda p: (bool(backend and backend in p.name.lower()), ver_key(p.name)), reverse=True)
+    return dirs
+
+
+def _rebase_component_path(raw: str, cfg: dict, active_engine_dir: Path | None = None) -> Path | None:
+    """Resolve a path pointing into a pruned `components/engine/<ver>`, `components/shapes/<shape>/engine/<ver>`,
+    or `components/control/<ver>` folder against the currently installed active component (#4891)."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    for idx, pattern in enumerate(_COMPONENT_PATH_RE):
+        match = pattern.match(raw)
+        if not match:
+            continue
+        root = Path(match.group("root"))
+        rest = (match.group("rest") or "").lstrip("/\\")
+        candidates: list[Path] = []
+        if idx in (0, 1):                                # engine or shape engine
+            if active_engine_dir is not None and active_engine_dir.is_dir():
+                candidates.append(active_engine_dir)
+            exe_raw = cfg.get("exe")
+            if isinstance(exe_raw, str) and exe_raw:
+                try:
+                    from strata_control import engine_component
+                    if engine_component.is_reference(exe_raw):
+                        expanded = Path(engine_component.expand(exe_raw, cfg, full=False))
+                        if expanded.parent.is_dir():
+                            candidates.append(expanded.parent)
+                except Exception:                        # noqa: BLE001
+                    pass
+            active = _active_component_folder(root)
+            if active is not None:
+                candidates.append(active)
+            candidates.extend(_newest_component_folders(root, prefer_backend=cfg.get("backend")))
+        else:                                            # control
+            active = _active_component_folder(root)
+            if active is not None:
+                candidates.append(active)
+            candidates.extend(_newest_component_folders(root))
+            env_ctl = os.environ.get("STRATA_CONTROL_DIR")
+            if env_ctl:
+                p = Path(env_ctl)
+                if p.is_dir():
+                    candidates.append(p)
+            here = Path(__file__).resolve().parents[1]
+            if here.is_dir():
+                candidates.append(here)
+        seen: set[Path] = set()
+        for base in candidates:
+            if base in seen:
+                continue
+            seen.add(base)
+            target = (base / rest) if rest else base
+            if target.exists():
+                return target
+    return None
+
+
+def _location(raw: str, cfg: dict, config_path: Path, *, active_engine_dir: Path | None = None) -> Path:
     from strata_control import engine_component
     if engine_component.is_reference(raw):
         try:
@@ -38,9 +127,26 @@ def _location(raw: str, cfg: dict, config_path: Path) -> Path:
             return engine_component.engine_dir() / "(no engine for this PC)"     # reported as missing
     value = Path(raw).expanduser()
     if value.is_absolute():
+        if not value.exists():
+            rebased = _rebase_component_path(raw, cfg, active_engine_dir)
+            if rebased is not None:
+                return rebased
         return value
     cwd = cfg.get("cwd")
-    return (Path(cwd) if isinstance(cwd, str) and cwd else config_path.parent) / value
+    if isinstance(cwd, str) and cwd:
+        base = Path(cwd)
+        if not base.exists():
+            rebased_cwd = _rebase_component_path(cwd, cfg, active_engine_dir)
+            if rebased_cwd is not None:
+                base = rebased_cwd
+    else:
+        base = config_path.parent
+    joined = base / value
+    if not joined.exists():
+        rebased = _rebase_component_path(str(joined), cfg, active_engine_dir)
+        if rebased is not None:
+            return rebased
+    return joined
 
 
 def _engine_integrity_failure(raw: str, cfg: dict) -> tuple[Path | None, str | None]:
@@ -208,6 +314,7 @@ def inspect(config_path: Path | None, *, profile_id: str | None = None, live: bo
     report["backend"] = cfg.get("backend") or "cuda_or_cpu_unverified"
     report["devices_selected"] = cfg.get("gpu")
     exe = _location(cfg["exe"], cfg, config_path)
+    active_engine_dir = exe.parent if exe.is_file() else None
     components.append(_item("engine", exe, "file"))
     if components[-1]["status"] != "ok":                 # an installed engine that failed its integrity check is not "no engine for this PC": the same sentence and reason as `strata components engine`
         folder, why = _engine_integrity_failure(cfg["exe"], cfg)
@@ -238,7 +345,7 @@ def inspect(config_path: Path | None, *, profile_id: str | None = None, live: bo
     else:
         components[-1]["build_metadata"] = "unavailable"
 
-    tokenizer = _location(cfg["tokenizer"], cfg, config_path)
+    tokenizer = _location(cfg["tokenizer"], cfg, config_path, active_engine_dir=active_engine_dir)
     for child in ("vocab.json", "merges.txt", "token_type.json"):
         components.append(_item(f"tokenizer/{child}", tokenizer / child, "file"))
 
@@ -265,21 +372,21 @@ def inspect(config_path: Path | None, *, profile_id: str | None = None, live: bo
             kind = "file"
         # The MTP layer is one of two drafters, never both: a model whose drafter is DFlash2, or Off, has no layer on disk, and the run config keeps `--mtp <folder>`
         # for a later switch to the MTP. Its absence then does not make the model unusable (strata_control/drafting.py loads the drafter that is there).
-        components.append(_item(arg.lstrip("-"), _location(raw, cfg, config_path), kind, required=not (arg == "--mtp" and not _drafter_needs_mtp(cfg))))
+        components.append(_item(arg.lstrip("-"), _location(raw, cfg, config_path, active_engine_dir=active_engine_dir), kind, required=not (arg == "--mtp" and not _drafter_needs_mtp(cfg))))
 
     vision = cfg.get("vision")
     if isinstance(vision, dict):
         for key in ("exe", "mmproj", "model"):
             raw = vision.get(key)
             if isinstance(raw, str) and raw:
-                components.append(_item(f"vision/{key}", _location(raw, cfg, config_path), "file"))
+                components.append(_item(f"vision/{key}", _location(raw, cfg, config_path, active_engine_dir=active_engine_dir), "file"))
             else:
                 components.append({"name": f"vision/{key}", "status": "invalid", "kind": "file",
                                    "required": True, "reason": "missing path"})
     elif str(cfg.get("arch") or "").lower() in ("hy4flash", "inkling2_loop") and "--vision" in args:
         vi = args.index("--vision")
         if vi + 1 < len(args) and isinstance(args[vi + 1], str) and args[vi + 1] and not args[vi + 1].startswith("--"):
-            components.append(_item("vision/mmproj", _location(args[vi + 1], cfg, config_path), "file"))
+            components.append(_item("vision/mmproj", _location(args[vi + 1], cfg, config_path, active_engine_dir=active_engine_dir), "file"))
 
     components.append(_monitor_component())
     driver_name = "rocminfo" if cfg.get("backend") == "hip" else "nvidia-smi"

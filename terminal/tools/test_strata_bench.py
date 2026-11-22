@@ -430,5 +430,40 @@ class MachineDetailTests(unittest.TestCase):
         self.assertEqual((g["power_limit_w"], g["pcie"], g["pstate"], g["temp_c"]), ("165.00", "gen4 x8", "P3", "45"))
 
 
+class AgentCorpusLayoutTests(unittest.TestCase):
+    """#6628: Quick Agent benchmark must resolve repo docs across the 0.2.16 terminal/ layout and record corpus identity."""
+
+    def test_doc_root_finds_parent_repo_docs_and_records_corpus(self):
+        # In this repository checkout (terminal/tools/strata_bench.py), README.md and docs/ live at repo root (ROOT.parent)
+        self.assertTrue((B.doc_root() / "README.md").is_file())
+        self.assertTrue((B.doc_root() / "docs").is_dir())
+        suite = B.Suite("http://127.0.0.1:1", "", 32768, 1, False, log=lambda *a: None)
+        files = suite.agent_files()
+        self.assertEqual(len(files), B.AGENT_TURNS)
+        # Must use real project docs rather than silently falling back to generated/part0..4.txt
+        self.assertFalse(all(rel.startswith("generated/") for rel, _ in files), f"unexpected fallback: {[r for r, _ in files]}")
+        info = B.agent_corpus_info(files)
+        self.assertIn(info["corpus"], ("repo_docs", "mixed"))
+        self.assertEqual(len(info["corpus_sha256"]), 12)
+
+    def test_compare_table_warns_when_agent_corpus_differs(self):
+        base = {
+            "machine": {"gpu": ["RTX 4090"], "engine_version": "0.1.65", "model": "qwen", "quant": "IQ2_XS", "context": 32768},
+            "results": {
+                "chat": {"decode_tps": {"median": 80.0, "min": 79.0, "max": 81.0, "n": 3}},
+                "prompts": {},
+                "agent": {"corpus": "repo_docs", "corpus_sha256": "aaaa1111bbbb",
+                          "hit_pct": {"median": 80.0, "min": 79.0, "max": 81.0, "n": 1}},
+                "clients": {},
+            },
+        }
+        other = json.loads(json.dumps(base))
+        other["results"]["agent"]["corpus"] = "generated"
+        other["results"]["agent"]["corpus_sha256"] = "cccc2222dddd"
+        diff = B.compare_table(base, other)
+        self.assertIn("agent corpus: repo_docs (aaaa1111bbbb) -> generated (cccc2222dddd)", diff)
+        self.assertIn("not directly comparable", diff)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -23,11 +23,14 @@ test('#3195: the cards to choose from are the ones the engine drives; the other 
   assert.deepEqual(runCards([...gpus.slice(0, 2), card(0, 'AMD Radeon 760M', 8, { vendor: 'amd' })], 'nvidia').map(g => g.name), ['NVIDIA GeForce RTX 3090', 'NVIDIA GeForce RTX 3090']);
 });
 
-test('#3195: a chip that shares the system memory is left out while a card of its own exists, and is the only choice when it is alone', () => {
-  const igpu = card(0, 'AMD Radeon 8060S', 64, { vendor: 'amd', uma: true });
+test('#3195 & #6619: a small iGPU is left out beside a discrete card, while Big UMA (8060S / gfx1151) stays selectable', () => {
+  const smallIgpu = card(0, 'AMD Radeon 780M', 4, { vendor: 'amd', uma: true });
   const real = card(1, 'AMD Radeon RX 9070 XT', 16, { vendor: 'amd' });
-  assert.deepEqual(runCards([igpu, real], 'amd').map(g => g.index), [1]);
-  assert.deepEqual(runCards([igpu], 'amd').map(g => g.index), [0]);
+  assert.deepEqual(runCards([smallIgpu, real], 'amd').map(g => g.index), [1]);
+  assert.deepEqual(runCards([smallIgpu], 'amd').map(g => g.index), [0]);
+  const halo = card(0, 'AMD Radeon(TM) 8060S Graphics', 128, { vendor: 'amd', arch: 'gfx1151', uma: true });
+  const r9700 = card(1, 'AMD Radeon AI PRO R9700', 32, { vendor: 'amd', arch: 'gfx1201' });
+  assert.deepEqual(runCards([halo, r9700], 'amd').map(g => g.index), [0, 1], '#6619: 8060S must remain selectable alongside R9700');
 });
 
 test('#3203: a card the engine cannot use (usable false) is never offered', () => {

@@ -566,7 +566,10 @@ public:
         const char* b_env = getenv("HY4_PF_BOUNCE");
         const bool force_bounce = b_env && atoi(b_env) != 0;
         const bool force_arena  = b_env && atoi(b_env) == 0;
-        const bool safe_to_pin  = ((double)arena_span < 0.48 * ram_limit_gb() * 1e9);
+        // #6614: allow pinning the host expert arena on Linux when >= 12 GiB OS headroom remains (e.g. 56 GB SQ-64 on 92 GB Linux) so PCIe DMA is zero-copy;
+        // hipHostRegister still safely falls back to the pinned bounce ring if ulimit -l / driver refuses.
+        const double ram_bytes = ram_limit_gb() * 1e9;
+        const bool safe_to_pin  = ((double)arena_span < 0.70 * ram_bytes) && ((double)arena_span + (double)(12ull << 30) < ram_bytes);
         if (!force_bounce && (force_arena || safe_to_pin)) {
             if (hipHostRegister((void*)lo, arena_span, 0) == hipSuccess) pinned_arena = true;
             else (void)hipGetLastError();
@@ -718,8 +721,9 @@ public:
         vcache_nslots = g.vcache_nslots;
         vcache_slot_bytes = g.vcache_slot_bytes;
         if (!hyb || vcache_nslots <= 0 || vcache_slot_bytes == 0) return;
-        // Anti-thrashing guard on 8-12 GB cards (< 15% of 20,992 experts in vcache): slower decay & tighter promotion cap keep the hottest Zipf experts pinned.
-        if (vcache_nslots < 3148) {
+        // Anti-thrashing guard on 8-12 GB cards (< 15% of 20,992 experts in total VRAM): count both tight static VRAM experts and dynamic vcache slots (#6614).
+        const int total_vram_slots = g.n_vram_experts + vcache_nslots;
+        if (total_vram_slots < 3148) {
             vcache_decay = 0.985;
             vcache_max_swaps = 2;
         }
@@ -946,7 +950,7 @@ public:
         }
         vc_scan_cursor = s;
         int vi = 0, rpi = 0, h2d_used = 0;
-        const bool small_vc = vcache_nslots < 3148;
+        const bool small_vc = (g.n_vram_experts + vcache_nslots) < 3148;
         hipStream_t pst = st_vprom ? st_vprom : st2;
         for (int ci = 0; ci < n_cands && vi < n_vic; ++ci) {
             const int best_miss = cand_idx[ci];
@@ -2368,11 +2372,12 @@ public:
                 }
                 if (run_src) HCK(hipMemcpyAsync(d_scratch[b] + run_off, run_src, run_len, hipMemcpyHostToDevice, st2));
             } else {
-                // Pinned bounce ring (Windows WDDM / >48% RAM): parallel pack via pf_pool (8 threads) when n_gpu >= 4
-                // while cpu.submit is already computing on the CPU pool, then single contiguous DMA!
+                // #6614: Pinned bounce ring: when cpu.submit is already running across all CPU cores (n_cpu_pairs > 0), pack directly on the host thread
+                // instead of waking 8 extra pf_pool threads that oversubscribe the CPU cores and stall both CPU experts and DMA!
                 const double t_pk0 = rec_cal ? now_s() : 0.0;
+                const bool use_pf_pool = (n_cpu_pairs == 0 && n_gpu >= 6);
                 PfGroup dec_grp;
-                if (n_gpu >= 4) dec_grp.runs.reserve((size_t)n_gpu);
+                if (use_pf_pool) dec_grp.runs.reserve((size_t)n_gpu);
                 for (int i = 0; i < n_gpu; ++i) {
                     const MissCand& mc = cands[gpu_e[i]];
                     const ExpertRef& er = g.experts[(size_t)ml * 512 + mc.e];
@@ -2383,14 +2388,14 @@ public:
                     ht[mc.e].gu_code = er.gu_code;
                     ht[mc.e].dn_code = er.dn_code;
                     ht[mc.e].pad = 0;
-                    if (n_gpu >= 4) {
+                    if (use_pf_pool) {
                         dec_grp.runs.push_back({mc.body, off, mc.bytes});
                     } else {
                         std::memcpy(h_bounce[b] + off, mc.body, mc.bytes);
                     }
                     off += sz;
                 }
-                if (n_gpu >= 4 && !dec_grp.runs.empty()) {
+                if (use_pf_pool && !dec_grp.runs.empty()) {
                     dec_grp.total_bytes = off;
                     pf_pool.kick(b, h_bounce[b], &dec_grp, nullptr);
                     pf_pool.wait();

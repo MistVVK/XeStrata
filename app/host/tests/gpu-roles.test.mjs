@@ -92,3 +92,37 @@ test('words: the sentence and the one-line summary', () => {
   assert.equal(R.noteText('old_main_helper:1', V.hw.two), 'RTX 4070 Ti is now a Helper.');
   assert.equal(R.noteText('only_main', V.hw.two), 'The only card that is on has to be Main.');
 });
+
+test('#6619: Big UMA (Strix Halo 8060S 128 GB) vs discrete R9700 (32 GB) picks by model memory and respects usable=false', () => {
+  const hybrid = [
+    { index: 0, name: 'AMD Radeon(TM) 8060S Graphics', vram_gb: 128, arch: 'gfx1151', vendor: 'amd', uma: true, speed: 40 },
+    { index: 1, name: 'AMD Radeon AI PRO R9700', vram_gb: 32, arch: 'gfx1201', vendor: 'amd', speed: 100 },
+  ];
+  // Model fits in 32 GB R9700 -> discrete R9700 is Main (faster), 8060S starts Off
+  const smallModel = R.recommend(hybrid, 'amd', { modelMemoryGb: 20 });
+  assert.equal(smallModel.main, 1);
+  assert.equal(smallModel.why, 'faster');
+  assert.deepEqual(smallModel.roles, { 0: 'off', 1: 'main' });
+
+  // Model needs > 32 GB (e.g. Qwen3.8 / Hy4-Flash 62 GB) -> Big UMA 8060S is Main (memory), R9700 starts Off
+  const bigModel = R.recommend(hybrid, 'amd', { modelMemoryGb: 62 });
+  assert.equal(bigModel.main, 0);
+  assert.equal(bigModel.why, 'memory');
+  assert.deepEqual(bigModel.roles, { 0: 'main', 1: 'off' });
+
+  // No model size specified -> Big UMA with 128 GB > 32 GB wins by memory
+  const noSize = R.recommend(hybrid, 'amd');
+  assert.equal(noSize.main, 0);
+  assert.equal(noSize.why, 'memory');
+  assert.deepEqual(noSize.roles, { 0: 'main', 1: 'off' });
+
+  // No bogus "built-in graphics; slow as Main" warning when 8060S Big UMA is Main
+  assert.deepEqual(R.warnings({ 0: 'main', 1: 'off' }, hybrid), []);
+
+  // When hip-rdna3 engine marks R9700 unusable -> 8060S is the only usable Main
+  const rdna3Only = [hybrid[0], { ...hybrid[1], usable: false, problem: 'not built for gfx1201' }];
+  const recRdna3 = R.recommend(rdna3Only, 'amd', { modelMemoryGb: 20 });
+  assert.equal(recRdna3.main, 0);
+  assert.equal(recRdna3.why, 'only');
+  assert.deepEqual(recRdna3.roles, { 0: 'main', 1: 'off' });
+});
