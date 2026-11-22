@@ -9,14 +9,22 @@ endif()
 
 # Locate hipcc / AMD clang++ if not already configured by top-level hip_backend.cmake
 if(NOT DEFINED STRATA_HIP_CXX OR "${STRATA_HIP_CXX}" STREQUAL "")
-  find_program(_ink_hip_cxx NAMES hipcc clang++ HINTS
-    "$ENV{ROCM_PATH}/bin" "$ENV{ROCM_PATH}/llvm/bin" "/opt/rocm/bin" "/opt/rocm/llvm/bin" "C:/TheRock/lib/llvm/bin")
-  set(STRATA_HIP_CXX "${_ink_hip_cxx}")
+  if(DEFINED CMAKE_HIP_COMPILER AND NOT "${CMAKE_HIP_COMPILER}" STREQUAL "")
+    set(STRATA_HIP_CXX "${CMAKE_HIP_COMPILER}")
+  else()
+    find_program(_ink_hip_cxx NAMES hipcc clang++ HINTS
+      "$ENV{ROCM_PATH}/bin" "$ENV{ROCM_PATH}/llvm/bin" "/opt/rocm/bin" "/opt/rocm/llvm/bin" "C:/TheRock/lib/llvm/bin")
+    set(STRATA_HIP_CXX "${_ink_hip_cxx}")
+  endif()
 endif()
 
+# hip_backend.cmake exports STRATA_HIP_ARCHS comma-separated ("gfx1100,gfx1151"); normalize to a CMake list
+string(REPLACE "," ";" _ink_hip_arch_list "${STRATA_HIP_ARCHS}")
 set(_ink_hip_arch_flags "")
-foreach(_a IN LISTS STRATA_HIP_ARCHS)
-  list(APPEND _ink_hip_arch_flags "--offload-arch=${_a}")
+foreach(_a IN LISTS _ink_hip_arch_list)
+  if(NOT "${_a}" STREQUAL "")
+    list(APPEND _ink_hip_arch_flags "--offload-arch=${_a}")
+  endif()
 endforeach()
 
 # Build HIP backend object using AMD clang++ -x hip (matches hy4flash & Strata Windows/Linux ROCm SDK layout)
@@ -33,14 +41,28 @@ set(_ink_hip_inc
 )
 
 set(_ink_hip_extra_flags "")
+set(_ink_rocm_root "")
 if(DEFINED STRATA_ROCM_PATH AND NOT "${STRATA_ROCM_PATH}" STREQUAL "")
-  list(APPEND _ink_hip_extra_flags "--rocm-path=${STRATA_ROCM_PATH}")
+  set(_ink_rocm_root "${STRATA_ROCM_PATH}")
+elseif(DEFINED CMAKE_HIP_COMPILER_ROCM_ROOT AND NOT "${CMAKE_HIP_COMPILER_ROCM_ROOT}" STREQUAL "")
+  set(_ink_rocm_root "${CMAKE_HIP_COMPILER_ROCM_ROOT}")
+endif()
+if(NOT "${_ink_rocm_root}" STREQUAL "")
+  list(APPEND _ink_hip_extra_flags "--rocm-path=${_ink_rocm_root}")
 endif()
 if(DEFINED STRATA_ROCM_BITCODE_PATH AND NOT "${STRATA_ROCM_BITCODE_PATH}" STREQUAL "")
   list(APPEND _ink_hip_extra_flags "--rocm-device-lib-path=${STRATA_ROCM_BITCODE_PATH}")
+elseif(NOT "${_ink_rocm_root}" STREQUAL "" AND EXISTS "${_ink_rocm_root}/lib/llvm/amdgcn/bitcode")
+  list(APPEND _ink_hip_extra_flags "--rocm-device-lib-path=${_ink_rocm_root}/lib/llvm/amdgcn/bitcode")
 endif()
 if(WIN32)
   list(APPEND _ink_hip_extra_flags "-D_CRT_SECURE_NO_WARNINGS" "-DWIN32_LEAN_AND_MEAN" "-DNOMINMAX")
+  # Match CMake's default MSVC dynamic CRT (/MD or /MDd) so lld-link does not fail with RuntimeLibrary mismatch
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    list(APPEND _ink_hip_extra_flags "-D_DEBUG" "-D_DLL" "-D_MT" "-Xclang" "--dependent-lib=msvcrtd")
+  else()
+    list(APPEND _ink_hip_extra_flags "-D_DLL" "-D_MT" "-Xclang" "--dependent-lib=msvcrt")
+  endif()
 endif()
 
 add_custom_command(
@@ -56,6 +78,7 @@ add_custom_command(
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_common.hip.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_codecs.hip.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_ops.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_tree.hip.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_blaslt.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_hybrid.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../../include/strata/hip_uma_guard.hpp"
@@ -68,9 +91,11 @@ set_target_properties(strata_inkling_hip PROPERTIES LINKER_LANGUAGE CXX)
 
 if(DEFINED STRATA_HIP_RUNTIME_LIB AND NOT "${STRATA_HIP_RUNTIME_LIB}" STREQUAL "")
   target_link_libraries(strata_inkling_hip PUBLIC "${STRATA_HIP_RUNTIME_LIB}")
+elseif(TARGET hip::host)
+  target_link_libraries(strata_inkling_hip PUBLIC hip::host)
 else()
   find_library(_ink_amdhip64 NAMES amdhip64 amdhip64_7 amdhip64_6 HINTS
-    "$ENV{ROCM_PATH}/lib" "/opt/rocm/lib")
+    "${_ink_rocm_root}/lib" "$ENV{ROCM_PATH}/lib" "/opt/rocm/lib")
   if(_ink_amdhip64)
     target_link_libraries(strata_inkling_hip PUBLIC "${_ink_amdhip64}")
   endif()

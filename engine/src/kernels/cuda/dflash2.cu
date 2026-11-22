@@ -6,7 +6,9 @@
 #include "strata/core/per_device_flag.hpp"
 #include "s26_tsum.cuh"
 
+#if !defined(__HIPCC__)
 #include <cuda_bf16.h>
+#endif
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
