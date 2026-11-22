@@ -85,7 +85,8 @@ inline std::vector<std::pair<std::string, std::string>> gfx11_discrete_exact_env
 }
 
 /// KL-validated matrix-core prompt & MoE switches for discrete RDNA3 (gfx1100 / gfx1101 / gfx1102), matching the Windows
-/// gfx1151 (Strix Halo) matrix-core set plus GDN_CHUNKED and PF_P1A_L2 (covering all 48/48 layers of UD-Q4_K_XL / UD-Q5_K_XL).
+/// gfx1151 (Strix Halo) matrix-core set plus PF_P1A_L2 (covering all 48/48 layers of UD-Q4_K_XL / UD-Q5_K_XL),
+/// DFLASH_WMMA, and HIP_FAST_DEC (GDN_CHUNKED remains opt-in on gfx11 to keep 4K+ prefill KL <= 0.016).
 inline std::vector<std::pair<std::string, std::string>> gfx11_discrete_wmma_env(
     const char* gcn_arch, bool defaults026) {
     std::vector<std::pair<std::string, std::string>> t;
@@ -95,7 +96,6 @@ inline std::vector<std::pair<std::string, std::string>> gfx11_discrete_wmma_env(
         {"STRATA_HIP_WMMA", "1"},
         {"STRATA_PA_FAST", "1"},
         {"STRATA_SELECT_WMMA", "1"},
-        {"STRATA_GDN_CHUNKED", "1"},
         {"STRATA_PF_GEMM", "1"},
         {"STRATA_HC_UPMIX", "1"},
         {"STRATA_PF_FUSED", "1"},

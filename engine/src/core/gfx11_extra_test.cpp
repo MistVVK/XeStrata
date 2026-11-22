@@ -55,7 +55,7 @@ int main() {
         const auto wm     = gfx11_discrete_wmma_env(g, false);
         CHECK(ex_lin.size() == 24);
         CHECK(ex_win.size() == 26);
-        CHECK(wm.size() == 13);
+        CHECK(wm.size() == 12);
         CHECK(has_kv(ex_lin, "STRATA_GDN_HEAD", "1"));
         CHECK(has_kv(ex_lin, "STRATA_GDN_PP", "2"));
         CHECK(has_kv(ex_lin, "STRATA_EXPERT_V2", "1"));
@@ -68,7 +68,7 @@ int main() {
         CHECK(has_kv(ex_win, "GPU_ENABLE_PAL_SDMA", "1"));
         CHECK(has_kv(wm, "STRATA_HIP_WMMA", "1"));
         CHECK(has_kv(wm, "STRATA_SELECT_WMMA", "1"));
-        CHECK(has_kv(wm, "STRATA_GDN_CHUNKED", "1"));
+        CHECK(!has_kv(wm, "STRATA_GDN_CHUNKED", "1"));
         CHECK(has_kv(wm, "STRATA_PF_F16", "2"));
         CHECK(has_kv(wm, "STRATA_PF_P1A", "1"));
         CHECK(has_kv(wm, "STRATA_PF_P1A_L2", "1"));
