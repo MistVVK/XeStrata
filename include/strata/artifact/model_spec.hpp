@@ -80,6 +80,9 @@ struct ModelSpec {
     // are those mainline llama.cpp writes in src/llama-arch.cpp (PR #32694).  The loop expands the trunk's 24 physical
     // layers to 48 cache slots; the extra 24 share their weights with core layers 6-17 but keep their own K/V and
     // convolution state.  `layer_phys` is the slot -> physical layer map of llama_model_inkling2_loop::layer_phys.
+    // loop_start, loop_end and loop_count are also SenseNova-Loop's (below): both write <arch>.loop.start, .end and
+    // .count, the physical layers [loop_start, loop_end) run loop_count times.  Each architecture reads and checks
+    // them in its own branch of read_model_spec, and each accessor answers for its own architecture only.
     int64_t loop_start = 0, loop_end = 0, loop_count = 0, loop_gate_rank = 0;
     bool loop_varying = false;
     int64_t attn_res_block = 0;                 ///< inkling2_loop.attn_res.block_size
@@ -100,7 +103,7 @@ struct ModelSpec {
         return n_layer + (loop_count - 1) * (loop_end - loop_start);
     }
     int64_t layer_phys(int64_t il) const {
-        if (il < n_layer || loop_end <= loop_start) return il;
+        if (arch != ModelArch::Inkling2Loop || il < n_layer || loop_end <= loop_start) return il;
         return loop_start + (il - n_layer) % (loop_end - loop_start);
     }
     /// True when cache slot `il` is a copy of a physical core layer (its weights are shared, its state is not).
@@ -115,8 +118,8 @@ struct ModelSpec {
     int64_t kda_head_dim = 0;
     double kda_gate_lower_bound = 0;
 
-    // SenseNova-Loop: layer numbers are visits; tensor names after the loop use the visit number.
-    int64_t loop_start = 0, loop_end = 0, loop_count = 0;
+    // SenseNova-Loop: layer numbers are visits; tensor names after the loop use the visit number.  The loop is
+    // loop_start, loop_end and loop_count above; here n_layer counts the visits, inkling2_loop's the physical layers.
     int64_t mhc_start = 0, mhc_end = 0, mhc_streams = 0, mhc_iterations = 0;
     bool mhc_fixed_identity = false;
     double mhc_pre_scale = 0;
