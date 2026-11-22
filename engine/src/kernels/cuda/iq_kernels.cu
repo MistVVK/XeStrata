@@ -6060,11 +6060,13 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
     extern __shared__ int sh_raw[];   // LDS_NT entries x hb blocks of q8_1
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    if (e0 >= e1) return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const float sd = (TD == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
     const int nb = (int) (L.n_ff / F::qk), hb = (int) (L.n_ff / 32);
     const int n_items = nb * F::ipb;
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
     const int nrow = (int) L.n_embd;
     const block_q8_1* sh = (const block_q8_1*) sh_raw;
     constexpr bool kDownSplit = kSplit<TD> || (TD == 7);
@@ -6113,7 +6115,10 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
                         float v = s[j];
 #pragma unroll
                         for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-                        if (slane == 0) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = v;
+                        if (slane == 0) {
+                            if constexpr (TD == 40) v *= sd;
+                            out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = v;
+                        }
                     }
                 };
                 switch (cn) {
@@ -6160,7 +6165,6 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
                 }
 #pragma unroll
                 for (int j = 0; j < NTC; ++j) {
-                    const float sd = (TD == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
                     const float a = warp_sum(s0[j]) * sd, b = warp_sum(s1[j]) * sd;
                     if (lane == 0) {
                         out[(size_t) ent_dst[c0 + j] * L.n_embd + r0] = a;
@@ -6201,6 +6205,8 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
     extern __shared__ int sx_raw[];
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    if (e0 >= e1) return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     if constexpr (kHasGrid) {
         const GT* gsrc = GridOf<TG>::src();
@@ -6217,7 +6223,6 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
     const float s_gate = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
     const float s_up   = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
     const int nb = (int) (L.n_embd / F::qk), xb = (int) (L.n_embd / 32), hb = (int) (L.n_ff / 32);
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
     const int r0 = blockIdx.x * 32;
     const block_q8_1* sx = (const block_q8_1*) sx_raw;
     auto wrow = [&](int i) -> const uint8_t* {   // i < 32: gate row r0 + i, else up row r0 + i - 32

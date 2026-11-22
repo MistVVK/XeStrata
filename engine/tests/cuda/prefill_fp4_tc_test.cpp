@@ -142,6 +142,49 @@ struct DevBuf {
     template <typename T> T* as() const { return reinterpret_cast<T*>(p); }
 };
 
+// Exercise the first row beyond the old 65535-CTA grid limit without allocating a full MoE layer.
+void run_long_quantize_case(cudaStream_t s) {
+    constexpr int blocks_per_row = N / 64;
+    constexpr int rows = (65535 * 8) / blocks_per_row + 1;
+    const size_t block_bytes = fused::act_bytes(1, 64);
+    const size_t row_bytes = fused::act_bytes(1, N);
+    const int endpoints[] = {0, rows - 1};
+    DevBuf x((size_t) rows * N * sizeof(float));
+    DevBuf packed(rows * row_bytes);
+    DevBuf reference(2 * row_bytes);
+    ck(cudaMemsetAsync(x.p, 0, (size_t) rows * N * sizeof(float), s), "long quantize input");
+    ck(cudaMemsetAsync(packed.p, 0xff, rows * row_bytes, s), "long quantize sentinel");
+
+    std::vector<float> samples(2 * N);
+    std::vector<uint8_t> expected(2 * row_bytes), actual(2 * row_bytes);
+    for (int i = 0; i < 2; ++i) {
+        for (int k = 0; k < N; ++k) {
+            const int sign = (k + i) % 2 == 0 ? 1 : -1;
+            samples[i * N + k] = sign * (1 + (k * 7 + i * 11) % 37) * (1 + k / 64) / 32.0f;
+        }
+        float* row = x.as<float>() + (size_t) endpoints[i] * N;
+        ck(cudaMemcpyAsync(row, samples.data() + i * N, N * sizeof(float), cudaMemcpyHostToDevice, s), "long quantize endpoint");
+        fp4_tc::quantize_act(row, 1, N, reference.as<uint8_t>() + i * row_bytes, s);
+    }
+    fp4_tc::quantize_act(x.as<float>(), rows, N, packed.p, s);
+    ck(cudaMemcpyAsync(expected.data(), reference.p, expected.size(), cudaMemcpyDeviceToHost, s), "short quantize results");
+    for (int i = 0; i < 2; ++i) {
+        ck(cudaMemcpyAsync(actual.data() + i * row_bytes, packed.as<uint8_t>() + endpoints[i] * row_bytes,
+                           row_bytes, cudaMemcpyDeviceToHost, s), "long quantize results");
+    }
+    ck(cudaStreamSynchronize(s), "long quantize sync");
+    // Each 64-value block writes 32 payload bytes, four scale codes and an outer float scale.
+    for (int i = 0; i < 2; ++i) {
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const size_t offset = i * row_bytes + b * block_bytes;
+            if (std::memcmp(actual.data() + offset, expected.data() + offset, 40) != 0) {
+                std::fprintf(stderr, "prefill_fp4_tc_test: activation block mismatch at row %d block %d\n", endpoints[i], b);
+                std::exit(1);
+            }
+        }
+    }
+}
+
 void run_parity_case(int T, int E, size_t blob_shift, cudaStream_t s) {
     const size_t gu_row = (size_t) (N / 64) * BS;
     const size_t d_row = (size_t) (FF / 64) * BS;
@@ -528,6 +571,7 @@ int main(int argc, char** argv) {
     }
     cudaStream_t s = nullptr;
     ck(cudaStreamCreate(&s), "cudaStreamCreate");
+    run_long_quantize_case(s);
     run_parity_case(1, 16, 0, s);
     run_parity_case(17, 16, 2, s);
     run_parity_case(65, 32, 0, s);
