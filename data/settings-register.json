@@ -40,22 +40,22 @@
    "reads": [
     "serve/server.py:12175",
     "serve/server.py:12474",
-    "setup.py:8607"
+    "setup.py:8647"
    ]
   },
   "ARENA_HOST_USM": {
    "reads": [
-    "src/core/expert_source.cpp:4450"
+    "src/core/expert_source.cpp:4488"
    ]
   },
   "ARENA_LOW_RAM": {
    "reads": [
-    "src/program/generate.cpp:5307"
+    "src/program/generate.cpp:5351"
    ]
   },
   "ARENA_MMAP": {
    "reads": [
-    "src/core/expert_source.cpp:4313"
+    "src/core/expert_source.cpp:4351"
    ]
   },
   "ARENA_PIN_GIB": {
@@ -65,12 +65,12 @@
   },
   "ARENA_RAM_WAIT_S": {
    "reads": [
-    "src/core/expert_source.cpp:4388"
+    "src/core/expert_source.cpp:4426"
    ]
   },
   "ARENA_RELEASE": {
    "reads": [
-    "src/program/generate.cpp:7289"
+    "src/program/generate.cpp:7333"
    ]
   },
   "ARENA_THP": {
@@ -115,7 +115,7 @@
   },
   "AUX_CPUS": {
    "reads": [
-    "src/program/generate.cpp:5440",
+    "src/program/generate.cpp:5484",
     "src/program/plain_generate.cpp:3110"
    ]
   },
@@ -132,24 +132,24 @@
   },
   "BATCH_DECODE_SHARE": {
    "reads": [
-    "src/program/generate.cpp:12446"
+    "src/program/generate.cpp:12490"
    ]
   },
   "BATCH_GROUPS_NV_SERIAL": {
    "reads": [
-    "src/program/generate.cpp:5152"
+    "src/program/generate.cpp:5196"
    ]
   },
   "BATCH_MTP": {
    "reads": [
     "serve/server.py:4044",
-    "src/program/generate.cpp:4840",
+    "src/program/generate.cpp:4884",
     "src/program/plain_generate.cpp:2683"
    ]
   },
   "BATCH_MTP_SERIAL": {
    "reads": [
-    "src/program/generate.cpp:4826",
+    "src/program/generate.cpp:4870",
     "src/program/plain_generate.cpp:779"
    ]
   },
@@ -175,7 +175,7 @@
   },
   "BIG_CHUNK": {
    "reads": [
-    "src/program/generate.cpp:7460"
+    "src/program/generate.cpp:7504"
    ]
   },
   "BIH3_F16_ROWS": {
@@ -201,7 +201,7 @@
   },
   "CACHE_MESSAGE_BOUNDARY": {
    "reads": [
-    "src/program/generate.cpp:12729"
+    "src/program/generate.cpp:12773"
    ]
   },
   "CANON": {
@@ -219,24 +219,24 @@
   "CKPT_ASYNC": {
    "reads": [
     "src/core/conversation_state.cpp:222",
-    "src/program/generate.cpp:3320"
+    "src/program/generate.cpp:3324"
    ]
   },
   "CKPT_GATHER": {
    "reads": [
     "src/core/conversation_state.cpp:348",
-    "src/program/generate.cpp:3320"
+    "src/program/generate.cpp:3324"
    ]
   },
   "CKPT_REREAD": {
    "reads": [
-    "src/program/generate.cpp:12079",
-    "src/program/generate.cpp:12144"
+    "src/program/generate.cpp:12123",
+    "src/program/generate.cpp:12188"
    ]
   },
   "CKPT_STAGE": {
    "reads": [
-    "src/program/generate.cpp:4416"
+    "src/program/generate.cpp:4460"
    ]
   },
   "CKPT_VRAM_SLOTS": {
@@ -246,8 +246,8 @@
   },
   "COLD_OVERLAP": {
    "reads": [
-    "src/core/expert_source.cpp:3262",
-    "src/program/generate.cpp:5391"
+    "src/core/expert_source.cpp:3300",
+    "src/program/generate.cpp:5435"
    ]
   },
   "COMMIT_BATCH": {
@@ -317,12 +317,12 @@
   },
   "DECODE_TIMING": {
    "reads": [
-    "src/program/generate.cpp:12938"
+    "src/program/generate.cpp:12982"
    ]
   },
   "DEC_BATCH": {
    "reads": [
-    "src/core/expert_source.cpp:3465",
+    "src/core/expert_source.cpp:3503",
     "src/core/verify.cpp:839",
     "src/kernels/xe/shared_expert.cpp:103"
    ]
@@ -334,7 +334,7 @@
   },
   "DENSE_HOST": {
    "reads": [
-    "src/program/generate.cpp:5875"
+    "src/program/generate.cpp:5919"
    ]
   },
   "DETECT_REPEAT": {
@@ -349,7 +349,7 @@
   },
   "DF2_BLOCK_LOG": {
    "reads": [
-    "src/program/generate.cpp:13965",
+    "src/program/generate.cpp:14009",
     "src/program/plain_generate.cpp:2418"
    ]
   },
@@ -406,12 +406,12 @@
   },
   "DISK_SKIP_FROM": {
    "reads": [
-    "src/core/expert_source.cpp:3312"
+    "src/core/expert_source.cpp:3350"
    ]
   },
   "DL_CONNECTIONS": {
    "reads": [
-    "setup.py:3890",
+    "setup.py:3907",
     "tools/mtp_fetch.py:254"
    ]
   },
@@ -424,7 +424,7 @@
    "reads": [
     "src/core/draft_head.cpp:245",
     "src/core/mtp.cpp:488",
-    "src/core/plain_model.cpp:4765"
+    "src/core/plain_model.cpp:4791"
    ]
   },
   "DRAFT_INT2_K": {
@@ -459,7 +459,7 @@
   },
   "DUMP_FIRST_LOGITS": {
    "reads": [
-    "src/program/generate.cpp:13719"
+    "src/program/generate.cpp:13763"
    ]
   },
   "EMB_REUSE_ACCOUNT": {
@@ -510,8 +510,8 @@
   },
   "FETCH_THREADS": {
    "reads": [
-    "src/core/plain_model.cpp:2128",
-    "src/program/generate.cpp:5376"
+    "src/core/plain_model.cpp:2162",
+    "src/program/generate.cpp:5420"
    ]
   },
   "FFMPEG": {
@@ -526,22 +526,22 @@
   },
   "FILE_TIER_IDLE": {
    "reads": [
-    "src/program/generate.cpp:6409"
+    "src/program/generate.cpp:6453"
    ]
   },
   "FILL_AHEAD": {
    "reads": [
-    "src/program/generate.cpp:6171"
+    "src/program/generate.cpp:6215"
    ]
   },
   "FOLLOW": {
    "reads": [
-    "src/program/generate.cpp:12884"
+    "src/program/generate.cpp:12928"
    ]
   },
   "FOLLOW_LOGPOS": {
    "reads": [
-    "src/program/generate.cpp:12905"
+    "src/program/generate.cpp:12949"
    ]
   },
   "FORCE_AVX2": {
@@ -557,7 +557,7 @@
   },
   "FREE_MISSES": {
    "reads": [
-    "src/core/expert_source.cpp:3342"
+    "src/core/expert_source.cpp:3380"
    ]
   },
   "FUSE_HITS": {
@@ -662,7 +662,7 @@
   },
   "HC_HOST": {
    "reads": [
-    "src/program/generate.cpp:5840"
+    "src/program/generate.cpp:5884"
    ]
   },
   "HC_Q8": {
@@ -749,12 +749,12 @@
   },
   "INKLING_PLACEMENT": {
    "reads": [
-    "src/core/plain_inkling.cpp:1119"
+    "src/core/plain_inkling.cpp:1120"
    ]
   },
   "INKLING_RESIDUAL": {
    "reads": [
-    "src/core/plain_inkling.cpp:1122"
+    "src/core/plain_inkling.cpp:1123"
    ]
   },
   "IO_PF_AHEAD": {
@@ -784,23 +784,23 @@
   },
   "IO_PF_THREADS": {
    "reads": [
-    "src/program/generate.cpp:5388"
+    "src/program/generate.cpp:5432"
    ]
   },
   "IO_PREFETCH": {
    "reads": [
-    "src/program/generate.cpp:5385",
-    "src/program/generate.cpp:6414"
+    "src/program/generate.cpp:5429",
+    "src/program/generate.cpp:6458"
    ]
   },
   "IO_PREFETCH_DEPTH": {
    "reads": [
-    "src/program/generate.cpp:6454"
+    "src/program/generate.cpp:6498"
    ]
   },
   "IO_STATS": {
    "reads": [
-    "src/program/generate.cpp:5406"
+    "src/program/generate.cpp:5450"
    ]
   },
   "IO_THREADS": {
@@ -909,12 +909,12 @@
   },
   "KV_GROW": {
    "reads": [
-    "src/program/generate.cpp:4305"
+    "src/program/generate.cpp:4349"
    ]
   },
   "KV_GROW_FLOOR": {
    "reads": [
-    "src/program/generate.cpp:7078"
+    "src/program/generate.cpp:7122"
    ]
   },
   "KV_GROW_HOLD": {
@@ -924,13 +924,13 @@
   },
   "KV_GROW_INIT": {
    "reads": [
-    "src/core/plain_model.cpp:1691",
-    "src/program/generate.cpp:4320"
+    "src/core/plain_model.cpp:1725",
+    "src/program/generate.cpp:4364"
    ]
   },
   "KV_GROW_STEP": {
    "reads": [
-    "src/program/generate.cpp:7075"
+    "src/program/generate.cpp:7119"
    ]
   },
   "KV_MAIN_OFF": {
@@ -950,9 +950,9 @@
   },
   "KV_ROT": {
    "reads": [
-    "src/program/generate.cpp:2950",
-    "src/program/generate.cpp:8389",
-    "src/program/generate.cpp:8496"
+    "src/program/generate.cpp:2952",
+    "src/program/generate.cpp:8433",
+    "src/program/generate.cpp:8540"
    ]
   },
   "KV_STAGE_OWN": {
@@ -962,7 +962,7 @@
   },
   "KV_TCQ_DEFER": {
    "reads": [
-    "src/core/plain_model.cpp:1555"
+    "src/core/plain_model.cpp:1589"
    ]
   },
   "KV_WIDE_HOST": {
@@ -1010,14 +1010,14 @@
   },
   "LATENT_STREAM": {
    "reads": [
-    "src/program/generate.cpp:5583",
-    "src/program/generate.cpp:5802"
+    "src/program/generate.cpp:5627",
+    "src/program/generate.cpp:5846"
    ]
   },
   "LATENT_U_GPU": {
    "reads": [
     "src/core/moe_window.cpp:178",
-    "src/program/generate.cpp:6383"
+    "src/program/generate.cpp:6427"
    ]
   },
   "LATENT_U_MMU": {
@@ -1056,13 +1056,13 @@
   },
   "LOGPOS": {
    "reads": [
-    "src/program/generate.cpp:12302",
-    "src/program/generate.cpp:12334"
+    "src/program/generate.cpp:12346",
+    "src/program/generate.cpp:12378"
    ]
   },
   "LOGPOS_EXTRA": {
    "reads": [
-    "src/program/generate.cpp:12338"
+    "src/program/generate.cpp:12382"
    ]
   },
   "LOGPOS_TOPK": {
@@ -1072,19 +1072,19 @@
   },
   "LOOKAHEAD": {
    "reads": [
-    "src/program/generate.cpp:6413",
-    "src/program/generate.cpp:6435"
+    "src/program/generate.cpp:6457",
+    "src/program/generate.cpp:6479"
    ]
   },
   "LOOKAHEAD_K": {
    "reads": [
-    "src/program/generate.cpp:6446"
+    "src/program/generate.cpp:6490"
    ]
   },
   "LOOKUP_CHAIN_FIXED": {
    "reads": [
-    "src/program/generate.cpp:12922",
-    "src/program/generate.cpp:15128"
+    "src/program/generate.cpp:12966",
+    "src/program/generate.cpp:15172"
    ]
   },
   "LOOP_GUARD": {
@@ -1099,7 +1099,7 @@
   },
   "MAX_ALLOC_MIB": {
    "reads": [
-    "src/core/device.cpp:1003"
+    "src/core/device.cpp:1013"
    ]
   },
   "MAX_BODY_MIB": {
@@ -1167,7 +1167,7 @@
   },
   "MTP_EXPERTS_HOST": {
    "reads": [
-    "src/program/generate.cpp:5784"
+    "src/program/generate.cpp:5828"
    ]
   },
   "MTP_FULL_HEAD": {
@@ -1197,7 +1197,7 @@
   },
   "MTP_VOCAB_EN": {
    "reads": [
-    "src/program/generate.cpp:5857"
+    "src/program/generate.cpp:5901"
    ]
   },
   "NAME": {
@@ -1246,7 +1246,7 @@
    "reads": [
     "src/kernels/cpu/native_expert.cpp:413",
     "src/kernels/cpu/native_expert.cpp:493",
-    "src/program/generate.cpp:3365"
+    "src/program/generate.cpp:3369"
    ]
   },
   "NO_IQ4NL": {
@@ -1334,7 +1334,7 @@
    "reads": [
     "src/core/conversation_snapshot.cpp:236",
     "src/program/generate.cpp:1349",
-    "src/program/generate.cpp:3321"
+    "src/program/generate.cpp:3325"
    ]
   },
   "PARK_TRACE": {
@@ -1356,12 +1356,12 @@
   },
   "PCIE_SPLIT_REFINE": {
    "reads": [
-    "src/core/expert_source.cpp:3026"
+    "src/core/expert_source.cpp:3064"
    ]
   },
   "PENALTY_PROMPT": {
    "reads": [
-    "src/program/generate.cpp:12708",
+    "src/program/generate.cpp:12752",
     "src/program/plain_generate.cpp:1639"
    ]
   },
@@ -1388,29 +1388,29 @@
   },
   "PIPED_MTP": {
    "reads": [
-    "src/program/generate.cpp:4848"
+    "src/program/generate.cpp:4892"
    ]
   },
   "PIPELINE_ADAPT_ASYNC": {
    "reads": [
-    "src/program/generate.cpp:7516"
+    "src/program/generate.cpp:7560"
    ]
   },
   "PIPELINE_DEBUG": {
    "reads": [
-    "src/core/plain_model.cpp:5737",
+    "src/core/plain_model.cpp:5763",
     "src/program/generate.cpp:200"
    ]
   },
   "PIPELINE_THETA": {
    "reads": [
-    "src/core/plain_model.cpp:5738"
+    "src/core/plain_model.cpp:5764"
    ]
   },
   "PIPE_ADAPT_EVERY": {
    "reads": [
-    "src/program/generate.cpp:10568",
-    "src/program/generate.cpp:7535"
+    "src/program/generate.cpp:10612",
+    "src/program/generate.cpp:7579"
    ]
   },
   "PLAIN_CPU_SHARE": {
@@ -1421,7 +1421,7 @@
   },
   "PLAIN_DECODE_PCIE": {
    "reads": [
-    "src/core/plain_model.cpp:2558"
+    "src/core/plain_model.cpp:2584"
    ]
   },
   "PLAIN_DENSE_MMQ": {
@@ -1432,8 +1432,8 @@
   },
   "PLAIN_MMQ": {
    "reads": [
-    "src/core/plain_model.cpp:1781",
-    "src/core/plain_model.cpp:1798"
+    "src/core/plain_model.cpp:1815",
+    "src/core/plain_model.cpp:1832"
    ]
   },
   "PLAIN_PROMPT_ATTN": {
@@ -1443,17 +1443,17 @@
   },
   "PLAIN_RING": {
    "reads": [
-    "src/core/plain_model.cpp:1452"
+    "src/core/plain_model.cpp:1486"
    ]
   },
   "PLE_AUTO_MMAP": {
    "reads": [
-    "src/program/generate.cpp:4553"
+    "src/program/generate.cpp:4597"
    ]
   },
   "PLE_AUTO_RAM": {
    "reads": [
-    "src/program/generate.cpp:4507"
+    "src/program/generate.cpp:4551"
    ]
   },
   "PLE_BATCH": {
@@ -1480,12 +1480,12 @@
   },
   "PLE_PROBE": {
    "reads": [
-    "src/program/generate.cpp:4547"
+    "src/program/generate.cpp:4591"
    ]
   },
   "POOL_CORES": {
    "reads": [
-    "src/program/generate.cpp:3122",
+    "src/program/generate.cpp:3124",
     "src/program/plain_generate.cpp:3100"
    ]
   },
@@ -1496,7 +1496,7 @@
   },
   "POOL_TRACE": {
    "reads": [
-    "src/core/expert_source.cpp:3253"
+    "src/core/expert_source.cpp:3291"
    ]
   },
   "POOL_UMWAIT": {
@@ -1576,7 +1576,7 @@
   },
   "PREFILL_HELPER_SOURCE": {
    "reads": [
-    "src/program/generate.cpp:7675"
+    "src/program/generate.cpp:7719"
    ]
   },
   "PREFILL_ISSUER": {
@@ -1631,7 +1631,7 @@
   },
   "PREFILL_STAGED_3K": {
    "reads": [
-    "include/strata/core/expert_tier.hpp:265"
+    "include/strata/core/expert_tier.hpp:331"
    ]
   },
   "PREFILL_TIMING": {
@@ -1745,8 +1745,8 @@
   },
   "RAM_ADAPT": {
    "reads": [
-    "src/core/plain_model.cpp:5450",
-    "src/program/generate.cpp:13664"
+    "src/core/plain_model.cpp:5476",
+    "src/program/generate.cpp:13708"
    ]
   },
   "RAM_RESERVE_MIB": {
@@ -1762,12 +1762,12 @@
   },
   "REMOTE_SPIN": {
    "reads": [
-    "src/core/remote_experts.cpp:402"
+    "src/core/remote_experts.cpp:461"
    ]
   },
   "REMOTE_ZEROCOPY": {
    "reads": [
-    "src/core/remote_experts.cpp:260"
+    "src/core/remote_experts.cpp:299"
    ]
   },
   "REPLICA_START": {
@@ -1782,9 +1782,9 @@
   },
   "RESIDENT_PIN": {
    "reads": [
-    "src/core/plain_model.cpp:2703",
+    "src/core/plain_model.cpp:2729",
     "src/image/qi_stream.cpp:353",
-    "src/program/generate.cpp:7591"
+    "src/program/generate.cpp:7635"
    ]
   },
   "ROPE_TABLE": {
@@ -1804,7 +1804,7 @@
   },
   "ROUTE_PRIOR": {
    "reads": [
-    "src/program/generate.cpp:6123"
+    "src/program/generate.cpp:6167"
    ]
   },
   "ROUTE_PRIOR_COUNT": {
@@ -1834,9 +1834,9 @@
   },
   "ROUTE_TAIL_SKIP": {
    "reads": [
-    "src/core/expert_source.cpp:3058",
-    "src/program/generate.cpp:3618",
-    "src/program/generate.cpp:8960"
+    "src/core/expert_source.cpp:3096",
+    "src/program/generate.cpp:3655",
+    "src/program/generate.cpp:9004"
    ]
   },
   "SCRIPT_GUARD": {
@@ -1871,13 +1871,13 @@
   },
   "SENSENOVA_QSA_DENSE": {
    "reads": [
-    "src/core/plain_model.cpp:1231",
-    "src/core/plain_model.cpp:757"
+    "src/core/plain_model.cpp:1265",
+    "src/core/plain_model.cpp:756"
    ]
   },
   "SERVE_STOP_BOUND": {
    "reads": [
-    "src/program/generate.cpp:12916"
+    "src/program/generate.cpp:12960"
    ]
   },
   "SESSION_BUFFERED": {
@@ -1908,17 +1908,17 @@
   },
   "SNAPSHOT_FULL_CAPTURE": {
    "reads": [
-    "src/program/generate.cpp:12032"
+    "src/program/generate.cpp:12076"
    ]
   },
   "SNAPSHOT_VERIFY": {
    "reads": [
-    "src/program/generate.cpp:12011"
+    "src/program/generate.cpp:12055"
    ]
   },
   "SOURCE": {
    "reads": [
-    "setup.py:481",
+    "setup.py:497",
     "tools/mtp_fetch.py:50"
    ]
   },
@@ -1934,7 +1934,7 @@
   },
   "SPEC_DEPTH": {
    "reads": [
-    "src/program/generate.cpp:14292"
+    "src/program/generate.cpp:14336"
    ]
   },
   "SPEC_GUMBEL": {
@@ -1944,93 +1944,94 @@
   },
   "SPEC_WATCH": {
    "reads": [
-    "src/program/generate.cpp:15054"
+    "src/program/generate.cpp:15098"
    ]
   },
   "SPLIT_CPU_GBPS": {
    "reads": [
-    "src/core/split_predict.cpp:152"
+    "src/core/split_predict.cpp:156",
+    "src/core/split_predict.cpp:197"
    ]
   },
   "SPLIT_GAIN_PCT": {
    "reads": [
-    "src/core/plain_model.cpp:1002",
-    "src/program/generate.cpp:3940"
+    "src/core/plain_model.cpp:1029",
+    "src/program/generate.cpp:3977"
    ]
   },
   "SPLIT_HEADROOM": {
    "reads": [
-    "src/program/generate.cpp:3859"
+    "src/program/generate.cpp:3896"
    ]
   },
   "SPLIT_HEADROOM_TOL": {
    "reads": [
-    "src/program/generate.cpp:3861"
+    "src/program/generate.cpp:3898"
    ]
   },
   "SPLIT_HELPER_GAIN_PCT": {
    "reads": [
-    "src/core/plain_model.cpp:1036",
-    "src/program/generate.cpp:4004"
+    "src/core/plain_model.cpp:1070",
+    "src/program/generate.cpp:4047"
    ]
   },
   "SPLIT_LINK_ABS": {
    "reads": [
-    "src/program/generate.cpp:3584"
+    "src/program/generate.cpp:3614"
    ]
   },
   "SPLIT_MASS_EXP": {
    "reads": [
-    "src/core/plain_model.cpp:966",
-    "src/program/generate.cpp:3598"
+    "src/core/plain_model.cpp:992",
+    "src/program/generate.cpp:3628"
    ]
   },
   "SPLIT_MTP_BATCH": {
    "reads": [
-    "src/program/generate.cpp:8829"
+    "src/program/generate.cpp:8873"
    ]
   },
   "SPLIT_NEAR_TIE_PCT": {
    "reads": [
-    "src/program/generate.cpp:3904"
+    "src/program/generate.cpp:3941"
    ]
   },
   "SPLIT_ROLE": {
    "reads": [
-    "src/core/plain_model.cpp:1000",
-    "src/core/plain_model.cpp:893",
-    "src/program/generate.cpp:3936"
+    "src/core/plain_model.cpp:1027",
+    "src/core/plain_model.cpp:892",
+    "src/program/generate.cpp:3973"
    ]
   },
   "SPLIT_ROLE_AUTO": {
    "reads": [
-    "src/core/plain_model.cpp:892"
+    "src/core/plain_model.cpp:891"
    ]
   },
   "SPLIT_ROWS": {
    "reads": [
-    "src/core/plain_model.cpp:943",
-    "src/program/generate.cpp:3593"
+    "src/core/plain_model.cpp:969",
+    "src/program/generate.cpp:3623"
    ]
   },
   "SPLIT_SPEED_SCALE": {
    "reads": [
-    "src/program/generate.cpp:3554"
+    "src/program/generate.cpp:3561"
    ]
   },
   "SPLIT_TIMING": {
    "reads": [
-    "src/program/generate.cpp:14265"
+    "src/program/generate.cpp:14309"
    ]
   },
   "SSD_KEEPALIVE": {
    "reads": [
-    "src/program/generate.cpp:4486"
+    "src/program/generate.cpp:4530"
    ]
   },
   "SSD_KEEPALIVE_WINDOW": {
    "reads": [
-    "src/program/generate.cpp:4487"
+    "src/program/generate.cpp:4531"
    ]
   },
   "STAGER_RING": {
@@ -2066,13 +2067,13 @@
   },
   "STATE_HASH": {
    "reads": [
-    "src/program/generate.cpp:14026"
+    "src/program/generate.cpp:14070"
    ]
   },
   "STATE_HASH_GDN": {
    "reads": [
     "src/prefill/prefill.cpp:4613",
-    "src/program/generate.cpp:14057"
+    "src/program/generate.cpp:14101"
    ]
   },
   "SUB_GROUP_32": {
@@ -2082,12 +2083,12 @@
   },
   "TAIL_SKIP_MAX_CACHED": {
    "reads": [
-    "src/program/generate.cpp:8968"
+    "src/program/generate.cpp:9012"
    ]
   },
   "TEST_CACHE_FAIL": {
    "reads": [
-    "src/program/generate.cpp:6062"
+    "src/program/generate.cpp:6106"
    ]
   },
   "TEST_PAGEABLE": {
@@ -2122,12 +2123,12 @@
     "src/prefill/gemm.cpp:262",
     "src/prefill/prefill.cpp:2684",
     "src/program/generate.cpp:1232",
-    "src/program/generate.cpp:9556"
+    "src/program/generate.cpp:9600"
    ]
   },
   "TRACE_ADAPT": {
    "reads": [
-    "src/program/generate.cpp:14910"
+    "src/program/generate.cpp:14954"
    ]
   },
   "TRAIN_CONTROL_MS": {
@@ -2170,7 +2171,7 @@
   },
   "UMA_HEADROOM_GIB": {
    "reads": [
-    "src/core/device.cpp:1164"
+    "src/core/device.cpp:1174"
    ]
   },
   "UNDECLARED_TOOL_CALLS": {
@@ -2180,7 +2181,7 @@
   },
   "USAGE_SEED": {
    "reads": [
-    "include/strata/core/expert_tier.hpp:229"
+    "include/strata/core/expert_tier.hpp:295"
    ]
   },
   "VERIFY_DEBUG": {
@@ -2190,7 +2191,7 @@
   },
   "VERIFY_DEVICE_PLAN": {
    "reads": [
-    "src/core/expert_source.cpp:3469",
+    "src/core/expert_source.cpp:3507",
     "src/core/verify.cpp:790"
    ]
   },
@@ -2228,7 +2229,7 @@
   "VRAM_LIMIT_MIB": {
    "reads": [
     "serve/server.py:3637",
-    "src/core/device.cpp:999"
+    "src/core/device.cpp:1009"
    ]
   },
   "W8_FUSED": {
@@ -2259,7 +2260,7 @@
   },
   "WSL_PCIE_SPLIT": {
    "reads": [
-    "src/core/plain_model.cpp:2531"
+    "src/core/plain_model.cpp:2557"
    ]
   },
   "XESTRATA_APP_DIR": {
@@ -2277,6 +2278,13 @@
     "tools/package/container.sh:278",
     "tools/package/gui.sh:113",
     "tools/package/windows.sh:191"
+   ]
+  },
+  "XESTRATA_CUDNN_CACHE": {
+   "reads": [
+    "tools/lint/cudnn-headers.sh:19",
+    "tools/lint/cudnn-headers.sh:23",
+    "tools/lint/cudnn-headers.sh:34"
    ]
   },
   "XESTRATA_DISTRO": {
@@ -2308,7 +2316,7 @@
   },
   "XESTRATA_LINT_BUILD": {
    "reads": [
-    "tools/lint/run.sh:13"
+    "tools/lint/run.sh:15"
    ]
   },
   "XESTRATA_NONFREE": {
