@@ -141,14 +141,19 @@ struct GpuModel {
     int primary_gpu = 0;
     int planned_chunk = 2048;
     bool has_vision = false;
+    bool draft_enabled = false;
     double vram_experts_gb_cap = -1.0;  // >= 0: --vram-experts-gb total cap across all selected GPUs (GiB)
     double ram_experts_gb_cap = -1.0;   // >= 0: --ram-experts-gb host RAM cap (GiB)
+    std::string layer_split_spec;       // "" = default EP, "auto" or "K1,K2,..." = layer-partitioned multi-GPU
+    std::vector<int> layer_split_counts;
+    std::vector<int> layer_owner;       // [42] -> GPU ordinal 0..ng-1 when layer_split is active
     std::vector<int> peer_devs;   // secondary GPU device ids for multi-GPU expert split (--gpus 0,1,...)
     std::vector<PeerGpu> peers;
 #ifdef STRATA_HY4_DISTRIBUTED
     int expert_shard = -1;
 #endif
     uint8_t* d_trunk = nullptr;   // Section 1
+    uint8_t* h_trunk_mapped = nullptr;  // pinned mapped host trunk fallback on 4 GB / tight 6 GB discrete GPUs
     uint8_t* d_sec4 = nullptr;    // Section 4 (expert bodies), 4 KiB aligned bodies, same offsets as the file's directory
     uint64_t trunk_bytes = 0, sec4_bytes = 0;
     std::vector<ExpertRef> experts;  // [41*512] indexed by moe_layer*512 + expert_id
@@ -405,9 +410,27 @@ inline void hy4_setenv(const char* k, const char* v, int) {
 #endif
 }
 
-inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& model_path, bool multi_gpu = false, bool has_vision = false, int n_peers = 0, size_t min_peer_total = 0) {
+inline double wddm_vram_floor_gb(size_t total_bytes) {
+    const double tot_gib = (double)total_bytes / 1073741824.0;
+#ifdef _WIN32
+    // Hard Windows WDDM free-VRAM floor so desktop compositor, cuBLAS, and driver context never page or OOM (#6528):
+    // >= 12 GB cards keep >= 1.0 GiB free; 6-8 GB cards keep >= 600 MiB; 4 GB cards keep >= 450 MiB.
+    if (tot_gib >= 11.0) return 1.074;  // 1.00 GiB
+    if (tot_gib >= 5.5)  return 0.644;  // 600 MiB
+    return 0.483;                       // 450 MiB
+#else
+    if (tot_gib >= 11.0) return 0.50;
+    if (tot_gib >= 5.5)  return 0.35;
+    return 0.25;
+#endif
+}
+
+inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& model_path, bool multi_gpu = false, bool has_vision = false, int n_peers = 0, size_t min_peer_total = 0, size_t free_bytes = 0, bool has_draft = true) {
     const double GB = 1e9, tot = (double)total / GB;
+    const double free_gb = (free_bytes > 0 && free_bytes <= total) ? ((double)free_bytes / GB) : tot;
+    const double eff_tot = std::min(tot, free_gb + 0.35);
     const double min_card_gb = (multi_gpu && min_peer_total > 0) ? std::min(tot, (double)min_peer_total / GB) : tot;
+    const double wddm_floor = wddm_vram_floor_gb(total);
     double trunk = 5.92, sec4_gb = 0.0;
     if (!model_path.empty()) {
         strata::artifact::StrataFileReader rd;
@@ -421,45 +444,52 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     const bool host_embed = !getenv("HY4_EMBED_VRAM") && (total < (48ull << 30));
     if (host_embed && trunk > 0.5) trunk -= 0.38;
     // Sparse KV (no Vt: 1152 B/slot) + IndexPool (576 B/slot) = 1728 B/slot * 12 layers = 20,736 B/token.
-    // On single discrete cards (< 48 GB) with max_ctx > 16384, allocate sparse KV + IndexPool in 16,384-token VRAM increments
-    // (reclaiming adaptive vcache slabs as KV grows). On multi-GPU static EP (no vcache slabs), reserve full max_ctx KV upfront so 128K stays in VRAM.
+    // Elastic KV initial sizing on single discrete cards (< 48 GB) so idle KV never starves hot experts on 4-12 GB cards:
+    //   <= 8 GB -> init 4096 (step 4096); 12 GB -> init 8192 (step 8192); 16..32 GB -> init 16384 (step 16384).
     const double per_pos = 12.0 * 1152.0 + 12.0 * 512.0 + 12.0 * 64.0;  // 20,736 B per token across 12 sparse layers
     int init_slots = max_ctx;
-    if (!multi_gpu && !getenv("HY4_KV_NO_GROW") && total < (48ull << 30) && max_ctx > 16384) {
-        init_slots = 16384;
-        if (getenv("HY4_KV_INIT_SLOTS")) init_slots = std::max(4096, std::min(max_ctx, atoi(getenv("HY4_KV_INIT_SLOTS"))));
-        else {
-            char b[16];
-            snprintf(b, sizeof b, "%d", init_slots);
-            hy4_setenv("HY4_KV_INIT_SLOTS", b, 1);
+    int kv_step = 16384;
+    if (!multi_gpu && !getenv("HY4_KV_NO_GROW") && total < (48ull << 30)) {
+        const int target_init = (tot <= 9.0) ? 4096 : (tot <= 13.5 ? 8192 : 16384);
+        kv_step = target_init;
+        if (max_ctx > target_init) {
+            init_slots = target_init;
+            if (getenv("HY4_KV_INIT_SLOTS")) init_slots = std::max(2048, std::min(max_ctx, atoi(getenv("HY4_KV_INIT_SLOTS"))));
+            else {
+                char b[16];
+                snprintf(b, sizeof b, "%d", init_slots);
+                hy4_setenv("HY4_KV_INIT_SLOTS", b, 1);
+            }
+        }
+        if (!getenv("HY4_KV_STEP_SLOTS")) {
+            char bs[16];
+            snprintf(bs, sizeof bs, "%d", kv_step);
+            hy4_setenv("HY4_KV_STEP_SLOTS", bs, 1);
         }
     }
     const double kv_init_gb = (double)((init_slots + 8 + 15) / 16 * 16) * per_pos / GB;
     const double wkv = 0.03;  // single-layer reusable FP16 wk/wv prefill scratch (28 MiB)
-    const double cublas_gb = HY4_CUDA ? 0.08 : 0.0;  // 64 MiB reusable side-stream FP16 dequant + cuBLAS scratch
+    const double cublas_gb = HY4_CUDA ? 0.12 : 0.0;  // reusable side-stream FP16 dequant + cuBLAS workspace/handles
+    const double dfly_gb = has_draft ? 0.28 : 0.0;  // DFly2 runtime KV/logit/graph buffers (allocated AFTER Runner::init)
     auto est_work_gb = [&](int c) {
         // Aliased work_arena (max(2*c*16384*4, moe_ws_bytes(c))) + qa_h/H1/x/z/etc (~0.195 MB/tok) + SWA rings (30*(512+c)*1152 B) + misc 0.22 GB
         const double arena = std::max(2.0 * c * 16384.0 * 4.0, (double)c * 16.0 * 1536.0 * 6.0) / GB;
         return arena + c * 0.195e6 / GB + 0.22 + 30.0 * (512.0 + c) * 1152.0 / GB;
     };
     if (chunk <= 0) {
-        // 16..32 GB cards default to Tc = 4096 (maximizes AdaptiveExpertCache by +1.6 GB / +450-600 VRAM slots over Tc = 8192);
-        // 48 GB+ cards default to Tc = 8192 when ctx >= 8192 (halves PCIe passes at 128K).
-        // Multi-GPU 32 GB static EP at >=96K context uses Tc = 2048 so 100% of SQ-64 experts + full 128K KV fit in HBM2 (e.g. 2x V100 32 GB).
-        // Heterogeneous multi-GPU with a smaller peer card (< 14 GB, e.g. 2x V100 16 GB + TITAN V 12 GB) caps Tc <= 4096 so peer moe_ws stays <= 0.6 GB.
         int c = (multi_gpu && max_ctx >= 98304 && tot < 40.0) ? 2048
               : (tot >= 44.0 ? ((max_ctx >= 8192) ? 8192 : 4096)
-              : (tot >= 15.0 ? 4096 : (tot >= 11.0 ? 2048 : 1024)));
+              : (tot >= 15.0 ? 4096 : (tot >= 11.0 ? 2048 : (tot >= 7.0 ? 1024 : 512))));
         if (multi_gpu && min_card_gb < 14.0 && c > 4096) c = 4096;
         if (multi_gpu && min_card_gb < 10.0 && c > 2048) c = 2048;
-        const double work_cap = (tot >= 15.0) ? 0.22 : 0.16;
-        while (c > 256 && est_work_gb(c) > work_cap * tot) c >>= 1;
-        while (c > 256 && trunk + est_work_gb(c) + kv_init_gb + wkv + cublas_gb + 0.55 > tot) c >>= 1;
+        const double work_cap = (tot >= 15.0) ? 0.22 : (tot >= 7.0 ? 0.16 : 0.14);
+        while (c > 256 && est_work_gb(c) > work_cap * eff_tot) c >>= 1;
+        while (c > 256 && trunk + est_work_gb(c) + kv_init_gb + wkv + cublas_gb + dfly_gb + wddm_floor > eff_tot) c >>= 1;
         // Preserve 100%-resident placement when a smaller chunk keeps all experts + full KV in VRAM (e.g. SQ-96 128K on 96 GB card)
         if (sec4_gb > 0.0 && c > 4096) {
             const double kv_full = (double)((max_ctx + 8 + 15) / 16 * 16) * per_pos / GB;
-            if (trunk + sec4_gb + est_work_gb(c) + kv_full + wkv + cublas_gb + 0.55 > tot &&
-                trunk + sec4_gb + est_work_gb(c >> 1) + kv_full + wkv + cublas_gb + 0.55 <= tot)
+            if (trunk + sec4_gb + est_work_gb(c) + kv_full + wkv + cublas_gb + dfly_gb + wddm_floor > eff_tot &&
+                trunk + sec4_gb + est_work_gb(c >> 1) + kv_full + wkv + cublas_gb + dfly_gb + wddm_floor <= eff_tot)
                 c >>= 1;
         }
         chunk = c;
@@ -468,14 +498,15 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     const double rows = 12.0 * slots * 1152.0 / GB;                                                         // full max_ctx sparse-layer KV rows (no Vt)
     const double pivg = 12.0 * (double)max_ctx * 512.0 / GB + 12.0 * (double)(max_ctx / 4 + 8) * 256.0 / GB;  // full max_ctx IndexPool iv/ig + pooled keys
     const double work_gb = est_work_gb(chunk);
-    // Check if full max_ctx KV fits in VRAM; if not and card is very small (8 GB), set dev_pos for VRAM-to-host spill
+    // Check if initial elastic KV fits in VRAM with WDDM floor + DFly2; on 4-6 GB cards (where trunk spills or barely fits), put KV in pinned host RAM.
+    const double trunk_in_vram = (eff_tot < trunk + wddm_floor + 0.50) ? 0.0 : trunk;
     int mask = 0;
-    if (trunk + work_gb + pivg + rows + wkv + cublas_gb + 0.35 > tot) mask |= 1;
+    if (trunk_in_vram + work_gb + pivg + rows + wkv + cublas_gb + dfly_gb + wddm_floor > eff_tot) mask |= 1;
     long dev_pos = 0;
     if ((mask & 1) && !getenv("HY4_KV_HOST")) {
-        const double avail = tot - trunk - work_gb - wkv - cublas_gb - 0.35;
+        const double avail = eff_tot - trunk_in_vram - work_gb - wkv - cublas_gb - dfly_gb - wddm_floor;
         dev_pos = avail > 0 ? (long)(avail * GB / per_pos) / 1024 * 1024 : 0;
-        if (dev_pos >= 4096 && dev_pos < max_ctx) {
+        if (dev_pos >= 4096 && dev_pos < max_ctx && trunk_in_vram > 0.0) {
             mask &= ~1;
             char b[16];
             snprintf(b, sizeof b, "%ld", dev_pos);
@@ -492,24 +523,27 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         char b[32];
         const double host_kv = ((mask & 1) || dev_pos) ? (rows + (dev_pos ? pivg : 0.0)) : 0.0;
         const double host_emb = host_embed ? 0.40 : 0.0;
+        const double host_trunk = (trunk_in_vram == 0.0) ? trunk : 0.0;
         const double host_bounce = (tot < 48.0) ? ((tot >= 20.0) ? 0.82 : 0.55) : 0.0;  // 2 x 384 MiB (>= 20 GiB) or 2 x 256 MiB pinned prefill bounce ring
-        snprintf(b, sizeof b, "%.2f", host_kv + host_emb + host_bounce + 0.3);
+        snprintf(b, sizeof b, "%.2f", host_kv + host_emb + host_trunk + host_bounce + 0.35);
         hy4_setenv("HY4_HOST_NEED_GB", b, 1);
     }
     if (!getenv("HY4_RESERVE_GB")) {
         const double kv_res = (mask & 1) ? 0.0 : (init_slots < max_ctx ? kv_init_gb : (dev_pos ? dev_pos * per_pos / GB : (rows + pivg)));
         const double pf_res = (tot >= 21.5 && tot < 64.0 && mask == 0) ? 0.82 : ((tot >= 10.0 && tot < 64.0 && mask == 0) ? 0.56 : 0.0);  // 2 x 384 MiB (>= 21.5 GiB) or 2 x 256 MiB device scratch for prefill streaming
-        const double vis_res = (multi_gpu && has_vision) ? 1.15 : 0.0;  // multi-GPU static EP has no dynamic vcache slabs to reclaim on first image
+        // On <= 14 GB single GPUs Vision loads on-demand and evicts immediately after encoding (reclaiming vcache slabs if needed);
+        // on multi-GPU static EP (no vcache slabs to reclaim) or large GPUs, reserve Vision upfront when requested.
+        const double vis_res = (multi_gpu && has_vision) ? 1.15 : 0.0;
         const int eff_peers = std::max(n_peers, multi_gpu ? 1 : 0);
         // Primary-GPU headroom for peer output buffers (d_zpeer0), DFly2 buffers, batch-invariant MLA workspace, and CUDA Graph capture handles
-        const double peer_graph_res = multi_gpu ? ((double)eff_peers * ((double)chunk * 1536.0 * 4.0 / GB + 0.05) + 0.25) : 0.15;
-        const double reserve = work_gb + kv_res + wkv + cublas_gb + pf_res + vis_res + peer_graph_res + 0.45;
+        const double peer_graph_res = multi_gpu ? ((double)eff_peers * ((double)chunk * 1536.0 * 4.0 / GB + 0.05) + 0.30) : 0.20;
+        const double reserve = work_gb + kv_res + wkv + cublas_gb + dfly_gb + pf_res + vis_res + peer_graph_res + wddm_floor;
         char b[32];
         snprintf(b, sizeof b, "%.2f", reserve);
         hy4_setenv("HY4_RESERVE_GB", b, 1);
     }
-    fprintf(stderr, "[plan] ctx %d (init %d) chunk %d: buffers ~%.2f GB, KV+idx %.2f GB (128K full %.2f GB), kv_b scratch %.2f GB, trunk %.2f GB%s on a %.1f GB card -> host mask %d; reserve %s GB\n",
-            max_ctx, init_slots, chunk, work_gb, kv_init_gb, rows + pivg, wkv, trunk, host_embed ? " (embed in RAM)" : "", tot, atoi(getenv("HY4_KV_HOST")), getenv("HY4_RESERVE_GB"));
+    fprintf(stderr, "[plan] ctx %d (init %d) chunk %d: buffers ~%.2f GB, KV+idx %.2f GB (128K full %.2f GB), dfly %.2f GB, floor %.2f GB, trunk %.2f GB%s on %.1f/%.1f GB -> host mask %d; reserve %s GB\n",
+            max_ctx, init_slots, chunk, work_gb, kv_init_gb, rows + pivg, dfly_gb, wddm_floor, trunk, host_embed ? " (embed in RAM)" : "", free_gb, tot, atoi(getenv("HY4_KV_HOST")), getenv("HY4_RESERVE_GB"));
     if (dev_pos) fprintf(stderr, "[plan] growable KV: up to %ld positions stay in VRAM, moves to pinned host memory if context exceeds that\n", dev_pos);
     return chunk;
 }
@@ -751,15 +785,27 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     bool cgroup_limited = false;
     const double lim_gb = ram_limit_gb(&cgroup_limited), avail_gb = ram_avail_gb();
     double ram_budget_gb = 0.0;
-    if (cpu_mode) {
-        if (const char* rb = getenv("HY4_RAM_BUDGET_GB") ? getenv("HY4_RAM_BUDGET_GB") : getenv("STRATA_HY4_RAM_GB"))
+    {
+        // Compute safe RAM budget on BOTH Windows and Linux so swap is 0 (#6556, #6528):
+        // reserve OS + WDDM commit headroom + Vision + Engram LRU + ColdStore + host KV/bounce.
+        if (const char* rb = getenv("HY4_RAM_BUDGET_GB") ? getenv("HY4_RAM_BUDGET_GB") : getenv("STRATA_HY4_RAM_GB")) {
             ram_budget_gb = std::max(0.0, atof(rb));
-        else {
+        } else {
             const double need = getenv("HY4_HOST_NEED_GB") ? atof(getenv("HY4_HOST_NEED_GB")) : 0.0;
-            const double engram_gb = getenv("HY4_ENGRAM_CACHE_MIB") ? std::max(0.0, atof(getenv("HY4_ENGRAM_CACHE_MIB")) / 1024.0) : 0.85;
-            const double vis_extra = (cgroup_limited && g.has_vision) ? 1.5 : 0.0;  // vision shard (0.93 GB) + serve/server.py RSS inside cgroup limit
-            const double by_total = lim_gb - 3.5 - need - engram_gb - 0.65 - vis_extra;  // OS and runtime, host KV / kv_b copies, engram cache + pinned staging
-            const double by_avail = avail_gb - 2.0 - need - engram_gb - 0.50 - vis_extra;  // live MemAvailable / ullAvailPhys headroom (prevents swapping on 64 GB hosts)
+            const double def_eng_mib = (lim_gb <= 20.0) ? 128.0 : (lim_gb <= 40.0 ? 256.0 : (lim_gb <= 72.0 ? 512.0 : 850.0));
+            const double engram_gb = getenv("HY4_ENGRAM_CACHE_MIB") ? std::max(0.0, atof(getenv("HY4_ENGRAM_CACHE_MIB")) / 1024.0) : (def_eng_mib / 1024.0);
+            const double vis_extra = g.has_vision ? 1.25 : 0.0;  // Vision shard (0.93 GB) + decode scratch
+#ifdef _WIN32
+            const double os_tot_res = std::max(4.5, 0.10 * lim_gb);
+            const double os_avail_res = std::max(3.0, 0.06 * lim_gb);
+            const double by_total = lim_gb - os_tot_res - need - engram_gb - 0.85 - vis_extra;
+            const double by_avail = avail_gb - os_avail_res - need - engram_gb - 0.65 - vis_extra;
+#else
+            const double os_tot_res = std::max(3.5, 0.06 * lim_gb);
+            const double os_avail_res = std::max(2.2, 0.04 * lim_gb);
+            const double by_total = lim_gb - os_tot_res - need - engram_gb - 0.65 - vis_extra;
+            const double by_avail = avail_gb - os_avail_res - need - engram_gb - 0.50 - vis_extra;
+#endif
             ram_budget_gb = std::max(0.0, (avail_gb > 0.5) ? std::min(by_total, by_avail) : by_total);
         }
         if (g.ram_experts_gb_cap >= 0.0) {
@@ -773,6 +819,14 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         const uint64_t sz = al(dir[i].body_bytes);
         all_al_bytes += sz;
         max_body_sz = std::max<size_t>(max_body_sz, (size_t)sz);
+    }
+    // Cross-platform (Windows + Linux + macOS) automatic SSD cold-expert tier (#6556, #6528):
+    // whenever host experts exceed safe MemAvailable / ullAvailPhys, auto-enable cpu_mode so ColdStore streams cold tail from SSD with 0 swap!
+    const uint64_t est_host_need = all_al_bytes > vram_budget ? (all_al_bytes - vram_budget) : 0;
+    if (!cpu_mode && est_host_need > ram_budget_bytes) {
+        cpu_mode = true;
+        fprintf(stderr, "[load] host experts %.1f GB exceed safe RAM budget %.1f GB (avail %.1f / %.1f GiB); auto-enabling 4-tier CPU + SSD cold-expert streaming\n",
+                est_host_need / 1e9, ram_budget_gb, avail_gb, lim_gb);
     }
     double dyn_frac = (ng == 1) ? 1.0 : 0.0;
     if (ng == 1) {
@@ -877,18 +931,84 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
             fprintf(stderr, "\n");
         }
     }
+    // Compute optional --layer-split auto|K1,K2,... layer ownership across GPUs so each layer's experts stay contiguous
+    // on one GPU (eliminating per-layer cross-EPYC-root synchronization barriers on non-NVLink / unequal multi-GPU rigs!).
+    g.layer_split_counts.clear();
+    g.layer_owner.clear();
+    if (ng >= 2 && !g.layer_split_spec.empty()) {
+        std::vector<int> counts(ng, 0);
+        if (g.layer_split_spec == "auto") {
+            std::vector<double> wt(ng, 1.0);
+            double wsum = 0.0;
+            for (size_t gi = 0; gi < ng; ++gi) {
+                wt[gi] = std::max(0.25, (double)vcap[gi] / 1073741824.0);
+                wsum += wt[gi];
+            }
+            int assigned = 0;
+            for (size_t gi = 0; gi < ng; ++gi) {
+                counts[gi] = std::max(1, (int)std::lround(42.0 * wt[gi] / std::max(wsum, 1e-6)));
+                assigned += counts[gi];
+            }
+            while (assigned > 42) {
+                size_t best = 0;
+                for (size_t gi = 1; gi < ng; ++gi) if (counts[gi] > counts[best]) best = gi;
+                if (counts[best] > 1) { --counts[best]; --assigned; } else break;
+            }
+            while (assigned < 42) {
+                size_t best = 0;
+                for (size_t gi = 1; gi < ng; ++gi) if (wt[gi] > wt[best]) best = gi;
+                ++counts[best]; ++assigned;
+            }
+        } else {
+            size_t pos = 0, gi = 0;
+            int sum = 0;
+            while (pos < g.layer_split_spec.size() && gi < ng) {
+                int v = std::max(0, atoi(g.layer_split_spec.c_str() + pos));
+                counts[gi++] = v;
+                sum += v;
+                size_t q = g.layer_split_spec.find(',', pos);
+                if (q == std::string::npos) break;
+                pos = q + 1;
+            }
+            if (gi != ng || sum != 42) {
+                fprintf(stderr, "[load] --layer-split %s invalid for %zu GPUs (must sum to 42); ignoring\n", g.layer_split_spec.c_str(), ng);
+                counts.clear();
+            }
+        }
+        if (counts.size() == ng) {
+            g.layer_split_counts = counts;
+            g.layer_owner.assign(42, 0);
+            int cur = 0;
+            fprintf(stderr, "[load] --layer-split active across %zu GPUs:", ng);
+            for (size_t gi = 0; gi < ng; ++gi) {
+                const int dev = gi == 0 ? g.primary_gpu : g.peer_devs[gi - 1];
+                fprintf(stderr, " GPU%d=%d layers[%d..%d]", dev, counts[gi], cur, cur + counts[gi] - 1);
+                for (int k = 0; k < counts[gi] && cur < 42; ++k) g.layer_owner[cur++] = (int)gi;
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     uint64_t hb = 0;
+    const bool use_layer_owner = (g.layer_owner.size() == 42);
     for (size_t r = 0; r < 512; ++r) {
         bool any_placed = false;
         for (size_t L = 0; L < N / 512; ++L) {
             size_t i = L * 512 + r;
             uint64_t sz = al(dir[i].body_bytes);
             int best_g = -1;
-            double best_frac = -1.0;
-            for (size_t gi = 0; gi < ng; ++gi) {
-                if (vcap[gi] > 0 && vb_gpu[gi] + sz <= vcap[gi]) {
-                    const double frac = (double)(vcap[gi] - vb_gpu[gi]) / (double)vcap[gi];
-                    if (frac > best_frac) { best_frac = frac; best_g = (int)gi; }
+            if (use_layer_owner) {
+                const int pref = g.layer_owner[L + 1];
+                if (pref >= 0 && (size_t)pref < ng && vcap[pref] > 0 && vb_gpu[pref] + sz <= vcap[pref]) {
+                    best_g = pref;
+                }
+            }
+            if (best_g < 0 && !use_layer_owner) {
+                double best_frac = -1.0;
+                for (size_t gi = 0; gi < ng; ++gi) {
+                    if (vcap[gi] > 0 && vb_gpu[gi] + sz <= vcap[gi]) {
+                        const double frac = (double)(vcap[gi] - vb_gpu[gi]) / (double)vcap[gi];
+                        if (frac > best_frac) { best_frac = frac; best_g = (int)gi; }
+                    }
                 }
             }
             if (best_g >= 0) {
@@ -900,7 +1020,35 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
                 any_placed = true;
             }
         }
-        if (!any_placed) break;
+        if (!any_placed && !use_layer_owner) break;
+    }
+    // Second pass for --layer-split: if any GPU still has free VRAM headroom after filling its owned layers, fill leftover hottest experts
+    if (use_layer_owner) {
+        for (size_t r = 0; r < 512; ++r) {
+            bool any_placed = false;
+            for (size_t L = 0; L < N / 512; ++L) {
+                size_t i = L * 512 + r;
+                if (owner[i] >= 0) continue;
+                uint64_t sz = al(dir[i].body_bytes);
+                int best_g = -1;
+                double best_frac = -1.0;
+                for (size_t gi = 0; gi < ng; ++gi) {
+                    if (vcap[gi] > 0 && vb_gpu[gi] + sz <= vcap[gi]) {
+                        const double frac = (double)(vcap[gi] - vb_gpu[gi]) / (double)vcap[gi];
+                        if (frac > best_frac) { best_frac = frac; best_g = (int)gi; }
+                    }
+                }
+                if (best_g >= 0) {
+                    owner[i] = best_g;
+                    tier[i] = (best_g == 0) ? 0 : 4;
+                    off[i] = vb_gpu[best_g];
+                    vb_gpu[best_g] += sz;
+                    ++nv_gpu[best_g];
+                    any_placed = true;
+                }
+            }
+            if (!any_placed) break;
+        }
     }
     uint64_t vb = vb_gpu[0];
     // Size adaptive vcache slots to the largest remaining non-VRAM (tier != 0) expert so static S6/S8 hot experts do not bloat dynamic slot stride!
@@ -1066,15 +1214,17 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     }
     g.t_load_experts = now_s() - t0;
     if (g.peers.empty()) {
-        fprintf(stderr, "[load] experts tiered: %llu static VRAM (%.2f GB) + %d adaptive VRAM slots (%.2f GB) = %.2f GB VRAM, %llu in %s (%.2f GB), %.1f s\n",
+        const double ram_gb_shown = cpu_mode ? (double)(g.sec4_bytes > vb + cold_bytes ? g.sec4_bytes - vb - cold_bytes : 0) / 1e9 : hb / 1e9;
+        fprintf(stderr, "[load] experts 4-tier: %llu static VRAM (%.2f GB) + %d adaptive VRAM slots (%.2f GB) = %.2f GB VRAM, %llu in %s (%.2f GB), %llu on SSD (%.2f GB), %.1f s\n",
                 (unsigned long long)n_v, vb / 1e9, dyn_slots, dyn_bytes / 1e9, total_vram_arena / 1e9, (unsigned long long)n_h,
-                cpu_mode ? "host RAM computed by the CPU" : "pinned host memory read by the GPU", cpu_mode ? (double)(g.sec4_bytes - vb) / 1e9 : hb / 1e9, g.t_load_experts);
+                cpu_mode ? "RAM (CPU)" : "pinned host (GPU)", ram_gb_shown, (unsigned long long)n_cold, cold_bytes / 1e9, g.t_load_experts);
     } else {
         uint64_t tot_vram_b = vb, tot_vram_n = n_v;
         for (const auto& pr : g.peers) { tot_vram_b += pr.vram_bytes; tot_vram_n += pr.n_experts; }
+        const double ram_gb_shown = (double)(g.sec4_bytes > tot_vram_b + cold_bytes ? g.sec4_bytes - tot_vram_b - cold_bytes : 0) / 1e9;
         fprintf(stderr, "[load] multi-GPU experts (%zu GPUs): total %llu in VRAM (%.2f GB: GPU%d=%llu/%.2fGB", ng, (unsigned long long)tot_vram_n, tot_vram_b / 1e9, g.primary_gpu, (unsigned long long)n_v, vb / 1e9);
         for (const auto& pr : g.peers) fprintf(stderr, ", GPU%d=%llu/%.2fGB", pr.dev, (unsigned long long)pr.n_experts, pr.vram_bytes / 1e9);
-        fprintf(stderr, "), %llu in host/CPU (%.2f GB), %.1f s\n", (unsigned long long)n_h, (double)(g.sec4_bytes > tot_vram_b ? g.sec4_bytes - tot_vram_b : 0) / 1e9, g.t_load_experts);
+        fprintf(stderr, "), %llu in RAM (%.2f GB), %llu on SSD (%.2f GB), %.1f s\n", (unsigned long long)n_h, ram_gb_shown, (unsigned long long)n_cold, cold_bytes / 1e9, g.t_load_experts);
     }
     return true;
 }
@@ -1121,16 +1271,24 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
                 const uint64_t p2_dst = e1 - shift;
                 const uint64_t p2_len = g.trunk_bytes - e1;
                 const uint64_t new_trunk = (p2_dst + p2_len + 4095) & ~4095ull;
-                HCK(hipMalloc((void**)&g.d_trunk, new_trunk));
-                double t1 = 0, t2 = 0;
-                if (e0 > 0) stream_to_device(path, h.sections[1].file_offset, e0, g.d_trunk, &t1, "trunk-a");
-                if (p2_len > 0) stream_to_device(path, h.sections[1].file_offset + e1, p2_len, g.d_trunk + p2_dst, &t2, "trunk");
-                for (auto& kv : g.man.T)
-                    if (kv.second.off >= e1) kv.second.off -= shift;
-                g.trunk_bytes = new_trunk;
-                g.t_load_trunk = t1 + t2;
-                loaded_host_embed = true;
-                fprintf(stderr, "[load] embed_tokens (%.2f GB) in pinned mapped host RAM -> trunk VRAM %.2f GB\n", emb.bytes / 1e9, new_trunk / 1e9);
+                const uint64_t floor_b = (uint64_t)(wddm_vram_floor_gb(tot0) * 1e9);
+                const bool trunk_fits_vram = (fr0 > new_trunk + floor_b + (256ull << 20));
+                if (trunk_fits_vram && hipMalloc((void**)&g.d_trunk, new_trunk) == hipSuccess) {
+                    double t1 = 0, t2 = 0;
+                    if (e0 > 0) stream_to_device(path, h.sections[1].file_offset, e0, g.d_trunk, &t1, "trunk-a");
+                    if (p2_len > 0) stream_to_device(path, h.sections[1].file_offset + e1, p2_len, g.d_trunk + p2_dst, &t2, "trunk");
+                    for (auto& kv : g.man.T)
+                        if (kv.second.off >= e1) kv.second.off -= shift;
+                    g.trunk_bytes = new_trunk;
+                    g.t_load_trunk = t1 + t2;
+                    loaded_host_embed = true;
+                    fprintf(stderr, "[load] embed_tokens (%.2f GB) in pinned mapped host RAM -> trunk VRAM %.2f GB\n", emb.bytes / 1e9, new_trunk / 1e9);
+                } else {
+                    (void)hipGetLastError();
+                    hipHostFree(g.h_embed);
+                    g.h_embed = nullptr;
+                    g.d_embed_mapped = nullptr;
+                }
             } else {
                 hipHostFree(g.h_embed);
                 g.h_embed = nullptr;
@@ -1154,18 +1312,49 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
                 stream_to_device(path, h.sections[1].file_offset, g.trunk_bytes, g.d_trunk, &g.t_load_trunk, "trunk");
             }
         } else {
-            HCK(hipMalloc((void**)&g.d_trunk, trunk_al));
-            stream_to_device(path, h.sections[1].file_offset, g.trunk_bytes, g.d_trunk, &g.t_load_trunk, "trunk");
+            const uint64_t floor_b = (uint64_t)(wddm_vram_floor_gb(tot0) * 1e9);
+            if (fr0 > trunk_al + floor_b + (256ull << 20) && hipMalloc((void**)&g.d_trunk, trunk_al) == hipSuccess) {
+                stream_to_device(path, h.sections[1].file_offset, g.trunk_bytes, g.d_trunk, &g.t_load_trunk, "trunk");
+            } else {
+                (void)hipGetLastError();
+                void* hp = nullptr;
+                if (hipHostMalloc(&hp, trunk_al, hipHostMallocMapped) != hipSuccess) {
+                    (void)hipGetLastError();
+                    fprintf(stderr, "trunk alloc failed (%.2f GB, free VRAM %.2f GiB)\n", trunk_al / 1e9, fr0 / 1073741824.0);
+                    return false;
+                }
+                g.h_trunk_mapped = (uint8_t*)hp;
+                read_file_parallel(path, h.sections[1].file_offset, g.trunk_bytes, g.h_trunk_mapped, &g.t_load_trunk, "trunk(host-mapped-4gb)");
+                HCK(hipHostGetDevicePointer((void**)&g.d_trunk, g.h_trunk_mapped, 0));
+                fprintf(stderr, "[load] low-VRAM GPU (%.1f GiB free): trunk (%.2f GB) in pinned mapped host RAM -> 0 VRAM expert slots\n",
+                        fr0 / 1073741824.0, trunk_al / 1e9);
+            }
         }
 #else
         if (uma_mapped) {
             void* hp = nullptr;
             HCK(hipHostMalloc(&hp, trunk_al, hipHostMallocMapped));
+            g.h_trunk_mapped = (uint8_t*)hp;
             read_file_parallel(path, h.sections[1].file_offset, g.trunk_bytes, (uint8_t*)hp, &g.t_load_trunk, "trunk(uma-mapped)");
             HCK(hipHostGetDevicePointer((void**)&g.d_trunk, hp, 0));
         } else {
-            HCK(hipMalloc((void**)&g.d_trunk, trunk_al));
-            stream_to_device(path, h.sections[1].file_offset, g.trunk_bytes, g.d_trunk, &g.t_load_trunk, "trunk");
+            const uint64_t floor_b = (uint64_t)(wddm_vram_floor_gb(tot0) * 1e9);
+            if (fr0 > trunk_al + floor_b + (256ull << 20) && hipMalloc((void**)&g.d_trunk, trunk_al) == hipSuccess) {
+                stream_to_device(path, h.sections[1].file_offset, g.trunk_bytes, g.d_trunk, &g.t_load_trunk, "trunk");
+            } else {
+                (void)hipGetLastError();
+                void* hp = nullptr;
+                if (hipHostMalloc(&hp, trunk_al, hipHostMallocMapped) != hipSuccess) {
+                    (void)hipGetLastError();
+                    fprintf(stderr, "trunk alloc failed (%.2f GB, free VRAM %.2f GiB)\n", trunk_al / 1e9, fr0 / 1073741824.0);
+                    return false;
+                }
+                g.h_trunk_mapped = (uint8_t*)hp;
+                read_file_parallel(path, h.sections[1].file_offset, g.trunk_bytes, g.h_trunk_mapped, &g.t_load_trunk, "trunk(host-mapped-4gb)");
+                HCK(hipHostGetDevicePointer((void**)&g.d_trunk, g.h_trunk_mapped, 0));
+                fprintf(stderr, "[load] low-VRAM GPU (%.1f GiB free): trunk (%.2f GB) in pinned mapped host RAM -> 0 VRAM expert slots\n",
+                        fr0 / 1073741824.0, trunk_al / 1e9);
+            }
         }
 #endif
     }
@@ -1203,6 +1392,9 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
             budget = atof(vb) * 1073741824.0;
         if (g.peer_devs.empty() && g.vram_experts_gb_cap >= 0.0) {
             budget = std::min(budget, g.vram_experts_gb_cap * 1073741824.0);
+        }
+        if (g.h_trunk_mapped != nullptr) {
+            budget = 0.0;  // 4-6 GB discrete GPU with host-mapped trunk: clean 0 VRAM expert slots
         }
         const uint64_t sec4_al = (g.sec4_bytes + 4095) & ~4095ull;
         bool loaded_full = false;

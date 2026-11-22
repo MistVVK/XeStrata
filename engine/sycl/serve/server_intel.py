@@ -196,9 +196,9 @@ def install_logprobs():
 
     keys = Eng.sampling_keys
 
-    def sampling_keys(sampling):
+    def sampling_keys(sampling, **kw):
         k = top_logprobs(sampling or {})
-        return keys(sampling) + (f" logprobs={k}" if k is not None else "")
+        return keys(sampling, **kw) + (f" logprobs={k}" if k is not None else "")
     Eng.sampling_keys = staticmethod(sampling_keys)
 
     generate = Eng.generate

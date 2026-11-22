@@ -28,3 +28,13 @@ test('in a checkout the same file the shell is built from is read, so there is o
     assert.equal(appVersionFrom({ env: {}, here: join(dir, 'host', 'server') }), '9.8.7-rc.1');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('the sidebar and updates view format and display the release version badge (#6602)', async () => {
+  const sidebar = await readFile(new URL('../src/app/Sidebar.tsx', import.meta.url), 'utf8');
+  const updates = await readFile(new URL('../src/components/SettingsUpdates.tsx', import.meta.url), 'utf8');
+  const helper = await readFile(new URL('../src/lib/app-version.ts', import.meta.url), 'utf8');
+  assert.match(helper, /export function releaseVersionBadge\(/);
+  assert.match(sidebar, /className="nav__version nav__rail-hide"/);
+  assert.match(sidebar, /releaseVersionBadge\(/);
+  assert.match(updates, /releaseVersionBadge\(/);
+});

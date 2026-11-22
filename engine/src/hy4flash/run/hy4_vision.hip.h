@@ -559,8 +559,11 @@ __global__ void k_fill_newline(float* __restrict__ rows, const float* __restrict
 // =============================================================================================================================================================================
 struct VisionEncoder {
     VisionShardInfo vi;
-    uint8_t* d_w = nullptr;  // Section 1 of the shard
+    uint8_t* d_w = nullptr;  // Section 1 of the shard (GPU mode)
+    std::vector<uint8_t> h_w;  // Section 1 of the shard (CPU fallback on < 6 GB GPUs or tight VRAM)
+    std::string shard_path;
     bool loaded = false;
+    bool cpu_mode = false;
     double t_load = 0;
     // debug: dump the residual stream after the embedding and every layer (fp32 [N][1152]) as .npy into dump_dir
     bool dump = false;
@@ -572,18 +575,59 @@ struct VisionEncoder {
 
     const __half* wh(const std::string& n) const { return reinterpret_cast<const __half*>(d_w + vi.get(n).off); }
     const float* wf(const std::string& n) const { return reinterpret_cast<const float*>(d_w + vi.get(n).off); }
+    const uint16_t* cwh(const std::string& n) const { return reinterpret_cast<const uint16_t*>(h_w.data() + vi.get(n).off); }
+    const float* cwf(const std::string& n) const { return reinterpret_cast<const float*>(h_w.data() + vi.get(n).off); }
 
-    bool load(const std::string& path, std::string& err) {
-        if (loaded) return true;
+    static inline float fp16_to_f32_cpu(uint16_t h) {
+        const uint32_t s = (uint32_t)(h >> 15) << 31;
+        uint32_t e = (h >> 10) & 0x1fu;
+        uint32_t m = h & 0x3ffu;
+        uint32_t u = 0;
+        if (e == 0) {
+            if (m == 0) u = s;
+            else {
+                e = 127 - 14;
+                while ((m & 0x400u) == 0) { m <<= 1; --e; }
+                m &= 0x3ffu;
+                u = s | (e << 23) | (m << 13);
+            }
+        } else if (e == 31) {
+            u = s | 0x7f800000u | (m << 13);
+        } else {
+            u = s | ((e + 112u) << 23) | (m << 13);
+        }
+        float out;
+        std::memcpy(&out, &u, sizeof(out));
+        return out;
+    }
+
+    bool load(const std::string& path, std::string& err, bool force_cpu = false) {
+        if (loaded && (!force_cpu || cpu_mode)) return true;
+        if (loaded) unload();
         if (!vision_probe(path, vi, err)) return false;
+        shard_path = path;
         gelu_tanh_ffn = vi.c.gelu_tanh_ffn;
         if (const char* g = getenv("HY4_VIT_GELU")) gelu_tanh_ffn = std::string(g) != "erf";
         const uint64_t bytes = (vi.sec1_len + 4095) & ~(uint64_t)4095;
-        hipError_t e = hipMalloc((void**)&d_w, bytes);
-        if (e != hipSuccess) {
-            (void)hipGetLastError();
-            err = "cannot allocate " + std::to_string(bytes / 1048576) + " MiB for the vision weights";
-            return false;
+        size_t vfr = 0, vtot = 0;
+        if (hipMemGetInfo(&vfr, &vtot) != hipSuccess) (void)hipGetLastError();
+        const bool env_cpu = getenv("HY4_VIT_CPU") && atoi(getenv("HY4_VIT_CPU")) != 0;
+        const bool low_vram_gpu = (vtot > 0 && vtot < ((size_t)6500 << 20)) || (vfr > 0 && vfr < bytes + ((size_t)384 << 20));
+        bool use_cpu = force_cpu || env_cpu || low_vram_gpu;
+        if (!use_cpu) {
+            hipError_t e = hipMalloc((void**)&d_w, bytes);
+            if (e != hipSuccess) {
+                (void)hipGetLastError();
+                use_cpu = true;
+            }
+        }
+        if (use_cpu) {
+            h_w.resize((size_t)bytes);
+            read_file_parallel(path, vi.sec1_off, vi.sec1_len, h_w.data(), &t_load, "vision(cpu)");
+            cpu_mode = true;
+            loaded = true;
+            fprintf(stderr, "[vision] shard loaded on CPU (low-VRAM fallback): %.2f GB in %.2f s\n", vi.sec1_len / 1e9, t_load);
+            return true;
         }
         stream_to_device(path, vi.sec1_off, vi.sec1_len, d_w, &t_load, "vision");
 #if HY4_MMA && !HY4_CUDA
@@ -597,6 +641,7 @@ struct VisionEncoder {
 #if !HY4_CUDA
         use_fdot2 = !use_wmma && !getenv("HY4_VIT_PLAIN");
 #endif
+        cpu_mode = false;
         loaded = true;
         fprintf(stderr, "[vision] shard loaded to the GPU: %.2f GB in %.2f s (%s)\n", vi.sec1_len / 1e9, t_load,
                 use_wmma ? "wmma" : (use_fdot2 ? "fdot2" : "plain"));
@@ -605,7 +650,171 @@ struct VisionEncoder {
     void unload() {
         if (d_w) HCK(hipFree(d_w));
         d_w = nullptr;
+        h_w.clear();
+        h_w.shrink_to_fit();
+        cpu_mode = false;
         loaded = false;
+    }
+
+    // CPU ViT fallback for < 6 GB GPUs or tight VRAM: exact same math (FP16 weights -> FP32 accumulate), copies only final rows to GPU.
+    bool encode_cpu(hipStream_t st, const uint8_t* rgb, int h, int w, float* rows_out, std::string& err) {
+        const VitCfg& c = vi.c;
+        const int P = c.patch, D = c.hidden, NH = c.heads, HD = D / NH, FF = c.ffn, OD = c.out_hidden;
+        const int gh = h / P, gw = w / P, N = gh * gw, oh = gh / 2, ow = gw / 2, M2 = oh * ow;
+        const int nt = std::max(1, std::min(16, (int)std::thread::hardware_concurrency()));
+        auto par_rows = [&](int total_rows, auto&& fn) {
+            if (nt <= 1 || total_rows < 8) { fn(0, total_rows); return; }
+            std::vector<std::thread> th;
+            const int per = (total_rows + nt - 1) / nt;
+            for (int t = 0; t < nt; ++t) {
+                int r0 = t * per, r1 = std::min(total_rows, r0 + per);
+                if (r0 >= r1) break;
+                th.emplace_back([&, r0, r1]() { fn(r0, r1); });
+            }
+            for (auto& x : th) x.join();
+        };
+        auto gelu_cpu = [&](float x, bool tanh_m) -> float {
+            if (tanh_m) return 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+            return 0.5f * x * (1.0f + std::erff(x * 0.7071067811865476f));
+        };
+        auto gemm_cpu = [&](const float* X, const uint16_t* W, const float* bias, float* Y, int M, int Nout, int K, int mode) {
+            // mode: 0=set, 1=add, 2=gelu_tanh, 3=gelu_erf
+            std::vector<float> wf32((size_t)Nout * K);
+            par_rows(Nout, [&](int r0, int r1) {
+                for (int n = r0; n < r1; ++n) {
+                    const uint16_t* wp = W + (size_t)n * K;
+                    float* dst = wf32.data() + (size_t)n * K;
+                    for (int k = 0; k < K; ++k) dst[k] = fp16_to_f32_cpu(wp[k]);
+                }
+            });
+            par_rows(M, [&](int m0, int m1) {
+                for (int m = m0; m < m1; ++m) {
+                    const float* xp = X + (size_t)m * K;
+                    float* yp = Y + (size_t)m * Nout;
+                    for (int n = 0; n < Nout; ++n) {
+                        const float* wp = wf32.data() + (size_t)n * K;
+                        float acc = bias ? bias[n] : 0.f;
+                        for (int k = 0; k < K; ++k) acc += xp[k] * wp[k];
+                        if (mode == 1) yp[n] += acc;
+                        else if (mode == 2) yp[n] = gelu_cpu(acc, true);
+                        else if (mode == 3) yp[n] = gelu_cpu(acc, false);
+                        else yp[n] = acc;
+                    }
+                }
+            });
+        };
+        std::vector<float> pix((size_t)N * 768), x((size_t)N * D, 0.f), hbuf((size_t)N * D), q((size_t)N * D), k((size_t)N * D), v((size_t)N * D), ff((size_t)N * FF);
+        for (int p = 0; p < N; ++p) {
+            const int py = p / gw, px = p % gw;
+            for (int e = 0; e < 768; ++e) {
+                const int ch = e >> 8, dy = (e >> 4) & 15, dx = e & 15;
+                const float val = (float)rgb[((size_t)(py * 16 + dy) * w + px * 16 + dx) * 3 + ch] * (1.0f / 255.0f);
+                pix[(size_t)p * 768 + e] = (val - 0.5f) / 0.5f;
+            }
+        }
+        // Bilinear position embedding
+        const float sy = (float)(1.0 / (((double)gh + 0.1) / (double)c.pos_edge)), sx = (float)(1.0 / (((double)gw + 0.1) / (double)c.pos_edge));
+        const uint16_t* ptab = cwh("vit.embeddings.position_embedding.weight") + (size_t)D;
+        for (int p = 0; p < N; ++p) {
+            const int y = p / gw, xx = p % gw;
+            float fy = std::max(0.f, sy * ((float)y + 0.5f) - 0.5f), fx = std::max(0.f, sx * ((float)xx + 0.5f) - 0.5f);
+            int y0 = std::min(c.pos_edge - 1, (int)fy), x0 = std::min(c.pos_edge - 1, (int)fx);
+            int y1 = std::min(c.pos_edge - 1, y0 + 1), x1 = std::min(c.pos_edge - 1, x0 + 1);
+            float ly = fy - (float)y0, lx = fx - (float)x0;
+            for (int d = 0; d < D; ++d) {
+                float a = fp16_to_f32_cpu(ptab[((size_t)y0 * c.pos_edge + x0) * D + d]);
+                float b = fp16_to_f32_cpu(ptab[((size_t)y0 * c.pos_edge + x1) * D + d]);
+                float cc = fp16_to_f32_cpu(ptab[((size_t)y1 * c.pos_edge + x0) * D + d]);
+                float dd = fp16_to_f32_cpu(ptab[((size_t)y1 * c.pos_edge + x1) * D + d]);
+                x[(size_t)p * D + d] = (1.f - ly) * ((1.f - lx) * a + lx * b) + ly * ((1.f - lx) * cc + lx * dd);
+            }
+        }
+        gemm_cpu(pix.data(), cwh("vit.embeddings.patch_embedding.weight"), cwf("vit.embeddings.patch_embedding.bias"), x.data(), N, D, 768, 1);
+        const float scale = 1.0f / std::sqrt((float)HD);
+        auto ln_cpu = [&](const float* in, const float* gw_p, const float* gb_p, float* out) {
+            par_rows(N, [&](int r0, int r1) {
+                for (int r = r0; r < r1; ++r) {
+                    const float* xr = in + (size_t)r * D;
+                    float* orow = out + (size_t)r * D;
+                    double mean = 0.0;
+                    for (int d = 0; d < D; ++d) mean += xr[d];
+                    mean /= (double)D;
+                    double var = 0.0;
+                    for (int d = 0; d < D; ++d) { double df = xr[d] - mean; var += df * df; }
+                    const float inv = 1.0f / std::sqrt((float)(var / (double)D) + c.eps);
+                    for (int d = 0; d < D; ++d) orow[d] = (xr[d] - (float)mean) * inv * gw_p[d] + gb_p[d];
+                }
+            });
+        };
+        for (int il = 0; il < c.layers; ++il) {
+            if (cancel && cancel->load()) { err = "cancelled"; return false; }
+            const std::string p = "vit.layers." + std::to_string(il) + ".";
+            ln_cpu(x.data(), cwf(p + "input_layernorm.weight"), cwf(p + "input_layernorm.bias"), hbuf.data());
+            gemm_cpu(hbuf.data(), cwh(p + "self_attn.q_proj.weight"), cwf(p + "self_attn.q_proj.bias"), q.data(), N, D, D, 0);
+            gemm_cpu(hbuf.data(), cwh(p + "self_attn.k_proj.weight"), cwf(p + "self_attn.k_proj.bias"), k.data(), N, D, D, 0);
+            gemm_cpu(hbuf.data(), cwh(p + "self_attn.v_proj.weight"), cwf(p + "self_attn.v_proj.bias"), v.data(), N, D, D, 0);
+            par_rows(N, [&](int q0, int q1) {
+                std::vector<float> sc(N);
+                for (int qi = q0; qi < q1; ++qi) {
+                    for (int hh = 0; hh < NH; ++hh) {
+                        const float* qp = q.data() + (size_t)qi * D + hh * HD;
+                        float mx = -1e30f;
+                        for (int ki = 0; ki < N; ++ki) {
+                            const float* kp = k.data() + (size_t)ki * D + hh * HD;
+                            float dot = 0.f;
+                            for (int d = 0; d < HD; ++d) dot += qp[d] * kp[d];
+                            sc[ki] = dot * scale;
+                            if (sc[ki] > mx) mx = sc[ki];
+                        }
+                        float sum = 0.f;
+                        for (int ki = 0; ki < N; ++ki) { sc[ki] = std::exp(sc[ki] - mx); sum += sc[ki]; }
+                        const float inv = 1.0f / std::max(sum, 1e-20f);
+                        float* op = hbuf.data() + (size_t)qi * D + hh * HD;
+                        for (int d = 0; d < HD; ++d) op[d] = 0.f;
+                        for (int ki = 0; ki < N; ++ki) {
+                            const float w_a = sc[ki] * inv;
+                            const float* vp = v.data() + (size_t)ki * D + hh * HD;
+                            for (int d = 0; d < HD; ++d) op[d] += w_a * vp[d];
+                        }
+                    }
+                }
+            });
+            gemm_cpu(hbuf.data(), cwh(p + "self_attn.o_proj.weight"), cwf(p + "self_attn.o_proj.bias"), x.data(), N, D, D, 1);
+            ln_cpu(x.data(), cwf(p + "post_attention_layernorm.weight"), cwf(p + "post_attention_layernorm.bias"), hbuf.data());
+            gemm_cpu(hbuf.data(), cwh(p + "mlp.dense_h_to_4h.weight"), cwf(p + "mlp.dense_h_to_4h.bias"), ff.data(), N, FF, D, gelu_tanh_ffn ? 2 : 3);
+            gemm_cpu(ff.data(), cwh(p + "mlp.dense_4h_to_h.weight"), cwf(p + "mlp.dense_4h_to_h.bias"), x.data(), N, D, FF, 1);
+        }
+        // Adapter: RMSNorm + 2x2 merge -> proj.0 (GELU erf) -> proj.2 -> rowmap + image_newline
+        std::vector<float> A((size_t)M2 * D * 4), mid((size_t)M2 * D * 4), out_cells((size_t)M2 * OD);
+        const float* pnw = cwf("vit.perceive.norm.weight");
+        for (int p = 0; p < N; ++p) {
+            const int y = p / gw, xx = p % gw;
+            const float* xr = x.data() + (size_t)p * D;
+            double ss = 0.0;
+            for (int d = 0; d < D; ++d) ss += (double)xr[d] * xr[d];
+            const float inv = 1.0f / std::sqrt((float)(ss / (double)D) + c.eps);
+            const size_t cell = (size_t)(y >> 1) * (gw >> 1) + (xx >> 1);
+            const int sub = (y & 1) * 2 + (xx & 1);
+            for (int d = 0; d < D; ++d) A[cell * (size_t)(D * 4) + (size_t)d * 4 + sub] = xr[d] * inv * pnw[d];
+        }
+        gemm_cpu(A.data(), cwh("vit.perceive.proj.0.weight"), cwf("vit.perceive.proj.0.bias"), mid.data(), M2, D * 4, D * 4, 3);
+        gemm_cpu(mid.data(), cwh("vit.perceive.proj.2.weight"), cwf("vit.perceive.proj.2.bias"), out_cells.data(), M2, OD, D * 4, 0);
+        const int total_rows = oh * (ow + 1);
+        std::vector<float> host_rows((size_t)total_rows * OD);
+        const float* nl = cwf("vit.perceive.image_newline");
+        for (int r = 0; r < oh; ++r) {
+            for (int col = 0; col < ow; ++col) {
+                std::memcpy(host_rows.data() + ((size_t)r * (ow + 1) + col) * OD, out_cells.data() + ((size_t)r * ow + col) * OD, (size_t)OD * 4);
+            }
+            std::memcpy(host_rows.data() + ((size_t)r * (ow + 1) + ow) * OD, nl, (size_t)OD * 4);
+        }
+        if (hipMemcpyAsync(rows_out, host_rows.data(), host_rows.size() * 4, hipMemcpyHostToDevice, st) != hipSuccess ||
+            hipStreamSynchronize(st) != hipSuccess) {
+            (void)hipGetLastError();
+            err = "failed to upload CPU-encoded image rows";
+            return false;
+        }
+        return true;
     }
 
     void gemm(hipStream_t st, int epi, const __half* X, const __half* W, const float* bias, __half* Yh, float* Yf, const float* pe, int M, int N, int K, int ow = 1) {
@@ -681,6 +890,7 @@ struct VisionEncoder {
             err = "vision shard not loaded";
             return false;
         }
+        if (cpu_mode) return encode_cpu(st, rgb, h, w, rows_out, err);
         const VitCfg& c = vi.c;
         const int P = c.patch, D = c.hidden, NH = c.heads, FF = c.ffn, OD = c.out_hidden;
         if (h % (P * c.merge) || w % (P * c.merge) || h < 32 || w < 32) {
@@ -698,11 +908,17 @@ struct VisionEncoder {
         const size_t bN = (size_t)N * D;
         auto free_ws = [&]() {
             for (void* q : {(void*)d_rgb, (void*)d_pix, (void*)d_x, (void*)d_pe, (void*)d_h, (void*)d_q, (void*)d_k, (void*)d_v, (void*)d_ff, (void*)d_A, (void*)d_mid})
-                if (q) HCK(hipFree(q));
+                if (q) (void)hipFree(q);
         };
         auto fail = [&](const char* what) {
             free_ws();
             (void)hipGetLastError();
+            if (!shard_path.empty()) {
+                fprintf(stderr, "[vision] GPU workspace OOM (%s); falling back to CPU vision encoder\n", what);
+                const std::string sp = shard_path;
+                unload();
+                if (load(sp, err, true)) return encode_cpu(st, rgb, h, w, rows_out, err);
+            }
             err = std::string("out of device memory for the vision workspace (") + what + ")";
             return false;
         };
@@ -928,10 +1144,20 @@ struct VisionCtx {
         for (const ImageSpan& s : spans)
             for (int j = 0; j < s.n; ++j) mask[s.start + j] = 1;
         tab_n = (int)ids.size();
-        HCK(hipMalloc((void**)&d_tab, (size_t)3 * tab_n * 4));
+        if (hipMalloc((void**)&d_tab, (size_t)3 * tab_n * 4) != hipSuccess) {
+            (void)hipGetLastError();
+            release();
+            err = "out of device memory for the vision rope table";
+            return false;
+        }
         for (int a = 0; a < 3; ++a) HCK(hipMemcpy(d_tab + (size_t)a * tab_n, pos.p[a].data(), (size_t)tab_n * 4, hipMemcpyHostToDevice));
         map_cap = max_chunk;
-        HCK(hipMalloc((void**)&d_map, (size_t)map_cap * 4));
+        if (hipMalloc((void**)&d_map, (size_t)map_cap * 4) != hipSuccess) {
+            (void)hipGetLastError();
+            release();
+            err = "out of device memory for the vision token map";
+            return false;
+        }
         return true;
     }
 

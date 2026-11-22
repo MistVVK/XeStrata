@@ -1582,11 +1582,37 @@ struct CpuExperts::Impl {
     // ------------------------------------------------------------------------------------------------ load
     bool alloc_arena(size_t bytes, std::string& err) {
         arena_size = bytes;
+        locked = false;
+        if (bytes == 0) {
+            arena = nullptr;
+            arena_map_size = 0;
+            return true;
+        }
+        const char* mlock_env = std::getenv("HY4_CPUEXP_MLOCK");
+        bool want_lock = (mlock_env && mlock_env[0] == '1');
+        if (!mlock_env) {
+            // Only lock RAM pages when there is generous free RAM headroom (>= 16 GiB above arena) so
+            // tight 32-64 GB hosts (and Windows WDDM commit limits) never suffer swap pressure or working-set faults.
+#ifdef _WIN32
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof(ms);
+            if (GlobalMemoryStatusEx(&ms) && ms.ullAvailPhys > (uint64_t)bytes + (16ull << 30)) want_lock = true;
+#else
+            unsigned long long avail_kb = 0;
+            if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+                char ln[256];
+                while (std::fgets(ln, sizeof ln, f))
+                    if (std::sscanf(ln, "MemAvailable: %llu kB", &avail_kb) == 1) break;
+                std::fclose(f);
+            }
+            if (avail_kb * 1024ull > (unsigned long long)bytes + (16ull << 30)) want_lock = true;
+#endif
+        }
 #ifdef _WIN32
         arena = (uint8_t*)VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         arena_map_size = bytes;
         if (!arena) { err = "VirtualAlloc failed for expert arena"; return false; }
-        locked = VirtualLock(arena, bytes) != 0;
+        if (want_lock) locked = VirtualLock(arena, bytes) != 0;
 #else
         const size_t HP = 2u << 20;
         arena_map_size = bytes + HP;
@@ -1598,7 +1624,7 @@ struct CpuExperts::Impl {
         madvise(a, bytes, MADV_HUGEPAGE);
 #endif
         arena = a;
-        locked = mlock(arena, bytes) == 0;  // best effort (RLIMIT_MEMLOCK)
+        if (want_lock) locked = mlock(arena, bytes) == 0;  // best effort (RLIMIT_MEMLOCK)
 #endif
         return true;
     }

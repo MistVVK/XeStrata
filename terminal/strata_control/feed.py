@@ -720,10 +720,12 @@ def fetch(source: str, trusted: dict[str, bytes], *, timeout: float = 30, say=No
 # ---------------------------------------------------------------------------------------------- hardware and selection
 
 def gfx_covers(archs, present: list[str]) -> bool:
-    """HIP: the build holds machine code for at least one of the installed AMD GPUs (``gfx1201``). Unknown GPUs: not a refusal."""
+    """HIP: the build holds machine code for at least one of the installed AMD GPUs (``gfx1201``, ``gfx1150``).
+    Feature suffixes such as ``:xnack-`` are stripped before comparison. Unknown GPUs: not a refusal."""
     if not present:
         return True
-    return any(a in present for a in archs)
+    have = {str(p).split(":", 1)[0].lower() for p in present if p}
+    return any(str(a).split(":", 1)[0].lower() in have for a in archs)
 
 
 def engine_fit_reasons(pkg: EnginePackage, hardware: dict) -> list[str]:
@@ -768,6 +770,11 @@ def select_engine(packages, hardware: dict) -> tuple[EnginePackage | None, list[
     fitting = _settle_hip_variants(fitting, hardware, reasons)
     if not fitting:
         return None, reasons
+    wanted_variant = str(hardware.get("variant_wanted") or "").lower()
+    if wanted_variant and hardware.get("backend") == "hip":
+        exact = [p for p in fitting if p.backend == "hip" and p.variant.lower() == wanted_variant]
+        if exact:
+            fitting = exact
     best = max(fitting, key=lambda p: (version_key(p.version), ec._version_key(p.min_driver.get("nvidia", "0")),
                                        ec.hip_preference(p.archs) if p.backend == "hip" else 1,
                                        ec.arch_native(p.archs, hardware.get("cuda_archs") or []) if p.backend == "cuda" else False))

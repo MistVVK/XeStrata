@@ -25,6 +25,9 @@ BY = "Strata's own quantization of Tencent's model"
 ENGRAM_SECTION4_SHA256 = "176944953bf2b601645d206171964f7fa51b77522ef5dc14ae61b0eb1c803d74"
 ENGRAM_FILE = "Hy4-Flash-Engram-Q8.strata"
 VISION_FILE = "Hy4-Flash-Vision.strata"
+TOKENIZER_FILE = "tokenizer.json"
+CHAT_TEMPLATE_FILE = "chat_template.jinja"
+TOKENIZER_HF_BASE = "https://huggingface.co/tencent/Hy4-flash/resolve/main"
 DEFAULT_CONTEXT = hy4_fit.DEFAULT_CONTEXT       # owner, 2026-11-19: 128K by default, everywhere (setup, launch, the catalog, the app)
 CONTEXTS = hy4_fit.CONTEXTS
 #: The drafter (DFly2) the engine starts with when the person has not chosen: "off" or "dfly2".  Owner, 2026-11-19: on by default, "as it is natively built in".  The engine says
@@ -163,6 +166,14 @@ def join_parts(parts, dst, *, keep_parts: bool = False, chunk: int = 16 << 20) -
         os.fsync(out.fileno())
     os.replace(tmp, dst)
     return dst
+
+
+def tokenizer_sources(env: dict | None = None, cfg: dict | None = None, shipped: Path | None = None) -> list[dict]:
+    """Download sources for companion tokenizer.json + chat_template.jinja: configured HY-4 sources first, then Tencent's public HF repo fallback."""
+    out = list(sources(env=env, cfg=cfg, shipped=shipped))
+    if not any((s.get("base") or "").rstrip("/") == TOKENIZER_HF_BASE for s in out):
+        out.append({"kind": "http", "base": TOKENIZER_HF_BASE, "files": {}})
+    return out
 
 
 def local_files(folder: str | os.PathLike, build: str | None = None) -> dict[str, Path]:

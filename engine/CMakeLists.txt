@@ -848,8 +848,31 @@ if(STRATA_BUILD_HY4)
   endif()
   find_path(STRATA_HY4_ZSTD_INCLUDE_DIR zstd.h)
   find_library(STRATA_HY4_ZSTD_LIBRARY NAMES zstd libzstd zstd_static)
+  set(_strata_hy4_zstd_bundled OFF)
   if(STRATA_HY4_ZSTD_INCLUDE_DIR AND STRATA_HY4_ZSTD_LIBRARY)
     set(_strata_hy4_reader src/artifact/strata_reader.cpp)
+  elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd-dec/zstd.h")
+    enable_language(C)
+    set(_hy4_zstd_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd-dec")
+    if(NOT TARGET strata_zstd_dec)
+      add_library(strata_zstd_dec STATIC
+        ${_hy4_zstd_dir}/common/debug.c
+        ${_hy4_zstd_dir}/common/entropy_common.c
+        ${_hy4_zstd_dir}/common/error_private.c
+        ${_hy4_zstd_dir}/common/fse_decompress.c
+        ${_hy4_zstd_dir}/common/xxhash.c
+        ${_hy4_zstd_dir}/common/zstd_common.c
+        ${_hy4_zstd_dir}/decompress/huf_decompress.c
+        ${_hy4_zstd_dir}/decompress/zstd_ddict.c
+        ${_hy4_zstd_dir}/decompress/zstd_decompress.c
+        ${_hy4_zstd_dir}/decompress/zstd_decompress_block.c
+      )
+      target_include_directories(strata_zstd_dec PUBLIC ${_hy4_zstd_dir} ${_hy4_zstd_dir}/common ${_hy4_zstd_dir}/decompress)
+      target_compile_definitions(strata_zstd_dec PRIVATE ZSTD_DISABLE_ASM=1)
+    endif()
+    set(_strata_hy4_reader src/artifact/strata_reader.cpp)
+    set(_strata_hy4_zstd_bundled ON)
+    message(STATUS "STRATA_BUILD_HY4: using bundled third_party/zstd-dec (strata_zstd_dec) for native .strata manifest decompression")
   else()
     message(WARNING "STRATA_BUILD_HY4: libzstd not found; building strata-hy4 with sidecar manifest reader (strata_reader_nozstd.cpp)")
     set(_strata_hy4_reader src/hy4flash/metal/strata_reader_nozstd.cpp)
@@ -861,12 +884,13 @@ if(STRATA_BUILD_HY4)
     set_source_files_properties(${_strata_hy4_gpu_srcs} PROPERTIES LANGUAGE HIP)
   endif()
   add_executable(strata-hy4 ${_strata_hy4_gpu_srcs}
-    src/hy4flash/run/hy4_engram.cpp src/hy4flash/run/hy4_cpu_experts.cpp ${_strata_hy4_reader})
+    src/hy4flash/run/hy4_engram.cpp src/hy4flash/run/hy4_cpu_experts.cpp src/hy4flash/run/hy4_cpu_k512.cpp ${_strata_hy4_reader})
   strata_utf8_manifest(strata-hy4)
   target_include_directories(strata-hy4 PRIVATE include src/hy4flash/run)
   if(STRATA_CPU_X86)
     if(MSVC)
       set_source_files_properties(src/hy4flash/run/hy4_cpu_experts.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+      set_source_files_properties(src/hy4flash/run/hy4_cpu_k512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     else()
       set_source_files_properties(src/hy4flash/run/hy4_cpu_experts.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     endif()
@@ -881,6 +905,8 @@ if(STRATA_BUILD_HY4)
   if(STRATA_HY4_ZSTD_INCLUDE_DIR AND STRATA_HY4_ZSTD_LIBRARY)
     target_include_directories(strata-hy4 PRIVATE "${STRATA_HY4_ZSTD_INCLUDE_DIR}")
     target_link_libraries(strata-hy4 PRIVATE "${STRATA_HY4_ZSTD_LIBRARY}")
+  elseif(_strata_hy4_zstd_bundled)
+    target_link_libraries(strata-hy4 PRIVATE strata_zstd_dec)
   endif()
 endif()
 

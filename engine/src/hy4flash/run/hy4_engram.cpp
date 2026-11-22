@@ -24,6 +24,9 @@
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #endif
 
 namespace hy4 {
@@ -321,14 +324,41 @@ bool PageFile::read_pages(const uint64_t* pages, size_t n, uint8_t* dst, int thr
 static bool engram_in_cgroup_mem_limit() {
     return strata::platform::cgroup_mem::in_cgroup_memory_limit();
 }
+// Returns true when host RAM is tight enough that OS page cache bloat from the 67.6 GB Engram shard
+// would cause swapping or evict resident experts (< 128 GiB total or < 80 GiB currently available).
+static bool engram_ram_tight() {
+#if defined(__APPLE__)
+    uint64_t mem_bytes = 0;
+    size_t sz = sizeof(mem_bytes);
+    if (sysctlbyname("hw.memsize", &mem_bytes, &sz, nullptr, 0) == 0 && mem_bytes > 0) {
+        return mem_bytes < (128ull << 30);
+    }
+    return true;
+#else
+    unsigned long long total_kb = 0, avail_kb = 0;
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char ln[256];
+        unsigned long long v = 0;
+        while (std::fgets(ln, sizeof ln, f)) {
+            if (std::sscanf(ln, "MemTotal: %llu kB", &v) == 1) total_kb = v;
+            else if (std::sscanf(ln, "MemAvailable: %llu kB", &v) == 1) avail_kb = v;
+        }
+        std::fclose(f);
+    }
+    if (total_kb > 0 && total_kb < (128ull << 20)) return true;
+    if (avail_kb > 0 && avail_kb < (80ull << 20)) return true;
+    return false;
+#endif
+}
 bool PageFile::open_impl(const std::string& path, std::string& err, bool direct) {
     close();
     fadv_dontneed_ = false;
-    // Bypass Linux page cache with O_DIRECT when explicitly requested (HY4_ENGRAM_ODIRECT=1) OR when running inside a
-    // cgroup memory limit (unless HY4_ENGRAM_ODIRECT=0), so 67 GB Engram reads never charge cgroup v2 memory.current.
+    // Bypass OS page cache (O_DIRECT on Linux, F_NOCACHE on macOS, FILE_FLAG_NO_BUFFERING on Windows)
+    // when explicitly requested (HY4_ENGRAM_ODIRECT=1), inside a cgroup memory limit, OR whenever host RAM
+    // is tight (< 128 GiB total or < 80 GiB available), so 67.6 GB Engram reads never bloat RAM or trigger swap.
     const char* od_env = std::getenv("HY4_ENGRAM_ODIRECT");
     const bool want_direct = direct && !(od_env && od_env[0] == '0') &&
-                             ((od_env && od_env[0] == '1') || engram_in_cgroup_mem_limit());
+                             ((od_env && od_env[0] == '1') || engram_in_cgroup_mem_limit() || engram_ram_tight());
     int fd = -1;
 #ifdef O_DIRECT
     if (want_direct) {
@@ -338,6 +368,11 @@ bool PageFile::open_impl(const std::string& path, std::string& err, bool direct)
 #endif
     if (fd < 0) fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) { err = "open failed for " + path; return false; }
+#if defined(F_NOCACHE)
+    if (want_direct) {
+        (void)fcntl(fd, F_NOCACHE, 1);
+    }
+#endif
     off_t sz = lseek(fd, 0, SEEK_END);
     h_ = (void*)(intptr_t)(fd + 1);
     size_ = (uint64_t)sz;

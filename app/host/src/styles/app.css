@@ -5835,6 +5835,8 @@ button.menu__item:disabled { opacity: .5; cursor: default; }
 [data-theme='dark'] .st-composer__bar > .st-btn--primary:hover:not(:disabled) { background: color-mix(in srgb, var(--st-ink) 12%, var(--st-surface)); }
 .nav__bottom { display: flex; align-items: center; gap: 8px; }
 .nav__bottom .nav__more { flex: 1; min-width: 0; }
+.nav__version { flex: none; font-size: 11px; line-height: 1; font-variant-numeric: tabular-nums; color: var(--st-ink-muted); text-decoration: none; padding: 4px 6px; border-radius: var(--st-r-sm); }
+.nav__version:hover { color: var(--st-ink); background: var(--st-surface-2); }
 .theme-switch { flex: none; color: var(--st-ink-muted); }
 .theme-switch__icon { display: grid; place-items: center; animation: theme-reveal var(--st-t-local) var(--st-ease-enter); }
 @keyframes theme-reveal { from { opacity: 0; transform: rotate(-70deg) scale(.8); } to { opacity: 1; transform: rotate(0) scale(1); } }

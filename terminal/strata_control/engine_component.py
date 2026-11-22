@@ -1154,6 +1154,9 @@ def resolve(root: Path | None = None, *, backend: str | None = None, target: str
     archs_here = cuda_archs_present() if wanted == "cuda" else []
     driver_here = nvidia_driver_version() if wanted == "cuda" else None
     hip_here = hip_archs_present() if wanted == "hip" else []
+    if wanted == "hip" and not hip_here and os.name != "nt":
+        hip_here = hip_archs_from_pci()
+    hip_here_base = {a.split(":", 1)[0].lower() for a in hip_here}
     have_runtime = runtime if runtime is not None else runtime_version()
     for item in found:
         label = f"{item.version} {item.platform}-{item.backend}"
@@ -1175,7 +1178,7 @@ def resolve(root: Path | None = None, *, backend: str | None = None, target: str
             reasons.append(f"{label} has code for {', '.join(item.cuda_archs)}, this PC's GPU is "
                            f"{', '.join(archs_here)}")
             continue
-        if item.hip_archs and hip_here and not set(item.hip_archs) & set(hip_here):
+        if item.hip_archs and hip_here_base and not ({a.split(":", 1)[0].lower() for a in item.hip_archs} & hip_here_base):
             reasons.append(f"{label} has code for {', '.join(item.hip_archs)}, this PC's GPU is "
                            f"{', '.join(hip_here)}")
             arch_blocked.append(item)

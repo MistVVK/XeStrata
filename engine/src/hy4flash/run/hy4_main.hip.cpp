@@ -359,6 +359,7 @@ int main(int argc, char** argv) {
     int cc_min = 1024;
     int gpu = -1;
     std::string gpus_csv = getenv("HY4_GPUS") ? getenv("HY4_GPUS") : "";
+    std::string layer_split = getenv("HY4_LAYER_SPLIT") ? getenv("HY4_LAYER_SPLIT") : "";
     std::string draft = "auto";  // auto: dfly2 under --serve (when the file carries the drafter), off for the CLI runs (gates / benches); "off" and "dfly2" force
     SpecCfg scfg;
     SampleOpts cli_samp;
@@ -401,6 +402,7 @@ int main(int argc, char** argv) {
         else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
         else if (a == "--gpu") gpu = atoi(nxt().c_str());
         else if (a == "--gpus" || a == "--devices") gpus_csv = nxt();
+        else if (a == "--layer-split") layer_split = nxt();
         else if (a == "--draft") draft = nxt();
         else if (a == "--dfly-override") dfly_override = nxt();
         else if (a == "--spec-k") scfg.K = atoi(nxt().c_str());
@@ -568,6 +570,7 @@ int main(int argc, char** argv) {
         so.peer_devs = peer_devs;
         so.vram_experts_gb = vram_experts_gb;
         so.ram_experts_gb = ram_experts_gb;
+        so.layer_split = layer_split;
 #ifdef STRATA_HY4_DISTRIBUTED
         if (mpi_experts) {
             try {
@@ -638,13 +641,15 @@ int main(int argc, char** argv) {
         min_peer_tot = (min_peer_tot == 0) ? ptot : std::min(min_peer_tot, ptot);
     }
     if (!peer_devs.empty()) HCK(hipSetDevice(primary_gpu));
-    chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, model, !peer_devs.empty(), !vision_path.empty(), (int)peer_devs.size(), min_peer_tot);
+    chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, model, !peer_devs.empty(), !vision_path.empty(), (int)peer_devs.size(), min_peer_tot, fr, draft != "off");
     GpuModel g;
     g.primary_gpu = primary_gpu;
     g.planned_chunk = chunk;
     g.has_vision = !vision_path.empty();
+    g.draft_enabled = (draft != "off");
     g.vram_experts_gb_cap = vram_experts_gb;
     g.ram_experts_gb_cap = ram_experts_gb;
+    g.layer_split_spec = layer_split;
     g.peer_devs = peer_devs;
     double t_load0 = now_s();
     if (!load_gpu_model(g, model, true)) return 1;

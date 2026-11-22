@@ -7583,7 +7583,10 @@ SHAPE_ENGINE: dict = {}       # the model-shape engine the chosen model runs on:
 
 
 def engine_exe(eng: Path) -> str:
-    """The `exe` of a run config: the engine component in the app, else the engine binary's path. A model of its own shape names that shape's engine."""
+    """The `exe` of a run config: the engine component in the app, else the engine binary's path. A model of its own shape names that shape's engine
+    (unless locally compiled via `--build`, in which case its local binary path is written)."""
+    if SHAPE_ENGINE.get("local_exe"):
+        return str(SHAPE_ENGINE["local_exe"])
     if SHAPE_ENGINE.get("shape"):
         from strata_control import shape_engine
         return shape_engine.reference(SHAPE_ENGINE["shape"])
@@ -9375,12 +9378,79 @@ def shape_engine_fetch(a):
     return found
 
 
-def shape_engine_step(a, gpu, vision):
+def build_shape_engine(shape: str, gpu: dict, hip: bool, cuda_tk=None, yes: bool = False) -> Path | None:
+    """Compile a shape engine (`hy4` -> `strata-hy4`, `inkling2` -> `strata-inkling`) locally from `engine/` when `--build` is passed (#6588).
+    Returns the installed engine directory containing the built executable + `BUILD.json`, or None if unsupported."""
+    from strata_control import shape_engine
+    if shape not in (shape_engine.HY4_SHAPE, shape_engine.INKLING_SHAPE):
+        return None
+    src = engine_src()
+    if not (src / "CMakeLists.txt").is_file():
+        fail(f"cannot compile {shape} locally: engine source not found at {src}")
+    exe_name = shape_engine.exe_name(shape)
+    out_dir = home() / f"engine-{shape}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    build_dir = src / f"build-{shape}"
+    cmake = shutil.which("cmake")
+    if not cmake:
+        fail("cmake is required to compile with --build", "install cmake and ninja, or run without --build to download a prebuilt engine")
+    ninja = shutil.which("ninja")
+    cfg_cmd = [cmake, "-S", str(src), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release"]
+    if ninja:
+        cfg_cmd += ["-G", "Ninja"]
+    if shape == shape_engine.HY4_SHAPE:
+        cfg_cmd += ["-DSTRATA_BUILD_HY4=ON", "-DSTRATA_BUILD_INKLING=OFF", "-DSTRATA_BUILD_TESTS=OFF"]
+        if hip:
+            cfg_cmd += ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF"]
+        else:
+            cfg_cmd += ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_ENABLE_HIP=OFF"]
+        target = "strata-hy4"
+    else:
+        cfg_cmd += ["-DSTRATA_BUILD_INKLING=ON", "-DSTRATA_BUILD_HY4=OFF", "-DSTRATA_BUILD_TESTS=OFF"]
+        if hip:
+            cfg_cmd += ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF"]
+        elif sys.platform == "darwin":
+            cfg_cmd += ["-DSTRATA_ENABLE_METAL=ON", "-DSTRATA_ENABLE_CUDA=OFF"]
+        else:
+            cfg_cmd += ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_ENABLE_HIP=OFF"]
+        target = "strata-inkling"
+    say(f"  compiling {target} locally (--build) in {build_dir} ...")
+    run(cfg_cmd)
+    run([cmake, "--build", str(build_dir), "--target", target, "--config", "Release"])
+    built = None
+    for cand in (build_dir / exe_name, build_dir / "Release" / exe_name,
+                 build_dir / "src" / "inkling2" / exe_name, build_dir / "src" / "inkling2" / "Release" / exe_name):
+        if cand.is_file():
+            built = cand
+            break
+    if built is None:
+        fail(f"local build of {target} finished but {exe_name} was not found in {build_dir}")
+    dst = out_dir / exe_name
+    shutil.copy2(built, dst)
+    if not WIN:
+        dst.chmod(dst.stat().st_mode | 0o755)
+    meta = {"version": "local", "backend": "hip" if hip else ("metal" if sys.platform == "darwin" else "cuda"),
+            "source": "local", "shape": shape, "entrypoint": exe_name}
+    (out_dir / "BUILD.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    ok(f"built {target} locally: {dst}")
+    return out_dir
+
+
+def shape_engine_step(a, gpu, vision, *, hip: bool = False, cuda_tk=None):
     """Step 4 for a model that runs on the engine of its own shape (a Qwen4 model whose geometry is not Flash-Next's: strata_control/shape_engine.py). That engine is a
-    separate component next to the Strata engine (shape_engine_fetch); the run config names it ("component:strata-q4-lite") and every start looks it up.
-    Returns what engine_step returns."""
+    separate component next to the Strata engine (shape_engine_fetch); with `--build` outside CONTROL mode, compiles `strata-hy4` / `strata-inkling` locally (#6588)."""
     shape = SHAPE_ENGINE["shape"]
     llama = llama_cpp_if_here()
+    if getattr(a, "build", False) and not CONTROL:
+        from strata_control import shape_engine
+        if shape in (shape_engine.HY4_SHAPE, shape_engine.INKLING_SHAPE):
+            eng = build_shape_engine(shape, gpu, hip, cuda_tk, getattr(a, "yes", False))
+            if eng is not None:
+                exe_path = eng / shape_engine.exe_name(shape)
+                SHAPE_ENGINE["local_exe"] = str(exe_path)
+                meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
+                lib_dirs = cuda_lib_dirs(cuda_tk) if (not hip and not sys.platform == "darwin") else []
+                return llama, eng, meta, lib_dirs, gpu, "none"
     found = shape_engine_fetch(a)
     if found is None:
         return llama, home() / "engine", {"version": "99.0.0", "source": "local", "component": "missing"}, [], gpu, "none"
@@ -9397,7 +9467,7 @@ def engine_step(a, gpu, hip, amd, cuda_tk, vision):
     """Step 4: llama.cpp's sources and the engine (ready-made, or compiled here).  Returns (llama, engine folder, its
     BUILD.json, its library folders, the GPU (AMD on Windows: as the engine sees it), the image-encoder choice)."""
     if SHAPE_ENGINE.get("shape"):
-        return shape_engine_step(a, gpu, vision)
+        return shape_engine_step(a, gpu, vision, hip=hip, cuda_tk=cuda_tk)
     if CONTROL:
         return control_engine_step(gpu, vision)
     llama = llama_override()
@@ -9971,18 +10041,44 @@ def hy4_fetch(a, name: str, folder: Path, own: bool) -> Path:
     fail(f"no source lists {name}")
 
 
-def hy4_tokenizer_dir(model: Path, out: Path, engine: Path | None) -> Path | None:
-    """The tokenizer directory serve reads, from the model file: Python reads Section 0 itself when it has a zstd module, else the engine exports it (`strata-hy4
-    --export-tokenizer`).  None when neither can (no engine yet and no zstd): the person is told to run this again once the engine is installed."""
+def hy4_tokenizer_dir(model: Path, out: Path, engine: Path | None, a=None, folder: Path | None = None, own: bool = False, data: Path | None = None) -> Path | None:
+    """The tokenizer directory serve reads, from the model file or companion files:
+    1) already populated (`vocab.json` + `chat_template.jinja`);
+    2) Section 0 read directly in Python (3.14 `compression.zstd` or `zstandard`);
+    3) companion `tokenizer.json` + `chat_template.jinja` beside the model file or in `<data>/models/hy4-flash`;
+    4) exported by the engine (`strata-hy4 --export-tokenizer`);
+    5) public download fallback (`hy4_family.tokenizer_sources()`, including `tencent/Hy4-flash`) when `not own`."""
     sys.path.insert(0, str(ROOT / "tools"))
     import hy4_tokenizer
+    out = Path(out)
+    model = Path(model)
     if (out / "vocab.json").is_file() and (out / "chat_template.jinja").is_file():
         return out
     try:
         hy4_tokenizer.convert_manifest(hy4_tokenizer.read_manifest(model), out)
         return out
-    except RuntimeError:                               # no zstd in this Python
+    except (RuntimeError, ValueError, OSError, KeyError):    # no zstd in Python or non-strata file
         pass
+    # Companion tokenizer.json + chat_template.jinja beside the model or in the data folder
+    search_dirs: list[Path] = [model.parent]
+    if folder is not None and Path(folder) not in search_dirs:
+        search_dirs.append(Path(folder))
+    if data is not None:
+        dmod = Path(data) / "models" / hy4_family.FAMILY
+        if dmod not in search_dirs:
+            search_dirs.append(dmod)
+    if out not in search_dirs:
+        search_dirs.append(out)
+    for base in search_dirs:
+        for tok_name in (hy4_family.TOKENIZER_FILE, "tokenizer.hf.json"):
+            tok_json = base / tok_name
+            tmpl_file = base / hy4_family.CHAT_TEMPLATE_FILE
+            if tok_json.is_file() and tmpl_file.is_file():
+                try:
+                    hy4_tokenizer.convert_files(tok_json, tmpl_file, out)
+                    return out
+                except (ValueError, OSError, KeyError):
+                    pass
     if engine is not None and Path(engine).is_file():
         raw = out.with_name(out.name + "-export")
         raw.mkdir(parents=True, exist_ok=True)
@@ -9990,9 +10086,40 @@ def hy4_tokenizer_dir(model: Path, out: Path, engine: Path | None) -> Path | Non
         var = "PATH" if WIN else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
         eng_dir = str(Path(engine).resolve().parent)
         env[var] = os.pathsep.join([eng_dir, env[var]]) if env.get(var) else eng_dir
-        run([str(engine), "--export-tokenizer", str(model), str(raw)], env=env)
-        hy4_tokenizer.convert_files(raw / "tokenizer.hf.json", raw / "chat_template.jinja", out)
-        return out
+        try:
+            run([str(engine), "--export-tokenizer", str(model), str(raw)], env=env)
+            if (raw / "tokenizer.hf.json").is_file() and (raw / "chat_template.jinja").is_file():
+                hy4_tokenizer.convert_files(raw / "tokenizer.hf.json", raw / "chat_template.jinja", out)
+                return out
+        except (SystemExit, OSError, ValueError):
+            pass
+    # Public HF / configured source fallback so `packs/hy4-flash-*/tokenizer/vocab.json` is ALWAYS populated even without zstd or unpacked engine
+    if not own and a is not None:
+        fetch_dir = Path(folder) if folder is not None else model.parent
+        fetch_dir.mkdir(parents=True, exist_ok=True)
+        tok_json = fetch_dir / hy4_family.TOKENIZER_FILE
+        tmpl_file = fetch_dir / hy4_family.CHAT_TEMPLATE_FILE
+        for src in hy4_family.tokenizer_sources():
+            if not tok_json.is_file():
+                for u in hy4_family.urls_for(hy4_family.TOKENIZER_FILE, src):
+                    try:
+                        download(u, tok_json, hy4_family.TOKENIZER_FILE)
+                        break
+                    except (SystemExit, OSError):
+                        pass
+            if not tmpl_file.is_file():
+                for u in hy4_family.urls_for(hy4_family.CHAT_TEMPLATE_FILE, src):
+                    try:
+                        download(u, tmpl_file, hy4_family.CHAT_TEMPLATE_FILE)
+                        break
+                    except (SystemExit, OSError):
+                        pass
+            if tok_json.is_file() and tmpl_file.is_file():
+                try:
+                    hy4_tokenizer.convert_files(tok_json, tmpl_file, out)
+                    return out
+                except (ValueError, OSError, KeyError):
+                    pass
     return None
 
 
@@ -10085,7 +10212,7 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
 
     step(6, "preparing the model for Strata")
     data, _ = data_folder_for(a)
-    tokdir = hy4_tokenizer_dir(paths[files[0]], data / "packs" / tag.lower() / "tokenizer", engine_program)
+    tokdir = hy4_tokenizer_dir(paths[files[0]], data / "packs" / tag.lower() / "tokenizer", engine_program, a=a, folder=folder, own=own, data=data)
     if tokdir is None:
         warn("the tokenizer is read from the model file by the engine, which is not installed yet: run this again once it is (nothing is downloaded twice)")
         tokdir = data / "packs" / tag.lower() / "tokenizer"
@@ -10096,10 +10223,15 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
     args = ["--native", str(paths[files[0]]), "--engram", str(engram), "--max-context", str(ctx), "--session-reuse", "1"]   # the engine reuses a conversation's longest common prefix
     if vision:                                         # the Vision shard: the engine reads pictures with it once it supports them (serve leaves the option out until the engine says images=1)
         args += ["--vision", str(paths[hy4_family.VISION_FILE])]
+    use_layer_split = len(multi_cards) >= 2 and hy4_fit.should_layer_split(multi_cards, windows=WIN)
+    if use_layer_split:
+        args += ["--layer-split", "auto"]
     if not unified:                                    # a card: the rank-cut plan (hy4_fit) as the engine's caps; one pool: the engine puts everything in it
         args += ["--vram-experts-gb", f"{placed['vram_gb']:.2f}", "--ram-experts-gb", f"{placed['ram_gb']:.2f}"]
     cfg = {"exe": engine_exe(eng), "args": args, "cwd": str(ROOT), "tokenizer": str(tokdir), "model_name": f"{fam['name']}-{model.lower()}", "arch": fam["arch"],
            "log": str(home() / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port, "drafting": hy4_family.DEFAULT_DRAFTER}
+    if use_layer_split:
+        cfg["layer_split"] = "auto"
     if hip:
         cfg["backend"] = "hip"
     elif sys.platform == "darwin":

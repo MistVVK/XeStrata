@@ -75,6 +75,55 @@ ORDER = ("SQ-128", "SQ-96", "SQ-64")      # best quality first; SQ-64 is the sma
 NOT_OFFERED = {"SQ-32": {"file": "Hy4-Flash-SQ-32.strata", "footprint_gb": 37.98, "dense_gb": 5.25, "bodies_gb": 32.73, "file_gb": 38.09}}
 
 
+def wddm_vram_floor_gb(vram_gib: float, *, windows: bool | None = None) -> float:
+    """Hard free-VRAM floor kept clear of experts (GB) so Windows WDDM compositor, DFly2, and cuBLAS never OOM (#6528):
+    >= 1.0 GiB on >= 12 GB cards, >= 600 MiB on 6-8 GB cards, >= 450 MiB on 4 GB cards."""
+    import os as _os
+    is_win = (_os.name == "nt") if windows is None else bool(windows)
+    v = float(vram_gib or 0.0)
+    if is_win:
+        if v >= 11.0:
+            return 1.074
+        if v >= 5.5:
+            return 0.644
+        return 0.483
+    if v >= 11.0:
+        return 0.50
+    if v >= 5.5:
+        return 0.35
+    return 0.25
+
+
+def elastic_kv_init_slots(vram_gib: float | None, max_ctx: int = DEFAULT_CONTEXT, *, unified: bool = False) -> int:
+    """Initial elastic sparse-KV allocation (tokens) matching plan_memory: 4096 on <= 8 GB, 8192 on 12 GB, 16384 on 16..48 GB."""
+    ctx = int(max_ctx or DEFAULT_CONTEXT)
+    if unified or vram_gib is None:
+        return ctx
+    v_gb = float(vram_gib) * GIB_TO_GB
+    if v_gb >= 48.0 * GIB_TO_GB:
+        return ctx
+    init = 4096 if v_gb <= 9.0 else (8192 if v_gb <= 13.5 else 16384)
+    return min(ctx, init)
+
+
+def should_layer_split(cards: list[dict], *, windows: bool | None = None) -> bool:
+    """Whether multi-GPU HY-4 should pass `--layer-split auto` (layer-partitioned experts across 2..4 GPUs):
+    recommended whenever cards have unequal VRAM (> 15% diff), mixed architectures, Windows WDDM, or 2+ discrete GPUs without NVLink."""
+    import os as _os
+    if not cards or len(cards) < 2:
+        return False
+    is_win = (_os.name == "nt") if windows is None else bool(windows)
+    if is_win:
+        return True
+    vrams = [float(c.get("vram_gb") or 0.0) for c in cards if float(c.get("vram_gb") or 0.0) > 0.0]
+    if len(vrams) >= 2 and (max(vrams) / max(min(vrams), 0.1)) > 1.15:
+        return True
+    archs = {str(c.get("arch") or "").lower() for c in cards if c.get("arch")}
+    if len(archs) > 1:
+        return True
+    return not any(c.get("nvlink") is True for c in cards)
+
+
 def build_names() -> list[str]:
     return list(BUILDS)
 

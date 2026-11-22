@@ -848,17 +848,49 @@ def stage_engine(ctx: Context, feed: feedmod.Feed, pkg: feedmod.EnginePackage, a
         raise
 
 
+def _is_shape_engine_config(source) -> bool:
+    """True when a saved run config targets a shape engine (Hy4-Flash, Inkling-2-Mini, or another `component:strata-<shape>`):
+    updating the general `strata-engine` must never pass Hy4 (`--engram`) or Inkling (`--dspark`) flags to `strata` (#6589)."""
+    cfg = source
+    if not isinstance(cfg, dict):
+        try:
+            cfg = json.loads(Path(source).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, TypeError):
+            return False
+    if not isinstance(cfg, dict):
+        return False
+    arch = str(cfg.get("arch") or "").strip().lower()
+    if arch in ("hy4flash", "inkling2_loop"):
+        return True
+    exe = str(cfg.get("exe") or "").strip()
+    if ec.is_reference(exe):
+        comp = exe[len(ec.REFERENCE_PREFIX):]
+        if comp not in ("", ec.COMPONENT_ID):
+            return True
+    exe_base = exe.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if exe_base.startswith(("strata-hy4", "strata-inkling")):
+        return True
+    args = cfg.get("args")
+    if isinstance(args, list):
+        arg_set = {str(a) for a in args}
+        if "--engram" in arg_set or "--dspark" in arg_set:
+            return True
+    return False
+
+
 def discover_run_config(environ=None) -> Path | None:
     """A saved model's run config for the test start: the one a saved profile uses if its files are all present, otherwise any
-    installed model whose files are present. DeepSeek models are left out (strata_control/retired.py: this Strata does not run them).
-    None when no model can be used (the first run)."""
+    installed model whose files are present. DeepSeek models and shape-engine models (Hy4-Flash, Inkling-2-Mini) are left out
+    so updating `strata-engine` never passes `--engram` or `--dspark` to `strata` (#6589).
+    None when no general-engine model can be used (the first run)."""
     from strata_control import models, profiles, retired
     try:
         listed = models.list_installed()
     except Exception:                                   # noqa: BLE001 - discovery is best effort
         return None
     ready = [m for m in listed.get("models", []) if m.get("component_status") == "present" and m.get("source_config")
-             and not retired.config_file_reason(m["source_config"])]
+             and not retired.config_file_reason(m["source_config"])
+             and not _is_shape_engine_config(m["source_config"])]
     if not ready:
         return None
     try:
@@ -1293,6 +1325,9 @@ def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Con
     the one-token generation probe, and stop it. Everything runs in an isolated runtime, profile and component folder, so a
     user's own instances, profiles and engines are not involved. With no model installed the engine is only run with --version."""
     source = Path(ctx.run_config) if ctx.run_config else discover_run_config(ctx.environ)
+    if source is not None and component.id == ec.COMPONENT_ID and _is_shape_engine_config(source):
+        # #6589: never test the general `strata` engine against a Hy4-Flash (`--engram`) or Inkling (`--dspark`) config
+        source = discover_run_config(ctx.environ)
     if source is None:
         if not ctx.allow_no_model_smoke:
             raise TestStartFailed(component.version, "no installed model to test with")
