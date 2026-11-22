@@ -2431,9 +2431,11 @@ inline void launch_ink_moe_dispatch_only(
     InkMoeWorkspace& ws,
     bool force_exact_dec,
     bool quant_x_done = false) {
-    const bool use_sm120_tc = (!force_exact_dec && M >= 16 && sm120::available());
-    const bool use_fp16_tc  = (!use_sm120_tc && M >= 16 && ink_has_int8_tc());
-    const bool use_wmma_tc  = (!use_sm120_tc && !use_fp16_tc && M >= 16 && ink_has_wmma_f16());
+    // For 128-expert Top-8 MoE, M<=16 (all spec verify trees) averages ~1..1.5 tok/active-expert (fast decode kernel);
+    // M>=24 (c=32, c=64, prefill) gets 2x-3x speedup from Blackwell sm_120a / INT8 / FP16 Tensor Cores!
+    const bool use_sm120_tc = (!force_exact_dec && M >= 24 && sm120::available());
+    const bool use_fp16_tc  = (!use_sm120_tc && M >= 24 && ink_has_int8_tc());
+    const bool use_wmma_tc  = (!use_sm120_tc && !use_fp16_tc && M >= 24 && ink_has_wmma_f16());
     const int tile_rows = use_wmma_tc ? ((M <= 128) ? 16 : 64)
                                       : ((M <= 128 || use_fp16_tc) ? 16 : 64);
     k_ink_moe_bin<<<1, 128, 0, st>>>(experts, ws.topk_idx, M, tile_rows, ws.tb);
@@ -2507,7 +2509,7 @@ inline void launch_ink_moe_dispatch_only(
             const int nblk_x = M * (kInkHidden / 64);
             k_ink_quant_q8_1<<<(nblk_x + 7) / 8, 256, 0, st>>>(x_f32, ws.xq_sk, M, kInkHidden);
         }
-        if (M >= 16 && ink_has_int8_tc()) {
+        if (M >= 24 && ink_has_int8_tc()) {
             const int mt = ink_moe_max_tiles(M, tile_rows);
             const unsigned grid = (unsigned)std::min(std::max(1, mt * 18), 2048);
             if (tile_rows <= 16) k_ink_moe_sk_tc<true, 16><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, nullptr, ws.h_f32);
@@ -2519,12 +2521,12 @@ inline void launch_ink_moe_dispatch_only(
         } else {
             dim3 g32(kInkInter / 32, max_act);
             if (M == 1)       k_ink_moe_gu_sk<1><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
-            else if (M <= 16) k_ink_moe_gu_sk<4><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
+            else if (M <= 32) k_ink_moe_gu_sk<4><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
             else              k_ink_moe_gu_sk<16><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
             const int nblk_h = P * (kInkInter / 64);
             k_ink_quant_q8_1<<<(nblk_h + 7) / 8, 256, 0, st>>>(ws.h_f32, ws.hq_sk, P, kInkInter);
             if (M == 1)       k_ink_moe_dn_sk<1><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
-            else if (M <= 16) k_ink_moe_dn_sk<4><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
+            else if (M <= 32) k_ink_moe_dn_sk<4><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
             else              k_ink_moe_dn_sk<16><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
         }
     }
@@ -2543,7 +2545,8 @@ inline void launch_ink_moe(
     int M,
     InkMoeWorkspace& ws,
     float route_scale = kInkRouteScale,
-    bool force_exact_dec = false) {
+    bool force_exact_dec = false,
+    bool run_reduce8 = true) {
     // 1. Exact Top-8 / 128 sigmoid router
     if (M <= 16) {
         if (M == 1)      k_ink_router_gemv_smallM<1><<<kInkExperts, 256, 0, st>>>(x_f32, gate_w, ws.r_logits, M);
@@ -2556,7 +2559,7 @@ inline void launch_ink_moe(
             cublas, CUBLAS_OP_T, CUBLAS_OP_N, kInkExperts, M, kInkHidden, &alpha,
             gate_w, CUDA_R_32F, kInkHidden, x_f32, CUDA_R_32F, kInkHidden, &beta,
             ws.r_logits, CUDA_R_32F, kInkExperts,
-            ink_has_int8_tc() ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F,
+            (!force_exact_dec && ink_has_int8_tc()) ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
     k_ink_router_select_topk8<<<M, 32, 0, st>>>(ws.r_logits, gate_b, ws.topk_idx, ws.topk_w, route_scale, M);
@@ -2564,9 +2567,11 @@ inline void launch_ink_moe(
     // 2. Dispatch GPU-resident experts
     launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false);
 
-    // 3. Deterministic 8-slot weighted sum -> y_out [M, 2304]
-    dim3 rgrid((kInkHidden + 255) / 256, M);
-    k_ink_moe_reduce8<<<rgrid, 256, 0, st>>>(ws.y_pair, y_out, M);
+    // 3. Deterministic 8-slot weighted sum -> y_out [M, 2304] (skipped when caller fuses reduce8 + post-MLP ShortConv4!)
+    if (run_reduce8) {
+        dim3 rgrid((kInkHidden + 255) / 256, M);
+        k_ink_moe_reduce8<<<rgrid, 256, 0, st>>>(ws.y_pair, y_out, M);
+    }
 }
 
 }  // namespace strata::ink

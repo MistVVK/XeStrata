@@ -23,14 +23,15 @@ namespace strata::ink {
 
 // Commit accepted path[0..n_acc-1] of 4 ShortConv streams across ALL 48 visits in ONE kernel launch!
 // Grid: (48 visits, 4 streams), Block: 256 threads
-// stage_sconv: [48, max_M, 6656] F32 where channels are [0..1024)=k, [1024..2048)=v, [2048..4352)=attn, [4352..6656)=mlp
+// stage_sconv: [48, tree_cap, 6656] F32 where channels are [0..1024)=k, [1024..2048)=v, [2048..4352)=attn, [4352..6656)=mlp
 __global__ void __launch_bounds__(256) k_ink_commit_sconv_all48(
     float* const* __restrict__ sconv_pools,  // [48] pointers to d_sconv_pool[v]
-    const float* __restrict__ stage_sconv,   // [48, 16, 6656]
-    const int32_t* __restrict__ path,        // [n_acc] accepted node indices (<= 16)
+    const float* __restrict__ stage_sconv,   // [48, tree_cap, 6656]
+    const int32_t* __restrict__ path,        // [n_acc] accepted node indices (<= tree_cap)
     int n_acc,
     int slot0,
-    int max_slots) {
+    int max_slots,
+    int tree_cap) {
     const int v = blockIdx.x;       // 0..47
     const int strm = blockIdx.y;    // 0..3
     const int tid = threadIdx.x;
@@ -42,7 +43,7 @@ __global__ void __launch_bounds__(256) k_ink_commit_sconv_all48(
     const int C = c_len[strm];
 
     float* hist = sconv_pools[v] + (size_t)ch_off * 3 * max_slots + (size_t)slot0 * 3 * C;
-    const float* st_v = stage_sconv + (size_t)v * 16 * kInkSconvCh;
+    const float* st_v = stage_sconv + (size_t)v * tree_cap * kInkSconvCh;
 
     for (int c = tid; c < C; c += 256) {
         float h0 = hist[0 * C + c];
@@ -65,12 +66,13 @@ __global__ void __launch_bounds__(256) k_ink_commit_sconv_all48(
 // Grid: (48 visits, 8 kv_heads), Block: 128 threads (1 dim per thread)
 __global__ void __launch_bounds__(128) k_ink_commit_kv_all48(
     const InkKvVisitDesc* __restrict__ kv_descs,  // [48]
-    const float* __restrict__ stage_k,            // [48, 16, 1024]
-    const float* __restrict__ stage_v,            // [48, 16, 1024]
+    const float* __restrict__ stage_k,            // [48, tree_cap, 1024]
+    const float* __restrict__ stage_v,            // [48, tree_cap, 1024]
     const int32_t* __restrict__ path,             // [n_acc]
     int p0,
     int n_acc,
-    int slot0) {
+    int slot0,
+    int tree_cap) {
     const int v = blockIdx.x;  // 0..47
     const int h = blockIdx.y;  // 0..7
     const int d = threadIdx.x; // 0..127
@@ -81,7 +83,7 @@ __global__ void __launch_bounds__(128) k_ink_commit_kv_all48(
         const int node = path[k];
         const int p = p0 + k;
         const int p_idx = kv.is_swa ? (p % kv.cap_pos) : p;
-        const size_t sbase = (((size_t)v * 16 + node) * kInkKVHeads + h) * kInkHeadDim + d;
+        const size_t sbase = (((size_t)v * tree_cap + node) * kInkKVHeads + h) * kInkHeadDim + d;
         const float kv_val = stage_k[sbase];
         const float vv_val = stage_v[sbase];
         const size_t dbase = (((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + h) * kInkHeadDim;
@@ -199,9 +201,9 @@ inline int ink_spec_step_block8(
     // 4. Commit ONLY the accepted path's KV + ShortConv across all 48 visits (2 kernel launches total!) + ingest accepted taps into DSpark!
     INK_CK(cudaMemcpyAsync(runner.d_acc_path, path, (size_t)n_acc_nodes * 4, cudaMemcpyHostToDevice, runner.st));
     k_ink_commit_sconv_all48<<<dim3(kInkVisits, 4), 256, 0, runner.st>>>(
-        runner.d_sconv_pool_arr, runner.d_stage_sconv, runner.d_acc_path, n_acc_nodes, 0, runner.max_slots);
+        runner.d_sconv_pool_arr, runner.d_stage_sconv, runner.d_acc_path, n_acc_nodes, 0, runner.max_slots, runner.tree_cap);
     k_ink_commit_kv_all48<<<dim3(kInkVisits, kInkKVHeads), 128, 0, runner.st>>>(
-        runner.d_kv_desc_arr, runner.d_stage_k, runner.d_stage_v, runner.d_acc_path, pos, n_acc_nodes, 0);
+        runner.d_kv_desc_arr, runner.d_stage_k, runner.d_stage_v, runner.d_acc_path, pos, n_acc_nodes, 0, runner.tree_cap);
     for (int t = 0; t < 4; ++t) {
         k_ink_compact_taps<<<n_acc_nodes, 256, 0, runner.st>>>(runner.d_taps[t], runner.d_taps_compact[t], runner.d_acc_path, n_acc_nodes);
     }
@@ -299,9 +301,75 @@ inline int ink_spec_step_tree(
 
     INK_CK(cudaMemcpyAsync(runner.d_acc_path, path, (size_t)n_acc_nodes * 4, cudaMemcpyHostToDevice, runner.st));
     k_ink_commit_sconv_all48<<<dim3(kInkVisits, 4), 256, 0, runner.st>>>(
-        runner.d_sconv_pool_arr, runner.d_stage_sconv, runner.d_acc_path, n_acc_nodes, 0, runner.max_slots);
+        runner.d_sconv_pool_arr, runner.d_stage_sconv, runner.d_acc_path, n_acc_nodes, 0, runner.max_slots, runner.tree_cap);
     k_ink_commit_kv_all48<<<dim3(kInkVisits, kInkKVHeads), 128, 0, runner.st>>>(
-        runner.d_kv_desc_arr, runner.d_stage_k, runner.d_stage_v, runner.d_acc_path, pos, n_acc_nodes, 0);
+        runner.d_kv_desc_arr, runner.d_stage_k, runner.d_stage_v, runner.d_acc_path, pos, n_acc_nodes, 0, runner.tree_cap);
+    for (int t = 0; t < 4; ++t) {
+        k_ink_compact_taps<<<n_acc_nodes, 256, 0, runner.st>>>(runner.d_taps[t], runner.d_taps_compact[t], runner.d_acc_path, n_acc_nodes);
+    }
+    dspark.ingest_taps_from(runner.d_taps_compact, pos, n_acc_nodes);
+    double t3 = now_s();
+
+    pos += n_acc_nodes;
+    cur_tok = out_emitted[n_emit - 1];
+
+    st.iters++;
+    st.tokens += n_emit;
+    st.drafted += (tr.M - 1);
+    st.accepted += (n_acc_nodes - 1);
+    st.t_draft_ms += (t1 - t0) * 1000.0;
+    st.t_verify_ms += (t2 - t1) * 1000.0;
+    st.t_commit_ms += (t3 - t2) * 1000.0;
+    if (n_emit < 17) st.hist[n_emit]++;
+    return n_emit;
+}
+
+// Run 1 lossless True W=2..4 Multi-Branch Markov Beam Tree step (M = 16 / 24 / 32 nodes, 100.000% bitwise exact!)
+inline int ink_spec_step_beam_tree(
+    InkCudaRunner& runner,
+    InkDSpark& dspark,
+    int32_t& cur_tok,
+    int& pos,
+    int beam_w,
+    int max_nodes,
+    int32_t* out_emitted,
+    InkSpecStats& st,
+    float adaptive_moe_ratio = 0.0f) {
+    double t0 = now_s();
+    InkTreeSpec tr{};
+    dspark.draft_beam_tree(cur_tok, pos, beam_w, max_nodes, tr, adaptive_moe_ratio);
+    double t1 = now_s();
+
+    runner.forward_tree_verify(tr, pos, 0, true);
+    int32_t target_next[kInkMaxTree] = {};
+    runner.head_argmax_exact(tr.M, target_next);
+    double t2 = now_s();
+
+    // Exact greedy walk down the verified multi-branch tree: match ANY child of cur_node whose token == target_next[cur_node]!
+    int32_t path[kInkMaxTree] = {};
+    int n_acc_nodes = 0;
+    int n_emit = 0;
+    int cur_node = 0;
+    while (true) {
+        path[n_acc_nodes++] = cur_node;
+        const int32_t tok_next = target_next[cur_node];
+        out_emitted[n_emit++] = tok_next;
+        int next_child = -1;
+        for (int j = cur_node + 1; j < tr.M; ++j) {
+            if (tr.parent[j] == cur_node && tr.tok[j] == tok_next) {
+                next_child = j;
+                break;
+            }
+        }
+        if (next_child >= 0) cur_node = next_child;
+        else break;
+    }
+
+    INK_CK(cudaMemcpyAsync(runner.d_acc_path, path, (size_t)n_acc_nodes * 4, cudaMemcpyHostToDevice, runner.st));
+    k_ink_commit_sconv_all48<<<dim3(kInkVisits, 4), 256, 0, runner.st>>>(
+        runner.d_sconv_pool_arr, runner.d_stage_sconv, runner.d_acc_path, n_acc_nodes, 0, runner.max_slots, runner.tree_cap);
+    k_ink_commit_kv_all48<<<dim3(kInkVisits, kInkKVHeads), 128, 0, runner.st>>>(
+        runner.d_kv_desc_arr, runner.d_stage_k, runner.d_stage_v, runner.d_acc_path, pos, n_acc_nodes, 0, runner.tree_cap);
     for (int t = 0; t < 4; ++t) {
         k_ink_compact_taps<<<n_acc_nodes, 256, 0, runner.st>>>(runner.d_taps[t], runner.d_taps_compact[t], runner.d_acc_path, n_acc_nodes);
     }

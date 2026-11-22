@@ -527,6 +527,298 @@ __global__ void __launch_bounds__(256) k_ink_rms_norm_3x(
     }
 }
 
+// FUSED 1-Launch Looped Pre-Attn Kernel: replaces attn_res_mix(d_msgs) + attn_res_mix(d_mixed) + ctrl_3x_cat_rms (-48 launches/step!)
+// Grid: dim3(M, 4), Block: 256 threads.
+//   blockIdx.y in {0,1,2}: computes msg_c from bank (bst, msg_q[c]) AND src_c from depth states (stp, res_q[is_swa ? 0 : c]),
+//                          writes d_msgs[c], d_mixed[c], AND normalized [rms(src_c); rms(msg_c)] into cat3[c]!
+//   blockIdx.y == 3:       computes msg_3 (for MLP controller) from bank (bst, msg_q[3]) -> writes d_msgs[3]!
+__global__ void __launch_bounds__(256) k_ink_attn_res_3x_cat_rms(
+    DepthStatePtrs stp,              // depth states [0..S-1]
+    const float* __restrict__ q_res, // [1 or 3, D]
+    bool is_swa,
+    DepthStatePtrs bst,              // bank states [0..B-1]
+    const float* __restrict__ q_msg, // [4, D]
+    float* __restrict__ mixed_out,   // [3, M, D] (for is_swa, slot 0..2 all written so ctrl_3x reads uniformly)
+    float* __restrict__ msgs_out,    // [4, M, D]
+    float* __restrict__ cat3_out,    // [3, M, 2*D] (only used when cat3_out != nullptr)
+    int M, int D) {
+    const int m = blockIdx.x;
+    const int c = blockIdx.y;  // 0..3
+    if (m >= M || c >= 4) return;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int D4 = D >> 2;
+    const float inv_sqrt_d = rsqrtf((float)D);
+    __shared__ float s_wred[8][2][8];  // [state][0=ss, 1=dot][warp]
+    __shared__ float s_prob[8];
+    __shared__ float sh[32];
+
+    auto compute_mix_probs = [&](const DepthStatePtrs& ds, const float* qptr) {
+        const int S = ds.count;
+        const float4* q4 = reinterpret_cast<const float4*>(qptr);
+        for (int s = 0; s < S; ++s) {
+            const float4* sp4 = reinterpret_cast<const float4*>(ds.p[s] + (size_t)m * D);
+            float ss = 0.0f, dot = 0.0f;
+            for (int i = tid; i < D4; i += 256) {
+                const float4 sv = sp4[i], qv = q4[i];
+                ss  += sv.x * sv.x + sv.y * sv.y + sv.z * sv.z + sv.w * sv.w;
+                dot = fmaf(sv.x, qv.x, dot); dot = fmaf(sv.y, qv.y, dot);
+                dot = fmaf(sv.z, qv.z, dot); dot = fmaf(sv.w, qv.w, dot);
+            }
+            ss  = warp_sum(ss);
+            dot = warp_sum(dot);
+            if (lane == 0) { s_wred[s][0][warp] = ss; s_wred[s][1][warp] = dot; }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float sc[8], sinv[8];
+            float mx = -1e30f;
+            for (int s = 0; s < S; ++s) {
+                float ss = 0.0f, ds_v = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 8; ++w) { ss += s_wred[s][0][w]; ds_v += s_wred[s][1][w]; }
+                sinv[s] = rsqrtf(ss / (float)D + kInkRmsEps);
+                sc[s] = ds_v * sinv[s] * inv_sqrt_d;
+                mx = fmaxf(mx, sc[s]);
+            }
+            float sum = 0.0f;
+            for (int s = 0; s < S; ++s) { sc[s] = expf(sc[s] - mx); sum += sc[s]; }
+            const float inv_s = 1.0f / sum;
+            for (int s = 0; s < S; ++s) s_prob[s] = sc[s] * inv_s * sinv[s];
+        }
+        __syncthreads();
+    };
+
+    // 1. Compute msg_c from bank states -> write msgs_out[c, m, :] and accumulate ssm!
+    compute_mix_probs(bst, q_msg + (size_t)c * D);
+    float4* mdst4 = reinterpret_cast<float4*>(msgs_out + ((size_t)c * M + m) * D);
+    float ssm = 0.0f;
+    for (int i = tid; i < D4; i += 256) {
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            if (s < bst.count) {
+                const float w = s_prob[s];
+                const float4 sv = reinterpret_cast<const float4*>(bst.p[s] + (size_t)m * D)[i];
+                ax = fmaf(w, sv.x, ax); ay = fmaf(w, sv.y, ay);
+                az = fmaf(w, sv.z, az); aw = fmaf(w, sv.w, aw);
+            }
+        }
+        mdst4[i] = make_float4(ax, ay, az, aw);
+        ssm += ax * ax + ay * ay + az * az + aw * aw;
+    }
+    if (c == 3) return;  // MLP message done!
+
+    // 2. Compute src_c from depth states -> write mixed_out[c, m, :] and accumulate ssc!
+    const int rq = is_swa ? 0 : c;
+    compute_mix_probs(stp, q_res + (size_t)rq * D);
+    float4* sdst4 = reinterpret_cast<float4*>(mixed_out + ((size_t)c * M + m) * D);
+    float ssc = 0.0f;
+    for (int i = tid; i < D4; i += 256) {
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            if (s < stp.count) {
+                const float w = s_prob[s];
+                const float4 sv = reinterpret_cast<const float4*>(stp.p[s] + (size_t)m * D)[i];
+                ax = fmaf(w, sv.x, ax); ay = fmaf(w, sv.y, ay);
+                az = fmaf(w, sv.z, az); aw = fmaf(w, sv.w, aw);
+            }
+        }
+        sdst4[i] = make_float4(ax, ay, az, aw);
+        ssc += ax * ax + ay * ay + az * az + aw * aw;
+    }
+
+    // 3. Write normalized [rms(src_c); rms(msg_c)] directly into cat3_out (if small-M fused path)!
+    if (cat3_out) {
+        ssc = block_sum(ssc, sh);
+        ssm = block_sum(ssm, sh);
+        const float ic = rsqrtf(ssc / (float)D + kInkRmsEps);
+        const float im = rsqrtf(ssm / (float)D + kInkRmsEps);
+        float* dst = cat3_out + ((size_t)c * M + m) * (2 * D);
+        float4* d0 = reinterpret_cast<float4*>(dst);
+        float4* d1 = reinterpret_cast<float4*>(dst + D);
+        for (int i = tid; i < D4; i += 256) {
+            const float4 sv = sdst4[i], mv = mdst4[i];
+            d0[i] = make_float4(sv.x * ic, sv.y * ic, sv.z * ic, sv.w * ic);
+            d1[i] = make_float4(mv.x * im, mv.y * im, mv.z * im, mv.w * im);
+        }
+    }
+}
+
+// FUSED 1-Launch Looped Pre-MLP Kernel: replaces attn_res_mix(d_moe_in) + ctrl_cat_rms (-24 launches/step!)
+__global__ void __launch_bounds__(256) k_ink_mlp_res_cat_rms(
+    DepthStatePtrs stp,
+    const float* __restrict__ q_mlp,  // [D]
+    const float* __restrict__ msg_m,  // [M, D] (d_msgs + 3*M*D)
+    float* __restrict__ moe_in_out,   // [M, D]
+    float* __restrict__ cat_out,      // [M, 2*D]
+    int M, int D) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int D4 = D >> 2;
+    const float inv_sqrt_d = rsqrtf((float)D);
+    __shared__ float s_wred[8][2][8];
+    __shared__ float s_prob[8];
+    __shared__ float sh[32];
+
+    const int S = stp.count;
+    const float4* q4 = reinterpret_cast<const float4*>(q_mlp);
+    for (int s = 0; s < S; ++s) {
+        const float4* sp4 = reinterpret_cast<const float4*>(stp.p[s] + (size_t)m * D);
+        float ss = 0.0f, dot = 0.0f;
+        for (int i = tid; i < D4; i += 256) {
+            const float4 sv = sp4[i], qv = q4[i];
+            ss  += sv.x * sv.x + sv.y * sv.y + sv.z * sv.z + sv.w * sv.w;
+            dot = fmaf(sv.x, qv.x, dot); dot = fmaf(sv.y, qv.y, dot);
+            dot = fmaf(sv.z, qv.z, dot); dot = fmaf(sv.w, qv.w, dot);
+        }
+        ss = warp_sum(ss); dot = warp_sum(dot);
+        if (lane == 0) { s_wred[s][0][warp] = ss; s_wred[s][1][warp] = dot; }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sc[8], sinv[8];
+        float mx = -1e30f;
+        for (int s = 0; s < S; ++s) {
+            float ss = 0.0f, ds_v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) { ss += s_wred[s][0][w]; ds_v += s_wred[s][1][w]; }
+            sinv[s] = rsqrtf(ss / (float)D + kInkRmsEps);
+            sc[s] = ds_v * sinv[s] * inv_sqrt_d;
+            mx = fmaxf(mx, sc[s]);
+        }
+        float sum = 0.0f;
+        for (int s = 0; s < S; ++s) { sc[s] = expf(sc[s] - mx); sum += sc[s]; }
+        const float inv_s = 1.0f / sum;
+        for (int s = 0; s < S; ++s) s_prob[s] = sc[s] * inv_s * sinv[s];
+    }
+    __syncthreads();
+
+    float4* dst4 = reinterpret_cast<float4*>(moe_in_out + (size_t)m * D);
+    const float4* mp4 = reinterpret_cast<const float4*>(msg_m + (size_t)m * D);
+    float ssc = 0.0f, ssm = 0.0f;
+    for (int i = tid; i < D4; i += 256) {
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            if (s < S) {
+                const float w = s_prob[s];
+                const float4 sv = reinterpret_cast<const float4*>(stp.p[s] + (size_t)m * D)[i];
+                ax = fmaf(w, sv.x, ax); ay = fmaf(w, sv.y, ay);
+                az = fmaf(w, sv.z, az); aw = fmaf(w, sv.w, aw);
+            }
+        }
+        dst4[i] = make_float4(ax, ay, az, aw);
+        const float4 mv = mp4[i];
+        ssc += ax * ax + ay * ay + az * az + aw * aw;
+        ssm += mv.x * mv.x + mv.y * mv.y + mv.z * mv.z + mv.w * mv.w;
+    }
+    ssc = block_sum(ssc, sh);
+    ssm = block_sum(ssm, sh);
+    const float ic = rsqrtf(ssc / (float)D + kInkRmsEps);
+    const float im = rsqrtf(ssm / (float)D + kInkRmsEps);
+    float4* c0 = reinterpret_cast<float4*>(cat_out + (size_t)m * (2 * D));
+    float4* c1 = reinterpret_cast<float4*>(cat_out + (size_t)m * (2 * D) + D);
+    for (int i = tid; i < D4; i += 256) {
+        const float4 sv = dst4[i], mv = mp4[i];
+        c0[i] = make_float4(sv.x * ic, sv.y * ic, sv.z * ic, sv.w * ic);
+        c1[i] = make_float4(mv.x * im, mv.y * im, mv.z * im, mv.w * im);
+    }
+}
+
+// FUSED MoE 8-Slot Reduction + Post-MLP ShortConv4 + Residual Add (-48 launches & -48 [M,2304] DRAM round-trips!)
+__global__ void __launch_bounds__(256) k_ink_moe_reduce8_sconv_m1(
+    const float* __restrict__ y_pair,     // [8, 2304]
+    const float* __restrict__ static_w,   // [2304, 4]
+    float* __restrict__ history,          // [3, 2304]
+    float* __restrict__ cur_io) {         // [2304] in/out
+    const int c = blockIdx.x * 256 + threadIdx.x;
+    if (c >= kInkHidden) return;
+    float cur = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kInkTopK; ++k) cur += y_pair[(size_t)k * kInkHidden + c];
+    const float4 sw = reinterpret_cast<const float4*>(static_w)[c];
+    const float h0 = history[0 * kInkHidden + c];
+    const float h1 = history[1 * kInkHidden + c];
+    const float h2 = history[2 * kInkHidden + c];
+    const float acc = h0 * sw.x + h1 * sw.y + h2 * sw.z + cur * sw.w;
+    cur_io[c] += (cur + acc) * 0.44721359549995793f;
+    history[0 * kInkHidden + c] = h1;
+    history[1 * kInkHidden + c] = h2;
+    history[2 * kInkHidden + c] = cur;
+}
+
+__global__ void __launch_bounds__(256) k_ink_moe_reduce8_sconv_batched(
+    const float* __restrict__ y_pair,     // [B, 8, 2304]
+    const float* __restrict__ static_w,   // [2304, 4]
+    float* __restrict__ history_pool,     // [max_slots, 3, 2304]
+    const int32_t* __restrict__ slot_ids, // [B]
+    float* __restrict__ cur_io,           // [B, 2304]
+    int B) {
+    const int b = blockIdx.y;
+    const int c = blockIdx.x * 256 + threadIdx.x;
+    if (b >= B || c >= kInkHidden) return;
+    const float* yp = y_pair + (size_t)b * kInkTopK * kInkHidden + c;
+    float cur = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kInkTopK; ++k) cur += yp[(size_t)k * kInkHidden];
+    const int slot = slot_ids[b];
+    float* hist = history_pool + (size_t)slot * 3 * kInkHidden;
+    const float4 sw = reinterpret_cast<const float4*>(static_w)[c];
+    const float h0 = hist[0 * kInkHidden + c];
+    const float h1 = hist[1 * kInkHidden + c];
+    const float h2 = hist[2 * kInkHidden + c];
+    const float acc = h0 * sw.x + h1 * sw.y + h2 * sw.z + cur * sw.w;
+    cur_io[(size_t)b * kInkHidden + c] += (cur + acc) * 0.44721359549995793f;
+    hist[0 * kInkHidden + c] = h1;
+    hist[1 * kInkHidden + c] = h2;
+    hist[2 * kInkHidden + c] = cur;
+}
+
+// Tree-32 Fused Reduce8 + ShortConv4 + Stage + Residual Add (18 CTAs x 128 threads, 16 KB smem, ZERO d_moe_raw!)
+__global__ void __launch_bounds__(128) k_ink_moe_reduce8_sconv_tree(
+    const float* __restrict__ y_pair,     // [M, 8, 2304]
+    const float* __restrict__ static_w,   // [2304, 4]
+    const float* __restrict__ history,    // [3, 2304]
+    const int8_t* __restrict__ lag_idx,   // [M, 3]
+    float* __restrict__ stage_v,          // [tree_cap, kInkSconvCh]
+    int ch_off,
+    float* __restrict__ cur_io,           // [M, 2304]
+    int M) {
+    const int tid = threadIdx.x;
+    const int c = blockIdx.x * 128 + tid;
+    if (c >= kInkHidden) return;
+    __shared__ float s_x[kInkMaxTree][128];  // 32 x 128 x 4 = 16 KB!
+    for (int m = 0; m < M; ++m) {
+        const float* yp = y_pair + (size_t)m * kInkTopK * kInkHidden + c;
+        float s = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kInkTopK; ++k) s += yp[(size_t)k * kInkHidden];
+        s_x[m][tid] = s;
+        if (stage_v) stage_v[(size_t)m * kInkSconvCh + ch_off + c] = s;
+    }
+    const float4 sw = reinterpret_cast<const float4*>(static_w)[c];
+    const float hc0 = history[0 * kInkHidden + c];
+    const float hc1 = history[1 * kInkHidden + c];
+    const float hc2 = history[2 * kInkHidden + c];
+    auto fetch = [&](int idx) -> float {
+        return (idx >= 0) ? s_x[idx][tid] : ((idx == -1) ? hc2 : ((idx == -2) ? hc1 : hc0));
+    };
+    for (int m = 0; m < M; ++m) {
+        const float h2 = fetch((int)lag_idx[m * 3 + 0]);
+        const float h1 = fetch((int)lag_idx[m * 3 + 1]);
+        const float h0 = fetch((int)lag_idx[m * 3 + 2]);
+        const float cur = s_x[m][tid];
+        const float acc = h0 * sw.x + h1 * sw.y + h2 * sw.z + cur * sw.w;
+        cur_io[(size_t)m * kInkHidden + c] += (cur + acc) * 0.44721359549995793f;
+    }
+}
+
 // Fast Shared-W F32 GEMM for tiny N (<= 64, e.g. attn_sink_proj [24, 2304], k/v_sconv.weight_proj [32, 2304]) at large M!
 // Caches W[row, 0..K-1] in 9 KB shared memory ONCE and computes 16 tokens/CTA (reads W 16x fewer times -> 0.15 ms)!
 // Grid: (N, (M + 15) / 16), Block: 256 (8 warps x 2 tokens/warp = 16 tokens/CTA)
@@ -1203,7 +1495,7 @@ __global__ void __launch_bounds__(128) k_ink_gemv_multi_q8row_preq(
         reinterpret_cast<const int8_t*>(mp.W[pid] + (size_t)mp.N[pid] * 4) + (size_t)lrow * K) : nullptr;
     float acc[MAX_M] = {};
 
-    constexpr int GT = (MAX_M <= 8) ? 36 : 18;
+    constexpr int GT = (MAX_M <= 8) ? 36 : 16;
     const int ng_tot = K >> 6;
     __shared__ alignas(16) InkQ8_1_G64 s_xq[MAX_M][GT];
     for (int g0 = 0; g0 < ng_tot; g0 += GT) {

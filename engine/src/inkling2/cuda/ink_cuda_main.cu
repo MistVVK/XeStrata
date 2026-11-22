@@ -49,6 +49,8 @@ int main(int argc, char** argv) {
     bool use_graph = true;
     bool use_screen = true;
     bool prof = false;
+    bool probe_early = false;
+    int beam_w = 4;
     std::string dump_logits_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -68,6 +70,8 @@ int main(int argc, char** argv) {
         else if (a == "--no-graph") use_graph = false;
         else if (a == "--no-screen") use_screen = false;
         else if (a == "--prof") { prof = true; use_graph = false; }
+        else if (a == "--probe-early-exit") probe_early = true;
+        else if (a == "--beam-w") beam_w = std::atoi(next_s().c_str());
         else if (a == "--dump-logits") dump_logits_path = next_s();
     }
     if (model_path.empty()) {
@@ -129,14 +133,22 @@ int main(int argc, char** argv) {
     runner.prof_reset();
     INK_CK(cudaDeviceSynchronize());
     double t_pp0 = now_s();
+    double dt_ingest_s = 0.0;
     for (int off = 0; off < P; off += chunk) {
         const int n = std::min(chunk, P - off);
         runner.forward_seq(prompt.data() + off, off, n, 0, dspark.ready);
-        if (dspark.ready) dspark.ingest_taps(off, n);
+        if (dspark.ready) {
+            if (prof) INK_CK(cudaStreamSynchronize(runner.st));
+            double ti0 = now_s();
+            dspark.ingest_taps(off, n);
+            if (prof) { INK_CK(cudaStreamSynchronize(runner.st)); dt_ingest_s += now_s() - ti0; }
+        }
     }
     INK_CK(cudaStreamSynchronize(runner.st));
     double dt_pp = now_s() - t_pp0;
-    std::printf("[PREFILL] %d tokens in %.2f ms -> %.1f ppts\n", P, dt_pp * 1000.0, (double)P / dt_pp);
+    std::printf("[PREFILL] %d tokens in %.2f ms -> %.1f ppts", P, dt_pp * 1000.0, (double)P / dt_pp);
+    if (prof && dspark.ready) std::printf(" (dspark_ingest=%.2f ms)", dt_ingest_s * 1000.0);
+    std::printf("\n");
     if (prof) runner.prof_print("PREFILL", 1);
 
     // Emit first token from last prompt position!
@@ -287,6 +299,90 @@ int main(int argc, char** argv) {
                 std::printf("  [PARITY vs PLAIN] %d/%d EXACT (first_diff=%d)\n", match, cmp_n, first_diff);
             }
         }
+        // Benchmark True W=4 Multi-Branch Bayes-Optimal Markov Beam Trees (fixed M = 6, 8, 12, 16 + Sparse-MoE Adaptive!)
+        struct BeamCfg { const char* name; int max_nodes; float moe_ratio; };
+        const BeamCfg cfgs[] = {
+            {"BEAM-W4 TREE-6",         6, 0.0f},
+            {"BEAM-W4 TREE-8",         8, 0.0f},
+            {"BEAM-W4 ADAPT-3..12 r35",12, 3.5f},
+            {"BEAM-W4 ADAPT-3..12 r42",12, 4.2f},
+        };
+        for (const auto& cfg : cfgs) {
+            if (cfg.max_nodes > runner.tree_cap) continue;
+            runner.reset_slot(0);
+            for (int off = 0; off < P; off += chunk) {
+                const int n = std::min(chunk, P - off);
+                runner.forward_seq(prompt.data() + off, off, n, 0, true);
+                dspark.ingest_taps(off, n);
+            }
+            INK_CK(cudaStreamSynchronize(runner.st));
+            std::vector<int32_t> spec_toks;
+            spec_toks.reserve(gen_n + 32);
+            spec_toks.push_back(first_tok);
+            int32_t cur = first_tok;
+            int pos = P;
+            InkSpecStats warm_st{}, st{};
+            int32_t emit[kInkMaxTree];
+            int n0 = ink_spec_step_beam_tree(runner, dspark, cur, pos, beam_w, cfg.max_nodes, emit, warm_st, cfg.moe_ratio);
+            for (int i = 0; i < n0 && (int)spec_toks.size() < gen_n; ++i) spec_toks.push_back(emit[i]);
+            INK_CK(cudaStreamSynchronize(runner.st));
+            double t_sp0 = now_s();
+            while ((int)spec_toks.size() < gen_n) {
+                int ne = ink_spec_step_beam_tree(runner, dspark, cur, pos, beam_w, cfg.max_nodes, emit, st, cfg.moe_ratio);
+                for (int i = 0; i < ne && (int)spec_toks.size() < gen_n; ++i) spec_toks.push_back(emit[i]);
+            }
+            INK_CK(cudaStreamSynchronize(runner.st));
+            double dt_sp = now_s() - t_sp0;
+            const int meas_toks = (int)st.tokens;
+            const double mean_acc = st.iters > 0 ? (double)st.tokens / (double)st.iters : 0.0;
+            const double mean_M = st.iters > 0 ? (double)(st.drafted + st.iters) / (double)st.iters : 0.0;
+            std::printf("[DSPARK %s c=1] %d tokens (%ld iters, %.2f tok/iter, avgM=%.1f) in %.2f ms -> %.1f tps (draft=%.2fms verify=%.2fms commit=%.2fms /iter)\n",
+                        cfg.name, meas_toks, st.iters, mean_acc, mean_M, dt_sp * 1000.0,
+                        (double)meas_toks / dt_sp,
+                        st.t_draft_ms / std::max(1L, st.iters),
+                        st.t_verify_ms / std::max(1L, st.iters),
+                        st.t_commit_ms / std::max(1L, st.iters));
+            if (check_parity) {
+                int match = 0, cmp_n = std::min((int)plain_toks.size(), (int)spec_toks.size());
+                int first_diff = -1;
+                for (int i = 0; i < cmp_n; ++i) {
+                    if (plain_toks[i] == spec_toks[i]) ++match;
+                    else if (first_diff < 0) first_diff = i;
+                }
+                std::printf("  [PARITY vs PLAIN] %d/%d EXACT (first_diff=%d)\n", match, cmp_n, first_diff);
+                if (first_diff >= 0) {
+                    std::printf("    plain[%d]=%d vs spec[%d]=%d\n", first_diff, plain_toks[first_diff], first_diff, spec_toks[first_diff]);
+                }
+            }
+        }
+    }
+
+    // ---- 2C. Empirical Early-Pass Exit Probe (1-Pass+Coda = 24 visits, 2-Pass+Coda = 36 visits vs 3-Pass = 48 visits!) ----
+    if (probe_early && (int)plain_toks.size() >= 16) {
+        const int probe_n = std::min((int)plain_toks.size() - 1, 64);
+        for (int np : {1, 2}) {
+            runner.max_passes_override = np;
+            runner.reset_slot(0);
+            for (int off = 0; off < P; off += chunk) {
+                const int n = std::min(chunk, P - off);
+                runner.forward_seq(prompt.data() + off, off, n, 0, false);
+            }
+            int agree = 0;
+            double t_ep0 = now_s();
+            for (int k = 0; k < probe_n; ++k) {
+                // Feed exact teacher-forced plain_toks[k] and compare Early-Pass prediction vs plain_toks[k+1]!
+                int32_t tok = plain_toks[k];
+                runner.forward_seq(&tok, P + k, 1, 0, false);
+                int32_t pred = 0;
+                runner.head_argmax_exact(1, &pred);
+                if (pred == plain_toks[k + 1]) ++agree;
+            }
+            double dt_ep = now_s() - t_ep0;
+            std::printf("[EARLY-EXIT PROBE %d-PASS+CODA (%d visits)] Top-1 agree vs 3-Pass = %d/%d (%.1f%%), %.2f ms/tok\n",
+                        np, 6 + np * 12 + 6, agree, probe_n, 100.0 * agree / std::max(1, probe_n),
+                        (dt_ep * 1000.0) / std::max(1, probe_n));
+        }
+        runner.max_passes_override = 0;
     }
 
     // ---- 3. Multi-Request Parallel Continuous Batching Benchmark (c = parallel) ----

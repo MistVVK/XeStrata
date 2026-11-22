@@ -357,11 +357,11 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa(
         attend_kv(kv4, vv4, kp);
     }
 
-    // 2. Tree-16 ancestor keys (only when tree_k != nullptr)
+    // 2. Tree-32 ancestor keys (only when tree_k != nullptr)
     if (tree_k) {
         const int dep = (int)tree_dep[m];
         for (int d_i = warp; d_i <= dep; d_i += 4) {
-            const int anc_node = (int)tree_anc[m * 16 + d_i];
+            const int anc_node = (int)tree_anc[m * kInkMaxTreeDepth + d_i];
             const int kp = tp0 + d_i;
             if (kv.is_swa && (qp - kp) >= kInkSwaWin) continue;
             const size_t tbase = ((size_t)anc_node * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
@@ -457,7 +457,7 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
 
     const int tp0 = tree_k ? q_pos[0] : tree_p0;
     const int k_start = kv.is_swa ? max(0, qp - kInkSwaWin + 1) : 0;
-    const int k_end   = tree_k ? tp0 : (qp + 1);
+    const int k_end   = qp + 1;
     const int k_len   = max(0, k_end - k_start);
     const int per_sp  = (k_len + kInkAttnSplits - 1) / kInkAttnSplits;
     const int s_beg   = k_start + sp * per_sp;
@@ -496,44 +496,40 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
         }
     };
 
+    // Unified bit-exact loop: every key kp (committed OR tree ancestor!) lands in the EXACT same (split, warp) as M=1!
     for (int kp = s_beg + warp; kp < s_end; kp += 4) {
-        const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
-        const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
         float4 kv4, vv4;
-        if (!kv.is_fp8) {
-            const uint2 k2 = *(const uint2*)(kv.k_f16 + base);
-            const uint2 v2 = *(const uint2*)(kv.v_f16 + base);
-            const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
-            const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
-            const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
-            const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
-            kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
-            vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
+        if (tree_k && kp >= tp0) {
+            const int anc_node = (int)tree_anc[m * kInkMaxTreeDepth + (kp - tp0)];
+            const size_t tbase = ((size_t)anc_node * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
+            kv4 = *(const float4*)(tree_k + tbase);
+            vv4 = *(const float4*)(tree_v + tbase);
         } else {
-            const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-            const float sk = kv.k_sc[sidx], sv = kv.v_sc[sidx];
-            const uint32_t k4 = *(const uint32_t*)(kv.k_f8 + base);
-            const uint32_t v4 = *(const uint32_t*)(kv.v_f8 + base);
-            const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
-            const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
-            const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
-            const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4 >> 16));
-            kv4 = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
-            vv4 = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
+            const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
+            const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
+            if (!kv.is_fp8) {
+                const uint2 k2 = *(const uint2*)(kv.k_f16 + base);
+                const uint2 v2 = *(const uint2*)(kv.v_f16 + base);
+                const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
+                const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
+                const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
+                const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
+                kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
+                vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
+            } else {
+                const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh;
+                const float sk = kv.k_sc[sidx], sv = kv.v_sc[sidx];
+                const uint32_t k4 = *(const uint32_t*)(kv.k_f8 + base);
+                const uint32_t v4 = *(const uint32_t*)(kv.v_f8 + base);
+                const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
+                const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
+                const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
+                const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4 >> 16));
+                kv4 = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
+                vv4 = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
+            }
         }
         attend3(kv4, vv4, kp);
-    }
-
-    // Split 0 also attends tree ancestors (at most 16 nodes!)
-    if (tree_k && sp == 0) {
-        const int dep = (int)tree_dep[m];
-        for (int d_i = warp; d_i <= dep; d_i += 4) {
-            const int anc_node = (int)tree_anc[m * 16 + d_i];
-            const int kp = tp0 + d_i;
-            if (kv.is_swa && (qp - kp) >= kInkSwaWin) continue;
-            const size_t tbase = ((size_t)anc_node * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
-            attend3(*(const float4*)(tree_k + tbase), *(const float4*)(tree_v + tbase), kp);
-        }
     }
 
     // Merge 4 warps inside this split for each of the 3 Q heads -> write to part_m / part_l / part_o!

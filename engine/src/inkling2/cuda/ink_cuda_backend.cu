@@ -178,6 +178,7 @@ public:
         if (slot >= 0 && slot < max_slots_) {
             slot_alloc_[slot] = false;
             snap_active_[slot] = false;
+            if (slot == 0) tree_snap_ready_ = false;
         }
     }
 
@@ -185,7 +186,7 @@ public:
         if (!initialized_ || slot < 0 || slot >= max_slots_) return;
         runner_->reset_slot(slot);
         snap_active_[slot] = false;
-        if (slot == 0) dspark_slot_ = -1;
+        if (slot == 0) { dspark_slot_ = -1; tree_snap_ready_ = false; }
     }
 
     void snapshot_slot(int slot) override {
@@ -194,23 +195,37 @@ public:
             runner_->d_sconv_pool_arr, d_sconv_snap_, slot, runner_->max_slots, true);
         snap_active_[slot] = true;
         snap_M_[slot] = 0;
+        if (slot == 0) tree_snap_ready_ = false;
     }
 
     void rollback_slot(int slot, int keep_len) override {
-        if (!initialized_ || slot < 0 || slot >= max_slots_ || !snap_active_[slot]) return;
-        const int n_keep = std::max(0, std::min(snap_M_[slot], keep_len - snap_p0_[slot]));
-        // 1. Restore pre-verify ShortConv history from snapshot (2.5 us!)
-        strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
-            runner_->d_sconv_pool_arr, d_sconv_snap_, slot, runner_->max_slots, false);
-        // 2. Replay exact n_keep accepted steps from d_stage_sconv!
-        if (n_keep > 0) {
-            int32_t path[16];
-            for (int i = 0; i < n_keep; ++i) path[i] = i;
-            INK_CK(cudaMemcpyAsync(runner_->d_acc_path, path, (size_t)n_keep * 4, cudaMemcpyHostToDevice, runner_->st));
-            strata::ink::k_ink_commit_sconv_all48<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
-                runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_keep, slot, runner_->max_slots);
+        if (!initialized_ || slot < 0 || slot >= max_slots_) return;
+        if (snap_active_[slot]) {
+            const int n_keep = std::max(0, std::min(snap_M_[slot], keep_len - snap_p0_[slot]));
+            strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+                runner_->d_sconv_pool_arr, d_sconv_snap_, slot, runner_->max_slots, false);
+            if (n_keep > 0) {
+                int32_t path[16];
+                for (int i = 0; i < n_keep; ++i) path[i] = i;
+                INK_CK(cudaMemcpyAsync(runner_->d_acc_path, path, (size_t)n_keep * 4, cudaMemcpyHostToDevice, runner_->st));
+                strata::ink::k_ink_commit_sconv_all48<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+                    runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_keep, slot, runner_->max_slots, runner_->tree_cap);
+            }
+            snap_active_[slot] = false;
+            return;
         }
-        snap_active_[slot] = false;
+        if (slot == 0 && tree_snap_ready_) {
+            // Exact multi-branch tree rewind on early EOS / stop_tok / anti-loop!
+            const int n_keep = std::max(0, std::min(tree_snap_M_, keep_len - tree_snap_p0_));
+            strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+                runner_->d_sconv_pool_arr, d_sconv_snap_, 0, runner_->max_slots, false);
+            if (n_keep > 0) {
+                INK_CK(cudaMemcpyAsync(runner_->d_acc_path, tree_snap_path_, (size_t)n_keep * 4, cudaMemcpyHostToDevice, runner_->st));
+                strata::ink::k_ink_commit_sconv_all48<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+                    runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_keep, 0, runner_->max_slots, runner_->tree_cap);
+            }
+            tree_snap_ready_ = false;
+        }
     }
 
     bool forward_batch(
@@ -224,6 +239,7 @@ public:
         }
         const int N = batch.n_tokens;
         if (N <= 0) return true;
+        tree_snap_ready_ = false;
         const int V = model_.man.c.vocab_unpadded;
 
         // Pre-compute packed output row index for every token with want_logits[i] != 0
@@ -339,9 +355,9 @@ public:
                     for (int k = 0; k < M; ++k) path[k] = k;
                     INK_CK(cudaMemcpyAsync(runner_->d_acc_path, path, (size_t)M * 4, cudaMemcpyHostToDevice, runner_->st));
                     strata::ink::k_ink_commit_sconv_all48<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
-                        runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, M, slot, runner_->max_slots);
+                        runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, M, slot, runner_->max_slots, runner_->tree_cap);
                     strata::ink::k_ink_commit_kv_all48<<<dim3(strata::ink::kInkVisits, strata::ink::kInkKVHeads), 128, 0, runner_->st>>>(
-                        runner_->d_kv_desc_arr, runner_->d_stage_k, runner_->d_stage_v, runner_->d_acc_path, p0, M, slot);
+                        runner_->d_kv_desc_arr, runner_->d_stage_k, runner_->d_stage_v, runner_->d_acc_path, p0, M, slot, runner_->tree_cap);
                     snap_p0_[slot] = p0;
                     snap_M_[slot] = M;
                 } else {
@@ -435,10 +451,92 @@ public:
         if (!initialized_ || !dspark_ || !dspark_->ready || slot != 0 || dspark_slot_ != 0) return 0;
         if (anchor_pos <= 0 || anchor_pos + 8 >= dspark_->max_ctx) return 0;
         int32_t ids7[8] = {};
-        dspark_->draft_block8(anchor_tok, anchor_pos, ids7, nullptr);
-        const int nd = std::max(0, std::min(7, max_draft));
-        for (int i = 0; i < nd; ++i) out_draft_ids[i] = ids7[i];
-        return nd;
+        float conf7[8] = {};
+        dspark_->draft_block8(anchor_tok, anchor_pos, ids7, conf7);
+        const int cap = std::max(0, std::min(7, max_draft));
+        if (cap <= 0) return 0;
+        // Sparse-MoE Bayes-Optimal Adaptive Draft Length (128 experts, Top-8):
+        // Pick nd in [2..cap] maximizing expected emitted tokens / (1 + 4.2 * (1 - (15/16)^(nd+1)))!
+        double best_rate = -1.0;
+        int best_nd = std::min(2, cap);
+        double cum_p = 1.0;
+        double e_tok = 1.0;
+        for (int k = 1; k <= cap; ++k) {
+            cum_p *= std::max(0.0, std::min(1.0, (double)conf7[k - 1]));
+            e_tok += cum_p;
+            if (k >= 2 || k == cap) {
+                const double exp_frac = 1.0 - std::pow(15.0 / 16.0, (double)(k + 1));
+                const double rate = e_tok / (1.0 + 4.2 * exp_frac);
+                if (rate > best_rate) { best_rate = rate; best_nd = k; }
+            }
+        }
+        for (int i = 0; i < best_nd; ++i) out_draft_ids[i] = ids7[i];
+        return best_nd;
+    }
+
+    int dspark_spec_step_greedy(
+        int slot,
+        int32_t anchor_tok,
+        int anchor_pos,
+        int max_emit,
+        int32_t* out_emitted,
+        int* out_drafted,
+        std::string& /*err*/) override {
+        if (!initialized_ || !dspark_ || !dspark_->ready || slot != 0 || dspark_slot_ != 0) return 0;
+        if (anchor_pos <= 0 || anchor_pos + 12 >= dspark_->max_ctx || max_emit < 1 || !out_emitted) return 0;
+
+        // 1. Snapshot slot-0 ShortConv pre-verify state (2.5 us) for exact mid-tree EOS rollback if needed!
+        strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+            runner_->d_sconv_pool_arr, d_sconv_snap_, 0, runner_->max_slots, true);
+
+        // 2. True W=4 Multi-Branch Sparse-MoE Bayes-Optimal Adaptive Beam Tree (M* in {3,4,5,6,8,10,12})!
+        strata::ink::InkTreeSpec tr{};
+        const int max_nodes = std::min(12, runner_->tree_cap);
+        dspark_->draft_beam_tree(anchor_tok, anchor_pos, /*beam_w=*/4, max_nodes, tr, /*adaptive_moe_ratio=*/4.2f);
+
+        // 3. Single CUDA-Graph 48-visit tree verify + exact GPU screened argmax (ZERO 6.4 MB logits D2H!)
+        runner_->forward_tree_verify(tr, anchor_pos, 0, true);
+        int32_t target_next[strata::ink::kInkMaxTree] = {};
+        runner_->head_argmax_exact(tr.M, target_next);
+
+        // 4. Exact greedy tree walk (clamped to min(max_emit, 8))
+        const int emit_cap = std::min(max_emit, 8);
+        int32_t path[strata::ink::kInkMaxTree] = {};
+        int n_emit = 0;
+        int cur_node = 0;
+        while (n_emit < emit_cap) {
+            path[n_emit] = cur_node;
+            const int32_t tok_next = target_next[cur_node];
+            out_emitted[n_emit++] = tok_next;
+            int next_child = -1;
+            for (int j = cur_node + 1; j < tr.M; ++j) {
+                if (tr.parent[j] == cur_node && tr.tok[j] == tok_next) {
+                    next_child = j;
+                    break;
+                }
+            }
+            if (next_child >= 0) cur_node = next_child;
+            else break;
+        }
+
+        // 5. Commit ONLY the accepted tree path across all 48 visits (2 launches) + compact & ingest DSpark taps!
+        INK_CK(cudaMemcpyAsync(runner_->d_acc_path, path, (size_t)n_emit * 4, cudaMemcpyHostToDevice, runner_->st));
+        strata::ink::k_ink_commit_sconv_all48<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+            runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_emit, 0, runner_->max_slots, runner_->tree_cap);
+        strata::ink::k_ink_commit_kv_all48<<<dim3(strata::ink::kInkVisits, strata::ink::kInkKVHeads), 128, 0, runner_->st>>>(
+            runner_->d_kv_desc_arr, runner_->d_stage_k, runner_->d_stage_v, runner_->d_acc_path, anchor_pos, n_emit, 0, runner_->tree_cap);
+        for (int t = 0; t < 4; ++t) {
+            strata::ink::k_ink_compact_taps<<<n_emit, 256, 0, runner_->st>>>(
+                runner_->d_taps[t], runner_->d_taps_compact[t], runner_->d_acc_path, n_emit);
+        }
+        dspark_->ingest_taps_from(runner_->d_taps_compact, anchor_pos, n_emit);
+
+        tree_snap_ready_ = true;
+        tree_snap_p0_ = anchor_pos;
+        tree_snap_M_ = n_emit;
+        for (int i = 0; i < n_emit; ++i) tree_snap_path_[i] = path[i];
+        if (out_drafted) *out_drafted = tr.M - 1;
+        return n_emit;
     }
 
     bool selfcheck(std::string& err) override {
@@ -505,6 +603,10 @@ private:
     std::vector<bool> snap_active_;
     std::vector<int> snap_p0_;
     std::vector<int> snap_M_;
+    bool tree_snap_ready_ = false;
+    int tree_snap_p0_ = 0;
+    int tree_snap_M_ = 0;
+    int32_t tree_snap_path_[strata::ink::kInkMaxTree] = {};
 };
 
 std::unique_ptr<InkBackend> make_cuda_backend() {

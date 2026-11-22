@@ -674,6 +674,333 @@ __global__ void __launch_bounds__(256) k_dspark_top2_reduce(
 }
 
 // ============================================================================
+// True W=4 Multi-Branch On-GPU Markov Beam Tree Kernels (CUDA-Graph Capturable!)
+// ============================================================================
+constexpr int kInkMaxBeam = 4;
+constexpr int kInkBeamPoolCap = 64;
+
+__global__ void __launch_bounds__(256) k_dspark_beam_init(
+    const int32_t* __restrict__ anchor_id,
+    float* __restrict__ beam_state,       // [4, 256]
+    int32_t* __restrict__ beam_prev_tok,  // [4]
+    float* __restrict__ beam_logp,        // [4]
+    int32_t* __restrict__ beam_node,      // [4]
+    int32_t* __restrict__ pool_tok,       // [64]
+    int8_t* __restrict__ pool_parent,     // [64]
+    uint8_t* __restrict__ pool_depth,     // [64]
+    float* __restrict__ pool_logp,        // [64]
+    int32_t* __restrict__ pool_cnt) {     // [1]
+    const int tid = threadIdx.x;
+    for (int b = 0; b < kInkMaxBeam; ++b) beam_state[b * kInkMarkovRank + tid] = 0.0f;
+    if (tid == 0) {
+        const int32_t anc = *anchor_id;
+        beam_prev_tok[0] = anc;
+        beam_logp[0] = 0.0f;
+        beam_node[0] = 0;
+        for (int b = 1; b < kInkMaxBeam; ++b) {
+            beam_prev_tok[b] = anc;
+            beam_logp[b] = -1e30f;
+            beam_node[b] = 0;
+        }
+        pool_tok[0] = anc;
+        pool_parent[0] = -1;
+        pool_depth[0] = 0;
+        pool_logp[0] = 0.0f;
+        *pool_cnt = 1;
+    }
+}
+
+__global__ void __launch_bounds__(256) k_dspark_markov_prep_batch(
+    const int32_t* __restrict__ prev_toks, // [nw]
+    const float* __restrict__ states,      // [nw, 256]
+    const float* __restrict__ hidden,      // [2304]
+    const float* __restrict__ f_rnn_base,  // [max_ctx, 2304]
+    const int32_t* __restrict__ apos_ptr,  // [1]
+    const uint8_t* __restrict__ mw1_raw, int mw1_fmt,
+    float* __restrict__ joint_out,         // [nw, 5120]
+    int nw) {
+    constexpr int R = kInkMarkovRank;
+    constexpr int J = 2 * R + 2 * kInkHidden;
+    const int b = blockIdx.x;
+    if (b >= nw) return;
+    const int tid = threadIdx.x;
+    const int32_t pt = prev_toks[b];
+    const int apos = *apos_ptr;
+    const float* ctx = f_rnn_base + (size_t)(apos > 0 ? (apos - 1) : 0) * kInkHidden;
+    float* jo = joint_out + (size_t)b * J;
+
+    jo[tid] = states[(size_t)b * R + tid];
+    float mv = 0.0f;
+    if (mw1_fmt == FMT_BF16) mv = bf16_to_f32(reinterpret_cast<const uint16_t*>(mw1_raw)[(size_t)pt * R + tid]);
+    else if (mw1_fmt == FMT_F32) mv = reinterpret_cast<const float*>(mw1_raw)[(size_t)pt * R + tid];
+    else {
+        const float sc = reinterpret_cast<const float*>(mw1_raw)[pt];
+        mv = (float)reinterpret_cast<const int8_t*>(mw1_raw + (size_t)kInkVocabPad * 4)[(size_t)pt * R + tid] * sc;
+    }
+    jo[R + tid] = mv;
+    for (int d = tid; d < kInkHidden; d += 256) {
+        jo[2 * R + d]              = hidden[d];
+        jo[2 * R + kInkHidden + d] = ctx[d];
+    }
+}
+
+__global__ void __launch_bounds__(256) k_dspark_markov_gru_upd_batch(
+    const float* __restrict__ proj,       // [nw, 768]
+    const float* __restrict__ rp_b,       // [768]
+    const float* __restrict__ state_in,   // [nw, 256]
+    float* __restrict__ state_next,       // [nw, 256]
+    float* __restrict__ lat_out,          // [nw, 256]
+    int nw) {
+    constexpr int R = kInkMarkovRank;
+    const int b = blockIdx.x;
+    if (b >= nw) return;
+    const int tid = threadIdx.x;
+    const float* pr = proj + (size_t)b * (3 * R);
+    const float p0 = pr[tid]         + rp_b[tid];
+    const float p1 = pr[R + tid]     + rp_b[R + tid];
+    const float p2 = pr[2 * R + tid] + rp_b[2 * R + tid];
+    const float g = 1.0f / (1.0f + __expf(-p0));
+    const float cand = tanhf(p1);
+    const float st_old = state_in[(size_t)b * R + tid];
+    state_next[(size_t)b * R + tid] = cand + g * (st_old - cand);
+    lat_out[(size_t)b * R + tid]    = tanhf(p2);
+}
+
+__global__ void __launch_bounds__(256) k_dspark_add_bias_and_h_batch(
+    float* __restrict__ corr,       // [nw, 2304]
+    const float* __restrict__ ho_b, // [2304]
+    const float* __restrict__ hs,   // [2304]
+    bool add_hs,
+    int nw) {
+    const int b = blockIdx.y;
+    const int d = blockIdx.x * 256 + threadIdx.x;
+    if (b >= nw || d >= kInkHidden) return;
+    corr[(size_t)b * kInkHidden + d] += ho_b[d] + (add_hs ? hs[d] : 0.0f);
+}
+
+// Ultra-fast dp4a_i8 Batched Candidate Scorer: reads each K_cand INT8 unembed row ONCE for ALL nw <= 4 beams (~6 us!)
+__global__ void __launch_bounds__(256) k_dspark_score_cand_dp4a_batch(
+    const int8_t* __restrict__ q8,         // [V, 2304]
+    const float* __restrict__ sc,          // [V]
+    const float* __restrict__ corr,        // [nw, 2304]
+    const int32_t* __restrict__ cand_ids,  // [K_cand]
+    const float* __restrict__ cand_base,   // [K_cand] (nullable)
+    int K_cand,
+    int nw,
+    float* __restrict__ cand_scores) {     // [nw, K_cand]
+    __shared__ alignas(16) uint32_t s_c[kInkMaxBeam][kInkHidden / 4];  // 9,216 B!
+    __shared__ float s_sc[kInkMaxBeam];
+    __shared__ float sm[8];
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    for (int b = 0; b < nw; ++b) {
+        const float* cp = corr + (size_t)b * kInkHidden;
+        float am = 0.0f;
+        for (int d = tid; d < kInkHidden; d += 256) am = fmaxf(am, fabsf(cp[d]));
+        am = warp_max(am);
+        if (lane == 0) sm[warp] = am;
+        __syncthreads();
+        am = fmaxf(fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3])),
+                   fmaxf(fmaxf(sm[4], sm[5]), fmaxf(sm[6], sm[7])));
+        const float csc = am * (1.0f / 127.0f);
+        const float inv = csc > 0.0f ? (127.0f / am) : 0.0f;
+        int8_t* dst = reinterpret_cast<int8_t*>(s_c[b]);
+        for (int d = tid; d < kInkHidden; d += 256) dst[d] = (int8_t)max(-127, min(127, __float2int_rn(cp[d] * inv)));
+        if (tid == 0) s_sc[b] = csc;
+        __syncthreads();
+    }
+
+    const int k = blockIdx.x * 8 + warp;
+    if (k >= K_cand) return;
+    const int32_t row = cand_ids[k];
+    const uint4* q16 = reinterpret_cast<const uint4*>(q8 + (size_t)row * kInkHidden);
+    int32_t acc[kInkMaxBeam] = {};
+    for (int i = lane; i < (kInkHidden / 16); i += 32) {
+        const uint4 v = q16[i];
+        const int base = i * 4;
+#pragma unroll
+        for (int b = 0; b < kInkMaxBeam; ++b) {
+            if (b < nw) {
+                const uint4 cv = *reinterpret_cast<const uint4*>(s_c[b] + base);
+                int32_t a = acc[b];
+                a = dp4a_i8(v.x, cv.x, a);
+                a = dp4a_i8(v.y, cv.y, a);
+                a = dp4a_i8(v.z, cv.z, a);
+                a = dp4a_i8(v.w, cv.w, a);
+                acc[b] = a;
+            }
+        }
+    }
+    const float sc_r = sc[row];
+    const float bv = cand_base ? cand_base[k] : 0.0f;
+#pragma unroll
+    for (int b = 0; b < kInkMaxBeam; ++b) {
+        if (b < nw) {
+            int32_t s = acc[b];
+#pragma unroll
+            for (int o = 16; o >= 1; o >>= 1) s += __shfl_xor_sync(0xFFFFFFFFu, s, o);
+            if (lane == 0) {
+                const float val = bv + (float)s * sc_r * s_sc[b];
+                cand_scores[(size_t)b * K_cand + k] = kInkSoftcap * tanhf(val * (1.0f / kInkSoftcap));
+            }
+        }
+    }
+}
+
+// Parallel 256-thread Beam Expansion: exact log-softmax over K_cand -> top-4 children/beam -> record top-8 into pool + advance top-W beams!
+__global__ void __launch_bounds__(256) k_dspark_beam_expand(
+    const float* __restrict__ cand_scores,  // [nw, K_cand]
+    const int32_t* __restrict__ cand_ids,   // [K_cand]
+    const float* __restrict__ state_next,   // [nw, 256]
+    int K_cand,
+    int nw,
+    int beam_w,
+    int depth,
+    float* __restrict__ state_out,          // [beam_w, 256]
+    int32_t* __restrict__ beam_prev_tok,    // [beam_w]
+    float* __restrict__ beam_logp,          // [beam_w] in/out
+    int32_t* __restrict__ beam_node,        // [beam_w] in/out
+    int32_t* __restrict__ pool_tok,         // [64]
+    int8_t* __restrict__ pool_parent,       // [64]
+    uint8_t* __restrict__ pool_depth,       // [64]
+    float* __restrict__ pool_logp,          // [64]
+    int32_t* __restrict__ pool_cnt) {       // [1]
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    __shared__ float s_wval[8];
+    __shared__ int32_t s_widx[8];
+    __shared__ float sh_sum[32];
+    __shared__ float s_mx, s_logz;
+    __shared__ int32_t s_picked[4];
+
+    __shared__ int32_t exp_tok[16];
+    __shared__ float   exp_lp[16];
+    __shared__ int32_t exp_pnode[16];
+    __shared__ int32_t exp_pbeam[16];
+    __shared__ int32_t win_beam[kInkMaxBeam];
+
+    for (int b = 0; b < nw; ++b) {
+        const float* sc = cand_scores + (size_t)b * K_cand;
+        // 1. Max score
+        float mv = -3e38f;
+        for (int k = tid; k < K_cand; k += 256) mv = fmaxf(mv, sc[k]);
+        mv = warp_max(mv);
+        if (lane == 0) s_wval[warp] = mv;
+        __syncthreads();
+        if (tid == 0) {
+            float g = s_wval[0];
+            for (int w = 1; w < 8; ++w) g = fmaxf(g, s_wval[w]);
+            s_mx = g;
+        }
+        __syncthreads();
+        // 2. Partition function Z = sum exp(sc[k] - s_mx)
+        const float mx_v = s_mx;
+        float z = 0.0f;
+        for (int k = tid; k < K_cand; k += 256) z += __expf(sc[k] - mx_v);
+        z = block_sum(z, sh_sum);
+        if (tid == 0) s_logz = mx_v + logf(fmaxf(z, 1e-30f));
+        __syncthreads();
+        const float logz = s_logz;
+        const float parent_lp = beam_logp[b];
+        const int32_t parent_nd = beam_node[b];
+
+        // 3. Extract top-4 distinct candidates for beam b
+        for (int r = 0; r < 4; ++r) {
+            float bv = -3e38f;
+            int32_t bk = -1;
+            for (int k = tid; k < K_cand; k += 256) {
+                bool skip = false;
+                for (int j = 0; j < r; ++j) if (k == s_picked[j]) skip = true;
+                if (!skip) {
+                    const float v = sc[k];
+                    if (v > bv || (v == bv && (bk < 0 || cand_ids[k] < cand_ids[bk]))) {
+                        bv = v; bk = k;
+                    }
+                }
+            }
+#pragma unroll
+            for (int o = 16; o >= 1; o >>= 1) {
+                float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, o);
+                int32_t ok = __shfl_xor_sync(0xFFFFFFFFu, bk, o);
+                if (ok >= 0 && (bk < 0 || ov > bv || (ov == bv && cand_ids[ok] < cand_ids[bk]))) {
+                    bv = ov; bk = ok;
+                }
+            }
+            if (lane == 0) { s_wval[warp] = bv; s_widx[warp] = bk; }
+            __syncthreads();
+            if (tid == 0) {
+                float gv = -3e38f; int32_t gk = -1;
+                for (int w = 0; w < 8; ++w) {
+                    int32_t ok = s_widx[w];
+                    float ov = s_wval[w];
+                    if (ok >= 0 && (gk < 0 || ov > gv || (ov == gv && cand_ids[ok] < cand_ids[gk]))) {
+                        gv = ov; gk = ok;
+                    }
+                }
+                s_picked[r] = gk;
+                const int idx = b * 4 + r;
+                exp_tok[idx]   = (gk >= 0) ? cand_ids[gk] : 0;
+                exp_lp[idx]    = (gk >= 0) ? (parent_lp + (gv - logz)) : -1e30f;
+                exp_pnode[idx] = parent_nd;
+                exp_pbeam[idx] = b;
+            }
+            __syncthreads();
+        }
+    }
+
+    if (tid == 0) {
+        const int n_exp = nw * 4;
+        int ord[16];
+        for (int i = 0; i < n_exp; ++i) ord[i] = i;
+        // Insertion sort descending by joint log-prob
+        for (int i = 1; i < n_exp; ++i) {
+            int key = ord[i];
+            int j = i - 1;
+            while (j >= 0 && exp_lp[ord[j]] < exp_lp[key]) {
+                ord[j + 1] = ord[j];
+                --j;
+            }
+            ord[j + 1] = key;
+        }
+        const int base = *pool_cnt;
+        const int k_rec = min(n_exp, min((depth == 1) ? 4 : 8, kInkBeamPoolCap - base));
+        for (int j = 0; j < k_rec; ++j) {
+            const int id = ord[j];
+            const int dst = base + j;
+            pool_tok[dst]    = exp_tok[id];
+            pool_parent[dst] = (int8_t)exp_pnode[id];
+            pool_depth[dst]  = (uint8_t)depth;
+            pool_logp[dst]   = exp_lp[id];
+        }
+        *pool_cnt = base + k_rec;
+
+        const int k_keep = min(beam_w, k_rec);
+        for (int j = 0; j < beam_w; ++j) {
+            if (j < k_keep) {
+                const int id = ord[j];
+                beam_prev_tok[j] = exp_tok[id];
+                beam_logp[j]     = exp_lp[id];
+                beam_node[j]     = base + j;
+                win_beam[j]      = exp_pbeam[id];
+            } else {
+                beam_prev_tok[j] = exp_tok[ord[0]];
+                beam_logp[j]     = -1e30f;
+                beam_node[j]     = base;
+                win_beam[j]      = exp_pbeam[ord[0]];
+            }
+        }
+    }
+    __syncthreads();
+    for (int j = 0; j < beam_w; ++j) {
+        const int pb = win_beam[j];
+        state_out[(size_t)j * kInkMarkovRank + tid] = state_next[(size_t)pb * kInkMarkovRank + tid];
+    }
+}
+
+// ============================================================================
 // InkDSpark: On-GPU 3-Layer Block-8 / Tree-16 Recurrent Markov Drafter
 // ============================================================================
 struct InkDSpark {
@@ -717,6 +1044,30 @@ struct InkDSpark {
     int32_t *h_meta_pin = nullptr;   // pinned [16] for async anchor/apos/pos
     int32_t *h_pos_pin = nullptr;    // pinned [max_batch] for zero-sync ingest_taps_from!
     cudaGraphExec_t draft_graph = nullptr;
+    cudaGraphExec_t beam_graph = nullptr;
+    int beam_graph_w = 0;
+
+    // W=4 Multi-Branch Beam Tree buffers (~150 KB total!)
+    float   *d_beam_state = nullptr;      // [4, 256]
+    float   *d_beam_state_next = nullptr; // [4, 256]
+    int32_t *d_beam_prev_tok = nullptr;   // [4]
+    float   *d_beam_logp = nullptr;       // [4]
+    int32_t *d_beam_node = nullptr;       // [4]
+    float   *d_rnn_joint_b = nullptr;     // [4, 5120]
+    float   *d_rnn_proj_b = nullptr;      // [4, 768]
+    float   *d_rnn_lat_b = nullptr;       // [4, 256]
+    float   *d_corr_b = nullptr;          // [4, 2304]
+    float   *d_cand_scores_b = nullptr;   // [4, K_cand]
+    int32_t *d_pool_tok = nullptr;        // [64]
+    int8_t  *d_pool_parent = nullptr;     // [64]
+    uint8_t *d_pool_depth = nullptr;      // [64]
+    float   *d_pool_logp = nullptr;       // [64]
+    int32_t *d_pool_cnt = nullptr;        // [1]
+    int32_t *h_pool_tok = nullptr;        // pinned [64]
+    int8_t  *h_pool_parent = nullptr;     // pinned [64]
+    uint8_t *h_pool_depth = nullptr;      // pinned [64]
+    float   *h_pool_logp = nullptr;       // pinned [64]
+    int32_t *h_pool_cnt = nullptr;        // pinned [1]
     // Pre-dequantized BF16 (sm_80+) or FP16 (sm_70/75) cache of DSpark's 3 tiny layers (+ fused kv_ctx!)
     std::unordered_map<std::string, uint16_t*> bf16_cache;
     uint16_t* d_bf16_pool = nullptr;
@@ -776,6 +1127,28 @@ struct InkDSpark {
         h_meta_pin    = halloc_pinned<int32_t>(16);
         h_pos_pin     = halloc_pinned<int32_t>(std::max(r.max_batch, 16));
 
+        // Allocate W=4 Multi-Branch Beam Tree buffers (~150 KB total!)
+        d_beam_state      = dalloc<float>(kInkMaxBeam * kInkMarkovRank);
+        d_beam_state_next = dalloc<float>(kInkMaxBeam * kInkMarkovRank);
+        d_beam_prev_tok   = dalloc<int32_t>(kInkMaxBeam);
+        d_beam_logp       = dalloc<float>(kInkMaxBeam);
+        d_beam_node       = dalloc<int32_t>(kInkMaxBeam);
+        d_rnn_joint_b     = dalloc<float>((size_t)kInkMaxBeam * (2 * kInkMarkovRank + 2 * kInkHidden));
+        d_rnn_proj_b      = dalloc<float>((size_t)kInkMaxBeam * 3 * kInkMarkovRank);
+        d_rnn_lat_b       = dalloc<float>((size_t)kInkMaxBeam * kInkMarkovRank);
+        d_corr_b          = dalloc<float>((size_t)kInkMaxBeam * kInkHidden);
+        d_cand_scores_b   = dalloc<float>((size_t)kInkMaxBeam * K_cand);
+        d_pool_tok        = dalloc<int32_t>(kInkBeamPoolCap);
+        d_pool_parent     = dalloc<int8_t>(kInkBeamPoolCap);
+        d_pool_depth      = dalloc<uint8_t>(kInkBeamPoolCap);
+        d_pool_logp       = dalloc<float>(kInkBeamPoolCap);
+        d_pool_cnt        = dalloc<int32_t>(1);
+        h_pool_tok        = halloc_pinned<int32_t>(kInkBeamPoolCap);
+        h_pool_parent     = halloc_pinned<int8_t>(kInkBeamPoolCap);
+        h_pool_depth      = halloc_pinned<uint8_t>(kInkBeamPoolCap);
+        h_pool_logp       = halloc_pinned<float>(kInkBeamPoolCap);
+        h_pool_cnt        = halloc_pinned<int32_t>(1);
+
         // Pre-pack the 3 tiny DSpark layers into fused BF16 (sm_80+) or FP16 (sm_70/75) QKV, GU, KV_CTX, O, DOWN!
         // Collapses 21+6 cuBLAS calls -> 12+3 Tensor Core calls (< 0.35 ms on 5090 & V100!)
         size_t vfree = 0, vtot = 0;
@@ -815,6 +1188,13 @@ struct InkDSpark {
             if (cache_is_fp16 || m.tinfo(p + ".self_attn.o_proj.weight").fmt != FMT_BF16) tot_elems += (size_t)kInkHidden * kInkQDim;
             if (cache_is_fp16 || m.tinfo(p + ".mlp.down_proj.weight").fmt != FMT_BF16)    tot_elems += (size_t)kInkHidden * kInkDsparkInter;
         }
+        // Also pre-pack Markov RNN projections (~9 MB) so SQ-10/SQ-15 never dequantize them 7x/draft!
+        const std::string rn_w = "dspark.markov_head.rnn_proj.weight";
+        const std::string ho_w = "dspark.markov_head.hidden_out.weight";
+        const bool pack_rn = (cache_is_fp16 || m.tinfo(rn_w).fmt != FMT_BF16);
+        const bool pack_ho = (cache_is_fp16 || m.tinfo(ho_w).fmt != FMT_BF16);
+        if (pack_rn) tot_elems += (size_t)m.tinfo(rn_w).rows() * m.tinfo(rn_w).cols();
+        if (pack_ho) tot_elems += (size_t)m.tinfo(ho_w).rows() * m.tinfo(ho_w).cols();
         if (m.sm_cc >= 70 && vfree > tot_elems * 2 + (768ull << 20)) {
             d_bf16_pool = dalloc<uint16_t>(tot_elems);
             size_t cur = 0;
@@ -851,6 +1231,16 @@ struct InkDSpark {
                     bf16_cache[dp] = d_bf16_pool + cur;
                     cur += (size_t)kInkHidden * kInkDsparkInter;
                 }
+            }
+            if (pack_rn) {
+                load_to_tc(rn_w, d_bf16_pool + cur);
+                bf16_cache[rn_w] = d_bf16_pool + cur;
+                cur += (size_t)m.tinfo(rn_w).rows() * m.tinfo(rn_w).cols();
+            }
+            if (pack_ho) {
+                load_to_tc(ho_w, d_bf16_pool + cur);
+                bf16_cache[ho_w] = d_bf16_pool + cur;
+                cur += (size_t)m.tinfo(ho_w).rows() * m.tinfo(ho_w).cols();
             }
             INK_CK(cudaStreamSynchronize(r.st));
         }
@@ -966,8 +1356,8 @@ struct InkDSpark {
         ingest_taps_from(r.d_taps, p0, M);
     }
 
-    // Emit full Block-8 draft graph body (100% CUDA-Graph capturable -> < 0.45 ms on RTX 5090!)
-    void emit_draft_block8() {
+    // Shared 3-layer Block-8 DSpark transformer + Top-K_cand screening (captured in both draft_graph and beam_graph!)
+    void emit_dspark_backbone() {
         const int B = kInkDsparkBlock;  // 8
         const auto& ei = m.tinfo("model.llm.embed.weight");
         k_ink_embed_norm<<<1, 256, 0, r.st>>>(
@@ -1020,7 +1410,6 @@ struct InkDSpark {
         const float* base_logits_7 = d_base_logits;
         int base_ld = V;
         if (d_unembed_fp16) {
-            // Volta sm_70 V100: (V_pad, 8, 2304) ALL multiples of 8 -> 125 TFLOPS FP16 Tensor Cores (~0.67 ms vs 4.6 ms!)
             const int V_pad = (V + 7) & ~7;
             const size_t nx = 8ull * kInkHidden;
             __half* x_fp16 = reinterpret_cast<__half*>(r.d_x_bf16);
@@ -1035,7 +1424,6 @@ struct InkDSpark {
         } else if (m.unembed_screen.ready) {
             k_dspark_quant_h_q8<<<7, 256, 0, r.st>>>(d_cur + kInkHidden, d_h_q8, d_h_sc);
             if (m.sm_cc == 70 || m.sm_cc == 60) {
-                // Volta sm_70 (V100) & Pascal sm_60 (P100) lack hardware dp4a -> use 31.4/21.2 TFLOPS FP16x2 __hfma2!
                 k_dspark_screen_h2_7<<<(V + 3) / 4, 128, 0, r.st>>>(
                     m.unembed_screen.q8, m.unembed_screen.sc, d_h_q8, d_h_sc, d_base_logits, V);
             } else {
@@ -1045,17 +1433,21 @@ struct InkDSpark {
         } else {
             r.linear("model.llm.unembed.weight", d_cur + kInkHidden, d_base_logits, 7, V);
         }
-        // Note: if base_ld > V (V_pad), pass V_pad? No, k_dspark_top_cand_s1 indexes slot*V + i!
-        // Instead use ld=V when V_pad==V, or pass stride! Let's check k_dspark_top_cand_s1: ld=V if V_pad==V else V_pad.
         k_dspark_top_cand_s1<<<dim3(128, 7), 256, 0, r.st>>>(base_logits_7, V, d_top_tmp_ids, d_top_tmp_vals, base_ld);
         k_dspark_top_cand_s2<<<7, 256, 0, r.st>>>(d_top_tmp_ids, d_top_tmp_vals, K_cand, d_cand_ids, d_cand_base);
+    }
 
-        // 4. Multi-CTA 7-step on-GPU Markov RNN loop (~0.06 ms total for all 7 steps!)
+    // Emit full Block-8 draft graph body (100% CUDA-Graph capturable -> < 0.45 ms on RTX 5090!)
+    void emit_draft_block8() {
+        emit_dspark_backbone();
+
+        // 4. Multi-CTA 7-step on-GPU Markov RNN loop (with pre-packed BF16 weights + dp4a_i8 candidate scoring!)
         INK_CK(cudaMemsetAsync(d_rnn_state, 0, kInkMarkovRank * 4, r.st));
         const auto& ti_mw1 = m.tinfo("dspark.markov_head.markov_w1.weight");
         const auto& ti_rpb = m.tinfo("dspark.markov_head.rnn_proj.bias");
         const auto& ti_hob = m.tinfo("dspark.markov_head.hidden_out.bias");
         const auto& ti_un  = m.tinfo("model.llm.unembed.weight");
+        const bool use_dp4a_cand = (m.unembed_screen.ready && (m.sm_cc == 61 || m.sm_cc >= 75));
 
         const int32_t* prev_ptr = d_anchor_id;
         for (int s = 0; s < 7; ++s) {
@@ -1063,21 +1455,75 @@ struct InkDSpark {
             k_dspark_markov_prep<<<1, 256, 0, r.st>>>(
                 prev_ptr, d_rnn_state, hs, d_f_rnn, d_apos,
                 m.d_trunk + ti_mw1.off, ti_mw1.fmt, d_rnn_joint);
-            r.linear("dspark.markov_head.rnn_proj.weight", d_rnn_joint, d_rnn_proj, 1);
+            dspark_linear_b8("dspark.markov_head.rnn_proj.weight", d_rnn_joint, d_rnn_proj, 1);
             k_dspark_markov_gru_upd<<<1, 256, 0, r.st>>>(
                 d_rnn_proj, (const float*)(m.d_trunk + ti_rpb.off), d_rnn_state, d_rnn_lat);
-            r.linear("dspark.markov_head.hidden_out.weight", d_rnn_lat, d_corr, 1);
+            dspark_linear_b8("dspark.markov_head.hidden_out.weight", d_rnn_lat, d_corr, 1);
             k_dspark_add_bias_and_h<<<(kInkHidden + 255) / 256, 256, 0, r.st>>>(
                 d_corr, (const float*)(m.d_trunk + ti_hob.off), hs, m.unembed_screen.ready);
-            k_dspark_score_cand_eval<<<(K_cand + 7) / 8, 256, 0, r.st>>>(
-                m.d_trunk + ti_un.off, ti_un.fmt, (int)ti_un.rows(),
-                d_corr, d_cand_ids + (size_t)s * K_cand,
-                m.unembed_screen.ready ? nullptr : (d_cand_base + (size_t)s * K_cand),
-                K_cand, d_cand_scores);
+            if (use_dp4a_cand) {
+                k_dspark_score_cand_dp4a_batch<<<(K_cand + 7) / 8, 256, 0, r.st>>>(
+                    m.unembed_screen.q8, m.unembed_screen.sc, d_corr,
+                    d_cand_ids + (size_t)s * K_cand, nullptr, K_cand, 1, d_cand_scores);
+            } else {
+                k_dspark_score_cand_eval<<<(K_cand + 7) / 8, 256, 0, r.st>>>(
+                    m.d_trunk + ti_un.off, ti_un.fmt, (int)ti_un.rows(),
+                    d_corr, d_cand_ids + (size_t)s * K_cand,
+                    m.unembed_screen.ready ? nullptr : (d_cand_base + (size_t)s * K_cand),
+                    K_cand, d_cand_scores);
+            }
             k_dspark_top2_reduce<<<1, 256, 0, r.st>>>(
                 d_cand_scores, d_cand_ids + (size_t)s * K_cand, K_cand,
                 d_top2_ids + 2 * s, d_top2_probs + 2 * s);
             prev_ptr = d_top2_ids + 2 * s;
+        }
+    }
+
+    // Emit True W=2..4 Multi-Branch On-GPU Markov Beam Tree Graph (captures ALL 7 beam steps in ONE CUDA Graph!)
+    void emit_draft_beam_tree(int beam_w) {
+        emit_dspark_backbone();
+
+        const auto& ti_mw1 = m.tinfo("dspark.markov_head.markov_w1.weight");
+        const auto& ti_rpb = m.tinfo("dspark.markov_head.rnn_proj.bias");
+        const auto& ti_hob = m.tinfo("dspark.markov_head.hidden_out.bias");
+        const auto& ti_un  = m.tinfo("model.llm.unembed.weight");
+        const bool use_dp4a_cand = (m.unembed_screen.ready && (m.sm_cc == 61 || m.sm_cc >= 75));
+
+        k_dspark_beam_init<<<1, 256, 0, r.st>>>(
+            d_anchor_id, d_beam_state, d_beam_prev_tok, d_beam_logp, d_beam_node,
+            d_pool_tok, d_pool_parent, d_pool_depth, d_pool_logp, d_pool_cnt);
+
+        for (int s = 0; s < 7; ++s) {
+            const int nw = (s == 0) ? 1 : beam_w;
+            const float* hs = d_cur + (size_t)(s + 1) * kInkHidden;
+            k_dspark_markov_prep_batch<<<nw, 256, 0, r.st>>>(
+                d_beam_prev_tok, d_beam_state, hs, d_f_rnn, d_apos,
+                m.d_trunk + ti_mw1.off, ti_mw1.fmt, d_rnn_joint_b, nw);
+            dspark_linear_b8("dspark.markov_head.rnn_proj.weight", d_rnn_joint_b, d_rnn_proj_b, nw);
+            k_dspark_markov_gru_upd_batch<<<nw, 256, 0, r.st>>>(
+                d_rnn_proj_b, (const float*)(m.d_trunk + ti_rpb.off),
+                d_beam_state, d_beam_state_next, d_rnn_lat_b, nw);
+            dspark_linear_b8("dspark.markov_head.hidden_out.weight", d_rnn_lat_b, d_corr_b, nw);
+            k_dspark_add_bias_and_h_batch<<<dim3((kInkHidden + 255) / 256, nw), 256, 0, r.st>>>(
+                d_corr_b, (const float*)(m.d_trunk + ti_hob.off), hs, m.unembed_screen.ready, nw);
+            if (use_dp4a_cand) {
+                k_dspark_score_cand_dp4a_batch<<<(K_cand + 7) / 8, 256, 0, r.st>>>(
+                    m.unembed_screen.q8, m.unembed_screen.sc, d_corr_b,
+                    d_cand_ids + (size_t)s * K_cand, nullptr, K_cand, nw, d_cand_scores_b);
+            } else {
+                for (int b = 0; b < nw; ++b) {
+                    k_dspark_score_cand_eval<<<(K_cand + 7) / 8, 256, 0, r.st>>>(
+                        m.d_trunk + ti_un.off, ti_un.fmt, (int)ti_un.rows(),
+                        d_corr_b + (size_t)b * kInkHidden, d_cand_ids + (size_t)s * K_cand,
+                        m.unembed_screen.ready ? nullptr : (d_cand_base + (size_t)s * K_cand),
+                        K_cand, d_cand_scores_b + (size_t)b * K_cand);
+                }
+            }
+            k_dspark_beam_expand<<<1, 256, 0, r.st>>>(
+                d_cand_scores_b, d_cand_ids + (size_t)s * K_cand, d_beam_state_next,
+                K_cand, nw, beam_w, s + 1,
+                d_beam_state, d_beam_prev_tok, d_beam_logp, d_beam_node,
+                d_pool_tok, d_pool_parent, d_pool_depth, d_pool_logp, d_pool_cnt);
         }
     }
 
@@ -1113,8 +1559,106 @@ struct InkDSpark {
         }
     }
 
+    // Draft True W=2..4 Multi-Branch Bayes-Optimal Connected Tree (M <= 16..32 nodes, CUDA Graph captured!)
+    // When adaptive_moe_ratio > 0, dynamically picks M* in {4, 6, 8, 10, 12, 16} maximizing E[emit(M)] / (1 + ratio*(1-(15/16)^M))!
+    void draft_beam_tree(int32_t anchor_tok, int apos, int beam_w, int max_nodes, InkTreeSpec& out_tree, float adaptive_moe_ratio = 0.0f) {
+        beam_w = std::max(1, std::min(kInkMaxBeam, beam_w));
+        max_nodes = std::max(2, std::min(r.tree_cap, max_nodes));
+        const int B = kInkDsparkBlock;  // 8
+        h_meta_pin[0] = anchor_tok;
+        h_meta_pin[1] = apos;
+        for (int i = 0; i < B; ++i) h_meta_pin[2 + i] = apos + i;
+        INK_CK(cudaMemcpyAsync(d_anchor_id, h_meta_pin + 0, 4, cudaMemcpyHostToDevice, r.st));
+        INK_CK(cudaMemcpyAsync(d_apos,      h_meta_pin + 1, 4, cudaMemcpyHostToDevice, r.st));
+        INK_CK(cudaMemcpyAsync(d_pos,       h_meta_pin + 2, B * 4, cudaMemcpyHostToDevice, r.st));
+
+        if (r.use_cuda_graph) {
+            if (!beam_graph || beam_graph_w != beam_w) {
+                if (beam_graph) { cudaGraphExecDestroy(beam_graph); beam_graph = nullptr; }
+                cudaGraph_t gr = nullptr;
+                INK_CK(cudaStreamBeginCapture(r.st, cudaStreamCaptureModeThreadLocal));
+                emit_draft_beam_tree(beam_w);
+                INK_CK(cudaStreamEndCapture(r.st, &gr));
+                INK_CK(cudaGraphInstantiate(&beam_graph, gr, nullptr, nullptr, 0));
+                INK_CK(cudaGraphDestroy(gr));
+                beam_graph_w = beam_w;
+            }
+            INK_CK(cudaGraphLaunch(beam_graph, r.st));
+        } else {
+            emit_draft_beam_tree(beam_w);
+        }
+        INK_CK(cudaMemcpyAsync(h_pool_cnt,    d_pool_cnt,    4, cudaMemcpyDeviceToHost, r.st));
+        INK_CK(cudaMemcpyAsync(h_pool_tok,    d_pool_tok,    kInkBeamPoolCap * 4, cudaMemcpyDeviceToHost, r.st));
+        INK_CK(cudaMemcpyAsync(h_pool_parent, d_pool_parent, kInkBeamPoolCap, cudaMemcpyDeviceToHost, r.st));
+        INK_CK(cudaMemcpyAsync(h_pool_depth,  d_pool_depth,  kInkBeamPoolCap, cudaMemcpyDeviceToHost, r.st));
+        INK_CK(cudaMemcpyAsync(h_pool_logp,   d_pool_logp,   kInkBeamPoolCap * 4, cudaMemcpyDeviceToHost, r.st));
+        INK_CK(cudaStreamSynchronize(r.st));
+
+        const int cnt = std::min(kInkBeamPoolCap, std::max(1, *h_pool_cnt));
+        int ord[kInkBeamPoolCap];
+        int n_cand = cnt - 1;
+        for (int i = 0; i < n_cand; ++i) ord[i] = i + 1;
+        std::sort(ord, ord + n_cand, [&](int a, int b) {
+            if (h_pool_logp[a] != h_pool_logp[b]) return h_pool_logp[a] > h_pool_logp[b];
+            if (h_pool_depth[a] != h_pool_depth[b]) return h_pool_depth[a] < h_pool_depth[b];
+            return a < b;
+        });
+
+        int want = std::min(max_nodes, cnt);
+        if (adaptive_moe_ratio > 0.0f) {
+            // Exact Sparse-MoE Bayes-Optimal Dynamic Tree Sizing across cached CUDA Graph buckets {3, 4, 5, 6, 8, 10, 12}!
+            static constexpr int kBuckets[] = {3, 4, 5, 6, 8, 10, 12, 16};
+            double pref_p[kInkBeamPoolCap + 1];
+            pref_p[0] = 1.0;  // root always emits 1 token
+            for (int i = 0; i < n_cand; ++i) {
+                const float lp = h_pool_logp[ord[i]];
+                pref_p[i + 1] = pref_p[i] + ((lp > -20.0f) ? std::exp((double)lp) : 0.0);
+            }
+            double best_rate = -1.0;
+            int best_m = std::min(3, cnt);
+            for (int mb : kBuckets) {
+                if (mb > max_nodes || mb > cnt) continue;
+                const double e_tok = pref_p[mb - 1];
+                const double exp_frac = 1.0 - std::pow(15.0 / 16.0, (double)mb);
+                const double cost = 1.0 + (double)adaptive_moe_ratio * exp_frac;
+                const double rate = e_tok / cost;
+                if (rate > best_rate) { best_rate = rate; best_m = mb; }
+            }
+            want = best_m;
+        }
+
+        uint8_t keep[kInkBeamPoolCap] = {};
+        keep[0] = 1;
+        int n_kept = 1;
+        for (int i = 0; i < n_cand && n_kept < want; ++i) {
+            const int u = ord[i];
+            if (h_pool_logp[u] <= -1e20f) break;
+            if (!keep[u]) {
+                const int par = (int)h_pool_parent[u];
+                if (par >= 0 && keep[par]) {
+                    keep[u] = 1;
+                    ++n_kept;
+                }
+            }
+        }
+
+        out_tree = InkTreeSpec{};
+        int8_t remap[kInkBeamPoolCap];
+        std::memset(remap, -1, sizeof(remap));
+        for (int p = 0; p < cnt; ++p) {
+            if (!keep[p]) continue;
+            const int nid = out_tree.M++;
+            remap[p] = (int8_t)nid;
+            out_tree.tok[nid] = h_pool_tok[p];
+            out_tree.parent[nid] = (p == 0) ? -1 : remap[(int)h_pool_parent[p]];
+            out_tree.depth[nid] = h_pool_depth[p];
+        }
+        out_tree.build();
+    }
+
     void free_all() {
         if (draft_graph) { cudaGraphExecDestroy(draft_graph); draft_graph = nullptr; }
+        if (beam_graph)  { cudaGraphExecDestroy(beam_graph);  beam_graph = nullptr; beam_graph_w = 0; }
         bf16_cache.clear();
         if (d_bf16_pool) { cudaFree(d_bf16_pool); d_bf16_pool = nullptr; }
         if (d_unembed_fp16) { cudaFree(d_unembed_fp16); d_unembed_fp16 = nullptr; }
@@ -1129,10 +1673,18 @@ struct InkDSpark {
         fr(d_rnn_state); fr(d_rnn_joint); fr(d_rnn_proj); fr(d_rnn_lat);
         fr(d_corr); fr(d_pos); fr(d_apos); fr(d_anchor_id); fr(d_draft_ids);
         fr(d_top2_ids); fr(d_top2_probs);
+        fr(d_beam_state); fr(d_beam_state_next); fr(d_beam_prev_tok); fr(d_beam_logp); fr(d_beam_node);
+        fr(d_rnn_joint_b); fr(d_rnn_proj_b); fr(d_rnn_lat_b); fr(d_corr_b); fr(d_cand_scores_b);
+        fr(d_pool_tok); fr(d_pool_parent); fr(d_pool_depth); fr(d_pool_logp); fr(d_pool_cnt);
         if (h_top2_ids) { cudaFreeHost(h_top2_ids); h_top2_ids = nullptr; }
         if (h_top2_probs) { cudaFreeHost(h_top2_probs); h_top2_probs = nullptr; }
         if (h_meta_pin) { cudaFreeHost(h_meta_pin); h_meta_pin = nullptr; }
         if (h_pos_pin) { cudaFreeHost(h_pos_pin); h_pos_pin = nullptr; }
+        if (h_pool_tok) { cudaFreeHost(h_pool_tok); h_pool_tok = nullptr; }
+        if (h_pool_parent) { cudaFreeHost(h_pool_parent); h_pool_parent = nullptr; }
+        if (h_pool_depth) { cudaFreeHost(h_pool_depth); h_pool_depth = nullptr; }
+        if (h_pool_logp) { cudaFreeHost(h_pool_logp); h_pool_logp = nullptr; }
+        if (h_pool_cnt) { cudaFreeHost(h_pool_cnt); h_pool_cnt = nullptr; }
         ready = false;
     }
 };
