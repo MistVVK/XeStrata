@@ -41,6 +41,10 @@ public:
     RemoteExperts(const RemoteExperts&) = delete;
     RemoteExperts& operator=(const RemoteExperts&) = delete;
 
+    /// Whether a helper computes the experts of the process's layout: every native format but BF16 experts, whose rows
+    /// take FP32 activations (native_expert_grouped_bf16) that begin() does not run.  `why` says which it does not.
+    /// open() refuses those, and a role choice (--layer-split auto) leaves the helper out for them.
+    static bool computes_layout(std::string& why);
     /// Initialise the device before the host expert arena registers
     /// tens of GiB of portable mapped memory with CUDA.
     static bool preflight(int device, double& free_gib, std::string& err);
@@ -111,6 +115,7 @@ private:
     uint8_t* d_q8_ = nullptr;
     float* d_scales_ = nullptr;
     void* d_scratch_ = nullptr;
+    uint8_t* d_types_ = nullptr;   ///< a mixed pack: each expert's (gate/up K, down K), layer by layer
     void* d_meta_ = nullptr;  ///< one upload of the grouped indices, instead of five small copies
     int32_t* d_start_ = nullptr;
     int32_t* d_dst_ = nullptr;

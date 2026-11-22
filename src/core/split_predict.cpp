@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "strata/core/split_predict.hpp"
+#include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/runtime.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/env.hpp"
 #include "strata/platform/memory.hpp"
 #include <algorithm>
@@ -95,8 +98,9 @@ SplitPredictionResult predict_layer_split(const SplitPrediction& p, const std::v
         int st = 0;
         while (st + 1 < nst && l >= cuts[(size_t) st]) ++st;
         if (full[(size_t) st]) continue;
-        if (out.used[(size_t) st] + p.cost(l) > out.capacity[(size_t) st]) { full[(size_t) st] = true; continue; }
-        out.used[(size_t) st] += p.cost(l);
+        const int64_t c = p.cost(l, p.profile[r].second);
+        if (out.used[(size_t) st] + c > out.capacity[(size_t) st]) { full[(size_t) st] = true; continue; }
+        out.used[(size_t) st] += c;
         layer_held[(size_t) l] += mass;
         ++out.held;
     }
@@ -183,6 +187,23 @@ double split_cpu_bandwidth() {
         best = std::max(best, (double) nt * (double) per / std::max(ms, 1e-3));
     }
     return best;
+}
+
+MissRate split_miss_rate(const ExpertFacts& facts, const PoolShape& pool, double ram_rate) {
+    MissRate out;
+    out.rate = ram_rate;
+    if (facts.layers < 1 || facts.n_expert < 1) out.why = "the model has no experts";
+    else if (!facts.pool_rows) out.why = "its missed experts are not the CPU pool's native rows";
+    else if (strata::env_get("SPLIT_CPU_GBPS") != nullptr) out.why = "XESTRATA_SPLIT_CPU_GBPS sets the rate";
+    if (!out.why.empty()) return out;
+    Runtime::wait_preload_all();
+    strata::kernels::cpu::ExpertPool cal(pool.workers, /*pin=*/true, pool.host_works, /*first_core=*/0, pool.tasks);
+    double c = 0.0, bytes = 0.0;
+    if (!measure_cpu_expert_ms_unloaded(cal, facts.layer, c, bytes, out.why)) return out;
+    out.expert_ms = c;
+    out.expert_rate = bytes / c;
+    out.rate = std::min(ram_rate, out.expert_rate);
+    return out;
 }
 
 // The time of one small host->device copy (64 KiB, the median of 16 after a warmup): the fixed part of a layer

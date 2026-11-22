@@ -97,11 +97,6 @@ namespace {
 
 namespace k = strata::kernels;
 
-// The plain engine's floor for the room no plan counts (core::vram_room): under STRATA_VRAM_LIMIT_MIB=4096 on
-// the RX 9060 XT the peak stayed below the card with 128 MiB kept free - llm-jp Q4_K_M, Ornith Q4_K_M and
-// GSQ-RCO 3bit, 2026-10-12 - where the 768 MiB of before left 700 MiB of the card unused.
-constexpr uint64_t kTierRoomLeast = 192ull << 20;
-
 constexpr int kQ6K = 14;
 constexpr int kQ80 = 8;
 constexpr int kBF16 = 30;   // a BF16 file's projections: bf16_gemv_fp32_mmvf_multi on the FP32 rows
@@ -518,7 +513,8 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     }
     if (!read_model_spec(model_->meta(), spec_, err)) return false;
     if (spec_.arch == ModelArch::Inkling2Loop) {
-        if (serve_ || opt_.vision || opt_.encoder || opt_.batch_slots > 0 || opt_.split_auto || !opt_.split_at.empty()) {
+        if (serve_ || opt_.vision || opt_.encoder || opt_.batch_slots > 0 || opt_.split_auto || !opt_.split_at.empty() ||
+            std::any_of(opt_.expert_cache_remote.begin(), opt_.expert_cache_remote.end(), [](int n) { return n > 0; })) {
             err = "inkling2: GPU reference supports single-device text CLI only";
             return false;
         }
@@ -526,7 +522,10 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         opt_.spec = 0;
         inkling_ = std::make_unique<PlainInkling>();
         if (!inkling_->load(*model_, spec_, err) || !inkling_->enable_gpu(err) ||
-            (opt_.draft == "dspark" && !inkling_->load_dspark(opt_.draft_model, err)) || !inkling_->configure_experts(opt_.profile, opt_.max_cells, err)) return false;
+            (opt_.draft == "dspark" && !inkling_->load_dspark(opt_.draft_model, err)) ||
+            !inkling_->configure_experts(opt_.profile, opt_.max_cells, opt_.reserve_mib, opt_.vram_free_mib,
+                                         opt_.expert_slots, err))
+            return false;
         n_vocab_ = inkling_->vocab();
         return true;
     }
@@ -939,7 +938,34 @@ bool PlainModel::split_auto_role(std::string& err) {
     // the measurements, per GPU (the first, then the second): free memory, read bandwidth, link, small-copy latency
     std::vector<int64_t> free0((size_t) n), reserve((size_t) n);
     std::vector<double> bw((size_t) n), link_gbps((size_t) n), side_ms((size_t) n);
-    const double cpu_bw = core::split_cpu_bandwidth();
+    double cpu_bw = core::split_cpu_bandwidth();
+    // the CPU's misses at the pool's own rate on this model's experts where that is below the RAM's read rate
+    // (split_miss_rate, generate.cpp's too).  The experts' layout is read here for it, before anything is loaded;
+    // load_qwen and open_experts read it again as they did (with the MTP block where the model has one).
+    bool have_layout = false;
+    {
+        std::vector<int64_t> blocks;
+        for (int64_t l = 0; l < L; ++l)
+            if (s.layer_routes(l)) blocks.push_back(l);
+        std::string lerr;
+        have_layout = expert_layout_from_gguf(opt_.gguf, blocks, E, s.n_embd, s.n_ff_exp, lerr);
+        core::ExpertFacts facts;
+        facts.layers = M;
+        facts.n_expert = E;
+        facts.layer = M / 2;
+        facts.pool_rows = have_layout;
+        const core::MissRate miss =
+            core::split_miss_rate(facts, {opt_.pool_workers, opt_.pool_host_works, opt_.pool_tasks}, cpu_bw);
+        if (miss.expert_ms > 0.0)
+            std::fprintf(stderr, "xestrata plain: --layer-split auto: the CPU pool computes an expert of this model in "
+                                 "%.3f ms (%.0f GB/s)%s\n", miss.expert_ms, miss.expert_rate / 1e6,
+                         miss.rate < cpu_bw ? ": the misses are priced by it" : "");
+        else
+            std::fprintf(stderr, "xestrata plain: --layer-split auto: the CPU pool's time an expert is not measured "
+                                 "(%s): the RAM's read rate prices the misses\n",
+                         have_layout ? miss.why.c_str() : lerr.c_str());
+        cpu_bw = miss.rate;
+    }
     const double rows = strata::env_get("SPLIT_ROWS") ? std::strtod(strata::env_get("SPLIT_ROWS"), nullptr) : 3.0;
     const double hand_bytes = rows * (double) s.n_embd * sizeof(float);
     for (int d = 0; d < n; ++d) {
@@ -976,7 +1002,7 @@ bool PlainModel::split_auto_role(std::string& err) {
     model.side_ms = side_ms;
     model.order = order;
     model.capacity = capacity;
-    model.cost = [&](int64_t l) { return (int64_t) std::ceil(blob[(size_t) l]); };
+    model.cost = [&](int64_t l, int64_t) { return (int64_t) std::ceil(blob[(size_t) l]); };
     model.blob_bytes = [&](int64_t l) { return blob[(size_t) l]; };
     model.prompt_min = 0;
     model.cpu_bw = cpu_bw;
@@ -993,15 +1019,23 @@ bool PlainModel::split_auto_role(std::string& err) {
     const double split_ms = split_r.startable ? split_r.ms : 1e30;
     const double alone_ms = alone_r.startable ? alone_r.ms : 1e30;
     const bool alone_holds_all = alone_r.startable && alone_r.held == (int64_t) prof.size();
-    std::fprintf(stderr, "xestrata plain: --layer-split auto: %s alone would take %.1f ms per window (~%.1f%% of the "
-                         "routed mass cached%s)\n", strata::gpu::device_name(split_devs_[0]).c_str(), alone_r.ms,
-                 100.0 * alone_r.held_mass, alone_holds_all ? ", every profiled pair" : "");
+    std::fprintf(stderr, "xestrata plain: --layer-split auto: %s alone would take %.1f ms per window (its cache holds "
+                         "%lld of %zu profiled pairs, ~%.1f%% of the routed mass%s)\n",
+                 strata::gpu::device_name(split_devs_[0]).c_str(), alone_r.ms, (long long) alone_r.held, prof.size(),
+                 100.0 * alone_r.held_mass, alone_holds_all ? ": every pair" : "");
     // the second GPU as a helper expert cache
     const char* role_env = strata::env_get("SPLIT_ROLE");
     const std::string role = role_env != nullptr ? role_env : "";
     const char* gain_env = strata::env_get("SPLIT_GAIN_PCT");
     const double gain = (gain_env != nullptr ? std::strtod(gain_env, nullptr) : 5.0) / 100.0;
-    const bool helper_eligible = opt_.pipeline_windows <= 0 && opt_.batch_slots <= 0 && role != "split";
+    // a model whose experts a helper does not compute (BF16 ones, RemoteExperts::computes_layout): no helper role
+    std::string helper_why;
+    const bool helper_takes = !have_layout || RemoteExperts::computes_layout(helper_why);
+    if (!helper_takes && (role == "helper" || opt_.split_roles_helper)) {
+        err = "plain model: " + helper_why + "; use a layer split instead";
+        return false;
+    }
+    const bool helper_eligible = helper_takes && opt_.pipeline_windows <= 0 && opt_.batch_slots <= 0 && role != "split";
     core::HelperCachePrediction hc;
     if (helper_eligible) {
         double submit_ms = 0.0, layer_ms = 0.0;
@@ -2196,18 +2230,14 @@ bool PlainModel::open_experts(std::string& err) {
             prompt_carve(opt_.prompt_chunk, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
         }
     }
-    const uint64_t window_b = (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * (uint64_t) s.n_embd * 4 * 3 +
-                              16 * lay.max_blob + (64ull << 20);
-    // what is allocated after the tier (the products' libraries, the graphs) and the driver's margin: the room of
-    // the device's memory (core::vram_room; its floor kTierRoomLeast above, its 768 MiB ceiling past 24 GiB)
-    const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20
-                                                   : core::vram_room(total_b_, /*parts*/ 1, kTierRoomLeast);
-    const uint64_t room = free_b > window_b + reserve ? free_b - window_b - reserve : 0;
+    const uint64_t window_b = tier_window_bytes(opt_.max_t, s.n_expert_used, s.n_embd, lay.max_blob);
     uint64_t per_layer_b = 0;
     for (int64_t l : moe_local_) per_layer_b += lay.bytes[(size_t) l];
-    int64_t q = per_layer_b > 0 ? (int64_t) (room / per_layer_b) : 0;
-    q = std::min<int64_t>(q, E);
-    if (opt_.expert_slots >= 0) q = std::min<int64_t>(q, opt_.expert_slots / std::max<int64_t>(L, 1));
+    // the room, the reserve and the slots a layer takes by the tiers' one rule (plan_tier_room, expert_tier.hpp)
+    const TierRoom fits = plan_tier_room(free_b, total_b_, window_b, opt_.reserve_mib, opt_.expert_slots, per_layer_b,
+                                         L, E);
+    const uint64_t reserve = fits.reserve, room = fits.room;
+    const int64_t q = fits.q;
     if (q < 1 && LS > 0) {
         err = "plain model: no VRAM is left for the expert tier (" + std::to_string(free_b >> 20) +
               " MiB free); reduce --max-context, --batch or --vram-reserve-mib, or close other GPU programs";
@@ -2221,7 +2251,8 @@ bool PlainModel::open_experts(std::string& err) {
     // profile's pairs in its order over all the layers while the tier's bytes last; without one, the layers alike
     // (a profile of the trunk's layers serves a load with the MTP layer as well, and one with the MTP layer a load
     // without it: its pairs dropped)
-    std::vector<int64_t> quota((size_t) L, 0);
+    std::vector<char> local((size_t) L, 0);
+    for (int64_t l : moe_local_) local[(size_t) l] = 1;
     if (!opt_.profile.empty()) {
         int64_t ranked_slots = 0;
         std::string err2;
@@ -2232,17 +2263,15 @@ bool PlainModel::open_experts(std::string& err) {
                          prior_.end());
             err.clear();
         }
-        std::vector<char> local((size_t) L, 0);
-        for (int64_t l : moe_local_) local[(size_t) l] = 1;
-        // Ornith-1.5 (qwen35moe) the layers alike: the order over all the layers lost hits there (RTX 4070, Q6_K,
-        // 256 tokens: 72.8-73.1% -> 70.8%, 91.1 / 90.8 -> 87.5 / 87.6 tok/s, 2026-10-26)
-        const bool alike = s.arch == ModelArch::Qwen35Moe;
-        quota = plan_profile_fill(prior_, L, E, per_layer_b * (uint64_t) q, [&](int64_t l) { return lay.bytes[(size_t) l]; },
-                                  [&](int64_t l) { return local[(size_t) l] != 0; }, alike)
-                    .quota;
-    } else {
-        for (int64_t l : moe_local_) quota[(size_t) l] = q;
     }
+    // Ornith-1.5 (qwen35moe) the layers alike: the order over all the layers lost hits there (RTX 4070, Q6_K,
+    // 256 tokens: 72.8-73.1% -> 70.8%, 91.1 / 90.8 -> 87.5 / 87.6 tok/s, 2026-10-26)
+    const bool alike = s.arch == ModelArch::Qwen35Moe;
+    const std::vector<int64_t> quota =
+        plan_tier_fill(opt_.profile.empty() ? nullptr : &prior_, L, E, fits,
+                       [&](int64_t l) { return lay.bytes[(size_t) l]; },
+                       [&](int64_t l) { return local[(size_t) l] != 0; }, alike)
+            .quota;
     std::vector<int64_t> slot_bytes;
     free_.assign((size_t) L, {});
     slot_layer_.clear();
@@ -2263,11 +2292,8 @@ bool PlainModel::open_experts(std::string& err) {
         if (strata::gpu::mem_info(&f, &t)) {
             const uint64_t now = counted_free(f, f, opt_.vram_free_mib);
             const uint64_t limit = now > window_b + reserve ? now - window_b - reserve : 0;
-            uint64_t need = 0;
-            for (const int64_t b : slot_bytes) need += ((uint64_t) b + 255) / 256 * 256;
             const size_t before = slot_bytes.size();
-            while (!slot_bytes.empty() && need > limit) {
-                need -= ((uint64_t) slot_bytes.back() + 255) / 256 * 256;
+            for (const size_t keep = tier_slots_within(slot_bytes, limit); slot_bytes.size() > keep;) {
                 free_[(size_t) slot_layer_.back()].pop_back();   // (before the reverse: its last is this slot)
                 slot_layer_.pop_back();
                 slot_bytes.pop_back();

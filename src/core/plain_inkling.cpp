@@ -1115,7 +1115,8 @@ bool PlainInkling::enable_gpu(std::string& err) {
     return true;
 }
 
-bool PlainInkling::configure_experts(const std::string& profile, int64_t context, std::string& err) {
+bool PlainInkling::configure_experts(const std::string& profile, int64_t context, int64_t reserve_mib,
+                                     int64_t vram_free_mib, int64_t expert_slots, std::string& err) {
     const char* mode = strata::env_get("INKLING_PLACEMENT");
     const std::string_view placement = mode ? mode : "host";
     if (placement == "host") return true;
@@ -1143,36 +1144,63 @@ bool PlainInkling::configure_experts(const std::string& profile, int64_t context
                                    free - std::min<uint64_t>(free, vram_room(total)));
     } catch (const std::exception& e) { err = e.what(); return false; }
     if (!gpu::mem_info(&free, &total)) { err = "inkling2: cannot query VRAM after KV placement"; return false; }
-    const uint64_t vr = free - std::min<uint64_t>(free, vram_room(total));
     const auto host = sample_host_memory();
     const uint64_t hr = detail::ram_headroom(host ? host->limit / 32 : 0);
     const uint64_t dram = host ? host->available - std::min(host->available, hr) : 0;
-    const auto bytes = [&](int64_t layer) {
-        const auto& l = p_->layers[(size_t) layer];
-        return (size_t) l.gu.rows * l.gu.row_bytes + (size_t) l.down.rows * l.down.row_bytes;
+    const auto gu_bytes = [&](int64_t l) {
+        return (size_t) p_->layers[(size_t) l].gu.rows * p_->layers[(size_t) l].gu.row_bytes;
     };
+    const auto down_bytes = [&](int64_t l) {
+        return (size_t) p_->layers[(size_t) l].down.rows * p_->layers[(size_t) l].down.row_bytes;
+    };
+    uint64_t all = 0, batch = 0;
+    for (int64_t l = 0; l < s.n_layer; ++l) {
+        all += (uint64_t) (gu_bytes(l) + down_bytes(l)) * (uint64_t) p_->NE;
+        batch = std::max<uint64_t>(batch, gu_bytes(l) + down_bytes(l));
+    }
+    // The tier's room and the slots each layer takes by the tiers' one rule (expert_tier.hpp: plan_tier_room and
+    // plan_tier_fill, PlainModel's), so that --vram-reserve-mib, --vram-free-mib, --expert-cache and a later change of
+    // the rule reach this model as well.  This model's facts go into it: a slot is one expert's gate/up and down
+    // (InklingProducts::slot_bytes), a window is kWindowRows rows of NK experts, and a layer takes slots where one
+    // of its experts fits the device's largest allocation.  The residents do not move here (no adaptive rounds):
+    // the profile's pairs within the layers' slots, or without a profile each layer's first experts.
+    const auto slot = [&](int64_t l) { return (uint64_t) InklingProducts::slot_bytes(gu_bytes(l), down_bytes(l)); };
     const uint64_t max_alloc = max_alloc_bytes();
-    const auto local = [&](int64_t l) { return bytes(l) <= max_alloc; };
-    const auto plan = plan_profile_fill(prior, s.n_layer, p_->NE, vr, bytes, local, false);
+    const auto local = [&](int64_t l) { return slot(l) <= max_alloc; };
+    uint64_t per_layer_b = 0;
+    for (int64_t l = 0; l < s.n_layer; ++l)
+        if (local(l)) per_layer_b += slot(l);
+    const uint64_t window_b = tier_window_bytes(InklingProducts::kWindowRows, p_->NK, p_->N, batch);
+    const TierRoom fits = plan_tier_room(counted_free(free, free, vram_free_mib), total, window_b, reserve_mib,
+                                         expert_slots, per_layer_b, s.n_layer, p_->NE);
+    auto fill = plan_tier_fill(profile.empty() ? nullptr : &prior, s.n_layer, p_->NE, fits, slot, local, false).fill;
     uint64_t hot_bytes = 0;
     try {
-        for (const auto& [layer, expert] : plan.fill) {
+        if (!fill.empty()) {
+            std::vector<int64_t> sizes;
+            sizes.reserve(fill.size());
+            for (const auto& pair : fill) sizes.push_back((int64_t) slot(pair.first));
+            p_->products->open_tier(sizes, s.n_layer, p_->NE);
+            // (taken in pieces after a refused allocation, the device may give the first slots only)
+            fill.resize(std::min(fill.size(), (size_t) p_->products->tier_slots()));
+        }
+        for (const auto& [layer, expert] : fill) {
             const auto& l = p_->layers[(size_t) layer];
-            for (const auto* e : {&l.gu, &l.down}) {
-                const size_t len = (size_t) e->rows * e->row_bytes;
-                p_->products->reserve_hot(e->data + (size_t) expert * len, len);
-                hot_bytes += len;
-            }
+            const size_t gu = gu_bytes(layer), down = down_bytes(layer);
+            p_->products->reserve_hot(layer, expert, l.gu.data + (size_t) expert * gu, gu,
+                                      l.down.data + (size_t) expert * down, down);
+            hot_bytes += gu + down;
         }
     } catch (const std::exception& e) { err = e.what(); return false; }
-    uint64_t all = 0, batch = 0;
-    for (int64_t l = 0; l < s.n_layer; ++l) { all += bytes(l) * (uint64_t) p_->NE; batch = std::max(batch, bytes(l)); }
     const uint64_t hint = std::min(dram, batch * (uint64_t) p_->NK);
     p_->products->set_cold_hint(hint);
     std::fprintf(stderr, "xestrata: Inkling expert tier: %zu experts, %llu bytes hot of %llu bytes; "
-                         "VRAM pool %llu, DRAM pool %llu, prefetch up to %llu bytes per tile\n", plan.fill.size(),
-                 (unsigned long long) hot_bytes, (unsigned long long) all, (unsigned long long) vr,
+                         "VRAM pool %llu, DRAM pool %llu, prefetch up to %llu bytes per tile\n", fill.size(),
+                 (unsigned long long) hot_bytes, (unsigned long long) all, (unsigned long long) fits.room,
                  (unsigned long long) dram, (unsigned long long) hint);
+    std::fprintf(stderr, "xestrata: Inkling expert tier plan: %llu bytes free, %llu kept free, %llu beside it for a "
+                         "window; %lld experts a layer at most\n", (unsigned long long) free,
+                 (unsigned long long) fits.reserve, (unsigned long long) window_b, (long long) fits.q);
     return true;
 }
 

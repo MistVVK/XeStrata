@@ -32,8 +32,8 @@ struct HelperCacheInputs {
     int64_t layers = 0;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< (layer, expert), hottest first
     std::vector<double> mass;                         ///< each pair's routed weight (empty: equal)
-    std::function<int64_t(int64_t)> cost;             ///< a pair's bytes in the cache, by its layer
-    std::function<double(int64_t)> blob_bytes;        ///< one expert's bytes, by its layer
+    std::function<int64_t(int64_t, int64_t)> cost;    ///< a (layer, expert) pair's bytes in the cache
+    std::function<double(int64_t)> blob_bytes;        ///< the bytes a routed expert reads, by its layer
     int64_t cap0 = 0;                                 ///< the first GPU's room for experts alone (bytes)
     int64_t caph = 0;                                 ///< the helper's room for experts (bytes)
     double bw0 = 0, bwh = 0;                          ///< the two GPUs' read bandwidths (bytes/ms)
@@ -65,7 +65,7 @@ inline HelperCachePrediction predict_helper_cache(const HelperCacheInputs& in) {
     for (size_t r = 0; r < in.profile.size(); ++r) {
         const int64_t l = in.profile[r].first;
         const double m = in.mass.empty() ? 1.0 : in.mass[r];
-        const int64_t c = in.cost(l);
+        const int64_t c = in.cost(l, in.profile[r].second);
         if (!full0) {
             if (u0 + c <= in.cap0) {
                 u0 += c;
