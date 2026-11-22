@@ -156,6 +156,33 @@ class Decision(TempDir):
             self.assertEqual(d.path is not None, used, (arch, d.message))
             self.assertIsNone(ht.resolve(pkg, [arch], environ={ht.SWITCH: "off"}).path)
 
+    def test_gfx1103_auto_requires_cwsr_disabled_on_linux(self):
+        pkg = fake_package(self.root, version=100401, tables=(("gfx1103", 100401),))
+        with mock.patch.object(ht, "amdgpu_cwsr_disabled", return_value=False):
+            d = ht.resolve(pkg, ["gfx1103"], environ=AUTO)
+            self.assertIsNone(d.path)
+            self.assertEqual(d.level, "warn")
+            self.assertIn("amdgpu.cwsr_enable=0", d.message)
+            # explicit on still forces the table
+            d_on = ht.resolve(pkg, ["gfx1103"], environ=ON)
+            self.assertEqual(d_on.path, pkg / "tuning" / "gfx1103-hipblaslt-100401.txt")
+        with mock.patch.object(ht, "amdgpu_cwsr_disabled", return_value=True):
+            d_ok = ht.resolve(pkg, ["gfx1103"], environ=AUTO)
+            self.assertEqual(d_ok.path, pkg / "tuning" / "gfx1103-hipblaslt-100401.txt")
+
+    def test_amdgpu_cwsr_disabled_reads_sysfs_and_cmdline(self):
+        sysfs = self.root / "cwsr_enable"
+        cmdline = self.root / "cmdline"
+        sysfs.write_text("1\n", encoding="utf-8")
+        cmdline.write_text("ro quiet splash\n", encoding="utf-8")
+        self.assertIs(ht.amdgpu_cwsr_disabled(platform="linux", sysfs_path=sysfs, cmdline_path=cmdline), False)
+        self.assertIsNone(ht.amdgpu_cwsr_disabled(platform="win32", sysfs_path=sysfs, cmdline_path=cmdline))
+        sysfs.write_text("0\n", encoding="utf-8")
+        self.assertIs(ht.amdgpu_cwsr_disabled(platform="linux", sysfs_path=sysfs, cmdline_path=cmdline), True)
+        sysfs.write_text("-1\n", encoding="utf-8")
+        cmdline.write_text("ro amdgpu.cwsr_enable=0 quiet\n", encoding="utf-8")
+        self.assertIs(ht.amdgpu_cwsr_disabled(platform="linux", sysfs_path=sysfs, cmdline_path=cmdline), True)
+
     def test_a_table_the_person_set_is_never_replaced(self):
         pkg = fake_package(self.root)
         mine = str(self.root / "mine.txt")

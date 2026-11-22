@@ -56,7 +56,14 @@ changes no host setting).
 export STRATA_HIPBLASLT_TUNING=$PWD/tools/hip/gfx1103-hipblaslt-100401.txt
 ```
 
-setup hands it over automatically when the installed hipBLASLt reports 1.4.1. It was calibrated with
+setup hands it over automatically when the installed hipBLASLt reports 1.4.1 and Linux `amdgpu.cwsr_enable=0` is
+active (#6132, #6574). Without `amdgpu.cwsr_enable=0` on the kernel command line, hipBLASLt warm-up on `gfx1103` can
+trigger a KFD/MES `REMOVE_QUEUE` reset, so auto-selection skips the table and falls back to plain hipBLAS until
+`amdgpu.cwsr_enable=0` is set (or `STRATA_HIPBLASLT_TABLE=on` forces it). On `gfx1103` with hipBLASLt 1.2.0 (`100200`),
+a minimal 6-row zero-workspace subset covering the 3 main prompt GEMM shapes (f16/bf16) captures essentially all of the
+whole-model prompt speedup (~217-225 tok/s vs 165-212 tok/s plain hipBLAS on cold 56K prompts; #6574).
+
+The shipped `gfx1103-hipblaslt-100401.txt` table was calibrated with
 `tools/hip/tune_hipblaslt` over the gfx1150 table's 144 GEMM cases at T = 64..16384 (the same case list the 890M
 run used), two passes, 32 MiB workspace, each row the solution with the lowest median of all six repetitions: 143
 rows (the `bf16 N=1 K=2560 T=64` shape has no candidate faster than plain hipBLAS and is left out), 1.05-23.30x per

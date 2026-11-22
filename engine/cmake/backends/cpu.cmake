@@ -60,6 +60,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(kva_test src/prefill/kva_test.cpp)   # KVA: the switch, the automatic tail, the reasons a read is turned away
   target_include_directories(kva_test PRIVATE include)
   add_test(NAME kva_test COMMAND kva_test)
+  add_executable(hipblaslt_tuning_test src/prefill/hipblaslt_tuning_test.cpp)   # #6574: gfx1103 cwsr_enable guard and tuning table parser
+  target_include_directories(hipblaslt_tuning_test PRIVATE include src/prefill)
+  add_test(NAME hipblaslt_tuning_test COMMAND hipblaslt_tuning_test)
   add_executable(adapt_async_default_test src/core/adapt_async_default_test.cpp)
   target_include_directories(adapt_async_default_test PRIVATE include)
   add_test(NAME adapt_async_default_test COMMAND adapt_async_default_test)
