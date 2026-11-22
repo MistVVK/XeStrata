@@ -2267,7 +2267,7 @@
    "download_gb": 22.1,
    "ram_gb": 14.5,
    "edits": true,
-   "license": "MOSS-Image is under the Apache 2.0 license: https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT; its text encoder, Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well).  Its edit adapters: chinoll's Moss-Image-Edit (PedroMarinhoDev's ComfyUI copy) under GPL-3.0, https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6 under Apache 2.0, https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ",
+   "license": "MOSS-Image is under the Apache 2.0 license: https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT; its text encoder, Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well).  Its edit adapters: chinoll's Moss-Image-Edit (PedroMarinhoDev's ComfyUI copy) under GPL-3.0, https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI",
    "tools": [
     "generate_image",
     "edit_image",
@@ -2323,7 +2323,7 @@
    "download_gb": 22.1,
    "ram_gb": 14.5,
    "edits": true,
-   "license": "MOSS-Image-Base is under the Apache 2.0 license: https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base; its text encoder, Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well).  Its edit adapters: chinoll's Moss-Image-Edit (PedroMarinhoDev's ComfyUI copy) under GPL-3.0, https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6 under Apache 2.0, https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ",
+   "license": "MOSS-Image-Base is under the Apache 2.0 license: https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base; its text encoder, Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well).  Its edit adapters: chinoll's Moss-Image-Edit (PedroMarinhoDev's ComfyUI copy) under GPL-3.0, https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI",
    "tools": [
     "generate_image",
     "edit_image",
