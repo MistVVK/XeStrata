@@ -42521,6 +42521,39 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_SM86_DOWN_WS",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/kernels/cuda/iq_kernels.cu",
+          "line": 4293,
+          "backend": "cuda-hip",
+          "fn": "env_int_or"
+        }
+      ],
+      "parse": "int",
+      "default_state": "off",
+      "code_default": 0,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "",
+      "first_date": "2026-11-22",
+      "since": "v0.2.20",
+      "last_commit": "",
+      "last_date": "2026-11-22",
+      "status": "opt-in",
+      "owner": "kernels/cuda",
+      "note": "Opt-in zero-spill sm_86 down kernels for n_ff=640 (#6581: 1/6=IQ4_NL+Q2_0, 5=Q2_0 only, 0=off).",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_SMALL_UNR",
       "backends": [
         "cuda-hip"
@@ -50109,5 +50142,6 @@
       "retire_after": "",
       "retired_in": ""
     }
-  ]
+  ],
+  "count": 1216
 }

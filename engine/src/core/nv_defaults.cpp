@@ -53,10 +53,10 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_GU_SWIGLU", "1"},           // -0.8, -1.4
             {"STRATA_QSA_ROWS", "1"},            // -0.5, -1.2
             {"STRATA_B6_MMVQ_ROWS", "1"},        // A4000 0, 3060 -1.7
-            // 0.2.19 sm_86 (RTX 3090 24 GB / A4000 16 GB): bit-exact pipeline/PLE/quant fusions + fused K-quant prompt
-            // kernels. (STRATA_HC_Q8=1 remains opt-in: +0.764 pts on 11,121-tok force_check.)
+            // 0.2.19 sm_86 (RTX 3090 24 GB / A4000 16 GB): bit-exact pipeline/PLE fusions + fused K-quant prompt
+            // kernels. (#6583: STRATA_QFUSE=1 stays opt-in on sm_86 — it overrides STRATA_GR_UP75=1 and disables
+            // 1-token self_commit, regressing sm_86 partial-VRAM decode by ~5%. STRATA_HC_Q8=1 also stays opt-in.)
             {"STRATA_DEQUANT_SIDE", "1"},
-            {"STRATA_QFUSE", "1"},
             {"STRATA_LFUSE", "1"},
             {"STRATA_PLE_COMPACT", "1"},
             {"STRATA_PLE_COPY_STREAM", "1"},
