@@ -9192,6 +9192,34 @@ def sycl_setup(argv) -> int:
     return subprocess.call([sys.executable, str(script), *rest])
 
 
+def _select_sycl_cards(a, cards: list[dict]) -> list[dict]:
+    """Select one or more Intel Arc cards from `cards` honoring --gpu-roles / --gpus / --gpu (Helper..Main order)."""
+    by_idx = {int(c["index"]): c for c in cards}
+    roles_raw = getattr(a, "gpu_roles", None)
+    if isinstance(roles_raw, str) and roles_raw.strip():
+        from strata_control import gpu_roles as GR
+        roles = GR.roles_from_text(roles_raw, cards)
+        order = GR.order(roles, cards)
+        if order:
+            a._roles = roles
+            a._roles_cards = cards
+            return [by_idx[i] for i in order if i in by_idx]
+    gpus_raw = getattr(a, "gpus", None)
+    if isinstance(gpus_raw, str) and gpus_raw.strip():
+        if gpus_raw.strip().lower() == "all":
+            return list(cards)
+        sel = [int(x.strip()) for x in gpus_raw.split(",") if x.strip().isdigit()]
+        picked = [by_idx[i] for i in sel if i in by_idx]
+        if picked:
+            return picked
+    gpu_raw = getattr(a, "gpu", None)
+    if isinstance(gpu_raw, int) and not isinstance(gpu_raw, bool) and gpu_raw in by_idx:
+        return [by_idx[gpu_raw]]
+    if isinstance(gpu_raw, str) and gpu_raw.strip().isdigit() and int(gpu_raw.strip()) in by_idx:
+        return [by_idx[int(gpu_raw.strip())]]
+    return list(cards[:1])
+
+
 def intel_control_setup(a) -> int:
     """`--backend sycl` in the app's CONTROL mode (tools/strata_mcp.py passes it for an Intel Arc PC): what the Terminal does for an Arc
     (strata_cli/launch/runner.py adopt_prepared_files): the pack from the model's GGUF files (`--prepare-pack`'s step), then the run config
@@ -9205,6 +9233,17 @@ def intel_control_setup(a) -> int:
     if not intel_app.supported_here():
         fail("the Intel Arc engine runs on Linux only", "there is no Windows or Mac Intel engine yet")
     family = a.family or "qwen"
+    if family in HY4_FAMILIES or family in INKLING_FAMILIES:
+        cards = intel_app.arc_cards()
+        if not cards:
+            fail("no Intel Arc card Strata can use was found in this computer")
+        sel_cards = _select_sycl_cards(a, cards)
+        main_gpu = {**sel_cards[-1], "count": len(cards)}
+        multi = sel_cards if len(sel_cards) > 1 else []
+        a.backend = "sycl"
+        if family in HY4_FAMILIES:
+            return install_hy4_flash(a, family, main_gpu, False, [], None, multi, a.port or 8080, ram_gb(), None)
+        return install_inkling2(a, family, main_gpu, False, [], None, multi, a.port or 8080, ram_gb(), None)
     if family not in FAMILIES or not intel_app.can_set_up(family, FAMILIES[family]):
         fail(f"cannot set up {family} for an Intel Arc card", "choose a Qwen3.8-Flash-Next, Swift, Coder, Gyro or Unsloth size")
     fam, model = FAMILIES[family], a.model
@@ -9223,7 +9262,8 @@ def intel_control_setup(a) -> int:
         fail(intel_app.NO_DOWNLOAD)
     ok(f"model files: {model_dir} ({len(shards)} file{'s' if len(shards) != 1 else ''})")
     cards = intel_app.arc_cards()
-    vram = max((float(c.get("vram_gb") or 0) for c in cards), default=0.0)
+    sel_cards = _select_sycl_cards(a, cards) if cards else []
+    vram = max((float(c.get("vram_gb") or 0) for c in (sel_cards or cards)), default=0.0)
     ok("graphics card: " + (", ".join(f"{c['name']} ({c['vram_gb']:g} GB)" for c in cards) or "an Intel Arc"))
     if a.check:
         return 0
@@ -9247,6 +9287,24 @@ def intel_control_setup(a) -> int:
                                backend="sycl", vram_gb=vram, notes=notes, pack_name=tag.lower())
     if cfg is None:
         fail("Strata cannot start this model on the Intel Arc card yet: " + "; ".join(problems))
+    if isinstance(getattr(a, "_roles", None), dict) and cards:
+        from strata_control import gpu_roles as GR
+        cfg.update(GR.mirror(a._roles, getattr(a, "_roles_cards", None) or cards))
+        cfg["gpus_asked"] = True
+        if isinstance(cfg.get("gpu"), list) and len(cfg["gpu"]) > 1:
+            cfg["layer_split"] = "auto"
+    elif isinstance(getattr(a, "gpus", None), str) and len(sel_cards) > 1:
+        cfg["gpu"] = [int(c["index"]) for c in sel_cards]
+        cfg["gpus_asked"] = True
+        cfg["layer_split"] = "auto"
+    elif isinstance(getattr(a, "gpu", None), int) and not isinstance(getattr(a, "gpu", None), bool) and sel_cards:
+        cfg["gpu"] = int(sel_cards[0]["index"])
+        cfg["gpus_asked"] = True
+    if isinstance(cfg.get("gpu"), list) and len(cfg["gpu"]) == 2:
+        from strata_control import intel_spec
+        spec_note = intel_spec.apply_for_launch(cfg)
+        if spec_note:
+            notes.append(spec_note)
     if a.port:
         cfg["port"] = a.port
     if a.host:
@@ -9811,14 +9869,44 @@ def hy4_pc(gpu, ram) -> tuple:
     return float(g.get("vram_gb") or 0.0), float(ram), False
 
 
-def hy4_menu_lines(vram_gib, ram_gib, unified, ctx=None, vision=hy4_family.DEFAULT_VISION) -> list:
+def hy4_menu_lines(vram_gib, ram_gib, unified, ctx=None, vision=hy4_family.DEFAULT_VISION, extra_vram_gib=0.0) -> list:
     """One line per build for the size menu, best first, with the fit words (at this context, with the image reader's memory when images are on) and the recommended mark."""
-    rec = hy4_fit.recommend(vram_gib, ram_gib, unified, ctx, vision)["build"]
+    rec = hy4_fit.recommend(vram_gib, ram_gib, unified, ctx, vision, extra_vram_gib=extra_vram_gib)["build"]
     words = {"ram_vram_zero_ssd": "fits in memory", "near_resident_ssd": "fits, a few experts are read from the SSD", "cross_tier_ssd": "streams experts from the SSD: much slower"}
     out = []
-    for r in hy4_fit.rows(vram_gib, ram_gib, unified, ctx, vision):
+    for r in hy4_fit.rows(vram_gib, ram_gib, unified, ctx, vision, extra_vram_gib=extra_vram_gib):
         out.append((r["build"], f"{r['build']:7s} {hy4_family.BUILD_ABOUT[r['build']]}; download {r['download_gb']:.0f} GB   <- {words[r['mode']]}"
                     + ("   (recommended)" if r["build"] == rec else "")))
+    return out
+
+
+def _multi_gpu_cards(multi, gpu, hip, amd) -> list[dict]:
+    """Resolve `multi` (either a list of int indices from main(), or a list of GPU dicts) into discrete GPU dicts for CUDA, AMD HIP, or Intel SYCL."""
+    if not multi or not isinstance(multi, (list, tuple)):
+        return []
+    out: list[dict] = []
+    amd_by = {int(g["index"]): g for g in (amd or []) if isinstance(g, dict) and "index" in g}
+    nv_by: dict[int, dict] | None = None
+    for item in multi:
+        if isinstance(item, dict):
+            card = dict(item)
+        elif isinstance(item, int) and not isinstance(item, bool):
+            if hip and item in amd_by:
+                card = dict(amd_by[item])
+            elif gpu and int(gpu.get("index", -1)) == item:
+                card = dict(gpu)
+            else:
+                if nv_by is None:
+                    try:
+                        nv_by = {int(g["index"]): g for g in gpus()}
+                    except Exception:                  # noqa: BLE001
+                        nv_by = {}
+                card = dict(nv_by.get(item) or {"index": item, "name": f"GPU {item}", "vram_gb": float((gpu or {}).get("vram_gb") or 0.0)})
+        else:
+            continue
+        if card.get("uma") or card.get("unified") or card.get("unified_gb") or card.get("integrated"):
+            continue
+        out.append(card)
     return out
 
 
@@ -9921,16 +10009,23 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
     say(f"  {fam['title']} - {fam['by']}: {fam['about']}")
     ok(f"model: {fam['title']}")
     say(f"  Its license: {fam['license']}")
-    if multi:
-        warn(f"{fam['title']} runs on one GPU so far: using GPU {gpu.get('index', 0)} ({gpu_name(gpu)}) only")
     names = list(fam["models"])
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
     vram_gib, ram_gib, unified = hy4_pc(gpu, ram)
+    multi_cards = _multi_gpu_cards(multi, gpu, hip, amd)[:4] if not unified else []
+    extra_vram_gib = 0.0
+    if len(multi_cards) >= 2:
+        main_idx = int(gpu.get("index", multi_cards[-1]["index"]))
+        helpers = [c for c in multi_cards if int(c["index"]) != main_idx]
+        if len(helpers) == len(multi_cards):
+            helpers = multi_cards[:-1]
+        extra_vram_gib = sum(float(c.get("vram_gb") or 0.0) for c in helpers)
+        ok("GPUs: " + " + ".join(gpu_name(c) for c in multi_cards) + f" (expert-parallel across {len(multi_cards)} GPUs)")
     vision = a.vision not in ("no", "none")            # images are on by default (owner, 2026-11-19): the Vision shard is in the download set; --vision no leaves it out
     want_ctx = a.context or hy4_family.DEFAULT_CONTEXT
-    lines = hy4_menu_lines(vram_gib, ram_gib, unified, want_ctx, vision)
-    rec = hy4_fit.recommend(vram_gib, ram_gib, unified, want_ctx, vision)
+    lines = hy4_menu_lines(vram_gib, ram_gib, unified, want_ctx, vision, extra_vram_gib=extra_vram_gib)
+    rec = hy4_fit.recommend(vram_gib, ram_gib, unified, want_ctx, vision, extra_vram_gib=extra_vram_gib)
     say()
     order = [b for b, _ in lines]
     for i, (b, text) in enumerate(lines, 1):
@@ -9948,11 +10043,11 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
         for i, c in enumerate(ctxs, 1):
             say(f"  {i}) {c // 1024}K tokens" + ("   (recommended)" if c == hy4_family.DEFAULT_CONTEXT else ""))
         ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(hy4_family.DEFAULT_CONTEXT) + 1), a.yes)) - 1]
-    placed =hy4_fit.place(model, vram_gib, ram_gib, unified, ctx, vision)
+    placed = hy4_fit.place(model, vram_gib, ram_gib, unified, ctx, vision, extra_vram_gib=extra_vram_gib)
     mode = hy4_fit.mode(placed["ssd_gb"])
     if mode == "cross_tier_ssd":
         warn(f"{model} does not fit this PC's memory: about {placed['ssd_gb']:.0f} GB of its experts are read from the SSD while it answers, so it is much slower "
-             f"({hy4_fit.recommend(vram_gib, ram_gib, unified, ctx, vision)['build']} fits better)")
+             f"({hy4_fit.recommend(vram_gib, ram_gib, unified, ctx, vision, extra_vram_gib=extra_vram_gib)['build']} fits better)")
     ok(f"context: {ctx} tokens")
     ok("images: " + ("on (the Vision file is downloaded; the engine reads pictures once it supports them)" if vision else "off"))
     if a.rope_scaling or a.rope_scale or a.kv or a.resident_budget_gib is not None or a.low_ram not in (None, "auto"):
@@ -10012,7 +10107,18 @@ def install_hy4_flash(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopt
         cfg["backend"] = "hip"
     elif sys.platform == "darwin":
         cfg["backend"] = "metal"
-    if gpu.get("count", 1) > 1 or a.gpu is not None:
+    elif getattr(a, "backend", None) == "sycl":
+        cfg["backend"] = "sycl"
+    if isinstance(getattr(a, "_roles", None), dict):
+        from strata_control import gpu_roles as GR
+        rcards = getattr(a, "_roles_cards", None) or (multi_cards if len(multi_cards) >= 2 else [gpu])
+        cfg.update(GR.mirror(GR.parse_saved(a._roles) or a._roles, rcards))
+        cfg["gpus_asked"] = True
+    elif len(multi_cards) >= 2:
+        cfg["gpu"] = [int(c["index"]) for c in multi_cards]
+        cfg["gpu_order"] = "as_given"
+        cfg["gpus_asked"] = True
+    elif gpu.get("count", 1) > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]
         cfg["gpus_asked"] = True
     if a.host:
@@ -10194,9 +10300,11 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
     vram_gib, ram_gib, unified, igpu, arch = inkling_pc(gpu, ram)
-    dual_gpus = [g for g in (multi or []) if g.get("vendor", "nvidia") == "nvidia"] if (not hip and not amd and not unified) else []
+    multi_cards = _multi_gpu_cards(multi, gpu, hip, amd) if not unified else []
+    dual_gpus = multi_cards[:2] if len(multi_cards) >= 2 else []
     if len(dual_gpus) >= 2:
-        vram_gib = sum(float(g.get("vram_gb") or 0.0) for g in dual_gpus[:2])
+        vram_gib = sum(float(g.get("vram_gb") or 0.0) for g in dual_gpus)
+        ok("GPUs: " + " + ".join(gpu_name(c) for c in dual_gpus) + " (dual-GPU expert parallelism)")
     vision = a.vision not in ("no", "none")
     want_ctx = a.context or inkling_family.DEFAULT_CONTEXT
     lines = inkling_menu_lines(vram_gib, ram_gib, unified, want_ctx, vision, igpu=igpu, arch=arch)
@@ -10287,8 +10395,14 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         cfg["backend"] = "metal"
     elif a.backend == "sycl":
         cfg["backend"] = "sycl"
-    if len(dual_gpus) >= 2:
-        cfg["gpu"] = [g["index"] for g in dual_gpus[:2]]
+    if isinstance(getattr(a, "_roles", None), dict):
+        from strata_control import gpu_roles as GR
+        rcards = getattr(a, "_roles_cards", None) or (dual_gpus if len(dual_gpus) >= 2 else [gpu])
+        cfg.update(GR.mirror(GR.parse_saved(a._roles) or a._roles, rcards))
+        cfg["gpus_asked"] = True
+    elif len(dual_gpus) >= 2:
+        cfg["gpu"] = [int(g["index"]) for g in dual_gpus]
+        cfg["gpu_order"] = "as_given"
         cfg["gpus_asked"] = True
     elif gpu.get("count", 1) > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]
@@ -11165,8 +11279,6 @@ def main() -> int:
             say(f"  (the AMD card: {'START-HERE.bat' if WIN else './setup.sh'} --backend hip)")
     cuda_tk = 13                                       # NVIDIA: the toolkit of this model's engine (cuda_choice)
     if hip:                                            # AMD: compiled here; Windows: ready-made
-        if WIN and a.gpus:
-            fail("several AMD cards sharing one model (--gpus) is Linux-only for now", "use one card: --gpu N")
         say("  Your AMD GPUs:" if amd else "  No AMD GPU found (" + ("Windows lists no AMD display adapter)." if WIN
                                                                    else "the amdgpu driver's KFD topology is empty)."))
         for g in amd:
@@ -11189,9 +11301,9 @@ def main() -> int:
                         "your user in the render and video groups)")
         if not usable:
             fail("no AMD GPU Strata can use", f"the AMD backend runs on {AMD_CARDS}")
-        if a.gpus:                                     # a layer split across these cards, the first one the main
+        if a.gpus:                                     # a layer split / expert-parallel across these cards (roles: Main is last)
             chosen = amd_parse_gpus(a.gpus, amd)
-            gpu = chosen[0]
+            gpu = chosen[-1] if getattr(a, "_roles", None) else chosen[0]
         elif a.gpu is not None:
             gpu = next((g for g in usable if g["index"] == a.gpu), None)
             if gpu is None:
@@ -11207,7 +11319,7 @@ def main() -> int:
                     + ", ".join(f"--gpu {g['index']} ({g['name']})" for g in others))
         # the engine is compiled for every chosen card's architecture
         gpu = {**gpu, "count": len(amd), "archs": sorted({g["arch"] for g in chosen})}
-        chosen = [gpu] + chosen[1:]
+        chosen = [gpu if g["index"] == gpu["index"] else g for g in chosen]
         sel = [g["index"] for g in chosen]
         multi = sel if len(sel) > 1 else []
         a.gpu = gpu["index"] if len(amd) > 1 else a.gpu

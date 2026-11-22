@@ -71,10 +71,12 @@ class Hy4TuiWalkTests(unittest.TestCase):
     def test_flow_for_omits_qwen_only_screens_for_hy4_and_keeps_qwen_intact(self) -> None:
         for hw in (HW_12, HW_24, HW_2X16, HW_ARC_LINUX, HW_MAC_METAL):
             ctx = make_ctx(hw)
-            self.assertEqual(
-                screens.flow_for(ctx, "hy4-flash"),
-                ["model", "folder", "context", "pictures", "access", "save"],
+            want = (
+                ["model", "cards", "folder", "context", "pictures", "access", "save"]
+                if hw is HW_2X16
+                else ["model", "folder", "context", "pictures", "access", "save"]
             )
+            self.assertEqual(screens.flow_for(ctx, "hy4-flash"), want)
             qwen_flow = screens.flow_for(ctx, "qwen")
             for must_have in ("parallel", "tuning", "advanced"):
                 self.assertIn(must_have, qwen_flow)
@@ -95,20 +97,26 @@ class Hy4TuiWalkTests(unittest.TestCase):
                         await settle(pilot, 2)
                         head = flat(app)
                         self.assertIn("Tencent Hy4-Flash", head)
-                        self.assertIn("Step 1 of 6: Model", head)
+                        self.assertIn("Step 1 of 7: Model", head)
 
-                        # Step 1 -> Step 2 (Folder)
+                        # Step 1 -> Step 2 (Cards on multi-GPU HW_2X16)
+                        await pilot.press("enter")
+                        await settle(pilot)
+                        self.assertEqual(app.current, "cards")
+                        self.assertIn("Step 2 of 7: Cards", flat(app))
+
+                        # Step 2 -> Step 3 (Folder)
                         await pilot.press("enter")
                         await settle(pilot)
                         self.assertEqual(app.current, "folder")
-                        self.assertIn("Step 2 of 6: Folder", flat(app))
+                        self.assertIn("Step 3 of 7: Folder", flat(app))
 
-                        # Step 2 -> Step 3 (Context)
+                        # Step 3 -> Step 4 (Context)
                         await pilot.press("enter")
                         await settle(pilot)
                         self.assertEqual(app.current, "context")
                         ctx_text = flat(app)
-                        self.assertIn("Step 3 of 6: Context", ctx_text)
+                        self.assertIn("Step 4 of 7: Context", ctx_text)
                         self.assertIn("128K", ctx_text)
                         self.assertIn("managed automatically by Hy4-Flash", ctx_text)
                         self.assertNotIn("press m to change", ctx_text)
@@ -117,12 +125,12 @@ class Hy4TuiWalkTests(unittest.TestCase):
                         await settle(pilot, 1)
                         self.assertIsNone(ctx.settings.kv)
 
-                        # Step 3 -> Step 4 (Pictures)
+                        # Step 4 -> Step 5 (Pictures)
                         await pilot.press("enter")
                         await settle(pilot)
                         self.assertEqual(app.current, "pictures")
                         pic_text = flat(app)
-                        self.assertIn("Step 4 of 6: Pictures", pic_text)
+                        self.assertIn("Step 5 of 7: Pictures", pic_text)
                         self.assertIn("Yes, read pictures", pic_text)
                         self.assertNotIn("no picture reader", pic_text)
                         self.assertNotIn("not available on Intel Arc", pic_text)
@@ -130,19 +138,19 @@ class Hy4TuiWalkTests(unittest.TestCase):
                         if size[1] >= 30:
                             self.assertIn("Hy4-Flash-Vision.strata", pic_text)
 
-                        # Step 4 -> Step 5 (Access) - skips Drafting, Parallel, Tuning, Advanced!
+                        # Step 5 -> Step 6 (Access) - skips Drafting, Parallel, Tuning, Advanced!
                         await pilot.press("enter")
                         await settle(pilot)
                         self.assertEqual(app.current, "access")
                         self.assertEqual(ctx.settings.vision, "on")
-                        self.assertIn("Step 5 of 6: Access", flat(app))
+                        self.assertIn("Step 6 of 7: Access", flat(app))
 
-                        # Step 5 -> Step 6 (Save)
+                        # Step 6 -> Step 7 (Save)
                         await pilot.press("enter")
                         await settle(pilot)
                         self.assertEqual(app.current, "save")
                         save_text = flat(app)
-                        self.assertIn("Step 6 of 6: Save", save_text)
+                        self.assertIn("Step 7 of 7: Save", save_text)
                         self.assertIn(f"Tencent Hy4-Flash {build}", save_text)
                         self.assertIn("Pictures on", save_text)
                         self.assertIn("DFly2", save_text)
@@ -152,7 +160,7 @@ class Hy4TuiWalkTests(unittest.TestCase):
                         self.assertNotIn("It tunes first.", save_text)
 
                         # Escape all the way back to Start cleanly
-                        for expected in ("access", "pictures", "context", "folder", "model", "start"):
+                        for expected in ("access", "pictures", "context", "folder", "cards", "model", "start"):
                             await pilot.press("escape")
                             await settle(pilot)
                             self.assertEqual(app.current, expected)

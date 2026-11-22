@@ -1220,18 +1220,21 @@ class StrataEngine:
         finally:
             ctl.release()
 
-    def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
+    def vram(self, reserve_mib: int | None, timeout: float = 120.0, device: int | None = None) -> dict:
         with self._exclusive_control():
-            return self._vram(reserve_mib, timeout)
+            return self._vram(reserve_mib, timeout, device)
 
-    def _vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
+    def _vram(self, reserve_mib: int | None, timeout: float = 120.0, device: int | None = None) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
         expert cache until that much VRAM is free, or grows it back when more is free; None: back to the reserve it
         started with.  -> the engine's figures (expert_slots, expert_cache_mib, vram_free_mib, ...); raises ValueError
         with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
+        if device is not None and reserve_mib is None:   # per-GPU (#533): a device only makes sense with an explicit reserve.
+            raise ValueError("VRAM with a device needs an explicit reserve_mib")
+        cmd = "VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}" + (f" {int(device)}" if device is not None else ""))
+        self.proc.stdin.write(cmd + "\n")
         self.proc.stdin.flush()
         deadline = time.time() + timeout
         while True:
@@ -1250,6 +1253,16 @@ class StrataEngine:
                     k, _, v = kv.partition("=")
                     out[k] = int(v) if v.lstrip("-").isdigit() else v
                 self.info.update({k: out[k] for k in ("expert_slots", "vram_free_mib") if k in out})
+                cards = out.get("cards")                     # #533 per-GPU free, keyed by CUDA device id (a card the command did not act on is reported too).
+                if isinstance(cards, str):
+                    per = {}
+                    for part in cards.split("|"):
+                        bits = part.split(":")
+                        if len(bits) == 3 and all(b.isdigit() for b in bits):   # reject any sign: a malformed engine line cannot inject a negative device or figure.
+                            dev, mapped_mib, free_mib = (int(b) for b in bits)
+                            per[str(dev)] = {"mapped_mib": mapped_mib, "free_mib": free_mib}
+                    if per:
+                        out["per_device"] = per
                 self.info["vram"] = out
                 return out
             if time.time() > deadline:
@@ -3674,6 +3687,8 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None, archs=None) -> list[int]:
     if "--peer-device" in args or "--layer-split" in args or layer_split_value(cfg) != "auto":
         return gl
     hip = cfg.get("backend") == "hip"
+    if cfg.get("backend") == "sycl" and scores is None:
+        return gl
     if hip:
         # An integrated Radeon (Strix Halo beside an R9700) is never the LAST stage: that stage runs the head, the draft layer and the
         # check of the guesses, and the iGPU usually draws the desktop.  Its "VRAM" is the BIOS carve-out (up to 96 GB), which made the
@@ -3754,6 +3769,14 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
     if gpu_all_off(cfg):                             # every card Off: the engine sees none (a CPU engine runs; the others say so at start)
         env["CUDA_VISIBLE_DEVICES"] = ""
         env["HIP_VISIBLE_DEVICES"] = ""
+        if cfg.get("backend") == "sycl":
+            env["ZE_AFFINITY_MASK"] = ""
+            env["ONEAPI_DEVICE_SELECTOR"] = ""
+    elif cfg.get("backend") == "sycl":               # Intel Arc (Level Zero / SYCL): expose only selected cards in Helper..Main order
+        sycl_cards = ordered_gpus(cfg)
+        if sycl_cards:
+            env["ZE_AFFINITY_MASK"] = ",".join(str(i) for i in sycl_cards)
+            env.setdefault("ONEAPI_DEVICE_SELECTOR", "level_zero:gpu")
     elif hip_visible(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (hip_visible)
         env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in hip_visible(cfg))
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
@@ -4537,7 +4560,7 @@ class Service:
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
 
-    def vram(self, reserve_mib: int | None) -> dict:
+    def vram(self, reserve_mib: int | None, device: int | None = None) -> dict:
         """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
         engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
@@ -4560,7 +4583,7 @@ class Service:
                 return {"status": "not loaded", "reserve_mib": reserve_mib,
                         "note": "applied when the model loads"}
             # an elastic encoder that runs keeps its VRAM on top of the asked reserve
-            out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
+            out = self.engine.vram(((reserve_mib or 0) + self.vision.elastic_mib) if self.vision_held else reserve_mib, device=device)
             self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
             print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
                   f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
@@ -4733,9 +4756,14 @@ class Service:
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        amd=getattr(self, "backend", None) == "hip")
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
-                # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
-                # slow card keeps the GPU at work while the host thread sleeps)
-                self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
+                # #1317 / #6473: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt
+                # chunk on a slow card, or one active stage of a multi-GPU split, keeps a GPU at work while the host sleeps)
+                def _any_gpu_busy():
+                    now = self.telemetry.snapshot()["now"]
+                    if (now.get("gpu_util") or 0) >= 10:
+                        return True
+                    return any((g.get("util") or 0) >= 10 for g in (now.get("gpus") or ()))
+                self.engine.gpu_busy = _any_gpu_busy
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
@@ -7222,10 +7250,15 @@ def make_handler(svc: Service):
                     if not self._own_page("the VRAM reserve can be changed"):
                         return
                     r = req.get("reserve_mib")
+                    d = req.get("device")                     # per-GPU (#533): free only this CUDA card; null/absent: every card.
                     if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
                         raise ValueError("reserve_mib: a whole number of MiB (0 or more), or null for the start's")
+                    if d is not None and (isinstance(d, bool) or not isinstance(d, int) or d < 0):
+                        raise ValueError("device: a CUDA device index (0 or more), or null for every card")
+                    if d is not None and r is None:
+                        raise ValueError("device needs an explicit reserve_mib to free")
                     try:
-                        self._json(200, svc.vram(r))
+                        self._json(200, svc.vram(r, d))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return

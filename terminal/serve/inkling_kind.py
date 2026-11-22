@@ -98,10 +98,11 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     if isinstance(par, int) and 1 <= par <= inkling_family.MAX_PARALLEL and "--parallel" not in args:
         if par > 1:
             args += ["--parallel", str(par)]
-    # Propagate 2-GPU selection (`cfg["gpu"] = [0, 1]`) into `--gpus 2` for dual-GPU Expert Parallelism
-    gpu_cfg = cfg.get("gpu")
-    if isinstance(gpu_cfg, (list, tuple)) and len(gpu_cfg) >= 2 and "--gpus" not in args:
-        args += ["--gpus", str(min(2, len(gpu_cfg)))]
+    # Propagate 2-GPU selection (`cfg["gpu"] = [0, 1]` or `gpu_roles`) into `--gpus 2` for dual-GPU Expert Parallelism (CUDA, HIP, SYCL)
+    from serve.server_parts.engines import gpu_list
+    n_gpus = len(gpu_list(cfg))
+    if n_gpus >= 2 and "--gpus" not in args:
+        args += ["--gpus", str(min(2, n_gpus))]
     wants_images = "--vision" in args
     need_draft = "--draft" not in args and wants_drafter(cfg)
     info = probe(exe, args, cfg) if (exe and (wants_images or need_draft)) else None

@@ -18,7 +18,7 @@ import { isInkling } from './inkling.mjs';
 export const KNOWN_KEYS = new Set([
   ...NATIVE_FIELDS.map(f => f.id),
   'exe', 'args', 'args_written', 'user_args', 'gpus_by', 'cwd', 'tokenizer', 'model_name', 'model', 'arch', 'log', 'lib_dirs', 'port', 'host', 'api_key', 'cuda', 'backend', 'gpu', 'gpus_asked',
-  'gpu_policy', 'hip_ordinal', 'env', 'env_to_user', 'sampling', 'mcp_servers', 'mcpServers', 'before_load', 'before_load_ignore_failure',
+  'gpu_roles', 'gpu_cards', 'gpu_none', 'gpu_policy', 'hip_ordinal', 'env', 'env_to_user', 'sampling', 'mcp_servers', 'mcpServers', 'before_load', 'before_load_ignore_failure',
   'before_load_strict', 'before_load_timeout_s', 'cors_origins', 'trusted_origins', 'allowed_hosts', 'open_browser', 'prevent_sleep',
   'max_queue', 'queue_timeout', 'max_tokens', 'min_tokens', 'answer_room', 'threads', 'replicas', 'replica_cpus', 'replica_load_tokens',
   'elastic', 'elastic_idle_s', 'elastic_mib', 'min_free_vram_mib', 'vram_segment_mib', 'slot_save_path', 'telemetry_read_key', 'batch_telemetry',

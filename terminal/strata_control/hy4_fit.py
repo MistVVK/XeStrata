@@ -38,6 +38,7 @@ from __future__ import annotations
 
 GIB_TO_GB = 1.073741824
 VRAM_NON_EXPERT_GB = 2.00        # 1.00 GB driver/WDDM + 0.32 GB fp16 MLA KV at 20K context + 0.68 GB buffers
+PEER_OVERHEAD_GB = 1.00          # driver / workspace overhead on helper GPU(s) holding routed experts only
 OS_RESERVE_GB = 5.10
 HOT_ENGRAM_GB = 0.90             # Section 2 seed (64 MiB) + clock LRU (836 MiB), in RAM
 UMA_RESERVE_GB = OS_RESERVE_GB + HOT_ENGRAM_GB + VRAM_NON_EXPERT_GB - 1.0   # one pool: the system, the Engram cache and the buffers (the driver's 1 GB is the pool's own)
@@ -137,19 +138,22 @@ def kv_in_host(vram_gib: float | None, ctx: int | None = None) -> bool:
     return vram_gib is not None and n > AUTHOR_CONTEXT and engine_plan(vram_gib, n)["host_need_gb"] > 0.0
 
 
-def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None, vision: bool = False) -> dict:
-    """Where the expert bodies of `build` go on a PC with a card of `vram_gib` and `ram_gib` of main memory (GiB): GB in video memory, in RAM, on the SSD.  At the author's 20K
-    (and below) the author's rule holds.  Beyond it the engine's own plan decides (`engine_plan`): the card keeps the buffers and the KV state it holds free of experts (on a small card
-    only the first positions: growable KV), and what the state takes in pinned host memory, plus the pinned headroom, comes out of RAM."""
+def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None, vision: bool = False, extra_vram_gib: float = 0.0) -> dict:
+    """Where the expert bodies of `build` go on a PC with a card of `vram_gib` (plus optional `extra_vram_gib` on helper GPUs) and `ram_gib` of main memory (GiB): GB in video
+    memory, in RAM, on the SSD.  At the author's 20K (and below) the author's rule holds.  Beyond it the engine's own plan decides (`engine_plan`): the primary card keeps the
+    buffers and the KV state it holds free of experts (on a small card only the first positions: growable KV), helper GPUs hold routed experts only, and what the state takes
+    in pinned host memory, plus the pinned headroom, comes out of RAM."""
     info = BUILDS[build]
     n = DEFAULT_CONTEXT if ctx is None else int(ctx)
     if n > AUTHOR_CONTEXT and vram_gib > 0:
         plan = engine_plan(vram_gib, n, info["dense_gb"])
-        gpu_room = max(0.0, vram_gib * GIB_TO_GB - info["dense_gb"] - ENGINE_DENSE_EXTRA_GB - plan["reserve_gb"])
+        primary_room = max(0.0, vram_gib * GIB_TO_GB - info["dense_gb"] - ENGINE_DENSE_EXTRA_GB - plan["reserve_gb"])
         host = plan["host_need_gb"]
     else:
-        gpu_room = max(0.0, vram_gib * GIB_TO_GB - info["dense_gb"] - non_expert_gb(ctx))
+        primary_room = max(0.0, vram_gib * GIB_TO_GB - info["dense_gb"] - non_expert_gb(ctx))
         host = 0.0
+    extra_room = max(0.0, float(extra_vram_gib) * GIB_TO_GB - PEER_OVERHEAD_GB) if extra_vram_gib and extra_vram_gib > 0 else 0.0
+    gpu_room = primary_room + extra_room
     ram_room = max(0.0, ram_gib * GIB_TO_GB - OS_RESERVE_GB - HOT_ENGRAM_GB - (VISION_GB if vision else 0.0) - ((host + HOST_PIN_HEADROOM_GB) if host > 0 else 0.0))
     in_vram = min(info["bodies_gb"], gpu_room)
     in_ram = min(info["bodies_gb"] - in_vram, ram_room)
@@ -165,12 +169,12 @@ def compute_unified(build: str, pool_gib: float, ctx: int | None = None, vision:
     return {"vram_gb": round(held, 2), "ram_gb": 0.0, "ssd_gb": round(max(0.0, info["footprint_gb"] - held), 2)}
 
 
-def place(build: str, vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None, vision: bool = False) -> dict:
-    """The placement of `build`: compute() for a PC with a card, compute_unified() for one pool (`ram_gib` is then the pool), compute() with no card at all (the CPU
-    engine path is not offered: vram_gib None gives the whole footprint on the SSD side of the card, i.e. the RAM rule only)."""
+def place(build: str, vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None, vision: bool = False, extra_vram_gib: float = 0.0) -> dict:
+    """The placement of `build`: compute() for a PC with a card (or several cards via `extra_vram_gib`), compute_unified() for one pool (`ram_gib` is then the pool),
+    compute() with no card at all (the CPU engine path is not offered: vram_gib None gives the whole footprint on the SSD side of the card, i.e. the RAM rule only)."""
     if unified:
         return compute_unified(build, ram_gib, ctx, vision)
-    return compute(build, vram_gib or 0.0, ram_gib, ctx, vision)
+    return compute(build, vram_gib or 0.0, ram_gib, ctx, vision, extra_vram_gib=extra_vram_gib)
 
 
 def mode(ssd_gb: float) -> str:
@@ -182,26 +186,26 @@ def mode(ssd_gb: float) -> str:
     return "cross_tier_ssd"
 
 
-def fits(build: str, vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None, vision: bool = False) -> bool:
+def fits(build: str, vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None, vision: bool = False, extra_vram_gib: float = 0.0) -> bool:
     """Every expert body stays in memory (nothing read from the SSD while it answers)."""
-    return mode(place(build, vram_gib, ram_gib, unified, ctx, vision)["ssd_gb"]) == "ram_vram_zero_ssd"
+    return mode(place(build, vram_gib, ram_gib, unified, ctx, vision, extra_vram_gib=extra_vram_gib)["ssd_gb"]) == "ram_vram_zero_ssd"
 
 
-def recommend(vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None, vision: bool = False) -> dict:
+def recommend(vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None, vision: bool = False, extra_vram_gib: float = 0.0) -> dict:
     """The build to offer first on this PC: the best quality whose experts all stay in memory; when none does, the one with the least read from the SSD
     (ties to the smaller build).  Returns {"build", "placement", "mode", "fits"}.  Never refuses and never hides the model: a PC that cannot hold SQ-64 (the smallest build) still gets SQ-64 with the words "may run slower" and its SSD-read figure."""
-    best = next((b for b in ORDER if fits(b, vram_gib, ram_gib, unified, ctx, vision)), None)
+    best = next((b for b in ORDER if fits(b, vram_gib, ram_gib, unified, ctx, vision, extra_vram_gib=extra_vram_gib)), None)
     if best is None:
-        best = min(reversed(ORDER), key=lambda b: place(b, vram_gib, ram_gib, unified, ctx, vision)["ssd_gb"])
-    placed = place(best, vram_gib, ram_gib, unified, ctx, vision)
-    return {"build": best, "placement": placed, "mode": mode(placed["ssd_gb"]), "fits": fits(best, vram_gib, ram_gib, unified, ctx, vision)}
+        best = min(reversed(ORDER), key=lambda b: place(b, vram_gib, ram_gib, unified, ctx, vision, extra_vram_gib=extra_vram_gib)["ssd_gb"])
+    placed = place(best, vram_gib, ram_gib, unified, ctx, vision, extra_vram_gib=extra_vram_gib)
+    return {"build": best, "placement": placed, "mode": mode(placed["ssd_gb"]), "fits": fits(best, vram_gib, ram_gib, unified, ctx, vision, extra_vram_gib=extra_vram_gib)}
 
 
-def rows(vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None, vision: bool = False) -> list[dict]:
+def rows(vram_gib: float | None, ram_gib: float, unified: bool = False, ctx: int | None = None, vision: bool = False, extra_vram_gib: float = 0.0) -> list[dict]:
     """Every build for this PC, best quality first, for a menu: name, download GB (the Engram and Vision shards are the caller's sum), placement, mode."""
     out = []
     for b in ORDER:
-        placed = place(b, vram_gib, ram_gib, unified, ctx, vision)
+        placed = place(b, vram_gib, ram_gib, unified, ctx, vision, extra_vram_gib=extra_vram_gib)
         out.append({"build": b, "file": BUILDS[b]["file"], "download_gb": BUILDS[b]["file_gb"], "footprint_gb": BUILDS[b]["footprint_gb"],
                     "placement": placed, "mode": mode(placed["ssd_gb"])})
     return out

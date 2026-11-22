@@ -26,8 +26,9 @@ def families() -> tuple:
 
 
 def can_set_up(family: str, family_def: dict | None = None) -> bool:
-    """An Arc run config can be written for this family: one of families(), or a model of the signed feed (Qwen4 day: strata_control/feed_models.py)."""
-    return family in families() or bool((family_def or {}).get("feed"))
+    """An Arc run config can be written for this family: one of families(), a native .strata family (Hy4-Flash, Inkling-2-Mini), or a model of the signed feed."""
+    fd = family_def or {}
+    return family in families() or family in ("hy4-flash", "inkling-2-mini") or bool(fd.get("feed") or fd.get("hy4") or fd.get("inkling"))
 
 
 def model_files_in(folder, family: str, family_def: dict | None = None) -> list:

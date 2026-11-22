@@ -360,7 +360,8 @@ def _adl_cards(buf, count):
         if buf[i].VendorID not in (0x1002, 1002) and b"VEN_1002" not in udid.upper():   # ADL can list another vendor's adapter (an NVIDIA card beside the iGPU)
             continue
         dev = udid.split(b"DEV_", 1)[1].split(b"&", 1)[0] if b"DEV_" in udid else None
-        key = dev or nm
+        bdf = (buf[i].BusNumber, buf[i].DeviceNumber, buf[i].FunctionNumber)
+        key = bdf if any(bdf) else (dev or nm)
         if key in seen:
             continue
         seen.add(key)

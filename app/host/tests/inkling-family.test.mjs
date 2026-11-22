@@ -162,3 +162,22 @@ test('profile.mjs disables thinking mode for Inkling-2-Mini (off only) and run-c
   }));
   assert.equal(checkedBadEffort.ok, false, 'Inkling-2-Mini must reject non-off reasoning_effort');
 });
+
+test('multi-GPU config keys and NativeModels UI omit layer_split for expert-parallel native families', async () => {
+  const { readFileSync } = await import('node:fs');
+  const models = readFileSync(new URL('../src/components/NativeModels.tsx', import.meta.url), 'utf8');
+  const nc = readFileSync(new URL('../server/native-control.mjs', import.meta.url), 'utf8');
+  assert.match(models, /cardsGpus\.length > 1 && !isHy4Selected/);
+  assert.match(models, /!isHy4Selected \? \{ layerSplit:/);
+  assert.match(nc, /isHy4\(cfg\)\|\|isInkling\(cfg\)/);
+  const checked = checkRunConfig(JSON.stringify({
+    exe: 'component:strata-inkling',
+    arch: 'inkling2_loop',
+    gpu: [1, 0],
+    gpu_roles: { '0': 'main', '1': 'helper' },
+    gpu_cards: { '0': 'AMD Radeon RX 9070 XT', '1': 'AMD Radeon RX 9070 XT' },
+    gpu_none: false,
+    args: ['--native', 'Inkling-2-Mini-SQ-20.strata', '--gpus', '2'],
+  }));
+  assert.equal(checked.ok, true, JSON.stringify(checked.issues));
+});
