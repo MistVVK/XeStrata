@@ -385,8 +385,9 @@ inline void swiglu_h(const float* g, const float* u, half* out, size_t n) {
 // ---- router: logits fp32 [T][512] -> top-16 by sigmoid+bias; weights = p/(sum p + 1e-20)*scale. One group (256 thr) per token.
 inline void router_topk(const float* logits, const float* bias, int32_t* idx, float* w, int E, int K, float scale, int T) {
     Q().parallel_for(NR(T, 256), [=](sycl::nd_item<1> it) REQD_SG32 {
-        float* sp = lmem<float, 512>(it);
-        float* ss = lmem<float, 512>(it);
+        float* sbuf = lmem<float, 1024>(it);
+        float* sp = sbuf;
+        float* ss = sbuf + 512;
         float* rv = lmem<float, 8>(it);
         int* ri = lmem<int, 8>(it);
         int* chosen = lmem<int, 16>(it);

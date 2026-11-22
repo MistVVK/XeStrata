@@ -78,6 +78,42 @@ struct EngramDev {
     float* hcs = nullptr;
 };
 
+// Tree-8 speculative verification topology (M <= 8 nodes rooted at logical position p0).
+// Node 0 is always the anchor (parent = -1, depth = 0). Nodes are in topological order (parent[i] < i).
+struct TreeSpec {
+    int M = 0;
+    int32_t tok[8] = {};
+    int8_t parent[8] = {-1, 0, 1, 2, 3, 4, 5, 6};
+    uint8_t depth[8] = {};
+    uint8_t anc[8][8] = {};
+
+    int max_depth() const {
+        int md = 0;
+        for (int i = 0; i < M; ++i) md = std::max(md, (int)depth[i]);
+        return md;
+    }
+    void build_anc() {
+        for (int i = 0; i < M; ++i) {
+            int d = (int)depth[i];
+            int cur = i;
+            while (cur >= 0 && d >= 0) {
+                anc[i][d] = (uint8_t)cur;
+                cur = parent[cur];
+                --d;
+            }
+        }
+    }
+    TreePos to_tree_pos() const {
+        TreePos tp{};
+        tp.n = M;
+        for (int i = 0; i < M; ++i) {
+            tp.depth[i] = depth[i];
+            for (int d = 0; d < 8; ++d) tp.anc[i][d] = anc[i][d];
+        }
+        return tp;
+    }
+};
+
 // Shared placement helper for sy_main & sy_serve: partitions Section 4 experts across
 //   Tier 0: SyVramExpertCache (multi-slab <= 1.4 GiB/slab, auto-sized from free VRAM or --vram-experts-gb)
 //   Tier 1: hy4::CpuExperts RAM arena (AVX-512 VBMI/VNNI or AVX2 + optional two-term "hi")
@@ -273,6 +309,7 @@ public:
 
     // Indexer state
     std::vector<half*> ivg, pooled;
+    half* tmp_pooled = nullptr;  // [16][128] temporary per-node pooled keys for Tree-8 speculative verify
     float *ik_f = nullptr, *iv_f = nullptr, *ig_f = nullptr, *iq_f = nullptr, *hw_f = nullptr, *score = nullptr;
     half *ik_h = nullptr, *iq_h = nullptr;
     int32_t *keys = nullptr, *nkeys = nullptr;
@@ -285,11 +322,11 @@ public:
 
 #if HY4S_HAS_GRAPH
     struct GraphKey {
-        int T = 0, use_list = 0, dfly_cap = 0, engram_on = 0;
+        int T = 0, use_list = 0, dfly_cap = 0, engram_on = 0, is_tree = 0;
         int swa_TK = 0, swa_S = 0, swa_tps = 0;
         int sp_TK = 0, sp_S = 0, sp_tps = 0;
         bool operator==(const GraphKey& o) const {
-            return T == o.T && use_list == o.use_list && dfly_cap == o.dfly_cap && engram_on == o.engram_on &&
+            return T == o.T && use_list == o.use_list && dfly_cap == o.dfly_cap && engram_on == o.engram_on && is_tree == o.is_tree &&
                    swa_TK == o.swa_TK && swa_S == o.swa_S && swa_tps == o.swa_tps &&
                    sp_TK == o.sp_TK && sp_S == o.sp_S && sp_tps == o.sp_tps;
         }
@@ -320,9 +357,44 @@ public:
         if (!vcache || !vcache->adaptive() || dump || tap || !force_route_dir.empty()) return;
         vcache->commit_tokens(n_committed, next_pos, [&](int L, int e) -> const uint8_t* { return ucx.view(L, e).body; });
     }
+    void commit_vram_adapt_path(const int* path, int n_committed, int next_pos) {
+        if (!vcache || !vcache->adaptive() || dump || tap || !force_route_dir.empty()) return;
+        vcache->commit_tokens(n_committed, next_pos, [&](int L, int e) -> const uint8_t* { return ucx.view(L, e).body; }, 41, path);
+    }
     void step_adapt() {
         if (!vcache || !vcache->adaptive() || dump || tap || !force_route_dir.empty()) return;
         vcache->step_adapt([&](int L, int e) -> const uint8_t* { return ucx.view(L, e).body; });
+    }
+
+    // Compact accepted Tree-8 path (nodes path[0..n_accepted] -> contiguous slots p0..p0+n_accepted) across KV, IndexPool ivg/pooled, and DFly2 capture lists.
+    void commit_tree_path(int p0, const int* path, int n_accepted) {
+        const int m = n_accepted + 1;
+        TreePos src{};
+        src.n = m;
+        bool need_compact = false;
+        for (int k = 0; k < m; ++k) {
+            src.depth[k] = (uint8_t)path[k];
+            if (path[k] != k) need_compact = true;
+        }
+        const int g_lo = p0 / 4, g_hi = (p0 + m) / 4 - 1;
+        for (int il = 0; il < c.n_layers; ++il) {
+            const bool swa = c.is_swa[il];
+            if (need_compact) mla_compact_kv(kcache[il], swa ? ring : slots_sparse, p0, swa ? ring : 0, src);
+            if (!swa && index_on) {
+                if (need_compact) idx::compact_ivg(ivg[il], p0, src, iring);
+                if (g_hi >= g_lo) {
+                    const std::string p = L(il) + ".self_attn.compressed_indexer";
+                    idx::pool(ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], g_lo, g_hi - g_lo + 1, (float)theta(il), c.rms_eps, iring);
+                }
+            }
+            if (dfly_cap && !swa) {
+                const int ds = dfly_slot(il);
+                if (ds >= 0 && cap_list[ds] && path[n_accepted] != n_accepted) {
+                    d2d(dkeys[ds] + (size_t)n_accepted * index_topk, dkeys[ds] + (size_t)path[n_accepted] * index_topk, (size_t)index_topk * 4);
+                    d2d(dnkc[ds] + n_accepted, dnkc[ds] + path[n_accepted], 4);
+                }
+            }
+        }
     }
 
     // Per-section GPU timeline (prof2)
@@ -467,6 +539,7 @@ public:
                 ivg[il] = dalloc<half>((size_t)iring * 256);
                 pooled[il] = dalloc<half>((size_t)(max_ctx / 4 + 8) * 128);
             }
+        tmp_pooled = dalloc<half>(16 * 128);
         ik_f = dalloc<float>((size_t)Tc * 128);
         iv_f = dalloc<float>((size_t)Tc * 128);
         ig_f = dalloc<float>((size_t)Tc * 128);
@@ -540,6 +613,8 @@ public:
     struct EPrep {
         std::vector<uint8_t> raw, valid;
         int p0 = -1, T = 0;
+        bool is_tree = false;
+        TreeSpec tree{};
         bool ok = false, pending = false;
         std::string err;
         std::future<void> fut;
@@ -554,14 +629,16 @@ public:
             ep[s].valid.resize((size_t)4 * Tc * 16);
         }
     }
-    void ep_compute(EPrep* e, const int32_t* tok_all, int p0, int T) {
+    void ep_compute(EPrep* e, const int32_t* tok_all, int p0, int T, const TreeSpec* tree = nullptr) {
         std::string err;
         e->ok = true;
+        const bool use_tree = tree != nullptr && tree->M > 0;
         for (int mo = 0; mo < 4; ++mo) {
             std::vector<uint64_t> ids((size_t)T * 16);
             uint8_t* valid = e->valid.data() + (size_t)mo * Tc * 16;
-            hy4::engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), valid);
-            if (vis) vis->mask_engram(valid, p0, T);
+            if (use_tree) hy4::engram_hash_tree(emeta, mo, tok_all, p0, tree->tok, tree->parent, T, ids.data(), valid);
+            else hy4::engram_hash(emeta, mo, tok_all, p0, p0 + T, ids.data(), valid);
+            if (!use_tree && vis) vis->mask_engram(valid, p0, T);
             uint8_t* raw = e->raw.data() + (size_t)mo * Tc * 16 * 100;
             if (!eio.fetch_raw(ids.data(), ids.size(), raw, err)) {
                 e->ok = false;
@@ -570,24 +647,30 @@ public:
             }
         }
     }
-    void prefetch_engram(const int32_t* tok_all, int p0, int T) {
+    void prefetch_engram(const int32_t* tok_all, int p0, int T, const TreeSpec* tree = nullptr) {
         if (!engram_ready) return;
-        for (int s = 0; s < 3; ++s)
-            if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T) return;
+        const bool use_tree = tree != nullptr && tree->M > 0;
+        if (!use_tree) {
+            for (int s = 0; s < 3; ++s)
+                if (ep[s].pending && !ep[s].is_tree && ep[s].p0 == p0 && ep[s].T == T) return;
+        }
         EPrep& e = ep[ep_next];
         if (e.fut.valid()) e.fut.wait();
         if (e.have_used) e.used.wait();
         e.p0 = p0;
         e.T = T;
+        e.is_tree = use_tree;
+        if (use_tree) e.tree = *tree;
         e.pending = true;
-        e.fut = std::async(std::launch::async, [this, &e, tok_all, p0, T]() { ep_compute(&e, tok_all, p0, T); });
+        e.fut = std::async(std::launch::async, [this, &e, tok_all, p0, T, use_tree]() { ep_compute(&e, tok_all, p0, T, use_tree ? &e.tree : nullptr); });
         ep_next = (ep_next + 1) % 3;
     }
-    bool engram_prep(const int32_t* tok_all, int p0, int T, std::string& err) {
+    bool engram_prep(const int32_t* tok_all, int p0, int T, std::string& err, const TreeSpec* tree = nullptr) {
         const double t0 = now_s();
+        const bool use_tree = tree != nullptr && tree->M > 0;
         EPrep* e = nullptr;
         for (int s = 0; s < 3; ++s)
-            if (ep[s].pending && ep[s].p0 == p0 && ep[s].T == T) e = &ep[s];
+            if (ep[s].pending && ep[s].is_tree == use_tree && ep[s].p0 == p0 && ep[s].T == T) e = &ep[s];
         if (e) {
             e->fut.get();
             e->pending = false;
@@ -597,7 +680,7 @@ public:
             e = &ep[ep_next];
             if (e->have_used) e->used.wait();
             ep_next = (ep_next + 1) % 3;
-            ep_compute(e, tok_all, p0, T);
+            ep_compute(e, tok_all, p0, T, tree);
         }
         if (!e->ok) {
             err = e->err;
@@ -731,10 +814,13 @@ public:
     bool fuse_dec = false;
     float *kva2 = nullptr, *sg_f = nullptr, *su_f = nullptr, *so_f = nullptr;
     std::vector<GemvMulti> mg_att, mg_m1, mg_shd, mg_up;
-    std::vector<char> mg_att_ok, mg_moe_ok;
+    std::vector<char> mg_att_ok, mg_att_gate, mg_moe_ok;
+    GemvMulti mg_mlp0;
+    bool mg_mlp0_ok = false;
     bool mg_add(GemvMulti& m, const std::string& name, float* Y, int xmode, const half* Xh, const float* Xf, const float* Xg, const float* Xu) {
         const hy4::TInfo& t = ti(name);
-        if (!g.is_rp(name) || t.fmt != FMT_S4 || t.shape.size() != 2 || m.n >= 3) return false;
+        const bool fmt_ok = (t.fmt == FMT_S4 || t.fmt == FMT_S5 || t.fmt == FMT_S8);
+        if (!g.is_rp(name) || !fmt_ok || t.shape.size() != 2 || m.n >= 3) return false;
         if (m.n == 0) m.K = (int)t.cols();
         else if (m.K != (int)t.cols()) return false;
         GemvJob& j = m.j[m.n++];
@@ -743,29 +829,42 @@ public:
         j.N = (int)t.rows();
         j.row0 = m.total;
         j.xmode = xmode;
+        j.fmt = t.fmt;
         m.total += j.N;
         return true;
     }
     void build_fuse() {
         const char* e = std::getenv("HY4S_FUSE");
-        fuse_dec = !(e && e[0] == '0');  // ON by default: fuses q_a+kv_a, down+shared_g+u, swiglu+shared_dn, f2h+routed_up (zero atomics, bitwise identical!)
+        fuse_dec = !(e && e[0] == '0');  // ON by default: fuses q_a+kv_a+gate, mlp0 gate+up, down+shared_g+u, swiglu+shared_dn, f2h+routed_up across T=1..8!
         const int NL = c.n_layers;
         mg_att.assign(NL, GemvMulti());
         mg_m1.assign(NL, GemvMulti());
         mg_shd.assign(NL, GemvMulti());
         mg_up.assign(NL, GemvMulti());
         mg_att_ok.assign(NL, 0);
+        mg_att_gate.assign(NL, 0);
         mg_moe_ok.assign(NL, 0);
+        mg_mlp0 = GemvMulti();
+        mg_mlp0_ok = false;
         if (!fuse_dec) return;
-        kva2 = dalloc<float>(576);
-        sg_f = dalloc<float>(1536);
-        su_f = dalloc<float>(1536);
-        so_f = dalloc<float>(HID);
+        kva2 = dalloc<float>(8 * 576);
+        sg_f = dalloc<float>(8 * 1536);
+        su_f = dalloc<float>(8 * 1536);
+        so_f = dalloc<float>(8 * HID);
         float* z1 = d_pack + 32;
         for (int il = 0; il < NL; ++il) {
             const std::string pa = L(il) + ".self_attn", pm = L(il) + ".mlp";
-            mg_att_ok[il] = mg_add(mg_att[il], pa + ".q_a_proj.weight", F1, 0, cur_h, nullptr, nullptr, nullptr) && mg_add(mg_att[il], pa + ".kv_a_proj_with_mqa.weight", kva2, 0, cur_h, nullptr, nullptr, nullptr);
-            if (il == 0) continue;
+            mg_att_ok[il] = mg_add(mg_att[il], pa + ".q_a_proj.weight", F1, 0, cur_h, nullptr, nullptr, nullptr) &&
+                            mg_add(mg_att[il], pa + ".kv_a_proj_with_mqa.weight", kva2, 0, cur_h, nullptr, nullptr, nullptr);
+            if (mg_att_ok[il]) {
+                // F3 is untouched between q_a_proj and mla_vup_sk -> 3-way fusion eliminates 42 launches + 42 redundant cur_h reads/step!
+                mg_att_gate[il] = mg_add(mg_att[il], pa + ".linear_gate.weight", F3, 0, cur_h, nullptr, nullptr, nullptr) ? 1 : 0;
+            }
+            if (il == 0) {
+                mg_mlp0_ok = mg_add(mg_mlp0, pm + ".gate_proj.weight", F1, 0, cur_h, nullptr, nullptr, nullptr) &&
+                             mg_add(mg_mlp0, pm + ".up_proj.weight", F2, 0, cur_h, nullptr, nullptr, nullptr);
+                continue;
+            }
             mg_moe_ok[il] = mg_add(mg_m1[il], pm + ".routed_expert_down_proj.weight", z1, 0, cur_h, nullptr, nullptr, nullptr) &&
                             mg_add(mg_m1[il], pm + ".shared_experts.gate_proj.weight", sg_f, 0, cur_h, nullptr, nullptr, nullptr) &&
                             mg_add(mg_m1[il], pm + ".shared_experts.up_proj.weight", su_f, 0, cur_h, nullptr, nullptr, nullptr) &&
@@ -774,14 +873,18 @@ public:
         }
     }
 
-    // IndexPool helpers (both eager host-p0 and graph device-p0)
-    void idx_update(int il, int p0, int T, const StepParams* dp = nullptr) {
+    // IndexPool helpers (both eager host-p0 and graph device-p0, linear and Tree-8)
+    void idx_update(int il, int p0, int T, const StepParams* dp = nullptr, bool is_tree = false, TreePos tp = {}) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".token_key_projection.weight", cur_h, ik_f, T);
         rms_rows(ik_f, (const float*)tw(p + ".token_key_norm.weight"), nullptr, ik_h, 128, c.rms_eps, T, 128);
         lin(p + ".key_value_projection.weight", ik_h, iv_f, T);
         lin(p + ".key_gate_projection.weight", ik_h, ig_f, T);
-        if (dp) {
+        if (is_tree) {
+            if (dp) idx::store_dev(iv_f, ig_f, ivg[il], dp, T, iring);
+            else idx::store(iv_f, ig_f, ivg[il], p0, T, iring);
+            idx::pool_tree(ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), tmp_pooled, p0, tp, dp, T, (float)theta(il), c.rms_eps, iring);
+        } else if (dp) {
             idx::store_dev(iv_f, ig_f, ivg[il], dp, T, iring);
             idx::pool_dev(ivg[il], (const float*)tw(p + ".intra_group_ape"), (const float*)tw(p + ".key_norm.weight"), pooled[il], dp, T, (float)theta(il), c.rms_eps, iring);
         } else {
@@ -792,10 +895,12 @@ public:
         }
     }
 
-    void idx_select(int il, int p0, int T, const StepParams* dp = nullptr) {
+    void idx_select(int il, int p0, int T, const StepParams* dp = nullptr, bool is_tree = false, TreePos tp = {}) {
         const std::string p = L(il) + ".self_attn.compressed_indexer";
         lin(p + ".query_projection.weight", qr_h, iq_f, T);
-        if (dp) {
+        if (is_tree) {
+            idx::q_rope_tree(iq_f, iq_h, p0, tp, dp, (float)theta(il), T);
+        } else if (dp) {
             idx::q_rope_dev(iq_f, iq_h, dp, (float)theta(il), T);
         } else {
             if (vis && vis->needs_fix(p0, T)) vis->iq_rope(iq_f, iq_h, T, p0, (float)theta(il));
@@ -803,7 +908,10 @@ public:
         }
         lin(p + ".head_weight_projection.weight", cur_h, hw_f, T);
         const int n_top = index_topk / c.kpool - 1;
-        if (dp) {
+        if (is_tree) {
+            idx::score_tree(iq_h, hw_f, pooled[il], tmp_pooled, score, p0, tp, dp, (int)ldS, 1.0f / std::sqrt((float)(128 * 16)), T);
+            idx::select_tree(score, (int)ldS, p0, tp, dp, n_top, index_topk, keys, nkeys, T);
+        } else if (dp) {
             idx::score_dev(iq_h, hw_f, pooled[il], score, dp, (int)ldS, 1.0f / std::sqrt((float)(128 * 16)), T);
             idx::select_dev(score, (int)ldS, dp, n_top, index_topk, keys, nkeys, T);
         } else {
@@ -817,9 +925,9 @@ public:
         }
     }
 
-    // Core attention kernels (works for both eager host-p0 and command_graph device-p0!)
+    // Core attention kernels (works for both eager host-p0 and command_graph device-p0, linear and Tree-8!)
     void attention_layer_core(int il, int p0, int T, const StepParams* dp, bool force_use_list,
-                              int g_TK, int g_S, int g_tps) {
+                              int g_TK, int g_S, int g_tps, bool is_tree = false, TreePos tp = {}) {
         const std::string pa = L(il) + ".self_attn";
         const int NH = heads(il);
         const bool swa = c.is_swa[il];
@@ -827,8 +935,8 @@ public:
         const float* hsc = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(il) + ".hc_attn_layer.hc_pre.hc_base");
         { PS _q(this, "hc_pre"); hc_pre_run(hfn, hsc, hbs, (const float*)tw(L(il) + ".input_layernorm.weight"), 8, T, x, cur_h, nullptr); }
-        const bool fz = T == 1 && fuse_dec && !dump && mg_att_ok[il];
-        if (fz) { PS _q(this, "lin q_a+kv_a"); k_gemv_multi(mg_att[il]); }
+        const bool fz = T >= 1 && T <= 8 && fuse_dec && !dump && mg_att_ok[il];
+        if (fz) { PS _q(this, mg_att_gate[il] ? "lin q_a+kv_a+gate" : "lin q_a+kv_a"); k_gemv_multi(mg_att[il], T); }
         else lin(pa + ".q_a_proj.weight", cur_h, F1, T);
         { PS _q(this, "q_a_rms"); rms_rows(F1, (const float*)tw(pa + ".q_a_layernorm.weight"), nullptr, qr_h, c.q_lora, c.rms_eps, T, 256); }
         lin(pa + ".q_b_proj.weight", qr_h, F2, T);
@@ -839,7 +947,7 @@ public:
             mla_write_kv_dev(fz ? kva2 : F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, dp, false, swa ? ring : 0, (float)theta(il), c.rms_eps);
         } else {
             PS _q(this, "mla_write_kv");
-            mla_write_kv(fz ? kva2 : F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps);
+            mla_write_kv(fz ? kva2 : F1, (const float*)tw(pa + ".kv_a_layernorm.weight"), cache, cslots, T, p0, swa ? ring : 0, (float)theta(il), c.rms_eps, tp);
         }
 
         const std::string kvb_nm = pa + ".kv_b_proj.weight";
@@ -847,23 +955,29 @@ public:
         const void* kvb_w = tw(kvb_nm);
         if (T <= 16) {
             PS _q(this, "mla_prep_q_sk");
-            mla_prep_q_sk(kvb_fmt, kvb_w, F2, qa_h, T, NH, p0, dp, false, (float)theta(il));
+            mla_prep_q_sk(kvb_fmt, kvb_w, F2, qa_h, T, NH, p0, dp, false, (float)theta(il), tp);
         } else {
             PS _q(this, "mla_prep_q_xmx");
             split_kvb(kvb_fmt, kvb_w, wk_tmp, wv_tmp, NH);
             mla_prep_q(F2, wk_tmp, qa_h, T, NH, p0, (float)theta(il));
         }
-        if (!dp && vis && vis->needs_fix(p0, T)) {
+        if (!dp && !is_tree && vis && vis->needs_fix(p0, T)) {
             vis->fixk(fz ? kva2 : F1, cache, T, p0, swa ? ring : 0, (float)theta(il));
             vis->fixq(F2, qa_h, T, NH, p0, (float)theta(il));
         }
 
         bool use_list = false;
         if (!swa && index_on) {
-            { PS _q(this, "idx_update"); idx_update(il, p0, T, dp); }
-            const bool do_sel = dp ? force_use_list : (p0 + T > index_topk);
+            { PS _q(this, "idx_update"); idx_update(il, p0, T, dp, is_tree, tp); }
+            int max_pos = p0 + T;
+            if (is_tree && !dp) {
+                int md = 0;
+                for (int i = 0; i < tp.n; ++i) md = std::max(md, (int)tp.depth[i]);
+                max_pos = p0 + md + 1;
+            }
+            const bool do_sel = dp ? force_use_list : (max_pos > index_topk);
             if (do_sel) {
-                { PS _q(this, "idx_select"); idx_select(il, p0, T, dp); }
+                { PS _q(this, "idx_select"); idx_select(il, p0, T, dp, is_tree, tp); }
                 if (!dp && tap) tap_keys("L" + std::to_string(il) + "_keys", T);
                 use_list = true;
             }
@@ -874,13 +988,14 @@ public:
             else dfly_capture(il, p0, T, use_list);
         }
 
-        lin(pa + ".linear_gate.weight", cur_h, F3, T);
+        if (!(fz && mg_att_gate[il])) lin(pa + ".linear_gate.weight", cur_h, F3, T);
         MlaAttnArgs a;
         a.M = T; a.NH = NH; a.p0 = p0;
         a.mode = swa ? MLA_WINDOW : (use_list ? MLA_LIST : MLA_CAUSAL);
         a.window = c.window;
         a.ring = swa ? ring : 0;
         a.cache_slots = cslots;
+        a.tree = tp;
         if (use_list) { a.keys = keys; a.nkeys = nkeys; a.kmax = index_topk; }
         if (dp) {
             mla_attend_dev(qa_h, cache, (const float*)tw(pa + ".learnable_sink_param"), ctx_h, a, dp, false, g_TK, g_S, g_tps, mla_ws, mla_ws_bytes);
@@ -901,8 +1016,8 @@ public:
         { PS _q(this, "o_norm_post"); add_rms_post(F1, nullptr, (const float*)tw(pa + ".post_proj_norm.weight"), x, post, HID, c.rms_eps, T); }
     }
 
-    void attention_layer(int il, int p0, int T) {
-        attention_layer_core(il, p0, T, nullptr, false, 0, 0, 0);
+    void attention_layer(int il, int p0, int T, bool is_tree = false, TreePos tp = {}) {
+        attention_layer_core(il, p0, T, nullptr, false, 0, 0, 0, is_tree, tp);
     }
 
     // MoE layer sub-stages (shared between eager and command_graph!)
@@ -912,8 +1027,14 @@ public:
         const float* hsc = (const float*)tw(L(0) + ".hc_mlp_layer.hc_pre.hc_scale");
         const float* hbs = (const float*)tw(L(0) + ".hc_mlp_layer.hc_pre.hc_base");
         { PS _q(this, "hc_pre"); hc_pre_run(hfn, hsc, hbs, (const float*)tw(L(0) + ".post_attention_layernorm.weight"), 8, T, x, cur_h, cur_f); }
-        lin(pm + ".gate_proj.weight", cur_h, F1, T);
-        lin(pm + ".up_proj.weight", cur_h, F2, T);
+        const bool fm0 = T >= 1 && T <= 8 && fuse_dec && !dump && mg_mlp0_ok;
+        if (fm0) {
+            PS _q(this, "lin mlp0 gate+up");
+            k_gemv_multi(mg_mlp0, T);
+        } else {
+            lin(pm + ".gate_proj.weight", cur_h, F1, T);
+            lin(pm + ".up_proj.weight", cur_h, F2, T);
+        }
         { PS _q(this, "swiglu"); swiglu_h(F1, F2, H1, (size_t)T * 13824); }
         lin(pm + ".down_proj.weight", H1, F3, T);
         { PS _q(this, "o_norm_post"); add_rms_post(F3, nullptr, (const float*)tw(pm + ".post_fc2_norm.weight"), x, post, HID, c.rms_eps, T); }
@@ -930,18 +1051,24 @@ public:
         { PS _q(this, "router"); linear_f32((const float*)tw(pm + ".gate.weight"), 512, HID, cur_f, F1, T); }
         { PS _q(this, "router_topk"); router_topk_sg(F1, (const float*)tw(pm + ".gate.e_score_correction_bias"), moe_idx, moe_w, 16, c.routed_scale, T); }
         if (d_hash) { tap_hash("L" + std::to_string(il) + "_router_logits", F1, (size_t)T * 512); tap_hash("L" + std::to_string(il) + "_router_w", moe_w, (size_t)T * 16); tap_hash("L" + std::to_string(il) + "_router_idx", (const float*)moe_idx, (size_t)T * 16); }
-        const bool fm = T == 1 && fuse_dec && !dump && mg_moe_ok[il];
-        if (fm) { PS _q(this, "lin down+shared gate/up"); k_gemv_multi(mg_m1[il]); }
-        else lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);
+        const bool fm = T >= 1 && T <= 8 && fuse_dec && !dump && mg_moe_ok[il];
+        if (fm) {
+            GemvMulti m = mg_m1[il];
+            m.j[0].Y = z_f;  // offset depends on T (d_pack + T*32)
+            PS _q(this, "lin down+shared gate/up");
+            k_gemv_multi(m, T);
+        } else {
+            lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);
+        }
         if (d_hash) tap_hash("L" + std::to_string(il) + "_routed_down_z", z_f, (size_t)T * 1536);
     }
 
     void mlp_moe_shared(int il, int T) {
         const std::string pm = L(il) + ".mlp";
         const size_t nz = (size_t)T * 1536;
-        const bool fm = T == 1 && fuse_dec && !dump && mg_moe_ok[il];
+        const bool fm = T >= 1 && T <= 8 && fuse_dec && !dump && mg_moe_ok[il];
         if (fm) {
-            k_gemv_multi(mg_shd[il]);
+            k_gemv_multi(mg_shd[il], T);
         } else {
             lin(pm + ".shared_experts.gate_proj.weight", cur_h, F1, T);
             lin(pm + ".shared_experts.up_proj.weight", cur_h, F3, T);
@@ -954,10 +1081,10 @@ public:
     void mlp_moe_post(int il, int T) {
         const std::string pm = L(il) + ".mlp";
         const size_t nz = (size_t)T * 1536;
-        const bool fm = T == 1 && fuse_dec && !dump && mg_moe_ok[il];
+        const bool fm = T >= 1 && T <= 8 && fuse_dec && !dump && mg_moe_ok[il];
         if (d_hash) tap_hash("L" + std::to_string(il) + "_routed_zout", zout_f, nz);
         if (fm) {
-            k_gemv_multi(mg_up[il]);
+            k_gemv_multi(mg_up[il], T);
         } else {
             f2h(zout_f, z_h, nz);
             lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);
@@ -1044,8 +1171,10 @@ public:
     }
 
 #if HY4S_HAS_GRAPH
-    GraphSet* get_or_build_graph(int p0, int T) {
-        const bool use_list = index_on && (p0 + T > index_topk);
+    GraphSet* get_or_build_graph(int p0, int T, const TreeSpec* tree = nullptr) {
+        const bool is_tree = tree != nullptr && tree->M > 0;
+        const int max_pos = is_tree ? (p0 + tree->max_depth() + 1) : (p0 + T);
+        const bool use_list = index_on && (max_pos > index_topk);
         MlaAttnArgs a_swa, a_sp;
         a_swa.M = T; a_swa.NH = c.heads_swa; a_swa.p0 = p0; a_swa.mode = MLA_WINDOW; a_swa.window = c.window; a_swa.ring = ring; a_swa.cache_slots = ring;
         a_sp.M = T; a_sp.NH = c.heads_sparse; a_sp.p0 = p0; a_sp.mode = use_list ? MLA_LIST : MLA_CAUSAL; a_sp.kmax = index_topk; a_sp.cache_slots = slots_sparse;
@@ -1054,6 +1183,7 @@ public:
         k.use_list = use_list ? 1 : 0;
         k.dfly_cap = dfly_cap ? 1 : 0;
         k.engram_on = engram_ready ? 1 : 0;
+        k.is_tree = is_tree ? 1 : 0;
         mla_choose_splits(a_swa, k.swa_TK, k.swa_S, k.swa_tps);
         mla_choose_splits(a_sp, k.sp_TK, k.sp_S, k.sp_tps);
         ensure_mla_ws(std::max(mla_workspace_bytes(a_swa), mla_workspace_bytes(a_sp)));
@@ -1061,8 +1191,8 @@ public:
         for (auto& gs : gcache_)
             if (gs->key == k) return gs.get();
 
-        // Cap cache at 12 graph sets to bound driver command-buffer memory
-        if (gcache_.size() >= 12) {
+        // Cap cache at 16 graph sets to bound driver command-buffer memory
+        if (gcache_.size() >= 16) {
             wait();
             gcache_.clear();
         }
@@ -1085,7 +1215,7 @@ public:
             auto att_dev = [&](int il) {
                 const bool swa = c.is_swa[il];
                 attention_layer_core(il, p0, T, d_step, use_list,
-                                     swa ? k.swa_TK : k.sp_TK, swa ? k.swa_S : k.sp_S, swa ? k.swa_tps : k.sp_tps);
+                                     swa ? k.swa_TK : k.sp_TK, swa ? k.swa_S : k.sp_S, swa ? k.swa_tps : k.sp_tps, is_tree);
             };
 
             // 1. g_init: embed + Layer 0 (engram if on L0 + attn + dense MLP)
@@ -1131,24 +1261,27 @@ public:
         }
     }
 
-    bool forward_chunk_graphed(const int32_t* tok_all, int p0, int T, std::string& err) {
-        GraphSet* gs = get_or_build_graph(p0, T);
+    bool forward_chunk_graphed(const int32_t* tok_all, int p0, int T, std::string& err, const TreeSpec* tree = nullptr) {
+        const bool is_tree = tree != nullptr && tree->M > 0;
+        GraphSet* gs = get_or_build_graph(p0, T, tree);
         if (!gs) return false;
         const size_t nz = (size_t)T * 1536;
         moe_idx = (int32_t*)d_pack; moe_w = d_pack + (size_t)T * 16; z_f = d_pack + (size_t)T * 32;
         h_idx = (int32_t*)h_pack; h_w = h_pack + (size_t)T * 16; h_z = h_pack + (size_t)T * 32;
 
         h_step->p0 = p0;
+        h_step->tree_on = is_tree ? 1 : 0;
+        h_step->tree = is_tree ? tree->to_tree_pos() : TreePos{};
         h2d(d_step, h_step, sizeof(StepParams));
-        h2d(d_ids, tok_all + p0, (size_t)T * 4);
+        h2d(d_ids, is_tree ? tree->tok : (tok_all + p0), (size_t)T * 4);
         const bool defer_eng = engram_ready;
-        if (defer_eng) prefetch_engram(tok_all, p0, T);
+        if (defer_eng) prefetch_engram(tok_all, p0, T, tree);
 
         Q().ext_oneapi_graph(*gs->g_init);
 
         if (defer_eng) {
             const double tw0 = now_s();
-            if (!engram_prep(tok_all, p0, T, err)) return false;
+            if (!engram_prep(tok_all, p0, T, err, tree)) return false;
             t_engram_wait += now_s() - tw0;
         }
 
@@ -1173,27 +1306,29 @@ public:
     }
 #endif
 
-    // Process tokens [p0, p0+T) (T <= Tc) of tok_all. Returns false on error.
-    bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err) {
+    // Process tokens [p0, p0+T) (T <= Tc) of tok_all (or Tree-8 nodes when tree != nullptr). Returns false on error.
+    bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err, const TreeSpec* tree = nullptr) {
         cur_p0 = p0;
+        const bool is_tree = tree != nullptr && tree->M > 0;
 #if HY4S_HAS_GRAPH
         if (graph_enabled && T <= 8 && !dump && !tap && !prof && !prof2 && !d_hash && vis == nullptr && force_route_dir.empty()) {
-            if (forward_chunk_graphed(tok_all, p0, T, err)) return true;
+            if (forward_chunk_graphed(tok_all, p0, T, err, tree)) return true;
             if (!err.empty()) return false;
             // Fallback to eager if capture disabled graph_enabled
         }
 #endif
-        h2d(d_ids, tok_all + p0, (size_t)T * 4);
+        const TreePos tp = is_tree ? tree->to_tree_pos() : TreePos{};
+        h2d(d_ids, is_tree ? tree->tok : (tok_all + p0), (size_t)T * 4);
         embed_hc((const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
-        if (vis) vis->embed(x, p0, T);
+        if (!is_tree && vis) vis->embed(x, p0, T);
         const int eng_first_layer = engram_ready ? emeta.layers[0] : 0;
         const bool defer_eng = engram_ready && (T <= 8 || eng_first_layer > 0);
-        if (defer_eng) prefetch_engram(tok_all, p0, T);
-        else if (engram_ready && !engram_prep(tok_all, p0, T, err)) return false;
+        if (defer_eng) prefetch_engram(tok_all, p0, T, tree);
+        else if (engram_ready && !engram_prep(tok_all, p0, T, err, tree)) return false;
         for (int il = 0; il < c.n_layers; ++il) {
             if (defer_eng && il == std::max(1, eng_first_layer)) {
                 double tw0 = now_s();
-                if (!engram_prep(tok_all, p0, T, err)) return false;
+                if (!engram_prep(tok_all, p0, T, err, tree)) return false;
                 t_engram_wait += now_s() - tw0;
             }
             const int mo = engram_mod_of(il);
@@ -1204,7 +1339,7 @@ public:
                 maybe_dump("x_L" + std::to_string(il) + "_engram", T, 4 * HID, x, 4);
             }
             if (prof) { wait(); double tb = now_s(); p_eng += tb - ta; ta = tb; }
-            attention_layer(il, p0, T);
+            attention_layer(il, p0, T, is_tree, tp);
             maybe_dump("x_L" + std::to_string(il) + "_attn", T, 4 * HID, x, 4);
             if (prof) { wait(); double tb = now_s(); (c.is_swa[il] ? p_attn_swa : p_attn_sp) += tb - ta; ta = tb; }
             mlp_layer(il, T);

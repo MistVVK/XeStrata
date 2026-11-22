@@ -24,6 +24,7 @@
 #include <unistd.h>
 #endif
 
+#define REQD_SG16 [[sycl::reqd_sub_group_size(16)]]
 #define REQD_SG32 [[sycl::reqd_sub_group_size(32)]]
 
 namespace hy4s {
@@ -59,12 +60,20 @@ inline double io_read_gb() {
     return v;
 }
 
+// Tree-8 speculative verification topology passed to device kernels (command_graph replayable)
+struct TreePos {
+    int32_t n = 0;               // 0 = standard linear chunk; 1..8 = tree node count
+    uint8_t depth[8] = {};       // logical depth of node t (or source node index for KV/ivg compaction)
+    uint8_t anc[8][8] = {};      // anc[t][d] = physical node index of node t's ancestor at depth d
+};
+
 // Device-resident dynamic step parameters for SYCL command_buffer / command_graph replay
 struct StepParams {
     int32_t p0 = 0;
     int32_t cap_row = 0;
     int32_t a = 0;
-    int32_t pad = 0;
+    int32_t tree_on = 0;
+    TreePos tree{};
 };
 
 using half = sycl::half;
@@ -74,13 +83,22 @@ constexpr int NHC = 4;
 
 inline sycl::queue& Q() {
     // HY4S_DISCARD=1: the queue creates no event objects (cheaper launches; the events returned by submit/memcpy then must not be waited on - use host flags / q.wait())
+    // HY4S_CPU_DEVICE=1: select CPU SYCL device (for CPU-only unit tests when GPU is unavailable/busy)
     static sycl::queue q = [] {
+        const char* cpu_e = std::getenv("HY4S_CPU_DEVICE");
+        const bool use_cpu = (cpu_e && cpu_e[0] == '1');
         const char* pf = std::getenv("HY4S_PROF");
-        if (pf && pf[0] == '1') return sycl::queue{sycl::gpu_selector_v, sycl::property_list{sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+        if (pf && pf[0] == '1') {
+            auto props = sycl::property_list{sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()};
+            return use_cpu ? sycl::queue{sycl::cpu_selector_v, props} : sycl::queue{sycl::gpu_selector_v, props};
+        }
         const char* d = std::getenv("HY4S_DISCARD");
-        if (d && d[0] == '1')
-            return sycl::queue{sycl::gpu_selector_v, sycl::property_list{sycl::property::queue::in_order(), sycl::ext::oneapi::property::queue::discard_events()}};
-        return sycl::queue{sycl::gpu_selector_v, sycl::property_list{sycl::property::queue::in_order()}};
+        if (d && d[0] == '1') {
+            auto props = sycl::property_list{sycl::property::queue::in_order(), sycl::ext::oneapi::property::queue::discard_events()};
+            return use_cpu ? sycl::queue{sycl::cpu_selector_v, props} : sycl::queue{sycl::gpu_selector_v, props};
+        }
+        auto props = sycl::property_list{sycl::property::queue::in_order()};
+        return use_cpu ? sycl::queue{sycl::cpu_selector_v, props} : sycl::queue{sycl::gpu_selector_v, props};
     }();
     return q;
 }
