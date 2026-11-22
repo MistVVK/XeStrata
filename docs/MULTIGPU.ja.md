@@ -69,6 +69,7 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
 
 - 各 GPU が VRAM を読む速さと、空いている VRAM。
 - CPU が RAM を読む速さ（CPU が計算するエキスパートの速さを決めます）。
+- CPU のプールがその pack のエキスパートを 1 個計算する時間（どちらのエンジンも同じ部品で測ります。RAM を読む速さより遅い形式では、こちらで CPU の分を見積もります。Sync の R1Q2 がそうです）。
 - 各 GPU が持つ重みとセッション（どちらも自分の層だけ）、出力ヘッド（最後の GPU）、prefill に残す分。
 
 - 各 GPU のリンク（ホストから GPU への転送の速さ）。
@@ -100,6 +101,7 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
   起動時に 2 枚目で測った層ごとの投入と待ちの時間と、入力と結果をリンクで往復する時間も見積もりに入れます。
   選んだ方はログに出ます（`as a helper expert cache instead: ... -> the helper`）。
   `--pipeline-windows`、`--no-pool`、`--batch` のときは分割のままです。
+  エキスパートが BF16 のモデルは、補助の GPU がそのエキスパートを計算しないので、補助を選びません。`--expert-cache-device1..3` を付けるとエラーで止まります。Inkling-2-Mini も、この指定をエラーで断ります。
 
 plain のエンジン（Qwen3.6-35B-A3B・Ornith-1.5 など）も、2 枚目の役目のこの選び（補助のキャッシュか分担か単独か）を
 同じ共通の部品（`core/split_role.hpp`）で行います。ただし分割点は上の探索ではなく各 GPU の空いたメモリの割合
@@ -117,7 +119,7 @@ prompt も 32K で 13.5% 遅かった（選びは誤り）。見積もりは両�
 | --- | --- | --- |
 | `XESTRATA_SPLIT_ROWS` | 3 | 1 ウィンドウで計算するトークンの数（MTP の下書きを含む平均） |
 | `XESTRATA_SPLIT_MASS_EXP` | 0.8 | よく使われる順で r 番目のエキスパートが使われる割合を (r+1)^-a としたときの a |
-| `XESTRATA_SPLIT_CPU_GBPS` | 測った値 | CPU が RAM を読む速さ（GB/s） |
+| `XESTRATA_SPLIT_CPU_GBPS` | 測った値 | CPU が RAM を読む速さ（GB/s）。指定すると、エキスパート 1 個の時間は測らず、この値で見積もります |
 | `XESTRATA_SPLIT_NEAR_TIE_PCT` | 4 | 別の分割をログに出す差（%）。0 で出しません |
 | `XESTRATA_SPLIT_HELPER_GAIN_PCT` | 5 | 補助のキャッシュを選ぶのに要る、分割より短い見積もりの差（%）。0 で少しでも短ければ選びます |
 | `XESTRATA_SPLIT_ROLE` | 見積もり | 2 枚のときの 2 枚目の役割。`split` で分割の段、`helper` で補助のキャッシュに決めます |

@@ -2862,6 +2862,8 @@ int main(int argc, char** argv) {
     // the helper-GPU expert caches (--expert-cache-remote, upstream's docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
     int remote_dev[3] = {1, 2, 3};
+    // --layer-split auto's helper of a mixed pack: its count is from the experts' mean size, so it takes what fits
+    bool remote_fit = false;
     if (multi_gpu) {
         if (o.expert_profile.empty()) {
             std::fprintf(stderr, "xestrata generate: a layer split across GPUs needs --expert-profile\n");
@@ -3548,7 +3550,7 @@ int main(int argc, char** argv) {
         // each GPU reading its own memory (bytes per ms; random bytes: a memset's run of one value is compressed on
         // some GPUs, and the B70 then read it at over 1.7 TB/s)
         std::vector<double> bw((size_t) ns);
-        const double cpu_bw = strata::core::split_cpu_bandwidth();
+        double cpu_bw = strata::core::split_cpu_bandwidth();
         // STRATA_SPLIT_SPEED_SCALE="1,0.55" (upstream 4a1ef86b, a test seam): each stage's speed times this factor, an
         // unequal pair on two equal cards (#2644); unset = nothing changes
         const char* speed_scale = strata::env_get("SPLIT_SPEED_SCALE");
@@ -3567,6 +3569,29 @@ int main(int argc, char** argv) {
                          dev_of_stage(i), bw[(size_t) i] / 1e6, (double) free0[(size_t) i] / 1073741824.0);
         }
         std::fprintf(stderr, "xestrata generate: layer split auto: the CPU experts read RAM at %.0f GB/s\n", cpu_bw / 1e6);
+        // The CPU's misses at the pool's own rate on this pack's experts where that is below the RAM's read rate
+        // (split_miss_rate, the plain engine's too): the time one more expert takes a pool like the run's, on stand-ins
+        // of the middle layer's experts, nothing being loaded yet.  i7-14700, 13 workers, 2026-11-22: Sync's R1Q2
+        // experts 0.13-0.15 ms each (7-10 GB/s, the RAM read at 42), IQ3_S and IQ3_XXS ones 0.04 ms (45 GB/s: the
+        // RAM's rate stays).  A latent pack's experts and a canonical pack's are not the pool's native rows and keep
+        // the RAM's rate.
+        {
+            strata::core::ExpertFacts facts;
+            facts.layers = L;
+            facts.n_expert = lay.n_expert;
+            facts.layer = L / 2;
+            facts.pool_rows = native_pack && !(lay.native && !lay.fmt.empty() && lay.fmt[0].n_embd != (int64_t) ga.n_embd);
+            const strata::core::MissRate miss =
+                strata::core::split_miss_rate(facts, {o.pool_workers, !o.no_host_worker, o.pool_tasks}, cpu_bw);
+            if (miss.expert_ms > 0.0)
+                std::fprintf(stderr, "xestrata generate: layer split auto: the CPU pool computes an expert of this pack "
+                                     "in %.3f ms (%.0f GB/s)%s\n", miss.expert_ms, miss.expert_rate / 1e6,
+                             miss.rate < cpu_bw ? ": the misses are priced by it" : "");
+            else
+                std::fprintf(stderr, "xestrata generate: layer split auto: the CPU pool's time an expert is not "
+                                     "measured (%s): the RAM's read rate prices the misses\n", miss.why.c_str());
+            cpu_bw = miss.rate;
+        }
         // each stage's link (upstream 0391e478): the prompt path streams a stage's missed experts over its own link,
         // so a stage on a narrow one pays more per missed expert (upstream: 2x 4090 D, CUDA1 on a x1 link at 1.6 GB/s,
         // K=22 -> 38, prompts ~350 -> ~1410 tok/s).
@@ -3598,8 +3623,15 @@ int main(int argc, char** argv) {
         const double mass_exp = strata::env_get("SPLIT_MASS_EXP") ? std::strtod(strata::env_get("SPLIT_MASS_EXP"), nullptr) : 0.8;
         std::vector<double> mass(prof.size());
         for (size_t r = 0; r < prof.size(); ++r) mass[r] = std::pow((double) r + 1.0, -mass_exp);
-        auto cost = [&](int64_t l) -> int64_t {
-            return native_pack ? ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+        // an expert's bytes.  In a mixed pack (a size each expert) a cache counts each pair's own, as its slots are
+        // sized: by a layer's largest Sync-S's cache was counted at 16,000 of the 24,400 experts it holds (a layer's
+        // mean came within 1% of the pairs' own sizes on Sync-M: 22,896 against 22,693 pairs).  The bytes a routed
+        // expert reads are the layer's mean.
+        auto expert_bytes = [&](int64_t l) -> double {
+            return lay.mixed() ? (double) lay.layer_bytes(l) / (double) lay.n_expert : (double) lay.blob_bytes(l);
+        };
+        auto cost = [&](int64_t l, int64_t e) -> int64_t {
+            return native_pack ? ((int64_t) lay.blob_bytes(l, e) + 255) / 256 * 256 : (int64_t) lay.max_blob;
         };
         // a hand-off between two stages: a window's rows of the hand-off copied to the host by one GPU and from it by
         // the next, each side its probed link and one small copy's time (5 tokens B70 -> RTX 4070 measured ~60 us
@@ -3633,7 +3665,7 @@ int main(int argc, char** argv) {
         model.order = ord;
         model.capacity = cap_raw;
         model.cost = cost;
-        model.blob_bytes = [&](int64_t l) { return (double) lay.blob_bytes(l); };
+        model.blob_bytes = expert_bytes;
         model.prompt_min = prompt_min;
         model.cpu_bw = cpu_bw;
         model.rows = rows;
@@ -3951,7 +3983,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "xestrata generate: the latent MoE cannot use a helper GPU; use a layer split instead\n");
             return 1;
         }
-        const bool helper_eligible = !latent_layout && ns == 2 && !o.no_pool && o.pipeline_windows <= 0 &&
+        std::string helper_why;   // a pack whose experts a helper does not compute (RemoteExperts::computes_layout)
+        const bool helper_takes = strata::core::RemoteExperts::computes_layout(helper_why);
+        if (!helper_takes && (role == "helper" || o.split_roles_helper)) {
+            std::fprintf(stderr, "xestrata generate: %s; use a layer split instead\n", helper_why.c_str());
+            return 1;
+        }
+        const bool helper_eligible = !latent_layout && helper_takes && ns == 2 && !o.no_pool && o.pipeline_windows <= 0 &&
                                      o.batch <= 0 && role != "split";
         const int h = 1;   // the second GPU's index in the measurements above
         // the helper cache's window, predicted by the part the plain engine calls too (split_role.hpp)
@@ -3978,7 +4016,7 @@ int main(int argc, char** argv) {
             hi.profile = prof;
             hi.mass = mass;
             hi.cost = cost;
-            hi.blob_bytes = [&](int64_t l) { return (double) lay.blob_bytes(l); };
+            hi.blob_bytes = expert_bytes;
             hi.cap0 = std::max<int64_t>(cap_raw(0, 0, -1, true), 0);
             hi.caph = free0[(size_t) h] - ((int64_t) (512 + 256) << 20);
             hi.bw0 = bw[0];
@@ -4043,6 +4081,7 @@ int main(int argc, char** argv) {
         } else if (choice.role == strata::core::SplitRole::Helper) {
             o.expert_cache_remote[0] = (int) hc.held;
             remote_dev[0] = dev_of_stage(h);
+            remote_fit = lay.mixed();
             split_devs.clear();
             split_at.clear();
             o.layer_split.clear();
@@ -6355,7 +6394,7 @@ int main(int argc, char** argv) {
         }
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
             if (!remote_experts[(size_t) r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
-                     g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err)) {
+                     g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err, remote_fit)) {
                 std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
                 return 1;
             }

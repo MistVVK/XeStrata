@@ -115,7 +115,7 @@ int main() {
         hi.layers = 1;
         hi.profile = {{0, 0}, {0, 1}};
         hi.mass = {1.0, 1.0};
-        hi.cost = [](int64_t) { return 10; };
+        hi.cost = [](int64_t, int64_t) { return 10; };
         hi.blob_bytes = [](int64_t) { return 10.0; };
         hi.cap0 = 10;
         hi.caph = 10;
@@ -133,7 +133,7 @@ int main() {
         core::HelperCacheInputs hi;   // the helper's room is too small for a pair: it holds none, the CPU pays
         hi.layers = 1;
         hi.profile = {{0, 0}, {0, 1}};
-        hi.cost = [](int64_t) { return 10; };
+        hi.cost = [](int64_t, int64_t) { return 10; };
         hi.blob_bytes = [](int64_t) { return 10.0; };
         hi.cap0 = 10;
         hi.caph = 5;

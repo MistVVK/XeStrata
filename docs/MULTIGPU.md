@@ -69,6 +69,7 @@ The start-up log names the GPUs by these numbers, as `CUDA0`, `CUDA1` (upstream'
 
 - how fast each GPU reads its VRAM, and how much VRAM is free;
 - how fast the CPU reads the RAM (which sets the speed of the experts the CPU computes);
+- how long the CPU pool takes for one of the pack's experts (both engines measure it with the same part; a format the pool computes slower than it reads the RAM is priced by this instead: Sync's R1Q2 is one);
 - what each GPU holds: weights and sessions (both of its own layers only), the output head (the last GPU), and the room the prefill path keeps.
 
 - each GPU's link (how fast the host copies to it).
@@ -100,6 +101,7 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
   The prediction counts, each layer, the launches and the wait measured on the second GPU at start and the round trip over its link (the inputs there, the results back).
   The log shows which one wins (`as a helper expert cache instead: ... -> the helper`).
   With `--pipeline-windows`, `--no-pool` or `--batch` the split stays.
+  A model whose experts are BF16 does not take the helper: a helper GPU does not compute those experts, and `--expert-cache-device1..3` stops with an error. Inkling-2-Mini refuses that option with an error too.
 
 The plain engine (Qwen3.6-35B-A3B, Ornith-1.5 and the others) makes this choice of the second GPU's role (a helper
 cache, a stage, or none) through the same shared part (`core/split_role.hpp`). Its split points come from each GPU's
@@ -119,7 +121,7 @@ Environment variables change the model's assumptions:
 | --- | --- | --- |
 | `XESTRATA_SPLIT_ROWS` | 3 | tokens computed per window (the average, with the MTP drafts) |
 | `XESTRATA_SPLIT_MASS_EXP` | 0.8 | a, where the expert of rank r by use takes a share (r+1)^-a of the routing |
-| `XESTRATA_SPLIT_CPU_GBPS` | measured | how fast the CPU reads the RAM (GB/s) |
+| `XESTRATA_SPLIT_CPU_GBPS` | measured | how fast the CPU reads the RAM (GB/s); when set, the time of one expert is not measured and this value prices the CPU's share |
 | `XESTRATA_SPLIT_NEAR_TIE_PCT` | 4 | the difference (%) within which another placement is named; 0 names none |
 | `XESTRATA_SPLIT_HELPER_GAIN_PCT` | 5 | how much shorter (%) the helper cache's predicted time must be to be taken; 0 takes it when shorter at all |
 | `XESTRATA_SPLIT_ROLE` | predicted | the second GPU's role with two GPUs: `split` a stage, `helper` the helper cache |

@@ -518,7 +518,8 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     }
     if (!read_model_spec(model_->meta(), spec_, err)) return false;
     if (spec_.arch == ModelArch::Inkling2Loop) {
-        if (serve_ || opt_.vision || opt_.encoder || opt_.batch_slots > 0 || opt_.split_auto || !opt_.split_at.empty()) {
+        if (serve_ || opt_.vision || opt_.encoder || opt_.batch_slots > 0 || opt_.split_auto || !opt_.split_at.empty() ||
+            std::any_of(opt_.expert_cache_remote.begin(), opt_.expert_cache_remote.end(), [](int n) { return n > 0; })) {
             err = "inkling2: GPU reference supports single-device text CLI only";
             return false;
         }
@@ -939,7 +940,34 @@ bool PlainModel::split_auto_role(std::string& err) {
     // the measurements, per GPU (the first, then the second): free memory, read bandwidth, link, small-copy latency
     std::vector<int64_t> free0((size_t) n), reserve((size_t) n);
     std::vector<double> bw((size_t) n), link_gbps((size_t) n), side_ms((size_t) n);
-    const double cpu_bw = core::split_cpu_bandwidth();
+    double cpu_bw = core::split_cpu_bandwidth();
+    // the CPU's misses at the pool's own rate on this model's experts where that is below the RAM's read rate
+    // (split_miss_rate, generate.cpp's too).  The experts' layout is read here for it, before anything is loaded;
+    // load_qwen and open_experts read it again as they did (with the MTP block where the model has one).
+    bool have_layout = false;
+    {
+        std::vector<int64_t> blocks;
+        for (int64_t l = 0; l < L; ++l)
+            if (s.layer_routes(l)) blocks.push_back(l);
+        std::string lerr;
+        have_layout = expert_layout_from_gguf(opt_.gguf, blocks, E, s.n_embd, s.n_ff_exp, lerr);
+        core::ExpertFacts facts;
+        facts.layers = M;
+        facts.n_expert = E;
+        facts.layer = M / 2;
+        facts.pool_rows = have_layout;
+        const core::MissRate miss =
+            core::split_miss_rate(facts, {opt_.pool_workers, opt_.pool_host_works, opt_.pool_tasks}, cpu_bw);
+        if (miss.expert_ms > 0.0)
+            std::fprintf(stderr, "xestrata plain: --layer-split auto: the CPU pool computes an expert of this model in "
+                                 "%.3f ms (%.0f GB/s)%s\n", miss.expert_ms, miss.expert_rate / 1e6,
+                         miss.rate < cpu_bw ? ": the misses are priced by it" : "");
+        else
+            std::fprintf(stderr, "xestrata plain: --layer-split auto: the CPU pool's time an expert is not measured "
+                                 "(%s): the RAM's read rate prices the misses\n",
+                         have_layout ? miss.why.c_str() : lerr.c_str());
+        cpu_bw = miss.rate;
+    }
     const double rows = strata::env_get("SPLIT_ROWS") ? std::strtod(strata::env_get("SPLIT_ROWS"), nullptr) : 3.0;
     const double hand_bytes = rows * (double) s.n_embd * sizeof(float);
     for (int d = 0; d < n; ++d) {
@@ -976,7 +1004,7 @@ bool PlainModel::split_auto_role(std::string& err) {
     model.side_ms = side_ms;
     model.order = order;
     model.capacity = capacity;
-    model.cost = [&](int64_t l) { return (int64_t) std::ceil(blob[(size_t) l]); };
+    model.cost = [&](int64_t l, int64_t) { return (int64_t) std::ceil(blob[(size_t) l]); };
     model.blob_bytes = [&](int64_t l) { return blob[(size_t) l]; };
     model.prompt_min = 0;
     model.cpu_bw = cpu_bw;
@@ -1001,7 +1029,14 @@ bool PlainModel::split_auto_role(std::string& err) {
     const std::string role = role_env != nullptr ? role_env : "";
     const char* gain_env = strata::env_get("SPLIT_GAIN_PCT");
     const double gain = (gain_env != nullptr ? std::strtod(gain_env, nullptr) : 5.0) / 100.0;
-    const bool helper_eligible = opt_.pipeline_windows <= 0 && opt_.batch_slots <= 0 && role != "split";
+    // a model whose experts a helper does not compute (BF16 ones, RemoteExperts::computes_layout): no helper role
+    std::string helper_why;
+    const bool helper_takes = !have_layout || RemoteExperts::computes_layout(helper_why);
+    if (!helper_takes && (role == "helper" || opt_.split_roles_helper)) {
+        err = "plain model: " + helper_why + "; use a layer split instead";
+        return false;
+    }
+    const bool helper_eligible = helper_takes && opt_.pipeline_windows <= 0 && opt_.batch_slots <= 0 && role != "split";
     core::HelperCachePrediction hc;
     if (helper_eligible) {
         double submit_ms = 0.0, layer_ms = 0.0;

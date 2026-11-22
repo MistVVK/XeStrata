@@ -550,6 +550,12 @@ struct PcieSplitTimes {
 /// native format; `layer` < 0 picks the first such layer and gets it.  False, with `why`, when no layer has enough such
 /// experts or the pack is not native.
 bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, double& c, int64_t& layer, std::string& why);
+/// The CPU side before anything is loaded (--layer-split auto prices a placement's misses by it): the time `c` (ms)
+/// one more expert takes `pool`, timed as measure_cpu_expert_ms times it, on 64 stand-ins of `layer`'s experts - their
+/// formats and sizes (each expert's own in a mixed pack), arbitrary bytes - and their mean size `bytes`.  False, with
+/// `why`, when the pack is not native.
+bool measure_cpu_expert_ms_unloaded(strata::kernels::cpu::ExpertPool& pool, int64_t layer, double& c, double& bytes,
+                                    std::string& why);
 /// The CPU side on ONE expert, for a decision a start may spend about 100 ms on where measure_cpu_expert_ms takes
 /// about half a second: the same call, 32 rounds after 30 ms of calls, the median.  False, with `why`, as above.
 bool measure_cpu_expert_one_ms(ExpertDispatch& d, int64_t n_layers, double& c, int64_t& layer, std::string& why);

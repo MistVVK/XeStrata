@@ -2897,6 +2897,22 @@ struct CpuCalJobs {
         }
     }
 };
+// one token's activation for every job of a call, in the layer's format `f`
+void cpu_cal_token(CpuCalJobs& cj, const strata::kernels::cpu::NativeFmt& f) {
+    using namespace strata::kernels::cpu;
+    cj.f = f;
+    const int64_t H = cj.f.n_embd;
+    cj.x.assign((size_t) H, 0.0f);
+    cj.out.assign((size_t) CpuCalJobs::kCall * (size_t) H, 0.0f);
+    for (int64_t i = 0; i < H; ++i) cj.x[(size_t) i] = 0.01f * (float) ((i * 37) % 101 - 50);
+    native_quant_act(cj.f, cj.x.data(), cj.act.bytes);
+    for (int j = 0; j < CpuCalJobs::kCall; ++j) {
+        cj.jobs[j] = ExpertJobMulti{};
+        cj.jobs[j].nt = 1;
+        cj.jobs[j].nact[0] = cj.act.bytes;
+        cj.jobs[j].out[0] = cj.out.data() + (size_t) j * (size_t) H;
+    }
+}
 bool cpu_cal_jobs(ExpertDispatch& d, int64_t n_layers, int64_t& layer, CpuCalJobs& cj, std::string& why) {
     using namespace strata::kernels::cpu;
     const ExpertLayout& lay = expert_layout();
@@ -2918,25 +2934,11 @@ bool cpu_cal_jobs(ExpertDispatch& d, int64_t n_layers, int64_t& layer, CpuCalJob
         if (n == CpuCalJobs::kRing) layer = l;
     }
     if (layer < 0) { why = "no layer has 64 experts in RAM outside VRAM"; return false; }
-    cj.f = lay.fmt[(size_t) layer];
-    const int64_t H = cj.f.n_embd;
-    cj.x.assign((size_t) H, 0.0f);
-    cj.out.assign((size_t) CpuCalJobs::kCall * (size_t) H, 0.0f);
-    for (int64_t i = 0; i < H; ++i) cj.x[(size_t) i] = 0.01f * (float) ((i * 37) % 101 - 50);
-    native_quant_act(cj.f, cj.x.data(), cj.act.bytes);
-    for (int j = 0; j < CpuCalJobs::kCall; ++j) {
-        cj.jobs[j] = ExpertJobMulti{};
-        cj.jobs[j].nt = 1;
-        cj.jobs[j].nact[0] = cj.act.bytes;
-        cj.jobs[j].out[0] = cj.out.data() + (size_t) j * (size_t) H;
-    }
+    cpu_cal_token(cj, lay.fmt[(size_t) layer]);
     return true;
 }
-}  // namespace
-
-bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, double& c, int64_t& layer, std::string& why) {
-    CpuCalJobs cj;
-    if (!cpu_cal_jobs(d, n_layers, layer, cj, why)) return false;
+// 1 and 8 of cj's experts a call on `pool`: the first call's time and each further expert's
+bool cpu_cal_time(strata::kernels::cpu::ExpertPool& pool, CpuCalJobs& cj, double& c0, double& c, std::string& why) {
     constexpr int kCall = CpuCalJobs::kCall;
     // three rounds, each after 100 ms of calls that keep the clocks up (an idle CPU takes tens of ms to raise them; a
     // decode keeps them up): 1 and 8 experts a call in turns, 32 calls each, the median; the lowest round.  One round's
@@ -2948,7 +2950,7 @@ bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, doub
     for (int round = 0; round < 3; ++round) {
         for (const auto t0 = now(); now() - t0 < std::chrono::milliseconds(100);) {
             cj.next(kCall);
-            d.pool->run_split_multi_native(cj.f, cj.jobs, kCall);
+            pool.run_split_multi_native(cj.f, cj.jobs, kCall);
         }
         double one[2][32];
         for (int rep = 0; rep < 32; ++rep)
@@ -2956,7 +2958,7 @@ bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, doub
                 const int k = w == 0 ? 1 : kCall;
                 cj.next(k);
                 const auto t0 = now();
-                d.pool->run_split_multi_native(cj.f, cj.jobs, k);
+                pool.run_split_multi_native(cj.f, cj.jobs, k);
                 one[w][rep] = std::chrono::duration<double, std::milli>(now() - t0).count();
             }
         for (int w = 0; w < 2; ++w) {
@@ -2968,6 +2970,42 @@ bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, doub
     c0 = std::max(0.0, ms[0] - c);
     if (!(c > 0.0)) { why = "the CPU times did not grow with the experts"; return false; }
     return true;
+}
+}  // namespace
+
+bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, double& c, int64_t& layer, std::string& why) {
+    CpuCalJobs cj;
+    if (!cpu_cal_jobs(d, n_layers, layer, cj, why)) return false;
+    return cpu_cal_time(*d.pool, cj, c0, c, why);
+}
+
+bool measure_cpu_expert_ms_unloaded(strata::kernels::cpu::ExpertPool& pool, int64_t layer, double& c, double& bytes,
+                                    std::string& why) {
+    using namespace strata::kernels::cpu;
+    const ExpertLayout& lay = expert_layout();
+    if (!lay.native || layer < 0 || layer >= (int64_t) lay.fmt.size() || lay.n_expert <= 0) {
+        why = "not a native pack";
+        return false;
+    }
+    // 64 stand-ins, as many as the loaded measurement takes from the layer (past the CPU's caches together): the
+    // layer's first experts' formats and sizes with arbitrary bytes, written so that every page is its own, and a
+    // cache line more than each takes
+    CpuCalJobs cj;
+    std::vector<std::vector<uint64_t>> blobs((size_t) CpuCalJobs::kRing);
+    uint64_t x = 0x9e3779b97f4a7c15ull;
+    bytes = 0.0;
+    for (int n = 0; n < CpuCalJobs::kRing; ++n) {
+        const int64_t e = n % lay.n_expert;
+        const uint64_t b = lay.blob_bytes(layer, e);
+        blobs[(size_t) n].resize((size_t) (b + 64 + 7) / 8);
+        for (uint64_t& v : blobs[(size_t) n]) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; v = x; }
+        cj.ring[n] = reinterpret_cast<const uint8_t*>(blobs[(size_t) n].data());
+        cj.formats[n] = lay.mixed() ? &lay.format(layer, e) : nullptr;
+        bytes += (double) b / CpuCalJobs::kRing;
+    }
+    cpu_cal_token(cj, lay.fmt[(size_t) layer]);
+    double c0 = 0.0;
+    return cpu_cal_time(pool, cj, c0, c, why);
 }
 
 bool measure_cpu_expert_one_ms(ExpertDispatch& d, int64_t n_layers, double& c, int64_t& layer, std::string& why) {

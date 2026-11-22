@@ -126,6 +126,16 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
     }
 }
 
+bool RemoteExperts::computes_layout(std::string& why) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l)
+        if (lay.fmt[l].gu_type == 30 || lay.fmt[l].d_type == 30) {
+            why = "BF16 experts are not computed on a helper GPU";
+            return false;
+        }
+    return true;
+}
+
 void RemoteExperts::close() {
     if (device_ < 0) return;
     try {
@@ -166,6 +176,10 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     if (device < 1 || device >= Runtime::count() || slots <= 0 || ranked.empty() ||
         layers <= 0 || experts <= 0 || claimed.size() != (size_t) layers * (size_t) experts) {
         err = "GPU" + std::to_string(device) + " experts: need the device, ranked experts and positive slot count";
+        return false;
+    }
+    if (std::string why; !computes_layout(why)) {
+        err = "GPU" + std::to_string(device) + " experts: " + why + " (--expert-cache-device1..3)";
         return false;
     }
     std::vector<std::pair<int32_t, int32_t>> selected;
