@@ -19,7 +19,7 @@ struct PcGdnPArgs { uint32_t n_tok, h_k, h_v, channels; float eps; uint32_t f32;
 struct PcMmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks, gu_gx, dn_gx; };   // moe_mm.metal's MmPlanArgs
 struct PcMmArgs { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t gu_row, d_row, n_embd, n_ff; };
 int pc_unit_of(int t) {
-    return t == ref::Q2_0 || t == ref::IQ3_S || t == ref::BF16 || t == ref::F32 || t == 18 || t == 16 || t == 17 || t == 22 ? 16 : 32;
+    return t == ref::Q2_0 || t == ref::NVFP4 || t == ref::IQ3_S || t == ref::BF16 || t == ref::F32 || t == 18 || t == 16 || t == 17 || t == 22 ? 16 : 32;
 }
 }  // namespace
 
@@ -79,10 +79,12 @@ bool Window::pc_setup(int C) {
     b.tm = b.gu3[0];
     if (b.v3e) {   // STRATA_PROMPT_V6=MS (default 4, 0 = off): ragged tiles, groups of MS (2..4) 16-row subtiles of one expert share the weight decode
         // the ragged-tile kernels exist for these expert types only (every layer's must be one of them)
-        auto gu_ok = [](int t) { return t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K || t == ref::Q8_0 || t == ref::IQ3_XXS ||
-                                        t == ref::IQ2_S || t == ref::IQ4_XS || t == ref::IQ3_S || t == ref::IQ2_XS || t == ref::IQ2_XXS; };
-        auto dn_ok = [](int t) { return t == ref::Q5_1 || t == ref::Q8_0 || t == ref::Q5_0 || t == ref::IQ4_NL || t == ref::Q2_0 ||
-                                        t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K || t == ref::Q3_K || t == ref::IQ4_XS || t == ref::IQ3_S; };   // (the last six: Q4-KQ, UD downs at widths divisible by 256)
+        auto gu_ok = [](int t) { return t == ref::Q2_K || t == ref::Q3_K || t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K || t == ref::Q8_0 ||
+                                        t == ref::IQ3_XXS || t == ref::IQ2_S || t == ref::IQ4_XS || t == ref::IQ3_S || t == ref::IQ2_XS || t == ref::IQ2_XXS ||
+                                        t == ref::NVFP4; };
+        auto dn_ok = [](int t) { return t == ref::Q5_1 || t == ref::Q8_0 || t == ref::Q5_0 || t == ref::IQ4_NL || t == ref::Q2_0 || t == ref::IQ3_XXS ||
+                                        t == ref::NVFP4 || t == ref::Q2_K || t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K || t == ref::Q3_K ||
+                                        t == ref::IQ4_XS || t == ref::IQ3_S; };   // (the last seven: Q4-KQ, UD downs at widths divisible by 256)
         bool types_ok = true;
         for (int l = 0; l < G_NL && types_ok; ++l) {
             const std::string bl = "blk." + std::to_string(l) + ".";

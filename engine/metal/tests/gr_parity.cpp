@@ -40,8 +40,8 @@ int main(int argc, char** argv) {
     const int SETS = bench ? 48 : 1;
     const bool q8 = std::getenv("GR_Q8") != nullptr;   // the Q8_0 form of the HC matrices (gr_down_q8_*, gr_up_q8)
     const int wty = q8 ? ref::Q8_0 : ref::BF16;
-    // GR_INJ_F32 (with GR_Q8): the inject rows as F32 (the Unsloth files), read by gr_down_q8f_*
-    const bool injf = q8 && std::getenv("GR_INJ_F32") != nullptr;
+    // GR_INJ_F32: the inject rows as F32 (the Unsloth files), read by gr_down_q8f_* (GR_Q8) or gr_down_bf16f_*
+    const bool injf = std::getenv("GR_INJ_F32") != nullptr;
     const size_t wd_bytes = (size_t)LR * NIN * 2, wi_bytes = (size_t)HC * NIN * 4, wu_bytes = (size_t)NIN * LR * 2;
     const size_t set_bytes = wd_bytes + wi_bytes + wu_bytes + NIN * 4;
     mtl::Buffer W = cx.alloc(set_bytes * SETS);
@@ -63,6 +63,10 @@ int main(int argc, char** argv) {
                 if (m == 1 && injf) std::memcpy(b + offs[m], f.data(), 4 * ns[m]);
                 else ref::quantize_q8_0(f.data(), ns[m], b + offs[m]);
             }
+        } else if (injf) {
+            std::vector<float> f((size_t)HC * NIN);
+            ref::dequant(ref::BF16, b + wd_bytes, f.data(), f.size());
+            std::memcpy(b + wd_bytes, f.data(), 4 * f.size());
         }
     }
     const int MAXT = 8;
@@ -82,7 +86,7 @@ int main(int argc, char** argv) {
     int fails = 0;
     for (int nt : ntoks) {
         mtl::Pipeline pn = cx.pipeline(lib, "gr_norm"),
-                      pd = cx.pipeline(lib, std::string(injf ? "gr_down_q8f_" : q8 ? "gr_down_q8_" : "gr_down_") + grd, mtl::Constants().i(1, nt)),
+                      pd = cx.pipeline(lib, std::string(q8 ? (injf ? "gr_down_q8f_" : "gr_down_q8_") : (injf ? "gr_down_bf16f_" : "gr_down_")) + grd, mtl::Constants().i(1, nt)),
                       pu = cx.pipeline(lib, q8 ? "gr_up_q8" : "gr_up", mtl::Constants().i(1, nt));
         for (int apply = 0; apply < 2; ++apply) {
             GrArgs a{N, HC, LR, (uint32_t)nt, (uint32_t)apply, 1e-6f};

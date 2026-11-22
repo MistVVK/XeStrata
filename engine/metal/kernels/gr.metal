@@ -280,6 +280,7 @@ kernel void gr_up_f(device const uchar* w_up [[buffer(0)]], device const float* 
 }
 
 #define GRD(S, K) template [[host_name("gr_down_" #S "_" #K)]] kernel decltype(gr_down_f<S, K, T_BF16, T_BF16>) gr_down_f<S, K, T_BF16, T_BF16>; \
+    template [[host_name("gr_down_bf16f_" #S "_" #K)]] kernel decltype(gr_down_f<S, K, T_BF16, T_F32>) gr_down_f<S, K, T_BF16, T_F32>; \
     template [[host_name("gr_down_q8_" #S "_" #K)]] kernel decltype(gr_down_f<S, K, T_Q8_0, T_Q8_0>) gr_down_f<S, K, T_Q8_0, T_Q8_0>; \
     template [[host_name("gr_down_q8f_" #S "_" #K)]] kernel decltype(gr_down_f<S, K, T_Q8_0, T_F32>) gr_down_f<S, K, T_Q8_0, T_F32>;
 GRD(8, 8) GRD(8, 4) GRD(4, 4) GRD(4, 2) GRD(16, 16) GRD(16, 8)
@@ -288,4 +289,5 @@ template [[host_name("gr_up_q8")]] kernel decltype(gr_up_f<T_Q8_0>) gr_up_f<T_Q8
 // the prefetching variants (the engine's default; STRATA_METAL_HCLD=0 keeps the originals above)
 template [[host_name("gr_downp_q8_8_8")]] kernel decltype(gr_down_f<8, 8, T_Q8_0, T_Q8_0, 1>) gr_down_f<8, 8, T_Q8_0, T_Q8_0, 1>;
 template [[host_name("gr_downp_q8f_8_8")]] kernel decltype(gr_down_f<8, 8, T_Q8_0, T_F32, 1>) gr_down_f<8, 8, T_Q8_0, T_F32, 1>;
+template [[host_name("gr_downp_bf16f_8_8")]] kernel decltype(gr_down_f<8, 8, T_BF16, T_F32, 1>) gr_down_f<8, 8, T_BF16, T_F32, 1>;
 template [[host_name("gr_upp_q8")]] kernel decltype(gr_up_f<T_Q8_0, 1>) gr_up_f<T_Q8_0, 1>;

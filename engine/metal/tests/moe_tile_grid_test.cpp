@@ -60,7 +60,7 @@ int main() {
         {ref::IQ2_S, "IQ2_S"},     {ref::IQ3_S, "IQ3_S"},     {ref::IQ4_NL, "IQ4_NL"},   {ref::IQ4_XS, "IQ4_XS"},
         {ref::Q4_K, "Q4_K"},       {ref::Q5_K, "Q5_K"},       {ref::Q6_K, "Q6_K"},       {ref::Q8_0, "Q8_0"},
         {ref::Q5_1, "Q5_1"},       {ref::Q5_0, "Q5_0"},       {ref::BF16, "BF16"},       {ref::F32, "F32"},
-        {ref::Q3_K, "Q3_K"},
+        {ref::Q3_K, "Q3_K"},       {ref::Q2_K, "Q2_K"},       {ref::NVFP4, "NVFP4"},
     };
 
     for (const auto& e : types) {

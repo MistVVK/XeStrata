@@ -52,7 +52,7 @@ struct MoeArgs {
 };
 
 int type_of(const std::string& s) {
-    for (int t : {ref::TQ2_T, ref::TQK6, ref::TQK7, ref::TQP5, ref::TQP6, ref::TQP7, ref::Q2_0, ref::IQ3_XXS, ref::IQ2_XXS, ref::IQ2_XS, ref::IQ1_M, ref::IQ2_S, ref::IQ3_S, ref::IQ4_NL, ref::IQ4_XS, ref::Q3_K, ref::Q4_K, ref::Q5_K, ref::Q6_K, ref::Q8_0, ref::Q5_1, ref::Q5_0})
+    for (int t : {ref::TQ2_T, ref::TQK6, ref::TQK7, ref::TQP5, ref::TQP6, ref::TQP7, ref::Q2_0, ref::IQ3_XXS, ref::IQ2_XXS, ref::IQ2_XS, ref::IQ1_M, ref::IQ2_S, ref::IQ3_S, ref::IQ4_NL, ref::IQ4_XS, ref::Q2_K, ref::Q3_K, ref::Q4_K, ref::Q5_K, ref::Q6_K, ref::Q8_0, ref::Q5_1, ref::Q5_0, ref::NVFP4})
         if (s == ref::type_name(t)) return t;
     std::fprintf(stderr, "unknown type %s\n", s.c_str());
     std::exit(2);
@@ -116,7 +116,7 @@ int xkind(int t) {
     switch (t) {
         case ref::Q2_0: return 1;
         case ref::Q4_K: case ref::Q5_K: return 2;
-        case ref::Q6_K: case ref::Q3_K: return 3;
+        case ref::Q6_K: case ref::Q3_K: case ref::Q2_K: return 3;
         default: return 0;
     }
 }
@@ -284,7 +284,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     // the host defines STRATA_KQ_DOWN only for a model whose downs are K-quant / IQ4_XS / IQ3_S (window.cpp kq_down_prelude)
-    const bool kq_dn = dn == ref::Q3_K || dn == ref::Q4_K || dn == ref::Q5_K || dn == ref::Q6_K || dn == ref::IQ3_S || dn == ref::IQ4_XS;
+    const bool kq_dn = dn == ref::Q2_K || dn == ref::Q3_K || dn == ref::Q4_K || dn == ref::Q5_K || dn == ref::Q6_K || dn == ref::IQ3_S || dn == ref::IQ4_XS;
     const int lib = cx.compile({"quant.metal", "units.metal", "moe.metal"},
                                std::string(g_f16 ? "#define STRATA_METAL_F16 1\n" : "") + (kq_dn ? "#define STRATA_KQ_DOWN 1\n" : ""));
     const Layout L = layout(gu, dn);

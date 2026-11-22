@@ -26,6 +26,7 @@ static inline void put_x16(device float* xp, uint plane, uint idx, uint jj, floa
 #endif
 
 #define T_Q4_0 2
+#define T_Q2_K 10
 #define T_Q3_K 11
 #define T_BF16 30
 #define T_F32 0
@@ -44,6 +45,7 @@ static inline void put_x16(device float* xp, uint plane, uint idx, uint jj, floa
 #define T_IQ1_M 29   // the 2.00 bpw pack's 1.75-bit type
 #define T_IQ2_S 22
 #define T_IQ4_XS 23
+#define T_NVFP4 40   // ModelOpt NVFP4: 64 values = 4 x 16 sub-blocks with UE4M3 scales + E2M1 nibbles (36-byte blocks)
 #define T_Q2_0 42
 #define T_Q2_0R 142   // Q2_0 read with raw activations (codes - 1 in the decoder; no prepared x needed)
 #define T_TQ2T 144    // agentionai's trellis types (Gyro): 128 values a block, 34 / 26 / 30 bytes, Hadamard-folded experts
@@ -68,10 +70,12 @@ template <> struct fmt<T_IQ2_S>   { enum { QK = 256, BB = 82,  UNIT = 16, TAB = 
 template <> struct fmt<T_IQ3_S>   { enum { QK = 256, BB = 110, UNIT = 16, TAB = 512 + 32 }; };
 template <> struct fmt<T_IQ4_NL>  { enum { QK = 32,  BB = 18,  UNIT = 32, TAB = 256 }; };
 template <> struct fmt<T_IQ4_XS>  { enum { QK = 256, BB = 136, UNIT = 32, TAB = 256 }; };
+template <> struct fmt<T_Q2_K>    { enum { QK = 256, BB = 84,  UNIT = 32, TAB = 1 }; };
 template <> struct fmt<T_Q3_K>    { enum { QK = 256, BB = 110, UNIT = 32, TAB = 1 }; };
 template <> struct fmt<T_Q4_K>    { enum { QK = 256, BB = 144, UNIT = 32, TAB = 1 }; };
 template <> struct fmt<T_Q5_K>    { enum { QK = 256, BB = 176, UNIT = 32, TAB = 1 }; };
 template <> struct fmt<T_Q6_K>    { enum { QK = 256, BB = 210, UNIT = 32, TAB = 1 }; };
+template <> struct fmt<T_NVFP4>   { enum { QK = 64,  BB = 36,  UNIT = 16, TAB = 1 }; };
 template <> struct fmt<T_BF16>    { enum { QK = 16,  BB = 32,  UNIT = 16, TAB = 1 }; };
 template <> struct fmt<T_F32>     { enum { QK = 16,  BB = 64,  UNIT = 16, TAB = 1 }; };
 template <> struct fmt<T_Q8_0>    { enum { QK = 32,  BB = 34,  UNIT = 32, TAB = 1 }; };
@@ -389,10 +393,12 @@ template <> inline void load_tab<T_Q8_0>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q4_0>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q5_0>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q5_1>(threadgroup uint*, ushort, ushort) {}
+template <> inline void load_tab<T_Q2_K>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q3_K>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q4_K>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q5_K>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q6_K>(threadgroup uint*, ushort, ushort) {}
+template <> inline void load_tab<T_NVFP4>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_BF16>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_F32>(threadgroup uint*, ushort, ushort) {}
 
@@ -637,6 +643,24 @@ template <> inline float deq<T_Q5_1>(device const uchar* b, int, thread float* q
         q[j1 + 16] = float(int(v >> 12) | int(((hb >> (j1 + 16)) & 1) << 4));
     }
     return rdh(b);
+}
+
+// NVFP4: UE4M3 scale * 0.5 (since kvalues_fp4 holds doubled E2M1 values 0,1,2,3,4,6,8,12), NaN (0x7F) -> 0
+static inline float ue4m3_to_f32_half(uchar x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const uint exp = (uint(x) >> 3) & 0xFu, man = uint(x) & 0x7u;
+    return exp == 0 ? float(man) * 0.0009765625f : as_type<float>(((exp + 119u) << 23) | (man << 20));
+}
+
+// NVFP4: 64 = 4 units of 16; unit ui is sub-block ui: UE4M3 scale b[ui], 8 bytes at b + 4 + 8*ui (low nibbles 0..7, high 8..15)
+template <> inline float deq<T_NVFP4>(device const uchar* b, int ui, thread float* q, threadgroup const uint*) {
+    device const uchar* qs = b + 4 + 8 * ui;
+    for (int j = 0; j < 8; ++j) {
+        const uchar v = qs[j];
+        q[j] = float(kvalues_fp4[v & 15]);
+        q[j + 8] = float(kvalues_fp4[v >> 4]);
+    }
+    return ue4m3_to_f32_half(b[ui]);
 }
 
 // Trellis types (ggml-common-tq.h): a 128-value block is {fp16 d; qs}, 32 steps of K bits (K = 8 / 6 / 7).  A unit is

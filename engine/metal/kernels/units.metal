@@ -44,6 +44,7 @@ template <> struct XKind<T_Q4_K> { enum { K = XK_P4 }; };
 template <> struct XKind<T_Q5_K> { enum { K = XK_P4 }; };
 template <> struct XKind<T_Q6_K> { enum { K = XK_P2 }; };
 template <> struct XKind<T_Q3_K> { enum { K = XK_P2 }; };
+template <> struct XKind<T_Q2_K> { enum { K = XK_P2 }; };
 
 // X<F>::load(xp, s16, u, xs, xsum): unit u's prepared x (xp = the token's row of the format's kind, s16 = its sums)
 template <int F> struct X {
@@ -97,13 +98,18 @@ template <> struct X<T_Q5_1> {
         xsum[1] = b;
     }
 };
-// Q3_K: 32 contiguous, sums per 16
+// Q3_K / Q2_K: 32 contiguous, sums per 16
 template <> struct X<T_Q3_K> {
     template <typename P> static inline void load(P xp, P s16, int u, thread float* xs, thread float* xsum) {
         load16(xp + 32 * u, xs);
         load16(xp + 32 * u + 16, xs + 16);
         xsum[0] = s16[2 * u];
         xsum[1] = s16[2 * u + 1];
+    }
+};
+template <> struct X<T_Q2_K> {
+    template <typename P> static inline void load(P xp, P s16, int u, thread float* xs, thread float* xsum) {
+        X<T_Q3_K>::load(xp, s16, u, xs, xsum);
     }
 };
 
@@ -280,6 +286,21 @@ template <> struct Dec<T_Q3_K> {
         }
         const float d1 = d * float(l1 - 32), d2 = d * float(l2 - 32);
         sc = float4(d1, d2, 4.0f * d1, 4.0f * d2);
+    }
+};
+
+template <> struct Dec<T_Q2_K> {
+    static inline void run(device const uchar* row, int u, thread float* q, thread float4& sc, threadgroup const uint*) {
+        device const uchar* b = row + (u >> 3) * 84;
+        const int n = (u >> 2) & 1, j = u & 3;
+        device const ushort* qv = (device const ushort*)(b + 16 + 32 * n);
+        const uchar s1 = b[8 * n + 2 * j], s2 = b[8 * n + 2 * j + 1];
+        const float d = rdh(b + 80), dm = rdh(b + 82);
+        for (int w = 0; w < 8; ++w) {
+            bytes2((qv[w] >> (2 * j)) & 0x0303, q + 2 * w);
+            bytes2((qv[w + 8] >> (2 * j)) & 0x0303, q + 16 + 2 * w);
+        }
+        sc = float4(d * float(s1 & 0xF), d * float(s2 & 0xF), dm * float(s1 >> 4), dm * float(s2 >> 4));
     }
 };
 
@@ -539,6 +560,91 @@ template <> struct Dec16<T_Q2_0R> {
     }
 };
 template <> struct X16<T_Q2_0R> {
+    static inline void load(device const half* xp, device const float*, int u, thread half* xs, thread float* xsum) {
+        load16h(xp + 16 * u, xs);
+        xsum[0] = xsum[1] = 0.0f;
+    }
+};
+template <> struct Dec16<T_Q2_K> {
+    static inline void run(device const uchar* row, int u, thread half* q, thread float4& sc, threadgroup const uint*) {
+        device const uchar* b = row + (u >> 3) * 84;
+        const int n = (u >> 2) & 1, j = u & 3;
+        device const ushort* qv = (device const ushort*)(b + 16 + 32 * n);
+        const uchar s1 = b[8 * n + 2 * j], s2 = b[8 * n + 2 * j + 1];
+        const float d = rdh(b + 80), dm = rdh(b + 82);
+        for (int w = 0; w < 8; ++w) {
+            bytes2h((qv[w] >> (2 * j)) & 0x0303, q + 2 * w);
+            bytes2h((qv[w + 8] >> (2 * j)) & 0x0303, q + 16 + 2 * w);
+        }
+        sc = float4(d * float(s1 & 0xF), d * float(s2 & 0xF), dm * float(s1 >> 4), dm * float(s2 >> 4));
+    }
+};
+template <> struct X16<T_Q2_K> {
+    static inline void load(device const half* xp, device const float* s16, int u, thread half* xs, thread float* xsum) {
+        X16<T_Q3_K>::load(xp, s16, u, xs, xsum);
+    }
+};
+template <> struct Dec16<T_Q8_0> {
+    static inline void run(device const uchar* row, int u, thread half* q, thread float4& sc, threadgroup const uint*) {
+        device const uchar* b = row + u * 34;
+        device const ushort* p = (device const ushort*)(b + 2);
+        for (int j = 0; j < 16; ++j) {
+            const ushort v = p[j];
+            q[2 * j] = half(as_type<char>(uchar(v & 255)));
+            q[2 * j + 1] = half(as_type<char>(uchar(v >> 8)));
+        }
+        const float d = rdh(b);
+        sc = float4(d, d, 0.0f, 0.0f);
+    }
+};
+template <> struct X16<T_Q8_0> {
+    static inline void load(device const half* xp, device const float* s16, int u, thread half* xs, thread float* xsum) {
+        X16<T_IQ4_XS>::load(xp, s16, u, xs, xsum);
+    }
+};
+template <> struct Dec16<T_IQ3_XXS> {
+    static inline void run(device const uchar* row, int u, thread half* q, thread float4& sc, threadgroup const uint* tab) {
+        float qf[16];
+        const float s = deq<T_IQ3_XXS>(row + (u >> 4) * 98, u & 15, qf, tab);
+        for (int j = 0; j < 16; ++j) q[j] = half(qf[j]);
+        sc = float4(s, s, 0.0f, 0.0f);
+    }
+};
+template <> struct X16<T_IQ3_XXS> {
+    static inline void load(device const half* xp, device const float*, int u, thread half* xs, thread float* xsum) {
+        load16h(xp + 16 * u, xs);
+        xsum[0] = xsum[1] = 0.0f;
+    }
+};
+template <> struct Dec16<T_IQ3_S> {
+    static inline void run(device const uchar* row, int u, thread half* q, thread float4& sc, threadgroup const uint* tab) {
+        float qf[16];
+        const float s = deq<T_IQ3_S>(row + (u >> 4) * 110, u & 15, qf, tab);
+        for (int j = 0; j < 16; ++j) q[j] = half(qf[j]);
+        sc = float4(s, s, 0.0f, 0.0f);
+    }
+};
+template <> struct X16<T_IQ3_S> {
+    static inline void load(device const half* xp, device const float*, int u, thread half* xs, thread float* xsum) {
+        load16h(xp + 16 * u, xs);
+        xsum[0] = xsum[1] = 0.0f;
+    }
+};
+template <> struct Dec16<T_NVFP4> {
+    static inline void run(device const uchar* row, int u, thread half* q, thread float4& sc, threadgroup const uint*) {
+        device const uchar* b = row + (u >> 2) * 36;
+        const int ui = u & 3;
+        device const uchar* qs = b + 4 + 8 * ui;
+        for (int j = 0; j < 8; ++j) {
+            const uchar v = qs[j];
+            q[j] = half(kvalues_fp4[v & 15]);
+            q[j + 8] = half(kvalues_fp4[v >> 4]);
+        }
+        const float s = ue4m3_to_f32_half(b[ui]);
+        sc = float4(s, s, 0.0f, 0.0f);
+    }
+};
+template <> struct X16<T_NVFP4> {
     static inline void load(device const half* xp, device const float*, int u, thread half* xs, thread float* xsum) {
         load16h(xp + 16 * u, xs);
         xsum[0] = xsum[1] = 0.0f;

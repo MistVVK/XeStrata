@@ -28,7 +28,7 @@ const std::vector<Cfg> kCfgs = {{32, 1, 4, 1}, {32, 2, 4, 1}, {16, 1, 4, 1}, {16
 int rows_per_tg(Cfg c) { return (c.S / c.K) * (32 / c.L) * c.R; }
 int unit_of(int t) {
     switch (t) {
-        case ref::Q2_0: case ref::IQ3_S: case ref::IQ3_XXS: case ref::IQ2_XXS: case ref::IQ2_XS: case ref::IQ2_S:
+        case ref::Q2_0: case ref::NVFP4: case ref::IQ3_S: case ref::IQ3_XXS: case ref::IQ2_XXS: case ref::IQ2_XS: case ref::IQ2_S:
         case ref::BF16: case ref::F32: return 16;
         default: return 32;
     }
@@ -47,7 +47,7 @@ int xkind(int t) {
     switch (t) {
         case ref::Q2_0: return 1;
         case ref::Q4_K: case ref::Q5_K: return 2;
-        case ref::Q6_K: case ref::Q3_K: return 3;
+        case ref::Q6_K: case ref::Q3_K: case ref::Q2_K: return 3;
         default: return 0;
     }
 }
@@ -62,8 +62,8 @@ mtl::Dispatch xprep_dispatch(const mtl::Pipeline& p, const mtl::Buffer& x, const
 }
 
 int type_of(const std::string& s) {
-    for (int t : {ref::Q2_0, ref::Q4_0, ref::Q5_0, ref::Q8_0, ref::Q3_K, ref::Q4_K, ref::Q5_K, ref::Q6_K, ref::IQ4_NL,
-                  ref::IQ4_XS, ref::IQ3_S, ref::BF16})
+    for (int t : {ref::Q2_0, ref::Q4_0, ref::Q5_0, ref::Q8_0, ref::Q2_K, ref::Q3_K, ref::Q4_K, ref::Q5_K, ref::Q6_K, ref::IQ4_NL,
+                  ref::IQ4_XS, ref::IQ3_XXS, ref::IQ3_S, ref::NVFP4, ref::BF16})
         if (s == ref::type_name(t)) return t;
     std::fprintf(stderr, "unknown type %s\n", s.c_str());
     std::exit(2);
@@ -120,8 +120,9 @@ int main(int argc, char** argv) {
                 continue;
             const int ty = t.type;
             const bool gemv_type = ty == ref::BF16 || ty == ref::Q8_0 || ty == ref::Q4_0 || ty == ref::Q5_0 ||
-                                   ty == ref::IQ4_NL || ty == ref::IQ4_XS || ty == ref::Q2_0 || ty == ref::IQ3_S ||
-                                   ty == ref::Q3_K || ty == ref::Q4_K || ty == ref::Q5_K || ty == ref::Q6_K;
+                                   ty == ref::IQ4_NL || ty == ref::IQ4_XS || ty == ref::Q2_0 || ty == ref::IQ3_XXS ||
+                                   ty == ref::IQ3_S || ty == ref::Q2_K || ty == ref::Q3_K || ty == ref::Q4_K ||
+                                   ty == ref::Q5_K || ty == ref::Q6_K || ty == ref::NVFP4;
             if (gemv_type && !pick.count(ty)) pick[ty] = &t;
         }
         int fails = 0;
@@ -170,8 +171,8 @@ int main(int argc, char** argv) {
     }
     if (!bench) {
         int fails = 0;
-        for (int t : {ref::F32, ref::BF16, ref::Q8_0, ref::Q4_0, ref::Q5_0, ref::IQ4_NL, ref::IQ4_XS, ref::Q2_0, ref::IQ3_S,
-                      ref::Q3_K, ref::Q4_K, ref::Q5_K, ref::Q6_K}) {
+        for (int t : {ref::F32, ref::BF16, ref::Q8_0, ref::Q4_0, ref::Q5_0, ref::IQ4_NL, ref::IQ4_XS, ref::Q2_0, ref::IQ3_XXS, ref::IQ3_S,
+                      ref::Q2_K, ref::Q3_K, ref::Q4_K, ref::Q5_K, ref::Q6_K, ref::NVFP4}) {
             for (int n_in : nins) {
                 if (n_in % ref::block_elems(t)) continue;
                 const int n_out = 100;   // not a multiple of the rows per threadgroup on purpose
@@ -298,7 +299,7 @@ int main(int argc, char** argv) {
         if (f16)   // the half plane from the raw x: the K-quants 2^-8 at odd positions, Q2_0 4^-(i % 4), the rest raw
             for (size_t i = 0; i < (size_t)s.n_in * MAXT; ++i) {
                 const size_t k = i % (size_t)s.n_in;
-                const bool p2 = s.type == ref::Q3_K || s.type == ref::Q4_K || s.type == ref::Q5_K || s.type == ref::Q6_K;
+                const bool p2 = s.type == ref::Q2_K || s.type == ref::Q3_K || s.type == ref::Q4_K || s.type == ref::Q5_K || s.type == ref::Q6_K;
                 const float f = p2 ? ((k & 1) ? 1.0f / 256 : 1.0f) : s.type == ref::Q2_0 ? 1.0f / float(1 << (2 * (k & 3))) : 1.0f;
                 xh.as<_Float16>()[i] = (_Float16)(xp.as<float>()[i] * f);
             }

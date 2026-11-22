@@ -22,7 +22,8 @@ NativeHead::~NativeHead() {
 }
 
 bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
-                      int64_t n_out, std::string &err) try {
+                      int64_t n_out, std::string &err, int peer_device) try {
+    (void) peer_device;
     if (loaded()) { err = "native head is already loaded"; return false; }
     if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
         err = "native head requires positive int32 dimensions and whole 256-value rows";

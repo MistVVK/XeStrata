@@ -4753,9 +4753,21 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         // a layer in another format keeps the dequantize + oneMKL path)
                         auto xmx2_fmt = [&]() {
                             if (!lay.native) return false;
-                            const int gt = lay.fmt[(size_t) l].gu_type, dt = lay.fmt[(size_t) l].d_type;
+                            const auto& ff = lay.fmt[(size_t) l];
+                            if (ff.tail_off) return false;   // NVFP4: per-expert tail scales go through iq_dequant_expert_f16
+                            if ((N % 128) != 0 || (kFF2 % 128) != 0 || (kFF % 32) != 0) return false;
+                            const int gt = ff.gu_type, dt = ff.d_type;
                             if ((gt == 144 || gt == 145) && (dt == 144 || dt == 146)) return true;   // Gyro's trellis experts (rotated above)
-                            return (gt == 18 || gt == 21 || gt == 22 || gt == 23) && (dt == 20 || dt == 42);
+                            auto ok_xmx = [](int t) {
+                                return t == 2 || t == 3 || t == 6 || t == 7 || t == 8 ||
+                                       t == 12 || t == 13 ||
+#ifdef STRATA_Q6K_EXPERTS
+                                       t == 14 ||
+#endif
+                                       t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 ||
+                                       t == 23 || t == 29 || t == 42;
+                            };
+                            return ok_xmx(gt) && ok_xmx(dt);
                         };
                         const bool xmx2_only = strata::prefill::xmx::mode() == 2 && !use_mmq && xmx2_fmt();
                         // 151-b70: the fused int8 DPAS products (IQ3_S gate/up, IQ4_NL down, the 640 x 2560 expert), the same
@@ -4983,8 +4995,9 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                         const int qd = pipeline ? 0 : i % DQ;
                                         pt.mark(kPfDequant, cs);
                                         if (!pipeline) {
+                                            const float* tail = f.tail_off ? reinterpret_cast<const float*>(xg_g[i] + f.tail_off) : nullptr;
                                             strata::kernels::iq_dequant_expert_f16(f.gu_type, f.d_type, xg_g[i], xg_u[i], xg_d[i],
-                                                f.n_ff, f.n_embd, m.dq_gu[qd], m.dq_d[qd], m.cs);
+                                                f.n_ff, f.n_embd, m.dq_gu[qd], m.dq_d[qd], m.cs, tail);
                                         } else if (first) {
                                             strata::kernels::iq_dequant_gu_f16(f.gu_type, xg_g[i], xg_u[i], f.n_ff, f.n_embd, m.dq_gu[0], m.cs);
                                         }
@@ -5038,10 +5051,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 int64_t o = xg_r0;
                                 for (int i = 0; i < xg_n; ++i) {
                                     const int q = i % DQ;
+                                    const float* tail = f.tail_off ? reinterpret_cast<const float*>(xg_g[i] + f.tail_off) : nullptr;
                                     pt.mark(kPfDequant, cs);
                                     strata::kernels::iq_dequant_gu_f16(f.gu_type, xg_g[i], xg_u[i], f.n_ff, f.n_embd,
-                                                                       m.dq_gu[q], m.cs);
-                                    strata::kernels::iq_dequant_f16(f.d_type, xg_d[i], f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                                                       m.dq_gu[q], m.cs, tail);
+                                    strata::kernels::iq_dequant_f16(f.d_type, xg_d[i], f.n_embd * f.n_ff, m.dq_d[q], m.cs,
+                                                                    tail ? tail + 2 : nullptr);
                                     pt.mark(kPfGemmGU, cs);
                                     expert_gate_up(o, xg_c[i], m.dq_gu[q]);
                                     had_h(o, xg_c[i]);
@@ -5148,17 +5163,18 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
+                                const float* tail = f.tail_off ? reinterpret_cast<const float*>(blob_dev + f.tail_off) : nullptr;
                                 // 0.1.43: both matrices in one launch (the same values; STRATA_PF_DQ_FUSED=0: two launches)
                                 static const bool dq_one = [] { const char* v = std::getenv("STRATA_PF_DQ_FUSED"); return !(v && v[0] == '0'); }();
                                 if (dq_one && !f16_pairs) {
                                     strata::kernels::iq_dequant_expert_f16(f.gu_type, f.d_type, blob_dev, blob_dev + f.up_off,
                                                                            blob_dev + f.down_off, f.n_ff, f.n_embd, m.dq_gu[q],
-                                                                           m.dq_d[q], m.cs);
+                                                                           m.dq_d[q], m.cs, tail);
                                 } else {
                                     strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                                       m.dq_gu[q], m.cs);
-                                    if (f16_pairs && f.d_type == 42) strata::kernels::iq_dequant_f16_plain_launch(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
-                                    else strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                                                       m.dq_gu[q], m.cs, tail);
+                                    if (f16_pairs && f.d_type == 42 && tail == nullptr) strata::kernels::iq_dequant_f16_plain_launch(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                    else strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs, tail ? tail + 2 : nullptr);
                                 }
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);

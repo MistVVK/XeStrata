@@ -24,12 +24,12 @@ struct MoeTile { const char* name; int tn; };
 // units), the rest TK 16
 inline MoeTile gu2_tile(int t) {
     if (t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K) return {"_16_16_128_2", 16};   // the M4's best (513fc615)
-    if (t == ref::Q8_0 || t == ref::IQ4_XS)                 return {"_16_64_32_2", 64};
+    if (t == ref::Q8_0 || t == ref::IQ4_XS || t == ref::Q3_K || t == ref::Q2_K) return {"_16_64_32_2", 64};
     return {"_16_64_16_2", 64};
 }
 inline MoeTile dn2_tile(int t) {
     if (t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K) return {"_16_16_128_2", 16};   // Q4-KQ: the K-quants' down experts need TK 128 as their gate/up do
-    if (t == ref::Q3_K || t == ref::IQ4_XS) return {"_16_64_32_2", 64};
+    if (t == ref::Q3_K || t == ref::Q2_K || t == ref::IQ4_XS) return {"_16_64_32_2", 64};
     return {t == ref::IQ4_NL || t == ref::Q5_1 || t == ref::Q5_0 || t == ref::Q8_0 ? "_16_64_32_2" : "_16_64_16_2", 64};
 }
 

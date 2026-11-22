@@ -274,8 +274,8 @@ kernel void mm_combine(device const float* YE [[buffer(0)]], device const int* p
 #define MMDN(F, M, N, K, S) MMDN_(F, M, N, K, S)
 #define MM_GU_SET(F) MMGU(F, 32, 64, 64, 4) MMGU(F, 64, 64, 64, 4) MMGU(F, 16, 64, 64, 2) MMGU(F, 32, 32, 64, 2)
 #define MM_DN_SET(F) MMDN(F, 32, 64, 64, 4) MMDN(F, 64, 64, 64, 4) MMDN(F, 16, 64, 64, 2) MMDN(F, 32, 32, 64, 2)
-MM_GU_SET(T_Q2_0) MM_GU_SET(T_IQ3_XXS) MM_GU_SET(T_IQ2_XXS) MM_GU_SET(T_IQ2_XS) MM_GU_SET(T_IQ2_S) MM_GU_SET(T_IQ3_S) MM_GU_SET(T_IQ1_M)
-MM_DN_SET(T_Q2_0) MM_DN_SET(T_IQ4_NL) MM_DN_SET(T_Q5_0)
+MM_GU_SET(T_Q2_0) MM_GU_SET(T_IQ3_XXS) MM_GU_SET(T_IQ2_XXS) MM_GU_SET(T_IQ2_XS) MM_GU_SET(T_IQ2_S) MM_GU_SET(T_IQ3_S) MM_GU_SET(T_IQ1_M) MM_GU_SET(T_NVFP4)
+MM_DN_SET(T_Q2_0) MM_DN_SET(T_IQ4_NL) MM_DN_SET(T_Q5_0) MM_DN_SET(T_IQ3_XXS) MM_DN_SET(T_NVFP4)
 
 // ---- v2: activations gathered once per layer as fp16 rows, read by matmul2d from device memory ---------------------
 // mm_gather: XS[row][k] = half(x[srt_tok[row]][k]) (0 on padding rows).  grid (rows), 256 threads.
@@ -406,13 +406,16 @@ kernel void mm_down2(device const uchar* W [[buffer(0)]], device const half* HS 
     MMDN2(F, 16, 128, 32, 4) MMDN2(F, 32, 64, 32, 2) MMDN2(F, 64, 64, 32, 4)
 // K-quants: the staged K chunk must hold whole units as DW places them (128 wide): TK 128
 #define MM_GU2_KQ(F) MMGU2(F, 16, 32, 128, 2) MMGU2(F, 16, 16, 128, 2) MMGU2(F, 32, 32, 128, 2) MMGU2(F, 16, 32, 128, 4)
-MM_GU2_KQ(T_Q4_K) MM_GU2_KQ(T_Q5_K) MM_GU2_KQ(T_Q6_K) MM_GU2_U32(T_Q8_0) MM_DN2_U32(T_Q5_1) MM_DN2_U32(T_Q5_0) MM_DN2_U32(T_Q8_0)
+MM_GU2_KQ(T_Q4_K) MM_GU2_KQ(T_Q5_K) MM_GU2_KQ(T_Q6_K) MM_GU2_U32(T_Q8_0) MM_GU2_U32(T_Q3_K) MM_GU2_U32(T_Q2_K) MM_DN2_U32(T_Q5_1) MM_DN2_U32(T_Q5_0) MM_DN2_U32(T_Q8_0)
 // K-quant / IQ4_XS / IQ3_S down experts (a UD file's downs at expert widths divisible by 256: Q4-KQ): the staged K chunk
-// follows the same rule as the gate/up's (Q4_K / Q5_K / Q6_K 128, Q3_K and IQ4_XS 32, IQ3_S 16)
+// follows the same rule as the gate/up's (Q4_K / Q5_K / Q6_K 128, Q3_K / Q2_K and IQ4_XS 32, IQ3_S / IQ3_XXS / NVFP4 16)
+MMDN2(T_IQ3_XXS, 16, 64, 16, 2) MMDN2(T_IQ3_XXS, 16, 64, 32, 2) MMDN2(T_IQ3_XXS, 16, 32, 32, 2)
+MM_GU2_SET(T_NVFP4) MM_DN2_SET(T_NVFP4)
 #ifdef STRATA_KQ_DOWN   // (see moe.metal)
 #define MM_DN2_KQ(F) MMDN2(F, 16, 16, 128, 2) MMDN2(F, 16, 32, 128, 2) MMDN2(F, 32, 32, 128, 2) MMDN2(F, 16, 32, 128, 4)
 MM_DN2_KQ(T_Q4_K) MM_DN2_KQ(T_Q5_K) MM_DN2_KQ(T_Q6_K)
 MMDN2(T_IQ4_XS, 16, 64, 32, 2) MMDN2(T_IQ4_XS, 16, 64, 64, 2) MMDN2(T_IQ4_XS, 16, 32, 32, 2)
+MMDN2(T_Q2_K, 16, 64, 32, 2) MMDN2(T_Q2_K, 16, 32, 32, 2)
 MMDN2(T_Q3_K, 16, 64, 32, 2) MMDN2(T_Q3_K, 16, 32, 32, 2)
 MMDN2(T_IQ3_S, 16, 64, 16, 2) MMDN2(T_IQ3_S, 16, 64, 32, 2) MMDN2(T_IQ3_S, 16, 32, 32, 2)
 #endif
@@ -687,11 +690,132 @@ template <> struct W4<T_Q3_K> {   // 256 a block: hmask[32], qs[64], scales[12],
         return half4(w);
     }
 };
+template <> struct W4<T_Q2_K> {   // 256 a block: scales[16], qs[64], d (80), dmin (82)
+    static inline half4 run(device const uchar* row, int k, threadgroup const uint*) {
+        device const uchar* b = row + (k >> 8) * 84;
+        const int j = k & 255, n = j >> 7, jj = j & 127, jg = jj >> 5, l = jj & 31;
+        const uchar sc = b[8 * n + 2 * jg + (l >> 4)];
+        const float dl = rdh(b + 80) * float(sc & 0xF), ml = rdh(b + 82) * float(sc >> 4);
+        device const uchar* qs = b + 16 + 32 * n + l;
+        const uint sh = uint(2 * jg);
+        float4 w;
+        for (int c = 0; c < 4; ++c) w[c] = dl * float((qs[c] >> sh) & 3) - ml;
+        return half4(w);
+    }
+};
+template <> struct W4<T_NVFP4> {   // 64 a block: d[4] (UE4M3), qs[32] (8 bytes per 16-subblock, low 0..7, high 8..15)
+    static inline half4 run(device const uchar* row, int k, threadgroup const uint*) {
+        device const uchar* b = row + (k >> 6) * 36;
+        const int s = (k & 63) >> 4, j = k & 15, hi = j >> 3, o = j & 7;
+        const float sc = ue4m3_to_f32_half(b[s]);
+        device const uchar* qs = b + 4 + 8 * s + o;
+        float4 q;
+        for (int c = 0; c < 4; ++c) q[c] = float(kvalues_fp4[hi ? (qs[c] >> 4) : (qs[c] & 15)]);
+        return half4(q * sc);
+    }
+};
 
 template <int F> struct W8 {
     static inline void run(device const uchar* row, int k, threadgroup const uint* tab, thread half4& a, thread half4& b) {
         a = W4<F>::run(row, k, tab);
         b = W4<F>::run(row, k + 16, tab);
+    }
+};
+template <> struct W8<T_IQ4_XS> {   // k and k+16 share the exact same 4 bytes of qs (low nibbles vs high nibbles) and scale!
+    static inline void run(device const uchar* row, int k, threadgroup const uint* tab, thread half4& a, thread half4& b) {
+        device const uchar* bl = row + (k >> 8) * 136;
+        const int j = k & 255, ib = j >> 5, o = j & 15;
+        const uint sh = *(device const ushort*)(bl + 2);
+        const int ls = int((bl[4 + (ib >> 1)] >> (4 * (ib & 1))) & 15) | int(((sh >> (2 * ib)) & 3) << 4);
+        const float s = rdh(bl) * float(ls - 32);
+        device const uchar* qs = bl + 8 + 16 * ib + o;
+        float4 qa, qb;
+        for (int c = 0; c < 4; ++c) {
+            const half2 w = as_type<half2>(tab[qs[c]]);
+            qa[c] = float(w.x);
+            qb[c] = float(w.y);
+        }
+        a = half4(qa * s);
+        b = half4(qb * s);
+    }
+};
+template <> struct W8<T_IQ4_NL> {   // k and k+16 share the exact same 4 bytes of qs (low vs high nibbles) and d!
+    static inline void run(device const uchar* row, int k, threadgroup const uint* tab, thread half4& a, thread half4& b) {
+        device const uchar* bl = row + (k >> 5) * 18;
+        const int o = k & 15;
+        const float d = rdh(bl);
+        device const uchar* qs = bl + 2 + o;
+        float4 qa, qb;
+        for (int c = 0; c < 4; ++c) {
+            const half2 w = as_type<half2>(tab[qs[c]]);
+            qa[c] = float(w.x);
+            qb[c] = float(w.y);
+        }
+        a = half4(qa * d);
+        b = half4(qb * d);
+    }
+};
+template <> struct W8<T_Q8_0> {   // k and k+16 share d in the same 32-element block
+    static inline void run(device const uchar* row, int k, threadgroup const uint*, thread half4& a, thread half4& b) {
+        device const uchar* bl = row + (k >> 5) * 34;
+        const float d = rdh(bl);
+        device const char* q = (device const char*)(bl + 2 + (k & 15));
+        a = half4(float4(float(q[0]), float(q[1]), float(q[2]), float(q[3])) * d);
+        b = half4(float4(float(q[16]), float(q[17]), float(q[18]), float(q[19])) * d);
+    }
+};
+template <> struct W8<T_Q3_K> {
+    static inline void run(device const uchar* row, int k, threadgroup const uint*, thread half4& a, thread half4& b) {
+        device const uchar* bl = row + (k >> 8) * 110;
+        const int j = k & 255, n = j >> 7, jj = j & 127, jg = jj >> 5, l = jj & 15;
+        device const uchar* s = bl + 96;
+        const int i1 = 8 * n + 2 * jg, i2 = i1 + 1;
+        const int sc1 = (i1 < 8 ? s[i1] & 0xF : s[i1 - 8] >> 4) | (((s[8 + (i1 & 3)] >> (2 * (i1 >> 2))) & 3) << 4);
+        const int sc2 = (i2 < 8 ? s[i2] & 0xF : s[i2 - 8] >> 4) | (((s[8 + (i2 & 3)] >> (2 * (i2 >> 2))) & 3) << 4);
+        const float d = rdh(bl + 108);
+        const float dl1 = d * float(sc1 - 32), dl2 = d * float(sc2 - 32);
+        device const uchar* qs = bl + 32 + 32 * n + l;
+        device const uchar* hm = bl + l;
+        const uint bit = 1u << (4 * n + jg), sh = uint(2 * jg);
+        float4 wa, wb;
+        for (int c = 0; c < 4; ++c) {
+            wa[c] = dl1 * float(int((qs[c] >> sh) & 3) - ((hm[c] & bit) ? 0 : 4));
+            wb[c] = dl2 * float(int((qs[16 + c] >> sh) & 3) - ((hm[16 + c] & bit) ? 0 : 4));
+        }
+        a = half4(wa);
+        b = half4(wb);
+    }
+};
+template <> struct W8<T_Q2_K> {   // 84-byte block (4-aligned): aligned uint loads for qs[l..l+3] and qs[l+16..l+19]
+    static inline void run(device const uchar* row, int k, threadgroup const uint*, thread half4& a, thread half4& b) {
+        device const uchar* bl = row + (k >> 8) * 84;
+        const int j = k & 255, n = j >> 7, jj = j & 127, jg = jj >> 5, l = jj & 15;
+        const uchar s1 = bl[8 * n + 2 * jg], s2 = bl[8 * n + 2 * jg + 1];
+        const float d = rdh(bl + 80), dm = rdh(bl + 82);
+        const float dl1 = d * float(s1 & 0xF), ml1 = dm * float(s1 >> 4);
+        const float dl2 = d * float(s2 & 0xF), ml2 = dm * float(s2 >> 4);
+        device const uint* q = (device const uint*)(bl + 16 + 32 * n + l);
+        const uint sh = uint(2 * jg);
+        const float4 qa = float4(as_type<uchar4>((q[0] >> sh) & 0x03030303u));
+        const float4 qb = float4(as_type<uchar4>((q[4] >> sh) & 0x03030303u));
+        a = half4(dl1 * qa - ml1);
+        b = half4(dl2 * qb - ml2);
+    }
+};
+template <> struct W8<T_NVFP4> {   // k and k+16 are adjacent 16-value sub-blocks s and s+1 of the same 36-byte block
+    static inline void run(device const uchar* row, int k, threadgroup const uint*, thread half4& a, thread half4& b) {
+        device const uchar* bl = row + (k >> 6) * 36;
+        const int s = (k & 63) >> 4, j = k & 15, hi = j >> 3, o = j & 7;
+        const float sc0 = ue4m3_to_f32_half(bl[s]), sc1 = ue4m3_to_f32_half(bl[s + 1]);
+        device const uchar* q0 = bl + 4 + 8 * s + o;
+        device const uchar* q1 = bl + 4 + 8 * (s + 1) + o;
+        float4 qa, qb;
+        for (int c = 0; c < 4; ++c) {
+            qa[c] = float(kvalues_fp4[hi ? (q0[c] >> 4) : (q0[c] & 15)]);
+            qb[c] = float(kvalues_fp4[hi ? (q1[c] >> 4) : (q1[c] & 15)]);
+        }
+        a = half4(qa * sc0);
+        b = half4(qb * sc1);
     }
 };
 // (a W8<T_Q2_0> sharing the block scale was measured slower than the two W4 of the generic one: 5.5 vs 3.5-4.2 ms)
@@ -1105,12 +1229,12 @@ kernel void mm_down3(device const uchar* W [[buffer(0)]], device const half* HS 
     MMGU3(F, 16, 32, 16, 2) MMGU3(F, 32, 32, 32, 2) MMGU3(F, 16, 64, 32, 1) MMGU3(F, 16, 64, 32, 4)     MMGU3(F, 16, 32, 16, 4) MMGU3(F, 16, 32, 32, 5) MMGU3(F, 16, 32, 16, 5) MMGU3(F, 16, 16, 32, 4) MMGU3(F, 16, 16, 32, 8)     MMGU3(F, 16, 16, 16, 8)
 #define MM3_DN(F) MMDN3(F, 16, 64, 32, 2) MMDN3(F, 16, 32, 32, 4) MMDN3(F, 32, 64, 32, 2) MMDN3(F, 16, 64, 64, 2) \
     MMDN3(F, 16, 32, 16, 2) MMDN3(F, 32, 32, 32, 2) MMDN3(F, 16, 64, 32, 1) MMDN3(F, 16, 64, 32, 4)     MMDN3(F, 16, 64, 16, 2) MMDN3(F, 16, 32, 16, 4) MMDN3(F, 16, 64, 32, 5) MMDN3(F, 16, 64, 16, 4)
-MM3_GU(T_Q4_K) MM3_GU(T_Q5_K) MM3_GU(T_Q6_K) MM3_GU(T_Q8_0) MM3_GU(T_IQ4_XS) MM3_GU(T_Q2_0) MM3_GU(T_IQ3_XXS) MM3_GU(T_IQ2_XXS) MM3_GU(T_IQ2_XS) MM3_GU(T_IQ2_S) MM3_GU(T_IQ3_S)
+MM3_GU(T_Q2_K) MM3_GU(T_Q3_K) MM3_GU(T_Q4_K) MM3_GU(T_Q5_K) MM3_GU(T_Q6_K) MM3_GU(T_Q8_0) MM3_GU(T_IQ4_XS) MM3_GU(T_Q2_0) MM3_GU(T_IQ3_XXS) MM3_GU(T_IQ2_XXS) MM3_GU(T_IQ2_XS) MM3_GU(T_IQ2_S) MM3_GU(T_IQ3_S) MM3_GU(T_NVFP4)
 MM3_GU(T_TQP5) MM3_GU(T_TQP6) MM3_GU(T_TQP7)   // the pair trellis on the register-operand chain (COOP_K4)
 MM3_GU(T_IQ1_M)   // the GSQ IQ2_XS pack's IQ1_M expert gate/up on the register-operand chain (W8<T_IQ1_M> above; #4886 added mm_gu and mm_gu2 only)
-MM3_DN(T_Q2_0) MM3_DN(T_IQ4_NL) MM3_DN(T_Q5_1) MM3_DN(T_Q5_0) MM3_DN(T_Q8_0)
+MM3_DN(T_Q2_0) MM3_DN(T_IQ4_NL) MM3_DN(T_Q5_1) MM3_DN(T_Q5_0) MM3_DN(T_Q8_0) MM3_DN(T_IQ3_XXS) MM3_DN(T_NVFP4)
 #ifdef STRATA_KQ_DOWN
-MM3_DN(T_Q4_K) MM3_DN(T_Q5_K) MM3_DN(T_Q6_K) MM3_DN(T_Q3_K) MM3_DN(T_IQ4_XS) MM3_DN(T_IQ3_S)
+MM3_DN(T_Q2_K) MM3_DN(T_Q4_K) MM3_DN(T_Q5_K) MM3_DN(T_Q6_K) MM3_DN(T_Q3_K) MM3_DN(T_IQ4_XS) MM3_DN(T_IQ3_S)
 #endif
 MM3_DN(T_TQP5) MM3_DN(T_TQP6) MM3_DN(T_TQP7)
 
@@ -1196,6 +1320,7 @@ kernel void mm_gu4(device const uchar* W [[buffer(0)]], device const half* XS [[
 #define MMGU4(F, M, N, K, S) MMGU4_(F, M, N, K, S)
 #define MM4_GU(F) MMGU4(F, 2, 32, 32, 4) MMGU4(F, 2, 32, 32, 2) MMGU4(F, 2, 16, 32, 4) MMGU4(F, 1, 32, 32, 4)
 MM4_GU(T_Q2_0) MM4_GU(T_IQ3_XXS) MM4_GU(T_IQ2_XXS) MM4_GU(T_IQ2_XS) MM4_GU(T_IQ2_S) MM4_GU(T_IQ3_S) MM4_GU(T_IQ4_XS)
+MM4_GU(T_Q2_K) MM4_GU(T_Q3_K) MM4_GU(T_Q4_K) MM4_GU(T_Q5_K) MM4_GU(T_Q6_K) MM4_GU(T_Q8_0) MM4_GU(T_NVFP4)
 
 // mm_gu5: mm_gu3 (COOP_K4 layout, TK 32) with the threadgroup's weight rows staged block by block (QK = 256 values a
 // row, gate and up) into threadgroup memory by coalesced ushort loads, the lanes decoding from there: the decode's
@@ -1489,8 +1614,8 @@ MM6_DN(T_Q5_1) MM6_DN(T_Q8_0)
 // the other sets' types (UD-IQ4_XS-v31, IQ3_S): the one tile shape the engine uses (MS 4; gate/up TN 16, down TN 32, SG 4)
 #define MM6_GU1(F) MMGU6(F, 4, 16, 32, 4)
 #define MM6_DN1(F) MMDN6(F, 4, 32, 32, 4)
-MM6_GU1(T_Q6_K) MM6_GU1(T_Q8_0) MM6_GU1(T_IQ3_XXS) MM6_GU1(T_IQ2_S) MM6_GU1(T_IQ4_XS) MM6_GU1(T_IQ3_S) MM6_GU1(T_IQ2_XS) MM6_GU1(T_IQ2_XXS)
-MM6_DN1(T_Q5_0) MM6_DN1(T_IQ4_NL) MM6_DN1(T_Q2_0)
+MM6_GU1(T_Q2_K) MM6_GU1(T_Q3_K) MM6_GU1(T_Q6_K) MM6_GU1(T_Q8_0) MM6_GU1(T_IQ3_XXS) MM6_GU1(T_IQ2_S) MM6_GU1(T_IQ4_XS) MM6_GU1(T_IQ3_S) MM6_GU1(T_IQ2_XS) MM6_GU1(T_IQ2_XXS) MM6_GU1(T_NVFP4)
+MM6_DN1(T_Q5_0) MM6_DN1(T_IQ4_NL) MM6_DN1(T_Q2_0) MM6_DN1(T_IQ3_XXS) MM6_DN1(T_NVFP4)
 #ifdef STRATA_KQ_DOWN
-MM6_DN1(T_Q4_K) MM6_DN1(T_Q5_K) MM6_DN1(T_Q6_K) MM6_DN1(T_Q3_K) MM6_DN1(T_IQ4_XS) MM6_DN1(T_IQ3_S)
+MM6_DN1(T_Q2_K) MM6_DN1(T_Q4_K) MM6_DN1(T_Q5_K) MM6_DN1(T_Q6_K) MM6_DN1(T_Q3_K) MM6_DN1(T_IQ4_XS) MM6_DN1(T_IQ3_S)
 #endif
