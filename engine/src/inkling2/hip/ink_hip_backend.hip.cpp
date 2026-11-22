@@ -84,6 +84,15 @@ __global__ void __launch_bounds__(256) k_f32_to_bf16_vec(const float* src, uint1
     if (i < n) dst[i] = strata::inkling2::hip::f32_to_bf16(src[i]);
 }
 
+__global__ void __launch_bounds__(256) k_f32_to_bf16_vec4(const float* __restrict__ src, uint16_t* __restrict__ dst, int n4) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    const float4 v = reinterpret_cast<const float4*>(src)[i];
+    reinterpret_cast<uint2*>(dst)[i] = make_uint2(
+        static_cast<uint32_t>(strata::inkling2::hip::f32_to_bf16(v.x)) | (static_cast<uint32_t>(strata::inkling2::hip::f32_to_bf16(v.y)) << 16),
+        static_cast<uint32_t>(strata::inkling2::hip::f32_to_bf16(v.z)) | (static_cast<uint32_t>(strata::inkling2::hip::f32_to_bf16(v.w)) << 16));
+}
+
 __global__ void __launch_bounds__(256) k_add_bias_rows(float* Y, const float* bias, int M, int N) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < M * N) Y[idx] += bias[idx % N];
@@ -477,7 +486,7 @@ public:
             const int v = std::atoi(ev);
             if (v >= 16) blaslt_moe_min_b_ = v;
         }
-        // RDNA4 (gfx120x) has true 2x-rate 16x16x32 iu8 WMMA (96 TOPS); RDNA3/3.5 (gfx11xx) uses 16x16x16 so FP16 WMMA avoids Q8 quant overhead!
+        // RDNA4 (gfx120x) has true 2x-rate 16x16x32 iu8 WMMA; RDNA3/3.5 (gfx11xx) wins with double-buffered FP16 WMMA!
         use_i8_moe_wmma_ = (mem_info_.gen == AmdGen::Rdna4);
         if (const char* ev = std::getenv("STRATA_HIP_MOE_I8")) {
             use_i8_moe_wmma_ = (std::atoi(ev) != 0);
@@ -521,6 +530,12 @@ public:
                 GpuBuffer b;
                 if (!upload_raw(b, f32.data(), f32.size() * sizeof(float), err)) return false;
                 trunk_f32_[name] = b;
+                if (name.find(".mlp.gate.weight") != std::string::npos) {
+                    auto bf16 = f32_vec_to_bf16(f32);
+                    GpuBuffer gb;
+                    if (!upload_raw(gb, bf16.data(), bf16.size() * sizeof(uint16_t), err)) return false;
+                    trunk_bf16_[name] = gb;
+                }
             }
         }
 
@@ -1370,18 +1385,39 @@ private:
         return reinterpret_cast<const uint16_t*>(vision_.w_bf16.at(k).dev_ptr);
     }
 
+    void convert_x_to_bf16(const float* X, uint16_t* dst, int total) {
+        if ((total & 3) == 0) {
+            const int n4 = total >> 2;
+            k_f32_to_bf16_vec4<<<(n4 + 255) / 256, 256, 0, stream_>>>(X, dst, n4);
+        } else {
+            k_f32_to_bf16_vec<<<(total + 255) / 256, 256, 0, stream_>>>(X, dst, total);
+        }
+    }
+
     void launch_bf16_opt(const uint16_t* W, const float* X, const float* bias, float* Y, int M, int N, int K) {
         if (blaslt_.ready() && M >= blaslt_min_m_ && N >= 64 && K >= 64) {
             const size_t need = static_cast<size_t>(M) * K * sizeof(uint16_t);
             if (sc_x_bf16_.bytes >= need) {
                 uint16_t* x_bf = reinterpret_cast<uint16_t*>(sc_x_bf16_.dev_ptr);
-                k_f32_to_bf16_vec<<<(M * K + 255) / 256, 256, 0, stream_>>>(X, x_bf, M * K);
+                convert_x_to_bf16(X, x_bf, M * K);
                 if (blaslt_.gemm_bf16_f32(W, x_bf, Y, M, N, K, stream_, 1.0f)) {
                     if (bias) {
                         k_add_bias_rows<<<(M * N + 255) / 256, 256, 0, stream_>>>(Y, bias, M, N);
                     }
                     return;
                 }
+            }
+        }
+        // Wave-5 MALL-Swizzled BM=128, BN=128, BK=32 BF16 WMMA on RDNA3/3.5/4 (pre-converts X once -> 32x less W DRAM!)
+        if (M >= 64 && N >= 128 && K >= 64 && (K & 31) == 0 &&
+            mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
+            const size_t need = static_cast<size_t>(M) * K * sizeof(uint16_t);
+            if (sc_x_bf16_.bytes >= need) {
+                uint16_t* x_bf = reinterpret_cast<uint16_t*>(sc_x_bf16_.dev_ptr);
+                convert_x_to_bf16(X, x_bf, M * K);
+                const int tiles = ((M + 127) / 128) * ((N + 127) / 128);
+                k_bf16_wmma_bf16_128x128_swiz<<<tiles, 256, 0, stream_>>>(W, x_bf, bias, Y, M, N, K);
+                return;
             }
         }
         launch_bf16_linear(W, X, bias, Y, M, N, K, mem_info_.gen, stream_);
@@ -1536,6 +1572,11 @@ private:
             !re(sc_moe_gu_, static_cast<size_t>(B) * 2 * inter * 4) ||
             !re(sc_moe_ye_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_exp_off_, 129 * 4) ||
+            !re(sc_exp_cur_, 128 * 4) ||
+            !re(sc_x_q8_, static_cast<size_t>(B) * D) ||
+            !re(sc_x_d_, static_cast<size_t>(B) * (D >> 4) * 4) ||
+            !re(sc_act_q8_, static_cast<size_t>(B) * c_.top_k * inter) ||
+            !re(sc_act_d_, static_cast<size_t>(B) * c_.top_k * (inter >> 4) * 4) ||
             !re(sc_bucket_tok_, static_cast<size_t>(B) * c_.top_k * 4) ||
             !re(sc_slotk_bidx_, static_cast<size_t>(B) * c_.top_k * 4) ||
             !re(sc_bucket_x_f16_, static_cast<size_t>(B) * c_.top_k * D * sizeof(half_t)) ||
@@ -1750,7 +1791,7 @@ private:
                     in_ptr, sw, dyn_ptr, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), hp, out_ptr, B, C, n_heads);
             } else if (is_contiguous_single_slot) {
                 uint16_t* h_slot = hp + static_cast<size_t>(batch.slot_ids[0]) * 3 * C;
-                k2_shortconv4_prefill_par<<<dim3((C + 255) / 256, B), 256, 0, stream_>>>(
+                k2_shortconv4_prefill_par<<<dim3((C + 255) / 256, (B + 15) / 16), 256, 0, stream_>>>(
                     in_ptr, sw, dyn_ptr, h_slot, out_ptr, B, C, n_heads);
                 k2_shortconv4_update_hist<<<(C + 255) / 256, 256, 0, stream_>>>(in_ptr, h_slot, B, C);
             } else {
@@ -1766,7 +1807,13 @@ private:
             BlockPtrs12 bp{};
             const int nb = static_cast<int>(ptrs.size());
             for (int i = 0; i < nb && i < 12; ++i) bp.p[i] = ptrs[i];
-            k1_attn_res_mix<<<dim3(nq, B), 256, 0, stream_>>>(bp, nb, cur_p, q_p, out_p, B, nq, D);
+            if (nq == 3) {
+                k1_attn_res_mix_multi<3><<<B, 256, 0, stream_>>>(bp, nb, cur_p, q_p, out_p, B, D);
+            } else if (nq == 4) {
+                k1_attn_res_mix_multi<4><<<B, 256, 0, stream_>>>(bp, nb, cur_p, q_p, out_p, B, D);
+            } else {
+                k1_attn_res_mix<<<dim3(nq, B), 256, 0, stream_>>>(bp, nb, cur_p, q_p, out_p, B, nq, D);
+            }
         };
 
         // Check eligibility for HIP Graph Capture (all distinct slots, all GPU-resident layers, no images/host-taps, want all logits)
@@ -1854,7 +1901,6 @@ private:
         std::vector<const float*> blk_ptrs;
         std::vector<const float*> bank_ptrs;
 
-        float* res   = reinterpret_cast<float*>(sc_res_.dev_ptr);
         float* in0   = reinterpret_cast<float*>(sc_in0_.dev_ptr);
         float* in1   = reinterpret_cast<float*>(sc_in1_.dev_ptr);
         float* in2   = reinterpret_cast<float*>(sc_in2_.dev_ptr);
@@ -1882,13 +1928,32 @@ private:
         float* moeout = reinterpret_cast<float*>(sc_moe_out_.dev_ptr);
         float* msc   = reinterpret_cast<float*>(sc_m_sconv_.dev_ptr);
 
+        const bool prof_on = (!use_graph && B >= 64 && std::getenv("STRATA_HIP_PROF") && std::atoi(std::getenv("STRATA_HIP_PROF")) != 0);
+        hipEvent_t pev[9]{};
+        double p_acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (prof_on) {
+            for (int i = 0; i < 9; ++i) (void)hipEventCreate(&pev[i]);
+        }
+        auto pmark = [&](int idx) {
+            if (prof_on) (void)hipEventRecord(pev[idx], stream_);
+        };
+        auto pflush = [&]() {
+            if (!prof_on) return;
+            (void)hipEventSynchronize(pev[8]);
+            for (int i = 0; i < 8; ++i) {
+                float ms = 0.0f;
+                (void)hipEventElapsedTime(&ms, pev[i], pev[i + 1]);
+                p_acc[i] += ms;
+            }
+        };
+
         int visit = 0;
         auto run_visit = [&](int ip, bool has_msgs) -> bool {
+            pmark(0);
             maybe_tap(visit, cur);
             const std::string p = "model.llm.layers." + std::to_string(ip);
             const bool is_swa = c_.is_swa[ip] != 0;
             const int kv_slot = c_.visit_kv_slot[visit];
-            (void)hipMemcpyAsync(res, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
 
             // k1: AttnRes + optional loop controllers + input RMSNorm (zero unnecessary D2D copies!)
             float* q_in = in0;
@@ -1908,8 +1973,8 @@ private:
                 }
             } else {
                 q_in = in0;
-                (void)hipMemcpyAsync(in0, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
                 if (!is_swa || has_msgs) {
+                    (void)hipMemcpyAsync(in0, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
                     (void)hipMemcpyAsync(in1, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
                     (void)hipMemcpyAsync(in2, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
                 }
@@ -1926,19 +1991,42 @@ private:
                     float* cin = reinterpret_cast<float*>(sc_ctrl_in_.dev_ptr);
                     float* cg  = reinterpret_cast<float*>(sc_ctrl_gain_.dev_ptr);
                     float* cf  = reinterpret_cast<float*>(sc_ctrl_forget_.dev_ptr);
-                    k1_loop_ctrl_pack_in<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
-                        target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, cin, B, D);
-                    if (is_bf) {
+                    if (is_bf && c_.gate_rank == 64 && mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
+                        if (blaslt_.ready() && sc_x_bf16_.bytes >= static_cast<size_t>(B) * 2 * D * sizeof(uint16_t)) {
+                            uint16_t* cin_bf = reinterpret_cast<uint16_t*>(sc_x_bf16_.dev_ptr);
+                            k1_loop_ctrl_pack_in_bf16<<<dim3(((D >> 2) + 255) / 256, B), 256, 0, stream_>>>(
+                                target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, cin_bf, B, D);
+                            if (!blaslt_.gemm_bf16_f32(bf16_ptr(cp + ".down_weight"), cin_bf, ctrl_gate, B, 64, 2 * D, stream_, 1.0f)) {
+                                k1_loop_ctrl_down_wmma_fused<<<dim3(1, (B + 63) / 64), 128, 0, stream_>>>(
+                                    target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m,
+                                    bf16_ptr(cp + ".down_weight"), ctrl_gate, B, D);
+                            }
+                        } else {
+                            // Fused WMMA down (ZERO 37.7 MB cin DRAM!) + fused WMMA up (ZERO 37.7 MB cg/cf DRAM!)
+                            k1_loop_ctrl_down_wmma_fused<<<dim3(1, (B + 63) / 64), 128, 0, stream_>>>(
+                                target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m,
+                                bf16_ptr(cp + ".down_weight"), ctrl_gate, B, D);
+                        }
+                        k1_loop_ctrl_up_wmma_fused<<<dim3((D + 63) / 64, (B + 63) / 64), 128, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, ctrl_gate,
+                            bf16_ptr(cp + ".gain_weight"), bf16_ptr(cp + ".forget_weight"), B, D);
+                    } else if (is_bf) {
+                        k1_loop_ctrl_pack_in<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, cin, B, D);
                         launch_bf16_opt(bf16_ptr(cp + ".down_weight"),   cin,       nullptr, ctrl_gate, B, c_.gate_rank, 2 * D);
                         launch_bf16_opt(bf16_ptr(cp + ".gain_weight"),   ctrl_gate, nullptr, cg,        B, D, c_.gate_rank);
                         launch_bf16_opt(bf16_ptr(cp + ".forget_weight"), ctrl_gate, nullptr, cf,        B, D, c_.gate_rank);
+                        k1_loop_ctrl_apply_out<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, cg, cf, target_in, B, D);
                     } else {
+                        k1_loop_ctrl_pack_in<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, cin, B, D);
                         launch_f32_linear(f32_ptr(cp + ".down_weight"),   cin,       nullptr, ctrl_gate, B, c_.gate_rank, 2 * D, stream_, mem_info_.gen);
                         launch_f32_linear(f32_ptr(cp + ".gain_weight"),   ctrl_gate, nullptr, cg,        B, D, c_.gate_rank,    stream_, mem_info_.gen);
                         launch_f32_linear(f32_ptr(cp + ".forget_weight"), ctrl_gate, nullptr, cf,        B, D, c_.gate_rank,    stream_, mem_info_.gen);
+                        k1_loop_ctrl_apply_out<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, cg, cf, target_in, B, D);
                     }
-                    k1_loop_ctrl_apply_out<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
-                        target_in, msgs, 4, msg_ch, cg, cf, target_in, B, D);
                 } else if (is_bf) {
                     k1_loop_ctrl_down<true><<<dim3((c_.gate_rank + 7) / 8, B), 256, 0, stream_>>>(
                         target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, bf16_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
@@ -1962,7 +2050,8 @@ private:
 
             if (is_swa) {
                 const float* an = f32_ptr(p + ".attn_norm.weight");
-                k_rms_norm_rows<<<B, 256, 0, stream_>>>(in0, an, in0, B, D, c_.rms_eps);
+                const float* norm_src0 = (ip == 0 && !has_msgs) ? cur : in0;
+                k_rms_norm_rows<<<B, 256, 0, stream_>>>(norm_src0, an, in0, B, D, c_.rms_eps);
                 if (has_msgs) {
                     k_rms_norm_rows<<<B, 256, 0, stream_>>>(in1, an, in1, B, D, c_.rms_eps);
                     k_rms_norm_rows<<<B, 256, 0, stream_>>>(in2, an, in2, B, D, c_.rms_eps);
@@ -1977,6 +2066,7 @@ private:
             }
 
             // Batched Q/K/V/R/Sink/Gate projections (1 fused concatenated GEMM + 1-launch splitter!)
+            pmark(1);
             const int r_dim = c_.n_head * c_.d_rel;
             if (trunk_qkvrg_[ip].dev_ptr != nullptr) {
                 const uint16_t* w_cat = reinterpret_cast<const uint16_t*>(trunk_qkvrg_[ip].dev_ptr);
@@ -2008,6 +2098,7 @@ private:
             }
 
             // k2: ShortConv K & V + L2 clip + V RMSNorm + global tau
+            pmark(2);
             GpuSlotMeta* rsl = (rec_slot >= 0) ? &slots_[rec_slot] : nullptr;
             run_sconv(k_raw, p + ".k_sconv", is_swa ? nullptr : k_dyn, d_sconv_k_all_, k_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_k : nullptr, visit);
             run_sconv(v_raw, p + ".v_sconv", is_swa ? nullptr : v_dyn, d_sconv_v_all_, v_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_v : nullptr, visit);
@@ -2046,8 +2137,9 @@ private:
             k_relpos_bias_proj<<<dim3(c_.n_head, B), 256, 0, stream_>>>(
                 r_raw, f32_ptr(p + ".attn.rel_logits_proj.proj"), pos_dev, rbias, B, c_.n_head, c_.d_rel, c_.rel_extent);
 
+            pmark(3);
             if (is_contiguous_single_slot && B >= 64 && mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
-                // Wave32 WMMA FlashAttention-2 Prefill (BQ=64, BK=64, 27 KB LDS, register online softmax!)
+                // Wave32 WMMA FlashAttention-2 Prefill (BQ=64, BK=64, 27 KB LDS = 2 WG/CU, uint2 V + hoisted rel_bias skip!)
                 const dim3 fgrid(c_.n_head, (B + 63) / 64);
                 if (is_fp8) {
                     k3_flash_swa_gqa_prefill_wmma<true><<<fgrid, 128, 0, stream_>>>(
@@ -2113,20 +2205,20 @@ private:
             }
 
             // O-proj + post-attention ShortConv + AttnRes block boundary rule
+            pmark(4);
             launch_trunk_linear(p + ".attn.wo_ud.weight", aout, oproj, B, D, q_dim);
             run_sconv(oproj, p + ".attn_sconv", nullptr, d_sconv_attn_all_, asc, D, 0, rsl ? &rsl->sconv_rec_attn : nullptr, visit);
 
             if (ip % c_.block_size == 0) {
-                (void)hipMemcpyAsync(sc_blocks_[n_blocks].dev_ptr, res, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                (void)hipMemcpyAsync(sc_blocks_[n_blocks].dev_ptr, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
                 blk_ptrs.push_back(reinterpret_cast<const float*>(sc_blocks_[n_blocks].dev_ptr));
                 ++n_blocks;
                 (void)hipMemcpyAsync(cur, asc, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
             } else {
-                k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, asc, cur, B * D);
+                k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, asc, cur, B * D);
             }
 
-            // MoE sublayer: AttnRes mlp_queries + optional mlp controller + mlp_norm
-            (void)hipMemcpyAsync(res, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+            // MoE sublayer: AttnRes mlp_queries + optional mlp controller + mlp_norm (cur unmodified -> 0 res copy!)
             run_attnres(blk_ptrs, cur, f32_ptr("model.llm.attn_res.mlp_queries." + std::to_string(ip)), 1, mlpin);
             if (has_msgs) {
                 run_loop_ctrl(mlpin, 3, p + ".controllers.mlp");
@@ -2134,7 +2226,13 @@ private:
             k_rms_norm_rows<<<B, 256, 0, stream_>>>(mlpin, f32_ptr(p + ".mlp_norm.weight"), mlpin, B, D, c_.rms_eps);
 
             // k4: Top-8/128 Sigmoid Router (exact route_scale=8.0 & tie-break)
-            launch_f32_linear(f32_ptr(p + ".mlp.gate.weight"), mlpin, nullptr, rlog, B, c_.n_experts, D, stream_, mem_info_.gen);
+            pmark(5);
+            if (B >= 64 && trunk_bf16_.count(p + ".mlp.gate.weight") > 0 &&
+                mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
+                launch_bf16_opt(bf16_ptr(p + ".mlp.gate.weight"), mlpin, nullptr, rlog, B, c_.n_experts, D);
+            } else {
+                launch_f32_linear(f32_ptr(p + ".mlp.gate.weight"), mlpin, nullptr, rlog, B, c_.n_experts, D, stream_, mem_info_.gen);
+            }
             k4_moe_router_topk<<<B, 128, 0, stream_>>>(rlog, f32_ptr(p + ".mlp.gate.bias"), tk_i, tk_w, B, c_.top_k, c_.route_scale);
 
             // MoE Expert Execution:
@@ -2190,39 +2288,119 @@ private:
                 k_moe_reduce_buckets<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
                     d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
             } else if (layer_all_gpu_[ip]) {
-                k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
                 const GpuExpertDesc* d_exps = reinterpret_cast<const GpuExpertDesc*>(d_layer_exps_[ip].dev_ptr);
                 int32_t* d_off = reinterpret_cast<int32_t*>(sc_exp_off_.dev_ptr);
+                int32_t* d_cur = reinterpret_cast<int32_t*>(sc_exp_cur_.dev_ptr);
                 int32_t* d_btk = reinterpret_cast<int32_t*>(sc_bucket_tok_.dev_ptr);
                 int32_t* d_s2b = reinterpret_cast<int32_t*>(sc_slotk_bidx_.dev_ptr);
                 half_t*  d_act = reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr);
                 float*   d_by  = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
-                k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
+                const int tot_pairs = B * c_.top_k;
+                if (B >= 32) {
+                    (void)hipMemsetAsync(d_off, 0, 129 * sizeof(int32_t), stream_);
+                    const int cblks = std::min(64, (tot_pairs + 255) / 256);
+                    k_moe_count_buckets<<<cblks, 256, 0, stream_>>>(tk_i, d_off, tot_pairs);
+                    k_moe_prefix_buckets<<<1, 128, 0, stream_>>>(d_off, d_off, d_cur);
+                    k_moe_scatter_buckets<<<(tot_pairs + 255) / 256, 256, 0, stream_>>>(tk_i, d_cur, d_btk, d_s2b, tot_pairs, c_.top_k);
+                } else {
+                    k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
+                }
                 if (mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
-                    const int m_tiles = (B >= 1024) ? 4 : ((B >= 512) ? 2 : 1);
-                    const dim3 g13((2 * c_.inter + 127) / 128, c_.n_experts, m_tiles);
-                    const dim3 g2((D + 127) / 128, c_.n_experts, m_tiles);
-                    if (use_i8_moe_wmma_ && layer_gu_class_[ip] == 0) {
-                        k_moe_grouped_w13_situ_wmma_sk_i8<<<g13, 256, 0, stream_>>>(
-                            d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
-                    } else if (use_i8_moe_wmma_ && layer_gu_class_[ip] == 1) {
-                        k_moe_grouped_w13_situ_wmma_sf4_i8<<<g13, 256, 0, stream_>>>(
-                            d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                    if (B >= 64) {
+                        // Wave-5 BM=128, BN=128 Grouped-MoE with m_tiles=8 hot-expert fan-out!
+                        // Cold/avg experts (m_e <= 128) exit z>=1 on instruction #1 -> 1.0x W reads;
+                        // Hot Zipfian experts (m_e=500..1000) fan out across 8 parallel CTAs sharing W in L2/MALL (ZERO tail stragglers!)
+                        const int m_tiles_128 = (B >= 1024) ? 8 : ((B >= 256) ? 4 : 2);
+                        const dim3 g13((2 * c_.inter + 127) / 128, c_.n_experts, m_tiles_128);
+                        const dim3 g2((D + 127) / 128, c_.n_experts, m_tiles_128);
+                        int8_t* xq = reinterpret_cast<int8_t*>(sc_x_q8_.dev_ptr);
+                        float*  xd = reinterpret_cast<float*>(sc_x_d_.dev_ptr);
+                        int8_t* aq = reinterpret_cast<int8_t*>(sc_act_q8_.dev_ptr);
+                        float*  ad = reinterpret_cast<float*>(sc_act_d_.dev_ptr);
+
+                        pmark(6);
+                        if (use_i8_moe_wmma_ && layer_gu_class_[ip] == 0) {
+                            const int nb64 = B * (D >> 6);
+                            k_quant_f32_to_q8_64<<<(nb64 + 15) / 16, 256, 0, stream_>>>(mlpin, xq, xd, nb64);
+                            k_moe_grouped_w13_situ_wmma_sk_i8_128<<<g13, 256, 0, stream_>>>(
+                                d_exps, d_off, d_btk, xq, xd, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                        } else if (use_i8_moe_wmma_ && layer_gu_class_[ip] == 1) {
+                            const int nb16 = B * (D >> 4);
+                            k_quant_f32_to_q8_16<<<(nb16 + 63) / 64, 256, 0, stream_>>>(mlpin, xq, xd, nb16);
+                            k_moe_grouped_w13_situ_wmma_sf4_i8_128<<<g13, 256, 0, stream_>>>(
+                                d_exps, d_off, d_btk, xq, xd, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                        } else {
+                            k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
+                            if (layer_gu_class_[ip] == 0) {
+                                k_moe_grouped_w13_situ_wmma_128_spec<0><<<g13, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                            } else if (layer_gu_class_[ip] == 1) {
+                                k_moe_grouped_w13_situ_wmma_128_spec<1><<<g13, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                            } else if (layer_gu_class_[ip] == 2) {
+                                k_moe_grouped_w13_situ_wmma_128_spec<2><<<g13, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                            } else {
+                                k_moe_grouped_w13_situ_wmma_128<<<g13, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                            }
+                        }
+                        pmark(7);
+                        if (use_i8_moe_wmma_ && layer_dn_class_[ip] == 0) {
+                            const int nb64 = tot_pairs * (c_.inter >> 6);
+                            k_quant_f16_to_q8_64<<<(nb64 + 15) / 16, 256, 0, stream_>>>(d_act, aq, ad, nb64);
+                            k_moe_grouped_w2_wmma_sk_i8_128<<<g2, 256, 0, stream_>>>(
+                                d_exps, d_off, aq, ad, d_by, D, c_.inter);
+                        } else if (use_i8_moe_wmma_ && layer_dn_class_[ip] == 1) {
+                            const int nb16 = tot_pairs * (c_.inter >> 4);
+                            k_quant_f16_to_q8_16<<<(nb16 + 63) / 64, 256, 0, stream_>>>(d_act, aq, ad, nb16);
+                            k_moe_grouped_w2_wmma_sf4_i8_128<<<g2, 256, 0, stream_>>>(
+                                d_exps, d_off, aq, ad, d_by, D, c_.inter);
+                        } else {
+                            if (layer_dn_class_[ip] == 0) {
+                                k_moe_grouped_w2_wmma_128_spec<0><<<g2, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_act, d_by, D, c_.inter);
+                            } else if (layer_dn_class_[ip] == 1) {
+                                k_moe_grouped_w2_wmma_128_spec<1><<<g2, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_act, d_by, D, c_.inter);
+                            } else if (layer_dn_class_[ip] == 2) {
+                                k_moe_grouped_w2_wmma_128_spec<2><<<g2, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_act, d_by, D, c_.inter);
+                            } else {
+                                k_moe_grouped_w2_wmma_128<<<g2, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_act, d_by, D, c_.inter);
+                            }
+                        }
                     } else {
-                        k_moe_grouped_w13_situ_wmma<<<g13, 256, 0, stream_>>>(
-                            d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
-                    }
-                    if (use_i8_moe_wmma_ && layer_dn_class_[ip] == 0) {
-                        k_moe_grouped_w2_wmma_sk_i8<<<g2, 256, 0, stream_>>>(
-                            d_exps, d_off, d_act, d_by, D, c_.inter);
-                    } else if (use_i8_moe_wmma_ && layer_dn_class_[ip] == 1) {
-                        k_moe_grouped_w2_wmma_sf4_i8<<<g2, 256, 0, stream_>>>(
-                            d_exps, d_off, d_act, d_by, D, c_.inter);
-                    } else {
-                        k_moe_grouped_w2_wmma<<<g2, 256, 0, stream_>>>(
-                            d_exps, d_off, d_act, d_by, D, c_.inter);
+                        k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
+                        const dim3 g13((2 * c_.inter + 127) / 128, c_.n_experts, 1);
+                        const dim3 g2((D + 127) / 128, c_.n_experts, 1);
+                        const bool small_i8 = (mem_info_.gen == AmdGen::Rdna4) && use_i8_moe_wmma_;
+                        pmark(6);
+                        if (small_i8 && layer_gu_class_[ip] == 0) {
+                            k_moe_grouped_w13_situ_wmma_sk_i8<<<g13, 256, 0, stream_>>>(
+                                d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                        } else if (small_i8 && layer_gu_class_[ip] == 1) {
+                            k_moe_grouped_w13_situ_wmma_sf4_i8<<<g13, 256, 0, stream_>>>(
+                                d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                        } else {
+                            k_moe_grouped_w13_situ_wmma<<<g13, 256, 0, stream_>>>(
+                                d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                        }
+                        pmark(7);
+                        if (small_i8 && layer_dn_class_[ip] == 0) {
+                            k_moe_grouped_w2_wmma_sk_i8<<<g2, 256, 0, stream_>>>(
+                                d_exps, d_off, d_act, d_by, D, c_.inter);
+                        } else if (small_i8 && layer_dn_class_[ip] == 1) {
+                            k_moe_grouped_w2_wmma_sf4_i8<<<g2, 256, 0, stream_>>>(
+                                d_exps, d_off, d_act, d_by, D, c_.inter);
+                        } else {
+                            k_moe_grouped_w2_wmma<<<g2, 256, 0, stream_>>>(
+                                d_exps, d_off, d_act, d_by, D, c_.inter);
+                        }
                     }
                 } else {
+                    k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
                     k_moe_grouped_w13_situ<<<dim3((c_.inter + 3) / 4, c_.n_experts), 256, 0, stream_>>>(
                         d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
                     k_moe_grouped_w2<<<dim3((D + 7) / 8, c_.n_experts), 256, 0, stream_>>>(
@@ -2513,9 +2691,11 @@ private:
                     d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
             }
 
-            // Post-MLP ShortConv + residual add
+            // Post-MLP ShortConv + residual add (cur unmodified -> in-place add, 0 res copy!)
             run_sconv(moeout, p + ".mlp_sconv", nullptr, d_sconv_mlp_all_, msc, D, 0, rsl ? &rsl->sconv_rec_mlp : nullptr, visit);
-            k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, msc, cur, B * D);
+            k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, msc, cur, B * D);
+            pmark(8);
+            pflush();
             ++visit;
 
             // Periodic TDR/MES flush on heavy prefill batches (skipped during HIP Graph capture!)
@@ -2645,6 +2825,15 @@ private:
         }
 
         const bool ok = hip_ok(hipStreamSynchronize(stream_), "forward_batch sync", err);
+        if (prof_on) {
+            double sum = 0.0;
+            for (int i = 0; i < 8; ++i) sum += p_acc[i];
+            std::fprintf(stderr,
+                "[HIP-PROF] B=%d sum=%.1fms (%.1fms/v, %.1f ppts) | res_ctrl=%.1f qkvrg=%.1f sconv_kv=%.1f attn=%.1f wo_post=%.1f moe_prep=%.1f moe_w13=%.1f moe_w2_post=%.1f\n",
+                B, sum, sum / std::max(1, visit), (sum > 0.0 ? B * 1000.0 / sum : 0.0),
+                p_acc[0], p_acc[1], p_acc[2], p_acc[3], p_acc[4], p_acc[5], p_acc[6], p_acc[7]);
+            for (int i = 0; i < 9; ++i) (void)hipEventDestroy(pev[i]);
+        }
         free_gpu_buffer(d_img_emb);
         return ok;
     }
@@ -2794,7 +2983,9 @@ private:
         free_gpu_buffer(sc_mlp_in_); free_gpu_buffer(sc_mlp_f16_); free_gpu_buffer(sc_r_logits_);
         free_gpu_buffer(sc_topk_ids_); free_gpu_buffer(sc_topk_w_); free_gpu_buffer(sc_moe_act_);
         free_gpu_buffer(sc_moe_gu_); free_gpu_buffer(sc_moe_ye_); free_gpu_buffer(sc_moe_out_); free_gpu_buffer(sc_m_sconv_);
-        free_gpu_buffer(sc_exp_off_); free_gpu_buffer(sc_bucket_tok_); free_gpu_buffer(sc_slotk_bidx_);
+        free_gpu_buffer(sc_exp_off_); free_gpu_buffer(sc_exp_cur_);
+        free_gpu_buffer(sc_x_q8_); free_gpu_buffer(sc_x_d_); free_gpu_buffer(sc_act_q8_); free_gpu_buffer(sc_act_d_);
+        free_gpu_buffer(sc_bucket_tok_); free_gpu_buffer(sc_slotk_bidx_);
         free_gpu_buffer(sc_bucket_x_f16_); free_gpu_buffer(sc_bucket_y_);
         free_gpu_buffer(sc_exp_tok_idx_); free_gpu_buffer(sc_exp_tok_w_); free_gpu_buffer(sc_h_norm_);
         free_gpu_buffer(sc_blk_ptrs_); free_gpu_buffer(sc_prelude_); free_gpu_buffer(sc_bank_out_); free_gpu_buffer(sc_logits_);
@@ -2868,7 +3059,8 @@ private:
     GpuBuffer sc_sinks_, sc_gate_a_, sc_k_dyn_, sc_v_dyn_, sc_attn_out_, sc_splitkv_part_, sc_o_proj_, sc_a_sconv_;
     GpuBuffer sc_mlp_in_, sc_mlp_f16_, sc_r_logits_, sc_topk_ids_, sc_topk_w_;
     GpuBuffer sc_moe_act_, sc_moe_gu_, sc_moe_ye_, sc_moe_out_, sc_m_sconv_;
-    GpuBuffer sc_exp_off_, sc_bucket_tok_, sc_slotk_bidx_, sc_bucket_x_f16_, sc_bucket_y_;
+    GpuBuffer sc_exp_off_, sc_exp_cur_, sc_x_q8_, sc_x_d_, sc_act_q8_, sc_act_d_;
+    GpuBuffer sc_bucket_tok_, sc_slotk_bidx_, sc_bucket_x_f16_, sc_bucket_y_;
     GpuBuffer sc_exp_tok_idx_, sc_exp_tok_w_, sc_h_norm_, sc_blk_ptrs_, sc_prelude_, sc_bank_out_, sc_logits_;
     std::vector<GpuBuffer> sc_blocks_;
     std::vector<GpuBuffer> sc_bank_;

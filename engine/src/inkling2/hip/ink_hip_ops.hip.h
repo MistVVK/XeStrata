@@ -115,6 +115,109 @@ __global__ void __launch_bounds__(256) k1_attn_res_mix(
     }
 }
 
+// Single-Pass Multi-Query AttnRes Depth Mix (nq in 1..4): reads each depth state ONCE for all nq queries!
+// Cuts DRAM traffic 3x-4x on Global layers (nq=3) and Cross-Pass Messages (nq=4) at B=512..2048!
+// Grid: (M,), Block: 256
+template <int NQ>
+__global__ void __launch_bounds__(256) k1_attn_res_mix_multi(
+    BlockPtrs12 bp,
+    int n_blocks,
+    const float* __restrict__ cur,
+    const float* __restrict__ queries,  // [NQ, D]
+    float* __restrict__ out,            // [M, NQ, D]
+    int M, int D) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int n_states = n_blocks + 1;
+    const float inv_sqrt_d = rsqrtf(static_cast<float>(D));
+    const int d4 = D >> 2;
+
+    __shared__ float s_ss[8];
+    __shared__ float s_dot[NQ][8];
+    __shared__ float s_w[NQ][16];
+    __shared__ float s_ir[16];
+
+    for (int s = 0; s < n_states; ++s) {
+        const float4* sv4 = reinterpret_cast<const float4*>(
+            (s < n_blocks) ? (bp.p[s] + static_cast<size_t>(m) * D)
+                           : (cur + static_cast<size_t>(m) * D));
+        float ss = 0.0f;
+        float dot[NQ];
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) dot[q] = 0.0f;
+
+        for (int i = tid; i < d4; i += 256) {
+            const float4 x = sv4[i];
+            ss = fmaf(x.x, x.x, fmaf(x.y, x.y, fmaf(x.z, x.z, fmaf(x.w, x.w, ss))));
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                const float4 q4 = reinterpret_cast<const float4*>(queries + static_cast<size_t>(q) * D)[i];
+                dot[q] = fmaf(x.x, q4.x, fmaf(x.y, q4.y, fmaf(x.z, q4.z, fmaf(x.w, q4.w, dot[q]))));
+            }
+        }
+        ss = wave32_sum(ss);
+        if (lane == 0) s_ss[wave] = ss;
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) {
+            dot[q] = wave32_sum(dot[q]);
+            if (lane == 0) s_dot[q][wave] = dot[q];
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float tss = 0.0f;
+            for (int w = 0; w < 8; ++w) tss += s_ss[w];
+            const float ir = rsqrtf(tss / static_cast<float>(D) + kRmsEps);
+            s_ir[s] = ir;
+            for (int q = 0; q < NQ; ++q) {
+                float td = 0.0f;
+                for (int w = 0; w < 8; ++w) td += s_dot[q][w];
+                s_w[q][s] = td * ir * inv_sqrt_d;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid < NQ) {
+        const int q = tid;
+        float mx = -1e30f;
+        for (int s = 0; s < n_states; ++s) mx = fmaxf(mx, s_w[q][s]);
+        float sum = 0.0f;
+        for (int s = 0; s < n_states; ++s) {
+            s_w[q][s] = __expf(s_w[q][s] - mx);
+            sum += s_w[q][s];
+        }
+        const float inv = 1.0f / fmaxf(sum, 1e-30f);
+        for (int s = 0; s < n_states; ++s) s_w[q][s] = (s_w[q][s] * inv) * s_ir[s];
+    }
+    __syncthreads();
+
+    for (int i = tid; i < d4; i += 256) {
+        float a0[NQ], a1[NQ], a2[NQ], a3[NQ];
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) { a0[q] = 0.0f; a1[q] = 0.0f; a2[q] = 0.0f; a3[q] = 0.0f; }
+        for (int s = 0; s < n_states; ++s) {
+            const float4* sv4 = reinterpret_cast<const float4*>(
+                (s < n_blocks) ? (bp.p[s] + static_cast<size_t>(m) * D)
+                               : (cur + static_cast<size_t>(m) * D));
+            const float4 x = sv4[i];
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                const float w = s_w[q][s];
+                a0[q] = fmaf(w, x.x, a0[q]); a1[q] = fmaf(w, x.y, a1[q]);
+                a2[q] = fmaf(w, x.z, a2[q]); a3[q] = fmaf(w, x.w, a3[q]);
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) {
+            reinterpret_cast<float4*>(out + (static_cast<size_t>(m) * NQ + q) * D)[i] = make_float4(a0[q], a1[q], a2[q], a3[q]);
+        }
+    }
+}
+
 // Multi-CU Parallel Rank-64 Tanh Loop Message Controller (3 fast kernels across ALL CUs -> 20x faster at B=1!):
 //   Step 1: k1_loop_ctrl_rms   <<<B, 256>>>                  -> inv_rms(cur)[B], inv_rms(msg)[B]
 //   Step 2: k1_loop_ctrl_down  <<<dim3((rank+7)/8, B), 256>>> -> gate[B, rank] (8 blocks x 8 waves = 64 waves!)
@@ -295,6 +398,247 @@ __global__ void __launch_bounds__(256) k1_loop_ctrl_apply_out(
     const float c = cur[idx];
     const float mv = msg_base[(static_cast<size_t>(m) * msg_stride_ch + msg_ch) * D + d];
     out[idx] = fmaf(1.0f - tanhf(forget_raw[idx]), c, tanhf(gain_raw[idx]) * mv);
+}
+
+// Pack normalized [cur; msg] directly to BF16 (2x less DRAM than FP32!)
+__global__ void __launch_bounds__(256) k1_loop_ctrl_pack_in_bf16(
+    const float* __restrict__ cur,       // [M, D]
+    const float* __restrict__ msg_base,  // [M, msg_stride_ch, D]
+    int msg_stride_ch, int msg_ch,
+    const float* __restrict__ inv_c_arr, // [M]
+    const float* __restrict__ inv_m_arr, // [M]
+    uint16_t* __restrict__ packed_bf16,  // [M, 2*D] BF16
+    int M, int D) {
+    const int d4 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m = blockIdx.y;
+    const int d = d4 * 4;
+    if (m >= M || d >= D) return;
+    const float ic = inv_c_arr[m];
+    const float im = inv_m_arr[m];
+    const float4 cv = *reinterpret_cast<const float4*>(cur + static_cast<size_t>(m) * D + d);
+    const float4 mv = *reinterpret_cast<const float4*>(msg_base + (static_cast<size_t>(m) * msg_stride_ch + msg_ch) * D + d);
+    uint16_t* dst = packed_bf16 + static_cast<size_t>(m) * (2 * D);
+    *reinterpret_cast<uint2*>(dst + d) = make_uint2(
+        static_cast<uint32_t>(f32_to_bf16(cv.x * ic)) | (static_cast<uint32_t>(f32_to_bf16(cv.y * ic)) << 16),
+        static_cast<uint32_t>(f32_to_bf16(cv.z * ic)) | (static_cast<uint32_t>(f32_to_bf16(cv.w * ic)) << 16));
+    *reinterpret_cast<uint2*>(dst + D + d) = make_uint2(
+        static_cast<uint32_t>(f32_to_bf16(mv.x * im)) | (static_cast<uint32_t>(f32_to_bf16(mv.y * im)) << 16),
+        static_cast<uint32_t>(f32_to_bf16(mv.z * im)) | (static_cast<uint32_t>(f32_to_bf16(mv.w * im)) << 16));
+}
+
+// Fused WMMA Loop Controller Down-Projection (BM=64, BN=64, BK=64): reads cur & msg directly -> ZERO 37.7 MB cin DRAM!
+// Grid: (1, (M + 63)/64) [since rank=64!], Block: 128 (4 waves: W_M=2, W_N=2, 18.4 KB LDS -> 3 WG/CU!)
+__global__ void __launch_bounds__(128) k1_loop_ctrl_down_wmma_fused(
+    const float* __restrict__ cur,       // [M, D]
+    const float* __restrict__ msg_base,  // [M, msg_stride_ch, D]
+    int msg_stride_ch, int msg_ch,
+    const float* __restrict__ inv_c_arr, // [M]
+    const float* __restrict__ inv_m_arr, // [M]
+    const uint16_t* __restrict__ w_down, // [64, 2*D] BF16
+    float* __restrict__ gate_out,        // [M, 64] FP32
+    int M, int D) {
+#if INK_HAS_WMMA
+    constexpr int BM = 64, BN = 64, BK = 64, LD = BK + 8;
+    __shared__ alignas(16) uint16_t sX[BM * LD];   // 9,216 B
+    __shared__ alignas(16) uint16_t sW[BN * LD];   // 9,216 B -> 18,432 B (18.0 KB!)
+    __shared__ float sInvC[BM];
+    __shared__ float sInvM[BM];
+
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int l16 = lane & 15;
+    const int hi = lane >> 4;
+    (void)hi;
+    const int wm = wave >> 1;
+    const int wn = wave & 1;
+    const int m_blk = blockIdx.y * BM;
+    const int tm = (M - m_blk < BM) ? (M - m_blk) : BM;
+
+    if (tid < BM) {
+        sInvC[tid] = (tid < tm) ? inv_c_arr[m_blk + tid] : 0.0f;
+        sInvM[tid] = (tid < tm) ? inv_m_arr[m_blk + tid] : 0.0f;
+    }
+    sync_lds();
+
+    fv8 acc[2][2];
+    acc[0][0] = fv8_zero(); acc[0][1] = fv8_zero();
+    acc[1][0] = fv8_zero(); acc[1][1] = fv8_zero();
+
+    // Two halves: h=0 reads cur * inv_c with w_down[:, 0..D-1], h=1 reads msg * inv_m with w_down[:, D..2D-1]
+    for (int half = 0; half < 2; ++half) {
+        const int w_col_off = half * D;
+        for (int k0 = 0; k0 < D; k0 += BK) {
+            for (int idx = tid; idx < BM * 16; idx += 128) {
+                const int r = idx >> 4, c4 = idx & 15;
+                uint16_t* dst = &sX[r * LD + c4 * 4];
+                if (r < tm) {
+                    const int gm = m_blk + r;
+                    const float sc = (half == 0) ? sInvC[r] : sInvM[r];
+                    const float* src_row = (half == 0)
+                        ? (cur + static_cast<size_t>(gm) * D)
+                        : (msg_base + (static_cast<size_t>(gm) * msg_stride_ch + msg_ch) * D);
+                    const float4 v = *reinterpret_cast<const float4*>(src_row + k0 + c4 * 4);
+                    *reinterpret_cast<uint2*>(dst) = make_uint2(
+                        static_cast<uint32_t>(f32_to_bf16(v.x * sc)) | (static_cast<uint32_t>(f32_to_bf16(v.y * sc)) << 16),
+                        static_cast<uint32_t>(f32_to_bf16(v.z * sc)) | (static_cast<uint32_t>(f32_to_bf16(v.w * sc)) << 16));
+                } else {
+                    *reinterpret_cast<uint2*>(dst) = make_uint2(0u, 0u);
+                }
+            }
+            for (int idx = tid; idx < BN * 8; idx += 128) {
+                const int r = idx >> 3, c8 = idx & 7;
+                *reinterpret_cast<uint4*>(&sW[r * LD + c8 * 8]) =
+                    *reinterpret_cast<const uint4*>(w_down + static_cast<size_t>(r) * (2 * D) + w_col_off + k0 + c8 * 8);
+            }
+            sync_lds();
+
+            if (wm * 32 < tm) {
+                const bool do_m1 = (wm * 32 + 16 < tm);
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+                    wmma_bf_t b0 = wmma_ld_bf(&sW[(wn * 32 + l16) * LD + kk * 16], hi);
+                    wmma_bf_t b1 = wmma_ld_bf(&sW[(wn * 32 + 16 + l16) * LD + kk * 16], hi);
+                    wmma_bf_t a0 = wmma_ld_bf(&sX[(wm * 32 + l16) * LD + kk * 16], hi);
+                    acc[0][0] = wmma_bf16(a0, b0, acc[0][0]);
+                    acc[0][1] = wmma_bf16(a0, b1, acc[0][1]);
+                    if (do_m1) {
+                        wmma_bf_t a1 = wmma_ld_bf(&sX[(wm * 32 + 16 + l16) * LD + kk * 16], hi);
+                        acc[1][0] = wmma_bf16(a1, b0, acc[1][0]);
+                        acc[1][1] = wmma_bf16(a1, b1, acc[1][1]);
+                    }
+                }
+            }
+            sync_lds();
+        }
+    }
+
+    if (wm * 32 < tm) {
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+            if (wm * 32 + mi * 16 >= tm) continue;
+#pragma unroll
+            for (int ni = 0; ni < 2; ++ni) {
+                const int gn = wn * 32 + ni * 16 + wmma_acc_n(0, lane);
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    const int gm = m_blk + wm * 32 + mi * 16 + wmma_acc_m(r, lane);
+                    if (gm < M) gate_out[static_cast<size_t>(gm) * 64 + gn] = acc[mi][ni][r];
+                }
+            }
+        }
+    }
+#else
+    (void)cur; (void)msg_base; (void)msg_stride_ch; (void)msg_ch; (void)inv_c_arr; (void)inv_m_arr; (void)w_down; (void)gate_out; (void)M; (void)D;
+#endif
+}
+
+// Fused WMMA Loop Controller Up-Projection + Tanh Apply (K = rank = 64 -> ONE single BK=64 step, ZERO K-loop!)
+// Computes cg = gate @ W_gain^T & cf = gate @ W_forget^T in registers and updates cur in-place -> ZERO cg/cf DRAM traffic!
+// Grid: ((D + 63)/64, (M + 63)/64), Block: 128 (4 waves: 2x2 tiles/wave, 27.6 KB LDS < 32 KB -> 2 WG/CU!)
+__global__ void __launch_bounds__(128) k1_loop_ctrl_up_wmma_fused(
+    float* __restrict__ cur,              // [M, D] (updated in-place!)
+    const float* __restrict__ msg_base,   // [M, msg_stride_ch, D]
+    int msg_stride_ch, int msg_ch,
+    const float* __restrict__ gate_in,    // [M, 64] FP32
+    const uint16_t* __restrict__ w_gain,  // [D, 64] BF16
+    const uint16_t* __restrict__ w_forget,// [D, 64] BF16
+    int M, int D) {
+#if INK_HAS_WMMA
+    constexpr int BM = 64, BN = 64, BK = 64, LD = BK + 8;
+    __shared__ alignas(16) uint16_t sG[BM * LD];   // 9,216 B
+    __shared__ alignas(16) uint16_t sWg[BN * LD];  // 9,216 B
+    __shared__ alignas(16) uint16_t sWf[BN * LD];  // 9,216 B -> 27,648 B (27.0 KB!)
+
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int l16 = lane & 15;
+    const int hi = lane >> 4;
+    (void)hi;
+    const int wm = wave >> 1;  // 0..1 (32 M)
+    const int wn = wave & 1;   // 0..1 (32 N)
+    const int m_blk = blockIdx.y * BM;
+    const int n_blk = blockIdx.x * BN;
+    const int tm = (M - m_blk < BM) ? (M - m_blk) : BM;
+
+    // Load gate[64, 64] FP32 -> BF16 (8 iters/thread)
+    for (int idx = tid; idx < BM * 16; idx += 128) {
+        const int r = idx >> 4, c4 = idx & 15;
+        uint16_t* dst = &sG[r * LD + c4 * 4];
+        if (r < tm) {
+            const float4 gv = *reinterpret_cast<const float4*>(gate_in + static_cast<size_t>(m_blk + r) * 64 + c4 * 4);
+            *reinterpret_cast<uint2*>(dst) = make_uint2(
+                static_cast<uint32_t>(f32_to_bf16(gv.x)) | (static_cast<uint32_t>(f32_to_bf16(gv.y)) << 16),
+                static_cast<uint32_t>(f32_to_bf16(gv.z)) | (static_cast<uint32_t>(f32_to_bf16(gv.w)) << 16));
+        } else {
+            *reinterpret_cast<uint2*>(dst) = make_uint2(0u, 0u);
+        }
+    }
+    // Load w_gain[64, 64] & w_forget[64, 64] BF16 via uint4 (4 iters/thread)
+    for (int idx = tid; idx < BN * 8; idx += 128) {
+        const int r = idx >> 3, c8 = idx & 7;
+        const int gn = n_blk + r;
+        if (gn < D) {
+            *reinterpret_cast<uint4*>(&sWg[r * LD + c8 * 8]) = *reinterpret_cast<const uint4*>(w_gain   + static_cast<size_t>(gn) * 64 + c8 * 8);
+            *reinterpret_cast<uint4*>(&sWf[r * LD + c8 * 8]) = *reinterpret_cast<const uint4*>(w_forget + static_cast<size_t>(gn) * 64 + c8 * 8);
+        } else {
+            *reinterpret_cast<uint4*>(&sWg[r * LD + c8 * 8]) = make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(&sWf[r * LD + c8 * 8]) = make_uint4(0, 0, 0, 0);
+        }
+    }
+    sync_lds();
+
+    if (wm * 32 < tm) {
+        fv8 ag[2][2], af[2][2];
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+            for (int ni = 0; ni < 2; ++ni) { ag[mi][ni] = fv8_zero(); af[mi][ni] = fv8_zero(); }
+        const bool do_m1 = (wm * 32 + 16 < tm);
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            wmma_bf_t a0 = wmma_ld_bf(&sG[(wm * 32 + l16) * LD + kk * 16], hi);
+            wmma_bf_t g0 = wmma_ld_bf(&sWg[(wn * 32 + l16) * LD + kk * 16], hi);
+            wmma_bf_t g1 = wmma_ld_bf(&sWg[(wn * 32 + 16 + l16) * LD + kk * 16], hi);
+            wmma_bf_t f0 = wmma_ld_bf(&sWf[(wn * 32 + l16) * LD + kk * 16], hi);
+            wmma_bf_t f1 = wmma_ld_bf(&sWf[(wn * 32 + 16 + l16) * LD + kk * 16], hi);
+            ag[0][0] = wmma_bf16(a0, g0, ag[0][0]);
+            ag[0][1] = wmma_bf16(a0, g1, ag[0][1]);
+            af[0][0] = wmma_bf16(a0, f0, af[0][0]);
+            af[0][1] = wmma_bf16(a0, f1, af[0][1]);
+            if (do_m1) {
+                wmma_bf_t a1 = wmma_ld_bf(&sG[(wm * 32 + 16 + l16) * LD + kk * 16], hi);
+                ag[1][0] = wmma_bf16(a1, g0, ag[1][0]);
+                ag[1][1] = wmma_bf16(a1, g1, ag[1][1]);
+                af[1][0] = wmma_bf16(a1, f0, af[1][0]);
+                af[1][1] = wmma_bf16(a1, f1, af[1][1]);
+            }
+        }
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+            if (wm * 32 + mi * 16 >= tm) continue;
+#pragma unroll
+            for (int ni = 0; ni < 2; ++ni) {
+                const int gn = n_blk + wn * 32 + ni * 16 + wmma_acc_n(0, lane);
+                if (gn < D) {
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) {
+                        const int gm = m_blk + wm * 32 + mi * 16 + wmma_acc_m(r, lane);
+                        if (gm < M) {
+                            const size_t cidx = static_cast<size_t>(gm) * D + gn;
+                            const float cv = cur[cidx];
+                            const float mv = msg_base[(static_cast<size_t>(gm) * msg_stride_ch + msg_ch) * D + gn];
+                            cur[cidx] = fmaf(1.0f - tanhf(af[mi][ni][r]), cv, tanhf(ag[mi][ni][r]) * mv);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#else
+    (void)cur; (void)msg_base; (void)msg_stride_ch; (void)msg_ch; (void)gate_in; (void)w_gain; (void)w_forget; (void)M; (void)D;
+#endif
 }
 
 // Legacy single-block k1_loop_control kept for standalone tests
@@ -632,7 +976,8 @@ __global__ void __launch_bounds__(256) k3_kv_paged_store(
 }
 
 // 100% Parallel 4-tap ShortConv for single-slot contiguous prefill (B >= 16):
-// Eliminates the 4-block serial bottleneck of k2_shortconv4_grouped_seq -> (C/256)*B = 4,608 parallel blocks at B=512!
+// Wave-5G: Tiled 16-token sliding register window per thread -> loads static_w[c,0..3] ONCE and in_x 1.18x instead of 4.0x!
+// Grid: ((C + 255) / 256, (B + 15) / 16), Block: 256
 __global__ void __launch_bounds__(256) k2_shortconv4_prefill_par(
     const float* __restrict__ in_x,       // [B, C]
     const float* __restrict__ static_w,   // [C, 4] (oldest lag t-3 at [0] .. current t at [3])
@@ -641,26 +986,33 @@ __global__ void __launch_bounds__(256) k2_shortconv4_prefill_par(
     float* __restrict__ out_y,            // [B, C]
     int B, int C, int n_heads) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
-    if (c >= C || t >= B) return;
+    const int t0 = blockIdx.y * 16;
+    if (c >= C || t0 >= B) return;
 
-    const float x3 = in_x[static_cast<size_t>(t) * C + c];
-    const float x2 = (t >= 1) ? bf16_to_f32(f32_to_bf16(in_x[static_cast<size_t>(t - 1) * C + c])) : bf16_to_f32(hist_in[2 * C + c]);
-    const float x1 = (t >= 2) ? bf16_to_f32(f32_to_bf16(in_x[static_cast<size_t>(t - 2) * C + c])) : bf16_to_f32(hist_in[(t + 1) * C + c]);
-    const float x0 = (t >= 3) ? bf16_to_f32(f32_to_bf16(in_x[static_cast<size_t>(t - 3) * C + c])) : bf16_to_f32(hist_in[t * C + c]);
+    const float4 sw = *reinterpret_cast<const float4*>(static_w + static_cast<size_t>(c) * 4);
+    float x0 = (t0 >= 3) ? bf16_to_f32(f32_to_bf16(in_x[static_cast<size_t>(t0 - 3) * C + c])) : bf16_to_f32(hist_in[t0 * C + c]);
+    float x1 = (t0 >= 2) ? bf16_to_f32(f32_to_bf16(in_x[static_cast<size_t>(t0 - 2) * C + c])) : bf16_to_f32(hist_in[(t0 + 1) * C + c]);
+    float x2 = (t0 >= 1) ? bf16_to_f32(f32_to_bf16(in_x[static_cast<size_t>(t0 - 1) * C + c])) : bf16_to_f32(hist_in[2 * C + c]);
 
-    const float* sw = static_w + static_cast<size_t>(c) * 4;
-    float y = x3 + sw[0] * x0 + sw[1] * x1 + sw[2] * x2 + sw[3] * x3;
-    if (dyn_taps != nullptr && n_heads > 0) {
-        const int hd = C / n_heads;
-        const int h = c / hd;
-        const float* dt = dyn_taps + (static_cast<size_t>(t) * n_heads + h) * 4;
-        y += x3 * dt[0] + x2 * dt[1] + x1 * dt[2] + x0 * dt[3];
-        y *= (1.0f / 3.0f);
-    } else {
-        y *= 0.44721359549995793f;  // 1 / sqrt(5)
+    const bool has_dyn = (dyn_taps != nullptr && n_heads > 0);
+    const int h = has_dyn ? (c / (C / n_heads)) : 0;
+    const int tend = (t0 + 16 < B) ? (t0 + 16) : B;
+
+    for (int t = t0; t < tend; ++t) {
+        const float x3 = in_x[static_cast<size_t>(t) * C + c];
+        float y = x3 + sw.x * x0 + sw.y * x1 + sw.z * x2 + sw.w * x3;
+        if (has_dyn) {
+            const float4 dt = *reinterpret_cast<const float4*>(dyn_taps + (static_cast<size_t>(t) * n_heads + h) * 4);
+            y += x3 * dt.x + x2 * dt.y + x1 * dt.z + x0 * dt.w;
+            y *= (1.0f / 3.0f);
+        } else {
+            y *= 0.44721359549995793f;  // 1 / sqrt(5)
+        }
+        out_y[static_cast<size_t>(t) * C + c] = y;
+        x0 = x1;
+        x1 = x2;
+        x2 = bf16_to_f32(f32_to_bf16(x3));
     }
-    out_y[static_cast<size_t>(t) * C + c] = y;
 }
 
 __global__ void __launch_bounds__(256) k2_shortconv4_update_hist(
@@ -1089,8 +1441,8 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
 #if INK_HAS_WMMA
     constexpr int BQ = 64, BK = 64, HD = 128;
     constexpr int LDK = HD + 8;   // 136 -> 64 * 136 * 2 = 17,408 B
-    constexpr int LDV = BK + 8;   // 72  -> 128 * 72 * 2 = 18,432 B
-    constexpr int LDP = BK + 8;   // 72  -> 64 * 72 * 2  =  9,216 B
+    constexpr int LDV = BK + 8;   //  72 -> 128 * 72 * 2 = 18,432 B (16B-aligned for ds_read_b128 wmma_ld_h!)
+    constexpr int LDP = BK + 8;   //  72 -> 64 * 72 * 2  =  9,216 B
 
     union KvBuf {
         alignas(16) half_t sK[BQ * LDK];   // [64, 136] for Q (init) and K tiles
@@ -1213,26 +1565,37 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
         }
         sync_lds();
 
-        // 3C. Register-only 16-lane online softmax + mask + rel_bias -> write FP16 P[64, 64] to sP!
+        // 3C. Register-only 16-lane online softmax + mask + hoisted rel_bias skip -> write FP16 P[64, 64] to sP!
         const int col16 = wmma_acc_n(0, lane);
+        const bool blk_has_rb = (rel_bias != nullptr && (kb + BK - 1) > (q_min_pos - max_rel));
+        const bool blk_full_causal = (kb + BK - 1 <= q_min_pos) && (swa_window <= 0 || (q_max_pos - kb < swa_window));
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int gm = row_gm[r];
             const int qp = row_pos[r];
-            const float* rbr = rb_ptrs[r];
+            const float* rbr = blk_has_rb ? rb_ptrs[r] : nullptr;
             float sv[4];
             float lmax = -1e30f;
+            if (blk_full_causal && gm < M && !rbr) {
 #pragma unroll
-            for (int kt = 0; kt < 4; ++kt) {
-                const int kp = kb + kt * 16 + col16;
-                const int dist = qp - kp;
-                if (gm < M && kp <= qp && (swa_window <= 0 || dist < swa_window)) {
-                    float val = s_acc[kt][r];
-                    if (rbr && dist < max_rel) val += rbr[dist];
+                for (int kt = 0; kt < 4; ++kt) {
+                    const float val = s_acc[kt][r];
                     sv[kt] = val;
                     lmax = fmaxf(lmax, val);
-                } else {
-                    sv[kt] = -1e30f;
+                }
+            } else {
+#pragma unroll
+                for (int kt = 0; kt < 4; ++kt) {
+                    const int kp = kb + kt * 16 + col16;
+                    const int dist = qp - kp;
+                    if (gm < M && kp <= qp && (swa_window <= 0 || dist < swa_window)) {
+                        float val = s_acc[kt][r];
+                        if (rbr && dist < max_rel) val += rbr[dist];
+                        sv[kt] = val;
+                        lmax = fmaxf(lmax, val);
+                    } else {
+                        sv[kt] = -1e30f;
+                    }
                 }
             }
             // Half-wave 16-lane max reduction (exact per-row max on BOTH RDNA3/3.5 and RDNA4!)
@@ -1282,11 +1645,13 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
                     kv.sVt[(d0 + 2) * LDV + r] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs);
                     kv.sVt[(d0 + 3) * LDV + r] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs);
                 } else {
-                    const half_t* vp = static_cast<const half_t*>(v_pool) + base;
-                    kv.sVt[(d0 + 0) * LDV + r] = vp[0];
-                    kv.sVt[(d0 + 1) * LDV + r] = vp[1];
-                    kv.sVt[(d0 + 2) * LDV + r] = vp[2];
-                    kv.sVt[(d0 + 3) * LDV + r] = vp[3];
+                    const uint2 vw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(v_pool) + base);
+                    const hv2 v01 = __builtin_bit_cast(hv2, vw.x);
+                    const hv2 v23 = __builtin_bit_cast(hv2, vw.y);
+                    kv.sVt[(d0 + 0) * LDV + r] = v01[0];
+                    kv.sVt[(d0 + 1) * LDV + r] = v01[1];
+                    kv.sVt[(d0 + 2) * LDV + r] = v23[0];
+                    kv.sVt[(d0 + 3) * LDV + r] = v23[1];
                 }
             } else {
                 kv.sVt[(d0 + 0) * LDV + r] = static_cast<half_t>(0.0f);
@@ -1817,6 +2182,7 @@ __global__ void __launch_bounds__(256) k_vit_gelu_exact(float* __restrict__ x, i
 // =================================================================================================
 
 // Batched RMSNorm: out[r, d] = x[r, d] * rsqrt(mean(x^2) + eps) * (w ? w[d] : 1)
+// Wave-5G: float4 single-read register-cached fast path (2x less DRAM traffic across 96+ launches!)
 // Grid: (rows,), Block: 256
 __global__ void __launch_bounds__(256) k_rms_norm_rows(
     const float* __restrict__ x,    // [rows, D]
@@ -1832,6 +2198,48 @@ __global__ void __launch_bounds__(256) k_rms_norm_rows(
     float* yr = out + static_cast<size_t>(r) * D;
     __shared__ float s_w[8];
     __shared__ float s_inv;
+
+    if ((D & 3) == 0 && D <= 4096) {
+        const int D4 = D >> 2;
+        const float4* xr4 = reinterpret_cast<const float4*>(xr);
+        const float4* w4  = reinterpret_cast<const float4*>(w);
+        float4* yr4 = reinterpret_cast<float4*>(yr);
+        float4 reg[4];
+        float ss = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int d4 = tid + i * 256;
+            if (d4 < D4) {
+                const float4 v = xr4[d4];
+                reg[i] = v;
+                ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
+            }
+        }
+        ss = wave32_sum(ss);
+        if (lane == 0) s_w[wave] = ss;
+        __syncthreads();
+        if (tid == 0) {
+            float t = 0.0f;
+            for (int i = 0; i < 8; ++i) t += s_w[i];
+            s_inv = rsqrtf(t / static_cast<float>(D) + eps);
+        }
+        __syncthreads();
+        const float inv = s_inv;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int d4 = tid + i * 256;
+            if (d4 < D4) {
+                const float4 v = reg[i];
+                if (w4) {
+                    const float4 ww = w4[d4];
+                    yr4[d4] = make_float4(v.x * inv * ww.x, v.y * inv * ww.y, v.z * inv * ww.z, v.w * inv * ww.w);
+                } else {
+                    yr4[d4] = make_float4(v.x * inv, v.y * inv, v.z * inv, v.w * inv);
+                }
+            }
+        }
+        return;
+    }
 
     float ss = 0.0f;
     for (int d = tid; d < D; d += 256) {
