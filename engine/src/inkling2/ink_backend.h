@@ -20,6 +20,7 @@ struct BackendOpts {
     int chunk = 512;
     int gpu_index = 0;
     int gpus = 1;                // 1 or 2 (--gpus 2 activates Dual-GPU Expert Parallelism, #6506)
+    std::vector<int> gpu_ids;    // optional explicit GPU ordinals (--gpus 0,1 / --devices 0,1 / IK2_GPUS)
     double ep_split = 0.5;       // GPU 1 expert share in (0, 1) (--ep-split / IK2_EP_SPLIT)
     int vram_reserve_mib = -1;   // >= 0 reserves N MiB free VRAM & activates hybrid offload (#6520)
     int cpu_threads = 0;         // > 0 activates CUDA-Graph mapped-memory doorbell NUMA CPU expert pool (#6520)
@@ -131,12 +132,10 @@ std::unique_ptr<InkBackend> make_sycl_backend();
 inline std::unique_ptr<InkBackend> make_default_backend(bool force_cpu = false, const BackendOpts* opts = nullptr) {
     if (!force_cpu) {
 #ifdef INKLING_ENABLE_EP_CUDA
-        // Prefer modular Dual-GPU EP / Graph-Doorbell Hybrid CUDA backend when --gpus >= 2, --cpu-threads > 0,
-        // --vram-reserve-mib >= 0, or when K8V8/K8V4 KV is selected (or when primary CUDA backend isn't built).
-        const bool need_ep_or_hybrid = opts && (
-            opts->gpus >= 2 || opts->cpu_threads > 0 || opts->vram_reserve_mib >= 0 ||
-            opts->kv_dtype == KvDtype::K8V8 || opts->kv_dtype == KvDtype::K8V4);
-        if (need_ep_or_hybrid) return make_ep_cuda_backend();
+        // Primary InkCudaBackend now natively supports .strata, .gguf, safetensors, hybrid offload, AND full on-GPU
+        // Dual-GPU EP (`--gpus 2` / `--gpus 0,1`). Only route to legacy ep_dual_gpu when K8V8/K8V4 KV is explicitly asked.
+        const bool need_k8v_kv = opts && (opts->kv_dtype == KvDtype::K8V8 || opts->kv_dtype == KvDtype::K8V4);
+        if (need_k8v_kv) return make_ep_cuda_backend();
 #endif
 #ifdef INKLING_ENABLE_CUDA
         return make_cuda_backend();

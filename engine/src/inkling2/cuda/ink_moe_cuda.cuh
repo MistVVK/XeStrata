@@ -336,6 +336,293 @@ __global__ void __launch_bounds__(256) k_ink_moe_reduce8(
     y_out[(size_t)tok * kInkHidden + d] = s;
 }
 
+// Masked 8-slot reduction for Dual-GPU EP (sums ONLY slots where experts[topk_idx].tier <= 1, zero memset needed!)
+__global__ void __launch_bounds__(256) k_ink_moe_reduce8_tier0(
+    const InkExpertDev* __restrict__ experts,
+    const int32_t* __restrict__ topk_idx,
+    const float* __restrict__ y_pair,
+    float* __restrict__ y_out,
+    int M) {
+    const int tok = blockIdx.y;
+    const int d = blockIdx.x * 256 + threadIdx.x;
+    if (tok >= M || d >= kInkHidden) return;
+    const int32_t* tidx = topk_idx + (size_t)tok * kInkTopK;
+    const float* base = y_pair + (size_t)tok * kInkTopK * kInkHidden + d;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kInkTopK; ++k) {
+        if (experts[tidx[k]].tier <= 1) s += base[(size_t)k * kInkHidden];
+    }
+    y_out[(size_t)tok * kInkHidden + d] = s;
+}
+
+__global__ void __launch_bounds__(256) k_ink_add_f32(
+    float* __restrict__ dst,
+    const float* __restrict__ src,
+    size_t n) {
+    const size_t i = (size_t)blockIdx.x * 256 + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
+
+// ============================================================================
+// 2B. Native Lossless GGUF_RAW CUDA MoE Kernels (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4, BF16, F16, F32)
+// ============================================================================
+struct InkGgufExpertHeader {
+    uint32_t magic;       // 0x47475546 ('GGUF')
+    uint32_t gu_type;     // ggml_type for gate/up
+    uint32_t dn_type;     // ggml_type for down
+    uint32_t flags;       // 0 = split [gate 0..F-1, up F..2F-1]
+    float    gate_scale;
+    float    up_scale;
+    float    dn_scale;
+    uint32_t reserved;
+};
+static_assert(sizeof(InkGgufExpertHeader) == 32, "InkGgufExpertHeader must be 32 B");
+
+__host__ __device__ inline bool ink_gguf_has_gpu_kernel(uint32_t t) noexcept {
+    switch (t) {
+        case 0: case 1: case 2: case 8: case 12: case 13: case 14: case 20: case 23: case 30: case 39:
+            return true;
+        default:
+            return false;
+    }
+}
+
+__host__ __device__ inline size_t ink_gguf_row_bytes(uint32_t t, int K) noexcept {
+    switch (t) {
+        case 0:  return (size_t)K * 4u;
+        case 1:
+        case 30: return (size_t)K * 2u;
+        case 2:  return (size_t)(K / 32) * 18u;
+        case 8:  return (size_t)(K / 32) * 34u;
+        case 12: return (size_t)(K / 256) * 144u;
+        case 13: return (size_t)(K / 256) * 176u;
+        case 14: return (size_t)(K / 256) * 210u;
+        case 20: return (size_t)(K / 32) * 18u;
+        case 23: return (size_t)(K / 256) * 136u;
+        case 39: return (size_t)(K / 32) * 17u;
+        default: return 0u;
+    }
+}
+
+#if defined(__CUDACC__)
+__device__ __constant__ int8_t kInkIq4NlLut[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+__device__ __forceinline__ float ink_gguf_row_dot(uint32_t ggml_type, const uint8_t* __restrict__ row,
+                                                  const float* __restrict__ x, int K, int lane) {
+    float acc = 0.0f;
+    if (ggml_type == 20) {  // IQ4_NL: 32 elems = 18 B (d fp16, qs[16])
+        for (int b = lane; b < K / 32; b += 32) {
+            const uint8_t* blk = row + (size_t)b * 18u;
+            const float d = f16_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+            const uint8_t* qs = blk + 2;
+            const float* xb = x + b * 32;
+            float s = 0.0f;
+#pragma unroll 4
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t q = qs[j];
+                s += (float)kInkIq4NlLut[q & 0xFu] * xb[j] + (float)kInkIq4NlLut[q >> 4] * xb[j + 16];
+            }
+            acc += s * d;
+        }
+    } else if (ggml_type == 8) {  // Q8_0: 32 elems = 34 B
+        for (int b = lane; b < K / 32; b += 32) {
+            const uint8_t* blk = row + (size_t)b * 34u;
+            const float d = f16_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+            const int8_t* qs = reinterpret_cast<const int8_t*>(blk + 2);
+            const float* xb = x + b * 32;
+            float s = 0.0f;
+#pragma unroll 4
+            for (int j = 0; j < 32; ++j) s += (float)qs[j] * xb[j];
+            acc += s * d;
+        }
+    } else if (ggml_type == 2) {  // Q4_0: 32 elems = 18 B
+        for (int b = lane; b < K / 32; b += 32) {
+            const uint8_t* blk = row + (size_t)b * 18u;
+            const float d = f16_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+            const uint8_t* qs = blk + 2;
+            const float* xb = x + b * 32;
+            float s = 0.0f;
+#pragma unroll 4
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t q = qs[j];
+                s += (float)((int)(q & 0xFu) - 8) * xb[j] + (float)((int)(q >> 4) - 8) * xb[j + 16];
+            }
+            acc += s * d;
+        }
+    } else if (ggml_type == 12) {  // Q4_K: 256 elems = 144 B
+        for (int b = 0; b < K / 256; ++b) {
+            const uint8_t* blk = row + (size_t)b * 144u;
+            const float d = f16_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+            const float dmin = f16_to_f32((uint16_t)blk[2] | ((uint16_t)blk[3] << 8));
+            const uint8_t* sc = blk + 4;
+            const uint8_t* qs = blk + 16;
+            const float* xb = x + b * 256;
+            for (int idx = lane; idx < 256; idx += 32) {
+                const int j64 = idx >> 6, in64 = idx & 63, sub = j64 * 2 + (in64 >> 5);
+                uint8_t sd = 0, sm = 0;
+                if (sub < 4) { sd = sc[sub] & 63u; sm = sc[sub + 4] & 63u; }
+                else { sd = (sc[sub + 4] & 0xFu) | ((sc[sub - 4] >> 6) << 4); sm = (sc[sub + 4] >> 4) | ((sc[sub] >> 6) << 4); }
+                const uint8_t byte = qs[j64 * 32 + (in64 & 31)];
+                const uint8_t q = (in64 < 32) ? (byte & 0xFu) : (byte >> 4);
+                acc += (d * (float)sd * (float)q - dmin * (float)sm) * xb[idx];
+            }
+        }
+    } else if (ggml_type == 13) {  // Q5_K: 256 elems = 176 B (d, dmin, scales[12], qh[32], qs[128])
+        for (int b = 0; b < K / 256; ++b) {
+            const uint8_t* blk = row + (size_t)b * 176u;
+            const float d = f16_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+            const float dmin = f16_to_f32((uint16_t)blk[2] | ((uint16_t)blk[3] << 8));
+            const uint8_t* sc = blk + 4;
+            const uint8_t* qh = blk + 16;
+            const uint8_t* qs = blk + 48;
+            const float* xb = x + b * 256;
+            for (int idx = lane; idx < 256; idx += 32) {
+                const int j64 = idx >> 6, in64 = idx & 63, sub = j64 * 2 + (in64 >> 5);
+                uint8_t sd = 0, sm = 0;
+                if (sub < 4) { sd = sc[sub] & 63u; sm = sc[sub + 4] & 63u; }
+                else { sd = (sc[sub + 4] & 0xFu) | ((sc[sub - 4] >> 6) << 4); sm = (sc[sub + 4] >> 4) | ((sc[sub] >> 6) << 4); }
+                const int l = in64 & 31;
+                const uint8_t byte = qs[j64 * 32 + l];
+                const uint8_t ql = (in64 < 32) ? (byte & 0xFu) : (byte >> 4);
+                const uint8_t hb = (qh[l] >> sub) & 1u;
+                const uint8_t q = ql | (hb << 4);
+                acc += (d * (float)sd * (float)q - dmin * (float)sm) * xb[idx];
+            }
+        }
+    } else if (ggml_type == 14) {  // Q6_K: 256 elems = 210 B
+        for (int b = 0; b < K / 256; ++b) {
+            const uint8_t* blk = row + (size_t)b * 210u;
+            const uint8_t* ql = blk;
+            const uint8_t* qh = blk + 128;
+            const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192);
+            const float d = f16_to_f32((uint16_t)blk[208] | ((uint16_t)blk[209] << 8));
+            const float* xb = x + b * 256;
+            for (int idx = lane; idx < 256; idx += 32) {
+                const int half = idx >> 7, r = idx & 127, qgrp = r >> 5, l = r & 31;
+                const uint8_t* qlh = ql + half * 64;
+                const uint8_t* qhh = qh + half * 32;
+                const int8_t* sch = sc + half * 8;
+                const int is = l >> 4;
+                int q = 0, sc_i = 0;
+                if (qgrp == 0)      { q = (int)((qlh[l] & 0xFu) | (((qhh[l] >> 0) & 3u) << 4)) - 32; sc_i = is + 0; }
+                else if (qgrp == 1) { q = (int)((qlh[l + 32] & 0xFu) | (((qhh[l] >> 2) & 3u) << 4)) - 32; sc_i = is + 2; }
+                else if (qgrp == 2) { q = (int)((qlh[l] >> 4) | (((qhh[l] >> 4) & 3u) << 4)) - 32; sc_i = is + 4; }
+                else                { q = (int)((qlh[l + 32] >> 4) | (((qhh[l] >> 6) & 3u) << 4)) - 32; sc_i = is + 6; }
+                acc += d * (float)sch[sc_i] * (float)q * xb[idx];
+            }
+        }
+    } else if (ggml_type == 23) {  // IQ4_XS: 256 elems = 136 B
+        for (int b = 0; b < K / 256; ++b) {
+            const uint8_t* blk = row + (size_t)b * 136u;
+            const float d = f16_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+            const uint16_t sh = (uint16_t)blk[2] | ((uint16_t)blk[3] << 8);
+            const uint8_t* sl = blk + 4;
+            const uint8_t* qs = blk + 8;
+            const float* xb = x + b * 256;
+            for (int idx = lane; idx < 256; idx += 32) {
+                const int ib = idx >> 5, in32 = idx & 31;
+                const int ls = ((sl[ib >> 1] >> (4 * (ib & 1))) & 0xFu) | (((sh >> (2 * ib)) & 3u) << 4);
+                const float dl = d * (float)(ls - 32);
+                const uint8_t byte = qs[ib * 16 + (in32 & 15)];
+                const uint8_t q = (in32 < 16) ? (byte & 0xFu) : (byte >> 4);
+                acc += dl * (float)kInkIq4NlLut[q] * xb[idx];
+            }
+        }
+    } else if (ggml_type == 39) {  // MXFP4: 32 elems = 17 B
+        for (int b = lane; b < K / 32; b += 32) {
+            const uint8_t* blk = row + (size_t)b * 17u;
+            const uint8_t e = blk[0];
+            const float d = (e < 2) ? __uint_as_float(0x00200000u << e) : __uint_as_float((uint32_t)(e - 1) << 23);
+            const uint8_t* qs = blk + 1;
+            const float* xb = x + b * 32;
+            float s = 0.0f;
+#pragma unroll 4
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t q = qs[j];
+                s += (2.0f * e2m1_nibble_to_f32(q & 0xFu)) * xb[j] + (2.0f * e2m1_nibble_to_f32(q >> 4)) * xb[j + 16];
+            }
+            acc += s * d;
+        }
+    } else if (ggml_type == 30) {  // BF16
+        const uint16_t* w = reinterpret_cast<const uint16_t*>(row);
+        for (int i = lane; i < K; i += 32) acc += bf16_to_f32(w[i]) * x[i];
+    } else if (ggml_type == 1) {   // F16
+        const uint16_t* w = reinterpret_cast<const uint16_t*>(row);
+        for (int i = lane; i < K; i += 32) acc += f16_to_f32(w[i]) * x[i];
+    } else if (ggml_type == 0) {   // F32
+        const float* w = reinterpret_cast<const float*>(row);
+        for (int i = lane; i < K; i += 32) acc += w[i] * x[i];
+    }
+    return warp_sum(acc);
+}
+
+// Grouped GGUF_RAW Gate+Up+SITU kernel (grid: (kInkInter/4, max_act), block: 128 = 4 warps)
+__global__ void __launch_bounds__(128) k_ink_moe_gu_gguf(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    InkMoeTables tb,
+    const float* __restrict__ x_f32,
+    float* __restrict__ h_out) {
+    const int ai = blockIdx.y;
+    if (ai >= *tb.nact) return;
+    const int e = tb.active[ai];
+    const InkExpertDev ex = experts[e];
+    if (ex.gu_code != FMT_GGUF_RAW) return;
+    const int f = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (f >= kInkInter) return;
+    const int lane = threadIdx.x & 31;
+    const int beg = tb.off[e];
+    const int cnt = tb.cnt[e];
+    const uint8_t* body = sec4_base + ex.body_off;
+    const InkGgufExpertHeader* hdr = reinterpret_cast<const InkGgufExpertHeader*>(body);
+    const size_t rb = ink_gguf_row_bytes(hdr->gu_type, kInkHidden);
+    const uint8_t* base = body + sizeof(InkGgufExpertHeader);
+    const uint8_t* rg = base + (size_t)f * rb;
+    const uint8_t* ru = base + (size_t)(kInkInter + f) * rb;
+    for (int k = 0; k < cnt; ++k) {
+        const int row = beg + k;
+        const float* xt = x_f32 + (size_t)tb.tok_idx[row] * kInkHidden;
+        const float g = ink_gguf_row_dot(hdr->gu_type, rg, xt, kInkHidden, lane) * hdr->gate_scale;
+        const float u = ink_gguf_row_dot(hdr->gu_type, ru, xt, kInkHidden, lane) * hdr->up_scale;
+        if (lane == 0) h_out[(size_t)row * kInkInter + f] = situ_f32(g, u);
+    }
+}
+
+// Grouped GGUF_RAW Down projection kernel (grid: (kInkHidden/4, max_act), block: 128 = 4 warps)
+__global__ void __launch_bounds__(128) k_ink_moe_dn_gguf(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    InkMoeTables tb,
+    const float* __restrict__ h_in,
+    const float* __restrict__ topk_w,
+    float* __restrict__ y_pair) {
+    const int ai = blockIdx.y;
+    if (ai >= *tb.nact) return;
+    const int e = tb.active[ai];
+    const InkExpertDev ex = experts[e];
+    if (ex.dn_code != FMT_GGUF_RAW) return;
+    const int r = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (r >= kInkHidden) return;
+    const int lane = threadIdx.x & 31;
+    const int beg = tb.off[e];
+    const int cnt = tb.cnt[e];
+    const uint8_t* body = sec4_base + ex.body_off;
+    const InkGgufExpertHeader* hdr = reinterpret_cast<const InkGgufExpertHeader*>(body);
+    const size_t rb = ink_gguf_row_bytes(hdr->dn_type, kInkInter);
+    const uint8_t* rr = body + ex.dn_off + (size_t)r * rb;
+    for (int k = 0; k < cnt; ++k) {
+        const int row = beg + k;
+        const int pair = tb.pairs[row];
+        const float* ht = h_in + (size_t)row * kInkInter;
+        const float v = ink_gguf_row_dot(hdr->dn_type, rr, ht, kInkInter, lane) * hdr->dn_scale;
+        if (lane == 0) y_pair[(size_t)pair * kInkHidden + r] = v * topk_w[pair];
+    }
+}
+#endif  // __CUDACC__
+
 // ============================================================================
 // 3. Universal Q8_1_G64 Quantizer (for S_K experts, matches sk_codecs.cpp bit-for-bit!)
 // ============================================================================
@@ -2415,10 +2702,39 @@ __global__ void __launch_bounds__(256, 4) k_ink_moe_wmma_f16_bk64(
 // 5. High-Level MoE Dispatcher (Auto-selects Blackwell sm_120a TC vs Exact FP16 TC vs INT8 TC vs WMMA sm_70/75 vs Decode!)
 // ============================================================================
 struct InkLayerMoeInfo {
-    bool has_sf4 = false;
-    bool has_mx8 = false;
-    bool has_sk  = false;
+    bool has_sf4  = false;
+    bool has_mx8  = false;
+    bool has_sk   = false;
+    bool has_gguf = false;
 };
+
+// Standalone Top-8 / 128 exact sigmoid router (shared by single-GPU, hybrid, and Dual-GPU EP!)
+inline void launch_ink_moe_router(
+    cudaStream_t st,
+    cublasHandle_t cublas,
+    const float* gate_w,
+    const float* gate_b,
+    const float* x_f32,
+    int M,
+    InkMoeWorkspace& ws,
+    float route_scale = kInkRouteScale,
+    bool force_exact_dec = false) {
+    if (M <= 16) {
+        if (M == 1)      k_ink_router_gemv_smallM<1><<<kInkExperts, 256, 0, st>>>(x_f32, gate_w, ws.r_logits, M);
+        else if (M <= 4) k_ink_router_gemv_smallM<4><<<kInkExperts, 256, 0, st>>>(x_f32, gate_w, ws.r_logits, M);
+        else if (M <= 8) k_ink_router_gemv_smallM<8><<<kInkExperts, 256, 0, st>>>(x_f32, gate_w, ws.r_logits, M);
+        else             k_ink_router_gemv_smallM<16><<<kInkExperts, 256, 0, st>>>(x_f32, gate_w, ws.r_logits, M);
+    } else {
+        const float alpha = 1.0f, beta = 0.0f;
+        INK_CUBLAS_CK(cublasGemmEx(
+            cublas, CUBLAS_OP_T, CUBLAS_OP_N, kInkExperts, M, kInkHidden, &alpha,
+            gate_w, CUDA_R_32F, kInkHidden, x_f32, CUDA_R_32F, kInkHidden, &beta,
+            ws.r_logits, CUDA_R_32F, kInkExperts,
+            (!force_exact_dec && ink_has_int8_tc()) ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+    k_ink_router_select_topk8<<<M, 32, 0, st>>>(ws.r_logits, gate_b, ws.topk_idx, ws.topk_w, route_scale, M);
+}
 
 // Shared GPU expert execution helper (bins tier<=1 experts in `experts` and writes weighted outputs to ws.y_pair)
 inline void launch_ink_moe_dispatch_only(
@@ -2444,7 +2760,7 @@ inline void launch_ink_moe_dispatch_only(
     const int max_act = std::min(P, kInkExperts);
 
     // 2A. Volta sm_70 (V100) & Turing sm_75 (2080 Ti) Zero-Spill 4-CTA/SM WMMA FP16 Tensor Core path!
-    if (use_wmma_tc) {
+    if (use_wmma_tc && (info.has_sf4 || info.has_mx8 || info.has_sk)) {
         const int mt = ink_moe_max_tiles(M, tile_rows);
         if (tile_rows <= 16) {
             const unsigned grid = (unsigned)std::min(std::max(1, mt * 18), 2048);
@@ -2469,11 +2785,11 @@ inline void launch_ink_moe_dispatch_only(
                 k_ink_moe_wmma_f16_bk64<false, true><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
             }
         }
-        return;
+        if (!info.has_gguf) return;
     }
 
     // 2B. Dispatch SF4 & MX8 experts (Blackwell sm_120a TC for M>=16 prefill, exact FP16 TC for M>=16 sm_80..89, 8-lane uint4 for M<16!)
-    if (info.has_sf4 || info.has_mx8) {
+    if (!use_wmma_tc && (info.has_sf4 || info.has_mx8)) {
         if (use_sm120_tc) {
             const int mt = ink_moe_max_tiles(M, tile_rows);
             if (info.has_sf4) {
@@ -2504,7 +2820,7 @@ inline void launch_ink_moe_dispatch_only(
     }
 
     // 2C. Dispatch S_K experts (Coalesced sm_80..sm_121 INT8 TC for M>=16, 4-lane zero-shuffle 32-feat/CTA dp4a_i8 for M<16!)
-    if (info.has_sk) {
+    if (!use_wmma_tc && info.has_sk) {
         if (!quant_x_done) {
             const int nblk_x = M * (kInkHidden / 64);
             k_ink_quant_q8_1<<<(nblk_x + 7) / 8, 256, 0, st>>>(x_f32, ws.xq_sk, M, kInkHidden);
@@ -2530,6 +2846,14 @@ inline void launch_ink_moe_dispatch_only(
             else              k_ink_moe_dn_sk<16><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
         }
     }
+
+    // 2D. Dispatch native GGUF_RAW experts (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4, BF16, F16, F32)
+    if (info.has_gguf) {
+        dim3 g_gu(kInkInter / 4, max_act);
+        dim3 g_dn(kInkHidden / 4, max_act);
+        k_ink_moe_gu_gguf<<<g_gu, 128, 0, st>>>(sec4_base, experts, ws.tb, x_f32, ws.h_f32);
+        k_ink_moe_dn_gguf<<<g_dn, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
+    }
 }
 
 inline void launch_ink_moe(
@@ -2548,21 +2872,7 @@ inline void launch_ink_moe(
     bool force_exact_dec = false,
     bool run_reduce8 = true) {
     // 1. Exact Top-8 / 128 sigmoid router
-    if (M <= 16) {
-        if (M == 1)      k_ink_router_gemv_smallM<1><<<kInkExperts, 256, 0, st>>>(x_f32, gate_w, ws.r_logits, M);
-        else if (M <= 4) k_ink_router_gemv_smallM<4><<<kInkExperts, 256, 0, st>>>(x_f32, gate_w, ws.r_logits, M);
-        else if (M <= 8) k_ink_router_gemv_smallM<8><<<kInkExperts, 256, 0, st>>>(x_f32, gate_w, ws.r_logits, M);
-        else             k_ink_router_gemv_smallM<16><<<kInkExperts, 256, 0, st>>>(x_f32, gate_w, ws.r_logits, M);
-    } else {
-        const float alpha = 1.0f, beta = 0.0f;
-        INK_CUBLAS_CK(cublasGemmEx(
-            cublas, CUBLAS_OP_T, CUBLAS_OP_N, kInkExperts, M, kInkHidden, &alpha,
-            gate_w, CUDA_R_32F, kInkHidden, x_f32, CUDA_R_32F, kInkHidden, &beta,
-            ws.r_logits, CUDA_R_32F, kInkExperts,
-            (!force_exact_dec && ink_has_int8_tc()) ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    }
-    k_ink_router_select_topk8<<<M, 32, 0, st>>>(ws.r_logits, gate_b, ws.topk_idx, ws.topk_w, route_scale, M);
+    launch_ink_moe_router(st, cublas, gate_w, gate_b, x_f32, M, ws, route_scale, force_exact_dec);
 
     // 2. Dispatch GPU-resident experts
     launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false);

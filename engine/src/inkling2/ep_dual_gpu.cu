@@ -1028,8 +1028,11 @@ public:
             EP_CK(cudaMalloc(&d_y_buf_[g], max_tok * c_.hidden * sizeof(float)));
         }
         EP_CK(cudaSetDevice(gpu_ids_[0]));
-        EP_CK(cudaMalloc(&d_dense_x_, max_tok * c_.hidden * sizeof(float)));
-        EP_CK(cudaMalloc(&d_dense_y_, max_tok * std::max(c_.vocab_unpadded, c_.n_head * c_.head_dim) * sizeof(float)));
+        const size_t max_dense_k = static_cast<size_t>(std::max(c_.hidden, c_.n_head * c_.head_dim));
+        const size_t max_dense_n = static_cast<size_t>(std::max(std::max(c_.vocab_unpadded, c_.n_head * c_.head_dim),
+                                                                std::max(c_.hidden, c_.n_experts)));
+        EP_CK(cudaMalloc(&d_dense_x_, max_tok * max_dense_k * sizeof(float)));
+        EP_CK(cudaMalloc(&d_dense_y_, max_tok * max_dense_n * sizeof(float)));
 
         // Start NUMA Doorbell CPU pool if hybrid doorbell offload is active
         if (doorbell_active_) {
@@ -1663,6 +1666,7 @@ private:
             }
             doorbell_active_ = false;
         }
+        if (n_gpus_ > 0) cudaSetDevice(gpu_ids_[0]);
         for (auto& kv : d_mats_bf16_) if (kv.second) cudaFree(kv.second);
         d_mats_bf16_.clear();
         if (d_unembed_bf16_) { cudaFree(d_unembed_bf16_); d_unembed_bf16_ = nullptr; }
@@ -1736,16 +1740,23 @@ private:
 
     bool gpu_dense_proj(const float* x, const std::string& wname, float* y, int M, int N, int K, std::string& err) {
         auto it = d_mats_bf16_.find(wname);
-        if (it == d_mats_bf16_.end() || M > kMaxParallelSlots || K > c_.n_head * c_.head_dim) {
+        const int max_k = std::max(c_.hidden, c_.n_head * c_.head_dim);
+        const int max_n = std::max(std::max(c_.vocab_unpadded, c_.n_head * c_.head_dim), std::max(c_.hidden, c_.n_experts));
+        if (it == d_mats_bf16_.end() || K > max_k || N > max_n) {
             cpu_matmul(x, trunk_f32_.at(wname).data(), y, M, N, K);
             return true;
         }
         EP_CK(cudaSetDevice(gpu_ids_[0]));
-        EP_CK(cudaMemcpyAsync(d_dense_x_, x, static_cast<size_t>(M) * K * 4, cudaMemcpyHostToDevice, streams_[0]));
-        dim3 grid((N + 7) / 8, M);
-        k_bf16_matmul<<<grid, 256, 0, streams_[0]>>>(d_dense_x_, it->second, d_dense_y_, M, N, K);
-        EP_CK(cudaMemcpyAsync(y, d_dense_y_, static_cast<size_t>(M) * N * 4, cudaMemcpyDeviceToHost, streams_[0]));
-        EP_CK(cudaStreamSynchronize(streams_[0]));
+        for (int m0 = 0; m0 < M; m0 += kMaxParallelSlots) {
+            const int cm = std::min(kMaxParallelSlots, M - m0);
+            EP_CK(cudaMemcpyAsync(d_dense_x_, x + static_cast<size_t>(m0) * K,
+                                  static_cast<size_t>(cm) * K * sizeof(float), cudaMemcpyHostToDevice, streams_[0]));
+            dim3 grid((N + 7) / 8, cm);
+            k_bf16_matmul<<<grid, 256, 0, streams_[0]>>>(d_dense_x_, it->second, d_dense_y_, cm, N, K);
+            EP_CK(cudaMemcpyAsync(y + static_cast<size_t>(m0) * N, d_dense_y_,
+                                  static_cast<size_t>(cm) * N * sizeof(float), cudaMemcpyDeviceToHost, streams_[0]));
+            EP_CK(cudaStreamSynchronize(streams_[0]));
+        }
         (void)err;
         return true;
     }
@@ -1805,7 +1816,7 @@ private:
                 std::memcpy(jb.xe.data() + static_cast<size_t>(t) * D,
                             mlp_in.data() + static_cast<size_t>(exp_tokens[e][t].first) * D, D * 4);
             }
-            if (de.resident && jb.m <= kMaxParallelSlots) {
+            if (de.resident) {
                 gpu_jobs[de.owner_gpu].push_back(std::move(jb));
             } else {
                 host_jobs.push_back(std::move(jb));
@@ -1858,22 +1869,36 @@ private:
             }
         }
 
-        // Launch GPU 0 and GPU 1 jobs concurrently (each GPU runs its own experts in VRAM!)
+        // Launch GPU 0 and GPU 1 jobs concurrently (each GPU runs its own experts in VRAM, chunked to kMaxParallelSlots)
         size_t max_jobs = std::max(gpu_jobs[0].size(), gpu_jobs[1].size());
         for (size_t idx = 0; idx < max_jobs; ++idx) {
-            for (int g = 0; g < n_gpus_; ++g) {
-                if (idx >= gpu_jobs[g].size()) continue;
-                auto& jb = gpu_jobs[g][idx];
-                const auto& de = experts_[ip * c_.n_experts + jb.eid];
-                EP_CK(cudaSetDevice(gpu_ids_[g]));
-                EP_CK(cudaMemcpyAsync(d_x_buf_[g], jb.xe.data(), jb.xe.size() * 4, cudaMemcpyHostToDevice, streams_[g]));
-                launch_gpu_expert(g, de, jb.m);
-                EP_CK(cudaMemcpyAsync(jb.ye.data(), d_y_buf_[g], jb.ye.size() * 4, cudaMemcpyDeviceToHost, streams_[g]));
-            }
+            int max_chunks = 0;
             for (int g = 0; g < n_gpus_; ++g) {
                 if (idx < gpu_jobs[g].size()) {
+                    const int nc = (gpu_jobs[g][idx].m + kMaxParallelSlots - 1) / kMaxParallelSlots;
+                    if (nc > max_chunks) max_chunks = nc;
+                }
+            }
+            for (int ci = 0; ci < max_chunks; ++ci) {
+                const int off = ci * kMaxParallelSlots;
+                for (int g = 0; g < n_gpus_; ++g) {
+                    if (idx >= gpu_jobs[g].size()) continue;
+                    auto& jb = gpu_jobs[g][idx];
+                    if (off >= jb.m) continue;
+                    const int cm = std::min(kMaxParallelSlots, jb.m - off);
+                    const auto& de = experts_[ip * c_.n_experts + jb.eid];
                     EP_CK(cudaSetDevice(gpu_ids_[g]));
-                    EP_CK(cudaStreamSynchronize(streams_[g]));
+                    EP_CK(cudaMemcpyAsync(d_x_buf_[g], jb.xe.data() + static_cast<size_t>(off) * D,
+                                          static_cast<size_t>(cm) * D * sizeof(float), cudaMemcpyHostToDevice, streams_[g]));
+                    launch_gpu_expert(g, de, cm);
+                    EP_CK(cudaMemcpyAsync(jb.ye.data() + static_cast<size_t>(off) * D, d_y_buf_[g],
+                                          static_cast<size_t>(cm) * D * sizeof(float), cudaMemcpyDeviceToHost, streams_[g]));
+                }
+                for (int g = 0; g < n_gpus_; ++g) {
+                    if (idx < gpu_jobs[g].size() && off < gpu_jobs[g][idx].m) {
+                        EP_CK(cudaSetDevice(gpu_ids_[g]));
+                        EP_CK(cudaStreamSynchronize(streams_[g]));
+                    }
                 }
             }
         }
@@ -1903,6 +1928,10 @@ private:
             for (auto& jb : host_jobs) {
                 const int key = ip * c_.n_experts + jb.eid;
                 const auto& hd = host_descs_[key];
+                if (hd.body == nullptr) {
+                    err = "cuda-ep: missing host body for non-resident expert " + std::to_string(key);
+                    return false;
+                }
                 eval_inkling2_expert_batch(hd.body, static_cast<SkCode>(hd.gu_code), static_cast<SkCode>(hd.dn_code),
                                            hd.dn_offset, jb.xe.data(), static_cast<size_t>(jb.m), D, c_.inter, jb.ye.data());
             }

@@ -16,6 +16,10 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+// MERGED from kuraneko1/Strata (MIT, kuraneko1/_ryu15_): two-axis SM x VRAM
+// automatic profile selection. Credit: kuraneko1 (_ryu15_), kuraneko1/Strata (MIT).
+#include "strata/inkling2/profile_rules.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -72,6 +76,17 @@ inline int current_sm_arch(int dev = 0) {
         cached_sm = p.major * 10 + p.minor;
     }
     return cached_sm;
+}
+
+// MERGED from kuraneko1/Strata (MIT): select the measured SM x VRAM profile for
+// this GPU. Returns a pure-C++ table entry (no CUDA dependency in its own TU);
+// unmeasured cards take the conservative Generic defaults. Explicit CLI flags /
+// env overrides still win at the caller, per Strata's measured-only rule.
+inline strata::inkling2::ArchProfile current_arch_profile(int dev = 0) {
+    const int sm = current_sm_arch(dev);
+    if (sm <= 0) return strata::inkling2::select_arch_profile(0, 0);
+    const int major = sm / 10, minor = sm % 10;
+    return strata::inkling2::select_arch_profile(major, minor);
 }
 
 // Unified-Memory-safe VRAM query: on Linux integrated GPUs (e.g. DGX Spark GB10 sm_121 128 GB UMA),
@@ -157,6 +172,7 @@ enum InkFmt : int {
     FMT_S8_K  = 8,
     FMT_SF4   = 15,
     FMT_MX8   = 16,
+    FMT_GGUF_RAW = 20,
     FMT_Q8ROW = 100,
     FMT_F32   = 101,
     FMT_BF16  = 102,
