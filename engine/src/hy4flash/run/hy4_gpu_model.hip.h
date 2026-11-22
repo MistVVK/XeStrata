@@ -127,6 +127,7 @@ struct ExpertRef {  // per (moe_layer, expert id); offsets relative to the arena
 
 struct PeerGpu {
     int dev = 0;
+    bool can_p2p = false;
     uint8_t* d_sec4 = nullptr;
     uint64_t vram_bytes = 0, n_experts = 0;
     std::vector<ExpertRef> experts;  // [41*512], tier=0 on this peer, tier=4 elsewhere
@@ -137,9 +138,15 @@ struct GpuModel {
     strata::artifact::StrataFileReader rd;
     std::string path;
     int primary_gpu = 0;
+    int planned_chunk = 2048;
     bool has_vision = false;
+    double vram_experts_gb_cap = -1.0;  // >= 0: --vram-experts-gb total cap across all selected GPUs (GiB)
+    double ram_experts_gb_cap = -1.0;   // >= 0: --ram-experts-gb host RAM cap (GiB)
     std::vector<int> peer_devs;   // secondary GPU device ids for multi-GPU expert split (--gpus 0,1,...)
     std::vector<PeerGpu> peers;
+#ifdef STRATA_HY4_DISTRIBUTED
+    int expert_shard = -1;
+#endif
     uint8_t* d_trunk = nullptr;   // Section 1
     uint8_t* d_sec4 = nullptr;    // Section 4 (expert bodies), 4 KiB aligned bodies, same offsets as the file's directory
     uint64_t trunk_bytes = 0, sec4_bytes = 0;
@@ -173,6 +180,66 @@ struct GpuModel {
         return d_trunk + man.get(name).off;
     }
 };
+
+#ifdef STRATA_HY4_DISTRIBUTED
+// The directory stores hotness order within each layer. Alternate ranks so both
+// GPUs receive a mix of hot and cold experts without changing routed expert IDs.
+inline bool load_expert_shard(GpuModel& g, const std::string& path, size_t budget, std::string& err) {
+    const auto& dir = g.rd.expert_directory();
+    const auto& section = g.rd.header().sections[4];
+    constexpr size_t count = 41 * 512;
+    if (dir.size() != count) { err = "Hy4 expert directory has the wrong geometry"; return false; }
+    g.experts.assign(count, ExpertRef{0, 0, 0, 0, 4});
+    g.expert_rank.assign(count, -1);
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const auto& e = dir[i];
+        const size_t idx = (i / 512) * 512 + e.expert_id;
+        if (e.expert_id >= 512 || g.expert_rank[idx] != -1) { err = "invalid Hy4 expert ID"; return false; }
+        if (e.dn_offset >= e.body_bytes || e.body_offset > section.byte_length || e.body_bytes > section.byte_length - e.body_offset) {
+            err = "Hy4 expert body lies outside its data section";
+            return false;
+        }
+        g.expert_rank[idx] = int(i % 512);
+        if ((i & 1) != size_t(g.expert_shard)) continue;
+        g.experts[idx] = ExpertRef{bytes, e.dn_offset, e.gu_code_id, e.dn_code_id, 0};
+        bytes += (uint64_t(e.body_bytes) + 4095) & ~4095ull;
+    }
+    if (!bytes || bytes > budget) { err = "Hy4 expert shard exceeds the local GPU memory budget"; return false; }
+    const hipError_t allocation = hipMalloc((void**)&g.d_sec4, bytes);
+    if (allocation != hipSuccess) { err = hipGetErrorString(allocation); return false; }
+    const double started = now_s();
+    std::atomic<bool> failed{false};
+    std::atomic<size_t> next{size_t(g.expert_shard)};
+    std::vector<std::jthread> threads;
+    for (int t = 0; t < 4; ++t) threads.emplace_back([&] {
+      try {
+        if (hipSetDevice(g.primary_gpu) != hipSuccess) { failed = true; return; }
+        AlignedFile file;
+        if (!file.open(path, false)) { failed = true; return; }
+        std::vector<uint8_t> staging;
+        for (size_t i; !failed && (i = next.fetch_add(2)) < count;) {
+            const auto& e = dir[i];
+            const auto& local = g.experts[(i / 512) * 512 + e.expert_id];
+            staging.resize(e.body_bytes);
+            if (file.read_at(section.file_offset + e.body_offset, staging.data(), staging.size()) != staging.size() ||
+                hipMemcpy(g.d_sec4 + local.body_off, staging.data(), staging.size(), hipMemcpyHostToDevice) != hipSuccess) {
+                failed = true;
+                break;
+            }
+        }
+      } catch (const std::exception&) { failed = true; }
+    });
+    for (auto& thread : threads) thread.join();
+    if (failed) { hipFree(g.d_sec4); g.d_sec4 = nullptr; err = "Hy4 expert shard loading failed"; return false; }
+    g.n_vram_experts = count / 2;
+    g.vram_expert_bytes = bytes;
+    g.t_load_experts = now_s() - started;
+    fprintf(stderr, "[load] rank %d: %llu local experts, %.2f GB in %.1f s\n", g.expert_shard,
+            (unsigned long long)g.n_vram_experts, bytes / 1e9, g.t_load_experts);
+    return true;
+}
+#endif
 
 // Parallel direct read into a host-accessible buffer (used for UMA zero-copy mapped load).
 inline void read_file_parallel(const std::string& path, uint64_t file_off, uint64_t bytes, uint8_t* dst, double* seconds, const char* what) {
@@ -337,8 +404,9 @@ inline void hy4_setenv(const char* k, const char* v, int) {
 #endif
 }
 
-inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& model_path, bool multi_gpu = false) {
+inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& model_path, bool multi_gpu = false, bool has_vision = false, int n_peers = 0, size_t min_peer_total = 0) {
     const double GB = 1e9, tot = (double)total / GB;
+    const double min_card_gb = (multi_gpu && min_peer_total > 0) ? std::min(tot, (double)min_peer_total / GB) : tot;
     double trunk = 5.92, sec4_gb = 0.0;
     if (!model_path.empty()) {
         strata::artifact::StrataFileReader rd;
@@ -376,7 +444,10 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     if (chunk <= 0) {
         // 16 GB+ cards default to Tc = 8192 when ctx >= 8192 (halves PCIe passes 32->16 at 128K; capped to 4096 for <=4K sessions to maximize expert cache!).
         // Multi-GPU 32 GB static EP at >=96K context uses Tc = 2048 so 100% of SQ-64 experts + full 128K KV fit in HBM2 (e.g. 2x V100 32 GB).
+        // Heterogeneous multi-GPU with a smaller peer card (< 14 GB, e.g. 2x V100 16 GB + TITAN V 12 GB) caps Tc <= 4096 so peer moe_ws stays <= 0.6 GB.
         int c = (multi_gpu && max_ctx >= 98304 && tot < 40.0) ? 2048 : ((tot >= 15.0) ? ((max_ctx >= 8192) ? 8192 : 4096) : (tot >= 11.0 ? 2048 : 1024));
+        if (multi_gpu && min_card_gb < 14.0 && c > 4096) c = 4096;
+        if (multi_gpu && min_card_gb < 10.0 && c > 2048) c = 2048;
         const double work_cap = (tot >= 15.0) ? 0.22 : 0.16;
         while (c > 256 && est_work_gb(c) > work_cap * tot) c >>= 1;
         while (c > 256 && trunk + est_work_gb(c) + kv_init_gb + wkv + cublas_gb + 0.55 > tot) c >>= 1;
@@ -424,7 +495,11 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
     if (!getenv("HY4_RESERVE_GB")) {
         const double kv_res = (mask & 1) ? 0.0 : (init_slots < max_ctx ? kv_init_gb : (dev_pos ? dev_pos * per_pos / GB : (rows + pivg)));
         const double pf_res = (tot >= 21.5 && tot < 64.0 && mask == 0) ? 0.82 : ((tot >= 10.0 && tot < 64.0 && mask == 0) ? 0.56 : 0.0);  // 2 x 384 MiB (>= 21.5 GiB) or 2 x 256 MiB device scratch for prefill streaming
-        const double reserve = work_gb + kv_res + wkv + cublas_gb + pf_res + 0.45;
+        const double vis_res = (multi_gpu && has_vision) ? 1.15 : 0.0;  // multi-GPU static EP has no dynamic vcache slabs to reclaim on first image
+        const int eff_peers = std::max(n_peers, multi_gpu ? 1 : 0);
+        // Primary-GPU headroom for peer output buffers (d_zpeer0), DFly2 buffers, batch-invariant MLA workspace, and CUDA Graph capture handles
+        const double peer_graph_res = multi_gpu ? ((double)eff_peers * ((double)chunk * 1536.0 * 4.0 / GB + 0.05) + 0.25) : 0.15;
+        const double reserve = work_gb + kv_res + wkv + cublas_gb + pf_res + vis_res + peer_graph_res + 0.45;
         char b[32];
         snprintf(b, sizeof b, "%.2f", reserve);
         hy4_setenv("HY4_RESERVE_GB", b, 1);
@@ -472,6 +547,119 @@ inline double host_mem_gb() {
 #endif
 }
 
+#if HY4_CUDA || HY4_HIP_PEERS
+// Returns false on Linux when two CUDA GPUs sit behind separate PCIe root ports (PHB / SYS) without
+// NVLink / native P2P atomics. Avoiding cudaDeviceEnablePeerAccess + cudaMemcpyPeer on PHB/ACS boards
+// (e.g. 2x RTX A4000) prevents faulting the peer GPU's context or hitting ~98 ms/copy PHB stalls.
+inline bool p2p_topology_safe(int dev0, int dev1) {
+    if (const char* fp = getenv("HY4_PEER_FORCE_P2P"); fp && atoi(fp) != 0) return true;
+#if HY4_CUDA
+    int atomic_ok = 0;
+    if (cudaDeviceGetP2PAttribute(&atomic_ok, cudaDevP2PAttrNativeAtomicSupported, dev0, dev1) == cudaSuccess && atomic_ok) {
+        return true;  // NVLink or true hardware P2P switch with native atomics
+    }
+    (void)cudaGetLastError();
+#if defined(__linux__)
+    auto ancestors = [](int d) -> std::vector<std::string> {
+        char bdf[64] = {};
+        if (cudaDeviceGetPCIBusId(bdf, sizeof(bdf), d) != cudaSuccess) { (void)cudaGetLastError(); return {}; }
+        for (char* p = bdf; *p; ++p) if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+        std::string sys = std::string("/sys/bus/pci/devices/") + bdf;
+        char resolved[4096] = {};
+        if (!realpath(sys.c_str(), resolved)) return {};
+        std::vector<std::string> parts;
+        std::string s(resolved);
+        size_t pos = 0;
+        while (pos < s.size()) {
+            size_t nxt = s.find('/', pos);
+            if (nxt == std::string::npos) nxt = s.size();
+            if (nxt > pos) parts.push_back(s.substr(pos, nxt - pos));
+            pos = nxt + 1;
+        }
+        if (!parts.empty()) parts.pop_back();
+        return parts;
+    };
+    const auto a0 = ancestors(dev0), a1 = ancestors(dev1);
+    if (!a0.empty() && !a1.empty()) {
+        size_t common_bridges = 0;
+        const size_t n = std::min(a0.size(), a1.size());
+        for (size_t i = 0; i < n && a0[i] == a1[i]; ++i) {
+            if (a0[i].find(':') != std::string::npos && a0[i].find('.') != std::string::npos) ++common_bridges;
+        }
+        if (common_bridges == 0) return false;  // PHB / NODE / SYS (no shared PCIe switch)
+    }
+#endif
+#endif
+    return true;
+}
+
+// Verify that peer access actually moves data both ways AND is fast (not a broken/stalling PHB):
+// some PCIe host-bridge ("PHB") pairs (e.g. 2x RTX A4000 behind CPU root complex) report
+// hipDeviceCanAccessPeer==1 and succeed on hipDeviceEnablePeerAccess, yet hipMemcpyPeerAsync either
+// leaves destination buffers zeroed/corrupt OR stalls at ~98 ms/copy (8.1 s/step across 41 layers vs
+// ~25 us for portable host-pinned DMA). Test the exact async peer copy path both ways and require
+// both bit-exact data integrity and <= 2.0 ms per 64 KiB roundtrip.
+inline bool p2p_probe_pair(int dev0, int dev1, double* out_ms = nullptr) {
+    constexpr size_t kN = 1 << 14;  // 64 KiB
+    std::vector<uint32_t> h(kN), back(kN);
+    for (size_t i = 0; i < kN; ++i) h[i] = 0x9e3779b9u ^ (uint32_t)(i * 2654435761u);
+    uint32_t* d[2] = {nullptr, nullptr};
+    hipStream_t st[2] = {nullptr, nullptr};
+    const int dev[2] = {dev0, dev1};
+    bool ok = true, tested = true;
+    for (int k = 0; k < 2 && tested; ++k) {
+        if (hipSetDevice(dev[k]) != hipSuccess ||
+            hipMalloc((void**)&d[k], kN * 4) != hipSuccess ||
+            hipStreamCreate(&st[k]) != hipSuccess) {
+            (void)hipGetLastError();
+            tested = false;
+        }
+    }
+    double total_copy_ms = 0.0;
+    for (int dir = 0; dir < 2 && tested && ok; ++dir) {
+        const int from = dir == 0 ? 0 : 1, to = 1 - from;
+        if (hipSetDevice(dev[from]) != hipSuccess ||
+            hipMemcpy(d[from], h.data(), kN * 4, hipMemcpyHostToDevice) != hipSuccess) {
+            tested = false;
+            break;
+        }
+        if (hipSetDevice(dev[to]) != hipSuccess ||
+            hipMemset(d[to], 0, kN * 4) != hipSuccess) {
+            tested = false;
+            break;
+        }
+        const double t0 = now_s();
+        if (hipMemcpyPeerAsync(d[to], dev[to], d[from], dev[from], kN * 4, st[to]) != hipSuccess ||
+            hipStreamSynchronize(st[to]) != hipSuccess) {
+            tested = false;
+            break;
+        }
+        total_copy_ms += (now_s() - t0) * 1000.0;
+        if (hipMemcpy(back.data(), d[to], kN * 4, hipMemcpyDeviceToHost) != hipSuccess) {
+            tested = false;
+            break;
+        }
+        ok = std::memcmp(back.data(), h.data(), kN * 4) == 0;
+        if (total_copy_ms > 5.0) break;  // early-exit slow PHB stall before wasting a second direction
+    }
+    for (int k = 0; k < 2; ++k) {
+        (void)hipSetDevice(dev[k]);
+        if (st[k]) (void)hipStreamDestroy(st[k]);
+        if (d[k]) (void)hipFree(d[k]);
+    }
+    (void)hipSetDevice(dev0);
+    if (out_ms) *out_ms = total_copy_ms;
+    if (!tested) {
+        (void)hipGetLastError();
+        return false;
+    }
+    if (!ok) return false;
+    const char* force_p2p = getenv("HY4_PEER_FORCE_P2P");
+    if (!(force_p2p && atoi(force_p2p) != 0) && total_copy_ms > 2.0) return false;
+    return true;
+}
+#endif
+
 // Expert tiering for cards that cannot hold Section 4: the hottest ranks (rank-major over the 41 layers, Section 4 is stored hot to cold) go to a device arena,
 // every other expert goes to pinned, device-mapped host memory that the GPU reads directly (zero-copy over PCIe). Each expert's body_off is rewritten as the
 // (wrapping) distance of its final address from g.d_sec4, so the kernels keep their `sec4 + body_off` addressing and need no change.
@@ -496,6 +684,9 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
             const double need = getenv("HY4_HOST_NEED_GB") ? atof(getenv("HY4_HOST_NEED_GB")) : 0.0;
             const double vis_extra = (cgroup_limited && g.has_vision) ? 1.5 : 0.0;  // vision shard (0.93 GB) + serve/server.py RSS inside cgroup limit
             ram_budget_gb = lim_gb - 3.5 - need - 1.5 - vis_extra;  // OS and runtime, host KV / kv_b copies, engram cache + pinned staging
+            if (g.ram_experts_gb_cap >= 0.0) {
+                ram_budget_gb = std::min(ram_budget_gb, g.ram_experts_gb_cap);
+            }
         }
     }
     const uint64_t ram_budget_bytes = ram_budget_gb > 0 ? (uint64_t)(ram_budget_gb * 1e9) : 0;
@@ -526,22 +717,84 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
         static_budget = vram_budget - dyn_bytes;
     }
     vcap[0] = static_budget;
-#if HY4_CUDA
+    std::vector<bool> peer_p2p(g.peer_devs.size(), false);
+#if HY4_CUDA || HY4_HIP_PEERS
+    const bool force_no_p2p = getenv("HY4_PEER_NO_P2P") && atoi(getenv("HY4_PEER_NO_P2P")) != 0;
+    // Per-peer reserve covers exact moe_ws_bytes(Tc) + z_h/idx/w/zout + 41-layer CUDA Graph capture + driver context headroom
+    const size_t chunk_ws = (size_t)std::max(g.planned_chunk, 1024) * 16ull * 1536ull * 6ull +
+                            (size_t)std::max(g.planned_chunk, 1024) * 1536ull * 10ull + (512ull << 20);
+    const char* reserve_mb = getenv("HY4_PEER_RESERVE_MB");
+    const size_t preserve = (reserve_mb && atoi(reserve_mb) > 0)
+        ? ((size_t)atoi(reserve_mb) << 20)
+        : std::max<size_t>((size_t)1024 << 20, chunk_ws);
     for (size_t p = 0; p < g.peer_devs.size(); ++p) {
         const int pd = g.peer_devs[p];
         HCK(hipSetDevice(pd));
         size_t pfr = 0, ptot = 0;
         HCK(hipMemGetInfo(&pfr, &ptot));
-        const size_t preserve = (size_t)960 << 20;  // 960 MiB for peer moe_ws (604 MiB at Tc=4096) + buffers + runtime
         vcap[1 + p] = pfr > preserve ? (uint64_t)(pfr - preserve) : 0;
-        int can = 0;
-        if (cudaDeviceCanAccessPeer(&can, g.primary_gpu, pd) == cudaSuccess && can) {
-            (void)cudaSetDevice(g.primary_gpu); (void)cudaDeviceEnablePeerAccess(pd, 0); (void)cudaGetLastError();
-            (void)cudaSetDevice(pd); (void)cudaDeviceEnablePeerAccess(g.primary_gpu, 0); (void)cudaGetLastError();
+        if (vcap[1 + p] == 0) {
+            fprintf(stderr, "[load] peer GPU%d free %.2f GiB <= required reserve %.2f GiB (chunk=%d); placing 0 experts on GPU%d\n",
+                    pd, pfr / 1073741824.0, preserve / 1073741824.0, g.planned_chunk, pd);
+        }
+        int can01 = 0, can10 = 0;
+        if (!force_no_p2p &&
+            hipDeviceCanAccessPeer(&can01, g.primary_gpu, pd) == hipSuccess && can01 &&
+            hipDeviceCanAccessPeer(&can10, pd, g.primary_gpu) == hipSuccess && can10) {
+            if (!p2p_topology_safe(g.primary_gpu, pd)) {
+                fprintf(stderr,
+                        "hy4: gpu %d <-> gpu %d: GPUs sit behind a PCIe host bridge (PHB/SYS, no shared PCIe switch or NVLink); "
+                        "using portable host-pinned bounce (HY4_PEER_FORCE_P2P=1 overrides)\n",
+                        g.primary_gpu, pd);
+                peer_p2p[p] = false;
+                continue;
+            }
+            HCK(hipSetDevice(g.primary_gpu));
+            hipError_t e0 = hipDeviceEnablePeerAccess(pd, 0);
+            if (e0 != hipSuccess) (void)hipGetLastError();
+            HCK(hipSetDevice(pd));
+            hipError_t e1 = hipDeviceEnablePeerAccess(g.primary_gpu, 0);
+            if (e1 != hipSuccess) (void)hipGetLastError();
+            // Treat both hipSuccess and PeerAccessAlreadyEnabled as P2P enabled, then verify data integrity
+            const bool ok0 = (e0 == hipSuccess || e0 == hipErrorPeerAccessAlreadyEnabled);
+            const bool ok1 = (e1 == hipSuccess || e1 == hipErrorPeerAccessAlreadyEnabled);
+            bool p2p_ok = ok0 && ok1;
+            double p2p_ms = 0.0;
+            if (p2p_ok && !p2p_probe_pair(g.primary_gpu, pd, &p2p_ms)) {
+                fprintf(stderr,
+                        "hy4: gpu %d <-> gpu %d: peer access enabled but round-trip async P2P probe failed "
+                        "(%.2f ms; PCIe host bridge / ACS); falling back to portable host-pinned bounce\n",
+                        g.primary_gpu, pd, p2p_ms);
+                (void)hipSetDevice(g.primary_gpu);
+                (void)hipDeviceDisablePeerAccess(pd);
+                (void)hipGetLastError();
+                (void)hipSetDevice(pd);
+                (void)hipDeviceDisablePeerAccess(g.primary_gpu);
+                (void)hipGetLastError();
+                p2p_ok = false;
+            }
+            peer_p2p[p] = p2p_ok;
         }
     }
     HCK(hipSetDevice(g.primary_gpu));
 #endif
+    if (g.vram_experts_gb_cap >= 0.0) {
+        const uint64_t total_cap_b = (uint64_t)(g.vram_experts_gb_cap * 1073741824.0);
+        uint64_t sum_vcap = 0;
+        for (size_t gi = 0; gi < ng; ++gi) sum_vcap += vcap[gi];
+        if (sum_vcap > total_cap_b) {
+            const double scale = sum_vcap > 0 ? ((double)total_cap_b / (double)sum_vcap) : 0.0;
+            for (size_t gi = 0; gi < ng; ++gi) {
+                vcap[gi] = (uint64_t)((double)vcap[gi] * scale);
+            }
+            fprintf(stderr, "[load] --vram-experts-gb %.2f cap applied across %zu GPU(s):", g.vram_experts_gb_cap, ng);
+            for (size_t gi = 0; gi < ng; ++gi) {
+                const int dev = gi == 0 ? g.primary_gpu : g.peer_devs[gi - 1];
+                fprintf(stderr, " GPU%d<=%.2fGiB", dev, vcap[gi] / 1073741824.0);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     uint64_t hb = 0;
     for (size_t r = 0; r < 512; ++r) {
         bool any_placed = false;
@@ -624,6 +877,7 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     g.peers.resize(g.peer_devs.size());
     for (size_t p = 0; p < g.peer_devs.size(); ++p) {
         g.peers[p].dev = g.peer_devs[p];
+        g.peers[p].can_p2p = peer_p2p[p];
         g.peers[p].vram_bytes = vb_gpu[1 + p];
         g.peers[p].n_experts = nv_gpu[1 + p];
         g.peers[p].experts.assign(41 * 512, ExpertRef{0, 0, 0, 0, 4});
@@ -822,6 +1076,17 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
         fprintf(stderr, "sec2: %s\n", err.c_str());
         return false;
     }
+#ifdef STRATA_HY4_DISTRIBUTED
+    if (g.expert_shard >= 0) {
+        size_t free_bytes = 0, total = 0;
+        gpu_mem_avail(free_bytes, total);
+        const char* reserve = getenv("HY4_RESERVE_GB");
+        const double budget = double(free_bytes) - (reserve ? atof(reserve) : 6.0) * 1073741824.0;
+        if (load_expert_shard(g, path, budget > 0 ? size_t(budget) : 0, err)) return true;
+        fprintf(stderr, "experts: %s\n", err.c_str());
+        return false;
+    }
+#endif
     const auto& dir = g.rd.expert_directory();
     g.experts.assign(41 * 512, ExpertRef{0, 0, 0, 0});
     g.expert_rank.assign(41 * 512, 511);
@@ -838,6 +1103,9 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
         double reserve_gb = getenv("HY4_RESERVE_GB") ? atof(getenv("HY4_RESERVE_GB")) : 6.0;
         double budget = (double)fr - reserve_gb * 1073741824.0;
         if (getenv("HY4_EXPERT_VRAM_GB")) budget = atof(getenv("HY4_EXPERT_VRAM_GB")) * 1073741824.0;
+        if (g.peer_devs.empty() && g.vram_experts_gb_cap >= 0.0) {
+            budget = std::min(budget, g.vram_experts_gb_cap * 1073741824.0);
+        }
         const uint64_t sec4_al = (g.sec4_bytes + 4095) & ~4095ull;
         bool loaded_full = false;
         if (g.peer_devs.empty() && budget >= (double)sec4_al) {

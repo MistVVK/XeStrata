@@ -56,6 +56,7 @@
 #define hipEventSynchronize cudaEventSynchronize
 #define hipEventElapsedTime cudaEventElapsedTime
 #define hipHostMallocDefault cudaHostAllocDefault
+#define hipHostMallocPortable cudaHostAllocPortable
 #define hipHostMalloc(p, n, f) cudaHostAlloc((p), (n), (f))
 #define hipHostFree cudaFreeHost
 #define hipSetDevice cudaSetDevice
@@ -66,6 +67,13 @@
 #define hipStreamWaitEvent cudaStreamWaitEvent
 #define hipHostGetDevicePointer cudaHostGetDevicePointer
 #define hipDeviceSynchronize cudaDeviceSynchronize
+#define hipDeviceCanAccessPeer cudaDeviceCanAccessPeer
+#define hipDeviceEnablePeerAccess cudaDeviceEnablePeerAccess
+#define hipDeviceDisablePeerAccess cudaDeviceDisablePeerAccess
+#define hipErrorPeerAccessAlreadyEnabled cudaErrorPeerAccessAlreadyEnabled
+#define hipMemcpyPeer cudaMemcpyPeer
+#define hipMemcpyPeerAsync cudaMemcpyPeerAsync
+#define hipGetDeviceCount cudaGetDeviceCount
 
 #include <cstddef>
 #include <cstdint>
@@ -304,6 +312,10 @@ __device__ __forceinline__ const void* shfl_ptr(const void* p, int src) {
 #else  // ---------------------------------------------------------------- HIP
 #ifndef HY4_CUDA
 #define HY4_CUDA 0
+#endif
+// HY4_HIP_PEERS: 1 builds the multi-GPU expert split (`--gpus 0,1`; experts on peer AMD GPUs) by default on HIP.
+#ifndef HY4_HIP_PEERS
+#define HY4_HIP_PEERS 1
 #endif
 // RDNA2 (gfx103x) has no WMMA instructions; guard WMMA cleanly and route to custom Wave32 sdot4/fdot2 kernels.
 #if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)

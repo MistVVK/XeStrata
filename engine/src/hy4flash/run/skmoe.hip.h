@@ -1483,6 +1483,7 @@ inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const Exper
 // rounding as a separate fp32 -> fp16 pass); z_out_h = fp16 copy of z_out written by the reduce kernel (same rounding). Both nullptr = the original behaviour.
 // slot_rec (M == 1, no CPU-resident experts): rec[slot] = the ExpertDev record of the expert chosen in that slot (written by the router kernel). The one-token kernels read it directly, so the
 // counting-sort kernel and the reduce kernel are gone (2 launches instead of 4). The ws region `fill` is used as 96 tickets and must be zero before the first call (they reset themselves).
+// z_out == nullptr leaves the weighted slot contributions in the workspace for reduction elsewhere.
 inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev* experts, const __half* z, const int32_t* topk_idx, const float* topk_w,
                         float* z_out, int M, void* ws, const float* z_f32 = nullptr, __half* z_out_h = nullptr, const ExpertDev* slot_rec = nullptr, int accum = 0) {
 #if !HY4_MMA && HY4_CUDA
@@ -1494,7 +1495,7 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
     const int P = M * MOE_TOPK;
     const skd::MoeWs w = skd::moe_ws_split(ws, P);
     const int eb = P < MOE_E ? P : MOE_E;
-    if (slot_rec && M == 1 && !skd::moe_has_cpu() && !accum) {
+    if (z_out && slot_rec && M == 1 && !skd::moe_has_cpu() && !accum) {
         hipLaunchKernelGGL(skd::k_moe_gu_dec1, dim3(MOE_D / 8, MOE_TOPK), dim3(256), 0, s, sec4_base, slot_rec, z, z_f32, w.h2);
         hipLaunchKernelGGL(skd::k_moe_dn_dec1, dim3(MOE_D / 16, MOE_TOPK), dim3(256), 0, s, sec4_base, slot_rec, topk_w, w.h2, w.y, z_out, z_out_h, (unsigned*)w.fill);
         return;
@@ -1601,7 +1602,7 @@ inline void moe_experts(hipStream_t s, const uint8_t* sec4_base, const ExpertDev
 #endif
     }
 #endif
-    hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out, z_out_h, experts, topk_idx, accum);
+    if (z_out) hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out, z_out_h, experts, topk_idx, accum);
 }
 
 // simple reference path (any M); same arguments and workspace
@@ -1616,7 +1617,7 @@ inline void moe_experts_ref(hipStream_t s, const uint8_t* sec4_base, const Exper
     hipLaunchKernelGGL(skd::k_moe_scatter, dim3((P + 255) / 256), dim3(256), 0, s, experts, topk_idx, P, w.off, w.fill, w.pairs);
     hipLaunchKernelGGL(skd::k_moe_gu_ref, dim3(MOE_D / 8, MOE_E), dim3(256), 0, s, sec4_base, experts, z, w.cnt, w.off, w.pairs, w.h2);
     hipLaunchKernelGGL(skd::k_moe_dn_ref, dim3(MOE_D / 8, MOE_E), dim3(256), 0, s, sec4_base, experts, topk_w, w.cnt, w.off, w.pairs, w.h2, w.y);
-    hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out, z_out_h, experts, topk_idx, 0);
+    if (z_out) hipLaunchKernelGGL(skd::k_moe_reduce, dim3(M), dim3(256), 0, s, w.y, z_out, z_out_h, experts, topk_idx, 0);
 }
 
 }  // namespace hy4

@@ -213,6 +213,12 @@ ctest --test-dir build-hip --output-on-failure --timeout 60 -E '^(ple_parity|pla
 
 `ple_parity` needs an external model fixture. `platform_memory_test` needs a memlock limit above the shell's default.
 
+### Hy4-Flash: experts on multiple AMD GPUs
+
+`strata-hy4 --gpus 0,1` (or `--gpus 2` / `--devices 0,1`) distributes routed experts across all selected AMD GPUs by default (`HY4_HIP_PEERS=1`). When PCIe peer access (`hipDeviceCanAccessPeer`) is available, partial activations transfer directly with `hipMemcpyPeerAsync`; when peer access is unavailable (or disabled with `HY4_PEER_NO_P2P=1`), the runner falls back automatically to async pinned host bounce buffers.
+
+Each peer card reserves workspace memory sized automatically for the active prefill chunk (`Tc`); set `HY4_PEER_RESERVE_MB` to override the per-peer reserve explicitly.
+
 ## Model and serving configuration
 
 Prepare a supported model pack and its MTP runtime with the existing tools. For OrcaRouter IQ3_XXS, follow the

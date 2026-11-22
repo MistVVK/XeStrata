@@ -335,12 +335,16 @@ int main(int argc, char** argv) {
     bool load_only = false, dump = false, save_logits = false, all_logits = false, no_engram = false, no_index = false, prof = false, prof2 = false;
     int gen = 0, max_ctx = 0, chunk = 0 /* 0: auto from the card */, index_topk = 2048;
     bool serve = false, session_reuse = false;
+#ifdef STRATA_HY4_DISTRIBUTED
+    bool mpi_experts = false;
+#endif
     int gpu = -1;
     std::string gpus_csv = getenv("HY4_GPUS") ? getenv("HY4_GPUS") : "";
     std::string draft = "auto";  // auto: dfly2 under --serve (when the file carries the drafter), off for the CLI runs (gates / benches); "off" and "dfly2" force
     SpecCfg scfg;
     SampleOpts cli_samp;
     int tail_skip_arg = 0;  // opt-in only (0 = OFF by default)
+    double vram_experts_gb = -1.0, ram_experts_gb = -1.0;
     std::string dump_dfly_batch, dump_dfly_out;
     int dump_dfly_gen = 384;
     float dump_dfly_temp = -0.6f;  // <0: mixed 2/3 greedy + 1/3 sampled at |temp|; 0: pure greedy; >0: sampled
@@ -371,10 +375,13 @@ int main(int argc, char** argv) {
             return export_tokenizer(f, nxt());
         }
         if (a == "--serve") serve = true;
+#ifdef STRATA_HY4_DISTRIBUTED
+        else if (a == "--mpi-experts") mpi_experts = true;
+#endif
         else if (a == "--model" || a == "--native") model = nxt();
         else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
         else if (a == "--gpu") gpu = atoi(nxt().c_str());
-        else if (a == "--gpus") gpus_csv = nxt();
+        else if (a == "--gpus" || a == "--devices") gpus_csv = nxt();
         else if (a == "--draft") draft = nxt();
         else if (a == "--dfly-override") dfly_override = nxt();
         else if (a == "--spec-k") scfg.K = atoi(nxt().c_str());
@@ -417,7 +424,9 @@ int main(int argc, char** argv) {
         else if (a == "--vision") vision_path = nxt();           // HY4-VISION: the Vision shard; loaded on the first request that carries a picture
         else if (a == "--image") image_files.push_back(nxt());  // HY4-VISION (offline runs): a picture file per image-pad token of --tokens, in order (the engine expands each pad)
         else if (a == "--image-max-pixels") image_max_pixels = atoll(nxt().c_str());
-        else if (a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner yet\n", a.c_str(), nxt().c_str());
+        else if (a == "--vram-experts-gb") vram_experts_gb = atof(nxt().c_str());
+        else if (a == "--ram-experts-gb") ram_experts_gb = atof(nxt().c_str());
+        else if (a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner yet\n", a.c_str(), nxt().c_str());
         else if (a == "--kv") {
             std::string kv = nxt();
             if (kv != "fp16") {
@@ -451,20 +460,38 @@ int main(int argc, char** argv) {
         }
     }
     if (!info_file.empty()) return print_info(info_file, vision_path);
+#ifdef STRATA_HY4_DISTRIBUTED
+    if (mpi_experts && (!serve || !gpus_csv.empty() || gpu > 0)) {
+        fprintf(stderr, "--mpi-experts requires --serve and a single visible CUDA device per host\n");
+        return 2;
+    }
+#endif
     std::vector<int> peer_devs;
     int primary_gpu = gpu >= 0 ? gpu : 0;
     if (!gpus_csv.empty()) {
         std::vector<int> ids;
-        for (size_t pos = 0; pos < gpus_csv.size();) {
-            ids.push_back(atoi(gpus_csv.c_str() + pos));
-            size_t q = gpus_csv.find(',', pos);
-            if (q == std::string::npos) break;
-            pos = q + 1;
+        if (gpus_csv.find(',') == std::string::npos) {
+            int val = atoi(gpus_csv.c_str());
+            int ndev = 0;
+            if (val >= 2 && hipGetDeviceCount(&ndev) == hipSuccess && ndev >= 2) {
+                int use_n = std::min(val, ndev);
+                for (int k = 0; k < use_n; ++k) ids.push_back(k);
+            } else {
+                ids.push_back(val);
+            }
+        } else {
+            for (size_t pos = 0; pos < gpus_csv.size();) {
+                ids.push_back(atoi(gpus_csv.c_str() + pos));
+                size_t q = gpus_csv.find(',', pos);
+                if (q == std::string::npos) break;
+                pos = q + 1;
+            }
         }
         if (!ids.empty()) {
             primary_gpu = ids[0];
             for (size_t k = 1; k < ids.size(); ++k)
-                if (ids[k] != primary_gpu) peer_devs.push_back(ids[k]);
+                if (ids[k] != primary_gpu && std::find(peer_devs.begin(), peer_devs.end(), ids[k]) == peer_devs.end())
+                    peer_devs.push_back(ids[k]);
             gpu = primary_gpu;
         }
     }
@@ -497,6 +524,41 @@ int main(int argc, char** argv) {
         so.image_max_pixels = image_max_pixels;
         so.primary_gpu = primary_gpu;
         so.peer_devs = peer_devs;
+        so.vram_experts_gb = vram_experts_gb;
+        so.ram_experts_gb = ram_experts_gb;
+#ifdef STRATA_HY4_DISTRIBUTED
+        if (mpi_experts) {
+            try {
+                strata::tp::MpiRuntime mpi(argc, argv, std::chrono::minutes(10));
+                if (mpi.size() != 2 || mpi.minimum(mpi.local_rank() == 0 ? 1 : 0) != 1)
+                    mpi.fail("Hy4 expert parallelism requires two hosts with one MPI rank each");
+                try {
+                    int devices = 0;
+                    HCK(cudaGetDeviceCount(&devices));
+                    if (devices != 1) mpi.fail("Hy4 each host must expose exactly one CUDA device");
+                    HCK(cudaSetDevice(0));
+                    mpi.agree(expert_model_identity(model));
+                    {
+                        RemoteExperts remote(mpi);
+                        if (mpi.rank() == 0) {
+                            so.remote_experts = &remote;
+                            if (hy4_serve_main(so) != 0) mpi.fail("Hy4 coordinator failed to serve");
+                            remote.finish();
+                        } else {
+                            remote.work(model);
+                        }
+                    }
+                    mpi.finish();
+                    return 0;
+                } catch (const std::exception& failure) {
+                    mpi.fail(failure.what());
+                }
+            } catch (const std::exception& failure) {
+                fprintf(stderr, "Hy4 MPI initialization failed: %s\n", failure.what());
+                return 1;
+            }
+        }
+#endif
         return hy4_serve_main(so);
     }
     if (model.empty()) {
@@ -526,10 +588,21 @@ int main(int argc, char** argv) {
         while (f >> v) tok.push_back((int32_t)v);
         if (max_ctx <= 0 && !tok.empty()) max_ctx = (int)tok.size() + gen + 16;
     }
-    chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, model, !peer_devs.empty());
+    size_t min_peer_tot = 0;
+    for (int pd : peer_devs) {
+        HCK(hipSetDevice(pd));
+        size_t pfr = 0, ptot = 0;
+        HCK(hipMemGetInfo(&pfr, &ptot));
+        min_peer_tot = (min_peer_tot == 0) ? ptot : std::min(min_peer_tot, ptot);
+    }
+    if (!peer_devs.empty()) HCK(hipSetDevice(primary_gpu));
+    chunk = plan_memory(max_ctx > 0 ? max_ctx : 32768, chunk, tot, model, !peer_devs.empty(), !vision_path.empty(), (int)peer_devs.size(), min_peer_tot);
     GpuModel g;
     g.primary_gpu = primary_gpu;
+    g.planned_chunk = chunk;
     g.has_vision = !vision_path.empty();
+    g.vram_experts_gb_cap = vram_experts_gb;
+    g.ram_experts_gb_cap = ram_experts_gb;
     g.peer_devs = peer_devs;
     double t_load0 = now_s();
     if (!load_gpu_model(g, model, true)) return 1;

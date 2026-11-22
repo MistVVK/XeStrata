@@ -140,8 +140,55 @@ With `"parallel": 4` (the default) the original four-switch set adds up: 32 clie
 and 35.7 with all four off. The side mixer was not part of that check. At `"parallel": 8` the two original decode switches cost about 3.5%
 each; set `STRATA_HC_UPMIX=0 STRATA_SPEC_COST=0` there.
 
+## Hy4-Flash across two Spark hosts
+
+Hy4-Flash can split its routed experts between two Spark GPUs. The coordinator reads
+standard input and owns attention, KV, Engram, vision and sampling. The second rank
+loads its share of the routed experts. The coordinator sums the returned contributions
+in router slot order.
+
+Build with CUDA 13, MPI, NCCL and the zstd headers and library. Use the same NCCL
+version at build time and runtime. Put the binary and the verified model pack at the
+same paths on both hosts. Place the Engram and optional vision shards on the
+coordinator.
+
+```sh
+cmake -S engine/src/hy4flash/run -B build-hy4 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=121-real \
+  -DSTRATA_HY4_DISTRIBUTED=ON
+cmake --build build-hy4 --parallel
+ctest --test-dir build-hy4 --output-on-failure
+cmake --build build-hy4 --target strata-hy4-slot-order-test
+./build-hy4/strata-hy4-slot-order-test
+```
+
+Configure the MPI hosts and NCCL interface for the link between the Spark units.
+Run one rank per host with one visible CUDA device on each rank. In this example,
+`spark-a` and `spark-b` resolve to addresses on that link.
+
+```sh
+mpirun --host spark-a:1,spark-b:1 --map-by ppr:1:node --stdin 0 \
+  -x NCCL_SOCKET_IFNAME -x NCCL_IB_HCA \
+  /shared/path/strata-hy4 --mpi-experts --serve \
+  --native /shared/path/Hy4-Flash-SQ-96.strata \
+  --engram /shared/path/Hy4-Flash-Engram-Q8.strata \
+  --max-context 8192 --chunk 512 --draft off
+```
+
+When enabling NCCL diagnostics, export `NCCL_DEBUG_FILE` with a writable path
+such as `/tmp/hy4-nccl-%h-%p.log` and add `-x NCCL_DEBUG_FILE` to the launch.
+Standard output carries the engine protocol. For HTTP
+serving, configure an executable wrapper that uses MPI for `--serve` and runs the
+binary directly for metadata commands such as `--info` and `--export-tokenizer`.
+Set `HY4_CUDA_GRAPH=1` on the coordinator to capture the GPU work in decode
+and verification windows of up to eight rows. Each segment runs between MPI
+expert exchanges. This also enables graphs for the DFly2 drafter.
+`--session-reuse 1` enables reuse for
+prompts that extend the cached prefix. `--draft dfly2` enables DFly2 on packs
+that contain the drafter. Add `--vision FILE` on an image-capable configuration.
+
 ## What this does not cover
 
-Decode on the 48-SM GB10 is limited by the GPU's work, about 930 kernel launches per token. No configuration switch measured here moved it more
+Qwen3.8-Flash-Next decode on the 48-SM GB10 is limited by the GPU's work, about 930 kernel launches per token. No configuration switch measured here moved it more
 than a few percent. A DFlash2 drafter is slower here than the MTP drafter (37 against 45 tok/s) and is not used. Teacher-forced quality over
 long text and task suites was run only for the prompt path (above).

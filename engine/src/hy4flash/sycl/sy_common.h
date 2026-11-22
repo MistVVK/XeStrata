@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #ifdef _WIN32
 #include <process.h>
 #else
@@ -72,15 +73,91 @@ using half = sycl::half;
 constexpr int HID = 3072;
 constexpr int NHC = 4;
 
+inline int& primary_gpu_index() {
+    static int idx = 0;
+    return idx;
+}
+
+inline void set_primary_gpu_index(int idx) {
+    primary_gpu_index() = idx < 0 ? 0 : idx;
+}
+
+// Enumerate all GPU devices on the active SYCL backend (Level Zero by default, or OpenCL when HY4S_BACKEND=opencl).
+// Filtering to a single backend avoids duplicate OpenCL + Level Zero views of the same physical Arc cards.
+inline std::vector<sycl::device> enum_gpu_devices() {
+    std::vector<sycl::device> all = sycl::device::get_devices(sycl::info::device_type::gpu);
+    if (all.empty()) return all;
+    const char* be_env = std::getenv("HY4S_BACKEND");
+    const bool want_ocl = (be_env && std::string(be_env) == "opencl");
+    const sycl::backend want_be = want_ocl ? sycl::backend::opencl : sycl::backend::ext_oneapi_level_zero;
+    std::vector<sycl::device> filtered;
+    for (const auto& d : all) {
+        if (d.get_backend() == want_be) filtered.push_back(d);
+    }
+    if (!filtered.empty()) return filtered;
+    // Fall back to the backend of device 0 if preferred backend isn't present
+    const sycl::backend b0 = all[0].get_backend();
+    for (const auto& d : all) {
+        if (d.get_backend() == b0) filtered.push_back(d);
+    }
+    return filtered;
+}
+
+// Parse --gpus / --devices / HY4_GPUS spec: accepts either a count ("2") or a CSV ("0,1" / "1,0").
+inline void parse_gpu_spec(const std::string& spec, int default_primary, int n_avail, int& out_primary, std::vector<int>& out_peers) {
+    out_primary = std::max(0, default_primary);
+    out_peers.clear();
+    if (spec.empty() || n_avail <= 0) {
+        if (n_avail > 0 && out_primary >= n_avail) out_primary = 0;
+        return;
+    }
+    if (spec.find(',') != std::string::npos) {
+        std::vector<int> ids;
+        for (size_t pos = 0; pos < spec.size();) {
+            size_t q = spec.find(',', pos);
+            if (q == std::string::npos) q = spec.size();
+            if (q > pos) {
+                int id = std::atoi(spec.substr(pos, q - pos).c_str());
+                if (id >= 0 && id < n_avail) {
+                    bool dup = false;
+                    for (int x : ids) if (x == id) { dup = true; break; }
+                    if (!dup) ids.push_back(id);
+                } else {
+                    fprintf(stderr, "[gpu] ignoring out-of-range device index %d (visible GPUs: %d)\n", id, n_avail);
+                }
+            }
+            pos = q + 1;
+        }
+        if (!ids.empty()) {
+            out_primary = ids[0];
+            for (size_t i = 1; i < ids.size(); ++i) out_peers.push_back(ids[i]);
+        }
+    } else {
+        const int count = std::atoi(spec.c_str());
+        if (out_primary >= n_avail) out_primary = 0;
+        const int target = std::min(std::max(count, 1), n_avail);
+        for (int d = 0; d < n_avail && (int)out_peers.size() + 1 < target; ++d) {
+            if (d != out_primary) out_peers.push_back(d);
+        }
+    }
+}
+
 inline sycl::queue& Q() {
     // HY4S_DISCARD=1: the queue creates no event objects (cheaper launches; the events returned by submit/memcpy then must not be waited on - use host flags / q.wait())
     static sycl::queue q = [] {
-        const char* pf = std::getenv("HY4S_PROF");
-        if (pf && pf[0] == '1') return sycl::queue{sycl::gpu_selector_v, sycl::property_list{sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
-        const char* d = std::getenv("HY4S_DISCARD");
-        if (d && d[0] == '1')
-            return sycl::queue{sycl::gpu_selector_v, sycl::property_list{sycl::property::queue::in_order(), sycl::ext::oneapi::property::queue::discard_events()}};
-        return sycl::queue{sycl::gpu_selector_v, sycl::property_list{sycl::property::queue::in_order()}};
+        auto devs = enum_gpu_devices();
+        auto make_props = []() -> sycl::property_list {
+            const char* pf = std::getenv("HY4S_PROF");
+            if (pf && pf[0] == '1') return sycl::property_list{sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()};
+            const char* d = std::getenv("HY4S_DISCARD");
+            if (d && d[0] == '1') return sycl::property_list{sycl::property::queue::in_order(), sycl::ext::oneapi::property::queue::discard_events()};
+            return sycl::property_list{sycl::property::queue::in_order()};
+        };
+        if (!devs.empty()) {
+            const int idx = std::min(std::max(primary_gpu_index(), 0), (int)devs.size() - 1);
+            return sycl::queue{devs[idx], make_props()};
+        }
+        return sycl::queue{sycl::gpu_selector_v, make_props()};
     }();
     return q;
 }

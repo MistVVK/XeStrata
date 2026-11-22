@@ -30,6 +30,7 @@
 #include "sy_model.h"
 #include "sy_vision.h"
 #include "sy_vram_cache.h"
+#include "sy_peer.h"
 
 namespace hy4s {
 
@@ -79,12 +80,14 @@ struct EngramDev {
 };
 
 // Shared placement helper for sy_main & sy_serve: partitions Section 4 experts across
-//   Tier 0: SyVramExpertCache (multi-slab <= 1.4 GiB/slab, auto-sized from free VRAM or --vram-experts-gb)
+//   Tier 0: SyVramExpertCache on primary GPU 0 (multi-slab <= 1.4 GiB/slab, auto-sized from free VRAM or --vram-experts-gb)
+//   Tier 0b: SyPeerExperts on secondary GPU(s) (--gpus 0,1 / --gpus 2 / --devices / HY4_GPUS)
 //   Tier 1: hy4::CpuExperts RAM arena (AVX-512 VBMI/VNNI or AVX2 + optional two-term "hi")
 //   Tier 2: hy4::CpuExperts cold SSD tier (when remaining experts exceed RAM budget)
 inline bool setup_experts_unified(const std::string& model_path, int threads, double vram_experts_gb_arg, double ram_experts_gb_arg,
                                   size_t reserve_vram_bytes, size_t host_overhead_bytes, bool hi_act,
-                                  SyVramExpertCache& vcache, hy4::CpuExperts& ucx, std::string& err) {
+                                  SyVramExpertCache& vcache, hy4::CpuExperts& ucx, std::string& err,
+                                  const std::vector<int>& peer_devs = {}, SyPeerExperts* peers = nullptr) {
     // 1. Determine VRAM expert cache budget (caller includes DFly2 reserve in reserve_vram_bytes when !df.ok so plain & DFly2 match!)
     size_t vram_budget = 0;
     if (vram_experts_gb_arg >= 0.0) {
@@ -102,15 +105,23 @@ inline bool setup_experts_unified(const std::string& model_path, int threads, do
     if (!vcache.init(model_path, vram_budget, err, 1400)) return false;
     vcache.set_q8_act(!hi_act);
 
+    // 1b. Populate secondary peer GPU(s) with the next hottest Section 4 experts
+    std::vector<std::vector<bool>> vram_mask;
+    vcache.build_vram_mask(vram_mask);
+    std::vector<std::vector<bool>> peer_mask;
+    if (peers && !peer_devs.empty()) {
+        const size_t per_peer_budget = (vram_experts_gb_arg > 0.0) ? (size_t)(vram_experts_gb_arg * 1073741824.0) : 0;
+        if (!peers->init(model_path, peer_devs, vram_mask, per_peer_budget, err, 1400)) return false;
+        peers->set_q8_act(!hi_act);
+        peers->mark_peer_mask(peer_mask);
+    }
+
     // 2. Partition remaining experts into RAM arena vs cold SSD using Section 3 rank order
     std::vector<uint16_t> eor, codes;
     std::vector<uint32_t> bbytes;
     if (!hy4::CpuExperts::read_rank_table(model_path, eor, codes, err)) return false;
     if (!hy4::CpuExperts::read_body_bytes(model_path, bbytes, err)) return false;
     const int NL = (int)(eor.size() / 512);
-
-    std::vector<std::vector<bool>> vram_mask;
-    vcache.build_vram_mask(vram_mask);
 
     uint64_t ram_budget = 0;
     if (ram_experts_gb_arg > 0.0) {
@@ -135,6 +146,10 @@ inline bool setup_experts_unified(const std::string& model_path, int threads, do
             if (vcache.active() && vram_mask[L][e]) {
                 // Initially in VRAM; mark cold_mask as on-disk fallback in case adaptive cache evicts it later (0 RAM cost!)
                 cold_mask[L][e] = true;
+                continue;
+            }
+            if (peers && peers->active() && L < (int)peer_mask.size() && peer_mask[L][e]) {
+                // Static peer-GPU resident: neither RAM nor cold SSD needed during decode!
                 continue;
             }
             if (!ram_full && ram_used + sz <= ram_budget) {
@@ -175,9 +190,10 @@ inline bool setup_experts_unified(const std::string& model_path, int threads, do
         if (!ucx.set_cold_experts(cold_mask, err)) return false;
     }
 #endif
-    fprintf(stderr, "[experts] unified pool (%s, %d thr, act=%s): %d VRAM (%.2f GiB), %llu RAM (%.2f GB, load %.1f s), %llu cold SSD (%.2f GB)\n",
+    fprintf(stderr, "[experts] unified pool (%s, %d thr, act=%s): %d GPU0 VRAM (%.2f GiB), %d peer VRAM (%.2f GiB), %llu RAM (%.2f GB, load %.1f s), %llu cold SSD (%.2f GB)\n",
             ucx.kernel_name(), ucx.n_threads(), ucx.hi_activations() ? "hi" : "q8",
             vcache.num_slots(), vcache.device_bytes() / 1073741824.0,
+            peers ? peers->total_experts() : 0, peers ? peers->total_device_bytes() / 1073741824.0 : 0.0,
             (unsigned long long)n_cpu, ucx.arena_bytes() / 1e9, ucx.load_seconds(),
             (unsigned long long)n_cold, cold_bytes / 1e9);
     return true;
@@ -189,6 +205,7 @@ public:
     const hy4::Cfg& c;
     hy4::CpuExperts& ucx;
     SyVramExpertCache* vcache = nullptr;
+    SyPeerExperts* peers = nullptr;
     int max_ctx, Tc;
     int expert_act = 1;
     GpuExperts* gx = nullptr;
@@ -318,11 +335,17 @@ public:
     // Call strictly on committed tokens for bitwise plain == DFly2 adaptive VRAM cache promotion
     void commit_vram_adapt(int n_committed, int next_pos) {
         if (!vcache || !vcache->adaptive() || dump || tap || !force_route_dir.empty()) return;
-        vcache->commit_tokens(n_committed, next_pos, [&](int L, int e) -> const uint8_t* { return ucx.view(L, e).body; });
+        vcache->commit_tokens(n_committed, next_pos, [&](int L, int e) -> const uint8_t* {
+            if (peers && peers->has_expert(L, e)) return nullptr;  // already resident on a peer GPU
+            return ucx.view(L, e).body;
+        });
     }
     void step_adapt() {
         if (!vcache || !vcache->adaptive() || dump || tap || !force_route_dir.empty()) return;
-        vcache->step_adapt([&](int L, int e) -> const uint8_t* { return ucx.view(L, e).body; });
+        vcache->step_adapt([&](int L, int e) -> const uint8_t* {
+            if (peers && peers->has_expert(L, e)) return nullptr;  // already resident on a peer GPU
+            return ucx.view(L, e).body;
+        });
     }
 
     // Per-section GPU timeline (prof2)
@@ -982,7 +1005,14 @@ public:
             for (size_t i = 0; i < (size_t)T * 16; ++i) { h_idx[i] = (int32_t)fi[(size_t)cur_p0 * 16 + i]; h_w[i] = fw[(size_t)cur_p0 * 16 + i]; }
         }
         if (use_gx) {
-            gx->run(il - 1, T, z_f, h_idx, h_w, zout_f, nullptr);
+            if (peers && peers->active()) {
+                uint8_t only_non_peer[512];
+                peers->build_non_peer_mask(il - 1, only_non_peer);
+                gx->run(il - 1, T, z_f, h_idx, h_w, zout_f, only_non_peer);
+                peers->run_prefill_tile_and_add(il - 1, T, z_f, h_idx, h_w, zout_f);
+            } else {
+                gx->run(il - 1, T, z_f, h_idx, h_w, zout_f, nullptr);
+            }
             t_cpu_exp += now_s() - tc;
             return;
         }
@@ -991,26 +1021,69 @@ public:
             t_cpu_exp += now_s() - tc;
             return;
         }
-        // Decode / Verify (T <= 16): overlap CPU misses (submitted FIRST!) with GPU VRAM cache hits!
-        int vhits = 0;
-        if (vcache && vcache->active() && T <= SyVramExpertCache::MAX_T) {
-            vhits = vcache->plan_decode(il - 1, T, h_idx, h_w, h_use_cpu);
-            if (vhits < T * 16) ucx.submit(il - 1, T, h_z, h_idx, h_w, h_use_cpu, h_zout, false);
+        // Decode / Verify (T <= 16): overlap CPU misses + peer GPU(s) + GPU 0 VRAM cache hits in parallel!
+        int vhits = 0, phits = 0;
+        const bool can_vcache = vcache && vcache->active() && T <= SyVramExpertCache::MAX_T;
+        const bool can_peers = peers && peers->active() && T <= SyPeerExperts::MAX_DEC_T;
+        if (can_vcache || can_peers) {
+            if (can_vcache) {
+                vhits = vcache->plan_decode(il - 1, T, h_idx, h_w, h_use_cpu);
+            } else {
+                std::memset(h_use_cpu, 1, (size_t)T * 16);
+            }
+            if (can_peers) {
+                phits = peers->plan_decode(il - 1, T, h_idx, h_w, h_use_cpu);
+            }
+            const int cpu_need = T * 16 - vhits - phits;
+            if (cpu_need > 0) ucx.submit(il - 1, T, h_z, h_idx, h_w, h_use_cpu, h_zout, false);
+            if (phits > 0) peers->launch_decode(z_f, h_z);
             if (vhits > 0) vcache->launch_decode(z_f, zout_gpu_f);
-            if (vhits < T * 16) ucx.wait();
+            if (cpu_need > 0) ucx.wait();
+        } else if (peers && peers->active()) {
+            // T > 16 with !use_gx (e.g. T in 17..31 or --no-gpu-experts): split non-peer CPU vs peer GPU tiles.
+            std::vector<uint8_t> use_cpu_big((size_t)T * 16, 1);
+            int cpu_need_big = 0;
+            for (size_t i = 0; i < (size_t)T * 16; ++i) {
+                const int e = h_idx[i];
+                if (peers->has_expert(il - 1, e)) use_cpu_big[i] = 0;
+                else ++cpu_need_big;
+            }
+            if (cpu_need_big > 0) {
+                ucx.submit(il - 1, T, h_z, h_idx, h_w, use_cpu_big.data(), h_zout, false);
+                ucx.wait();
+                h2d(zout_f, h_zout, nz * 4);
+            } else {
+                dzero(zout_f, nz * 4);
+            }
+            peers->run_prefill_tile_and_add(il - 1, T, z_f, h_idx, h_w, zout_f);
+            t_cpu_exp += now_s() - tc;
+            return;
         } else {
             ucx.submit(il - 1, T, h_z, h_idx, h_w, nullptr, h_zout, false);
             ucx.wait();
         }
         t_cpu_exp += now_s() - tc;
 
-        if (vhits == T * 16) {
+        const int cpu_need = T * 16 - vhits - phits;
+        bool zout_inited = false;
+        if (vhits > 0) {
             d2d(zout_f, zout_gpu_f, nz * 4);
-        } else if (vhits == 0) {
-            h2d(zout_f, h_zout, nz * 4);
-        } else {
-            h2d(zout_f, h_zout, nz * 4);
-            SyVramExpertCache::add_zout(zout_f, zout_gpu_f, nz);
+            zout_inited = true;
+        }
+        if (cpu_need > 0) {
+            if (!zout_inited) {
+                h2d(zout_f, h_zout, nz * 4);
+                zout_inited = true;
+            } else {
+                h2d(zout_gpu_f, h_zout, nz * 4);
+                SyVramExpertCache::add_zout(zout_f, zout_gpu_f, nz);
+            }
+        }
+        if (phits > 0) {
+            peers->finish_decode(T, zout_f, zout_inited);
+        }
+        if (!zout_inited) {
+            dzero(zout_f, nz * 4);
         }
         if (dump && dbg_layers) {
             wait();
