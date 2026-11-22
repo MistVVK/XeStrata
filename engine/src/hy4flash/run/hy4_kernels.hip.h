@@ -365,6 +365,16 @@ __global__ void k_f2h(const float* __restrict__ in, __half* __restrict__ out, si
     if (i < n) out[i] = __float2half(in[i]);
 }
 
+// ---- pack [z_f (T*1536) | moe_idx (T*16) | moe_w (T*16)] into one contiguous buffer so hybrid decode/verify issues ONE D2H copy per layer instead of three
+__global__ void k_hyb_pack(const float* __restrict__ z, const int32_t* __restrict__ idx, const float* __restrict__ w, uint32_t* __restrict__ out, int T) {
+    const size_t nz = (size_t)T * 1536, ni = (size_t)T * 16, tot = nz + 2 * ni;
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tot) return;
+    if (i < nz) out[i] = __float_as_uint(z[i]);
+    else if (i < nz + ni) out[i] = (uint32_t)idx[i - nz];
+    else out[i] = __float_as_uint(w[i - nz - ni]);
+}
+
 // ---- SwiGLU: h = silu(g) * u, optional clamp (routed experts only), fp32 in -> fp16 out.  g,u: [T][n] each
 __global__ void k_swiglu_h(const float* __restrict__ g, const float* __restrict__ u, __half* __restrict__ out, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

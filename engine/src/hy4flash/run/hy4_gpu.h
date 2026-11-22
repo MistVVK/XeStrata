@@ -21,6 +21,9 @@
 #ifndef HY4_CUDA
 #define HY4_CUDA 1
 #endif
+#ifndef HY4_HAS_GRAPHS
+#define HY4_HAS_GRAPHS 1
+#endif
 #ifndef HY4_GFX12
 #define HY4_GFX12 0
 #endif
@@ -31,6 +34,15 @@
 #define hipSuccess cudaSuccess
 #define hipStream_t cudaStream_t
 #define hipEvent_t cudaEvent_t
+#define hipGraph_t cudaGraph_t
+#define hipGraphExec_t cudaGraphExec_t
+#define hipStreamCaptureModeThreadLocal cudaStreamCaptureModeThreadLocal
+#define hipStreamBeginCapture cudaStreamBeginCapture
+#define hipStreamEndCapture cudaStreamEndCapture
+#define hipGraphInstantiate cudaGraphInstantiate
+#define hipGraphDestroy cudaGraphDestroy
+#define hipGraphExecDestroy cudaGraphExecDestroy
+#define hipGraphLaunch cudaGraphLaunch
 #define hipDeviceProp_t cudaDeviceProp
 #define hipGetErrorString cudaGetErrorString
 #define hipGetDeviceProperties cudaGetDeviceProperties
@@ -304,6 +316,9 @@ __device__ __forceinline__ const void* shfl_ptr(const void* p, int src) {
 #else  // ---------------------------------------------------------------- HIP
 #ifndef HY4_CUDA
 #define HY4_CUDA 0
+#endif
+#ifndef HY4_HAS_GRAPHS
+#define HY4_HAS_GRAPHS 1
 #endif
 // RDNA2 (gfx103x) has no WMMA instructions; guard WMMA cleanly and route to custom Wave32 sdot4/fdot2 kernels.
 #if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)

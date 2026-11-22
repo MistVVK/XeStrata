@@ -851,10 +851,218 @@ __global__ void __launch_bounds__(256) k_gemm_s(const uint8_t* __restrict__ W, i
     }
 }
 
+// 64-row BK=128 low-LDS WMMA mainloops (gfx11/gfx12 Wave32): ws[64][136] = 17.4 KB (< 32 KB -> 2-3 WG/CU vs 1 WG/CU at 33.8 KB!).
+// Explicit scalar register rings (aq0/aq1, b0/b1) avoid AMDGPU VGPR spilling that occurs with 2D array templates!
+template <int FMT>
+__device__ __forceinline__ void gemm_mainloop_bk128_64_1x1(const uint8_t* wr, int nsb, const half_t* xrow0, half_t* ws, fv8 (&acc)[1][1], int b0row) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int tid = threadIdx.x, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
+    const int drow = tid >> 2, sg_lo = (tid >> 1) & 1, qh = tid & 1;
+    const int q4a = qh * 2, q4b = qh * 2 + 1;
+    if constexpr (FMT == FMT_S1_25) {
+        s125_lut_init();
+        hy4_sync_lds();
+    }
+    RawQ16<FMT> cur0, cur1, nxt0, nxt1;
+    load_q16<FMT>(wr, sg_lo, q4a, cur0);
+    load_q16<FMT>(wr, sg_lo, q4b, cur1);
+    float cur_eff = sk_eff<FMT>(wr, sg_lo), nxt_eff = 0.f;
+    constexpr int PD = 4;
+    const int total = nsb * 16;
+    hv_t aq0[PD];
+#pragma unroll
+    for (int i = 0; i < PD; ++i) aq0[i] = ld_hv(xrow0 + i * 16, hi);
+    const int nhalf = nsb * 2;
+    for (int hs = 0; hs < nhalf; ++hs) {
+        dequant_q16_scaled<FMT>(cur0, q4a, cur_eff, &ws[drow * BK128_LD + sg_lo * 64 + q4a * 16]);
+        dequant_q16_scaled<FMT>(cur1, q4b, cur_eff, &ws[drow * BK128_LD + sg_lo * 64 + q4b * 16]);
+        if (hs + 1 < nhalf) {
+            const uint8_t* nblk = wr + (size_t)((hs + 1) >> 1) * SB;
+            const int ndg = ((hs + 1) & 1) * 2 + sg_lo;
+            load_q16<FMT>(nblk, ndg, q4a, nxt0);
+            load_q16<FMT>(nblk, ndg, q4b, nxt1);
+            nxt_eff = sk_eff<FMT>(nblk, ndg);
+        }
+        hy4_sync_lds();
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+            const int g = hs * 8 + kk;
+            const hv_t a0 = aq0[kk & (PD - 1)];
+            if (g + PD < total) aq0[kk & (PD - 1)] = ld_hv(xrow0 + (g + PD) * 16, hi);
+            const hv_t b0 = ld_hv(&ws[(b0row + l16) * BK128_LD + kk * 16], hi);
+            acc[0][0] = wmma_f16(a0, b0, acc[0][0]);
+        }
+        hy4_sync_lds();
+        cur0 = nxt0;
+        cur1 = nxt1;
+        cur_eff = nxt_eff;
+    }
+}
+
+template <int FMT>
+__device__ __forceinline__ void gemm_mainloop_bk128_64_2x1(const uint8_t* wr, int nsb, const half_t* xrow0, const half_t* xrow1, half_t* ws, fv8 (&acc)[2][1],
+                                                           int b0row) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int tid = threadIdx.x, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
+    const int drow = tid >> 2, sg_lo = (tid >> 1) & 1, qh = tid & 1;
+    const int q4a = qh * 2, q4b = qh * 2 + 1;
+    if constexpr (FMT == FMT_S1_25) {
+        s125_lut_init();
+        hy4_sync_lds();
+    }
+    RawQ16<FMT> cur0, cur1, nxt0, nxt1;
+    load_q16<FMT>(wr, sg_lo, q4a, cur0);
+    load_q16<FMT>(wr, sg_lo, q4b, cur1);
+    float cur_eff = sk_eff<FMT>(wr, sg_lo), nxt_eff = 0.f;
+    constexpr int PD = 4;
+    const int total = nsb * 16;
+    hv_t aq0[PD], aq1[PD];
+#pragma unroll
+    for (int i = 0; i < PD; ++i) {
+        aq0[i] = ld_hv(xrow0 + i * 16, hi);
+        aq1[i] = ld_hv(xrow1 + i * 16, hi);
+    }
+    const int nhalf = nsb * 2;
+    for (int hs = 0; hs < nhalf; ++hs) {
+        dequant_q16_scaled<FMT>(cur0, q4a, cur_eff, &ws[drow * BK128_LD + sg_lo * 64 + q4a * 16]);
+        dequant_q16_scaled<FMT>(cur1, q4b, cur_eff, &ws[drow * BK128_LD + sg_lo * 64 + q4b * 16]);
+        if (hs + 1 < nhalf) {
+            const uint8_t* nblk = wr + (size_t)((hs + 1) >> 1) * SB;
+            const int ndg = ((hs + 1) & 1) * 2 + sg_lo;
+            load_q16<FMT>(nblk, ndg, q4a, nxt0);
+            load_q16<FMT>(nblk, ndg, q4b, nxt1);
+            nxt_eff = sk_eff<FMT>(nblk, ndg);
+        }
+        hy4_sync_lds();
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+            const int g = hs * 8 + kk;
+            const hv_t a0 = aq0[kk & (PD - 1)], a1 = aq1[kk & (PD - 1)];
+            if (g + PD < total) {
+                aq0[kk & (PD - 1)] = ld_hv(xrow0 + (g + PD) * 16, hi);
+                aq1[kk & (PD - 1)] = ld_hv(xrow1 + (g + PD) * 16, hi);
+            }
+            const hv_t b0 = ld_hv(&ws[(b0row + l16) * BK128_LD + kk * 16], hi);
+            acc[0][0] = wmma_f16(a0, b0, acc[0][0]);
+            acc[1][0] = wmma_f16(a1, b0, acc[1][0]);
+        }
+        hy4_sync_lds();
+        cur0 = nxt0;
+        cur1 = nxt1;
+        cur_eff = nxt_eff;
+    }
+}
+
+template <int FMT>
+__device__ __forceinline__ void gemm_mainloop_bk128_64_1x2(const uint8_t* wr, int nsb, const half_t* xrow0, half_t* ws, fv8 (&acc)[1][2],
+                                                           int b0row, int b1row) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int tid = threadIdx.x, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
+    const int drow = tid >> 2, sg_lo = (tid >> 1) & 1, qh = tid & 1;
+    const int q4a = qh * 2, q4b = qh * 2 + 1;
+    if constexpr (FMT == FMT_S1_25) {
+        s125_lut_init();
+        hy4_sync_lds();
+    }
+    RawQ16<FMT> cur0, cur1, nxt0, nxt1;
+    load_q16<FMT>(wr, sg_lo, q4a, cur0);
+    load_q16<FMT>(wr, sg_lo, q4b, cur1);
+    float cur_eff = sk_eff<FMT>(wr, sg_lo), nxt_eff = 0.f;
+    constexpr int PD = 4;
+    const int total = nsb * 16;
+    hv_t aq0[PD];
+#pragma unroll
+    for (int i = 0; i < PD; ++i) aq0[i] = ld_hv(xrow0 + i * 16, hi);
+    const int nhalf = nsb * 2;
+    for (int hs = 0; hs < nhalf; ++hs) {
+        dequant_q16_scaled<FMT>(cur0, q4a, cur_eff, &ws[drow * BK128_LD + sg_lo * 64 + q4a * 16]);
+        dequant_q16_scaled<FMT>(cur1, q4b, cur_eff, &ws[drow * BK128_LD + sg_lo * 64 + q4b * 16]);
+        if (hs + 1 < nhalf) {
+            const uint8_t* nblk = wr + (size_t)((hs + 1) >> 1) * SB;
+            const int ndg = ((hs + 1) & 1) * 2 + sg_lo;
+            load_q16<FMT>(nblk, ndg, q4a, nxt0);
+            load_q16<FMT>(nblk, ndg, q4b, nxt1);
+            nxt_eff = sk_eff<FMT>(nblk, ndg);
+        }
+        hy4_sync_lds();
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+            const int g = hs * 8 + kk;
+            const hv_t a0 = aq0[kk & (PD - 1)];
+            if (g + PD < total) aq0[kk & (PD - 1)] = ld_hv(xrow0 + (g + PD) * 16, hi);
+            const hv_t b0 = ld_hv(&ws[(b0row + l16) * BK128_LD + kk * 16], hi);
+            const hv_t b1 = ld_hv(&ws[(b1row + l16) * BK128_LD + kk * 16], hi);
+            acc[0][0] = wmma_f16(a0, b0, acc[0][0]);
+            acc[0][1] = wmma_f16(a0, b1, acc[0][1]);
+        }
+        hy4_sync_lds();
+        cur0 = nxt0;
+        cur1 = nxt1;
+        cur_eff = nxt_eff;
+    }
+}
+
+template <int FMT>
+__device__ __forceinline__ void gemm_mainloop_bk128_64_2x2(const uint8_t* wr, int nsb, const half_t* xrow0, const half_t* xrow1, half_t* ws, fv8 (&acc)[2][2],
+                                                           int b0row, int b1row) {
+    constexpr int SB = sk_sb_bytes(FMT);
+    const int tid = threadIdx.x, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
+    const int drow = tid >> 2, sg_lo = (tid >> 1) & 1, qh = tid & 1;
+    const int q4a = qh * 2, q4b = qh * 2 + 1;
+    if constexpr (FMT == FMT_S1_25) {
+        s125_lut_init();
+        hy4_sync_lds();
+    }
+    RawQ16<FMT> cur0, cur1, nxt0, nxt1;
+    load_q16<FMT>(wr, sg_lo, q4a, cur0);
+    load_q16<FMT>(wr, sg_lo, q4b, cur1);
+    float cur_eff = sk_eff<FMT>(wr, sg_lo), nxt_eff = 0.f;
+    constexpr int PD = 4;
+    const int total = nsb * 16;
+    hv_t aq0[PD], aq1[PD];
+#pragma unroll
+    for (int i = 0; i < PD; ++i) {
+        aq0[i] = ld_hv(xrow0 + i * 16, hi);
+        aq1[i] = ld_hv(xrow1 + i * 16, hi);
+    }
+    const int nhalf = nsb * 2;
+    for (int hs = 0; hs < nhalf; ++hs) {
+        dequant_q16_scaled<FMT>(cur0, q4a, cur_eff, &ws[drow * BK128_LD + sg_lo * 64 + q4a * 16]);
+        dequant_q16_scaled<FMT>(cur1, q4b, cur_eff, &ws[drow * BK128_LD + sg_lo * 64 + q4b * 16]);
+        if (hs + 1 < nhalf) {
+            const uint8_t* nblk = wr + (size_t)((hs + 1) >> 1) * SB;
+            const int ndg = ((hs + 1) & 1) * 2 + sg_lo;
+            load_q16<FMT>(nblk, ndg, q4a, nxt0);
+            load_q16<FMT>(nblk, ndg, q4b, nxt1);
+            nxt_eff = sk_eff<FMT>(nblk, ndg);
+        }
+        hy4_sync_lds();
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+            const int g = hs * 8 + kk;
+            const hv_t a0 = aq0[kk & (PD - 1)], a1 = aq1[kk & (PD - 1)];
+            if (g + PD < total) {
+                aq0[kk & (PD - 1)] = ld_hv(xrow0 + (g + PD) * 16, hi);
+                aq1[kk & (PD - 1)] = ld_hv(xrow1 + (g + PD) * 16, hi);
+            }
+            const hv_t b0 = ld_hv(&ws[(b0row + l16) * BK128_LD + kk * 16], hi);
+            const hv_t b1 = ld_hv(&ws[(b1row + l16) * BK128_LD + kk * 16], hi);
+            acc[0][0] = wmma_f16(a0, b0, acc[0][0]);
+            acc[0][1] = wmma_f16(a0, b1, acc[0][1]);
+            acc[1][0] = wmma_f16(a1, b0, acc[1][0]);
+            acc[1][1] = wmma_f16(a1, b1, acc[1][1]);
+        }
+        hy4_sync_lds();
+        cur0 = nxt0;
+        cur1 = nxt1;
+        cur_eff = nxt_eff;
+    }
+}
+
 template <int FMT>
 __global__ void __launch_bounds__(256) k_gemm(const uint8_t* __restrict__ W, int N, int K, const __half* __restrict__ X, float* __restrict__ Y, int M) {
     constexpr int SB = sk_sb_bytes(FMT);
-    __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * GEMM_LDW];
+    __shared__ __attribute__((aligned(16))) half_t ws[GEMM_BN * BK128_LD];
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
     const int wm = wave & 3, wn = wave >> 2;
     const int bn = blockIdx.x * GEMM_BN, bm = blockIdx.y * GEMM_BM;
@@ -870,7 +1078,7 @@ __global__ void __launch_bounds__(256) k_gemm(const uint8_t* __restrict__ W, int
     }
     int wrow = bn + (tid >> 2);
     wrow = wrow < N ? wrow : N - 1;
-    gemm_mainloop<FMT>(W + (size_t)wrow * nsb * SB, nsb, xrow[0], xrow[1], ws, acc, wn * 32, wn * 32 + 16);
+    gemm_mainloop_bk128_64_2x2<FMT>(W + (size_t)wrow * nsb * SB, nsb, xrow[0], xrow[1], ws, acc, wn * 32, wn * 32 + 16);
 #pragma unroll
     for (int i = 0; i < 2; ++i)
 #pragma unroll

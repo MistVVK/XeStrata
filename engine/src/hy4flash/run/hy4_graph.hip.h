@@ -188,7 +188,7 @@ public:
         HCK(hipMalloc(&mla_ws, mla_ws_bytes));
         if (getenv("HY4_POISON")) HCK(hipMemset(mla_ws, 0xFF, mla_ws_bytes));
         ++mla_ws_gen;
-#if HY4_CUDA
+#if HY4_HAS_GRAPHS
         cg_clear();
 #endif
     }
@@ -260,6 +260,7 @@ public:
     std::vector<uint8_t> cold_flag, h_use;  // [41*512] cold experts by (layer, id); [Tc*16] per-pair "computed by the CPU" flags of a prefill chunk
     float *h_z = nullptr, *h_w = nullptr, *h_zcpu = nullptr, *d_zcpu = nullptr;
     int32_t* h_idx = nullptr;
+    uint32_t *d_hyb_pack = nullptr, *h_hyb_pack = nullptr;  // packed [z_f | moe_idx | moe_w] for 1x D2H/layer when T <= 16
     hipEvent_t ev_hyb = nullptr;
     // prefill streaming of the CPU-tier experts: for chunks of >= pf_min_T tokens the experts of a layer are DMA'd from the host arena into alternating device scratch buffers
     // while attention / earlier groups compute. When whole-arena hipHostRegister fails (Windows WDDM or ulimit -l containers) or HY4_PF_BOUNCE=1, a 2 x 256 MiB pinned host
@@ -774,8 +775,10 @@ public:
             const uint64_t slot_off = g.vcache_slot_off(s);
             const int rp = swapped % VPROM_RING;
             if (swapped >= VPROM_RING) HCK(hipEventSynchronize(vprom[rp].ev_done));
-            std::memcpy(vprom[rp].h_stg, vw.body, vw.body_bytes);
-            HCK(hipMemcpyAsync(g.vcache_slot_ptr(s), vprom[rp].h_stg, vw.body_bytes, hipMemcpyHostToDevice, st2));
+            const bool direct_dma = pf_stream && !pf_bounce;
+            const void* src = direct_dma ? (const void*)vw.body : (const void*)vprom[rp].h_stg;
+            if (!direct_dma) std::memcpy(vprom[rp].h_stg, vw.body, vw.body_bytes);
+            HCK(hipMemcpyAsync(g.vcache_slot_ptr(s), src, vw.body_bytes, hipMemcpyHostToDevice, st2));
             HCK(hipEventRecord(vprom[rp].ev_done, st2));
             vslots[s] = {nl, ne};
             vslot_of[nidx] = s;
@@ -864,8 +867,10 @@ public:
             vslots[victim] = {-2, -2};  // mark in-flight so no other promotion picks this slot
             HCK(hipEventRecord(vprom[rp].ev_evict, st));
             HCK(hipStreamWaitEvent(st2, vprom[rp].ev_evict, 0));
-            std::memcpy(vprom[rp].h_stg, vw.body, vw.body_bytes);
-            HCK(hipMemcpyAsync(g.vcache_slot_ptr(victim), vprom[rp].h_stg, vw.body_bytes, hipMemcpyHostToDevice, st2));
+            const bool direct_dma = pf_stream && !pf_bounce;
+            const void* src = direct_dma ? (const void*)vw.body : (const void*)vprom[rp].h_stg;
+            if (!direct_dma) std::memcpy(vprom[rp].h_stg, vw.body, vw.body_bytes);
+            HCK(hipMemcpyAsync(g.vcache_slot_ptr(victim), src, vw.body_bytes, hipMemcpyHostToDevice, st2));
             HCK(hipEventRecord(vprom[rp].ev_done, st2));
             vprom[rp].inflight = true;
             vprom[rp].slot = victim;
@@ -984,7 +989,7 @@ public:
     bool cuda_graph_on = false;
     bool capturing = false;
     int cap_score_grid = 0;
-#if HY4_CUDA
+#if HY4_HAS_GRAPHS
     struct CgKey {
         int T, is_tree, use_list, s_causal, s_swa, score_grid, dfly_cap, route_now, nof, kv_is_host, slots_sparse, engram_ready, hyb, n_peers;
         int lin_gemv_max, moe_dec_max, int8_mma, dp4a, mla_ws_gen;
@@ -992,15 +997,15 @@ public:
     };
     struct CgEntry {
         CgKey key;
-        cudaGraphExec_t g_l0 = nullptr;       // embed + L0 (or all 42 layers when !engram_ready && !hyb && n_peers==0)
-        cudaGraphExec_t g_l1_10 = nullptr;    // L1 .. emeta.layers[1]-1 (when engram_ready && !hyb && n_peers==0)
-        cudaGraphExec_t g_l11_41 = nullptr;   // emeta.layers[1] .. 41 (when engram_ready && !hyb && n_peers==0)
-        cudaGraphExec_t g_pre[41] = {};       // hybrid / multi-GPU: per-MoE-layer pre segment
-        cudaGraphExec_t g_gpuexp[41] = {};    // hybrid / multi-GPU: per-MoE-layer GPU-expert + shared segment
-        cudaGraphExec_t g_tail_last = nullptr; // hybrid / multi-GPU: layer 41 post tail
-        std::vector<std::array<cudaGraphExec_t, 41>> g_peers;  // multi-GPU: per-peer moe_experts graphs
+        hipGraphExec_t g_l0 = nullptr;       // embed + L0 (or all 42 layers when !engram_ready && !hyb && n_peers==0)
+        hipGraphExec_t g_l1_10 = nullptr;    // L1 .. emeta.layers[1]-1 (when engram_ready && !hyb && n_peers==0)
+        hipGraphExec_t g_l11_41 = nullptr;   // emeta.layers[1] .. 41 (when engram_ready && !hyb && n_peers==0)
+        hipGraphExec_t g_pre[41] = {};       // hybrid / multi-GPU: per-MoE-layer pre segment
+        hipGraphExec_t g_gpuexp[41] = {};    // hybrid / multi-GPU: per-MoE-layer GPU-expert + shared segment
+        hipGraphExec_t g_tail_last = nullptr; // hybrid / multi-GPU: layer 41 post tail
+        std::vector<std::array<hipGraphExec_t, 41>> g_peers;  // multi-GPU: per-peer moe_experts graphs
         void destroy() {
-            auto d = [](cudaGraphExec_t& e) { if (e) { (void)cudaGraphExecDestroy(e); e = nullptr; } };
+            auto d = [](hipGraphExec_t& e) { if (e) { (void)hipGraphExecDestroy(e); e = nullptr; } };
             d(g_l0); d(g_l1_10); d(g_l11_41); d(g_tail_last);
             for (int i = 0; i < 41; ++i) { d(g_pre[i]); d(g_gpuexp[i]); }
             for (auto& arr : g_peers) for (int i = 0; i < 41; ++i) d(arr[i]);
@@ -1012,7 +1017,11 @@ public:
         for (auto& e : cg_cache) e.destroy();
         cg_cache.clear();
     }
-    ~Runner() { cg_clear(); if (h_experts) { (void)hipHostFree(h_experts); h_experts = nullptr; } }
+    ~Runner() {
+        cg_clear();
+        if (h_experts) { (void)hipHostFree(h_experts); h_experts = nullptr; }
+        if (h_hyb_pack) { (void)hipHostFree(h_hyb_pack); h_hyb_pack = nullptr; }
+    }
 #endif
 
     Runner(GpuModel& gm, int max_ctx_, int max_chunk) : g(gm), c(gm.man.c), max_ctx(max_ctx_), Tc(max_chunk) {}
@@ -1313,6 +1322,8 @@ public:
             HCK(hipHostMalloc((void**)&h_zcpu, nz * 4, hipHostMallocDefault));
             HCK(hipHostMalloc((void**)&h_w, (size_t)Tc * 16 * 4, hipHostMallocDefault));
             HCK(hipHostMalloc((void**)&h_idx, (size_t)Tc * 16 * 4, hipHostMallocDefault));
+            HCK(hipHostMalloc((void**)&h_hyb_pack, (size_t)16 * 1568 * 4, hipHostMallocDefault));
+            d_hyb_pack = dalloc<uint32_t>((size_t)16 * 1568);
             d_zcpu = dalloc<float>(nz);
             HCK(hipEventCreateWithFlags(&ev_hyb, hipEventDisableTiming));
             int nth = getenv("HY4_CPU_THREADS") ? atoi(getenv("HY4_CPU_THREADS")) : CpuExperts::default_threads();
@@ -1448,7 +1459,18 @@ public:
         tune_init();
 #if HY4_CUDA
         skd::cublas_pf().ensure(st);
-        cuda_graph_on = getenv("HY4_CUDA_GRAPH") ? atoi(getenv("HY4_CUDA_GRAPH")) != 0 : true;
+#endif
+#if HY4_HAS_GRAPHS
+        {
+            const char* cg_env = getenv("HY4_GPU_GRAPH");
+            if (!cg_env) cg_env = getenv("HY4_CUDA_GRAPH");
+            if (!cg_env) cg_env = getenv("HY4_HIP_GRAPH");
+            // On CUDA, capture both all-VRAM and hybrid by default; on AMD HIP (ROCm + Windows WDDM),
+            // hipGraphInstantiate on 42-layer MoE graphs introduces 80-150ms stalls on first (T,is_tree) verify capture
+            // that trip DFly2 adaptive backoff, so default off (opt-in via HY4_HIP_GRAPH=1 / HY4_GPU_GRAPH=1).
+            const bool def_graph = HY4_CUDA ? true : false;
+            cuda_graph_on = cg_env ? atoi(cg_env) != 0 : def_graph;
+        }
         HCK(hipHostMalloc((void**)&h_step, sizeof(DevStepArgs), hipHostMallocDefault));
         d_step = dalloc<DevStepArgs>(1);
         HCK(hipHostMalloc((void**)&h_ids, 64, hipHostMallocDefault));
@@ -1459,10 +1481,10 @@ public:
                                                 mla_workspace_bytes(8, c.heads_sparse, max_ctx + 16));
             ensure_mla_ws(need_dec_ws);
         }
-#if HY4_MMA
+#if HY4_CUDA && HY4_MMA
         if (skd::lin_int8_mma()) skd::int8_act_buf().ensure((size_t)Tc * 16384, skd::lin_int8_mma() >= 2);
 #endif
-        if (cuda_graph_on) fprintf(stderr, "[runner] CUDA Graph capture/replay enabled (HY4_CUDA_GRAPH=1)\n");
+        if (cuda_graph_on) fprintf(stderr, "[runner] %s Graph capture/replay enabled\n", HY4_CUDA ? "CUDA" : "HIP");
 #endif
         size_t fr = 0, tot = 0;
         HCK(hipMemGetInfo(&fr, &tot));
@@ -2071,9 +2093,16 @@ public:
             return;
         }
         const int ml = il - 1;
-        HCK(hipMemcpyAsync(h_z, z_f, nz * 4, hipMemcpyDeviceToHost, st));
-        HCK(hipMemcpyAsync(h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
-        HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+        const bool use_pack = (T <= 16 && d_hyb_pack != nullptr && h_hyb_pack != nullptr);
+        if (use_pack) {
+            const size_t npack = (size_t)T * 1568;
+            hipLaunchKernelGGL(k_hyb_pack, dim3((npack + 255) / 256), dim3(256), 0, st, z_f, moe_idx, moe_w, d_hyb_pack, T);
+            HCK(hipMemcpyAsync(h_hyb_pack, d_hyb_pack, npack * 4, hipMemcpyDeviceToHost, st));
+        } else {
+            HCK(hipMemcpyAsync(h_z, z_f, nz * 4, hipMemcpyDeviceToHost, st));
+            HCK(hipMemcpyAsync(h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+            HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+        }
         HCK(hipEventRecord(ev_hyb, st));
         { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, z_f, z_h, nz); }
         peers_launch(il, T);
@@ -2090,6 +2119,9 @@ public:
         lin(pm + ".shared_experts.down_proj.weight", H1, F3s, T);  // [T][3072]
         double t0 = now_s();
         HCK(hipEventSynchronize(ev_hyb));
+        const float* hz_p = use_pack ? reinterpret_cast<const float*>(h_hyb_pack) : h_z;
+        const int32_t* hidx_p = use_pack ? reinterpret_cast<const int32_t*>(h_hyb_pack + (size_t)T * 1536) : h_idx;
+        const float* hw_p = use_pack ? reinterpret_cast<const float*>(h_hyb_pack + (size_t)T * 1552) : h_w;
         const uint8_t* use_ptr = nullptr;
         const bool do_tail = (tail_skip > 0 && T <= 16);
         if (vcache_nslots > 1 || do_tail) {
@@ -2098,14 +2130,14 @@ public:
                 for (int e = 0; e < 512; ++e) minr[e] = 99;
                 for (int t = 0; t < T; ++t)
                     for (int s = 0; s < 16; ++s) {
-                        const int e = h_idx[(size_t)t * 16 + s];
+                        const int e = hidx_p[(size_t)t * 16 + s];
                         if (e >= 0 && e < 512 && s < minr[e]) minr[e] = s;
                     }
             }
             for (int t = 0; t < T; ++t)
                 for (int s = 0; s < 16; ++s) {
                     const size_t i = (size_t)t * 16 + s;
-                    const int e = h_idx[i];
+                    const int e = hidx_p[i];
                     uint8_t u = (e >= 0 && e < 512 && !(vcache_nslots > 1 && vram_flag[ml * 512 + e])) ? 1 : 0;
                     if (u && do_tail && g.experts[(size_t)ml * 512 + e].tier >= 2 && minr[e] >= tail_skip) {
                         u = 0;
@@ -2115,14 +2147,13 @@ public:
                 }
             use_ptr = h_use.data();
         }
-        cpu.submit(ml, T, h_z, h_idx, h_w, use_ptr, h_zcpu);
-        if (vcache_nslots > 1) vcache_note_decode(ml, T, h_idx);  // hidden behind CPU expert execution!
+        cpu.submit(ml, T, hz_p, hidx_p, hw_p, use_ptr, h_zcpu);
+        if (vcache_nslots > 1) vcache_note_decode(ml, T, hidx_p);  // hidden behind CPU expert execution!
         cpu.wait();
         t_cpu_wait += now_s() - t0;
         peers_gather(T);
         HCK(hipMemcpyAsync(d_zcpu, h_zcpu, nz * 4, hipMemcpyHostToDevice, st));
-        hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
-        { PS _q(this, "f2h"); hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz); }
+        { PS _q(this, "add_f2h"); hipLaunchKernelGGL(k_add_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, z_h, nz); }
         lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);  // [T][3072]
         { PS _q(this, "combine_norm_post"); hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3s, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps); }
     }
@@ -2234,7 +2265,7 @@ public:
         slots_sparse = (int)ns;
         kv_is_host = true;
         ++kv_gen;
-#if HY4_CUDA
+#if HY4_HAS_GRAPHS
         cg_clear();
 #endif
         fprintf(stderr, "[runner] sparse KV + IndexPool moved to pinned host memory (%d positions, %.2f GB, %.2f s)\n", max_ctx, host_big_bytes / 1e9, now_s() - t0);
@@ -2294,7 +2325,7 @@ public:
         kv_alloc_pos = target;
         slots_sparse = (int)ns;
         ++kv_gen;
-#if HY4_CUDA
+#if HY4_HAS_GRAPHS
         cg_clear();
 #endif
         fprintf(stderr, "[runner] sparse KV + IndexPool grew in VRAM: %d -> %d positions (%.2f GB total, %.1f ms)\n",
@@ -2352,24 +2383,23 @@ public:
             cap_rows = cnt;
         }
     }
-#if HY4_CUDA
+#if HY4_HAS_GRAPHS
     template <class Fn>
-    cudaGraphExec_t cg_capture_one(Fn&& fn) {
-        cudaGraph_t gr = nullptr;
-        cudaGraphExec_t ex = nullptr;
-        HCK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+    hipGraphExec_t cg_capture_one(Fn&& fn) {
+        hipGraph_t gr = nullptr;
+        hipGraphExec_t ex = nullptr;
+        HCK(hipStreamBeginCapture(st, hipStreamCaptureModeThreadLocal));
         fn();
-        HCK(cudaStreamEndCapture(st, &gr));
-        HCK(cudaGraphInstantiate(&ex, gr, nullptr, nullptr, 0));
-        HCK(cudaGraphDestroy(gr));
+        HCK(hipStreamEndCapture(st, &gr));
+        HCK(hipGraphInstantiate(&ex, gr, nullptr, nullptr, 0));
+        HCK(hipGraphDestroy(gr));
         return ex;
     }
     void cg_emit_layer_pre_hyb(int il, int p0, int T, const TreeSpec* tree = nullptr) {
         const size_t nz = (size_t)T * 1536;
         if (il > 1) {
             const std::string pm_prev = L(il - 1) + ".mlp";
-            hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
-            hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz);
+            hipLaunchKernelGGL(k_add_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, z_h, nz);
             lin(pm_prev + ".routed_expert_up_proj.weight", z_h, F2, T);
             hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3_dec, (const float*)tw(pm_prev + ".combine_output_norm.weight"), x, post, c.rms_eps);
         }
@@ -2392,9 +2422,15 @@ public:
         if (tune & TN_TOPK) hipLaunchKernelGGL(k_router_topk_w32, dim3(T), dim3(32), 0, st, F1, rb, moe_idx, moe_w, 16, c.routed_scale, (const uint4*)nullptr, (uint4*)nullptr);
         else hipLaunchKernelGGL(k_router_topk, dim3(T), dim3(256), 0, st, F1, rb, moe_idx, moe_w, 512, 16, c.routed_scale, (const uint4*)nullptr, (uint4*)nullptr);
         lin(pm + ".routed_expert_down_proj.weight", cur_h, z_f, T);
-        HCK(hipMemcpyAsync(h_z, z_f, nz * 4, hipMemcpyDeviceToHost, st));
-        HCK(hipMemcpyAsync(h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
-        HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+        if (d_hyb_pack && h_hyb_pack) {
+            const size_t npack = (size_t)T * 1568;
+            hipLaunchKernelGGL(k_hyb_pack, dim3((npack + 255) / 256), dim3(256), 0, st, z_f, moe_idx, moe_w, d_hyb_pack, T);
+            HCK(hipMemcpyAsync(h_hyb_pack, d_hyb_pack, npack * 4, hipMemcpyDeviceToHost, st));
+        } else {
+            HCK(hipMemcpyAsync(h_z, z_f, nz * 4, hipMemcpyDeviceToHost, st));
+            HCK(hipMemcpyAsync(h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+            HCK(hipMemcpyAsync(h_w, moe_w, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
+        }
     }
     void cg_emit_layer_gpuexp_hyb(int il, int T) {
         const size_t nz = (size_t)T * 1536;
@@ -2411,6 +2447,7 @@ public:
         hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3_dec, H1, nz);
         lin(pm + ".shared_experts.down_proj.weight", H1, F3_dec, T);
     }
+#if HY4_CUDA
     void cg_emit_layer_pre_mgpu(int il, int p0, int T, const TreeSpec* tree = nullptr) {
         const size_t nz = (size_t)T * 1536;
         if (il > 1) {
@@ -2456,6 +2493,7 @@ public:
         hipLaunchKernelGGL(k_swiglu_h, dim3((nz + 255) / 256), dim3(256), 0, st, F1, F3_dec, H1, nz);
         lin(pm + ".shared_experts.down_proj.weight", H1, F3_dec, T);
     }
+#endif
     bool forward_chunk_graph(const int32_t* tok_all, int p0, int T, std::string& err, const TreeSpec* tree = nullptr) {
         const bool is_tree = tree != nullptr && tree->M > 0;
         const int end_pos = is_tree ? (p0 + tree->max_depth() + 1) : (p0 + T);
@@ -2476,7 +2514,7 @@ public:
         const size_t need_ws = std::max(mla_workspace_bytes(ma_swa), mla_workspace_bytes(T, c.heads_sparse, std::max(index_topk, p0 + T)));
         ensure_mla_ws(need_ws);
         if (!hcpart) hcpart = dalloc<float>((size_t)Tc * 24 * 9);
-#if HY4_MMA
+#if HY4_CUDA && HY4_MMA
         if (skd::lin_int8_mma()) skd::int8_act_buf().ensure((size_t)T * 16384, skd::lin_int8_mma() >= 2);
 #endif
         CgKey key{};
@@ -2496,9 +2534,11 @@ public:
         key.n_peers = (int)peer_runs.size();
         key.lin_gemv_max = skd::lin_gemv_max_m();
         key.moe_dec_max = skd::moe_dec_max_m();
-#if HY4_MMA
+#if HY4_CUDA && HY4_MMA
         key.int8_mma = skd::lin_int8_mma();
         key.dp4a = skd::lin_dp4a();
+#elif HY4_MMA
+        key.int8_mma = skd::int8_wmma_mode();
 #endif
         key.mla_ws_gen = mla_ws_gen;
         CgEntry* ent = nullptr;
@@ -2548,7 +2588,9 @@ public:
                         }
                     });
                 }
-            } else if (!hyb && !peer_runs.empty()) {
+            }
+#if HY4_CUDA
+            else if (!hyb && !peer_runs.empty()) {
                 // Multi-GPU segmented CUDA Graphs: GPU 0 segments + per-peer moe_experts graphs (zero host sync!)
                 ent->g_l0 = cg_capture_one([&] {
                     hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
@@ -2581,7 +2623,9 @@ public:
                     lin(pm_last + ".routed_expert_up_proj.weight", z_h, F2, T);
                     hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3_dec, (const float*)tw(pm_last + ".combine_output_norm.weight"), x, post, c.rms_eps);
                 });
-            } else {
+            }
+#endif
+            else {
                 // Hybrid segmented graphs: layer 0 + 41 (pre, gpuexp) pairs + final layer tail
                 ent->g_l0 = cg_capture_one([&] {
                     hipLaunchKernelGGL(k_embed_hc, dim3(T), dim3(256), 0, st, (const uint8_t*)tw("model.embed_tokens.weight"), d_ids, x, T);
@@ -2595,8 +2639,7 @@ public:
                 const size_t nz = (size_t)T * 1536;
                 const std::string pm_last = L(c.n_layers - 1) + ".mlp";
                 ent->g_tail_last = cg_capture_one([&] {
-                    hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, nz);
-                    hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz);
+                    hipLaunchKernelGGL(k_add_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, z_h, nz);
                     lin(pm_last + ".routed_expert_up_proj.weight", z_h, F2, T);
                     hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3_dec, (const float*)tw(pm_last + ".combine_output_norm.weight"), x, post, c.rms_eps);
                 });
@@ -2629,23 +2672,25 @@ public:
             t_eng_issue += now_s() - t_pf0;
         }
         if (!hyb && peer_runs.empty()) {
-            HCK(cudaGraphLaunch(ent->g_l0, st));
+            HCK(hipGraphLaunch(ent->g_l0, st));
             if (engram_ready) {
                 double tq = now_s();
                 if (!engram_prep(tok_all, p0, T, err, tree)) return false;
                 t_eng_prep += now_s() - tq; ++n_eng_dec;
-                HCK(cudaGraphLaunch(ent->g_l1_10, st));
+                HCK(hipGraphLaunch(ent->g_l1_10, st));
                 if (!engram_prep_rest(err)) return false;
-                HCK(cudaGraphLaunch(ent->g_l11_41, st));
+                HCK(hipGraphLaunch(ent->g_l11_41, st));
             }
-        } else if (!hyb && !peer_runs.empty()) {
+        }
+#if HY4_CUDA
+        else if (!hyb && !peer_runs.empty()) {
             const size_t nz = (size_t)T * 1536;
             const int l_mid = engram_ready ? emeta.layers[1] : -1;
-            HCK(cudaGraphLaunch(ent->g_l0, st));
+            HCK(hipGraphLaunch(ent->g_l0, st));
             for (int il = 1; il < c.n_layers; ++il) {
                 if (engram_ready && il == 1) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err, tree)) return false; t_eng_prep += now_s() - tq; ++n_eng_dec; }
                 if (engram_ready && il == l_mid && !engram_prep_rest(err)) return false;
-                HCK(cudaGraphLaunch(ent->g_pre[il - 1], st));
+                HCK(hipGraphLaunch(ent->g_pre[il - 1], st));
                 for (size_t p = 0; p < peer_runs.size(); ++p) {
                     PeerRun& pr = peer_runs[p];
                     HCK(cudaEventRecord(pr.ev_in, st));
@@ -2659,20 +2704,26 @@ public:
                     HCK(cudaEventRecord(pr.ev_out, pr.st));
                 }
                 HCK(cudaSetDevice(g.primary_gpu));
-                HCK(cudaGraphLaunch(ent->g_gpuexp[il - 1], st));
+                HCK(hipGraphLaunch(ent->g_gpuexp[il - 1], st));
                 for (auto& pr : peer_runs) HCK(cudaStreamWaitEvent(st, pr.ev_out, 0));
             }
-            HCK(cudaGraphLaunch(ent->g_tail_last, st));
-        } else {
+            HCK(hipGraphLaunch(ent->g_tail_last, st));
+        }
+#endif
+        else {
             const size_t nz = (size_t)T * 1536;
             const int l_mid = engram_ready ? emeta.layers[1] : -1;
-            HCK(cudaGraphLaunch(ent->g_l0, st));
+            const bool use_pack = (d_hyb_pack != nullptr && h_hyb_pack != nullptr);
+            const float* hz_p = use_pack ? reinterpret_cast<const float*>(h_hyb_pack) : h_z;
+            const int32_t* hidx_p = use_pack ? reinterpret_cast<const int32_t*>(h_hyb_pack + (size_t)T * 1536) : h_idx;
+            const float* hw_p = use_pack ? reinterpret_cast<const float*>(h_hyb_pack + (size_t)T * 1552) : h_w;
+            HCK(hipGraphLaunch(ent->g_l0, st));
             for (int il = 1; il < c.n_layers; ++il) {
                 if (engram_ready && il == 1) { double tq = now_s(); if (!engram_prep(tok_all, p0, T, err, tree)) return false; t_eng_prep += now_s() - tq; ++n_eng_dec; }
                 if (engram_ready && il == l_mid && !engram_prep_rest(err)) return false;
-                HCK(cudaGraphLaunch(ent->g_pre[il - 1], st));
+                HCK(hipGraphLaunch(ent->g_pre[il - 1], st));
                 HCK(hipEventRecord(ev_hyb, st));
-                HCK(cudaGraphLaunch(ent->g_gpuexp[il - 1], st));
+                HCK(hipGraphLaunch(ent->g_gpuexp[il - 1], st));
                 double t0 = now_s();
                 HCK(hipEventSynchronize(ev_hyb));
                 const int ml = il - 1;
@@ -2684,14 +2735,14 @@ public:
                         for (int e = 0; e < 512; ++e) minr[e] = 99;
                         for (int t = 0; t < T; ++t)
                             for (int s = 0; s < 16; ++s) {
-                                const int e = h_idx[(size_t)t * 16 + s];
+                                const int e = hidx_p[(size_t)t * 16 + s];
                                 if (e >= 0 && e < 512 && s < minr[e]) minr[e] = s;
                             }
                     }
                     for (int t = 0; t < T; ++t)
                         for (int s = 0; s < 16; ++s) {
                             const size_t i = (size_t)t * 16 + s;
-                            const int e = h_idx[i];
+                            const int e = hidx_p[i];
                             uint8_t u = (e >= 0 && e < 512 && !(vcache_nslots > 1 && vram_flag[ml * 512 + e])) ? 1 : 0;
                             if (u && do_tail && g.experts[(size_t)ml * 512 + e].tier >= 2 && minr[e] >= tail_skip) {
                                 u = 0;
@@ -2701,13 +2752,13 @@ public:
                         }
                     use_ptr = h_use.data();
                 }
-                cpu.submit(ml, T, h_z, h_idx, h_w, use_ptr, h_zcpu);
-                if (vcache_nslots > 1) vcache_note_decode(ml, T, h_idx);
+                cpu.submit(ml, T, hz_p, hidx_p, hw_p, use_ptr, h_zcpu);
+                if (vcache_nslots > 1) vcache_note_decode(ml, T, hidx_p);
                 cpu.wait();
                 t_cpu_wait += now_s() - t0;
                 HCK(hipMemcpyAsync(d_zcpu, h_zcpu, nz * 4, hipMemcpyHostToDevice, st));
             }
-            HCK(cudaGraphLaunch(ent->g_tail_last, st));
+            HCK(hipGraphLaunch(ent->g_tail_last, st));
         }
         // Update host-side capture metadata for DFly2
         last_use_list = use_list;
@@ -2727,7 +2778,7 @@ public:
             vcache_poll_commit();
         }
         const bool is_tree = tree != nullptr && tree->M > 0;
-#if HY4_CUDA
+#if HY4_HAS_GRAPHS
         if (cuda_graph_on && (peer_runs.empty() || !hyb) && T <= 8 && !dump && !prof && !prof2 && !(!is_tree && vis && vis->needs_fix(p0, T)))
             return forward_chunk_graph(tok_all, p0, T, err, tree);
 #endif
