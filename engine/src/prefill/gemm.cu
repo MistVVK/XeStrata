@@ -440,7 +440,7 @@ HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipbl
     auto algo = candidates.front().algo;
 #if defined(HIPBLASLT_VERSION_MAJOR) && (HIPBLASLT_VERSION_MAJOR * 100000 + HIPBLASLT_VERSION_MINOR * 100 + HIPBLASLT_VERSION_PATCH >= 100500)
     if (!row->kernel_name.empty()) {
-        const std::string actual_name = hipblaslt_ext::getAlgoName(algo);
+        const std::string actual_name = hipblaslt_ext::getKernelNameFromAlgo(state.handle, algo);
         if (!actual_name.empty() && actual_name != row->kernel_name) {
             if (verbose) {
                 std::fprintf(stderr, "prefill gemm: Lt fallback; solution %d kernel '%s' != V2 expected '%s'\n",
