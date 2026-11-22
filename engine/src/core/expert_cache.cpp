@@ -817,11 +817,7 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
 
 size_t ExpertCache::slot_capacity(int32_t slot) const {
     if (slot < 0 || slot >= slots_) return 0;
-    if (!off_.empty()) {
-        const uint64_t end = (slot + 1 < slots_) ? off_[(size_t) (slot + 1)] : (uint64_t) bytes_;
-        return end > off_[(size_t) slot] ? (size_t) (end - off_[(size_t) slot]) : 0;
-    }
-    return (size_t) blob_;
+    return (size_t) slot_room(slot);
 }
 
 bool ExpertCache::scrub_loan_boundary(int32_t first_lent_slot, std::string& err, void* stream) {

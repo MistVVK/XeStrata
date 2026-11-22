@@ -205,7 +205,9 @@ void eval_inkling2_expert_batch(
     size_t m,
     size_t hidden,
     size_t inter,
-    float* y_out) noexcept {
+    float* y_out,
+    void (*wait_down)(void*),
+    void* wait_ctx) noexcept {
     if (m == 0) return;
     std::vector<float> gu(m * 2 * inter);
     std::vector<float> act(m * inter);
@@ -317,7 +319,8 @@ void eval_inkling2_expert_batch(
         }
     }
 
-    // 3. w2 projection [hidden, inter]
+    // 3. w2 projection [hidden, inter] (wait for down projection bytes if overlapped with NVMe read!)
+    if (wait_down) wait_down(wait_ctx);
     if (dn_code == SkCode::GGUF_RAW) {
         GgufExpertHeader hdr{};
         std::memcpy(&hdr, body, sizeof(hdr));

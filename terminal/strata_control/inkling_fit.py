@@ -221,3 +221,32 @@ def build_of_model_name(model_name: str | None) -> str | None:
         return None
     size = low[len(FAMILY_NAME) + 1:].upper()
     return size if size in BUILDS else None
+
+
+def ssd_mode_flags(build: str, vram_gib: float | None, ram_gib: float, unified: bool = False,
+                   ctx: int | None = None, vision: bool = False, parallel: int = 1) -> dict:
+    """First-class GPU+SSD Only / CPU+SSD Only runner flags for Inkling-2-Mini (never blocks or overcommits RAM)."""
+    placed = place(build, vram_gib, ram_gib, unified, ctx, vision, parallel)
+    v = float(vram_gib or 0.0)
+    r = float(ram_gib or 0.0)
+    ssd = placed["ssd_gb"]
+    if ssd <= 0.05:
+        if not unified and v < 4.0:
+            return {"tier": "cpu_in_memory", "runnable": True, "placement": placed, "flags": ["--cpu"]}
+        return {"tier": "in_memory", "runnable": True, "placement": placed, "flags": []}
+    if not unified and v >= 4.0 and (placed["ram_gb"] < 8.0 and ssd > placed["ram_gb"]):
+        return {
+            "tier": "gpu_ssd_only", "runnable": True, "placement": placed,
+            "bounce_ring_gb": round(min(2.0, max(0.5, r * 0.15)), 1),
+            "flags": ["--ssd-experts", "--ram-experts-gb", "0"],
+        }
+    if not unified and v < 4.0:
+        lru_gb = round(max(1.0, min(placed["ram_gb"] if placed["ram_gb"] > 0 else max(1.0, r * 0.5), max(1.0, r * 0.5))), 1)
+        return {
+            "tier": "cpu_ssd_only", "runnable": True, "placement": placed,
+            "flags": ["--cpu", "--ssd-experts", "--ram-experts-gb", f"{lru_gb:g}"],
+        }
+    return {
+        "tier": "hybrid_ssd", "runnable": True, "placement": placed,
+        "flags": ["--ssd-experts", "--ram-experts-gb", f"{max(0.0, placed['ram_gb']):g}"],
+    }

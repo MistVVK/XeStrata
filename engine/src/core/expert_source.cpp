@@ -2839,11 +2839,16 @@ bool FileExpertSource::open_prompt_direct(std::string& why) {
 #endif
 }
 
-bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
+bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why, bool force) {
 #if defined(_WIN32) || defined(__linux__)
     if (base_ == nullptr || paths_.empty() || !direct_.empty()) {
         why = !direct_.empty() ? "already unbuffered" : "no expert files open";
         return !direct_.empty();
+    }
+    if (force) {
+        if (!open_direct(why)) return false;
+        why = "--ssd-experts / bounded GPU+SSD or CPU+SSD direct NVMe streaming";
+        return true;
     }
     // #577: the file tier reads the experts outside the RAM copy, not every byte of the shards (dense weights, the
     // PLE table), and the copy holds at most every expert - the budget asked for can be more than that
@@ -2853,6 +2858,7 @@ bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
     return open_direct(why);
 #else
     (void) ram_bytes;
+    (void) force;
     why = "through the file cache (no unbuffered reads on this platform)";
     return false;
 #endif
@@ -3549,7 +3555,9 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
     if (layer + 1 >= (int64_t) routers_.size() || n_tok <= 0 || x == nullptr) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
+        // Zero-drop latest-submission overwrite: even when busy_ is true, overwrite the pending staging slot
+        // (worker runs from work_x_ / work_res_) so the freshest L+1/L+2 prediction is never skipped!
+        if (pending_) skipped_.fetch_add(1, std::memory_order_relaxed);  // superseded unstarted older layer
         n_tok_ = std::min<int64_t>(n_tok, 8);
         std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
         layer_ = layer + 1;
@@ -3677,7 +3685,13 @@ void RouterLookahead::run() {
             busy_ = true;
             layer = layer_;
             nt = n_tok_;
-            host_res = has_res_ ? res_.data() : nullptr;
+            work_x_.assign(x_.data(), x_.data() + (size_t) (nt * n_embd_));
+            if (has_res_) {
+                work_res_ = res_;
+                host_res = work_res_.data();
+            } else {
+                host_res = nullptr;
+            }
             fs = fs_;
             sgen = sub_gen_;
         }
@@ -3695,14 +3709,14 @@ void RouterLookahead::run() {
         // prefetch); the order of the additions differs between the three, the output does not depend on it.
 #if defined(__aarch64__) && !defined(STRATA_GPU_METAL)   // Metal (Apple silicon) keeps the plain loop below: its bf16_rows_dot_multi is a stub
         strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
-                                                  x_.data(), (int) nt, logits.data());
+                                                  work_x_.data(), (int) nt, logits.data());
 #else
         if (strata::kernels::cpu::cpu_avx2_ok()) {
             strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
-                                                      x_.data(), (int) nt, logits.data());
+                                                      work_x_.data(), (int) nt, logits.data());
         } else if (strata::kernels::cpu::cpu_avx1_ok()) {
             strata::kernels::cpu::bf16_rows_dot_multi_avx1(routers_[(size_t) layer].data(), (int) n_expert_,
-                                                           (int) n_embd_, x_.data(), (int) nt, logits.data());
+                                                           (int) n_embd_, work_x_.data(), (int) nt, logits.data());
         } else {
             // a mul and an add, not std::fma: without an FMA instruction that is a libm call per element (74x
             // slower on a Xeon E5-2665, measured by the fork)
@@ -3710,7 +3724,7 @@ void RouterLookahead::run() {
             for (int64_t r = 0; r < n_expert_; ++r) {
                 const uint16_t* wr = rw + (size_t) r * (size_t) n_embd_;
                 for (int64_t t = 0; t < nt; ++t) {
-                    const float* xr = x_.data() + (size_t) t * (size_t) n_embd_;
+                    const float* xr = work_x_.data() + (size_t) t * (size_t) n_embd_;
                     float acc = 0.0f;
                     for (int64_t c = 0; c < n_embd_; ++c) {
                         const uint32_t bits = (uint32_t) wr[c] << 16;

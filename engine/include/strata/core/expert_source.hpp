@@ -364,11 +364,13 @@ private:
     std::condition_variable cv_;
     bool quit_ = false, pending_ = false, busy_ = false;
     int64_t layer_ = -1, n_tok_ = 0;
-    std::vector<int32_t> res_;   ///< the residency rows of the layers predicted, copied at submit (admissions write the table)
+    std::vector<int32_t> res_;       ///< pending residency rows (overwritten by submit() without dropping!)
+    std::vector<int32_t> work_res_;  ///< worker's active copy while busy_ == true
     bool has_res_ = false;
     uint64_t sub_gen_ = 0;
-    ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
-    std::vector<float> x_;
+    ForesightSwap* fs_ = nullptr;    ///< (under mu_)
+    std::vector<float> x_;           ///< pending activation buffer (overwritten by submit() without dropping!)
+    std::vector<float> work_x_;      ///< worker's active copy while busy_ == true
     std::atomic<int64_t> predicted_{0}, skipped_{0};
     std::atomic<uint64_t> busy_us_{0};
     // STRATA_LOOKAHEAD_STATS
@@ -913,7 +915,7 @@ public:
     /// experts_unbuffered.  The mapped reads' page faults are one small request each, and the pages they bring in
     /// take the RAM the budget was sized for.  `why` says what decided.
     /// #577: `ram_bytes` counts up to every expert, and only the experts outside it are what the cache must keep.
-    bool set_unbuffered(uint64_t ram_bytes, std::string& why);
+    bool set_unbuffered(uint64_t ram_bytes, std::string& why, bool force = false);
     /// #577: the same decision once the RAM copy is built (pin_cache_complement), from the RAM it really holds and the
     /// expert bytes outside it; switches either way (startup only, nothing reading).  Returns whether unbuffered.
     bool recheck_unbuffered(std::string& why);

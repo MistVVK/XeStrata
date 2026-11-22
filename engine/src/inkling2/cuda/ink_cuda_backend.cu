@@ -136,9 +136,10 @@ public:
                                                                       : (320ull << 20));
         const size_t min_reserve_bytes = min_kv_bytes + ws_pad;
 
-        // Load .strata v1.1 trunk + experts (100% VRAM or 3x loop-weighted vram_load_order!)
+        // Load .strata v1.1 trunk + experts (100% VRAM, hybrid RAM, or first-class GPU+SSD Only!)
         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
-        if (!model_.load(mf.path, gpu_id_, build_screen, err, min_reserve_bytes)) return false;
+        if (!model_.load(mf.path, gpu_id_, build_screen, err, min_reserve_bytes,
+                         opts.vram_experts_gb, opts.ram_experts_gb, opts.ssd_experts)) return false;
 
         auto cuda_kvd = (kv_dtype_ == KvDtype::FP8_E4M3) ? strata::ink::InkKvDtype::FP8
                                                           : strata::ink::InkKvDtype::FP16;

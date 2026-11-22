@@ -413,6 +413,8 @@ int main(int argc, char** argv) {
             cfg.bopts.vram_experts_gb = std::atof(next().c_str());
         } else if (a == "--ram-experts-gb") {
             cfg.bopts.ram_experts_gb = std::atof(next().c_str());
+        } else if (a == "--ssd-experts") {
+            cfg.bopts.ssd_experts = true;
         } else if (a == "--vram-reserve-mib") {
             cfg.bopts.vram_reserve_mib = std::atoi(next().c_str());
         } else if (a == "--cpu-threads") {
@@ -443,7 +445,7 @@ int main(int argc, char** argv) {
                    "  --info PATH [--vision VISION] [--dspark PATH]\n"
                    "  --export-tokenizer PATH OUT_DIR\n"
                    "  --selfcheck [--native PATH] [--verify-hash] [--cpu] [--gpus 1|2] [--kv fp16|fp8|k8v8|k8v4]\n"
-                   "  --bench --native PATH [--parallel 1..64] [--gpus 1|2] [--ep-split F] [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4] [--prompt-len N] [--gen N]\n"
+                   "  --bench --native PATH [--parallel 1..64] [--gpus 1|2] [--ep-split F] [--vram-experts-gb F] [--ram-experts-gb F] [--ssd-experts] [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4] [--prompt-len N] [--gen N]\n"
                    "  --kld-eval REF.bin --native PATH\n"
                    "  --serve --native PATH [--vision VISION] [--dspark PATH] [--max-context N] [--parallel 1..64] [--gpus 1|2] [--draft auto|dspark|off]\n",
                    INKLING_VERSION);

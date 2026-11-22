@@ -433,7 +433,30 @@ int main(int argc, char** argv) {
         else if (a == "--vision") vision_path = nxt();           // HY4-VISION: the Vision shard; loaded on the first request that carries a picture
         else if (a == "--image") image_files.push_back(nxt());  // HY4-VISION (offline runs): a picture file per image-pad token of --tokens, in order (the engine expands each pad)
         else if (a == "--image-max-pixels") image_max_pixels = atoll(nxt().c_str());
-        else if (a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner yet\n", a.c_str(), nxt().c_str());
+        else if (a == "--vram-experts-gb") {
+            std::string v = nxt();
+#ifdef _WIN32
+            _putenv_s("STRATA_HY4_VRAM_GB", v.c_str());
+#else
+            setenv("STRATA_HY4_VRAM_GB", v.c_str(), 1);
+#endif
+        } else if (a == "--ram-experts-gb") {
+            std::string v = nxt();
+#ifdef _WIN32
+            _putenv_s("STRATA_HY4_RAM_GB", v.c_str());
+#else
+            setenv("STRATA_HY4_RAM_GB", v.c_str(), 1);
+#endif
+        } else if (a == "--ssd-experts") {
+            // First-class GPU+SSD Only mode: 0 GiB full host arena, bounded O_DIRECT/FILE_FLAG_NO_BUFFERING ColdStore!
+#ifdef _WIN32
+            _putenv_s("STRATA_HY4_RAM_GB", "0");
+            _putenv_s("STRATA_CPUEXP_COLD_IO", "direct");
+#else
+            setenv("STRATA_HY4_RAM_GB", "0", 1);
+            setenv("STRATA_CPUEXP_COLD_IO", "direct", 1);
+#endif
+        } else if (a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner yet\n", a.c_str(), nxt().c_str());
         else if (a == "--kv") {
             std::string kv = nxt();
             if (kv != "fp16") {

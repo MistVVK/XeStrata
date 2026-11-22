@@ -17,6 +17,8 @@
 
 #include "ink_cuda.cuh"
 #include "ink_moe_cuda.cuh"
+#include "../ink_cold_store.hpp"
+#include "strata/core/moe_wave_plan.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -42,11 +44,12 @@ namespace strata::ink {
 // 1. Fast Host-Side Expert Evaluator (SF4, MX8, S1.5..S8_K) — Bit-Exact to GPU!
 // ============================================================================
 struct InkHostExpertMeta {
-    const uint8_t* body = nullptr;  // pinned host RAM body pointer
+    const uint8_t* body = nullptr;  // pinned host RAM body pointer (nullptr when cold_ssd == true)
     uint32_t body_bytes = 0;
     uint32_t dn_off     = 0;
     uint8_t  gu_code    = 0;
     uint8_t  dn_code    = 0;
+    bool     cold_ssd   = false;    // true in GPU+SSD Only mode: streamed via InkColdStore pinned DMA ring!
 };
 
 namespace host_eval {
@@ -453,10 +456,12 @@ inline float dot_sk_sub64_h(const uint8_t* pl, int fmt, int g, const InkQ8_1_G64
     return 0.0f;
 }
 
-inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float* y_out) noexcept {
+inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float* y_out,
+                              const uint8_t* body_override = nullptr,
+                              void (*wait_down)(void*) = nullptr, void* wait_ctx = nullptr) noexcept {
     constexpr int D = kInkHidden;
     constexpr int I = kInkInter;
-    const uint8_t* body = em.body;
+    const uint8_t* body = body_override ? body_override : em.body;
     if (!body) {
         std::memset(y_out, 0, (size_t)D * sizeof(float));
         return;
@@ -514,7 +519,8 @@ inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float
         }
     }
 
-    // 2. Down projection [D, I]
+    // 2. Down projection [D, I] (overlaps gate+up+SITU compute with down NVMe read when wait_down is set!)
+    if (wait_down) wait_down(wait_ctx);
     if (em.dn_code == FMT_SF4) {
         float hdr[4];
         std::memcpy(hdr, body, 16);
@@ -670,10 +676,15 @@ struct InkHybridEngine {
     int n_layers = kInkPhysLayers;
     int n_experts = kInkExperts;
 
-    // Pinned host expert table (all 3072 experts; body != nullptr for host-resident experts)
+    // Pinned host expert table (all 3072 experts; body != nullptr for RAM-resident, cold_ssd == true for GPU+SSD Only)
     std::vector<InkHostExpertMeta> host_meta;  // [24 * 128]
     uint8_t* h_sec4_pinned = nullptr;
     size_t   h_sec4_bytes  = 0;
+    std::unique_ptr<ink2::InkColdStore> cold_store;
+    bool ssd_only = false;
+    std::atomic<uint64_t> step_gen{1};
+    uint8_t* h_copyback_buf = nullptr;
+    size_t   h_copyback_bytes = 0;
 
     // Mapped doorbell + device state
     InkMappedDoorbell* h_bell = nullptr;
@@ -709,10 +720,35 @@ struct InkHybridEngine {
     std::atomic<int> work_done{0};
     int cur_layer = 0, cur_nj = 0;
     int cur_slot_k[kInkTopK] = {}, cur_eid[kInkTopK] = {};
+    int cur_cold_slot[kInkTopK] = {-1,-1,-1,-1,-1,-1,-1,-1};
+    const uint8_t* cur_cold_ptr[kInkTopK] = {};
     float cur_x[kInkHidden] = {};
     std::vector<std::thread> workers;
     std::thread master_thr;
     int n_threads = 0;
+
+    void eval_doorbell_job(int j) noexcept {
+        const int key = cur_layer * n_experts + cur_eid[j];
+        const auto& hm = host_meta[key];
+        float* ydst = const_cast<float*>(h_bell->y[cur_slot_k[j]]);
+        if (hm.body != nullptr) {
+            host_eval::eval_expert_f32_h(hm, cur_x, ydst);
+        } else if (hm.cold_ssd && cold_store && cur_cold_slot[j] >= 0 && cur_cold_ptr[j] != nullptr) {
+            struct DwCtx { ink2::InkColdStore* cs; int slot; };
+            DwCtx ctx{cold_store.get(), cur_cold_slot[j]};
+            auto dw_cb = +[](void* p) {
+                auto* c = static_cast<DwCtx*>(p);
+                c->cs->wait_down(c->slot);
+            };
+            if (cold_store->wait_gate_up(cur_cold_slot[j])) {
+                host_eval::eval_expert_f32_h(hm, cur_x, ydst, cur_cold_ptr[j], dw_cb, &ctx);
+            } else {
+                std::memset(ydst, 0, (size_t)kInkHidden * sizeof(float));
+            }
+        } else {
+            std::memset(ydst, 0, (size_t)kInkHidden * sizeof(float));
+        }
+    }
 
     void start_workers(int num_threads = 0) {
         if (active) return;
@@ -756,8 +792,7 @@ struct InkHybridEngine {
                     }
                     seen = g;
                     for (int j = t; j < cur_nj; j += n_threads) {
-                        const int key = cur_layer * n_experts + cur_eid[j];
-                        host_eval::eval_expert_f32_h(host_meta[key], cur_x, const_cast<float*>(h_bell->y[cur_slot_k[j]]));
+                        eval_doorbell_job(j);
                     }
                     work_done.fetch_add(1, std::memory_order_release);
                     last_t = std::chrono::steady_clock::now();
@@ -779,9 +814,16 @@ struct InkHybridEngine {
                 std::atomic_thread_fence(std::memory_order_acquire);
                 cur_layer = h_bell->layer;
                 cur_nj    = std::min((int)h_bell->n_jobs, kInkTopK);
+                const uint64_t g_now = step_gen.load(std::memory_order_relaxed);
                 for (int j = 0; j < cur_nj; ++j) {
-                    cur_slot_k[j] = h_bell->slot_k[j];
-                    cur_eid[j]    = h_bell->expert_id[j];
+                    cur_slot_k[j]    = h_bell->slot_k[j];
+                    cur_eid[j]       = h_bell->expert_id[j];
+                    cur_cold_slot[j] = -1;
+                    cur_cold_ptr[j]  = nullptr;
+                    const int key = cur_layer * n_experts + cur_eid[j];
+                    if (cold_store && host_meta[key].cold_ssd && !host_meta[key].body) {
+                        cur_cold_ptr[j] = cold_store->demand_begin(key, cur_layer, g_now, cur_cold_slot[j]);
+                    }
                 }
                 std::memcpy(cur_x, const_cast<const float*>(h_bell->x), kInkHidden * sizeof(float));
                 work_done.store(0, std::memory_order_relaxed);
@@ -789,11 +831,18 @@ struct InkHybridEngine {
                     work_gen.fetch_add(1, std::memory_order_release);
                 }
                 for (int j = 0; j < cur_nj; j += (cur_nj > 1 ? n_threads : 1)) {
-                    const int key = cur_layer * n_experts + cur_eid[j];
-                    host_eval::eval_expert_f32_h(host_meta[key], cur_x, const_cast<float*>(h_bell->y[cur_slot_k[j]]));
+                    eval_doorbell_job(j);
                 }
                 if (n_threads > 1 && cur_nj > 1) {
                     while (work_done.load(std::memory_order_acquire) < n_threads - 1) std::this_thread::yield();
+                }
+                if (cold_store) {
+                    for (int j = 0; j < cur_nj; ++j) {
+                        if (cur_cold_slot[j] >= 0) {
+                            cold_store->unpin_slot(cur_cold_slot[j]);
+                            cur_cold_slot[j] = -1;
+                        }
+                    }
                 }
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 h_bell->ack = seq;
@@ -851,9 +900,13 @@ struct InkHybridEngine {
         std::sort(wants, wants + n_take, [&](int a, int b) { return h_cnt[a] > h_cnt[b]; });
 
         int promoted = 0;
+        std::vector<int> pinned_cold_slots;
+        const uint64_t g_now = step_gen.fetch_add(1, std::memory_order_relaxed);
         for (int i = 0; i < n_take && promoted < 4; ++i) {
             const int key = wants[i];
-            if (key < 0 || key >= n_layers * n_experts || !host_meta[key].body) continue;
+            if (key < 0 || key >= n_layers * n_experts) continue;
+            const auto& nm = host_meta[key];
+            if (!nm.body && !(nm.cold_ssd && cold_store)) continue;
             if (key_to_slot[key] >= 0) continue;
             // Pick free slot or lowest-use victim
             int victim = -1;
@@ -863,11 +916,25 @@ struct InkHybridEngine {
                 if (h_cnt[promo_owner[sl]] < vmin) { vmin = h_cnt[promo_owner[sl]]; victim = sl; }
             }
             if (victim < 0) continue;
+            const uint8_t* src_body = nm.body;
+            int cold_slot = -1;
+            if (!src_body && nm.cold_ssd && cold_store) {
+                src_body = cold_store->demand_wait(key, key / n_experts, g_now, cold_slot);
+                if (!src_body) continue;
+                pinned_cold_slots.push_back(cold_slot);
+            }
             const int old_key = promo_owner[victim];
+            uint8_t* dst_slot = d_promo_pool + (size_t)victim * promo_slot_bytes;
             if (old_key >= 0) {
+                // Full-duplex VRAM -> RAM copyback for SSD-backed evicted experts so future misses hit RAM ring!
+                const auto& om = host_meta[old_key];
+                if (om.cold_ssd && cold_store && h_copyback_buf && om.body_bytes <= h_copyback_bytes) {
+                    INK_CK(cudaMemcpyAsync(h_copyback_buf, dst_slot, om.body_bytes, cudaMemcpyDeviceToHost, promo_st));
+                    INK_CK(cudaStreamSynchronize(promo_st));
+                    cold_store->insert_from_copyback(old_key, h_copyback_buf, om.body_bytes);
+                }
                 key_to_slot[old_key] = -1;
                 InkExpertDev dem{};
-                const auto& om = host_meta[old_key];
                 dem.body_off = orig_host_off[old_key];
                 dem.dn_off   = om.dn_off;
                 dem.gu_code  = om.gu_code;
@@ -875,9 +942,7 @@ struct InkHybridEngine {
                 dem.tier     = 2;
                 INK_CK(cudaMemcpyAsync(&d_experts[old_key / n_experts][old_key % n_experts], &dem, sizeof(dem), cudaMemcpyHostToDevice, promo_st));
             }
-            const auto& nm = host_meta[key];
-            uint8_t* dst_slot = d_promo_pool + (size_t)victim * promo_slot_bytes;
-            INK_CK(cudaMemcpyAsync(dst_slot, nm.body, nm.body_bytes, cudaMemcpyHostToDevice, promo_st));
+            INK_CK(cudaMemcpyAsync(dst_slot, src_body, nm.body_bytes, cudaMemcpyHostToDevice, promo_st));
             InkExpertDev pro{};
             pro.body_off = (uint64_t)((intptr_t)dst_slot - (intptr_t)d_sec4);
             pro.dn_off   = nm.dn_off;
@@ -890,6 +955,9 @@ struct InkHybridEngine {
             ++promoted;
         }
         if (promoted > 0) INK_CK(cudaStreamSynchronize(promo_st));
+        if (cold_store) {
+            for (int cs : pinned_cold_slots) cold_store->unpin_slot(cs);
+        }
         k_ink_decay_use_cnt<<<(n_layers * n_experts + 255) / 256, 256, 0, main_st>>>(d_use_cnt, n_layers * n_experts, 0.97f);
     }
 
@@ -909,6 +977,8 @@ struct InkHybridEngine {
         for (int b = 0; b < 2; ++b) {
             if (h_pf_exp_pin[b]) { cudaFreeHost(h_pf_exp_pin[b]); h_pf_exp_pin[b] = nullptr; }
         }
+        if (h_copyback_buf) { cudaFreeHost(h_copyback_buf); h_copyback_buf = nullptr; h_copyback_bytes = 0; }
+        cold_store.reset();
         if (h_bell) { cudaFreeHost(h_bell); h_bell = nullptr; d_bell = nullptr; }
         if (h_sec4_pinned) { cudaFreeHost(h_sec4_pinned); h_sec4_pinned = nullptr; h_sec4_bytes = 0; }
         if (promo_st) { cudaStreamDestroy(promo_st); promo_st = nullptr; }
@@ -966,42 +1036,53 @@ inline void launch_ink_moe_hybrid(
         k_ink_doorbell_wait_collect<<<kInkTopK, 256, 0, st>>>(hyb.d_bell, hyb.d_cur_seq, ws.topk_w, ws.y_pair);
     } else {
         // Double-Buffered Ping-Pong Async DMA Streaming overlapped with Blackwell sm_120a / INT8 Tensor Cores!
-        // Step A: Collect which host experts in layer `ip` are needed (all host experts for M>16; exact hit set for M<=16!)
+        // Step A: Collect which host/SSD experts in layer `ip` are needed (pe128-ordered on prefill!)
         std::vector<int> host_list;
         host_list.reserve(kInkExperts);
-        if (M <= 16) {
-            int32_t h_idx[16 * kInkTopK];
-            INK_CK(cudaMemcpyAsync(h_idx, ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
+        auto is_off_gpu = [&](int key) -> bool {
+            return (hyb.host_meta[key].body != nullptr || hyb.host_meta[key].cold_ssd) &&
+                   (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0);
+        };
+        if (M <= 16 || hyb.ssd_only) {
+            std::vector<int32_t> h_idx((size_t)M * kInkTopK);
+            INK_CK(cudaMemcpyAsync(h_idx.data(), ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
             INK_CK(cudaStreamSynchronize(st));
             uint8_t seen[kInkExperts] = {};
+            std::vector<int32_t> active_all;
             for (int i = 0; i < M * kInkTopK; ++i) {
                 const int e = h_idx[i];
-                const int key = ip * kInkExperts + e;
-                if (!seen[e] && hyb.host_meta[key].body != nullptr &&
-                    (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0)) {
+                if (e >= 0 && e < kInkExperts && !seen[e]) {
                     seen[e] = 1;
-                    host_list.push_back(e);
+                    active_all.push_back(e);
                 }
+            }
+            // Apply pe128 prompt-end recency wave ordering so hottest prompt-end experts stay resident in cold_store!
+            const auto w_pe = strata::core::compute_pe128_scores(h_idx.data(), M, kInkTopK, kInkExperts);
+            std::vector<uint8_t> is_res(kInkExperts, 0);
+            for (int32_t e : active_all) {
+                if (!is_off_gpu(ip * kInkExperts + e)) is_res[e] = 1;
+            }
+            const int cap_s = hyb.cold_store ? std::max(16, hyb.cold_store->num_slots()) : 64;
+            const auto wplan = strata::core::plan_moe_waves(active_all, is_res, w_pe, cap_s);
+            for (const auto& wv : wplan.cold_waves) {
+                for (int32_t e : wv) host_list.push_back(e);
             }
         } else {
             for (int e = 0; e < kInkExperts; ++e) {
-                const int key = ip * kInkExperts + e;
-                if (hyb.host_meta[key].body != nullptr &&
-                    (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0)) {
-                    host_list.push_back(e);
-                }
+                if (is_off_gpu(ip * kInkExperts + e)) host_list.push_back(e);
             }
         }
 
-        // Partition host_list into ping-pong VRAM chunks fitting inside pf_stage_bytes!
+        // Partition host_list into ping-pong VRAM chunks fitting inside pf_stage_bytes (and cold_store slots/2 when SSD-only)!
         struct PfChunk { std::vector<int> eids; std::vector<size_t> offs; };
         std::vector<PfChunk> chunks;
+        const size_t max_e_per_chunk = hyb.cold_store ? (size_t)std::max(1, hyb.cold_store->num_slots() / 2 - 2) : (size_t)kInkExperts;
         if (!host_list.empty() && hyb.d_pf_stage[0] && hyb.pf_stage_bytes > 0) {
             PfChunk cur;
             size_t used = 0;
             for (int e : host_list) {
                 const size_t b = (hyb.host_meta[ip * kInkExperts + e].body_bytes + 255ull) & ~255ull;
-                if (used + b > hyb.pf_stage_bytes && !cur.eids.empty()) {
+                if ((used + b > hyb.pf_stage_bytes || cur.eids.size() >= max_e_per_chunk) && !cur.eids.empty()) {
                     chunks.push_back(std::move(cur));
                     cur = {};
                     used = 0;
@@ -1013,24 +1094,58 @@ inline void launch_ink_moe_hybrid(
             if (!cur.eids.empty()) chunks.push_back(std::move(cur));
         }
 
+        // Track cold_store pinned slots per ping-pong buffer so we unpin only after DMA finishes!
+        if (hyb.cold_store) hyb.cold_store->notify_active();
+        std::vector<int> buf_cold_slots[2];
+        const uint64_t pf_gen = hyb.step_gen.fetch_add(1, std::memory_order_relaxed);
+        auto unpin_buf_slots = [&](int buf) {
+            if (hyb.cold_store) {
+                for (int s : buf_cold_slots[buf]) hyb.cold_store->unpin_slot(s);
+            }
+            buf_cold_slots[buf].clear();
+        };
+
         // Kick off Chunk `ci` DMA into ping-pong buffer `buf` (waits on prior pf_ev_done[buf] so h_pf_exp_pin[buf] & d_pf_stage[buf] NEVER race!)
         auto issue_dma = [&](size_t ci, int buf) {
             if (hyb.pf_buf_busy[buf]) {
                 INK_CK(cudaEventSynchronize(hyb.pf_ev_done[buf]));
                 hyb.pf_buf_busy[buf] = false;
             }
+            unpin_buf_slots(buf);
             const auto& ch = chunks[ci];
             InkExpertDev* h_exp = hyb.h_pf_exp_pin[buf];
             for (int e = 0; e < kInkExperts; ++e) { h_exp[e] = {}; h_exp[e].tier = 2; }
+            // Pre-issue NVMe demand reads for all cold_ssd experts in this chunk in parallel!
+            std::vector<const uint8_t*> ptrs(ch.eids.size(), nullptr);
+            std::vector<int> cslots(ch.eids.size(), -1);
+            for (size_t i = 0; i < ch.eids.size(); ++i) {
+                const int key = ip * kInkExperts + ch.eids[i];
+                const auto& hm = hyb.host_meta[key];
+                if (hm.body) {
+                    ptrs[i] = hm.body;
+                } else if (hm.cold_ssd && hyb.cold_store) {
+                    ptrs[i] = hyb.cold_store->demand_begin(key, ip, pf_gen, cslots[i]);
+                    if (cslots[i] >= 0) buf_cold_slots[buf].push_back(cslots[i]);
+                }
+            }
             for (size_t i = 0; i < ch.eids.size(); ++i) {
                 const int e = ch.eids[i];
                 const auto& hm = hyb.host_meta[ip * kInkExperts + e];
+                bool ok_io = true;
+                if (cslots[i] >= 0 && hyb.cold_store) {
+                    ok_io = hyb.cold_store->wait_gate_up(cslots[i]) && hyb.cold_store->wait_down(cslots[i]);
+                }
+                if (!ptrs[i] || !ok_io) {
+                    std::fprintf(stderr, "[inkling-cuda] WARN cold_store expert key=%d ptr=%p ok_io=%d slot=%d\n",
+                                 ip * kInkExperts + e, (const void*)ptrs[i], (int)ok_io, cslots[i]);
+                    continue;
+                }
                 h_exp[e].body_off = ch.offs[i];
                 h_exp[e].dn_off   = hm.dn_off;
                 h_exp[e].gu_code  = hm.gu_code;
                 h_exp[e].dn_code  = hm.dn_code;
                 h_exp[e].tier     = 0;
-                INK_CK(cudaMemcpyAsync(hyb.d_pf_stage[buf] + ch.offs[i], hm.body, hm.body_bytes, cudaMemcpyHostToDevice, hyb.pf_dma_st));
+                INK_CK(cudaMemcpyAsync(hyb.d_pf_stage[buf] + ch.offs[i], ptrs[i], hm.body_bytes, cudaMemcpyHostToDevice, hyb.pf_dma_st));
             }
             INK_CK(cudaMemcpyAsync(hyb.d_pf_exp_tmp[buf], h_exp, (size_t)kInkExperts * sizeof(InkExpertDev), cudaMemcpyHostToDevice, hyb.pf_dma_st));
             INK_CK(cudaEventRecord(hyb.pf_ev_dma[buf], hyb.pf_dma_st));
@@ -1050,6 +1165,12 @@ inline void launch_ink_moe_hybrid(
             launch_ink_moe_dispatch_only(st, hyb.d_pf_stage[buf], hyb.d_pf_exp_tmp[buf], info, x_f32, M, ws, force_exact_dec, true);
             INK_CK(cudaEventRecord(hyb.pf_ev_done[buf], st));
             hyb.pf_buf_busy[buf] = true;
+        }
+        // Unpin cold_store slots after the last chunk's DMA has completed (pf_ev_dma already waited by st).
+        if (hyb.cold_store && (!buf_cold_slots[0].empty() || !buf_cold_slots[1].empty())) {
+            INK_CK(cudaStreamSynchronize(hyb.pf_dma_st));
+            unpin_buf_slots(0);
+            unpin_buf_slots(1);
         }
     }
 

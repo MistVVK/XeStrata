@@ -13,6 +13,8 @@
 #include <thread>
 
 #include "hy4_io.h"
+#include "strata/core/moe_wave_plan.hpp"
+#include "strata/core/ssd_stream_scheduler.hpp"
 #include "strata/platform/cgroup_mem.hpp"
 #include "strata/platform/direct_file.hpp"
 #include "strata/quant/sk_codecs.hpp"
@@ -1586,31 +1588,24 @@ struct ColdStore {
         int64_t key = -1;  // layer * 512 + expert, -1 = empty
         uint64_t tick = 0;
         int pin = 0;       // > 0: needed by the wave being computed / in flight
-    };
-    struct Req {
-        uint8_t* dst;
-        uint64_t off;
-        size_t len;
+        int io_active = 0; // > 0: reader thread currently writing into this slot
     };
 #ifdef _WIN32
     HANDLE h = INVALID_HANDLE_VALUE;
 #else
     int fd = -1;
 #endif
-    int io_mode = 0;  // 0 = direct (O_DIRECT / FILE_FLAG_NO_BUFFERING), 1 = buffered (page cache kept: "warm cache" runs), 2 = buffered + POSIX_FADV_DONTNEED
+    int io_mode = 0;  // 0 = direct (O_DIRECT / FILE_FLAG_NO_BUFFERING), 1 = buffered, 2 = buffered + POSIX_FADV_DONTNEED
     size_t slot_bytes = 0;
     size_t sector_align = 4096;
     int nslots = 0;
     uint8_t* mem = nullptr;
+    std::mutex slot_mu;
     std::vector<Slot> slots;
     std::unordered_map<int64_t, int> where;
     uint64_t tick = 0;
-    std::vector<std::thread> readers;
-    std::mutex qm;
-    std::condition_variable qcv;
-    std::deque<Req> q;
-    bool stop = false;
-    std::atomic<int> pending{0};
+    uint64_t gen = 1;
+    strata::core::TwoPriorityExpertScheduler sched;
     std::atomic<int64_t> last_done_ns{0};
     std::atomic<bool> err{false};
     std::atomic<uint64_t> short_reads{0};
@@ -1619,12 +1614,67 @@ struct ColdStore {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
+    bool read_chunk(uint64_t off, uint8_t* dst, size_t len) {
+        size_t got = 0;
+#ifdef _WIN32
+        HANDLE ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        bool ok = true;
+        while (got < len) {
+            OVERLAPPED ov{};
+            const uint64_t o = off + got;
+            ov.Offset = (DWORD)(o & 0xFFFFFFFFu);
+            ov.OffsetHigh = (DWORD)(o >> 32);
+            ov.hEvent = ev;
+            if (ev) ResetEvent(ev);
+            const DWORD chunk = (DWORD)((len - got) > (1u << 30) ? (1u << 30) : (len - got));
+            DWORD n = 0;
+            if (!ReadFile(h, dst + got, chunk, &n, &ov)) {
+                const DWORD le = GetLastError();
+                if (le == ERROR_IO_PENDING) {
+                    if (!GetOverlappedResult(h, &ov, &n, TRUE)) {
+                        if (GetLastError() == ERROR_HANDLE_EOF) break;
+                        ok = false;
+                        break;
+                    }
+                } else if (le == ERROR_HANDLE_EOF) {
+                    break;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if (n == 0) break;
+            got += (size_t)n;
+        }
+        if (ev) CloseHandle(ev);
+        if (!ok) { err.store(true); return false; }
+        if (got < len) std::memset(dst + got, 0, len - got);
+#else
+        while (got < len) {
+            const ssize_t n = ::pread(fd, dst + got, len - got, (off_t)(off + got));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                err.store(true);
+                return false;
+            }
+            if (n == 0) break;
+            got += (size_t)n;
+        }
+        if (got < len) std::memset(dst + got, 0, len - got);
+        if (io_mode == 2) posix_fadvise(fd, (off_t)off, (off_t)len, POSIX_FADV_DONTNEED);
+#endif
+        const int64_t t = now_ns();
+        int64_t prev = last_done_ns.load(std::memory_order_relaxed);
+        while (prev < t && !last_done_ns.compare_exchange_weak(prev, t, std::memory_order_relaxed)) {}
+        return true;
+    }
+
     bool open(const std::string& path, size_t slot_bytes_, int nslots_, int nreaders, int mode, std::string& e) {
         slot_bytes = slot_bytes_;
         nslots = nslots_;
         io_mode = mode;
 #ifdef _WIN32
-        if (mode == 2) io_mode = 0;  // Windows uses FILE_FLAG_NO_BUFFERING rather than fadvise
+        if (mode == 2) io_mode = 0;
         DWORD fl = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS | (io_mode == 0 ? FILE_FLAG_NO_BUFFERING : 0);
         h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, fl, nullptr);
         if (h == INVALID_HANDLE_VALUE && io_mode == 0) {
@@ -1661,95 +1711,68 @@ struct ColdStore {
         std::memset(mem, 0, slot_bytes * (size_t)nslots);
 #endif
         slots.assign(nslots, Slot());
-        for (int i = 0; i < nreaders; ++i) readers.emplace_back([this]() { reader(); });
+        sched.start(
+            std::max(1, nreaders), nslots,
+            [this](int /*file_idx*/, uint64_t off, uint8_t* dst, size_t len) -> bool {
+                return read_chunk(off, dst, len);
+            },
+            [this](const strata::core::StreamExpertReq& req, int& out_slot, uint8_t*& out_dst) -> bool {
+                std::lock_guard<std::mutex> lk(slot_mu);
+                if (where.find(req.key) != where.end()) return false;
+                int best = -1;
+                uint64_t bt = ~0ull;
+                for (int s = 0; s < nslots; ++s) {
+                    if (slots[s].pin > 0 || slots[s].io_active > 0) continue;
+                    if (slots[s].key < 0) { best = s; break; }
+                    if (slots[s].tick < bt) { bt = slots[s].tick; best = s; }
+                }
+                if (best < 0) return false;
+                if (slots[best].key >= 0) where.erase(slots[best].key);
+                slots[best].key = req.key;
+                slots[best].tick = ++tick;
+                slots[best].pin = 0;
+                slots[best].io_active++;
+                if (auto* st = sched.slot_state(best)) st->reset_for_load(req.key);
+                where[req.key] = best;
+                out_slot = best;
+                out_dst = mem + (size_t)best * slot_bytes;
+                return true;
+            },
+            [this](const strata::core::StreamExpertReq& req, bool ok, bool /*was_pf*/) {
+                if (req.slot >= 0 && req.slot < nslots) {
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    if (slots[req.slot].io_active > 0) slots[req.slot].io_active--;
+                    if (!ok && slots[req.slot].key == req.key) {
+                        where.erase(slots[req.slot].key);
+                        slots[req.slot].key = -1;
+                    }
+                }
+            });
         return true;
     }
 
-    void enqueue(uint8_t* dst, uint64_t off, size_t len) {
-        pending.fetch_add(1, std::memory_order_acq_rel);
-        {
-            std::lock_guard<std::mutex> lk(qm);
-            q.push_back({dst, off, len});
-        }
-        qcv.notify_one();
+    void enqueue_demand(int64_t key, int layer, int slot, uint8_t* dst, uint64_t off, size_t len, size_t dn_off) {
+        const size_t align = std::max<size_t>(4096u, sector_align);
+        const size_t alen = (len + align - 1u) & ~(align - 1u);
+        auto req = strata::core::StreamExpertReq::make_contiguous_split(
+            key, layer, gen, slot, dst, 0, off, alen, dn_off, align);
+        sched.enqueue_demand(std::move(req));
     }
 
-    void reader() {
-#ifdef _WIN32
-        HANDLE ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-#endif
-        for (;;) {
-            Req r;
-            {
-                std::unique_lock<std::mutex> lk(qm);
-                qcv.wait(lk, [&] { return stop || !q.empty(); });
-                if (stop && q.empty()) {
-#ifdef _WIN32
-                    if (ev) CloseHandle(ev);
-#endif
-                    return;
-                }
-                r = q.front();
-                q.pop_front();
-            }
-            size_t got = 0;
-#ifdef _WIN32
-            while (got < r.len) {
-                OVERLAPPED ov{};
-                const uint64_t o = r.off + got;
-                ov.Offset = (DWORD)(o & 0xFFFFFFFFu);
-                ov.OffsetHigh = (DWORD)(o >> 32);
-                ov.hEvent = ev;
-                if (ev) ResetEvent(ev);
-                const DWORD chunk = (DWORD)((r.len - got) > (1u << 30) ? (1u << 30) : (r.len - got));
-                DWORD n = 0;
-                if (!ReadFile(h, r.dst + got, chunk, &n, &ov)) {
-                    const DWORD le = GetLastError();
-                    if (le == ERROR_IO_PENDING) {
-                        if (!GetOverlappedResult(h, &ov, &n, TRUE)) {
-                            if (GetLastError() == ERROR_HANDLE_EOF) break;
-                            err.store(true);
-                            break;
-                        }
-                    } else if (le == ERROR_HANDLE_EOF) {
-                        break;
-                    } else {
-                        err.store(true);
-                        break;
-                    }
-                }
-                if (n == 0) break;
-                got += (size_t)n;
-            }
-            if (got < r.len) std::memset(r.dst + got, 0, r.len - got);
-#else
-            while (got < r.len) {
-                const ssize_t n = ::pread(fd, r.dst + got, r.len - got, (off_t)(r.off + got));
-                if (n < 0) {
-                    if (errno == EINTR) continue;
-                    err.store(true);
-                    break;
-                }
-                if (n == 0) break;  // EOF: the last body of the file may be clipped
-                got += (size_t)n;
-            }
-            if (got < r.len) std::memset(r.dst + got, 0, r.len - got);
-            if (io_mode == 2) posix_fadvise(fd, (off_t)r.off, (off_t)r.len, POSIX_FADV_DONTNEED);
-#endif
-            const int64_t t = now_ns();
-            int64_t prev = last_done_ns.load();
-            while (prev < t && !last_done_ns.compare_exchange_weak(prev, t)) {}
-            pending.fetch_sub(1, std::memory_order_acq_rel);
+    void enqueue_prefetch(int64_t key, int layer, uint64_t off, size_t len, size_t dn_off) {
+        {
+            std::lock_guard<std::mutex> lk(slot_mu);
+            if (where.find(key) != where.end()) return;
         }
+        const size_t align = std::max<size_t>(4096u, sector_align);
+        const size_t alen = (len + align - 1u) & ~(align - 1u);
+        auto req = strata::core::StreamExpertReq::make_contiguous_split(
+            key, layer, gen, -1, nullptr, 0, off, alen, dn_off, align);
+        sched.enqueue_prefetch(std::move(req));
     }
 
     ~ColdStore() {
-        {
-            std::lock_guard<std::mutex> lk(qm);
-            stop = true;
-        }
-        qcv.notify_all();
-        for (auto& t : readers) t.join();
+        sched.stop();
 #ifdef _WIN32
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
         if (mem) VirtualFree(mem, 0, MEM_RELEASE);
@@ -2314,23 +2337,40 @@ void CpuExperts::Impl::plan(const Job& J, int t0, int Tc) {
             std::vector<int> ea, oa, na, mi;
             std::vector<const uint8_t*> ba;
             std::vector<int> sa;
-            for (int a = 0; a < nact; ++a) {
-                const int e = act_e[a];
-                const Rec& r = lr[e];
-                if (r.body) {
-                    ea.push_back(e); oa.push_back(act_o[a]); na.push_back(act_n[a]); ba.push_back(r.body); sa.push_back(-1);
-                    continue;
+            // Compute pe128 prompt-end recency weights when Tc > 1 so Order-A waves keep prompt-end experts resident!
+            std::vector<float> w_pe;
+            if (Tc > 1) {
+                w_pe = strata::core::compute_pe128_scores(J.idx + (size_t)t0 * TOPK, Tc, TOPK, E);
+            }
+            {
+                std::lock_guard<std::mutex> lk(cs->slot_mu);
+                cs->sched.drop_stale(J.layer, cs->gen);
+                for (int a = 0; a < nact; ++a) {
+                    const int e = act_e[a];
+                    const Rec& r = lr[e];
+                    if (r.body) {
+                        ea.push_back(e); oa.push_back(act_o[a]); na.push_back(act_n[a]); ba.push_back(r.body); sa.push_back(-1);
+                        continue;
+                    }
+                    auto it = cs->where.find((int64_t)J.layer * E + e);
+                    if (it != cs->where.end()) {  // cache hit (or in-flight prefetch promoted to demand!)
+                        const int s = it->second;
+                        cs->slots[s].pin++;
+                        cs->slots[s].tick = ++cs->tick;
+                        cs->sched.promote_to_demand((int64_t)J.layer * E + e, s, cs->mem + (size_t)s * cs->slot_bytes);
+                        ea.push_back(e); oa.push_back(act_o[a]); na.push_back(act_n[a]); ba.push_back(cs->mem + (size_t)s * cs->slot_bytes); sa.push_back(s);
+                        ++st.cold_hits;
+                    } else {
+                        mi.push_back(a);
+                    }
                 }
-                auto it = cs->where.find((int64_t)J.layer * E + e);
-                if (it != cs->where.end()) {  // cache hit
-                    const int s = it->second;
-                    cs->slots[s].pin++;
-                    cs->slots[s].tick = ++cs->tick;
-                    ea.push_back(e); oa.push_back(act_o[a]); na.push_back(act_n[a]); ba.push_back(cs->mem + (size_t)s * cs->slot_bytes); sa.push_back(s);
-                    ++st.cold_hits;
-                } else {
-                    mi.push_back(a);
-                }
+            }
+            // Order-A pe128 miss ordering: coldest misses stream first, hottest prompt-end misses stream LAST!
+            if (Tc > 1 && mi.size() > 1) {
+                std::sort(mi.begin(), mi.end(), [&](int a, int b) {
+                    const float wa = w_pe[act_e[a]], wb = w_pe[act_e[b]];
+                    return (wa != wb) ? (wa < wb) : (act_e[a] < act_e[b]);
+                });
             }
             nA = (int)ea.size();
             for (int a : mi) {
@@ -2566,25 +2606,32 @@ void CpuExperts::Impl::cold_issue() {
     uint64_t bytes = 0;
     while (next_miss < nact && issued < B) {
         int best = -1;
-        uint64_t bt = ~0ull;
-        for (int s = 0; s < cs->nslots; ++s)
-            if (cs->slots[s].pin == 0 && cs->slots[s].tick < bt) { bt = cs->slots[s].tick; best = s; }
-        if (best < 0) break;  // everything pinned by the wave being computed: the rest is read after it finishes
+        {
+            std::lock_guard<std::mutex> lk(cs->slot_mu);
+            uint64_t bt = ~0ull;
+            for (int s = 0; s < cs->nslots; ++s)
+                if (cs->slots[s].pin == 0 && cs->slots[s].io_active == 0 && cs->slots[s].tick < bt) { bt = cs->slots[s].tick; best = s; }
+            if (best < 0) break;  // everything pinned by the wave being computed
+            const int a = next_miss;
+            ColdStore::Slot& sl = cs->slots[best];
+            if (sl.key >= 0) cs->where.erase(sl.key);
+            sl.key = (int64_t)cold_layer * E + act_e[a];
+            sl.tick = ++cs->tick;
+            sl.pin = 1;
+            sl.io_active++;
+            if (auto* stp = cs->sched.slot_state(best)) stp->reset_for_load(sl.key);
+            cs->where[sl.key] = best;
+            act_slot[a] = best;
+            act_body[a] = cs->mem + (size_t)best * cs->slot_bytes;
+        }
         const int a = next_miss;
         const Rec& r = cold_lr[act_e[a]];
-        ColdStore::Slot& sl = cs->slots[best];
-        if (sl.key >= 0) cs->where.erase(sl.key);
-        sl.key = (int64_t)cold_layer * E + act_e[a];
-        sl.tick = ++cs->tick;
-        sl.pin = 1;
-        cs->where[sl.key] = best;
-        act_slot[a] = best;
-        act_body[a] = cs->mem + (size_t)best * cs->slot_bytes;
         if (issued == 0 && !batch_open) {
             batch_start_ns = ColdStore::now_ns();
             batch_open = true;
         }
-        cs->enqueue(const_cast<uint8_t*>(act_body[a]), r.file_off, ((size_t)r.body_bytes + 4095) & ~(size_t)4095);
+        cs->enqueue_demand((int64_t)cold_layer * E + act_e[a], cold_layer, best,
+                           const_cast<uint8_t*>(act_body[a]), r.file_off, (size_t)r.body_bytes, (size_t)r.dn_off);
         bytes += r.body_bytes;
         ++next_miss;
         ++issued;
@@ -2596,7 +2643,13 @@ void CpuExperts::Impl::cold_issue() {
 
 void CpuExperts::Impl::cold_wait() {
     const double t0 = now_s();
-    while (cs->pending.load(std::memory_order_acquire) > 0) std::this_thread::sleep_for(std::chrono::microseconds(20));
+    // Wait only for gate+up readiness on the wave being promoted so gu_unit can overlap with down NVMe reads!
+    for (int a = nxt_a0; a < nxt_a1; ++a) {
+        const int sl = act_slot[a];
+        if (sl >= 0) {
+            if (auto* stp = cs->sched.slot_state(sl)) stp->wait_gate_up();
+        }
+    }
     st.cold_wait_s += now_s() - t0;
     if (batch_open) {
         const int64_t end = cs->last_done_ns.load();
@@ -2609,13 +2662,14 @@ void CpuExperts::Impl::cold_wait() {
             std::fprintf(stderr, "[cpuexp] cold: a read from the .strata file failed; results of this job are invalid\n");
             cold_err_reported = true;
         }
+        std::lock_guard<std::mutex> lk(cs->slot_mu);
         for (int a = nxt_a0; a < nxt_a1; ++a)
             if (act_slot[a] >= 0) { cs->where.erase(cs->slots[act_slot[a]].key); cs->slots[act_slot[a]].key = -1; }
         cs->err.store(false);
     }
 }
 
-// Prepare wave w: wave 0 = resident + cache hits; wave w > 0 = the cold experts read meanwhile (wait for them, then start reading the next wave)
+// Prepare wave w: wave 0 = resident + cache hits; wave w > 0 = the cold experts read meanwhile (wait for gate+up, then start reading the next wave)
 void CpuExperts::Impl::cold_advance(int w) {
     guctr.v.store(0);
     dnctr.v.store(0);
@@ -2625,8 +2679,11 @@ void CpuExperts::Impl::cold_advance(int w) {
         wave_finished = false;
         return;
     }
-    for (int a = cur_a0; a < cur_a1; ++a)  // wave w-1 is done: release its slots
-        if (act_slot[a] >= 0) cs->slots[act_slot[a]].pin--;
+    {
+        std::lock_guard<std::mutex> lk(cs->slot_mu);
+        for (int a = cur_a0; a < cur_a1; ++a)  // wave w-1 is done: release its slots
+            if (act_slot[a] >= 0) cs->slots[act_slot[a]].pin--;
+    }
     if (nxt_a1 == nxt_a0) {  // nothing in flight
         if (next_miss >= nact) {
             cur_a0 = cur_a1 = nact;
@@ -2638,6 +2695,7 @@ void CpuExperts::Impl::cold_advance(int w) {
     cold_wait();
     cur_a0 = nxt_a0;
     cur_a1 = nxt_a1;
+    // Wait for prior wave's down projections ONLY if we need to re-issue; current wave's down overlaps gu_unit!
     cold_issue();  // the wave after this one is read while this one is computed
 }
 
@@ -2694,6 +2752,16 @@ void CpuExperts::Impl::run_job(int tid) {
                     const int u = guctr.v.fetch_add(1, std::memory_order_relaxed);
                     if (u >= na * NUNIT) break;
                     gu_unit(tid, J, a0 + u / NUNIT, u % NUNIT);
+                }
+                bar.wait(sense);
+                // Ensure each cold expert's down projection finished landing (overlapped with gu_unit above via proj_ready[3]!)
+                if (tid == 0) {
+                    for (int a = cur_a0; a < cur_a1; ++a) {
+                        const int sl = act_slot[a];
+                        if (sl >= 0) {
+                            if (auto* stp = cs->sched.slot_state(sl)) stp->wait_down();
+                        }
+                    }
                 }
                 bar.wait(sense);
                 for (;;) {
@@ -3136,5 +3204,24 @@ bool CpuExperts::hi_activations() const { return p_->hi; }
 
 CpuExpertStats CpuExperts::stats() const { return p_->st; }
 void CpuExperts::reset_stats() { p_->st = CpuExpertStats(); }
+
+void CpuExperts::prefetch_cold(int layer, const int32_t* experts, int n) {
+    Impl& I = *p_;
+    if (!I.cs || !experts || n <= 0 || layer < 0 || layer >= I.nlayers) return;
+    const Rec* lr = I.recs.data() + (size_t)layer * E;
+    for (int i = 0; i < n; ++i) {
+        const int e = experts[i];
+        if (e < 0 || e >= E) continue;
+        const Rec& r = lr[e];
+        if (r.body || !r.cold) continue;
+        I.cs->enqueue_prefetch((int64_t)layer * E + e, layer, r.file_off, (size_t)r.body_bytes, (size_t)r.dn_off);
+    }
+}
+
+void CpuExperts::drop_stale_cold(int current_layer) {
+    Impl& I = *p_;
+    if (!I.cs) return;
+    I.cs->sched.drop_stale(current_layer, I.cs->gen);
+}
 
 }  // namespace hy4

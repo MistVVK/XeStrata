@@ -46,7 +46,7 @@ inline bool volta_forever_active_from(const char* explicit_env,
     if (explicit_env != nullptr && explicit_env[0] != '\0') {
         return explicit_env[0] != '0';
     }
-    if (vf_env != nullptr && vf_env[0] != '\0' && vf_env[0] != '0') {
+    if (vf_env != nullptr && vf_env[0] != '\0' && std::strcmp(vf_env, "0") != 0) {
         return true;
     }
     if (dlsym_version != nullptr && dlsym_version[0] != '\0') {

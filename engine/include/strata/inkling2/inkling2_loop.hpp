@@ -99,7 +99,9 @@ void eval_inkling2_expert_batch(
     size_t m,
     size_t hidden,             // 2304
     size_t inter,              // 1152
-    float* y_out) noexcept;    // [m, hidden]
+    float* y_out,              // [m, hidden]
+    void (*wait_down)(void*) = nullptr,
+    void* wait_ctx = nullptr) noexcept;
 
 // DSpark Block-8 Recurrent Markov head step (one slot i in 1..block_size-1):
 // Updates state [rank] in-place and produces softcapped logits [V_unpadded] + deterministic first-max argmax token.

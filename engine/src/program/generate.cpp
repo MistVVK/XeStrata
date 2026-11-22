@@ -886,6 +886,9 @@ struct Options {
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
     /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
+    /// First-class `GPU + SSD` Only / `CPU + SSD` Only mode (`--ssd-experts` or `--ram-experts-gb 0` / `--resident-budget-gib 0`):
+    /// allocates 0 multi-GB host expert arena (bounded pinned DMA bounce/prefetch ring only, O_DIRECT / FILE_FLAG_NO_BUFFERING, 0 swap).
+    bool ssd_experts = false;
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -4149,15 +4152,28 @@ int main(int argc, char** argv) {
             o.ram_keep = strata::core::ram_keep_from_gib(gib);
             ram_keep_by_flag = true;
         }
-        else if (a == "--resident-budget-gib") {
-            const double gib = std::atof(next("--resident-budget-gib"));
-            if (!(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-budget-gib needs N > 0\n"); return 2; }
-            o.resident_budget = (uint64_t) (gib * 1073741824.0);
-            o.mmap_experts = o.resident_cpu_experts = true;
-            o.resident_pin = strata::core::resident_pin_from_env(std::getenv("STRATA_RESIDENT_PIN"));
-            o.resident_headroom = 4ull << 30;
-            if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
-                o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
+        else if (a == "--ssd-experts") {
+            o.ssd_experts = true;
+            o.mmap_experts = true;
+            o.resident_cpu_experts = o.resident_pin = o.resident_soft = false;
+            o.resident_budget = 0;
+        }
+        else if (a == "--resident-budget-gib" || a == "--ram-experts-gb") {
+            const double gib = std::atof(next(a.c_str()));
+            if (!(gib >= 0.0)) { std::fprintf(stderr, "strata generate: %s needs N >= 0\n", a.c_str()); return 2; }
+            if (gib == 0.0) {
+                o.ssd_experts = true;
+                o.mmap_experts = true;
+                o.resident_cpu_experts = o.resident_pin = o.resident_soft = false;
+                o.resident_budget = 0;
+            } else {
+                o.resident_budget = (uint64_t) (gib * 1073741824.0);
+                o.mmap_experts = o.resident_cpu_experts = true;
+                o.resident_pin = strata::core::resident_pin_from_env(std::getenv("STRATA_RESIDENT_PIN"));
+                o.resident_headroom = 4ull << 30;
+                if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
+                    o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
+            }
         }
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
@@ -4981,12 +4997,12 @@ int main(int argc, char** argv) {
                 // Guard Blackwell W4A4 against uncalibrated NVFP4 weights lacking `<stem>.input_scale`.
                 bool any_nvfp4_exp = false;
                 bool missing_input_scale = false;
-                for (size_t si = 0; si < model.shards().size(); ++si) {
-                    for (const auto& kv : model.shards()[si].tensors()) {
-                        if (kv.second.type == static_cast<uint32_t>(strata::quant::Type::NVFP4) &&
-                            strata::quant::nvfp4_layer_eligible(kv.first)) {
+                for (size_t si = 0; si < model.size(); ++si) {
+                    for (const auto& t : model.shard(si).tensors()) {
+                        if (t.type == static_cast<uint32_t>(strata::quant::Type::NVFP4) &&
+                            strata::quant::nvfp4_layer_eligible(t.name)) {
                             any_nvfp4_exp = true;
-                            if (model.find_input_scale_for(kv.first) == nullptr) missing_input_scale = true;
+                            if (model.find_input_scale_for(t.name) == nullptr) missing_input_scale = true;
                         }
                     }
                 }
@@ -8420,9 +8436,9 @@ int main(int argc, char** argv) {
         // #773: without a RAM budget there is no RAM copy and the file cache IS the expert tier (measured on a
         // 32 GB, 2 x 16 GB rig: forcing unbuffered reads there re-read 163-629 GB from the drive and halved the
         // speed), so STRATA_UNBUFFERED_LOAD=1 is not honoured in that mode
-        if (o.resident_budget > 0) {
+        if (o.resident_budget > 0 || o.ssd_experts) {
             std::string why;
-            const bool ub = src.set_unbuffered(o.resident_budget, why);
+            const bool ub = src.set_unbuffered(o.ssd_experts ? 0 : o.resident_budget, why, o.ssd_experts);
             std::fprintf(stderr, "strata generate: the file tier reads %s (%s)\n",
                          ub ? "unbuffered" : "through the file cache", why.c_str());
 #if defined(_WIN32)
@@ -9986,7 +10002,7 @@ int main(int argc, char** argv) {
             if (la_stats) lookahead.enable_stats(g.n_layers);
             if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
                 lookahead.set_depth(std::atoi(dv));
-            else if (srcp == &src && src.io_prefetch())
+            else if (srcp == &src && (src.io_prefetch() || o.ssd_experts))
                 lookahead.set_depth(2);
             la_started = true;
             if (srcp == &src && gpu_holds_all && !la_asked && !fs_ahead && !la_stats) {   // started, but not attached while nothing is read
@@ -23330,16 +23346,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         // refill the lent slots from the arena and give them back to the decode tier
-        if (borrow != nullptr && o.expert_cache > 0) {
-            const int32_t first_lent = (int32_t) ((borrow - xcache.device_slot(0)) / (blob > 0 ? blob : 1));
+        if (borrow != nullptr && o.expert_cache > 0 && xcache.slots() > 0) {
+            const uint8_t* bptr = static_cast<const uint8_t*>(borrow);
+            const uint8_t* base0 = xcache.device_slot(0);
             int32_t boundary_slot = -1;
-            if (xcache.slot_offsets() != nullptr) {
-                const uint64_t boff = (uint64_t) (borrow - xcache.device_slot(0));
+            if (base0 != nullptr && bptr >= base0) {
+                const uint64_t boff = (uint64_t) (bptr - base0);
                 for (int32_t s = 0; s < xcache.slots(); ++s) {
-                    if (xcache.slot_offsets()[s] == boff) { boundary_slot = s; break; }
+                    if (xcache.slot_offset(s) == boff) { boundary_slot = s; break; }
                 }
-            } else {
-                boundary_slot = first_lent;
             }
             if (boundary_slot >= 0 && !xcache.scrub_loan_boundary(boundary_slot, err)) {
                 std::fprintf(stderr, "strata generate: scrubbing the lent boundary failed: %s\n", err.c_str());

@@ -1451,7 +1451,9 @@ public:
         skd::cublas_pf().ensure(st);
         {
             hipDeviceProp_t dp_cg{};
-            (void)hipGetDeviceProperties(&dp_cg, m.primary_gpu);
+            int cur_dev = 0;
+            (void)cudaGetDevice(&cur_dev);
+            (void)hipGetDeviceProperties(&dp_cg, cur_dev);
             const bool vf_block = !strata::core::allow_1024_thread_cuda_graphs(
                 dp_cg.major, dp_cg.minor, strata::core::volta_forever_active());
             cuda_graph_on = getenv("HY4_CUDA_GRAPH") ? atoi(getenv("HY4_CUDA_GRAPH")) != 0 : !vf_block;
