@@ -1797,7 +1797,8 @@ QUANTIZERS = {"gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth",
               "gyro": "Gyro by agentionai", "sync": "Sync by hiruhiru2005",
               "ad": "AD by AtomicChat", "ornith-ai": "GGUFs by Ornith AI", "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
               "dealignai": "GGUFs by dealignai", "llm-jp": "GGUFs by LLM-jp", "apex": "APEX by SC117",
-              "hauhaucs": "GGUFs by HauhauCS", "inkling-unsloth": "UD quants by Unsloth", "qsa": "SenseNova QSA indexers",
+              "hauhaucs": "GGUFs by HauhauCS", "inkling-unsloth": "UD quants by Unsloth",
+              "qsa": "SenseNova QSA indexers",
               "own": "your own files"}
 TIERS = {  # family: (model, version, quantization), in the order each level lists them
     "qwen": ("qwen3.8-flash-next", "original", "gsq-rco"),
