@@ -101,6 +101,9 @@ static bool run_greedy_decode(InkSyRunner& R, const std::vector<int>& prompt, in
 int main(int argc, char** argv) {
     std::string model_path, vision_path, image_path, prompt_csv = "1,2,3,4,5,6,7,8";
     int n_gen = 32, max_ctx = 4096, parallel = 1;
+    int gpu_index = 0, req_gpus = 1;
+    std::vector<int> req_gpu_ids;
+    double ep_split = 0.5;
     double vram_gb = -1.0;
     bool show_info = false, do_selfcheck = false, do_spec_check = false, do_bench = false, do_par_sweep = false;
     bool no_dspark = false;
@@ -109,7 +112,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         auto need = [&]() -> std::string { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(); };
         if (a == "--version") { printf("strata-inkling 0.1.65\n"); return 0; }
-        else if (a == "--model" || a == "-m") model_path = need();
+        else if (a == "--model" || a == "-m" || a == "--native") model_path = need();
         else if (a == "--vision") vision_path = need();
         else if (a == "--image") image_path = need();
         else if (a == "--info") { show_info = true; if (i + 1 < argc && argv[i + 1][0] != '-') model_path = argv[++i]; }
@@ -119,11 +122,45 @@ int main(int argc, char** argv) {
         else if (a == "--par-sweep") do_par_sweep = true;
         else if (a == "--no-dspark") no_dspark = true;
         else if (a == "--gen" || a == "-n") n_gen = std::atoi(need().c_str());
-        else if (a == "--ctx") max_ctx = std::atoi(need().c_str());
+        else if (a == "--ctx" || a == "--max-context") max_ctx = std::atoi(need().c_str());
         else if (a == "--parallel" || a == "-p") parallel = std::atoi(need().c_str());
+        else if (a == "--gpu") gpu_index = std::atoi(need().c_str());
+        else if (a == "--gpus" || a == "--devices") {
+            std::string spec = need();
+            if (spec.find(',') != std::string::npos) {
+                req_gpu_ids = parse_csv_ints(spec);
+                if (!req_gpu_ids.empty()) {
+                    gpu_index = req_gpu_ids[0];
+                    req_gpus = (int)req_gpu_ids.size();
+                }
+            } else {
+                req_gpu_ids.clear();
+                req_gpus = std::max(1, std::atoi(spec.c_str()));
+            }
+        }
+        else if (a == "--ep-split") ep_split = std::atof(need().c_str());
         else if (a == "--vram-experts-gb") vram_gb = std::atof(need().c_str());
-        else if (a == "--prompt-tokens") prompt_csv = need();
+        else if (a == "--prompt-tokens" || a == "--prompt-ids") prompt_csv = need();
     }
+    if (const char* ep_env = std::getenv("IK2_EP_SPLIT"); ep_env && *ep_env) {
+        double v = std::atof(ep_env);
+        if (v > 0.0 && v < 1.0) ep_split = v;
+    }
+    if (req_gpus == 1 && req_gpu_ids.empty()) {
+        if (const char* g_env = std::getenv("IK2_GPUS"); g_env && *g_env) {
+            std::string spec(g_env);
+            if (spec.find(',') != std::string::npos) {
+                req_gpu_ids = parse_csv_ints(spec);
+                if (!req_gpu_ids.empty()) {
+                    gpu_index = req_gpu_ids[0];
+                    req_gpus = (int)req_gpu_ids.size();
+                }
+            } else {
+                req_gpus = std::max(1, std::atoi(g_env));
+            }
+        }
+    }
+    set_primary_gpu_index(gpu_index);
 
     if (model_path.empty()) {
         fprintf(stderr, "Usage: strata-inkling-sycl --model <path.strata> [--info] [--selfcheck] [--spec-check] [--bench] [--par-sweep] [--parallel N] [--vram-experts-gb G] [--vision <vis.strata> --image <img.png>]\n");
@@ -142,7 +179,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (!mod.load(model_path, vram_gb, err)) { fprintf(stderr, "[ERROR] %s\n", err.c_str()); return 1; }
+    if (!mod.load(model_path, vram_gb, err, 0, req_gpus, req_gpu_ids, ep_split)) { fprintf(stderr, "[ERROR] %s\n", err.c_str()); return 1; }
 
     // Optional Vision test
     if (!vision_path.empty() && !image_path.empty()) {

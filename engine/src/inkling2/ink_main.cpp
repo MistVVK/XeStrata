@@ -405,8 +405,31 @@ int main(int argc, char** argv) {
             cfg.bopts.cpu_threads = std::atoi(next().c_str());
         } else if (a == "--gpu") {
             cfg.bopts.gpu_index = std::atoi(next().c_str());
-        } else if (a == "--gpus") {
-            cfg.bopts.gpus = std::max(1, std::atoi(next().c_str()));
+        } else if (a == "--gpus" || a == "--devices") {
+            std::string spec = next();
+            if (spec.find(',') != std::string::npos) {
+                cfg.bopts.gpu_ids.clear();
+                for (size_t pos = 0; pos < spec.size();) {
+                    size_t q = spec.find(',', pos);
+                    if (q == std::string::npos) q = spec.size();
+                    if (q > pos) {
+                        int id = std::atoi(spec.substr(pos, q - pos).c_str());
+                        if (id >= 0 && std::find(cfg.bopts.gpu_ids.begin(), cfg.bopts.gpu_ids.end(), id) == cfg.bopts.gpu_ids.end()) {
+                            cfg.bopts.gpu_ids.push_back(id);
+                        }
+                    }
+                    pos = q + 1;
+                }
+                if (!cfg.bopts.gpu_ids.empty()) {
+                    cfg.bopts.gpu_index = cfg.bopts.gpu_ids[0];
+                    cfg.bopts.gpus = static_cast<int>(cfg.bopts.gpu_ids.size());
+                } else {
+                    cfg.bopts.gpus = 1;
+                }
+            } else {
+                cfg.bopts.gpu_ids.clear();
+                cfg.bopts.gpus = std::max(1, std::atoi(spec.c_str()));
+            }
         } else if (a == "--ep-split") {
             cfg.bopts.ep_split = std::atof(next().c_str());
         } else if (a == "--threads") {
@@ -440,10 +463,34 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Read optional IK2_EP_SPLIT env override (#6506)
+    // Read optional IK2_EP_SPLIT and IK2_GPUS env overrides (#6506)
     if (const char* ep_env = std::getenv("IK2_EP_SPLIT"); ep_env && *ep_env) {
         double v = std::atof(ep_env);
         if (v > 0.0 && v < 1.0) cfg.bopts.ep_split = v;
+    }
+    if (cfg.bopts.gpus == 1 && cfg.bopts.gpu_ids.empty()) {
+        if (const char* g_env = std::getenv("IK2_GPUS"); g_env && *g_env) {
+            std::string spec(g_env);
+            if (spec.find(',') != std::string::npos) {
+                for (size_t pos = 0; pos < spec.size();) {
+                    size_t q = spec.find(',', pos);
+                    if (q == std::string::npos) q = spec.size();
+                    if (q > pos) {
+                        int id = std::atoi(spec.substr(pos, q - pos).c_str());
+                        if (id >= 0 && std::find(cfg.bopts.gpu_ids.begin(), cfg.bopts.gpu_ids.end(), id) == cfg.bopts.gpu_ids.end()) {
+                            cfg.bopts.gpu_ids.push_back(id);
+                        }
+                    }
+                    pos = q + 1;
+                }
+                if (!cfg.bopts.gpu_ids.empty()) {
+                    cfg.bopts.gpu_index = cfg.bopts.gpu_ids[0];
+                    cfg.bopts.gpus = static_cast<int>(cfg.bopts.gpu_ids.size());
+                }
+            } else {
+                cfg.bopts.gpus = std::max(1, std::atoi(g_env));
+            }
+        }
     }
 
     // Auto-select FP8_E4M3 KV when parallel >= 16 unless user explicitly forced a format

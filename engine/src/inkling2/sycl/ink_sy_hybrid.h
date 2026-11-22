@@ -618,8 +618,9 @@ struct InkSyHybridEngine {
             for (int pid = 0; pid < P; ++pid) {
                 const int e = bell->topk_idx[pid]; if (e < 0 || e >= E) continue;
                 const int gid = base_gid + e;
+                if (mod->h_ed[gid].in_vram == 2) continue;  // owned by peer GPU 1 in Dual-GPU EP
                 use_freq[gid] += freq_inc;
-                if (mod->h_ed[gid].in_vram != 0) {
+                if (mod->h_ed[gid].in_vram == 1) {
                     ++stat_vram_hits;
                     if (slot_of_gid[gid] >= 0 && is_core && visit_pass > 0) ++stat_loop_prom_hits;
                     int vg = exp_to_vg[e];
@@ -692,7 +693,11 @@ struct InkSyHybridEngine {
                 k_moe_scatter_cpu_sg16(bell->y_cpu, bell->cpu_pair_ids, b_moe_yp, cpu_p);
             }
 
-            k_moe_reduce8_sg16(b_moe_yp, b_moe_raw, M);
+            if (mod->ep2_active) {
+                k_moe_reduce8_sg16_q(Q(), b_moe_yp, b_moe_raw, M, mod->expert_dev + (size_t)ip * E, b_topk_idx);
+            } else {
+                k_moe_reduce8_sg16(b_moe_yp, b_moe_raw, M);
+            }
             return;
         }
 
@@ -712,8 +717,9 @@ struct InkSyHybridEngine {
         for (int e = 0; e < E; ++e) {
             if (by_exp[e].empty()) continue;
             const int gid = base_gid + e;
+            if (mod->h_ed[gid].in_vram == 2) continue;  // owned by peer GPU 1 in Dual-GPU EP
             use_freq[gid] += freq_inc * (float)by_exp[e].size();
-            if (mod->h_ed[gid].in_vram != 0) {
+            if (mod->h_ed[gid].in_vram == 1) {
                 stat_vram_hits += by_exp[e].size();
                 v_uexp.push_back(e);
                 v_uoff.push_back((int)v_pairs.size());
@@ -806,7 +812,11 @@ struct InkSyHybridEngine {
             }
         }
 
-        k_moe_reduce8_sg16(b_moe_yp, b_moe_raw, M);
+        if (mod->ep2_active) {
+            k_moe_reduce8_sg16_q(Q(), b_moe_yp, b_moe_raw, M, mod->expert_dev + (size_t)ip * E, b_topk_idx);
+        } else {
+            k_moe_reduce8_sg16(b_moe_yp, b_moe_raw, M);
+        }
     }
 };
 

@@ -433,17 +433,29 @@ class HipBackend final : public InkBackend {
 public:
     ~HipBackend() override { cleanup(); }
 
-    const char* backend_name() const noexcept override { return "hip"; }
+    const char* backend_name() const noexcept override { return ep2_active_ ? "hip-ep2" : "hip"; }
 
     std::string device_info() const override {
-        char buf[320];
-        std::snprintf(buf, sizeof(buf), "%s (%s, %d CUs, UMA=%d, eff=%.2f GiB, chunk<=%d, blasLt=%d, hybrid=%d)",
-                      mem_info_.device_name, mem_info_.arch_name, mem_info_.cu_count,
-                      mem_info_.is_uma ? 1 : 0,
-                      static_cast<double>(mem_info_.effective_total_bytes) / 1073741824.0,
-                      guard_.max_prefill_chunk,
-                      blaslt_.ready() ? 1 : 0,
-                      hybrid_.active() ? 1 : 0);
+        char buf[512];
+        if (ep2_active_) {
+            std::snprintf(buf, sizeof(buf),
+                          "%s (%s, %d CUs) + %s (%s, %d CUs) [EP-2GPU split=%.2f, p2p=%s, eff=%.2f GiB, chunk<=%d, blasLt=%d, hybrid=%d]",
+                          mem_info_.device_name, mem_info_.arch_name, mem_info_.cu_count,
+                          peer_mem_info_.device_name, peer_mem_info_.arch_name, peer_mem_info_.cu_count,
+                          ep_split_, ep2_p2p_ ? "on" : "pinned",
+                          static_cast<double>(mem_info_.effective_total_bytes + peer_mem_info_.effective_total_bytes) / 1073741824.0,
+                          guard_.max_prefill_chunk,
+                          blaslt_.ready() ? 1 : 0,
+                          hybrid_.active() ? 1 : 0);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%s (%s, %d CUs, UMA=%d, eff=%.2f GiB, chunk<=%d, blasLt=%d, hybrid=%d)",
+                          mem_info_.device_name, mem_info_.arch_name, mem_info_.cu_count,
+                          mem_info_.is_uma ? 1 : 0,
+                          static_cast<double>(mem_info_.effective_total_bytes) / 1073741824.0,
+                          guard_.max_prefill_chunk,
+                          blaslt_.ready() ? 1 : 0,
+                          hybrid_.active() ? 1 : 0);
+        }
         return std::string(buf);
     }
 
@@ -452,8 +464,8 @@ public:
         st.vram_experts_loaded = vram_experts_loaded_;
         st.ram_experts_loaded = ram_experts_loaded_;
         st.total_experts = model_ ? model_->rd.expert_directory().size() : 0;
-        st.vram_used_bytes = vram_used_bytes();
-        st.vram_total_bytes = mem_info_.effective_total_bytes;
+        st.vram_used_bytes = vram_used_bytes() + (ep2_active_ ? peer_expert_gpu_arena_.bytes : 0);
+        st.vram_total_bytes = mem_info_.effective_total_bytes + (ep2_active_ ? peer_mem_info_.effective_total_bytes : 0);
         st.max_slots = max_slots_;
         for (const auto& s : slots_) if (s.allocated) ++st.active_slots;
         st.kv_dtype = default_kv_dtype_;
@@ -467,10 +479,106 @@ public:
         c_ = model.m.c;
         dspark_cfg_ = model.m.dspark;
 
-        if (!hip_ok(hipSetDevice(opts.gpu_index), "hipSetDevice", err)) return false;
+        int dev_count = 0;
+        if (hipGetDeviceCount(&dev_count) != hipSuccess || dev_count < 1) {
+            err = "[ink-hip] no HIP devices visible";
+            return false;
+        }
+        gpu0_id_ = (!opts.gpu_ids.empty()) ? opts.gpu_ids[0] : opts.gpu_index;
+        gpu0_id_ = std::max(0, std::min(gpu0_id_, dev_count - 1));
+        gpu1_id_ = -1;
+        ep2_active_ = false;
+        ep2_p2p_ = false;
+        ep_split_ = std::clamp(opts.ep_split, 0.1, 0.9);
+
+        if (!hip_ok(hipSetDevice(gpu0_id_), "hipSetDevice", err)) return false;
         if (!hip_ok(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "hipStreamCreate", err)) return false;
 
-        mem_info_ = query_device_memory(opts.gpu_index);
+        mem_info_ = query_device_memory(gpu0_id_);
+
+        // Dual-GPU Expert Parallelism setup (--gpus 2 / --gpus 0,1 / --devices 0,1)
+        if ((opts.gpus >= 2 || opts.gpu_ids.size() >= 2) && dev_count >= 2) {
+            int g1 = -1;
+            if (opts.gpu_ids.size() >= 2) {
+                for (size_t k = 1; k < opts.gpu_ids.size(); ++k) {
+                    if (opts.gpu_ids[k] >= 0 && opts.gpu_ids[k] < dev_count && opts.gpu_ids[k] != gpu0_id_) {
+                        g1 = opts.gpu_ids[k];
+                        break;
+                    }
+                }
+            }
+            if (g1 < 0) g1 = (gpu0_id_ == 0) ? 1 : 0;
+            if (g1 >= 0 && g1 < dev_count && g1 != gpu0_id_) {
+                gpu1_id_ = g1;
+                if (!hip_ok(hipSetDevice(gpu1_id_), "hipSetDevice peer", err)) return false;
+                peer_mem_info_ = query_device_memory(gpu1_id_);
+                if (!hip_ok(hipStreamCreateWithFlags(&peer_stream_, hipStreamNonBlocking), "hipStreamCreate peer", err) ||
+                    !hip_ok(hipEventCreateWithFlags(&ev_g1_done_, hipEventDisableTiming), "hipEventCreate peer", err)) {
+                    (void)hipSetDevice(gpu0_id_);
+                    return false;
+                }
+                if (!hip_ok(hipSetDevice(gpu0_id_), "hipSetDevice restore0", err) ||
+                    !hip_ok(hipEventCreateWithFlags(&ev_g0_to_g1_, hipEventDisableTiming), "hipEventCreate g0", err)) {
+                    return false;
+                }
+                // Probe P2P with a 16-byte hardware roundtrip check; fall back to host-pinned bounce if unsupported or broken!
+                const char* force_pinned = std::getenv("INK_HIP_PEER_PINNED");
+                if (!(force_pinned && force_pinned[0] == '1')) {
+                    int p01 = 0, p10 = 0;
+                    if (hipDeviceCanAccessPeer(&p01, gpu0_id_, gpu1_id_) == hipSuccess &&
+                        hipDeviceCanAccessPeer(&p10, gpu1_id_, gpu0_id_) == hipSuccess &&
+                        p01 && p10) {
+                        (void)hipSetDevice(gpu0_id_);
+                        hipError_t e1 = hipDeviceEnablePeerAccess(gpu1_id_, 0);
+                        if (e1 == hipErrorPeerAccessAlreadyEnabled) { (void)hipGetLastError(); e1 = hipSuccess; }
+                        (void)hipSetDevice(gpu1_id_);
+                        hipError_t e2 = hipDeviceEnablePeerAccess(gpu0_id_, 0);
+                        if (e2 == hipErrorPeerAccessAlreadyEnabled) { (void)hipGetLastError(); e2 = hipSuccess; }
+                        if (e1 == hipSuccess && e2 == hipSuccess) {
+                            uint32_t h_tx[4] = {0x12345678u, 0xCAFEBABEu, 0xA5A55A5Au, 0xDEADBEEFu};
+                            uint32_t h_rx01[4] = {0, 0, 0, 0};
+                            uint32_t h_rx10[4] = {0, 0, 0, 0};
+                            uint32_t *d0 = nullptr, *d1 = nullptr;
+                            (void)hipSetDevice(gpu0_id_);
+                            hipError_t a0 = hipMalloc(&d0, sizeof(h_tx));
+                            (void)hipSetDevice(gpu1_id_);
+                            hipError_t a1 = hipMalloc(&d1, sizeof(h_tx));
+                            bool hw_ok = false;
+                            if (a0 == hipSuccess && a1 == hipSuccess) {
+                                (void)hipSetDevice(gpu0_id_);
+                                (void)hipMemcpy(d0, h_tx, sizeof(h_tx), hipMemcpyHostToDevice);
+                                (void)hipSetDevice(gpu1_id_);
+                                (void)hipMemset(d1, 0, sizeof(h_tx));
+                                hipError_t c01 = hipMemcpyPeer(d1, gpu1_id_, d0, gpu0_id_, sizeof(h_tx));
+                                (void)hipMemcpy(h_rx01, d1, sizeof(h_tx), hipMemcpyDeviceToHost);
+                                (void)hipSetDevice(gpu0_id_);
+                                (void)hipMemset(d0, 0, sizeof(h_tx));
+                                hipError_t c10 = hipMemcpyPeer(d0, gpu0_id_, d1, gpu1_id_, sizeof(h_tx));
+                                (void)hipMemcpy(h_rx10, d0, sizeof(h_tx), hipMemcpyDeviceToHost);
+                                hw_ok = (c01 == hipSuccess && c10 == hipSuccess &&
+                                         std::memcmp(h_tx, h_rx01, sizeof(h_tx)) == 0 &&
+                                         std::memcmp(h_tx, h_rx10, sizeof(h_tx)) == 0);
+                            }
+                            if (d0) { (void)hipSetDevice(gpu0_id_); (void)hipFree(d0); }
+                            if (d1) { (void)hipSetDevice(gpu1_id_); (void)hipFree(d1); }
+                            if (hw_ok) {
+                                ep2_p2p_ = true;
+                            } else {
+                                std::fprintf(stderr,
+                                             "[ink-hip] Hardware P2P roundtrip probe FAILED (GPU%d<->GPU%d); using pinned-host DMA fallback\n",
+                                             gpu0_id_, gpu1_id_);
+                                (void)hipSetDevice(gpu0_id_);
+                                if (hipDeviceDisablePeerAccess(gpu1_id_) != hipSuccess) (void)hipGetLastError();
+                                (void)hipSetDevice(gpu1_id_);
+                                if (hipDeviceDisablePeerAccess(gpu0_id_) != hipSuccess) (void)hipGetLastError();
+                            }
+                        }
+                    }
+                }
+                (void)hipSetDevice(gpu0_id_);
+                ep2_active_ = true;
+            }
+        }
         guard_ = compute_dispatch_guard(mem_info_.arch_name, mem_info_.cu_count, mem_info_.is_uma,
 #if defined(_WIN32)
                                         true
@@ -760,9 +868,22 @@ public:
             }
         }
 
-        // Plan contiguous GPU arena for all experts fitting in static_vram_budget
+        // Plan contiguous GPU arena(s) for all experts fitting in GPU 0 (+ GPU 1 when Dual-GPU EP is active)
+        peer_expert_gpu_offset_.assign(n_dir, static_cast<size_t>(-1));
+        size_t peer_vram_budget = 0;
+        if (ep2_active_) {
+            const size_t peer_oh = peer_mem_info_.reserve_bytes + (768ULL << 20);
+            if (peer_mem_info_.effective_total_bytes > peer_oh) {
+                peer_vram_budget = peer_mem_info_.effective_total_bytes - peer_oh;
+            }
+            if (opts.vram_experts_gb >= 0.0) {
+                peer_vram_budget = std::min(peer_vram_budget, static_cast<size_t>(opts.vram_experts_gb * 1073741824.0));
+            }
+        }
         size_t arena_bytes = 0;
+        size_t peer_arena_bytes = 0;
         std::vector<uint16_t> gpu_plan;
+        std::vector<uint16_t> peer_gpu_plan;
         std::vector<uint16_t> ram_plan;
         const size_t ram_cap = (opts.ram_experts_gb > 0.0)
             ? static_cast<size_t>(opts.ram_experts_gb * 1073741824.0)
@@ -773,14 +894,40 @@ public:
             if (idx >= n_dir) continue;
             const size_t sz = dir[idx].body_bytes;
             const size_t aligned = (sz + 63u) & ~size_t(63u);
-            if (arena_bytes + aligned <= static_vram_budget) {
-                expert_gpu_offset_[idx] = arena_bytes;
-                arena_bytes += aligned;
-                gpu_plan.push_back(idx);
-            } else if (ram_bytes + sz <= ram_cap) {
-                ram_bytes += sz;
-                ram_plan.push_back(idx);
+            if (ep2_active_) {
+                const int il = static_cast<int>(idx) / c_.n_experts;
+                const int eid = static_cast<int>(dir[idx].expert_id);
+                const uint32_t hh = (static_cast<uint32_t>(eid) * 2654435761u + static_cast<uint32_t>(il) * 40503u) >> 8;
+                const int pref = ((hh % 10000u) < static_cast<uint32_t>(ep_split_ * 10000.0)) ? 1 : 0;
+                if (pref == 1 && peer_arena_bytes + aligned <= peer_vram_budget) {
+                    peer_expert_gpu_offset_[idx] = peer_arena_bytes;
+                    peer_arena_bytes += aligned;
+                    peer_gpu_plan.push_back(idx);
+                } else if (arena_bytes + aligned <= static_vram_budget) {
+                    expert_gpu_offset_[idx] = arena_bytes;
+                    arena_bytes += aligned;
+                    gpu_plan.push_back(idx);
+                } else if (peer_arena_bytes + aligned <= peer_vram_budget) {
+                    peer_expert_gpu_offset_[idx] = peer_arena_bytes;
+                    peer_arena_bytes += aligned;
+                    peer_gpu_plan.push_back(idx);
+                } else if (ram_bytes + sz <= ram_cap) {
+                    ram_bytes += sz;
+                    ram_plan.push_back(idx);
+                }
+            } else {
+                if (arena_bytes + aligned <= static_vram_budget) {
+                    expert_gpu_offset_[idx] = arena_bytes;
+                    arena_bytes += aligned;
+                    gpu_plan.push_back(idx);
+                } else if (ram_bytes + sz <= ram_cap) {
+                    ram_bytes += sz;
+                    ram_plan.push_back(idx);
+                }
             }
+        }
+        if (ep2_active_ && peer_gpu_plan.empty()) {
+            ep2_active_ = false;
         }
 
         if (arena_bytes > 0) {
@@ -801,8 +948,34 @@ public:
                     return false;
                 }
             }
-            vram_experts_loaded_ = gpu_plan.size();
         }
+        if (ep2_active_ && peer_arena_bytes > 0) {
+            if (!hip_ok(hipSetDevice(gpu1_id_), "hipSetDevice peer arena", err)) return false;
+            if (!hip_ok(alloc_gpu_buffer(peer_expert_gpu_arena_, peer_arena_bytes, peer_mem_info_.is_uma), "peer expert GPU arena alloc", err)) {
+                (void)hipSetDevice(gpu0_id_);
+                return false;
+            }
+            std::vector<uint8_t> tmp;
+            for (uint16_t idx : peer_gpu_plan) {
+                if (!model.rd.read_expert_body(idx, tmp, err)) {
+                    (void)hipSetDevice(gpu0_id_);
+                    return false;
+                }
+                if ((dir[idx].gu_code_id == CODE_SF4 || dir[idx].dn_code_id == CODE_SF4) && tmp.size() >= 16) {
+                    float hdr[4];
+                    std::memcpy(hdr, tmp.data(), 16);
+                    expert_sf4_outer_[idx] = {hdr[0] / hdr[1], hdr[2] / hdr[3]};
+                }
+                if (!hip_ok(hipMemcpy(peer_expert_gpu_arena_.dev_ptr + peer_expert_gpu_offset_[idx], tmp.data(),
+                                      tmp.size(), hipMemcpyHostToDevice),
+                            "peer expert H2D", err)) {
+                    (void)hipSetDevice(gpu0_id_);
+                    return false;
+                }
+            }
+            if (!hip_ok(hipSetDevice(gpu0_id_), "hipSetDevice restore0 after peer arena", err)) return false;
+        }
+        vram_experts_loaded_ = gpu_plan.size() + peer_gpu_plan.size();
         for (uint16_t idx : ram_plan) {
             if (!model.rd.read_expert_body(idx, expert_ram_bodies_[idx], err)) return false;
             if ((dir[idx].gu_code_id == CODE_SF4 || dir[idx].dn_code_id == CODE_SF4) && expert_ram_bodies_[idx].size() >= 16) {
@@ -825,16 +998,20 @@ public:
         // Build per-layer GPU expert descriptor tables [128] & per-layer codec class (0=all S_K, 1=all SF4, 2=MX8/mixed)
         d_layer_exps_.resize(c_.n_phys);
         h_layer_exps_.resize(c_.n_phys);
+        peer_d_layer_exps_.resize(ep2_active_ ? c_.n_phys : 0);
         layer_all_gpu_.assign(c_.n_phys, true);
+        layer_all_ep2_.assign(c_.n_phys, true);
         layer_gu_class_.assign(c_.n_phys, 2);
         layer_dn_class_.assign(c_.n_phys, 2);
         for (int il = 0; il < c_.n_phys; ++il) {
             std::vector<GpuExpertDesc> tbl(c_.n_experts);
+            std::vector<GpuExpertDesc> peer_tbl(ep2_active_ ? c_.n_experts : 0);
             bool all_gu_sk = true, all_gu_sf4 = true;
             bool all_dn_sk = true, all_dn_sf4 = true;
             for (int e = 0; e < c_.n_experts; ++e) {
                 const int dir_idx = model.dir_index_of[il * c_.n_experts + e];
                 GpuExpertDesc d{};
+                GpuExpertDesc pd{};
                 if (dir_idx >= 0 && expert_gpu_offset_[dir_idx] != static_cast<size_t>(-1)) {
                     d.body = expert_gpu_arena_.dev_ptr + expert_gpu_offset_[dir_idx];
                     d.dn_offset = dir[dir_idx].dn_offset;
@@ -844,16 +1021,41 @@ public:
                     if (d.gu_code == CODE_SF4 || d.gu_code == CODE_MX8) all_gu_sk = false;
                     if (d.dn_code != CODE_SF4) all_dn_sf4 = false;
                     if (d.dn_code == CODE_SF4 || d.dn_code == CODE_MX8) all_dn_sk = false;
+                } else if (ep2_active_ && dir_idx >= 0 && peer_expert_gpu_offset_[dir_idx] != static_cast<size_t>(-1)) {
+                    pd.body = peer_expert_gpu_arena_.dev_ptr + peer_expert_gpu_offset_[dir_idx];
+                    pd.dn_offset = dir[dir_idx].dn_offset;
+                    pd.gu_code = dir[dir_idx].gu_code_id;
+                    pd.dn_code = dir[dir_idx].dn_code_id;
+                    layer_all_gpu_[il] = false;
+                    all_gu_sk = all_gu_sf4 = all_dn_sk = all_dn_sf4 = false;
                 } else {
                     layer_all_gpu_[il] = false;
+                    layer_all_ep2_[il] = false;
                     all_gu_sk = all_gu_sf4 = all_dn_sk = all_dn_sf4 = false;
                 }
                 tbl[e] = d;
+                if (ep2_active_) peer_tbl[e] = pd;
             }
             layer_gu_class_[il] = all_gu_sk ? 0 : (all_gu_sf4 ? 1 : 2);
             layer_dn_class_[il] = all_dn_sk ? 0 : (all_dn_sf4 ? 1 : 2);
             h_layer_exps_[il] = tbl;
             if (!upload_raw(d_layer_exps_[il], tbl.data(), tbl.size() * sizeof(GpuExpertDesc), err)) return false;
+            if (ep2_active_) {
+                if (!hip_ok(hipSetDevice(gpu1_id_), "hipSetDevice peer tbl", err)) return false;
+                if (!hip_ok(alloc_gpu_buffer(peer_d_layer_exps_[il], peer_tbl.size() * sizeof(GpuExpertDesc), peer_mem_info_.is_uma), "peer tbl alloc", err) ||
+                    !hip_ok(hipMemcpy(peer_d_layer_exps_[il].dev_ptr, peer_tbl.data(), peer_tbl.size() * sizeof(GpuExpertDesc), hipMemcpyHostToDevice), "peer tbl H2D", err)) {
+                    (void)hipSetDevice(gpu0_id_);
+                    return false;
+                }
+                if (!hip_ok(hipSetDevice(gpu0_id_), "hipSetDevice restore0 tbl", err)) return false;
+            }
+        }
+        if (ep2_active_) {
+            std::fprintf(stderr,
+                         "[ink-hip] Dual-GPU EP2 active: GPU%d (%s, %zu exp, %.2f GiB) + GPU%d (%s, %zu exp, %.2f GiB), RAM=%zu | split=%.2f p2p=%s\n",
+                         gpu0_id_, mem_info_.device_name, gpu_plan.size(), arena_bytes / 1073741824.0,
+                         gpu1_id_, peer_mem_info_.device_name, peer_gpu_plan.size(), peer_arena_bytes / 1073741824.0,
+                         ram_plan.size(), ep_split_, ep2_p2p_ ? "on" : "pinned");
         }
 
         // 4. Initialize GPU Paged KV pools & 48-Visit ShortConv BF16 pools
@@ -2202,6 +2404,173 @@ private:
         return tot;
     }
 
+    bool ensure_peer_scratch(int B, std::string& err) {
+        if (!ep2_active_ || B <= peer_scratch_B_) return true;
+        const int D = c_.hidden;
+        const int inter = c_.inter;
+        const size_t tot_pairs = static_cast<size_t>(B) * c_.top_k;
+        auto re0 = [&](GpuBuffer& b, size_t bytes) -> bool {
+            free_gpu_buffer(b);
+            return hip_ok(alloc_gpu_buffer(b, bytes, mem_info_.is_uma), "ep2 g0 scratch", err);
+        };
+        if (!re0(sc_peer_moe_out_, static_cast<size_t>(B) * D * sizeof(float))) return false;
+
+        if (!ep2_p2p_) {
+            if (h_ep_x_f16_) { (void)hipHostFree(h_ep_x_f16_); h_ep_x_f16_ = nullptr; }
+            if (h_ep_ids_)   { (void)hipHostFree(h_ep_ids_);   h_ep_ids_ = nullptr; }
+            if (h_ep_ws_)    { (void)hipHostFree(h_ep_ws_);    h_ep_ws_ = nullptr; }
+            if (h_ep_y1_)    { (void)hipHostFree(h_ep_y1_);    h_ep_y1_ = nullptr; }
+            if (!hip_ok(hipHostMalloc(reinterpret_cast<void**>(&h_ep_x_f16_), static_cast<size_t>(B) * D * sizeof(half_t), hipHostMallocDefault), "ep2 host x", err) ||
+                !hip_ok(hipHostMalloc(reinterpret_cast<void**>(&h_ep_ids_),   tot_pairs * sizeof(int32_t), hipHostMallocDefault), "ep2 host ids", err) ||
+                !hip_ok(hipHostMalloc(reinterpret_cast<void**>(&h_ep_ws_),    tot_pairs * sizeof(float), hipHostMallocDefault), "ep2 host ws", err) ||
+                !hip_ok(hipHostMalloc(reinterpret_cast<void**>(&h_ep_y1_),    static_cast<size_t>(B) * D * sizeof(float), hipHostMallocDefault), "ep2 host y1", err)) {
+                return false;
+            }
+        }
+
+        if (!hip_ok(hipSetDevice(gpu1_id_), "hipSetDevice peer scratch", err)) return false;
+        auto re1 = [&](GpuBuffer& b, size_t bytes) -> bool {
+            free_gpu_buffer(b);
+            return hip_ok(alloc_gpu_buffer(b, bytes, peer_mem_info_.is_uma), "ep2 g1 scratch", err);
+        };
+        const bool ok =
+            re1(peer_sc_mlp_f16_,    static_cast<size_t>(B) * D * sizeof(half_t)) &&
+            re1(peer_sc_topk_ids_,   tot_pairs * sizeof(int32_t)) &&
+            re1(peer_sc_topk_w_,     tot_pairs * sizeof(float)) &&
+            re1(peer_sc_moe_act_,    tot_pairs * inter * sizeof(half_t)) &&
+            re1(peer_sc_moe_out_,    static_cast<size_t>(B) * D * sizeof(float)) &&
+            re1(peer_sc_exp_off_,    129u * sizeof(int32_t)) &&
+            re1(peer_sc_exp_cur_,    129u * sizeof(int32_t)) &&
+            re1(peer_sc_bucket_tok_, tot_pairs * sizeof(int32_t)) &&
+            re1(peer_sc_slotk_bidx_, tot_pairs * sizeof(int32_t)) &&
+            re1(peer_sc_bucket_y_,   tot_pairs * D * sizeof(float));
+        (void)hipSetDevice(gpu0_id_);
+        if (!ok) return false;
+        peer_scratch_B_ = B;
+        return true;
+    }
+
+    // Launch GPU 1 peer experts asynchronously on peer_stream_ (overlaps with GPU 0 experts on stream_!).
+    bool launch_peer_moe_async(int ip, int B, const half_t* mlpf16_g0, const int32_t* tk_i_g0, const float* tk_w_g0, std::string& err) {
+        if (!ensure_peer_scratch(B, err)) return false;
+        const int D = c_.hidden;
+        const int tot_pairs = B * c_.top_k;
+        const size_t x_bytes = static_cast<size_t>(B) * D * sizeof(half_t);
+        const size_t idx_bytes = static_cast<size_t>(tot_pairs) * sizeof(int32_t);
+        const size_t w_bytes = static_cast<size_t>(tot_pairs) * sizeof(float);
+        const size_t y_bytes = static_cast<size_t>(B) * D * sizeof(float);
+
+        if (ep2_p2p_) {
+            if (!hip_ok(hipEventRecord(ev_g0_to_g1_, stream_), "ep2 rec g0", err)) return false;
+            if (!hip_ok(hipSetDevice(gpu1_id_), "ep2 set g1", err)) return false;
+            if (!hip_ok(hipStreamWaitEvent(peer_stream_, ev_g0_to_g1_, 0), "ep2 wait g0", err)) {
+                (void)hipSetDevice(gpu0_id_); return false;
+            }
+            if (!hip_ok(hipMemcpyPeerAsync(peer_sc_mlp_f16_.dev_ptr, gpu1_id_, mlpf16_g0, gpu0_id_, x_bytes, peer_stream_), "ep2 p2p x", err) ||
+                !hip_ok(hipMemcpyPeerAsync(peer_sc_topk_ids_.dev_ptr, gpu1_id_, tk_i_g0, gpu0_id_, idx_bytes, peer_stream_), "ep2 p2p ids", err) ||
+                !hip_ok(hipMemcpyPeerAsync(peer_sc_topk_w_.dev_ptr, gpu1_id_, tk_w_g0, gpu0_id_, w_bytes, peer_stream_), "ep2 p2p ws", err)) {
+                (void)hipSetDevice(gpu0_id_); return false;
+            }
+        } else {
+            if (!hip_ok(hipMemcpyAsync(h_ep_x_f16_, mlpf16_g0, x_bytes, hipMemcpyDeviceToHost, stream_), "ep2 d2h x", err) ||
+                !hip_ok(hipMemcpyAsync(h_ep_ids_, tk_i_g0, idx_bytes, hipMemcpyDeviceToHost, stream_), "ep2 d2h ids", err) ||
+                !hip_ok(hipMemcpyAsync(h_ep_ws_, tk_w_g0, w_bytes, hipMemcpyDeviceToHost, stream_), "ep2 d2h ws", err) ||
+                !hip_ok(hipStreamSynchronize(stream_), "ep2 sync g0->h", err)) {
+                return false;
+            }
+            if (!hip_ok(hipSetDevice(gpu1_id_), "ep2 set g1 bounce", err)) return false;
+            if (!hip_ok(hipMemcpyAsync(peer_sc_mlp_f16_.dev_ptr, h_ep_x_f16_, x_bytes, hipMemcpyHostToDevice, peer_stream_), "ep2 h2d x", err) ||
+                !hip_ok(hipMemcpyAsync(peer_sc_topk_ids_.dev_ptr, h_ep_ids_, idx_bytes, hipMemcpyHostToDevice, peer_stream_), "ep2 h2d ids", err) ||
+                !hip_ok(hipMemcpyAsync(peer_sc_topk_w_.dev_ptr, h_ep_ws_, w_bytes, hipMemcpyHostToDevice, peer_stream_), "ep2 h2d ws", err)) {
+                (void)hipSetDevice(gpu0_id_); return false;
+            }
+        }
+
+        const GpuExpertDesc* p_exps = reinterpret_cast<const GpuExpertDesc*>(peer_d_layer_exps_[ip].dev_ptr);
+        const half_t*  p_x   = reinterpret_cast<const half_t*>(peer_sc_mlp_f16_.dev_ptr);
+        const int32_t* p_tki = reinterpret_cast<const int32_t*>(peer_sc_topk_ids_.dev_ptr);
+        const float*   p_tkw = reinterpret_cast<const float*>(peer_sc_topk_w_.dev_ptr);
+        half_t*        p_act = reinterpret_cast<half_t*>(peer_sc_moe_act_.dev_ptr);
+        float*         p_by  = reinterpret_cast<float*>(peer_sc_bucket_y_.dev_ptr);
+        float*         p_out = reinterpret_cast<float*>(peer_sc_moe_out_.dev_ptr);
+
+        if (B <= 4) {
+            k_moe_direct_w13_situ<<<dim3((c_.inter + 3) / 4, tot_pairs), 256, 0, peer_stream_>>>(
+                p_exps, p_tki, p_x, p_act, B, c_.top_k, D, c_.inter, c_.situ_beta, c_.situ_lb);
+            k_moe_direct_w2_par<<<dim3((D + 7) / 8, tot_pairs), 256, 0, peer_stream_>>>(
+                p_exps, p_tki, p_act, p_by, B, c_.top_k, D, c_.inter);
+            k_moe_direct_reduce<<<dim3((D + 255) / 256, B), 256, 0, peer_stream_>>>(
+                p_by, p_tkw, p_out, B, c_.top_k, D);
+        } else {
+            int32_t* p_off = reinterpret_cast<int32_t*>(peer_sc_exp_off_.dev_ptr);
+            int32_t* p_cur = reinterpret_cast<int32_t*>(peer_sc_exp_cur_.dev_ptr);
+            int32_t* p_btk = reinterpret_cast<int32_t*>(peer_sc_bucket_tok_.dev_ptr);
+            int32_t* p_s2b = reinterpret_cast<int32_t*>(peer_sc_slotk_bidx_.dev_ptr);
+            if (B >= 16) {
+                (void)hipMemsetAsync(p_off, 0, 129 * sizeof(int32_t), peer_stream_);
+                const int cblks = std::min(64, (tot_pairs + 255) / 256);
+                k_moe_count_buckets<<<cblks, 256, 0, peer_stream_>>>(p_tki, p_off, tot_pairs);
+                k_moe_prefix_buckets<<<1, 128, 0, peer_stream_>>>(p_off, p_off, p_cur);
+                k_moe_scatter_buckets<<<(tot_pairs + 255) / 256, 256, 0, peer_stream_>>>(p_tki, p_cur, p_btk, p_s2b, tot_pairs, c_.top_k);
+            } else {
+                k_moe_build_buckets<<<1, 128, 0, peer_stream_>>>(p_tki, p_off, p_btk, p_s2b, B, c_.top_k);
+            }
+            if (peer_mem_info_.gen != AmdGen::Rdna2 && peer_mem_info_.gen != AmdGen::Unknown) {
+                const int mt = (B >= 1024) ? 8 : ((B >= 256) ? 4 : ((B >= 64) ? 2 : 1));
+                const dim3 g13((2 * c_.inter + 127) / 128, c_.n_experts, mt);
+                const dim3 g2((D + 127) / 128, c_.n_experts, mt);
+                if (B >= 64) {
+                    k_moe_grouped_w13_situ_wmma_128<<<g13, 256, 0, peer_stream_>>>(
+                        p_exps, p_off, p_btk, p_x, p_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                    k_moe_grouped_w2_wmma_128<<<g2, 256, 0, peer_stream_>>>(
+                        p_exps, p_off, p_act, p_by, D, c_.inter);
+                } else {
+                    k_moe_grouped_w13_situ_wmma<<<g13, 256, 0, peer_stream_>>>(
+                        p_exps, p_off, p_btk, p_x, p_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                    k_moe_grouped_w2_wmma<<<g2, 256, 0, peer_stream_>>>(
+                        p_exps, p_off, p_act, p_by, D, c_.inter);
+                }
+            } else {
+                k_moe_grouped_w13_situ<<<dim3((c_.inter + 3) / 4, c_.n_experts), 256, 0, peer_stream_>>>(
+                    p_exps, p_off, p_btk, p_x, p_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                k_moe_grouped_w2<<<dim3((D + 7) / 8, c_.n_experts), 256, 0, peer_stream_>>>(
+                    p_exps, p_off, p_act, p_by, D, c_.inter);
+            }
+            k_moe_reduce_buckets_masked<<<dim3((D + 255) / 256, B), 256, 0, peer_stream_>>>(
+                p_exps, p_tki, p_by, p_s2b, p_tkw, p_out, B, c_.top_k, D);
+        }
+
+        if (ep2_p2p_) {
+            if (!hip_ok(hipMemcpyPeerAsync(sc_peer_moe_out_.dev_ptr, gpu0_id_, p_out, gpu1_id_, y_bytes, peer_stream_), "ep2 p2p y", err)) {
+                (void)hipSetDevice(gpu0_id_); return false;
+            }
+        } else {
+            if (!hip_ok(hipMemcpyAsync(h_ep_y1_, p_out, y_bytes, hipMemcpyDeviceToHost, peer_stream_), "ep2 d2h y", err)) {
+                (void)hipSetDevice(gpu0_id_); return false;
+            }
+        }
+        if (!hip_ok(hipEventRecord(ev_g1_done_, peer_stream_), "ep2 rec g1", err)) {
+            (void)hipSetDevice(gpu0_id_); return false;
+        }
+        return hip_ok(hipSetDevice(gpu0_id_), "ep2 restore g0", err);
+    }
+
+    bool finish_peer_moe_add(int B, float* moeout_g0, std::string& err) {
+        const int D = c_.hidden;
+        if (ep2_p2p_) {
+            if (!hip_ok(hipStreamWaitEvent(stream_, ev_g1_done_, 0), "ep2 wait g1", err)) return false;
+        } else {
+            if (!hip_ok(hipEventSynchronize(ev_g1_done_), "ep2 sync g1", err)) return false;
+            if (!hip_ok(hipMemcpyAsync(sc_peer_moe_out_.dev_ptr, h_ep_y1_, static_cast<size_t>(B) * D * sizeof(float),
+                                       hipMemcpyHostToDevice, stream_), "ep2 h2d y", err)) {
+                return false;
+            }
+        }
+        k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(
+            moeout_g0, reinterpret_cast<const float*>(sc_peer_moe_out_.dev_ptr), moeout_g0, B * D);
+        return true;
+    }
+
     bool ensure_batch_scratch(int B, std::string& err) {
         if (B <= scratch_B_) return true;
         const int D = c_.hidden;
@@ -3090,7 +3459,72 @@ private:
             // Fast Path B1 (Hybrid partial-VRAM, B <= 16): Strata Predictive CPU/RAM Hybrid (GPU VRAM+ElasticCache || Spin-Wait CPU Pool + 3x-Loop Async DMA Prefetch!)
             // Fast Path B2 (Hybrid partial-VRAM, B > 16): Chunked Double-Buffered GPU Matrix-Core Expert Streaming!
             bool fused_moe_post = false;
-            if (layer_all_gpu_[ip] && B <= 4) {
+            if (ep2_active_) {
+                // Dual-GPU Expert Parallelism: launch GPU 1 peer experts FIRST, then compute GPU 0 (+ optional hybrid RAM) in parallel!
+                if (!fused_router_f16) {
+                    k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
+                }
+                if (!launch_peer_moe_async(ip, B, mlpf16, tk_i, tk_w, err)) return false;
+
+                if (layer_all_ep2_[ip]) {
+                    const GpuExpertDesc* d_exps = reinterpret_cast<const GpuExpertDesc*>(d_layer_exps_[ip].dev_ptr);
+                    if (B <= 4) {
+                        k_moe_direct_w13_situ<<<dim3((c_.inter + 3) / 4, B * c_.top_k), 256, 0, stream_>>>(
+                            d_exps, tk_i, mlpf16, reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr),
+                            B, c_.top_k, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                        float* y_part = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
+                        k_moe_direct_w2_par<<<dim3((D + 7) / 8, B * c_.top_k), 256, 0, stream_>>>(
+                            d_exps, tk_i, reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr),
+                            y_part, B, c_.top_k, D, c_.inter);
+                        k_moe_direct_reduce<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                            y_part, tk_w, moeout, B, c_.top_k, D);
+                    } else {
+                        int32_t* d_off = reinterpret_cast<int32_t*>(sc_exp_off_.dev_ptr);
+                        int32_t* d_cur = reinterpret_cast<int32_t*>(sc_exp_cur_.dev_ptr);
+                        int32_t* d_btk = reinterpret_cast<int32_t*>(sc_bucket_tok_.dev_ptr);
+                        int32_t* d_s2b = reinterpret_cast<int32_t*>(sc_slotk_bidx_.dev_ptr);
+                        half_t*  d_act = reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr);
+                        float*   d_by  = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
+                        const int tot_pairs = B * c_.top_k;
+                        if (B >= 16) {
+                            (void)hipMemsetAsync(d_off, 0, 129 * sizeof(int32_t), stream_);
+                            const int cblks = std::min(64, (tot_pairs + 255) / 256);
+                            k_moe_count_buckets<<<cblks, 256, 0, stream_>>>(tk_i, d_off, tot_pairs);
+                            k_moe_prefix_buckets<<<1, 128, 0, stream_>>>(d_off, d_off, d_cur);
+                            k_moe_scatter_buckets<<<(tot_pairs + 255) / 256, 256, 0, stream_>>>(tk_i, d_cur, d_btk, d_s2b, tot_pairs, c_.top_k);
+                        } else {
+                            k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
+                        }
+                        if (mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
+                            const int mt = (B >= 1024) ? 8 : ((B >= 256) ? 4 : ((B >= 64) ? 2 : 1));
+                            const dim3 g13((2 * c_.inter + 127) / 128, c_.n_experts, mt);
+                            const dim3 g2((D + 127) / 128, c_.n_experts, mt);
+                            if (B >= 64) {
+                                k_moe_grouped_w13_situ_wmma_128<<<g13, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                                k_moe_grouped_w2_wmma_128<<<g2, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_act, d_by, D, c_.inter);
+                            } else {
+                                k_moe_grouped_w13_situ_wmma<<<g13, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                                k_moe_grouped_w2_wmma<<<g2, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_act, d_by, D, c_.inter);
+                            }
+                        } else {
+                            k_moe_grouped_w13_situ<<<dim3((c_.inter + 3) / 4, c_.n_experts), 256, 0, stream_>>>(
+                                d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                            k_moe_grouped_w2<<<dim3((D + 7) / 8, c_.n_experts), 256, 0, stream_>>>(
+                                d_exps, d_off, d_act, d_by, D, c_.inter);
+                        }
+                        k_moe_reduce_buckets_masked<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                            d_exps, tk_i, d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
+                    }
+                    if (!finish_peer_moe_add(B, moeout, err)) return false;
+                }
+            }
+            if (ep2_active_ && layer_all_ep2_[ip]) {
+                // Already completed on GPU 0 || GPU 1 above!
+            } else if (layer_all_gpu_[ip] && B <= 4) {
                 if (!fused_router_f16) {
                     k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
                 }
@@ -3311,6 +3745,7 @@ private:
                         const float rw = h_ws[b * c_.top_k + k];
                         const int dir_idx = model_->dir_index_of[ip * c_.n_experts + eid];
                         if (dir_idx < 0) continue;
+                        if (ep2_active_ && peer_expert_gpu_offset_[dir_idx] != static_cast<size_t>(-1)) continue;  // handled by GPU 1!
                         if (step_exps[eid].body != nullptr) {
                             any_gpu_exp = true;
                             continue;
@@ -3468,6 +3903,7 @@ private:
                     if (m_e <= 0) continue;
                     const int dir_idx = model_->dir_index_of[ip * c_.n_experts + eid];
                     if (dir_idx < 0) continue;
+                    if (ep2_active_ && peer_expert_gpu_offset_[dir_idx] != static_cast<size_t>(-1)) continue;  // handled by GPU 1!
                     const uint8_t* dev_p = nullptr;
                     if (expert_gpu_offset_[dir_idx] != static_cast<size_t>(-1)) {
                         dev_p = expert_gpu_arena_.dev_ptr + expert_gpu_offset_[dir_idx];
@@ -3534,6 +3970,9 @@ private:
                         (void)hybrid_.stage_prefill_async(p_i, ram_exps[p_i].host_ptr, dir[ram_exps[p_i].dir_idx].body_bytes, false);
                     }
                 }
+                if (ep2_active_) {
+                    (void)hipMemsetAsync(d_by, 0, static_cast<size_t>(B) * c_.top_k * D * sizeof(float), stream_);
+                }
                 for (const auto& ge : gpu_exps) exec_one(ge, ge.dev_ptr);
 
                 for (int ri = 0; ri < static_cast<int>(ram_exps.size()); ++ri) {
@@ -3556,6 +3995,9 @@ private:
 
                 k_moe_reduce_buckets<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
                     d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
+            }
+            if (ep2_active_ && !layer_all_ep2_[ip]) {
+                if (!finish_peer_moe_add(B, moeout, err)) return false;
             }
 
             // Post-MLP ShortConv + residual add (already fused into k_moe_reduce_sconv_add for B<=4 decode!)
@@ -4429,6 +4871,34 @@ private:
         invalidate_graph();
         hybrid_.release();
         blaslt_.release();
+        if (peer_stream_ || ev_g1_done_ || peer_expert_gpu_arena_.dev_ptr || !peer_d_layer_exps_.empty() || peer_scratch_B_ > 0) {
+            if (gpu1_id_ >= 0) (void)hipSetDevice(gpu1_id_);
+            if (peer_stream_) {
+                (void)hipStreamSynchronize(peer_stream_);
+                (void)hipStreamDestroy(peer_stream_);
+                peer_stream_ = nullptr;
+            }
+            if (ev_g1_done_) { (void)hipEventDestroy(ev_g1_done_); ev_g1_done_ = nullptr; }
+            for (auto& b : peer_d_layer_exps_) free_gpu_buffer(b);
+            peer_d_layer_exps_.clear();
+            free_gpu_buffer(peer_expert_gpu_arena_);
+            free_gpu_buffer(peer_sc_mlp_f16_); free_gpu_buffer(peer_sc_topk_ids_); free_gpu_buffer(peer_sc_topk_w_);
+            free_gpu_buffer(peer_sc_moe_act_); free_gpu_buffer(peer_sc_moe_out_);
+            free_gpu_buffer(peer_sc_exp_off_); free_gpu_buffer(peer_sc_exp_cur_);
+            free_gpu_buffer(peer_sc_bucket_tok_); free_gpu_buffer(peer_sc_slotk_bidx_); free_gpu_buffer(peer_sc_bucket_y_);
+            peer_scratch_B_ = 0;
+            if (gpu0_id_ >= 0) (void)hipSetDevice(gpu0_id_);
+        }
+        if (ev_g0_to_g1_) { (void)hipEventDestroy(ev_g0_to_g1_); ev_g0_to_g1_ = nullptr; }
+        free_gpu_buffer(sc_peer_moe_out_);
+        if (h_ep_x_f16_) { (void)hipHostFree(h_ep_x_f16_); h_ep_x_f16_ = nullptr; }
+        if (h_ep_ids_)   { (void)hipHostFree(h_ep_ids_);   h_ep_ids_ = nullptr; }
+        if (h_ep_ws_)    { (void)hipHostFree(h_ep_ws_);    h_ep_ws_ = nullptr; }
+        if (h_ep_y1_)    { (void)hipHostFree(h_ep_y1_);    h_ep_y1_ = nullptr; }
+        peer_expert_gpu_offset_.clear();
+        layer_all_ep2_.clear();
+        ep2_active_ = false;
+        ep2_p2p_ = false;
         if (stream_) {
             (void)hipStreamSynchronize(stream_);
             (void)hipStreamDestroy(stream_);
@@ -4512,8 +4982,30 @@ private:
     InkCfg c_;
     DsparkCfg dspark_cfg_;
     DeviceMemoryInfo mem_info_;
+    DeviceMemoryInfo peer_mem_info_;
     DispatchGuard guard_;
     hipStream_t stream_ = nullptr;
+    int gpu0_id_ = 0;
+    int gpu1_id_ = -1;
+    bool ep2_active_ = false;
+    bool ep2_p2p_ = false;
+    double ep_split_ = 0.5;
+    hipStream_t peer_stream_ = nullptr;
+    hipEvent_t ev_g0_to_g1_ = nullptr;
+    hipEvent_t ev_g1_done_ = nullptr;
+    GpuBuffer peer_expert_gpu_arena_;
+    std::vector<size_t> peer_expert_gpu_offset_;
+    std::vector<GpuBuffer> peer_d_layer_exps_;
+    std::vector<bool> layer_all_ep2_;
+    int peer_scratch_B_ = 0;
+    GpuBuffer sc_peer_moe_out_;
+    GpuBuffer peer_sc_mlp_f16_, peer_sc_topk_ids_, peer_sc_topk_w_;
+    GpuBuffer peer_sc_moe_act_, peer_sc_moe_out_;
+    GpuBuffer peer_sc_exp_off_, peer_sc_exp_cur_, peer_sc_bucket_tok_, peer_sc_slotk_bidx_, peer_sc_bucket_y_;
+    half_t* h_ep_x_f16_ = nullptr;
+    int32_t* h_ep_ids_ = nullptr;
+    float* h_ep_ws_ = nullptr;
+    float* h_ep_y1_ = nullptr;
     HipBlasLtRunner blaslt_;
     HipHybridController hybrid_;
     int blaslt_min_m_ = 16;

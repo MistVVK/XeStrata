@@ -19,7 +19,8 @@ struct BackendOpts {
     int parallel = 1;            // 1..64 concurrent slots
     int chunk = 512;
     int gpu_index = 0;
-    int gpus = 1;                // 1 or 2 (--gpus 2 activates Dual-GPU Expert Parallelism, #6506)
+    int gpus = 1;                // 1 or 2 (--gpus 2 or --gpus 0,1 activates Dual-GPU Expert Parallelism, #6506)
+    std::vector<int> gpu_ids;    // optional explicit device indices parsed from --gpus 0,1 / --devices 0,1
     double ep_split = 0.5;       // GPU 1 expert share in (0, 1) (--ep-split / IK2_EP_SPLIT)
     int vram_reserve_mib = -1;   // >= 0 reserves N MiB free VRAM & activates hybrid offload (#6520)
     int cpu_threads = 0;         // > 0 activates CUDA-Graph mapped-memory doorbell NUMA CPU expert pool (#6520)

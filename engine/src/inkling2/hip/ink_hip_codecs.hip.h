@@ -3728,6 +3728,30 @@ __global__ void __launch_bounds__(256) k_moe_reduce_buckets(
     moe_out[static_cast<size_t>(b) * D + d] = acc;
 }
 
+// Masked deterministic reduction across top_k=8 bucket outputs for Dual-GPU EP (skips experts with null body!)
+// Grid: ((D + 255) / 256, B), Block: 256
+__global__ void __launch_bounds__(256) k_moe_reduce_buckets_masked(
+    const GpuExpertDesc* __restrict__ exps,     // [128]
+    const int32_t* __restrict__ topk_ids,       // [B * top_k]
+    const float* __restrict__ bucket_y,         // [B * top_k, D]
+    const int32_t* __restrict__ slotk_to_bidx,  // [B * top_k]
+    const float* __restrict__ topk_weights,     // [B * top_k]
+    float* __restrict__ moe_out,                // [B, D]
+    int B, int top_k, int D) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b = blockIdx.y;
+    if (d >= D || b >= B) return;
+    float acc = 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+        const int sk = b * top_k + k;
+        const int eid = topk_ids[sk];
+        if (eid < 0 || !exps[eid].body) continue;
+        const int bi = slotk_to_bidx[sk];
+        acc = fmaf(bucket_y[static_cast<size_t>(bi) * D + d], topk_weights[sk], acc);
+    }
+    moe_out[static_cast<size_t>(b) * D + d] = acc;
+}
+
 // =================================================================================================
 // 4D. Wave32 WMMA BM=64, BN=128 Fused Grouped-MoE (SF4 + MX8 + S_K) for Prefill & Batched Decode (B >= 5)!
 // 256 threads = 8 waves (W_M=2, W_N=4 -> 2x2 WMMA tiles/wave) + 3D blockIdx.z M-tile fan-out for hot experts!

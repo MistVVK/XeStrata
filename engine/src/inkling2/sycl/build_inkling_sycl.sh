@@ -51,8 +51,12 @@ fi
 "${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -I"${ENG_ROOT}/include" \
   -c "${ENG_ROOT}/src/quant/sk_codecs.cpp" -o "${OUT_DIR}/sk_codecs.o"
 "${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -I"${ENG_ROOT}/include" \
+  -c "${ENG_ROOT}/src/quant/dequant.cpp" -o "${OUT_DIR}/dequant.o"
+"${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -I"${ENG_ROOT}/include" \
+  -c "${ENG_ROOT}/src/quant/types.cpp" -o "${OUT_DIR}/types.o"
+"${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -I"${ENG_ROOT}/include" \
   -c "${ENG_ROOT}/src/inkling2/inkling2_loop.cpp" -o "${OUT_DIR}/inkling2_loop.o"
-OBJS+=("${OUT_DIR}/sk_codecs.o" "${OUT_DIR}/inkling2_loop.o")
+OBJS+=("${OUT_DIR}/sk_codecs.o" "${OUT_DIR}/dequant.o" "${OUT_DIR}/types.o" "${OUT_DIR}/inkling2_loop.o")
 
 # 2. Target flags (Alchemist dg2 + Battlemage bmg_g21 + Arc Pro B70 bmg_g31 + portable spir64 JIT!)
 SYCL_FLAGS=(-fsycl -std=c++20 -O3 -fno-fast-math)
@@ -60,11 +64,9 @@ case "${TARGET_MODE}" in
   fat)
     if [ -n "${SYCL_TARGETS_OVERRIDE:-}" ]; then
       SYCL_FLAGS+=("-fsycl-targets=${SYCL_TARGETS_OVERRIDE}")
-    elif command -v ocloc >/dev/null 2>&1 && ocloc compile -device bmg_g31 -file <(echo 'kernel void k(){}') -output /tmp/_ocloc_probe_g31 >/dev/null 2>&1; then
-      rm -f /tmp/_ocloc_probe_g31*
+    elif command -v ocloc >/dev/null 2>&1 && ocloc ids bmg_g31 >/dev/null 2>&1; then
       SYCL_FLAGS+=(-fsycl-targets=spir64,intel_gpu_acm_g10,intel_gpu_bmg_g21,intel_gpu_bmg_g31)
     else
-      rm -f /tmp/_ocloc_probe_g31*
       SYCL_FLAGS+=(-fsycl-targets=spir64,intel_gpu_acm_g10,intel_gpu_bmg_g21)
     fi
     ;;
