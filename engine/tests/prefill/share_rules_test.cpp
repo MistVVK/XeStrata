@@ -98,9 +98,11 @@ int main() {
         in.resident = -1;
         CHECK(!link_rule(in).arm);                                     // the card's counts not known
         CHECK(env_state(nullptr) == -1 && env_state("") == -1 && env_state("1") == 1 && env_state("0") == 0 && env_state("auto") == 0);
-        CHECK(link_rule_enabled(true, true, true, 12, 0, -1));         // the class: a discrete cc 12.0 card, link probed
-        CHECK(!link_rule_enabled(true, true, true, 8, 6, -1));         // other cards: not measured
-        CHECK(link_rule_enabled(true, true, true, 8, 6, 1));           // =1 asks for it
+        CHECK(link_rule_enabled(true, true, true, 12, 0, -1));         // sm_120: enabled by default
+        CHECK(link_rule_enabled(true, true, true, 8, 6, -1));          // sm_86 (Ampere): enabled by default (Track 6A)
+        CHECK(link_rule_enabled(true, true, true, 8, 9, -1));          // sm_89 (Ada): enabled by default (Track 6A)
+        CHECK(!link_rule_enabled(true, true, true, 7, 5, -1));         // older Turing: not measured
+        CHECK(link_rule_enabled(true, true, true, 7, 5, 1));           // =1 asks for it
         CHECK(!link_rule_enabled(true, true, true, 12, 0, 0));         // =0 is the way back
         CHECK(!link_rule_enabled(true, false, true, 12, 0, -1));       // an integrated card
         CHECK(!link_rule_enabled(true, true, false, 12, 0, 1));        // no probe: nothing to read the link from

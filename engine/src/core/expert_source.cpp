@@ -4456,21 +4456,35 @@ bool FileExpertSource::pin_cache_complement(
                         if (offsets[i] < got && offsets[i] + b > got) { w = offsets[i]; break; }
                     }
                     if (w > 0) {
-                        if (cudaHostRegister(arena, (size_t) w, cudaHostRegisterMapped | cudaHostRegisterPortable) ==
-                            cudaSuccess) {
-                            void* alias = nullptr;
-                            if (cudaHostGetDevicePointer(&alias, arena, 0) == cudaSuccess && alias != nullptr) {
-                                device = (const uint8_t*) alias;
-                                partial_pin = w;
-                            } else {
+                        const uint64_t reg_step = 2ull << 30;
+                        bool reg_ok = false;
+                        for (uint64_t want = w; want > 0; want = want > reg_step ? want - reg_step : 0) {
+                            uint64_t cw = want;
+                            for (size_t i = 0; i < offsets.size() && cw < bytes; ++i) {
+                                if (offsets[i] == kNoComplement) continue;
+                                const uint64_t b = layer_blob_bytes_[i / (size_t) n_expert_];
+                                if (offsets[i] < want && offsets[i] + b > want) { cw = offsets[i]; break; }
+                            }
+                            if (cw == 0) break;
+                            if (cudaHostRegister(arena, (size_t) cw, cudaHostRegisterMapped | cudaHostRegisterPortable) ==
+                                cudaSuccess) {
+                                void* alias = nullptr;
+                                if (cudaHostGetDevicePointer(&alias, arena, 0) == cudaSuccess && alias != nullptr) {
+                                    device = (const uint8_t*) alias;
+                                    partial_pin = cw;
+                                    reg_ok = true;
+                                    if (cw < w && stop == nullptr) stop = "the driver capped the page-locked prefix";
+                                    break;
+                                }
                                 (void) cudaGetLastError();
                                 (void) cudaHostUnregister(arena);
                                 if (stop == nullptr) stop = "no device alias";
+                                break;
                             }
-                        } else {
                             (void) cudaGetLastError();
-                            if (stop == nullptr) stop = "the driver refused to page-lock it";
+                            if (want <= reg_step) break;
                         }
+                        if (!reg_ok && stop == nullptr) stop = "the driver refused to page-lock it";
                     }
                     lock_off = partial_pin;
                     char msg[240];
@@ -5615,7 +5629,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             int32_t vic[64];
             int nv = 0;
             for (int32_t e = 0; e < (int32_t) d.n_expert && nc > 0; ++e) {
-                if (d.res_mut[lb + (size_t) e] < 0 || d.fetch_mark[(size_t) e] != 0) continue;
+                if (d.res_mut[lb + (size_t) e] < 0 || d.fetch_mark[(size_t) e] != 0 ||
+                    (d.fetch_pin != nullptr && d.fetch_pin[lb + (size_t) e] != 0)) continue;
                 if (nv < nc) vic[nv++] = e;
                 else if (use[e] < use[vic[nv - 1]]) vic[nv - 1] = e;
                 else continue;

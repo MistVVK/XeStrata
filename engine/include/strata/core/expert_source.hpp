@@ -681,6 +681,7 @@ struct ExpertDispatch {
     int32_t* res_mut = nullptr;
     std::vector<uint8_t> in_flight;
     std::vector<uint8_t> fetch_mark;   ///< per expert of the layer: routed in the window
+    const uint8_t* fetch_pin = nullptr;   ///< non-null: pinned Zipf-head (layer, expert) slots protected from eviction
     /// STRATA_ADAPT_FETCH: whether the pool can admit into `layer` now (a window still needs a PCIe share there)
     bool fetch_can(int64_t layer) const;
     /// per layer: the PCIe share fetched there since the tier's last round (the tier leaves those layers' fetchable

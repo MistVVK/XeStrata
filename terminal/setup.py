@@ -11763,8 +11763,10 @@ def main() -> int:
                   else "as requested")
         ok(f"rope scaling: {scaling}, factor {rope_scale:g} ({origin})")
     ok(f"context: {ctx} tokens")
-    # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21)
-    kv = "fp16" if ctx <= 8192 else (a.kv or "int8")
+    # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21).
+    # Track 6A: on <= 12.5 GB GPUs, default to int8 KV even at <= 8192 context (saves ~112 MiB VRAM for ExpertCache/DFlash2).
+    _low_vram_kv = 0 < float((gpu or {}).get("vram_gb") or 0.0) <= 12.5
+    kv = (a.kv or "int8") if (ctx > 8192 or _low_vram_kv) else (a.kv or "fp16")
     if ctx > 8192 and not a.kv and not a.yes:
         say()
         say("  KV cache precision (the model's memory of the conversation):")

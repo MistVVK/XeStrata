@@ -91,10 +91,11 @@ inline int env_state(const char* v) {
     if (v == nullptr || v[0] == '\0') return -1;
     return (v[0] == '1' && v[1] == '\0') ? 1 : 0;
 }
-/// Whether the rule runs: the class it was measured on by default (a CUDA discrete card, one card, the link probed, compute capability 12.0), every CUDA card with =1, none with any other value.
+/// Whether the rule runs: discrete CUDA cards with link probed on sm_120, sm_89 (Ada), and sm_86 (Ampere) by default, every CUDA card with =1, none with any other value.
 inline bool link_rule_enabled(bool cuda, bool discrete, bool link_probed, int cc_major, int cc_minor, int env) {
     if (!cuda || env == 0 || !discrete || !link_probed) return false;
-    return env == 1 || (cc_major == 12 && cc_minor == 0);
+    return env == 1 || (cc_major == 12 && cc_minor == 0) ||
+           (cc_major == 8 && (cc_minor == 6 || cc_minor == 9));
 }
 
 /// resident_slots: the expert cache's live slots; total_pairs: layers x routed experts per layer (<= 0: unknown, arm).

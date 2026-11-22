@@ -24,11 +24,14 @@
 
 namespace strata::core {
 
-/// STRATA_ADAPT_FETCH=2 as a default (0.2.17, owner yes 11-19; BW-9 on 2x RTX 5060 Ti 16 GB, phaseA-tests/bw/RESULTS-BW-F.md): compute
-/// capability 12.x cards with at most this much VRAM (RTX 5050 / 5060 / 5060 Ti / 5070 / 5070 Ti / 5080 and the laptop parts).  A card with more
-/// VRAM keeps it opt-in.  The switch is read once per process and only a one-card run uses it (a layer split, helper cards, a peer tier, --batch
-/// and the other cases the start-up line names turn it off), so the card that decides is the engine's main one (STRATA_PRIMARY_DEVICE).
+/// STRATA_ADAPT_FETCH=2 as a default (0.2.17, owner yes 11-19; BW-9 on 2x RTX 5060 Ti 16 GB, phaseA-tests/bw/RESULTS-BW-F.md;
+/// 0.2.20 extended to <= 13 GiB sm_86/sm_89 consumer cards: RTX 3060/3060 Ti/3070/3080, RTX 4060/4060 Ti 8G/4070/4070 Ti):
+/// compute capability 12.x cards with at most kAdaptFetchMaxVramBytes (16 GiB), or sm_86/sm_89 cards with at most
+/// kAdaptFetchLowVramBytes (13 GiB). A card with more VRAM keeps it opt-in. The switch is read once per process and only a
+/// one-card run uses it (a layer split, helper cards, a peer tier, --batch, resident RAM mode and the other cases the start-up
+/// line names turn it off), so the card that decides is the engine's main one (STRATA_PRIMARY_DEVICE).
 constexpr uint64_t kAdaptFetchMaxVramBytes = 16ull << 30;
+constexpr uint64_t kAdaptFetchLowVramBytes = 13ull << 30;
 /// Whether STRATA_ADAPT_FETCH=2 is the default of a card with compute capability major.minor (raw) and `vram_bytes` of memory
 /// (cudaDeviceProp::totalGlobalMem; 0 = unknown, which is no).  Not about the environment: the off switches are in nv_default_env.
 bool adapt_fetch_default_card(int major, int minor, uint64_t vram_bytes);

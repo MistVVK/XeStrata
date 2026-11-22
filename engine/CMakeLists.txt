@@ -422,6 +422,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(share_rules_test PRIVATE include)
   add_test(NAME share_rules_test COMMAND share_rules_test)
 
+  # Track 6A: low-VRAM (<= 13 GiB) consumer GPU rules (auto reserve, tiny-cache anti-thrash, Zipf pinning, auto L3_PF)
+  add_executable(low_vram_rules_test src/core/low_vram_rules_test.cpp)
+  target_include_directories(low_vram_rules_test PRIVATE include)
+  add_test(NAME low_vram_rules_test COMMAND low_vram_rules_test)
+
   # the chunk a prompt piece below the walk floor lends its buffers for (the staged layout, not the rounded chunk's streamed one): header-only rule, no GPU
   add_executable(loan_rules_test tests/prefill/loan_rules_test.cpp)
   target_include_directories(loan_rules_test PRIVATE include)

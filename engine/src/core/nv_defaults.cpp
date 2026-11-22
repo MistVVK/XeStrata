@@ -20,7 +20,10 @@ bool off(const char* name) {
 
 bool adapt_fetch_default_card(int major, int minor, uint64_t vram_bytes) {
     const int cc = strata::cc_of(major, minor);
-    return (cc / 10) == 12 && vram_bytes > 0 && vram_bytes <= kAdaptFetchMaxVramBytes;
+    if (vram_bytes == 0) return false;
+    if ((cc / 10) == 12) return vram_bytes <= kAdaptFetchMaxVramBytes;
+    if (cc == 86 || cc == 89) return vram_bytes <= kAdaptFetchLowVramBytes;
+    return false;
 }
 
 std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor) {
@@ -61,8 +64,14 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_PLE_COMPACT", "1"},
             {"STRATA_PLE_COPY_STREAM", "1"},
             {"STRATA_PF_FUSED_KQ", "1"},
+            // 0.2.20 sm_86 consumer parity (RTX 3070 8 GB / 3060 12 GB): exact kernels matching sm_89/sm_120
+            {"STRATA_HC_UPMIX", "1"},
+            {"STRATA_Q80_ROWS1", "1"},
+            {"STRATA_EXP_MODE", "8"},
+            {"STRATA_PREFILL_CPU_SHARE_NT", "32"},
         };
-        if (main_vram_bytes > kAdaptFetchMaxVramBytes) t.push_back({"STRATA_VERIFY_DEVICE_HITS", "1"});
+        if (!defaults026 && adapt_fetch_default_card(major, minor, main_vram_bytes)) t.push_back({"STRATA_ADAPT_FETCH", "2"});
+        else if (main_vram_bytes > kAdaptFetchMaxVramBytes) t.push_back({"STRATA_VERIFY_DEVICE_HITS", "1"});
     } else if (mj == 8 && mn == 9) {
         // RTX 40 / Ada Lovelace (compute capability 8.9: RTX 4090 / 4080 / 4070 / RTX 6000 Ada).
         // #6462 measured the sm_86 bit-exact set (+6%, KL 0.00000) and CPU share 32/6144 (-26% 3K follow-up TTFT) on RTX 4090.
@@ -89,7 +98,8 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_PREFILL_CPU_SHARE_NT", "32"},
             {"STRATA_PREFILL_CPU_SHARE_MAX", "6144"},
         };
-        if (main_vram_bytes > kAdaptFetchMaxVramBytes) t.push_back({"STRATA_VERIFY_DEVICE_HITS", "1"});
+        if (adapt_fetch_default_card(major, minor, main_vram_bytes)) t.push_back({"STRATA_ADAPT_FETCH", "2"});
+        else if (main_vram_bytes > kAdaptFetchMaxVramBytes) t.push_back({"STRATA_VERIFY_DEVICE_HITS", "1"});
     } else if (mj == 12 && mn == 0) {
         // RTX 50 / PRO Blackwell (compute capability 12.0; a gfx12 HIP card reports 12.0 too, but this table is applied by the CUDA build only).  STRATA_SM120_PERF=0 and STRATA_DEFAULTS=026 leave it out.
         if (off("STRATA_SM120_PERF") || defaults026) return t;
