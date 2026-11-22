@@ -444,6 +444,17 @@ def generate_row(text: str) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------ one run
+def stop(p: subprocess.Popen) -> None:
+    """Ends `p` as the server ends an engine: SIGTERM, on which the engine drains its GPU queues (at most 5 s), then
+    SIGKILL after 10 s.  A SIGKILL alone leaves the GPU work it queued behind it, and the next engine's queue can hang
+    on the xe driver (issue #62)."""
+    p.terminate()
+    try:
+        p.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        p.kill()
+
+
 def watch_generate(p: subprocess.Popen, log: Path, slow: float, owner: str) -> str | None:
     """Stops `p` once it is plainly at `slow` tok/s or less (0: never): its prompt when the PP progress line says so
     after 30 s, its output when 256 tokens at `slow` tok/s and a minute have passed since the prompt was read (an
@@ -466,12 +477,12 @@ def watch_generate(p: subprocess.Popen, log: Path, slow: float, owner: str) -> s
         done, total, ms, rate = int(pp[-1][0]), int(pp[-1][1]), int(pp[-1][2]), pp[-1][3]
         if done < total:
             if ms >= 30000 and float(rate) <= slow:
-                p.kill()
+                stop(p)
                 return f"bench: stopped, {owner} prompt at {rate} tok/s after {ms // 1000} s"
         elif t_done is None:
             t_done = time.monotonic()
         elif time.monotonic() - t_done > MAX_NEW // slow + 60:
-            p.kill()
+            stop(p)
             return (f"bench: stopped, {owner} output under {slow:g} tok/s ({time.monotonic() - t_done:.0f} s after "
                     "the prompt)")
     return None
@@ -489,7 +500,7 @@ def run_generate(e: Engine, args: list[str], ids: Path, log: Path, follow: Path 
     with open(log, "w", encoding="utf-8") as f:
         p = subprocess.Popen(cmd, cwd=e.cwd, env={**e.env, **(extra_env or {})}, stdout=f, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL)
-        timer = threading.Timer(DEADLINE, p.kill)       # bench.sh's `timeout 2400`
+        timer = threading.Timer(DEADLINE, stop, (p,))   # bench.sh's `timeout 2400`
         timer.start()
         why = watch_generate(p, log, slow, "upstream's" if e.arm == "up" else "XeStrata's")
         rc = p.wait()
@@ -609,7 +620,7 @@ def run_serve(e: Engine, args: list[str], ids: dict, tier: str, mode: str, rnd: 
         try:
             p.wait(timeout=60)
         except subprocess.TimeoutExpired:
-            p.kill()
+            stop(p)
             p.wait()
         if why:
             f.write(f"bench: {why}\n")
