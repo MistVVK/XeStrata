@@ -75,6 +75,9 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
     } else if (mj == 8 && mn == 9) {
         // RTX 40 / Ada Lovelace (compute capability 8.9: RTX 4090 / 4080 / 4070 / RTX 6000 Ada).
         // #6462 measured the sm_86 bit-exact set (+6%, KL 0.00000) and CPU share 32/6144 (-26% 3K follow-up TTFT) on RTX 4090.
+        // #6431: STRATA_L2_PF=1 stays opt-in (regressed PCIe-streaming decode by 8-12% on partial-VRAM cards).
+        // #6583: STRATA_QFUSE=1 stays opt-in alongside STRATA_GR_UP75=1 (overrides GR_UP75 and disables 1-token self_commit,
+        // regressing partial-VRAM decode by ~5%).
         // STRATA_SM89_PERF=0 and STRATA_DEFAULTS=026 leave it out.
         if (off("STRATA_SM89_PERF") || defaults026) return t;
         t = {
@@ -85,12 +88,10 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_QSA_ROWS", "1"},
             {"STRATA_B6_MMVQ_ROWS", "1"},
             {"STRATA_HC_UPMIX", "1"},
-            {"STRATA_L2_PF", "1"},
             {"STRATA_Q80_ROWS1", "1"},
             {"STRATA_EXP_MODE", "8"},
             {"STRATA_SIDE_MIXER", "2"},
             {"STRATA_DEQUANT_SIDE", "1"},
-            {"STRATA_QFUSE", "1"},
             {"STRATA_LFUSE", "1"},
             {"STRATA_PLE_COMPACT", "1"},
             {"STRATA_PLE_COPY_STREAM", "1"},

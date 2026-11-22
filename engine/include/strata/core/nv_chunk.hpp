@@ -28,6 +28,16 @@ inline int64_t nv_chunk_ceiling(const char* env, bool defaults026) noexcept {
     return 32768;
 }
 
+/// #5199: VRAM-aware ceiling for bare `--prefill auto` on NVIDIA cards.
+/// On <= 16.5 GiB GPUs (8-16 GB consumer cards), raising bare auto to 16384/32768 lends ~3.5+ GB out of hot
+/// expert slots and duplicates those lent slots in host RAM, regressing decode by 12-18% and stressing 64 GB PCs.
+/// Keep bare auto at 8192 (return 0) on <= 16.5 GiB GPUs unless the operator explicitly sets STRATA_NV_CHUNK.
+inline int64_t nv_chunk_ceiling_for_vram(const char* env, bool defaults026, uint64_t min_vram_bytes) noexcept {
+    if (defaults026) return 0;
+    if (env == nullptr && min_vram_bytes > 0 && min_vram_bytes <= (16ull << 30) + (512ull << 20)) return 0;
+    return nv_chunk_ceiling(env, defaults026);
+}
+
 /// Compute capability 8.0 and up, and 7.0 (Volta, measured, see above).  Turing (7.5) and Pascal (6.x) were not measured: they keep 8192.
 /// `min_major` / `min_minor`: the lowest compute capability among the visible cards (the lowest minor of the lowest major).
 inline bool nv_chunk_card_ok(int min_major, int min_minor) noexcept { return min_major >= 8 || (min_major == 7 && min_minor == 0); }

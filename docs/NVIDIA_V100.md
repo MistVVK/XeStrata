@@ -72,8 +72,10 @@ These switches are opt-in (either multi-GPU topology-specific or non-bitwise FP 
 | `STRATA_PF_WMMA2=1` | A second prompt-expert kernel for IQ2_S gate/up and IQ4_NL down (#2356). |
 | `STRATA_ARGMAX_ROWS_SM70=1` | The multi-block greedy pick on sm_7x (#2357), bitwise the one-block pick. |
 | `STRATA_GR_NORM_FAST=1` | The register-split hyper-connection norm (#2358). |
+| `STRATA_GR_V70=1` | The token-split hyper-connection read: one warp per row and token for the down and up projections. Bitwise the default read; each card checks it at start-up against the default read at 1-8 tokens and keeps the default read if any output differs. |
 | `STRATA_Q8_GATHER_WIDE=0` | Turns off the 8-wide int8 KV gather (#1095) that the experimental build uses below compute capability 7.5. |
 | `STRATA_GDN_REC_WARP=2` | The chain-split DeltaNet recurrence of the prompt (#1098). Changes the FP32 summation order, so the default stays the pipelined kernel. `1` is the bit-exact sync-free variant; `STRATA_GDN_CHUNK=1` the chunked path. |
+| `STRATA_Q8_V70=1` | The dense Q8_0 GEMV of 2-4 columns with its block loop unrolled (`n_in` a multiple of 1024). Bitwise the default kernel. Not taken with `STRATA_TSUM=1`. |
 
 Volta's tensor cores take FP16 only. A model's BF16 weights are converted, and a weight outside FP16's range would saturate (none
 did in the check in the history section).

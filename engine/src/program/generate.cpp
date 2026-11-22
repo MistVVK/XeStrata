@@ -3813,6 +3813,20 @@ int main(int argc, char** argv) {
     }
 #endif
 #if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    // #5162 / #5649 / #5718 / #6127: ROCm/TheRock dynamic queue assignment can colocate prompt H2D copy streams
+    // onto the compute queue after a decode request (dropping prompt speed 10-25%, copy/kernel overlap -> 0.00 s)
+    // and can stall blocked queues (ROCm/rocm-systems#9249). Must be set before the first HIP API call.
+    // STRATA_HIP_DYNAMIC_QUEUES=1 or an explicit DEBUG_HIP_DYNAMIC_QUEUES keeps the runtime default.
+    if (std::getenv("DEBUG_HIP_DYNAMIC_QUEUES") == nullptr) {
+        const char* dyn = std::getenv("STRATA_HIP_DYNAMIC_QUEUES");
+        if (!(dyn != nullptr && dyn[0] == '1')) {
+#if defined(_WIN32)
+            _putenv_s("DEBUG_HIP_DYNAMIC_QUEUES", "0");
+#else
+            setenv("DEBUG_HIP_DYNAMIC_QUEUES", "0", 0);
+#endif
+        }
+    }
     prime_hw_queues();
 #endif
     Options o;
@@ -4480,9 +4494,10 @@ int main(int argc, char** argv) {
         // auto:N or STRATA_PREFILL_AUTO_MAX is never touched (prefill_auto_bare is false then).  STRATA_NV_CHUNK=0 or STRATA_DEFAULTS=026 keeps 8192,
         // STRATA_NV_CHUNK=16 keeps 16384.  A layer split takes 8192 back (like gfx12; STRATA_SPLIT_CHUNK16K=1 keeps the raised ceiling).
         // A6000 UD-Q4_K_XL (13.1K of 24.6K experts in VRAM): 20K +43.4%, 32K +22.5%, 64K +21.3%, 8K 0.0%; cards that hold every expert: flat.
-        const int64_t top = strata::core::nv_chunk_ceiling(std::getenv("STRATA_NV_CHUNK"), strata::qwen_defaults_026());
+        const char* nv_chunk_env = std::getenv("STRATA_NV_CHUNK");
         int nd = 0, lo_major = 99, lo_minor = 99;   // the lowest compute capability of the visible cards
-        if (top > 0 && cudaGetDeviceCount(&nd) == cudaSuccess && nd > 0) {
+        uint64_t min_vram_b = 0;
+        if (cudaGetDeviceCount(&nd) == cudaSuccess && nd > 0) {
             for (int d = 0; d < nd; ++d) {
                 int m = 0, n = 0;
                 if (cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess ||
@@ -4490,13 +4505,24 @@ int main(int argc, char** argv) {
                 const int cc = strata::cc_of(m, n);
                 const int mj = cc / 10, mn = cc % 10;
                 if (mj < lo_major || (mj == lo_major && mn < lo_minor)) { lo_major = mj; lo_minor = mn; }
+                cudaDeviceProp vp{};
+                if (cudaGetDeviceProperties(&vp, d) == cudaSuccess && vp.totalGlobalMem > 0)
+                    min_vram_b = min_vram_b == 0 ? (uint64_t) vp.totalGlobalMem
+                                                 : std::min<uint64_t>(min_vram_b, (uint64_t) vp.totalGlobalMem);
             }
-            if (strata::core::nv_chunk_card_ok(lo_major, lo_minor)) {
+            const int64_t top = strata::core::nv_chunk_ceiling_for_vram(nv_chunk_env, strata::qwen_defaults_026(), min_vram_b);
+            if (top > 0 && strata::core::nv_chunk_card_ok(lo_major, lo_minor)) {
                 o.prefill_auto_max = top;
                 o.prefill_chunk = top;
                 o.prefill_gfx12_16k = true;
                 o.prefill_raise_who = "NVIDIA";
                 std::fprintf(stderr, "strata generate: NVIDIA: --prefill auto may take chunks up to %lld (STRATA_NV_CHUNK=0 keeps 8192, =16 keeps 16384)\n", (long long) top);
+            } else if (nv_chunk_env == nullptr && !strata::qwen_defaults_026() &&
+                       min_vram_b > 0 && min_vram_b <= (16ull << 30) + (512ull << 20) &&
+                       strata::core::nv_chunk_card_ok(lo_major, lo_minor)) {
+                std::fprintf(stderr, "strata generate: NVIDIA (%.1f GiB): --prefill auto stays at 8192 so prompt loans do not "
+                                     "cannibalize hot expert slots (#5199; STRATA_NV_CHUNK=16 or 1 raises it)\n",
+                             (double) min_vram_b / 1073741824.0);
             }
         }
         (void) cudaGetLastError();
@@ -8414,8 +8440,16 @@ int main(int argc, char** argv) {
         // result depends on the card and STRATA_HC_SPLIT only (random weights, compared bit for bit), so it is the same here.
         if (named && strata::core::kfd_quiet::load_moves().hc_check_early) strata::kernels::fused_gr_check();
 #endif
-        // the first prompt's one-time hipBLAS library loads (about 2.5 s), done on a thread while the expert arena loads
+        // the first prompt's one-time hipBLAS library loads (about 2.5 s).
+        // #6254: on Windows HIP (observed on RX 9060 XT gfx1200 cold boots), running rocBLAS's first-ever
+        // code-object load on a background thread concurrently with main-thread HIP runtime calls (hipHostRegister /
+        // hipMalloc / hipMemGetInfo) causes 0xC0000005 in amdhip64_7.dll / rocblas.dll. Run synchronously on Windows
+        // HIP before arena/file-tier registration; keep async overlap on Linux HIP.
+#if defined(_WIN32)
+        if (named) strata::prefill::warm_gemm_libraries(dev);
+#else
         if (named) g_warm_thr = std::thread([dev] { strata::prefill::warm_gemm_libraries(dev); });
+#endif
         // (RDNA4's matrix-core prompt attention is the default since 148-amd: the engine says so once, at its first prompt;
         // STRATA_HIP_WMMA=0 turns it off.)
 #if defined(_WIN32)
@@ -8963,13 +8997,49 @@ int main(int argc, char** argv) {
                      (long long) o.prefill_chunk, (long long) mib, (long long) (160 + (o.prefill_chunk * 680) / 1024));
         return mib + 64;   // a margin for the allocator
     };
+    // Track 6A + #6128/#5915: remember post-cache unpriced + priced VRAM needs so sized_slots and the post-alloc
+    // shrink loop (after cudaMemset(xcache)) never leave Windows WDDM below the free-VRAM safety floor.
+    bool wddm_discrete = false;
+    int64_t post_cache_extra_b = 0;   // prefill_mib + mtp_bind + late_alloc_b (added to reserve + pipe_first)
     if (o.expert_cache < 0) {
+        // Ensure background GEMM library warm-up finished before measuring free VRAM (avoids racing cuBLAS/hipBLAS init).
+        if (g_warm_thr.joinable()) g_warm_thr.join();
         size_t free_b = 0, total_b = 0;
         free_b = strata::core::device_free_bytes(); (void) total_b;
         if (free_b == 0 && o.prefill_head_alias) {
             (void) cudaGetLastError();
             free_b = strata::core::device_free_bytes();
         }
+#if defined(_WIN32) && !defined(STRATA_GPU_METAL)
+        {
+            cudaDeviceProp wp{};
+            int wd = 0;
+            size_t fb_w = 0, tb_w = 0;
+            if (cudaGetDevice(&wd) == cudaSuccess && cudaGetDeviceProperties(&wp, wd) == cudaSuccess &&
+                cudaMemGetInfo(&fb_w, &tb_w) == cudaSuccess) {
+#if !defined(STRATA_USE_HIP)
+                const bool tcc = wp.tccDriver != 0;
+#else
+                const bool tcc = false;
+#endif
+                wddm_discrete = strata::core::is_wddm_discrete(true, wp.integrated != 0, tcc);
+                if (wddm_discrete && tb_w > 0) {
+                    const int w_res = strata::core::wddm_effective_reserve_mib(
+                        true, o.vram_reserve_given, o.vision, o.vram_reserve_mib, (uint64_t) tb_w,
+                        std::getenv("STRATA_WDDM_VRAM_FLOOR"));
+                    if (w_res > o.vram_reserve_mib) {
+                        std::fprintf(stderr, "strata generate: Windows WDDM (%.1f GiB): keeping %d MiB VRAM reserve (was %d MiB) "
+                                             "so the driver does not page GPU memory to host RAM (#6128/#5915; "
+                                             "STRATA_WDDM_VRAM_FLOOR=0 or explicit --vram-reserve-mib N overrides)\n",
+                                     (double) tb_w / 1073741824.0, w_res, o.vram_reserve_mib);
+                        o.vram_reserve_mib = w_res;
+                    }
+                }
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+#endif
 #if defined(STRATA_USE_HIP) && !defined(_WIN32)
         {   // An integrated GPU's "free VRAM" is system RAM (the BIOS carve-out plus the GTT pool, nearly all of the RAM when the kernel was told
             // ttm.pages_limit), and the cache copies experts into that same RAM on top of the arena: sized from the pool alone it can ask for
@@ -9028,8 +9098,9 @@ int main(int argc, char** argv) {
             }
 #endif
         }
-        // Track 6A (v0.2.20): lower automatic non-vision reserve on discrete <= 12.5 GiB GPUs to recover ExpertCache slots
-        if (!o.vram_reserve_given && !o.vision && spill_discrete_gpu()) {
+        // Track 6A (v0.2.20): lower automatic non-vision reserve on Linux/TCC discrete <= 12.5 GiB GPUs to recover
+        // ExpertCache slots. On Windows WDDM discrete GPUs, keep the WDDM free-VRAM safety floor (#6128/#5915).
+        if (!wddm_discrete && !o.vram_reserve_given && !o.vision && spill_discrete_gpu()) {
             size_t fb_lv = 0, tb_lv = 0;
             if (cudaMemGetInfo(&fb_lv, &tb_lv) == cudaSuccess) {
                 const int lv_res = strata::core::low_vram_auto_reserve_mib(true, o.vram_reserve_given, o.vram_reserve_mib, (uint64_t) tb_lv);
@@ -9061,12 +9132,14 @@ int main(int argc, char** argv) {
         // 256-token chunk's buffers (plus the 128 slots a loan leaves; one slot without --prefill) makes it allocate its own on top
         int64_t min_slots = (o.prefill_chunk > 0 && pf_borrow)
             ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + g_lend_keep : 1;
-        // #4474: what the load allocates after the cache that no setting prices (cuBLAS and the lazily loaded modules the prompt path and the
-        // verifier warm up, ~245 MiB on every card measured) came out of the reserve, so a card ended 240 MiB under the reserve it was asked to
-        // keep (459 MiB free at --vram-reserve-mib 700: under the 512 MiB line the serve check warns about, #2065).  The cache now leaves it too.
-        // Not on a card that could not keep min_slots after it, and not under STRATA_DEFAULTS=026 (the v0.2.6 sizing).
+        // #4474 / #6128: what the load allocates after the cache that no setting prices (cuBLAS, DEQUANT_SIDE, 12-tok
+        // verify buffers, CUDA graph captures) came out of the reserve, so a card ended under the reserve it was asked
+        // to keep. On Windows WDDM discrete GPUs, price kWddmLateAllocMib (384 MiB) so post-load free VRAM stays above
+        // the WDDM floor after all late allocations and graph captures.
+        const int64_t late_mib = strata::core::wddm_late_alloc_mib(wddm_discrete, strata::qwen_defaults_026(), strata::core::kLateAllocMib);
         strata::core::AutoCacheSlots auto_slots = strata::core::auto_cache_slots(
-            (int64_t) free_b, reserve, blob, min_slots, strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
+            (int64_t) free_b, reserve, blob, min_slots, late_mib);
+        post_cache_extra_b = (prefill_mib << 20) + mtp_bind + (auto_slots.late_priced ? (late_mib << 20) : 0);
         int64_t slots = auto_slots.slots;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
 #if defined(STRATA_GPU_METAL)
@@ -9083,10 +9156,12 @@ int main(int argc, char** argv) {
         }
 #endif
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
+        std::string late_note = auto_slots.late_priced
+            ? (", +" + std::to_string(late_mib) + " MiB for what is allocated after the cache") : std::string();
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head%s) -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
-                     auto_slots.late_priced ? ", +256 MiB for what is allocated after the cache" : "", o.expert_cache);
+                     late_note.c_str(), o.expert_cache);
 #if defined(STRATA_USE_HIP) && !defined(_WIN32)
         // An APU's "VRAM" is system RAM: the device-free figure above counts the whole GPU-addressable pool and does not
         // subtract ordinary CPU allocations (the host expert arena), so a cache sized from it alone can ask the OOM killer
@@ -9317,7 +9392,8 @@ int main(int argc, char** argv) {
         // held one slot fewer than asked (--expert-cache 1: none)
         const uint64_t budget = (uint64_t) o.expert_cache * ((nibble_max_slot_bytes() + 255) / 256 * 256);
         uint64_t used = 0;
-        const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first;
+        const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first +
+                                 (auto_cache && post_cache_extra_b > 0 ? (size_t) post_cache_extra_b : 0);
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         for (const auto& pr : profile) {
@@ -9526,16 +9602,20 @@ int main(int argc, char** argv) {
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
             free_b = strata::core::device_free_bytes(); (void) total_b;
-            const int64_t want = ((int64_t) o.vram_reserve_mib << 20) + pipe_first;
-            if ((int64_t) free_b >= want - (64ll << 20)) break;
+            // #6128: include mtp_bind, owned prefill buffers, and unpriced late allocations (cuBLAS, verify, graph
+            // capture) in `want` so shrinking stops ONLY when post-load free VRAM stays >= vram_reserve_mib!
+            const int64_t want = ((int64_t) o.vram_reserve_mib << 20) + pipe_first + post_cache_extra_b;
+            const int64_t slack = wddm_discrete ? 0 : (64ll << 20);
+            if ((int64_t) free_b >= want - slack) break;
             // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB
             // each (under WDDM the free figure read before the allocation runs ~0.7 GiB high), later ones a quarter
             int64_t give = want - (int64_t) free_b + (64ll << 20);
             if (free_b < ((size_t) 16 << 20))
                 give = std::max<int64_t>(give, ++zero_reads <= 2 ? 1ll << 30 : xcache.bytes() / 4);
             const int64_t keep_bytes = xcache.bytes() - give;
-            std::fprintf(stderr, "strata generate: only %lld MiB free once the slots are written (reserve %d MiB); "
-                                 "shrinking the expert cache\n", (long long) (free_b >> 20), o.vram_reserve_mib);
+            std::fprintf(stderr, "strata generate: only %lld MiB free once the slots are written (need %lld MiB: reserve %d MiB + %lld MiB post-cache); "
+                                 "shrinking the expert cache\n", (long long) (free_b >> 20), (long long) (want >> 20),
+                         o.vram_reserve_mib, (long long) ((pipe_first + post_cache_extra_b) >> 20));
             xcache.close();
             if (!shrink_to(keep_bytes)) break;
         }
@@ -12828,7 +12908,7 @@ int main(int argc, char** argv) {
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
             int cur_dev = 0;
-            cudaGetDevice(&cur_dev);   // the device this path is about to run on (dev -1: the current one)
+            if (cudaGetDevice(&cur_dev) != cudaSuccess) { (void) cudaGetLastError(); cur_dev = 0; }   // the device this path is about to run on (dev -1: the current one)
             const bool room_here = mtp_room_slots > 0 && mtp.device() == cur_dev;
             if (room_here) room_path = &sp;
             sp.set_ring_room(room_here ? mtp_room_slots : 0);
@@ -14672,7 +14752,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<strata::core::ForesightSwap> fs_swap;
         {
             int main_dev = 0;
-            cudaGetDevice(&main_dev);
+            if (cudaGetDevice(&main_dev) != cudaSuccess) { (void) cudaGetLastError(); main_dev = 0; }
             std::vector<int> devs{main_dev};
             for (auto& st : stages) devs.push_back(st->dev);
             std::vector<int> card((size_t) g.n_layers, 0);
@@ -14724,10 +14804,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON: a missed expert that every token of a verify window routes at rank %d or "
                                  "lower is skipped (answers differ slightly); it is off when STRATA_ROUTE_TAIL_SKIP is not set or is 0\n",
                          strata::core::tail_skip_rank(), strata::core::tail_skip_rank());
-        // Track 6A (v0.2.20): tiny-cache (< 25% resident) anti-thrash dampening + Zipf-head profile pinning
+        // Track 6A + #6509 (v0.2.20): tiny-cache (< 25% resident) anti-thrash dampening + Zipf-head profile pinning
+        // Applies to both single-GPU and multi-GPU layer splits (e.g. 2x 12 GB #6509 at ~16.6% total residency).
         const int64_t total_expert_pairs = g.n_layers * g.n_expert;
-        const int64_t live_gpu_slots = xcache.slots();
-        if (!multi_gpu && stages.empty()) {
+        int64_t live_gpu_slots = xcache.slots();
+        for (const auto& stp : stages) live_gpu_slots += stp->cache.slots();
+        {
             const int damp = strata::core::low_vram_adapt_swaps(o.adapt_swaps, o.adapt_swaps_given, live_gpu_slots, total_expert_pairs);
             if (damp != o.adapt_swaps) {
                 std::fprintf(stderr, "strata serve: tiny expert cache (%lld of %lld slots, %.1f%%): dampening adaptive swaps %d -> %d "
@@ -14739,7 +14821,7 @@ int main(int argc, char** argv) {
             }
         }
         std::vector<uint8_t> pinned_pair;
-        if (!multi_gpu && stages.empty() && !profile.empty() && !host_res.empty() && live_gpu_slots > 0 && !all_experts_resident) {
+        if (!profile.empty() && !host_res.empty() && live_gpu_slots > 0 && !all_experts_resident) {
             const int64_t pin_n = strata::core::low_vram_pin_slots(live_gpu_slots, total_expert_pairs, std::getenv("STRATA_CACHE_PIN_FRAC"));
             if (pin_n > 0) {
                 pinned_pair.assign((size_t) total_expert_pairs, 0);

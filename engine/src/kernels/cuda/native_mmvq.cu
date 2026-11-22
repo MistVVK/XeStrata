@@ -368,12 +368,20 @@ __global__ void native_q2_0_mmvq_kernel(const Q20Block* __restrict__ w,
 }
 
 // Q3_K's 110-byte stride gives alternate blocks only two-byte alignment.
-// Preserve the pinned helper's pair of 16-bit loads and little-endian combine.
+// #6526: on RDNA4 (gfx1200/gfx1201), __builtin_memcpy preserves align-2 semantics while letting AMDGPU lower
+// unaligned 32-bit global loads directly instead of two 16-bit loads + shift + OR. Older targets and CUDA keep
+// the pinned pair of 16-bit loads and little-endian combine.
 __device__ __forceinline__ int load_int_b2(const void* ptr, int i32) {
+#if defined(__HIPCC__) && (defined(__gfx1200__) || defined(__gfx1201__))
+    int value;
+    __builtin_memcpy(&value, static_cast<const uint16_t*>(ptr) + 2 * i32, sizeof(int));
+    return value;
+#else
     const auto* x = static_cast<const uint16_t*>(ptr);
     int value = x[2 * i32] << 0;
     value |= x[2 * i32 + 1] << 16;
     return value;
+#endif
 }
 
 __device__ __forceinline__ float q3_q8_dot_impl(int vl, int vh, const int* __restrict__ u,
@@ -661,9 +669,8 @@ __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __res
     }
     return d * sumf;
 }
-#if !defined(__HIPCC__)   // CUDA only: the native_mmvq_il_pf_kernel family below (itself CUDA only) is the only user
-// q6_q8_dot_impl with the two scales already in registers (the interleaved kernels' hoisted loads, P1): the same
-// expression in the same order
+// q6_q8_dot_impl with the two scales already in registers (#6526: shared by Q6KTraits on CUDA & HIP and by
+// CUDA's interleaved kernels): the same expression in the same order
 __device__ __forceinline__ float q6_q8_dot_sc(int vl, int vh, const int* __restrict__ u, int sc0, int sc1, float d,
                                             const float* __restrict__ d8) {
     float sumf = 0.0f;
@@ -678,6 +685,7 @@ __device__ __forceinline__ float q6_q8_dot_sc(int vl, int vh, const int* __restr
     }
     return d * sumf;
 }
+#if !defined(__HIPCC__)   // CUDA only: the native_mmvq_il_pf_kernel family below (itself CUDA only) is the only user
 
 // P1: loads the compiler may not sink into a later branch (it moved the Q6_K scale and d loads of the hoisted group
 // into the dot sections, where each one is a dependent L1 round trip); the same ld.global.nc the __restrict__ loads use
@@ -1053,7 +1061,7 @@ struct Q6KTraits {
     [[maybe_unused]] static constexpr int TYPE = 14;   // ggml type
     static constexpr int DIV = 256, T = 32, KBY = 8, BPI = WARPS * WARP / 32;
     __device__ static int kqs(int tid) { return tid % 32; }
-    struct W { int vl, vh; float d; const int8_t* scales; int bq8_offset; };
+    struct W { int vl, vh, sc0, sc1; float d; int bq8_offset; };
     __device__ static W load(const Block* __restrict__ w, int iqs) {
         W r;
         r.bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
@@ -1061,7 +1069,8 @@ struct Q6KTraits {
         const int vh_shift = 2 * ((iqs % 16) / 8);
         r.vl = load_int_b2(w->ql, iqs);
         r.vh = load_int_b2(w->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
-        r.scales = w->scales + scale_offset;
+        r.sc0 = w->scales[scale_offset];
+        r.sc1 = w->scales[scale_offset + 4];
         r.d = w->d;
         return r;
     }
@@ -1073,7 +1082,7 @@ struct Q6KTraits {
             u[i] = reinterpret_cast<const int*>(x[r.bq8_offset + 2 * i].qs)[iqs % 8];
             d8[i] = __low2float(x[r.bq8_offset + 2 * i].ds);
         }
-        return q6_q8_dot_impl(r.vl, r.vh, u, r.scales, r.d, d8);
+        return q6_q8_dot_sc(r.vl, r.vh, u, r.sc0, r.sc1, r.d, d8);
     }
 };
 struct IQ4XSTraits {
@@ -1422,8 +1431,8 @@ template<> struct B6X<Q6KTraits> {
         W r;
         r.vl = t.vl;
         r.vh = t.vh;
-        r.sc[0] = t.scales[0];
-        r.sc[1] = t.scales[4];
+        r.sc[0] = t.sc0;
+        r.sc[1] = t.sc1;
         r.d = t.d;
         return r;
     }
@@ -1561,11 +1570,118 @@ bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
     }
 }
 
+#if !defined(__HIPCC__)
+// ---- STRATA_Q8_V70=1 (opt-in, Volta sm_70 only): the dense Q8_0 GEMV of 2..4 columns with its block loop unrolled.
+// The default multi-column kernel (native_mmvq_multi_kernel<SmallTraits<Q80Block, 8>, NCOLS, WARPS, 2>) walks a row's
+// blocks in a loop whose trip count is only known at run time, so a thread has one block of weights in flight at a time;
+// with the 34-byte blocks (16-bit loads) a V100 reads Flash-Next's 6144 -> 2560 projections (ssm_out, attn_output) at
+// 540-570 GB/s for 3 columns.  Here the trip count NIT = n_in / 1024 is a template parameter and every iteration's
+// weights are loaded (F::load) before the first dot.  Each thread keeps the default kernel's blocks (kbx = tid / 4 +
+// 32 it, the same two ints), adds F::apply's values in the same order per (column, row), and the cross-warp sum and xor
+// tree are the default's, so every output is bitwise the default kernel's (and so a single-column call's).
+// Taken for 2..4 columns, n_in a multiple of 1024 (2..8 x 1024) and an even n_out, not with STRATA_TSUM (another
+// reduction; STRATA_B6_MMVQ_ROWS has no Q8_0 kernel, b6_launch declines it first).  Device code for sm_70 only (an
+// empty kernel elsewhere, never launched: q8_v70_on asks for compute capability 7.0).
+template<typename F, int NCOLS, int NIT>
+__launch_bounds__(WARPS * WARP, 4)
+__global__ void q8_v70_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                              int n_in, int n_out) {
+    static_assert(F::BPI == 32 && F::T == 4, "the Q8_0 traits' thread layout");
+    static_assert(NCOLS >= 2 && NCOLS <= 4 && NIT >= 2 && NIT <= 8, "q8_v70_launch's instantiations");
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 700
+    (void) w; (void) x; (void) y; (void) n_in; (void) n_out;
+#else
+    constexpr int ROWS = 2;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    const int kqs = F::kqs(tid);
+    typename F::W wv[NIT][ROWS];
+#pragma unroll
+    for (int it = 0; it < NIT; ++it)
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i)
+            wv[it][i] = F::load(w + std::size_t(row0 + i) * blocks_per_row + tid / F::T + it * F::BPI, kqs);
+    float tmp[NCOLS][ROWS] = {};
+#pragma unroll
+    for (int it = 0; it < NIT; ++it) {
+        const int kby = (tid / F::T + it * F::BPI) * F::KBY;
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) tmp[j][i] += F::apply(wv[it][i], x + std::size_t(j) * x_stride + kby, kqs);
+    }
+    __shared__ float partial[WARPS - 1][NCOLS][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < WARPS - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
+    }
+#endif
+}
+bool q8_v70_on() {
+    static const bool env = [] { const char* v = std::getenv("STRATA_Q8_V70"); return v != nullptr && std::atoi(v) != 0; }();
+    if (!env) return false;
+    static int per_dev[16];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) { cudaGetLastError(); return false; }
+    if (!per_dev[dev]) {
+        int maj = 0, mnr = 0;
+        const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        per_dev[dev] = ok && maj == 7 && mnr == 0 ? 2 : 1;
+        if (per_dev[dev] == 2) std::fprintf(stderr, "strata: STRATA_Q8_V70=1: the unrolled Q8_0 GEMV for 2-4 columns on CUDA%d "
+                                                    "(bitwise the default kernel)\n", dev);
+    }
+    return per_dev[dev] == 2;
+}
+template<typename F, int NCOLS>
+bool q8_v70_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    if constexpr (!std::is_same_v<F, SmallTraits<Q80Block, 8>> || NCOLS < 2 || NCOLS > 4) {
+        (void) w; (void) x; (void) y; (void) n_in; (void) n_out; (void) s;
+        return false;
+    } else {
+        if (!g_multi_exact || s26_tsum_on() || n_in % 1024 != 0 || n_out % 2 != 0) return false;
+        const int nit = n_in / 1024;
+        if (nit < 2 || nit > 8 || !q8_v70_on()) return false;
+        const dim3 threads(WARP, WARPS), blocks(unsigned(n_out / 2));
+        switch (nit) {
+        case 2: q8_v70_kernel<F, NCOLS, 2><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 3: q8_v70_kernel<F, NCOLS, 3><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 4: q8_v70_kernel<F, NCOLS, 4><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 5: q8_v70_kernel<F, NCOLS, 5><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 6: q8_v70_kernel<F, NCOLS, 6><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 7: q8_v70_kernel<F, NCOLS, 7><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 8: q8_v70_kernel<F, NCOLS, 8><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); break;
+        default: return false;
+        }
+        return true;
+    }
+}
+#endif
 template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     if (b6_launch<F, NCOLS>(w, x, y, n_in, n_out, s)) return;   // STRATA_B6_MMVQ_ROWS
+#if !defined(__HIPCC__)
+    if (q8_v70_launch<F, NCOLS>(w, x, y, n_in, n_out, s)) return;   // STRATA_Q8_V70 (Volta)
+#endif
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
@@ -1969,7 +2085,7 @@ struct IlQ6K {
         for (int c = 0; c < NC; ++c) {
             const int uc[2] = {u[0][c], u[1][c]};
             const float dc[2] = {d8[0][c], d8[1][c]};
-            out[c] = q6_q8_dot_impl(r.vl, r.vh, uc, r.scales, r.d, dc);
+            out[c] = q6_q8_dot_sc(r.vl, r.vh, uc, r.sc0, r.sc1, r.d, dc);
         }
     }
     // P1: the two scale bytes loaded with the rest (F::W keeps a pointer into the block, which would put their loads

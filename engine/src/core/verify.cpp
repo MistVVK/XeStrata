@@ -3998,6 +3998,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         auto last_flush = a;
         uint32_t spins = 0;
         progress_at("verify window: waiting for the GPU to reach layer", l);
+        const auto verify_timeout = [] {
+#if defined(STRATA_USE_HIP)
+            constexpr int kDefSec = 30;   // #5718: RDNA4/Linux memory-pressure reclaim can delay a layer past 20 s
+#else
+            constexpr int kDefSec = 20;
+#endif
+            const char* e = std::getenv("STRATA_VERIFY_TIMEOUT_S");
+            const int s = (e != nullptr && e[0] != '\0') ? std::atoi(e) : kDefSec;
+            return std::chrono::seconds(s > 0 ? s : kDefSec);
+        }();
+        bool republished = false;
         while (*seq < want) {
             strata_cpu_pause();
             if ((++spins & 1023u) != 0) continue;
@@ -4017,7 +4028,22 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
+            if (now - a > verify_timeout) {
+                // #5718: before declaring an unrecoverable timeout on an alive GPU delayed by memory reclaim or
+                // WC/PCIe visibility, re-publish the already-served flags with a full fence and grant a 5 s grace.
+                if (!republished && want > 1) {
+                    republished = true;
+                    const uint32_t prev = want - 1;
+                    if (h_flagA_ != nullptr && *(volatile uint32_t*) h_flagA_ >= prev) *(volatile uint32_t*) h_flagA_ = *(volatile uint32_t*) h_flagA_;
+                    if (h_flagB_ != nullptr && *(volatile uint32_t*) h_flagB_ >= prev) *(volatile uint32_t*) h_flagB_ = *(volatile uint32_t*) h_flagB_;
+                    if (*flag >= prev) *flag = *flag;
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    strata_store_fence();
+                    (void) cudaStreamQuery(cs_);
+                    trace_ev("RETRY-PUBLISH", k, l, (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(now - a).count());
+                    continue;
+                }
+                if (now - a <= verify_timeout + std::chrono::seconds(5)) continue;
                 // #267: the caller ends the engine; no spin kernel may outlive it
 #if defined(STRATA_VERIFY_HGL)
                 trace_ev("TIMEOUT", k, l, (int64_t) (launch_o ? launch_o->query() : cudaStreamQuery(cs_)));

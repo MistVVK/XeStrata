@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (303)
+## Switches you can turn on (307)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -88,6 +88,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_GR_Q8_UP_COLS` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [NVIDIA_V100.md](NVIDIA_V100.md) |
 | `STRATA_GR_Q8_UP_MODE` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [NVIDIA_V100.md](NVIDIA_V100.md) |
 | `STRATA_GR_SPLIT` | on / off | AMD | [AMD_HIP.md](AMD_HIP.md) |
+| `STRATA_GR_V70` | number | NVIDIA and AMD | [NVIDIA_V100.md](NVIDIA_V100.md) |
 | `STRATA_HANDOFF_PIPE` | number | NVIDIA and AMD | [BATCHING.md](BATCHING.md) |
 | `STRATA_HC_PERSIST` | number | NVIDIA and AMD | [AMD_HIP.md](AMD_HIP.md), [README.md](bench-results/README.md), [README.md](bench-results/2026-10-12-hc-persist-gfx1030/README.md) |
 | `STRATA_HC_REQ8` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
@@ -95,6 +96,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_HIPBLASLT_TUNING` | on / off | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [AMD_HIP_PERFORMANCE.md](AMD_HIP_PERFORMANCE.md), [RADEON_780M.md](RADEON_780M.md) |
 | `STRATA_HIPBLASLT_VERBOSE` | text | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [METHOD-AND-DISCLOSURES.md](bench-results/2026-10-03-community-r9700-windows/METHOD-AND-DISCLOSURES.md), [README.md](bench-results/2026-10-03-community-r9700-windows/README.md) |
 | `STRATA_HIP_ADAPT_KERNEL_COPY` | on / off | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [DETAILS.md](DETAILS.md), [README.md](bench-results/2026-10-07-rdna2-qsa-select-simt/README.md) |
+| `STRATA_HIP_DYNAMIC_QUEUES` | on / off | NVIDIA and AMD | - |
 | `STRATA_HIP_ROUTER_OLD` | on / off | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_HIP_WMMA_MIN_Q` | number | AMD | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_HOST_CORE` | on / off | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
@@ -260,6 +262,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_Q8_INPLACE` | on / off | NVIDIA and AMD | [NVIDIA_V100.md](NVIDIA_V100.md) |
 | `STRATA_Q8_INPLACE_MIN_OUT` | number | NVIDIA and AMD | [NVIDIA_V100.md](NVIDIA_V100.md) |
 | `STRATA_Q8_SM60` | on / off | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md) |
+| `STRATA_Q8_V70` | number | NVIDIA and AMD | [NVIDIA_V100.md](NVIDIA_V100.md) |
 | `STRATA_QSA_CLUSTER` | number | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
 | `STRATA_QSA_SPLIT_ATTN` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_RAM_ADAPT` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [release-notes-0.2.7.md](release-notes-0.2.7.md) |
@@ -315,6 +318,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_VERIFY_ALL_SLOTS` | on / off | Intel Arc | [INTEL.md](INTEL.md) |
 | `STRATA_VERIFY_EARLY_PLE_FLAG` | number | NVIDIA and AMD | [release-notes-0.2.2.md](release-notes-0.2.2.md) |
 | `STRATA_VERIFY_NO_HOST` | on / off | Intel Arc | [A770_SPEED_SPEC.md](A770_SPEED_SPEC.md), [INTEL.md](INTEL.md), [INTEL_ARC.md](INTEL_ARC.md) |
+| `STRATA_VERIFY_TIMEOUT_S` | number | NVIDIA and AMD | - |
 | `STRATA_VOLTA_FOREVER` | text | NVIDIA and AMD | - |
 | `STRATA_VRAM_FREE` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [release-notes-0.2.7.md](release-notes-0.2.7.md) |
 | `STRATA_WATCHDOG_S` | number | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
