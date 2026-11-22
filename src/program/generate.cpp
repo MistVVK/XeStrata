@@ -3145,7 +3145,9 @@ int main(int argc, char** argv) {
     // the PLE key in its GGUF form, read where the GGUF's dense projections are (the canonical pack's key otherwise)
     o.native_ple_key = !o.no_ple && !o.native_dense_gguf.empty();
     if (o.cpu_oracle_q8_0 && (o.expert_cache != 0 || !o.expert_profile.empty())) {
-        std::fprintf(stderr, "xestrata generate: --cpu-oracle-q8-0 cannot be combined with --expert-cache or --expert-profile until the GPU expert contract matches\n");
+        std::fprintf(stderr, "xestrata generate: --cpu-oracle-q8-0 requires --expert-cache 0: the default auto also "
+                             "sizes a GPU expert cache whose hit path does not use the pinned CPU contract; "
+                             "--expert-profile is incompatible for the same reason\n");
         return 2;
     }
 
