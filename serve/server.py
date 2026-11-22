@@ -9305,6 +9305,17 @@ def make_handler(svc: Service):
             return False
 
         def _load_image_source(self, source: str) -> bytes:
+            """A picture a request names: one this server kept, asked for by its own link, is read from the store that
+            kept it (images_api.kept_link) - a chain hands the link a previous result gave straight back as the next
+            input, and fetching one's own address is what the #28 guard refuses.  Any other http(s) URL goes through
+            svc.download, a data: URL or a path through Vision.load."""
+            name = images_api.kept_link(source, self.headers.get("Host") or "") if svc.images is not None else None
+            if name is not None:
+                kept = svc.images.file(name)
+                if kept is None:
+                    raise ValueError("the image link names no picture kept here (the server keeps the newest "
+                                     f"images only): {source}")
+                return kept.read_bytes()
             return svc.download(source) if source.startswith(("http://", "https://")) else Vision.load(source)
 
         def _images(self, req):
