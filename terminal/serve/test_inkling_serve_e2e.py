@@ -257,7 +257,7 @@ class TestInklingServeE2E(unittest.TestCase):
                     "messages": [{"role": "user", "content": "Say hi"}],
                 })
                 msg1 = r1["choices"][0]["message"]
-                self.assertEqual(msg1["reasoning_content"], "Quick thought.")
+                self.assertFalse(msg1.get("reasoning_content"))
                 self.assertEqual(msg1["content"], "Hello from Inkling!")
 
                 # 2. Tool call round-trip with XML special chars
@@ -295,7 +295,7 @@ class TestInklingServeE2E(unittest.TestCase):
                     "messages": [{"role": "user", "content": "Ping"}],
                 })
                 blocks = {b["type"]: b for b in r4["content"]}
-                self.assertEqual(blocks["thinking"]["thinking"], "Anthropic check.")
+                self.assertNotIn("thinking", blocks)
                 self.assertEqual(blocks["text"]["text"], "Anthropic OK.")
 
                 # Verify wire protocol recorded exact reasoning effort levels & image= key
@@ -331,7 +331,7 @@ class TestInklingServeE2E(unittest.TestCase):
                     self.assertEqual(len(results), conc)
                     for txt, thk in results:
                         self.assertEqual(txt, "Batch OK.", f"failed at c={conc}")
-                        self.assertEqual(thk, "Parallel slot.", f"failed at c={conc}")
+                        self.assertEqual(thk, "", f"unexpected reasoning leaked at c={conc}")
 
 
 if __name__ == "__main__":

@@ -374,7 +374,7 @@ class TestInklingServing(unittest.TestCase):
         reason = "".join(e.text for e in events if e.kind == "reasoning")
         content = "".join(e.text for e in events if e.kind == "content")
         calls = [e.call for e in events if e.kind == "tool_call"]
-        self.assertIn("Tokyo weather", reason)
+        self.assertEqual(reason, "")
         self.assertIn("Checking now.", content)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].name, "get_weather")

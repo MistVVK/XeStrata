@@ -14,16 +14,16 @@ from serve import frontend, inkling_dialect, inkling_kind, toolformat
 
 
 class TestInklingDialect(unittest.TestCase):
-    def test_streaming_thinking_and_text_byte_by_byte(self):
+    def test_streaming_thinking_discarded_and_text_byte_by_byte(self):
         raw = (
             "<|message_model|><|content_thinking|>Let me check 2 + 2 = 4.<|end_message|>"
             "<|message_model|><|content_text|>The answer is 4.<|end_message|>"
             "<|content_model_end_sampling|>"
         )
-        # Feed 1 character at a time to verify tag boundary holdback never drops or leaks control tokens
+        # Feed 1 character at a time: raw <|content_thinking|> is silently discarded (no thinking mode), text streams cleanly
         d = inkling_dialect.InklingDialect()
         out = "".join(d.feed(ch) for ch in raw) + d.feed(final=True)
-        self.assertEqual(out, "<think>Let me check 2 + 2 = 4.</think>The answer is 4.")
+        self.assertEqual(out, "The answer is 4.")
         self.assertEqual(d.calls, 0)
 
     def test_tool_call_preserves_xml_chars_quotes_and_closing_tags(self):
@@ -57,7 +57,7 @@ class TestInklingDialect(unittest.TestCase):
             elif ev.kind == "tool_call" and ev.call is not None:
                 tool_calls.append({"name": ev.call.name, "arguments": ev.call.arguments})
 
-        self.assertEqual("".join(reasoning_parts), "Writing patch with < and > and </tool_call>.")
+        self.assertEqual("".join(reasoning_parts), "")
         self.assertEqual("".join(content_parts), "")
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "write_file")

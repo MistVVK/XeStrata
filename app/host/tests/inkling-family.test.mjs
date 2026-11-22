@@ -144,13 +144,21 @@ test('profile.mjs disables thinking mode for Inkling-2-Mini (off only) and run-c
   });
   assert.match(prof.patch, /"reasoning": false/);
   assert.doesNotMatch(prof.patch, /"thinkingFormat": "chat-template"/);
-  // Also verify run-config-check allows parallel up to 64 for Inkling-2-Mini
+  // Also verify run-config-check allows parallel up to 64 and rejects non-off reasoning_effort for Inkling-2-Mini
   const checked64 = checkRunConfig(JSON.stringify({
     exe: 'component:strata-inkling',
     arch: 'inkling2_loop',
     parallel: 64,
     gpu: [0, 1],
+    reasoning_effort: 'none',
     args: ['--native', 'Inkling-2-Mini-SQ-20.strata', '--gpus', '2', '--parallel', '64'],
   }));
   assert.equal(checked64.ok, true, JSON.stringify(checked64.issues));
+  const checkedBadEffort = checkRunConfig(JSON.stringify({
+    exe: 'component:strata-inkling',
+    arch: 'inkling2_loop',
+    reasoning_effort: 'high',
+    args: ['--native', 'Inkling-2-Mini-SQ-20.strata'],
+  }));
+  assert.equal(checkedBadEffort.ok, false, 'Inkling-2-Mini must reject non-off reasoning_effort');
 });

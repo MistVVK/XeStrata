@@ -186,7 +186,8 @@ class InklingDialect:
         if not chunk:
             return
         if self.state == "think":
-            out.append(("reasoning", chunk))
+            # Inkling-2-Mini has no thinking mode (off / "none" only): silently discard any raw <|content_thinking|> span.
+            return
         elif self.state in ("idle", "text"):
             out.append(("content", chunk))
         elif self.state == "header":
