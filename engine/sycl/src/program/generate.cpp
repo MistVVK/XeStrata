@@ -11502,8 +11502,12 @@ int main(int argc, char **argv) try {
                 return e != nullptr && std::atoi(e) != 0;
             }();
             // Only add a snapshot; the existing token and image checks still decide reuse.
+            // #2518: the branch point sits at the turn before the one this prompt ends with, which is
+            // max_tail tokens further back - a long reply hides it past the default 1024, so the engine
+            // never made the checkpoint a branching follow-up needs. 16384 covers a full reply.
             const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
-                ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
+                ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token,
+                                                               8192, 16384) : -1;
             int64_t at = read_from;
             for (const int64_t to : {reread_to, root_at, message_at, turn_at, n - 1}) {
                 if (to <= at) continue;
@@ -13042,12 +13046,12 @@ int main(int argc, char **argv) try {
                     }
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
-                    const ConvCheckpoint* best = nullptr;
-                    for (const ConvCheckpoint& c : checks)
-                        if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
-                            std::equal(c.ids.begin(), c.ids.end(), live.begin()))
-                            best = &c;
-                    if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                    // #2518: keep EVERY checkpoint that prefixes the conversation, not just the longest: the
+                    // message boundary between a shared context and the question is what a later request
+                    // branching inside this conversation resumes from. The longest (the turn) alone diverges
+                    // before that boundary and is useless to such a request, which then overwrites another
+                    // chat's slot instead. (The slot -> main copy at copy_from_slot already carries all of them.)
+                    sl.checks = strata::core::conversation_checkpoints_prefixing(checks, live, sl.img);
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
