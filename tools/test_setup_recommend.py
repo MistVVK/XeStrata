@@ -103,6 +103,13 @@ def with_other_branches():
     return mock.patch.multiple(setup, **{name: {**getattr(setup, name), **add} for name, add in OTHER_BRANCHES.items()})
 
 
+def without_families(*names: str):
+    """FAMILIES and TIERS without `names`' entries, as in a tree whose branches never registered them"""
+    kept: dict[str, Any] = {t: {k: v for k, v in getattr(setup, t).items() if k not in names}
+                            for t in ("FAMILIES", "TIERS")}
+    return mock.patch.multiple(setup, **kept)
+
+
 class FirstModel(unittest.TestCase):
     # edge0, like CUSTOM, is outside the recommendation ladder (--family edge0, setup_edge0; setup's list excludes it)
     fams = [f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")]
@@ -159,11 +166,15 @@ class FirstModel(unittest.TestCase):
             self.assertEqual(self.first(62.7, 16, fams), ("sync", "Sync-M"))   # 64 GB installed
 
     def test_a_family_not_registered_is_passed_over(self):
-        # this tree without Signal-2's and SenseNova's entries: SC117, Sync, Qwen3.5-2B
-        self.assertEqual(self.first(123.2, 32, self.fams), ("sc117-swift", "IQ3_S"))
-        self.assertEqual(self.first(123.2, 24, self.fams), ("sync", "Sync-M"))
-        self.assertEqual(self.first(48, 0, self.fams), ("sync", "Sync-M"))
-        self.assertEqual(self.first(20, 16, self.fams), ("qwen35-2b", "Q8_0"))
+        # a tree without Signal-2's and SenseNova's entries, whatever this one registers: SC117, Sync, Qwen3.5-2B
+        gone = ("signal2", "sensenova-loop-qsa")
+        self.assertTrue(set(gone) <= {f for f, *_ in setup.FIRST_CHOICE})
+        with without_families(*gone):
+            fams = [f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")]
+            self.assertEqual(self.first(123.2, 32, fams), ("sc117-swift", "IQ3_S"))
+            self.assertEqual(self.first(123.2, 24, fams), ("sync", "Sync-M"))
+            self.assertEqual(self.first(48, 0, fams), ("sync", "Sync-M"))
+            self.assertEqual(self.first(20, 16, fams), ("qwen35-2b", "Q8_0"))
 
     def test_without_a_gpu_the_2b(self):
         self.assertEqual(setup.recommend_family(["qwen35-2b", "qwen35-0.8b"], room(32, None)), "qwen35-2b")
