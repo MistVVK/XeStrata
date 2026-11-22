@@ -14,6 +14,7 @@
 #include "ink_backend.h"
 #include "ink_vision.h"
 #include "ink_hip_ops.hip.h"
+#include "ink_hip_tree.hip.h"
 #include "ink_hip_blaslt.hpp"
 #include "ink_hip_hybrid.hpp"
 #include "strata/hip_uma_guard.hpp"
@@ -366,6 +367,15 @@ struct GpuSlotMeta {
     GpuBuffer dspark_frnn;
     int dspark_cap = 0;
     int dspark_len = 0;
+    // Adaptive EMA DSpark acceptance tracker (zero regression on low-accept chat prompts!)
+    float dspark_ema_acc = 0.50f;
+    int dspark_last_draft = 0;
+    int dspark_last_anchor = -1;
+    int dspark_skip_rem = 0;
+    bool dspark_had_rollback = false;
+    // Wave-7D: Realized-gain adaptive tree cooldown (zero regression on high-entropy chat!)
+    float tree_ema_gain = 1.25f;
+    int tree_cool_rem = 0;
 
     void release() {
         free_gpu_buffer(sconv_snap_k);
@@ -383,6 +393,13 @@ struct GpuSlotMeta {
         }
         free_gpu_buffer(dspark_frnn);
         dspark_cap = dspark_len = 0;
+        dspark_ema_acc = 0.50f;
+        dspark_last_draft = 0;
+        dspark_last_anchor = -1;
+        dspark_skip_rem = 0;
+        dspark_had_rollback = false;
+        tree_ema_gain = 1.25f;
+        tree_cool_rem = 0;
         allocated = false;
         has_snap = false;
         seq_len = snap_seq_len = 0;
@@ -656,6 +673,46 @@ public:
                 !hip_ok(alloc_gpu_buffer(d_dspark_cand_i_, 7u * 1024u * sizeof(int32_t), mem_info_.is_uma), "dspark candi", err)) {
                 return false;
             }
+            // Concatenate DSpark [q_proj; k_proj; v_proj] and [gate_proj; up_proj] per layer (0 extra VRAM -> 1 GEMM instead of 3/2!)
+            dspark_qkv_.resize(dspark_cfg_.n_layers);
+            dspark_gu_.resize(dspark_cfg_.n_layers);
+            for (int il = 0; il < dspark_cfg_.n_layers; ++il) {
+                const std::string p = "layers." + std::to_string(il);
+                const std::string qk[3] = {
+                    p + ".self_attn.q_proj.weight", p + ".self_attn.k_proj.weight", p + ".self_attn.v_proj.weight"
+                };
+                if (dspark_bf16_.count(qk[0]) && dspark_bf16_.count(qk[1]) && dspark_bf16_.count(qk[2])) {
+                    const size_t tb = dspark_bf16_[qk[0]].bytes + dspark_bf16_[qk[1]].bytes + dspark_bf16_[qk[2]].bytes;
+                    GpuBuffer cat;
+                    if (alloc_gpu_buffer(cat, tb, mem_info_.is_uma) == hipSuccess) {
+                        size_t off = 0;
+                        for (int j = 0; j < 3; ++j) {
+                            auto& b = dspark_bf16_.at(qk[j]);
+                            (void)hipMemcpy(cat.dev_ptr + off, b.dev_ptr, b.bytes, hipMemcpyDeviceToDevice);
+                            off += b.bytes;
+                            free_gpu_buffer(b);
+                            dspark_bf16_.erase(qk[j]);
+                        }
+                        dspark_qkv_[il] = cat;
+                    }
+                }
+                const std::string gk[2] = { p + ".mlp.gate_proj.weight", p + ".mlp.up_proj.weight" };
+                if (dspark_bf16_.count(gk[0]) && dspark_bf16_.count(gk[1])) {
+                    const size_t tb = dspark_bf16_[gk[0]].bytes + dspark_bf16_[gk[1]].bytes;
+                    GpuBuffer cat;
+                    if (alloc_gpu_buffer(cat, tb, mem_info_.is_uma) == hipSuccess) {
+                        size_t off = 0;
+                        for (int j = 0; j < 2; ++j) {
+                            auto& b = dspark_bf16_.at(gk[j]);
+                            (void)hipMemcpy(cat.dev_ptr + off, b.dev_ptr, b.bytes, hipMemcpyDeviceToDevice);
+                            off += b.bytes;
+                            free_gpu_buffer(b);
+                            dspark_bf16_.erase(gk[j]);
+                        }
+                        dspark_gu_[il] = cat;
+                    }
+                }
+            }
         }
 
         // 3. Load Section 4 experts in 3x loop-weighted vram_load_order priority!
@@ -852,9 +909,17 @@ public:
 
     void reset_slot(int slot) override {
         if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return;
-        slots_[slot].seq_len = 0;
-        slots_[slot].dspark_len = 0;
-        slots_[slot].has_snap = false;
+        auto& sl = slots_[slot];
+        sl.seq_len = 0;
+        sl.dspark_len = 0;
+        sl.has_snap = false;
+        sl.dspark_ema_acc = 0.50f;
+        sl.dspark_last_draft = 0;
+        sl.dspark_last_anchor = -1;
+        sl.dspark_skip_rem = 0;
+        sl.dspark_had_rollback = false;
+        sl.tree_ema_gain = 1.25f;
+        sl.tree_cool_rem = 0;
         clear_slot_sconv(slot);
     }
 
@@ -901,6 +966,12 @@ public:
         sl.dspark_len = std::min(sl.dspark_len, keep_len);
         if (sl.has_snap) {
             const int keep_steps = keep_len - sl.snap_seq_len;
+            if (sl.dspark_last_draft > 0 && keep_steps >= 1) {
+                const int acc_toks = std::max(0, std::min(sl.dspark_last_draft, keep_steps - 1));
+                const float rate = static_cast<float>(acc_toks) / static_cast<float>(sl.dspark_last_draft);
+                sl.dspark_ema_acc = 0.70f * sl.dspark_ema_acc + 0.30f * rate;
+                sl.dspark_had_rollback = true;
+            }
             const int kv_dim = c_.n_kv * c_.head_dim;
             if (keep_steps >= 0 && keep_steps <= sl.sconv_rec_n) {
                 // 2 batched launches across all 48 visits instead of 192 kernel/memcpy submissions!
@@ -977,7 +1048,28 @@ public:
         if (anchor_pos < 1 || sl.dspark_len < anchor_pos) return 0;
 
         const int B = dspark_cfg_.block_size;  // 8
-        const int n_draft = std::min(max_draft, B - 1);
+        // Adaptive EMA DSpark length control: full K=7 on math/code, graceful backoff K=4->2->0 on low-accept chat!
+        if (sl.dspark_last_draft > 0 && !sl.dspark_had_rollback &&
+            sl.dspark_last_anchor >= 0 && anchor_pos == sl.dspark_last_anchor + sl.dspark_last_draft + 1) {
+            // All drafted tokens were accepted (no rollback called)!
+            sl.dspark_ema_acc = 0.70f * sl.dspark_ema_acc + 0.30f * 1.0f;
+        }
+        sl.dspark_had_rollback = false;
+        if (sl.dspark_skip_rem > 0) {
+            --sl.dspark_skip_rem;
+            sl.dspark_last_draft = 0;
+            return 0;
+        }
+        int adapt_max = B - 1;
+        if (sl.dspark_ema_acc < 0.20f) {
+            sl.dspark_skip_rem = 6;
+            adapt_max = 2;  // periodic probe so chat->code transitions recover immediately with zero chat regression!
+        } else if (sl.dspark_ema_acc < 0.25f) {
+            adapt_max = 4;
+        }
+        const int n_draft = std::min(max_draft, adapt_max);
+        sl.dspark_last_draft = n_draft;
+        sl.dspark_last_anchor = anchor_pos;
         const int D = dspark_cfg_.hidden;
         const int H = dspark_cfg_.n_head;
         const int KV = dspark_cfg_.n_kv;
@@ -989,20 +1081,47 @@ public:
 
         if (!ensure_dspark_scratch(B, D, q_dim, kv_dim, inter, err)) return 0;
 
+        // Upload 8-byte header {anchor_pos, anchor_tok} into d_dspark_toks_[0..1]
+        int32_t* d_toks = reinterpret_cast<int32_t*>(d_dspark_toks_.dev_ptr);
+        const int32_t h_in[2] = {anchor_pos, anchor_tok};
+        if (!hip_ok(hipMemcpyAsync(d_toks, h_in, 2 * sizeof(int32_t), hipMemcpyHostToDevice, stream_), "dspark hdr", err)) return 0;
+
+        const bool ds_prof = (std::getenv("STRATA_HIP_DSPARK_PROF") && std::atoi(std::getenv("STRATA_HIP_DSPARK_PROF")) > 0);
+        const bool use_ds_graph = (!ds_prof && n_draft >= 1 && n_draft <= 7 &&
+                                   static_cast<int>(dspark_qkv_.size()) == dspark_cfg_.n_layers &&
+                                   dspark_qkv_[0].dev_ptr != nullptr && dspark_gu_[0].dev_ptr != nullptr && hd <= 128);
+
+        if (use_ds_graph) {
+            hipGraphExec_t& g_exec = graph_dspark_exec_[n_draft];
+            if (g_exec != nullptr && ds_graph_slot_[n_draft] == slot && ds_graph_gen_[n_draft] == dspark_ptr_gen_) {
+                if (!hip_ok(hipGraphLaunch(g_exec, stream_), "dspark graph launch", err)) return 0;
+                if (!hip_ok(hipMemcpyAsync(out_ids, d_toks + 2, static_cast<size_t>(n_draft) * sizeof(int32_t),
+                                           hipMemcpyDeviceToHost, stream_), "dspark D2H", err)) return 0;
+                if (!hip_ok(hipStreamSynchronize(stream_), "dspark sync", err)) return 0;
+                return n_draft;
+            }
+            if (g_exec != nullptr) { (void)hipGraphExecDestroy(g_exec); g_exec = nullptr; }
+            if (!hip_ok(hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal), "dspark capture begin", err)) return 0;
+        }
+
+        hipEvent_t devt[4]{};
+        if (ds_prof) {
+            for (int i = 0; i < 4; ++i) (void)hipEventCreate(&devt[i]);
+            (void)hipEventRecord(devt[0], stream_);
+        }
+
         // 1. Build draft block [B, D]: row 0 = embed_norm(embed(anchor_tok)), rows 1..B-1 = mask_embed
-        int32_t h_anchor = anchor_tok;
-        if (!hip_ok(hipMemcpyAsync(d_dspark_toks_.dev_ptr, &h_anchor, sizeof(int32_t), hipMemcpyHostToDevice, stream_), "dspark anchor", err)) return 0;
         const auto& emb_pk = packed_trunk_.at("model.llm.embed.weight");
         k_embed_lookup<<<1, 256, 0, stream_>>>(
             emb_pk.buf.dev_ptr, emb_pk.info.fmt, static_cast<int>(emb_pk.info.rows()),
             f32_ptr("model.llm.embed_norm.weight"),
-            reinterpret_cast<const int32_t*>(d_dspark_toks_.dev_ptr), nullptr, nullptr,
+            d_toks + 1, nullptr, nullptr,
             reinterpret_cast<float*>(ds_cur_.dev_ptr), 1, D, c_.rms_eps);
         const float* mask_e = reinterpret_cast<const float*>(dspark_f32_.at("mask_embed").dev_ptr);
         k_fill_dspark_masks<<<((B - 1) * D + 255) / 256, 256, 0, stream_>>>(
             mask_e, reinterpret_cast<float*>(ds_cur_.dev_ptr) + D, B - 1, D);
 
-        // 2. Run 3 non-causal block-8 attention + SwiGLU layers on GPU!
+        // 2. Run 3 non-causal block-8 attention + SwiGLU layers on GPU (concatenated QKV & GU + fused Norm+RoPE + ZERO res copies!)
         float* cur = reinterpret_cast<float*>(ds_cur_.dev_ptr);
         float* res = reinterpret_cast<float*>(ds_res_.dev_ptr);
         float* h   = reinterpret_cast<float*>(ds_h_.dev_ptr);
@@ -1012,63 +1131,72 @@ public:
         float* ao  = reinterpret_cast<float*>(ds_ao_.dev_ptr);
         float* mg  = reinterpret_cast<float*>(ds_mg_.dev_ptr);
         float* mu  = reinterpret_cast<float*>(ds_mu_.dev_ptr);
+        float* qkv_cat = reinterpret_cast<float*>(ds_qkv_.dev_ptr);
+        float* gu_cat  = reinterpret_cast<float*>(ds_gu_.dev_ptr);
 
         for (int il = 0; il < dspark_cfg_.n_layers; ++il) {
             const std::string p = "layers." + std::to_string(il);
-            (void)hipMemcpyAsync(res, cur, static_cast<size_t>(B) * D * sizeof(float), hipMemcpyDeviceToDevice, stream_);
             k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32(p + ".input_layernorm.weight"), h, B, D, dspark_cfg_.rms_eps);
 
-            launch_bf16_opt(ds_bf16(p + ".self_attn.q_proj.weight"), h, nullptr, q,  B, q_dim,  D);
-            launch_bf16_opt(ds_bf16(p + ".self_attn.k_proj.weight"), h, nullptr, kd, B, kv_dim, D);
-            launch_bf16_opt(ds_bf16(p + ".self_attn.v_proj.weight"), h, nullptr, vd, B, kv_dim, D);
+            if (dspark_qkv_[il].dev_ptr != nullptr && hd <= 128) {
+                launch_bf16_opt(reinterpret_cast<const uint16_t*>(dspark_qkv_[il].dev_ptr), h, nullptr, qkv_cat, B, q_dim + 2 * kv_dim, D);
+                k_dspark_split_qkv_norm_rope<<<dim3(H + 2 * KV, B), 128, 0, stream_>>>(
+                    qkv_cat, ds_f32(p + ".self_attn.q_norm.weight"), ds_f32(p + ".self_attn.k_norm.weight"),
+                    d_toks, q, kd, vd, B, H, KV, hd, dspark_cfg_.rms_eps, dspark_cfg_.rope_theta);
+            } else {
+                launch_bf16_opt(ds_bf16(p + ".self_attn.q_proj.weight"), h, nullptr, q,  B, q_dim,  D);
+                launch_bf16_opt(ds_bf16(p + ".self_attn.k_proj.weight"), h, nullptr, kd, B, kv_dim, D);
+                launch_bf16_opt(ds_bf16(p + ".self_attn.v_proj.weight"), h, nullptr, vd, B, kv_dim, D);
+                k_rms_norm_rows<<<B * H, 256, 0, stream_>>>(q, ds_f32(p + ".self_attn.q_norm.weight"), q, B * H, hd, dspark_cfg_.rms_eps);
+                k_rms_norm_rows<<<B * KV, 256, 0, stream_>>>(kd, ds_f32(p + ".self_attn.k_norm.weight"), kd, B * KV, hd, dspark_cfg_.rms_eps);
+                k_half_rope<<<dim3(H, B), hd / 2, 0, stream_>>>(q, nullptr, anchor_pos, B, H, hd, dspark_cfg_.rope_theta);
+                k_half_rope<<<dim3(KV, B), hd / 2, 0, stream_>>>(kd, nullptr, anchor_pos, B, KV, hd, dspark_cfg_.rope_theta);
+            }
 
-            k_rms_norm_rows<<<B * H, 256, 0, stream_>>>(q, ds_f32(p + ".self_attn.q_norm.weight"), q, B * H, hd, dspark_cfg_.rms_eps);
-            k_rms_norm_rows<<<B * KV, 256, 0, stream_>>>(kd, ds_f32(p + ".self_attn.k_norm.weight"), kd, B * KV, hd, dspark_cfg_.rms_eps);
-            k_half_rope<<<dim3(H, B), hd / 2, 0, stream_>>>(q, nullptr, anchor_pos, B, H, hd, dspark_cfg_.rope_theta);
-            k_half_rope<<<dim3(KV, B), hd / 2, 0, stream_>>>(kd, nullptr, anchor_pos, B, KV, hd, dspark_cfg_.rope_theta);
-
-            const int c0 = dspark_cfg_.is_swa[il] ? std::max(0, anchor_pos - dspark_cfg_.swa_win + 1) : 0;
-            const int c_len = anchor_pos - c0;
-            k_dspark_block_attn<<<dim3((H + 3) / 4, B), 128, 0, stream_>>>(
+            const int swa_w = dspark_cfg_.is_swa[il] ? dspark_cfg_.swa_win : 0;
+            k_dspark_block_attn_dyn<<<dim3((H + 3) / 4, B), 128, 0, stream_>>>(
                 q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
                 reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
-                kd, vd, ao, B, H, KV, c0, c_len);
+                kd, vd, d_toks, ao, B, H, KV, swa_w);
 
             launch_bf16_opt(ds_bf16(p + ".self_attn.o_proj.weight"), ao, nullptr, h, B, D, q_dim);
-            k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, h, cur, B * D);
+            k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, h, cur, B * D);
 
-            (void)hipMemcpyAsync(res, cur, static_cast<size_t>(B) * D * sizeof(float), hipMemcpyDeviceToDevice, stream_);
             k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32(p + ".post_attention_layernorm.weight"), h, B, D, dspark_cfg_.rms_eps);
-            launch_bf16_opt(ds_bf16(p + ".mlp.gate_proj.weight"), h, nullptr, mg, B, inter, D);
-            launch_bf16_opt(ds_bf16(p + ".mlp.up_proj.weight"),   h, nullptr, mu, B, inter, D);
-            k_swiglu_f32<<<(B * inter + 255) / 256, 256, 0, stream_>>>(mg, mu, mg, B * inter);
+            if (dspark_gu_[il].dev_ptr != nullptr) {
+                launch_bf16_opt(reinterpret_cast<const uint16_t*>(dspark_gu_[il].dev_ptr), h, nullptr, gu_cat, B, 2 * inter, D);
+                k_swiglu_split_f32<<<(B * inter + 255) / 256, 256, 0, stream_>>>(gu_cat, mg, B, inter);
+            } else {
+                launch_bf16_opt(ds_bf16(p + ".mlp.gate_proj.weight"), h, nullptr, mg, B, inter, D);
+                launch_bf16_opt(ds_bf16(p + ".mlp.up_proj.weight"),   h, nullptr, mu, B, inter, D);
+                k_swiglu_f32<<<(B * inter + 255) / 256, 256, 0, stream_>>>(mg, mu, mg, B * inter);
+            }
             launch_bf16_opt(ds_bf16(p + ".mlp.down_proj.weight"), mg, nullptr, h, B, D, inter);
-            k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(res, h, cur, B * D);
+            k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, h, cur, B * D);
         }
 
-        // 3. Final norm + Single-Pass Base Unembed Top-1024 Screen + 7-Step Multi-CU Recurrent Markov Head!
+        // 3. Final norm + dynamic f_rnn load + Single-Pass Base Unembed Top-512 Screen + Recurrent Markov Head!
         k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32("norm.weight"), cur, B, D, dspark_cfg_.rms_eps);
-        // Convert slot's f_rnn BF16 vector at (anchor_pos - 1) to FP32 in ds_res_ (reusing first D floats)
-        k_bf16_to_f32_vec<<<(D + 255) / 256, 256, 0, stream_>>>(
-            reinterpret_cast<const uint16_t*>(sl.dspark_frnn.dev_ptr) + static_cast<size_t>(anchor_pos - 1) * D,
-            res, D);
+        k_dspark_load_frnn_zero<<<(std::max(D, rank) + 255) / 256, 256, 0, stream_>>>(
+            reinterpret_cast<const uint16_t*>(sl.dspark_frnn.dev_ptr), d_toks,
+            res, reinterpret_cast<float*>(d_dspark_state_.dev_ptr), D, rank);
+        if (ds_prof) (void)hipEventRecord(devt[1], stream_);
 
-        (void)hipMemsetAsync(d_dspark_state_.dev_ptr, 0, static_cast<size_t>(rank) * sizeof(float), stream_);
         const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
         const int V = c_.vocab_unpadded;
-        constexpr int kScreenBlks = 512;
-        constexpr int kNumCand = kScreenBlks * 2;  // 1,024 top candidates per step
-        constexpr int kCandArgBlks = (kNumCand + 7) / 8;  // 128 blocks x 8 waves = 1,024
+        constexpr int kScreenBlks = 256;
+        constexpr int kNumCand = kScreenBlks * 2;
+        constexpr int kCandArgBlks = (kNumCand + 7) / 8;
 
-        // Read unembed[V, D] ONCE across all n_draft steps -> 7x less memory bandwidth!
+        // Read unembed[V, D] ONCE across all n_draft steps (2 WG/CU union LDS!)
         k5_dspark_base_top2_screen<<<kScreenBlks, 256, 0, stream_>>>(
             unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
             cur + D,
             reinterpret_cast<float*>(d_dspark_cand_v_.dev_ptr),
             reinterpret_cast<int32_t*>(d_dspark_cand_i_.dev_ptr),
             n_draft, D, V);
+        if (ds_prof) (void)hipEventRecord(devt[2], stream_);
 
-        int32_t* d_toks = reinterpret_cast<int32_t*>(d_dspark_toks_.dev_ptr);
         float* st_a = reinterpret_cast<float*>(d_dspark_state_.dev_ptr);
         float* st_b = reinterpret_cast<float*>(d_dspark_state2_.dev_ptr);
         float* d_lat = reinterpret_cast<float*>(d_dspark_latent_.dev_ptr);
@@ -1077,7 +1205,7 @@ public:
             float* st_in  = (step & 1) ? st_a : st_b;
             float* st_out = (step & 1) ? st_b : st_a;
             k5_dspark_markov_proj_bf16<<<(rank + 7) / 8, 256, 0, stream_>>>(
-                d_toks + (step - 1),
+                d_toks + step,
                 st_in, st_out, d_lat,
                 cur + static_cast<size_t>(step) * D,
                 res,
@@ -1101,14 +1229,557 @@ public:
             k5_dspark_argmax_stage2<<<1, 256, 0, stream_>>>(
                 reinterpret_cast<const float*>(d_dspark_blk_v_.dev_ptr),
                 reinterpret_cast<const int32_t*>(d_dspark_blk_i_.dev_ptr),
-                kCandArgBlks, d_toks + step);
+                kCandArgBlks, d_toks + step + 1);
+        }
+        if (ds_prof) (void)hipEventRecord(devt[3], stream_);
+
+        if (use_ds_graph) {
+            hipGraph_t g = nullptr;
+            if (!hip_ok(hipStreamEndCapture(stream_, &g), "dspark capture end", err)) return 0;
+            hipGraphExec_t& g_exec = graph_dspark_exec_[n_draft];
+            hipError_t ie = hipGraphInstantiate(&g_exec, g, nullptr, nullptr, 0);
+            (void)hipGraphDestroy(g);
+            if (!hip_ok(ie, "dspark graph instantiate", err)) return 0;
+            ds_graph_slot_[n_draft] = slot;
+            ds_graph_gen_[n_draft] = dspark_ptr_gen_;
+            if (!hip_ok(hipGraphLaunch(g_exec, stream_), "dspark graph launch(first)", err)) return 0;
         }
 
-        // Single tiny 28-byte D2H copy for all drafted tokens!
-        if (!hip_ok(hipMemcpyAsync(out_ids, d_toks + 1, static_cast<size_t>(n_draft) * sizeof(int32_t),
+        // Single tiny <=28-byte D2H copy for all drafted tokens!
+        if (!hip_ok(hipMemcpyAsync(out_ids, d_toks + 2, static_cast<size_t>(n_draft) * sizeof(int32_t),
                                    hipMemcpyDeviceToHost, stream_), "dspark D2H", err)) return 0;
         if (!hip_ok(hipStreamSynchronize(stream_), "dspark sync", err)) return 0;
+        if (ds_prof) {
+            float m0 = 0, m1 = 0, m2 = 0, mt = 0;
+            (void)hipEventElapsedTime(&m0, devt[0], devt[1]);
+            (void)hipEventElapsedTime(&m1, devt[1], devt[2]);
+            (void)hipEventElapsedTime(&m2, devt[2], devt[3]);
+            (void)hipEventElapsedTime(&mt, devt[0], devt[3]);
+            std::fprintf(stderr, "[DSPARK-PROF] K=%d pos=%d tot=%.2fms | 3L=%.2f screen=%.2f markov=%.2f\n",
+                         n_draft, anchor_pos, mt, m0, m1, m2);
+            for (int i = 0; i < 4; ++i) (void)hipEventDestroy(devt[i]);
+        }
         return n_draft;
+    }
+
+    // Wave-7 Full On-GPU W=4 Multi-Branch Adaptive Beam Tree DSpark Speculative Step (greedy, no penalties)!
+    // Matches InkBackend::dspark_spec_step_greedy exact ABI (#398) with zero file overlaps outside hip/.
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winconsistent-missing-override"
+#endif
+    int dspark_spec_step_greedy(
+        int slot,
+        int32_t anchor_tok,
+        int anchor_pos,
+        int max_emit,
+        int32_t* out_emitted,
+        int* out_drafted,
+        std::string& err) {
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+        if (!has_dspark_ || max_emit <= 0 || out_emitted == nullptr) return 0;
+        if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return 0;
+        auto& sl = slots_[slot];
+        if (anchor_pos < 1 || sl.dspark_len < anchor_pos || anchor_pos + kTreeMaxM >= sl.max_ctx) return 0;
+        if (c_.head_dim > 128 || c_.d_rel > 16 || (c_.rel_extent & 3) != 0) return 0;
+        if (static_cast<int>(dspark_qkv_.size()) != dspark_cfg_.n_layers ||
+            dspark_qkv_[0].dev_ptr == nullptr || dspark_gu_[0].dev_ptr == nullptr) return 0;
+        for (bool ok_l : layer_all_gpu_) if (!ok_l) return 0;
+
+        const int D = dspark_cfg_.hidden;
+        const int H = dspark_cfg_.n_head;
+        const int KV = dspark_cfg_.n_kv;
+        const int hd = dspark_cfg_.head_dim;
+        const int kv_dim = KV * hd;
+        const int q_dim = H * hd;
+        const int inter = dspark_cfg_.inter;
+        const int rank = dspark_cfg_.markov_rank;
+        const int B_ds = dspark_cfg_.block_size;  // 8
+
+        if (!ensure_dspark_scratch(B_ds, D, q_dim, kv_dim, inter, err)) return 0;
+        if (!ensure_batch_scratch(kTreeMaxM, err)) return 0;
+        if (!ensure_tree_scratch(err)) return 0;
+
+        // Ensure slot snapshot & record buffers exist so rollback_slot() stays 100% exact on early EOS!
+        if (!sl.sconv_snap_k.dev_ptr) {
+            const int trunk_kvd = c_.n_kv * c_.head_dim;
+            const size_t kv_one = 3u * trunk_kvd * sizeof(uint16_t);
+            const size_t h_one  = 3u * c_.hidden * sizeof(uint16_t);
+            const size_t kv_rec = 8u * trunk_kvd * sizeof(uint16_t);
+            const size_t h_rec  = 8u * c_.hidden * sizeof(uint16_t);
+            if (!hip_ok(alloc_gpu_buffer(sl.sconv_snap_k, static_cast<size_t>(c_.n_visits) * kv_one, mem_info_.is_uma), "tree snap k", err) ||
+                !hip_ok(alloc_gpu_buffer(sl.sconv_snap_v, static_cast<size_t>(c_.n_visits) * kv_one, mem_info_.is_uma), "tree snap v", err) ||
+                !hip_ok(alloc_gpu_buffer(sl.sconv_snap_attn, static_cast<size_t>(c_.n_visits) * h_one, mem_info_.is_uma), "tree snap a", err) ||
+                !hip_ok(alloc_gpu_buffer(sl.sconv_snap_mlp, static_cast<size_t>(c_.n_visits) * h_one, mem_info_.is_uma), "tree snap m", err) ||
+                !hip_ok(alloc_gpu_buffer(sl.sconv_rec_k, static_cast<size_t>(c_.n_visits) * kv_rec, mem_info_.is_uma), "tree rec k", err) ||
+                !hip_ok(alloc_gpu_buffer(sl.sconv_rec_v, static_cast<size_t>(c_.n_visits) * kv_rec, mem_info_.is_uma), "tree rec v", err) ||
+                !hip_ok(alloc_gpu_buffer(sl.sconv_rec_attn, static_cast<size_t>(c_.n_visits) * h_rec, mem_info_.is_uma), "tree rec a", err) ||
+                !hip_ok(alloc_gpu_buffer(sl.sconv_rec_mlp, static_cast<size_t>(c_.n_visits) * h_rec, mem_info_.is_uma), "tree rec m", err)) {
+                return 0;
+            }
+        }
+
+        // Pre-ensure DSpark context capacity for anchor_pos + 8 before capturing/launching graphs!
+        const int old_ds_cap = sl.dspark_cap;
+        if (!ensure_dspark_slot_cap(sl, anchor_pos + 8, err)) return 0;
+        if (!d_ds_k_ptrs_[0].dev_ptr || sl.dspark_cap != old_ds_cap) {
+            std::vector<uint16_t*> pt(max_slots_, nullptr);
+            for (int il = 0; il < dspark_cfg_.n_layers; ++il) {
+                for (int s = 0; s < max_slots_; ++s) pt[s] = reinterpret_cast<uint16_t*>(slots_[s].dspark_k[il].dev_ptr);
+                if (!d_ds_k_ptrs_[il].dev_ptr && !hip_ok(alloc_gpu_buffer(d_ds_k_ptrs_[il], max_slots_ * sizeof(uint16_t*), mem_info_.is_uma), "ds k ptrs", err)) return 0;
+                (void)hipMemcpyAsync(d_ds_k_ptrs_[il].dev_ptr, pt.data(), max_slots_ * sizeof(uint16_t*), hipMemcpyHostToDevice, stream_);
+                for (int s = 0; s < max_slots_; ++s) pt[s] = reinterpret_cast<uint16_t*>(slots_[s].dspark_v[il].dev_ptr);
+                if (!d_ds_v_ptrs_[il].dev_ptr && !hip_ok(alloc_gpu_buffer(d_ds_v_ptrs_[il], max_slots_ * sizeof(uint16_t*), mem_info_.is_uma), "ds v ptrs", err)) return 0;
+                (void)hipMemcpyAsync(d_ds_v_ptrs_[il].dev_ptr, pt.data(), max_slots_ * sizeof(uint16_t*), hipMemcpyHostToDevice, stream_);
+            }
+            for (int s = 0; s < max_slots_; ++s) pt[s] = reinterpret_cast<uint16_t*>(slots_[s].dspark_frnn.dev_ptr);
+            if (!d_ds_frnn_ptrs_.dev_ptr && !hip_ok(alloc_gpu_buffer(d_ds_frnn_ptrs_, max_slots_ * sizeof(uint16_t*), mem_info_.is_uma), "ds frnn ptrs", err)) return 0;
+            (void)hipMemcpyAsync(d_ds_frnn_ptrs_.dev_ptr, pt.data(), max_slots_ * sizeof(uint16_t*), hipMemcpyHostToDevice, stream_);
+            ++dspark_ptr_gen_;
+        }
+
+        // ---- STAGE 1 & 2: Realized-Gain Cooldown + On-GPU W=4 Beam Draft + Sparse-MoE Bayes Tree Sizing ----
+        const bool tprof = (std::getenv("STRATA_HIP_TREE_PROF") && std::atoi(std::getenv("STRATA_HIP_TREE_PROF")) > 0);
+        hipEvent_t tev[4]{};
+        if (tprof) {
+            for (int i = 0; i < 4; ++i) (void)hipEventCreate(&tev[i]);
+            (void)hipEventRecord(tev[0], stream_);
+        }
+
+        int32_t t_tok[kTreeMaxM];
+        int32_t t_par[kTreeMaxM];
+        int32_t t_dep[kTreeMaxM];
+        float   t_prob[kTreeMaxM];
+        t_tok[0] = anchor_tok;
+        t_par[0] = -1;
+        t_dep[0] = 0;
+        t_prob[0] = 1.0f;
+
+        int M = 1;
+        double chosen_cost_ratio = 1.0;
+
+        if (sl.tree_cool_rem > 0) {
+            // Fast cooldown -> fall straight into 100% fused B=1 HIP Graph (graph_exec_) with zero draft overhead!
+            --sl.tree_cool_rem;
+            sl.dspark_skip_rem = std::max(sl.dspark_skip_rem, 1);
+            if (tprof) for (int i = 0; i < 4; ++i) (void)hipEventDestroy(tev[i]);
+            return 0;
+        }
+        {
+            int32_t* d_hdr = reinterpret_cast<int32_t*>(d_dspark_toks_.dev_ptr);
+            const int32_t h_in[2] = {anchor_pos, anchor_tok};
+            if (!hip_ok(hipMemcpyAsync(d_hdr, h_in, 2 * sizeof(int32_t), hipMemcpyHostToDevice, stream_), "beam hdr", err)) return 0;
+
+            if (graph_beam_draft_exec_ != nullptr && beam_graph_slot_ == slot && beam_graph_gen_ == dspark_ptr_gen_) {
+                if (!hip_ok(hipGraphLaunch(graph_beam_draft_exec_, stream_), "beam graph launch", err)) return 0;
+            } else {
+                if (graph_beam_draft_exec_ != nullptr) {
+                    (void)hipGraphExecDestroy(graph_beam_draft_exec_);
+                    graph_beam_draft_exec_ = nullptr;
+                }
+                if (!hip_ok(hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal), "beam capture begin", err)) return 0;
+
+                const auto& emb_pk = packed_trunk_.at("model.llm.embed.weight");
+                k_embed_lookup<<<1, 256, 0, stream_>>>(
+                    emb_pk.buf.dev_ptr, emb_pk.info.fmt, static_cast<int>(emb_pk.info.rows()),
+                    f32_ptr("model.llm.embed_norm.weight"),
+                    d_hdr + 1, nullptr, nullptr,
+                    reinterpret_cast<float*>(ds_cur_.dev_ptr), 1, D, c_.rms_eps);
+                k_fill_dspark_masks<<<((B_ds - 1) * D + 255) / 256, 256, 0, stream_>>>(
+                    reinterpret_cast<const float*>(dspark_f32_.at("mask_embed").dev_ptr),
+                    reinterpret_cast<float*>(ds_cur_.dev_ptr) + D, B_ds - 1, D);
+
+                float* cur = reinterpret_cast<float*>(ds_cur_.dev_ptr);
+                float* res = reinterpret_cast<float*>(ds_res_.dev_ptr);
+                float* h   = reinterpret_cast<float*>(ds_h_.dev_ptr);
+                float* q   = reinterpret_cast<float*>(ds_q_.dev_ptr);
+                float* kd  = reinterpret_cast<float*>(ds_k_.dev_ptr);
+                float* vd  = reinterpret_cast<float*>(ds_v_.dev_ptr);
+                float* ao  = reinterpret_cast<float*>(ds_ao_.dev_ptr);
+                float* mg  = reinterpret_cast<float*>(ds_mg_.dev_ptr);
+                float* qkv_cat = reinterpret_cast<float*>(ds_qkv_.dev_ptr);
+                float* gu_cat  = reinterpret_cast<float*>(ds_gu_.dev_ptr);
+
+                for (int il = 0; il < dspark_cfg_.n_layers; ++il) {
+                    const std::string p = "layers." + std::to_string(il);
+                    k_rms_norm_rows<<<B_ds, 256, 0, stream_>>>(cur, ds_f32(p + ".input_layernorm.weight"), h, B_ds, D, dspark_cfg_.rms_eps);
+                    launch_bf16_opt(reinterpret_cast<const uint16_t*>(dspark_qkv_[il].dev_ptr), h, nullptr, qkv_cat, B_ds, q_dim + 2 * kv_dim, D);
+                    k_dspark_split_qkv_norm_rope<<<dim3(H + 2 * KV, B_ds), 128, 0, stream_>>>(
+                        qkv_cat, ds_f32(p + ".self_attn.q_norm.weight"), ds_f32(p + ".self_attn.k_norm.weight"),
+                        d_hdr, q, kd, vd, B_ds, H, KV, hd, dspark_cfg_.rms_eps, dspark_cfg_.rope_theta);
+                    const int swa_w = dspark_cfg_.is_swa[il] ? dspark_cfg_.swa_win : 0;
+                    k_dspark_block_attn_dyn<<<dim3((H + 3) / 4, B_ds), 128, 0, stream_>>>(
+                        q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
+                        reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
+                        kd, vd, d_hdr, ao, B_ds, H, KV, swa_w);
+                    launch_bf16_opt(ds_bf16(p + ".self_attn.o_proj.weight"), ao, nullptr, h, B_ds, D, q_dim);
+                    k_vec_add<<<(B_ds * D + 255) / 256, 256, 0, stream_>>>(cur, h, cur, B_ds * D);
+
+                    k_rms_norm_rows<<<B_ds, 256, 0, stream_>>>(cur, ds_f32(p + ".post_attention_layernorm.weight"), h, B_ds, D, dspark_cfg_.rms_eps);
+                    launch_bf16_opt(reinterpret_cast<const uint16_t*>(dspark_gu_[il].dev_ptr), h, nullptr, gu_cat, B_ds, 2 * inter, D);
+                    k_swiglu_split_f32<<<(B_ds * inter + 255) / 256, 256, 0, stream_>>>(gu_cat, mg, B_ds, inter);
+                    launch_bf16_opt(ds_bf16(p + ".mlp.down_proj.weight"), mg, nullptr, h, B_ds, D, inter);
+                    k_vec_add<<<(B_ds * D + 255) / 256, 256, 0, stream_>>>(cur, h, cur, B_ds * D);
+                }
+
+                k_rms_norm_rows<<<B_ds, 256, 0, stream_>>>(cur, ds_f32("norm.weight"), cur, B_ds, D, dspark_cfg_.rms_eps);
+                k_dspark_load_frnn_zero<<<(std::max(D, rank) + 255) / 256, 256, 0, stream_>>>(
+                    reinterpret_cast<const uint16_t*>(sl.dspark_frnn.dev_ptr), d_hdr,
+                    res, reinterpret_cast<float*>(d_beam_st_a_.dev_ptr), D, rank);
+
+                const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
+                const int V = c_.vocab_unpadded;
+                constexpr int kScreenBlks = 256;
+                constexpr int kNumCand = kScreenBlks * 2;  // 512
+
+                k5_dspark_base_top2_screen<<<kScreenBlks, 256, 0, stream_>>>(
+                    unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
+                    cur + D,
+                    reinterpret_cast<float*>(d_dspark_cand_v_.dev_ptr),
+                    reinterpret_cast<int32_t*>(d_dspark_cand_i_.dev_ptr),
+                    kBeamMaxSteps, D, V);
+
+                BeamTreeNode* d_pool = reinterpret_cast<BeamTreeNode*>(d_beam_pool_.dev_ptr);
+                int32_t* d_cnt  = reinterpret_cast<int32_t*>(d_beam_cnt_.dev_ptr);
+                int32_t* d_btok = reinterpret_cast<int32_t*>(d_beam_tok_.dev_ptr);
+                int32_t* d_bnod = reinterpret_cast<int32_t*>(d_beam_node_.dev_ptr);
+                float*   d_blp  = reinterpret_cast<float*>(d_beam_lp_.dev_ptr);
+                float*   d_sta  = reinterpret_cast<float*>(d_beam_st_a_.dev_ptr);
+                float*   d_stb  = reinterpret_cast<float*>(d_beam_st_b_.dev_ptr);
+                float*   d_lat  = reinterpret_cast<float*>(d_beam_lat_.dev_ptr);
+                float*   d_cor  = reinterpret_cast<float*>(d_beam_corr_.dev_ptr);
+                float*   d_sco  = reinterpret_cast<float*>(d_beam_scores_.dev_ptr);
+
+                k5_beam_init<<<1, 32, 0, stream_>>>(d_hdr, d_pool, d_cnt, d_btok, d_bnod, d_blp);
+
+                for (int step = 1; step <= kBeamMaxSteps; ++step) {
+                    const int w_in = (step == 1) ? 1 : kBeamW;
+                    k5_beam_markov_proj_bf16<<<dim3((rank + 7) / 8, w_in), 256, 0, stream_>>>(
+                        d_btok, d_sta, d_stb, d_lat,
+                        cur + static_cast<size_t>(step) * D, res,
+                        ds_f32("markov_head.markov_w1.weight"),
+                        ds_bf16("markov_head.rnn_proj.weight"),
+                        ds_f32("markov_head.rnn_proj.bias"),
+                        D, rank);
+                    k5_beam_markov_corr_bf16<<<dim3((D + 7) / 8, w_in), 256, 0, stream_>>>(
+                        d_lat,
+                        ds_bf16("markov_head.hidden_out.weight"),
+                        ds_f32("markov_head.hidden_out.bias"),
+                        d_cor, D, rank);
+                    k5_beam_cand_scores<<<(kNumCand + 7) / 8, 256, 0, stream_>>>(
+                        unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
+                        reinterpret_cast<const float*>(d_dspark_cand_v_.dev_ptr) + static_cast<size_t>(step - 1) * kNumCand,
+                        reinterpret_cast<const int32_t*>(d_dspark_cand_i_.dev_ptr) + static_cast<size_t>(step - 1) * kNumCand,
+                        d_cor, d_sco, w_in, kNumCand, D, V);
+                    k5_beam_select_step<<<1, 256, 0, stream_>>>(
+                        d_sco,
+                        reinterpret_cast<const int32_t*>(d_dspark_cand_i_.dev_ptr) + static_cast<size_t>(step - 1) * kNumCand,
+                        d_stb, d_sta, d_btok, d_bnod, d_blp, d_pool, d_cnt,
+                        w_in, kNumCand, step, rank, c_.logit_softcap);
+                }
+
+                hipGraph_t g = nullptr;
+                if (!hip_ok(hipStreamEndCapture(stream_, &g), "beam capture end", err)) return 0;
+                hipError_t ie = hipGraphInstantiate(&graph_beam_draft_exec_, g, nullptr, nullptr, 0);
+                (void)hipGraphDestroy(g);
+                if (!hip_ok(ie, "beam graph instantiate", err)) return 0;
+                beam_graph_slot_ = slot;
+                beam_graph_gen_ = dspark_ptr_gen_;
+                if (!hip_ok(hipGraphLaunch(graph_beam_draft_exec_, stream_), "beam graph launch(first)", err)) return 0;
+            }
+
+            // Download tiny 512-byte candidate pool + 4-byte count
+            if (tprof) (void)hipEventRecord(tev[1], stream_);
+            BeamTreeNode h_pool[kTreePoolMax];
+            int32_t h_cnt = 0;
+            if (!hip_ok(hipMemcpyAsync(h_pool, d_beam_pool_.dev_ptr, sizeof(h_pool), hipMemcpyDeviceToHost, stream_), "beam pool D2H", err) ||
+                !hip_ok(hipMemcpyAsync(&h_cnt, d_beam_cnt_.dev_ptr, sizeof(int32_t), hipMemcpyDeviceToHost, stream_), "beam cnt D2H", err) ||
+                !hip_ok(hipStreamSynchronize(stream_), "beam draft sync", err)) {
+                return 0;
+            }
+            h_cnt = std::max(1, std::min(h_cnt, kTreePoolMax));
+
+            // Build connected prefix-closed tree ordered by descending acceptance probability exp(cum_lp)
+            const int max_depth_allowed = std::min(kBeamMaxSteps, max_emit - 1);
+            int pool_to_tree[kTreePoolMax];
+            for (int i = 0; i < kTreePoolMax; ++i) pool_to_tree[i] = -1;
+            pool_to_tree[0] = 0;
+            int n_sel = 1;
+            constexpr int kMaxTreeSel = 12;
+
+            while (n_sel < kMaxTreeSel) {
+                int best_p = -1;
+                float best_lp = -1e29f;
+                for (int i = 1; i < h_cnt; ++i) {
+                    if (pool_to_tree[i] >= 0) continue;
+                    if (h_pool[i].depth > max_depth_allowed) continue;
+                    const int par_i = h_pool[i].parent;
+                    if (par_i < 0 || par_i >= h_cnt || pool_to_tree[par_i] < 0) continue;
+                    if (h_pool[i].cum_lp > best_lp) {
+                        best_lp = h_pool[i].cum_lp;
+                        best_p = i;
+                    }
+                }
+                if (best_p < 0) break;
+                pool_to_tree[best_p] = n_sel;
+                t_tok[n_sel] = h_pool[best_p].tok;
+                t_par[n_sel] = pool_to_tree[h_pool[best_p].parent];
+                t_dep[n_sel] = h_pool[best_p].depth;
+                t_prob[n_sel] = std::exp(std::max(-40.0f, std::min(0.0f, h_pool[best_p].cum_lp)));
+                ++n_sel;
+            }
+
+            // Sparse-MoE Bayes-optimal M* normalized to M=1 (1.0x) plain decode!
+            static const int kCandMs[] = {3, 4, 5, 6, 8, 10, 12};
+            int best_M = 1;
+            double best_score = 0.88;  // reject flat high-entropy chat probes while never starving code/math!
+            double best_cost = 1.0;
+            for (int cm : kCandMs) {
+                if (cm > n_sel) continue;
+                double exp_acc = 1.0;
+                for (int i = 1; i < cm; ++i) exp_acc += static_cast<double>(t_prob[i]);
+                const double cost = 1.0 + 4.2 * (1.0 - std::pow(15.0 / 16.0, static_cast<double>(cm)));
+                const double score = exp_acc / cost;
+                if (score > best_score) {
+                    best_score = score;
+                    best_M = cm;
+                    best_cost = cost;
+                }
+            }
+            M = best_M;
+            chosen_cost_ratio = best_cost;
+        }
+        if (M < 2) {
+            // Low-confidence probe -> fall straight into fused B=1 HIP Graph & enter cooldown!
+            sl.tree_ema_gain = 0.80f * sl.tree_ema_gain + 0.20f * 0.65f;
+            if (sl.tree_ema_gain < 0.82f) sl.tree_cool_rem = 12;
+            sl.dspark_skip_rem = std::max(sl.dspark_skip_rem, 1);
+            if (tprof) for (int i = 0; i < 4; ++i) (void)hipEventDestroy(tev[i]);
+            return 0;
+        }
+
+        // Build TreeMetaDev (anc1, anc2, anc3, uint32_t ancestor bitmask)
+        TreeMetaDev h_tmeta{};
+        h_tmeta.base_pos = anchor_pos;
+        h_tmeta.slot = slot;
+        int max_dep = 0;
+        int32_t h_sids[kTreeMaxM], h_pos[kTreeMaxM], h_img[kTreeMaxM];
+        for (int m = 0; m < M; ++m) {
+            const int a1 = t_par[m];
+            const int a2 = (a1 >= 0) ? t_par[a1] : (a1 - 1);
+            const int a3 = (a2 >= 0) ? t_par[a2] : (a2 - 1);
+            h_tmeta.anc1[m] = a1;
+            h_tmeta.anc2[m] = a2;
+            h_tmeta.anc3[m] = a3;
+            uint32_t msk = (1u << m);
+            int p = a1;
+            while (p >= 0) { msk |= (1u << p); p = t_par[p]; }
+            h_tmeta.mask[m] = msk;
+            h_sids[m] = slot;
+            h_pos[m] = anchor_pos + t_dep[m];
+            h_img[m] = -1;
+            max_dep = std::max(max_dep, t_dep[m]);
+        }
+
+        // Pre-ensure KV pages for all possible committed positions anchor_pos .. anchor_pos + max_dep
+        for (int d = 0; d <= max_dep; ++d) {
+            const int p = anchor_pos + d;
+            const int swa_lp = (p % c_.swa_win) >> 6;
+            const int glb_lp = p >> 6;
+            for (int i = 0; i < c_.n_swa_visits; ++i) {
+                if (!swa_pools_[i].ensure_page(slot, swa_lp, stream_, err)) return 0;
+            }
+            for (int i = 0; i < c_.n_global_visits; ++i) {
+                if (!glob_pools_[i].ensure_page(slot, glb_lp, stream_, err)) return 0;
+            }
+        }
+        for (auto& p : swa_pools_) if (!p.sync_pt(stream_, err)) return 0;
+        for (auto& p : glob_pools_) if (!p.sync_pt(stream_, err)) return 0;
+
+        uint64_t kv_gen_sum = dspark_ptr_gen_;
+        for (const auto& p : swa_pools_) kv_gen_sum += p.pool_gen;
+        for (const auto& p : glob_pools_) kv_gen_sum += p.pool_gen;
+        if (kv_gen_sum != tree_kv_desc_gen_) {
+            std::vector<KvVisitDesc> h_descs(c_.n_visits);
+            for (int v = 0; v < c_.n_visits; ++v) {
+                const int ip = (v < c_.core_start) ? v
+                    : ((v < c_.core_start + c_.num_passes * (c_.core_end - c_.core_start))
+                        ? (c_.core_start + (v - c_.core_start) % (c_.core_end - c_.core_start))
+                        : (c_.core_end + (v - c_.core_start - c_.num_passes * (c_.core_end - c_.core_start))));
+                const bool is_swa = c_.is_swa[ip] != 0;
+                const VisitKvPool& kvp = is_swa ? swa_pools_[c_.visit_kv_slot[v]] : glob_pools_[c_.visit_kv_slot[v]];
+                h_descs[v] = {
+                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                    reinterpret_cast<float*>(kvp.k_scales.dev_ptr),
+                    reinterpret_cast<float*>(kvp.v_scales.dev_ptr),
+                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr),
+                    kvp.max_pages_per_slot,
+                    is_swa ? c_.swa_win : 0
+                };
+            }
+            if (!hip_ok(hipMemcpyAsync(d_tree_kv_descs_.dev_ptr, h_descs.data(),
+                                       h_descs.size() * sizeof(KvVisitDesc), hipMemcpyHostToDevice, stream_),
+                        "tree kv descs H2D", err)) return 0;
+            tree_kv_desc_gen_ = kv_gen_sum;
+        }
+
+        // ---- STAGE 3: Exact Batched Tree Verify (M tokens) + Zero-Logits-D2H On-GPU Argmax (1 HIP Graph!) ----
+        (void)hipMemcpyAsync(d_tree_meta_.dev_ptr, &h_tmeta, sizeof(TreeMetaDev), hipMemcpyHostToDevice, stream_);
+        (void)hipMemcpyAsync(sc_slot_ids_.dev_ptr, h_sids, M * 4, hipMemcpyHostToDevice, stream_);
+        (void)hipMemcpyAsync(sc_pos_.dev_ptr, h_pos, M * 4, hipMemcpyHostToDevice, stream_);
+        (void)hipMemcpyAsync(sc_tok_ids_.dev_ptr, t_tok, M * 4, hipMemcpyHostToDevice, stream_);
+        (void)hipMemcpyAsync(sc_img_idx_.dev_ptr, h_img, M * 4, hipMemcpyHostToDevice, stream_);
+
+        if (!forward_tree_verify(M, slot, kv_gen_sum, err)) return 0;
+        if (tprof) (void)hipEventRecord(tev[2], stream_);
+
+        int32_t h_argmax[kTreeMaxM];
+        if (!hip_ok(hipMemcpyAsync(h_argmax, d_tree_arg_out_.dev_ptr, M * sizeof(int32_t), hipMemcpyDeviceToHost, stream_), "tree argmax D2H", err) ||
+            !hip_ok(hipStreamSynchronize(stream_), "tree verify sync", err)) {
+            return 0;
+        }
+
+        // ---- STAGE 4: Walk Winning Path + 1-Launch Commit (ShortConv + Paged KV + DSpark Context!) ----
+        WinPath8 wp{};
+        wp.n_acc = 0;
+        int cur_node = 0;
+        while (wp.n_acc < max_emit && wp.n_acc < 8) {
+            const int32_t pred = h_argmax[cur_node];
+            out_emitted[wp.n_acc] = pred;
+            wp.idx[wp.n_acc] = cur_node;
+            ++wp.n_acc;
+            if (wp.n_acc >= max_emit || wp.n_acc >= 8) break;
+            int next_child = -1;
+            for (int j = cur_node + 1; j < M; ++j) {
+                if (t_par[j] == cur_node && t_tok[j] == pred) {
+                    next_child = j;
+                    break;
+                }
+            }
+            if (next_child < 0) break;
+            cur_node = next_child;
+        }
+
+        const int n_acc = wp.n_acc;
+        const int trunk_kvd = c_.n_kv * c_.head_dim;
+        const bool is_fp8 = (default_kv_dtype_ == KvDtype::FP8_E4M3);
+
+        // 4a. Commit ShortConv (all 48 visits x 4 pools in 2 launches + populate snap/rec for rollback_slot!)
+        k_sconv_commit_tree_pair<<<dim3((trunk_kvd + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<uint16_t*>(d_sconv_k_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_snap_k.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_rec_k.dev_ptr),
+            reinterpret_cast<const uint16_t*>(d_tree_rec_k_.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_v_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_snap_v.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_rec_v.dev_ptr),
+            reinterpret_cast<const uint16_t*>(d_tree_rec_v_.dev_ptr),
+            wp, slot, max_slots_, c_.n_visits, trunk_kvd);
+        k_sconv_commit_tree_pair<<<dim3((c_.hidden + 255) / 256, c_.n_visits), 256, 0, stream_>>>(
+            reinterpret_cast<uint16_t*>(d_sconv_attn_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_snap_attn.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_rec_attn.dev_ptr),
+            reinterpret_cast<const uint16_t*>(d_tree_rec_attn_.dev_ptr),
+            reinterpret_cast<uint16_t*>(d_sconv_mlp_all_.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_snap_mlp.dev_ptr),
+            reinterpret_cast<uint16_t*>(sl.sconv_rec_mlp.dev_ptr),
+            reinterpret_cast<const uint16_t*>(d_tree_rec_mlp_.dev_ptr),
+            wp, slot, max_slots_, c_.n_visits, c_.hidden);
+
+        // 4b. Commit winning path K/V across ALL 48 visits in 1 launch!
+        if (is_fp8) {
+            k3_kv_commit_tree_all<true><<<dim3(n_acc, c_.n_visits), 256, 0, stream_>>>(
+                reinterpret_cast<const KvVisitDesc*>(d_tree_kv_descs_.dev_ptr),
+                reinterpret_cast<const half_t*>(d_tree_k_.dev_ptr),
+                reinterpret_cast<const half_t*>(d_tree_v_.dev_ptr),
+                wp, slot, anchor_pos, c_.n_visits, trunk_kvd);
+        } else {
+            k3_kv_commit_tree_all<false><<<dim3(n_acc, c_.n_visits), 256, 0, stream_>>>(
+                reinterpret_cast<const KvVisitDesc*>(d_tree_kv_descs_.dev_ptr),
+                reinterpret_cast<const half_t*>(d_tree_k_.dev_ptr),
+                reinterpret_cast<const half_t*>(d_tree_v_.dev_ptr),
+                wp, slot, anchor_pos, c_.n_visits, trunk_kvd);
+        }
+
+        // 4c. Commit DSpark context K/V/f_rnn ONLY for the n_acc winning tokens (100% async-safe GPU slot/pos + HIP-graphed!)
+        k_gather_tree_taps4<<<dim3((c_.hidden + 255) / 256, n_acc), 256, 0, stream_>>>(
+            reinterpret_cast<const float*>(sc_taps_[0].dev_ptr),
+            reinterpret_cast<const float*>(sc_taps_[1].dev_ptr),
+            reinterpret_cast<const float*>(sc_taps_[2].dev_ptr),
+            reinterpret_cast<const float*>(sc_taps_[3].dev_ptr),
+            reinterpret_cast<float*>(d_tree_taps_win_[0].dev_ptr),
+            reinterpret_cast<float*>(d_tree_taps_win_[1].dev_ptr),
+            reinterpret_cast<float*>(d_tree_taps_win_[2].dev_ptr),
+            reinterpret_cast<float*>(d_tree_taps_win_[3].dev_ptr),
+            wp, c_.hidden);
+        k_fill_win_slot_pos<<<1, 32, 0, stream_>>>(
+            reinterpret_cast<int32_t*>(sc_slot_ids_.dev_ptr),
+            reinterpret_cast<int32_t*>(sc_pos_.dev_ptr),
+            slot, anchor_pos, n_acc);
+        if (graph_tree_ctx_exec_[n_acc] != nullptr && tctx_graph_gen_[n_acc] == dspark_ptr_gen_ && tctx_graph_B_[n_acc] == scratch_B_) {
+            (void)hipGraphLaunch(graph_tree_ctx_exec_[n_acc], stream_);
+        } else {
+            if (graph_tree_ctx_exec_[n_acc]) {
+                (void)hipGraphExecDestroy(graph_tree_ctx_exec_[n_acc]);
+                graph_tree_ctx_exec_[n_acc] = nullptr;
+            }
+            if (hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal) == hipSuccess) {
+                launch_dspark_ctx_kernels_from(
+                    n_acc,
+                    reinterpret_cast<const float*>(d_tree_taps_win_[0].dev_ptr),
+                    reinterpret_cast<const float*>(d_tree_taps_win_[1].dev_ptr),
+                    reinterpret_cast<const float*>(d_tree_taps_win_[2].dev_ptr),
+                    reinterpret_cast<const float*>(d_tree_taps_win_[3].dev_ptr));
+                hipGraph_t cg = nullptr;
+                if (hipStreamEndCapture(stream_, &cg) == hipSuccess) {
+                    if (hipGraphInstantiate(&graph_tree_ctx_exec_[n_acc], cg, nullptr, nullptr, 0) == hipSuccess) {
+                        tctx_graph_gen_[n_acc] = dspark_ptr_gen_;
+                        tctx_graph_B_[n_acc] = scratch_B_;
+                        (void)hipGraphLaunch(graph_tree_ctx_exec_[n_acc], stream_);
+                    }
+                    (void)hipGraphDestroy(cg);
+                }
+            } else {
+                launch_dspark_ctx_kernels_from(
+                    n_acc,
+                    reinterpret_cast<const float*>(d_tree_taps_win_[0].dev_ptr),
+                    reinterpret_cast<const float*>(d_tree_taps_win_[1].dev_ptr),
+                    reinterpret_cast<const float*>(d_tree_taps_win_[2].dev_ptr),
+                    reinterpret_cast<const float*>(d_tree_taps_win_[3].dev_ptr));
+            }
+        }
+        if (tprof) {
+            (void)hipEventRecord(tev[3], stream_);
+            (void)hipEventSynchronize(tev[3]);
+            float md = 0, mv = 0, mc = 0;
+            (void)hipEventElapsedTime(&md, tev[0], tev[1]);
+            (void)hipEventElapsedTime(&mv, tev[1], tev[2]);
+            (void)hipEventElapsedTime(&mc, tev[2], tev[3]);
+            std::fprintf(stderr, "[TREE-PROF] pos=%d M=%d acc=%d tot=%.2fms | draft=%.2f verify=%.2f commit=%.2f\n",
+                         anchor_pos, M, n_acc, md + mv + mc, md, mv, mc);
+            for (int i = 0; i < 4; ++i) (void)hipEventDestroy(tev[i]);
+        }
+
+        sl.seq_len = anchor_pos + n_acc;
+        sl.dspark_len = anchor_pos + n_acc;
+        sl.has_snap = true;
+        sl.snap_seq_len = anchor_pos;
+        sl.sconv_rec_n = n_acc;
+        sl.dspark_last_draft = 0;
+
+        // Realized-gain adaptive cooldown: protect high-entropy chat prompts while never starving code/math!
+        if (M >= 2) {
+            const float realized = static_cast<float>(n_acc) / static_cast<float>(chosen_cost_ratio);
+            sl.tree_ema_gain = 0.80f * sl.tree_ema_gain + 0.20f * realized;
+            if (sl.tree_ema_gain < 0.82f) {
+                sl.tree_cool_rem = 12;
+            }
+        }
+
+        if (out_drafted) *out_drafted = M - 1;
+        return n_acc;
     }
 
     bool encode_image(const ImageRec& img, std::vector<float>& out_embeds, std::string& err) override {
@@ -1605,7 +2276,9 @@ private:
         };
         return al(ds_cur_, B * D * 4) && al(ds_res_, B * D * 4) && al(ds_h_, B * D * 4) &&
                al(ds_q_, B * q_dim * 4) && al(ds_k_, B * kv_dim * 4) && al(ds_v_, B * kv_dim * 4) &&
-               al(ds_ao_, B * q_dim * 4) && al(ds_mg_, B * inter * 4) && al(ds_mu_, B * inter * 4);
+               al(ds_ao_, B * q_dim * 4) && al(ds_mg_, B * inter * 4) && al(ds_mu_, B * inter * 4) &&
+               al(ds_qkv_, static_cast<size_t>(B) * (q_dim + 2 * kv_dim) * 4) &&
+               al(ds_gu_, static_cast<size_t>(B) * 2 * inter * 4);
     }
 
     bool ensure_dspark_slot_cap(GpuSlotMeta& sl, int need_len, std::string& err) {
@@ -1816,6 +2489,25 @@ private:
             }
         };
 
+        auto run_attnres_norm = [&](const std::vector<const float*>& ptrs, const float* cur_p, const float* q_p,
+                                    const float* nw_p, float* out_p) {
+            BlockPtrs12 bp{};
+            const int nb = static_cast<int>(ptrs.size());
+            for (int i = 0; i < nb && i < 12; ++i) bp.p[i] = ptrs[i];
+            if ((D & 3) == 0 && D <= 4096) {
+                k1_attn_res_mix_norm_fused<<<B, 256, 0, stream_>>>(bp, nb, cur_p, q_p, nw_p, out_p, B, D, c_.rms_eps);
+            } else {
+                k1_attn_res_mix<<<dim3(1, B), 256, 0, stream_>>>(bp, nb, cur_p, q_p, out_p, B, 1, D);
+                k_rms_norm_rows<<<B, 256, 0, stream_>>>(out_p, nw_p, out_p, B, D, c_.rms_eps);
+            }
+        };
+
+        // Pre-prepare DSpark context buffers/ptrs BEFORE HIP Graph capture so update_dspark_ctx_gpu runs 100% INSIDE the graph!
+        const bool do_dspark_ctx = has_dspark_ && batch.capture_taps && h_dspark_fuse_.size() >= 16;
+        if (do_dspark_ctx) {
+            if (!prepare_dspark_ctx_ptrs(batch, err)) return false;
+        }
+
         // Check eligibility for HIP Graph Capture (all distinct slots, all GPU-resident layers, no images/host-taps, want all logits)
         bool all_gpu_layers = true;
         for (bool ok_l : layer_all_gpu_) if (!ok_l) { all_gpu_layers = false; break; }
@@ -1823,11 +2515,12 @@ private:
         for (int b = 0; b < B && all_want_logits; ++b) if (!batch.want_logits[b]) all_want_logits = false;
         const bool need_taps = (taps_out != nullptr) || (has_dspark_ && batch.capture_taps);
 
-        uint64_t kv_gen_sum = 0;
+        uint64_t kv_gen_sum = dspark_ptr_gen_;
         for (const auto& p : swa_pools_) kv_gen_sum += p.pool_gen;
         for (const auto& p : glob_pools_) kv_gen_sum += p.pool_gen;
 
-        const bool use_graph = all_gpu_layers && all_want_logits && max_img_row < 0 && taps_out == nullptr &&
+        const int prof_mode = (std::getenv("STRATA_HIP_PROF") ? std::atoi(std::getenv("STRATA_HIP_PROF")) : 0);
+        const bool use_graph = (prof_mode < 2) && all_gpu_layers && all_want_logits && max_img_row < 0 && taps_out == nullptr &&
                                ((all_distinct_slots && rec_slot < 0 && B <= 64) ||
                                 (!all_distinct_slots && rec_slot >= 0 && n_groups == 1 && B >= 2 && B <= 8));
         const bool is_verify_graph = use_graph && !all_distinct_slots;
@@ -1844,10 +2537,10 @@ private:
             for (int b = 0; b < B; ++b) want_seq[b] = b;
             (void)hipMemcpyAsync(sc_want_idx_.dev_ptr, want_seq.data(), B * 4, hipMemcpyHostToDevice, stream_);
 
-            hipGraphExec_t& g_exec = is_verify_graph ? graph_verify_exec_ : graph_exec_;
+            hipGraphExec_t& g_exec = is_verify_graph ? graph_verify_exec_[B] : graph_exec_;
             const bool g_hit = is_verify_graph
-                ? (g_exec != nullptr && vgraph_B_ == B && vgraph_slot_ == rec_slot &&
-                   vgraph_need_taps_ == need_taps && vgraph_kv_gen_ == kv_gen_sum && vgraph_scratch_B_ == scratch_B_)
+                ? (g_exec != nullptr && vgraph_slot_[B] == rec_slot &&
+                   vgraph_need_taps_[B] == need_taps && vgraph_kv_gen_[B] == kv_gen_sum && vgraph_scratch_B_[B] == scratch_B_)
                 : (g_exec != nullptr && graph_B_ == B && graph_need_taps_ == need_taps &&
                    graph_kv_gen_ == kv_gen_sum && graph_scratch_B_ == scratch_B_);
 
@@ -1856,16 +2549,14 @@ private:
                 for (int b = 0; b < B; ++b) {
                     auto& sl = slots_[batch.slot_ids[b]];
                     sl.seq_len = std::max(sl.seq_len, batch.pos[b] + 1);
-                }
-                if (has_dspark_ && batch.capture_taps && h_dspark_fuse_.size() >= 16) {
-                    if (!update_dspark_ctx_gpu(batch, err)) return false;
+                    if (do_dspark_ctx) sl.dspark_len = std::max(sl.dspark_len, batch.pos[b] + 1);
                 }
                 if (!hip_ok(hipMemcpyAsync(logits_out, sc_logits_.dev_ptr, lbytes, hipMemcpyDeviceToHost, stream_),
                             "logits D2H", err)) return false;
                 return hip_ok(hipStreamSynchronize(stream_), "graph sync", err);
             }
             if (is_verify_graph) {
-                if (graph_verify_exec_) { (void)hipGraphExecDestroy(graph_verify_exec_); graph_verify_exec_ = nullptr; }
+                if (graph_verify_exec_[B]) { (void)hipGraphExecDestroy(graph_verify_exec_[B]); graph_verify_exec_[B] = nullptr; }
             } else {
                 if (graph_exec_) { (void)hipGraphExecDestroy(graph_exec_); graph_exec_ = nullptr; }
             }
@@ -1928,11 +2619,11 @@ private:
         float* moeout = reinterpret_cast<float*>(sc_moe_out_.dev_ptr);
         float* msc   = reinterpret_cast<float*>(sc_m_sconv_.dev_ptr);
 
-        const bool prof_on = (!use_graph && B >= 64 && std::getenv("STRATA_HIP_PROF") && std::atoi(std::getenv("STRATA_HIP_PROF")) != 0);
-        hipEvent_t pev[9]{};
+        const bool prof_on = (!use_graph && ((prof_mode == 1 && B >= 64) || prof_mode >= 2));
+        hipEvent_t pev[11]{};
         double p_acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         if (prof_on) {
-            for (int i = 0; i < 9; ++i) (void)hipEventCreate(&pev[i]);
+            for (int i = 0; i < 11; ++i) (void)hipEventCreate(&pev[i]);
         }
         auto pmark = [&](int idx) {
             if (prof_on) (void)hipEventRecord(pev[idx], stream_);
@@ -1955,17 +2646,26 @@ private:
             const bool is_swa = c_.is_swa[ip] != 0;
             const int kv_slot = c_.visit_kv_slot[visit];
 
-            // k1: AttnRes + optional loop controllers + input RMSNorm (zero unnecessary D2D copies!)
+            // k1: AttnRes + optional loop controllers + input RMSNorm (zero unnecessary D2D copies + fused AttnRes+Norm!)
             float* q_in = in0;
             float* k_in = in1;
             float* v_in = in2;
+            bool attn_norm_done = false;
+            const bool batch3_ctrl = (has_msgs && B <= 12 && (D & 3) == 0);
             if (ip > 0) {
                 const float* q_res = f32_ptr("model.llm.attn_res.attn_queries." + std::to_string(ip - 1));
                 if (is_swa) {
-                    run_attnres(blk_ptrs, cur, q_res, 1, in0);
-                    if (has_msgs) {
-                        (void)hipMemcpyAsync(in1, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
-                        (void)hipMemcpyAsync(in2, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                    if (!has_msgs) {
+                        run_attnres_norm(blk_ptrs, cur, q_res, f32_ptr(p + ".attn_norm.weight"), in0);
+                        k_in = in0;
+                        v_in = in0;
+                        attn_norm_done = true;
+                    } else {
+                        run_attnres(blk_ptrs, cur, q_res, 1, in0);
+                        if (!batch3_ctrl) {
+                            (void)hipMemcpyAsync(in1, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                            (void)hipMemcpyAsync(in2, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                        }
                     }
                 } else {
                     run_attnres(blk_ptrs, cur, q_res, 3, mx3);
@@ -1987,7 +2687,7 @@ private:
             auto run_loop_ctrl = [&](float* target_in, int msg_ch, const std::string& cp) {
                 k1_loop_ctrl_rms<<<B, 256, 0, stream_>>>(target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, B, D);
                 const bool is_bf = trunk_bf16_.count(cp + ".down_weight") > 0;
-                if (B >= 16) {
+                if (B >= 32) {
                     float* cin = reinterpret_cast<float*>(sc_ctrl_in_.dev_ptr);
                     float* cg  = reinterpret_cast<float*>(sc_ctrl_gain_.dev_ptr);
                     float* cf  = reinterpret_cast<float*>(sc_ctrl_forget_.dev_ptr);
@@ -2028,59 +2728,144 @@ private:
                             target_in, msgs, 4, msg_ch, cg, cf, target_in, B, D);
                     }
                 } else if (is_bf) {
-                    k1_loop_ctrl_down<true><<<dim3((c_.gate_rank + 7) / 8, B), 256, 0, stream_>>>(
-                        target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, bf16_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
-                    k1_loop_ctrl_up<true><<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                    if (B <= 4 && (D & 3) == 0) {
+                        k1_loop_ctrl_down_hiocc<true><<<dim3(c_.gate_rank, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, bf16_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
+                    } else {
+                        k1_loop_ctrl_down<true><<<dim3((c_.gate_rank + 7) / 8, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, bf16_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
+                    }
+                    k1_loop_ctrl_up<true><<<dim3((D + 63) / 64, B), 64, 0, stream_>>>(
                         target_in, msgs, 4, msg_ch, ctrl_gate, bf16_ptr(cp + ".gain_weight"), bf16_ptr(cp + ".forget_weight"), target_in, B, D, c_.gate_rank);
                 } else {
-                    k1_loop_ctrl_down<false><<<dim3((c_.gate_rank + 7) / 8, B), 256, 0, stream_>>>(
-                        target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, f32_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
-                    k1_loop_ctrl_up<false><<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                    if (B <= 4 && (D & 3) == 0) {
+                        k1_loop_ctrl_down_hiocc<false><<<dim3(c_.gate_rank, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, f32_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
+                    } else {
+                        k1_loop_ctrl_down<false><<<dim3((c_.gate_rank + 7) / 8, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, f32_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
+                    }
+                    k1_loop_ctrl_up<false><<<dim3((D + 63) / 64, B), 64, 0, stream_>>>(
                         target_in, msgs, 4, msg_ch, ctrl_gate, f32_ptr(cp + ".gain_weight"), f32_ptr(cp + ".forget_weight"), target_in, B, D, c_.gate_rank);
                 }
             };
 
             if (has_msgs) {
                 const char* cnames[3] = {"attn", "k", "v"};
-                float* ins[3] = {in0, in1, in2};
-                for (int j = 0; j < 3; ++j) {
-                    run_loop_ctrl(ins[j], j, p + ".controllers." + cnames[j]);
-                }
-            }
-
-            if (is_swa) {
-                const float* an = f32_ptr(p + ".attn_norm.weight");
-                const float* norm_src0 = (ip == 0 && !has_msgs) ? cur : in0;
-                k_rms_norm_rows<<<B, 256, 0, stream_>>>(norm_src0, an, in0, B, D, c_.rms_eps);
-                if (has_msgs) {
-                    k_rms_norm_rows<<<B, 256, 0, stream_>>>(in1, an, in1, B, D, c_.rms_eps);
-                    k_rms_norm_rows<<<B, 256, 0, stream_>>>(in2, an, in2, B, D, c_.rms_eps);
+                const std::string c0 = p + ".controllers." + cnames[0];
+                const std::string c1 = p + ".controllers." + cnames[1];
+                const std::string c2 = p + ".controllers." + cnames[2];
+                const bool all_bf = (trunk_bf16_.count(c0 + ".down_weight") > 0 &&
+                                     trunk_bf16_.count(c1 + ".down_weight") > 0 &&
+                                     trunk_bf16_.count(c2 + ".down_weight") > 0);
+                const bool all_f32 = (trunk_bf16_.count(c0 + ".down_weight") == 0 &&
+                                      trunk_bf16_.count(c1 + ".down_weight") == 0 &&
+                                      trunk_bf16_.count(c2 + ".down_weight") == 0);
+                if (batch3_ctrl && (all_bf || all_f32)) {
+                    FPtr3 src_p = is_swa ? FPtr3{{in0, in0, in0}} : FPtr3{{in0, in1, in2}};
+                    MutFPtr3 dst_p{{in0, in1, in2}};
+                    float* ic3 = reinterpret_cast<float*>(sc_ctrl_tmp_.dev_ptr);
+                    float* im3 = ic3 + 3 * B;
+                    float* gt3 = im3 + 3 * B;
+                    k1_loop_ctrl_rms3<<<dim3(3, B), 256, 0, stream_>>>(src_p, msgs, ic3, im3, B, D);
+                    if (all_bf) {
+                        Ptr3 wd{{bf16_ptr(c0 + ".down_weight"), bf16_ptr(c1 + ".down_weight"), bf16_ptr(c2 + ".down_weight")}};
+                        Ptr3 wg{{bf16_ptr(c0 + ".gain_weight"), bf16_ptr(c1 + ".gain_weight"), bf16_ptr(c2 + ".gain_weight")}};
+                        Ptr3 wf{{bf16_ptr(c0 + ".forget_weight"), bf16_ptr(c1 + ".forget_weight"), bf16_ptr(c2 + ".forget_weight")}};
+                        k1_loop_ctrl_down_hiocc3<true><<<dim3(c_.gate_rank, B, 3), 256, 0, stream_>>>(
+                            src_p, msgs, ic3, im3, wd, gt3, B, D, c_.gate_rank);
+                        k1_loop_ctrl_up3<true><<<dim3((D + 63) / 64, B, 3), 64, 0, stream_>>>(
+                            src_p, msgs, gt3, wg, wf, dst_p, B, D, c_.gate_rank);
+                    } else {
+                        Ptr3 wd{{f32_ptr(c0 + ".down_weight"), f32_ptr(c1 + ".down_weight"), f32_ptr(c2 + ".down_weight")}};
+                        Ptr3 wg{{f32_ptr(c0 + ".gain_weight"), f32_ptr(c1 + ".gain_weight"), f32_ptr(c2 + ".gain_weight")}};
+                        Ptr3 wf{{f32_ptr(c0 + ".forget_weight"), f32_ptr(c1 + ".forget_weight"), f32_ptr(c2 + ".forget_weight")}};
+                        k1_loop_ctrl_down_hiocc3<false><<<dim3(c_.gate_rank, B, 3), 256, 0, stream_>>>(
+                            src_p, msgs, ic3, im3, wd, gt3, B, D, c_.gate_rank);
+                        k1_loop_ctrl_up3<false><<<dim3((D + 63) / 64, B, 3), 64, 0, stream_>>>(
+                            src_p, msgs, gt3, wg, wf, dst_p, B, D, c_.gate_rank);
+                    }
                 } else {
-                    k_in = in0;
-                    v_in = in0;
+                    if (batch3_ctrl && is_swa) {
+                        (void)hipMemcpyAsync(in1, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                        (void)hipMemcpyAsync(in2, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                    }
+                    float* ins[3] = {in0, in1, in2};
+                    for (int j = 0; j < 3; ++j) {
+                        run_loop_ctrl(ins[j], j, p + ".controllers." + cnames[j]);
+                    }
                 }
-            } else {
-                k_rms_norm_rows<<<B, 256, 0, stream_>>>(in0, f32_ptr(p + ".q_input_norm.weight"), in0, B, D, c_.rms_eps);
-                k_rms_norm_rows<<<B, 256, 0, stream_>>>(in1, f32_ptr(p + ".k_input_norm.weight"), in1, B, D, c_.rms_eps);
-                k_rms_norm_rows<<<B, 256, 0, stream_>>>(in2, f32_ptr(p + ".v_input_norm.weight"), in2, B, D, c_.rms_eps);
             }
 
-            // Batched Q/K/V/R/Sink/Gate projections (1 fused concatenated GEMM + 1-launch splitter!)
+            if (!attn_norm_done) {
+                if (has_msgs && (D & 3) == 0) {
+                    MutFPtr3 io_p{{in0, in1, in2}};
+                    FPtr3 nw_p = is_swa
+                        ? FPtr3{{f32_ptr(p + ".attn_norm.weight"), f32_ptr(p + ".attn_norm.weight"), f32_ptr(p + ".attn_norm.weight")}}
+                        : FPtr3{{f32_ptr(p + ".q_input_norm.weight"), f32_ptr(p + ".k_input_norm.weight"), f32_ptr(p + ".v_input_norm.weight")}};
+                    k_rms_norm_rows3<<<dim3(3, B), 256, 0, stream_>>>(io_p, nw_p, B, D, c_.rms_eps);
+                } else if (is_swa) {
+                    const float* an = f32_ptr(p + ".attn_norm.weight");
+                    const float* norm_src0 = (ip == 0 && !has_msgs) ? cur : in0;
+                    k_rms_norm_rows<<<B, 256, 0, stream_>>>(norm_src0, an, in0, B, D, c_.rms_eps);
+                    if (has_msgs) {
+                        k_rms_norm_rows<<<B, 256, 0, stream_>>>(in1, an, in1, B, D, c_.rms_eps);
+                        k_rms_norm_rows<<<B, 256, 0, stream_>>>(in2, an, in2, B, D, c_.rms_eps);
+                    } else {
+                        k_in = in0;
+                        v_in = in0;
+                    }
+                } else {
+                    if ((D & 3) == 0) {
+                        MutFPtr3 io_p{{in0, in1, in2}};
+                        FPtr3 nw_p{{f32_ptr(p + ".q_input_norm.weight"), f32_ptr(p + ".k_input_norm.weight"), f32_ptr(p + ".v_input_norm.weight")}};
+                        k_rms_norm_rows3<<<dim3(3, B), 256, 0, stream_>>>(io_p, nw_p, B, D, c_.rms_eps);
+                    } else {
+                        k_rms_norm_rows<<<B, 256, 0, stream_>>>(in0, f32_ptr(p + ".q_input_norm.weight"), in0, B, D, c_.rms_eps);
+                        k_rms_norm_rows<<<B, 256, 0, stream_>>>(in1, f32_ptr(p + ".k_input_norm.weight"), in1, B, D, c_.rms_eps);
+                        k_rms_norm_rows<<<B, 256, 0, stream_>>>(in2, f32_ptr(p + ".v_input_norm.weight"), in2, B, D, c_.rms_eps);
+                    }
+                }
+            }
+
+            // Batched Q/K/V/R/Sink/Gate projections (fused direct-scatter GEMV + sink at B=1, concatenated GEMM+split for B>1!)
             pmark(1);
             const int r_dim = c_.n_head * c_.d_rel;
+            bool sink_done = false;
+            const bool sink_is_f32 = (trunk_bf16_.count(p + ".attn.attn_sink_proj.weight") == 0);
             if (trunk_qkvrg_[ip].dev_ptr != nullptr) {
                 const uint16_t* w_cat = reinterpret_cast<const uint16_t*>(trunk_qkvrg_[ip].dev_ptr);
                 float* cat_out = reinterpret_cast<float*>(sc_qkvrg_out_.dev_ptr);
                 if (!has_msgs && is_swa) {
                     const int tot_n = 2 * q_dim + r_dim + 2 * kv_dim;
-                    launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, tot_n, D);
-                    k_split_qkvrg<<<dim3(((tot_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
-                        cat_out, q, r_raw, gatea, k_raw, v_raw, B, q_dim, r_dim, kv_dim, tot_n);
+                    if (B == 1 && D <= 4096 && (D & 7) == 0) {
+                        const int ns = sink_is_f32 ? c_.n_head : 0;
+                        k_bf16_gemv1_qkvrg<<<(tot_n + ns + 7) / 8, 256, 0, stream_>>>(
+                            w_cat, q_in, q, r_raw, gatea, k_raw, v_raw,
+                            sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
+                            sink_is_f32 ? sinks : nullptr,
+                            q_dim, r_dim, kv_dim, tot_n, ns, D);
+                        sink_done = sink_is_f32;
+                    } else {
+                        launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, tot_n, D);
+                        k_split_qkvrg<<<dim3(((tot_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
+                            cat_out, q, r_raw, gatea, k_raw, v_raw, B, q_dim, r_dim, kv_dim, tot_n);
+                    }
                 } else {
                     const int qrg_n = 2 * q_dim + r_dim;
-                    launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, qrg_n, D);
-                    k_split_qkvrg<<<dim3(((qrg_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
-                        cat_out, q, r_raw, gatea, nullptr, nullptr, B, q_dim, r_dim, kv_dim, qrg_n);
+                    if (B == 1 && D <= 4096 && (D & 7) == 0) {
+                        const int ns = sink_is_f32 ? c_.n_head : 0;
+                        k_bf16_gemv1_qkvrg<<<(qrg_n + ns + 7) / 8, 256, 0, stream_>>>(
+                            w_cat, q_in, q, r_raw, gatea, nullptr, nullptr,
+                            sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
+                            sink_is_f32 ? sinks : nullptr,
+                            q_dim, r_dim, kv_dim, qrg_n, ns, D);
+                        sink_done = sink_is_f32;
+                    } else {
+                        launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, qrg_n, D);
+                        k_split_qkvrg<<<dim3(((qrg_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
+                            cat_out, q, r_raw, gatea, nullptr, nullptr, B, q_dim, r_dim, kv_dim, qrg_n);
+                    }
                     launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n) * D, k_in, nullptr, k_raw, B, kv_dim, D);
                     launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n + kv_dim) * D, v_in, nullptr, v_raw, B, kv_dim, D);
                 }
@@ -2091,51 +2876,81 @@ private:
                 launch_trunk_linear(p + ".attn.wr_du.weight", q_in, r_raw, B, r_dim, D);
                 launch_trunk_linear(p + ".attn.gate_attn.weight", q_in, gatea, B, q_dim, D);
             }
-            launch_trunk_linear(p + ".attn.attn_sink_proj.weight", q_in, sinks, B, c_.n_head, D);
+            if (!sink_done) {
+                launch_trunk_linear(p + ".attn.attn_sink_proj.weight", q_in, sinks, B, c_.n_head, D);
+            }
             if (!is_swa) {
                 launch_trunk_linear(p + ".attn.k_sconv.weight_proj", k_in, k_dyn, B, c_.n_kv * 4, D);
                 launch_trunk_linear(p + ".attn.v_sconv.weight_proj", v_in, v_dyn, B, c_.n_kv * 4, D);
             }
 
-            // k2: ShortConv K & V + L2 clip + V RMSNorm + global tau
+            // k2 + k3 prep: ShortConv K & V + super-fused Q/R/K/V Norm+Clip + FP16 Paged KV Store + RelPos Bias Proj!
             pmark(2);
             GpuSlotMeta* rsl = (rec_slot >= 0) ? &slots_[rec_slot] : nullptr;
-            run_sconv(k_raw, p + ".k_sconv", is_swa ? nullptr : k_dyn, d_sconv_k_all_, k_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_k : nullptr, visit);
-            run_sconv(v_raw, p + ".v_sconv", is_swa ? nullptr : v_dyn, d_sconv_v_all_, v_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_v : nullptr, visit);
+            if (all_distinct_slots && rec_slot < 0) {
+                const size_t kv_vstride = static_cast<size_t>(max_slots_) * 3u * static_cast<size_t>(kv_dim) * sizeof(uint16_t);
+                k2_shortconv4_kv_pair<<<dim3((kv_dim + 255) / 256, 2 * B), 256, 0, stream_>>>(
+                    k_raw, reinterpret_cast<const float*>(static_sconv_.at(p + ".k_sconv").dev_ptr),
+                    is_swa ? nullptr : k_dyn, reinterpret_cast<uint16_t*>(d_sconv_k_all_.dev_ptr + visit * kv_vstride), k_cv,
+                    v_raw, reinterpret_cast<const float*>(static_sconv_.at(p + ".v_sconv").dev_ptr),
+                    is_swa ? nullptr : v_dyn, reinterpret_cast<uint16_t*>(d_sconv_v_all_.dev_ptr + visit * kv_vstride), v_cv,
+                    reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), B, kv_dim, c_.n_kv);
+            } else {
+                run_sconv(k_raw, p + ".k_sconv", is_swa ? nullptr : k_dyn, d_sconv_k_all_, k_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_k : nullptr, visit);
+                run_sconv(v_raw, p + ".v_sconv", is_swa ? nullptr : v_dyn, d_sconv_v_all_, v_cv, kv_dim, c_.n_kv, rsl ? &rsl->sconv_rec_v : nullptr, visit);
+            }
 
             const int32_t* pos_dev = reinterpret_cast<const int32_t*>(sc_pos_.dev_ptr);
             const std::string q_sc_k = p + ".attn.q_l2_clip.scale";
             const std::string r_sc_k = p + ".attn.rel_l2_clip.scale";
             const int q_sc_stride = (trunk_f32_.at(q_sc_k).bytes >= static_cast<size_t>(c_.n_head) * c_.head_dim * 4) ? c_.head_dim : 0;
             const int r_sc_stride = (trunk_f32_.at(r_sc_k).bytes >= static_cast<size_t>(c_.n_head) * c_.d_rel * 4) ? c_.d_rel : 0;
-            k2_head_l2_clip<<<dim3(c_.n_head, B), 128, 0, stream_>>>(
-                q, f32_ptr(q_sc_k), q_sc_stride, is_swa ? nullptr : pos_dev, c_.qk_l2_clip, B, c_.n_head, c_.head_dim);
-            k2_head_l2_clip<<<dim3(c_.n_head, B), 128, 0, stream_>>>(
-                r_raw, f32_ptr(r_sc_k), r_sc_stride, is_swa ? nullptr : pos_dev, c_.rel_l2_clip, B, c_.n_head, c_.d_rel);
-            k2_head_l2_clip<<<dim3(c_.n_kv, B), 128, 0, stream_>>>(
-                k_cv, nullptr, 0, nullptr, c_.qk_l2_clip, B, c_.n_kv, c_.head_dim);
-            k_rms_norm_rows<<<B * c_.n_kv, 256, 0, stream_>>>(v_cv, nullptr, v_cv, B * c_.n_kv, c_.head_dim, c_.rms_eps);
-
-            // k3: Paged KV store + RelPos projection + Flash-SWA / Flash-GQA
             VisitKvPool& kvp = is_swa ? swa_pools_[kv_slot] : glob_pools_[kv_slot];
             const int swa_w = is_swa ? c_.swa_win : 0;
-            if (is_fp8) {
-                k3_kv_paged_store<true><<<B, 256, 0, stream_>>>(
-                    k_cv, v_cv, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+            if (!is_fp8 && c_.head_dim <= 128 && c_.d_rel <= 16 && (c_.rel_extent & 3) == 0) {
+                k2_qrkv_kvstore_relpos_fused<<<dim3(2 * c_.n_head + 2 * c_.n_kv, B), 128, 0, stream_>>>(
+                    q, f32_ptr(q_sc_k), q_sc_stride,
+                    r_raw, f32_ptr(r_sc_k), r_sc_stride,
+                    f32_ptr(p + ".attn.rel_logits_proj.proj"), rbias,
+                    k_cv, v_cv,
+                    reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
                     reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
-                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
-                    reinterpret_cast<float*>(kvp.k_scales.dev_ptr), reinterpret_cast<float*>(kvp.v_scales.dev_ptr),
-                    B, c_.n_kv, c_.head_dim, swa_w);
+                    reinterpret_cast<half_t*>(kvp.k_pool.dev_ptr),
+                    reinterpret_cast<half_t*>(kvp.v_pool.dev_ptr),
+                    !is_swa, c_.qk_l2_clip, c_.rel_l2_clip, c_.rms_eps,
+                    B, c_.n_head, c_.n_kv, c_.head_dim, c_.d_rel, swa_w, c_.rel_extent);
             } else {
-                k3_kv_paged_store<false><<<B, 256, 0, stream_>>>(
-                    k_cv, v_cv, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
-                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
-                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
-                    B, c_.n_kv, c_.head_dim, swa_w);
+                if (c_.head_dim <= 128 && c_.d_rel <= 32) {
+                    k2_qrkv_norm_clip_fused<<<dim3(2 * c_.n_head + 2 * c_.n_kv, B), 128, 0, stream_>>>(
+                        q, f32_ptr(q_sc_k), q_sc_stride, r_raw, f32_ptr(r_sc_k), r_sc_stride, k_cv, v_cv,
+                        is_swa ? nullptr : pos_dev, c_.qk_l2_clip, c_.rel_l2_clip, c_.rms_eps,
+                        B, c_.n_head, c_.n_kv, c_.head_dim, c_.d_rel);
+                } else {
+                    k2_head_l2_clip<<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                        q, f32_ptr(q_sc_k), q_sc_stride, is_swa ? nullptr : pos_dev, c_.qk_l2_clip, B, c_.n_head, c_.head_dim);
+                    k2_head_l2_clip<<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                        r_raw, f32_ptr(r_sc_k), r_sc_stride, is_swa ? nullptr : pos_dev, c_.rel_l2_clip, B, c_.n_head, c_.d_rel);
+                    k2_head_l2_clip<<<dim3(c_.n_kv, B), 128, 0, stream_>>>(
+                        k_cv, nullptr, 0, nullptr, c_.qk_l2_clip, B, c_.n_kv, c_.head_dim);
+                    k_rms_norm_rows<<<B * c_.n_kv, 256, 0, stream_>>>(v_cv, nullptr, v_cv, B * c_.n_kv, c_.head_dim, c_.rms_eps);
+                }
+                if (is_fp8) {
+                    k3_kv_paged_store<true><<<B, 256, 0, stream_>>>(
+                        k_cv, v_cv, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                        reinterpret_cast<float*>(kvp.k_scales.dev_ptr), reinterpret_cast<float*>(kvp.v_scales.dev_ptr),
+                        B, c_.n_kv, c_.head_dim, swa_w);
+                } else {
+                    k3_kv_paged_store<false><<<B, 256, 0, stream_>>>(
+                        k_cv, v_cv, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
+                        B, c_.n_kv, c_.head_dim, swa_w);
+                }
+                k_relpos_bias_proj<<<dim3(c_.n_head, B), 256, 0, stream_>>>(
+                    r_raw, f32_ptr(p + ".attn.rel_logits_proj.proj"), pos_dev, rbias, B, c_.n_head, c_.d_rel, c_.rel_extent);
             }
-
-            k_relpos_bias_proj<<<dim3(c_.n_head, B), 256, 0, stream_>>>(
-                r_raw, f32_ptr(p + ".attn.rel_logits_proj.proj"), pos_dev, rbias, B, c_.n_head, c_.d_rel, c_.rel_extent);
 
             pmark(3);
             if (is_contiguous_single_slot && B >= 64 && mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
@@ -2204,52 +3019,103 @@ private:
                     aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
             }
 
-            // O-proj + post-attention ShortConv + AttnRes block boundary rule
+            // O-proj + post-attention ShortConv + AttnRes block boundary rule (1-launch super-fused at B=1 distinct-slot!)
             pmark(4);
-            launch_trunk_linear(p + ".attn.wo_ud.weight", aout, oproj, B, D, q_dim);
-            run_sconv(oproj, p + ".attn_sconv", nullptr, d_sconv_attn_all_, asc, D, 0, rsl ? &rsl->sconv_rec_attn : nullptr, visit);
-
-            if (ip % c_.block_size == 0) {
-                (void)hipMemcpyAsync(sc_blocks_[n_blocks].dev_ptr, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
-                blk_ptrs.push_back(reinterpret_cast<const float*>(sc_blocks_[n_blocks].dev_ptr));
-                ++n_blocks;
-                (void)hipMemcpyAsync(cur, asc, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+            const std::string wo_key = p + ".attn.wo_ud.weight";
+            if (B == 1 && all_distinct_slots && rec_slot < 0 && q_dim <= 4096 && (q_dim & 7) == 0 && trunk_bf16_.count(wo_key) > 0) {
+                const size_t vstride = static_cast<size_t>(max_slots_) * 3u * static_cast<size_t>(D) * sizeof(uint16_t);
+                float* bsave = nullptr;
+                if (ip % c_.block_size == 0) {
+                    bsave = reinterpret_cast<float*>(sc_blocks_[n_blocks].dev_ptr);
+                    blk_ptrs.push_back(bsave);
+                    ++n_blocks;
+                }
+                k_bf16_gemv1_wo_sconv<<<(D + 7) / 8, 256, 0, stream_>>>(
+                    bf16_ptr(wo_key), aout,
+                    reinterpret_cast<const float*>(static_sconv_.at(p + ".attn_sconv").dev_ptr),
+                    reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr),
+                    reinterpret_cast<uint16_t*>(d_sconv_attn_all_.dev_ptr + visit * vstride),
+                    cur, bsave, D, q_dim);
             } else {
-                k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, asc, cur, B * D);
+                launch_trunk_linear(wo_key, aout, oproj, B, D, q_dim);
+                if (ip % c_.block_size == 0) {
+                    run_sconv(oproj, p + ".attn_sconv", nullptr, d_sconv_attn_all_, asc, D, 0, rsl ? &rsl->sconv_rec_attn : nullptr, visit);
+                    (void)hipMemcpyAsync(sc_blocks_[n_blocks].dev_ptr, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                    blk_ptrs.push_back(reinterpret_cast<const float*>(sc_blocks_[n_blocks].dev_ptr));
+                    ++n_blocks;
+                    (void)hipMemcpyAsync(cur, asc, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                } else if (all_distinct_slots && rec_slot < 0) {
+                    const size_t vstride = static_cast<size_t>(max_slots_) * 3u * static_cast<size_t>(D) * sizeof(uint16_t);
+                    k2_sconv_add_inplace<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                        oproj, reinterpret_cast<const float*>(static_sconv_.at(p + ".attn_sconv").dev_ptr),
+                        reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr),
+                        reinterpret_cast<uint16_t*>(d_sconv_attn_all_.dev_ptr + visit * vstride),
+                        cur, B, D);
+                } else {
+                    run_sconv(oproj, p + ".attn_sconv", nullptr, d_sconv_attn_all_, asc, D, 0, rsl ? &rsl->sconv_rec_attn : nullptr, visit);
+                    k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, asc, cur, B * D);
+                }
             }
 
-            // MoE sublayer: AttnRes mlp_queries + optional mlp controller + mlp_norm (cur unmodified -> 0 res copy!)
-            run_attnres(blk_ptrs, cur, f32_ptr("model.llm.attn_res.mlp_queries." + std::to_string(ip)), 1, mlpin);
-            if (has_msgs) {
+            // MoE sublayer: fused AttnRes+mlp_norm when !has_msgs (deletes 24 launches/tok!)
+            if (!has_msgs) {
+                run_attnres_norm(blk_ptrs, cur, f32_ptr("model.llm.attn_res.mlp_queries." + std::to_string(ip)),
+                                 f32_ptr(p + ".mlp_norm.weight"), mlpin);
+            } else {
+                run_attnres(blk_ptrs, cur, f32_ptr("model.llm.attn_res.mlp_queries." + std::to_string(ip)), 1, mlpin);
                 run_loop_ctrl(mlpin, 3, p + ".controllers.mlp");
+                k_rms_norm_rows<<<B, 256, 0, stream_>>>(mlpin, f32_ptr(p + ".mlp_norm.weight"), mlpin, B, D, c_.rms_eps);
             }
-            k_rms_norm_rows<<<B, 256, 0, stream_>>>(mlpin, f32_ptr(p + ".mlp_norm.weight"), mlpin, B, D, c_.rms_eps);
 
-            // k4: Top-8/128 Sigmoid Router (exact route_scale=8.0 & tie-break)
+            // k4: Top-8/128 Sigmoid Router (fused with f32->f16 mlpin conversion for B<=4!)
             pmark(5);
-            if (B >= 64 && trunk_bf16_.count(p + ".mlp.gate.weight") > 0 &&
+            if (B >= 8 && trunk_bf16_.count(p + ".mlp.gate.weight") > 0 &&
                 mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
                 launch_bf16_opt(bf16_ptr(p + ".mlp.gate.weight"), mlpin, nullptr, rlog, B, c_.n_experts, D);
             } else {
                 launch_f32_linear(f32_ptr(p + ".mlp.gate.weight"), mlpin, nullptr, rlog, B, c_.n_experts, D, stream_, mem_info_.gen);
             }
-            k4_moe_router_topk<<<B, 128, 0, stream_>>>(rlog, f32_ptr(p + ".mlp.gate.bias"), tk_i, tk_w, B, c_.top_k, c_.route_scale);
+            const bool fused_router_f16 = (layer_all_gpu_[ip] && B <= 4 && (D & 3) == 0);
+            if (fused_router_f16) {
+                k4_moe_router_topk_f16<<<B, 128, 0, stream_>>>(
+                    rlog, f32_ptr(p + ".mlp.gate.bias"), mlpin, mlpf16, tk_i, tk_w, B, D, c_.top_k, c_.route_scale);
+            } else {
+                k4_moe_router_topk<<<B, 128, 0, stream_>>>(rlog, f32_ptr(p + ".mlp.gate.bias"), tk_i, tk_w, B, c_.top_k, c_.route_scale);
+            }
 
             // MoE Expert Execution:
-            // Fast Path A1 (B <= 4, all GPU-resident): 2-launch ZERO-SYNC active-only direct MoE
+            // Fast Path A1 (B <= 4, all GPU-resident): 2-launch ZERO-SYNC parallel-expert direct MoE (2,304 blocks!)
             // Fast Path A2 (B >= blaslt_moe_min_b_, all GPU-resident, hipBLASLt ready): L3/MALL-resident unpack-once + hipBLASLt FP16 GEMM!
-            // Fast Path A3 (B >= 5, all GPU-resident): 4-launch ZERO-SYNC BM=64 BN=128 Wave32 WMMA Grouped-MoE
+            // Fast Path A3 (B >= 5, all GPU-resident): 4-launch ZERO-SYNC Wave32 WMMA Grouped-MoE
             // Fast Path B1 (Hybrid partial-VRAM, B <= 16): Strata Predictive CPU/RAM Hybrid (GPU VRAM+ElasticCache || Spin-Wait CPU Pool + 3x-Loop Async DMA Prefetch!)
             // Fast Path B2 (Hybrid partial-VRAM, B > 16): Chunked Double-Buffered GPU Matrix-Core Expert Streaming!
+            bool fused_moe_post = false;
             if (layer_all_gpu_[ip] && B <= 4) {
-                k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
+                if (!fused_router_f16) {
+                    k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
+                }
                 const GpuExpertDesc* d_exps = reinterpret_cast<const GpuExpertDesc*>(d_layer_exps_[ip].dev_ptr);
+                pmark(6);
                 k_moe_direct_w13_situ<<<dim3((c_.inter + 3) / 4, B * c_.top_k), 256, 0, stream_>>>(
                     d_exps, tk_i, mlpf16, reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr),
                     B, c_.top_k, D, c_.inter, c_.situ_beta, c_.situ_lb);
-                k_moe_direct_w2_reduce<<<dim3((D + 7) / 8, B), 256, 0, stream_>>>(
-                    d_exps, tk_i, tk_w, reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr),
-                    moeout, B, c_.top_k, D, c_.inter);
+                pmark(7);
+                float* y_part = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
+                k_moe_direct_w2_par<<<dim3((D + 7) / 8, B * c_.top_k), 256, 0, stream_>>>(
+                    d_exps, tk_i, reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr),
+                    y_part, B, c_.top_k, D, c_.inter);
+                if (all_distinct_slots && rec_slot < 0) {
+                    const size_t vstride = static_cast<size_t>(max_slots_) * 3u * static_cast<size_t>(D) * sizeof(uint16_t);
+                    k_moe_reduce_sconv_add<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                        y_part, tk_w, reinterpret_cast<const float*>(static_sconv_.at(p + ".mlp_sconv").dev_ptr),
+                        reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr),
+                        reinterpret_cast<uint16_t*>(d_sconv_mlp_all_.dev_ptr + visit * vstride),
+                        cur, B, c_.top_k, D);
+                    fused_moe_post = true;
+                } else {
+                    k_moe_direct_reduce<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                        y_part, tk_w, moeout, B, c_.top_k, D);
+                }
             } else if (layer_all_gpu_[ip] && B >= blaslt_moe_min_b_ && blaslt_.ready() &&
                        d_exp_w13_f16_.dev_ptr != nullptr && d_exp_w2_f16_.dev_ptr != nullptr && !use_graph) {
                 int32_t* d_off = reinterpret_cast<int32_t*>(sc_exp_off_.dev_ptr);
@@ -2296,7 +3162,7 @@ private:
                 half_t*  d_act = reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr);
                 float*   d_by  = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
                 const int tot_pairs = B * c_.top_k;
-                if (B >= 32) {
+                if (B >= 16) {
                     (void)hipMemsetAsync(d_off, 0, 129 * sizeof(int32_t), stream_);
                     const int cblks = std::min(64, (tot_pairs + 255) / 256);
                     k_moe_count_buckets<<<cblks, 256, 0, stream_>>>(tk_i, d_off, tot_pairs);
@@ -2375,7 +3241,8 @@ private:
                         k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
                         const dim3 g13((2 * c_.inter + 127) / 128, c_.n_experts, 1);
                         const dim3 g2((D + 127) / 128, c_.n_experts, 1);
-                        const bool small_i8 = (mem_info_.gen == AmdGen::Rdna4) && use_i8_moe_wmma_;
+                        // Use exact FP16 WMMA for B < 64 (0.09 ms faster at B=8 AND bit-consistent with B=1 decode!)
+                        const bool small_i8 = false;
                         pmark(6);
                         if (small_i8 && layer_gu_class_[ip] == 0) {
                             k_moe_grouped_w13_situ_wmma_sk_i8<<<g13, 256, 0, stream_>>>(
@@ -2691,9 +3558,11 @@ private:
                     d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
             }
 
-            // Post-MLP ShortConv + residual add (cur unmodified -> in-place add, 0 res copy!)
-            run_sconv(moeout, p + ".mlp_sconv", nullptr, d_sconv_mlp_all_, msc, D, 0, rsl ? &rsl->sconv_rec_mlp : nullptr, visit);
-            k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, msc, cur, B * D);
+            // Post-MLP ShortConv + residual add (already fused into k_moe_reduce_sconv_add for B<=4 decode!)
+            if (!fused_moe_post) {
+                run_sconv(moeout, p + ".mlp_sconv", nullptr, d_sconv_mlp_all_, msc, D, 0, rsl ? &rsl->sconv_rec_mlp : nullptr, visit);
+                k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, msc, cur, B * D);
+            }
             pmark(8);
             pflush();
             ++visit;
@@ -2738,32 +3607,34 @@ private:
             if (!run_visit(ip, false)) return false;
         }
 
-        // 3. Final output depth mix + output_norm
+        // 3. Final output depth mix + output_norm (fused!)
         float* h_norm = reinterpret_cast<float*>(sc_h_norm_.dev_ptr);
-        run_attnres(blk_ptrs, cur, f32_ptr("model.llm.attn_res.output_query"), 1, h_norm);
-        k_rms_norm_rows<<<B, 256, 0, stream_>>>(h_norm, f32_ptr("model.llm.norm.weight"), h_norm, B, D, c_.rms_eps);
+        run_attnres_norm(blk_ptrs, cur, f32_ptr("model.llm.attn_res.output_query"),
+                         f32_ptr("model.llm.norm.weight"), h_norm);
         maybe_tap(c_.n_visits, h_norm);
 
         if (use_graph) {
+            if (do_dspark_ctx) {
+                launch_dspark_ctx_kernels(B);
+            }
             const int V = c_.vocab_unpadded;
             const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
-            k_unembed_softcap<<<dim3((V + 7) / 8, (B + 7) / 8), 256, 0, stream_>>>(
+            k_unembed_softcap<<<dim3((V + 7) / 8, (B + 15) / 16), 256, 0, stream_>>>(
                 unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
                 h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
                 reinterpret_cast<float*>(sc_logits_.dev_ptr), B, V, D, c_.logit_softcap);
 
             hipGraph_t g = nullptr;
             if (!hip_ok(hipStreamEndCapture(stream_, &g), "hipStreamEndCapture", err)) return false;
-            hipGraphExec_t& g_exec = is_verify_graph ? graph_verify_exec_ : graph_exec_;
+            hipGraphExec_t& g_exec = is_verify_graph ? graph_verify_exec_[B] : graph_exec_;
             hipError_t ie = hipGraphInstantiate(&g_exec, g, nullptr, nullptr, 0);
             (void)hipGraphDestroy(g);
             if (!hip_ok(ie, "hipGraphInstantiate", err)) return false;
             if (is_verify_graph) {
-                vgraph_B_ = B;
-                vgraph_slot_ = rec_slot;
-                vgraph_need_taps_ = need_taps;
-                vgraph_kv_gen_ = kv_gen_sum;
-                vgraph_scratch_B_ = scratch_B_;
+                vgraph_slot_[B] = rec_slot;
+                vgraph_need_taps_[B] = need_taps;
+                vgraph_kv_gen_[B] = kv_gen_sum;
+                vgraph_scratch_B_[B] = scratch_B_;
             } else {
                 graph_B_ = B;
                 graph_need_taps_ = need_taps;
@@ -2775,9 +3646,7 @@ private:
             for (int b = 0; b < B; ++b) {
                 auto& sl = slots_[batch.slot_ids[b]];
                 sl.seq_len = std::max(sl.seq_len, batch.pos[b] + 1);
-            }
-            if (has_dspark_ && batch.capture_taps && h_dspark_fuse_.size() >= 16) {
-                if (!update_dspark_ctx_gpu(batch, err)) return false;
+                if (do_dspark_ctx) sl.dspark_len = std::max(sl.dspark_len, batch.pos[b] + 1);
             }
             const size_t lbytes = static_cast<size_t>(B) * V * sizeof(float);
             if (!hip_ok(hipMemcpyAsync(logits_out, sc_logits_.dev_ptr, lbytes, hipMemcpyDeviceToHost, stream_),
@@ -2790,8 +3659,12 @@ private:
             auto& sl = slots_[batch.slot_ids[b]];
             sl.seq_len = std::max(sl.seq_len, batch.pos[b] + 1);
         }
-        if (has_dspark_ && batch.capture_taps && h_dspark_fuse_.size() >= 16) {
-            if (!update_dspark_ctx_gpu(batch, err)) return false;
+        if (do_dspark_ctx) {
+            launch_dspark_ctx_kernels(B);
+            for (int b = 0; b < B; ++b) {
+                auto& sl = slots_[batch.slot_ids[b]];
+                sl.dspark_len = std::max(sl.dspark_len, batch.pos[b] + 1);
+            }
         }
         if (taps_out) {
             for (int k = 0; k < 4; ++k) {
@@ -2815,10 +3688,12 @@ private:
                 }
                 (void)hipMemcpyAsync(sc_want_idx_.dev_ptr, want_idx.data(), n_want * 4, hipMemcpyHostToDevice, stream_);
                 const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
-                k_unembed_softcap<<<dim3((V + 7) / 8, (n_want + 7) / 8), 256, 0, stream_>>>(
+                if (prof_on) (void)hipEventRecord(pev[9], stream_);
+                k_unembed_softcap<<<dim3((V + 7) / 8, (n_want + 15) / 16), 256, 0, stream_>>>(
                     unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
                     h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
                     reinterpret_cast<float*>(sc_logits_.dev_ptr), n_want, V, D, c_.logit_softcap);
+                if (prof_on) (void)hipEventRecord(pev[10], stream_);
                 if (!hip_ok(hipMemcpyAsync(logits_out, sc_logits_.dev_ptr, lbytes, hipMemcpyDeviceToHost, stream_),
                             "logits D2H", err)) return false;
             }
@@ -2828,23 +3703,20 @@ private:
         if (prof_on) {
             double sum = 0.0;
             for (int i = 0; i < 8; ++i) sum += p_acc[i];
+            float unemb_ms = 0.0f;
+            if (logits_out != nullptr) (void)hipEventElapsedTime(&unemb_ms, pev[9], pev[10]);
             std::fprintf(stderr,
-                "[HIP-PROF] B=%d sum=%.1fms (%.1fms/v, %.1f ppts) | res_ctrl=%.1f qkvrg=%.1f sconv_kv=%.1f attn=%.1f wo_post=%.1f moe_prep=%.1f moe_w13=%.1f moe_w2_post=%.1f\n",
-                B, sum, sum / std::max(1, visit), (sum > 0.0 ? B * 1000.0 / sum : 0.0),
+                "[HIP-PROF] B=%d sum=%.2fms unemb=%.2fms tot=%.2fms (%.1f tok/s) | res_ctrl=%.2f qkvrg=%.2f sconv_kv=%.2f attn=%.2f wo_post=%.2f moe_prep=%.2f moe_w13=%.2f moe_w2_post=%.2f\n",
+                B, sum, unemb_ms, sum + unemb_ms, (sum + unemb_ms > 0.0 ? B * 1000.0 / (sum + unemb_ms) : 0.0),
                 p_acc[0], p_acc[1], p_acc[2], p_acc[3], p_acc[4], p_acc[5], p_acc[6], p_acc[7]);
-            for (int i = 0; i < 9; ++i) (void)hipEventDestroy(pev[i]);
+            for (int i = 0; i < 11; ++i) (void)hipEventDestroy(pev[i]);
         }
         free_gpu_buffer(d_img_emb);
         return ok;
     }
 
-    bool update_dspark_ctx_gpu(const StepBatch& batch, std::string& err) {
+    bool prepare_dspark_ctx_ptrs(const StepBatch& batch, std::string& err) {
         const int B = batch.n_tokens;
-        const int D = dspark_cfg_.hidden;
-        const int KV = dspark_cfg_.n_kv;
-        const int hd = dspark_cfg_.head_dim;
-        const int kv_dim = KV * hd;
-
         bool ptrs_changed = false;
         for (int b = 0; b < B; ++b) {
             auto& sl = slots_[batch.slot_ids[b]];
@@ -2865,7 +3737,25 @@ private:
             for (int s = 0; s < max_slots_; ++s) pt[s] = reinterpret_cast<uint16_t*>(slots_[s].dspark_frnn.dev_ptr);
             if (!d_ds_frnn_ptrs_.dev_ptr && !hip_ok(alloc_gpu_buffer(d_ds_frnn_ptrs_, max_slots_ * sizeof(uint16_t*), mem_info_.is_uma), "ds frnn ptrs", err)) return false;
             (void)hipMemcpyAsync(d_ds_frnn_ptrs_.dev_ptr, pt.data(), max_slots_ * sizeof(uint16_t*), hipMemcpyHostToDevice, stream_);
+            ++dspark_ptr_gen_;
         }
+        return true;
+    }
+
+    void launch_dspark_ctx_kernels(int B) {
+        launch_dspark_ctx_kernels_from(
+            B,
+            reinterpret_cast<const float*>(sc_taps_[0].dev_ptr),
+            reinterpret_cast<const float*>(sc_taps_[1].dev_ptr),
+            reinterpret_cast<const float*>(sc_taps_[2].dev_ptr),
+            reinterpret_cast<const float*>(sc_taps_[3].dev_ptr));
+    }
+
+    void launch_dspark_ctx_kernels_from(int B, const float* t0, const float* t1, const float* t2, const float* t3) {
+        const int D = dspark_cfg_.hidden;
+        const int KV = dspark_cfg_.n_kv;
+        const int hd = dspark_cfg_.head_dim;
+        const int kv_dim = KV * hd;
 
         auto softmax4 = [&](int row, float w[4]) {
             float mx = -1e30f, sm = 0.0f;
@@ -2874,10 +3764,6 @@ private:
             for (int i = 0; i < 4; ++i) w[i] /= sm;
         };
 
-        const float* t0 = reinterpret_cast<const float*>(sc_taps_[0].dev_ptr);
-        const float* t1 = reinterpret_cast<const float*>(sc_taps_[1].dev_ptr);
-        const float* t2 = reinterpret_cast<const float*>(sc_taps_[2].dev_ptr);
-        const float* t3 = reinterpret_cast<const float*>(sc_taps_[3].dev_ptr);
         float* ctx = reinterpret_cast<float*>(sc_in0_.dev_ptr);
         float* kc  = reinterpret_cast<float*>(sc_k_conv_.dev_ptr);
         float* vc  = reinterpret_cast<float*>(sc_v_conv_.dev_ptr);
@@ -2905,11 +3791,586 @@ private:
                                                   ds_f32("markov_head.dflare_norm.weight"), ctx, B, D, dspark_cfg_.rms_eps);
         k_dspark_ctx_scatter<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
             ctx, reinterpret_cast<uint16_t* const*>(d_ds_frnn_ptrs_.dev_ptr), sids_d, pos_d, B, D);
-        for (int b = 0; b < B; ++b) {
-            auto& sl = slots_[batch.slot_ids[b]];
-            sl.dspark_len = std::max(sl.dspark_len, batch.pos[b] + 1);
+    }
+
+    bool ensure_tree_scratch(std::string& err) {
+        if (d_tree_meta_.dev_ptr) return true;
+        const int D = c_.hidden;
+        const int kv_dim = c_.n_kv * c_.head_dim;
+        const int rank = dspark_cfg_.markov_rank;
+        const size_t nv = static_cast<size_t>(c_.n_visits);
+        auto al = [&](GpuBuffer& b, size_t bytes) -> bool {
+            return hip_ok(alloc_gpu_buffer(b, bytes, mem_info_.is_uma), "tree scratch", err);
+        };
+        if (!al(d_beam_pool_, kTreePoolMax * sizeof(BeamTreeNode)) ||
+            !al(d_beam_cnt_, sizeof(int32_t)) ||
+            !al(d_beam_tok_, kBeamW * sizeof(int32_t)) ||
+            !al(d_beam_node_, kBeamW * sizeof(int32_t)) ||
+            !al(d_beam_lp_, kBeamW * sizeof(float)) ||
+            !al(d_beam_st_a_, static_cast<size_t>(kBeamW) * rank * sizeof(float)) ||
+            !al(d_beam_st_b_, static_cast<size_t>(kBeamW) * rank * sizeof(float)) ||
+            !al(d_beam_lat_, static_cast<size_t>(kBeamW) * rank * sizeof(float)) ||
+            !al(d_beam_corr_, static_cast<size_t>(kBeamW) * D * sizeof(float)) ||
+            !al(d_beam_scores_, static_cast<size_t>(kBeamW) * 512 * sizeof(float)) ||
+            !al(d_tree_meta_, sizeof(TreeMetaDev)) ||
+            !al(d_tree_k_, nv * kTreeMaxM * kv_dim * sizeof(half_t)) ||
+            !al(d_tree_v_, nv * kTreeMaxM * kv_dim * sizeof(half_t)) ||
+            !al(d_tree_rec_k_, nv * kTreeMaxM * kv_dim * sizeof(uint16_t)) ||
+            !al(d_tree_rec_v_, nv * kTreeMaxM * kv_dim * sizeof(uint16_t)) ||
+            !al(d_tree_rec_attn_, nv * kTreeMaxM * D * sizeof(uint16_t)) ||
+            !al(d_tree_rec_mlp_, nv * kTreeMaxM * D * sizeof(uint16_t)) ||
+            !al(d_tree_h_f16_, static_cast<size_t>(kTreeMaxM) * D * sizeof(half_t)) ||
+            !al(d_tree_arg_v_, static_cast<size_t>(kTreeMaxM) * 256 * sizeof(float)) ||
+            !al(d_tree_arg_i_, static_cast<size_t>(kTreeMaxM) * 256 * sizeof(int32_t)) ||
+            !al(d_tree_arg_out_, static_cast<size_t>(kTreeMaxM) * sizeof(int32_t)) ||
+            !al(d_tree_kv_descs_, nv * sizeof(KvVisitDesc))) {
+            return false;
+        }
+        for (int k = 0; k < 4; ++k) {
+            if (!al(d_tree_taps_win_[k], 8u * static_cast<size_t>(D) * sizeof(float))) return false;
         }
         return true;
+    }
+
+    // Exact 48-Visit Tree Verify + On-GPU Greedy Argmax (100% HIP-Graphable per tree size M=2..12!)
+    bool forward_tree_verify(int B, int slot, uint64_t kv_gen_sum, std::string& err) {
+        if (B < 1 || B > 12) return false;
+        const int tprof_lvl = (std::getenv("STRATA_HIP_TREE_PROF") ? std::atoi(std::getenv("STRATA_HIP_TREE_PROF")) : 0);
+        const bool tprof_detail = (tprof_lvl >= 2);
+        hipGraphExec_t& g_exec = graph_tree_verify_exec_[B];
+        if (!tprof_detail) {
+            if (g_exec != nullptr && tgraph_slot_[B] == slot &&
+                tgraph_kv_gen_[B] == kv_gen_sum && tgraph_scratch_B_[B] == scratch_B_) {
+                return hip_ok(hipGraphLaunch(g_exec, stream_), "tree graph launch", err);
+            }
+            if (g_exec != nullptr) { (void)hipGraphExecDestroy(g_exec); g_exec = nullptr; }
+            if (!hip_ok(hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal), "tree capture begin", err)) return false;
+        }
+        hipEvent_t pev[11]{};
+        double p_acc[8] = {};
+        if (tprof_detail) for (int i = 0; i < 11; ++i) (void)hipEventCreate(&pev[i]);
+        auto pm = [&](int idx) { if (tprof_detail) (void)hipEventRecord(pev[idx], stream_); };
+        auto pf = [&]() {
+            if (!tprof_detail) return;
+            (void)hipEventSynchronize(pev[8]);
+            for (int i = 0; i < 8; ++i) { float ms = 0; (void)hipEventElapsedTime(&ms, pev[i], pev[i+1]); p_acc[i] += ms; }
+        };
+
+        const int D = c_.hidden;
+        const int q_dim = c_.n_head * c_.head_dim;
+        const int kv_dim = c_.n_kv * c_.head_dim;
+        const bool is_fp8 = (default_kv_dtype_ == KvDtype::FP8_E4M3);
+        const TreeMetaDev* d_tm = reinterpret_cast<const TreeMetaDev*>(d_tree_meta_.dev_ptr);
+
+        float* cur = reinterpret_cast<float*>(sc_cur_.dev_ptr);
+        const auto& emb_pk = packed_trunk_.at("model.llm.embed.weight");
+        k_embed_lookup<<<B, 256, 0, stream_>>>(
+            emb_pk.buf.dev_ptr, emb_pk.info.fmt, static_cast<int>(emb_pk.info.rows()),
+            f32_ptr("model.llm.embed_norm.weight"),
+            reinterpret_cast<const int32_t*>(sc_tok_ids_.dev_ptr),
+            reinterpret_cast<const int32_t*>(sc_img_idx_.dev_ptr),
+            nullptr, cur, B, D, c_.rms_eps);
+
+        auto maybe_tap = [&](int visit_id, const float* vec) {
+            for (int k = 0; k < 4 && k < static_cast<int>(dspark_cfg_.target_visits.size()); ++k) {
+                if (dspark_cfg_.target_visits[k] == visit_id) {
+                    (void)hipMemcpyAsync(sc_taps_[k].dev_ptr, vec, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                }
+            }
+        };
+
+        auto run_attnres = [&](const std::vector<const float*>& ptrs, const float* cur_p, const float* q_p,
+                               int nq, float* out_p) {
+            BlockPtrs12 bp{};
+            const int nb = static_cast<int>(ptrs.size());
+            for (int i = 0; i < nb && i < 12; ++i) bp.p[i] = ptrs[i];
+            if (nq == 3) k1_attn_res_mix_multi<3><<<B, 256, 0, stream_>>>(bp, nb, cur_p, q_p, out_p, B, D);
+            else if (nq == 4) k1_attn_res_mix_multi<4><<<B, 256, 0, stream_>>>(bp, nb, cur_p, q_p, out_p, B, D);
+            else k1_attn_res_mix<<<dim3(nq, B), 256, 0, stream_>>>(bp, nb, cur_p, q_p, out_p, B, nq, D);
+        };
+        auto run_attnres_norm = [&](const std::vector<const float*>& ptrs, const float* cur_p, const float* q_p,
+                                    const float* nw_p, float* out_p) {
+            BlockPtrs12 bp{};
+            const int nb = static_cast<int>(ptrs.size());
+            for (int i = 0; i < nb && i < 12; ++i) bp.p[i] = ptrs[i];
+            if ((D & 3) == 0 && D <= 4096) {
+                k1_attn_res_mix_norm_fused<<<B, 256, 0, stream_>>>(bp, nb, cur_p, q_p, nw_p, out_p, B, D, c_.rms_eps);
+            } else {
+                k1_attn_res_mix<<<dim3(1, B), 256, 0, stream_>>>(bp, nb, cur_p, q_p, out_p, B, 1, D);
+                k_rms_norm_rows<<<B, 256, 0, stream_>>>(out_p, nw_p, out_p, B, D, c_.rms_eps);
+            }
+        };
+
+        int n_blocks = 0, n_prelude_blocks = 0, n_bank = 0;
+        std::vector<const float*> blk_ptrs, bank_ptrs;
+
+        float* in0   = reinterpret_cast<float*>(sc_in0_.dev_ptr);
+        float* in1   = reinterpret_cast<float*>(sc_in1_.dev_ptr);
+        float* in2   = reinterpret_cast<float*>(sc_in2_.dev_ptr);
+        float* mx3   = reinterpret_cast<float*>(sc_mx3_.dev_ptr);
+        float* msgs  = reinterpret_cast<float*>(sc_msgs_.dev_ptr);
+        float* q     = reinterpret_cast<float*>(sc_q_.dev_ptr);
+        float* k_raw = reinterpret_cast<float*>(sc_k_raw_.dev_ptr);
+        float* v_raw = reinterpret_cast<float*>(sc_v_raw_.dev_ptr);
+        float* k_cv  = reinterpret_cast<float*>(sc_k_conv_.dev_ptr);
+        float* v_cv  = reinterpret_cast<float*>(sc_v_conv_.dev_ptr);
+        float* r_raw = reinterpret_cast<float*>(sc_r_raw_.dev_ptr);
+        float* rbias = reinterpret_cast<float*>(sc_rel_bias_.dev_ptr);
+        float* sinks = reinterpret_cast<float*>(sc_sinks_.dev_ptr);
+        float* gatea = reinterpret_cast<float*>(sc_gate_a_.dev_ptr);
+        float* k_dyn = reinterpret_cast<float*>(sc_k_dyn_.dev_ptr);
+        float* v_dyn = reinterpret_cast<float*>(sc_v_dyn_.dev_ptr);
+        float* aout  = reinterpret_cast<float*>(sc_attn_out_.dev_ptr);
+        float* oproj = reinterpret_cast<float*>(sc_o_proj_.dev_ptr);
+        float* asc   = reinterpret_cast<float*>(sc_a_sconv_.dev_ptr);
+        float* mlpin = reinterpret_cast<float*>(sc_mlp_in_.dev_ptr);
+        half_t* mlpf16 = reinterpret_cast<half_t*>(sc_mlp_f16_.dev_ptr);
+        float* rlog  = reinterpret_cast<float*>(sc_r_logits_.dev_ptr);
+        int32_t* tk_i = reinterpret_cast<int32_t*>(sc_topk_ids_.dev_ptr);
+        float*   tk_w = reinterpret_cast<float*>(sc_topk_w_.dev_ptr);
+        float* moeout = reinterpret_cast<float*>(sc_moe_out_.dev_ptr);
+        float* msc   = reinterpret_cast<float*>(sc_m_sconv_.dev_ptr);
+
+        int visit = 0;
+        auto run_tree_visit = [&](int ip, bool has_msgs) {
+            pm(0);
+            maybe_tap(visit, cur);
+            const std::string p = "model.llm.layers." + std::to_string(ip);
+            const bool is_swa = c_.is_swa[ip] != 0;
+            const int kv_slot = c_.visit_kv_slot[visit];
+
+            float* q_in = in0;
+            float* k_in = in1;
+            float* v_in = in2;
+            bool attn_norm_done = false;
+            const bool batch3_ctrl = (has_msgs && B <= 12 && (D & 3) == 0);
+            if (ip > 0) {
+                const float* q_res = f32_ptr("model.llm.attn_res.attn_queries." + std::to_string(ip - 1));
+                if (is_swa) {
+                    if (!has_msgs) {
+                        run_attnres_norm(blk_ptrs, cur, q_res, f32_ptr(p + ".attn_norm.weight"), in0);
+                        k_in = in0; v_in = in0; attn_norm_done = true;
+                    } else {
+                        run_attnres(blk_ptrs, cur, q_res, 1, in0);
+                        if (!batch3_ctrl) {
+                            (void)hipMemcpyAsync(in1, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                            (void)hipMemcpyAsync(in2, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                        }
+                    }
+                } else {
+                    run_attnres(blk_ptrs, cur, q_res, 3, mx3);
+                    k_split_attnres3<<<(B * D + 255) / 256, 256, 0, stream_>>>(mx3, in0, in1, in2, B, D);
+                }
+            } else {
+                q_in = in0;
+                if (!is_swa || has_msgs) {
+                    (void)hipMemcpyAsync(in0, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                    (void)hipMemcpyAsync(in1, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                    (void)hipMemcpyAsync(in2, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                }
+            }
+
+            float* ctrl_inv_c = reinterpret_cast<float*>(sc_ctrl_tmp_.dev_ptr);
+            float* ctrl_inv_m = ctrl_inv_c + B;
+            float* ctrl_gate  = ctrl_inv_m + B;
+            auto run_loop_ctrl_one = [&](float* target_in, int msg_ch, const std::string& cp) {
+                k1_loop_ctrl_rms<<<B, 256, 0, stream_>>>(target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, B, D);
+                const bool is_bf = trunk_bf16_.count(cp + ".down_weight") > 0;
+                if (is_bf) {
+                    if (B <= 4 && (D & 3) == 0) {
+                        k1_loop_ctrl_down_hiocc<true><<<dim3(c_.gate_rank, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, bf16_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
+                    } else {
+                        k1_loop_ctrl_down<true><<<dim3((c_.gate_rank + 7) / 8, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, bf16_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
+                    }
+                    k1_loop_ctrl_up<true><<<dim3((D + 63) / 64, B), 64, 0, stream_>>>(
+                        target_in, msgs, 4, msg_ch, ctrl_gate, bf16_ptr(cp + ".gain_weight"), bf16_ptr(cp + ".forget_weight"), target_in, B, D, c_.gate_rank);
+                } else {
+                    if (B <= 4 && (D & 3) == 0) {
+                        k1_loop_ctrl_down_hiocc<false><<<dim3(c_.gate_rank, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, f32_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
+                    } else {
+                        k1_loop_ctrl_down<false><<<dim3((c_.gate_rank + 7) / 8, B), 256, 0, stream_>>>(
+                            target_in, msgs, 4, msg_ch, ctrl_inv_c, ctrl_inv_m, f32_ptr(cp + ".down_weight"), ctrl_gate, B, D, c_.gate_rank);
+                    }
+                    k1_loop_ctrl_up<false><<<dim3((D + 63) / 64, B), 64, 0, stream_>>>(
+                        target_in, msgs, 4, msg_ch, ctrl_gate, f32_ptr(cp + ".gain_weight"), f32_ptr(cp + ".forget_weight"), target_in, B, D, c_.gate_rank);
+                }
+            };
+
+            if (has_msgs) {
+                const char* cnames[3] = {"attn", "k", "v"};
+                const std::string c0 = p + ".controllers." + cnames[0];
+                const std::string c1 = p + ".controllers." + cnames[1];
+                const std::string c2 = p + ".controllers." + cnames[2];
+                const bool all_bf = (trunk_bf16_.count(c0 + ".down_weight") > 0 &&
+                                     trunk_bf16_.count(c1 + ".down_weight") > 0 &&
+                                     trunk_bf16_.count(c2 + ".down_weight") > 0);
+                const bool all_f32 = (trunk_bf16_.count(c0 + ".down_weight") == 0 &&
+                                      trunk_bf16_.count(c1 + ".down_weight") == 0 &&
+                                      trunk_bf16_.count(c2 + ".down_weight") == 0);
+                if (batch3_ctrl && (all_bf || all_f32)) {
+                    FPtr3 src_p = is_swa ? FPtr3{{in0, in0, in0}} : FPtr3{{in0, in1, in2}};
+                    MutFPtr3 dst_p{{in0, in1, in2}};
+                    float* ic3 = reinterpret_cast<float*>(sc_ctrl_tmp_.dev_ptr);
+                    float* im3 = ic3 + 3 * B;
+                    float* gt3 = im3 + 3 * B;
+                    k1_loop_ctrl_rms3<<<dim3(3, B), 256, 0, stream_>>>(src_p, msgs, ic3, im3, B, D);
+                    if (all_bf) {
+                        Ptr3 wd{{bf16_ptr(c0 + ".down_weight"), bf16_ptr(c1 + ".down_weight"), bf16_ptr(c2 + ".down_weight")}};
+                        Ptr3 wg{{bf16_ptr(c0 + ".gain_weight"), bf16_ptr(c1 + ".gain_weight"), bf16_ptr(c2 + ".gain_weight")}};
+                        Ptr3 wf{{bf16_ptr(c0 + ".forget_weight"), bf16_ptr(c1 + ".forget_weight"), bf16_ptr(c2 + ".forget_weight")}};
+                        k1_loop_ctrl_down_hiocc3<true><<<dim3(c_.gate_rank, B, 3), 256, 0, stream_>>>(
+                            src_p, msgs, ic3, im3, wd, gt3, B, D, c_.gate_rank);
+                        k1_loop_ctrl_up3<true><<<dim3((D + 63) / 64, B, 3), 64, 0, stream_>>>(
+                            src_p, msgs, gt3, wg, wf, dst_p, B, D, c_.gate_rank);
+                    } else {
+                        Ptr3 wd{{f32_ptr(c0 + ".down_weight"), f32_ptr(c1 + ".down_weight"), f32_ptr(c2 + ".down_weight")}};
+                        Ptr3 wg{{f32_ptr(c0 + ".gain_weight"), f32_ptr(c1 + ".gain_weight"), f32_ptr(c2 + ".gain_weight")}};
+                        Ptr3 wf{{f32_ptr(c0 + ".forget_weight"), f32_ptr(c1 + ".forget_weight"), f32_ptr(c2 + ".forget_weight")}};
+                        k1_loop_ctrl_down_hiocc3<false><<<dim3(c_.gate_rank, B, 3), 256, 0, stream_>>>(
+                            src_p, msgs, ic3, im3, wd, gt3, B, D, c_.gate_rank);
+                        k1_loop_ctrl_up3<false><<<dim3((D + 63) / 64, B, 3), 64, 0, stream_>>>(
+                            src_p, msgs, gt3, wg, wf, dst_p, B, D, c_.gate_rank);
+                    }
+                } else {
+                    if (batch3_ctrl && is_swa) {
+                        (void)hipMemcpyAsync(in1, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                        (void)hipMemcpyAsync(in2, in0, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                    }
+                    float* ins[3] = {in0, in1, in2};
+                    for (int j = 0; j < 3; ++j) run_loop_ctrl_one(ins[j], j, p + ".controllers." + cnames[j]);
+                }
+            }
+
+            if (!attn_norm_done) {
+                if (has_msgs && (D & 3) == 0) {
+                    MutFPtr3 io_p{{in0, in1, in2}};
+                    FPtr3 nw_p = is_swa
+                        ? FPtr3{{f32_ptr(p + ".attn_norm.weight"), f32_ptr(p + ".attn_norm.weight"), f32_ptr(p + ".attn_norm.weight")}}
+                        : FPtr3{{f32_ptr(p + ".q_input_norm.weight"), f32_ptr(p + ".k_input_norm.weight"), f32_ptr(p + ".v_input_norm.weight")}};
+                    k_rms_norm_rows3<<<dim3(3, B), 256, 0, stream_>>>(io_p, nw_p, B, D, c_.rms_eps);
+                } else if (is_swa) {
+                    const float* an = f32_ptr(p + ".attn_norm.weight");
+                    k_rms_norm_rows<<<B, 256, 0, stream_>>>((ip == 0 && !has_msgs) ? cur : in0, an, in0, B, D, c_.rms_eps);
+                    if (!has_msgs) { k_in = in0; v_in = in0; }
+                } else {
+                    MutFPtr3 io_p{{in0, in1, in2}};
+                    FPtr3 nw_p{{f32_ptr(p + ".q_input_norm.weight"), f32_ptr(p + ".k_input_norm.weight"), f32_ptr(p + ".v_input_norm.weight")}};
+                    k_rms_norm_rows3<<<dim3(3, B), 256, 0, stream_>>>(io_p, nw_p, B, D, c_.rms_eps);
+                }
+            }
+
+            // Q/K/V/R/Sink/Gate projections (fused 1-launch GEMV+sink at B=1, concatenated GEMM+split for B>=2!)
+            pm(1);
+            const int r_dim = c_.n_head * c_.d_rel;
+            bool sink_done = false;
+            const bool sink_is_f32 = (trunk_bf16_.count(p + ".attn.attn_sink_proj.weight") == 0);
+            if (trunk_qkvrg_[ip].dev_ptr != nullptr) {
+                const uint16_t* w_cat = reinterpret_cast<const uint16_t*>(trunk_qkvrg_[ip].dev_ptr);
+                float* cat_out = reinterpret_cast<float*>(sc_qkvrg_out_.dev_ptr);
+                if (!has_msgs && is_swa) {
+                    const int tot_n = 2 * q_dim + r_dim + 2 * kv_dim;
+                    if (B == 1 && D <= 4096 && (D & 7) == 0) {
+                        const int ns = sink_is_f32 ? c_.n_head : 0;
+                        k_bf16_gemv1_qkvrg<<<(tot_n + ns + 7) / 8, 256, 0, stream_>>>(
+                            w_cat, q_in, q, r_raw, gatea, k_raw, v_raw,
+                            sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
+                            sink_is_f32 ? sinks : nullptr,
+                            q_dim, r_dim, kv_dim, tot_n, ns, D);
+                        sink_done = sink_is_f32;
+                    } else {
+                        launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, tot_n, D);
+                        k_split_qkvrg<<<dim3(((tot_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
+                            cat_out, q, r_raw, gatea, k_raw, v_raw, B, q_dim, r_dim, kv_dim, tot_n);
+                    }
+                } else {
+                    const int qrg_n = 2 * q_dim + r_dim;
+                    if (B == 1 && D <= 4096 && (D & 7) == 0) {
+                        const int ns = sink_is_f32 ? c_.n_head : 0;
+                        k_bf16_gemv1_qkvrg<<<(qrg_n + ns + 7) / 8, 256, 0, stream_>>>(
+                            w_cat, q_in, q, r_raw, gatea, nullptr, nullptr,
+                            sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
+                            sink_is_f32 ? sinks : nullptr,
+                            q_dim, r_dim, kv_dim, qrg_n, ns, D);
+                        sink_done = sink_is_f32;
+                    } else {
+                        launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, qrg_n, D);
+                        k_split_qkvrg<<<dim3(((qrg_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
+                            cat_out, q, r_raw, gatea, nullptr, nullptr, B, q_dim, r_dim, kv_dim, qrg_n);
+                    }
+                    launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n) * D, k_in, nullptr, k_raw, B, kv_dim, D);
+                    launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n + kv_dim) * D, v_in, nullptr, v_raw, B, kv_dim, D);
+                }
+            } else {
+                launch_trunk_linear(p + ".attn.wq_du.weight", q_in, q, B, q_dim, D);
+                launch_trunk_linear(p + ".attn.wk_dv.weight", k_in, k_raw, B, kv_dim, D);
+                launch_trunk_linear(p + ".attn.wv_dv.weight", v_in, v_raw, B, kv_dim, D);
+                launch_trunk_linear(p + ".attn.wr_du.weight", q_in, r_raw, B, r_dim, D);
+                launch_trunk_linear(p + ".attn.gate_attn.weight", q_in, gatea, B, q_dim, D);
+            }
+            if (!sink_done) {
+                launch_trunk_linear(p + ".attn.attn_sink_proj.weight", q_in, sinks, B, c_.n_head, D);
+            }
+            if (!is_swa) {
+                launch_trunk_linear(p + ".attn.k_sconv.weight_proj", k_in, k_dyn, B, c_.n_kv * 4, D);
+                launch_trunk_linear(p + ".attn.v_sconv.weight_proj", v_in, v_dyn, B, c_.n_kv * 4, D);
+            }
+
+            // Tree ShortConv K & V (records BF16 input into d_tree_rec_k/v WITHOUT mutating hist_pool!)
+            pm(2);
+            const size_t kv_vstride = static_cast<size_t>(max_slots_) * 3u * static_cast<size_t>(kv_dim) * sizeof(uint16_t);
+            const size_t kv_trec_st = static_cast<size_t>(kTreeMaxM) * static_cast<size_t>(kv_dim);
+            k2_shortconv4_tree<<<dim3((kv_dim + 255) / 256, B), 256, 0, stream_>>>(
+                k_raw, reinterpret_cast<const float*>(static_sconv_.at(p + ".k_sconv").dev_ptr),
+                is_swa ? nullptr : k_dyn, d_tm,
+                reinterpret_cast<const uint16_t*>(d_sconv_k_all_.dev_ptr + visit * kv_vstride),
+                reinterpret_cast<uint16_t*>(d_tree_rec_k_.dev_ptr) + visit * kv_trec_st,
+                k_cv, B, kv_dim, c_.n_kv);
+            k2_shortconv4_tree<<<dim3((kv_dim + 255) / 256, B), 256, 0, stream_>>>(
+                v_raw, reinterpret_cast<const float*>(static_sconv_.at(p + ".v_sconv").dev_ptr),
+                is_swa ? nullptr : v_dyn, d_tm,
+                reinterpret_cast<const uint16_t*>(d_sconv_v_all_.dev_ptr + visit * kv_vstride),
+                reinterpret_cast<uint16_t*>(d_tree_rec_v_.dev_ptr) + visit * kv_trec_st,
+                v_cv, B, kv_dim, c_.n_kv);
+
+            // Super-fused Q/R/K/V Norm+Clip + Direct Tree Scratch KV Store + RelPos Bias Proj
+            const int32_t* pos_dev = reinterpret_cast<const int32_t*>(sc_pos_.dev_ptr);
+            const std::string q_sc_k = p + ".attn.q_l2_clip.scale";
+            const std::string r_sc_k = p + ".attn.rel_l2_clip.scale";
+            const int q_sc_stride = (trunk_f32_.at(q_sc_k).bytes >= static_cast<size_t>(c_.n_head) * c_.head_dim * 4) ? c_.head_dim : 0;
+            const int r_sc_stride = (trunk_f32_.at(r_sc_k).bytes >= static_cast<size_t>(c_.n_head) * c_.d_rel * 4) ? c_.d_rel : 0;
+            half_t* tk_v = reinterpret_cast<half_t*>(d_tree_k_.dev_ptr) + visit * kv_trec_st;
+            half_t* tv_v = reinterpret_cast<half_t*>(d_tree_v_.dev_ptr) + visit * kv_trec_st;
+            k2_qrkv_treestore_relpos_fused<<<dim3(2 * c_.n_head + 2 * c_.n_kv, B), 128, 0, stream_>>>(
+                q, f32_ptr(q_sc_k), q_sc_stride,
+                r_raw, f32_ptr(r_sc_k), r_sc_stride,
+                f32_ptr(p + ".attn.rel_logits_proj.proj"), rbias,
+                k_cv, v_cv, pos_dev, tk_v, tv_v,
+                !is_swa, c_.qk_l2_clip, c_.rel_l2_clip, c_.rms_eps,
+                B, c_.n_head, c_.n_kv, c_.head_dim, c_.d_rel, c_.rel_extent);
+
+            // Tree Flash-SWA / Flash-GQA Attention (committed prefix + bitmask tree ancestors!)
+            pm(3);
+            VisitKvPool& kvp = is_swa ? swa_pools_[kv_slot] : glob_pools_[kv_slot];
+            const int swa_w = is_swa ? c_.swa_win : 0;
+            if (is_fp8) {
+                k3_flash_swa_gqa_tree<true><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                    q, gatea, rbias, sinks, d_tm, pos_dev,
+                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                    reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                    tk_v, tv_v, aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+            } else {
+                k3_flash_swa_gqa_tree<false><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                    q, gatea, rbias, sinks, d_tm, pos_dev,
+                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
+                    tk_v, tv_v, aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+            }
+
+            // O-proj + Tree post-attn ShortConv + AttnRes block boundary
+            pm(4);
+            launch_trunk_linear(p + ".attn.wo_ud.weight", aout, oproj, B, D, q_dim);
+            const size_t h_vstride = static_cast<size_t>(max_slots_) * 3u * static_cast<size_t>(D) * sizeof(uint16_t);
+            const size_t h_trec_st = static_cast<size_t>(kTreeMaxM) * static_cast<size_t>(D);
+            k2_shortconv4_tree<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                oproj, reinterpret_cast<const float*>(static_sconv_.at(p + ".attn_sconv").dev_ptr),
+                nullptr, d_tm,
+                reinterpret_cast<const uint16_t*>(d_sconv_attn_all_.dev_ptr + visit * h_vstride),
+                reinterpret_cast<uint16_t*>(d_tree_rec_attn_.dev_ptr) + visit * h_trec_st,
+                asc, B, D, 0);
+            if (ip % c_.block_size == 0) {
+                (void)hipMemcpyAsync(sc_blocks_[n_blocks].dev_ptr, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                blk_ptrs.push_back(reinterpret_cast<const float*>(sc_blocks_[n_blocks].dev_ptr));
+                ++n_blocks;
+                (void)hipMemcpyAsync(cur, asc, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+            } else {
+                k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, asc, cur, B * D);
+            }
+
+            // MoE sublayer
+            if (!has_msgs) {
+                run_attnres_norm(blk_ptrs, cur, f32_ptr("model.llm.attn_res.mlp_queries." + std::to_string(ip)),
+                                 f32_ptr(p + ".mlp_norm.weight"), mlpin);
+            } else {
+                run_attnres(blk_ptrs, cur, f32_ptr("model.llm.attn_res.mlp_queries." + std::to_string(ip)), 1, mlpin);
+                run_loop_ctrl_one(mlpin, 3, p + ".controllers.mlp");
+                k_rms_norm_rows<<<B, 256, 0, stream_>>>(mlpin, f32_ptr(p + ".mlp_norm.weight"), mlpin, B, D, c_.rms_eps);
+            }
+
+            pm(5);
+            if (B >= 8 && trunk_bf16_.count(p + ".mlp.gate.weight") > 0 &&
+                mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
+                launch_bf16_opt(bf16_ptr(p + ".mlp.gate.weight"), mlpin, nullptr, rlog, B, c_.n_experts, D);
+            } else {
+                launch_f32_linear(f32_ptr(p + ".mlp.gate.weight"), mlpin, nullptr, rlog, B, c_.n_experts, D, stream_, mem_info_.gen);
+            }
+            const bool use_direct_moe = (B <= 6);
+            const bool fused_router_f16 = ((D & 3) == 0);
+            if (fused_router_f16) {
+                k4_moe_router_topk_f16<<<B, 128, 0, stream_>>>(
+                    rlog, f32_ptr(p + ".mlp.gate.bias"), mlpin, mlpf16, tk_i, tk_w, B, D, c_.top_k, c_.route_scale);
+            } else {
+                k4_moe_router_topk<<<B, 128, 0, stream_>>>(rlog, f32_ptr(p + ".mlp.gate.bias"), tk_i, tk_w, B, c_.top_k, c_.route_scale);
+            }
+
+            const GpuExpertDesc* d_exps = reinterpret_cast<const GpuExpertDesc*>(d_layer_exps_[ip].dev_ptr);
+            if (use_direct_moe) {
+                if (!fused_router_f16) k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
+                pm(6);
+                k_moe_direct_w13_situ<<<dim3((c_.inter + 3) / 4, B * c_.top_k), 256, 0, stream_>>>(
+                    d_exps, tk_i, mlpf16, reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr),
+                    B, c_.top_k, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                pm(7);
+                float* y_part = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
+                k_moe_direct_w2_par<<<dim3((D + 7) / 8, B * c_.top_k), 256, 0, stream_>>>(
+                    d_exps, tk_i, reinterpret_cast<const half_t*>(sc_moe_act_.dev_ptr),
+                    y_part, B, c_.top_k, D, c_.inter);
+                k_moe_direct_reduce<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                    y_part, tk_w, moeout, B, c_.top_k, D);
+            } else {
+                // Wave-7E: WMMA Grouped-MoE for B>=7 on RDNA3/3.5/4 (zero-WMMA register grouped MoE on RDNA2!)
+                int32_t* d_off = reinterpret_cast<int32_t*>(sc_exp_off_.dev_ptr);
+                int32_t* d_btk = reinterpret_cast<int32_t*>(sc_bucket_tok_.dev_ptr);
+                int32_t* d_s2b = reinterpret_cast<int32_t*>(sc_slotk_bidx_.dev_ptr);
+                half_t*  d_act = reinterpret_cast<half_t*>(sc_moe_act_.dev_ptr);
+                float*   d_by  = reinterpret_cast<float*>(sc_bucket_y_.dev_ptr);
+                k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
+                if (!fused_router_f16) k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(mlpin, mlpf16, B * D);
+                if (mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
+                    const dim3 g13((2 * c_.inter + 127) / 128, c_.n_experts, 1);
+                    const dim3 g2((D + 127) / 128, c_.n_experts, 1);
+                    pm(6);
+                    k_moe_grouped_w13_situ_wmma<<<g13, 256, 0, stream_>>>(
+                        d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                    pm(7);
+                    k_moe_grouped_w2_wmma<<<g2, 256, 0, stream_>>>(
+                        d_exps, d_off, d_act, d_by, D, c_.inter);
+                } else {
+                    pm(6);
+                    k_moe_grouped_w13_situ<<<dim3((c_.inter + 3) / 4, c_.n_experts), 256, 0, stream_>>>(
+                        d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                    pm(7);
+                    k_moe_grouped_w2<<<dim3((D + 7) / 8, c_.n_experts), 256, 0, stream_>>>(
+                        d_exps, d_off, d_act, d_by, D, c_.inter);
+                }
+                k_moe_reduce_buckets<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                    d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
+            }
+
+            // Tree post-MLP ShortConv + residual add
+            k2_shortconv4_tree<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
+                moeout, reinterpret_cast<const float*>(static_sconv_.at(p + ".mlp_sconv").dev_ptr),
+                nullptr, d_tm,
+                reinterpret_cast<const uint16_t*>(d_sconv_mlp_all_.dev_ptr + visit * h_vstride),
+                reinterpret_cast<uint16_t*>(d_tree_rec_mlp_.dev_ptr) + visit * h_trec_st,
+                msc, B, D, 0);
+            k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, msc, cur, B * D);
+            pm(8);
+            pf();
+            ++visit;
+        };
+
+        for (int ip = 0; ip < c_.core_start; ++ip) run_tree_visit(ip, false);
+        (void)hipMemcpyAsync(sc_prelude_.dev_ptr, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+        n_prelude_blocks = n_blocks;
+        for (int p_idx = 0; p_idx < c_.num_passes; ++p_idx) {
+            if (p_idx > 0) {
+                bank_ptrs.clear();
+                n_bank = 0;
+                for (int k = n_prelude_blocks + 1; k < n_blocks; ++k) {
+                    (void)hipMemcpyAsync(sc_bank_[n_bank].dev_ptr, sc_blocks_[k].dev_ptr, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                    bank_ptrs.push_back(reinterpret_cast<const float*>(sc_bank_[n_bank].dev_ptr));
+                    ++n_bank;
+                }
+                (void)hipMemcpyAsync(sc_bank_out_.dev_ptr, cur, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                (void)hipMemcpyAsync(cur, sc_prelude_.dev_ptr, static_cast<size_t>(B) * D * 4, hipMemcpyDeviceToDevice, stream_);
+                n_blocks = n_prelude_blocks;
+                blk_ptrs.resize(n_prelude_blocks);
+            }
+            for (int ip = c_.core_start; ip < c_.core_end; ++ip) {
+                if (p_idx > 0) {
+                    run_attnres(bank_ptrs, reinterpret_cast<const float*>(sc_bank_out_.dev_ptr),
+                                reinterpret_cast<const float*>(d_msg_queries_[ip].dev_ptr), 4, msgs);
+                }
+                run_tree_visit(ip, p_idx > 0);
+            }
+        }
+        for (int ip = c_.core_end; ip < c_.n_phys; ++ip) run_tree_visit(ip, false);
+
+        // Final output norm + tap + Zero-Logits-D2H Batched Unembed Argmax!
+        float* h_norm = reinterpret_cast<float*>(sc_h_norm_.dev_ptr);
+        run_attnres_norm(blk_ptrs, cur, f32_ptr("model.llm.attn_res.output_query"),
+                         f32_ptr("model.llm.norm.weight"), h_norm);
+        maybe_tap(c_.n_visits, h_norm);
+
+        const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
+        const int V = c_.vocab_unpadded;
+        constexpr int kArgBlks = 256;
+        half_t* h_f16 = reinterpret_cast<half_t*>(d_tree_h_f16_.dev_ptr);
+        pm(9);
+        k_f32_to_f16<<<(B * D + 255) / 256, 256, 0, stream_>>>(h_norm, h_f16, B * D);
+        if (B <= 4) {
+            k_unembed_argmax_batch_stage1<4><<<kArgBlks, 256, 0, stream_>>>(
+                unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
+                h_norm, h_f16,
+                reinterpret_cast<float*>(d_tree_arg_v_.dev_ptr),
+                reinterpret_cast<int32_t*>(d_tree_arg_i_.dev_ptr),
+                B, V, D);
+        } else if (B <= 6) {
+            k_unembed_argmax_batch_stage1<6><<<kArgBlks, 256, 0, stream_>>>(
+                unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
+                h_norm, h_f16,
+                reinterpret_cast<float*>(d_tree_arg_v_.dev_ptr),
+                reinterpret_cast<int32_t*>(d_tree_arg_i_.dev_ptr),
+                B, V, D);
+        } else if (B <= 8) {
+            k_unembed_argmax_batch_stage1<8><<<kArgBlks, 256, 0, stream_>>>(
+                unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
+                h_norm, h_f16,
+                reinterpret_cast<float*>(d_tree_arg_v_.dev_ptr),
+                reinterpret_cast<int32_t*>(d_tree_arg_i_.dev_ptr),
+                B, V, D);
+        } else {
+            k_unembed_argmax_batch_stage1<12><<<kArgBlks, 256, 0, stream_>>>(
+                unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
+                h_norm, h_f16,
+                reinterpret_cast<float*>(d_tree_arg_v_.dev_ptr),
+                reinterpret_cast<int32_t*>(d_tree_arg_i_.dev_ptr),
+                B, V, D);
+        }
+        k_unembed_argmax_batch_stage2<<<B, 256, 0, stream_>>>(
+            reinterpret_cast<const float*>(d_tree_arg_v_.dev_ptr),
+            reinterpret_cast<const int32_t*>(d_tree_arg_i_.dev_ptr),
+            reinterpret_cast<int32_t*>(d_tree_arg_out_.dev_ptr),
+            B, kArgBlks);
+        pm(10);
+
+        if (tprof_detail) {
+            (void)hipEventSynchronize(pev[10]);
+            double sum = 0.0;
+            for (int i = 0; i < 8; ++i) sum += p_acc[i];
+            float unemb_ms = 0.0f;
+            (void)hipEventElapsedTime(&unemb_ms, pev[9], pev[10]);
+            std::fprintf(stderr,
+                "[TREE-DETAIL] B=%d sum=%.2fms unemb=%.2fms tot=%.2fms | res_ctrl=%.2f qkvrg=%.2f sconv_kv=%.2f attn=%.2f wo_post=%.2f moe_prep=%.2f moe_w13=%.2f moe_w2_post=%.2f\n",
+                B, sum, unemb_ms, sum + unemb_ms,
+                p_acc[0], p_acc[1], p_acc[2], p_acc[3], p_acc[4], p_acc[5], p_acc[6], p_acc[7]);
+            for (int i = 0; i < 11; ++i) (void)hipEventDestroy(pev[i]);
+            return true;
+        }
+
+        hipGraph_t g = nullptr;
+        if (!hip_ok(hipStreamEndCapture(stream_, &g), "tree capture end", err)) return false;
+        hipError_t ie = hipGraphInstantiate(&g_exec, g, nullptr, nullptr, 0);
+        (void)hipGraphDestroy(g);
+        if (!hip_ok(ie, "tree graph instantiate", err)) return false;
+        tgraph_slot_[B] = slot;
+        tgraph_kv_gen_[B] = kv_gen_sum;
+        tgraph_scratch_B_[B] = scratch_B_;
+        return hip_ok(hipGraphLaunch(g_exec, stream_), "tree graph launch(first)", err);
     }
 
     void invalidate_graph() {
@@ -2917,17 +4378,51 @@ private:
             (void)hipGraphExecDestroy(graph_exec_);
             graph_exec_ = nullptr;
         }
-        if (graph_verify_exec_) {
-            (void)hipGraphExecDestroy(graph_verify_exec_);
-            graph_verify_exec_ = nullptr;
+        for (int b = 0; b <= 8; ++b) {
+            if (graph_verify_exec_[b]) {
+                (void)hipGraphExecDestroy(graph_verify_exec_[b]);
+                graph_verify_exec_[b] = nullptr;
+            }
+            vgraph_slot_[b] = -1;
+            vgraph_need_taps_[b] = false;
+            vgraph_kv_gen_[b] = 0;
+            vgraph_scratch_B_[b] = 0;
         }
+        for (int k = 0; k < 8; ++k) {
+            if (graph_dspark_exec_[k]) {
+                (void)hipGraphExecDestroy(graph_dspark_exec_[k]);
+                graph_dspark_exec_[k] = nullptr;
+            }
+            ds_graph_slot_[k] = -1;
+            ds_graph_gen_[k] = 0;
+        }
+        if (graph_beam_draft_exec_) {
+            (void)hipGraphExecDestroy(graph_beam_draft_exec_);
+            graph_beam_draft_exec_ = nullptr;
+        }
+        beam_graph_slot_ = -1;
+        beam_graph_gen_ = 0;
+        for (int b = 0; b <= 12; ++b) {
+            if (graph_tree_verify_exec_[b]) {
+                (void)hipGraphExecDestroy(graph_tree_verify_exec_[b]);
+                graph_tree_verify_exec_[b] = nullptr;
+            }
+            tgraph_slot_[b] = -1;
+            tgraph_kv_gen_[b] = 0;
+            tgraph_scratch_B_[b] = 0;
+        }
+        for (int k = 0; k <= 8; ++k) {
+            if (graph_tree_ctx_exec_[k]) {
+                (void)hipGraphExecDestroy(graph_tree_ctx_exec_[k]);
+                graph_tree_ctx_exec_[k] = nullptr;
+            }
+            tctx_graph_gen_[k] = 0;
+            tctx_graph_B_[k] = 0;
+        }
+        tree_kv_desc_gen_ = 0;
         graph_B_ = 0;
         graph_kv_gen_ = 0;
         graph_scratch_B_ = 0;
-        vgraph_B_ = 0;
-        vgraph_slot_ = -1;
-        vgraph_kv_gen_ = 0;
-        vgraph_scratch_B_ = 0;
     }
 
     void cleanup() {
@@ -2953,6 +4448,9 @@ private:
         for (auto& kv : packed_trunk_) free_gpu_buffer(kv.second.buf);
         for (auto& kv : static_sconv_) free_gpu_buffer(kv.second);
         for (auto& b : d_msg_queries_) free_gpu_buffer(b);
+        for (auto& b : dspark_qkv_) free_gpu_buffer(b);
+        for (auto& b : dspark_gu_) free_gpu_buffer(b);
+        dspark_qkv_.clear(); dspark_gu_.clear();
         for (auto& kv : dspark_bf16_) free_gpu_buffer(kv.second);
         for (auto& kv : dspark_f32_) free_gpu_buffer(kv.second);
         for (auto& b : d_layer_exps_) free_gpu_buffer(b);
@@ -2968,6 +4466,18 @@ private:
         free_gpu_buffer(ds_cur_); free_gpu_buffer(ds_res_); free_gpu_buffer(ds_h_);
         free_gpu_buffer(ds_q_); free_gpu_buffer(ds_k_); free_gpu_buffer(ds_v_);
         free_gpu_buffer(ds_ao_); free_gpu_buffer(ds_mg_); free_gpu_buffer(ds_mu_);
+        free_gpu_buffer(ds_qkv_); free_gpu_buffer(ds_gu_);
+        free_gpu_buffer(d_beam_pool_); free_gpu_buffer(d_beam_cnt_);
+        free_gpu_buffer(d_beam_tok_); free_gpu_buffer(d_beam_node_); free_gpu_buffer(d_beam_lp_);
+        free_gpu_buffer(d_beam_st_a_); free_gpu_buffer(d_beam_st_b_); free_gpu_buffer(d_beam_lat_);
+        free_gpu_buffer(d_beam_corr_); free_gpu_buffer(d_beam_scores_);
+        free_gpu_buffer(d_tree_meta_); free_gpu_buffer(d_tree_k_); free_gpu_buffer(d_tree_v_);
+        free_gpu_buffer(d_tree_rec_k_); free_gpu_buffer(d_tree_rec_v_);
+        free_gpu_buffer(d_tree_rec_attn_); free_gpu_buffer(d_tree_rec_mlp_);
+        free_gpu_buffer(d_tree_h_f16_); free_gpu_buffer(d_tree_arg_v_);
+        free_gpu_buffer(d_tree_arg_i_); free_gpu_buffer(d_tree_arg_out_);
+        free_gpu_buffer(d_tree_kv_descs_);
+        for (int k = 0; k < 4; ++k) free_gpu_buffer(d_tree_taps_win_[k]);
         for (int i = 0; i < 3; ++i) { free_gpu_buffer(d_ds_k_ptrs_[i]); free_gpu_buffer(d_ds_v_ptrs_[i]); }
         free_gpu_buffer(d_ds_frnn_ptrs_);
         free_gpu_buffer(sc_slot_ids_); free_gpu_buffer(sc_pos_); free_gpu_buffer(sc_tok_ids_); free_gpu_buffer(sc_img_idx_);
@@ -3022,13 +4532,16 @@ private:
     std::unordered_map<std::string, std::vector<float>> host_tmp_;
     std::vector<GpuBuffer> d_msg_queries_;
 
+    std::vector<GpuBuffer> dspark_qkv_;
+    std::vector<GpuBuffer> dspark_gu_;
     std::unordered_map<std::string, GpuBuffer> dspark_bf16_;
     std::unordered_map<std::string, GpuBuffer> dspark_f32_;
     std::vector<float> h_dspark_fuse_;
     GpuBuffer d_dspark_state_, d_dspark_state2_, d_dspark_latent_, d_dspark_corr_, d_dspark_toks_;
     GpuBuffer d_dspark_blk_v_, d_dspark_blk_i_, d_dspark_cand_v_, d_dspark_cand_i_;
-    GpuBuffer ds_cur_, ds_res_, ds_h_, ds_q_, ds_k_, ds_v_, ds_ao_, ds_mg_, ds_mu_;
+    GpuBuffer ds_cur_, ds_res_, ds_h_, ds_q_, ds_k_, ds_v_, ds_ao_, ds_mg_, ds_mu_, ds_qkv_, ds_gu_;
     GpuBuffer d_ds_k_ptrs_[3], d_ds_v_ptrs_[3], d_ds_frnn_ptrs_;
+    uint64_t dspark_ptr_gen_ = 0;
 
     GpuBuffer expert_gpu_arena_;
     GpuBuffer d_exp_stage_;
@@ -3071,12 +4584,32 @@ private:
     bool graph_need_taps_ = false;
     uint64_t graph_kv_gen_ = 0;
     int graph_scratch_B_ = 0;
-    hipGraphExec_t graph_verify_exec_ = nullptr;
-    int vgraph_B_ = 0;
-    int vgraph_slot_ = -1;
-    bool vgraph_need_taps_ = false;
-    uint64_t vgraph_kv_gen_ = 0;
-    int vgraph_scratch_B_ = 0;
+    hipGraphExec_t graph_verify_exec_[9]{};
+    int vgraph_slot_[9] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+    bool vgraph_need_taps_[9]{};
+    uint64_t vgraph_kv_gen_[9]{};
+    int vgraph_scratch_B_[9]{};
+    hipGraphExec_t graph_dspark_exec_[8]{};
+    int ds_graph_slot_[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    uint64_t ds_graph_gen_[8]{};
+
+    GpuBuffer d_beam_pool_, d_beam_cnt_, d_beam_tok_, d_beam_node_, d_beam_lp_;
+    GpuBuffer d_beam_st_a_, d_beam_st_b_, d_beam_lat_, d_beam_corr_, d_beam_scores_;
+    GpuBuffer d_tree_meta_, d_tree_k_, d_tree_v_;
+    GpuBuffer d_tree_rec_k_, d_tree_rec_v_, d_tree_rec_attn_, d_tree_rec_mlp_;
+    GpuBuffer d_tree_h_f16_, d_tree_arg_v_, d_tree_arg_i_, d_tree_arg_out_, d_tree_kv_descs_;
+    GpuBuffer d_tree_taps_win_[4];
+    uint64_t tree_kv_desc_gen_ = 0;
+    hipGraphExec_t graph_beam_draft_exec_ = nullptr;
+    int beam_graph_slot_ = -1;
+    uint64_t beam_graph_gen_ = 0;
+    hipGraphExec_t graph_tree_verify_exec_[13]{};
+    int tgraph_slot_[13] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+    uint64_t tgraph_kv_gen_[13]{};
+    int tgraph_scratch_B_[13]{};
+    hipGraphExec_t graph_tree_ctx_exec_[9]{};
+    uint64_t tctx_graph_gen_[9]{};
+    int tctx_graph_B_[9]{};
 };
 
 }  // namespace
