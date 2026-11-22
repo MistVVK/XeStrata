@@ -5,6 +5,7 @@
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/nvfp4_decode_sm120.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/sm75_series.hpp"
@@ -6062,9 +6063,12 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
     const int nb = (int) (L.n_ff / F::qk), hb = (int) (L.n_ff / 32);
+    const int n_items = nb * F::ipb;
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
     const int nrow = (int) L.n_embd;
     const block_q8_1* sh = (const block_q8_1*) sh_raw;
+    constexpr bool kDownSplit = kSplit<TD> || (TD == 7);
+    const bool use_sub8 = kDownSplit && (n_items == 40 || n_items == 20);
     for (int c0 = e0; c0 < e1; c0 += LDS_NT) {
         const int cn = min(LDS_NT, e1 - c0);
         __syncthreads();
@@ -6073,6 +6077,54 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
             for (int i = tid; i < cn * hb * 9; i += 256) sh_raw[i] = src[i];
         }
         __syncthreads();
+        if (use_sub8) {
+            // 8-lane sub-warp (4 rows/warp = 32 rows/block in 2 passes of 32 = 64 rows), 100% active lanes + hoisted load!
+            const int sub_row = (tid >> 3);   // 0..31 within block
+            const int slane = tid & 7;        // 0..7 within sub-warp
+            for (int p = 0; p < 2; ++p) {
+                const int r = blockIdx.x * LDS_RB + p * 32 + sub_row;
+                if (r >= nrow) break;
+                const uint8_t* w = blob + L.down_off + (size_t) r * L.d_row;
+                auto pass8 = [&](auto ntc) {
+                    constexpr int NTC = decltype(ntc)::value;
+                    float s[NTC];
+#pragma unroll
+                    for (int j = 0; j < NTC; ++j) s[j] = 0.0f;
+                    for (int k = slane; k < n_items; k += 8) {
+                        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                        if constexpr (kSplit<TD>) {
+                            const auto rw = Split<TD>::load(w, kbx, iqs);
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) {
+                                const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
+                                s[j] += Split<TD>::apply(rw, xk, iqs);
+                            }
+                        } else if constexpr (TD == 7) {
+                            const auto rw = S27<7>::load(w, kbx, iqs);
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) {
+                                const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
+                                s[j] += S27<7>::apply(rw, xk, iqs);
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < NTC; ++j) {
+                        float v = s[j];
+#pragma unroll
+                        for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+                        if (slane == 0) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = v;
+                    }
+                };
+                switch (cn) {
+                    case 1: pass8(std::integral_constant<int, 1>{}); break;
+                    case 2: pass8(std::integral_constant<int, 2>{}); break;
+                    case 3: pass8(std::integral_constant<int, 3>{}); break;
+                    default: pass8(std::integral_constant<int, 4>{}); break;
+                }
+            }
+            continue;
+        }
         for (int p = 0; p < LDS_RB / 16; ++p) {
             const int r0 = blockIdx.x * LDS_RB + p * 16 + warp, r1 = r0 + 8;
             if (r0 >= nrow) break;
@@ -6084,15 +6136,26 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
                 float s0[NTC], s1[NTC];
 #pragma unroll
                 for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
-                for (int k = lane; k < nb * F::ipb; k += 32) {
+                for (int k = lane; k < n_items; k += 32) {
                     const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                    if constexpr (kSplit<TD>) {
+                        const auto rw0 = Split<TD>::load(w0, kbx, iqs);
+                        const auto rw1 = Split<TD>::load(w1, kbx, iqs);
 #pragma unroll
-                    for (int j = 0; j < NTC; ++j) {
-                        const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
-                        const float a = F::dot(w0, xk, kbx, iqs);
-                        const float b = F::dot(w1, xk, kbx, iqs);
-                        s0[j] += a;
-                        s1[j] += b;
+                        for (int j = 0; j < NTC; ++j) {
+                            const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
+                            s0[j] += Split<TD>::apply(rw0, xk, iqs);
+                            s1[j] += Split<TD>::apply(rw1, xk, iqs);
+                        }
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < NTC; ++j) {
+                            const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
+                            const float a = F::dot(w0, xk, kbx, iqs);
+                            const float b = F::dot(w1, xk, kbx, iqs);
+                            s0[j] += a;
+                            s1[j] += b;
+                        }
                     }
                 }
 #pragma unroll
@@ -6119,6 +6182,8 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
 // [r0, r0 + 32): gate rows r0.. and up rows r0.. (64 weight rows, the same per-(row, entry) sums as mode 7), so
 // one 32-lane warp per entry holds exactly one q8_1 block of h and runs quantize_q8_1_kernel's own code on it -
 // bitwise the separate kernels' hq, two launches fewer per call.
+// Hoists Split<TG>::load outside the per-entry loop (j = 0..NTC-1) so multi-token verify hits decode weights ONCE
+// instead of NTC times, and supports Q4_K (12), Q5_K (13), and NVFP4 (40) with exact tail scales in addition to IQ*.
 template<int TG>
 __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
@@ -6126,17 +6191,31 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
                                                               const int32_t* __restrict__ ent_tok,
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                               block_q8_1* __restrict__ hq) {
-    using GT = typename GridOf<TG>::T;
     using F = Fmt<TG>;
-    __shared__ GT sgrid[GridOf<TG>::N];
+    constexpr bool kHasGrid = (TG == 16 || TG == 17 || TG == 18 || TG == 21 || TG == 22);
+    // TG == 21 (IQ3_S): stage 512 grid entries + 256 lo-nibble + 256 hi-nibble sign masks = 1024 uint32s for Split<21>::load<true>!
+    constexpr int kGridN = kHasGrid ? (TG == 22 ? 1024 : TG == 21 ? 1024 : TG == 17 ? 512 : 256) : 1;
+    using GT = typename std::conditional<(TG == 16 || TG == 17 || TG == 22), uint64_t, uint32_t>::type;
+    __shared__ GT sgrid[kGridN];
     __shared__ float res[LDS_NT][64];
     extern __shared__ int sx_raw[];
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const GT* gsrc = GridOf<TG>::src();
-    for (int i = tid; i < GridOf<TG>::N; i += 256) sgrid[i] = gsrc[i];
+    if constexpr (kHasGrid) {
+        const GT* gsrc = GridOf<TG>::src();
+        for (int i = tid; i < GridOf<TG>::N; i += 256) sgrid[i] = gsrc[i];
+        if constexpr (TG == 21) {
+            // Fill sign mask tables at [512..767] (low nibble) and [768..1023] (high nibble) for Split<21>::load<true>.
+            const uint32_t m_lo = (uint32_t) nib_mask((uint32_t) tid);
+            const uint32_t m_hi = (uint32_t) nib_mask((uint32_t) tid >> 4);
+            sgrid[512 + tid] = m_lo;
+            sgrid[768 + tid] = m_hi;
+        }
+    }
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const float s_gate = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
+    const float s_up   = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
     const int nb = (int) (L.n_embd / F::qk), xb = (int) (L.n_embd / 32), hb = (int) (L.n_ff / 32);
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
     const int r0 = blockIdx.x * 32;
@@ -6152,44 +6231,90 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
             for (int i = tid; i < xb * 9; i += 256) sx_raw[j * xb * 9 + i] = src[i];
         }
         __syncthreads();
-        for (int p = 0; p < 4; ++p) {
-            const int i0 = p * 16 + warp, i1 = i0 + 8;
-            const uint8_t* w0 = wrow(i0);
-            const uint8_t* w1 = wrow(i1);
-            auto pass = [&](auto ntc) {
-                constexpr int NTC = decltype(ntc)::value;
-                float s0[NTC], s1[NTC];
+        if (kSplit<TG> && (nb * F::ipb == 80)) {
+            // 16-lane sub-warp dual-row (gate+up pair): 16 pairs/pass x 2 passes = 64 rows, 100% active lanes (0 idle
+            // lanes on k=64..79), halves shared activation reads, bitwise identical addition tree to warp_sum!
+            const int sub = tid >> 4;
+            const int t16 = tid & 15;
+            for (int p = 0; p < 2; ++p) {
+                const int i0 = p * 16 + sub;
+                const int i1 = 32 + i0;
+                const uint8_t* w0 = wrow(i0);
+                const uint8_t* w1 = wrow(i1);
+                auto pass16 = [&](auto ntc) {
+                    constexpr int NTC = decltype(ntc)::value;
+                    if constexpr (kSplit<TG>) {
+                        constexpr bool kStageSplit = (TG == 16 || TG == 21 || TG == 22);
+                        int off[NTC];
 #pragma unroll
-                for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
-                for (int k = lane; k < nb * F::ipb; k += 32) {
-                    const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                        for (int j = 0; j < NTC; ++j) off[j] = j * xb;
+                        float s0[NTC], s1[NTC];
+                        row_dot2_80_sub16<TG, NTC, true, kStageSplit>(w0, w1, sx, off, NTC, t16, s0, s1,
+                                                                      (const uint32_t*) sgrid);
+                        if (t16 == 0) {
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) { res[j][i0] = s0[j]; res[j][i1] = s1[j]; }
+                        }
+                    }
+                };
+                switch (cn) {
+                    case 1: pass16(std::integral_constant<int, 1>{}); break;
+                    case 2: pass16(std::integral_constant<int, 2>{}); break;
+                    case 3: pass16(std::integral_constant<int, 3>{}); break;
+                    default: pass16(std::integral_constant<int, 4>{}); break;
+                }
+            }
+        } else {
+            for (int p = 0; p < 4; ++p) {
+                const int i0 = p * 16 + warp, i1 = i0 + 8;
+                const uint8_t* w0 = wrow(i0);
+                const uint8_t* w1 = wrow(i1);
+                auto pass = [&](auto ntc) {
+                    constexpr int NTC = decltype(ntc)::value;
+                    float s0[NTC], s1[NTC];
+#pragma unroll
+                    for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
+                    for (int k = lane; k < nb * F::ipb; k += 32) {
+                        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                        if constexpr (kSplit<TG>) {
+                            // Stage grid + sign masks in smem for IQ2_XXS (16), IQ3_S (21), and IQ2_S (22).
+                            constexpr bool kStageSplit = (TG == 16 || TG == 21 || TG == 22);
+                            const auto rw0 = Split<TG>::template load<kStageSplit>(w0, kbx, iqs, (const uint32_t*) sgrid);
+                            const auto rw1 = Split<TG>::template load<kStageSplit>(w1, kbx, iqs, (const uint32_t*) sgrid);
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) {
+                                const block_q8_1* xk = sx + (size_t) j * xb + kbx * (F::qk / 32);
+                                s0[j] += Split<TG>::apply(rw0, xk, iqs);
+                                s1[j] += Split<TG>::apply(rw1, xk, iqs);
+                            }
+                        } else {
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) {
+                                const block_q8_1* xk = sx + (size_t) j * xb + kbx * (F::qk / 32);
+                                const float a = DotG<TG, 1>::f(w0, xk, kbx, iqs, sgrid);
+                                const float b = DotG<TG, 1>::f(w1, xk, kbx, iqs, sgrid);
+                                s0[j] += a;
+                                s1[j] += b;
+                            }
+                        }
+                    }
 #pragma unroll
                     for (int j = 0; j < NTC; ++j) {
-                        const block_q8_1* xk = sx + (size_t) j * xb + kbx * (F::qk / 32);
-                        const float a = DotG<TG, 1>::f(w0, xk, kbx, iqs, sgrid);
-                        const float b = DotG<TG, 1>::f(w1, xk, kbx, iqs, sgrid);
-                        s0[j] += a;
-                        s1[j] += b;
+                        const float a = warp_sum(s0[j]), b = warp_sum(s1[j]);
+                        if (lane == 0) { res[j][i0] = a; res[j][i1] = b; }
                     }
+                };
+                switch (cn) {
+                    case 1: pass(std::integral_constant<int, 1>{}); break;
+                    case 2: pass(std::integral_constant<int, 2>{}); break;
+                    case 3: pass(std::integral_constant<int, 3>{}); break;
+                    default: pass(std::integral_constant<int, 4>{}); break;
                 }
-#pragma unroll
-                for (int j = 0; j < NTC; ++j) {
-                    const float a = warp_sum(s0[j]), b = warp_sum(s1[j]);
-                    if (lane == 0) { res[j][i0] = a; res[j][i1] = b; }
-                }
-            };
-            switch (cn) {
-                case 1: pass(std::integral_constant<int, 1>{}); break;
-                case 2: pass(std::integral_constant<int, 2>{}); break;
-                case 3: pass(std::integral_constant<int, 3>{}); break;
-                default: pass(std::integral_constant<int, 4>{}); break;
             }
         }
         __syncthreads();
         if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
-            const float sg = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
-            const float su = (TG == 40 && L.tail_off) ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
-            const float gg = res[warp][lane] * sg, uu = res[warp][32 + lane] * su;
+            const float gg = res[warp][lane] * s_gate, uu = res[warp][32 + lane] * s_up;
             const float xi = (gg / (1.0f + __expf(-gg))) * uu;
             float amax = fabsf(xi), sum = xi;
 #pragma unroll
@@ -6566,6 +6691,18 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (cap_groups <= 0 || cap_entries <= 0) return;
     strata::dispatch::kernel(strata::dispatch::kExpert, 0, L.gu_type, (int) L.n_embd, (int) L.n_ff, L.d_type);   // BW-MEASURE: one grouped expert call
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
+    // Blackwell sm_120/sm_121 Tensor Core NVFP4 grouped verify (T >= 2, cap_entries > 10):
+    // single-token T=1 (cap_entries <= 10) stays on sub-warp row_dot_20_sub8 to avoid m16n8k16 N=8 padding.
+    if (!g_grouped_v1 && cap_entries > 10 && L.gu_type == 40 && L.d_type == 40 && !L.gu_nib && g_exp_phase == 0 &&
+        nvfp4_decode_sm120_available()) {
+        const size_t f0 = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float);
+        const size_t fa0 = (f0 + 255) & ~(size_t) 255;
+        void* hq_ptr = (uint8_t*) scratch + 3 * fa0;
+        if (nvfp4_decode_sm120_grouped(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                                       cap_groups, cap_entries, x_q8_1, hq_ptr, out, stream)) {
+            return;
+        }
+    }
     // (OWN-I8: this fallback no longer hands its calls to native_expert_i8: that kernel reads its own activation image, native_expert_i8_quantize's, and this call's rows are q8_1
     //  blocks.  The prompt path's MMQ groups, where the kernel was measured, quantize the image themselves.)
     cudaStream_t s = (cudaStream_t) stream;
@@ -6668,12 +6805,16 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu = !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23 || L.gu_type == 40) &&
+    const bool fused_gu = !nib_layout(L) && em0 == 8 &&
+                          ((kExpLds16 && L.gu_type == 16) || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 ||
+                           L.gu_type == 22 || L.gu_type == 23 || L.gu_type == 12 || L.gu_type == 13 || L.gu_type == 40) &&
                           L.n_ff % 32 == 0;
     if (fused_gu && g_exp_phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
+            case 12: native_gu_fused_kernel<12><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 13: native_gu_fused_kernel<13><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 16: native_gu_fused_kernel<16><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 17: native_gu_fused_kernel<17><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 18: native_gu_fused_kernel<18><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;

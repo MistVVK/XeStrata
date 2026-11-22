@@ -61,4 +61,11 @@ bool qsa_block_scores_slots(const float* const*, const float* const*, const floa
                             const QsaShapes&, float*, void*) { return false; }
 bool qsa_decode_attn_slots(const float*, const QsaAttnSlotPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&,
                            float*, float*, int64_t, void*) { return false; }
+void resident_hits_plan(const int32_t*, int, int, const int32_t*, int, const uint8_t*, const unsigned long long*,
+                        long long, int32_t*, long long, void*) {
+    strata::metal_engine::missing("strata::kernels::resident_hits_plan");
+}
+void route_tail_renorm(const int32_t*, float*, const int32_t*, int, int, int, int, void*) {
+    strata::metal_engine::missing("strata::kernels::route_tail_renorm");
+}
 }  // namespace strata::kernels

@@ -39,7 +39,7 @@ macro(strata_hip_pf_own)
       src/prefill/moe_p1a.cu
       src/prefill/moe_helpers.cu)
     set_source_files_properties(${_strata_pf_own_sources} PROPERTIES LANGUAGE HIP INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
-    add_library(strata_pf_own STATIC ${_strata_pf_own_sources} src/prefill/mmq_absent.cpp)
+    add_library(strata_pf_own STATIC ${_strata_pf_own_sources} src/prefill/mmq_absent.cpp src/prefill/moe_fp4_tc_absent.cpp src/prefill/dense_fp4_tc_absent.cpp src/prefill/moe_fp8_mxf_tc_absent.cpp)
     target_include_directories(strata_pf_own PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml" PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(strata_pf_own PRIVATE GGML_USE_HIP=1)
     target_link_libraries(strata_pf_own PUBLIC strata_quant hip::host roc::hipblas)

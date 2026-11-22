@@ -26,6 +26,8 @@
 #include "strata/core/sm120_series.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/prefill/fused_tile_rule.hpp"
+#include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/nvfp4_prefill_mode.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
 
 #define STRATA_FUSED_GEO_N_EMBD 2048

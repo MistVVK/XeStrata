@@ -9,6 +9,7 @@
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
+#include "strata/core/device_hits_plan.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/pending_cuda_error.hpp"
@@ -53,6 +54,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/megakernel.hpp"
+#include "strata/kernels/vhead_bitplane.hpp"
 #include "strata/core/dispatch_stats.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
@@ -1401,12 +1403,20 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1 or
-    // STRATA_VERIFY_DEVICE_HITS=1: on; bitwise exact, off by default unless arch defaults opt in)
+    // STRATA_VERIFY_DEVICE_HITS=1: bitwise exact, off by default unless arch defaults opt in).  STRATA_VERIFY_DEVICE_HITS=1
+    // also plans every layer's resident hit groups on-device when --pcie-frac 0 (set_no_pcie_share), avoiding host flag spins.
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
         if (v == nullptr) v = std::getenv("STRATA_VERIFY_DEVICE_HITS");
         // (not with set_always_publish: the device table may lag the host's while windows are in flight)
         device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
+#if defined(STRATA_GPU_METAL)
+        device_hits_ = false;
+#else
+        device_hits_ = !all_resident_ && !always_publish_ && hits.d_res != nullptr && hits.cache_base != nullptr &&
+                       device_hits_env_on(std::getenv("STRATA_VERIFY_DEVICE_HITS"));
+#endif
+        if (device_hits_) device_plan_ = false;
     }
     // (halo's STRATA_VERIFY_RESIDENT=1 is this window's all_resident_ graph above, which 0.1.39 has on by default)
     if (g_qfuse() || g_qfuse_hc()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
@@ -1417,7 +1427,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             qcnt_ = nullptr;
         }
     }
-    if (all_resident_ || device_plan_) {
+    if (all_resident_ || device_plan_ || device_hits_) {
         bool ok2 = true;
         if (device_plan_)
             ok2 = cudaMalloc((void**) &skip_, 64) == cudaSuccess && cudaMemset(skip_, 0, 64) == cudaSuccess;
@@ -1426,7 +1436,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                   cudaMemcpy(slot_off_d_, hits.slot_off, (size_t) hits.n_slots * sizeof(unsigned long long),
                              cudaMemcpyHostToDevice) == cudaSuccess;
         }
-        if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
+        if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; device_hits_ = false; }
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
@@ -1509,16 +1519,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // projections may start while the kernel before them finishes, loading their weights before they wait for its
     // output.  Only a launch whose predecessors in the graph are all kernels gets programmatic edges; every value is
     // the same as without them.
+    const bool dev_hits = !batch_rec_ && device_hits_active();
+#if defined(STRATA_GPU_METAL)
+    constexpr bool tail_renorm_env = false;
+#else
+    static const bool tail_renorm_env = route_tail_renorm_env_on(std::getenv("STRATA_ROUTE_TAIL_RENORM"));
+#endif
     struct PdlScope {
         bool prev;
         explicit PdlScope(bool on) : prev(pdl_scope()) { pdl_scope() = on; }
         ~PdlScope() { pdl_scope() = prev; }
-    } pdl_window(G == 1 && pdl_supported() && (std::getenv("STRATA_DF_PDL") != nullptr || (ar_on() && !batch_rec_)));
+    } pdl_window(G == 1 && pdl_supported() && (std::getenv("STRATA_DF_PDL") != nullptr || ((ar_on() || dev_hits) && !batch_rec_)));
     // BW-MEASURE (dispatch counters, include/strata/core/dispatch_stats.hpp): the window's counts go to the bin of this T and graph kind
     // (0 = zero-doorbell all-resident, 1 = doorbell graph with CPU / PCIe experts, 2 = batch)
     strata::dispatch::Scope dsp_scope(T, batch_rec_ ? 2 : (ar_on() ? 0 : 1));
-    strata::dispatch::notef("win groups=%ld all_resident=%ld device_plan=%ld", (long) G, (long) ar_on(), (long) device_plan_);
-    strata::dispatch::notef("win pdl=%ld side_mixer=%ld side_proj=%ld", (long) (G == 1 && pdl_supported() && (std::getenv("STRATA_DF_PDL") != nullptr || (ar_on() && !batch_rec_))), (long) side_mixer_mode, (long) side_proj);
+    strata::dispatch::notef("win groups=%ld all_resident=%ld device_plan=%ld", (long) G, (long) ar_on(), (long) (dev_hits ? 2 : device_plan_));
+    strata::dispatch::notef("win pdl=%ld side_mixer=%ld side_proj=%ld", (long) (G == 1 && pdl_supported() && (std::getenv("STRATA_DF_PDL") != nullptr || ((ar_on() || dev_hits) && !batch_rec_))), (long) side_mixer_mode, (long) side_proj);
     strata::dispatch::notef("win df_branch=%ld sh_stream=%ld prof=%ld", (long) (df_branch_ && G == 1 && !batch_rec_ && !prof_on_ && !side_mixer), (long) sh_stream_on(), (long) prof_on_);
     // STRATA_DF_BRANCH: mixer work that reads only the layer's input runs on a side stream inside the graph.  fork(i)
     // makes side i depend on everything captured on `cs` so far, join(i) makes `cs` depend on everything captured on
@@ -2461,12 +2477,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (rs_on_ && G == 1 && n <= 16 && T <= 16)
             strata::kernels::route_marginal_stats(ids_ + tb * K, n, (int) K, rs_dev_ + ((size_t) T * (size_t) g.n_layers + (size_t) l) * 16, cs);
+        if (tail_renorm_env && !ar_on() && !batch_rec_ && remote_opt_ == nullptr && hits_.d_res != nullptr &&
+            strata::core::tail_skip_rank() > 0) {
+            route_tail_renorm(ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n, (int) K, (int) g.n_expert,
+                              strata::core::tail_skip_rank(), cs);
+        }
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
         } else {
-            if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
+            if (dev_hits)
+                resident_hits_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                                   hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                                   plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, cs);
+            else if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
                 resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
@@ -2507,6 +2532,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
+            nsw.q8_1_il = (sh_fork || !g_mmvq_il()) ? nullptr : xil_;
             // STRATA_VERIFY_QDEDUP=1 (not with the forked shared-expert stream, which quantizes into its own buffer): the
             // experts' q8_1 image of xm is made first and the shared expert's gate/up read it (quantize_q8_1_rows and
             // native_quantize_q8_1 write the same bytes)
@@ -2603,6 +2629,35 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out, true);
             stamp(l, 20, grp);
+        } else if (dev_hits) {
+            strata::dispatch::note("experts layer: partial residency, device_hits_plan (--pcie-frac 0: no flagA/flagB spins, no PCIe staging)");
+            stamp(l, 19, grp);
+            grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
+            stamp(l, 20, grp);
+            if (!l2pf.empty() && l + 1 < le_ && l2pf[(size_t) (l + 1)].n > 0 && sh_stream_on() && sh_cs_ != nullptr &&
+                ev_fork_ != nullptr && ev_join_ != nullptr) {
+                note_prio_fork(cs);
+                cudaEventRecord(ev_fork_, cs);
+                cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+                strata::kernels::l2_prefetch_ranges(l2pf[(size_t) (l + 1)], sh_cs_);
+                note_prio_tail(sh_cs_, -1);
+                cudaEventRecord(ev_join_, sh_cs_);
+            }
+            const bool fuse_rows = fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr;
+            if (!fuse_rows) wait_flag_ge(m_flag_, ring, cs);
+            stamp(l, 23, grp);
+            if (fuse_rows)
+                copy_rows_from_mapped_after(m_flag_, ring, parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
+                                            p_dst, p_counts + 1, cs);
+            else if (dec_batch)
+                copy_rows_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
+                                      p_dst, p_counts + 1, cs);
+            else
+                copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
+                              native_moe_combine_enabled() && n <= 8 &&
+                              native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
+            if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         } else {
             strata::dispatch::notef("experts layer: partial residency, plan from %ld (1 = device plan, 0 = host pool), pcie_mode=%ld, remote_opt=%ld", (long) device_plan_, (long) sink_.pcie_mode, (long) (remote_opt_ != nullptr));
             if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
@@ -2761,10 +2816,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // kFusedGrMaxT columns a launch: a longer window (--lookup-max-t) runs them in chunks of that many columns (one
     // chunk - the same launches as before - for every window up to kFusedGrMaxT tokens)
     stamp(g.n_layers, 0, 0);
+    head_bitplane_used_ = false;
     {
         const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
+        static const bool logits_dump = std::getenv("STRATA_LOGITS_DUMP") != nullptr;
+        const bool use_bitplane = head_ != nullptr && head_->loaded() && head_->bitplane() != nullptr &&
+                                  T <= 16 && (head_->type() == 8 || T >= 4) && !logits_dump;
       for (int h0 = 0; h0 < T; h0 += kFusedGrMaxT) {
         const int HT = std::min(T - h0, kFusedGrMaxT);   // this chunk's columns: h0 .. h0 + HT
         // S25 (STRATA_HC_Q8=1): the final mixer from the GGUF's Q8_0 projections too, through the same multi read
@@ -2842,12 +2901,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
                 if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
-                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
+                uint32_t* const nf_dst = nan_guard_on() && m_nf_ != nullptr
+                                             ? m_nf_ + (size_t) h0 * strata::kernels::kNonfiniteBlocks
+                                             : nullptr;
+                if (use_bitplane && strata::kernels::vhead_bitplane_argmax(head_->bitplane(), xq_, HT, m_out_ + h0, cs,
+                                                                           nf_dst, strata::kernels::kNonfiniteBlocks)) {
+                    head_bitplane_used_ = true;
+                } else if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
                     if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, hl, (int) N,
                                                     (int) n_vocab_, (int) HT, cs);
-                } else
-                native_mmvq(head_->type(), head_->weights(), xq_, hl, (int) N, (int) n_vocab_, HT, cs);
+                } else {
+                    native_mmvq(head_->type(), head_->weights(), xq_, hl, (int) N, (int) n_vocab_, HT, cs);
+                }
             } catch (const std::exception& e) {
                 err = std::string("verify head: ") + e.what();
                 return false;
@@ -2857,16 +2923,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
-        if (argmax_rows_wanted()) {   // sm_80 to sm_89 (sm_7x opt-in): the pick over many blocks a row (bitwise the one-block kernel's)
-            argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
-        } else {
-            SamplerParams sp;
-            sp.greedy = true;
-            sp.temperature = 0.0f;
-            sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+        if (!head_bitplane_used_) {
+            if (argmax_rows_wanted()) {   // sm_80 to sm_89 (sm_7x opt-in): the pick over many blocks a row (bitwise the one-block kernel's)
+                argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
+            } else {
+                SamplerParams sp;
+                sp.greedy = true;
+                sp.temperature = 0.0f;
+                sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+            }
+            // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
+            if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
         }
-        // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
-        if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
     stamp(g.n_layers, 1, 0);
     if (tap_on_ && !batch_rec_ && tap_file_ != nullptr && !tap_split_) copy_from_mapped(m_tap_, tap_dev_, (int64_t) T * (int64_t) tap_layers_.size() * N, cs);
@@ -3795,7 +3863,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             bal_np_[bi] = bal_ok_[bi] ? sink_.counts[2] : 0;
             sink_.cpu_jobs = 0;
         }
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+        if (!sink_.device_hits_only && *(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
@@ -3892,6 +3960,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
+        ensure_head_logits(T);
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
@@ -4049,6 +4118,7 @@ void Verifier::set_plan_slot(int grp) {
     const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
+    sink_.device_hits_only = !last_batch_ && device_hits_active();
     sink_.staging_cap = per;
     const int tb = G == 2 && grp == 1 ? (last_t_ + 1) / 2 : 0;
     // STRATA_P2P_DECODE_SCATTER=1 (opt-in; #6023 had it always on): the decode peer writes its experts' outputs straight into this
@@ -4114,6 +4184,20 @@ void Verifier::publish_plan(void* ctx) {
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
+void Verifier::ensure_head_logits(int T) {
+    if (!head_bitplane_used_ || head_ == nullptr || !head_->loaded() || head_mixed_ == nullptr || head_logits_ == nullptr)
+        return;
+    const int64_t N = g_->n_embd;
+    for (int h0 = 0; h0 < T; h0 += strata::kernels::kFusedGrMaxT) {
+        const int HT = std::min(T - h0, strata::kernels::kFusedGrMaxT);
+        strata::kernels::native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs_);
+        strata::kernels::native_mmvq(head_->type(), head_->weights(), xq_,
+                                     head_logits_ + (size_t) h0 * (size_t) n_vocab_,
+                                     (int) N, (int) n_vocab_, HT, cs_);
+    }
+    head_bitplane_used_ = false;
+}
+
 bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
                                std::string& err) {
     if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
@@ -4134,6 +4218,10 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     if (head_logits_ == nullptr || n_vocab_ <= 0 || T <= 0 || targets == nullptr || out == nullptr) {
         err = "window_logprobs: no head logits for this window";
         return false;
+    }
+    if (head_bitplane_used_) {
+        ensure_head_logits(T);
+        (void) cudaStreamSynchronize(cs_);
     }
     // run() synchronized cs_ before returning, so the head of this window is complete
     std::vector<float> h((size_t) T * (size_t) n_vocab_);
@@ -5155,7 +5243,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         strata_store_fence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+        if (!sink_.device_hits_only && *(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
@@ -5375,7 +5463,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         strata_store_fence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+        if (!sink_.device_hits_only && *(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
@@ -5737,7 +5825,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         strata_store_fence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+        if (!sink_.device_hits_only && *(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;

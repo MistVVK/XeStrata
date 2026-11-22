@@ -5407,6 +5407,14 @@ int main(int argc, char** argv) {
             o.pcie_frac = base;
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
+        const char* dh_env = std::getenv("STRATA_VERIFY_DEVICE_HITS");
+        if (dh_env != nullptr && std::atoi(dh_env) != 0 && !pf_old && native_pack && o.layer_split.empty() &&
+            o.batch <= 0 && o.peer_device < 0) {
+            o.pcie_frac = 0.0;
+            o.pcie_frac_auto = false;
+            std::fprintf(stderr, "strata generate: STRATA_VERIFY_DEVICE_HITS=1 -> pcie_frac 0.00 "
+                                 "(on-device VRAM hit planning; pass --pcie-frac or STRATA_VERIFY_DEVICE_HITS=0 to override)\n");
+        }
     }
     // STRATA_PCIE_BALANCE=1 (opt-in): each verify layer's PCIe count from measured costs (Verifier::set_pcie_balance)
     // instead of the probe's fixed share above - the CPU's speed sets the right share as much as the link's.  IQ2_XS,
@@ -8324,6 +8332,9 @@ int main(int argc, char** argv) {
                                      "toolkit>, with its libcudart.so present) (#542)\n",
                              CUDART_VERSION / 1000, CUDART_VERSION % 1000 / 10, rt / 1000, rt % 1000 / 10);
         }
+        // Pre-warm cuBLAS BF16 & FP16 modules on a background thread while the expert arena loads
+        // (eliminates ~210-490 ms of cold layer-0 cuBLAS load latency on the first prompt; STRATA_PREFILL_WARM=0 skips).
+        if (named) g_warm_thr = std::thread([dev] { strata::prefill::warm_gemm_libraries(dev); });
 #endif
 #endif
         const std::string e = strata::core::device_code_error();
@@ -14460,6 +14471,12 @@ int main(int argc, char** argv) {
                               : remote_opt || drive.d.remote_count > 0 ? "helper GPUs" : o.adapt_async ? "--adapt-async"
                               : o.pipeline_windows > 0 ? "--pipeline-windows" : o.batch > 0 ? "--batch"
                               : adapt_overlap() ? "STRATA_ADAPT_OVERLAP=1" : nullptr;
+        if (fetch_off == nullptr && !pcie_auto.on && drive.d.pcie_num == 0 && fs_swap == nullptr && !ver.pcie_balance_on()) {
+            ver.set_no_pcie_share(true);
+            if (ver.device_hits_active())
+                std::fprintf(stderr, "strata serve: STRATA_VERIFY_DEVICE_HITS=1: planning VRAM expert hits on-device "
+                                     "(--pcie-frac 0: no plan/PCIe flag waits)\n");
+        }
         if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in; the default on a 12.x card of 16 GiB or less)
             const char* off = drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off
                             : o.pcie_mode == "dma" || o.pcie_mode == "direct" ? "--pcie-mode dma / direct"
@@ -20569,7 +20586,7 @@ int main(int argc, char** argv) {
                                  want && !strata::aux_cpus::enabled() ? " (asked for, but no CPU is spare: see the start-up line)" : "");
             }
             ver.pause_pcie_balance(req_pcie_set);   // the measured costs keep across requests
-            drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
+            drive.d.pcie_num = ver.device_hits_active() ? 0 : std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
@@ -23185,6 +23202,26 @@ int main(int argc, char** argv) {
             k = 0;   // Metal: no loan of expert-cache slots (the prompt buffers are the Metal window's own); the refill after it copied into given-back allocations
 #endif
             if (k > 0) {   // the lent slots are refilled after the prompt
+                // Skip borrowing & refilling expert cache slots when the GPU already has ample free VRAM for the
+                // prompt path's own buffers (e.g., 48-72 GB Blackwell/Ampere cards where all experts fit with GBs to
+                // spare). Avoids evicting resident experts and paying ~80-150 ms of PCIe refill after prefill.
+                static const bool no_free_skip = [] {
+                    const char* e = std::getenv("STRATA_PREFILL_ALWAYS_BORROW");
+                    return e != nullptr && e[0] == '1';
+                }();
+                if (!no_free_skip && !o.kv_grow) {
+                    const uint64_t own_need =
+                        strata::prefill::Prefill::bytes_needed_owned(g, ss, chunk, srcp != nullptr);
+                    size_t fb = 0, tb = 0;
+                    if (cudaMemGetInfo(&fb, &tb) == cudaSuccess &&
+                        fb > own_need + (4ull << 30)) {
+                        k = 0;
+                    } else {
+                        (void) cudaGetLastError();
+                    }
+                }
+            }
+            if (k > 0) {   // the lent slots are refilled after the prompt
                 const int32_t first = (int32_t) (xcache.slots() - k);
                 // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
                 kvg_started = true;
@@ -23634,6 +23671,12 @@ int main(int argc, char** argv) {
         const char* fetch_off = d_res == nullptr ? "no residency table" : o.spec_split ? "--spec-split"
                               : multi_gpu ? "a layer split" : drive.d.peer != nullptr ? "a peer tier"
                               : drive.d.remote_count > 0 ? "helper GPUs" : nullptr;
+        if (fetch_off == nullptr && drive.d.pcie_num == 0 && drive.d.fs == nullptr && !ver.pcie_balance_on()) {
+            ver.set_no_pcie_share(true);
+            if (ver.device_hits_active())
+                std::fprintf(stderr, "strata generate: STRATA_VERIFY_DEVICE_HITS=1: planning VRAM expert hits on-device "
+                                     "(--pcie-frac 0: no plan/PCIe flag waits)\n");
+        }
         if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in; the default on a 12.x card of 16 GiB or less)
             const char* off = drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off
                             : o.pcie_mode == "dma" || o.pcie_mode == "direct" ? "--pcie-mode dma / direct"

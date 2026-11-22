@@ -4,6 +4,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/vhead_bitplane.hpp"
 #include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
@@ -20,6 +21,7 @@ NativeHead::~NativeHead() {
 }
 
 void NativeHead::unload() {
+    if (bitplane_) { strata::kernels::vhead_bitplane_destroy(bitplane_); bitplane_ = nullptr; }
     if (weights_) strata::kernels::native_q6_k_unpack(weights_);
     if (weights_) strata::kernels::native_q8_0_sm60_release(weights_);
     if (scratch_) cudaFree(scratch_);
@@ -108,6 +110,21 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
         if (type_ == 8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix
             strata::kernels::native_q8_0_sm60_pack(weights_, n_in_, n_out_, "output head");
+        if (host_ == nullptr && (type_ == 8 || type_ == 14) && strata::kernels::vhead_bitplane_enabled() &&
+            !(type_ == 14 && strata::kernels::native_q6_k_packed_enabled())) {
+            size_t free_b = 0, total_b = 0;
+            // Require >= 1.5 GiB VRAM headroom so small-VRAM cards keep their expert slots.
+            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > (1536ull << 20)) {
+                bitplane_ = strata::kernels::vhead_bitplane_create(type_, weights_, n_in_, n_out_);
+                if (bitplane_ != nullptr) {
+                    std::fprintf(stderr, "strata: exact bit-plane LM head enabled (%s, +%.1f MiB VRAM; STRATA_VHEAD_BITPLANE=0 disables)\n",
+                                 strata::ggml_type_name((uint32_t) type_),
+                                 (double) strata::kernels::vhead_bitplane_bytes(bitplane_) / (1024.0 * 1024.0));
+                }
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
         if (strata::core::manifest::enabled()) {   // STRATA_MANIFEST: what the head holds and where
             namespace mf = strata::core::manifest;
             mf::instance().tensors("head", strata::ggml_type_name((uint32_t) type_), 1, bytes);
@@ -126,6 +143,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
 
 bool NativeHead::to_host(std::string& err) {
     if (weights_ == nullptr || host_ != nullptr || (type_ == 14 && strata::kernels::native_q6_k_packed_enabled()) || (type_ == 8 && std::getenv("STRATA_Q8_SM60") != nullptr)) return false;   // (repacked in place: those stay in VRAM)
+    if (bitplane_) { strata::kernels::vhead_bitplane_destroy(bitplane_); bitplane_ = nullptr; }
     { int d = 0; cudaDeviceProp pr{}; if (cudaGetDevice(&d) != cudaSuccess || cudaGetDeviceProperties(&pr, d) != cudaSuccess || !strata::spill_allowed(strata::kSpillMetalBuild, pr.integrated != 0)) { (void) cudaGetLastError(); return false; } }   // (Q6_K / Q8_0 may be repacked in place: those stay)
     void* hp = nullptr;
     void* dp = nullptr;

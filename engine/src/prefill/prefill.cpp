@@ -77,6 +77,8 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/i8_expert_rule.hpp"
 #include "strata/prefill/i8_group.hpp"
+#include "strata/prefill/moe_fp4_tc.hpp"
+#include "strata/prefill/moe_fp8_mxf_tc.hpp"
 #include "strata/prefill/routed_stream.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/expert_nibble.hpp"
@@ -209,6 +211,14 @@ bool h11p_wanted() { return false; }
 bool h11p_takes_pair(int, int) { return false; }
 void hadamard128_rows(float*, int64_t, int64_t, const float*, void*) {}
 }  // namespace strata::prefill::fused
+namespace strata::prefill::fp4_tc {
+bool built() { return false; }
+bool available() { return false; }
+bool wanted() { return false; }
+void quantize_act(const float*, int64_t, int64_t, void*, void*) {}
+void experts(const strata::prefill::fused::Batch&, const strata::prefill::fused::NativeGeom&, int, int64_t, const void*,
+             const void*, const int32_t*, void*, float*, void*) {}
+}  // namespace strata::prefill::fp4_tc
 #endif
 #if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
 // P4-SPLIT: built with Strata's own prompt kernels and without llama.cpp's MMQ (-DSTRATA_MMQ=OFF, or HIP without STRATA_PREFILL_MMQ)
@@ -1602,6 +1612,8 @@ struct Prefill::Impl {
     // pool's per-token activations and jobs.
     float *cpu_x = nullptr, *cpu_rows = nullptr, *cpu_ones = nullptr;
     size_t cpu_x_n = 0, cpu_rows_n = 0, cpu_ones_n = 0;
+    cudaStream_t cpu_x_stream = nullptr;
+    cudaEvent_t cpu_x_ready = nullptr, cpu_x_done = nullptr;
     bool cpu_dead = false;   // a pinned buffer of the share could not be had (host memory is short): the GPU does it all
     std::vector<uint8_t> cpu_nact;
     std::vector<kernels::cpu::ActQ> cpu_actq;   // a Q2_0 layer's activations (the pool's Q2_0 kernels read ActQ)
@@ -1856,6 +1868,9 @@ void Prefill::release() {
     impl_->steps_up.release();
     impl_->tok_up.release();
     impl_->up_ring.release();
+    if (impl_->cpu_x_stream) { (void) cudaStreamSynchronize(impl_->cpu_x_stream); (void) cudaStreamDestroy(impl_->cpu_x_stream); }
+    if (impl_->cpu_x_ready) (void) cudaEventDestroy(impl_->cpu_x_ready);
+    if (impl_->cpu_x_done) (void) cudaEventDestroy(impl_->cpu_x_done);
     for (float* p : {impl_->cpu_x, impl_->cpu_rows, impl_->cpu_ones})
         if (p) cudaFreeHost(p);
     for (cudaEvent_t e : impl_->cpu_ev)
@@ -2382,6 +2397,7 @@ void warm_gemm_libraries(int device) {
         return wanted;
     }();
     if (!arch_ok) return;
+#endif
     static std::mutex mu;
     static unsigned done_mask = 0;   // per device: each card loads its own code objects
     if (device < 0 || device >= 32) return;
@@ -2419,9 +2435,6 @@ void warm_gemm_libraries(int device) {
     if (ok)
         std::fprintf(stderr, "strata prefill: warmed the BF16 and FP16 GEMM libraries on GPU %d in %.0f ms (STRATA_PREFILL_WARM=0 skips)\n",
                      device, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-#else
-    (void) device;
-#endif
 }
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
@@ -2655,6 +2668,40 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         const bool ones_new = m.cpu_ones == nullptr;
         pin(m.cpu_ones, m.cpu_ones_n, rows);
         if (ones_new && m.cpu_ones != nullptr) std::fill(m.cpu_ones, m.cpu_ones + rows, 1.0f);
+    }
+#elif !defined(STRATA_GPU_METAL)
+    // Pre-pin the CPU prompt share buffers + async D2H stream at init time on CUDA so Layer 0 never pays a 30-40 ms
+    // cudaHostAlloc stall inside kPfHostGroup and wide cpu_share_nt never reallocates mid-prompt.
+    if (T > 0 && cpu_pool_ != nullptr && cpu_share_on()) {
+        const size_t ts = std::min<size_t>(T, (size_t) std::max<int64_t>(cpu_share_max(), 1));
+        const int64_t nt_cap = std::max<int64_t>(cpu_share_nt(), strata::kernels::cpu::MAXT);
+        const size_t rows = (size_t) std::min<int64_t>({(int64_t) ts * K, nt_cap * g.n_expert, kShareRowsMax});
+        auto pin = [](float*& p, size_t& n, size_t want) {
+            if (p != nullptr && n >= want) return;
+            if (p != nullptr) { cudaFreeHost(p); p = nullptr; n = 0; }
+            if (cudaHostAlloc((void**) &p, want * sizeof(float), cudaHostAllocDefault) == cudaSuccess) {
+                n = want;
+            } else {
+                p = nullptr;
+                n = 0;
+                (void) cudaGetLastError();
+            }
+        };
+        pin(m.cpu_x, m.cpu_x_n, ts * N);
+        pin(m.cpu_rows, m.cpu_rows_n, rows * N);
+        const bool ones_new = m.cpu_ones == nullptr || m.cpu_ones_n < rows;
+        pin(m.cpu_ones, m.cpu_ones_n, rows);
+        if (ones_new && m.cpu_ones != nullptr) std::fill(m.cpu_ones, m.cpu_ones + rows, 1.0f);
+        if (!m.cpu_x_stream) {
+            if (cudaStreamCreateWithFlags(&m.cpu_x_stream, cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&m.cpu_x_ready, cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&m.cpu_x_done, cudaEventDisableTiming) != cudaSuccess) {
+                if (m.cpu_x_stream) { (void) cudaStreamDestroy(m.cpu_x_stream); m.cpu_x_stream = nullptr; }
+                if (m.cpu_x_ready) { (void) cudaEventDestroy(m.cpu_x_ready); m.cpu_x_ready = nullptr; }
+                if (m.cpu_x_done) { (void) cudaEventDestroy(m.cpu_x_done); m.cpu_x_done = nullptr; }
+                (void) cudaGetLastError();
+            }
+        }
     }
 #endif
     pf_mark("init: host buffers, PLE rows, identity table", tr_last);
@@ -5670,6 +5717,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     std::vector<const uint8_t*> cpu_blob;   // the CPU experts' blobs, taken on this thread (the source is not thread-safe)
                     double cpu_ms = 0;                    // the thread's time (the measured share)
                     std::future<bool> cpu_fut;
+                    bool cpu_x_async = false;
                     int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0, cpu_at = 0;   // cpu_at: the CPU's first row of Dm
                     bool cpu_arm = true;                  // auto: this layer may share (false: the arm without)
                     int cpu_set = -1;                     // auto: the wall events' set, -1 when not measured
@@ -5678,14 +5726,33 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (fused_l && nib_l.on) core::nibble::fatal(l, "the prompt path's fused experts", "they read GGUF blocks");
 #endif
                     if (fused_l) {
-                        if (static bool said = false; !said) {
+                        constexpr int kTypeNvfp4 = (int) strata::quant::Type::NVFP4;
+                        const bool fp4_nat = fused_nat && !had_gu && !had_d && mmq_gt == kTypeNvfp4 &&
+                                             mmq_dt == kTypeNvfp4 && fp4_tc::wanted();
+                        const bool fp8_nat = !fp4_nat && fused_nat && !had_gu && !had_d &&
+                                             fp8_mxf_tc::wanted(mmq_gt, mmq_dt);
+                        if (fp4_nat) {
+                            if (static bool said_fp4 = false; !said_fp4) {
+                                said_fp4 = true;
+                                std::fprintf(stderr, "strata: prompt NVFP4 experts on the Blackwell mxf4nvf4 tensor-core "
+                                                     "kernels (STRATA_PREFILL_NVFP4=w4a4)\n");
+                            }
+                        } else if (fp8_nat) {
+                            if (static bool said_fp8 = false; !said_fp8) {
+                                said_fp8 = true;
+                                std::fprintf(stderr, "strata: prompt experts on the Blackwell mxf8f6f4 tensor-core "
+                                                     "kernels (STRATA_PF_MXFP8_MOE=0 disables)\n");
+                            }
+                        } else if (static bool said = false; !said) {
                             said = true;
                             std::fprintf(stderr, "strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, "
                                                  "#136)\n");
                         }
                         pt.mark(kPfGather, cs);
-                        // the layer's input to int8 once per token; the rows of each expert from the router's ids
-                        if (fused_nat && had_gu) {   // (a folded trellis gate/up: its input rotated, as the MMQ path's xsrc = m.Xr)
+                        // the layer's input to NVFP4 (Blackwell w4a4), MXFP8 (Blackwell mxf8f6f4), or int8 once per token
+                        if (fp4_nat) fp4_tc::quantize_act(m.mixed, T, N, m.Xq, m.cs);
+                        else if (fp8_nat) fp8_mxf_tc::quantize_act(m.mixed, T, N, m.Xq, m.cs);
+                        else if (fused_nat && had_gu) {   // (a folded trellis gate/up: its input rotated, as the MMQ path's xsrc = m.Xr)
                             strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);
                             fused::quantize_act_native(m.Xr, T, N, m.Xq, m.cs);
                         } else if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
@@ -5693,7 +5760,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // (a folded trellis down: H rotated inside experts_native; off again after the layer's launches)
                         if (fused_nat && had_d) fused::set_down_rotation(true, had_sh);
                         // STRATA_PF_P1A=1 (gfx1151): the layer input's FP16 rows for the P1A kernels (p1a_input keeps nullptr otherwise)
-                        if (fused_nat) fused::p1a_input(had_gu ? nullptr : m.mixed_h, m.H_bytes);
+                        if (fused_nat && !fp4_nat && !fp8_nat) fused::p1a_input(had_gu ? nullptr : m.mixed_h, m.H_bytes);
                         bool p1a_layer = false;
                         fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
                         // launches over the experts in id order, each at most kMaxBatch experts (STRATA_PF_BATCH: below)
@@ -5711,7 +5778,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int n = v ? std::atoi(v) : 0;
                             return n > 0 ? std::min(n, fused::kBatchRoom) : fused::kMaxBatch;
                         }();
-                        const bool wide = fused_nat && pf_batch > fused::kMaxBatch && fused::native_wide();
+                        const bool wide = fused_nat && !fp4_nat && !fp8_nat && pf_batch > fused::kMaxBatch && fused::native_wide();
                         const int per_launch = wide ? pf_batch : std::min(pf_batch, fused::kMaxBatch);
                         for (int32_t e = 0; e < m.g->n_expert;) {
                             fused::Batch b;
@@ -5740,7 +5807,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 wait_copied(k - 1, (k - 1) % (size_t) m.ring);
                             }
                             pt.mark(kPfGemmGU, cs);
-                            if (fused_nat) {
+                            if (fp4_nat) {
+                                const auto& f = lay.fmt[(size_t) l];
+                                const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+                                fp4_tc::experts(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                            } else if (fp8_nat) {
+                                const auto& f = lay.fmt[(size_t) l];
+                                const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+                                fp8_mxf_tc::experts(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                            } else if (fused_nat) {
                                 fused::want_dm_f16(pf_dm16() && rows_cpu == 0 && !peer_now && ((reinterpret_cast<uintptr_t>(m.shared) | reinterpret_cast<uintptr_t>(m.bo)) & 15) == 0);
                                 const auto& f = lay.fmt[(size_t) l];
                                 const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
@@ -5832,7 +5907,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     m.cpu_x_n = want;
                                 }
                             }
-                            if (cpu_maybe) cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
+                            if (cpu_maybe) {
+                                if (m.cpu_x_stream != nullptr && m.cpu_x_ready != nullptr && m.cpu_x_done != nullptr) {
+                                    cudaEventRecord(m.cpu_x_ready, m.cs);
+                                    cudaStreamWaitEvent(m.cpu_x_stream, m.cpu_x_ready, 0);
+                                    cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cpu_x_stream);
+                                    cudaEventRecord(m.cpu_x_done, m.cpu_x_stream);
+                                    cpu_x_async = true;
+                                } else {
+                                    cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
+                                }
+                            }
                         }
                         // #579: a stall here is the GPU (this layer's attention and router, or the previous layer's
                         // work), not the host: the watchdog's report says so (only its text changes)
@@ -6142,7 +6227,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.cpu_ev[0] == nullptr) { cudaEventCreate(&m.cpu_ev[0]); cudaEventCreate(&m.cpu_ev[1]); }
                                 cudaEventRecord(m.cpu_ev[0], m.cs);
                             }
-                            cpu_fut = std::async(std::launch::async, [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, src_h, l, T, r0c, this]() -> bool {
+                            cpu_fut = std::async(std::launch::async, [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, src_h, l, T, r0c, cpu_x_async, this]() -> bool {
                                 const auto t0 = std::chrono::steady_clock::now();
                                 constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
                                 // a Q2_0 layer (gate/up on the pool's Q2_0 kernels): ActQ activations, as decode's
@@ -6150,16 +6235,56 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (q2 && m.cpu_actq.size() < (size_t) T) m.cpu_actq.resize((size_t) T);
                                 if (!q2 && m.cpu_nact.size() < (size_t) T * AB) m.cpu_nact.resize((size_t) T * AB);
                                 std::vector<char> need((size_t) T, 0);
+                                std::vector<int32_t> need_toks;
+                                need_toks.reserve((size_t) T);
                                 for (int32_t e = 0; e < m.g->n_expert; ++e)   // the tokens the CPU's experts read
                                     if (on_cpu[(size_t) e])
-                                        for (int32_t r = 0; r < m.cnt[(size_t) e]; ++r)
-                                            need[(size_t) src_h[(size_t) m.off[(size_t) e] + (size_t) r]] = 1;
-                                for (int64_t t = 0; t < T; ++t)
-                                    if (need[(size_t) t] && q2)
-                                        strata::kernels::cpu::act_quant_any(m.cpu_x + (size_t) t * N, (int) N, m.cpu_actq[(size_t) t]);
-                                    else if (need[(size_t) t])
-                                        strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N,
-                                                                               m.cpu_nact.data() + (size_t) t * AB);
+                                        for (int32_t r = 0; r < m.cnt[(size_t) e]; ++r) {
+                                            const int32_t tok = src_h[(size_t) m.off[(size_t) e] + (size_t) r];
+                                            if (!need[(size_t) tok]) { need[(size_t) tok] = 1; need_toks.push_back(tok); }
+                                        }
+                                if (cpu_x_async) {
+                                    if (m.device >= 0) cudaSetDevice(m.device);
+                                    cudaEventSynchronize(m.cpu_x_done);
+                                }
+                                const int n_need = (int) need_toks.size();
+                                if (n_need >= 64 && cpu_pool_->workers() > 1) {
+                                    constexpr int kTokChunk = 32;
+                                    const int n_tasks = (n_need + kTokChunk - 1) / kTokChunk;
+                                    struct QuantCtx {
+                                        const int32_t* toks;
+                                        int n_need;
+                                        bool q2;
+                                        const strata::kernels::cpu::NativeFmt* cf;
+                                        const float* cpu_x;
+                                        strata::kernels::cpu::ActQ* actq;
+                                        uint8_t* nact;
+                                    } qctx{need_toks.data(), n_need, q2, &cf, m.cpu_x,
+                                           q2 ? m.cpu_actq.data() : nullptr,
+                                           q2 ? nullptr : m.cpu_nact.data()};
+                                    cpu_pool_->run_range(n_tasks, [](void* vp, int tidx) {
+                                        const auto* c = static_cast<const QuantCtx*>(vp);
+                                        const int i0 = tidx * kTokChunk;
+                                        const int i1 = std::min(c->n_need, i0 + kTokChunk);
+                                        for (int i = i0; i < i1; ++i) {
+                                            const int64_t t = c->toks[i];
+                                            if (c->q2)
+                                                strata::kernels::cpu::act_quant_any(c->cpu_x + (size_t) t * N, (int) N, c->actq[(size_t) t]);
+                                            else
+                                                strata::kernels::cpu::native_quant_act(*c->cf, c->cpu_x + (size_t) t * N,
+                                                                                       c->nact + (size_t) t * AB);
+                                        }
+                                    }, &qctx);
+                                } else {
+                                    for (int i = 0; i < n_need; ++i) {
+                                        const int64_t t = need_toks[i];
+                                        if (q2)
+                                            strata::kernels::cpu::act_quant_any(m.cpu_x + (size_t) t * N, (int) N, m.cpu_actq[(size_t) t]);
+                                        else
+                                            strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N,
+                                                                                   m.cpu_nact.data() + (size_t) t * AB);
+                                    }
+                                }
                                 m.cpu_jobs.clear();
                                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                     if (!on_cpu[(size_t) e]) continue;
@@ -6286,6 +6411,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // the routed experts' input: `mixed`, or (APR) its rotated copy, which the peer / the layer
                         // split's helper also take (one rotation for both cards; `mixed` itself feeds the shared expert)
                         const float* xsrc = m.mixed;
+                        constexpr int kTypeNvfp4Staged = (int) strata::quant::Type::NVFP4;
+                        const bool fz_fp4 = fz_staged && mmq_gt == kTypeNvfp4Staged && mmq_dt == kTypeNvfp4Staged && fp4_tc::wanted();
                         if (fz_staged) {
                             fz_staged_l = true;
                             if (!use_mmq) {   // a fused-only layer (the class default, or STRATA_PF_STAGED_FO=1): said once
@@ -6298,7 +6425,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
 #endif
                             }
-                            fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
+                            if (fz_fp4) fp4_tc::quantize_act(m.mixed, T, N, m.Xq, m.cs);
+                            else fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         }
                         if (i8_l) {   // the layer's T tokens as q8_1 rows, once (the grouped kernels' activations)
                             if (static bool said = false; !said) {
@@ -7074,7 +7202,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 // Expose FP16 layer inputs (m.mixed_h) to native_h11p_kernel (STRATA_PF_F16=2) on staged partial-cache discrete gfx11
                                 fused::p1a_input(had_gu ? nullptr : m.mixed_h, m.H_bytes);
                                 // the layer's tables (group_bounds, before the walk) and rows: the batch's experts are local indices of them
-                                fused::experts_native(fz_b, fz_geom, (int) order.size(), T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                                if (fz_fp4) fp4_tc::experts(fz_b, fz_geom, (int) order.size(), T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                                else fused::experts_native(fz_b, fz_geom, (int) order.size(), T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                                 fused::p1a_input(nullptr, 0);
                                 if (gg_nslots > 0) {   // the batch's staged blobs are read: one event releases their slots
                                     const int rel = gg_slots[gg_nslots - 1];
@@ -7449,6 +7578,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             cudaMemcpyAsync(m.row_sd + r0c, m.cpu_ones, (size_t) rows_cpu * sizeof(float),
                                             cudaMemcpyHostToDevice, m.cs);
                         stats_.experts_cpu += n_cpu;
+                    } else if (cpu_x_async) {
+                        cudaStreamWaitEvent(m.cs, m.cpu_x_done, 0);
                     }
                     // no reading from a layer the share could not change (nothing taken) or with one-time costs
                     if (cpu_set >= 0 && n_stream > 0 && (!cpu_arm || n_cpu > 0) && !cpu_cold) {
@@ -8684,10 +8815,14 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         int fz_rel[MMQ_GROUP] = {};
         int fz_nrel = 0;
         fused::NativeGeom fz_geom{};
+        bool lm_fp4 = false;
         if (fz_l) {
             const auto& f = lay.fmt[(size_t) l];
             fz_geom = fused::NativeGeom{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
-            fused::quantize_act_native(lb.mixed, Sn, N, lb.xa, cs);
+            constexpr int kTypeNvfp4Lm = (int) strata::quant::Type::NVFP4;
+            lm_fp4 = !f.had_gu && !f.had_d && f.gu_type == kTypeNvfp4Lm && f.d_type == kTypeNvfp4Lm && fp4_tc::wanted();
+            if (lm_fp4) fp4_tc::quantize_act(lb.mixed, Sn, N, lb.xa, cs);
+            else fused::quantize_act_native(lb.mixed, Sn, N, lb.xa, cs);
         }
         mmq::GatherGroup gg;
         int gg_slots[MMQ_GROUP];
@@ -8769,7 +8904,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 for (int i = 0; i < ngx; ++i) fb.blob[i] = fz_blob[i];
                 fused::want_dm_f16(false);
                 fused::p1a_input(lb.mixed_h, m.H_bytes);
-                fused::experts_native(fb, fz_geom, ngx, gp.nr, m.GU, lb.xa, d_row_tok + gp.r0, m.H, m.Dm, cs);
+                if (lm_fp4) fp4_tc::experts(fb, fz_geom, ngx, gp.nr, m.GU, lb.xa, d_row_tok + gp.r0, m.H, m.Dm, cs);
+                else fused::experts_native(fb, fz_geom, ngx, gp.nr, m.GU, lb.xa, d_row_tok + gp.r0, m.H, m.Dm, cs);
                 fused::p1a_input(nullptr, 0);
                 for (int i = 0; i < fz_nrel; ++i) {   // the group's staged blobs are read: their slots are free
                     cudaEventRecord(m.used[fz_rel[i]], cs);

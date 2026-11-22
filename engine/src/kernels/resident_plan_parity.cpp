@@ -9,6 +9,7 @@
 // then the plan is untouched) and without one (the all-resident graph: a non-resident expert gives an empty plan and
 // sets *plan_err).
 // Every word of the plan the host pool would read is compared with memcmp. GPU, synthetic, no model.
+#include "strata/core/device_hits_plan.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -141,6 +142,45 @@ int main() {
         if (skip != 0 || !untouched) {
             std::printf("    *** a non-resident expert: skip=%u untouched=%d (want 0 / 1) ***\n", skip, (int) untouched);
             ++bad;
+        }
+    }
+
+    // partial-VRAM resident_hits_plan against strata::core::build_device_hits_plan across 0%, 35%, 75%, 100% residency
+    for (int pct : {0, 35, 75, 100}) {
+        std::vector<int32_t> res_part(NE, -1);
+        for (int e = 0; e < NE; ++e) {
+            if (pct == 100 || (pct > 0 && (int) (rng() % 100) < pct)) res_part[e] = res[e];
+        }
+        ck(cudaMemcpy(d_res, res_part.data(), NE * 4, cudaMemcpyHostToDevice), "res_part");
+        for (int n : {1, 10, 37, 80}) {
+            std::vector<int32_t> ids(n);
+            for (int i = 0; i < n; ++i) ids[i] = (int32_t) (rng() % 32) * 5;
+            ck(cudaMemcpy(d_ids, ids.data(), n * 4, cudaMemcpyHostToDevice), "ids_part");
+            for (int use_off = 0; use_off < 2; ++use_off) {
+                std::vector<int32_t> ref_plan(plan_words, 0);
+                strata::core::build_device_hits_plan(ids.data(), n, K, res_part.data(), NE, (uintptr_t) cache_base,
+                                                     use_off ? off.data() : nullptr, blob, ref_plan.data(), capx);
+                ck(cudaMemset(d_plan, 0xAB, plan_words * 4), "fill_hits");
+                k::resident_hits_plan(d_ids, n, K, d_res, NE, cache_base, use_off ? d_off : nullptr, blob, d_plan, capx, nullptr);
+                ck(cudaDeviceSynchronize(), "sync_hits");
+                std::vector<int32_t> got(plan_words);
+                ck(cudaMemcpy(got.data(), d_plan, plan_words * 4, cudaMemcpyDeviceToHost), "got_hits");
+                const int groups = ref_plan[0];
+                const int entries = ref_plan[1];
+                const int32_t* gdst = got.data() + 4 + capx + 1;
+                const int32_t* rdst = ref_plan.data() + 4 + capx + 1;
+                bool ok = std::memcmp(got.data(), ref_plan.data(), 3 * 4) == 0 &&
+                          std::memcmp(got.data() + 4, ref_plan.data() + 4, (size_t) (groups + 1) * 4) == 0 &&
+                          std::memcmp(gdst, rdst, (size_t) entries * 4) == 0 &&
+                          std::memcmp(gdst + capx, rdst + capx, (size_t) entries * 4) == 0 &&
+                          std::memcmp(got.data() + ptr_off, ref_plan.data() + ptr_off, (size_t) groups * 8) == 0 &&
+                          got[(size_t) (ptr_off + 4 * capx)] == entries;
+                ++cases;
+                if (!ok) {
+                    std::printf("    *** resident_hits_plan pct=%d n=%d use_off=%d differs ***\n", pct, n, use_off);
+                    ++bad;
+                }
+            }
         }
     }
 

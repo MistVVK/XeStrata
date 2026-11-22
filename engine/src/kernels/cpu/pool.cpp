@@ -1219,6 +1219,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+        } else if (mode_ == 8) {
+            range_fn_(range_ctx_, (int) i);
         } else if (mode_ == 7) {
             dep_task((int) i);   // BW-G: the one-batch layer call (STRATA_POOL_DEP)
         } else if (mode_ >= 5) {
@@ -1355,8 +1357,19 @@ void ExpertPool::dep_task(int i) {
         native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
 }
 
+void ExpertPool::run_range(int n_tasks, void (*fn)(void*, int), void* ctx) {
+    if (n_tasks <= 0 || fn == nullptr) return;
+    if (n_ <= 0 || n_tasks == 1) {
+        for (int i = 0; i < n_tasks; ++i) fn(ctx, i);
+        return;
+    }
+    range_fn_ = fn;
+    range_ctx_ = ctx;
+    run_phase(8, n_tasks);
+}
+
 void ExpertPool::run_phase(int mode, int n_tasks) {
-    const bool dg = diag_pool_on() && mode >= 5;
+    const bool dg = diag_pool_on() && (mode == 5 || mode == 6 || mode == 7);
     const int64_t dg_a = dg ? now_ns() : 0;
     wait_parked("before a phase");
     const int64_t dg_b = dg ? now_ns() : 0;

@@ -279,6 +279,11 @@ private:
     int launch_n_ = 0;
     int64_t launch_pos0_ = 0;
     std::chrono::steady_clock::time_point launch_t0_{};
+    // Lazy batched context scratch (kCtxBatch = 64 rows, ~2.2 MiB) for fast zero-sync prompt context updates
+    struct CtxBatch;
+    CtxBatch* ctx_batch_ = nullptr;
+    bool ensure_ctx_batch(std::string& err);
+    void free_ctx_batch();
 };
 
 }  // namespace strata::core

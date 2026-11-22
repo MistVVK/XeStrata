@@ -5447,7 +5447,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             for (int64_t i = i0; i < n; ++i)
                 if (first_of[i] == i0) kind[i] = kd;
-            if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
+            if (kd != 0 || P.device_hits_only) continue;   // the VRAM groups first; skipped when planned on-device
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
             for (int64_t i = i0; i < n; ++i)
@@ -5516,20 +5516,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             for (int64_t i = 0; i < n; ++i)
                 if (ids[i] >= 0 && ids[i] < d.n_expert) d.fetch_mark[(size_t) ids[i]] = 0;
         }
-        P.start2[fetches] = entries;
-        const bool peer_p2p_hit = d.peer != nullptr && d.peer->p2p() && P.hit_out_dev != nullptr && d.peer->direct_mode();
-        if (peer_p2p_hit) {
-            for (int64_t i = 0; i < n; ++i)
-                if (kind[i] == 2) P.dst[entries++] = (int32_t) i;
+        if (!P.device_hits_only) {
+            P.start2[fetches] = entries;
+            const bool peer_p2p_hit = d.peer != nullptr && d.peer->p2p() && P.hit_out_dev != nullptr && d.peer->direct_mode();
+            if (peer_p2p_hit) {
+                for (int64_t i = 0; i < n; ++i)
+                    if (kind[i] == 2) P.dst[entries++] = (int32_t) i;
+            }
+            P.counts[0] = groups;
+            P.counts[1] = entries;
+            P.counts[2] = fetches;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            pt("publish", fetches);
+            if (P.publish) P.publish(P.ctx);
+            pt("fetch", fetches);
+            if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
         }
-        P.counts[0] = groups;
-        P.counts[1] = entries;
-        P.counts[2] = fetches;
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        pt("publish", fetches);
-        if (P.publish) P.publish(P.ctx);
-        pt("fetch", fetches);
-        if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -5561,12 +5563,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    // the GPU's copy_rows_from_mapped zeroes the rows it computed itself (dec_batch); STRATA_VERIFY_DEVICE_PLAN's
-    // (or its alias STRATA_VERIFY_DEVICE_HITS's) copy_or_zero_from_mapped copies every row, so there the host still zeroes them
+    // the GPU's copy_rows_from_mapped zeroes the rows it computed itself (dec_batch); STRATA_VERIFY_DEVICE_PLAN /
+    // STRATA_VERIFY_DEVICE_HITS's copy_or_zero_from_mapped copies every row, so there the host still zeroes them
     static const bool device_plan = [] {
-        const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-        if (v == nullptr) v = std::getenv("STRATA_VERIFY_DEVICE_HITS");
-        return v != nullptr && std::atoi(v) != 0;
+        const char* p = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
+        const char* h = std::getenv("STRATA_VERIFY_DEVICE_HITS");
+        return (p != nullptr && std::atoi(p) != 0) || (h != nullptr && std::atoi(h) != 0);
     }();
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
     bool any_cpu = false;
@@ -7133,9 +7135,9 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
     const int slots = v ? std::atoi(v) : 0;
     if (slots <= 0) return nullptr;
     const char* dp = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-    if (dp == nullptr) dp = std::getenv("STRATA_VERIFY_DEVICE_HITS");
-    if (dp && std::atoi(dp) != 0) {
-        std::fprintf(stderr, "strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN (the device would plan "
+    const char* dh = std::getenv("STRATA_VERIFY_DEVICE_HITS");
+    if ((dp && std::atoi(dp) != 0) || (dh && std::atoi(dh) != 0)) {
+        std::fprintf(stderr, "strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN/HITS (the device would plan "
                              "resident layers without the host)\n");
         return nullptr;
     }

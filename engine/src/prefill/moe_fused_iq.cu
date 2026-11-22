@@ -20,6 +20,8 @@
 // ldmatrix.  The products are mma.sync m16n8k32 (m16n8k16 for the formats with a scale per 16 values); the epilogues
 // (SwiGLU, H to int8 per 32 features; down into the per-slot rows) are moe_fused.cu's.
 #include "strata/prefill/moe_fused_iq.hpp"
+#include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/nvfp4_prefill_mode.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/fused_tile_rule.hpp"
 #include "strata/prefill/fused_tq_default.hpp"
@@ -53,6 +55,12 @@
 #include <cstring>
 #include <mutex>
 #include <type_traits>
+
+#if !defined(STRATA_FUSED_DECODE_ONLY) && !defined(STRATA_FUSED_GEO_N_EMBD)
+namespace strata::prefill::fp4_tc {
+bool available();
+}  // namespace strata::prefill::fp4_tc
+#endif
 
 namespace strata::prefill::fused {
 namespace {
@@ -3440,9 +3448,26 @@ bool native_supported(int gu_type, int d_type) {
     // path, w4a4 for Blackwell's FP4 MMA: both stay as they are).  The kernels' arithmetic is MMQ's w4a8 class (int8 products, FP32 scales, the weight_scale_2 values on the FP32 products).
     // Not with the NT = 256 / warp-specialized opt-ins (no NVFP4 form of theirs).
     if (gu_type == T_NVFP4 || d_type == T_NVFP4) {
-        static const bool mode_ok = [] { const char* v = std::getenv("STRATA_PREFILL_NVFP4"); return v == nullptr || v[0] == '\0' || std::strcmp(v, "w4a8") == 0; }();
+#if !defined(STRATA_FUSED_GEO_N_EMBD)
+        const bool fp4_avail = strata::prefill::fp4_tc::available();
+#else
+        constexpr bool fp4_avail = false;
+#endif
+        bool degraded = false;
+        const bool mode_ok = strata::prefill::nvfp4_fused_covers(std::getenv("STRATA_PREFILL_NVFP4"), fp4_avail,
+                                                                 strata::prefill::mmq::built(), &degraded);
+        if (degraded) {
+            static bool said_deg = false;
+            if (!said_deg) {
+                said_deg = true;
+                std::fprintf(stderr, "strata: STRATA_PREFILL_NVFP4=w4a4 requested, but native Blackwell FP4 tensor-core "
+                                     "prompt kernels are not active on this device/build; staying on fused W4A8 tensor "
+                                     "cores instead of falling back to FP16 cuBLAS\n");
+            }
+        }
         const DevInfo& d = dev_info();
-        return gu_type == T_NVFP4 && d_type == T_NVFP4 && env_set == 1 && mode_ok && d.ok && d.nvfp4 && !d.t75 && d.occ_nt <= 0 && !d.ws;
+        const bool dev_covers = fp4_avail || (d.ok && d.nvfp4);
+        return gu_type == T_NVFP4 && d_type == T_NVFP4 && env_set == 1 && mode_ok && dev_covers && !d.t75 && d.occ_nt <= 0 && !d.ws;
     }
     if (d_type == T_Q8_0 && gu_type != T_Q4_K && gu_type != T_Q5_K) {
         const DevInfo& d = dev_info();

@@ -6,6 +6,7 @@
 #include "strata/core/per_device_flag.hpp"
 #include "s26_tsum.cuh"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -125,6 +126,11 @@ __global__ void rope_table_kernel(const int32_t* __restrict__ pos, int rows, flo
 __global__ void rope_inv_kernel(float theta, double* __restrict__ inv) {
     const int i = threadIdx.x;   // 64 threads
     inv[i] = pow((double) theta, -(double) (2 * i) / (double) HD);
+}
+
+__global__ void iota_pos_kernel(int32_t* __restrict__ pos, int32_t pos0, int rows) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows) pos[i] = pos0 + i;
 }
 
 __global__ void rope_table_inv_kernel(const int32_t* __restrict__ pos, int rows, const double* __restrict__ inv_tab, float* __restrict__ table) {
@@ -553,6 +559,248 @@ static bool df2_attn_wmma_enabled() {
 }
 #endif  // __HIP_PLATFORM_AMD__
 
+// Clean-room MIT sm_80+ BF16 Tensor Core DFlash2 attention (Ampere RTX 3090 + Blackwell RTX 5090).
+// Uses PTX mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 for both S = Q * K^T (all 128 threads active)
+// and O = O * corr + P * V, keeping exact FP32 online softmax and full FP32 dynamic range via BF16 operands.
+#if !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+#define STRATA_DF2_TC_SM80 1
+#else
+#define STRATA_DF2_TC_SM80 0
+#endif
+
+#if STRATA_DF2_TC_SM80
+__device__ __forceinline__ void df2_mma_bf16_m16n8k16(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                      uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+#endif
+
+constexpr int AS16 = 136;   // 128 bf16 + 8 pad (16-byte aligned, bank-conflict-free)
+constexpr int VS16 = 36;    // 32 bf16 + 4 pad (8-byte aligned)
+__global__ void __launch_bounds__(128) attn_part_tc_kernel(
+    const float* __restrict__ q, const float* __restrict__ kring, const float* __restrict__ vring,
+    const float* __restrict__ kblk, const float* __restrict__ vblk,
+    const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
+    const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
+#if STRATA_DF2_TC_SM80
+    __shared__ __align__(16) uint16_t Qs[32 * AS16];        // 8,704 B
+    __shared__ __align__(16) union {
+        uint16_t K[32 * AS16];                              // 8,704 B: [t][d]
+        uint16_t VT[HD * VS16];                             // 9,216 B: [d][t]
+    } kv_s;
+    __shared__ __align__(16) uint16_t Ps16[32 * VS16];      // 2,304 B: [qi][t]
+    __shared__ float Sc[32 * 33];                           // 4,224 B
+    __shared__ float m_s[32], l_s[32], corr_s[32];
+    __shared__ unsigned char kvalid[32];
+
+    const int kvh = blockIdx.x, chunk = blockIdx.y, tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int wq = warp >> 1;      // 0..1: 16 queries each
+    const int wk = warp & 1;       // 0..1: 16 keys (S) or 64 dims (PV)
+    const int g = lane >> 2;       // 0..7
+    const int tig = lane & 3;      // 0..3
+
+    const int s = *anchor_pos;
+    const int lo = s - (window - 1) > 0 ? s - (window - 1) : 0;
+    const int nctx = s - lo;
+    const int nkeys = nctx + kDf2Rows;
+    const int k_begin = chunk * kDf2Chunk;
+    const int64_t ep = tag != nullptr ? ((int64_t) *epoch_ptr << 32) : 0;
+    float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * 32) * 130;
+    if (k_begin >= nkeys) {
+        for (int i = tid; i < 32 * 130; i += 128) pbase[i] = (i % 130 == 0) ? -INFINITY : 0.0f;
+        return;
+    }
+
+    auto f2bf16x2 = [](float a, float b) -> uint32_t {
+        const __nv_bfloat162 h = __floats2bfloat162_rn(a, b);
+        uint32_t u;
+        memcpy(&u, &h, 4);
+        return u;
+    };
+
+    const float scale = rsqrtf((float) HD);
+    for (int i = tid; i < 32 * (HD / 4); i += 128) {
+        const int a = i / (HD / 4), d4 = i % (HD / 4);
+        const int row = a >> 2, gq = a & 3;
+        const float4 v = *reinterpret_cast<const float4*>(q + ((size_t) row * 32 + kvh * kDf2Gqa + gq) * HD + d4 * 4);
+        const uint32_t p0 = f2bf16x2(v.x * scale, v.y * scale);
+        const uint32_t p1 = f2bf16x2(v.z * scale, v.w * scale);
+        *reinterpret_cast<uint2*>(&Qs[a * AS16 + d4 * 4]) = make_uint2(p0, p1);
+    }
+    if (tid < 32) { m_s[tid] = -INFINITY; l_s[tid] = 0.0f; }
+
+    float O[8][4];
+#pragma unroll
+    for (int nd = 0; nd < 8; ++nd) { O[nd][0] = 0.0f; O[nd][1] = 0.0f; O[nd][2] = 0.0f; O[nd][3] = 0.0f; }
+
+    const int k_end = min(k_begin + kDf2Chunk, nkeys);
+    auto fetch = [&](int k0, float4 (&reg)[8], const float* ring, const float* blk) {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4), k = k0 + t;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (k < nctx) v = *reinterpret_cast<const float4*>(ring + ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
+            else if (k < nkeys) v = *reinterpret_cast<const float4*>(blk + ((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d4 * 4);
+            reg[u] = v;
+        }
+    };
+    auto put_k = [&](const float4 (&reg)[8]) {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
+            const uint32_t p0 = f2bf16x2(reg[u].x, reg[u].y);
+            const uint32_t p1 = f2bf16x2(reg[u].z, reg[u].w);
+            *reinterpret_cast<uint2*>(&kv_s.K[t * AS16 + d4 * 4]) = make_uint2(p0, p1);
+        }
+    };
+    auto put_vt = [&](const float4 (&reg)[8]) {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
+            const int d0 = d4 * 4;
+            const __nv_bfloat16 b0 = __float2bfloat16_rn(reg[u].x);
+            const __nv_bfloat16 b1 = __float2bfloat16_rn(reg[u].y);
+            const __nv_bfloat16 b2 = __float2bfloat16_rn(reg[u].z);
+            const __nv_bfloat16 b3 = __float2bfloat16_rn(reg[u].w);
+            uint16_t u0, u1, u2, u3;
+            memcpy(&u0, &b0, 2); memcpy(&u1, &b1, 2); memcpy(&u2, &b2, 2); memcpy(&u3, &b3, 2);
+            kv_s.VT[(d0 + 0) * VS16 + t] = u0;
+            kv_s.VT[(d0 + 1) * VS16 + t] = u1;
+            kv_s.VT[(d0 + 2) * VS16 + t] = u2;
+            kv_s.VT[(d0 + 3) * VS16 + t] = u3;
+        }
+    };
+
+    float4 kreg[8], vreg[8];
+    fetch(k_begin, kreg, kring, kblk);
+
+    for (int k0 = k_begin; k0 < k_end; k0 += 32) {
+        __syncthreads();
+        put_k(kreg);
+        if (tid < 32) {
+            const int k = k0 + tid;
+            kvalid[tid] = (tag == nullptr || k >= nctx || k >= nkeys) ? 1 : (tag[(lo + k) % ring_slots] == (ep | (int64_t) (lo + k)) ? 1 : 0);
+        }
+        fetch(k0, vreg, vring, vblk);
+        __syncthreads();
+
+        // Stage 1: S = Q * K^T (32 x 32 over HD=128) via BF16 Tensor Cores (all 4 warps active!).
+        float sc0[4] = {0.f, 0.f, 0.f, 0.f};
+        float sc1[4] = {0.f, 0.f, 0.f, 0.f};
+        const int q0 = wq * 16;
+        const int kb0 = wk * 16;
+        if (!(variant & 1)) {
+#pragma unroll
+            for (int d = 0; d < HD; d += 16) {
+                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(&Qs[(q0 + g) * AS16 + d + 2 * tig]);
+                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(&Qs[(q0 + g + 8) * AS16 + d + 2 * tig]);
+                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(&Qs[(q0 + g) * AS16 + d + 8 + 2 * tig]);
+                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(&Qs[(q0 + g + 8) * AS16 + d + 8 + 2 * tig]);
+                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&kv_s.K[(kb0 + g) * AS16 + d + 2 * tig]);
+                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&kv_s.K[(kb0 + g) * AS16 + d + 8 + 2 * tig]);
+                df2_mma_bf16_m16n8k16(sc0, a0, a1, a2, a3, b0, b1);
+                const uint32_t b2 = *reinterpret_cast<const uint32_t*>(&kv_s.K[(kb0 + 8 + g) * AS16 + d + 2 * tig]);
+                const uint32_t b3 = *reinterpret_cast<const uint32_t*>(&kv_s.K[(kb0 + 8 + g) * AS16 + d + 8 + 2 * tig]);
+                df2_mma_bf16_m16n8k16(sc1, a0, a1, a2, a3, b2, b3);
+            }
+        }
+        auto store_sc = [&](int qi, int t, float val) {
+            const int k = k0 + t, row = qi >> 2;
+            bool ok = k < nkeys;
+            if (ok && k < nctx) ok = (lo + k) > (s + row - window) && kvalid[t];
+            Sc[qi * 33 + t] = ok ? val : -INFINITY;
+        };
+        store_sc(q0 + g,     kb0 + 2 * tig,     sc0[0]);
+        store_sc(q0 + g,     kb0 + 2 * tig + 1, sc0[1]);
+        store_sc(q0 + g + 8, kb0 + 2 * tig,     sc0[2]);
+        store_sc(q0 + g + 8, kb0 + 2 * tig + 1, sc0[3]);
+        store_sc(q0 + g,     kb0 + 8 + 2 * tig,     sc1[0]);
+        store_sc(q0 + g,     kb0 + 8 + 2 * tig + 1, sc1[1]);
+        store_sc(q0 + g + 8, kb0 + 8 + 2 * tig,     sc1[2]);
+        store_sc(q0 + g + 8, kb0 + 8 + 2 * tig + 1, sc1[3]);
+        __syncthreads();
+
+        // Stage 2: Exact FP32 online softmax -> write Ps16[qi][t] as BF16.
+        {
+            const int qi = tid >> 2, sub = tid & 3;
+            float v[8], tmax = -INFINITY;
+#pragma unroll
+            for (int u = 0; u < 8; ++u) { v[u] = Sc[qi * 33 + sub * 8 + u]; tmax = fmaxf(tmax, v[u]); }
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 2));
+            const float m_old = m_s[qi];
+            const float mn = fmaxf(m_old, tmax);
+            const float corr = (m_old == -INFINITY) ? 0.0f : __expf(m_old - mn);
+            float psum = 0.0f;
+            float pf[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const float p = v[u] == -INFINITY ? 0.0f : __expf(v[u] - mn);
+                pf[u] = p;
+                psum += p;
+            }
+            uint32_t* pdst = reinterpret_cast<uint32_t*>(&Ps16[qi * VS16 + sub * 8]);
+            pdst[0] = f2bf16x2(pf[0], pf[1]);
+            pdst[1] = f2bf16x2(pf[2], pf[3]);
+            pdst[2] = f2bf16x2(pf[4], pf[5]);
+            pdst[3] = f2bf16x2(pf[6], pf[7]);
+            psum += __shfl_xor_sync(0xffffffffu, psum, 1);
+            psum += __shfl_xor_sync(0xffffffffu, psum, 2);
+            if (sub == 0) { l_s[qi] = l_s[qi] * corr + psum; m_s[qi] = mn; corr_s[qi] = corr; }
+        }
+        __syncthreads();
+
+        // Stage 3: Transpose-store V into kv_s.VT, prefetch next K, run O = O*corr + P * V via BF16 TC!
+        put_vt(vreg);
+        if (k0 + 32 < k_end) fetch(k0 + 32, kreg, kring, kblk);
+        __syncthreads();
+
+        const float cr0 = corr_s[q0 + g];
+        const float cr1 = corr_s[q0 + g + 8];
+#pragma unroll
+        for (int nd = 0; nd < 8; ++nd) {
+            O[nd][0] *= cr0; O[nd][1] *= cr0;
+            O[nd][2] *= cr1; O[nd][3] *= cr1;
+        }
+        if (!(variant & 2)) {
+            const int d_base = wk * 64;
+#pragma unroll
+            for (int t = 0; t < 32; t += 16) {
+                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(&Ps16[(q0 + g) * VS16 + t + 2 * tig]);
+                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(&Ps16[(q0 + g + 8) * VS16 + t + 2 * tig]);
+                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(&Ps16[(q0 + g) * VS16 + t + 8 + 2 * tig]);
+                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(&Ps16[(q0 + g + 8) * VS16 + t + 8 + 2 * tig]);
+#pragma unroll
+                for (int nd = 0; nd < 8; ++nd) {
+                    const int d_row = d_base + nd * 8 + g;
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&kv_s.VT[d_row * VS16 + t + 2 * tig]);
+                    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&kv_s.VT[d_row * VS16 + t + 8 + 2 * tig]);
+                    df2_mma_bf16_m16n8k16(O[nd], a0, a1, a2, a3, b0, b1);
+                }
+            }
+        }
+    }
+
+    __syncthreads();
+    if (tid < 32) { pbase[tid * 130] = m_s[tid]; pbase[tid * 130 + 1] = l_s[tid]; }
+    const int q0 = wq * 16;
+    const int d_base = wk * 64;
+#pragma unroll
+    for (int nd = 0; nd < 8; ++nd) {
+        const int d_off = 2 + d_base + nd * 8 + 2 * tig;
+        *reinterpret_cast<float2*>(pbase + (size_t) (q0 + g) * 130 + d_off) = make_float2(O[nd][0], O[nd][1]);
+        *reinterpret_cast<float2*>(pbase + (size_t) (q0 + g + 8) * 130 + d_off) = make_float2(O[nd][2], O[nd][3]);
+    }
+#else
+    (void) q; (void) kring; (void) vring; (void) kblk; (void) vblk; (void) anchor_pos;
+    (void) ring_slots; (void) window; (void) part; (void) variant; (void) tag; (void) epoch_ptr;
+#endif
+}
 __device__ __forceinline__ void quant_block(float v, int blk, int col, int K, int8_t* __restrict__ xq, float* __restrict__ xd);
 
 __global__ void attn_merge_kernel(const float* __restrict__ part, int8_t* __restrict__ xq, float* __restrict__ xd) {
@@ -794,6 +1042,260 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_rows_kernel(Df2Segs segs, co
         }
     }
     df2_reduce_store_cols<R>(acc, lane, ncols, sg, row0 + sub * R);
+}
+
+// Clean-room MIT sm_80+ INT8 Tensor Core DFlash2 GEMM (Ampere RTX 3090 + Blackwell RTX 5090 / PRO 5000).
+// Uses PTX mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 matching DFlash2's exact ncols <= 8 shape:
+// each 128-thread CTA owns 16 output rows (two 8-row tiled groups), stages the 512-K activation step in smem (4.5 KB),
+// and splits the 16 K-blocks across 4 warps with 16-byte coalesced uint4 loads on Q4_0 weights (exact signed q - 8,
+// zero xsum overhead, zero weight smem, zero spills).
+#if STRATA_DF2_TC_SM80
+__device__ __forceinline__ void df2_mma_s8_m16n8k32(int32_t (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                    uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// Exact bit-parallel conversion of four 4-bit unsigned nibbles q in [0..15] (in bytes 0..3) to signed int8 (q - 8) in [-8..7].
+__device__ __forceinline__ uint32_t df2_u4x4_to_s8x4(uint32_t q) {
+    return (q & 0x07070707u) | ((~q & 0x08080808u) * 0x1Fu);
+}
+#endif
+
+template <bool Q4>
+__global__ void __launch_bounds__(128) gemm_tc_kernel(Df2Segs segs, const int8_t* __restrict__ xq,
+                                                      const float* __restrict__ xd, int n_in, int ncols) {
+#if STRATA_DF2_TC_SM80
+    __shared__ alignas(16) int8_t s_xq[8][512];   // 4,096 B
+    __shared__ float s_xd[8][16];                 //   512 B
+    __shared__ float s_out[4][16][8];             // 2,048 B (total 6,656 B -> max occupancy)
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int tig = lane & 3;
+    const int t0 = 2 * tig;
+    const int t1 = t0 + 1;
+
+    const int row_g = blockIdx.x * 16;
+    const Df2Seg sg = df2_pick(segs, row_g);
+    const int row0 = row_g - sg.row0;
+    const int nb = n_in >> 5;
+    const int steps = nb >> 4;
+
+    const uint8_t* base_q0 = reinterpret_cast<const uint8_t*>(sg.q) + (size_t) row0 * (Q4 ? (n_in >> 1) : n_in);
+    const uint8_t* base_q1 = base_q0 + (size_t) 8 * (Q4 ? (n_in >> 1) : n_in);
+    const __half* base_d0 = sg.d + (size_t) row0 * nb;
+    const __half* base_d1 = base_d0 + (size_t) 8 * nb;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int n_in_i4 = n_in >> 4;
+    const int4* xq4 = reinterpret_cast<const int4*>(xq);
+
+    for (int st = 0; st < steps; ++st) {
+        // Cooperatively stage 512 int8 activations + 16 scales for all ncols <= 8 columns (16-byte coalesced).
+        const int tot_i4 = ncols * 32;
+        for (int i = tid; i < tot_i4; i += 128) {
+            const int c = i >> 5;
+            const int k4 = i & 31;
+            *reinterpret_cast<int4*>(&s_xq[c][k4 * 16]) = __ldg(xq4 + (size_t) c * n_in_i4 + st * 32 + k4);
+        }
+        if (tid < ncols * 16) {
+            const int c = tid >> 4;
+            const int bi = tid & 15;
+            s_xd[c][bi] = __ldg(xd + (size_t) c * nb + st * 16 + bi);
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const int bi = warp + s * 4;
+            uint32_t a0, a1, a2, a3;
+            if constexpr (Q4) {
+                const uint4 r0 = __ldg(reinterpret_cast<const uint4*>(base_q0 + (size_t) st * 2048 + g * 256 + bi * 16));
+                const uint4 r1 = __ldg(reinterpret_cast<const uint4*>(base_q1 + (size_t) st * 2048 + g * 256 + bi * 16));
+                const uint32_t w0_lo = (tig < 2) ? r0.x : r0.y;
+                const uint32_t w0_hi = (tig < 2) ? r0.z : r0.w;
+                const uint32_t w1_lo = (tig < 2) ? r1.x : r1.y;
+                const uint32_t w1_hi = (tig < 2) ? r1.z : r1.w;
+                const int sh = (tig & 1) ? 4 : 0;
+                a0 = df2_u4x4_to_s8x4((w0_lo >> sh) & 0x0F0F0F0Fu);
+                a2 = df2_u4x4_to_s8x4((w0_hi >> sh) & 0x0F0F0F0Fu);
+                a1 = df2_u4x4_to_s8x4((w1_lo >> sh) & 0x0F0F0F0Fu);
+                a3 = df2_u4x4_to_s8x4((w1_hi >> sh) & 0x0F0F0F0Fu);
+            } else {
+                const uint8_t* p0 = base_q0 + (size_t) st * 4096 + g * 512 + bi * 32;
+                const uint8_t* p1 = base_q1 + (size_t) st * 4096 + g * 512 + bi * 32;
+                a0 = __ldg(reinterpret_cast<const uint32_t*>(p0 + tig * 4));
+                a2 = __ldg(reinterpret_cast<const uint32_t*>(p0 + 16 + tig * 4));
+                a1 = __ldg(reinterpret_cast<const uint32_t*>(p1 + tig * 4));
+                a3 = __ldg(reinterpret_cast<const uint32_t*>(p1 + 16 + tig * 4));
+            }
+            const float dw0 = __half2float(__ldg(base_d0 + (size_t) st * 128 + g * 16 + bi));
+            const float dw1 = __half2float(__ldg(base_d1 + (size_t) st * 128 + g * 16 + bi));
+            const uint32_t b0 = (g < ncols) ? *reinterpret_cast<const uint32_t*>(&s_xq[g][bi * 32 + tig * 4]) : 0u;
+            const uint32_t b1 = (g < ncols) ? *reinterpret_cast<const uint32_t*>(&s_xq[g][bi * 32 + 16 + tig * 4]) : 0u;
+            int32_t d[4] = {0, 0, 0, 0};
+            df2_mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
+            if (t0 < ncols) {
+                const float dx0 = s_xd[t0][bi];
+                acc[0] = fmaf(dw0 * dx0, (float) d[0], acc[0]);
+                acc[2] = fmaf(dw1 * dx0, (float) d[2], acc[2]);
+            }
+            if (t1 < ncols) {
+                const float dx1 = s_xd[t1][bi];
+                acc[1] = fmaf(dw0 * dx1, (float) d[1], acc[1]);
+                acc[3] = fmaf(dw1 * dx1, (float) d[3], acc[3]);
+            }
+        }
+        __syncthreads();
+    }
+
+    s_out[warp][g][t0] = acc[0];
+    s_out[warp][g][t1] = acc[1];
+    s_out[warp][8 + g][t0] = acc[2];
+    s_out[warp][8 + g][t1] = acc[3];
+    __syncthreads();
+
+    const int r = tid >> 3;
+    const int c = tid & 7;
+    if (c < ncols) {
+        const float sum = (s_out[0][r][c] + s_out[1][r][c]) + (s_out[2][r][c] + s_out[3][r][c]);
+        sg.y[(size_t) c * sg.n_out + row0 + r] = sum;
+    }
+#else
+    (void) segs; (void) xq; (void) xd; (void) n_in; (void) ncols;
+#endif
+}
+
+// Clean-room MIT sm_80+ batched INT8 Tensor Core DFlash2 GEMM for arbitrary ncols (prefill context updates):
+// each 128-thread CTA owns 16 output rows x up to 64 columns, reading weights ONCE per 64 tokens (8x fewer weight loads!).
+template <bool Q4>
+__global__ void __launch_bounds__(128) gemm_batch_tc_kernel(Df2Segs segs, const int8_t* __restrict__ xq,
+                                                            const float* __restrict__ xd, int n_in, int ncols) {
+#if STRATA_DF2_TC_SM80
+    __shared__ alignas(16) int8_t s_xq[64][128];  // 8,192 B (64 cols x 4 blocks of 32)
+    __shared__ float s_xd[64][4];                 // 1,024 B
+    __shared__ float s_out[4][16][8];             // 2,048 B (total 11.2 KB)
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int tig = lane & 3;
+    const int t0 = 2 * tig;
+    const int t1 = t0 + 1;
+
+    const int row_g = blockIdx.x * 16;
+    const int c_base = blockIdx.y * 64;
+    const int nc = min(64, ncols - c_base);
+    if (nc <= 0) return;
+
+    const Df2Seg sg = df2_pick(segs, row_g);
+    const int row0 = row_g - sg.row0;
+    const int nb = n_in >> 5;
+    const int steps = nb >> 4;
+    const int n_in_i4 = n_in >> 4;
+    const int4* xq4 = reinterpret_cast<const int4*>(xq);
+
+    const uint8_t* base_q0 = reinterpret_cast<const uint8_t*>(sg.q) + (size_t) row0 * (Q4 ? (n_in >> 1) : n_in);
+    const uint8_t* base_q1 = base_q0 + (size_t) 8 * (Q4 ? (n_in >> 1) : n_in);
+    const __half* base_d0 = sg.d + (size_t) row0 * nb;
+    const __half* base_d1 = base_d0 + (size_t) 8 * nb;
+
+    float acc[8][4];
+#pragma unroll
+    for (int ct = 0; ct < 8; ++ct) acc[ct][0] = acc[ct][1] = acc[ct][2] = acc[ct][3] = 0.0f;
+
+    const int tot_i4 = nc * 8;
+    const int tot_d = nc * 4;
+    for (int st = 0; st < steps; ++st) {
+        for (int s = 0; s < 4; ++s) {
+            for (int i = tid; i < tot_i4; i += 128) {
+                const int c = i >> 3;
+                const int k4 = i & 7;
+                *reinterpret_cast<int4*>(&s_xq[c][k4 * 16]) =
+                    __ldg(xq4 + (size_t) (c_base + c) * n_in_i4 + st * 32 + s * 8 + k4);
+            }
+            for (int i = tid; i < tot_d; i += 128) {
+                const int c = i >> 2;
+                const int bi4 = i & 3;
+                s_xd[c][bi4] = __ldg(xd + (size_t) (c_base + c) * nb + st * 16 + s * 4 + bi4);
+            }
+            __syncthreads();
+
+            const int bi = s * 4 + warp;
+            uint32_t a0, a1, a2, a3;
+            if constexpr (Q4) {
+                const uint4 r0 = __ldg(reinterpret_cast<const uint4*>(base_q0 + (size_t) st * 2048 + g * 256 + bi * 16));
+                const uint4 r1 = __ldg(reinterpret_cast<const uint4*>(base_q1 + (size_t) st * 2048 + g * 256 + bi * 16));
+                const uint32_t w0_lo = (tig < 2) ? r0.x : r0.y;
+                const uint32_t w0_hi = (tig < 2) ? r0.z : r0.w;
+                const uint32_t w1_lo = (tig < 2) ? r1.x : r1.y;
+                const uint32_t w1_hi = (tig < 2) ? r1.z : r1.w;
+                const int sh = (tig & 1) ? 4 : 0;
+                a0 = df2_u4x4_to_s8x4((w0_lo >> sh) & 0x0F0F0F0Fu);
+                a2 = df2_u4x4_to_s8x4((w0_hi >> sh) & 0x0F0F0F0Fu);
+                a1 = df2_u4x4_to_s8x4((w1_lo >> sh) & 0x0F0F0F0Fu);
+                a3 = df2_u4x4_to_s8x4((w1_hi >> sh) & 0x0F0F0F0Fu);
+            } else {
+                const uint8_t* p0 = base_q0 + (size_t) st * 4096 + g * 512 + bi * 32;
+                const uint8_t* p1 = base_q1 + (size_t) st * 4096 + g * 512 + bi * 32;
+                a0 = __ldg(reinterpret_cast<const uint32_t*>(p0 + tig * 4));
+                a2 = __ldg(reinterpret_cast<const uint32_t*>(p0 + 16 + tig * 4));
+                a1 = __ldg(reinterpret_cast<const uint32_t*>(p1 + tig * 4));
+                a3 = __ldg(reinterpret_cast<const uint32_t*>(p1 + 16 + tig * 4));
+            }
+            const float dw0 = __half2float(__ldg(base_d0 + (size_t) st * 128 + g * 16 + bi));
+            const float dw1 = __half2float(__ldg(base_d1 + (size_t) st * 128 + g * 16 + bi));
+
+#pragma unroll
+            for (int ct = 0; ct < 8; ++ct) {
+                const int c0 = ct * 8;
+                if (c0 >= nc) break;
+                const int cg = c0 + g;
+                const uint32_t b0 = (cg < nc) ? *reinterpret_cast<const uint32_t*>(&s_xq[cg][warp * 32 + tig * 4]) : 0u;
+                const uint32_t b1 = (cg < nc) ? *reinterpret_cast<const uint32_t*>(&s_xq[cg][warp * 32 + 16 + tig * 4]) : 0u;
+                int32_t d[4] = {0, 0, 0, 0};
+                df2_mma_s8_m16n8k32(d, a0, a1, a2, a3, b0, b1);
+                if (c0 + t0 < nc) {
+                    const float dx0 = s_xd[c0 + t0][warp];
+                    acc[ct][0] = fmaf(dw0 * dx0, (float) d[0], acc[ct][0]);
+                    acc[ct][2] = fmaf(dw1 * dx0, (float) d[2], acc[ct][2]);
+                }
+                if (c0 + t1 < nc) {
+                    const float dx1 = s_xd[c0 + t1][warp];
+                    acc[ct][1] = fmaf(dw0 * dx1, (float) d[1], acc[ct][1]);
+                    acc[ct][3] = fmaf(dw1 * dx1, (float) d[3], acc[ct][3]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    const int r = tid >> 3;
+    const int c = tid & 7;
+    for (int ct = 0; ct < 8; ++ct) {
+        const int c0 = ct * 8;
+        if (c0 >= nc) break;
+        s_out[warp][g][t0] = acc[ct][0];
+        s_out[warp][g][t1] = acc[ct][1];
+        s_out[warp][8 + g][t0] = acc[ct][2];
+        s_out[warp][8 + g][t1] = acc[ct][3];
+        __syncthreads();
+        if (c0 + c < nc) {
+            const float sum = (s_out[0][r][c] + s_out[1][r][c]) + (s_out[2][r][c] + s_out[3][r][c]);
+            sg.y[(size_t) (c_base + c0 + c) * sg.n_out + row0 + r] = sum;
+        }
+        __syncthreads();
+    }
+#else
+    (void) segs; (void) xq; (void) xd; (void) n_in; (void) ncols;
+#endif
 }
 
 // quantize one 32-block of one row to the planar activation layout (a warp: lane = element)
@@ -1196,6 +1698,21 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
         attn_part_wmma_gfx11_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, tag, epoch);
         check("attn_part_wmma_gfx11");
     } else
+#elif !defined(__HIPCC__)
+    static const bool tc_ok = [] {
+        if (const char* e = std::getenv("STRATA_DF2_ATTN_TC"); e && e[0] == '0') return false;
+        int dev = 0, major = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        return major >= 8;
+    }();
+    if (tc_ok) {
+        attn_part_tc_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+        check("attn_part_tc");
+    } else
 #endif
     {
         attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
@@ -1234,6 +1751,12 @@ void df2_rope_table_inv(const int32_t* pos, int rows, const double* inv, float* 
     check("rope_table_inv");
 }
 
+void df2_iota_pos(int32_t* pos, int32_t pos0, int rows, void* stream) {
+    if (rows <= 0) return;
+    iota_pos_kernel<<<(rows + 255) / 256, 256, 0, (cudaStream_t) stream>>>(pos, pos0, rows);
+    check("iota_pos");
+}
+
 void df2_gemm_variant(int v) { g_gemm_variant = v; }
 void df2_attention_variant(int v) { g_attn_variant = v; }
 
@@ -1260,7 +1783,7 @@ static int df2_q4_auto(int rows) {
 #define DF2_Q4_AUTO(rows) df2_q4_auto(rows)
 #endif
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream) {
-    if (n < 1 || n > 3 || n_in % 512 != 0 || ncols < 1 || ncols > 8) throw std::invalid_argument("df2_gemm: unsupported shape");
+    if (n < 1 || n > 3 || n_in % 512 != 0 || ncols < 1) throw std::invalid_argument("df2_gemm: unsupported shape");
     Df2Segs segs;
     int rows = 0;
     for (int i = 0; i < n; ++i) {
@@ -1273,6 +1796,64 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
     segs.n = n;
     const int8_t* xqp = static_cast<const int8_t*>(xq);
     cudaStream_t st = (cudaStream_t) stream;
+    if (ncols > 8) {
+#if !defined(__HIPCC__)
+        static const bool batch_tc_ok = [] {
+            int dev = 0, major = 0;
+            if (cudaGetDevice(&dev) != cudaSuccess ||
+                cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return false;
+            }
+            return major >= 8;
+        }();
+        if (batch_tc_ok && (rows & 15) == 0) {
+            const dim3 grid((unsigned) (rows / 16), (unsigned) ((ncols + 63) / 64));
+            if (mats[0].q4) {
+                gemm_batch_tc_kernel<true><<<grid, 128, 0, st>>>(segs, xqp, xd, n_in, ncols);
+                check("gemm4_batch_tc");
+            } else {
+                gemm_batch_tc_kernel<false><<<grid, 128, 0, st>>>(segs, xqp, xd, n_in, ncols);
+                check("gemm8_batch_tc");
+            }
+            return;
+        }
+#endif
+        const int nb = n_in / 32;
+        for (int c0 = 0; c0 < ncols; c0 += 8) {
+            const int nc = (ncols - c0 < 8) ? (ncols - c0) : 8;
+            Df2Mat sub[3];
+            for (int i = 0; i < n; ++i) {
+                sub[i] = mats[i];
+                sub[i].y = mats[i].y + (size_t) c0 * (size_t) mats[i].n_out;
+            }
+            df2_gemm(sub, n, xqp + (size_t) c0 * (size_t) n_in, xd + (size_t) c0 * (size_t) nb, n_in, nc, stream);
+        }
+        return;
+    }
+#if !defined(__HIPCC__)
+    static const bool tc_gemm_ok = [] {
+        const char* e = std::getenv("STRATA_DF2_GEMM_TC");
+        if (e == nullptr || e[0] == '\0' || e[0] == '0') return false;
+        int dev = 0, major = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        return major >= 8;
+    }();
+    if (tc_gemm_ok && g_gemm_variant == 0 && ncols >= 2 && rows >= 1024 && (rows & 15) == 0) {
+        if (mats[0].q4) {
+            gemm_tc_kernel<true><<<rows / 16, 128, 0, st>>>(segs, xqp, xd, n_in, ncols);
+            check("gemm4_tc");
+        } else {
+            gemm_tc_kernel<false><<<rows / 16, 128, 0, st>>>(segs, xqp, xd, n_in, ncols);
+            check("gemm8_tc");
+        }
+        return;
+    }
+#endif
     if (mats[0].q4) {   // the Q4_0 pack: 4 warps a block when the rows allow, else 2; the rows-a-warp variants (bitwise the same results) by matrix size
         static const int tune4 = [] { const char* e = std::getenv("STRATA_DF2_GEMM4"); return e ? std::atoi(e) : 0; }();   // 0: the table; 1: 8 rows a warp as before; 10 and up: that variant for every matrix (bench / A/B)
         int v4 = g_gemm_variant != 0 ? g_gemm_variant : tune4 >= 10 ? tune4 : tune4 != 0 ? 1 : DF2_Q4_AUTO(rows);

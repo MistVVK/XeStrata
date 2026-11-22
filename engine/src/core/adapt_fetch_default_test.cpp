@@ -69,75 +69,87 @@ int main() {
     CHECK(!adapt_fetch_default_card(10, 0, 16 * GiB));
     CHECK(!adapt_fetch_default_card(6, 0, 16 * GiB));                    // P100 16 GB
 
-    // the table: the sm_120 entries are unchanged, the fifth is the switch, and only for a card the rule takes
+    auto unset_sm120 = [] {
+        for (const char* k : {
+                 "STRATA_ADAPT_FETCH", "STRATA_VERIFY_DEVICE_HITS", "STRATA_L2_PF", "STRATA_HC_UPMIX",
+                 "STRATA_Q80_ROWS1", "STRATA_EXP_MODE", "STRATA_SIDE_MIXER", "STRATA_DEQUANT_SIDE",
+                 "STRATA_QFUSE", "STRATA_LFUSE", "STRATA_PLE_COMPACT", "STRATA_PLE_COPY_STREAM",
+                 "STRATA_PF_FUSED_KQ", "STRATA_HC_Q8", "STRATA_PREFILL_CPU_SHARE_NT", "STRATA_PREFILL_NVFP4"}) {
+            unset(k);
+        }
+    };
+
+    // the table: the sm_120 entries (13 base), + ADAPT_FETCH for <= 16 GiB or + VERIFY_DEVICE_HITS for > 16 GiB
     {
         const auto t = nv_default_env(12, 0, false, 12 * GiB);
-        CHECK(t.size() == 5 && has(t, "STRATA_ADAPT_FETCH", "2") && has(t, "STRATA_HC_UPMIX", "1") && has(t, "STRATA_EXP_MODE", "8"));
-        CHECK(nv_default_env(12, 0, false, 16 * GiB).size() == 5);
-        CHECK(nv_default_env(12, 0, false, 32 * GiB).size() == 4 && lacks(nv_default_env(12, 0, false, 32 * GiB), "STRATA_ADAPT_FETCH"));
-        CHECK(nv_default_env(12, 0, false, 0).size() == 4);              // no memory given: the table of 0.2.16 + BW-A / BW-G
-        CHECK(nv_default_env(12, 0, false).size() == 4);
+        CHECK(t.size() == 14 && has(t, "STRATA_ADAPT_FETCH", "2") && has(t, "STRATA_HC_UPMIX", "1") && has(t, "STRATA_EXP_MODE", "8"));
+        CHECK(nv_default_env(12, 0, false, 16 * GiB).size() == 14);
+        CHECK(nv_default_env(12, 0, false, 32 * GiB).size() == 14 &&
+              has(nv_default_env(12, 0, false, 32 * GiB), "STRATA_VERIFY_DEVICE_HITS", "1") &&
+              lacks(nv_default_env(12, 0, false, 32 * GiB), "STRATA_ADAPT_FETCH"));
+        CHECK(nv_default_env(12, 0, false, 0).size() == 13);              // no memory given: the base sm_120 table
+        CHECK(nv_default_env(12, 0, false).size() == 13);
         CHECK(nv_default_env(12, 0, true, 12 * GiB).empty());           // STRATA_DEFAULTS=026
         put("STRATA_SM120_PERF", "0");
         CHECK(nv_default_env(12, 0, false, 12 * GiB).empty());          // STRATA_SM120_PERF=0 leaves the whole table out, the switch with it
         unset("STRATA_SM120_PERF");
-        CHECK(nv_default_env(12, 1, false, 12 * GiB).size() == 7);       // a 12.1 part: only if it reported 16 GiB or less (the GB10 reports far more)
-        CHECK(nv_default_env(12, 1, false, 121 * GiB).size() == 6);
+        CHECK(nv_default_env(12, 1, false, 12 * GiB).size() == 12);     // a 12.1 part: 11 base + ADAPT_FETCH when <= 16 GiB
+        CHECK(nv_default_env(12, 1, false, 121 * GiB).size() == 12 &&
+              has(nv_default_env(12, 1, false, 121 * GiB), "STRATA_VERIFY_DEVICE_HITS", "1") &&
+              lacks(nv_default_env(12, 1, false, 121 * GiB), "STRATA_ADAPT_FETCH"));
     }
-    // no other architecture gets it, whatever its memory
+    // no other architecture gets ADAPT_FETCH, whatever its memory
     CHECK(lacks(nv_default_env(8, 6, false, 12 * GiB), "STRATA_ADAPT_FETCH"));
+    CHECK(lacks(nv_default_env(8, 9, false, 16 * GiB), "STRATA_ADAPT_FETCH"));
     CHECK(lacks(nv_default_env(6, 0, false, 16 * GiB), "STRATA_ADAPT_FETCH"));
-    CHECK(nv_default_env(8, 9, false, 16 * GiB).empty() && nv_default_env(10, 0, false, 16 * GiB).empty());
+    CHECK(nv_default_env(10, 0, false, 16 * GiB).empty());
 
     // apply_nv_defaults: sets the environment where the user has not
     {
-        unset("STRATA_ADAPT_FETCH");
-        unset("STRATA_L2_PF"); unset("STRATA_HC_UPMIX"); unset("STRATA_Q80_ROWS1"); unset("STRATA_EXP_MODE");
+        unset_sm120();
         const auto set = apply_nv_defaults(12, 0, 12 * GiB);
-        CHECK(in(set, "STRATA_ADAPT_FETCH") && set.size() == 5);
+        CHECK(in(set, "STRATA_ADAPT_FETCH") && set.size() == 14);
         const char* v = val("STRATA_ADAPT_FETCH");
         CHECK(v != nullptr && std::string(v) == "2");
         CHECK(adapt_fetch_is_default());
     }
-    {   // a card over 16 GiB: the 4 earlier entries only, the variable stays unset, the flag is false
-        unset("STRATA_ADAPT_FETCH");
-        unset("STRATA_L2_PF"); unset("STRATA_HC_UPMIX"); unset("STRATA_Q80_ROWS1"); unset("STRATA_EXP_MODE");
+    {   // a card over 16 GiB: the 13 base entries + VERIFY_DEVICE_HITS, ADAPT_FETCH stays unset, the flag is false
+        unset_sm120();
         const auto set = apply_nv_defaults(12, 0, 32 * GiB);
-        CHECK(!in(set, "STRATA_ADAPT_FETCH") && set.size() == 4);
+        CHECK(!in(set, "STRATA_ADAPT_FETCH") && in(set, "STRATA_VERIFY_DEVICE_HITS") && set.size() == 14);
         CHECK(val("STRATA_ADAPT_FETCH") == nullptr);
         CHECK(!adapt_fetch_is_default());
     }
     {   // the user's own value wins, 0 included (the way back), and then the flag is false: the value is not the default's
         for (const char* mine : {"0", "1", "2"}) {
-            unset("STRATA_L2_PF"); unset("STRATA_HC_UPMIX"); unset("STRATA_Q80_ROWS1"); unset("STRATA_EXP_MODE");
+            unset_sm120();
             put("STRATA_ADAPT_FETCH", mine);
             const auto set = apply_nv_defaults(12, 0, 12 * GiB);
-            CHECK(!in(set, "STRATA_ADAPT_FETCH") && set.size() == 4);
+            CHECK(!in(set, "STRATA_ADAPT_FETCH") && set.size() == 13);
             const char* v = val("STRATA_ADAPT_FETCH");
             CHECK(v != nullptr && std::string(v) == mine);
             CHECK(!adapt_fetch_is_default());
         }
-        unset("STRATA_ADAPT_FETCH");
+        unset_sm120();
     }
     {   // STRATA_SM120_PERF=0: nothing of the table is set, so no switch either
-        unset("STRATA_ADAPT_FETCH");
+        unset_sm120();
         put("STRATA_SM120_PERF", "0");
         const auto set = apply_nv_defaults(12, 0, 12 * GiB);
         CHECK(set.empty() && val("STRATA_ADAPT_FETCH") == nullptr && !adapt_fetch_is_default());
         unset("STRATA_SM120_PERF");
     }
     {   // an older card with 12 GiB: the architecture decides, not the memory
-        unset("STRATA_ADAPT_FETCH");
+        unset_sm120();
         const auto set = apply_nv_defaults(8, 6, 12 * GiB);
         CHECK(!in(set, "STRATA_ADAPT_FETCH") && val("STRATA_ADAPT_FETCH") == nullptr && !adapt_fetch_is_default());
     }
-    {   // no memory given (the two-argument call of the other callers): as before
-        unset("STRATA_ADAPT_FETCH");
-        unset("STRATA_L2_PF"); unset("STRATA_HC_UPMIX"); unset("STRATA_Q80_ROWS1"); unset("STRATA_EXP_MODE");
+    {   // no memory given (the two-argument call of the other callers): as before (13 base entries)
+        unset_sm120();
         const auto set = apply_nv_defaults(12, 0);
-        CHECK(set.size() == 4 && val("STRATA_ADAPT_FETCH") == nullptr && !adapt_fetch_is_default());
+        CHECK(set.size() == 13 && val("STRATA_ADAPT_FETCH") == nullptr && !adapt_fetch_is_default());
     }
-    unset("STRATA_ADAPT_FETCH");
+    unset_sm120();
     if (fails == 0) std::printf("adapt_fetch_default_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

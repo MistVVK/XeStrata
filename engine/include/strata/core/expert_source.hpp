@@ -415,6 +415,7 @@ struct GpuPlanSink {
     int pcie_mode = 0;
     int32_t cpu_jobs = 0;   ///< host only: the distinct experts the pool computes for the layer just published
     float* hit_out_dev = nullptr;   ///< device address of this group's hit_out buffer on the primary GPU (P2P peer scatter)
+    bool device_hits_only = false;   ///< STRATA_VERIFY_DEVICE_HITS=1: GPU built its own hit plan; host only marks kind[]
 };
 
 /// Verifier::set_pcie_balance: a verify window's costs, fitted to each layer's measured times (ms, least squares with

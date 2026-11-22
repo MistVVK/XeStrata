@@ -112,6 +112,8 @@ private:
     static std::atomic<bool>& w16_auto_default_() { static std::atomic<bool> v{false}; return v; }
     void* hipblaslt_state_ = nullptr;
     void* rocblas_state_ = nullptr;   // HIP: the rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING)
+    void* mxfp8_state_ = nullptr;     // CUDA 12.8+ sm_120+: cuBLASLt MXFP8 (VEC32_UE8M0) dense prefill state
+    size_t ws_bytes_ = 0;
     bool f16_io_ = false;
     /// cuBLAS 12 answers the default FP16 algorithm of a few (N, K) shapes with CUBLAS_STATUS_INTERNAL_ERROR once
     /// another CUDA device in the process has initialized its context (issue #1650, Turing + Pascal).  A fixed
