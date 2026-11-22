@@ -53,15 +53,14 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_GU_SWIGLU", "1"},           // -0.8, -1.4
             {"STRATA_QSA_ROWS", "1"},            // -0.5, -1.2
             {"STRATA_B6_MMVQ_ROWS", "1"},        // A4000 0, 3060 -1.7
-            // 0.2.19 sm_86 (RTX 3090 24 GB / A4000 16 GB): bit-exact pipeline/PLE/quant fusions + Q8_0 HC (with sm_80+
-            // 320-CTA INT8 TC gr_up_q8_tc saving ~600 MiB VRAM & -0.62 ms/round) + fused K-quant prompt kernels.
+            // 0.2.19 sm_86 (RTX 3090 24 GB / A4000 16 GB): bit-exact pipeline/PLE/quant fusions + fused K-quant prompt
+            // kernels. (STRATA_HC_Q8=1 remains opt-in: +0.764 pts on 11,121-tok force_check.)
             {"STRATA_DEQUANT_SIDE", "1"},
             {"STRATA_QFUSE", "1"},
             {"STRATA_LFUSE", "1"},
             {"STRATA_PLE_COMPACT", "1"},
             {"STRATA_PLE_COPY_STREAM", "1"},
             {"STRATA_PF_FUSED_KQ", "1"},
-            {"STRATA_HC_Q8", "1"},
         };
         if (main_vram_bytes > kAdaptFetchMaxVramBytes) t.push_back({"STRATA_VERIFY_DEVICE_HITS", "1"});
     } else if (mj == 8 && mn == 9) {
@@ -80,7 +79,6 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_PLE_COMPACT", "1"},
             {"STRATA_PLE_COPY_STREAM", "1"},
             {"STRATA_PF_FUSED_KQ", "1"},
-            {"STRATA_HC_Q8", "1"},
             {"STRATA_PREFILL_CPU_SHARE_NT", "32"},
         };
         if (main_vram_bytes > kAdaptFetchMaxVramBytes) t.push_back({"STRATA_VERIFY_DEVICE_HITS", "1"});
@@ -100,9 +98,8 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_Q80_ROWS1", "1"},
             // the grouped native experts' mode-8 layout (the GB10 / P100 / P40 default; exact against the CUDA layout on UD-Q4_K_XL)
             {"STRATA_EXP_MODE", "8"},
-            // 0.2.19 sm_120 (RTX 5090 / RTX PRO 5000 Blackwell): exact overlap/PLE/quant fusions + Q8_0 HC (320-CTA
-            // INT8 TC gr_up_q8_tc, -0.62 ms/round & ~600 MiB VRAM saved) + fused K-quant prompt kernels + wide CPU
-            // prefill share + native sm_120a mxf4nvf4 NVFP4 prefill (STRATA_HC_Q8=0 turns Q8_0 HC off).
+            // 0.2.19 sm_120 (RTX 5090 / RTX PRO 5000 Blackwell): exact overlap/PLE/quant fusions (0.000 pts on 11,121-tok
+            // force_check) + fused K-quant prompt kernels + wide CPU prefill share + native sm_120a mxf4nvf4 NVFP4 prefill.
             {"STRATA_SIDE_MIXER", "2"},
             {"STRATA_DEQUANT_SIDE", "1"},
             {"STRATA_QFUSE", "1"},
@@ -110,7 +107,6 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_PLE_COMPACT", "1"},
             {"STRATA_PLE_COPY_STREAM", "1"},
             {"STRATA_PF_FUSED_KQ", "1"},
-            {"STRATA_HC_Q8", "1"},
             {"STRATA_PREFILL_CPU_SHARE_NT", "32"},
             {"STRATA_PREFILL_NVFP4", "w4a4"},
         };
@@ -162,14 +158,13 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             // Measured on IQ3_S: decode 1.047x [1.019, 1.079], prompt unchanged, 24 of 24 greedy answers byte-identical.
             // It only changes which drafts are attempted, and every draft is verified, so the answers cannot drift.
             {"STRATA_SPEC_COST", "1"},
-            // 0.2.19 sm_121 (DGX Spark GB10 Blackwell): pipeline/PLE/quant fusions + Q8_0 HC (INT8 TC gr_up_q8_tc) +
-            // native sm_121a mxf4nvf4 NVFP4 prefill (STRATA_SM121_PERF=0 or per-switch =0 turns off).
+            // 0.2.19 sm_121 (DGX Spark GB10 Blackwell): bit-exact pipeline/PLE/quant fusions + native sm_121a mxf4nvf4
+            // NVFP4 prefill (STRATA_SM121_PERF=0 or per-switch =0 turns off).
             {"STRATA_DEQUANT_SIDE", "1"},
             {"STRATA_QFUSE", "1"},
             {"STRATA_LFUSE", "1"},
             {"STRATA_PLE_COMPACT", "1"},
             {"STRATA_PLE_COPY_STREAM", "1"},
-            {"STRATA_HC_Q8", "1"},
             {"STRATA_PREFILL_NVFP4", "w4a4"},
         };
         // a 12.1 part reports its unified memory, far above 16 GiB, so ADAPT_FETCH stays off and on-device verify hit planning turns on
