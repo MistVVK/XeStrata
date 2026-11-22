@@ -1560,6 +1560,12 @@ if(STRATA_ENABLE_XE)
     add_executable(qsa_parity src/kernels/qsa_parity.cpp)
     target_link_libraries(qsa_parity PRIVATE strata_kernels)
     add_test(NAME qsa_parity COMMAND qsa_parity --selftest)
+    # QSA selection against the 14 recorded reference fixtures (64 sampled positions each = 896).  The five
+    # accepted deviations are listed by visit, position and block size in qsa_parity; any other deviation fails.
+    # The fixtures live outside the tree: XESTRATA_QSA_896_FIXTURES names their directory, and the test skips
+    # when it is absent.
+    add_test(NAME qsa_selection_896_fixture COMMAND qsa_parity --qsa-896-fixture)
+    set_tests_properties(qsa_selection_896_fixture PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
     # perf-review D-1: the prompt attention against the FP32 kernel and FP64 (a benchmark too: not a CTest case,
     # as in the CUDA build)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)

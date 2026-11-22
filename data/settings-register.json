@@ -1702,6 +1702,11 @@
     "src/core/verify.cpp:1070"
    ]
   },
+  "QSA_896_FIXTURES": {
+   "reads": [
+    "src/kernels/qsa_parity.cpp:698"
+   ]
+  },
   "QSA_DUMP": {
    "reads": [
     "src/prefill/prefill.cpp:3305"
