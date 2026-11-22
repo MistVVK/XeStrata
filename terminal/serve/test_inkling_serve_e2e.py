@@ -301,11 +301,11 @@ class TestInklingServeE2E(unittest.TestCase):
                 # Verify wire protocol recorded exact reasoning effort levels & image= key
                 lines = h.record_path.read_text(encoding="utf-8").splitlines()
                 self.assertEqual(len(lines), 4)
-                # Decode prompt tokens from request 1 (low=0.2) and request 2 (max=0.99)
+                # Decode prompt tokens: Inkling-2-Mini has no thinking mode so all requests render Thinking effort level: 0.0
                 p1 = h.tok.decode([int(x) for x in lines[0].split()[-1].split(",")])
                 p2 = h.tok.decode([int(x) for x in lines[1].split()[-1].split(",")])
-                self.assertIn("Thinking effort level: 0.2", p1)
-                self.assertIn("Thinking effort level: 0.99", p2)
+                self.assertIn("Thinking effort level: 0.0", p1)
+                self.assertIn("Thinking effort level: 0.0", p2)
                 self.assertIn("image=", lines[2])
 
     def test_concurrent_streaming_4_8_32_64(self):

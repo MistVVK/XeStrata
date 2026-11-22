@@ -24,7 +24,6 @@ const modes: {
 ];
 const efforts = ['Off', 'Low', 'Medium', 'High', 'Max'];
 const hy4Efforts = ['Off', 'High', 'Max'];
-const inklingEfforts = ['Off', 'Minimal', 'Low', 'Medium', 'High', 'Max'];
 /** The most tokens a reply may spend thinking (the server's reasoning_budget_tokens); 0 = no limit. */
 const THINKING_BUDGETS: [number, string][] = [[0, 'No limit'], [2048, '2K'], [8192, '8K'], [32768, '32K']];
 const textTypes = /\.(txt|md|markdown|csv|tsx?|jsx?|py|json|css|rs|go|sh|html?|ya?ml|toml|xml|log)$/i;
@@ -78,9 +77,9 @@ export function ComposerControls({ session, onPreview, onAttach, onError, onSlas
     const pictures = pictureStatus(native, remoteModel, providers);
     const isHy4Active = !remoteModel && !!nativeModel && /^hy4-flash/i.test(nativeModel.model);
     const isInklingActive = !remoteModel && !!nativeModel && /^inkling-2-mini/i.test(nativeModel.model);
-    const activeEfforts = isHy4Active ? hy4Efforts : isInklingActive ? inklingEfforts : efforts;
+    const activeEfforts = isHy4Active ? hy4Efforts : efforts;
     const mode = modes.find(m => m.value === session?.preferences?.mode) ?? modes[0];
-    const effort = activeEfforts.includes(session?.preferences?.thinking ?? '') ? session!.preferences!.thinking! : ((isHy4Active || isInklingActive) ? 'High' : 'Medium');
+    const effort = isInklingActive ? 'Off' : (activeEfforts.includes(session?.preferences?.thinking ?? '') ? session!.preferences!.thinking! : (isHy4Active ? 'High' : 'Medium'));
     const budget = session?.preferences?.thinkingBudget ?? 0;
     const shortcut = MOD === '⌘' ? '⌘⇧A' : 'Ctrl+Shift+A';
     async function openFile(selected: File | undefined) {
@@ -203,7 +202,7 @@ export function ComposerControls({ session, onPreview, onAttach, onError, onSlas
     <DictationControl draft={draft} onDraft={onDraft} sessionId={session?.id} disabled={streaming}/>
     <button ref={modeTrigger} className="composer-choice composer-mode" aria-label={tr("Mode: {0}", [tr(mode.label)])} aria-haspopup="menu" aria-expanded={preferences === 'mode'} onClick={() => { setMenu(false); setPreferences(v => v === 'mode' ? null : 'mode'); }}><span>{tr(mode.label)}</span><Icon name="chevron" size={13}/></button>
     <span className="spacer"/>
-    <button ref={thinkingTrigger} className="composer-choice composer-effort" disabled={apiOnlyDefault} title={tr(apiOnlyDefault ? "Reasoning uses the API provider’s defaults." : undefined)} aria-label={tr("Reasoning effort: {0}", [apiOnlyDefault ? tr('Provider default') : effort])} aria-haspopup="menu" aria-expanded={preferences === 'thinking'} onClick={() => { setMenu(false); setPreferences(v => v === 'thinking' ? null : 'thinking'); }}><Icon name="thinking" size={16}/><span>{tr(apiOnlyDefault ? 'Default' : effort)}</span><Icon name="chevron" size={13}/></button>
+    {isInklingActive ? null : <button ref={thinkingTrigger} className="composer-choice composer-effort" disabled={apiOnlyDefault} title={tr(apiOnlyDefault ? "Reasoning uses the API provider’s defaults." : undefined)} aria-label={tr("Reasoning effort: {0}", [apiOnlyDefault ? tr('Provider default') : effort])} aria-haspopup="menu" aria-expanded={preferences === 'thinking'} onClick={() => { setMenu(false); setPreferences(v => v === 'thinking' ? null : 'thinking'); }}><Icon name="thinking" size={16}/><span>{tr(apiOnlyDefault ? 'Default' : effort)}</span><Icon name="chevron" size={13}/></button>}
     {tr(menu ? <FloatingMenu anchor={trigger.current} title={tr("Add or open")} width={292} onClose={() => setMenu(false)}>
       <button role="menuitem" className="menu__item" onClick={() => { setMenu(false); files.current?.click(); }}><Icon name="attach"/><span>{tr("Add files or photos")}</span><kbd className="menu-shortcut">{tr(shortcut)}</kbd></button>
       <button role="menuitem" className="menu__item" onClick={() => { setMenu(false); folder.current?.click(); }}><Icon name="folder-plus"/>{tr("Add folder")}</button>

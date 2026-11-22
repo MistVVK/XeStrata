@@ -228,8 +228,8 @@ export function compactionThreshold(context, outputBudget, env = process.env) {
 export const LOCAL_EFFORTS = Object.freeze({ off: null, low: 'low', medium: 'medium', high: 'high', max: 'high' });
 /** Thinking levels for Tencent Hy4-Flash: Off, High (default), Max (passes max through to strata-hy4's max reasoning budget). */
 export const HY4_LOCAL_EFFORTS = Object.freeze({ off: null, low: 'high', medium: 'high', high: 'high', max: 'max' });
-/** Thinking levels for Inkling-2-Mini: full native spectrum Off (none), Minimal, Low, Medium, High (default), Max. */
-export const INKLING_LOCAL_EFFORTS = Object.freeze({ off: 'none', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', max: 'max' });
+/** Inkling-2-Mini has no thinking mode: default is off ("none") and that's it. */
+export const INKLING_LOCAL_EFFORTS = Object.freeze({ off: 'none' });
 /** The menu's words to the Harness's level names. */
 export const EFFORT_LEVEL = Object.freeze({ off: 'off', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', max: 'max' });
 /**
@@ -309,6 +309,8 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
     // does not authenticate gets a fixed placeholder; one that does gets its real key, by reference.
     env[keyEnv] = inst.key || 'strata-local';
     const context = inst.context ?? 32768;
+    const isInklingModel = /^inkling-2-mini/i.test(String(inst.modelId ?? ''));
+    const isHy4Model = /^hy4-flash/i.test(String(inst.modelId ?? ''));
     providers[route] = {
       displayName: inst.label ? `Strata (local) ${inst.label}` : 'Strata (local)',
       api: 'openai-completions',
@@ -319,11 +321,13 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
       streamIdleTimeoutMs: 60 * 60_000,
       // The Strata server reads the thinking level from `chat_template_kwargs` (enable_thinking, reasoning_effort) or from a top-level
       // reasoning_effort; a top-level `enable_thinking` (pi-ai's `qwen` format) is ignored, so the model went on thinking with the menu on Off.
-      compat: THINKING_COMPAT,
+      // Inkling-2-Mini has no thinking mode (always off / reasoning_effort="none").
+      compat: isInklingModel ? { supportsStore: false } : THINKING_COMPAT,
       models: [{
         id: inst.modelId, name: inst.label || inst.modelId, contextWindow: context, maxTokens: localOutputBudget(context),
         input: inst.vision ? ['text', 'image'] : ['text'],
-        reasoning: true, reasoningEfforts: /^hy4-flash/i.test(String(inst.modelId ?? '')) ? HY4_LOCAL_EFFORTS : /^inkling-2-mini/i.test(String(inst.modelId ?? '')) ? INKLING_LOCAL_EFFORTS : LOCAL_EFFORTS,
+        reasoning: !isInklingModel,
+        ...(isInklingModel ? {} : { reasoningEfforts: isHy4Model ? HY4_LOCAL_EFFORTS : LOCAL_EFFORTS }),
       }],
     };
     compaction.push({ provider: route, model: inst.modelId, headroomTokens: compactionHeadroom(context, localOutputBudget(context)), thresholdRatio: thresholdRatio() });

@@ -97,6 +97,8 @@ def flow_for(ctx, family: str | None = None) -> list[str]:
     if fam == "hy4-flash":
         return ["model", "folder", "context", "pictures", "access", "save"]
     if fam == "inkling-2-mini":
+        if len(ctx.computer.usable_gpus) >= 2:
+            return ["model", "folder", "cards", "context", "pictures", "parallel", "access", "save"]
         return ["model", "folder", "context", "pictures", "parallel", "access", "save"]
     ids = [sid for sid, _ in STEPS]
     if len(ctx.computer.usable_gpus) < 2:

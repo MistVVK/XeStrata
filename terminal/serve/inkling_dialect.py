@@ -266,54 +266,24 @@ def translate(text: str) -> str:
     return InklingDialect().feed(text, final=True)
 
 
-# ---- reasoning effort: Inkling-2-Mini natively supports all 6 levels (none/minimal/low/medium/high/max, default high) ----
+# ---- thinking mode: Inkling-2-Mini has NO thinking mode (default is off / "none", and that's it) ----
+DEFAULT_EFFORT = "none"
 EFFORT = {
     "none": "none", "off": "none", "no_think": "none", "disabled": "none", "false": "none", "0": "none", "0.0": "none",
-    "minimal": "minimal", "min": "minimal", "0.1": "minimal",
-    "low": "low", "0.2": "low",
-    "medium": "medium", "med": "medium", "0.7": "medium",
-    "high": "high", "auto": "high", "default": "high", "0.9": "high",
-    "max": "max", "maximum": "max", "xhigh": "max", "0.99": "max",
 }
 
 
-def normalize_effort(value) -> str:
-    if value is False:
-        return "none"
-    if value is True or value is None or value == "":
-        return "high"
-    if isinstance(value, (int, float)):
-        v = float(value)
-        if v <= 0.0:
-            return "none"
-        if v <= 0.15:
-            return "minimal"
-        if v <= 0.45:
-            return "low"
-        if v <= 0.8:
-            return "medium"
-        if v <= 0.95:
-            return "high"
-        return "max"
-    key = str(value).strip().lower()
-    if key in EFFORT:
-        return EFFORT[key]
-    return "high"
+def normalize_effort(value=None) -> str:
+    """Inkling-2-Mini has no thinking mode: always normalizes to `"none"` (`Thinking effort level: 0`)."""
+    return DEFAULT_EFFORT
 
 
 def template_kwargs(kwargs: dict) -> dict:
-    """Normalize kwargs for Inkling-2-Mini's chat_template.jinja (`reasoning_effort` in none|minimal|low|medium|high|max)."""
+    """Normalize kwargs for Inkling-2-Mini's chat_template.jinja: always enforces thinking off (`reasoning_effort="none"`)."""
     out = dict(kwargs)
-    if "thinking_mode" in out:
-        tm = out.pop("thinking_mode")
-        if out.get("reasoning_effort") in (None, ""):
-            out["reasoning_effort"] = tm
-    if out.get("enable_thinking") is False:
-        out["reasoning_effort"] = "none"
-    elif out.get("reasoning_effort") not in (None, ""):
-        out["reasoning_effort"] = normalize_effort(out["reasoning_effort"])
-    else:
-        out.pop("reasoning_effort", None)
+    out.pop("thinking_mode", None)
+    out["enable_thinking"] = False
+    out["reasoning_effort"] = DEFAULT_EFFORT
     return out
 
 

@@ -186,7 +186,7 @@ def build(src: Path, backend: str, version: str, target: str, out: Path, *, entr
         problems = hipblaslt_tuning.check_stage(src, archs)
         if problems:
             raise SystemExit("refusing to package the AMD engine:\n  " + "\n  ".join(problems))
-    entrypoint = entry or (shape_engine.exe_name(shape) if shape in shape_engine.CUSTOM_SHAPES else ("strata.exe" if target.startswith("windows") else "strata"))
+    entrypoint = entry or (shape_engine.exe_name(shape, target=target) if shape in shape_engine.CUSTOM_SHAPES else ("strata.exe" if target.startswith("windows") else "strata"))
     if not (src / entrypoint).is_file():
         raise SystemExit(f"{src / entrypoint} does not exist")
     if check_reader and shape not in shape_engine.CUSTOM_SHAPES:   # custom shape runners (Hy4-Flash, Inkling-2-Mini) read pictures inside their runner (no strata-vision)

@@ -77,16 +77,41 @@ class TestInklingDialect(unittest.TestCase):
         calls = [ev.call for ev in events if ev.kind == "tool_call" and ev.call is not None]
         self.assertEqual([c.arguments["path"] for c in calls], ["a.py", "b.py"])
 
-    def test_all_six_reasoning_effort_levels(self):
+    def test_no_thinking_mode_always_off(self):
+        # Inkling-2-Mini has no thinking mode: default is off ("none") and every input normalizes to "none"
+        for level in (None, "", "none", "off", "minimal", "low", "medium", "high", "max", "xhigh", 0.0, 0.9):
+            self.assertEqual(inkling_dialect.normalize_effort(level), "none")
+        self.assertEqual(inkling_dialect.template_kwargs({}), {"enable_thinking": False, "reasoning_effort": "none"})
         for level in ("none", "minimal", "low", "medium", "high", "max"):
             got = inkling_dialect.template_kwargs({"reasoning_effort": level})
-            self.assertEqual(got, {"reasoning_effort": level})
-        # Aliases normalize cleanly
-        self.assertEqual(inkling_dialect.normalize_effort("xhigh"), "max")
-        self.assertEqual(inkling_dialect.normalize_effort(0.0), "none")
-        self.assertEqual(inkling_dialect.normalize_effort(0.9), "high")
-        # enable_thinking=False maps to none
-        self.assertEqual(inkling_dialect.template_kwargs({"enable_thinking": False}), {"enable_thinking": False, "reasoning_effort": "none"})
+            self.assertEqual(got, {"enable_thinking": False, "reasoning_effort": "none"})
+        self.assertEqual(inkling_dialect.template_kwargs({"enable_thinking": True, "thinking_mode": "high"}), {"enable_thinking": False, "reasoning_effort": "none"})
+
+    def test_chat_template_empty_kwargs_forces_effort_zero_and_caps_no_reasoning(self):
+        import tempfile
+        tpl_src = (
+            "{%- set effort_map = {'none': 0.0, 'high': 0.9} -%}"
+            "{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}"
+            "{%- set num = effort_map[eff] if eff is string else eff -%}"
+            "<|message_system|><|content_text|>Thinking effort level: {% if num == 0.0 %}0{% else %}{{ num }}{% endif %}<|end_message|>"
+            "{%- if tools -%}<|message_system|>tool_declare<|content_xml|>{{ tools | tojson }}<|end_message|>{%- endif -%}"
+            "{%- for m in messages -%}"
+            "{%- if m.role == 'system' -%}<|message_system|><|content_text|>{{ m.content }}<|end_message|>"
+            "{%- elif m.role == 'user' -%}<|message_user|><|content_text|>{{ m.content }}<|end_message|>"
+            "{%- elif m.role == 'assistant' -%}"
+            "{%- if m.tool_calls -%}{%- for tc in m.tool_calls -%}<|message_model|>{{ tc.function.name }}<|content_invoke_tool_json|>{{ tc.function.arguments | tojson }}<|end_message|>{%- endfor -%}{%- endif -%}"
+            "{%- if m.content -%}<|message_model|><|content_text|>{{ m.content }}<|end_message|>{%- endif -%}"
+            "{%- elif m.role == 'tool' -%}<|message_tool|><|content_text|>{{ m.content }}<|end_message|>{%- endif -%}"
+            "{%- endfor -%}"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "chat_template.jinja"
+            p.write_text(tpl_src, encoding="utf-8")
+            tpl = frontend.ChatTemplate(p)
+            rendered = tpl.render([{"role": "user", "content": "hi"}])
+            self.assertIn("Thinking effort level: 0<|end_message|>", rendered)
+            self.assertFalse(tpl.caps["supports_preserve_reasoning"])
+            self.assertTrue(tpl.caps["supports_tools"])
 
     def test_prepare_messages_converts_json_string_tool_args_to_dicts(self):
         msgs = [
@@ -129,11 +154,13 @@ class TestInklingDialect(unittest.TestCase):
             inkling_kind.refuse(_FakeEngine(), {"logprobs": True})
 
         built = inkling_kind.engine_args(
-            {"args": ["--native", "Inkling-2-Mini-SQ-20.strata", "--max-context", "32768", "--vision", "Inkling-2-Mini-Vision.strata"], "parallel": 32},
+            {"args": ["--native", "Inkling-2-Mini-SQ-20.strata", "--max-context", "32768", "--vision", "Inkling-2-Mini-Vision.strata"], "parallel": 32, "gpu": [0, 1]},
             announce=False,
         )
         self.assertIn("--parallel", built)
         self.assertEqual(built[built.index("--parallel") + 1], "32")
+        self.assertIn("--gpus", built)
+        self.assertEqual(built[built.index("--gpus") + 1], "2")
 
 
 if __name__ == "__main__":

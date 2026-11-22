@@ -31,8 +31,9 @@ DEFAULT_VISION = True
 DEFAULT_PARALLEL = inkling_fit.DEFAULT_PARALLEL
 PARALLEL_CHOICES = inkling_fit.PARALLEL_CHOICES
 MAX_PARALLEL = inkling_fit.MAX_PARALLEL
-REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "max")
-DEFAULT_REASONING_EFFORT = "high"
+REASONING_EFFORTS = ("none",)
+DEFAULT_REASONING_EFFORT = "none"
+HAS_THINKING = False
 
 #: file name -> (bytes, sha256 or None)
 FILES = {

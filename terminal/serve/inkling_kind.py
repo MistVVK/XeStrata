@@ -1,5 +1,5 @@
-"""The Inkling-2-Mini engine as serve sees it: its own shape engine program (`strata-inkling`, component `strata-inkling2`),
-with native DSpark speculative drafting, on-demand in-process Vision, and `1..64` continuous-batching parallelism (`--parallel`).
+"""The Inkling-2-Mini engine as serve sees it: its own shape engine program (`strata-inkling`, component `strata-inkling`),
+with native DSpark speculative drafting, on-demand in-process Vision, `--gpus 2` dual-GPU EP, and `1..64` continuous-batching parallelism (`--parallel`).
 """
 from __future__ import annotations
 
@@ -98,6 +98,10 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     if isinstance(par, int) and 1 <= par <= inkling_family.MAX_PARALLEL and "--parallel" not in args:
         if par > 1:
             args += ["--parallel", str(par)]
+    # Propagate 2-GPU selection (`cfg["gpu"] = [0, 1]`) into `--gpus 2` for dual-GPU Expert Parallelism
+    gpu_cfg = cfg.get("gpu")
+    if isinstance(gpu_cfg, (list, tuple)) and len(gpu_cfg) >= 2 and "--gpus" not in args:
+        args += ["--gpus", str(min(2, len(gpu_cfg)))]
     wants_images = "--vision" in args
     need_draft = "--draft" not in args and wants_drafter(cfg)
     info = probe(exe, args, cfg) if (exe and (wants_images or need_draft)) else None

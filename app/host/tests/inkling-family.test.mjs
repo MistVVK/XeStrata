@@ -136,17 +136,21 @@ test('inklingVisionShard, withoutInklingVision, runtimeVision, and markPictures 
   assert.equal(inkFam.sizes[0].images, true);
 });
 
-test('profile.mjs exposes all 6 Inkling-2-Mini reasoning efforts (none..max)', async () => {
-  const { INKLING_LOCAL_EFFORTS } = await import('../server/agent/profile.mjs');
-  assert.deepEqual(
-    Object.values(INKLING_LOCAL_EFFORTS),
-    ['none', 'minimal', 'low', 'medium', 'high', 'max'],
-  );
+test('profile.mjs disables thinking mode for Inkling-2-Mini (off only) and run-config-check allows parallel 64', async () => {
+  const { INKLING_LOCAL_EFFORTS, buildProfile } = await import('../server/agent/profile.mjs');
+  assert.deepEqual(INKLING_LOCAL_EFFORTS, { off: 'none' });
+  const prof = buildProfile({
+    local: [{ id: 'ink', label: 'Inkling-2-Mini SQ-20', baseUrl: 'http://127.0.0.1:8080/v1', modelId: 'inkling-2-mini-sq-20', context: 32768, vision: true, slots: 8 }],
+  });
+  assert.match(prof.patch, /"reasoning": false/);
+  assert.doesNotMatch(prof.patch, /"thinkingFormat": "chat-template"/);
   // Also verify run-config-check allows parallel up to 64 for Inkling-2-Mini
   const checked64 = checkRunConfig(JSON.stringify({
     exe: 'component:strata-inkling',
     arch: 'inkling2_loop',
     parallel: 64,
+    gpu: [0, 1],
+    args: ['--native', 'Inkling-2-Mini-SQ-20.strata', '--gpus', '2', '--parallel', '64'],
   }));
   assert.equal(checked64.ok, true, JSON.stringify(checked64.issues));
 });

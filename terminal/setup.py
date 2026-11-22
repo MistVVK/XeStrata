@@ -10194,6 +10194,9 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
     vram_gib, ram_gib, unified, igpu, arch = inkling_pc(gpu, ram)
+    dual_gpus = [g for g in (multi or []) if g.get("vendor", "nvidia") == "nvidia"] if (not hip and not amd and not unified) else []
+    if len(dual_gpus) >= 2:
+        vram_gib = sum(float(g.get("vram_gb") or 0.0) for g in dual_gpus[:2])
     vision = a.vision not in ("no", "none")
     want_ctx = a.context or inkling_family.DEFAULT_CONTEXT
     lines = inkling_menu_lines(vram_gib, ram_gib, unified, want_ctx, vision, igpu=igpu, arch=arch)
@@ -10261,7 +10264,9 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     args = ["--native", str(paths[files[0]]), "--max-context", str(ctx)]
     if vision:
         args += ["--vision", str(paths[inkling_family.VISION_FILE])]
-    if not unified:
+    if len(dual_gpus) >= 2:
+        args += ["--gpus", "2"]
+    if not unified and len(dual_gpus) < 2:
         args += ["--vram-experts-gb", f"{placed['vram_gb']:.2f}", "--ram-experts-gb", f"{placed['ram_gb']:.2f}"]
     cfg = {
         "exe": engine_exe(eng),
@@ -10274,7 +10279,6 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         "lib_dirs": lib_dirs,
         "port": port,
         "drafting": inkling_family.DEFAULT_DRAFTER,
-        "reasoning_effort": inkling_family.DEFAULT_REASONING_EFFORT,
         "parallel": inkling_family.DEFAULT_PARALLEL,
     }
     if hip:
@@ -10283,7 +10287,10 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         cfg["backend"] = "metal"
     elif a.backend == "sycl":
         cfg["backend"] = "sycl"
-    if gpu.get("count", 1) > 1 or a.gpu is not None:
+    if len(dual_gpus) >= 2:
+        cfg["gpu"] = [g["index"] for g in dual_gpus[:2]]
+        cfg["gpus_asked"] = True
+    elif gpu.get("count", 1) > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]
         cfg["gpus_asked"] = True
     if a.host:

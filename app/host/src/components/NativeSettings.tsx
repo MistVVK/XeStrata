@@ -12,8 +12,8 @@ import { choiceOptions, choiceValue, isNumberChoice, withChoice } from '../lib/s
 import { HY4_FAMILY, INKLING_FAMILY } from '../lib/native-catalog';
 /** Native engine fields that apply only to the Qwen Flash-Next engine (strata-hy4 ignores them). */
 const HY4_HIDDEN_FIELDS = new Set(['mtp', 'batchMtp', 'layer_split', 'gpu_order', 'split_skip_if_fits', 'vram_elastic', 'vram_reserve_mib', 'vision_tokens', 'vision_min_tokens', 'parallel', 'effort_position', 'anthropic_thinking']);
-/** Native engine fields that Inkling-2-Mini (strata-inkling) ignores — note `parallel` (1..64) IS shown! */
-const INKLING_HIDDEN_FIELDS = new Set(['mtp', 'batchMtp', 'layer_split', 'gpu_order', 'split_skip_if_fits', 'vram_elastic', 'vram_reserve_mib', 'vision_tokens', 'vision_min_tokens', 'effort_position', 'anthropic_thinking']);
+/** Native engine fields that Inkling-2-Mini (strata-inkling) ignores — no thinking mode, and `parallel` (1..64) IS shown! */
+const INKLING_HIDDEN_FIELDS = new Set(['mtp', 'batchMtp', 'layer_split', 'gpu_order', 'split_skip_if_fits', 'vram_elastic', 'vram_reserve_mib', 'vision_tokens', 'vision_min_tokens', 'reasoning_budget_tokens', 'effort_position', 'anthropic_thinking']);
 /** One of the speed features: what it is called, what it does, whether it is on by default, and the engine environment it writes outside its default (server/native-settings.mjs). */
 interface SpeedSwitch {
     id: string;

@@ -82,8 +82,7 @@ class ChatTemplate:
         elif self._is_inkling2:
             from serve import inkling_dialect
             messages = inkling_dialect.prepare_messages(messages)
-            if kwargs:
-                kwargs = inkling_dialect.template_kwargs(kwargs)
+            kwargs = inkling_dialect.template_kwargs(kwargs)
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
@@ -138,7 +137,7 @@ class ChatTemplate:
                     "supports_tool_calls": inkling_calls(1),
                     "supports_system_role": "strata_caps_system" in render([{"role": "system", "content": "strata_caps_system"}, user]),
                     "supports_parallel_tool_calls": inkling_calls(2),
-                    "supports_preserve_reasoning": "<|content_thinking|>strata_caps_reasoning" in render(history, tools)}
+                    "supports_preserve_reasoning": False}
         if "<tool_calls{}>" in self.source:      # Hy4-Flash (serve/hy4_dialect.py): its own spelling of the same capabilities
             def hy4_calls(count):
                 calls = [{"name": f"strata_caps_call_{i}", "arguments": {"arg": f"strata_caps_arg_{i}"}} for i in range(count)]

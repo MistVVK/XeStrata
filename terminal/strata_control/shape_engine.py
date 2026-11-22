@@ -127,14 +127,15 @@ INKLING_SHAPE = "inkling2"
 CUSTOM_SHAPES = frozenset({HY4_SHAPE, INKLING_SHAPE})
 
 
-def exe_name(shape: str | None = None) -> str:
+def exe_name(shape: str | None = None, *, target: str | None = None) -> str:
     if shape == HY4_SHAPE:
         base = "strata-hy4"
     elif shape == INKLING_SHAPE:
         base = "strata-inkling"
     else:
         base = "strata"
-    return base + (".exe" if os.name == "nt" else "")
+    win = target.startswith("windows") if target else (os.name == "nt")
+    return base + (".exe" if win else "")
 
 
 # ---------------------------------------------------------------------------------------------- where, what is installed
