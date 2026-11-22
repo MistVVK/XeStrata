@@ -11831,6 +11831,7 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
     its own cards, log and CPU cores; the ReplicaEngine in front spreads the requests.  On Linux the replicas share one
     expert arena in RAM (upstream 3ccfd5aed, 378200894; "replica_shared_arena": false gives each its own copy), as
     split serving's engines do: the first replica fills it, the others start after it and map what it filled."""
+    from serve import gpu_select
     from serve import replicas as rp
     from serve import split as sp
     n = len(groups)
@@ -11847,9 +11848,14 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
         rc = rp.replica_cfg(cfg, i, groups[i])
         if arena:
             rc["args"] = list(rc.get("args") or []) + ["--shared-expert-arena", arena]
-        env = child_env(rc)
-        envvars.put(env, "GPU_PCI", rc["gpu_pci"])           # its own card, whatever the server's environment names
         try:
+            env = child_env(rc)
+            # #68: a selector inherited from the server can hide this replica's card; scope() drops the filters and
+            # picks the card by PCI.  A selector the config names is the operator's choice, so it stays.  A group of
+            # two or more cards is a layer split: one selector would hide the others from --split-device.
+            if len(groups[i]) == 1 and not any(k in (rc.get("env") or {}) for k in gpu_select.FILTERS):
+                env = gpu_select.scope(exe, env, groups[i][0])
+            envvars.put(env, "GPU_PCI", rc["gpu_pci"])       # its own card, whatever the server's environment names
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                       env=env, lazy=lazy, cpus=cpus[i] if cpus else None,
                                       fds=(arena_fd,) if arena_fd is not None else ())
