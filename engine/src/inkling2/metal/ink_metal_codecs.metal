@@ -1581,7 +1581,7 @@ static inline float moe_sum8(float v) {
 template <int STEP>
 static inline void sf4_w13_chunk_s(
     device const uchar* body, int r, device const float* x_in,
-    thread const int* tk, int mm, int lane, thread float* ag, thread float* au) {
+    thread const uint* tk, int mm, int lane, thread float* ag, thread float* au) {
     device const float* hdr = (device const float*)body;
     const float outer = hdr[0] / hdr[1];
     device const uchar* p_base = body + 16;
@@ -1605,7 +1605,7 @@ static inline void sf4_w13_chunk_s(
         const float4 wu2 = float4(kE2M1[bu.y & 15u], kE2M1[(bu.y >> 4) & 15u], kE2M1[(bu.y >> 8) & 15u], kE2M1[(bu.y >> 12) & 15u]);
         const float4 wu3 = float4(kE2M1[(bu.y >> 16) & 15u], kE2M1[(bu.y >> 20) & 15u], kE2M1[(bu.y >> 24) & 15u], kE2M1[bu.y >> 28]);
         for (int i = 0; i < mm; ++i) {
-            device const float4* xp = (device const float4*)(x_in + (size_t)tk[i] * 2304 + b * 16);
+            device const float4* xp = (device const float4*)(x_in + ulong(tk[i]) * 2304ul + uint(b * 16));
             const float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
             ag[i] = fma(scg, dot(wg0, x0) + dot(wg1, x1) + dot(wg2, x2) + dot(wg3, x3), ag[i]);
             au[i] = fma(scu, dot(wu0, x0) + dot(wu1, x1) + dot(wu2, x2) + dot(wu3, x3), au[i]);
@@ -1616,7 +1616,7 @@ static inline void sf4_w13_chunk_s(
 // Vectorized 64-bit uint2 MX8 w13 (288 chunks of 8 = 9*32 exact iters, ZERO IDLE LANES!)
 static inline void mx8_w13_chunk(
     device const uchar* body, int r, device const float* x_in,
-    thread const int* tk, int mm, int lane, thread float* ag, thread float* au) {
+    thread const uint* tk, int mm, int lane, thread float* ag, thread float* au) {
     device const uchar* w_base = body;
     device const uchar* s_base = body + 5308416;
     const int rg = 2 * r, ru = 2 * r + 1;
@@ -1635,7 +1635,7 @@ static inline void mx8_w13_chunk(
         const float4 u0 = float4(e4m3_to_f32(uw.x & 255u), e4m3_to_f32((uw.x >> 8) & 255u), e4m3_to_f32((uw.x >> 16) & 255u), e4m3_to_f32(uw.x >> 24));
         const float4 u1 = float4(e4m3_to_f32(uw.y & 255u), e4m3_to_f32((uw.y >> 8) & 255u), e4m3_to_f32((uw.y >> 16) & 255u), e4m3_to_f32(uw.y >> 24));
         for (int i = 0; i < mm; ++i) {
-            device const float4* xp = (device const float4*)(x_in + (size_t)tk[i] * 2304 + u * 8);
+            device const float4* xp = (device const float4*)(x_in + ulong(tk[i]) * 2304ul + uint(u * 8));
             const float4 x0 = xp[0], x1 = xp[1];
             ag[i] = fma(scg, dot(g0, x0) + dot(g1, x1), ag[i]);
             au[i] = fma(scu, dot(u0, x0) + dot(u1, x1), au[i]);
@@ -1646,7 +1646,7 @@ static inline void mx8_w13_chunk(
 template <int F>
 static inline void sk_w13_chunk(
     device const uchar* body, int r, device const float* x_in,
-    thread const int* tk, int mm, int lane, thread float* ag, thread float* au) {
+    thread const uint* tk, int mm, int lane, thread float* ag, thread float* au) {
     constexpr int SB = sk_sb_bytes(F);
     const size_t rowb = 9ul * SB;
     device const uchar* gu = body + 2304;
@@ -1662,7 +1662,7 @@ static inline void sk_w13_chunk(
         sk_w8<F>(bg + 6, j, wg0, wg1);
         sk_w8<F>(bu + 6, j, wu0, wu1);
         for (int i = 0; i < mm; ++i) {
-            device const float4* xp = (device const float4*)(x_in + (size_t)tk[i] * 2304 + sbi * 256 + j);
+            device const float4* xp = (device const float4*)(x_in + ulong(tk[i]) * 2304ul + uint(sbi * 256 + j));
             const float4 x0 = xp[0], x1 = xp[1];
             ag[i] = fma(effg, dot(wg0, x0) + dot(wg1, x1), ag[i]);
             au[i] = fma(effu, dot(wu0, x0) + dot(wu1, x1), au[i]);
@@ -1670,6 +1670,7 @@ static inline void sk_w13_chunk(
     }
 }
 
+// Generic mixed-codec MoE gate/up + SITU (Apple M1/M2 G13/G14 GlobalISel-safe: pure uint indexing, single mm<=4 loop!)
 kernel void ink_moe_gu_situ(
     device const uchar* sec4        [[buffer(0)]],
     device const InkExpertDev* ex   [[buffer(1)]],
@@ -1694,28 +1695,16 @@ kernel void ink_moe_gu_situ(
     const bool is_sk_dn = (ed.dn_code != 15 && ed.dn_code != 16);
     const float inv_sq = is_sk_dn ? (1.0f / float(as_type<half>(ld16(body + 2 * r)))) : 1.0f;
 
-    if (n == 1) {
-        const int pid0 = pair_list[off], tk0 = pid0 >> 3;
-        float ag0 = 0.0f, au0 = 0.0f;
-        if (ed.gu_code == 15)      sf4_w13_chunk_s<32>(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
-        else if (ed.gu_code == 16) mx8_w13_chunk(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
-        else if (ed.gu_code == 3)  sk_w13_chunk<3>(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
-        else if (ed.gu_code == 2)  sk_w13_chunk<2>(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
-        else if (ed.gu_code == 4)  sk_w13_chunk<4>(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
-        else if (ed.gu_code == 5)  sk_w13_chunk<5>(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
-        else if (ed.gu_code == 6)  sk_w13_chunk<6>(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
-        else if (ed.gu_code == 8)  sk_w13_chunk<8>(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
-        const float g = simd_sum(ag0), u = simd_sum(au0);
-        if (lane == 0) h_act[(size_t)pid0 * 1152 + r] = situ_act(g, u) * inv_sq;
-        return;
-    }
-
-    for (int t0 = 0; t0 < n; t0 += 8) {
-        const int mm = min(8, n - t0);
-        int pid[8], tk[8];
-        for (int i = 0; i < mm; ++i) { pid[i] = pair_list[off + t0 + i]; tk[i] = pid[i] >> 3; }
-        float ag[8] = {0,0,0,0,0,0,0,0};
-        float au[8] = {0,0,0,0,0,0,0,0};
+    for (int t0 = 0; t0 < n; t0 += 4) {
+        const int mm = min(4, n - t0);
+        uint pid[4], tk[4];
+        for (int i = 0; i < mm; ++i) {
+            const uint p = uint(pair_list[off + t0 + i]);
+            pid[i] = p;
+            tk[i] = p >> 3u;
+        }
+        float ag[4] = {0,0,0,0};
+        float au[4] = {0,0,0,0};
         if (ed.gu_code == 15)      sf4_w13_chunk_s<32>(body, r, x_in, tk, mm, int(lane), ag, au);
         else if (ed.gu_code == 16) mx8_w13_chunk(body, r, x_in, tk, mm, int(lane), ag, au);
         else if (ed.gu_code == 3)  sk_w13_chunk<3>(body, r, x_in, tk, mm, int(lane), ag, au);
@@ -1728,7 +1717,7 @@ kernel void ink_moe_gu_situ(
         for (int i = 0; i < mm; ++i) {
             const float g = simd_sum(ag[i]);
             const float u = simd_sum(au[i]);
-            if (lane == 0) h_act[(size_t)pid[i] * 1152 + r] = situ_act(g, u) * inv_sq;
+            if (lane == 0) h_act[ulong(pid[i]) * 1152ul + uint(r)] = situ_act(g, u) * inv_sq;
         }
     }
 }
@@ -1736,7 +1725,7 @@ kernel void ink_moe_gu_situ(
 template <int STEP>
 static inline void sf4_w2_pair_s(
     device const uchar* body, uint dn_off, int rp, device const float* h_act,
-    thread const int* pid, int mm, int lane, thread float* a0, thread float* a1) {
+    thread const uint* pid, int mm, int lane, thread float* a0, thread float* a1) {
     device const float* hdr = (device const float*)body;
     const float outer = hdr[2] / hdr[3];
     device const uchar* p_base = body + dn_off;
@@ -1760,7 +1749,7 @@ static inline void sf4_w2_pair_s(
         const float4 w12 = float4(kE2M1[b1.y & 15u], kE2M1[(b1.y >> 4) & 15u], kE2M1[(b1.y >> 8) & 15u], kE2M1[(b1.y >> 12) & 15u]);
         const float4 w13 = float4(kE2M1[(b1.y >> 16) & 15u], kE2M1[(b1.y >> 20) & 15u], kE2M1[(b1.y >> 24) & 15u], kE2M1[b1.y >> 28]);
         for (int i = 0; i < mm; ++i) {
-            device const float4* xp = (device const float4*)(h_act + (size_t)pid[i] * 1152 + b * 16);
+            device const float4* xp = (device const float4*)(h_act + ulong(pid[i]) * 1152ul + uint(b * 16));
             const float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
             a0[i] = fma(sc0, dot(w00, x0) + dot(w01, x1) + dot(w02, x2) + dot(w03, x3), a0[i]);
             a1[i] = fma(sc1, dot(w10, x0) + dot(w11, x1) + dot(w12, x2) + dot(w13, x3), a1[i]);
@@ -1772,7 +1761,7 @@ static inline void sf4_w2_pair_s(
 template <int STEP>
 static inline void mx8_w2_pair_s(
     device const uchar* body, uint dn_off, int rp, device const float* h_act,
-    thread const int* pid, int mm, int lane, thread float* a0, thread float* a1) {
+    thread const uint* pid, int mm, int lane, thread float* a0, thread float* a1) {
     device const uchar* w_base = body + dn_off;
     device const uchar* s_base = w_base + 2654208;
     const int r0 = 2 * rp, r1 = 2 * rp + 1;
@@ -1790,7 +1779,7 @@ static inline void mx8_w2_pair_s(
         const float4 v0 = float4(e4m3_to_f32(vw.x & 255u), e4m3_to_f32((vw.x >> 8) & 255u), e4m3_to_f32((vw.x >> 16) & 255u), e4m3_to_f32(vw.x >> 24));
         const float4 v1 = float4(e4m3_to_f32(vw.y & 255u), e4m3_to_f32((vw.y >> 8) & 255u), e4m3_to_f32((vw.y >> 16) & 255u), e4m3_to_f32(vw.y >> 24));
         for (int i = 0; i < mm; ++i) {
-            device const float4* xp = (device const float4*)(h_act + (size_t)pid[i] * 1152 + u * 8);
+            device const float4* xp = (device const float4*)(h_act + ulong(pid[i]) * 1152ul + uint(u * 8));
             const float4 x0 = xp[0], x1 = xp[1];
             a0[i] = fma(sc0, dot(u0, x0) + dot(u1, x1), a0[i]);
             a1[i] = fma(sc1, dot(v0, x0) + dot(v1, x1), a1[i]);
@@ -1801,7 +1790,7 @@ static inline void mx8_w2_pair_s(
 template <int F>
 static inline void sk_w2_paired2(
     device const uchar* body, uint dn_off, int rp, device const float* h_act,
-    thread const int* pid, int mm, int lane, thread float* a0, thread float* a1) {
+    thread const uint* pid, int mm, int lane, thread float* a0, thread float* a1) {
     constexpr int SB = sk_sb_bytes(F);
     device const uchar* pr = body + dn_off + (size_t)rp * 9ul * SB;
     for (int unit = lane; unit < 288; unit += 32) {
@@ -1813,13 +1802,14 @@ static inline void sk_w2_paired2(
         const bool is_r1 = (unit >= 144);
         const int col = (is_r1 ? (unit - 144) : unit) << 3;
         for (int i = 0; i < mm; ++i) {
-            device const float4* xp = (device const float4*)(h_act + (size_t)pid[i] * 1152 + col);
+            device const float4* xp = (device const float4*)(h_act + ulong(pid[i]) * 1152ul + uint(col));
             const float val = eff * (dot(w0, xp[0]) + dot(w1, xp[1]));
             if (is_r1) a1[i] += val; else a0[i] += val;
         }
     }
 }
 
+// Generic mixed-codec MoE down projection (Apple M1/M2 G13/G14 GlobalISel-safe: pure uint indexing, single mm<=4 loop!)
 kernel void ink_moe_dn(
     device const uchar* sec4        [[buffer(0)]],
     device const InkExpertDev* ex   [[buffer(1)]],
@@ -1843,32 +1833,12 @@ kernel void ink_moe_dn(
     const InkExpertDev ed = ex[e];
     device const uchar* body = sec4 + ed.body_off;
 
-    if (n == 1) {
-        const int pid0 = pair_list[off];
-        float a0 = 0.0f, a1 = 0.0f;
-        if (ed.dn_code == 15)      sf4_w2_pair_s<32>(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane), &a0, &a1);
-        else if (ed.dn_code == 16) mx8_w2_pair_s<32>(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane), &a0, &a1);
-        else if (ed.dn_code == 2)  sk_w2_paired2<2>(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane), &a0, &a1);
-        else if (ed.dn_code == 3)  sk_w2_paired2<3>(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane), &a0, &a1);
-        else if (ed.dn_code == 4)  sk_w2_paired2<4>(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane), &a0, &a1);
-        else if (ed.dn_code == 5)  sk_w2_paired2<5>(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane), &a0, &a1);
-        else if (ed.dn_code == 6)  sk_w2_paired2<6>(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane), &a0, &a1);
-        else if (ed.dn_code == 8)  sk_w2_paired2<8>(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane), &a0, &a1);
-        const float v0 = simd_sum(a0), v1 = simd_sum(a1);
-        if (lane == 0) {
-            const float rw = topk_w[pid0];
-            y_pairs[(size_t)pid0 * 2304 + 2 * rp]     = v0 * rw;
-            y_pairs[(size_t)pid0 * 2304 + 2 * rp + 1] = v1 * rw;
-        }
-        return;
-    }
-
-    for (int t0 = 0; t0 < n; t0 += 8) {
-        const int mm = min(8, n - t0);
-        int pid[8];
-        for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
-        float a0[8] = {0,0,0,0,0,0,0,0};
-        float a1[8] = {0,0,0,0,0,0,0,0};
+    for (int t0 = 0; t0 < n; t0 += 4) {
+        const int mm = min(4, n - t0);
+        uint pid[4];
+        for (int i = 0; i < mm; ++i) pid[i] = uint(pair_list[off + t0 + i]);
+        float a0[4] = {0,0,0,0};
+        float a1[4] = {0,0,0,0};
         if (ed.dn_code == 15)      sf4_w2_pair_s<32>(body, ed.dn_off, rp, h_act, pid, mm, int(lane), a0, a1);
         else if (ed.dn_code == 16) mx8_w2_pair_s<32>(body, ed.dn_off, rp, h_act, pid, mm, int(lane), a0, a1);
         else if (ed.dn_code == 2)  sk_w2_paired2<2>(body, ed.dn_off, rp, h_act, pid, mm, int(lane), a0, a1);
@@ -1883,8 +1853,9 @@ kernel void ink_moe_dn(
             const float v1 = simd_sum(a1[i]);
             if (lane == 0) {
                 const float rw = topk_w[pid[i]];
-                y_pairs[(size_t)pid[i] * 2304 + 2 * rp]     = v0 * rw;
-                y_pairs[(size_t)pid[i] * 2304 + 2 * rp + 1] = v1 * rw;
+                const ulong yb = ulong(pid[i]) * 2304ul + uint(2 * rp);
+                y_pairs[yb]     = v0 * rw;
+                y_pairs[yb + 1] = v1 * rw;
             }
         }
     }
@@ -1932,22 +1903,22 @@ kernel void ink_moe_gu_sf4(
     const bool is_sk_dn = (ed.dn_code != 15 && ed.dn_code != 16);
     const float inv_sq = is_sk_dn ? (1.0f / float(as_type<half>(ld16(body + 2 * r)))) : 1.0f;
     if (n == 1) {
-        const int pid0 = pair_list[off], tk0 = pid0 >> 3;
+        const uint pid0 = uint(pair_list[off]), tk0 = pid0 >> 3u;
         float ag0 = 0.0f, au0 = 0.0f;
         sf4_w13_chunk_s<16>(body, r, x_in, &tk0, 1, int(lane16), &ag0, &au0);
         const float g = moe_sum16(ag0), u = moe_sum16(au0);
-        if (lane16 == 0) h_act[(size_t)pid0 * 1152 + r] = situ_act(g, u) * inv_sq;
+        if (lane16 == 0) h_act[ulong(pid0) * 1152ul + uint(r)] = situ_act(g, u) * inv_sq;
         return;
     }
     for (int t0 = 0; t0 < n; t0 += 4) {
         const int mm = min(4, n - t0);
-        int pid[4], tk[4];
-        for (int i = 0; i < mm; ++i) { pid[i] = pair_list[off + t0 + i]; tk[i] = pid[i] >> 3; }
+        uint pid[4], tk[4];
+        for (int i = 0; i < mm; ++i) { pid[i] = uint(pair_list[off + t0 + i]); tk[i] = pid[i] >> 3u; }
         float ag[4] = {0,0,0,0}, au[4] = {0,0,0,0};
         sf4_w13_chunk_s<16>(body, r, x_in, tk, mm, int(lane16), ag, au);
         for (int i = 0; i < mm; ++i) {
             const float g = moe_sum16(ag[i]), u = moe_sum16(au[i]);
-            if (lane16 == 0) h_act[(size_t)pid[i] * 1152 + r] = situ_act(g, u) * inv_sq;
+            if (lane16 == 0) h_act[ulong(pid[i]) * 1152ul + uint(r)] = situ_act(g, u) * inv_sq;
         }
     }
 }
@@ -1977,29 +1948,29 @@ kernel void ink_moe_dn_sf4(
     const int off = uoff[yy], n = ucnt[yy];
     device const uchar* body = sec4 + ed.body_off;
     if (n == 1) {
-        const int pid0 = pair_list[off];
+        const uint pid0 = uint(pair_list[off]);
         float a0 = 0.0f, a1 = 0.0f;
         sf4_w2_pair_s<8>(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane8), &a0, &a1);
         const float v0 = moe_sum8(a0), v1 = moe_sum8(a1);
         if (lane8 == 0) {
             const float rw = topk_w[pid0];
-            y_pairs[(size_t)pid0 * 2304 + 2 * rp]     = v0 * rw;
-            y_pairs[(size_t)pid0 * 2304 + 2 * rp + 1] = v1 * rw;
+            y_pairs[ulong(pid0) * 2304ul + uint(2 * rp)]     = v0 * rw;
+            y_pairs[ulong(pid0) * 2304ul + uint(2 * rp + 1)] = v1 * rw;
         }
         return;
     }
     for (int t0 = 0; t0 < n; t0 += 4) {
         const int mm = min(4, n - t0);
-        int pid[4];
-        for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
+        uint pid[4];
+        for (int i = 0; i < mm; ++i) pid[i] = uint(pair_list[off + t0 + i]);
         float a0[4] = {0,0,0,0}, a1[4] = {0,0,0,0};
         sf4_w2_pair_s<8>(body, ed.dn_off, rp, h_act, pid, mm, int(lane8), a0, a1);
         for (int i = 0; i < mm; ++i) {
             const float v0 = moe_sum8(a0[i]), v1 = moe_sum8(a1[i]);
             if (lane8 == 0) {
                 const float rw = topk_w[pid[i]];
-                y_pairs[(size_t)pid[i] * 2304 + 2 * rp]     = v0 * rw;
-                y_pairs[(size_t)pid[i] * 2304 + 2 * rp + 1] = v1 * rw;
+                y_pairs[ulong(pid[i]) * 2304ul + uint(2 * rp)]     = v0 * rw;
+                y_pairs[ulong(pid[i]) * 2304ul + uint(2 * rp + 1)] = v1 * rw;
             }
         }
     }
@@ -2029,22 +2000,22 @@ kernel void ink_moe_gu_mx8(
     const int off = uoff[y], n = ucnt[y];
     device const uchar* body = sec4 + ed.body_off;
     if (n == 1) {
-        const int pid0 = pair_list[off], tk0 = pid0 >> 3;
+        const uint pid0 = uint(pair_list[off]), tk0 = pid0 >> 3u;
         float ag0 = 0.0f, au0 = 0.0f;
         mx8_w13_chunk(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
         const float g = simd_sum(ag0), u = simd_sum(au0);
-        if (lane == 0) h_act[(size_t)pid0 * 1152 + r] = situ_act(g, u);
+        if (lane == 0) h_act[ulong(pid0) * 1152ul + uint(r)] = situ_act(g, u);
         return;
     }
     for (int t0 = 0; t0 < n; t0 += 8) {
         const int mm = min(8, n - t0);
-        int pid[8], tk[8];
-        for (int i = 0; i < mm; ++i) { pid[i] = pair_list[off + t0 + i]; tk[i] = pid[i] >> 3; }
+        uint pid[8], tk[8];
+        for (int i = 0; i < mm; ++i) { pid[i] = uint(pair_list[off + t0 + i]); tk[i] = pid[i] >> 3u; }
         float ag[8] = {0,0,0,0,0,0,0,0}, au[8] = {0,0,0,0,0,0,0,0};
         mx8_w13_chunk(body, r, x_in, tk, mm, int(lane), ag, au);
         for (int i = 0; i < mm; ++i) {
             const float g = simd_sum(ag[i]), u = simd_sum(au[i]);
-            if (lane == 0) h_act[(size_t)pid[i] * 1152 + r] = situ_act(g, u);
+            if (lane == 0) h_act[ulong(pid[i]) * 1152ul + uint(r)] = situ_act(g, u);
         }
     }
 }
@@ -2074,29 +2045,29 @@ kernel void ink_moe_dn_mx8(
     const int off = uoff[yy], n = ucnt[yy];
     device const uchar* body = sec4 + ed.body_off;
     if (n == 1) {
-        const int pid0 = pair_list[off];
+        const uint pid0 = uint(pair_list[off]);
         float a0 = 0.0f, a1 = 0.0f;
         mx8_w2_pair_s<16>(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane16), &a0, &a1);
         const float v0 = moe_sum16(a0), v1 = moe_sum16(a1);
         if (lane16 == 0) {
             const float rw = topk_w[pid0];
-            y_pairs[(size_t)pid0 * 2304 + 2 * rp]     = v0 * rw;
-            y_pairs[(size_t)pid0 * 2304 + 2 * rp + 1] = v1 * rw;
+            y_pairs[ulong(pid0) * 2304ul + uint(2 * rp)]     = v0 * rw;
+            y_pairs[ulong(pid0) * 2304ul + uint(2 * rp + 1)] = v1 * rw;
         }
         return;
     }
     for (int t0 = 0; t0 < n; t0 += 8) {
         const int mm = min(8, n - t0);
-        int pid[8];
-        for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
+        uint pid[8];
+        for (int i = 0; i < mm; ++i) pid[i] = uint(pair_list[off + t0 + i]);
         float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
         mx8_w2_pair_s<16>(body, ed.dn_off, rp, h_act, pid, mm, int(lane16), a0, a1);
         for (int i = 0; i < mm; ++i) {
             const float v0 = moe_sum16(a0[i]), v1 = moe_sum16(a1[i]);
             if (lane16 == 0) {
                 const float rw = topk_w[pid[i]];
-                y_pairs[(size_t)pid[i] * 2304 + 2 * rp]     = v0 * rw;
-                y_pairs[(size_t)pid[i] * 2304 + 2 * rp + 1] = v1 * rw;
+                y_pairs[ulong(pid[i]) * 2304ul + uint(2 * rp)]     = v0 * rw;
+                y_pairs[ulong(pid[i]) * 2304ul + uint(2 * rp + 1)] = v1 * rw;
             }
         }
     }
@@ -2129,22 +2100,22 @@ kernel void ink_moe_gu_sk_t(
     const bool is_sk_dn = (ed.dn_code != 15 && ed.dn_code != 16);
     const float inv_sq = is_sk_dn ? (1.0f / float(as_type<half>(ld16(body + 2 * r)))) : 1.0f;
     if (n == 1) {
-        const int pid0 = pair_list[off], tk0 = pid0 >> 3;
+        const uint pid0 = uint(pair_list[off]), tk0 = pid0 >> 3u;
         float ag0 = 0.0f, au0 = 0.0f;
         sk_w13_chunk<F>(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
         const float g = simd_sum(ag0), u = simd_sum(au0);
-        if (lane == 0) h_act[(size_t)pid0 * 1152 + r] = situ_act(g, u) * inv_sq;
+        if (lane == 0) h_act[ulong(pid0) * 1152ul + uint(r)] = situ_act(g, u) * inv_sq;
         return;
     }
     for (int t0 = 0; t0 < n; t0 += 4) {
         const int mm = min(4, n - t0);
-        int pid[4], tk[4];
-        for (int i = 0; i < mm; ++i) { pid[i] = pair_list[off + t0 + i]; tk[i] = pid[i] >> 3; }
+        uint pid[4], tk[4];
+        for (int i = 0; i < mm; ++i) { pid[i] = uint(pair_list[off + t0 + i]); tk[i] = pid[i] >> 3u; }
         float ag[4] = {0,0,0,0}, au[4] = {0,0,0,0};
         sk_w13_chunk<F>(body, r, x_in, tk, mm, int(lane), ag, au);
         for (int i = 0; i < mm; ++i) {
             const float g = simd_sum(ag[i]), u = simd_sum(au[i]);
-            if (lane == 0) h_act[(size_t)pid[i] * 1152 + r] = situ_act(g, u) * inv_sq;
+            if (lane == 0) h_act[ulong(pid[i]) * 1152ul + uint(r)] = situ_act(g, u) * inv_sq;
         }
     }
 }
@@ -2174,29 +2145,29 @@ kernel void ink_moe_dn_sk_t(
     const int off = uoff[yy], n = ucnt[yy];
     device const uchar* body = sec4 + ed.body_off;
     if (n == 1) {
-        const int pid0 = pair_list[off];
+        const uint pid0 = uint(pair_list[off]);
         float a0 = 0.0f, a1 = 0.0f;
         sk_w2_paired2<F>(body, ed.dn_off, rp, h_act, &pid0, 1, int(lane), &a0, &a1);
         const float v0 = simd_sum(a0), v1 = simd_sum(a1);
         if (lane == 0) {
             const float rw = topk_w[pid0];
-            y_pairs[(size_t)pid0 * 2304 + 2 * rp]     = v0 * rw;
-            y_pairs[(size_t)pid0 * 2304 + 2 * rp + 1] = v1 * rw;
+            y_pairs[ulong(pid0) * 2304ul + uint(2 * rp)]     = v0 * rw;
+            y_pairs[ulong(pid0) * 2304ul + uint(2 * rp + 1)] = v1 * rw;
         }
         return;
     }
     for (int t0 = 0; t0 < n; t0 += 4) {
         const int mm = min(4, n - t0);
-        int pid[4];
-        for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
+        uint pid[4];
+        for (int i = 0; i < mm; ++i) pid[i] = uint(pair_list[off + t0 + i]);
         float a0[4] = {0,0,0,0}, a1[4] = {0,0,0,0};
         sk_w2_paired2<F>(body, ed.dn_off, rp, h_act, pid, mm, int(lane), a0, a1);
         for (int i = 0; i < mm; ++i) {
             const float v0 = simd_sum(a0[i]), v1 = simd_sum(a1[i]);
             if (lane == 0) {
                 const float rw = topk_w[pid[i]];
-                y_pairs[(size_t)pid[i] * 2304 + 2 * rp]     = v0 * rw;
-                y_pairs[(size_t)pid[i] * 2304 + 2 * rp + 1] = v1 * rw;
+                y_pairs[ulong(pid[i]) * 2304ul + uint(2 * rp)]     = v0 * rw;
+                y_pairs[ulong(pid[i]) * 2304ul + uint(2 * rp + 1)] = v1 * rw;
             }
         }
     }
@@ -2237,26 +2208,26 @@ kernel void ink_moe_gu_sk23(
     const float inv_sq = is_sk_dn ? (1.0f / float(as_type<half>(ld16(body + 2 * r)))) : 1.0f;
 
     if (n == 1) {
-        const int pid0 = pair_list[off], tk0 = pid0 >> 3;
+        const uint pid0 = uint(pair_list[off]), tk0 = pid0 >> 3u;
         float ag0 = 0.0f, au0 = 0.0f;
         if (ed.gu_code == 3)      sk_w13_chunk<3>(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
         else if (ed.gu_code == 2) sk_w13_chunk<2>(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
         else                      sf4_w13_chunk_s<32>(body, r, x_in, &tk0, 1, int(lane), &ag0, &au0);
         const float g = simd_sum(ag0), u = simd_sum(au0);
-        if (lane == 0) h_act[(size_t)pid0 * 1152 + r] = situ_act(g, u) * inv_sq;
+        if (lane == 0) h_act[ulong(pid0) * 1152ul + uint(r)] = situ_act(g, u) * inv_sq;
         return;
     }
     for (int t0 = 0; t0 < n; t0 += 4) {
         const int mm = min(4, n - t0);
-        int pid[4], tk[4];
-        for (int i = 0; i < mm; ++i) { pid[i] = pair_list[off + t0 + i]; tk[i] = pid[i] >> 3; }
+        uint pid[4], tk[4];
+        for (int i = 0; i < mm; ++i) { pid[i] = uint(pair_list[off + t0 + i]); tk[i] = pid[i] >> 3u; }
         float ag[4] = {0,0,0,0}, au[4] = {0,0,0,0};
         if (ed.gu_code == 3)      sk_w13_chunk<3>(body, r, x_in, tk, mm, int(lane), ag, au);
         else if (ed.gu_code == 2) sk_w13_chunk<2>(body, r, x_in, tk, mm, int(lane), ag, au);
         else                      sf4_w13_chunk_s<32>(body, r, x_in, tk, mm, int(lane), ag, au);
         for (int i = 0; i < mm; ++i) {
             const float g = simd_sum(ag[i]), u = simd_sum(au[i]);
-            if (lane == 0) h_act[(size_t)pid[i] * 1152 + r] = situ_act(g, u) * inv_sq;
+            if (lane == 0) h_act[ulong(pid[i]) * 1152ul + uint(r)] = situ_act(g, u) * inv_sq;
         }
     }
 }
@@ -2265,7 +2236,7 @@ kernel void ink_moe_gu_sk23(
 template <int F>
 static inline void sk_w2_2pair_coalesced(
     device const uchar* body, uint dn_off, int rp0, device const float* h_act,
-    thread const int* pid, int mm, int lane,
+    thread const uint* pid, int mm, int lane,
     thread float* a0, thread float* a1, thread float* b0, thread float* b1) {
     constexpr int SB = sk_sb_bytes(F);
     const size_t pb = 9ul * (size_t)SB;
@@ -2284,7 +2255,7 @@ static inline void sk_w2_2pair_coalesced(
         sk_w8<F>(p1 + 6, j, w10, w11);
         const int col = sbi * 256 + j;
         for (int i = 0; i < mm; ++i) {
-            device const float4* xp = (device const float4*)(h_act + (size_t)pid[i] * 1152 + col);
+            device const float4* xp = (device const float4*)(h_act + ulong(pid[i]) * 1152ul + uint(col));
             const float4 x0 = xp[0], x1 = xp[1];
             a0[i] = fma(ef0, dot(w00, x0) + dot(w01, x1), a0[i]);
             b0[i] = fma(ef1, dot(w10, x0) + dot(w11, x1), b0[i]);
@@ -2302,7 +2273,7 @@ static inline void sk_w2_2pair_coalesced(
         const bool is_r1 = (lane >= 16);
         const int col = is_r1 ? ((lane - 16) << 3) : (1024 + (lane << 3));
         for (int i = 0; i < mm; ++i) {
-            device const float4* xp = (device const float4*)(h_act + (size_t)pid[i] * 1152 + col);
+            device const float4* xp = (device const float4*)(h_act + ulong(pid[i]) * 1152ul + uint(col));
             const float4 x0 = xp[0], x1 = xp[1];
             const float v0 = ef0 * (dot(w00, x0) + dot(w01, x1));
             const float v1 = ef1 * (dot(w10, x0) + dot(w11, x1));
@@ -2321,7 +2292,7 @@ static inline void sk_w2_2pair_coalesced(
         sk_w8<F>(p1 + 6, j, w10, w11);
         const int col = (sbi - 5) * 256 + 128 + j;
         for (int i = 0; i < mm; ++i) {
-            device const float4* xp = (device const float4*)(h_act + (size_t)pid[i] * 1152 + col);
+            device const float4* xp = (device const float4*)(h_act + ulong(pid[i]) * 1152ul + uint(col));
             const float4 x0 = xp[0], x1 = xp[1];
             a1[i] = fma(ef0, dot(w00, x0) + dot(w01, x1), a1[i]);
             b1[i] = fma(ef1, dot(w10, x0) + dot(w11, x1), b1[i]);
@@ -2355,22 +2326,22 @@ kernel void ink_moe_dn_sk23(
 
     if (ed.dn_code == 2 || ed.dn_code == 3) {
         if (n == 1) {
-            const int pid0 = pair_list[off];
+            const uint pid0 = uint(pair_list[off]);
             float a0 = 0.0f, a1 = 0.0f, b0 = 0.0f, b1 = 0.0f;
             if (ed.dn_code == 2) sk_w2_2pair_coalesced<2>(body, ed.dn_off, rp0, h_act, &pid0, 1, int(lane), &a0, &a1, &b0, &b1);
             else                 sk_w2_2pair_coalesced<3>(body, ed.dn_off, rp0, h_act, &pid0, 1, int(lane), &a0, &a1, &b0, &b1);
             const float va0 = simd_sum(a0), va1 = simd_sum(a1), vb0 = simd_sum(b0), vb1 = simd_sum(b1);
             if (lane == 0) {
                 const float rw = topk_w[pid0];
-                device float* dst = y_pairs + (size_t)pid0 * 2304 + 2 * rp0;
+                device float* dst = y_pairs + ulong(pid0) * 2304ul + uint(2 * rp0);
                 dst[0] = va0 * rw; dst[1] = va1 * rw; dst[2] = vb0 * rw; dst[3] = vb1 * rw;
             }
             return;
         }
         for (int t0 = 0; t0 < n; t0 += 2) {
             const int mm = min(2, n - t0);
-            int pid[2];
-            for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
+            uint pid[2];
+            for (int i = 0; i < mm; ++i) pid[i] = uint(pair_list[off + t0 + i]);
             float a0[2] = {0,0}, a1[2] = {0,0};
             float b0[2] = {0,0}, b1[2] = {0,0};
             if (ed.dn_code == 2) sk_w2_2pair_coalesced<2>(body, ed.dn_off, rp0, h_act, pid, mm, int(lane), a0, a1, b0, b1);
@@ -2379,7 +2350,7 @@ kernel void ink_moe_dn_sk23(
                 const float va0 = simd_sum(a0[i]), va1 = simd_sum(a1[i]), vb0 = simd_sum(b0[i]), vb1 = simd_sum(b1[i]);
                 if (lane == 0) {
                     const float rw = topk_w[pid[i]];
-                    device float* dst = y_pairs + (size_t)pid[i] * 2304 + 2 * rp0;
+                    device float* dst = y_pairs + ulong(pid[i]) * 2304ul + uint(2 * rp0);
                     dst[0] = va0 * rw; dst[1] = va1 * rw; dst[2] = vb0 * rw; dst[3] = vb1 * rw;
                 }
             }
@@ -2389,16 +2360,16 @@ kernel void ink_moe_dn_sk23(
         const int rp = int(tgp.x) * 16 + int(hid);
         for (int t0 = 0; t0 < n; t0 += 4) {
             const int mm = min(4, n - t0);
-            int pid[4];
-            for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
+            uint pid[4];
+            for (int i = 0; i < mm; ++i) pid[i] = uint(pair_list[off + t0 + i]);
             float a0[4] = {0,0,0,0}, a1[4] = {0,0,0,0};
             sf4_w2_pair_s<16>(body, ed.dn_off, rp, h_act, pid, mm, int(lane16), a0, a1);
             for (int i = 0; i < mm; ++i) {
                 const float v0 = moe_sum16(a0[i]), v1 = moe_sum16(a1[i]);
                 if (lane16 == 0) {
                     const float rw = topk_w[pid[i]];
-                    y_pairs[(size_t)pid[i] * 2304 + 2 * rp]     = v0 * rw;
-                    y_pairs[(size_t)pid[i] * 2304 + 2 * rp + 1] = v1 * rw;
+                    y_pairs[ulong(pid[i]) * 2304ul + uint(2 * rp)]     = v0 * rw;
+                    y_pairs[ulong(pid[i]) * 2304ul + uint(2 * rp + 1)] = v1 * rw;
                 }
             }
         }

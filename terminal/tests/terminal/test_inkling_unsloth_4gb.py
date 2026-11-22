@@ -190,12 +190,21 @@ class TestInklingUnslothDirectCatalog(unittest.TestCase):
 class TestUnlock4GbAndIssue6587(unittest.TestCase):
     def test_issue_6587_rtx3060_12gb_sq15_128k_vision_safe_vram_experts(self):
         placed = inkling_fit.compute("SQ-15", vram_gib=12.0, ram_gib=32.0, ctx=131072, vision=True, parallel=1, dspark=True)
-        # Previously passed 5.50 GB (ignoring DSpark KV + Vision + hybrid workspace -> OOM on 12 GB + desktop).
-        # Now reserves realistic headroom so >= 2.5 GB remains for runner + DSpark + Vision + desktop compositor.
-        self.assertLessEqual(placed["vram_gb"], 4.4, placed)
-        self.assertGreater(placed["vram_gb"], 1.5, placed)
+        # With Host KV Offload + SWA-1025 DSpark + CPU Vision on <= 12.5 GiB, 128K Global KV spills to mapped host RAM
+        # while >= 2.5 GB VRAM headroom remains alongside the 2.07 GB dense trunk for runner + DSpark + desktop (#6587, #552).
+        vram_total_gb = 12.0 * inkling_fit.GIB_TO_GB
+        dense_gb = inkling_fit.BUILDS["SQ-15"]["dense_gb"]
+        self.assertGreaterEqual(vram_total_gb - dense_gb - placed["vram_gb"], 2.5, placed)
+        self.assertEqual(placed["kv_offload"], "on")
+        self.assertGreater(placed["host_kv_gb"], 4.0)
         self.assertEqual(placed["ssd_gb"], 0.0)
         self.assertFalse(placed["full_vram"])
+        # When Host KV Offload is explicitly disabled, KV steps down to FP8 while keeping >= 4.5 GB VRAM headroom.
+        placed_vram_fp8 = inkling_fit.compute(
+            "SQ-15", vram_gib=12.0, ram_gib=32.0, ctx=131072, vision=True, parallel=1, dspark=True, kv_offload="off"
+        )
+        self.assertEqual(placed_vram_fp8["kv_dtype"], "fp8")
+        self.assertGreaterEqual(vram_total_gb - dense_gb - placed_vram_fp8["vram_gb"], 4.5, placed_vram_fp8)
 
     def test_4gb_and_6gb_gpus_unlocked_across_all_moe_families(self):
         # 1. gpu_fit & gpu_roles admit 4 GB discrete GPUs reporting 3.8-4.0 GiB (GTX 1650, RTX 3050 4 GB, T500, Arc A310)

@@ -441,6 +441,8 @@ public:
 
     const char* backend_name() const noexcept override { return ep2_active_ ? "hip-ep2" : "hip"; }
 
+    int effective_max_ctx() const override { return max_ctx_; }
+
     std::string device_info() const override {
         char buf[512];
         if (ep2_active_) {
@@ -920,6 +922,26 @@ public:
             : ((opts.ram_experts_gb > 0.0)
                 ? static_cast<size_t>(strata::platform::cgroup_mem::gib_to_bytes(opts.ram_experts_gb))
                 : static_cast<size_t>(-1));
+        if (opts.ram_experts_gb < 0.0 && !opts.ssd_experts) {
+            // Auto-cap RAM experts to safe available host memory so cold SSD streaming activates automatically on tight-RAM hosts!
+            uint64_t host_avail = 0;
+#ifdef __linux__
+            if (FILE* fp = std::fopen("/proc/meminfo", "r")) {
+                char key[64];
+                unsigned long long kb = 0;
+                char unit[32];
+                while (std::fscanf(fp, "%63[^:]: %llu %31s\n", key, &kb, unit) == 3) {
+                    if (std::strcmp(key, "MemAvailable") == 0) { host_avail = kb * 1024ull; break; }
+                }
+                std::fclose(fp);
+            }
+#endif
+            if (host_avail > 0) {
+                const uint64_t os_res = std::max<uint64_t>(2ULL << 30, std::min<uint64_t>(host_avail / 4, 4ULL << 30));
+                const size_t safe_host = static_cast<size_t>(host_avail > os_res ? (host_avail - os_res) : 0);
+                if (ram_cap > safe_host) ram_cap = safe_host;
+            }
+        }
         {
             const auto cg = strata::platform::cgroup_mem::probe_cgroup_room(strata::platform::cgroup_mem::kUnlimited);
             if (cg.limited && cg.available_bytes != strata::platform::cgroup_mem::kUnlimited && cg.available_bytes > 0) {
@@ -1103,7 +1125,7 @@ public:
             }
         }
         ram_experts_loaded_ = ram_plan.size();
-        if (vram_experts_loaded_ + ram_experts_loaded_ < n_dir && max_exp_bytes > 0) {
+        if (model.kind == ModelSourceKind::Strata && vram_experts_loaded_ + ram_experts_loaded_ < n_dir && max_exp_bytes > 0) {
             std::vector<InkColdExpertDesc> cdescs(n_dir);
             const uint64_t sec4_off = model.rd.header().sections[4].file_offset;
             for (size_t i = 0; i < n_dir; ++i) {
@@ -1134,19 +1156,19 @@ public:
             }
         }
 
-        // Build per-layer GPU expert descriptor tables [128] & per-layer codec class (0=all S_K, 1=all SF4, 2=MX8/mixed)
+        // Build per-layer GPU expert descriptor tables [128] & per-layer codec class (0=all S_K, 1=all SF4, 2=all MX8, 3=mixed)
         d_layer_exps_.resize(c_.n_phys);
         h_layer_exps_.resize(c_.n_phys);
         peer_d_layer_exps_.resize(ep2_active_ ? c_.n_phys : 0);
         layer_all_gpu_.assign(c_.n_phys, true);
         layer_all_ep2_.assign(c_.n_phys, true);
-        layer_gu_class_.assign(c_.n_phys, 2);
-        layer_dn_class_.assign(c_.n_phys, 2);
+        layer_gu_class_.assign(c_.n_phys, 3);
+        layer_dn_class_.assign(c_.n_phys, 3);
         for (int il = 0; il < c_.n_phys; ++il) {
             std::vector<GpuExpertDesc> tbl(c_.n_experts);
             std::vector<GpuExpertDesc> peer_tbl(ep2_active_ ? c_.n_experts : 0);
-            bool all_gu_sk = true, all_gu_sf4 = true;
-            bool all_dn_sk = true, all_dn_sf4 = true;
+            bool all_gu_sk = true, all_gu_sf4 = true, all_gu_mx8 = true;
+            bool all_dn_sk = true, all_dn_sf4 = true, all_dn_mx8 = true;
             for (int e = 0; e < c_.n_experts; ++e) {
                 const int dir_idx = model.dir_index_of[il * c_.n_experts + e];
                 GpuExpertDesc d{};
@@ -1157,8 +1179,10 @@ public:
                     d.gu_code = dir[dir_idx].gu_code_id;
                     d.dn_code = dir[dir_idx].dn_code_id;
                     if (d.gu_code != CODE_SF4) all_gu_sf4 = false;
+                    if (d.gu_code != CODE_MX8) all_gu_mx8 = false;
                     if (d.gu_code == CODE_SF4 || d.gu_code == CODE_MX8) all_gu_sk = false;
                     if (d.dn_code != CODE_SF4) all_dn_sf4 = false;
+                    if (d.dn_code != CODE_MX8) all_dn_mx8 = false;
                     if (d.dn_code == CODE_SF4 || d.dn_code == CODE_MX8) all_dn_sk = false;
                 } else if (ep2_active_ && dir_idx >= 0 && peer_expert_gpu_offset_[dir_idx] != static_cast<size_t>(-1)) {
                     pd.body = peer_expert_gpu_arena_.dev_ptr + peer_expert_gpu_offset_[dir_idx];
@@ -1166,17 +1190,17 @@ public:
                     pd.gu_code = dir[dir_idx].gu_code_id;
                     pd.dn_code = dir[dir_idx].dn_code_id;
                     layer_all_gpu_[il] = false;
-                    all_gu_sk = all_gu_sf4 = all_dn_sk = all_dn_sf4 = false;
+                    all_gu_sk = all_gu_sf4 = all_gu_mx8 = all_dn_sk = all_dn_sf4 = all_dn_mx8 = false;
                 } else {
                     layer_all_gpu_[il] = false;
                     layer_all_ep2_[il] = false;
-                    all_gu_sk = all_gu_sf4 = all_dn_sk = all_dn_sf4 = false;
+                    all_gu_sk = all_gu_sf4 = all_gu_mx8 = all_dn_sk = all_dn_sf4 = all_dn_mx8 = false;
                 }
                 tbl[e] = d;
                 if (ep2_active_) peer_tbl[e] = pd;
             }
-            layer_gu_class_[il] = all_gu_sk ? 0 : (all_gu_sf4 ? 1 : 2);
-            layer_dn_class_[il] = all_dn_sk ? 0 : (all_dn_sf4 ? 1 : 2);
+            layer_gu_class_[il] = all_gu_sk ? 0 : (all_gu_sf4 ? 1 : (all_gu_mx8 ? 2 : 3));
+            layer_dn_class_[il] = all_dn_sk ? 0 : (all_dn_sf4 ? 1 : (all_dn_mx8 ? 2 : 3));
             h_layer_exps_[il] = tbl;
             if (!upload_raw(d_layer_exps_[il], tbl.data(), tbl.size() * sizeof(GpuExpertDesc), err)) return false;
             if (ep2_active_) {
@@ -3724,6 +3748,7 @@ private:
                         d_gu, d_act, d_by + static_cast<size_t>(beg) * D,
                         m_e, D, c_.inter);
                 }
+
                 k_moe_reduce_buckets<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
                     d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
             } else if (layer_all_gpu_[ip]) {
@@ -3846,6 +3871,7 @@ private:
                     k_moe_grouped_w2<<<dim3((D + 7) / 8, c_.n_experts), 256, 0, stream_>>>(
                         d_exps, d_off, d_act, d_by, D, c_.inter);
                 }
+
                 k_moe_reduce_buckets<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
                     d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
             } else if (hybrid_.active() && B <= 16) {
@@ -4022,6 +4048,10 @@ private:
                     (void)hipMemcpyAsync(hybrid_.d_cpu_y(), hybrid_.h_y(), static_cast<size_t>(B) * D * 4, hipMemcpyHostToDevice, stream_);
                     k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(moeout, hybrid_.d_cpu_y(), moeout, B * D);
                 }
+                if (!disk_fallback_bufs.empty()) {
+                    (void)hipStreamSynchronize(hybrid_.dma_stream());
+                    (void)hipStreamSynchronize(stream_);
+                }
             } else {
                 // Fast Path B2: Chunked Double-Buffered GPU Matrix-Core Expert Streaming for Hybrid Prefill!
                 // Overlaps PCIe H2D of RAM expert i+1 on dma_stream_ with GPU hipBLASLt/WMMA compute of expert i!
@@ -4154,6 +4184,11 @@ private:
                                     "exp stage H2D", err)) return false;
                         exec_one(re, d_exp_stage_.dev_ptr);
                     }
+                }
+
+                if (!disk_bufs.empty()) {
+                    if (hybrid_.active()) (void)hipStreamSynchronize(hybrid_.dma_stream());
+                    (void)hipStreamSynchronize(stream_);
                 }
 
                 k_moe_reduce_buckets<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
@@ -4861,6 +4896,7 @@ private:
                     k_moe_grouped_w2<<<dim3((D + 7) / 8, c_.n_experts), 256, 0, stream_>>>(
                         d_exps, d_off, d_act, d_by, D, c_.inter);
                 }
+
                 k_moe_reduce_buckets<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
                     d_by, d_s2b, tk_w, moeout, B, c_.top_k, D);
             }

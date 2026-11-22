@@ -79,39 +79,18 @@ __global__ void __launch_bounds__(128) k_ink_commit_kv_all48(
     if (v >= kInkVisits || h >= kInkKVHeads) return;
 
     const InkKvVisitDesc kv = kv_descs[v];
+    __shared__ float sk[4], sv[4];
     for (int k = 0; k < n_acc; ++k) {
         const int node = path[k];
         const int p = p0 + k;
+        if (p < 0 || (!kv.is_swa && p >= kv.cap_pos)) continue;
         const int p_idx = kv.is_swa ? (p % kv.cap_pos) : p;
         const size_t sbase = (((size_t)v * tree_cap + node) * kInkKVHeads + h) * kInkHeadDim + d;
         const float kv_val = stage_k[sbase];
         const float vv_val = stage_v[sbase];
-        const size_t dbase = (((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + h) * kInkHeadDim;
-
-        if (!kv.is_fp8) {
-            kv.k_f16[dbase + d] = __float2half(kv_val);
-            kv.v_f16[dbase + d] = __float2half(vv_val);
-        } else {
-            float mk = warp_max(fabsf(kv_val));
-            float mv = warp_max(fabsf(vv_val));
-            __shared__ float sk[4], sv[4];
-            if ((d & 31) == 0) { sk[d >> 5] = mk; sv[d >> 5] = mv; }
-            __syncthreads();
-            float amk = fmaxf(fmaxf(sk[0], sk[1]), fmaxf(sk[2], sk[3]));
-            float amv = fmaxf(fmaxf(sv[0], sv[1]), fmaxf(sv[2], sv[3]));
-            const float sc_k = amk > 0.0f ? (amk * (1.0f / 448.0f)) : 1.0f;
-            const float sc_v = amv > 0.0f ? (amv * (1.0f / 448.0f)) : 1.0f;
-            const __nv_fp8_e4m3 qk(fminf(fmaxf(kv_val / sc_k, -448.0f), 448.0f));
-            const __nv_fp8_e4m3 qv(fminf(fmaxf(vv_val / sc_v, -448.0f), 448.0f));
-            kv.k_f8[dbase + d] = qk.__x;
-            kv.v_f8[dbase + d] = qv.__x;
-            if (d == 0) {
-                const size_t sidx = ((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + h;
-                kv.k_sc[sidx] = sc_k;
-                kv.v_sc[sidx] = sc_v;
-            }
-            __syncthreads();
-        }
+        ink_kv_store_128(kv, slot0, p_idx, h, d, kv_val, true, sk);
+        ink_kv_store_128(kv, slot0, p_idx, h, d, vv_val, false, sv);
+        if (kv.kv_fmt != 0) __syncthreads();
     }
 }
 

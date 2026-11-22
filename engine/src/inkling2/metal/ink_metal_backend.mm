@@ -67,6 +67,8 @@ class MetalInkBackend final : public InkBackend {
 public:
     const char* backend_name() const noexcept override { return "metal"; }
 
+    int effective_max_ctx() const override { return runner_.max_ctx; }
+
     std::string device_info() const override {
         return cx_.device_name() + " (workSet=" +
                std::to_string((int)(cx_.recommended_working_set() / (1024ull * 1024ull * 1024ull))) + " GiB)";
@@ -427,7 +429,8 @@ public:
     }
 
     bool encode_image(const ImageRec& img, std::vector<float>& out_embeds, std::string& err) override {
-        if (!runner_.vis.loaded || img.file.empty()) return false;
+        if (img.file.empty()) return false;
+        if (!runner_.ensure_vision(err)) return false;
         int ntok = 0;
         return runner_.vis.encode_image_file(cx_, img.file, out_embeds, ntok, err);
     }

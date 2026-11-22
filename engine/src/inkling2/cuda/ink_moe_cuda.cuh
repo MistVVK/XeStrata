@@ -917,7 +917,8 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
             __half2* dst2 = s_x[m];
             for (int i = tid; i < (kInkHidden / 2); i += 128) {
                 const float2 f = src2[i];
-                dst2[i] = __floats2half2_rn(f.x, f.y);
+                dst2[i] = __floats2half2_rn(fminf(fmaxf(f.x, -65504.0f), 65504.0f),
+                                            fminf(fmaxf(f.y, -65504.0f), 65504.0f));
             }
         }
         __syncthreads();
@@ -1099,7 +1100,8 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
             __half2* dst2 = s_h[m];
             for (int i = tid; i < (kInkInter / 2); i += 128) {
                 const float2 f = src2[i];
-                dst2[i] = __floats2half2_rn(f.x, f.y);
+                dst2[i] = __floats2half2_rn(fminf(fmaxf(f.x, -65504.0f), 65504.0f),
+                                            fminf(fmaxf(f.y, -65504.0f), 65504.0f));
             }
         }
         __syncthreads();
@@ -1337,16 +1339,19 @@ __device__ __forceinline__ void sk_unpack64_g_to_u32(const uint8_t* pl, int g, u
 
 __device__ __forceinline__ int32_t dp64_i8_smem(const uint32_t (&w)[16], const InkQ8_1_G64& xb) {
     const uint4* x4 = reinterpret_cast<const uint4*>(xb.qs);
-    const uint4 v0 = x4[0], v1 = x4[1], v2 = x4[2], v3 = x4[3];
-    int32_t s0 = dp4a_i8(w[0],  v0.x, 0);
-    int32_t s1 = dp4a_i8(w[1],  v0.y, 0);
-    s0 = dp4a_i8(w[2],  v0.z, s0); s1 = dp4a_i8(w[3],  v0.w, s1);
-    s0 = dp4a_i8(w[4],  v1.x, s0); s1 = dp4a_i8(w[5],  v1.y, s1);
-    s0 = dp4a_i8(w[6],  v1.z, s0); s1 = dp4a_i8(w[7],  v1.w, s1);
-    s0 = dp4a_i8(w[8],  v2.x, s0); s1 = dp4a_i8(w[9],  v2.y, s1);
-    s0 = dp4a_i8(w[10], v2.z, s0); s1 = dp4a_i8(w[11], v2.w, s1);
-    s0 = dp4a_i8(w[12], v3.x, s0); s1 = dp4a_i8(w[13], v3.y, s1);
-    s0 = dp4a_i8(w[14], v3.z, s0); s1 = dp4a_i8(w[15], v3.w, s1);
+    uint4 v = x4[0];
+    int32_t s0 = dp4a_i8(w[0],  v.x, 0);
+    int32_t s1 = dp4a_i8(w[1],  v.y, 0);
+    s0 = dp4a_i8(w[2],  v.z, s0); s1 = dp4a_i8(w[3],  v.w, s1);
+    v = x4[1];
+    s0 = dp4a_i8(w[4],  v.x, s0); s1 = dp4a_i8(w[5],  v.y, s1);
+    s0 = dp4a_i8(w[6],  v.z, s0); s1 = dp4a_i8(w[7],  v.w, s1);
+    v = x4[2];
+    s0 = dp4a_i8(w[8],  v.x, s0); s1 = dp4a_i8(w[9],  v.y, s1);
+    s0 = dp4a_i8(w[10], v.z, s0); s1 = dp4a_i8(w[11], v.w, s1);
+    v = x4[3];
+    s0 = dp4a_i8(w[12], v.x, s0); s1 = dp4a_i8(w[13], v.y, s1);
+    s0 = dp4a_i8(w[14], v.z, s0); s1 = dp4a_i8(w[15], v.w, s1);
     return s0 + s1;
 }
 
@@ -1362,50 +1367,54 @@ __device__ __forceinline__ void sk_gu_fused_4lane(
     if (n_e == 1) {
         float g0 = 0.0f, u0 = 0.0f;
         const InkQ8_1_G64* x0 = xp[0];
+#pragma unroll 1
         for (int s = 0; s < 9; ++s) {
             const uint8_t* bg = gr + s * SB;
             const uint8_t* bu = ur + s * SB;
-            const float eg = f16_to_f32(ld16_u(bg)) * ((float)bg[2 + g] * (1.0f / 255.0f));
-            const float eu = f16_to_f32(ld16_u(bu)) * ((float)bu[2 + g] * (1.0f / 255.0f));
             const InkQ8_1_G64& xb = x0[s * 4 + g];
-            uint32_t wg[16], wu[16];
-            sk_unpack64_g_to_u32<FMT>(bg + 6, g, wg);
-            sk_unpack64_g_to_u32<FMT>(bu + 6, g, wu);
-            const int32_t ig = dp64_i8_smem(wg, xb);
-            const int32_t iu = dp64_i8_smem(wu, xb);
-            if constexpr (HAS_HALF) {
-                g0 = fmaf(eg, xb.d * (float)ig - HALF * xb.s, g0);
-                u0 = fmaf(eu, xb.d * (float)iu - HALF * xb.s, u0);
-            } else {
-                g0 = fmaf(eg, xb.d * (float)ig, g0);
-                u0 = fmaf(eu, xb.d * (float)iu, u0);
-            }
+            uint32_t w[16];
+            // Sequential gate then up unpack reuses w[16] (halves live weight regs: 32 -> 16, bit-exact)
+            const float eg = f16_to_f32(ld16_u(bg)) * ((float)bg[2 + g] * (1.0f / 255.0f));
+            sk_unpack64_g_to_u32<FMT>(bg + 6, g, w);
+            const int32_t ig = dp64_i8_smem(w, xb);
+            if constexpr (HAS_HALF) g0 = fmaf(eg, xb.d * (float)ig - HALF * xb.s, g0);
+            else                    g0 = fmaf(eg, xb.d * (float)ig, g0);
+
+            const float eu = f16_to_f32(ld16_u(bu)) * ((float)bu[2 + g] * (1.0f / 255.0f));
+            sk_unpack64_g_to_u32<FMT>(bu + 6, g, w);
+            const int32_t iu = dp64_i8_smem(w, xb);
+            if constexpr (HAS_HALF) u0 = fmaf(eu, xb.d * (float)iu - HALF * xb.s, u0);
+            else                    u0 = fmaf(eu, xb.d * (float)iu, u0);
         }
         g0 += __shfl_xor_sync(0xFFFFFFFFu, g0, 2); g0 += __shfl_xor_sync(0xFFFFFFFFu, g0, 1);
         u0 += __shfl_xor_sync(0xFFFFFFFFu, u0, 2); u0 += __shfl_xor_sync(0xFFFFFFFFu, u0, 1);
         ag[0] = g0; au[0] = u0;
     } else {
+#pragma unroll 1
         for (int s = 0; s < 9; ++s) {
             const uint8_t* bg = gr + s * SB;
             const uint8_t* bu = ur + s * SB;
+            uint32_t w[16];
             const float eg = f16_to_f32(ld16_u(bg)) * ((float)bg[2 + g] * (1.0f / 255.0f));
-            const float eu = f16_to_f32(ld16_u(bu)) * ((float)bu[2 + g] * (1.0f / 255.0f));
-            uint32_t wg[16], wu[16];
-            sk_unpack64_g_to_u32<FMT>(bg + 6, g, wg);
-            sk_unpack64_g_to_u32<FMT>(bu + 6, g, wu);
+            sk_unpack64_g_to_u32<FMT>(bg + 6, g, w);
 #pragma unroll
             for (int m = 0; m < MAX_M; ++m) {
                 if (m < n_e) {
                     const InkQ8_1_G64& xb = xp[m][s * 4 + g];
-                    const int32_t ig = dp64_i8_smem(wg, xb);
-                    const int32_t iu = dp64_i8_smem(wu, xb);
-                    if constexpr (HAS_HALF) {
-                        ag[m] = fmaf(eg, xb.d * (float)ig - HALF * xb.s, ag[m]);
-                        au[m] = fmaf(eu, xb.d * (float)iu - HALF * xb.s, au[m]);
-                    } else {
-                        ag[m] = fmaf(eg, xb.d * (float)ig, ag[m]);
-                        au[m] = fmaf(eu, xb.d * (float)iu, au[m]);
-                    }
+                    const int32_t ig = dp64_i8_smem(w, xb);
+                    if constexpr (HAS_HALF) ag[m] = fmaf(eg, xb.d * (float)ig - HALF * xb.s, ag[m]);
+                    else                    ag[m] = fmaf(eg, xb.d * (float)ig, ag[m]);
+                }
+            }
+            const float eu = f16_to_f32(ld16_u(bu)) * ((float)bu[2 + g] * (1.0f / 255.0f));
+            sk_unpack64_g_to_u32<FMT>(bu + 6, g, w);
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (m < n_e) {
+                    const InkQ8_1_G64& xb = xp[m][s * 4 + g];
+                    const int32_t iu = dp64_i8_smem(w, xb);
+                    if constexpr (HAS_HALF) au[m] = fmaf(eu, xb.d * (float)iu - HALF * xb.s, au[m]);
+                    else                    au[m] = fmaf(eu, xb.d * (float)iu, au[m]);
                 }
             }
         }
@@ -1431,6 +1440,7 @@ __device__ __forceinline__ void sk_dn_paired2_4lane(
     if (n_e == 1) {
         float y0 = 0.0f, y1 = 0.0f;
         const InkQ8_1_G64* h0 = hp[0];
+#pragma unroll 1
         for (int s = 0; s < 9; ++s) {
             const uint8_t* blk = pr + s * SB;
             const float eff = f16_to_f32(ld16_u(blk)) * ((float)blk[2 + g] * (1.0f / 255.0f));
@@ -1447,6 +1457,7 @@ __device__ __forceinline__ void sk_dn_paired2_4lane(
         y1 += __shfl_xor_sync(0xFFFFFFFFu, y1, 2); y1 += __shfl_xor_sync(0xFFFFFFFFu, y1, 1);
         a0[0] = y0; a1[0] = y1;
     } else {
+#pragma unroll 1
         for (int s = 0; s < 9; ++s) {
             const uint8_t* blk = pr + s * SB;
             const float eff = f16_to_f32(ld16_u(blk)) * ((float)blk[2 + g] * (1.0f / 255.0f));
@@ -1607,6 +1618,134 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sk(
                 case FMT_S1_5: sk_dn_paired2_4lane<FMT_S1_5, MAX_M>(pr, hp, n_e, g, a0, a1); break;
                 default: break;
             }
+            if (g == 0) {
+#pragma unroll
+                for (int m = 0; m < MAX_M; ++m) {
+                    if (m < n_e) {
+                        const int pid = tb.pairs[row0 + off_m + m];
+                        const float rw = topk_w[pid];
+                        y_pair[(size_t)pid * kInkHidden + 2 * pair_r]     = a0[m] * rw;
+                        y_pair[(size_t)pid * kInkHidden + 2 * pair_r + 1] = a1[m] * rw;
+                    }
+                }
+            }
+        }
+        if constexpr (MAX_M <= 4) { if (off_m + MAX_M < n_total) __syncthreads(); }
+    }
+}
+
+// Per-format specialized S_K decode/verify kernels (eliminates the 7-way runtime switch that forced REG:255 STACK:32..72!)
+template <int FMT, int MAX_M>
+__global__ void __launch_bounds__(128, (FMT == FMT_S1_5 ? 2 : (MAX_M == 1 ? 6 : (MAX_M <= 4 ? 5 : 2)))) k_ink_moe_gu_sk_fmt(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    InkMoeTables tb,
+    const InkQ8_1_G64* __restrict__ x_sk,
+    float* __restrict__ h_f32) {
+    const int ai = blockIdx.y;
+    if (ai >= *tb.nact) return;
+    const int e = tb.active[ai];
+    const InkExpertDev ed = experts[e];
+    if (ed.tier > 1 || ed.gu_code != FMT) return;
+    const int row0 = tb.off[e];
+    const int n_total = tb.cnt[e];
+
+    const int tid  = threadIdx.x;
+    const int sub  = tid >> 2;
+    const int g    = tid & 3;
+    const int feat = blockIdx.x * 32 + sub;
+
+    const uint8_t* body = sec4_base + ed.body_off;
+    const uint8_t* gu_base = body + kInkInter * 2;
+    constexpr size_t row_b = (size_t)(kInkHidden / 256) * ink_sb_bytes(FMT);
+    const uint8_t* gr = gu_base + (size_t)(2 * feat) * row_b;
+    const uint8_t* ur = gr + row_b;
+    const float inv_sq = (feat < kInkInter) ? (1.0f / f16_to_f32(ld16_u(body + feat * 2))) : 0.0f;
+
+    constexpr int SM_M = (MAX_M <= 4) ? MAX_M : 1;
+    __shared__ alignas(16) InkQ8_1_G64 s_xq[SM_M][kInkHidden / 64];
+
+    for (int off_m = 0; off_m < n_total; off_m += MAX_M) {
+        const int n_e = min(MAX_M, n_total - off_m);
+        float ag[MAX_M] = {}, au[MAX_M] = {};
+        const InkQ8_1_G64* xp[MAX_M];
+        if constexpr (MAX_M <= 4) {
+            constexpr int N4 = (int)((kInkHidden / 64) * sizeof(InkQ8_1_G64) / 16);
+            for (int m = 0; m < n_e; ++m) {
+                const uint4* src = reinterpret_cast<const uint4*>(x_sk + (size_t)tb.tok_idx[row0 + off_m + m] * (kInkHidden / 64));
+                uint4* dst = reinterpret_cast<uint4*>(s_xq[m]);
+                for (int i = tid; i < N4; i += 128) dst[i] = src[i];
+            }
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m) xp[m] = s_xq[m];
+            __syncthreads();
+        } else {
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m)
+                xp[m] = (m < n_e) ? (x_sk + (size_t)tb.tok_idx[row0 + off_m + m] * (kInkHidden / 64)) : nullptr;
+        }
+        if (feat < kInkInter) {
+            sk_gu_fused_4lane<FMT, MAX_M>(gr, ur, xp, n_e, g, ag, au);
+            if (g == 0) {
+#pragma unroll
+                for (int m = 0; m < MAX_M; ++m) {
+                    if (m < n_e) h_f32[(size_t)(row0 + off_m + m) * kInkInter + feat] = situ_f32(ag[m], au[m]) * inv_sq;
+                }
+            }
+        }
+        if constexpr (MAX_M <= 4) { if (off_m + MAX_M < n_total) __syncthreads(); }
+    }
+}
+
+template <int FMT, int MAX_M>
+__global__ void __launch_bounds__(128, (FMT == FMT_S1_5 ? 2 : (MAX_M == 1 ? 6 : (MAX_M <= 4 ? 5 : 2)))) k_ink_moe_dn_sk_fmt(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    InkMoeTables tb,
+    const InkQ8_1_G64* __restrict__ h_sk,
+    const float* __restrict__ topk_w,
+    float* __restrict__ y_pair) {
+    const int ai = blockIdx.y;
+    if (ai >= *tb.nact) return;
+    const int e = tb.active[ai];
+    const InkExpertDev ed = experts[e];
+    if (ed.tier > 1 || ed.dn_code != FMT) return;
+    const int row0 = tb.off[e];
+    const int n_total = tb.cnt[e];
+
+    const int tid    = threadIdx.x;
+    const int sub    = tid >> 2;
+    const int g      = tid & 3;
+    const int pair_r = blockIdx.x * 32 + sub;
+
+    const uint8_t* body = sec4_base + ed.body_off;
+    constexpr size_t pair_b = 9ull * ink_sb_bytes(FMT);
+    const uint8_t* pr = body + ed.dn_off + (size_t)pair_r * pair_b;
+
+    constexpr int SM_M = (MAX_M <= 4) ? MAX_M : 1;
+    __shared__ alignas(16) InkQ8_1_G64 s_hq[SM_M][kInkInter / 64];
+
+    for (int off_m = 0; off_m < n_total; off_m += MAX_M) {
+        const int n_e = min(MAX_M, n_total - off_m);
+        float a0[MAX_M] = {}, a1[MAX_M] = {};
+        const InkQ8_1_G64* hp[MAX_M];
+        if constexpr (MAX_M <= 4) {
+            constexpr int N4 = (int)((kInkInter / 64) * sizeof(InkQ8_1_G64) / 16);
+            for (int m = 0; m < n_e; ++m) {
+                const uint4* src = reinterpret_cast<const uint4*>(h_sk + (size_t)(row0 + off_m + m) * (kInkInter / 64));
+                uint4* dst = reinterpret_cast<uint4*>(s_hq[m]);
+                for (int i = tid; i < N4; i += 128) dst[i] = src[i];
+            }
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m) hp[m] = s_hq[m];
+            __syncthreads();
+        } else {
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m)
+                hp[m] = (m < n_e) ? (h_sk + (size_t)(row0 + off_m + m) * (kInkInter / 64)) : nullptr;
+        }
+        if (pair_r < kInkHidden / 2) {
+            sk_dn_paired2_4lane<FMT, MAX_M>(pr, hp, n_e, g, a0, a1);
             if (g == 0) {
 #pragma unroll
                 for (int m = 0; m < MAX_M; ++m) {
@@ -2096,8 +2235,10 @@ __global__ void __launch_bounds__(256) k_ink_moe_sf4_mx8_fp16tc(
                     if (r < nrows) {
                         const float4 fv = *reinterpret_cast<const float4*>(act_f32 + (size_t)s_row[r] * K + k32 * 32 + j * 4);
                         __half2* da = reinterpret_cast<__half2*>(s_a[r]);
-                        da[2 * j + 0] = __floats2half2_rn(fv.x, fv.y);
-                        da[2 * j + 1] = __floats2half2_rn(fv.z, fv.w);
+                        da[2 * j + 0] = __floats2half2_rn(fminf(fmaxf(fv.x, -65504.0f), 65504.0f),
+                                                          fminf(fmaxf(fv.y, -65504.0f), 65504.0f));
+                        da[2 * j + 1] = __floats2half2_rn(fminf(fmaxf(fv.z, -65504.0f), 65504.0f),
+                                                          fminf(fmaxf(fv.w, -65504.0f), 65504.0f));
                     }
                 }
                 __syncthreads();
@@ -2158,8 +2299,10 @@ __global__ void __launch_bounds__(256) k_ink_moe_sf4_mx8_fp16tc(
                     const int j = tid & 7;
                     const float4 fv = *reinterpret_cast<const float4*>(act_f32 + (size_t)s_row[r] * K + k32 * 32 + j * 4);
                     __half2* da = reinterpret_cast<__half2*>(s_a[r]);
-                    da[2 * j + 0] = __floats2half2_rn(fv.x, fv.y);
-                    da[2 * j + 1] = __floats2half2_rn(fv.z, fv.w);
+                    da[2 * j + 0] = __floats2half2_rn(fminf(fmaxf(fv.x, -65504.0f), 65504.0f),
+                                                      fminf(fmaxf(fv.y, -65504.0f), 65504.0f));
+                    da[2 * j + 1] = __floats2half2_rn(fminf(fmaxf(fv.z, -65504.0f), 65504.0f),
+                                                      fminf(fmaxf(fv.w, -65504.0f), 65504.0f));
                 }
                 __syncthreads();
 
@@ -2706,7 +2849,39 @@ struct InkLayerMoeInfo {
     bool has_mx8  = false;
     bool has_sk   = false;
     bool has_gguf = false;
+    uint32_t sk_gu_mask = 0;
+    uint32_t sk_dn_mask = 0;
 };
+
+template <int MAX_M>
+inline void launch_ink_moe_gu_sk_mask(
+    dim3 grid, cudaStream_t st, uint32_t mask,
+    const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
+    const InkQ8_1_G64* x_sk, float* h_f32) {
+    if (mask == 0) { k_ink_moe_gu_sk<MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32); return; }
+    if (mask & (1u << FMT_S1_5)) k_ink_moe_gu_sk_fmt<FMT_S1_5, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32);
+    if (mask & (1u << FMT_S2_K)) k_ink_moe_gu_sk_fmt<FMT_S2_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32);
+    if (mask & (1u << FMT_S3_K)) k_ink_moe_gu_sk_fmt<FMT_S3_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32);
+    if (mask & (1u << FMT_S4_K)) k_ink_moe_gu_sk_fmt<FMT_S4_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32);
+    if (mask & (1u << FMT_S5_K)) k_ink_moe_gu_sk_fmt<FMT_S5_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32);
+    if (mask & (1u << FMT_S6_K)) k_ink_moe_gu_sk_fmt<FMT_S6_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32);
+    if (mask & (1u << FMT_S8_K)) k_ink_moe_gu_sk_fmt<FMT_S8_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32);
+}
+
+template <int MAX_M>
+inline void launch_ink_moe_dn_sk_mask(
+    dim3 grid, cudaStream_t st, uint32_t mask,
+    const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
+    const InkQ8_1_G64* h_sk, const float* topk_w, float* y_pair) {
+    if (mask == 0) { k_ink_moe_dn_sk<MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair); return; }
+    if (mask & (1u << FMT_S1_5)) k_ink_moe_dn_sk_fmt<FMT_S1_5, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
+    if (mask & (1u << FMT_S2_K)) k_ink_moe_dn_sk_fmt<FMT_S2_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
+    if (mask & (1u << FMT_S3_K)) k_ink_moe_dn_sk_fmt<FMT_S3_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
+    if (mask & (1u << FMT_S4_K)) k_ink_moe_dn_sk_fmt<FMT_S4_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
+    if (mask & (1u << FMT_S5_K)) k_ink_moe_dn_sk_fmt<FMT_S5_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
+    if (mask & (1u << FMT_S6_K)) k_ink_moe_dn_sk_fmt<FMT_S6_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
+    if (mask & (1u << FMT_S8_K)) k_ink_moe_dn_sk_fmt<FMT_S8_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
+}
 
 // Standalone Top-8 / 128 exact sigmoid router (shared by single-GPU, hybrid, and Dual-GPU EP!)
 inline void launch_ink_moe_router(
@@ -2836,14 +3011,14 @@ inline void launch_ink_moe_dispatch_only(
             else                 k_ink_moe_sk_tc<false, 64><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
         } else {
             dim3 g32(kInkInter / 32, max_act);
-            if (M == 1)       k_ink_moe_gu_sk<1><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
-            else if (M <= 32) k_ink_moe_gu_sk<4><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
-            else              k_ink_moe_gu_sk<16><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
+            if (M == 1)       launch_ink_moe_gu_sk_mask<1>(g32, st, info.sk_gu_mask, sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
+            else if (M <= 32) launch_ink_moe_gu_sk_mask<4>(g32, st, info.sk_gu_mask, sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
+            else              launch_ink_moe_gu_sk_mask<16>(g32, st, info.sk_gu_mask, sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
             const int nblk_h = P * (kInkInter / 64);
             k_ink_quant_q8_1<<<(nblk_h + 7) / 8, 256, 0, st>>>(ws.h_f32, ws.hq_sk, P, kInkInter);
-            if (M == 1)       k_ink_moe_dn_sk<1><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
-            else if (M <= 32) k_ink_moe_dn_sk<4><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
-            else              k_ink_moe_dn_sk<16><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
+            if (M == 1)       launch_ink_moe_dn_sk_mask<1>(g32, st, info.sk_dn_mask, sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
+            else if (M <= 32) launch_ink_moe_dn_sk_mask<4>(g32, st, info.sk_dn_mask, sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
+            else              launch_ink_moe_dn_sk_mask<16>(g32, st, info.sk_dn_mask, sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
         }
     }
 

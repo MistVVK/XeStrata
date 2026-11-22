@@ -123,11 +123,18 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     if isinstance(par, int) and 1 <= par <= inkling_family.MAX_PARALLEL and "--parallel" not in args:
         if par > 1:
             args += ["--parallel", str(par)]
-    # Propagate 2-GPU selection (`cfg["gpu"] = [0, 1]` or `gpu_roles`) into `--gpus 2` for dual-GPU Expert Parallelism (CUDA, HIP, SYCL)
+    # Propagate 2..4 GPU selection (`cfg["gpu"]` or `gpu_roles`) into `--gpus` and `--layer-split` (#6592)
     from serve.server_parts.engines import gpu_list
     n_gpus = len(gpu_list(cfg))
+    is_cuda = cfg.get("backend") not in ("hip", "sycl", "metal", "cpu")
     if n_gpus >= 2 and "--gpus" not in args:
-        args += ["--gpus", str(min(2, n_gpus))]
+        max_g = 4 if is_cuda else 2
+        args += ["--gpus", str(min(max_g, n_gpus))]
+    if n_gpus >= 2 and is_cuda and "--layer-split" not in args:
+        if cfg.get("layer_split"):
+            args += ["--layer-split", str(cfg["layer_split"])]
+        elif n_gpus >= 3:
+            args += ["--layer-split", "auto"]
     wants_images = "--vision" in args
     need_draft = "--draft" not in args and wants_drafter(cfg)
     info = probe(exe, args, cfg) if (exe and (wants_images or need_draft)) else None

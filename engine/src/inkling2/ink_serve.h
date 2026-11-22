@@ -377,11 +377,19 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     size_t sl = base.find_last_of("/\\");
     if (sl != std::string::npos) base = base.substr(sl + 1);
 
+    const int eff_max_ctx = (backend.effective_max_ctx() > 0) ? backend.effective_max_ctx() : cfg.bopts.max_ctx;
+    const auto kv_str = [&]() -> const char* {
+        const KvDtype kd = backend.stats().kv_dtype;
+        if (kd == KvDtype::FP8_E4M3) return "fp8";
+        if (kd == KvDtype::K8V8)     return "k8v8";
+        if (kd == KvDtype::K8V4)     return "k8v4";
+        return "fp16";
+    }();
     proto("INFO engine=strata-inkling-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 kv_dtype=%s drafter=%s images=%d image_pad=%d parallel=%d",
           cfg.version.c_str(), backend.backend_name(), base.c_str(), c.n_phys, c.n_visits, V, chunk_sz,
-          P, cfg.bopts.kv_dtype == KvDtype::FP8_E4M3 ? "fp8" : "fp16",
+          P, kv_str,
           use_dspark ? "dspark" : "none", images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
-    proto("READY %d stop hold holdb", cfg.bopts.max_ctx);
+    proto("READY %d stop hold holdb", eff_max_ctx);
 
     std::vector<ActiveReq> reqs(P);
     std::unordered_map<std::string, int> req_id_to_slot;
@@ -704,7 +712,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 for (int i = 0; i <= nd; ++i) {
                     float* lg = logits_buf.data() + static_cast<size_t>(i) * V;
                     if (!finite_logits(lg, V)) {
-                        backend.rollback_slot(rq.slot, rq.cur_pos);
+                        // Never leave poisoned KV/ShortConv prefix cached across retries (#879)!
+                        rq.cached_prefix.clear();
+                        backend.reset_slot(rq.slot);
                         finish_req(rq, "nonfinite");
                         done = true;
                         break;
@@ -757,6 +767,10 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         for (int s = 0; s < P; ++s) {
             auto& rq = reqs[s];
             if (!rq.active || rq.prefill_pos < rq.prompt_len) continue;
+            if (rq.cur_pos >= eff_max_ctx) {
+                finish_req(rq, "length");
+                continue;
+            }
             batch.push(s, rq.cur_pos, rq.next_tok, true);
             logit_slots.push_back(s);
             --token_budget;
@@ -819,6 +833,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             auto& rq = reqs[s];
             float* lg = logits_buf.data() + static_cast<size_t>(wi) * V;
             if (!finite_logits(lg, V)) {
+                // Purge poisoned KV/ShortConv state so subsequent retries start clean (#879)!
+                rq.cached_prefix.clear();
+                backend.reset_slot(rq.slot);
                 finish_req(rq, "nonfinite");
                 continue;
             }
@@ -838,7 +855,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             ++rq.generated;
 
             const bool stop = is_stop_tok(tok);
-            const bool hit_len = (rq.generated >= rq.max_new) || (rq.cur_pos + 1 >= cfg.bopts.max_ctx);
+            const bool hit_len = (rq.generated >= rq.max_new) || (rq.cur_pos + 1 >= eff_max_ctx);
             const bool hit_hold = (rq.s.hold_budget > 0 && rq.generated >= rq.s.hold_budget && tok != rq.s.hold_token_id);
             const bool hit_loop = cfg.anti_loop && detect_repetition_loop(rq.gen_ids);
 

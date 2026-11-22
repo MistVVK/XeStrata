@@ -21,13 +21,13 @@ from __future__ import annotations
 
 GIB_TO_GB = 1.073741824
 VRAM_DRIVER_GB = 1.10            # driver / WDDM / desktop compositor + runtime buffers
-VRAM_HYBRID_WORKSPACE_GB = 0.90  # hybrid ping-pong DMA ring + runner scratch + desktop margin (#6587)
-DSPARK_BASE_GB = 0.08            # DSpark activation / head buffers
-DSPARK_KV_BYTES_PER_TOK = 12288  # 3 DSpark layers x 8 kv_heads x 128 head_dim x 2 (K+V) x 2B (FP16)
+VRAM_HYBRID_WORKSPACE_GB = 0.90  # hybrid ping-pong DMA ring + O(1) prefill scratch + desktop margin (#6587)
+DSPARK_BASE_GB = 0.11            # DSpark activation + compact SWA-1025 rings for layers 0 & 2
+DSPARK_KV_BYTES_PER_TOK = 4096   # 1 global DSpark layer (L1) x 8 kv_heads x 128 head_dim x 2 (K+V) x 2B (FP16)
 OS_RESERVE_GB = 4.50             # system RAM reserve on discrete or UMA hosts
 UMA_RESERVE_GB = 5.00            # unified memory OS + driver reserve
 SSD_NEAR_RESIDENT_GB = 2.0
-VISION_GB = 0.637                # Inkling-2-Mini-Vision.strata (636,526,592 B)
+VISION_GB = 0.637                # Inkling-2-Mini-Vision.strata (636,526,592 B, CPU / on-demand on <=12 GiB GPUs)
 DSPARK_GGUF_GB = 0.402           # dspark-Inkling-2-Mini-Q8_0.gguf (402,278,560 B)
 DEFAULT_CONTEXT = 32768          # docs/10-GUI-TUI.md default: 32K (up to 1M available)
 CONTEXTS = [8192, 32768, 65536, 131072, 262144]
@@ -121,61 +121,124 @@ def kv_cache_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False)
     return round(slots * (active_ctx * per_tok + fixed), 3)
 
 
-def auto_fp8_kv(vram_gib: float | None, ctx: int | None = None, parallel: int = 1) -> bool:
-    """True when the engine auto-enables FP8/k8v8 KV cache to preserve VRAM for 3x-looped routed experts (<= 13.0 GiB discrete GPUs or >= 16 parallel slots)."""
-    if int(parallel or 1) >= 16:
+def auto_fp8_kv(vram_gib: float | None, ctx: int | None = None, parallel: int = 1, kv_offload: str = "auto") -> bool:
+    """Whether FP8 KV is auto-selected. With Host KV Offload ('auto'/'on'), lossless FP16 stays default (#552)
+    except at high concurrency (parallel >= 16) where 40 SWA rings dominate VRAM."""
+    slots = max(1, min(MAX_PARALLEL, int(parallel or 1)))
+    if slots >= 16:
         return True
-    v = float(vram_gib or 0.0)
-    return 0.0 < v <= 13.0
+    if str(kv_offload or "auto").lower() == "off":
+        v = float(vram_gib or 0.0)
+        return 0.0 < v <= 13.0
+    return False
+
+
+def global_kv_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False) -> float:
+    """Global KV cache size in GB across the 8 global visits (spillable to mapped pinned host RAM via --kv-offload)."""
+    n = DEFAULT_CONTEXT if ctx is None else max(1024, int(ctx))
+    slots = max(1, min(MAX_PARALLEL, int(parallel or 1)))
+    if fp8_kv or slots >= 16:
+        per_tok = GLOBAL_KV_BYTES_PER_TOK_FP8 / 1e9
+        active_ctx = min(n, 4096) if slots >= 16 else n
+    else:
+        per_tok = GLOBAL_KV_BYTES_PER_TOK_FP16 / 1e9
+        active_ctx = n
+    return round(slots * active_ctx * per_tok, 3)
+
+
+def swa_sconv_gb(parallel: int = 1, fp8_kv: bool = False) -> float:
+    """VRAM-resident 40x SWA-1024 + ShortConv state in GB."""
+    slots = max(1, min(MAX_PARALLEL, int(parallel or 1)))
+    fixed = SWA_AND_SCONV_GB_FP8 if (fp8_kv or slots >= 16) else SWA_AND_SCONV_GB_FP16
+    return round(slots * fixed, 3)
 
 
 def non_expert_gb(ctx: int | None = None, parallel: int = 1, vision: bool = False, *,
-                  dspark: bool = True, fp8_kv: bool = False, hybrid: bool = False) -> float:
+                  dspark: bool = True, fp8_kv: bool = False, hybrid: bool = False,
+                  host_offload_global_kv: bool = False) -> float:
     """Video memory kept free of expert bodies: driver/desktop + hybrid workspace + DSpark KV + KV/SWA/ShortConv (+ Vision shard)."""
+    kv_vram = swa_sconv_gb(parallel, fp8_kv=fp8_kv) if host_offload_global_kv else kv_cache_gb(ctx, parallel, fp8_kv=fp8_kv)
     return round(
         VRAM_DRIVER_GB
         + (VRAM_HYBRID_WORKSPACE_GB if hybrid else 0.0)
         + dspark_gb(ctx, enabled=dspark)
-        + kv_cache_gb(ctx, parallel, fp8_kv=fp8_kv)
+        + kv_vram
         + (VISION_GB if vision else 0.0),
         3,
     )
 
 
 def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None, vision: bool = False,
-            parallel: int = 1, dspark: bool = True) -> dict:
+            parallel: int = 1, dspark: bool = True, kv_offload: str = "auto") -> dict:
     """Placement of `build` on a discrete-GPU PC (vram_gib + ram_gib): GB of experts in VRAM, in RAM, and on SSD.
 
-    Accounts for driver/desktop overhead, KV/SWA cache, DSpark KV, Vision shard, and hybrid runner workspace (#6587),
-    clamping `in_vram >= 0.0` so 4 GB and 6 GB GPUs place trunk in VRAM and stream routed experts from RAM/SSD cleanly.
+    Implements the unified 4-tier adaptive contract (GPU -> RAM+CPU -> SSD) with Host KV Offloading (#552),
+    CPU/on-demand Vision on <= 12.5 GiB GPUs, O(1) prefill headroom, and WDDM floor so 4/6/8/12/16/24+ GB GPUs
+    never OOM even at 64K+ context with DSpark and Vision enabled.
     """
     info = BUILDS[build]
     v_gib = float(vram_gib or 0.0)
     vram_gb = v_gib * GIB_TO_GB
     ram_gb = float(ram_gib or 0.0) * GIB_TO_GB
-    fp8_kv = auto_fp8_kv(vram_gib, ctx, parallel)
+    offload_mode = str(kv_offload or "auto").lower()
+    fp8_kv = auto_fp8_kv(v_gib, ctx, parallel, kv_offload=offload_mode)
+    kv_dtype = "fp8" if fp8_kv else "fp16"
     extra_dspark_weights = DSPARK_GGUF_GB if (dspark and info.get("format") == "gguf") else 0.0
     dense_total = info["dense_gb"] + extra_dspark_weights
-    # Check 100%-VRAM residency first (no hybrid bounce ring needed when every expert fits on GPU)
-    full_need = dense_total + info["bodies_gb"] + non_expert_gb(ctx, parallel, vision=vision, dspark=dspark, fp8_kv=fp8_kv, hybrid=False)
-    if vram_gb > 0.0 and full_need <= vram_gb:
-        in_vram = info["bodies_gb"]
-        in_ram = 0.0
-        on_ssd = 0.0
-        full_vram = True
-    else:
-        gpu_room = max(0.0, vram_gb - dense_total - non_expert_gb(ctx, parallel, vision=vision, dspark=dspark, fp8_kv=fp8_kv, hybrid=True))
-        ram_room = max(0.0, ram_gb - OS_RESERVE_GB - (VISION_GB if vision else 0.0))
-        in_vram = min(info["bodies_gb"], gpu_room)
-        in_ram = min(info["bodies_gb"] - in_vram, ram_room)
-        on_ssd = max(0.0, info["bodies_gb"] - in_vram - in_ram)
-        full_vram = False
+    # Vision stays in host RAM / CPU on <= 12.5 GiB GPUs so it never steals ~0.64 GB of hot 3x-looped expert VRAM!
+    vision_in_vram = bool(vision and v_gib > 12.5)
+    glob_kv = global_kv_gb(ctx, parallel, fp8_kv=fp8_kv)
+    ram_avail_for_model = max(0.0, ram_gb - OS_RESERVE_GB - (VISION_GB if vision else 0.0))
+
+    # 1. Try 100%-VRAM expert residency with VRAM-resident global KV first
+    full_need = dense_total + info["bodies_gb"] + non_expert_gb(
+        ctx, parallel, vision=vision_in_vram, dspark=dspark, fp8_kv=fp8_kv, hybrid=False, host_offload_global_kv=False
+    )
+    if vram_gb > 0.0 and offload_mode != "on" and full_need <= vram_gb:
+        return {
+            "vram_gb": round(info["bodies_gb"], 2),
+            "ram_gb": 0.0,
+            "ssd_gb": 0.0,
+            "host_kv_gb": 0.0,
+            "kv_dtype": kv_dtype,
+            "kv_offload": "off",
+            "full_vram": True,
+        }
+
+    # 2. Try 100%-VRAM expert residency with Host KV Offloading (e.g. 12 GiB RTX 5070 + SQ-10 + lossless FP16 32K!)
+    can_offload_kv = (offload_mode != "off") and (ram_avail_for_model >= glob_kv)
+    full_need_offload = dense_total + info["bodies_gb"] + non_expert_gb(
+        ctx, parallel, vision=vision_in_vram, dspark=dspark, fp8_kv=fp8_kv, hybrid=False, host_offload_global_kv=True
+    )
+    if vram_gb > 0.0 and can_offload_kv and full_need_offload <= vram_gb:
+        return {
+            "vram_gb": round(info["bodies_gb"], 2),
+            "ram_gb": 0.0,
+            "ssd_gb": 0.0,
+            "host_kv_gb": round(glob_kv, 2),
+            "kv_dtype": kv_dtype,
+            "kv_offload": "on",
+            "full_vram": True,
+        }
+
+    # 3. Hybrid 3/4-tier placement (VRAM hot 3x-looped core -> Host RAM -> Auto-SSD)
+    use_host_kv = can_offload_kv and (offload_mode == "on" or v_gib <= 13.0 or glob_kv > 1.5)
+    host_kv_used = glob_kv if use_host_kv else 0.0
+    gpu_room = max(0.0, vram_gb - dense_total - non_expert_gb(
+        ctx, parallel, vision=vision_in_vram, dspark=dspark, fp8_kv=fp8_kv, hybrid=True, host_offload_global_kv=use_host_kv
+    ))
+    ram_room = max(0.0, ram_avail_for_model - host_kv_used)
+    in_vram = min(info["bodies_gb"], gpu_room)
+    in_ram = min(info["bodies_gb"] - in_vram, ram_room)
+    on_ssd = max(0.0, info["bodies_gb"] - in_vram - in_ram)
     return {
         "vram_gb": round(in_vram, 2),
         "ram_gb": round(in_ram, 2),
         "ssd_gb": round(on_ssd, 2),
-        "full_vram": full_vram,
-        "kv_dtype": "fp8" if fp8_kv else "fp16",
+        "host_kv_gb": round(host_kv_used, 2),
+        "kv_dtype": kv_dtype,
+        "kv_offload": "on" if use_host_kv else "off",
+        "full_vram": False,
     }
 
 
@@ -322,3 +385,18 @@ def ssd_mode_flags(build: str, vram_gib: float | None, ram_gib: float, unified: 
         "tier": "hybrid_ssd", "runnable": True, "placement": placed,
         "flags": ["--ssd-experts", "--ram-experts-gb", f"{max(0.0, placed['ram_gb']):g}"],
     }
+
+
+def multi_gpu_flags(gpus: list[dict], *, windows: bool = False) -> list[str]:
+    """Automatic multi-GPU flags for 2..4 discrete GPUs: uses --layer-split auto on 3-4 GPUs,
+    mixed architectures, unequal VRAM (>15% skew), or Windows WDDM (avoids EP2 P2P issues #6592)."""
+    n = min(4, len(gpus or []))
+    if n < 2:
+        return []
+    flags = ["--gpus", str(n)]
+    vrams = [float(g.get("vram_gb") or g.get("vram_gib") or 0.0) for g in gpus[:n]]
+    archs = {str(g.get("arch") or "").strip().lower() for g in gpus[:n] if g.get("arch")}
+    unequal = (min(vrams) > 0.0 and (max(vrams) / min(vrams)) > 1.15)
+    if n >= 3 or windows or unequal or len(archs) > 1:
+        flags += ["--layer-split", "auto"]
+    return flags

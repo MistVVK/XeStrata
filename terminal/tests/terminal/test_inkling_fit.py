@@ -79,15 +79,48 @@ class TestInklingFitAndHardwareSelection(unittest.TestCase):
         self.assertTrue(rec_strix["unified"])
         self.assertTrue(rec_strix["fits"])
 
-        # 8 GiB & 12 GiB discrete GPUs auto-enable FP8 KV while reserving hybrid workspace + DSpark headroom (#6587)
+    def test_4tier_host_kv_offload_and_low_vram_contract(self):
+        # Lossless FP16 KV stays default on 8/12/16/24 GiB GPUs via Host KV Offload (#552)!
         p8 = inkling_fit.compute("SQ-10", 8, 32, 32768)
-        self.assertEqual(p8["kv_dtype"], "fp8")
+        self.assertEqual(p8["kv_dtype"], "fp16")
+        self.assertEqual(p8["kv_offload"], "on")
+        self.assertGreater(p8["host_kv_gb"], 0.9)
         self.assertGreater(p8["vram_gb"], 3.5)
+        self.assertEqual(p8["ssd_gb"], 0.0)
+
+        # Pastebin CA1JEeAx: RTX 5050 Laptop 8 GiB + SQ-15 + 64K + Vision + DSpark must NEVER drop below 0 VRAM or OOM!
+        p8_vis = inkling_fit.compute("SQ-15", 8, 32, 65536, vision=True, dspark=True)
+        self.assertGreater(p8_vis["vram_gb"], 3.5)
+        self.assertEqual(p8_vis["kv_offload"], "on")
+        self.assertEqual(p8_vis["ssd_gb"], 0.0)
+        # Vision stays on CPU/host on <= 12.5 GiB GPUs (0 permanent VRAM stolen)
+        p8_novis = inkling_fit.compute("SQ-15", 8, 32, 65536, vision=False, dspark=True)
+        self.assertEqual(p8_vis["vram_gb"], p8_novis["vram_gb"])
+
+        # 12 GiB + SQ-15 + 32K keeps > 7.5 GB hot 3x-looped experts in VRAM with lossless FP16 Host KV Offload
         p12 = inkling_fit.compute("SQ-15", 12, 32, 32768)
-        self.assertEqual(p12["kv_dtype"], "fp8")
+        self.assertEqual(p12["kv_dtype"], "fp16")
         self.assertGreater(p12["vram_gb"], 7.5)
+        self.assertEqual(p12["ssd_gb"], 0.0)
+
+        # 16 GiB + SQ-15 + 32K fits 100% in VRAM with lossless FP16 KV (0 host spill)
         p16 = inkling_fit.compute("SQ-15", 16, 32, 32768)
         self.assertEqual(p16["kv_dtype"], "fp16")
+        self.assertTrue(p16["full_vram"])
+        self.assertEqual(p16["host_kv_gb"], 0.0)
+
+        # 4 GiB & 6 GiB GPUs never produce negative VRAM; low-RAM 4 GiB auto-activates SSD tier
+        p4 = inkling_fit.compute("SQ-10", 4, 8, 32768)
+        self.assertGreaterEqual(p4["vram_gb"], 0.0)
+        self.assertGreater(p4["ssd_gb"], 0.0)
+        ssd_f = inkling_fit.ssd_mode_flags("SQ-10", 4, 8, ctx=32768)
+        self.assertIn("--ssd-experts", ssd_f["flags"])
+
+        # Multi-GPU layer-split auto-activates for 3x P100, unequal VRAM, mixed arch, or Windows WDDM
+        f_3p100 = inkling_fit.multi_gpu_flags([{"vram_gb": 16, "arch": "sm_60"}] * 3, windows=True)
+        self.assertEqual(f_3p100, ["--gpus", "3", "--layer-split", "auto"])
+        f_mixed = inkling_fit.multi_gpu_flags([{"vram_gb": 24, "arch": "sm_86"}, {"vram_gb": 12, "arch": "sm_89"}])
+        self.assertEqual(f_mixed, ["--gpus", "2", "--layer-split", "auto"])
 
     def test_kv_cache_scales_for_parallel_1_to_64(self):
         k1 = inkling_fit.kv_cache_gb(32768, parallel=1)

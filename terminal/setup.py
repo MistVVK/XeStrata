@@ -10511,10 +10511,14 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
     vram_gib, ram_gib, unified, igpu, arch = inkling_pc(gpu, ram)
     multi_cards = _multi_gpu_cards(multi, gpu, hip, amd) if not unified else []
-    dual_gpus = multi_cards[:2] if len(multi_cards) >= 2 else []
-    if len(dual_gpus) >= 2:
-        vram_gib = sum(float(g.get("vram_gb") or 0.0) for g in dual_gpus)
-        ok("GPUs: " + " + ".join(gpu_name(c) for c in dual_gpus) + " (dual-GPU expert parallelism)")
+    is_cuda_ink = not hip and getattr(a, "backend", None) != "sycl" and sys.platform != "darwin"
+    ink_gpus = multi_cards[:(4 if is_cuda_ink else 2)] if len(multi_cards) >= 2 else []
+    mgpu_flags = inkling_fit.multi_gpu_flags(ink_gpus, windows=WIN) if (is_cuda_ink and len(ink_gpus) >= 2) else (["--gpus", "2"] if len(ink_gpus) >= 2 else [])
+    use_ink_ls = "--layer-split" in mgpu_flags
+    if len(ink_gpus) >= 2:
+        vram_gib = sum(float(g.get("vram_gb") or 0.0) for g in ink_gpus)
+        mode_desc = "pipeline layer-split" if use_ink_ls else "dual-GPU expert parallelism"
+        ok("GPUs: " + " + ".join(gpu_name(c) for c in ink_gpus) + f" ({mode_desc})")
     vision = a.vision not in ("no", "none")
     want_ctx = a.context or inkling_family.DEFAULT_CONTEXT
     lines = inkling_menu_lines(vram_gib, ram_gib, unified, want_ctx, vision, igpu=igpu, arch=arch)
@@ -10618,10 +10622,12 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         args += ["--vision", str(vision_path)]
     if dspark_path is not None:
         args += ["--dspark", str(dspark_path)]
-    if len(dual_gpus) >= 2:
-        args += ["--gpus", "2"]
-    if not unified and len(dual_gpus) < 2:
+    if mgpu_flags:
+        args += mgpu_flags
+    if not unified and len(ink_gpus) < 2:
         args += ["--vram-experts-gb", f"{placed['vram_gb']:.2f}", "--ram-experts-gb", f"{placed['ram_gb']:.2f}"]
+        if placed.get("ssd_gb", 0.0) > 0.05:
+            args += ["--ssd-experts"]
     cfg = {
         "exe": engine_exe(eng),
         "args": args,
@@ -10635,6 +10641,8 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         "drafting": drafting_mode,
         "parallel": inkling_family.DEFAULT_PARALLEL,
     }
+    if use_ink_ls:
+        cfg["layer_split"] = "auto"
     if hip:
         cfg["backend"] = "hip"
     elif sys.platform == "darwin":
@@ -10643,11 +10651,11 @@ def install_inkling2(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         cfg["backend"] = "sycl"
     if isinstance(getattr(a, "_roles", None), dict):
         from strata_control import gpu_roles as GR
-        rcards = getattr(a, "_roles_cards", None) or (dual_gpus if len(dual_gpus) >= 2 else [gpu])
+        rcards = getattr(a, "_roles_cards", None) or (ink_gpus if len(ink_gpus) >= 2 else [gpu])
         cfg.update(GR.mirror(GR.parse_saved(a._roles) or a._roles, rcards))
         cfg["gpus_asked"] = True
-    elif len(dual_gpus) >= 2:
-        cfg["gpu"] = [int(g["index"]) for g in dual_gpus]
+    elif len(ink_gpus) >= 2:
+        cfg["gpu"] = [int(g["index"]) for g in ink_gpus]
         cfg["gpu_order"] = "as_given"
         cfg["gpus_asked"] = True
     elif gpu.get("count", 1) > 1 or a.gpu is not None:

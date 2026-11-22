@@ -55,6 +55,7 @@ set_target_properties(strata_inkling_cuda_sm120 PROPERTIES
   CUDA_STANDARD 20
   CUDA_STANDARD_REQUIRED ON
   CUDA_ARCHITECTURES "${_ink_sm120a_archs}"
+  CUDA_RUNTIME_LIBRARY Shared
   POSITION_INDEPENDENT_CODE ON
 )
 target_compile_options(strata_inkling_cuda_sm120 PRIVATE
@@ -70,6 +71,7 @@ set_target_properties(strata_inkling_cuda PROPERTIES
   CUDA_STANDARD 20
   CUDA_STANDARD_REQUIRED ON
   CUDA_ARCHITECTURES "${STRATA_INK_CUDA_ARCHS}"
+  CUDA_RUNTIME_LIBRARY Shared
   POSITION_INDEPENDENT_CODE ON
 )
 target_compile_options(strata_inkling_cuda PRIVATE

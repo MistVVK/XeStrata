@@ -22,27 +22,142 @@
 
 namespace strata::ink {
 
-// ---- KV Cache Representation (Supports both FP16 and FP8 E4M3 per-head-token scaled!) ----
+// ---- KV Cache Representation (Native GPU FP16, FP8 E4M3, K8V8 INT8, and K8V4 INT8/INT4!) ----
 enum class InkKvDtype : int {
     FP16 = 0,
     FP8  = 1,
+    K8V8 = 2,
+    K8V4 = 3,
 };
 
 // Per-visit KV cache descriptor passed by value to attention kernels (CUDA-Graph friendly!)
+// Supports zero-copy Host KV Offloading: global tokens [0..dev_cap-1] live in VRAM and [dev_cap..cap_pos-1]
+// live in mapped pinned host RAM (cudaHostAllocMapped + cudaHostGetDevicePointer) so lossless FP16 KV never OOMs!
 struct InkKvVisitDesc {
-    __half*  k_f16;      // [max_slots, cap_pos, 8, 128] (used if dtype == FP16)
+    __half*  k_f16;      // [max_slots, dev_cap, 8, 128] (kv_fmt == 0)
     __half*  v_f16;
-    uint8_t* k_f8;       // [max_slots, cap_pos, 8, 128] E4M3 (used if dtype == FP8)
-    uint8_t* v_f8;
-    float*   k_sc;       // [max_slots, cap_pos, 8] per-head FP32 scale for FP8
+    uint8_t* k_f8;       // [max_slots, dev_cap, 8, 128] (FP8 E4M3 / K8V8 int8 / K8V4 int8)
+    uint8_t* v_f8;       // [max_slots, dev_cap, 8, 128] (FP8 / K8V8) or [max_slots, dev_cap, 8, 64] (K8V4 packed 4-bit)
+    float*   k_sc;       // [max_slots, dev_cap, 8] per-head FP32 scale
     float*   v_sc;
-    int      cap_pos;    // SWA: swa_ring (>= 1024 + max_chunk or 1024+16); Global: max_ctx
+    __half*  h_k_f16;    // Mapped pinned host K [max_slots, host_cap, 8, 128] (global visits only)
+    __half*  h_v_f16;
+    uint8_t* h_k_f8;
+    uint8_t* h_v_f8;
+    float*   h_k_sc;
+    float*   h_v_sc;
+    int      cap_pos;    // SWA: swa_ring; Global: dev_cap + host_cap (total allocated elastic capacity <= max_ctx)
+    int      dev_cap;    // Global: VRAM-resident prefix [0..dev_cap-1]; 0 when 100% host-offloaded
+    int      host_cap;   // Global: mapped pinned host tail [dev_cap..dev_cap+host_cap-1]; 0 when VRAM-only
     bool     is_swa;
-    bool     is_fp8;
+    uint8_t  kv_fmt;     // 0=FP16, 1=FP8, 2=K8V8, 3=K8V4
 };
 
+// Unified inline 4-dim KV loader for all 4 formats (FP16 / FP8 / K8V8 / K8V4) + transparent Host KV Offload!
+__device__ __forceinline__ void ink_kv_load4(
+    const InkKvVisitDesc& kv, int sl, int p_idx, int kh, int lane, float4& kv4, float4& vv4) {
+    const bool use_host = (!kv.is_swa && kv.host_cap > 0 && p_idx >= kv.dev_cap);
+    const int stride = use_host ? kv.host_cap : (kv.host_cap > 0 ? kv.dev_cap : kv.cap_pos);
+    const int pos_l  = use_host ? (p_idx - kv.dev_cap) : p_idx;
+    const size_t hbase = ((size_t)sl * stride + pos_l) * kInkKVHeads + kh;
+    const size_t base  = hbase * kInkHeadDim + (size_t)lane * 4;
+    if (kv.kv_fmt == 0) {
+        const __half* pk = use_host ? kv.h_k_f16 : kv.k_f16;
+        const __half* pv = use_host ? kv.h_v_f16 : kv.v_f16;
+        const uint2 k2 = *(const uint2*)(pk + base);
+        const uint2 v2 = *(const uint2*)(pv + base);
+        const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
+        const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
+        const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
+        const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
+        kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
+        vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
+    } else if (kv.kv_fmt == 1) {
+        const uint8_t* pk = use_host ? kv.h_k_f8 : kv.k_f8;
+        const uint8_t* pv = use_host ? kv.h_v_f8 : kv.v_f8;
+        const float sk = (use_host ? kv.h_k_sc : kv.k_sc)[hbase];
+        const float sv = (use_host ? kv.h_v_sc : kv.v_sc)[hbase];
+        const uint32_t k4 = *(const uint32_t*)(pk + base);
+        const uint32_t v4 = *(const uint32_t*)(pv + base);
+        const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
+        const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
+        const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
+        const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4 >> 16));
+        kv4 = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
+        vv4 = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
+    } else if (kv.kv_fmt == 2) {
+        const uint8_t* pk = use_host ? kv.h_k_f8 : kv.k_f8;
+        const uint8_t* pv = use_host ? kv.h_v_f8 : kv.v_f8;
+        const float sk = (use_host ? kv.h_k_sc : kv.k_sc)[hbase];
+        const float sv = (use_host ? kv.h_v_sc : kv.v_sc)[hbase];
+        const uint32_t k4 = *(const uint32_t*)(pk + base);
+        const uint32_t v4 = *(const uint32_t*)(pv + base);
+        kv4 = make_float4((float)(int8_t)(k4 & 0xFFu) * sk, (float)(int8_t)((k4 >> 8) & 0xFFu) * sk,
+                          (float)(int8_t)((k4 >> 16) & 0xFFu) * sk, (float)(int8_t)(k4 >> 24) * sk);
+        vv4 = make_float4((float)(int8_t)(v4 & 0xFFu) * sv, (float)(int8_t)((v4 >> 8) & 0xFFu) * sv,
+                          (float)(int8_t)((v4 >> 16) & 0xFFu) * sv, (float)(int8_t)(v4 >> 24) * sv);
+    } else {
+        const uint8_t* pk = use_host ? kv.h_k_f8 : kv.k_f8;
+        const uint8_t* pv = use_host ? kv.h_v_f8 : kv.v_f8;
+        const float sk = (use_host ? kv.h_k_sc : kv.k_sc)[hbase];
+        const float sv = (use_host ? kv.h_v_sc : kv.v_sc)[hbase];
+        const uint32_t k4 = *(const uint32_t*)(pk + base);
+        kv4 = make_float4((float)(int8_t)(k4 & 0xFFu) * sk, (float)(int8_t)((k4 >> 8) & 0xFFu) * sk,
+                          (float)(int8_t)((k4 >> 16) & 0xFFu) * sk, (float)(int8_t)(k4 >> 24) * sk);
+        const uint16_t vp = *(const uint16_t*)(pv + hbase * (kInkHeadDim / 2) + (size_t)lane * 2);
+        const int v0 = (int)(vp & 0xFu) - 8;
+        const int v1 = (int)((vp >> 4) & 0xFu) - 8;
+        const int v2 = (int)((vp >> 8) & 0xFu) - 8;
+        const int v3 = (int)((vp >> 12) & 0xFu) - 8;
+        vv4 = make_float4((float)v0 * sv, (float)v1 * sv, (float)v2 * sv, (float)v3 * sv);
+    }
+}
+
+// Unified 128-thread per-head KV store (all 4 formats + transparent Host KV Offload + FP16 overflow clamp!)
+__device__ __forceinline__ void ink_kv_store_128(
+    const InkKvVisitDesc& kv, int sl, int p_idx, int kh, int tid, float val, bool is_k, float sh[4]) {
+    const bool use_host = (!kv.is_swa && kv.host_cap > 0 && p_idx >= kv.dev_cap);
+    const int stride = use_host ? kv.host_cap : (kv.host_cap > 0 ? kv.dev_cap : kv.cap_pos);
+    const int pos_l  = use_host ? (p_idx - kv.dev_cap) : p_idx;
+    const size_t hbase = ((size_t)sl * stride + pos_l) * kInkKVHeads + kh;
+    const size_t base  = hbase * kInkHeadDim;
+    if (kv.kv_fmt == 0) {
+        __half* dst = is_k ? (use_host ? kv.h_k_f16 : kv.k_f16) : (use_host ? kv.h_v_f16 : kv.v_f16);
+        dst[base + tid] = __float2half_rn(fminf(fmaxf(val, -65504.0f), 65504.0f));
+        return;
+    }
+    float mv = warp_max(fabsf(val));
+    if ((tid & 31) == 0) sh[tid >> 5] = mv;
+    __syncthreads();
+    const float am = fmaxf(fmaxf(sh[0], sh[1]), fmaxf(sh[2], sh[3]));
+    uint8_t* dst8 = is_k ? (use_host ? kv.h_k_f8 : kv.k_f8) : (use_host ? kv.h_v_f8 : kv.v_f8);
+    float* dst_sc = is_k ? (use_host ? kv.h_k_sc : kv.k_sc) : (use_host ? kv.h_v_sc : kv.v_sc);
+    if (kv.kv_fmt == 1) {
+        const float sc = am > 0.0f ? (am * (1.0f / 448.0f)) : 1.0f;
+        const __nv_fp8_e4m3 qv(fminf(fmaxf(val / sc, -448.0f), 448.0f));
+        dst8[base + tid] = qv.__x;
+        if (tid == 0) dst_sc[hbase] = sc;
+    } else if (kv.kv_fmt == 2 || is_k) {
+        const float sc = am > 0.0f ? (am * (1.0f / 127.0f)) : 1.0f;
+        const float inv = am > 0.0f ? (127.0f / am) : 0.0f;
+        const int8_t qv = (int8_t)max(-127, min(127, __float2int_rn(val * inv)));
+        dst8[base + tid] = (uint8_t)qv;
+        if (tid == 0) dst_sc[hbase] = sc;
+    } else {
+        // K8V4: V quantized to signed 4-bit [-7..+7] biased by +8 -> [1..15], two dims packed per byte!
+        const float sc = am > 0.0f ? (am * (1.0f / 7.0f)) : 1.0f;
+        const float inv = am > 0.0f ? (7.0f / am) : 0.0f;
+        const uint32_t q = (uint32_t)(max(-7, min(7, __float2int_rn(val * inv))) + 8);
+        const uint32_t q_hi = __shfl_xor_sync(0xFFFFFFFFu, q, 1);
+        if ((tid & 1) == 0) {
+            dst8[hbase * (kInkHeadDim / 2) + (tid >> 1)] = (uint8_t)((q & 0xFu) | ((q_hi & 0xFu) << 4));
+        }
+        if (tid == 0) dst_sc[hbase] = sc;
+    }
+}
+
 // Write K, V [M, 8, 128] FP32 into KV cache at positions pos_arr[m] for slot_arr[m]
-// (For SWA, writes to ring index pos % cap_pos; for Global, writes to pos).
+// (For SWA, writes to ring index pos % cap_pos; for Global, guards 0 <= pos < cap_pos to prevent CUDA error 700!).
 __global__ void __launch_bounds__(128) k_ink_kv_write(
     const float* __restrict__ k_in,     // [M, 8, 128]
     const float* __restrict__ v_in,     // [M, 8, 128]
@@ -58,35 +173,13 @@ __global__ void __launch_bounds__(128) k_ink_kv_write(
 
     const int sl = slots ? slots[m] : slot0;
     const int p = pos[m];
+    if (p < 0 || (!kv.is_swa && p >= kv.cap_pos)) return;
     const int p_idx = kv.is_swa ? (p % kv.cap_pos) : p;
-    const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + h) * kInkHeadDim;
     const float kv_val = k_in[((size_t)m * kInkKVHeads + h) * kInkHeadDim + d];
     const float vv_val = v_in[((size_t)m * kInkKVHeads + h) * kInkHeadDim + d];
-
-    if (!kv.is_fp8) {
-        kv.k_f16[base + d] = __float2half(kv_val);
-        kv.v_f16[base + d] = __float2half(vv_val);
-    } else {
-        // Warp/block max for per-head FP8 scale
-        float mk = warp_max(fabsf(kv_val));
-        float mv = warp_max(fabsf(vv_val));
-        __shared__ float sk[4], sv[4];
-        if ((d & 31) == 0) { sk[d >> 5] = mk; sv[d >> 5] = mv; }
-        __syncthreads();
-        float amk = fmaxf(fmaxf(sk[0], sk[1]), fmaxf(sk[2], sk[3]));
-        float amv = fmaxf(fmaxf(sv[0], sv[1]), fmaxf(sv[2], sv[3]));
-        const float sc_k = amk > 0.0f ? (amk * (1.0f / 448.0f)) : 1.0f;
-        const float sc_v = amv > 0.0f ? (amv * (1.0f / 448.0f)) : 1.0f;
-        const __nv_fp8_e4m3 qk(fminf(fmaxf(kv_val / sc_k, -448.0f), 448.0f));
-        const __nv_fp8_e4m3 qv(fminf(fmaxf(vv_val / sc_v, -448.0f), 448.0f));
-        kv.k_f8[base + d] = qk.__x;
-        kv.v_f8[base + d] = qv.__x;
-        if (d == 0) {
-            const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + h;
-            kv.k_sc[sidx] = sc_k;
-            kv.v_sc[sidx] = sc_v;
-        }
-    }
+    __shared__ float sk[4], sv[4];
+    ink_kv_store_128(kv, sl, p_idx, h, d, kv_val, true, sk);
+    ink_kv_store_128(kv, sl, p_idx, h, d, vv_val, false, sv);
 }
 
 // ---- FUSED 1-Launch Post-QKV Kernel (K/V ShortConv4 + Q/K/V/R Clip + V RMSNorm + Global Tau + KV Write/Stage!) ----
@@ -188,28 +281,15 @@ __global__ void __launch_bounds__(128) k_ink_post_qkv_fused(
 
         if (mode == 2) {
             // Round to FP16 when KV cache is FP16 so tree_k/tree_v are 100% bitwise identical to committed KV reads!
-            const float kv_val = kv.is_fp8 ? val : __half2float(__float2half(val));
+            const float kv_val = (kv.kv_fmt != 0) ? val : __half2float(__float2half_rn(fminf(fmaxf(val, -65504.0f), 65504.0f)));
             (is_k ? k_out : v_out)[(size_t)m * kInkKVDim + c] = kv_val;
             (is_k ? stage_k : stage_v)[(size_t)m * kInkKVDim + c] = val;
         } else {
-            // Direct write into KV cache (FP16 or FP8 E4M3)!
+            // Direct write into KV cache (FP16 / FP8 / K8V8 / K8V4) with defensive OOB guard!
             const int p = pos_arr[m];
-            const int p_idx = kv.is_swa ? (p % kv.cap_pos) : p;
-            const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim;
-            if (!kv.is_fp8) {
-                (is_k ? kv.k_f16 : kv.v_f16)[base + tid] = __float2half(val);
-            } else {
-                float mv = warp_max(fabsf(val));
-                if ((tid & 31) == 0) sh[tid >> 5] = mv;
-                __syncthreads();
-                float am = fmaxf(fmaxf(sh[0], sh[1]), fmaxf(sh[2], sh[3]));
-                const float sc = am > 0.0f ? (am * (1.0f / 448.0f)) : 1.0f;
-                const __nv_fp8_e4m3 qv(fminf(fmaxf(val / sc, -448.0f), 448.0f));
-                (is_k ? kv.k_f8 : kv.v_f8)[base + tid] = qv.__x;
-                if (tid == 0) {
-                    const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-                    (is_k ? kv.k_sc : kv.v_sc)[sidx] = sc;
-                }
+            if (p >= 0 && (kv.is_swa || p < kv.cap_pos)) {
+                const int p_idx = kv.is_swa ? (p % kv.cap_pos) : p;
+                ink_kv_store_128(kv, sl, p_idx, kh, tid, val, is_k, sh);
             }
         }
     } else if (blk < 64) {
@@ -328,32 +408,11 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa(
     };
 
     // 1. Committed KV cache loop (stride 4 across the 4 warps)
-    for (int kp = k_start + warp; kp < k_end; kp += 4) {
+    const int k_end_safe = kv.is_swa ? k_end : min(k_end, kv.cap_pos);
+    for (int kp = k_start + warp; kp < k_end_safe; kp += 4) {
         const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
-        const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
         float4 kv4, vv4;
-        if (!kv.is_fp8) {
-            const uint2 k2 = *(const uint2*)(kv.k_f16 + base);
-            const uint2 v2 = *(const uint2*)(kv.v_f16 + base);
-            const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
-            const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
-            const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
-            const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
-            kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
-            vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
-        } else {
-            const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-            const float sk = kv.k_sc[sidx];
-            const float sv = kv.v_sc[sidx];
-            const uint32_t k4 = *(const uint32_t*)(kv.k_f8 + base);
-            const uint32_t v4 = *(const uint32_t*)(kv.v_f8 + base);
-            const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
-            const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
-            const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
-            const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4 >> 16));
-            kv4 = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
-            vv4 = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
-        }
+        ink_kv_load4(kv, sl, p_idx, kh, lane, kv4, vv4);
         attend_kv(kv4, vv4, kp);
     }
 
@@ -412,11 +471,10 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa(
 }
 
 // ============================================================================
-// Split-K FlashDecoding with 3-Head GQA KV Sharing (13x faster on M=1..16!)
-// Grid: (8 KV heads, kInkAttnSplits=16 splits, M tokens) = 128*M CTAs across 170 SMs!
-// Each CTA reads K and V ONCE for KV head kh and attends all 3 Q heads (3*kh + 0..2)!
+// Adaptive Split-K FlashDecoding with 3-Head GQA KV Sharing (up to 32 splits -> 256 CTAs on M=1 -> saturates sm_75..sm_120!)
 // ============================================================================
 constexpr int kInkAttnSplits = 8;
+constexpr int kInkAttnMaxSplits = 32;
 
 __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     const float* __restrict__ q,          // [M, 24, 128]
@@ -431,14 +489,15 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     const uint8_t* __restrict__ tree_anc, // [M, 16]
     const uint8_t* __restrict__ tree_dep, // [M]
     int tree_p0,
-    float* __restrict__ part_m,           // [M, 24, kInkAttnSplits]
-    float* __restrict__ part_l,           // [M, 24, kInkAttnSplits]
-    float* __restrict__ part_o,           // [M, 24, kInkAttnSplits, 128]
-    int M) {
+    float* __restrict__ part_m,           // [M, 24, n_splits]
+    float* __restrict__ part_l,           // [M, 24, n_splits]
+    float* __restrict__ part_o,           // [M, 24, n_splits, 128]
+    int M,
+    int n_splits = kInkAttnSplits) {
     const int kh = blockIdx.x;  // 0..7
-    const int sp = blockIdx.y;  // 0..kInkAttnSplits-1
+    const int sp = blockIdx.y;  // 0..n_splits-1
     const int m  = blockIdx.z;  // 0..M-1
-    if (kh >= kInkKVHeads || sp >= kInkAttnSplits || m >= M) return;
+    if (kh >= kInkKVHeads || sp >= n_splits || m >= M) return;
 
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;  // 0..3
@@ -459,7 +518,7 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     const int k_start = kv.is_swa ? max(0, qp - kInkSwaWin + 1) : 0;
     const int k_end   = qp + 1;
     const int k_len   = max(0, k_end - k_start);
-    const int per_sp  = (k_len + kInkAttnSplits - 1) / kInkAttnSplits;
+    const int per_sp  = (k_len + n_splits - 1) / n_splits;
     const int s_beg   = k_start + sp * per_sp;
     const int s_end   = min(k_end, s_beg + per_sp);
 
@@ -505,29 +564,9 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
             kv4 = *(const float4*)(tree_k + tbase);
             vv4 = *(const float4*)(tree_v + tbase);
         } else {
+            if (!kv.is_swa && (kp < 0 || kp >= kv.cap_pos)) continue;
             const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
-            const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
-            if (!kv.is_fp8) {
-                const uint2 k2 = *(const uint2*)(kv.k_f16 + base);
-                const uint2 v2 = *(const uint2*)(kv.v_f16 + base);
-                const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
-                const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
-                const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
-                const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
-                kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
-                vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
-            } else {
-                const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-                const float sk = kv.k_sc[sidx], sv = kv.v_sc[sidx];
-                const uint32_t k4 = *(const uint32_t*)(kv.k_f8 + base);
-                const uint32_t v4 = *(const uint32_t*)(kv.v_f8 + base);
-                const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
-                const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
-                const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
-                const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4 >> 16));
-                kv4 = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
-                vv4 = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
-            }
+            ink_kv_load4(kv, sl, p_idx, kh, lane, kv4, vv4);
         }
         attend3(kv4, vv4, kp);
     }
@@ -549,7 +588,7 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
             float w2 = sm_l[2] > 0.0f ? __expf(sm_m[2] - mg) : 0.0f;
             float w3 = sm_l[3] > 0.0f ? __expf(sm_m[3] - mg) : 0.0f;
             const float lt = sm_l[0] * w0 + sm_l[1] * w1 + sm_l[2] * w2 + sm_l[3] * w3;
-            const size_t idx_sp = ((size_t)m * kInkHeads + h0 + r) * kInkAttnSplits + sp;
+            const size_t idx_sp = ((size_t)m * kInkHeads + h0 + r) * n_splits + sp;
             if (lane == 0) { part_m[idx_sp] = mg; part_l[idx_sp] = lt; }
             *(float4*)(part_o + idx_sp * kInkHeadDim + lane * 4) = make_float4(
                 sm_a[0][lane * 4 + 0] * w0 + sm_a[1][lane * 4 + 0] * w1 + sm_a[2][lane * 4 + 0] * w2 + sm_a[3][lane * 4 + 0] * w3,
@@ -561,29 +600,28 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     }
 }
 
-// Merge kInkAttnSplits=16 splits + fused * sigmoid(gate_attn)! Grid: (24 heads, M), Block: 128 (1 dim/thread!)
+// Merge n_splits (8..32) + fused * sigmoid(gate_attn)! Grid: (24 heads, M), Block: 128 (1 dim/thread!)
 __global__ void __launch_bounds__(128) k_ink_flash_gqa_merge(
-    const float* __restrict__ part_m,     // [M, 24, 16]
-    const float* __restrict__ part_l,     // [M, 24, 16]
-    const float* __restrict__ part_o,     // [M, 24, 16, 128]
+    const float* __restrict__ part_m,     // [M, 24, n_splits]
+    const float* __restrict__ part_l,     // [M, 24, n_splits]
+    const float* __restrict__ part_o,     // [M, 24, n_splits, 128]
     const float* __restrict__ gate_attn,  // [M, 24, 128]
     float* __restrict__ out,              // [M, 24, 128]
-    int M) {
+    int M,
+    int n_splits = kInkAttnSplits) {
     const int h = blockIdx.x;
     const int m = blockIdx.y;
     const int d = threadIdx.x;  // 0..127
     if (h >= kInkHeads || m >= M) return;
 
-    const size_t base_sp = ((size_t)m * kInkHeads + h) * kInkAttnSplits;
+    const size_t base_sp = ((size_t)m * kInkHeads + h) * n_splits;
     float mg = -1e30f;
-#pragma unroll
-    for (int s = 0; s < kInkAttnSplits; ++s) {
+    for (int s = 0; s < n_splits; ++s) {
         if (part_l[base_sp + s] > 0.0f) mg = fmaxf(mg, part_m[base_sp + s]);
     }
     float lt = 0.0f;
     float acc = 0.0f;
-#pragma unroll
-    for (int s = 0; s < kInkAttnSplits; ++s) {
+    for (int s = 0; s < n_splits; ++s) {
         const float ls = part_l[base_sp + s];
         if (ls > 0.0f) {
             const float w = __expf(part_m[base_sp + s] - mg);
@@ -642,31 +680,11 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_gqa3(
     float lw[3] = { (warp == 0) ? 1.0f : 0.0f, (warp == 0) ? 1.0f : 0.0f, (warp == 0) ? 1.0f : 0.0f };
     float a[3][4] = {};
 
-    for (int kp = k_start + warp; kp < k_end; kp += 4) {
+    const int k_end_safe = kv.is_swa ? k_end : min(k_end, kv.cap_pos);
+    for (int kp = k_start + warp; kp < k_end_safe; kp += 4) {
         const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
-        const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
         float4 kv4, vv4;
-        if (!kv.is_fp8) {
-            const uint2 k2 = *(const uint2*)(kv.k_f16 + base);
-            const uint2 v2 = *(const uint2*)(kv.v_f16 + base);
-            const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
-            const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
-            const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
-            const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
-            kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
-            vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
-        } else {
-            const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-            const float sk = kv.k_sc[sidx], sv = kv.v_sc[sidx];
-            const uint32_t k4 = *(const uint32_t*)(kv.k_f8 + base);
-            const uint32_t v4 = *(const uint32_t*)(kv.v_f8 + base);
-            const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
-            const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
-            const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
-            const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4 >> 16));
-            kv4 = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
-            vv4 = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
-        }
+        ink_kv_load4(kv, sl, p_idx, kh, lane, kv4, vv4);
         const int dist = min(max(qp - kp, 0), kInkRelExtent);
         const float sc[3] = {
             warp_sum(qv0.x * kv4.x + qv0.y * kv4.y + qv0.z * kv4.z + qv0.w * kv4.w) * scale + rt0[dist],
@@ -756,27 +774,56 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
     const int d  = threadIdx.x; // 0..127
     if (kh >= kInkKVHeads || ki >= K_len) return;
     const int kp = k_start + ki;
-    const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
-    const size_t base = (((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim + d;
+    const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : min(max(kp, 0), kv.cap_pos - 1);
+    const bool use_host = (!kv.is_swa && kv.host_cap > 0 && p_idx >= kv.dev_cap);
+    const int stride = use_host ? kv.host_cap : (kv.host_cap > 0 ? kv.dev_cap : kv.cap_pos);
+    const int pos_l  = use_host ? (p_idx - kv.dev_cap) : p_idx;
+    const size_t hbase = ((size_t)slot0 * stride + pos_l) * kInkKVHeads + kh;
+    const size_t base  = hbase * kInkHeadDim + d;
+    const __half*  pk16 = use_host ? kv.h_k_f16 : kv.k_f16;
+    const __half*  pv16 = use_host ? kv.h_v_f16 : kv.v_f16;
+    const uint8_t* pk8  = use_host ? kv.h_k_f8  : kv.k_f8;
+    const uint8_t* pv8  = use_host ? kv.h_v_f8  : kv.v_f8;
+    const float*   pksc = use_host ? kv.h_k_sc  : kv.k_sc;
+    const float*   pvsc = use_host ? kv.h_v_sc  : kv.v_sc;
     uint16_t kb, vb;
     if constexpr (USE_FP16) {
-        if (!kv.is_fp8) {
-            kb = *reinterpret_cast<const uint16_t*>(&kv.k_f16[base]);
-            vb = *reinterpret_cast<const uint16_t*>(&kv.v_f16[base]);
+        if (kv.kv_fmt == 0) {
+            kb = *reinterpret_cast<const uint16_t*>(&pk16[base]);
+            vb = *reinterpret_cast<const uint16_t*>(&pv16[base]);
         } else {
-            const size_t sidx = ((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-            kb = pf_cvt_from_f32<true>(e4m3_to_f32(kv.k_f8[base]) * kv.k_sc[sidx]);
-            vb = pf_cvt_from_f32<true>(e4m3_to_f32(kv.v_f8[base]) * kv.v_sc[sidx]);
+            float kf, vf;
+            if (kv.kv_fmt == 1) {
+                kf = e4m3_to_f32(pk8[base]) * pksc[hbase];
+                vf = e4m3_to_f32(pv8[base]) * pvsc[hbase];
+            } else if (kv.kv_fmt == 2) {
+                kf = (float)(int8_t)pk8[base] * pksc[hbase];
+                vf = (float)(int8_t)pv8[base] * pvsc[hbase];
+            } else {
+                kf = (float)(int8_t)pk8[base] * pksc[hbase];
+                const uint8_t pb = pv8[hbase * (kInkHeadDim / 2) + (d >> 1)];
+                const int qv = (int)((d & 1) ? (pb >> 4) : (pb & 0xFu)) - 8;
+                vf = (float)qv * pvsc[hbase];
+            }
+            kb = pf_cvt_from_f32<true>(kf);
+            vb = pf_cvt_from_f32<true>(vf);
         }
     } else {
         float kf, vf;
-        if (!kv.is_fp8) {
-            kf = __half2float(kv.k_f16[base]);
-            vf = __half2float(kv.v_f16[base]);
+        if (kv.kv_fmt == 0) {
+            kf = __half2float(pk16[base]);
+            vf = __half2float(pv16[base]);
+        } else if (kv.kv_fmt == 1) {
+            kf = e4m3_to_f32(pk8[base]) * pksc[hbase];
+            vf = e4m3_to_f32(pv8[base]) * pvsc[hbase];
+        } else if (kv.kv_fmt == 2) {
+            kf = (float)(int8_t)pk8[base] * pksc[hbase];
+            vf = (float)(int8_t)pv8[base] * pvsc[hbase];
         } else {
-            const size_t sidx = ((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-            kf = e4m3_to_f32(kv.k_f8[base]) * kv.k_sc[sidx];
-            vf = e4m3_to_f32(kv.v_f8[base]) * kv.v_sc[sidx];
+            kf = (float)(int8_t)pk8[base] * pksc[hbase];
+            const uint8_t pb = pv8[hbase * (kInkHeadDim / 2) + (d >> 1)];
+            const int qv = (int)((d & 1) ? (pb >> 4) : (pb & 0xFu)) - 8;
+            vf = (float)qv * pvsc[hbase];
         }
         kb = pf_cvt_from_f32<false>(kf);
         vb = pf_cvt_from_f32<false>(vf);
@@ -922,6 +969,124 @@ __global__ void __launch_bounds__(128) k_ink_pf_unpack_o_gate(
     float v = o_in[((size_t)h * C + ci) * kInkHeadDim + d];
     if (gate_attn) v *= 1.0f / (1.0f + __expf(-gate_attn[ob]));
     out[ob] = v;
+}
+
+// ---- O(1)-VRAM KV-Tiled Online-Softmax Tensor Core Prefill Helpers (Fixes #6609 28k OOM & #6605 27k hang!) ----
+// Bounded to KV_TILE <= 2048 so prefill workspace is strictly <= ~114 MiB forever (even at 256K..1M context)!
+__global__ void __launch_bounds__(128) k_ink_pf_online_init(
+    const float* __restrict__ sinks,      // [M, 24]
+    float* __restrict__ m_acc,            // [24, C]
+    float* __restrict__ l_acc,            // [24, C]
+    float* __restrict__ o_acc,            // [24, C, 128]
+    int q0, int C) {
+    const int h  = blockIdx.x;  // 0..23
+    const int ci = blockIdx.y;  // 0..C-1
+    const int d  = threadIdx.x; // 0..127
+    if (h >= kInkHeads || ci >= C) return;
+    if (d == 0) {
+        const size_t idx = (size_t)h * C + ci;
+        m_acc[idx] = sinks[(size_t)(q0 + ci) * kInkHeads + h];
+        l_acc[idx] = 1.0f;
+    }
+    o_acc[((size_t)h * C + ci) * kInkHeadDim + d] = 0.0f;
+}
+
+template <bool USE_FP16 = false>
+__global__ void __launch_bounds__(256) k_ink_pf_softmax_tile_online(
+    const float* __restrict__ scores,     // [24, C, K_t] F32 (K_t <= 2048)
+    const float* __restrict__ rel_table,  // [M, 24, 1025]
+    void* __restrict__ probs_v,           // [24, C, K_t] BF16 or FP16 (unnormalized exp(s - m_new))
+    float* __restrict__ m_acc,            // [24, C] in/out
+    float* __restrict__ l_acc,            // [24, C] in/out
+    float* __restrict__ alpha_out,        // [24, C] exp(m_old - m_new)
+    int q0, int C, int k_tile_start, int K_t, int p0, bool is_swa) {
+    const int ci = blockIdx.x;  // 0..C-1
+    const int h  = blockIdx.y;  // 0..23
+    if (ci >= C || h >= kInkHeads) return;
+    const int tid = threadIdx.x;
+    const int m   = q0 + ci;
+    const int qp  = p0 + m;
+    const size_t st_idx = (size_t)h * C + ci;
+    const float* sc_row = scores + st_idx * K_t;
+    const float* rt     = rel_table + ((size_t)m * kInkHeads + h) * (kInkRelExtent + 1);
+    uint16_t* pr_row    = reinterpret_cast<uint16_t*>(probs_v) + st_idx * K_t;
+    __shared__ float sh[32];
+
+    const float m_old = m_acc[st_idx];
+    float reg_v[8];
+    uint8_t reg_ok[8];
+    float mx = (tid == 0) ? m_old : -1e30f;
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const int ki = t * 256 + tid;
+        if (ki < K_t) {
+            const int kp = k_tile_start + ki;
+            const int dist = qp - kp;
+            const bool ok = (kp <= qp) && (!is_swa || dist < kInkSwaWin);
+            reg_ok[t] = ok ? 1 : 0;
+            if (ok) {
+                const float v = sc_row[ki] + rt[min(dist, kInkRelExtent)];
+                reg_v[t] = v;
+                mx = fmaxf(mx, v);
+            }
+        } else {
+            reg_ok[t] = 0;
+        }
+    }
+    mx = warp_max(mx);
+    if ((tid & 31) == 0) sh[tid >> 5] = mx;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < 8) ? sh[tid] : -1e30f;
+        v = warp_max(v);
+        if (tid == 0) sh[0] = v;
+    }
+    __syncthreads();
+    const float m_new = sh[0];
+    __syncthreads();
+
+    const float alpha = __expf(m_old - m_new);
+    float tile_l = 0.0f;
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const int ki = t * 256 + tid;
+        if (ki < K_t) {
+            const float e = reg_ok[t] ? __expf(reg_v[t] - m_new) : 0.0f;
+            tile_l += e;
+            pr_row[ki] = pf_cvt_from_f32<USE_FP16>(e);
+        }
+    }
+    tile_l = block_sum(tile_l, sh);
+    if (tid == 0) {
+        m_acc[st_idx]     = m_new;
+        l_acc[st_idx]     = l_acc[st_idx] * alpha + tile_l;
+        alpha_out[st_idx] = alpha;
+    }
+}
+
+__global__ void __launch_bounds__(128) k_ink_pf_accum_tile(
+    const float* __restrict__ o_tile,     // [24, C, 128]
+    const float* __restrict__ alpha_in,   // [24, C]
+    const float* __restrict__ l_acc,      // [24, C]
+    float* __restrict__ o_acc,            // [24, C, 128]
+    const float* __restrict__ gate_attn,  // [M, 24, 128]
+    float* __restrict__ out,              // [M, 24, 128] (written on is_last!)
+    int q0, int C, bool is_last) {
+    const int h  = blockIdx.x;  // 0..23
+    const int ci = blockIdx.y;  // 0..C-1
+    const int d  = threadIdx.x; // 0..127
+    if (h >= kInkHeads || ci >= C) return;
+    const size_t st_idx = (size_t)h * C + ci;
+    const size_t oi = st_idx * kInkHeadDim + d;
+    const float v = o_acc[oi] * alpha_in[st_idx] + o_tile[oi];
+    if (!is_last) {
+        o_acc[oi] = v;
+    } else {
+        float res = v / l_acc[st_idx];
+        const size_t ob = ((size_t)(q0 + ci) * kInkHeads + h) * kInkHeadDim + d;
+        if (gate_attn) res *= 1.0f / (1.0f + __expf(-gate_attn[ob]));
+        out[ob] = res;
+    }
 }
 
 }  // namespace strata::ink
