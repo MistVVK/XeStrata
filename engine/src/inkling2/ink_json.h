@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -20,7 +21,7 @@ struct JVal {
     bool is_int = false;
     std::string s;
     std::vector<JVal> a;
-    std::unordered_map<std::string, JVal> o;
+    std::map<std::string, JVal> o;
 
     int64_t i() const {
         if (t != NUM) throw std::runtime_error("JSON: expected number");

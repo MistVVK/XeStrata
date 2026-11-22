@@ -18,6 +18,7 @@
 //     order-preserving 64-bit atomicMax (lowest row index wins ties). Zero false negatives, zero overflow regardless
 //     of where the argmax row sits in the vocabulary.
 #include "strata/kernels/vhead_bitplane.hpp"
+#include "strata/kernels/dp4a.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -551,7 +552,7 @@ __device__ __forceinline__ float exact_dot_q8_0_warp(const uint8_t* __restrict__
         for (int j = 0; j < 8; ++j) {
             const uint8_t* p = blk + 2 + j * 4;
             const int wv = (int) ((uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24));
-            dot = __dp4a(wv, x4[j], dot);
+            dot = STRATA_DP4A(wv, x4[j], dot);
         }
         sum = fmaf(dw * dx, (float) dot, sum);
     }
