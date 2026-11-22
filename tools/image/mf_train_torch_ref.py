@@ -138,46 +138,7 @@ TAPE_JOINT = ("jq", "jk", "jv", "jo", "jdo", "jdq", "jdk", "jdv", "lse")
 TAPE_F = (7, 8, 18, 19)   # mlp1's own and the GELU rows, forward and back: F wide; every other slice is C wide
 
 
-class GeluHolder:
-    """The engine's mlp1 output, read from its tape after the engine has run (unknown at the reference's forward)."""
-    def __init__(self):
-        self.v = None
-
-
-class _GeluAtEngineInput(torch.autograd.Function):
-    """GELU's forward value stays the reference's own; its derivative is taken at the engine's m1.
-
-    The two forwards differ by 8.49e-05 at --big-norm2 1e5 (one FP16 step of the second norm's rows):
-    at GELU's transition that puts the derivative, and the block's gradients, 5.27e-02 apart.  The tape
-    is checked against the reference's m1 at 3e-03 separately, so this compares the backward at the
-    values the engine actually differentiated, with no looser tolerance anywhere."""
-    @staticmethod
-    def forward(ctx, x, holder):
-        ctx.holder = holder
-        return torch.nn.functional.gelu(x, approximate="tanh")
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        v = ctx.holder.v.detach().requires_grad_(True)
-        with torch.enable_grad():
-            y = torch.nn.functional.gelu(v, approximate="tanh")
-            d, = torch.autograd.grad(y, v, grad_output)
-        return d, None
-
-
-def gelu_at_engine_input(x, holder):
-    return _GeluAtEngineInput.apply(x, holder)
-
-
-def engine_mlp1(tape, st, R, C, F, Ri):
-    """The engine's tape slice kTapeM1 (index 7): mlp1's FP32 output the GELU read in its forward."""
-    off = 0 if st == "img" else Ri * (17 * C + 4 * F)
-    for i in range(7):
-        off += R * (F if i in TAPE_F else C)
-    return tape[off:off + R * F].reshape(R, F)
-
-
-def block_forward(w, ad, rows_in, C, heads, hd, F, Ri, Rt, cos, sin, gelu):
+def block_forward(w, ad, rows_in, C, heads, hd, F, Ri, Rt, cos, sin):
     """The block, one stream at a time, with the joint attention between them, and the stages the engine's tape holds
     beside them (`rows_in` is (img, txt)).  A stage is what the engine *stored* - the FP16 rows a product read, widened
     back - so a stage that disagrees names the kernel to look at, not the whole block."""
@@ -236,7 +197,10 @@ def block_forward(w, ad, rows_in, C, heads, hd, F, Ri, Rt, cos, sin, gelu):
         l16, rs2 = rows(ln2)
         m1 = grab(f"{name}.m1", adapt(prod_nb(l16, rs2, w[f"w_{name}_mlp1"]), l16, rs2, w[f"w_{name}_mlp1"],
                                       ad.get((name, "mlp1")), w[f"b_{name}_mlp1"]))
-        g = grab(f"{name}.g", gelu_at_engine_input(m1, gelu[name]))
+        # the engine's tanh GELU, differentiated by torch at the reference's own m1: no engine tape value enters
+        # the reference's backward.  At --big-norm2 1e5 the two LayerNorm FP16 rows differ by one step (8.49e-05),
+        # which moves the derivative by 5.89e-02 there; that difference is reported, not absorbed.
+        g = grab(f"{name}.g", torch.nn.functional.gelu(m1, approximate="tanh"))
         g16, rs3 = rows(g)
         m2 = grab(f"{name}.m2", adapt(prod_nb(g16, rs3, w[f"w_{name}_mlp2"]), g16, rs3, w[f"w_{name}_mlp2"],
                                       ad.get((name, "mlp2")), w[f"b_{name}_mlp2"]))
@@ -476,10 +440,10 @@ def main() -> int:
             if a.skip_mlp:
                 m[C2 + 3 * C:C2 + 4 * C].zero_()
     ad = make_adapters(w16, C, F, g)
-    gelu = {st: GeluHolder() for st in ("img", "txt")}
-    outs, stage, gcap, ref_rs = block_forward(w, ad, (imgg, txtg), C, heads, hd, F, Ri, Rt, cos, sin, gelu)
+    outs, stage, gcap, ref_rs = block_forward(w, ad, (imgg, txtg), C, heads, hd, F, Ri, Rt, cos, sin)
     d_out_img = (rnd(g, Ri, C) * 0.9).cuda()
     d_out_txt = (rnd(g, Rt, C) * 0.9).cuda()
+    torch.autograd.backward([outs["img"]["out"], outs["txt"]["out"]], [d_out_img, d_out_txt])
 
     # the dumps the engine reads
     save(d, "dims", torch.tensor([C, heads, hd, F, Ri, Rt], dtype=torch.float32))
@@ -513,10 +477,6 @@ def main() -> int:
     if out.returncode != 0:
         print(f"the engine's block failed to run: {out.stderr.strip()}", file=sys.stderr)
         return 1
-    tape = load(d, "tape").reshape(-1)
-    for name, R in (("img", Ri), ("txt", Rt)):
-        gelu[name].v = engine_mlp1(tape, name, R, C, F, Ri)
-    torch.autograd.backward([outs["img"]["out"], outs["txt"]["out"]], [d_out_img, d_out_txt])
     if a.stages:
         for name in ("img", "txt"):   # the backward's slices, in the engine's order
             stage[name] += [gcap[f"{name}.{s}"] for s in ("ln", "q", "k", "v", "y", "h1", "ln2", "m1", "g", "m2")]
