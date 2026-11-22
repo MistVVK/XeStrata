@@ -5,7 +5,9 @@
 // The six functions and the two enum values are RCCL's (rccl.h: ncclSum = 0, ncclFloat16 = 6, ncclFloat32 = 7, ncclSuccess = 0).
 #pragma once
 
+#if !defined(_WIN32)
 #include <dlfcn.h>
+#endif
 
 #include <cstddef>
 #include <cstdlib>
@@ -31,6 +33,12 @@ struct RcclApi {
 
 // path: the library to load ("" = librccl.so.1 from the library path; FNX_RCCL_LIB overrides it, for tests). false with the reason in why.
 inline bool rccl_load(RcclApi& api, const std::string& path, std::string& why) {
+#if defined(_WIN32)
+    (void) api;
+    (void) path;
+    why = "RCCL is not available on Windows";
+    return false;
+#else
     const char* over = std::getenv("FNX_RCCL_LIB");
     const std::string lib = over && *over ? over : (path.empty() ? "librccl.so.1" : path);
     api.handle = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -56,6 +64,7 @@ inline bool rccl_load(RcclApi& api, const std::string& path, std::string& why) {
     }
     why = lib;
     return true;
+#endif
 }
 
 // The decision: FNX_PF_RCCL=0 or unset (the default, until the screens say the prompt sums win): the host exchange, no line. =1: only with the peer push on (RCCL moves its

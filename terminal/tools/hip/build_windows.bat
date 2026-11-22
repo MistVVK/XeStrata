@@ -21,6 +21,7 @@ rem   STRATA_GGML_DIR      optional override (kept for two releases): a llama.cp
 rem   STRATA_ROCM_KEEP      1 = use the ROCM_VENV as it is (no pip install, even when its archs differ from STRATA_HIP_ARCHS)
 rem   STRATA_VISION_HIP_ARCHS  the GPU reader's archs (default: STRATA_HIP_ARCHS; about 70 MB of the zip per arch)
 rem   STRATA_NO_VISION     1 = skip the two picture readers (strata-vision.exe for the CPU, strata-vision-hip.exe for the GPU)
+rem   STRATA_NO_SPLIT      1 = skip the 2-GPU split engine (strata-split-2-amd.exe)
 rem   STRATA_CMAKE_EXTRA   extra cmake configure arguments (for example -DSTRATA_WINDOW_MAX_T=8)
 setlocal EnableDelayedExpansion
 for %%I in ("%~dp0..\..\..") do set "SRC=%%~fI"
@@ -70,9 +71,12 @@ set "PATH=%ROCM%\bin;%ROCM%\lib\llvm\bin;%PATH%"
 rem ---- 3. configure + build (STRATA_PORTABLE: the CPU kernels for an AVX2 baseline, as in the NVIDIA zip)
 set "GGML="
 if defined STRATA_GGML_DIR set "GGML=-DSTRATA_GGML_DIR=%STRATA_GGML_DIR:\=/%"
+set "BUILD_SPLIT=ON"
+if "%STRATA_NO_SPLIT%"=="1" set "BUILD_SPLIT=OFF"
 if not exist "%BUILD_DIR%\build.ninja" (
   cmake -G Ninja -S "%SRC%\engine" -B "%BUILD_DIR%" -DCMAKE_BUILD_TYPE=Release ^
     -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=%TESTS% ^
+    -DSTRATA_BUILD_SPLIT=%BUILD_SPLIT% ^
     -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON "-DCMAKE_HIP_ARCHITECTURES=%STRATA_HIP_ARCHS%" ^
     "-DCMAKE_C_COMPILER=%ROCM_F%/lib/llvm/bin/clang.exe" "-DCMAKE_CXX_COMPILER=%ROCM_F%/lib/llvm/bin/clang++.exe" ^
     "-DCMAKE_HIP_COMPILER=%ROCM_F%/lib/llvm/bin/clang++.exe" "-DCMAKE_HIP_COMPILER_ROCM_ROOT=%ROCM_F%" ^
@@ -83,6 +87,15 @@ if "%TESTS%"=="ON" (
   cmake --build "%BUILD_DIR%" || exit /b 1
 ) else (
   cmake --build "%BUILD_DIR%" --target strata strata-device || exit /b 1
+  if "%BUILD_SPLIT%"=="ON" (
+    findstr /c:"strata-split-2" "%BUILD_DIR%\build.ninja" >nul 2>nul && (
+      cmake --build "%BUILD_DIR%" --target strata-split-2 || exit /b 1
+    )
+  )
+)
+set "SPLIT_ARGS="
+if exist "%BUILD_DIR%\src\split\strata-split-2.exe" (
+  set "SPLIT_ARGS=--split-2 %BUILD_DIR%\src\split\strata-split-2.exe"
 )
 
 rem ---- 3b. the picture readers (terminal/tools/vision, Strata's own tower): strata-vision.exe on the CPU (MSVC, portable: the
@@ -109,7 +122,7 @@ if not "%STRATA_NO_VISION%"=="1" (
 
 rem ---- 4. the zip: the programs, the ROCm DLLs they load (+ rocBLAS/hipBLASLt kernels for these archs), licenses
 "%ROCM_VENV%\Scripts\python.exe" "%SRC%\terminal\tools\hip\package_windows.py" --build "%BUILD_DIR%" --rocm "%ROCM%" ^
-  --archs "%STRATA_HIP_ARCHS%" --rocm-version "%STRATA_ROCM_VERSION%" --out "%DIST_DIR%" !VISION_ARGS! || exit /b 1
+  --archs "%STRATA_HIP_ARCHS%" --rocm-version "%STRATA_ROCM_VERSION%" --out "%DIST_DIR%" !VISION_ARGS! !SPLIT_ARGS! || exit /b 1
 echo.
 echo Done: %DIST_DIR%\strata-windows-x64-hip.zip
 endlocal

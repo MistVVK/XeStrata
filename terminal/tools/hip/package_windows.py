@@ -88,6 +88,7 @@ def main() -> int:
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--vision-cpu", type=Path, help="strata-vision.exe built for the CPU (tools/vision, STRATA_PORTABLE=ON)")
     ap.add_argument("--vision-hip", type=Path, help="strata-vision-hip.exe built for the same archs (STRATA_VISION_HIP=ON)")
+    ap.add_argument("--split-2", type=Path, help="strata-split-2.exe built with STRATA_BUILD_SPLIT=ON (packaged as strata-split-2-amd.exe)")
     a = ap.parse_args()
     archs = [x for x in re.split(r"[;, ]+", a.archs) if x]
     rbin = a.rocm / "bin"
@@ -98,13 +99,20 @@ def main() -> int:
 
     for p in PROGRAMS:
         shutil.copy2(a.build / p, stage / p)
-    readers = [(src, src.name) for src in (a.vision_cpu, a.vision_hip) if src is not None]
-    for src, name in readers:
+    extras: list[tuple[Path, str]] = [(src, src.name) for src in (a.vision_cpu, a.vision_hip) if src is not None]
+    split2 = a.split_2
+    if split2 is None:
+        cand = a.build / "src" / "split" / "strata-split-2.exe"
+        if cand.is_file():
+            split2 = cand
+    if split2 is not None and split2.is_file():
+        extras.append((split2, "strata-split-2-amd.exe"))
+    for src, name in extras:
         shutil.copy2(src, stage / name)
 
     # the ROCm DLLs: the programs' imports, followed through the ROCm DLLs themselves
     rocm_dlls = {p.name.lower(): p for p in rbin.glob("*.dll")}
-    need, todo, crt = [], [stage / p for p in PROGRAMS] + [stage / n for _, n in readers] + [rbin / d for d in DYNAMIC], set()
+    need, todo, crt = [], [stage / p for p in PROGRAMS] + [stage / n for _, n in extras] + [rbin / d for d in DYNAMIC], set()
     while todo:
         f = todo.pop()
         for name in imports(objdump, f):
@@ -179,6 +187,8 @@ def main() -> int:
         meta.update({"vision": "cpu", "vision_cpu": a.vision_cpu.name})
     if a.vision_hip is not None:
         meta.update({"vision": "gpu", "vision_gpu": a.vision_hip.name, "vision_archs": archs})
+    if split2 is not None and split2.is_file():
+        meta["split"] = ["strata-split-2-amd.exe"]
     (stage / "BUILD.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
     # the hipBLASLt tuning tables of tools/hip for these archs and exactly this hipBLASLt version, in tuning/ (strata_control/hipblaslt_tuning.py):
     # the engine start points STRATA_HIPBLASLT_TUNING at the one for the card; an arch without a table keeps plain hipBLAS

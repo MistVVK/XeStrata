@@ -2256,7 +2256,7 @@ int main(int argc, char **argv) try {
         if (ok && !o.split_device.empty()) ok = ints(o.split_device, split_devs);
         else if (ok)
             for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d)
-                if (!split_auto || stage_dev(d)) split_devs.push_back(d);
+                if (stage_dev(d)) split_devs.push_back(d);
         if (ok && !split_auto && split_devs.empty() && split_at.size() == 1) split_devs.push_back(0);   // one GPU
         split_same = ok && split_devs.size() == 1 && split_devs[0] == 0 && !split_auto;
         if (split_same && o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0) {
@@ -2272,7 +2272,7 @@ int main(int argc, char **argv) try {
             ok = (split_auto || split_at.size() == split_devs.size()) && split_devs.size() < (size_t) SplitDrive::kMax;
             for (size_t i = 0; ok && i < split_at.size(); ++i) ok = split_at[i] >= 2 && (i == 0 || split_at[i] > split_at[i - 1]);
             for (size_t i = 0; ok && !split_same && i < split_devs.size(); ++i) {
-                ok = split_devs[i] > 0 && split_devs[i] < n_dev;
+                ok = split_devs[i] > 0 && split_devs[i] < n_dev && stage_dev(split_devs[i]);
                 for (size_t j = 0; ok && j < i; ++j) ok = split_devs[i] != split_devs[j];
             }
         }
@@ -8582,17 +8582,25 @@ int main(int argc, char **argv) try {
         };
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
+        // #6560: request thread owns drive.d.usage exclusively (no race with expert_pool_dispatch_multi's += 1.0f
+        // under --pipeline-windows 2); snapshot + heat + decay run on the request thread before spawning adapt().
+        auto snapshot_usage = [&]() -> std::vector<float> {
+            std::vector<float> snap = drive.d.usage;
+            for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) snap[i];
+            for (float& v : drive.d.usage) v *= o.adapt_decay;
+            return snap;
+        };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
-        auto adapt = [&]() -> bool {
+        auto adapt = [&](const std::vector<float>& usage_snap) -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
-            if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
+            if (remote_opt && !remote_opt->adapt(usage_snap, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 cand.clear();
                 vict.clear();
-                const float* u = drive.d.usage.data() + l * g.n_expert;
+                const float* u = usage_snap.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
@@ -8638,7 +8646,6 @@ int main(int argc, char **argv) try {
                     dpct::get_in_order_queue().memcpy(mirror_table_d, tab.data(), tab.size() * 8).wait_and_throw();
                     res_upload();
                 }
-                for (float& value : drive.d.usage) value *= o.adapt_decay;
                 return true;
             }
             // the copies back read the cache of the card that owns each layer (see resident_stage_swaps)
@@ -8758,21 +8765,16 @@ int main(int argc, char **argv) try {
                     const strata::core::OnDevice on(st->dev);
                     dpct::sync_barrier(st->adapt_ev, st->adapt_stream);
                 }
-            // #477: the routing counted since the start (each count adds up to 1 / (1 - --adapt-decay) over its
-            // decays: the sum is proportional to the routing itself) - only with --expert-profile-save, else `heat`
-            // is empty
-            for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
             if (peer.valid()) {                   // multi-GPU: the peer takes the next most-routed CPU misses
                 std::vector<int32_t> r0 = host_res;
                 for (const auto& [i, slot] : pending) r0[(size_t) i] = slot;   // swapped into the primary already
                 std::string perr;
-                if (!peer.adapt(drive.d.usage.data(), r0.data(),
+                if (!peer.adapt(usage_snap.data(), r0.data(),
                                 o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps, perr)) {
                     std::fprintf(stderr, "strata serve: %s\n", perr.c_str());
                     return false;
                 }
             }
-            for (float& v : drive.d.usage) v *= o.adapt_decay;
             return true;
         };
         // ---- --adapt-async 1: the asynchronous adaptive tier (opt-in; the resident RAM mode, see the checks where
@@ -11750,8 +11752,9 @@ int main(int argc, char **argv) try {
                     pl_apply();
                     if (!drive.d.usage.empty() && o.adapt_every > 0 && (rounds % o.adapt_every) == 0 && pending.empty() &&
                         !exch_wait) {
+                        auto usnap = snapshot_usage();
                         pl_adapt_done = false;
-                        pl_adapt_thr = std::thread([&] { pl_adapt_ok = adapt(); pl_adapt_done = true; });
+                        pl_adapt_thr = std::thread([&, u = std::move(usnap)] { pl_adapt_ok = adapt(u); pl_adapt_done = true; });
                     }
                     return true;
                 };
@@ -12487,9 +12490,10 @@ int main(int argc, char **argv) try {
                 strata::workload_trace::Scope commit_trace("decode.commit_emit", nullptr, T);
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
-                if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0) {
-                    if (sycl_mirror_adapt()) adapt_ok = adapt();
-                    else adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                if (!drive.d.usage.empty() && !ajob && pending.empty() && ((rounds + 1) % o.adapt_every) == 0) {
+                    auto usnap = snapshot_usage();
+                    if (sycl_mirror_adapt()) adapt_ok = adapt(usnap);
+                    else adapt_thr = std::thread([&, u = std::move(usnap)] { adapt_ok = adapt(u); });
                 }
                 if (sycl_mirror_adapt() && !adapt_ok) { std::printf("ERR SYCL mirror adaptive exchange failed\n"); return 1; }
                 if (!ver.commit(a + 1, err)) {
@@ -13538,7 +13542,7 @@ int main(int argc, char **argv) try {
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
         // routed clearly more often.  Copies run between rounds, when the GPU is idle.
-        auto adapt = [&]() -> bool {
+        auto adapt = [&](const std::vector<float>& usage_snap) -> bool {
             const Clock::time_point ta = Clock::now();
             ++adapt_rounds;
             // STRATA_TRACE_ADAPT: why an adapt round did or did not swap.  Default off, one getenv, and it
@@ -13558,7 +13562,7 @@ int main(int argc, char **argv) try {
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 cand.clear();
                 vict.clear();
-                const float* u = drive.d.usage.data() + l * g.n_expert;
+                const float* u = usage_snap.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
@@ -13629,7 +13633,6 @@ int main(int argc, char **argv) try {
             if (trace_adapt)
                 std::fprintf(stderr, "strata: ADAPT round=%lld swapped %zu of %d slots, usage decayed\n",
                              (long long) adapt_rounds, swaps.size(), o.adapt_swaps);
-            for (float& v : drive.d.usage) v *= o.adapt_decay;
             swaps_total += (int64_t) swaps.size();
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
             return true;
@@ -13865,8 +13868,11 @@ int main(int argc, char **argv) try {
             // GPU commits and drafts; it touches only the residency tables, which nothing reads until the next window
             std::thread adapt_thr;
             bool adapt_ok = true;
-            if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+            if (!drive.d.usage.empty() && pending.empty() && ((rounds + 1) % o.adapt_every) == 0) {
+                std::vector<float> usnap = drive.d.usage;
+                for (float& v : drive.d.usage) v *= o.adapt_decay;
+                adapt_thr = std::thread([&, u = std::move(usnap)] { adapt_ok = adapt(u); });
+            }
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());

@@ -169,6 +169,19 @@ inline std::vector<double> link_miss_scale(const std::vector<double>& gbps, doub
     return s;
 }
 
+// ---- the gate-off fallback must still load.  When no placement can start the prompt path the search chooses by decode speed
+// alone, and nothing checked that a later stage's cache can hold anything; a later stage with no room for one expert slot ends
+// the start ("layer split, CUDA1 expert cache: no room").  2x 8 GB (RTX 3060 Ti + RTX 3070 Ti) with DFlash2 on CUDA1: the PCIe
+// probe put the link gap at 3.66-4.33, on both sides of kLinkScaleMin, and the K=45 it picked below the step could not load.
+// So the fallback first keeps to placements in which every later stage holds at least one slot; with none, it picks as before.
+
+/// held[i]: the expert slots stage i's cache holds in the search's fill.  True when a stage after the first holds none.
+inline bool later_stage_empty(const std::vector<int64_t>& held) {
+    for (size_t i = 1; i < held.size(); ++i)
+        if (held[i] <= 0) return true;
+    return false;
+}
+
 /// The smallest spare room over the stages of `cuts`: room[i] - session(lb, le) - need(lb, le), where `need_prefix[l]`
 /// is the bytes of every expert of layers [0, l) (n_layers + 1 entries).
 template <class Session>

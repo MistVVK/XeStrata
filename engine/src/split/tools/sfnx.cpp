@@ -95,7 +95,11 @@ Args parse_args(int argc, char** argv) {
             const std::string s = val();
             if (const char* e = std::getenv("FNX_ROPE_SCALE"); e && s != e)
                 throw std::runtime_error("--rope-scale " + s + " and FNX_ROPE_SCALE=" + e + " disagree");
+#ifdef _WIN32
+            _putenv_s("FNX_ROPE_SCALE", s.c_str());
+#else
             ::setenv("FNX_ROPE_SCALE", s.c_str(), 1);
+#endif
         }
         else if (k == "--vision") a.vision = true;
         else throw std::runtime_error("unknown argument " + k);

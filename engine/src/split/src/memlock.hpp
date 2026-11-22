@@ -12,8 +12,15 @@
 // A failing mlock call (another process used the allowance, the kernel said no) only leaves its range unlocked.
 #pragma once
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <sys/resource.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -79,6 +86,21 @@ inline uint64_t lock_page_ceil(uint64_t x) { return (x + kLockPage - 1) / kLockP
 // Step 1 and the environment: the soft limit raised towards the hard limit for `need` bytes (plus 1 GiB of room for the other locks), then what is left.
 inline LockEnv read_lock_env(uint64_t need) {
     LockEnv e;
+#ifdef _WIN32
+    (void) need;
+    MEMORYSTATUSEX st{};
+    st.dwLength = sizeof(st);
+    if (GlobalMemoryStatusEx(&st)) {
+        e.avail = (uint64_t) st.ullAvailPhys;
+        e.reserve = std::max<uint64_t>(kLockReserveMinBytes, (uint64_t) st.ullTotalPhys / kLockReserveShareDiv);
+    } else {
+        e.avail = UINT64_MAX;
+        e.reserve = kLockReserveMinBytes;
+    }
+    e.limit = 0;   // Windows uses parallel fault-in without VirtualLock working-set limits
+    e.limit_hard = 0;
+    return e;
+#else
     struct rlimit rl {};
     if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0) {
         const uint64_t room = need + (1ull << 30);
@@ -101,6 +123,7 @@ inline LockEnv read_lock_env(uint64_t need) {
     e.avail = avail ? avail : UINT64_MAX;   // no /proc/meminfo: no RAM cut
     e.reserve = std::max<uint64_t>(kLockReserveMinBytes, total / kLockReserveShareDiv);
     return e;
+#endif
 }
 
 // Steps 2 and 3: how many bytes of each part are to be locked (the budget handed out in order, page-sized pieces); returns the total.
@@ -122,9 +145,15 @@ inline uint64_t plan_lock(const std::vector<LockPart>& parts, const LockEnv& env
     return total;
 }
 
+#ifdef _WIN32
+inline int default_mlock(const void*, size_t) { errno = ENOSYS; return -1; }
+#else
+inline int default_mlock(const void* p, size_t n) { return ::mlock(p, n); }
+#endif
+
 // Step 4 and the locking: LOCKERS threads, each locks its piece of the planned range and then reads in its piece of the rest (a cold file is read 2x faster
 // by 16 threads side by side than by one; tools/stage_test.cpp). A part's `locked` is the length of the planned prefix whose pieces all succeeded in a row.
-inline LockOutcome lock_parts(std::vector<LockPart>& parts, LockEnv env, MlockFn fn = ::mlock) {
+inline LockOutcome lock_parts(std::vector<LockPart>& parts, LockEnv env, MlockFn fn = default_mlock) {
     constexpr int LOCKERS = 16;
     LockOutcome out;
     out.env = env;
