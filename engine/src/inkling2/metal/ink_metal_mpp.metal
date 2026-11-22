@@ -44,54 +44,145 @@ static inline constexpr float mpp_sk_half(int F) {
     return (F == 2) ? 1.5f : (F == 3) ? 3.5f : (F == 4) ? 7.5f : (F == 5) ? 15.5f : (F == 6) ? 31.5f : 0.0f;
 }
 
-// Exact .strata S_K split low/high plane decoder (100% alignment-safe 16-bit/32-bit loads!)
+constant half4 kMppS2Lut[256] = {
+    half4(-1.5h,-1.5h,-1.5h,-1.5h), half4(-0.5h,-1.5h,-1.5h,-1.5h), half4(0.5h,-1.5h,-1.5h,-1.5h), half4(1.5h,-1.5h,-1.5h,-1.5h),
+    half4(-1.5h,-0.5h,-1.5h,-1.5h), half4(-0.5h,-0.5h,-1.5h,-1.5h), half4(0.5h,-0.5h,-1.5h,-1.5h), half4(1.5h,-0.5h,-1.5h,-1.5h),
+    half4(-1.5h,0.5h,-1.5h,-1.5h), half4(-0.5h,0.5h,-1.5h,-1.5h), half4(0.5h,0.5h,-1.5h,-1.5h), half4(1.5h,0.5h,-1.5h,-1.5h),
+    half4(-1.5h,1.5h,-1.5h,-1.5h), half4(-0.5h,1.5h,-1.5h,-1.5h), half4(0.5h,1.5h,-1.5h,-1.5h), half4(1.5h,1.5h,-1.5h,-1.5h),
+    half4(-1.5h,-1.5h,-0.5h,-1.5h), half4(-0.5h,-1.5h,-0.5h,-1.5h), half4(0.5h,-1.5h,-0.5h,-1.5h), half4(1.5h,-1.5h,-0.5h,-1.5h),
+    half4(-1.5h,-0.5h,-0.5h,-1.5h), half4(-0.5h,-0.5h,-0.5h,-1.5h), half4(0.5h,-0.5h,-0.5h,-1.5h), half4(1.5h,-0.5h,-0.5h,-1.5h),
+    half4(-1.5h,0.5h,-0.5h,-1.5h), half4(-0.5h,0.5h,-0.5h,-1.5h), half4(0.5h,0.5h,-0.5h,-1.5h), half4(1.5h,0.5h,-0.5h,-1.5h),
+    half4(-1.5h,1.5h,-0.5h,-1.5h), half4(-0.5h,1.5h,-0.5h,-1.5h), half4(0.5h,1.5h,-0.5h,-1.5h), half4(1.5h,1.5h,-0.5h,-1.5h),
+    half4(-1.5h,-1.5h,0.5h,-1.5h), half4(-0.5h,-1.5h,0.5h,-1.5h), half4(0.5h,-1.5h,0.5h,-1.5h), half4(1.5h,-1.5h,0.5h,-1.5h),
+    half4(-1.5h,-0.5h,0.5h,-1.5h), half4(-0.5h,-0.5h,0.5h,-1.5h), half4(0.5h,-0.5h,0.5h,-1.5h), half4(1.5h,-0.5h,0.5h,-1.5h),
+    half4(-1.5h,0.5h,0.5h,-1.5h), half4(-0.5h,0.5h,0.5h,-1.5h), half4(0.5h,0.5h,0.5h,-1.5h), half4(1.5h,0.5h,0.5h,-1.5h),
+    half4(-1.5h,1.5h,0.5h,-1.5h), half4(-0.5h,1.5h,0.5h,-1.5h), half4(0.5h,1.5h,0.5h,-1.5h), half4(1.5h,1.5h,0.5h,-1.5h),
+    half4(-1.5h,-1.5h,1.5h,-1.5h), half4(-0.5h,-1.5h,1.5h,-1.5h), half4(0.5h,-1.5h,1.5h,-1.5h), half4(1.5h,-1.5h,1.5h,-1.5h),
+    half4(-1.5h,-0.5h,1.5h,-1.5h), half4(-0.5h,-0.5h,1.5h,-1.5h), half4(0.5h,-0.5h,1.5h,-1.5h), half4(1.5h,-0.5h,1.5h,-1.5h),
+    half4(-1.5h,0.5h,1.5h,-1.5h), half4(-0.5h,0.5h,1.5h,-1.5h), half4(0.5h,0.5h,1.5h,-1.5h), half4(1.5h,0.5h,1.5h,-1.5h),
+    half4(-1.5h,1.5h,1.5h,-1.5h), half4(-0.5h,1.5h,1.5h,-1.5h), half4(0.5h,1.5h,1.5h,-1.5h), half4(1.5h,1.5h,1.5h,-1.5h),
+    half4(-1.5h,-1.5h,-1.5h,-0.5h), half4(-0.5h,-1.5h,-1.5h,-0.5h), half4(0.5h,-1.5h,-1.5h,-0.5h), half4(1.5h,-1.5h,-1.5h,-0.5h),
+    half4(-1.5h,-0.5h,-1.5h,-0.5h), half4(-0.5h,-0.5h,-1.5h,-0.5h), half4(0.5h,-0.5h,-1.5h,-0.5h), half4(1.5h,-0.5h,-1.5h,-0.5h),
+    half4(-1.5h,0.5h,-1.5h,-0.5h), half4(-0.5h,0.5h,-1.5h,-0.5h), half4(0.5h,0.5h,-1.5h,-0.5h), half4(1.5h,0.5h,-1.5h,-0.5h),
+    half4(-1.5h,1.5h,-1.5h,-0.5h), half4(-0.5h,1.5h,-1.5h,-0.5h), half4(0.5h,1.5h,-1.5h,-0.5h), half4(1.5h,1.5h,-1.5h,-0.5h),
+    half4(-1.5h,-1.5h,-0.5h,-0.5h), half4(-0.5h,-1.5h,-0.5h,-0.5h), half4(0.5h,-1.5h,-0.5h,-0.5h), half4(1.5h,-1.5h,-0.5h,-0.5h),
+    half4(-1.5h,-0.5h,-0.5h,-0.5h), half4(-0.5h,-0.5h,-0.5h,-0.5h), half4(0.5h,-0.5h,-0.5h,-0.5h), half4(1.5h,-0.5h,-0.5h,-0.5h),
+    half4(-1.5h,0.5h,-0.5h,-0.5h), half4(-0.5h,0.5h,-0.5h,-0.5h), half4(0.5h,0.5h,-0.5h,-0.5h), half4(1.5h,0.5h,-0.5h,-0.5h),
+    half4(-1.5h,1.5h,-0.5h,-0.5h), half4(-0.5h,1.5h,-0.5h,-0.5h), half4(0.5h,1.5h,-0.5h,-0.5h), half4(1.5h,1.5h,-0.5h,-0.5h),
+    half4(-1.5h,-1.5h,0.5h,-0.5h), half4(-0.5h,-1.5h,0.5h,-0.5h), half4(0.5h,-1.5h,0.5h,-0.5h), half4(1.5h,-1.5h,0.5h,-0.5h),
+    half4(-1.5h,-0.5h,0.5h,-0.5h), half4(-0.5h,-0.5h,0.5h,-0.5h), half4(0.5h,-0.5h,0.5h,-0.5h), half4(1.5h,-0.5h,0.5h,-0.5h),
+    half4(-1.5h,0.5h,0.5h,-0.5h), half4(-0.5h,0.5h,0.5h,-0.5h), half4(0.5h,0.5h,0.5h,-0.5h), half4(1.5h,0.5h,0.5h,-0.5h),
+    half4(-1.5h,1.5h,0.5h,-0.5h), half4(-0.5h,1.5h,0.5h,-0.5h), half4(0.5h,1.5h,0.5h,-0.5h), half4(1.5h,1.5h,0.5h,-0.5h),
+    half4(-1.5h,-1.5h,1.5h,-0.5h), half4(-0.5h,-1.5h,1.5h,-0.5h), half4(0.5h,-1.5h,1.5h,-0.5h), half4(1.5h,-1.5h,1.5h,-0.5h),
+    half4(-1.5h,-0.5h,1.5h,-0.5h), half4(-0.5h,-0.5h,1.5h,-0.5h), half4(0.5h,-0.5h,1.5h,-0.5h), half4(1.5h,-0.5h,1.5h,-0.5h),
+    half4(-1.5h,0.5h,1.5h,-0.5h), half4(-0.5h,0.5h,1.5h,-0.5h), half4(0.5h,0.5h,1.5h,-0.5h), half4(1.5h,0.5h,1.5h,-0.5h),
+    half4(-1.5h,1.5h,1.5h,-0.5h), half4(-0.5h,1.5h,1.5h,-0.5h), half4(0.5h,1.5h,1.5h,-0.5h), half4(1.5h,1.5h,1.5h,-0.5h),
+    half4(-1.5h,-1.5h,-1.5h,0.5h), half4(-0.5h,-1.5h,-1.5h,0.5h), half4(0.5h,-1.5h,-1.5h,0.5h), half4(1.5h,-1.5h,-1.5h,0.5h),
+    half4(-1.5h,-0.5h,-1.5h,0.5h), half4(-0.5h,-0.5h,-1.5h,0.5h), half4(0.5h,-0.5h,-1.5h,0.5h), half4(1.5h,-0.5h,-1.5h,0.5h),
+    half4(-1.5h,0.5h,-1.5h,0.5h), half4(-0.5h,0.5h,-1.5h,0.5h), half4(0.5h,0.5h,-1.5h,0.5h), half4(1.5h,0.5h,-1.5h,0.5h),
+    half4(-1.5h,1.5h,-1.5h,0.5h), half4(-0.5h,1.5h,-1.5h,0.5h), half4(0.5h,1.5h,-1.5h,0.5h), half4(1.5h,1.5h,-1.5h,0.5h),
+    half4(-1.5h,-1.5h,-0.5h,0.5h), half4(-0.5h,-1.5h,-0.5h,0.5h), half4(0.5h,-1.5h,-0.5h,0.5h), half4(1.5h,-1.5h,-0.5h,0.5h),
+    half4(-1.5h,-0.5h,-0.5h,0.5h), half4(-0.5h,-0.5h,-0.5h,0.5h), half4(0.5h,-0.5h,-0.5h,0.5h), half4(1.5h,-0.5h,-0.5h,0.5h),
+    half4(-1.5h,0.5h,-0.5h,0.5h), half4(-0.5h,0.5h,-0.5h,0.5h), half4(0.5h,0.5h,-0.5h,0.5h), half4(1.5h,0.5h,-0.5h,0.5h),
+    half4(-1.5h,1.5h,-0.5h,0.5h), half4(-0.5h,1.5h,-0.5h,0.5h), half4(0.5h,1.5h,-0.5h,0.5h), half4(1.5h,1.5h,-0.5h,0.5h),
+    half4(-1.5h,-1.5h,0.5h,0.5h), half4(-0.5h,-1.5h,0.5h,0.5h), half4(0.5h,-1.5h,0.5h,0.5h), half4(1.5h,-1.5h,0.5h,0.5h),
+    half4(-1.5h,-0.5h,0.5h,0.5h), half4(-0.5h,-0.5h,0.5h,0.5h), half4(0.5h,-0.5h,0.5h,0.5h), half4(1.5h,-0.5h,0.5h,0.5h),
+    half4(-1.5h,0.5h,0.5h,0.5h), half4(-0.5h,0.5h,0.5h,0.5h), half4(0.5h,0.5h,0.5h,0.5h), half4(1.5h,0.5h,0.5h,0.5h),
+    half4(-1.5h,1.5h,0.5h,0.5h), half4(-0.5h,1.5h,0.5h,0.5h), half4(0.5h,1.5h,0.5h,0.5h), half4(1.5h,1.5h,0.5h,0.5h),
+    half4(-1.5h,-1.5h,1.5h,0.5h), half4(-0.5h,-1.5h,1.5h,0.5h), half4(0.5h,-1.5h,1.5h,0.5h), half4(1.5h,-1.5h,1.5h,0.5h),
+    half4(-1.5h,-0.5h,1.5h,0.5h), half4(-0.5h,-0.5h,1.5h,0.5h), half4(0.5h,-0.5h,1.5h,0.5h), half4(1.5h,-0.5h,1.5h,0.5h),
+    half4(-1.5h,0.5h,1.5h,0.5h), half4(-0.5h,0.5h,1.5h,0.5h), half4(0.5h,0.5h,1.5h,0.5h), half4(1.5h,0.5h,1.5h,0.5h),
+    half4(-1.5h,1.5h,1.5h,0.5h), half4(-0.5h,1.5h,1.5h,0.5h), half4(0.5h,1.5h,1.5h,0.5h), half4(1.5h,1.5h,1.5h,0.5h),
+    half4(-1.5h,-1.5h,-1.5h,1.5h), half4(-0.5h,-1.5h,-1.5h,1.5h), half4(0.5h,-1.5h,-1.5h,1.5h), half4(1.5h,-1.5h,-1.5h,1.5h),
+    half4(-1.5h,-0.5h,-1.5h,1.5h), half4(-0.5h,-0.5h,-1.5h,1.5h), half4(0.5h,-0.5h,-1.5h,1.5h), half4(1.5h,-0.5h,-1.5h,1.5h),
+    half4(-1.5h,0.5h,-1.5h,1.5h), half4(-0.5h,0.5h,-1.5h,1.5h), half4(0.5h,0.5h,-1.5h,1.5h), half4(1.5h,0.5h,-1.5h,1.5h),
+    half4(-1.5h,1.5h,-1.5h,1.5h), half4(-0.5h,1.5h,-1.5h,1.5h), half4(0.5h,1.5h,-1.5h,1.5h), half4(1.5h,1.5h,-1.5h,1.5h),
+    half4(-1.5h,-1.5h,-0.5h,1.5h), half4(-0.5h,-1.5h,-0.5h,1.5h), half4(0.5h,-1.5h,-0.5h,1.5h), half4(1.5h,-1.5h,-0.5h,1.5h),
+    half4(-1.5h,-0.5h,-0.5h,1.5h), half4(-0.5h,-0.5h,-0.5h,1.5h), half4(0.5h,-0.5h,-0.5h,1.5h), half4(1.5h,-0.5h,-0.5h,1.5h),
+    half4(-1.5h,0.5h,-0.5h,1.5h), half4(-0.5h,0.5h,-0.5h,1.5h), half4(0.5h,0.5h,-0.5h,1.5h), half4(1.5h,0.5h,-0.5h,1.5h),
+    half4(-1.5h,1.5h,-0.5h,1.5h), half4(-0.5h,1.5h,-0.5h,1.5h), half4(0.5h,1.5h,-0.5h,1.5h), half4(1.5h,1.5h,-0.5h,1.5h),
+    half4(-1.5h,-1.5h,0.5h,1.5h), half4(-0.5h,-1.5h,0.5h,1.5h), half4(0.5h,-1.5h,0.5h,1.5h), half4(1.5h,-1.5h,0.5h,1.5h),
+    half4(-1.5h,-0.5h,0.5h,1.5h), half4(-0.5h,-0.5h,0.5h,1.5h), half4(0.5h,-0.5h,0.5h,1.5h), half4(1.5h,-0.5h,0.5h,1.5h),
+    half4(-1.5h,0.5h,0.5h,1.5h), half4(-0.5h,0.5h,0.5h,1.5h), half4(0.5h,0.5h,0.5h,1.5h), half4(1.5h,0.5h,0.5h,1.5h),
+    half4(-1.5h,1.5h,0.5h,1.5h), half4(-0.5h,1.5h,0.5h,1.5h), half4(0.5h,1.5h,0.5h,1.5h), half4(1.5h,1.5h,0.5h,1.5h),
+    half4(-1.5h,-1.5h,1.5h,1.5h), half4(-0.5h,-1.5h,1.5h,1.5h), half4(0.5h,-1.5h,1.5h,1.5h), half4(1.5h,-1.5h,1.5h,1.5h),
+    half4(-1.5h,-0.5h,1.5h,1.5h), half4(-0.5h,-0.5h,1.5h,1.5h), half4(0.5h,-0.5h,1.5h,1.5h), half4(1.5h,-0.5h,1.5h,1.5h),
+    half4(-1.5h,0.5h,1.5h,1.5h), half4(-0.5h,0.5h,1.5h,1.5h), half4(0.5h,0.5h,1.5h,1.5h), half4(1.5h,0.5h,1.5h,1.5h),
+    half4(-1.5h,1.5h,1.5h,1.5h), half4(-0.5h,1.5h,1.5h,1.5h), half4(0.5h,1.5h,1.5h,1.5h), half4(1.5h,1.5h,1.5h,1.5h),
+};
+constant half4 kMppS3Hi[16] = {
+    half4(-2.0h,-2.0h,-2.0h,-2.0h), half4(2.0h,-2.0h,-2.0h,-2.0h), half4(-2.0h,2.0h,-2.0h,-2.0h), half4(2.0h,2.0h,-2.0h,-2.0h),
+    half4(-2.0h,-2.0h,2.0h,-2.0h), half4(2.0h,-2.0h,2.0h,-2.0h), half4(-2.0h,2.0h,2.0h,-2.0h), half4(2.0h,2.0h,2.0h,-2.0h),
+    half4(-2.0h,-2.0h,-2.0h,2.0h), half4(2.0h,-2.0h,-2.0h,2.0h), half4(-2.0h,2.0h,-2.0h,2.0h), half4(2.0h,2.0h,-2.0h,2.0h),
+    half4(-2.0h,-2.0h,2.0h,2.0h), half4(2.0h,-2.0h,2.0h,2.0h), half4(-2.0h,2.0h,2.0h,2.0h), half4(2.0h,2.0h,2.0h,2.0h),
+};
+constant half2 kMppS4Lut[256] = {
+    half2(-7.5h,-7.5h), half2(-6.5h,-7.5h), half2(-5.5h,-7.5h), half2(-4.5h,-7.5h), half2(-3.5h,-7.5h), half2(-2.5h,-7.5h), half2(-1.5h,-7.5h), half2(-0.5h,-7.5h),
+    half2(0.5h,-7.5h), half2(1.5h,-7.5h), half2(2.5h,-7.5h), half2(3.5h,-7.5h), half2(4.5h,-7.5h), half2(5.5h,-7.5h), half2(6.5h,-7.5h), half2(7.5h,-7.5h),
+    half2(-7.5h,-6.5h), half2(-6.5h,-6.5h), half2(-5.5h,-6.5h), half2(-4.5h,-6.5h), half2(-3.5h,-6.5h), half2(-2.5h,-6.5h), half2(-1.5h,-6.5h), half2(-0.5h,-6.5h),
+    half2(0.5h,-6.5h), half2(1.5h,-6.5h), half2(2.5h,-6.5h), half2(3.5h,-6.5h), half2(4.5h,-6.5h), half2(5.5h,-6.5h), half2(6.5h,-6.5h), half2(7.5h,-6.5h),
+    half2(-7.5h,-5.5h), half2(-6.5h,-5.5h), half2(-5.5h,-5.5h), half2(-4.5h,-5.5h), half2(-3.5h,-5.5h), half2(-2.5h,-5.5h), half2(-1.5h,-5.5h), half2(-0.5h,-5.5h),
+    half2(0.5h,-5.5h), half2(1.5h,-5.5h), half2(2.5h,-5.5h), half2(3.5h,-5.5h), half2(4.5h,-5.5h), half2(5.5h,-5.5h), half2(6.5h,-5.5h), half2(7.5h,-5.5h),
+    half2(-7.5h,-4.5h), half2(-6.5h,-4.5h), half2(-5.5h,-4.5h), half2(-4.5h,-4.5h), half2(-3.5h,-4.5h), half2(-2.5h,-4.5h), half2(-1.5h,-4.5h), half2(-0.5h,-4.5h),
+    half2(0.5h,-4.5h), half2(1.5h,-4.5h), half2(2.5h,-4.5h), half2(3.5h,-4.5h), half2(4.5h,-4.5h), half2(5.5h,-4.5h), half2(6.5h,-4.5h), half2(7.5h,-4.5h),
+    half2(-7.5h,-3.5h), half2(-6.5h,-3.5h), half2(-5.5h,-3.5h), half2(-4.5h,-3.5h), half2(-3.5h,-3.5h), half2(-2.5h,-3.5h), half2(-1.5h,-3.5h), half2(-0.5h,-3.5h),
+    half2(0.5h,-3.5h), half2(1.5h,-3.5h), half2(2.5h,-3.5h), half2(3.5h,-3.5h), half2(4.5h,-3.5h), half2(5.5h,-3.5h), half2(6.5h,-3.5h), half2(7.5h,-3.5h),
+    half2(-7.5h,-2.5h), half2(-6.5h,-2.5h), half2(-5.5h,-2.5h), half2(-4.5h,-2.5h), half2(-3.5h,-2.5h), half2(-2.5h,-2.5h), half2(-1.5h,-2.5h), half2(-0.5h,-2.5h),
+    half2(0.5h,-2.5h), half2(1.5h,-2.5h), half2(2.5h,-2.5h), half2(3.5h,-2.5h), half2(4.5h,-2.5h), half2(5.5h,-2.5h), half2(6.5h,-2.5h), half2(7.5h,-2.5h),
+    half2(-7.5h,-1.5h), half2(-6.5h,-1.5h), half2(-5.5h,-1.5h), half2(-4.5h,-1.5h), half2(-3.5h,-1.5h), half2(-2.5h,-1.5h), half2(-1.5h,-1.5h), half2(-0.5h,-1.5h),
+    half2(0.5h,-1.5h), half2(1.5h,-1.5h), half2(2.5h,-1.5h), half2(3.5h,-1.5h), half2(4.5h,-1.5h), half2(5.5h,-1.5h), half2(6.5h,-1.5h), half2(7.5h,-1.5h),
+    half2(-7.5h,-0.5h), half2(-6.5h,-0.5h), half2(-5.5h,-0.5h), half2(-4.5h,-0.5h), half2(-3.5h,-0.5h), half2(-2.5h,-0.5h), half2(-1.5h,-0.5h), half2(-0.5h,-0.5h),
+    half2(0.5h,-0.5h), half2(1.5h,-0.5h), half2(2.5h,-0.5h), half2(3.5h,-0.5h), half2(4.5h,-0.5h), half2(5.5h,-0.5h), half2(6.5h,-0.5h), half2(7.5h,-0.5h),
+    half2(-7.5h,0.5h), half2(-6.5h,0.5h), half2(-5.5h,0.5h), half2(-4.5h,0.5h), half2(-3.5h,0.5h), half2(-2.5h,0.5h), half2(-1.5h,0.5h), half2(-0.5h,0.5h),
+    half2(0.5h,0.5h), half2(1.5h,0.5h), half2(2.5h,0.5h), half2(3.5h,0.5h), half2(4.5h,0.5h), half2(5.5h,0.5h), half2(6.5h,0.5h), half2(7.5h,0.5h),
+    half2(-7.5h,1.5h), half2(-6.5h,1.5h), half2(-5.5h,1.5h), half2(-4.5h,1.5h), half2(-3.5h,1.5h), half2(-2.5h,1.5h), half2(-1.5h,1.5h), half2(-0.5h,1.5h),
+    half2(0.5h,1.5h), half2(1.5h,1.5h), half2(2.5h,1.5h), half2(3.5h,1.5h), half2(4.5h,1.5h), half2(5.5h,1.5h), half2(6.5h,1.5h), half2(7.5h,1.5h),
+    half2(-7.5h,2.5h), half2(-6.5h,2.5h), half2(-5.5h,2.5h), half2(-4.5h,2.5h), half2(-3.5h,2.5h), half2(-2.5h,2.5h), half2(-1.5h,2.5h), half2(-0.5h,2.5h),
+    half2(0.5h,2.5h), half2(1.5h,2.5h), half2(2.5h,2.5h), half2(3.5h,2.5h), half2(4.5h,2.5h), half2(5.5h,2.5h), half2(6.5h,2.5h), half2(7.5h,2.5h),
+    half2(-7.5h,3.5h), half2(-6.5h,3.5h), half2(-5.5h,3.5h), half2(-4.5h,3.5h), half2(-3.5h,3.5h), half2(-2.5h,3.5h), half2(-1.5h,3.5h), half2(-0.5h,3.5h),
+    half2(0.5h,3.5h), half2(1.5h,3.5h), half2(2.5h,3.5h), half2(3.5h,3.5h), half2(4.5h,3.5h), half2(5.5h,3.5h), half2(6.5h,3.5h), half2(7.5h,3.5h),
+    half2(-7.5h,4.5h), half2(-6.5h,4.5h), half2(-5.5h,4.5h), half2(-4.5h,4.5h), half2(-3.5h,4.5h), half2(-2.5h,4.5h), half2(-1.5h,4.5h), half2(-0.5h,4.5h),
+    half2(0.5h,4.5h), half2(1.5h,4.5h), half2(2.5h,4.5h), half2(3.5h,4.5h), half2(4.5h,4.5h), half2(5.5h,4.5h), half2(6.5h,4.5h), half2(7.5h,4.5h),
+    half2(-7.5h,5.5h), half2(-6.5h,5.5h), half2(-5.5h,5.5h), half2(-4.5h,5.5h), half2(-3.5h,5.5h), half2(-2.5h,5.5h), half2(-1.5h,5.5h), half2(-0.5h,5.5h),
+    half2(0.5h,5.5h), half2(1.5h,5.5h), half2(2.5h,5.5h), half2(3.5h,5.5h), half2(4.5h,5.5h), half2(5.5h,5.5h), half2(6.5h,5.5h), half2(7.5h,5.5h),
+    half2(-7.5h,6.5h), half2(-6.5h,6.5h), half2(-5.5h,6.5h), half2(-4.5h,6.5h), half2(-3.5h,6.5h), half2(-2.5h,6.5h), half2(-1.5h,6.5h), half2(-0.5h,6.5h),
+    half2(0.5h,6.5h), half2(1.5h,6.5h), half2(2.5h,6.5h), half2(3.5h,6.5h), half2(4.5h,6.5h), half2(5.5h,6.5h), half2(6.5h,6.5h), half2(7.5h,6.5h),
+    half2(-7.5h,7.5h), half2(-6.5h,7.5h), half2(-5.5h,7.5h), half2(-4.5h,7.5h), half2(-3.5h,7.5h), half2(-2.5h,7.5h), half2(-1.5h,7.5h), half2(-0.5h,7.5h),
+    half2(0.5h,7.5h), half2(1.5h,7.5h), half2(2.5h,7.5h), half2(3.5h,7.5h), half2(4.5h,7.5h), half2(5.5h,7.5h), half2(6.5h,7.5h), half2(7.5h,7.5h),
+};
+constant half4 kMppS5Hi[16] = {
+    half4(-8.0h,-8.0h,-8.0h,-8.0h), half4(8.0h,-8.0h,-8.0h,-8.0h), half4(-8.0h,8.0h,-8.0h,-8.0h), half4(8.0h,8.0h,-8.0h,-8.0h),
+    half4(-8.0h,-8.0h,8.0h,-8.0h), half4(8.0h,-8.0h,8.0h,-8.0h), half4(-8.0h,8.0h,8.0h,-8.0h), half4(8.0h,8.0h,8.0h,-8.0h),
+    half4(-8.0h,-8.0h,-8.0h,8.0h), half4(8.0h,-8.0h,-8.0h,8.0h), half4(-8.0h,8.0h,-8.0h,8.0h), half4(8.0h,8.0h,-8.0h,8.0h),
+    half4(-8.0h,-8.0h,8.0h,8.0h), half4(8.0h,-8.0h,8.0h,8.0h), half4(-8.0h,8.0h,8.0h,8.0h), half4(8.0h,8.0h,8.0h,8.0h),
+};
+
+// Constant-cache LUT .strata S_K decoder (10-15x fewer ALU ops on S2_K..S6_K!)
 template <int F>
 static inline void mpp_sk_w8(device const uchar* pl, int j, thread float4& o0, thread float4& o1) {
-    constexpr float H = mpp_sk_half(F);
     if constexpr (F == 2) {
-        const uint w = uint(mpp_ld16(pl + (j >> 2)));
-        o0 = float4(float(w & 3u), float((w >> 2) & 3u), float((w >> 4) & 3u), float((w >> 6) & 3u)) - H;
-        o1 = float4(float((w >> 8) & 3u), float((w >> 10) & 3u), float((w >> 12) & 3u), float((w >> 14) & 3u)) - H;
+        device const uchar* p = pl + (j >> 2);
+        o0 = float4(kMppS2Lut[p[0]]);
+        o1 = float4(kMppS2Lut[p[1]]);
     } else if constexpr (F == 3) {
-        const uint w = uint(mpp_ld16(pl + (j >> 2)));
+        device const uchar* p = pl + (j >> 2);
         const uint h = uint(pl[64 + (j >> 3)]);
-        o0 = float4(float((w & 3u) | ((h & 1u) << 2)),
-                    float(((w >> 2) & 3u) | (((h >> 1) & 1u) << 2)),
-                    float(((w >> 4) & 3u) | (((h >> 2) & 1u) << 2)),
-                    float(((w >> 6) & 3u) | (((h >> 3) & 1u) << 2))) - H;
-        o1 = float4(float(((w >> 8) & 3u) | (((h >> 4) & 1u) << 2)),
-                    float(((w >> 10) & 3u) | (((h >> 5) & 1u) << 2)),
-                    float(((w >> 12) & 3u) | (((h >> 6) & 1u) << 2)),
-                    float(((w >> 14) & 3u) | (((h >> 7) & 1u) << 2))) - H;
+        o0 = float4(kMppS2Lut[p[0]] + kMppS3Hi[h & 15u]);
+        o1 = float4(kMppS2Lut[p[1]] + kMppS3Hi[h >> 4]);
     } else if constexpr (F == 4) {
-        const uint lo = uint(mpp_ld16(pl + (j >> 1)));
-        const uint hi = uint(mpp_ld16(pl + (j >> 1) + 2));
-        o0 = float4(float(lo & 15u), float((lo >> 4) & 15u), float((lo >> 8) & 15u), float(lo >> 12)) - H;
-        o1 = float4(float(hi & 15u), float((hi >> 4) & 15u), float((hi >> 8) & 15u), float(hi >> 12)) - H;
+        device const uchar* p = pl + (j >> 1);
+        o0 = float4(half4(kMppS4Lut[p[0]], kMppS4Lut[p[1]]));
+        o1 = float4(half4(kMppS4Lut[p[2]], kMppS4Lut[p[3]]));
     } else if constexpr (F == 5) {
-        const uint lo = uint(mpp_ld16(pl + (j >> 1)));
-        const uint hi = uint(mpp_ld16(pl + (j >> 1) + 2));
+        device const uchar* p = pl + (j >> 1);
         const uint h = uint(pl[128 + (j >> 3)]);
-        o0 = float4(float((lo & 15u) | ((h & 1u) << 4)),
-                    float(((lo >> 4) & 15u) | (((h >> 1) & 1u) << 4)),
-                    float(((lo >> 8) & 15u) | (((h >> 2) & 1u) << 4)),
-                    float((lo >> 12) | (((h >> 3) & 1u) << 4))) - H;
-        o1 = float4(float((hi & 15u) | (((h >> 4) & 1u) << 4)),
-                    float(((hi >> 4) & 15u) | (((h >> 5) & 1u) << 4)),
-                    float(((hi >> 8) & 15u) | (((h >> 6) & 1u) << 4)),
-                    float((hi >> 12) | (((h >> 7) & 1u) << 4))) - H;
+        o0 = float4(half4(kMppS4Lut[p[0]], kMppS4Lut[p[1]]) + kMppS5Hi[h & 15u]);
+        o1 = float4(half4(kMppS4Lut[p[2]], kMppS4Lut[p[3]]) + kMppS5Hi[h >> 4]);
     } else if constexpr (F == 6) {
-        const uint lo = uint(mpp_ld16(pl + (j >> 1)));
-        const uint hi = uint(mpp_ld16(pl + (j >> 1) + 2));
-        const uint hh = uint(mpp_ld16(pl + 128 + (j >> 2)));
-        o0 = float4(float((lo & 15u) | ((hh & 3u) << 4)),
-                    float(((lo >> 4) & 15u) | (((hh >> 2) & 3u) << 4)),
-                    float(((lo >> 8) & 15u) | (((hh >> 4) & 3u) << 4)),
-                    float((lo >> 12) | (((hh >> 6) & 3u) << 4))) - H;
-        o1 = float4(float((hi & 15u) | (((hh >> 8) & 3u) << 4)),
-                    float(((hi >> 4) & 15u) | (((hh >> 10) & 3u) << 4)),
-                    float(((hi >> 8) & 15u) | (((hh >> 12) & 3u) << 4)),
-                    float((hi >> 12) | (((hh >> 14) & 3u) << 4))) - H;
+        device const uchar* p = pl + (j >> 1);
+        device const uchar* hp = pl + 128 + (j >> 2);
+        o0 = float4(fma(kMppS2Lut[hp[0]], half4(16.0h), half4(kMppS4Lut[p[0]], kMppS4Lut[p[1]])));
+        o1 = float4(fma(kMppS2Lut[hp[1]], half4(16.0h), half4(kMppS4Lut[p[2]], kMppS4Lut[p[3]])));
     } else {
         device const char* qp = (device const char*)(pl + j);
         o0 = float4(float(qp[0]), float(qp[1]), float(qp[2]), float(qp[3]));
@@ -311,58 +402,73 @@ kernel void ink_mpp_ctrl_fuse_gf_norm(
 kernel void ink_mpp_moe_plan(
     device const int* topk_idx [[buffer(0)]],
     constant int& P            [[buffer(1)]],
-    constant int& TM_sm        [[buffer(2)]],  // 32 for M >= 128, 16 for M < 128
+    constant int& allow_128    [[buffer(2)]],  // 1 for M >= 128, 0 for M < 128
     device int* srt_pair       [[buffer(3)]],  // [total_rows] (-1 for padded rows)
     device int* pair_pos       [[buffer(4)]],  // [P] -> row index in sorted layout
     device int4* tiles_128     [[buffer(5)]],  // [n128] = (e, row0, valid_rows, 0)
     device int4* tiles_64      [[buffer(6)]],  // [n64]  = (e, row0, valid_rows, 0)
-    device int4* tiles_sm      [[buffer(7)]],  // [nsm]  = (e, row0, valid_rows, 0)
-    device uint* meta          [[buffer(8)]],  // indirect dispatch args (20 uints)
+    device int4* tiles_32      [[buffer(7)]],  // [n32]  = (e, row0, valid_rows, 0)
+    device int4* tiles_16      [[buffer(8)]],  // [n16]  = (e, row0, valid_rows, 0)
+    device uint* meta          [[buffer(9)]],  // indirect dispatch args (24 uints)
     uint e    [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]]) {
     threadgroup int sg_r[4];
     threadgroup int sg_128[4];
     threadgroup int sg_64[4];
-    threadgroup int sg_sm[4];
+    threadgroup int sg_32[4];
+    threadgroup int sg_16[4];
 
     int c = 0;
     for (int i = 0; i < P; ++i) if (topk_idx[i] == int(e)) ++c;
 
-    int n128 = 0, n64 = 0, nsm = 0;
+    // Exact 4-bucket binary tile decomposition (128 / 64 / 32 / 16): <= 15 wasted rows/expert (<4.5% waste at P=1024!)
+    int n128 = 0, n64 = 0, n32 = 0, n16 = 0;
     if (c > 0) {
-        if (TM_sm >= 32) {
-            n128 = c >> 7;
-            const int rem = c & 127;
-            if (rem > 64)      { ++n128; }
-            else if (rem > 32) { n64 = 1; }
-            else if (rem > 0)  { nsm = 1; }
-        } else {
-            n64 = c >> 6;
-            const int rem = c & 63;
-            if (rem > 32)      { ++n64; }
-            else if (rem > 0)  { nsm = (rem + 15) >> 4; }
+        int rem = c;
+        if (allow_128) {
+            n128 = rem >> 7;
+            rem &= 127;
+            if (rem > 112) { ++n128; rem = 0; }
+        }
+        if (rem > 0) {
+            n64 = rem >> 6;
+            rem &= 63;
+            if (rem > 48) { ++n64; rem = 0; }
+        }
+        if (rem > 0) {
+            n32 = rem >> 5;
+            rem &= 31;
+            if (rem > 16) { ++n32; rem = 0; }
+        }
+        if (rem > 0) {
+            n16 = 1;
         }
     }
-    const int rows = n128 * 128 + n64 * 64 + nsm * TM_sm;
+    const int rows = n128 * 128 + n64 * 64 + n32 * 32 + n16 * 16;
 
     const int ex_r   = simd_prefix_exclusive_sum(rows);
     const int ex_128 = simd_prefix_exclusive_sum(n128);
     const int ex_64  = simd_prefix_exclusive_sum(n64);
-    const int ex_sm  = simd_prefix_exclusive_sum(nsm);
+    const int ex_32  = simd_prefix_exclusive_sum(n32);
+    const int ex_16  = simd_prefix_exclusive_sum(n16);
     if (lane == 31) {
         sg_r[sg]   = ex_r + rows;
         sg_128[sg] = ex_128 + n128;
         sg_64[sg]  = ex_64 + n64;
-        sg_sm[sg]  = ex_sm + nsm;
+        sg_32[sg]  = ex_32 + n32;
+        sg_16[sg]  = ex_16 + n16;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    int br = 0, b128 = 0, b64 = 0, bsm = 0;
-    for (uint w = 0; w < sg; ++w) { br += sg_r[w]; b128 += sg_128[w]; b64 += sg_64[w]; bsm += sg_sm[w]; }
+    int br = 0, b128 = 0, b64 = 0, b32 = 0, b16 = 0;
+    for (uint w = 0; w < sg; ++w) {
+        br += sg_r[w]; b128 += sg_128[w]; b64 += sg_64[w]; b32 += sg_32[w]; b16 += sg_16[w];
+    }
     const int roff = br + ex_r;
     const int o128 = b128 + ex_128;
     const int o64  = b64 + ex_64;
-    const int osm  = bsm + ex_sm;
+    const int o32  = b32 + ex_32;
+    const int o16  = b16 + ex_16;
 
     int cur_r = roff, rem_c = c;
     for (int j = 0; j < n128; ++j) {
@@ -375,10 +481,15 @@ kernel void ink_mpp_moe_plan(
         tiles_64[o64 + j] = int4(int(e), cur_r, v, 0);
         cur_r += 64; rem_c -= v;
     }
-    for (int j = 0; j < nsm; ++j) {
-        const int v = min(TM_sm, rem_c);
-        tiles_sm[osm + j] = int4(int(e), cur_r, v, 0);
-        cur_r += TM_sm; rem_c -= v;
+    for (int j = 0; j < n32; ++j) {
+        const int v = min(32, rem_c);
+        tiles_32[o32 + j] = int4(int(e), cur_r, v, 0);
+        cur_r += 32; rem_c -= v;
+    }
+    for (int j = 0; j < n16; ++j) {
+        const int v = min(16, rem_c);
+        tiles_16[o16 + j] = int4(int(e), cur_r, v, 0);
+        cur_r += 16; rem_c -= v;
     }
 
     for (int r = 0; r < rows; ++r) srt_pair[roff + r] = -1;
@@ -395,17 +506,21 @@ kernel void ink_mpp_moe_plan(
     if (e == 127) {
         const uint t128 = uint(o128 + n128);
         const uint t64  = uint(o64 + n64);
-        const uint tsm  = uint(osm + nsm);
+        const uint t32  = uint(o32 + n32);
+        const uint t16  = uint(o16 + n16);
         const uint tot_rows = uint(roff + rows);
-        meta[0] = t128; meta[1] = t64; meta[2] = tsm; meta[3] = tot_rows;
+        meta[0] = t128; meta[1] = t64; meta[2] = t32; meta[3] = tot_rows;
         // [4..6] gather: (tot_rows, 1, 1)
         meta[4] = tot_rows; meta[5] = 1u; meta[6] = 1u;
         // [7..9] dir_128 (L2-swizzled!): (t128, 36, 1)
         meta[7] = t128; meta[8] = 36u; meta[9] = 1u;
         // [10..12] dir_64 (L2-swizzled!): (t64, 36, 1)
         meta[10] = t64; meta[11] = 36u; meta[12] = 1u;
-        // [13..15] dir_sm (L2-swizzled!): (tsm, 36, 1)
-        meta[13] = tsm; meta[14] = 36u; meta[15] = 1u;
+        // [13..15] dir_32 (L2-swizzled!): (t32, 36, 1)
+        meta[13] = t32; meta[14] = 36u; meta[15] = 1u;
+        // [16..18] dir_16 (L2-swizzled!): (t16, 36, 1)
+        meta[16] = t16; meta[17] = 36u; meta[18] = 1u;
+        meta[19] = t16;
     }
 }
 

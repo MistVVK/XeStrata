@@ -83,7 +83,8 @@ struct InkMetalRunner {
     InkMetalVision vis;
 
     int lib_codecs = -1, lib_ops = -1, lib_dspark = -1, lib_vis = -1, lib_mpp = -1;
-    bool use_mpp = false, use_mpp_trunk_f16 = false;
+    bool is_apple10 = false;
+    bool use_mpp = false, use_mpp_trunk_f16 = false, use_dspark_f16 = false;
     int mpp_decomp_cap = 0;
 
     // Metal 4 MPP Neural Accelerator pipelines (active when lib_mpp >= 0)
@@ -99,9 +100,9 @@ struct InkMetalRunner {
     mtl::Pipeline p_lin_bf16_mv1, p_lin_bf16_mv, p_lin_bf16_mm8, p_lin_bf16_mm;
     mtl::Pipeline p_lin_q8_mv1, p_lin_q8_mv, p_lin_q8_mm8, p_lin_q8_mm;
     mtl::Pipeline p_lin_f32, p_lin_f32_mm, p_lin_f32_exact_mm;
-    mtl::Pipeline p_lin_sk[9], p_lin_sk6_mm8;
+    mtl::Pipeline p_lin_sk[9], p_lin_sk5_mm8, p_lin_sk6_mm8;
     mtl::Pipeline p_unemb_argmax_q8, p_unemb_argmax_bf16, p_unemb_argmax_sk6, p_argmax_part;
-    mtl::Pipeline p_moe_plan, p_moe_gu, p_moe_dn, p_moe_red8;
+    mtl::Pipeline p_moe_plan, p_moe_gu, p_moe_dn, p_moe_gu_sk23, p_moe_dn_sk23, p_moe_red8;
     mtl::Pipeline p_moe_gu_sf4, p_moe_dn_sf4, p_moe_gu_mx8, p_moe_dn_mx8;
     mtl::Pipeline p_moe_gu_sk2, p_moe_dn_sk2, p_moe_gu_sk3, p_moe_dn_sk3, p_moe_gu_sk4, p_moe_dn_sk4, p_moe_gu_sk5, p_moe_dn_sk5;
     mtl::Pipeline p_moe_gu_mm_sf4, p_moe_dn_mm_sf4, p_moe_gu_mm_mx8, p_moe_dn_mm_mx8, p_moe_gu_mm_gen, p_moe_dn_mm_gen;
@@ -181,7 +182,7 @@ struct InkMetalRunner {
 
     // Metal 4 MPP workspace & optional concatenated FP16 trunk cache (on >= 24 GiB working-set Macs)
     mtl::Buffer b_mpp_x_f16, b_mpp_tmp_out, b_mpp_qh, b_mpp_rh;
-    mtl::Buffer b_mpp_srt_pair, b_mpp_pair_pos, b_mpp_tiles_128, b_mpp_tiles_64, b_mpp_tiles_sm, b_mpp_meta;
+    mtl::Buffer b_mpp_srt_pair, b_mpp_pair_pos, b_mpp_tiles_128, b_mpp_tiles_64, b_mpp_tiles_32, b_mpp_tiles_16, b_mpp_meta;
     mtl::Buffer b_mpp_xs, b_mpp_hs, b_mpp_ye;
     mtl::Buffer w_qrsg_f16[24], w_k_f16[24], w_v_f16[24], w_wo_f16[24];
     mtl::Buffer w_ctrl_dn_f16[12][4], w_ctrl_gf_f16[12][4];
@@ -195,6 +196,7 @@ struct InkMetalRunner {
               const std::string& kernel_dir, std::string& err) {
         cx = &ctx;
         mod = &m;
+        is_apple10 = cx->has_family_apple(10);
         max_slots = std::max(1, std::min(64, slots));
         max_ctx = std::max(256, ctx_len);
         max_batch = std::max(64, batch_cap);
@@ -222,10 +224,13 @@ struct InkMetalRunner {
         for (int f : {2, 3, 4, 5, 6, 8}) {
             p_lin_sk[f] = cx->pipeline(lib_codecs, "ink_linear_sk_mv_" + std::to_string(f));
         }
+        p_lin_sk5_mm8   = cx->pipeline(lib_codecs, "ink_linear_sk5_mm8");
         p_lin_sk6_mm8   = cx->pipeline(lib_codecs, "ink_linear_sk6_mm8");
         p_moe_plan      = cx->pipeline(lib_codecs, "ink_moe_plan");
         p_moe_gu        = cx->pipeline(lib_codecs, "ink_moe_gu_situ");
         p_moe_dn        = cx->pipeline(lib_codecs, "ink_moe_dn");
+        p_moe_gu_sk23   = cx->pipeline(lib_codecs, "ink_moe_gu_sk23");
+        p_moe_dn_sk23   = cx->pipeline(lib_codecs, "ink_moe_dn_sk23");
         p_moe_gu_sf4    = cx->pipeline(lib_codecs, "ink_moe_gu_sf4");
         p_moe_dn_sf4    = cx->pipeline(lib_codecs, "ink_moe_dn_sf4");
         p_moe_gu_mx8    = cx->pipeline(lib_codecs, "ink_moe_gu_mx8");
@@ -539,7 +544,8 @@ struct InkMetalRunner {
             b_mpp_pair_pos  = cx->alloc(MB * (size_t)c.top_k * sizeof(int32_t));
             b_mpp_tiles_128 = cx->alloc((max_tot_rows / 64ul + 256ul) * 16ul);
             b_mpp_tiles_64  = cx->alloc((max_tot_rows / 32ul + 256ul) * 16ul);
-            b_mpp_tiles_sm  = cx->alloc((max_tot_rows / 16ul + 256ul) * 16ul);
+            b_mpp_tiles_32  = cx->alloc((max_tot_rows / 16ul + 256ul) * 16ul);
+            b_mpp_tiles_16  = cx->alloc((max_tot_rows / 16ul + 256ul) * 16ul);
             b_mpp_meta      = cx->alloc(24ul * sizeof(uint32_t));
             b_mpp_xs        = cx->alloc(max_tot_rows * D * sizeof(uint16_t));
             b_mpp_hs        = cx->alloc(max_tot_rows * (size_t)c.inter * sizeof(uint16_t));
@@ -610,21 +616,27 @@ struct InkMetalRunner {
                         cvt_trunk(p + ".controllers." + cnames[j] + ".forget_weight", w_ctrl_gf_f16[ci][j], D);
                     }
                 }
+                // Keep S5_K DSpark layers compressed (161 MB vs 496 MB FP16!) and run native LUT ink_linear_sk5_mm8 -> 3x less DRAM & -496 MiB RAM!
+                use_dspark_f16 = false;
                 if (use_dspark) {
-                    auto cvt_dsp = [&](const std::string& name, mtl::Buffer& dst_b) {
-                        const auto& ti = mod->man.get_d(name);
-                        dst_b = cx->alloc((size_t)ti.rows() * (size_t)ti.cols() * sizeof(uint16_t));
-                        cvt_tensor(ti, mod->dw(name), dst_b, 0);
-                    };
-                    for (int dl = 0; dl < 3; ++dl) {
-                        std::string lp = "dspark.layers." + std::to_string(dl);
-                        cvt_dsp(lp + ".self_attn.q_proj.weight", w_dsp_q_f16[dl]);
-                        cvt_dsp(lp + ".self_attn.k_proj.weight", w_dsp_k_f16[dl]);
-                        cvt_dsp(lp + ".self_attn.v_proj.weight", w_dsp_v_f16[dl]);
-                        cvt_dsp(lp + ".self_attn.o_proj.weight", w_dsp_o_f16[dl]);
-                        cvt_dsp(lp + ".mlp.gate_proj.weight",    w_dsp_g_f16[dl]);
-                        cvt_dsp(lp + ".mlp.up_proj.weight",      w_dsp_u_f16[dl]);
-                        cvt_dsp(lp + ".mlp.down_proj.weight",    w_dsp_d_f16[dl]);
+                    const auto& gti = mod->man.get_d("dspark.layers.0.mlp.gate_proj.weight");
+                    if (gti.fmt != FMT_S5) {
+                        use_dspark_f16 = true;
+                        auto cvt_dsp = [&](const std::string& name, mtl::Buffer& dst_b) {
+                            const auto& ti = mod->man.get_d(name);
+                            dst_b = cx->alloc((size_t)ti.rows() * (size_t)ti.cols() * sizeof(uint16_t));
+                            cvt_tensor(ti, mod->dw(name), dst_b, 0);
+                        };
+                        for (int dl = 0; dl < 3; ++dl) {
+                            std::string lp = "dspark.layers." + std::to_string(dl);
+                            cvt_dsp(lp + ".self_attn.q_proj.weight", w_dsp_q_f16[dl]);
+                            cvt_dsp(lp + ".self_attn.k_proj.weight", w_dsp_k_f16[dl]);
+                            cvt_dsp(lp + ".self_attn.v_proj.weight", w_dsp_v_f16[dl]);
+                            cvt_dsp(lp + ".self_attn.o_proj.weight", w_dsp_o_f16[dl]);
+                            cvt_dsp(lp + ".mlp.gate_proj.weight",    w_dsp_g_f16[dl]);
+                            cvt_dsp(lp + ".mlp.up_proj.weight",      w_dsp_u_f16[dl]);
+                            cvt_dsp(lp + ".mlp.down_proj.weight",    w_dsp_d_f16[dl]);
+                        }
                     }
                 }
                 cx->run_graph(init_ds);
@@ -714,7 +726,7 @@ struct InkMetalRunner {
                 d.p = &p_lin_bf16_mv1;
                 d.grid[0] = (uint32_t)((N + 31) / 32);
                 d.tg[0] = 256;
-            } else if (M >= 6 && M <= 8) {
+            } else if (M >= 3 && M <= 8) {
                 d.p = &p_lin_bf16_mm8;
                 d.grid[0] = (uint32_t)((N + 63) / 64);
                 d.tg[0] = 256;
@@ -733,7 +745,7 @@ struct InkMetalRunner {
                 d.p = &p_lin_q8_mv1;
                 d.grid[0] = (uint32_t)((N + 31) / 32);
                 d.tg[0] = 256;
-            } else if (M >= 6 && M <= 8) {
+            } else if (M >= 3 && M <= 8) {
                 d.p = &p_lin_q8_mm8;
                 d.grid[0] = (uint32_t)((N + 63) / 64);
                 d.tg[0] = 256;
@@ -765,8 +777,12 @@ struct InkMetalRunner {
                 d.tg[0] = 128;
             }
         } else if (ti.fmt >= FMT_S2 && ti.fmt <= FMT_S8) {
-            if (ti.fmt == FMT_S6 && M >= 2 && M <= 8) {
+            if (ti.fmt == FMT_S6 && M >= 2 && M <= 8 && is_apple10) {
                 d.p = &p_lin_sk6_mm8;
+                d.grid[0] = (uint32_t)((N + 63) / 64);
+                d.tg[0] = 256;
+            } else if (ti.fmt == FMT_S5 && M >= 2 && M <= 8) {
+                d.p = &p_lin_sk5_mm8;
                 d.grid[0] = (uint32_t)((N + 63) / 64);
                 d.tg[0] = 256;
             } else {
@@ -1099,7 +1115,9 @@ struct InkMetalRunner {
             const mtl::Arg in_v = (is_swa && !has_msgs) ? mtl::Arg::B(b_in3, 0) : mtl::Arg::B(b_in3, (size_t)2 * M_stride * 4);
 
             // Q, K, V, R, Sinks, GateAttn, k_sconv.weight_proj, v_sconv.weight_proj:
-            if (use_mpp && use_mpp_trunk_f16 && M >= 8) {
+            // On Apple9 (M1-M4), keep Q8_ROW 1B weights for M<=8 (2x less DRAM than FP16!); on Apple10 (M5), Neural Accelerators win from M>=8!
+            const int mpp_trunk_min_m = is_apple10 ? 8 : 16;
+            if (use_mpp && use_mpp_trunk_f16 && M >= mpp_trunk_min_m) {
                 const bool shared_qkv = (is_swa && !has_msgs);
                 const int n_in_floats = (shared_qkv ? 1 : 3) * M_stride;
                 push_f32_to_f16(ds, mtl::Arg::B(b_in3, 0), mtl::Arg::B(b_mpp_x_f16, 0), n_in_floats, true);
@@ -1263,7 +1281,8 @@ struct InkMetalRunner {
                     aa.scale = 1.0f / std::sqrt((float)c.head_dim);
                     int max_p = 0;
                     for (int m = 0; m < M; ++m) if (step.pos[m] > max_p) max_p = step.pos[m];
-                    if (M <= 16 && max_p >= 64) {
+                    const int splitk_min_p = is_apple10 ? 64 : 256;
+                    if (M <= 16 && max_p >= splitk_min_p) {
                         mtl::Dispatch d1;
                         d1.p = &p_relpos_gqa_splitk;
                         d1.grid[0] = (uint32_t)M; d1.grid[1] = (uint32_t)c.n_kv; d1.grid[2] = 8u; d1.tg[0] = 128;
@@ -1295,7 +1314,7 @@ struct InkMetalRunner {
             }
 
             // Output projection wo_ud + FUSED 4-tap attn_sconv + residual/block update (kills 56+ barriers/tok!)
-            if (use_mpp && use_mpp_trunk_f16 && M >= 8) {
+            if (use_mpp && use_mpp_trunk_f16 && M >= mpp_trunk_min_m) {
                 push_f32_to_f16(ds, mtl::Arg::B(b_attn_out), mtl::Arg::B(b_mpp_x_f16), M * 3072, true);
                 push_mpp_gemm(ds, mtl::Arg::B(w_wo_f16[ip]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(b_wo_raw), M, D, 3072, D, true);
             } else {
@@ -1415,16 +1434,16 @@ struct InkMetalRunner {
                     ds.push_back(std::move(d));
                 }
                 const int P = M * c.top_k;
-                const int TM_sm = (M >= 128) ? 32 : 16;
-                const int sm_bi = (TM_sm == 32) ? 1 : 0;
+                const int allow_128 = (M >= 128) ? 1 : 0;
                 const int gu_ci = (layer_homog_gu[ip] == 15) ? 0 : (layer_homog_gu[ip] == 16) ? 1 : 2;
                 const int dn_ci = (layer_homog_dn[ip] == 15) ? 0 : (layer_homog_dn[ip] == 16) ? 1 : 2;
                 {
                     mtl::Dispatch d;
                     d.p = &p_mpp_moe_plan; d.grid[0] = 1; d.tg[0] = 128;
-                    d.args = {mtl::Arg::B(b_topk_idx), mtl::Arg::V(P), mtl::Arg::V(TM_sm),
+                    d.args = {mtl::Arg::B(b_topk_idx), mtl::Arg::V(P), mtl::Arg::V(allow_128),
                               mtl::Arg::B(b_mpp_srt_pair), mtl::Arg::B(b_mpp_pair_pos),
-                              mtl::Arg::B(b_mpp_tiles_128), mtl::Arg::B(b_mpp_tiles_64), mtl::Arg::B(b_mpp_tiles_sm),
+                              mtl::Arg::B(b_mpp_tiles_128), mtl::Arg::B(b_mpp_tiles_64),
+                              mtl::Arg::B(b_mpp_tiles_32), mtl::Arg::B(b_mpp_tiles_16),
                               mtl::Arg::B(b_mpp_meta)};
                     ds.push_back(std::move(d));
                 }
@@ -1434,8 +1453,8 @@ struct InkMetalRunner {
                     dg.args = {mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_mpp_srt_pair), mtl::Arg::B(b_mpp_xs)};
                     ds.push_back(std::move(dg));
                 }
-                // All 3 tile buckets (128, 64, sm) write disjoint rows of HS -> run 100% CONCURRENTLY!
-                if (TM_sm >= 32) {
+                // All 4 exact-binary tile buckets (128, 64, 32, 16) write disjoint rows of HS -> run 100% CONCURRENTLY!
+                if (allow_128) {
                     mtl::Dispatch d128;
                     d128.p = &p_mpp_moe_gu_dir[gu_ci][3]; d128.ind_off = 7 * sizeof(uint32_t); d128.tg[0] = 128; d128.indirect = &b_mpp_meta;
                     d128.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
@@ -1444,22 +1463,30 @@ struct InkMetalRunner {
                 }
                 {
                     mtl::Dispatch d64;
-                    d64.barrier = (TM_sm < 32);
+                    d64.barrier = !allow_128;
                     d64.p = &p_mpp_moe_gu_dir[gu_ci][2]; d64.ind_off = 10 * sizeof(uint32_t); d64.tg[0] = 128; d64.indirect = &b_mpp_meta;
                     d64.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
                                 mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_64)};
                     ds.push_back(std::move(d64));
                 }
                 {
-                    mtl::Dispatch dsm;
-                    dsm.barrier = false;
-                    dsm.p = &p_mpp_moe_gu_dir[gu_ci][sm_bi]; dsm.ind_off = 13 * sizeof(uint32_t); dsm.tg[0] = 128; dsm.indirect = &b_mpp_meta;
-                    dsm.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
-                                mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_sm)};
-                    ds.push_back(std::move(dsm));
+                    mtl::Dispatch d32;
+                    d32.barrier = false;
+                    d32.p = &p_mpp_moe_gu_dir[gu_ci][1]; d32.ind_off = 13 * sizeof(uint32_t); d32.tg[0] = 128; d32.indirect = &b_mpp_meta;
+                    d32.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_32)};
+                    ds.push_back(std::move(d32));
                 }
-                // All 3 w2 buckets (128, 64, sm) write disjoint rows of YE -> run 100% CONCURRENTLY!
-                if (TM_sm >= 32) {
+                {
+                    mtl::Dispatch d16;
+                    d16.barrier = false;
+                    d16.p = &p_mpp_moe_gu_dir[gu_ci][0]; d16.ind_off = 16 * sizeof(uint32_t); d16.tg[0] = 128; d16.indirect = &b_mpp_meta;
+                    d16.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_16)};
+                    ds.push_back(std::move(d16));
+                }
+                // All 4 w2 buckets (128, 64, 32, 16) write disjoint rows of YE -> run 100% CONCURRENTLY!
+                if (allow_128) {
                     mtl::Dispatch d128;
                     d128.p = &p_mpp_moe_dn_dir[dn_ci][3]; d128.ind_off = 7 * sizeof(uint32_t); d128.tg[0] = 128; d128.indirect = &b_mpp_meta;
                     d128.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
@@ -1468,19 +1495,27 @@ struct InkMetalRunner {
                 }
                 {
                     mtl::Dispatch d64;
-                    d64.barrier = (TM_sm < 32);
+                    d64.barrier = !allow_128;
                     d64.p = &p_mpp_moe_dn_dir[dn_ci][2]; d64.ind_off = 10 * sizeof(uint32_t); d64.tg[0] = 128; d64.indirect = &b_mpp_meta;
                     d64.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
                                 mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_64)};
                     ds.push_back(std::move(d64));
                 }
                 {
-                    mtl::Dispatch dsm;
-                    dsm.barrier = false;
-                    dsm.p = &p_mpp_moe_dn_dir[dn_ci][sm_bi]; dsm.ind_off = 13 * sizeof(uint32_t); dsm.tg[0] = 128; dsm.indirect = &b_mpp_meta;
-                    dsm.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
-                                mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_sm)};
-                    ds.push_back(std::move(dsm));
+                    mtl::Dispatch d32;
+                    d32.barrier = false;
+                    d32.p = &p_mpp_moe_dn_dir[dn_ci][1]; d32.ind_off = 13 * sizeof(uint32_t); d32.tg[0] = 128; d32.indirect = &b_mpp_meta;
+                    d32.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_32)};
+                    ds.push_back(std::move(d32));
+                }
+                {
+                    mtl::Dispatch d16;
+                    d16.barrier = false;
+                    d16.p = &p_mpp_moe_dn_dir[dn_ci][0]; d16.ind_off = 16 * sizeof(uint32_t); d16.tg[0] = 128; d16.indirect = &b_mpp_meta;
+                    d16.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_16)};
+                    ds.push_back(std::move(d16));
                 }
                 {
                     mtl::Dispatch dc;
@@ -1548,16 +1583,18 @@ struct InkMetalRunner {
                         ds.push_back(std::move(d));
                     }
                 } else {
-                    // Homogeneous layers use lean specialized zero-idle-lane kernels; mixed layers use single dispatch to avoid 3x TG launch overhead!
+                    // Homogeneous layers use lean specialized kernels; SQ-10 mixed {S2,S3,SF4} uses ultra-lean sk23 (branchless 16-lane w2 + 3.25KB LUTs)!
+                    constexpr uint32_t kSk23Mask = (1u << 2) | (1u << 3) | (1u << 15);
                     {
                         mtl::Dispatch d;
-                        if (layer_homog_gu[ip] == 15)      { d.p = &p_moe_gu_sf4; d.ind_off = 5 * sizeof(uint32_t); }
-                        else if (layer_homog_gu[ip] == 16) { d.p = &p_moe_gu_mx8; d.ind_off = 2 * sizeof(uint32_t); }
-                        else if (layer_homog_gu[ip] == 2)  { d.p = &p_moe_gu_sk2; d.ind_off = 2 * sizeof(uint32_t); }
-                        else if (layer_homog_gu[ip] == 3)  { d.p = &p_moe_gu_sk3; d.ind_off = 2 * sizeof(uint32_t); }
-                        else if (layer_homog_gu[ip] == 4)  { d.p = &p_moe_gu_sk4; d.ind_off = 2 * sizeof(uint32_t); }
-                        else if (layer_homog_gu[ip] == 5)  { d.p = &p_moe_gu_sk5; d.ind_off = 2 * sizeof(uint32_t); }
-                        else                               { d.p = &p_moe_gu;     d.ind_off = 2 * sizeof(uint32_t); }
+                        if (layer_homog_gu[ip] == 15)      { d.p = &p_moe_gu_sf4;  d.ind_off = 5 * sizeof(uint32_t); }
+                        else if (layer_homog_gu[ip] == 16) { d.p = &p_moe_gu_mx8;  d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_gu[ip] == 2)  { d.p = &p_moe_gu_sk2;  d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_gu[ip] == 3)  { d.p = &p_moe_gu_sk3;  d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_gu[ip] == 4)  { d.p = &p_moe_gu_sk4;  d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_gu[ip] == 5)  { d.p = &p_moe_gu_sk5;  d.ind_off = 2 * sizeof(uint32_t); }
+                        else if ((layer_gu_mask[ip] & ~kSk23Mask) == 0) { d.p = &p_moe_gu_sk23; d.ind_off = 2 * sizeof(uint32_t); }
+                        else                               { d.p = &p_moe_gu;      d.ind_off = 2 * sizeof(uint32_t); }
                         d.tg[0] = 256; d.indirect = &b_moe_meta;
                         d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_mlp_in),
                                   mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
@@ -1566,13 +1603,14 @@ struct InkMetalRunner {
                     }
                     {
                         mtl::Dispatch d;
-                        if (layer_homog_dn[ip] == 15)      { d.p = &p_moe_dn_sf4; d.ind_off = 11 * sizeof(uint32_t); }
-                        else if (layer_homog_dn[ip] == 16) { d.p = &p_moe_dn_mx8; d.ind_off = 5 * sizeof(uint32_t); }
-                        else if (layer_homog_dn[ip] == 2)  { d.p = &p_moe_dn_sk2; d.ind_off = 2 * sizeof(uint32_t); }
-                        else if (layer_homog_dn[ip] == 3)  { d.p = &p_moe_dn_sk3; d.ind_off = 2 * sizeof(uint32_t); }
-                        else if (layer_homog_dn[ip] == 4)  { d.p = &p_moe_dn_sk4; d.ind_off = 2 * sizeof(uint32_t); }
-                        else if (layer_homog_dn[ip] == 5)  { d.p = &p_moe_dn_sk5; d.ind_off = 2 * sizeof(uint32_t); }
-                        else                               { d.p = &p_moe_dn;     d.ind_off = 2 * sizeof(uint32_t); }
+                        if (layer_homog_dn[ip] == 15)      { d.p = &p_moe_dn_sf4;  d.ind_off = 11 * sizeof(uint32_t); }
+                        else if (layer_homog_dn[ip] == 16) { d.p = &p_moe_dn_mx8;  d.ind_off = 5 * sizeof(uint32_t); }
+                        else if (layer_homog_dn[ip] == 2)  { d.p = &p_moe_dn_sk2;  d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_dn[ip] == 3)  { d.p = &p_moe_dn_sk3;  d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_dn[ip] == 4)  { d.p = &p_moe_dn_sk4;  d.ind_off = 2 * sizeof(uint32_t); }
+                        else if (layer_homog_dn[ip] == 5)  { d.p = &p_moe_dn_sk5;  d.ind_off = 2 * sizeof(uint32_t); }
+                        else if ((layer_dn_mask[ip] & ~kSk23Mask) == 0) { d.p = &p_moe_dn_sk23; d.ind_off = 5 * sizeof(uint32_t); }
+                        else                               { d.p = &p_moe_dn;      d.ind_off = 2 * sizeof(uint32_t); }
                         d.tg[0] = 256; d.indirect = &b_moe_meta;
                         d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_topk_w),
                                   mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
@@ -1835,7 +1873,7 @@ struct InkMetalRunner {
                 d.args = {mtl::Arg::B(bd_cur), mod->dw(lp + ".input_layernorm.weight"), mtl::Arg::B(bd_h), mtl::Arg::V(D)};
                 ds.push_back(std::move(d));
             }
-            if (use_mpp && use_mpp_trunk_f16) {
+            if (use_mpp && use_dspark_f16) {
                 push_f32_to_f16(ds, mtl::Arg::B(bd_h), mtl::Arg::B(b_mpp_x_f16), 8 * D, true);
                 push_mpp_gemm(ds, mtl::Arg::B(w_dsp_q_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_q), 8, 3072, D, 3072, true);
                 push_mpp_gemm(ds, mtl::Arg::B(w_dsp_k_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_k), 8, 1024, D, 1024, false);
@@ -1865,7 +1903,7 @@ struct InkMetalRunner {
                            mtl::Arg::V(c.dspark_swa_win), mtl::Arg::V(max_ctx)};
                 ds.push_back(std::move(da));
             }
-            if (use_mpp && use_mpp_trunk_f16) {
+            if (use_mpp && use_dspark_f16) {
                 push_f32_to_f16(ds, mtl::Arg::B(bd_ao), mtl::Arg::B(b_mpp_x_f16), 8 * 3072, true);
                 push_mpp_gemm(ds, mtl::Arg::B(w_dsp_o_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_proj), 8, D, 3072, D, true);
             } else {
@@ -1884,7 +1922,7 @@ struct InkMetalRunner {
                 d.args = {mtl::Arg::B(bd_cur), mod->dw(lp + ".post_attention_layernorm.weight"), mtl::Arg::B(bd_h), mtl::Arg::V(D)};
                 ds.push_back(std::move(d));
             }
-            if (use_mpp && use_mpp_trunk_f16) {
+            if (use_mpp && use_dspark_f16) {
                 push_f32_to_f16(ds, mtl::Arg::B(bd_h), mtl::Arg::B(b_mpp_x_f16), 8 * D, true);
                 push_mpp_gemm(ds, mtl::Arg::B(w_dsp_g_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_mg), 8, 9216, D, 9216, true);
                 push_mpp_gemm(ds, mtl::Arg::B(w_dsp_u_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_mu), 8, 9216, D, 9216, false);
@@ -1898,7 +1936,7 @@ struct InkMetalRunner {
                 d.args = {mtl::Arg::B(bd_mg), mtl::Arg::B(bd_mu), mtl::Arg::B(bd_mh), mtl::Arg::V(n8i)};
                 ds.push_back(std::move(d));
             }
-            if (use_mpp && use_mpp_trunk_f16) {
+            if (use_mpp && use_dspark_f16) {
                 push_f32_to_f16(ds, mtl::Arg::B(bd_mh), mtl::Arg::B(b_mpp_x_f16), 8 * 9216, true);
                 push_mpp_gemm(ds, mtl::Arg::B(w_dsp_d_f16[il]), mtl::Arg::B(b_mpp_x_f16), mtl::Arg::B(bd_proj), 8, D, 9216, D, true);
             } else {
@@ -1926,11 +1964,11 @@ struct InkMetalRunner {
         if (use_dspark_meff) {
             {
                 mtl::Dispatch db;
-                db.p = &p_dsp_add_bias7; db.grid[0] = 7; db.tg[0] = 256;
+                db.p = &p_dsp_add_bias7; db.grid[0] = (uint32_t)n_steps; db.tg[0] = 256;
                 db.args = {mtl::Arg::B(bd_cur), mod->dw("dspark.markov_head.hidden_out.bias"), mtl::Arg::B(bd_h)};
                 ds.push_back(std::move(db));
             }
-            push_trunk_linear(ds, "model.llm.unembed.weight", mtl::Arg::B(bd_h), mtl::Arg::B(b_logits), 7, c.vocab_unpadded);
+            push_trunk_linear(ds, "model.llm.unembed.weight", mtl::Arg::B(bd_h), mtl::Arg::B(b_logits), n_steps, c.vocab_unpadded);
         }
         const int V = c.vocab_unpadded;
         const int nparts_meff = (V + 31) / 32;

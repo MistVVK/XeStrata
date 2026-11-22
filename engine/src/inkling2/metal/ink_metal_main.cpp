@@ -161,11 +161,13 @@ static bool run_greedy_decode(
     out_ids.push_back(next_tok);
     int cur_pos = P;
 
-    // 2. Decode loop (adaptive DSpark draft length 3..7 maximizes tok/s across code, math & chat!)
+    // 2. Decode loop (adaptive DSpark draft length: 3..7 on M5 Apple10, 2..5 on M1-M4 bandwidth-bound GPUs!)
     double td0 = mtl::now_s();
     InkMetalRunner::SlotSconvSnap snap;
     std::vector<float> frnn_backup;
-    int cur_k = 5;
+    const int min_k = r.is_apple10 ? 3 : 2;
+    const int max_k = r.is_apple10 ? 7 : 6;
+    int cur_k = r.is_apple10 ? 5 : 4;
 
     while ((int)out_ids.size() < max_new && cur_pos + 1 < r.max_ctx) {
         if (next_tok == r.mod->man.c.eos_id) break;
@@ -238,7 +240,7 @@ static bool run_greedy_decode(
             if (accepted < rem) {
                 r.restore_verify_step(slot, accepted);
             }
-            cur_k = (accepted >= cur_k) ? std::min(7, cur_k + 1) : std::max(3, std::min(7, accepted + 1));
+            cur_k = (accepted >= cur_k) ? std::min(max_k, cur_k + 1) : std::max(min_k, std::min(max_k, accepted + 1));
             cur_pos += (1 + accepted);
         }
     }
