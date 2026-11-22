@@ -193,12 +193,12 @@ if [ -n "$model_path" ]; then
   # a folder that is not mounted (or a typo) must not end as "missing /xxx.gguf" after a minute of setup, and must never turn into a download
   if [ ! -e "$model_path" ]; then
     die "MODEL_PATH=$model_path is not in the container, so no model file can be found there. Mount your folder at that place, for example: -v /srv/gguf/IQ3_XXS:$model_path:ro (docs/DOCKER.md, \"Files you already have\"). Nothing was downloaded." 2
-  elif [ -d "$model_path" ] && ! ls "$model_path"/*.gguf >/dev/null 2>&1; then
-    sub=$(find "$model_path" -maxdepth 2 -name '*.gguf' 2>/dev/null | head -1)
+  elif [ -d "$model_path" ] && ! ls "$model_path"/*.gguf "$model_path"/*.strata >/dev/null 2>&1; then
+    sub=$(find "$model_path" -maxdepth 2 \( -name '*.gguf' -o -name '*.strata' \) 2>/dev/null | head -1)
     if [ -n "$sub" ]; then
-      die "MODEL_PATH=$model_path has no .gguf files directly in it, but there are some in ${sub%/*}. Set MODEL_PATH=${sub%/*} (the folder that holds the shards of one model). Nothing was downloaded." 2
+      die "MODEL_PATH=$model_path has no .gguf or .strata files directly in it, but there are some in ${sub%/*}. Set MODEL_PATH=${sub%/*} (the folder that holds the shards of one model). Nothing was downloaded." 2
     fi
-    die "MODEL_PATH=$model_path holds no .gguf files. Mount the folder with the model's shards (the -0000N-of-0000M.gguf files). Nothing was downloaded." 2
+    die "MODEL_PATH=$model_path holds no .gguf or .strata files. Mount the folder with the model's files (.gguf or .strata). Nothing was downloaded." 2
   fi
 fi
 legacy_models_guard "$model_path" "${STRATA_LEGACY_MODELS:-/data/models}"

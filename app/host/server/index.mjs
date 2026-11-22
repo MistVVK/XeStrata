@@ -1109,8 +1109,8 @@ async function api(req, res, path, method, url) {
    const file=join(folder,`strata-diagnostics-${new Date().toISOString().replace(/[:.]/g,'-').slice(0,19)}.txt`);writeFileSync(file,lines.join(NL),'utf8');
    return json(res,200,{path:file});}
   if(path==='/api/native/local/preview'&&method==='POST'){
-   /* "Use a local GGUF": pick (or type) the folder, and Control says what is in it. Nothing is copied or changed. */
-   const typed=await typedFolder((await readBody(req)).path,{isAbsolute,fileType:/\.gguf$/i});
+   /* "Use a local GGUF": pick (or type) the folder or file (.gguf / .strata), and Control says what is in it. Nothing is copied or changed. */
+   const typed=await typedFolder((await readBody(req)).path,{isAbsolute,fileType:/\.(gguf|strata)$/i});
    const picked=typed?{path:typed}:await chooseFolder('Choose the folder that holds your GGUF files');
    if(picked.unavailable){const u=chooserUnavailable(picked);return error(res,501,u.message,{code:u.code});};
    if(picked.cancelled)return json(res,200,{cancelled:true});
@@ -1381,10 +1381,16 @@ async function api(req, res, path, method, url) {
     const engine = control ? await control.engine().catch(e => ({ usable: false, notice: e.message })) : null;
     // the first start copies the engine that came with the app (about a minute): say so instead of "no engine"
     if (engine && !engine.usable && !bundledEngineSettled) engine.notice = 'The engine that came with the app is being set up. This takes a minute the first time.';
+    const shapeEngines = Array.isArray(engine?.shapes)
+      ? engine.shapes.map(s => ({ shape: s.shape, component: s.component, usable: s.usable === true, version: s.engine?.version ?? null, backend: s.engine?.backend ?? null }))
+      : [];
+    const anyUsableEngine = Boolean(engine?.usable) || shapeEngines.some(s => s.usable);
     return json(res, 200, {
       packaged: process.env.STRATA_PACKAGED === '1',
       control: control ? { dir: control.control.dir, python: control.control.python, version: control.version, bundle: control.control.bundle } : null,   // control.control: the Control in use now (a first-run update can switch it)
       engine,
+      shapeEngines,
+      anyUsableEngine,
       engineSetup: !bundledEngineSettled,
       componentsDir: componentsDirectory(),
       acquisition: { forbidden: acquisitionForbidden(), env: process.env.STRATA_NO_ACQUIRE ?? null },

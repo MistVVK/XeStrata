@@ -16,7 +16,8 @@ import re
 from pathlib import Path
 
 SHARD = re.compile(r"^(?P<stem>.+)-(?P<i>\d{5})-of-(?P<n>\d{5})\.gguf$")
-FAMILIES = ("qwen", "swift", "coder", "gyro", "unsloth")      # the catalog offers Gyro-S / Gyro-M on an Arc card too (round 8, N11); Unsloth's sets since round 0214 (ENG-AMD: UD-IQ1_M ran on an Arc A750)
+FAMILIES = ("qwen", "swift", "coder", "gyro", "unsloth", "inkling-2-mini")      # the catalog offers Gyro-S / Gyro-M on an Arc card too (round 8, N11); Unsloth's sets since round 0214; Inkling-2-Mini local .gguf/.strata since 0.2.20
+_INKLING_AUX = re.compile(r"^(?:mmproj|dspark|imatrix|mtp[-_]).*\.gguf$", re.I)
 UNSUPPORTED = ("no nvidia gpu found", "no amd gpu", "nvidia gpu", "not supported", "cannot be used")
 
 
@@ -60,9 +61,22 @@ def find_single(folder: Path) -> list[Path]:
 
 
 def model_files(folder: Path, family: str, family_def: dict | None = None) -> list[Path]:
-    """The model files plan() runs: Gyro's one file; a GGUF set's shards; a feed model's shards, or its one file when it is a single GGUF."""
+    """The model files plan() runs: Gyro's one file; a GGUF set's shards; Inkling-2-Mini's .gguf or .strata; a feed model's shards or single GGUF."""
     if family == "gyro":
         return find_single(folder)
+    if family == "inkling-2-mini":
+        target = Path(folder)
+        if target.is_file() and target.suffix.lower() in (".gguf", ".strata"):
+            return [target]
+        shards = find_shards(target)
+        if shards:
+            return shards
+        ggufs = [p for p in sorted(target.glob("*.gguf")) if p.is_file() and not _INKLING_AUX.match(p.name)]
+        if len(ggufs) == 1:
+            return ggufs
+        stratas = [p for p in sorted(target.glob("*.strata"))
+                   if p.is_file() and "vision" not in p.name.lower() and "engram" not in p.name.lower()]
+        return stratas[:1] if len(stratas) == 1 else []
     return find_shards(folder) or (find_single(folder) if (family_def or {}).get("feed") else [])
 
 
@@ -71,6 +85,39 @@ def plan(*, family: str, model: str, model_dir: Path, data_dir: Path, src: Path,
     """(config, problems): the config to write, or None with plain-words problems (what is missing). `pack_name`: the pack folder under
     packs/ (default the model's name in lower case; Gyro's is its tag, gyro-gyro-s)."""
     problems: list[str] = []
+    if family == "inkling-2-mini":
+        from strata_control import inkling_family
+        shards = model_files(model_dir, family, family_def)
+        if not shards:
+            return None, [f"the Inkling-2-Mini .gguf or .strata file is not in {model_dir}"]
+        native = shards[0]
+        folder = native.parent
+        is_gguf = native.suffix.lower() == ".gguf"
+        tag = (pack_name or (inkling_family.TAG + model)).lower()
+        tokenizer = Path(data_dir) / "packs" / tag / "tokenizer"
+        if not (tokenizer / "vocab.json").is_file():
+            problems.append(f"the tokenizer {tokenizer} is missing")
+        if problems:
+            return None, problems
+        args = ["--native", str(native), "--max-context", str(context)]
+        vision = next((c for c in (folder / inkling_family.VISION_FILE,
+                                   Path(data_dir) / "models" / inkling_family.FAMILY / inkling_family.VISION_FILE)
+                       if c.is_file()), None)
+        if vision is None and is_gguf:
+            mmprojs = sorted(p for p in folder.glob("mmproj*.gguf") if p.is_file())
+            vision = mmprojs[0] if mmprojs else None
+        if vision is not None:
+            args += ["--vision", str(vision)]
+        dspark = next((p for p in sorted(folder.glob("dspark*.gguf")) if p.is_file()), None) if is_gguf else None
+        if dspark is not None:
+            args += ["--dspark", str(dspark)]
+        cfg = {"exe": f"component:{inkling_family.COMPONENT}", "args": args, "cwd": str(src), "tokenizer": str(tokenizer),
+               "model_name": model_name, "arch": inkling_family.ARCH, "log": str(log), "lib_dirs": [], "port": 8080,
+               "drafting": "off" if (is_gguf and dspark is None) else inkling_family.DEFAULT_DRAFTER,
+               "parallel": inkling_family.DEFAULT_PARALLEL}
+        if backend:
+            cfg["backend"] = backend
+        return cfg, []
     feed = bool((family_def or {}).get("feed"))     # a model of the signed feed (Qwen4 day): the Unsloth layout, its own shape's engine when it has one
     if family not in FAMILIES and not feed:
         # no full stop: the caller joins the problems with "; " and ends the sentence (a "gyro.." came out of the old text, round 8, N11)

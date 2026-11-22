@@ -59,9 +59,11 @@ def probe(exe: str | None, args: list, cfg: dict | None = None, timeout: float =
     model = next((args[i + 1] for i, a in enumerate(args) if a in ("--native", "--model") and i + 1 < len(args)), None)
     if not exe or not model or not Path(str(exe)).is_file():
         return None
+    vision = next((args[i + 1] for i, a in enumerate(args) if a == "--vision" and i + 1 < len(args)), None)
+    dspark = next((args[i + 1] for i, a in enumerate(args) if a == "--dspark" and i + 1 < len(args)), None)
     try:
         st = Path(str(exe)).stat()
-        key = (str(exe), st.st_mtime_ns, st.st_size, str(model))
+        key = (str(exe), st.st_mtime_ns, st.st_size, str(model), str(vision or ""), str(dspark or ""))
     except OSError:
         return None
     if key in _PROBES:
@@ -72,8 +74,13 @@ def probe(exe: str | None, args: list, cfg: dict | None = None, timeout: float =
     if dirs:
         var = "PATH" if os.name == "nt" else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
+    cmd = [str(exe), "--info", str(model)]
+    if vision:
+        cmd += ["--vision", str(vision)]
+    if dspark:
+        cmd += ["--dspark", str(dspark)]
     try:
-        done = subprocess.run([str(exe), "--info", str(model)], capture_output=True, text=True, errors="replace",
+        done = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                               timeout=timeout, env=env, cwd=str(Path(str(exe)).parent))
         info = parse_info(done.stdout) if done.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):

@@ -9,7 +9,8 @@
 export interface OwnFilesProjector { status: string; pinned?: boolean }
 export interface OwnFilesPictures { visionPrepared?: boolean }
 
-export function ownFilesVision(projectors: OwnFilesProjector[] | undefined, visionReader: boolean | undefined, installed: OwnFilesPictures[] | undefined): 'yes' | 'no' {
+export function ownFilesVision(projectors: OwnFilesProjector[] | undefined, visionReader: boolean | undefined, installed: OwnFilesPictures[] | undefined, family?: string): 'yes' | 'no' {
+  if (family === 'inkling-2-mini') return (projectors ?? []).some(p => p.status === 'ok') ? 'yes' : 'no';
   if (!visionReader) return 'no';
   if ((projectors ?? []).some(p => (p.status === 'ok' && p.pinned) || p.status === 'other_name')) return 'yes';
   return (installed ?? []).some(m => m.visionPrepared === true) ? 'yes' : 'no';

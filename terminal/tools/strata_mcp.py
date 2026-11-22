@@ -2577,8 +2577,11 @@ class Tools:
             md = {**md, "download_gb": round(sum(hy4_family.size_of(n) / 1e9 for n in hy4_family.files_of(model, vision != "no") if n not in have_files), 1)}
         elif md.get("inkling"):
             from strata_control import inkling_family
-            have_files = inkling_family.local_files(target / "models" / inkling_family.FAMILY)
-            md = {**md, "download_gb": round(sum(inkling_family.size_of(n) / 1e9 for n in inkling_family.files_of(model, vision != "no") if n not in have_files), 1)}
+            if gguf_dir:
+                md = {**md, "download_gb": 0.0}
+            else:
+                have_files = inkling_family.local_files(target / "models" / inkling_family.FAMILY)
+                md = {**md, "download_gb": round(sum(inkling_family.size_of(n) / 1e9 for n in inkling_family.files_of(model, vision != "no") if n not in have_files), 1)}
         partly = (have_dir.is_dir() and any(have_dir.glob("*.gguf*"))) or bool(gguf_dir) \
             or (ready_dir is not None and ready_dir.is_dir() and any(ready_dir.glob("*.gguf*")))   # a local folder: nothing to download
         repack_gb = 0 if (md.get("hy4") or md.get("inkling")) else (s.mac().repacked_gb(model) if mac and s.mac() else 0)
@@ -2602,8 +2605,9 @@ class Tools:
                 args += [flag, str(v)]
         if gguf_dir:
             local = Path(os.path.expandvars(gguf_dir)).expanduser()
-            if not local.is_absolute() or not local.is_dir() or ".." in local.parts:
-                raise ToolError("gguf_dir must be an existing absolute folder")
+            is_model_file = local.is_file() and local.suffix.lower() in (".gguf", ".strata")
+            if not local.is_absolute() or (not local.is_dir() and not is_model_file) or ".." in local.parts:
+                raise ToolError("gguf_dir must be an existing absolute folder or .gguf/.strata file")
             args += ["--gguf-dir", str(local)]
         if backend in ("cuda", "hip", "sycl"):
             args += ["--backend", backend]

@@ -75,9 +75,9 @@ test('the engine card comes back while setup is dismissed but not complete, and 
   assert.doesNotMatch(setup.slice(setup.indexOf('if (!engineStepDone')), /dismissed/, 'the card does not look at "dismissed"');
   const warning = src('src/components/EngineWarning.tsx');
   assert.match(warning, /onSetup \? <p><Btn size="sm" onClick=\{onSetup\}>\{tr\("Run guided setup"\)\}<\/Btn><\/p> : null/);
-  assert.match(src('src/components/NativeModels.tsx'), /<EngineWarning native=\{native\} onSetup=\{\(\) => go\('setup'\)\}\/>/);
+  assert.match(src('src/components/NativeModels.tsx'), /<EngineWarning native=\{native\}(?: family=\{selectedFamily\?\.family\})? onSetup=\{\(\) => go\('setup'\)\}\/>/);
   // the first-run card reads Control's local answer, so the card shows again after a restart while no engine is installed
-  assert.match(src('src/components/EngineFirstRun.tsx'), /setNeeded\(!!s\.engine && s\.engine\.usable === false\)/);
+  assert.match(src('src/components/EngineFirstRun.tsx'), /return !!s\.engine && s\.engine\.usable === false;/);
 });
 
 test('the two sentences are in the guic catalog in all ten languages', () => {
