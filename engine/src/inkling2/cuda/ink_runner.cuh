@@ -334,7 +334,11 @@ struct InkCudaModel {
         // Tight on-demand VRAM reserve: lets SQ-10 fit 100% in 12 GB RTX 5070 (even under Win11 WDDM!) and SQ-15 in 16 GB RTX 5070 Ti,
         // while keeping full headroom for FP8 KV + workspaces + DSpark + CUDA Graph (spilling cleanly to Hybrid on 11 GB GPUs)!
         const size_t base_reserve = (vtot >= (20ull << 30)) ? (1600ull << 20)
+#ifdef _WIN32
                                   : (vtot <= (13ull << 30)) ? (780ull << 20)
+#else
+                                  : (vtot <= (13ull << 30)) ? (1024ull << 20)
+#endif
                                                             : (1280ull << 20);
         const size_t reserve = std::max(base_reserve, extra_reserve_bytes);
         const size_t user_vram_cap = (vram_experts_gb >= 0.0)
@@ -366,12 +370,25 @@ struct InkCudaModel {
             if ((int)vorder.size() == n_total) {
                 order = vorder;
             } else {
-                order.resize(n_total);
-                for (int i = 0; i < n_total; ++i) order[i] = (uint16_t)i;
+                // Guarantee 3x looped core layers (core_start..core_end-1) are ALWAYS prioritized before 1x prelude/coda!
+                order.reserve(n_total);
+                for (int il = man.c.core_start; il < man.c.core_end; ++il)
+                    for (int r = 0; r < man.c.n_experts; ++r) order.push_back((uint16_t)(il * man.c.n_experts + r));
+                for (int il = 0; il < man.c.core_start; ++il)
+                    for (int r = 0; r < man.c.n_experts; ++r) order.push_back((uint16_t)(il * man.c.n_experts + r));
+                for (int il = man.c.core_end; il < man.c.n_phys; ++il)
+                    for (int r = 0; r < man.c.n_experts; ++r) order.push_back((uint16_t)(il * man.c.n_experts + r));
             }
-            // Reserve full headroom (1.66 GiB for runner+DSpark+cuBLAS+Graph + 256 MiB for ping-pong DMA + promo ring)!
-            const size_t hyb_post_res = std::max(reserve, (size_t)(1664ull << 20));
-            const size_t hyb_reserve = hyb_post_res + (256ull << 20);
+            // Tight VRAM reserve tailored to 8 GB / 10-12 GB / 16+ GB cards so ALL 12 looped 3x core layers fit in VRAM on 8 GB SQ-10 & 12 GB SQ-15
+            // while leaving enough headroom (~1.08 GiB) for FP8 KV + activations + DSpark + cuBLAS with ZERO OOMs!
+            const size_t hyb_post_floor = (vtot <= (10ull << 30)) ? (1080ull << 20)
+                                        : (vtot <= (14ull << 30)) ? (1120ull << 20)
+                                                                  : (1664ull << 20);
+            // 256 MiB staging+promo budget = 2x64 MiB ping-pong DMA (1-chunk SQ-15!) + ~120 MiB FREE 1.4us D2D dynamic hot-expert ring (~30-45 slots)!
+            const size_t stage_res      = (vtot <= (14ull << 30)) ? (256ull << 20)
+                                                                  : (256ull << 20);
+            const size_t hyb_post_res = std::max(reserve, hyb_post_floor);
+            const size_t hyb_reserve = hyb_post_res + stage_res;
             size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
             if (user_vram_cap < vram_budget) vram_budget = user_vram_cap;
             const size_t ram_cap = (ram_experts_gb >= 0.0)
@@ -494,7 +511,7 @@ struct InkCudaModel {
                 size_t vf_now = 0, vt_now = 0;
                 INK_CK(ink_cuda_mem_info(&vf_now, &vt_now));
                 const size_t avail = (vf_now > hyb_post_res) ? (vf_now - hyb_post_res) : 0;
-                hybrid.alloc_staging(max_exp_bytes, avail);
+                hybrid.alloc_staging(max_exp_bytes, avail, vt_now);
                 if (hybrid.cold_store) {
                     std::vector<int> idle_keys;
                     for (uint16_t di : order) {
@@ -857,11 +874,20 @@ struct InkCudaModel {
             eff_bytes[di] = need_sf4_repack[di] ? sf4_body_const : (size_t)e.body_bytes;
         }
 
-        // Build 3x loop-weighted load order
+        // Build 3x loop-weighted load order (prioritize 3x looped core layers before 1x prelude/coda even for GGUF!)
         const auto& vorder = mf.vram_load_order;
         std::vector<uint16_t> order;
-        if ((int)vorder.size() == n_total) order = vorder;
-        else { order.resize(n_total); for (int i = 0; i < n_total; ++i) order[i] = (uint16_t)i; }
+        if ((int)vorder.size() == n_total) {
+            order = vorder;
+        } else {
+            order.reserve(n_total);
+            for (int il = man.c.core_start; il < man.c.core_end; ++il)
+                for (int r = 0; r < man.c.n_experts; ++r) order.push_back((uint16_t)(il * man.c.n_experts + r));
+            for (int il = 0; il < man.c.core_start; ++il)
+                for (int r = 0; r < man.c.n_experts; ++r) order.push_back((uint16_t)(il * man.c.n_experts + r));
+            for (int il = man.c.core_end; il < man.c.n_phys; ++il)
+                for (int r = 0; r < man.c.n_experts; ++r) order.push_back((uint16_t)(il * man.c.n_experts + r));
+        }
 
         // Assign each expert to GPU0 (0), GPU1 (1), or Host hybrid (2)
         // For ep2: balance each layer's 128 experts across GPU0 and GPU1 using ep_split (GPU1 target share).
@@ -891,7 +917,9 @@ struct InkCudaModel {
             ? static_cast<size_t>(vram_experts_gb * 1073741824.0)
             : static_cast<size_t>(-1);
         const bool all_fit_gpu = !ssd_experts && (need0_ideal <= std::min(bud0, user_vram_cap) && need1_ideal <= std::min(bud1, user_vram_cap));
-        const size_t hyb_post_res = std::max(res0, (size_t)(1664ull << 20));
+        const size_t hyb_post_floor0 = (vt0 <= (10ull << 30)) ? (1080ull << 20)
+                                     : (vt0 <= (14ull << 30)) ? (1120ull << 20) : (1664ull << 20);
+        const size_t hyb_post_res = std::max(res0, hyb_post_floor0);
         const size_t hyb_bud0 = (vf0 > hyb_post_res + (256ull << 20)) ? (vf0 - hyb_post_res - (256ull << 20)) : 0;
         const size_t cap0 = std::min(all_fit_gpu ? bud0 : hyb_bud0, user_vram_cap);
         if (user_vram_cap < bud1) bud1 = user_vram_cap;
@@ -1103,7 +1131,7 @@ struct InkCudaModel {
             size_t vf_now = 0, vt_now = 0;
             INK_CK(ink_cuda_mem_info(&vf_now, &vt_now, primary_gpu));
             const size_t avail = (vf_now > hyb_post_res) ? (vf_now - hyb_post_res) : 0;
-            hybrid.alloc_staging(max_exp_b, avail);
+            hybrid.alloc_staging(max_exp_b, avail, vt_now);
         }
         double t_exp = now_s() - t1;
 
@@ -1365,17 +1393,23 @@ struct InkCudaRunner {
             INK_CK(ink_cuda_mem_info(&vfree, &vtot));
             tree_cap = (max_slots <= 4 && vfree > (700ull << 20)) ? kInkMaxTree : 16;
             max_batch = std::max(max_batch, tree_cap);
-            // On tight 12 GB GPUs (especially Win11 WDDM), cap max_batch to 512 so workspaces never trigger host paging!
-            if (vfree < (2200ull << 20) && max_batch > 512) {
-                max_batch = 512;
+            // On tight 8-12 GB GPUs (especially Win11 WDDM), cap max_batch so workspaces & SWA rings leave maximum VRAM for 3x-looped experts & KV without WDDM spill!
+            const int batch_cap = (vtot <= (10ull << 30) || vfree < (1800ull << 20)) ? 256 : 512;
+            if ((vtot <= (10ull << 30) || vfree < (2200ull << 20)) && max_batch > batch_cap) {
+                max_batch = batch_cap;
                 swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
             }
             const size_t bpe = (kv_dtype == InkKvDtype::FP8) ? 2 : 4;  // K+V bytes per element
             const size_t sc_per_pos = (kv_dtype == InkKvDtype::FP8) ? (size_t)(2 * kInkKVHeads * 4) : 0;
             const size_t swa_kv_bytes = (size_t)40 * max_slots * swa_ring * ((size_t)kInkKVDim * bpe + sc_per_pos);
             const size_t sconv_bytes  = (size_t)kInkVisits * max_slots * 3 * kInkSconvCh * 4;
-            const size_t ws_reserve   = ((max_slots >= 8) ? (1536ull << 20) : (1024ull << 20))
-                                      + (m.man.has_dspark ? (384ull << 20) : 0ull);  // activation workspaces + moe_ws + DSpark + cuBLAS headroom
+            const size_t ws_reserve   = (max_slots >= 8) ? (1536ull << 20)
+#ifdef _WIN32
+                                      : (vtot <= (13ull << 30)) ? ((max_slots == 1) ? (580ull << 20) : (340ull << 20))
+#else
+                                      : (vtot <= (13ull << 30)) ? ((max_slots == 1) ? (780ull << 20) : (260ull << 20))
+#endif
+                                      : ((1024ull << 20) + (m.man.has_dspark ? (384ull << 20) : 0ull));
             if (vfree > swa_kv_bytes + sconv_bytes + ws_reserve) {
                 const size_t avail_glob = vfree - swa_kv_bytes - sconv_bytes - ws_reserve;
                 const size_t per_pos_glob = (size_t)8 * max_slots * ((size_t)kInkKVDim * bpe + sc_per_pos);
@@ -2253,8 +2287,9 @@ struct InkCudaRunner {
             prof_mark_end(5); prof_mark_start();
             run_sconv_uniform(d_moe_raw, m.d_sconv_mlp[ip], nullptr, d_cur, kInkHidden, 2 * kInkKVDim + kInkHidden, 0, true);
         } else if (m.layer_has_host[ip] && m.hybrid.active) {
+            const int next_ip = (visit + 1 < kInkVisits) ? ink_visit_phys(visit + 1) : -1;
             launch_ink_moe_hybrid(
-                st, cublas, m.d_sec4, m.d_experts[ip], m.moe_info[ip], ip, m.hybrid,
+                st, cublas, m.d_sec4, m.d_experts, m.moe_info[ip], ip, next_ip, m.hybrid,
                 (const float*)m.trunk_ptr(p + ".mlp.gate.weight"),
                 (const float*)m.trunk_ptr(p + ".mlp.gate.bias"),
                 d_moe_in, d_moe_raw, M, moe_ws, m.man.c.route_scale, (mode == 2));
@@ -2447,6 +2482,7 @@ struct InkCudaRunner {
             return;
         }
         emit_48_visits(M, 2, slot0, p0, want_taps);
+        if (m.hybrid.active && m.n_host_experts > 0) m.hybrid.decay_verify_counts();
     }
 
     // Batched multi-slot 1-token-per-slot step (B = 1..64 concurrent requests, captured in CUDA Graph when 100% VRAM!)

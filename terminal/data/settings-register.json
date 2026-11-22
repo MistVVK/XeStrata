@@ -4112,7 +4112,7 @@
     },
     {
      "file": "engine/src/hy4flash/run/hy4_graph.hip.h",
-     "line": 1529,
+     "line": 1562,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4596,7 +4596,7 @@
    "reads": [
     {
      "file": "engine/src/inkling2/cuda/ink_runner.cuh",
-     "line": 596,
+     "line": 613,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4624,7 +4624,7 @@
    "reads": [
     {
      "file": "engine/src/inkling2/cuda/ink_runner.cuh",
-     "line": 594,
+     "line": 611,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -14239,7 +14239,7 @@
    "reads": [
     {
      "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
-     "line": 629,
+     "line": 631,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -14272,7 +14272,7 @@
    "reads": [
     {
      "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
-     "line": 636,
+     "line": 638,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -14535,13 +14535,13 @@
    "reads": [
     {
      "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
-     "line": 1428,
+     "line": 1430,
      "backend": "hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
-     "line": 1428,
+     "line": 1430,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -14660,7 +14660,7 @@
    "reads": [
     {
      "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
-     "line": 642,
+     "line": 644,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -14693,13 +14693,13 @@
    "reads": [
     {
      "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
-     "line": 3028,
+     "line": 3030,
      "backend": "hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
-     "line": 3028,
+     "line": 3030,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -14956,25 +14956,25 @@
    "reads": [
     {
      "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
-     "line": 1683,
+     "line": 1685,
      "backend": "hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
-     "line": 1683,
+     "line": 1685,
      "backend": "hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
-     "line": 4441,
+     "line": 4443,
      "backend": "hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/inkling2/hip/ink_hip_backend.hip.cpp",
-     "line": 4441,
+     "line": 4443,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -15303,7 +15303,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_gpu_model.hip.h",
-     "line": 755,
+     "line": 772,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -15345,7 +15345,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_graph.hip.h",
-     "line": 1537,
+     "line": 1570,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -15378,7 +15378,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_gpu_model.hip.h",
-     "line": 1202,
+     "line": 1225,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -16158,7 +16158,7 @@
    "reads": [
     {
      "file": "engine/src/inkling2/cuda/ink_hybrid.cuh",
-     "line": 883,
+     "line": 1074,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -19062,7 +19062,7 @@
     },
     {
      "file": "engine/src/inkling2/cuda/ink_hybrid.cuh",
-     "line": 882,
+     "line": 1073,
      "backend": "cuda-hip",
      "fn": "getenv"
     },

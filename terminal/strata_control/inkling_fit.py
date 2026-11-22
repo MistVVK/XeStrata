@@ -121,6 +121,14 @@ def kv_cache_gb(ctx: int | None = None, parallel: int = 1, fp8_kv: bool = False)
     return round(slots * (active_ctx * per_tok + fixed), 3)
 
 
+def auto_fp8_kv(vram_gib: float | None, ctx: int | None = None, parallel: int = 1) -> bool:
+    """True when the engine auto-enables FP8/k8v8 KV cache to preserve VRAM for 3x-looped routed experts (<= 13.0 GiB discrete GPUs or >= 16 parallel slots)."""
+    if int(parallel or 1) >= 16:
+        return True
+    v = float(vram_gib or 0.0)
+    return 0.0 < v <= 13.0
+
+
 def non_expert_gb(ctx: int | None = None, parallel: int = 1, vision: bool = False, *,
                   dspark: bool = True, fp8_kv: bool = False, hybrid: bool = False) -> float:
     """Video memory kept free of expert bodies: driver/desktop + hybrid workspace + DSpark KV + KV/SWA/ShortConv (+ Vision shard)."""
@@ -145,7 +153,7 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
     v_gib = float(vram_gib or 0.0)
     vram_gb = v_gib * GIB_TO_GB
     ram_gb = float(ram_gib or 0.0) * GIB_TO_GB
-    fp8_kv = 0.0 < v_gib <= 13.0 or int(parallel or 1) >= 16
+    fp8_kv = auto_fp8_kv(vram_gib, ctx, parallel)
     extra_dspark_weights = DSPARK_GGUF_GB if (dspark and info.get("format") == "gguf") else 0.0
     dense_total = info["dense_gb"] + extra_dspark_weights
     # Check 100%-VRAM residency first (no hybrid bounce ring needed when every expert fits on GPU)
@@ -167,6 +175,7 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
         "ram_gb": round(in_ram, 2),
         "ssd_gb": round(on_ssd, 2),
         "full_vram": full_vram,
+        "kv_dtype": "fp8" if fp8_kv else "fp16",
     }
 
 

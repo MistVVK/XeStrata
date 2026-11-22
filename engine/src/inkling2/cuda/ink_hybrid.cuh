@@ -24,9 +24,11 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -626,6 +628,160 @@ inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float
     }
 }
 
+// Coalesced batch host expert evaluator for M=2..16 DSpark verification:
+// Evaluates `cnt` (1..16) tokens routed to the SAME expert in a single weight pass over DDR4/DDR5
+// (and reuses pre-quantized Q8_1 activations `xqs[c]` for S_K formats -> 2-4x less RAM traffic on duplicates!).
+inline void eval_expert_batch_h(
+    const InkHostExpertMeta& em,
+    const float* const* xs,
+    const InkQ8_1_G64* const* xqs,
+    float* const* ys,
+    int cnt) noexcept {
+    constexpr int D = kInkHidden;
+    constexpr int I = kInkInter;
+    if (cnt <= 0) return;
+    const uint8_t* body = em.body;
+    if (!body) {
+        for (int c = 0; c < cnt; ++c) std::memset(ys[c], 0, (size_t)D * sizeof(float));
+        return;
+    }
+    if (cnt == 1 && !xqs) {
+        eval_expert_f32_h(em, xs[0], ys[0]);
+        return;
+    }
+    float act[16][I];
+
+    // 1. Gate + Up + SITU(4.0, 25.0) — single pass over gate/up rows across all `cnt` tokens!
+    if (em.gu_code == FMT_SF4) {
+        float hdr[4];
+        std::memcpy(hdr, body, 16);
+        const float w_outer = hdr[0] / hdr[1];
+        const uint8_t* bp = body + 16;
+        const uint8_t* bs = bp + (size_t)(2 * I) * (D / 2);
+        for (int j = 0; j < I; ++j) {
+            const uint8_t* gp = bp + (size_t)(2 * j) * (D / 2);
+            const uint8_t* gs = bs + (size_t)(2 * j) * (D / 16);
+            const uint8_t* up = gp + (D / 2);
+            const uint8_t* us = gs + (D / 16);
+            for (int c = 0; c < cnt; ++c) {
+                const float g = dot_sf4_row_h(gp, gs, w_outer, xs[c], D);
+                const float u = dot_sf4_row_h(up, us, w_outer, xs[c], D);
+                const float sig = 1.0f / (1.0f + std::exp(-g));
+                act[c][j] = (kInkSituBeta * std::tanh(g / kInkSituBeta) * sig) * (kInkSituLb * std::tanh(u / kInkSituLb));
+            }
+        }
+    } else if (em.gu_code == FMT_MX8) {
+        const uint8_t* bp = body;
+        const uint8_t* bs = bp + (size_t)(2 * I) * D;
+        for (int j = 0; j < I; ++j) {
+            const uint8_t* gp = bp + (size_t)(2 * j) * D;
+            const uint8_t* gs = bs + (size_t)(2 * j) * (D / 32);
+            const uint8_t* up = gp + D;
+            const uint8_t* us = gs + (D / 32);
+            for (int c = 0; c < cnt; ++c) {
+                const float g = dot_mx8_row_h(gp, gs, xs[c], D);
+                const float u = dot_mx8_row_h(up, us, xs[c], D);
+                const float sig = 1.0f / (1.0f + std::exp(-g));
+                act[c][j] = (kInkSituBeta * std::tanh(g / kInkSituBeta) * sig) * (kInkSituLb * std::tanh(u / kInkSituLb));
+            }
+        }
+    } else {
+        InkQ8_1_G64 xq_local[16][D / 64];
+        const InkQ8_1_G64* xq_ptr[16];
+        for (int c = 0; c < cnt; ++c) {
+            if (xqs && xqs[c]) {
+                xq_ptr[c] = xqs[c];
+            } else {
+                quant_q8_1_h(xs[c], xq_local[c], D);
+                xq_ptr[c] = xq_local[c];
+            }
+        }
+        const int sb = ink_sb_bytes(em.gu_code);
+        const size_t row_b = 9ull * sb;
+        const uint8_t* gu_base = body + I * 2;
+        for (int j = 0; j < I; ++j) {
+            const uint8_t* gr = gu_base + (size_t)(2 * j) * row_b;
+            const uint8_t* ur = gr + row_b;
+            uint16_t sq_bits;
+            std::memcpy(&sq_bits, body + j * 2, 2);
+            const float inv_sq = 1.0f / f16_to_f32_h(sq_bits);
+            float gs_acc[16] = {}, us_acc[16] = {};
+            for (int s = 0; s < 9; ++s) {
+                const uint8_t* bg = gr + s * sb;
+                const uint8_t* bu = ur + s * sb;
+                uint16_t dg, du;
+                std::memcpy(&dg, bg, 2); std::memcpy(&du, bu, 2);
+                const float Dg = f16_to_f32_h(dg), Du = f16_to_f32_h(du);
+                for (int sg = 0; sg < 4; ++sg) {
+                    const float eg = Dg * ((float)bg[2 + sg] * (1.0f / 255.0f));
+                    const float eu = Du * ((float)bu[2 + sg] * (1.0f / 255.0f));
+                    const int gidx = s * 4 + sg;
+                    for (int c = 0; c < cnt; ++c) {
+                        gs_acc[c] += dot_sk_sub64_h(bg + 6, em.gu_code, sg, xq_ptr[c][gidx], eg);
+                        us_acc[c] += dot_sk_sub64_h(bu + 6, em.gu_code, sg, xq_ptr[c][gidx], eu);
+                    }
+                }
+            }
+            for (int c = 0; c < cnt; ++c) {
+                const float g = gs_acc[c], u = us_acc[c];
+                const float sig = 1.0f / (1.0f + std::exp(-g));
+                act[c][j] = (kInkSituBeta * std::tanh(g / kInkSituBeta) * sig) * (kInkSituLb * std::tanh(u / kInkSituLb)) * inv_sq;
+            }
+        }
+    }
+
+    // 2. Down projection [D, I] — single pass over down rows across all `cnt` tokens!
+    if (em.dn_code == FMT_SF4) {
+        float hdr[4];
+        std::memcpy(hdr, body, 16);
+        const float w_outer = hdr[2] / hdr[3];
+        const uint8_t* bp = body + em.dn_off;
+        const uint8_t* bs = bp + (size_t)D * (I / 2);
+        for (int r = 0; r < D; ++r) {
+            const uint8_t* rp = bp + (size_t)r * (I / 2);
+            const uint8_t* rs = bs + (size_t)r * (I / 16);
+            for (int c = 0; c < cnt; ++c) ys[c][r] = dot_sf4_row_h(rp, rs, w_outer, act[c], I);
+        }
+    } else if (em.dn_code == FMT_MX8) {
+        const uint8_t* bp = body + em.dn_off;
+        const uint8_t* bs = bp + (size_t)D * I;
+        for (int r = 0; r < D; ++r) {
+            const uint8_t* rp = bp + (size_t)r * I;
+            const uint8_t* rs = bs + (size_t)r * (I / 32);
+            for (int c = 0; c < cnt; ++c) ys[c][r] = dot_mx8_row_h(rp, rs, act[c], I);
+        }
+    } else {
+        InkQ8_1_G64 hq[16][I / 64];
+        for (int c = 0; c < cnt; ++c) quant_q8_1_h(act[c], hq[c], I);
+        const int sb = ink_sb_bytes(em.dn_code);
+        const size_t pair_b = 9ull * sb;
+        const uint8_t* dn_base = body + em.dn_off;
+        for (int pr = 0; pr < D / 2; ++pr) {
+            const uint8_t* blk0 = dn_base + (size_t)pr * pair_b;
+            float y0[16] = {}, y1[16] = {};
+            for (int s = 0; s < 9; ++s) {
+                const uint8_t* blk = blk0 + s * sb;
+                uint16_t d16;
+                std::memcpy(&d16, blk, 2);
+                const float Dsc = f16_to_f32_h(d16);
+                for (int sg = 0; sg < 4; ++sg) {
+                    const int sub_g = s * 4 + sg;
+                    const float eff = Dsc * ((float)blk[2 + sg] * (1.0f / 255.0f));
+                    if (sub_g < 18) {
+                        for (int c = 0; c < cnt; ++c) y0[c] += dot_sk_sub64_h(blk + 6, em.dn_code, sg, hq[c][sub_g], eff);
+                    } else {
+                        for (int c = 0; c < cnt; ++c) y1[c] += dot_sk_sub64_h(blk + 6, em.dn_code, sg, hq[c][sub_g - 18], eff);
+                    }
+                }
+            }
+            for (int c = 0; c < cnt; ++c) {
+                ys[c][2 * pr]     = y0[c];
+                ys[c][2 * pr + 1] = y1[c];
+            }
+        }
+    }
+}
+
 }  // namespace host_eval
 
 // ============================================================================
@@ -764,15 +920,40 @@ struct InkHybridEngine {
     float* h_v_x    = nullptr;   // pinned [16 * kInkHidden]
     float* h_v_y    = nullptr;   // pinned [16 * kInkTopK * kInkHidden]
     int32_t* h_v_p  = nullptr;   // pinned [16 * kInkTopK] pair indices written by CPU
+    int32_t* h_v_idx = nullptr;  // pinned [16 * kInkTopK] router topk indices (avoids pageable stack stall!)
     float* d_v_y    = nullptr;   // device mirror for fast scatter
     int32_t* d_v_p  = nullptr;   // device pair indices
-    double dec_pcie_share = -1.0; // -1 = auto, 0 = 100% CPU, 1 = 100% PCIe DMA (STRATA_INK_DEC_PCIE_SHARE)
+    cudaEvent_t ev_v_routed = nullptr;  // signals h_v_idx + h_v_x D2H complete while GPU runs VRAM experts!
+    double dec_pcie_share = 1.0;  // 1.0 = 100% PCIe DMA to GPU TC on M=2..16 (zero CPU stall on PCIe 3/4/5); set STRATA_INK_DEC_PCIE_SHARE=auto or 0..0.99 on slow risers
+    double auto_pcie_share = 0.75;
+    double ema_gpu_ms_exp = 0.0, ema_cpu_ms_exp = 0.0;
+    int cal_gpu_n = 0, cal_cpu_n = 0;
+    cudaEvent_t ev_pcie_a = nullptr, ev_pcie_b = nullptr;
+    bool pcie_ev_pending = false;
+    int pcie_ev_exp = 0;
     bool l3_pf_enabled = true;    // STRATA_L3_PF: idle-worker next-layer L3 prefetch
     std::atomic<uint32_t> pf_gen{0};
     int pf_layer = -1, pf_n = 0;
     int32_t pf_eids[32] = {};
     int32_t prev_cpu_eids[24][32] = {};
     int prev_cpu_n[24] = {};
+
+    // Coalesced persistent spin-wait verify batch state (eliminates 48x/step std::thread spawn/join!)
+    struct VerifyCpuJob {
+        int eid = 0;
+        int cnt = 0;
+        int m_idx[16] = {};
+        int out_j[16] = {};
+    };
+    std::atomic<int> work_mode{0};     // 0 = M=1 doorbell, 1 = M=2..16 coalesced verify batch
+    std::atomic<int> v_next_job{0};
+    int v_layer = 0, v_njobs = 0;
+    bool v_xq_ready = false;
+    InkQ8_1_G64 v_xq[16][kInkHidden / 64] = {};
+    VerifyCpuJob v_jobs[128] = {};
+    std::vector<float> h_use_cnt;      // [3072] host-side decayed frequency for M=2..16 FREE D2D promotion
+    InkExpertDev* h_promo_dev_pin = nullptr;
+    int h_promo_dev_cur = 0;
 
     // Allocate host expert arena safely (pinned if small & within 45% MemAvailable, else pageable + pinned bounce ring!)
     uint8_t* alloc_host_arena(size_t bytes) {
@@ -839,10 +1020,13 @@ struct InkHybridEngine {
     InkExpertDev* h_pf_exp_pin[2] = {};
     bool pf_buf_busy[2] = {false, false};
 
-    // Spin-wait worker threads
+    // Spin-wait + condition_variable worker threads (zero 15.6ms Windows timer stalls, zero idle CPU burn!)
     std::atomic<bool> stop_flag{false};
     std::atomic<uint32_t> work_gen{0};
     std::atomic<int> work_done{0};
+    std::atomic<int> workers_sleeping{0};
+    std::mutex wake_mu;
+    std::condition_variable wake_cv;
     int cur_layer = 0, cur_nj = 0;
     int cur_slot_k[kInkTopK] = {}, cur_eid[kInkTopK] = {};
     int cur_cold_slot[kInkTopK] = {-1,-1,-1,-1,-1,-1,-1,-1};
@@ -875,12 +1059,22 @@ struct InkHybridEngine {
         }
     }
 
+    inline void notify_workers() noexcept {
+        if (workers_sleeping.load(std::memory_order_acquire) > 0) {
+            std::lock_guard<std::mutex> lk(wake_mu);
+            wake_cv.notify_all();
+        }
+    }
+
     void start_workers(int num_threads = 0) {
         if (active) return;
         const int hw = ink_logical_cpus();
         n_threads = (num_threads > 0) ? num_threads : std::min(16, std::max(2, hw / 2));
         if (const char* e = std::getenv("STRATA_L3_PF")) l3_pf_enabled = (e[0] != '0');
-        if (const char* e = std::getenv("STRATA_INK_DEC_PCIE_SHARE")) dec_pcie_share = std::max(0.0, std::min(1.0, std::atof(e)));
+        if (const char* e = std::getenv("STRATA_INK_DEC_PCIE_SHARE")) {
+            if (std::strcmp(e, "auto") == 0) dec_pcie_share = -1.0;
+            else dec_pcie_share = std::max(0.0, std::min(1.0, std::atof(e)));
+        }
         INK_CK(cudaHostAlloc(&h_bell, sizeof(InkMappedDoorbell), cudaHostAllocMapped));
         std::memset(h_bell, 0, sizeof(InkMappedDoorbell));
         INK_CK(cudaHostGetDevicePointer(&d_bell, h_bell, 0));
@@ -888,11 +1082,19 @@ struct InkHybridEngine {
         d_cur_seq = dalloc<uint32_t>(1);
         INK_CK(cudaMemset(d_seq, 0, 4));
         INK_CK(cudaMemset(d_cur_seq, 0, 4));
-        h_v_x = halloc_pinned<float>(16 * kInkHidden);
-        h_v_y = halloc_pinned<float>(16 * kInkTopK * kInkHidden);
-        h_v_p = halloc_pinned<int32_t>(16 * kInkTopK);
-        d_v_y = dalloc<float>(16 * kInkTopK * kInkHidden);
-        d_v_p = dalloc<int32_t>(16 * kInkTopK);
+        h_v_x   = halloc_pinned<float>(16 * kInkHidden);
+        h_v_y   = halloc_pinned<float>(16 * kInkTopK * kInkHidden);
+        h_v_p   = halloc_pinned<int32_t>(16 * kInkTopK);
+        h_v_idx = halloc_pinned<int32_t>(16 * kInkTopK);
+        d_v_y   = dalloc<float>(16 * kInkTopK * kInkHidden);
+        d_v_p   = dalloc<int32_t>(16 * kInkTopK);
+        INK_CK(cudaEventCreateWithFlags(&ev_v_routed, cudaEventDisableTiming));
+        h_use_cnt.assign((size_t)n_layers * n_experts, 0.0f);
+        h_promo_dev_pin = halloc_pinned<InkExpertDev>(256);
+        h_promo_dev_cur = 0;
+        INK_CK(cudaEventCreate(&ev_pcie_a));
+        INK_CK(cudaEventCreate(&ev_pcie_b));
+        auto_pcie_share = sec4_is_pinned ? 0.50 : 0.40;
 
         d_use_cnt   = dalloc<float>(n_layers * n_experts);
         d_want_keys = dalloc<int32_t>(64);
@@ -942,13 +1144,31 @@ struct InkHybridEngine {
                             }
                         }
                         auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - last_t).count();
-                        if (dt > 15) std::this_thread::sleep_for(std::chrono::microseconds(100));
-                        else std::this_thread::yield();
+                        if (dt > 80) {
+                            std::unique_lock<std::mutex> lk(wake_mu);
+                            workers_sleeping.fetch_add(1, std::memory_order_release);
+                            wake_cv.wait(lk, [&]() {
+                                return stop_flag.load(std::memory_order_acquire) ||
+                                       work_gen.load(std::memory_order_acquire) != seen;
+                            });
+                            workers_sleeping.fetch_sub(1, std::memory_order_release);
+                            last_t = std::chrono::steady_clock::now();
+                        } else {
+                            std::this_thread::yield();
+                        }
                         continue;
                     }
                     seen = g;
-                    for (int j = t; j < cur_nj; j += n_threads) {
-                        eval_doorbell_job(j);
+                    if (work_mode.load(std::memory_order_acquire) == 1) {
+                        for (;;) {
+                            const int ji = v_next_job.fetch_add(1, std::memory_order_relaxed);
+                            if (ji >= v_njobs) break;
+                            run_verify_job(ji);
+                        }
+                    } else {
+                        for (int j = t; j < cur_nj; j += n_threads) {
+                            eval_doorbell_job(j);
+                        }
                     }
                     work_done.fetch_add(1, std::memory_order_release);
                     last_t = std::chrono::steady_clock::now();
@@ -962,7 +1182,7 @@ struct InkHybridEngine {
                 const uint32_t seq = h_bell->ring;
                 if (seq == seen) {
                     auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - last_t).count();
-                    if (dt > 15) std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    if (dt > 250) std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     else std::this_thread::yield();
                     continue;
                 }
@@ -984,7 +1204,9 @@ struct InkHybridEngine {
                 std::memcpy(cur_x, const_cast<const float*>(h_bell->x), kInkHidden * sizeof(float));
                 work_done.store(0, std::memory_order_relaxed);
                 if (n_threads > 1 && cur_nj > 1) {
+                    work_mode.store(0, std::memory_order_release);
                     work_gen.fetch_add(1, std::memory_order_release);
+                    notify_workers();
                 }
                 for (int j = 0; j < cur_nj; j += (cur_nj > 1 ? n_threads : 1)) {
                     eval_doorbell_job(j);
@@ -1008,31 +1230,160 @@ struct InkHybridEngine {
         active = true;
     }
 
-    // Allocate ping-pong prefill streaming buffers (2 x 64 MiB) + optional dynamic decode promotion ring!
-    void alloc_staging(size_t max_exp_bytes, size_t vram_avail) {
+    inline void run_verify_job(int ji) noexcept {
+        const VerifyCpuJob& jb = v_jobs[ji];
+        const float* xs[16];
+        const InkQ8_1_G64* xqs[16];
+        float* ys[16];
+        for (int c = 0; c < jb.cnt; ++c) {
+            xs[c]  = h_v_x + (size_t)jb.m_idx[c] * kInkHidden;
+            xqs[c] = v_xq_ready ? v_xq[jb.m_idx[c]] : nullptr;
+            ys[c]  = h_v_y + (size_t)jb.out_j[c] * kInkHidden;
+        }
+        host_eval::eval_expert_batch_h(host_meta[v_layer * n_experts + jb.eid], xs, v_xq_ready ? xqs : nullptr, ys, jb.cnt);
+    }
+
+    inline void kick_verify_cpu(int ip, int M, bool need_xq) noexcept {
+        v_layer = ip;
+        v_xq_ready = need_xq;
+        if (need_xq) {
+            for (int m = 0; m < M; ++m) host_eval::quant_q8_1_h(h_v_x + (size_t)m * kInkHidden, v_xq[m], kInkHidden);
+        }
+        v_next_job.store(0, std::memory_order_relaxed);
+        work_done.store(0, std::memory_order_relaxed);
+        work_mode.store(1, std::memory_order_release);
+        if (n_threads > 1 && v_njobs > 0) {
+            work_gen.fetch_add(1, std::memory_order_release);
+            notify_workers();
+        }
+    }
+
+    inline void finish_verify_cpu() noexcept {
+        for (;;) {
+            const int ji = v_next_job.fetch_add(1, std::memory_order_relaxed);
+            if (ji >= v_njobs) break;
+            run_verify_job(ji);
+        }
+        if (n_threads > 1 && v_njobs > 0) {
+            while (work_done.load(std::memory_order_acquire) < n_threads - 1) std::this_thread::yield();
+        }
+    }
+
+    inline void poll_pcie_cal() noexcept {
+        if (!pcie_ev_pending || !ev_pcie_b) return;
+        if (cudaEventQuery(ev_pcie_b) != cudaSuccess) return;
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, ev_pcie_a, ev_pcie_b) == cudaSuccess && ms > 0.005f && pcie_ev_exp > 0) {
+            const double per_e = (double)ms / (double)pcie_ev_exp;
+            ema_gpu_ms_exp = (cal_gpu_n == 0) ? per_e : (0.85 * ema_gpu_ms_exp + 0.15 * per_e);
+            ++cal_gpu_n;
+            update_auto_share();
+        }
+        pcie_ev_pending = false;
+    }
+
+    inline void record_cpu_cal(double cpu_ms, int n_exp) noexcept {
+        if (cpu_ms > 0.005 && n_exp > 0) {
+            const double per_e = cpu_ms / (double)n_exp;
+            ema_cpu_ms_exp = (cal_cpu_n == 0) ? per_e : (0.85 * ema_cpu_ms_exp + 0.15 * per_e);
+            ++cal_cpu_n;
+            update_auto_share();
+        }
+    }
+
+    inline void update_auto_share() noexcept {
+        if (cal_gpu_n >= 4 && cal_cpu_n >= 4 && ema_gpu_ms_exp > 1e-4 && ema_cpu_ms_exp > 1e-4) {
+            const double rg = 1.0 / ema_gpu_ms_exp;
+            const double rc = 1.0 / ema_cpu_ms_exp;
+            const double opt = rg / (rg + rc);
+            auto_pcie_share = (opt >= 0.78) ? 1.0 : std::max(0.10, opt);
+        }
+    }
+
+    inline void decay_verify_counts() noexcept {
+        if (h_use_cnt.empty()) return;
+        const float decay = (n_promo_slots > 0 && n_promo_slots < 256) ? 0.985f : 0.97f;
+        for (float& c : h_use_cnt) c *= decay;
+    }
+
+    // FREE ~1.4 us GPU D2D promotion directly from d_pf_stage[buf] during M=2..16 DSpark verify!
+    inline void try_d2d_promote_verify(
+        uint8_t* d_sec4, InkExpertDev* const d_experts[24], cudaStream_t main_st,
+        int ip, int eid, const uint8_t* src_stage_ptr) noexcept {
+        if (n_promo_slots <= 0 || !d_promo_pool || !h_promo_dev_pin) return;
+        const int key = ip * n_experts + eid;
+        if (key < 0 || key >= n_layers * n_experts || !host_meta[key].body) return;
+        if (key_to_slot[key] >= 0) return;
+        const float sc = h_use_cnt[key];
+        const float min_sc = (n_promo_slots < 256) ? 2.0f : 1.0f;
+        const float hyst   = (n_promo_slots < 256) ? 1.35f : 1.15f;
+        if (sc < min_sc) return;
+        int victim = -1;
+        float vmin = 1e30f;
+        for (int sl = 0; sl < n_promo_slots; ++sl) {
+            if (promo_owner[sl] < 0) { victim = sl; vmin = -1.0f; break; }
+            const float os = h_use_cnt[promo_owner[sl]];
+            if (os < vmin) { vmin = os; victim = sl; }
+        }
+        if (victim < 0 || (vmin >= 0.0f && sc <= vmin * hyst)) return;
+        const int old_key = promo_owner[victim];
+        if (old_key >= 0) {
+            key_to_slot[old_key] = -1;
+            InkExpertDev* dem = h_promo_dev_pin + (h_promo_dev_cur++ & 255);
+            const auto& om = host_meta[old_key];
+            dem->body_off = orig_host_off[old_key];
+            dem->dn_off   = om.dn_off;
+            dem->gu_code  = om.gu_code;
+            dem->dn_code  = om.dn_code;
+            dem->tier     = 2;
+            INK_CK(cudaMemcpyAsync(&d_experts[old_key / n_experts][old_key % n_experts], dem, sizeof(InkExpertDev), cudaMemcpyHostToDevice, main_st));
+        }
+        const auto& nm = host_meta[key];
+        uint8_t* dst_slot = d_promo_pool + (size_t)victim * promo_slot_bytes;
+        INK_CK(cudaMemcpyAsync(dst_slot, src_stage_ptr, nm.body_bytes, cudaMemcpyDeviceToDevice, main_st));
+        InkExpertDev* pro = h_promo_dev_pin + (h_promo_dev_cur++ & 255);
+        pro->body_off = (uint64_t)((intptr_t)dst_slot - (intptr_t)d_sec4);
+        pro->dn_off   = nm.dn_off;
+        pro->gu_code  = nm.gu_code;
+        pro->dn_code  = nm.dn_code;
+        pro->tier     = 0;
+        INK_CK(cudaMemcpyAsync(&d_experts[ip][eid], pro, sizeof(InkExpertDev), cudaMemcpyHostToDevice, main_st));
+        promo_owner[victim] = key;
+        key_to_slot[key] = victim;
+    }
+
+    // Allocate ping-pong prefill streaming buffers + dynamic decode/verify D2D promotion ring!
+    void alloc_staging(size_t max_exp_bytes, size_t vram_avail, size_t vtot = 0) {
         if (!active) return;
         const size_t align_b = (max_exp_bytes + 255ull) & ~255ull;
         promo_slot_bytes = align_b;
-        // Reserve 2 x 16..64 MiB ping-pong staging buffers for ultra-fast prefill DMA streaming!
-        if (vram_avail > (48ull << 20)) {
-            const size_t max_each = (vram_avail - (16ull << 20)) / 2;
-            pf_stage_bytes = std::min<size_t>(64ull << 20, std::min(max_each, std::max<size_t>(16 * align_b, 32ull << 20)));
+        const size_t pf_cap_max = (64ull << 20);
+        // Reserve 2 x 16..64 MiB ping-pong staging buffers for ultra-fast prefill & verify DMA streaming!
+        if (vram_avail > (24ull << 20)) {
+            const size_t keep_pad = (vtot > 0 && vtot <= (14ull << 30)) ? (8ull << 20) : (16ull << 20);
+            const size_t max_each = (vram_avail > keep_pad) ? ((vram_avail - keep_pad) / 2) : 0;
+            pf_stage_bytes = std::min(pf_cap_max, std::min(max_each, std::max<size_t>(8 * align_b, pf_cap_max)));
             pf_stage_bytes = std::max(pf_stage_bytes, align_b);
-            INK_CK(cudaMalloc(&d_pf_stage[0], pf_stage_bytes));
-            INK_CK(cudaMalloc(&d_pf_stage[1], pf_stage_bytes));
-            if (!sec4_is_pinned) {
-                for (int b = 0; b < 2; ++b) {
-                    if (cudaHostAlloc(&h_pf_bounce[b], pf_stage_bytes, cudaHostAllocDefault) != cudaSuccess) {
-                        (void)cudaGetLastError();
-                        h_pf_bounce[b] = nullptr;
+            if (2 * pf_stage_bytes <= vram_avail) {
+                INK_CK(cudaMalloc(&d_pf_stage[0], pf_stage_bytes));
+                INK_CK(cudaMalloc(&d_pf_stage[1], pf_stage_bytes));
+                if (!sec4_is_pinned) {
+                    for (int b = 0; b < 2; ++b) {
+                        if (cudaHostAlloc(&h_pf_bounce[b], pf_stage_bytes, cudaHostAllocDefault) != cudaSuccess) {
+                            (void)cudaGetLastError();
+                            h_pf_bounce[b] = nullptr;
+                        }
                     }
                 }
+                vram_avail -= 2 * pf_stage_bytes;
+            } else {
+                pf_stage_bytes = 0;
             }
-            vram_avail -= 2 * pf_stage_bytes;
         }
-        // Remaining spare VRAM (> 256 MiB headroom) becomes dynamic decayed-frequency promotion ring!
-        if (vram_avail > (320ull << 20) && align_b > 0) {
-            const size_t ring_bytes = std::min<size_t>(256ull << 20, vram_avail - (256ull << 20));
+        // Remaining spare VRAM inside stage_res becomes dynamic decayed-frequency D2D promotion ring!
+        const size_t promo_pad = (vtot > 0 && vtot <= (14ull << 30)) ? (8ull << 20) : (256ull << 20);
+        if (vram_avail > promo_pad + 4 * align_b && align_b > 0) {
+            const size_t ring_bytes = std::min<size_t>(256ull << 20, vram_avail - promo_pad);
             n_promo_slots = (int)(ring_bytes / align_b);
             if (n_promo_slots >= 4) {
                 INK_CK(cudaMalloc(&d_promo_pool, (size_t)n_promo_slots * align_b));
@@ -1141,6 +1492,10 @@ struct InkHybridEngine {
         if (active) {
             stop_flag.store(true, std::memory_order_release);
             work_gen.fetch_add(1, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lk(wake_mu);
+            }
+            wake_cv.notify_all();
             if (master_thr.joinable()) master_thr.join();
             for (auto& w : workers) if (w.joinable()) w.join();
             workers.clear();
@@ -1156,6 +1511,12 @@ struct InkHybridEngine {
             if (h_pf_bounce[b])  { cudaFreeHost(h_pf_bounce[b]);  h_pf_bounce[b]  = nullptr; }
         }
         if (h_promo_stg) { cudaFreeHost(h_promo_stg); h_promo_stg = nullptr; }
+        if (h_promo_dev_pin) { cudaFreeHost(h_promo_dev_pin); h_promo_dev_pin = nullptr; }
+        if (ev_pcie_a) { cudaEventDestroy(ev_pcie_a); ev_pcie_a = nullptr; }
+        if (ev_pcie_b) { cudaEventDestroy(ev_pcie_b); ev_pcie_b = nullptr; }
+        if (ev_v_routed) { cudaEventDestroy(ev_v_routed); ev_v_routed = nullptr; }
+        pcie_ev_pending = false;
+        if (h_v_idx) { cudaFreeHost(h_v_idx); h_v_idx = nullptr; }
         if (h_v_x) { cudaFreeHost(h_v_x); h_v_x = nullptr; }
         if (h_v_y) { cudaFreeHost(h_v_y); h_v_y = nullptr; }
         if (h_v_p) { cudaFreeHost(h_v_p); h_v_p = nullptr; }
@@ -1206,10 +1567,11 @@ __global__ void __launch_bounds__(256) k_ink_scatter_cpu_pairs(
 inline void launch_ink_moe_hybrid(
     cudaStream_t st,
     cublasHandle_t cublas,
-    const uint8_t* sec4_base,
-    const InkExpertDev* experts,
+    uint8_t* sec4_base,
+    InkExpertDev* const d_experts_all[24],
     const InkLayerMoeInfo& info,
     int ip,
+    int next_ip,
     InkHybridEngine& hyb,
     const float* gate_w,
     const float* gate_b,
@@ -1219,6 +1581,7 @@ inline void launch_ink_moe_hybrid(
     InkMoeWorkspace& ws,
     float route_scale = kInkRouteScale,
     bool force_exact_dec = false) {
+    const InkExpertDev* experts = d_experts_all[ip];
     // 1. Exact Top-8 / 128 sigmoid router
     if (M <= 16) {
         if (M == 1)      k_ink_router_gemv_smallM<1><<<kInkExperts, 256, 0, st>>>(x_f32, gate_w, ws.r_logits, M);
@@ -1245,52 +1608,77 @@ inline void launch_ink_moe_hybrid(
         launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, 1, ws, force_exact_dec, false);
         k_ink_doorbell_wait_collect<<<kInkTopK, 256, 0, st>>>(hyb.d_bell, hyb.d_cur_seq, ws.topk_w, ws.y_pair);
     } else {
-        // Double-Buffered Ping-Pong Async DMA Streaming + Simultaneous PCIe/CPU Miss-Sharing (M=2..16) + GPU+SSD Wave Planning!
+        // Step A: Queue async pinned D2H of router topk + x_f32, record ev_v_routed, and IMMEDIATELY launch GPU resident VRAM experts
+        // so GPU computes VRAM experts IN PARALLEL with host router readback, CPU pool dispatch, and PCIe DMA!
         std::vector<int> host_list;
         host_list.reserve(kInkExperts);
+        int32_t h_idx_stack[16 * kInkTopK] = {};
+        int32_t* h_idx = hyb.h_v_idx ? hyb.h_v_idx : h_idx_stack;
+        int ecnt[kInkExperts] = {};
         std::vector<int> cpu_eids;
-        std::vector<std::pair<int, int>> cpu_pairs;  // (pair_id, expert_id)
+        int np_cpu = 0;
+        bool cpu_kicked = false;
+        std::chrono::steady_clock::time_point t_cpu0;
         auto is_off_gpu = [&](int key) -> bool {
             return (hyb.host_meta[key].body != nullptr || hyb.host_meta[key].cold_ssd) &&
                    (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0);
         };
         if (M <= 16 && !hyb.ssd_only) {
-            int32_t h_idx[16 * kInkTopK] = {};
-            int ecnt[kInkExperts] = {};
+            hyb.poll_pcie_cal();
+            const double share = (hyb.dec_pcie_share >= 0.0) ? hyb.dec_pcie_share : hyb.auto_pcie_share;
             INK_CK(cudaMemcpyAsync(h_idx, ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
-            if (hyb.h_v_x) INK_CK(cudaMemcpyAsync(hyb.h_v_x, x_f32, (size_t)M * kInkHidden * 4, cudaMemcpyDeviceToHost, st));
-            INK_CK(cudaStreamSynchronize(st));
+            if (hyb.h_v_x && share < 0.999) INK_CK(cudaMemcpyAsync(hyb.h_v_x, x_f32, (size_t)M * kInkHidden * 4, cudaMemcpyDeviceToHost, st));
+            if (hyb.ev_v_routed) INK_CK(cudaEventRecord(hyb.ev_v_routed, st));
+            // Launch resident tier==0 VRAM experts NOW (overlaps 100% with host router readback + PCIe DMA!)
+            launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false);
+            if (hyb.ev_v_routed) INK_CK(cudaEventSynchronize(hyb.ev_v_routed));
+            else INK_CK(cudaStreamSynchronize(st));
             for (int i = 0; i < M * kInkTopK; ++i) {
                 const int e = h_idx[i];
+                if (e < 0 || e >= kInkExperts) continue;
                 const int key = ip * kInkExperts + e;
-                if (e >= 0 && e < kInkExperts && hyb.host_meta[key].body != nullptr &&
+                if (!hyb.h_use_cnt.empty()) hyb.h_use_cnt[key] += 1.0f;
+                if (hyb.host_meta[key].body != nullptr &&
                     (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0)) {
                     if (ecnt[e] == 0) host_list.push_back(e);
                     ++ecnt[e];
                 }
             }
-            // Simultaneous PCIe H2D GPU Miss-Sharing + CPU Pool (L / (L + k R)) for DSpark Block-8 verify (M = 2..16)!
-            const double share = (hyb.dec_pcie_share >= 0.0) ? hyb.dec_pcie_share : (hyb.sec4_is_pinned ? 0.60 : 0.50);
+            // Bandwidth-Calibrated Simultaneous PCIe H2D GPU Miss-Sharing + Persistent Spin-Wait CPU Pool (L / (L + k R))!
+            // Highest-multiplicity experts go to GPU Tensor Cores over PCIe DMA; remaining misses run concurrently on persistent CPU workers when share < 1.0!
             if (hyb.active && hyb.h_v_x && hyb.h_v_y && host_list.size() >= 2 && share < 0.999) {
                 std::sort(host_list.begin(), host_list.end(), [&](int a, int b) { return ecnt[a] > ecnt[b]; });
-                int w_tot = 0;
-                for (int e : host_list) w_tot += ecnt[e];
-                const double w_goal = share * (double)w_tot;
-                int w_acc = 0;
-                size_t split = 0;
-                while (split < host_list.size() && (double)w_acc < w_goal) {
-                    w_acc += ecnt[host_list[split]];
-                    ++split;
-                }
-                uint8_t is_cpu[kInkExperts] = {};
+                const size_t split = (share <= 0.001) ? 0 : std::min(host_list.size() - 1, std::max<size_t>(1, (size_t)std::lround(share * (double)host_list.size())));
+                int e_to_job[kInkExperts];
+                for (int e = 0; e < kInkExperts; ++e) e_to_job[e] = -1;
+                hyb.v_njobs = 0;
                 for (size_t i = split; i < host_list.size(); ++i) {
-                    is_cpu[host_list[i]] = 1;
-                    cpu_eids.push_back(host_list[i]);
+                    const int e = host_list[i];
+                    cpu_eids.push_back(e);
+                    const int ji = hyb.v_njobs++;
+                    e_to_job[e] = ji;
+                    hyb.v_jobs[ji].eid = e;
+                    hyb.v_jobs[ji].cnt = 0;
                 }
                 host_list.resize(split);
                 for (int p = 0; p < M * kInkTopK; ++p) {
                     const int e = h_idx[p];
-                    if (e >= 0 && e < kInkExperts && is_cpu[e]) cpu_pairs.push_back({p, e});
+                    if (e >= 0 && e < kInkExperts && e_to_job[e] >= 0) {
+                        auto& jb = hyb.v_jobs[e_to_job[e]];
+                        if (jb.cnt < 16) {
+                            const int oj = np_cpu++;
+                            hyb.h_v_p[oj] = p;
+                            jb.m_idx[jb.cnt] = p / kInkTopK;
+                            jb.out_j[jb.cnt] = oj;
+                            ++jb.cnt;
+                        }
+                    }
+                }
+                if (np_cpu > 0) {
+                    // Kick persistent spin-wait CPU workers IMMEDIATELY BEFORE PCIe DMA & GPU VRAM kernels!
+                    t_cpu0 = std::chrono::steady_clock::now();
+                    hyb.kick_verify_cpu(ip, M, info.has_sk);
+                    cpu_kicked = true;
                 }
             }
         } else if (M <= 16 || hyb.ssd_only) {
@@ -1412,12 +1800,18 @@ inline void launch_ink_moe_hybrid(
             INK_CK(cudaMemcpyAsync(hyb.d_pf_exp_tmp[buf], h_exp, (size_t)kInkExperts * sizeof(InkExpertDev), cudaMemcpyHostToDevice, hyb.pf_dma_st));
             INK_CK(cudaEventRecord(hyb.pf_ev_dma[buf], hyb.pf_dma_st));
         };
+        const bool time_pcie = (M <= 16 && !chunks.empty() && !hyb.pcie_ev_pending && hyb.ev_pcie_a && hyb.ev_pcie_b);
+        if (time_pcie) INK_CK(cudaEventRecord(hyb.ev_pcie_a, hyb.pf_dma_st));
         if (!chunks.empty()) issue_dma(0, 0);
 
-        // Run resident tier==0 VRAM experts on main stream `st` (quantizes x once!)
-        launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false);
+        // Run resident tier==0 VRAM experts on main stream `st` for M>16 (already launched before ev_v_routed sync for M<=16!)
+        if (M > 16) {
+            launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false);
+        }
 
         // Execute each streamed host chunk on GPU Tensor Cores while pf_dma_st overlaps the NEXT chunk!
+        int d2d_promos_done = 0;
+        const int d2d_promo_cap = (hyb.n_promo_slots < 128) ? 1 : 2;
         for (size_t ci = 0; ci < chunks.size(); ++ci) {
             const int buf = (int)(ci & 1);
             if (ci + 1 < chunks.size()) {
@@ -1425,54 +1819,46 @@ inline void launch_ink_moe_hybrid(
             }
             INK_CK(cudaStreamWaitEvent(st, hyb.pf_ev_dma[buf], 0));
             launch_ink_moe_dispatch_only(st, hyb.d_pf_stage[buf], hyb.d_pf_exp_tmp[buf], info, x_f32, M, ws, force_exact_dec, true);
+            // FREE ~1.4 us D2D promotion from d_pf_stage[buf] into dynamic VRAM promo ring during M=2..16!
+            if (M <= 16 && hyb.n_promo_slots >= 4 && d2d_promos_done < d2d_promo_cap) {
+                const auto& ch = chunks[ci];
+                int best_i = -1;
+                float best_sc = 0.0f;
+                for (size_t i = 0; i < ch.eids.size(); ++i) {
+                    const int key = ip * kInkExperts + ch.eids[i];
+                    if (hyb.key_to_slot[key] < 0 && hyb.h_use_cnt[key] > best_sc) {
+                        best_sc = hyb.h_use_cnt[key];
+                        best_i = (int)i;
+                    }
+                }
+                if (best_i >= 0) {
+                    hyb.try_d2d_promote_verify(sec4_base, d_experts_all, st, ip, ch.eids[best_i], hyb.d_pf_stage[buf] + ch.offs[best_i]);
+                    ++d2d_promos_done;
+                }
+            }
             INK_CK(cudaEventRecord(hyb.pf_ev_done[buf], st));
             hyb.pf_buf_busy[buf] = true;
         }
+        if (time_pcie) {
+            INK_CK(cudaEventRecord(hyb.ev_pcie_b, st));
+            hyb.pcie_ev_pending = true;
+            hyb.pcie_ev_exp = (int)host_list.size();
+        }
 
-        // Concurrently evaluate CPU-assigned pairs for M=2..16 while GPU executes VRAM + PCIe-streamed chunks!
-        if (!cpu_pairs.empty()) {
-            const int np = (int)cpu_pairs.size();
-            const int nt = std::min(std::max(1, hyb.n_threads), np);
-            if (nt > 1) {
-                std::vector<std::thread> tmp_th;
-                tmp_th.reserve((size_t)nt - 1);
-                for (int t = 1; t < nt; ++t) {
-                    tmp_th.emplace_back([&, t]() {
-                        for (int j = t; j < np; j += nt) {
-                            const int pid = cpu_pairs[j].first;
-                            const int e   = cpu_pairs[j].second;
-                            const int m   = pid / kInkTopK;
-                            hyb.h_v_p[j]  = pid;
-                            host_eval::eval_expert_f32_h(hyb.host_meta[ip * kInkExperts + e], hyb.h_v_x + (size_t)m * kInkHidden, hyb.h_v_y + (size_t)j * kInkHidden);
-                        }
-                    });
-                }
-                for (int j = 0; j < np; j += nt) {
-                    const int pid = cpu_pairs[j].first;
-                    const int e   = cpu_pairs[j].second;
-                    const int m   = pid / kInkTopK;
-                    hyb.h_v_p[j]  = pid;
-                    host_eval::eval_expert_f32_h(hyb.host_meta[ip * kInkExperts + e], hyb.h_v_x + (size_t)m * kInkHidden, hyb.h_v_y + (size_t)j * kInkHidden);
-                }
-                for (auto& th : tmp_th) th.join();
-            } else {
-                for (int j = 0; j < np; ++j) {
-                    const int pid = cpu_pairs[j].first;
-                    const int e   = cpu_pairs[j].second;
-                    const int m   = pid / kInkTopK;
-                    hyb.h_v_p[j]  = pid;
-                    host_eval::eval_expert_f32_h(hyb.host_meta[ip * kInkExperts + e], hyb.h_v_x + (size_t)m * kInkHidden, hyb.h_v_y + (size_t)j * kInkHidden);
-                }
-            }
-            INK_CK(cudaMemcpyAsync(hyb.d_v_y, hyb.h_v_y, (size_t)np * kInkHidden * 4, cudaMemcpyHostToDevice, st));
-            INK_CK(cudaMemcpyAsync(hyb.d_v_p, hyb.h_v_p, (size_t)np * 4, cudaMemcpyHostToDevice, st));
-            k_ink_scatter_cpu_pairs<<<np, 256, 0, st>>>(hyb.d_v_y, hyb.d_v_p, ws.topk_w, ws.y_pair, np);
-            // Record CPU misses for layer ip and kick L3 prefetch for next layer (STRATA_L3_PF)
+        // Main thread joins persistent CPU workers on remaining verify jobs, then scatters CPU results into y_pair!
+        if (cpu_kicked && np_cpu > 0) {
+            hyb.finish_verify_cpu();
+            const double cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu0).count();
+            hyb.record_cpu_cal(cpu_ms, (int)cpu_eids.size());
+            INK_CK(cudaMemcpyAsync(hyb.d_v_y, hyb.h_v_y, (size_t)np_cpu * kInkHidden * 4, cudaMemcpyHostToDevice, st));
+            INK_CK(cudaMemcpyAsync(hyb.d_v_p, hyb.h_v_p, (size_t)np_cpu * 4, cudaMemcpyHostToDevice, st));
+            k_ink_scatter_cpu_pairs<<<np_cpu, 256, 0, st>>>(hyb.d_v_y, hyb.d_v_p, ws.topk_w, ws.y_pair, np_cpu);
+            // Record CPU misses for layer ip and kick L3 prefetch for actual next visit in 48-visit loop (STRATA_L3_PF)
             const int cn = std::min((int)cpu_eids.size(), 32);
             hyb.prev_cpu_n[ip] = cn;
             for (int i = 0; i < cn; ++i) hyb.prev_cpu_eids[ip][i] = cpu_eids[i];
-            if (ip + 1 < kInkPhysLayers && hyb.prev_cpu_n[ip + 1] > 0) {
-                hyb.kick_l3_prefetch(ip + 1, hyb.prev_cpu_eids[ip + 1], hyb.prev_cpu_n[ip + 1]);
+            if (next_ip >= 0 && next_ip < kInkPhysLayers && hyb.prev_cpu_n[next_ip] > 0) {
+                hyb.kick_l3_prefetch(next_ip, hyb.prev_cpu_eids[next_ip], hyb.prev_cpu_n[next_ip]);
             }
         }
         // Unpin cold_store slots after the last chunk's DMA has completed (pf_ev_dma already waited by st).

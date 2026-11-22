@@ -440,7 +440,7 @@ struct DFly2 {
     struct DevDraftArgs { int a; int row; };
     DevDraftArgs *h_dargs = nullptr, *d_dargs = nullptr;
     struct DgKey {
-        int K, list_mask, s_causal, rv, kv_is_host, slots_sparse, lin_gemv_max, int8_mma, dp4a, mla_ws_gen, bb_only;
+        int K, list_mask, s_causal, rv, kv_is_host, kv_q8, slots_sparse, lin_gemv_max, int8_mma, dp4a, mla_ws_gen, bb_only;
         uint64_t kv_gen;
         bool operator==(const DgKey& o) const { return std::memcmp(this, &o, sizeof(DgKey)) == 0; }
     };
@@ -593,7 +593,7 @@ struct DFly2 {
             int lmask = 0;
             for (int d = 0; d < 5; ++d) if (r.cap_list[d]) lmask |= (1 << d);
             MlaAttnArgs ma_c;
-            ma_c.M = B; ma_c.NH = 32; ma_c.p0 = a; ma_c.mode = MLA_CAUSAL;
+            ma_c.M = B; ma_c.NH = 32; ma_c.p0 = a; ma_c.mode = MLA_CAUSAL; ma_c.kv_q8 = r.kv_q8;
             const int s_causal = (lmask == 31) ? 0 : mla_choose_splits(ma_c);
             const size_t need_ws = mla_workspace_bytes(B, 32, std::max(lstride, a + B));
             r.ensure_mla_ws(need_ws);
@@ -603,6 +603,7 @@ struct DFly2 {
             DgKey key{};
             key.K = K; key.list_mask = lmask; key.s_causal = s_causal; key.rv = std::min(rv, 1024);
             key.kv_is_host = r.kv_is_host ? 1 : 0;
+            key.kv_q8 = r.kv_q8 ? 1 : 0;
             key.slots_sparse = r.slots_sparse;
             key.lin_gemv_max = skd::lin_gemv_max_m();
 #if HY4_CUDA && HY4_MMA
@@ -647,12 +648,12 @@ struct DFly2 {
                     hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps);
                     r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);
                     if (daf == 0) r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);
-                    mla_write_kv_d(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, &d_dargs->a, 0, (float)c.theta_sparse, c.rms_eps);
+                    mla_write_kv_d(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, &d_dargs->a, 0, (float)c.theta_sparse, c.rms_eps, nullptr, r.kv_q8);
                     const int kvfmt = r.ti(pa + ".kv_b_proj.weight").fmt;
                     mla_prep_q_dec_d(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), F2, qa_h, B, 32, &d_dargs->a, (float)c.theta_sparse);
                     if (daf < 3) r.lin(pa + ".linear_gate.weight", hn, F4, B);
                     MlaAttnArgs ma;
-                    ma.M = B; ma.NH = 32; ma.p0 = a; ma.p0_dev = &d_dargs->a; ma.cache_slots = r.slots_sparse;
+                    ma.M = B; ma.NH = 32; ma.p0 = a; ma.p0_dev = &d_dargs->a; ma.cache_slots = r.slots_sparse; ma.kv_q8 = r.kv_q8;
                     if (use_list) {
                         hipLaunchKernelGGL(k_dfly_lists_d, dim3(B), dim3(256), 0, st, (const int32_t*)r.dkeys[d], (const int32_t*)r.dnkc[d], r.index_topk, &d_dargs->a, &d_dargs->row, dlist, dnk, lstride);
                         ma.mode = MLA_LIST; ma.keys = dlist; ma.nkeys = dnk; ma.kmax = lstride;
@@ -737,7 +738,7 @@ struct DFly2 {
             const bool use_list = r.cap_list[d];
             __half* dcache = r.kcache[L];
             if (isolate) {  // debug: work on a private copy of the target layer's cache so the target cache is never written by the drafter
-                const size_t by = mla_cache_bytes(r.slots_sparse);
+                const size_t by = mla_cache_bytes(r.slots_sparse, r.kv_q8);
                 if (!shadow[d]) HCK(hipMalloc((void**)&shadow[d], by));
                 HCK(hipMemcpyAsync(shadow[d], r.kcache[L], by, hipMemcpyDeviceToDevice, st));
                 dcache = shadow[d];
@@ -749,7 +750,7 @@ struct DFly2 {
             hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps);
             if (!(skip & 32)) r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);  // [B][8192]
             if (daf == 0 && !(skip & 32)) r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);  // [B][576]
-            if (!(skip & 8)) mla_write_kv(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, a, 0, (float)c.theta_sparse, c.rms_eps);
+            if (!(skip & 8)) mla_write_kv(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, a, 0, (float)c.theta_sparse, c.rms_eps, TreePos{}, r.kv_q8);
             const int kvfmt = r.ti(pa + ".kv_b_proj.weight").fmt;
             if (!(skip & 8)) mla_prep_q_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), F2, qa_h, B, 32, a, (float)c.theta_sparse);
             if (daf < 3 && !(skip & 32)) r.lin(pa + ".linear_gate.weight", hn, F4, B);  // [B][8192]
@@ -758,6 +759,7 @@ struct DFly2 {
             ma.NH = 32;
             ma.p0 = a;
             ma.cache_slots = r.slots_sparse;
+            ma.kv_q8 = r.kv_q8;
             if (use_list) {
                 hipLaunchKernelGGL(k_dfly_lists, dim3(B), dim3(256), 0, st, (const int32_t*)(r.dkeys[d] + (size_t)row * r.index_topk), (const int32_t*)(r.dnkc[d] + row), a, dlist, dnk, lstride);
                 ma.mode = MLA_LIST;
@@ -846,7 +848,7 @@ struct DFly2 {
             int lmask = 0;
             for (int d = 0; d < 5; ++d) if (r.cap_list[d]) lmask |= (1 << d);
             MlaAttnArgs ma_c;
-            ma_c.M = B; ma_c.NH = 32; ma_c.p0 = a; ma_c.mode = MLA_CAUSAL;
+            ma_c.M = B; ma_c.NH = 32; ma_c.p0 = a; ma_c.mode = MLA_CAUSAL; ma_c.kv_q8 = r.kv_q8;
             const int s_causal = (lmask == 31) ? 0 : mla_choose_splits(ma_c);
             const size_t need_ws = mla_workspace_bytes(B, 32, std::max(lstride, a + B));
             r.ensure_mla_ws(need_ws);
@@ -858,6 +860,7 @@ struct DFly2 {
             DgKey key{};
             key.K = K; key.list_mask = lmask; key.s_causal = s_causal; key.rv = N;
             key.kv_is_host = r.kv_is_host ? 1 : 0;
+            key.kv_q8 = r.kv_q8 ? 1 : 0;
             key.slots_sparse = r.slots_sparse;
             key.lin_gemv_max = skd::lin_gemv_max_m();
 #if HY4_CUDA && HY4_MMA
@@ -901,12 +904,12 @@ struct DFly2 {
                     hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps);
                     r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);
                     if (daf == 0) r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);
-                    mla_write_kv_d(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, &d_dargs->a, 0, (float)c.theta_sparse, c.rms_eps);
+                    mla_write_kv_d(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, &d_dargs->a, 0, (float)c.theta_sparse, c.rms_eps, nullptr, r.kv_q8);
                     const int kvfmt = r.ti(pa + ".kv_b_proj.weight").fmt;
                     mla_prep_q_dec_d(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), F2, qa_h, B, 32, &d_dargs->a, (float)c.theta_sparse);
                     if (daf < 3) r.lin(pa + ".linear_gate.weight", hn, F4, B);
                     MlaAttnArgs ma;
-                    ma.M = B; ma.NH = 32; ma.p0 = a; ma.p0_dev = &d_dargs->a; ma.cache_slots = r.slots_sparse;
+                    ma.M = B; ma.NH = 32; ma.p0 = a; ma.p0_dev = &d_dargs->a; ma.cache_slots = r.slots_sparse; ma.kv_q8 = r.kv_q8;
                     if (use_list) {
                         hipLaunchKernelGGL(k_dfly_lists_d, dim3(B), dim3(256), 0, st, (const int32_t*)r.dkeys[d], (const int32_t*)r.dnkc[d], r.index_topk, &d_dargs->a, &d_dargs->row, dlist, dnk, lstride);
                         ma.mode = MLA_LIST; ma.keys = dlist; ma.nkeys = dnk; ma.kmax = lstride;
@@ -962,7 +965,7 @@ struct DFly2 {
             const bool use_list = r.cap_list[d];
             __half* dcache = r.kcache[L];
             if (isolate) {
-                const size_t by = mla_cache_bytes(r.slots_sparse);
+                const size_t by = mla_cache_bytes(r.slots_sparse, r.kv_q8);
                 if (!shadow[d]) HCK(hipMalloc((void**)&shadow[d], by));
                 HCK(hipMemcpyAsync(shadow[d], r.kcache[L], by, hipMemcpyDeviceToDevice, st));
                 dcache = shadow[d];
@@ -974,7 +977,7 @@ struct DFly2 {
             hipLaunchKernelGGL(k_rms_rows, dim3(B), dim3(256), 0, st, (const float*)F1, wf(pa + ".q_a_layernorm.weight"), (float*)nullptr, qr_h, c.q_lora, c.rms_eps);
             if (!(skip & 32)) r.lin(pa + ".q_b_proj.weight", qr_h, F2, B);
             if (daf == 0 && !(skip & 32)) r.lin(pa + ".kv_a_proj_with_mqa.weight", hn, F3, B);
-            if (!(skip & 8)) mla_write_kv(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, a, 0, (float)c.theta_sparse, c.rms_eps);
+            if (!(skip & 8)) mla_write_kv(st, F3, wf(pa + ".kv_a_layernorm.weight"), dcache, r.slots_sparse, B, a, 0, (float)c.theta_sparse, c.rms_eps, TreePos{}, r.kv_q8);
             const int kvfmt = r.ti(pa + ".kv_b_proj.weight").fmt;
             if (!(skip & 8)) mla_prep_q_dec(st, kvfmt, r.tw(pa + ".kv_b_proj.weight"), F2, qa_h, B, 32, a, (float)c.theta_sparse);
             if (daf < 3 && !(skip & 32)) r.lin(pa + ".linear_gate.weight", hn, F4, B);
@@ -983,6 +986,7 @@ struct DFly2 {
             ma.NH = 32;
             ma.p0 = a;
             ma.cache_slots = r.slots_sparse;
+            ma.kv_q8 = r.kv_q8;
             if (use_list) {
                 hipLaunchKernelGGL(k_dfly_lists, dim3(B), dim3(256), 0, st, (const int32_t*)(r.dkeys[d] + (size_t)row * r.index_topk), (const int32_t*)(r.dnkc[d] + row), a, dlist, dnk, lstride);
                 ma.mode = MLA_LIST;

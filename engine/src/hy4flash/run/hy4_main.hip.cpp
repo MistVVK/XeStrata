@@ -468,8 +468,12 @@ int main(int argc, char** argv) {
         }
         else if (a == "--kv") {
             std::string kv = nxt();
-            if (kv != "fp16") {
-                printf("ERR --kv %s: only fp16\n", kv.c_str());
+            if (kv == "fp16" || kv == "f16") {
+                hy4_setenv("HY4_KV_Q8", "0", 1);
+            } else if (kv == "q8" || kv == "int8" || kv == "i8" || kv == "k8v8") {
+                hy4_setenv("HY4_KV_Q8", "1", 1);
+            } else if (kv != "auto") {
+                printf("ERR --kv %s: expected fp16, q8 or auto\n", kv.c_str());
                 fflush(stdout);
                 return 2;
             }

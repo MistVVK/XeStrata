@@ -24,7 +24,13 @@ namespace hy4 {
 
 constexpr int MLA_KV_LORA = 512;
 constexpr int MLA_ROPE = 64;
-constexpr int MLA_ROW = 576;     // halves per cache row
+constexpr int MLA_ROW = 576;     // halves per FP16 cache row (1152 B/slot)
+// Compressed Q8 MLA cache row (656 B/slot = 328 halves, 43.1% smaller than FP16, 16-byte aligned):
+//   [0..511]   int8_t kv_cmpr[512] (8 groups of 64, symmetric INT8)
+//   [512..527] __half sc[8]        (per-64-element scale = amax / 127.0f)
+//   [528..655] __half k_pe[64]     (lossless FP16 RoPE key!)
+constexpr int MLA_ROW_Q8_BYTES = 656;
+constexpr int MLA_ROW_Q8_HALVES = 328;
 constexpr int MLA_NOPE = 192;
 constexpr int MLA_QHEAD = 256;   // q_b output per head: [192 nope | 64 pe]
 constexpr int MLA_VHEAD = 256;
@@ -48,6 +54,7 @@ struct MlaAttnArgs {
     int window = 512;       // MLA_WINDOW
     int ring = 0;           // ring size (slots) of the cache; 0 = linear cache (slot = position)
     int cache_slots = 0;    // total slots of the cache buffer (the Vt region starts at cache + cache_slots*576 halves); must equal the value given to mla_write_kv
+    bool kv_q8 = false;     // true: compressed Q8 MLA KV cache (656 B/slot: int8 kv_cmpr[512] + half sc[8] + lossless FP16 k_pe[64])
     // MLA_LIST (IndexPool picks). Entries are consumed in blocks of 4: entry 4b+u is the slot of position 4*G+u of ONE aligned 4-token group G
     // (for the fast path the 4 entries of a block must be the slots 4G..4G+3 in order; the last block may be partial, nkeys counts valid entries).
     const int32_t* keys = nullptr;   // [M][kmax] cache slot indices (logical positions when tree_nodes > 0), kmax % 4 == 0
@@ -73,8 +80,8 @@ struct MlaAttnArgs {
 size_t mla_workspace_bytes(int M, int NH, int max_keys);
 size_t mla_workspace_bytes(const struct MlaAttnArgs& a);   // exact for this call (derives max_keys from the mode; use this one)
 int mla_choose_splits(const struct MlaAttnArgs& a);        // exact split count S that mla_attend will use for these args
-// bytes of one layer's KV cache buffer with `slots` slots (rows + Vt)
-size_t mla_cache_bytes(int slots);
+// bytes of one layer's KV cache buffer with `slots` slots (FP16: 1152 B/slot, Q8: 656 B/slot)
+size_t mla_cache_bytes(int slots, bool kv_q8 = false);
 
 // ---- kernels -------------------------------------------------------------------------------------------------------------------------------------
 // 1. q absorb + rope.   q_b: fp32 [M][NH][256] (output of the q_b_proj GEMM; first 192 = nope, last 64 = pe).
@@ -95,12 +102,12 @@ void mla_vup_dec(hipStream_t s, int fmt, const void* kv_b, const __half* ctx, co
 
 // 2. KV cache write.  kv_a: fp32 [M][576] (output of kv_a_proj_with_mqa: 512 latent | 64 pe). Writes cache slot (p0+t) % ring (ring = 0: slot = p0+t):
 //    cache[slot][0:512] = half(kv_a[t][0:512] * rsqrt(mean(kv_a[t][0:512]^2) + eps) * norm_w[c]);  cache[slot][512:576] = rope(kv_a[t][512:576], pos, theta).
-void mla_write_kv(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, int p0, int ring, float theta, float eps, TreePos tp = {});
-void mla_write_kv_d(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, const int* p0_dev, int ring, float theta, float eps, const TreePos* tp_dev = nullptr);
+void mla_write_kv(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, int p0, int ring, float theta, float eps, TreePos tp = {}, bool kv_q8 = false);
+void mla_write_kv_d(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, const int* p0_dev, int ring, float theta, float eps, const TreePos* tp_dev = nullptr, bool kv_q8 = false);
 
 // 2b. Compact accepted tree-branch KV rows: for k = 0..src.n-1 copies physical slot (p0 + src.depth[k]) -> (p0 + k) (mod ring if ring > 0).
 //     Requires src.depth[k] >= k (topological order), so sequential in-place compaction is race-free.
-void mla_compact_kv(hipStream_t s, __half* cache, int cache_slots, int p0, int ring, TreePos src);
+void mla_compact_kv(hipStream_t s, __half* cache, int cache_slots, int p0, int ring, TreePos src, bool kv_q8 = false);
 
 // 3. attention, latent output.  qa: half [M][NH][576]; cache: half rows; sinks: fp32 [NH]; ctx: HALF [M][NH][512] (softmax-weighted latent rows).
 //    The cache must already hold every key position the chunk can see (write the chunk's own K/V first).  ws: scratch (>= mla_workspace_bytes()), may be null for tiny M*keys.

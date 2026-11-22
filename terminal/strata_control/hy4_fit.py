@@ -50,16 +50,19 @@ DEFAULT_CONTEXT = 131072         # owner, 2026-11-19: 128K by default
 CONTEXTS = [8192, 32768, 65536, 131072]
 KV_GB_PER_TOKEN = 34.7e-6        # KV + context workspace (IndexPool, workspace and Engram buffers grow with it too), per token: HY4-STRIX, Strix Halo SQ-64: (66.3 - 62.2) GiB x 1.0737 / (131072 - 4096); HY4-METAL (M5 Max): +5.0 GB from 4K to 128K, KV alone 1.9 GB of it
 DRAFTER_GB = 0.44                # the 5-layer DFly2 drafter, in Section 1 already (inside every build's dense_gb): kept here to say so, not added twice
-#: HY4-CUDA's engine decides where the Vt-free sparse-layer KV rows and IndexPool state live (plan_memory in hy4_gpu_model.hip.h, 71576cda5 / 6e38f588a): `engine_plan` below
-#: is that rule.  Pinned host memory is what the engine puts out of the card when full-context KV exceeds VRAM: ~3.02 GB at 128K on an 8 GiB card (rows 1.81 + IndexPool 0.91 + 0.30), 0 GB on >= 12 GiB.
-HOST_KV_GB_PER_TOKEN = 3.018 / 131072    # kept for callers that want the 8 GiB-card figure per token (host_kv_gb says it for a card)
+#: HY4-CUDA's engine decides where the Vt-free sparse-layer KV rows and IndexPool state live (plan_memory in hy4_gpu_model.hip.h): `engine_plan` below
+#: is that rule.  Pinned host memory is what the engine puts out of the card when full-context KV exceeds VRAM: ~3.04 GB at 128K on an 8 GiB card, 0 GB on >= 12 GiB.
+HOST_KV_GB_PER_TOKEN = 3.04 / 131072     # kept for callers that want the 8 GiB-card figure per token (host_kv_gb says it for a card)
 HOST_PIN_HEADROOM_GB = 3.8               # the pinned staging beside the cache itself
-ENGINE_KV_ROW_B = 12.0 * 1152.0          # per position: the 12 sparse layers' Vt-free MLA KV rows (bytes; 71576cda5 eliminated the 1024 B/slot Vt cache)
+ENGINE_KV_ROW_B = 12.0 * 1152.0          # per position: the 12 sparse layers' FP16 MLA KV rows (576 halves, no Vt)
+ENGINE_KV_ROW_Q8_B = 12.0 * 656.0        # per position: the 12 sparse layers' Q8 compressed MLA KV rows (656 B/slot, lossless FP16 RoPE)
 ENGINE_IDX_B = 12.0 * 512.0 + 12.0 * 64.0  # per position: IndexPool iv/ig + the pooled keys (bytes; the pooled keys are max_ctx/4 x 256 B, i.e. 64 B a position)
-ENGINE_WKV_GB = 0.03                     # single-layer reusable FP16 wk/wv prefill scratch (28 MiB; replaced the 1.06 GB absorbed kv_b copies in 6e38f588a)
+ENGINE_KVB_GB = 0.03                     # single-layer reusable FP16 wk/wv prefill scratch (28 MiB; decode reads quantized kv_b directly)
+ENGINE_WKV_GB = ENGINE_KVB_GB
 ENGINE_CUBLAS_GB = 0.08                  # 64 MiB reusable side-stream FP16 dequant + cuBLAS scratch
-ENGINE_HOST_EMBED_GB = 0.38              # discrete cards (< 48 GiB) map embed_tokens in host RAM (hy4_gpu_model.hip.h:340)
-ENGINE_MARGIN_GB = 0.3
+ENGINE_EMBED_HOST_GB = 0.38              # embed_tokens pinned in host RAM on discrete cards < 48 GiB
+ENGINE_HOST_EMBED_GB = ENGINE_EMBED_HOST_GB
+ENGINE_MARGIN_GB = 0.32
 ENGINE_DENSE_EXTRA_GB = 0.12             # the engine's trunk (Section 1 of the file, 5.92 GB for SQ-64) is a little more than the author's dense_gb (5.80)
 FAMILY = "hy4-flash"
 FAMILY_NAME = "hy4-flash"        # the config's model_name prefix
@@ -90,56 +93,66 @@ def non_expert_gb(ctx: int | None = None) -> float:
     return VRAM_NON_EXPERT_GB + kv_extra_gb(ctx)
 
 
-def _est_work_gb(c: int) -> float:
-    """HY4-CUDA's aliased work_arena + activations + 30 SWA rings (est_work_gb in hy4_gpu_model.hip.h:359-363)."""
-    arena = max(2.0 * c * 16384.0 * 4.0, float(c) * 16.0 * 1536.0 * 6.0) / 1e9
-    return arena + c * 0.195e6 / 1e9 + 0.22 + 30.0 * (512.0 + c) * 1152.0 / 1e9
-
-
-def engine_plan(vram_gib: float, ctx: int | None = None, dense_gb: float = 5.80) -> dict:
-    """HY4-CUDA's memory plan for a context on a card (plan_memory in engine/src/hy4flash/run/hy4_gpu_model.hip.h:328-423, v0.2.18), mirrored: where the KV state lives and
-    what the card keeps free for it at full `ctx` steady state.  Returns {chunk, work_gb, mask, dev_pos, host_embed, trunk_gb, reserve_gb, host_need_gb}:
-      mask bit 1: the KV rows + IndexPool live in pinned host memory from token 0;
-      dev_pos: on a card that cannot hold all `ctx` rows in VRAM (e.g. 8 GiB at 128K), the first dev_pos positions of rows + IndexPool stay in VRAM (~94K on SQ-64) and move
-               to pinned host memory once the context passes it (growable KV; mask bit 1 is then clear, and host_need_gb counts the spilled rows + IndexPool);
-      host_embed: discrete cards under 48 GiB map embed_tokens (0.38 GB) in host RAM, reducing trunk VRAM by 0.38 GB;
-      reserve_gb: video memory the engine keeps free of experts at full `ctx` (working buffers, held KV state, wkv/cuBLAS scratch, and prefill streaming scratch);
-      host_need_gb: pinned host memory the spilled KV state takes once moved (0 when the whole state stays in the card, i.e. >= 12 GiB at 128K)."""
+def engine_plan(vram_gib: float, ctx: int | None = None, dense_gb: float = 5.80, kv_q8: bool = False) -> dict:
+    """HY4-CUDA's memory plan for a context on a card (plan_memory in engine/src/hy4flash/run/hy4_gpu_model.hip.h), mirrored:
+    - Discrete cards (< 48 GiB) keep embed_tokens (0.38 GB) in pinned mapped host memory and use single-layer reusable wk/wv scratch (0.03 GB).
+    - Single discrete cards (< 48 GiB) with ctx > 16384 start with 16K KV+IndexPool slots and grow incrementally by reclaiming adaptive vcache slabs.
+    - Optional compressed Q8 MLA KV (`kv_q8=True`, 656 B/slot vs 1152 B/slot FP16, lossless FP16 RoPE) is available via `--kv q8` / `HY4_KV_Q8=1`.
+    Returns {chunk, work_gb, mask, dev_pos, trunk_gb, reserve_gb, host_need_gb, kv_q8, init_slots, host_embed}."""
     n = DEFAULT_CONTEXT if ctx is None else int(ctx)
-    tot = float(vram_gib) * GIB_TO_GB
-    host_embed = tot < (48.0 * GIB_TO_GB)
-    trunk = dense_gb + ENGINE_DENSE_EXTRA_GB
-    if host_embed and trunk > 0.5:
-        trunk -= ENGINE_HOST_EMBED_GB
-    per_pos = ENGINE_KV_ROW_B + ENGINE_IDX_B  # 20,736 B per token across 12 sparse layers
-    init_slots = 16384 if (host_embed and n > 16384) else n
+    v = float(vram_gib)
+    tot = v * GIB_TO_GB
+    host_embed = v < 48.0
+    trunk = dense_gb + ENGINE_DENSE_EXTRA_GB - (ENGINE_EMBED_HOST_GB if host_embed and dense_gb > 0.5 else 0.0)
+    kv_q8 = bool(kv_q8)
+    kv_row_b = 656.0 if kv_q8 else 1152.0
+    per_pos = 12.0 * kv_row_b + ENGINE_IDX_B
+    init_slots = 16384 if (v < 48.0 and n > 16384) else n
     kv_init_gb = ((init_slots + 8 + 15) // 16 * 16) * per_pos / 1e9
-    chunk = (8192 if n >= 8192 else 4096) if tot >= 15.0 else (2048 if tot >= 11.0 else 1024)
+    wkv = ENGINE_KVB_GB
+    cublas_gb = 0.08
+
+    def est_work_gb(c: int) -> float:
+        arena = max(2.0 * c * 16384.0 * 4.0, float(c) * 16.0 * 1536.0 * 6.0) / 1e9
+        return arena + c * 0.195e6 / 1e9 + 0.22 + 30.0 * (512.0 + c) * kv_row_b / 1e9
+
+    chunk = (8192 if n >= 8192 else 4096) if tot >= 44.0 else (4096 if tot >= 15.0 else (2048 if tot >= 11.5 else 1024))
     work_cap = 0.22 if tot >= 15.0 else 0.16
-    while chunk > 256 and _est_work_gb(chunk) > work_cap * tot:
+    while chunk > 256 and est_work_gb(chunk) > work_cap * tot:
         chunk //= 2
-    while chunk > 256 and trunk + _est_work_gb(chunk) + kv_init_gb + ENGINE_WKV_GB + ENGINE_CUBLAS_GB + 0.55 > tot:
+    while chunk > 256 and trunk + est_work_gb(chunk) + kv_init_gb + wkv + cublas_gb + 0.55 > tot:
         chunk //= 2
+
+    work = est_work_gb(chunk)
     slots = (n + 8 + 15) // 16 * 16
-    rows = slots * ENGINE_KV_ROW_B / 1e9
+    rows = 12.0 * slots * kv_row_b / 1e9
     pivg = (12.0 * n * 512.0 + 12.0 * (n // 4 + 8) * 256.0) / 1e9
-    work = _est_work_gb(chunk)
-    mask = 1 if (trunk + work + pivg + rows + ENGINE_WKV_GB + ENGINE_CUBLAS_GB + 0.35 > tot) else 0
+    mask = 1 if (trunk + work + pivg + rows + wkv + cublas_gb + 0.35 > tot) else 0
     dev_pos = 0
     if mask & 1:
-        avail = tot - trunk - work - ENGINE_WKV_GB - ENGINE_CUBLAS_GB - 0.35
+        avail = tot - trunk - work - wkv - cublas_gb - 0.35
         dp = int(avail * 1e9 / per_pos) // 1024 * 1024 if avail > 0 else 0
         if 4096 <= dp < n:
             mask &= ~1
             dev_pos = dp
-    host_need = (rows + (pivg if dev_pos else 0.0) if ((mask & 1) or dev_pos) else 0.0) + ENGINE_MARGIN_GB
-    kv_res = 0.0 if (mask & 1) else ((dev_pos * per_pos / 1e9) if dev_pos else (rows + pivg))
-    pf_res = 0.82 if (21.5 <= tot < 64.0 and mask == 0 and not dev_pos) else (0.56 if (10.0 <= tot < 64.0 and mask == 0 and not dev_pos) else 0.0)
-    margin_res = 0.35 if dev_pos else 0.45
-    reserve = work + kv_res + ENGINE_WKV_GB + ENGINE_CUBLAS_GB + pf_res + margin_res
-    return {"chunk": chunk, "work_gb": round(work, 3), "mask": mask, "dev_pos": dev_pos, "host_embed": host_embed,
-            "trunk_gb": round(trunk, 2), "reserve_gb": round(reserve, 3),
-            "host_need_gb": round(host_need, 3) if (mask or dev_pos) else 0.0}
+    host_kv = (rows + (pivg if dev_pos else 0.0)) if ((mask & 1) or dev_pos) else 0.0
+    host_need = (host_kv + ENGINE_MARGIN_GB) if host_kv > 0.0 else 0.0
+    kv_res = 0.0 if (mask & 1) else (kv_init_gb if init_slots < n else (dev_pos * per_pos / 1e9 if dev_pos else (rows + pivg)))
+    pf_res = 0.0 if (mask != 0 or tot >= 64.0) else (0.82 if tot >= 21.5 else (0.56 if tot >= 14.5 else (0.34 if tot >= 10.0 else 0.22)))
+    margin = ENGINE_MARGIN_GB if tot < 14.5 else 0.45
+    reserve = work + kv_res + wkv + cublas_gb + pf_res + margin
+    return {
+        "chunk": chunk,
+        "work_gb": round(work, 3),
+        "mask": mask,
+        "dev_pos": dev_pos,
+        "trunk_gb": round(trunk, 2),
+        "reserve_gb": round(reserve, 3),
+        "host_need_gb": round(host_need, 3),
+        "kv_q8": kv_q8,
+        "init_slots": init_slots,
+        "host_embed": host_embed,
+    }
 
 
 def host_kv_gb(ctx: int | None = None, vram_gib: float = 8.0) -> float:
@@ -165,14 +178,12 @@ def compute(build: str, vram_gib: float, ram_gib: float, ctx: int | None = None,
         plan = engine_plan(vram_gib, n, info["dense_gb"])
         primary_room = max(0.0, vram_gib * GIB_TO_GB - plan["trunk_gb"] - plan["reserve_gb"])
         host = plan["host_need_gb"]
-        host_embed_ram = ENGINE_HOST_EMBED_GB if plan["host_embed"] else 0.0
     else:
         primary_room = max(0.0, vram_gib * GIB_TO_GB - info["dense_gb"] - non_expert_gb(ctx))
         host = 0.0
-        host_embed_ram = 0.0
     extra_room = max(0.0, float(extra_vram_gib) * GIB_TO_GB - PEER_OVERHEAD_GB) if extra_vram_gib and extra_vram_gib > 0 else 0.0
     gpu_room = primary_room + extra_room
-    ram_room = max(0.0, ram_gib * GIB_TO_GB - OS_RESERVE_GB - HOT_ENGRAM_GB - host_embed_ram - (VISION_GB if vision else 0.0) - ((host + HOST_PIN_HEADROOM_GB) if host > 0 else 0.0))
+    ram_room = max(0.0, ram_gib * GIB_TO_GB - OS_RESERVE_GB - HOT_ENGRAM_GB - (VISION_GB if vision else 0.0) - ((host + HOST_PIN_HEADROOM_GB) if host > 0 else 0.0))
     in_vram = min(info["bodies_gb"], gpu_room)
     in_ram = min(info["bodies_gb"] - in_vram, ram_room)
     on_ssd = max(0.0, info["bodies_gb"] - in_vram - in_ram)

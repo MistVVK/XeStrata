@@ -143,19 +143,28 @@ public:
         // Compute exact minimum KV + ShortConv + workspace headroom for parallel slots before pinning experts!
         max_slots_ = std::max(1, std::min(kMaxParallelSlots, opts.parallel));
         kv_dtype_ = opts.kv_dtype;
-        if (opts.kv_dtype_auto && (max_slots_ >= 16 || prop.totalGlobalMem <= (13ull << 30)) && prop.totalGlobalMem < (40ull << 30)) {
+        // Auto-select FP8 KV on <= 13 GiB GPUs:
+        // - Always on sm_89+ (Ada/Blackwell native FP8) or <= 10.5 GiB (8-10 GB cards where FP16 KV crowds out 3x-looped core experts / OOMs at 32K)
+        // - On pre-Ada 12 GB cards (e.g. RTX 3060 sm_86 without native FP8), keep FP16 KV at parallel < 4 for max speed; switch to FP8 when parallel >= 4!
+        const int cc = prop.major * 10 + prop.minor;
+        const bool tight_ampere_kv = (prop.totalGlobalMem <= (size_t)(10.5 * 1073741824.0)) || (max_slots_ >= 4);
+        if (opts.kv_dtype_auto && prop.totalGlobalMem < (40ull << 30) &&
+            (max_slots_ >= 16 || (prop.totalGlobalMem <= (13ull << 30) && (cc >= 89 || tight_ampere_kv)))) {
             kv_dtype_ = KvDtype::FP8_E4M3;
         }
-        const int eff_chunk = std::max(64, opts.chunk);
+        const bool is_8bit_kv = (kv_dtype_ == KvDtype::FP8_E4M3 || kv_dtype_ == KvDtype::K8V8 || kv_dtype_ == KvDtype::K8V4);
+        const int eff_chunk = (prop.totalGlobalMem <= (10ull << 30)) ? std::max(64, std::min(opts.chunk, 256))
+                                                                     : std::max(64, opts.chunk);
         const size_t swa_r = (max_slots_ >= 16) ? (size_t)(strata::ink::kInkSwaWin + 32)
                                                 : (size_t)(strata::ink::kInkSwaWin + std::max(eff_chunk, 64));
-        const size_t bpe = (kv_dtype_ == KvDtype::FP8_E4M3) ? 2ull : 4ull;
-        const size_t sc_per_pos = (kv_dtype_ == KvDtype::FP8_E4M3) ? (size_t)(2 * strata::ink::kInkKVHeads * 4) : 0ull;
+        const size_t bpe = is_8bit_kv ? 2ull : 4ull;
+        const size_t sc_per_pos = is_8bit_kv ? (size_t)(2 * strata::ink::kInkKVHeads * 4) : 0ull;
         const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos)
                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
                                   + (size_t)8 * max_slots_ * 256 * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos);
         const size_t ws_pad = (max_slots_ >= 8) ? (1536ull << 20)
                             : ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20)
+                             : (prop.totalGlobalMem <= (10ull << 30)) ? (220ull << 20)
                              : (prop.totalGlobalMem <= (13ull << 30)) ? (260ull << 20)
                                                                       : (320ull << 20));
         size_t min_reserve_bytes = min_kv_bytes + ws_pad;
@@ -171,8 +180,8 @@ public:
             return false;
         }
 
-        auto cuda_kvd = (kv_dtype_ == KvDtype::FP8_E4M3) ? strata::ink::InkKvDtype::FP8
-                                                          : strata::ink::InkKvDtype::FP16;
+        auto cuda_kvd = is_8bit_kv ? strata::ink::InkKvDtype::FP8
+                                   : strata::ink::InkKvDtype::FP16;
 
         runner_ = std::make_unique<strata::ink::InkCudaRunner>(model_);
         const bool vf_graph_ok = strata::core::allow_1024_thread_cuda_graphs(
@@ -526,10 +535,10 @@ public:
         strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
             runner_->d_sconv_pool_arr, d_sconv_snap_, 0, runner_->max_slots, true);
 
-        // 2. True W=4 Multi-Branch Sparse-MoE Bayes-Optimal Adaptive Beam Tree (M* in {3,4,5,6,8,10,12})!
+        // 2. True W=4 Multi-Branch Sparse-MoE Bayes-Optimal Adaptive Beam Tree (M* in {3..12}):
+        //    In hybrid mode, full W=4 M<=12 amortizes PCIe+CPU host expert misses across 4-6 accepted tokens/step!
         strata::ink::InkTreeSpec tr{};
-        const int max_nodes = std::min(12, runner_->tree_cap);
-        dspark_->draft_beam_tree(anchor_tok, anchor_pos, /*beam_w=*/4, max_nodes, tr, /*adaptive_moe_ratio=*/4.2f);
+        dspark_->draft_beam_tree(anchor_tok, anchor_pos, 4, std::min(12, runner_->tree_cap), tr, 4.2f);
 
         // 3. Single CUDA-Graph 48-visit tree verify + exact GPU screened argmax (ZERO 6.4 MB logits D2H!)
         runner_->forward_tree_verify(tr, anchor_pos, 0, true);

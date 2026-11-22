@@ -613,9 +613,11 @@ public:
 #endif
         );
 
-        // Auto-select FP8_E4M3 KV when high concurrency (>= 16) on <= 32 GiB GPU
+        // Auto-select FP8_E4M3 KV when high concurrency (>= 16) on <= 32 GiB GPU OR on <= 13 GiB discrete GPUs (8/10/12 GB)
         default_kv_dtype_ = opts.kv_dtype;
-        if (opts.kv_dtype_auto && opts.parallel >= 16 && mem_info_.effective_total_bytes <= 36ULL * 1073741824ULL) {
+        if (opts.kv_dtype_auto &&
+            ((opts.parallel >= 16 && mem_info_.effective_total_bytes <= 36ULL * 1073741824ULL) ||
+             (!mem_info_.is_uma && mem_info_.effective_total_bytes <= 13ULL * 1073741824ULL))) {
             default_kv_dtype_ = KvDtype::FP8_E4M3;
         }
         max_slots_ = std::max(1, std::min(kMaxParallelSlots, opts.parallel));

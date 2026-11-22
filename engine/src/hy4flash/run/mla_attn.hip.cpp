@@ -150,6 +150,59 @@ __global__ void __launch_bounds__(256) k_compact_kv(__half* __restrict__ cache, 
     }
 }
 
+// Compressed Q8 MLA KV cache write (656 B/slot = 41 x 16B: int8_t[512] + half sc[8] + lossless FP16 k_pe[64]).
+// 256 threads = 8 warps -> 1 warp per 64-element group (zero extra __syncthreads() for absmax!).
+__global__ void __launch_bounds__(256) k_write_kv_q8(const float* __restrict__ kv_a, const float* __restrict__ norm_w, __half* __restrict__ cache, int cache_slots, int M, int p0,
+                                                       int ring, float theta, float eps, TreePos tp, const int* __restrict__ p0_dev = nullptr, const TreePos* __restrict__ tp_dev = nullptr) {
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float red[8];
+    const float* row = kv_a + (size_t)t * MLA_ROW;
+    const float v0 = row[2 * tid], v1 = row[2 * tid + 1];
+    const float ss = block_sum(v0 * v0 + v1 * v1, red);
+    const float inv = 1.0f / sqrtf(ss / (float)MLA_KV_LORA + eps);
+    const float x0 = v0 * inv * norm_w[2 * tid];
+    const float x1 = v1 * inv * norm_w[2 * tid + 1];
+    const float amax = wave_max(fmaxf(fabsf(x0), fabsf(x1)));
+    const float sc = amax > 1e-12f ? (amax * (1.0f / 127.0f)) : 1.0f;
+    const float inv_sc = amax > 1e-12f ? (127.0f / amax) : 0.0f;
+    const int q0 = max(-127, min(127, __float2int_rn(x0 * inv_sc)));
+    const int q1 = max(-127, min(127, __float2int_rn(x1 * inv_sc)));
+    const int p0_use = p0_dev ? *p0_dev : p0;
+    const int phys_pos = p0_use + t;
+    const int tp_n = tp_dev ? tp_dev->n : tp.n;
+    const int rope_pos = tp_n > 0 ? p0_use + (int)(tp_dev ? tp_dev->depth[t] : tp.depth[t]) : phys_pos;
+    const int slot = ring > 0 ? phys_pos % ring : phys_pos;
+    uint8_t* dst_b = reinterpret_cast<uint8_t*>(cache) + (size_t)slot * MLA_ROW_Q8_BYTES;
+    int8_t* dst_q = reinterpret_cast<int8_t*>(dst_b);
+    dst_q[2 * tid]     = (int8_t)q0;
+    dst_q[2 * tid + 1] = (int8_t)q1;
+    if ((tid & 31) == 0) {
+        reinterpret_cast<__half*>(dst_b + 512)[tid >> 5] = __float2half(sc);
+    }
+    (void)cache_slots;
+    if (tid < 32) {
+        float o0, o1;
+        rope_pair(row[MLA_KV_LORA + 2 * tid], row[MLA_KV_LORA + 2 * tid + 1], rope_pos, tid, theta, o0, o1);
+        *reinterpret_cast<__half2*>(reinterpret_cast<__half*>(dst_b + 528) + 2 * tid) = __floats2half2_rn(o0, o1);
+    }
+}
+
+__global__ void __launch_bounds__(256) k_compact_kv_q8(__half* __restrict__ cache, int /*cache_slots*/, int p0, int ring, TreePos src) {
+    const int tid = threadIdx.x;
+    uint8_t* base = reinterpret_cast<uint8_t*>(cache);
+    for (int k = 0; k < src.n; ++k) {
+        const int sidx = (int)src.depth[k];
+        if (sidx == k) continue;
+        const int s_slot = ring > 0 ? (p0 + sidx) % ring : (p0 + sidx);
+        const int d_slot = ring > 0 ? (p0 + k) % ring : (p0 + k);
+        const uint4* sr = reinterpret_cast<const uint4*>(base + (size_t)s_slot * MLA_ROW_Q8_BYTES);
+        uint4* dr = reinterpret_cast<uint4*>(base + (size_t)d_slot * MLA_ROW_Q8_BYTES);
+        if (tid < MLA_ROW_Q8_BYTES / 16) dr[tid] = sr[tid];
+        __syncthreads();
+    }
+}
+
 __device__ __forceinline__ int mla_tree_slot(const MlaAttnArgs& a, int t, int lp) {
     int phys = lp;
     const int p0_use = a.p0_dev ? *a.p0_dev : a.p0;
@@ -164,6 +217,82 @@ __device__ __forceinline__ int mla_tree_slot(const MlaAttnArgs& a, int t, int lp
 __device__ __forceinline__ int mla_query_pos(const MlaAttnArgs& a, int t, int p0_use) {
     const int tnodes = a.tree_dev ? a.tree_dev->tree_nodes : a.tree_nodes;
     return p0_use + (tnodes > 0 ? (int)(a.tree_dev ? a.tree_dev->tree_depth[t] : a.tree_depth[t]) : t);
+}
+
+__global__ void __launch_bounds__(256) k_attend_simple_q8(const __half* __restrict__ qa, const __half* __restrict__ cache, const float* __restrict__ sinks, __half* __restrict__ ctx,
+                                                          MlaAttnArgs a) {
+    const int h = blockIdx.x, t = blockIdx.y, tid = threadIdx.x;
+    __shared__ float qs[MLA_ROW];
+    __shared__ float sp[256];
+    __shared__ int ssl[256];
+    __shared__ float red[8];
+    const __half* qrow = qa + ((size_t)t * a.NH + h) * MLA_ROW;
+    for (int i = tid; i < MLA_ROW; i += 256) qs[i] = __half2float(qrow[i]);
+    __syncthreads();
+    const int p0_use = a.p0_dev ? *a.p0_dev : a.p0;
+    const int pos = mla_query_pos(a, t, p0_use);
+    int nk, lo = 0;
+    if (a.mode == MLA_CAUSAL) nk = pos + 1;
+    else if (a.mode == MLA_WINDOW) {
+        lo = max(0, pos - a.window + 1);
+        nk = pos - lo + 1;
+    } else nk = a.nkeys[t];
+
+    const uint8_t* base_b = reinterpret_cast<const uint8_t*>(cache);
+    float m = sinks[h];
+    float l = 1.0f;
+    float acc0 = 0.f, acc1 = 0.f;
+    for (int base = 0; base < nk; base += 256) {
+        const int j = base + tid;
+        float s = -INFINITY;
+        int slot = 0;
+        if (j < nk) {
+            const int lp = a.mode == MLA_CAUSAL ? j : (a.mode == MLA_WINDOW ? lo + j : a.keys[(size_t)t * a.kmax + j]);
+            slot = mla_tree_slot(a, t, lp);
+            const uint8_t* rb = base_b + (size_t)slot * MLA_ROW_Q8_BYTES;
+            const int8_t* rq = reinterpret_cast<const int8_t*>(rb);
+            const __half* rsc = reinterpret_cast<const __half*>(rb + 512);
+            const __half2* rpe = reinterpret_cast<const __half2*>(rb + 528);
+            float d = 0.f;
+            for (int g = 0; g < 8; ++g) {
+                const float sg = __half2float(rsc[g]);
+                float dg = 0.f;
+                for (int i = 0; i < 64; ++i) dg += qs[g * 64 + i] * (float)rq[g * 64 + i];
+                d += dg * sg;
+            }
+            for (int i = 0; i < 32; ++i) {
+                const __half2 kk = rpe[i];
+                d += qs[512 + 2 * i] * __low2float(kk) + qs[512 + 2 * i + 1] * __high2float(kk);
+            }
+            s = d * a.scale;
+        }
+        ssl[tid] = slot;
+        const float tmax = block_max(s, red);
+        const float nm = fmaxf(m, tmax);
+        const float corr = expf(m - nm);
+        const float p = (j < nk) ? expf(s - nm) : 0.f;
+        sp[tid] = p;
+        const float psum = block_sum(p, red);
+        l = l * corr + psum;
+        m = nm;
+        acc0 *= corr;
+        acc1 *= corr;
+        __syncthreads();
+        const int cnt = min(256, nk - base);
+        const int g = tid >> 5;
+        for (int jj = 0; jj < cnt; ++jj) {
+            const float pj = sp[jj];
+            const uint8_t* rb = base_b + (size_t)ssl[jj] * MLA_ROW_Q8_BYTES;
+            const int8_t* rq = reinterpret_cast<const int8_t*>(rb);
+            const float sg = __half2float(reinterpret_cast<const __half*>(rb + 512)[g]);
+            acc0 += pj * ((float)rq[2 * tid] * sg);
+            acc1 += pj * ((float)rq[2 * tid + 1] * sg);
+        }
+        __syncthreads();
+    }
+    const float il = 1.0f / l;
+    __half* o = ctx + ((size_t)t * a.NH + h) * MLA_KV_LORA;
+    *reinterpret_cast<__half2*>(o + 2 * tid) = __floats2half2_rn(acc0 * il, acc1 * il);
 }
 
 // ---- 3. simple attention: one block per (head, query) -------------------------------------------------------------------------------------------------
@@ -1030,11 +1159,11 @@ __global__ void __launch_bounds__(128) k_attend_wmma(const __half* __restrict__ 
     }
 }
 
-// Coalesced Host-KV Tile-Staging Flash-MLA kernel (CUDA, sm_80+ / sm_75):
-// Used automatically when `cache` lives in pinned host memory (8 GB cards past 34K context) or when HY4_HOST_KV_STAGE=1.
-// Stages 16 full key rows (16 x 576 halves = 18.4 KB) into shared memory using 100% coalesced 128-byte PCIe bursts,
-// then computes BOTH Q@K^T and P@V straight from LDS (zero scattered reads, zero Vt PCIe reads -> 2x less PCIe traffic!).
+// Coalesced Host-KV / Q8-KV Tile-Staging Flash-MLA kernel (CUDA, sm_80+ / sm_75):
+// Stages 16 full key rows into shared memory `sK[16][QP]` using 100% coalesced 128-byte bursts (or 43% smaller Q8 rows unpacked in-register!),
+// then computes BOTH Q@K^T and P@V straight from LDS with Tensor Core `mma_16816` (zero scattered reads, zero Vt reads!).
 constexpr int HBK = 16;
+template <bool KV_Q8 = false>
 __global__ void __launch_bounds__(128) k_attend_host_kv(const __half* __restrict__ qa, const __half* __restrict__ cache, const float* __restrict__ sinks, __half* __restrict__ out,
                                                         float* __restrict__ part, MlaAttnArgs a, int S, int tps) {
     const int rt = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
@@ -1048,6 +1177,7 @@ __global__ void __launch_bounds__(128) k_attend_host_kv(const __half* __restrict
     __shared__ float sSc[2][16 * 16];  // two K-halves of scores [16 heads][16 keys]
     __shared__ int sSlot[HBK];
     __shared__ uint8_t sValid[HBK];
+    __shared__ float sQ8Sc[HBK][8];    // per-64-element dequant scales when KV_Q8 == true
     {
         const half_t* qsrc = reinterpret_cast<const half_t*>(qa) + ((size_t)t * NH + h0) * MLA_ROW;
         for (int idx = tid; idx < 16 * (MLA_ROW / 8); idx += 128) {
@@ -1073,6 +1203,7 @@ __global__ void __launch_bounds__(128) k_attend_host_kv(const __half* __restrict
     const int tb = sp * tps_use, te = min(ntiles, tb + tps_use);
     const int32_t* klist = a.keys + (size_t)t * a.kmax;
     const half_t* rows = reinterpret_cast<const half_t*>(cache);
+    const uint8_t* rows_q8 = reinterpret_cast<const uint8_t*>(cache);
 
     float mrun[2], lrun[2];
 #pragma unroll
@@ -1102,12 +1233,47 @@ __global__ void __launch_bounds__(128) k_attend_host_kv(const __half* __restrict
             sValid[tid] = v ? 1 : 0;
         }
         __syncthreads();
-        // Coalesced 128-byte burst load of 16 key rows into sK[16][584] (zeroes invalid rows -> exact causal V masking)
-        for (int idx = tid; idx < HBK * (MLA_ROW / 8); idx += 128) {
-            const int k = idx / (MLA_ROW / 8), cc = (idx % (MLA_ROW / 8)) * 8;
-            uint4 v4 = make_uint4(0, 0, 0, 0);
-            if (sValid[k]) v4 = *reinterpret_cast<const uint4*>(rows + (size_t)sSlot[k] * MLA_ROW + cc);
-            *reinterpret_cast<uint4*>(&sK[k * QP + cc]) = v4;
+        if constexpr (KV_Q8) {
+            // Load 16 x 8 FP16 scales into sQ8Sc[16][8] (128 threads = 1 scale per thread!)
+            {
+                const int k = tid >> 3, sg = tid & 7;
+                sQ8Sc[k][sg] = sValid[k] ? __half2float(reinterpret_cast<const __half*>(rows_q8 + (size_t)sSlot[k] * MLA_ROW_Q8_BYTES + 512)[sg]) : 0.0f;
+            }
+            __syncthreads();
+            // Coalesced uint4 load of 16 x 512 int8 = 512 uint4s (4 per thread -> 64 int8 dequantized straight to sK!)
+            for (int idx = tid; idx < HBK * 32; idx += 128) {
+                const int k = idx >> 5, blk16 = idx & 31, cc = blk16 * 16;
+                const float sc = sQ8Sc[k][cc >> 6];
+                uint4 q4 = make_uint4(0, 0, 0, 0);
+                if (sValid[k]) q4 = *reinterpret_cast<const uint4*>(rows_q8 + (size_t)sSlot[k] * MLA_ROW_Q8_BYTES + cc);
+                const uint32_t words[4] = {q4.x, q4.y, q4.z, q4.w};
+                __half2* dst2 = reinterpret_cast<__half2*>(&sK[k * QP + cc]);
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const uint32_t wd = words[u];
+                    const int8_t b0 = (int8_t)(wd & 0xFFu);
+                    const int8_t b1 = (int8_t)((wd >> 8) & 0xFFu);
+                    const int8_t b2 = (int8_t)((wd >> 16) & 0xFFu);
+                    const int8_t b3 = (int8_t)((wd >> 24) & 0xFFu);
+                    dst2[2 * u + 0] = __floats2half2_rn((float)b0 * sc, (float)b1 * sc);
+                    dst2[2 * u + 1] = __floats2half2_rn((float)b2 * sc, (float)b3 * sc);
+                }
+            }
+            // Coalesced uint4 load of 16 x 64 lossless FP16 k_pe (128 uint4s = 1 per thread!)
+            {
+                const int k = tid >> 3, c8 = (tid & 7) * 8;
+                uint4 v4 = make_uint4(0, 0, 0, 0);
+                if (sValid[k]) v4 = *reinterpret_cast<const uint4*>(rows_q8 + (size_t)sSlot[k] * MLA_ROW_Q8_BYTES + 528 + c8 * 2);
+                *reinterpret_cast<uint4*>(&sK[k * QP + 512 + c8]) = v4;
+            }
+        } else {
+            // Coalesced 128-byte burst load of 16 key rows into sK[16][584] (zeroes invalid rows -> exact causal V masking)
+            for (int idx = tid; idx < HBK * (MLA_ROW / 8); idx += 128) {
+                const int k = idx / (MLA_ROW / 8), cc = (idx % (MLA_ROW / 8)) * 8;
+                uint4 v4 = make_uint4(0, 0, 0, 0);
+                if (sValid[k]) v4 = *reinterpret_cast<const uint4*>(rows + (size_t)sSlot[k] * MLA_ROW + cc);
+                *reinterpret_cast<uint4*>(&sK[k * QP + cc]) = v4;
+            }
         }
         __syncthreads();
         // Q @ K^T from LDS: 4 warps = 2 n8 sub-tiles (sn = w&1) x 2 K-halves (kh = w>>1, 18 steps each)
@@ -1875,7 +2041,9 @@ size_t mla_workspace_bytes(int M, int NH, int max_keys) {
     return (size_t)M * (NH / 16) * S * (16 * MLA_KV_LORA + 32) * sizeof(float);
 }
 
-size_t mla_cache_bytes(int slots) { return (size_t)slots * MLA_ROW * sizeof(__half); }
+size_t mla_cache_bytes(int slots, bool kv_q8) {
+    return (size_t)slots * (kv_q8 ? (size_t)MLA_ROW_Q8_BYTES : ((size_t)MLA_ROW * sizeof(__half)));
+}
 
 static int max_keys_of(const MlaAttnArgs& a) {
     if (a.mode == MLA_CAUSAL) {
@@ -2007,22 +2175,26 @@ void mla_prep_q(hipStream_t s, const float* q_b, const __half* wk_b, __half* qa,
     hipLaunchKernelGGL((k_prep_q<TT>), grid, dim3(256), 0, s, q_b, wk_b, qa, M, NH, p0, theta);
 }
 
-void mla_write_kv(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, int p0, int ring, float theta, float eps, TreePos tp) {
-    hipLaunchKernelGGL(k_write_kv, dim3(M), dim3(256), 0, s, kv_a, norm_w, cache, cache_slots, M, p0, ring, theta, eps, tp, (const int*)nullptr, (const TreePos*)nullptr);
+void mla_write_kv(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, int p0, int ring, float theta, float eps, TreePos tp, bool kv_q8) {
+    if (kv_q8) hipLaunchKernelGGL(k_write_kv_q8, dim3(M), dim3(256), 0, s, kv_a, norm_w, cache, cache_slots, M, p0, ring, theta, eps, tp, (const int*)nullptr, (const TreePos*)nullptr);
+    else hipLaunchKernelGGL(k_write_kv, dim3(M), dim3(256), 0, s, kv_a, norm_w, cache, cache_slots, M, p0, ring, theta, eps, tp, (const int*)nullptr, (const TreePos*)nullptr);
 }
-void mla_write_kv_d(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, const int* p0_dev, int ring, float theta, float eps, const TreePos* tp_dev) {
-    hipLaunchKernelGGL(k_write_kv, dim3(M), dim3(256), 0, s, kv_a, norm_w, cache, cache_slots, M, 0, ring, theta, eps, TreePos{}, p0_dev, tp_dev);
+void mla_write_kv_d(hipStream_t s, const float* kv_a, const float* norm_w, __half* cache, int cache_slots, int M, const int* p0_dev, int ring, float theta, float eps, const TreePos* tp_dev, bool kv_q8) {
+    if (kv_q8) hipLaunchKernelGGL(k_write_kv_q8, dim3(M), dim3(256), 0, s, kv_a, norm_w, cache, cache_slots, M, 0, ring, theta, eps, TreePos{}, p0_dev, tp_dev);
+    else hipLaunchKernelGGL(k_write_kv, dim3(M), dim3(256), 0, s, kv_a, norm_w, cache, cache_slots, M, 0, ring, theta, eps, TreePos{}, p0_dev, tp_dev);
 }
 
-void mla_compact_kv(hipStream_t s, __half* cache, int cache_slots, int p0, int ring, TreePos src) {
+void mla_compact_kv(hipStream_t s, __half* cache, int cache_slots, int p0, int ring, TreePos src, bool kv_q8) {
     if (src.n <= 0) return;
-    hipLaunchKernelGGL(k_compact_kv, dim3(1), dim3(256), 0, s, cache, cache_slots, p0, ring, src);
+    if (kv_q8) hipLaunchKernelGGL(k_compact_kv_q8, dim3(1), dim3(256), 0, s, cache, cache_slots, p0, ring, src);
+    else hipLaunchKernelGGL(k_compact_kv, dim3(1), dim3(256), 0, s, cache, cache_slots, p0, ring, src);
 }
 
 void mla_attend(hipStream_t s, const __half* qa, const __half* cache, const float* sinks, __half* ctx, const MlaAttnArgs& a, void* ws, size_t ws_bytes) {
     const bool fast_ok = !g_mla_force_simple && (a.NH % 16 == 0) && a.cache_slots > 0 && (a.cache_slots % 16 == 0) && (a.mode != MLA_WINDOW || (a.ring > 0 && a.ring % 16 == 0));
     if (!fast_ok) {
-        hipLaunchKernelGGL(k_attend_simple, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);
+        if (a.kv_q8) hipLaunchKernelGGL(k_attend_simple_q8, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);
+        else hipLaunchKernelGGL(k_attend_simple, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);
         return;
     }
     const int max_keys = max_keys_of(a);
@@ -2031,10 +2203,18 @@ void mla_attend(hipStream_t s, const __half* qa, const __half* cache, const floa
     const int tps = (ntiles + S - 1) / S;
     float* part = static_cast<float*>(ws);
     if (S > 1 && (ws == nullptr || ws_bytes < mla_workspace_bytes(a.M, a.NH, max_keys))) {
-        hipLaunchKernelGGL(k_attend_simple, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);  // no workspace: fall back
+        if (a.kv_q8) hipLaunchKernelGGL(k_attend_simple_q8, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);
+        else hipLaunchKernelGGL(k_attend_simple, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);  // no workspace: fall back
         return;
     }
 #if HY4_CUDA
+    if (a.kv_q8) {
+        const int ntiles_h = (max_keys + HBK - 1) / HBK;
+        const int tps_h = (ntiles_h + S - 1) / S;
+        hipLaunchKernelGGL((k_attend_host_kv<true>), dim3(a.NH / 16, S, a.M), dim3(128), 0, s, qa, cache, sinks, ctx, part, a, S, tps_h);
+        if (S > 1) hipLaunchKernelGGL(k_combine, dim3(16, a.NH / 16, a.M), dim3(256), 0, s, part, ctx, a.NH, S);
+        return;
+    }
     static const int host_kv_env = getenv("HY4_HOST_KV_STAGE") ? atoi(getenv("HY4_HOST_KV_STAGE")) : -1;
     bool use_host_kv = (host_kv_env == 1);
     if (host_kv_env < 0) {
@@ -2050,11 +2230,15 @@ void mla_attend(hipStream_t s, const __half* qa, const __half* cache, const floa
     if (use_host_kv) {
         const int ntiles_h = (max_keys + HBK - 1) / HBK;
         const int tps_h = (ntiles_h + S - 1) / S;
-        hipLaunchKernelGGL(k_attend_host_kv, dim3(a.NH / 16, S, a.M), dim3(128), 0, s, qa, cache, sinks, ctx, part, a, S, tps_h);
+        hipLaunchKernelGGL((k_attend_host_kv<false>), dim3(a.NH / 16, S, a.M), dim3(128), 0, s, qa, cache, sinks, ctx, part, a, S, tps_h);
         if (S > 1) hipLaunchKernelGGL(k_combine, dim3(16, a.NH / 16, a.M), dim3(256), 0, s, part, ctx, a.NH, S);
         return;
     }
 #else
+    if (a.kv_q8) {
+        hipLaunchKernelGGL(k_attend_simple_q8, dim3(a.NH, a.M), dim3(256), 0, s, qa, cache, sinks, ctx, a);
+        return;
+    }
     if (!HY4_MMA || hy4_is_rdna2()) {
         hipLaunchKernelGGL(k_attend_rdna2, dim3(a.NH / 16, S, a.M), dim3(128), 0, s, qa, cache, sinks, ctx, part, a, S, tps);
         if (S > 1) hipLaunchKernelGGL(k_combine, dim3(16, a.NH / 16, a.M), dim3(256), 0, s, part, ctx, a.NH, S);
