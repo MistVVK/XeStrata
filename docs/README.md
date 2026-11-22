@@ -1,6 +1,6 @@
 # Strata guides
 
-**New here? Start with [Install Strata](INSTALL.md).** Download the one installer for your system (Windows, Linux or Mac), or install the Terminal with one line. Both use released engine packages. This documentation is for version 0.2.18.
+**New here? Start with [Install Strata](INSTALL.md).** Download the one installer for your system (Windows, Linux or Mac), or install the Terminal with one line. Both use released engine packages. This documentation is for version 0.2.19.
 
 ## Use Strata
 

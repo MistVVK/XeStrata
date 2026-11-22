@@ -9,7 +9,7 @@
 #   SRC=<this checkout>              the Strata source (default: the checkout this script is in)
 #   LLAMA=<llama.cpp checkout>       optional override (kept for two releases): ggml comes from that checkout instead of the vendored engine/third_party/
 #   HP=<ROCm devel root>  CORE=<ROCm core root>  LIBW=<ROCm libraries root>   (TheRock: _rocm_sdk_devel, _rocm_sdk_core, _rocm_sdk_libraries_*)
-#   OUT=<work folder>  PKGVER=0.1.64  COMMIT=<source commit for the build id>  JOBS=16
+#   OUT=<work folder>  PKGVER=0.1.65  COMMIT=<source commit for the build id>  JOBS=16
 #   VISION_ONLY=1                    build only the two readers (no engine, no package)
 #   SPLIT_DIR=<folder>               ship the strata-split-N-amd binaries of that folder (made by tools/packaging/build_split_hip.sh) beside strata
 #   NO_PACKAGE=1                     stop after the stage folder
@@ -27,7 +27,7 @@ HP=${HP:?HP=<ROCm devel root>}
 CORE=${CORE:-$HP}
 LIBW=${LIBW:-$HP}
 OUT=${OUT:-$PWD/work-$V}
-PKGVER=${PKGVER:-0.1.64}
+PKGVER=${PKGVER:-0.1.65}
 COMMIT=${COMMIT:-unknown}
 JOBS=${JOBS:-16}
 case "$V" in

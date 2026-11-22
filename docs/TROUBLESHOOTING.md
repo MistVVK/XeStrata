@@ -18,7 +18,7 @@ strata launch --status
 **I cannot find `START-HERE.bat` or `SETUP.bat`.**
 Open the installed Strata app, or run `strata launch`. Those wrappers are in the source repository and are not the
 startup path for the app. For a fresh desktop install, download the one installer for your system
-(`Strata-0.2.18-windows-x64-setup.exe`, `Strata-0.2.18-linux-x86_64.AppImage` or `Strata-0.2.18-macos-arm64.dmg`), not a
+(`Strata-0.2.19-windows-x64-setup.exe`, `Strata-0.2.19-linux-x86_64.AppImage` or `Strata-0.2.19-macos-arm64.dmg`), not a
 `strata-engine-…` archive.
 
 **`strata` is not found.**
