@@ -685,7 +685,7 @@ MODELS: dict[str, dict[str, Any]] = {
                    "file": "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-0000{i}-of-00003.gguf", "vision": True},
 }
 # Sync's pre-built packs use the same engine as Qwen3.8-Flash-Next.  The thresholds are the pack authors'
-# recommendations, in GiB; they decide only the size within this family, not the first model setup recommends.
+# recommendations, in GiB; they decide the size within this family and whether it runs here (FIRST_CHOICE).
 MODELS.update({
     "Sync-XS": {"about": "the smallest Sync pack", "download_gb": 57.7, "ram_gb": 24,
                 "arena_gb": 20.47, "families": ("sync",), "vision": True},
@@ -1697,7 +1697,7 @@ FAMILIES.update(PLAIN_FAMILIES)
 # changed copy) and its quantization (whose files), then the size (the user's decision of 2026-11-09: the families of
 # one level mixed models, copies and quantizers).  A family is one (model, version, quantization), its --family ID
 # kept; Ornith-1.5's sizes are of two quantizations (a size's own "quantizer").  BASES in the order setup lists them:
-# FIRST_CHOICE's models first.
+# Qwen3.8-Flash-Next, the model of FIRST_CHOICE's first families, first.
 BASES = {"qwen3.8-flash-next": "Qwen3.8-Flash-Next",
          "ornith-1.5": "Ornith-1.5-35B-A3B",
          "qwen3.6": "Qwen3.6-35B-A3B", "qwen3.5-9b": "Qwen3.5-9B", "qwen3.5-2b": "Qwen3.5-2B",
@@ -1740,11 +1740,18 @@ TIERS = {  # family: (model, version, quantization), in the order each level lis
 }
 # a model's line in setup's first question where its original family's "about" does not say what the model is
 BASE_ABOUT = {"qwen3.8-flash-next": "Qwen's model, the one XeStrata is made for"}
+# Signal-2's RAM at its peak (GiB, the engine's resident set): 58.6 to 64.4 in the runs of 2026-11-22 (Arc Pro B70,
+# its n-gram table in RAM: --ple-io ram, 1K and 4K prompts, 512 tokens of decode), the largest kept
+SIGNAL2_PEAK_RAM_GB = 64.4
 # the families a first install is offered, in this order: the first this PC runs (recommend_family), with the size it
-# must hold where one is named (the user's decisions of 2026-11-09 and 2026-11-14: Swift 1.5's SC117 copy where its
-# IQ3_XXS runs, else Gyro-Coder-L where its experts all fit the RAM, else Gyro-Coder, then the smaller models)
-FIRST_CHOICE = (("sc117-swift", "IQ3_XXS"), ("gyro-coder", "Gyro-Coder-L"), ("gyro-coder", "Gyro-Coder"),
-                ("ornith", None), ("qwen36", None), ("qwen35", None), ("qwen35-2b", None))
+# must hold where one is named and the RAM it takes at its peak where it asks for its RAM's room beside that (the
+# user's decision of 2026-11-22): Swift 1.5's SC117 copy where its IQ3_XXS runs (recommend_size takes its IQ3_S where
+# that runs), else Signal-2 where the RAM holds its peak with LOW_RAM_HEADROOM_GB beside it (74.4 GiB: a 64 GB PC,
+# 62.7 as ram_gb reads it, does not; a 96 GB one does), else Sync (XS, S or M), else SenseNova-Loop-9B (QSA), else
+# Qwen3.5-2B (LAST_CHOICE), which is offered when nothing else runs.  A family that is not in FAMILIES is passed over.
+FIRST_CHOICE = (("sc117-swift", "IQ3_XXS", None), ("signal2", None, SIGNAL2_PEAK_RAM_GB), ("sync", None, None),
+                ("sensenova-loop-qsa", None, None), ("qwen35-2b", None, None))
+LAST_CHOICE = "qwen35-2b"
 
 
 def plain_parts(d: dict) -> list[dict[str, Any]]:
@@ -6919,11 +6926,14 @@ def runs_here(family: str, room: Room) -> bool:
 
 def recommend_family(fams: list, room: Room) -> str:
     """The family a first install is offered: on the CPU Qwen3.5-2B, else the first of FIRST_CHOICE this PC runs (the
-    size it names, or any), else the first of `fams`"""
+    size it names, or any, and its peak RAM with LOW_RAM_HEADROOM_GB beside it), else Qwen3.5-2B (LAST_CHOICE); the
+    first of `fams` without it"""
+    last = LAST_CHOICE if LAST_CHOICE in fams else fams[0]
     if room.on_cpu:
-        return "qwen35-2b" if "qwen35-2b" in fams else fams[0]
-    return next((f for f, size in FIRST_CHOICE if f in fams and
-                 (size_fits(f, size, room) if size else runs_here(f, room))), fams[0])
+        return last
+    return next((f for f, size, peak in FIRST_CHOICE if f in fams and
+                 (peak is None or room.ram >= peak + LOW_RAM_HEADROOM_GB) and
+                 (size_fits(f, size, room) if size else runs_here(f, room))), last)
 
 
 def model_shards(fam: dict, model: str) -> int:

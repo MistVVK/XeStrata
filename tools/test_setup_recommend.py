@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,22 +79,78 @@ class SizeByQuality(unittest.TestCase):
         self.assertEqual(setup.recommend_size("ornith", room(36, 4), gsq), "GSQ-RCO-3.5BIT")
 
 
+# Signal-2's and SenseNova-Loop-9B (QSA)'s entries as their branches register them (signal-2-setup 4dcba88997,
+# sensenova-loop-qsa 966ff45a3e), for the steps of FIRST_CHOICE that name them
+OTHER_BRANCHES: dict[str, dict[str, Any]] = {
+    "MODELS": {"S": {"about": "Signal-2", "download_gb": 59.5, "ram_gb": 35.8, "arena_gb": 25.8,
+                     "families": ("signal2",), "file": "Signal-2-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1}},
+    "FAMILIES": {"signal2": {"title": "Signal-2-Flash-Next (Gyro)", "by": "", "about": "", "file": "", "tag": "",
+                             "name": "qwen3.8-flash-next-signal-2"},
+                 "sensenova-loop-qsa": {"title": "SenseNova-Loop-9B (QSA)", "by": "", "about": "", "tag": "",
+                                        "name": "sensenova-loop-9b-qsa", "max_context": 524288, "plain": True,
+                                        "dense": True, "kv_bytes": 57344,
+                                        "models": {"Q4_K_M": {"size": 5965458112, "about": ""},
+                                                   "Q8_0": {"size": 9945475776, "about": ""},
+                                                   "BF16": {"size": 18566736576, "about": ""},
+                                                   "Q5_K_M": {"size": 6815328960, "about": ""}}}},
+    "TIERS": {"signal2": ("qwen3.8-flash-next", "signal-2", "gyro"),
+              "sensenova-loop-qsa": ("sensenova-loop-9b", "original", "qsa")},
+}
+
+
+def with_other_branches():
+    """Signal-2 and SenseNova-Loop-9B (QSA) registered, as when their branches are in"""
+    return mock.patch.multiple(setup, **{name: {**getattr(setup, name), **add} for name, add in OTHER_BRANCHES.items()})
+
+
 class FirstModel(unittest.TestCase):
     # edge0, like CUSTOM, is outside the recommendation ladder (--family edge0, setup_edge0; setup's list excludes it)
     fams = [f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")]
 
+    def first(self, ram: float, vram: float | None, fams=None) -> tuple:
+        r = room(ram, vram)
+        f = setup.recommend_family(fams or self.fams + list(OTHER_BRANCHES["FAMILIES"]), r)
+        return f, setup.recommend_size(f, r)
+
     def test_the_first_this_pc_runs_in_the_users_order(self):
-        self.assertEqual(setup.recommend_family(self.fams, room(64, 16)), "sc117-swift")
-        self.assertEqual(setup.recommend_family(self.fams, room(48, 0)), "gyro-coder")    # IQ2_XS only: not Swift
-        self.assertEqual(setup.recommend_family(self.fams, room(36, 4)), "gyro-coder")    # Gyro-Coder-L in RAM
-        self.assertEqual(setup.recommend_family(self.fams, room(32, 8)), "gyro-coder")    # Gyro-Coder, not -L
-        self.assertEqual(setup.recommend_size("gyro-coder", room(36, 4)), "Gyro-Coder-L")
-        self.assertEqual(setup.recommend_family(self.fams, room(16, 12)), "ornith")    # its GSQ-RCO 3-bit
-        self.assertEqual(setup.recommend_family(self.fams, room(12, 8)), "qwen35")
-        self.assertEqual(setup.recommend_family(self.fams, room(8, 4)), "qwen35-2b")
+        # the user's order of 2026-11-22: SC117's Swift 1.5, Signal-2 where the RAM is plenty else Sync, SenseNova,
+        # Qwen3.5-2B.  Every PC with the RAM for Signal-2 runs SC117's IQ3_XXS, so the order never reaches Signal-2
+        # (the user is asked whether Signal-2 goes first there: then FIRST_CHOICE and the first case change)
+        cases = [((123.2, 32), ("sc117-swift", "IQ3_S")),        # 128 GB installed: SC117 before Signal-2
+                 ((62.7, 16), ("sc117-swift", "IQ3_S")),         # 64 GB installed
+                 ((52, 0), ("sc117-swift", "IQ3_XXS")),          # IQ3_XXS in the low-RAM mode, IQ3_S not
+                 ((48, 0), ("sync", "Sync-M")),                  # SC117's IQ2_XS only: not SC117
+                 ((32, 12), ("sync", "Sync-S")),
+                 ((24, 8), ("sync", "Sync-XS")),
+                 ((20, 16), ("sensenova-loop-qsa", "Q8_0")),
+                 ((20, 10), ("sensenova-loop-qsa", "Q5_K_M")),
+                 ((20, 9), ("sensenova-loop-qsa", "Q4_K_M")),
+                 ((20, 8), ("qwen35-2b", "Q8_0")),
+                 ((2, 1), ("qwen35-2b", "Q4_K_M"))]               # nothing runs: the last choice
+        with with_other_branches():
+            for (ram, vram), expected in cases:
+                with self.subTest(ram=ram, vram=vram):
+                    self.assertEqual(self.first(ram, vram), expected)
+
+    def test_signal2_where_the_ram_is_plenty_else_sync(self):
+        # the step itself, SC117 aside: Signal-2's peak, 64.4 GiB, with LOW_RAM_HEADROOM_GB beside it
+        fams = [f for f in self.fams if f != "sc117-swift"] + list(OTHER_BRANCHES["FAMILIES"])
+        with with_other_branches():
+            self.assertEqual(self.first(123.2, 32, fams), ("signal2", "S"))    # 128 GB installed
+            self.assertEqual(self.first(92, 16, fams), ("signal2", "S"))       # 96 GB installed
+            self.assertEqual(self.first(74.4, 16, fams), ("signal2", "S"))
+            self.assertEqual(self.first(74.3, 16, fams), ("sync", "Sync-M"))
+            self.assertEqual(self.first(62.7, 16, fams), ("sync", "Sync-M"))   # 64 GB installed
+
+    def test_a_family_not_registered_is_passed_over(self):
+        # this tree without Signal-2's and SenseNova's entries: SC117, Sync, Qwen3.5-2B
+        self.assertEqual(self.first(123.2, 32, self.fams), ("sc117-swift", "IQ3_S"))
+        self.assertEqual(self.first(48, 0, self.fams), ("sync", "Sync-M"))
+        self.assertEqual(self.first(20, 16, self.fams), ("qwen35-2b", "Q8_0"))
 
     def test_without_a_gpu_the_2b(self):
         self.assertEqual(setup.recommend_family(["qwen35-2b", "qwen35-0.8b"], room(32, None)), "qwen35-2b")
+        self.assertEqual(setup.recommend_family(self.fams, room(128, None)), "qwen35-2b")
 
 
 class Levels(unittest.TestCase):
@@ -121,7 +178,7 @@ class Levels(unittest.TestCase):
         with mock.patch.object(setup, "say"), \
                 mock.patch.object(setup, "ask", side_effect=lambda q, choices, default, yes: default) as ask:
             family, quant = setup.ask_tiers(fams, setup.recommend_family(fams, r), r, None, True)
-        self.assertEqual((family, quant), ("gyro-coder", None))
+        self.assertEqual((family, quant), ("sync", None))
         self.assertEqual([c.args[0] for c in ask.call_args_list], ["Which model?", "Which version?",
                                                                    "Which quantization?"])
 
