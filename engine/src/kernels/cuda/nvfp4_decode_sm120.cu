@@ -57,8 +57,14 @@ __device__ __forceinline__ uint32_t ld32_u(const uint8_t* p) {
            ((uint32_t) __ldg(p + 2) << 16) | ((uint32_t) __ldg(p + 3) << 24);
 }
 
+__device__ __forceinline__ float ld_f32_u(const uint8_t* p) {
+    if (((uintptr_t) p & 3u) == 0u) return __ldg(reinterpret_cast<const float*>(p));
+    return __uint_as_float(ld32_u(p));
+}
+
 // Convert UE4M3 byte to 0.5f * float (folding the 0.5 factor of kvalues_fp4 = 2 * E2M1!).
 __device__ __forceinline__ float ue4m3_half_to_f32(uint8_t v) {
+    if (v == 0u || v == 0x7Fu || v == 0xFFu) return 0.0f;
     const uint32_t exp = (uint32_t) (v >> 3) & 0x0Fu;
     const uint32_t man = (uint32_t) v & 0x07u;
     if (exp == 0u) return ldexpf((float) man, -10);
@@ -174,6 +180,8 @@ __global__ void __launch_bounds__(128) nvfp4_gu_tc_sm120_kernel(
 #if defined(STRATA_NVFP4_DEC_DEV)
     const int g_idx = (int) blockIdx.y;
     if (g_idx >= *n_groups) return;
+    const int e0 = grp_start[g_idx], e1 = grp_start[g_idx + 1];
+    if (e0 >= e1) return;
 
     const int tid = (int) threadIdx.x;
     const int warp = tid >> 5;      // 0,1 = gate rows [0..15], [16..31]; 2,3 = up rows [0..15], [16..31]
@@ -182,10 +190,8 @@ __global__ void __launch_bounds__(128) nvfp4_gu_tc_sm120_kernel(
     const int tig = lane & 3;       // 0..3
 
     const uint8_t* blob = reinterpret_cast<const uint8_t*>(grp_ptr[g_idx]);
-    const bool aligned4 = (((uintptr_t) blob & 3u) == 0u) && ((L.gu_row & 3u) == 0u);
-    const float s_scale = L.tail_off
-                              ? *reinterpret_cast<const float*>(blob + L.tail_off + ((warp < 2) ? 0u : 4u))
-                              : 1.0f;
+    const bool aligned4 = (((uintptr_t) blob & 3u) == 0u) && ((L.gu_row & 3u) == 0u) && ((L.up_off & 3u) == 0u);
+    const float s_scale = L.tail_off ? ld_f32_u(blob + L.tail_off + ((warp < 2) ? 0u : 4u)) : 1.0f;
 
     const int r_tile = (int) blockIdx.x * 32 + (warp & 1) * 16;
     const size_t base_off = (warp < 2) ? 0u : L.up_off;
@@ -194,7 +200,6 @@ __global__ void __launch_bounds__(128) nvfp4_gu_tc_sm120_kernel(
     const int xb = (int) (L.n_embd >> 5);       // 80 Q8_1 blocks for 2560
     const int hb = (int) (L.n_ff >> 5);         // 20 Q8_1 blocks for 640
     const int n_chunks = (int) (L.n_embd >> 8); // 10 chunks of 256 elements (4 NVFP4 blocks = 8 Q8_1 blocks)
-    const int e0 = grp_start[g_idx], e1 = grp_start[g_idx + 1];
 
     __shared__ alignas(16) int8_t s_xq[kCnMax * 256]; // 2,048 B
     __shared__ float s_dx[kCnMax * 8];                //   256 B
@@ -280,6 +285,8 @@ __global__ void __launch_bounds__(128) nvfp4_down_tc_sm120_kernel(
 #if defined(STRATA_NVFP4_DEC_DEV)
     const int g_idx = (int) blockIdx.y;
     if (g_idx >= *n_groups) return;
+    const int e0 = grp_start[g_idx], e1 = grp_start[g_idx + 1];
+    if (e0 >= e1) return;
 
     const int tid = (int) threadIdx.x;
     const int warp = tid >> 5;
@@ -294,14 +301,13 @@ __global__ void __launch_bounds__(128) nvfp4_down_tc_sm120_kernel(
     const bool v1 = (r1 < L.n_embd);
 
     const uint8_t* blob = reinterpret_cast<const uint8_t*>(grp_ptr[g_idx]);
-    const bool aligned4 = (((uintptr_t) blob & 3u) == 0u) && ((L.d_row & 3u) == 0u);
-    const float s_down = L.tail_off ? *reinterpret_cast<const float*>(blob + L.tail_off + 8) : 1.0f;
+    const bool aligned4 = (((uintptr_t) blob & 3u) == 0u) && ((L.down_off & 3u) == 0u) && ((L.d_row & 3u) == 0u);
+    const float s_down = L.tail_off ? ld_f32_u(blob + L.tail_off + 8) : 1.0f;
 
     const uint8_t* w_base = blob + L.down_off + (size_t) r_base * L.d_row;
 
     const int hb = (int) (L.n_ff >> 5);       // 20 Q8_1 blocks (n_ff = 640 -> 10 NVFP4 blocks)
     const int n_blk64 = (int) (L.n_ff >> 6);  // 10 NVFP4 blocks
-    const int e0 = grp_start[g_idx], e1 = grp_start[g_idx + 1];
 
     __shared__ alignas(16) int8_t s_xq[kCnMax * 256]; // 2,048 B
     __shared__ float s_dx[kCnMax * 8];                //   256 B
@@ -398,7 +404,7 @@ bool nvfp4_decode_sm120_grouped(const NativeExpertLayout& L, const unsigned long
                                 const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
                                 const void* x_q8_1, void* hq_scratch, float* out, void* stream) {
     if (!nvfp4_decode_sm120_available()) return false;
-    if (L.gu_type != kTypeNVFP4 || L.d_type != kTypeNVFP4) return false;
+    if (L.gu_type != kTypeNVFP4 || L.d_type != kTypeNVFP4 || L.had_block != 0) return false;
     if (L.n_embd % 256 != 0 || L.n_ff % 64 != 0 || L.n_ff % 32 != 0) return false;
     if (cap_groups <= 0 || cap_entries <= 0) return true;
 

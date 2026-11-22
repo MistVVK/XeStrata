@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -557,6 +558,201 @@ void run_dense_fp4_bench_case(int T, int N_out, int K_in, cudaStream_t s) {
     ck(cudaEventDestroy(ev0), "d0"); ck(cudaEventDestroy(ev1), "d1");
 }
 
+void run_long_dense_case(int T, cudaStream_t s) {
+    namespace dense_fp4 = strata::prefill::dense_fp4_tc;
+    constexpr int N_out = 256;
+    constexpr int K_in = N;
+    const size_t w_row_bytes = (size_t) (K_in / 64) * BS;
+    std::mt19937 rng(77000u + (unsigned) T);
+    std::uniform_real_distribution<float> fdist(-1.25f, 1.25f);
+
+    std::vector<uint8_t> h_w((size_t) N_out * w_row_bytes);
+    for (int n = 0; n < N_out; ++n) {
+        uint8_t* row = h_w.data() + (size_t) n * w_row_bytes;
+        for (int b = 0; b < K_in / 64; ++b) {
+            uint8_t* blk = row + (size_t) b * BS;
+            for (int sub = 0; sub < 4; ++sub) blk[sub] = (uint8_t) (0x24 + (rng() % 24));
+            for (int q = 0; q < 32; ++q) blk[4 + q] = (uint8_t) (rng() & 0xffu);
+        }
+    }
+
+    // Fill a few distinct probe rows (including 0, T/2, T-1, an all-zero row, and an Inf/NaN edge row).
+    std::vector<uint16_t> h_x16((size_t) T * K_in, 0);
+    std::vector<float> h_probe[3];
+    const int probe_rows[3] = {0, T / 2, T - 1};
+    for (int p = 0; p < 3; ++p) {
+        h_probe[p].resize((size_t) K_in);
+        for (int k = 0; k < K_in; ++k) {
+            const float v = __half2float(__float2half(fdist(rng)));
+            h_probe[p][(size_t) k] = v;
+            h_x16[(size_t) probe_rows[p] * K_in + k] = __half_as_ushort(__float2half(v));
+        }
+    }
+    // Edge row 1: all zeros; edge row 2: Inf/NaN elements (must sanitize to finite 0, never NaN).
+    h_x16[(size_t) 2 * K_in + 0] = 0x7C00u; // +Inf
+    h_x16[(size_t) 2 * K_in + 1] = 0xFC00u; // -Inf
+    h_x16[(size_t) 2 * K_in + 2] = 0x7E00u; // NaN
+
+    DevBuf d_w(h_w.size());
+    DevBuf d_x(h_x16.size() * sizeof(uint16_t));
+    DevBuf d_y((size_t) T * N_out * sizeof(float));
+    ck(cudaMemcpyAsync(d_w.p, h_w.data(), h_w.size(), cudaMemcpyHostToDevice, s), "long dense H2D w");
+    ck(cudaMemcpyAsync(d_x.p, h_x16.data(), h_x16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice, s), "long dense H2D x");
+    ck(cudaMemsetAsync(d_y.p, 0xff, (size_t) T * N_out * sizeof(float), s), "long dense poison y");
+
+    if (!dense_fp4::gemm_f16_nvfp4(d_x.as<uint16_t>(), d_w.p, d_y.as<float>(), T, N_out, K_in, N_out, 0.0f, s)) {
+        std::fprintf(stderr, "prefill_fp4_tc_test: long dense_fp4_tc failed at T=%d\n", T);
+        std::exit(1);
+    }
+    ck(cudaStreamSynchronize(s), "long dense sync");
+
+    std::vector<float> h_y((size_t) T * N_out);
+    ck(cudaMemcpy(h_y.data(), d_y.p, h_y.size() * sizeof(float), cudaMemcpyDeviceToHost), "long dense D2H y");
+
+    size_t nonfinite = 0;
+    for (size_t i = 0; i < h_y.size(); ++i)
+        if (!std::isfinite(h_y[i])) ++nonfinite;
+    if (nonfinite > 0) {
+        std::fprintf(stderr, "prefill_fp4_tc_test: long dense T=%d produced %zu non-finite outputs!\n", T, nonfinite);
+        std::exit(1);
+    }
+
+    std::vector<float> w_row((size_t) K_in), x_q4((size_t) K_in);
+    double num = 0.0, den = 0.0;
+    for (int p = 0; p < 3; ++p) {
+        quantize_act_nvfp4_host(h_probe[p].data(), K_in, x_q4.data());
+        for (int n = 0; n < N_out; n += 4) {
+            dequant_nvfp4_row(h_w.data() + (size_t) n * w_row_bytes, K_in, w_row.data());
+            double acc = 0.0;
+            for (int k = 0; k < K_in; ++k) acc += (double) w_row[(size_t) k] * (double) x_q4[(size_t) k];
+            const double got = (double) h_y[(size_t) probe_rows[p] * N_out + n];
+            num += (got - acc) * (got - acc);
+            den += acc * acc;
+        }
+    }
+    const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+    std::printf("  LONG DENSE T=%5d N=%d K=%d: nonfinite=%zu rel_vs_W4A4_FP64=%.6f OK\n", T, N_out, K_in, nonfinite, rel);
+    if (!std::isfinite(rel) || rel > 1e-3) {
+        std::fprintf(stderr, "prefill_fp4_tc_test: long dense T=%d rel %.6f > 1e-3\n", T, rel);
+        std::exit(1);
+    }
+}
+
+void run_long_moe_case(int T, cudaStream_t s) {
+    constexpr int E = 8;
+    constexpr int K_top = 1;
+    const size_t gu_row = (size_t) (N / 64) * BS;
+    const size_t d_row = (size_t) (FF / 64) * BS;
+    const size_t up_off = (size_t) FF * gu_row;
+    const size_t down_off = (size_t) (2 * FF) * gu_row;
+    const size_t tail_off = down_off + (size_t) N * d_row;
+    const size_t blob_bytes = tail_off + 16;
+    const size_t stride = ((blob_bytes + 63) / 64) * 64;
+
+    std::mt19937 rng(88000u + (unsigned) T);
+    std::uniform_real_distribution<float> xdist(-1.2f, 1.2f);
+    std::vector<uint8_t> h_blobs((size_t) E * stride, 0);
+    for (int e = 0; e < E; ++e) {
+        uint8_t* bp = h_blobs.data() + (size_t) e * stride;
+        const size_t total_blocks = (2 * (size_t) FF * (N / 64)) + ((size_t) N * (FF / 64));
+        for (size_t b = 0; b < total_blocks; ++b) {
+            uint8_t* blk = bp + b * BS;
+            for (int sub = 0; sub < 4; ++sub) blk[sub] = (uint8_t) (0x24 + (rng() % 24));
+            for (int q = 0; q < 32; ++q) blk[4 + q] = (uint8_t) (rng() & 0xffu);
+        }
+        const float scales[4] = {0.003f, 0.003f, 0.003f, 0.0f};
+        std::memcpy(bp + tail_off, scales, 16);
+    }
+
+    std::vector<float> h_x((size_t) T * N, 0.0f);
+    const int probe_toks[3] = {0, T / 2, T - 1};
+    for (int p = 0; p < 3; ++p)
+        for (int c = 0; c < N; ++c) h_x[(size_t) probe_toks[p] * N + c] = xdist(rng);
+    // Edge token 1: all zeros; edge token 2: Inf/NaN elements (must sanitize to 0, zero NaNs in dm).
+    h_x[(size_t) 2 * N + 0] = std::numeric_limits<float>::infinity();
+    h_x[(size_t) 2 * N + 1] = -std::numeric_limits<float>::infinity();
+    h_x[(size_t) 2 * N + 2] = std::numeric_limits<float>::quiet_NaN();
+
+    const int64_t rows = (int64_t) T * K_top;
+    std::vector<int32_t> h_ids((size_t) rows);
+    for (int t = 0; t < T; ++t) h_ids[(size_t) t] = t % E;
+
+    DevBuf d_blobs(h_blobs.size());
+    DevBuf d_x(h_x.size() * sizeof(float));
+    DevBuf d_ids(h_ids.size() * sizeof(int32_t));
+    DevBuf d_gu(fused::group_bytes(rows, E));
+    DevBuf d_slot((size_t) rows * sizeof(int32_t));
+    DevBuf d_src((size_t) rows * sizeof(int32_t));
+    DevBuf d_xq(fused::act_bytes(T, N));
+    DevBuf d_hq(fused::act_bytes(rows, FF));
+    DevBuf d_dm((size_t) rows * N * sizeof(float));
+
+    ck(cudaMemcpyAsync(d_blobs.p, h_blobs.data(), h_blobs.size(), cudaMemcpyHostToDevice, s), "long moe H2D blobs");
+    ck(cudaMemcpyAsync(d_x.p, h_x.data(), h_x.size() * sizeof(float), cudaMemcpyHostToDevice, s), "long moe H2D x");
+    ck(cudaMemcpyAsync(d_ids.p, h_ids.data(), h_ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s), "long moe H2D ids");
+    ck(cudaMemsetAsync(d_dm.p, 0xff, (size_t) rows * N * sizeof(float), s), "long moe poison dm");
+
+    fp4_tc::quantize_act(d_x.as<float>(), T, N, d_xq.p, s);
+    fused::group(d_ids.as<int32_t>(), rows, K_top, E, d_gu.p, d_slot.as<int32_t>(), d_src.as<int32_t>(), s);
+    const fused::NativeGeom ng{T_NVFP4, T_NVFP4, gu_row, d_row, up_off, down_off};
+    fused::Batch b;
+    b.e0 = 0; b.e1 = E;
+    for (int e = 0; e < E; ++e) b.blob[e] = d_blobs.as<uint8_t>() + (size_t) e * stride;
+    fp4_tc::experts(b, ng, E, rows, d_gu.p, d_xq.p, d_src.as<int32_t>(), d_hq.p, d_dm.as<float>(), s);
+    ck(cudaStreamSynchronize(s), "long moe sync");
+
+    std::vector<int32_t> h_slot((size_t) rows);
+    std::vector<float> h_dm((size_t) rows * N);
+    ck(cudaMemcpy(h_slot.data(), d_slot.p, h_slot.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "long moe D2H slot");
+    ck(cudaMemcpy(h_dm.data(), d_dm.p, h_dm.size() * sizeof(float), cudaMemcpyDeviceToHost), "long moe D2H dm");
+
+    size_t nonfinite = 0;
+    for (size_t i = 0; i < h_dm.size(); ++i)
+        if (!std::isfinite(h_dm[i])) ++nonfinite;
+    if (nonfinite > 0) {
+        std::fprintf(stderr, "prefill_fp4_tc_test: long moe T=%d produced %zu non-finite outputs!\n", T, nonfinite);
+        std::exit(1);
+    }
+
+    // Verify exact W4A4-FP64 parity on the 3 probe tokens (0, T/2, T-1).
+    std::vector<float> w_buf((size_t) std::max(N, FF)), x_q4((size_t) N), h_f32((size_t) FF), h_q4((size_t) FF);
+    double num = 0.0, den = 0.0;
+    for (int p = 0; p < 3; ++p) {
+        const int t = probe_toks[p];
+        const int e = h_ids[(size_t) t];
+        const uint8_t* bp = h_blobs.data() + (size_t) e * stride;
+        const float* xrow = h_x.data() + (size_t) t * N;
+        quantize_act_nvfp4_host(xrow, N, x_q4.data());
+        for (int f = 0; f < FF; ++f) {
+            dequant_nvfp4_row(bp + (size_t) f * gu_row, N, w_buf.data());
+            double g_q4 = 0.0;
+            for (int c = 0; c < N; ++c) g_q4 += (double) w_buf[(size_t) c] * (double) x_q4[(size_t) c];
+            dequant_nvfp4_row(bp + up_off + (size_t) f * gu_row, N, w_buf.data());
+            double u_q4 = 0.0;
+            for (int c = 0; c < N; ++c) u_q4 += (double) w_buf[(size_t) c] * (double) x_q4[(size_t) c];
+            const double gt4 = g_q4 * 0.003;
+            const double up4 = u_q4 * 0.003;
+            h_f32[(size_t) f] = (float) ((gt4 / (1.0 + std::exp(-gt4))) * up4);
+        }
+        quantize_act_nvfp4_host(h_f32.data(), FF, h_q4.data());
+        const float* got = h_dm.data() + (size_t) h_slot[(size_t) t] * N;
+        for (int o = 0; o < N; o += 16) {
+            dequant_nvfp4_row(bp + down_off + (size_t) o * d_row, FF, w_buf.data());
+            double d_q4 = 0.0;
+            for (int f = 0; f < FF; ++f) d_q4 += (double) w_buf[(size_t) f] * (double) h_q4[(size_t) f];
+            const double ref = d_q4 * 0.003;
+            num += ((double) got[o] - ref) * ((double) got[o] - ref);
+            den += ref * ref;
+        }
+    }
+    const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+    std::printf("  LONG MOE   T=%5d E=%d: nonfinite=%zu rel_vs_W4A4_FP64=%.6f OK\n", T, E, nonfinite, rel);
+    if (!std::isfinite(rel) || rel > 5e-3) {
+        std::fprintf(stderr, "prefill_fp4_tc_test: long moe T=%d rel %.6f > 5e-3\n", T, rel);
+        std::exit(1);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -579,6 +775,10 @@ int main(int argc, char** argv) {
     run_dense_fp4_parity_case(33, 192, 256, 0.0f, s);
     run_dense_fp4_parity_case(65, 320, 512, 1.0f, s);
     run_dense_fp4_parity_case(130, 2560, 2560, 0.0f, s);
+    run_long_dense_case(24576, s);
+    run_long_dense_case(45056, s);
+    run_long_moe_case(24576, s);
+    run_long_moe_case(45056, s);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
         run_bench_case(512, 512, s);
         run_bench_case(2048, 512, s);

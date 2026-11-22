@@ -216,27 +216,31 @@ Tables tables(void* scratch, int n_expert) {
 
 // ---- activations in natural order: one warp per 64 values
 __global__ void quant_act_nat_kernel(const float* __restrict__ x, int64_t nblk, uint8_t* __restrict__ xa) {
-    const int64_t w = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
-    if (w >= nblk) return;
-    const float v0 = x[w * 64 + lane], v1 = x[w * 64 + 32 + lane];
-    float a0 = fabsf(v0), a1 = fabsf(v1);
+    const int64_t warps_per_blk = (int64_t) (blockDim.x / 32);
+    const int64_t stride = (int64_t) gridDim.x * warps_per_blk;
+    for (int64_t w = (int64_t) blockIdx.x * warps_per_blk + threadIdx.x / 32; w < nblk; w += stride) {
+        const float r0 = x[w * 64 + lane], r1 = x[w * 64 + 32 + lane];
+        const float v0 = isfinite(r0) ? r0 : 0.0f, v1 = isfinite(r1) ? r1 : 0.0f;
+        float a0 = fabsf(v0), a1 = fabsf(v1);
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        a0 = fmaxf(a0, __shfl_xor_sync(0xffffffffu, a0, o));
-        a1 = fmaxf(a1, __shfl_xor_sync(0xffffffffu, a1, o));
-    }
-    uint8_t* out = xa + w * AB;
-    const int c0 = a0 > 0.0f ? __float2int_rn(v0 * (127.0f / a0)) : 0, c1 = a1 > 0.0f ? __float2int_rn(v1 * (127.0f / a1)) : 0;
-    out[lane] = (uint8_t) (int8_t) c0;
-    out[32 + lane] = (uint8_t) (int8_t) c1;
-    int s0 = c0, s1 = c1;   // the codes' sums per 32 values (the formats with a minimum read them)
+        for (int o = 16; o > 0; o >>= 1) {
+            a0 = fmaxf(a0, __shfl_xor_sync(0xffffffffu, a0, o));
+            a1 = fmaxf(a1, __shfl_xor_sync(0xffffffffu, a1, o));
+        }
+        uint8_t* out = xa + w * AB;
+        const int c0 = (a0 > 0.0f && isfinite(a0)) ? max(-127, min(127, __float2int_rn(v0 * (127.0f / a0)))) : 0;
+        const int c1 = (a1 > 0.0f && isfinite(a1)) ? max(-127, min(127, __float2int_rn(v1 * (127.0f / a1)))) : 0;
+        out[lane] = (uint8_t) (int8_t) c0;
+        out[32 + lane] = (uint8_t) (int8_t) c1;
+        int s0 = c0, s1 = c1;   // the codes' sums per 32 values (the formats with a minimum read them)
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        s0 += __shfl_xor_sync(0xffffffffu, s0, o);
-        s1 += __shfl_xor_sync(0xffffffffu, s1, o);
+        for (int o = 16; o > 0; o >>= 1) {
+            s0 += __shfl_xor_sync(0xffffffffu, s0, o);
+            s1 += __shfl_xor_sync(0xffffffffu, s1, o);
+        }
+        if (lane == 0) *(float4*) (out + 64) = make_float4(isfinite(a0) ? a0 / 127.0f : 0.0f, isfinite(a1) ? a1 / 127.0f : 0.0f, (float) s0, (float) s1);
     }
-    if (lane == 0) *(float4*) (out + 64) = make_float4(a0 / 127.0f, a1 / 127.0f, (float) s0, (float) s1);
 }
 
 // (STRATA_PF_FUSED_TQ=1: CUDA sm_80+, HIP gfx12, wave32) the block-Hadamard rotation of a Hadamard-folded expert's input (include/strata/kernels/cpu/hadamard.hpp):
@@ -275,30 +279,37 @@ __global__ void hadamard128_kernel(float* __restrict__ x, int64_t nblk, int cols
 __global__ void rot_quant_h_kernel(const float* __restrict__ hf, const int32_t* __restrict__ off, int e0, int e1, int64_t n,
                                    const float* __restrict__ signs, uint8_t* __restrict__ ha) {
     constexpr int BLK = D_ROWS_K / 128;   // Hadamard blocks a row (5 for n_ff 640)
-    const int64_t w = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
-    if (w >= n * BLK) return;
-    const int64_t row = w / BLK;
-    const int b = (int) (w % BLK);
-    if (row < off[e0] || row >= off[e1]) return;
-    const float* p = hf + row * D_ROWS_N + 128 * b;
-    float v[4];
+    const int64_t warps_per_blk = (int64_t) (blockDim.x / 32);
+    const int64_t stride = (int64_t) gridDim.x * warps_per_blk;
+    const int64_t total = n * BLK;
+    for (int64_t w = (int64_t) blockIdx.x * warps_per_blk + threadIdx.x / 32; w < total; w += stride) {
+        const int64_t row = w / BLK;
+        const int b = (int) (w % BLK);
+        if (row < off[e0] || row >= off[e1]) continue;
+        const float* p = hf + row * D_ROWS_N + 128 * b;
+        float v[4];
 #pragma unroll
-    for (int k = 0; k < 4; ++k) v[k] = p[32 * k + lane] * (signs ? signs[128 * b + 32 * k + lane] : 1.0f);
-    fwht128_warp(v, lane);
+        for (int k = 0; k < 4; ++k) {
+            const float rv = p[32 * k + lane] * (signs ? signs[128 * b + 32 * k + lane] : 1.0f);
+            v[k] = isfinite(rv) ? rv : 0.0f;
+        }
+        fwht128_warp(v, lane);
 #pragma unroll
-    for (int k = 0; k < 4; ++k) {   // value 128 b + 32 k + lane: AB block (128 b + 32 k) / 64, half k & 1
-        float am = fabsf(v[k]);
+        for (int k = 0; k < 4; ++k) {   // value 128 b + 32 k + lane: AB block (128 b + 32 k) / 64, half k & 1
+            const float vk = isfinite(v[k]) ? v[k] : 0.0f;
+            float am = fabsf(vk);
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
-        const int code = am > 0.0f ? __float2int_rn(v[k] * (127.0f / am)) : 0;
-        int cs = code;
+            for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+            const int code = (am > 0.0f && isfinite(am)) ? max(-127, min(127, __float2int_rn(vk * (127.0f / am)))) : 0;
+            int cs = code;
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) cs += __shfl_xor_sync(0xffffffffu, cs, o);
-        uint8_t* o = ha + row * H_ROW_BYTES + ((128 * b + 32 * k) / 64) * AB;
-        const int hh = k & 1;
-        o[32 * hh + lane] = (uint8_t) (int8_t) code;
-        if (lane == 0) { *(float*) (o + 64 + 4 * hh) = am / 127.0f; *(float*) (o + 72 + 4 * hh) = (float) cs; }
+            for (int o = 16; o > 0; o >>= 1) cs += __shfl_xor_sync(0xffffffffu, cs, o);
+            uint8_t* o = ha + row * H_ROW_BYTES + ((128 * b + 32 * k) / 64) * AB;
+            const int hh = k & 1;
+            o[32 * hh + lane] = (uint8_t) (int8_t) code;
+            if (lane == 0) { *(float*) (o + 64 + 4 * hh) = isfinite(am) ? am / 127.0f : 0.0f; *(float*) (o + 72 + 4 * hh) = (float) cs; }
+        }
     }
 }
 
@@ -1309,12 +1320,13 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
                     for (int i = 0; i < 4; ++i) {
                         float gt = acc[i][n][c], up = acc[i][n][2 + c];
                         if constexpr (WT == T_NVFP4) { gt *= t_gate; up *= t_up; }   // (the expert's s_gate / s_up)
-                        h[i] = gt / (1.0f + __expf(-gt)) * up;
+                        const float hv = gt / (1.0f + __expf(-gt)) * up;
+                        h[i] = isfinite(hv) ? hv : 0.0f;
                         am = fmaxf(am, fabsf(h[i]));
                     }
 #pragma unroll
                     for (int o = 4; o < 32; o <<= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
-                    const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+                    const float inv = (am > 0.0f && isfinite(am)) ? 127.0f / am : 0.0f;
                     const int r = nb0 + 8 * n + 2 * tig + c;
                     if constexpr (is_tq(WT)) {
                         // (CUDA, STRATA_PF_FUSED_TQ=1, a Hadamard-folded down: set_down_rotation) H as FP32, n_ff values at the start of the row's

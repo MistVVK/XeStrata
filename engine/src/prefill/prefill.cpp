@@ -7452,11 +7452,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
+                                constexpr int kNvfp4 = (int) strata::quant::Type::NVFP4;
                                 strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                    m.dq_gu[q], m.cs,
-                                                                   f.tail_off ? (const float*) (blob_dev + f.tail_off) : nullptr);
+                                                                   (f.gu_type == kNvfp4 && f.tail_off) ? (const float*) (blob_dev + f.tail_off) : nullptr);
                                 strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs,
-                                                                f.tail_off ? (const float*) (blob_dev + f.tail_off) + 2 : nullptr);
+                                                                (f.d_type == kNvfp4 && f.tail_off) ? (const float*) (blob_dev + f.tail_off) + 2 : nullptr);
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }
@@ -8884,10 +8885,12 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                     dq = (dq + 1) % DQ;
                     if (lay.native) {
                         const auto& f = lay.fmt[(size_t) l];
+                        constexpr int kNvfp4 = (int) strata::quant::Type::NVFP4;
                         strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                           m.dq_gu[dq], cs, nullptr);
+                                                           m.dq_gu[dq], cs,
+                                                           (f.gu_type == kNvfp4 && f.tail_off) ? (const float*) (blob_dev + f.tail_off) : nullptr);
                         strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[dq], cs,
-                                                        nullptr);
+                                                        (f.d_type == kNvfp4 && f.tail_off) ? (const float*) (blob_dev + f.tail_off) + 2 : nullptr);
                     } else {
                         blob_dequant_f16(blob_dev, m.dq_gu[dq], m.dq_d[dq], cs);
                     }

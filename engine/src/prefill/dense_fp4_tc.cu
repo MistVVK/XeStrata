@@ -43,9 +43,13 @@ constexpr int A_STRIDE = 48;
 #endif
 
 __device__ __forceinline__ uint32_t ld32_u(const uint8_t* p) {
-    const uint16_t lo = __ldg(reinterpret_cast<const uint16_t*>(p));
-    const uint16_t hi = __ldg(reinterpret_cast<const uint16_t*>(p + 2));
-    return (uint32_t) lo | ((uint32_t) hi << 16);
+    if (((uintptr_t) p & 1u) == 0u) {
+        const uint16_t lo = __ldg(reinterpret_cast<const uint16_t*>(p));
+        const uint16_t hi = __ldg(reinterpret_cast<const uint16_t*>(p + 2));
+        return (uint32_t) lo | ((uint32_t) hi << 16);
+    }
+    return (uint32_t) __ldg(p) | ((uint32_t) __ldg(p + 1) << 8) |
+           ((uint32_t) __ldg(p + 2) << 16) | ((uint32_t) __ldg(p + 3) << 24);
 }
 
 __device__ __forceinline__ uint32_t ld32_fast(const uint8_t* p, bool aligned4) {
@@ -99,45 +103,51 @@ __device__ __forceinline__ uint8_t pack_e2m1x2(float v_lo, float v_hi) {
 }
 #endif
 
-// Quantize FP16 activations X [T, K] -> split-half NVFP4 blocks (40 bytes per 64 values: qs[32], d[4], g_blk).
-// One warp per 64-element block (8 warps / 256 threads per CTA).
+// Quantize FP16 activations X [T, K] -> split-half NVFP4 blocks (48 bytes per 64 values: qs[32], d[4], g_blk, pad[8]).
+// One warp per 64-element block (8 warps / 256 threads per CTA), grid-strided for arbitrary T * K.
 __global__ void __launch_bounds__(256) quant_f16_to_nvfp4_kernel(const uint16_t* __restrict__ x, int64_t nblk,
                                                                  uint8_t* __restrict__ xa) {
 #if defined(STRATA_DENSE_FP4_DEV)
-    const int64_t w = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 5);
-    if (w >= nblk) return;
     const int lane = threadIdx.x & 31;
     const int sub = lane >> 3;
     const int j = lane & 7;
+    const int64_t stride = (int64_t) gridDim.x * 8;
+    for (int64_t w = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 5); w < nblk; w += stride) {
+        const uint16_t* xb = x + w * K_STEP;
+        const float r0 = __half2float(__ushort_as_half(__ldg(xb + 16 * sub + j)));
+        const float r1 = __half2float(__ushort_as_half(__ldg(xb + 16 * sub + 8 + j)));
+        const float v0 = isfinite(r0) ? r0 : 0.0f;
+        const float v1 = isfinite(r1) ? r1 : 0.0f;
 
-    const uint16_t* xb = x + w * K_STEP;
-    const float v0 = __half2float(__ushort_as_half(__ldg(xb + 16 * sub + j)));
-    const float v1 = __half2float(__ushort_as_half(__ldg(xb + 16 * sub + 8 + j)));
-
-    float am_sub = fmaxf(fabsf(v0), fabsf(v1));
+        float am_sub = fmaxf(fabsf(v0), fabsf(v1));
 #pragma unroll
-    for (int o = 1; o < 8; o <<= 1) am_sub = fmaxf(am_sub, __shfl_xor_sync(0xffffffffu, am_sub, o));
+        for (int o = 1; o < 8; o <<= 1) am_sub = fmaxf(am_sub, __shfl_xor_sync(0xffffffffu, am_sub, o));
 
-    float am_64 = fmaxf(am_sub, __shfl_xor_sync(0xffffffffu, am_sub, 8));
-    am_64 = fmaxf(am_64, __shfl_xor_sync(0xffffffffu, am_64, 16));
+        float am_64 = fmaxf(am_sub, __shfl_xor_sync(0xffffffffu, am_sub, 8));
+        am_64 = fmaxf(am_64, __shfl_xor_sync(0xffffffffu, am_64, 16));
 
-    const float g_blk = am_64 * (1.0f / (6.0f * 448.0f));
-    float s_sub = 0.0f;
-    const uint8_t d_code = encode_ue4m3(g_blk > 0.0f ? (am_sub / (g_blk * 6.0f)) : 0.0f, s_sub);
-    const float denom = g_blk * s_sub;
-    const float inv = denom > 0.0f ? (1.0f / denom) : 0.0f;
+        const float g_blk = (am_64 > 0.0f && isfinite(am_64)) ? (am_64 * (1.0f / (6.0f * 448.0f))) : 0.0f;
+        float s_sub = 0.0f;
+        const float ratio = (g_blk > 0.0f && isfinite(g_blk)) ? (am_sub / (g_blk * 6.0f)) : 0.0f;
+        const uint8_t d_code = encode_ue4m3(isfinite(ratio) ? ratio : 0.0f, s_sub);
+        const float denom = g_blk * s_sub;
+        const float inv = (denom > 0.0f && isfinite(denom)) ? (1.0f / denom) : 0.0f;
+        const float q0 = v0 * inv;
+        const float q1 = v1 * inv;
 
-    uint8_t* out = xa + w * ACT_BLK;
-    out[lane] = pack_e2m1x2(v0 * inv, v1 * inv);
-    if (j == 0) out[32 + sub] = d_code;
-    if (lane == 0) *reinterpret_cast<float*>(out + 36) = g_blk;
+        uint8_t* out = xa + w * ACT_BLK;
+        out[lane] = pack_e2m1x2(isfinite(q0) ? q0 : 0.0f, isfinite(q1) ? q1 : 0.0f);
+        if (j == 0) out[32 + sub] = d_code;
+        if (lane == 0) *reinterpret_cast<float*>(out + 36) = g_blk;
+    }
 #else
     (void) x; (void) nblk; (void) xa;
 #endif
 }
 
 // High-throughput coalesced Blackwell mxf4nvf4 dense GEMM: Y[T, N] = beta * Y + X_fp4 @ W_nvfp4^T.
-// Grid: (ceil(N / 128), ceil(T / 64)), Block: 256 (8 warps, ~20.5 KB smem, 0 spills).
+// Grid: (ceil(T / 64), min(65535, ceil(N / 128))), Block: 256 (8 warps, ~20.5 KB smem, 0 spills).
+// Unbounded token axis T is placed on gridDim.x (2^31 - 1 hardware limit); N loops over gridDim.y.
 __global__ void __launch_bounds__(NT, 2) dense_fp4_tc_kernel(const uint8_t* __restrict__ w_base,
                                                              const uint8_t* __restrict__ x_act,
                                                              float* __restrict__ Y, int N, int T, int K,
@@ -164,21 +174,14 @@ __global__ void __launch_bounds__(NT, 2) dense_fp4_tc_kernel(const uint8_t* __re
     const int rl = tid >> 3;           // 0..31: row offset in 32-row group
     const int lc = tid & 7;            // 0..7: 8 lanes load 32 contiguous qs bytes!
 
-    const int n0 = (int) blockIdx.x * BM;
-    const int t0 = (int) blockIdx.y * BN;
-    const int nrows = min(BM, N - n0);
+    const int t0 = (int) blockIdx.x * BN;
     const int ntoks = min(BN, T - t0);
-    if (nrows <= 0 || ntoks <= 0) return;
+    if (ntoks <= 0) return;
 
     const int ns = K / K_STEP;
     const size_t w_row_bytes = (size_t) ns * BS_NVFP4;
     const size_t a_row_bytes = (size_t) ns * ACT_BLK;
     const bool aligned4 = (((uintptr_t) w_base & 3u) == 0u) && ((w_row_bytes & 3u) == 0u);
-
-    const uint8_t* const wr0 = (rl + 0 < nrows) ? (w_base + (size_t) (n0 + rl + 0) * w_row_bytes) : nullptr;
-    const uint8_t* const wr1 = (rl + 32 < nrows) ? (w_base + (size_t) (n0 + rl + 32) * w_row_bytes) : nullptr;
-    const uint8_t* const wr2 = (rl + 64 < nrows) ? (w_base + (size_t) (n0 + rl + 64) * w_row_bytes) : nullptr;
-    const uint8_t* const wr3 = (rl + 96 < nrows) ? (w_base + (size_t) (n0 + rl + 96) * w_row_bytes) : nullptr;
 
     const int a_off = (64 * wf + 8 * (lm & 1) + l8) * W_STRIDE + 16 * (lm >> 1);
     const int b_off = (nb0 + 8 * (lm >> 1) + l8) * A_STRIDE + 16 * (lm & 1);
@@ -191,7 +194,9 @@ __global__ void __launch_bounds__(NT, 2) dense_fp4_tc_kernel(const uint8_t* __re
         z0[0] = make_uint4(0u, 0u, 0u, 0u); z0[1] = make_uint4(0u, 0u, 0u, 0u);
         z1[0] = make_uint4(0u, 0u, 0u, 0u); z1[1] = make_uint4(0u, 0u, 0u, 0u);
     }
-    __syncthreads();
+
+    const bool on0 = nb0 < ntoks;
+    const bool on1 = nb0 + 8 < ntoks;
 
     auto issue_act = [&](int st, int buf) {
         if (tid < 2 * BN) {
@@ -213,119 +218,128 @@ __global__ void __launch_bounds__(NT, 2) dense_fp4_tc_kernel(const uint8_t* __re
         cp_commit();
     };
 
-    auto load_w_regs = [&](int st, uint32_t& q0, uint32_t& q1, uint32_t& q2, uint32_t& q3, uint32_t& wsc) {
-        const size_t sb = (size_t) st * BS_NVFP4;
-        const size_t qo = sb + 4 + (size_t) lc * 4;
-        q0 = wr0 ? ld32_fast(wr0 + qo, aligned4) : 0u;
-        q1 = wr1 ? ld32_fast(wr1 + qo, aligned4) : 0u;
-        q2 = wr2 ? ld32_fast(wr2 + qo, aligned4) : 0u;
-        q3 = wr3 ? ld32_fast(wr3 + qo, aligned4) : 0u;
-        if (lc == 0) wsc = wr0 ? ld32_fast(wr0 + sb, aligned4) : 0u;
-        else if (lc == 1) wsc = wr1 ? ld32_fast(wr1 + sb, aligned4) : 0u;
-        else if (lc == 2) wsc = wr2 ? ld32_fast(wr2 + sb, aligned4) : 0u;
-        else if (lc == 3) wsc = wr3 ? ld32_fast(wr3 + sb, aligned4) : 0u;
-        else wsc = 0u;
-    };
+    for (int n0 = (int) blockIdx.y * BM; n0 < N; n0 += (int) gridDim.y * BM) {
+        const int nrows = min(BM, N - n0);
+        if (nrows <= 0) break;
 
-    auto store_w_smem = [&](int buf, uint32_t q0, uint32_t q1, uint32_t q2, uint32_t q3, uint32_t wsc) {
-        *reinterpret_cast<uint32_t*>(s_wqs[buf] + (rl + 0) * W_STRIDE + lc * 4) = q0;
-        *reinterpret_cast<uint32_t*>(s_wqs[buf] + (rl + 32) * W_STRIDE + lc * 4) = q1;
-        *reinterpret_cast<uint32_t*>(s_wqs[buf] + (rl + 64) * W_STRIDE + lc * 4) = q2;
-        *reinterpret_cast<uint32_t*>(s_wqs[buf] + (rl + 96) * W_STRIDE + lc * 4) = q3;
-        if (lc < 4) s_wsc[buf][lc * 32 + rl] = wsc;
-    };
+        const uint8_t* const wr0 = (rl + 0 < nrows) ? (w_base + (size_t) (n0 + rl + 0) * w_row_bytes) : nullptr;
+        const uint8_t* const wr1 = (rl + 32 < nrows) ? (w_base + (size_t) (n0 + rl + 32) * w_row_bytes) : nullptr;
+        const uint8_t* const wr2 = (rl + 64 < nrows) ? (w_base + (size_t) (n0 + rl + 64) * w_row_bytes) : nullptr;
+        const uint8_t* const wr3 = (rl + 96 < nrows) ? (w_base + (size_t) (n0 + rl + 96) * w_row_bytes) : nullptr;
 
-    // Prologue: load stage 0 weights & activations.
-    issue_act(0, 0);
-    {
-        uint32_t q0, q1, q2, q3, wsc;
-        load_w_regs(0, q0, q1, q2, q3, wsc);
-        store_w_smem(0, q0, q1, q2, q3, wsc);
-    }
+        auto load_w_regs = [&](int st, uint32_t& q0, uint32_t& q1, uint32_t& q2, uint32_t& q3, uint32_t& wsc) {
+            const size_t sb = (size_t) st * BS_NVFP4;
+            const size_t qo = sb + 4 + (size_t) lc * 4;
+            q0 = wr0 ? ld32_fast(wr0 + qo, aligned4) : 0u;
+            q1 = wr1 ? ld32_fast(wr1 + qo, aligned4) : 0u;
+            q2 = wr2 ? ld32_fast(wr2 + qo, aligned4) : 0u;
+            q3 = wr3 ? ld32_fast(wr3 + qo, aligned4) : 0u;
+            if (lc == 0) wsc = wr0 ? ld32_fast(wr0 + sb, aligned4) : 0u;
+            else if (lc == 1) wsc = wr1 ? ld32_fast(wr1 + sb, aligned4) : 0u;
+            else if (lc == 2) wsc = wr2 ? ld32_fast(wr2 + sb, aligned4) : 0u;
+            else if (lc == 3) wsc = wr3 ? ld32_fast(wr3 + sb, aligned4) : 0u;
+            else wsc = 0u;
+        };
 
-    float acc[4][2][4] = {};
-    const bool on0 = nb0 < ntoks;
-    const bool on1 = nb0 + 8 < ntoks;
+        auto store_w_smem = [&](int buf, uint32_t q0, uint32_t q1, uint32_t q2, uint32_t q3, uint32_t wsc) {
+            *reinterpret_cast<uint32_t*>(s_wqs[buf] + (rl + 0) * W_STRIDE + lc * 4) = q0;
+            *reinterpret_cast<uint32_t*>(s_wqs[buf] + (rl + 32) * W_STRIDE + lc * 4) = q1;
+            *reinterpret_cast<uint32_t*>(s_wqs[buf] + (rl + 64) * W_STRIDE + lc * 4) = q2;
+            *reinterpret_cast<uint32_t*>(s_wqs[buf] + (rl + 96) * W_STRIDE + lc * 4) = q3;
+            if (lc < 4) s_wsc[buf][lc * 32 + rl] = wsc;
+        };
 
-    for (int st = 0; st < ns; ++st) {
-        const int buf = st & 1;
-        const int nxt = buf ^ 1;
-        cp_wait0();
         __syncthreads();
-
-        uint32_t nq0 = 0u, nq1 = 0u, nq2 = 0u, nq3 = 0u, nwsc = 0u;
-        if (st + 1 < ns) {
-            issue_act(st + 1, nxt);
-            load_w_regs(st + 1, nq0, nq1, nq2, nq3, nwsc);
+        // Prologue: load stage 0 weights & activations.
+        issue_act(0, 0);
+        {
+            uint32_t q0, q1, q2, q3, wsc;
+            load_w_regs(0, q0, q1, q2, q3, wsc);
+            store_w_smem(0, q0, q1, q2, q3, wsc);
         }
 
-        if (on0) {
-            uint32_t bq[4];
-            ldsm4(bq, s_aqs[buf] + b_off);
-            const uint32_t sfb0 = s_asc[buf][nb0 + g];
-            const uint32_t sfb1 = on1 ? s_asc[buf][nb0 + 8 + g] : 0u;
-            const float gb0_0 = s_agb[buf][nb0 + 2 * tig];
-            const float gb0_1 = s_agb[buf][nb0 + 2 * tig + 1];
-            const float gb1_0 = on1 ? s_agb[buf][nb0 + 8 + 2 * tig] : 0.0f;
-            const float gb1_1 = on1 ? s_agb[buf][nb0 + 8 + 2 * tig + 1] : 0.0f;
+        float acc[4][2][4] = {};
+
+        for (int st = 0; st < ns; ++st) {
+            const int buf = st & 1;
+            const int nxt = buf ^ 1;
+            cp_wait0();
+            __syncthreads();
+
+            uint32_t nq0 = 0u, nq1 = 0u, nq2 = 0u, nq3 = 0u, nwsc = 0u;
+            if (st + 1 < ns) {
+                issue_act(st + 1, nxt);
+                load_w_regs(st + 1, nq0, nq1, nq2, nq3, nwsc);
+            }
+
+            if (on0) {
+                uint32_t bq[4];
+                ldsm4(bq, s_aqs[buf] + b_off);
+                const uint32_t sfb0 = s_asc[buf][nb0 + g];
+                const uint32_t sfb1 = on1 ? s_asc[buf][nb0 + 8 + g] : 0u;
+                const float gb0_0 = s_agb[buf][nb0 + 2 * tig];
+                const float gb0_1 = s_agb[buf][nb0 + 2 * tig + 1];
+                const float gb1_0 = on1 ? s_agb[buf][nb0 + 8 + 2 * tig] : 0.0f;
+                const float gb1_1 = on1 ? s_agb[buf][nb0 + 8 + 2 * tig + 1] : 0.0f;
 
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                uint32_t a[4];
-                ldsm4(a, s_wqs[buf] + a_off + 16 * i * W_STRIDE);
-                const uint32_t sfa = s_wsc[buf][64 * wf + 16 * i + tidx_a];
+                for (int i = 0; i < 4; ++i) {
+                    uint32_t a[4];
+                    ldsm4(a, s_wqs[buf] + a_off + 16 * i * W_STRIDE);
+                    const uint32_t sfa = s_wsc[buf][64 * wf + 16 * i + tidx_a];
 
-                float d0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                mma_nvfp4_m16n8k64(d0, a, bq[0], bq[1], sfa, sfb0);
-                acc[i][0][0] = fmaf(d0[0], gb0_0, acc[i][0][0]);
-                acc[i][0][1] = fmaf(d0[1], gb0_1, acc[i][0][1]);
-                acc[i][0][2] = fmaf(d0[2], gb0_0, acc[i][0][2]);
-                acc[i][0][3] = fmaf(d0[3], gb0_1, acc[i][0][3]);
+                    float d0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    mma_nvfp4_m16n8k64(d0, a, bq[0], bq[1], sfa, sfb0);
+                    acc[i][0][0] = fmaf(d0[0], gb0_0, acc[i][0][0]);
+                    acc[i][0][1] = fmaf(d0[1], gb0_1, acc[i][0][1]);
+                    acc[i][0][2] = fmaf(d0[2], gb0_0, acc[i][0][2]);
+                    acc[i][0][3] = fmaf(d0[3], gb0_1, acc[i][0][3]);
 
-                if (on1) {
-                    float d1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    mma_nvfp4_m16n8k64(d1, a, bq[2], bq[3], sfa, sfb1);
-                    acc[i][1][0] = fmaf(d1[0], gb1_0, acc[i][1][0]);
-                    acc[i][1][1] = fmaf(d1[1], gb1_1, acc[i][1][1]);
-                    acc[i][1][2] = fmaf(d1[2], gb1_0, acc[i][1][2]);
-                    acc[i][1][3] = fmaf(d1[3], gb1_1, acc[i][1][3]);
+                    if (on1) {
+                        float d1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        mma_nvfp4_m16n8k64(d1, a, bq[2], bq[3], sfa, sfb1);
+                        acc[i][1][0] = fmaf(d1[0], gb1_0, acc[i][1][0]);
+                        acc[i][1][1] = fmaf(d1[1], gb1_1, acc[i][1][1]);
+                        acc[i][1][2] = fmaf(d1[2], gb1_0, acc[i][1][2]);
+                        acc[i][1][3] = fmaf(d1[3], gb1_1, acc[i][1][3]);
+                    }
                 }
+            }
+
+            if (st + 1 < ns) {
+                store_w_smem(nxt, nq0, nq1, nq2, nq3, nwsc);
             }
         }
 
-        if (st + 1 < ns) {
-            store_w_smem(nxt, nq0, nq1, nq2, nq3, nwsc);
-        }
-    }
-
-    if (on0) {
+        if (on0) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int row_lo = n0 + 64 * wf + 16 * i + g;
-            const int row_hi = row_lo + 8;
+            for (int i = 0; i < 4; ++i) {
+                const int row_lo = n0 + 64 * wf + 16 * i + g;
+                const int row_hi = row_lo + 8;
 #pragma unroll
-            for (int n = 0; n < 2; ++n) {
-                if (n == 1 && !on1) break;
-                const int tok0 = t0 + nb0 + 8 * n + 2 * tig;
-                const int tok1 = tok0 + 1;
-                if (tok0 < T) {
-                    if (row_lo < N) {
-                        float* dst = Y + (size_t) tok0 * ldy + row_lo;
-                        *dst = (beta == 0.0f) ? acc[i][n][0] : fmaf(beta, *dst, acc[i][n][0]);
+                for (int n = 0; n < 2; ++n) {
+                    if (n == 1 && !on1) break;
+                    const int tok0 = t0 + nb0 + 8 * n + 2 * tig;
+                    const int tok1 = tok0 + 1;
+                    if (tok0 < T) {
+                        if (row_lo < N) {
+                            float* dst = Y + (size_t) tok0 * (size_t) ldy + row_lo;
+                            *dst = (beta == 0.0f) ? acc[i][n][0] : fmaf(beta, *dst, acc[i][n][0]);
+                        }
+                        if (row_hi < N) {
+                            float* dst = Y + (size_t) tok0 * (size_t) ldy + row_hi;
+                            *dst = (beta == 0.0f) ? acc[i][n][2] : fmaf(beta, *dst, acc[i][n][2]);
+                        }
                     }
-                    if (row_hi < N) {
-                        float* dst = Y + (size_t) tok0 * ldy + row_hi;
-                        *dst = (beta == 0.0f) ? acc[i][n][2] : fmaf(beta, *dst, acc[i][n][2]);
-                    }
-                }
-                if (tok1 < T) {
-                    if (row_lo < N) {
-                        float* dst = Y + (size_t) tok1 * ldy + row_lo;
-                        *dst = (beta == 0.0f) ? acc[i][n][1] : fmaf(beta, *dst, acc[i][n][1]);
-                    }
-                    if (row_hi < N) {
-                        float* dst = Y + (size_t) tok1 * ldy + row_hi;
-                        *dst = (beta == 0.0f) ? acc[i][n][3] : fmaf(beta, *dst, acc[i][n][3]);
+                    if (tok1 < T) {
+                        if (row_lo < N) {
+                            float* dst = Y + (size_t) tok1 * (size_t) ldy + row_lo;
+                            *dst = (beta == 0.0f) ? acc[i][n][1] : fmaf(beta, *dst, acc[i][n][1]);
+                        }
+                        if (row_hi < N) {
+                            float* dst = Y + (size_t) tok1 * (size_t) ldy + row_hi;
+                            *dst = (beta == 0.0f) ? acc[i][n][3] : fmaf(beta, *dst, acc[i][n][3]);
+                        }
                     }
                 }
             }
@@ -432,10 +446,12 @@ bool gemm_f16_nvfp4(const uint16_t* X_f16, const void* W_nvfp4, float* Y, int64_
     }
 
     const cudaStream_t cs = static_cast<cudaStream_t>(stream);
-    const unsigned qgrid = (unsigned) ((nblk + 7) / 8);
+    const unsigned qgrid = (unsigned) std::min<int64_t>((nblk + 7) / 8, 0x7fffffffLL);
     quant_f16_to_nvfp4_kernel<<<qgrid, 256, 0, cs>>>(X_f16, nblk, x_act);
 
-    const dim3 dgrid((unsigned) ((N + BM - 1) / BM), (unsigned) ((T + BN - 1) / BN));
+    const unsigned gx = (unsigned) ((T + BN - 1) / BN);
+    const unsigned gy = (unsigned) std::min<int64_t>((N + BM - 1) / BM, 65535LL);
+    const dim3 dgrid(gx, gy);
     dense_fp4_tc_kernel<<<dgrid, NT, 0, cs>>>(static_cast<const uint8_t*>(W_nvfp4), x_act, Y, (int) N, (int) T,
                                               (int) K, (int) ldy, beta);
     if (cudaGetLastError() != cudaSuccess) return false;
