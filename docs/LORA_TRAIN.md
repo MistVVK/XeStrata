@@ -358,7 +358,7 @@ gradients and the optimizer's computation do not change (only the placement).
 
 The test fixtures: `XESTRATA_TRAIN_WEIGHTS_MIB` (the resident weights' budget), `XESTRATA_TRAIN_TAPES` (the tapes
 kept), `XESTRATA_TRAIN_INPUTS16` (0: FP32 forced, 1: BF16 forced), `XESTRATA_TRAIN_INPUTS_HOST` (0: the host form
-forbidden). The SSD tier comes later (not in v1).
+forbidden). The SSD tier is outside v1's scope.
 
 ### The budget's hand-over (one form with serve's training job)
 
@@ -431,7 +431,7 @@ Training defaults to caption dropout 0. Change it in the browser's settings or w
 
 Prepare the training bases with setup, for example `--images qwen-image-turbo --image-lora-training`. With several image models it fetches each one's base. The interactive setup and launcher offer the same choice. Without it there are no extra training downloads.
 
-Distilled models are not in the training list. Qwen-Image-2.1 Turbo uses Qwen-Image-2.1 F16, Mage-Flow Turbo uses `mage-flow` (RL), MOSS-Image 4-step uses `moss-image-sft` (SFT), and Anima Turbo uses `anima-base`. Anima Base is the author's choice for training; it is not claimed to be Turbo's teacher. MageTrail is trained separately; its compatibility with Mage-Flow LoRAs is unverified. An API or chat request for a distilled model switches to its base and reports the switch. The resulting LoRA can also be used with the corresponding distilled model.
+Distilled models are not in the training list. Qwen-Image-2.1 Turbo uses Qwen-Image-2.1 F16, Mage-Flow Turbo uses `mage-flow` (RL), MOSS-Image 4-step uses `moss-image-sft` (SFT), and Anima Turbo uses `anima-base`. Anima Base is the author's choice for training; it is not claimed to be Turbo's teacher. MageTrail is trained separately. Its modulation is an F32 low-rank form, and the engine binds no adapter to that weight. A Mage-Flow LoRA's modulation keys (`img_mod.1`, `txt_mod.1`) have no effect on MageTrail. An API or chat request for a distilled model switches to its base and reports the switch. The resulting LoRA can also be used with the corresponding distilled model.
 
 - Say "I want a LoRA of this character" in the chat: the model reads the `lora-train` skill and calls `train_lora`. The training panel opens in the chat (the Images view's LoRA section has a "Train a LoRA…" button too).
 - The panel's flow: put the pictures in (drag and drop, several at once, or pick this chat's images) -> choose the kind (character, style, other), the name, the trigger word and the model -> caption them automatically (`tools/image/lora_caption.py`, written by the chat's picture-reading model, per the [caption policy](#the-caption-policy)) and edit them on the panel -> the settings (the preset's defaults: the most steps n, how often a version is saved k, rank, lr, seed, the weights' selection, the sample prompts; the advanced ones fold away) -> start.
