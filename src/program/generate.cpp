@@ -879,13 +879,41 @@ void usage() {
                  "                       by default where it applies; not bit-exact run to run). 0 = the blocking tier.\n");
 }
 
-/// A blob for a copy that is not over at once (a queued or asynchronous fill, a long loop of blocking ones): the
-/// source's own pointer, or - for a source that assembles its blobs into short-lived buffers (the GGUF read in place,
-/// `transient`) - a copy in `tmp`, which the caller must not reuse before the copy from it is done.
-const uint8_t* blob_to_copy(strata::core::ExpertSource* src, int64_t layer, int64_t expert, std::vector<uint8_t>& tmp) {
-    if (!src->transient(layer, expert)) return src->blob(layer, expert);
-    tmp.resize((size_t) strata::kernels::cpu::expert_layout().max_blob);
-    return src->copy_blob(layer, expert, tmp.data()) ? tmp.data() : nullptr;
+/// The buffer `blob_to_copy` copies a blob into: host USM (page-locked), ordinary memory where that cannot be had.
+struct FillBuf {
+    uint8_t* p = nullptr;
+    std::vector<uint8_t> pageable;
+    FillBuf() = default;
+    FillBuf(const FillBuf&) = delete;
+    FillBuf& operator=(const FillBuf&) = delete;
+    ~FillBuf() { if (pageable.empty()) strata::gpu::free(p); }
+    uint8_t* get() {
+        if (p == nullptr) {
+            const size_t n = (size_t) strata::kernels::cpu::expert_layout().max_blob;
+            if (!strata::gpu::alloc_host(&p, n)) { pageable.resize(n); p = pageable.data(); }
+        }
+        return p;
+    }
+};
+
+/// A blob for a copy to the device.  The source's own pointer where the GPU's runtime can keep reading it: page-locked
+/// RAM the source reports (`pinned`), or host USM.  Any other blob - the model file's mapping, a RAM copy the PC could
+/// not lock, a source that assembles its blobs into short-lived buffers (the GGUF read in place, `transient`) - is
+/// copied into `tmp`, and `in_tmp` says so: the caller finishes the copy from it before the next call.  As the prompt
+/// path's stager: a copy straight from pageable memory hands the GPU's runtime the caller's pages (HIP registers them
+/// for a copy of more than 1 MiB), and where the OS takes those back the process's GPU queues are suspended (RX 9060
+/// XT, 15 GiB of RAM, Edge0-120B, 2026-11-21: the profile fill from the mapping, then the queues suspended about 0.9 s
+/// of each second for the rest of the run).
+const uint8_t* blob_to_copy(strata::core::ExpertSource* src, int64_t layer, int64_t expert, FillBuf& tmp, bool& in_tmp) {
+    in_tmp = false;
+    const bool tr = src->transient(layer, expert);
+    const uint8_t* b = tr ? nullptr : src->blob(layer, expert);
+    if (!tr && (b == nullptr || src->pinned(layer, expert) || strata::gpu::is_host_usm(b))) return b;
+    in_tmp = true;
+    uint8_t* t = tmp.get();
+    if (tr) return src->copy_blob(layer, expert, t) ? t : nullptr;
+    std::memcpy(t, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer, expert));
+    return t;
 }
 
 // --lookup-chain: the context's last tokens for the draft sources (at most 64), the MTP's pending drafts last
@@ -5256,7 +5284,8 @@ int main(int argc, char** argv) {
     bool io_pf_by_default = false;   // the file tier's Linux defaults turned io prefetch on (no XESTRATA_IO_PREFETCH given)
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
-    std::vector<uint8_t> fill_tmp;   // blob_to_copy's buffer for a transient source
+    FillBuf fill_tmp;   // blob_to_copy's buffer for a blob the GPU's runtime must not read in place
+    bool in_tmp = false;
     // Issue #10: less RAM available than the whole expert arena.  The arena then swaps while it loads, and on Level
     // Zero the PCIe share later moves it into host USM (make_kernel_readable): GPU driver memory that the OOM killer
     // cannot reclaim, so the GPU VM's rebind swapped it back in and the OOM killer emptied the host (#10, Case 1:
@@ -6148,7 +6177,7 @@ int main(int argc, char** argv) {
             if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile_order.data() + i + fill_ahead, 1);
             const int32_t slot = xcache.admit(profile_order[(size_t) i].first, profile_order[(size_t) i].second);
             if (slot == strata::core::kNotResident) break;
-            const uint8_t* b = blob_to_copy(srcp, profile_order[(size_t) i].first, profile_order[(size_t) i].second, fill_tmp);
+            const uint8_t* b = blob_to_copy(srcp, profile_order[(size_t) i].first, profile_order[(size_t) i].second, fill_tmp, in_tmp);
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
                     (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile_order[(size_t) i].first, profile_order[(size_t) i].second))) {
                 std::fprintf(stderr, "xestrata generate: the profile fill failed at pair %lld: %s\n",
@@ -6163,7 +6192,7 @@ int main(int argc, char** argv) {
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
         if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile_order[0].first, profile_order[0].second),
-                                blob_to_copy(srcp, profile_order[0].first, profile_order[0].second, fill_tmp), err,
+                                blob_to_copy(srcp, profile_order[0].first, profile_order[0].second, fill_tmp, in_tmp), err,
                                 (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile_order[0].first, profile_order[0].second))) {
             std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
             return 1;
@@ -6252,7 +6281,7 @@ int main(int argc, char** argv) {
             if (filled >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
             if (slot == strata::core::kNotResident) break;
-            const uint8_t* b = blob_to_copy(srcp, pr.first, pr.second, fill_tmp);
+            const uint8_t* b = blob_to_copy(srcp, pr.first, pr.second, fill_tmp, in_tmp);
             if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first, pr.second))) {
                 std::fprintf(stderr, "xestrata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
                              st.dev, (long long) filled, err.c_str());
@@ -6262,7 +6291,7 @@ int main(int argc, char** argv) {
         }
         st.held = filled;
         if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
-                                                 blob_to_copy(srcp, st.profile[0].first, st.profile[0].second, fill_tmp), err,
+                                                 blob_to_copy(srcp, st.profile[0].first, st.profile[0].second, fill_tmp, in_tmp), err,
                                                  (int64_t) lay.blob_bytes(st.profile[0].first, st.profile[0].second))) {
             std::fprintf(stderr, "xestrata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
                          filled == 0 ? "nothing filled" : err.c_str());
@@ -7206,9 +7235,10 @@ int main(int argc, char** argv) {
                 const int32_t l = profile[pi].first, e = profile[pi].second;
                 const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
                 if (host_res[i] >= 0 || lay.blob_bytes(l, e) > room) continue;
-                const uint8_t* b = srcp->blob(l, e);
+                const uint8_t* b = blob_to_copy(srcp, l, e, fill_tmp, in_tmp);
                 if (b == nullptr) continue;
-                strata::gpu::copy_async(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l, e), nullptr);
+                if (in_tmp) strata::gpu::copy(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l, e));
+                else strata::gpu::copy_async(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l, e), nullptr);
                 filled.emplace_back(i, (int32_t) s);
                 ++pi;
                 break;
@@ -9026,9 +9056,10 @@ int main(int argc, char** argv) {
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
-                // a transient source's blob (the GGUF read in place) is copied into fill_tmp: that swap is synchronous
-                const bool tb = srcp->transient(s.layer, s.in);
-                const uint8_t* b = blob_to_copy(srcp, s.layer, s.in, fill_tmp);
+                // a blob copied into fill_tmp (blob_to_copy: not page-locked, or the GGUF read in place): that swap is
+                // synchronous
+                bool tb = false;
+                const uint8_t* b = blob_to_copy(srcp, s.layer, s.in, fill_tmp, tb);
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
                 const strata::core::OnDevice on(gs ? gs->dev : -1);
@@ -9994,9 +10025,10 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (pick < 0) continue;
-                    const uint8_t* b = blob_to_copy(srcp, layer, pick % g.n_expert, fill_tmp);
-                    if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
-                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer, pick % g.n_expert))) {
+                    const uint8_t* b = blob_to_copy(srcp, layer, pick % g.n_expert, fill_tmp, in_tmp);
+                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer, pick % g.n_expert);
+                    if (b == nullptr || !(in_tmp ? xcache.fill_slot_blocking(slot, b, ferr, nb)
+                                                 : xcache.fill_slot_queued(slot, b, ferr, nb))) {
                         e = "VRAM: refilling the cache failed: " + ferr;
                         return false;
                     }
@@ -12343,9 +12375,9 @@ int main(int argc, char** argv) {
                     bool any = false;
                     for (const auto& [i, slot] : lent_now) {   // D-4: queued, one wait
                         if (stage_at(i) != st) continue;
-                        // a transient source's blob is copied into fill_tmp, so each fill must be over before the next
-                        const bool tb = srcp->transient(i / g.n_expert, i % g.n_expert);
-                        const uint8_t* b = blob_to_copy(srcp, i / g.n_expert, i % g.n_expert, fill_tmp);
+                        // a blob copied into fill_tmp (blob_to_copy): each such fill must be over before the next
+                        bool tb = false;
+                        const uint8_t* b = blob_to_copy(srcp, i / g.n_expert, i % g.n_expert, fill_tmp, tb);
                         const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert, i % g.n_expert);
                         if (b == nullptr || !(tb ? c.fill_slot_blocking(slot, b, e, nb)
                                                  : c.fill_slot_queued(slot, b, e, nb)))
@@ -14490,8 +14522,8 @@ int main(int argc, char** argv) {
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait
-                const bool tb = srcp->transient(i / g.n_expert, i % g.n_expert);   // see the serve loop's refill
-                const uint8_t* b = blob_to_copy(srcp, i / g.n_expert, i % g.n_expert, fill_tmp);
+                bool tb = false;   // see the serve loop's refill
+                const uint8_t* b = blob_to_copy(srcp, i / g.n_expert, i % g.n_expert, fill_tmp, tb);
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert, i % g.n_expert);
                 if (b == nullptr || !(tb ? xcache.fill_slot_blocking(slot, b, err, nb)
                                          : xcache.fill_slot_queued(slot, b, err, nb))) {
@@ -14920,10 +14952,10 @@ int main(int argc, char** argv) {
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
-                // asynchronous: the copies run while the MTP drafts; the next window waits for them (a transient
-                // source's blob - the GGUF read in place - is copied into fill_tmp, so that swap is synchronous)
-                const bool tb = srcp->transient(s.layer, s.in);
-                const uint8_t* b = blob_to_copy(srcp, s.layer, s.in, fill_tmp);
+                // asynchronous: the copies run while the MTP drafts; the next window waits for them (a blob copied
+                // into fill_tmp - not page-locked, or the GGUF read in place - makes that swap synchronous)
+                bool tb = false;
+                const uint8_t* b = blob_to_copy(srcp, s.layer, s.in, fill_tmp, tb);
                 const size_t sn = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer, s.in);
                 if (slot < 0 || b == nullptr ||
                     !(tb ? strata::gpu::copy(xcache.device_slot(slot), b, sn)
